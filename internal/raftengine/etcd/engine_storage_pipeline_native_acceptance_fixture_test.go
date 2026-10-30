@@ -247,6 +247,7 @@ func openAsyncNativeAcceptanceEngine(t *testing.T, node *transportTestNode, peer
 	require.NoError(t, e.recoverOpenConfiguration(prepared, e.applied))
 	e.initTransport(prepared.cfg)
 	e.refreshStatus()
+	require.NoError(t, e.attachPipelineSnapshotView(prepared.cfg, &prepared.disk.LocalSnap))
 	go e.run()
 	return e
 }

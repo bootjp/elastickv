@@ -19,12 +19,28 @@ func (e *Engine) queuePipelineReceivedFrontWithLease(message *raftpb.Message, le
 	if err := validatePipelineIngress(message); err != nil {
 		return err
 	}
-	owned := cloneDispatchMessage(*message)
-	plan, err := e.newPipelineSnapshotPlanWithLease(&owned, lease)
+	if message.GetSnapshot().GetMetadata().GetIndex() <= e.rawNode.BasicStatus().GetCommit() {
+		// The native reject/current-prefix response does not install or clone
+		// this body. Keep its real storage-response durability gating intact.
+		plan, err := e.newPipelineSnapshotPlanWithLease(nil, lease)
+		if err != nil {
+			return err
+		}
+		if err := e.queuePipelineSnapshotDisk(plan, pipelineReceivedDiscard); err != nil {
+			return err
+		}
+		return errors.WithStack(e.rawNode.Step(message))
+	}
+	plan, err := e.newPipelineSnapshotPlanWithLease(message, lease)
 	if err != nil {
 		return err
 	}
-	return e.queuePipelineSnapshotApply(plan, pipelineReceivedRestore)
+	n, err := e.newPipelineNormalization(plan.snapshot, plan.env, plan, false)
+	if err != nil {
+		return err
+	}
+	e.storagePipeline.normalizingReceived = plan
+	return e.queuePipelineNormalization(n)
 }
 
 func (e *Engine) frontPipelineReceivedSnapshot(request *pipelineSnapshotRequest) error {
@@ -48,6 +64,9 @@ func (e *Engine) frontPipelineReceivedSnapshot(request *pipelineSnapshotRequest)
 	plan.permits = append(plan.permits, permit)
 	plan.frontReply = request.reply
 	p.receiving = plan
+	if p.normalizingReceived == plan {
+		p.normalizingReceived = nil
+	}
 	e.snapshotTransition.Store(true)
 	e.ackTracker.reset()
 	e.singleNodeLeaderAckMonoNs.Store(0)
@@ -152,6 +171,9 @@ func (p *engineStoragePipeline) releasePipelineReceivedSnapshot(plan *pipelineSn
 }
 
 func (e *Engine) publishPipelineReceivedSnapshot(plan *pipelineSnapshotPlan) error {
+	if err := e.pipelineMemoryStorageMutable(); err != nil {
+		return err
+	}
 	p := e.storagePipeline
 	if err := e.flushHeldSnapshotDisk(); err != nil {
 		return err
@@ -160,15 +182,19 @@ func (e *Engine) publishPipelineReceivedSnapshot(plan *pipelineSnapshotPlan) err
 	if err := e.storage.ApplySnapshot(snapshot); err != nil {
 		return errors.WithStack(err)
 	}
+	if p.snapshotView != nil {
+		p.snapshotView.publish(snapshot, true)
+	}
 	if err := e.storage.Append(plan.message.Entries); err != nil {
 		return errors.WithStack(err)
 	}
 	if err := e.applyReadyHardState(&raftpb.HardState{Term: plan.message.Term, Vote: plan.message.Vote, Commit: plan.message.Commit}); err != nil {
 		return err
 	}
-	e.snapshotConfigurations.reset(snapshot.GetMetadata().GetIndex(), snapshot.GetMetadata().GetConfState())
+	if err := e.resetPipelineSnapshotConfiguration(snapshot); err != nil {
+		return err
+	}
 	e.snapshotConfigurationReplayIndex = 0
-	p.retireConfigurationHistory()
 	e.applied = snapshot.GetMetadata().GetIndex()
 	e.appliedIndex.Store(e.applied)
 	e.clearPendingConfChange(e.applied)

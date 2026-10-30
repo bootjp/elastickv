@@ -33,7 +33,7 @@ func ledgerResponse(index, entryTerm, generationTerm uint64) *raftpb.Message {
 
 func TestAsyncUnstableLedgerPartialPrefixRetained(t *testing.T) {
 	t.Parallel()
-	b := newStorageWorkBudget(4096, 10)
+	b := newStorageWorkBudget(8192, 10)
 	l := newAsyncUnstableLedger(b)
 	t.Cleanup(l.discard)
 	first := ledgerAppend(ledgerEntry(1, 1, "large-prefix"), ledgerEntry(2, 1, "second"))
@@ -41,7 +41,7 @@ func TestAsyncUnstableLedgerPartialPrefixRetained(t *testing.T) {
 	require.NoError(t, l.retain(first))
 	require.NoError(t, l.retain(second))
 	bytes, items := b.usage()
-	require.Equal(t, 4, items)
+	require.Equal(t, 2, items, "two append generations, each retaining two entries")
 	require.True(t, l.stabilize(ledgerResponse(2, 1, 1), 1))
 	require.Equal(t, []asyncUnstableEntry{{3, 1}, {4, 1}}, l.entries)
 	requireStorageWorkUsage(t, b, bytes, items)
@@ -52,13 +52,14 @@ func TestAsyncUnstableLedgerPartialPrefixRetained(t *testing.T) {
 	require.Nil(t, l.entries)
 	requireStorageWorkUsage(t, b, 0, 0)
 	// A new empty-to-nonempty epoch does not inherit retired reservations.
-	require.NoError(t, l.retain(ledgerAppend(ledgerEntry(5, 2, "next"))))
-	requireStorageWorkUsage(t, b, uint64(proto.Size(ledgerEntry(5, 2, "next"))), 1)
+	next := ledgerEntry(5, 2, "next")
+	require.NoError(t, l.retain(ledgerAppend(next)))
+	requireStorageWorkUsage(t, b, pipelinePhysicalEntryBytes+uint64(cap(next.Data))+pipelinePointerBytes, 1)
 }
 
 func TestAsyncUnstableLedgerOverwrittenSuffixABA(t *testing.T) {
 	t.Parallel()
-	b := newStorageWorkBudget(4096, 20)
+	b := newStorageWorkBudget(8192, 20)
 	l := newAsyncUnstableLedger(b)
 	t.Cleanup(l.discard)
 	for _, message := range []*raftpb.Message{
@@ -70,7 +71,7 @@ func TestAsyncUnstableLedgerOverwrittenSuffixABA(t *testing.T) {
 	}
 	require.Equal(t, []asyncUnstableEntry{{1, 1}, {2, 2}}, l.entries)
 	bytes, items := b.usage()
-	require.Equal(t, 5, items, "displaced generations remain charged")
+	require.Equal(t, 3, items, "displaced generations remain charged")
 	for _, stale := range []*raftpb.Message{
 		ledgerResponse(2, 2, 2), ledgerResponse(2, 3, 3), ledgerResponse(3, 2, 4), ledgerResponse(2, 3, 4),
 	} {
@@ -91,7 +92,7 @@ func TestAsyncUnstableLedgerReplaceBeforeOffset(t *testing.T) {
 	require.NoError(t, l.retain(ledgerAppend(ledgerEntry(4, 2, "replacement"))))
 	require.Equal(t, []asyncUnstableEntry{{4, 2}}, l.entries)
 	_, items := b.usage()
-	require.Equal(t, 3, items)
+	require.Equal(t, 2, items)
 	require.False(t, l.stabilize(ledgerResponse(6, 1, 2), 2))
 	require.True(t, l.stabilize(ledgerResponse(4, 2, 2), 2))
 	requireStorageWorkUsage(t, b, 0, 0)
@@ -101,9 +102,9 @@ func TestAsyncUnstableLedgerFailedAcquireRollback(t *testing.T) {
 	t.Parallel()
 	for _, kind := range []string{"bytes", "items"} {
 		t.Run(kind, func(t *testing.T) {
-			b := newStorageWorkBudget(4096, 3)
+			b := newStorageWorkBudget(8192, 1)
 			if kind == "bytes" {
-				b = newStorageWorkBudget(50, 20)
+				b = newStorageWorkBudget(4096, 20)
 			}
 			l := newAsyncUnstableLedger(b)
 			t.Cleanup(l.discard)
@@ -251,7 +252,7 @@ func TestAsyncUnstableLedgerNear64MiBNoPayloadCopy(t *testing.T) {
 	entry := ledgerEntry(1, 1, "")
 	entry.Data = make([]byte, payloadSize)
 	message := ledgerAppend(entry)
-	bytes := uint64(proto.Size(entry))
+	bytes := uint64(cap(entry.Data)) + pipelinePhysicalEntryBytes + pipelinePointerBytes
 	b := newStorageWorkBudget(bytes, 1)
 	l := newAsyncUnstableLedger(b)
 	t.Cleanup(l.discard)
@@ -288,7 +289,7 @@ func TestAsyncUnstableLedgerConcurrentBudgetOwnership(t *testing.T) {
 				require.LessOrEqual(t, bytes, b.maxBytes)
 				require.GreaterOrEqual(t, items, 0)
 				require.LessOrEqual(t, items, b.maxItems)
-				require.Zero(t, items%2, "no partial reservation may be visible")
+				require.GreaterOrEqual(t, bytes, uint64(items*2*pipelinePhysicalEntryBytes), "each generation atomically retains both entry descriptors")
 				if err == nil && !l.stabilize(ledgerResponse(2, 1, 1), 1) {
 					t.Error("matching response failed to stabilize")
 				}

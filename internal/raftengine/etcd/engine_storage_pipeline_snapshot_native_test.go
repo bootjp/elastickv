@@ -205,6 +205,7 @@ func newNativeSnapshotClusterWithHook(t *testing.T, leaderStage, receiverStage s
 		node.engine = e
 		e.dispatchFn = c.dispatcher(node)
 		beforeRun(e, i)
+		require.NoError(t, e.attachPipelineSnapshotView(prepared.cfg, &prepared.disk.LocalSnap))
 		require.NoError(t, e.recoverOpenConfiguration(prepared, e.applied))
 		e.initTransport(prepared.cfg)
 		e.refreshStatus()

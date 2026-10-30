@@ -36,6 +36,20 @@ type pipelineIngress struct {
 	message raftpb.Message
 	permit  *storageWorkPermit
 	lease   *pipelineSnapshotLease
+	decode  *storageWorkPermit
+}
+
+func (input *pipelineIngress) release() {
+	permit, decode := input.permit, input.decode
+	if permit != nil {
+		*input = pipelineIngress{}
+	} else {
+		// A network ReadIndex transfers both its permit and this exact message
+		// header to RawNode. Mutating the header would corrupt pending/readOnly.
+		input.decode = nil
+	}
+	permit.Release()
+	decode.Release()
 }
 
 type pipelineTask struct {
@@ -52,6 +66,7 @@ type pipelineTask struct {
 	configPermits []*storageWorkPermit
 	snapshotPlan  *pipelineSnapshotPlan
 	snapshotStage pipelineSnapshotStage
+	normalization *pipelineSnapshotNormalization
 }
 
 // engineStoragePipeline is an unactivated runtime. Its own
@@ -70,7 +85,13 @@ type engineStoragePipeline struct {
 	proposalBudget, bulkIngressBudget  *storageWorkBudget
 	priorityIngressBudget, readyBudget *storageWorkBudget
 	outboundBulk, outboundControl      *storageWorkBudget
+	bulkOwnership, controlOwnership    *storageWorkBudget
 	bulk, priority                     chan pipelineIngress
+	deferredSnapshots                  []pipelineIngress
+	failedIngress                      []*pipelineIngress
+	readOwnership                      map[uint64]*pipelineReadOwnership
+	networkReadOwnership               map[pipelineNetworkReadKey]*pipelineNetworkReadOwnership
+	readyReadRetire                    []*storageWorkPermit
 	bulkPaused                         atomic.Bool
 	stopping                           atomic.Bool
 	ingressMu                          sync.Mutex
@@ -102,6 +123,10 @@ type engineStoragePipeline struct {
 	heldSnapshotDisk                  []storageWorkCompletion
 	receivedApplyFloor                uint64 // apply actor only
 	publishedSnapshotFloor            uint64 // owner only
+	snapshotView                      *pipelineSnapshotStorageView
+	recoveryNormalization             *pipelineSnapshotNormalization
+	normalizingReceived               *pipelineSnapshotPlan
+	normalizations                    map[*pipelineSnapshotNormalization]bool
 }
 
 func newEngineStoragePipeline(persist etcdstorage.Storage) (*engineStoragePipeline, error) {
@@ -147,6 +172,7 @@ func newEngineStoragePipeline(persist etcdstorage.Storage) (*engineStoragePipeli
 		snapshotIngressBudget:      newStorageWorkBudget(pipelineBulkBytes, pipelineActorQueue),
 		snapshotPins:               make(map[*pipelineSnapshotPlan]uint64),
 	}
+	p.connectOwnershipBudgets()
 	return p, nil
 }
 
@@ -170,7 +196,12 @@ func (e *Engine) reservePipelineProposal(bytes uint64) (*storageWorkPermit, erro
 	if bytes > (math.MaxUint64-pipelineTaskOverhead)/3 {
 		return nil, errors.WithStack(errStorageWorkInvalidReservation)
 	}
-	return p.proposalBudget.tryAcquire(bytes*3 + pipelineTaskOverhead)
+	// The envelope allocation has exactly header+payload length. Entry/owner
+	// metadata must also fit the admitted first-entry exception, before Propose.
+	if bytes > pipelineMaxOwnedInputBytes-pipelinePhysicalEntryBytes-envelopeHeaderSize {
+		return nil, errors.WithStack(errStorageWorkInvalidReservation)
+	}
+	return p.proposalBudget.tryAcquire(bytes*3 + pipelinePhysicalEntryBytes*4)
 }
 
 // enqueuePipelineStep owns accepted transport input, not authenticated local
@@ -212,20 +243,38 @@ func (e *Engine) admitPipelineStep(message raftpb.Message) error {
 		return errors.WithStack(errStepQueueFull)
 	}
 	if message.GetType() == raftpb.MsgSnap {
+		if p.bulkPaused.Load() {
+			return errors.WithStack(errStepQueueFull)
+		}
 		budget = p.snapshotIngressBudget
 	}
+	return e.reservePipelineIngress(message, budget, ch)
+}
+
+func (e *Engine) reservePipelineIngress(message raftpb.Message, budget *storageWorkBudget, ch chan pipelineIngress) error {
+	p := e.storagePipeline
+	decode, err := p.reservePipelineConfigurationDecode(&message)
+	if err != nil {
+		return err
+	}
+	defer func() { decode.Release() }()
 	// Use the same conservative bill as outbound ownership, before cloning any
 	// payload. A shallow detach can retain a much larger caller backing array.
-	permit, err := budget.tryAcquire(outboundDispatchBytes(&message))
+	permit, err := budget.tryAcquire(pipelineCloneMessageBytes(&message))
 	if err == nil {
 		message = cloneDispatchMessage(message)
+		if budget != p.priorityIngressBudget && pipelineOwnedMessageBytes(&message) > pipelineMaxOwnedInputBytes {
+			permit.Release()
+			return errors.WithStack(errStepQueueFull)
+		}
 		lease, err := p.snapshotIngressLease(&message)
 		if err != nil {
 			permit.Release()
 			return err
 		}
 		select {
-		case ch <- pipelineIngress{message: message, permit: permit, lease: lease}:
+		case ch <- pipelineIngress{message: message, permit: permit, lease: lease, decode: decode}:
+			decode = nil
 			return nil
 		default:
 			p.snapshotResources.forget(lease)
@@ -310,36 +359,62 @@ func pipelineMessageHeaders(message *raftpb.Message) uint64 {
 
 func (e *Engine) foldPipelineReady() error {
 	p := e.storagePipeline
+	if failure := p.firstFailure(nil); failure != nil {
+		return failure
+	}
 	for e.rawNode.HasReady() {
-		rd := e.rawNode.Ready()
-		// Ready has already accepted upstream messages. Keep their ownership
-		// even if sizing or reservation fails before routing can begin.
-		p.failedReady = &rd
-		var size uint64 = pipelineTaskOverhead
-		for _, message := range rd.Messages {
-			bytes := pipelineMessageBytes(message)
-			if bytes > math.MaxUint64-size {
-				return errors.Wrap(errStoragePipelineResource, "atomic Ready size overflow")
-			}
-			size += bytes
+		e.rebindPipelinePendingReads()
+		rd, size, err := e.borrowPipelineReady()
+		if err != nil {
+			return err
 		}
-		permit, err := p.readyBudget.tryAcquire(size)
+		permit, err := p.reserveReadyOwnership(*rd, size)
 		if err != nil {
 			// Upstream has no append-Ready size bound. Full ingress/atomic
 			// overshoot admission is still an activation gate for this runtime.
 			return errors.Wrap(errStoragePipelineResource, "atomic Ready exceeds prototype routing headroom")
 		}
 		p.failedReadyPermit = permit
-		if err := e.routePipelineReady(rd); err != nil {
+		if err := e.routePipelineReady(*rd); err != nil {
 			return err
 		}
 		p.failedReady, p.failedReadyPermit = nil, nil
+		*rd = etcdraft.Ready{}
 		permit.Release()
+		p.retireReadyReads()
+		if p.snapshotView != nil {
+			p.snapshotView.retireClones()
+		}
 		// Async Ready is accepted by Ready itself, not a later Advance. Only
 		// now release local drop feedback, including mandatory SnapshotFailure.
 		e.flushDeferredDispatchReports()
 	}
+	if p.snapshotView != nil {
+		p.snapshotView.retireClones()
+	}
 	return nil
+}
+
+func (p *engineStoragePipeline) reserveReadyOwnership(rd etcdraft.Ready, size uint64) (*storageWorkPermit, error) {
+	permit, err := p.readyBudget.tryAcquire(size)
+	if err != nil {
+		return nil, err
+	}
+	root, bulk := p.controlOwnership, false
+	for _, message := range rd.Messages {
+		if (message.GetType() == raftpb.MsgStorageAppend || message.GetType() == raftpb.MsgStorageApply) &&
+			(len(message.Entries) != 0 || message.Snapshot != nil) {
+			root, bulk = p.bulkOwnership, true
+			break
+		}
+	}
+	parent, err := root.acquire(size, 1, bulk)
+	if err != nil {
+		permit.Release()
+		return nil, err
+	}
+	permit.parent = parent
+	return permit, nil
 }
 
 func (e *Engine) routePipelineReady(rd etcdraft.Ready) error {
@@ -365,13 +440,18 @@ func (e *Engine) routePipelineReadyMessage(message *raftpb.Message) error {
 	if message.GetTo() == e.nodeID {
 		return errors.Wrap(errInvalidStorageWork, "unexpected Ready self response")
 	}
-	return e.sendPipelineMessage(message)
+	err := e.sendPipelineMessage(message)
+	e.retirePipelineNetworkRead(message)
+	return err
 }
 
 func (e *Engine) handlePipelineReadStates(states []etcdraft.ReadState) {
 	// Even VerifyLeader's read receipt waits for the actually applied prefix.
 	for _, state := range states {
 		if id, ok := decodeReadContext(state.RequestCtx); ok {
+			if owned := e.storagePipeline.readOwnership[id]; owned != nil {
+				owned.ready, owned.pendingCommit = true, false
+			}
 			if req, found := e.pendingRead(id); found {
 				req.target, req.waitApplied = state.Index, true
 				e.storePendingRead(req)
@@ -404,7 +484,7 @@ func (e *Engine) queuePipelineAppend(message *raftpb.Message) error {
 	if len(message.Entries) == 0 {
 		budget = p.diskControl
 	}
-	permit, err := budget.tryAcquire(pipelineMessageBytes(message))
+	permit, err := budget.tryAcquire(pipelineTaskMessageBytes(message))
 	if err != nil {
 		return errors.Wrap(errStoragePipelineResource, err.Error())
 	}
@@ -426,7 +506,7 @@ func (e *Engine) queuePipelineAppend(message *raftpb.Message) error {
 		}
 		return value, err
 	}
-	work.token, work.retainedBytes = task, pipelineMessageBytes(message)
+	work.token, work.retainedBytes = task, pipelineTaskMessageBytes(message)
 	task.work = work
 	p.diskIssued++
 	task.diskSequence = p.diskIssued
@@ -440,7 +520,7 @@ func (e *Engine) queuePipelineApply(message *raftpb.Message) error {
 	if message.GetTo() != etcdraft.LocalApplyThread || !etcdraft.IsEmptySnap(message.Snapshot) {
 		return errors.WithStack(errInvalidStorageWork)
 	}
-	permit, err := p.applyBudget.tryAcquire(pipelineMessageBytes(message))
+	permit, err := p.applyBudget.tryAcquire(pipelineTaskMessageBytes(message))
 	if err != nil {
 		return errors.Wrap(errStoragePipelineResource, err.Error())
 	}
@@ -450,7 +530,7 @@ func (e *Engine) queuePipelineApply(message *raftpb.Message) error {
 	for i, entry := range message.Entries {
 		task.inputs[i] = e.prepareNormalApply(*entry, false)
 	}
-	task.work = storageWork{token: task, retainedBytes: pipelineMessageBytes(message), run: func() (any, error) {
+	task.work = storageWork{token: task, retainedBytes: pipelineTaskMessageBytes(message), run: func() (any, error) {
 		_, err := runStorageWork(func() (any, error) {
 			return nil, p.executePipelineApply(task)
 		})
@@ -533,6 +613,13 @@ func (e *Engine) completePipelineDisk(completion storageWorkCompletion) error {
 	if !ok || task == nil {
 		return errors.WithStack(errInvalidStorageWork)
 	}
+	if task.normalization != nil {
+		defer completion.Release()
+		defer task.retire()
+		p.diskOutstanding--
+		p.diskRetired = maxUint64(p.diskRetired, task.diskSequence)
+		return e.completePipelineNormalization(task.normalization, completion.err)
+	}
 	if task.snapshotPlan != nil {
 		defer completion.Release()
 		return e.completePipelineSnapshotDisk(task, completion.err)
@@ -562,6 +649,9 @@ func (e *Engine) publishPipelineAppend(task *pipelineTask, err error) error {
 	}
 	message := task.message
 	// MemoryStorage publication is owner-only and follows real Save/Sync.
+	if err := e.pipelineMemoryStorageMutable(); err != nil {
+		return err
+	}
 	if err := e.storage.Append(message.Entries); err != nil {
 		return errors.WithStack(err)
 	}
@@ -637,6 +727,9 @@ func (e *Engine) stepPipelineOwner(message *raftpb.Message) error {
 // resulting self responses have drained. No owner-side durable FSM call occurs.
 func (e *Engine) startupPipeline() error {
 	p := e.storagePipeline
+	if p.recoveryNormalization != nil {
+		return nil
+	}
 	if !p.campaignChecked {
 		p.campaignChecked = true
 		if e.rawNode.BasicStatus().RaftState != etcdraft.StateLeader && e.shouldCampaignSingleNode() {
@@ -737,17 +830,23 @@ func (p *engineStoragePipeline) stopActorsOnFailure() {
 func (p *engineStoragePipeline) updateAdmission() {
 	diskBytes, diskItems := p.diskBulk.usage()
 	applyBytes, applyItems := p.applyBudget.usage()
-	p.bulkPaused.Store(p.quiescing || !p.started || len(p.diskDeferred) > 0 || len(p.applyDeferred) > 0 ||
+	debtBytes, debtItems := p.bulkOwnership.debt()
+	p.bulkPaused.Store(p.quiescing || !p.started || debtBytes != 0 || debtItems != 0 || len(p.diskDeferred) > 0 || len(p.applyDeferred) > 0 ||
 		diskBytes > pipelineBulkBytes-pipelineEntryRoom || applyBytes > pipelineBulkBytes-pipelineEntryRoom ||
 		diskItems >= pipelineBulkItems-1 || applyItems >= pipelineBulkItems-1)
 }
 
 func (p *engineStoragePipeline) retireIngress() {
+	p.retireFailedIngress()
+	for i := range p.deferredSnapshots {
+		p.deferredSnapshots[i].release()
+	}
+	p.deferredSnapshots = nil
 	for _, ch := range []chan pipelineIngress{p.bulk, p.priority} {
 		for {
 			select {
 			case input := <-ch:
-				input.permit.Release()
+				input.release()
 			default:
 				goto next
 			}
@@ -756,11 +855,24 @@ func (p *engineStoragePipeline) retireIngress() {
 	}
 }
 
+func (p *engineStoragePipeline) retireFailedIngress() {
+	for _, input := range p.failedIngress {
+		// Only after joins/RawNode disposal: even a transferred ReadIndex
+		// message header no longer has an upstream reader at this boundary.
+		input.message = raftpb.Message{}
+		input.release()
+	}
+	p.failedIngress = nil
+}
+
 // runStoragePipeline never calls Advance, fail, shutdown or a synchronous
 // snapshot helper. The outer Engine.run owns doneCh. Even on fatal shutdown,
 // storage is not closed until both actors deliver all actual completions.
 func (e *Engine) runStoragePipeline() {
 	p := e.storagePipeline
+	if p.snapshotView == nil {
+		e.beginPipelineShutdown(errors.Wrap(errInvalidStorageWork, "async snapshot storage view required"))
+	}
 	p.applyCursor = e.applied
 	e.initPipelineSnapshotFiles()
 	ticker := time.NewTicker(e.tickInterval)
@@ -804,10 +916,40 @@ func (e *Engine) preparePipelineTurn() (bool, error) {
 	if e.isClosing() && !p.quiescing {
 		e.beginPipelineShutdown(nil)
 	}
+	if err := e.queuePipelineRecoveryNormalization(); err != nil {
+		return false, err
+	}
 	if err := e.foldPipelineReady(); err != nil {
 		return false, err
 	}
-	return e.progressPipelineActors()
+	if !p.quiescing {
+		e.retirePipelineReadOwnership()
+	}
+	again, err := e.progressPipelineActors()
+	if err != nil || again {
+		return again, err
+	}
+	p.updateAdmission()
+	return e.consumeDeferredPipelineSnapshot()
+}
+
+func (e *Engine) queuePipelineRecoveryNormalization() error {
+	p := e.storagePipeline
+	if p.quiescing || p.recoveryNormalization == nil || p.recoveryNormalization.queued {
+		return nil
+	}
+	return e.queuePipelineNormalization(p.recoveryNormalization)
+}
+
+func (e *Engine) consumeDeferredPipelineSnapshot() (bool, error) {
+	p := e.storagePipeline
+	if !p.bulkPaused.Load() && p.receiving == nil && p.normalizingReceived == nil && len(p.deferredSnapshots) > 0 {
+		input := p.deferredSnapshots[0]
+		p.deferredSnapshots[0] = pipelineIngress{}
+		p.deferredSnapshots = p.deferredSnapshots[1:]
+		return true, e.consumePipelineIngress(input)
+	}
+	return false, nil
 }
 
 func (e *Engine) progressPipelineActors() (bool, error) {
@@ -842,13 +984,20 @@ func (e *Engine) finishStoragePipeline() {
 	<-p.disk.done
 	<-p.apply.done
 	e.rawNode = nil
-	e.retirePipelineSnapshotPins()
-	p.retireConfigurationHistory()
-	e.snapshotConfigurations = snapshotConfigurationHistory{}
-	p.configuration = nil
 	p.failedReady = nil
 	p.failedReadyPermit.Release()
 	p.failedReadyPermit = nil
+	p.retireFailedIngress()
+	if p.snapshotView != nil {
+		p.snapshotView.close()
+	}
+	e.retirePipelineNormalizations()
+	p.retireReadyReads()
+	e.retirePipelineReadOwnership()
+	e.retirePipelineSnapshotPins()
+	e.snapshotConfigurations = snapshotConfigurationHistory{}
+	p.retireConfigurationHistory()
+	p.configuration = nil
 	p.ledger.discard()
 	p.retireIngress()
 	e.finishShutdown(e.currentErrorOrClosed())
@@ -914,7 +1063,7 @@ func (e *Engine) handlePipelineAdmin() {
 		if e.configurationTransition.Load() {
 			request.done <- adminResult{err: errors.WithStack(errMembershipConfChangePending)}
 		} else {
-			e.handleAdmin(request)
+			e.admitPipelineAdmin(request)
 		}
 	default:
 	}
@@ -971,11 +1120,20 @@ func (e *Engine) handlePipelineRead(request readRequest) {
 		request.done <- readResult{err: failure}
 		return
 	}
-	e.handleRead(request)
+	e.admitPipelineRead(request)
 }
 
 func (e *Engine) consumePipelineIngress(input pipelineIngress) error {
-	defer input.permit.Release()
+	p := e.storagePipeline
+	debtBytes, debtItems := p.bulkOwnership.debt()
+	if input.message.GetType() == raftpb.MsgSnap && (debtBytes != 0 || debtItems != 0 || p.receiving != nil || p.normalizingReceived != nil) && !p.quiescing {
+		// Already accepted snapshots keep their ingress permit/lease. Move no
+		// payload and leave the priority lane available for heartbeat/vote.
+		p.deferredSnapshots = append(p.deferredSnapshots, input)
+		return nil
+	}
+	e.retainPipelineNetworkRead(&input)
+	defer p.finishPipelineIngress(&input)
 	if err := e.storagePipeline.firstFailure(nil); err != nil {
 		return err
 	}
@@ -990,4 +1148,15 @@ func (e *Engine) consumePipelineIngress(input pipelineIngress) error {
 	}
 	// Transfer ownership to emitted work/unstable before ingress retirement.
 	return e.foldPipelineReady()
+}
+
+func (p *engineStoragePipeline) finishPipelineIngress(input *pipelineIngress) {
+	if p.failedReady != nil {
+		// RawNode has accepted this input but output reservation/routing failed.
+		// Keep its existing reservation until real joins and RawNode disposal,
+		// even when the failed Ready has no newly acquired permit of its own.
+		p.failedIngress = append(p.failedIngress, input)
+		return
+	}
+	input.release()
 }

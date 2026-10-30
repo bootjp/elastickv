@@ -256,13 +256,14 @@ type Snapshot = raftengine.Snapshot
 type StateMachine = raftengine.StateMachine
 
 type OpenConfig struct {
-	NodeID        uint64
-	LocalID       string
-	LocalAddress  string
-	DataDir       string
-	Peers         []Peer
-	BootstrapSeed []Peer
-	Bootstrap     bool
+	asyncSnapshotView *pipelineSnapshotStorageView
+	NodeID            uint64
+	LocalID           string
+	LocalAddress      string
+	DataDir           string
+	Peers             []Peer
+	BootstrapSeed     []Peer
+	Bootstrap         bool
 	// JoinAsLearner mirrors raftengine.FactoryConfig.JoinAsLearner. The
 	// engine watches every post-apply ConfState and emits an
 	// ERROR-level alarm whenever the local node is in Voters while
@@ -1004,6 +1005,9 @@ func newRawNode(cfg OpenConfig, storage *etcdraft.MemoryStorage, applied uint64)
 }
 
 func newStorageRawNode(cfg OpenConfig, storage *etcdraft.MemoryStorage, applied uint64) (*etcdraft.RawNode, error) {
+	if err := validatePipelineRecoveredStorage(storage); err != nil {
+		return nil, err
+	}
 	return newRawNodeWithStorageMode(cfg, storage, applied, true)
 }
 
@@ -1024,6 +1028,13 @@ func newRawNodeWithStorageMode(cfg OpenConfig, storage *etcdraft.MemoryStorage, 
 		AsyncStorageWrites:        asynchronous,
 	}
 	if asynchronous {
+		if cfg.asyncSnapshotView != nil {
+			config.Storage = cfg.asyncSnapshotView
+		}
+		// A committed batch has its own bound. Upstream still returns the first
+		// entry when it exceeds this target, preserving maximum-size commands.
+		// This does NOT bound append Ready work; admission bounds that input.
+		config.MaxCommittedSizePerReady = pipelineCommittedBatchBytes
 		config.MaxUncommittedEntriesSize = pipelineUncommittedBytes
 		config.MaxInflightBytes = pipelineEntryRoom
 	}
@@ -3862,7 +3873,7 @@ func (e *Engine) refreshStatus() {
 	e.mu.RUnlock()
 	basic := e.rawNode.BasicStatus()
 	lastLogIndex, _ := e.storage.LastIndex()
-	snapshot, _ := e.storage.Snapshot()
+	lastSnapshotIndex, _ := e.storedSnapshotIndex()
 	config := e.currentConfiguration()
 
 	state := translateState(basic.RaftState)
@@ -3875,7 +3886,7 @@ func (e *Engine) refreshStatus() {
 		CommitIndex:        basic.GetCommit(),
 		AppliedIndex:       e.applied,
 		LastLogIndex:       lastLogIndex,
-		LastSnapshotIndex:  snapshot.GetMetadata().GetIndex(),
+		LastSnapshotIndex:  lastSnapshotIndex,
 		FSMPending:         pendingEntries(basic.GetCommit(), e.applied),
 		NumPeers:           numRemoteServers(config.Servers, e.localID),
 		LastContact:        lastContactFor(state, basic.Lead, e.lastLeaderContactFrom, e.lastLeaderContactAt),

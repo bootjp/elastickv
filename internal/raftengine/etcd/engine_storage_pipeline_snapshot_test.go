@@ -22,6 +22,10 @@ func TestEnginePipelineNativeSnapshotIsOrderedWork(t *testing.T) {
 	require.NoError(t, e.stepPipelineOwner(&message))
 	require.NoError(t, e.foldPipelineReady())
 	require.NoError(t, e.storagePipeline.flush())
+	// Inline ingress is normalized by the actual FIFO disk actor before the
+	// ordered restore handshake may inspect or install its token.
+	require.NoError(t, e.completePipelineDisk(awaitOwnedPipelineCompletion(t, e.storagePipeline.disk)))
+	require.NoError(t, e.storagePipeline.flush())
 	completion := awaitOwnedPipelineCompletion(t, e.storagePipeline.apply)
 	request, ok := completion.token.(*pipelineSnapshotRequest)
 	require.True(t, ok)

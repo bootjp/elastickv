@@ -6,7 +6,6 @@ import (
 	"github.com/cockroachdb/errors"
 	etcdraft "go.etcd.io/raft/v3"
 	raftpb "go.etcd.io/raft/v3/raftpb"
-	"google.golang.org/protobuf/proto"
 )
 
 var (
@@ -21,7 +20,7 @@ type asyncUnstableEntry struct {
 // asyncUnstableLedger is an owner-only shadow of raft v3.7.0 unstable entries.
 // Fold every mutation's Ready before the next mutation or storage completion.
 // It retains metadata, not entry/message pointers or payload copies. All entry
-// protobuf bytes and one item per entry remain charged for the entire nonempty
+// backing capacity and one item per append generation remain charged for the entire nonempty
 // epoch, including displaced suffixes and logically stable prefixes: upstream
 // log_unstable.go stableTo/shrinkEntriesArray can retain their backing array.
 // Append actor references MUST have separate reservations and retirement.
@@ -31,6 +30,7 @@ type asyncUnstableLedger struct {
 	entries       []asyncUnstableEntry
 	retainedBytes uint64
 	retainedItems int
+	permits       []*storageWorkPermit
 }
 
 func newAsyncUnstableLedger(budget *storageWorkBudget) *asyncUnstableLedger {
@@ -83,11 +83,11 @@ func asyncUnstableEntryBytes(entries []*raftpb.Entry) (uint64, error) {
 			(i > 0 && (previous == math.MaxUint64 || entry.GetIndex() != previous+1)) {
 			return 0, errors.WithStack(errInvalidAsyncUnstable)
 		}
-		size := proto.Size(entry)
-		if size < 0 || uint64(size) > math.MaxUint64-bytes {
+		size := pipelineOwnedEntryBytes(entry)
+		if size > math.MaxUint64-bytes {
 			return 0, errors.WithStack(errStorageWorkInvalidReservation)
 		}
-		bytes += uint64(size)
+		bytes += size
 		previous = entry.GetIndex()
 	}
 	return bytes, nil
@@ -115,19 +115,19 @@ func (l *asyncUnstableLedger) prefixToKeep(entries []*raftpb.Entry) (int, error)
 // Preflight uses subtraction so neither counters nor shadow need rollback on
 // failure, and competing budget users cannot observe a partial reservation.
 func (l *asyncUnstableLedger) reserve(bytes uint64, items int) error {
-	b := l.budget
-	if b == nil || b.maxBytes == 0 || b.maxItems <= 0 || bytes > b.maxBytes {
-		return errors.WithStack(errStorageWorkInvalidReservation)
+	if items == 0 {
+		return nil
 	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if items > b.maxItems-b.usedItems || bytes > b.maxBytes-b.usedBytes {
-		return errors.WithStack(errStorageWorkBackpressure)
+	// One append generation is one outstanding work item, not one item per
+	// entry. Entry objects, pointer capacity and shadow descriptors are bytes.
+	bytes = pipelineAddBytes(bytes, pipelineArrayBytes(items, pipelinePointerBytes))
+	permit, err := l.budget.tryAcquire(bytes)
+	if err != nil {
+		return err
 	}
-	b.usedBytes += bytes
-	b.usedItems += items
+	l.permits = append(l.permits, permit)
 	l.retainedBytes += bytes
-	l.retainedItems += items
+	l.retainedItems++
 	return nil
 }
 
@@ -178,12 +178,11 @@ func (l *asyncUnstableLedger) discard() {
 
 func (l *asyncUnstableLedger) releaseEpoch() {
 	if l.retainedItems != 0 {
-		b := l.budget
-		b.mu.Lock()
-		b.usedBytes -= l.retainedBytes
-		b.usedItems -= l.retainedItems
-		b.mu.Unlock()
+		for _, permit := range l.permits {
+			permit.Release()
+		}
 	}
 	l.entries = nil
 	l.retainedBytes, l.retainedItems = 0, 0
+	l.permits = nil
 }

@@ -843,3 +843,292 @@ whole-KV race passes (105.064s), native SIGKILL/reopen race20 passes (26.798s),
 and full lint reports zero issues. That test-only correction is now included
 in this branch's main merge, so new composed-source checks can qualify the
 actual latest source rather than a lucky rerun of the old fault boundary.
+
+### Physical ownership/debt candidate: not an activation receipt
+
+The explicit internal runtime now connects proposal/transport ingress, unstable
+generations, append/apply tasks, snapshots and configuration history to bounded
+reservation roots. The bulk root has normal allowance B = 512 MiB / 128 work
+items and one shared emergency allowance of 512 MiB / 7 work items. This is a
+single root allowance, not a new allowance granted to each Ready. Debt closes
+new bulk proposal/transport admission and local checkpoint capture. Accepted
+snapshots wait with their ingress permit and receive lease; priority traffic and
+real actor completions remain pumpable. Impossible owner routing fails terminally
+with the accepted Ready retained through actual actor join; it does not drop
+opaque responses or fabricate successful completion.
+
+The control root remains 8 MiB / 256 work items. Outbound clones deliberately
+retain their independently reviewed budgets: 512 MiB / 128 bulk work items and
+8 MiB / 256 control work items. StoragePipelineUsage reports these separately
+and reports ReservedBytes/ReservedWork across all four roots. The configured
+reservation ceiling is therefore 1552 MiB / 775 work items, not 1024 MiB for the
+"total pipeline". Component counters are sampled under their respective locks,
+not as one atomic heap census. Queue occupancy permits do not duplicate payload
+ownership: the task's owner permit spans deferred, queued, executing and
+unconsumed-completion states. Durable MemoryStorage/FSM data, transport codecs,
+OS buffers, GC/allocator overhead and pre-reservation upstream allocations are
+not claimed to be covered by this counter ceiling.
+
+Ownership paths and actual retirement boundaries are:
+
+- Proposal: reserve before caller payload copy/envelope/Propose; the resulting
+  unstable ledger and emitted task reservations outlive the ingress reservation.
+- Transport: reserve the complete clone projection before cloning/Step; transfer
+  accepted snapshot leases and network ReadIndex permits rather than releasing
+  them at queue removal. ReadIndex cancellation alone cannot release RawNode's
+  retained context. Raft v3.7's pre-current-term-commit pending queue survives
+  term/leader reset. Those permits survive too. A genuine current-term commit
+  rebinds them to the new readOnly epoch before routing its Ready; only actual
+  ReadState/response routing, a subsequent readOnly reset, or RawNode disposal
+  retires them. Remote read permits wait until the entire Ready is routed.
+- Unstable: retain backing capacity, unknown fields and one item per append
+  generation, not per entry. Displaced suffixes and stable prefixes remain
+  conservatively charged until the actual upstream epoch drains or RawNode is
+  disposed. Append actor borrows have independent reservations.
+- Append/apply: compact borrowed pointer arrays before retaining tasks; preserve
+  task/receipt ownership through the real FIFO completion, owner publication and
+  routing of the original opaque responses. Actor queue permits retire only at
+  actual completion consumption.
+- Configuration/snapshot: plans retain their own permits and exact ConfState,
+  peer inventory, file/history pins and receive lease through the handshake's
+  actual final disk/apply stage. Received-snapshot replacement resets the
+  unstable base only after RawNode actually replaces it. Close/failure joins
+  actors before disposing RawNode and releasing remaining pins/owners.
+- Outbound: reserve before clone; queue removal, RPC return and pending reliable
+  snapshot reports are not retirement. Close follows the worker's actual final
+  use. The existing replacement-before-release and peer-removal/drain contracts
+  remain unchanged.
+
+**The proposed generic numerical Ready bound is still not proved.** The earlier
+bill charged a separate Entry descriptor per remote message, even though pinned
+Raft v3.7.0 `log.go:slice` and `storage.go:Entries` return shared Entry pointers
+and, for pure stable/unstable ranges, the same pointer array. That bill failed
+both one-voter/40-learner/65,536-entry and three-voter/57-learner/40,000-entry
+success-asserting native regressions. Both are now maintained in the repository.
+
+Ready accounting now visits actual Entry/message identities once and charges
+each identical-start pointer array's largest exposed capacity. Different-start
+overlaps, snapshots and distinct-object byte-slice aliases remain conservatively
+charged separately; payload and unknown-field backing capacity are not omitted.
+The walk stops when the Ready cannot fit, bounding its temporary identity maps.
+It includes ReadStates and contexts, not just local append/apply messages.
+Ready retains its own permit throughout routing; each local task/ledger acquires
+its independent permit before takeover, while every actual outbound deep clone
+still reserves its independent budget before copying. Clearing the successful
+Ready precedes release. A failed Ready remains retained until real actor join.
+
+The maintained fan-out cases include 63.5 MiB with forty real learner RawNodes.
+Their initial protocol exchange and local response provenance use actual
+volatile MemoryStorage publication, not fabricated ACKs. Outbound consumers are
+then held at the real dispatch clone/enqueue boundary: admitted clones retain
+their permits after Ready retirement, existing outbound congestion/retry policy
+is unchanged, and clone retirement cannot retire local append/unstable owners.
+These witnesses qualify actual Ready shape/routing and ownership, not durable
+catch-up of forty learners. The separate native three-voter WAL/quorum/FSM large
+value, held-Sync and snapshot/reopen tests remain required.
+
+The read-lifetime regression uses actual three-voter elections, CheckQuorum
+expiry and three canceled local plus three network reads across terms. All six
+reservations survive the native pending queue, then survive its transfer to a
+new-term readOnly queue with heartbeat responses withheld. Only the subsequent
+real read-quorum responses retire them. Term reset is not treated as proof that
+pendingReadIndexMessages died. The current-commit proof uses the owner unstable
+shadow first (it may replace an older durable entry), then MemoryStorage.Term;
+no actor or upstream-private-field reads are used in production.
+
+The previous conditional 3A + 4H + M / 7U + 8 MiB argument was not an upstream
+bound and is not an activation receipt. In particular, `log.go:slice` allocates
+an extended pointer array for a mixed stable/unstable range, and `stepLeader`
+can repeatedly call `maybeSendAppend` after one MsgAppResp. Unlike pure-range
+fan-out, these can be distinct arrays. Membership, configured inflights and
+actual mixed-range entry counts need a pre-mutation resource contract; a fixed
+8-MiB remainder or topology alone is not a proof. No business payload target,
+election timeout, B, R or accepted configuration size was reduced to pass tests.
+Snapshot restore/Snapshot clones, startup/WAL first-entry bounds, configuration
+decode expansion and allocation before reservation also remain numerical gates.
+No maximum topology or special storage provenance is silently assumed. A full
+physical B+R theorem, all-shape routing acceptance and production activation
+remain open pending those bounds and independent review of the new source.
+
+#### Follow-up: enforced preflights and an actual snapshot obstruction
+
+A second native success regression covers 600,000 recovered stable one-byte
+commands, three voters, MaxSizePerMsg=1 MiB and MaxInflightMsgs=1024. One genuine
+follower ACK at index 53,255 previously caused the 11-message Ready walk to stop
+above R (536,871,304 bytes). Existing stable objects were charged as new owners.
+The fixed owner captures the exact MemoryStorage Entry range before Ready and
+compares BOTH Entry identity and pointer-array cell identity, not just equal
+index/term/data. Only base-owned objects/arrays borrowed by the non-yielding
+Ready walk are excluded. Different concat arrays remain independently charged.
+
+Every pipeline MemoryStorage Append/CreateSnapshot/Compact/ApplySnapshot path
+now checks that no accepted Ready borrow is live. Successful routing clears the
+Ready before releasing its permit. Failure retains it, and the mutation checks
+also prohibit invalidating that base during failure/join. Actor tasks detach
+pointer arrays and reserve full retained Entry/data before handoff, even when
+the source was stable. Thus task payload/array retention AFTER compaction is
+still charged; durable MemoryStorage's exclusion does not extend to such new
+last references. The maintained exact-identity/compaction/takeover control and
+the genuine 600,000-command catch-up success assertion exercise these boundaries.
+
+Additional enforced guards, without changing B/R/C or business-entry size:
+
+- Received snapshot front reserves the complete projected message clone AND
+  snapshot clone before either clone. Rejected input cannot allocate the full
+  payload first. Caller-owned backing is not silently adopted.
+- Configuration wire is scanned with protowire before Unmarshal. Context and
+  unknown byte expansion, repeated change descriptors, prospective joint-member
+  records, temporary shallow Progress/maps and peer inventory are reserved before
+  native ApplyConfChange. The four-Entry-allowance per member is a conservative
+  control projection, not a theorem about arbitrary runtime allocator overhead.
+  Changer.checkAndCopy shares existing inflight buffers rather than cloning them.
+  The actual decoded plan is checked against that reservation. Existing uint16
+  context fields at their maximum size remain accepted by the projection.
+  Public ingress additionally reserves the peak proposal-decode projection
+  before clone/Step, since RawNode.stepLeader itself unmarshals configuration
+  proposals. Queue rejection/drain and completed owner consumption retire it;
+  local admin proposal reserves the same bounded temporary decode headroom.
+- Initial and received ConfState expansion has a resource-derived projection
+  check against C before NewRawNode or snapshot cloning. Recovery scans borrowed
+  entries before NewRawNode and rejects an individual retained Entry backing
+  above U=72 MiB, including unknown capacity/metadata. The 64-MiB command plus
+  1-KiB envelope remains accepted. This per-entry check is not a bound on the
+  union of stable catch-up entries or mixed-array fan-out.
+
+An input whose Ready has already been accepted but cannot be reserved/routed
+keeps its original ingress reservation until actual joins and RawNode disposal.
+This does not pretend to charge an oversized newly generated output, but avoids
+releasing the already owned source while failed Ready still borrows it. Network
+ReadIndex transfers its exact message HEADER as well as its permit: normal
+ingress cleanup must not zero that header while pending/readOnly retains it.
+Fatal cleanup clears failed Ready and failed-input headers only after disposal,
+before retiring transferred read owners. Native read/config and join regressions
+cover this distinction; a cleanup-zeroing regression was reproduced and fixed
+without suppressing the original assertions.
+
+**Generic R still has a concrete, independent-clone obstruction.** A private
+native witness bootstraps one voter and nine real learners to a genuine stable
+prefix, loses subsequent append packets without fabricating any ACK, and
+publishes/applies a normal 63.5-MiB command locally. It serializes the actual FSM
+snapshot using the supported inline path, installs/compacts that snapshot, and
+reports the delayed transport failures. The next tiny admitted proposal calls
+bcastAppend. Pinned MemoryStorage.Snapshot deep-clones the inline body separately
+for all nine lagging learners BEFORE Ready reservation. Actual distinct Data
+backings have capacity 599,334,912 bytes, exceeding R=536,870,912 by themselves.
+This is new pipeline-held memory, not the original stable/FSM storage and not
+the old duplicate Entry bill. The preserved success assertion fails terminally.
+The witness uses volatile MemoryStorage/FSM publication, not a WAL durability,
+encrypted cutover, or complete-heap measurement claim.
+
+The existing APIs do not supply pre-clone snapshot size/provenance:
+MemoryStorage.InitialState exposes ConfState but not snapshot Data, while
+MemoryStorage.Snapshot performs the clone before returning. Snapshot.WriteTo
+also supplies no pre-capture resident/pin-memory bound. Inspecting a clone after
+it was allocated, dropping the accepted Ready, or excluding its new last
+references cannot fix this pre-mutation contract.
+
+Minimal compatible directions, requiring an explicit next handshake contract:
+
+1. Normalize every local/received/recovered inline snapshot to the existing
+   verified file/token format on the FIFO disk actor BEFORE installing it in
+   the RawNode storage view. Seed owner-visible bounded descriptor metadata at
+   bootstrap as well as publication; do not first discover it through a clone.
+   This needs no new on-disk format or lower business payload limit, but must
+   preserve retained-pair recovery and save/restore/publication ordering.
+2. Alternatively supply an owner-seeded snapshot resident/clone bound and reserve
+   total per-mutation fan-out before Step, with a typed retry/admission result
+   before accepting work that cannot fit. An arbitrary Snapshot implementation
+   additionally needs a resident/pin-size capability; its output-byte count alone
+   cannot bound memory retained by its captured export handle.
+
+Mixed stable/unstable concat still requires an owner-side prospective array
+projection (actual stable/unstable boundary, entry counts, peer progress and
+effective message/inflight settings) before Step/Propose/config mutation. Pure
+borrowed stable ranges now have an exact base lifetime rule; newly allocated
+concat arrays do not inherit that exclusion. This too has a concrete native
+witness: one real voter plus 104 real learners, ten admitted 65,536-command
+batches with original local append/apply responses after volatile publication,
+remote packet loss, and delayed ReportUnreachable. Every drained prefix Ready
+fits the old routing bill. The next tiny admitted proposal joins the 655,360
+stable commands to one unstable command for every learner. Pinned util.go:extend
+allocates each mixed range separately: 104 distinct arrays, each capacity
+655,361, total pointer cells 545,260,352 bytes > R=536,870,912, before charging
+any Entry objects or payloads. The unchanged success assertion fails. The
+non-race 90-second run reaches the boundary in 6.539s; the race run times out
+during prefix preparation at 90.658s and is NOT counted as race evidence of the
+final allocation. The payloads, prefix assertions and deadline were unchanged.
+
+The minimal mixed-range repair needs owner preflight of that prospective output
+union, not an input-byte guard. When it cannot fit, a typed rejection/retry must
+precede mutation/acceptance (including the network owner-admission handshake),
+while ordinary catch-up control/completions remain pumpable. Descriptor-aware
+upstream batching is another option, preserving the first-large-command rule;
+silently truncating emitted messages or cloning them before checking is not.
+Snapshot normalization and this headroom contract, not a larger R or smaller
+successful payload, are the next required changes. No full generic R or
+production activation receipt is issued.
+
+### Inline Snapshot Normalization Candidate
+
+The explicit async runtime now seeds an owner-only Storage facade from the
+selected snapshot before starting its owner. The facade fences Snapshot until
+the FIFO disk actor verifies an existing token or normalizes a legacy inline
+snapshot into the existing FSM file/footer/token representation. Recovery reads
+the existing native Raft snapshot file as a stream: it verifies the CRC32C of
+the entire inner protobuf, checks the selected index/term/full ConfState and
+unknown metadata, and copies only its body into the verified FSM file. Native
+EnsureSnapshot scalar defaults are canonicalized for comparison; unknown fields
+and all joint-configuration fields remain significant. Zero CRC rejection is
+the same as the native snapshot reader. No new disk format is introduced.
+
+For recovered inline snapshots the durable FSM file precedes SaveSnap of its
+token. Only the actual disk completion lets the owner replace MemoryStorage
+with the same snapshot tuple, HardState and retained entry tail. Already-token
+recovery verifies the file without rewriting SaveSnap. Local/configuration
+checkpoints always serialize to that existing file form. Received inline data
+is normalized before native Step; the original ordered restore, SaveSnap/WAL,
+durable-index, MemoryStorage publication and opaque-response handshakes remain
+in force. A native stale snapshot follows native rejection/current-prefix
+handling without writing over an existing same-index file.
+
+Public snapshot admission validates ConfState expansion AND the descriptor's
+unknown/metadata projection before ownership cloning or enqueue acceptance.
+Configuration entry ingress reserves its bounded standard-decoder expansion
+before validating V1/V2 nested protobuf grammar; malformed nested Single data
+therefore cannot reach native stepLeader's panic. Maximum context field values
+and the 64-MiB command plus envelope controls remain enabled.
+
+Before each real MemoryStorage.Snapshot clone the facade reserves its token,
+full configuration and unknown descriptor projection. Clones stay charged until
+the accepted Ready is successfully routed to independently reserved tasks or
+outbound clones. Failure keeps those permits until actual actor joins and
+RawNode disposal. Normalization source/scratch reservations and file pins are
+similarly retired only after actual completion or joins. Index-only owner
+queries, including Status refresh, no longer clone inline snapshot bodies.
+Received publication reserves the new independently cloned configuration-history
+base before replacing/releasing the old history; its reservation lasts beyond
+the receive plan and is released after the history's actual last reference.
+
+The maintained nine-learner/63.5-MiB witness preserves the original proposal,
+native local responses, lost packets, deadline and final success assertion.
+It now runs real FIFO normalization before installation, verifies the actual
+file's restored FSM contents, and requires all nine native snapshot sends.
+Additional native controls cover selected Raft file CRC/metadata, retained WAL
+tail clean reopen, public inline three-voter catch-up with held Restore and
+no early opaque ACK, and the existing encrypted large-quorum snapshot/restart
+path. Clean reopen is not crash/rotation/cutover certification.
+
+This fixes the independent large-body snapshot-clone witness, NOT generic R or
+the FSM capture-memory gate. The existing Snapshot capability still has no
+pre-capture resident/pin bound. The memory store returns an immutable temp-file
+handle, while native Pebble's WriteTo creates an iterator that may pin live
+memtables/read state until serialization returns; SST export additionally owns
+checkpoint/fallback state. Neither encoded output size nor a constant handle
+metadata bill bounds that retention or capture's transient memory. A truthful
+native capability must separately guarantee capture peak, retained state and
+serialization pin/working memory, atomically with the captured read point,
+before the engine can reserve and later release it at real Close/join. No such
+store/FSM capability is claimed by this etcd-only change. It requires an
+explicit lower-layer implementation, not an assumed zero or arbitrary fixed
+cap. Mixed stable/unstable output union and topology/descriptor headroom remain
+separate unresolved admission gates. B/R/C and production Open are unchanged.

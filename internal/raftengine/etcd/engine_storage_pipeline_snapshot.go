@@ -75,6 +75,20 @@ func validatePipelineSnapshotIngress(message *raftpb.Message) error {
 			return errors.WithStack(ErrFSMSnapshotTokenInvalid)
 		}
 	}
+	return validatePipelineSnapshotDescriptor(snapshot)
+}
+
+func validatePipelineSnapshotDescriptor(snapshot *raftpb.Snapshot) error {
+	if err := validatePipelineConfigurationState(snapshot.GetMetadata().GetConfState()); err != nil {
+		return err
+	}
+	metadata, err := pipelineNormalizationMetadata(snapshot)
+	if err != nil {
+		return err
+	}
+	if pipelineSnapshotAccounting(&metadata, true) > pipelineControlBytes {
+		return errors.WithStack(errStorageWorkInvalidReservation)
+	}
 	return nil
 }
 
@@ -87,7 +101,12 @@ func (e *Engine) newPipelineSnapshotPlanWithLease(message *raftpb.Message, lease
 	e.initPipelineSnapshotFiles()
 	size := uint64(pipelineTaskOverhead)
 	if message != nil {
-		size += pipelineMessageBytes(message)
+		if err := validatePipelineSnapshotDescriptor(message.GetSnapshot()); err != nil {
+			return nil, err
+		}
+		// The receive front owns both its detached message and snapshot clone.
+		size = pipelineAddBytes(size, pipelineCloneMessageBytes(message))
+		size = pipelineAddBytes(size, pipelineSnapshotAccounting(message.Snapshot, true))
 	}
 	permit, err := p.snapshotBudget.tryAcquire(size)
 	if err != nil {
@@ -101,10 +120,12 @@ func (e *Engine) newPipelineSnapshotPlanWithLease(message *raftpb.Message, lease
 		}
 	}
 	plan := &pipelineSnapshotPlan{message: message, lease: lease, files: p.snapshotFiles, permits: []*storageWorkPermit{permit},
-		env: pipelineConfigurationEnvironment{fsm: e.fsm, dataDir: e.dataDir, fsmSnapDir: e.fsmSnapDir, maxWALFiles: e.maxWALFiles}}
+		env: pipelineSnapshotEnvironment(pipelineConfigurationEnvironment{fsm: e.fsm, dataDir: e.dataDir, fsmSnapDir: e.fsmSnapDir, maxWALFiles: e.maxWALFiles})}
 	p.snapshotPins[plan] = 0
 	if message != nil {
-		plan.snapshot = proto.CloneOf(message.Snapshot)
+		owned := cloneDispatchMessage(*message)
+		plan.message = &owned
+		plan.snapshot = proto.CloneOf(owned.Snapshot)
 		p.snapshotPins[plan] = plan.snapshot.GetMetadata().GetIndex()
 		plan.files.pin(plan.snapshot.GetMetadata().GetIndex())
 	}
@@ -125,11 +146,10 @@ func (e *Engine) maybeQueuePipelineCheckpoint() error {
 	if !p.canQueueCheckpoint(e.applied) {
 		return nil
 	}
-	snapshot, err := e.storage.Snapshot()
+	index, err := e.storedSnapshotIndex()
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	index := snapshot.GetMetadata().GetIndex()
 	if e.applied <= index || e.applied-index < e.snapshotThreshold() {
 		return nil
 	}
@@ -143,7 +163,8 @@ func (e *Engine) maybeQueuePipelineCheckpoint() error {
 }
 
 func (p *engineStoragePipeline) canQueueCheckpoint(applied uint64) bool {
-	return p.started && !p.quiescing && p.checkpoint == nil && p.receiving == nil && applied != 0 && p.checkpointAttempt != applied
+	bytes, work := p.bulkOwnership.debt()
+	return bytes == 0 && work == 0 && p.started && !p.quiescing && p.checkpoint == nil && p.receiving == nil && applied != 0 && p.checkpointAttempt != applied
 }
 
 func (e *Engine) queuePipelineSnapshotApply(plan *pipelineSnapshotPlan, stage pipelineSnapshotStage) error {
@@ -302,7 +323,7 @@ func pipelinePeerInventoryBytes(peers []Peer) uint64 {
 
 func (e *Engine) queuePipelineSnapshotDisk(plan *pipelineSnapshotPlan, stage pipelineSnapshotStage) error {
 	p := e.storagePipeline
-	size := pipelineConfigurationBytes(plan.snapshot)
+	size := pipelineAddBytes(pipelineTaskOverhead, pipelineConfigurationBytes(plan.snapshot))
 	permit, err := p.diskBulk.tryAcquire(size)
 	if err != nil {
 		return errors.Wrap(errStoragePipelineResource, "snapshot disk reservation")
@@ -374,8 +395,7 @@ func writePipelineCheckpoint(plan *pipelineSnapshotPlan) (err error) {
 		return err
 	}
 	if plan.env.fsmSnapDir == "" {
-		plan.snapshot.Data, err = snapshotBytes(plan.lease.snapshot, plan.env.dataDir)
-		return err
+		return errors.Wrap(errInvalidStorageWork, "async checkpoint requires file backing")
 	}
 	plan.files.mu.Lock()
 	defer plan.files.mu.Unlock()
@@ -437,17 +457,23 @@ func (e *Engine) completePipelineSnapshotDisk(task *pipelineTask, err error) err
 }
 
 func (e *Engine) publishPipelineCheckpoint(plan *pipelineSnapshotPlan) error {
+	if err := e.pipelineMemoryStorageMutable(); err != nil {
+		return err
+	}
 	snapshot := plan.snapshot
-	current, err := e.storage.Snapshot()
+	current, err := e.storedSnapshotIndex()
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	if current.GetMetadata().GetIndex() < snapshot.GetMetadata().GetIndex() {
+	if current < snapshot.GetMetadata().GetIndex() {
 		if _, err := e.storage.CreateSnapshot(snapshot.GetMetadata().GetIndex(), snapshot.GetMetadata().GetConfState(), snapshot.GetData()); err != nil {
 			return errors.WithStack(err)
 		}
 		if err := e.storage.Compact(snapshot.GetMetadata().GetIndex()); err != nil {
 			return errors.WithStack(err)
+		}
+		if e.storagePipeline.snapshotView != nil {
+			e.storagePipeline.snapshotView.publish(snapshot, false)
 		}
 	}
 	return e.queuePipelineSnapshotDisk(plan, pipelineCheckpointRelease)
@@ -455,21 +481,27 @@ func (e *Engine) publishPipelineCheckpoint(plan *pipelineSnapshotPlan) error {
 
 func (e *Engine) retirePipelineSnapshot(plan *pipelineSnapshotPlan) {
 	p := e.storagePipeline
+	permits, task, lease := plan.permits, plan.appendTask, plan.lease
 	if index := p.snapshotPins[plan]; index != 0 {
 		plan.files.unpin(index)
 	}
 	delete(p.snapshotPins, plan)
-	for _, permit := range plan.permits {
-		permit.Release()
+	if task != nil {
+		task.retire()
 	}
-	plan.permits = nil
-	if plan.appendTask != nil {
-		plan.appendTask.retire()
-		plan.appendTask = nil
-	}
-	p.snapshotResources.forget(plan.lease)
+	p.snapshotResources.forget(lease)
 	if p.checkpoint == plan {
 		p.checkpoint = nil
+	}
+	if p.receiving == plan {
+		p.receiving = nil
+	}
+	if p.normalizingReceived == plan {
+		p.normalizingReceived = nil
+	}
+	*plan = pipelineSnapshotPlan{}
+	for _, permit := range permits {
+		permit.Release()
 	}
 }
 

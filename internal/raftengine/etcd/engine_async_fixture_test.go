@@ -238,6 +238,9 @@ func newNativeStorageRuntime(t *testing.T, fsm *asyncStorageFSM, gate *asyncStor
 		// The explicit pipeline owns the disk writer. Starting the legacy
 		// snapshot worker here would create a second concurrent writer.
 		configure(e)
+		if e.storagePipeline != nil {
+			require.NoError(t, e.attachPipelineSnapshotView(prepared.cfg, &prepared.disk.LocalSnap))
+		}
 	}
 	e.initTransport(prepared.cfg)
 	if configure == nil {

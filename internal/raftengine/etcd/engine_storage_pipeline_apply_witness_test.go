@@ -1,6 +1,7 @@
 package etcd
 
 import (
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -46,6 +47,8 @@ func newOwnedPipelineApplyWitness(t *testing.T, fsm StateMachine) *Engine {
 		require.NoError(t, closePersist(e.persist))
 	})
 	e.nodeID, e.fsm, e.storage = 2, fsm, prepared.disk.Storage
+	e.dataDir = prepared.cfg.DataDir
+	e.fsmSnapDir = filepath.Join(e.dataDir, fsmSnapDirName)
 	e.applied = coldStartApplied(prepared.disk)
 	e.raftCutoverIndex = orInertCutover(nil)
 	e.pendingProposals = map[uint64]proposalRequest{}

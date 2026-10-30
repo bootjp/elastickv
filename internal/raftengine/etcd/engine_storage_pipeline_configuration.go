@@ -32,6 +32,7 @@ type pipelineConfigurationPlan struct {
 	term                     uint64
 	skipPersistence, capture bool
 	snapshotPlan             *pipelineSnapshotPlan
+	reservedBytes            uint64
 }
 
 type pipelineConfigurationRequest struct {
@@ -62,11 +63,31 @@ func (p *engineStoragePipeline) retireConfigurationHistory() {
 }
 
 func pipelineConfigurationBytes(message proto.Message) uint64 {
+	switch value := message.(type) {
+	case *raftpb.Snapshot:
+		return pipelineOwnedSnapshotBytes(value)
+	case *raftpb.ConfState:
+		return pipelineOwnedConfStateBytes(value)
+	case *raftpb.ConfChange:
+		return pipelineAddBytes(pipelineTaskOverhead, pipelineAddBytes(uint64(cap(value.Context)), uint64(cap(value.ProtoReflect().GetUnknown()))))
+	case *raftpb.ConfChangeV2:
+		bytes := pipelineAddBytes(pipelineTaskOverhead, pipelineAddBytes(uint64(cap(value.Context)), uint64(cap(value.ProtoReflect().GetUnknown()))))
+		bytes = pipelineAddBytes(bytes, pipelineArrayBytes(cap(value.Changes), pipelinePointerBytes))
+		for _, change := range value.Changes {
+			if change != nil {
+				bytes = pipelineAddBytes(bytes, pipelineAddBytes(pipelineTaskOverhead, uint64(cap(change.ProtoReflect().GetUnknown()))))
+			}
+		}
+		return bytes
+	default:
+	}
 	size := proto.Size(message)
 	if size < 0 {
 		return pipelineControlBytes + 1
 	}
-	return uint64(size) + pipelineTaskOverhead
+	// Decoded configuration records have no bulk byte slices; account optional
+	// fields, change descriptors and allocator rounding, including unknowns.
+	return pipelineAddBytes(pipelineArrayBytes(size, pipelinePhysicalEntryBytes), pipelineTaskOverhead)
 }
 
 func (e *Engine) recordPipelineConfiguration(plan configApplyPlan) error {
@@ -88,11 +109,10 @@ func (e *Engine) recordPipelineConfiguration(plan configApplyPlan) error {
 
 func (e *Engine) prunePipelineConfigurationHistory() error {
 	p := e.storagePipeline
-	snapshot, err := e.storage.Snapshot()
+	floor, err := e.storedSnapshotIndex()
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	floor := snapshot.GetMetadata().GetIndex()
 	for _, index := range p.snapshotPins {
 		if index < floor {
 			floor = index
@@ -225,8 +245,10 @@ func (e *Engine) handlePipelineConfiguration(request pipelineConfigurationReques
 }
 
 func (e *Engine) frontPipelineConfiguration(request pipelineConfigurationRequest) (*pipelineConfigurationPlan, error) {
-	plan := &pipelineConfigurationPlan{}
-	var err error
+	plan, err := e.reservePipelineConfiguration(request)
+	if err != nil {
+		return nil, err
+	}
 	switch request.entry.GetType() {
 	case raftpb.EntryConfChange:
 		plan.v1 = &raftpb.ConfChange{}
@@ -255,10 +277,23 @@ func (e *Engine) frontPipelineConfiguration(request pipelineConfigurationRequest
 	if err != nil {
 		return nil, err
 	}
-	return e.finishPipelineConfigurationPlan(request.task, plan)
+	return e.finishPipelineConfigurationPlan(plan)
 }
 
-func (e *Engine) finishPipelineConfigurationPlan(task *pipelineTask, plan *pipelineConfigurationPlan) (*pipelineConfigurationPlan, error) {
+func (e *Engine) reservePipelineConfiguration(request pipelineConfigurationRequest) (*pipelineConfigurationPlan, error) {
+	size, err := e.pipelineConfigurationPreflightBytes(request.entry)
+	if err != nil {
+		return nil, err
+	}
+	permit, err := e.storagePipeline.configurationBudget.tryAcquire(size)
+	if err != nil {
+		return nil, errors.Wrap(errStoragePipelineResource, "configuration preflight reservation")
+	}
+	request.task.configPermits = append(request.task.configPermits, permit)
+	return &pipelineConfigurationPlan{reservedBytes: size}, nil
+}
+
+func (e *Engine) finishPipelineConfigurationPlan(plan *pipelineConfigurationPlan) (*pipelineConfigurationPlan, error) {
 	size := pipelineConfigurationBytes(&plan.confState)
 	if plan.v1 != nil {
 		size += pipelineConfigurationBytes(plan.v1)
@@ -268,21 +303,20 @@ func (e *Engine) finishPipelineConfigurationPlan(task *pipelineTask, plan *pipel
 	for _, peer := range plan.peers {
 		size += uint64(len(peer.ID) + len(peer.Address) + pipelineEntryOverhead)
 	}
-	permit, err := e.storagePipeline.configurationBudget.tryAcquire(size)
-	if err != nil {
-		return nil, errors.Wrap(errStoragePipelineResource, "configuration plan reservation")
+	if size > plan.reservedBytes {
+		return nil, errors.Wrap(errStoragePipelineResource, "configuration preflight projection exceeded")
 	}
-	task.configPermits = append(task.configPermits, permit)
+	var err error
 	plan.term, err = e.storage.Term(plan.index)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	snapshot, err := e.storage.Snapshot()
+	snapshotIndex, err := e.storedSnapshotIndex()
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
 	plan.skipPersistence = e.currentConfigIndex() >= plan.index
-	plan.capture = plan.index >= e.applied && plan.index > snapshot.GetMetadata().GetIndex()
+	plan.capture = plan.index >= e.applied && plan.index > snapshotIndex
 	if plan.capture {
 		captured, err := e.newPipelineSnapshotPlan(nil)
 		if err != nil {
@@ -362,8 +396,15 @@ func (e *Engine) completePipelineConfigurationDisk(request *pipelineConfiguratio
 		err = failure
 	}
 	if err == nil && request.phase == pipelineConfigurationSave {
+		if err := e.pipelineMemoryStorageMutable(); err != nil {
+			request.reply <- pipelineConfigurationReply{err: err}
+			return err
+		}
 		snapshot := request.snapshot
 		_, err = e.storage.CreateSnapshot(snapshot.GetMetadata().GetIndex(), snapshot.GetMetadata().GetConfState(), snapshot.GetData())
+		if err == nil && e.storagePipeline.snapshotView != nil {
+			e.storagePipeline.snapshotView.publish(snapshot, false)
+		}
 	}
 	request.reply <- pipelineConfigurationReply{err: err}
 	return errors.WithStack(err)
