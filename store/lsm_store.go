@@ -733,11 +733,14 @@ func writeTempDBMetadata(db *pebble.DB, meta streamingMVCCRestoreMetadata) error
 	if err := stageSnapshotServingMetadata(batch, meta); err != nil {
 		return err
 	}
+	if err := stageSnapshotRaftControl(batch, meta.raftControl, meta.controlAppliedIndex); err != nil {
+		return err
+	}
 	return errors.WithStack(batch.Commit(pebble.Sync))
 }
 
 func isPebbleMetaKey(rawKey []byte) bool {
-	return bytes.Equal(rawKey, metaLastCommitTSBytes) ||
+	return IsRaftControlMetadataKey(rawKey) || bytes.Equal(rawKey, metaLastCommitTSBytes) ||
 		bytes.Equal(rawKey, metaMinRetainedTSBytes) ||
 		bytes.Equal(rawKey, metaPendingMinRetainedTSBytes) ||
 		bytes.Equal(rawKey, metaAppliedIndexBytes) ||
@@ -765,6 +768,9 @@ func couldBePebbleWriterRegistryKey(rawKey []byte) bool {
 var errMVCCMetadataKeyCollision = errors.New("store: mvcc encoded key collides with reserved pebble metadata key")
 
 func encodePebbleUserVersionKey(key []byte, commitTS uint64) ([]byte, error) {
+	if err := validateOrdinaryControlKey(key); err != nil {
+		return nil, err
+	}
 	encoded := encodeKey(key, commitTS)
 	if isPebbleMetaKey(encoded) {
 		return nil, errors.WithStack(errMVCCMetadataKeyCollision)
@@ -774,6 +780,28 @@ func encodePebbleUserVersionKey(key []byte, commitTS uint64) ([]byte, error) {
 
 func isPebbleOperationalKey(rawKey []byte) bool {
 	return isPebbleMetaKey(rawKey)
+}
+
+func skipPebbleMetadataForward(iter *pebble.Iterator) bool {
+	for iter.Valid() && isPebbleMetaKey(iter.Key()) {
+		if IsRaftControlMetadataKey(iter.Key()) {
+			iter.SeekGE(keyUpperBound([]byte(RaftControlMetadataPrefix)))
+		} else {
+			iter.Next()
+		}
+	}
+	return iter.Valid()
+}
+
+func skipPebbleMetadataReverse(iter *pebble.Iterator) bool {
+	for iter.Valid() && isPebbleMetaKey(iter.Key()) {
+		if IsRaftControlMetadataKey(iter.Key()) {
+			iter.SeekLT([]byte(RaftControlMetadataPrefix))
+		} else {
+			iter.Prev()
+		}
+	}
+	return iter.Valid()
 }
 
 // IsPebbleOperationalKey reports whether rawKey, as it appears in a native
@@ -823,7 +851,7 @@ func (s *pebbleStore) findMaxDataCommitTS() (uint64, error) {
 		if userKey == nil {
 			continue
 		}
-		if isLocalAuxiliaryMVCCKey(userKey) {
+		if isNonAdvertisedMVCCKey(userKey) {
 			continue
 		}
 		if ts > maxTS {
@@ -1128,13 +1156,13 @@ func (s *pebbleStore) alignCommitTS(commitTS uint64) uint64 {
 
 // getAt is the internal implementation of GetAt.  It must be called while the
 // caller holds at least s.dbMu.RLock().
-func (s *pebbleStore) getAt(_ context.Context, key []byte, ts uint64) ([]byte, error) {
+func (s *pebbleStore) getAt(ctx context.Context, key []byte, ts uint64) ([]byte, error) {
 	if readTSCompacted(ts, s.effectiveMinRetainedTS()) {
 		return nil, ErrReadTSCompacted
 	}
 
 	seekKey := encodeKey(key, ts)
-	iter, err := s.db.NewIter(&pebble.IterOptions{
+	iter, err := s.raftEntryReader(ctx).NewIter(&pebble.IterOptions{
 		LowerBound: seekKey,
 		UpperBound: keyUpperBound(key),
 	})
@@ -1162,32 +1190,29 @@ func (s *pebbleStore) getAt(_ context.Context, key []byte, ts uint64) ([]byte, e
 // values, in which case the visibility checks below are operating
 // on authenticated bytes.
 func (s *pebbleStore) readVisibleVersion(iter *pebble.Iterator, key []byte, ts uint64) ([]byte, error) {
-	for ; iter.Valid(); iter.Next() {
-		k := iter.Key()
-		if isPebbleMetaKey(k) {
-			continue
-		}
-		userKey, _ := decodeKeyView(k)
-		if !bytes.Equal(userKey, key) {
-			return nil, ErrKeyNotFound
-		}
-		sv, err := decodeValue(iter.Value())
-		if err != nil {
-			return nil, errors.WithStack(err)
-		}
-		plain, flag, err := s.decryptAuthenticatedForKey(k, sv, sv.Value)
-		if err != nil {
-			return nil, err
-		}
-		if sv.Tombstone {
-			return nil, ErrKeyNotFound
-		}
-		if sv.ExpireAt != 0 && sv.ExpireAt <= ts {
-			return nil, ErrKeyNotFound
-		}
-		return finishAuthenticatedValue(plain, flag)
+	if !skipPebbleMetadataForward(iter) {
+		return nil, ErrKeyNotFound
 	}
-	return nil, ErrKeyNotFound
+	k := iter.Key()
+	userKey, _ := decodeKeyView(k)
+	if !bytes.Equal(userKey, key) {
+		return nil, ErrKeyNotFound
+	}
+	sv, err := decodeValue(iter.Value())
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	plain, flag, err := s.decryptAuthenticatedForKey(k, sv, sv.Value)
+	if err != nil {
+		return nil, err
+	}
+	if sv.Tombstone {
+		return nil, ErrKeyNotFound
+	}
+	if sv.ExpireAt != 0 && sv.ExpireAt <= ts {
+		return nil, ErrKeyNotFound
+	}
+	return finishAuthenticatedValue(plain, flag)
 }
 
 func (s *pebbleStore) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte, error) {
@@ -1207,7 +1232,7 @@ func (s *pebbleStore) VersionExistsAtOrBefore(ctx context.Context, key []byte, t
 	}
 
 	seekKey := encodeKey(key, ts)
-	iter, err := s.db.NewIter(&pebble.IterOptions{
+	iter, err := s.raftEntryReader(ctx).NewIter(&pebble.IterOptions{
 		LowerBound: seekKey,
 		UpperBound: keyUpperBound(key),
 	})
@@ -1216,7 +1241,7 @@ func (s *pebbleStore) VersionExistsAtOrBefore(ctx context.Context, key []byte, t
 	}
 	defer iter.Close()
 
-	if !iter.SeekGE(seekKey) {
+	if !iter.SeekGE(seekKey) || !skipPebbleMetadataForward(iter) {
 		if err := iter.Error(); err != nil {
 			return false, errors.WithStack(err)
 		}
@@ -1244,7 +1269,7 @@ func (s *pebbleStore) GetAtBatch(ctx context.Context, keys [][]byte, ts uint64) 
 	}
 
 	sortedKeys := uniqueSortedKeys(keys)
-	iter, err := s.db.NewIter(&pebble.IterOptions{})
+	iter, err := s.raftEntryReader(ctx).NewIter(&pebble.IterOptions{})
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -1336,14 +1361,10 @@ func (s *pebbleStore) ExistsAt(ctx context.Context, key []byte, ts uint64) (bool
 // live retry's PrevCommitTS never falls below pebble's compacted floor on
 // any replica. The earlier round-10 retention guard was reverted with this
 // rationale; see design doc §race-freedom.
-func (s *pebbleStore) CommittedVersionAt(_ context.Context, key []byte, commitTS uint64) (bool, error) {
+func (s *pebbleStore) CommittedVersionAt(ctx context.Context, key []byte, commitTS uint64) (bool, error) {
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
-	return s.committedVersionAtLocked(key, commitTS)
-}
-
-func (s *pebbleStore) committedVersionAtLocked(key []byte, commitTS uint64) (bool, error) {
-	return committedVersionAtWith(s.db, key, commitTS)
+	return committedVersionAtWith(s.raftEntryReader(ctx), key, commitTS)
 }
 
 func committedVersionAtWith(r pebble.Reader, key []byte, commitTS uint64) (bool, error) {
@@ -1426,10 +1447,10 @@ func (s *pebbleStore) seekToVisibleVersion(iter *pebble.Iterator, userKey []byte
 
 func (s *pebbleStore) skipToNextUserKey(iter *pebble.Iterator, userKey []byte) bool {
 	for iter.Next() {
-		rawKey := iter.Key()
-		if isPebbleOperationalKey(rawKey) {
-			continue
+		if !skipPebbleMetadataForward(iter) {
+			return false
 		}
+		rawKey := iter.Key()
 		nextUserKey, _ := decodeKeyView(rawKey)
 		if nextUserKey == nil {
 			continue
@@ -1450,14 +1471,8 @@ func beforeScanStart(userKey, start []byte) bool {
 }
 
 func nextScannableUserKey(iter *pebble.Iterator) ([]byte, uint64, bool) {
-	for iter.Valid() {
+	for skipPebbleMetadataForward(iter) {
 		rawKey := iter.Key()
-		if isPebbleOperationalKey(rawKey) {
-			if !iter.Next() {
-				return nil, 0, false
-			}
-			continue
-		}
 		userKey, version := decodeKey(rawKey)
 		if userKey == nil {
 			if !iter.Next() {
@@ -1486,17 +1501,11 @@ func (s *pebbleStore) nextForwardScanUserKeyContext(ctx context.Context, iter *p
 }
 
 func nextScannableUserKeyContext(ctx context.Context, iter *pebble.Iterator) ([]byte, uint64, bool, error) {
-	for iter.Valid() {
+	for skipPebbleMetadataForward(iter) {
 		if err := ctx.Err(); err != nil {
 			return nil, 0, false, errors.WithStack(err)
 		}
 		rawKey := iter.Key()
-		if isPebbleOperationalKey(rawKey) {
-			if !iter.Next() {
-				return nil, 0, false, nil
-			}
-			continue
-		}
 		userKey, version := decodeKey(rawKey)
 		if userKey == nil {
 			if !iter.Next() {
@@ -1510,14 +1519,8 @@ func nextScannableUserKeyContext(ctx context.Context, iter *pebble.Iterator) ([]
 }
 
 func prevScannableUserKey(iter *pebble.Iterator) ([]byte, bool) {
-	for iter.Valid() {
+	for skipPebbleMetadataReverse(iter) {
 		rawKey := iter.Key()
-		if isPebbleOperationalKey(rawKey) {
-			if !iter.Prev() {
-				return nil, false
-			}
-			continue
-		}
 		userKey, _ := decodeKey(rawKey)
 		if userKey == nil {
 			if !iter.Prev() {
@@ -1752,7 +1755,7 @@ func (s *pebbleStore) visibleExactKeyAt(ctx context.Context, reader pebbleIterat
 	}
 	defer iter.Close()
 
-	for iter.SeekGE(encodeKey(key, math.MaxUint64)); iter.Valid(); iter.Next() {
+	for iter.SeekGE(encodeKey(key, math.MaxUint64)); skipPebbleMetadataForward(iter); iter.Next() {
 		if err := ctx.Err(); err != nil {
 			return false, errors.WithStack(err)
 		}
@@ -1768,6 +1771,9 @@ func (s *pebbleStore) visibleExactKeyAt(ctx context.Context, reader pebbleIterat
 }
 
 func (s *pebbleStore) visibleExactIteratorEntry(iter *pebble.Iterator, key []byte, ts uint64, stopOnPrefixExit bool) (bool, bool, error) {
+	if isPebbleMetaKey(iter.Key()) {
+		return false, false, nil
+	}
 	userKey, version := decodeKeyView(iter.Key())
 	if userKey == nil {
 		return false, false, nil
@@ -1808,7 +1814,7 @@ func (s *pebbleStore) ScanAt(ctx context.Context, start []byte, end []byte, limi
 		return nil, ErrReadTSCompacted
 	}
 
-	iter, err := s.db.NewIter(&pebble.IterOptions{
+	iter, err := s.raftEntryReader(ctx).NewIter(&pebble.IterOptions{
 		LowerBound: encodeKey(start, math.MaxUint64),
 	})
 	if err != nil {
@@ -1836,7 +1842,7 @@ func (s *pebbleStore) ScanAtPhysicalLimit(ctx context.Context, start []byte, end
 		return nil, false, ErrReadTSCompacted
 	}
 
-	iter, err := s.db.NewIter(&pebble.IterOptions{
+	iter, err := s.raftEntryReader(ctx).NewIter(&pebble.IterOptions{
 		LowerBound: encodeKey(start, math.MaxUint64),
 	})
 	if err != nil {
@@ -1867,10 +1873,16 @@ func (s *pebbleStore) ScanKeysAt(ctx context.Context, start []byte, end []byte, 
 		return nil, ErrReadTSCompacted
 	}
 
-	snap := s.db.NewSnapshot()
-	defer snap.Close()
+	var reader pebble.Reader
+	if scope := s.raftEntryScopeFrom(ctx); scope != nil {
+		reader = scope.batch
+	} else {
+		snap := s.db.NewSnapshot()
+		defer snap.Close()
+		reader = snap
+	}
 
-	iter, err := snap.NewIter(&pebble.IterOptions{
+	iter, err := reader.NewIter(&pebble.IterOptions{
 		LowerBound: encodeKey(start, math.MaxUint64),
 	})
 	if err != nil {
@@ -1878,7 +1890,7 @@ func (s *pebbleStore) ScanKeysAt(ctx context.Context, start []byte, end []byte, 
 	}
 	defer iter.Close()
 
-	return s.collectScanKeys(ctx, snap, iter, start, end, limit, ts)
+	return s.collectScanKeys(ctx, reader, iter, start, end, limit, ts)
 }
 
 func (s *pebbleStore) collectReverseScanResults(
@@ -1944,8 +1956,8 @@ func (s *pebbleStore) nextReverseScanKV(
 	if start != nil && bytes.Compare(userKey, start) < 0 {
 		return nil, false, true, nil
 	}
-	if !iter.SeekGE(encodeKey(userKey, ts)) {
-		return nil, false, true, nil
+	if !iter.SeekGE(encodeKey(userKey, ts)) || !skipPebbleMetadataForward(iter) {
+		return nil, false, true, errors.WithStack(iter.Error())
 	}
 	currentUserKey, _ := decodeKeyView(iter.Key())
 	if !bytes.Equal(currentUserKey, userKey) {
@@ -1980,7 +1992,7 @@ func (s *pebbleStore) ReverseScanAt(ctx context.Context, start []byte, end []byt
 	if end != nil {
 		opts.UpperBound = encodeKey(end, math.MaxUint64)
 	}
-	iter, err := s.db.NewIter(opts)
+	iter, err := s.raftEntryReader(ctx).NewIter(opts)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -2012,7 +2024,7 @@ func (s *pebbleStore) ReverseScanAtPhysicalLimit(ctx context.Context, start []by
 	if end != nil {
 		opts.UpperBound = encodeKey(end, math.MaxUint64)
 	}
-	iter, err := s.db.NewIter(opts)
+	iter, err := s.raftEntryReader(ctx).NewIter(opts)
 	if err != nil {
 		return nil, false, errors.WithStack(err)
 	}
@@ -2022,6 +2034,8 @@ func (s *pebbleStore) ReverseScanAtPhysicalLimit(ctx context.Context, start []by
 }
 
 func (s *pebbleStore) PutAt(ctx context.Context, key []byte, value []byte, commitTS uint64, expireAt uint64) error {
+	s.applyMu.Lock()
+	defer s.applyMu.Unlock()
 	if err := validateValueSize(value); err != nil {
 		return err
 	}
@@ -2048,6 +2062,8 @@ func (s *pebbleStore) PutAt(ctx context.Context, key []byte, value []byte, commi
 }
 
 func (s *pebbleStore) DeleteAt(ctx context.Context, key []byte, commitTS uint64) error {
+	s.applyMu.Lock()
+	defer s.applyMu.Unlock()
 	k, err := encodePebbleUserVersionKey(key, commitTS)
 	if err != nil {
 		return err
@@ -2070,6 +2086,8 @@ func (s *pebbleStore) PutWithTTLAt(ctx context.Context, key []byte, value []byte
 }
 
 func (s *pebbleStore) ExpireAt(ctx context.Context, key []byte, expireAt uint64, commitTS uint64) error {
+	s.applyMu.Lock()
+	defer s.applyMu.Unlock()
 	k, err := encodePebbleUserVersionKey(key, commitTS)
 	if err != nil {
 		return err
@@ -2100,9 +2118,9 @@ func (s *pebbleStore) ExpireAt(ctx context.Context, key []byte, expireAt uint64,
 
 // latestCommitTS is the internal implementation of LatestCommitTS.  It must be
 // called while the caller holds at least s.dbMu.RLock().
-func (s *pebbleStore) latestCommitTS(_ context.Context, key []byte) (uint64, bool, error) {
+func (s *pebbleStore) latestCommitTS(ctx context.Context, key []byte) (uint64, bool, error) {
 	// Peek latest version (SeekGE key + ^MaxUint64)
-	iter, err := s.db.NewIter(&pebble.IterOptions{
+	iter, err := s.raftEntryReader(ctx).NewIter(&pebble.IterOptions{
 		LowerBound: encodeKey(key, math.MaxUint64),
 		UpperBound: keyUpperBound(key),
 	})
@@ -2165,6 +2183,10 @@ func sortedReadConflictKeys(readKeys [][]byte) []conflictCheckKey {
 
 func conflictTSFromCurrentIter(iter *pebble.Iterator, key []byte, limit int) (uint64, bool, bool, error) {
 	for steps := 0; steps < limit && iter.Valid(); steps++ {
+		if isPebbleMetaKey(iter.Key()) {
+			skipPebbleMetadataForward(iter)
+			continue
+		}
 		userKey, version := decodeKeyView(iter.Key())
 		switch c := bytes.Compare(userKey, key); {
 		case c < 0:
@@ -2204,7 +2226,7 @@ func (s *pebbleStore) latestCommitTSWithIter(ctx context.Context, iter *pebble.I
 	}
 	*seekKey = appendEncodedKey(*seekKey, key, math.MaxUint64)
 	*upperBound = appendKeyUpperBound(*upperBound, key)
-	if iter.SeekGEWithLimit(*seekKey, *upperBound) == pebble.IterValid {
+	if iter.SeekGEWithLimit(*seekKey, *upperBound) == pebble.IterValid && skipPebbleMetadataForward(iter) {
 		userKey, version := decodeKeyView(iter.Key())
 		if bytes.Equal(userKey, key) {
 			return version, true, nil
@@ -2600,7 +2622,7 @@ func (s *pebbleStore) checkApplyConflictsWith(ctx context.Context, r pebble.Read
 	if err := s.checkAbsenceGuardsWith(ctx, r, mutations); err != nil {
 		return err
 	}
-	if !force && !hasCommitsAfter(startTS) {
+	if !force && !hasCommitsAfter(startTS) && !hasNonAdvertisedMVCCDependencies(mutations, readKeys) {
 		return nil
 	}
 	if err := s.checkConflictsWith(ctx, r, mutations, startTS); err != nil {
@@ -3524,6 +3546,8 @@ func writeNativeSnapshotToTempDir(r io.Reader, tmpDir string, ts uint64, disable
 // place after the CRC32 checksum is verified, preserving the existing store
 // on failure.
 type streamingMVCCRestoreMetadata struct {
+	raftControl         map[string][]byte
+	controlAppliedIndex uint64
 	lastCommitTS        uint64
 	minRetainedTS       uint64
 	migrationAcks       map[migrationAckID]migrationImportAck
@@ -3548,6 +3572,8 @@ func readStreamingMVCCRestoreHeader(r io.Reader) (io.Reader, hash.Hash32, uint32
 		return nil, nil, 0, streamingMVCCRestoreMetadata{}, err
 	}
 	meta := streamingMVCCRestoreMetadata{
+		raftControl:         snapshotMeta.raftControl,
+		controlAppliedIndex: snapshotMeta.controlAppliedIndex,
 		lastCommitTS:        lastCommitTS,
 		minRetainedTS:       minRetainedTS,
 		migrationAcks:       snapshotMeta.acks,

@@ -435,8 +435,13 @@ type Request struct {
 	// creation epoch. Producers set it only after validating the unchanged
 	// persistence timestamp against the durable TSO allocation range.
 	TimestampAdmissionFloor uint64 `protobuf:"varint,8,opt,name=timestamp_admission_floor,json=timestampAdmissionFloor,proto3" json:"timestamp_admission_floor,omitempty"`
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	// timestamp_binding_operation_id is a stable retry identity for a
+	// data-group-bound creation. The receiving leader must authenticate the
+	// timestamp source before proposing this field; replicas recompute the
+	// manifest digest from the request rather than trusting a supplied hash.
+	TimestampBindingOperationId []byte `protobuf:"bytes,9,opt,name=timestamp_binding_operation_id,json=timestampBindingOperationId,proto3" json:"timestamp_binding_operation_id,omitempty"`
+	unknownFields               protoimpl.UnknownFields
+	sizeCache                   protoimpl.SizeCache
 }
 
 func (x *Request) Reset() {
@@ -523,6 +528,13 @@ func (x *Request) GetTimestampAdmissionFloor() uint64 {
 		return x.TimestampAdmissionFloor
 	}
 	return 0
+}
+
+func (x *Request) GetTimestampBindingOperationId() []byte {
+	if x != nil {
+		return x.TimestampBindingOperationId
+	}
+	return nil
 }
 
 type RaftCommand struct {
@@ -2830,7 +2842,7 @@ const file_internal_proto_rawDesc = "" +
 	"\x03key\x18\x02 \x01(\fR\x03key\x12\x14\n" +
 	"\x05value\x18\x03 \x01(\fR\x05value\x123\n" +
 	"\x16commit_ts_value_offset\x18\x04 \x01(\x04R\x13commitTsValueOffset\x12%\n" +
-	"\x0erequire_absent\x18\x05 \x01(\bR\rrequireAbsent\"\xbd\x02\n" +
+	"\x0erequire_absent\x18\x05 \x01(\bR\rrequireAbsent\"\x82\x03\n" +
 	"\aRequest\x12\x15\n" +
 	"\x06is_txn\x18\x01 \x01(\bR\x05isTxn\x12\x1c\n" +
 	"\x05phase\x18\x02 \x01(\x0e2\x06.PhaseR\x05phase\x12\x0e\n" +
@@ -2839,7 +2851,8 @@ const file_internal_proto_rawDesc = "" +
 	"\tread_keys\x18\x05 \x03(\fR\breadKeys\x124\n" +
 	"\x16observed_route_version\x18\x06 \x01(\x04R\x14observedRouteVersion\x125\n" +
 	"\x17write_fence_bypass_keys\x18\a \x03(\fR\x14writeFenceBypassKeys\x12:\n" +
-	"\x19timestamp_admission_floor\x18\b \x01(\x04R\x17timestampAdmissionFloor\"3\n" +
+	"\x19timestamp_admission_floor\x18\b \x01(\x04R\x17timestampAdmissionFloor\x12C\n" +
+	"\x1etimestamp_binding_operation_id\x18\t \x01(\fR\x1btimestampBindingOperationId\"3\n" +
 	"\vRaftCommand\x12$\n" +
 	"\brequests\x18\x01 \x03(\v2\b.RequestR\brequests\"M\n" +
 	"\x0eForwardRequest\x12\x15\n" +

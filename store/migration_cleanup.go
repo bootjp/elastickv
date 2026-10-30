@@ -37,7 +37,12 @@ func cleanupResult(exported ExportVersionsResult) CleanupVersionsResult {
 }
 
 func (s *mvccStore) CleanupVersions(ctx context.Context, opts CleanupVersionsOptions) (CleanupVersionsResult, error) {
+	if err := s.rejectMemoryEntry(ctx); err != nil {
+		return CleanupVersionsResult{}, err
+	}
+	s.applyMu.Lock()
 	s.mtx.Lock()
+	defer s.applyMu.Unlock()
 	defer s.mtx.Unlock()
 	if _, retired := s.migrationRetired[opts.JobID]; retired {
 		return CleanupVersionsResult{}, errors.WithStack(ErrMigrationRetired)
@@ -61,11 +66,16 @@ func (s *mvccStore) CleanupVersions(ctx context.Context, opts CleanupVersionsOpt
 	return cleanupResult(exported), nil
 }
 
-func (s *mvccStore) ClearMigrationState(_ context.Context, jobID, _ uint64) error {
+func (s *mvccStore) ClearMigrationState(ctx context.Context, jobID, _ uint64) error {
+	if err := s.rejectMemoryEntry(ctx); err != nil {
+		return err
+	}
 	if jobID == 0 {
 		return errors.New("migration cleanup job id is required")
 	}
+	s.applyMu.Lock()
 	s.mtx.Lock()
+	defer s.applyMu.Unlock()
 	defer s.mtx.Unlock()
 	s.clearMigrationStateLocked(jobID)
 	return nil

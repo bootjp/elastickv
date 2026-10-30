@@ -42,6 +42,9 @@ type kvFSM struct {
 	log   *slog.Logger
 	// Set only by the replicated protocol activation, never by a process flag.
 	ttlInlineCapability atomic.Bool
+	// Disabled until every data-group member and ingress has adopted the
+	// timestamp-binding protocol. Tests may enable it directly.
+	timestampBindingEnabled atomic.Bool
 	// hlc is the shared HLC instance updated when a HLC lease entry is applied.
 	// May be nil for nodes that do not participate in physical ceiling tracking.
 	hlc *HLC
@@ -394,8 +397,18 @@ func (f *kvFSM) Apply(data []byte) any {
 	if err != nil {
 		return errors.WithStack(err)
 	}
+	return f.applyDecodedRequests(ctx, reqs)
+}
+
+func (f *kvFSM) applyDecodedRequests(ctx context.Context, reqs []*pb.Request) any {
 	if len(reqs) == 1 {
+		if len(reqs[0].GetTimestampBindingOperationId()) != 0 {
+			return f.applyTimestampBoundCreation(ctx, reqs[0])
+		}
 		return f.applyRequest(ctx, reqs[0])
+	}
+	if requestsUseTimestampBinding(reqs) {
+		return errors.WithStack(ErrTimestampBindingInvalid)
 	}
 
 	resp := &fsmApplyResponse{results: make([]error, len(reqs))}
@@ -407,6 +420,15 @@ func (f *kvFSM) Apply(data []byte) any {
 		return resp
 	}
 	return nil
+}
+
+func requestsUseTimestampBinding(reqs []*pb.Request) bool {
+	for _, request := range reqs {
+		if len(request.GetTimestampBindingOperationId()) != 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // ErrRaftEntryApply marks the halt the FSM returns when a batched Raft
@@ -768,31 +790,39 @@ func haltResponseFor(err error) *haltApplyResponse {
 }
 
 func (f *kvFSM) applyRequestErr(ctx context.Context, r *pb.Request) error {
+	commitTS, err := f.applyRequestData(ctx, r)
+	if err != nil {
+		return err
+	}
+	f.observeAppliedCommitTS(commitTS)
+	return nil
+}
+
+func (f *kvFSM) applyRequestData(ctx context.Context, r *pb.Request) (uint64, error) {
 	if f.migrationNamespaceVersion.Load() != 0 {
 		if err := verifyRequestMigrationControlKeys(r); err != nil {
-			return err
+			return 0, err
 		}
 	}
 	var err error
 	ctx, err = f.withMigrationOwnershipEvidence(ctx, r)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if err := f.verifyPrepareCreationGate(r); err != nil {
-		return err
+		return 0, err
 	}
 	commitTS, err := requestCommitTS(r)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if err := f.verifyBackupTimestampFloor(r, commitTS); err != nil {
-		return err
+		return 0, err
 	}
 	if err := f.handleRequest(ctx, r, commitTS); err != nil {
-		return errors.WithStack(err)
+		return 0, errors.WithStack(err)
 	}
-	f.observeAppliedCommitTS(commitTS)
-	return nil
+	return commitTS, nil
 }
 
 func (f *kvFSM) handleRequest(ctx context.Context, r *pb.Request, commitTS uint64) error {
