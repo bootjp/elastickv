@@ -493,13 +493,15 @@ func (s *S3Server) handle(w http.ResponseWriter, r *http.Request) {
 	if s.serveS3LeaderHealthz(w, r) {
 		return
 	}
-	if s.maybeProxyToLeader(w, r) {
-		return
-	}
-
 	bucket, objectKey, hasObject, err := parseS3Path(r)
 	if err != nil {
 		writeS3Error(w, http.StatusBadRequest, "InvalidURI", err.Error(), bucket, objectKey)
+		return
+	}
+	if rejectOversizedS3ObjectKey(w, objectKey, hasObject) {
+		return
+	}
+	if s.maybeProxyToLeader(w, r) {
 		return
 	}
 
@@ -801,7 +803,6 @@ func (s *S3Server) deleteBucket(w http.ResponseWriter, r *http.Request, bucket s
 			return errors.Wrap(err, "s3: allocate startTS for mutation")
 		}
 		readTS = readTimestamp.Timestamp()
-		startTS := readTS
 		readPin := s.pinReadTS(readTS)
 		defer readPin.Release()
 
@@ -833,21 +834,16 @@ func (s *S3Server) deleteBucket(w http.ResponseWriter, r *http.Request, bucket s
 		}
 
 		// Phase 1: Del BucketMetaKey in a txn (OCC-protected
-		// against concurrent createBucket racing this delete).
+		// against concurrent createBucket racing this delete) and re-put
+		// the generation key to fence concurrent part uploads.
 		// Phase 2 (DEL_PREFIX safety net) runs outside the txn
 		// because the production coordinator rejects DEL_PREFIX
 		// inside transactions and rejects mixed Del+DelPrefix
 		// groups (kv/sharded_coordinator.go: dispatchDelPrefixBroadcast).
 		// See AdminDeleteBucket's doc comment for the full
 		// rationale.
-		dispatchCtx := readTimestamp.WithDispatchVoucher(r.Context())
-		_, err = kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, &kv.OperationGroup[kv.OP]{
-			IsTxn:   true,
-			StartTS: startTS,
-			Elems:   []*kv.Elem[kv.OP]{{Op: kv.Del, Key: s3keys.BucketMetaKey(bucket)}},
-		})
-		if err != nil {
-			return errors.WithStack(err)
+		if err := s.dispatchBucketDeleteTxn(r.Context(), readTimestamp, bucket, meta.Generation); err != nil {
+			return err
 		}
 		deletedGeneration = meta.Generation
 		return nil
@@ -1390,7 +1386,7 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 		r.Context(), r, streamBody, state, bucket, objectKey, uploadID, admissionProtocol, offload,
 	)
 	if uploadErr != nil || uploadBodyErr != nil {
-		s.writeS3ChunkUploadError(w, uploadBodyErr, uploadErr, bucket, objectKey)
+		s.writeS3UploadPartError(w, uploadBodyErr, uploadErr, bucket, objectKey)
 		return
 	}
 
@@ -1411,14 +1407,9 @@ func (s *S3Server) completeMultipartUpload(w http.ResponseWriter, r *http.Reques
 		writeS3ResponseOrInternalError(w, err)
 		return
 	}
-	completion, err := s.loadS3MultipartCompletion(r.Context(), bucket, objectKey, uploadID, request)
+	completion, previous, err := s.commitS3MultipartCompletion(r.Context(), bucket, objectKey, uploadID, request)
 	if err != nil {
-		writeS3ResponseOrInternalError(w, err)
-		return
-	}
-	previous, err := s.commitS3MultipartCompletion(r.Context(), completion)
-	if err != nil {
-		writeS3MutationError(w, err, bucket, objectKey)
+		writeS3MultipartMutationError(w, err, bucket, objectKey)
 		return
 	}
 
@@ -2552,6 +2543,9 @@ func (s *S3Server) nextTxnCommitTS(ctx context.Context, startTS uint64) (uint64,
 }
 
 func isRetryableS3MutationErr(err error) bool {
+	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+		return false
+	}
 	return errors.Is(err, store.ErrWriteConflict) || errors.Is(err, kv.ErrTxnLocked) || isRouteWriteFencedError(err)
 }
 

@@ -694,3 +694,64 @@ The implementation now discards snapshot-covered queued work without creating
 proposal receipts and includes unconsumed ingress in post-join cleanup. The
 configuration ordering test also observes owner publication directly instead
 of assuming its caller's forwarding goroutine has already run.
+
+## Outbound Ownership And Snapshot Composition
+
+The internal runtime now reserves outbound capacity before cloning a message.
+Its separate bulk allowance is 512 MiB / 128 requests; heartbeat, vote,
+ReadIndex and append-response traffic use an independent 8 MiB / 256-request
+allowance. These limits are retained across queueing, RPC execution and a
+blocked reliable snapshot-completion report. Peer removal, cancellation,
+coalescing, failed admission and shutdown retire only their actual owned
+requests. Network admission failure uses the existing Raft dispatch feedback;
+it does not discard local storage work or create a durability receipt.
+
+The charge conservatively allows twice the protobuf/envelope estimate for
+byte-slice allocation rounding plus sixteen bytes per ConfState uint64 element,
+including nested responses. Addition and multiplication saturate on overflow.
+This is not an exact or complete Go-heap measurement. A real 63.5 MiB entry
+still fits the unchanged allowance and is tested without reducing its payload.
+Aggregate ingress/unstable/actor ownership and atomic-Ready overshoot/debt are
+still separate unfinished acceptance requirements.
+
+Two physical-capacity regressions failed before correction: 1,000 snapshot
+voters held at least 8,200 bytes against a 3,412-byte charge; a 65,537-byte
+entry retained 73,728-byte capacity against a 66,327-byte charge. A separate
+independent reproduction found that shallow unknown protobuf fields retained
+a shared 1 MiB backing array with only a few KiB reserved. The complete protobuf
+is now cloned, including unknown fields and optional headers; repeated nil
+message sentinels are preserved rather than normalized into manufactured
+messages. The concurrent-WAL-marshal tests exercise that actual live clone
+path, not a removed entry-only helper. Five unknown-field cases failed before
+repair and the already-owned Entry case remained a positive control.
+
+The new worker-exit drain also exposed a fixture/runtime integration error:
+the old nonblocking receive helper ignored a closed channel's boolean result
+and repeatedly returned a zero-value request. It now distinguishes closed and
+empty channels; a direct regression and real cancellation/join tests cover it.
+Both initially hung test runs remain failed evidence, not successful receipts.
+
+Snapshot file pins and byte permits coexist on the same dispatch request.
+Both are acquired before cloning and retained through the last dispatch/report
+use; idempotent Close retires both. Composition controls check simultaneous
+retirement, rejected clones acquiring no pin, and removed-peer lane drains
+releasing every queued snapshot pin and byte reservation.
+
+The final standalone outbound source passed focused race tests three times
+(2.374s), whole engine race without short/skip options (93.646s), full lint,
+and independent ownership re-review. The re-review includes unknown fields,
+optional pointers, every slice and nested nils; no new validated P1/P2 remains
+within that component. A staged-only snapshot/outbound export passed the broad
+pipeline/snapshot/ownership race selection (59.988s) and full lint. Main through
+0d5c5c230 was then merged without changing that engine source. These component
+receipts are not final composed-repository CI, encrypted three-voter acceptance
+or default activation. The original synchronous diagnostic stays outside the
+published tree and remains intentionally unresolved until production activation.
+
+A subsequent whole-KV run failed the existing process-kill recovery fixture
+because its secondary was already committed before the explicit recovery
+assertion. The same unchanged test also reproduces on an independent baseline;
+its cause and fault boundary must be repaired or reconciled, not hidden by a
+rerun, skip or relaxed assertion. Earlier KV passes do not qualify the final
+composed source. Fresh full-suite, last-push code/security review and all CI
+remain mandatory before publication readiness.
