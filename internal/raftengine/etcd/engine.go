@@ -3134,6 +3134,7 @@ func (e *Engine) resolveProposal(commitIndex uint64, data []byte, response any) 
 func (e *Engine) applyConfigChange(changeType raftpb.ConfChangeType, nodeID uint64, context []byte, index uint64, confState raftpb.ConfState) {
 	e.publishConfigChange(changeType, nodeID, context, index, confState)
 	e.resolveConfigChange(index, context)
+	e.alarmIfJoinedAsVoter(confState)
 }
 
 func (e *Engine) publishConfigChange(changeType raftpb.ConfChangeType, nodeID uint64, context []byte, index uint64, confState raftpb.ConfState) {
@@ -3141,12 +3142,12 @@ func (e *Engine) publishConfigChange(changeType raftpb.ConfChangeType, nodeID ui
 	e.applyConfigPeerChange(changeType, nodeID, context)
 	e.refreshConfigServers(confState)
 	e.setConfigIndex(index)
-	e.alarmIfJoinedAsVoter(confState)
 }
 
 func (e *Engine) applyConfigChangeV2(cc raftpb.ConfChangeV2, index uint64, confState raftpb.ConfState) {
 	e.publishConfigChangeV2(cc, index, confState)
 	e.resolveConfigChange(index, cc.GetContext())
+	e.alarmIfJoinedAsVoter(confState)
 }
 
 func (e *Engine) publishConfigChangeV2(cc raftpb.ConfChangeV2, index uint64, confState raftpb.ConfState) {
@@ -3156,7 +3157,6 @@ func (e *Engine) publishConfigChangeV2(cc raftpb.ConfChangeV2, index uint64, con
 	}
 	e.refreshConfigServers(confState)
 	e.setConfigIndex(index)
-	e.alarmIfJoinedAsVoter(confState)
 }
 
 // alarmIfJoinedAsVoter implements the operator-alarm semantics from

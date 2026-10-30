@@ -4,6 +4,7 @@ package etcd
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"os"
 	"sync"
@@ -31,7 +32,9 @@ func TestEnginePipelineConfigurationRealPeerMetadataIODoesNotBlockOwner(t *testi
 		unblock()
 		select {
 		case err := <-finished:
-			require.NoError(t, err)
+			if !errors.Is(err, context.Canceled) {
+				require.NoError(t, err)
+			}
 		case <-time.After(5 * time.Second):
 			t.Error("peer metadata pipe writer did not join")
 		}
@@ -58,7 +61,7 @@ func holdConfigurationPeerPipe(path string, previous []byte) (<-chan error, <-ch
 	entered, finished := make(chan error, 1), make(chan error, 1)
 	release := make(chan struct{})
 	go func() {
-		writer, err := os.OpenFile(path, os.O_WRONLY, 0)
+		writer, err := openConfigurationPeerPipe(path, release)
 		entered <- err
 		if err != nil {
 			finished <- err
@@ -69,4 +72,71 @@ func holdConfigurationPeerPipe(path string, previous []byte) (<-chan error, <-ch
 		finished <- errors.CombineErrors(err, writer.Close())
 	}()
 	return entered, finished, release
+}
+
+func openConfigurationPeerPipe(path string, release <-chan struct{}) (*os.File, error) {
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-release:
+			return nil, context.Canceled
+		default:
+		}
+		writer, err := os.OpenFile(path, os.O_WRONLY|unix.O_NONBLOCK, 0)
+		if !errors.Is(err, unix.ENXIO) {
+			return writer, err
+		}
+		select {
+		case <-release:
+			return nil, context.Canceled
+		case <-ticker.C:
+		}
+	}
+}
+
+func TestEnginePipelineConfigurationPeerPipeJoinsAfterEarlyFailure(t *testing.T) {
+	failure := errors.New("configuration record failed before peer metadata reader")
+	h, _, gate, _ := newPipelineConfigurationRuntime(t, "record", failure, false)
+	proposeNativePipelineConfiguration(t, h, true)
+	asyncStorageAwait(t, h, gate.entered, "actual configuration record before reader")
+	path := peersFilePath(h.engine.dataDir)
+	previous, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.NoError(t, os.Remove(path))
+	require.NoError(t, unix.Mkfifo(path, 0o600))
+	_, finished, release := holdConfigurationPeerPipe(path, previous)
+	joined := false
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	t.Cleanup(func() {
+		unblock()
+		if joined {
+			return
+		}
+		// A failed regression must also join the original uncancellable helper.
+		fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NONBLOCK, 0)
+		require.NoError(t, err)
+		defer unix.Close(fd)
+		select {
+		case <-finished:
+		case <-time.After(5 * time.Second):
+			t.Error("peer pipe rescue did not join writer")
+		}
+	})
+	gate.unblock()
+	select {
+	case <-h.engine.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("configuration failure did not join before peer-file reader phase")
+	}
+	require.ErrorIs(t, h.engine.Err(), failure)
+	unblock()
+	select {
+	case err := <-finished:
+		joined = true
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Error("peer pipe writer did not join after cancellation before reader open")
+	}
 }

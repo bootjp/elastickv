@@ -618,3 +618,21 @@ pre-existing untracked synchronous heartbeat diagnostic, and full lint has zero
 issues. The diagnostic remains unchanged and outside the published tree.
 Independent review, main-dependency integration, exact staged-only export and
 final-push normal/security review plus all CI are separate publication gates.
+
+Independent review found no validated production-handshake blocker, including
+native ahead-FSM and two-configurations-in-one-task response/ordering controls.
+It did reproduce a P2 in the new I/O test fixture: if configuration recording
+failed before the FIFO reader opened, its blocking writer open could not see
+the cleanup release. The maintained real-runtime regression failed before
+repair (1.806s), with a rescue reader joining the old helper after failure.
+The helper now retries a nonblocking kernel open with cancellation; the actual
+successful open and withheld bytes remain the normal-path progress witness.
+Both normal I/O and early-failure join pass twenty race repetitions (13.133s).
+The common-path extraction also retains the synchronous alarm-after-result
+sequence, rather than moving logging before an existing proposal receipt.
+
+The first parent main-integrated source export passes whole engine race
+without skips (114.235s), whole KV race (107.177s), all SQS/FIFO and the real
+DynamoDB leader-change control (45.934s), and complete lint. That export
+predates the fixture/alarm follow-up; final publication requires a fresh
+source export of those changes rather than reusing its receipts.

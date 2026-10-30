@@ -390,5 +390,6 @@ func (e *Engine) publishPipelineConfiguration(plan *pipelineConfigurationPlan) e
 			e.resolveConfigChange(plan.index, plan.v2.GetContext())
 		}
 	}
+	e.alarmIfJoinedAsVoter(plan.confState)
 	return nil
 }
