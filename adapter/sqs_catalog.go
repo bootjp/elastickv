@@ -120,6 +120,10 @@ type sqsQueueMeta struct {
 	// Persisted on the meta so a leader failover loads the configuration
 	// along with the rest of the queue.
 	Throttle *sqsQueueThrottle `json:"throttle,omitempty"`
+	// FIFO delay changes rewrite initial-delivery deadlines before reopening
+	// the data plane. Keeping the cursor here fences stale writers via meta OCC.
+	DelayReindex     *sqsFifoDelayReindex `json:"fifo_delay_reindex,omitempty"`
+	FifoOrderIndexed bool                 `json:"fifo_order_indexed,omitempty"`
 	// PartitionCount is the number of FIFO partitions for this queue
 	// (Phase 3.D HT-FIFO, see docs/design/2026_04_26_implemented_sqs_split_queue_fifo.md).
 	// Zero or 1 means the legacy single-partition layout — no schema
@@ -884,7 +888,7 @@ func (s *SQSServer) beginTxnReadTimestamp(ctx context.Context, label string) (kv
 }
 
 func (s *SQSServer) loadQueueMetaAt(ctx context.Context, queueName string, ts uint64) (*sqsQueueMeta, bool, error) {
-	b, err := s.store.GetAt(ctx, sqsQueueMetaKey(queueName), ts)
+	b, err := s.getSQSAt(ctx, sqsQueueMetaKey(queueName), ts)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return nil, false, nil
@@ -899,7 +903,7 @@ func (s *SQSServer) loadQueueMetaAt(ctx context.Context, queueName string, ts ui
 }
 
 func (s *SQSServer) loadQueueGenerationAt(ctx context.Context, queueName string, ts uint64) (uint64, error) {
-	b, err := s.store.GetAt(ctx, sqsQueueGenKey(queueName), ts)
+	b, err := s.getSQSAt(ctx, sqsQueueGenKey(queueName), ts)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return 0, nil
@@ -1611,18 +1615,21 @@ func (s *SQSServer) setQueueAttributesCore(ctx context.Context, name string, att
 		s.throttle.invalidateQueueBuckets(name)
 		s.observeThrottleConfigChange(name, throttle, resetActions, throttleResetCutoff)
 	}
-	return nil
+	return s.completeFifoDelayReindex(ctx, name)
 }
 
 func (s *SQSServer) setQueueAttributesWithRetry(ctx context.Context, queueName string, attrs map[string]string) (bool, *sqsQueueThrottle, []string, uint64, error) {
 	backoff := transactRetryInitialBackoff
 	deadline := time.Now().Add(transactRetryMaxDuration)
 	for range transactRetryMaxAttempts {
+		if err := s.completeFifoDelayReindex(ctx, queueName); err != nil {
+			return false, nil, nil, 0, err
+		}
 		throttleChanged, throttle, resetActions, throttleResetCutoff, done, err := s.trySetQueueAttributesOnce(ctx, queueName, attrs)
 		if err == nil && done {
 			return throttleChanged, throttle, resetActions, throttleResetCutoff, nil
 		}
-		if err != nil && !isRetryableTransactWriteError(err) {
+		if err != nil && (errors.Is(err, kv.ErrTransactionOutcomeUnknown) || !isRetryableTransactWriteError(err)) {
 			return false, nil, nil, 0, err
 		}
 		if err := waitRetryWithDeadline(ctx, deadline, backoff); err != nil {
@@ -1699,10 +1706,7 @@ func (s *SQSServer) trySetQueueAttributesOnce(ctx context.Context, queueName str
 	// against, not a later one. Cheap because the value is small (six
 	// floats wrapped in a struct).
 	preThrottle := snapshotThrottle(meta.Throttle)
-	if err := applyAndValidateSetAttributes(meta, attrs); err != nil {
-		return false, nil, nil, 0, false, err
-	}
-	if err := s.validateRedrivePolicyTarget(ctx, meta, readTS); err != nil {
+	if err := s.prepareFifoDelayAttributes(ctx, meta, attrs, readTS); err != nil {
 		return false, nil, nil, 0, false, err
 	}
 	throttleChanged := !throttleConfigEqual(preThrottle, meta.Throttle)

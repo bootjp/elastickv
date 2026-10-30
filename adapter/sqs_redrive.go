@@ -276,6 +276,12 @@ func (s *SQSServer) validateRedriveTargets(
 	if err != nil {
 		return nil, err
 	}
+	if err := checkFifoDelayReady(srcMeta); err != nil {
+		return nil, err
+	}
+	if err := checkFifoDelayReady(dlqMeta); err != nil {
+		return nil, err
+	}
 	if err := validateRedriveQueuePair(srcMeta, dlqMeta); err != nil {
 		return nil, err
 	}
@@ -517,6 +523,11 @@ func (s *SQSServer) buildRedriveOps(
 			readKeys = append(readKeys, lockKey)
 			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: lockKey})
 		}
+	}
+	elems = appendFifoOrderDelete(elems, srcMeta, srcQueueName, cand.partition, srcGen, srcRec)
+	if dlqMeta.FifoOrderIndexed {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put,
+			Key: sqsFifoOrderKey(dlqMeta, policy.DLQName, dlqPartition, dlqMeta.Generation, dlqRec), Value: []byte(dlqRec.MessageID)})
 	}
 	return &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
