@@ -80,6 +80,8 @@ const (
 // upgrades that have not yet finished.
 const sqsCapabilityHTFIFO = "htfifo"
 
+const sqsCapabilityFifoRetroactiveDelay = "fifo-retroactive-delay-v1"
+
 // htfifoCapabilityAdvertised gates whether this binary lists
 // "htfifo" on /sqs_health. The §11 PR 4 contract requires BOTH
 // the routing-layer wiring AND the leadership-refusal safeguard
@@ -123,10 +125,11 @@ const htfifoCapabilityAdvertised = true
 // returned slice is freshly allocated per call so the caller may
 // mutate it without aliasing the package-level state.
 func sqsAdvertisedCapabilities() []string {
-	caps := make([]string, 0, 1)
+	var caps []string
 	if htfifoCapabilityAdvertised {
 		caps = append(caps, sqsCapabilityHTFIFO)
 	}
+	caps = append(caps, sqsCapabilityFifoRetroactiveDelay)
 	return caps
 }
 

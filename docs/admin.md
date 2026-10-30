@@ -9,7 +9,7 @@ read that first if you're touching the code.
 
 A separate HTTP listener (default `127.0.0.1:8080`) that exposes a
 React SPA + JSON API for inspecting the cluster and managing
-DynamoDB tables / S3 buckets without having to construct SigV4
+DynamoDB tables / S3 buckets / SQS queues without having to construct SigV4
 requests. It is **disabled by default**: set `--adminEnabled` to turn
 it on.
 
@@ -146,6 +146,33 @@ method.
 | `GET` | `/s3/buckets/{name}` | any | Bucket meta + ACL. |
 | `PUT` | `/s3/buckets/{name}/acl` | full | Body `{acl}`. Only `private` and `public-read` are accepted. |
 | `DELETE` | `/s3/buckets/{name}` | full | 204 on success. The bucket must be empty (no objects); a non-empty bucket returns 409 `bucket_not_empty`. |
+| `GET` | `/sqs/queues` | any | List queue names. |
+| `POST` | `/sqs/queues` | full | Body `{name, attributes?}`. Returns 201. Leader required. |
+
+## Creating SQS queues
+
+Open **SQS queues**, select **Create queue**, and enter a queue name and
+type (Standard or FIFO). Names contain letters, digits, hyphens, and
+underscores, with an 80-character total limit. FIFO names must end in
+`.fifo`; the form also offers content-based deduplication.
+Other attributes use the existing SQS defaults. After creation the
+dialog closes and the queue list refreshes.
+
+Creation requires the `full` role and an enabled SQS adapter
+(`--sqsAddress`). Connect to the Raft leader's admin listener for
+queue writes; a follower returns 503 with `Retry-After: 1`.
+
+The JSON endpoint is `POST /admin/api/v1/sqs/queues`, with the session
+cookie and `X-Admin-CSRF` header used by other admin writes:
+
+```json
+{"name":"orders.fifo","attributes":{"FifoQueue":"true","ContentBasedDeduplication":"true"}}
+```
+
+Success returns 201 with `{"name":"orders.fifo"}` and a `Location`
+header pointing to the queue's admin API resource. Creation shares
+the public SQS validator and idempotency rules: the same name and
+attributes succeed again; conflicting attributes return 400.
 
 ## Follower → leader forwarding
 

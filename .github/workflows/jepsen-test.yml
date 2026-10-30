@@ -59,7 +59,6 @@ jobs:
       - name: Pre-fetch Go modules and build binary
         run: |
           mkdir -p "$GOCACHE" /tmp/go-tmp
-          GOPATH=$(go env GOPATH)
           export GOCACHE GOTMPDIR=/tmp/go-tmp
           go mod download
           go build -o /tmp/elastickv-bin .
@@ -143,7 +142,7 @@ jobs:
           done
 
           echo "Waiting for redis (63791-63793), dynamo (63801-63803), s3 (63901-63903), sqs (63501-63503) listeners and FUSE mounts..."
-          for i in {1..90}; do
+          for _ in {1..90}; do
             if nc -z 127.0.0.1 63791 && nc -z 127.0.0.1 63792 && nc -z 127.0.0.1 63793 \
               && nc -z 127.0.0.1 63801 && nc -z 127.0.0.1 63802 && nc -z 127.0.0.1 63803 \
               && nc -z 127.0.0.1 63901 && nc -z 127.0.0.1 63902 && nc -z 127.0.0.1 63903 \
@@ -289,6 +288,13 @@ jobs:
             /tmp/s3-acceptance-source.txt
           retention-days: 14
           if-no-files-found: warn
+      - name: Run SQS Standard Jepsen workload against elastickv
+        working-directory: jepsen
+        timeout-minutes: 3
+        run: |
+          timeout 120 ~/lein run -m elastickv.sqs-workload --local \
+            --time-limit 5 --rate 5 --concurrency 5 --drain-time 40 \
+            --sqs-ports 63501,63502,63503 --host 127.0.0.1
       - name: Run SQS HT-FIFO Jepsen workload against elastickv
         working-directory: jepsen
         # The HT-FIFO workload runs sends and receives across a 4-partition
