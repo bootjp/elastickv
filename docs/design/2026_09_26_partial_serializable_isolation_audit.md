@@ -713,8 +713,10 @@ paths G0 names, behind a replicated activation.
 - **2PC: fence the PREPARE, not the COMMIT.** The section above moves the
   commit-timestamp allocation after the PREPAREs and fences the primary
   COMMIT. This branch keeps the allocation where it is (settled before
-  PREPARE, carried in `TxnMeta.CommitTS`) and fences each PREPARE against
-  it instead: a PREPARE whose `CommitTS` is at or below its group's
+  PREPARE, carried in `TxnMeta.CommitTS` or, when durable PREPARE evidence
+  is enabled, `TxnMeta.PrepareCommitTS`) and fences each PREPARE against
+  the same timestamp used for its route floor and durable lock proof. A
+  PREPARE whose settled timestamp is at or below its group's
   watermark is rejected with a write conflict, and the coordinator aborts
   the transaction as for any PREPARE conflict. Once a PREPARE applies, its
   write locks (at `start_ts < CommitTS`) are visible, so a reader at

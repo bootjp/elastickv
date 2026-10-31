@@ -104,6 +104,29 @@ func TestPrepareFencedOnceActivated(t *testing.T) {
 	require.NoError(t, applyFSMRequest(t, fsm, prepareRequest(7, 25, "p3", "p3")))
 }
 
+func TestPreparedEvidenceCommitTimestampIsFenced(t *testing.T) {
+	t.Parallel()
+	fsm, st := newCommitTSFenceFSM(t)
+	require.Nil(t, fsm.Apply(EncodePrepareEvidenceFence(0)))
+	activateCommitTSFence(t, fsm)
+	require.NoError(t, applyFSMRequest(t, fsm, rawPut(20, "watermark", "v")))
+
+	for _, hint := range []uint64{0, 999} {
+		stale := preparedEvidenceRequest(pb.Phase_PREPARE, 18)
+		meta, _, err := extractTxnMeta(stale.Mutations)
+		require.NoError(t, err)
+		meta.CommitTS = hint
+		stale.Mutations[0].Value = EncodeTxnMeta(meta)
+		err = applyFSMRequest(t, fsm, stale)
+		require.ErrorIs(t, err, store.ErrWriteConflict)
+		_, err = st.GetAt(t.Context(), txnLockKey([]byte("primary")), ^uint64(0))
+		require.ErrorIs(t, err, store.ErrKeyNotFound)
+	}
+
+	fresh := preparedEvidenceRequest(pb.Phase_PREPARE, 25)
+	require.NoError(t, applyFSMRequest(t, fsm, fresh))
+}
+
 // The activation persists: a new FSM over the same store fences without
 // seeing the entry again, and a replay of the entry is a no-op.
 func TestCommitTSFenceActivationPersists(t *testing.T) {

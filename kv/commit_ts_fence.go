@@ -91,10 +91,11 @@ func (f *kvFSM) applyCommitTSFenceActivation(ctx context.Context, body []byte) a
 // the COMMIT itself is not fenced. A transaction without a settled commit
 // timestamp, or a PREPARE that writes nothing, is not checked.
 func (f *kvFSM) checkPrepareCommitTSFence(meta TxnMeta, storeMuts []*store.KVPairMutation) error {
-	if !f.commitTSFenceEnabled.Load() || meta.CommitTS == 0 {
+	commitTS := prepareRouteFloorTimestamp(meta, 0)
+	if !f.commitTSFenceEnabled.Load() || commitTS == 0 {
 		return nil
 	}
-	if meta.CommitTS > f.store.LastCommitTS() {
+	if commitTS > f.store.LastCommitTS() {
 		return nil
 	}
 	for _, mut := range storeMuts {
