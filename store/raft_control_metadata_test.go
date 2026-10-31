@@ -126,6 +126,10 @@ func TestRaftControlMetadataReceiptAndJournalOnly(t *testing.T) {
 			require.NoError(t, api.ApplyRaftControlMetadata(t.Context(), func(ctx context.Context) error {
 				return api.StageRaftControlMetadata(ctx, []byte("J/9"), []byte("PREPARED"))
 			}))
+			err := api.ApplyRaftControlMetadata(t.Context(), func(ctx context.Context) error {
+				return api.StageRaftControlMetadata(ctx, []byte(RaftControlReceiptKeyPrefix+"9"), []byte("orphan"))
+			})
+			require.ErrorIs(t, err, ErrRaftControlScopeRequired)
 			require.Zero(t, s.LastCommitTS())
 			if _, ok := s.(*pebbleStore); ok {
 				_, present := raftEntryAppliedIndex(t, s)
@@ -138,7 +142,7 @@ func TestRaftControlMetadataReceiptAndJournalOnly(t *testing.T) {
 				return api.StageRaftControlMetadata(ctx, []byte("J/9"), []byte("FSM_RECEIPTED"))
 			}))
 			require.Zero(t, s.LastCommitTS())
-			err := api.ApplyRaftControlMetadata(t.Context(), func(ctx context.Context) error {
+			err = api.ApplyRaftControlMetadata(t.Context(), func(ctx context.Context) error {
 				require.NoError(t, api.StageRaftControlMetadata(ctx, []byte("J/9"), []byte("bad")))
 				require.Error(t, s.ApplyMutationsRaftAt(ctx, raftEntryPut("forbidden", "data"), nil, 10, 10, 0))
 				return nil

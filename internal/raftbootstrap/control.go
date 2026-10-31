@@ -18,6 +18,10 @@ const (
 
 var controlMagic = [2]byte{'B', 'C'}
 
+func IsReservedControlPayload(payload []byte) bool {
+	return len(payload) != 0 && payload[0] == controlPrefix
+}
+
 type ControlKind uint8
 
 const (

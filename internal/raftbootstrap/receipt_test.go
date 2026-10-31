@@ -1,6 +1,7 @@
 package raftbootstrap
 
 import (
+	"bytes"
 	"encoding/hex"
 	"testing"
 
@@ -70,4 +71,92 @@ func TestReceiptKeyCollidesOnlyOnEntrySlot(t *testing.T) {
 	nextKey, err := ReceiptKey(next)
 	require.NoError(t, err)
 	require.NotEqual(t, key, nextKey)
+}
+
+func TestGuardedReceiptRoundTripAndGoldenSize(t *testing.T) {
+	command := testGuardedCommand(ControlGuardedWatermark)
+	receipt := GuardedReceipt{
+		Entry: EntryIdentity{Cluster: command.Witness.Cluster, Group: command.Witness.Group, Index: 21, Term: 8, Digest: Digest{9}},
+		Kind:  ControlGuardedWatermark, Verdict: GuardedReceiptApplied,
+		OperationID: command.OperationID, Witness: command.Witness, RequestedWatermark: 99, ReturnedWatermark: 99,
+	}
+	encoded, err := EncodeGuardedReceipt(receipt)
+	require.NoError(t, err)
+	require.Len(t, encoded, guardedReceiptSize)
+	require.Equal(t, guardedReceiptMagic, string(encoded[:len(guardedReceiptMagic)]))
+	parsed, err := ParseGuardedReceipt(encoded)
+	require.NoError(t, err)
+	require.Equal(t, receipt, parsed)
+
+	encoded[len(encoded)-1] ^= 1
+	require.Equal(t, uint64(99), parsed.ReturnedWatermark, "parsed receipt must not alias input")
+}
+
+func TestGuardedReceiptRejectsMalformedAndInconsistentRecords(t *testing.T) {
+	command := testGuardedCommand(ControlGuardedCatalog)
+	valid := GuardedReceipt{
+		Entry: EntryIdentity{Cluster: command.Witness.Cluster, Group: command.Witness.Group, Index: 21, Term: 8, Digest: Digest{9}},
+		Kind:  ControlGuardedCatalog, Verdict: GuardedReceiptApplied,
+		OperationID: command.OperationID, Witness: command.Witness,
+	}
+	encoded, err := EncodeGuardedReceipt(valid)
+	require.NoError(t, err)
+	for i := range encoded {
+		_, err = ParseGuardedReceipt(encoded[:i])
+		require.ErrorIs(t, err, ErrInvalid, "length %d", i)
+	}
+	badMagic := bytes.Clone(encoded)
+	badMagic[0] ^= 1
+	_, err = ParseGuardedReceipt(badMagic)
+	require.ErrorIs(t, err, ErrInvalid)
+
+	for _, mutate := range []func(*GuardedReceipt){
+		func(r *GuardedReceipt) { r.Entry.Cluster[0]++ },
+		func(r *GuardedReceipt) { r.Entry.Group++ },
+		func(r *GuardedReceipt) { r.Entry.Index = 0 },
+		func(r *GuardedReceipt) { r.Kind = ControlActivate },
+		func(r *GuardedReceipt) { r.Verdict = 0 },
+		func(r *GuardedReceipt) { r.OperationID = OperationID{} },
+		func(r *GuardedReceipt) { r.Witness.Generation = 0 },
+		func(r *GuardedReceipt) { r.ReturnedWatermark = 1 },
+	} {
+		candidate := valid
+		mutate(&candidate)
+		_, err = EncodeGuardedReceipt(candidate)
+		require.ErrorIs(t, err, ErrInvalid)
+	}
+}
+
+func TestGuardedReceiptRejectionsCannotCarryInnerResult(t *testing.T) {
+	command := testGuardedCommand(ControlGuardedWatermark)
+	for _, verdict := range []GuardedReceiptVerdict{GuardedReceiptRejectedStaleWitness, GuardedReceiptRejectedReservation} {
+		receipt := GuardedReceipt{
+			Entry: EntryIdentity{Cluster: command.Witness.Cluster, Group: command.Witness.Group, Index: 21, Term: 8, Digest: Digest{9}},
+			Kind:  ControlGuardedWatermark, Verdict: verdict,
+			OperationID: command.OperationID, Witness: command.Witness, RequestedWatermark: 99,
+		}
+		encoded, err := EncodeGuardedReceipt(receipt)
+		require.NoError(t, err)
+		_, err = ParseGuardedReceipt(encoded)
+		require.NoError(t, err)
+
+		receipt.ReturnedWatermark = 99
+		_, err = EncodeGuardedReceipt(receipt)
+		require.ErrorIs(t, err, ErrInvalid)
+	}
+}
+
+func TestGuardedWatermarkReceiptMustCoverRequestedValue(t *testing.T) {
+	command := testGuardedCommand(ControlGuardedWatermark)
+	receipt := GuardedReceipt{
+		Entry: EntryIdentity{Cluster: command.Witness.Cluster, Group: command.Witness.Group, Index: 21, Term: 8, Digest: Digest{9}},
+		Kind:  ControlGuardedWatermark, Verdict: GuardedReceiptApplied,
+		OperationID: command.OperationID, Witness: command.Witness,
+		RequestedWatermark: 99, ReturnedWatermark: 98,
+	}
+	_, err := EncodeGuardedReceipt(receipt)
+	require.ErrorIs(t, err, ErrInvalid)
+	receipt.ReturnedWatermark = 100
+	_, err = EncodeGuardedReceipt(receipt)
+	require.NoError(t, err)
 }
