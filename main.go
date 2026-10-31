@@ -4601,6 +4601,9 @@ func setupDistributionCatalog(
 	runtimes []*raftGroupRuntime,
 	engine *distribution.Engine,
 ) (*distribution.CatalogStore, error) {
+	if err := validateNoExistingCommitTSFenceActivation(ctx, runtimes); err != nil {
+		return nil, err
+	}
 	catalogGroupID, err := distributionCatalogGroupID(engine)
 	if err != nil {
 		return nil, errors.Wrapf(err, "resolve distribution catalog group")
@@ -4630,6 +4633,22 @@ func setupDistributionCatalog(
 		return nil, errors.Wrapf(err, "initialize distribution catalog")
 	}
 	return distCatalog, nil
+}
+
+func validateNoExistingCommitTSFenceActivation(ctx context.Context, runtimes []*raftGroupRuntime) error {
+	for _, rt := range runtimes {
+		if rt == nil || rt.store == nil {
+			continue
+		}
+		active, err := kv.CommitTSFenceEnabled(ctx, rt.store)
+		if err != nil {
+			return errors.Wrapf(err, "read commit-ts fence activation for group %d", rt.spec.id)
+		}
+		if active {
+			return errors.WithStack(errors.Newf("group %d has an active commit-ts fence; replicated catalog bootstrap is required before startup", rt.spec.id))
+		}
+	}
+	return nil
 }
 
 func distributionCatalogGroupID(engine *distribution.Engine) (uint64, error) {

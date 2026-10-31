@@ -739,9 +739,12 @@ paths G0 names, behind a replicated activation.
   marker missing, but production startup rejects `--commitTSFence` until
   catalog bootstrap is replicated through Raft. Draft status does not stop
   an operator from setting the flag, whereas this startup gate prevents the
-  known replica-dependent watermark verdict. After the catalog prerequisite
-  is implemented, enablement also requires every node to understand tag
-  `0x1f`; an older replica fails to decode the entry and does not fence.
+  known replica-dependent watermark verdict. Startup also rejects a group
+  whose durable activation marker is already present, even with the flag off;
+  otherwise a restarted node could resume fencing before catalog bootstrap.
+  After the catalog prerequisite is implemented, enablement also requires
+  every node to understand tag `0x1f`; an older replica fails to decode the
+  entry and does not fence.
 - **Still open:** `DEL_PREFIX`; the replica-determinism caveat above (the
   fence compares against `LastCommitTS()`, which the catalog bootstrap's
   direct write also advances), shared with the one-phase fence; the 2PC
