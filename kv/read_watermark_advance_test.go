@@ -95,6 +95,40 @@ func TestShardStoreSnapshotReadAdvancesLaggingGroupWatermark(t *testing.T) {
 	require.NoError(t, f.onePhase(t, 2, s, 40, "b-k", "old+1", "b-k"))
 }
 
+func TestAdvanceReadWatermarkForGroupReturnsLocalApplyReceipt(t *testing.T) {
+	t.Parallel()
+	f := newTwoGroupReadFixture(t)
+
+	first, err := f.shards.AdvanceReadWatermarkForGroup(t.Context(), 2, 42)
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), first.GroupID)
+	require.Equal(t, uint64(42), first.RequestedTimestamp)
+	require.GreaterOrEqual(t, first.AppliedTimestamp, uint64(42))
+	require.NotZero(t, first.CommitIndex)
+	require.Equal(t, f.stores[2].LastCommitTS(), first.AppliedTimestamp)
+
+	second, err := f.shards.AdvanceReadWatermarkForGroup(t.Context(), 2, 42)
+	require.NoError(t, err)
+	require.Greater(t, second.CommitIndex, first.CommitIndex,
+		"an explicit startup fence must commit even when the watermark already covers it")
+	require.GreaterOrEqual(t, second.AppliedTimestamp, first.AppliedTimestamp)
+}
+
+func TestAdvanceReadWatermarkForGroupRejectsUnreceiptableRequests(t *testing.T) {
+	t.Parallel()
+	f := newTwoGroupReadFixture(t)
+
+	for _, ts := range []uint64{0, ^uint64(0)} {
+		_, err := f.shards.AdvanceReadWatermarkForGroup(t.Context(), 1, ts)
+		require.ErrorIs(t, err, ErrInvalidWatermarkAdvance)
+	}
+	farFuture := uint64(time.Now().Add(24*time.Hour).UnixMilli()) << hlcLogicalBits
+	_, err := f.shards.AdvanceReadWatermarkForGroup(t.Context(), 1, farFuture)
+	require.ErrorIs(t, err, ErrInvalidWatermarkAdvance)
+	_, err = f.shards.AdvanceReadWatermarkForGroup(t.Context(), 99, 42)
+	require.ErrorIs(t, err, ErrWatermarkAdvanceReceiptUnavailable)
+}
+
 // The same advance covers a single-route range read.
 func TestShardStoreSnapshotScanAdvancesLaggingGroupWatermark(t *testing.T) {
 	t.Parallel()

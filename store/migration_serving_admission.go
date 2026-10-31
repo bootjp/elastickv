@@ -112,8 +112,14 @@ func (s *mvccStore) MigrationServingAdmissionState(ctx context.Context) (Migrati
 	if err := ctx.Err(); err != nil {
 		return MigrationServingState{}, errors.WithStack(err)
 	}
+	if staged := s.memoryEntryStore(ctx); staged != nil {
+		return staged.MigrationServingAdmissionState(ctx)
+	}
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
+	if len(s.readinessOverlay) != 0 {
+		return s.migrationAdmission.view(mergedEntryReadiness(s.migrationReadinessCache, s.readinessOverlay)), nil
+	}
 	return s.migrationAdmission.view(s.migrationReadinessCache), nil
 }
 
@@ -123,6 +129,9 @@ func (s *pebbleStore) MigrationServingAdmissionState(ctx context.Context) (Migra
 	}
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
+	if sc := s.raftEntryScopeFrom(ctx); sc != nil && len(sc.readiness) != 0 {
+		return s.migrationAdmission.view(mergedEntryReadiness(s.migrationReadinessCache, sc.readiness)), nil
+	}
 	return s.migrationAdmission.view(s.migrationReadinessCache), nil
 }
 
@@ -130,9 +139,14 @@ func (s *mvccStore) MigrationServingSummary(ctx context.Context) (MigrationServi
 	if err := ctx.Err(); err != nil {
 		return MigrationServingSummary{}, errors.WithStack(err)
 	}
+	if staged := s.memoryEntryStore(ctx); staged != nil {
+		return staged.MigrationServingSummary(ctx)
+	}
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
-	return s.migrationAdmission.withReadiness(s.migrationReadinessCache), nil
+	view := s.migrationAdmission.withReadiness(s.migrationReadinessCache)
+	view.Present = view.Present || len(s.readinessOverlay) != 0
+	return view, nil
 }
 
 func (s *pebbleStore) MigrationServingSummary(ctx context.Context) (MigrationServingSummary, error) {
@@ -141,7 +155,11 @@ func (s *pebbleStore) MigrationServingSummary(ctx context.Context) (MigrationSer
 	}
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
-	return s.migrationAdmission.withReadiness(s.migrationReadinessCache), nil
+	view := s.migrationAdmission.withReadiness(s.migrationReadinessCache)
+	if sc := s.raftEntryScopeFrom(ctx); sc != nil {
+		view.Present = view.Present || len(sc.readiness) != 0
+	}
+	return view, nil
 }
 
 var _ MigrationServingAdmissionReader = (*mvccStore)(nil)

@@ -56,6 +56,9 @@ func validateRestoreTempDB(dir string, validate func(string) error) error {
 }
 
 func validateExternalMVCCTree(ctx context.Context, tree *treemap.Map, meta mvccSnapshotMigrationMetadata) error {
+	if len(meta.raftControl) != 0 || meta.controlAppliedIndex != 0 {
+		return errors.WithStack(ErrExternalSnapshotControlState)
+	}
 	if len(meta.acks)+len(meta.floors)+len(meta.promotions)+len(meta.readiness)+len(meta.retired)+len(meta.ownership) != 0 || partitionHasEvidence(meta.partitions) {
 		return errors.WithStack(ErrExternalSnapshotMigrationState)
 	}
@@ -111,6 +114,9 @@ func validateExternalPebbleRows(ctx context.Context, db *pebble.DB) error {
 }
 
 func validateExternalPebbleRow(key, value []byte) error {
+	if IsRaftControlMetadataKey(key) {
+		return errors.WithStack(ErrExternalSnapshotControlState)
+	}
 	if isMigrationMetadataKey(key) {
 		return validateExternalMigrationRow(key, value)
 	}
@@ -175,6 +181,9 @@ func externalMigrationCollection(size int, valid bool) error {
 }
 
 func validateExternalTypedMigrationKey(key []byte) error {
+	if IsRaftControlMetadataKey(key) {
+		return errors.WithStack(ErrExternalSnapshotControlState)
+	}
 	// Keep these logical-key guards aligned with distribution's migration-only
 	// control namespaces. Raw store metadata is decoded separately above.
 	for _, prefix := range []string{"!dist|migstage|", "!migstage|", "!migwrite|", "!migfence|", "!dist|meta|ownership_partition/"} {

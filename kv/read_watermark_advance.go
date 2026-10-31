@@ -3,6 +3,7 @@ package kv
 import (
 	"context"
 	"encoding/binary"
+	"time"
 
 	"github.com/cockroachdb/errors"
 )
@@ -28,7 +29,22 @@ const raftEncodeWatermarkAdvance byte = 0x17
 
 const watermarkAdvancePayloadLen = 8
 
+const watermarkAdvanceApplyPollInterval = 10 * time.Millisecond
+
 var ErrInvalidWatermarkAdvance = errors.New("invalid read watermark advance")
+
+var ErrWatermarkAdvanceReceiptUnavailable = errors.New("read watermark advance apply receipt is unavailable")
+
+// AppliedWatermarkReceipt proves that the local FSM has applied the Raft entry
+// that carried an explicit watermark advance. AppliedTimestamp is the local
+// durable watermark after that entry; it can exceed RequestedTimestamp when a
+// later committed entry applied before the caller observed the receipt.
+type AppliedWatermarkReceipt struct {
+	GroupID            uint64
+	RequestedTimestamp uint64
+	AppliedTimestamp   uint64
+	CommitIndex        uint64
+}
 
 // EncodeWatermarkAdvance returns the Raft payload that raises a group's
 // applied commit watermark to ts.
@@ -121,6 +137,106 @@ func (s *ShardStore) ensureReadWatermark(ctx context.Context, g *ShardGroup, ts 
 		}
 	}
 	return nil
+}
+
+// AdvanceReadWatermarkForGroup always proposes an explicit watermark advance
+// to groupID and waits until the proposal's commit index is applied locally.
+// It is intended for startup/control protocols that must establish an exact
+// replicated read boundary; ordinary reads should use ensureReadWatermark.
+func (s *ShardStore) AdvanceReadWatermarkForGroup(ctx context.Context, groupID, ts uint64) (AppliedWatermarkReceipt, error) {
+	receipt := AppliedWatermarkReceipt{GroupID: groupID, RequestedTimestamp: ts}
+	g, err := s.explicitWatermarkAdvanceTarget(groupID, ts)
+	if err != nil {
+		return receipt, err
+	}
+	commitIndex, err := s.proposeExplicitWatermarkAdvance(ctx, g, ts)
+	if err != nil {
+		return receipt, err
+	}
+	receipt.CommitIndex = commitIndex
+	if err := waitForLocalAppliedIndex(ctx, g, commitIndex); err != nil {
+		return receipt, err
+	}
+	receipt.AppliedTimestamp = g.Store.LastCommitTS()
+	if receipt.AppliedTimestamp < ts {
+		return receipt, errors.Wrapf(ErrWatermarkAdvanceReceiptUnavailable,
+			"group %d applied index %d but watermark %d is below requested %d",
+			groupID, commitIndex, receipt.AppliedTimestamp, ts)
+	}
+	return receipt, nil
+}
+
+func (s *ShardStore) explicitWatermarkAdvanceTarget(groupID, ts uint64) (*ShardGroup, error) {
+	if s == nil || ts == 0 || ts == ^uint64(0) || !ReadWatermarkAdvanceAdmissible(time.Now().UnixMilli(), ts) {
+		return nil, errors.WithStack(ErrInvalidWatermarkAdvance)
+	}
+	g, ok := s.groups[groupID]
+	if !ok || g == nil || g.Store == nil || engineForGroup(g) == nil {
+		return nil, errors.Wrapf(ErrWatermarkAdvanceReceiptUnavailable, "raft group %d", groupID)
+	}
+	return g, nil
+}
+
+func (s *ShardStore) proposeExplicitWatermarkAdvance(ctx context.Context, g *ShardGroup, ts uint64) (uint64, error) {
+	proposer := NewLeaderAdminProposer(g.Engine, g.Proposer(), &s.connCache, WithLeaderAdminToken(g.forwardedLeaderReadToken()))
+	result, err := proposer.ProposeAdmin(ctx, EncodeWatermarkAdvance(ts))
+	if err != nil {
+		return 0, errors.Wrap(err, "advance read watermark")
+	}
+	if result == nil || result.CommitIndex == 0 {
+		return 0, errors.WithStack(ErrWatermarkAdvanceReceiptUnavailable)
+	}
+	if applyErr, ok := result.Response.(error); ok && applyErr != nil {
+		return 0, errors.Wrap(applyErr, "advance read watermark apply")
+	}
+	return result.CommitIndex, nil
+}
+
+type appliedIndexView interface {
+	AppliedIndex() uint64
+}
+
+type durableAppliedIndexView interface {
+	LastAppliedIndex() (uint64, bool, error)
+}
+
+func waitForLocalAppliedIndex(ctx context.Context, g *ShardGroup, want uint64) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ticker := time.NewTicker(watermarkAdvanceApplyPollInterval)
+	defer ticker.Stop()
+	for {
+		applied, supported, err := localAppliedIndex(g)
+		if err != nil {
+			return errors.Wrap(err, "read local applied index")
+		}
+		if !supported {
+			return errors.WithStack(ErrWatermarkAdvanceReceiptUnavailable)
+		}
+		if applied >= want {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return errors.Wrap(ctx.Err(), "wait for local watermark advance apply")
+		case <-ticker.C:
+		}
+	}
+}
+
+func localAppliedIndex(g *ShardGroup) (uint64, bool, error) {
+	if g == nil {
+		return 0, false, nil
+	}
+	if view, ok := g.Engine.(appliedIndexView); ok {
+		return view.AppliedIndex(), true, nil
+	}
+	if view, ok := g.Store.(durableAppliedIndexView); ok {
+		index, present, err := view.LastAppliedIndex()
+		return index, present, errors.WithStack(err)
+	}
+	return 0, false, nil
 }
 
 // readWatermarkAdvanceNeeded reports whether a read at ts on g needs an

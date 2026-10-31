@@ -560,7 +560,11 @@ func (s *pebbleStore) readMigrationHLCFloorLocked(jobID uint64) (uint64, error) 
 }
 
 func (s *pebbleStore) readMigrationHLCFloors() (map[uint64]uint64, error) {
-	val, closer, err := s.db.Get(migrationHLCFloorMetaKeyBytes)
+	return readEntryMigrationFloors(s.db)
+}
+
+func readEntryMigrationFloors(reader pebble.Reader) (map[uint64]uint64, error) {
+	val, closer, err := reader.Get(migrationHLCFloorMetaKeyBytes)
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
 			return make(map[uint64]uint64), nil
@@ -575,20 +579,20 @@ func (s *pebbleStore) readMigrationHLCFloors() (map[uint64]uint64, error) {
 	return floors, nil
 }
 
-func (s *pebbleStore) MigrationHLCFloor(_ context.Context, jobID uint64) (uint64, error) {
+func (s *pebbleStore) MigrationHLCFloor(ctx context.Context, jobID uint64) (uint64, error) {
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
-	floor, err := s.readMigrationHLCFloorLocked(jobID)
+	floors, err := readEntryMigrationFloors(s.raftEntryReader(ctx))
 	if err != nil {
 		return 0, err
 	}
-	return floor, nil
+	return floors[jobID], nil
 }
 
-func (s *pebbleStore) MigrationImportMetadataPresent(_ context.Context, jobID uint64) (bool, error) {
+func (s *pebbleStore) MigrationImportMetadataPresent(ctx context.Context, jobID uint64) (bool, error) {
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
-	floors, err := s.readMigrationHLCFloors()
+	floors, err := readEntryMigrationFloors(s.raftEntryReader(ctx))
 	if err != nil {
 		return false, err
 	}

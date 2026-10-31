@@ -2,6 +2,8 @@ package raftengine
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"io"
 )
 
@@ -67,6 +69,40 @@ type StateMachine interface {
 // for the field this hint backs.
 type ApplyIndexAware interface {
 	SetApplyIndex(idx uint64)
+}
+
+// AppliedEntryIdentity identifies the committed plaintext entry currently
+// being applied. Digest is domain-separated and covers Type plus the exact
+// plaintext payload handed to StateMachine.Apply.
+type AppliedEntryIdentity struct {
+	Index  uint64
+	Term   uint64
+	Type   int32
+	Digest [sha256.Size]byte
+}
+
+// NewAppliedEntryIdentity constructs the canonical identity used by protected
+// control receipts. The payload length is framed so concatenations cannot
+// alias, and hashing happens after any transport envelope is decrypted.
+func NewAppliedEntryIdentity(index, term uint64, entryType int32, payload []byte) AppliedEntryIdentity {
+	h := sha256.New()
+	_, _ = h.Write([]byte("elastickv/raft-entry/v1\x00"))
+	var framed [12]byte
+	binary.BigEndian.PutUint32(framed[:4], uint32(entryType)) //nolint:gosec // preserves the signed protobuf enum's canonical 32-bit representation.
+	binary.BigEndian.PutUint64(framed[4:], uint64(len(payload)))
+	_, _ = h.Write(framed[:])
+	_, _ = h.Write(payload)
+	var digest [sha256.Size]byte
+	copy(digest[:], h.Sum(nil))
+	return AppliedEntryIdentity{Index: index, Term: term, Type: entryType, Digest: digest}
+}
+
+// ApplyEntryIdentityAware is the stronger optional apply seam used by FSMs
+// that persist exact replay receipts. Engines call it instead of
+// ApplyIndexAware immediately before the matching Apply call.
+type ApplyEntryIdentityAware interface {
+	SetApplyEntryIdentity(AppliedEntryIdentity)
+	ClearApplyEntryIdentity()
 }
 
 // AppliedConfigurationAware records the actual ConfChange index on the serial

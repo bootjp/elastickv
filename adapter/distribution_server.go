@@ -1544,25 +1544,9 @@ func nextCatalogSplitIDs(expectedVersion uint64, rightRouteID uint64) (uint64, u
 }
 
 func catalogStoreMutationsToOps(mutations []*store.KVPairMutation) ([]*kv.Elem[kv.OP], error) {
-	ops := make([]*kv.Elem[kv.OP], 0, len(mutations))
-	for _, mutation := range mutations {
-		if mutation == nil {
-			return nil, errors.WithStack(errDistributionCatalogMutationInvalid)
-		}
-		var op kv.OP
-		switch mutation.Op {
-		case store.OpTypePut:
-			op = kv.Put
-		case store.OpTypeDelete:
-			op = kv.Del
-		default:
-			return nil, errors.Wrapf(errDistributionCatalogMutationInvalid, "unknown operation %d", mutation.Op)
-		}
-		ops = append(ops, &kv.Elem[kv.OP]{
-			Op:    op,
-			Key:   distribution.CloneBytes(mutation.Key),
-			Value: distribution.CloneBytes(mutation.Value),
-		})
+	ops, err := kv.StoreMutationsToElems(mutations)
+	if err != nil {
+		return nil, errors.WithStack(errors.Join(errDistributionCatalogMutationInvalid, err))
 	}
 	return ops, nil
 }

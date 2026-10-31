@@ -19,7 +19,8 @@ import (
 // the FSM, so the tail is never applied on that replica while every other
 // replica applied all of it (serializable isolation audit, G17).
 //
-// Inside fn, ApplyMutationsRaftAt and DeletePrefixesAtRaftAt stage into one
+// Inside fn, ApplyMutationsRaftAt, DeletePrefixesAtRaftAt and migration
+// readiness tracker updates stage into one
 // indexed batch and validate through it, so a later request observes an
 // earlier request's writes exactly as it would after a per-request commit.
 // The batch is committed once, with one applied-index write, after fn
@@ -32,6 +33,9 @@ import (
 // encryption failure) is replica-local, so it fails the whole scope rather
 // than one request: committing the rest of the entry would diverge from
 // the replicas where the request succeeded (found in review).
+// Other typed migration commands are dispatched before this scope by kvFSM;
+// they are not supported within the callback. Direct non-indexed writers must
+// run outside the callback, and wait for applyMu like unrelated writers.
 type RaftEntryApplier interface {
 	ApplyRaftEntry(ctx context.Context, appliedIndex uint64, fn func(ctx context.Context) error) error
 }
@@ -71,9 +75,10 @@ type raftEntryScope struct {
 	db           *pebble.DB
 	batch        *pebble.Batch
 	appliedIndex uint64
-	// maxCommitTS is the highest commit timestamp staged so far; it becomes
-	// the entry's lastCommitTS advance at commit.
-	maxCommitTS uint64
+	// OCC counts every staged version, including non-advertised projections.
+	// Only advertised commits may advance the data watermark at publication.
+	maxStagedTS           uint64
+	maxAdvertisedCommitTS uint64
 	// advance records that at least one staged request advances
 	// lastCommitTS, mirroring the advanceLastCommitTS argument of the
 	// per-request path.
@@ -81,7 +86,11 @@ type raftEntryScope struct {
 	// touched records that at least one request staged or observed
 	// something, so an entry whose every request failed validation commits
 	// nothing, as the per-request path does.
-	touched bool
+	touched     bool
+	dataTouched bool
+	forceSync   bool
+	controlOnly bool
+	readiness   map[uint64]TargetStagedReadinessState
 	// failed is the first staging error; once set, every later staging call
 	// and the commit return it, so a partially staged request can never
 	// land.
@@ -99,15 +108,23 @@ func (s *pebbleStore) raftEntryScopeFrom(ctx context.Context) *raftEntryScope {
 	return scope
 }
 
+// The caller holds dbMu.RLock. Scoped reads must observe earlier staged writes.
+func (s *pebbleStore) raftEntryReader(ctx context.Context) pebble.Reader {
+	if scope := s.raftEntryScopeFrom(ctx); scope != nil {
+		return scope.batch
+	}
+	return s.db
+}
+
 func (sc *raftEntryScope) observe(commitTS uint64, advance bool) {
 	sc.touched = true
+	sc.dataTouched = true
+	sc.maxStagedTS = max(sc.maxStagedTS, commitTS)
 	if !advance {
 		return
 	}
 	sc.advance = true
-	if commitTS > sc.maxCommitTS {
-		sc.maxCommitTS = commitTS
-	}
+	sc.maxAdvertisedCommitTS = max(sc.maxAdvertisedCommitTS, commitTS)
 }
 
 func (sc *raftEntryScope) fail(err error) error {
@@ -123,7 +140,7 @@ func (sc *raftEntryScope) fail(err error) error {
 // request's timestamp is therefore still validated against it, exactly as
 // it is after a per-request commit.
 func (sc *raftEntryScope) hasCommitsAfter(startTS uint64) bool {
-	return sc.store.hasCommitsAfter(startTS) || (sc.advance && sc.maxCommitTS > startTS)
+	return sc.store.hasCommitsAfter(startTS) || sc.maxStagedTS > startTS
 }
 
 func (sc *raftEntryScope) checkIndex(appliedIndex uint64) error {
@@ -131,6 +148,16 @@ func (sc *raftEntryScope) checkIndex(appliedIndex uint64) error {
 		return sc.fail(errors.Wrapf(ErrRaftEntryIndexMismatch, "scope index=%d call index=%d", sc.appliedIndex, appliedIndex))
 	}
 	return nil
+}
+
+func (sc *raftEntryScope) checkDataIndex(index uint64) error {
+	if sc.failed != nil {
+		return sc.failed
+	}
+	if sc.controlOnly {
+		return sc.fail(errors.Wrap(ErrNotSupported, "data mutation in journal-only scope"))
+	}
+	return sc.checkIndex(index)
 }
 
 // ApplyRaftEntry implements RaftEntryApplier. It holds applyMu from before
@@ -149,13 +176,27 @@ func (sc *raftEntryScope) checkIndex(appliedIndex uint64) error {
 // held read lock. The nested staging calls detect the scope through ctx
 // and take neither lock again.
 func (s *pebbleStore) ApplyRaftEntry(ctx context.Context, appliedIndex uint64, fn func(ctx context.Context) error) error {
-	if s.raftEntryScopeFrom(ctx) != nil {
-		return fn(ctx)
+	return s.applyRaftEntry(ctx, appliedIndex, false, fn)
+}
+
+func (s *pebbleStore) applyRaftEntry(ctx context.Context, appliedIndex uint64, controlOnly bool, fn func(ctx context.Context) error) error {
+	if scope := s.raftEntryScopeFrom(ctx); scope != nil {
+		if scope.controlOnly != controlOnly {
+			return scope.fail(errors.WithStack(ErrRaftControlScopeRequired))
+		}
+		if err := scope.checkIndex(appliedIndex); err != nil {
+			return err
+		}
+		if err := fn(ctx); err != nil {
+			return scope.fail(err)
+		}
+		return scope.failed
 	}
 	s.applyMu.Lock()
 	defer s.applyMu.Unlock()
 
 	scope := s.newRaftEntryScope(appliedIndex)
+	scope.controlOnly = controlOnly
 	defer func() { _ = scope.batch.Close() }()
 
 	if err := fn(context.WithValue(ctx, raftEntryScopeKey{}, scope)); err != nil {
@@ -163,6 +204,9 @@ func (s *pebbleStore) ApplyRaftEntry(ctx context.Context, appliedIndex uint64, f
 	}
 	if scope.failed != nil {
 		return scope.failed
+	}
+	if err := ctx.Err(); err != nil {
+		return errors.WithStack(err)
 	}
 	return s.commitRaftEntryScope(scope)
 }
@@ -191,28 +235,63 @@ func (s *pebbleStore) commitRaftEntryScope(scope *raftEntryScope) error {
 	if s.db != scope.db {
 		return errors.WithStack(ErrRaftEntryStoreSwapped)
 	}
+	if err := s.validateRaftControlIndex(scope); err != nil {
+		return err
+	}
 
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 	newLastTS := s.lastCommitTS
 	if scope.advance {
-		if scope.maxCommitTS > newLastTS {
-			newLastTS = scope.maxCommitTS
-		}
-		if err := setPebbleUint64InBatch(scope.batch, metaLastCommitTSBytes, newLastTS); err != nil {
-			return err
+		if scope.maxAdvertisedCommitTS > newLastTS {
+			newLastTS = scope.maxAdvertisedCommitTS
 		}
 	}
-	if scope.appliedIndex > 0 {
-		if err := setPebbleUint64InBatch(scope.batch, metaAppliedIndexBytes, scope.appliedIndex); err != nil {
-			return err
-		}
+	if err := stageRaftEntryCommitMetadata(scope, newLastTS); err != nil {
+		return err
 	}
-	if err := scope.batch.Commit(s.raftApplyWriteOpts()); err != nil {
+	opts := s.raftApplyWriteOpts()
+	if scope.forceSync {
+		opts = pebble.Sync
+	}
+	if err := scope.batch.Commit(opts); err != nil {
 		return errors.WithStack(err)
 	}
+	s.publishRaftEntryMirrors(scope, newLastTS)
+	return nil
+}
+
+func (s *pebbleStore) publishRaftEntryMirrors(scope *raftEntryScope, newLastTS uint64) {
 	if scope.advance {
 		s.updateLastCommitTS(newLastTS)
+	}
+	for _, state := range scope.readiness {
+		s.migrationReadinessCache = upsertTargetStagedReadinessStateCache(s.migrationReadinessCache, state)
+	}
+}
+
+func (s *pebbleStore) validateRaftControlIndex(scope *raftEntryScope) error {
+	if !scope.forceSync || scope.controlOnly || scope.appliedIndex == 0 {
+		return nil
+	}
+	index, present, err := s.readAppliedIndexLocked()
+	if err != nil {
+		return err
+	}
+	if present && index > scope.appliedIndex {
+		return errors.WithStack(ErrRaftControlStaleIndex)
+	}
+	return nil
+}
+
+func stageRaftEntryCommitMetadata(scope *raftEntryScope, lastTS uint64) error {
+	if scope.advance {
+		if err := setPebbleUint64InBatch(scope.batch, metaLastCommitTSBytes, lastTS); err != nil {
+			return err
+		}
+	}
+	if scope.appliedIndex != 0 {
+		return setPebbleUint64InBatch(scope.batch, metaAppliedIndexBytes, scope.appliedIndex)
 	}
 	return nil
 }
@@ -226,10 +305,7 @@ func (s *pebbleStore) stageMutationsInRaftEntry(ctx context.Context, scope *raft
 }
 
 func (s *pebbleStore) stageMutationsInRaftEntryWithFence(ctx context.Context, scope *raftEntryScope, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS, appliedIndex uint64, fenced bool) error {
-	if scope.failed != nil {
-		return scope.failed
-	}
-	if err := scope.checkIndex(appliedIndex); err != nil {
+	if err := scope.checkDataIndex(appliedIndex); err != nil {
 		return err
 	}
 	s.dbMu.RLock()
@@ -269,6 +345,32 @@ func (s *pebbleStore) checkRaftEntryMutationConflicts(ctx context.Context, scope
 	return s.checkApplyConflictsWith(ctx, scope.batch, scope.hasCommitsAfter, mutations, readKeys, startTS, false)
 }
 
+func (s *pebbleStore) stagePreservingMutationsInRaftEntry(ctx context.Context, scope *raftEntryScope, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS uint64) error {
+	if scope.failed != nil {
+		return scope.failed
+	}
+	if scope.controlOnly {
+		return scope.fail(errors.Wrap(ErrNotSupported, "data mutation in journal-only scope"))
+	}
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+	if s.db != scope.db {
+		return scope.fail(errors.WithStack(ErrRaftEntryStoreSwapped))
+	}
+	if err := s.checkApplyConflictsWith(ctx, scope.batch, scope.hasCommitsAfter, mutations, readKeys, startTS, true); err != nil {
+		return scope.failUnlessVerdict(err)
+	}
+	encoded, err := s.encodeMutationsForBatch(mutations, commitTS, false)
+	if err != nil {
+		return scope.failUnlessVerdict(err)
+	}
+	if err := stageEncodedMutations(scope.batch, encoded); err != nil {
+		return scope.fail(err)
+	}
+	scope.observe(commitTS, false)
+	return nil
+}
+
 func (s *pebbleStore) raftEntryMutationAlreadyLanded(scope *raftEntryScope, mutations []*KVPairMutation, commitTS, appliedIndex uint64, fenced bool) (bool, bool, error) {
 	if appliedIndex == 0 {
 		return false, false, nil
@@ -280,7 +382,7 @@ func (s *pebbleStore) raftEntryMutationAlreadyLanded(scope *raftEntryScope, muta
 	if present && appliedIndex < persisted {
 		return true, false, nil
 	}
-	if (present && appliedIndex == persisted) || (scope.touched && !fenced) {
+	if (present && appliedIndex == persisted) || (scope.dataTouched && !fenced) {
 		landed, err := s.raftApplyAlreadyLandedWith(scope.batch, mutations, commitTS)
 		return landed, landed, err
 	}
@@ -302,6 +404,9 @@ func (sc *raftEntryScope) failUnlessVerdict(err error) error {
 // after a per-request commit; the iterator does not observe the tombstones
 // this call stages, which matches the DB iterator of the per-request path.
 func (s *pebbleStore) stagePrefixDeletesInRaftEntry(scope *raftEntryScope, deletes []PrefixDelete, commitTS, appliedIndex uint64) error {
+	if scope.controlOnly {
+		return scope.fail(errors.Wrap(ErrNotSupported, "prefix delete in journal-only scope"))
+	}
 	if len(deletes) == 0 {
 		return nil
 	}
