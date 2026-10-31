@@ -3017,6 +3017,8 @@ func (e *Engine) applyNormalCommitted(entry raftpb.Entry) error {
 // applyCommitted (extracted for cyclomatic-budget hygiene; see
 // applyNormalCommitted).
 func (e *Engine) applyConfChangeCommitted(entry raftpb.Entry) error {
+	clearIdentity := e.deliverApplyIdentity(entry, entry.GetData())
+	defer clearIdentity()
 	var cc raftpb.ConfChange
 	if err := proto.Unmarshal(entry.GetData(), &cc); err != nil {
 		return errors.WithStack(err)
@@ -3041,6 +3043,8 @@ func (e *Engine) applyConfChangeCommitted(entry raftpb.Entry) error {
 // applyConfChangeV2Committed is the EntryConfChangeV2 arm of
 // applyCommitted.
 func (e *Engine) applyConfChangeV2Committed(entry raftpb.Entry) error {
+	clearIdentity := e.deliverApplyIdentity(entry, entry.GetData())
+	defer clearIdentity()
 	var cc raftpb.ConfChangeV2
 	if err := proto.Unmarshal(entry.GetData(), &cc); err != nil {
 		return errors.WithStack(err)
@@ -3163,7 +3167,7 @@ func (e *Engine) applyNormalEntry(entry raftpb.Entry, dropIfNonVolatile bool) (a
 	if dropIfNonVolatile && !e.isVolatilePayload(payload) {
 		return nil, nil
 	}
-	// SetApplyIndex is suppressed on the duplicate-replay path
+	// Apply identity delivery is suppressed on the duplicate-replay path
 	// because pendingApplyIdx is documented as "the entry index the
 	// engine is about to apply". On a volatile replay entry.Index is
 	// BELOW e.applied; writing it would feed a stale index to any
@@ -3174,11 +3178,23 @@ func (e *Engine) applyNormalEntry(entry raftpb.Entry, dropIfNonVolatile bool) (a
 	// volatile entry type that also persists. Claude #934 round 7
 	// finding R7-F1.
 	if !dropIfNonVolatile {
-		if aware, ok := e.fsm.(raftengine.ApplyIndexAware); ok {
-			aware.SetApplyIndex(entry.GetIndex())
-		}
+		clearIdentity := e.deliverApplyIdentity(entry, payload)
+		defer clearIdentity()
 	}
 	return e.fsm.Apply(payload), nil
+}
+
+func (e *Engine) deliverApplyIdentity(entry raftpb.Entry, payload []byte) func() {
+	if aware, ok := e.fsm.(raftengine.ApplyEntryIdentityAware); ok {
+		aware.SetApplyEntryIdentity(raftengine.NewAppliedEntryIdentity(
+			entry.GetIndex(), entry.GetTerm(), int32(entry.GetType()), payload,
+		))
+		return aware.ClearApplyEntryIdentity
+	}
+	if aware, ok := e.fsm.(raftengine.ApplyIndexAware); ok {
+		aware.SetApplyIndex(entry.GetIndex())
+	}
+	return func() {}
 }
 
 // isVolatilePayload is the cold-start duplicate guard's cleartext

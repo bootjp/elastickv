@@ -65,6 +65,11 @@ type kvFSM struct {
 	// write", preserving Stage 6A behavior for backends that did
 	// not opt in).
 	pendingApplyIdx uint64
+	// pendingApplyIdentity is the stronger replay identity supplied by engines
+	// that support protected control receipts. Direct SetApplyIndex callers
+	// clear it so a test or legacy engine cannot accidentally reuse stale term
+	// or digest evidence.
+	pendingApplyIdentity raftengine.AppliedEntryIdentity
 	// readTracker is shared with the local FSM compactor. BackupPin
 	// FSM entries mutate this tracker so compaction retains versions
 	// at the live-backup read timestamp until the pin is released or
@@ -188,6 +193,19 @@ type RouteSnapshot interface {
 // leave it at 0 to opt out, matching the pre-Stage-6C-2d default).
 func (f *kvFSM) SetApplyIndex(idx uint64) {
 	f.pendingApplyIdx = idx
+	f.pendingApplyIdentity = raftengine.AppliedEntryIdentity{}
+}
+
+// SetApplyEntryIdentity implements raftengine.ApplyEntryIdentityAware.
+func (f *kvFSM) SetApplyEntryIdentity(identity raftengine.AppliedEntryIdentity) {
+	f.pendingApplyIdx = identity.Index
+	f.pendingApplyIdentity = identity
+}
+
+// ClearApplyEntryIdentity invalidates term/hash provenance after the matching
+// normal or configuration entry finishes its serial apply attempt.
+func (f *kvFSM) ClearApplyEntryIdentity() {
+	f.pendingApplyIdentity = raftengine.AppliedEntryIdentity{}
 }
 
 // LastAppliedIndex implements raftengine.AppliedIndexReader by
@@ -379,6 +397,10 @@ type fsmApplyResponse struct {
 }
 
 func (f *kvFSM) Apply(data []byte) any {
+	// Full provenance is valid for exactly one engine-delivered Apply call.
+	// Keep pendingApplyIdx for legacy direct callers, but never let term/hash
+	// evidence leak into a later call that did not receive its own identity.
+	defer f.ClearApplyEntryIdentity()
 	if f.replicatedPinLoadErr != nil {
 		return replicatedBackupHalt(f.replicatedPinLoadErr, "load journal")
 	}
