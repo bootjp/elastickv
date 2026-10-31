@@ -1414,7 +1414,8 @@ func (c *ShardedCoordinator) dispatchRawWithComposed1Retry(ctx context.Context, 
 		if err == nil {
 			return resp, nil
 		}
-		if !errors.Is(err, ErrComposed1VersionGCd) || attempt == composed1RetryAttempts || c.engine == nil {
+		if errors.Is(err, ErrTransactionOutcomeUnknown) ||
+			!errors.Is(err, ErrComposed1VersionGCd) || attempt == composed1RetryAttempts || c.engine == nil {
 			return resp, err
 		}
 		if !shape.singleRequest() || !c.canRetryRawVersionGC(reqs) {

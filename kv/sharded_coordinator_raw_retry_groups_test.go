@@ -2,6 +2,7 @@ package kv
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
@@ -9,6 +10,38 @@ import (
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 )
+
+func TestRawRetryDoesNotReplayUnknownOutcome(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{name: "write conflict", err: errors.Join(ErrTransactionOutcomeUnknown, store.NewWriteConflictError([]byte("k")))},
+		{name: "version GC", err: errors.Join(ErrTransactionOutcomeUnknown, ErrComposed1VersionGCd)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			engine := distribution.NewEngine()
+			require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+				Version: 1,
+				Routes: []distribution.RouteDescriptor{
+					{RouteID: 1, GroupID: 1, State: distribution.RouteStateActive},
+				},
+			}))
+			txn := &recordingTransactional{errs: []error{tc.err}}
+			coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+				1: {Txn: txn},
+			}, 1, NewHLC(), nil)
+
+			_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{Elems: []*Elem[OP]{
+				{Op: Put, Key: []byte("k"), Value: []byte("value")},
+			}})
+			require.ErrorIs(t, err, ErrTransactionOutcomeUnknown)
+			require.ErrorIs(t, err, tc.err)
+			require.Len(t, txn.requests, 1, "an unknown outcome must never be replayed")
+		})
+	}
+}
 
 func TestRawRetryDoesNotResendPartiallyAppliedGroupsAfterRouteChange(t *testing.T) {
 	t.Parallel()

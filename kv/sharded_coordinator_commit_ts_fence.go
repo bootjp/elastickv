@@ -93,6 +93,7 @@ func (c *ShardedCoordinator) activateCommitTSFences(ctx context.Context) {
 // its own contract (the caller sees it) and is not retried here.
 func (c *ShardedCoordinator) retryableRawFenceConflict(reqs *OperationGroup[OP], shape rawDispatchShape, err error) bool {
 	return errors.Is(err, store.ErrWriteConflict) &&
+		!errors.Is(err, ErrTransactionOutcomeUnknown) &&
 		!errors.Is(err, ErrRouteWriteTimestampTooLow) &&
 		shape.singleRequest() && c.canRetryRawVersionGC(reqs)
 }
