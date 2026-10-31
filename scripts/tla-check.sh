@@ -56,6 +56,7 @@ gap_configs_for() {
             printf '_g1_gap|Invariant OCC8_NoWriteSkew is violated\n'
             printf '_emptystore_gap|Invariant OCC3b_EmptyStoreReadStability is violated\n'
             printf '_multigroup_gap|Invariant OCC3_ReadSnapshotStability is violated\n'
+            printf '_raw_gap|Invariant OCC3_ReadSnapshotStability is violated\n'
             ;;
         mvcc)
             printf '_gap|Invariant MVCC4_NoLostCommitOnSnapshotInstall is violated\n'
@@ -80,7 +81,7 @@ gap_configs_for() {
 # because the full model (with 2PC) pins known OCC-3 / OCC-8 gaps.
 pass_configs_for() {
     case "$1" in
-        occ) printf '_onephase\n_multigroup\n' ;;
+        occ) printf '_onephase\n_multigroup\n_g0\n' ;;
         hlc|mvcc|routes|composed) ;;
         *)
             echo "ERROR: no pass-config list registered for module '$1'." \

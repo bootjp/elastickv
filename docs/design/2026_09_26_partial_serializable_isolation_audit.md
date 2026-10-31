@@ -697,6 +697,63 @@ idempotent but cost log entries and latency); skipping the repeated no-op
 forward a follower sends on every page of a long scan while its local
 apply still lags `ts`; and the read-side benchmark.
 
+**Raw and 2PC apply-order fence (branch
+`design/serializable-audit-a0-raw-commit-fence`).** Extends the one-phase
+commit-ts fence, which is all `main` carries of A0's fence, to the other two
+paths G0 names, behind a replicated activation.
+
+- **Raw.** `handleRawRequest` applies through `ApplyMutationsRaftAtFenced`,
+  so a raw entry whose timestamp is at or below the group's watermark is
+  rejected with a write conflict. Raw timestamps are coordinator-allocated
+  (never caller-chosen), so the fence only fires on reordering;
+  `ShardedCoordinator` re-dispatches a fenced single-group raw write with a
+  fresh timestamp (raw writes carry no read set, and nothing was applied).
+  Single-group eligibility requires both the group set actually dispatched
+  on that attempt and the current route to remain single-group. The same
+  rule applies to the existing raw Composed-1 version-GC retry: a partially
+  successful multi-group write must never be reissued after a route change.
+  `DEL_PREFIX` stays unfenced: a multi-prefix broadcast shares one
+  timestamp and would fence itself.
+- **2PC: fence the PREPARE, not the COMMIT.** The section above moves the
+  commit-timestamp allocation after the PREPAREs and fences the primary
+  COMMIT. This branch keeps the allocation where it is (settled before
+  PREPARE, carried in `TxnMeta.CommitTS` or, when durable PREPARE evidence
+  is enabled, `TxnMeta.PrepareCommitTS`) and fences each PREPARE against
+  the same timestamp used for its route floor and durable lock proof. A
+  PREPARE whose settled timestamp is at or below its group's
+  watermark is rejected with a write conflict, and the coordinator aborts
+  the transaction as for any PREPARE conflict. Once a PREPARE applies, its
+  write locks (at `start_ts < CommitTS`) are visible, so a reader at
+  `s >= start_ts` meets the lock and resolves it, and a reader that
+  completed before the PREPARE read at `s` no higher than the watermark
+  the PREPARE was checked against, below `CommitTS`. Neither can see the
+  COMMIT land below its snapshot, so the COMMIT needs no fence and keeps
+  its idempotent re-apply. With the read watermark advance on, a reader
+  advances a secondary group before reading, so the same check covers 2PC
+  across groups. TLC agrees: OCC.tla's `CommitFence` constant adds the
+  check to `Prepare`; `MCOCC_g0.cfg` (fence on) passes OCC-3 where
+  `MCOCC_g0_gap.cfg` (fence off) fails it, and with `MultiGroup` and 2PC
+  the check passes with `ReadAdvance` and fails without it.
+- **Activation.** A fence changes the FSM verdict, so a per-node flag would
+  let replicas of one group disagree. A replicated activation entry (FSM
+  tag `0x1f`, an invalid protobuf prefix; `0x18` would be a legacy
+  `Request`'s `ts` tag) persists a marker key per group, reloaded at open and after
+  a snapshot restore; the FSM fences raw entries and PREPAREs only once the
+  marker is set. The coordinator can propose activation once it finds the
+  marker missing, but production startup rejects `--commitTSFence` until
+  catalog bootstrap is replicated through Raft. Draft status does not stop
+  an operator from setting the flag, whereas this startup gate prevents the
+  known replica-dependent watermark verdict. Startup also rejects a group
+  whose durable activation marker is already present, even with the flag off;
+  otherwise a restarted node could resume fencing before catalog bootstrap.
+  After the catalog prerequisite is implemented, enablement also requires
+  every node to understand tag `0x1f`; an older replica fails to decode the
+  entry and does not fence.
+- **Still open:** `DEL_PREFIX`; the replica-determinism caveat above (the
+  fence compares against `LastCommitTS()`, which the catalog bootstrap's
+  direct write also advances), shared with the one-phase fence; the 2PC
+  ABORT timestamp; and G1, which the fence does not touch.
+
 Open after this branch:
 
 - **2PC commit timestamps versus advanced secondaries.** The commit
