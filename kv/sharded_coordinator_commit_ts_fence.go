@@ -81,29 +81,31 @@ func (c *ShardedCoordinator) activateCommitTSFences(ctx context.Context) {
 // retried, because the other groups' entries may have applied. A route
 // write-timestamp floor rejection also reads as a write conflict; it keeps
 // its own contract (the caller sees it) and is not retried here.
-func (c *ShardedCoordinator) retryableRawFenceConflict(reqs *OperationGroup[OP], err error) bool {
+func (c *ShardedCoordinator) retryableRawFenceConflict(reqs *OperationGroup[OP], groupCount int, err error) bool {
 	return errors.Is(err, store.ErrWriteConflict) &&
 		!errors.Is(err, ErrRouteWriteTimestampTooLow) &&
-		c.canRetryRawVersionGC(reqs)
+		groupCount == 1 && c.canRetryRawVersionGC(reqs)
 }
 
 // dispatchRawWithFenceRetry dispatches a raw request, and re-dispatches it
 // with a fresh timestamp when the apply rejected it as out of timestamp
 // order (retryableRawFenceConflict).
-func (c *ShardedCoordinator) dispatchRawWithFenceRetry(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
+func (c *ShardedCoordinator) dispatchRawWithFenceRetry(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, int, error) {
 	var (
-		resp *CoordinateResponse
-		err  error
+		resp       *CoordinateResponse
+		groupCount int
+		err        error
 	)
 	for attempt := 0; attempt <= rawFenceRetryAttempts; attempt++ {
 		var handled bool
+		groupCount = 0
 		resp, handled, err = c.dispatchBeforeShardRouting(ctx, reqs)
 		if !handled {
-			resp, err = c.dispatchNonTxn(ctx, reqs)
+			resp, groupCount, err = c.dispatchNonTxn(ctx, reqs)
 		}
-		if err == nil || !c.retryableRawFenceConflict(reqs, err) {
-			return resp, err
+		if err == nil || !c.retryableRawFenceConflict(reqs, groupCount, err) {
+			return resp, groupCount, err
 		}
 	}
-	return resp, err
+	return resp, groupCount, err
 }

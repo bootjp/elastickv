@@ -708,6 +708,10 @@ paths G0 names, behind a replicated activation.
   (never caller-chosen), so the fence only fires on reordering;
   `ShardedCoordinator` re-dispatches a fenced single-group raw write with a
   fresh timestamp (raw writes carry no read set, and nothing was applied).
+  Single-group eligibility requires both the group set actually dispatched
+  on that attempt and the current route to remain single-group. The same
+  rule applies to the existing raw Composed-1 version-GC retry: a partially
+  successful multi-group write must never be reissued after a route change.
   `DEL_PREFIX` stays unfenced: a multi-prefix broadcast shares one
   timestamp and would fence itself.
 - **2PC: fence the PREPARE, not the COMMIT.** The section above moves the
