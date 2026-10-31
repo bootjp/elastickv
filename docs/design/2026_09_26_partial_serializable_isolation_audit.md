@@ -735,11 +735,13 @@ paths G0 names, behind a replicated activation.
   tag `0x1f`, an invalid protobuf prefix; `0x18` would be a legacy
   `Request`'s `ts` tag) persists a marker key per group, reloaded at open and after
   a snapshot restore; the FSM fences raw entries and PREPAREs only once the
-  marker is set. With `--commitTSFence`, each group's leader proposes the
-  activation once it finds the marker missing. The operator enables the
-  flag only after every node runs a binary that knows tag `0x1f`; an older
-  replica fails to decode the entry and does not fence, which is the same
-  rolling-upgrade rule as `--readWatermarkAdvance`.
+  marker is set. The coordinator can propose activation once it finds the
+  marker missing, but production startup rejects `--commitTSFence` until
+  catalog bootstrap is replicated through Raft. Draft status does not stop
+  an operator from setting the flag, whereas this startup gate prevents the
+  known replica-dependent watermark verdict. After the catalog prerequisite
+  is implemented, enablement also requires every node to understand tag
+  `0x1f`; an older replica fails to decode the entry and does not fence.
 - **Still open:** `DEL_PREFIX`; the replica-determinism caveat above (the
   fence compares against `LastCommitTS()`, which the catalog bootstrap's
   direct write also advances), shared with the one-phase fence; the 2PC

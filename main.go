@@ -147,7 +147,7 @@ var (
 	tsoBatchSize                    = flag.Int("tsoBatchSize", defaultTSOBatchSize, "Timestamp batch size used by TSO cutover and shadow validation")
 	tsoModeFile                     = flag.String("tsoModeFile", "", "Path to a runtime-reloadable TSO mode file containing legacy, shadow, cutover, or phase-d")
 	tsoModeReloadInterval           = flag.Duration("tsoModeReloadInterval", defaultTSOReload, "Polling interval for tsoModeFile")
-	commitTSFence                   = flag.Bool("commitTSFence", false, "Fence raw writes and 2PC PREPAREs against the group's commit watermark: each group leader proposes a replicated activation once, after which entries allocated below the watermark are rejected and raw writes retry with a fresh timestamp; enable only after every node runs a binary that understands the activation entry")
+	commitTSFence                   = flag.Bool("commitTSFence", false, "Reserved for replicated catalog bootstrap; activation is rejected until the startup catalog no longer writes outside Raft")
 	readWatermarkAdvance            = flag.Bool("readWatermarkAdvance", false, "Raise a lagging group's commit watermark before a cross-group snapshot read so late one-phase writes cannot land below the snapshot; enable only after every node runs a binary that understands the advance entry")
 	leaderBalance                   = flag.Bool("leaderBalance", false, "Enable automatic count-based Raft-group leader balancing on the default-group leader")
 	leaderBalanceInterval           = flag.Duration("leaderBalanceInterval", defaultLeaderBalanceInterval, "Interval between leader-balance scheduler evaluations")
@@ -790,6 +790,9 @@ func startTSOModeReloader(ctx context.Context, eg *errgroup.Group, wiring coordi
 }
 
 func resolveValidatedRuntimeInputs() (runtimeConfig, raftEngineType, raftBootstrapConfig, bool, error) {
+	if err := validateCommitTSFenceStartup(*commitTSFence); err != nil {
+		return runtimeConfig{}, "", raftBootstrapConfig{}, false, err
+	}
 	cfg, engineType, bootstrapCfg, bootstrap, err := resolveRuntimeInputs()
 	if err != nil {
 		return runtimeConfig{}, "", raftBootstrapConfig{}, false, err
@@ -799,6 +802,13 @@ func resolveValidatedRuntimeInputs() (runtimeConfig, raftEngineType, raftBootstr
 		*backupSnapshotHeadroomEntries, *backupScanPageSize, *backupMaxActivePins,
 	)
 	return cfg, engineType, bootstrapCfg, bootstrap, err
+}
+
+func validateCommitTSFenceStartup(enabled bool) error {
+	if enabled {
+		return errors.New("commitTSFence requires replicated catalog bootstrap; startup catalog writes outside Raft")
+	}
+	return nil
 }
 
 func validateLiveBackupConfig(
