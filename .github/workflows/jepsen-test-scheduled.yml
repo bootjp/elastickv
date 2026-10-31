@@ -55,7 +55,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        workload: ${{ fromJSON(inputs.workloads-json || '["unit","redis","redis-zset","dynamodb","dynamodb-type-string","dynamodb-type-number","dynamodb-type-binary","dynamodb-type-bool","dynamodb-type-null","dynamodb-type-string-set","dynamodb-type-number-set","dynamodb-type-binary-set","dynamodb-type-list","dynamodb-type-map","s3","filesystem-cross-mount","filesystem-sqlite-check","filesystem-node-crash","filesystem-benchmark","filesystem-benchmark-legacy","filesystem-benchmark-multigroup","filesystem-benchmark-multigroup-legacy","filesystem-overwrite","filesystem-rename","sqlite"]') }}
+        workload: ${{ fromJSON(inputs.workloads-json || '["unit","redis","redis-zset","dynamodb","dynamodb-type-string","dynamodb-type-number","dynamodb-type-binary","dynamodb-type-bool","dynamodb-type-null","dynamodb-type-string-set","dynamodb-type-number-set","dynamodb-type-binary-set","dynamodb-type-list","dynamodb-type-map","s3","sqs-standard","sqs-htfifo","filesystem-cross-mount","filesystem-sqlite-check","filesystem-node-crash","filesystem-benchmark","filesystem-benchmark-legacy","filesystem-benchmark-multigroup","filesystem-benchmark-multigroup-legacy","filesystem-overwrite","filesystem-rename","sqlite"]') }}
     env:
       GOCACHE: /tmp/go-build
       WORKLOAD: ${{ matrix.workload }}
@@ -100,7 +100,7 @@ jobs:
           export GOCACHE GOTMPDIR=/tmp/go-tmp
           go mod download
           case "$WORKLOAD" in
-            filesystem-*|sqlite) go build -o /tmp/elastickv-bin . ;;
+            filesystem-*|sqlite|sqs-*) go build -o /tmp/elastickv-bin . ;;
             *) go build -o /tmp/elastickv-demo ./cmd/server ;;
           esac
       # Warm the Maven cache up front so unit tests / workloads start
@@ -130,7 +130,7 @@ jobs:
         working-directory: jepsen
         run: ~/lein test
       - name: Launch demo cluster
-        if: matrix.workload != 'unit' && !startsWith(matrix.workload, 'filesystem-') && matrix.workload != 'sqlite'
+        if: matrix.workload != 'unit' && !startsWith(matrix.workload, 'filesystem-') && !startsWith(matrix.workload, 'sqs-') && matrix.workload != 'sqlite'
         run: |
           set -euo pipefail
           nohup /tmp/elastickv-demo > /tmp/elastickv-demo.log 2>&1 &
@@ -225,6 +225,54 @@ jobs:
             --threads-per-key 4 \
             --s3-ports 63901,63902,63903 \
             --host 127.0.0.1
+      - name: Launch SQS cluster
+        if: startsWith(matrix.workload, 'sqs-')
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/elastickv-sqs
+          BOOTSTRAP_MEMBERS="n1=127.0.0.1:50051,n2=127.0.0.1:50052,n3=127.0.0.1:50053"
+          RAFT_SQS_MAP="127.0.0.1:50051=127.0.0.1:63501,127.0.0.1:50052=127.0.0.1:63502,127.0.0.1:50053=127.0.0.1:63503"
+          : > /tmp/elastickv-sqs.pid
+          for node in 1 2 3; do
+            nohup /tmp/elastickv-bin \
+              --address "127.0.0.1:5005${node}" \
+              --redisAddress "" --dynamoAddress "" --s3Address "" \
+              --sqsAddress "127.0.0.1:6350${node}" \
+              --metricsAddress "" --pprofAddress "" \
+              --raftId "n${node}" --raftDataDir "/tmp/elastickv-sqs/n${node}" \
+              --raftBootstrapMembers "$BOOTSTRAP_MEMBERS" \
+              --raftSqsMap "$RAFT_SQS_MAP" \
+              > "/tmp/elastickv-sqs-n${node}.log" 2>&1 &
+            echo $! >> /tmp/elastickv-sqs.pid
+          done
+          for _ in {1..90}; do
+            if nc -z 127.0.0.1 63501 && nc -z 127.0.0.1 63502 && nc -z 127.0.0.1 63503; then
+              echo "SQS cluster is up"
+              exit 0
+            fi
+            sleep 1
+          done
+          cat /tmp/elastickv-sqs-n*.log
+          exit 1
+      - name: Run SQS Jepsen workload against elastickv
+        if: startsWith(matrix.workload, 'sqs-')
+        working-directory: jepsen
+        timeout-minutes: 70
+        run: |
+          set -euo pipefail
+          MODULE=elastickv.sqs-workload
+          EXTRA_ARGS=()
+          if [[ "$WORKLOAD" == "sqs-htfifo" ]]; then
+            MODULE=elastickv.sqs-htfifo-workload
+            EXTRA_ARGS=(--partition-count 4 --group-count 8)
+          fi
+          timeout 3600 ~/lein run -m "$MODULE" --local \
+            --time-limit ${{ inputs.time-limit || '300' }} \
+            --rate ${{ inputs.rate || '5' }} \
+            --concurrency ${{ inputs.concurrency || '4' }} \
+            --drain-time 40 \
+            --sqs-ports 63501,63502,63503 --host 127.0.0.1 \
+            "${EXTRA_ARGS[@]}"
       - name: Launch filesystem cluster
         if: startsWith(matrix.workload, 'filesystem-') || matrix.workload == 'sqlite'
         # Mirrors the cluster in jepsen-test.yml: every node mounts the shared
@@ -429,7 +477,7 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
       - name: Dump demo cluster log on failure
-        if: failure() && matrix.workload != 'unit' && !startsWith(matrix.workload, 'filesystem-') && matrix.workload != 'sqlite'
+        if: failure() && matrix.workload != 'unit' && !startsWith(matrix.workload, 'filesystem-') && !startsWith(matrix.workload, 'sqs-') && matrix.workload != 'sqlite'
         # The previous `tail -n 500` truncated a 3-minute workload's
         # log down to startup-only lines, making it impossible to
         # correlate a Jepsen anomaly with the server-side state
@@ -445,7 +493,7 @@ jobs:
           echo "=== full log line count ==="
           wc -l /tmp/elastickv-demo.log || true
       - name: Upload demo cluster log on failure
-        if: failure() && matrix.workload != 'unit' && !startsWith(matrix.workload, 'filesystem-') && matrix.workload != 'sqlite'
+        if: failure() && matrix.workload != 'unit' && !startsWith(matrix.workload, 'filesystem-') && !startsWith(matrix.workload, 'sqs-') && matrix.workload != 'sqlite'
         uses: actions/upload-artifact@v7
         with:
           name: elastickv-demo-log-${{ matrix.workload }}
@@ -478,6 +526,22 @@ jobs:
             /tmp/elastickv-fs-n1-restarted.log
           retention-days: 14
           if-no-files-found: ignore
+      - name: Upload SQS cluster logs on failure
+        if: failure() && startsWith(matrix.workload, 'sqs-')
+        uses: actions/upload-artifact@v7
+        with:
+          name: elastickv-sqs-log-${{ matrix.workload }}
+          path: /tmp/elastickv-sqs-n*.log
+          retention-days: 14
+          if-no-files-found: warn
+      - name: Stop SQS cluster
+        if: always() && startsWith(matrix.workload, 'sqs-')
+        run: |
+          if [ -f /tmp/elastickv-sqs.pid ]; then
+            while read -r pid; do
+              kill "$pid" 2>/dev/null || true
+            done < /tmp/elastickv-sqs.pid
+          fi
       - name: Stop demo cluster
         if: always()
         run: |

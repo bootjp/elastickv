@@ -613,10 +613,7 @@ func run() error {
 	recordFSMApplySyncMode(metricsRegistry, runtimes)
 
 	cleanup.Add(readTracker.Close)
-	shardStore := kv.NewShardStore(cfg.engine, shardGroups)
-	if *readWatermarkAdvance {
-		shardStore.WithReadWatermarkAdvance()
-	}
+	shardStore := newStartupShardStore(cfg.engine, shardGroups, *readWatermarkAdvance)
 	cleanup.Add(func() {
 		_ = shardStore.Close()
 		for _, rt := range runtimes {
@@ -634,9 +631,7 @@ func run() error {
 		WithKeyVizLabelsEnabled(*keyVizFlags.LabelsEnabled).
 		WithAllShardGroups(dataGroupIDs(cfg.groups)...).
 		WithPartitionResolver(sqsPartitionResolver)
-	if *commitTSFence {
-		coordinate.WithCommitTSFenceActivation()
-	}
+	configureCommitTSFenceActivation(coordinate, *commitTSFence)
 	tsoWiring, err := configureCoordinatorTSOWithObserver(
 		coordinate,
 		shardGroups,
@@ -756,6 +751,20 @@ func run() error {
 	)
 
 	return waitRunGroup(eg)
+}
+
+func newStartupShardStore(engine *distribution.Engine, groups map[uint64]*kv.ShardGroup, advanceReadWatermark bool) *kv.ShardStore {
+	shardStore := kv.NewShardStore(engine, groups)
+	if advanceReadWatermark {
+		shardStore.WithReadWatermarkAdvance()
+	}
+	return shardStore
+}
+
+func configureCommitTSFenceActivation(coordinate *kv.ShardedCoordinator, enabled bool) {
+	if enabled {
+		coordinate.WithCommitTSFenceActivation()
+	}
 }
 
 func waitRunGroup(eg *errgroup.Group) error {
@@ -4255,9 +4264,7 @@ func startRaftServers(
 			return migrationOwnershipRuntimeReady(trx, shardStore, distServer, rt.spec.id, rt.snapshotEngine())
 		}))
 		internalOpts = append(internalOpts, migrationInternalProtocolOptions(trx, shardStore, distServer, rt)...)
-		if *readWatermarkAdvance {
-			internalOpts = append(internalOpts, adapter.WithInternalReadWatermarkProposer(proposerForGroup(rt, shardGroups)))
-		}
+		internalOpts = append(internalOpts, internalReadWatermarkOptions(*readWatermarkAdvance, rt, shardGroups)...)
 		staticServingServices := registerS3BlobFetchServer(
 			gs,
 			adminGRPCOpts.s3BlobFetchEnabled,
@@ -4348,6 +4355,13 @@ func startRaftServers(
 		})
 	}
 	return nil
+}
+
+func internalReadWatermarkOptions(enabled bool, rt *raftGroupRuntime, groups map[uint64]*kv.ShardGroup) []adapter.InternalOption {
+	if !enabled {
+		return nil
+	}
+	return []adapter.InternalOption{adapter.WithInternalReadWatermarkProposer(proposerForGroup(rt, groups))}
 }
 
 func internalServerOptions(

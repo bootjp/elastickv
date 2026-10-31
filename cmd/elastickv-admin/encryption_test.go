@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net"
 	"strings"
 	"testing"
@@ -782,6 +783,13 @@ func TestRunEncryptionRegisterWriter_HappyPath(t *testing.T) {
 	}
 }
 
+func TestEncryptionAdminUnusedServerCleanup(t *testing.T) {
+	t.Parallel()
+	t.Run("unused", func(t *testing.T) {
+		startCustomEncryptionAdminTestServer(t, &stubMutatorServer{})
+	})
+}
+
 // startEncryptionAdminTestServer brings up a real gRPC server on a
 // loopback listener so the CLI dial path (grpc.NewClient against a
 // host:port string) exercises the same code as production. The
@@ -809,15 +817,8 @@ func startCustomEncryptionAdminTestServer(t *testing.T, impl pb.EncryptionAdminS
 	}
 	srv := grpc.NewServer()
 	pb.RegisterEncryptionAdminServer(srv, impl)
-	go func() {
-		// Surface unexpected Serve failures so a listener bind
-		// or accept error before the test calls GracefulStop is
-		// visible. GracefulStop returns nil from Serve, so the
-		// happy-path exit prints nothing.
-		if err := srv.Serve(lis); err != nil {
-			t.Logf("encryption-admin test server Serve: %v", err)
-		}
-	}()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- srv.Serve(lis) }()
 	t.Cleanup(func() {
 		done := make(chan struct{})
 		go func() { srv.GracefulStop(); close(done) }()
@@ -825,6 +826,11 @@ func startCustomEncryptionAdminTestServer(t *testing.T, impl pb.EncryptionAdminS
 		case <-done:
 		case <-time.After(2 * time.Second):
 			srv.Stop()
+			<-done
+		}
+		// Stop may run before Serve starts; join it before the test finishes.
+		if err := <-serveDone; err != nil && !errors.Is(err, grpc.ErrServerStopped) {
+			t.Errorf("encryption-admin test server Serve: %v", err)
 		}
 	})
 	return lis.Addr().String()

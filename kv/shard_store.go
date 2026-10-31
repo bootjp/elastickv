@@ -270,6 +270,9 @@ func (s *ShardStore) GetAtWithReadFence(ctx context.Context, key []byte, ts uint
 	if err := s.awaitReadRouteVersion(ctx, readRouteVersion); err != nil {
 		return nil, err
 	}
+	if value, handled, err := s.partitionTxnGetAtWithReadFence(ctx, key, ts, groupID, readRouteVersion); handled {
+		return value, err
+	}
 	if groupID != 0 {
 		return s.getGroupAtWithReadFence(ctx, groupID, key, ts, readRouteVersion)
 	}
@@ -753,31 +756,31 @@ func (s *ShardStore) routeForExplicitGroupKey(groupID uint64, key []byte) (distr
 	if s == nil || s.engine == nil {
 		return fallback, nil
 	}
+	partitionTxn, err := s.validatePartitionTxnGroup(key, groupID)
+	if err != nil {
+		return distribution.Route{}, err
+	}
 	if route, ok := s.s3BucketAuxiliaryOwnerRouteForKey(key); ok {
-		if route.GroupID == groupID {
-			return route, nil
-		}
-		if routeHasStagedVisibility(route) {
-			return distribution.Route{}, errors.Wrapf(ErrExplicitGroupStagedVisibilityUnresolved, "group_id=%d key=%q", groupID, key)
-		}
-		return distribution.Route{}, errors.Wrapf(
-			ErrExplicitGroupRouteOwnerMismatch,
-			"group_id=%d catalog_group_id=%d key=%q", groupID, route.GroupID, key)
+		return explicitGroupOwnerRoute(route, groupID, key, false)
 	}
 	if route, ok := s.engine.GetRoute(routeKey(key)); ok {
-		if route.GroupID == groupID {
-			return route, nil
-		}
-		if routeHasStagedVisibility(route) {
-			return distribution.Route{}, errors.Wrapf(ErrExplicitGroupStagedVisibilityUnresolved, "group_id=%d key=%q", groupID, key)
-		}
-		if !explicitGroupResolverOwnedKey(key) {
-			return distribution.Route{}, errors.Wrapf(
-				ErrExplicitGroupRouteOwnerMismatch,
-				"group_id=%d catalog_group_id=%d key=%q", groupID, route.GroupID, key)
-		}
+		return explicitGroupOwnerRoute(route, groupID, key, partitionTxn || explicitGroupResolverOwnedKey(key))
 	}
 	return fallback, nil
+}
+
+func explicitGroupOwnerRoute(route distribution.Route, groupID uint64, key []byte, resolverOwned bool) (distribution.Route, error) {
+	if route.GroupID == groupID {
+		return route, nil
+	}
+	if routeHasStagedVisibility(route) {
+		return distribution.Route{}, errors.Wrapf(ErrExplicitGroupStagedVisibilityUnresolved, "group_id=%d key=%q", groupID, key)
+	}
+	if !resolverOwned {
+		return distribution.Route{}, errors.Wrapf(ErrExplicitGroupRouteOwnerMismatch,
+			"group_id=%d catalog_group_id=%d key=%q", groupID, route.GroupID, key)
+	}
+	return distribution.Route{GroupID: groupID}, nil
 }
 
 // explicitGroupResolverOwnedKey reports whether key belongs to a keyspace whose
@@ -5581,7 +5584,10 @@ func (s *ShardStore) loadTxnLock(ctx context.Context, primaryKey []byte) (txnLoc
 }
 
 func (s *ShardStore) tryAbortExpiredPrimary(ctx context.Context, primaryKey []byte, startTS uint64) (bool, error) {
-	pg, ok := s.groupForKey(primaryKey)
+	pg, ok, err := s.groupForTxnPrimary(primaryKey)
+	if err != nil {
+		return false, err
+	}
 	if !ok || pg == nil || pg.Txn == nil {
 		return false, nil
 	}

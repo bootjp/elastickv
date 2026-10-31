@@ -649,6 +649,9 @@ func (s *SQSServer) loadQueueMetaForSend(ctx context.Context, queueName string, 
 	if !exists {
 		return nil, readTimestamp, newSQSAPIError(http.StatusBadRequest, sqsErrQueueDoesNotExist, "queue does not exist")
 	}
+	if err := checkFifoDelayReady(meta); err != nil {
+		return nil, readTimestamp, err
+	}
 	// AWS rejects SendMessage when MessageBody is empty (InvalidParameterValue
 	// "Message body cannot be empty"). Silently enqueuing a zero-length
 	// message would let producer bugs (missing serialization, a forgotten
@@ -1105,9 +1108,13 @@ func (s *SQSServer) dropReceiveFanoutCounter(queueName string) {
 // sqsMsgVisScanBoundsDispatch's legacy branch — byte-identical to
 // the pre-fanout scanAndDeliverOnce body.
 func (s *SQSServer) scanAndDeliverPartition(ctx context.Context, queueName string, meta *sqsQueueMeta, partition uint32, readTS uint64, deadline time.Time, pageSize int, opts sqsReceiveOptions) ([]map[string]any, error) {
+	if err := checkFifoDelayReady(meta); err != nil {
+		return nil, err
+	}
 	now := time.Now().UnixMilli()
 	start, end := sqsMsgVisScanBoundsDispatch(meta, queueName, partition, meta.Generation, now)
 	delivered := make([]map[string]any, 0, opts.Max)
+	var fifoState sqsFifoReceiveState
 	for len(delivered) < opts.Max {
 		if time.Now().After(deadline) {
 			return delivered, nil
@@ -1124,7 +1131,7 @@ func (s *SQSServer) scanAndDeliverPartition(ctx context.Context, queueName strin
 			VisibilityTimeout:     opts.VisibilityTimeout,
 			WaitSeconds:           opts.WaitSeconds,
 			MessageAttributeNames: opts.MessageAttributeNames,
-		})
+		}, &fifoState)
 		if err != nil {
 			return delivered, err
 		}
@@ -1256,7 +1263,7 @@ func (s *SQSServer) loadCandidateRecord(ctx context.Context, queueName string, m
 		}
 		raw, err = groupGetter.GetGroupAt(ctx, cand.groupID, dataKey, readTS)
 	} else {
-		raw, err = s.store.GetAt(ctx, dataKey, readTS)
+		raw, err = s.getSQSAt(ctx, dataKey, readTS)
 	}
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
@@ -1271,13 +1278,15 @@ func (s *SQSServer) loadCandidateRecord(ctx context.Context, queueName string, m
 	return rec, dataKey, false, nil
 }
 
-// expireMessage removes a retention-expired record, its current
-// visibility index entry, and the byage index entry in a single OCC
-// transaction. On ErrWriteConflict (another worker raced us to delete
-// or rotate this same message) we treat it as success: the message is
-// no longer our responsibility either way. Any other error propagates
-// so a coordinator / storage failure does not silently fall through
-// to "delivered empty", matching the receive-error policy.
+// Unknown outcomes and route fences take precedence over any nested expected
+// race: an empty receive must not stand in for a lost decision or a moved route.
+func isIgnorableSQSReceiveRace(err error) bool {
+	return !errors.Is(err, kv.ErrTransactionOutcomeUnknown) && !isRouteWriteFencedError(err) && isIgnorableTransactRaceError(err)
+}
+
+// expireMessage removes a retention-expired record and both indexes atomically.
+// An expected OCC race permits skipping it, but does not prove another worker
+// deleted it. Operational failures and unknown decisions remain errors.
 func (s *SQSServer) expireMessage(ctx context.Context, queueName string, meta *sqsQueueMeta, partition uint32, gen uint64, visKey, dataKey []byte, rec *sqsMessageRecord, readTS uint64) error {
 	byAgeKey := sqsMsgByAgeKeyDispatch(meta, queueName, partition, gen, rec.SendTimestampMillis, rec.MessageID)
 	readKeys := [][]byte{visKey, dataKey, sqsQueueMetaKey(queueName), sqsQueueGenKey(queueName)}
@@ -1286,6 +1295,7 @@ func (s *SQSServer) expireMessage(ctx context.Context, queueName string, meta *s
 		{Op: kv.Del, Key: dataKey},
 		{Op: kv.Del, Key: byAgeKey},
 	}
+	elems = appendFifoOrderDelete(elems, meta, queueName, partition, gen, rec)
 	// FIFO retention expiry must release the group lock so a successor
 	// in the same group can become deliverable. This mirrors the delete
 	// and redrive paths.
@@ -1307,7 +1317,7 @@ func (s *SQSServer) expireMessage(ctx context.Context, queueName string, meta *s
 		Elems:    elems,
 	}
 	if _, err := kv.DispatchWithReadTimestamp(ctx, s.coordinator, req); err != nil {
-		if isIgnorableTransactRaceError(err) {
+		if isIgnorableSQSReceiveRace(err) {
 			return nil
 		}
 		return errors.WithStack(err)
@@ -1322,6 +1332,7 @@ func (s *SQSServer) rotateMessagesForDelivery(
 	candidates []sqsMsgCandidate,
 	readTS uint64,
 	opts sqsReceiveOptions,
+	fifoState *sqsFifoReceiveState,
 ) ([]map[string]any, error) {
 	// Parse RedrivePolicy once per receive call rather than per
 	// candidate. The struct only changes via SetQueueAttributes /
@@ -1337,7 +1348,7 @@ func (s *SQSServer) rotateMessagesForDelivery(
 		if len(delivered) >= opts.Max {
 			break
 		}
-		msg, skip, err := s.tryDeliverCandidate(ctx, queueName, meta, cand, readTS, opts, redrive)
+		msg, skip, err := s.tryDeliverCandidate(ctx, queueName, meta, cand, readTS, opts, redrive, fifoState)
 		if err != nil {
 			return delivered, err
 		}
@@ -1369,44 +1380,58 @@ func (s *SQSServer) tryDeliverCandidate(
 	readTS uint64,
 	opts sqsReceiveOptions,
 	redrive *parsedRedrivePolicy,
+	fifoState *sqsFifoReceiveState,
 ) (map[string]any, bool, error) {
 	gen := meta.Generation
 	rec, dataKey, skip, err := s.loadCandidateRecord(ctx, queueName, meta, gen, cand, readTS)
 	if skip || err != nil {
 		return nil, skip, err
 	}
-	if expired, err := s.handleRetentionExpiry(ctx, queueName, meta, cand, dataKey, rec, meta.MessageRetentionSeconds, readTS); expired || err != nil {
-		return nil, expired, err
-	}
-	if shouldRedrive(rec, redrive) {
-		// The candidate has hit maxReceiveCount; move it to the DLQ
-		// inside its own OCC transaction and skip past it. The
-		// receive response intentionally omits redriven messages —
-		// AWS does the same and consumers polling the source queue
-		// must not observe a poison message past the limit.
-		moved, err := s.redriveCandidateToDLQ(ctx, queueName, meta, cand, dataKey, rec, redrive, s.queueArn(queueName), readTS)
-		if err != nil {
-			return nil, false, err
-		}
-		return nil, moved, nil
+	if handled, skip, err := s.discardBeforeReceive(ctx, queueName, meta, cand, dataKey, rec, readTS, redrive); handled {
+		return nil, skip, err
 	}
 	// FIFO group lock filter: skip candidates whose group is held by
 	// another in-flight message. Standard queues short-circuit because
 	// MessageGroupId is empty.
-	lockState := fifoLockAcquire
-	var lockKey []byte
 	if rec.MessageGroupId != "" {
-		state, key, err := s.classifyFifoGroupLock(ctx, queueName, meta, cand.partition, gen, rec, readTS)
-		if err != nil {
-			return nil, false, err
-		}
-		if state == fifoLockSkip {
-			return nil, true, nil
-		}
-		lockState = state
-		lockKey = key
+		return s.tryDeliverFifoCandidate(ctx, queueName, meta, cand, dataKey, rec, readTS, opts, redrive, fifoState)
 	}
-	return s.commitReceiveRotation(ctx, queueName, meta, cand, dataKey, rec, readTS, opts, lockKey, lockState)
+	return s.commitReceiveRotation(ctx, queueName, meta, cand, dataKey, rec, readTS, opts, nil, fifoLockAcquire)
+}
+
+func (s *SQSServer) discardBeforeReceive(ctx context.Context, queueName string, meta *sqsQueueMeta, cand sqsMsgCandidate, dataKey []byte, rec *sqsMessageRecord, readTS uint64, redrive *parsedRedrivePolicy) (handled bool, skip bool, err error) {
+	if expired, expiryErr := s.handleRetentionExpiry(ctx, queueName, meta, cand, dataKey, rec, meta.MessageRetentionSeconds, readTS); expired || expiryErr != nil {
+		return true, expired, expiryErr
+	}
+	if !shouldRedrive(rec, redrive) {
+		return false, false, nil
+	}
+	moved, err := s.redriveCandidateToDLQ(ctx, queueName, meta, cand, dataKey, rec, redrive, s.queueArn(queueName), readTS)
+	if err != nil {
+		return true, false, err
+	}
+	return true, moved, nil
+}
+
+func (s *SQSServer) tryDeliverFifoCandidate(ctx context.Context, queueName string, meta *sqsQueueMeta, cand sqsMsgCandidate, dataKey []byte, rec *sqsMessageRecord, readTS uint64, opts sqsReceiveOptions, redrive *parsedRedrivePolicy, fifoState *sqsFifoReceiveState) (map[string]any, bool, error) {
+	if _, attempted := fifoState.attempted[rec.MessageGroupId]; attempted {
+		return nil, true, nil
+	}
+	head, state, lockKey, err := s.resolveFifoCandidate(ctx, queueName, meta, cand, rec, readTS)
+	if err != nil {
+		return nil, false, err
+	}
+	if state == fifoLockSkip {
+		return nil, true, nil
+	}
+	fifoState.markAttempted(rec.MessageGroupId)
+	if head != nil {
+		cand, rec, dataKey = head.candidate, head.record, head.dataKey
+		if handled, skip, err := s.discardBeforeReceive(ctx, queueName, meta, cand, dataKey, rec, readTS, redrive); handled {
+			return nil, skip, err
+		}
+	}
+	return s.commitReceiveRotation(ctx, queueName, meta, cand, dataKey, rec, readTS, opts, lockKey, state)
 }
 
 // handleRetentionExpiry deletes the candidate inline when its
@@ -1457,7 +1482,7 @@ func (s *SQSServer) commitReceiveRotation(ctx context.Context, queueName string,
 		return nil, false, err
 	}
 	if _, err := kv.DispatchWithReadTimestamp(ctx, s.coordinator, req); err != nil {
-		if isIgnorableTransactRaceError(err) {
+		if isIgnorableSQSReceiveRace(err) {
 			return nil, true, nil
 		}
 		return nil, false, errors.WithStack(err)
@@ -1673,6 +1698,7 @@ func (s *SQSServer) buildDeleteOps(ctx context.Context, queueName string, meta *
 		{Op: kv.Del, Key: visKey},
 		{Op: kv.Del, Key: byAgeKey},
 	}
+	elems = appendFifoOrderDelete(elems, meta, queueName, handle.Partition, handle.QueueGeneration, rec)
 	if rec.MessageGroupId != "" {
 		lockKey := sqsMsgGroupKeyDispatch(meta, queueName, handle.Partition, handle.QueueGeneration, rec.MessageGroupId)
 		lock, err := s.loadFifoGroupLock(ctx, queueName, meta, handle.Partition, handle.QueueGeneration, rec.MessageGroupId, readTS)
@@ -1737,7 +1763,7 @@ func (s *SQSServer) loadMessageForDelete(ctx context.Context, queueName string, 
 		return nil, nil, nil, readTimestamp, sqsDeleteProceed, newSQSAPIError(http.StatusBadRequest, sqsErrReceiptHandleInvalid, "receipt handle is not valid for this queue")
 	}
 	dataKey := sqsMsgDataKeyDispatch(meta, queueName, handle.Partition, handle.QueueGeneration, handle.MessageIDHex)
-	raw, err := s.store.GetAt(ctx, dataKey, readTS)
+	raw, err := s.getSQSAt(ctx, dataKey, readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return meta, nil, nil, readTimestamp, sqsDeleteNoOp, nil
@@ -1898,7 +1924,7 @@ func (s *SQSServer) loadAndVerifyMessage(ctx context.Context, queueName string, 
 		return nil, nil, nil, readTimestamp, newSQSAPIError(http.StatusBadRequest, sqsErrReceiptHandleInvalid, "receipt handle is not valid for this queue")
 	}
 	dataKey := sqsMsgDataKeyDispatch(meta, queueName, handle.Partition, handle.QueueGeneration, handle.MessageIDHex)
-	raw, err := s.store.GetAt(ctx, dataKey, readTS)
+	raw, err := s.getSQSAt(ctx, dataKey, readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return nil, nil, nil, readTimestamp, newSQSAPIError(http.StatusBadRequest, sqsErrReceiptHandleInvalid, "message not found")

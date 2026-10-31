@@ -1173,6 +1173,80 @@ code at fix time and turns the `N` rows into fixes:
 - gRPC: none in this audit; the API gap (G8) is documented in the positioning
   doc and README.
 
+#### S3 A1 completion plan (2026-10-30)
+
+The unpublished branch described below is historical evidence, not a merge
+or acceptance receipt. Implementation now proceeds from main `c316b829e` on
+`design/serializable-audit-a1-s3-validation`; the open A0 PR #1355 is separate.
+
+- Every completion attempt acquires one read timestamp, loads the bucket,
+  upload metadata, requested part descriptors and replaced manifest at that
+  snapshot, then commits with every consumed descriptor key in `ReadKeys`.
+  A retry repeats those reads and ETag checks rather than reusing a manifest
+  assembled from an earlier snapshot.
+- UploadPart keeps its streamed blob namespace and read voucher, but checks
+  the upload, bucket generation and superseded descriptor again at exactly
+  the dispatched `StartTS` before its descriptor commit, using the original
+  pre-body read timestamp voucher and retained snapshot. Do not replace that
+  snapshot with a local/latest watermark or rename the already-streamed blob
+  and chunkref namespaces. Allocate the descriptor commit timestamp after
+  chunk durability in both inline and offloaded modes; keep the reserved
+  inline blob version separate from the descriptor's MVCC commit timestamp.
+  The read set contains the upload metadata, generation
+  key and part key. Bucket deletion re-puts the generation key, preserving
+  its maximum value, in both public and admin deletion transactions. Other
+  object writers do not write that key, so parallel unrelated uploads do
+  not acquire an accidental bucket-wide conflict.
+- Support all 10,000 requested parts during staged-visibility migration as
+  well as normal routing. The physical read-key cap is bounded at
+  `2 * (10_000 + 240)` to include migration aliases and control-key headroom.
+  Retain every existing cap check and every alias; do not accept the older
+  branch's approximately 4,998-part migration limitation as completion.
+- Multipart conflicts that are proven noncommits can use the existing
+  bounded completion retry or a 503 SlowDown response for the consumed
+  upload body. Unknown outcomes must not become permission to replay.
+  Track whether descriptor dispatch was attempted: clean new blobs after
+  pre-dispatch failure or a proven noncommit, but preserve them after an
+  uncertain dispatch result. Clean superseded blobs only after confirmed
+  success. The unknown marker takes precedence over any joined conflict,
+  lock or route-fence cause. This prevents a lost success reply from deleting
+  blobs that a committed descriptor may already reference.
+- Red/green regressions run through the production ShardedCoordinator/FSM,
+  including both part-read windows, deletion/recreation, superseded blob
+  cleanup, unrelated bucket writes, maximum part counts and alias capacity.
+  Test server-side data and cleanup effects, not only HTTP status codes.
+- Add an opt-in S3 multipart register mode to the existing Jepsen workload.
+  Each write races same-body part replacement with completion under one
+  upload ID; the expected object remains the register value regardless of
+  which immutable part version wins. Preserve the existing linearizability
+  checker and honest indeterminate outcomes. Require complete successful
+  final reads so lost referenced chunks cannot be hidden by failed GETs.
+  Keep the default PUT/GET workload unchanged and run both modes in CI.
+  Run the new multipart mode for 30 seconds at rate 10 and concurrency 10
+  in each encryption job; a five-second sample produced no confirmed writes
+  under contention in one local run and must not be accepted as evidence.
+  Preserve both named S3 histories, source SHA, encryption mode and step
+  outcomes as unconditional CI artifacts. Do not weaken the nonvacuity or
+  final-read gate to obtain a passing result.
+- Security acceptance: reject public S3 object keys exceeding 1,024 decoded
+  UTF-8 bytes before proxying, body consumption or mutation. Apply the same
+  creation limit to admin PUT; admin GET/delete remain available for recovery
+  of previously stored nonconforming keys. Before allocating completion
+  descriptor/read-key arrays or reading descriptors, enforce a 24 MiB logical
+  aggregate read-key budget, including escaped segment lengths and fixed key
+  encoding overhead. Use division/subtraction rather than unchecked byte-count
+  multiplication. This supports 10,000 maximum-length conforming keys, including
+  zero-byte escaping; migration alias expansion remains separately bounded by
+  the existing physical key-count cap. The budget bounds this dependency set,
+  not total request/protobuf/Raft heap or concurrency, and does not change RawKV
+  value limits. Existing overlong public S3 keys require the admin recovery API.
+  Add runtime-red HTTP/admin and pre-allocation/no-descriptor-read regressions
+  before the fix, then repeat latest-push code/security review and CI.
+- Verify all changed helper callers, full adapter/KV/store race suites,
+  unfiltered lint, relevant Jepsen checks, and latest-push review/CI. A1 does
+  not establish cross-group serializability before A2's read-lock protocol,
+  nor close any other audit milestone.
+
 Status of the S3 half: landed on branch `design/serializable-audit-a1-s3`
 (from `main`, not pushed): `3a975625` adds
 `adapter/s3_multipart_occ_repro_test.go`, four cases through the real FSM
