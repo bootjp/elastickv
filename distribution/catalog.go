@@ -313,6 +313,12 @@ func (s *CatalogStore) Snapshot(ctx context.Context) (CatalogSnapshot, error) {
 	return s.SnapshotAt(ctx, s.store.LastCommitTS())
 }
 
+// IsCatalogKey reports whether key belongs to the durable distribution
+// catalog namespace.
+func IsCatalogKey(key []byte) bool {
+	return bytes.HasPrefix(key, []byte("!dist|"))
+}
+
 // LatestCommitTS returns the local catalog store watermark without reading
 // catalog data. Callers use it as the pre-Phase-D legacy timestamp input before
 // selecting the transaction snapshot through the dedicated TSO.
