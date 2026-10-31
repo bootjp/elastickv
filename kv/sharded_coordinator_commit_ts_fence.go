@@ -15,6 +15,15 @@ import (
 // repeats.
 const rawFenceRetryAttempts = 3
 
+type rawDispatchShape struct {
+	groupCount   int
+	requestCount int
+}
+
+func (s rawDispatchShape) singleRequest() bool {
+	return s.groupCount == 1 && s.requestCount == 1
+}
+
 // WithCommitTSFenceActivation makes this coordinator, while it leads a group,
 // propose the raw and PREPARE apply-order fence activation for that group
 // until the activation has applied (--commitTSFence). Enable it only once
@@ -77,35 +86,36 @@ func (c *ShardedCoordinator) activateCommitTSFences(ctx context.Context) {
 // err can be re-dispatched with a fresh timestamp. Only a write conflict
 // qualifies (a fenced raw entry, or one below a newer version, which is the
 // same reordering seen per key); nothing of a rejected raw entry applied,
-// and a raw write carries no read set. A multi-group raw dispatch is not
-// retried, because the other groups' entries may have applied. A route
+// and a raw write carries no read set. A dispatch with multiple requests
+// is not retried, even if they reached one group, because another request
+// may have applied. A route
 // write-timestamp floor rejection also reads as a write conflict; it keeps
 // its own contract (the caller sees it) and is not retried here.
-func (c *ShardedCoordinator) retryableRawFenceConflict(reqs *OperationGroup[OP], groupCount int, err error) bool {
+func (c *ShardedCoordinator) retryableRawFenceConflict(reqs *OperationGroup[OP], shape rawDispatchShape, err error) bool {
 	return errors.Is(err, store.ErrWriteConflict) &&
 		!errors.Is(err, ErrRouteWriteTimestampTooLow) &&
-		groupCount == 1 && c.canRetryRawVersionGC(reqs)
+		shape.singleRequest() && c.canRetryRawVersionGC(reqs)
 }
 
 // dispatchRawWithFenceRetry dispatches a raw request, and re-dispatches it
 // with a fresh timestamp when the apply rejected it as out of timestamp
 // order (retryableRawFenceConflict).
-func (c *ShardedCoordinator) dispatchRawWithFenceRetry(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, int, error) {
+func (c *ShardedCoordinator) dispatchRawWithFenceRetry(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, rawDispatchShape, error) {
 	var (
-		resp       *CoordinateResponse
-		groupCount int
-		err        error
+		resp  *CoordinateResponse
+		shape rawDispatchShape
+		err   error
 	)
 	for attempt := 0; attempt <= rawFenceRetryAttempts; attempt++ {
 		var handled bool
-		groupCount = 0
+		shape = rawDispatchShape{}
 		resp, handled, err = c.dispatchBeforeShardRouting(ctx, reqs)
 		if !handled {
-			resp, groupCount, err = c.dispatchNonTxn(ctx, reqs)
+			resp, shape, err = c.dispatchNonTxn(ctx, reqs)
 		}
-		if err == nil || !c.retryableRawFenceConflict(reqs, groupCount, err) {
-			return resp, groupCount, err
+		if err == nil || !c.retryableRawFenceConflict(reqs, shape, err) {
+			return resp, shape, err
 		}
 	}
-	return resp, groupCount, err
+	return resp, shape, err
 }

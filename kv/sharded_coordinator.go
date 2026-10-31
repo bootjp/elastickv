@@ -1357,22 +1357,23 @@ func isComposed1RetryableError(err error) bool {
 // dispatchNonTxn routes a non-transactional operation group through the
 // shard router. Extracted from Dispatch to keep that method's branch
 // count within the cyclop budget after the 7a registration gate landed.
-func (c *ShardedCoordinator) dispatchNonTxn(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, int, error) {
+func (c *ShardedCoordinator) dispatchNonTxn(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, rawDispatchShape, error) {
 	if err := c.rejectWriteFencedPointElems(reqs.Elems); err != nil {
-		return nil, 0, err
+		return nil, rawDispatchShape{}, err
 	}
 	if hasExplicitGroupElem(reqs.Elems) {
 		return c.dispatchExplicitGroupNonTxn(ctx, reqs)
 	}
 	logs, err := c.requestLogs(ctx, reqs)
 	if err != nil {
-		return nil, 0, err
+		return nil, rawDispatchShape{}, err
 	}
 	r, groupCount, err := c.router.commitWithGroupCount(ctx, logs)
+	shape := rawDispatchShape{groupCount: groupCount, requestCount: len(logs)}
 	if err != nil {
-		return nil, groupCount, errors.WithStack(err)
+		return nil, shape, errors.WithStack(err)
 	}
-	return &CoordinateResponse{CommitIndex: r.CommitIndex}, groupCount, nil
+	return &CoordinateResponse{CommitIndex: r.CommitIndex}, shape, nil
 }
 
 func hasExplicitGroupElem(elems []*Elem[OP]) bool {
@@ -1384,38 +1385,39 @@ func hasExplicitGroupElem(elems []*Elem[OP]) bool {
 	return false
 }
 
-func (c *ShardedCoordinator) dispatchExplicitGroupNonTxn(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, int, error) {
+func (c *ShardedCoordinator) dispatchExplicitGroupNonTxn(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, rawDispatchShape, error) {
 	logs, gids, err := c.rawLogsWithGroups(ctx, reqs)
 	if err != nil {
-		return nil, 0, err
+		return nil, rawDispatchShape{}, err
 	}
+	shape := rawDispatchShape{groupCount: len(gids), requestCount: len(logs)}
 	var maxIndex uint64
 	for i, gid := range gids {
 		g, err := c.txnGroupForID(gid)
 		if err != nil {
-			return nil, len(gids), err
+			return nil, shape, err
 		}
 		resp, err := g.Txn.Commit(ctx, []*pb.Request{logs[i]})
 		if err != nil {
-			return nil, len(gids), errors.WithStack(err)
+			return nil, shape, errors.WithStack(err)
 		}
 		if resp != nil && resp.CommitIndex > maxIndex {
 			maxIndex = resp.CommitIndex
 		}
 	}
-	return &CoordinateResponse{CommitIndex: maxIndex}, len(gids), nil
+	return &CoordinateResponse{CommitIndex: maxIndex}, shape, nil
 }
 
 func (c *ShardedCoordinator) dispatchRawWithComposed1Retry(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
 	for attempt := 0; attempt <= composed1RetryAttempts; attempt++ {
-		resp, groupCount, err := c.dispatchRawWithFenceRetry(ctx, reqs)
+		resp, shape, err := c.dispatchRawWithFenceRetry(ctx, reqs)
 		if err == nil {
 			return resp, nil
 		}
 		if !errors.Is(err, ErrComposed1VersionGCd) || attempt == composed1RetryAttempts || c.engine == nil {
 			return resp, err
 		}
-		if groupCount != 1 || !c.canRetryRawVersionGC(reqs) {
+		if !shape.singleRequest() || !c.canRetryRawVersionGC(reqs) {
 			return resp, err
 		}
 		reqs.ObservedRouteVersion = c.engine.Version()

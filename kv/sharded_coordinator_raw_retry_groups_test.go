@@ -55,3 +55,41 @@ func TestRawRetryDoesNotResendPartiallyAppliedGroupsAfterRouteChange(t *testing.
 		})
 	}
 }
+
+func TestRawRetryRequiresSingleAppliedRequestAfterRouteConvergence(t *testing.T) {
+	t.Parallel()
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: []byte("m"), GroupID: 2, State: distribution.RouteStateActive},
+		},
+	}))
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: &recordingTransactional{}},
+		2: {Txn: &recordingTransactional{}},
+	}, 1, NewHLC(), nil)
+	reqs := &OperationGroup[OP]{Elems: []*Elem[OP]{
+		{Op: Put, Key: []byte("a"), Value: []byte("first")},
+		{Op: Put, Key: []byte("z"), Value: []byte("second")},
+	}}
+	logs, err := coord.requestLogs(context.Background(), reqs)
+	require.NoError(t, err)
+	require.Len(t, logs, 2)
+
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 2,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
+	grouped, err := coord.router.groupRequests(logs)
+	require.NoError(t, err)
+	require.Len(t, grouped, 1)
+	require.Len(t, grouped[1], 2)
+	shape := rawDispatchShape{groupCount: len(grouped), requestCount: len(logs)}
+	require.False(t, coord.retryableRawFenceConflict(reqs, shape, store.NewWriteConflictError([]byte("z"))),
+		"one request can apply while the other conflicts in the same destination group")
+	require.False(t, shape.singleRequest(), "version-GC retry must obey the same partial-success guard")
+}
