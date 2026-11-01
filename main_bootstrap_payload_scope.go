@@ -9,6 +9,11 @@ import (
 
 func bootstrapPayloadValidator(cluster raftbootstrap.UUID) func(raftadmission.Kind, uint64, []byte) error {
 	return func(kind raftadmission.Kind, group uint64, payload []byte) error {
+		// Legacy/plain wiring has no controller-owned rotation recipe. Keep
+		// it closed; protected rotation uses validateBootstrapFinalPayload.
+		if kind == raftadmission.Rotation {
+			return errors.Join(errBootstrapAdmissionPayload, errBootstrapRotationRecipe)
+		}
 		if err := validateBootstrapAdmissionPayload(kind, payload); err != nil {
 			return err
 		}

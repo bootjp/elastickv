@@ -23,6 +23,8 @@ type bootstrapDomain struct {
 	owners       map[uint64]*peersession.Owner
 	startupToken string
 	activations  map[uint64][]byte
+	cluster      raftbootstrap.UUID
+	encryption   *bootstrapEncryptionDomain
 }
 
 const bootstrapReadinessRetryInterval = 25 * time.Millisecond
@@ -72,23 +74,35 @@ func bootstrapDomainForRuntimes(runtimes []*raftGroupRuntime) *bootstrapDomain {
 	return nil
 }
 
-func newBootstrapDomain(cluster raftbootstrap.UUID, groups []groupSpec) (*bootstrapDomain, error) {
-	if *encryptionRotateOnStartup || *encryptionEnabled || *encryptionSidecarPath != "" {
-		return nil, errors.Wrap(errBootstrapEncryptionUnsupported, "protected runtime requires complete owned encryption/rotation reconciliation")
+func newBootstrapDomain(cluster raftbootstrap.UUID, groups []groupSpec, encWiring ...encryptionWriteWiring) (*bootstrapDomain, error) {
+	enc, err := newBootstrapEncryptionDomain(groups, encWiring)
+	if err != nil {
+		return nil, err
 	}
 	ids := make([]uint64, 0, len(groups))
 	for _, group := range groups {
 		ids = append(ids, group.id)
 	}
-	a, err := raftadmission.New(raftadmission.Config{
+	d := &bootstrapDomain{cluster: cluster, encryption: enc, owners: make(map[uint64]*peersession.Owner), activations: make(map[uint64][]byte)}
+	cfg := raftadmission.Config{
 		Cluster: cluster, Groups: ids, DefaultGroup: defaultGroupID(groups),
-		RotationRequested: *encryptionRotateOnStartup,
-		ValidatePayload:   bootstrapPayloadValidator(cluster),
-	})
+		RotationRequested:    *encryptionRotateOnStartup,
+		ValidatePayload:      bootstrapPayloadValidator(cluster),
+		EncryptionConfigured: enc != nil,
+	}
+	if enc != nil {
+		cfg.InspectPayload = d.inspectPayload
+	}
+	a, err := raftadmission.New(cfg)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	return &bootstrapDomain{admission: a, owners: make(map[uint64]*peersession.Owner), activations: make(map[uint64][]byte)}, nil
+	d.admission = a
+	if enc != nil {
+		enc.wiring.cache.SetBeforeEncryptionChange(a.BeginEncryptionMutation)
+		enc.wiring.raftEnvelope.setBeforeEncryptionChange(a.BeginEncryptionMutation)
+	}
+	return d, nil
 }
 
 func (d *bootstrapDomain) register(id uint64, owner *peersession.Owner) error {

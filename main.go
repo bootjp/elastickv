@@ -678,7 +678,13 @@ func run() error {
 	// registry-read / behind-epoch failure fails the process
 	// synchronously here, BEFORE the gRPC servers serve, so writes never
 	// run with no registration gate installed.
-	distStartup, err := startDistributionStartup(distributionStartupInput{
+	encryptionStartup := bootstrapEncryptionStartupConfig{
+		runtimes: runtimes, groups: shardGroups, defaultGroup: cfg.defaultGroup,
+		network: bootstrapNetwork, wiring: encWiring, sidecarPath: *encryptionSidecarPath,
+		wrapper: kekUnwrapper, nodeID: etcdraftengine.DeriveNodeID(*raftId), requested: *encryptionRotateOnStartup,
+		eg: eg, cleanup: &cleanup,
+	}
+	distStartup, err := startDistributionWithBootstrapEncryption(distributionStartupInput{
 		ctx:             runCtx,
 		eg:              eg,
 		cancel:          cancel,
@@ -697,7 +703,7 @@ func run() error {
 		clock:           clock,
 		tsoWiring:       tsoWiring,
 		shardGroups:     shardGroups,
-	})
+	}, encryptionStartup)
 	if err != nil {
 		// Members already run on eg (TSO reloader, raft lifecycle
 		// watchers, the registration gate); drain them before the deferred
@@ -705,7 +711,7 @@ func run() error {
 		// the registration retry surfaces here as context.Canceled.
 		return waitErrgroupAfterStartupFailure(cancel, eg, err)
 	}
-	defaultRuntime := distStartup.defaultRuntime
+	runCtx = distStartup.registrationCtx
 	distServer := distStartup.distServer
 	distCatalog := distStartup.distCatalog
 	autoSplitRuntime := distStartup.autoSplitRuntime
@@ -718,19 +724,7 @@ func run() error {
 	encryptionConfChangeInterceptor := newEncryptionConfChangeInterceptor(
 		encWiring.encryptionConfigured(),
 		coordinate, shardGroups[cfg.defaultGroup], encWiring.cache, *encryptionSidecarPath, etcdraftengine.DeriveNodeID)
-	rotateOnStartupDeregister, waitRotateOnStartup := installEncryptionRotateOnStartup(
-		runCtx,
-		*encryptionRotateOnStartup,
-		defaultRuntime,
-		postCutoverProposerForRuntime(defaultRuntime, shardGroups),
-		*encryptionSidecarPath,
-		kekUnwrapper,
-		encWiring.raftEnvelope,
-		etcdraftengine.DeriveNodeID(*raftId),
-		encWiring.epoch,
-		encWiring.raftEpoch,
-		slog.Default(),
-	)
+	rotateOnStartupDeregister, waitRotateOnStartup := installBootstrapStartupRotation(distStartup.rotationSupervisor, runCtx, encryptionStartup)
 	cleanup.Add(rotateOnStartupDeregister)
 	if err := startServersAfterStartupRotation(waitRotateOnStartup, serversInput{
 		ctx: runCtx, eg: eg, cancel: cancel, lc: &lc,
@@ -861,8 +855,10 @@ type distributionStartupInput struct {
 }
 
 type distributionStartup struct {
-	defaultRuntime *raftGroupRuntime
-	distServer     *adapter.DistributionServer
+	defaultRuntime     *raftGroupRuntime
+	distServer         *adapter.DistributionServer
+	registrationCtx    context.Context
+	rotationSupervisor *bootstrapRotationRuntime
 	// distCatalog is the durable route catalog the admin backup store reads
 	// to capture a route snapshot at a pinned timestamp. It is built here, so
 	// it has to travel back out rather than be rebuilt at the call site.
@@ -2157,7 +2153,7 @@ func buildShardGroups(
 	// breaking the shared-cache invariant 6D-6c-1 relies on.
 	encWiring = encWiring.withDefaultedCache()
 	multi = effectiveMultiDataDirs(groups, multi)
-	bootstrapSpecs, bootstrapDomain, err := loadProtectedBootstrapDomain(raftID, raftDir, groups, multi)
+	bootstrapSpecs, bootstrapDomain, err := loadProtectedBootstrapDomain(raftID, raftDir, groups, multi, encWiring)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -2193,6 +2189,13 @@ func buildShardGroups(
 		runtimes = append(runtimes, runtime)
 		shardGroups[g.id] = sg
 		encWiring.attachRaftEnvelopeGroup(g.id, sg)
+		if bootstrapDomain != nil {
+			if err := bootstrapDomain.attachEncryptionGroup(g.id, sg); err != nil {
+				closeRaftGroupRuntimes(runtimes)
+				bootstrapDomain.admission.Close()
+				return nil, nil, err
+			}
+		}
 	}
 	return runtimes, shardGroups, nil
 }
@@ -4927,6 +4930,9 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 		return r.startupFailure(err)
 	}
 	adminGRPCOpts := bootstrapServiceAuthOptions(r.adminGRPCOpts, bootstrapDomainForRuntimes(r.runtimes))
+	if bootstrapDomainForRuntimes(r.runtimes) != nil {
+		adminGRPCOpts.unary = append([]grpc.UnaryServerInterceptor{bootstrapRegistrationReceiverInterceptor(r.defaultGroupID)}, adminGRPCOpts.unary...)
+	}
 	if r.publicKVGate != nil {
 		adminGRPCOpts.unary = append(adminGRPCOpts.unary, r.publicKVGate.unaryInterceptor)
 		adminGRPCOpts.stream = append(adminGRPCOpts.stream, r.publicKVGate.streamInterceptor)

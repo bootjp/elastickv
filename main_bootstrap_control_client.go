@@ -112,7 +112,7 @@ func (c *bootstrapControlClient) Invoke(ctx context.Context, group uint64, addre
 		return errors.WithStack(peersession.ErrDenied)
 	}
 	message, err := descriptor.BoundRequest(peersession.RequestBinding{Group: group, From: local.local, To: peer}, input)
-	if err != nil || message.Traffic != peersession.Control {
+	if err != nil || !bootstrapOutgoingControlTraffic(message.Traffic) {
 		// Activation is the separately owned LOCAL recovery worker, not a
 		// standalone remote client manufacturing a policy from reply hints.
 		return errors.WithStack(peersession.ErrDenied)
@@ -131,6 +131,10 @@ func (c *bootstrapControlClient) Invoke(ctx context.Context, group uint64, addre
 	proto.Reset(output)
 	proto.Merge(output, pending)
 	return nil
+}
+
+func bootstrapOutgoingControlTraffic(traffic peersession.Traffic) bool {
+	return traffic == peersession.Control || traffic == peersession.Registration
 }
 
 func bootstrapControlProtoMessages(request, reply any) (proto.Message, proto.Message, error) {

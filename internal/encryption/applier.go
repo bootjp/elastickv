@@ -200,6 +200,7 @@ type RaftCutoverWrapInstaller func(cutoverIdx uint64, activeRaftDEKID uint32) er
 // DEK, envelope gate off) so a freshly-constructed StateCache is
 // safe to use before any apply or prime has run.
 type StateCache struct {
+	beforeEncryptionChange atomic.Pointer[func() func()]
 	// activeStorageDEKID mirrors sidecar.Active.Storage. Zero means
 	// "not bootstrapped"; readers surface (0, false) and the storage
 	// layer writes cleartext.
@@ -257,6 +258,8 @@ func (c *StateCache) RefreshFromSidecar(sc *Sidecar) {
 	if c == nil || sc == nil {
 		return
 	}
+	end := c.beginEncryptionChange()
+	defer end()
 	c.activeStorageDEKID.Store(sc.Active.Storage)
 	c.storageEnvelopeActive.Store(sc.StorageEnvelopeActive)
 	c.activeRaftDEKID.Store(sc.Active.Raft)
@@ -326,6 +329,8 @@ func (c *StateCache) MarkRegistered(dekID uint32) {
 	if c == nil || dekID == 0 {
 		return
 	}
+	end := c.beginEncryptionChange()
+	defer end()
 	c.registeredStorageDEKID.Store(dekID)
 }
 

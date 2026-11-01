@@ -66,8 +66,7 @@ func bootstrapAdmissionPayloadValidator(kind raftadmission.Kind) func([]byte) er
 	case raftadmission.Recovery:
 		return validateBootstrapActivationPayload
 	case raftadmission.Rotation:
-		// No owned-rotation proposal codec is wired.
-		return nil
+		return validateBootstrapRotationPayload
 	default:
 		return nil
 	}
@@ -128,8 +127,14 @@ func validateBootstrapRegistrationPayload(payload []byte) error {
 	if payload[0] != fsmwire.OpRegistration {
 		return errors.WithStack(errBootstrapAdmissionPayload)
 	}
-	_, err := fsmwire.DecodeRegistration(payload[1:])
-	return errors.Wrap(err, "decode bootstrap writer registration")
+	registration, err := fsmwire.DecodeRegistration(payload[1:])
+	if err != nil {
+		return errors.Wrap(err, "decode bootstrap writer registration")
+	}
+	if registration.DEKID == 0 || registration.FullNodeID == 0 {
+		return errors.WithStack(errBootstrapAdmissionPayload)
+	}
+	return nil
 }
 
 func validateBootstrapCatalogPayload(payload []byte) error {

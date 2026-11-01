@@ -34,10 +34,33 @@ type bootstrapAuthFixture struct {
 	gateCalls atomic.Int64
 }
 
+type bootstrapAuthRegistrationOptions struct {
+	prepared       bool
+	receiverGroup  *uint64
+	omitReceiver   bool
+	inspectPayload func(raftadmission.Kind, uint64, []byte, raftbootstrap.Digest) (raftadmission.PayloadInspection, error)
+}
+
+func bootstrapAuthRegistrationInterceptor(group uint64, options bootstrapAuthRegistrationOptions) grpc.UnaryServerInterceptor {
+	if options.omitReceiver {
+		return func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, next grpc.UnaryHandler) (any, error) {
+			return next(ctx, req)
+		}
+	}
+	if options.receiverGroup != nil {
+		group = *options.receiverGroup
+	}
+	return bootstrapRegistrationReceiverInterceptor(group)
+}
+
 // Exercise the production order on a real mTLS/session connection:
 // owner -> wrapped original AdminTokenAuth -> startup/DataReady gate -> handler.
-func newBootstrapAuthFixture(t *testing.T, group uint64, stage peersession.Stage, rewrite func(any) any) *bootstrapAuthFixture {
+func newBootstrapAuthFixture(t *testing.T, group uint64, stage peersession.Stage, rewrite func(any) any, registrationOptions ...bootstrapAuthRegistrationOptions) *bootstrapAuthFixture {
 	t.Helper()
+	var registrationConfig bootstrapAuthRegistrationOptions
+	if len(registrationOptions) != 0 {
+		registrationConfig = registrationOptions[0]
+	}
 	pki := newBootstrapGatePKI(t)
 	serverCert, serverKey := pki.certificate(t, 2)
 	clientCert, clientKey := pki.certificate(t, 3)
@@ -65,9 +88,14 @@ func newBootstrapAuthFixture(t *testing.T, group uint64, stage peersession.Stage
 	projection := peersession.Group{ID: group, Generation: 1, Configuration: configuration, Policy: policyDigest,
 		Floor: raftbootstrap.Floor{ActivationIndex: 1, Generation: 1}, Minimum: versions, State: peersession.Intact,
 		Stage: stage, Pending: peersession.PendingClear, MarkerReady: true}
+	preactivation := registrationConfig.prepared
+	if preactivation {
+		projection.Policy, projection.Floor = raftbootstrap.Digest{}, raftbootstrap.Floor{}
+	}
 	require.NoError(t, server.UpdateGroup(projection))
 	require.NoError(t, client.UpdateGroup(projection))
-	a, err := raftadmission.New(raftadmission.Config{Cluster: cluster, DefaultGroup: group, Groups: []uint64{group}, ValidatePayload: bootstrapPayloadValidator(cluster)})
+	a, err := raftadmission.New(raftadmission.Config{Cluster: cluster, DefaultGroup: group, Groups: []uint64{group},
+		ValidatePayload: bootstrapPayloadValidator(cluster), InspectPayload: registrationConfig.inspectPayload})
 	require.NoError(t, err)
 	require.NoError(t, a.WithNative(t.Context(), group, func(scope raftengine.NativeScope) error {
 		scope.Observe(raftengine.NativeState{Term: 1, Role: raftengine.StateLeader, LeaderID: 1, ConfigurationIndex: 1})
@@ -79,7 +107,11 @@ func newBootstrapAuthFixture(t *testing.T, group uint64, stage peersession.Stage
 	if stage == peersession.IdentityReady {
 		registration = raftadmission.RegistrationUnknown
 	}
-	require.NoError(t, a.PublishRecovery(ticket, policy, 1, registration))
+	if preactivation {
+		publishBootstrapRegistrationPreparedFixture(t, a, ticket, policy, serverCert)
+	} else {
+		require.NoError(t, a.PublishRecovery(ticket, policy, 1, registration))
+	}
 	f := &bootstrapAuthFixture{bootstrapGateFixture: &bootstrapGateFixture{a: a, server: server, client: client,
 		service: &bootstrapGateService{}, group: group}}
 	domain := &bootstrapDomain{admission: a, startupToken: bootstrapGateTestToken}
@@ -92,7 +124,7 @@ func newBootstrapAuthFixture(t *testing.T, group uint64, stage peersession.Stage
 		return admin(ctx, request, info, next)
 	}
 	options = append(options, grpc.ChainUnaryInterceptor(
-		bootstrapAuthRewrite(rewrite), bootstrapStartupAuthException(domain, countedAdmin), f.publicGate,
+		bootstrapAuthRegistrationInterceptor(group, registrationConfig), bootstrapAuthRewrite(rewrite), bootstrapStartupAuthException(domain, countedAdmin), f.publicGate,
 	), grpc.ChainStreamInterceptor(adminStream))
 	gs := grpc.NewServer(options...)
 	server.Register(gs)
@@ -101,6 +133,7 @@ func newBootstrapAuthFixture(t *testing.T, group uint64, stage peersession.Stage
 	pb.RegisterDistributionServer(gs, service)
 	pb.RegisterInternalServer(gs, service)
 	pb.RegisterAdminServer(gs, service)
+	pb.RegisterEncryptionAdminServer(gs, service)
 	done := make(chan struct{})
 	go func() { defer close(done); _ = gs.Serve(lis) }()
 	t.Cleanup(func() {
@@ -127,7 +160,7 @@ func newBootstrapAuthFixture(t *testing.T, group uint64, stage peersession.Stage
 
 func bootstrapAuthRewrite(rewrite func(any) any) grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, request any, info *grpc.UnaryServerInfo, next grpc.UnaryHandler) (any, error) {
-		if rewrite != nil && info.FullMethod == pb.Internal_ForwardAdminProposal_FullMethodName {
+		if rewrite != nil && (info.FullMethod == pb.Internal_ForwardAdminProposal_FullMethodName || info.FullMethod == pb.EncryptionAdmin_RegisterEncryptionWriter_FullMethodName) {
 			request = rewrite(request)
 		}
 		return next(ctx, request)

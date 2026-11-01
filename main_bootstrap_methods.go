@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
+	"math"
 
 	"github.com/bootjp/elastickv/internal/peersession"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
@@ -21,7 +23,35 @@ func bootstrapSharedGRPCMethods(groupID uint64) []peersession.Method {
 		bootstrapControlMethod(groupID, pb.Distribution_GetTimestamp_FullMethodName, bootstrapTimestampRequest, bootstrapTimestampReply),
 		bootstrapControlMethod(groupID, pb.Internal_GetPrepareEvidenceState_FullMethodName, bootstrapPrepareStateRequest, bootstrapPrepareStateReply),
 		bootstrapControlMethod(groupID, pb.Internal_ForwardAdminProposal_FullMethodName, bootstrapPrepareProposalRequest, bootstrapPrepareProposalReply),
+		bootstrapControlMethod(groupID, pb.EncryptionAdmin_RegisterEncryptionWriter_FullMethodName, bootstrapRegistrationRequest, bootstrapRegistrationReply),
 	}
+}
+
+func bootstrapRegistrationRequest(binding peersession.RequestBinding, payload any) (peersession.Message, error) {
+	req, ok := payload.(*pb.RegisterEncryptionWriterRequest)
+	if !ok || !bootstrapExactProto(req) || req.GetDekId() == 0 || len(req.GetWriters()) != 1 {
+		return peersession.Message{}, peersession.ErrFormat
+	}
+	writer := req.GetWriters()[0]
+	if !bootstrapExactProto(writer) || writer.GetFullNodeId() == 0 || writer.GetFullNodeId() != binding.From.Member || writer.GetLocalEpoch() > math.MaxUint16 {
+		return peersession.Message{}, peersession.ErrFormat
+	}
+	message := bootstrapControlMessage(binding)
+	message.Traffic = peersession.Registration
+	epoch, err := bootstrapRegistrationEpoch(writer.GetLocalEpoch())
+	if err != nil {
+		return peersession.Message{}, peersession.ErrFormat
+	}
+	message.Declaration = sha256.Sum256(registrationEntry(req.GetDekId(), writer.GetFullNodeId(), epoch))
+	return message, nil
+}
+
+func bootstrapRegistrationReply(request peersession.Message, payload any) (peersession.Message, error) {
+	reply, ok := payload.(*pb.RegisterEncryptionWriterResponse)
+	if !ok || !bootstrapExactProto(reply) || reply.GetAppliedIndex() == 0 {
+		return peersession.Message{}, peersession.ErrFormat
+	}
+	return bootstrapControlReply(request), nil
 }
 
 func bootstrapControlMethod(groupID uint64, name string, request peersession.BindingDecoder, reply peersession.ReplyDecoder) peersession.Method {

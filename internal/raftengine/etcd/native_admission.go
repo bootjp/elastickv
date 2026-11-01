@@ -88,7 +88,7 @@ func (e *Engine) mutateNative(ctx context.Context, request *raftengine.NativeReq
 }
 
 func validateNativeAdmissionConfig(cfg OpenConfig) error {
-	if cfg.NativeIdentity == nil && cfg.RecoveredAdmission == nil && cfg.AdmissionChanged == nil {
+	if cfg.NativeIdentity == nil && cfg.RecoveredAdmission == nil && cfg.AdmissionChanged == nil && cfg.BeforeAdmissionChange == nil {
 		return nil
 	}
 	if cfg.NativeIdentity == nil {

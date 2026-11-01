@@ -42,7 +42,8 @@ func TestBootstrapSharedGRPCMethodsExactInventory(t *testing.T) {
 		require.NotNil(t, method.Reply)
 	}
 	require.ElementsMatch(t, []string{pb.RawKV_RawLatestCommitTS_FullMethodName, pb.Distribution_GetTimestamp_FullMethodName,
-		pb.Internal_GetPrepareEvidenceState_FullMethodName, pb.Internal_ForwardAdminProposal_FullMethodName}, names)
+		pb.Internal_GetPrepareEvidenceState_FullMethodName, pb.Internal_ForwardAdminProposal_FullMethodName,
+		pb.EncryptionAdmin_RegisterEncryptionWriter_FullMethodName}, names)
 }
 
 func TestBootstrapSharedGRPCMethodsBoundRoutingAndReplies(t *testing.T) {

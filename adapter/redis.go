@@ -180,6 +180,9 @@ type RedisServer struct {
 	// nil preserves the historical unbounded path for narrow test fixtures.
 	heavyCommandLimiter *redisHeavyCommandLimiter
 	requestAdmission    RequestAdmission
+	wireTxnMu           sync.Mutex
+	wireTxns            map[*redisWireTxn]struct{}
+	wireTxnIdleTimeout  time.Duration
 	// peerLimiter bounds concurrent Redis connections per remote peer IP.
 	peerLimiter *redisPeerLimiter
 	// blockWaitFallback is the safety-net polling interval used by blocking
@@ -501,6 +504,7 @@ type connState struct {
 	mu                 sync.Mutex
 	inTxn              bool
 	transactionRefused bool
+	wireTxn            *redisWireTxn
 	queue              []redcon.Command
 	// connID is a monotonically increasing per-server connection
 	// identifier assigned on first access via getConnState. Exposed via
@@ -635,6 +639,7 @@ func (r *RedisServer) acceptConn(conn redcon.Conn) bool {
 }
 
 func (r *RedisServer) closeConn(conn redcon.Conn) {
+	r.closeWireTransaction(conn)
 	if r == nil || r.peerLimiter == nil {
 		return
 	}
@@ -722,7 +727,7 @@ func (r *RedisServer) triggerUrgentCompaction(typeName string, key []byte) {
 }
 
 func (r *RedisServer) dispatchCommand(conn redcon.Conn, name string, handler func(redcon.Conn, redcon.Command), cmd redcon.Command, start time.Time) {
-	if r.refuseProtectedTransaction(conn, name) {
+	if r.dispatchProtectedTransaction(conn, name, cmd, start) {
 		return
 	}
 	if r.requestAdmission != nil {
@@ -831,6 +836,7 @@ func (r *RedisServer) Close() error {
 	if r.baseCancel != nil {
 		r.baseCancel()
 	}
+	r.closeWireTransactions()
 	if r.pubsub != nil {
 		r.pubsub.Close()
 	}
@@ -892,7 +898,7 @@ func (r *RedisServer) handleRedisCommand(conn redcon.Conn, cmd redcon.Command) {
 		start = time.Now()
 	}
 	name := strings.ToUpper(string(cmd.Args[0]))
-	if r.refuseProtectedTransaction(conn, name) {
+	if r.dispatchProtectedTransaction(conn, name, cmd, start) {
 		return
 	}
 	handler, ok := r.route[name]
@@ -911,8 +917,7 @@ func (r *RedisServer) handleRedisCommand(conn redcon.Conn, cmd redcon.Command) {
 	}
 	state := getConnState(conn)
 	if redisQueueOnlyCommand(state, name) {
-		// Legacy MULTI only copies argv. Protected wire transactions have
-		// already been refused above until their original H can be retained.
+		// Protected queues are handled above with their retained MULTI owner.
 		state.queue = append(state.queue, cloneCommand(cmd))
 		r.traceCommandDone(conn, name, cmd.Args[1:], 0, true)
 		conn.WriteString("QUEUED")

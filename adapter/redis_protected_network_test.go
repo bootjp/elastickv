@@ -41,18 +41,17 @@ func TestRedisProtectedNetworkIngress(t *testing.T) {
 	require.NoError(t, c.SetDeadline(time.Now().Add(5*time.Second)))
 	_, err = io.WriteString(c, "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n*2\r\n$3\r\nGET\r\n$1\r\nk\r\n*1\r\n$5\r\nMULTI\r\n*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nw\r\n*1\r\n$4\r\nEXEC\r\n")
 	require.NoError(t, err)
-	refusal := "-" + errRedisTransactionOwnership.Error() + "\r\n"
-	want := "+OK\r\n$1\r\nv\r\n" + refusal + refusal + refusal
+	want := "+OK\r\n$1\r\nv\r\n+OK\r\n+QUEUED\r\n*1\r\n+OK\r\n"
 	reply := make([]byte, len(want))
 	_, err = io.ReadFull(c, reply)
 	require.NoError(t, err)
 	require.Equal(t, want, string(reply))
 	_, err = io.WriteString(c, "*2\r\n$3\r\nGET\r\n$1\r\nk\r\n")
 	require.NoError(t, err)
-	reply = make([]byte, len("$1\r\nv\r\n"))
+	reply = make([]byte, len("$1\r\nw\r\n"))
 	_, err = io.ReadFull(c, reply)
 	require.NoError(t, err)
-	require.Equal(t, "$1\r\nv\r\n", string(reply), "refused pipelined SET must not execute outside its transaction")
+	require.Equal(t, "$1\r\nw\r\n", string(reply), "pipelined transaction commits before the subsequent GET")
 	_, err = io.WriteString(c, "*2\r\n$9\r\nSUBSCRIBE\r\n$1\r\nc\r\n")
 	require.NoError(t, err)
 	want = "*3\r\n$9\r\nsubscribe\r\n$1\r\nc\r\n:1\r\n"

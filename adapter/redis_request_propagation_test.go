@@ -239,10 +239,6 @@ func TestRedisOwnedUrgentCompactionUsesOriginalContext(t *testing.T) {
 
 func TestRedisOwnedRegisteredAndUnsupportedCommands(t *testing.T) {
 	for _, spec := range redisCommandSpecs {
-		if redisWireTransaction(spec.Constant) {
-			require.False(t, redisOwnedCommandSupported(spec.Constant))
-			continue
-		}
 		require.True(t, redisOwnedCommandSupported(spec.Constant), "registered command %s needs an ownership audit", spec.Constant)
 	}
 	s, owner := redisPropagationServer(t)
@@ -258,38 +254,30 @@ func TestRedisOwnedRegisteredAndUnsupportedCommands(t *testing.T) {
 }
 
 func TestRedisOwnedWireTransactionCannotRemintQueuedGeneration(t *testing.T) {
-	for _, stale := range []bool{false, true} {
-		t.Run(map[bool]string{false: "pipelined", true: "stale-generation"}[stale], func(t *testing.T) {
-			s, owner := redisPropagationServer(t)
-			mints := 0
-			s.requestAdmission = func(context.Context) (RequestOwnership, error) {
-				mints++
-				return &redisTestOwnership{ctx: owner.ctx}, nil
-			}
-			c := &redisOwnedTestConn{}
-			if stale {
-				state := getConnState(c)
-				state.inTxn = true
-				state.queue = []redcon.Command{{Args: [][]byte{[]byte(cmdSet), []byte("stale"), []byte("must-not-write")}}}
-				owner.revoked.Store(true)
-			} else {
-				s.handleRedisCommand(c, redcon.Command{Args: [][]byte{[]byte(cmdMulti)}})
-			}
-			s.handleRedisCommand(c, redcon.Command{Args: [][]byte{[]byte(cmdSet), []byte("stale"), []byte("must-not-write")}})
-			s.handleRedisCommand(c, redcon.Command{Args: [][]byte{[]byte(cmdExec)}})
-			require.Zero(t, mints, "a stale transaction must not obtain any fresh H")
-			require.Empty(t, c.raw.String())
-			for _, write := range c.writes {
-				require.Equal(t, "error", write.op)
-				require.Equal(t, errRedisTransactionOwnership.Error(), write.s)
-			}
-			require.Empty(t, getConnState(c).queue)
-			require.False(t, getConnState(c).inTxn)
-			require.False(t, getConnState(c).transactionRefused)
-			_, err := s.store.GetAt(owner.ctx, redisStrKey([]byte("stale")), s.readTS())
-			require.ErrorIs(t, err, store.ErrKeyNotFound)
-		})
+	s, owner := redisPropagationServer(t)
+	mints := 0
+	s.requestAdmission = func(context.Context) (RequestOwnership, error) {
+		mints++
+		return &redisTestOwnership{ctx: owner.ctx}, nil
 	}
+	c := &redisOwnedTestConn{}
+	state := getConnState(c)
+	state.inTxn = true
+	state.queue = []redcon.Command{{Args: [][]byte{[]byte(cmdSet), []byte("stale"), []byte("must-not-write")}}}
+	owner.revoked.Store(true)
+	s.handleRedisCommand(c, redcon.Command{Args: [][]byte{[]byte(cmdSet), []byte("stale"), []byte("must-not-write")}})
+	s.handleRedisCommand(c, redcon.Command{Args: [][]byte{[]byte(cmdExec)}})
+	require.Zero(t, mints, "a queue missing its carrier must not obtain fresh H")
+	require.Empty(t, c.raw.String())
+	for _, write := range c.writes {
+		require.Equal(t, "error", write.op)
+		require.Equal(t, errRedisAdmission.Error(), write.s)
+	}
+	require.Empty(t, state.queue)
+	require.False(t, state.inTxn)
+	require.False(t, state.transactionRefused)
+	_, err := s.store.GetAt(owner.ctx, redisStrKey([]byte("stale")), s.readTS())
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
 }
 
 func TestRedisOwnedExecStylePerElementErrors(t *testing.T) {

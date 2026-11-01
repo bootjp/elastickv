@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"os"
 	"path/filepath"
 	"testing"
@@ -35,7 +36,8 @@ func newBootstrapProjectionFixture(t *testing.T) *bootstrapProjectionFixture {
 	require.True(t, ok)
 	f := &bootstrapProjectionFixture{
 		in: bootstrapEncryptionProjectionInput{
-			configured: true, sidecarPath: filepath.Join(t.TempDir(), "keys.json"),
+			runtimeFence: func() (uint64, error) { return 1, nil },
+			configured:   true, sidecarPath: filepath.Join(t.TempDir(), "keys.json"),
 			localStore: st, fullNodeID: 123, storageEpoch: 7, raftEpoch: 9,
 			storageWrapperInstalled: func(id uint32, epoch uint16) bool { return id == 1 && epoch == 7 },
 			raftWrapperInstalled:    func(id uint32, epoch uint16) bool { return id == 2 && epoch == 9 },
@@ -102,9 +104,11 @@ func TestBootstrapEncryptionProjectionAppliedObservation(t *testing.T) {
 	require.Equal(t, uint64(30), got.checkpoint.Index)
 	require.Equal(t, bootstrapEncryptionPurposeProjection{
 		dekID: 1, epoch: 7, registered: true, envelopeActive: true, cutoverIndex: 10, wrapperInstalled: true,
+		keyDigest: sha256.Sum256([]byte{1}), registry: encryption.RegistryValue{FullNodeID: 123, FirstSeenLocalEpoch: 7, LastSeenLocalEpoch: 7},
 	}, got.storage)
 	require.Equal(t, bootstrapEncryptionPurposeProjection{
 		dekID: 2, epoch: 9, registered: true, envelopeActive: true, cutoverIndex: 20, wrapperInstalled: true,
+		keyDigest: sha256.Sum256([]byte{2}), registry: encryption.RegistryValue{FullNodeID: 123, FirstSeenLocalEpoch: 9, LastSeenLocalEpoch: 9},
 	}, got.raft)
 	after, err := os.ReadFile(f.in.sidecarPath)
 	require.NoError(t, err)

@@ -1,8 +1,77 @@
 # Raft catalog bootstrap
 
-Status: Proposed v5; accepted-baseline plaintext startup integrated; final verification in progress; full protocol and production operation not yet verified
+Status: Proposed v5; accepted-baseline startup, protected wire transactions and exact active-envelope startup rotation implemented; bounded E2E verified; full protocol and production operation not yet verified
 Author: bootjp
 Date: 2026-10-30
+
+## Implementation Status (2026-11-02)
+
+The opt-in runtime and offline CLI implement accepted-baseline preparation and
+activation for existing plaintext native state, including dedicated TSO group
+zero with a data group. Preparation, active policy, ControlReady and DataReady
+are separate milestones. Real native/Pebble tests cover plaintext restart and
+selected three-member TLS data-group snapshot catch-up cases. Those cases do
+not establish the complete v5 snapshot/journal or membership protocol.
+
+Protected Redis wire `MULTI` now retains its original receiver-local admission
+owner across copied queued arguments until `EXEC`, `DISCARD` or cancellation.
+It does not refresh a stale handle at EXEC. Idle timeout, disconnect and server
+shutdown cancel and join owned work. Protected follower forwarding disables
+automatic transaction retries and retains top-level unknown outcomes after a
+lost reply or terminal reply overflow. Targeted real-wire race tests cover
+these paths; they are not a distributed Jepsen campaign result.
+
+The encryption extension is limited to the exact local startup rotation recipe
+requested with `--encryptionRotateOnStartup` under the protected runtime.
+Protected encrypted startup requires an already active storage envelope.
+Inactive storage-envelope configurations are synchronously rejected as
+unsupported before workers start; inactive-key registration is not a supported
+startup path. Raft envelope activation and multigroup configurations remain
+subject to the existing namespace/runtime scope validation; the local rotation
+recipe does not relax those restrictions.
+Receiver-owned rotation supervision, native invalidation and installed-state
+projection are integrated for this bounded active-envelope profile. Payload
+validation authenticates and completely parses the actual final payload outside
+the admission lock,
+using the explicitly bound installed cipher/key/wrapper projection. The final
+seal hashes the actual ciphertext, not merely its decoded plaintext. Rotation
+grants bind exact typed recipe frames; they are not general admin authority.
+Ordinary external `EncryptionAdmin.RotateDEK`, enable and bootstrap operations
+remain fail-closed unless separately wired with their own admission authority.
+
+Follower encryption recovery uses a native ReadIndex/applied barrier under the
+original Recovery handle before publishing a fresh local permission. A cached
+sidecar, earlier Wait result or a successful leader RPC alone is insufficient.
+Role/generation changes invalidate the observation; unresolved owned rotation
+outcomes require reconciliation rather than a fresh retry claiming absence.
+The follower Recovery read path does not authorize ordinary follower-local
+linearizable reads or peer proposals. Native follower-barrier and lifetime unit
+tests are distinct from composed encrypted multi-member verification.
+
+In particular, `TestBootstrapRotationE2EPreparedInactiveKeys` proves real native
+plaintext preparation with committed inactive keys and all-member readiness,
+not protected encrypted rotation or restart. Installed projection/runtime IO
+tests exercise actual cipher/wrapper selection, including pending registration.
+The inactive-key preparation fixture does not establish a supported protected
+encrypted startup configuration.
+`TestBootstrapRotationE2EActiveEnvelopesBusinessRestart` covers a real single
+data group with active storage and Raft envelopes, local requested startup
+rotation, business write/read and protected restart; the final focused race run
+passed in 22.119s. The original accepted offline cut remains plaintext: this is
+not encrypted-row migration evidence. Encrypted three-member follower permission
+(F), term-change and lost-result scenarios have not been validated end to end;
+their lifetime handling has unit coverage only. Composed lint/review remains a
+separate gate, and this result is not production-operation evidence.
+`TestRecoveryReadIndexActualFollowerUsesOriginalRecoveryHandle` exercises the
+native follower barrier with real Raft and admission, but its loopback peer
+transport fixture is not a composed production TLS/session test.
+
+This work does not enable encrypted legacy/offline baseline migration, cold
+seed, lost-state replacement, arbitrary protected membership changes or the
+complete snapshot protocol. Existing plaintext preparation may retain committed
+inactive encryption metadata; that is not import of encrypted legacy payloads.
+Full v5 support, production operation and historical serializability remain
+unclaimed. See `docs/raft_bootstrap_enablement.md` for the bounded runbook.
 
 ## Context
 
@@ -73,8 +142,10 @@ policy activation, shared admission and Control/DataReady. Real native tests
 cover existing data, a three-member TLS group, dedicated TSO plus a data group,
 ordinary writes and restart. These are integration tests, not production
 operation or historical correctness evidence. See `docs/raft_bootstrap_enablement.md`.
-Encrypted/rotation profiles, cold seed, lost-state replacement, guarded
-membership and the complete snapshot/journal protocol remain release gates.
+Exact protected startup rotation is implemented with the bounded active-envelope
+E2E evidence scoped above. Encrypted legacy migration, cold seed, lost-state
+replacement,
+guarded membership and the complete snapshot/journal protocol remain release gates.
 Unsupported profiles or operations fail closed; this does not complete v5.
 The new composed source still requires its own latest-push review and CI.
 

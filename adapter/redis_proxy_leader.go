@@ -7,7 +7,9 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"strings"
 
+	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
@@ -19,6 +21,7 @@ const (
 	defaultRedisLeaderClientPoolSize         = 4
 	defaultRedisBlockingLeaderClientPoolSize = 4
 	redisLeaderProxyPoolSplitDivisor         = 2
+	redisSetMinArgs                          = 3
 )
 
 func (r *RedisServer) proxyKeys(pattern []byte, requestContexts ...context.Context) ([]string, error) {
@@ -70,13 +73,97 @@ func (r *RedisServer) proxyTransactionToLeaderAddr(conn redcon.Conn, queue []red
 	defer cancel()
 
 	cmds, err := r.execTxPipeline(ctx, cli, queue)
+	if r.requestAdmission != nil {
+		if terminal := ownedProxyTransactionError(err, cmds); terminal != nil {
+			writeRedisError(conn, terminal)
+			return
+		}
+	}
 	if handleProxyTxnError(conn, err) {
 		return
 	}
 	if handleProxyTxnCommandError(conn, cmds) {
 		return
 	}
+	if r.requestAdmission != nil {
+		writeOwnedProxyTxnResults(conn, queue, cmds)
+		return
+	}
 	writeProxyCmdsResult(conn, cmds)
+}
+
+// go-redis decodes both simple and bulk strings as string. Recover only the
+// status replies defined by the local transaction handlers; GET/SET GET values
+// (even the literal "OK") must remain bulk strings. Legacy proxy is unchanged.
+func writeOwnedProxyTxnResults(conn redcon.Conn, queue []redcon.Command, cmds []*redis.Cmd) {
+	conn.WriteArray(len(cmds))
+	for i, cmd := range cmds {
+		if i < len(queue) && cmd.Err() == nil && redisTxnReturnsStatus(queue[i]) {
+			if value, ok := cmd.Val().(string); ok {
+				conn.WriteString(value)
+				continue
+			}
+		}
+		writeGoRedisResult(conn, cmd)
+	}
+}
+
+func redisTxnReturnsStatus(cmd redcon.Command) bool {
+	if len(cmd.Args) == 0 {
+		return false
+	}
+	switch strings.ToUpper(string(cmd.Args[0])) {
+	case cmdHMSet:
+		return true
+	case cmdSet:
+		if len(cmd.Args) < redisSetMinArgs {
+			return false
+		}
+		for _, arg := range cmd.Args[redisSetMinArgs:] {
+			if bytes.EqualFold(arg, []byte("GET")) {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+func ambiguousProxyTransactionError(err error) bool {
+	var netErr net.Error
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) ||
+		errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.As(err, &netErr)
+}
+
+func ownedProxyTransactionError(err error, cmds []*redis.Cmd) error {
+	if ambiguousProxyTransactionError(err) || isProxyTransactionOutcomeUnknown(err) {
+		return errors.Join(kv.ErrTransactionOutcomeUnknown, err)
+	}
+	// go-redis may copy an EXEC-level error onto every command handle. An
+	// unknown transaction outcome is terminal, never a successful array of
+	// per-element errors, even though RESP no longer carries the Go error type.
+	for _, cmd := range cmds {
+		if isProxyTransactionOutcomeUnknown(cmd.Err()) {
+			return errors.Join(kv.ErrTransactionOutcomeUnknown, cmd.Err())
+		}
+	}
+	return nil
+}
+
+func isProxyTransactionOutcomeUnknown(err error) bool {
+	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+		return true
+	}
+	if err == nil {
+		return false
+	}
+	message := strings.TrimPrefix(err.Error(), "ERR ")
+	unknown := kv.ErrTransactionOutcomeUnknown.Error()
+	// Match the exact terminal overflow spelling emitted by writeTerminalFailure,
+	// not arbitrary semicolon-bearing command errors from a peer.
+	overflow := unknown + "; " + errRedisReplyTooLarge.Error()
+	return message == unknown || message == overflow || strings.HasPrefix(message, unknown+" ") || strings.HasPrefix(message, unknown+"\n")
 }
 
 // resolveLeaderRedisAddr looks up the Redis address of the current Raft leader,
@@ -112,6 +199,26 @@ func (r *RedisServer) resolveLeaderRedisAddrForKey(conn redcon.Conn, key []byte)
 // execTxPipeline sends queue as a single TxPipelined batch and returns the
 // per-command result handles together with any pipeline-level error.
 func (r *RedisServer) execTxPipeline(ctx context.Context, cli *redis.Client, queue []redcon.Command) ([]*redis.Cmd, error) {
+	if r.requestAdmission != nil {
+		// An owned EXEC cannot retry a lost reply under a new target-side MULTI
+		// owner. A dedicated client also lets revocation interrupt socket reads
+		// without closing a pooled connection belonging to another request.
+		owned := redis.NewClient(&redis.Options{Addr: cli.Options().Addr, PoolSize: 1,
+			MaxRetries: -1, ContextTimeoutEnabled: true})
+		cancelDone := make(chan struct{})
+		stop := context.AfterFunc(ctx, func() { _ = owned.Close(); close(cancelDone) })
+		defer func() {
+			if !stop() {
+				<-cancelDone
+			}
+			_ = owned.Close()
+		}()
+		return execRedisTxPipeline(ctx, owned, queue)
+	}
+	return execRedisTxPipeline(ctx, cli, queue)
+}
+
+func execRedisTxPipeline(ctx context.Context, cli *redis.Client, queue []redcon.Command) ([]*redis.Cmd, error) {
 	cmds := make([]*redis.Cmd, 0, len(queue))
 	_, err := cli.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
 		for _, cmd := range queue {

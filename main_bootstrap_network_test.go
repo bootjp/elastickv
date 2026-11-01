@@ -108,11 +108,12 @@ func newBootstrapNetworkFixture(t *testing.T, wrongSPKI bool) *bootstrapNetworkF
 	require.NoError(t, err)
 	gate := &startupPublicKVGate{domain: receiver}
 	gate.markReady()
-	serverGRPC := grpc.NewServer(append(options, grpc.ChainUnaryInterceptor(gate.unaryInterceptor), grpc.ChainStreamInterceptor(gate.streamInterceptor))...)
+	serverGRPC := grpc.NewServer(append(options, grpc.ChainUnaryInterceptor(bootstrapRegistrationReceiverInterceptor(bootstrapNetworkTestGroup), gate.unaryInterceptor), grpc.ChainStreamInterceptor(gate.streamInterceptor))...)
 	receiver.owners[bootstrapNetworkTestGroup].Register(serverGRPC)
 	pb.RegisterRawKVServer(serverGRPC, f.service)
 	pb.RegisterDistributionServer(serverGRPC, f.service)
 	pb.RegisterInternalServer(serverGRPC, f.service)
+	pb.RegisterEncryptionAdminServer(serverGRPC, f.service)
 	done := make(chan struct{})
 	go func() { defer close(done); _ = serverGRPC.Serve(listener) }()
 	t.Cleanup(func() { serverGRPC.Stop(); _ = listener.Close(); <-done })

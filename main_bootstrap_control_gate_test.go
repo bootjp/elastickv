@@ -70,8 +70,16 @@ type bootstrapGateService struct {
 	pb.UnimplementedRawKVServer
 	pb.UnimplementedDistributionServer
 	pb.UnimplementedInternalServer
+	pb.UnimplementedEncryptionAdminServer
 	calls  atomic.Int64
 	action func(context.Context) error
+}
+
+func (s *bootstrapGateService) RegisterEncryptionWriter(ctx context.Context, _ *pb.RegisterEncryptionWriterRequest) (*pb.RegisterEncryptionWriterResponse, error) {
+	if err := s.run(ctx); err != nil {
+		return nil, err
+	}
+	return &pb.RegisterEncryptionWriterResponse{AppliedIndex: 1}, nil
 }
 
 func (s *bootstrapGateService) run(ctx context.Context) error {
@@ -172,7 +180,7 @@ func newBootstrapGateFixture(t *testing.T, group uint64, stages ...peersession.S
 	options, err := server.ServerOptions(&tls.Config{Certificates: []tls.Certificate{serverCert}, ClientCAs: pki.roots,
 		ClientAuth: tls.RequireAndVerifyClientCert, MinVersion: tls.VersionTLS13})
 	require.NoError(t, err)
-	options = append(options, grpc.ChainUnaryInterceptor(func(ctx context.Context, request any, info *grpc.UnaryServerInfo, next grpc.UnaryHandler) (any, error) {
+	options = append(options, grpc.ChainUnaryInterceptor(bootstrapRegistrationReceiverInterceptor(group), func(ctx context.Context, request any, info *grpc.UnaryServerInfo, next grpc.UnaryHandler) (any, error) {
 		reply, handled, err := handleBootstrapStartupControl(ctx, bootstrapGateTestToken, a, info.FullMethod, request, next)
 		f.handled.Store(handled)
 		if handled {
@@ -189,6 +197,7 @@ func newBootstrapGateFixture(t *testing.T, group uint64, stages ...peersession.S
 	pb.RegisterRawKVServer(gs, f.service)
 	pb.RegisterDistributionServer(gs, f.service)
 	pb.RegisterInternalServer(gs, f.service)
+	pb.RegisterEncryptionAdminServer(gs, f.service)
 	done := make(chan struct{})
 	go func() { defer close(done); _ = gs.Serve(lis) }()
 	t.Cleanup(func() {
@@ -311,7 +320,7 @@ func TestBootstrapControlGateTLSRevocationDiscardsSuccess(t *testing.T) {
 
 func TestBootstrapControlGateDescriptorDoesNotExpandAuthority(t *testing.T) {
 	for _, method := range []string{pb.RawKV_RawGet_FullMethodName, pb.Internal_Forward_FullMethodName,
-		pb.EncryptionAdmin_RegisterEncryptionWriter_FullMethodName, pb.Admin_BeginBackup_FullMethodName, "/unknown/Control"} {
+		pb.EncryptionAdmin_RotateDEK_FullMethodName, pb.Admin_BeginBackup_FullMethodName, "/unknown/Control"} {
 		_, _, ok := bootstrapStartupControlDescriptor(17, method)
 		require.False(t, ok)
 	}

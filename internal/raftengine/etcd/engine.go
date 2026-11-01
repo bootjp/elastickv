@@ -268,14 +268,18 @@ type OpenConfig struct {
 	// AdmissionChanged synchronously revokes admission before native authority
 	// changes are published. It must not reopen admission or reenter the loop.
 	AdmissionChanged func()
-	NativeIdentity   *WALIdentity
-	NodeID           uint64
-	LocalID          string
-	LocalAddress     string
-	DataDir          string
-	Peers            []Peer
-	BootstrapSeed    []Peer
-	Bootstrap        bool
+	// BeforeAdmissionChange runs outside A after revocation and before any FSM
+	// effects. Payload is decoded plaintext, borrowed read-only. Errors halt
+	// apply. Reopening requires independently verified RecoveredAdmission.
+	BeforeAdmissionChange func(raftengine.AppliedEntryIdentity, []byte) error
+	NativeIdentity        *WALIdentity
+	NodeID                uint64
+	LocalID               string
+	LocalAddress          string
+	DataDir               string
+	Peers                 []Peer
+	BootstrapSeed         []Peer
+	Bootstrap             bool
 	// JoinAsLearner mirrors raftengine.FactoryConfig.JoinAsLearner. The
 	// engine watches every post-apply ConfState and emits an
 	// ERROR-level alarm whenever the local node is in Voters while
@@ -318,6 +322,7 @@ type Engine struct {
 	baselineStartupGuard     io.Closer
 	recoveredAdmission       func(RecoveredState) error
 	admissionChanged         func()
+	beforeAdmissionChange    func(raftengine.AppliedEntryIdentity, []byte) error
 	nativeAdmission          raftengine.NativeAdmission
 	groupID                  uint64
 	nativeConfigurationIndex uint64 // actual native configuration, owned by the loop
@@ -587,6 +592,7 @@ type proposalResult struct {
 }
 
 type readRequest struct {
+	recovery    bool
 	ctx         context.Context
 	id          uint64
 	done        chan readResult
@@ -682,6 +688,7 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		baselineStartupGuard:    guard,
 		recoveredAdmission:      prepared.cfg.RecoveredAdmission,
 		admissionChanged:        prepared.cfg.AdmissionChanged,
+		beforeAdmissionChange:   prepared.cfg.BeforeAdmissionChange,
 		nativeAdmission:         prepared.cfg.NativeAdmission,
 		groupID:                 prepared.cfg.GroupID,
 		recoveredIdentity:       copyWALIdentity([]*WALIdentity{prepared.disk.VerifiedIdentity}),
@@ -1204,6 +1211,16 @@ func (e *Engine) LinearizableRead(ctx context.Context) (uint64, error) {
 	return e.submitRead(ctx, true)
 }
 
+// RecoveryLinearizableRead is an additive Recovery-only applied barrier. The
+// native guard must validate the caller's original private Recovery H, even
+// when the actual node is a follower. It never admits follower business reads.
+func (e *Engine) RecoveryLinearizableRead(ctx context.Context) (uint64, error) {
+	if e == nil || e.nativeAdmission == nil {
+		return 0, errors.WithStack(raftengine.ErrNativeAdmissionDenied)
+	}
+	return e.submitReadRequest(ctx, true, true)
+}
+
 // LeaseDuration returns the time during which a lease holder can serve
 // reads from local state without re-confirming leadership via ReadIndex.
 // It is bounded by electionTimeout - leaseSafetyMargin so that the lease
@@ -1608,6 +1625,10 @@ func (e *Engine) invokeLeaderLossCallback(fn func()) {
 }
 
 func (e *Engine) submitRead(ctx context.Context, waitApplied bool) (uint64, error) {
+	return e.submitReadRequest(ctx, waitApplied, false)
+}
+
+func (e *Engine) submitReadRequest(ctx context.Context, waitApplied, recovery bool) (uint64, error) {
 	if err := contextErr(ctx); err != nil {
 		return 0, err
 	}
@@ -1615,6 +1636,7 @@ func (e *Engine) submitRead(ctx context.Context, waitApplied bool) (uint64, erro
 		return 0, errors.WithStack(errNilEngine)
 	}
 	req := readRequest{
+		recovery:    recovery,
 		ctx:         ctx,
 		id:          e.nextID(),
 		done:        make(chan readResult, 1),
@@ -2127,7 +2149,7 @@ func (e *Engine) handleRead(req readRequest) {
 		req.done <- readResult{err: err}
 		return
 	}
-	if e.State() != raftengine.StateLeader {
+	if !e.readRoleAllowed(req.recovery) {
 		req.done <- readResult{err: errors.WithStack(errNotLeader)}
 		return
 	}
@@ -2143,6 +2165,9 @@ func (e *Engine) handleRead(req readRequest) {
 	}
 	e.storePendingRead(req)
 	request := &raftengine.NativeRequest{Operation: raftengine.NativeReadIndex}
+	if req.recovery {
+		request.Operation = raftengine.NativeRecoveryReadIndex
+	}
 	if err := e.withNative(req.ctx, request, func() error {
 		e.rawNode.ReadIndex(encodeReadContext(req.id))
 		return nil
@@ -3302,7 +3327,7 @@ func (e *Engine) applyNormalEntry(entry raftpb.Entry, dropIfNonVolatile bool) (a
 		clearIdentity := e.deliverApplyIdentity(entry, payload)
 		defer clearIdentity()
 	}
-	if err := e.invalidateBeforeBootstrapPolicy(payload); err != nil {
+	if err := e.invalidateBeforeBootstrapPolicy(entry, payload); err != nil {
 		return nil, err
 	}
 	return e.fsm.Apply(payload), nil

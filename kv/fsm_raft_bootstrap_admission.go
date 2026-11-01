@@ -12,10 +12,19 @@ func (f *kvFSM) ApplyChangesAdmission(payload []byte) (bool, error) {
 	return BootstrapApplyChangesAdmission(context.Background(), f.store, f.NativeGroupIdentity(), payload)
 }
 
-// BootstrapApplyChangesAdmission distinguishes a NEW activation from a
+// BootstrapApplyChangesAdmission revokes for fully decoded encryption mutations
+// before sidecar, registry or installed-wrapper effects. It distinguishes a NEW
+// activation from a
 // deterministic already-active rejection. Repeated activation must not revoke
 // healthy sessions when it cannot change P. Call only on the serial apply loop.
 func BootstrapApplyChangesAdmission(ctx context.Context, st store.MVCCStore, identity raftbootstrap.Identity, payload []byte) (bool, error) {
+	if changed, err := EncryptionApplyChangesAdmission(payload); changed || err != nil {
+		return changed, err
+	}
+	return bootstrapActivationChangesAdmission(ctx, st, identity, payload)
+}
+
+func bootstrapActivationChangesAdmission(ctx context.Context, st store.MVCCStore, identity raftbootstrap.Identity, payload []byte) (bool, error) {
 	_, matched, err := raftbootstrap.ParseActivationCommand(payload)
 	if err != nil || !matched {
 		return false, errors.WithStack(err)

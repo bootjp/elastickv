@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/internal/peersession"
+	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/cockroachdb/errors"
 )
 
@@ -32,6 +33,7 @@ type Operation struct {
 	doneOnce           sync.Once
 	cancel             context.CancelFunc
 	permission         uint64
+	rotationRecipe     raftbootstrap.Digest
 	snapshot           map[uint64]uint64
 	used               map[uint64]bool
 	peer               *peersession.Receipt
@@ -60,7 +62,7 @@ func operationFrom(ctx context.Context) *Operation {
 // Begin captures the local generations before work starts, not when a delayed
 // child finally reaches a proposal queue. Native checks never renew this image.
 func (a *Arbiter) Begin(ctx context.Context, kind Kind) (context.Context, *Operation, error) {
-	if ctx == nil || ctx.Err() != nil || !validKind(kind) {
+	if !validBegin(ctx, kind) {
 		return nil, nil, errors.WithStack(ErrClosed)
 	}
 	var id [16]byte
@@ -81,6 +83,10 @@ func (a *Arbiter) Begin(ctx context.Context, kind Kind) (context.Context, *Opera
 		return nil, nil, err
 	}
 	return a.newOperationLocked(ctx, kind, id, ancestor, peer)
+}
+
+func validBegin(ctx context.Context, kind Kind) bool {
+	return ctx != nil && ctx.Err() == nil && validKind(kind) && kind != Rotation
 }
 
 func validKind(kind Kind) bool { return kind >= Data && kind <= Maintenance }
@@ -176,7 +182,7 @@ func (a *Arbiter) kindReadyLocked(kind Kind, id uint64) bool {
 	case Registration, Recovery:
 		return stage >= peersession.IdentityReady
 	case Rotation:
-		return false
+		return a.rotationReadyLocked() && a.rotationTargetReadyLocked(id)
 	default:
 		return false
 	}
@@ -286,7 +292,8 @@ func (a *Arbiter) BindProposal(ctx context.Context, id uint64, payload []byte) (
 	if err != nil {
 		return nil, err
 	}
-	if err := a.config.ValidatePayload(op.kind, id, payload); err != nil {
+	inspection, err := a.inspectProposal(op, id, payload)
+	if err != nil {
 		return nil, errors.WithStack(err)
 	}
 	digest := sha256.Sum256(payload)
@@ -295,8 +302,39 @@ func (a *Arbiter) BindProposal(ctx context.Context, id uint64, payload []byte) (
 	if err := a.validateLocked(op, id); err != nil {
 		return nil, err
 	}
+	if inspection.ProjectionGeneration != 0 && inspection.ProjectionGeneration != op.permission {
+		return nil, errors.WithStack(ErrStale)
+	}
+	if err := registrationDeclarationMatches(op, inspection.PlaintextDigest); err != nil {
+		return nil, err
+	}
 	a.markUsedLocked(op, id)
 	return context.WithValue(ctx, payloadKey{}, boundPayload{operation: op, group: id, digest: digest}), nil
+}
+
+func (a *Arbiter) inspectProposal(op *Operation, id uint64, payload []byte) (PayloadInspection, error) {
+	if a.config.InspectPayload != nil {
+		return a.config.InspectPayload(op.kind, id, payload, op.rotationRecipe)
+	}
+	if err := a.config.ValidatePayload(op.kind, id, payload); err != nil {
+		return PayloadInspection{}, errors.WithStack(err)
+	}
+	return PayloadInspection{PlaintextDigest: sha256.Sum256(payload)}, nil
+}
+
+func registrationDeclarationMatches(op *Operation, plain raftbootstrap.Digest) error {
+	if op.peer == nil {
+		return nil
+	}
+	message := op.peer.Message()
+	if op.kind == Registration {
+		if message.Traffic != peersession.Registration || message.Declaration == (raftbootstrap.Digest{}) || message.Declaration != plain {
+			return errors.WithStack(ErrClosed)
+		}
+	} else if message.Traffic == peersession.Registration {
+		return errors.WithStack(ErrClosed)
+	}
+	return nil
 }
 
 func (a *Arbiter) ValidateResult(ctx context.Context) error {

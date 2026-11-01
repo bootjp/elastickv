@@ -43,7 +43,7 @@ func validateProtectedBootstrapDomain(raftID, baseDir string, groups []groupSpec
 	return nil
 }
 
-func loadProtectedBootstrapDomain(raftID, baseDir string, groups []groupSpec, multi bool) (map[uint64]*groupBootstrapSpec, *bootstrapDomain, error) {
+func loadProtectedBootstrapDomain(raftID, baseDir string, groups []groupSpec, multi bool, encWiring ...encryptionWriteWiring) (map[uint64]*groupBootstrapSpec, *bootstrapDomain, error) {
 	if *raftBootstrapPeerConfigDir == "" {
 		return nil, nil, nil
 	}
@@ -59,7 +59,7 @@ func loadProtectedBootstrapDomain(raftID, baseDir string, groups []groupSpec, mu
 		}
 		specs[group.id], cluster = spec, spec.intent.Identity.Cluster
 	}
-	domain, err := newBootstrapDomain(cluster, groups)
+	domain, err := newBootstrapDomain(cluster, groups, encWiring...)
 	if err != nil {
 		return nil, nil, err
 	}

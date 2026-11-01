@@ -562,9 +562,6 @@ func (r *RedisServer) multi(conn redcon.Conn, _ redcon.Command) {
 	if !r.requireRequestContext(conn) {
 		return
 	}
-	if r.refuseProtectedTransaction(conn, cmdMulti) {
-		return
-	}
 
 	state := getConnState(conn)
 	if state.inTxn {
@@ -580,9 +577,6 @@ func (r *RedisServer) discard(conn redcon.Conn, _ redcon.Command) {
 	if !r.requireRequestContext(conn) {
 		return
 	}
-	if r.refuseProtectedTransaction(conn, cmdDiscard) {
-		return
-	}
 
 	state := getConnState(conn)
 	if !state.inTxn {
@@ -596,9 +590,6 @@ func (r *RedisServer) discard(conn redcon.Conn, _ redcon.Command) {
 
 func (r *RedisServer) exec(conn redcon.Conn, _ redcon.Command) {
 	if !r.requireRequestContext(conn) {
-		return
-	}
-	if r.refuseProtectedTransaction(conn, cmdExec) {
 		return
 	}
 

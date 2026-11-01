@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"strconv"
 
 	"github.com/bootjp/elastickv/internal/encryption"
@@ -9,6 +11,10 @@ import (
 )
 
 var errBootstrapEncryptionUnsupported = errors.New("bootstrap encryption projection: unsupported configuration")
+
+// Pending means retry with authority closed. All other errors require the
+// supervisor to fail closed rather than infer completion or parse error text.
+var errBootstrapEncryptionProjectionPending = errors.New("bootstrap encryption projection: pending reconciliation")
 
 type bootstrapEncryptionObservationKind uint8
 
@@ -23,6 +29,7 @@ type bootstrapRotationObservationKind uint8
 const (
 	bootstrapRotationUnobserved bootstrapRotationObservationKind = iota
 	bootstrapRotationNotRequested
+	bootstrapRotationRequestedUnproven
 )
 
 type bootstrapEncryptionProjectionInput struct {
@@ -37,6 +44,9 @@ type bootstrapEncryptionProjectionInput struct {
 	// including its nonce epoch, not merely sidecar/cache intent.
 	storageWrapperInstalled func(dekID uint32, epoch uint16) bool
 	raftWrapperInstalled    func(dekID uint32, epoch uint16) bool
+	// runtimeFence includes fatal/retired evidence; see bindInstalledObservation.
+	runtimeFence func() (uint64, error)
+	installed    func(raftKeyID uint32) (bootstrapEncryptionInstalledProjection, error)
 }
 
 type bootstrapEncryptionPurposeProjection struct {
@@ -46,18 +56,23 @@ type bootstrapEncryptionPurposeProjection struct {
 	envelopeActive   bool
 	cutoverIndex     uint64
 	wrapperInstalled bool
+	keyDigest        [32]byte
+	registry         encryption.RegistryValue
+	wrapperIdentity  uint64
 }
 
 // This is a local observation, NOT an admission handle, rotation receipt or F.
 // No peer TLS, policy, leadership, recipe or responsibility proof is supplied.
 type bootstrapEncryptionProjection struct {
-	kind         bootstrapEncryptionObservationKind
-	rotation     bootstrapRotationObservationKind
-	fullNodeID   uint64
-	appliedIndex uint64
-	checkpoint   encryption.SnapshotCheckpoint
-	storage      bootstrapEncryptionPurposeProjection
-	raft         bootstrapEncryptionPurposeProjection
+	kind              bootstrapEncryptionObservationKind
+	rotation          bootstrapRotationObservationKind
+	fullNodeID        uint64
+	appliedIndex      uint64
+	checkpoint        encryption.SnapshotCheckpoint
+	storage           bootstrapEncryptionPurposeProjection
+	raft              bootstrapEncryptionPurposeProjection
+	generation        uint64
+	installedEvidence bool
 }
 
 type bootstrapEncryptionProjectionStore interface {
@@ -70,15 +85,23 @@ type bootstrapEncryptionProjectionStore interface {
 // atomic snapshot: the caller must fence restore/apply and validate dependency
 // generations before using observations. Success never enables the CLI profile.
 func readBootstrapEncryptionProjection(in bootstrapEncryptionProjectionInput) (bootstrapEncryptionProjection, error) {
-	if in.rotationRequested {
-		return bootstrapEncryptionProjection{}, errors.Wrap(errBootstrapEncryptionUnsupported, "requested rotation requires receiver-owned reconciliation")
-	}
 	if !in.configured {
+		if in.rotationRequested {
+			return bootstrapEncryptionProjection{}, errors.Wrap(errBootstrapEncryptionUnsupported, "rotation without encryption")
+		}
 		return bootstrapEncryptionProjection{
 			kind: bootstrapEncryptionNotRequested, rotation: bootstrapRotationNotRequested,
 		}, nil
 	}
 	if err := in.validate(); err != nil {
+		return bootstrapEncryptionProjection{}, err
+	}
+	return readFencedBootstrapEncryptionProjection(in)
+}
+
+func readFencedBootstrapEncryptionProjection(in bootstrapEncryptionProjectionInput) (bootstrapEncryptionProjection, error) {
+	generation, err := in.observeFence()
+	if err != nil {
 		return bootstrapEncryptionProjection{}, err
 	}
 	source, ok := in.localStore.(bootstrapEncryptionProjectionStore)
@@ -98,14 +121,39 @@ func readBootstrapEncryptionProjection(in bootstrapEncryptionProjectionInput) (b
 		return bootstrapEncryptionProjection{}, err
 	}
 	if first != second {
-		return bootstrapEncryptionProjection{}, errors.New("bootstrap encryption projection: local state changed during observation")
+		return bootstrapEncryptionProjection{}, errors.Wrap(errBootstrapEncryptionProjectionPending, "local state changed during observation")
 	}
+	current, err := in.observeFence()
+	if err != nil {
+		return bootstrapEncryptionProjection{}, err
+	}
+	if current != generation {
+		return bootstrapEncryptionProjection{}, errors.Wrap(errBootstrapEncryptionProjectionPending, "dependency generation changed")
+	}
+	second.generation = generation
 	return second, nil
+}
+
+func (in bootstrapEncryptionProjectionInput) observeFence() (uint64, error) {
+	generation, err := in.runtimeFence()
+	if err != nil {
+		return 0, errors.Wrap(err, "bootstrap encryption projection: fatal/retired runtime fence")
+	}
+	if generation == 0 {
+		return 0, errors.Wrap(errBootstrapEncryptionUnsupported, "zero runtime generation")
+	}
+	return generation, nil
 }
 
 func (in bootstrapEncryptionProjectionInput) validate() error {
 	if in.sidecarPath == "" || in.localStore == nil || in.fullNodeID == 0 {
 		return errors.Wrap(errBootstrapEncryptionUnsupported, "sidecar, local store and full node ID are required")
+	}
+	if in.runtimeFence == nil {
+		return errors.Wrap(errBootstrapEncryptionUnsupported, "missing runtime generation/fatal fence")
+	}
+	if in.rotationRequested && in.installed == nil {
+		return errors.Wrap(errBootstrapEncryptionUnsupported, "requested rotation requires bound installed observations")
 	}
 	return nil
 }
@@ -117,14 +165,14 @@ func readBootstrapEncryptionCheckpoint(source bootstrapEncryptionProjectionStore
 		return 0, empty, errors.Wrap(err, "bootstrap encryption projection: durable applied index")
 	}
 	if !present || applied == 0 {
-		return 0, empty, errors.Wrap(errBootstrapEncryptionUnsupported, "missing durable applied index")
+		return 0, empty, errors.Wrap(errBootstrapEncryptionProjectionPending, "missing durable applied index")
 	}
 	cp, present, err := source.LoadEncryptionSnapshotCheckpoint()
 	if err != nil {
 		return 0, empty, errors.Wrap(err, "bootstrap encryption projection: applied checkpoint")
 	}
 	if !present || cp.Index == 0 || cp.Index > applied {
-		return 0, empty, errors.New("bootstrap encryption projection: checkpoint missing or beyond durable apply")
+		return 0, empty, errors.Wrap(errBootstrapEncryptionProjectionPending, "checkpoint missing or beyond durable apply")
 	}
 	return applied, cp, nil
 }
@@ -135,23 +183,9 @@ func sampleBootstrapEncryptionProjection(
 	registry encryption.WriterRegistryStore,
 ) (bootstrapEncryptionProjection, error) {
 	var result bootstrapEncryptionProjection
-	applied, cp, err := readBootstrapEncryptionCheckpoint(source)
+	applied, cp, sc, err := readBootstrapAppliedSidecar(in.sidecarPath, source)
 	if err != nil {
 		return result, err
-	}
-	sc, err := encryption.ReadSidecar(in.sidecarPath)
-	if err != nil {
-		return result, errors.Wrap(err, "bootstrap encryption projection: sidecar")
-	}
-	want, err := encryption.SidecarCheckpoint(sc)
-	if err != nil {
-		return result, errors.Wrap(err, "bootstrap encryption projection: sidecar checkpoint")
-	}
-	if cp != want {
-		return result, errors.New("bootstrap encryption projection: applied checkpoint disagrees with sidecar")
-	}
-	if sc.Active.Storage == 0 && sc.Active.Raft == 0 {
-		return result, errors.Wrap(errBootstrapEncryptionUnsupported, "configured encryption has no active DEK")
 	}
 	storagePurpose := bootstrapEncryptionPurposeProjection{
 		dekID: sc.Active.Storage, epoch: in.storageEpoch,
@@ -169,11 +203,96 @@ func sampleBootstrapEncryptionProjection(
 	if err != nil {
 		return result, errors.Wrap(err, "bootstrap encryption projection: raft")
 	}
-	return bootstrapEncryptionProjection{
+	result = bootstrapEncryptionProjection{
 		kind: bootstrapEncryptionObserved, rotation: bootstrapRotationNotRequested,
 		fullNodeID: in.fullNodeID, appliedIndex: applied, checkpoint: cp,
 		storage: storagePurpose, raft: raftPurpose,
-	}, nil
+	}
+	if err := result.observeInstalled(in); err != nil {
+		return bootstrapEncryptionProjection{}, err
+	}
+	return result, nil
+}
+
+func (result *bootstrapEncryptionProjection) observeInstalled(in bootstrapEncryptionProjectionInput) error {
+	if in.rotationRequested {
+		result.rotation = bootstrapRotationRequestedUnproven
+	}
+	if in.installed != nil {
+		if err := result.validateInstalled(in); err != nil {
+			return err
+		}
+		result.installedEvidence = true
+	} else if (result.storage.envelopeActive && !result.storage.wrapperInstalled) || (result.raft.envelopeActive && !result.raft.wrapperInstalled) {
+		return errors.Wrap(errBootstrapEncryptionUnsupported, "missing installed-wrapper probe")
+	}
+	return nil
+}
+
+func readBootstrapAppliedSidecar(path string, source bootstrapEncryptionProjectionStore) (uint64, encryption.SnapshotCheckpoint, *encryption.Sidecar, error) {
+	applied, cp, err := readBootstrapEncryptionCheckpoint(source)
+	if err != nil {
+		return 0, cp, nil, err
+	}
+	sc, err := encryption.ReadSidecar(path)
+	if err != nil {
+		return 0, cp, nil, errors.Wrap(err, "bootstrap encryption projection: sidecar")
+	}
+	want, err := encryption.SidecarCheckpoint(sc)
+	if err != nil {
+		return 0, cp, nil, errors.Wrap(err, "bootstrap encryption projection: sidecar checkpoint")
+	}
+	if cp != want {
+		return 0, cp, nil, errors.Wrap(errBootstrapEncryptionProjectionPending, "applied checkpoint disagrees with sidecar")
+	}
+	if sc.Active.Storage == 0 && sc.Active.Raft == 0 {
+		return 0, cp, nil, errors.Wrap(errBootstrapEncryptionUnsupported, "configured encryption has no active DEK")
+	}
+	if err := validateBootstrapEncryptionKeyPurposes(sc); err != nil {
+		return 0, cp, nil, err
+	}
+	return applied, cp, sc, nil
+}
+
+func validateBootstrapEncryptionKeyPurposes(sc *encryption.Sidecar) error {
+	for _, purpose := range []struct {
+		id   uint32
+		name string
+	}{
+		{sc.Active.Storage, encryption.SidecarPurposeStorage}, {sc.Active.Raft, encryption.SidecarPurposeRaft},
+	} {
+		if purpose.id != 0 && sc.Keys[strconv.FormatUint(uint64(purpose.id), 10)].Purpose != purpose.name {
+			return errors.New("bootstrap encryption projection: active key purpose mismatch")
+		}
+	}
+	return nil
+}
+
+// digest is domain-separated and contains only immutable values, never local
+// function pointers or key plaintext. Applied/checkpoint indices and observation
+// generations fence sampling, NOT authority: ordinary data apply must not revoke
+// a valid permission. It is NOT a rotation completion receipt.
+func (p bootstrapEncryptionProjection) digest() [32]byte {
+	b := []byte("elastickv/bootstrap-encryption-observation/v1\x00")
+	for _, v := range []uint64{uint64(p.kind), uint64(p.rotation), p.fullNodeID} {
+		b = binary.BigEndian.AppendUint64(b, v)
+	}
+	b = append(b, bootstrapEncryptionBool(p.installedEvidence))
+	for _, purpose := range []bootstrapEncryptionPurposeProjection{p.storage, p.raft} {
+		for _, v := range []uint64{uint64(purpose.dekID), uint64(purpose.epoch), purpose.cutoverIndex, purpose.registry.FullNodeID, uint64(purpose.registry.FirstSeenLocalEpoch), uint64(purpose.registry.LastSeenLocalEpoch), purpose.wrapperIdentity} {
+			b = binary.BigEndian.AppendUint64(b, v)
+		}
+		b = append(b, purpose.keyDigest[:]...)
+		b = append(b, bootstrapEncryptionBool(purpose.registered), bootstrapEncryptionBool(purpose.envelopeActive), bootstrapEncryptionBool(purpose.wrapperInstalled))
+	}
+	return sha256.Sum256(b)
+}
+
+func bootstrapEncryptionBool(v bool) byte {
+	if v {
+		return 1
+	}
+	return 0
 }
 
 func observeBootstrapEncryptionPurpose(
@@ -189,24 +308,48 @@ func observeBootstrapEncryptionPurpose(
 	if p.dekID == 0 {
 		return p, nil
 	}
-	registered, err := registrationCommittedAtEpoch(registry, p.dekID, fullNodeID, p.epoch)
+	registration, err := readBootstrapWriterRegistration(registry, p.dekID, fullNodeID, p.epoch)
 	if err != nil {
-		return bootstrapEncryptionPurposeProjection{}, errors.Wrap(err, "read local writer registration")
-	}
-	if !registered {
-		return bootstrapEncryptionPurposeProjection{}, errors.New("local writer registration missing or epoch/identity mismatch")
+		return bootstrapEncryptionPurposeProjection{}, err
 	}
 	p.registered = true
+	p.registry = registration
+	p.keyDigest = sha256.Sum256(sc.Keys[strconv.FormatUint(uint64(p.dekID), 10)].Wrapped)
 	if p.envelopeActive {
 		if installed == nil {
-			return bootstrapEncryptionPurposeProjection{}, errors.Wrap(errBootstrapEncryptionUnsupported, "missing installed-wrapper probe")
+			return p, nil
 		}
 		if !installed(p.dekID, p.epoch) {
-			return bootstrapEncryptionPurposeProjection{}, errors.New("matching local wrapper is not installed")
+			return bootstrapEncryptionPurposeProjection{}, errors.Wrap(errBootstrapEncryptionProjectionPending, "matching local wrapper is not installed")
 		}
 		p.wrapperInstalled = true
 	}
 	return p, nil
+}
+
+func readBootstrapWriterRegistration(registry encryption.WriterRegistryStore, id uint32, fullNodeID uint64, epoch uint16) (encryption.RegistryValue, error) {
+	var empty encryption.RegistryValue
+	raw, present, err := registry.GetRegistryRow(encryption.RegistryKey(id, encryption.NodeID16(fullNodeID)))
+	if err != nil {
+		return empty, errors.Wrap(err, "read registry evidence")
+	}
+	if !present {
+		return empty, errors.Wrap(errBootstrapEncryptionProjectionPending, "writer registry evidence missing")
+	}
+	registration, err := encryption.DecodeRegistryValue(raw)
+	if err != nil {
+		return empty, errors.Wrap(err, "decode writer registry evidence")
+	}
+	if registration.FullNodeID != fullNodeID || registration.FirstSeenLocalEpoch > registration.LastSeenLocalEpoch {
+		return empty, errors.New("invalid writer registry evidence")
+	}
+	if registration.LastSeenLocalEpoch > epoch {
+		return empty, errors.Wrap(encryption.ErrLocalEpochRollback, "writer registry exceeds installed local epoch")
+	}
+	if registration.LastSeenLocalEpoch < epoch {
+		return empty, errors.Wrap(errBootstrapEncryptionProjectionPending, "local writer epoch not yet registered")
+	}
+	return registration, nil
 }
 
 func validateBootstrapEncryptionPurpose(sc *encryption.Sidecar, p bootstrapEncryptionPurposeProjection) error {

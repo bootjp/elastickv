@@ -81,8 +81,11 @@ func bootstrapStartupControlDescriptor(group uint64, method string) (peersession
 			continue
 		}
 		kind := raftadmission.Control
-		if method == pb.Distribution_GetTimestamp_FullMethodName {
+		switch method {
+		case pb.Distribution_GetTimestamp_FullMethodName:
 			kind = raftadmission.Allocator
+		case pb.EncryptionAdmin_RegisterEncryptionWriter_FullMethodName:
+			kind = raftadmission.Registration
 		}
 		return descriptor, kind, true
 	}
@@ -97,6 +100,9 @@ func validateBootstrapStartupControl(ctx context.Context, token, method string, 
 	}
 	if err := receipt.Check(ctx); err != nil {
 		return errors.WithStack(err)
+	}
+	if message.Traffic == peersession.Registration && !bootstrapRegistrationReceiverMatches(ctx, message.Group) {
+		return errors.WithStack(status.Error(codes.PermissionDenied, "registration requires the configured default-group session"))
 	}
 	binding := peersession.RequestBinding{Group: message.Group,
 		From: peersession.Node{Member: message.From}, To: peersession.Node{Member: message.To}}

@@ -15,35 +15,13 @@ import (
 // receiver-local owner through work, child joins and terminal validation.
 // Detached subscriptions retain the original owner until cleanup. A nil hook
 // preserves legacy behavior.
-// Wire MULTI/EXEC is explicitly refused: argv-only queuing cannot preserve H.
+// Wire transactions retain the MULTI owner through EXEC or DISCARD.
 func WithRedisRequestAdmission(hook RequestAdmission) RedisServerOption {
 	return func(r *RedisServer) { r.requestAdmission = hook }
 }
 
 var errRedisAdmission = errors.New("ERR request admission unavailable or expired")
 var errRedisOwnershipUnsupported = errors.New("ERR command request ownership is not implemented")
-var errRedisTransactionOwnership = errors.New("ERR protected MULTI/EXEC requires retained transaction ownership; transaction refused")
-
-func redisWireTransaction(name string) bool {
-	return name == cmdMulti || name == cmdExec || name == cmdDiscard
-}
-
-func (r *RedisServer) refuseProtectedTransaction(conn redcon.Conn, name string) bool {
-	if r.requestAdmission == nil {
-		return false
-	}
-	state := getConnState(conn)
-	if !redisWireTransaction(name) && !state.inTxn && !state.transactionRefused {
-		return false
-	}
-	state.inTxn = false
-	state.queue = nil
-	// Quarantine a rejected pipelined transaction through EXEC/DISCARD, so
-	// its following SET/etc. cannot accidentally execute as standalone work.
-	state.transactionRefused = name != cmdExec && name != cmdDiscard
-	conn.WriteError(errRedisTransactionOwnership.Error())
-	return true
-}
 
 func redisOwnedCommandSupported(name string) bool {
 	switch name {
@@ -57,7 +35,7 @@ func redisOwnedCommandSupported(name string) bool {
 		cmdXAdd, cmdXTrim, cmdXLen, cmdXRange, cmdXRevRange, cmdXRead, cmdBZPopMin,
 		cmdEval, cmdEvalSHA, cmdSubscribe, cmdPublish, cmdPubSub,
 		cmdHello, cmdClient, cmdCommand, cmdInfo, cmdQuit, cmdSelect, cmdKeys, cmdScan, cmdDBSize,
-		cmdFlushDB, cmdFlushAll, cmdFlushLegacy:
+		cmdFlushDB, cmdFlushAll, cmdFlushLegacy, cmdMulti, cmdExec, cmdDiscard:
 		return true
 	default:
 		return false
@@ -256,20 +234,28 @@ func (c *redisOwnedConn) finishOnExit() {
 }
 
 func (c *redisOwnedConn) publish() {
+	c.publishResult(true)
+}
+
+func (c *redisOwnedConn) publishResult(terminal bool) bool {
 	validationErr := errors.Join(c.cancellationError(), c.owner.Validate())
 	c.prepareTerminalError(validationErr)
 	terminalErr := errors.Join(c.resultErr, validationErr)
-	c.finished = true
-	finishedErr := c.owner.Finish(terminalErr)
+	finishedErr := terminalErr
+	if terminal {
+		c.finished = true
+		finishedErr = c.owner.Finish(terminalErr)
+	}
 	if validationErr != nil || (finishedErr != nil && !errors.Is(finishedErr, c.resultErr)) {
 		c.writeTerminalFailure()
-		return
+		return false
 	}
 	if c.resultErr != nil {
 		c.writeTerminalFailure()
-		return
+		return true
 	}
 	c.Conn.WriteRaw(c.writer.Buffer())
+	return true
 }
 
 func (c *redisOwnedConn) prepareTerminalError(validationErr error) {

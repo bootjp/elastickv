@@ -54,7 +54,8 @@ type ShardGroup struct {
 	// 6E-2d) can activate the wrap the instant the cutover entry
 	// commits, without rebuilding the TransactionManager or
 	// stalling in-flight proposals.
-	raftPayloadWrap atomic.Pointer[RaftPayloadWrapper]
+	raftPayloadWrap            atomic.Pointer[RaftPayloadWrapper]
+	raftPayloadWrapInvalidator atomic.Pointer[func() func()]
 	// proposer is the wrap-aware proposer chain for this shard
 	// group. Set by NewLeaderProxyForShardGroup so direct shard
 	// proposals (HLC lease renewal — see RunHLCLeaseRenewal —
@@ -124,11 +125,7 @@ func (g *ShardGroup) Proposer() raftengine.Proposer {
 // EnableRaftEnvelope handler will call this on every leader when
 // the cutover entry commits.
 func (g *ShardGroup) SetRaftPayloadWrap(wrap RaftPayloadWrapper) {
-	if wrap == nil {
-		g.raftPayloadWrap.Store(nil)
-		return
-	}
-	g.raftPayloadWrap.Store(&wrap)
+	g.SetObservedRaftPayloadWrap(wrap)
 }
 
 // RaftPayloadWrap returns the currently-installed wrap closure, or

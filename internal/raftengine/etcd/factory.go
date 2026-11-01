@@ -36,14 +36,15 @@ type FactoryConfig struct {
 }
 
 type BootstrapStartup struct {
-	NativeAdmission    raftengine.NativeAdmission
-	NativeIdentity     *WALIdentity
-	RecoveredAdmission func(RecoveredState) error
-	AdmissionChanged   func()
-	PublicReady        func() bool
-	ServerOptions      []grpc.ServerOption
-	Register           func(grpc.ServiceRegistrar)
-	Close              func()
+	NativeAdmission       raftengine.NativeAdmission
+	NativeIdentity        *WALIdentity
+	RecoveredAdmission    func(RecoveredState) error
+	AdmissionChanged      func()
+	BeforeAdmissionChange func(raftengine.AppliedEntryIdentity, []byte) error
+	PublicReady           func() bool
+	ServerOptions         []grpc.ServerOption
+	Register              func(grpc.ServiceRegistrar)
+	Close                 func()
 }
 
 // Factory creates etcd raft engine instances.
@@ -92,30 +93,31 @@ func (f *Factory) Create(cfg raftengine.FactoryConfig) (*raftengine.FactoryResul
 	}
 
 	engine, err := Open(context.Background(), OpenConfig{
-		namespaceOwnership: f.cfg.namespaceOwnership,
-		namespaceRecovery:  f.cfg.namespaceRecovery,
-		NativeAdmission:    startup.NativeAdmission,
-		GroupID:            cfg.GroupID,
-		NativeIdentity:     startup.NativeIdentity,
-		RecoveredAdmission: startup.RecoveredAdmission,
-		AdmissionChanged:   startup.AdmissionChanged,
-		LocalID:            cfg.LocalID,
-		LocalAddress:       cfg.LocalAddress,
-		DataDir:            cfg.DataDir,
-		Peers:              peers,
-		BootstrapSeed:      peersFromServers(cfg.BootstrapSeed),
-		Bootstrap:          cfg.Bootstrap,
-		JoinAsLearner:      cfg.JoinAsLearner,
-		Transport:          transport,
-		StateMachine:       cfg.StateMachine,
-		TickInterval:       f.cfg.TickInterval,
-		HeartbeatTick:      f.cfg.HeartbeatTick,
-		ElectionTick:       f.cfg.ElectionTick,
-		MaxSizePerMsg:      f.cfg.MaxSizePerMsg,
-		MaxInflightMsg:     f.cfg.MaxInflightMsg,
-		RaftCipher:         f.cfg.RaftCipher,
-		RaftCutoverIndex:   f.cfg.RaftCutoverIndex,
-		ColdStartObserver:  f.cfg.ColdStartObserver,
+		namespaceOwnership:    f.cfg.namespaceOwnership,
+		namespaceRecovery:     f.cfg.namespaceRecovery,
+		NativeAdmission:       startup.NativeAdmission,
+		GroupID:               cfg.GroupID,
+		NativeIdentity:        startup.NativeIdentity,
+		RecoveredAdmission:    startup.RecoveredAdmission,
+		AdmissionChanged:      startup.AdmissionChanged,
+		BeforeAdmissionChange: startup.BeforeAdmissionChange,
+		LocalID:               cfg.LocalID,
+		LocalAddress:          cfg.LocalAddress,
+		DataDir:               cfg.DataDir,
+		Peers:                 peers,
+		BootstrapSeed:         peersFromServers(cfg.BootstrapSeed),
+		Bootstrap:             cfg.Bootstrap,
+		JoinAsLearner:         cfg.JoinAsLearner,
+		Transport:             transport,
+		StateMachine:          cfg.StateMachine,
+		TickInterval:          f.cfg.TickInterval,
+		HeartbeatTick:         f.cfg.HeartbeatTick,
+		ElectionTick:          f.cfg.ElectionTick,
+		MaxSizePerMsg:         f.cfg.MaxSizePerMsg,
+		MaxInflightMsg:        f.cfg.MaxInflightMsg,
+		RaftCipher:            f.cfg.RaftCipher,
+		RaftCutoverIndex:      f.cfg.RaftCutoverIndex,
+		ColdStartObserver:     f.cfg.ColdStartObserver,
 	})
 	if err != nil {
 		closeBootstrapStartup(startup)

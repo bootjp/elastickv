@@ -42,13 +42,20 @@ const (
 )
 
 type Config struct {
-	Cluster           raftbootstrap.UUID
-	DefaultGroup      uint64
-	Groups            []uint64
-	RotationRequested bool
+	Cluster              raftbootstrap.UUID
+	DefaultGroup         uint64
+	Groups               []uint64
+	RotationRequested    bool
+	EncryptionConfigured bool
 	// ValidatePayload parses the complete final native payload outside A.
 	// It must reject commands outside the receiver-owned operation's lane.
 	ValidatePayload func(Kind, uint64, []byte) error
+	InspectPayload  func(Kind, uint64, []byte, raftbootstrap.Digest) (PayloadInspection, error)
+}
+
+type PayloadInspection struct {
+	PlaintextDigest      raftbootstrap.Digest
+	ProjectionGeneration uint64
 }
 
 type group struct {
@@ -72,6 +79,8 @@ type Arbiter struct {
 	fatal                error
 	closed               bool
 	operations           map[*Operation]struct{}
+	encryption           encryptionState
+	rotation             rotationState
 }
 
 // RecoveryTicket binds I/O performed outside A to the native image preceding it.
@@ -203,10 +212,11 @@ func stableRole(role raftengine.State) bool {
 
 func (a *Arbiter) permissionLocked() bool {
 	g := a.groups[a.config.DefaultGroup]
-	// Requested rotation needs its owned completion/F protocol. It must never
-	// accidentally acquire the explicit not-requested permission.
-	return !a.config.RotationRequested && g != nil && g.reconciled && stableRole(g.native.Role) &&
-		g.registration != RegistrationUnknown && !g.reservation && len(g.draining) == 0
+	if g == nil || !g.reconciled || !stableRole(g.native.Role) ||
+		g.registration == RegistrationUnknown || g.reservation || len(g.draining) != 0 {
+		return false
+	}
+	return a.rotationPermissionLocked(g)
 }
 
 func (a *Arbiter) invalidateLocked(id uint64) {
@@ -222,6 +232,8 @@ func (a *Arbiter) invalidateLocked(id uint64) {
 	if id == a.config.DefaultGroup {
 		g.loaded = false
 		a.permissionGeneration++
+		a.encryption.observed = false
+		a.rotation.permission = rotationPermission{}
 	}
 	for op := range a.operations {
 		if id == a.config.DefaultGroup || op.used[id] || op.globalDataDependency() {
@@ -311,6 +323,9 @@ func (s nativeScope) Observe(state raftengine.NativeState) {
 	if !g.observed || g.native != state {
 		s.owner.invalidateLocked(s.group)
 		g.native, g.observed = state, true
+		if s.group == s.owner.config.DefaultGroup && s.owner.config.RotationRequested && state.Role == raftengine.StateLeader {
+			s.owner.rotation.responsibility = true
+		}
 	}
 }
 
@@ -328,7 +343,11 @@ func (s nativeScope) Check(ctx context.Context, request raftengine.NativeRequest
 	if err := a.validateWithHeldPeerLocked(op, s.group, s.heldPeer); err != nil {
 		return err
 	}
-	if g.native.Role != raftengine.StateLeader {
+	if request.Operation == raftengine.NativeRecoveryReadIndex {
+		if op.kind != Recovery || !stableRole(g.native.Role) {
+			return errors.WithStack(ErrClosed)
+		}
+	} else if g.native.Role != raftengine.StateLeader {
 		return errors.WithStack(raftengine.ErrNotLeader)
 	}
 	if err := s.checkOwnedRequest(ctx, op, request); err != nil {
@@ -352,6 +371,10 @@ func (s nativeScope) checkOwnedRequest(ctx context.Context, op *Operation, reque
 			return errors.WithStack(ErrClosed)
 		}
 	case raftengine.NativeReadIndex:
+	case raftengine.NativeRecoveryReadIndex:
+		if op.kind != Recovery {
+			return errors.WithStack(ErrClosed)
+		}
 	case raftengine.NativeTransfer:
 		if op.kind != Control {
 			return errors.WithStack(ErrClosed)

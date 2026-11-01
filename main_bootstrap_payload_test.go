@@ -248,7 +248,10 @@ func FuzzBootstrapAdmissionPayload(f *testing.F) {
 		err := validateBootstrapAdmissionPayload(raftadmission.Kind(kind), payload)
 		require.Equal(t, original, payload)
 		if err == nil {
-			require.NotContains(t, []byte{0, byte(raftadmission.Rotation), 255}, kind, "unexpected open lane %d", kind)
+			require.NotContains(t, []byte{0, 255}, kind, "unexpected open lane %d", kind)
+			if raftadmission.Kind(kind) == raftadmission.Rotation {
+				require.NoError(t, validateBootstrapRotationPayload(payload))
+			}
 			if raftadmission.Kind(kind) == raftadmission.Recovery {
 				_, matched, parseErr := raftbootstrap.ParseActivationCommand(payload)
 				require.True(t, matched)

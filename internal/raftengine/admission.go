@@ -40,6 +40,9 @@ const (
 	NativeMembership
 	NativeTransfer
 	NativePeerStep
+	// NativeRecoveryReadIndex is an owned Recovery-only barrier; it must not
+	// authorize ordinary business reads on followers or mint a new handle.
+	NativeRecoveryReadIndex
 )
 
 // Payload is borrowed synchronously and must not be retained or mutated.

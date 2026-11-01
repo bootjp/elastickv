@@ -93,6 +93,10 @@ type Message struct {
 	Group    uint64
 	From, To uint64
 	Traffic  Traffic
+	// Declaration seals the canonical Registration Raft entry (including opcode)
+	// for exact identity/epoch revalidation. Other traffic leaves it zero.
+	// It is derived by a trusted decoder, never RPC metadata.
+	Declaration raftbootstrap.Digest
 }
 
 type Decoder func(any) (Message, error)
