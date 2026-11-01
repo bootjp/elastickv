@@ -7,14 +7,12 @@
 package fuseadapter_test
 
 import (
-	"context"
 	"errors"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -257,61 +255,6 @@ func assertOneCreatedDescriptor(t *testing.T, first, second *os.File) {
 	b, err := unix.FcntlInt(second.Fd(), unix.F_CREATED_QUERY, 0)
 	require.NoError(t, err)
 	require.Equal(t, 1, a+b, "only the actual creator may report a newly created descriptor")
-}
-
-type collidingMountCore struct {
-	fuseadapter.Core
-	ready           chan struct{}
-	createMu        sync.Mutex
-	creates         atomic.Int32
-	collisions      atomic.Int32
-	interruptFlush  atomic.Bool
-	interrupted     atomic.Int32
-	released        atomic.Int32
-	releaseFailures atomic.Int32
-}
-
-func (c *collidingMountCore) Flush(ctx context.Context, inode, fh uint64) error {
-	if err := c.Core.Flush(ctx, inode, fh); err != nil {
-		return err
-	}
-	if c.interruptFlush.CompareAndSwap(true, false) {
-		c.interrupted.Add(1)
-		return syscall.EINTR
-	}
-	return nil
-}
-
-func (c *collidingMountCore) Release(ctx context.Context, inode, fh uint64, client []byte) error {
-	err := c.Core.Release(ctx, inode, fh, client)
-	if err != nil {
-		c.releaseFailures.Add(1)
-	}
-	c.released.Add(1)
-	return err
-}
-
-func (c *collidingMountCore) Create(ctx context.Context, parent uint64, name []byte, opts filesystem.CreateOptions) (filesystem.CreateResult, error) {
-	if attempt := c.creates.Add(1); attempt <= 2 {
-		if attempt == 2 {
-			close(c.ready)
-		}
-		select {
-		case <-c.ready:
-		case <-time.After(5 * time.Second):
-			return filesystem.CreateResult{}, context.DeadlineExceeded
-		}
-	}
-	// Exercise a definite EEXIST, not a concurrent OCC failure whose commit
-	// outcome the adapter cannot safely replay. The initial barrier above
-	// forces both mounts into FUSE_CREATE before either backend call finishes.
-	c.createMu.Lock()
-	defer c.createMu.Unlock()
-	result, err := c.Core.Create(ctx, parent, name, opts)
-	if errors.Is(err, filesystem.ErrExists) {
-		c.collisions.Add(1)
-	}
-	return result, err
 }
 
 func skipOrFail(t *testing.T, format string, args ...any) {

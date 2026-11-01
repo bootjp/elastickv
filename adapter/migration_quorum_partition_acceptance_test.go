@@ -36,6 +36,8 @@ const (
 	quorumAcceptanceHeartbeatTicks = 10
 	quorumAcceptanceElectionWait   = 3 * quorumAcceptanceTick * quorumAcceptanceElectionTicks
 	quorumAcceptanceSnapshotEvery  = 8
+	quorumAcceptancePhaseBudget    = 60 * time.Second
+	quorumAcceptancePhases         = 5 // configuration, snapshot, restore, guard, resolution
 )
 
 // Real data-group elections, WAL, transport, ConfChanges and native snapshots.
@@ -415,9 +417,9 @@ func (c *quorumAcceptanceCluster) completeInitialOwner(t *testing.T, ctx context
 
 func TestMigrationQuorumPartitionAcceptance(t *testing.T) {
 	t.Setenv("ELASTICKV_RAFT_SNAPSHOT_COUNT", fmt.Sprint(quorumAcceptanceSnapshotEvery))
-	lifetime, stop := context.WithTimeout(t.Context(), 3*time.Minute)
+	lifetime, stop := context.WithTimeout(t.Context(), quorumAcceptancePhases*quorumAcceptancePhaseBudget)
 	defer stop()
-	ctx, cancel := context.WithTimeout(lifetime, 60*time.Second)
+	ctx, cancel := quorumAcceptancePhase(t, lifetime, "configuration/guard")
 	defer cancel()
 	// Bound each costly acceptance phase independently; request cancellation
 	// must not double as the lifetime of the cluster needed by the next phase.
@@ -465,10 +467,12 @@ func TestMigrationQuorumPartitionAcceptance(t *testing.T) {
 		return err
 	})
 	require.NoError(t, consumer.revalidateSplitTransferAdmission(ctx, witness))
-	c.exerciseLearner(t, ctx, leader, consumer, job, control, witness, root)
+	newEpoch := c.exerciseLearner(t, ctx, leader, consumer, job, control, witness, root)
+	cancel()
+	c.retainedAndRestart(t, root, newEpoch)
 }
 
-func (c *quorumAcceptanceCluster) exerciseLearner(t *testing.T, ctx context.Context, leader *quorumAcceptanceNode, consumer *DistributionServer, job distribution.SplitJob, control *pb.TargetStagedReadinessRequest, oldWitness *splitTransferAdmissionWitness, root quorumAcceptanceRoot) {
+func (c *quorumAcceptanceCluster) exerciseLearner(t *testing.T, ctx context.Context, leader *quorumAcceptanceNode, consumer *DistributionServer, job distribution.SplitJob, control *pb.TargetStagedReadinessRequest, oldWitness *splitTransferAdmissionWitness, root quorumAcceptanceRoot) uint64 {
 	t.Helper()
 	joining := c.nodes[3]
 	peers := make([]etcdraft.Peer, len(c.nodes))
@@ -547,7 +551,7 @@ func (c *quorumAcceptanceCluster) exerciseLearner(t *testing.T, ctx context.Cont
 	require.Len(t, witness.snapshot.Members, 4)
 	c.checkReplicas(t, ctx, newEpoch)
 	require.NoError(t, ctx.Err(), "configuration/guard phase must finish within its own budget")
-	c.retainedAndRestart(t, root, newEpoch)
+	return newEpoch
 }
 
 func (c *quorumAcceptanceCluster) namespaceSnapshot(ctx context.Context) (NamespaceAdmissionSnapshot, error) {
@@ -676,7 +680,7 @@ func quorumAcceptancePrepare(phase pb.Phase, version uint64) *pb.Request {
 
 func (c *quorumAcceptanceCluster) retainedAndRestart(t *testing.T, root quorumAcceptanceRoot, epoch uint64) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(c.lifetime, 60*time.Second)
+	ctx, cancel := quorumAcceptancePhase(t, c.lifetime, "large-write/snapshot")
 	defer cancel()
 	started := time.Now()
 	large := make([]byte, store.MigrationPagePayloadBudget+(1<<19))
@@ -716,7 +720,7 @@ func (c *quorumAcceptanceCluster) retainedAndRestart(t *testing.T, root quorumAc
 	require.NoError(t, ctx.Err(), "large-write/snapshot phase must finish within its own budget")
 	t.Logf("large-write/snapshot phase completed in %s", time.Since(started))
 	cancel()
-	ctx, cancel = context.WithTimeout(c.lifetime, 60*time.Second)
+	ctx, cancel = quorumAcceptancePhase(t, c.lifetime, "restart/restore")
 	defer cancel()
 	started = time.Now()
 	for _, n := range c.nodes {
@@ -741,9 +745,17 @@ func (c *quorumAcceptanceCluster) retainedAndRestart(t *testing.T, root quorumAc
 	value, err := reader.GetGroupAt(ctx, quorumAcceptanceGroup, []byte("b"), 1000)
 	require.NoError(t, err)
 	require.True(t, bytes.Equal(large, value), "native restart must restore the ACKed retained-left value")
+	require.NoError(t, ctx.Err(), "restart/restore phase must finish within its own budget")
+	cancel()
+	ctx, cancel = quorumAcceptancePhase(t, c.lifetime, "restored typed guard/no-write proof")
+	defer cancel()
 	err = c.rejectOversizedMovingWrite(t, ctx, large, epoch)
 	require.ErrorIs(t, err, kv.ErrMigrationTransferTooLarge)
 	t.Log("typed moving-range size rejection and unrestricted retained-left oversized data survive native restart on all four members")
+	require.NoError(t, ctx.Err(), "restored guard phase must finish within its own budget")
+	cancel()
+	ctx, cancel = quorumAcceptancePhase(t, c.lifetime, "PREPARE resolution/admission/quorum")
+	defer cancel()
 	leader, _, err = c.commitToCurrentLeader(ctx, []*pb.Request{quorumAcceptancePrepare(pb.Phase_COMMIT, quorumAcceptanceCatalogVersion)})
 	require.NoError(t, err, "native snapshot must retain PREPARE resolution evidence")
 	reader = kv.NewShardStore(mirror, map[uint64]*kv.ShardGroup{quorumAcceptanceGroup: {Store: leader.store, Engine: leader.engine, Txn: leader.tx}})
@@ -757,6 +769,24 @@ func (c *quorumAcceptanceCluster) retainedAndRestart(t *testing.T, root quorumAc
 	c.checkNoQuorum(t, ctx, leader)
 	require.NoError(t, ctx.Err(), "restart/admission phase must finish within its own budget")
 	t.Logf("restart/admission phase completed in %s", time.Since(started))
+}
+
+func quorumAcceptancePhase(t *testing.T, parent context.Context, name string) (context.Context, context.CancelFunc) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(parent, quorumAcceptancePhaseBudget)
+	started := time.Now()
+	deadline, _ := ctx.Deadline()
+	t.Logf("phase %s started; remaining budget %s", name, time.Until(deadline))
+	var once sync.Once
+	finish := func() {
+		once.Do(func() {
+			t.Logf("phase %s finished after %s; context error: %v", name, time.Since(started), ctx.Err())
+			cancel()
+		})
+	}
+	// Preserve timing evidence even when an assertion ends this phase early.
+	t.Cleanup(finish)
+	return ctx, finish
 }
 
 // Only this negative write may be reissued after an unknown outcome. Ordinary
