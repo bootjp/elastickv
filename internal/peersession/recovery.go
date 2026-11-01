@@ -16,12 +16,24 @@ func (o *Owner) PublishRecoveredPolicy(files *raftbootstrap.Store, groupID uint6
 			o.SuspendGroup(groupID)
 		}
 	}()
+	group, err := o.RecoverPolicyProjection(files, groupID, policy, state)
+	if err != nil {
+		return err
+	}
+	group.Generation = generation
+	return errors.WithStack(o.UpdateGroup(group))
+}
+
+// RecoverPolicyProjection verifies durable evidence without publishing session
+// authority. Generation is intentionally unset: the runtime binds publication
+// to a current native ticket under its admission arbiter, after this I/O ends.
+func (o *Owner) RecoverPolicyProjection(files *raftbootstrap.Store, groupID uint64, policy raftbootstrap.PolicyRecord, state raftbootstrap.RaftState) (Group, error) {
 	if files == nil || state != raftbootstrap.Intact || policy.Identity.Cluster != o.local.Cluster || policy.Identity.Group != groupID {
-		return errors.WithStack(ErrDenied)
+		return Group{}, errors.WithStack(ErrDenied)
 	}
 	digest, err := raftbootstrap.PolicyDigest(policy)
 	if err != nil {
-		return errors.WithStack(err)
+		return Group{}, errors.WithStack(err)
 	}
 	floor := raftbootstrap.Floor{ActivationIndex: policy.ActivationIndex, Generation: policy.Generation}
 	authoritative := raftbootstrap.Policy{
@@ -31,20 +43,20 @@ func (o *Owner) PublishRecoveredPolicy(files *raftbootstrap.Store, groupID uint6
 		Identity: &policy.Identity, BaselineDigest: &policy.BaselineDigest, RaftState: state, Policy: &authoritative,
 	})
 	if err != nil {
-		return errors.WithStack(err)
+		return Group{}, errors.WithStack(err)
 	}
 	if inspection.Class != raftbootstrap.Required {
-		return errors.WithStack(ErrDenied)
+		return Group{}, errors.WithStack(ErrDenied)
 	}
 	group := Group{
-		ID: policy.Identity.Group, Generation: generation, Configuration: policy.Configuration,
+		ID: policy.Identity.Group, Configuration: policy.Configuration,
 		Policy: digest, Floor: floor, Minimum: policy.Minimum, State: Intact,
 		Stage: IdentityReady, Pending: PendingClear, MarkerReady: true,
 	}
 	if !memberMatches(o.local, group) {
-		return errors.WithStack(ErrDenied)
+		return Group{}, errors.WithStack(ErrDenied)
 	}
-	return errors.WithStack(o.UpdateGroup(group))
+	return group, nil
 }
 
 // SuspendGroup closes current sessions AND future restricted admission before

@@ -75,6 +75,7 @@ func TestProtectedDataSnapshotRetainsConfigurationIndex(t *testing.T) {
 	defer cancel()
 	fsm := kv.NewKvFSMWithHLC(store.NewMVCCStore(), nil)
 	cfg := OpenConfig{NodeID: 7, LocalID: "n7", LocalAddress: "127.0.0.1:7007",
+		GroupID: identityFixture().Identity.Group, NativeAdmission: fixtureNativeAdmission{},
 		DataDir: t.TempDir(), Bootstrap: true, NativeIdentity: identityFixture(), StateMachine: fsm,
 		TickInterval: 10 * time.Millisecond, ElectionTick: 5, HeartbeatTick: 1}
 	e, err := Open(ctx, cfg)

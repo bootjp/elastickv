@@ -37,6 +37,20 @@ func LoadAppliedBootstrapPolicy(ctx context.Context, st store.MVCCStore, identit
 	if err := verifyBootstrapAppliedIndex(index, applied); err != nil {
 		return zero, err
 	}
+	policy, err := readAppliedBootstrapPolicy(ctx, metadata, identity, applied)
+	if err != nil {
+		return zero, err
+	}
+	if err := verifyBootstrapAppliedIndex(index, applied); err != nil {
+		return zero, err
+	}
+	return policy, nil
+}
+
+// readAppliedBootstrapPolicy also serves apply, where ctx reads the indexed
+// batch and applied is the boundary strictly before the NEW protected entry.
+func readAppliedBootstrapPolicy(ctx context.Context, metadata store.RaftControlMetadataStore, identity raftbootstrap.Identity, applied uint64) (raftbootstrap.PolicyRecord, error) {
+	var zero raftbootstrap.PolicyRecord
 	key, err := BootstrapPolicyMetadataKey(identity)
 	if err != nil {
 		return zero, err
@@ -51,9 +65,6 @@ func LoadAppliedBootstrapPolicy(ctx context.Context, st store.MVCCStore, identit
 	}
 	if policy.Identity != identity || !bootstrapPolicyWithinApplied(policy, applied) {
 		return zero, errors.WithStack(raftbootstrap.ErrInconsistent)
-	}
-	if err := verifyBootstrapAppliedIndex(index, applied); err != nil {
-		return zero, err
 	}
 	return policy, nil
 }

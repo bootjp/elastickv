@@ -177,6 +177,8 @@ type Internal struct {
 	clock                           *kv.HLC
 	tsAllocator                     kv.TimestampAllocator
 	adminProposer                   raftengine.Proposer
+	bootstrapPolicyProposer         raftengine.Proposer
+	prepareStartupAuthorization     func(context.Context, *pb.PrepareEvidenceStateRequest) bool
 	readWatermarkProposer           raftengine.Proposer
 	lastCommitTimestamp             func() uint64
 	relay                           *RedisPubSubRelay
@@ -610,6 +612,13 @@ func (i *Internal) ForwardAdminProposal(
 	if req.GetForceEntry() {
 		return nil, errors.WithStack(status.Error(codes.PermissionDenied, "force-entry forwarding is only valid for read watermark advances"))
 	}
+	if reply, matched, err := i.forwardBootstrapActivation(ctx, req); matched {
+		return reply, err
+	}
+	return i.forwardSupportedAdminProposal(ctx, req)
+}
+
+func (i *Internal) forwardSupportedAdminProposal(ctx context.Context, req *pb.ForwardAdminProposalRequest) (*pb.ForwardAdminProposalResponse, error) {
 	if i.adminProposer == nil {
 		return nil, errors.New("admin proposer is unavailable")
 	}

@@ -30,11 +30,13 @@ func WithLeaderAdminToken(token string) LeaderAdminProposerOption {
 // Propose remains local because only barrier-exempt, idempotent admin entries
 // are safe to retry across a leadership change.
 type leaderAdminProposer struct {
-	leader     raftengine.LeaderView
-	local      raftengine.Proposer
-	connCache  *GRPCConnCache
-	adminToken string
-	forceEntry bool
+	startupControlRPC   StartupControlRPC
+	startupControlGroup uint64
+	leader              raftengine.LeaderView
+	local               raftengine.Proposer
+	connCache           *GRPCConnCache
+	adminToken          string
+	forceEntry          bool
 }
 
 func NewLeaderAdminProposer(
@@ -145,19 +147,15 @@ func (p *leaderAdminProposer) forwardAdmin(
 	if addr == "" {
 		return nil, errors.WithStack(ErrLeaderNotFound)
 	}
-	if p.connCache == nil {
+	if p.connCache == nil && p.startupControlRPC == nil {
 		return nil, errors.New("leader admin proposer connection cache is unavailable")
-	}
-	conn, err := p.connCache.ConnFor(addr)
-	if err != nil {
-		return nil, err
 	}
 	ctx, cancel := context.WithTimeout(parentCtx, leaderForwardTimeout)
 	defer cancel()
 	if p.adminToken != "" {
 		ctx = metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+p.adminToken)
 	}
-	resp, err := pb.NewInternalClient(conn).ForwardAdminProposal(ctx, &pb.ForwardAdminProposalRequest{
+	resp, err := p.remoteStartupAdminProposal(ctx, addr, &pb.ForwardAdminProposalRequest{
 		Payload: data, ForceEntry: forceEntry,
 	})
 	if err != nil {

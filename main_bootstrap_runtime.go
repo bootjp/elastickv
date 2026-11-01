@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"github.com/bootjp/elastickv/internal/peersession"
+	"github.com/bootjp/elastickv/internal/raftadmission"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/internal/raftengine/etcd"
@@ -17,21 +18,23 @@ import (
 type bootstrapStartupFactory = func(raftengine.FactoryConfig, *etcd.GRPCTransport) (*etcd.BootstrapStartup, error)
 
 // The parent supplies the exact public method list for this shared listener.
-func newBootstrapStartupForGroup(config *bootstrapPeerConfig, files *raftbootstrap.Store, intent raftbootstrap.Intent, st store.MVCCStore, publicMethods []string) bootstrapStartupFactory {
+func newBootstrapStartupForGroup(config *bootstrapPeerConfig, files *raftbootstrap.Store, intent raftbootstrap.Intent, st store.MVCCStore, publicMethods []string, domains ...*bootstrapDomain) bootstrapStartupFactory {
 	publicMethods = slices.Clone(publicMethods)
 	return func(cfg raftengine.FactoryConfig, transport *etcd.GRPCTransport) (*etcd.BootstrapStartup, error) {
-		identity, err := validateBootstrapStartup(config, intent, cfg)
+		identity, err := bootstrapRuntimeIdentity(config, files, intent, st, cfg, transport)
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}
-		if err := validateBootstrapStartupDependencies(files, st, transport); err != nil {
-			return nil, err
+		if len(domains) != 1 || domains[0] == nil {
+			return nil, errors.New("protected startup requires the process-wide admission arbiter")
 		}
+		domain := domains[0]
+		admission := domain.admission
 		owner, err := peersession.NewOwner(peersession.Config{
 			Local: config.local, Provisioned: config.provisions, Versions: intent.Minimum,
 			PublicMethods: publicMethods,
 			MethodFactory: func(owner *peersession.Owner) ([]peersession.Method, error) {
-				return etcd.PeerSessionMethodsForOwner(cfg.GroupID, owner), nil
+				return append(etcd.PeerSessionMethodsForOwner(cfg.GroupID, owner), bootstrapSharedGRPCMethods(cfg.GroupID)...), nil
 			},
 		})
 		if err != nil {
@@ -47,13 +50,17 @@ func newBootstrapStartupForGroup(config *bootstrapPeerConfig, files *raftbootstr
 			owner.Close()
 			return nil, errors.WithStack(err)
 		}
+		if err := domain.register(cfg.GroupID, owner); err != nil {
+			owner.Close()
+			return nil, err
+		}
+		domain.registerActivation(cfg.GroupID, config.activation)
 		var mu sync.Mutex
-		var generation uint64
 		return &etcd.BootstrapStartup{
-			NativeIdentity: &identity, ServerOptions: options, Register: owner.Register, Close: owner.Close,
+			NativeAdmission: admission,
+			NativeIdentity:  &identity, ServerOptions: options, Register: owner.Register, Close: owner.Close,
 			PublicReady: func() bool {
-				group, ok := owner.GroupProjection(cfg.GroupID)
-				return ok && group.Stage == peersession.DataReady && group.Pending == peersession.PendingClear
+				return bootstrapPublicReady(admission, owner, cfg.GroupID)
 			},
 			AdmissionChanged: func() {
 				mu.Lock()
@@ -65,15 +72,67 @@ func newBootstrapStartupForGroup(config *bootstrapPeerConfig, files *raftbootstr
 				defer mu.Unlock()
 				// Any failed re-publication permanently closes this owner rather than
 				// retaining an earlier projection's authority.
-				if err := publishBootstrapRecovery(owner, files, st, identity, state, generation+1); err != nil {
+				if err := publishBootstrapAdmissionRecovery(admission, owner, files, st, identity, state, config.activation); err != nil {
+					admission.LatchFatal(err)
 					owner.Close()
 					return err
 				}
-				generation++
-				return nil
+				return domain.refresh()
 			},
 		}, nil
 	}
+}
+
+func bootstrapPublicReady(admission *raftadmission.Arbiter, owner *peersession.Owner, id uint64) bool {
+	group, ok := owner.GroupProjection(id)
+	return admission.Stage(id) == peersession.DataReady && ok && group.Stage == peersession.DataReady && group.Pending == peersession.PendingClear
+}
+
+func publishBootstrapAdmissionRecovery(admission *raftadmission.Arbiter, owner *peersession.Owner, files *raftbootstrap.Store, st store.MVCCStore, expected etcd.WALIdentity, state etcd.RecoveredState, activation []byte) error {
+	ticket, err := admission.Ticket(expected.Identity.Group)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	policy, err := loadVerifiedBootstrapPolicy(files, st, expected, state)
+	if err != nil {
+		if errors.Is(err, store.ErrKeyNotFound) {
+			return publishPreparedBootstrapRecovery(admission, ticket, owner, files, st, expected, state, activation)
+		}
+		return errors.WithStack(err)
+	}
+	projection, err := owner.RecoverPolicyProjection(files, expected.Identity.Group, policy, raftbootstrap.Intact)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	// Configured encryption remains closed until independent epoch/wrapper
+	// inspection publishes its evidence; process-wide "Done" is not proof.
+	registration := raftadmission.RegistrationUnknown
+	if !*encryptionEnabled && *encryptionSidecarPath == "" {
+		registration = raftadmission.RegistrationNotConfigured
+	}
+	return errors.WithStack(admission.PublishRecoveryWith(ticket, policy, registration,
+		func(stage peersession.Stage, generation uint64) (func(), error) {
+			projection.Stage, projection.Generation = stage, generation
+			return owner.UpdateGroupProjection(projection)
+		}))
+}
+
+func loadVerifiedBootstrapPolicy(files *raftbootstrap.Store, st store.MVCCStore, expected etcd.WALIdentity, state etcd.RecoveredState) (raftbootstrap.PolicyRecord, error) {
+	actual, verified := state.Identity()
+	if !verified || actual != expected {
+		return raftbootstrap.PolicyRecord{}, errors.WithStack(etcd.ErrWALIdentity)
+	}
+	policy, err := kv.LoadAppliedBootstrapPolicy(context.Background(), st, expected.Identity, state.AppliedIndex())
+	if err != nil {
+		return policy, errors.WithStack(err)
+	}
+	if policy.BaselineDigest != expected.BaselineDigest {
+		return policy, errors.WithStack(raftbootstrap.ErrInconsistent)
+	}
+	if err := validateBootstrapRecoveredConfiguration(policy, state); err != nil {
+		return policy, err
+	}
+	return policy, mirrorRecoveredBootstrapFloor(files, policy)
 }
 
 func validateBootstrapStartupDependencies(files *raftbootstrap.Store, st store.MVCCStore, transport *etcd.GRPCTransport) error {

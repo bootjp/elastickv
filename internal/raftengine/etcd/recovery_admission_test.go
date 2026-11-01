@@ -103,6 +103,8 @@ func recoveryWALConfig(t *testing.T, bound bool) (OpenConfig, uint64) {
 		DataDir: t.TempDir(), Bootstrap: true, StateMachine: &recoveryProofFSM{}}
 	if bound {
 		cfg.NativeIdentity = identityFixture()
+		cfg.GroupID = cfg.NativeIdentity.Identity.Group
+		cfg.NativeAdmission = fixtureNativeAdmission{}
 	}
 	engine, err := Open(context.Background(), cfg)
 	require.NoError(t, err)

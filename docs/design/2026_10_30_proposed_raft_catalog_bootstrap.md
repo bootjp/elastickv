@@ -1,6 +1,6 @@
 # Raft catalog bootstrap
 
-Status: Proposed v5; design accepted; local format/planner/session/storage components implemented in this branch; runtime not implemented
+Status: Proposed v5; accepted-baseline plaintext startup integrated; final verification in progress; full protocol and production operation not yet verified
 Author: bootjp
 Date: 2026-10-30
 
@@ -26,6 +26,100 @@ The isolation audit remains partial, and #1355 remains blocked until its
 replica-determinism and legacy-state acceptance obligations are satisfied.
 
 ## Decisions
+
+### Existing-cluster preparation evidence
+
+The accepted baseline and readiness are separate certificates. A baseline probe
+is signed while the existing members are quiesced, before local migration. It
+binds the agreed committed cut, configuration, complete retained data image and
+watermark. Its signature does not assert that any required-format marker or
+versioned native WAL identity has subsequently been persisted.
+
+Each member signs a separate domain-separated `PreparedMemberAck` only after
+the native migration has reached its durable bound phase. The signing owner
+must independently verify the original backup, retained term/vote/log/snapshot,
+version-2 WAL identity bound to the complete baseline manifest, required marker,
+intent and exact prepared store transformation. The acknowledgement binds that
+manifest digest, member, minimum formats and final local durable proof digest.
+It grants neither data admission nor a claim of historical correctness.
+
+`ControlActivate` carries both the baseline manifest and a `PreparedCertificate`.
+The latter must contain valid pinned-key signatures from every current member,
+including outgoing voters, learners and learners-next, not merely a quorum.
+Baseline probes cannot be substituted for preparation acknowledgements. The
+apply path still requires its independently retained local preparation and
+actual native configuration; the received certificate cannot select these.
+
+An explicit per-group `activation_file` may supply this complete command to the
+startup owner. Only after listeners start can that owner acquire a fresh local
+recovery handle and submit the command through its configured proposer. A lost
+or cancelled reply is unknown: completion follows independently recovered P,
+not an assumed acknowledgement or a fresh handle attached to an old request.
+
+A native snapshot may carry its sender's original preparation row. Runtime
+must not interpret that source probe as the receiver's offline preparation.
+When the probe names another member, its complete canonical bytes and context
+must match the independently configured activation manifest, including all
+baseline signatures and all prepared acknowledgments. Its manifest digest
+must equal the receiver's own verified WAL v2 preparation digest; recovered
+identity must separately match the receiver's configured local NodeID. No J or
+WAL is rewritten to manufacture this proof. Without the complete artifact, the
+original local-member validation remains strict. Keep that artifact across
+restarts after snapshot catch-up.
+
+The opt-in `--raftBootstrapPeerConfigDir` runtime path and offline CLI now wire
+accepted-baseline plaintext recovery, all-member preparation acknowledgments,
+policy activation, shared admission and Control/DataReady. Real native tests
+cover existing data, a three-member TLS group, dedicated TSO plus a data group,
+ordinary writes and restart. These are integration tests, not production
+operation or historical correctness evidence. See `docs/raft_bootstrap_enablement.md`.
+Encrypted/rotation profiles, cold seed, lost-state replacement, guarded
+membership and the complete snapshot/journal protocol remain release gates.
+Unsupported profiles or operations fail closed; this does not complete v5.
+The new composed source still requires its own latest-push review and CI.
+
+The current runtime conservatively treats every data/maintenance root as
+dependent on all local protected groups. Direct reads may reach a store before
+recording a target-specific native action; any native group change must cancel
+these roots as well. New data admission waits until all groups are DataReady
+and affected old owners have joined. Identity/control work retains its narrower
+generation-bound dependencies so elections and policy activation do not depend
+on catalog/data completion. Target-specific data admission is a future
+availability optimization, not an exception to result validation.
+
+Protected RAW commits retain the original receiver context through the terminal
+proposal. The legacy cross-request microbatch detaches onto a background
+context, so it is not used by protected native proposers. Each protected raw
+command still submits its complete request list atomically in one entry.
+Cross-request batching requires a composite retaining every original handle
+and an atomic terminal validation of all of them; creating a fresh batch owner
+would not satisfy that requirement. Legacy proposers retain their existing
+batching. Protected throughput therefore needs separate measurement and must
+not be described as unchanged by this correctness fix.
+
+Admission refusal before work is distinct from revocation after a successful
+handler or child operation. The latter withholds the result and preserves an
+unknown-outcome error; it cannot assert that a submitted write was absent.
+Business gRPC responses use `Unknown` for that final boundary, not the
+pre-admission `Unavailable` signal. Existing deterministic apply errors remain
+distinct and are not converted into successful results or retry-safe refusal.
+
+A public stream blocked in transport I/O must also terminate on revocation.
+Replacing its application context alone cannot interrupt the underlying
+HTTP/2 read or flow-control wait. The protected listener captures its genuine
+server-owned physical connection and closes that connection outside A when the
+operation is cancelled, joining the cancellation callback before retirement.
+This may interrupt other multiplexed calls on that connection. It is an
+availability cost, not evidence that their submitted writes were absent.
+Normal stream completion stops the abort callback before finishing ownership,
+so a healthy connection remains reusable.
+
+HTTP adapters similarly capture the accepted server connection and join its
+cancellation callback before retiring the request. A blocked request-body read
+cannot rely on `Body.Close`, whose lock may already be held by that read.
+After entering a handler, revoked response admission aborts the HTTP exchange
+rather than returning a generic 503 that could imply non-acceptance. Refusal
+before handler admission remains a 503. Normal completion retains keep-alive.
 
 ### Ordered startup
 

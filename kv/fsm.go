@@ -74,7 +74,9 @@ type kvFSM struct {
 	// raftBootstrapIdentity is trusted local runtime configuration used to
 	// derive receipt slots. Protected payloads may only prove equality with it;
 	// they never select their own cluster or group namespace.
-	raftBootstrapIdentity raftbootstrap.Identity
+	raftBootstrapIdentity          raftbootstrap.Identity
+	bootstrapActivationNativeProof func(context.Context) (BootstrapActivationNativeProof, error)
+	pendingNativeConfiguration     *raftengine.NativeConfiguration
 	// readTracker is shared with the local FSM compactor. BackupPin
 	// FSM entries mutate this tracker so compaction retains versions
 	// at the live-backup read timestamp until the pin is released or
@@ -199,6 +201,7 @@ type RouteSnapshot interface {
 func (f *kvFSM) SetApplyIndex(idx uint64) {
 	f.pendingApplyIdx = idx
 	f.pendingApplyIdentity = raftengine.AppliedEntryIdentity{}
+	f.ClearApplyNativeConfiguration()
 }
 
 // SetApplyEntryIdentity implements raftengine.ApplyEntryIdentityAware.
@@ -211,6 +214,7 @@ func (f *kvFSM) SetApplyEntryIdentity(identity raftengine.AppliedEntryIdentity) 
 // normal or configuration entry finishes its serial apply attempt.
 func (f *kvFSM) ClearApplyEntryIdentity() {
 	f.pendingApplyIdentity = raftengine.AppliedEntryIdentity{}
+	f.ClearApplyNativeConfiguration()
 }
 
 // LastAppliedIndex implements raftengine.AppliedIndexReader by

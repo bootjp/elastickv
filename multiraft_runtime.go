@@ -15,7 +15,10 @@ import (
 )
 
 type raftGroupRuntime struct {
-	spec groupSpec
+	spec                groupSpec
+	bootstrapDomain     *bootstrapDomain
+	bootstrapPeerConfig *bootstrapPeerConfig
+	bootstrapNetwork    *bootstrapNetwork
 	// engineMu guards engine to allow concurrent readers
 	// (specifically the keyviz leader-term publisher goroutine that
 	// runs on a ticker independent of startup ordering) to coexist

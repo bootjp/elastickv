@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/adapter"
-	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/bootjp/elastickv/internal/raftadmin"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/internal/raftengine/etcd"
@@ -32,10 +31,10 @@ type migrationNamespaceMembershipGate struct {
 var _ raftadmin.MembershipChangeInterceptor = (*migrationNamespaceMembershipGate)(nil)
 var _ raftadmin.MembershipPromotionInterceptor = (*migrationNamespaceMembershipGate)(nil)
 
-func newMigrationNamespaceMembershipGate(st store.MVCCStore, engine raftengine.Engine, proposer raftengine.Proposer, token string, next raftadmin.MembershipChangeInterceptor) *migrationNamespaceMembershipGate {
+func newMigrationNamespaceMembershipGate(st store.MVCCStore, engine raftengine.Engine, proposer raftengine.Proposer, token string, next raftadmin.MembershipChangeInterceptor, providers ...kv.GRPCDialOptionsForAddress) *migrationNamespaceMembershipGate {
 	return &migrationNamespaceMembershipGate{store: st, engine: engine, proposer: proposer, next: next,
 		probe: func(ctx context.Context, address string, request *pb.ProbeMigrationStateRequest) (*pb.ProbeMigrationStateResponse, error) {
-			conn, err := grpc.NewClient(address, internalutil.GRPCDialOptions()...)
+			conn, err := newBootstrapOrdinaryClient(address, providers...)
 			if err != nil {
 				return nil, errors.WithStack(err)
 			}

@@ -70,9 +70,10 @@ type Inspection struct {
 // serializes calls through this instance only; other processes/instances must
 // not publish concurrently. It never creates directories or opens a Raft engine.
 type Store struct {
-	dir string
-	mu  sync.Mutex
-	ops fileOps
+	dir     string
+	mu      sync.Mutex
+	ops     fileOps
+	staging *publicationStaging
 }
 
 func NewStore(dir string) *Store { return &Store{dir: dir, ops: realFileOps()} }

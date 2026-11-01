@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/bootjp/elastickv/internal/peersession"
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/cockroachdb/errors"
 	"go.etcd.io/raft/v3/raftpb"
 )
@@ -47,7 +48,8 @@ func (e *Engine) enqueueProtectedStep(ctx context.Context, msg raftpb.Message, r
 func (e *Engine) handleProtectedStep(request protectedStep) {
 	// The apply loop owns Step and invalidation ordering. The RPC may already
 	// have completed; retain session generation, not the RPC's short lifetime.
-	e.handleStepWithAdmission(request.message, func(action func() error) error {
+	nativeRequest := &raftengine.NativeRequest{Operation: raftengine.NativePeerStep, SessionGeneration: request.receipt.LocalGeneration()}
+	e.handleStepWithAdmission(request.message, nativeRequest, func(action func() error) error {
 		return request.receipt.WithAdmission(context.Background(), action)
 	})
 }

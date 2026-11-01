@@ -97,6 +97,16 @@ type Message struct {
 
 type Decoder func(any) (Message, error)
 type ReplyDecoder func(request Message, reply any) (Message, error)
+
+// RequestBinding contains request-oriented endpoints derived privately from an
+// owned connection/session, not from RPC metadata or a caller's payload. It is
+// decoder input only; the resulting Message still needs live authorization.
+type RequestBinding struct {
+	Group    uint64
+	From, To Node
+}
+
+type BindingDecoder func(RequestBinding, any) (Message, error)
 type StreamDecoders struct {
 	Request Decoder
 	Reply   ReplyDecoder
@@ -108,13 +118,21 @@ type StreamDecoders struct {
 // Its decoders must support gRPC's concurrent send/receive directions safely.
 type StreamFactory func(Binding) (StreamDecoders, error)
 type Method struct {
-	Name    string
-	Request Decoder
-	Reply   ReplyDecoder
-	Stream  StreamFactory
+	Name         string
+	Request      Decoder
+	BoundRequest BindingDecoder // Unary only; mutually exclusive with Request/Stream.
+	Reply        ReplyDecoder
+	Stream       StreamFactory
+	// AllowPublic permits calls WITHOUT either session header to reach the
+	// ordinary handler. Its own authentication/DataReady gates remain mandatory.
+	// Any supplied session metadata selects typed peer validation, never fallback.
+	AllowPublic bool
 }
 
 func validDecoders(m Method) bool {
+	if m.BoundRequest != nil {
+		return m.Request == nil && m.Stream == nil && m.Reply != nil
+	}
 	if (m.Request == nil) != (m.Reply == nil) {
 		return false
 	}
@@ -122,7 +140,7 @@ func validDecoders(m Method) bool {
 }
 
 func decodersForStream(h *Handle, m Method) (Method, error) {
-	if !h.owned() {
+	if !h.owned() || m.BoundRequest != nil {
 		return Method{}, ErrDenied
 	}
 	if m.Stream != nil {

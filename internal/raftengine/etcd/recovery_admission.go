@@ -1,8 +1,10 @@
 package etcd
 
 import (
+	"context"
 	"slices"
 
+	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/cockroachdb/errors"
 	etcdraft "go.etcd.io/raft/v3"
@@ -71,6 +73,16 @@ type RecoveredState struct {
 	peers                       []Peer
 }
 
+// VerifyPreparation must precede initial (floor-zero) policy publication. The
+// digest is the complete independently accepted BaselineManifestDigest. A v1
+// identity may recover activated policy, but cannot prove initial preparation.
+func (s RecoveredState) VerifyPreparation(expected raftbootstrap.Digest) error {
+	if expected == (raftbootstrap.Digest{}) || s.identity == nil || s.identity.PreparationDigest != expected {
+		return errors.WithStack(ErrWALIdentity)
+	}
+	return nil
+}
+
 func (s RecoveredState) Identity() (WALIdentity, bool) {
 	if s.identity == nil {
 		return WALIdentity{}, false
@@ -127,6 +139,11 @@ func (e *Engine) publishRecoveredAdmission() error {
 		hardState: hardState, confState: confState,
 		applied: e.applied, configurationIndex: e.currentConfigIndex(), peers: peers}
 	state.hardState, state.confState = state.HardState(), state.ConfState()
+	// Seed A from actual native authority only after the durable recovery prefix
+	// has been verified, and release A before policy/owner publication callbacks.
+	if err := e.withNative(context.Background(), nil, func() error { return nil }); err != nil {
+		return err
+	}
 	return errors.WithStack(e.recoveredAdmission(state))
 }
 
@@ -151,6 +168,7 @@ func recoveredRawNodeForOpen(prepared preparedOpenState) (*etcdraft.RawNode, uin
 // Called without e.mu or transport locks. Reconciliation, not this callback,
 // owns reopening Control/Data after a native authority change.
 func (e *Engine) invalidateAdmission() {
+	e.invalidateNativeAdmission()
 	e.admissionDirty = true
 	if e.admissionChanged != nil {
 		e.admissionChanged()

@@ -71,5 +71,6 @@ func TestProtectedDomainRejectsIncompleteConfigurationBeforeCreatingState(t *tes
 	require.Error(t, err)
 	require.NoDirExists(t, groupDataDir(base, "n1", 1, true))
 	err = validateProtectedBootstrapDomain("n1", base, []groupSpec{{id: dedicatedTSORaftGroupID}}, true)
-	require.ErrorContains(t, err, "refusing a partially protected domain")
+	require.Error(t, err, "a missing group-zero configuration must not fall back to legacy startup")
+	require.NoDirExists(t, groupDataDir(base, "n1", dedicatedTSORaftGroupID, true))
 }

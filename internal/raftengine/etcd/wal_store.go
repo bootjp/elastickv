@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/cockroachdb/errors"
 	"go.etcd.io/etcd/server/v3/etcdserver/api/snap"
@@ -43,6 +44,9 @@ func openDiskState(cfg OpenConfig, peers []Peer) (*diskState, error) {
 	if err := validateNativeIdentityConfig(cfg); err != nil {
 		return nil, err
 	}
+	if err := validateBaselineStartupSource(cfg); err != nil {
+		return nil, err
+	}
 	logger := zap.NewNop()
 	walDir := filepath.Join(cfg.DataDir, walDirName)
 	snapDir := filepath.Join(cfg.DataDir, snapDirName)
@@ -60,7 +64,7 @@ func openDiskState(cfg OpenConfig, peers []Peer) (*diskState, error) {
 	}
 
 	if wal.Exist(walDir) {
-		return loadWalState(logger, walDir, snapDir, fsmSnapDir, cfg.StateMachine, cfg.ColdStartObserver, cfg.NativeIdentity)
+		return loadWalStateWithNamespace(logger, walDir, snapDir, fsmSnapDir, cfg.StateMachine, cfg)
 	}
 
 	legacy, legacyErr := loadLegacyOrSplitState(cfg.DataDir)
@@ -110,6 +114,9 @@ func prepareDataDirs(dataDir, snapDir, fsmSnapDir string) error {
 }
 
 func bootstrapNewCluster(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, cfg OpenConfig, peers []Peer) (*diskState, error) {
+	if cfg.NativeIdentity != nil && cfg.NativeIdentity.PreparationDigest != (raftbootstrap.Digest{}) {
+		return nil, errors.Wrap(ErrWALIdentity, "preparation-bound identity cannot create replacement WAL")
+	}
 	if len(peers) == 1 {
 		return bootstrapWalState(logger, walDir, snapDir, fsmSnapDir, cfg.StateMachine, peers, cfg.NativeIdentity)
 	}
@@ -193,12 +200,24 @@ func readWALRestoreState(logger *zap.Logger, walDir, snapDir string, identity ..
 }
 
 func loadWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm StateMachine, obs raftengine.ColdStartObserver, identity ...*WALIdentity) (*diskState, error) {
+	return loadWalStateRecovery(logger, walDir, snapDir, fsmSnapDir, fsm, obs, nil, identity...)
+}
+
+func loadWalStateRecovery(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm StateMachine, obs raftengine.ColdStartObserver, verify NamespaceRecoveryVerifier, identity ...*WALIdentity) (*diskState, error) {
+	image, err := readNamespaceRecoveryImage(walDir, verify)
+	if err != nil {
+		return nil, err
+	}
 	selected, err := readWALRestoreState(logger, walDir, snapDir, identity...)
 	if err != nil {
 		return nil, err
 	}
 	committedReplayTarget := coldStartReplayTarget(selected.snapshot, selected.hardState)
-	effectiveApplied, externalValidated, err := restoreSnapshotWithOrigin(fsm, selected, committedReplayTarget, fsmSnapDir, obs, logger)
+	effectiveApplied, handled, err := recoverVerifiedNamespace(selected, image, filepath.Dir(walDir), verify)
+	externalValidated := false
+	if err == nil && !handled {
+		effectiveApplied, externalValidated, err = restoreSnapshotWithOrigin(fsm, selected, committedReplayTarget, fsmSnapDir, obs, logger)
+	}
 	if err != nil {
 		if closeErr := selected.w.Close(); closeErr != nil {
 			logger.Warn("WAL close failed after restoreSnapshotState error",

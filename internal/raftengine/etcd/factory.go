@@ -2,6 +2,7 @@ package etcd
 
 import (
 	"context"
+	"io"
 	"time"
 
 	"github.com/bootjp/elastickv/internal/encryption"
@@ -12,6 +13,8 @@ import (
 
 // FactoryConfig holds etcd-specific engine parameters.
 type FactoryConfig struct {
+	namespaceOwnership io.Closer
+	namespaceRecovery  NamespaceRecoveryVerifier
 	// BootstrapStartup configures protected transport before any RawNode or
 	// dispatch worker starts. It must use explicitly provisioned identity.
 	BootstrapStartup func(raftengine.FactoryConfig, *GRPCTransport) (*BootstrapStartup, error)
@@ -33,6 +36,7 @@ type FactoryConfig struct {
 }
 
 type BootstrapStartup struct {
+	NativeAdmission    raftengine.NativeAdmission
 	NativeIdentity     *WALIdentity
 	RecoveredAdmission func(RecoveredState) error
 	AdmissionChanged   func()
@@ -88,6 +92,10 @@ func (f *Factory) Create(cfg raftengine.FactoryConfig) (*raftengine.FactoryResul
 	}
 
 	engine, err := Open(context.Background(), OpenConfig{
+		namespaceOwnership: f.cfg.namespaceOwnership,
+		namespaceRecovery:  f.cfg.namespaceRecovery,
+		NativeAdmission:    startup.NativeAdmission,
+		GroupID:            cfg.GroupID,
 		NativeIdentity:     startup.NativeIdentity,
 		RecoveredAdmission: startup.RecoveredAdmission,
 		AdmissionChanged:   startup.AdmissionChanged,
@@ -162,7 +170,7 @@ func (f *Factory) prepareBootstrapStartup(cfg raftengine.FactoryConfig, transpor
 }
 
 func completeBootstrapStartup(s *BootstrapStartup) bool {
-	return s.NativeIdentity != nil && s.RecoveredAdmission != nil && s.AdmissionChanged != nil && s.PublicReady != nil &&
+	return s.NativeAdmission != nil && s.NativeIdentity != nil && s.RecoveredAdmission != nil && s.AdmissionChanged != nil && s.PublicReady != nil &&
 		s.Register != nil && len(s.ServerOptions) != 0 && s.Close != nil
 }
 

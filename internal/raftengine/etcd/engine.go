@@ -257,6 +257,10 @@ type Snapshot = raftengine.Snapshot
 type StateMachine = raftengine.StateMachine
 
 type OpenConfig struct {
+	namespaceOwnership io.Closer
+	namespaceRecovery  NamespaceRecoveryVerifier
+	GroupID            uint64
+	NativeAdmission    raftengine.NativeAdmission
 	// RecoveredAdmission runs synchronously after native startup replay and
 	// durable applied-index publication, before inbound delivery is enabled.
 	// It requires independently bound native WAL identity; nil keeps legacy startup.
@@ -311,18 +315,22 @@ type OpenConfig struct {
 }
 
 type Engine struct {
-	recoveredAdmission func(RecoveredState) error
-	admissionChanged   func()
-	admissionDirty     bool // owned by the native loop, like RawNode
-	admissionPublished bool
-	recoveredIdentity  *WALIdentity
-	nodeID             uint64
-	localID            string
-	localAddress       string
-	dataDir            string
-	fsmSnapDir         string
-	tickInterval       time.Duration
-	electionTick       int
+	baselineStartupGuard     io.Closer
+	recoveredAdmission       func(RecoveredState) error
+	admissionChanged         func()
+	nativeAdmission          raftengine.NativeAdmission
+	groupID                  uint64
+	nativeConfigurationIndex uint64 // actual native configuration, owned by the loop
+	admissionDirty           bool   // owned by the native loop, like RawNode
+	admissionPublished       bool
+	recoveredIdentity        *WALIdentity
+	nodeID                   uint64
+	localID                  string
+	localAddress             string
+	dataDir                  string
+	fsmSnapDir               string
+	tickInterval             time.Duration
+	electionTick             int
 	// joinAsLearner is captured from OpenConfig; consulted by
 	// alarmIfJoinedAsVoter on every post-apply ConfState. See §4.5 of
 	// the learner design doc.
@@ -566,10 +574,11 @@ type adminResult struct {
 }
 
 type proposalRequest struct {
-	ctx     context.Context
-	id      uint64
-	payload []byte
-	done    chan proposalResult
+	ctx           context.Context
+	id            uint64
+	payload       []byte
+	payloadDigest [32]byte
+	done          chan proposalResult
 }
 
 type proposalResult struct {
@@ -640,10 +649,11 @@ type preparedOpenState struct {
 // engine immediately. Multi-node startup returns after the local node is
 // running; leadership is established asynchronously through raft transport.
 func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
-	prepared, err := prepareOpenState(cfg)
+	prepared, guard, err := prepareBaselineOwnedOpen(cfg)
 	if err != nil {
 		return nil, err
 	}
+	defer guard.abandon()
 	rawNode, initialApplied, rawNodeApplied, err := recoveredRawNodeForOpen(prepared)
 	if err != nil {
 		_ = closePersist(prepared.disk.Persist)
@@ -669,8 +679,11 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 	}()
 
 	engine := &Engine{
+		baselineStartupGuard:    guard,
 		recoveredAdmission:      prepared.cfg.RecoveredAdmission,
 		admissionChanged:        prepared.cfg.AdmissionChanged,
+		nativeAdmission:         prepared.cfg.NativeAdmission,
+		groupID:                 prepared.cfg.GroupID,
 		recoveredIdentity:       copyWALIdentity([]*WALIdentity{prepared.disk.VerifiedIdentity}),
 		nodeID:                  prepared.cfg.NodeID,
 		localID:                 prepared.cfg.LocalID,
@@ -723,6 +736,7 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		_ = closePersist(prepared.disk.Persist)
 		return nil, err
 	}
+	engine.nativeConfigurationIndex = engine.currentConfigIndex()
 	engine.initTransport(prepared.cfg)
 	engine.initSnapshotWorker()
 	engine.refreshStatus()
@@ -743,6 +757,7 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 	// slow LinearizableRead path -- but make the degradation visible.
 	engine.warnIfLeaseReadDisabled()
 
+	guard.transferred = true
 	go engine.run()
 
 	openedEngine, err := waitForOpen(ctx, engine, len(prepared.peers) == 1)
@@ -1127,11 +1142,9 @@ func (e *Engine) propose(ctx context.Context, data []byte) (*raftengine.Proposal
 		return nil, errors.WithStack(errNilEngine)
 	}
 
-	req := proposalRequest{
-		ctx:     ctx,
-		id:      e.nextID(),
-		payload: append([]byte(nil), data...),
-		done:    make(chan proposalResult, 1),
+	req, err := e.ownedNativeProposal(ctx, data)
+	if err != nil {
+		return nil, err
 	}
 
 	select {
@@ -1147,10 +1160,7 @@ func (e *Engine) propose(ctx context.Context, data []byte) (*raftengine.Proposal
 		e.cancelPendingProposal(req.id)
 		return nil, errors.WithStack(ctx.Err())
 	case res := <-req.done:
-		if res.err != nil {
-			return nil, res.err
-		}
-		return res.result, nil
+		return e.nativeProposalResult(req.ctx, res)
 	}
 }
 
@@ -1627,6 +1637,9 @@ func (e *Engine) submitRead(ctx context.Context, waitApplied bool) (uint64, erro
 		if res.err != nil {
 			return 0, res.err
 		}
+		if err := e.validateNativeResult(ctx); err != nil {
+			return 0, err
+		}
 		return res.index, nil
 	}
 }
@@ -1790,6 +1803,9 @@ func (e *Engine) submitAdminEx(ctx context.Context, req adminRequest) (adminResu
 		if res.err != nil {
 			return adminResult{}, res.err
 		}
+		if err := e.validateNativeResult(ctx); err != nil {
+			return adminResult{}, err
+		}
 		return res, nil
 	}
 }
@@ -1813,7 +1829,7 @@ func (e *Engine) waitForLeadershipTransfer(ctx context.Context, target Peer) err
 			return err
 		}
 		if done {
-			return nil
+			return e.validateNativeResult(ctx)
 		}
 		select {
 		case <-ctx.Done():
@@ -1860,6 +1876,11 @@ func (e *Engine) checkLeadershipTransfer(ctx context.Context, target Peer, sawPe
 
 func (e *Engine) run() {
 	defer close(e.doneCh)
+	defer func() {
+		if e.baselineStartupGuard != nil {
+			_ = e.baselineStartupGuard.Close()
+		}
+	}()
 
 	ticker := time.NewTicker(e.tickInterval)
 	defer ticker.Stop()
@@ -1906,7 +1927,7 @@ func (e *Engine) startup() error {
 	if !e.shouldCampaignSingleNode() {
 		return nil
 	}
-	if err := e.rawNode.Campaign(); err != nil {
+	if err := e.withNative(context.Background(), nil, e.rawNode.Campaign); err != nil {
 		return errors.WithStack(err)
 	}
 	return e.drainReady()
@@ -1940,7 +1961,9 @@ func (e *Engine) handleBlockingEvent(tick <-chan time.Time) (bool, error) { //no
 	case <-e.closeCh:
 		return false, nil
 	case <-tick:
-		e.rawNode.Tick()
+		if err := e.withNative(context.Background(), nil, func() error { e.rawNode.Tick(); return nil }); err != nil {
+			return false, err
+		}
 	case req := <-e.proposeCh:
 		e.handleProposal(req)
 	case req := <-e.readCh:
@@ -2025,10 +2048,14 @@ func (e *Engine) handleDispatchReport(report dispatchReport) {
 		if report.snapshotFinish {
 			status = etcdraft.SnapshotFinish
 		}
-		e.rawNode.ReportSnapshot(report.to, status)
+		if err := e.withNative(context.Background(), nil, func() error { e.rawNode.ReportSnapshot(report.to, status); return nil }); err != nil {
+			e.fail(err)
+		}
 		return
 	}
-	e.rawNode.ReportUnreachable(report.to)
+	if err := e.withNative(context.Background(), nil, func() error { e.rawNode.ReportUnreachable(report.to); return nil }); err != nil {
+		e.fail(err)
+	}
 }
 
 // postDispatchReport delivers a dispatch outcome to the event loop without
@@ -2085,7 +2112,11 @@ func (e *Engine) handleProposal(req proposalRequest) {
 		return
 	}
 	e.storePendingProposal(req)
-	if err := e.rawNode.Propose(encodeProposalEnvelope(req.id, req.payload)); err != nil {
+	request := &raftengine.NativeRequest{Operation: raftengine.NativeProposal, Payload: req.payload, PayloadDigest: req.payloadDigest}
+	envelope := encodeProposalEnvelope(req.id, req.payload)
+	if err := e.withNative(req.ctx, request, func() error {
+		return e.rawNode.Propose(envelope)
+	}); err != nil {
 		e.cancelPendingProposal(req.id)
 		req.done <- proposalResult{err: errors.WithStack(err)}
 	}
@@ -2111,7 +2142,14 @@ func (e *Engine) handleRead(req readRequest) {
 		return
 	}
 	e.storePendingRead(req)
-	e.rawNode.ReadIndex(encodeReadContext(req.id))
+	request := &raftengine.NativeRequest{Operation: raftengine.NativeReadIndex}
+	if err := e.withNative(req.ctx, request, func() error {
+		e.rawNode.ReadIndex(encodeReadContext(req.id))
+		return nil
+	}); err != nil {
+		e.cancelPendingRead(req.id)
+		req.done <- readResult{err: err}
+	}
 }
 
 func (e *Engine) handleAdmin(req adminRequest) {
@@ -2233,7 +2271,8 @@ func (e *Engine) proposeMembershipChange(req adminRequest, changeType raftpb.Con
 		return
 	}
 	lastIndex, _ := e.storage.LastIndex()
-	if err := e.rawNode.ProposeConfChange(&cc); err != nil {
+	request := &raftengine.NativeRequest{Operation: raftengine.NativeMembership, Payload: contextBytes}
+	if err := e.withNative(req.ctx, request, func() error { return e.rawNode.ProposeConfChange(&cc) }); err != nil {
 		e.cancelPendingConfig(req.id)
 		req.done <- adminResult{err: errors.WithStack(err)}
 		return
@@ -2296,7 +2335,13 @@ func (e *Engine) transferLeadershipToTargets(req adminRequest, targets []Peer, b
 			lastErr = err
 			continue
 		}
-		e.rawNode.TransferLeader(target.NodeID)
+		request := &raftengine.NativeRequest{Operation: raftengine.NativeTransfer}
+		if err := e.withNative(req.ctx, request, func() error {
+			e.rawNode.TransferLeader(target.NodeID)
+			return nil
+		}); err != nil {
+			return Peer{}, err
+		}
 		basic = e.rawNode.BasicStatus()
 		// TransferLeader is processed synchronously inside rawNode.TransferLeader.
 		// If raft accepted the request, r.leadTransferee now equals target.NodeID.
@@ -2347,7 +2392,9 @@ func (e *Engine) drainReady() error {
 		}
 		e.releaseProtectedReceivedFSMSnapshotsUpTo(e.appliedIndex.Load())
 		e.handleReadStates(rd.ReadStates)
-		e.rawNode.Advance(rd)
+		if err := e.withNative(context.Background(), nil, func() error { e.rawNode.Advance(rd); return nil }); err != nil {
+			return err
+		}
 		e.flushDeferredDispatchReports()
 		if err := e.maybePersistLocalSnapshot(); err != nil {
 			return err
@@ -2417,21 +2464,23 @@ func (e *Engine) applyReadyLocked(rd etcdraft.Ready) error {
 }
 
 func (e *Engine) handleStep(msg raftpb.Message) {
-	e.handleStepWithAdmission(msg, func(action func() error) error { return action() })
+	e.handleStepWithAdmission(msg, &raftengine.NativeRequest{Operation: raftengine.NativePeerStep}, func(action func() error) error { return action() })
 }
 
-func (e *Engine) handleStepWithAdmission(msg raftpb.Message, admit func(func() error) error) {
+func (e *Engine) handleStepWithAdmission(msg raftpb.Message, request *raftengine.NativeRequest, admit func(func() error) error) {
 	if e.rawNode == nil {
 		return
 	}
 	commitBeforeStep := e.rawNode.Status().GetCommit()
-	err := admit(func() error {
-		e.recordLeaderContact(msg)
-		e.recordQuorumAck(msg)
-		return e.rawNode.Step(&msg)
+	err := e.mutateNative(context.Background(), request, msg.GetType() == raftpb.MsgSnap, func() error {
+		return admit(func() error {
+			e.recordLeaderContact(msg)
+			e.recordQuorumAck(msg)
+			return e.rawNode.Step(&msg)
+		})
 	})
 	if err != nil {
-		if errors.Is(err, peersession.ErrDenied) || errors.Is(err, context.Canceled) {
+		if errors.Is(err, peersession.ErrDenied) || errors.Is(err, raftengine.ErrNativeAdmissionDenied) || errors.Is(err, context.Canceled) {
 			e.removeReceivedFSMSnapshotToken(msg)
 			e.unprotectReceivedFSMSnapshotToken(msg)
 			return
@@ -2751,7 +2800,13 @@ func (e *Engine) applyReadySnapshotLocked(snapshot *raftpb.Snapshot) error {
 	if err != nil {
 		return err
 	}
-	if err := e.storage.ApplySnapshot(snapshot); err != nil {
+	if err := e.withNative(context.Background(), nil, func() error {
+		if err := e.storage.ApplySnapshot(snapshot); err != nil {
+			return errors.WithStack(err)
+		}
+		e.nativeConfigurationIndex = configurationIndex
+		return nil
+	}); err != nil {
 		return errors.Wrapf(err, "apply snapshot to raft storage index=%d term=%d",
 			snapshot.GetMetadata().GetIndex(), snapshot.GetMetadata().GetTerm())
 	}
@@ -3078,7 +3133,10 @@ func (e *Engine) applyConfChangeCommitted(entry raftpb.Entry) error {
 	if err := e.beforeConfigurationChange(); err != nil {
 		return err
 	}
-	confState := e.rawNode.ApplyConfChange(&cc)
+	confState, err := e.applyNativeConfChange(&cc, entry.GetIndex())
+	if err != nil {
+		return err
+	}
 	nextPeers, err := e.nextPeersAfterConfigChange(cc.GetType(), cc.GetNodeId(), cc.GetContext(), confStateValue(confState))
 	if err != nil {
 		return errors.Wrapf(err, "build peer inventory for config change index=%d", entry.GetIndex())
@@ -3107,7 +3165,10 @@ func (e *Engine) applyConfChangeV2Committed(entry raftpb.Entry) error {
 	if err := e.beforeConfigurationChange(); err != nil {
 		return err
 	}
-	confState := e.rawNode.ApplyConfChange(&cc)
+	confState, err := e.applyNativeConfChange(&cc, entry.GetIndex())
+	if err != nil {
+		return err
+	}
 	nextPeers, err := e.nextPeersAfterConfigChangeV2(cc, confStateValue(confState))
 	if err != nil {
 		return errors.Wrapf(err, "build peer inventory for config change v2 index=%d", entry.GetIndex())
@@ -3236,8 +3297,13 @@ func (e *Engine) applyNormalEntry(entry raftpb.Entry, dropIfNonVolatile bool) (a
 	// volatile entry type that also persists. Claude #934 round 7
 	// finding R7-F1.
 	if !dropIfNonVolatile {
+		clearConfiguration := e.deliverApplyNativeConfiguration()
+		defer clearConfiguration()
 		clearIdentity := e.deliverApplyIdentity(entry, payload)
 		defer clearIdentity()
+	}
+	if err := e.invalidateBeforeBootstrapPolicy(payload); err != nil {
+		return nil, err
 	}
 	return e.fsm.Apply(payload), nil
 }
@@ -4650,6 +4716,9 @@ func inboundQueueCapacity(peerCount, maxInflight int) int {
 }
 
 func validateConfig(cfg OpenConfig) error {
+	if err := validateNativeAdmissionConfig(cfg); err != nil {
+		return err
+	}
 	switch {
 	case cfg.NodeID == 0:
 		return errors.WithStack(errNodeIDRequired)

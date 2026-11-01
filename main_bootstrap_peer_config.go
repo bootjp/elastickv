@@ -14,6 +14,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/bootjp/elastickv/internal/peersession"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/cockroachdb/errors"
@@ -21,20 +22,25 @@ import (
 
 const bootstrapPeerConfigLimit = 16 << 20
 const bootstrapPeerMaxDepth = 4
+const bootstrapMemberIDJSONField = "member_id"
 
 type bootstrapPeerConfig struct {
 	local                peersession.Node
 	provisions           []peersession.Provision
 	serverTLS, clientTLS *tls.Config
+	startupToken         string
+	activation           []byte
 }
 
 type bootstrapPeerJSON struct {
-	Cluster string                    `json:"cluster_uuid"`
-	Local   uint64                    `json:"local_member"`
-	Members []bootstrapPeerMemberJSON `json:"members"`
-	CA      string                    `json:"ca_file"`
-	Cert    string                    `json:"cert_file"`
-	Key     string                    `json:"key_file"`
+	Cluster          string                    `json:"cluster_uuid"`
+	Local            uint64                    `json:"local_member"`
+	Members          []bootstrapPeerMemberJSON `json:"members"`
+	CA               string                    `json:"ca_file"`
+	Cert             string                    `json:"cert_file"`
+	Key              string                    `json:"key_file"`
+	StartupTokenFile string                    `json:"startup_token_file"`
+	ActivationFile   string                    `json:"activation_file"`
 }
 
 type bootstrapPeerMemberJSON struct {
@@ -117,7 +123,7 @@ func bootstrapReadKey(d *json.Decoder, seen map[string]bool) error {
 
 func bootstrapJSONKey(key string) bool {
 	switch key {
-	case "cluster_uuid", "local_member", "members", "ca_file", "cert_file", "key_file", "member_id", "address", "public_key_sha256", "groups":
+	case "cluster_uuid", "local_member", "members", "ca_file", "cert_file", "key_file", "startup_token_file", "activation_file", bootstrapMemberIDJSONField, "address", "public_key_sha256", "groups":
 		return true
 	default:
 		return false
@@ -153,10 +159,34 @@ func buildBootstrapPeerConfig(raw bootstrapPeerJSON) (*bootstrapPeerConfig, erro
 	if out.local.Member == 0 {
 		return nil, errors.New("local member not provisioned")
 	}
-	if err = out.loadTLS(raw); err != nil {
+	if err = out.loadRuntimeCredentials(raw); err != nil {
 		return nil, err
 	}
 	return out, nil
+}
+
+func (out *bootstrapPeerConfig) loadRuntimeCredentials(raw bootstrapPeerJSON) error {
+	if err := out.loadTLS(raw); err != nil {
+		return err
+	}
+	if raw.StartupTokenFile != "" {
+		token, err := internalutil.LoadBearerTokenFile(raw.StartupTokenFile, adminTokenMaxBytes, "startup token")
+		if err != nil {
+			return errors.Wrap(err, "load protected startup token")
+		}
+		out.startupToken = token
+	}
+	if raw.ActivationFile != "" {
+		data, err := readBootstrapOperatorInput(raw.ActivationFile)
+		if err != nil {
+			return err
+		}
+		if _, matched, err := raftbootstrap.ParseActivationCommand(data); err != nil || !matched {
+			return errors.Join(raftbootstrap.ErrInvalid, err)
+		}
+		out.activation = data
+	}
+	return nil
 }
 
 func bootstrapDuplicatePeer(id, address, key bool) bool { return id || address || key }

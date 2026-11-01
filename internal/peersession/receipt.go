@@ -18,6 +18,15 @@ type Receipt struct {
 	method  string
 }
 
+// LocalGeneration is the local projection sealed into the accepted session.
+// It is not the generation asserted by the remote peer.
+func (r *Receipt) LocalGeneration() uint64 {
+	if r == nil || r.handle == nil || r.handle.s == nil {
+		return 0
+	}
+	return r.handle.s.local.Generation
+}
+
 func (r *Receipt) Check(ctx context.Context) error {
 	if r == nil || r.handle == nil {
 		return ErrDenied

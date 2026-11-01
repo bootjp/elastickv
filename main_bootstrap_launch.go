@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"path/filepath"
 
@@ -13,15 +14,15 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-// Do not register a CLI flag until maintenance/control attempts share the
-// runtime's revocable admission and owned cancellation/join boundaries.
-var raftBootstrapPeerConfigDir = new(string)
+// This opt-in requires explicit accepted-baseline preparation for every group.
+var raftBootstrapPeerConfigDir = flag.String("raftBootstrapPeerConfigDir", "", "Directory of prepared protected Raft group peer configurations")
 
 type groupBootstrapSpec struct {
 	config *bootstrapPeerConfig
 	files  *raftbootstrap.Store
 	intent raftbootstrap.Intent
 	dir    string
+	domain *bootstrapDomain
 }
 
 func validateProtectedBootstrapDomain(raftID, baseDir string, groups []groupSpec, multi bool) error {
@@ -30,9 +31,6 @@ func validateProtectedBootstrapDomain(raftID, baseDir string, groups []groupSpec
 	}
 	var cluster raftbootstrap.UUID
 	for _, group := range groups {
-		if group.id == dedicatedTSORaftGroupID {
-			return errors.New("protected timestamp-group policy recovery is not implemented; refusing a partially protected domain")
-		}
 		spec, err := loadGroupBootstrapSpec(raftID, group, groupDataDir(baseDir, raftID, group.id, multi))
 		if err != nil {
 			return err
@@ -43,6 +41,52 @@ func validateProtectedBootstrapDomain(raftID, baseDir string, groups []groupSpec
 		cluster = spec.intent.Identity.Cluster
 	}
 	return nil
+}
+
+func loadProtectedBootstrapDomain(raftID, baseDir string, groups []groupSpec, multi bool) (map[uint64]*groupBootstrapSpec, *bootstrapDomain, error) {
+	if *raftBootstrapPeerConfigDir == "" {
+		return nil, nil, nil
+	}
+	if err := validateProtectedBootstrapDomain(raftID, baseDir, groups, multi); err != nil {
+		return nil, nil, err
+	}
+	specs := make(map[uint64]*groupBootstrapSpec, len(groups))
+	var cluster raftbootstrap.UUID
+	for _, group := range groups {
+		spec, err := loadGroupBootstrapSpec(raftID, group, groupDataDir(baseDir, raftID, group.id, multi))
+		if err != nil {
+			return nil, nil, err
+		}
+		specs[group.id], cluster = spec, spec.intent.Identity.Cluster
+	}
+	domain, err := newBootstrapDomain(cluster, groups)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := attachBootstrapDomain(specs, domain); err != nil {
+		domain.admission.Close()
+		return nil, nil, err
+	}
+	return specs, domain, nil
+}
+
+func attachBootstrapDomain(specs map[uint64]*groupBootstrapSpec, domain *bootstrapDomain) error {
+	for _, spec := range specs {
+		if spec.config.startupToken == "" || (domain.startupToken != "" && domain.startupToken != spec.config.startupToken) {
+			return errors.New("all protected groups require the same dedicated startup token")
+		}
+		domain.startupToken = spec.config.startupToken
+		spec.domain = domain
+	}
+	return validateBootstrapStartupToken(domain.startupToken)
+}
+
+func (b shardGroupBuilder) bootstrapSpecForGroup(id uint64) (*groupBootstrapSpec, error) {
+	spec := b.bootstrapSpecs[id]
+	if *raftBootstrapPeerConfigDir != "" && (spec == nil || spec.domain == nil) {
+		return nil, errors.New("protected group missing the process-wide bootstrap domain")
+	}
+	return spec, nil
 }
 
 func loadGroupBootstrapSpec(raftID string, group groupSpec, dir string) (*groupBootstrapSpec, error) {
@@ -62,8 +106,11 @@ func loadGroupBootstrapSpec(raftID string, group groupSpec, dir string) (*groupB
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	if inspection.Marker != raftbootstrap.MarkerRequired || inspection.Intent == nil || inspection.Intent.Floor.ActivationIndex == 0 {
-		return nil, errors.New("protected recovery requires an activated durable intent and exact required marker; legacy/cold activation needs the explicit rollout protocol")
+	if inspection.Marker != raftbootstrap.MarkerRequired || inspection.Intent == nil {
+		return nil, errors.New("protected recovery requires a durable intent and exact required marker; legacy activation needs explicit offline preparation")
+	}
+	if inspection.Intent.Floor.ActivationIndex == 0 && inspection.Intent.BaselineKind != raftbootstrap.Accepted {
+		return nil, errors.New("initial protected recovery requires the explicit accepted-baseline rollout")
 	}
 	return &groupBootstrapSpec{config: config, files: files, intent: *inspection.Intent, dir: dir}, nil
 }
@@ -81,7 +128,7 @@ func bootstrapFactoryForGroup(base raftengine.Factory, spec *groupBootstrapSpec,
 	if !ok {
 		return nil, errors.New("protected recovery requires the native etcd factory")
 	}
-	setup := newBootstrapStartupForGroup(spec.config, spec.files, spec.intent, st, nil)
+	setup := newBootstrapStartupForGroup(spec.config, spec.files, spec.intent, st, bootstrapPublicGRPCMethods(), spec.domain)
 	return &protectedGroupFactory{Factory: native.WithBootstrapStartup(setup), spec: spec}, nil
 }
 
@@ -124,14 +171,28 @@ func loadProtectedCatalog(ctx context.Context, runtimes []*raftGroupRuntime, id 
 		if runtime == nil || runtime.spec.id != id || runtime.publicReady == nil {
 			continue
 		}
-		snapshot, err := catalog.Snapshot(ctx)
-		if err != nil {
-			return true, errors.WithStack(err)
-		}
-		if snapshot.Version == 0 || len(snapshot.Routes) == 0 {
-			return true, errors.New("protected catalog is not initialized by a committed guarded entry")
-		}
-		return true, errors.WithStack(engine.ApplySnapshot(snapshot))
+		return true, loadProtectedRuntimeCatalog(ctx, runtime, catalog, engine)
 	}
 	return false, nil
+}
+
+func loadProtectedRuntimeCatalog(ctx context.Context, runtime *raftGroupRuntime, catalog *distribution.CatalogStore, engine *distribution.Engine) error {
+	if runtime.bootstrapDomain == nil {
+		return errors.New("protected catalog lacks the process-wide admission domain")
+	}
+	ticket, err := runtime.bootstrapDomain.admission.Ticket(runtime.spec.id)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	snapshot, err := catalog.Snapshot(ctx)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if snapshot.Version == 0 || len(snapshot.Routes) == 0 {
+		return errors.New("protected catalog is not initialized by a committed guarded entry")
+	}
+	if err := engine.ApplySnapshot(snapshot); err != nil {
+		return errors.WithStack(err)
+	}
+	return runtime.bootstrapDomain.catalogLoaded(ticket)
 }
