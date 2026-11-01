@@ -17,6 +17,7 @@ import (
 
 const (
 	IntentFile                 = "bootstrap-intent"
+	PolicyFile                 = "bootstrap-policy"
 	MarkerFile                 = "raft-engine"
 	MarkerV1                   = "etcd-bootstrap-v1\n"
 	MaxFileSize                = 16 << 20

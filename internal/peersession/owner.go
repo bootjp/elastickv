@@ -114,6 +114,16 @@ func provisionMap(local Node, records []Provision) (map[raftbootstrap.Digest]Pro
 }
 
 func (o *Owner) configureMethods(cfg Config) error {
+	if cfg.MethodFactory != nil {
+		if len(cfg.Methods) != 0 {
+			return ErrFormat
+		}
+		methods, err := cfg.MethodFactory(o)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		cfg.Methods = methods
+	}
 	for _, m := range cfg.Methods {
 		if !validMethod(m.Name) || isHandshake(m.Name) || !validDecoders(m) {
 			return ErrFormat
@@ -145,6 +155,22 @@ func validMethod(s string) bool {
 	}
 	service, method, ok := strings.Cut(s[1:], "/")
 	return ok && service != "" && method != "" && !strings.ContainsAny(s, " \t\r\n\x00") && !strings.Contains(method, "/")
+}
+
+// GroupProjection returns an owned copy of the locally published applied view.
+// It is decoder input, not enqueue permission: handles must still validate the
+// session generation at every send/receive and runtime admission boundary.
+func (o *Owner) GroupProjection(id uint64) (Group, bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.closed {
+		return Group{}, false
+	}
+	group, found := o.groups[id]
+	if !found {
+		return Group{}, false
+	}
+	return copyGroup(group), true
 }
 func isHandshake(m string) bool {
 	return m == wire.PeerSession_Begin_FullMethodName || m == wire.PeerSession_Finish_FullMethodName

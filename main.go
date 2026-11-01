@@ -2138,6 +2138,9 @@ func buildShardGroups(
 	// breaking the shared-cache invariant 6D-6c-1 relies on.
 	encWiring = encWiring.withDefaultedCache()
 	multi = effectiveMultiDataDirs(groups, multi)
+	if err := validateProtectedBootstrapDomain(raftID, raftDir, groups, multi); err != nil {
+		return nil, nil, err
+	}
 	builder := shardGroupBuilder{
 		raftID:                   raftID,
 		raftDir:                  raftDir,
@@ -2189,6 +2192,9 @@ type shardGroupBuilder struct {
 }
 
 func (b shardGroupBuilder) build(group groupSpec) (*raftGroupRuntime, *kv.ShardGroup, error) {
+	if group.id == dedicatedTSORaftGroupID && *raftBootstrapPeerConfigDir != "" {
+		return nil, nil, errors.New("protected timestamp-group policy recovery is not implemented; refusing a partially protected domain")
+	}
 	groupBootstrap, groupBootstrapServers, groupBootstrapSeed := bootstrapSettingsForGroup(b.bootstrapCfg, group.id, b.bootstrap)
 	observer := observerForGroup(b.proposalObserverForGroup, group.id)
 	if group.id == dedicatedTSORaftGroupID {
@@ -2210,12 +2216,21 @@ func (b shardGroupBuilder) buildDataGroup(
 	proposalObserver kv.ProposalObserver,
 ) (*raftGroupRuntime, *kv.ShardGroup, error) {
 	dir := groupDataDir(b.raftDir, b.raftID, group.id, b.multi)
+	bootstrapSpec, err := loadGroupBootstrapSpec(b.raftID, group, dir)
+	if err != nil {
+		return nil, nil, err
+	}
 	if err := os.MkdirAll(dir, dirPerm); err != nil {
 		return nil, nil, errors.Wrapf(err, "failed to create fsm store dir for group %d", group.id)
 	}
 	st, err := store.NewPebbleStore(filepath.Join(dir, "fsm.db"), b.encWiring.pebbleOptions()...)
 	if err != nil {
 		return nil, nil, errors.Wrapf(err, "failed to open pebble fsm store for group %d", group.id)
+	}
+	factory, err := bootstrapFactoryForGroup(b.factory, bootstrapSpec, st)
+	if err != nil {
+		_ = st.Close()
+		return nil, nil, err
 	}
 	reg, err := store.WriterRegistryFor(st)
 	if err != nil {
@@ -2233,7 +2248,7 @@ func (b shardGroupBuilder) buildDataGroup(
 	runtime, err := buildRuntimeForGroup(
 		b.raftID, group, b.raftDir, b.multi, bootstrap,
 		bootstrapServers, bootstrapSeed,
-		st, sm, b.factory, *raftJoinAsLearner,
+		st, sm, factory, *raftJoinAsLearner,
 	)
 	if err != nil {
 		_ = st.Close()
@@ -2806,7 +2821,7 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 		return err
 	}
 	roleStore := startupRoleStoreFromFlags(*adminEnabled)
-	publicKVGate := &startupPublicKVGate{}
+	publicKVGate := &startupPublicKVGate{blockRuntime: func() bool { return protectedRuntimesBlocked(in.runtimes) }}
 	if in.distServer != nil {
 		in.distServer.SetReadGate(publicKVGate.blocked)
 	}
@@ -3508,6 +3523,7 @@ func (c startupGatedCoordinator) NextAfter(ctx context.Context, min uint64) (uin
 type startupPublicKVGate struct {
 	ready        atomic.Bool
 	blockMutator func() bool
+	blockRuntime func() bool
 }
 
 func (g *startupPublicKVGate) markReady() {
@@ -3549,6 +3565,9 @@ func (g *startupPublicKVGate) blocked() bool {
 		return false
 	}
 	if !g.ready.Load() {
+		return true
+	}
+	if g.blockRuntime != nil && g.blockRuntime() {
 		return true
 	}
 	return g.blockMutator != nil && g.blockMutator()
@@ -4245,7 +4264,8 @@ func startRaftServers(
 		adapter.WithEncryptionAdminCutoverBarrier(encWiring.raftEnvelope.barrier()),
 	)
 	for _, rt := range runtimes {
-		gs := grpc.NewServer(raftGRPCServerOptions(adminGRPCOpts)...)
+		serverOptions := append(raftGRPCServerOptions(adminGRPCOpts), rt.transportServerOptions...)
+		gs := grpc.NewServer(serverOptions...)
 		trx := newInternalMigrationTransaction(proposerForGroup(rt, shardGroups), observerForGroup(proposalObserverForGroup, rt.spec.id), rt.store, rt.spec.id)
 		grpcSvc := adapter.NewGRPCServer(shardStore, coordinate)
 		pb.RegisterRawKVServer(gs, grpcSvc)
@@ -4590,6 +4610,9 @@ func setupDistributionCatalog(
 	distCatalog := distributionCatalogStoreForGroup(runtimes, catalogGroupID)
 	if distCatalog == nil {
 		return nil, errors.WithStack(errors.Newf("distribution catalog store is not available for group %d", catalogGroupID))
+	}
+	if handled, err := loadProtectedCatalog(ctx, runtimes, catalogGroupID, distCatalog, engine); handled {
+		return distCatalog, err
 	}
 	// EnsureCatalogSnapshot may Save through the direct (non-raft) write
 	// path. When the §7.1 storage envelope is active and this load's

@@ -30,8 +30,10 @@ type raftGroupRuntime struct {
 	store        store.MVCCStore
 	stateMachine raftengine.StateMachine
 
-	registerTransport func(grpc.ServiceRegistrar)
-	closeFactory      func() error // releases factory-created resources (transport, stores)
+	registerTransport      func(grpc.ServiceRegistrar)
+	transportServerOptions []grpc.ServerOption
+	publicReady            func() bool
+	closeFactory           func() error // releases factory-created resources (transport, stores)
 }
 
 // snapshotEngine returns the current engine reference under engineMu.
@@ -241,11 +243,12 @@ func buildRuntimeForGroup(
 ) (*raftGroupRuntime, error) {
 	dir := groupDataDir(baseDir, raftID, group.id, multi)
 	engineType := raftEngineType(factory.EngineType())
-	if err := ensureRaftEngineDataDir(dir, engineType); err != nil {
+	if err := ensureRaftEngineDataDirForFactory(dir, engineType, factory); err != nil {
 		return nil, err
 	}
 
 	result, err := factory.Create(raftengine.FactoryConfig{
+		GroupID:       group.id,
 		LocalID:       raftID,
 		LocalAddress:  group.address,
 		DataDir:       dir,
@@ -260,11 +263,22 @@ func buildRuntimeForGroup(
 	}
 
 	return &raftGroupRuntime{
-		spec:              group,
-		engine:            result.Engine,
-		store:             st,
-		stateMachine:      sm,
-		registerTransport: result.RegisterTransport,
-		closeFactory:      result.Close,
+		spec:                   group,
+		engine:                 result.Engine,
+		store:                  st,
+		stateMachine:           sm,
+		registerTransport:      result.RegisterTransport,
+		transportServerOptions: result.ServerOptions,
+		publicReady:            result.PublicReady,
+		closeFactory:           result.Close,
 	}, nil
+}
+
+func ensureRaftEngineDataDirForFactory(dir string, engineType raftEngineType, factory raftengine.Factory) error {
+	if protected, ok := factory.(interface {
+		PreflightRaftDataDir(string, raftEngineType) error
+	}); ok {
+		return errors.WithStack(protected.PreflightRaftDataDir(dir, engineType))
+	}
+	return ensureRaftEngineDataDir(dir, engineType)
 }

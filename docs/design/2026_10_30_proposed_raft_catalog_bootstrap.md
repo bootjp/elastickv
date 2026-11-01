@@ -1028,6 +1028,35 @@ protocol choices or evidence that any implementation has passed them.
 
 ## Implementation checkpoint
 
+### Protected Recovery Integration In Progress
+
+The current working branch adds explicit per-listener mTLS provisioning,
+identity-bound native WAL metadata, a synchronous native post-replay admission
+boundary, protected FSM policy loading, and session-aware transport dialing.
+The group factory carries the session service and TLS/interceptor options into
+the existing listener while retaining its business authorization gates.
+Required-format preflight never rewrites a legacy marker or invents missing WAL
+identity. Every configured group is checked before the first engine is opened.
+
+The internal startup configuration reads `group-<id>.json` and currently
+requires an already activated intent and identity-bound native WAL. It is a
+recovery integration surface, not an upgrade command or cold bootstrap path.
+Recovered policy is read from protected FSM metadata, not `bootstrap-policy`.
+Native identity, applied index, configuration and peer addresses must agree.
+Only IdentityReady is published; the existing public gate additionally requires
+the runtime's revocable DataReady predicate. A protected version-zero catalog
+is rejected rather than initialized by direct local Save. The CLI flag is not
+registered while maintenance/control attempts still bypass runtime admission;
+this unfinished path must not be exposed as an operational rollout switch.
+
+This does not complete runtime admission. TSO policy recovery is still rejected
+instead of starting a partially protected domain. DataReady/control admission,
+cross-group rotation dependencies, background-writer admission, protected
+membership reservations and enqueue/install receipt rechecks remain required.
+The legacy startup regression remains separately retained and red. No usable
+production rollout, complete bootstrap, or completion of the parent isolation
+audit is claimed by this integration checkpoint.
+
 The branch now contains `internal/raftbootstrap`: strict canonical,
 checksummed intent parsing and intent-before-marker durable publication.
 Each file uses an exclusive same-directory temporary file, mode 0600,

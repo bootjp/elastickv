@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 
@@ -58,6 +59,113 @@ func TestPublishAndInspect(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, entries, 2)
 	require.NoError(t, s.Publish(in, e), "idempotent retry still syncs both files")
+}
+
+func TestLoadIntentIsStrictAndDoesNotClassify(t *testing.T) {
+	in, _ := fixture(t)
+	dir := t.TempDir()
+	s := NewStore(dir)
+	_, present, err := s.LoadIntent()
+	require.NoError(t, err)
+	require.False(t, present)
+
+	encoded, err := MarshalIntent(in)
+	require.NoError(t, err)
+	put(t, dir, IntentFile, encoded)
+	got, present, err := s.LoadIntent()
+	require.NoError(t, err)
+	require.True(t, present)
+	require.Equal(t, in.Identity, got.Identity)
+	require.Equal(t, in.BaselineKind, got.BaselineKind)
+	require.Equal(t, in.Minimum, got.Minimum)
+	require.Equal(t, in.Floor, got.Floor)
+	require.Equal(t, in.Baseline.Index, got.Baseline.Index)
+	canonical, err := canonicalIntent(in)
+	require.NoError(t, err)
+	canonical.Baseline.State.VotersOutgoing = []uint64{}
+	canonical.Baseline.State.LearnersNext = []uint64{}
+	require.Equal(t, canonical, got)
+
+	encoded[len(encoded)-1] ^= 1
+	put(t, dir, IntentFile, encoded)
+	_, present, err = s.LoadIntent()
+	require.True(t, present)
+	require.ErrorIs(t, err, ErrInvalid)
+}
+
+func TestPolicyStoreInitializeAndAdvance(t *testing.T) {
+	policy := policyFixture(t)
+	dir := t.TempDir()
+	s := NewStore(dir)
+	require.NoError(t, s.InitializePolicy(policy))
+	require.NoError(t, s.InitializePolicy(policy), "identical initialization is idempotent")
+	other := policyFixture(t)
+	other.Generation++
+	other.Reservation.Expected.Generation++
+	require.ErrorIs(t, s.InitializePolicy(other), ErrInconsistent, "initialization cannot replace existing policy")
+	loaded, present, err := s.LoadPolicy()
+	require.NoError(t, err)
+	require.True(t, present)
+	want, err := canonicalPolicy(policy)
+	require.NoError(t, err)
+	wantDigest, err := PolicyDigest(want)
+	require.NoError(t, err)
+	loadedDigest, err := PolicyDigest(loaded)
+	require.NoError(t, err)
+	require.Equal(t, wantDigest, loadedDigest)
+
+	witness, err := loaded.Witness()
+	require.NoError(t, err)
+	next := loaded
+	next.Reservation = nil
+	next.Generation++
+	next.Configuration = loaded.Reservation.Target
+	next.LastConfigurationIndex = next.Configuration.Index
+	next.TerminalOperations = append(slices.Clone(loaded.TerminalOperations), TerminalMembershipOperation{
+		ID: loaded.Reservation.ID, Outcome: MembershipCompleted, Member: loaded.Reservation.Candidate.ID,
+	})
+	wantNext, err := canonicalPolicy(next)
+	require.NoError(t, err)
+	require.NoError(t, s.AdvancePolicy(witness, next))
+
+	committed, present, err := s.LoadPolicy()
+	require.NoError(t, err)
+	require.True(t, present)
+	nextDigest, err := PolicyDigest(wantNext)
+	require.NoError(t, err)
+	gotDigest, err := PolicyDigest(committed)
+	require.NoError(t, err)
+	require.Equal(t, nextDigest, gotDigest)
+	before := diskBytes(t, dir, PolicyFile)
+	require.ErrorIs(t, s.AdvancePolicy(witness, next), ErrInconsistent, "stale witness must not overwrite policy")
+	require.Equal(t, before, diskBytes(t, dir, PolicyFile))
+
+	invalid := next
+	invalid.Generation++
+	invalid.TerminalOperations = slices.Clone(next.TerminalOperations)
+	invalid.TerminalOperations[len(invalid.TerminalOperations)-1].ID.OperationID[0]++
+	committedWitness, err := committed.Witness()
+	require.NoError(t, err)
+	require.ErrorIs(t, s.AdvancePolicy(committedWitness, invalid), ErrInvalid)
+	require.Equal(t, before, diskBytes(t, dir, PolicyFile))
+}
+
+func TestPolicyStoreDoesNotOverwriteCorruptState(t *testing.T) {
+	policy := policyFixture(t)
+	dir := t.TempDir()
+	s := NewStore(dir)
+	corrupt := []byte("not-a-policy")
+	put(t, dir, PolicyFile, corrupt)
+
+	require.Error(t, s.InitializePolicy(policy))
+	require.Equal(t, corrupt, diskBytes(t, dir, PolicyFile))
+	_, present, err := s.LoadPolicy()
+	require.ErrorIs(t, err, ErrInvalid)
+	require.True(t, present)
+
+	err = s.AdvancePolicy(Witness{}, policy)
+	require.Error(t, err)
+	require.Equal(t, corrupt, diskBytes(t, dir, PolicyFile))
 }
 
 func TestClassifyPartialPairs(t *testing.T) {

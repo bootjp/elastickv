@@ -256,13 +256,21 @@ type Snapshot = raftengine.Snapshot
 type StateMachine = raftengine.StateMachine
 
 type OpenConfig struct {
-	NodeID        uint64
-	LocalID       string
-	LocalAddress  string
-	DataDir       string
-	Peers         []Peer
-	BootstrapSeed []Peer
-	Bootstrap     bool
+	// RecoveredAdmission runs synchronously after native startup replay and
+	// durable applied-index publication, before inbound delivery is enabled.
+	// It requires independently bound native WAL identity; nil keeps legacy startup.
+	RecoveredAdmission func(RecoveredState) error
+	// AdmissionChanged synchronously revokes admission before native authority
+	// changes are published. It must not reopen admission or reenter the loop.
+	AdmissionChanged func()
+	NativeIdentity   *WALIdentity
+	NodeID           uint64
+	LocalID          string
+	LocalAddress     string
+	DataDir          string
+	Peers            []Peer
+	BootstrapSeed    []Peer
+	Bootstrap        bool
 	// JoinAsLearner mirrors raftengine.FactoryConfig.JoinAsLearner. The
 	// engine watches every post-apply ConfState and emits an
 	// ERROR-level alarm whenever the local node is in Voters while
@@ -302,13 +310,18 @@ type OpenConfig struct {
 }
 
 type Engine struct {
-	nodeID       uint64
-	localID      string
-	localAddress string
-	dataDir      string
-	fsmSnapDir   string
-	tickInterval time.Duration
-	electionTick int
+	recoveredAdmission func(RecoveredState) error
+	admissionChanged   func()
+	admissionDirty     bool // owned by the native loop, like RawNode
+	admissionPublished bool
+	recoveredIdentity  *WALIdentity
+	nodeID             uint64
+	localID            string
+	localAddress       string
+	dataDir            string
+	fsmSnapDir         string
+	tickInterval       time.Duration
+	electionTick       int
 	// joinAsLearner is captured from OpenConfig; consulted by
 	// alarmIfJoinedAsVoter on every post-apply ConfState. See §4.5 of
 	// the learner design doc.
@@ -628,15 +641,7 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	initialApplied := coldStartApplied(prepared.disk)
-	rawNodeApplied, err := rawNodeAppliedForOpen(prepared.disk.Storage, initialApplied, prepared.cfg)
-	if err != nil {
-		_ = closePersist(prepared.disk.Persist)
-		return nil, err
-	}
-
-	rawNode, err := newRawNode(prepared.cfg, prepared.disk.Storage, rawNodeApplied)
+	rawNode, initialApplied, rawNodeApplied, err := recoveredRawNodeForOpen(prepared)
 	if err != nil {
 		_ = closePersist(prepared.disk.Persist)
 		return nil, err
@@ -661,41 +666,44 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 	}()
 
 	engine := &Engine{
-		nodeID:           prepared.cfg.NodeID,
-		localID:          prepared.cfg.LocalID,
-		localAddress:     prepared.cfg.LocalAddress,
-		dataDir:          prepared.cfg.DataDir,
-		fsmSnapDir:       filepath.Join(prepared.cfg.DataDir, fsmSnapDirName),
-		tickInterval:     prepared.cfg.TickInterval,
-		electionTick:     prepared.cfg.ElectionTick,
-		joinAsLearner:    prepared.cfg.JoinAsLearner,
-		storage:          prepared.disk.Storage,
-		rawNode:          rawNode,
-		persist:          prepared.disk.Persist,
-		fsm:              prepared.cfg.StateMachine,
-		peers:            peerMap,
-		transport:        prepared.cfg.Transport,
-		raftCipher:       prepared.cfg.RaftCipher,
-		raftCutoverIndex: orInertCutover(prepared.cfg.RaftCutoverIndex),
-		proposeCh:        make(chan proposalRequest),
-		readCh:           make(chan readRequest),
-		adminCh:          make(chan adminRequest),
-		stepCh:           make(chan raftpb.Message, inboundQueueCap),
-		priorityStepCh:   make(chan raftpb.Message, priorityStepQueueCapacity),
-		dispatchReportCh: make(chan dispatchReport, inboundQueueCap),
-		closeCh:          make(chan struct{}),
-		doneCh:           make(chan struct{}),
-		startedCh:        make(chan struct{}),
-		leaderReady:      make(chan struct{}),
-		config:           configurationFromConfState(peerMap, confStateValue(prepared.disk.LocalSnap.GetMetadata().GetConfState())),
-		voterCount:       len(prepared.disk.LocalSnap.Metadata.GetConfState().GetVoters()),
-		isLearnerNode:    learnerSetFromConfState(confStateValue(prepared.disk.LocalSnap.GetMetadata().GetConfState())),
-		applied:          initialApplied,
-		dispatchCtx:      dispatchCtx,
-		dispatchCancel:   dispatchCancel,
-		pendingProposals: map[uint64]proposalRequest{},
-		pendingReads:     map[uint64]readRequest{},
-		pendingConfigs:   map[uint64]adminRequest{},
+		recoveredAdmission: prepared.cfg.RecoveredAdmission,
+		admissionChanged:   prepared.cfg.AdmissionChanged,
+		recoveredIdentity:  copyWALIdentity([]*WALIdentity{prepared.disk.VerifiedIdentity}),
+		nodeID:             prepared.cfg.NodeID,
+		localID:            prepared.cfg.LocalID,
+		localAddress:       prepared.cfg.LocalAddress,
+		dataDir:            prepared.cfg.DataDir,
+		fsmSnapDir:         filepath.Join(prepared.cfg.DataDir, fsmSnapDirName),
+		tickInterval:       prepared.cfg.TickInterval,
+		electionTick:       prepared.cfg.ElectionTick,
+		joinAsLearner:      prepared.cfg.JoinAsLearner,
+		storage:            prepared.disk.Storage,
+		rawNode:            rawNode,
+		persist:            prepared.disk.Persist,
+		fsm:                prepared.cfg.StateMachine,
+		peers:              peerMap,
+		transport:          prepared.cfg.Transport,
+		raftCipher:         prepared.cfg.RaftCipher,
+		raftCutoverIndex:   orInertCutover(prepared.cfg.RaftCutoverIndex),
+		proposeCh:          make(chan proposalRequest),
+		readCh:             make(chan readRequest),
+		adminCh:            make(chan adminRequest),
+		stepCh:             make(chan raftpb.Message, inboundQueueCap),
+		priorityStepCh:     make(chan raftpb.Message, priorityStepQueueCapacity),
+		dispatchReportCh:   make(chan dispatchReport, inboundQueueCap),
+		closeCh:            make(chan struct{}),
+		doneCh:             make(chan struct{}),
+		startedCh:          make(chan struct{}),
+		leaderReady:        make(chan struct{}),
+		config:             configurationFromConfState(peerMap, confStateValue(prepared.disk.LocalSnap.GetMetadata().GetConfState())),
+		voterCount:         len(prepared.disk.LocalSnap.Metadata.GetConfState().GetVoters()),
+		isLearnerNode:      learnerSetFromConfState(confStateValue(prepared.disk.LocalSnap.GetMetadata().GetConfState())),
+		applied:            initialApplied,
+		dispatchCtx:        dispatchCtx,
+		dispatchCancel:     dispatchCancel,
+		pendingProposals:   map[uint64]proposalRequest{},
+		pendingReads:       map[uint64]readRequest{},
+		pendingConfigs:     map[uint64]adminRequest{},
 		// Parse env-tunable retention/snapshot knobs once at Open. Both
 		// are consulted on hot paths (maybePersistLocalSnapshot runs per
 		// Ready-drain; purge runs after each snapshot persist) and the
@@ -1852,6 +1860,10 @@ func (e *Engine) run() {
 		e.fail(err)
 		return
 	}
+	if err := e.reconcileIdentityAdmission(); err != nil {
+		e.fail(err)
+		return
+	}
 	e.markStarted()
 
 	for {
@@ -2300,14 +2312,12 @@ func (e *Engine) checkGatedTransferTarget(req adminRequest, target Peer) error {
 func (e *Engine) drainReady() error {
 	for e.rawNode.HasReady() {
 		rd := e.rawNode.Ready()
+		e.invalidateNativeAuthority()
 		if err := e.persistReady(rd); err != nil {
 			return err
 		}
 		e.releaseIgnoredReceivedFSMSnapshotSteps(rd)
-		if err := e.sendReadyMessages(rd); err != nil {
-			return err
-		}
-		if err := e.applyCommitted(entryValues(rd.CommittedEntries)); err != nil {
+		if err := e.applyAndDispatchReady(rd); err != nil {
 			return err
 		}
 		e.releaseProtectedReceivedFSMSnapshotsUpTo(e.appliedIndex.Load())
@@ -2680,6 +2690,7 @@ func (e *Engine) applyReadySnapshotLocked(snapshot *raftpb.Snapshot) error {
 	if etcdraft.IsEmptySnap(snapshot) {
 		return nil
 	}
+	e.invalidateAdmission()
 	// etcdraft.IsEmptySnap only validates the raft metadata. This backend also
 	// requires FSM payload bytes so it can restore local state before applying
 	// the metadata snapshot to MemoryStorage.
@@ -3023,6 +3034,9 @@ func (e *Engine) applyConfChangeCommitted(entry raftpb.Entry) error {
 	if err := proto.Unmarshal(entry.GetData(), &cc); err != nil {
 		return errors.WithStack(err)
 	}
+	if err := e.beforeConfigurationChange(); err != nil {
+		return err
+	}
 	confState := e.rawNode.ApplyConfChange(&cc)
 	nextPeers, err := e.nextPeersAfterConfigChange(cc.GetType(), cc.GetNodeId(), cc.GetContext(), confStateValue(confState))
 	if err != nil {
@@ -3048,6 +3062,9 @@ func (e *Engine) applyConfChangeV2Committed(entry raftpb.Entry) error {
 	var cc raftpb.ConfChangeV2
 	if err := proto.Unmarshal(entry.GetData(), &cc); err != nil {
 		return errors.WithStack(err)
+	}
+	if err := e.beforeConfigurationChange(); err != nil {
+		return err
 	}
 	confState := e.rawNode.ApplyConfChange(&cc)
 	nextPeers, err := e.nextPeersAfterConfigChangeV2(cc, confStateValue(confState))
@@ -3956,7 +3973,8 @@ func (e *Engine) peerProgress(state raftengine.State) map[uint64]raftengine.Peer
 
 func (e *Engine) refreshStatus() {
 	e.mu.RLock()
-	previous := e.status.State
+	oldStatus := e.status
+	previous := oldStatus.State
 	e.mu.RUnlock()
 	basic := e.rawNode.BasicStatus()
 	lastLogIndex, _ := e.storage.LastIndex()
@@ -3983,6 +4001,7 @@ func (e *Engine) refreshStatus() {
 		PerPeer:            e.peerProgress(state),
 	}
 
+	e.invalidateChangedStatus(oldStatus, status)
 	e.mu.Lock()
 	e.status = status
 	if e.closed {
@@ -4052,6 +4071,7 @@ func (e *Engine) requestShutdown() {
 }
 
 func (e *Engine) shutdown() {
+	e.invalidateAdmission()
 	e.mu.Lock()
 	wasLeader := e.status.State == raftengine.StateLeader
 	e.closed = true
@@ -4080,6 +4100,7 @@ func (e *Engine) shutdown() {
 }
 
 func (e *Engine) fail(err error) {
+	e.invalidateAdmission()
 	// Idempotency guard: fail can be invoked from handleStep, which runs inside
 	// the main run loop and does not return on error. Without this guard a
 	// persistent step error would re-enter fail on every loop iteration,
@@ -4766,6 +4787,9 @@ func (e *Engine) enqueueBlockingStep(ctx context.Context, ch chan raftpb.Message
 }
 
 func (e *Engine) handleTransportMessage(ctx context.Context, msg raftpb.Message) error {
+	if msg.GetType() == raftpb.MsgProp {
+		return errors.WithStack(errPeerProposalForbidden)
+	}
 	select {
 	case <-ctx.Done():
 		return errors.WithStack(ctx.Err())

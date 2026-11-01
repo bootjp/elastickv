@@ -175,10 +175,14 @@ type CatchupAuthorizer interface {
 }
 
 type Config struct {
-	Local         Node
-	Provisioned   []Provision
-	Versions      raftbootstrap.Versions
-	Methods       []Method
+	Local       Node
+	Provisioned []Provision
+	Versions    raftbootstrap.Versions
+	Methods     []Method
+	// MethodFactory constructs immutable decoders referencing this owner's
+	// current applied projection. It must not publish the owner before NewOwner
+	// succeeds, and cannot be combined with Methods.
+	MethodFactory func(*Owner) ([]Method, error)
 	PublicMethods []string // Exact allowlist; all other unknown methods deny.
 	Catchup       CatchupAuthorizer
 }
