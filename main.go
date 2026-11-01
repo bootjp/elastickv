@@ -2243,8 +2243,7 @@ func (b shardGroupBuilder) buildDataGroup(
 		_ = st.Close()
 		return nil, nil, errors.Wrapf(err, "failed to construct encryption applier for group %d", group.id)
 	}
-	sm := kv.NewKvFSMWithHLCAndTracker(st, b.clock, b.readTracker,
-		fsmOptionsForGroup(applier, b.routeEngine, group.id, b.encWiring, b.applyObservers...)...)
+	sm := b.newDataGroupFSM(st, applier, group.id, bootstrapSpec)
 	runtime, err := buildRuntimeForGroup(
 		b.raftID, group, b.raftDir, b.multi, bootstrap,
 		bootstrapServers, bootstrapSeed,
@@ -2259,6 +2258,14 @@ func (b shardGroupBuilder) buildDataGroup(
 	sg := &kv.ShardGroup{Engine: runtime.engine, Store: st}
 	sg.Txn = kv.NewLeaderProxyForShardGroup(sg, kv.WithProposalObserver(proposalObserver))
 	return runtime, sg, nil
+}
+
+func (b shardGroupBuilder) newDataGroupFSM(st store.MVCCStore, applier *encryption.Applier, groupID uint64, bootstrapSpec *groupBootstrapSpec) raftengine.StateMachine {
+	opts := fsmOptionsForGroup(applier, b.routeEngine, groupID, b.encWiring, b.applyObservers...)
+	if bootstrapSpec != nil {
+		opts = append(opts, kv.WithRaftBootstrapIdentity(bootstrapSpec.config.local.Cluster, groupID))
+	}
+	return kv.NewKvFSMWithHLCAndTracker(st, b.clock, b.readTracker, opts...)
 }
 
 func closeRaftGroupRuntimes(runtimes []*raftGroupRuntime) {

@@ -680,7 +680,7 @@ func (c *quorumAcceptanceCluster) retainedAndRestart(t *testing.T, root quorumAc
 	defer cancel()
 	started := time.Now()
 	large := make([]byte, store.MigrationPagePayloadBudget+(1<<19))
-	_, _, err := c.write(ctx, "u", large, 100)
+	err := c.rejectOversizedMovingWrite(t, ctx, large, epoch)
 	require.ErrorIs(t, err, kv.ErrMigrationTransferTooLarge)
 	_, _, err = c.write(ctx, "u", []byte("moving-small"), 101)
 	require.NoError(t, err, "moving-range creation must remain available below the transfer budget")
@@ -741,7 +741,7 @@ func (c *quorumAcceptanceCluster) retainedAndRestart(t *testing.T, root quorumAc
 	value, err := reader.GetGroupAt(ctx, quorumAcceptanceGroup, []byte("b"), 1000)
 	require.NoError(t, err)
 	require.True(t, bytes.Equal(large, value), "native restart must restore the ACKed retained-left value")
-	_, _, err = c.write(ctx, "u", large, 100)
+	err = c.rejectOversizedMovingWrite(t, ctx, large, epoch)
 	require.ErrorIs(t, err, kv.ErrMigrationTransferTooLarge)
 	t.Log("typed moving-range size rejection and unrestricted retained-left oversized data survive native restart on all four members")
 	leader, _, err = c.commitToCurrentLeader(ctx, []*pb.Request{quorumAcceptancePrepare(pb.Phase_COMMIT, quorumAcceptanceCatalogVersion)})
@@ -757,6 +757,93 @@ func (c *quorumAcceptanceCluster) retainedAndRestart(t *testing.T, root quorumAc
 	c.checkNoQuorum(t, ctx, leader)
 	require.NoError(t, ctx.Err(), "restart/admission phase must finish within its own budget")
 	t.Logf("restart/admission phase completed in %s", time.Since(started))
+}
+
+// Only this negative write may be reissued after an unknown outcome. Ordinary
+// writes and PREPARE resolution still return unknown outcomes to their caller.
+func (c *quorumAcceptanceCluster) rejectOversizedMovingWrite(t *testing.T, ctx context.Context, value []byte, epoch uint64) error {
+	t.Helper()
+	return retryQuorumGuardRejection(ctx, func() error {
+		_, _, err := c.write(ctx, "u", value, 100)
+		return err
+	}, func() error {
+		return c.proveMovingWriteAbsent(t, ctx, epoch)
+	})
+}
+
+func (c *quorumAcceptanceCluster) proveMovingWriteAbsent(t *testing.T, ctx context.Context, epoch uint64) error {
+	t.Helper()
+	ticker := time.NewTicker(splitPartitionApplyPoll)
+	defer ticker.Stop()
+	for {
+		ready, err := c.replicasReadBarrier(ctx)
+		if err != nil {
+			return err
+		}
+		if ready {
+			// The recovered guard and ownership proof must agree on every
+			// member, including the learner, before another proposal is sent.
+			c.checkReplicas(t, ctx, epoch)
+			for _, n := range c.nodes {
+				present, readErr := n.store.CommittedVersionAt(ctx, []byte("u"), 100)
+				if readErr != nil {
+					return readErr
+				}
+				if present {
+					return fmt.Errorf("oversized moving write persisted on %s at timestamp 100", n.peer.ID)
+				}
+			}
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func (c *quorumAcceptanceCluster) replicasReadBarrier(ctx context.Context) (bool, error) {
+	leader := c.currentLeader()
+	if leader == nil {
+		return false, nil
+	}
+	index, err := leader.engine.LinearizableRead(ctx)
+	if errors.Is(err, raftengine.ErrNotLeader) || errors.Is(err, raftengine.ErrLeadershipLost) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return c.allApplied(index), nil
+}
+
+func (c *quorumAcceptanceCluster) allApplied(index uint64) bool {
+	for _, n := range c.nodes {
+		if n.engine == nil || n.engine.AppliedIndex() < index {
+			return false
+		}
+	}
+	return true
+}
+
+func retryQuorumGuardRejection(ctx context.Context, attempt, proveAbsent func() error) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err := attempt()
+		unknownLoss := errors.Is(err, kv.ErrTransactionOutcomeUnknown) && errors.Is(err, raftengine.ErrLeadershipLost)
+		if !unknownLoss && !errors.Is(err, kv.ErrMigrationTransferTooLarge) {
+			return err
+		}
+		if proofErr := proveAbsent(); proofErr != nil {
+			return proofErr
+		}
+		if !unknownLoss {
+			return err
+		}
+	}
 }
 
 func (c *quorumAcceptanceCluster) checkNoQuorum(t *testing.T, ctx context.Context, leader *quorumAcceptanceNode) {

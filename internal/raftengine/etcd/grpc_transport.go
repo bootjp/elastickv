@@ -764,7 +764,7 @@ func (t *GRPCTransport) openPeerStream(ctx context.Context, address string, clie
 	if err != nil {
 		return nil, err
 	}
-	sendStream, err := client.SendStream(streamCtx)
+	sendStream, err := openCallerBoundStream(ctx, streamCtx, cancel, client)
 	if err != nil {
 		cancel()
 		return nil, wrapSendStreamContextErr(err, gateCtx)
@@ -793,6 +793,25 @@ func (t *GRPCTransport) openPeerStream(ctx context.Context, address string, clie
 		t.closePeerStream(address, opened)
 	}()
 	return opened, nil
+}
+
+func openCallerBoundStream(ctx, streamCtx context.Context, cancel context.CancelFunc, client pb.EtcdRaftClient) (pb.EtcdRaft_SendStreamClient, error) {
+	// Stream creation can block on HTTP/2 quota. Bind cancellation until it
+	// returns, then detach the cached stream from this dispatch's lifetime.
+	setupCanceled := make(chan struct{})
+	stopSetupCancel := context.AfterFunc(ctx, func() {
+		cancel()
+		close(setupCanceled)
+	})
+	stream, err := client.SendStream(streamCtx)
+	if !stopSetupCancel() {
+		<-setupCanceled
+	}
+	if ctx.Err() != nil {
+		cancel()
+		return nil, errors.WithStack(ctx.Err())
+	}
+	return stream, errors.WithStack(err)
 }
 
 func (t *GRPCTransport) probeSendStream(ctx context.Context, address string, client pb.EtcdRaftClient) error {
@@ -1357,9 +1376,17 @@ func (t *GRPCTransport) handle(ctx context.Context, msg raftpb.Message) error {
 	}
 	t.mu.RLock()
 	handler := t.handler
+	protected := t.peerSession
 	t.mu.RUnlock()
 	if handler == nil {
 		return errors.WithStack(errTransportHandlerNil)
+	}
+	if protected != nil {
+		var err error
+		ctx, err = protected.owner.CaptureReceived(ctx)
+		if err != nil {
+			return errors.WithStack(err)
+		}
 	}
 	return errors.WithStack(handler(ctx, msg))
 }

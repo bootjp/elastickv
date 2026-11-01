@@ -51,6 +51,9 @@ func (o *Owner) UnaryServerInterceptor() grpc.UnaryServerInterceptor {
 		}
 		owned, cancel := boundContext(ctx, h.s.ctx)
 		defer cancel()
+		slot := &receiptSlot{}
+		slot.set(&Receipt{handle: h, message: request, method: info.FullMethod})
+		owned = context.WithValue(owned, receiptKey{}, slot)
 		reply, err := handler(owned, req)
 		if err != nil {
 			return nil, err

@@ -1049,6 +1049,22 @@ is rejected rather than initialized by direct local Save. The CLI flag is not
 registered while maintenance/control attempts still bypass runtime admission;
 this unfinished path must not be exposed as an operational rollout switch.
 
+Protected restart and received-snapshot reconciliation recover the actual
+configuration-entry index from the ordered FSM namespace proof, not the newer
+data-snapshot index. Missing, future, regressed or membership-inconsistent
+proofs remain rejected. The production data-group FSM receives its validated
+cluster/group identity before native replay, including durable receipt lookup.
+Protected stream creation observes dispatch cancellation while opening; an
+established cached stream is not tied to the first dispatch's short lifetime.
+
+The protected transport captures unary and per-message stream session receipts
+and retains them through the native inbound queue. Dequeue authorization and
+RawNode.Step share a bounded owner-lock scope with session revocation; a stale
+receipt cannot update leader contact, quorum acknowledgments or native state.
+This is not terminal-enqueue linearization: revocation can still race queue
+insertion, and snapshot terminal install/Ready apply needs its own admission
+boundary. Catch-up grant-owner admission remains closed at this scope.
+
 This does not complete runtime admission. TSO policy recovery is still rejected
 instead of starting a partially protected domain. DataReady/control admission,
 cross-group rotation dependencies, background-writer admission, protected

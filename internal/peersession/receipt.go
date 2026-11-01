@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 
+	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc"
 )
 
@@ -22,6 +23,41 @@ func (r *Receipt) Check(ctx context.Context) error {
 		return ErrDenied
 	}
 	return r.handle.validate(ctx, r.message, false)
+}
+
+// WithAdmission serializes a bounded terminal admission with session revocation.
+// The action must not call Owner APIs, perform I/O, or wait for other goroutines.
+// Catch-up requires a separate grant-owner scope and is deliberately denied here.
+func (r *Receipt) WithAdmission(ctx context.Context, action func() error) error {
+	if r == nil || r.handle == nil || !r.handle.owned() || action == nil {
+		return ErrDenied
+	}
+	h := r.handle
+	h.owner.mu.Lock()
+	defer h.owner.mu.Unlock()
+	if ctx.Err() != nil {
+		return errors.WithStack(ctx.Err())
+	}
+	if err := h.authorizationLocked(r.message, false); err != nil {
+		return ErrDenied
+	}
+	return action()
+}
+
+type capturedReceiptKey struct{}
+
+// CaptureReceived freezes the current unary/stream receipt before the next Recv.
+func (o *Owner) CaptureReceived(ctx context.Context) (context.Context, error) {
+	r, err := o.Received(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return context.WithValue(ctx, capturedReceiptKey{}, r), nil
+}
+
+func CapturedReceipt(ctx context.Context) *Receipt {
+	r, _ := ctx.Value(capturedReceiptKey{}).(*Receipt)
+	return r
 }
 func (r *Receipt) Message() Message {
 	if r == nil {

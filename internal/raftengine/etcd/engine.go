@@ -19,6 +19,7 @@ import (
 
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/monoclock"
+	"github.com/bootjp/elastickv/internal/peersession"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/cockroachdb/errors"
 	etcdstorage "go.etcd.io/etcd/server/v3/storage"
@@ -356,6 +357,8 @@ type Engine struct {
 	readCh                       chan readRequest
 	adminCh                      chan adminRequest
 	stepCh                       chan raftpb.Message
+	protectedStepCh              chan protectedStep
+	protectedPriorityStepCh      chan protectedStep
 	priorityStepCh               chan raftpb.Message
 	priorityStepBurst            int
 	dispatchReportCh             chan dispatchReport
@@ -666,44 +669,46 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 	}()
 
 	engine := &Engine{
-		recoveredAdmission: prepared.cfg.RecoveredAdmission,
-		admissionChanged:   prepared.cfg.AdmissionChanged,
-		recoveredIdentity:  copyWALIdentity([]*WALIdentity{prepared.disk.VerifiedIdentity}),
-		nodeID:             prepared.cfg.NodeID,
-		localID:            prepared.cfg.LocalID,
-		localAddress:       prepared.cfg.LocalAddress,
-		dataDir:            prepared.cfg.DataDir,
-		fsmSnapDir:         filepath.Join(prepared.cfg.DataDir, fsmSnapDirName),
-		tickInterval:       prepared.cfg.TickInterval,
-		electionTick:       prepared.cfg.ElectionTick,
-		joinAsLearner:      prepared.cfg.JoinAsLearner,
-		storage:            prepared.disk.Storage,
-		rawNode:            rawNode,
-		persist:            prepared.disk.Persist,
-		fsm:                prepared.cfg.StateMachine,
-		peers:              peerMap,
-		transport:          prepared.cfg.Transport,
-		raftCipher:         prepared.cfg.RaftCipher,
-		raftCutoverIndex:   orInertCutover(prepared.cfg.RaftCutoverIndex),
-		proposeCh:          make(chan proposalRequest),
-		readCh:             make(chan readRequest),
-		adminCh:            make(chan adminRequest),
-		stepCh:             make(chan raftpb.Message, inboundQueueCap),
-		priorityStepCh:     make(chan raftpb.Message, priorityStepQueueCapacity),
-		dispatchReportCh:   make(chan dispatchReport, inboundQueueCap),
-		closeCh:            make(chan struct{}),
-		doneCh:             make(chan struct{}),
-		startedCh:          make(chan struct{}),
-		leaderReady:        make(chan struct{}),
-		config:             configurationFromConfState(peerMap, confStateValue(prepared.disk.LocalSnap.GetMetadata().GetConfState())),
-		voterCount:         len(prepared.disk.LocalSnap.Metadata.GetConfState().GetVoters()),
-		isLearnerNode:      learnerSetFromConfState(confStateValue(prepared.disk.LocalSnap.GetMetadata().GetConfState())),
-		applied:            initialApplied,
-		dispatchCtx:        dispatchCtx,
-		dispatchCancel:     dispatchCancel,
-		pendingProposals:   map[uint64]proposalRequest{},
-		pendingReads:       map[uint64]readRequest{},
-		pendingConfigs:     map[uint64]adminRequest{},
+		recoveredAdmission:      prepared.cfg.RecoveredAdmission,
+		admissionChanged:        prepared.cfg.AdmissionChanged,
+		recoveredIdentity:       copyWALIdentity([]*WALIdentity{prepared.disk.VerifiedIdentity}),
+		nodeID:                  prepared.cfg.NodeID,
+		localID:                 prepared.cfg.LocalID,
+		localAddress:            prepared.cfg.LocalAddress,
+		dataDir:                 prepared.cfg.DataDir,
+		fsmSnapDir:              filepath.Join(prepared.cfg.DataDir, fsmSnapDirName),
+		tickInterval:            prepared.cfg.TickInterval,
+		electionTick:            prepared.cfg.ElectionTick,
+		joinAsLearner:           prepared.cfg.JoinAsLearner,
+		storage:                 prepared.disk.Storage,
+		rawNode:                 rawNode,
+		persist:                 prepared.disk.Persist,
+		fsm:                     prepared.cfg.StateMachine,
+		peers:                   peerMap,
+		transport:               prepared.cfg.Transport,
+		raftCipher:              prepared.cfg.RaftCipher,
+		raftCutoverIndex:        orInertCutover(prepared.cfg.RaftCutoverIndex),
+		proposeCh:               make(chan proposalRequest),
+		readCh:                  make(chan readRequest),
+		adminCh:                 make(chan adminRequest),
+		stepCh:                  make(chan raftpb.Message, inboundQueueCap),
+		protectedStepCh:         make(chan protectedStep, inboundQueueCap),
+		protectedPriorityStepCh: make(chan protectedStep, priorityStepQueueCapacity),
+		priorityStepCh:          make(chan raftpb.Message, priorityStepQueueCapacity),
+		dispatchReportCh:        make(chan dispatchReport, inboundQueueCap),
+		closeCh:                 make(chan struct{}),
+		doneCh:                  make(chan struct{}),
+		startedCh:               make(chan struct{}),
+		leaderReady:             make(chan struct{}),
+		config:                  configurationFromConfState(peerMap, confStateValue(prepared.disk.LocalSnap.GetMetadata().GetConfState())),
+		voterCount:              len(prepared.disk.LocalSnap.Metadata.GetConfState().GetVoters()),
+		isLearnerNode:           learnerSetFromConfState(confStateValue(prepared.disk.LocalSnap.GetMetadata().GetConfState())),
+		applied:                 initialApplied,
+		dispatchCtx:             dispatchCtx,
+		dispatchCancel:          dispatchCancel,
+		pendingProposals:        map[uint64]proposalRequest{},
+		pendingReads:            map[uint64]readRequest{},
+		pendingConfigs:          map[uint64]adminRequest{},
 		// Parse env-tunable retention/snapshot knobs once at Open. Both
 		// are consulted on hot paths (maybePersistLocalSnapshot runs per
 		// Ready-drain; purge runs after each snapshot persist) and the
@@ -752,6 +757,9 @@ func (e *Engine) recoverOpenConfiguration(prepared preparedOpenState, rawNodeApp
 	if err := recoverNamespaceConfiguration(e.fsm, prepared.disk.LocalSnap); err != nil {
 		return errors.Wrap(err, "recover namespace configuration")
 	}
+	if err := e.recoverProtectedConfigurationIndex(prepared); err != nil {
+		return err
+	}
 	if err := e.restorePendingConfChangeFenceFromStorage(rawNodeApplied); err != nil {
 		return err
 	}
@@ -797,6 +805,10 @@ func prepareOpenState(cfg OpenConfig) (preparedOpenState, error) {
 	disk, err := openDiskState(cfg, peers)
 	if err != nil {
 		return preparedOpenState{}, err
+	}
+	if cfg.RecoveredAdmission != nil && persistedPeersOK && persistedPeers.Index > disk.LocalSnap.GetMetadata().GetIndex() {
+		_ = closePersist(disk.Persist)
+		return preparedOpenState{}, errors.New("protected peers metadata is ahead of recovered snapshot")
 	}
 	if err := validateOpenPeers(disk.LocalSnap, peers, persistedPeers, persistedPeersOK); err != nil {
 		_ = closePersist(disk.Persist)
@@ -1921,7 +1933,9 @@ func (e *Engine) isClosing() bool {
 	}
 }
 
-func (e *Engine) handleBlockingEvent(tick <-chan time.Time) (bool, error) {
+// Each case is an independent event-loop input; keeping the select together
+// preserves cancellation and readiness ordering across legacy/protected lanes.
+func (e *Engine) handleBlockingEvent(tick <-chan time.Time) (bool, error) { //nolint:cyclop
 	select {
 	case <-e.closeCh:
 		return false, nil
@@ -1935,6 +1949,10 @@ func (e *Engine) handleBlockingEvent(tick <-chan time.Time) (bool, error) {
 		e.handleAdmin(req)
 	case msg := <-e.priorityStepCh:
 		e.handleStep(msg)
+	case request := <-e.protectedPriorityStepCh:
+		e.handleProtectedStep(request)
+	case request := <-e.protectedStepCh:
+		e.handleProtectedStep(request)
 	case msg := <-e.stepCh:
 		e.handleStep(msg)
 	case report := <-e.dispatchReportCh:
@@ -1956,6 +1974,13 @@ func (e *Engine) tryHandlePriorityStep() bool {
 	if e.priorityStepBurst >= priorityStepBurstLimit {
 		e.priorityStepBurst = 0
 		return false
+	}
+	select {
+	case request := <-e.protectedPriorityStepCh:
+		e.priorityStepBurst++
+		e.handleProtectedStep(request)
+		return true
+	default:
 	}
 	msg, ok := e.tryReceivePriorityStep()
 	if !ok {
@@ -2392,13 +2417,25 @@ func (e *Engine) applyReadyLocked(rd etcdraft.Ready) error {
 }
 
 func (e *Engine) handleStep(msg raftpb.Message) {
+	e.handleStepWithAdmission(msg, func(action func() error) error { return action() })
+}
+
+func (e *Engine) handleStepWithAdmission(msg raftpb.Message, admit func(func() error) error) {
 	if e.rawNode == nil {
 		return
 	}
-	e.recordLeaderContact(msg)
-	e.recordQuorumAck(msg)
 	commitBeforeStep := e.rawNode.Status().GetCommit()
-	if err := e.rawNode.Step(&msg); err != nil {
+	err := admit(func() error {
+		e.recordLeaderContact(msg)
+		e.recordQuorumAck(msg)
+		return e.rawNode.Step(&msg)
+	})
+	if err != nil {
+		if errors.Is(err, peersession.ErrDenied) || errors.Is(err, context.Canceled) {
+			e.removeReceivedFSMSnapshotToken(msg)
+			e.unprotectReceivedFSMSnapshotToken(msg)
+			return
+		}
 		if errors.Is(err, etcdraft.ErrStepPeerNotFound) {
 			e.removeReceivedFSMSnapshotToken(msg)
 			e.unprotectReceivedFSMSnapshotToken(msg)
@@ -2710,6 +2747,10 @@ func (e *Engine) applyReadySnapshotLocked(snapshot *raftpb.Snapshot) error {
 	if err := e.restoreReadySnapshotFSM(snapshot); err != nil {
 		return err
 	}
+	configurationIndex, err := e.receivedSnapshotConfigurationIndex(snapshot.GetMetadata().GetIndex())
+	if err != nil {
+		return err
+	}
 	if err := e.storage.ApplySnapshot(snapshot); err != nil {
 		return errors.Wrapf(err, "apply snapshot to raft storage index=%d term=%d",
 			snapshot.GetMetadata().GetIndex(), snapshot.GetMetadata().GetTerm())
@@ -2724,7 +2765,7 @@ func (e *Engine) applyReadySnapshotLocked(snapshot *raftpb.Snapshot) error {
 	// sequence in applyConfigChange. The order matches §4.6:
 	// voterCache first, then config.Servers.
 	e.refreshVoterCache(confState)
-	e.setConfigurationFromConfState(confState, snapshot.GetMetadata().GetIndex())
+	e.setConfigurationFromConfState(confState, configurationIndex)
 	// Persist the post-snapshot peers file with suffrage drawn from
 	// the snapshot's ConfState so a learner that received catch-up
 	// state via snapshot (the common case for fresh joiners) writes
@@ -4796,6 +4837,12 @@ func (e *Engine) handleTransportMessage(ctx context.Context, msg raftpb.Message)
 	case <-e.doneCh:
 		return e.currentErrorOrClosed()
 	case <-e.startedCh:
+		if receipt := peersession.CapturedReceipt(ctx); receipt != nil {
+			return e.enqueueProtectedStep(ctx, msg, receipt)
+		}
+		if e.recoveredAdmission != nil || e.admissionChanged != nil {
+			return errors.WithStack(peersession.ErrDenied)
+		}
 		return e.enqueueStep(ctx, msg)
 	}
 }

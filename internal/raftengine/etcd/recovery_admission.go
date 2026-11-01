@@ -10,6 +10,56 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// A data snapshot is not a configuration entry. Only the ordered FSM record,
+// restored and checked against that snapshot's membership, supplies its epoch.
+func (e *Engine) recoverProtectedConfigurationIndex(prepared preparedOpenState) error {
+	if prepared.cfg.RecoveredAdmission == nil {
+		return nil
+	}
+	snapshotIndex := prepared.disk.LocalSnap.GetMetadata().GetIndex()
+	if snapshotIndex == 0 {
+		e.configIndex.Store(0) // Committed bootstrap ConfChanges will replay.
+		return nil
+	}
+	index, err := e.provenSnapshotConfigurationIndex(snapshotIndex)
+	if err != nil {
+		return err
+	}
+	e.configIndex.Store(index)
+	return nil
+}
+
+// The caller must first restore the FSM and reconcile its namespace membership
+// against this exact snapshot's ConfState.
+func (e *Engine) provenSnapshotConfigurationIndex(snapshotIndex uint64) (uint64, error) {
+	if _, ok := e.fsm.(raftengine.NamespaceConfigurationAware); !ok {
+		return 0, errors.New("protected snapshot lacks namespace configuration proof")
+	}
+	aware, ok := e.fsm.(raftengine.AppliedConfigurationAware)
+	if !ok {
+		return 0, errors.New("protected snapshot lacks applied configuration proof")
+	}
+	index := aware.AppliedConfigurationIndex()
+	if index == 0 || index > snapshotIndex {
+		return 0, errors.New("protected snapshot configuration index is inconsistent")
+	}
+	return index, nil
+}
+
+func (e *Engine) receivedSnapshotConfigurationIndex(snapshotIndex uint64) (uint64, error) {
+	if e.recoveredAdmission == nil && e.admissionChanged == nil {
+		return snapshotIndex, nil
+	}
+	index, err := e.provenSnapshotConfigurationIndex(snapshotIndex)
+	if err != nil {
+		return 0, err
+	}
+	if index < e.currentConfigIndex() {
+		return 0, errors.New("protected snapshot configuration index regressed")
+	}
+	return index, nil
+}
+
 // RecoveredState is minted at a native post-persist/post-apply boundary.
 // A zero value has no verified identity. Accessors return independent copies.
 // It proves this recovery prefix, not future admission or historical data equality.
@@ -52,7 +102,13 @@ func (e *Engine) publishRecoveredAdmission() error {
 	if e.recoveredIdentity == nil {
 		return errors.WithStack(ErrWALIdentity)
 	}
+	e.storage.Lock()
 	hardState, confState, err := e.storage.InitialState()
+	if err == nil {
+		hardState, _ = proto.Clone(hardState).(*raftpb.HardState)
+		confState, _ = proto.Clone(confState).(*raftpb.ConfState)
+	}
+	e.storage.Unlock()
 	if err != nil {
 		return errors.WithStack(err)
 	}
