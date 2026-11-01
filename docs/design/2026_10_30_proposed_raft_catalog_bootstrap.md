@@ -840,6 +840,12 @@ with activation index/generation zero and the accepted baseline C digest.
   or inner bytes in that order. Inner watermark remains exact 0x17; catalog
   remains an existing single-group one-phase transaction, never arbitrary
   admin work. Duplicate receipt lookup uses engine-supplied index/term/hash.
+- `ForwardAdminProposalRequest.force_entry` is a forwarding-only receipt
+  request for the exact typed 0x17 watermark payload. The receiver rejects it
+  for every other payload and bypasses only the covered-watermark no-op; the
+  Raft entry bytes remain unchanged. If an older receiver ignores this unknown
+  protobuf field and takes its covered-watermark no-op, callers receive no
+  commit index and treat the receipt as unavailable rather than success.
 - ConfChange context: version=0x04, operation ID, reservation ID, expected W,
   canonical exact transition and identity digest, with length-delimited peer
   ID/address. Both entry forms use this context. Existing context 0x03 is

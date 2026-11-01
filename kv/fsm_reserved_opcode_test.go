@@ -22,6 +22,7 @@ func TestKVFSMReservedOpcodesAreDistinct(t *testing.T) {
 		"migration retire":  raftEncodeMigrationRetire,
 		"migration cleanup": raftEncodeMigrationCleanup,
 		"backup":            raftEncodeBackup,
+		"read watermark":    raftEncodeWatermarkAdvance,
 		"target readiness":  raftEncodeTargetReadiness,
 		"replicated backup": raftEncodeReplicatedBackup,
 	}

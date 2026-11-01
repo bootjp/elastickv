@@ -178,7 +178,8 @@ func (s *ShardStore) explicitWatermarkAdvanceTarget(groupID, ts uint64) (*ShardG
 }
 
 func (s *ShardStore) proposeExplicitWatermarkAdvance(ctx context.Context, g *ShardGroup, ts uint64) (uint64, error) {
-	proposer := NewLeaderAdminProposer(g.Engine, g.Proposer(), &s.connCache, WithLeaderAdminToken(g.forwardedLeaderReadToken()))
+	proposer := NewLeaderAdminProposer(g.Engine, g.Proposer(), &s.connCache,
+		WithLeaderAdminToken(g.forwardedLeaderReadToken()), WithLeaderAdminForceWatermarkEntry())
 	result, err := proposer.ProposeAdmin(ctx, EncodeWatermarkAdvance(ts))
 	if err != nil {
 		return 0, errors.Wrap(err, "advance read watermark")
