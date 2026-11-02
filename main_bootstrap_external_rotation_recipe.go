@@ -20,9 +20,11 @@ func newBootstrapExternalRotationRecipe(ctx context.Context, cfg bootstrapRotati
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
-	if err := validateBootstrapExternalRotationRequest(cfg, request); err != nil {
+	material, err := validateBootstrapExternalRotationRequest(cfg, request)
+	if err != nil {
 		return nil, err
 	}
+	defer zeroBytes(material)
 	req := cloneBootstrapRotationRequest(request)
 	if !cfg.IsLeader() {
 		return nil, fmt.Errorf("external rotation: only a leader may plan: %w", raftengine.ErrNotLeader)
@@ -35,6 +37,13 @@ func newBootstrapExternalRotationRecipe(ctx context.Context, cfg bootstrapRotati
 	if err := validateBootstrapExternalRotationKey(sc, req); err != nil {
 		return nil, err
 	}
+	purpose := encryption.SidecarPurposeStorage
+	if req.Purpose == pb.RotateDEKRequest_PURPOSE_RAFT {
+		purpose = encryption.SidecarPurposeRaft
+	}
+	if err := encryption.ValidateRotationDEKMaterial(sc, cfg.Wrapper, req.NewDekId, purpose, material); err != nil {
+		return nil, errors.Join(errBootstrapExternalRotationRequest, err)
+	}
 	r.baseline = sc.Active
 	if err := r.hash(); err != nil {
 		return nil, err
@@ -45,26 +54,27 @@ func newBootstrapExternalRotationRecipe(ctx context.Context, cfg bootstrapRotati
 	return r, nil
 }
 
-func validateBootstrapExternalRotationRequest(cfg bootstrapRotationRecipeConfig, request *pb.RotateDEKRequest) error {
+func validateBootstrapExternalRotationRequest(cfg bootstrapRotationRecipeConfig, request *pb.RotateDEKRequest) ([]byte, error) {
 	if _, err := bootstrapRotationPayloadFromRequest(request); err != nil {
-		return errors.Join(errBootstrapExternalRotationRequest, err)
+		return nil, errors.Join(errBootstrapExternalRotationRequest, err)
 	}
 	epoch := cfg.StorageEpoch
 	if request.Purpose == pb.RotateDEKRequest_PURPOSE_RAFT {
 		epoch = cfg.RaftEpoch
 	}
 	if request.ProposerNodeId != cfg.NodeID || request.ProposerLocalEpoch != uint32(epoch) {
-		return fmt.Errorf("%w: proposer identity or pinned purpose epoch mismatch", errBootstrapExternalRotationRequest)
+		return nil, fmt.Errorf("%w: proposer identity or pinned purpose epoch mismatch", errBootstrapExternalRotationRequest)
 	}
 	dek, err := cfg.Wrapper.Unwrap(bytes.Clone(request.WrappedNewDek))
 	if err != nil {
-		return errors.Join(errBootstrapExternalRotationRequest, fmt.Errorf("external rotation: unwrap requested key: %w", err))
+		zeroBytes(dek)
+		return nil, errors.Join(errBootstrapExternalRotationRequest, fmt.Errorf("external rotation: unwrap requested key: %w", err))
 	}
-	defer zeroBytes(dek)
 	if len(dek) != encryption.KeySize {
-		return fmt.Errorf("%w: invalid unwrapped key size", errBootstrapExternalRotationRequest)
+		zeroBytes(dek)
+		return nil, fmt.Errorf("%w: invalid unwrapped key size", errBootstrapExternalRotationRequest)
 	}
-	return nil
+	return dek, nil
 }
 
 func validateBootstrapExternalRotationKey(sc *encryption.Sidecar, req *pb.RotateDEKRequest) error {

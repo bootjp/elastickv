@@ -1025,6 +1025,10 @@ func (a *Applier) applyRotateDEK(raftIdx uint64, p fsmwire.RotationPayload) erro
 	if err != nil {
 		return errors.Wrap(err, "applier: kek-unwrap rotation DEK")
 	}
+	defer clear(dek)
+	if err := a.validateRotationMaterial(p, dek); err != nil {
+		return errors.Wrap(err, "applier: rotation DEK material")
+	}
 	if err := a.keystore.Set(p.DEKID, dek); err != nil {
 		return errors.Wrap(err, "applier: keystore set rotation DEK")
 	}
@@ -1038,6 +1042,18 @@ func (a *Applier) applyRotateDEK(raftIdx uint64, p fsmwire.RotationPayload) erro
 		return err
 	}
 	return nil
+}
+
+func (a *Applier) validateRotationMaterial(p fsmwire.RotationPayload, material []byte) error {
+	sc, err := ReadSidecar(a.sidecarPath)
+	if err != nil {
+		return errors.Wrap(err, "applier: read sidecar for material validation")
+	}
+	purpose, err := sidecarPurposeFor(p.Purpose)
+	if err != nil {
+		return err
+	}
+	return ValidateRotationDEKMaterial(sc, a.kek, p.DEKID, purpose, material)
 }
 
 func (a *Applier) reinstallRaftWrapAfterRotation(p fsmwire.RotationPayload) error {

@@ -31,6 +31,18 @@ func (f rotationRecipeTestAdmin) RotateDEK(ctx context.Context, req *pb.RotateDE
 	return f(ctx, req)
 }
 
+type rotationRecipeTestKEK struct{ fakeStartupKEK }
+
+func (rotationRecipeTestKEK) Unwrap(wrapped []byte) ([]byte, error) {
+	if len(wrapped) == encryption.KeySize+1 && wrapped[0] == 0xAA {
+		return bytes.Clone(wrapped[1:]), nil
+	}
+	if len(wrapped) != encryption.KeySize {
+		return nil, errors.New("bad wrapped dek length")
+	}
+	return bytes.Clone(wrapped), nil
+}
+
 type rotationRecipeFixture struct {
 	t                      *testing.T
 	path                   string
@@ -48,7 +60,7 @@ type rotationRecipeFixture struct {
 func newRotationRecipeFixture(t *testing.T) *rotationRecipeFixture {
 	t.Helper()
 	f := &rotationRecipeFixture{t: t, path: filepath.Join(t.TempDir(), "keys.json"), registry: rotationRecipeTestRegistry{}, loaded: map[uint32][]byte{}, index: 10, leader: true}
-	f.cfg = bootstrapRotationRecipeConfig{NodeID: 91, StorageEpoch: 3, RaftEpoch: 5, Wrapper: fakeStartupKEK{}, Registry: f.registry,
+	f.cfg = bootstrapRotationRecipeConfig{NodeID: 91, StorageEpoch: 3, RaftEpoch: 5, Wrapper: rotationRecipeTestKEK{}, Registry: f.registry,
 		IsLeader: func() bool { return f.leader }, Validate: func(ctx context.Context) error { return ctx.Err() },
 		ReadSidecar: func() (*encryption.Sidecar, error) { return encryption.ReadSidecar(f.path) },
 		Barrier: func(ctx context.Context) (uint64, error) {
@@ -74,8 +86,8 @@ func newRotationRecipeFixture(t *testing.T) *rotationRecipeFixture {
 		return &pb.RotateDEKResponse{AppliedIndex: f.index}, nil
 	})
 	sc := &encryption.Sidecar{Active: encryption.ActiveKeys{Storage: 1, Raft: 2}, RaftAppliedIndex: f.index, Keys: map[string]encryption.SidecarKey{
-		"1": {Purpose: encryption.SidecarPurposeStorage, Wrapped: bytes.Repeat([]byte{1}, 40), LocalEpoch: 3},
-		"2": {Purpose: encryption.SidecarPurposeRaft, Wrapped: bytes.Repeat([]byte{2}, 40), LocalEpoch: 5},
+		"1": {Purpose: encryption.SidecarPurposeStorage, Wrapped: bytes.Repeat([]byte{1}, encryption.KeySize), LocalEpoch: 3},
+		"2": {Purpose: encryption.SidecarPurposeRaft, Wrapped: bytes.Repeat([]byte{2}, encryption.KeySize), LocalEpoch: 5},
 	}}
 	require.NoError(t, encryption.WriteSidecar(f.path, sc))
 	f.register(1, 3)

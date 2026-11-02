@@ -156,8 +156,11 @@ func TestBootstrapExternalRotationRecipeFreshBarrierRequired(t *testing.T) {
 
 type externalRotationBoundedWrapper struct{ fakeStartupKEK }
 
-func (externalRotationBoundedWrapper) Unwrap([]byte) ([]byte, error) {
-	return bytes.Repeat([]byte{7}, encryption.KeySize), nil
+func (w externalRotationBoundedWrapper) Unwrap(wrapped []byte) ([]byte, error) {
+	if len(wrapped) == 4096 {
+		return bytes.Repeat([]byte{7}, encryption.KeySize), nil
+	}
+	return w.fakeStartupKEK.Unwrap(wrapped)
 }
 
 func TestBootstrapExternalRotationRecipePurposeEpochAndWrappedLimit(t *testing.T) {

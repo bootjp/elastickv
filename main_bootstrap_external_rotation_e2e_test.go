@@ -192,3 +192,49 @@ func TestBootstrapExternalRotationE2ELostReplyReconcilesExactRequest(t *testing.
 	externalRotationE2EApplied(t, f, node, req)
 	node.read(t, "legacy-key", "original-value")
 }
+
+func TestBootstrapExternalRotationE2ERejectsReplayedSidecarMaterial(t *testing.T) {
+	t.Setenv("ELASTICKV_RAFT_SNAPSHOT_COUNT", "1")
+	f := newBootstrapRotationE2EFixture(t, true)
+	bootstrapRecoveryRaceFlags(t, f)
+	node := f.protected(t)
+	client := externalRotationE2EClient(t, f, node, nil)
+	report, err := client.GetSidecarState(externalRotationE2EContext(t), &pb.Empty{})
+	require.NoError(t, err, "the attack obtains existing wrapped DEKs through the real public RPC")
+	before, err := encryption.ReadSidecar(f.sidecarPath)
+	require.NoError(t, err)
+	for _, source := range []uint32{report.ActiveStorageId, report.ActiveRaftId, e2eStorageDEKID, e2eRaftDEKID} {
+		wrapped := report.WrappedDeksById[source]
+		require.NotEmpty(t, wrapped, "active AND historical wrapped keys remain exposed by the sidecar report")
+		for _, purpose := range []pb.RotateDEKRequest_Purpose{pb.RotateDEKRequest_PURPOSE_STORAGE, pb.RotateDEKRequest_PURPOSE_RAFT} {
+			for _, rewrapped := range []bool{false, true} {
+				t.Run(strconv.FormatUint(uint64(source), 10)+"/"+purpose.String()+"/rewrapped="+strconv.FormatBool(rewrapped), func(t *testing.T) {
+					req := externalRotationE2ERequest(t, f, node)
+					req.Purpose, req.WrappedNewDek = purpose, bytes.Clone(wrapped)
+					if purpose == pb.RotateDEKRequest_PURPOSE_RAFT {
+						req.ProposerLocalEpoch = uint32(node.wiring.raftEpoch)
+					}
+					if rewrapped {
+						material, err := f.wrapper.Unwrap(wrapped)
+						require.NoError(t, err)
+						req.WrappedNewDek, err = f.wrapper.Wrap(material)
+						zeroBytes(material)
+						require.NoError(t, err)
+						require.NotEqual(t, wrapped, req.WrappedNewDek)
+					}
+					_, err := client.RotateDEK(externalRotationE2EContext(t), req)
+					require.Error(t, err)
+					require.Equal(t, codes.InvalidArgument, status.Code(err), "rewrapping or changing ID/purpose cannot create a fresh nonce domain: %v", err)
+				})
+			}
+		}
+	}
+	after, err := encryption.ReadSidecar(f.sidecarPath)
+	require.NoError(t, err)
+	require.Equal(t, before.Active, after.Active)
+	require.Equal(t, before.Keys, after.Keys)
+	state, err := node.domain.admission.RotationStatus()
+	require.NoError(t, err)
+	require.False(t, state.Responsibility, "reused material must be rejected before private Rot authority is installed")
+	node.read(t, "legacy-key", "original-value")
+}

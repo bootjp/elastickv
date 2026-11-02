@@ -213,7 +213,10 @@ func TestRedisWireBudgetConcurrentMaliciousConnections(t *testing.T) {
 	st := newRedisWireStore(t)
 	g := newRedisWireTestGate(t)
 	limit := clients*redisWireTxnBaseBytes + 64<<10
-	s := startRedisWireServer(t, st, newLocalAdapterCoordinator(st), g, func(s *RedisServer) { s.wireTxnBudgetLimit = limit })
+	s := startRedisWireServer(t, st, newLocalAdapterCoordinator(st), g, func(s *RedisServer) {
+		s.wireTxnBudgetLimit = limit
+		s.executionBudget.limit = clients // Isolate the queue budget from the separate command-execution gate.
+	})
 	connections := make([]*redisWireClient, clients)
 	owners := make([]*redisWireTestOwner, clients)
 	for i := range connections {

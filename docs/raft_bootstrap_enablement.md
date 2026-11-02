@@ -33,6 +33,14 @@ requires the local full node identity, pinned purpose epoch, ADMIN bearer and
 verified client mTLS; startup credentials cannot authorize it. Do not infer availability
 of that profile from helper tests or bypass a closed gate to force startup.
 
+Rotation requires fresh AES key material, distinct from every retained DEK
+under any other ID or purpose, including inactive historical keys. A different
+KEK envelope is not proof of different material. Both request planning and
+Raft apply enforce this before installing keys or changing sidecar/registry
+state. Exact active-request retries still reconcile without a new proposal;
+historical exact requests cannot reactivate a superseded key. Unavailable
+historical key material fails verification rather than bypassing this check.
+
 Encrypted offline migration authenticates the complete logical data history,
 retained WAL and native row-stream snapshots without reencrypting source bytes.
 Encrypted scalar TSO migration remains unsupported. A plaintext baseline with
@@ -201,6 +209,30 @@ the transaction and closes its connection; buffered commands cannot become new
 standalone writes. Idle queued transactions expire after 30 seconds by default.
 These bounds cover retained protected queue copies, not all parser buffers,
 execution allocations or legacy-mode queues.
+
+Protected RESP replies have a separate receiver-wide 128 MiB backing-capacity
+budget, independent of client IP and transaction ownership. Capacity is reserved
+before allocation, including old and new buffers during growth; one reply is
+still limited to 64 MiB. Protected network publication avoids redcon's copying
+pipeline writer, retains capacity until synchronous output completes, and uses
+a bounded write deadline. Detached messages release their capacity after each
+flush. Exhaustion rejects output or closes the connection; a write whose effects
+may already have committed keeps its unknown-outcome semantics. These are reply
+capacity bounds, not bounds on backend/parser working sets or eventual GC/RSS.
+
+Ordinary protected commands also share four execution slots acquired before backend
+reads or proxy forwarding, so concurrent GETs cannot each materialize a large
+value before RESP admission. A slot remains held through synchronous command
+work, owned-child joins and output. An idle MULTI retains no execution slot;
+EXEC acquires one before running queued work. Exhaustion returns BUSY and closes
+the connection, draining parsed commands and cancelling any retained transaction.
+This is a deliberate concurrency bound, not an unchanged-throughput claim or a
+bound on every individual command's internal allocations. Legacy mode is not
+subject to this protected-mode gate. The idle-wait commands XREAD and BZPOPMIN
+use a separate bounded four-slot lane, so sleeping consumers cannot exclude
+ordinary XADD/ZADD or Lua producers. EXEC uses the ordinary lane. Each lane
+retains the original operation owner;
+no authority is refreshed while waiting or executing.
 
 Revocation discards the queue and closes the old connection. Reconnect only
 for a genuinely new request; do not attach old queued work to a new handle.

@@ -61,7 +61,7 @@ func (r *RedisServer) dispatchOwnedCommand(conn redcon.Conn, name string, handle
 	ctx := context.WithValue(owner.Context(), redisOwnedRequestKey{}, true)
 	ctx, cancel := context.WithCancel(ctx)
 	stopServer := context.AfterFunc(r.baseRequestContext(), cancel)
-	carrier := &redisOwnedConn{Conn: conn, owner: owner, ctx: ctx, serverCtx: r.baseRequestContext(), writer: &redisReplyBuffer{}, initialDone: make(chan struct{}), cancel: cancel, stopServer: stopServer, mayWrite: redisCommandMayWrite(name)}
+	carrier := &redisOwnedConn{Conn: conn, owner: owner, ctx: ctx, serverCtx: r.baseRequestContext(), writer: r.newReplyBuffer(), initialDone: make(chan struct{}), cancel: cancel, stopServer: stopServer, mayWrite: redisCommandMayWrite(name)}
 	completed := false
 	defer func() {
 		if carrier.detached && !completed {
@@ -158,7 +158,12 @@ func redisCommandMayWrite(name string) bool {
 }
 
 func (c *redisOwnedConn) release() {
-	c.releaseOnce.Do(func() { c.stopServer(); c.cancel(); c.owner.CancelAndJoin() })
+	c.releaseOnce.Do(func() {
+		c.stopServer()
+		c.cancel()
+		c.owner.CancelAndJoin()
+		c.writer.release()
+	})
 }
 
 type redisOwnedRequestKey struct{}
@@ -288,11 +293,15 @@ func (c *redisOwnedConn) prepareTerminalError(validationErr error) {
 
 func (c *redisOwnedConn) writeTerminalFailure() {
 	if c.writer.err != nil {
+		message := errRedisReplyTooLarge.Error()
+		if errors.Is(c.writer.err, errRedisReplyBudget) {
+			message = errRedisReplyBudget.Error()
+		}
 		if c.workStarted && c.mayWrite {
-			c.Conn.WriteError(kv.ErrTransactionOutcomeUnknown.Error() + "; " + errRedisReplyTooLarge.Error())
+			c.Conn.WriteError(kv.ErrTransactionOutcomeUnknown.Error() + "; " + message)
 			return
 		}
-		c.Conn.WriteError(errRedisReplyTooLarge.Error())
+		c.Conn.WriteError(message)
 		return
 	}
 	if c.resultErr != nil {
@@ -345,7 +354,7 @@ func (c *redisOwnedConn) Detach() redcon.DetachedConn {
 	}
 	c.detached = true
 	raw := c.Conn.Detach()
-	d := &redisOwnedDetachedConn{DetachedConn: raw, root: c, writer: &redisReplyBuffer{}, cancelDone: make(chan struct{})}
+	d := &redisOwnedDetachedConn{DetachedConn: raw, root: c, writer: &redisReplyBuffer{budget: c.writer.budget}, cancelDone: make(chan struct{})}
 	d.stopCancel = context.AfterFunc(c.ctx, func() { defer close(d.cancelDone); _ = raw.NetConn().Close() })
 	return d
 }
@@ -376,11 +385,24 @@ func (c *redisOwnedDetachedConn) Flush() error {
 		_ = c.DetachedConn.NetConn().Close()
 		return errors.WithStack(err)
 	}
-	c.DetachedConn.WriteRaw(c.writer.Buffer())
-	c.writer = &redisReplyBuffer{}
-	return errors.WithStack(c.DetachedConn.Flush())
+	if sink, ok := c.root.Conn.(*redisReplySink); ok {
+		if err := sink.writeReply(c.writer.Buffer()); err != nil {
+			_ = c.DetachedConn.NetConn().Close()
+			return err
+		}
+	} else {
+		// Non-network test carriers retain their original sink contract.
+		c.DetachedConn.WriteRaw(c.writer.Buffer())
+		if err := c.DetachedConn.Flush(); err != nil {
+			return errors.WithStack(err)
+		}
+	}
+	c.writer.release()
+	c.writer.reset()
+	return nil
 }
 func (c *redisOwnedDetachedConn) finish() {
+	defer c.writer.release()
 	<-c.root.initialDone
 	_ = c.DetachedConn.NetConn().Close()
 	if !c.stopCancel() {

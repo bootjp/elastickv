@@ -9,17 +9,23 @@ import (
 )
 
 const (
-	redisMaxReplyBytes    = 64 << 20
-	redisRESPBulkOverhead = 5
-	redisRESPLineOverhead = 3
+	redisMaxReplyBytes        = 64 << 20
+	redisRESPBulkOverhead     = 5
+	redisRESPLineOverhead     = 3
+	redisReplyMinimumCapacity = 64
+	redisReplyCapacityGrowth  = 2
+	redisReplyDecimalBase     = 10
 )
 
 var errRedisReplyTooLarge = errors.New("ERR reply exceeds 64 MiB; command effects may have committed")
+var errRedisReplyBudget = errors.New("ERR server reply capacity exhausted")
 
 // Each command/message owns its buffer; reserve runs before RESP allocation.
 type redisReplyBuffer struct {
-	data []byte
-	err  error
+	data    []byte
+	err     error
+	budget  *redisReplyBudget
+	charged int
 }
 
 func (b *redisReplyBuffer) reserve(n int) bool {
@@ -27,11 +33,41 @@ func (b *redisReplyBuffer) reserve(n int) bool {
 		return false
 	}
 	if n < 0 || n > redisMaxReplyBytes-len(b.data) {
-		b.err = errRedisReplyTooLarge
-		b.data = nil
+		b.fail(errRedisReplyTooLarge)
 		return false
 	}
+	needed := len(b.data) + n
+	if needed <= cap(b.data) {
+		return true
+	}
+	capacity := max(redisReplyMinimumCapacity, cap(b.data))
+	for capacity < needed {
+		capacity = min(redisMaxReplyBytes, capacity*redisReplyCapacityGrowth)
+	}
+	charge := redisReplyCapacityCharge(capacity)
+	if !b.budget.acquire(charge) {
+		b.fail(errRedisReplyBudget)
+		return false
+	}
+	next := make([]byte, len(b.data), capacity)
+	copy(next, b.data)
+	b.data = next
+	b.budget.release(b.charged)
+	b.charged = charge
 	return true
+}
+
+func (b *redisReplyBuffer) fail(err error) {
+	if b.err == nil {
+		b.err = err
+	}
+	b.data = b.data[:0]
+}
+func (b *redisReplyBuffer) reset() { b.err, b.data = nil, b.data[:0] }
+func (b *redisReplyBuffer) release() {
+	b.data = nil
+	b.budget.release(b.charged)
+	b.charged = 0
 }
 func (b *redisReplyBuffer) Buffer() []byte { return b.data }
 func (b *redisReplyBuffer) WriteRaw(p []byte) {
@@ -50,14 +86,25 @@ func (b *redisReplyBuffer) WriteBulkString(p string) {
 	}
 }
 func (b *redisReplyBuffer) WriteString(p string) {
-	if b.reserve(len(p) + redisRESPLineOverhead) {
-		b.data = redcon.AppendString(b.data, p)
-	}
+	b.writeLine('+', p)
 }
 func (b *redisReplyBuffer) WriteError(p string) {
-	if b.reserve(len(p) + redisRESPLineOverhead) {
-		b.data = redcon.AppendError(b.data, p)
+	b.writeLine('-', p)
+}
+func (b *redisReplyBuffer) writeLine(prefix byte, p string) {
+	if !b.reserve(len(p) + redisRESPLineOverhead) {
+		return
 	}
+	b.data = append(b.data, prefix)
+	start := len(b.data)
+	b.data = append(b.data, p...)
+	// Match redcon's newline sanitation without its full-size temporary string.
+	for i := start; i < len(b.data); i++ {
+		if b.data[i] == '\r' || b.data[i] == '\n' {
+			b.data[i] = ' '
+		}
+	}
+	b.data = append(b.data, '\r', '\n')
 }
 func (b *redisReplyBuffer) WriteInt(p int) { b.WriteInt64(int64(p)) }
 func (b *redisReplyBuffer) WriteInt64(p int64) {
@@ -97,25 +144,26 @@ func (b *redisReplyBuffer) WriteAny(p any) {
 	case error:
 		b.WriteError(v.Error())
 	default:
-		b.err = errRedisOwnershipUnsupported
-		b.data = nil
+		b.fail(errRedisOwnershipUnsupported)
 	}
 }
 func (b *redisReplyBuffer) WriteBulkFrom(size int64, reader io.Reader) {
 	if size < 0 || size > int64(redisMaxReplyBytes-len(b.data)) {
-		b.err = errRedisReplyTooLarge
-		b.data = nil
+		b.fail(errRedisReplyTooLarge)
 		return
 	}
 	n := int(size)
 	if !b.reserve(n + len(strconv.Itoa(n)) + redisRESPBulkOverhead) {
 		return
 	}
-	p := make([]byte, n)
-	if _, err := io.ReadFull(reader, p); err != nil {
-		b.err = errors.WithStack(err)
-		b.data = nil
+	b.data = append(b.data, '$')
+	b.data = strconv.AppendInt(b.data, size, redisReplyDecimalBase)
+	b.data = append(b.data, '\r', '\n')
+	start := len(b.data)
+	b.data = b.data[:start+n]
+	if _, err := io.ReadFull(reader, b.data[start:]); err != nil {
+		b.fail(errors.WithStack(err))
 		return
 	}
-	b.WriteBulk(p)
+	b.data = append(b.data, '\r', '\n')
 }

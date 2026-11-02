@@ -41,6 +41,7 @@ type redisWireTxn struct {
 	queueErr   error
 	reserved   int
 	poisoned   bool
+	reply      *redisReplyBuffer
 }
 
 func (r *RedisServer) dispatchProtectedTransaction(conn redcon.Conn, name string, cmd redcon.Command, start time.Time) bool {
@@ -117,7 +118,7 @@ func (r *RedisServer) newWireTransaction(conn redcon.Conn, state *connState) (*r
 	}
 	ctx, cancel := context.WithCancel(context.WithValue(owner.Context(), redisOwnedRequestKey{}, true))
 	t := &redisWireTxn{server: r, conn: redisLifetimeConn(conn), state: state, owner: owner,
-		ctx: ctx, cancel: cancel, done: make(chan struct{}), watchDone: make(chan struct{}), reserved: redisWireTxnBaseBytes}
+		ctx: ctx, cancel: cancel, done: make(chan struct{}), watchDone: make(chan struct{}), reserved: redisWireTxnBaseBytes, reply: r.newReplyBuffer()}
 	t.mu.Lock()
 	t.stopServer = context.AfterFunc(r.baseRequestContext(), cancel)
 	r.wireTxnMu.Lock()
@@ -171,8 +172,9 @@ func (t *redisWireTxn) dispatch(name string, cmd redcon.Command, start time.Time
 			t.cleanupLocked(false, errRedisAdmission)
 		}
 	}()
+	t.reply.reset()
 	c := &redisOwnedConn{Conn: t.conn, owner: t.owner, ctx: t.ctx,
-		serverCtx: t.server.baseRequestContext(), writer: &redisReplyBuffer{}}
+		serverCtx: t.server.baseRequestContext(), writer: t.reply}
 	var terminal bool
 	if err := errors.Join(c.cancellationError(), t.owner.Validate()); err != nil {
 		c.resultErr, terminal = err, true
@@ -191,6 +193,7 @@ func (t *redisWireTxn) publishTerminal(c *redisOwnedConn) {
 	// Finish may cancel H itself. Stop the idle watcher before publication;
 	// any already-started watcher will observe closed under this same lock.
 	t.stopWatcher()
+	t.poisonReplyBudget(c)
 	live := c.publishResult(true)
 	t.cleanupLocked(true, nil)
 	if !live || t.poisoned {
@@ -204,8 +207,9 @@ func (t *redisWireTxn) publishTerminal(c *redisOwnedConn) {
 }
 
 func (t *redisWireTxn) publishQueued(c *redisOwnedConn) {
+	t.poisonReplyBudget(c)
 	c.publishResult(false)
-	if err := errors.Join(t.ctx.Err(), t.owner.Validate()); err != nil {
+	if err := errors.Join(t.ctx.Err(), t.owner.Validate()); err != nil || t.poisoned {
 		t.cleanupLocked(false, err)
 		_ = t.conn.Close()
 		return
@@ -216,6 +220,13 @@ func (t *redisWireTxn) publishQueued(c *redisOwnedConn) {
 		timeout = redisDispatchTimeout
 	}
 	t.idle = time.AfterFunc(timeout, t.cancel)
+}
+
+func (t *redisWireTxn) poisonReplyBudget(c *redisOwnedConn) {
+	if errors.Is(c.writer.err, errRedisReplyBudget) {
+		t.poisoned = true
+		t.conn.ReadPipeline()
+	}
 }
 
 func (t *redisWireTxn) execute(c *redisOwnedConn, name string, cmd redcon.Command, start time.Time) bool {
@@ -301,6 +312,7 @@ func (t *redisWireTxn) cleanupLocked(finished bool, err error) {
 	if !finished {
 		_ = t.owner.Finish(err)
 	}
+	t.reply.release()
 	t.state.inTxn, t.state.queue = false, nil
 	// EXEC may have detached queue into its handler's local variable. Only
 	// here, after that handler returned and all children joined, is its charge

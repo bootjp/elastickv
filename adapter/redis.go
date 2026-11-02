@@ -178,13 +178,17 @@ type RedisServer struct {
 	// heavyCommandLimiter bounds CPU-heavy Redis command families so one
 	// expensive path cannot occupy every scheduler P and starve Raft.
 	// nil preserves the historical unbounded path for narrow test fixtures.
-	heavyCommandLimiter *redisHeavyCommandLimiter
-	requestAdmission    RequestAdmission
-	wireTxnMu           sync.Mutex
-	wireTxns            map[*redisWireTxn]struct{}
-	wireTxnIdleTimeout  time.Duration
-	wireTxnBudgetLimit  int
-	wireTxnBytes        int
+	heavyCommandLimiter     *redisHeavyCommandLimiter
+	requestAdmission        RequestAdmission
+	replyBudget             redisReplyBudget
+	replyWriteTimeout       time.Duration
+	executionBudget         redisProtectedExecutionBudget
+	blockingExecutionBudget redisProtectedExecutionBudget
+	wireTxnMu               sync.Mutex
+	wireTxns                map[*redisWireTxn]struct{}
+	wireTxnIdleTimeout      time.Duration
+	wireTxnBudgetLimit      int
+	wireTxnBytes            int
 	// peerLimiter bounds concurrent Redis connections per remote peer IP.
 	peerLimiter *redisPeerLimiter
 	// blockWaitFallback is the safety-net polling interval used by blocking
@@ -887,11 +891,17 @@ func (r *RedisServer) Run() error {
 }
 
 func (r *RedisServer) handleRedisCommand(conn redcon.Conn, cmd redcon.Command) {
+	conn = r.replyConn(conn)
 	if !r.inflight.enter() {
 		conn.WriteError("ERR server is shutting down")
 		return
 	}
 	defer r.inflight.exit()
+	execution, admitted := r.acquireProtectedExecution(conn, cmd)
+	if !admitted {
+		return
+	}
+	defer releaseRedisExecution(execution)
 	if len(cmd.Args) == 0 {
 		conn.WriteError("ERR empty command")
 		return
