@@ -23,34 +23,44 @@ func (j *OperationJournal) BeginAttempt(ctx context.Context, id OperationID) (op
 		if !ready {
 			return operationRecord{}, errors.WithStack(kv.ErrTransactionOutcomeUnknown)
 		}
-		ts, record, session, err := j.pendingSnapshot(ctx, id)
-		if err != nil {
-			return operationRecord{}, err
-		}
-		if record.AttemptID != [16]byte{} {
+		record, err := j.beginAttemptOnce(ctx, id, observed)
+		if err == nil {
 			return record, nil
 		}
-		if record.Generation == ^uint64(0) {
-			return operationRecord{}, errors.WithStack(ErrOperationGeneration)
-		}
-		record.AttemptID, err = randomOperationToken()
-		if err != nil {
+		if !IsWriteConflict(err) && !j.retryUnknownSingleGroupCAS(err, observed) {
 			return operationRecord{}, err
 		}
-		record.Generation++
-		record.AttemptRouteVersion = observed
-		if err = j.storeRecordAndSession(ctx, ts, record, session); err != nil {
-			if IsWriteConflict(err) {
-				if err = waitOperationCASRetry(ctx, retry); err != nil {
-					return operationRecord{}, err
-				}
-				continue
+		if retry == operationCASRetries-1 && errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+			return operationRecord{}, err
+		}
+		if waitErr := waitOperationCASRetry(ctx, retry); waitErr != nil {
+			if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+				return operationRecord{}, errors.Join(err, waitErr)
 			}
-			return operationRecord{}, err
+			return operationRecord{}, waitErr
 		}
-		return record, nil
 	}
 	return operationRecord{}, errors.WithStack(ErrContentionLimit)
+}
+
+func (j *OperationJournal) beginAttemptOnce(ctx context.Context, id OperationID, observed uint64) (operationRecord, error) {
+	ts, record, session, err := j.pendingSnapshot(ctx, id)
+	if err != nil {
+		return operationRecord{}, err
+	}
+	if record.AttemptID != [16]byte{} {
+		return record, nil
+	}
+	if record.Generation == ^uint64(0) {
+		return operationRecord{}, errors.WithStack(ErrOperationGeneration)
+	}
+	record.AttemptID, err = randomOperationToken()
+	if err != nil {
+		return operationRecord{}, err
+	}
+	record.Generation++
+	record.AttemptRouteVersion = observed
+	return record, j.storeRecordAndSessionAtRoute(ctx, ts, record, session, nil, nil, observed)
 }
 
 // AdvanceGeneration fences an old attempt by committing a new version of its

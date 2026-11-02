@@ -395,7 +395,20 @@ func (j *OperationJournal) Admit(ctx context.Context, id OperationID, intent []b
 		return operationRecord{}, err
 	}
 	for retry := range operationCASRetries {
-		admitted, err := j.admitOnce(ctx, record)
+		observed, ready := j.backend.JournalRouteVersion()
+		if !ready {
+			return operationRecord{}, errors.WithStack(kv.ErrTransactionOutcomeUnknown)
+		}
+		admitted, err := j.admitOnce(ctx, record, observed)
+		if j.retryUnknownSingleGroupCAS(err, observed) {
+			if retry == operationCASRetries-1 {
+				return operationRecord{}, err
+			}
+			if waitErr := waitOperationCASRetry(ctx, retry); waitErr != nil {
+				return operationRecord{}, errors.Join(err, waitErr)
+			}
+			continue
+		}
 		if IsWriteConflict(err) {
 			if err = waitOperationCASRetry(ctx, retry); err != nil {
 				return operationRecord{}, err
@@ -407,7 +420,11 @@ func (j *OperationJournal) Admit(ctx context.Context, id OperationID, intent []b
 	return operationRecord{}, errors.WithStack(ErrContentionLimit)
 }
 
-func (j *OperationJournal) admitOnce(ctx context.Context, record operationRecord) (operationRecord, error) {
+func (j *OperationJournal) retryUnknownSingleGroupCAS(err error, observed uint64) bool {
+	return errors.Is(err, kv.ErrTransactionOutcomeUnknown) && j.backend.JournalSingleGroupAtVersion(observed)
+}
+
+func (j *OperationJournal) admitOnce(ctx context.Context, record operationRecord, observed uint64) (operationRecord, error) {
 	ts, err := j.backend.Snapshot(ctx)
 	if err != nil {
 		return operationRecord{}, errors.Wrap(err, "fence operation admission")
@@ -433,7 +450,7 @@ func (j *OperationJournal) admitOnce(ctx context.Context, record operationRecord
 	if err = reserveOperation(&session, record); err != nil {
 		return operationRecord{}, err
 	}
-	return record, j.storeRecordAndSession(ctx, ts, record, session)
+	return record, j.storeRecordAndSessionAtRoute(ctx, ts, record, session, nil, nil, observed)
 }
 
 func reserveOperation(session *operationSession, record operationRecord) error {
