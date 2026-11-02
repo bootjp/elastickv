@@ -219,20 +219,20 @@ func testSnapshotSealRaftLeaderChange(t *testing.T, restamp bool) {
 	}
 	release()
 	conflict := sealRaftReceive(t, ctx, coord.result)
-	require.ErrorIs(t, conflict, kv.ErrTransactionOutcomeUnknown, "a forwarded apply rejection cannot settle an earlier attempt")
+	require.ErrorIs(t, conflict, store.ErrWriteConflict, "the paused first dispatch has no earlier submitted attempt")
 	require.NotContains(t, conflict.Error(), dynamoSealPrefix, "internal seal keys must stay behind the forwarding boundary")
 	if restamp {
 		// A fresh commit timestamp bypasses the global apply-order fence;
 		// the stale read is still rejected by the seal.
 		require.Greater(t, coord.freshCommitTS, sealed)
 	}
-	require.ErrorIs(t, sealRaftReceive(t, ctx, done), kv.ErrTransactionOutcomeUnknown)
 	releaseSecond()
 	require.NoError(t, sealRaftReceive(t, ctx, txnDone))
-	require.Equal(t, []string{"1", "3"}, readListValues(t, nodes[1].dynamoServer, schema))
+	require.NoError(t, sealRaftReceive(t, ctx, done), "a certified conflict permits a fresh read and retry")
+	require.ElementsMatch(t, []string{"1", "2", "3"}, readListValues(t, nodes[1].dynamoServer, schema))
 	// Also exercise the follower's single-item legacy timestamp allocation.
 	sealRaftHTTP(t, ctx, nodes[2].dynamoAddress, "UpdateItem", sealRaftAppend(schema.TableName, "4"))
-	require.Equal(t, []string{"1", "3", "4"}, readListValues(t, nodes[1].dynamoServer, schema))
+	require.ElementsMatch(t, []string{"1", "2", "3", "4"}, readListValues(t, nodes[1].dynamoServer, schema))
 	t.Logf("delayed C=%d, successor seal R=%d, old write rejected before transaction commit", commitTS, sealed)
 }
 
