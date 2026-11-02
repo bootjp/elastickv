@@ -4678,7 +4678,7 @@ func setupDistributionCatalog(
 	if distCatalog == nil {
 		return nil, errors.WithStack(errors.Newf("distribution catalog store is not available for group %d", catalogGroupID))
 	}
-	if handled, err := loadProtectedCatalog(ctx, runtimes, catalogGroupID, distCatalog, engine); handled {
+	if handled, err := loadProtectedStartupCatalog(ctx, runtimes, catalogGroupID, distCatalog, engine); handled {
 		return distCatalog, err
 	}
 	// EnsureCatalogSnapshot may Save through the direct (non-raft) write

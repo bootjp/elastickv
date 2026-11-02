@@ -255,12 +255,15 @@ func TestBootstrapRotationE2EPreparedActiveEnvelopes(t *testing.T) {
 }
 
 type bootstrapRotationE2ENode struct {
-	runtime    *raftGroupRuntime
-	domain     *bootstrapDomain
-	coordinate *kv.ShardedCoordinator
-	shards     *kv.ShardStore
-	wiring     encryptionWriteWiring
-	close      func()
+	runtime         *raftGroupRuntime
+	domain          *bootstrapDomain
+	coordinate      *kv.ShardedCoordinator
+	shards          *kv.ShardStore
+	wiring          encryptionWriteWiring
+	registrationCtx context.Context
+	group           *kv.ShardGroup
+	stopReadiness   func()
+	close           func()
 }
 
 func (f *bootstrapRotationE2EFixture) protected(t *testing.T) *bootstrapRotationE2ENode {
@@ -306,6 +309,7 @@ func (f *bootstrapRotationE2EFixture) protected(t *testing.T) *bootstrapRotation
 		wrapper: f.wrapper, nodeID: f.config.local.Member, requested: true, eg: eg, cleanup: &cleanup})
 	require.NoError(t, err)
 	require.NotNil(t, supervisor)
+	node.registrationCtx, node.group = registered, groups[1]
 	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", f.group.address)
 	require.NoError(t, err)
 	server = grpc.NewServer(runtime.transportServerOptions...)
@@ -315,7 +319,11 @@ func (f *bootstrapRotationE2EFixture) protected(t *testing.T) *bootstrapRotation
 	startBootstrapActivationWorkers(registered, eg, runtimes, groups)
 	catalog, err := setupDistributionAndRegistration(registered, eg, runtimes, routes, coordinate, groups[1], wiring, "n1", f.sidecarPath)
 	require.NoError(t, err)
-	startBootstrapReadinessReconciler(registered, eg, runtimes, catalog, routes)
+	readinessCtx, stopReadiness := context.WithCancel(registered)
+	var readiness errgroup.Group
+	startBootstrapReadinessReconciler(readinessCtx, &readiness, runtimes, catalog, routes)
+	eg.Go(readiness.Wait)
+	node.stopReadiness = func() { stopReadiness(); require.NoError(t, readiness.Wait()) }
 	wait, stop := context.WithTimeout(t.Context(), 30*time.Second)
 	defer stop()
 	require.NoError(t, supervisor.Wait(wait), "actual protected encryption supervisor must publish owned completion")

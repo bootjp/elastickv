@@ -174,8 +174,10 @@ func reconcileBootstrapReadiness(ctx context.Context, domain *bootstrapDomain, r
 		return err
 	}
 	if domain.admission.Stage(id) == peersession.ControlReady {
-		if _, err := loadProtectedCatalog(ctx, runtimes, id, catalog, engine); err != nil && !errors.Is(err, raftadmission.ErrStale) {
-			return err
+		if _, err := loadProtectedCatalog(ctx, runtimes, id, catalog, engine); err != nil {
+			if err := deferBootstrapCatalogObservation(ctx, domain, id, err); err != nil {
+				return err
+			}
 		}
 	}
 	return domain.refresh()

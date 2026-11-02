@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	stderrors "errors"
 	"flag"
 	"fmt"
 	"path/filepath"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/raftadmission"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
@@ -166,6 +168,34 @@ func protectedRuntimesBlocked(runtimes []*raftGroupRuntime) bool {
 	return false
 }
 
+// Startup may lose its catalog ticket to ordinary native recovery while doing
+// I/O. Discard that observation, leaving DataReady closed until the readiness
+// reconciler independently reloads it. Never fall back to an unguarded Save.
+func loadProtectedStartupCatalog(ctx context.Context, runtimes []*raftGroupRuntime, id uint64, catalog *distribution.CatalogStore, engine *distribution.Engine) (bool, error) {
+	handled, err := loadProtectedCatalog(ctx, runtimes, id, catalog, engine)
+	if !handled || err == nil {
+		return handled, err
+	}
+	return true, deferBootstrapCatalogObservation(ctx, bootstrapDomainForRuntimes(runtimes), id, err)
+}
+
+func deferBootstrapCatalogObservation(ctx context.Context, domain *bootstrapDomain, id uint64, err error) error {
+	if !bootstrapCatalogObservationStale(err) || domain == nil {
+		return err
+	}
+	if ctx.Err() != nil {
+		return errors.Join(err, ctx.Err())
+	}
+	if _, currentErr := domain.admission.Ticket(id); currentErr != nil {
+		return errors.Join(err, currentErr)
+	}
+	return nil
+}
+
+func bootstrapCatalogObservationStale(err error) bool {
+	return stderrors.Is(err, raftadmission.ErrStale) || stderrors.Is(err, distribution.ErrEngineSnapshotVersionStale)
+}
+
 func loadProtectedCatalog(ctx context.Context, runtimes []*raftGroupRuntime, id uint64, catalog *distribution.CatalogStore, engine *distribution.Engine) (bool, error) {
 	for _, runtime := range runtimes {
 		if runtime == nil || runtime.spec.id != id || runtime.publicReady == nil {
@@ -190,6 +220,11 @@ func loadProtectedRuntimeCatalog(ctx context.Context, runtime *raftGroupRuntime,
 	}
 	if snapshot.Version == 0 || len(snapshot.Routes) == 0 {
 		return errors.New("protected catalog is not initialized by a committed guarded entry")
+	}
+	// ApplySnapshot deliberately treats an equal version as a no-op. Recovery
+	// still owes structural verification of every independently loaded image.
+	if _, err := distribution.RoutesFromCatalogSnapshot(snapshot); err != nil {
+		return errors.WithStack(err)
 	}
 	if err := engine.ApplySnapshot(snapshot); err != nil {
 		return errors.WithStack(err)

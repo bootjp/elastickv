@@ -157,6 +157,13 @@ catalog readiness; public data remains closed until every local group reaches
 DataReady. Never treat an activation RPC timeout as proof of either abort or
 success: inspect independently recovered durable policy and applied progress.
 
+An initial catalog read may lose its generation ticket to native recovery or
+writer registration, or be overtaken by a newer watcher snapshot. Startup
+discards that stale observation rather than
+marking it loaded or failing the process. The readiness reconciler reloads it
+under a fresh ticket before DataReady; corruption, closed/fatal admission and
+shutdown are still errors. No unguarded catalog initialization is attempted.
+
 Verify the same activated policy on all replicas, catalog routes, ordinary
 leader and follower read/write paths, dedicated TSO when used, and a controlled
 restart without losing data or policy. Keep backups and migration artifacts
