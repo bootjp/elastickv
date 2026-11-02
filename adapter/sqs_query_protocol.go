@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/bootjp/elastickv/kv"
 	"github.com/cockroachdb/errors"
 )
 
@@ -1318,6 +1319,9 @@ func writeSQSQueryResponse(w http.ResponseWriter, action string, result any) {
 // retry policy that works for the JSON client also works for the
 // query client.
 func sqsQueryErrorDetails(err error) (int, string, string, int) {
+	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+		return http.StatusConflict, sqsErrOperationOutcomeUnknown, sqsMsgOperationOutcomeUnknown, 0
+	}
 	status := http.StatusInternalServerError
 	code := sqsErrInternalFailure
 	message := "internal error"

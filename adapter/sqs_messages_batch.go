@@ -802,6 +802,12 @@ func totalBatchPayloadBytes(entries []sqsSendMessageBatchEntryInput) int {
 }
 
 func batchErrorEntryFromAPIErr(id string, err error) sqsBatchResultErrorEntry {
+	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+		return sqsBatchResultErrorEntry{
+			Id: id, Code: sqsErrOperationOutcomeUnknown,
+			Message: sqsMsgOperationOutcomeUnknown, SenderFault: true,
+		}
+	}
 	var apiErr *sqsAPIError
 	if errors.As(err, &apiErr) {
 		return sqsBatchResultErrorEntry{

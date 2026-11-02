@@ -58,6 +58,31 @@ func TestSQSUnknownOutcomeResponse(t *testing.T) {
 	require.False(t, strings.Contains(rec.Body.String(), "private-key"))
 }
 
+func TestSQSQueryUnknownOutcomeResponse(t *testing.T) {
+	t.Parallel()
+	rec := httptest.NewRecorder()
+	writeSQSQueryError(rec, fmt.Errorf("%w: private-key", kv.ErrTransactionOutcomeUnknown))
+	require.Equal(t, http.StatusConflict, rec.Code)
+	require.Equal(t, sqsErrOperationOutcomeUnknown, rec.Header().Get("x-amzn-ErrorType"))
+	var response queryErrorEnvelope
+	require.NoError(t, xml.Unmarshal(rec.Body.Bytes(), &response))
+	require.Equal(t, "Sender", response.Error.Type)
+	require.Equal(t, sqsErrOperationOutcomeUnknown, response.Error.Code)
+	require.Equal(t, sqsMsgOperationOutcomeUnknown, response.Error.Message)
+	require.NotContains(t, rec.Body.String(), "private-key")
+}
+
+func TestSQSBatchUnknownOutcomeEntry(t *testing.T) {
+	t.Parallel()
+	entry := batchErrorEntryFromAPIErr("entry-1", fmt.Errorf("%w: %w: private-key",
+		kv.ErrTransactionOutcomeUnknown, newSQSAPIError(http.StatusInternalServerError, sqsErrInternalFailure, "internal error")))
+	require.Equal(t, "entry-1", entry.Id)
+	require.Equal(t, sqsErrOperationOutcomeUnknown, entry.Code)
+	require.Equal(t, sqsMsgOperationOutcomeUnknown, entry.Message)
+	require.True(t, entry.SenderFault)
+	require.NotContains(t, entry.Message, "private-key")
+}
+
 func TestS3UnknownOutcomeGoSDKDoesNotReplay(t *testing.T) {
 	t.Parallel()
 	var calls atomic.Int32
