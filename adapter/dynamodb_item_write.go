@@ -406,6 +406,10 @@ func (d *DynamoDBServer) resolveReuseWriteConflict(
 			return nil, nil, errors.Wrap(perr, "dynamodb item-write: self-conflict probe")
 		}
 		if landed {
+			matches, matchErr := d.reuseWriteSetMatches(ctx, pending.plan.req.Elems, commitTS)
+			if matchErr != nil || !matches {
+				return nil, pending, errors.Wrap(kv.ErrTransactionOutcomeUnknown, "dynamodb item-write: reuse receipt does not prove this write set")
+			}
 			// The reuse landed at commitTS. Run the SAME generation fence +
 			// cleanup the normal success path runs (finishItemWriteAttempt), so
 			// a table dropped/recreated under us cleans up the landed write and
@@ -416,6 +420,53 @@ func (d *DynamoDBServer) resolveReuseWriteConflict(
 	// Probe missed (or no probe key): a genuine cross-writer conflict. dispErr
 	// is already wrapped by commitItemWrite; return it raw so the loop recomputes.
 	return nil, nil, dispErr
+}
+
+// A commit timestamp can be reused across leadership handoff. An exact
+// version of only the primary key is not a receipt for this write set.
+func (d *DynamoDBServer) reuseWriteSetMatches(ctx context.Context, elems []*kv.Elem[kv.OP], commitTS uint64) (bool, error) {
+	if len(elems) == 0 {
+		return false, nil
+	}
+	hasPut := false
+	for _, elem := range elems {
+		if elem == nil {
+			return false, nil
+		}
+		matches, err := d.reuseMutationMatches(ctx, elem, commitTS)
+		if err != nil || !matches {
+			return false, err
+		}
+		if elem.Op == kv.Put {
+			hasPut = true
+		}
+	}
+	// Tombstones alone carry no value that distinguishes our delete from a
+	// different writer's delete at the same timestamp.
+	return hasPut, nil
+}
+
+func (d *DynamoDBServer) reuseMutationMatches(ctx context.Context, elem *kv.Elem[kv.OP], commitTS uint64) (bool, error) {
+	landed, err := d.store.CommittedVersionAt(ctx, elem.Key, commitTS)
+	if err != nil || !landed {
+		return false, errors.Wrap(err, "probe reuse version")
+	}
+	value, err := d.store.GetAt(ctx, elem.Key, commitTS)
+	switch elem.Op {
+	case kv.Put:
+		if err != nil {
+			return false, errors.Wrap(err, "read reuse value")
+		}
+		return bytes.Equal(value, elem.Value), nil
+	case kv.Del:
+		if errors.Is(err, store.ErrKeyNotFound) {
+			return true, nil
+		}
+		return false, errors.Wrap(err, "read reuse tombstone")
+	case kv.DelPrefix:
+		return false, nil
+	}
+	return false, nil
 }
 
 // finishItemWriteAttempt runs the table-generation fence after a successful
