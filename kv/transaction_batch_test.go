@@ -241,16 +241,3 @@ func TestApplyRequestsWithEtcdEngineKeepsKVCommandSemantics(t *testing.T) {
 	require.ErrorIs(t, results[0], ErrInvalidRequest)
 	require.Zero(t, observer.FailureCount())
 }
-
-func TestNeedsTxnCleanupSkipsAbortRequests(t *testing.T) {
-	t.Parallel()
-
-	reqs := []*pb.Request{
-		{IsTxn: true, Phase: pb.Phase_ABORT},
-	}
-	require.False(t, needsTxnCleanup(reqs))
-	require.True(t, needsTxnCleanup([]*pb.Request{{IsTxn: true, Phase: pb.Phase_PREPARE}}))
-	require.True(t, needsTxnCleanup([]*pb.Request{{IsTxn: true, Phase: pb.Phase_COMMIT}}))
-	require.False(t, needsTxnCleanup([]*pb.Request{{IsTxn: true, Phase: pb.Phase_NONE}}))
-	require.True(t, needsTxnCleanup([]*pb.Request{{IsTxn: true, Phase: pb.Phase(99)}}))
-}

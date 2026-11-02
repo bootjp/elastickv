@@ -66,3 +66,14 @@
                                 {:type "InternalServerError"}))
                 :ok))))
     (is (= 2 @calls))))
+
+(deftest create-table-setup-retries-unknown-with-same-name
+  (let [calls (atom [])]
+    (with-redefs-fn {#'workload/ddb-invoke!
+                    (fn [_ op request]
+                      (swap! calls conj [op (:TableName request)])
+                      (throw (ex-info "create result" {:type (if (= 1 (count @calls))
+                                                              "OperationOutcomeUnknown"
+                                                              "ResourceInUseException")})))}
+      #(is (nil? (@#'workload/create-table! ::ddb "jepsen-type-string" 5 5))))
+    (is (= [[:CreateTable "jepsen-type-string"] [:CreateTable "jepsen-type-string"]] @calls))))

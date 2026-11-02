@@ -242,20 +242,8 @@ func (t *TransactionManager) commitSequential(ctx context.Context, reqs []*pb.Re
 	commitIndex, err := t.applySequentialRequests(ctx, reqs)
 
 	if err != nil {
-		// An unknown proposal may still commit. Aborting its intents here can
-		// contradict a committed primary decision; leave resolution to the
-		// transaction protocol until its outcome is known.
-		var appliedRejection *AppliedRequestRejection
-		if needsTxnCleanup(reqs) && !errors.Is(err, ErrTransactionOutcomeUnknown) && !errors.As(err, &appliedRejection) {
-			// A known rejection can release already-prepared intents without
-			// inheriting an expired caller deadline.
-			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), verifyLeaderTimeout)
-			_, _err := t.Abort(cleanupCtx, reqs)
-			cancel()
-			if _err != nil {
-				return nil, errors.WithStack(errors.CombineErrors(err, _err))
-			}
-		}
+		// Only the coordinator can decide whether earlier participants or an
+		// earlier attempt with this identity permit an ABORT.
 		return nil, errors.WithStack(err)
 	}
 
@@ -280,26 +268,6 @@ func (t *TransactionManager) applySequentialRequests(ctx context.Context, reqs [
 		commitIndex = idx
 	}
 	return commitIndex, nil
-}
-
-func needsTxnCleanup(reqs []*pb.Request) bool {
-	for _, req := range reqs {
-		if req == nil || !req.IsTxn {
-			continue
-		}
-		switch req.Phase {
-		case pb.Phase_NONE, pb.Phase_ABORT:
-			continue
-		case pb.Phase_PREPARE, pb.Phase_COMMIT:
-			return true
-		default:
-			// Be conservative: any transactional phase other than NONE/ABORT may
-			// have left intents that require cleanup, including unknown enum
-			// values that can appear during rolling upgrades.
-			return true
-		}
-	}
-	return false
 }
 
 func (t *TransactionManager) commitRaw(ctx context.Context, reqs []*pb.Request) (*TransactionResponse, error) {

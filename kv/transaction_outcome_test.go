@@ -63,6 +63,20 @@ func TestTransactionManagerDoesNotAbortUnknownTxnOutcome(t *testing.T) {
 	}
 }
 
+func TestTransactionManagerDoesNotAbortPreAppendRejection(t *testing.T) {
+	t.Parallel()
+	for _, phase := range []pb.Phase{pb.Phase_PREPARE, pb.Phase_COMMIT} {
+		t.Run(phase.String(), func(t *testing.T) {
+			t.Parallel()
+			proposer := &fakeProposer{err: raftengine.ErrNotLeader}
+			tm := NewTransactionWithProposer(proposer)
+			_, err := tm.Commit(context.Background(), []*pb.Request{outcomeTestTxnRequest(phase)})
+			require.ErrorIs(t, err, raftengine.ErrNotLeader)
+			require.EqualValues(t, 1, proposer.calls.Load(), "a participant rejection must not issue an unproven ABORT")
+		})
+	}
+}
+
 func TestTransactionManagerKeepsApplyVerdictSeparateFromLogicalOutcome(t *testing.T) {
 	t.Parallel()
 	cause := store.NewWriteConflictError([]byte("private-key"))
