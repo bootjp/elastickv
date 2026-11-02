@@ -628,14 +628,18 @@ func multiEnablementFollowerForward(t *testing.T, processes []*multiEnablementPr
 	_, err := follower.coordinate.Dispatch(ctx, &kv.OperationGroup[kv.OP]{Elems: []*kv.Elem[kv.OP]{{Op: kv.Put,
 		Key: []byte("forwarded-key"), Value: []byte("tls-follower-forwarded")}}})
 	require.NoError(t, err, "ordinary forwarding must retain receiver ownership on both nodes and use pinned TLS")
-	owned, op, err := follower.domain.admission.Begin(ctx, raftadmission.Data)
+	// The leader ACK can precede follower snapshot restore, which revokes H.
+	// Wait for local catch-up before acquiring ownership for the single TLS read.
+	for _, process := range processes {
+		multiEnablementReplicatedRead(t, process, "forwarded-key", "tls-follower-forwarded")
+	}
+	readCtx, cancelRead := context.WithTimeout(t.Context(), bootstrapE2EWaitTimeout)
+	defer cancelRead()
+	owned, op, err := follower.domain.admission.Begin(readCtx, raftadmission.Data)
 	require.NoError(t, err)
 	defer op.CancelAndJoin()
 	value, err := follower.shards.GetAt(owned, []byte("forwarded-key"), ^uint64(0))
 	err = finishBootstrapIngress(op, err)
 	require.NoError(t, err, "follower read forwarding uses the same runtime-local ordinary TLS capability")
 	require.Equal(t, "tls-follower-forwarded", string(value))
-	for _, process := range processes {
-		multiEnablementReplicatedRead(t, process, "forwarded-key", "tls-follower-forwarded")
-	}
 }

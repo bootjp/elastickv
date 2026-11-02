@@ -13,6 +13,7 @@ import (
 	"github.com/bootjp/elastickv/internal/peersession"
 	"github.com/bootjp/elastickv/internal/raftadmission"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -99,12 +100,14 @@ func forceBootstrapRecoveryOverlap(t *testing.T, f *bootstrapRotationE2EFixture,
 		entry := registrationEntry(sc.Active.Raft, f.config.local.Member, node.wiring.raftEpoch)
 		req := registrationRequest(sc.Active.Raft, f.config.local.Member, node.wiring.raftEpoch)
 		err = source.propose(ctx, node.group.Proposer(), entry, req)
-		require.True(t, err == nil || errors.Is(err, raftadmission.ErrStale) || errors.Is(err, kv.ErrTransactionOutcomeUnknown) || errors.Is(err, context.Canceled), "registration may lose its own reply after actual apply: %v", err)
+		require.True(t, err == nil || errors.Is(err, raftadmission.ErrStale) || errors.Is(err, kv.ErrTransactionOutcomeUnknown) || errors.Is(err, context.Canceled) || errors.Is(err, raftengine.ErrLeadershipLost), "registration may lose its reply during native recovery: %v", err)
 		require.Eventually(t, func() bool { return node.runtime.engine.Status().AppliedIndex > before }, enablementE2EWait, time.Millisecond)
 		require.Eventually(t, func() bool { return node.domain.admission.Stage(1) == peersession.ControlReady }, enablementE2EWait, time.Millisecond)
 		fresh, err := node.domain.admission.Ticket(1)
 		require.NoError(t, err)
-		require.NotEqual(t, old, fresh, "actual committed registration/native recovery must invalidate the catalog ticket")
+		// An unknown reply does not prove this duplicate registration committed;
+		// the applied prefix and fresh ticket prove actual native recovery.
+		require.NotEqual(t, old, fresh, "actual registration or native prefix/term recovery must invalidate the catalog ticket")
 		overlapped = true
 		if duringRead != nil {
 			duringRead(routes)
