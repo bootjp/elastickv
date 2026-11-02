@@ -24,11 +24,6 @@ type luaScriptContext struct {
 	// ctx is the request-scoped context captured at newLuaScriptContext
 	// time. New cmd* handlers should propagate it into store operations
 	// so the Eval's deadline and cancellation reach storage.
-	//
-	// Existing handlers in this file still use context.Background() at
-	// their store call sites -- a historical pattern from before we had
-	// a ctx available. Migrating those is tracked as a follow-up PR;
-	// see PR #570's review for the gemini note on scope.
 	ctx context.Context
 
 	redisCallDuration time.Duration
@@ -280,6 +275,10 @@ var luaRenameHandlers = map[redisValueType]luaRenameHandler{
 }
 
 func newLuaScriptContext(ctx context.Context, server *RedisServer) (*luaScriptContext, error) {
+	ctx = server.redisContext(ctx)
+	if err := ctx.Err(); err != nil {
+		return nil, errors.WithStack(err)
+	}
 	// LeaseRead confirms leadership at most once per LeaseDuration window;
 	// inside the window it returns immediately without a Raft round-trip.
 	// All subsequent reads within the script use snapshotGetAt at startTS,
@@ -396,7 +395,8 @@ func (c *luaScriptContext) loadTTL(key []byte) (*time.Time, error) {
 	if st.loaded {
 		return st.value, nil
 	}
-	value, err := c.server.ttlAt(context.Background(), key, c.startTS)
+	value, err := c.server.ttlAt(c.scriptCtx(),
+		key, c.startTS)
 	if err != nil {
 		return nil, err
 	}
@@ -639,7 +639,7 @@ func (c *luaScriptContext) stringState(key []byte) (*luaStringState, error) {
 		return nil, wrongTypeError()
 	}
 
-	value, _, err := c.server.readRedisStringAtSnapshot(key, c.startTS)
+	value, _, err := c.server.readRedisStringAtSnapshot(key, c.startTS, c.scriptCtx())
 	if errors.Is(err, store.ErrKeyNotFound) {
 		st.loaded = true
 		return st, nil
@@ -677,7 +677,8 @@ func (c *luaScriptContext) listState(key []byte) (*luaListState, error) {
 		return nil, wrongTypeError()
 	}
 
-	meta, exists, err := c.server.resolveListMeta(context.Background(), key, c.startTS)
+	meta, exists, err := c.server.resolveListMeta(c.scriptCtx(),
+		key, c.startTS)
 	if err != nil {
 		return nil, err
 	}
@@ -707,7 +708,8 @@ func (c *luaScriptContext) materializeList(key []byte, st *luaListState) error {
 	if remaining := st.remainingOriginalLen(); remaining > 0 {
 		start := st.leftTrim
 		end := st.meta.Len - st.rightTrim - 1
-		fetched, err := c.server.fetchListRange(context.Background(), key, st.meta, start, end, c.startTS)
+		fetched, err := c.server.fetchListRange(c.scriptCtx(),
+			key, st.meta, start, end, c.startTS)
 		if err != nil {
 			return err
 		}
@@ -765,7 +767,8 @@ func (c *luaScriptContext) hashState(key []byte) (*luaHashState, error) {
 		return nil, wrongTypeError()
 	}
 
-	value, err := c.server.loadHashAt(context.Background(), key, c.startTS)
+	value, err := c.server.loadHashAt(c.scriptCtx(),
+		key, c.startTS)
 	if err != nil {
 		return nil, err
 	}
@@ -801,7 +804,8 @@ func (c *luaScriptContext) setState(key []byte) (*luaSetState, error) {
 		return nil, wrongTypeError()
 	}
 
-	value, err := c.server.loadSetAt(context.Background(), setKind, key, c.startTS)
+	value, err := c.server.loadSetAt(c.scriptCtx(),
+		setKind, key, c.startTS)
 	if err != nil {
 		return nil, err
 	}
@@ -838,7 +842,8 @@ func (c *luaScriptContext) zsetState(key []byte) (*luaZSetState, error) {
 
 	// zsetStorageHintAt performs the member-prefix scan once, so we never need
 	// a second ScanAt after type detection.
-	h, err := c.server.zsetStorageHintAt(context.Background(), key, c.startTS)
+	h, err := c.server.zsetStorageHintAt(c.scriptCtx(),
+		key, c.startTS)
 	if err != nil {
 		return nil, err
 	}
@@ -867,7 +872,8 @@ func (c *luaScriptContext) zsetState(key []byte) (*luaZSetState, error) {
 	}
 	// No !zs|mem| rows: either wide-column with all members deleted (meta/delta
 	// only) or legacy blob. Probe the legacy blob key to distinguish.
-	blobExists, err := c.server.store.ExistsAt(context.Background(), redisZSetKey(key), c.startTS)
+	blobExists, err := c.server.store.ExistsAt(c.scriptCtx(),
+		redisZSetKey(key), c.startTS)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -906,7 +912,8 @@ func (c *luaScriptContext) ensureZSetLoaded(st *luaZSetState, key []byte) error 
 	}
 	members := map[string]float64{}
 	if st.exists {
-		value, _, err := c.server.loadZSetAt(context.Background(), key, c.startTS)
+		value, _, err := c.server.loadZSetAt(c.scriptCtx(),
+			key, c.startTS)
 		if err != nil {
 			return err
 		}
@@ -971,7 +978,8 @@ func (c *luaScriptContext) memberScoreFromPebble(st *luaZSetState, key []byte, m
 		score, ok := st.members[member]
 		return score, ok, nil
 	}
-	raw, err := c.server.store.GetAt(context.Background(), store.ZSetMemberKey(key, []byte(member)), c.startTS)
+	raw, err := c.server.store.GetAt(c.scriptCtx(),
+		store.ZSetMemberKey(key, []byte(member)), c.startTS)
 	if errors.Is(err, store.ErrKeyNotFound) {
 		st.storageScores[member] = nil
 		return 0, false, nil
@@ -1007,7 +1015,8 @@ func (c *luaScriptContext) zsetCard(st *luaZSetState, key []byte) (int64, error)
 		return int64(len(st.members)), nil
 	}
 	if !st.resolvedBaseCardCached {
-		baseLen, _, err := c.server.resolveZSetMeta(context.Background(), key, c.startTS)
+		baseLen, _, err := c.server.resolveZSetMeta(c.scriptCtx(),
+			key, c.startTS)
 		if err != nil {
 			return 0, err
 		}
@@ -1655,7 +1664,8 @@ func (c *luaScriptContext) cmdHGet(args []string) (luaReply, error) {
 	// the top-level HGET handler uses (see adapter/redis_compat_commands.go),
 	// reused verbatim here so BullMQ-style scripts that touch many
 	// hash keys stop paying the type-probe tax per redis.call.
-	raw, hit, alive, err := c.server.hashFieldFastLookup(context.Background(), key, []byte(field), c.startTS)
+	raw, hit, alive, err := c.server.hashFieldFastLookup(c.scriptCtx(),
+		key, []byte(field), c.startTS)
 	if err != nil {
 		return luaReply{}, err
 	}
@@ -1886,7 +1896,8 @@ func (c *luaScriptContext) cmdHExists(args []string) (luaReply, error) {
 		}
 		return hexistsFromSlowPath(c, key, field)
 	}
-	hit, alive, err := c.server.hashFieldFastExists(context.Background(), key, []byte(field), c.startTS)
+	hit, alive, err := c.server.hashFieldFastExists(c.scriptCtx(),
+		key, []byte(field), c.startTS)
 	if err != nil {
 		return luaReply{}, err
 	}
@@ -2661,7 +2672,8 @@ func (c *luaScriptContext) cmdSIsMember(args []string) (luaReply, error) {
 		}
 		return sismemberFromSlowPath(c, key, member)
 	}
-	hit, alive, err := c.server.setMemberFastExists(context.Background(), key, []byte(member), c.startTS)
+	hit, alive, err := c.server.setMemberFastExists(c.scriptCtx(),
+		key, []byte(member), c.startTS)
 	if err != nil {
 		return luaReply{}, err
 	}
@@ -2968,15 +2980,10 @@ func (c *luaScriptContext) zrangeByScoreFastPath(
 }
 
 // scriptCtx returns the request-scoped context captured at script
-// construction, or context.Background() if the caller bypassed the
-// normal entry point (unit tests constructing a luaScriptContext
-// directly). New code should always have a real ctx, so this is a
-// defensive fallback.
+// construction. Legacy unit fixtures may omit it; protected fixtures and
+// handlers without an owned context receive a cancelled context, never fresh H.
 func (c *luaScriptContext) scriptCtx() context.Context {
-	if c.ctx == nil {
-		return context.Background()
-	}
-	return c.ctx
+	return c.server.redisContext(c.ctx)
 }
 
 // cmdZRangeByScoreSlow is the legacy full-load path, preserved for
@@ -3199,7 +3206,8 @@ func (c *luaScriptContext) cmdZScore(args []string) (luaReply, error) {
 		}
 		return zscoreFromSlowPath(c, key, member)
 	}
-	score, hit, alive, err := c.server.zsetMemberFastScore(context.Background(), key, []byte(member), c.startTS)
+	score, hit, alive, err := c.server.zsetMemberFastScore(c.scriptCtx(),
+		key, []byte(member), c.startTS)
 	if err != nil {
 		return luaReply{}, err
 	}

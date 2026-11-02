@@ -54,7 +54,8 @@ type ShardGroup struct {
 	// 6E-2d) can activate the wrap the instant the cutover entry
 	// commits, without rebuilding the TransactionManager or
 	// stalling in-flight proposals.
-	raftPayloadWrap atomic.Pointer[RaftPayloadWrapper]
+	raftPayloadWrap            atomic.Pointer[RaftPayloadWrapper]
+	raftPayloadWrapInvalidator atomic.Pointer[func() func()]
 	// proposer is the wrap-aware proposer chain for this shard
 	// group. Set by NewLeaderProxyForShardGroup so direct shard
 	// proposals (HLC lease renewal — see RunHLCLeaseRenewal —
@@ -124,11 +125,7 @@ func (g *ShardGroup) Proposer() raftengine.Proposer {
 // EnableRaftEnvelope handler will call this on every leader when
 // the cutover entry commits.
 func (g *ShardGroup) SetRaftPayloadWrap(wrap RaftPayloadWrapper) {
-	if wrap == nil {
-		g.raftPayloadWrap.Store(nil)
-		return
-	}
-	g.raftPayloadWrap.Store(&wrap)
+	g.SetObservedRaftPayloadWrap(wrap)
 }
 
 // RaftPayloadWrap returns the currently-installed wrap closure, or
@@ -262,8 +259,9 @@ func NewLeaderProxyForShardGroup(g *ShardGroup, opts ...TransactionOption) *Lead
 // resp.CommitIndex > 0, which the underlying manager sets to the
 // last applied index only when at least one proposal went through.
 type leaseRefreshingTxn struct {
-	inner Transactional
-	g     *ShardGroup
+	groupID uint64
+	inner   Transactional
+	g       *ShardGroup
 	// coord back-references the owning coordinator so Commit can
 	// consult the Stage 7a registration barrier. Every self-originated
 	// write — client writes via router.Commit AND internal
@@ -276,6 +274,25 @@ type leaseRefreshingTxn struct {
 }
 
 func (t *leaseRefreshingTxn) Commit(ctx context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
+	start := monoclock.Now()
+	expectedGen := t.g.lease.generation()
+	resp, err := admittedOperation(ctx, t.operationAdmission(), t.groupID, AdmissionData, func(owned context.Context) (*TransactionResponse, error) {
+		return t.commitAdmitted(owned, reqs)
+	})
+	if err == nil {
+		t.maybeRefresh(resp, start, expectedGen)
+	}
+	return resp, err
+}
+
+func (t *leaseRefreshingTxn) operationAdmission() OperationAdmission {
+	if t.coord == nil {
+		return nil
+	}
+	return t.coord.operationAdmission
+}
+
+func (t *leaseRefreshingTxn) commitAdmitted(ctx context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
 	// Stage 7a §4.1: every Commit is a self-originated write, so gate it
 	// on this node's writer registration. This is the universal
 	// chokepoint (router.Commit and ShardStore lock-resolution both land
@@ -287,8 +304,6 @@ func (t *leaseRefreshingTxn) Commit(ctx context.Context, reqs []*pb.Request) (*T
 	if err := t.stampRawTimestampsForLocalCommit(ctx, reqs); err != nil {
 		return nil, err
 	}
-	start := monoclock.Now()
-	expectedGen := t.g.lease.generation()
 	resp, leaderCommitTS, err := t.commitWithLocalStamp(ctx, reqs)
 	if err != nil {
 		// Only invalidate on errors that actually signal a leadership
@@ -311,7 +326,6 @@ func (t *leaseRefreshingTxn) Commit(ctx context.Context, reqs []*pb.Request) (*T
 		}
 		resp.CommitTS = leaderCommitTS
 	}
-	t.maybeRefresh(resp, start, expectedGen)
 	return resp, nil
 }
 
@@ -413,7 +427,9 @@ func hasUnstampedRawRequests(reqs []*pb.Request) bool {
 func (t *leaseRefreshingTxn) Abort(ctx context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
 	start := monoclock.Now()
 	expectedGen := t.g.lease.generation()
-	resp, err := t.inner.Abort(ctx, reqs)
+	resp, err := admittedOperation(ctx, t.operationAdmission(), t.groupID, AdmissionData, func(owned context.Context) (*TransactionResponse, error) {
+		return t.inner.Abort(owned, reqs)
+	})
 	if err != nil {
 		if isLeadershipLossError(err) {
 			t.g.lease.invalidate()
@@ -477,11 +493,12 @@ const (
 // ShardedCoordinator routes operations to shard-specific raft groups.
 // It issues timestamps via a shared HLC and uses ShardRouter to dispatch.
 type ShardedCoordinator struct {
-	engine       *distribution.Engine
-	router       *ShardRouter
-	groups       map[uint64]*ShardGroup
-	defaultGroup uint64
-	clock        *HLC
+	operationAdmission OperationAdmission
+	engine             *distribution.Engine
+	router             *ShardRouter
+	groups             map[uint64]*ShardGroup
+	defaultGroup       uint64
+	clock              *HLC
 	// tsAllocator is an optional TSO-backed timestamp source used for every
 	// coordinator-owned persistence timestamp. Nil preserves the legacy shared
 	// HLC path.
@@ -972,8 +989,9 @@ func NewShardedCoordinator(engine *distribution.Engine, groups map[uint64]*Shard
 				// coordinator so Commit consults the freshly-installed
 				// registration gate, not a stale one.
 				existing.coord = c
+				existing.groupID = gid
 			} else {
-				g.Txn = &leaseRefreshingTxn{inner: g.Txn, g: g, coord: c}
+				g.Txn = &leaseRefreshingTxn{inner: g.Txn, g: g, coord: c, groupID: gid}
 			}
 		}
 		c.configureTimestampAdmissionForGroup(g)
@@ -1014,6 +1032,31 @@ func (c *ShardedCoordinator) Close() error {
 }
 
 func (c *ShardedCoordinator) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
+	group := c.defaultGroup
+	if c.operationAdmission != nil {
+		group = c.dispatchAdmissionGroup(reqs)
+	}
+	return admittedOperation(ctx, c.operationAdmission, group, AdmissionData, func(owned context.Context) (*CoordinateResponse, error) {
+		return c.dispatchAdmitted(owned, reqs)
+	})
+}
+
+func (c *ShardedCoordinator) dispatchAdmissionGroup(reqs *OperationGroup[OP]) uint64 {
+	if reqs == nil || len(reqs.Elems) == 0 || reqs.Elems[0] == nil || reqs.Elems[0].Op == DelPrefix {
+		return c.defaultGroup
+	}
+	if reqs.Elems[0].GroupID != 0 {
+		return reqs.Elems[0].GroupID
+	}
+	if c.router != nil {
+		if gid, ok := c.router.ResolveGroup(reqs.Elems[0].Key); ok {
+			return gid
+		}
+	}
+	return c.defaultGroup
+}
+
+func (c *ShardedCoordinator) dispatchAdmitted(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -1737,9 +1780,7 @@ func (c *ShardedCoordinator) broadcastToAllGroups(ctx context.Context, requests 
 			r, err := participant.group.Txn.Commit(ctx, participant.requests)
 			if err != nil {
 				errMu.Lock()
-				if firstErr == nil {
-					firstErr = err
-				}
+				firstErr = c.combineBroadcastErrors(firstErr, err)
 				errMu.Unlock()
 				return
 			}
@@ -1759,6 +1800,16 @@ func (c *ShardedCoordinator) broadcastToAllGroups(ctx context.Context, requests 
 		return nil, errors.WithStack(firstErr)
 	}
 	return &CoordinateResponse{CommitIndex: maxIndex.Load()}, nil
+}
+
+func (c *ShardedCoordinator) combineBroadcastErrors(first, next error) error {
+	if c.operationAdmission != nil {
+		return errors.Join(first, next)
+	}
+	if first != nil {
+		return first
+	}
+	return next
 }
 
 func (c *ShardedCoordinator) dispatchTxn(
@@ -2285,7 +2336,7 @@ func (c *ShardedCoordinator) commitOneSecondary(ctx context.Context, gid, startT
 		ObservedRouteVersion: observedRouteVersion,
 		WriteFenceBypassKeys: bypassKeys,
 	}
-	response, err := commitSecondaryWithRetry(ctx, g, req)
+	response, err := commitSecondaryWithRetry(ctx, g, req, c.operationAdmission != nil)
 	if err != nil {
 		return 0, c.secondaryCommitFailure(err, gid, startTS, commitTS, primaryKey, strict)
 	}
@@ -2299,7 +2350,7 @@ func (c *ShardedCoordinator) commitOneSecondary(ctx context.Context, gid, startT
 }
 
 func (c *ShardedCoordinator) secondaryCommitFailure(err error, gid, startTS, commitTS uint64, primaryKey []byte, strict bool) error {
-	if strict {
+	if strict || c.operationAdmission != nil {
 		return fmt.Errorf("%w: %w", ErrTransactionOutcomeUnknown, err)
 	}
 	message := "txn secondary commit failed"
@@ -2319,7 +2370,7 @@ func (c *ShardedCoordinator) secondaryCommitFailure(err error, gid, startTS, com
 	return nil
 }
 
-func commitSecondaryWithRetry(ctx context.Context, g *ShardGroup, req *pb.Request) (*TransactionResponse, error) {
+func commitSecondaryWithRetry(ctx context.Context, g *ShardGroup, req *pb.Request, preserveOutcomes ...bool) (*TransactionResponse, error) {
 	if g == nil || g.Txn == nil || req == nil {
 		return nil, errors.WithStack(ErrInvalidRequest)
 	}
@@ -2328,6 +2379,9 @@ func commitSecondaryWithRetry(ctx context.Context, g *ShardGroup, req *pb.Reques
 		resp, err := g.Txn.Commit(ctx, []*pb.Request{req})
 		if err == nil {
 			return resp, nil
+		}
+		if requireAllParticipantsFlag(preserveOutcomes) && errors.Is(err, ErrTransactionOutcomeUnknown) {
+			return nil, errors.WithStack(err)
 		}
 		lastErr = err
 		if attempt+1 < txnSecondaryCommitRetryAttempts {
@@ -2392,6 +2446,16 @@ func (c *ShardedCoordinator) allocateTimestamp(ctx context.Context, label string
 }
 
 func (c *ShardedCoordinator) allocateTimestampAfter(ctx context.Context, label string, min uint64) (uint64, error) {
+	group := c.defaultGroup
+	if timestampGroup, ok := c.effectiveTimestampGroup(); ok {
+		group = timestampGroup
+	}
+	return admittedOperation(ctx, c.operationAdmission, group, AdmissionAllocator, func(owned context.Context) (uint64, error) {
+		return c.allocateAdmittedTimestampAfter(owned, label, min)
+	})
+}
+
+func (c *ShardedCoordinator) allocateAdmittedTimestampAfter(ctx context.Context, label string, min uint64) (uint64, error) {
 	if min == ^uint64(0) {
 		return 0, errors.Wrap(ErrTxnCommitTSRequired, label)
 	}
@@ -3693,6 +3757,8 @@ func (c *ShardedCoordinator) RunHLCLeaseRenewal(ctx context.Context) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	var children sync.WaitGroup
+	defer children.Wait()
 	if len(c.groups) == 0 {
 		c.logger().WarnContext(ctx, "hlc lease renewal: no shard groups configured")
 		return
@@ -3710,7 +3776,12 @@ func (c *ShardedCoordinator) RunHLCLeaseRenewal(ctx context.Context) {
 				timer.Reset(hlcRenewalInterval)
 				continue
 			}
-			c.renewHLCLeases(ctx)
+			done := c.renewHLCLeases(ctx)
+			children.Add(1)
+			go func() {
+				defer children.Done()
+				<-done
+			}()
 			timer.Reset(hlcRenewalInterval)
 		case <-ctx.Done():
 			return
@@ -3728,7 +3799,10 @@ func (c *ShardedCoordinator) ProposeHLCLease(ctx context.Context, ceilingMs int6
 		if group == nil || group.Engine == nil || group.Engine.State() != raftengine.StateLeader {
 			continue
 		}
-		if err := c.proposeHLCLeaseForGroup(ctx, group, ceilingMs); err != nil {
+		if err := c.proposeHLCLeaseForGroup(ctx, gid, group, ceilingMs); err != nil {
+			if c.operationAdmission != nil {
+				return errors.Wrapf(err, "hlc lease renewal group %d", gid)
+			}
 			if firstErr == nil {
 				firstErr = errors.Wrapf(err, "hlc lease renewal group %d", gid)
 			}
@@ -3756,7 +3830,8 @@ func (c *ShardedCoordinator) timestampLeaseRenewalGroupIDs() []uint64 {
 // currently leads. A group with an older renewal still in flight is skipped for
 // this tick so slow Raft proposals cannot stack up behind write-heavy traffic;
 // other led groups continue renewing independently. The returned channel closes
-// when the launched proposals finish and exists for tests/diagnostics only.
+// when the launched proposals finish; the outer renewal loop joins it before
+// returning so proposal owners cannot outlive the loop.
 func (c *ShardedCoordinator) renewHLCLeases(ctx context.Context) <-chan struct{} {
 	if ctx == nil {
 		ctx = context.Background()
@@ -3870,7 +3945,7 @@ func (c *ShardedCoordinator) recoverHLCLeaseTargets(ctx context.Context, targets
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := c.proposeHLCLeaseForGroup(ctx, target.group, ceilingMs); err != nil {
+			if err := c.proposeHLCLeaseForGroup(ctx, target.gid, target.group, ceilingMs); err != nil {
 				errCh <- errors.Wrapf(err, "recover hlc lease group %d", target.gid)
 			}
 		}()
@@ -3878,7 +3953,14 @@ func (c *ShardedCoordinator) recoverHLCLeaseTargets(ctx context.Context, targets
 	wg.Wait()
 	close(errCh)
 	for err := range errCh {
-		recoveryErr = combineHLCRecoveryErrors(recoveryErr, err)
+		if c.operationAdmission != nil {
+			recoveryErr = errors.Join(recoveryErr, err)
+		} else {
+			recoveryErr = combineHLCRecoveryErrors(recoveryErr, err)
+		}
+	}
+	if c.operationAdmission != nil && recoveryErr != nil {
+		return recoveryErr
 	}
 	if !hlcCeilingExhausted(c.clock) {
 		return nil
@@ -3934,7 +4016,7 @@ func shardGroupAcceptingWrites(group *ShardGroup) bool {
 
 func (c *ShardedCoordinator) renewHLCLease(ctx context.Context, gid uint64, group *ShardGroup) {
 	ceilingMs := time.Now().UnixMilli() + hlcPhysicalWindowMs
-	if err := c.proposeHLCLeaseForGroup(ctx, group, ceilingMs); err != nil {
+	if err := c.proposeHLCLeaseForGroup(ctx, gid, group, ceilingMs); err != nil {
 		c.logger().WarnContext(ctx, "hlc lease renewal failed",
 			slog.Uint64("group_id", gid),
 			slog.Int64("ceiling_ms", ceilingMs),
@@ -3943,7 +4025,7 @@ func (c *ShardedCoordinator) renewHLCLease(ctx context.Context, gid uint64, grou
 	}
 }
 
-func (c *ShardedCoordinator) proposeHLCLeaseForGroup(ctx context.Context, group *ShardGroup, ceilingMs int64) error {
+func (c *ShardedCoordinator) proposeHLCLeaseForGroup(ctx context.Context, gid uint64, group *ShardGroup, ceilingMs int64) error {
 	start := monoclock.Now()
 	expectedGen := group.lease.generation()
 	// Route through the ShardGroup's wrap-aware proposer chain — NOT a
@@ -3952,7 +4034,9 @@ func (c *ShardedCoordinator) proposeHLCLeaseForGroup(ctx context.Context, group 
 	// post-cutover at `index > raftEnvelopeCutoverIndex` would land
 	// cleartext and trip the §6.3 strict-> unwrap on every replica's
 	// apply loop (codex P2 round-1).
-	if _, err := group.Proposer().Propose(ctx, marshalHLCLeaseRenew(ceilingMs)); err != nil {
+	if _, err := admittedOperation(ctx, c.operationAdmission, gid, AdmissionHLC, func(owned context.Context) (*raftengine.ProposalResult, error) {
+		return group.Proposer().Propose(owned, marshalHLCLeaseRenew(ceilingMs))
+	}); err != nil {
 		if isLeadershipLossError(err) {
 			group.lease.invalidate()
 		}

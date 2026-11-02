@@ -7,7 +7,8 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-func (r *RedisServer) proxyDBSize() (int, error) {
+func (r *RedisServer) proxyDBSize(requestContexts ...context.Context,
+) (int, error) {
 	leader := r.coordinator.RaftLeader()
 	if leader == "" {
 		return 0, ErrLeaderNotFound
@@ -19,7 +20,8 @@ func (r *RedisServer) proxyDBSize() (int, error) {
 
 	cli := r.getOrCreateLeaderClient(leaderAddr)
 
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.redisContext(requestContexts...),
+		redisDispatchTimeout)
 	defer cancel()
 
 	res, err := cli.DBSize(ctx).Result()
@@ -29,7 +31,7 @@ func (r *RedisServer) proxyDBSize() (int, error) {
 // proxyDel routes DEL keys to the correct leader per key (via RaftLeaderForKey)
 // so that internal-key discovery always runs on the key's leader, even in
 // sharded/multi-raft mode.
-func (r *RedisServer) proxyDel(keys [][]byte) (int64, error) {
+func (r *RedisServer) proxyDel(keys [][]byte, requestContexts ...context.Context) (int64, error) {
 	// Group keys by leader Redis address.
 	byAddr := make(map[string][]string)
 	for _, k := range keys {
@@ -44,7 +46,8 @@ func (r *RedisServer) proxyDel(keys [][]byte) (int64, error) {
 		byAddr[addr] = append(byAddr[addr], string(k))
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.redisContext(requestContexts...),
+		redisDispatchTimeout)
 	defer cancel()
 
 	var total int64
@@ -59,7 +62,7 @@ func (r *RedisServer) proxyDel(keys [][]byte) (int64, error) {
 	return total, nil
 }
 
-func (r *RedisServer) proxyFlushDatabase(all bool) error {
+func (r *RedisServer) proxyFlushDatabase(all bool, requestContexts ...context.Context) error {
 	leader := r.coordinator.RaftLeader()
 	if leader == "" {
 		return ErrLeaderNotFound
@@ -71,7 +74,8 @@ func (r *RedisServer) proxyFlushDatabase(all bool) error {
 
 	cli := r.getOrCreateLeaderClient(leaderAddr)
 
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.redisContext(requestContexts...),
+		redisDispatchTimeout)
 	defer cancel()
 
 	var err error
@@ -83,7 +87,8 @@ func (r *RedisServer) proxyFlushDatabase(all bool) error {
 	return errors.WithStack(err)
 }
 
-func (r *RedisServer) proxyFlushLegacy() (int, error) {
+func (r *RedisServer) proxyFlushLegacy(requestContexts ...context.Context,
+) (int, error) {
 	leader := r.coordinator.RaftLeader()
 	if leader == "" {
 		return 0, ErrLeaderNotFound
@@ -96,7 +101,8 @@ func (r *RedisServer) proxyFlushLegacy() (int, error) {
 	cli := r.getOrCreateLeaderClient(leaderAddr)
 
 	// Use a slightly longer timeout than the leader to account for network latency.
-	ctx, cancel := context.WithTimeout(context.Background(), redisFlushLegacyTimeout+30*time.Second)
+	ctx, cancel := context.WithTimeout(r.redisContext(requestContexts...),
+		redisFlushLegacyTimeout+30*time.Second)
 	defer cancel()
 
 	res := cli.Do(ctx, "FLUSHLEGACY")

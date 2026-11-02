@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"sync"
@@ -23,6 +24,7 @@ type redisPubSub struct {
 	conns   map[redcon.Conn]*pubsubConn
 	detach  func(redcon.Conn) redcon.DetachedConn
 	onClose func(redcon.Conn)
+	closing bool
 	// subs maps channel → set of *pubsubConn subscribed to it
 	subs map[string]map[*pubsubConn]struct{}
 }
@@ -52,7 +54,22 @@ func newRedisPubSub() *redisPubSub {
 // background goroutine is started to handle subsequent subscribe/unsubscribe
 // commands on the detached connection.
 func (ps *redisPubSub) Subscribe(conn redcon.Conn, channel string) {
+	conn = redisLifetimeConn(conn)
+	if conn == nil {
+		return
+	}
+	if carrier, ok := conn.(interface{ requestContext() context.Context }); ok {
+		if ctx := carrier.requestContext(); ctx != nil && ctx.Err() != nil {
+			conn.WriteError(errRedisAdmission.Error())
+			return
+		}
+	}
 	ps.mu.Lock()
+	if ps.closing {
+		ps.mu.Unlock()
+		conn.WriteError("ERR server is shutting down")
+		return
+	}
 	sc, isNew := ps.getOrCreate(conn)
 	ps.addEntry(sc, channel)
 	count := len(sc.chans)
@@ -62,6 +79,28 @@ func (ps *redisPubSub) Subscribe(conn redcon.Conn, channel string) {
 
 	if isNew {
 		go sc.bgrunner(ps)
+	}
+}
+
+// Close joins every detached reader before the server owner can tear down its
+// runtime. Admission cancellation alone is insufficient: ReadCommand must wake.
+func (ps *redisPubSub) Close() {
+	ps.mu.Lock()
+	ps.closing = true
+	conns := make([]*pubsubConn, 0, len(ps.conns))
+	for _, sc := range ps.conns {
+		conns = append(conns, sc)
+	}
+	ps.mu.Unlock()
+	for _, sc := range conns {
+		if raw := sc.dconn.NetConn(); raw != nil {
+			_ = raw.Close()
+		} else {
+			_ = sc.dconn.Close()
+		}
+	}
+	for _, sc := range conns {
+		<-sc.closeCh
 	}
 }
 
@@ -324,20 +363,23 @@ func (sc *pubsubConn) dispatchCommand(ps *redisPubSub, args [][]byte) bool {
 func (sc *pubsubConn) cleanup(ps *redisPubSub) {
 	ps.mu.Lock()
 	ps.removeAll(sc)
-	for conn, s := range ps.conns {
-		if s == sc {
-			delete(ps.conns, conn)
-			break
-		}
-	}
 	ps.mu.Unlock()
 
 	sc.mu.Lock()
 	sc.closed = true
 	sc.mu.Unlock()
 	sc.dconn.Close()
+	if owned, ok := sc.dconn.(*redisOwnedDetachedConn); ok {
+		owned.finish()
+	}
 	if ps.onClose != nil {
 		ps.onClose(sc.conn)
 	}
+	// Keep the lifetime registered until Finish/child joins have returned.
+	// Otherwise Close could miss a reader that is still retiring its owner.
+	ps.mu.Lock()
+	ps.removeAll(sc)
+	delete(ps.conns, sc.conn)
+	ps.mu.Unlock()
 	close(sc.closeCh)
 }

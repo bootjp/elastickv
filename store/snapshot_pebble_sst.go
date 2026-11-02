@@ -449,10 +449,12 @@ func (e *pebbleSSTExporter) Add(key, value []byte) error {
 	e.manifest.EntryCount++
 	e.manifest.UncompressedBytes += entryBytes
 	e.currentBytes += entryBytes
+	// All rows remain in the SST; non-advertised versions only skip the
+	// progress aggregate, matching native recovery's max-data scan.
 	if !isPebbleOperationalKey(key) {
-		_, commitTS := decodeKeyView(key)
-		if commitTS > e.manifest.LastCommitTS {
-			e.manifest.LastCommitTS = commitTS
+		userKey, commitTS := decodeKeyView(key)
+		if !isNonAdvertisedMVCCKey(userKey) {
+			e.manifest.LastCommitTS = max(e.manifest.LastCommitTS, commitTS)
 		}
 	}
 	if e.currentBytes >= e.targetFileBytes {

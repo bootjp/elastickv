@@ -170,15 +170,16 @@ const (
 type SQSServerOption func(*SQSServer)
 
 type SQSServer struct {
-	listen         net.Listener
-	store          store.MVCCStore
-	coordinator    kv.Coordinator
-	httpServer     *http.Server
-	httpConns      *httpConnTracker
-	targetHandlers map[string]func(http.ResponseWriter, *http.Request)
-	leaderSQS      map[string]string
-	region         string
-	staticCreds    map[string]string
+	requestAdmission RequestAdmission
+	listen           net.Listener
+	store            store.MVCCStore
+	coordinator      kv.Coordinator
+	httpServer       *http.Server
+	httpConns        *httpConnTracker
+	targetHandlers   map[string]func(http.ResponseWriter, *http.Request)
+	leaderSQS        map[string]string
+	region           string
+	staticCreds      map[string]string
 	// reaperCtx / reaperCancel drive the retention sweeper goroutine.
 	// Both are initialized in NewSQSServer (never reassigned) so a
 	// concurrent Stop() that lands before Run() completes still reads
@@ -519,6 +520,7 @@ func NewSQSServer(listen net.Listener, st store.MVCCStore, coordinate kv.Coordin
 			opt(s)
 		}
 	}
+	installHTTPRequestAdmission(s.httpServer, s.requestAdmission)
 	return s
 }
 

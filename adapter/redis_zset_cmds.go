@@ -505,6 +505,10 @@ func parseZAddPairs(remaining [][]byte) ([]zaddPair, error) {
 }
 
 func (r *RedisServer) zadd(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
@@ -524,7 +528,8 @@ func (r *RedisServer) zadd(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(conn),
+		redisDispatchTimeout)
 	defer cancel()
 	var added int
 	if err := r.retryRedisWrite(ctx, func() error {
@@ -797,6 +802,10 @@ func (r *RedisServer) zincrbyTxn(ctx context.Context, key []byte, member string,
 }
 
 func (r *RedisServer) zincrby(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
@@ -806,7 +815,8 @@ func (r *RedisServer) zincrby(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(conn),
+		redisDispatchTimeout)
 	defer cancel()
 	var newScore float64
 	if err := r.retryRedisWrite(ctx, func() error {
@@ -982,6 +992,10 @@ func (r *RedisServer) persistZSetRemovalsTxn(ctx context.Context, key []byte, re
 }
 
 func (r *RedisServer) zrange(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
@@ -1007,7 +1021,8 @@ func (r *RedisServer) zrange(conn redcon.Conn, cmd redcon.Command) {
 
 func (r *RedisServer) zrangeRead(conn redcon.Conn, key []byte, start, stop int, opts zrangeOptions) {
 	readTS := r.readTS()
-	typ, err := r.keyTypeAtExpect(context.Background(), key, readTS, redisTypeZSet)
+	typ, err := r.keyTypeAtExpect(r.handlerContext(conn),
+		key, readTS, redisTypeZSet)
 	if err != nil {
 		writeRedisError(conn, err)
 		return
@@ -1021,7 +1036,8 @@ func (r *RedisServer) zrangeRead(conn redcon.Conn, key []byte, start, stop int, 
 		return
 	}
 
-	value, _, err := r.loadZSetAt(context.Background(), key, readTS)
+	value, _, err := r.loadZSetAt(r.handlerContext(conn),
+		key, readTS)
 	if err != nil {
 		writeRedisError(conn, err)
 		return
@@ -1039,18 +1055,31 @@ func (r *RedisServer) zrangeRead(conn redcon.Conn, key []byte, start, stop int, 
 }
 
 func (r *RedisServer) zrem(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	r.zremWithTypeProbe(conn, cmd, false)
 }
 
 func (r *RedisServer) elasticKVZRemFast(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	r.zremWithTypeProbe(conn, cmd, true)
 }
 
 func (r *RedisServer) zremWithTypeProbe(conn redcon.Conn, cmd redcon.Command, fastMiss bool) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(conn),
+		redisDispatchTimeout)
 	defer cancel()
 	var removed int
 	if err := r.retryRedisWrite(ctx, func() error {
@@ -1111,6 +1140,10 @@ func (r *RedisServer) legacyZSetTypeAt(ctx context.Context, key []byte, readTS u
 }
 
 func (r *RedisServer) zremrangebyrank(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
@@ -1125,7 +1158,8 @@ func (r *RedisServer) zremrangebyrank(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(conn),
+		redisDispatchTimeout)
 	defer cancel()
 	var removed int
 	if err := r.retryRedisWrite(ctx, func() error {
@@ -1185,8 +1219,9 @@ func (r *RedisServer) zsetMutationValueAt(
 // (ZADD/ZINCRBY for zsetWaiters). bzpopminWaitLoop enforces this by
 // running fast=false on the first iteration and after every
 // fallback-timer wake or wall-time-bounded re-arm.
-func (r *RedisServer) tryBZPopMinWithMode(key []byte, fast bool) (*bzpopminResult, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+func (r *RedisServer) tryBZPopMinWithMode(key []byte, fast bool, requestContexts ...context.Context) (*bzpopminResult, error) {
+	ctx, cancel := context.WithTimeout(r.redisContext(requestContexts...),
+		redisDispatchTimeout)
 	defer cancel()
 	var result *bzpopminResult
 	err := r.retryRedisWrite(ctx, func() error {
@@ -1512,6 +1547,10 @@ func (r *RedisServer) persistBZPopMinResult(
 }
 
 func (r *RedisServer) bzpopmin(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyBlockingToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
@@ -1540,7 +1579,8 @@ func (r *RedisServer) bzpopmin(conn redcon.Conn, cmd redcon.Command) {
 // fires between the check and the wait cannot be lost: the buffered
 // channel holds it, and the next select wakes immediately.
 func (r *RedisServer) bzpopminWaitLoop(conn redcon.Conn, keys [][]byte, deadline time.Time) {
-	handlerCtx := r.handlerContext()
+	handlerCtx := r.handlerContext(conn)
+
 	w, release := r.zsetWaiters.Register(keys)
 	defer release()
 	// fast tracks whether the next iteration may skip the wrongType
@@ -1601,7 +1641,7 @@ func (r *RedisServer) bzpopminWaitLoop(conn redcon.Conn, keys [][]byte, deadline
 // the full check.
 func (r *RedisServer) bzpopminTryAllKeys(conn redcon.Conn, keys [][]byte, fast bool) bool {
 	for _, key := range keys {
-		result, err := r.tryBZPopMinWithMode(key, fast)
+		result, err := r.tryBZPopMinWithMode(key, fast, r.handlerContext(conn))
 		if err != nil {
 			writeRedisError(conn, err)
 			return true

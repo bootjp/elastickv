@@ -3,8 +3,10 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/peersession"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
@@ -145,8 +147,30 @@ func checkSplitMigrationTransport(ctx context.Context, method, token string, pee
 	if !ok {
 		return errors.WithStack(status.Error(codes.Unauthenticated, "split migration token requires TLS"))
 	}
-	if _, ok := p.AuthInfo.(credentials.TLSInfo); !ok {
+	if !splitMigrationTLSProtectedTransport(p.AuthInfo) {
 		return errors.WithStack(status.Error(codes.Unauthenticated, "split migration token requires TLS"))
 	}
 	return nil
+}
+
+// This is token confidentiality, NOT peer identity/session authorization. Native
+// server AuthInfo is transport-owned; headers/context flags cannot substitute.
+// CheckSecurityLevel alone accepts legacy zero CommonAuthInfo, so require the
+// explicit native TLS contract as well. Public TLS needs no client certificate.
+func splitMigrationTLSProtectedTransport(auth credentials.AuthInfo) bool {
+	var info credentials.TLSInfo
+	switch native := auth.(type) {
+	case credentials.TLSInfo:
+		info = native
+	case *peersession.ServerAuthInfo:
+		var current bool
+		info, current = native.TransportTLSInfo()
+		if !current {
+			return false
+		}
+	default:
+		return false
+	}
+	return info.SecurityLevel == credentials.PrivacyAndIntegrity && info.State.HandshakeComplete &&
+		info.State.Version >= tls.VersionTLS12 && info.State.CipherSuite != 0
 }
