@@ -1165,7 +1165,7 @@ func TestOperationJournalCommittedAttemptWinsGenerationFence(t *testing.T) {
 	require.Equal(t, AttemptCommitted, outcome)
 }
 
-func TestOperationJournalLostGenerationFenceReplyRetainsAbortProof(t *testing.T) {
+func TestOperationJournalLostGenerationFenceReplyRecoversAbortProof(t *testing.T) {
 	ctx := context.Background()
 	journal, _, _ := testOperationJournal(t)
 	id := testOperationID(t, journal, 1)
@@ -1174,8 +1174,9 @@ func TestOperationJournalLostGenerationFenceReplyRetainsAbortProof(t *testing.T)
 	attempt, err := journal.BeginAttempt(ctx, id)
 	require.NoError(t, err)
 	journal = newOperationJournalWithBackend(&lostGenerationFenceBackend{operationJournalBackend: journal.backend, lose: true})
-	_, err = journal.AdvanceGeneration(ctx, id, attempt.AttemptID)
-	require.ErrorIs(t, err, kv.ErrTransactionOutcomeUnknown)
+	next, err := journal.AdvanceGeneration(ctx, id, attempt.AttemptID)
+	require.NoError(t, err)
+	require.Contains(t, next.FencedAttempts, attempt.AttemptID)
 	outcome, record, err := journal.ResolveAttempt(ctx, id, attempt.AttemptID)
 	require.NoError(t, err)
 	require.Equal(t, AttemptAborted, outcome)
@@ -1183,6 +1184,44 @@ func TestOperationJournalLostGenerationFenceReplyRetainsAbortProof(t *testing.T)
 	current, err := journal.BeginAttempt(ctx, id)
 	require.NoError(t, err)
 	require.Equal(t, record.AttemptID, current.AttemptID)
+}
+
+func TestOperationJournalAdvanceGenerationRecoversUnknownSingleGroupCAS(t *testing.T) {
+	for _, loseBeforeCommit := range []bool{true, false} {
+		t.Run(map[bool]string{true: "before", false: "after"}[loseBeforeCommit], func(t *testing.T) {
+			ctx := t.Context()
+			journal, _, _ := testOperationJournal(t)
+			id := testOperationID(t, journal, 1)
+			_, err := journal.Admit(ctx, id, []byte("intent"), 128, 1024)
+			require.NoError(t, err)
+			attempt, err := journal.BeginAttempt(ctx, id)
+			require.NoError(t, err)
+			backend := &unknownSingleGroupCASBackend{operationJournalBackend: journal.backend, loseBeforeCommit: loseBeforeCommit, singleGroup: true}
+			journal = newOperationJournalWithBackend(backend)
+			next, err := journal.AdvanceGeneration(ctx, id, attempt.AttemptID)
+			require.NoError(t, err)
+			require.Contains(t, next.FencedAttempts, attempt.AttemptID)
+			require.NotEqual(t, attempt.AttemptID, next.AttemptID)
+			outcome, _, err := journal.ResolveAttempt(ctx, id, attempt.AttemptID)
+			require.NoError(t, err)
+			require.Equal(t, AttemptAborted, outcome)
+		})
+	}
+}
+
+func TestOperationJournalAdvanceGenerationUnknownWithoutSingleGroupProof(t *testing.T) {
+	ctx := t.Context()
+	journal, _, _ := testOperationJournal(t)
+	id := testOperationID(t, journal, 1)
+	_, err := journal.Admit(ctx, id, []byte("intent"), 128, 1024)
+	require.NoError(t, err)
+	attempt, err := journal.BeginAttempt(ctx, id)
+	require.NoError(t, err)
+	backend := &unknownSingleGroupCASBackend{operationJournalBackend: journal.backend, loseBeforeCommit: false}
+	journal = newOperationJournalWithBackend(backend)
+	_, err = journal.AdvanceGeneration(ctx, id, attempt.AttemptID)
+	require.ErrorIs(t, err, kv.ErrTransactionOutcomeUnknown)
+	require.Equal(t, 1, backend.commits)
 }
 
 func TestOperationJournalGenerationFenceRespectsSessionQuota(t *testing.T) {

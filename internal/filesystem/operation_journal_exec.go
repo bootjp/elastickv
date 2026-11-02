@@ -18,29 +18,9 @@ import (
 // BeginAttempt records a fresh transaction generation before any effect is
 // dispatched. A duplicate caller receives the same active attempt identity.
 func (j *OperationJournal) BeginAttempt(ctx context.Context, id OperationID) (operationRecord, error) {
-	for retry := range operationCASRetries {
-		observed, ready := j.backend.JournalRouteVersion()
-		if !ready {
-			return operationRecord{}, errors.WithStack(kv.ErrTransactionOutcomeUnknown)
-		}
-		record, err := j.beginAttemptOnce(ctx, id, observed)
-		if err == nil {
-			return record, nil
-		}
-		if !IsWriteConflict(err) && !j.retryUnknownSingleGroupCAS(err, observed) {
-			return operationRecord{}, err
-		}
-		if retry == operationCASRetries-1 && errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
-			return operationRecord{}, err
-		}
-		if waitErr := waitOperationCASRetry(ctx, retry); waitErr != nil {
-			if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
-				return operationRecord{}, errors.Join(err, waitErr)
-			}
-			return operationRecord{}, waitErr
-		}
-	}
-	return operationRecord{}, errors.WithStack(ErrContentionLimit)
+	return j.retryRecordCAS(ctx, ErrContentionLimit, func(observed uint64) (operationRecord, error) {
+		return j.beginAttemptOnce(ctx, id, observed)
+	})
 }
 
 func (j *OperationJournal) beginAttemptOnce(ctx context.Context, id OperationID, observed uint64) (operationRecord, error) {
@@ -71,20 +51,9 @@ func (j *OperationJournal) AdvanceGeneration(ctx context.Context, id OperationID
 	if old == [16]byte{} {
 		return operationRecord{}, errors.WithStack(ErrInvalid)
 	}
-	for retry := range operationCASRetries {
-		observed, ready := j.backend.JournalRouteVersion()
-		if !ready {
-			return operationRecord{}, errors.WithStack(kv.ErrTransactionOutcomeUnknown)
-		}
-		record, err := j.advanceGenerationOnce(ctx, id, old, observed)
-		if !IsWriteConflict(err) {
-			return record, err
-		}
-		if err = waitOperationCASRetry(ctx, retry); err != nil {
-			return operationRecord{}, err
-		}
-	}
-	return operationRecord{}, errors.WithStack(kv.ErrTransactionOutcomeUnknown)
+	return j.retryRecordCAS(ctx, kv.ErrTransactionOutcomeUnknown, func(observed uint64) (operationRecord, error) {
+		return j.advanceGenerationOnce(ctx, id, old, observed)
+	})
 }
 
 func (j *OperationJournal) advanceGenerationOnce(ctx context.Context, id OperationID, old [16]byte, observed uint64) (operationRecord, error) {

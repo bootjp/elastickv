@@ -394,30 +394,47 @@ func (j *OperationJournal) Admit(ctx context.Context, id OperationID, intent []b
 	if err := validateOperationRecord(record); err != nil {
 		return operationRecord{}, err
 	}
+	return j.retryRecordCAS(ctx, ErrContentionLimit, func(observed uint64) (operationRecord, error) {
+		return j.admitOnce(ctx, record, observed)
+	})
+}
+
+// A single-group CAS can be retried at a fresh snapshot because both attempts
+// write the same primary and validate its prior version. Keep an earlier
+// unknown outcome if a later read or retry is interrupted before resolution.
+func (j *OperationJournal) retryRecordCAS(ctx context.Context, exhausted error, attempt func(uint64) (operationRecord, error)) (operationRecord, error) {
+	var priorUnknown error
 	for retry := range operationCASRetries {
 		observed, ready := j.backend.JournalRouteVersion()
 		if !ready {
-			return operationRecord{}, errors.WithStack(kv.ErrTransactionOutcomeUnknown)
+			return operationRecord{}, preserveJournalUnknown(priorUnknown, errors.WithStack(kv.ErrTransactionOutcomeUnknown))
 		}
-		admitted, err := j.admitOnce(ctx, record, observed)
+		record, err := attempt(observed)
+		if err == nil {
+			return record, nil
+		}
 		if j.retryUnknownSingleGroupCAS(err, observed) {
+			if priorUnknown == nil {
+				priorUnknown = err
+			}
 			if retry == operationCASRetries-1 {
-				return operationRecord{}, err
+				return operationRecord{}, priorUnknown
 			}
-			if waitErr := waitOperationCASRetry(ctx, retry); waitErr != nil {
-				return operationRecord{}, errors.Join(err, waitErr)
-			}
-			continue
+		} else if !IsWriteConflict(err) {
+			return record, preserveJournalUnknown(priorUnknown, err)
 		}
-		if IsWriteConflict(err) {
-			if err = waitOperationCASRetry(ctx, retry); err != nil {
-				return operationRecord{}, err
-			}
-			continue
+		if waitErr := waitOperationCASRetry(ctx, retry); waitErr != nil {
+			return operationRecord{}, preserveJournalUnknown(priorUnknown, waitErr)
 		}
-		return admitted, err
 	}
-	return operationRecord{}, errors.WithStack(ErrContentionLimit)
+	return operationRecord{}, preserveJournalUnknown(priorUnknown, errors.WithStack(exhausted))
+}
+
+func preserveJournalUnknown(prior, current error) error {
+	if prior == nil {
+		return current
+	}
+	return errors.Join(prior, current)
 }
 
 func (j *OperationJournal) retryUnknownSingleGroupCAS(err error, observed uint64) bool {
