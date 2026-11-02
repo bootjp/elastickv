@@ -49,13 +49,14 @@ type urgentCompactionRequest struct {
 // tick silently. Compaction is performed as an OCC transaction so concurrent
 // writers never conflict with the compactor.
 type DeltaCompactor struct {
-	st             store.MVCCStore
-	coord          kv.Coordinator
-	logger         *slog.Logger
-	maxCount       int
-	interval       time.Duration
-	timeout        time.Duration
-	timeoutBackoff time.Duration
+	requestAdmission RequestAdmission
+	st               store.MVCCStore
+	coord            kv.Coordinator
+	logger           *slog.Logger
+	maxCount         int
+	interval         time.Duration
+	timeout          time.Duration
+	timeoutBackoff   time.Duration
 	// cursors tracks the exclusive lower bound for the next scan of each
 	// collection type (keyed by collectionDeltaHandler.typeName). This allows
 	// each tick to resume where the previous one stopped, ensuring that keys
@@ -187,7 +188,9 @@ func (c *DeltaCompactor) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case req := <-c.urgentCh:
-			c.compactUrgentKey(ctx, req)
+			if c.requestAdmission == nil {
+				c.compactUrgentKey(ctx, req)
+			}
 		case <-timer.C:
 			if err := c.SyncOnce(ctx); err != nil && !errors.Is(err, context.Canceled) {
 				c.logger.WarnContext(ctx, "delta compactor pass failed", "error", err)
@@ -201,7 +204,7 @@ func (c *DeltaCompactor) Run(ctx context.Context) error {
 // whose delta count has exceeded MaxDeltaScanLimit. The request is dropped
 // silently when the channel is full (the regular tick will catch it).
 func (c *DeltaCompactor) TriggerUrgentCompaction(typeName string, userKey []byte) {
-	if c == nil {
+	if c == nil || c.requestAdmission != nil {
 		return
 	}
 	req := urgentCompactionRequest{typeName: typeName, userKey: bytes.Clone(userKey)}
@@ -327,7 +330,31 @@ func (c *DeltaCompactor) compactUrgentKeyBatch(ctx context.Context, req urgentCo
 // time; under Redis migration load that can starve Raft heartbeats and cause
 // callers to see connection resets. Urgent single-key compaction and TTL
 // migration remain independently key-routed.
-func (c *DeltaCompactor) SyncOnce(ctx context.Context) error {
+func (c *DeltaCompactor) SyncOnce(ctx context.Context) (err error) {
+	if c.requestAdmission == nil || ctx.Value(redisOwnedRequestKey{}) != nil {
+		return c.syncOnceOwned(ctx)
+	}
+	owner, err := c.requestAdmission(ctx)
+	if owner != nil {
+		defer owner.CancelAndJoin()
+	}
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if owner == nil {
+		return errRedisAdmission
+	}
+	defer func() { err = errors.Join(err, owner.Finish(err)) }()
+	if owner.Context() == nil {
+		return errRedisAdmission
+	}
+	if err = owner.Validate(); err != nil {
+		return errors.WithStack(err)
+	}
+	return c.syncOnceOwned(context.WithValue(owner.Context(), redisOwnedRequestKey{}, true))
+}
+
+func (c *DeltaCompactor) syncOnceOwned(ctx context.Context) error {
 	if c.coord == nil {
 		return nil
 	}

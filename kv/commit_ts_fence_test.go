@@ -204,6 +204,38 @@ func TestShardedCoordinatorActivatesCommitTSFence(t *testing.T) {
 	require.True(t, done, "an activated group is remembered")
 }
 
+func TestShardedCoordinatorCommitTSFenceWaitsForReadinessAndAdmission(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.NewPebbleStore(t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+	r, stop := newSingleRaft(t, "fence-ready", NewKvFSMWithHLC(st, NewHLC()))
+	t.Cleanup(stop)
+
+	groups := map[uint64]*ShardGroup{1: {Engine: r, Store: st, Txn: NewLeaderProxyWithEngine(r)}}
+	coord := NewShardedCoordinator(distribution.NewEngine(), groups, 1, NewHLC(), nil).
+		WithCommitTSFenceActivation().WithCommitTSFenceActivationReady(func() bool { return false })
+	coord.activateCommitTSFences(ctx)
+	enabled, err := CommitTSFenceEnabled(ctx, st)
+	require.NoError(t, err)
+	require.False(t, enabled)
+
+	var admitted bool
+	coord.WithCommitTSFenceActivationReady(func() bool { return true })
+	coord.WithOperationAdmission(func(ctx context.Context, group uint64, purpose AdmissionPurpose) (context.Context, func(error) error, error) {
+		require.Equal(t, uint64(1), group)
+		require.Equal(t, AdmissionMaintenance, purpose)
+		admitted = true
+		return ctx, func(err error) error { return err }, nil
+	})
+	coord.activateCommitTSFences(ctx)
+	require.True(t, admitted)
+	require.Eventually(t, func() bool {
+		enabled, err := CommitTSFenceEnabled(ctx, st)
+		return err == nil && enabled
+	}, 5*time.Second, 10*time.Millisecond)
+}
+
 // Without WithCommitTSFenceActivation the coordinator proposes nothing.
 func TestShardedCoordinatorCommitTSFenceActivationIsOptIn(t *testing.T) {
 	t.Parallel()

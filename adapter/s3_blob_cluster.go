@@ -54,13 +54,14 @@ type S3BlobLocalStoreResolver interface {
 }
 
 type grpcS3BlobCluster struct {
-	selfNodeID string
-	members    kv.RaftMembershipCoordinator
-	adminToken string
-	peerToken  string
-	now        func() time.Time
-	capTimeout time.Duration
-	rpcTimeout time.Duration
+	dialOptions kv.GRPCDialOptionsForAddress
+	selfNodeID  string
+	members     kv.RaftMembershipCoordinator
+	adminToken  string
+	peerToken   string
+	now         func() time.Time
+	capTimeout  time.Duration
+	rpcTimeout  time.Duration
 
 	mu          sync.Mutex
 	conns       map[string]*grpc.ClientConn
@@ -77,8 +78,8 @@ type s3BlobCapabilityCache struct {
 // NewGRPCS3BlobCluster constructs the production peer client. An empty token
 // always fails capability negotiation because S3BlobFetch is peer-only and is
 // never exposed by the insecure Admin mode.
-func NewGRPCS3BlobCluster(selfNodeID string, members kv.RaftMembershipCoordinator, adminToken, peerToken string) S3BlobCluster {
-	return &grpcS3BlobCluster{
+func NewGRPCS3BlobCluster(selfNodeID string, members kv.RaftMembershipCoordinator, adminToken, peerToken string, providers ...kv.GRPCDialOptionsForAddress) S3BlobCluster {
+	client := &grpcS3BlobCluster{
 		selfNodeID: strings.TrimSpace(selfNodeID),
 		members:    members,
 		adminToken: adminToken,
@@ -88,6 +89,10 @@ func NewGRPCS3BlobCluster(selfNodeID string, members kv.RaftMembershipCoordinato
 		rpcTimeout: s3BlobPeerRPCTimeout,
 		conns:      map[string]*grpc.ClientConn{},
 	}
+	if len(providers) != 0 {
+		client.dialOptions = providers[0]
+	}
+	return client
 }
 
 func (c *grpcS3BlobCluster) SelfNodeID() string {
@@ -364,6 +369,14 @@ func (c *grpcS3BlobCluster) connFor(address string) (*grpc.ClientConn, error) {
 	if address == "" {
 		return nil, errors.New("s3 blob peer address is empty")
 	}
+	options := internal.GRPCDialOptions()
+	if c.dialOptions != nil {
+		var err error
+		options, err = c.dialOptions(address)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closeCalled {
@@ -372,7 +385,7 @@ func (c *grpcS3BlobCluster) connFor(address string) (*grpc.ClientConn, error) {
 	if conn := c.conns[address]; conn != nil {
 		return conn, nil
 	}
-	conn, err := grpc.NewClient(address, internal.GRPCDialOptions()...)
+	conn, err := grpc.NewClient(address, options...)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}

@@ -9,9 +9,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestCommitTSFenceStartupRequiresReplicatedCatalogBootstrap(t *testing.T) {
-	require.NoError(t, validateCommitTSFenceStartup(false))
-	require.ErrorContains(t, validateCommitTSFenceStartup(true), "requires replicated catalog bootstrap")
+func TestCommitTSFenceStartupRequiresProtectedCatalogBootstrap(t *testing.T) {
+	require.NoError(t, validateCommitTSFenceStartup(false, false))
+	require.NoError(t, validateCommitTSFenceStartup(false, true))
+	require.NoError(t, validateCommitTSFenceStartup(true, true))
+	require.ErrorContains(t, validateCommitTSFenceStartup(true, false), "requires protected Raft catalog bootstrap")
 }
 
 func TestRuntimeInputsRejectCommitTSFenceBeforeOpeningStores(t *testing.T) {
@@ -20,7 +22,7 @@ func TestRuntimeInputsRejectCommitTSFenceBeforeOpeningStores(t *testing.T) {
 	t.Cleanup(func() { *commitTSFence = previous })
 
 	_, _, _, _, err := resolveValidatedRuntimeInputs()
-	require.ErrorContains(t, err, "requires replicated catalog bootstrap")
+	require.ErrorContains(t, err, "requires protected Raft catalog bootstrap")
 }
 
 func TestCatalogSetupRejectsPreviouslyActivatedCommitTSFence(t *testing.T) {
@@ -38,4 +40,5 @@ func TestCatalogSetupRejectsPreviouslyActivatedCommitTSFence(t *testing.T) {
 	version, err := distribution.NewCatalogStore(st).Version(t.Context())
 	require.NoError(t, err)
 	require.Zero(t, version)
+	require.NoError(t, validateNoExistingCommitTSFenceActivation(t.Context(), []*raftGroupRuntime{{spec: groupSpec{id: 1}, store: st}}, true))
 }

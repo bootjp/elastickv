@@ -35,11 +35,20 @@ func (c *ShardedCoordinator) WithCommitTSFenceActivation() *ShardedCoordinator {
 	return c
 }
 
+// WithCommitTSFenceActivationReady delays proposals until the process has
+// loaded its protected catalog and all groups have reached DataReady.
+func (c *ShardedCoordinator) WithCommitTSFenceActivationReady(ready func() bool) *ShardedCoordinator {
+	if c != nil {
+		c.commitTSFenceActivationReady = ready
+	}
+	return c
+}
+
 // activateCommitTSFencesAsync runs one activation pass in the background so
 // a stalled group cannot delay the HLC lease renewal that shares the tick.
 // At most one pass runs at a time.
 func (c *ShardedCoordinator) activateCommitTSFencesAsync(ctx context.Context) {
-	if c == nil || !c.commitTSFenceActivation {
+	if c == nil || !c.commitTSFenceActivation || (c.commitTSFenceActivationReady != nil && !c.commitTSFenceActivationReady()) {
 		return
 	}
 	if !c.commitTSFenceActivationInFlight.CompareAndSwap(false, true) {
@@ -55,30 +64,42 @@ func (c *ShardedCoordinator) activateCommitTSFencesAsync(ctx context.Context) {
 // leads whose store has not applied it yet. A group whose store shows the
 // marker is remembered and not read again.
 func (c *ShardedCoordinator) activateCommitTSFences(ctx context.Context) {
+	if c.commitTSFenceActivationReady != nil && !c.commitTSFenceActivationReady() {
+		return
+	}
 	for gid, group := range c.groups {
-		if _, done := c.commitTSFenceActiveGroups.Load(gid); done {
-			continue
+		if c.commitTSFenceActivationReady != nil && !c.commitTSFenceActivationReady() {
+			return
 		}
-		if group == nil || group.Engine == nil || group.Store == nil || group.Engine.State() != raftengine.StateLeader {
-			continue
-		}
-		enabled, err := CommitTSFenceEnabled(ctx, group.Store)
-		if err != nil {
-			c.logger().WarnContext(ctx, "commit-ts fence activation: read marker", slog.Uint64("group_id", gid), slog.Any("err", err))
-			continue
-		}
-		if enabled {
-			c.commitTSFenceActiveGroups.Store(gid, struct{}{})
-			continue
-		}
-		pctx, cancel := context.WithTimeout(ctx, hlcRenewalProposalTimeout)
-		// The wrap-aware proposer chain, as for HLC lease entries, so the
-		// entry follows the group's Raft envelope cutover.
-		_, err = group.Proposer().Propose(pctx, EncodeCommitTSFenceActivation())
-		cancel()
-		if err != nil {
-			c.logger().WarnContext(ctx, "commit-ts fence activation: propose", slog.Uint64("group_id", gid), slog.Any("err", err))
-		}
+		c.activateCommitTSFenceForGroup(ctx, gid, group)
+	}
+}
+
+func (c *ShardedCoordinator) activateCommitTSFenceForGroup(ctx context.Context, gid uint64, group *ShardGroup) {
+	if _, done := c.commitTSFenceActiveGroups.Load(gid); done {
+		return
+	}
+	if group == nil || group.Engine == nil || group.Store == nil || group.Engine.State() != raftengine.StateLeader {
+		return
+	}
+	enabled, err := CommitTSFenceEnabled(ctx, group.Store)
+	if err != nil {
+		c.logger().WarnContext(ctx, "commit-ts fence activation: read marker", slog.Uint64("group_id", gid), slog.Any("err", err))
+		return
+	}
+	if enabled {
+		c.commitTSFenceActiveGroups.Store(gid, struct{}{})
+		return
+	}
+	pctx, cancel := context.WithTimeout(ctx, hlcRenewalProposalTimeout)
+	// The wrap-aware proposer chain, as for HLC lease entries, so the
+	// entry follows the group's Raft envelope cutover.
+	_, err = admittedOperation(pctx, c.operationAdmission, gid, AdmissionMaintenance, func(owned context.Context) (*raftengine.ProposalResult, error) {
+		return group.Proposer().Propose(owned, EncodeCommitTSFenceActivation())
+	})
+	cancel()
+	if err != nil {
+		c.logger().WarnContext(ctx, "commit-ts fence activation: propose", slog.Uint64("group_id", gid), slog.Any("err", err))
 	}
 }
 

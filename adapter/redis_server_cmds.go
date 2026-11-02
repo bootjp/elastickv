@@ -16,6 +16,10 @@ import (
 )
 
 func (r *RedisServer) info(conn redcon.Conn, _ redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	role := "slave"
 	if r.coordinator != nil && r.coordinator.IsLeader() {
 		role = "master"
@@ -96,6 +100,10 @@ func clientGetName(conn redcon.Conn, cmd redcon.Command, state *connState) {
 }
 
 func (r *RedisServer) clientID(conn redcon.Conn, cmd redcon.Command, state *connState) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if checkClientArity(conn, cmd, "ID", clientSubcommandArgCount) {
 		return
 	}
@@ -103,6 +111,10 @@ func (r *RedisServer) clientID(conn redcon.Conn, cmd redcon.Command, state *conn
 }
 
 func (r *RedisServer) clientInfo(conn redcon.Conn, cmd redcon.Command, state *connState) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if checkClientArity(conn, cmd, "INFO", clientSubcommandArgCount) {
 		return
 	}
@@ -123,6 +135,10 @@ func clientSetInfo(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) client(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	sub := strings.ToUpper(string(cmd.Args[1]))
 	state := getConnState(conn)
 	switch sub {
@@ -153,6 +169,14 @@ func (r *RedisServer) client(conn redcon.Conn, cmd redcon.Command) {
 //	COMMAND GETKEYS cmd args   -> array of extracted keys
 //	COMMAND GETKEYSANDFLAGS    -> ERR unsupported
 func (r *RedisServer) command(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+	r.commandOwned(conn, cmd)
+}
+
+func (r *RedisServer) commandOwned(conn redcon.Conn, cmd redcon.Command) {
+
 	if len(cmd.Args) == 1 {
 		r.writeCommandInfoAll(conn)
 		return
@@ -495,6 +519,10 @@ func parseHelloArgs(state *connState, args [][]byte) error {
 //   - SETNAME is wired into the existing connState.clientName slot, so
 //     a subsequent CLIENT GETNAME observes the name set here.
 func (r *RedisServer) hello(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	state := getConnState(conn)
 	if err := parseHelloArgs(state, cmd.Args[1:]); err != nil {
 		writeRedisError(conn, err)
@@ -529,6 +557,10 @@ func (r *RedisServer) hello(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) selectDB(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	db, err := strconv.Atoi(string(cmd.Args[1]))
 	if err != nil {
 		conn.WriteError("ERR invalid DB index")
@@ -542,6 +574,10 @@ func (r *RedisServer) selectDB(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) quit(conn redcon.Conn, _ redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	conn.WriteString("OK")
 	if err := conn.Close(); err != nil {
 		log.Printf("redis quit close failed: %v", err)
@@ -549,10 +585,15 @@ func (r *RedisServer) quit(conn redcon.Conn, _ redcon.Command) {
 }
 
 func (r *RedisServer) typeCmd(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
-	typ, err := r.keyType(context.Background(), cmd.Args[1])
+	typ, err := r.keyType(r.handlerContext(conn),
+		cmd.Args[1])
 	if err != nil {
 		writeRedisError(conn, err)
 		return
@@ -597,13 +638,17 @@ func writeScanReply(conn redcon.Conn, next int, keys [][]byte) {
 }
 
 func (r *RedisServer) scan(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	cursor, pattern, count, err := parseScanArgs(cmd.Args)
 	if err != nil {
 		writeRedisError(conn, err)
 		return
 	}
 
-	keys, err := r.visibleKeys(pattern)
+	keys, err := r.visibleKeys(pattern, r.handlerContext(conn))
 	if err != nil {
 		writeRedisError(conn, err)
 		return
@@ -623,7 +668,12 @@ func (r *RedisServer) scan(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) publish(conn redcon.Conn, cmd redcon.Command) {
-	count := r.publishCluster(context.Background(), cmd.Args[1], cmd.Args[2])
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
+	count := r.publishCluster(r.handlerContext(conn),
+		cmd.Args[1], cmd.Args[2])
 	if r.traceCommands {
 		log.Printf("redis trace publish remote=%s channel=%q subscribers=%d", conn.RemoteAddr(), string(cmd.Args[1]), count)
 	}
@@ -631,14 +681,22 @@ func (r *RedisServer) publish(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) subscribe(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	for _, channel := range cmd.Args[1:] {
 		r.pubsub.Subscribe(conn, string(channel))
 	}
 }
 
 func (r *RedisServer) dbsize(conn redcon.Conn, _ redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if !r.coordinator.IsLeader() {
-		size, err := r.proxyDBSize()
+		size, err := r.proxyDBSize(r.handlerContext(conn))
 		if err != nil {
 			writeRedisError(conn, err)
 			return
@@ -646,14 +704,15 @@ func (r *RedisServer) dbsize(conn redcon.Conn, _ redcon.Command) {
 		conn.WriteInt(size)
 		return
 	}
-	verifyCtx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
+	verifyCtx, cancel := context.WithTimeout(r.handlerContext(conn),
+		redisDispatchTimeout)
 	defer cancel()
 	if err := r.coordinator.VerifyLeader(verifyCtx); err != nil {
 		writeRedisError(conn, err)
 		return
 	}
 
-	keys, err := r.visibleKeys([]byte("*"))
+	keys, err := r.visibleKeys([]byte("*"), r.handlerContext(conn))
 	if err != nil {
 		writeRedisError(conn, err)
 		return
@@ -662,10 +721,18 @@ func (r *RedisServer) dbsize(conn redcon.Conn, _ redcon.Command) {
 }
 
 func (r *RedisServer) flushdb(conn redcon.Conn, _ redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	r.flushDatabase(conn, false)
 }
 
 func (r *RedisServer) flushall(conn redcon.Conn, _ redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	r.flushDatabase(conn, true)
 }
 
@@ -718,8 +785,12 @@ func (r *RedisServer) deleteLegacyKeys(ctx context.Context, readTS uint64) (int,
 // the !redis|str| prefix migration. It scans all keys and deletes those that
 // do not match any known internal prefix. This is a one-time migration operation.
 func (r *RedisServer) flushlegacy(conn redcon.Conn, _ redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if !r.coordinator.IsLeader() {
-		n, err := r.proxyFlushLegacy()
+		n, err := r.proxyFlushLegacy(r.handlerContext(conn))
 		if err != nil {
 			writeRedisError(conn, err)
 			return
@@ -728,7 +799,8 @@ func (r *RedisServer) flushlegacy(conn redcon.Conn, _ redcon.Command) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), redisFlushLegacyTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(conn),
+		redisFlushLegacyTimeout)
 	defer cancel()
 
 	totalDeleted, err := r.deleteLegacyKeys(ctx, r.readTS())
@@ -741,7 +813,7 @@ func (r *RedisServer) flushlegacy(conn redcon.Conn, _ redcon.Command) {
 
 func (r *RedisServer) flushDatabase(conn redcon.Conn, all bool) {
 	if !r.coordinator.IsLeader() {
-		if err := r.proxyFlushDatabase(all); err != nil {
+		if err := r.proxyFlushDatabase(all, r.handlerContext(conn)); err != nil {
 			writeRedisError(conn, err)
 			return
 		}
@@ -749,7 +821,8 @@ func (r *RedisServer) flushDatabase(conn redcon.Conn, all bool) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(conn),
+		redisDispatchTimeout)
 	defer cancel()
 
 	if err := r.retryRedisWrite(ctx, func() error {
@@ -803,6 +876,10 @@ func (r *RedisServer) flushDatabase(conn redcon.Conn, all bool) {
 }
 
 func (r *RedisServer) pubsubCmd(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	switch strings.ToUpper(string(cmd.Args[1])) {
 	case "CHANNELS":
 		r.writePubSubChannels(conn, cmd.Args)

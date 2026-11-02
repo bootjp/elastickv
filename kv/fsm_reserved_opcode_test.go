@@ -22,8 +22,10 @@ func TestKVFSMReservedOpcodesAreDistinct(t *testing.T) {
 		"migration retire":  raftEncodeMigrationRetire,
 		"migration cleanup": raftEncodeMigrationCleanup,
 		"backup":            raftEncodeBackup,
+		"read watermark":    raftEncodeWatermarkAdvance,
 		"target readiness":  raftEncodeTargetReadiness,
 		"replicated backup": raftEncodeReplicatedBackup,
+		"commit-ts fence":   raftEncodeCommitTSFenceActivation,
 	}
 	owner := make(map[byte]string, len(opcodes))
 	for name, op := range opcodes {
@@ -34,4 +36,6 @@ func TestKVFSMReservedOpcodesAreDistinct(t *testing.T) {
 		}
 		owner[op] = name
 	}
+	require.NotEqual(t, byte(0x1f), raftEncodeCommitTSFenceActivation,
+		"the guarded bootstrap control prefix must not dispatch as a legacy opcode")
 }

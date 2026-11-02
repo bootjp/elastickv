@@ -4,6 +4,7 @@ import "google.golang.org/grpc"
 
 // FactoryConfig holds engine-agnostic parameters for creating a raft engine.
 type FactoryConfig struct {
+	GroupID      uint64
 	LocalID      string
 	LocalAddress string
 	DataDir      string
@@ -29,6 +30,10 @@ type FactoryConfig struct {
 
 // FactoryResult holds the output of Factory.Create.
 type FactoryResult struct {
+	// ServerOptions augments the existing shared group listener. Existing
+	// business authorization interceptors remain installed by the startup owner.
+	ServerOptions     []grpc.ServerOption
+	PublicReady       func() bool
 	Engine            Engine
 	RegisterTransport func(grpc.ServiceRegistrar)
 	// Close releases engine-specific resources that are not owned by

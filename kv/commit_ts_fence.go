@@ -17,10 +17,10 @@ import (
 // raw entry and PREPARE. A per-node switch could not give that: replicas
 // with different settings would accept and reject the same entry.
 //
-// 0x1f (field 3, wire type 7) is an invalid protobuf prefix, so it cannot be
+// 0x2f (field 5, wire type 7) is an invalid protobuf prefix, so it cannot be
 // mistaken for a legacy bare Request (whose first byte is often 0x18, field 3
-// "ts" as a varint) or a RaftCommand.
-const raftEncodeCommitTSFenceActivation byte = 0x1f
+// "ts" as a varint) or a RaftCommand. 0x1f belongs to guarded bootstrap.
+const raftEncodeCommitTSFenceActivation byte = 0x2f
 
 var (
 	commitTSFenceEnabledKey   = []byte(txnMetaPrefix + "commit_ts_fence/enabled")

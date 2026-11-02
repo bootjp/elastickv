@@ -27,8 +27,13 @@ func GRPCDialOptions() []grpc.DialOption {
 	if cfg := grpcTLS.Load(); cfg != nil {
 		creds = cfg.client.Clone()
 	}
+	return append([]grpc.DialOption{grpc.WithTransportCredentials(creds)}, GRPCApplicationDialOptions()...)
+}
+
+// GRPCApplicationDialOptions preserves ordinary forwarding auth and message
+// limits without selecting process-global TLS for runtime-owned transports.
+func GRPCApplicationDialOptions() []grpc.DialOption {
 	return []grpc.DialOption{
-		grpc.WithTransportCredentials(creds),
 		grpc.WithChainUnaryInterceptor(forwardTokenClientInterceptor),
 		grpc.WithDefaultCallOptions(
 			grpc.MaxCallRecvMsgSize(GRPCMaxMessageBytes),

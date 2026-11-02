@@ -48,6 +48,7 @@ func newS3Server(
 		return nil, errors.WithStack(err)
 	}
 	options := []adapter.S3ServerOption{
+		adapter.WithS3RequestAdmission(bootstrapRequestAdmissionForCoordinator(coordinate)),
 		adapter.WithS3Region(region),
 		adapter.WithS3StaticCredentials(staticCreds),
 		adapter.WithS3ActiveTimestampTracker(readTracker),
