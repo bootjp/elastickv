@@ -362,6 +362,9 @@ func (d *DynamoDBServer) itemWriteReuseAttempt(
 	if dispErr == nil {
 		return d.finishItemWriteAttempt(ctx, tableName, pending.plan)
 	}
+	if errors.Is(dispErr, kv.ErrTransactionOutcomeUnknown) {
+		return nil, pending, dispErr
+	}
 	if errors.Is(dispErr, store.ErrWriteConflict) {
 		return d.resolveReuseWriteConflict(ctx, tableName, pending, commitTS, dispErr)
 	}

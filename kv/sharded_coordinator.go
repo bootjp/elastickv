@@ -2157,6 +2157,9 @@ func (c *ShardedCoordinator) prewriteTxn(ctx context.Context, startTS, commitTS 
 			WriteFenceBypassKeys: bypassKeysByGroup[gid],
 		}
 		if _, err := g.Txn.Commit(ctx, []*pb.Request{req}); err != nil {
+			if errors.Is(err, ErrTransactionOutcomeUnknown) {
+				return nil, errors.WithStack(err)
+			}
 			// Same WithoutCancel pattern as dispatchTxn's
 			// commitPrimaryTxn-failure cleanup: a cancelled ctx is
 			// the most likely cause of Commit failing here, and the

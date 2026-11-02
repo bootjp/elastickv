@@ -315,24 +315,15 @@ func (p *LeaderProxy) forward(callerCtx context.Context, parentCtx context.Conte
 }
 
 func classifyForwardRPCError(err error, reqs []*pb.Request) error {
-	// A PREPARE rejection only settles one participant. It cannot prove the
-	// outcome of the logical transaction across other groups or prior attempts.
-	if len(reqs) == 1 && reqs[0] != nil && reqs[0].Phase == pb.Phase_NONE {
-		if isDefinitiveForwardNotLeader(err) {
-			return errors.WithStack(err)
-		}
-		switch {
-		case isDefinitiveForwardConflict(err):
-			return fmt.Errorf("%w: %w", store.ErrWriteConflict, err)
-		case IsForwardTxnLocked(err):
-			return fmt.Errorf("%w: %w", ErrTxnLocked, err)
-		case IsForwardComposed1Violation(err):
-			return fmt.Errorf("%w: %w", ErrComposed1Violation, err)
-		case IsForwardComposed1VersionGCd(err):
-			return fmt.Errorf("%w: %w", ErrComposed1VersionGCd, err)
+	if phase, ok := ForwardFailurePhaseForRequests(reqs); ok {
+		reason, decision, valid := DecodeForwardDecisionStatus(err, phase)
+		if valid && decision == pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN {
+			return &ForwardFailure{Reason: reason, Decision: decision}
 		}
 	}
-	return fmt.Errorf("%w: %w", ErrTransactionOutcomeUnknown, err)
+	// Legacy ErrorInfo, malformed details, and even a definitive-looking
+	// detail have no logical-operation proof in this protocol generation.
+	return &ForwardFailure{Decision: pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN}
 }
 
 func isDefinitiveForwardNotLeader(err error) bool {

@@ -235,6 +235,9 @@ func (r *RedisServer) dispatchListPushReuse(ctx context.Context, key []byte, pen
 	// Normalize before the typed conflict branch; generic Redis writes keep
 	// raw wire write conflicts fail-closed.
 	dispErr = normalizeRetryableRedisTxnErr(dispErr)
+	if errors.Is(dispErr, kv.ErrTransactionOutcomeUnknown) {
+		return 0, false, dispErr
+	}
 	if errors.Is(dispErr, store.ErrWriteConflict) {
 		// Self-inflicted-conflict guard (codex P1): the apply might have
 		// landed at this fresh commitTS but bubbled up as WriteConflict due

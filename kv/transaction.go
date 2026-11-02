@@ -2,7 +2,6 @@ package kv
 
 import (
 	"context"
-	"fmt"
 	"math"
 	"sync"
 	"sync/atomic"
@@ -174,11 +173,11 @@ func applyRequests(ctx context.Context, proposer raftengine.Proposer, reqs []*pb
 		}
 		// Once Propose has been called, a timeout or leadership change does
 		// not prove that the entry was absent from the replicated log.
-		return 0, nil, fmt.Errorf("%w: %w", ErrTransactionOutcomeUnknown, err)
+		return 0, nil, &unknownTransactionFailure{cause: err}
 	}
 	if result == nil {
 		recordProposalFailure(proposalObserver)
-		return 0, nil, fmt.Errorf("%w: raft proposal returned nil result", ErrTransactionOutcomeUnknown)
+		return 0, nil, &unknownTransactionFailure{cause: errors.New("raft proposal returned nil result")}
 	}
 
 	return interpretProposalResult(result, reqs, proposalObserver)
@@ -240,36 +239,16 @@ func hasTxnRequests(reqs []*pb.Request) bool {
 }
 
 func (t *TransactionManager) commitSequential(ctx context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
-	commitIndex, err := func() (uint64, error) {
-		commitIndex := uint64(0)
-		for _, req := range reqs {
-			idx, results, err := applyRequests(ctx, t.proposer, []*pb.Request{req}, t.proposalObserver, t.migrationAdmission.Load())
-			if err != nil {
-				return 0, err
-			}
-			if len(results) > 0 && results[0] != nil {
-				return 0, results[0]
-			}
-			commitIndex = idx
-		}
-
-		return commitIndex, nil
-	}()
+	commitIndex, err := t.applySequentialRequests(ctx, reqs)
 
 	if err != nil {
-		// Only attempt transactional cleanup for transactional batches. Raw request
-		// batches may partially succeed across shards by design. One-phase
-		// transactional requests do not leave intents behind, so they do not need
-		// abort cleanup on failure.
-		if needsTxnCleanup(reqs) {
-			// Use a cleanup ctx that survives the original ctx's
-			// cancellation: the upstream commit very likely failed
-			// because ctx was cancelled / hit its deadline, and Abort
-			// MUST still go through to release intents — otherwise
-			// locks linger until LockResolver picks them up at a
-			// future tick. context.WithoutCancel detaches deadline
-			// and cancellation; we re-bound with verifyLeaderTimeout
-			// so a hung Abort cannot leak the cleanup goroutine.
+		// An unknown proposal may still commit. Aborting its intents here can
+		// contradict a committed primary decision; leave resolution to the
+		// transaction protocol until its outcome is known.
+		var appliedRejection *AppliedRequestRejection
+		if needsTxnCleanup(reqs) && !errors.Is(err, ErrTransactionOutcomeUnknown) && !errors.As(err, &appliedRejection) {
+			// A known rejection can release already-prepared intents without
+			// inheriting an expired caller deadline.
 			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), verifyLeaderTimeout)
 			_, _err := t.Abort(cleanupCtx, reqs)
 			cancel()
@@ -283,6 +262,24 @@ func (t *TransactionManager) commitSequential(ctx context.Context, reqs []*pb.Re
 	return &TransactionResponse{
 		CommitIndex: commitIndex,
 	}, nil
+}
+
+func (t *TransactionManager) applySequentialRequests(ctx context.Context, reqs []*pb.Request) (uint64, error) {
+	commitIndex := uint64(0)
+	for _, req := range reqs {
+		idx, results, err := applyRequests(ctx, t.proposer, []*pb.Request{req}, t.proposalObserver, t.migrationAdmission.Load())
+		if err != nil {
+			return 0, err
+		}
+		if len(results) > 0 && results[0] != nil {
+			if singleRequestApplyVerdict(req, len(reqs), idx, results[0]) {
+				return 0, &AppliedRequestRejection{commitIndex: idx, cause: results[0]}
+			}
+			return 0, &unknownTransactionFailure{cause: results[0]}
+		}
+		commitIndex = idx
+	}
+	return commitIndex, nil
 }
 
 func needsTxnCleanup(reqs []*pb.Request) bool {

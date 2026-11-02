@@ -3057,6 +3057,9 @@ func (r *RedisServer) dispatchExecReuse(ctx context.Context, pending *reusableEx
 	// Normalize before the typed conflict branch; the generic retry loop keeps
 	// raw wire write conflicts fail-closed for callers without this protection.
 	dispErr = normalizeRetryableRedisTxnErr(dispErr)
+	if errors.Is(dispErr, kv.ErrTransactionOutcomeUnknown) {
+		return nil, false, dispErr
+	}
 	if isRedisComposedRouteErr(dispErr) {
 		return nil, false, errors.WithStack(errRedisExecRouteChangedAfterAmbiguousAttempt)
 	}
@@ -3253,7 +3256,7 @@ func (r *RedisServer) firstExecAttempt(dispatchCtx context.Context, queue []redc
 }
 
 func isAmbiguousRedisExecDispatchErr(err error) bool {
-	return errors.Is(err, store.ErrWriteConflict)
+	return !errors.Is(err, kv.ErrTransactionOutcomeUnknown) && errors.Is(err, store.ErrWriteConflict)
 }
 
 func (r *RedisServer) txnStartTS() uint64 {

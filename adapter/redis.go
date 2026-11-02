@@ -401,6 +401,10 @@ func (c *redisMetricsConn) WriteError(msg string) {
 // kv.isLeadershipLossError so any sentinel those classifiers already
 // recognize as transient also flips a Redis reply to NOTLEADER.
 func writeRedisError(conn redcon.Conn, err error) {
+	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+		conn.WriteError("ERR operation outcome unknown")
+		return
+	}
 	msg := err.Error()
 	if isTransientLeaderRedisError(err) {
 		if strings.HasPrefix(strings.ToUpper(msg), "NOTLEADER ") {
