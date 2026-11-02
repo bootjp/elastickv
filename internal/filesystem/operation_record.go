@@ -51,12 +51,13 @@ const (
 )
 
 type operationRecord struct {
-	ID          OperationID    `json:"id"`
-	State       OperationState `json:"state"`
-	Fingerprint [32]byte       `json:"fingerprint"`
-	Intent      []byte         `json:"intent"`
-	Generation  uint64         `json:"generation"`
-	AttemptID   [16]byte       `json:"attempt_id"`
+	ID                  OperationID    `json:"id"`
+	State               OperationState `json:"state"`
+	Fingerprint         [32]byte       `json:"fingerprint"`
+	Intent              []byte         `json:"intent"`
+	Generation          uint64         `json:"generation"`
+	AttemptID           [16]byte       `json:"attempt_id"`
+	AttemptRouteVersion uint64         `json:"attempt_route_version,omitempty"`
 	// RecordIsPrimary certifies that each publication of this operation
 	// selects this row as its transaction primary. Legacy rows omit it and
 	// cannot use generation fencing.

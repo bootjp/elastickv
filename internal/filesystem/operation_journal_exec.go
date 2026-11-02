@@ -19,6 +19,10 @@ import (
 // dispatched. A duplicate caller receives the same active attempt identity.
 func (j *OperationJournal) BeginAttempt(ctx context.Context, id OperationID) (operationRecord, error) {
 	for retry := range operationCASRetries {
+		observed, ready := j.backend.JournalRouteVersion()
+		if !ready {
+			return operationRecord{}, errors.WithStack(kv.ErrTransactionOutcomeUnknown)
+		}
 		ts, record, session, err := j.pendingSnapshot(ctx, id)
 		if err != nil {
 			return operationRecord{}, err
@@ -34,6 +38,7 @@ func (j *OperationJournal) BeginAttempt(ctx context.Context, id OperationID) (op
 			return operationRecord{}, err
 		}
 		record.Generation++
+		record.AttemptRouteVersion = observed
 		if err = j.storeRecordAndSession(ctx, ts, record, session); err != nil {
 			if IsWriteConflict(err) {
 				if err = waitOperationCASRetry(ctx, retry); err != nil {
@@ -84,6 +89,7 @@ func (j *OperationJournal) advanceGenerationOnce(ctx context.Context, id Operati
 	if err != nil {
 		return operationRecord{}, err
 	}
+	record.AttemptRouteVersion = observed
 	if err = j.storeRecordAndSessionAtRoute(ctx, ts, record, session, nil, nil, observed); err != nil {
 		return operationRecord{}, err
 	}
@@ -106,6 +112,7 @@ func prepareGenerationFence(record operationRecord, session operationSession, ol
 	}
 	record.FencedAttempts = append(record.FencedAttempts, old)
 	record.AttemptID = next
+	record.AttemptRouteVersion = 0
 	record.Generation++
 	record.Reservation += operationFenceReservation
 	session.RetainedBytes += operationFenceReservation
@@ -224,10 +231,17 @@ func (j *OperationJournal) Publish(ctx context.Context, id OperationID, attempt 
 	if invalidOperationAttempt(record, attempt) {
 		return operationRecord{}, errors.WithStack(ErrOperationGeneration)
 	}
+	if record.AttemptRouteVersion != 0 && record.AttemptRouteVersion != plan.RouteVersion {
+		return operationRecord{}, errors.WithStack(kv.ErrTransactionOutcomeUnknown)
+	}
 	effectKeys, err := validateOperationPlan(record, session, plan)
 	if err != nil {
 		return operationRecord{}, err
 	}
+	return j.publishValidatedAttempt(ctx, id, attempt, plan, ts, record, session, effectKeys)
+}
+
+func (j *OperationJournal) publishValidatedAttempt(ctx context.Context, id OperationID, attempt [16]byte, plan operationAttemptPlan, ts uint64, record operationRecord, session operationSession, effectKeys [][]byte) (operationRecord, error) {
 	groups, proofs, routedEffects, err := j.operationProofs(record.ID, plan.Effects)
 	if err != nil {
 		return operationRecord{}, err
@@ -239,9 +253,46 @@ func (j *OperationJournal) Publish(ctx context.Context, id OperationID, attempt 
 	session.Pending--
 	effects := slices.Concat(routedEffects, proofs)
 	if err = j.storeRecordAndSessionAtRoute(ctx, ts, record, session, effects, plan.ReadKeys, plan.RouteVersion); err != nil {
+		if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+			return j.recoverSingleGroupPublication(ctx, id, attempt, plan, err)
+		}
 		return j.resolveDuplicatePublication(ctx, id, attempt, plan.Intent, err)
 	}
 	return j.Resolve(ctx, id)
+}
+
+func (j *OperationJournal) recoverSingleGroupPublication(ctx context.Context, id OperationID, attempt [16]byte, plan operationAttemptPlan, originalErr error) (operationRecord, error) {
+	if !j.isSingleGroupPublication(id, plan) {
+		return operationRecord{}, originalErr
+	}
+	outcome, current, err := j.ResolveAttempt(ctx, id, attempt)
+	if outcome != AttemptUnknown || !errors.Is(err, ErrOperationPending) ||
+		current.AttemptRouteVersion != plan.RouteVersion || !current.RecordIsPrimary {
+		return operationRecord{}, originalErr
+	}
+	if _, err = j.AdvanceGeneration(ctx, id, attempt); err != nil {
+		outcome, _, resolveErr := j.ResolveAttempt(ctx, id, attempt)
+		if resolveErr != nil || outcome != AttemptAborted {
+			return operationRecord{}, originalErr
+		}
+	}
+	return operationRecord{}, errors.WithStack(store.ErrWriteConflict)
+}
+
+func (j *OperationJournal) isSingleGroupPublication(id OperationID, plan operationAttemptPlan) bool {
+	if !j.backend.JournalSingleGroupAtVersion(plan.RouteVersion) {
+		return false
+	}
+	primaryGroup, err := j.backend.GroupIDForKey(id.key())
+	if err != nil {
+		return false
+	}
+	for _, effect := range plan.Effects {
+		if effect == nil || (effect.GroupID != 0 && effect.GroupID != primaryGroup) {
+			return false
+		}
+	}
+	return true
 }
 
 func (j *OperationJournal) requirePlanningRoute(observed uint64) error {

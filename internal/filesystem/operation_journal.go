@@ -29,6 +29,7 @@ type operationJournalBackend interface {
 	ScanAt(context.Context, []byte, []byte, int, uint64) ([]*store.KVPair, error)
 	Commit(context.Context, uint64, []*kv.Elem[kv.OP], [][]byte) (*kv.CoordinateResponse, error)
 	JournalRouteVersion() (uint64, bool)
+	JournalSingleGroupAtVersion(uint64) bool
 	CommitAtRouteVersion(context.Context, uint64, []*kv.Elem[kv.OP], [][]byte, uint64) (*kv.CoordinateResponse, error)
 	CommittedVersionAt(context.Context, []byte, uint64) (bool, error)
 	CommittedVersionAtGroup(context.Context, []byte, uint64, uint64) (bool, error)
@@ -72,6 +73,13 @@ func (b serviceOperationBackend) JournalRouteVersion() (uint64, bool) {
 	}
 	_, sharded := b.service.store.(*kv.ShardStore)
 	return 0, !sharded
+}
+
+func (b serviceOperationBackend) JournalSingleGroupAtVersion(observed uint64) bool {
+	if sharded, ok := b.service.store.(*kv.ShardStore); ok {
+		return sharded.JournalSingleGroupAtVersion(observed)
+	}
+	return observed == 0
 }
 
 func (b serviceOperationBackend) CommitAtRouteVersion(ctx context.Context, ts uint64, elems []*kv.Elem[kv.OP], readKeys [][]byte, observed uint64) (*kv.CoordinateResponse, error) {

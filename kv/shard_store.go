@@ -68,6 +68,24 @@ func NewShardStore(engine *distribution.Engine, groups map[uint64]*ShardGroup) *
 	}
 }
 
+// JournalSingleGroupAtVersion proves that a journal attempt could only have
+// used the one-phase path at the pinned catalog version.
+func (s *ShardStore) JournalSingleGroupAtVersion(observed uint64) bool {
+	if s == nil || s.engine == nil || s.partitionResolver != nil {
+		return false
+	}
+	version, tracked := DecodeObservedRouteVersion(observed)
+	if !tracked {
+		return false
+	}
+	snapshot := s.engine.AppliedCatalogSnapshot()
+	if snapshot.Version != version || len(snapshot.Routes) != 1 {
+		return false
+	}
+	route := snapshot.Routes[0]
+	return len(route.Start) == 0 && len(route.End) == 0 && route.GroupID != 0 && route.State == distribution.RouteStateActive
+}
+
 // WithPartitionResolver installs the same partition-keyspace resolver used by
 // ShardedCoordinator. ShardStore keeps normal byte-range routing for ordinary
 // calls, but backup scanners need the resolver to decide which physical group
