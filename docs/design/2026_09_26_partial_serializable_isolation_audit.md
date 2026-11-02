@@ -748,21 +748,20 @@ paths G0 names, behind a replicated activation.
   otherwise advance the watermark on only one replica. Enablement also
   requires every replica to understand tag `0x2f`; an older replica fails to
   decode the entry and does not fence.
-- **Still open:** `DEL_PREFIX`; the replica-determinism caveat above (the
-  fence compares against `LastCommitTS()`, which the catalog bootstrap's
-  direct write also advances), shared with the one-phase fence; the 2PC
-  ABORT timestamp; and G1, which the fence does not touch.
+- **Still open:** `DEL_PREFIX`; the 2PC ABORT timestamp; and G1, which the
+  fence does not touch.
+
+For multi-group 2PC, a secondary read that finishes before PREPARE raises
+that group's replicated watermark to its snapshot timestamp. A PREPARE with
+an older settled commit timestamp is then rejected before the coordinator
+commits the primary. If PREPARE applies first, the read meets its lock.
+`MCOCC_multigroup_2pc.cfg` checks both interleavings with `ReadAdvance` and
+`CommitFence`, and `TestMultiGroupPrepareRejectsCommitBelowSecondaryReadWatermark`
+checks the rejection and abort on two real Raft groups. This does not cover
+deployments that leave read-watermark advancement disabled.
 
 Open after this branch:
 
-- **2PC commit timestamps versus advanced secondaries.** The commit
-  timestamp is allocated on the primary group's leader, whose HLC and
-  watermark may sit below an `s` that a secondary group was advanced to;
-  the secondary COMMIT is unfenced, so it can land at or below `s` on that
-  group if its PREPARE applied after the read. Fix: the primary allocates
-  the commit timestamp above every participant's watermark (each PREPARE
-  reply returns its group's replicated watermark; the allocation goes
-  through the HLC's after-through path). A merge blocker for A0.
 - **Non-transactional reads stay plain.** Redis `GET` and the scans,
   DynamoDB `GetItem` / `Query` / `Scan`, S3 `GET` / `LIST`, and the SQS
   peek read at the local watermark without the capability. A single-key

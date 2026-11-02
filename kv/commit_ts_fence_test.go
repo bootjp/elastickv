@@ -127,6 +127,41 @@ func TestPreparedEvidenceCommitTimestampIsFenced(t *testing.T) {
 	require.NoError(t, applyFSMRequest(t, fsm, fresh))
 }
 
+func TestMultiGroupPrepareRejectsCommitBelowSecondaryReadWatermark(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	f := newTwoGroupReadFixture(t)
+	for _, gid := range []uint64{1, 2} {
+		_, err := f.groups[gid].Proposer().Propose(ctx, EncodeCommitTSFenceActivation())
+		require.NoError(t, err)
+		require.Eventually(t, func() bool {
+			enabled, err := CommitTSFenceEnabled(ctx, f.stores[gid])
+			return err == nil && enabled
+		}, 5*time.Second, 10*time.Millisecond)
+	}
+
+	// A completed read at s=30 on the secondary precedes its PREPARE.
+	// The primary may have settled commit_ts=20 earlier, but it must not
+	// commit after the secondary rejects that stale PREPARE.
+	receipt, err := f.shards.AdvanceReadWatermarkForGroup(ctx, 2, 30)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, receipt.AppliedTimestamp, uint64(30))
+
+	coord := NewShardedCoordinator(f.shards.engine, f.groups, 1, NewHLC(), f.shards)
+	grouped := map[uint64][]*pb.Mutation{
+		1: {{Op: pb.Op_PUT, Key: []byte("a-k"), Value: []byte("primary")}},
+		2: {{Op: pb.Op_PUT, Key: []byte("b-k"), Value: []byte("secondary")}},
+	}
+	_, err = coord.dispatchMultiShardTxn(ctx, 10, 20, 0, []byte("a-k"), grouped, []uint64{1, 2}, nil, 0, nil)
+	require.ErrorIs(t, err, store.ErrWriteConflict)
+	for gid, key := range map[uint64]string{1: "a-k", 2: "b-k"} {
+		_, err = f.stores[gid].GetAt(ctx, []byte(key), ^uint64(0))
+		require.ErrorIs(t, err, store.ErrKeyNotFound)
+		_, err = f.stores[gid].GetAt(ctx, txnLockKey([]byte(key)), ^uint64(0))
+		require.ErrorIs(t, err, store.ErrKeyNotFound)
+	}
+}
+
 // The activation persists: a new FSM over the same store fences without
 // seeing the entry again, and a replay of the entry is a no-op.
 func TestCommitTSFenceActivationPersists(t *testing.T) {
