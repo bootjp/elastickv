@@ -743,8 +743,11 @@ paths G0 names, behind a replicated activation.
   marker is set. Production startup accepts `--commitTSFence` only with the
   protected Raft catalog bootstrap configured. The coordinator waits until
   every local protected group reports DataReady before proposing activation
-  through maintenance admission. Legacy startup rejects both the flag and a
-  previously persisted activation marker: its non-Raft catalog writes could
+  through maintenance admission. Public listeners stay closed until every
+  local group has applied the marker; DataReady alone does not open the
+  write path before the renewal worker's first activation tick. Legacy
+  startup rejects both the flag and a previously persisted activation marker:
+  its non-Raft catalog writes could
   otherwise advance the watermark on only one replica. Enablement also
   requires every replica to understand tag `0x2f`; an older replica fails to
   decode the entry and does not fence.

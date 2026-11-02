@@ -1,8 +1,12 @@
 package main
 
 import (
+	"context"
 	"testing"
+	"time"
 
+	"github.com/bootjp/elastickv/kv"
+	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 )
 
@@ -29,4 +33,50 @@ func TestCommitTSFenceRuntimesReady(t *testing.T) {
 			require.Equal(t, tc.want, commitTSFenceRuntimesReady(tc.runtimes))
 		})
 	}
+}
+
+func TestPublicGateWaitsForEveryCommitTSFenceActivation(t *testing.T) {
+	runtimes := make([]*raftGroupRuntime, 2)
+	fsms := make([]kv.FSM, 2)
+	for i := range runtimes {
+		st, err := store.NewPebbleStore(t.TempDir())
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, st.Close()) })
+		runtimes[i] = &raftGroupRuntime{spec: groupSpec{id: uint64(i + 1)}, store: st}
+		fsms[i] = kv.NewKvFSMWithHLC(st, kv.NewHLC())
+	}
+	gate := &startupPublicKVGate{}
+	active, err := commitTSFenceRuntimesActive(t.Context(), runtimes)
+	require.NoError(t, err)
+	require.False(t, active)
+	require.Nil(t, fsms[0].Apply(kv.EncodeCommitTSFenceActivation()))
+	active, err = commitTSFenceRuntimesActive(t.Context(), runtimes)
+	require.NoError(t, err)
+	require.False(t, active, "one active group cannot open public traffic")
+
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- markPublicGateReadyAfterCommitTSFence(ctx, gate, runtimes, true) }()
+	select {
+	case err := <-done:
+		t.Fatalf("gate opened before all groups activated: %v", err)
+	case <-time.After(2 * bootstrapReadinessRetryInterval):
+	}
+	require.True(t, gate.blocked())
+	require.Nil(t, fsms[1].Apply(kv.EncodeCommitTSFenceActivation()))
+	require.NoError(t, <-done)
+	require.False(t, gate.blocked())
+}
+
+func TestCommitTSFenceActivationWaitFailsClosed(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	require.ErrorIs(t, waitForCommitTSFenceActivation(ctx, nil), context.Canceled)
+	require.ErrorIs(t, waitForCommitTSFenceActivation(ctx, []*raftGroupRuntime{{}}), context.Canceled)
+	gate := &startupPublicKVGate{}
+	require.ErrorIs(t, markPublicGateReadyAfterCommitTSFence(ctx, gate, nil, true), context.Canceled)
+	require.True(t, gate.blocked())
+	require.NoError(t, markPublicGateReadyAfterCommitTSFence(ctx, gate, nil, false))
+	require.False(t, gate.blocked())
 }

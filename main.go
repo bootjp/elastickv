@@ -2986,8 +2986,14 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 	if err := waitRotateOnStartup.Wait(in.ctx); err != nil {
 		return runner.startupFailure(errors.Wrap(err, "encryption rotate-on-startup: wait before serving"))
 	}
+	return startPublicServicesAfterCommitTSFence(in, &runner, publicKVGate, *commitTSFence)
+}
+
+func startPublicServicesAfterCommitTSFence(in serversInput, runner *runtimeServerRunner, gate *startupPublicKVGate, fenceEnabled bool) error {
 	startHLCLeaseRenewal(in.ctx, in.eg, in.coordinate)
-	publicKVGate.markReady()
+	if err := markPublicGateReadyAfterCommitTSFence(in.ctx, gate, in.runtimes, fenceEnabled); err != nil {
+		return runner.startupFailure(errors.Wrap(err, "wait for commit-ts fence activation before public service"))
+	}
 	startDistributionSplitJobRunner(in.ctx, in.eg, in.distServer)
 	startMigrationOwnershipRefresh(in.ctx, in.eg, in.distServer)
 	if err := runner.startPublicServices(); err != nil {
