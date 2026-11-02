@@ -268,7 +268,7 @@ func (i *Internal) Forward(ctx context.Context, req *pb.ForwardRequest) (*pb.For
 		return &pb.ForwardResponse{
 			Success:     false,
 			CommitIndex: 0,
-		}, forwardUnknownStatus(req.GetRequests(), err)
+		}, forwardCommitStatus(req.GetRequests(), err)
 	}
 	if i.forwardWriteObserver != nil {
 		i.forwardWriteObserver(req.GetRequests())
@@ -279,6 +279,23 @@ func (i *Internal) Forward(ctx context.Context, req *pb.ForwardRequest) (*pb.For
 		CommitIndex: r.CommitIndex,
 		CommitTs:    commitTS,
 	}, nil
+}
+
+func forwardCommitStatus(reqs []*pb.Request, err error) error {
+	phase, ok := kv.ForwardFailurePhaseForRequests(reqs)
+	var rejected *kv.AppliedRequestRejection
+	// Only an indexed, terminal one-phase apply verdict proves this attempt
+	// had no effect. The receiver must separately rule out earlier attempts.
+	if ok && phase == pb.ForwardFailurePhase_FORWARD_FAILURE_PHASE_ONE_PHASE_APPLY &&
+		!errors.Is(err, kv.ErrTransactionOutcomeUnknown) && errors.As(err, &rejected) &&
+		rejected.CommitIndex() != 0 && errors.Is(err, store.ErrWriteConflict) {
+		return &forwardWireFailure{
+			wire: kv.ForwardDecisionStatus(phase, pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CONFLICT,
+				pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_DEFINITIVELY_ABORTED),
+			cause: err,
+		}
+	}
+	return forwardUnknownStatus(reqs, err)
 }
 
 func forwardUnknownStatus(reqs []*pb.Request, err error) error {

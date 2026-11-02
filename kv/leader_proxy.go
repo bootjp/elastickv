@@ -320,9 +320,16 @@ func classifyForwardRPCError(err error, reqs []*pb.Request) error {
 		if valid && decision == pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN {
 			return &ForwardFailure{Reason: reason, Decision: decision}
 		}
+		if valid && phase == pb.ForwardFailurePhase_FORWARD_FAILURE_PHASE_ONE_PHASE_APPLY &&
+			decision == pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_DEFINITIVELY_ABORTED &&
+			reason == pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CONFLICT {
+			// A possibly submitted earlier Forward attempt is terminal in
+			// runForwardCycle; it can never reach this later classification.
+			return errors.WithStack(store.ErrWriteConflict)
+		}
 	}
-	// Legacy ErrorInfo, malformed details, and even a definitive-looking
-	// detail have no logical-operation proof in this protocol generation.
+	// Legacy ErrorInfo, malformed details, and unrecognized decisions do
+	// not prove the logical operation was absent or aborted.
 	return &ForwardFailure{Decision: pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN}
 }
 

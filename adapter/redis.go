@@ -396,6 +396,8 @@ func (c *redisMetricsConn) WriteError(msg string) {
 	c.Conn.WriteError(msg)
 }
 
+const redisOutcomeUnknownReply = "ERR operation outcome unknown"
+
 // writeRedisError writes a RESP error reply for err, prepending the
 // Redis-protocol semantic code NOTLEADER when err is a transient
 // leadership-loss signal. Real Redis clients (Carmine, and through it
@@ -416,7 +418,7 @@ func writeRedisError(conn redcon.Conn, err error) {
 		recorder.recordRequestError(err)
 	}
 	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
-		conn.WriteError("ERR operation outcome unknown")
+		conn.WriteError(redisOutcomeUnknownReply)
 		return
 	}
 	msg := err.Error()
