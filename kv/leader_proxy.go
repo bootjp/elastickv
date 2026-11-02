@@ -315,11 +315,12 @@ func (p *LeaderProxy) forward(callerCtx context.Context, parentCtx context.Conte
 }
 
 func classifyForwardRPCError(err error, reqs []*pb.Request) error {
-	if isDefinitiveForwardNotLeader(err) {
-		return errors.WithStack(err)
-	}
-	if len(reqs) == 1 && reqs[0] != nil &&
-		(reqs[0].Phase == pb.Phase_NONE || reqs[0].Phase == pb.Phase_PREPARE) {
+	// A PREPARE rejection only settles one participant. It cannot prove the
+	// outcome of the logical transaction across other groups or prior attempts.
+	if len(reqs) == 1 && reqs[0] != nil && reqs[0].Phase == pb.Phase_NONE {
+		if isDefinitiveForwardNotLeader(err) {
+			return errors.WithStack(err)
+		}
 		switch {
 		case isDefinitiveForwardConflict(err):
 			return fmt.Errorf("%w: %w", store.ErrWriteConflict, err)

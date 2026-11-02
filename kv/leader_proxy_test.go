@@ -434,9 +434,11 @@ func TestLeaderProxy_MultiPhaseConflictHasUnknownOutcome(t *testing.T) {
 
 	p := NewLeaderProxyWithEngine(newStubFollowerEngine(addr))
 	t.Cleanup(func() { _ = p.connCache.Close() })
-	_, err := p.Commit(context.Background(), []*pb.Request{{IsTxn: true, Phase: pb.Phase_COMMIT}})
-	require.ErrorIs(t, err, ErrTransactionOutcomeUnknown)
-	require.Equal(t, 1, svc.callCount())
+	for n, phase := range []pb.Phase{pb.Phase_PREPARE, pb.Phase_COMMIT, pb.Phase_ABORT} {
+		_, err := p.Commit(context.Background(), []*pb.Request{{IsTxn: true, Phase: phase}})
+		require.ErrorIs(t, err, ErrTransactionOutcomeUnknown)
+		require.Equal(t, n+1, svc.callCount())
+	}
 }
 
 func TestLeaderProxy_SinglePhaseConflictUsesStructuredStatus(t *testing.T) {
@@ -471,21 +473,32 @@ func TestLeaderProxy_SinglePhaseLockUsesStructuredStatus(t *testing.T) {
 func TestClassifyForwardConflictByPhase(t *testing.T) {
 	t.Parallel()
 	proof := ForwardWriteConflictStatus()
-	for _, phase := range []pb.Phase{pb.Phase_NONE, pb.Phase_PREPARE} {
-		err := classifyForwardRPCError(proof, []*pb.Request{{IsTxn: true, Phase: phase}})
-		require.ErrorIs(t, err, store.ErrWriteConflict)
-		require.NotErrorIs(t, err, ErrTransactionOutcomeUnknown)
-		wrapped := errors.WithStack(proof)
-		err = classifyForwardRPCError(wrapped, []*pb.Request{{IsTxn: true, Phase: phase}})
-		require.ErrorIs(t, err, store.ErrWriteConflict)
-	}
-	for _, phase := range []pb.Phase{pb.Phase_COMMIT, pb.Phase_ABORT} {
+	err := classifyForwardRPCError(proof, []*pb.Request{{IsTxn: true, Phase: pb.Phase_NONE}})
+	require.ErrorIs(t, err, store.ErrWriteConflict)
+	require.NotErrorIs(t, err, ErrTransactionOutcomeUnknown)
+	wrapped := errors.WithStack(proof)
+	err = classifyForwardRPCError(wrapped, []*pb.Request{{IsTxn: true, Phase: pb.Phase_NONE}})
+	require.ErrorIs(t, err, store.ErrWriteConflict)
+	for _, phase := range []pb.Phase{pb.Phase_PREPARE, pb.Phase_COMMIT, pb.Phase_ABORT} {
 		err := classifyForwardRPCError(proof, []*pb.Request{{IsTxn: true, Phase: phase}})
 		require.ErrorIs(t, err, ErrTransactionOutcomeUnknown)
 	}
 	legacy := status.Error(codes.Unknown, store.NewWriteConflictError([]byte("key")).Error())
-	err := classifyForwardRPCError(legacy, []*pb.Request{{IsTxn: true, Phase: pb.Phase_NONE}})
+	err = classifyForwardRPCError(legacy, []*pb.Request{{IsTxn: true, Phase: pb.Phase_NONE}})
 	require.ErrorIs(t, err, ErrTransactionOutcomeUnknown)
+}
+
+func TestClassifyForwardNotLeaderByPhase(t *testing.T) {
+	t.Parallel()
+	proof := ForwardNotLeaderStatus()
+	err := classifyForwardRPCError(proof, []*pb.Request{{IsTxn: true, Phase: pb.Phase_NONE}})
+	require.True(t, IsForwardNotLeader(err))
+	require.NotErrorIs(t, err, ErrTransactionOutcomeUnknown)
+	for _, phase := range []pb.Phase{pb.Phase_PREPARE, pb.Phase_COMMIT, pb.Phase_ABORT} {
+		err := classifyForwardRPCError(proof, []*pb.Request{{IsTxn: true, Phase: phase}})
+		require.ErrorIs(t, err, ErrTransactionOutcomeUnknown)
+		require.False(t, isTransientLeaderError(err))
+	}
 }
 
 func TestClassifyForwardLockAndRouteByPhase(t *testing.T) {
@@ -502,13 +515,11 @@ func TestClassifyForwardLockAndRouteByPhase(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			for _, phase := range []pb.Phase{pb.Phase_NONE, pb.Phase_PREPARE} {
-				err := classifyForwardRPCError(tc.proof, []*pb.Request{{IsTxn: true, Phase: phase}})
-				require.ErrorIs(t, err, tc.target)
-				require.NotErrorIs(t, err, ErrTransactionOutcomeUnknown)
-				require.True(t, isTerminalForwardError(err))
-			}
-			for _, phase := range []pb.Phase{pb.Phase_COMMIT, pb.Phase_ABORT} {
+			err := classifyForwardRPCError(tc.proof, []*pb.Request{{IsTxn: true, Phase: pb.Phase_NONE}})
+			require.ErrorIs(t, err, tc.target)
+			require.NotErrorIs(t, err, ErrTransactionOutcomeUnknown)
+			require.True(t, isTerminalForwardError(err))
+			for _, phase := range []pb.Phase{pb.Phase_PREPARE, pb.Phase_COMMIT, pb.Phase_ABORT} {
 				err := classifyForwardRPCError(tc.proof, []*pb.Request{{IsTxn: true, Phase: phase}})
 				require.ErrorIs(t, err, ErrTransactionOutcomeUnknown)
 			}
