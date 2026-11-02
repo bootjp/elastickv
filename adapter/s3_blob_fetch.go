@@ -248,6 +248,9 @@ func (s *S3BlobFetchServer) chunkBlobRepairVersion(
 }
 
 func normalizeS3ChunkBlobRepairError(err error) (bool, error) {
+	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+		return false, s3BlobFetchStatus(codes.Unknown, kv.ErrTransactionOutcomeUnknown.Error())
+	}
 	if errors.Is(err, store.ErrWriteConflict) {
 		return true, nil
 	}
@@ -265,6 +268,9 @@ func (s *S3BlobFetchServer) retryAfterChunkBlobWriteConflict(
 	payload []byte,
 	commitTS uint64,
 ) (bool, bool, error) {
+	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+		return false, false, s3BlobFetchStatus(codes.Unknown, kv.ErrTransactionOutcomeUnknown.Error())
+	}
 	if !errors.Is(err, store.ErrWriteConflict) {
 		return false, false, nil
 	}

@@ -40,10 +40,16 @@ var (
 )
 
 func isRetryableRedisTxnErr(err error) bool {
+	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+		return false
+	}
 	return isReusableRedisTxnErr(err) || isRedisComposedRouteErr(err)
 }
 
 func isReusableRedisTxnErr(err error) bool {
+	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+		return false
+	}
 	return errors.Is(err, store.ErrWriteConflict) ||
 		errors.Is(err, kv.ErrTxnLocked) ||
 		wireRedisTxnErrKind(err) == redisTxnWireErrLocked ||
@@ -57,6 +63,9 @@ func shouldPreserveRedisTxnAttempt(err error) bool {
 }
 
 func isRedisComposedRouteErr(err error) bool {
+	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+		return false
+	}
 	if errors.Is(err, kv.ErrComposed1Violation) ||
 		errors.Is(err, kv.ErrComposed1VersionGCd) {
 		return true
@@ -182,6 +191,9 @@ func (r *RedisServer) retryRedisWrite(ctx context.Context, fn func() error) erro
 }
 
 func normalizeRetryableRedisTxnErr(err error) error {
+	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+		return err
+	}
 	if parsed := parseWireRedisTxnErr(err); parsed != nil {
 		return parsed
 	}

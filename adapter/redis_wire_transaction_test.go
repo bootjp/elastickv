@@ -453,7 +453,7 @@ func TestRedisWireTransactionPreservesTypedUnknown(t *testing.T) {
 	require.Equal(t, 1, calls)
 	require.ErrorIs(t, owner.original, kv.ErrTransactionOutcomeUnknown)
 	require.Len(t, c.writes, 1)
-	require.Contains(t, c.writes[0].s, kv.ErrTransactionOutcomeUnknown.Error())
+	require.Equal(t, "ERR operation outcome unknown", c.writes[0].s)
 	require.Equal(t, 1, owner.finishes)
 	require.Equal(t, 1, owner.joins)
 }
@@ -495,7 +495,12 @@ func TestRedisOwnedProxyOverflowUnknownClassification(t *testing.T) {
 		cmd.SetErr(remote)
 		require.ErrorIs(t, ownedProxyTransactionError(nil, []*redis.Cmd{cmd}), kv.ErrTransactionOutcomeUnknown)
 	}
-	for _, other := range []string{"prefix " + message, kv.ErrTransactionOutcomeUnknown.Error() + "; unrelated", kv.ErrTransactionOutcomeUnknown.Error() + "ish"} {
+	require.True(t, isProxyTransactionOutcomeUnknown(errors.New("ERR operation outcome unknown")))
+	require.ErrorIs(t, ownedProxyTransactionError(errors.New("ERR operation outcome unknown"), nil), kv.ErrTransactionOutcomeUnknown)
+	cmd := redis.NewCmd(t.Context())
+	cmd.SetErr(errors.New("ERR operation outcome unknown"))
+	require.ErrorIs(t, ownedProxyTransactionError(nil, []*redis.Cmd{cmd}), kv.ErrTransactionOutcomeUnknown)
+	for _, other := range []string{"prefix " + message, kv.ErrTransactionOutcomeUnknown.Error() + "; unrelated", kv.ErrTransactionOutcomeUnknown.Error() + "ish", "ERR operation outcome unknownish"} {
 		require.False(t, isProxyTransactionOutcomeUnknown(errors.New(other)))
 	}
 }
@@ -528,8 +533,7 @@ func TestRedisOwnedProxyMutatingReplyOverflowIsTerminal(t *testing.T) {
 	line, err := c.r.ReadString('\n')
 	require.NoError(t, err)
 	require.True(t, strings.HasPrefix(line, "-"), "overflow must be a top-level EXEC error, not an array: %q", line)
-	require.Contains(t, line, kv.ErrTransactionOutcomeUnknown.Error())
-	require.Contains(t, line, errRedisReplyTooLarge.Error())
+	require.Equal(t, "-ERR operation outcome unknown\r\n", line)
 	requireRedisWireJoined(t, followerGate.next(t))
 	require.Empty(t, followerGate.owners, "overflow must not retry or remint receiver H")
 	value, err := st.GetAt(t.Context(), redisStrKey([]byte("committed")), ^uint64(0))
@@ -610,7 +614,7 @@ func runRedisWireTransactionFollowerProxy(t *testing.T, mode string) {
 	} else {
 		line, err := c.r.ReadString('\n')
 		require.NoError(t, err)
-		require.Contains(t, line, kv.ErrTransactionOutcomeUnknown.Error())
+		require.Equal(t, "-ERR operation outcome unknown\r\n", line)
 	}
 	requireRedisWireJoined(t, o)
 	require.Empty(t, followerGate.owners, "proxy must retain MULTI's receiver H")

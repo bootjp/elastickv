@@ -192,6 +192,7 @@
 
 (def ^:private setup-retryable-error-types
   #{"InternalServerError"
+    "OperationOutcomeUnknown"
     "ServiceUnavailableException"
     "ThrottlingException"
     "ProvisionedThroughputExceededException"})
@@ -207,6 +208,7 @@
         (str/includes? msg "no raft leader currently available"))))
 
 (defn- with-setup-retry!
+  "Only for fixed-identity CreateTable and idempotent DeleteItem setup calls."
   [f]
   (loop [delays setup-retry-delays-ms]
     (let [[ok result] (try
@@ -234,20 +236,26 @@
 (def ^:private default-write-capacity 100)
 
 (defn- create-table!
-  "Create a table for the type under test; ignore ResourceInUseException."
+  "Ensure a fixed-name setup table exists without replaying workload writes."
   [ddb table read-capacity write-capacity]
-  (try
-    (with-setup-retry!
-      #(ddb-invoke! ddb :CreateTable
-                    {:TableName             table
-                     :KeySchema             [{:AttributeName pk-attr :KeyType "HASH"}]
-                     :AttributeDefinitions  [{:AttributeName pk-attr
-                                               :AttributeType "S"}]
-                     :ProvisionedThroughput {:ReadCapacityUnits  read-capacity
-                                             :WriteCapacityUnits write-capacity}}))
-    (catch clojure.lang.ExceptionInfo e
-      (when-not (= "ResourceInUseException" (:type (ex-data e)))
-        (throw e)))))
+  (loop [delays [100 250 500 1000 2000]]
+    (let [[ok result]
+          (try
+            [true (with-setup-retry!
+                    #(ddb-invoke! ddb :CreateTable
+                                  {:TableName             table
+                                   :KeySchema             [{:AttributeName pk-attr :KeyType "HASH"}]
+                                   :AttributeDefinitions  [{:AttributeName pk-attr
+                                                             :AttributeType "S"}]
+                                   :ProvisionedThroughput {:ReadCapacityUnits  read-capacity
+                                                           :WriteCapacityUnits write-capacity}}))]
+            (catch clojure.lang.ExceptionInfo e [false e]))]
+      (cond
+        ok nil
+        (= "ResourceInUseException" (:type (ex-data result))) nil
+        (and (= "OperationOutcomeUnknown" (:type (ex-data result))) (seq delays))
+        (do (Thread/sleep (first delays)) (recur (rest delays)))
+        :else (throw result)))))
 
 (defn- clear-keys!
   "Delete every partition key the test will touch, giving re-runs a clean

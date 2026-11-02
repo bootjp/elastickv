@@ -58,6 +58,126 @@ type routeSwitchOperationBackend struct {
 	switchRoute func()
 }
 
+type unknownSingleGroupCASBackend struct {
+	operationJournalBackend
+	loseBeforeCommit bool
+	singleGroup      bool
+	intercepted      bool
+	commits          int
+	onUnknown        func()
+}
+
+func (b *unknownSingleGroupCASBackend) JournalRouteVersion() (uint64, bool) {
+	return 7, true
+}
+
+func (b *unknownSingleGroupCASBackend) JournalSingleGroupAtVersion(observed uint64) bool {
+	return b.singleGroup && observed == 7
+}
+
+func (b *unknownSingleGroupCASBackend) Commit(ctx context.Context, ts uint64, elems []*kv.Elem[kv.OP], reads [][]byte) (*kv.CoordinateResponse, error) {
+	return b.commitUnknownOnce(func() (*kv.CoordinateResponse, error) {
+		return b.operationJournalBackend.Commit(ctx, ts, elems, reads)
+	})
+}
+
+func (b *unknownSingleGroupCASBackend) CommitAtRouteVersion(ctx context.Context, ts uint64, elems []*kv.Elem[kv.OP], reads [][]byte, observed uint64) (*kv.CoordinateResponse, error) {
+	return b.commitUnknownOnce(func() (*kv.CoordinateResponse, error) {
+		return b.operationJournalBackend.CommitAtRouteVersion(ctx, ts, elems, reads, observed)
+	})
+}
+
+func (b *unknownSingleGroupCASBackend) commitUnknownOnce(commit func() (*kv.CoordinateResponse, error)) (*kv.CoordinateResponse, error) {
+	b.commits++
+	if b.intercepted {
+		return commit()
+	}
+	b.intercepted = true
+	if !b.loseBeforeCommit {
+		_, err := commit()
+		if err != nil {
+			return nil, err
+		}
+	}
+	if b.onUnknown != nil {
+		b.onUnknown()
+	}
+	return nil, kv.ErrTransactionOutcomeUnknown
+}
+
+func TestOperationJournalAdmitRecoversUnknownSingleGroupCAS(t *testing.T) {
+	for _, loseBeforeCommit := range []bool{true, false} {
+		t.Run(map[bool]string{true: "before", false: "after"}[loseBeforeCommit], func(t *testing.T) {
+			ctx := t.Context()
+			journal, _, _ := testOperationJournal(t)
+			id := testOperationID(t, journal, 1)
+			backend := &unknownSingleGroupCASBackend{operationJournalBackend: journal.backend, loseBeforeCommit: loseBeforeCommit, singleGroup: true}
+			journal = newOperationJournalWithBackend(backend)
+			record, err := journal.Admit(ctx, id, []byte("intent"), 128, 1024)
+			require.NoError(t, err)
+			require.Equal(t, OperationPending, record.State)
+			ts, err := backend.Snapshot(ctx)
+			require.NoError(t, err)
+			session, found, err := journal.loadSessionAt(ctx, OperationSessionID{Filesystem: id.Filesystem, Session: id.Session}, ts)
+			require.NoError(t, err)
+			require.True(t, found)
+			require.EqualValues(t, 1, session.Pending)
+		})
+	}
+}
+
+func TestOperationJournalBeginAttemptRecoversUnknownSingleGroupCAS(t *testing.T) {
+	for _, loseBeforeCommit := range []bool{true, false} {
+		t.Run(map[bool]string{true: "before", false: "after"}[loseBeforeCommit], func(t *testing.T) {
+			ctx := t.Context()
+			journal, _, _ := testOperationJournal(t)
+			id := testOperationID(t, journal, 1)
+			_, err := journal.Admit(ctx, id, []byte("intent"), 128, 1024)
+			require.NoError(t, err)
+			backend := &unknownSingleGroupCASBackend{operationJournalBackend: journal.backend, loseBeforeCommit: loseBeforeCommit, singleGroup: true}
+			journal = newOperationJournalWithBackend(backend)
+			record, err := journal.BeginAttempt(ctx, id)
+			require.NoError(t, err)
+			require.NotEqual(t, [16]byte{}, record.AttemptID)
+			require.EqualValues(t, 1, record.Generation)
+			duplicate, err := journal.BeginAttempt(ctx, id)
+			require.NoError(t, err)
+			require.Equal(t, record.AttemptID, duplicate.AttemptID)
+		})
+	}
+}
+
+func TestOperationJournalUnknownCASWithoutSingleGroupProofStaysUnknown(t *testing.T) {
+	for _, loseBeforeCommit := range []bool{true, false} {
+		t.Run(map[bool]string{true: "before", false: "after"}[loseBeforeCommit], func(t *testing.T) {
+			journal, _, _ := testOperationJournal(t)
+			id := testOperationID(t, journal, 1)
+			backend := &unknownSingleGroupCASBackend{operationJournalBackend: journal.backend, loseBeforeCommit: loseBeforeCommit}
+			journal = newOperationJournalWithBackend(backend)
+			_, err := journal.Admit(t.Context(), id, []byte("intent"), 128, 1024)
+			require.ErrorIs(t, err, kv.ErrTransactionOutcomeUnknown)
+			require.Equal(t, 1, backend.commits)
+		})
+	}
+}
+
+func TestOperationJournalUnknownCASPreservesUnknownOnCancellation(t *testing.T) {
+	journal, _, _ := testOperationJournal(t)
+	id := testOperationID(t, journal, 1)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	backend := &unknownSingleGroupCASBackend{
+		operationJournalBackend: journal.backend,
+		loseBeforeCommit:        false,
+		singleGroup:             true,
+		onUnknown:               cancel,
+	}
+	journal = newOperationJournalWithBackend(backend)
+	_, err := journal.Admit(ctx, id, []byte("intent"), 128, 1024)
+	require.ErrorIs(t, err, kv.ErrTransactionOutcomeUnknown)
+	require.ErrorIs(t, err, context.Canceled)
+}
+
 func (b *routeSwitchOperationBackend) CommitAtRouteVersion(ctx context.Context, ts uint64, elems []*kv.Elem[kv.OP], reads [][]byte, observed uint64) (*kv.CoordinateResponse, error) {
 	b.switchRoute()
 	return b.operationJournalBackend.CommitAtRouteVersion(ctx, ts, elems, reads, observed)
@@ -341,6 +461,130 @@ type delayedOperationCommitBackend struct {
 type lostGenerationFenceBackend struct {
 	operationJournalBackend
 	lose bool
+}
+
+type unknownPublicationBackend struct {
+	operationJournalBackend
+	unknown     bool
+	singleGroup bool
+	loseFence   bool
+}
+
+func (b *unknownPublicationBackend) Commit(ctx context.Context, ts uint64, elems []*kv.Elem[kv.OP], reads [][]byte) (*kv.CoordinateResponse, error) {
+	if b.unknown {
+		for _, elem := range elems {
+			if elem.CommitTSValueOffset != 0 {
+				b.unknown = false
+				return nil, kv.ErrTransactionOutcomeUnknown
+			}
+		}
+	}
+	response, err := b.operationJournalBackend.Commit(ctx, ts, elems, reads)
+	if err == nil && b.loseFence {
+		for _, elem := range elems {
+			if !fskeys.IsOperationKey(elem.Key) {
+				continue
+			}
+			record, decodeErr := decodeOperationRecord(elem.Value)
+			if decodeErr == nil && len(record.FencedAttempts) != 0 {
+				b.loseFence = false
+				return nil, kv.ErrTransactionOutcomeUnknown
+			}
+		}
+	}
+	return response, err
+}
+
+func (b *unknownPublicationBackend) JournalSingleGroupAtVersion(observed uint64) bool {
+	return b.singleGroup && b.operationJournalBackend.JournalSingleGroupAtVersion(observed)
+}
+
+func TestOperationJournalUnknownOnePhasePublicationNeedsDurableFence(t *testing.T) {
+	ctx := context.Background()
+	journal, st, _ := testOperationJournal(t)
+	id := testOperationID(t, journal, 1)
+	_, err := journal.Admit(ctx, id, []byte("write"), 128, 1024)
+	require.NoError(t, err)
+	attempt, err := journal.BeginAttempt(ctx, id)
+	require.NoError(t, err)
+	backend := &unknownPublicationBackend{operationJournalBackend: journal.backend, unknown: true, singleGroup: true}
+	journal = newOperationJournalWithBackend(backend)
+	_, err = journal.Publish(ctx, id, attempt.AttemptID, operationAttemptPlan{
+		Intent: []byte("write"), Effects: []*kv.Elem[kv.OP]{{Op: kv.Put, Key: []byte("data"), Value: []byte("old")}},
+	})
+	require.ErrorIs(t, err, store.ErrWriteConflict)
+	outcome, fenced, err := journal.ResolveAttempt(ctx, id, attempt.AttemptID)
+	require.NoError(t, err)
+	require.Equal(t, AttemptAborted, outcome)
+	require.NotEqual(t, attempt.AttemptID, fenced.AttemptID)
+	_, err = st.GetAt(ctx, []byte("data"), st.LastCommitTS())
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+	_, err = journal.Publish(ctx, id, fenced.AttemptID, operationAttemptPlan{
+		Intent: []byte("write"), Effects: []*kv.Elem[kv.OP]{{Op: kv.Put, Key: []byte("data"), Value: []byte("new")}},
+	})
+	require.NoError(t, err)
+}
+
+func TestOperationJournalUnknownPublicationWithoutSingleGroupProofStaysUnknown(t *testing.T) {
+	ctx := context.Background()
+	journal, _, _ := testOperationJournal(t)
+	id := testOperationID(t, journal, 1)
+	_, err := journal.Admit(ctx, id, []byte("write"), 128, 1024)
+	require.NoError(t, err)
+	attempt, err := journal.BeginAttempt(ctx, id)
+	require.NoError(t, err)
+	journal = newOperationJournalWithBackend(&unknownPublicationBackend{
+		operationJournalBackend: journal.backend, unknown: true,
+	})
+	_, err = journal.Publish(ctx, id, attempt.AttemptID, operationAttemptPlan{
+		Intent: []byte("write"), Effects: []*kv.Elem[kv.OP]{{Op: kv.Put, Key: []byte("data"), Value: []byte("old")}},
+	})
+	require.ErrorIs(t, err, kv.ErrTransactionOutcomeUnknown)
+	outcome, current, err := journal.ResolveAttempt(ctx, id, attempt.AttemptID)
+	require.ErrorIs(t, err, ErrOperationPending)
+	require.Equal(t, AttemptUnknown, outcome)
+	require.Equal(t, attempt.AttemptID, current.AttemptID)
+}
+
+func TestOperationJournalUnknownPublicationWithForeignExplicitGroupStaysUnknown(t *testing.T) {
+	ctx := context.Background()
+	journal, _, _ := testOperationJournal(t)
+	id := testOperationID(t, journal, 1)
+	_, err := journal.Admit(ctx, id, []byte("write"), 128, 1024)
+	require.NoError(t, err)
+	attempt, err := journal.BeginAttempt(ctx, id)
+	require.NoError(t, err)
+	journal = newOperationJournalWithBackend(&unknownPublicationBackend{
+		operationJournalBackend: journal.backend, unknown: true, singleGroup: true,
+	})
+	_, err = journal.Publish(ctx, id, attempt.AttemptID, operationAttemptPlan{
+		Intent: []byte("write"), Effects: []*kv.Elem[kv.OP]{{Op: kv.Put, Key: []byte("data"), Value: []byte("old"), GroupID: 2}},
+	})
+	require.ErrorIs(t, err, kv.ErrTransactionOutcomeUnknown)
+	outcome, current, err := journal.ResolveAttempt(ctx, id, attempt.AttemptID)
+	require.ErrorIs(t, err, ErrOperationPending)
+	require.Equal(t, AttemptUnknown, outcome)
+	require.Equal(t, attempt.AttemptID, current.AttemptID)
+}
+
+func TestOperationJournalUnknownPublicationLostFenceReplyUsesStoredAbort(t *testing.T) {
+	ctx := context.Background()
+	journal, _, _ := testOperationJournal(t)
+	id := testOperationID(t, journal, 1)
+	_, err := journal.Admit(ctx, id, []byte("write"), 128, 1024)
+	require.NoError(t, err)
+	attempt, err := journal.BeginAttempt(ctx, id)
+	require.NoError(t, err)
+	journal = newOperationJournalWithBackend(&unknownPublicationBackend{
+		operationJournalBackend: journal.backend, unknown: true, singleGroup: true, loseFence: true,
+	})
+	_, err = journal.Publish(ctx, id, attempt.AttemptID, operationAttemptPlan{
+		Intent: []byte("write"), Effects: []*kv.Elem[kv.OP]{{Op: kv.Put, Key: []byte("data"), Value: []byte("old")}},
+	})
+	require.ErrorIs(t, err, store.ErrWriteConflict)
+	outcome, _, err := journal.ResolveAttempt(ctx, id, attempt.AttemptID)
+	require.NoError(t, err)
+	require.Equal(t, AttemptAborted, outcome)
 }
 
 func (b *lostGenerationFenceBackend) Commit(ctx context.Context, ts uint64, elems []*kv.Elem[kv.OP], readKeys [][]byte) (*kv.CoordinateResponse, error) {
@@ -921,7 +1165,7 @@ func TestOperationJournalCommittedAttemptWinsGenerationFence(t *testing.T) {
 	require.Equal(t, AttemptCommitted, outcome)
 }
 
-func TestOperationJournalLostGenerationFenceReplyRetainsAbortProof(t *testing.T) {
+func TestOperationJournalLostGenerationFenceReplyRecoversAbortProof(t *testing.T) {
 	ctx := context.Background()
 	journal, _, _ := testOperationJournal(t)
 	id := testOperationID(t, journal, 1)
@@ -930,8 +1174,9 @@ func TestOperationJournalLostGenerationFenceReplyRetainsAbortProof(t *testing.T)
 	attempt, err := journal.BeginAttempt(ctx, id)
 	require.NoError(t, err)
 	journal = newOperationJournalWithBackend(&lostGenerationFenceBackend{operationJournalBackend: journal.backend, lose: true})
-	_, err = journal.AdvanceGeneration(ctx, id, attempt.AttemptID)
-	require.ErrorIs(t, err, kv.ErrTransactionOutcomeUnknown)
+	next, err := journal.AdvanceGeneration(ctx, id, attempt.AttemptID)
+	require.NoError(t, err)
+	require.Contains(t, next.FencedAttempts, attempt.AttemptID)
 	outcome, record, err := journal.ResolveAttempt(ctx, id, attempt.AttemptID)
 	require.NoError(t, err)
 	require.Equal(t, AttemptAborted, outcome)
@@ -939,6 +1184,44 @@ func TestOperationJournalLostGenerationFenceReplyRetainsAbortProof(t *testing.T)
 	current, err := journal.BeginAttempt(ctx, id)
 	require.NoError(t, err)
 	require.Equal(t, record.AttemptID, current.AttemptID)
+}
+
+func TestOperationJournalAdvanceGenerationRecoversUnknownSingleGroupCAS(t *testing.T) {
+	for _, loseBeforeCommit := range []bool{true, false} {
+		t.Run(map[bool]string{true: "before", false: "after"}[loseBeforeCommit], func(t *testing.T) {
+			ctx := t.Context()
+			journal, _, _ := testOperationJournal(t)
+			id := testOperationID(t, journal, 1)
+			_, err := journal.Admit(ctx, id, []byte("intent"), 128, 1024)
+			require.NoError(t, err)
+			attempt, err := journal.BeginAttempt(ctx, id)
+			require.NoError(t, err)
+			backend := &unknownSingleGroupCASBackend{operationJournalBackend: journal.backend, loseBeforeCommit: loseBeforeCommit, singleGroup: true}
+			journal = newOperationJournalWithBackend(backend)
+			next, err := journal.AdvanceGeneration(ctx, id, attempt.AttemptID)
+			require.NoError(t, err)
+			require.Contains(t, next.FencedAttempts, attempt.AttemptID)
+			require.NotEqual(t, attempt.AttemptID, next.AttemptID)
+			outcome, _, err := journal.ResolveAttempt(ctx, id, attempt.AttemptID)
+			require.NoError(t, err)
+			require.Equal(t, AttemptAborted, outcome)
+		})
+	}
+}
+
+func TestOperationJournalAdvanceGenerationUnknownWithoutSingleGroupProof(t *testing.T) {
+	ctx := t.Context()
+	journal, _, _ := testOperationJournal(t)
+	id := testOperationID(t, journal, 1)
+	_, err := journal.Admit(ctx, id, []byte("intent"), 128, 1024)
+	require.NoError(t, err)
+	attempt, err := journal.BeginAttempt(ctx, id)
+	require.NoError(t, err)
+	backend := &unknownSingleGroupCASBackend{operationJournalBackend: journal.backend, loseBeforeCommit: false}
+	journal = newOperationJournalWithBackend(backend)
+	_, err = journal.AdvanceGeneration(ctx, id, attempt.AttemptID)
+	require.ErrorIs(t, err, kv.ErrTransactionOutcomeUnknown)
+	require.Equal(t, 1, backend.commits)
 }
 
 func TestOperationJournalGenerationFenceRespectsSessionQuota(t *testing.T) {

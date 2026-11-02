@@ -232,7 +232,16 @@ func newSQSAPIError(status int, errorType string, message string) error {
 	return &sqsAPIError{status: status, errorType: errorType, message: message}
 }
 
+const (
+	sqsErrOperationOutcomeUnknown = "OperationOutcomeUnknown"
+	sqsMsgOperationOutcomeUnknown = "Operation outcome unknown"
+)
+
 func writeSQSErrorFromErr(w http.ResponseWriter, err error) {
+	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+		writeSQSError(w, http.StatusConflict, sqsErrOperationOutcomeUnknown, sqsMsgOperationOutcomeUnknown)
+		return
+	}
 	var throttled *sqsThrottlingError
 	if errors.As(err, &throttled) {
 		writeSQSThrottlingError(w, throttled.queue, throttled.action, throttled.retryAfter)

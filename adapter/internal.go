@@ -243,13 +243,13 @@ func (i *Internal) Forward(ctx context.Context, req *pb.ForwardRequest) (*pb.For
 	// Before the leader check, so a non-leader gets the accurate reason and a
 	// leader can never reach stampTimestamps and propose.
 	if i.kvForwardRejected {
-		return nil, errors.WithStack(ErrKVForwardNotSupported)
+		return nil, forwardUnknownStatus(req.GetRequests(), ErrKVForwardNotSupported)
 	}
 	if i.leader == nil || i.leader.State() != raftengine.StateLeader {
-		return nil, errors.WithStack(kv.ForwardNotLeaderStatus())
+		return nil, forwardUnknownStatus(req.GetRequests(), kv.ErrLeaderNotFound)
 	}
 	if err := i.leader.VerifyLeader(ctx); err != nil {
-		return nil, errors.WithStack(kv.ForwardNotLeaderStatus())
+		return nil, forwardUnknownStatus(req.GetRequests(), err)
 	}
 
 	commitTS, err := i.stampTimestamps(ctx, req)
@@ -257,10 +257,10 @@ func (i *Internal) Forward(ctx context.Context, req *pb.ForwardRequest) (*pb.For
 		return &pb.ForwardResponse{
 			Success:     false,
 			CommitIndex: 0,
-		}, errors.WithStack(err)
+		}, forwardUnknownStatus(req.GetRequests(), err)
 	}
 	if err := kv.StampTimestampAdmission(ctx, i.tsAllocator, i.store, req.GetRequests()); err != nil {
-		return nil, errors.WithStack(err)
+		return nil, forwardUnknownStatus(req.GetRequests(), err)
 	}
 
 	r, err := i.transactionManager.Commit(ctx, req.Requests)
@@ -268,7 +268,7 @@ func (i *Internal) Forward(ctx context.Context, req *pb.ForwardRequest) (*pb.For
 		return &pb.ForwardResponse{
 			Success:     false,
 			CommitIndex: 0,
-		}, forwardCommitError(err)
+		}, forwardCommitStatus(req.GetRequests(), err)
 	}
 	if i.forwardWriteObserver != nil {
 		i.forwardWriteObserver(req.GetRequests())
@@ -281,20 +281,59 @@ func (i *Internal) Forward(ctx context.Context, req *pb.ForwardRequest) (*pb.For
 	}, nil
 }
 
-func forwardCommitError(err error) error {
-	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
-		return errors.WithStack(err)
+func forwardCommitStatus(reqs []*pb.Request, err error) error {
+	phase, ok := kv.ForwardFailurePhaseForRequests(reqs)
+	var rejected *kv.AppliedRequestRejection
+	// Only an indexed, terminal one-phase apply verdict proves this attempt
+	// had no effect. The receiver must separately rule out earlier attempts.
+	if ok && phase == pb.ForwardFailurePhase_FORWARD_FAILURE_PHASE_ONE_PHASE_APPLY &&
+		!errors.Is(err, kv.ErrTransactionOutcomeUnknown) && errors.As(err, &rejected) &&
+		rejected.CommitIndex() != 0 && errors.Is(err, store.ErrWriteConflict) {
+		return &forwardWireFailure{
+			wire: kv.ForwardDecisionStatus(phase, pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CONFLICT,
+				pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_DEFINITIVELY_ABORTED),
+			cause: err,
+		}
 	}
-	if errors.Is(err, store.ErrWriteConflict) {
-		return errors.WithStack(kv.ForwardWriteConflictStatus())
+	return forwardUnknownStatus(reqs, err)
+}
+
+func forwardUnknownStatus(reqs []*pb.Request, err error) error {
+	phase, ok := kv.ForwardFailurePhaseForRequests(reqs)
+	if !ok {
+		return &forwardWireFailure{wire: status.Error(codes.Unknown, "forward outcome unknown"), cause: err}
 	}
-	if errors.Is(err, kv.ErrTxnLocked) {
-		return errors.WithStack(kv.ForwardTxnLockedStatus())
+	reason := pb.ForwardFailureReason_FORWARD_FAILURE_REASON_INTERRUPTED
+	switch {
+	case errors.Is(err, store.ErrWriteConflict), errors.Is(err, kv.ErrTxnLocked):
+		reason = pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CONFLICT
+	case errors.Is(err, kv.ErrComposed1Violation), errors.Is(err, kv.ErrComposed1VersionGCd),
+		errors.Is(err, kv.ErrRouteWriteFenced), errors.Is(err, kv.ErrRouteWriteTimestampTooLow):
+		reason = pb.ForwardFailureReason_FORWARD_FAILURE_REASON_FENCE
+	case errors.Is(err, kv.ErrLeaderNotFound), errors.Is(err, raftengine.ErrNotLeader):
+		reason = pb.ForwardFailureReason_FORWARD_FAILURE_REASON_NO_LEADER
 	}
-	if errors.Is(err, kv.ErrComposed1Violation) || errors.Is(err, kv.ErrComposed1VersionGCd) {
-		return errors.WithStack(kv.ForwardComposed1Status(err))
+	return &forwardWireFailure{
+		wire:  kv.ForwardDecisionStatus(phase, reason, pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN),
+		cause: err,
 	}
-	return errors.WithStack(err)
+}
+
+type forwardWireFailure struct {
+	wire  error
+	cause error
+}
+
+func (f *forwardWireFailure) Error() string {
+	return f.wire.Error()
+}
+
+func (f *forwardWireFailure) Unwrap() error {
+	return f.cause
+}
+
+func (f *forwardWireFailure) GRPCStatus() *status.Status {
+	return status.Convert(errors.Cause(f.wire))
 }
 
 func (i *Internal) ProbeMigrationState(ctx context.Context, req *pb.ProbeMigrationStateRequest) (*pb.ProbeMigrationStateResponse, error) {

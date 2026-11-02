@@ -32,7 +32,7 @@ const (
 	quorumAcceptanceGroup          = uint64(7)
 	quorumAcceptanceCatalogVersion = uint64(4)
 	quorumAcceptanceTick           = 10 * time.Millisecond
-	quorumAcceptanceElectionTicks  = 500
+	quorumAcceptanceElectionTicks  = 1000
 	quorumAcceptanceHeartbeatTicks = 10
 	quorumAcceptanceElectionWait   = 3 * quorumAcceptanceTick * quorumAcceptanceElectionTicks
 	quorumAcceptanceSnapshotEvery  = 8

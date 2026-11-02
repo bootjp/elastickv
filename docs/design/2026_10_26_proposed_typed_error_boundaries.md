@@ -157,6 +157,18 @@ The same cause can require a different decision when the request reaches a diffe
 | COMMIT reply is lost after the primary decision | Outcome unknown until durable resolution | The effect may have committed even if the caller saw a transport error. |
 | Leadership changes after proposal, then the new leader has no immediate answer | Outcome unknown | Absence of an answer is not evidence of rollback. |
 
+For the current single-request one-phase forwarding path, an indexed apply
+rejection certifies only the attempt handled by that leader. The receiver may
+surface it as a definitive logical conflict only while its current invocation
+has no earlier possibly submitted attempt. `LeaderProxy` terminates on any
+transport or outcome-unknown result and never sends a later request that
+could reinterpret a lost earlier reply as an abort. `Coordinate.redirect`
+sends one Forward RPC, and its outer dispatch loop treats an unknown outcome
+as terminal. A new caller invocation
+after an unknown result is not reconciled by this rule; it needs a durable
+operation identity. Mixed batches and PREPARE/COMMIT/ABORT retain unknown
+outcomes without a terminal transaction decision.
+
 The receiver does not accept an absent detail, unknown schema version, unknown enum, inconsistent status code, or phase mismatch as proof of a definitive rejection.
 It retains the error as an unknown outcome if submission might have occurred.
 Old peers that return text-only statuses get this conservative treatment.
