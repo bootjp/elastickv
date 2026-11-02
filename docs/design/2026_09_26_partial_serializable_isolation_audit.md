@@ -740,16 +740,14 @@ paths G0 names, behind a replicated activation.
   control prefix `0x1f`; `0x18` would be a legacy
   `Request`'s `ts` tag) persists a marker key per group, reloaded at open and after
   a snapshot restore; the FSM fences raw entries and PREPAREs only once the
-  marker is set. The coordinator can propose activation once it finds the
-  marker missing, but production startup rejects `--commitTSFence` until
-  catalog bootstrap is replicated through Raft. Draft status does not stop
-  an operator from setting the flag, whereas this startup gate prevents the
-  known replica-dependent watermark verdict. Startup also rejects a group
-  whose durable activation marker is already present, even with the flag off;
-  otherwise a restarted node could resume fencing before catalog bootstrap.
-  After the catalog prerequisite is implemented, enablement also requires
-  every node to understand tag `0x2f`; an older replica fails to decode the
-  entry and does not fence.
+  marker is set. Production startup accepts `--commitTSFence` only with the
+  protected Raft catalog bootstrap configured. The coordinator waits until
+  every local protected group reports DataReady before proposing activation
+  through maintenance admission. Legacy startup rejects both the flag and a
+  previously persisted activation marker: its non-Raft catalog writes could
+  otherwise advance the watermark on only one replica. Enablement also
+  requires every replica to understand tag `0x2f`; an older replica fails to
+  decode the entry and does not fence.
 - **Still open:** `DEL_PREFIX`; the replica-determinism caveat above (the
   fence compares against `LastCommitTS()`, which the catalog bootstrap's
   direct write also advances), shared with the one-phase fence; the 2PC
