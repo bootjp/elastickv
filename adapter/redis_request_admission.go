@@ -101,20 +101,37 @@ func (c *redisOwnedConn) publishIfAttached() {
 // is published if a context-insensitive local read returns after revocation.
 type redisOwnedConn struct {
 	redcon.Conn
-	owner       RequestOwnership
-	ctx         context.Context
-	serverCtx   context.Context
-	writer      *redisReplyBuffer
-	resultErr   error
-	errorReply  string
-	finished    bool
-	detached    bool
-	initialDone chan struct{}
-	cancel      context.CancelFunc
-	stopServer  func() bool
-	releaseOnce sync.Once
-	mayWrite    bool
-	workStarted bool
+	owner          RequestOwnership
+	ctx            context.Context
+	serverCtx      context.Context
+	writer         *redisReplyBuffer
+	resultErr      error
+	errorReply     string
+	finished       bool
+	detached       bool
+	initialDone    chan struct{}
+	cancel         context.CancelFunc
+	stopServer     func() bool
+	releaseOnce    sync.Once
+	mayWrite       bool
+	workStarted    bool
+	closeRequested bool
+}
+
+// A command's Close is an intent: its private RESP must pass terminal
+// validation before redcon flushes and closes the socket. redcon dispatches
+// already parsed pipeline commands even after Close, so discard them now.
+func (c *redisOwnedConn) Close() error {
+	c.closeRequested = true
+	c.ReadPipeline()
+	return nil
+}
+
+func (c *redisOwnedConn) closeIfRequested() {
+	if c.closeRequested {
+		c.closeRequested = false
+		_ = c.Conn.Close()
+	}
 }
 
 func (c *redisOwnedConn) cancellationError() error {
@@ -223,6 +240,7 @@ func redisLifetimeConn(conn redcon.Conn) redcon.Conn {
 }
 
 func (c *redisOwnedConn) finishOnExit() {
+	defer c.closeIfRequested()
 	if !c.finished {
 		if c.detached {
 			return
@@ -238,6 +256,9 @@ func (c *redisOwnedConn) publish() {
 }
 
 func (c *redisOwnedConn) publishResult(terminal bool) bool {
+	if terminal {
+		defer c.closeIfRequested()
+	}
 	validationErr := errors.Join(c.cancellationError(), c.owner.Validate())
 	c.prepareTerminalError(validationErr)
 	terminalErr := errors.Join(c.resultErr, validationErr)

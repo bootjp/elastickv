@@ -232,7 +232,7 @@ func (t *redisWireTxn) execute(c *redisOwnedConn, name string, cmd redcon.Comman
 		t.server.observeRedisError(name, time.Since(start))
 		return false
 	}
-	if redisQueueOnlyCommand(t.state, name) {
+	if redisQueueOnlyCommand(t.state, name) && name != cmdQuit {
 		return t.enqueue(c, name, cmd, start)
 	}
 	if name == cmdExec && t.queueErr != nil {
@@ -248,7 +248,7 @@ func (t *redisWireTxn) execute(c *redisOwnedConn, name string, cmd redcon.Comman
 		c.workStarted = c.mayWrite
 		handler(conn, command)
 	}, cmd, start)
-	return name == cmdExec || name == cmdDiscard
+	return name == cmdExec || name == cmdDiscard || name == cmdQuit
 }
 
 func (t *redisWireTxn) enqueue(c *redisOwnedConn, name string, cmd redcon.Command, start time.Time) bool {
