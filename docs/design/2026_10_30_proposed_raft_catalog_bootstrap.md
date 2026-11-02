@@ -8,7 +8,8 @@ Date: 2026-10-30
 
 The opt-in runtime and offline CLI implement accepted-baseline preparation and
 activation for existing plaintext native state, including dedicated TSO group
-zero with a data group. Preparation, active policy, ControlReady and DataReady
+zero with a data group, and explicit-key encrypted data-group migration.
+Preparation, active policy, ControlReady and DataReady
 are separate milestones. Real native/Pebble tests cover plaintext restart and
 selected three-member TLS data-group snapshot catch-up cases. Those cases do
 not establish the complete v5 snapshot/journal or membership protocol.
@@ -24,8 +25,9 @@ automatic transaction retries and retains top-level unknown outcomes after a
 lost reply or terminal reply overflow. Targeted real-wire race tests cover
 these paths; they are not a distributed Jepsen campaign result.
 
-The encryption extension is limited to the exact local startup rotation recipe
-requested with `--encryptionRotateOnStartup` under the protected runtime.
+The encryption extension supports the exact local startup rotation recipe
+requested with `--encryptionRotateOnStartup` and a separately authenticated
+external `EncryptionAdmin.RotateDEK` under the protected runtime.
 Protected encrypted startup requires an already active storage envelope.
 Inactive storage-envelope configurations are synchronously rejected as
 unsupported before workers start; inactive-key registration is not a supported
@@ -39,8 +41,14 @@ the admission lock,
 using the explicitly bound installed cipher/key/wrapper projection. The final
 seal hashes the actual ciphertext, not merely its decoded plaintext. Rotation
 grants bind exact typed recipe frames; they are not general admin authority.
-Ordinary external `EncryptionAdmin.RotateDEK`, enable and bootstrap operations
-remain fail-closed unless separately wired with their own admission authority.
+External rotation requires ADMIN bearer plus verified client mTLS, exact local
+full node identity and pinned purpose epoch. Its original request captures a
+receiver-owned generation before queueing and transfers it into the private
+rotation lane atomically. Startup credentials and captured peer receipts cannot
+authorize it. The supervisor serializes startup and external recipes; after an
+external unknown outcome it performs only read-only reconciliation, never a new
+proposal under a refreshed process context. Enable and bootstrap operations
+remain fail-closed.
 
 Follower encryption recovery uses a native ReadIndex/applied barrier under the
 original Recovery handle before publishing a fresh local permission. A cached
@@ -69,10 +77,24 @@ separate gate, and this result is not production-operation evidence.
 native follower barrier with real Raft and admission, but its loopback peer
 transport fixture is not a composed production TLS/session test.
 
-This work does not enable encrypted legacy/offline baseline migration, cold
-seed, lost-state replacement, arbitrary protected membership changes or the
-complete snapshot protocol. Existing plaintext preparation may retain committed
-inactive encryption metadata; that is not import of encrypted legacy payloads.
+`TestBootstrapOfflineEncryptionLegacyCiphertextToProtectedRestart` starts from
+an actual legacy data group with active storage and Raft envelopes, migrates
+its encrypted history through prepare/resume, activates policy, then verifies
+business reads/writes and protected restart. The external rotation E2E covers
+the authenticated public RPC, exact-request reconciliation, rejected requests,
+business writes and encrypted restart. These are single-data-group results;
+they do not extend the encrypted multi-member or scalar TSO coverage above.
+
+Encrypted legacy data-group migration requires an explicit verified KEK and
+sidecar, all historical keys and matching durable checkpoint/registrations.
+Read-only decoders authenticate the complete logical MVCC history, retained
+WAL and supported native row-stream snapshots. Preparation and resume preserve
+the original physical ciphertext, epochs and nonce state; they do not reencrypt
+or rewrite historical records. Missing keys, mismatched cutover or changed
+sidecar fail closed. Encrypted scalar TSO migration, cold seed, lost-state
+replacement, arbitrary protected membership changes and the complete snapshot
+protocol remain unsupported. Existing plaintext preparation may retain committed
+inactive encryption metadata; that alone is not encrypted migration evidence.
 Full v5 support, production operation and historical serializability remain
 unclaimed. See `docs/raft_bootstrap_enablement.md` for the bounded runbook.
 

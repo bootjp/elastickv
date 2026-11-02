@@ -33,6 +33,7 @@ type bootstrapObservationCommand struct {
 	OperationID                                  raftbootstrap.OperationID
 	MemberID                                     uint64
 	Probes                                       []string
+	Encryption                                   bootstrapOfflineEncryptionCLI
 }
 
 // Pins deliberately contain no configuration epoch, committed cut or data hash.
@@ -169,6 +170,7 @@ func parseBootstrapObservationFlags(args []string, r *bootstrapObservationComman
 	fs.SetOutput(io.Discard)
 	values := map[string]*string{bootstrapObservationOperationFlag: &operation, "output": &r.Output}
 	if r.Command == bootstrapObservationProbe {
+		r.Encryption.flags(fs)
 		values["pinned-config"], values["peer-config"], values["raft-data-dir"], values["member-id"] = &r.Config, &r.PeerConfig, &r.DataDir, &member
 	} else {
 		values["expected-config"] = &r.Config
@@ -194,7 +196,14 @@ func parseBootstrapObservationFlags(args []string, r *bootstrapObservationComman
 }
 
 func validateBootstrapObservationPaths(r bootstrapObservationCommand) error {
+	if r.Command != bootstrapObservationProbe && r.Encryption != (bootstrapOfflineEncryptionCLI{}) {
+		return errors.New("artifact-only manifest does not accept encryption options")
+	}
+	if err := r.Encryption.validate(); err != nil {
+		return err
+	}
 	paths := []string{r.Config, r.Output}
+	paths = append(paths, r.Encryption.paths()...)
 	if r.Command == bootstrapObservationProbe {
 		paths = append(paths, r.PeerConfig, r.DataDir)
 	} else {
@@ -294,14 +303,19 @@ func observeBootstrapOriginal(ctx context.Context, r bootstrapObservationCommand
 			probe = raftbootstrap.BaselineProbe{}
 		}
 	}()
+	enc, err := r.Encryption.load(ctx, r.MemberID, pins.Identity.Group, r.DataDir)
+	if err != nil {
+		return probe, err
+	}
 	probe, err = etcd.ObserveOfflineBaseline(ctx, etcd.OfflineBaselineObservationOptions{DataDir: r.DataDir, Ownership: ownership, MemberID: r.MemberID,
+		Crypto:   enc.NativeCrypto(),
 		Identity: pins.Identity, OperationID: r.OperationID, Minimum: pins.Minimum, Members: pins.Configuration.Members,
 		ProbeStore: func(ctx context.Context) (etcd.BaselineStoreProof, error) {
 			if pins.Identity.Group == 0 {
 				_, proof, err := probeOfflineTSOBaseline(ctx, r.DataDir, ownership)
 				return proof, err
 			}
-			return bootstrapOfflineDataStoreProbe(ctx, r.DataDir)
+			return bootstrapOfflineDataStoreProbe(ctx, r.DataDir, bootstrapOfflineOptionalEncryption(enc)...)
 		}})
 	if err != nil {
 		return probe, errors.WithStack(err)

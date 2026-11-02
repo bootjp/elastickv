@@ -4929,9 +4929,14 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 	if err := r.prepareAdminForwardServers(); err != nil {
 		return r.startupFailure(err)
 	}
-	adminGRPCOpts := bootstrapServiceAuthOptions(r.adminGRPCOpts, bootstrapDomainForRuntimes(r.runtimes))
-	if bootstrapDomainForRuntimes(r.runtimes) != nil {
+	domain := bootstrapDomainForRuntimes(r.runtimes)
+	adminGRPCOpts := bootstrapServiceAuthOptions(r.adminGRPCOpts, domain)
+	if domain != nil {
 		adminGRPCOpts.unary = append([]grpc.UnaryServerInterceptor{bootstrapRegistrationReceiverInterceptor(r.defaultGroupID)}, adminGRPCOpts.unary...)
+	}
+	adminGRPCOpts, err := bootstrapRotationRPCOptions(adminGRPCOpts, domain, etcdraftengine.DeriveNodeID(*raftId), domain.rotationRPCHandler())
+	if err != nil {
+		return r.startupFailure(err)
 	}
 	if r.publicKVGate != nil {
 		adminGRPCOpts.unary = append(adminGRPCOpts.unary, r.publicKVGate.unaryInterceptor)

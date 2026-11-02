@@ -8,6 +8,7 @@ import (
 	"github.com/bootjp/elastickv/internal/encryption/kek"
 	"github.com/bootjp/elastickv/internal/raftadmission"
 	"github.com/bootjp/elastickv/kv"
+	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
 	"golang.org/x/sync/errgroup"
 )
@@ -80,11 +81,15 @@ func configureBootstrapEncryptionStartup(ctx context.Context, cfg bootstrapEncry
 		plan: func(ctx context.Context) (*bootstrapRotationRecipe, error) {
 			return newBootstrapRotationRecipe(ctx, recipeConfig)
 		},
+		planExternal: func(ctx context.Context, request *pb.RotateDEKRequest) (*bootstrapRotationRecipe, error) {
+			return newBootstrapExternalRotationRecipe(ctx, recipeConfig, request)
+		},
 		authorize: domain.authorizeRotationRecipe, refresh: domain.refresh,
 	})
 	if err != nil {
 		return nil, nil, err
 	}
+	domain.setProtectedRotationHandler(supervisor.RotateDEK)
 	worker, cancel := context.WithCancel(registered)
 	done := make(chan struct{})
 	cfg.eg.Go(func() error { defer close(done); return supervisor.Run(worker) })

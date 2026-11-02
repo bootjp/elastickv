@@ -8,6 +8,7 @@ import (
 	"hash"
 	"math"
 
+	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/v2"
 )
@@ -26,15 +27,17 @@ var (
 // values from a local maximum. The native probe must independently match the
 // applied cut and configuration before anyone signs baseline evidence.
 type BootstrapBaselineProbe struct {
-	Version                   uint32
-	DataDigest                [sha256.Size]byte
-	Watermark                 uint64
-	WatermarkPresent          bool
-	AppliedIndex              uint64
-	ConfigurationIndex        uint64
-	ConfigurationIndexPresent bool
-	MVCCVersions              uint64
-	MetadataRecords           uint64
+	Version                     uint32
+	DataDigest                  [sha256.Size]byte
+	Watermark                   uint64
+	WatermarkPresent            bool
+	AppliedIndex                uint64
+	ConfigurationIndex          uint64
+	ConfigurationIndexPresent   bool
+	MVCCVersions                uint64
+	MetadataRecords             uint64
+	EncryptionCheckpoint        encryption.SnapshotCheckpoint
+	EncryptionCheckpointPresent bool
 }
 
 type baselineTxnHead struct {
@@ -47,6 +50,7 @@ type baselineProbeReader struct {
 	hash          hash.Hash
 	txnHeads      map[string]baselineTxnHead
 	configuration baselineTxnHead
+	decoder       *OfflineBaselineDecoder
 }
 
 type baselineProbeIterator interface {
@@ -102,6 +106,10 @@ func ProbeBootstrapBaseline(ctx context.Context, st MVCCStore) (BootstrapBaselin
 // Pebble open without constructing a write-capable MVCCStore. Encrypted rows
 // remain unsupported. No metadata (including encryption metadata) is excluded.
 func ProbeBootstrapBaselineSnapshot(ctx context.Context, snapshot *pebble.Snapshot) (BootstrapBaselineProbe, error) {
+	return probeBootstrapBaselineSnapshot(ctx, snapshot, nil)
+}
+
+func probeBootstrapBaselineSnapshot(ctx context.Context, snapshot *pebble.Snapshot, decoder *OfflineBaselineDecoder) (BootstrapBaselineProbe, error) {
 	if ctx == nil || snapshot == nil {
 		return BootstrapBaselineProbe{}, errors.WithStack(ErrBootstrapBaselineInvalid)
 	}
@@ -109,8 +117,9 @@ func ProbeBootstrapBaselineSnapshot(ctx context.Context, snapshot *pebble.Snapsh
 		return BootstrapBaselineProbe{}, errors.WithStack(err)
 	}
 	reader := baselineProbeReader{
-		result: BootstrapBaselineProbe{Version: BootstrapBaselineProbeVersion},
-		hash:   sha256.New(), txnHeads: make(map[string]baselineTxnHead),
+		decoder: decoder,
+		result:  BootstrapBaselineProbe{Version: BootstrapBaselineProbeVersion},
+		hash:    sha256.New(), txnHeads: make(map[string]baselineTxnHead),
 	}
 	_, _ = reader.hash.Write([]byte("elastickv/offline-full-mvcc-baseline/v1\x00"))
 	iter, err := snapshot.NewIter(nil)
@@ -138,23 +147,37 @@ func (r *baselineProbeReader) scan(ctx context.Context, iter baselineProbeIterat
 		if err != nil {
 			return errors.Wrap(err, "baseline iterator value")
 		}
-		if isPebbleMetaKey(key) {
-			if err := r.metadata(key, value); err != nil {
-				return err
-			}
-			r.result.MetadataRecords++
-		} else {
-			if err := r.version(key, value); err != nil {
-				return err
-			}
-			r.result.MVCCVersions++
+		if err := r.row(key, value); err != nil {
+			return err
 		}
-		// Pebble bytewise iteration and length framing give a layout-independent,
-		// unambiguous stream. Do not hash SST bytes or filter via GetAt/ScanAt.
-		r.field(key)
-		r.field(value)
 	}
 	return errors.WithStack(iter.Error())
+}
+
+func (r *baselineProbeReader) row(key, value []byte) error {
+	if r.decoder != nil {
+		var err error
+		value, err = r.decoder.canonical(key, value)
+		if err != nil {
+			return err
+		}
+	}
+	if isPebbleMetaKey(key) {
+		if err := r.metadata(key, value); err != nil {
+			return err
+		}
+		r.result.MetadataRecords++
+	} else {
+		if err := r.version(key, value); err != nil {
+			return err
+		}
+		r.result.MVCCVersions++
+	}
+	// Pebble bytewise iteration and length framing give a layout-independent,
+	// unambiguous stream. Do not hash SST bytes or filter via GetAt/ScanAt.
+	r.field(key)
+	r.field(value)
+	return nil
 }
 
 func (r *baselineProbeReader) field(value []byte) {
@@ -166,6 +189,8 @@ func (r *baselineProbeReader) field(value []byte) {
 
 func (r *baselineProbeReader) metadata(key, value []byte) error {
 	switch string(key) {
+	case string(encryptionCheckpointKey):
+		return r.encryptionMetadata(value)
 	case metaAppliedIndex:
 		index, err := baselineUint64(value)
 		if err != nil || index == 0 {
@@ -181,6 +206,18 @@ func (r *baselineProbeReader) metadata(key, value []byte) error {
 	case metaMinRetainedTS, metaPendingMinRetainedTS:
 		return baselineRetention(key, value)
 	}
+	return nil
+}
+
+func (r *baselineProbeReader) encryptionMetadata(value []byte) error {
+	if r.decoder == nil {
+		return nil
+	}
+	cp, err := decodeOfflineEncryptionCheckpoint(value)
+	if err != nil {
+		return err
+	}
+	r.result.EncryptionCheckpoint, r.result.EncryptionCheckpointPresent = cp, true
 	return nil
 }
 
@@ -279,6 +316,9 @@ func (r *baselineProbeReader) finish(ctx context.Context) error {
 	}
 	if r.result.AppliedIndex == 0 || r.result.ConfigurationIndex > r.result.AppliedIndex {
 		return errors.Wrap(ErrBootstrapBaselineInvalid, "absent applied proof or configuration beyond applied cut")
+	}
+	if r.result.EncryptionCheckpoint.Index > r.result.AppliedIndex {
+		return errors.Wrap(ErrBootstrapBaselineInvalid, "encryption checkpoint beyond applied cut")
 	}
 	for _, head := range r.txnHeads {
 		if err := ctx.Err(); err != nil {

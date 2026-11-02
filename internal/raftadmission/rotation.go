@@ -240,6 +240,10 @@ func (a *Arbiter) BeginRotation(ctx context.Context, recipe raftbootstrap.Digest
 	if a.rotation.responsibility && a.rotation.recipe != (raftbootstrap.Digest{}) && a.rotation.recipe != recipe {
 		return nil, errors.WithStack(ErrClosed)
 	}
+	return a.beginRotationLocked(ctx, recipe, id)
+}
+
+func (a *Arbiter) beginRotationLocked(ctx context.Context, recipe raftbootstrap.Digest, id [16]byte) (*RotationRun, error) {
 	// Close dependents before assigning responsibility or exposing the run.
 	a.invalidateEncryptionLocked()
 	if a.fatal != nil {

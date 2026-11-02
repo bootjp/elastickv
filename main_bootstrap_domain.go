@@ -18,13 +18,14 @@ import (
 // One domain owns all process-local group authority. Owner pointers are copied
 // before entering A; no path acquires this registry mutex while holding A.
 type bootstrapDomain struct {
-	admission    *raftadmission.Arbiter
-	mu           sync.Mutex
-	owners       map[uint64]*peersession.Owner
-	startupToken string
-	activations  map[uint64][]byte
-	cluster      raftbootstrap.UUID
-	encryption   *bootstrapEncryptionDomain
+	admission                *raftadmission.Arbiter
+	mu                       sync.Mutex
+	owners                   map[uint64]*peersession.Owner
+	startupToken             string
+	activations              map[uint64][]byte
+	cluster                  raftbootstrap.UUID
+	encryption               *bootstrapEncryptionDomain
+	protectedRotationHandler bootstrapRotationRPCHandler
 }
 
 const bootstrapReadinessRetryInterval = 25 * time.Millisecond

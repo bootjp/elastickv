@@ -31,11 +31,15 @@ var errBootstrapOfflineStore = errors.New("offline data store verification faile
 // These helpers do not acquire a process fence or authenticate the native
 // backup. Caller must retain offline ownership across native backup, callbacks,
 // WAL migration and publication. They never stop a running server or create a DB.
-func bootstrapOfflineDataStoreProbe(ctx context.Context, dataDir string) (etcd.BaselineStoreProof, error) {
+func bootstrapOfflineDataStoreProbe(ctx context.Context, dataDir string, optional ...*bootstrapOfflineEncryption) (etcd.BaselineStoreProof, error) {
+	enc, err := bootstrapOfflineEncryptionOption(optional)
+	if err != nil {
+		return etcd.BaselineStoreProof{}, err
+	}
 	var result etcd.BaselineStoreProof
-	err := bootstrapOfflineWithData(ctx, dataDir, true, func(db *pebble.DB) error {
+	err = bootstrapOfflineWithData(ctx, dataDir, true, func(db *pebble.DB) error {
 		snapshot := db.NewSnapshot()
-		proof, err := bootstrapOfflineSnapshotProof(ctx, snapshot)
+		proof, err := bootstrapOfflineSnapshotProofWithEncryption(ctx, snapshot, enc)
 		if err = errors.Join(err, snapshot.Close()); err != nil {
 			return err
 		}
@@ -48,8 +52,14 @@ func bootstrapOfflineDataStoreProbe(ctx context.Context, dataDir string) (etcd.B
 	return result, nil
 }
 
-func bootstrapOfflineSnapshotProof(ctx context.Context, snapshot *pebble.Snapshot) (etcd.BaselineStoreProof, error) {
-	observation, err := store.ProbeBootstrapBaselineSnapshot(ctx, snapshot)
+func bootstrapOfflineSnapshotProofWithEncryption(ctx context.Context, snapshot *pebble.Snapshot, enc *bootstrapOfflineEncryption) (etcd.BaselineStoreProof, error) {
+	var observation store.BootstrapBaselineProbe
+	var err error
+	if enc == nil {
+		observation, err = store.ProbeBootstrapBaselineSnapshot(ctx, snapshot)
+	} else {
+		observation, err = enc.probe(ctx, snapshot)
+	}
 	if err != nil {
 		return etcd.BaselineStoreProof{}, errors.WithStack(err)
 	}
@@ -58,16 +68,22 @@ func bootstrapOfflineSnapshotProof(ctx context.Context, snapshot *pebble.Snapsho
 	}
 	// A missing ordered configuration stays absent. Only native complete-history
 	// replay may establish it; never substitute the snapshot/data applied index.
-	return etcd.BaselineStoreProof{AppliedIndex: observation.AppliedIndex,
+	result := etcd.BaselineStoreProof{AppliedIndex: observation.AppliedIndex,
 		ConfigurationIndex: observation.ConfigurationIndex, Watermark: observation.Watermark,
-		DataDigest: raftbootstrap.Digest(observation.DataDigest)}, nil
+		DataDigest: raftbootstrap.Digest(observation.DataDigest)}
+	if enc != nil {
+		result.RaftEnvelopeCutoverIndex = enc.cutover
+		result.EncryptionContextRequired = true
+	}
+	return result, nil
 }
 
 type bootstrapOfflineDataPlan struct {
-	prepared kv.PreparedBootstrapActivation
-	probe    []byte
-	key      []byte
-	value    []byte
+	prepared   kv.PreparedBootstrapActivation
+	probe      []byte
+	key        []byte
+	value      []byte
+	encryption *bootstrapOfflineEncryption
 }
 
 // bootstrapOfflineDataPreparation freezes independently trusted preparation.
@@ -75,7 +91,11 @@ type bootstrapOfflineDataPlan struct {
 // and closing all RO handles. Restart accepts exactly original or exact prepared
 // target images, never arbitrary partial edits. Backup/native ownership remains
 // the orchestrator's responsibility; no caller-supplied bypass boolean exists.
-func bootstrapOfflineDataPreparation(prepared kv.PreparedBootstrapActivation) (*etcd.BaselinePreparationCallbacks, error) {
+func bootstrapOfflineDataPreparation(prepared kv.PreparedBootstrapActivation, optional ...*bootstrapOfflineEncryption) (*etcd.BaselinePreparationCallbacks, error) {
+	enc, err := bootstrapOfflineEncryptionOption(optional)
+	if err != nil {
+		return nil, err
+	}
 	encoded, err := raftbootstrap.MarshalBaselineProbe(prepared.Probe)
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -94,12 +114,15 @@ func bootstrapOfflineDataPreparation(prepared kv.PreparedBootstrapActivation) (*
 		return nil, errors.WithStack(err)
 	}
 	plan := &bootstrapOfflineDataPlan{prepared: prepared, probe: encoded,
-		key: append([]byte(store.RaftControlMetadataPrefix), key...), value: physicalValue}
+		key: append([]byte(store.RaftControlMetadataPrefix), key...), value: physicalValue, encryption: enc}
 	return &etcd.BaselinePreparationCallbacks{MutablePaths: []string{bootstrapOfflineDataPath},
 		StagePreparation: plan.stage, VerifyPreparedStore: plan.verify}, nil
 }
 
 func (p *bootstrapOfflineDataPlan) validate(c etcd.BaselinePreparationContext) error {
+	if err := p.encryption.validatePreparationContext(c); err != nil {
+		return err
+	}
 	if err := raftbootstrap.VerifyBaselineManifest(c.Manifest, p.prepared.Probe.BaselineContext); err != nil {
 		return errors.WithStack(err)
 	}
@@ -128,7 +151,10 @@ func (p *bootstrapOfflineDataPlan) stage(ctx context.Context, c etcd.BaselinePre
 	// inspect returned only after BOTH RO databases and snapshots closed.
 	err = bootstrapOfflineWithData(ctx, c.DataDir, false, func(db *pebble.DB) error {
 		snapshot := db.NewSnapshot()
-		current, err := bootstrapOfflineSnapshotProof(ctx, snapshot)
+		current, err := bootstrapOfflineSnapshotProofWithEncryption(ctx, snapshot, p.encryption)
+		if err == nil {
+			err = p.matchPhysicalBackup(ctx, c.BackupDir, snapshot)
+		}
 		if err = errors.Join(err, snapshot.Close()); err != nil {
 			return err
 		}
@@ -182,7 +208,7 @@ func (p *bootstrapOfflineDataPlan) inspect(ctx context.Context, c etcd.BaselineP
 
 func (p *bootstrapOfflineDataPlan) compare(ctx context.Context, source, target *pebble.Snapshot) (etcd.BaselinePreparedStoreProof, bool, error) {
 	var result etcd.BaselinePreparedStoreProof
-	baseline, err := bootstrapOfflineSnapshotProof(ctx, source)
+	baseline, err := bootstrapOfflineSnapshotProofWithEncryption(ctx, source, p.encryption)
 	if err != nil {
 		return result, false, err
 	}
@@ -192,7 +218,7 @@ func (p *bootstrapOfflineDataPlan) compare(ctx context.Context, source, target *
 	if err := p.checkUnpreparedSource(source); err != nil {
 		return result, false, err
 	}
-	current, err := bootstrapOfflineSnapshotProof(ctx, target)
+	current, err := bootstrapOfflineSnapshotProofWithEncryption(ctx, target, p.encryption)
 	if err != nil {
 		return result, false, err
 	}
@@ -201,18 +227,39 @@ func (p *bootstrapOfflineDataPlan) compare(ctx context.Context, source, target *
 		return result, false, err
 	}
 	if !present {
-		if current.DataDigest != baseline.DataDigest {
-			return result, false, errors.Wrap(errBootstrapOfflineStore, "unprepared target differs from preserved source")
-		}
-		return etcd.BaselinePreparedStoreProof{Baseline: baseline}, false, nil
+		err := bootstrapOfflineMatchUnprepared(ctx, source, target, current, baseline)
+		return etcd.BaselinePreparedStoreProof{Baseline: baseline}, false, err
 	}
 	if !bytes.Equal(raw, p.value) {
 		return result, false, errors.Wrap(errBootstrapOfflineStore, "conflicting preparation bytes")
 	}
-	if err := store.VerifyBootstrapBaselinePreparedTransform(ctx, source, target, map[string][]byte{string(p.key): p.value}); err != nil {
+	if err := p.verifyTransform(ctx, source, target); err != nil {
 		return result, false, errors.WithStack(err)
 	}
 	return etcd.BaselinePreparedStoreProof{Baseline: baseline, PreparedDataDigest: current.DataDigest}, true, nil
+}
+
+func bootstrapOfflineMatchUnprepared(ctx context.Context, source, target *pebble.Snapshot, current, baseline etcd.BaselineStoreProof) error {
+	if current.DataDigest != baseline.DataDigest {
+		return errors.Wrap(errBootstrapOfflineStore, "unprepared target differs from preserved source")
+	}
+	return errors.WithStack(store.VerifyBootstrapBaselinePhysicalEquality(ctx, source, target))
+}
+
+func (p *bootstrapOfflineDataPlan) verifyTransform(ctx context.Context, source, target *pebble.Snapshot) error {
+	allowed := map[string][]byte{string(p.key): p.value}
+	if p.encryption != nil {
+		return errors.WithStack(store.VerifyBootstrapBaselinePreparedTransformWithDecoder(ctx, source, target, allowed, p.encryption.decoder))
+	}
+	return errors.WithStack(store.VerifyBootstrapBaselinePreparedTransform(ctx, source, target, allowed))
+}
+
+func (p *bootstrapOfflineDataPlan) matchPhysicalBackup(ctx context.Context, backup string, target *pebble.Snapshot) error {
+	return bootstrapOfflineWithData(ctx, backup, true, func(db *pebble.DB) (err error) {
+		source := db.NewSnapshot()
+		defer func() { err = errors.Join(err, source.Close()) }()
+		return errors.WithStack(store.VerifyBootstrapBaselinePhysicalEquality(ctx, source, target))
+	})
 }
 
 func (p *bootstrapOfflineDataPlan) matchSource(proof etcd.BaselineStoreProof) error {

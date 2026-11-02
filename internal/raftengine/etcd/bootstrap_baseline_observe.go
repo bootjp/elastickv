@@ -14,6 +14,7 @@ import (
 // The roster, identity, fresh operation ID and minimum are independently pinned
 // operator inputs. No cut, data digest, epoch or timestamp is accepted as input.
 type OfflineBaselineObservationOptions struct {
+	Crypto      *OfflineBaselineCrypto
 	DataDir     string
 	Ownership   io.Closer
 	MemberID    uint64
@@ -29,7 +30,7 @@ type OfflineBaselineObservationOptions struct {
 // Caller may sign only after matching its provisioned certificate/member key.
 func ObserveOfflineBaseline(ctx context.Context, options OfflineBaselineObservationOptions) (raftbootstrap.BaselineProbe, error) {
 	var empty raftbootstrap.BaselineProbe
-	o := OfflineBaselineOptions{DataDir: options.DataDir, Ownership: options.Ownership, MemberID: options.MemberID, ProbeStore: options.ProbeStore}
+	o := OfflineBaselineOptions{DataDir: options.DataDir, Ownership: options.Ownership, MemberID: options.MemberID, ProbeStore: options.ProbeStore, Crypto: options.Crypto}
 	if !baselineHasInputs(o) {
 		return empty, errors.Wrap(ErrOfflineBaseline, "observation requires independent offline store probe and member")
 	}
@@ -39,7 +40,7 @@ func ObserveOfflineBaseline(ctx context.Context, options OfflineBaselineObservat
 	if err := baselineObservationFormat(o.DataDir); err != nil {
 		return empty, err
 	}
-	image, err := readBaselineWAL(filepath.Join(o.DataDir, walDirName))
+	image, err := readOfflineBaselineWAL(ctx, filepath.Join(o.DataDir, walDirName), o.Crypto, false)
 	if err != nil {
 		return empty, err
 	}

@@ -263,6 +263,7 @@ type bootstrapRotationE2ENode struct {
 	registrationCtx context.Context
 	group           *kv.ShardGroup
 	stopReadiness   func()
+	supervisor      *bootstrapRotationRuntime
 	close           func()
 }
 
@@ -309,6 +310,7 @@ func (f *bootstrapRotationE2EFixture) protected(t *testing.T) *bootstrapRotation
 		wrapper: f.wrapper, nodeID: f.config.local.Member, requested: true, eg: eg, cleanup: &cleanup})
 	require.NoError(t, err)
 	require.NotNil(t, supervisor)
+	node.supervisor = supervisor
 	node.registrationCtx, node.group = registered, groups[1]
 	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", f.group.address)
 	require.NoError(t, err)

@@ -9,26 +9,33 @@ import (
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
+	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
 )
 
 const bootstrapRotationAttemptTimeout = 5 * time.Second
 
 type bootstrapRotationRuntimeConfig struct {
-	admission *raftadmission.Arbiter
-	group     uint64
-	requested bool
-	barrier   func(context.Context) (uint64, error)
-	observe   func(context.Context) (bootstrapEncryptionProjection, error)
-	plan      func(context.Context) (*bootstrapRotationRecipe, error)
-	authorize func(*bootstrapRotationRecipe) error
-	refresh   func() error
+	admission    *raftadmission.Arbiter
+	group        uint64
+	requested    bool
+	barrier      func(context.Context) (uint64, error)
+	observe      func(context.Context) (bootstrapEncryptionProjection, error)
+	plan         func(context.Context) (*bootstrapRotationRecipe, error)
+	planExternal func(context.Context, *pb.RotateDEKRequest) (*bootstrapRotationRecipe, error)
+	authorize    func(*bootstrapRotationRecipe) error
+	refresh      func() error
 }
 
 type bootstrapRotationRuntime struct {
-	config     bootstrapRotationRuntimeConfig
-	recipe     *bootstrapRotationRecipe
-	superseded bool
+	config           bootstrapRotationRuntimeConfig
+	recipe           *bootstrapRotationRecipe
+	superseded       bool
+	external         bool
+	previousRecipe   *bootstrapRotationRecipe
+	previousExternal bool
+	requests         chan bootstrapExternalRotationCall
+	done             chan struct{}
 }
 
 type bootstrapRotationObservation struct {
@@ -45,12 +52,13 @@ func newBootstrapRotationRuntime(config bootstrapRotationRuntimeConfig) (*bootst
 		config.plan == nil || config.authorize == nil || config.refresh == nil {
 		return nil, errors.New("protected rotation requires complete receiver-owned wiring")
 	}
-	return &bootstrapRotationRuntime{config: config}, nil
+	return &bootstrapRotationRuntime{config: config, requests: make(chan bootstrapExternalRotationCall, 1), done: make(chan struct{})}, nil
 }
 
 // One goroutine serializes recipe ownership. All disk, wrapper, RPC and join
 // work happens outside A. Native mutation closes permission before callbacks.
 func (r *bootstrapRotationRuntime) Run(ctx context.Context) error {
+	defer close(r.done)
 	ticker := time.NewTicker(bootstrapReadinessRetryInterval)
 	defer ticker.Stop()
 	for {
@@ -71,6 +79,8 @@ func (r *bootstrapRotationRuntime) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
+		case call := <-r.requests:
+			r.handleExternal(ctx, call)
 		}
 	}
 }
@@ -182,7 +192,7 @@ func (r *bootstrapRotationRuntime) prepareRecipe(ctx context.Context, out *boots
 
 func (r *bootstrapRotationRuntime) resolvePrevious(observation bootstrapRotationObservation) error {
 	state := observation.status
-	if !state.Responsibility || (state.Native.Role != raftengine.StateFollower && !r.superseded) {
+	if !state.Responsibility || (state.Native.Role != raftengine.StateFollower && !r.superseded && !r.external) {
 		return nil
 	}
 	if state.Recipe != (raftbootstrap.Digest{}) && (!observation.reconciled || observation.receipt.RecipeDigest != state.Recipe) {
@@ -191,10 +201,17 @@ func (r *bootstrapRotationRuntime) resolvePrevious(observation bootstrapRotation
 	if err := r.config.admission.ResolveRotationResponsibility(observation.ticket, state.Recipe, observation.projection.digest()); err != nil {
 		return errors.WithStack(err)
 	}
-	if r.superseded {
-		r.recipe, r.superseded = nil, false
-	}
+	r.restoreAfterResolution(observation.receipt)
 	return nil
+}
+
+func (r *bootstrapRotationRuntime) restoreAfterResolution(receipt bootstrapRotationReceipt) {
+	if r.external && !r.superseded && !receipt.Complete {
+		r.recipe, r.external = r.previousRecipe, r.previousExternal
+	} else if r.superseded {
+		r.recipe, r.superseded, r.external = nil, false, false
+	}
+	r.previousRecipe, r.previousExternal = nil, false
 }
 
 func (r *bootstrapRotationRuntime) advance(ctx context.Context, observation bootstrapRotationObservation) error {
@@ -236,7 +253,7 @@ func (r *bootstrapRotationRuntime) runLeader(ctx context.Context, projection raf
 			_ = run.Finish(raftadmission.ErrClosed)
 		}
 	}()
-	result, attemptErr := r.recipe.Run(run.Context())
+	result, attemptErr := r.executeRecipe(run.Context())
 	finishErr := run.Finish(attemptErr)
 	finished = true
 	if finishErr != nil {
@@ -254,6 +271,13 @@ func (r *bootstrapRotationRuntime) runLeader(ctx context.Context, projection raf
 		return errors.WithStack(err)
 	}
 	return errors.WithStack(r.config.admission.CompleteRotation(run, ticket, projection))
+}
+
+func (r *bootstrapRotationRuntime) executeRecipe(ctx context.Context) (bootstrapRotationReceipt, error) {
+	if r.external {
+		return r.recipe.Reconcile(ctx)
+	}
+	return r.recipe.Run(ctx)
 }
 
 func (r *bootstrapRotationRuntime) Wait(ctx context.Context) error {

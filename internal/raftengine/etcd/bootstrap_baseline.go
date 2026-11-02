@@ -19,6 +19,8 @@ import (
 // configuration history; a snapshot's data index is never a replacement.
 type BaselineStoreProof struct {
 	AppliedIndex, ConfigurationIndex, Watermark uint64
+	RaftEnvelopeCutoverIndex                    uint64
+	EncryptionContextRequired                   bool
 	DataDigest                                  raftbootstrap.Digest
 	ConfigurationMembers                        []uint64
 	PreparedTransactions                        uint64
@@ -29,6 +31,7 @@ type BaselineStoreProbe func(context.Context) (BaselineStoreProof, error)
 // The caller MUST hold exclusive offline/quiescence ownership throughout every
 // call (including the callback). These APIs never stop a running server.
 type OfflineBaselineOptions struct {
+	Crypto      *OfflineBaselineCrypto
 	Ownership   io.Closer
 	Preparation *BaselinePreparationCallbacks
 	DataDir     string
@@ -111,7 +114,7 @@ func readBaselineInput(ctx context.Context, o OfflineBaselineOptions, identity *
 	if err := ctx.Err(); err != nil {
 		return nil, nil, proof, errors.WithStack(err)
 	}
-	image, err := readBaselineWAL(filepath.Join(o.DataDir, walDirName))
+	image, err := readOfflineBaselineWAL(ctx, filepath.Join(o.DataDir, walDirName), o.Crypto, false)
 	if err != nil {
 		return nil, nil, proof, err
 	}
@@ -125,6 +128,12 @@ func readBaselineInput(ctx context.Context, o OfflineBaselineOptions, identity *
 	proof, err = o.ProbeStore(ctx)
 	if err != nil {
 		return nil, nil, proof, errors.WithStack(err)
+	}
+	if err := validateOfflineBaselineCryptoCut(o.Crypto, proof, image.hardState.GetCommit()); err != nil {
+		return nil, nil, proof, err
+	}
+	if err := validateOfflineBaselineSnapshot(ctx, o.DataDir, snapshot, o.Crypto); err != nil {
+		return nil, nil, proof, err
 	}
 	if !baselineReplayable(o.Expected, image, snapshot) {
 		return nil, nil, proof, errors.Wrap(ErrOfflineBaseline, "unreplayable committed prefix")

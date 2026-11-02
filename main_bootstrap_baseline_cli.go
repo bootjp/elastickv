@@ -31,6 +31,7 @@ type bootstrapBaselineCLIRequest struct {
 	ExpectedConfigPath, ManifestPath, RaftDataDir string
 	OperationID                                   raftbootstrap.OperationID
 	MemberID                                      uint64
+	Encryption                                    bootstrapOfflineEncryptionCLI
 }
 
 func parseBootstrapBaselineCLI(args []string) (bootstrapBaselineCLIRequest, error) {
@@ -63,6 +64,7 @@ func parseBootstrapBaselineCLI(args []string) (bootstrapBaselineCLIRequest, erro
 func parseBootstrapBaselineFlags(args []string, request *bootstrapBaselineCLIRequest) (operation, member string, err error) {
 	fs := flag.NewFlagSet("baseline inspect", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
+	request.Encryption.flags(fs)
 	values := map[string]*string{
 		"expected-config": &request.ExpectedConfigPath, "manifest": &request.ManifestPath,
 		"raft-data-dir": &request.RaftDataDir, "operation-id": &operation, "member-id": &member,
@@ -126,10 +128,14 @@ func bootstrapBaselineUint(value string) (uint64, error) {
 }
 
 func validateBootstrapBaselineRequest(r bootstrapBaselineCLIRequest) error {
+	if err := r.Encryption.validate(); err != nil {
+		return err
+	}
 	if !bootstrapBaselineCommand(r.Command) || r.MemberID == 0 || r.OperationID == (raftbootstrap.OperationID{}) {
 		return errors.New("invalid baseline inspection request")
 	}
 	paths := []string{r.ExpectedConfigPath, r.ManifestPath, r.RaftDataDir}
+	paths = append(paths, r.Encryption.paths()...)
 	seen := map[string]bool{}
 	for _, path := range paths {
 		if !bootstrapBaselineValidPath(path) || seen[path] {

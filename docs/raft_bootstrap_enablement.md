@@ -9,8 +9,9 @@ watermark to force disagreeing probes to match.
 
 ## Scope And Verification Status
 
-The offline procedure below accepts existing **plaintext** native state. It
-covers data groups and dedicated TSO group zero; the latter reconstructs its
+The offline procedure accepts plaintext native state and, with explicit
+verified historical keys, encrypted data-group state. Plaintext support also
+covers dedicated TSO group zero; the latter reconstructs its
 complete legacy scalar state from the verified original snapshot/WAL backup
 and explicitly initializes `tso-control.db`. Runtime does not automatically
 import legacy TSO snapshots into a missing control database. Resume verifies
@@ -18,20 +19,24 @@ the original backup, not the already transformed target as a new baseline.
 
 Protected Redis wire `MULTI`/`EXEC`/`DISCARD` has receiver-owned queue and
 execution support; it is no longer categorically refused. The encryption
-runtime extension is **only** the exact local startup recipe requested by
-`--encryptionRotateOnStartup`, with an already active storage envelope.
+runtime supports the exact local startup recipe requested by
+`--encryptionRotateOnStartup` and authenticated external `EncryptionAdmin.RotateDEK`,
+with an already active storage envelope.
 Inactive storage-envelope configurations are synchronously unsupported before
 worker startup, including inactive-key registration. Raft envelope activation
 and multigroup profiles must still pass the existing namespace/runtime scope
 validation; this recipe grants no exception. Its supervisor/installed-projection
 wiring is implemented and verified for the single-data-group active storage
 and Raft envelope profile described below. This is not authorization for
-arbitrary external `EncryptionAdmin.RotateDEK`, enable or bootstrap RPCs;
-those remain fail-closed unless separately wired. Do not infer availability
+arbitrary enable or bootstrap RPCs; those remain fail-closed. External rotation
+requires the local full node identity, pinned purpose epoch, ADMIN bearer and
+verified client mTLS; startup credentials cannot authorize it. Do not infer availability
 of that profile from helper tests or bypass a closed gate to force startup.
 
-There is no encrypted legacy/offline migration procedure here. A plaintext
-baseline with committed but inactive DEK metadata is not an encrypted source.
+Encrypted offline migration authenticates the complete logical data history,
+retained WAL and native row-stream snapshots without reencrypting source bytes.
+Encrypted scalar TSO migration remains unsupported. A plaintext baseline with
+committed but inactive DEK metadata is not an encrypted source.
 Cold seed, missing-state replacement and arbitrary protected membership
 reconfiguration remain out of scope. Selected plaintext native snapshot
 catch-up/restart regressions do not certify the full v5 snapshot/journal
@@ -46,9 +51,9 @@ production operation; final composed review and CI remain required.
   SPKI pins, full role roster, WAL, snapshots, term and vote.
 - Use a fresh nonzero 32-digit lowercase hexadecimal operation ID per group.
   Reuse that ID only when resuming that same migration.
-- The accepted-baseline source uses an already populated replicated catalog,
-  plaintext stores and plaintext retained snapshot/WAL payloads. Do not use
-  startup rotation to bypass this offline source restriction. Preserve any
+- The accepted-baseline source uses an already populated replicated catalog.
+  Encrypted data groups require the explicit offline context described below;
+  startup rotation is not a substitute for that verification. Preserve any
   committed inactive DEK metadata and its required key material unchanged.
   Unsupported encryption profiles fail closed. Membership reconfiguration and
   lost-state replacement require separate protocols; this procedure does not
@@ -61,6 +66,18 @@ production operation; final composed review and CI remain required.
   by deleting a sidecar, registering a new identity or relaxing admission.
 
 ## Observe And Agree
+
+For encrypted data-group sources, supply `--encryption-sidecar=/absolute/path`
+and exactly one of `--encryption-kek-file=/absolute/path` or
+`--encryption-kek-uri=...` to every source-reading `probe`, `inspect`, `prepare`,
+`resume` and `attest` invocation. Keep the KEK file outside the source tree and
+backup image. These options have no runtime-global or environment-only fallback.
+Retain all historical DEKs, including keys referenced only by old snapshots or
+WAL entries. The sidecar must match the durable checkpoint and active writer
+registration; it remains unchanged throughout migration. Different ciphertext
+encodings are normalized only for authenticated logical comparison. Preparation
+and resume separately require exact preservation of the original physical rows,
+WAL and snapshot bytes. No nonce or epoch is allocated by the offline decoder.
 
 Create independently reviewed `pins.json` with `version`, `cluster_uuid`,
 `group_id`, `minimum` and `members`. Version is `1`; minimum entry, snapshot and
@@ -217,6 +234,13 @@ plaintext. Encrypted three-member follower permission (F), term-change and
 lost-result scenarios remain unvalidated end to end; lifetime unit coverage is
 not a substitute. This bounded result does not establish production operation.
 
+The separate encrypted-legacy migration E2E starts with actual encrypted MVCC
+history and retained Raft state, executes prepare/resume and activation, then
+checks protected business writes and restart. External rotation E2E exercises
+the authenticated RPC, exact retry after an unknown outcome, rejected requests
+and encrypted business restart. Both remain single-data-group evidence, not
+encrypted multi-member fault-injection or production-operation evidence.
+
 Validation uses the actual installed wrapper, active Raft key, nonce identity
 and cutover state, checked against durable sidecar/checkpoint/registration
 evidence. A sidecar naming a new key does not mean that key is already installed
@@ -234,8 +258,13 @@ leadership changes and cancellation leave an owned rotation outcome unresolved
 until independent reconciliation; do not delete state or issue an arbitrary
 admin retry to force completion. Fatal mismatches keep admission closed.
 
-Do not use this runtime path to migrate encrypted legacy snapshots/WAL or
-stores. Check the exact build/profile against the bounded evidence above before
+Use the explicit offline procedure, not runtime rotation, to migrate encrypted
+legacy snapshots/WAL or stores. External rotation captures request authority
+before queueing and is serialized with startup rotation. A cancelled or unknown
+external outcome is reconciled read-only; the supervisor never reproposes that
+command using a new process-owned handle. Retry only the exact request after
+checking the durable outcome; an applied index alone is not fresh authority.
+Check the exact build/profile against the bounded evidence above before
 operational enablement. Composed lint/review remains a separate gate; single-node
 rotation/restart and native follower-barrier tests do not substitute for the
 unvalidated encrypted multi-member scenarios.

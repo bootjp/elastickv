@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"path/filepath"
+	"slices"
 
 	"github.com/cockroachdb/errors"
 	"go.etcd.io/raft/v3/raftpb"
@@ -12,7 +13,8 @@ import (
 
 // OfflineBaselineReplayEntry includes every committed slot after the selected
 // snapshot. Normal Payload is the proposal-envelope-decoded FSM payload; the
-// consumer MUST reject unsupported/encrypted application formats, not guess.
+// consumer MUST reject unsupported application formats, not guess. The explicit
+// crypto source API authenticates/decrypts post-cutover payloads in memory only.
 type OfflineBaselineReplayEntry struct {
 	Index, Term uint64
 	Type        int32
@@ -27,19 +29,33 @@ type OfflineBaselineWALSource struct {
 	Snapshot                                                                               io.ReadCloser
 }
 
+type OfflineBaselineSourceOptions struct {
+	DataDir   string
+	Ownership io.Closer
+	Crypto    *OfflineBaselineCrypto
+	// Optional independent ordered store proof permits compacted configuration
+	// history. It is not a snapshot-data-index substitute.
+	StoreProof *BaselineStoreProof
+}
+
 // ReadOfflineBaselineWALSource provides the independent native cut needed by a
 // legacy TSO scalar reconstructor before Store evidence exists. It requires a
 // complete native configuration proof, and never creates/repairs/restores state.
 // Caller retains ownership through consumption and closes Snapshot.
 func ReadOfflineBaselineWALSource(ctx context.Context, dataDir string, ownership io.Closer) (OfflineBaselineWALSource, error) {
+	return ReadOfflineBaselineWALSourceWithOptions(ctx, OfflineBaselineSourceOptions{DataDir: dataDir, Ownership: ownership})
+}
+
+func ReadOfflineBaselineWALSourceWithOptions(ctx context.Context, options OfflineBaselineSourceOptions) (OfflineBaselineWALSource, error) {
 	var result OfflineBaselineWALSource
+	dataDir, ownership := options.DataDir, options.Ownership
 	if _, err := verifyBaselineOwnership(OfflineBaselineOptions{DataDir: dataDir, Ownership: ownership}); err != nil {
 		return result, err
 	}
 	if err := ctx.Err(); err != nil {
 		return result, errors.WithStack(err)
 	}
-	image, err := readBaselineWALPayloads(filepath.Join(dataDir, walDirName), true)
+	image, err := readOfflineBaselineWAL(ctx, filepath.Join(dataDir, walDirName), options.Crypto, true)
 	if err != nil {
 		return result, err
 	}
@@ -50,18 +66,28 @@ func ReadOfflineBaselineWALSource(ctx context.Context, dataDir string, ownership
 	if err != nil {
 		return result, err
 	}
-	return baselineWALReplaySource(dataDir, image, snapshot)
+	if err := validateOfflineBaselineSnapshot(ctx, dataDir, snapshot, options.Crypto); err != nil {
+		return result, err
+	}
+	proof, err := offlineBaselineSourceProof(options, image.hardState.GetCommit())
+	if err != nil {
+		return result, err
+	}
+	return baselineWALReplaySourceWithCrypto(dataDir, image, snapshot, proof, options.Crypto)
 }
 
-func baselineWALReplaySource(dataDir string, image *baselineWALImage, snapshot *raftpb.Snapshot) (OfflineBaselineWALSource, error) {
+func baselineWALReplaySourceWithCrypto(dataDir string, image *baselineWALImage, snapshot *raftpb.Snapshot, proof BaselineStoreProof, crypto *OfflineBaselineCrypto) (OfflineBaselineWALSource, error) {
 	var result OfflineBaselineWALSource
 	commit, index := image.hardState.GetCommit(), snapshot.GetMetadata().GetIndex()
 	if !baselineSourceCutComplete(image, index, commit) {
 		return result, errors.Wrap(ErrOfflineBaseline, "TSO source must have a complete committed cut without pending tail")
 	}
-	conf, n, err := baselineReplayedConfiguration(image, snapshot, BaselineStoreProof{})
+	conf, n, err := baselineReplayedConfiguration(image, snapshot, proof)
 	if err != nil {
 		return result, err
+	}
+	if len(proof.ConfigurationMembers) != 0 && !slices.Equal(proof.ConfigurationMembers, namespaceApplyMembers(*conf)) {
+		return result, errors.Wrap(ErrOfflineBaseline, "offline source ordered store membership differs from native configuration")
 	}
 	result = OfflineBaselineWALSource{HardState: image.hardState, SnapshotIndex: index, SnapshotTerm: snapshot.GetMetadata().GetTerm(), CommitIndex: commit,
 		LastLogIndex: image.lastIndex(), ConfigurationIndex: n, Configuration: conf}
@@ -72,7 +98,7 @@ func baselineWALReplaySource(dataDir string, image *baselineWALImage, snapshot *
 	if result.CommitTerm == 0 || result.CommitTerm > image.hardState.GetTerm() {
 		return result, errors.Wrap(ErrOfflineBaseline, "invalid source commit term")
 	}
-	result.Replay, err = baselineSourceReplayEntries(image, index, commit)
+	result.Replay, err = baselineSourceReplayEntriesWithCrypto(image, index, commit, crypto)
 	if err != nil {
 		return result, err
 	}
@@ -85,13 +111,17 @@ func baselineSourceCutComplete(image *baselineWALImage, index, commit uint64) bo
 }
 
 func baselineSourceReplayEntries(image *baselineWALImage, index, commit uint64) ([]OfflineBaselineReplayEntry, error) {
+	return baselineSourceReplayEntriesWithCrypto(image, index, commit, nil)
+}
+
+func baselineSourceReplayEntriesWithCrypto(image *baselineWALImage, index, commit uint64, crypto *OfflineBaselineCrypto) ([]OfflineBaselineReplayEntry, error) {
 	var replay []OfflineBaselineReplayEntry
 	for i := index + 1; i <= commit; i++ {
 		entry := image.entries[i]
 		if entry == nil {
 			return nil, errors.Wrap(ErrOfflineBaseline, "missing source replay entry")
 		}
-		payload, err := baselineReplayPayload(entry)
+		payload, err := offlineBaselineReplayPayload(entry, crypto)
 		if err != nil {
 			return nil, err
 		}

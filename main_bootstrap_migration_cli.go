@@ -18,7 +18,7 @@ func inspectBootstrapNativeInput(ctx context.Context, request bootstrapBaselineC
 		return errors.WithStack(err)
 	}
 	defer func() { err = errors.Join(err, ownership.Close()) }()
-	options, err := bootstrapOfflineOptions(request, expected, manifest, ownership)
+	options, err := bootstrapOfflineOptionsWithContext(ctx, request, expected, manifest, ownership)
 	if err != nil {
 		return err
 	}
@@ -37,31 +37,42 @@ func inspectBootstrapNativeInput(ctx context.Context, request bootstrapBaselineC
 }
 
 func bootstrapOfflineOptions(request bootstrapBaselineCLIRequest, expected raftbootstrap.BaselineContext, manifest raftbootstrap.BaselineManifest, ownership io.Closer) (etcd.OfflineBaselineOptions, error) {
+	return bootstrapOfflineOptionsWithContext(context.Background(), request, expected, manifest, ownership)
+}
+
+func bootstrapOfflineOptionsWithContext(ctx context.Context, request bootstrapBaselineCLIRequest, expected raftbootstrap.BaselineContext, manifest raftbootstrap.BaselineManifest, ownership io.Closer) (etcd.OfflineBaselineOptions, error) {
 	prepared, err := bootstrapLocalPreparation(request.MemberID, manifest)
 	if err != nil {
 		return etcd.OfflineBaselineOptions{}, err
 	}
-	data, err := bootstrapMigrationDataCallbacks(prepared)
+	enc, err := request.Encryption.load(ctx, request.MemberID, manifest.Identity.Group, request.RaftDataDir)
+	if err != nil {
+		return etcd.OfflineBaselineOptions{}, err
+	}
+	data, err := bootstrapMigrationDataCallbacks(prepared, bootstrapOfflineOptionalEncryption(enc)...)
 	if err != nil {
 		return etcd.OfflineBaselineOptions{}, err
 	}
 	options := etcd.OfflineBaselineOptions{DataDir: request.RaftDataDir, MemberID: request.MemberID,
 		Expected: expected, Ownership: ownership, Preparation: bootstrapOfflineFormatPreparation(data)}
+	if enc != nil {
+		options.Crypto = enc.NativeCrypto()
+	}
 	options.ProbeStore = func(ctx context.Context) (etcd.BaselineStoreProof, error) {
 		if manifest.Identity.Group == dedicatedTSORaftGroupID {
 			_, proof, err := probeOfflineTSOBaseline(ctx, request.RaftDataDir, ownership)
 			return proof, err
 		}
-		return bootstrapOfflineDataStoreProbe(ctx, request.RaftDataDir)
+		return bootstrapOfflineDataStoreProbe(ctx, request.RaftDataDir, bootstrapOfflineOptionalEncryption(enc)...)
 	}
 	return options, nil
 }
 
-func bootstrapMigrationDataCallbacks(prepared kv.PreparedBootstrapActivation) (*etcd.BaselinePreparationCallbacks, error) {
+func bootstrapMigrationDataCallbacks(prepared kv.PreparedBootstrapActivation, enc ...*bootstrapOfflineEncryption) (*etcd.BaselinePreparationCallbacks, error) {
 	if prepared.Probe.Identity.Group == dedicatedTSORaftGroupID {
 		return bootstrapOfflineTSOPreparation(prepared)
 	}
-	return bootstrapOfflineDataPreparation(prepared)
+	return bootstrapOfflineDataPreparation(prepared, enc...)
 }
 
 func bootstrapLocalPreparation(member uint64, manifest raftbootstrap.BaselineManifest) (kv.PreparedBootstrapActivation, error) {
@@ -87,7 +98,7 @@ func executeBootstrapMigration(ctx context.Context, request bootstrapBaselineCLI
 		return result, errors.WithStack(err)
 	}
 	defer func() { err = errors.Join(err, ownership.Close()) }()
-	options, err := bootstrapOfflineOptions(request, expected, manifest, ownership)
+	options, err := bootstrapOfflineOptionsWithContext(ctx, request, expected, manifest, ownership)
 	if err != nil {
 		return result, err
 	}

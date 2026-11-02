@@ -40,6 +40,13 @@ type BaselinePreparationCallbacks struct {
 func baselineTransformationDigest(o OfflineBaselineOptions) (raftbootstrap.Digest, error) {
 	h := sha256.New()
 	_, _ = h.Write([]byte("elastickv/offline-baseline/preparation-paths/v1\x00"))
+	if o.Crypto != nil {
+		if err := validateOfflineBaselineCrypto(o.Crypto); err != nil {
+			return raftbootstrap.Digest{}, err
+		}
+		_, _ = h.Write([]byte("explicit-offline-crypto/v1\x00"))
+		_, _ = h.Write(baselineAppendUint64(nil, o.Crypto.RaftEnvelopeCutoverIndex))
+	}
 	if o.Preparation == nil {
 		var digest raftbootstrap.Digest
 		copy(digest[:], h.Sum(nil))

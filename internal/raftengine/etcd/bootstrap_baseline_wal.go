@@ -36,6 +36,7 @@ type baselineWALImage struct {
 	entrySequence  hash.Hash
 	segmentPaths   []string
 	keepPayloads   bool
+	inspectEntry   func(*raftpb.Entry) error
 	recordSink     func(*walpb.Record) error
 	genesisAllowed bool
 	genesis        *raftpb.ConfState
@@ -64,12 +65,17 @@ func newBaselineWALImage() *baselineWALImage {
 }
 
 func readBaselineWALPayloads(dir string, keep bool) (*baselineWALImage, error) {
+	return readBaselineWALInspected(dir, keep, nil)
+}
+
+func readBaselineWALInspected(dir string, keep bool, inspect func(*raftpb.Entry) error) (*baselineWALImage, error) {
 	names, err := baselineWALNames(dir)
 	if err != nil {
 		return nil, err
 	}
 	image := newBaselineWALImage()
 	image.keepPayloads = keep
+	image.inspectEntry = inspect
 	image.genesisAllowed = names[0] == "0000000000000000-0000000000000000.wal"
 	var crc uint32
 	for _, name := range names {
@@ -267,6 +273,9 @@ func (w *baselineWALImage) consumeEntry(data []byte) error {
 	if entry.GetIndex() == 0 || entry.GetTerm() == 0 {
 		return errors.Wrap(ErrOfflineBaseline, "invalid retained entry")
 	}
+	if err := w.inspectBaselineEntry(entry); err != nil {
+		return err
+	}
 	digest := sha256.Sum256(entry.Data)
 	frame := baselineAppendUint64(nil, entry.GetIndex())
 	frame = baselineAppendUint64(frame, entry.GetTerm())
@@ -291,6 +300,13 @@ func (w *baselineWALImage) consumeEntry(data []byte) error {
 		entry.Data = nil
 	}
 	w.entries[entry.GetIndex()] = entry
+	return nil
+}
+
+func (w *baselineWALImage) inspectBaselineEntry(entry *raftpb.Entry) error {
+	if w.inspectEntry != nil {
+		return w.inspectEntry(entry)
+	}
 	return nil
 }
 

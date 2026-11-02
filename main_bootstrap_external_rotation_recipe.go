@@ -1,0 +1,83 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"strconv"
+
+	"github.com/bootjp/elastickv/internal/encryption"
+	"github.com/bootjp/elastickv/internal/raftengine"
+	pb "github.com/bootjp/elastickv/proto"
+)
+
+var errBootstrapExternalRotationRequest = errors.New("external rotation: invalid request")
+
+// The controller retains this immutable recipe across unknown outcomes and
+// supplies its existing owned context. Construction grants no proposal authority.
+func newBootstrapExternalRotationRecipe(ctx context.Context, cfg bootstrapRotationRecipeConfig, request *pb.RotateDEKRequest) (*bootstrapRotationRecipe, error) {
+	if err := cfg.validate(); err != nil {
+		return nil, err
+	}
+	if err := validateBootstrapExternalRotationRequest(cfg, request); err != nil {
+		return nil, err
+	}
+	req := cloneBootstrapRotationRequest(request)
+	if !cfg.IsLeader() {
+		return nil, fmt.Errorf("external rotation: only a leader may plan: %w", raftengine.ErrNotLeader)
+	}
+	r := &bootstrapRotationRecipe{config: cfg, requests: []*pb.RotateDEKRequest{req}}
+	sc, _, err := r.read(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateBootstrapExternalRotationKey(sc, req); err != nil {
+		return nil, err
+	}
+	r.baseline = sc.Active
+	if err := r.hash(); err != nil {
+		return nil, err
+	}
+	if err := cfg.Validate(ctx); err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+func validateBootstrapExternalRotationRequest(cfg bootstrapRotationRecipeConfig, request *pb.RotateDEKRequest) error {
+	if _, err := bootstrapRotationPayloadFromRequest(request); err != nil {
+		return errors.Join(errBootstrapExternalRotationRequest, err)
+	}
+	epoch := cfg.StorageEpoch
+	if request.Purpose == pb.RotateDEKRequest_PURPOSE_RAFT {
+		epoch = cfg.RaftEpoch
+	}
+	if request.ProposerNodeId != cfg.NodeID || request.ProposerLocalEpoch != uint32(epoch) {
+		return fmt.Errorf("%w: proposer identity or pinned purpose epoch mismatch", errBootstrapExternalRotationRequest)
+	}
+	dek, err := cfg.Wrapper.Unwrap(bytes.Clone(request.WrappedNewDek))
+	if err != nil {
+		return errors.Join(errBootstrapExternalRotationRequest, fmt.Errorf("external rotation: unwrap requested key: %w", err))
+	}
+	defer zeroBytes(dek)
+	if len(dek) != encryption.KeySize {
+		return fmt.Errorf("%w: invalid unwrapped key size", errBootstrapExternalRotationRequest)
+	}
+	return nil
+}
+
+func validateBootstrapExternalRotationKey(sc *encryption.Sidecar, req *pb.RotateDEKRequest) error {
+	purpose, active := encryption.SidecarPurposeStorage, sc.Active.Storage
+	if req.Purpose == pb.RotateDEKRequest_PURPOSE_RAFT {
+		purpose, active = encryption.SidecarPurposeRaft, sc.Active.Raft
+	}
+	if active == 0 {
+		return fmt.Errorf("%w: requested purpose is inactive", errBootstrapExternalRotationRequest)
+	}
+	k, occupied := sc.Keys[strconv.FormatUint(uint64(req.NewDekId), 10)]
+	if occupied && (k.Purpose != purpose || uint32(k.LocalEpoch) != req.ProposerLocalEpoch || !bytes.Equal(k.Wrapped, req.WrappedNewDek)) {
+		return fmt.Errorf("%w: key ID collision", errBootstrapExternalRotationRequest)
+	}
+	return nil
+}

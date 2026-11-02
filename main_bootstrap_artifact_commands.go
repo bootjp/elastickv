@@ -104,6 +104,9 @@ func parseBootstrapArtifactFlags(args []string, request *bootstrapArtifactComman
 	}
 	fs := flag.NewFlagSet("bootstrap "+request.Command, flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
+	if request.Command == bootstrapArtifactAttest {
+		request.Encryption.flags(fs)
+	}
 	values := map[string]*string{"expected-config": &request.ExpectedConfigPath, "manifest": &request.ManifestPath, "operation-id": &operation}
 	if request.Command == bootstrapArtifactAttest {
 		values["raft-data-dir"], values["member-id"], values["peer-config"] = &request.RaftDataDir, &member, &request.PeerConfig
@@ -134,7 +137,14 @@ func parseBootstrapArtifactFlags(args []string, request *bootstrapArtifactComman
 }
 
 func validateBootstrapArtifactPaths(request bootstrapArtifactCommand) error {
+	if request.Command != bootstrapArtifactAttest && request.Encryption != (bootstrapOfflineEncryptionCLI{}) {
+		return errors.New("artifact-only certify does not accept encryption options")
+	}
+	if err := request.Encryption.validate(); err != nil {
+		return err
+	}
 	paths := []string{request.ExpectedConfigPath, request.ManifestPath}
+	paths = append(paths, request.Encryption.paths()...)
 	if request.Command == bootstrapArtifactAttest {
 		paths = append(paths, request.RaftDataDir, request.PeerConfig)
 	} else {
@@ -221,7 +231,7 @@ func attestBootstrapArtifact(ctx context.Context, request bootstrapBaselineCLIRe
 			ack = nil
 		}
 	}()
-	options, err := bootstrapOfflineOptions(request, expected, manifest, ownership)
+	options, err := bootstrapOfflineOptionsWithContext(ctx, request, expected, manifest, ownership)
 	if err != nil {
 		return nil, err
 	}
