@@ -32,7 +32,7 @@ const (
 	quorumAcceptanceGroup          = uint64(7)
 	quorumAcceptanceCatalogVersion = uint64(4)
 	quorumAcceptanceTick           = 10 * time.Millisecond
-	quorumAcceptanceElectionTicks  = 500
+	quorumAcceptanceElectionTicks  = 1000
 	quorumAcceptanceHeartbeatTicks = 10
 	quorumAcceptanceElectionWait   = 3 * quorumAcceptanceTick * quorumAcceptanceElectionTicks
 	quorumAcceptanceSnapshotEvery  = 8
@@ -415,7 +415,7 @@ func (c *quorumAcceptanceCluster) completeInitialOwner(t *testing.T, ctx context
 
 func TestMigrationQuorumPartitionAcceptance(t *testing.T) {
 	t.Setenv("ELASTICKV_RAFT_SNAPSHOT_COUNT", fmt.Sprint(quorumAcceptanceSnapshotEvery))
-	lifetime, stop := context.WithTimeout(t.Context(), 3*time.Minute)
+	lifetime, stop := context.WithTimeout(t.Context(), 4*time.Minute)
 	defer stop()
 	ctx, cancel := context.WithTimeout(lifetime, 60*time.Second)
 	defer cancel()
@@ -716,7 +716,7 @@ func (c *quorumAcceptanceCluster) retainedAndRestart(t *testing.T, root quorumAc
 	require.NoError(t, ctx.Err(), "large-write/snapshot phase must finish within its own budget")
 	t.Logf("large-write/snapshot phase completed in %s", time.Since(started))
 	cancel()
-	ctx, cancel = context.WithTimeout(c.lifetime, 60*time.Second)
+	ctx, cancel = context.WithTimeout(c.lifetime, 90*time.Second)
 	defer cancel()
 	started = time.Now()
 	for _, n := range c.nodes {

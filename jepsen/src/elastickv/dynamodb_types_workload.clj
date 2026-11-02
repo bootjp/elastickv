@@ -192,6 +192,7 @@
 
 (def ^:private setup-retryable-error-types
   #{"InternalServerError"
+    "OperationOutcomeUnknown"
     "ServiceUnavailableException"
     "ThrottlingException"
     "ProvisionedThroughputExceededException"})
@@ -207,6 +208,7 @@
         (str/includes? msg "no raft leader currently available"))))
 
 (defn- with-setup-retry!
+  "Only for fixed-identity CreateTable and idempotent DeleteItem setup calls."
   [f]
   (loop [delays setup-retry-delays-ms]
     (let [[ok result] (try
