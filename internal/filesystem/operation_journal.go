@@ -394,9 +394,10 @@ func (j *OperationJournal) Admit(ctx context.Context, id OperationID, intent []b
 	if err := validateOperationRecord(record); err != nil {
 		return operationRecord{}, err
 	}
-	return j.retryRecordCAS(ctx, ErrContentionLimit, func(observed uint64) (operationRecord, error) {
+	admitted, err := j.retryRecordCAS(ctx, ErrContentionLimit, func(observed uint64) (operationRecord, error) {
 		return j.admitOnce(ctx, record, observed)
 	})
+	return admitted, errors.Wrap(err, "admit operation journal")
 }
 
 // A single-group CAS can be retried at a fresh snapshot because both attempts

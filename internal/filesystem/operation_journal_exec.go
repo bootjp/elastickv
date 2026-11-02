@@ -18,9 +18,10 @@ import (
 // BeginAttempt records a fresh transaction generation before any effect is
 // dispatched. A duplicate caller receives the same active attempt identity.
 func (j *OperationJournal) BeginAttempt(ctx context.Context, id OperationID) (operationRecord, error) {
-	return j.retryRecordCAS(ctx, ErrContentionLimit, func(observed uint64) (operationRecord, error) {
+	record, err := j.retryRecordCAS(ctx, ErrContentionLimit, func(observed uint64) (operationRecord, error) {
 		return j.beginAttemptOnce(ctx, id, observed)
 	})
+	return record, errors.Wrap(err, "begin operation attempt")
 }
 
 func (j *OperationJournal) beginAttemptOnce(ctx context.Context, id OperationID, observed uint64) (operationRecord, error) {
@@ -51,9 +52,10 @@ func (j *OperationJournal) AdvanceGeneration(ctx context.Context, id OperationID
 	if old == [16]byte{} {
 		return operationRecord{}, errors.WithStack(ErrInvalid)
 	}
-	return j.retryRecordCAS(ctx, kv.ErrTransactionOutcomeUnknown, func(observed uint64) (operationRecord, error) {
+	record, err := j.retryRecordCAS(ctx, kv.ErrTransactionOutcomeUnknown, func(observed uint64) (operationRecord, error) {
 		return j.advanceGenerationOnce(ctx, id, old, observed)
 	})
+	return record, errors.Wrap(err, "advance operation generation")
 }
 
 func (j *OperationJournal) advanceGenerationOnce(ctx context.Context, id OperationID, old [16]byte, observed uint64) (operationRecord, error) {
