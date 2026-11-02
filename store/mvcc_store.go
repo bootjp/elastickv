@@ -32,6 +32,7 @@ const (
 	mvccSnapshotVersionV5 = uint32(5)
 	mvccSnapshotVersionV6 = uint32(6)
 	mvccSnapshotVersionV7 = uint32(7)
+	mvccSnapshotVersionV8 = uint32(8)
 	maxSnapshotKeySize    = 1 << 20 // 1 MiB per logical key
 	// maxSnapshotInternalKeyEnvelope reserves snapshot headroom for internal
 	// stored-key envelopes such as migration staging. Logical source keys keep
@@ -82,6 +83,13 @@ func byteSliceComparator(a, b any) int {
 // mvccStore is an in-memory MVCC implementation backed by a treemap for
 // deterministic iteration order and range scans.
 type mvccStore struct {
+	applyMu             sync.Mutex
+	raftControl         map[string][]byte
+	controlAppliedIndex uint64
+	entryOverlay        map[string]memoryEntryValue
+	controlOverlay      map[string]memoryControlValue
+	readinessOverlay    map[uint64]TargetStagedReadinessState
+	floorOverlay        map[uint64]uint64
 	tree                *treemap.Map // key []byte -> []VersionedValue
 	mtx                 sync.RWMutex
 	log                 *slog.Logger
@@ -120,7 +128,9 @@ func (s *mvccStore) MinRetainedTS() uint64 {
 }
 
 func (s *mvccStore) SetMinRetainedTS(ts uint64) {
+	s.applyMu.Lock()
 	s.mtx.Lock()
+	defer s.applyMu.Unlock()
 	defer s.mtx.Unlock()
 	if ts > s.minRetainedTS {
 		s.minRetainedTS = ts
@@ -139,8 +149,13 @@ func WithLogger(l *slog.Logger) MVCCStoreOption {
 
 // NewMVCCStore creates a new MVCC-enabled in-memory store.
 func NewMVCCStore(opts ...MVCCStoreOption) MVCCStore {
+	return newMVCCStore(opts...)
+}
+
+func newMVCCStore(opts ...MVCCStoreOption) *mvccStore {
 	s := &mvccStore{
-		tree: treemap.NewWith(byteSliceComparator),
+		raftControl: make(map[string][]byte),
+		tree:        treemap.NewWith(byteSliceComparator),
 		log: slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 			Level: slog.LevelWarn,
 		})),
@@ -193,10 +208,13 @@ func visibleValue(versions []VersionedValue, ts uint64) ([]byte, bool) {
 }
 
 func (s *mvccStore) putVersionLocked(key, value []byte, commitTS, expireAt uint64) {
-	existing, _ := s.tree.Get(key)
+	existing, _ := s.entryTreeGet(key)
 	var versions []VersionedValue
 	if existing != nil {
 		versions, _ = existing.([]VersionedValue)
+	}
+	if s.entryOverlay != nil {
+		versions = append([]VersionedValue(nil), versions...)
 	}
 	versions = insertVersionSorted(versions, VersionedValue{
 		TS:        commitTS,
@@ -204,14 +222,17 @@ func (s *mvccStore) putVersionLocked(key, value []byte, commitTS, expireAt uint6
 		Tombstone: false,
 		ExpireAt:  expireAt,
 	})
-	s.tree.Put(bytes.Clone(key), versions)
+	s.entryTreePut(bytes.Clone(key), versions)
 }
 
 func (s *mvccStore) deleteVersionLocked(key []byte, commitTS uint64) {
-	existing, _ := s.tree.Get(key)
+	existing, _ := s.entryTreeGet(key)
 	var versions []VersionedValue
 	if existing != nil {
 		versions, _ = existing.([]VersionedValue)
+	}
+	if s.entryOverlay != nil {
+		versions = append([]VersionedValue(nil), versions...)
 	}
 	versions = insertVersionSorted(versions, VersionedValue{
 		TS:        commitTS,
@@ -219,7 +240,7 @@ func (s *mvccStore) deleteVersionLocked(key []byte, commitTS uint64) {
 		Tombstone: true,
 		ExpireAt:  0,
 	})
-	s.tree.Put(bytes.Clone(key), versions)
+	s.entryTreePut(bytes.Clone(key), versions)
 }
 
 func insertVersionSorted(versions []VersionedValue, vv VersionedValue) []VersionedValue {
@@ -240,10 +261,15 @@ func insertVersionSorted(versions []VersionedValue, vv VersionedValue) []Version
 }
 
 func (s *mvccStore) PutAt(ctx context.Context, key []byte, value []byte, commitTS uint64, expireAt uint64) error {
+	if err := validateControlVersionKey(key, commitTS); err != nil {
+		return err
+	}
 	if err := validateValueSize(value); err != nil {
 		return err
 	}
+	s.applyMu.Lock()
 	s.mtx.Lock()
+	defer s.applyMu.Unlock()
 	defer s.mtx.Unlock()
 
 	commitTS = s.alignCommitTS(commitTS)
@@ -257,7 +283,12 @@ func (s *mvccStore) PutAt(ctx context.Context, key []byte, value []byte, commitT
 }
 
 func (s *mvccStore) DeleteAt(ctx context.Context, key []byte, commitTS uint64) error {
+	if err := validateControlVersionKey(key, commitTS); err != nil {
+		return err
+	}
+	s.applyMu.Lock()
 	s.mtx.Lock()
+	defer s.applyMu.Unlock()
 	defer s.mtx.Unlock()
 
 	commitTS = s.alignCommitTS(commitTS)
@@ -283,7 +314,7 @@ func (s *mvccStore) alignCommitTS(commitTS uint64) uint64 {
 }
 
 func (s *mvccStore) latestVersionLocked(key []byte) (VersionedValue, bool) {
-	v, ok := s.tree.Get(key)
+	v, ok := s.entryTreeGet(key)
 	if !ok {
 		return VersionedValue{}, false
 	}
@@ -301,13 +332,16 @@ func readTSCompacted(ts, minRetainedTS uint64) bool {
 // ---- MVCCStore methods ----
 
 func (s *mvccStore) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte, error) {
+	if staged := s.memoryEntryStore(ctx); staged != nil {
+		return staged.GetAt(ctx, key, ts)
+	}
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
 	if readTSCompacted(ts, s.minRetainedTS) {
 		return nil, ErrReadTSCompacted
 	}
 
-	v, ok := s.tree.Get(key)
+	v, ok := s.entryTreeGet(key)
 	if !ok {
 		return nil, ErrKeyNotFound
 	}
@@ -319,14 +353,17 @@ func (s *mvccStore) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte, e
 	return bytes.Clone(ver.Value), nil
 }
 
-func (s *mvccStore) ExistsAt(_ context.Context, key []byte, ts uint64) (bool, error) {
+func (s *mvccStore) ExistsAt(ctx context.Context, key []byte, ts uint64) (bool, error) {
+	if staged := s.memoryEntryStore(ctx); staged != nil {
+		return staged.ExistsAt(ctx, key, ts)
+	}
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
 	if readTSCompacted(ts, s.minRetainedTS) {
 		return false, ErrReadTSCompacted
 	}
 
-	v, ok := s.tree.Get(key)
+	v, ok := s.entryTreeGet(key)
 	if !ok {
 		return false, nil
 	}
@@ -341,14 +378,17 @@ func (s *mvccStore) ExistsAt(_ context.Context, key []byte, ts uint64) (bool, er
 	return true, nil
 }
 
-func (s *mvccStore) VersionExistsAtOrBefore(_ context.Context, key []byte, ts uint64) (bool, error) {
+func (s *mvccStore) VersionExistsAtOrBefore(ctx context.Context, key []byte, ts uint64) (bool, error) {
+	if staged := s.memoryEntryStore(ctx); staged != nil {
+		return staged.VersionExistsAtOrBefore(ctx, key, ts)
+	}
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
 	if readTSCompacted(ts, s.minRetainedTS) {
 		return false, ErrReadTSCompacted
 	}
 
-	v, ok := s.tree.Get(key)
+	v, ok := s.entryTreeGet(key)
 	if !ok {
 		return false, nil
 	}
@@ -426,6 +466,9 @@ func (s *mvccStore) collectScanKeys(ctx context.Context, it *treemap.Iterator, e
 }
 
 func (s *mvccStore) ScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*KVPair, error) {
+	if staged := s.memoryEntryStore(ctx); staged != nil {
+		return staged.ScanAt(ctx, start, end, limit, ts)
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -443,14 +486,17 @@ func (s *mvccStore) ScanAt(ctx context.Context, start []byte, end []byte, limit 
 	}
 
 	capHint := computeScanCapHint(s.tree.Size(), limit)
-	it := s.tree.Iterator()
-	if !seekForwardIteratorStart(s.tree, &it, start) {
+	it := s.entryTreeIterator()
+	if !seekForwardIteratorStart(&it, start) {
 		return make([]*KVPair, 0, capHint), nil
 	}
 	return s.collectScanResults(ctx, &it, end, limit, capHint, ts)
 }
 
 func (s *mvccStore) ScanAtPhysicalLimit(ctx context.Context, start []byte, end []byte, visibleLimit, physicalLimit int, ts uint64) ([]*KVPair, bool, error) {
+	if staged := s.memoryEntryStore(ctx); staged != nil {
+		return staged.ScanAtPhysicalLimit(ctx, start, end, visibleLimit, physicalLimit, ts)
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, false, errors.WithStack(err)
 	}
@@ -467,14 +513,17 @@ func (s *mvccStore) ScanAtPhysicalLimit(ctx context.Context, start []byte, end [
 	}
 
 	capHint := computeScanCapHint(s.tree.Size(), visibleLimit)
-	it := s.tree.Iterator()
-	if !seekForwardIteratorStart(s.tree, &it, start) {
+	it := s.entryTreeIterator()
+	if !seekForwardIteratorStart(&it, start) {
 		return make([]*KVPair, 0, capHint), false, nil
 	}
 	return collectScanResultsWithPhysicalLimit(ctx, &it, end, visibleLimit, physicalLimit, capHint, ts)
 }
 
 func (s *mvccStore) ScanKeysAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([][]byte, error) {
+	if staged := s.memoryEntryStore(ctx); staged != nil {
+		return staged.ScanKeysAt(ctx, start, end, limit, ts)
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -492,8 +541,8 @@ func (s *mvccStore) ScanKeysAt(ctx context.Context, start []byte, end []byte, li
 	}
 
 	capHint := computeScanCapHint(s.tree.Size(), limit)
-	it := s.tree.Iterator()
-	if !seekForwardIteratorStart(s.tree, &it, start) {
+	it := s.entryTreeIterator()
+	if !seekForwardIteratorStart(&it, start) {
 		return make([][]byte, 0, capHint), nil
 	}
 	return s.collectScanKeys(ctx, &it, end, limit, capHint, ts)
@@ -501,26 +550,21 @@ func (s *mvccStore) ScanKeysAt(ctx context.Context, start []byte, end []byte, li
 
 // seekForwardIteratorStart positions the iterator at the first key >= start.
 // Returns true if such a position was found, false if no elements satisfy the bound.
-func seekForwardIteratorStart(tree *treemap.Map, it *treemap.Iterator, start []byte) bool {
+func seekForwardIteratorStart(it *treemap.Iterator, start []byte) bool {
 	if start == nil {
 		return it.First()
-	}
-	ceilKey, _ := tree.Ceiling(start)
-	if ceilKey == nil {
-		return false
-	}
-	target, ok := ceilKey.([]byte)
-	if !ok {
-		return false
 	}
 	it.Begin()
 	return it.NextTo(func(key any, value any) bool {
 		k, keyOK := key.([]byte)
-		return keyOK && bytes.Equal(k, target)
+		return keyOK && bytes.Compare(k, start) >= 0
 	})
 }
 
-func (s *mvccStore) ReverseScanAt(_ context.Context, start []byte, end []byte, limit int, ts uint64) ([]*KVPair, error) {
+func (s *mvccStore) ReverseScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*KVPair, error) {
+	if staged := s.memoryEntryStore(ctx); staged != nil {
+		return staged.ReverseScanAt(ctx, start, end, limit, ts)
+	}
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
 	if readTSCompacted(ts, s.minRetainedTS) {
@@ -540,8 +584,8 @@ func (s *mvccStore) ReverseScanAt(_ context.Context, start []byte, end []byte, l
 	}
 
 	result := make([]*KVPair, 0, capHint)
-	it := s.tree.Iterator()
-	if !seekReverseIteratorStart(s.tree, &it, end) {
+	it := s.entryTreeIterator()
+	if !seekReverseIteratorStart(&it, end) {
 		return result, nil
 	}
 	collectReverseVisibleKVs(&it, start, limit, ts, &result)
@@ -550,6 +594,9 @@ func (s *mvccStore) ReverseScanAt(_ context.Context, start []byte, end []byte, l
 }
 
 func (s *mvccStore) ReverseScanAtPhysicalLimit(ctx context.Context, start []byte, end []byte, visibleLimit, physicalLimit int, ts uint64) ([]*KVPair, bool, error) {
+	if staged := s.memoryEntryStore(ctx); staged != nil {
+		return staged.ReverseScanAtPhysicalLimit(ctx, start, end, visibleLimit, physicalLimit, ts)
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, false, errors.WithStack(err)
 	}
@@ -573,33 +620,19 @@ func (s *mvccStore) ReverseScanAtPhysicalLimit(ctx context.Context, start []byte
 		capHint = 0
 	}
 	result := make([]*KVPair, 0, capHint)
-	it := s.tree.Iterator()
-	if !seekReverseIteratorStart(s.tree, &it, end) {
+	it := s.entryTreeIterator()
+	if !seekReverseIteratorStart(&it, end) {
 		return result, false, nil
 	}
 	limitReached, err := collectReverseVisibleKVsWithPhysicalLimit(ctx, &it, start, visibleLimit, physicalLimit, ts, &result)
 	return result, limitReached, err
 }
 
-func seekReverseIteratorStart(tree *treemap.Map, it *treemap.Iterator, end []byte) bool {
+func seekReverseIteratorStart(it *treemap.Iterator, end []byte) bool {
 	if end == nil {
 		return it.Last()
 	}
-	floorKey, _ := tree.Floor(end)
-	if floorKey == nil {
-		return false
-	}
-	target, ok := floorKey.([]byte)
-	if !ok {
-		return false
-	}
 	it.End()
-	if bytes.Compare(target, end) < 0 {
-		return it.PrevTo(func(key any, value any) bool {
-			k, keyOK := key.([]byte)
-			return keyOK && bytes.Equal(k, target)
-		})
-	}
 	return it.PrevTo(func(key any, value any) bool {
 		k, keyOK := key.([]byte)
 		return keyOK && bytes.Compare(k, end) < 0
@@ -658,7 +691,10 @@ func appendVisibleReverseKV(it *treemap.Iterator, key []byte, ts uint64, result 
 	})
 }
 
-func (s *mvccStore) LatestCommitTS(_ context.Context, key []byte) (uint64, bool, error) {
+func (s *mvccStore) LatestCommitTS(ctx context.Context, key []byte) (uint64, bool, error) {
+	if staged := s.memoryEntryStore(ctx); staged != nil {
+		return staged.LatestCommitTS(ctx, key)
+	}
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
 
@@ -682,10 +718,13 @@ func (s *mvccStore) LatestCommitTS(_ context.Context, key []byte) (uint64, bool,
 // diverging local minRetainedTS — some surface ErrReadTSCompacted, others
 // see the version. Returning the raw existence answer is deterministic for
 // single-version-per-key write sets (the option-2 use case).
-func (s *mvccStore) CommittedVersionAt(_ context.Context, key []byte, commitTS uint64) (bool, error) {
+func (s *mvccStore) CommittedVersionAt(ctx context.Context, key []byte, commitTS uint64) (bool, error) {
+	if staged := s.memoryEntryStore(ctx); staged != nil {
+		return staged.CommittedVersionAt(ctx, key, commitTS)
+	}
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
-	v, ok := s.tree.Get(key)
+	v, ok := s.entryTreeGet(key)
 	if !ok {
 		return false, nil
 	}
@@ -707,19 +746,24 @@ func (s *mvccStore) ApplyMutationsRaft(ctx context.Context, mutations []*KVPairM
 // backend would always read as missing and the skip optimisation
 // would fall back to full restore. Acceptable: the in-memory store
 // is only used in unit tests and the catalog bootstrap path.
-func (s *mvccStore) ApplyMutationsRaftAt(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS, _ uint64) error {
+func (s *mvccStore) ApplyMutationsRaftAt(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS, index uint64) error {
+	if err := s.memoryEntryIndex(ctx, index); err != nil {
+		return err
+	}
+	if sc := s.memoryEntryScope(ctx); sc != nil {
+		return sc.result(sc.staged.applyMutations(ctx, mutations, readKeys, startTS, commitTS, false))
+	}
 	return s.ApplyMutations(ctx, mutations, readKeys, startTS, commitTS)
 }
 
-func (s *mvccStore) ApplyMutationsRaftAtFenced(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS, _ uint64) error {
+func (s *mvccStore) ApplyMutationsRaftAtFenced(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS, index uint64) error {
+	if err := s.memoryEntryIndex(ctx, index); err != nil {
+		return err
+	}
+	if sc := s.memoryEntryScope(ctx); sc != nil {
+		return sc.result(sc.staged.applyMutations(ctx, mutations, readKeys, startTS, commitTS, true))
+	}
 	return s.applyMutations(ctx, mutations, readKeys, startTS, commitTS, true)
-}
-
-// ApplyRaftEntry satisfies RaftEntryApplier. The in-memory store has no
-// durable state that a crash could tear, so the callback simply runs and
-// each request applies as it does on the per-request path.
-func (s *mvccStore) ApplyRaftEntry(ctx context.Context, _ uint64, fn func(ctx context.Context) error) error {
-	return fn(ctx)
 }
 
 func (s *mvccStore) ApplyMutations(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS uint64) error {
@@ -727,13 +771,18 @@ func (s *mvccStore) ApplyMutations(ctx context.Context, mutations []*KVPairMutat
 }
 
 func (s *mvccStore) applyMutations(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS uint64, fenced bool) error {
+	if err := validateMemoryMutations(ctx, mutations, commitTS); err != nil {
+		return err
+	}
+	s.applyMu.Lock()
 	s.mtx.Lock()
+	defer s.applyMu.Unlock()
 	defer s.mtx.Unlock()
 	if err := checkCommitTSFence(mutations, commitTS, s.lastCommitTS, fenced); err != nil {
 		return err
 	}
 
-	if s.lastCommitTS > startTS || hasAbsenceGuards(mutations) {
+	if s.lastCommitTS > startTS || hasAbsenceGuards(mutations) || hasNonAdvertisedMVCCDependencies(mutations, readKeys) {
 		if err := s.checkConflictsLocked(mutations, readKeys, startTS); err != nil {
 			return err
 		}
@@ -744,14 +793,9 @@ func (s *mvccStore) applyMutations(ctx context.Context, mutations []*KVPairMutat
 	for _, mut := range mutations {
 		switch mut.Op {
 		case OpTypePut:
-			if err := validateValueSize(mut.Value); err != nil {
-				return err
-			}
 			s.putVersionLocked(mut.Key, mut.Value, commitTS, mut.ExpireAt)
 		case OpTypeDelete:
 			s.deleteVersionLocked(mut.Key, commitTS)
-		default:
-			return errors.WithStack(ErrUnknownOp)
 		}
 		s.log.InfoContext(ctx, "apply mutation",
 			slog.String("key", string(mut.Key)),
@@ -769,7 +813,12 @@ func (s *mvccStore) applyMutations(ctx context.Context, mutations []*KVPairMutat
 // advertise that this replica has applied ordinary Raft entries up to that
 // timestamp.
 func (s *mvccStore) ApplyMutationsPreservingLastCommitTS(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS uint64) error {
+	if err := validateMemoryMutations(ctx, mutations, commitTS); err != nil {
+		return err
+	}
+	s.applyMu.Lock()
 	s.mtx.Lock()
+	defer s.applyMu.Unlock()
 	defer s.mtx.Unlock()
 
 	if err := s.checkConflictsLocked(mutations, readKeys, startTS); err != nil {
@@ -837,15 +886,21 @@ func (s *mvccStore) DeletePrefixAtRaft(ctx context.Context, prefix []byte, exclu
 
 // DeletePrefixAtRaftAt satisfies the MVCCStore interface — see
 // ApplyMutationsRaftAt for the appliedIndex disposition rationale.
-func (s *mvccStore) DeletePrefixAtRaftAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS, _ uint64) error {
-	return s.DeletePrefixesAtRaftAt(ctx, []PrefixDelete{{Prefix: prefix, ExcludePrefix: excludePrefix}}, commitTS, 0)
+func (s *mvccStore) DeletePrefixAtRaftAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS, index uint64) error {
+	return s.DeletePrefixesAtRaftAt(ctx, []PrefixDelete{{Prefix: prefix, ExcludePrefix: excludePrefix}}, commitTS, index)
 }
 
-func (s *mvccStore) DeletePrefixesAtRaftAt(_ context.Context, deletes []PrefixDelete, commitTS, _ uint64) error {
+func (s *mvccStore) DeletePrefixesAtRaftAt(ctx context.Context, deletes []PrefixDelete, commitTS, index uint64) error {
+	if err := s.memoryEntryIndex(ctx, index); err != nil {
+		return err
+	}
+	if sc := s.memoryEntryScope(ctx); sc != nil {
+		return sc.result(sc.staged.DeletePrefixesAtRaftAt(ctx, deletes, commitTS, index))
+	}
 	return s.deletePrefixesAt(deletes, commitTS)
 }
 
-func (s *mvccStore) DeletePrefixAt(_ context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error {
+func (s *mvccStore) DeletePrefixAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error {
 	return s.deletePrefixesAt([]PrefixDelete{{Prefix: prefix, ExcludePrefix: excludePrefix}}, commitTS)
 }
 
@@ -854,7 +909,9 @@ func (s *mvccStore) deletePrefixesAt(deletes []PrefixDelete, commitTS uint64) er
 		return nil
 	}
 
+	s.applyMu.Lock()
 	s.mtx.Lock()
+	defer s.applyMu.Unlock()
 	defer s.mtx.Unlock()
 
 	commitTS = s.alignCommitTS(commitTS)
@@ -880,10 +937,15 @@ func (s *mvccStore) PutWithTTLAt(ctx context.Context, key []byte, value []byte, 
 }
 
 func (s *mvccStore) ExpireAt(ctx context.Context, key []byte, expireAt uint64, commitTS uint64) error {
+	if err := validateControlVersionKey(key, commitTS); err != nil {
+		return err
+	}
+	s.applyMu.Lock()
 	s.mtx.Lock()
+	defer s.applyMu.Unlock()
 	defer s.mtx.Unlock()
 
-	v, ok := s.tree.Get(key)
+	v, ok := s.entryTreeGet(key)
 	if !ok {
 		return ErrKeyNotFound
 	}
@@ -965,6 +1027,9 @@ func (s *mvccStore) writeSnapshotFile(f *os.File) error {
 	if partitionHasEvidence(s.migrationPartitions) {
 		version = mvccSnapshotVersionV7
 	}
+	if len(s.raftControl) != 0 || s.controlAppliedIndex != 0 {
+		version = mvccSnapshotVersionV8
+	}
 	checksumOffset, err := writeMVCCSnapshotHeader(f, version)
 	if err != nil {
 		return err
@@ -1042,16 +1107,10 @@ func (s *mvccStore) writeSnapshotBodyLocked(f *os.File, version uint32) (uint32,
 	); err != nil {
 		return 0, err
 	}
-	if version >= mvccSnapshotVersionV7 {
-		data, err := encodeMigrationOwnershipPartitions(s.migrationPartitions)
-		if err != nil {
-			return 0, err
-		}
-		if err := writeMVCCSnapshotBytes(w, data); err != nil {
-			return 0, err
-		}
+	if err := s.writeSnapshotControlTail(w, version); err != nil {
+		return 0, err
 	}
-	iter := s.tree.Iterator()
+	iter := s.entryTreeIterator()
 	for iter.Next() {
 		key, ok := iter.Key().([]byte)
 		if !ok {
@@ -1211,10 +1270,10 @@ func writeMVCCSnapshotVersion(w io.Writer, version VersionedValue) error {
 }
 
 func (s *mvccStore) collectDeletePrefixKeysLocked(del PrefixDelete, commitTS uint64, seen map[string]struct{}, toDelete [][]byte) [][]byte {
-	it := s.tree.Iterator()
+	it := s.entryTreeIterator()
 	var started bool
 	if len(del.Prefix) > 0 {
-		started = seekForwardIteratorStart(s.tree, &it, del.Prefix)
+		started = seekForwardIteratorStart(&it, del.Prefix)
 	} else {
 		started = it.First()
 	}
@@ -1263,7 +1322,9 @@ func (s *mvccStore) restoreStreamingSnapshot(r io.Reader, validate func(*treemap
 	if actual != expected {
 		return errors.WithStack(ErrInvalidChecksum)
 	}
+	s.applyMu.Lock()
 	s.mtx.Lock()
+	defer s.applyMu.Unlock()
 	defer s.mtx.Unlock()
 	if validate != nil {
 		if err := validate(tree, meta); err != nil {
@@ -1283,6 +1344,7 @@ func (s *mvccStore) restoreStreamingSnapshot(r io.Reader, validate func(*treemap
 	s.migrationPartitions = meta.partitions
 	s.migrationAdmission = buildMigrationServingAdmission(meta.ownership, meta.partitions)
 	s.migrationReadinessCache = cloneTargetStagedReadinessStates(meta.readiness)
+	s.raftControl, s.controlAppliedIndex = meta.raftControl, meta.controlAppliedIndex
 	return nil
 }
 
@@ -1299,7 +1361,7 @@ func readMVCCSnapshotHeader(r io.Reader) (uint32, uint32, error) {
 	if err := binary.Read(r, binary.LittleEndian, &version); err != nil {
 		return 0, 0, errors.WithStack(err)
 	}
-	if version < mvccSnapshotVersionV1 || version > mvccSnapshotVersionV7 {
+	if version < mvccSnapshotVersionV1 || version > mvccSnapshotVersionV8 {
 		return 0, 0, errors.WithStack(errors.Newf("unsupported mvcc snapshot version %d", version))
 	}
 
@@ -1368,14 +1430,20 @@ func readMVCCSnapshotMetadata(
 	if err != nil {
 		return 0, 0, mvccSnapshotMigrationMetadata{}, err
 	}
+	control, controlIndex, err := readRaftControlSnapshot(r, version)
+	if err != nil {
+		return 0, 0, mvccSnapshotMigrationMetadata{}, err
+	}
 	return lastCommitTS, minRetainedTS, mvccSnapshotMigrationMetadata{
-		acks:       migrationAcks,
-		floors:     migrationHLCFloors,
-		promotions: migrationPromotions,
-		readiness:  migrationReadiness,
-		retired:    retired,
-		ownership:  ownership,
-		partitions: partitions,
+		raftControl:         control,
+		controlAppliedIndex: controlIndex,
+		acks:                migrationAcks,
+		floors:              migrationHLCFloors,
+		promotions:          migrationPromotions,
+		readiness:           migrationReadiness,
+		retired:             retired,
+		ownership:           ownership,
+		partitions:          partitions,
 	}, nil
 }
 
@@ -1435,21 +1503,24 @@ func readMVCCSnapshotServingMetadata(r io.Reader, version uint32) (map[uint64]st
 // Bundling them keeps the reader/restore signatures from growing a return
 // value per layer.
 type mvccSnapshotMigrationMetadata struct {
-	acks       map[migrationAckID]migrationImportAck
-	floors     map[uint64]uint64
-	promotions map[uint64]PromotionState
-	readiness  []TargetStagedReadinessState
-	retired    map[uint64]struct{}
-	ownership  []MigrationOwnershipState
-	partitions MigrationOwnershipPartitionState
+	raftControl         map[string][]byte
+	controlAppliedIndex uint64
+	acks                map[migrationAckID]migrationImportAck
+	floors              map[uint64]uint64
+	promotions          map[uint64]PromotionState
+	readiness           []TargetStagedReadinessState
+	retired             map[uint64]struct{}
+	ownership           []MigrationOwnershipState
+	partitions          MigrationOwnershipPartitionState
 }
 
 func emptyMVCCSnapshotMigrationMetadata() mvccSnapshotMigrationMetadata {
 	return mvccSnapshotMigrationMetadata{
-		acks:       make(map[migrationAckID]migrationImportAck),
-		floors:     make(map[uint64]uint64),
-		promotions: make(map[uint64]PromotionState),
-		retired:    make(map[uint64]struct{}),
+		raftControl: make(map[string][]byte),
+		acks:        make(map[migrationAckID]migrationImportAck),
+		floors:      make(map[uint64]uint64),
+		promotions:  make(map[uint64]PromotionState),
+		retired:     make(map[uint64]struct{}),
 	}
 }
 
@@ -1567,6 +1638,9 @@ func readMVCCSnapshotEntry(r io.Reader) ([]byte, []VersionedValue, bool, error) 
 		if err != nil {
 			return nil, nil, false, err
 		}
+		if err := validateControlVersionKey(key, version.TS); err != nil {
+			return nil, nil, false, err
+		}
 		versions = append(versions, version)
 	}
 	return key, versions, false, nil
@@ -1643,7 +1717,7 @@ const compactScanBatchSize = 500
 func (s *mvccStore) compactPhase1(minTS uint64) []compactEntry {
 	var pending []compactEntry
 	s.mtx.RLock()
-	it := s.tree.Iterator()
+	it := s.entryTreeIterator()
 	for it.Next() {
 		versions, ok := it.Value().([]VersionedValue)
 		if !ok {
@@ -1672,9 +1746,10 @@ func (s *mvccStore) compactPhase2(pending []compactEntry, minTS uint64) int {
 		}
 		batch := pending[i:end]
 
+		s.applyMu.Lock()
 		s.mtx.Lock()
 		for _, e := range batch {
-			cur, found := s.tree.Get(e.key)
+			cur, found := s.entryTreeGet(e.key)
 			if !found {
 				continue
 			}
@@ -1684,16 +1759,20 @@ func (s *mvccStore) compactPhase2(pending []compactEntry, minTS uint64) int {
 			}
 			fresh, changed := compactVersions(versions, minTS)
 			if changed {
-				s.tree.Put(e.key, fresh)
+				s.entryTreePut(e.key, fresh)
 				updatedTotal++
 			}
 		}
 		s.mtx.Unlock()
+		s.applyMu.Unlock()
 	}
 	return updatedTotal
 }
 
 func (s *mvccStore) Compact(ctx context.Context, minTS uint64) error {
+	if err := s.rejectMemoryEntry(ctx); err != nil {
+		return err
+	}
 	pending := s.compactPhase1(minTS)
 
 	updatedTotal := 0
@@ -1701,11 +1780,13 @@ func (s *mvccStore) Compact(ctx context.Context, minTS uint64) error {
 		updatedTotal = s.compactPhase2(pending, minTS)
 	}
 
+	s.applyMu.Lock()
 	s.mtx.Lock()
 	if minTS > s.minRetainedTS {
 		s.minRetainedTS = minTS
 	}
 	s.mtx.Unlock()
+	s.applyMu.Unlock()
 
 	s.log.InfoContext(ctx, "compact",
 		slog.Uint64("min_ts", minTS),

@@ -7,10 +7,12 @@ import (
 
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/internal/testutil/grpctest"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
 )
 
 // twoGroupReadFixture is two single-node Raft groups behind one
@@ -20,6 +22,15 @@ type twoGroupReadFixture struct {
 	groups map[uint64]*ShardGroup
 	stores map[uint64]store.MVCCStore
 }
+
+type watermarkFollowerEngine struct {
+	raftengine.Engine
+	leader raftengine.LeaderInfo
+}
+
+func (watermarkFollowerEngine) State() raftengine.State            { return raftengine.StateFollower }
+func (e watermarkFollowerEngine) Leader() raftengine.LeaderInfo    { return e.leader }
+func (watermarkFollowerEngine) VerifyLeader(context.Context) error { return nil }
 
 func newTwoGroupReadFixture(t *testing.T) *twoGroupReadFixture {
 	t.Helper()
@@ -93,6 +104,59 @@ func TestShardStoreSnapshotReadAdvancesLaggingGroupWatermark(t *testing.T) {
 	// T commits f(read) with b-k in its read set; W_B's write was never
 	// acknowledged, so nothing is lost.
 	require.NoError(t, f.onePhase(t, 2, s, 40, "b-k", "old+1", "b-k"))
+}
+
+func TestAdvanceReadWatermarkForGroupReturnsLocalApplyReceipt(t *testing.T) {
+	t.Parallel()
+	f := newTwoGroupReadFixture(t)
+
+	first, err := f.shards.AdvanceReadWatermarkForGroup(t.Context(), 2, 42)
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), first.GroupID)
+	require.Equal(t, uint64(42), first.RequestedTimestamp)
+	require.GreaterOrEqual(t, first.AppliedTimestamp, uint64(42))
+	require.NotZero(t, first.CommitIndex)
+	require.Equal(t, f.stores[2].LastCommitTS(), first.AppliedTimestamp)
+
+	second, err := f.shards.AdvanceReadWatermarkForGroup(t.Context(), 2, 42)
+	require.NoError(t, err)
+	require.Greater(t, second.CommitIndex, first.CommitIndex,
+		"an explicit startup fence must commit even when the watermark already covers it")
+	require.GreaterOrEqual(t, second.AppliedTimestamp, first.AppliedTimestamp)
+}
+
+func TestAdvanceReadWatermarkForGroupRejectsUnreceiptableRequests(t *testing.T) {
+	t.Parallel()
+	f := newTwoGroupReadFixture(t)
+
+	for _, ts := range []uint64{0, ^uint64(0)} {
+		_, err := f.shards.AdvanceReadWatermarkForGroup(t.Context(), 1, ts)
+		require.ErrorIs(t, err, ErrInvalidWatermarkAdvance)
+	}
+	farFuture := uint64(time.Now().Add(24*time.Hour).UnixMilli()) << hlcLogicalBits
+	_, err := f.shards.AdvanceReadWatermarkForGroup(t.Context(), 1, farFuture)
+	require.ErrorIs(t, err, ErrInvalidWatermarkAdvance)
+	_, err = f.shards.AdvanceReadWatermarkForGroup(t.Context(), 99, 42)
+	require.ErrorIs(t, err, ErrWatermarkAdvanceReceiptUnavailable)
+}
+
+func TestAdvanceReadWatermarkForGroupDoesNotAcceptForwardedNoopAsReceipt(t *testing.T) {
+	t.Parallel()
+	service := &forwardingAdminServer{emptyReceipt: true}
+	addr := grpctest.Serve(t, func(server *grpc.Server) { pb.RegisterInternalServer(server, service) })
+	st := store.NewMVCCStore()
+	require.NoError(t, st.ApplyMutationsRaftAt(t.Context(), nil, nil, 50, 50, 1))
+	engine := watermarkFollowerEngine{leader: raftengine.LeaderInfo{ID: "leader", Address: addr}}
+	group := &ShardGroup{Engine: engine, Store: st, proposer: &recordingAdminProposer{}}
+	shards := NewShardStore(nil, map[uint64]*ShardGroup{1: group})
+	t.Cleanup(func() { require.NoError(t, shards.connCache.Close()) })
+
+	_, err := shards.AdvanceReadWatermarkForGroup(t.Context(), 1, 50)
+	require.ErrorIs(t, err, ErrWatermarkAdvanceReceiptUnavailable)
+	service.mu.Lock()
+	require.Equal(t, EncodeWatermarkAdvance(50), service.payload)
+	require.True(t, service.forceEntry)
+	service.mu.Unlock()
 }
 
 // The same advance covers a single-route range read.

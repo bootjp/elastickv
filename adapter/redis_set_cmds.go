@@ -15,6 +15,10 @@ import (
 )
 
 func (r *RedisServer) sadd(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
@@ -22,30 +26,36 @@ func (r *RedisServer) sadd(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) srem(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
 	r.mutateExactSet(conn, setKind, cmd.Args[1], cmd.Args[2:], false)
 }
 
-func (r *RedisServer) validateExactSetKind(kind string, key []byte, readTS uint64) error {
-	typ, err := r.keyTypeAt(context.Background(), key, readTS)
+func (r *RedisServer) validateExactSetKind(kind string, key []byte, readTS uint64, requestContexts ...context.Context) error {
+	typ, err := r.keyTypeAt(r.redisContext(requestContexts...),
+		key, readTS)
 	if err != nil {
 		return err
 	}
 
 	switch kind {
 	case setKind:
-		return r.validateExactSetType(typ, key, readTS)
+		return r.validateExactSetType(typ, key, readTS, r.redisContext(requestContexts...))
 	case hllKind:
-		return r.validateExactHLLType(typ, key, readTS)
+		return r.validateExactHLLType(typ, key, readTS, r.redisContext(requestContexts...))
 	default:
 		return errors.New("ERR unsupported exact set kind")
 	}
 }
 
-func (r *RedisServer) hllExistsAt(key []byte, readTS uint64) (bool, error) {
-	ctx := context.Background()
+func (r *RedisServer) hllExistsAt(key []byte, readTS uint64, requestContexts ...context.Context) (bool, error) {
+	ctx := r.redisContext(requestContexts...)
+
 	exists, err := r.hllAnchorExistsAt(ctx, key, readTS)
 	if err != nil {
 		return false, err
@@ -128,7 +138,7 @@ func buildLegacySetMemberBase(migrationElems []*kv.Elem[kv.OP], key []byte) map[
 	return base
 }
 
-func (r *RedisServer) validateExactSetType(typ redisValueType, key []byte, readTS uint64) error {
+func (r *RedisServer) validateExactSetType(typ redisValueType, key []byte, readTS uint64, requestContexts ...context.Context) error {
 	if typ == redisTypeSet {
 		return nil
 	}
@@ -136,7 +146,7 @@ func (r *RedisServer) validateExactSetType(typ redisValueType, key []byte, readT
 		return wrongTypeError()
 	}
 
-	hllExists, err := r.hllExistsAt(key, readTS)
+	hllExists, err := r.hllExistsAt(key, readTS, r.redisContext(requestContexts...))
 	if err != nil {
 		return err
 	}
@@ -146,12 +156,12 @@ func (r *RedisServer) validateExactSetType(typ redisValueType, key []byte, readT
 	return nil
 }
 
-func (r *RedisServer) validateExactHLLType(typ redisValueType, key []byte, readTS uint64) error {
+func (r *RedisServer) validateExactHLLType(typ redisValueType, key []byte, readTS uint64, requestContexts ...context.Context) error {
 	if typ == redisTypeNone {
 		return nil
 	}
 
-	hllExists, err := r.hllExistsAt(key, readTS)
+	hllExists, err := r.hllExistsAt(key, readTS, r.redisContext(requestContexts...))
 	if err != nil {
 		return err
 	}
@@ -285,7 +295,7 @@ func (r *RedisServer) mutateExactSetLegacy(conn redcon.Conn, ctx context.Context
 			return cockerrors.WithStack(err)
 		}
 		readTS := readTimestamp.Timestamp()
-		if err := r.validateExactSetKind(kind, key, readTS); err != nil {
+		if err := r.validateExactSetKind(kind, key, readTS, ctx); err != nil {
 			return err
 		}
 		value, err := r.loadSetAt(ctx, kind, key, readTS)
@@ -624,7 +634,8 @@ func (r *RedisServer) applySetMemberMutations(ctx context.Context, key []byte, m
 }
 
 func (r *RedisServer) mutateExactSet(conn redcon.Conn, kind string, key []byte, members [][]byte, add bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(conn),
+		redisDispatchTimeout)
 	defer cancel()
 
 	if kind != setKind {
@@ -635,13 +646,17 @@ func (r *RedisServer) mutateExactSet(conn redcon.Conn, kind string, key []byte, 
 }
 
 func (r *RedisServer) sismember(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
 	key := cmd.Args[1]
 	member := cmd.Args[2]
 	readTS := r.readTS()
-	ctx := context.Background()
+	ctx := r.handlerContext(conn)
 
 	hit, alive, err := r.setMemberFastExists(ctx, key, member, readTS)
 	if err != nil {
@@ -708,11 +723,16 @@ func (r *RedisServer) sismemberSlow(conn redcon.Conn, ctx context.Context, key, 
 }
 
 func (r *RedisServer) smembers(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
 	readTS := r.readTS()
-	typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
+	typ, err := r.keyTypeAt(r.handlerContext(conn),
+		cmd.Args[1], readTS)
 	if err != nil {
 		writeRedisError(conn, err)
 		return
@@ -726,7 +746,8 @@ func (r *RedisServer) smembers(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 
-	value, err := r.loadSetAt(context.Background(), setKind, cmd.Args[1], readTS)
+	value, err := r.loadSetAt(r.handlerContext(conn),
+		setKind, cmd.Args[1], readTS)
 	if err != nil {
 		writeRedisError(conn, err)
 		return
@@ -738,10 +759,15 @@ func (r *RedisServer) smembers(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) pfadd(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(conn),
+		redisDispatchTimeout)
 	defer cancel()
 	var changed int
 	if err := r.retryRedisWrite(ctx, func() error {
@@ -750,7 +776,7 @@ func (r *RedisServer) pfadd(conn redcon.Conn, cmd redcon.Command) {
 			return cockerrors.WithStack(err)
 		}
 		readTS := readTimestamp.Timestamp()
-		if err := r.validateExactSetKind(hllKind, cmd.Args[1], readTS); err != nil {
+		if err := r.validateExactSetKind(hllKind, cmd.Args[1], readTS, r.handlerContext(conn)); err != nil {
 			return err
 		}
 
@@ -777,10 +803,19 @@ func (r *RedisServer) pfadd(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) pfcount(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+	r.pfcountCommand(conn, cmd)
+}
+
+func (r *RedisServer) pfcountCommand(conn redcon.Conn, cmd redcon.Command) {
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(conn),
+		redisDispatchTimeout)
 	defer cancel()
 	readTS := r.readTS()
 	union := map[string]struct{}{}
@@ -790,7 +825,7 @@ func (r *RedisServer) pfcount(conn redcon.Conn, cmd redcon.Command) {
 			writeRedisError(conn, err)
 			return
 		}
-		hllExists, err := r.hllExistsAt(key, readTS)
+		hllExists, err := r.hllExistsAt(key, readTS, r.handlerContext(conn))
 		if err != nil {
 			writeRedisError(conn, err)
 			return

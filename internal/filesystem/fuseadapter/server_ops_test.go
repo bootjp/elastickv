@@ -470,6 +470,26 @@ func TestRawFileSystemWriteMapsErrorsAndOverflow(t *testing.T) {
 	}
 }
 
+func TestRawFileSystemFlushBackendCancellation(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want syscall.Errno
+	}{
+		{name: "canceled", err: context.Canceled, want: syscall.EINTR},
+		{name: "wrapped canceled", err: errors.Join(errors.New("flush"), context.Canceled), want: syscall.EINTR},
+		{name: "raw errno is not a backend cancellation", err: syscall.EINTR, want: syscall.EIO},
+		{name: "io failure", err: syscall.EIO, want: syscall.EIO},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			core := &fakeCore{flushErr: tc.err}
+			raw, _ := newRawFileSystem(t, core)
+			require.Equal(t, fuse.Status(tc.want), raw.Flush(nil, &fuse.FlushIn{InHeader: fuse.InHeader{NodeId: 7}, Fh: 9}))
+			require.True(t, core.flushCalled, "must exercise backend error mapping, not canceled admission")
+		})
+	}
+}
+
 func TestRawFileSystemFlushAndFsyncForwardHandles(t *testing.T) {
 	core := &fakeCore{}
 	raw, _ := newRawFileSystem(t, core)

@@ -58,7 +58,12 @@ func promotedVersionsFromStaged(opts PromoteVersionsOptions, versions []MVCCVers
 }
 
 func (s *mvccStore) PromoteVersions(ctx context.Context, opts PromoteVersionsOptions) (PromoteVersionsResult, error) {
+	if err := s.rejectMemoryEntry(ctx); err != nil {
+		return PromoteVersionsResult{}, err
+	}
+	s.applyMu.Lock()
 	s.mtx.Lock()
+	defer s.applyMu.Unlock()
 	defer s.mtx.Unlock()
 	if _, retired := s.migrationRetired[opts.JobID]; retired {
 		return PromoteVersionsResult{}, errors.WithStack(ErrMigrationRetired)
@@ -145,7 +150,7 @@ func (s *mvccStore) MigrationPromotionState(_ context.Context, jobID uint64) (Pr
 }
 
 func (s *mvccStore) removeVersionLocked(key []byte, commitTS uint64) {
-	existing, ok := s.tree.Get(key)
+	existing, ok := s.entryTreeGet(key)
 	if !ok {
 		return
 	}
@@ -158,10 +163,10 @@ func (s *mvccStore) removeVersionLocked(key []byte, commitTS uint64) {
 	copy(next, versions[:idx])
 	copy(next[idx:], versions[idx+1:])
 	if len(next) == 0 {
-		s.tree.Remove(key)
+		s.entryTreeRemove(key)
 		return
 	}
-	s.tree.Put(bytes.Clone(key), next)
+	s.entryTreePut(bytes.Clone(key), next)
 }
 
 func findVersionIndex(versions []VersionedValue, commitTS uint64) int {

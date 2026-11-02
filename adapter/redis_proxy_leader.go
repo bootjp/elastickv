@@ -7,7 +7,9 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"strings"
 
+	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
@@ -19,9 +21,10 @@ const (
 	defaultRedisLeaderClientPoolSize         = 4
 	defaultRedisBlockingLeaderClientPoolSize = 4
 	redisLeaderProxyPoolSplitDivisor         = 2
+	redisSetMinArgs                          = 3
 )
 
-func (r *RedisServer) proxyKeys(pattern []byte) ([]string, error) {
+func (r *RedisServer) proxyKeys(pattern []byte, requestContexts ...context.Context) ([]string, error) {
 	leader := r.coordinator.RaftLeader()
 	if leader == "" {
 		return nil, ErrLeaderNotFound
@@ -34,7 +37,8 @@ func (r *RedisServer) proxyKeys(pattern []byte) ([]string, error) {
 
 	cli := r.getOrCreateLeaderClient(leaderAddr)
 
-	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.redisContext(requestContexts...),
+		redisDispatchTimeout)
 	defer cancel()
 
 	keys, err := cli.Keys(ctx, string(pattern)).Result()
@@ -64,17 +68,102 @@ func (r *RedisServer) proxyTransactionToLeaderForKey(conn redcon.Conn, routingKe
 func (r *RedisServer) proxyTransactionToLeaderAddr(conn redcon.Conn, queue []redcon.Command, leaderAddr string) {
 	cli := r.getOrCreateLeaderClient(leaderAddr)
 
-	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(conn),
+		redisDispatchTimeout)
 	defer cancel()
 
 	cmds, err := r.execTxPipeline(ctx, cli, queue)
+	if r.requestAdmission != nil {
+		if terminal := ownedProxyTransactionError(err, cmds); terminal != nil {
+			writeRedisError(conn, terminal)
+			return
+		}
+	}
 	if handleProxyTxnError(conn, err) {
 		return
 	}
 	if handleProxyTxnCommandError(conn, cmds) {
 		return
 	}
+	if r.requestAdmission != nil {
+		writeOwnedProxyTxnResults(conn, queue, cmds)
+		return
+	}
 	writeProxyCmdsResult(conn, cmds)
+}
+
+// go-redis decodes both simple and bulk strings as string. Recover only the
+// status replies defined by the local transaction handlers; GET/SET GET values
+// (even the literal "OK") must remain bulk strings. Legacy proxy is unchanged.
+func writeOwnedProxyTxnResults(conn redcon.Conn, queue []redcon.Command, cmds []*redis.Cmd) {
+	conn.WriteArray(len(cmds))
+	for i, cmd := range cmds {
+		if i < len(queue) && cmd.Err() == nil && redisTxnReturnsStatus(queue[i]) {
+			if value, ok := cmd.Val().(string); ok {
+				conn.WriteString(value)
+				continue
+			}
+		}
+		writeGoRedisResult(conn, cmd)
+	}
+}
+
+func redisTxnReturnsStatus(cmd redcon.Command) bool {
+	if len(cmd.Args) == 0 {
+		return false
+	}
+	switch strings.ToUpper(string(cmd.Args[0])) {
+	case cmdHMSet:
+		return true
+	case cmdSet:
+		if len(cmd.Args) < redisSetMinArgs {
+			return false
+		}
+		for _, arg := range cmd.Args[redisSetMinArgs:] {
+			if bytes.EqualFold(arg, []byte("GET")) {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+func ambiguousProxyTransactionError(err error) bool {
+	var netErr net.Error
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) ||
+		errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.As(err, &netErr)
+}
+
+func ownedProxyTransactionError(err error, cmds []*redis.Cmd) error {
+	if ambiguousProxyTransactionError(err) || isProxyTransactionOutcomeUnknown(err) {
+		return errors.Join(kv.ErrTransactionOutcomeUnknown, err)
+	}
+	// go-redis may copy an EXEC-level error onto every command handle. An
+	// unknown transaction outcome is terminal, never a successful array of
+	// per-element errors, even though RESP no longer carries the Go error type.
+	for _, cmd := range cmds {
+		if isProxyTransactionOutcomeUnknown(cmd.Err()) {
+			return errors.Join(kv.ErrTransactionOutcomeUnknown, cmd.Err())
+		}
+	}
+	return nil
+}
+
+func isProxyTransactionOutcomeUnknown(err error) bool {
+	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+		return true
+	}
+	if err == nil {
+		return false
+	}
+	message := strings.TrimPrefix(err.Error(), "ERR ")
+	unknown := kv.ErrTransactionOutcomeUnknown.Error()
+	// Match the exact terminal overflow spelling emitted by writeTerminalFailure,
+	// not arbitrary semicolon-bearing command errors from a peer.
+	overflow := unknown + "; " + errRedisReplyTooLarge.Error()
+	return message == unknown || message == overflow || strings.HasPrefix(message, unknown+" ") || strings.HasPrefix(message, unknown+"\n")
 }
 
 // resolveLeaderRedisAddr looks up the Redis address of the current Raft leader,
@@ -110,6 +199,26 @@ func (r *RedisServer) resolveLeaderRedisAddrForKey(conn redcon.Conn, key []byte)
 // execTxPipeline sends queue as a single TxPipelined batch and returns the
 // per-command result handles together with any pipeline-level error.
 func (r *RedisServer) execTxPipeline(ctx context.Context, cli *redis.Client, queue []redcon.Command) ([]*redis.Cmd, error) {
+	if r.requestAdmission != nil {
+		// An owned EXEC cannot retry a lost reply under a new target-side MULTI
+		// owner. A dedicated client also lets revocation interrupt socket reads
+		// without closing a pooled connection belonging to another request.
+		owned := redis.NewClient(&redis.Options{Addr: cli.Options().Addr, PoolSize: 1,
+			MaxRetries: -1, ContextTimeoutEnabled: true})
+		cancelDone := make(chan struct{})
+		stop := context.AfterFunc(ctx, func() { _ = owned.Close(); close(cancelDone) })
+		defer func() {
+			if !stop() {
+				<-cancelDone
+			}
+			_ = owned.Close()
+		}()
+		return execRedisTxPipeline(ctx, owned, queue)
+	}
+	return execRedisTxPipeline(ctx, cli, queue)
+}
+
+func execRedisTxPipeline(ctx context.Context, cli *redis.Client, queue []redcon.Command) ([]*redis.Cmd, error) {
 	cmds := make([]*redis.Cmd, 0, len(queue))
 	_, err := cli.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
 		for _, cmd := range queue {
@@ -206,7 +315,7 @@ func writeProxyCmdsResult(conn redcon.Conn, cmds []*redis.Cmd) {
 	}
 }
 
-func (r *RedisServer) proxyLRange(key, routingKey []byte, startRaw, endRaw []byte) ([]string, error) {
+func (r *RedisServer) proxyLRange(key, routingKey []byte, startRaw, endRaw []byte, requestContexts ...context.Context) ([]string, error) {
 	leader := r.coordinator.RaftLeaderForKey(routingKey)
 	if leader == "" {
 		return nil, ErrLeaderNotFound
@@ -227,14 +336,15 @@ func (r *RedisServer) proxyLRange(key, routingKey []byte, startRaw, endRaw []byt
 		return nil, err
 	}
 
-	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.redisContext(requestContexts...),
+		redisDispatchTimeout)
 	defer cancel()
 
 	res, err := cli.LRange(ctx, string(key), int64(start), int64(end)).Result()
 	return res, errors.WithStack(err)
 }
 
-func (r *RedisServer) proxyRPush(key []byte, values [][]byte) (int64, error) {
+func (r *RedisServer) proxyRPush(key []byte, values [][]byte, requestContexts ...context.Context) (int64, error) {
 	leader := r.coordinator.RaftLeaderForKey(redisUserRouteKey(key))
 	if leader == "" {
 		return 0, ErrLeaderNotFound
@@ -251,14 +361,15 @@ func (r *RedisServer) proxyRPush(key []byte, values [][]byte) (int64, error) {
 		args = append(args, string(v))
 	}
 
-	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.redisContext(requestContexts...),
+		redisDispatchTimeout)
 	defer cancel()
 
 	res, err := cli.RPush(ctx, string(key), args...).Result()
 	return res, errors.WithStack(err)
 }
 
-func (r *RedisServer) proxyLPush(key []byte, values [][]byte) (int64, error) {
+func (r *RedisServer) proxyLPush(key []byte, values [][]byte, requestContexts ...context.Context) (int64, error) {
 	leader := r.coordinator.RaftLeaderForKey(redisUserRouteKey(key))
 	if leader == "" {
 		return 0, ErrLeaderNotFound
@@ -275,7 +386,8 @@ func (r *RedisServer) proxyLPush(key []byte, values [][]byte) (int64, error) {
 		args = append(args, string(v))
 	}
 
-	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.redisContext(requestContexts...),
+		redisDispatchTimeout)
 	defer cancel()
 
 	res, err := cli.LPush(ctx, string(key), args...).Result()
@@ -298,7 +410,7 @@ func (r *RedisServer) getOrCreateLeaderClient(addr string) *redis.Client {
 	if cli, ok = r.leaderClients[addr]; ok {
 		return cli
 	}
-	cli = redis.NewClient(&redis.Options{Addr: addr, PoolSize: r.leaderClientPoolSize()})
+	cli = redis.NewClient(&redis.Options{Addr: addr, PoolSize: r.leaderClientPoolSize(), ContextTimeoutEnabled: r.requestAdmission != nil})
 	r.leaderClients[addr] = cli
 	return cli
 }
@@ -320,8 +432,9 @@ func (r *RedisServer) getOrCreateBlockingLeaderClient(addr string) *redis.Client
 		r.blockingLeaderClients = make(map[string]*redis.Client)
 	}
 	cli = redis.NewClient(&redis.Options{
-		Addr:     addr,
-		PoolSize: r.blockingLeaderClientPoolSize(),
+		Addr:                  addr,
+		PoolSize:              r.blockingLeaderClientPoolSize(),
+		ContextTimeoutEnabled: r.requestAdmission != nil,
 	})
 	r.blockingLeaderClients[addr] = cli
 	return cli
@@ -392,7 +505,7 @@ func (r *RedisServer) proxyToLeader(conn redcon.Conn, cmd redcon.Command, key []
 		return true
 	}
 
-	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(conn), redisDispatchTimeout)
 	defer cancel()
 
 	args := make([]interface{}, len(cmd.Args))
@@ -420,7 +533,8 @@ func (r *RedisServer) proxyBlockingToLeader(conn redcon.Conn, cmd redcon.Command
 	}
 	cli := r.getOrCreateBlockingLeaderClient(leaderAddr)
 
-	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(conn),
+		redisDispatchTimeout)
 	defer cancel()
 
 	args := make([]interface{}, len(cmd.Args))
@@ -496,7 +610,7 @@ func parseInt(b []byte) (int, error) {
 
 // tryLeaderGet proxies a GET to the current Raft leader, returning the value and
 // whether the proxy succeeded.
-func (r *RedisServer) tryLeaderGetAt(key []byte, ts uint64) ([]byte, error) {
+func (r *RedisServer) tryLeaderGetAtContext(parent context.Context, key []byte, ts uint64) ([]byte, error) {
 	addr := r.coordinator.RaftLeaderForKey(key)
 	if addr == "" {
 		return nil, ErrLeaderNotFound
@@ -507,7 +621,7 @@ func (r *RedisServer) tryLeaderGetAt(key []byte, ts uint64) ([]byte, error) {
 		return nil, errors.WithStack(err)
 	}
 
-	ctx, cancel := context.WithTimeout(r.handlerContext(), redisRelayPublishTimeout)
+	ctx, cancel := context.WithTimeout(parent, redisRelayPublishTimeout)
 	defer cancel()
 
 	cli := pb.NewRawKVClient(conn)
@@ -553,5 +667,5 @@ func (r *RedisServer) readValueAt(ctx context.Context, key []byte, readTS uint64
 		v, err := r.store.GetAt(ctx, key, readTS)
 		return v, errors.WithStack(err)
 	}
-	return r.tryLeaderGetAt(key, readTS)
+	return r.tryLeaderGetAtContext(ctx, key, readTS)
 }

@@ -14,7 +14,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
@@ -486,7 +485,7 @@ func TestOwnershipAttestationRPCRequiresMigrationCredential(t *testing.T) {
 		unary, _ := SplitMigrationTokenAuth(t.Name(), false, enforced)
 		for _, token := range []string{"", "other", t.Name()} {
 			ctx := metadata.NewIncomingContext(t.Context(), metadata.Pairs("authorization", "Bearer "+token))
-			ctx = peer.NewContext(ctx, &peer.Peer{AuthInfo: credentials.TLSInfo{}})
+			ctx = peer.NewContext(ctx, &peer.Peer{AuthInfo: migrationTLSInfoFixture(t)})
 			called := false
 			_, err := unary(ctx, &pb.AttestMigrationOwnershipRequest{}, &grpc.UnaryServerInfo{
 				FullMethod: pb.Distribution_AttestMigrationOwnership_FullMethodName,

@@ -99,6 +99,7 @@ const (
 )
 
 type S3Server struct {
+	requestAdmission     RequestAdmission
 	listen               net.Listener
 	s3Addr               string
 	region               string
@@ -421,6 +422,7 @@ func NewS3Server(listen net.Listener, s3Addr string, st store.MVCCStore, coordin
 	mux.HandleFunc("/", s.handle)
 	s.httpServer = &http.Server{Handler: mux, ReadHeaderTimeout: time.Second}
 	s.httpConns = trackHTTPConns(s.httpServer)
+	installHTTPRequestAdmission(s.httpServer, s.requestAdmission)
 	return s
 }
 

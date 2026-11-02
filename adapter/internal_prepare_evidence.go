@@ -24,7 +24,7 @@ func WithInternalPrepareEvidenceToken(token string) InternalOption {
 // GetPrepareEvidenceState serves read-only protocol negotiation on every
 // replica, and authoritative drain inspection only on an applied leader.
 func (i *Internal) GetPrepareEvidenceState(ctx context.Context, req *pb.PrepareEvidenceStateRequest) (*pb.PrepareEvidenceStateResponse, error) {
-	if err := checkBearerToken(ctx, i.prepareEvidenceToken, "prepare evidence peer"); err != nil {
+	if err := i.authorizePrepareEvidenceRequest(ctx, req); err != nil {
 		return nil, err
 	}
 	if req == nil {

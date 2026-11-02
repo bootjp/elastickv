@@ -15,7 +15,6 @@ import (
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
@@ -249,7 +248,7 @@ func TestMigrationCoverageEnabledFlagsRetainRPCAuthenticationAndNamespaceGuards(
 	}
 	_, err := auth(t.Context(), request, info, handler)
 	require.Equal(t, codes.Unauthenticated, status.Code(err))
-	tlsContext := peer.NewContext(t.Context(), &peer.Peer{AuthInfo: credentials.TLSInfo{}})
+	tlsContext := peer.NewContext(t.Context(), migrationNativeTLSPeerFixture(t))
 	_, err = auth(tlsContext, request, info, handler)
 	require.Equal(t, codes.Unauthenticated, status.Code(err), "TLS alone cannot authorize migration")
 	wrongToken := metadata.NewIncomingContext(tlsContext, metadata.Pairs("authorization", "Bearer unrelated"))
