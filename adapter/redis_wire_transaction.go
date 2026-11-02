@@ -16,6 +16,7 @@ const (
 )
 
 var errRedisExecAbort = errors.New("EXECABORT Transaction discarded because of previous errors.")
+var errRedisTxnQueueLimit = errors.New("ERR transaction queue limit exceeded")
 
 // The holder owns MULTI's original H, not a new admission for each queued argv.
 // Its lock serializes command publication with cancellation and child joins.
@@ -38,6 +39,8 @@ type redisWireTxn struct {
 	done       chan struct{}
 	queueBytes int
 	queueErr   error
+	reserved   int
+	poisoned   bool
 }
 
 func (r *RedisServer) dispatchProtectedTransaction(conn redcon.Conn, name string, cmd redcon.Command, start time.Time) bool {
@@ -45,6 +48,10 @@ func (r *RedisServer) dispatchProtectedTransaction(conn redcon.Conn, name string
 		return false
 	}
 	state := getConnState(conn)
+	if state.transactionPoisoned {
+		conn.WriteError(errRedisTxnQueueLimit.Error())
+		return true
+	}
 	state.mu.Lock()
 	txn := state.wireTxn
 	state.mu.Unlock()
@@ -59,15 +66,8 @@ func (r *RedisServer) dispatchProtectedTransaction(conn redcon.Conn, name string
 		if name != cmdMulti {
 			return false
 		}
-		if err := r.validateCmd(cmd); err != nil {
-			writeRedisError(conn, err)
-			return true
-		}
-		var err error
-		txn, err = r.newWireTransaction(conn, state)
-		if err != nil {
-			state.transactionRefused = true
-			conn.WriteError(errRedisAdmission.Error())
+		txn = r.beginWireTransaction(conn, state, cmd)
+		if txn == nil {
 			return true
 		}
 	}
@@ -75,7 +75,38 @@ func (r *RedisServer) dispatchProtectedTransaction(conn redcon.Conn, name string
 	return true
 }
 
+func (r *RedisServer) beginWireTransaction(conn redcon.Conn, state *connState, cmd redcon.Command) *redisWireTxn {
+	if err := r.validateCmd(cmd); err != nil {
+		writeRedisError(conn, err)
+		return nil
+	}
+	txn, err := r.newWireTransaction(conn, state)
+	if err == nil {
+		return txn
+	}
+	if errors.Is(err, errRedisTxnQueueLimit) {
+		// redcon can still dispatch buffered frames after Close. Keep a
+		// permanent tombstone so none becomes a fresh standalone request.
+		state.transactionPoisoned = true
+		conn.WriteError(err.Error())
+		_ = conn.Close()
+		return nil
+	}
+	state.transactionRefused = true
+	conn.WriteError(errRedisAdmission.Error())
+	return nil
+}
+
 func (r *RedisServer) newWireTransaction(conn redcon.Conn, state *connState) (*redisWireTxn, error) {
+	if !r.reserveWireTxnBytes(redisWireTxnBaseBytes) {
+		return nil, errRedisTxnQueueLimit
+	}
+	transferred := false
+	defer func() {
+		if !transferred {
+			r.releaseWireTxnBytes(redisWireTxnBaseBytes)
+		}
+	}()
 	owner, err := r.requestAdmission(r.baseRequestContext())
 	if err != nil || owner == nil || owner.Context() == nil {
 		if owner != nil {
@@ -86,7 +117,7 @@ func (r *RedisServer) newWireTransaction(conn redcon.Conn, state *connState) (*r
 	}
 	ctx, cancel := context.WithCancel(context.WithValue(owner.Context(), redisOwnedRequestKey{}, true))
 	t := &redisWireTxn{server: r, conn: redisLifetimeConn(conn), state: state, owner: owner,
-		ctx: ctx, cancel: cancel, done: make(chan struct{}), watchDone: make(chan struct{})}
+		ctx: ctx, cancel: cancel, done: make(chan struct{}), watchDone: make(chan struct{}), reserved: redisWireTxnBaseBytes}
 	t.mu.Lock()
 	t.stopServer = context.AfterFunc(r.baseRequestContext(), cancel)
 	r.wireTxnMu.Lock()
@@ -113,6 +144,7 @@ func (r *RedisServer) newWireTransaction(conn redcon.Conn, state *connState) (*r
 		t.abort()
 	})
 	t.mu.Unlock()
+	transferred = true
 	return t, nil
 }
 
@@ -161,7 +193,7 @@ func (t *redisWireTxn) publishTerminal(c *redisOwnedConn) {
 	t.stopWatcher()
 	live := c.publishResult(true)
 	t.cleanupLocked(true, nil)
-	if !live {
+	if !live || t.poisoned {
 		// Synchronous Close flushes the terminal error before disconnecting.
 		_ = t.conn.Close()
 		return
@@ -201,18 +233,7 @@ func (t *redisWireTxn) execute(c *redisOwnedConn, name string, cmd redcon.Comman
 		return false
 	}
 	if redisQueueOnlyCommand(t.state, name) {
-		size := queuedRedisCommandSize(cmd)
-		if len(t.state.queue) >= redisMaxQueuedCommands || size > redisMaxReplyBytes-t.queueBytes {
-			t.queueErr = errRedisExecAbort
-			c.WriteError("ERR transaction queue limit exceeded")
-			return false
-		}
-		t.state.queue = append(t.state.queue, cloneCommand(cmd))
-		t.queueBytes += size
-		c.WriteString("QUEUED")
-		t.server.traceCommandDone(t.conn, name, cmd.Args[1:], 0, true)
-		t.server.observeRedisSuccess(name, time.Since(start))
-		return false
+		return t.enqueue(c, name, cmd, start)
 	}
 	if name == cmdExec && t.queueErr != nil {
 		writeRedisError(c, t.queueErr)
@@ -230,15 +251,28 @@ func (t *redisWireTxn) execute(c *redisOwnedConn, name string, cmd redcon.Comman
 	return name == cmdExec || name == cmdDiscard
 }
 
-func queuedRedisCommandSize(cmd redcon.Command) int {
-	size := len(cmd.Raw) + redisQueuedCommandOverhead + redisQueuedArgOverhead*len(cmd.Args)
-	for _, arg := range cmd.Args {
-		if len(arg) > redisMaxReplyBytes-size {
-			return redisMaxReplyBytes + 1
-		}
-		size += len(arg)
+func (t *redisWireTxn) enqueue(c *redisOwnedConn, name string, cmd redcon.Command, start time.Time) bool {
+	size := queuedRedisCommandSize(cmd)
+	capacity, growth := redisQueueCapacityGrowth(t.state.queue)
+	charge := size + growth
+	if len(t.state.queue) >= redisMaxQueuedCommands || charge > redisMaxReplyBytes-t.queueBytes || !t.server.reserveWireTxnBytes(charge) {
+		t.poisoned = true
+		c.WriteError(errRedisTxnQueueLimit.Error())
+		return true
 	}
-	return size
+	// Own the reservation before either the slice growth or payload clone.
+	t.reserved += charge
+	t.queueBytes += charge
+	if capacity != cap(t.state.queue) {
+		queue := make([]redcon.Command, len(t.state.queue), capacity)
+		copy(queue, t.state.queue)
+		t.state.queue = queue
+	}
+	t.state.queue = append(t.state.queue, cloneCommand(cmd))
+	c.WriteString("QUEUED")
+	t.server.traceCommandDone(t.conn, name, cmd.Args[1:], 0, true)
+	t.server.observeRedisSuccess(name, time.Since(start))
+	return false
 }
 
 func (t *redisWireTxn) abort() {
@@ -268,6 +302,12 @@ func (t *redisWireTxn) cleanupLocked(finished bool, err error) {
 		_ = t.owner.Finish(err)
 	}
 	t.state.inTxn, t.state.queue = false, nil
+	// EXEC may have detached queue into its handler's local variable. Only
+	// here, after that handler returned and all children joined, is its charge
+	// reusable. Keep the lightweight closed holder for poisoned pipelines.
+	t.queueBytes = 0
+	t.server.releaseWireTxnBytes(t.reserved)
+	t.reserved = 0
 	close(t.done)
 }
 

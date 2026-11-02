@@ -183,6 +183,8 @@ type RedisServer struct {
 	wireTxnMu           sync.Mutex
 	wireTxns            map[*redisWireTxn]struct{}
 	wireTxnIdleTimeout  time.Duration
+	wireTxnBudgetLimit  int
+	wireTxnBytes        int
 	// peerLimiter bounds concurrent Redis connections per remote peer IP.
 	peerLimiter *redisPeerLimiter
 	// blockWaitFallback is the safety-net polling interval used by blocking
@@ -501,11 +503,12 @@ func (c *redisMetricsConn) reset(conn redcon.Conn) {
 }
 
 type connState struct {
-	mu                 sync.Mutex
-	inTxn              bool
-	transactionRefused bool
-	wireTxn            *redisWireTxn
-	queue              []redcon.Command
+	mu                  sync.Mutex
+	inTxn               bool
+	transactionRefused  bool
+	transactionPoisoned bool
+	wireTxn             *redisWireTxn
+	queue               []redcon.Command
 	// connID is a monotonically increasing per-server connection
 	// identifier assigned on first access via getConnState. Exposed via
 	// HELLO's `id` field and CLIENT ID / CLIENT INFO for parity with

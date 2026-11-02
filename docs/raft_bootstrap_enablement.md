@@ -167,12 +167,16 @@ until these checks and the latest-HEAD review/CI gates have completed.
 `MULTI` acquires one receiver-local owner. Queued commands copy their arguments
 and retain that owner through `EXEC` or `DISCARD`; neither queued commands nor
 EXEC obtain replacement authority. A nested MULTI returns its protocol error
-without replacing the original queue. Unsupported commands, queue-time arity
-failures and queue exhaustion poison EXEC with `EXECABORT`; ordinary execution
-errors retain their per-element result semantics. The queue is bounded by 65,536
-commands and a 64 MiB accounting budget including copies/overhead. Idle queued
-transactions expire after 30 seconds by default and cannot pin admission
-indefinitely.
+without replacing the original queue. Unsupported commands and queue-time arity
+failures poison EXEC with `EXECABORT`; ordinary execution errors retain their
+per-element result semantics. A queue is bounded by 65,536 commands and a 64 MiB
+accounting budget including copies/overhead. All protected transaction queues
+also share a server-wide 64 MiB budget, reserved before cloning commands and
+retained until execution and owned children finish. Resource overflow discards
+the transaction and closes its connection; buffered commands cannot become new
+standalone writes. Idle queued transactions expire after 30 seconds by default.
+These bounds cover retained protected queue copies, not all parser buffers,
+execution allocations or legacy-mode queues.
 
 Revocation discards the queue and closes the old connection. Reconnect only
 for a genuinely new request; do not attach old queued work to a new handle.

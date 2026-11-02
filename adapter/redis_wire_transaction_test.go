@@ -320,15 +320,13 @@ func TestRedisWireTransactionQueueBoundsAndErrors(t *testing.T) {
 		s.handleRedisCommand(c, cmd)
 	}
 	command(cmdMulti)
-	txn := getConnState(c).wireTxn
-	txn.mu.Lock()
-	txn.queueBytes = redisMaxReplyBytes
-	txn.mu.Unlock()
+	s.wireTxnBudgetLimit = redisWireTxnBaseBytes
 	command(cmdSet, "k", "never")
 	command(cmdExec)
 	require.Len(t, c.writes, 2)
 	require.Contains(t, c.writes[0].s, "queue limit exceeded")
-	require.Contains(t, c.writes[1].s, "EXECABORT")
+	require.Contains(t, c.writes[1].s, errRedisAdmission.Error())
+	require.True(t, getConnState(c).wireTxn.closed)
 	require.Equal(t, 1, owner.finishes)
 	require.Equal(t, 1, owner.joins)
 }
@@ -616,8 +614,13 @@ func runRedisWireTransactionFollowerProxy(t *testing.T, mode string) {
 	}
 	requireRedisWireJoined(t, o)
 	require.Empty(t, followerGate.owners, "proxy must retain MULTI's receiver H")
+	requireRedisBudgetReleased(t, follower)
+	if mode == "revoked" {
+		require.Greater(t, redisBudgetUsed(leader), redisWireTxnBaseBytes, "remote EXEC still retains its own queued copies")
+	}
 	unblock()
 	requireRedisWireJoined(t, <-dispatched)
+	requireRedisBudgetReleased(t, leader)
 	require.Empty(t, dispatched, "a lost EXEC reply must not be retried")
 	value, err := st.GetAt(t.Context(), redisStrKey([]byte("counter")), ^uint64(0))
 	require.NoError(t, err)

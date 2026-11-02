@@ -16,7 +16,10 @@ not establish the complete v5 snapshot/journal or membership protocol.
 Protected Redis wire `MULTI` now retains its original receiver-local admission
 owner across copied queued arguments until `EXEC`, `DISCARD` or cancellation.
 It does not refresh a stale handle at EXEC. Idle timeout, disconnect and server
-shutdown cancel and join owned work. Protected follower forwarding disables
+shutdown cancel and join owned work. Protected queues reserve their copied
+arguments against a shared server-wide 64 MiB budget; resource overflow discards
+the transaction and closes the connection without executing buffered commands.
+Protected follower forwarding disables
 automatic transaction retries and retains top-level unknown outcomes after a
 lost reply or terminal reply overflow. Targeted real-wire race tests cover
 these paths; they are not a distributed Jepsen campaign result.
