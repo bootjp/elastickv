@@ -1,6 +1,6 @@
 # Raft catalog bootstrap
 
-Status: Proposed v5; accepted-baseline startup, protected wire transactions and exact active-envelope startup rotation implemented; bounded E2E verified; full protocol and production operation not yet verified
+Status: Proposed v5; accepted-baseline startup, encrypted data-group migration, protected wire transactions and authenticated active-envelope rotation implemented; bounded E2E verified; full protocol and production operation not yet verified
 Author: bootjp
 Date: 2026-10-30
 

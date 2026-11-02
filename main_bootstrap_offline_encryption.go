@@ -255,14 +255,27 @@ func (e *bootstrapOfflineEncryption) validateSnapshot(ctx context.Context, index
 }
 
 func (e *bootstrapOfflineEncryption) validateSnapshotHeader(index, cutover uint64, cp encryption.SnapshotCheckpoint) error {
-	if index == 0 || cp.Index == 0 || cp.Index > index || cp.Index > e.checkpoint.Index {
-		return errors.Wrap(errBootstrapOfflineStore, "snapshot lacks bounded encryption checkpoint")
+	if err := e.validateSnapshotCheckpoint(index, cp); err != nil {
+		return err
+	}
+	if cutover > cp.Index {
+		return errors.Wrap(errBootstrapOfflineStore, "snapshot raft cutover exceeds its checkpoint prefix")
 	}
 	if cutover != 0 && cutover != e.cutover {
 		return errors.Wrap(errBootstrapOfflineStore, "snapshot raft cutover differs from verified context")
 	}
-	if e.cutover != 0 && index > e.cutover && cutover == 0 {
+	if e.cutover != 0 && index >= e.cutover && cutover == 0 {
 		return errors.Wrap(errBootstrapOfflineStore, "snapshot raft cutover missing")
+	}
+	return nil
+}
+
+func (e *bootstrapOfflineEncryption) validateSnapshotCheckpoint(index uint64, cp encryption.SnapshotCheckpoint) error {
+	if index == 0 || cp.Index == 0 || cp.Index > index || cp.Index > e.checkpoint.Index {
+		return errors.Wrap(errBootstrapOfflineStore, "snapshot lacks bounded encryption checkpoint")
+	}
+	if cp.Index == e.checkpoint.Index && cp.State != e.checkpoint.State {
+		return errors.Wrap(errBootstrapOfflineStore, "same-index snapshot encryption checkpoint differs from pinned sidecar")
 	}
 	return nil
 }

@@ -246,7 +246,53 @@ func TestBootstrapOfflineEncryptionNativeSnapshotValidation(t *testing.T) {
 	bad := bytes.Clone(stream.Bytes())
 	bad[42] ^= 1
 	require.Error(t, enc.NativeCrypto().ValidateSnapshot(t.Context(), 10, bytes.NewReader(bad)))
+	// A self-consistent header AND raw checkpoint is not sufficient at the
+	// same encryption-entry index: it must match the independently pinned state.
+	rawCheckpoint := binary.BigEndian.AppendUint64(nil, enc.checkpoint.Index)
+	rawCheckpoint = append(rawCheckpoint, enc.checkpoint.State[:]...)
+	consistentTamper := bytes.Clone(stream.Bytes())
+	occurrences := 0
+	for start := 0; start < len(consistentTamper); {
+		at := bytes.Index(consistentTamper[start:], rawCheckpoint)
+		if at < 0 {
+			break
+		}
+		at += start
+		consistentTamper[at+8] ^= 1
+		occurrences++
+		start = at + len(rawCheckpoint)
+	}
+	require.Equal(t, 2, occurrences, "fixture includes the carried and raw checkpoints")
+	require.ErrorContains(t, enc.NativeCrypto().ValidateSnapshot(t.Context(), 10, bytes.NewReader(consistentTamper)), "same-index")
 	require.Error(t, enc.NativeCrypto().ValidateSnapshot(t.Context(), 8, bytes.NewReader(stream.Bytes())))
 	require.Error(t, enc.NativeCrypto().ValidateSnapshot(t.Context(), 10, bytes.NewReader(stream.Bytes()[:stream.Len()-1])))
 	require.Equal(t, before, offlineDataFiles(t, root))
+}
+
+func TestBootstrapOfflineEncryptionSnapshotHeaderBoundaries(t *testing.T) {
+	e := &bootstrapOfflineEncryption{checkpoint: encryption.SnapshotCheckpoint{Index: 10, State: [32]byte{1}}, cutover: 6}
+	for _, tc := range []struct {
+		name           string
+		index, cutover uint64
+		checkpoint     encryption.SnapshotCheckpoint
+		valid          bool
+	}{
+		{"current matching", 10, 6, e.checkpoint, true},
+		{"current state mismatch", 10, 6, encryption.SnapshotCheckpoint{Index: 10, State: [32]byte{2}}, false},
+		{"historical checkpoint allowed", 8, 6, encryption.SnapshotCheckpoint{Index: 7, State: [32]byte{2}}, true},
+		{"before cutover remains plaintext", 5, 0, encryption.SnapshotCheckpoint{Index: 4, State: [32]byte{2}}, true},
+		{"future cutover beyond snapshot", 5, 6, encryption.SnapshotCheckpoint{Index: 4}, false},
+		{"cutover beyond checkpoint", 8, 6, encryption.SnapshotCheckpoint{Index: 5}, false},
+		{"missing cutover at boundary", 6, 0, encryption.SnapshotCheckpoint{Index: 6}, false},
+		{"checkpoint beyond snapshot", 8, 6, e.checkpoint, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := e.validateSnapshotHeader(tc.index, tc.cutover, tc.checkpoint)
+			if tc.valid {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+			}
+		})
+	}
 }
