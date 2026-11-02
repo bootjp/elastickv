@@ -74,6 +74,10 @@ func luaBoolReply(v bool) luaReply {
 }
 
 func (r *RedisServer) eval(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	script := string(cmd.Args[1])
 	sha := luaScriptSHA(script)
 	r.cacheScript(sha, script)
@@ -81,6 +85,10 @@ func (r *RedisServer) eval(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) evalsha(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	script, ok := r.lookupScript(strings.ToLower(string(cmd.Args[1])))
 	if !ok {
 		conn.WriteError("NOSCRIPT No matching script. Please use EVAL.")
@@ -115,7 +123,8 @@ func (r *RedisServer) runLuaScript(conn redcon.Conn, script string, evalArgs [][
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.handlerContext(), redisLuaDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(conn),
+		redisLuaDispatchTimeout)
 	defer cancel()
 
 	start := time.Now()
@@ -833,7 +842,8 @@ func (r *RedisServer) execLuaCompat(conn redcon.Conn, command string, args [][]b
 		stringArgs[i] = string(arg)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(conn),
+		redisDispatchTimeout)
 	defer cancel()
 
 	var reply luaReply
@@ -861,6 +871,10 @@ func (r *RedisServer) execLuaCompat(conn redcon.Conn, command string, args [][]b
 }
 
 func (r *RedisServer) rename(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
@@ -868,6 +882,10 @@ func (r *RedisServer) rename(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) llen(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
@@ -875,6 +893,10 @@ func (r *RedisServer) llen(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) lrem(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
@@ -882,6 +904,10 @@ func (r *RedisServer) lrem(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) lpop(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
@@ -889,6 +915,10 @@ func (r *RedisServer) lpop(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) rpop(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
@@ -899,6 +929,10 @@ func (r *RedisServer) rpop(conn redcon.Conn, cmd redcon.Command) {
 // mechanism for O(1) conflict-free pops. An optional count argument is supported:
 // LPOP key [count] / RPOP key [count].
 func (r *RedisServer) execListPop(conn redcon.Conn, cmd redcon.Command, left bool) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	count := 1
 	withCount := len(cmd.Args) > 2 //nolint:mnd // args: [CMD, key, count]
 	if withCount {
@@ -910,7 +944,8 @@ func (r *RedisServer) execListPop(conn redcon.Conn, cmd redcon.Command, left boo
 		count = n
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(conn),
+		redisDispatchTimeout)
 	defer cancel()
 
 	values, err := r.listPopClaim(ctx, cmd.Args[1], count, left)
@@ -940,6 +975,10 @@ func (r *RedisServer) execListPop(conn redcon.Conn, cmd redcon.Command, left boo
 }
 
 func (r *RedisServer) rpoplpush(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
@@ -947,6 +986,10 @@ func (r *RedisServer) rpoplpush(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) lpos(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
@@ -954,6 +997,10 @@ func (r *RedisServer) lpos(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) lset(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
@@ -970,11 +1017,16 @@ func (r *RedisServer) collectionCardinal(
 	resolveMeta func(context.Context, []byte, uint64) (int64, bool, error),
 	legacyCmd string,
 ) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
 	readTS := r.readTS()
-	typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
+	typ, err := r.keyTypeAt(r.handlerContext(conn),
+		cmd.Args[1], readTS)
 	if err != nil {
 		writeRedisError(conn, err)
 		return
@@ -987,7 +1039,8 @@ func (r *RedisServer) collectionCardinal(
 		conn.WriteError(wrongTypeMessage)
 		return
 	}
-	count, exists, err := resolveMeta(context.Background(), cmd.Args[1], readTS)
+	count, exists, err := resolveMeta(r.handlerContext(conn),
+		cmd.Args[1], readTS)
 	if err != nil {
 		writeRedisError(conn, err)
 		return
@@ -1001,14 +1054,26 @@ func (r *RedisServer) collectionCardinal(
 }
 
 func (r *RedisServer) scard(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	r.collectionCardinal(conn, cmd, redisTypeSet, r.resolveSetMeta, cmdSCard)
 }
 
 func (r *RedisServer) zcard(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	r.collectionCardinal(conn, cmd, redisTypeZSet, r.resolveZSetMeta, cmdZCard)
 }
 
 func (r *RedisServer) zcount(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
@@ -1016,6 +1081,10 @@ func (r *RedisServer) zcount(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) zrangebyscore(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
@@ -1023,6 +1092,10 @@ func (r *RedisServer) zrangebyscore(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) zrevrange(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
@@ -1030,6 +1103,10 @@ func (r *RedisServer) zrevrange(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) zrevrangebyscore(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
@@ -1037,6 +1114,10 @@ func (r *RedisServer) zrevrangebyscore(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) zscore(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
@@ -1044,6 +1125,10 @@ func (r *RedisServer) zscore(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) zpopmin(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
@@ -1051,6 +1136,10 @@ func (r *RedisServer) zpopmin(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) zremrangebyscore(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}

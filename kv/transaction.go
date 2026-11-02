@@ -271,6 +271,9 @@ func (t *TransactionManager) applySequentialRequests(ctx context.Context, reqs [
 }
 
 func (t *TransactionManager) commitRaw(ctx context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
+	if requiresOwnedProposalContext(t.proposer) {
+		return t.commitRawOwned(ctx, reqs)
+	}
 	item := &rawCommitItem{
 		reqs: reqs,
 		done: make(chan rawCommitResult, 1),
@@ -316,6 +319,25 @@ func (t *TransactionManager) commitRaw(ctx context.Context, reqs []*pb.Request) 
 	case <-ctx.Done():
 		return nil, errors.WithStack(ctx.Err())
 	}
+}
+
+// A future cross-request batch needs a composite of ALL original owned handles
+// and one atomic terminal check. Until then, retain this request's entire raw
+// command in one entry without detaching it from its receiver's context.
+func (t *TransactionManager) commitRawOwned(ctx context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
+	select {
+	case <-t.closeCh:
+		return nil, errShuttingDown
+	default:
+	}
+	index, results, err := applyRequests(ctx, t.proposer, reqs, t.proposalObserver, t.migrationAdmission.Load())
+	if err != nil {
+		return nil, err
+	}
+	if err := combineApplyErrors(results); err != nil {
+		return nil, err
+	}
+	return &TransactionResponse{CommitIndex: index}, nil
 }
 
 func (t *TransactionManager) flushRawPending() {

@@ -32,9 +32,11 @@ const maxTSOCommitFloorConcurrency = 16
 
 // ShardStore routes MVCC reads to shard-specific stores and proxies to leaders when needed.
 type ShardStore struct {
-	engine            *distribution.Engine
-	groups            map[uint64]*ShardGroup
-	partitionResolver PartitionResolver
+	operationAdmission OperationAdmission
+	startupControlRPC  StartupControlRPC
+	engine             *distribution.Engine
+	groups             map[uint64]*ShardGroup
+	partitionResolver  PartitionResolver
 	// readWatermarkAdvance enables ensureReadWatermark. It is opt-in until
 	// every replica understands the advance entry (rolling upgrades).
 	readWatermarkAdvance bool
@@ -84,6 +86,11 @@ func (s *ShardStore) JournalSingleGroupAtVersion(observed uint64) bool {
 	}
 	route := snapshot.Routes[0]
 	return len(route.Start) == 0 && len(route.End) == 0 && route.GroupID != 0 && route.State == distribution.RouteStateActive
+}
+
+// SetOperationAdmission must be called before starting receiver operations.
+func (s *ShardStore) SetOperationAdmission(hook OperationAdmission) {
+	s.operationAdmission = hook
 }
 
 // WithPartitionResolver installs the same partition-keyspace resolver used by
@@ -6455,14 +6462,9 @@ func (s *ShardStore) authoritativeGroupLastCommitTS(ctx context.Context, groupID
 		return 0, errors.Wrapf(ErrTSOCommitFloorUnavailable,
 			"data group %d has no known leader", groupID)
 	}
-	conn, err := s.connCache.ConnFor(addr)
-	if err != nil {
-		return 0, errors.Wrapf(ErrTSOCommitFloorUnavailable,
-			"dial data group %d leader %s: %v", groupID, addr, err)
-	}
 	requestCtx, cancel := context.WithTimeout(nonNilTSOContext(ctx), proxyForwardTimeout)
 	defer cancel()
-	resp, err := pb.NewRawKVClient(conn).RawLatestCommitTS(requestCtx, &pb.RawLatestCommitTSRequest{GroupId: groupID})
+	resp, err := s.remoteStartupGroupFloor(requestCtx, groupID, addr)
 	if err != nil {
 		return 0, errors.Wrapf(ErrTSOCommitFloorUnavailable,
 			"read data group %d leader %s watermark: %v", groupID, addr, err)
@@ -6577,11 +6579,14 @@ func (s *ShardStore) WriteConflictCountsByPrefix() map[string]uint64 {
 }
 
 func (s *ShardStore) Compact(ctx context.Context, minTS uint64) error {
-	for _, g := range s.groups {
+	for gid, g := range s.groups {
 		if g == nil || g.Store == nil {
 			continue
 		}
-		if err := g.Store.Compact(ctx, minTS); err != nil {
+		_, err := admittedOperation(ctx, s.operationAdmission, gid, AdmissionMaintenance, func(owned context.Context) (struct{}, error) {
+			return struct{}{}, g.Store.Compact(owned, minTS)
+		})
+		if err != nil {
 			return errors.WithStack(err)
 		}
 	}

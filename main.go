@@ -331,6 +331,12 @@ const (
 const bytesPerMiB = 1024 * 1024
 
 func main() {
+	if handled, err := dispatchBootstrapOperator(os.Args[1:], os.Stdout); handled {
+		if err != nil {
+			log.Fatalf("%v", err)
+		}
+		return
+	}
 	flag.Parse()
 	keyVizFlags.RecordExplicit(flag.CommandLine)
 
@@ -450,9 +456,9 @@ func enabledEnv(name string) bool {
 	return enabled
 }
 
-func startLockResolverIfEnabled(shardStore *kv.ShardStore, shardGroups map[uint64]*kv.ShardGroup, cleanup *internalutil.CleanupStack) {
+func startLockResolverIfEnabled(shardStore *kv.ShardStore, shardGroups map[uint64]*kv.ShardGroup, cleanup *internalutil.CleanupStack, opts ...kv.LockResolverOption) {
 	if enabledEnv(lockResolverEnabledEnvVar) {
-		lockResolver := kv.NewLockResolver(shardStore, shardGroups, nil)
+		lockResolver := kv.NewLockResolver(shardStore, shardGroups, nil, opts...)
 		cleanup.Add(func() { lockResolver.Close() })
 		return
 	}
@@ -461,9 +467,14 @@ func startLockResolverIfEnabled(shardStore *kv.ShardStore, shardGroups map[uint6
 
 func startFSMCompactorIfEnabled(ctx context.Context, eg *errgroup.Group, runtimes []*raftGroupRuntime, readTracker *kv.ActiveTimestampTracker) {
 	if enabledEnv(fsmCompactorEnabledEnvVar) {
+		var admission kv.OperationAdmission
+		if domain := bootstrapDomainForRuntimes(runtimes); domain != nil {
+			admission = domain.operationAdmission
+		}
 		compactor := kv.NewFSMCompactor(
 			fsmCompactionRuntimes(runtimes),
 			kv.WithFSMCompactorActiveTimestampTracker(readTracker),
+			kv.WithFSMCompactorOperationAdmission(admission),
 		)
 		eg.Go(func() error {
 			return compactor.Run(ctx)
@@ -486,10 +497,7 @@ func newRedisDeltaCompactorIfEnabled(shardStore *kv.ShardStore, coordinate kv.Co
 }
 
 func run() error {
-	if err := configureNodeGRPCTransport(); err != nil {
-		return err
-	}
-	cfg, engineType, bootstrapCfg, bootstrap, err := resolveValidatedRuntimeInputs()
+	cfg, engineType, bootstrapCfg, bootstrap, err := resolveNetworkRuntimeInputs()
 	if err != nil {
 		return err
 	}
@@ -619,8 +627,13 @@ func run() error {
 			rt.Close()
 		}
 	})
+	bootstrapDomain, resolverOptions := configureBootstrapOperations(ctx, runtimes, shardStore, &cleanup)
+	bootstrapNetwork, err := configureBootstrapNetwork(ctx, runtimes, shardStore, shardGroups, &cleanup)
+	if err != nil {
+		return err
+	}
 	cleanup.Add(cancel)
-	startLockResolverIfEnabled(shardStore, shardGroups, &cleanup)
+	startLockResolverIfEnabled(shardStore, shardGroups, &cleanup, resolverOptions...)
 	sampler := serverwiring.BuildSampler(keyVizFlags, autoSplitFlags)
 	sqsPartitionResolver := buildSQSPartitionResolver(cfg.sqsFifoPartitionMap)
 	shardStore.WithPartitionResolver(sqsPartitionResolver)
@@ -630,11 +643,13 @@ func run() error {
 		WithKeyVizLabelsEnabled(*keyVizFlags.LabelsEnabled).
 		WithAllShardGroups(dataGroupIDs(cfg.groups)...).
 		WithPartitionResolver(sqsPartitionResolver)
+	installBootstrapCoordinator(bootstrapDomain, coordinate, &cleanup)
 	tsoWiring, err := configureCoordinatorTSOWithObserver(
 		coordinate,
 		shardGroups,
 		shardStore,
 		metricsRegistry.TSOObserver(),
+		bootstrapNetwork,
 	)
 	if err != nil {
 		return err
@@ -663,7 +678,13 @@ func run() error {
 	// registry-read / behind-epoch failure fails the process
 	// synchronously here, BEFORE the gRPC servers serve, so writes never
 	// run with no registration gate installed.
-	distStartup, err := startDistributionStartup(distributionStartupInput{
+	encryptionStartup := bootstrapEncryptionStartupConfig{
+		runtimes: runtimes, groups: shardGroups, defaultGroup: cfg.defaultGroup,
+		network: bootstrapNetwork, wiring: encWiring, sidecarPath: *encryptionSidecarPath,
+		wrapper: kekUnwrapper, nodeID: etcdraftengine.DeriveNodeID(*raftId), requested: *encryptionRotateOnStartup,
+		eg: eg, cleanup: &cleanup,
+	}
+	distStartup, err := startDistributionWithBootstrapEncryption(distributionStartupInput{
 		ctx:             runCtx,
 		eg:              eg,
 		cancel:          cancel,
@@ -682,7 +703,7 @@ func run() error {
 		clock:           clock,
 		tsoWiring:       tsoWiring,
 		shardGroups:     shardGroups,
-	})
+	}, encryptionStartup)
 	if err != nil {
 		// Members already run on eg (TSO reloader, raft lifecycle
 		// watchers, the registration gate); drain them before the deferred
@@ -690,7 +711,7 @@ func run() error {
 		// the registration retry surfaces here as context.Canceled.
 		return waitErrgroupAfterStartupFailure(cancel, eg, err)
 	}
-	defaultRuntime := distStartup.defaultRuntime
+	runCtx = distStartup.registrationCtx
 	distServer := distStartup.distServer
 	distCatalog := distStartup.distCatalog
 	autoSplitRuntime := distStartup.autoSplitRuntime
@@ -703,19 +724,7 @@ func run() error {
 	encryptionConfChangeInterceptor := newEncryptionConfChangeInterceptor(
 		encWiring.encryptionConfigured(),
 		coordinate, shardGroups[cfg.defaultGroup], encWiring.cache, *encryptionSidecarPath, etcdraftengine.DeriveNodeID)
-	rotateOnStartupDeregister, waitRotateOnStartup := installEncryptionRotateOnStartup(
-		runCtx,
-		*encryptionRotateOnStartup,
-		defaultRuntime,
-		postCutoverProposerForRuntime(defaultRuntime, shardGroups),
-		*encryptionSidecarPath,
-		kekUnwrapper,
-		encWiring.raftEnvelope,
-		etcdraftengine.DeriveNodeID(*raftId),
-		encWiring.epoch,
-		encWiring.raftEpoch,
-		slog.Default(),
-	)
+	rotateOnStartupDeregister, waitRotateOnStartup := installBootstrapStartupRotation(distStartup.rotationSupervisor, runCtx, encryptionStartup)
 	cleanup.Add(rotateOnStartupDeregister)
 	if err := startServersAfterStartupRotation(waitRotateOnStartup, serversInput{
 		ctx: runCtx, eg: eg, cancel: cancel, lc: &lc,
@@ -846,8 +855,10 @@ type distributionStartupInput struct {
 }
 
 type distributionStartup struct {
-	defaultRuntime *raftGroupRuntime
-	distServer     *adapter.DistributionServer
+	defaultRuntime     *raftGroupRuntime
+	distServer         *adapter.DistributionServer
+	registrationCtx    context.Context
+	rotationSupervisor *bootstrapRotationRuntime
 	// distCatalog is the durable route catalog the admin backup store reads
 	// to capture a route snapshot at a pinned timestamp. It is built here, so
 	// it has to travel back out rather than be rebuilt at the call site.
@@ -877,7 +888,7 @@ func startDistributionStartup(in distributionStartupInput) (distributionStartup,
 	// every dispatched mutation.
 	serverwiring.SeedRoutes(in.sampler, in.cfg.engine)
 
-	catalogWatchConns := &kv.GRPCConnCache{}
+	catalogWatchConns := newBootstrapRuntimeConnCache(in.runtimes)
 	in.cleanup.Add(func() { _ = catalogWatchConns.Close() })
 	in.eg.Go(func() error {
 		return runDistributionCatalogStream(in.ctx, catalogRuntime, catalogWatchConns, in.cfg.engine)
@@ -885,7 +896,7 @@ func startDistributionStartup(in distributionStartupInput) (distributionStartup,
 	serverwiring.StartFlusher(in.ctx, in.eg, in.sampler)
 	startKeyVizLeaderTermPublisher(in.ctx, in.eg, in.sampler, in.runtimes)
 	startMemoryWatchdog(in.ctx, in.eg, in.cancel)
-	splitMigrationConnCache := &kv.GRPCConnCache{}
+	splitMigrationConnCache := newBootstrapRuntimeConnCache(in.runtimes)
 	in.cleanup.Add(func() { _ = splitMigrationConnCache.Close() })
 	distServer := adapter.NewDistributionServer(
 		in.cfg.engine,
@@ -903,7 +914,7 @@ func startDistributionStartup(in distributionStartupInput) (distributionStartup,
 		adapter.WithSplitMigrationCapabilityGate(newSplitMigrationCapabilityGate(
 			splitMigrationCapabilityPeerSourceForRuntimes(in.runtimes),
 			splitMigrationCapabilityProbeTimeout,
-			nil,
+			bootstrapSplitMigrationProbe(in.runtimes),
 			splitMigrationLocalReadinessGate,
 		)),
 		adapter.WithSplitPromotionClientFactory(splitPromotionClientFactory(
@@ -1647,10 +1658,14 @@ func newSplitMigrationCapabilityGate(
 }
 
 func probeSplitMigrationCapabilityPeer(ctx context.Context, address string) error {
+	return probeSplitMigrationCapabilityPeerWithDial(ctx, address)
+}
+
+func probeSplitMigrationCapabilityPeerWithDial(ctx context.Context, address string, providers ...kv.GRPCDialOptionsForAddress) error {
 	if strings.TrimSpace(address) == "" {
 		return errors.New("empty split migration capability peer address")
 	}
-	conn, err := grpc.NewClient(address, internalutil.GRPCDialOptions()...)
+	conn, err := newBootstrapOrdinaryClient(address, providers...)
 	if err != nil {
 		return errors.Wrapf(err, "dial split migration capability peer %s", address)
 	}
@@ -2138,6 +2153,10 @@ func buildShardGroups(
 	// breaking the shared-cache invariant 6D-6c-1 relies on.
 	encWiring = encWiring.withDefaultedCache()
 	multi = effectiveMultiDataDirs(groups, multi)
+	bootstrapSpecs, bootstrapDomain, err := loadProtectedBootstrapDomain(raftID, raftDir, groups, multi, encWiring)
+	if err != nil {
+		return nil, nil, err
+	}
 	builder := shardGroupBuilder{
 		raftID:                   raftID,
 		raftDir:                  raftDir,
@@ -2154,6 +2173,7 @@ func buildShardGroups(
 		encWiring:                encWiring,
 		routeEngine:              routeEngine,
 		applyObservers:           applyObservers,
+		bootstrapSpecs:           bootstrapSpecs,
 	}
 	runtimes := make([]*raftGroupRuntime, 0, len(groups))
 	shardGroups := make(map[uint64]*kv.ShardGroup, len(groups))
@@ -2161,11 +2181,21 @@ func buildShardGroups(
 		runtime, sg, err := builder.build(g)
 		if err != nil {
 			closeRaftGroupRuntimes(runtimes)
+			if bootstrapDomain != nil {
+				bootstrapDomain.admission.Close()
+			}
 			return nil, nil, err
 		}
 		runtimes = append(runtimes, runtime)
 		shardGroups[g.id] = sg
 		encWiring.attachRaftEnvelopeGroup(g.id, sg)
+		if bootstrapDomain != nil {
+			if err := bootstrapDomain.attachEncryptionGroup(g.id, sg); err != nil {
+				closeRaftGroupRuntimes(runtimes)
+				bootstrapDomain.admission.Close()
+				return nil, nil, err
+			}
+		}
 	}
 	return runtimes, shardGroups, nil
 }
@@ -2186,12 +2216,21 @@ type shardGroupBuilder struct {
 	encWiring                encryptionWriteWiring
 	routeEngine              *distribution.Engine
 	applyObservers           []kv.ApplyObserver
+	bootstrapSpecs           map[uint64]*groupBootstrapSpec
 }
 
 func (b shardGroupBuilder) build(group groupSpec) (*raftGroupRuntime, *kv.ShardGroup, error) {
 	groupBootstrap, groupBootstrapServers, groupBootstrapSeed := bootstrapSettingsForGroup(b.bootstrapCfg, group.id, b.bootstrap)
 	observer := observerForGroup(b.proposalObserverForGroup, group.id)
 	if group.id == dedicatedTSORaftGroupID {
+		if spec := b.bootstrapSpecs[group.id]; spec != nil {
+			return buildProtectedDedicatedTSOGroup(b.raftID, group, b.raftDir, b.multi, groupBootstrap,
+				groupBootstrapServers, groupBootstrapSeed, b.factory, b.clock, observer,
+				spec, spec.domain, bootstrapPublicGRPCMethods(), b.encWiring.pebbleOptions()...)
+		}
+		if *raftBootstrapPeerConfigDir != "" {
+			return nil, nil, errors.New("protected timestamp group missing bootstrap domain configuration")
+		}
 		runtime, sg, err := buildDedicatedTSOGroup(
 			b.raftID, group, b.raftDir, b.multi, groupBootstrap,
 			groupBootstrapServers, groupBootstrapSeed,
@@ -2210,12 +2249,21 @@ func (b shardGroupBuilder) buildDataGroup(
 	proposalObserver kv.ProposalObserver,
 ) (*raftGroupRuntime, *kv.ShardGroup, error) {
 	dir := groupDataDir(b.raftDir, b.raftID, group.id, b.multi)
+	bootstrapSpec, err := b.bootstrapSpecForGroup(group.id)
+	if err != nil {
+		return nil, nil, err
+	}
 	if err := os.MkdirAll(dir, dirPerm); err != nil {
 		return nil, nil, errors.Wrapf(err, "failed to create fsm store dir for group %d", group.id)
 	}
 	st, err := store.NewPebbleStore(filepath.Join(dir, "fsm.db"), b.encWiring.pebbleOptions()...)
 	if err != nil {
 		return nil, nil, errors.Wrapf(err, "failed to open pebble fsm store for group %d", group.id)
+	}
+	factory, err := bootstrapFactoryForGroup(b.factory, bootstrapSpec, st)
+	if err != nil {
+		_ = st.Close()
+		return nil, nil, err
 	}
 	reg, err := store.WriterRegistryFor(st)
 	if err != nil {
@@ -2228,12 +2276,11 @@ func (b shardGroupBuilder) buildDataGroup(
 		_ = st.Close()
 		return nil, nil, errors.Wrapf(err, "failed to construct encryption applier for group %d", group.id)
 	}
-	sm := kv.NewKvFSMWithHLCAndTracker(st, b.clock, b.readTracker,
-		fsmOptionsForGroup(applier, b.routeEngine, group.id, b.encWiring, b.applyObservers...)...)
+	sm := b.newDataGroupFSM(st, applier, group.id, bootstrapSpec)
 	runtime, err := buildRuntimeForGroup(
 		b.raftID, group, b.raftDir, b.multi, bootstrap,
 		bootstrapServers, bootstrapSeed,
-		st, sm, b.factory, *raftJoinAsLearner,
+		st, sm, factory, *raftJoinAsLearner,
 	)
 	if err != nil {
 		_ = st.Close()
@@ -2242,8 +2289,20 @@ func (b shardGroupBuilder) buildDataGroup(
 	// Every group goes through the wrap-aware proposer so HLC renewals and
 	// transactional proposals observe raft-envelope cutovers uniformly.
 	sg := &kv.ShardGroup{Engine: runtime.engine, Store: st}
+	if bootstrapSpec != nil {
+		runtime.bootstrapDomain = bootstrapSpec.domain
+		runtime.bootstrapPeerConfig = bootstrapSpec.config
+	}
 	sg.Txn = kv.NewLeaderProxyForShardGroup(sg, kv.WithProposalObserver(proposalObserver))
 	return runtime, sg, nil
+}
+
+func (b shardGroupBuilder) newDataGroupFSM(st store.MVCCStore, applier *encryption.Applier, groupID uint64, bootstrapSpec *groupBootstrapSpec) raftengine.StateMachine {
+	opts := fsmOptionsForGroup(applier, b.routeEngine, groupID, b.encWiring, b.applyObservers...)
+	if bootstrapSpec != nil {
+		opts = append(opts, kv.WithRaftBootstrapIdentity(bootstrapSpec.config.local.Cluster, groupID))
+	}
+	return kv.NewKvFSMWithHLCAndTracker(st, b.clock, b.readTracker, opts...)
 }
 
 func closeRaftGroupRuntimes(runtimes []*raftGroupRuntime) {
@@ -2796,7 +2855,7 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 	//
 	// connCache is also used by the gRPC Admin GetNodeVersion probe, so create
 	// it when either admin HTTP or gRPC Admin is enabled.
-	connCache := prepareAdminConnCache(in.ctx, in.eg, *adminEnabled || adminGRPCEnabled)
+	connCache := prepareAdminConnCache(in.ctx, in.eg, *adminEnabled || adminGRPCEnabled, in.runtimes...)
 	adminServer, adminGRPCOpts, err := setupAdminService(
 		*raftId, *myAddr, in.runtimes, in.shardGroups, in.bootstrapServers,
 		in.shardStore, in.distCatalog, in.coordinate, in.readTracker, in.keyvizSampler, connCache,
@@ -2806,7 +2865,9 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 		return err
 	}
 	roleStore := startupRoleStoreFromFlags(*adminEnabled)
-	publicKVGate := &startupPublicKVGate{}
+	publicKVGate := &startupPublicKVGate{blockRuntime: func() bool { return protectedRuntimesBlocked(in.runtimes) }}
+	publicKVGate.domain = bootstrapDomainForRuntimes(in.runtimes)
+	startBootstrapReadinessReconciler(in.ctx, in.eg, in.runtimes, in.distCatalog, in.cfg.engine)
 	if in.distServer != nil {
 		in.distServer.SetReadGate(publicKVGate.blocked)
 	}
@@ -2870,6 +2931,7 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 	if err := runner.startRaftTransport(); err != nil {
 		return err
 	}
+	startBootstrapActivationWorkers(in.ctx, in.eg, in.runtimes, in.shardGroups)
 	if err := preparePublicServicesAfterRaftJoinReady(
 		in.ctx,
 		in.runtimes,
@@ -3082,6 +3144,7 @@ func configureCoordinatorTSOWithObserver(
 	shardGroups map[uint64]*kv.ShardGroup,
 	floorProvider kv.TSOCutoverFloorProvider,
 	observer kv.TSOObserver,
+	networks ...*bootstrapNetwork,
 ) (coordinatorTSOWiring, error) {
 	var wiring coordinatorTSOWiring
 	if coordinate == nil {
@@ -3103,7 +3166,7 @@ func configureCoordinatorTSOWithObserver(
 	if tsoGroup != nil && tsoGroup.TSOState != nil && observer != nil {
 		tsoGroup.TSOState.SetDurableStateObserver(observer)
 	}
-	return configureDedicatedCoordinatorTSO(coordinate, tsoGroup, floorProvider, mode, observer)
+	return configureDedicatedCoordinatorTSO(coordinate, tsoGroup, floorProvider, mode, observer, networks...)
 }
 
 func configuredTSOMode() (kv.TSOMode, error) {
@@ -3190,6 +3253,7 @@ func configureDedicatedCoordinatorTSO(
 	floorProvider kv.TSOCutoverFloorProvider,
 	mode kv.TSOMode,
 	observer kv.TSOObserver,
+	networks ...*bootstrapNetwork,
 ) (coordinatorTSOWiring, error) {
 	var wiring coordinatorTSOWiring
 	opts := []kv.RaftTSOAllocatorOption{kv.WithTSOCutoverFloorProvider(floorProvider)}
@@ -3230,6 +3294,7 @@ func configureDedicatedCoordinatorTSO(
 	}
 
 	routedOpts := dedicatedTSORoutingOptions(coordinate.Clock(), observer)
+	routedOpts = append(routedOpts, bootstrapTSORoutingOptions(networks)...)
 	routed, err := kv.NewLeaderRoutedTSOAllocator(local, tsoGroup.Engine, routedOpts...)
 	if err != nil {
 		return wiring, errors.Wrap(err, "configure tso leader routing")
@@ -3506,8 +3571,10 @@ func (c startupGatedCoordinator) NextAfter(ctx context.Context, min uint64) (uin
 }
 
 type startupPublicKVGate struct {
+	domain       *bootstrapDomain
 	ready        atomic.Bool
 	blockMutator func() bool
+	blockRuntime func() bool
 }
 
 func (g *startupPublicKVGate) markReady() {
@@ -3522,6 +3589,9 @@ func (g *startupPublicKVGate) unaryInterceptor(
 	info *grpc.UnaryServerInfo,
 	handler grpc.UnaryHandler,
 ) (interface{}, error) {
+	if g != nil && g.domain != nil && info != nil {
+		return g.protectedUnary(ctx, req, info, handler)
+	}
 	if g != nil && info != nil && startupRotationGatedMethod(info.FullMethod) && g.blocked() {
 		// Return a raw gRPC status so clients and retry policy see Unavailable.
 		//nolint:wrapcheck
@@ -3536,6 +3606,9 @@ func (g *startupPublicKVGate) streamInterceptor(
 	info *grpc.StreamServerInfo,
 	handler grpc.StreamHandler,
 ) error {
+	if g != nil && g.domain != nil && info != nil {
+		return g.protectedStream(srv, stream, info, handler)
+	}
 	if g != nil && info != nil && startupRotationGatedMethod(info.FullMethod) && g.blocked() {
 		// Return a raw gRPC status so clients and retry policy see Unavailable.
 		//nolint:wrapcheck
@@ -3549,6 +3622,9 @@ func (g *startupPublicKVGate) blocked() bool {
 		return false
 	}
 	if !g.ready.Load() {
+		return true
+	}
+	if g.blockRuntime != nil && g.blockRuntime() {
 		return true
 	}
 	return g.blockMutator != nil && g.blockMutator()
@@ -4245,12 +4321,14 @@ func startRaftServers(
 		adapter.WithEncryptionAdminCutoverBarrier(encWiring.raftEnvelope.barrier()),
 	)
 	for _, rt := range runtimes {
-		gs := grpc.NewServer(raftGRPCServerOptions(adminGRPCOpts)...)
+		serverOptions := append(slices.Clone(rt.transportServerOptions), raftGRPCServerOptions(adminGRPCOpts)...)
+		gs := grpc.NewServer(serverOptions...)
 		trx := newInternalMigrationTransaction(proposerForGroup(rt, shardGroups), observerForGroup(proposalObserverForGroup, rt.spec.id), rt.store, rt.spec.id)
 		grpcSvc := adapter.NewGRPCServer(shardStore, coordinate)
 		pb.RegisterRawKVServer(gs, grpcSvc)
 		pb.RegisterTransactionalKVServer(gs, grpcSvc)
 		internalOpts := internalServerOptions(coordinate, adminServer, proposerForGroup(rt, shardGroups), shardGroups[rt.spec.id], rt.spec.id)
+		internalOpts = append(internalOpts, bootstrapInternalPolicyOptions(rt, proposerForGroup(rt, shardGroups))...)
 		internalOpts = append(internalOpts, dedicatedTimestampCutoverOptions(shardGroups)...)
 		internalOpts = append(internalOpts, adapter.WithInternalMigrationOwnershipReady(func() bool {
 			return migrationOwnershipRuntimeReady(trx, shardStore, distServer, rt.spec.id, rt.snapshotEngine())
@@ -4409,6 +4487,7 @@ func prepareRedisServer(ctx context.Context, lc *net.ListenConfig, redisAddr str
 	}
 	deltaCompactor := newRedisDeltaCompactorIfEnabled(shardStore, coordinate, metricsRegistry)
 	redisOpts := []adapter.RedisServerOption{
+		adapter.WithRedisRequestAdmission(bootstrapRequestAdmissionForCoordinator(coordinate)),
 		adapter.WithRedisActiveTimestampTracker(readTracker),
 		adapter.WithRedisRequestObserver(metricsRegistry.RedisObserver()),
 		adapter.WithLuaObserver(metricsRegistry.LuaObserver()),
@@ -4420,6 +4499,13 @@ func prepareRedisServer(ctx context.Context, lc *net.ListenConfig, redisAddr str
 		redisOpts = append(redisOpts, adapter.WithRedisCompactor(deltaCompactor))
 	}
 	redisServer := adapter.NewRedisServer(redisL, redisAddr, shardStore, coordinate, leaderRedis, relay, redisOpts...)
+	if dialOptions := shardStore.InternalGRPCDialOptions(); dialOptions != nil {
+		if err := redisServer.SetInternalGRPCDialOptions(dialOptions); err != nil {
+			redisServer.Stop()
+			_ = redisL.Close()
+			return nil, nil, nil, errors.WithStack(err)
+		}
+	}
 	// Wire the bounded Lua VM pool into Prometheus. The metrics
 	// (hits/misses/drops/idle/max_idle) are read at scrape time via
 	// CounterFunc / GaugeFunc, so the EVAL hot path stays
@@ -4467,6 +4553,7 @@ func newDynamoDBServer(shardStore *kv.ShardStore, coordinate kv.Coordinator, lea
 		adapter.WithDynamoDBActiveTimestampTracker(readTracker),
 		adapter.WithDynamoDBRequestObserver(metricsRegistry.DynamoDBObserver()),
 		adapter.WithDynamoDBLeaderMap(leaderDynamo),
+		adapter.WithDynamoDBRequestAdmission(bootstrapRequestAdmissionForCoordinator(coordinate)),
 	)
 }
 
@@ -4590,6 +4677,9 @@ func setupDistributionCatalog(
 	distCatalog := distributionCatalogStoreForGroup(runtimes, catalogGroupID)
 	if distCatalog == nil {
 		return nil, errors.WithStack(errors.Newf("distribution catalog store is not available for group %d", catalogGroupID))
+	}
+	if handled, err := loadProtectedStartupCatalog(ctx, runtimes, catalogGroupID, distCatalog, engine); handled {
+		return distCatalog, err
 	}
 	// EnsureCatalogSnapshot may Save through the direct (non-raft) write
 	// path. When the §7.1 storage envelope is active and this load's
@@ -4839,7 +4929,15 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 	if err := r.prepareAdminForwardServers(); err != nil {
 		return r.startupFailure(err)
 	}
-	adminGRPCOpts := r.adminGRPCOpts
+	domain := bootstrapDomainForRuntimes(r.runtimes)
+	adminGRPCOpts := bootstrapServiceAuthOptions(r.adminGRPCOpts, domain)
+	if domain != nil {
+		adminGRPCOpts.unary = append([]grpc.UnaryServerInterceptor{bootstrapRegistrationReceiverInterceptor(r.defaultGroupID)}, adminGRPCOpts.unary...)
+	}
+	adminGRPCOpts, err := bootstrapRotationRPCOptions(adminGRPCOpts, domain, etcdraftengine.DeriveNodeID(*raftId), domain.rotationRPCHandler())
+	if err != nil {
+		return r.startupFailure(err)
+	}
 	if r.publicKVGate != nil {
 		adminGRPCOpts.unary = append(adminGRPCOpts.unary, r.publicKVGate.unaryInterceptor)
 		adminGRPCOpts.stream = append(adminGRPCOpts.stream, r.publicKVGate.streamInterceptor)
@@ -4888,11 +4986,11 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 	return nil
 }
 
-func prepareAdminConnCache(ctx context.Context, eg *errgroup.Group, enabled bool) *kv.GRPCConnCache {
+func prepareAdminConnCache(ctx context.Context, eg *errgroup.Group, enabled bool, runtimes ...*raftGroupRuntime) *kv.GRPCConnCache {
 	if !enabled {
 		return nil
 	}
-	connCache := &kv.GRPCConnCache{}
+	connCache := newBootstrapRuntimeConnCache(runtimes)
 	eg.Go(func() error {
 		<-ctx.Done()
 		if err := connCache.Close(); err != nil {
@@ -4952,7 +5050,7 @@ func (r *runtimeServerRunner) newS3BlobCluster() (adapter.S3BlobCluster, error) 
 		}
 		peerToken = loaded
 	}
-	return adapter.NewGRPCS3BlobCluster(*raftId, members, adminToken, peerToken), nil
+	return adapter.NewGRPCS3BlobCluster(*raftId, members, adminToken, peerToken, bootstrapRuntimeDialOptions(r.runtimes)), nil
 }
 
 func (r *runtimeServerRunner) preparePublicServices() error {

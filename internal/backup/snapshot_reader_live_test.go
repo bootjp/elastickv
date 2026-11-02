@@ -133,6 +133,9 @@ func TestIsPebbleOperationalKey_MatchesStore(t *testing.T) {
 		want bool
 	}{
 		{name: "last commit ts", key: []byte("_meta_last_commit_ts"), want: true},
+		{name: "protected policy", key: []byte(store.RaftControlMetadataPrefix + "P"), want: true},
+		{name: "protected receipt", key: []byte(store.RaftControlMetadataPrefix + "R\x00\xff"), want: true},
+		{name: "control near miss", key: []byte("!txn|meta|raft-controL|P"), want: false},
 		{name: "min retained ts", key: []byte("_meta_min_retained_ts"), want: true},
 		{name: "pending min retained ts", key: []byte("_meta_pending_min_retained_ts"), want: true},
 		{name: "applied index", key: []byte("_meta_applied_index"), want: true},
@@ -168,6 +171,45 @@ func TestIsPebbleOperationalKey_MatchesStore(t *testing.T) {
 			}
 			if live := store.IsPebbleOperationalKey(tc.key); live != tc.want {
 				t.Fatalf("store.IsPebbleOperationalKey(%q) = %v, want %v: the mirror in snapshot_reader.go is stale", tc.key, live, tc.want)
+			}
+		})
+	}
+}
+
+func TestReadSnapshotRefusesToDropProtectedControlMetadata(t *testing.T) {
+	for _, sst := range []bool{false, true} {
+		t.Run(map[bool]string{false: "native", true: "sst"}[sst], func(t *testing.T) {
+			st, err := store.NewPebbleStore(t.TempDir(), store.WithSSTIngestSnapshots(sst))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = st.Close() })
+			api, ok := st.(store.RaftControlMetadataStore)
+			if !ok {
+				t.Fatal("store lacks control metadata API")
+			}
+			applier, ok := st.(store.RaftEntryApplier)
+			if !ok {
+				t.Fatal("store lacks indexed entry API")
+			}
+			err = applier.ApplyRaftEntry(t.Context(), 7, func(ctx context.Context) error {
+				return api.StageRaftControlMetadata(ctx, []byte("P"), []byte("protected-policy"))
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			snapshot, err := st.Snapshot()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer snapshot.Close()
+			var payload bytes.Buffer
+			if _, err := snapshot.WriteTo(&payload); err != nil {
+				t.Fatal(err)
+			}
+			_, _, err = ReadSnapshotFile(&payload, func(SnapshotHeader, SnapshotEntry) error { return nil })
+			if !errors.Is(err, ErrSnapshotProtectedControlMetadata) {
+				t.Fatalf("logical decoder silently discarded control rows: %v", err)
 			}
 		})
 	}

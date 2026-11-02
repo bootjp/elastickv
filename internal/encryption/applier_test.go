@@ -949,7 +949,7 @@ func TestApplyRotateDEK_LocalEpoch_AppliedPerApply(t *testing.T) {
 			SubTag:               fsmwire.RotateSubRotateDEK,
 			DEKID:                dek,
 			Purpose:              fsmwire.PurposeStorage,
-			Wrapped:              []byte("storage-vN-wrapped"),
+			Wrapped:              []byte("storage-v" + strconv.FormatUint(uint64(dek), 10) + "-wrapped"),
 			ProposerRegistration: fsmwire.RegistrationPayload{DEKID: dek, FullNodeID: 0xBEEF, LocalEpoch: 0},
 		}); err != nil {
 			t.Fatalf("ApplyRotation dek=%d: %v", dek, err)

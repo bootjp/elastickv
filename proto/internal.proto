@@ -136,6 +136,10 @@ message ForwardFailureDetail {
 
 message ForwardAdminProposalRequest {
   bytes payload = 1;
+  // force_entry requires the leader to propose the typed watermark payload
+  // even when its timestamp is already covered, so the caller can receive an
+  // applied commit-index receipt. It is invalid for other payloads.
+  bool force_entry = 2;
 }
 
 message ForwardAdminProposalResponse {

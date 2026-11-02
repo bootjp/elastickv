@@ -206,6 +206,10 @@ func compareStreamIDs(lms, lseq, rms, rseq uint64) int {
 }
 
 func (r *RedisServer) xadd(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
@@ -215,7 +219,8 @@ func (r *RedisServer) xadd(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(conn),
+		redisDispatchTimeout)
 	defer cancel()
 	var id string
 	if r.onePhaseTxnDedup {
@@ -802,6 +807,10 @@ func parseXTrimMaxLen(args [][]byte) (int, error) {
 }
 
 func (r *RedisServer) xtrim(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
@@ -811,7 +820,8 @@ func (r *RedisServer) xtrim(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(conn),
+		redisDispatchTimeout)
 	defer cancel()
 	var removed int
 	if err := r.retryRedisWrite(ctx, func() error {
@@ -937,6 +947,10 @@ func (r *RedisServer) xtrimTxn(ctx context.Context, key []byte, maxLen int) (int
 }
 
 func (r *RedisServer) xrange(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
@@ -944,6 +958,10 @@ func (r *RedisServer) xrange(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) xrevrange(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
@@ -1319,7 +1337,8 @@ func isXReadIterCtxError(err error) bool {
 }
 
 func (r *RedisServer) xreadFinalTypeCheck(conn redcon.Conn, req xreadRequest) bool {
-	ctx, cancel := context.WithTimeout(r.handlerContext(), redisFinalTypeCheckTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(conn),
+		redisFinalTypeCheckTimeout)
 	defer cancel()
 	var err error
 	if ok := r.runWithHeavyCommandSlot(func() {
@@ -1359,6 +1378,10 @@ func (r *RedisServer) writeXReadFinalOrNull(conn redcon.Conn, req xreadRequest) 
 }
 
 func (r *RedisServer) xread(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	req, err := parseXReadRequest(cmd.Args)
 	if err != nil {
 		writeRedisError(conn, err)
@@ -1384,7 +1407,8 @@ func (r *RedisServer) xread(conn redcon.Conn, cmd redcon.Command) {
 	// in-flight resolve aborts promptly when the server is shutting
 	// down — otherwise the per-resolve ScanAt could survive past
 	// graceful-shutdown's drain window.
-	resolveCtx, resolveCancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
+	resolveCtx, resolveCancel := context.WithTimeout(r.handlerContext(conn),
+		redisDispatchTimeout)
 	if ok := r.runWithHeavyCommandSlot(func() {
 		err = r.resolveXReadAfterIDs(resolveCtx, &req)
 	}); !ok {
@@ -1406,7 +1430,8 @@ func (r *RedisServer) xread(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) xreadWithoutBlock(conn redcon.Conn, req xreadRequest) {
-	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(conn),
+		redisDispatchTimeout)
 	defer cancel()
 	var results []xreadResult
 	var err error
@@ -1436,7 +1461,8 @@ func (r *RedisServer) xreadWithoutBlock(conn redcon.Conn, req xreadRequest) {
 // between the check and the wait cannot be lost: the buffered channel
 // holds it, and the next select wakes immediately.
 func (r *RedisServer) xreadBusyPoll(conn redcon.Conn, req xreadRequest, deadline time.Time) {
-	handlerCtx := r.handlerContext()
+	handlerCtx := r.handlerContext(conn)
+
 	w, release := r.streamWaiters.Register(req.keys)
 	defer release()
 	for {
@@ -1511,11 +1537,16 @@ func (r *RedisServer) xreadBusyPoll(conn redcon.Conn, req xreadRequest, deadline
 }
 
 func (r *RedisServer) xlen(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
 	readTS := r.readTS()
-	typ, err := r.keyTypeAtExpect(context.Background(), cmd.Args[1], readTS, redisTypeStream)
+	typ, err := r.keyTypeAtExpect(r.handlerContext(conn),
+		cmd.Args[1], readTS, redisTypeStream)
 	if err != nil {
 		writeRedisError(conn, err)
 		return
@@ -1528,7 +1559,8 @@ func (r *RedisServer) xlen(conn redcon.Conn, cmd redcon.Command) {
 		conn.WriteError(wrongTypeMessage)
 		return
 	}
-	meta, found, err := r.loadStreamMetaAt(context.Background(), cmd.Args[1], readTS)
+	meta, found, err := r.loadStreamMetaAt(r.handlerContext(conn),
+		cmd.Args[1], readTS)
 	if err != nil {
 		writeRedisError(conn, err)
 		return
@@ -1537,7 +1569,8 @@ func (r *RedisServer) xlen(conn redcon.Conn, cmd redcon.Command) {
 		conn.WriteInt64(meta.Length)
 		return
 	}
-	stream, err := r.loadStreamAt(context.Background(), cmd.Args[1], readTS)
+	stream, err := r.loadStreamAt(r.handlerContext(conn),
+		cmd.Args[1], readTS)
 	if err != nil {
 		writeRedisError(conn, err)
 		return
@@ -1621,6 +1654,10 @@ func selectStreamRangeEntries(entries []redisStreamEntry, startRaw, endRaw strin
 }
 
 func (r *RedisServer) rangeStream(conn redcon.Conn, cmd redcon.Command, reverse bool) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	count, err := parseRangeStreamCount(cmd.Args)
 	if err != nil {
 		writeRedisError(conn, err)
@@ -1628,7 +1665,8 @@ func (r *RedisServer) rangeStream(conn redcon.Conn, cmd redcon.Command, reverse 
 	}
 
 	readTS := r.readTS()
-	typ, err := r.keyTypeAtExpect(context.Background(), cmd.Args[1], readTS, redisTypeStream)
+	typ, err := r.keyTypeAtExpect(r.handlerContext(conn),
+		cmd.Args[1], readTS, redisTypeStream)
 	if err != nil {
 		writeRedisError(conn, err)
 		return
@@ -1644,13 +1682,15 @@ func (r *RedisServer) rangeStream(conn redcon.Conn, cmd redcon.Command, reverse 
 
 	startRaw, endRaw := string(cmd.Args[2]), string(cmd.Args[3])
 
-	meta, metaFound, err := r.loadStreamMetaAt(context.Background(), cmd.Args[1], readTS)
+	meta, metaFound, err := r.loadStreamMetaAt(r.handlerContext(conn),
+		cmd.Args[1], readTS)
 	if err != nil {
 		writeRedisError(conn, err)
 		return
 	}
 	if metaFound {
-		selected, err := r.rangeStreamNewLayout(context.Background(), cmd.Args[1], readTS, meta, startRaw, endRaw, reverse, count)
+		selected, err := r.rangeStreamNewLayout(r.handlerContext(conn),
+			cmd.Args[1], readTS, meta, startRaw, endRaw, reverse, count)
 		if err != nil {
 			writeRedisError(conn, err)
 			return
@@ -1659,7 +1699,8 @@ func (r *RedisServer) rangeStream(conn redcon.Conn, cmd redcon.Command, reverse 
 		return
 	}
 
-	stream, err := r.loadStreamAt(context.Background(), cmd.Args[1], readTS)
+	stream, err := r.loadStreamAt(r.handlerContext(conn),
+		cmd.Args[1], readTS)
 	if err != nil {
 		writeRedisError(conn, err)
 		return

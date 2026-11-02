@@ -917,8 +917,12 @@ func (x *ForwardFailureDetail) GetDecision() ForwardDecisionClass {
 }
 
 type ForwardAdminProposalRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Payload       []byte                 `protobuf:"bytes,1,opt,name=payload,proto3" json:"payload,omitempty"`
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Payload []byte                 `protobuf:"bytes,1,opt,name=payload,proto3" json:"payload,omitempty"`
+	// force_entry requires the leader to propose the typed watermark payload
+	// even when its timestamp is already covered, so the caller can receive an
+	// applied commit-index receipt. It is invalid for other payloads.
+	ForceEntry    bool `protobuf:"varint,2,opt,name=force_entry,json=forceEntry,proto3" json:"force_entry,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -958,6 +962,13 @@ func (x *ForwardAdminProposalRequest) GetPayload() []byte {
 		return x.Payload
 	}
 	return nil
+}
+
+func (x *ForwardAdminProposalRequest) GetForceEntry() bool {
+	if x != nil {
+		return x.ForceEntry
+	}
+	return false
 }
 
 type ForwardAdminProposalResponse struct {
@@ -3087,9 +3098,11 @@ const file_internal_proto_rawDesc = "" +
 	"\x0eschema_version\x18\x01 \x01(\rR\rschemaVersion\x12*\n" +
 	"\x05phase\x18\x02 \x01(\x0e2\x14.ForwardFailurePhaseR\x05phase\x12-\n" +
 	"\x06reason\x18\x03 \x01(\x0e2\x15.ForwardFailureReasonR\x06reason\x121\n" +
-	"\bdecision\x18\x04 \x01(\x0e2\x15.ForwardDecisionClassR\bdecision\"7\n" +
+	"\bdecision\x18\x04 \x01(\x0e2\x15.ForwardDecisionClassR\bdecision\"X\n" +
 	"\x1bForwardAdminProposalRequest\x12\x18\n" +
-	"\apayload\x18\x01 \x01(\fR\apayload\"A\n" +
+	"\apayload\x18\x01 \x01(\fR\apayload\x12\x1f\n" +
+	"\vforce_entry\x18\x02 \x01(\bR\n" +
+	"forceEntry\"A\n" +
 	"\x1cForwardAdminProposalResponse\x12!\n" +
 	"\fcommit_index\x18\x01 \x01(\x04R\vcommitIndex\"\x19\n" +
 	"\x17ForwardLeaseReadRequest\"e\n" +

@@ -44,6 +44,8 @@ type forwardingAdminServer struct {
 
 	mu            sync.Mutex
 	payload       []byte
+	forceEntry    bool
+	emptyReceipt  bool
 	authorization []string
 }
 
@@ -53,10 +55,14 @@ func (s *forwardingAdminServer) ForwardAdminProposal(
 ) (*pb.ForwardAdminProposalResponse, error) {
 	s.mu.Lock()
 	s.payload = append([]byte(nil), req.GetPayload()...)
+	s.forceEntry = req.GetForceEntry()
 	if md, ok := metadata.FromIncomingContext(ctx); ok {
 		s.authorization = append([]string(nil), md.Get("authorization")...)
 	}
 	s.mu.Unlock()
+	if s.emptyReceipt {
+		return &pb.ForwardAdminProposalResponse{}, nil
+	}
 	return &pb.ForwardAdminProposalResponse{CommitIndex: 123}, nil
 }
 
@@ -95,6 +101,29 @@ func TestLeaderAdminProposerForwardsFollowerProposal(t *testing.T) {
 	require.Zero(t, local.adminCalls)
 	service.mu.Lock()
 	require.Equal(t, []byte("pin"), service.payload)
+	service.mu.Unlock()
+}
+
+func TestLeaderAdminProposerForwardsForceEntryFlag(t *testing.T) {
+	t.Parallel()
+	service := &forwardingAdminServer{}
+	addr := grpctest.Serve(t, func(server *grpc.Server) { pb.RegisterInternalServer(server, service) })
+	cache := &GRPCConnCache{}
+	t.Cleanup(func() { require.NoError(t, cache.Close()) })
+	proposer := NewLeaderAdminProposer(
+		adminProposalLeaderView(raftengine.StateFollower, addr),
+		&recordingAdminProposer{},
+		cache,
+		WithLeaderAdminForceWatermarkEntry(),
+	)
+	payload := EncodeWatermarkAdvance(42)
+
+	result, err := proposer.ProposeAdmin(context.Background(), payload)
+	require.NoError(t, err)
+	require.Equal(t, uint64(123), result.CommitIndex)
+	service.mu.Lock()
+	require.Equal(t, payload, service.payload)
+	require.True(t, service.forceEntry)
 	service.mu.Unlock()
 }
 

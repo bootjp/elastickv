@@ -56,6 +56,7 @@ func prepareSQSServer(
 		shardStore,
 		coordinate,
 		adapter.WithSQSLeaderMap(leaderSQS),
+		adapter.WithSQSRequestAdmission(bootstrapRequestAdmissionForCoordinator(coordinate)),
 		adapter.WithSQSRegion(region),
 		adapter.WithSQSStaticCredentials(staticCreds),
 		adapter.WithSQSPartitionResolver(partitionResolver),

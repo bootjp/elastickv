@@ -189,12 +189,19 @@ func (s *pebbleStore) readMigrationOwnership() ([]MigrationOwnershipState, error
 	return decodeMigrationOwnership(data)
 }
 
-func (s *mvccStore) MigrationServingState(_ context.Context) (MigrationServingState, error) {
+func (s *mvccStore) MigrationServingState(ctx context.Context) (MigrationServingState, error) {
+	if staged := s.memoryEntryStore(ctx); staged != nil {
+		return staged.MigrationServingState(ctx)
+	}
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
+	readiness := s.migrationReadinessCache
+	if len(s.readinessOverlay) != 0 {
+		readiness = mergedEntryReadiness(readiness, s.readinessOverlay)
+	}
 	return MigrationServingState{
 		Ownership:  cloneMigrationOwnership(s.migrationOwnership),
-		Readiness:  cloneReadinessStates(s.migrationReadinessCache),
+		Readiness:  cloneReadinessStates(readiness),
 		Partitions: clonePartitionState(s.migrationPartitions),
 	}, nil
 }
@@ -218,7 +225,11 @@ func (s *pebbleStore) MigrationServingState(ctx context.Context) (MigrationServi
 	}
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
-	return MigrationServingState{Ownership: states, Readiness: cloneReadinessStates(s.migrationReadinessCache), Partitions: partitions}, nil
+	readiness := s.migrationReadinessCache
+	if sc := s.raftEntryScopeFrom(ctx); sc != nil && len(sc.readiness) != 0 {
+		readiness = mergedEntryReadiness(readiness, sc.readiness)
+	}
+	return MigrationServingState{Ownership: states, Readiness: cloneReadinessStates(readiness), Partitions: partitions}, nil
 }
 
 func cloneReadinessStates(states []TargetStagedReadinessState) []TargetStagedReadinessState {
@@ -406,8 +417,13 @@ func ownershipAcquisitionVersionMatches(state MigrationOwnershipState, guard Tar
 	return len(state.Generation) >= 16 && len(state.DescriptorHash) == 32 && state.CatalogVersion > guard.ExpectedCutoverVersion
 }
 
-func (s *mvccStore) AcquireMigrationOwnership(_ context.Context, state MigrationOwnershipState, appliedIndex uint64) error {
+func (s *mvccStore) AcquireMigrationOwnership(ctx context.Context, state MigrationOwnershipState, appliedIndex uint64) error {
+	if err := s.rejectMemoryEntry(ctx); err != nil {
+		return err
+	}
+	s.applyMu.Lock()
 	s.mtx.Lock()
+	defer s.applyMu.Unlock()
 	defer s.mtx.Unlock()
 	state.AppliedIndex = appliedIndex
 	if state.SourceTrackerVersion != 0 {
@@ -478,8 +494,13 @@ func (s *pebbleStore) AcquireMigrationOwnership(ctx context.Context, state Migra
 	return s.persistMigrationOwnershipLocked(states, appliedIndex, partitions)
 }
 
-func (s *mvccStore) RefreshMigrationOwnership(_ context.Context, state MigrationOwnershipState, appliedIndex uint64) error {
+func (s *mvccStore) RefreshMigrationOwnership(ctx context.Context, state MigrationOwnershipState, appliedIndex uint64) error {
+	if err := s.rejectMemoryEntry(ctx); err != nil {
+		return err
+	}
+	s.applyMu.Lock()
 	s.mtx.Lock()
+	defer s.applyMu.Unlock()
 	defer s.mtx.Unlock()
 	state.AppliedIndex = appliedIndex
 	if state.Generation == "" || state.RouteID == 0 {
@@ -555,8 +576,13 @@ func (s *pebbleStore) persistMigrationOwnershipLocked(states []MigrationOwnershi
 	return nil
 }
 
-func (s *mvccStore) ClearMigrationStateWithOwnership(_ context.Context, state MigrationOwnershipState, appliedIndex uint64) error {
+func (s *mvccStore) ClearMigrationStateWithOwnership(ctx context.Context, state MigrationOwnershipState, appliedIndex uint64) error {
+	if err := s.rejectMemoryEntry(ctx); err != nil {
+		return err
+	}
+	s.applyMu.Lock()
 	s.mtx.Lock()
+	defer s.applyMu.Unlock()
 	defer s.mtx.Unlock()
 	state.AppliedIndex = appliedIndex
 	if partitionJobReplay(s.migrationPartitions, s.migrationOwnership, state, MigrationOwnershipClear) {

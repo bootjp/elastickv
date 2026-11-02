@@ -710,7 +710,8 @@ func TestSchedulerRunAndSyncOnceAreRaceFree(t *testing.T) {
 // burst O(group-count) stacks — and, on a staggered scan, one timer
 // each — every interval, before the upload semaphore ever applies.
 func TestSchedulerBoundsScanGoroutines(t *testing.T) {
-	t.Parallel()
+	// NumGoroutine is process-wide: keep other parallel tests paused so their
+	// workers cannot contaminate this scan's baseline and peak measurements.
 
 	root := t.TempDir()
 	store := newTestLocalStore(t, filepath.Join(root, "objects"))
