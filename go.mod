@@ -4,7 +4,7 @@ replace github.com/hanwen/go-fuse/v2 => ./third_party/go-fuse
 
 go 1.26.0
 
-toolchain go1.27.2
+toolchain go1.27.3
 
 require (
 	github.com/Jille/grpc-multi-resolver v1.3.0
