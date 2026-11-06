@@ -143,6 +143,7 @@ func TestCoordinate_ProposeHLCLease_NoLeaseProviderNoPanic(t *testing.T) {
 }
 
 func TestCoordinate_RunHLCLeaseRenewal_BlockerSuppressesProposals(t *testing.T) {
+	t.Parallel()
 	eng := &fakeLeaseEngine{applied: 11, leaseDur: time.Hour}
 	c := NewCoordinatorWithEngine(nil, eng)
 	var blocked atomic.Bool
@@ -172,6 +173,7 @@ func TestCoordinate_RunHLCLeaseRenewal_BlockerSuppressesProposals(t *testing.T) 
 }
 
 func TestCoordinate_RenewHLCLeaseAsync_OverlapsSlowProposal(t *testing.T) {
+	t.Parallel()
 	eng := &fakeLeaseEngine{applied: 11, leaseDur: time.Hour}
 	entered := make(chan struct{}, 2)
 	release := make(chan struct{})
@@ -571,6 +573,7 @@ func TestHLCLeaseRenewalCadencePreservesLogicalCapacity(t *testing.T) {
 }
 
 func TestShardedCoordinator_RenewHLCLeases_SkipsInFlightGroupWithoutBlockingPeers(t *testing.T) {
+	t.Parallel()
 	eng1 := newShardedLeaseEngine(100)
 	eng2 := newShardedLeaseEngine(200)
 	entered := make(chan struct{}, 2)

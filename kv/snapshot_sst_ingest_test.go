@@ -13,6 +13,7 @@ import (
 )
 
 func TestKVFSMSnapshotRoundTripsSSTIngestPayload(t *testing.T) {
+	t.Parallel()
 	srcStore, err := store3.NewPebbleStore(
 		filepath.Join(t.TempDir(), "src"),
 		store3.WithSSTIngestSnapshots(true),

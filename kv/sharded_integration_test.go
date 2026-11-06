@@ -69,6 +69,7 @@ func newSingleRaft(t *testing.T, id string, fsm FSM) (raftengine.Engine, func())
 }
 
 func TestShardedCoordinatorDispatch(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 
 	engine := distribution.NewEngine()
@@ -123,6 +124,7 @@ func TestShardedCoordinatorDispatch(t *testing.T) {
 }
 
 func TestShardedCoordinatorDispatch_CrossShardTxnSucceeds(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 
 	engine := distribution.NewEngine()
@@ -168,6 +170,7 @@ func TestShardedCoordinatorDispatch_CrossShardTxnSucceeds(t *testing.T) {
 }
 
 func TestShardedCoordinatorStrictCrossShardTxnConfirmsEveryEffect(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	router := distribution.NewEngine()
 	applyComposed1Snapshot(t, router, 7, []distribution.RouteDescriptor{

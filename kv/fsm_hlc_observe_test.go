@@ -24,6 +24,7 @@ import (
 //   - docs/design/2026_05_28_implemented_tla_safety_spec.md §5.1 HLC-4 (ii)
 //   - tla/hlc/HLC.tla BecomeLeader_HLC (strategy (c))
 func TestApplyObservesCommitTSIntoHLC(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	hlc := NewHLC()
 	fsm, ok := NewKvFSMWithHLC(st, hlc).(*kvFSM)
@@ -91,6 +92,7 @@ func TestApplyObservesCommitTSIntoHLC(t *testing.T) {
 // every previously committed timestamp — otherwise a subsequent election
 // could let this node issue an HLC strictly less than a prior commit.
 func TestNewKvFSMWithHLCObservesStoreLastCommitTS(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 
 	// Pre-populate the store with a write at commit_ts = 12345 — the
@@ -116,6 +118,7 @@ func TestNewKvFSMWithHLCObservesStoreLastCommitTS(t *testing.T) {
 // that bypasses Apply replay: after Restore succeeds, a node's fresh HLC must
 // still dominate the restored store's max commit timestamp before it can serve.
 func TestRestoreObservesStoreLastCommitTSIntoHLC(t *testing.T) {
+	t.Parallel()
 	src := store.NewMVCCStore()
 	const restoredCommit uint64 = 67890
 	require.NoError(t, src.PutAt(t.Context(), []byte("restored"), []byte("v"), restoredCommit, 0))

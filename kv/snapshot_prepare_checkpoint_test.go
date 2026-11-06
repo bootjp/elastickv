@@ -12,6 +12,7 @@ import (
 )
 
 func TestEncryptionCheckpointSnapshotPreservesPrepareProtocol(t *testing.T) {
+	t.Parallel()
 	for _, released := range []bool{false, true} {
 		t.Run(map[bool]string{false: "sealed", true: "released"}[released], func(t *testing.T) {
 			st, err := store.NewPebbleStore(t.TempDir())

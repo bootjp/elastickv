@@ -271,6 +271,7 @@ func writeTSOModeFile(t *testing.T, path, contents string) {
 }
 
 func TestTSORuntimeControllerConcurrentAllocationsDuringReload(t *testing.T) {
+	t.Parallel()
 	controller, _ := newTestTSORuntimeController(t)
 	clock := NewHLC()
 	clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())

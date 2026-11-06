@@ -22,6 +22,7 @@ func tsoBaselineReplay(entries ...TSOBaselineEntry) TSOBaselineReplay {
 }
 
 func TestTSOBaselineReplayAndExactScalarImport(t *testing.T) {
+	t.Parallel()
 	cut := TSOBaselineCut{SnapshotIndex: 1, SnapshotTerm: 1, CommitIndex: 4, CommitTerm: 2, LastLogIndex: 4, ConfigurationIndex: 1}
 	baseline, err := ReconstructTSOBaseline(t.Context(), bytes.NewReader(make([]byte, tsoSnapshotV1Len)), cut, tsoBaselineReplay(
 		TSOBaselineEntry{Index: 2, Term: 1, Payload: marshalHLCLeaseRenew(20)},
@@ -46,6 +47,7 @@ func TestTSOBaselineReplayAndExactScalarImport(t *testing.T) {
 }
 
 func TestTSOBaselineLeaseOnlyDoesNotSynthesizeFloorOnImport(t *testing.T) {
+	t.Parallel()
 	cut := TSOBaselineCut{SnapshotIndex: 1, SnapshotTerm: 1, CommitIndex: 2, CommitTerm: 1, LastLogIndex: 2, ConfigurationIndex: 1}
 	baseline, err := ReconstructTSOBaseline(t.Context(), bytes.NewReader(make([]byte, tsoSnapshotV1Len)), cut, tsoBaselineReplay(TSOBaselineEntry{Index: 2, Term: 1, Payload: marshalHLCLeaseRenew(20)}))
 	require.NoError(t, err)
@@ -58,6 +60,7 @@ func TestTSOBaselineLeaseOnlyDoesNotSynthesizeFloorOnImport(t *testing.T) {
 }
 
 func TestTSOBaselineCanonicalAcrossLegacySnapshotLayouts(t *testing.T) {
+	t.Parallel()
 	cut := TSOBaselineCut{SnapshotIndex: 7, SnapshotTerm: 2, CommitIndex: 7, CommitTerm: 2, LastLogIndex: 7, ConfigurationIndex: 1}
 	legacy := &tsoFSMSnapshot{ceilingMs: 20, allocationFloor: 100}
 	short, err := legacy.encode()
@@ -70,6 +73,7 @@ func TestTSOBaselineCanonicalAcrossLegacySnapshotLayouts(t *testing.T) {
 }
 
 func TestTSOBaselineRejectsInvalidSource(t *testing.T) {
+	t.Parallel()
 	valid := TSOBaselineCut{SnapshotIndex: 1, SnapshotTerm: 1, CommitIndex: 3, CommitTerm: 2, LastLogIndex: 3, ConfigurationIndex: 1}
 	for _, kind := range []string{"gap", "duplicate", "tail", "bad-term", "unknown-type", "unknown-payload", "encrypted", "missing"} {
 		t.Run(kind, func(t *testing.T) {
@@ -100,6 +104,7 @@ func TestTSOBaselineRejectsInvalidSource(t *testing.T) {
 }
 
 func TestTSOBaselineRejectsIncompletePhaseD(t *testing.T) {
+	t.Parallel()
 	cut := TSOBaselineCut{SnapshotIndex: 1, SnapshotTerm: 1, CommitIndex: 3, CommitTerm: 2, LastLogIndex: 3, ConfigurationIndex: 1}
 	_, err := ReconstructTSOBaseline(t.Context(), bytes.NewReader(make([]byte, tsoSnapshotV1Len)), cut, tsoBaselineReplay(
 		TSOBaselineEntry{Index: 2, Term: 1, Payload: marshalTSOCutover()}, TSOBaselineEntry{Index: 3, Term: 2, Payload: marshalTSOPendingPhaseD(100)},
@@ -108,6 +113,7 @@ func TestTSOBaselineRejectsIncompletePhaseD(t *testing.T) {
 }
 
 func TestTSOBaselineRejectsIgnoredReplayErrorAndCancellation(t *testing.T) {
+	t.Parallel()
 	cut := TSOBaselineCut{SnapshotIndex: 1, SnapshotTerm: 1, CommitIndex: 2, CommitTerm: 1, LastLogIndex: 2, ConfigurationIndex: 1}
 	_, err := ReconstructTSOBaseline(t.Context(), bytes.NewReader(make([]byte, tsoSnapshotV1Len)), cut, func(yield func(TSOBaselineEntry) error) error {
 		_ = yield(TSOBaselineEntry{Index: 2, Term: 1, Payload: []byte{0xff}})
@@ -126,6 +132,7 @@ func TestTSOBaselineRejectsIgnoredReplayErrorAndCancellation(t *testing.T) {
 }
 
 func TestTSOBaselineRequiresCompleteConfigurationSuffix(t *testing.T) {
+	t.Parallel()
 	cut := TSOBaselineCut{CommitIndex: 3, CommitTerm: 1, LastLogIndex: 3, ConfigurationIndex: 1}
 	result, err := ReconstructTSOBaseline(t.Context(), nil, cut, tsoBaselineReplay(
 		TSOBaselineEntry{Index: 1, Term: 1, Type: 1, Payload: []byte("native-validated-conf")},

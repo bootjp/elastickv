@@ -70,6 +70,7 @@ func TestOnePhaseDedup_NoOpsWhenPriorAttemptLanded(t *testing.T) {
 }
 
 func TestOnePhaseDedup_DifferentWriteAtPriorTimestampIsNotOurAttempt(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := store.NewMVCCStore()
 	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
@@ -87,6 +88,7 @@ func TestOnePhaseDedup_DifferentWriteAtPriorTimestampIsNotOurAttempt(t *testing.
 }
 
 func TestOnePhaseDedup_DifferentScalarWriteAtPriorTimestampIsNotOurAttempt(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := store.NewMVCCStore()
 	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
@@ -102,6 +104,7 @@ func TestOnePhaseDedup_DifferentScalarWriteAtPriorTimestampIsNotOurAttempt(t *te
 }
 
 func TestOnePhaseDedup_ListItemRetryWithMatchingValueNoOps(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := store.NewMVCCStore()
 	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)

@@ -215,6 +215,7 @@ func g17FSM(t *testing.T, st store.MVCCStore, opts ...FSMOption) *kvFSM {
 // not be durable yet. Red before the fix (the first request had already
 // committed its own batch carrying the applied index).
 func TestFSMApplyBatch_EntryIsNotDurableUntilItCommits(t *testing.T) {
+	t.Parallel()
 	st := g17OpenStore(t, t.TempDir())
 	wrapped := &g17Store{MVCCStore: st}
 	var (
@@ -323,6 +324,7 @@ func g17RunCrashChild(t *testing.T, dir, shapeName string) {
 // is reported on its own slot while the requests around it land, and the
 // entry's applied index is written once.
 func TestFSMApplyBatch_PebbleKeepsPerRequestResults(t *testing.T) {
+	t.Parallel()
 	st := g17OpenStore(t, t.TempDir())
 	fsm := g17FSM(t, st)
 
@@ -350,6 +352,7 @@ func TestFSMApplyBatch_PebbleKeepsPerRequestResults(t *testing.T) {
 // DEL_PREFIX request staged after a PUT of the same entry tombstones it,
 // exactly as it did when each request committed on its own.
 func TestFSMApplyBatch_PrefixDeleteSeesEarlierRequestOfTheSameEntry(t *testing.T) {
+	t.Parallel()
 	st := g17OpenStore(t, t.TempDir())
 	fsm := g17FSM(t, st)
 
@@ -385,6 +388,7 @@ func (o *g17Observer) OnApply(_ pb.Op, key []byte) {
 // be skipped on this replica for good by the cold-start duplicate skip
 // (found in review).
 func TestFSMApplyBatch_EntryFailureHaltsApply(t *testing.T) {
+	t.Parallel()
 	st := g17OpenStore(t, t.TempDir())
 	errCommit := errors.New("pebble: batch commit failed")
 	fsm := g17FSM(t, &g17FailingEntryStore{MVCCStore: st, err: errCommit})
@@ -408,6 +412,7 @@ func TestFSMApplyBatch_EntryFailureHaltsApply(t *testing.T) {
 // index would commit and this replica would diverge from the replicas
 // where the request succeeded (found in review).
 func TestFSMApplyBatch_OperationalRequestFailureHaltsApply(t *testing.T) {
+	t.Parallel()
 	st := g17OpenStore(t, t.TempDir())
 	errRead := errors.New("pebble: read failed")
 	fsm := g17FSM(t, &g17OperationalFailureStore{MVCCStore: st, err: errRead})
@@ -428,6 +433,7 @@ func TestFSMApplyBatch_OperationalRequestFailureHaltsApply(t *testing.T) {
 // rule: a verdict (a write conflict, an unknown op, an invalid request) is
 // reported per request, the other requests land, and the entry commits.
 func TestFSMApplyBatch_VerdictsStayPerRequest(t *testing.T) {
+	t.Parallel()
 	st := g17OpenStore(t, t.TempDir())
 	fsm := g17FSM(t, st)
 
@@ -463,6 +469,7 @@ func TestFSMApplyBatch_VerdictsStayPerRequest(t *testing.T) {
 // are notified after the entry commits, so an observer that reads the key
 // it was told about finds it durable, for every request of the entry.
 func TestFSMApplyBatch_ObserversSeeOnlyCommittedWrites(t *testing.T) {
+	t.Parallel()
 	st := g17OpenStore(t, t.TempDir())
 	obs := &g17Observer{t: t, st: st}
 	fsm := g17FSM(t, st, WithApplyObserver(obs))
@@ -478,6 +485,7 @@ func TestFSMApplyBatch_ObserversSeeOnlyCommittedWrites(t *testing.T) {
 // TestFSMApplyBatch_InMemoryStoreUnchanged keeps the in-memory store on the
 // same per-request semantics as before.
 func TestFSMApplyBatch_InMemoryStoreUnchanged(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	fsm := g17FSM(t, st)
 	require.Nil(t, fsm.Apply(g17TwoPutEntry(t)))

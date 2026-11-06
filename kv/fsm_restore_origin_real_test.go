@@ -47,6 +47,7 @@ func restoreOriginRealPayload(t *testing.T, format string, bearing bool) []byte 
 }
 
 func TestExternalRestoreRealStoreLineage(t *testing.T) {
+	t.Parallel()
 	for _, format := range []string{"mvcc", "native", "sst"} {
 		for _, bearing := range []bool{false, true} {
 			name := format + map[bool]string{false: "/epoch-only", true: "/migration-bearing"}[bearing]

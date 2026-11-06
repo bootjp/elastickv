@@ -22,6 +22,7 @@ func activateTransferSizeGuardForTest(t *testing.T, f *kvFSM) {
 }
 
 func TestMigrationSizeGuardRawRequestAtomicVerdict(t *testing.T) {
+	t.Parallel()
 	f := newMigrationWriteTrackerFSM(t)
 	installSourceOwnershipForTest(t, f, 0)
 	activateTransferSizeGuardForTest(t, f)
@@ -38,6 +39,7 @@ func TestMigrationSizeGuardRawRequestAtomicVerdict(t *testing.T) {
 }
 
 func TestMigrationSizeGuardLegacyAndOutsideRangeUnchanged(t *testing.T) {
+	t.Parallel()
 	value := make([]byte, store.MigrationPagePayloadBudget+(1<<19))
 	for _, test := range []struct {
 		name  string
@@ -72,6 +74,7 @@ func sizeGuardTxnRequest(phase pb.Phase, value []byte) *pb.Request {
 }
 
 func TestMigrationSizeGuardChecksEncodedPrepareIntent(t *testing.T) {
+	t.Parallel()
 	value := make([]byte, store.MigrationPagePayloadBudget-130)
 	require.True(t, store.MigrationVersionFitsTransfer([]byte("n"), value), "the raw version itself fits")
 	f := newMigrationWriteTrackerFSM(t)
@@ -87,6 +90,7 @@ func TestMigrationSizeGuardChecksEncodedPrepareIntent(t *testing.T) {
 }
 
 func TestMigrationSizeGuardOnePhaseRejectsAtomically(t *testing.T) {
+	t.Parallel()
 	f := newMigrationWriteTrackerFSM(t)
 	installSourceOwnershipForTest(t, f, 0)
 	activateTransferSizeGuardForTest(t, f)
@@ -99,6 +103,7 @@ func TestMigrationSizeGuardOnePhaseRejectsAtomically(t *testing.T) {
 }
 
 func TestMigrationSizeGuardExistingPrepareResolutionsDrain(t *testing.T) {
+	t.Parallel()
 	value := make([]byte, store.MigrationPagePayloadBudget+(1<<19))
 	for _, phase := range []pb.Phase{pb.Phase_COMMIT, pb.Phase_ABORT} {
 		t.Run(phase.String(), func(t *testing.T) {
@@ -121,6 +126,7 @@ func TestMigrationSizeGuardExistingPrepareResolutionsDrain(t *testing.T) {
 }
 
 func TestMigrationSizeGuardRawBatchKeepsIndependentVerdicts(t *testing.T) {
+	t.Parallel()
 	f := newMigrationWriteTrackerFSM(t)
 	installSourceOwnershipForTest(t, f, 0)
 	activateTransferSizeGuardForTest(t, f)
@@ -139,6 +145,7 @@ func TestMigrationSizeGuardRawBatchKeepsIndependentVerdicts(t *testing.T) {
 }
 
 func TestMigrationSizeGuardActivationOrdersAndLegacyRefresh(t *testing.T) {
+	t.Parallel()
 	value := make([]byte, store.MigrationPagePayloadBudget+(1<<19))
 	for _, writeFirst := range []bool{false, true} {
 		f := newMigrationWriteTrackerFSM(t)
@@ -167,6 +174,7 @@ func TestMigrationSizeGuardActivationOrdersAndLegacyRefresh(t *testing.T) {
 }
 
 func TestMigrationSizeGuardStaleActivationConfiguration(t *testing.T) {
+	t.Parallel()
 	f := newMigrationWriteTrackerFSM(t)
 	installSourceOwnershipForTest(t, f, 0)
 	command, err := MarshalTargetStagedReadinessCommand(&pb.TargetStagedReadinessRequest{JobId: 11, MigrationJobId: 11,
@@ -185,6 +193,7 @@ func TestMigrationSizeGuardStaleActivationConfiguration(t *testing.T) {
 }
 
 func TestMigrationSizeGuardFullAtomicRequestBoundUnchanged(t *testing.T) {
+	t.Parallel()
 	value := make([]byte, 32<<20)
 	req := &pb.Request{Ts: 50, Mutations: []*pb.Mutation{
 		{Op: pb.Op_PUT, Key: []byte("n"), Value: value}, {Op: pb.Op_PUT, Key: []byte("o"), Value: value},
@@ -200,6 +209,7 @@ func TestMigrationSizeGuardFullAtomicRequestBoundUnchanged(t *testing.T) {
 }
 
 func TestMigrationSizeGuardNormalizedDerivedWriters(t *testing.T) {
+	t.Parallel()
 	value := make([]byte, store.MigrationPagePayloadBudget+(1<<19))
 	for _, key := range [][]byte{
 		store.HashFieldKey([]byte("n"), []byte("field")),
@@ -216,6 +226,7 @@ func TestMigrationSizeGuardNormalizedDerivedWriters(t *testing.T) {
 }
 
 func TestMigrationSizeGuardCommitOnlyUsesPreparedBytes(t *testing.T) {
+	t.Parallel()
 	f := newMigrationWriteTrackerFSM(t)
 	installSourceOwnershipForTest(t, f, 0)
 	activateTransferSizeGuardForTest(t, f)
@@ -228,6 +239,7 @@ func TestMigrationSizeGuardCommitOnlyUsesPreparedBytes(t *testing.T) {
 }
 
 func TestMigrationSizeGuardRestoredFSMAppliesGuard(t *testing.T) {
+	t.Parallel()
 	f := newMigrationWriteTrackerFSM(t)
 	installSourceOwnershipForTest(t, f, 0)
 	activateTransferSizeGuardForTest(t, f)

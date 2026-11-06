@@ -23,6 +23,7 @@ func activationApplyFixture(t *testing.T) (raftbootstrap.ActivationCommand, Prep
 }
 
 func TestBootstrapActivationPolicySeparatesBaselineAndPreparationDigests(t *testing.T) {
+	t.Parallel()
 	command, prepared, proof := activationApplyFixture(t)
 	policy, err := NewBootstrapActivationPolicy(proof.Identity, command.Manifest, command.Manifest.CommitIndex+1)
 	require.NoError(t, err)
@@ -81,6 +82,7 @@ func activationApplyFixtureAtWatermark(t *testing.T, watermark uint64) (raftboot
 }
 
 func TestBootstrapActivationRejectsMissingOrBaselineOnlyReadiness(t *testing.T) {
+	t.Parallel()
 	for _, scenario := range []string{"baseline_only", "missing_member", "baseline_signature"} {
 		t.Run(scenario, func(t *testing.T) {
 			command, prepared, proof := activationApplyFixture(t)

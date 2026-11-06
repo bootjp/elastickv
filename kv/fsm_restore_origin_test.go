@@ -55,6 +55,7 @@ func restoreOriginPayload(t *testing.T) []byte {
 }
 
 func TestRestoreWithContextDispatchesValidatedOrigin(t *testing.T) {
+	t.Parallel()
 	payload := restoreOriginPayload(t)
 	for _, external := range []bool{false, true} {
 		t.Run(map[bool]string{false: "raft", true: "external"}[external], func(t *testing.T) {
@@ -75,6 +76,7 @@ func TestRestoreWithContextDispatchesValidatedOrigin(t *testing.T) {
 }
 
 func TestExternalRestoreNeverFallsBackOrPublishesRejectedHeader(t *testing.T) {
+	t.Parallel()
 	payload := restoreOriginPayload(t)
 	st := &restoreOriginStore{MVCCStore: store.NewMVCCStore(), externalErr: errors.New("rejected migration state")}
 	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
@@ -96,6 +98,7 @@ func TestExternalRestoreNeverFallsBackOrPublishesRejectedHeader(t *testing.T) {
 }
 
 func TestRestoreWithContextRejectsCanceledOrUnknownOrigin(t *testing.T) {
+	t.Parallel()
 	st := &restoreOriginStore{MVCCStore: store.NewMVCCStore()}
 	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
 	require.True(t, ok)
