@@ -7,6 +7,7 @@ import (
 )
 
 func TestOwnershipPartitionLedgerNamespace(t *testing.T) {
+	t.Parallel()
 	key, err := CatalogOwnershipPartitionKey(3, make([]byte, 32))
 	require.NoError(t, err)
 	require.True(t, IsCatalogOwnershipPartitionKey(key))

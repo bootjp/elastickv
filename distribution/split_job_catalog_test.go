@@ -13,6 +13,7 @@ import (
 )
 
 func TestCatalogNextSplitJobIDCodecRoundTrip(t *testing.T) {
+	t.Parallel()
 	raw := EncodeCatalogNextSplitJobID(42)
 	got, err := DecodeCatalogNextSplitJobID(raw)
 	if err != nil {
@@ -24,6 +25,7 @@ func TestCatalogNextSplitJobIDCodecRoundTrip(t *testing.T) {
 }
 
 func TestCatalogNextSplitJobIDCodecRejectsInvalidPayload(t *testing.T) {
+	t.Parallel()
 	if _, err := DecodeCatalogNextSplitJobID(nil); !errors.Is(err, ErrCatalogInvalidNextSplitJobID) {
 		t.Fatalf("expected ErrCatalogInvalidNextSplitJobID, got %v", err)
 	}
@@ -33,6 +35,7 @@ func TestCatalogNextSplitJobIDCodecRejectsInvalidPayload(t *testing.T) {
 }
 
 func TestCatalogSplitJobKeyHelpers(t *testing.T) {
+	t.Parallel()
 	key := CatalogSplitJobKey(11)
 	if !IsCatalogSplitJobKey(key) {
 		t.Fatal("expected split job key prefix match")
@@ -53,6 +56,7 @@ func TestCatalogSplitJobKeyHelpers(t *testing.T) {
 }
 
 func TestCatalogSplitJobHistoryKeyHelpers(t *testing.T) {
+	t.Parallel()
 	key := CatalogSplitJobHistoryKey(12345, 99)
 	if !IsCatalogSplitJobHistoryKey(key) {
 		t.Fatal("expected split job history key prefix match")
@@ -70,6 +74,7 @@ func TestCatalogSplitJobHistoryKeyHelpers(t *testing.T) {
 }
 
 func TestSplitJobCodecRoundTrip(t *testing.T) {
+	t.Parallel()
 	want := sampleSplitJob(7)
 	raw, err := EncodeSplitJob(want)
 	if err != nil {
@@ -83,6 +88,7 @@ func TestSplitJobCodecRoundTrip(t *testing.T) {
 }
 
 func TestSplitJobCodecRejectsInvalidVersion(t *testing.T) {
+	t.Parallel()
 	job := sampleSplitJob(1)
 	raw, err := EncodeSplitJob(job)
 	if err != nil {
@@ -95,6 +101,7 @@ func TestSplitJobCodecRejectsInvalidVersion(t *testing.T) {
 }
 
 func TestSplitJobCodecRejectsInvalidPhase(t *testing.T) {
+	t.Parallel()
 	job := sampleSplitJob(1)
 	job.Phase = SplitJobPhaseNone
 	if _, err := EncodeSplitJob(job); !errors.Is(err, ErrCatalogInvalidSplitJobPhase) {
@@ -103,6 +110,7 @@ func TestSplitJobCodecRejectsInvalidPhase(t *testing.T) {
 }
 
 func TestSplitJobCodecValidatesRestartPhases(t *testing.T) {
+	t.Parallel()
 	for _, phase := range []SplitJobPhase{
 		SplitJobPhaseBackfill,
 		SplitJobPhaseFence,
@@ -134,6 +142,7 @@ func TestSplitJobCodecValidatesRestartPhases(t *testing.T) {
 }
 
 func TestSplitJobCodecRejectsInvalidRestartPhases(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name             string
 		phase            SplitJobPhase
@@ -189,6 +198,7 @@ func TestSplitJobCodecRejectsInvalidRestartPhases(t *testing.T) {
 }
 
 func TestSplitJobCodecRejectsDuplicateBracketIDs(t *testing.T) {
+	t.Parallel()
 	job := sampleSplitJob(1)
 	dupe := job.BracketProgress[0]
 	dupe.Family++
@@ -200,6 +210,7 @@ func TestSplitJobCodecRejectsDuplicateBracketIDs(t *testing.T) {
 }
 
 func TestSplitJobCodecRejectsUnknownProtoEnumValues(t *testing.T) {
+	t.Parallel()
 	body, err := gproto.MarshalOptions{Deterministic: true}.Marshal(&pb.SplitJob{
 		JobId:         1,
 		SourceRouteId: 2,
@@ -249,6 +260,7 @@ func TestSplitJobCodecRejectsUnknownProtoEnumValues(t *testing.T) {
 }
 
 func TestCatalogStoreNextSplitJobID_DefaultsToOne(t *testing.T) {
+	t.Parallel()
 	cs := NewCatalogStore(store.NewMVCCStore())
 	next, err := cs.NextSplitJobID(context.Background())
 	if err != nil {
@@ -260,6 +272,7 @@ func TestCatalogStoreNextSplitJobID_DefaultsToOne(t *testing.T) {
 }
 
 func TestCatalogStoreSaveAndLoadSplitJob(t *testing.T) {
+	t.Parallel()
 	cs := NewCatalogStore(store.NewMVCCStore())
 	ctx := context.Background()
 	job := sampleSplitJob(7)
@@ -286,6 +299,7 @@ func TestCatalogStoreSaveAndLoadSplitJob(t *testing.T) {
 }
 
 func TestCatalogStoreCreateSplitJobRejectsExistingJob(t *testing.T) {
+	t.Parallel()
 	cs := NewCatalogStore(store.NewMVCCStore())
 	ctx := context.Background()
 	job := sampleSplitJob(7)
@@ -299,6 +313,7 @@ func TestCatalogStoreCreateSplitJobRejectsExistingJob(t *testing.T) {
 }
 
 func TestCatalogStoreSaveSplitJobRejectsStaleExpectedJob(t *testing.T) {
+	t.Parallel()
 	cs := NewCatalogStore(store.NewMVCCStore())
 	ctx := context.Background()
 	job := sampleSplitJob(8)
@@ -340,6 +355,7 @@ func TestCatalogStoreSaveSplitJobRejectsStaleExpectedJob(t *testing.T) {
 }
 
 func TestCatalogStoreRetrySplitJobUsesDurableRetryPhase(t *testing.T) {
+	t.Parallel()
 	cs := NewCatalogStore(store.NewMVCCStore())
 	ctx := context.Background()
 	job := sampleSplitJob(18)
@@ -371,6 +387,7 @@ func TestCatalogStoreRetrySplitJobUsesDurableRetryPhase(t *testing.T) {
 }
 
 func TestCatalogStoreRetrySplitJobRejectsMissingRetryWitness(t *testing.T) {
+	t.Parallel()
 	cs := NewCatalogStore(store.NewMVCCStore())
 	ctx := context.Background()
 	job := sampleSplitJob(19)
@@ -383,6 +400,7 @@ func TestCatalogStoreRetrySplitJobRejectsMissingRetryWitness(t *testing.T) {
 }
 
 func TestCatalogStoreBeginSplitJobAbandonRecordsPreCutoverPhase(t *testing.T) {
+	t.Parallel()
 	cs := NewCatalogStore(store.NewMVCCStore())
 	ctx := context.Background()
 	job := sampleSplitJob(20)
@@ -414,6 +432,7 @@ func TestCatalogStoreBeginSplitJobAbandonRecordsPreCutoverPhase(t *testing.T) {
 }
 
 func TestCatalogStoreBeginSplitJobAbandonAllowsPlannedPhase(t *testing.T) {
+	t.Parallel()
 	cs := NewCatalogStore(store.NewMVCCStore())
 	ctx := context.Background()
 	job := sampleSplitJob(22)
@@ -439,6 +458,7 @@ func TestCatalogStoreBeginSplitJobAbandonAllowsPlannedPhase(t *testing.T) {
 }
 
 func TestCatalogStoreBeginSplitJobAbandonRejectsPostCutoverPhases(t *testing.T) {
+	t.Parallel()
 	cs := NewCatalogStore(store.NewMVCCStore())
 	ctx := context.Background()
 	job := sampleSplitJob(21)
@@ -454,6 +474,7 @@ func TestCatalogStoreBeginSplitJobAbandonRejectsPostCutoverPhases(t *testing.T) 
 }
 
 func TestCatalogStoreListSplitJobsIncludesLiveAndHistory(t *testing.T) {
+	t.Parallel()
 	cs := NewCatalogStore(store.NewMVCCStore())
 	ctx := context.Background()
 	live := sampleSplitJob(2)
@@ -492,6 +513,7 @@ func TestCatalogStoreListSplitJobsIncludesLiveAndHistory(t *testing.T) {
 }
 
 func TestCatalogStoreMoveSplitJobToHistoryIsIdempotentByJobID(t *testing.T) {
+	t.Parallel()
 	cs := NewCatalogStore(store.NewMVCCStore())
 	ctx := context.Background()
 	job := sampleSplitJob(12)
@@ -524,6 +546,7 @@ func TestCatalogStoreMoveSplitJobToHistoryIsIdempotentByJobID(t *testing.T) {
 }
 
 func TestCatalogStoreMoveSplitJobToHistoryRetiresMigrationMetadata(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	job := sampleSplitJob(14)
 	targetStore := store.NewMVCCStore()
@@ -549,6 +572,7 @@ func TestCatalogStoreMoveSplitJobToHistoryRetiresMigrationMetadata(t *testing.T)
 }
 
 func TestCatalogStoreMoveSplitJobToHistoryUsesMigrationRetireResolver(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	job := sampleSplitJob(14)
 	var calls []struct {
@@ -590,6 +614,7 @@ func TestCatalogStoreMoveSplitJobToHistoryUsesMigrationRetireResolver(t *testing
 }
 
 func TestCatalogStoreMoveSplitJobToHistoryRetiresMetadataOnIdempotentRetry(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	job := sampleSplitJob(15)
 	targetStore := store.NewMVCCStore()
@@ -687,6 +712,7 @@ func assertStoreValueAt(t *testing.T, ctx context.Context, st store.MVCCStore, k
 }
 
 func TestCatalogStoreMoveSplitJobToHistoryRejectsStaleExpectedJob(t *testing.T) {
+	t.Parallel()
 	cs := NewCatalogStore(store.NewMVCCStore())
 	ctx := context.Background()
 	job := sampleSplitJob(13)
@@ -719,6 +745,7 @@ func TestCatalogStoreMoveSplitJobToHistoryRejectsStaleExpectedJob(t *testing.T) 
 }
 
 func TestCatalogStoreMoveSplitJobToHistoryRejectsNonTerminal(t *testing.T) {
+	t.Parallel()
 	cs := NewCatalogStore(store.NewMVCCStore())
 	job := sampleSplitJob(1)
 	if err := cs.MoveSplitJobToHistory(context.Background(), job, job); !errors.Is(err, ErrCatalogSplitJobTerminalRequired) {
@@ -727,6 +754,7 @@ func TestCatalogStoreMoveSplitJobToHistoryRejectsNonTerminal(t *testing.T) {
 }
 
 func TestCatalogStoreDeleteSplitJob(t *testing.T) {
+	t.Parallel()
 	cs := NewCatalogStore(store.NewMVCCStore())
 	ctx := context.Background()
 	job := sampleSplitJob(3)
@@ -751,6 +779,7 @@ func TestCatalogStoreDeleteSplitJob(t *testing.T) {
 }
 
 func TestCatalogStoreSaveSeedsNextSplitJobIDFromExistingJobsWhenMetaMissing(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	cs := NewCatalogStore(st)
 	ctx := context.Background()
@@ -787,6 +816,7 @@ func TestCatalogStoreSaveSeedsNextSplitJobIDFromExistingJobsWhenMetaMissing(t *t
 }
 
 func TestCatalogStoreBuildSplitJobPutMutationsSkipsCurrentNextSplitJobID(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	cs := NewCatalogStore(st)
 	ctx := context.Background()
@@ -817,6 +847,7 @@ func TestCatalogStoreBuildSplitJobPutMutationsSkipsCurrentNextSplitJobID(t *test
 }
 
 func TestCatalogStoreNextSplitJobIDAt_FallsBackWhenMetaMissing(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	cs := NewCatalogStore(st)
 	ctx := context.Background()
@@ -852,6 +883,7 @@ func TestCatalogStoreNextSplitJobIDAt_FallsBackWhenMetaMissing(t *testing.T) {
 }
 
 func TestNextSplitJobIDFloorRejectsOverflow(t *testing.T) {
+	t.Parallel()
 	_, err := NextSplitJobIDFloor([]SplitJob{{JobID: math.MaxUint64}})
 	if !errors.Is(err, ErrCatalogSplitJobIDOverflow) {
 		t.Fatalf("expected ErrCatalogSplitJobIDOverflow, got %v", err)
