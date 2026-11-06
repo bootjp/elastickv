@@ -21,7 +21,8 @@ func TestOrdinaryUnmountCancelsRequestsAfterMountRemoved(t *testing.T) {
 }
 
 func TestJoinAbandonedMountWaitsForCleanup(t *testing.T) {
-	t.Parallel()
+	// Not parallel: its 1s wall-clock budget is sized for a quiet process,
+	// and parallel peers on a loaded runner can exhaust it.
 	entered, release := make(chan struct{}), make(chan struct{})
 	done := make(chan bool, 1)
 	go func() {
