@@ -9,6 +9,12 @@ import (
 	cockroachdberr "github.com/cockroachdb/errors"
 )
 
+// Logical exports cannot discard permission/receipt state from a protected
+// snapshot. Native row/SST copies retain it; rebase needs v5 manifest handling.
+var ErrSnapshotProtectedControlMetadata = cockroachdberr.New("protected control metadata requires a v5 manifest-aware export")
+
+const pebbleRaftControlMetadataPrefix = "!txn|meta|raft-control|"
+
 // snapshot_reader.go consumes the native Pebble snapshot format
 // produced by store/lsm_store.go::pebbleSnapshotMagic +
 // restoreBatchLoopInto and yields each entry as a (userKey,
@@ -308,6 +314,9 @@ func isPebbleWriterRegistryKey(rawKey []byte) bool {
 // data and follow neither the inverted-timestamp key layout nor the
 // value-header layout, so the reader skips them.
 func isPebbleOperationalKey(rawKey []byte) bool {
+	if bytes.HasPrefix(rawKey, []byte(pebbleRaftControlMetadataPrefix)) {
+		return true
+	}
 	for _, reserved := range pebbleOperationalKeys {
 		if bytes.Equal(rawKey, reserved) {
 			return true
@@ -355,6 +364,9 @@ func readOneEntry(
 // the value header, so decoding one fails the whole read; they carry no
 // user data, so the reader skips them.
 func emitRawEntry(key, value []byte, header SnapshotHeader, fn func(SnapshotHeader, SnapshotEntry) error) error {
+	if bytes.HasPrefix(key, []byte(pebbleRaftControlMetadataPrefix)) {
+		return cockroachdberr.WithStack(ErrSnapshotProtectedControlMetadata)
+	}
 	if isPebbleOperationalKey(key) {
 		return nil
 	}

@@ -10,6 +10,7 @@ import (
 
 	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/kv"
+	"github.com/bootjp/elastickv/kv/kvtest"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 )
@@ -256,42 +257,51 @@ func TestS3NextTxnCommitTSFailsClosedOnExpiredCeiling(t *testing.T) {
 		"s3 nextTxnCommitTS must propagate ErrCeilingExpired from NextFenced")
 }
 
-func TestS3CommitUploadPartRechecksUploadAtLatestAppliedWatermark(t *testing.T) {
+func TestS3CommitUploadPartProtectsUploadRemovedAfterStartTS(t *testing.T) {
 	st := store.NewMVCCStore()
 	const generation = uint64(1)
 	uploadMetaKey := s3keys.UploadMetaKey("bucket", generation, "object", "upload")
+	bucketMeta, err := encodeS3BucketMeta(&s3BucketMeta{BucketName: "bucket", Generation: generation})
+	require.NoError(t, err)
+	require.NoError(t, st.PutAt(context.Background(), s3keys.BucketMetaKey("bucket"), bucketMeta, 10, 0))
 	require.NoError(t, st.PutAt(context.Background(), uploadMetaKey, []byte("meta"), 10, 0))
 	require.NoError(t, st.DeleteAt(context.Background(), uploadMetaKey, 20))
-	coord := &recordingS3DispatchCoordinator{}
+	coord := kvtest.NewLocalCoordinator(st, kvtest.LocalOptions{OCC: kvtest.OCCAllGroups, ValidateReadKeys: true})
 	server := NewS3Server(nil, "", st, coord, nil)
 
-	_, err := server.commitS3UploadPart(context.Background(), &s3UploadPartState{
+	_, attempted, err := server.commitS3UploadPart(context.Background(), &s3UploadPartState{
 		partNo:        1,
 		readTS:        10,
 		meta:          &s3BucketMeta{Generation: generation},
 		uploadMetaKey: uploadMetaKey,
 	}, s3ChunkUploadResult{}, "bucket", "object", "upload", s3UploadPartVersion{startTS: 10, commitTS: 30})
-	require.ErrorContains(t, err, "upload not found")
-	require.Nil(t, coord.request, "an upload removed after startTS must not dispatch an orphan part")
+	require.True(t, attempted)
+	require.ErrorIs(t, err, store.ErrWriteConflict, "the read set must reject a delete after the retained snapshot")
+	_, err = st.GetAt(context.Background(), s3keys.UploadPartKey("bucket", generation, "object", "upload", 1), ^uint64(0))
+	require.ErrorIs(t, err, store.ErrKeyNotFound, "an upload removed after startTS must not commit an orphan part")
 }
 
 func TestS3CommitUploadPartIncludesUploadMetaInReadSet(t *testing.T) {
 	st := store.NewMVCCStore()
 	const generation = uint64(1)
 	uploadMetaKey := s3keys.UploadMetaKey("bucket", generation, "object", "upload")
+	bucketMeta, err := encodeS3BucketMeta(&s3BucketMeta{BucketName: "bucket", Generation: generation})
+	require.NoError(t, err)
+	require.NoError(t, st.PutAt(context.Background(), s3keys.BucketMetaKey("bucket"), bucketMeta, 10, 0))
 	require.NoError(t, st.PutAt(context.Background(), uploadMetaKey, []byte("meta"), 10, 0))
 	coord := &recordingS3DispatchCoordinator{}
 	server := NewS3Server(nil, "", st, coord, nil)
 
-	_, err := server.commitS3UploadPart(context.Background(), &s3UploadPartState{
+	_, attempted, err := server.commitS3UploadPart(context.Background(), &s3UploadPartState{
 		partNo:        1,
 		readTS:        10,
 		meta:          &s3BucketMeta{Generation: generation},
 		uploadMetaKey: uploadMetaKey,
 	}, s3ChunkUploadResult{}, "bucket", "object", "upload", s3UploadPartVersion{startTS: 10, commitTS: 30})
 	require.NoError(t, err)
+	require.True(t, attempted)
 	require.NotNil(t, coord.request)
-	require.Equal(t, [][]byte{uploadMetaKey}, coord.request.ReadKeys)
+	require.Equal(t, [][]byte{uploadMetaKey, s3keys.BucketGenerationKey("bucket"), s3keys.UploadPartKey("bucket", generation, "object", "upload", 1)}, coord.request.ReadKeys)
 }
 
 func seedS3ObjectForReadVoucherTest(t *testing.T, ctx context.Context, st store.MVCCStore, bucket, key string) {

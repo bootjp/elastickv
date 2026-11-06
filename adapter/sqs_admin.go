@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
+	"net/http"
 	"sort"
 	"strconv"
 	"strings"
@@ -480,6 +481,33 @@ func (s *SQSServer) AdminSetQueueAttributes(ctx context.Context, principal Admin
 		s.throttle.invalidateQueueBuckets(name)
 		s.observeThrottleConfigChange(name, throttle, resetActions, throttleResetCutoff)
 	}
+	return nil
+}
+
+// AdminCreateQueue creates a queue through the public SQS validator and
+// Raft write path, with admin role and leadership checks.
+func (s *SQSServer) AdminCreateQueue(ctx context.Context, principal AdminPrincipal, name string, attrs map[string]string) error {
+	if !principal.Role.canWrite() {
+		return ErrAdminForbidden
+	}
+	if !isVerifiedSQSLeader(ctx, s.coordinator) {
+		return ErrAdminNotLeader
+	}
+	if name != strings.TrimSpace(name) {
+		return errors.Wrap(ErrAdminSQSValidation, "queue name must not contain surrounding whitespace")
+	}
+	_, err := s.createQueueCore(ctx, &sqsCreateQueueInput{QueueName: name, Attributes: attrs})
+	if err != nil {
+		var apiErr *sqsAPIError
+		if errors.As(err, &apiErr) && apiErr.status == http.StatusBadRequest {
+			return errors.Wrap(ErrAdminSQSValidation, apiErr.message)
+		}
+		return errors.Wrap(err, "admin create queue")
+	}
+	s.adminLogger().InfoContext(ctx, "admin.sqs.create_queue",
+		slog.String("access_key", principal.AccessKey),
+		slog.String("role", string(principal.Role)),
+		slog.String("queue", name))
 	return nil
 }
 

@@ -177,6 +177,8 @@ type Internal struct {
 	clock                           *kv.HLC
 	tsAllocator                     kv.TimestampAllocator
 	adminProposer                   raftengine.Proposer
+	bootstrapPolicyProposer         raftengine.Proposer
+	prepareStartupAuthorization     func(context.Context, *pb.PrepareEvidenceStateRequest) bool
 	readWatermarkProposer           raftengine.Proposer
 	lastCommitTimestamp             func() uint64
 	relay                           *RedisPubSubRelay
@@ -605,8 +607,18 @@ func (i *Internal) ForwardAdminProposal(
 		return nil, errors.WithStack(ErrNotLeader)
 	}
 	if ts, ok, err := kv.DecodeWatermarkAdvance(req.GetPayload()); ok {
-		return i.forwardReadWatermarkAdvance(ctx, req.GetPayload(), ts, err)
+		return i.forwardReadWatermarkAdvance(ctx, req.GetPayload(), ts, req.GetForceEntry(), err)
 	}
+	if req.GetForceEntry() {
+		return nil, errors.WithStack(status.Error(codes.PermissionDenied, "force-entry forwarding is only valid for read watermark advances"))
+	}
+	if reply, matched, err := i.forwardBootstrapActivation(ctx, req); matched {
+		return reply, err
+	}
+	return i.forwardSupportedAdminProposal(ctx, req)
+}
+
+func (i *Internal) forwardSupportedAdminProposal(ctx context.Context, req *pb.ForwardAdminProposalRequest) (*pb.ForwardAdminProposalResponse, error) {
 	if i.adminProposer == nil {
 		return nil, errors.New("admin proposer is unavailable")
 	}
@@ -624,19 +636,20 @@ func (i *Internal) ForwardAdminProposal(
 }
 
 // forwardReadWatermarkAdvance applies a read-watermark advance a follower
-// forwarded before serving a snapshot read on this group. It is a no-op when
-// the group already covers ts, and refuses a timestamp beyond the HLC bound
-// so a caller cannot fence the group's writes into the future.
+// forwarded before serving a snapshot read on this group. Ordinary reads are
+// a no-op when the group already covers ts; explicit receipt requests force a
+// new entry. Both modes refuse timestamps beyond the HLC bound.
 func (i *Internal) forwardReadWatermarkAdvance(
 	ctx context.Context,
 	payload []byte,
 	ts uint64,
+	forceEntry bool,
 	decodeErr error,
 ) (*pb.ForwardAdminProposalResponse, error) {
 	if decodeErr != nil {
 		return nil, errors.WithStack(status.Error(codes.PermissionDenied, "admin forwarding requires a supported typed admin entry"))
 	}
-	if i.store != nil && ts <= i.store.LastCommitTS() {
+	if !forceEntry && i.store != nil && ts <= i.store.LastCommitTS() {
 		return &pb.ForwardAdminProposalResponse{}, nil
 	}
 	if i.readWatermarkProposer == nil {

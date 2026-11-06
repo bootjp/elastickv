@@ -60,6 +60,39 @@ type journalWriteCore struct {
 	ids []filesystem.OperationID
 }
 
+type unknownThenCommittedWriteCore struct {
+	*acknowledgementCore
+	id    filesystem.OperationID
+	calls int
+}
+
+func (c *unknownThenCommittedWriteCore) WriteWithOperation(_ context.Context, id filesystem.OperationID, _ uint64, _ uint64, data []byte) (int, error) {
+	c.id = id
+	c.calls++
+	if c.calls == 1 {
+		return 0, kv.ErrTransactionOutcomeUnknown
+	}
+	return len(data), nil
+}
+
+func TestAdapterWriteRecoversAfterUnknownReplyIsAcknowledged(t *testing.T) {
+	session := filesystem.OperationSessionID{Filesystem: [16]byte{1}, Session: [16]byte{2}}
+	core := &unknownThenCommittedWriteCore{acknowledgementCore: newAcknowledgementCore()}
+	adapter := New(core, []byte("client"), WithHandleKeepaliveInterval(0), WithJournaledWrites(session))
+	t.Cleanup(adapter.Close)
+	_, errno := adapter.Write(t.Context(), 7, 9, 0, []byte("first"))
+	require.Equal(t, syscall.EIO, errno)
+	require.Equal(t, syscall.EIO, adapter.Fsync(t.Context(), 7, 9, false))
+	adapter.replyMu.Lock()
+	adapter.ackPending = make(map[filesystem.OperationID]struct{})
+	adapter.ackPending[core.id] = struct{}{}
+	adapter.replyMu.Unlock()
+	adapter.processAcknowledgementBatch(t.Context())
+	_, errno = adapter.Write(t.Context(), 7, 9, 0, []byte("second"))
+	require.Zero(t, errno)
+	require.Equal(t, 2, core.calls)
+}
+
 func (c *journalWriteCore) WriteWithOperation(_ context.Context, id filesystem.OperationID, _ uint64, _ uint64, data []byte) (int, error) {
 	c.ids = append(c.ids, id)
 	return len(data), nil
@@ -89,10 +122,50 @@ type journalLifecycleCore struct {
 	releaseID filesystem.OperationID
 }
 
+type resolvingOpenCore struct {
+	*journalLifecycleCore
+	ackErr error
+}
+
+func (c *resolvingOpenCore) AcknowledgeOperation(context.Context, filesystem.OperationID) error {
+	return c.ackErr
+}
+
 type journalLeaseCore struct {
 	*receiptCore
 	leaseIDs []filesystem.OperationID
 	leaseErr error
+}
+
+type unknownThenCommittedLeaseCore struct {
+	*acknowledgementCore
+	id    filesystem.OperationID
+	calls int
+}
+
+func (c *unknownThenCommittedLeaseCore) RefreshOpenHandleLeaseWithOperation(_ context.Context, id filesystem.OperationID, _ uint64, _ uint64, _ []byte) error {
+	c.id = id
+	c.calls++
+	if c.calls == 1 {
+		return kv.ErrTransactionOutcomeUnknown
+	}
+	return nil
+}
+
+func TestAdapterLeaseRefreshRecoversAfterUnknownReplyIsAcknowledged(t *testing.T) {
+	session := filesystem.OperationSessionID{Filesystem: [16]byte{1}, Session: [16]byte{2}}
+	core := &unknownThenCommittedLeaseCore{acknowledgementCore: newAcknowledgementCore()}
+	adapter := New(core, []byte("client"), WithHandleKeepaliveInterval(0), WithJournaledLeaseRefresh(session))
+	adapter.ackCancel()
+	t.Cleanup(adapter.Close)
+	_, errno := adapter.Read(withReplyIdentity(t.Context(), 88), 7, 9, 0, 1)
+	require.Equal(t, syscall.EIO, errno)
+	require.Equal(t, syscall.EIO, adapter.Fsync(t.Context(), 7, 9, false))
+	adapter.replyAttempted(88)
+	adapter.processAcknowledgementBatch(t.Context())
+	_, errno = adapter.Read(t.Context(), 7, 9, 0, 1)
+	require.Zero(t, errno)
+	require.Equal(t, 2, core.calls)
 }
 
 type validatingLeaseCore struct {
@@ -228,6 +301,34 @@ func TestAdapterUnknownOpenStopsLaterFsync(t *testing.T) {
 	require.Equal(t, syscall.EIO, errno)
 	require.Equal(t, syscall.EIO, adapter.Fsync(t.Context(), 7, 9, false))
 	require.False(t, core.fsyncCalled)
+}
+
+func TestAdapterOpenRecoversAfterUnknownReplyIsAcknowledged(t *testing.T) {
+	session := filesystem.OperationSessionID{Filesystem: [16]byte{1}, Session: [16]byte{2}}
+	core := &resolvingOpenCore{journalLifecycleCore: &journalLifecycleCore{
+		receiptCore: &receiptCore{journalMetadataCore: &journalMetadataCore{
+			journalWriteCore: &journalWriteCore{fakeCore: &fakeCore{}},
+		}}, openErr: kv.ErrTransactionOutcomeUnknown,
+	}}
+	adapter := New(core, []byte("fuse-session"), WithHandleKeepaliveInterval(0), WithJournaledOpen(session))
+	adapter.ackCancel()
+	t.Cleanup(adapter.Close)
+
+	_, errno := adapter.Open(withReplyIdentity(t.Context(), 77), 7)
+	require.Equal(t, syscall.EIO, errno)
+	core.openErr = nil
+	_, errno = adapter.Open(t.Context(), 7)
+	require.Equal(t, syscall.EIO, errno, "the unknown attempt must block until its reply is resolved")
+
+	adapter.replyAttempted(77)
+	core.ackErr = context.DeadlineExceeded
+	require.False(t, adapter.processAcknowledgementBatch(t.Context()))
+	_, errno = adapter.Open(t.Context(), 7)
+	require.Equal(t, syscall.EIO, errno, "an unresolved acknowledgement must retain the barrier")
+	core.ackErr = nil
+	require.False(t, adapter.processAcknowledgementBatch(t.Context()))
+	_, errno = adapter.Open(t.Context(), 7)
+	require.Zero(t, errno, "a resolved open must not poison later reads of the inode")
 }
 
 func (c *journalLifecycleCore) ReleaseWithOperation(_ context.Context, id filesystem.OperationID, _ uint64, _ uint64, _ []byte) error {

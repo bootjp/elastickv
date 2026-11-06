@@ -707,12 +707,20 @@ func proposeWriterRegistration(
 ) error {
 	attemptCtx, cancel := context.WithTimeout(ctx, registrationAttemptTimeout)
 	defer cancel()
+	if source := bootstrapRegistrationFromContext(attemptCtx); source != nil {
+		if err := source.validate(entry, req); err != nil {
+			return err
+		}
+	}
 	if coordinate.IsLeader() {
 		// Local registration entries must honor the §7.1 cutover
 		// barrier. ProposeAdmin is intentionally barrier-exempt for
 		// the cutover marker itself; using it here could append a
 		// cleartext registration at index > cutover while the raft
 		// wrapper is not installed yet.
+		if source := bootstrapRegistrationFromContext(attemptCtx); source != nil {
+			return source.propose(attemptCtx, defaultProposer, entry, req)
+		}
 		if _, err := defaultProposer.Propose(attemptCtx, entry); err != nil {
 			return errors.Wrap(err, "writer registration: local propose")
 		}
@@ -731,7 +739,15 @@ func proposeWriterRegistrationBlockingOnCutover(
 ) error {
 	attemptCtx, cancel := context.WithTimeout(ctx, registrationAttemptTimeout)
 	defer cancel()
+	if source := bootstrapRegistrationFromContext(attemptCtx); source != nil {
+		if err := source.validate(entry, req); err != nil {
+			return err
+		}
+	}
 	if coordinate.IsLeader() {
+		if source := bootstrapRegistrationFromContext(attemptCtx); source != nil {
+			return source.propose(attemptCtx, defaultProposer, entry, req)
+		}
 		if _, err := defaultProposer.Propose(attemptCtx, entry); err != nil {
 			return errors.Wrap(err, "writer registration: local propose")
 		}
@@ -749,6 +765,9 @@ func forwardWriterRegistrationToLeader(
 	addr := coordinate.RaftLeader()
 	if addr == "" {
 		return errors.New("writer registration: no default-group leader known yet")
+	}
+	if source := bootstrapRegistrationFromContext(attemptCtx); source != nil {
+		return source.forward(attemptCtx, addr, req)
 	}
 	conn, err := connCache.ConnFor(addr)
 	if err != nil {

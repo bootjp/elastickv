@@ -5,6 +5,7 @@ import (
 	"log/slog"
 
 	internalutil "github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/internal/raftengine"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
 	etcdraft "go.etcd.io/raft/v3"
@@ -24,6 +25,11 @@ func (e *Engine) sendReadyMessages(rd etcdraft.Ready) error {
 	removed, err := committedRemovalIndexes(rd.CommittedEntries)
 	if err != nil {
 		return err
+	}
+	// Protected membership requires a journal/catch-up protocol that is not
+	// implemented here. Never send its notification through the legacy dial.
+	if len(removed) != 0 && e.nativeAdmission != nil {
+		return errors.WithStack(raftengine.ErrNativeAdmissionDenied)
 	}
 	if len(removed) == 0 || e.transport == nil {
 		return e.sendMessages(messageValues(rd.Messages))

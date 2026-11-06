@@ -443,6 +443,38 @@ history.
 
 
 
+SQS has two workloads: `elastickv.sqs-workload` for Standard queues and
+`elastickv.sqs-htfifo-workload` for partitioned FIFO queues. The Standard
+checker allows duplicate delivery and reordering, matching the
+[AWS Standard queue contract](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/standard-queues.html).
+It requires confirmed sends to be received and successfully acknowledged
+by DeleteMessage after a bounded drain, and rejects unexpected message
+bodies. A run with no confirmed sends fails rather than passing vacuously.
+The HT-FIFO checker additionally checks per-group ordering and duplicate
+acknowledgements.
+
+Against an existing three-node cluster with SQS enabled:
+
+```bash
+cd jepsen
+lein run -m elastickv.sqs-workload --local \
+  --time-limit 60 --rate 5 --concurrency 5 \
+  --sqs-ports 63501,63502,63503 --host 127.0.0.1
+lein run -m elastickv.sqs-htfifo-workload --local \
+  --time-limit 60 --rate 5 --concurrency 5 \
+  --partition-count 4 --group-count 8 \
+  --sqs-ports 63501,63502,63503 --host 127.0.0.1
+```
+
+Both run in the push CI (with encryption off/on), the VM workflow, and the
+scheduled stress matrix as `sqs-standard` and `sqs-htfifo`.
+For a manual scheduled run, `workloads-json` can be
+`["sqs-standard","sqs-htfifo"]`. The scheduled jobs start a dedicated
+three-node SQS cluster and retain Jepsen histories and failure logs.
+`--local` checks concurrent traffic without injecting faults; managed VM
+runs use the configured nemesis, heal faults, then drain for 40 seconds
+by default (longer than the 30-second receive visibility timeout).
+
 The filesystem workload drives the FUSE mounts directly. Start a cluster with
 `--filesystemMount` on every node (as `scripts/run-jepsen-local.sh` does), then
 run it in `--local` mode, which checks linearizability without injecting any

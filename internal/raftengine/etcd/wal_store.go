@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/cockroachdb/errors"
 	"go.etcd.io/etcd/server/v3/etcdserver/api/snap"
@@ -24,9 +25,10 @@ const (
 )
 
 type diskState struct {
-	Storage   *etcdraft.MemoryStorage
-	Persist   etcdstorage.Storage
-	LocalSnap raftpb.Snapshot
+	VerifiedIdentity *WALIdentity
+	Storage          *etcdraft.MemoryStorage
+	Persist          etcdstorage.Storage
+	LocalSnap        raftpb.Snapshot
 	// EffectiveApplied is the FSM's durable applied index when the
 	// cold-start skip gate fires (i.e., max(snap.Metadata.Index,
 	// have)). Engine.Open uses this to seed e.applied and the atomic
@@ -39,6 +41,12 @@ type diskState struct {
 }
 
 func openDiskState(cfg OpenConfig, peers []Peer) (*diskState, error) {
+	if err := validateNativeIdentityConfig(cfg); err != nil {
+		return nil, err
+	}
+	if err := validateBaselineStartupSource(cfg); err != nil {
+		return nil, err
+	}
 	logger := zap.NewNop()
 	walDir := filepath.Join(cfg.DataDir, walDirName)
 	snapDir := filepath.Join(cfg.DataDir, snapDirName)
@@ -56,18 +64,25 @@ func openDiskState(cfg OpenConfig, peers []Peer) (*diskState, error) {
 	}
 
 	if wal.Exist(walDir) {
-		return loadWalState(logger, walDir, snapDir, fsmSnapDir, cfg.StateMachine, cfg.ColdStartObserver)
+		return loadWalStateWithNamespace(logger, walDir, snapDir, fsmSnapDir, cfg.StateMachine, cfg)
 	}
 
 	legacy, legacyErr := loadLegacyOrSplitState(cfg.DataDir)
 	if legacyErr == nil {
-		return migrateLegacyState(logger, walDir, snapDir, fsmSnapDir, cfg.StateMachine, legacy)
+		return migrateUnprotectedState(logger, walDir, snapDir, fsmSnapDir, cfg, legacy)
 	}
 	if !os.IsNotExist(errors.UnwrapAll(legacyErr)) {
 		return nil, legacyErr
 	}
 
 	return bootstrapNewCluster(logger, walDir, snapDir, fsmSnapDir, cfg, peers)
+}
+
+func migrateUnprotectedState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, cfg OpenConfig, state persistedState) (*diskState, error) {
+	if cfg.NativeIdentity != nil {
+		return nil, errors.Wrap(ErrWALIdentity, "legacy migration requires explicit identity recovery")
+	}
+	return migrateLegacyState(logger, walDir, snapDir, fsmSnapDir, cfg.StateMachine, state)
 }
 
 func prepareDataDirs(dataDir, snapDir, fsmSnapDir string) error {
@@ -99,20 +114,26 @@ func prepareDataDirs(dataDir, snapDir, fsmSnapDir string) error {
 }
 
 func bootstrapNewCluster(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, cfg OpenConfig, peers []Peer) (*diskState, error) {
+	if cfg.NativeIdentity != nil && cfg.NativeIdentity.PreparationDigest != (raftbootstrap.Digest{}) {
+		return nil, errors.Wrap(ErrWALIdentity, "preparation-bound identity cannot create replacement WAL")
+	}
 	if len(peers) == 1 {
-		return bootstrapWalState(logger, walDir, snapDir, fsmSnapDir, cfg.StateMachine, peers)
+		return bootstrapWalState(logger, walDir, snapDir, fsmSnapDir, cfg.StateMachine, peers, cfg.NativeIdentity)
 	}
 	if !cfg.Bootstrap {
+		if cfg.NativeIdentity != nil {
+			return nil, errors.Wrap(ErrWALIdentity, "protected join requires explicit native baseline")
+		}
 		return joinWalState(logger, walDir, snapDir, fsmSnapDir)
 	}
-	return bootstrapWalState(logger, walDir, snapDir, fsmSnapDir, cfg.StateMachine, peers)
+	return bootstrapWalState(logger, walDir, snapDir, fsmSnapDir, cfg.StateMachine, peers, cfg.NativeIdentity)
 }
 
 func joinWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string) (*diskState, error) {
 	return persistBootState(logger, walDir, snapDir, fsmSnapDir, nil, persistedState{})
 }
 
-func bootstrapWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm StateMachine, peers []Peer) (*diskState, error) {
+func bootstrapWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm StateMachine, peers []Peer, identity ...*WALIdentity) (*diskState, error) {
 	// Bootstrap snapshot always has index 1.
 	const bootstrapIndex = uint64(1)
 	if err := recordNamespaceConfiguration(fsm, bootstrapIndex, confStateForPeers(peers)); err != nil {
@@ -132,20 +153,21 @@ func bootstrapWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, f
 	}
 	token := encodeSnapshotToken(bootstrapIndex, crc32c)
 	boot := bootstrapStateForPeers(peers, token)
-	return persistBootState(logger, walDir, snapDir, fsmSnapDir, fsm, boot)
+	return persistBootState(logger, walDir, snapDir, fsmSnapDir, fsm, boot, identity...)
 }
 
 // walRestoreState is constructed only by readWALRestoreState, which selects a
 // WAL-valid snapshot and successfully reads the WAL from that exact boundary.
 // Its unexported type carries that provenance into the origin-aware restorer.
 type walRestoreState struct {
-	snapshot  raftpb.Snapshot
-	w         *wal.WAL
-	hardState raftpb.HardState
-	entries   []raftpb.Entry
+	verifiedIdentity *WALIdentity
+	snapshot         raftpb.Snapshot
+	w                *wal.WAL
+	hardState        raftpb.HardState
+	entries          []raftpb.Entry
 }
 
-func readWALRestoreState(logger *zap.Logger, walDir, snapDir string) (*walRestoreState, error) {
+func readWALRestoreState(logger *zap.Logger, walDir, snapDir string, identity ...*WALIdentity) (*walRestoreState, error) {
 	// Scope the repair retry tightly to WAL-only reads: both
 	// loadPersistedSnapshot (scans WAL via wal.ValidSnapshotEntries)
 	// and openAndReadWAL's ReadAll can surface io.ErrUnexpectedEOF
@@ -170,20 +192,32 @@ func readWALRestoreState(logger *zap.Logger, walDir, snapDir string) (*walRestor
 	// applied pointer when volatile/conf-change entries must replay, and
 	// applyNormalCommitted drops data-mutating duplicates while applying
 	// the remaining committed tail.
-	w, hardState, entries, err := openAndReadWALWithRepair(logger, walDir, walSnapshotFor(snapshot))
+	w, hardState, entries, err := openAndReadWALWithRepair(logger, walDir, walSnapshotFor(snapshot), identity...)
 	if err != nil {
 		return nil, err
 	}
-	return &walRestoreState{snapshot: snapshot, w: w, hardState: hardState, entries: entries}, nil
+	return &walRestoreState{snapshot: snapshot, w: w, hardState: hardState, entries: entries, verifiedIdentity: copyWALIdentity(identity)}, nil
 }
 
-func loadWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm StateMachine, obs raftengine.ColdStartObserver) (*diskState, error) {
-	selected, err := readWALRestoreState(logger, walDir, snapDir)
+func loadWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm StateMachine, obs raftengine.ColdStartObserver, identity ...*WALIdentity) (*diskState, error) {
+	return loadWalStateRecovery(logger, walDir, snapDir, fsmSnapDir, fsm, obs, nil, identity...)
+}
+
+func loadWalStateRecovery(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm StateMachine, obs raftengine.ColdStartObserver, verify NamespaceRecoveryVerifier, identity ...*WALIdentity) (*diskState, error) {
+	image, err := readNamespaceRecoveryImage(walDir, verify)
+	if err != nil {
+		return nil, err
+	}
+	selected, err := readWALRestoreState(logger, walDir, snapDir, identity...)
 	if err != nil {
 		return nil, err
 	}
 	committedReplayTarget := coldStartReplayTarget(selected.snapshot, selected.hardState)
-	effectiveApplied, externalValidated, err := restoreSnapshotWithOrigin(fsm, selected, committedReplayTarget, fsmSnapDir, obs, logger)
+	effectiveApplied, handled, err := recoverVerifiedNamespace(selected, image, filepath.Dir(walDir), verify)
+	externalValidated := false
+	if err == nil && !handled {
+		effectiveApplied, externalValidated, err = restoreSnapshotWithOrigin(fsm, selected, committedReplayTarget, fsmSnapDir, obs, logger)
+	}
 	if err != nil {
 		if closeErr := selected.w.Close(); closeErr != nil {
 			logger.Warn("WAL close failed after restoreSnapshotState error",
@@ -215,6 +249,7 @@ func loadWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm St
 		LocalSnap:                selected.snapshot,
 		EffectiveApplied:         effectiveApplied,
 		ExternalRestoreValidated: externalValidated,
+		VerifiedIdentity:         copyWALIdentity([]*WALIdentity{selected.verifiedIdentity}),
 	}, nil
 }
 
@@ -337,8 +372,8 @@ func loadPersistedSnapshotWithRepair(logger *zap.Logger, walDir string, snapshot
 
 // openAndReadWALWithRepair wraps openAndReadWAL with one wal.Repair
 // attempt on io.ErrUnexpectedEOF.
-func openAndReadWALWithRepair(logger *zap.Logger, walDir string, walSnap walpb.Snapshot) (*wal.WAL, raftpb.HardState, []raftpb.Entry, error) {
-	w, hs, ents, err := openAndReadWAL(logger, walDir, walSnap)
+func openAndReadWALWithRepair(logger *zap.Logger, walDir string, walSnap walpb.Snapshot, identity ...*WALIdentity) (*wal.WAL, raftpb.HardState, []raftpb.Entry, error) {
+	w, hs, ents, err := openAndReadWAL(logger, walDir, walSnap, identity...)
 	if err == nil || !errors.Is(err, io.ErrUnexpectedEOF) {
 		return w, hs, ents, err
 	}
@@ -349,7 +384,7 @@ func openAndReadWALWithRepair(logger *zap.Logger, walDir string, walSnap walpb.S
 	if !wal.Repair(logger, walDir) {
 		return nil, raftpb.HardState{}, nil, errors.Wrap(err, "WAL unrepairable")
 	}
-	w, hs, ents, err = openAndReadWAL(logger, walDir, walSnap)
+	w, hs, ents, err = openAndReadWAL(logger, walDir, walSnap, identity...)
 	if err != nil {
 		return nil, raftpb.HardState{}, nil, errors.Wrap(err, "WAL unrepairable after repair")
 	}
@@ -360,12 +395,15 @@ func openAndReadWALWithRepair(logger *zap.Logger, walDir string, walSnap walpb.S
 // and other errors propagate upward; the retry/repair is handled once at
 // loadWalState so ValidSnapshotEntries and ReadAll share a single repair
 // pass and the "WAL tail truncated" log is emitted at most once.
-func openAndReadWAL(logger *zap.Logger, walDir string, walSnap walpb.Snapshot) (*wal.WAL, raftpb.HardState, []raftpb.Entry, error) {
+func openAndReadWAL(logger *zap.Logger, walDir string, walSnap walpb.Snapshot, identity ...*WALIdentity) (*wal.WAL, raftpb.HardState, []raftpb.Entry, error) {
 	w, err := wal.Open(logger, walDir, &walSnap)
 	if err != nil {
 		return nil, raftpb.HardState{}, nil, errors.WithStack(err)
 	}
-	_, hardState, entries, err := w.ReadAll()
+	metadata, hardState, entries, err := w.ReadAll()
+	if err == nil {
+		err = verifyWALIdentity(metadata, copyWALIdentity(identity))
+	}
 	if err != nil {
 		if closeErr := w.Close(); closeErr != nil {
 			logger.Warn("WAL close failed after ReadAll error",
@@ -686,7 +724,11 @@ func restoreAndOffloadLegacySnapshot(fsm StateMachine, fsmSnapDir string, snap r
 	return encodeSnapshotToken(index, crc32c), nil
 }
 
-func persistBootState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm StateMachine, state persistedState) (*diskState, error) {
+func persistBootState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm StateMachine, state persistedState, identity ...*WALIdentity) (*diskState, error) {
+	metadata, err := encodeWALIdentity(copyWALIdentity(identity))
+	if err != nil {
+		return nil, err
+	}
 	if err := ensureWalDirs(walDir, snapDir); err != nil {
 		return nil, err
 	}
@@ -696,10 +738,10 @@ func persistBootState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fs
 		// (bootstrap path runs before OpenConfig wiring reaches
 		// this point) and a fresh-bootstrap restore will be a no-op
 		// anyway (the WAL was just created).
-		return loadWalState(logger, walDir, snapDir, fsmSnapDir, fsm, nil)
+		return loadWalState(logger, walDir, snapDir, fsmSnapDir, fsm, nil, identity...)
 	}
 
-	w, err := wal.Create(logger, walDir, nil)
+	w, err := wal.Create(logger, walDir, metadata)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -717,9 +759,10 @@ func persistBootState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fs
 		return nil, err
 	}
 	return &diskState{
-		Storage:   storage,
-		Persist:   persist,
-		LocalSnap: state.Snapshot,
+		Storage:          storage,
+		Persist:          persist,
+		LocalSnap:        state.Snapshot,
+		VerifiedIdentity: copyWALIdentity(identity),
 	}, nil
 }
 

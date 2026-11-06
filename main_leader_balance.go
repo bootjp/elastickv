@@ -103,7 +103,7 @@ func startLeaderBalanceScheduler(ctx context.Context, eg *errgroup.Group, runtim
 		cfg:                cfg,
 		runtimes:           runtimes,
 		defaultRuntime:     runtimeForGroup(runtimes, cfg.defaultGroupID),
-		connCache:          &kv.GRPCConnCache{},
+		connCache:          newBootstrapRuntimeConnCache(runtimes),
 		groupCooldownUntil: make(map[uint64]time.Time),
 	}
 	eg.Go(func() error {

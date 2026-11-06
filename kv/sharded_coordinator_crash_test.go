@@ -22,6 +22,7 @@ const multiGroupCrashDirectory = "ELASTICKV_MULTIGROUP_CRASH_DIRECTORY"
 type killAfterPrimaryCommit struct {
 	Transactional
 	marker string
+	kill   func(int, syscall.Signal) error
 }
 
 func (t killAfterPrimaryCommit) Commit(ctx context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
@@ -42,9 +43,22 @@ func (t killAfterPrimaryCommit) Commit(ctx context.Context, reqs []*pb.Request) 
 		if closeErr := marker.Close(); closeErr != nil {
 			return nil, closeErr
 		}
-		_ = syscall.Kill(os.Getpid(), syscall.SIGKILL)
+		return nil, t.killAndWait(ctx)
 	}
 	return response, err
+}
+
+func (t killAfterPrimaryCommit) killAndWait(ctx context.Context) error {
+	kill := t.kill
+	if kill == nil {
+		kill = syscall.Kill
+	}
+	if err := kill(os.Getpid(), syscall.SIGKILL); err != nil {
+		return err
+	}
+	// Signal acceptance is not process death; never resume secondary commit.
+	<-ctx.Done()
+	return ctx.Err()
 }
 
 func openCrashTestGroups(t *testing.T, dir string, bootstrap bool) (*LockResolver, *ShardStore, map[uint64]*ShardGroup, func()) {

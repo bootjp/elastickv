@@ -1,0 +1,14 @@
+syntax = "proto3";
+
+package elastickv.peersession.v1;
+option go_package = "github.com/bootjp/elastickv/internal/peersession/wire";
+
+// Body is a bounded canonical v1 record, not an extensible protobuf policy.
+message Frame {
+  bytes body = 1;
+}
+
+service PeerSession {
+  rpc Begin(Frame) returns (Frame);
+  rpc Finish(Frame) returns (Frame);
+}

@@ -444,7 +444,6 @@ func (s *S3Server) adminDeleteBucketTxnBody(ctx context.Context, name string, de
 		return errors.Wrap(err, "s3 admin: allocate startTS for adminDeleteBucket")
 	}
 	readTS = readTimestamp.Timestamp()
-	startTS := readTS
 	readPin := s.pinReadTS(readTS)
 	defer readPin.Release()
 
@@ -467,13 +466,8 @@ func (s *S3Server) adminDeleteBucketTxnBody(ctx context.Context, name string, de
 	// AdminCreateBucket racing the delete is rejected by OCC.
 	// retryS3Mutation handles ErrWriteConflict / ErrTxnLocked
 	// by re-running this whole closure.
-	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
-	if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, &kv.OperationGroup[kv.OP]{
-		IsTxn:   true,
-		StartTS: startTS,
-		Elems:   []*kv.Elem[kv.OP]{{Op: kv.Del, Key: s3keys.BucketMetaKey(name)}},
-	}); err != nil {
-		return errors.WithStack(err)
+	if err := s.dispatchBucketDeleteTxn(ctx, readTimestamp, name, meta.Generation); err != nil {
+		return err
 	}
 	*deletedGeneration = meta.Generation
 	return nil

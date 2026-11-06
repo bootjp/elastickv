@@ -19,6 +19,7 @@ type mutationTracker struct {
 	pending map[uint64]map[*mutationTicket]struct{}
 	count   int
 	sticky  map[uint64]syscall.Errno
+	unknown map[uint64]uint64
 }
 
 type mutationTicket struct {
@@ -102,6 +103,10 @@ func (m *mutationTracker) end(ticket *mutationTicket, unknown bool) {
 				m.sticky = make(map[uint64]syscall.Errno)
 			}
 			m.sticky[key] = syscall.EIO
+			if m.unknown == nil {
+				m.unknown = make(map[uint64]uint64)
+			}
+			m.unknown[key]++
 		}
 		delete(m.pending[key], ticket)
 		if len(m.pending[key]) == 0 {
@@ -118,6 +123,26 @@ func (m *mutationTracker) markUnknown(key uint64) {
 		m.sticky = make(map[uint64]syscall.Errno)
 	}
 	m.sticky[key] = syscall.EIO
+	if m.unknown == nil {
+		m.unknown = make(map[uint64]uint64)
+	}
+	m.unknown[key]++
+}
+
+// resolveUnknown removes one ambiguity only after its operation has reached
+// an authoritative terminal decision. Other unresolved mutations on the same
+// inode must keep the barrier closed.
+func (m *mutationTracker) resolveUnknown(key uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.unknown[key] == 0 {
+		return
+	}
+	m.unknown[key]--
+	if m.unknown[key] == 0 {
+		delete(m.unknown, key)
+		delete(m.sticky, key)
+	}
 }
 
 func (m *mutationTracker) wait(ctx context.Context, key uint64) syscall.Errno {

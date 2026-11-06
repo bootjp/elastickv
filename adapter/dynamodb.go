@@ -118,17 +118,18 @@ const (
 type DynamoDBServerOption func(*DynamoDBServer)
 
 type DynamoDBServer struct {
-	listen          net.Listener
-	store           store.MVCCStore
-	coordinator     kv.Coordinator
-	httpServer      *http.Server
-	httpConns       *httpConnTracker
-	targetHandlers  map[string]func(http.ResponseWriter, *http.Request)
-	readTracker     *kv.ActiveTimestampTracker
-	requestObserver monitoring.DynamoDBRequestObserver
-	itemUpdateLocks [itemUpdateLockStripeCount]chan struct{}
-	tableLocks      [tableLockStripeCount]sync.Mutex
-	leaderDynamo    map[string]string
+	requestAdmission RequestAdmission
+	listen           net.Listener
+	store            store.MVCCStore
+	coordinator      kv.Coordinator
+	httpServer       *http.Server
+	httpConns        *httpConnTracker
+	targetHandlers   map[string]func(http.ResponseWriter, *http.Request)
+	readTracker      *kv.ActiveTimestampTracker
+	requestObserver  monitoring.DynamoDBRequestObserver
+	itemUpdateLocks  [itemUpdateLockStripeCount]chan struct{}
+	tableLocks       [tableLockStripeCount]sync.Mutex
+	leaderDynamo     map[string]string
 
 	// onePhaseTxnDedup enables option-2 one-phase idempotency on the
 	// single-item write path (UpdateItem / PutItem / DeleteItem): on a
@@ -302,6 +303,7 @@ func NewDynamoDBServer(listen net.Listener, st store.MVCCStore, coordinate kv.Co
 			opt(d)
 		}
 	}
+	installHTTPRequestAdmission(d.httpServer, d.requestAdmission)
 	return d
 }
 

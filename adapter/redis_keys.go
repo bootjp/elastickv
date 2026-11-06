@@ -14,6 +14,10 @@ import (
 const keysCommandArgs = 2
 
 func (r *RedisServer) keys(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if len(cmd.Args) < keysCommandArgs {
 		conn.WriteError("ERR wrong number of arguments for 'keys' command")
 		return
@@ -26,13 +30,14 @@ func (r *RedisServer) keys(conn redcon.Conn, cmd redcon.Command) {
 		// must not pin the command handler indefinitely. The same
 		// bound the rest of the dispatch path (sadd, set, …) uses;
 		// see Codex P1 review on PR #749.
-		ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
+		ctx, cancel := context.WithTimeout(r.handlerContext(conn),
+			redisDispatchTimeout)
 		defer cancel()
 		if err := r.coordinator.VerifyLeader(ctx); err != nil {
 			writeRedisError(conn, err)
 			return
 		}
-		keys, err := r.visibleKeys(pattern)
+		keys, err := r.visibleKeys(pattern, r.handlerContext(conn))
 		if err != nil {
 			writeRedisError(conn, err)
 			return
@@ -44,7 +49,7 @@ func (r *RedisServer) keys(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 
-	keys, err := r.proxyKeys(pattern)
+	keys, err := r.proxyKeys(pattern, r.handlerContext(conn))
 	if err != nil {
 		writeRedisError(conn, err)
 		return
@@ -56,15 +61,16 @@ func (r *RedisServer) keys(conn redcon.Conn, cmd redcon.Command) {
 	}
 }
 
-func (r *RedisServer) localKeys(pattern []byte) ([][]byte, error) {
+func (r *RedisServer) localKeys(pattern []byte, requestContexts ...context.Context) ([][]byte, error) {
 	if !bytes.Contains(pattern, []byte("*")) {
-		return r.localKeysExact(pattern)
+		return r.localKeysExact(pattern, r.redisContext(requestContexts...))
 	}
-	return r.localKeysPattern(pattern)
+	return r.localKeysPattern(pattern, r.redisContext(requestContexts...))
 }
 
-func (r *RedisServer) localKeysExact(pattern []byte) ([][]byte, error) {
-	typ, err := r.keyTypeAt(context.Background(), pattern, r.readTS())
+func (r *RedisServer) localKeysExact(pattern []byte, requestContexts ...context.Context) ([][]byte, error) {
+	typ, err := r.keyTypeAt(r.redisContext(requestContexts...),
+		pattern, r.readTS())
 	if err != nil {
 		return nil, err
 	}
@@ -143,13 +149,14 @@ func streamMetaScanStart(userPrefix []byte) []byte {
 	return store.StreamMetaKey(userPrefix)
 }
 
-func (r *RedisServer) localKeysPattern(pattern []byte) ([][]byte, error) {
+func (r *RedisServer) localKeysPattern(pattern []byte, requestContexts ...context.Context) ([][]byte, error) {
 	start, end := patternScanBounds(pattern)
 	keyset := map[string][]byte{}
 	readTS := r.readTS()
 
 	mergeScannedKeys := func(scanStart, scanEnd []byte) error {
-		keys, err := r.store.ScanAt(context.Background(), scanStart, scanEnd, math.MaxInt, readTS)
+		keys, err := r.store.ScanAt(r.redisContext(requestContexts...),
+			scanStart, scanEnd, math.MaxInt, readTS)
 		if err != nil {
 			return errors.WithStack(err)
 		}

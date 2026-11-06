@@ -28,8 +28,8 @@ func migrationMembershipInterceptor(runtime *raftGroupRuntime, shards *kv.ShardS
 		return prepare
 	}
 	protocols := newMigrationMembershipGate(runtime.store, migrationMemberProtocolsConfigured(),
-		newMigrationMemberProtocolProbe(token), prepare)
-	return newMigrationNamespaceMembershipGate(runtime.store, runtime.snapshotEngine(), proposer, token, protocols)
+		newMigrationMemberProtocolProbe(token, bootstrapRuntimeDialOptions([]*raftGroupRuntime{runtime})), prepare)
+	return newMigrationNamespaceMembershipGate(runtime.store, runtime.snapshotEngine(), proposer, token, protocols, bootstrapRuntimeDialOptions([]*raftGroupRuntime{runtime}))
 }
 
 // Check support before any new member can race a guarded-control proposal.

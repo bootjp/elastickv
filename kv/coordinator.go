@@ -247,6 +247,7 @@ type CoordinateResponse struct {
 }
 
 type Coordinate struct {
+	operationAdmission OperationAdmission
 	transactionManager Transactional
 	engine             raftengine.Engine
 	// lp caches the engine's optional LeaseProvider capability so the
@@ -555,6 +556,12 @@ func LeaseReadGroupKeys(c Coordinator, keys [][]byte) [][]byte {
 }
 
 func (c *Coordinate) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
+	return admittedOperation(ctx, c.operationAdmission, coordinateSingleGroupID, AdmissionData, func(owned context.Context) (*CoordinateResponse, error) {
+		return c.dispatchWithRetry(owned, reqs)
+	})
+}
+
+func (c *Coordinate) dispatchWithRetry(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -760,6 +767,12 @@ func prepareDispatchRetry(ctx context.Context, reqs *OperationGroup[OP], leaderA
 // physical-ceiling lease. Re-using the previous StartTS could violate
 // monotonicity across the leader transition.
 func (c *Coordinate) dispatchOnce(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
+	return admittedOperation(ctx, c.operationAdmission, coordinateSingleGroupID, AdmissionData, func(owned context.Context) (*CoordinateResponse, error) {
+		return c.dispatchAdmitted(owned, reqs)
+	})
+}
+
+func (c *Coordinate) dispatchAdmitted(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
 	if !c.IsLeader() {
 		c.observeElems(reqs.Elems, reqs.KeyVizLabel)
 		return c.redirect(ctx, reqs)
@@ -996,7 +1009,9 @@ func (c *Coordinate) Clock() *HLC {
 func (c *Coordinate) ProposeHLCLease(ctx context.Context, ceilingMs int64) error {
 	dispatchStart := monoclock.Now()
 	expectedGen := c.lease.generation()
-	_, err := c.engine.Propose(ctx, marshalHLCLeaseRenew(ceilingMs))
+	_, err := admittedOperation(ctx, c.operationAdmission, coordinateSingleGroupID, AdmissionHLC, func(owned context.Context) (*raftengine.ProposalResult, error) {
+		return c.engine.Propose(owned, marshalHLCLeaseRenew(ceilingMs))
+	})
 	if err != nil {
 		if isLeadershipLossError(err) {
 			c.lease.invalidate()
@@ -1057,6 +1072,8 @@ func (c *Coordinate) RunHLCLeaseRenewal(ctx context.Context) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	var children sync.WaitGroup
+	defer children.Wait()
 	// Schedule relative to proposal launch, not completion. A renewal proposal
 	// may legitimately take longer than hlcRenewalInterval under load; letting
 	// the next tick launch a fresher ceiling keeps logical counter headroom
@@ -1071,7 +1088,11 @@ func (c *Coordinate) RunHLCLeaseRenewal(ctx context.Context) {
 				continue
 			}
 			if c.IsLeaderAcceptingWrites() {
-				c.renewHLCLeaseAsync(ctx)
+				children.Add(1)
+				go func() {
+					defer children.Done()
+					<-c.renewHLCLeaseAsync(ctx)
+				}()
 			}
 			timer.Reset(hlcRenewalInterval)
 		case <-ctx.Done():
@@ -1080,9 +1101,11 @@ func (c *Coordinate) RunHLCLeaseRenewal(ctx context.Context) {
 	}
 }
 
-func (c *Coordinate) renewHLCLeaseAsync(ctx context.Context) {
+func (c *Coordinate) renewHLCLeaseAsync(ctx context.Context) <-chan struct{} {
+	done := make(chan struct{})
 	ceilingMs := time.Now().UnixMilli() + hlcPhysicalWindowMs
 	go func() {
+		defer close(done)
 		pctx, cancel := context.WithTimeout(ctx, hlcRenewalProposalTimeout)
 		defer cancel()
 		if err := c.ProposeHLCLease(pctx, ceilingMs); err != nil {
@@ -1092,6 +1115,7 @@ func (c *Coordinate) renewHLCLeaseAsync(ctx context.Context) {
 			)
 		}
 	}()
+	return done
 }
 
 func (c *Coordinate) IsLeaderForKey(_ []byte) bool {
@@ -1250,6 +1274,12 @@ func (c *Coordinate) allocateTimestamp(ctx context.Context, label string) (uint6
 }
 
 func (c *Coordinate) allocateTimestampAfter(ctx context.Context, label string, min uint64) (uint64, error) {
+	return admittedOperation(ctx, c.operationAdmission, coordinateSingleGroupID, AdmissionAllocator, func(owned context.Context) (uint64, error) {
+		return c.allocateAdmittedTimestampAfter(owned, label, min)
+	})
+}
+
+func (c *Coordinate) allocateAdmittedTimestampAfter(ctx context.Context, label string, min uint64) (uint64, error) {
 	if min == ^uint64(0) {
 		return 0, errors.Wrap(ErrTxnCommitTSRequired, label)
 	}
@@ -1538,9 +1568,20 @@ func (c *Coordinate) toRawRequest(req *Elem[OP]) *pb.Request {
 
 var ErrInvalidRequest = errors.New("invalid request")
 
-// maxReadKeys caps the number of keys that may appear in a transaction's read
-// set. Exceeding this limit is rejected to prevent unbounded memory growth.
-const maxReadKeys = 10_000
+// MaxReadKeys bounds the physical read set in a transaction request, including
+// staged-visibility aliases. S3 completion must support all 10,000 parts even
+// during migration: reserve 240 logical keys for metadata/fences and write
+// aliases, then allow two physical keys per logical read. Keep the post-alias
+// checks as well as the input checks to bound accepted physical key counts
+// without dropping conflict keys or reducing the supported part count. This
+// count is not a byte budget or a bound on allocations before alias checks.
+const (
+	maxDataReadKeys = 10_000
+	readKeyHeadroom = 240
+	MaxReadKeys     = 2 * (maxDataReadKeys + readKeyHeadroom)
+)
+
+const maxReadKeys = MaxReadKeys
 
 var ErrLeaderNotFound = errors.New("leader not found")
 

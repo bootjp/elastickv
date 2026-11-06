@@ -32,9 +32,11 @@ const maxTSOCommitFloorConcurrency = 16
 
 // ShardStore routes MVCC reads to shard-specific stores and proxies to leaders when needed.
 type ShardStore struct {
-	engine            *distribution.Engine
-	groups            map[uint64]*ShardGroup
-	partitionResolver PartitionResolver
+	operationAdmission OperationAdmission
+	startupControlRPC  StartupControlRPC
+	engine             *distribution.Engine
+	groups             map[uint64]*ShardGroup
+	partitionResolver  PartitionResolver
 	// readWatermarkAdvance enables ensureReadWatermark. It is opt-in until
 	// every replica understands the advance entry (rolling upgrades).
 	readWatermarkAdvance bool
@@ -66,6 +68,11 @@ func NewShardStore(engine *distribution.Engine, groups map[uint64]*ShardGroup) *
 		engine: engine,
 		groups: groups,
 	}
+}
+
+// SetOperationAdmission must be called before starting receiver operations.
+func (s *ShardStore) SetOperationAdmission(hook OperationAdmission) {
+	s.operationAdmission = hook
 }
 
 // WithPartitionResolver installs the same partition-keyspace resolver used by
@@ -269,6 +276,9 @@ func (s *ShardStore) GetAtWithReadFence(ctx context.Context, key []byte, ts uint
 	ctx = migrationServingReadContext(ctx, readRouteVersion)
 	if err := s.awaitReadRouteVersion(ctx, readRouteVersion); err != nil {
 		return nil, err
+	}
+	if value, handled, err := s.partitionTxnGetAtWithReadFence(ctx, key, ts, groupID, readRouteVersion); handled {
+		return value, err
 	}
 	if groupID != 0 {
 		return s.getGroupAtWithReadFence(ctx, groupID, key, ts, readRouteVersion)
@@ -753,31 +763,31 @@ func (s *ShardStore) routeForExplicitGroupKey(groupID uint64, key []byte) (distr
 	if s == nil || s.engine == nil {
 		return fallback, nil
 	}
+	partitionTxn, err := s.validatePartitionTxnGroup(key, groupID)
+	if err != nil {
+		return distribution.Route{}, err
+	}
 	if route, ok := s.s3BucketAuxiliaryOwnerRouteForKey(key); ok {
-		if route.GroupID == groupID {
-			return route, nil
-		}
-		if routeHasStagedVisibility(route) {
-			return distribution.Route{}, errors.Wrapf(ErrExplicitGroupStagedVisibilityUnresolved, "group_id=%d key=%q", groupID, key)
-		}
-		return distribution.Route{}, errors.Wrapf(
-			ErrExplicitGroupRouteOwnerMismatch,
-			"group_id=%d catalog_group_id=%d key=%q", groupID, route.GroupID, key)
+		return explicitGroupOwnerRoute(route, groupID, key, false)
 	}
 	if route, ok := s.engine.GetRoute(routeKey(key)); ok {
-		if route.GroupID == groupID {
-			return route, nil
-		}
-		if routeHasStagedVisibility(route) {
-			return distribution.Route{}, errors.Wrapf(ErrExplicitGroupStagedVisibilityUnresolved, "group_id=%d key=%q", groupID, key)
-		}
-		if !explicitGroupResolverOwnedKey(key) {
-			return distribution.Route{}, errors.Wrapf(
-				ErrExplicitGroupRouteOwnerMismatch,
-				"group_id=%d catalog_group_id=%d key=%q", groupID, route.GroupID, key)
-		}
+		return explicitGroupOwnerRoute(route, groupID, key, partitionTxn || explicitGroupResolverOwnedKey(key))
 	}
 	return fallback, nil
+}
+
+func explicitGroupOwnerRoute(route distribution.Route, groupID uint64, key []byte, resolverOwned bool) (distribution.Route, error) {
+	if route.GroupID == groupID {
+		return route, nil
+	}
+	if routeHasStagedVisibility(route) {
+		return distribution.Route{}, errors.Wrapf(ErrExplicitGroupStagedVisibilityUnresolved, "group_id=%d key=%q", groupID, key)
+	}
+	if !resolverOwned {
+		return distribution.Route{}, errors.Wrapf(ErrExplicitGroupRouteOwnerMismatch,
+			"group_id=%d catalog_group_id=%d key=%q", groupID, route.GroupID, key)
+	}
+	return distribution.Route{GroupID: groupID}, nil
 }
 
 // explicitGroupResolverOwnedKey reports whether key belongs to a keyspace whose
@@ -5581,7 +5591,10 @@ func (s *ShardStore) loadTxnLock(ctx context.Context, primaryKey []byte) (txnLoc
 }
 
 func (s *ShardStore) tryAbortExpiredPrimary(ctx context.Context, primaryKey []byte, startTS uint64) (bool, error) {
-	pg, ok := s.groupForKey(primaryKey)
+	pg, ok, err := s.groupForTxnPrimary(primaryKey)
+	if err != nil {
+		return false, err
+	}
 	if !ok || pg == nil || pg.Txn == nil {
 		return false, nil
 	}
@@ -6431,14 +6444,9 @@ func (s *ShardStore) authoritativeGroupLastCommitTS(ctx context.Context, groupID
 		return 0, errors.Wrapf(ErrTSOCommitFloorUnavailable,
 			"data group %d has no known leader", groupID)
 	}
-	conn, err := s.connCache.ConnFor(addr)
-	if err != nil {
-		return 0, errors.Wrapf(ErrTSOCommitFloorUnavailable,
-			"dial data group %d leader %s: %v", groupID, addr, err)
-	}
 	requestCtx, cancel := context.WithTimeout(nonNilTSOContext(ctx), proxyForwardTimeout)
 	defer cancel()
-	resp, err := pb.NewRawKVClient(conn).RawLatestCommitTS(requestCtx, &pb.RawLatestCommitTSRequest{GroupId: groupID})
+	resp, err := s.remoteStartupGroupFloor(requestCtx, groupID, addr)
 	if err != nil {
 		return 0, errors.Wrapf(ErrTSOCommitFloorUnavailable,
 			"read data group %d leader %s watermark: %v", groupID, addr, err)
@@ -6553,11 +6561,14 @@ func (s *ShardStore) WriteConflictCountsByPrefix() map[string]uint64 {
 }
 
 func (s *ShardStore) Compact(ctx context.Context, minTS uint64) error {
-	for _, g := range s.groups {
+	for gid, g := range s.groups {
 		if g == nil || g.Store == nil {
 			continue
 		}
-		if err := g.Store.Compact(ctx, minTS); err != nil {
+		_, err := admittedOperation(ctx, s.operationAdmission, gid, AdmissionMaintenance, func(owned context.Context) (struct{}, error) {
+			return struct{}{}, g.Store.Compact(owned, minTS)
+		})
+		if err != nil {
 			return errors.WithStack(err)
 		}
 	}

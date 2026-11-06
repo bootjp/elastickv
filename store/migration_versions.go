@@ -390,6 +390,9 @@ func decodeMigrationPromotionStates(data []byte) (map[uint64]PromotionState, boo
 }
 
 func validateImportVersion(version MVCCVersion) error {
+	if err := validateControlVersionKey(version.Key, version.CommitTS); err != nil {
+		return err
+	}
 	if IsMigrationOwnershipMetadataKey(version.Key) || IsMigrationOwnershipPartitionMetadataKey(version.Key) {
 		return errors.Wrap(ErrInvalidImportVersion, "migration cannot import ownership metadata")
 	}
@@ -469,7 +472,7 @@ func (s *mvccStore) ExportVersions(ctx context.Context, opts ExportVersionsOptio
 
 func (s *mvccStore) exportVersionsLocked(ctx context.Context, opts ExportVersionsOptions, pos exportCursorPosition) (ExportVersionsResult, error) {
 	result := newExportVersionsResult(opts.MaxVersions)
-	it := s.tree.Iterator()
+	it := s.entryTreeIterator()
 	if !s.seekMemoryExportStart(&it, opts.StartKey, pos) {
 		result.Done = true
 		return result, nil
@@ -536,9 +539,9 @@ func newExportVersionsResult(maxVersions int) ExportVersionsResult {
 
 func (s *mvccStore) seekMemoryExportStart(it *treemap.Iterator, startKey []byte, pos exportCursorPosition) bool {
 	if pos.hasKey {
-		return seekForwardIteratorStart(s.tree, it, pos.key)
+		return seekForwardIteratorStart(it, pos.key)
 	}
-	return seekForwardIteratorStart(s.tree, it, startKey)
+	return seekForwardIteratorStart(it, startKey)
 }
 
 func exportMemoryIteratorKey(
@@ -696,8 +699,17 @@ func exportMemoryVersionsForKey(
 	return true, nil
 }
 
-func (s *mvccStore) ImportVersions(_ context.Context, opts ImportVersionsOptions) (ImportVersionsResult, error) {
+func (s *mvccStore) ImportVersions(ctx context.Context, opts ImportVersionsOptions) (ImportVersionsResult, error) {
+	if err := s.rejectMemoryEntry(ctx); err != nil {
+		return ImportVersionsResult{}, err
+	}
+	return s.importMemoryVersions(opts)
+}
+
+func (s *mvccStore) importMemoryVersions(opts ImportVersionsOptions) (ImportVersionsResult, error) {
+	s.applyMu.Lock()
 	s.mtx.Lock()
+	defer s.applyMu.Unlock()
 	defer s.mtx.Unlock()
 	if _, retired := s.migrationRetired[opts.JobID]; retired {
 		return ImportVersionsResult{}, errors.WithStack(ErrMigrationRetired)
@@ -741,16 +753,22 @@ func (s *mvccStore) ImportVersionsRaft(ctx context.Context, opts ImportVersionsO
 	return s.ImportVersions(ctx, opts)
 }
 
-func (s *mvccStore) MigrationHLCFloor(_ context.Context, jobID uint64) (uint64, error) {
+func (s *mvccStore) MigrationHLCFloor(ctx context.Context, jobID uint64) (uint64, error) {
+	if staged := s.memoryEntryStore(ctx); staged != nil {
+		return staged.MigrationHLCFloor(ctx, jobID)
+	}
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
-	return s.migrationHLCFloors[jobID], nil
+	return max(s.migrationHLCFloors[jobID], s.floorOverlay[jobID]), nil
 }
 
-func (s *mvccStore) MigrationImportMetadataPresent(_ context.Context, jobID uint64) (bool, error) {
+func (s *mvccStore) MigrationImportMetadataPresent(ctx context.Context, jobID uint64) (bool, error) {
+	if staged := s.memoryEntryStore(ctx); staged != nil {
+		return staged.MigrationImportMetadataPresent(ctx, jobID)
+	}
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
-	if s.migrationHLCFloors[jobID] != 0 {
+	if max(s.migrationHLCFloors[jobID], s.floorOverlay[jobID]) != 0 {
 		return true, nil
 	}
 	for id := range s.migrationAcks {
@@ -762,10 +780,15 @@ func (s *mvccStore) MigrationImportMetadataPresent(_ context.Context, jobID uint
 }
 
 func (s *mvccStore) RetireMigration(ctx context.Context, jobID uint64) error {
+	if err := s.rejectMemoryEntry(ctx); err != nil {
+		return err
+	}
 	if err := ctx.Err(); err != nil {
 		return errors.WithStack(err)
 	}
+	s.applyMu.Lock()
 	s.mtx.Lock()
+	defer s.applyMu.Unlock()
 	defer s.mtx.Unlock()
 	for id := range s.migrationAcks {
 		if id.jobID == jobID {

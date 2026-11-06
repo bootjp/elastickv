@@ -409,6 +409,9 @@ func (s *SQSServer) resolveFreshFifoSnapshot(ctx context.Context, queueName stri
 	if !exists {
 		return nil, "", 0, newSQSAPIError(http.StatusBadRequest, sqsErrQueueDoesNotExist, "queue does not exist")
 	}
+	if err := checkFifoDelayReady(meta); err != nil {
+		return nil, "", 0, err
+	}
 	if int64(len(in.MessageBody)) > meta.MaximumMessageSize {
 		return nil, "", 0, newSQSAPIError(http.StatusBadRequest, sqsErrMessageTooLong, "message body exceeds MaximumMessageSize")
 	}

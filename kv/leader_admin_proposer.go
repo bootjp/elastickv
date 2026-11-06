@@ -14,6 +14,12 @@ import (
 
 type LeaderAdminProposerOption func(*leaderAdminProposer)
 
+func WithLeaderAdminForceWatermarkEntry() LeaderAdminProposerOption {
+	return func(p *leaderAdminProposer) {
+		p.forceEntry = true
+	}
+}
+
 func WithLeaderAdminToken(token string) LeaderAdminProposerOption {
 	return func(p *leaderAdminProposer) {
 		p.adminToken = token
@@ -24,10 +30,13 @@ func WithLeaderAdminToken(token string) LeaderAdminProposerOption {
 // Propose remains local because only barrier-exempt, idempotent admin entries
 // are safe to retry across a leadership change.
 type leaderAdminProposer struct {
-	leader     raftengine.LeaderView
-	local      raftengine.Proposer
-	connCache  *GRPCConnCache
-	adminToken string
+	startupControlRPC   StartupControlRPC
+	startupControlGroup uint64
+	leader              raftengine.LeaderView
+	local               raftengine.Proposer
+	connCache           *GRPCConnCache
+	adminToken          string
+	forceEntry          bool
 }
 
 func NewLeaderAdminProposer(
@@ -71,12 +80,13 @@ func (p *leaderAdminProposer) ProposeAdmin(
 			}
 		}
 	}
-	return p.forwardAdminWithRetry(ctx, data)
+	return p.forwardAdminWithRetry(ctx, data, p.forceEntry)
 }
 
 func (p *leaderAdminProposer) forwardAdminWithRetry(
 	callerCtx context.Context,
 	data []byte,
+	forceEntry bool,
 ) (*raftengine.ProposalResult, error) {
 	deadline := time.Now().Add(leaderProxyRetryBudget)
 	parentCtx, cancel := context.WithDeadline(callerCtx, deadline)
@@ -84,7 +94,7 @@ func (p *leaderAdminProposer) forwardAdminWithRetry(
 
 	var lastErr error
 	for {
-		result, err, done := p.runAdminForwardCycle(parentCtx, data, deadline)
+		result, err, done := p.runAdminForwardCycle(parentCtx, data, forceEntry, deadline)
 		if done {
 			return result, err
 		}
@@ -105,6 +115,7 @@ func (p *leaderAdminProposer) forwardAdminWithRetry(
 func (p *leaderAdminProposer) runAdminForwardCycle(
 	ctx context.Context,
 	data []byte,
+	forceEntry bool,
 	deadline time.Time,
 ) (*raftengine.ProposalResult, error, bool) {
 	var lastErr error
@@ -112,7 +123,7 @@ func (p *leaderAdminProposer) runAdminForwardCycle(
 		if !time.Now().Before(deadline) {
 			break
 		}
-		result, err := p.forwardAdmin(ctx, data)
+		result, err := p.forwardAdmin(ctx, data, forceEntry)
 		if err == nil {
 			return result, nil, true
 		}
@@ -130,24 +141,23 @@ func (p *leaderAdminProposer) runAdminForwardCycle(
 func (p *leaderAdminProposer) forwardAdmin(
 	parentCtx context.Context,
 	data []byte,
+	forceEntry bool,
 ) (*raftengine.ProposalResult, error) {
 	addr := leaderAddrFromEngine(p.leader)
 	if addr == "" {
 		return nil, errors.WithStack(ErrLeaderNotFound)
 	}
-	if p.connCache == nil {
+	if p.connCache == nil && p.startupControlRPC == nil {
 		return nil, errors.New("leader admin proposer connection cache is unavailable")
-	}
-	conn, err := p.connCache.ConnFor(addr)
-	if err != nil {
-		return nil, err
 	}
 	ctx, cancel := context.WithTimeout(parentCtx, leaderForwardTimeout)
 	defer cancel()
 	if p.adminToken != "" {
 		ctx = metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+p.adminToken)
 	}
-	resp, err := pb.NewInternalClient(conn).ForwardAdminProposal(ctx, &pb.ForwardAdminProposalRequest{Payload: data})
+	resp, err := p.remoteStartupAdminProposal(ctx, addr, &pb.ForwardAdminProposalRequest{
+		Payload: data, ForceEntry: forceEntry,
+	})
 	if err != nil {
 		if code := status.Code(err); code != codes.Unknown {
 			return nil, status.Errorf(code, "forward admin proposal: %v", err)

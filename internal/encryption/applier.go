@@ -200,6 +200,7 @@ type RaftCutoverWrapInstaller func(cutoverIdx uint64, activeRaftDEKID uint32) er
 // DEK, envelope gate off) so a freshly-constructed StateCache is
 // safe to use before any apply or prime has run.
 type StateCache struct {
+	beforeEncryptionChange atomic.Pointer[func() func()]
 	// activeStorageDEKID mirrors sidecar.Active.Storage. Zero means
 	// "not bootstrapped"; readers surface (0, false) and the storage
 	// layer writes cleartext.
@@ -257,6 +258,8 @@ func (c *StateCache) RefreshFromSidecar(sc *Sidecar) {
 	if c == nil || sc == nil {
 		return
 	}
+	end := c.beginEncryptionChange()
+	defer end()
 	c.activeStorageDEKID.Store(sc.Active.Storage)
 	c.storageEnvelopeActive.Store(sc.StorageEnvelopeActive)
 	c.activeRaftDEKID.Store(sc.Active.Raft)
@@ -326,6 +329,8 @@ func (c *StateCache) MarkRegistered(dekID uint32) {
 	if c == nil || dekID == 0 {
 		return
 	}
+	end := c.beginEncryptionChange()
+	defer end()
 	c.registeredStorageDEKID.Store(dekID)
 }
 
@@ -1020,6 +1025,10 @@ func (a *Applier) applyRotateDEK(raftIdx uint64, p fsmwire.RotationPayload) erro
 	if err != nil {
 		return errors.Wrap(err, "applier: kek-unwrap rotation DEK")
 	}
+	defer clear(dek)
+	if err := a.validateRotationMaterial(p, dek); err != nil {
+		return errors.Wrap(err, "applier: rotation DEK material")
+	}
 	if err := a.keystore.Set(p.DEKID, dek); err != nil {
 		return errors.Wrap(err, "applier: keystore set rotation DEK")
 	}
@@ -1033,6 +1042,18 @@ func (a *Applier) applyRotateDEK(raftIdx uint64, p fsmwire.RotationPayload) erro
 		return err
 	}
 	return nil
+}
+
+func (a *Applier) validateRotationMaterial(p fsmwire.RotationPayload, material []byte) error {
+	sc, err := ReadSidecar(a.sidecarPath)
+	if err != nil {
+		return errors.Wrap(err, "applier: read sidecar for material validation")
+	}
+	purpose, err := sidecarPurposeFor(p.Purpose)
+	if err != nil {
+		return err
+	}
+	return ValidateRotationDEKMaterial(sc, a.kek, p.DEKID, purpose, material)
 }
 
 func (a *Applier) reinstallRaftWrapAfterRotation(p fsmwire.RotationPayload) error {

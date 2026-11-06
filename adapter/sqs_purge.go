@@ -120,6 +120,7 @@ func (s *SQSServer) tryPurgeQueueOnce(ctx context.Context, queueName string) (bo
 		return false, 0, 0, errors.WithStack(err)
 	}
 	meta.Generation = lastGen + 1
+	meta.DelayReindex = nil
 	meta.LastPurgedAtMillis = now
 	meta.LastModifiedAtMillis = now
 	metaBytes, err := encodeSQSQueueMeta(meta)

@@ -39,6 +39,10 @@ jobs:
           persist-credentials: false
       - uses: actions/github-script@v9
         with:
+          # Retry transient GitHub API failures (e.g. a 503 on GET /pulls/N)
+          # instead of failing the whole reconcile run. 4xx statuses in the
+          # default retry-exempt list still fail fast.
+          retries: 3
           script: |
             const { run } = require('./.github/scripts/review-approval-label.cjs');
             await run({ github, context, core });

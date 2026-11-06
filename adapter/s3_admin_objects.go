@@ -204,7 +204,7 @@ func (s *S3Server) AdminPutObject(ctx context.Context, principal AdminPrincipal,
 		return err
 	}
 	defer s.exitAdminBlobUse()
-	if key == "" {
+	if key == "" || len(key) > s3MaxObjectKeyBytes {
 		return ErrAdminInvalidObjectKey
 	}
 	if err := validateS3BucketName(bucket); err != nil {

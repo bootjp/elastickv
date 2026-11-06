@@ -7,19 +7,15 @@
    contracts that AWS HT-FIFO is supposed to honour even under partition
    and node-loss faults:
 
-   1. Within-group ordering — for any MessageGroupId, the sequence of
-      received seq values (sorted by global completion time across all
-      consumers) is strictly increasing. Strict (rather than merely
-      non-decreasing) is what the checker enforces, since seqs are
-      assigned monotonically by next-seq! and equal seqs would already
-      be flagged as duplicates by contract 3.
+   1. Within-group ordering — raw ReceiveMessage responses preserve the
+      real-time precedence of successful sends. Concurrent sends may arrive
+      in either order; client sequence numbers identify messages, not order.
    2. No loss — every (group, seq) successfully :sent eventually appears
       in the :recv history. Sends with :info status are treated as
       possibly-committed and not counted as lost.
-   3. No duplicates — every (group, seq) appears at most once in the
-      :recv history. ContentBasedDeduplication on the queue + a unique
-      (group, seq) body is what enforces this server-side, so a duplicate
-      here is a real bug (e.g. a deletion that did not commit).
+   3. No duplicate acknowledged consumption — every (group, seq) has at
+      most one successful delete. Raw redeliveries remain in the ordering
+      evidence even when deletion fails.
 
    Each MessageGroupId is hashed by partitionFor (FNV-1a) onto one of N
    partitions; with several distinct groups the workload exercises
@@ -30,19 +26,14 @@
             [clojure.string :as str]
             [clojure.tools.logging :refer [info warn]]
             [cognitect.aws.client.api :as aws]
-            [cognitect.aws.credentials :as creds]
             [elastickv.cli :as cli]
-            [elastickv.db :as ekdb]
+            [elastickv.sqs-common :as sqs]
             [jepsen [checker :as checker]
                     [client :as client]
-                    [generator :as gen]
-                    [net :as net]]
-            [jepsen.control :as control]
-            [jepsen.db :as jdb]
-            [jepsen.nemesis :as nemesis]
-            [jepsen.nemesis.combined :as combined]
-            [jepsen.os :as os]
-            [jepsen.os.debian :as debian]))
+                    [generator :as gen]])
+  (:import (java.nio.charset StandardCharsets)
+           (java.security MessageDigest)
+           (java.util UUID)))
 
 ;; ---------------------------------------------------------------------------
 ;; Constants
@@ -71,47 +62,6 @@
   (str "jepsen-htfifo-" (System/currentTimeMillis) ".fifo"))
 
 ;; ---------------------------------------------------------------------------
-;; SQS client construction
-;; ---------------------------------------------------------------------------
-
-(defn- make-sqs-client
-  "Returns a cognitect/aws-api SQS client pointed at http://host:port.
-   Dummy credentials match the elastickv server's open-endpoint mode (no
-   --sqsCredentialsFile passed → adapter accepts any signed request)."
-  [host port region]
-  (aws/client
-    {:api                  :sqs
-     :region               (or region "us-east-1")
-     :credentials-provider (creds/basic-credentials-provider
-                             {:access-key-id     "dummy"
-                              :secret-access-key "dummy"})
-     :endpoint-override    {:protocol :http
-                            :hostname  host
-                            :port      port}}))
-
-(defn- anomaly? [resp]
-  (contains? resp :cognitect.anomalies/category))
-
-(defn- sqs-invoke!
-  "Invoke op against sqs-client, returning the parsed response.
-   Throws ex-info on any error (SQS API error or transport failure).
-   ex-data: :type (SQS __type), :category (anomaly), :resp (raw)."
-  [sqs op request]
-  (let [resp (aws/invoke sqs {:op op :request request})]
-    (if (anomaly? resp)
-      (let [err-type (:__type resp)
-            category (:cognitect.anomalies/category resp)
-            msg      (or (:message resp)
-                         (:Message resp)
-                         (:cognitect.anomalies/message resp)
-                         "")]
-        (throw (ex-info (str "SQS " (or err-type category) ": " msg)
-                        {:type     err-type
-                         :category category
-                         :resp     resp})))
-      resp)))
-
-;; ---------------------------------------------------------------------------
 ;; Queue setup
 ;; ---------------------------------------------------------------------------
 
@@ -127,14 +77,14 @@
                "FifoThroughputLimit"       "perMessageGroupId"
                "DeduplicationScope"        "messageGroup"}
         resp  (try
-                (sqs-invoke! sqs :CreateQueue
+                (sqs/invoke! sqs :CreateQueue
                              {:QueueName  queue-name
                               :Attributes attrs})
                 (catch clojure.lang.ExceptionInfo e
                   (let [err-type (:type (ex-data e))]
                     (if (or (= "QueueAlreadyExists" err-type)
                             (= "QueueNameExists" err-type))
-                      (sqs-invoke! sqs :GetQueueUrl {:QueueName queue-name})
+                      (sqs/invoke! sqs :GetQueueUrl {:QueueName queue-name})
                       (throw e)))))]
     (or (:QueueUrl resp)
         (throw (ex-info "CreateQueue did not return QueueUrl" {:resp resp})))))
@@ -192,18 +142,138 @@
 ;; Jepsen client
 ;; ---------------------------------------------------------------------------
 
-(defrecord HTFIFOClient [node->port region groups seq-counters queue-name sqs queue-url partition-count]
+(defn- fresh-observer []
+  (atom {:clock-id (str (UUID/randomUUID)) :origin (System/nanoTime) :last -1}))
+
+(defn- observe! [observer]
+  ;; Only timestamp allocation is serialized, never an SQS call. All workers
+  ;; share this controller clock, independently of Jepsen's completion times.
+  (locking observer
+    (let [{:keys [origin last]} @observer
+          t (max (inc last) (- (System/nanoTime) origin))]
+      (swap! observer assoc :last t)
+      t)))
+
+(defn- observation [observer]
+  {:version 1 :clock-id (:clock-id @observer)})
+
+(defn- identity-hash [s]
+  (when (and (string? s) (not (str/blank? s)))
+    (let [digest (.digest (MessageDigest/getInstance "SHA-256")
+                          (.getBytes s StandardCharsets/UTF_8))]
+      (apply str (map #(format "%02x" (bit-and 255 %)) digest)))))
+
+(defn- classify-error [op e]
+  (if (instance? clojure.lang.ExceptionInfo e)
+    (let [{err-type :type category :category} (ex-data e)]
+      (cond
+        (and (nil? err-type)
+             (#{:cognitect.anomalies/fault :cognitect.anomalies/unavailable
+                :cognitect.anomalies/interrupted} category))
+        (assoc op :type :info :error :network-error)
+
+        (#{"InternalFailure" "InternalServerError" "ServiceUnavailable"} err-type)
+        (assoc op :type :info :error (str err-type))
+
+        (#{"InvalidParameterValue" "QueueDoesNotExist"
+           "ReceiptHandleIsInvalid" "InvalidIdFormat"} err-type)
+        (assoc op :type :fail :error (str err-type))
+
+        :else
+        (assoc op :type :info
+               :error (cond
+                        (#{"MissingParameter" "QueueNameExists" "QueueAlreadyExists"
+                           "AWS.SimpleQueueService.NonExistentQueue"
+                           "AWS.SimpleQueueService.PurgeQueueInProgress"
+                           "InvalidAttributeName" "InvalidAttributeValue"
+                           "IncompleteSignature" "SignatureDoesNotMatch" "RequestTimeTooSkewed"
+                           "InvalidAction" "MalformedQueryString" "Throttling" "RequestThrottled"
+                           "InvalidReceiptHandle" "MessageNotInflight" "AccessDenied"} err-type)
+                        err-type
+                        (#{:cognitect.anomalies/incorrect :cognitect.anomalies/forbidden
+                           :cognitect.anomalies/unsupported :cognitect.anomalies/not-found
+                           :cognitect.anomalies/conflict :cognitect.anomalies/busy} category)
+                        category
+                        :else :unexpected-client-error))))
+    (assoc op :type :info :error :unexpected-client-error)))
+
+(defn- observe-send! [sqs queue-url groups counters observer current]
+  (let [group (rand-nth groups)
+        seq-num (next-seq! counters group)
+        body (encode-body group seq-num)
+        obs (assoc (observation observer) :send-start (observe! observer))]
+    (vswap! current assoc :value [group seq-num] :sqs-observation obs)
+    (sqs/invoke! sqs :SendMessage
+                 {:QueueUrl @queue-url :MessageBody body :MessageGroupId group})
+    (vswap! current assoc-in [:sqs-observation :send-end] (observe! observer))
+    (assoc @current :type :ok)))
+
+(defn- raw-delivery [index msg]
+  (let [decoded (decode-body (:Body msg))]
+    {:delivery-index index
+     :tuple (when decoded [(:group decoded) (:seq decoded)])
+     :message-hash (identity-hash (:MessageId msg))
+     :receipt-hash (identity-hash (:ReceiptHandle msg))}))
+
+(defn- receive-batch [response]
+  (when-not (map? response)
+    (throw (ex-info "Malformed SQS receive response" {})))
+  (let [messages (:Messages response)]
+    (when-not (or (nil? messages) (sequential? messages))
+      (throw (ex-info "Malformed SQS receive batch" {})))
+    (vec messages)))
+
+(defn- observe-receive! [sqs queue-url observer current]
+  (vswap! current assoc :value [] :sqs-observation
+          (assoc (observation observer) :receive-start (observe! observer)))
+  (let [resp (sqs/invoke! sqs :ReceiveMessage
+                          {:QueueUrl @queue-url
+                           :MaxNumberOfMessages receive-batch-size
+                           :VisibilityTimeout visibility-timeout-seconds
+                           :WaitTimeSeconds receive-wait-seconds})
+        received-at (observe! observer)
+        ;; Preserve the successful SDK return even if batch conversion fails:
+        ;; it must not become an unobserved network-unknown operation.
+        _ (vswap! current assoc-in [:sqs-observation :received-at] received-at)
+        msgs (receive-batch resp)
+        deliveries (mapv raw-delivery (range) msgs)]
+    ;; Persist the whole raw batch before the first delete can unlock a group.
+    (vswap! current assoc-in [:sqs-observation :deliveries] deliveries)
+    (doseq [[i msg] (map-indexed vector msgs)
+            :let [delivery (nth deliveries i)]
+            :when (:tuple delivery)]
+      (let [path [:sqs-observation :deliveries i :delete]
+            deletion {:delivery-index i :receipt-hash (:receipt-hash delivery)
+                      :start (observe! observer)}]
+        (vswap! current assoc-in path deletion)
+        (let [result (try
+                       (sqs/invoke! sqs :DeleteMessage
+                                    {:QueueUrl @queue-url :ReceiptHandle (:ReceiptHandle msg)})
+                       {:type :ok}
+                       (catch clojure.lang.ExceptionInfo e
+                         ;; No exception text, request, body or receipt enters
+                         ;; delete metadata or logs. Preserve outcome classes.
+                         (warn "DeleteMessage failed; delivery remains unacknowledged")
+                         (select-keys (classify-error {} e) [:type])))]
+          (vswap! current assoc-in path
+                  (merge deletion result {:end (observe! observer)}))
+          (when (= :ok (:type result))
+            (vswap! current update :value conj (:tuple delivery))))))
+    (assoc @current :type :ok)))
+
+(defrecord HTFIFOClient [node->port region groups seq-counters queue-name sqs queue-url partition-count observer]
   client/Client
 
   (open! [this test node]
     (let [port (get node->port node default-sqs-port)
           host (or (:sqs-host test) (name node))]
-      (assoc this :sqs (make-sqs-client host port region))))
+      (assoc this :sqs (sqs/make-client host port region))))
 
   (setup! [this _test]
     (let [url (create-htfifo-queue! sqs queue-name partition-count)]
       (info "HT-FIFO test queue ready" url "partitions=" partition-count)
-      (assoc this :queue-url url)))
+      (reset! queue-url url)
+      this))
 
   (teardown! [_this _test]
     ;; Leave the queue around — the test cluster is torn down by db/teardown!.
@@ -215,106 +285,13 @@
     (assoc this :sqs nil :queue-url nil))
 
   (invoke! [_this _test op]
-    (try
-      (case (:f op)
-        :send
-        ;; Compute (group, seq, body) BEFORE the SQS call so the
-        ;; op carries :value [group seq-num] regardless of whether
-        ;; the call succeeded — :info sends with their tuple intact
-        ;; let a future checker reason about in-flight messages
-        ;; (today's "lost" formula is committed-only, but matching
-        ;; Jepsen's standard convention keeps the history
-        ;; interpretable). Re-throw on send failure so the outer
-        ;; catch performs the existing error classification, but
-        ;; with the enriched op as context (passed via ex-data so
-        ;; the outer catch can pull it out).
-        (let [group   (rand-nth groups)
-              seq-num (next-seq! seq-counters group)
-              body    (encode-body group seq-num)
-              op'     (assoc op :value [group seq-num])]
-          (try
-            (sqs-invoke! sqs :SendMessage
-                         {:QueueUrl      queue-url
-                          :MessageBody   body
-                          :MessageGroupId group})
-            (assoc op' :type :ok)
-            (catch clojure.lang.ExceptionInfo e
-              ;; Re-raise with the enriched op stashed so the outer
-              ;; catch returns it instead of the bare op. The outer
-              ;; catch checks for :enriched-op in ex-data first.
-              (throw (ex-info (.getMessage e)
-                              (merge (ex-data e) {:enriched-op op'})
-                              e)))))
-
-        :recv
-        (let [resp (sqs-invoke! sqs :ReceiveMessage
-                                {:QueueUrl            queue-url
-                                 :MaxNumberOfMessages receive-batch-size
-                                 :VisibilityTimeout   visibility-timeout-seconds
-                                 :WaitTimeSeconds     receive-wait-seconds})
-              msgs (or (:Messages resp) [])
-              parsed (keep (fn [m]
-                             (when-let [decoded (decode-body (:Body m))]
-                               (assoc decoded
-                                      :receipt-handle (:ReceiptHandle m)
-                                      :message-id     (:MessageId m))))
-                           msgs)]
-          ;; SQS contract: a message is "received" (and the duplicate-
-          ;; detection contract activates) only after a successful
-          ;; DeleteMessage acks it. A failed delete (transport fault,
-          ;; partition mid-ack) leaves the message visible — the next
-          ;; receive WILL see it again, and that re-delivery is correct
-          ;; SQS behaviour, not a duplicate the checker should flag.
-          ;; So: include only successfully-deleted tuples in :value.
-          ;; Tuples whose delete failed are dropped here and naturally
-          ;; reappear in a subsequent :recv. We log the failure so a
-          ;; spike in the warn rate (vs duplicate signal in the report)
-          ;; is the right triage cue.
-          (let [acked (volatile! [])]
-            (doseq [{:keys [group seq receipt-handle]} parsed]
-              (try
-                (sqs-invoke! sqs :DeleteMessage
-                             {:QueueUrl      queue-url
-                              :ReceiptHandle receipt-handle})
-                (vswap! acked conj [group seq])
-                (catch clojure.lang.ExceptionInfo e
-                  (warn e "DeleteMessage failed; tuple will be redelivered"
-                        {:group group :seq seq}))))
-            (assoc op :type :ok :value @acked))))
-
-      (catch clojure.lang.ExceptionInfo e
-        (let [data     (ex-data e)
-              err-type (:type data)
-              category (:category data)
-              ;; If the :send branch attached an enriched op (with
-              ;; [group seq-num] :value), use it so the resulting :info
-              ;; / :fail op still carries the tuple the checker can see.
-              base     (or (:enriched-op data) op)]
-          (cond
-            ;; Transport faults (network partition, kill, peer down).
-            ;; :info: the operation may or may not have committed.
-            (and (nil? err-type)
-                 (#{:cognitect.anomalies/fault
-                    :cognitect.anomalies/unavailable
-                    :cognitect.anomalies/interrupted} category))
-            (assoc base :type :info :error :network-error)
-
-            ;; Server-side InternalFailure / 5xx — possibly committed.
-            (#{"InternalFailure" "InternalServerError" "ServiceUnavailable"} err-type)
-            (assoc base :type :info :error (str err-type))
-
-            ;; Definite client-side rejection — operation did not commit.
-            (#{"InvalidParameterValue" "QueueDoesNotExist"
-               "ReceiptHandleIsInvalid" "InvalidIdFormat"} err-type)
-            (assoc base :type :fail :error (str err-type))
-
-            :else
-            (assoc base :type :info :error (or err-type
-                                                category
-                                                (.getMessage e))))))
-
-      (catch Exception e
-        (assoc op :type :info :error (.getMessage e))))))
+    (let [current (volatile! op)]
+      (try
+        (case (:f op)
+          :send (observe-send! sqs queue-url groups seq-counters observer current)
+          :recv (observe-receive! sqs queue-url observer current))
+        (catch Exception e
+          (classify-error @current e))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Checker — within-group ordering + no loss + no duplicates
@@ -335,56 +312,150 @@
                      (map :value)
                      set)}))
 
-(defn- collect-receives
-  "Return a list of {:group g :seq s :time t :process p :index i} maps
-   in completion-time order, one per (group, seq) tuple actually
-   surfaced by a successful :recv op. Each tuple carries the op's
-   :time / :process / its position within the batch so per-group
-   ordering can be checked against a globally-consistent timeline.
+(defn- timestamp? [t] (and (integer? t) (<= 0 t)))
 
-   Sort key is (juxt :time :process :index) — :time is the primary,
-   :process tiebreaks two workers polling at the same nanosecond
-   (rare but possible), and :index preserves the within-batch order
-   the server returned (which is the FIFO order for messages in the
-   same batch). Without :index, sort-by would only be stable across
-   the input ordering and the per-group seqs from one batch could
-   appear out-of-order in the sorted output."
+(defn- tuple? [v]
+  (and (vector? v) (= 2 (count v))
+       (string? (first v)) (not (str/blank? (first v)))
+       (timestamp? (second v))))
+
+(defn- hash? [v] (and (string? v) (boolean (re-matches #"[0-9a-f]{64}" v))))
+
+(defn- delivery-error [received-at previous-end i delivery]
+  (let [{:keys [tuple message-hash receipt-hash delete delivery-index]} delivery]
+    (cond
+      (not= i delivery-index) :bad-delivery-index
+      (not (tuple? tuple)) :malformed-body
+      (not (hash? message-hash)) :missing-message-identity
+      (not (hash? receipt-hash)) :missing-receipt-identity
+      (not (map? delete)) :missing-delete-result
+      (or (not= i (:delivery-index delete))
+          (not= receipt-hash (:receipt-hash delete))) :delete-identity-mismatch
+      (not (#{:ok :info :fail} (:type delete))) :bad-delete-result
+      (not (and (timestamp? (:start delete)) (timestamp? (:end delete))
+                (<= received-at (:start delete) (:end delete))
+                (or (nil? previous-end)
+                    (and (timestamp? previous-end) (<= previous-end (:start delete))))))
+      :bad-delete-interval)))
+
+(defn- receive-error [op obs]
+  (let [{:keys [receive-start received-at deliveries]} obs]
+    (cond
+      (not (timestamp? receive-start)) :missing-receive-start
+      (nil? received-at)
+      (when (or (= :ok (:type op)) (some? deliveries)
+                (not (or (nil? (:value op)) (= [] (:value op)))))
+        :missing-raw-response)
+      (not (and (timestamp? received-at) (<= receive-start received-at))) :bad-response-time
+      (not (vector? deliveries)) :missing-raw-batch
+      (not (vector? (:value op))) :bad-acknowledgment-shape
+      :else
+      (or (some identity
+                (map-indexed
+                  (fn [i delivery]
+                    (delivery-error received-at
+                                    (when (pos? i) (get-in deliveries [(dec i) :delete :end]))
+                                    i delivery))
+                  deliveries))
+          (when (not= (or (:value op) [])
+                      (mapv :tuple (filter #(= :ok (get-in % [:delete :type])) deliveries)))
+            :acknowledgment-mismatch)))))
+
+(defn- observation-error [test op]
+  (let [obs (:sqs-observation op)]
+    (cond
+      (not (#{:ok :fail :info} (:type op))) :invalid-operation-outcome
+      (not (map? obs)) :missing-observation
+      (not= 1 (:version obs)) :unsupported-observation-version
+      (or (not (string? (:sqs-observation-clock-id test)))
+          (str/blank? (:sqs-observation-clock-id test))
+          (not= (:sqs-observation-clock-id test) (:clock-id obs))) :foreign-observation-clock
+      (= :send (:f op))
+      (cond
+        (not (tuple? (:value op))) :bad-send-identity
+        (not (timestamp? (:send-start obs))) :missing-send-start
+        (= :ok (:type op))
+        (when-not (and (timestamp? (:send-end obs))
+                       (<= (:send-start obs) (:send-end obs))) :bad-send-interval)
+        (contains? obs :send-end) :ambiguous-send-has-end)
+      :else (receive-error op obs))))
+
+(defn- send-intervals
+  "Pair framework invokes/completions, not client sequence numbers. Only
+   successful completions bound a send's end; :info remains open-ended."
   [history]
-  (->> history
-       (filter #(and (= :recv (:f %)) (= :ok (:type %))))
-       (mapcat (fn [op]
-                 (map-indexed
-                   (fn [i [g s]]
-                     {:group g :seq s
-                      :time (:time op)
-                      :process (:process op)
-                      :index i})
-                   (:value op))))
-       (sort-by (juxt :time :process :index))))
+  (reduce
+    (fn [{:keys [pending intervals] :as state} op]
+      (if (not= :send (:f op))
+        state
+        (let [p (:process op) tuple (:value op)
+              invocation (get pending p)]
+          (if (= :invoke (:type op))
+            (cond-> (assoc-in state [:pending p] op)
+              invocation (update :errors conj :overlapping-worker-send))
+            (let [start (:time invocation)
+                  end (when (= :ok (:type op)) (:time op))
+                  error (cond
+                          (not (and (timestamp? start) (timestamp? (:time op))
+                                    (<= start (:time op)))) :missing-send-invocation
+                          (and end (< end start)) :bad-framework-send-interval
+                          (contains? intervals tuple) :reused-send-identity)]
+              (cond-> (-> state
+                          (update :pending dissoc p)
+                          (assoc-in [:intervals tuple]
+                                    {:start start :end end :type (:type op)
+                                     :observed-start (get-in op [:sqs-observation :send-start])}))
+                error (update :errors conj error)))))))
+    {:pending {} :intervals {} :errors []}
+    history))
 
-(defn- ordering-violations
-  "For each group, return the list of out-of-order pairs in the
-   completion-time-ordered receive sequence. Returns a map of
-   group → [{:prev p :curr c} ...] (empty if no violation)."
-  [received-events]
-  (let [per-group (group-by :group received-events)]
-    (->> per-group
-         (keep (fn [[group events]]
-                 (let [seqs   (mapv :seq events)
-                       pairs  (map vector seqs (rest seqs))
-                       breaks (filter (fn [[p c]] (>= p c)) pairs)]
-                   (when (seq breaks)
-                     [group (mapv (fn [[p c]] {:prev p :curr c}) breaks)]))))
-         (into {}))))
+(defn- raw-deliveries [ops]
+  (mapcat (fn [op]
+            (let [obs (:sqs-observation op)]
+              (when (vector? (:deliveries obs))
+                (map #(assoc % :received-at (:received-at obs)) (:deliveries obs)))))
+          (filter #(= :recv (:f %)) ops)))
 
-(defn- duplicate-receives
-  "Return the set of (group, seq) tuples that appeared more than once in
-   the receive history (FIFO contract violation)."
-  [received-events]
-  (->> received-events
-       (group-by (juxt :group :seq))
-       (keep (fn [[k events]] (when (> (count events) 1) k)))
-       set))
+(defn- identity-errors [deliveries intervals]
+  (:errors
+    (reduce
+      (fn [{:keys [messages tuples receipts] :as state} d]
+        (let [{:keys [tuple message-hash receipt-hash]} d
+              send (get intervals tuple)
+              reason (cond
+                       (or (nil? send) (= :fail (:type send))) :unmatched-delivery
+                       (< (:received-at d) (:observed-start send)) :delivery-before-send
+                       (and (contains? messages message-hash)
+                            (not= tuple (get messages message-hash))) :message-identity-reused
+                       (and (contains? tuples tuple)
+                            (not= message-hash (get tuples tuple))) :tuple-identity-changed
+                       (contains? receipts receipt-hash) :receipt-identity-reused)]
+          (cond-> (-> state
+                      (assoc-in [:messages message-hash] tuple)
+                      (assoc-in [:tuples tuple] message-hash)
+                      (update :receipts conj receipt-hash))
+            reason (update :errors conj reason))))
+      {:messages {} :tuples {} :receipts #{} :errors []}
+      deliveries)))
+
+(defn- ordering-violations [deliveries intervals]
+  ;; If an earlier-observed send began after this send successfully ended,
+  ;; that delivery is an inversion. One maximum per group is a sufficient
+  ;; witness, including nonadjacent inversions and every raw redelivery.
+  (:violations
+    (reduce
+      (fn [{:keys [latest] :as state} {:keys [tuple]}]
+        (let [[group seq-num] tuple
+              {:keys [start end]} (get intervals tuple)
+              previous (get latest group)]
+          (cond-> state
+            (and end previous (< end (:start previous)))
+            (update-in [:violations group] (fnil conj [])
+                       {:prev (second (:tuple previous)) :curr seq-num})
+            (or (nil? previous) (> start (:start previous)))
+            (assoc-in [:latest group] {:tuple tuple :start start}))))
+      {:latest {} :violations {}}
+      (sort-by (juxt :received-at :delivery-index) deliveries))))
 
 (defn ht-fifo-checker
   "Custom Jepsen checker for the HT-FIFO contract. Returns
@@ -392,23 +463,32 @@
     :ordering-violations {...}}."
   []
   (reify checker/Checker
-    (check [_ _test history _opts]
+    (check [_ test history _opts]
       (let [{:keys [committed in-flight]} (collect-sends history)
-            ;; in-flight is reported in the result map for diagnostics
-            ;; (operators want to see how many sends were ambiguous);
-            ;; the loss formula does not subtract it because
-            ;; committed/in-flight are disjoint by construction.
-            received-events (collect-receives history)
-            received-tuples (set (map (fn [{:keys [group seq]}] [group seq])
-                                      received-events))
-            ;; "lost" = committed sends that never arrived. :info sends
-            ;; (in-flight) are excluded from `committed` at collection
-            ;; time, not subtracted here, so committed and in-flight are
-            ;; always disjoint.
+            ops (filter #(and (#{:send :recv} (:f %))
+                               (not= :invoke (:type %))) history)
+            recvs (filter #(= :recv (:f %)) ops)
+            ;; Preserve legacy acknowledged-consumption diagnostics even if
+            ;; the trace predates raw observations. Never retrofit a pass.
+            acknowledged (mapcat #(when (vector? (:value %)) (:value %)) recvs)
+            received-tuples (set acknowledged)
             lost (cset/difference committed received-tuples)
-            dups (duplicate-receives received-events)
-            ord  (ordering-violations received-events)]
-        {:valid?              (and (empty? lost)
+            dups (set (keep (fn [[tuple n]] (when (> n 1) tuple)) (frequencies acknowledged)))
+            op-errors (keep (fn [op]
+                              (when-let [reason (observation-error test op)]
+                                {:process (:process op) :index (:index op) :reason reason})) ops)
+            {:keys [pending intervals errors]} (send-intervals history)
+            deliveries (when (empty? op-errors) (vec (raw-deliveries ops)))
+            response-times (keep #(get-in % [:sqs-observation :received-at]) recvs)
+            trace-errors (concat op-errors errors
+                                 (when (seq pending) [:incomplete-send-invocation])
+                                 (when (not= (count response-times) (count (set response-times)))
+                                   [:reused-response-time])
+                                 (when deliveries (identity-errors deliveries intervals)))
+            ord (if (empty? trace-errors) (ordering-violations deliveries intervals) {})]
+        {:valid?              (and (pos? (count committed))
+                                   (empty? trace-errors)
+                                   (empty? lost)
                                    (empty? dups)
                                    (empty? ord))
          :committed-sends     (count committed)
@@ -416,6 +496,10 @@
          :received            (count received-tuples)
          :lost                lost
          :duplicates          dups
+         :raw-deliveries      (reduce + 0 (map #(let [v (get-in % [:sqs-observation :deliveries])]
+                                                (if (vector? v) (count v) 0)) recvs))
+         :ordering-checked?   (empty? trace-errors)
+         :observation-errors (vec trace-errors)
          :ordering-violations ord}))))
 
 ;; ---------------------------------------------------------------------------
@@ -434,12 +518,6 @@
   (gen/mix
     (concat (repeat (max 1 (Math/round (* 10.0 (double send-fraction)))) send-op)
             (repeat (max 1 (- 10 (Math/round (* 10.0 (double send-fraction))))) recv-op))))
-
-(defn- drain-generator
-  "Drain phase: only :recv ops, run after the main generator finishes so
-   the checker sees the in-flight messages get delivered."
-  []
-  (gen/repeat {:f :recv}))
 
 ;; ---------------------------------------------------------------------------
 ;; Workload & Test builders
@@ -464,6 +542,7 @@
         send-fraction   (or (:send-fraction opts) 0.5)
         groups          (group-ids group-count)
         seq-counters    (fresh-seq-counters groups)
+        observer        (fresh-observer)
         queue-name      (or (:queue-name opts) (fresh-queue-name))
         client          (->HTFIFOClient (or (:node->port opts)
                                             (zipmap default-nodes (repeat default-sqs-port)))
@@ -472,79 +551,20 @@
                                         seq-counters
                                         queue-name
                                         nil  ; sqs (per-worker)
-                                        nil  ; queue-url
-                                        partition-count)]
+                                        (atom nil)  ; URL shared by setup and execution clients
+                                        partition-count
+                                        observer)]
     {:client    client
+     :sqs-observation-clock-id (:clock-id @observer)
      :generator (mixed-generator send-fraction)
      :checker   (ht-fifo-checker)}))
 
 (defn elastickv-sqs-htfifo-test
-  "Builds a Jepsen test map that drives elastickv's HT-FIFO SQS endpoint."
+  "Build a partitioned FIFO queue test."
   ([] (elastickv-sqs-htfifo-test {}))
   ([opts]
-   (let [nodes      (or (:nodes opts) default-nodes)
-         sqs-ports  (or (:sqs-ports opts)
-                        (repeat (count nodes) (or (:sqs-port opts) default-sqs-port)))
-         node->port (or (:node->port opts) (cli/ports->node-map sqs-ports nodes))
-         sqs-region (or (:sqs-region opts) "us-east-1")
-         local?     (:local opts)
-         db         (if local?
-                      jdb/noop
-                      (ekdb/db {:grpc-port    (or (:grpc-port opts) 50051)
-                                :redis-port   (or (:redis-port opts) 6379)
-                                :sqs-port     node->port
-                                :sqs-region   sqs-region
-                                :raft-groups  (:raft-groups opts)
-                                :shard-ranges (:shard-ranges opts)
-                                :encryption   (:encryption opts)}))
-         rate       (double (or (:rate opts) 5))
-         time-limit (or (:time-limit opts) 30)
-         ;; Drain must outlast the visibility-timeout window plus a
-         ;; safety buffer. Otherwise a message that becomes invisible
-         ;; right at drain start reappears at exactly drain-end (or
-         ;; later) and gen/time-limit can fire before the next :recv
-         ;; surfaces it — the checker would then report a :lost that
-         ;; the server still owns. visibility-timeout + 10s closes
-         ;; that race. The +10s also dominates the (max 5,
-         ;; time-limit/6) short-test floor at any reasonable
-         ;; time-limit, so the floor is no longer needed.
-         drain-time (or (:drain-time opts)
-                        (+ visibility-timeout-seconds 10))
-         faults     (if local?
-                      []
-                      (cli/normalize-faults (or (:faults opts) [:partition :kill])))
-         nemesis-p  (when-not local?
-                      (combined/nemesis-package {:db       db
-                                                 :faults   faults
-                                                 :interval (or (:fault-interval opts) 40)}))
-         nemesis-gen (if nemesis-p
-                       (:generator nemesis-p)
-                       (gen/once {:type :info :f :noop}))
-         workload   (sqs-htfifo-workload (assoc opts :node->port node->port))
-         main-gen   (->> (:generator workload)
-                         (gen/nemesis nemesis-gen)
-                         (gen/stagger (/ rate))
-                         (gen/time-limit time-limit))
-         drain-gen  (->> (drain-generator)
-                         (gen/stagger (/ rate))
-                         (gen/time-limit drain-time))]
-     (merge workload
-            {:name            (or (:name opts) "elastickv-sqs-htfifo")
-             :nodes           nodes
-             :db              db
-             :sqs-host        (:sqs-host opts)
-             :os              (if local? os/noop debian/os)
-             :net             (if local? net/noop net/iptables)
-             :ssh             (merge {:username                  "vagrant"
-                                      :private-key-path          "/home/vagrant/.ssh/id_rsa"
-                                      :strict-host-key-checking  false}
-                                     (when local? {:dummy true})
-                                     (:ssh opts))
-             :remote          control/ssh
-             :nemesis         (if nemesis-p (:nemesis nemesis-p) nemesis/noop)
-             :final-generator nil
-             :concurrency     (or (:concurrency opts) 8)
-             :generator       (gen/phases main-gen drain-gen)}))))
+   (sqs/build-test (assoc opts :name (or (:name opts) "elastickv-sqs-htfifo"))
+                   sqs-htfifo-workload)))
 
 ;; ---------------------------------------------------------------------------
 ;; CLI

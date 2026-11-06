@@ -3,8 +3,10 @@ package kv
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/binary"
 	"io"
+	"sync"
 	"sync/atomic"
 
 	"github.com/bootjp/elastickv/internal/encryption/fsmwire"
@@ -46,6 +48,10 @@ const (
 // TSO FSM's own applied state so unrelated shard-group lease renewals cannot
 // advance group-0 state outside the group-0 log.
 type TSOStateMachine struct {
+	controlMu          sync.Mutex
+	backing            TSODurableBacking
+	applyIndex         uint64
+	configurationIndex atomic.Uint64
 	hlc                *HLC
 	ceilingMs          atomic.Int64
 	allocationFloor    atomic.Uint64
@@ -125,6 +131,16 @@ func NewTSOStateMachine(hlc *HLC, opts ...TSOStateMachineOption) *TSOStateMachin
 }
 
 func (f *TSOStateMachine) Apply(data []byte) any {
+	if len(data) == 0 {
+		return haltErr(errors.Wrap(ErrTSOStateMachineInvalidEntry, "empty entry"))
+	}
+	if f != nil && f.backing != nil {
+		return f.ApplyWithControl(context.Background(), f.applyIndex, data, nil)
+	}
+	return f.applyLegacy(data)
+}
+
+func (f *TSOStateMachine) applyLegacy(data []byte) any {
 	if len(data) == 0 {
 		return haltErr(errors.Wrap(ErrTSOStateMachineInvalidEntry, "empty entry"))
 	}
@@ -285,6 +301,9 @@ func (f *TSOStateMachine) PhaseDFloor() uint64 {
 }
 
 func (f *TSOStateMachine) Snapshot() (raftengine.Snapshot, error) {
+	if f != nil && f.backing != nil {
+		return f.controlSnapshot()
+	}
 	var ceilingMs int64
 	var allocationFloor uint64
 	var cutoverActive bool
@@ -310,6 +329,9 @@ func (f *TSOStateMachine) Snapshot() (raftengine.Snapshot, error) {
 }
 
 func (f *TSOStateMachine) Restore(r io.Reader) error {
+	if f != nil && f.backing != nil {
+		return f.restoreControlSnapshot(r)
+	}
 	if r == nil {
 		return errors.New("tso fsm snapshot: reader is nil")
 	}
@@ -541,6 +563,9 @@ func legacyKVFSMStoreSnapshotMagics() [][]byte {
 }
 
 func (f *TSOStateMachine) IsVolatileOnlyPayload(payload []byte) bool {
+	if f != nil && f.backing != nil {
+		return false
+	}
 	if isTSOPendingPhaseDEntry(payload) {
 		return true
 	}

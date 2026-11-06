@@ -18,7 +18,8 @@
             [elastickv.redis-workload :as redis]
             [elastickv.redis-zset-safety-workload :as zset]
             [elastickv.s3-workload :as s3]
-            [elastickv.sqs-htfifo-workload :as sqs]))
+            [elastickv.sqs-htfifo-workload :as sqs]
+            [elastickv.sqs-workload :as standard-sqs]))
 
 (deftest encryption-flag-is-available-to-every-workload
   ;; It lives in common-cli-opts rather than per-workload, so a future
@@ -423,6 +424,7 @@
                         ["dynamodb-multi-table"  multi/elastickv-dynamodb-multi-table-test]
                         ["s3"                    s3/elastickv-s3-test]
                         ["sqs-htfifo"            sqs/elastickv-sqs-htfifo-test]
+                        ["sqs-standard"          standard-sqs/elastickv-sqs-test]
                         ["filesystem"             filesystem/elastickv-filesystem-test]]]
     (testing label
       (is (true? (get-in (ctor {:encryption true}) [:db :opts :encryption]))
