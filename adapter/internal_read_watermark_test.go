@@ -76,6 +76,31 @@ func TestInternalForwardReadWatermarkAdvanceCoveredIsNoop(t *testing.T) {
 	require.Nil(t, proposer.payload)
 }
 
+func TestInternalForwardExplicitReadWatermarkAdvanceCoveredStillProposes(t *testing.T) {
+	t.Parallel()
+	st := store.NewMVCCStore()
+	require.NoError(t, st.ApplyMutationsRaftAt(context.Background(), nil, nil, 50, 50, 1))
+	proposer := &internalAdminProposer{}
+	internal, _ := newReadWatermarkInternal(t, proposer, WithInternalStore(st))
+	payload := kv.EncodeWatermarkAdvance(50)
+
+	resp, err := internal.ForwardAdminProposal(context.Background(), &pb.ForwardAdminProposalRequest{Payload: payload, ForceEntry: true})
+	require.NoError(t, err)
+	require.Equal(t, uint64(17), resp.GetCommitIndex())
+	require.Equal(t, payload, proposer.payload, "an explicit fence must return a committed-entry receipt even when already covered")
+}
+
+func TestInternalForwardForceEntryRejectsNonWatermarkPayload(t *testing.T) {
+	t.Parallel()
+	proposer := &internalAdminProposer{}
+	internal, _ := newReadWatermarkInternal(t, proposer)
+	_, err := internal.ForwardAdminProposal(context.Background(), &pb.ForwardAdminProposalRequest{
+		Payload: []byte("admin"), ForceEntry: true,
+	})
+	require.Equal(t, codes.PermissionDenied, status.Code(err))
+	require.Nil(t, proposer.payload)
+}
+
 // Without the read-watermark proposer (the advance is opt-in until every
 // replica understands it) a forwarded advance is refused, and never falls
 // back to the admin proposer.

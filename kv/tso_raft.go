@@ -508,16 +508,17 @@ type tsoRemoteValidation func(context.Context, string, uint64) error
 // It re-resolves that address after transient errors so a leadership change
 // does not pin a BatchAllocator refill to a stale endpoint.
 type LeaderRoutedTSOAllocator struct {
-	local          TSOAllocator
-	leader         raftengine.LeaderView
-	connCache      GRPCConnCache
-	remoteRequest  tsoRemoteRequest
-	retryBudget    time.Duration
-	retryInterval  time.Duration
-	activation     atomic.Uint32
-	clock          *HLC
-	remoteValidate tsoRemoteValidation
-	observer       TSOObserver
+	startupControlRPC StartupControlRPC
+	local             TSOAllocator
+	leader            raftengine.LeaderView
+	connCache         GRPCConnCache
+	remoteRequest     tsoRemoteRequest
+	retryBudget       time.Duration
+	retryInterval     time.Duration
+	activation        atomic.Uint32
+	clock             *HLC
+	remoteValidate    tsoRemoteValidation
+	observer          TSOObserver
 }
 
 const (
@@ -719,11 +720,7 @@ func (a *LeaderRoutedTSOAllocator) requestRemoteBatch(
 	activatePhaseD bool,
 ) (TSOReservation, error) {
 	var empty TSOReservation
-	conn, err := a.connCache.ConnFor(addr)
-	if err != nil {
-		return empty, errors.Wrap(err, "tso dial leader")
-	}
-	resp, err := pb.NewDistributionClient(conn).GetTimestamp(ctx, &pb.GetTimestampRequest{
+	resp, err := a.remoteStartupTimestamp(ctx, addr, &pb.GetTimestampRequest{
 		Count:           uint32(n), //nolint:gosec // n is bounded by maxHLCBatchSize.
 		MinTimestamp:    min,
 		ActivateCutover: activate,

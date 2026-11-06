@@ -1,8 +1,102 @@
 # Raft catalog bootstrap
 
-Status: Proposed v5; design accepted; local format/planner/session/storage components implemented in this branch; runtime not implemented
+Status: Proposed v5; accepted-baseline startup, encrypted data-group migration, protected wire transactions and authenticated active-envelope rotation implemented; bounded E2E verified; full protocol and production operation not yet verified
 Author: bootjp
 Date: 2026-10-30
+
+## Implementation Status (2026-11-02)
+
+The opt-in runtime and offline CLI implement accepted-baseline preparation and
+activation for existing plaintext native state, including dedicated TSO group
+zero with a data group, and explicit-key encrypted data-group migration.
+Preparation, active policy, ControlReady and DataReady
+are separate milestones. Real native/Pebble tests cover plaintext restart and
+selected three-member TLS data-group snapshot catch-up cases. Those cases do
+not establish the complete v5 snapshot/journal or membership protocol.
+
+Protected Redis wire `MULTI` now retains its original receiver-local admission
+owner across copied queued arguments until `EXEC`, `DISCARD` or cancellation.
+It does not refresh a stale handle at EXEC. Idle timeout, disconnect and server
+shutdown cancel and join owned work. Protected queues reserve their copied
+arguments against a shared server-wide 64 MiB budget; resource overflow discards
+the transaction and closes the connection without executing buffered commands.
+Protected follower forwarding disables
+automatic transaction retries and retains top-level unknown outcomes after a
+lost reply or terminal reply overflow. Targeted real-wire race tests cover
+these paths; they are not a distributed Jepsen campaign result.
+
+The encryption extension supports the exact local startup rotation recipe
+requested with `--encryptionRotateOnStartup` and a separately authenticated
+external `EncryptionAdmin.RotateDEK` under the protected runtime.
+Protected encrypted startup requires an already active storage envelope.
+Inactive storage-envelope configurations are synchronously rejected as
+unsupported before workers start; inactive-key registration is not a supported
+startup path. Raft envelope activation and multigroup configurations remain
+subject to the existing namespace/runtime scope validation; the local rotation
+recipe does not relax those restrictions.
+Receiver-owned rotation supervision, native invalidation and installed-state
+projection are integrated for this bounded active-envelope profile. Payload
+validation authenticates and completely parses the actual final payload outside
+the admission lock,
+using the explicitly bound installed cipher/key/wrapper projection. The final
+seal hashes the actual ciphertext, not merely its decoded plaintext. Rotation
+grants bind exact typed recipe frames; they are not general admin authority.
+External rotation requires ADMIN bearer plus verified client mTLS, exact local
+full node identity and pinned purpose epoch. Its original request captures a
+receiver-owned generation before queueing and transfers it into the private
+rotation lane atomically. Startup credentials and captured peer receipts cannot
+authorize it. The supervisor serializes startup and external recipes; after an
+external unknown outcome it performs only read-only reconciliation, never a new
+proposal under a refreshed process context. Enable and bootstrap operations
+remain fail-closed.
+
+Follower encryption recovery uses a native ReadIndex/applied barrier under the
+original Recovery handle before publishing a fresh local permission. A cached
+sidecar, earlier Wait result or a successful leader RPC alone is insufficient.
+Role/generation changes invalidate the observation; unresolved owned rotation
+outcomes require reconciliation rather than a fresh retry claiming absence.
+The follower Recovery read path does not authorize ordinary follower-local
+linearizable reads or peer proposals. Native follower-barrier and lifetime unit
+tests are distinct from composed encrypted multi-member verification.
+
+In particular, `TestBootstrapRotationE2EPreparedInactiveKeys` proves real native
+plaintext preparation with committed inactive keys and all-member readiness,
+not protected encrypted rotation or restart. Installed projection/runtime IO
+tests exercise actual cipher/wrapper selection, including pending registration.
+The inactive-key preparation fixture does not establish a supported protected
+encrypted startup configuration.
+`TestBootstrapRotationE2EActiveEnvelopesBusinessRestart` covers a real single
+data group with active storage and Raft envelopes, local requested startup
+rotation, business write/read and protected restart; the final focused race run
+passed in 22.119s. The original accepted offline cut remains plaintext: this is
+not encrypted-row migration evidence. Encrypted three-member follower permission
+(F), term-change and lost-result scenarios have not been validated end to end;
+their lifetime handling has unit coverage only. Composed lint/review remains a
+separate gate, and this result is not production-operation evidence.
+`TestRecoveryReadIndexActualFollowerUsesOriginalRecoveryHandle` exercises the
+native follower barrier with real Raft and admission, but its loopback peer
+transport fixture is not a composed production TLS/session test.
+
+`TestBootstrapOfflineEncryptionLegacyCiphertextToProtectedRestart` starts from
+an actual legacy data group with active storage and Raft envelopes, migrates
+its encrypted history through prepare/resume, activates policy, then verifies
+business reads/writes and protected restart. The external rotation E2E covers
+the authenticated public RPC, exact-request reconciliation, rejected requests,
+business writes and encrypted restart. These are single-data-group results;
+they do not extend the encrypted multi-member or scalar TSO coverage above.
+
+Encrypted legacy data-group migration requires an explicit verified KEK and
+sidecar, all historical keys and matching durable checkpoint/registrations.
+Read-only decoders authenticate the complete logical MVCC history, retained
+WAL and supported native row-stream snapshots. Preparation and resume preserve
+the original physical ciphertext, epochs and nonce state; they do not reencrypt
+or rewrite historical records. Missing keys, mismatched cutover or changed
+sidecar fail closed. Encrypted scalar TSO migration, cold seed, lost-state
+replacement, arbitrary protected membership changes and the complete snapshot
+protocol remain unsupported. Existing plaintext preparation may retain committed
+inactive encryption metadata; that alone is not encrypted migration evidence.
+Full v5 support, production operation and historical serializability remain
+unclaimed. See `docs/raft_bootstrap_enablement.md` for the bounded runbook.
 
 ## Context
 
@@ -26,6 +120,102 @@ The isolation audit remains partial, and #1355 remains blocked until its
 replica-determinism and legacy-state acceptance obligations are satisfied.
 
 ## Decisions
+
+### Existing-cluster preparation evidence
+
+The accepted baseline and readiness are separate certificates. A baseline probe
+is signed while the existing members are quiesced, before local migration. It
+binds the agreed committed cut, configuration, complete retained data image and
+watermark. Its signature does not assert that any required-format marker or
+versioned native WAL identity has subsequently been persisted.
+
+Each member signs a separate domain-separated `PreparedMemberAck` only after
+the native migration has reached its durable bound phase. The signing owner
+must independently verify the original backup, retained term/vote/log/snapshot,
+version-2 WAL identity bound to the complete baseline manifest, required marker,
+intent and exact prepared store transformation. The acknowledgement binds that
+manifest digest, member, minimum formats and final local durable proof digest.
+It grants neither data admission nor a claim of historical correctness.
+
+`ControlActivate` carries both the baseline manifest and a `PreparedCertificate`.
+The latter must contain valid pinned-key signatures from every current member,
+including outgoing voters, learners and learners-next, not merely a quorum.
+Baseline probes cannot be substituted for preparation acknowledgements. The
+apply path still requires its independently retained local preparation and
+actual native configuration; the received certificate cannot select these.
+
+An explicit per-group `activation_file` may supply this complete command to the
+startup owner. Only after listeners start can that owner acquire a fresh local
+recovery handle and submit the command through its configured proposer. A lost
+or cancelled reply is unknown: completion follows independently recovered P,
+not an assumed acknowledgement or a fresh handle attached to an old request.
+
+A native snapshot may carry its sender's original preparation row. Runtime
+must not interpret that source probe as the receiver's offline preparation.
+When the probe names another member, its complete canonical bytes and context
+must match the independently configured activation manifest, including all
+baseline signatures and all prepared acknowledgments. Its manifest digest
+must equal the receiver's own verified WAL v2 preparation digest; recovered
+identity must separately match the receiver's configured local NodeID. No J or
+WAL is rewritten to manufacture this proof. Without the complete artifact, the
+original local-member validation remains strict. Keep that artifact across
+restarts after snapshot catch-up.
+
+The opt-in `--raftBootstrapPeerConfigDir` runtime path and offline CLI now wire
+accepted-baseline plaintext recovery, all-member preparation acknowledgments,
+policy activation, shared admission and Control/DataReady. Real native tests
+cover existing data, a three-member TLS group, dedicated TSO plus a data group,
+ordinary writes and restart. These are integration tests, not production
+operation or historical correctness evidence. See `docs/raft_bootstrap_enablement.md`.
+Exact protected startup rotation is implemented with the bounded active-envelope
+E2E evidence scoped above. Encrypted legacy migration, cold seed, lost-state
+replacement,
+guarded membership and the complete snapshot/journal protocol remain release gates.
+Unsupported profiles or operations fail closed; this does not complete v5.
+The new composed source still requires its own latest-push review and CI.
+
+The current runtime conservatively treats every data/maintenance root as
+dependent on all local protected groups. Direct reads may reach a store before
+recording a target-specific native action; any native group change must cancel
+these roots as well. New data admission waits until all groups are DataReady
+and affected old owners have joined. Identity/control work retains its narrower
+generation-bound dependencies so elections and policy activation do not depend
+on catalog/data completion. Target-specific data admission is a future
+availability optimization, not an exception to result validation.
+
+Protected RAW commits retain the original receiver context through the terminal
+proposal. The legacy cross-request microbatch detaches onto a background
+context, so it is not used by protected native proposers. Each protected raw
+command still submits its complete request list atomically in one entry.
+Cross-request batching requires a composite retaining every original handle
+and an atomic terminal validation of all of them; creating a fresh batch owner
+would not satisfy that requirement. Legacy proposers retain their existing
+batching. Protected throughput therefore needs separate measurement and must
+not be described as unchanged by this correctness fix.
+
+Admission refusal before work is distinct from revocation after a successful
+handler or child operation. The latter withholds the result and preserves an
+unknown-outcome error; it cannot assert that a submitted write was absent.
+Business gRPC responses use `Unknown` for that final boundary, not the
+pre-admission `Unavailable` signal. Existing deterministic apply errors remain
+distinct and are not converted into successful results or retry-safe refusal.
+
+A public stream blocked in transport I/O must also terminate on revocation.
+Replacing its application context alone cannot interrupt the underlying
+HTTP/2 read or flow-control wait. The protected listener captures its genuine
+server-owned physical connection and closes that connection outside A when the
+operation is cancelled, joining the cancellation callback before retirement.
+This may interrupt other multiplexed calls on that connection. It is an
+availability cost, not evidence that their submitted writes were absent.
+Normal stream completion stops the abort callback before finishing ownership,
+so a healthy connection remains reusable.
+
+HTTP adapters similarly capture the accepted server connection and join its
+cancellation callback before retiring the request. A blocked request-body read
+cannot rely on `Body.Close`, whose lock may already be held by that read.
+After entering a handler, revoked response admission aborts the HTTP exchange
+rather than returning a generic 503 that could imply non-acceptance. Refusal
+before handler admission remains a 503. Normal completion retains keep-alive.
 
 ### Ordered startup
 
@@ -840,6 +1030,12 @@ with activation index/generation zero and the accepted baseline C digest.
   or inner bytes in that order. Inner watermark remains exact 0x17; catalog
   remains an existing single-group one-phase transaction, never arbitrary
   admin work. Duplicate receipt lookup uses engine-supplied index/term/hash.
+- `ForwardAdminProposalRequest.force_entry` is a forwarding-only receipt
+  request for the exact typed 0x17 watermark payload. The receiver rejects it
+  for every other payload and bypasses only the covered-watermark no-op; the
+  Raft entry bytes remain unchanged. If an older receiver ignores this unknown
+  protobuf field and takes its covered-watermark no-op, callers receive no
+  commit index and treat the receipt as unavailable rather than success.
 - ConfChange context: version=0x04, operation ID, reservation ID, expected W,
   canonical exact transition and identity digest, with length-delimited peer
   ID/address. Both entry forms use this context. Existing context 0x03 is
@@ -1021,6 +1217,51 @@ protocol choices or evidence that any implementation has passed them.
   isolation or all-design-doc goal complete from this prerequisite alone.
 
 ## Implementation checkpoint
+
+### Protected Recovery Integration In Progress
+
+The current working branch adds explicit per-listener mTLS provisioning,
+identity-bound native WAL metadata, a synchronous native post-replay admission
+boundary, protected FSM policy loading, and session-aware transport dialing.
+The group factory carries the session service and TLS/interceptor options into
+the existing listener while retaining its business authorization gates.
+Required-format preflight never rewrites a legacy marker or invents missing WAL
+identity. Every configured group is checked before the first engine is opened.
+
+The internal startup configuration reads `group-<id>.json` and currently
+requires an already activated intent and identity-bound native WAL. It is a
+recovery integration surface, not an upgrade command or cold bootstrap path.
+Recovered policy is read from protected FSM metadata, not `bootstrap-policy`.
+Native identity, applied index, configuration and peer addresses must agree.
+Only IdentityReady is published; the existing public gate additionally requires
+the runtime's revocable DataReady predicate. A protected version-zero catalog
+is rejected rather than initialized by direct local Save. The CLI flag is not
+registered while maintenance/control attempts still bypass runtime admission;
+this unfinished path must not be exposed as an operational rollout switch.
+
+Protected restart and received-snapshot reconciliation recover the actual
+configuration-entry index from the ordered FSM namespace proof, not the newer
+data-snapshot index. Missing, future, regressed or membership-inconsistent
+proofs remain rejected. The production data-group FSM receives its validated
+cluster/group identity before native replay, including durable receipt lookup.
+Protected stream creation observes dispatch cancellation while opening; an
+established cached stream is not tied to the first dispatch's short lifetime.
+
+The protected transport captures unary and per-message stream session receipts
+and retains them through the native inbound queue. Dequeue authorization and
+RawNode.Step share a bounded owner-lock scope with session revocation; a stale
+receipt cannot update leader contact, quorum acknowledgments or native state.
+This is not terminal-enqueue linearization: revocation can still race queue
+insertion, and snapshot terminal install/Ready apply needs its own admission
+boundary. Catch-up grant-owner admission remains closed at this scope.
+
+This does not complete runtime admission. TSO policy recovery is still rejected
+instead of starting a partially protected domain. DataReady/control admission,
+cross-group rotation dependencies, background-writer admission, protected
+membership reservations and enqueue/install receipt rechecks remain required.
+The legacy startup regression remains separately retained and red. No usable
+production rollout, complete bootstrap, or completion of the parent isolation
+audit is claimed by this integration checkpoint.
 
 The branch now contains `internal/raftbootstrap`: strict canonical,
 checksummed intent parsing and intent-before-marker durable publication.

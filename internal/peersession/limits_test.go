@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/bootjp/elastickv/internal/peersession/wire"
 	pb "github.com/bootjp/elastickv/proto"
@@ -12,12 +13,17 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
-const publicEchoMethod = "/test.Public/Echo"
+const (
+	publicEchoMethod     = "/test.Public/Echo"
+	largeExchangeTimeout = 30 * time.Second
+)
 
 type largeService struct {
 	pb.UnimplementedEtcdRaftServer
@@ -82,25 +88,41 @@ func TestNativePublicAndRaftKeep64MiBContract(t *testing.T) {
 	f := setupNative(t, fixtureOptions{})
 	cc := f.dial(t)
 	h := f.handshake(t, cc)
-	ctx, cancel := context.WithTimeout(t.Context(), testTimeout)
-	defer cancel()
 	require.Equal(t, 64<<20, TransportMaxMessageSize)
 	// Existing public requests AND replies must remain usable above 16 MiB.
 	public := &wrapperspb.BytesValue{Value: bytes.Repeat([]byte{0x4a}, 20<<20)}
-	var echo wrapperspb.BytesValue
-	require.NoError(t, cc.Invoke(ctx, publicEchoMethod, public, &echo, grpc.MaxCallRecvMsgSize(TransportMaxMessageSize), grpc.MaxCallSendMsgSize(TransportMaxMessageSize)))
-	require.Equal(t, public.Value, echo.Value)
+	// Large race-instrumented serialization/TLS exchanges need independent
+	// budgets; earlier work must not consume a later exchange's deadline.
+	t.Run("public echo", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), largeExchangeTimeout)
+		defer cancel()
+		var echo wrapperspb.BytesValue
+		require.NoError(t, cc.Invoke(ctx, publicEchoMethod, public, &echo, grpc.MaxCallRecvMsgSize(TransportMaxMessageSize), grpc.MaxCallSendMsgSize(TransportMaxMessageSize)))
+		require.Equal(t, public.Value, echo.Value)
+	})
 	// Use the EXISTING EtcdRaft protobuf service/envelope and a real decoded
 	// MsgApp, not the new control Frame, for the forwarding-size regression.
 	message := &raftpb.Message{Type: raftpb.MsgApp.Enum(), From: proto.Uint64(2), To: proto.Uint64(1), Term: proto.Uint64(4), Entries: []*raftpb.Entry{{Data: public.Value}}}
 	data, err := proto.Marshal(message)
 	require.NoError(t, err)
-	var ack pb.EtcdRaftAck
-	require.NoError(t, h.Invoke(ctx, cc, pb.EtcdRaft_Send_FullMethodName, &pb.EtcdRaftMessage{Message: data}, &ack))
+	t.Run("raft forwarding", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), largeExchangeTimeout)
+		defer cancel()
+		var ack pb.EtcdRaftAck
+		require.NoError(t, h.Invoke(ctx, cc, pb.EtcdRaft_Send_FullMethodName, &pb.EtcdRaftMessage{Message: data}, &ack))
+	})
 	// A 64 MiB PAYLOAD plus protobuf envelope still exceeds the old 64 MiB
 	// transport budget and remains rejected (the cap was not removed).
-	tooLarge := &wrapperspb.BytesValue{Value: make([]byte, TransportMaxMessageSize)}
-	require.Error(t, cc.Invoke(ctx, publicEchoMethod, tooLarge, &echo, grpc.MaxCallSendMsgSize(TransportMaxMessageSize+128)))
+	t.Run("oversized rejected", func(t *testing.T) {
+		tooLarge := &wrapperspb.BytesValue{Value: make([]byte, TransportMaxMessageSize)}
+		ctx, cancel := context.WithTimeout(t.Context(), largeExchangeTimeout)
+		defer cancel()
+		var echo wrapperspb.BytesValue
+		err := cc.Invoke(ctx, publicEchoMethod, tooLarge, &echo,
+			grpc.MaxCallSendMsgSize(TransportMaxMessageSize+128), grpc.MaxCallRecvMsgSize(TransportMaxMessageSize+128))
+		require.Equal(t, codes.ResourceExhausted, status.Code(err))
+		require.ErrorContains(t, err, "received message larger than max")
+	})
 }
 
 type rawCodec struct{ data []byte }

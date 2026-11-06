@@ -1,6 +1,7 @@
-// Package raftbootstrap provides local durable bootstrap format primitives.
-// It does not implement replicated P, policy activation, peer sessions, runtime
-// admission, catalog initialization or native WAL/snapshot recovery.
+// Package raftbootstrap provides local durable bootstrap format primitives and
+// canonical codecs for guarded bootstrap control entries. It does not implement
+// replicated P, policy activation, peer sessions, runtime admission, catalog
+// initialization or native WAL/snapshot recovery.
 //
 // Startup integration contract:
 //

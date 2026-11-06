@@ -87,10 +87,10 @@ func (h *Handle) Invoke(ctx context.Context, cc grpc.ClientConnInterface, name s
 	if err != nil {
 		return err
 	}
-	if m.Request == nil || m.Reply == nil {
+	if (m.Request == nil && m.BoundRequest == nil) || m.Reply == nil {
 		return ErrDenied
 	}
-	request, err := m.Request(req)
+	request, err := decodeRequest(h, m, req, true)
 	if err != nil {
 		return err
 	}
@@ -228,10 +228,10 @@ func (h *Handle) CheckIncoming(ctx context.Context, name string, payload any) er
 	if h.c == nil || h.c.client {
 		return ErrDenied
 	}
-	if m.Request == nil {
+	if m.Request == nil && m.BoundRequest == nil {
 		return ErrDenied
 	}
-	msg, err := m.Request(payload)
+	msg, err := decodeRequest(h, m, payload, false)
 	if err != nil {
 		return err
 	}

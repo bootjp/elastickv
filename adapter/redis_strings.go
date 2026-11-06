@@ -122,7 +122,7 @@ func (r *RedisServer) loadRedisSetState(ctx context.Context, key []byte, readTS 
 		return state, nil
 	}
 
-	oldValue, _, err := r.readRedisStringAt(key, readTS)
+	oldValue, _, err := r.readRedisStringAt(key, readTS, ctx)
 	if err != nil && !errors.Is(err, store.ErrKeyNotFound) {
 		return redisSetState{}, err
 	}
@@ -195,7 +195,8 @@ func (r *RedisServer) trySetFastPath(conn redcon.Conn, ctx context.Context, key,
 	readTS := r.readTS()
 	// Use rawKeyTypeAt (TTL-unaware) so that expired keys whose internal data
 	// still exists are detected and routed through the full cleanup path.
-	typ, err := r.rawKeyTypeAt(context.Background(), key, readTS)
+	typ, err := r.rawKeyTypeAt(ctx,
+		key, readTS)
 	if err != nil {
 		writeRedisError(conn, err)
 		return true
@@ -212,6 +213,10 @@ func (r *RedisServer) trySetFastPath(conn redcon.Conn, ctx context.Context, key,
 }
 
 func (r *RedisServer) set(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
@@ -225,7 +230,7 @@ func (r *RedisServer) runStandaloneDedup(conn redcon.Conn, cmd redcon.Command) b
 	if !r.onePhaseTxnDedup {
 		return false
 	}
-	results, err := r.runTransactionWithDedup([]redcon.Command{cmd})
+	results, err := r.runTransactionWithDedup([]redcon.Command{cmd}, r.handlerContext(conn))
 	if err != nil {
 		writeRedisError(conn, err)
 		return true
@@ -240,13 +245,18 @@ func (r *RedisServer) runStandaloneDedup(conn redcon.Conn, cmd redcon.Command) b
 // shape carries its own decision points). Behaviour is byte-identical to
 // the pre-PR set() body.
 func (r *RedisServer) setLegacy(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	opts, err := parseRedisSetOptions(cmd.Args[3:], time.Now())
 	if err != nil {
 		writeRedisError(conn, err)
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(conn),
+		redisDispatchTimeout)
 	defer cancel()
 
 	if opts.isFastPath() && r.trySetFastPath(conn, ctx, cmd.Args[1], cmd.Args[2], opts.ttl) {
@@ -319,19 +329,17 @@ func writeRedisStandaloneResult(conn redcon.Conn, results []redisResult) {
 }
 
 func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	key := cmd.Args[1]
 	if r.proxyToLeader(conn, cmd, key) {
 		return
 	}
 
-	// Single bounded context for the slow paths in this handler,
-	// derived from the server's base context so Close() cancels any
-	// in-flight handler instead of leaving it running on a detached
-	// context.Background(). Only LeaseReadForKey and keyTypeAt accept
-	// a context; readRedisStringAt is a local-store read that does
-	// not take one. The shared deadline bounds the only branches
-	// that can actually block on quorum / I/O.
-	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
+	// Preserve the command's captured owner through quorum and local reads.
+	ctx, cancel := context.WithTimeout(r.handlerContext(conn), redisDispatchTimeout)
 	defer cancel()
 	if _, err := kv.LeaseReadForKeyThrough(r.coordinator, ctx, redisUserRouteKey(key)); err != nil {
 		writeRedisError(conn, err)
@@ -352,7 +360,9 @@ func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
 	// Use the snapshot variant: LeaseReadForKeyThrough above already
 	// established the ReadIndex fence, so a per-call VerifyLeaderForKey
 	// (inside leaderAwareGetAt) would duplicate the quorum work.
-	v, _, err := r.readRedisStringAtSnapshot(key, readTS)
+	v, _, err := r.readRedisStringWith(key, readTS, func(key []byte, ts uint64) ([]byte, error) {
+		return r.doGetAtContext(ctx, key, ts, false)
+	})
 	if err == nil {
 		conn.WriteBulk(v)
 		return
@@ -391,8 +401,9 @@ func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
 // payload is in new format, returns the embedded-TTL expiry verdict. The bool
 // indicates whether the caller should use this verdict (true) or fall through
 // to the legacy !redis|ttl| index (false).
-func (r *RedisServer) leaderEmbeddedTTLExpired(key []byte) (bool, bool) {
-	raw, err := r.tryLeaderGetAt(redisStrKey(key), 0)
+func (r *RedisServer) leaderEmbeddedTTLExpired(key []byte, requestContexts ...context.Context) (bool, bool) {
+	raw, err := r.tryLeaderGetAtContext(r.redisContext(requestContexts...),
+		redisStrKey(key), 0)
 	if err != nil || !isNewRedisStrFormat(raw) {
 		return false, false
 	}
@@ -408,12 +419,13 @@ func (r *RedisServer) leaderEmbeddedTTLExpired(key []byte) (bool, bool) {
 }
 
 // isLeaderKeyExpired checks whether the key has an expired TTL on the leader.
-func (r *RedisServer) isLeaderKeyExpired(key []byte) bool {
+func (r *RedisServer) isLeaderKeyExpired(key []byte, requestContexts ...context.Context) bool {
 	// For string keys with new encoding: check embedded TTL.
-	if expired, ok := r.leaderEmbeddedTTLExpired(key); ok {
+	if expired, ok := r.leaderEmbeddedTTLExpired(key, r.redisContext(requestContexts...)); ok {
 		return expired
 	}
-	raw, err := r.tryLeaderGetAt(redisTTLKey(key), 0)
+	raw, err := r.tryLeaderGetAtContext(r.redisContext(requestContexts...),
+		redisTTLKey(key), 0)
 	if err != nil {
 		return false
 	}
@@ -427,9 +439,10 @@ func (r *RedisServer) isLeaderKeyExpired(key []byte) bool {
 // tryLeaderNonStringExists checks whether the key exists as a non-string type
 // (hash, set, zset, stream, HLL, or list) on the leader. Returns false if the
 // key has an expired TTL.
-func (r *RedisServer) tryLeaderNonStringExists(key []byte) bool {
+func (r *RedisServer) tryLeaderNonStringExists(key []byte, requestContexts ...context.Context) bool {
 	// Check TTL first: if expired, the key is logically gone.
-	if raw, err := r.tryLeaderGetAt(redisTTLKey(key), 0); err == nil {
+	if raw, err := r.tryLeaderGetAtContext(r.redisContext(requestContexts...),
+		redisTTLKey(key), 0); err == nil {
 		if ttl, decErr := decodeRedisTTL(raw); decErr == nil && !ttl.After(time.Now()) {
 			return false
 		}
@@ -441,24 +454,27 @@ func (r *RedisServer) tryLeaderNonStringExists(key []byte) bool {
 		redisZSetKey(key),
 		redisStreamKey(key),
 	} {
-		if _, err := r.tryLeaderGetAt(internalKey, 0); err == nil {
+		if _, err := r.tryLeaderGetAtContext(r.redisContext(requestContexts...),
+			internalKey, 0); err == nil {
 			return true
 		}
 	}
-	if _, err := r.tryLeaderGetAt(listMetaKey(key), 0); err == nil {
+	if _, err := r.tryLeaderGetAtContext(r.redisContext(requestContexts...),
+		listMetaKey(key), 0); err == nil {
 		return true
 	}
 	return false
 }
 
 // tryLeaderLogicalExists checks whether the key exists as any type on the leader.
-func (r *RedisServer) tryLeaderLogicalExists(key []byte) bool {
+func (r *RedisServer) tryLeaderLogicalExists(key []byte, requestContexts ...context.Context) bool {
 	// Prefer asking the leader's Redis command path directly: it evaluates
 	// existence with ttlAt() semantics (including the in-memory TTL buffer).
 	// If this path is unavailable we fall back to raw-KV probing, which is
 	// best-effort and may lag unflushed buffer-only TTL updates.
 	if cli, err := r.leaderClientForRedisUserKey(key); err == nil {
-		ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
+		ctx, cancel := context.WithTimeout(r.redisContext(requestContexts...),
+			redisDispatchTimeout)
 		defer cancel()
 		if count, existsErr := cli.Exists(ctx, string(key)).Result(); existsErr == nil {
 			return count > 0
@@ -466,17 +482,22 @@ func (r *RedisServer) tryLeaderLogicalExists(key []byte) bool {
 	}
 
 	// Fallback to raw KV probing if Redis command proxying is unavailable.
-	if r.isLeaderKeyExpired(key) {
+	if r.isLeaderKeyExpired(key, r.redisContext(requestContexts...)) {
 		return false
 	}
 	// String type (raw user key).
-	if _, err := r.tryLeaderGetAt(key, 0); err == nil {
+	if _, err := r.tryLeaderGetAtContext(r.redisContext(requestContexts...),
+		key, 0); err == nil {
 		return true
 	}
-	return r.tryLeaderNonStringExists(key)
+	return r.tryLeaderNonStringExists(key, r.redisContext(requestContexts...))
 }
 
 func (r *RedisServer) del(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	// DEL discovers internal keys via local MVCC state. On followers this state
 	// may lag, producing incomplete deletes. Check per-key leadership and proxy
 	// non-local keys to the correct leader for accurate internal-key discovery.
@@ -494,7 +515,7 @@ func (r *RedisServer) del(conn redcon.Conn, cmd redcon.Command) {
 
 	// Proxy non-local keys to the appropriate leader.
 	if len(proxyKeys) > 0 {
-		proxied, err := r.proxyDel(proxyKeys)
+		proxied, err := r.proxyDel(proxyKeys, r.handlerContext(conn))
 		if err != nil {
 			writeRedisError(conn, err)
 			return
@@ -504,7 +525,7 @@ func (r *RedisServer) del(conn redcon.Conn, cmd redcon.Command) {
 
 	// Delete local keys directly.
 	if len(localKeys) > 0 {
-		localRemoved, err := r.delLocal(localKeys)
+		localRemoved, err := r.delLocal(localKeys, r.handlerContext(conn))
 		if err != nil {
 			writeRedisError(conn, err)
 			return
@@ -515,8 +536,9 @@ func (r *RedisServer) del(conn redcon.Conn, cmd redcon.Command) {
 	conn.WriteInt64(removed)
 }
 
-func (r *RedisServer) delLocal(keys [][]byte) (int, error) {
-	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
+func (r *RedisServer) delLocal(keys [][]byte, requestContexts ...context.Context) (int, error) {
+	ctx, cancel := context.WithTimeout(r.redisContext(requestContexts...),
+		redisDispatchTimeout)
 	defer cancel()
 	var removed int
 	err := r.retryRedisWrite(ctx, func() error {
@@ -547,6 +569,10 @@ func (r *RedisServer) delLocal(keys [][]byte) (int, error) {
 }
 
 func (r *RedisServer) exists(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	readTS := r.readTS()
 	// Derive ctx from the server's base context so work in this handler
 	// that honors context deadlines is bounded and cancels on shutdown.
@@ -555,7 +581,8 @@ func (r *RedisServer) exists(conn redcon.Conn, cmd redcon.Command) {
 	// an in-flight local probe. The negative-result follower fallback
 	// currently calls tryLeaderLogicalExists(), which manages its own
 	// timeout/context rather than using this ctx.
-	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(conn),
+		redisDispatchTimeout)
 	defer cancel()
 	count := 0
 	for _, key := range cmd.Args[1:] {
@@ -568,7 +595,7 @@ func (r *RedisServer) exists(conn redcon.Conn, cmd redcon.Command) {
 			count++
 		} else if !r.coordinator.IsLeaderForKey(redisUserRouteKey(key)) {
 			// Local MVCC may be stale on a follower; proxy to the leader.
-			if r.tryLeaderLogicalExists(key) {
+			if r.tryLeaderLogicalExists(key, r.handlerContext(conn)) {
 				count++
 			}
 		}

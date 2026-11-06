@@ -5,22 +5,21 @@ import (
 	"strings"
 	"time"
 
-	internalutil "github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
-	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
 const migrationMemberProbeTimeout = 2 * time.Second
 
-func newMigrationMemberProtocolProbe(token string) func(context.Context, string) error {
+func newMigrationMemberProtocolProbe(token string, providers ...kv.GRPCDialOptionsForAddress) func(context.Context, string) error {
 	return func(ctx context.Context, address string) error {
 		if strings.TrimSpace(address) == "" {
 			return errors.WithStack(status.Error(codes.FailedPrecondition, "migration member address is empty"))
 		}
-		conn, err := grpc.NewClient(address, internalutil.GRPCDialOptions()...)
+		conn, err := newBootstrapOrdinaryClient(address, providers...)
 		if err != nil {
 			return errors.Wrap(err, "migration member capability connection")
 		}

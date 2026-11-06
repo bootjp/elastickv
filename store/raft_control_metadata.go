@@ -11,6 +11,7 @@ import (
 // RaftControlMetadataPrefix is a raw, non-MVCC namespace beneath the already
 // reserved transaction metadata family. It is not a new user-key namespace.
 const RaftControlMetadataPrefix = "!txn|meta|raft-control|"
+const RaftControlReceiptKeyPrefix = "R/"
 
 var ErrRaftControlScopeRequired = errors.New("store: control metadata requires an indexed raft entry scope")
 var ErrRaftControlKey = errors.New("store: invalid raft control metadata key")
@@ -202,8 +203,8 @@ func (s *pebbleStore) stageRaftControlMetadata(ctx context.Context, key, value [
 	if scope == nil {
 		return errors.WithStack(ErrRaftControlScopeRequired)
 	}
-	if scope.appliedIndex == 0 && !scope.controlOnly {
-		return scope.fail(errors.WithStack(ErrRaftControlScopeRequired))
+	if err := validateRaftControlScope(scope.appliedIndex, scope.controlOnly, key); err != nil {
+		return scope.fail(err)
 	}
 	if scope.failed != nil {
 		return scope.failed
@@ -280,8 +281,8 @@ func (s *mvccStore) stageMemoryControlMetadata(ctx context.Context, key, value [
 	if scope == nil {
 		return errors.WithStack(ErrRaftControlScopeRequired)
 	}
-	if scope.index == 0 && !scope.controlOnly {
-		return scope.fail(errors.WithStack(ErrRaftControlScopeRequired))
+	if err := validateRaftControlScope(scope.index, scope.controlOnly, key); err != nil {
+		return scope.fail(err)
 	}
 	if scope.failed != nil {
 		return scope.failed
@@ -299,5 +300,12 @@ func (s *mvccStore) stageMemoryControlMetadata(ctx context.Context, key, value [
 	}
 	scope.staged.controlAppliedIndex = max(scope.staged.controlAppliedIndex, scope.index)
 	scope.touched = true
+	return nil
+}
+
+func validateRaftControlScope(index uint64, controlOnly bool, key []byte) error {
+	if index == 0 && (!controlOnly || bytes.HasPrefix(key, []byte(RaftControlReceiptKeyPrefix))) {
+		return errors.WithStack(ErrRaftControlScopeRequired)
+	}
 	return nil
 }

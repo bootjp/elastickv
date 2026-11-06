@@ -31,7 +31,7 @@ func (o *Owner) ServerOptions(cfg *tls.Config) ([]grpc.ServerOption, error) {
 
 func (o *Owner) UnaryServerInterceptor() grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
-		if o.public[info.FullMethod] || isHandshake(info.FullMethod) {
+		if o.permitsPublic(ctx, info.FullMethod) || isHandshake(info.FullMethod) {
 			return handler(ctx, req)
 		}
 		method, ok := o.unaryMethod(info.FullMethod)
@@ -42,7 +42,7 @@ func (o *Owner) UnaryServerInterceptor() grpc.UnaryServerInterceptor {
 		if err != nil {
 			return nil, err
 		}
-		request, err := method.Request(req)
+		request, err := decodeRequest(h, method, req, false)
 		if err != nil {
 			return nil, malformed()
 		}
@@ -51,6 +51,11 @@ func (o *Owner) UnaryServerInterceptor() grpc.UnaryServerInterceptor {
 		}
 		owned, cancel := boundContext(ctx, h.s.ctx)
 		defer cancel()
+		slot := &receiptSlot{}
+		receipt := &Receipt{handle: h, message: request, method: info.FullMethod}
+		slot.set(receipt)
+		owned = context.WithValue(owned, receiptKey{}, slot)
+		owned = context.WithValue(owned, capturedReceiptKey{}, receipt)
 		reply, err := handler(owned, req)
 		if err != nil {
 			return nil, err
@@ -68,7 +73,7 @@ func (o *Owner) UnaryServerInterceptor() grpc.UnaryServerInterceptor {
 
 func (o *Owner) unaryMethod(name string) (Method, bool) {
 	m, ok := o.methods[name]
-	return m, ok && m.Request != nil && m.Reply != nil
+	return m, ok && (m.Request != nil || m.BoundRequest != nil) && m.Reply != nil
 }
 
 func streamError(err error) error {
@@ -87,7 +92,7 @@ func boundContext(parent, lifetime context.Context) (context.Context, context.Ca
 
 func (o *Owner) StreamServerInterceptor() grpc.StreamServerInterceptor {
 	return func(srv any, stream grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
-		if o.public[info.FullMethod] {
+		if o.permitsPublic(stream.Context(), info.FullMethod) {
 			return handler(srv, stream)
 		}
 		method, ok := o.methods[info.FullMethod]

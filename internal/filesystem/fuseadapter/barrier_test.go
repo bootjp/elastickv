@@ -78,6 +78,19 @@ func TestFsyncRetainsUnknownPredecessorError(t *testing.T) {
 	require.False(t, core.fsyncCalled)
 }
 
+func TestMutationTrackerRetainsOtherUnknownAfterOneResolution(t *testing.T) {
+	var tracker mutationTracker
+	tracker.markUnknown(7)
+	tracker.markUnknown(7)
+	tracker.resolveUnknown(7)
+	_, errno := tracker.begin(t.Context(), 7)
+	require.Equal(t, syscall.EIO, errno)
+	tracker.resolveUnknown(7)
+	ticket, errno := tracker.begin(t.Context(), 7)
+	require.Zero(t, errno)
+	tracker.end(ticket, false)
+}
+
 func TestOrdinaryWriteEIODoesNotPoisonLaterMutations(t *testing.T) {
 	core := &fakeCore{writeErr: errors.New("storage unavailable")}
 	adapter := New(core, []byte("client"), WithHandleKeepaliveInterval(0))

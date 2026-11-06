@@ -37,21 +37,22 @@ type FSMCompactRuntime struct {
 type FSMCompactorOption func(*FSMCompactor)
 
 type FSMCompactor struct {
-	runtimes        []FSMCompactRuntime
-	tracker         *ActiveTimestampTracker
-	interval        time.Duration
-	retentionWindow time.Duration
-	timeout         time.Duration
-	leaderTimeout   time.Duration
-	leaderCooldown  time.Duration
-	timeoutBackoff  time.Duration
-	maxL0Files      int64
-	maxL0Sublevels  int32
-	maxLSMDebtBytes uint64
-	logger          *slog.Logger
-	mu              sync.Mutex
-	backoffUntil    map[uint64]time.Time
-	leaderUntil     map[uint64]time.Time
+	operationAdmission OperationAdmission
+	runtimes           []FSMCompactRuntime
+	tracker            *ActiveTimestampTracker
+	interval           time.Duration
+	retentionWindow    time.Duration
+	timeout            time.Duration
+	leaderTimeout      time.Duration
+	leaderCooldown     time.Duration
+	timeoutBackoff     time.Duration
+	maxL0Files         int64
+	maxL0Sublevels     int32
+	maxLSMDebtBytes    uint64
+	logger             *slog.Logger
+	mu                 sync.Mutex
+	backoffUntil       map[uint64]time.Time
+	leaderUntil        map[uint64]time.Time
 }
 
 type pebbleMetricsSource interface {
@@ -219,6 +220,13 @@ func (c *FSMCompactor) validate() error {
 }
 
 func (c *FSMCompactor) compactRuntime(ctx context.Context, runtime FSMCompactRuntime) error {
+	_, err := admittedOperation(ctx, c.operationAdmission, runtime.GroupID, AdmissionMaintenance, func(owned context.Context) (struct{}, error) {
+		return struct{}{}, c.compactAdmittedRuntime(owned, runtime)
+	})
+	return err
+}
+
+func (c *FSMCompactor) compactAdmittedRuntime(ctx context.Context, runtime FSMCompactRuntime) error {
 	retention, status, ok := c.compactionRuntimeReady(runtime)
 	if !ok {
 		return nil

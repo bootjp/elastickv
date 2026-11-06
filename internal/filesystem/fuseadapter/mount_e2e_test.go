@@ -7,14 +7,12 @@
 package fuseadapter_test
 
 import (
-	"context"
 	"errors"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -23,6 +21,7 @@ import (
 	"github.com/bootjp/elastickv/internal/filesystem/fstest"
 	"github.com/bootjp/elastickv/internal/filesystem/fuseadapter"
 	"github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 )
@@ -128,13 +127,24 @@ func mountMemoryServiceAtWithOptions(t *testing.T, svc fuseadapter.Core, clientI
 }
 
 func TestKernelMountConcurrentCreateAcrossMounts(t *testing.T) {
+	testConcurrentCreateAcrossMounts(t, false)
+}
+
+func TestKernelMountConcurrentCreateInterruptedClose(t *testing.T) {
+	testConcurrentCreateAcrossMounts(t, true)
+}
+
+func testConcurrentCreateAcrossMounts(t *testing.T, interruptFlush bool) {
+	t.Helper()
 	if _, err := os.Stat("/dev/fuse"); err != nil {
 		skipOrFail(t, "no /dev/fuse: %v", err)
 	}
 	svc := &collidingMountCore{Core: newMemoryServiceForMount(t), ready: make(chan struct{})}
+	svc.interruptFlush.Store(interruptFlush)
 
 	mountA := mountMemoryService(t, svc, "e2e-mount-a")
 	mountB := mountMemoryService(t, svc, "e2e-mount-b")
+	interruptedCloses := 0
 	for i := range 32 {
 		name := "shared-" + strconv.Itoa(i)
 		pathA := filepath.Join(mountA, name)
@@ -159,19 +169,77 @@ func TestKernelMountConcurrentCreateAcrossMounts(t *testing.T) {
 		}
 		close(start)
 		first, second := <-results, <-results
+		// Register both before assertions: a failure must not strand the other
+		// descriptor and turn the original error into an unmount-busy failure.
+		closeFirst := closeCreatedDescriptor(t, first.file)
+		closeSecond := closeCreatedDescriptor(t, second.file)
 		assertOneCreatedDescriptor(t, first.file, second.file)
-		if first.file != nil {
-			require.NoError(t, first.file.Close())
-		}
-		if second.file != nil {
-			require.NoError(t, second.file.Close())
-		}
 		require.NoError(t, first.err)
 		require.NoError(t, second.err)
-		require.FileExists(t, pathA)
-		require.FileExists(t, pathB)
+		payload := []byte(name)
+		n, err := first.file.Write(payload)
+		require.NoError(t, err)
+		require.Equal(t, len(payload), n)
+		// Close is not a durability barrier. Establish the barrier while each
+		// descriptor is still usable, including the non-creator's handle.
+		require.NoError(t, first.file.Sync())
+		require.NoError(t, second.file.Sync())
+		got := make([]byte, len(payload))
+		n, err = second.file.ReadAt(got, 0)
+		require.NoError(t, err)
+		require.Equal(t, len(payload), n)
+		require.Equal(t, payload, got)
+		firstCloseErr, secondCloseErr := closeFirst(), closeSecond()
+		for _, closeErr := range []error{firstCloseErr, secondCloseErr} {
+			if errors.Is(closeErr, syscall.EINTR) {
+				interruptedCloses++
+			} else {
+				require.NoError(t, closeErr)
+			}
+		}
+		// Linux removes the fd before returning a FLUSH error; never retry
+		// close(fd). RELEASE is asynchronous and must succeed independently.
+		require.Eventually(t, func() bool { return svc.released.Load() == int32(2*(i+1)) },
+			5*time.Second, time.Millisecond, "both backend handles must be released")
+		require.Zero(t, svc.releaseFailures.Load())
+		a, err := os.Stat(pathA)
+		require.NoError(t, err)
+		require.EqualValues(t, len(payload), a.Size())
+		b, err := os.Stat(pathB)
+		require.NoError(t, err)
+		require.EqualValues(t, len(payload), b.Size())
+		statA, ok := a.Sys().(*syscall.Stat_t)
+		require.True(t, ok)
+		statB, ok := b.Sys().(*syscall.Stat_t)
+		require.True(t, ok)
+		require.Equal(t, statA.Ino, statB.Ino)
+		inode, err := svc.Resolve(t.Context(), filesystem.RootInode, []byte(name))
+		require.NoError(t, err)
+		require.Equal(t, inode, statA.Ino)
+		_, err = svc.GetAttr(t.Context(), inode)
+		require.NoError(t, err)
 	}
 	require.Positive(t, svc.collisions.Load(), "must exercise an actual FUSE_CREATE collision, not just existing-file Open")
+	if interruptFlush {
+		require.EqualValues(t, 1, svc.interrupted.Load(), "must exercise a real kernel close returning EINTR")
+		require.Positive(t, interruptedCloses)
+	}
+}
+
+func closeCreatedDescriptor(t *testing.T, file *os.File) func() error {
+	t.Helper()
+	closeOnce := sync.OnceValue(func() error {
+		if file == nil {
+			return nil
+		}
+		return file.Close()
+	})
+	t.Cleanup(func() {
+		if err := closeOnce(); !errors.Is(err, syscall.EINTR) {
+			assert.NoError(t, err)
+		}
+	})
+	return closeOnce
 }
 
 func assertOneCreatedDescriptor(t *testing.T, first, second *os.File) {
@@ -187,37 +255,6 @@ func assertOneCreatedDescriptor(t *testing.T, first, second *os.File) {
 	b, err := unix.FcntlInt(second.Fd(), unix.F_CREATED_QUERY, 0)
 	require.NoError(t, err)
 	require.Equal(t, 1, a+b, "only the actual creator may report a newly created descriptor")
-}
-
-type collidingMountCore struct {
-	fuseadapter.Core
-	ready      chan struct{}
-	createMu   sync.Mutex
-	creates    atomic.Int32
-	collisions atomic.Int32
-}
-
-func (c *collidingMountCore) Create(ctx context.Context, parent uint64, name []byte, opts filesystem.CreateOptions) (filesystem.CreateResult, error) {
-	if attempt := c.creates.Add(1); attempt <= 2 {
-		if attempt == 2 {
-			close(c.ready)
-		}
-		select {
-		case <-c.ready:
-		case <-time.After(5 * time.Second):
-			return filesystem.CreateResult{}, context.DeadlineExceeded
-		}
-	}
-	// Exercise a definite EEXIST, not a concurrent OCC failure whose commit
-	// outcome the adapter cannot safely replay. The initial barrier above
-	// forces both mounts into FUSE_CREATE before either backend call finishes.
-	c.createMu.Lock()
-	defer c.createMu.Unlock()
-	result, err := c.Core.Create(ctx, parent, name, opts)
-	if errors.Is(err, filesystem.ErrExists) {
-		c.collisions.Add(1)
-	}
-	return result, err
 }
 
 func skipOrFail(t *testing.T, format string, args ...any) {

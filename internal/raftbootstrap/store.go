@@ -1,6 +1,7 @@
 package raftbootstrap
 
 import (
+	"bytes"
 	"io"
 	"os"
 	"sync"
@@ -69,12 +70,96 @@ type Inspection struct {
 // serializes calls through this instance only; other processes/instances must
 // not publish concurrently. It never creates directories or opens a Raft engine.
 type Store struct {
-	dir string
-	mu  sync.Mutex
-	ops fileOps
+	dir     string
+	mu      sync.Mutex
+	ops     fileOps
+	staging *publicationStaging
 }
 
 func NewStore(dir string) *Store { return &Store{dir: dir, ops: realFileOps()} }
+
+// LoadIntent returns the strict durable intent when present. It does not
+// classify Raft state or grant admission; callers must still reconcile the
+// marker, WAL/snapshot identity and replicated policy before voting or data
+// service. The method exists so pre-admission components can bind namespaced
+// state to the provisioned cluster/group without trusting a payload field.
+func (s *Store) LoadIntent() (Intent, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	data, present, err := readBounded(s.dir, IntentFile)
+	if err != nil || !present {
+		return Intent{}, present, err
+	}
+	intent, err := ParseIntent(data)
+	return intent, true, errors.WithStack(err)
+}
+
+// LoadPolicy returns the durable replicated-policy cache when present. Its
+// contents are not authoritative until the caller reconciles it with the
+// selected Raft snapshot/log.
+func (s *Store) LoadPolicy() (PolicyRecord, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	data, present, err := readBounded(s.dir, PolicyFile)
+	if err != nil || !present {
+		return PolicyRecord{}, present, err
+	}
+	policy, err := ParsePolicyRecord(data)
+	return policy, true, errors.WithStack(err)
+}
+
+// InitializePolicy writes only when no prior policy exists. Repeated identical
+// initialization is idempotent; a different value is never overwritten.
+func (s *Store) InitializePolicy(policy PolicyRecord) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	data, err := MarshalPolicyRecord(policy)
+	if err != nil {
+		return err
+	}
+	current, present, err := readBounded(s.dir, PolicyFile)
+	if err != nil {
+		return err
+	}
+	if present {
+		if !bytes.Equal(current, data) {
+			return errors.WithStack(ErrInconsistent)
+		}
+		return nil
+	}
+	return s.replace(PolicyFile, data)
+}
+
+// AdvancePolicy applies one validated state transition to the local durable
+// cache. The expected witness prevents stale writers; Raft apply must call
+// this only after the corresponding policy entry is committed.
+func (s *Store) AdvancePolicy(expected Witness, next PolicyRecord) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	data, present, err := readBounded(s.dir, PolicyFile)
+	if err != nil {
+		return err
+	}
+	if !present {
+		return errors.WithStack(ErrInconsistent)
+	}
+	previous, err := ParsePolicyRecord(data)
+	if err != nil {
+		return err
+	}
+	witness, err := previous.Witness()
+	if err != nil || witness != expected {
+		return errors.WithStack(ErrInconsistent)
+	}
+	if err := ValidatePolicyTransition(previous, next); err != nil {
+		return err
+	}
+	encoded, err := MarshalPolicyRecord(next)
+	if err != nil {
+		return err
+	}
+	return s.replace(PolicyFile, encoded)
+}
 
 func ParseMarker(data []byte) (MarkerState, error) {
 	switch string(data) {

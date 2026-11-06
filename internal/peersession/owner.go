@@ -114,6 +114,16 @@ func provisionMap(local Node, records []Provision) (map[raftbootstrap.Digest]Pro
 }
 
 func (o *Owner) configureMethods(cfg Config) error {
+	if cfg.MethodFactory != nil {
+		if len(cfg.Methods) != 0 {
+			return ErrFormat
+		}
+		methods, err := cfg.MethodFactory(o)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		cfg.Methods = methods
+	}
 	for _, m := range cfg.Methods {
 		if !validMethod(m.Name) || isHandshake(m.Name) || !validDecoders(m) {
 			return ErrFormat
@@ -146,6 +156,22 @@ func validMethod(s string) bool {
 	service, method, ok := strings.Cut(s[1:], "/")
 	return ok && service != "" && method != "" && !strings.ContainsAny(s, " \t\r\n\x00") && !strings.Contains(method, "/")
 }
+
+// GroupProjection returns an owned copy of the locally published applied view.
+// It is decoder input, not enqueue permission: handles must still validate the
+// session generation at every send/receive and runtime admission boundary.
+func (o *Owner) GroupProjection(id uint64) (Group, bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.closed {
+		return Group{}, false
+	}
+	group, found := o.groups[id]
+	if !found {
+		return Group{}, false
+	}
+	return copyGroup(group), true
+}
 func isHandshake(m string) bool {
 	return m == wire.PeerSession_Begin_FullMethodName || m == wire.PeerSession_Finish_FullMethodName
 }
@@ -155,26 +181,59 @@ func isHandshake(m string) bool {
 // exposing a changed role/policy/term/configuration/stage in the runtime owner.
 // Increment Generation for every such change, including a term-only change.
 func (o *Owner) UpdateGroup(g Group) error {
-	if err := validateGroup(g); err != nil {
+	retire, err := o.UpdateGroupProjection(g)
+	if err != nil {
 		return err
+	}
+	retire()
+	return nil
+}
+
+// UpdateGroupProjection publishes only memory state and revokes session keys.
+// A process arbiter may call it in its native admission critical section; the
+// returned physical-transport cleanup must run after releasing that arbiter.
+func (o *Owner) UpdateGroupProjection(g Group) (func(), error) {
+	if err := validateGroup(g); err != nil {
+		return nil, err
 	}
 	g = copyGroup(g)
 	o.mu.Lock()
 	if o.closed {
 		o.mu.Unlock()
-		return ErrClosed
+		return nil, ErrClosed
 	}
 	if old, ok := o.groups[g.ID]; ok {
 		if err := validateGroupUpdate(old, g); err != nil {
 			o.mu.Unlock()
-			return err
+			return nil, err
 		}
 	}
 	transports := o.revokeGroupLocked(g.ID)
 	o.groups[g.ID] = g
 	o.mu.Unlock()
-	closeTransports(transports)
-	return nil
+	return sync.OnceFunc(func() { closeTransports(transports) }), nil
+}
+
+// UpdateStageProjection changes readiness only if its sampled policy/session
+// image is still current. Like UpdateGroupProjection, physical closes are deferred.
+func (o *Owner) UpdateStageProjection(id, expected, generation uint64, stage Stage) (func(), error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	g, ok := o.groups[id]
+	if o.closed || !ok || g.Generation != expected || g.Stage == Reconciling {
+		return nil, ErrDenied
+	}
+	next := copyGroup(g)
+	next.Generation, next.Stage = generation, stage
+	if err := validateGroup(next); err != nil {
+		return nil, err
+	}
+	if err := validateGroupUpdate(g, next); err != nil {
+		return nil, err
+	}
+	transports := o.revokeGroupLocked(id)
+	o.groups[id] = next
+	return sync.OnceFunc(func() { closeTransports(transports) }), nil
 }
 
 func validateGroupUpdate(old, next Group) error {

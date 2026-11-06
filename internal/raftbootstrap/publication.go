@@ -76,7 +76,7 @@ func openDirectory(path string) (_ syncDirectory, err error) {
 }
 
 func (s *Store) replace(name string, data []byte) (err error) {
-	f, err := s.ops.createTemp(s.dir, "."+name+"-*.tmp")
+	f, err := s.createPublicationTemp(name)
 	if err != nil {
 		return errors.Wrap(err, "bootstrap temporary creation")
 	}
@@ -86,7 +86,7 @@ func (s *Store) replace(name string, data []byte) (err error) {
 			err = errors.CombineErrors(err, errors.WithStack(f.Close()))
 		}
 		if !renamed {
-			err = errors.CombineErrors(err, errors.WithStack(os.Remove(f.Name())))
+			err = errors.CombineErrors(err, removePublicationTemp(f.Name()))
 		}
 	}()
 	if err := f.Chmod(filePerm); err != nil {

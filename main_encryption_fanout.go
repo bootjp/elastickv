@@ -38,7 +38,7 @@ func buildEncryptionCapabilityFanout(ctx context.Context, eg *errgroup.Group, ru
 	if !enableMutators {
 		return nil
 	}
-	fanoutConnCache := &kv.GRPCConnCache{}
+	fanoutConnCache := newBootstrapRuntimeConnCache(runtimes)
 	eg.Go(func() error {
 		<-ctx.Done()
 		if err := fanoutConnCache.Close(); err != nil {
@@ -68,7 +68,7 @@ func buildStorageEnvelopeV2MonitorFanout(
 	if !enableMutators {
 		return nil, nil
 	}
-	connCache := &kv.GRPCConnCache{}
+	connCache := newBootstrapRuntimeConnCache(runtimes)
 	return buildCapabilityFanoutFn(runtimes, connCache, capabilityFanoutTimeout), connCache.Close
 }
 
