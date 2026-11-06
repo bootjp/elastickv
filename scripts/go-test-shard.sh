@@ -30,7 +30,15 @@ case "${1:-}" in
   root) run . ;;
   raft-crypto) run ./internal/encryption ./internal/raftengine/etcd ;;
   rest)
-    mapfile -t pkgs < <(go list ./... | grep -vxF -f <(printf '%s\n' "${heavy[@]}"))
+    # Discover in a plain assignment so a go list failure (which omits
+    # erroneous packages) aborts the shard under set -e instead of being
+    # lost inside a process substitution.
+    all=$(go list ./...)
+    mapfile -t pkgs < <(printf '%s\n' "$all" | grep -vxF -f <(printf '%s\n' "${heavy[@]}") || true)
+    if [[ ${#pkgs[@]} -eq 0 || -z "${pkgs[0]}" ]]; then
+      echo "rest shard selected no packages" >&2
+      exit 1
+    fi
     run "${pkgs[@]}"
     ;;
   *)
