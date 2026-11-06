@@ -267,7 +267,13 @@ func TestRunLiveBackupRenewalDeadlineCancelsStream(t *testing.T) {
 func TestRunLiveBackupStopsRenewalBeforeManifestPublication(t *testing.T) {
 	t.Parallel()
 	rpc := successfulLiveBackupRPC()
-	rpc.begin.TtlMsEffective = 300
+	// The renewal RPC starts at ttl/liveBackupRenewalDivisor and gets the
+	// same span as its attempt timeout. The stream is released only once that
+	// RPC is in flight, so streaming plus finalize must finish inside the
+	// attempt timeout for stop() (not the deadline) to end the renewal. At
+	// 300ms that left 100ms, which -race on a loaded runner overran and the
+	// test failed with a deadline-route renewal error.
+	rpc.begin.TtlMsEffective = 3000
 	rpc.renewStarted = make(chan struct{})
 	rpc.renewWait = true
 	rpc.streamRelease = rpc.renewStarted
@@ -287,7 +293,7 @@ func TestRunLiveBackupStopsRenewalBeforeManifestPublication(t *testing.T) {
 		t.Fatal("MANIFEST.json was published while a pin renewal was still active")
 	}
 	manifest := readLiveBackupManifest(t, root)
-	if manifest.Live == nil || manifest.Live.ReadTS != 42 || manifest.BackupTSTTLMS != 300 {
+	if manifest.Live == nil || manifest.Live.ReadTS != 42 || manifest.BackupTSTTLMS != 3000 {
 		t.Fatalf("manifest live metadata = %+v", manifest)
 	}
 }
