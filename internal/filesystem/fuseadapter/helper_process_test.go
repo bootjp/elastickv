@@ -14,6 +14,7 @@ import (
 )
 
 func TestUnmountHelperCancellationKillsLateDescendant(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	helper, ready, late := filepath.Join(dir, "helper"), filepath.Join(dir, "ready"), filepath.Join(dir, "late")
 	script := fmt.Sprintf("#!/bin/sh\n( /bin/sleep 1; printf late > '%s' ) &\nprintf ready > '%s'\nwait\n", late, ready)

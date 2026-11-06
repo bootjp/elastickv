@@ -127,10 +127,12 @@ func mountMemoryServiceAtWithOptions(t *testing.T, svc fuseadapter.Core, clientI
 }
 
 func TestKernelMountConcurrentCreateAcrossMounts(t *testing.T) {
+	t.Parallel()
 	testConcurrentCreateAcrossMounts(t, false)
 }
 
 func TestKernelMountConcurrentCreateInterruptedClose(t *testing.T) {
+	t.Parallel()
 	testConcurrentCreateAcrossMounts(t, true)
 }
 
@@ -266,6 +268,7 @@ func skipOrFail(t *testing.T, format string, args ...any) {
 }
 
 func TestKernelMountFileLifecycle(t *testing.T) {
+	t.Parallel()
 	mountPoint := mountMemoryFilesystem(t)
 
 	path := filepath.Join(mountPoint, "hello.txt")
@@ -325,6 +328,7 @@ func TestKernelMountFileLifecycle(t *testing.T) {
 }
 
 func TestKernelMountDirectoryOperations(t *testing.T) {
+	t.Parallel()
 	mountPoint := mountMemoryFilesystem(t)
 
 	dir := filepath.Join(mountPoint, "dir")
@@ -365,6 +369,7 @@ func TestKernelMountDirectoryOperations(t *testing.T) {
 }
 
 func TestKernelMountReaddirPagesLargeDirectory(t *testing.T) {
+	t.Parallel()
 	mountPoint := mountMemoryFilesystem(t)
 
 	const count = 300
@@ -386,6 +391,7 @@ func TestKernelMountReaddirPagesLargeDirectory(t *testing.T) {
 }
 
 func TestKernelMountUnlinkWhileOpenKeepsDataReadable(t *testing.T) {
+	t.Parallel()
 	mountPoint := mountMemoryFilesystem(t)
 
 	path := filepath.Join(mountPoint, "open.txt")
@@ -406,6 +412,7 @@ func TestKernelMountUnlinkWhileOpenKeepsDataReadable(t *testing.T) {
 }
 
 func TestKernelMountUnsupportedOperationsReturnErrno(t *testing.T) {
+	t.Parallel()
 	mountPoint := mountMemoryFilesystem(t)
 
 	path := filepath.Join(mountPoint, "target")
@@ -422,6 +429,7 @@ func TestKernelMountUnsupportedOperationsReturnErrno(t *testing.T) {
 }
 
 func TestKernelMountStatfsReportsNameLimit(t *testing.T) {
+	t.Parallel()
 	mountPoint := mountMemoryFilesystem(t)
 
 	var stat syscall.Statfs_t
@@ -439,6 +447,7 @@ func requireOperationRetired(t *testing.T, journal *filesystem.OperationJournal,
 }
 
 func TestKernelMountJournaledFixedOffsetWrite(t *testing.T) {
+	t.Parallel()
 	if _, err := os.Stat("/dev/fuse"); err != nil {
 		skipOrFail(t, "no /dev/fuse: %v", err)
 	}
@@ -466,6 +475,7 @@ func TestKernelMountJournaledFixedOffsetWrite(t *testing.T) {
 }
 
 func TestKernelMountStrictModeMutationsAndReplyAcknowledgement(t *testing.T) {
+	t.Parallel()
 	if _, err := os.Stat("/dev/fuse"); err != nil {
 		skipOrFail(t, "no /dev/fuse: %v", err)
 	}
@@ -506,6 +516,7 @@ func TestKernelMountStrictModeMutationsAndReplyAcknowledgement(t *testing.T) {
 }
 
 func TestKernelMountStrictModeReclaimsJournalQuota(t *testing.T) {
+	t.Parallel()
 	if _, err := os.Stat("/dev/fuse"); err != nil {
 		skipOrFail(t, "no /dev/fuse: %v", err)
 	}
@@ -535,6 +546,7 @@ func TestKernelMountStrictModeReclaimsJournalQuota(t *testing.T) {
 }
 
 func TestKernelMountJournaledCreateAndMkdir(t *testing.T) {
+	t.Parallel()
 	if _, err := os.Stat("/dev/fuse"); err != nil {
 		skipOrFail(t, "no /dev/fuse: %v", err)
 	}
@@ -572,6 +584,7 @@ func TestKernelMountJournaledCreateAndMkdir(t *testing.T) {
 }
 
 func TestKernelMountJournaledLeaseRefreshAndFsync(t *testing.T) {
+	t.Parallel()
 	if _, err := os.Stat("/dev/fuse"); err != nil {
 		skipOrFail(t, "no /dev/fuse: %v", err)
 	}
@@ -597,6 +610,7 @@ func TestKernelMountJournaledLeaseRefreshAndFsync(t *testing.T) {
 }
 
 func TestKernelMountJournaledMetadataChange(t *testing.T) {
+	t.Parallel()
 	if _, err := os.Stat("/dev/fuse"); err != nil {
 		skipOrFail(t, "no /dev/fuse: %v", err)
 	}
@@ -634,6 +648,7 @@ func TestKernelMountJournaledMetadataChange(t *testing.T) {
 }
 
 func TestKernelMountJournaledUnlinkAndDirectoryFsync(t *testing.T) {
+	t.Parallel()
 	if _, err := os.Stat("/dev/fuse"); err != nil {
 		skipOrFail(t, "no /dev/fuse: %v", err)
 	}

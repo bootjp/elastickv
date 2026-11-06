@@ -21,6 +21,7 @@ func TestOrdinaryUnmountCancelsRequestsAfterMountRemoved(t *testing.T) {
 }
 
 func TestJoinAbandonedMountWaitsForCleanup(t *testing.T) {
+	t.Parallel()
 	entered, release := make(chan struct{}), make(chan struct{})
 	done := make(chan bool, 1)
 	go func() {
@@ -33,6 +34,7 @@ func TestJoinAbandonedMountWaitsForCleanup(t *testing.T) {
 }
 
 func TestJoinAbandonedMountHasBound(t *testing.T) {
+	t.Parallel()
 	release, finished := make(chan struct{}), make(chan struct{})
 	require.False(t, joinAbandonedMount(func() { <-release; close(finished) }, time.Millisecond))
 	close(release)

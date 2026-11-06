@@ -27,6 +27,7 @@ const (
 // TestMountSQLiteConcurrentProcesses uses the real Linux kernel mount. Each
 // UPDATE runs in a separate sqlite3 process without an application retry loop.
 func TestMountSQLiteConcurrentProcesses(t *testing.T) {
+	t.Parallel()
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		if os.Getenv("ELASTICKV_REQUIRE_SQLITE") != "" {
 			t.Fatal("sqlite3 is required for the mounted SQLite test")

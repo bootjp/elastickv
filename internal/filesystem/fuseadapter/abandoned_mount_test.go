@@ -20,6 +20,7 @@ import (
 // be a plain directory again afterwards, and a request in flight on the
 // late mount must have been cancelled.
 func TestReleaseAbandonedMountReturns(t *testing.T) {
+	t.Parallel()
 	if _, err := os.Stat("/dev/fuse"); err != nil {
 		if os.Getenv("ELASTICKV_REQUIRE_FUSE") != "" {
 			t.Fatalf("no /dev/fuse: %v", err)
@@ -69,6 +70,7 @@ func TestReleaseAbandonedMountReturns(t *testing.T) {
 // remembers for its stale-mount check and lazy detach must be built from
 // Name: built from FsName it would never match the server's own mount.
 func TestMountContextTypeFollowsMountName(t *testing.T) {
+	t.Parallel()
 	if _, err := os.Stat("/dev/fuse"); err != nil {
 		if os.Getenv("ELASTICKV_REQUIRE_FUSE") != "" {
 			t.Fatalf("no /dev/fuse: %v", err)

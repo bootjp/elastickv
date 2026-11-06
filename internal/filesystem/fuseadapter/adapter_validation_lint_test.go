@@ -80,6 +80,7 @@ func newValidationAdapter(t *testing.T, core Core, opts ...Option) *Adapter {
 }
 
 func TestValidationRemovalPartialCapabilities(t *testing.T) {
+	t.Parallel()
 	for _, op := range validationOperations()[:2] {
 		t.Run(op.name, func(t *testing.T) {
 			core := &validationCore{fakeCore: &fakeCore{}}
@@ -114,6 +115,7 @@ func TestValidationRemovalPartialCapabilities(t *testing.T) {
 }
 
 func TestValidationRejectsBeforeOperationID(t *testing.T) {
+	t.Parallel()
 	session := validationSession()
 	for _, op := range validationOperations() {
 		for _, invalid := range []struct {
@@ -153,6 +155,7 @@ func TestValidationRejectsBeforeOperationID(t *testing.T) {
 }
 
 func TestValidationMutationOutcomeClassification(t *testing.T) {
+	t.Parallel()
 	for _, op := range validationOperations() {
 		for _, outcome := range []struct {
 			name    string
@@ -193,6 +196,7 @@ func TestValidationMutationOutcomeClassification(t *testing.T) {
 }
 
 func TestValidationMutationAdmissionPrecedesOperation(t *testing.T) {
+	t.Parallel()
 	for _, op := range validationOperations() {
 		t.Run(op.name, func(t *testing.T) {
 			core := &validationCore{fakeCore: &fakeCore{}}
@@ -212,6 +216,7 @@ func TestValidationMutationAdmissionPrecedesOperation(t *testing.T) {
 }
 
 func TestValidationEmptyWriteRefreshesBeforeCapabilityCheck(t *testing.T) {
+	t.Parallel()
 	core := &fakeCore{}
 	a := newValidationAdapter(t, core, WithJournaledWrites(filesystem.OperationSessionID{}))
 	n, errno := a.Write(t.Context(), 7, 9, 4, nil)

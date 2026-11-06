@@ -124,6 +124,7 @@ func spawnDanglingMount(t *testing.T) string {
 // leaves `Transport endpoint is not connected` at the mount point and the
 // next Mount used to fail. Mount now detaches the dead mount and serves.
 func TestMountDetachesStaleMountLeftByKilledServer(t *testing.T) {
+	t.Parallel()
 	mountPoint := spawnDanglingMount(t)
 
 	mountMemoryFilesystemAt(t, mountPoint)
@@ -140,6 +141,7 @@ func TestMountDetachesStaleMountLeftByKilledServer(t *testing.T) {
 // FUSE entry, so remounting there must not try to detach anything and the
 // directory must be usable as an ordinary directory in between.
 func TestKernelMountUnmountLeavesPlainDirectory(t *testing.T) {
+	t.Parallel()
 	if _, err := os.Stat("/dev/fuse"); err != nil {
 		skipOrFail(t, "no /dev/fuse: %v", err)
 	}
