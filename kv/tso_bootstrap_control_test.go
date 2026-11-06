@@ -33,6 +33,7 @@ func tsoTestBacking(t *testing.T, s store.MVCCStore) TSODurableBacking {
 }
 
 func TestTSOControlAtomicPublicationAndAbort(t *testing.T) {
+	t.Parallel()
 	for name, factory := range tsoControlStores(t) {
 		t.Run(name, func(t *testing.T) {
 			s := factory(t)
@@ -75,6 +76,7 @@ func TestTSOControlAtomicPublicationAndAbort(t *testing.T) {
 }
 
 func TestTSOControlSnapshotCarriesCompleteState(t *testing.T) {
+	t.Parallel()
 	for name, factory := range tsoControlStores(t) {
 		t.Run(name, func(t *testing.T) {
 			s := factory(t)
@@ -120,6 +122,7 @@ func TestTSOControlSnapshotCarriesCompleteState(t *testing.T) {
 }
 
 func TestTSOControlRejectMalformedSnapshotBeforeSwap(t *testing.T) {
+	t.Parallel()
 	for name, factory := range tsoControlStores(t) {
 		t.Run(name, func(t *testing.T) {
 			b := tsoTestBacking(t, factory(t))
@@ -146,6 +149,7 @@ func TestTSOControlRejectMalformedSnapshotBeforeSwap(t *testing.T) {
 }
 
 func TestTSOControlConcurrentReaders(t *testing.T) {
+	t.Parallel()
 	f, err := NewDurableTSOStateMachine(nil, tsoTestBacking(t, store.NewMVCCStore()))
 	require.NoError(t, err)
 	var readers sync.WaitGroup
@@ -163,6 +167,7 @@ func TestTSOControlConcurrentReaders(t *testing.T) {
 }
 
 func TestTSOControlRequiresBackingAndIndex(t *testing.T) {
+	t.Parallel()
 	_, err := NewDurableTSOStateMachine(nil, nil)
 	require.ErrorIs(t, err, ErrTSODurableBacking)
 	f, err := NewDurableTSOStateMachine(nil, tsoTestBacking(t, store.NewMVCCStore()))
@@ -172,6 +177,7 @@ func TestTSOControlRequiresBackingAndIndex(t *testing.T) {
 }
 
 func TestTSOControlLegacyInitialization(t *testing.T) {
+	t.Parallel()
 	for name, factory := range tsoControlStores(t) {
 		t.Run(name, func(t *testing.T) {
 			legacy := NewTSOStateMachine(nil)
@@ -233,6 +239,7 @@ func (b tsoFailCommitBacking) ApplyRaftEntry(ctx context.Context, index uint64, 
 }
 
 func TestTSOControlCommitFailureDoesNotPublish(t *testing.T) {
+	t.Parallel()
 	b := tsoTestBacking(t, store.NewMVCCStore())
 	hlc := NewHLC()
 	f, err := NewDurableTSOStateMachine(hlc, tsoFailCommitBacking{TSODurableBacking: b})
@@ -245,6 +252,7 @@ func TestTSOControlCommitFailureDoesNotPublish(t *testing.T) {
 }
 
 func TestTSOControlCheckpointPinsWholeState(t *testing.T) {
+	t.Parallel()
 	for name, factory := range tsoControlStores(t) {
 		t.Run(name, func(t *testing.T) {
 			b := tsoTestBacking(t, factory(t))

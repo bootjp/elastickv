@@ -89,6 +89,7 @@ func startPrepareSafetyPeer(t *testing.T, peer pb.InternalServer) string {
 }
 
 func TestPrepareEvidenceSafetyRejectsEveryUnsupportedMemberBeforeFence(t *testing.T) {
+	t.Parallel()
 	for _, groupID := range []uint64{0, 1} {
 		for _, role := range []string{"voter", "learner"} {
 			t.Run(fmt.Sprintf("group-%d-%s", groupID, role), func(t *testing.T) {
@@ -110,6 +111,7 @@ func TestPrepareEvidenceSafetyRejectsEveryUnsupportedMemberBeforeFence(t *testin
 }
 
 func TestPrepareEvidenceSafetyNegotiatesTokenAndMembershipBeforeMarker(t *testing.T) {
+	t.Parallel()
 	for _, changed := range []bool{false, true} {
 		t.Run(fmt.Sprintf("configuration-changed-%t", changed), func(t *testing.T) {
 			shards, engine, _ := newPrepareSafetyGate(t)
@@ -150,6 +152,7 @@ func TestPrepareEvidenceSafetyNegotiatesTokenAndMembershipBeforeMarker(t *testin
 }
 
 func TestPrepareEvidenceSafetyFloorZeroDrainsNormalAndStagedLocks(t *testing.T) {
+	t.Parallel()
 	for _, staged := range []bool{false, true} {
 		t.Run(fmt.Sprintf("staged-%t", staged), func(t *testing.T) {
 			shards, _, fsm := newPrepareSafetyGate(t)
@@ -184,6 +187,7 @@ func TestPrepareEvidenceSafetyFloorZeroDrainsNormalAndStagedLocks(t *testing.T) 
 }
 
 func TestPrepareEvidenceSafetyMarkerRejectsNewLegacyButAllowsRetryAndResolution(t *testing.T) {
+	t.Parallel()
 	for _, phase := range []pb.Phase{pb.Phase_COMMIT, pb.Phase_ABORT} {
 		t.Run(phase.String(), func(t *testing.T) {
 			_, _, fsm := newPrepareSafetyGate(t)
@@ -205,6 +209,7 @@ func TestPrepareEvidenceSafetyMarkerRejectsNewLegacyButAllowsRetryAndResolution(
 }
 
 func TestPrepareEvidenceSafetyMarkerBlocksLateLegacyImportAtAnyStart(t *testing.T) {
+	t.Parallel()
 	for _, floor := range []uint64{0, 100} {
 		for _, start := range []uint64{10, 1000} {
 			t.Run(fmt.Sprintf("floor-%d-start-%d", floor, start), func(t *testing.T) {
@@ -228,6 +233,7 @@ func TestPrepareEvidenceSafetyMarkerBlocksLateLegacyImportAtAnyStart(t *testing.
 }
 
 func TestPrepareEvidenceSafetyMarkerIsExcludedFromMigration(t *testing.T) {
+	t.Parallel()
 	brackets, err := distribution.PlanExportBrackets([]byte(txnBackupPrefix), []byte("!txn|meta}"))
 	require.NoError(t, err)
 	for _, key := range [][]byte{backupTimestampFloorKey, prepareEvidenceEnabledKey, prepareEvidenceGateKey, prepareEvidenceTimestampFloorKey,
@@ -241,6 +247,7 @@ func TestPrepareEvidenceSafetyMarkerIsExcludedFromMigration(t *testing.T) {
 }
 
 func TestReplicatedControlMigrationPreservesNormalizedUserKey(t *testing.T) {
+	t.Parallel()
 	raw := replicatedPinStateKey
 	normalized := ExtractTxnUserKey(raw)
 	require.Equal(t, []byte("ttl-inline-control|backup-pins"), normalized)
@@ -260,6 +267,7 @@ func TestReplicatedControlMigrationPreservesNormalizedUserKey(t *testing.T) {
 }
 
 func TestPrepareEvidenceSafetyMigrationCannotReplaceLocalProtocolState(t *testing.T) {
+	t.Parallel()
 	for _, enabled := range []bool{false, true} {
 		for _, tombstone := range []bool{false, true} {
 			for _, key := range [][]byte{backupTimestampFloorKey, prepareEvidenceEnabledKey, prepareEvidenceGateKey, prepareEvidenceTimestampFloorKey,
@@ -322,6 +330,7 @@ func runPrepareEvidenceSafetyMigrationCase(t *testing.T, enabled, tombstone bool
 }
 
 func TestPrepareEvidenceSafetyMarkerCannotBeForgedByTwoPhaseWrite(t *testing.T) {
+	t.Parallel()
 	_, _, fsm := newPrepareSafetyGate(t)
 	meta := TxnMeta{PrimaryKey: prepareEvidenceEnabledKey, LockTTLms: defaultTxnLockTTLms}
 	req := &pb.Request{IsTxn: true, Phase: pb.Phase_PREPARE, Ts: 10, Mutations: []*pb.Mutation{
@@ -341,6 +350,7 @@ func TestPrepareEvidenceSafetyMarkerCannotBeForgedByTwoPhaseWrite(t *testing.T) 
 }
 
 func TestPrepareEvidenceSafetyExistingForgedIntentCannotMaterializeMarker(t *testing.T) {
+	t.Parallel()
 	_, _, fsm := newPrepareSafetyGate(t)
 	ctx := context.Background()
 	// Simulate state prepared before the write-namespace protection existed.
@@ -361,6 +371,7 @@ func TestPrepareEvidenceSafetyExistingForgedIntentCannotMaterializeMarker(t *tes
 }
 
 func TestPrepareEvidenceSafetyPendingFreezesCachedBatchWindow(t *testing.T) {
+	t.Parallel()
 	gate := &testPhaseDGate{prepareErr: ErrTSOPhaseDActivationPending}
 	allocator, fsm, _, _ := pendingTestAllocator(t, gate)
 	batch, err := NewBatchAllocator(allocator, 8)
@@ -375,6 +386,7 @@ func TestPrepareEvidenceSafetyPendingFreezesCachedBatchWindow(t *testing.T) {
 }
 
 func TestPrepareEvidenceSafetyRequiresEveryMembersCutoverAdoption(t *testing.T) {
+	t.Parallel()
 	for _, groupID := range []uint64{0, 1} {
 		for _, role := range []string{"voter", "learner"} {
 			t.Run(fmt.Sprintf("group-%d-%s", groupID, role), func(t *testing.T) {
@@ -436,6 +448,7 @@ func prepareSafetyAdmittedCreation(kind string, timestamp, floor uint64) *pb.Req
 }
 
 func TestPrepareEvidenceSafetyCreationSealRejectsLateRequests(t *testing.T) {
+	t.Parallel()
 	for _, kind := range []string{"raw", "onephase", "prepare"} {
 		t.Run(kind, func(t *testing.T) {
 			shards, _, fsm := newPrepareSafetyGate(t)
@@ -461,6 +474,7 @@ func TestPrepareEvidenceSafetyCreationSealRejectsLateRequests(t *testing.T) {
 }
 
 func TestPrepareEvidenceSafetyCreationSealAllowsExistingResolution(t *testing.T) {
+	t.Parallel()
 	for _, proof := range []uint64{0, 20} {
 		for _, phase := range []pb.Phase{pb.Phase_COMMIT, pb.Phase_ABORT} {
 			t.Run(fmt.Sprintf("proof-%d-%s", proof, phase), func(t *testing.T) {
@@ -489,6 +503,7 @@ func TestPrepareEvidenceSafetyCreationSealAllowsExistingResolution(t *testing.T)
 }
 
 func TestPrepareEvidenceSafetyCreationGateSurvivesRecovery(t *testing.T) {
+	t.Parallel()
 	for _, snapshot := range []bool{false, true} {
 		for _, released := range []bool{false, true} {
 			t.Run(fmt.Sprintf("snapshot-%t-released-%t", snapshot, released), func(t *testing.T) {
@@ -557,6 +572,7 @@ func TestPrepareEvidenceSafetyCreationGateSurvivesRecovery(t *testing.T) {
 }
 
 func TestPrepareEvidenceSafetyReleaseValidationAndRetry(t *testing.T) {
+	t.Parallel()
 	_, _, fsm := newPrepareSafetyGate(t)
 	require.ErrorIs(t, haltApplyOf(fsm.Apply(EncodePrepareEvidenceSeal())), ErrTSOProtocolUnsupported)
 	require.Nil(t, fsm.Apply(EncodePrepareEvidenceFence(100)))
@@ -590,6 +606,7 @@ func TestPrepareEvidenceSafetyReleaseValidationAndRetry(t *testing.T) {
 }
 
 func TestPrepareEvidenceSafetyPartialReleaseFanoutRetries(t *testing.T) {
+	t.Parallel()
 	shards, _, first := newPrepareSafetyGate(t)
 	other, engine, second := newPrepareSafetyGate(t)
 	shards.groups[2] = other.groups[1]
@@ -614,6 +631,7 @@ func TestPrepareEvidenceSafetyPartialReleaseFanoutRetries(t *testing.T) {
 }
 
 func TestPrepareEvidenceSafetyPreCutoverRequestsCannotLandAfterRelease(t *testing.T) {
+	t.Parallel()
 	for _, kind := range []string{"raw", "onephase"} {
 		t.Run(kind, func(t *testing.T) {
 			shards, _, dataFSM := newPrepareSafetyGate(t)
@@ -643,6 +661,7 @@ func TestPrepareEvidenceSafetyPreCutoverRequestsCannotLandAfterRelease(t *testin
 }
 
 func TestPrepareEvidenceSafetyReleasedGateRequiresExactAdmissionEpoch(t *testing.T) {
+	t.Parallel()
 	for _, kind := range []string{"raw", "onephase", "prepare"} {
 		t.Run(kind, func(t *testing.T) {
 			_, _, fsm := newPrepareSafetyGate(t)
@@ -658,6 +677,7 @@ func TestPrepareEvidenceSafetyReleasedGateRequiresExactAdmissionEpoch(t *testing
 }
 
 func TestPrepareEvidenceSafetyPostCutoverReadVoucherDoesNotBypassBackupPin(t *testing.T) {
+	t.Parallel()
 	for _, backup := range []bool{false, true} {
 		t.Run(fmt.Sprintf("backup-%t", backup), func(t *testing.T) {
 			tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))

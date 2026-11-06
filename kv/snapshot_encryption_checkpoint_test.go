@@ -22,6 +22,7 @@ func (a *checkpointApplier) SnapshotCheckpoint() (encryption.SnapshotCheckpoint,
 }
 
 func TestEncryptionSnapshotCheckpointRoundTrip(t *testing.T) {
+	t.Parallel()
 	cp := encryption.SnapshotCheckpoint{Index: 6, State: [32]byte{1, 2, 3}}
 	for _, headerOnly := range []bool{false, true} {
 		t.Run(map[bool]string{false: "full-physical-restore", true: "skip-gate-header-restore"}[headerOnly], func(t *testing.T) {
@@ -66,6 +67,7 @@ func TestEncryptionSnapshotCheckpointRoundTrip(t *testing.T) {
 }
 
 func TestEncryptionSnapshotCheckpointRejectsTruncationWithoutMutation(t *testing.T) {
+	t.Parallel()
 	fsm, ok := NewKvFSMWithHLC(store.NewMVCCStore(), NewHLC()).(*kvFSM)
 	require.True(t, ok)
 	fsm.encryptionCheckpoint = encryption.SnapshotCheckpoint{Index: 6, State: [32]byte{1}}
@@ -81,6 +83,7 @@ func TestEncryptionSnapshotCheckpointRejectsTruncationWithoutMutation(t *testing
 }
 
 func TestEncryptionCheckpointAllowsTrailingV2Extensions(t *testing.T) {
+	t.Parallel()
 	cp := encryption.SnapshotCheckpoint{Index: 6, State: [32]byte{1, 2, 3}}
 	header := &kvFSMSnapshot{useV2: true, checkpoint: cp}
 	encoded, size := header.encodeHeader()
@@ -112,6 +115,7 @@ func (s *durableCheckpointFixture) LastAppliedIndex() (uint64, bool, error) {
 }
 
 func TestEncryptionCheckpointSkipPreservesPostSnapshotRotation(t *testing.T) {
+	t.Parallel()
 	old := encryption.SnapshotCheckpoint{Index: 6, State: [32]byte{6}}
 	newer := encryption.SnapshotCheckpoint{Index: 890, State: [32]byte{8}}
 	header := &kvFSMSnapshot{useV2: true, checkpoint: old}
@@ -145,6 +149,7 @@ func TestEncryptionCheckpointSkipPreservesPostSnapshotRotation(t *testing.T) {
 }
 
 func TestEncryptionCheckpointSkipRejectsChangedDurableRecord(t *testing.T) {
+	t.Parallel()
 	old := encryption.SnapshotCheckpoint{Index: 6, State: [32]byte{6}}
 	header := &kvFSMSnapshot{useV2: true, checkpoint: old}
 	encoded, size := header.encodeHeader()

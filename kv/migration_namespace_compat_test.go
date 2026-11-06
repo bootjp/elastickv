@@ -16,6 +16,7 @@ import (
 // lines: they include the verdict and every resulting MVCC version. The
 // preexisting wall-clock-derived lock deadline is normalized, and only that.
 func TestMigrationNamespaceCompatibilityMatrix(t *testing.T) {
+	t.Parallel()
 	keys := []string{"!migstage|ready|customer", "!migstage|ownership", "!migstage|retired", "!migstage|ack|", "!migs", "!dist|migstage|x", "!migwrite|x", "!migfence|x", "!txn|lock|x", "!txn|meta|migration_configuration_index", "!txn|meta|prepare_evidence/enabled", "!txn|backup|timestamp_floor", "!txn|foo", "_migack", "user"}
 	for _, phase := range []pb.Phase{pb.Phase_NONE, pb.Phase_PREPARE, pb.Phase_COMMIT, pb.Phase_ABORT} {
 		for _, key := range keys {

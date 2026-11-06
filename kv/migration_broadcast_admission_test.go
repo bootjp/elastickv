@@ -89,6 +89,7 @@ func installBroadcastOwnership(t *testing.T, f *kvFSM, proposer raftengine.Propo
 }
 
 func TestMigrationBroadcastRefusesBeforeAnyParticipantCommit(t *testing.T) {
+	t.Parallel()
 	c, recorders := realPrefixBroadcastFixture(t, true)
 	_, err := c.Dispatch(t.Context(), &OperationGroup[OP]{ObservedRouteVersion: 7,
 		Elems: []*Elem[OP]{{Op: DelPrefix}}})
@@ -109,6 +110,7 @@ func assertBroadcastUnchanged(t *testing.T, c *ShardedCoordinator, recorders map
 }
 
 func TestMigrationBroadcastPreservesObservedVersionWithoutRepinning(t *testing.T) {
+	t.Parallel()
 	for _, version := range []uint64{0, 6, 8} {
 		t.Run(strconv.FormatUint(version, 10), func(t *testing.T) {
 			c, recorders := realPrefixBroadcastFixture(t, false)
@@ -121,6 +123,7 @@ func TestMigrationBroadcastPreservesObservedVersionWithoutRepinning(t *testing.T
 }
 
 func TestMigrationBroadcastTimestampSealAndParticipantSelection(t *testing.T) {
+	t.Parallel()
 	c, recorders := realPrefixBroadcastFixture(t, false)
 	for _, command := range [][]byte{EncodePrepareEvidenceFence(0), EncodePrepareEvidenceSeal()} {
 		result, err := c.groups[33].Engine.ProposeAdmin(t.Context(), command)
@@ -143,6 +146,7 @@ func TestMigrationBroadcastTimestampSealAndParticipantSelection(t *testing.T) {
 }
 
 func TestMigrationBroadcastFullyAdmittedPrefixCommitsAllParticipants(t *testing.T) {
+	t.Parallel()
 	c, recorders := realPrefixBroadcastFixture(t, false)
 	_, err := c.Dispatch(t.Context(), &OperationGroup[OP]{ObservedRouteVersion: 7,
 		Elems: []*Elem[OP]{{Op: DelPrefix, Key: []byte("p")}}})

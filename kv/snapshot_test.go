@@ -54,6 +54,7 @@ func writeV2Header(t *testing.T, w *bytes.Buffer, ceiling, cutover uint64, plen 
 }
 
 func TestSnapshot(t *testing.T) {
+	t.Parallel()
 	store := store3.NewMVCCStore()
 	fsm := NewKvFSMWithHLC(store, NewHLC())
 

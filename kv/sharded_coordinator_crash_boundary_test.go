@@ -33,6 +33,7 @@ func (c *crashBoundaryContext) Err() error {
 }
 
 func TestKillAfterPrimaryCommitAcceptedSignalCannotResume(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	observed := &crashBoundaryContext{Context: ctx, waiting: make(chan struct{}), errRead: make(chan error, 1)}
@@ -92,6 +93,7 @@ func TestKillAfterPrimaryCommitAcceptedSignalCannotResume(t *testing.T) {
 }
 
 func TestKillAfterPrimaryCommitSignalErrorCannotReturnSuccess(t *testing.T) {
+	t.Parallel()
 	hook := killAfterPrimaryCommit{
 		Transactional: &stubTransactional{},
 		marker:        filepath.Join(t.TempDir(), "primary-committed"),
@@ -107,6 +109,7 @@ func TestKillAfterPrimaryCommitSignalErrorCannotReturnSuccess(t *testing.T) {
 }
 
 func TestKillAfterPrimaryCommitOtherOutcomesPassThrough(t *testing.T) {
+	t.Parallel()
 	for _, test := range []struct {
 		name    string
 		primary Transactional
@@ -144,6 +147,7 @@ func TestKillAfterPrimaryCommitOtherOutcomesPassThrough(t *testing.T) {
 }
 
 func TestKillAfterPrimaryCommitMarkerErrorDoesNotSignal(t *testing.T) {
+	t.Parallel()
 	killCalls := 0
 	hook := killAfterPrimaryCommit{
 		Transactional: &stubTransactional{},

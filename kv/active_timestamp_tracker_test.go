@@ -21,6 +21,7 @@ func TestActiveTimestampTrackerNotifiesBackupTimestampFloor(t *testing.T) {
 }
 
 func TestActiveTimestampTrackerOldest(t *testing.T) {
+	t.Parallel()
 	tracker := NewActiveTimestampTracker()
 
 	first := tracker.Pin(30)
@@ -37,6 +38,7 @@ func TestActiveTimestampTrackerOldest(t *testing.T) {
 }
 
 func TestActiveTimestampTrackerOldestIncludesBackupPins(t *testing.T) {
+	t.Parallel()
 	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
 
 	token := tracker.Pin(30)
@@ -51,6 +53,7 @@ func TestActiveTimestampTrackerOldestIncludesBackupPins(t *testing.T) {
 }
 
 func TestActiveTimestampTrackerOldestBackupForGroupIgnoresReadsAndOtherGroups(t *testing.T) {
+	t.Parallel()
 	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
 	read := tracker.Pin(5)
 	defer read.Release()
@@ -64,6 +67,7 @@ func TestActiveTimestampTrackerOldestBackupForGroupIgnoresReadsAndOtherGroups(t 
 }
 
 func TestActiveTimestampTrackerBackupPinExpiry(t *testing.T) {
+	t.Parallel()
 	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
 	now := time.UnixMilli(3000)
 
@@ -78,6 +82,7 @@ func TestActiveTimestampTrackerBackupPinExpiry(t *testing.T) {
 }
 
 func TestActiveTimestampTrackerBackupPinExtendMovesDeadline(t *testing.T) {
+	t.Parallel()
 	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
 	pinID := backupTrackerTestPinID(1)
 	now := time.Now()
@@ -112,6 +117,7 @@ func TestActiveTimestampTrackerBackupPinExtendKeepsLaterDeadline(t *testing.T) {
 }
 
 func TestActiveTimestampTrackerBackupPinExtendMissingIsInvalid(t *testing.T) {
+	t.Parallel()
 	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
 
 	require.ErrorIs(t, tracker.Extend(backupTrackerTestPinID(1), time.UnixMilli(5000)), ErrInvalidBackupPin)
@@ -119,6 +125,7 @@ func TestActiveTimestampTrackerBackupPinExtendMissingIsInvalid(t *testing.T) {
 }
 
 func TestActiveTimestampTrackerBackupPinExtendExpiredIsInvalid(t *testing.T) {
+	t.Parallel()
 	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
 	pinID := backupTrackerTestPinID(1)
 	now := time.Now()
@@ -130,6 +137,7 @@ func TestActiveTimestampTrackerBackupPinExtendExpiredIsInvalid(t *testing.T) {
 }
 
 func TestActiveTimestampTrackerApplyExtendReplaysAfterLocalExpiry(t *testing.T) {
+	t.Parallel()
 	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
 	pinID := backupTrackerTestPinID(1)
 	now := time.Now()
@@ -144,6 +152,7 @@ func TestActiveTimestampTrackerApplyExtendReplaysAfterLocalExpiry(t *testing.T) 
 }
 
 func TestActiveTimestampTrackerBackupPinReleaseIsIdempotent(t *testing.T) {
+	t.Parallel()
 	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
 	pinID := backupTrackerTestPinID(1)
 
@@ -156,6 +165,7 @@ func TestActiveTimestampTrackerBackupPinReleaseIsIdempotent(t *testing.T) {
 }
 
 func TestActiveTimestampTrackerBackupPinLimit(t *testing.T) {
+	t.Parallel()
 	tracker := NewActiveTimestampTracker(
 		WithActiveTimestampTrackerSweepInterval(0),
 		WithActiveTimestampTrackerMaxBackupPins(1),
@@ -172,6 +182,7 @@ func TestActiveTimestampTrackerBackupPinLimit(t *testing.T) {
 }
 
 func TestActiveTimestampTrackerBackupPinLimitCountsLogicalPinIDs(t *testing.T) {
+	t.Parallel()
 	tracker := NewActiveTimestampTracker(
 		WithActiveTimestampTrackerSweepInterval(0),
 		WithActiveTimestampTrackerMaxBackupPins(1),
@@ -187,6 +198,7 @@ func TestActiveTimestampTrackerBackupPinLimitCountsLogicalPinIDs(t *testing.T) {
 }
 
 func TestActiveTimestampTrackerBackupPinLimitReapsExpiredPinsFirst(t *testing.T) {
+	t.Parallel()
 	tracker := NewActiveTimestampTracker(
 		WithActiveTimestampTrackerSweepInterval(0),
 		WithActiveTimestampTrackerMaxBackupPins(1),
@@ -202,6 +214,7 @@ func TestActiveTimestampTrackerBackupPinLimitReapsExpiredPinsFirst(t *testing.T)
 }
 
 func TestActiveTimestampTrackerBackupPinsAreScopedByRaftGroup(t *testing.T) {
+	t.Parallel()
 	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
 	pinID := backupTrackerTestPinID(1)
 	deadline := time.Now().Add(time.Hour)
@@ -220,6 +233,7 @@ func TestActiveTimestampTrackerBackupPinsAreScopedByRaftGroup(t *testing.T) {
 }
 
 func TestActiveTimestampTrackerDuplicatePinApplyIsMonotonic(t *testing.T) {
+	t.Parallel()
 	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
 	pinID := backupTrackerTestPinID(1)
 	now := time.Now()
@@ -236,6 +250,7 @@ func TestActiveTimestampTrackerDuplicatePinApplyIsMonotonic(t *testing.T) {
 }
 
 func TestActiveTimestampTrackerOldestForGroupKeepsReadPinsGlobal(t *testing.T) {
+	t.Parallel()
 	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
 	readPin := tracker.Pin(25)
 	defer readPin.Release()
@@ -250,6 +265,7 @@ func TestActiveTimestampTrackerOldestForGroupKeepsReadPinsGlobal(t *testing.T) {
 }
 
 func TestActiveTimestampTrackerRejectsInvalidBackupPins(t *testing.T) {
+	t.Parallel()
 	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
 	validID := backupTrackerTestPinID(1)
 
@@ -262,6 +278,7 @@ func TestActiveTimestampTrackerRejectsInvalidBackupPins(t *testing.T) {
 }
 
 func TestActiveTimestampTrackerCloseIsIdempotent(t *testing.T) {
+	t.Parallel()
 	tracker := NewActiveTimestampTracker()
 
 	tracker.Close()

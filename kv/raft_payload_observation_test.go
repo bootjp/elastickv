@@ -7,6 +7,7 @@ import (
 )
 
 func TestRaftPayloadWrapObservationRejectsReplacement(t *testing.T) {
+	t.Parallel()
 	g := &ShardGroup{}
 	wrap := func(p []byte) ([]byte, error) { return p, nil }
 	first := g.SetObservedRaftPayloadWrap(wrap)
@@ -23,6 +24,7 @@ func TestRaftPayloadWrapObservationRejectsReplacement(t *testing.T) {
 }
 
 func TestRaftPayloadWrapInvalidationPrecedesActualPublication(t *testing.T) {
+	t.Parallel()
 	g := &ShardGroup{}
 	wrap := func(p []byte) ([]byte, error) { return p, nil }
 	first := g.SetObservedRaftPayloadWrap(wrap)
@@ -46,6 +48,7 @@ func TestRaftPayloadWrapInvalidationPrecedesActualPublication(t *testing.T) {
 }
 
 func TestRaftPayloadMutationCannotBeReusedAfterSettlement(t *testing.T) {
+	t.Parallel()
 	g := &ShardGroup{}
 	wrap := func(p []byte) ([]byte, error) { return p, nil }
 	mutation := BeginRaftPayloadWrapMutation(func() func() { return func() {} })

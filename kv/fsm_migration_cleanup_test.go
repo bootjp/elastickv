@@ -10,6 +10,7 @@ import (
 )
 
 func TestApplyMigrationCleanupCommandDeletesBoundedVersions(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := store.NewMVCCStore()
 	require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("old"), 10, 0))

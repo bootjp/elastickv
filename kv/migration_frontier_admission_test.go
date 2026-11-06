@@ -66,6 +66,7 @@ func frontierAdmissionSplitLegacy(t *testing.T, f *kvFSM, legacy store.Migration
 }
 
 func TestMigrationFrontierAdmissionSameJobChildrenKeepIndependentAuthority(t *testing.T) {
+	t.Parallel()
 	f, engine, _ := frontierAdmissionSplitFixture(t)
 	request := &pb.Request{Ts: 200, ObservedRouteVersion: EncodeObservedRouteVersion(engine.Version()),
 		Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("n"), Value: []byte("left")},
@@ -90,6 +91,7 @@ func TestMigrationFrontierAdmissionSameJobChildrenKeepIndependentAuthority(t *te
 }
 
 func TestMigrationFrontierAdmissionRequiresCompleteUnion(t *testing.T) {
+	t.Parallel()
 	f, engine, view := frontierAdmissionSplitFixture(t)
 	proofs, err := migrationAdmissionRangeProofs(view, migrationApplyRange{[]byte("m"), []byte("z")})
 	require.NoError(t, err)
@@ -116,6 +118,7 @@ func TestMigrationFrontierAdmissionRequiresCompleteUnion(t *testing.T) {
 }
 
 func TestMigrationFrontierAdmissionSourceAndStagedBoundaries(t *testing.T) {
+	t.Parallel()
 	f, engine, _ := frontierAdmissionSplitFixture(t)
 	shards := NewShardStore(engine, map[uint64]*ShardGroup{2: {Store: f.store}})
 	applyComposed1Snapshot(t, engine, engine.Version()+1, []distribution.RouteDescriptor{
@@ -141,6 +144,7 @@ func TestMigrationFrontierAdmissionSourceAndStagedBoundaries(t *testing.T) {
 }
 
 func TestMigrationFrontierAdmissionPartialRefreshDoesNotUpgradeSibling(t *testing.T) {
+	t.Parallel()
 	f, engine, view := frontierAdmissionSplitFixture(t)
 	left := view.Partitions.Partitions[0]
 	ref, err := store.MigrationOwnershipPartitionReferenceFor(left)
@@ -169,6 +173,7 @@ func TestMigrationFrontierAdmissionPartialRefreshDoesNotUpgradeSibling(t *testin
 }
 
 func TestMigrationFrontierAdmissionNonOwnerChildrenNeverGrant(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	retireServingSource(t, st)
 	engine := staleServingEngine(t, 11)
@@ -203,6 +208,7 @@ func TestMigrationFrontierAdmissionNonOwnerChildrenNeverGrant(t *testing.T) {
 }
 
 func TestMigrationFrontierAdmissionStaleFenceRejectedBeforeProxy(t *testing.T) {
+	t.Parallel()
 	f, engine, _ := frontierAdmissionSplitFixture(t)
 	shards := NewShardStore(engine, map[uint64]*ShardGroup{
 		2: {Store: f.store, Engine: newStubFollowerEngine("127.0.0.1:1")},
@@ -223,6 +229,7 @@ func TestMigrationFrontierAdmissionStaleFenceRejectedBeforeProxy(t *testing.T) {
 }
 
 func TestMigrationFrontierAdmissionUnknownLegacyCannotBorrowNewerPartition(t *testing.T) {
+	t.Parallel()
 	_, engine, view := frontierAdmissionSplitFixture(t)
 	view.Ownership = []store.MigrationOwnershipState{{JobID: 7, LocalGroupID: 2, OwnerGroupID: 2,
 		CatalogVersion: engine.Version() - 1, ConfigurationIndex: 9, AppliedIndex: 11, Role: store.MigrationOwner,

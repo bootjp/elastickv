@@ -81,6 +81,7 @@ func requireDeadlineWithin(t *testing.T, deadline time.Time, start time.Time, ti
 }
 
 func TestFSMCompactorCompactsEligibleRuntime(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	ctx := context.Background()
 	require.NoError(t, st.PutAt(ctx, []byte("k"), []byte("v10"), 10, 0))
@@ -113,6 +114,7 @@ func TestFSMCompactorCompactsEligibleRuntime(t *testing.T) {
 }
 
 func TestFSMCompactorRespectsPinnedTimestamp(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	ctx := context.Background()
 	require.NoError(t, st.PutAt(ctx, []byte("k"), []byte("v10"), 10, 0))
@@ -147,6 +149,7 @@ func TestFSMCompactorRespectsPinnedTimestamp(t *testing.T) {
 }
 
 func TestBeginBackupBlocksCompactor(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	ctx := context.Background()
 	require.NoError(t, st.PutAt(ctx, []byte("k"), []byte("v10"), 10, 0))
@@ -179,6 +182,7 @@ func TestBeginBackupBlocksCompactor(t *testing.T) {
 }
 
 func TestFSMCompactorScopesBackupPinsByGroup(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	stores := map[uint64]store.MVCCStore{1: store.NewMVCCStore(), 2: store.NewMVCCStore()}
 	for _, st := range stores {
@@ -217,6 +221,7 @@ func TestFSMCompactorScopesBackupPinsByGroup(t *testing.T) {
 }
 
 func TestFSMCompactorSkipsLaggingRuntime(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	ctx := context.Background()
 	require.NoError(t, st.PutAt(ctx, []byte("k"), []byte("v10"), 10, 0))
@@ -245,6 +250,7 @@ func TestFSMCompactorSkipsLaggingRuntime(t *testing.T) {
 }
 
 func TestFSMCompactorSkipsMultiPeerLeaderRuntimeDuringCooldown(t *testing.T) {
+	t.Parallel()
 	st := &deadlineCapturingStore{lastCommitTS: 20}
 	ctx := context.Background()
 
@@ -269,6 +275,7 @@ func TestFSMCompactorSkipsMultiPeerLeaderRuntimeDuringCooldown(t *testing.T) {
 }
 
 func TestFSMCompactorCompactsMultiPeerLeaderRuntimeAfterCooldown(t *testing.T) {
+	t.Parallel()
 	st := &deadlineCapturingStore{lastCommitTS: 20}
 	ctx := context.Background()
 	leaderTimeout := 20 * time.Millisecond
@@ -306,6 +313,7 @@ func TestFSMCompactorCompactsMultiPeerLeaderRuntimeAfterCooldown(t *testing.T) {
 }
 
 func TestFSMCompactorCompactsMultiPeerFollowerRuntimeWithConfiguredTimeout(t *testing.T) {
+	t.Parallel()
 	st := &deadlineCapturingStore{lastCommitTS: 20}
 	ctx := context.Background()
 	configuredTimeout := 2 * time.Second
@@ -337,6 +345,7 @@ func TestFSMCompactorCompactsMultiPeerFollowerRuntimeWithConfiguredTimeout(t *te
 }
 
 func TestFSMCompactorSkipsPebbleRuntimeUnderLSMBackpressure(t *testing.T) {
+	t.Parallel()
 	metrics := &pebble.Metrics{}
 	metrics.Levels[0].Sublevels = defaultFSMCompactorMaxL0Sublevels
 	st := &metricsCapturingStore{
@@ -367,12 +376,14 @@ func TestFSMCompactorSkipsPebbleRuntimeUnderLSMBackpressure(t *testing.T) {
 }
 
 func TestFSMCompactorDefaultL0SublevelLimitMatchesPebbleStopWrites(t *testing.T) {
+	t.Parallel()
 	var opts pebble.Options
 	opts.EnsureDefaults()
 	require.Equal(t, defaultFSMCompactorMaxL0Sublevels, opts.L0StopWritesThreshold)
 }
 
 func TestFSMCompactorAllowsStableWideL0(t *testing.T) {
+	t.Parallel()
 	metrics := &pebble.Metrics{}
 	metrics.Levels[0].Sublevels = 1
 	metrics.Levels[0].TablesCount = defaultFSMCompactorMaxL0Files * 2
@@ -405,6 +416,7 @@ func TestFSMCompactorAllowsStableWideL0(t *testing.T) {
 }
 
 func TestFSMCompactorCompactsSingleNodeLeaderRuntimeWithShortTimeout(t *testing.T) {
+	t.Parallel()
 	st := &deadlineCapturingStore{lastCommitTS: 20}
 	ctx := context.Background()
 	leaderTimeout := 20 * time.Millisecond
@@ -436,6 +448,7 @@ func TestFSMCompactorCompactsSingleNodeLeaderRuntimeWithShortTimeout(t *testing.
 }
 
 func TestFSMCompactorBacksOffLeaderRuntimeAfterTimeout(t *testing.T) {
+	t.Parallel()
 	st := &timeoutCompactionStore{
 		deadlineCapturingStore: deadlineCapturingStore{lastCommitTS: 20},
 	}
@@ -471,6 +484,7 @@ func TestFSMCompactorBacksOffLeaderRuntimeAfterTimeout(t *testing.T) {
 }
 
 func TestFSMCompactorResumesLeaderRuntimeAfterTimeoutBackoffExpires(t *testing.T) {
+	t.Parallel()
 	st := &timeoutCompactionStore{
 		deadlineCapturingStore: deadlineCapturingStore{lastCommitTS: 20},
 	}
@@ -510,6 +524,7 @@ func TestFSMCompactorResumesLeaderRuntimeAfterTimeoutBackoffExpires(t *testing.T
 }
 
 func TestFSMCompactorCompactsEligiblePebbleRuntime(t *testing.T) {
+	t.Parallel()
 	dir, err := os.MkdirTemp("", "fsm-compactor-pebble-*")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)

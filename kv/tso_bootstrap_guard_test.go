@@ -94,6 +94,7 @@ func tsoGuardWatermark(t *testing.T, f *GuardedTSOStateMachine, ts uint64) ([]by
 }
 
 func TestTSOGuardActivationWatermarkAndExactReplay(t *testing.T) {
+	t.Parallel()
 	for name, factory := range tsoControlStores(t) {
 		t.Run(name, func(t *testing.T) {
 			st := factory(t)
@@ -128,6 +129,7 @@ func TestTSOGuardActivationWatermarkAndExactReplay(t *testing.T) {
 }
 
 func TestTSOGuardRejectsStaleAndReceiptConflict(t *testing.T) {
+	t.Parallel()
 	f, activation := tsoGuardFixture(t, tsoTestBacking(t, store.NewMVCCStore()))
 	activateTSOGuard(t, f, activation)
 	_, command := tsoGuardWatermark(t, f, 30<<hlcLogicalBits)
@@ -148,6 +150,7 @@ func TestTSOGuardRejectsStaleAndReceiptConflict(t *testing.T) {
 }
 
 func TestTSOGuardActivationRequiresNativeProof(t *testing.T) {
+	t.Parallel()
 	f, command := tsoGuardFixture(t, tsoTestBacking(t, store.NewMVCCStore()))
 	payload, err := raftbootstrap.EncodeActivationCommand(command)
 	require.NoError(t, err)
@@ -161,6 +164,7 @@ func TestTSOGuardActivationRequiresNativeProof(t *testing.T) {
 }
 
 func TestTSOGuardCommitFailurePublishesNothing(t *testing.T) {
+	t.Parallel()
 	backing := tsoTestBacking(t, store.NewMVCCStore())
 	f, command := tsoGuardFixture(t, backing)
 	activateTSOGuard(t, f, command)
@@ -177,6 +181,7 @@ func TestTSOGuardCommitFailurePublishesNothing(t *testing.T) {
 }
 
 func TestTSOGuardActivationCommitFailureIsAtomic(t *testing.T) {
+	t.Parallel()
 	backing := tsoTestBacking(t, store.NewMVCCStore())
 	f, command := tsoGuardFixture(t, backing)
 	payload, err := raftbootstrap.EncodeActivationCommand(command)
@@ -195,6 +200,7 @@ func TestTSOGuardActivationCommitFailureIsAtomic(t *testing.T) {
 }
 
 func TestTSOGuardReplayAfterNewPolicyAndAlreadyActive(t *testing.T) {
+	t.Parallel()
 	f, command := tsoGuardFixture(t, tsoTestBacking(t, store.NewMVCCStore()))
 	activation, first := activateTSOGuard(t, f, command)
 	payload, guarded := tsoGuardWatermark(t, f, 30<<hlcLogicalBits)
@@ -235,6 +241,7 @@ func tsoActivationNativeImage(command raftbootstrap.ActivationCommand) raftengin
 }
 
 func TestTSOGuardActivationFromDeliveredNativeImage(t *testing.T) {
+	t.Parallel()
 	f, command := tsoGuardFixture(t, tsoTestBacking(t, store.NewMVCCStore()))
 	f.SetBootstrapActivationNativeProof(nil)
 	payload, err := raftbootstrap.EncodeActivationCommand(command)
@@ -252,6 +259,7 @@ func TestTSOGuardActivationFromDeliveredNativeImage(t *testing.T) {
 }
 
 func TestTSOGuardRejectsInconsistentNativeImageWithoutFallback(t *testing.T) {
+	t.Parallel()
 	for _, kind := range []string{"index", "roles", "address", "missing-member", "unknown-member", "autoleave", "cleared"} {
 		t.Run(kind, func(t *testing.T) {
 			f, command := tsoGuardFixture(t, tsoTestBacking(t, store.NewMVCCStore()))
@@ -289,6 +297,7 @@ func TestTSOGuardRejectsInconsistentNativeImageWithoutFallback(t *testing.T) {
 }
 
 func TestTSOGuardNativeImageOwnershipAndClear(t *testing.T) {
+	t.Parallel()
 	f, _ := tsoGuardFixture(t, tsoTestBacking(t, store.NewMVCCStore()))
 	image := raftengine.NativeConfiguration{Index: 3, Voters: []uint64{1}, VotersOutgoing: []uint64{2}, Learners: []uint64{3}, LearnersNext: []uint64{4},
 		Members: []raftengine.NativeConfigurationMember{{ID: 1, Address: "one"}}}
@@ -311,6 +320,7 @@ func TestTSOGuardNativeImageOwnershipAndClear(t *testing.T) {
 }
 
 func TestTSOGuardRejectsReceiptVariantCollision(t *testing.T) {
+	t.Parallel()
 	f, command := tsoGuardFixture(t, tsoTestBacking(t, store.NewMVCCStore()))
 	activation, applied := activateTSOGuard(t, f, command)
 	payload, guarded := tsoGuardWatermark(t, f, 30<<hlcLogicalBits)
@@ -339,6 +349,7 @@ func TestTSOGuardRejectsReceiptVariantCollision(t *testing.T) {
 }
 
 func TestTSOGuardSnapshotRestoresReceipts(t *testing.T) {
+	t.Parallel()
 	for name, factory := range tsoControlStores(t) {
 		t.Run(name, func(t *testing.T) {
 			f, command := tsoGuardFixture(t, tsoTestBacking(t, factory(t)))

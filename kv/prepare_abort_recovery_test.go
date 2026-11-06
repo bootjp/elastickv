@@ -10,6 +10,7 @@ import (
 )
 
 func TestPreparedAbortRemainsFinalAcrossSnapshotAndReopen(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name    string
 		version byte

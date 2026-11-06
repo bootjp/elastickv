@@ -24,6 +24,7 @@ func activateMigrationNamespace(t *testing.T, f *kvFSM) {
 }
 
 func TestMigrationNamespaceOrderedBatchIgnoresDifferentWatchers(t *testing.T) {
+	t.Parallel()
 	for _, rejectedPosition := range []int{0, 1, 2} {
 		var snapshots [][]byte
 		for _, watcher := range []RouteHistory{nil, forbiddenApplyWatcher{}} {
@@ -59,6 +60,7 @@ func TestMigrationNamespaceOrderedBatchIgnoresDifferentWatchers(t *testing.T) {
 }
 
 func TestMigrationNamespaceSharedPrepareAndCommitValidatorsUseDurableVersion(t *testing.T) {
+	t.Parallel()
 	for _, active := range []bool{false, true} {
 		f := &kvFSM{store: store.NewMVCCStore()}
 		if active {
@@ -83,6 +85,7 @@ func TestMigrationNamespaceSharedPrepareAndCommitValidatorsUseDurableVersion(t *
 // These entries were admitted by 2d1a36ac. A newly upgraded apply-member must
 // produce the same writes, including resolution of pre-upgrade intents.
 func TestMigrationNamespaceUpgradeLegacyHistory(t *testing.T) {
+	t.Parallel()
 	for _, phase := range []pb.Phase{pb.Phase_NONE, pb.Phase_PREPARE, pb.Phase_COMMIT, pb.Phase_ABORT} {
 		t.Run(phase.String(), func(t *testing.T) {
 			st := store.NewMVCCStore()
