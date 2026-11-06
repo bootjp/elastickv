@@ -20,6 +20,7 @@ func newTestStatic() fstest.MapFS {
 }
 
 func TestRouter_APIPathIsNeverSwallowedBySPA(t *testing.T) {
+	t.Parallel()
 	api := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("X-Came-From", "api")
 		writeJSONError(w, http.StatusNotFound, "unknown_endpoint", "no handler")
@@ -37,6 +38,7 @@ func TestRouter_APIPathIsNeverSwallowedBySPA(t *testing.T) {
 }
 
 func TestRouter_HealthzReturnsPlainText(t *testing.T) {
+	t.Parallel()
 	r := NewRouter(nil, nil)
 	req := httptest.NewRequest(http.MethodGet, "/admin/healthz", nil)
 	rec := httptest.NewRecorder()
@@ -48,6 +50,7 @@ func TestRouter_HealthzReturnsPlainText(t *testing.T) {
 }
 
 func TestRouter_HealthzHeadNoBody(t *testing.T) {
+	t.Parallel()
 	r := NewRouter(nil, nil)
 	req := httptest.NewRequest(http.MethodHead, "/admin/healthz", nil)
 	rec := httptest.NewRecorder()
@@ -58,6 +61,7 @@ func TestRouter_HealthzHeadNoBody(t *testing.T) {
 }
 
 func TestRouter_HealthzRejectsPost(t *testing.T) {
+	t.Parallel()
 	r := NewRouter(nil, nil)
 	req := httptest.NewRequest(http.MethodPost, "/admin/healthz", strings.NewReader(""))
 	rec := httptest.NewRecorder()
@@ -72,6 +76,7 @@ func TestRouter_HealthzRejectsPost(t *testing.T) {
 // /healthz/leader contract so a multi-protocol load balancer
 // sees identical semantics.
 func TestRouter_HealthzLeader_ReturnsOKWhenLeader(t *testing.T) {
+	t.Parallel()
 	r := NewRouterWithLeaderProbe(nil, nil, LeaderProbeFunc(func(context.Context) bool { return true }))
 	req := httptest.NewRequest(http.MethodGet, "/admin/healthz/leader", nil)
 	rec := httptest.NewRecorder()
@@ -89,6 +94,7 @@ func TestRouter_HealthzLeader_ReturnsOKWhenLeader(t *testing.T) {
 // rotation when it loses leadership; the body string is informative
 // for operators reading curl output.
 func TestRouter_HealthzLeader_Returns503WhenNotLeader(t *testing.T) {
+	t.Parallel()
 	r := NewRouterWithLeaderProbe(nil, nil, LeaderProbeFunc(func(context.Context) bool { return false }))
 	req := httptest.NewRequest(http.MethodGet, "/admin/healthz/leader", nil)
 	rec := httptest.NewRecorder()
@@ -103,6 +109,7 @@ func TestRouter_HealthzLeader_Returns503WhenNotLeader(t *testing.T) {
 // healthz HEAD test. The status code must still indicate the
 // leader state; only the body is suppressed.
 func TestRouter_HealthzLeader_HeadOmitsBody(t *testing.T) {
+	t.Parallel()
 	rLeader := NewRouterWithLeaderProbe(nil, nil, LeaderProbeFunc(func(context.Context) bool { return true }))
 	req := httptest.NewRequest(http.MethodHead, "/admin/healthz/leader", nil)
 	rec := httptest.NewRecorder()
@@ -124,6 +131,7 @@ func TestRouter_HealthzLeader_HeadOmitsBody(t *testing.T) {
 // §6.5.5 — load balancers and synthetic-monitor tools key off this
 // header to discover supported verbs.
 func TestRouter_HealthzLeader_RejectsPost(t *testing.T) {
+	t.Parallel()
 	r := NewRouterWithLeaderProbe(nil, nil, LeaderProbeFunc(func(context.Context) bool { return true }))
 	req := httptest.NewRequest(http.MethodPost, "/admin/healthz/leader", strings.NewReader(""))
 	rec := httptest.NewRecorder()
@@ -170,6 +178,7 @@ func TestRouter_405_AllowHeader(t *testing.T) {
 // leader"). Single-node dev runs and admin builds without runtime
 // access fall here.
 func TestRouter_HealthzLeader_NilProbeReturns404(t *testing.T) {
+	t.Parallel()
 	r := NewRouter(nil, newTestStatic()) // NewRouter passes nil probe to NewRouterWithLeaderProbe
 	req := httptest.NewRequest(http.MethodGet, "/admin/healthz/leader", nil)
 	rec := httptest.NewRecorder()
@@ -186,6 +195,7 @@ func TestRouter_HealthzLeader_NilProbeReturns404(t *testing.T) {
 // balancer probing the path to see HTML 200 forever and never
 // detect a leadership change.
 func TestRouter_HealthzLeader_NotSwallowedBySPA(t *testing.T) {
+	t.Parallel()
 	probe := LeaderProbeFunc(func(context.Context) bool { return false })
 	r := NewRouterWithLeaderProbe(nil, newTestStatic(), probe)
 	req := httptest.NewRequest(http.MethodGet, "/admin/healthz/leader", nil)
@@ -196,6 +206,7 @@ func TestRouter_HealthzLeader_NotSwallowedBySPA(t *testing.T) {
 }
 
 func TestRouter_StaticAssetServed(t *testing.T) {
+	t.Parallel()
 	r := NewRouter(nil, newTestStatic())
 	req := httptest.NewRequest(http.MethodGet, "/admin/assets/app.js", nil)
 	rec := httptest.NewRecorder()
@@ -206,6 +217,7 @@ func TestRouter_StaticAssetServed(t *testing.T) {
 }
 
 func TestRouter_StaticAssetRejectsPost(t *testing.T) {
+	t.Parallel()
 	r := NewRouter(nil, newTestStatic())
 	req := httptest.NewRequest(http.MethodPost, "/admin/assets/app.js", strings.NewReader("payload"))
 	rec := httptest.NewRecorder()
@@ -215,6 +227,7 @@ func TestRouter_StaticAssetRejectsPost(t *testing.T) {
 }
 
 func TestRouter_StaticAssetMissingReturnsJSONNotFound(t *testing.T) {
+	t.Parallel()
 	r := NewRouter(nil, newTestStatic())
 	req := httptest.NewRequest(http.MethodGet, "/admin/assets/missing.js", nil)
 	rec := httptest.NewRecorder()
@@ -225,6 +238,7 @@ func TestRouter_StaticAssetMissingReturnsJSONNotFound(t *testing.T) {
 }
 
 func TestRouter_StaticTraversalRejected(t *testing.T) {
+	t.Parallel()
 	r := NewRouter(nil, newTestStatic())
 	req := httptest.NewRequest(http.MethodGet, "/admin/assets/../index.html", nil)
 	rec := httptest.NewRecorder()
@@ -240,6 +254,7 @@ func TestRouter_StaticTraversalRejected(t *testing.T) {
 // Filenames containing ".." as a substring (but not as a path segment)
 // are legitimate — the guard must not reject `app..js`.
 func TestRouter_StaticSubstringDotDotAllowed(t *testing.T) {
+	t.Parallel()
 	fs := fstest.MapFS{
 		"index.html":     {Data: []byte("<!doctype html>")},
 		"assets/app..js": {Data: []byte("console.log('double-dot');")},
@@ -255,6 +270,7 @@ func TestRouter_StaticSubstringDotDotAllowed(t *testing.T) {
 
 // A client-supplied double slash must resolve to a JSON 404, not a 500.
 func TestRouter_StaticDoubleSlashReturnsJSON404(t *testing.T) {
+	t.Parallel()
 	r := NewRouter(nil, newTestStatic())
 	req := httptest.NewRequest(http.MethodGet, "/admin/assets//app.js", nil)
 	rec := httptest.NewRecorder()
@@ -265,6 +281,7 @@ func TestRouter_StaticDoubleSlashReturnsJSON404(t *testing.T) {
 }
 
 func TestRouter_SPAFallbackServesIndex(t *testing.T) {
+	t.Parallel()
 	r := NewRouter(nil, newTestStatic())
 	for _, p := range []string{"/admin", "/admin/", "/admin/dynamo", "/admin/s3/bucket-42"} {
 		req := httptest.NewRequest(http.MethodGet, p, nil)
@@ -277,6 +294,7 @@ func TestRouter_SPAFallbackServesIndex(t *testing.T) {
 }
 
 func TestRouter_SPAWithoutStaticReturns404(t *testing.T) {
+	t.Parallel()
 	r := NewRouter(nil, nil)
 	req := httptest.NewRequest(http.MethodGet, "/admin/dynamo", nil)
 	rec := httptest.NewRecorder()
@@ -285,6 +303,7 @@ func TestRouter_SPAWithoutStaticReturns404(t *testing.T) {
 }
 
 func TestRouter_BareAPIRootReturnsJSON404NotHTML(t *testing.T) {
+	t.Parallel()
 	r := NewRouter(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	}), newTestStatic())
@@ -311,6 +330,7 @@ func TestRouter_BareAPIRootReturnsJSON404NotHTML(t *testing.T) {
 }
 
 func TestRouter_NonAdminPathReturns404JSON(t *testing.T) {
+	t.Parallel()
 	r := NewRouter(nil, newTestStatic())
 	req := httptest.NewRequest(http.MethodGet, "/other", nil)
 	rec := httptest.NewRecorder()
@@ -321,6 +341,7 @@ func TestRouter_NonAdminPathReturns404JSON(t *testing.T) {
 }
 
 func TestRouter_APIHandlerReceivesFullPath(t *testing.T) {
+	t.Parallel()
 	var received string
 	api := http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 		received = r.URL.Path

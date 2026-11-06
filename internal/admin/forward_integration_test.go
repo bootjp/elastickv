@@ -120,6 +120,7 @@ func newFollowerHandler(t *testing.T, fwd LeaderForwarder) *DynamoHandler {
 }
 
 func TestDynamoHandler_FollowerForwardsCreateTable_HappyPath(t *testing.T) {
+	t.Parallel()
 	// Acceptance criterion 2: a write hitting a follower is
 	// transparently forwarded; the SPA sees the same 201 + body
 	// shape it would have seen from a leader-direct call.
@@ -142,6 +143,7 @@ func TestDynamoHandler_FollowerForwardsCreateTable_HappyPath(t *testing.T) {
 }
 
 func TestDynamoHandler_FollowerForwardsDeleteTable_HappyPath(t *testing.T) {
+	t.Parallel()
 	fwd := &stubLeaderForwarder{deleteRes: &ForwardResult{
 		StatusCode:  http.StatusNoContent,
 		ContentType: "application/json; charset=utf-8",
@@ -159,6 +161,7 @@ func TestDynamoHandler_FollowerForwardsDeleteTable_HappyPath(t *testing.T) {
 }
 
 func TestDynamoHandler_NoForwarder_FallsBackTo503(t *testing.T) {
+	t.Parallel()
 	// Without a forwarder configured, a follower handler still
 	// produces the original 503 leader_unavailable + Retry-After
 	// — preserves the leader-only deployment story from PR #634.
@@ -174,6 +177,7 @@ func TestDynamoHandler_NoForwarder_FallsBackTo503(t *testing.T) {
 }
 
 func TestDynamoHandler_ForwarderLeaderUnavailableReturns503(t *testing.T) {
+	t.Parallel()
 	// Acceptance criterion 3: when the forwarder cannot find a
 	// leader (election in progress), the handler must surface
 	// 503 + Retry-After: 1 so the client retries instead of
@@ -193,6 +197,7 @@ func TestDynamoHandler_ForwarderLeaderUnavailableReturns503(t *testing.T) {
 }
 
 func TestDynamoHandler_ForwarderTransportErrorReturns503(t *testing.T) {
+	t.Parallel()
 	// Generic gRPC error from the forwarder also produces 503 +
 	// Retry-After. The error is logged on the server (covered by
 	// inspection of slog output) but never surfaces to the SPA.
@@ -224,6 +229,7 @@ func TestDynamoHandler_ForwarderTransportErrorReturns503(t *testing.T) {
 // tryForwardCreate or tryForwardDelete will fail one of the
 // sub-tests.
 func TestDynamoHandler_ForwarderNotInvokedForNonNotLeaderError(t *testing.T) {
+	t.Parallel()
 	createCases := []struct {
 		name     string
 		err      error
@@ -287,6 +293,7 @@ func TestDynamoHandler_ForwarderNotInvokedForNonNotLeaderError(t *testing.T) {
 // "no leader known" sentinel from the forwarder layer; tryForwardDelete
 // catches it and routes through writeForwardFailure.
 func TestDynamoHandler_ForwarderLeaderUnavailableReturns503_Delete(t *testing.T) {
+	t.Parallel()
 	fwd := &stubLeaderForwarder{deleteErr: ErrLeaderUnavailable}
 	// notLeaderSource.AdminDeleteTable unconditionally returns
 	// ErrTablesNotLeader, so the embedded stubTablesSource.tables
@@ -311,6 +318,7 @@ func TestDynamoHandler_ForwarderLeaderUnavailableReturns503_Delete(t *testing.T)
 // slog output in the create-side test); the assertion here is
 // strictly on the wire shape.
 func TestDynamoHandler_ForwarderTransportErrorReturns503_Delete(t *testing.T) {
+	t.Parallel()
 	fwd := &stubLeaderForwarder{deleteErr: errors.New("gRPC transport sentinel DEL-TX-1")}
 	src := &notLeaderSource{}
 	h := NewDynamoHandler(src).WithLeaderForwarder(fwd)
@@ -332,6 +340,7 @@ func TestDynamoHandler_ForwarderTransportErrorReturns503_Delete(t *testing.T) {
 // follower would silently lose MIME-sniff protection on
 // forwarded responses.
 func TestDynamoHandler_ForwarderForwardsLeaderResponseSetsNosniff(t *testing.T) {
+	t.Parallel()
 	fwd := &stubLeaderForwarder{createRes: &ForwardResult{
 		StatusCode:  http.StatusCreated,
 		Payload:     []byte(`{"name":"users"}`),
@@ -348,6 +357,7 @@ func TestDynamoHandler_ForwarderForwardsLeaderResponseSetsNosniff(t *testing.T) 
 }
 
 func TestDynamoHandler_ForwarderForwardsLeaderConflictResponse(t *testing.T) {
+	t.Parallel()
 	// 409 Conflict from the leader (table already exists) must
 	// be relayed verbatim to the SPA, not re-classified as 503.
 	// The forwarder's transport succeeded; the leader's
@@ -368,6 +378,7 @@ func TestDynamoHandler_ForwarderForwardsLeaderConflictResponse(t *testing.T) {
 }
 
 func TestDynamoHandler_ForwarderForwardsLeader503WithRetryAfter(t *testing.T) {
+	t.Parallel()
 	// If the leader stepped down mid-request and returned 503
 	// itself, the forwarder relays the body but the handler must
 	// also set Retry-After: 1 so the SPA's retry policy works
@@ -389,6 +400,7 @@ func TestDynamoHandler_ForwarderForwardsLeader503WithRetryAfter(t *testing.T) {
 }
 
 func TestDynamoHandler_ForwarderNotInvokedForReadOnlyPrincipal(t *testing.T) {
+	t.Parallel()
 	// The role check fires before the forward path — a read-only
 	// principal must NEVER reach the forwarder. Defence in depth:
 	// even if a malicious follower could fabricate the principal,
@@ -405,6 +417,7 @@ func TestDynamoHandler_ForwarderNotInvokedForReadOnlyPrincipal(t *testing.T) {
 }
 
 func TestDynamoHandler_ForwarderNotInvokedForBadJSON(t *testing.T) {
+	t.Parallel()
 	// Body validation runs before the source call — invalid JSON
 	// must fail at the handler with 400 and never produce a
 	// forward attempt.

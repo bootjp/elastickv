@@ -17,11 +17,13 @@ func makeKey(seed byte) string {
 }
 
 func TestConfigValidate_DisabledNoOp(t *testing.T) {
+	t.Parallel()
 	c := &Config{}
 	require.NoError(t, c.Validate())
 }
 
 func TestConfigValidate_RequiresListen(t *testing.T) {
+	t.Parallel()
 	c := &Config{
 		Enabled:           true,
 		SessionSigningKey: makeKey(1),
@@ -32,6 +34,7 @@ func TestConfigValidate_RequiresListen(t *testing.T) {
 }
 
 func TestConfigValidate_RequiresSigningKey(t *testing.T) {
+	t.Parallel()
 	c := &Config{
 		Enabled: true,
 		Listen:  "127.0.0.1:8080",
@@ -42,6 +45,7 @@ func TestConfigValidate_RequiresSigningKey(t *testing.T) {
 }
 
 func TestConfigValidate_SigningKeyWrongLength(t *testing.T) {
+	t.Parallel()
 	short := base64.StdEncoding.EncodeToString([]byte("too short"))
 	c := &Config{
 		Enabled:           true,
@@ -54,6 +58,7 @@ func TestConfigValidate_SigningKeyWrongLength(t *testing.T) {
 }
 
 func TestConfigValidate_SigningKeyNotBase64(t *testing.T) {
+	t.Parallel()
 	c := &Config{
 		Enabled:           true,
 		Listen:            "127.0.0.1:8080",
@@ -65,6 +70,7 @@ func TestConfigValidate_SigningKeyNotBase64(t *testing.T) {
 }
 
 func TestConfigValidate_LoopbackNoTLSOK(t *testing.T) {
+	t.Parallel()
 	for _, addr := range []string{"127.0.0.1:8080", "[::1]:8080", "localhost:8080"} {
 		c := &Config{
 			Enabled:           true,
@@ -76,6 +82,7 @@ func TestConfigValidate_LoopbackNoTLSOK(t *testing.T) {
 }
 
 func TestConfigValidate_NonLoopbackRequiresTLS(t *testing.T) {
+	t.Parallel()
 	c := &Config{
 		Enabled:           true,
 		Listen:            "0.0.0.0:8080",
@@ -88,6 +95,7 @@ func TestConfigValidate_NonLoopbackRequiresTLS(t *testing.T) {
 }
 
 func TestConfigValidate_PartialTLSRejected(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name, cert, key string
 	}{
@@ -110,6 +118,7 @@ func TestConfigValidate_PartialTLSRejected(t *testing.T) {
 }
 
 func TestConfigValidate_NonLoopbackWithTLSOK(t *testing.T) {
+	t.Parallel()
 	c := &Config{
 		Enabled:           true,
 		Listen:            "10.0.0.1:8443",
@@ -121,6 +130,7 @@ func TestConfigValidate_NonLoopbackWithTLSOK(t *testing.T) {
 }
 
 func TestConfigValidate_NonLoopbackPlaintextOptInOK(t *testing.T) {
+	t.Parallel()
 	c := &Config{
 		Enabled:                   true,
 		Listen:                    "0.0.0.0:8080",
@@ -131,6 +141,7 @@ func TestConfigValidate_NonLoopbackPlaintextOptInOK(t *testing.T) {
 }
 
 func TestConfigValidate_OverlappingRolesRejected(t *testing.T) {
+	t.Parallel()
 	c := &Config{
 		Enabled:            true,
 		Listen:             "127.0.0.1:8080",
@@ -145,6 +156,7 @@ func TestConfigValidate_OverlappingRolesRejected(t *testing.T) {
 }
 
 func TestConfigValidate_RoleIndexExclusive(t *testing.T) {
+	t.Parallel()
 	c := &Config{
 		Enabled:            true,
 		Listen:             "127.0.0.1:8080",
@@ -161,6 +173,7 @@ func TestConfigValidate_RoleIndexExclusive(t *testing.T) {
 }
 
 func TestConfigValidate_PreviousSigningKeyValidated(t *testing.T) {
+	t.Parallel()
 	c := &Config{
 		Enabled:                   true,
 		Listen:                    "127.0.0.1:8080",
@@ -173,6 +186,7 @@ func TestConfigValidate_PreviousSigningKeyValidated(t *testing.T) {
 }
 
 func TestConfigDecodedSigningKeys_Order(t *testing.T) {
+	t.Parallel()
 	c := &Config{
 		Enabled:                   true,
 		Listen:                    "127.0.0.1:8080",
@@ -188,12 +202,14 @@ func TestConfigDecodedSigningKeys_Order(t *testing.T) {
 }
 
 func TestRole_AllowsWrite(t *testing.T) {
+	t.Parallel()
 	require.True(t, RoleFull.AllowsWrite())
 	require.False(t, RoleReadOnly.AllowsWrite())
 	require.False(t, Role("").AllowsWrite())
 }
 
 func TestAddressRequiresTLS(t *testing.T) {
+	t.Parallel()
 	require.False(t, addressRequiresTLS("127.0.0.1:8080"))
 	require.False(t, addressRequiresTLS("[::1]:8080"))
 	require.False(t, addressRequiresTLS("localhost:8080"))
@@ -204,6 +220,7 @@ func TestAddressRequiresTLS(t *testing.T) {
 }
 
 func TestConfigValidate_DisabledIgnoresBadFields(t *testing.T) {
+	t.Parallel()
 	c := &Config{
 		Enabled: false,
 		Listen:  "not a host port",
@@ -214,6 +231,7 @@ func TestConfigValidate_DisabledIgnoresBadFields(t *testing.T) {
 // TestConfigValidate_PreservesContext ensures the validation message
 // includes the offending field so operators can resolve errors quickly.
 func TestConfigValidate_PreservesContext(t *testing.T) {
+	t.Parallel()
 	c := &Config{
 		Enabled:           true,
 		Listen:            "::::::::",
