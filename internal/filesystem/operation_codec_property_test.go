@@ -8,6 +8,7 @@ import (
 )
 
 func TestOperationRecordCodecProperty(t *testing.T) {
+	t.Parallel()
 	rapid.Check(t, func(rt *rapid.T) {
 		intent := rapid.SliceOfN(rapid.Byte(), 0, 1024).Draw(rt, "intent")
 		sequence := rapid.Uint64Range(1, ^uint64(0)).Draw(rt, "sequence")
@@ -27,6 +28,7 @@ func TestOperationRecordCodecProperty(t *testing.T) {
 }
 
 func TestOperationRecordCodecPreservesGenerationFence(t *testing.T) {
+	t.Parallel()
 	id := OperationID{Filesystem: [16]byte{1}, Session: [16]byte{2}, Sequence: 1}
 	record := newOperationRecord(id, []byte("write"), 128, 1024)
 	record.AttemptID = [16]byte{4}
@@ -54,6 +56,7 @@ func TestOperationRecordCodecPreservesGenerationFence(t *testing.T) {
 }
 
 func TestOperationSessionCodecProperty(t *testing.T) {
+	t.Parallel()
 	rapid.Check(t, func(rt *rapid.T) {
 		owner := rapid.StringMatching(`[a-z]{1,16}`).Draw(rt, "owner")
 		watermark := rapid.Uint64Range(0, ^uint64(0)-1).Draw(rt, "watermark")

@@ -16,6 +16,7 @@ import (
 )
 
 func TestOperationJournalRetainedAccountingAcrossSequenceBoundary(t *testing.T) {
+	t.Parallel()
 	t.Run("memory", func(t *testing.T) {
 		journal, _, _ := testOperationJournal(t)
 		assertOperationJournalRetainedAccountingAcrossSequenceBoundary(t, journal)
@@ -33,6 +34,7 @@ func TestOperationJournalRetainedAccountingAcrossSequenceBoundary(t *testing.T) 
 }
 
 func TestOperationJournalConcurrentAcknowledgementChurn(t *testing.T) {
+	t.Parallel()
 	t.Run("memory", func(t *testing.T) {
 		journal, _, _ := testOperationJournal(t)
 		assertConcurrentAcknowledgementChurn(t, journal)
@@ -50,6 +52,7 @@ func TestOperationJournalConcurrentAcknowledgementChurn(t *testing.T) {
 }
 
 func TestOperationJournalGenerationFenceRacesAcknowledgement(t *testing.T) {
+	t.Parallel()
 	t.Run("memory", func(t *testing.T) {
 		journal, _, _ := testOperationJournal(t)
 		assertGenerationFenceRacesAcknowledgement(t, journal)
@@ -240,6 +243,7 @@ func assertConcurrentAcknowledgementChurn(t *testing.T, journal *OperationJourna
 }
 
 func TestOperationJournalConcurrentAcknowledgementsPreserveAccounting(t *testing.T) {
+	t.Parallel()
 	t.Run("memory", func(t *testing.T) {
 		journal, _, _ := testOperationJournal(t)
 		assertConcurrentAcknowledgementsPreserveAccounting(t, journal)

@@ -8,6 +8,7 @@ import (
 )
 
 func TestOperationJournalStatsTrackRetainedWorkAcrossSessions(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	svc, err := NewService(st, &testCoordinator{st: st})
 	require.NoError(t, err)

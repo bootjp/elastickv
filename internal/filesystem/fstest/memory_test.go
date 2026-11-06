@@ -33,6 +33,7 @@ func (s *mutationCaptureStore) ApplyMutations(_ context.Context, mutations []*st
 }
 
 func TestMemoryDispatcherTimestampPatchBoundaries(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name   string
 		size   int
@@ -78,6 +79,7 @@ func TestMemoryDispatcherTimestampPatchBoundaries(t *testing.T) {
 }
 
 func TestMemoryDispatcherCopiesMutationInputs(t *testing.T) {
+	t.Parallel()
 	st := &mutationCaptureStore{}
 	putKey, delKey, value := []byte("put"), []byte("del"), []byte("value")
 	_, err := fstest.NewMemoryDispatcher(st).Dispatch(context.Background(), &kv.OperationGroup[kv.OP]{
@@ -101,6 +103,7 @@ func TestMemoryDispatcherCopiesMutationInputs(t *testing.T) {
 }
 
 func TestMemoryDispatcherTimestampSelectionAndOCC(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name     string
 		lastTS   uint64
@@ -133,6 +136,7 @@ func TestMemoryDispatcherTimestampSelectionAndOCC(t *testing.T) {
 }
 
 func TestMemoryDispatcherRejectsUnsupportedOperationsBeforeApply(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name   string
 		op     kv.OP
