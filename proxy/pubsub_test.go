@@ -153,6 +153,7 @@ func newTestSession(dconn *mockDetachedConn) *pubsubSession {
 }
 
 func TestPubSub_WriteUnsubAll_PerChannelReplies(t *testing.T) {
+	t.Parallel()
 	dconn := newMockDetachedConn()
 	s := newTestSession(dconn)
 
@@ -180,6 +181,7 @@ func TestPubSub_WriteUnsubAll_PerChannelReplies(t *testing.T) {
 }
 
 func TestPubSub_WriteUnsubAll_EmptySet_SingleNullReply(t *testing.T) {
+	t.Parallel()
 	dconn := newMockDetachedConn()
 	s := newTestSession(dconn)
 
@@ -204,6 +206,7 @@ func TestPubSub_WriteUnsubAll_EmptySet_SingleNullReply(t *testing.T) {
 }
 
 func TestPubSub_WriteUnsubAll_Patterns(t *testing.T) {
+	t.Parallel()
 	dconn := newMockDetachedConn()
 	s := newTestSession(dconn)
 
@@ -229,6 +232,7 @@ func TestPubSub_WriteUnsubAll_Patterns(t *testing.T) {
 }
 
 func TestPubSub_SubCount(t *testing.T) {
+	t.Parallel()
 	s := newTestSession(newMockDetachedConn())
 
 	assert.Equal(t, 0, s.subCount())
@@ -247,6 +251,7 @@ func TestPubSub_SubCount(t *testing.T) {
 }
 
 func TestPubSub_DispatchPubSubCommand_Quit(t *testing.T) {
+	t.Parallel()
 	dconn := newMockDetachedConn()
 	s := newTestSession(dconn)
 
@@ -258,6 +263,7 @@ func TestPubSub_DispatchPubSubCommand_Quit(t *testing.T) {
 }
 
 func TestPubSub_DispatchPubSubCommand_InvalidCommand(t *testing.T) {
+	t.Parallel()
 	dconn := newMockDetachedConn()
 	s := newTestSession(dconn)
 
@@ -275,6 +281,7 @@ func TestPubSub_DispatchPubSubCommand_InvalidCommand(t *testing.T) {
 }
 
 func TestPubSub_DispatchNormalCommand_Quit(t *testing.T) {
+	t.Parallel()
 	dconn := newMockDetachedConn()
 	s := newTestSession(dconn)
 
@@ -283,6 +290,7 @@ func TestPubSub_DispatchNormalCommand_Quit(t *testing.T) {
 }
 
 func TestPubSub_DispatchNormalCommand_Ping(t *testing.T) {
+	t.Parallel()
 	dconn := newMockDetachedConn()
 	s := newTestSession(dconn)
 
@@ -294,6 +302,7 @@ func TestPubSub_DispatchNormalCommand_Ping(t *testing.T) {
 }
 
 func TestPubSub_DispatchNormalCommand_PingWithMessage(t *testing.T) {
+	t.Parallel()
 	dconn := newMockDetachedConn()
 	s := newTestSession(dconn)
 
@@ -305,6 +314,7 @@ func TestPubSub_DispatchNormalCommand_PingWithMessage(t *testing.T) {
 }
 
 func TestPubSub_HandlePubSubPing(t *testing.T) {
+	t.Parallel()
 	dconn := newMockDetachedConn()
 	s := newTestSession(dconn)
 
@@ -318,6 +328,7 @@ func TestPubSub_HandlePubSubPing(t *testing.T) {
 }
 
 func TestPubSub_HandlePubSubPingWithData(t *testing.T) {
+	t.Parallel()
 	dconn := newMockDetachedConn()
 	s := newTestSession(dconn)
 
@@ -328,6 +339,7 @@ func TestPubSub_HandlePubSubPingWithData(t *testing.T) {
 }
 
 func TestPubSub_HandleUnsubNoSession(t *testing.T) {
+	t.Parallel()
 	dconn := newMockDetachedConn()
 	s := newTestSession(dconn)
 
@@ -347,6 +359,7 @@ func TestPubSub_HandleUnsubNoSession(t *testing.T) {
 }
 
 func TestPubSub_SubscribeInTxnQueued(t *testing.T) {
+	t.Parallel()
 	dconn := newMockDetachedConn()
 	s := newTestSession(dconn)
 	s.inTxn = true
@@ -366,6 +379,7 @@ func TestPubSub_SubscribeInTxnQueued(t *testing.T) {
 }
 
 func TestPubSub_HandleTxnInSession_MultiExecDiscard(t *testing.T) {
+	t.Parallel()
 	dconn := newMockDetachedConn()
 	s := newTestSession(dconn)
 
@@ -418,6 +432,7 @@ func TestPubSub_HandleTxnInSession_MultiExecDiscard(t *testing.T) {
 }
 
 func TestPubSub_ShouldExitPubSub(t *testing.T) {
+	t.Parallel()
 	s := newTestSession(newMockDetachedConn())
 
 	// No upstream, no subs → false (no upstream to close)
@@ -434,6 +449,7 @@ func TestPubSub_ShouldExitPubSub(t *testing.T) {
 }
 
 func TestPubSub_ByteSlicesToStrings(t *testing.T) {
+	t.Parallel()
 	input := [][]byte{[]byte("hello"), []byte("world")}
 	result := byteSlicesToStrings(input)
 	assert.Equal(t, []string{"hello", "world"}, result)
@@ -443,6 +459,7 @@ func TestPubSub_ByteSlicesToStrings(t *testing.T) {
 }
 
 func TestPubSub_SelectAuthSilentlyAccepted(t *testing.T) {
+	t.Parallel()
 	for _, cmd := range []string{"SELECT", "AUTH"} {
 		t.Run(cmd, func(t *testing.T) {
 			dconn := newMockDetachedConn()
@@ -460,6 +477,7 @@ func TestPubSub_SelectAuthSilentlyAccepted(t *testing.T) {
 }
 
 func TestPubSub_DetachedSessionCommandReplyTypes(t *testing.T) {
+	t.Parallel()
 	primary := newMockBackend("redis")
 	primary.doFunc = makeCmd("OK", nil)
 	dual := NewDualWriter(primary, nil, ProxyConfig{Mode: ModeRedisOnly}, newTestMetrics(), newTestSentry(), testLogger)
@@ -474,6 +492,7 @@ func TestPubSub_DetachedSessionCommandReplyTypes(t *testing.T) {
 }
 
 func TestPubSub_DetachedSessionTransactionReplyTypes(t *testing.T) {
+	t.Parallel()
 	primary := newMockBackend("redis")
 	primary.pipelineFunc = func(ctx context.Context, cmds [][]any) ([]*redis.Cmd, error) {
 		exec := redis.NewCmd(ctx, "EXEC")
@@ -495,6 +514,7 @@ func TestPubSub_DetachedSessionTransactionReplyTypes(t *testing.T) {
 
 // TestPubSub_CleanupClosesUpstream verifies that cleanup closes upstream and dconn.
 func TestPubSub_CleanupClosesUpstream(t *testing.T) {
+	t.Parallel()
 	dconn := newMockDetachedConn()
 	s := newTestSession(dconn)
 
@@ -506,6 +526,7 @@ func TestPubSub_CleanupClosesUpstream(t *testing.T) {
 
 // TestPubSub_CommandLoop_EmptyArgs verifies that empty command args are skipped.
 func TestPubSub_CommandLoop_EmptyArgs(t *testing.T) {
+	t.Parallel()
 	dconn := newMockDetachedConn()
 	// Queue empty args then QUIT
 	dconn.commands = append(dconn.commands, redcon.Command{Args: nil})
@@ -520,6 +541,7 @@ func TestPubSub_CommandLoop_EmptyArgs(t *testing.T) {
 }
 
 func TestPubSub_CommandLoop_EOF(t *testing.T) {
+	t.Parallel()
 	dconn := newMockDetachedConn()
 	dconn.readErr = errors.New("connection closed")
 
@@ -530,6 +552,7 @@ func TestPubSub_CommandLoop_EOF(t *testing.T) {
 // ========== T3: forwardMessages message/pmessage branch test ==========
 
 func TestPubSub_ForwardMessages_MessageBranch(t *testing.T) {
+	t.Parallel()
 	dconn := newMockDetachedConn()
 	s := newTestSession(dconn)
 
@@ -562,6 +585,7 @@ func TestPubSub_ForwardMessages_MessageBranch(t *testing.T) {
 }
 
 func TestPubSub_ForwardMessages_ClosedSession(t *testing.T) {
+	t.Parallel()
 	dconn := newMockDetachedConn()
 	s := newTestSession(dconn)
 
@@ -581,6 +605,7 @@ func TestPubSub_ForwardMessages_ClosedSession(t *testing.T) {
 }
 
 func TestPubSub_ForwardMessages_EmptyChannel(t *testing.T) {
+	t.Parallel()
 	dconn := newMockDetachedConn()
 	s := newTestSession(dconn)
 
@@ -596,6 +621,7 @@ func TestPubSub_ForwardMessages_EmptyChannel(t *testing.T) {
 // ========== T4: reenterPubSub test ==========
 
 func TestPubSub_ReenterPubSub_TooFewArgs(t *testing.T) {
+	t.Parallel()
 	dconn := newMockDetachedConn()
 	s := newTestSession(dconn)
 
@@ -613,6 +639,7 @@ func TestPubSub_ReenterPubSub_TooFewArgs(t *testing.T) {
 }
 
 func TestPubSub_ReenterPubSub_NilBackend(t *testing.T) {
+	t.Parallel()
 	dconn := newMockDetachedConn()
 	reg := prometheus.NewRegistry()
 	metrics := NewProxyMetrics(reg)
