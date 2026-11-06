@@ -38,7 +38,8 @@ func (applyMemberAuthServer) ProbeMigrationState(ctx context.Context, _ *pb.Prob
 }
 
 func TestSplitMigrationApplyMemberSnapshotFactoryPreservesTLSCredentials(t *testing.T) {
-	t.Parallel()
+	// Not parallel: internalutil.ConfigureGRPCTLS replaces the process-global
+	// TLS config that every gRPC server and dialer in the process reads.
 	cert, key := writeSelfSignedCert(t)
 	require.NoError(t, internalutil.ConfigureGRPCTLS(cert, cert, key))
 	t.Cleanup(func() { require.NoError(t, internalutil.ConfigureGRPCTLS("", "", "")) })
