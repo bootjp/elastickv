@@ -63,7 +63,8 @@ func prepareSafetyInternalClient(t *testing.T, server *Internal) pb.InternalClie
 }
 
 func TestPrepareEvidenceSafetyRPCRequiresTokenAndLeaderFence(t *testing.T) {
-	t.Parallel()
+	// Not parallel: its deadline/liveness budget is sized for a quiet
+	// process, and parallel peers on a loaded runner can exhaust it.
 	st := store.NewMVCCStore()
 	fsm := kv.NewKvFSMWithHLC(st, kv.NewHLC())
 	require.Nil(t, fsm.Apply(kv.EncodePrepareEvidenceFence(0)))

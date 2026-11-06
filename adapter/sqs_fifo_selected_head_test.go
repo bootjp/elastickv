@@ -338,7 +338,8 @@ func runSelectedHeadCleanupFault(t *testing.T, partitions uint32, redrive bool, 
 }
 
 func TestSQSSelectedHeadSingleRotationPerSnapshot(t *testing.T) {
-	t.Parallel()
+	// Not parallel: its deadline/liveness budget is sized for a quiet
+	// process, and parallel peers on a loaded runner can exhaust it.
 	for _, partitions := range []uint32{1, 4} {
 		t.Run(fmt.Sprintf("partitions_%d", partitions), func(t *testing.T) {
 			f, coord := newSelectedHeadFixture(t, partitions, 33)

@@ -2268,7 +2268,8 @@ func TestDistributionServerStartSplitMigrationReturnsCapabilityGateError(t *test
 }
 
 func TestDistributionServerStartSplitMigrationCapabilityGateRunsOutsideCatalogLock(t *testing.T) {
-	t.Parallel()
+	// Not parallel: its deadline/liveness budget is sized for a quiet
+	// process, and parallel peers on a loaded runner can exhaust it.
 	ctx := context.Background()
 	baseStore := store.NewMVCCStore()
 	catalog := distribution.NewCatalogStore(baseStore)

@@ -324,7 +324,8 @@ func TestSplitMigrationNativePlaintextRejectsToken(t *testing.T) {
 }
 
 func TestSplitMigrationNativeWrappedTransportOwnership(t *testing.T) {
-	t.Parallel()
+	// Not parallel: its deadline/liveness budget is sized for a quiet
+	// process, and parallel peers on a loaded runner can exhaust it.
 	for _, closeMode := range []string{"physical disconnect", "owner shutdown"} {
 		t.Run(closeMode, func(t *testing.T) {
 			f := newMigrationNativeAuthFixture(t, migrationNativeWrapped)

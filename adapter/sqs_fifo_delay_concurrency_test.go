@@ -15,7 +15,8 @@ import (
 )
 
 func TestSQSFIFODelayConcurrentConfiguration(t *testing.T) {
-	t.Parallel()
+	// Not parallel: its deadline/liveness budget is sized for a quiet
+	// process, and parallel peers on a loaded runner can exhaust it.
 	st := store.NewMVCCStore()
 	t.Cleanup(func() { require.NoError(t, st.Close()) })
 	srv := newDelayTestServer(t, st)
