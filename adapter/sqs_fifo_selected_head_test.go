@@ -246,7 +246,8 @@ func runSelectedHeadCleanup(t *testing.T, partitions uint32, redrive, owned bool
 }
 
 func TestSQSSelectedHeadRetentionExpiry(t *testing.T) {
-	t.Parallel()
+	// Not parallel: selectedHeadScan runs under a 100ms wall-clock budget
+	// that returns an empty result (not an error) when parallel load exceeds it.
 	for _, partitions := range []uint32{1, 4} {
 		for _, owned := range []bool{false, true} {
 			t.Run(fmt.Sprintf("partitions_%d/owned_%t", partitions, owned), func(t *testing.T) {
@@ -257,7 +258,8 @@ func TestSQSSelectedHeadRetentionExpiry(t *testing.T) {
 }
 
 func TestSQSSelectedHeadRedrive(t *testing.T) {
-	t.Parallel()
+	// Not parallel: selectedHeadScan runs under a 100ms wall-clock budget
+	// that returns an empty result (not an error) when parallel load exceeds it.
 	for _, partitions := range []uint32{1, 4} {
 		for _, owned := range []bool{false, true} {
 			t.Run(fmt.Sprintf("partitions_%d/owned_%t", partitions, owned), func(t *testing.T) {
