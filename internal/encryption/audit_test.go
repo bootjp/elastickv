@@ -19,6 +19,7 @@ import (
 // ErrSidecarBehindRaftLog guard; a regression that widens or
 // narrows the range silently changes the security guarantee.
 func TestIsEncryptionRelevantOpcode_AllRangeMembers(t *testing.T) {
+	t.Parallel()
 	// Every byte in the sidecar-mutating range MUST be relevant.
 	//
 	// Iterate via int so the loop terminates even if a future
@@ -70,6 +71,7 @@ func TestIsEncryptionRelevantOpcode_AllRangeMembers(t *testing.T) {
 // below and the IMPORTANT block in IsEncryptionRelevantOpcode's
 // godoc.
 func TestIsEncryptionRelevantOpcode_KnownRanges(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name   string
 		opcode byte
@@ -134,6 +136,7 @@ func (f *fakeScanner) HasEncryptionRelevantEntryInRange(start, end uint64) (bool
 // fast path: sidecar's applied index is equal to (or ahead of)
 // the engine's. The scanner is NEVER called in this branch.
 func TestGuardSidecarBehindRaftLog_CaughtUp(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name                  string
 		sidecarIdx, engineIdx uint64
@@ -160,6 +163,7 @@ func TestGuardSidecarBehindRaftLog_CaughtUp(t *testing.T) {
 // "behind but harmless" path: there is a gap but it contains no
 // encryption-relevant entries. The guard MUST pass.
 func TestGuardSidecarBehindRaftLog_GapNotCovered(t *testing.T) {
+	t.Parallel()
 	scanner := &fakeScanner{hit: false}
 	err := encryption.GuardSidecarBehindRaftLog(10, 50, scanner)
 	if err != nil {
@@ -178,6 +182,7 @@ func TestGuardSidecarBehindRaftLog_GapNotCovered(t *testing.T) {
 // entry. The guard MUST fire ErrSidecarBehindRaftLog and the
 // error annotation MUST include both indices.
 func TestGuardSidecarBehindRaftLog_GapCovered(t *testing.T) {
+	t.Parallel()
 	scanner := &fakeScanner{hit: true}
 	err := encryption.GuardSidecarBehindRaftLog(10, 50, scanner)
 	if !errors.Is(err, encryption.ErrSidecarBehindRaftLog) {
@@ -197,6 +202,7 @@ func TestGuardSidecarBehindRaftLog_GapCovered(t *testing.T) {
 // scanner failure (e.g., WAL corruption) differently from a
 // gap-coverage refusal.
 func TestGuardSidecarBehindRaftLog_ScannerError(t *testing.T) {
+	t.Parallel()
 	scannerErr := errors.New("simulated WAL corruption")
 	scanner := &fakeScanner{err: scannerErr}
 	err := encryption.GuardSidecarBehindRaftLog(10, 50, scanner)
@@ -217,6 +223,7 @@ func TestGuardSidecarBehindRaftLog_ScannerError(t *testing.T) {
 // A nil scanner in production is a wiring bug; the guard's job
 // is to be loud about it rather than silently accept the gap.
 func TestGuardSidecarBehindRaftLog_NilScanner(t *testing.T) {
+	t.Parallel()
 	err := encryption.GuardSidecarBehindRaftLog(10, 50, nil)
 	if !errors.Is(err, encryption.ErrSidecarBehindRaftLog) {
 		t.Fatalf("nil scanner with non-empty gap MUST fail closed with ErrSidecarBehindRaftLog; got %v", err)
@@ -229,6 +236,7 @@ func TestGuardSidecarBehindRaftLog_NilScanner(t *testing.T) {
 // is irrelevant — refusing here would force every non-encrypted
 // caller to wire a scanner just to get past the guard.
 func TestGuardSidecarBehindRaftLog_NilScanner_CaughtUp(t *testing.T) {
+	t.Parallel()
 	err := encryption.GuardSidecarBehindRaftLog(42, 42, nil)
 	if err != nil {
 		t.Errorf("caught-up case with nil scanner must pass; got %v", err)

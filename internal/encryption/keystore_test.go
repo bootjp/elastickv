@@ -11,6 +11,7 @@ import (
 )
 
 func TestKeystore_SetDEK(t *testing.T) {
+	t.Parallel()
 	ks := encryption.NewKeystore()
 	dek := make([]byte, encryption.KeySize)
 	if _, err := rand.Read(dek); err != nil {
@@ -33,6 +34,7 @@ func TestKeystore_SetDEK(t *testing.T) {
 // This is the type-safe alternative to a defensive []byte copy: the
 // signature itself enforces immutability of the live entry.
 func TestKeystore_DEK_ValueCopy(t *testing.T) {
+	t.Parallel()
 	ks := encryption.NewKeystore()
 	dek := make([]byte, encryption.KeySize)
 	dek[0] = 0xAA
@@ -58,6 +60,7 @@ func TestKeystore_DEK_ValueCopy(t *testing.T) {
 }
 
 func TestKeystore_AEAD_FoundAndMissing(t *testing.T) {
+	t.Parallel()
 	ks := encryption.NewKeystore()
 	dek := make([]byte, encryption.KeySize)
 	if _, err := rand.Read(dek); err != nil {
@@ -75,6 +78,7 @@ func TestKeystore_AEAD_FoundAndMissing(t *testing.T) {
 }
 
 func TestKeystore_Set_RejectsReservedKeyID(t *testing.T) {
+	t.Parallel()
 	ks := encryption.NewKeystore()
 	dek := make([]byte, encryption.KeySize)
 	err := ks.Set(encryption.ReservedKeyID, dek)
@@ -87,6 +91,7 @@ func TestKeystore_Set_RejectsReservedKeyID(t *testing.T) {
 }
 
 func TestKeystore_Set_RejectsBadKeySize(t *testing.T) {
+	t.Parallel()
 	ks := encryption.NewKeystore()
 	for _, n := range []int{0, 1, 16, 24, 31, 33, 64} {
 		err := ks.Set(7, make([]byte, n))
@@ -97,6 +102,7 @@ func TestKeystore_Set_RejectsBadKeySize(t *testing.T) {
 }
 
 func TestKeystore_Set_CopiesInput(t *testing.T) {
+	t.Parallel()
 	ks := encryption.NewKeystore()
 	dek := make([]byte, encryption.KeySize)
 	dek[0] = 0xAA
@@ -116,6 +122,7 @@ func TestKeystore_Set_CopiesInput(t *testing.T) {
 }
 
 func TestKeystore_Delete(t *testing.T) {
+	t.Parallel()
 	ks := encryption.NewKeystore()
 	dek := make([]byte, encryption.KeySize)
 	_ = ks.Set(1, dek)
@@ -132,6 +139,7 @@ func TestKeystore_Delete(t *testing.T) {
 }
 
 func TestKeystore_IDs_Sorted(t *testing.T) {
+	t.Parallel()
 	ks := encryption.NewKeystore()
 	dek := make([]byte, encryption.KeySize)
 	for _, id := range []uint32{5, 1, 9, 3, 7} {
@@ -152,6 +160,7 @@ func TestKeystore_IDs_Sorted(t *testing.T) {
 }
 
 func TestKeystore_Len(t *testing.T) {
+	t.Parallel()
 	ks := encryption.NewKeystore()
 	if ks.Len() != 0 {
 		t.Fatalf("empty Len() = %d, want 0", ks.Len())
@@ -172,6 +181,7 @@ func TestKeystore_Len(t *testing.T) {
 // readers should see consistent snapshots even while writers churn the
 // map. Run under -race.
 func TestKeystore_Concurrent(t *testing.T) {
+	t.Parallel()
 	ks := encryption.NewKeystore()
 	dek := make([]byte, encryption.KeySize)
 	dek[0] = 0xAA

@@ -75,6 +75,7 @@ func newTestKEK(t *testing.T, dir string, seed byte) kek.Wrapper {
 // configured, nothing to refuse" paths. Each sub-case represents a
 // legitimate startup posture that MUST be allowed.
 func TestCheckStartupGuards_OK(t *testing.T) {
+	t.Parallel()
 	t.Run("no_flag_no_sidecar", func(t *testing.T) {
 		// Plain unencrypted operation: flag off, no sidecar path
 		// supplied. This is the production posture for clusters that
@@ -150,6 +151,7 @@ func TestCheckStartupGuards_OK(t *testing.T) {
 // dir first, which would silently route new writes to cleartext
 // while old wrapped DEKs sit untouched on disk.
 func TestCheckStartupGuards_SidecarPresentWithoutFlag(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	k := newTestKEK(t, dir, 0x42)
 	wrapped, err := k.Wrap(make([]byte, 32))
@@ -173,6 +175,7 @@ func TestCheckStartupGuards_SidecarPresentWithoutFlag(t *testing.T) {
 // operator-intent level and continuing would mislead a sleepy
 // on-caller into thinking the cluster is encryption-capable.
 func TestCheckStartupGuards_KEKRequiredWithFlag(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	// Sidecar path is supplied but the file does not exist; what
 	// matters is the (flag, KEKConfigured) pair.
@@ -195,6 +198,7 @@ func TestCheckStartupGuards_KEKRequiredWithFlag(t *testing.T) {
 // under KEK B's wrap of a freshly-rotated DEK that the post-rotate
 // reads can never recover the prior values for).
 func TestCheckStartupGuards_KEKMismatch(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	wrappingKEK := newTestKEK(t, dir, 0x42)
 	wrappedUnderA, err := wrappingKEK.Wrap(make([]byte, 32))
@@ -221,6 +225,7 @@ func TestCheckStartupGuards_KEKMismatch(t *testing.T) {
 // production mismatch would require an operator to manually
 // re-derive which DEK failed.
 func TestCheckStartupGuards_KEKMismatch_RaftOnly(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	rightKEK := newTestKEK(t, dir, 0x42)
 	wrongKEK := newTestKEK(t, dir, 0xAA)
@@ -263,6 +268,7 @@ func TestCheckStartupGuards_KEKMismatch_RaftOnly(t *testing.T) {
 // that if iteration is by-insertion-order the wrong purpose
 // surfaces; sorted iteration always picks key_id=1 (storage).
 func TestCheckStartupGuards_KEKMismatch_DeterministicAnnotation(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	wrongKEK := newTestKEK(t, dir, 0xAA)
 	// Both DEKs wrapped under wrongKEK from the perspective of the
@@ -316,6 +322,7 @@ func TestCheckStartupGuards_KEKMismatch_DeterministicAnnotation(t *testing.T) {
 // This locks down the godoc claim that the helper "Returns nil
 // ... when ... the sidecar exists but has no wrapped DEKs".
 func TestCheckStartupGuards_EmptyWrappedSkipped(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	// Write a sidecar with two SidecarKey entries that BOTH have
 	// empty Wrapped bytes. validateSidecar requires Active.X to
@@ -350,6 +357,7 @@ func TestCheckStartupGuards_EmptyWrappedSkipped(t *testing.T) {
 // transient permission glitch could be misclassified as
 // "downgrade is safe."
 func TestCheckStartupGuards_SidecarStatError(t *testing.T) {
+	t.Parallel()
 	// A path that contains a NUL byte will make os.Stat fail
 	// with EINVAL on every platform we support, without
 	// requiring the test to set up perms or chroot. The exact
@@ -401,6 +409,7 @@ func writeTestSidecarWithEpoch(t *testing.T, dir string, wrapped []byte, localEp
 // the classic GCM catastrophic key-reuse pattern. Refuse to
 // start until the operator rotates.
 func TestCheckStartupGuards_LocalEpochExhausted_Storage(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	k := newTestKEK(t, dir, 0x42)
 	wrapped, err := k.Wrap(make([]byte, 32))
@@ -428,6 +437,7 @@ func TestCheckStartupGuards_LocalEpochExhausted_Storage(t *testing.T) {
 // >= 0xFFFE instead of == 0xFFFF would refuse a perfectly safe
 // DEK and force a spurious rotation.
 func TestCheckStartupGuards_LocalEpochExhausted_BoundaryNotFire(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	k := newTestKEK(t, dir, 0x42)
 	wrapped, err := k.Wrap(make([]byte, 32))
@@ -454,6 +464,7 @@ func TestCheckStartupGuards_LocalEpochExhausted_BoundaryNotFire(t *testing.T) {
 // (active id points elsewhere) with local_epoch=0xFFFF is harmless
 // — no new write will allocate a nonce under it.
 func TestCheckStartupGuards_LocalEpochExhausted_RetiredKeyIgnored(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	k := newTestKEK(t, dir, 0x42)
 	wrappedFresh, err := k.Wrap(make([]byte, 32))
@@ -495,6 +506,7 @@ func TestCheckStartupGuards_LocalEpochExhausted_RetiredKeyIgnored(t *testing.T) 
 // sequence the §5.1 protocol requires, so the probe returns nil
 // and leaves no sentinel file behind.
 func TestProbeSidecarFilesystem_OK(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	sidecarPath := filepath.Join(dir, "keys.json")
 	if err := encryption.ProbeSidecarFilesystem(sidecarPath); err != nil {
@@ -518,6 +530,7 @@ func TestProbeSidecarFilesystem_OK(t *testing.T) {
 // missing dir is a config error the operator must fix; filesystem
 // no-fsync is an environment problem that needs a different mount.
 func TestProbeSidecarFilesystem_MissingDir(t *testing.T) {
+	t.Parallel()
 	err := encryption.ProbeSidecarFilesystem("/nonexistent/elastickv-probe/keys.json")
 	if err == nil {
 		t.Fatal("expected error for missing parent directory")
@@ -534,6 +547,7 @@ func TestProbeSidecarFilesystem_MissingDir(t *testing.T) {
 // crash-durability for, so a non-fsync filesystem in the
 // sidecar dir is irrelevant — the probe must skip silently.
 func TestCheckStartupGuards_FilesystemProbe_RunsOnlyWhenEnabled(t *testing.T) {
+	t.Parallel()
 	// SidecarPath set, EncryptionEnabled=false → probe should
 	// not run (and even if it did, we'd hit the missing-dir
 	// branch rather than ErrUnsupportedFilesystem). Use a path
@@ -557,6 +571,7 @@ func TestCheckStartupGuards_FilesystemProbe_RunsOnlyWhenEnabled(t *testing.T) {
 // this ordering; without it the sidecar would be read first and
 // the parse error would mask the missing-KEK condition.
 func TestCheckStartupGuards_CorruptSidecarMissingKEK_RefusesWithKEKError(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	// Write a malformed sidecar — version=0 fails the ReadSidecar
 	// validation. Any unreadable file would do; we use malformed
@@ -587,6 +602,7 @@ func TestCheckStartupGuards_CorruptSidecarMissingKEK_RefusesWithKEKError(t *test
 // public API without bypassing validation. The assertion here
 // pins the format string of the parseErr-included path.
 func TestCheckStartupGuards_KEKMismatch_ParseErrIncluded(t *testing.T) {
+	t.Parallel()
 	// Sanity: the format string from startup.go must reference
 	// "parse error:" in the parseErr-included branch. Grepping
 	// the package source rather than executing the unreachable
