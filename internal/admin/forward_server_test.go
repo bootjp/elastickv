@@ -38,6 +38,7 @@ func mustJSON(t *testing.T, v any) []byte {
 }
 
 func TestForwardServer_RejectsMissingPrincipal(t *testing.T) {
+	t.Parallel()
 	srv := newForwardServerForTest(&stubTablesSource{tables: map[string]*DynamoTableSummary{}}, fullPrincipalRoleStore())
 	resp, err := srv.Forward(context.Background(), &pb.AdminForwardRequest{
 		Operation: pb.AdminOperation_ADMIN_OP_CREATE_TABLE,
@@ -48,6 +49,7 @@ func TestForwardServer_RejectsMissingPrincipal(t *testing.T) {
 }
 
 func TestForwardServer_RejectsUnknownAccessKey(t *testing.T) {
+	t.Parallel()
 	// A follower could forward a principal that the leader's
 	// role-store does not know about (rolling-update window). The
 	// leader must reject without ever touching the source.
@@ -64,6 +66,7 @@ func TestForwardServer_RejectsUnknownAccessKey(t *testing.T) {
 }
 
 func TestForwardServer_DemotesReadOnlyEvenIfFollowerSaidFull(t *testing.T) {
+	t.Parallel()
 	// Design Section 3.3.2 acceptance criterion 4: follower ships a
 	// "full" role but the leader's config is read-only. Result: 403.
 	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{}}
@@ -78,6 +81,7 @@ func TestForwardServer_DemotesReadOnlyEvenIfFollowerSaidFull(t *testing.T) {
 }
 
 func TestForwardServer_CreateTable_HappyPath(t *testing.T) {
+	t.Parallel()
 	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{}}
 	srv := newForwardServerForTest(src, fullPrincipalRoleStore())
 	body := CreateTableRequest{TableName: "users", PartitionKey: CreateTableAttribute{Name: "id", Type: "S"}}
@@ -98,6 +102,7 @@ func TestForwardServer_CreateTable_HappyPath(t *testing.T) {
 }
 
 func TestForwardServer_CreateTable_BadJSONReturns400(t *testing.T) {
+	t.Parallel()
 	srv := newForwardServerForTest(&stubTablesSource{tables: map[string]*DynamoTableSummary{}}, fullPrincipalRoleStore())
 	resp, err := srv.Forward(context.Background(), &pb.AdminForwardRequest{
 		Principal: &pb.AdminPrincipal{AccessKey: "AKIA_FULL", Role: "full"},
@@ -110,6 +115,7 @@ func TestForwardServer_CreateTable_BadJSONReturns400(t *testing.T) {
 }
 
 func TestForwardServer_CreateTable_AlreadyExistsReturns409(t *testing.T) {
+	t.Parallel()
 	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{
 		"users": {Name: "users", PartitionKey: "id"},
 	}}
@@ -125,6 +131,7 @@ func TestForwardServer_CreateTable_AlreadyExistsReturns409(t *testing.T) {
 }
 
 func TestForwardServer_DeleteTable_HappyPath(t *testing.T) {
+	t.Parallel()
 	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{
 		"users": {Name: "users"},
 	}}
@@ -142,6 +149,7 @@ func TestForwardServer_DeleteTable_HappyPath(t *testing.T) {
 }
 
 func TestForwardServer_DeleteTable_MissingReturns404(t *testing.T) {
+	t.Parallel()
 	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{}}
 	srv := newForwardServerForTest(src, fullPrincipalRoleStore())
 	resp, err := srv.Forward(context.Background(), &pb.AdminForwardRequest{
@@ -159,6 +167,7 @@ func TestForwardServer_DeleteTable_MissingReturns404(t *testing.T) {
 // `{"name":"users"}\x00{"extra":1}` would otherwise pass dec.More()
 // undetected. The handler now scans for NUL before decoding.
 func TestForwardServer_DeleteTable_RejectsNULBytePayload(t *testing.T) {
+	t.Parallel()
 	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{"users": {Name: "users"}}}
 	srv := newForwardServerForTest(src, fullPrincipalRoleStore())
 	resp, err := srv.Forward(context.Background(), &pb.AdminForwardRequest{
@@ -178,6 +187,7 @@ func TestForwardServer_DeleteTable_RejectsNULBytePayload(t *testing.T) {
 // HTTP path's slash rejection on forwarded delete requests so the
 // two surfaces cannot diverge (Codex P2).
 func TestForwardServer_DeleteTable_RejectsSlashInName(t *testing.T) {
+	t.Parallel()
 	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{}}
 	srv := newForwardServerForTest(src, fullPrincipalRoleStore())
 	resp, err := srv.Forward(context.Background(), &pb.AdminForwardRequest{
@@ -191,6 +201,7 @@ func TestForwardServer_DeleteTable_RejectsSlashInName(t *testing.T) {
 }
 
 func TestForwardServer_UnknownOperationRejected(t *testing.T) {
+	t.Parallel()
 	srv := newForwardServerForTest(&stubTablesSource{tables: map[string]*DynamoTableSummary{}}, fullPrincipalRoleStore())
 	resp, err := srv.Forward(context.Background(), &pb.AdminForwardRequest{
 		Principal: &pb.AdminPrincipal{AccessKey: "AKIA_FULL", Role: "full"},
@@ -208,6 +219,7 @@ func TestForwardServer_UnknownOperationRejected(t *testing.T) {
 // the HTTP path's 64 KiB limit; gRPC's own 4 MiB default is too
 // permissive for the admin surface.
 func TestForwardServer_CreateTable_PayloadTooLargeReturns413(t *testing.T) {
+	t.Parallel()
 	srv := newForwardServerForTest(&stubTablesSource{tables: map[string]*DynamoTableSummary{}}, fullPrincipalRoleStore())
 	oversize := make([]byte, adminForwardPayloadLimit+1)
 	for i := range oversize {
@@ -229,6 +241,7 @@ func TestForwardServer_CreateTable_PayloadTooLargeReturns413(t *testing.T) {
 // follower could smuggle silently-ignored fields the leader-direct
 // HTTP path would have rejected.
 func TestForwardServer_CreateTable_RejectsUnknownFields(t *testing.T) {
+	t.Parallel()
 	srv := newForwardServerForTest(&stubTablesSource{tables: map[string]*DynamoTableSummary{}}, fullPrincipalRoleStore())
 	resp, err := srv.Forward(context.Background(), &pb.AdminForwardRequest{
 		Principal: &pb.AdminPrincipal{AccessKey: "AKIA_FULL", Role: "full"},
@@ -244,6 +257,7 @@ func TestForwardServer_CreateTable_RejectsUnknownFields(t *testing.T) {
 // strict validation pulled in via decodeCreateTableRequest also
 // catches the slash-rejection rule the HTTP path enforces.
 func TestForwardServer_CreateTable_RejectsSlashInName(t *testing.T) {
+	t.Parallel()
 	srv := newForwardServerForTest(&stubTablesSource{tables: map[string]*DynamoTableSummary{}}, fullPrincipalRoleStore())
 	resp, err := srv.Forward(context.Background(), &pb.AdminForwardRequest{
 		Principal: &pb.AdminPrincipal{AccessKey: "AKIA_FULL", Role: "full"},
@@ -260,6 +274,7 @@ func TestForwardServer_CreateTable_RejectsSlashInName(t *testing.T) {
 // before the JSON decoder runs, regardless of how the gRPC layer
 // configures its own message limits.
 func TestForwardServer_DeleteTable_PayloadTooLargeReturns413(t *testing.T) {
+	t.Parallel()
 	srv := newForwardServerForTest(&stubTablesSource{tables: map[string]*DynamoTableSummary{}}, fullPrincipalRoleStore())
 	oversize := make([]byte, adminForwardPayloadLimit+1)
 	resp, err := srv.Forward(context.Background(), &pb.AdminForwardRequest{
@@ -272,6 +287,7 @@ func TestForwardServer_DeleteTable_PayloadTooLargeReturns413(t *testing.T) {
 }
 
 func TestForwardServer_CreateTable_GenericErrorReturns500(t *testing.T) {
+	t.Parallel()
 	// A non-sentinel error from the source must surface as 500 with
 	// a sanitised message. The leader logs the raw error; nothing
 	// reaches the follower except the structured response.
@@ -298,6 +314,7 @@ func TestForwardServer_CreateTable_GenericErrorReturns500(t *testing.T) {
 // dynamo_delete_failed so client retry/branching logic that
 // already handles the leader-direct path works unchanged.
 func TestForwardServer_DeleteTable_GenericErrorUsesOperationSpecificCode(t *testing.T) {
+	t.Parallel()
 	src := &stubTablesSource{
 		tables:    map[string]*DynamoTableSummary{"users": {Name: "users"}},
 		deleteErr: errors.New("storage backing sentinel DEL-1"),
@@ -324,6 +341,7 @@ func TestForwardServer_DeleteTable_GenericErrorUsesOperationSpecificCode(t *test
 // already know — Claude review on PR #635 flagged the gap (no test
 // exercised this code path despite the comment).
 func TestForwardServer_CreateTable_LeaderSteppedDownReturns503(t *testing.T) {
+	t.Parallel()
 	src := &stubTablesSource{createErr: ErrTablesNotLeader}
 	srv := newForwardServerForTest(src, fullPrincipalRoleStore())
 	resp, err := srv.Forward(context.Background(), &pb.AdminForwardRequest{
@@ -345,6 +363,7 @@ func TestForwardServer_CreateTable_LeaderSteppedDownReturns503(t *testing.T) {
 // TestForwardServer_DeleteTable_LeaderSteppedDownReturns503 mirrors
 // the create-side coverage on the delete path.
 func TestForwardServer_DeleteTable_LeaderSteppedDownReturns503(t *testing.T) {
+	t.Parallel()
 	src := &stubTablesSource{
 		tables:    map[string]*DynamoTableSummary{"users": {Name: "users"}},
 		deleteErr: ErrTablesNotLeader,
@@ -366,6 +385,7 @@ func TestForwardServer_DeleteTable_LeaderSteppedDownReturns503(t *testing.T) {
 // able to split a single audit/error line into two when slog is
 // using a text-format handler. Claude review on PR #635.
 func TestForwardServer_SanitisesForwardedFromInLog(t *testing.T) {
+	t.Parallel()
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{}}
@@ -396,6 +416,7 @@ func TestForwardServer_SanitisesForwardedFromInLog(t *testing.T) {
 // the forward path, forwarded failures were operationally invisible
 // (Codex P2 on PR #635).
 func TestForwardServer_LogsUnexpectedSourceError(t *testing.T) {
+	t.Parallel()
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelError}))
 	src := &stubTablesSource{createErr: errors.New("storage sentinel SENT-42")}
@@ -420,6 +441,7 @@ func TestForwardServer_LogsUnexpectedSourceError(t *testing.T) {
 // client-side outcomes, not server regressions, so logging them
 // at LevelError would drown the operational signal.
 func TestForwardServer_DoesNotLogStructuredSourceErrors(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name string
 		err  error
@@ -456,6 +478,7 @@ func newForwardServerWithBucketsForTest(buckets BucketsSource, roles MapRoleStor
 }
 
 func TestForwardServer_CreateBucket_HappyPath(t *testing.T) {
+	t.Parallel()
 	buckets := &stubBucketsSource{}
 	srv := newForwardServerWithBucketsForTest(buckets, fullPrincipalRoleStore())
 	body := CreateBucketRequest{BucketName: "public-assets", ACL: "public-read"}
@@ -475,6 +498,7 @@ func TestForwardServer_CreateBucket_HappyPath(t *testing.T) {
 }
 
 func TestForwardServer_BucketOps_NoBucketsSourceReturns501(t *testing.T) {
+	t.Parallel()
 	// Builds without S3 do not call WithBucketsSource; the leader
 	// must still reject every bucket operation cleanly with 501
 	// instead of reaching for a nil receiver and panicking. Sweep
@@ -518,6 +542,7 @@ func TestForwardServer_BucketOps_NoBucketsSourceReturns501(t *testing.T) {
 }
 
 func TestForwardServer_DynamoOps_NoTablesSourceReturns501(t *testing.T) {
+	t.Parallel()
 	// S3-only deployments construct ForwardServer with a nil
 	// TablesSource so leaders can still register the gRPC service
 	// for follower-forwarded bucket writes. Dynamo operations must
@@ -558,6 +583,7 @@ func TestForwardServer_DynamoOps_NoTablesSourceReturns501(t *testing.T) {
 }
 
 func TestForwardServer_CreateBucket_RejectsWhitespacePaddedName(t *testing.T) {
+	t.Parallel()
 	// Validation parity with the HTTP path's
 	// validateCreateBucketRequest: a name like " bucket " must
 	// produce the same 400 invalid_body the leader-direct path
@@ -576,6 +602,7 @@ func TestForwardServer_CreateBucket_RejectsWhitespacePaddedName(t *testing.T) {
 }
 
 func TestForwardServer_CreateBucket_BadJSONReturns400(t *testing.T) {
+	t.Parallel()
 	srv := newForwardServerWithBucketsForTest(&stubBucketsSource{}, fullPrincipalRoleStore())
 	resp, err := srv.Forward(context.Background(), &pb.AdminForwardRequest{
 		Principal: &pb.AdminPrincipal{AccessKey: "AKIA_FULL", Role: "full"},
@@ -588,6 +615,7 @@ func TestForwardServer_CreateBucket_BadJSONReturns400(t *testing.T) {
 }
 
 func TestForwardServer_CreateBucket_AlreadyExistsReturns409(t *testing.T) {
+	t.Parallel()
 	buckets := &stubBucketsSource{
 		buckets:   map[string]BucketSummary{"existing": {Name: "existing"}},
 		createErr: ErrBucketsAlreadyExists,
@@ -604,6 +632,7 @@ func TestForwardServer_CreateBucket_AlreadyExistsReturns409(t *testing.T) {
 }
 
 func TestForwardServer_DeleteBucket_HappyPath(t *testing.T) {
+	t.Parallel()
 	buckets := &stubBucketsSource{
 		buckets: map[string]BucketSummary{"orders": {Name: "orders"}},
 	}
@@ -619,6 +648,7 @@ func TestForwardServer_DeleteBucket_HappyPath(t *testing.T) {
 }
 
 func TestForwardServer_DeleteBucket_NotEmptyReturns409(t *testing.T) {
+	t.Parallel()
 	buckets := &stubBucketsSource{deleteErr: ErrBucketsNotEmpty}
 	srv := newForwardServerWithBucketsForTest(buckets, fullPrincipalRoleStore())
 	resp, err := srv.Forward(context.Background(), &pb.AdminForwardRequest{
@@ -632,6 +662,7 @@ func TestForwardServer_DeleteBucket_NotEmptyReturns409(t *testing.T) {
 }
 
 func TestForwardServer_DeleteBucket_RejectsSlashInName(t *testing.T) {
+	t.Parallel()
 	srv := newForwardServerWithBucketsForTest(&stubBucketsSource{}, fullPrincipalRoleStore())
 	resp, err := srv.Forward(context.Background(), &pb.AdminForwardRequest{
 		Principal: &pb.AdminPrincipal{AccessKey: "AKIA_FULL", Role: "full"},
@@ -644,6 +675,7 @@ func TestForwardServer_DeleteBucket_RejectsSlashInName(t *testing.T) {
 }
 
 func TestForwardServer_PutBucketAcl_HappyPath(t *testing.T) {
+	t.Parallel()
 	buckets := &stubBucketsSource{
 		buckets: map[string]BucketSummary{"orders": {Name: "orders", ACL: "private"}},
 	}
@@ -660,6 +692,7 @@ func TestForwardServer_PutBucketAcl_HappyPath(t *testing.T) {
 }
 
 func TestForwardServer_PutBucketAcl_RejectsMissingACL(t *testing.T) {
+	t.Parallel()
 	srv := newForwardServerWithBucketsForTest(&stubBucketsSource{}, fullPrincipalRoleStore())
 	resp, err := srv.Forward(context.Background(), &pb.AdminForwardRequest{
 		Principal: &pb.AdminPrincipal{AccessKey: "AKIA_FULL", Role: "full"},
@@ -672,6 +705,7 @@ func TestForwardServer_PutBucketAcl_RejectsMissingACL(t *testing.T) {
 }
 
 func TestForwardServer_PutBucketAcl_RejectsSlashInName(t *testing.T) {
+	t.Parallel()
 	srv := newForwardServerWithBucketsForTest(&stubBucketsSource{}, fullPrincipalRoleStore())
 	resp, err := srv.Forward(context.Background(), &pb.AdminForwardRequest{
 		Principal: &pb.AdminPrincipal{AccessKey: "AKIA_FULL", Role: "full"},
@@ -683,6 +717,7 @@ func TestForwardServer_PutBucketAcl_RejectsSlashInName(t *testing.T) {
 }
 
 func TestForwardServer_BucketOps_PayloadTooLargeReturns413(t *testing.T) {
+	t.Parallel()
 	cases := []pb.AdminOperation{
 		pb.AdminOperation_ADMIN_OP_CREATE_BUCKET,
 		pb.AdminOperation_ADMIN_OP_DELETE_BUCKET,

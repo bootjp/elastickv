@@ -13,6 +13,7 @@ import (
 )
 
 func TestClusterHandler_HappyPath(t *testing.T) {
+	t.Parallel()
 	source := ClusterInfoFunc(func(_ context.Context) (ClusterInfo, error) {
 		return ClusterInfo{
 			NodeID:  "node-1",
@@ -39,6 +40,7 @@ func TestClusterHandler_HappyPath(t *testing.T) {
 }
 
 func TestClusterHandler_PreservesExplicitTimestamp(t *testing.T) {
+	t.Parallel()
 	ts := time.Date(2026, 4, 24, 10, 0, 0, 0, time.UTC)
 	source := ClusterInfoFunc(func(_ context.Context) (ClusterInfo, error) {
 		return ClusterInfo{NodeID: "n", Version: "v", Timestamp: ts}, nil
@@ -54,6 +56,7 @@ func TestClusterHandler_PreservesExplicitTimestamp(t *testing.T) {
 }
 
 func TestClusterHandler_SourceErrorReturns500(t *testing.T) {
+	t.Parallel()
 	source := ClusterInfoFunc(func(_ context.Context) (ClusterInfo, error) {
 		return ClusterInfo{}, errors.New("raft storage sentinel XYZ123")
 	})
@@ -70,6 +73,7 @@ func TestClusterHandler_SourceErrorReturns500(t *testing.T) {
 }
 
 func TestClusterHandler_OnlyGET(t *testing.T) {
+	t.Parallel()
 	h := NewClusterHandler(ClusterInfoFunc(func(_ context.Context) (ClusterInfo, error) {
 		return ClusterInfo{}, nil
 	}))
