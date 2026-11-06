@@ -9,12 +9,14 @@ import (
 )
 
 func TestAttributeValue_UnmarshalJSON_RejectsEmptyObject(t *testing.T) {
+	t.Parallel()
 	var a attributeValue
 	err := json.Unmarshal([]byte(`{}`), &a)
 	require.Error(t, err)
 }
 
 func TestAttributeValue_HasStringType_IsExplicit(t *testing.T) {
+	t.Parallel()
 	var zero attributeValue
 	require.False(t, zero.hasStringType())
 
@@ -28,6 +30,7 @@ func TestAttributeValue_HasStringType_IsExplicit(t *testing.T) {
 }
 
 func TestAttributeValue_UnmarshalJSON_RejectsNullListAndMap(t *testing.T) {
+	t.Parallel()
 	var listAttr attributeValue
 	err := json.Unmarshal([]byte(`{"L":null}`), &listAttr)
 	require.Error(t, err)
@@ -38,12 +41,14 @@ func TestAttributeValue_UnmarshalJSON_RejectsNullListAndMap(t *testing.T) {
 }
 
 func TestAttributeValue_UnmarshalJSON_RejectsNullFalse(t *testing.T) {
+	t.Parallel()
 	var a attributeValue
 	err := json.Unmarshal([]byte(`{"NULL":false}`), &a)
 	require.Error(t, err)
 }
 
 func TestAttributeValue_MarshalJSON_NormalizesNullTrue(t *testing.T) {
+	t.Parallel()
 	falseVal := false
 	a := attributeValue{NULL: &falseVal}
 	b, err := json.Marshal(a)
@@ -52,6 +57,7 @@ func TestAttributeValue_MarshalJSON_NormalizesNullTrue(t *testing.T) {
 }
 
 func TestAttributeValue_UnmarshalJSON_RejectsExcessiveListNesting(t *testing.T) {
+	t.Parallel()
 	var a attributeValue
 
 	err := json.Unmarshal([]byte(nestedListAttributeJSON(maxAttributeValueNestingDepth+1)), &a)
@@ -61,6 +67,7 @@ func TestAttributeValue_UnmarshalJSON_RejectsExcessiveListNesting(t *testing.T) 
 }
 
 func TestAttributeValue_UnmarshalJSON_AllowsMaxMapNestingDepth(t *testing.T) {
+	t.Parallel()
 	var a attributeValue
 
 	err := json.Unmarshal([]byte(nestedMapAttributeJSON(maxAttributeValueNestingDepth-1)), &a)

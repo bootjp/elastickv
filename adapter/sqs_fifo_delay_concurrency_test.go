@@ -15,6 +15,7 @@ import (
 )
 
 func TestSQSFIFODelayConcurrentConfiguration(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	t.Cleanup(func() { require.NoError(t, st.Close()) })
 	srv := newDelayTestServer(t, st)
@@ -76,6 +77,7 @@ func (c *fifoDelayFaultCoordinator) Dispatch(ctx context.Context, req *kv.Operat
 }
 
 func TestSQSFIFODelayUnknownOutcomeRecovery(t *testing.T) {
+	t.Parallel()
 	for _, applied := range []bool{false, true} {
 		t.Run(fmt.Sprint(applied), func(t *testing.T) {
 			st := store.NewMVCCStore()
@@ -105,6 +107,7 @@ func TestSQSFIFODelayUnknownOutcomeRecovery(t *testing.T) {
 }
 
 func TestSQSFIFODelayInitialFenceUnknownOutcome(t *testing.T) {
+	t.Parallel()
 	for _, applied := range []bool{false, true} {
 		t.Run(fmt.Sprint(applied), func(t *testing.T) {
 			st := store.NewMVCCStore()
@@ -130,6 +133,7 @@ func TestSQSFIFODelayInitialFenceUnknownOutcome(t *testing.T) {
 }
 
 func TestSQSFIFODelayDeleteDuringBackfill(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	t.Cleanup(func() { require.NoError(t, st.Close()) })
 	srv := newDelayTestServer(t, st)
@@ -162,6 +166,7 @@ func TestSQSFIFODelayDeleteDuringBackfill(t *testing.T) {
 }
 
 func TestSQSFIFOIndexedHeadExpiryRemovesMembership(t *testing.T) {
+	t.Parallel()
 	for _, partitions := range []uint32{1, 4} {
 		for _, reaper := range []bool{false, true} {
 			t.Run(fmt.Sprintf("partitions_%d/reaper_%t", partitions, reaper), func(t *testing.T) {
@@ -203,6 +208,7 @@ func TestSQSFIFOIndexedHeadExpiryRemovesMembership(t *testing.T) {
 }
 
 func TestSQSFIFOOrderPrefixDoesNotAlias(t *testing.T) {
+	t.Parallel()
 	meta := &sqsQueueMeta{Name: fifoDelayTestQueue, Generation: 1, PartitionCount: 4}
 	for _, group := range []string{"g", "gg", "g\x00", "g|", "g/", ""} {
 		prefix := sqsFifoOrderPrefix(meta, meta.Name, 0, meta.Generation, group)
@@ -217,6 +223,7 @@ func TestSQSFIFOOrderPrefixDoesNotAlias(t *testing.T) {
 }
 
 func TestSQSFIFODelayReadFailureDoesNotAdvance(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	t.Cleanup(func() { require.NoError(t, st.Close()) })
 	srv := newDelayTestServer(t, st)
@@ -240,6 +247,7 @@ func TestSQSFIFODelayReadFailureDoesNotAdvance(t *testing.T) {
 }
 
 func TestSQSFIFODelayDeleteRecreateCleansMembership(t *testing.T) {
+	t.Parallel()
 	for _, partitions := range []uint32{1, 4} {
 		t.Run(fmt.Sprint(partitions), func(t *testing.T) {
 			st := store.NewMVCCStore()

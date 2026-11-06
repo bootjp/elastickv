@@ -246,6 +246,7 @@ func runSelectedHeadCleanup(t *testing.T, partitions uint32, redrive, owned bool
 }
 
 func TestSQSSelectedHeadRetentionExpiry(t *testing.T) {
+	t.Parallel()
 	for _, partitions := range []uint32{1, 4} {
 		for _, owned := range []bool{false, true} {
 			t.Run(fmt.Sprintf("partitions_%d/owned_%t", partitions, owned), func(t *testing.T) {
@@ -256,6 +257,7 @@ func TestSQSSelectedHeadRetentionExpiry(t *testing.T) {
 }
 
 func TestSQSSelectedHeadRedrive(t *testing.T) {
+	t.Parallel()
 	for _, partitions := range []uint32{1, 4} {
 		for _, owned := range []bool{false, true} {
 			t.Run(fmt.Sprintf("partitions_%d/owned_%t", partitions, owned), func(t *testing.T) {
@@ -266,6 +268,7 @@ func TestSQSSelectedHeadRedrive(t *testing.T) {
 }
 
 func TestSQSSelectedHeadCleanupJoinedErrors(t *testing.T) {
+	t.Parallel()
 	for _, fault := range []struct {
 		name string
 		err  error
@@ -335,6 +338,7 @@ func runSelectedHeadCleanupFault(t *testing.T, partitions uint32, redrive bool, 
 }
 
 func TestSQSSelectedHeadSingleRotationPerSnapshot(t *testing.T) {
+	t.Parallel()
 	for _, partitions := range []uint32{1, 4} {
 		t.Run(fmt.Sprintf("partitions_%d", partitions), func(t *testing.T) {
 			f, coord := newSelectedHeadFixture(t, partitions, 33)
@@ -416,6 +420,7 @@ func selectedHeadAddDecoys(t *testing.T, f *fifoProgressFixture) []selectedHeadS
 }
 
 func TestSQSSelectedHeadSelectionFilters(t *testing.T) {
+	t.Parallel()
 	for _, partitions := range []uint32{1, 4} {
 		t.Run(fmt.Sprintf("partitions_%d", partitions), func(t *testing.T) {
 			f, coord := newSelectedHeadFixture(t, partitions, 4)

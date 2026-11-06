@@ -61,6 +61,7 @@ func redisOwnedTestServer(owner *redisTestOwnership) *RedisServer {
 }
 
 func TestRedisRequestAdmissionBeforeHeavyExecution(t *testing.T) {
+	t.Parallel()
 	owner := &redisTestOwnership{ctx: context.WithValue(context.Background(), redisOwnershipTestKey{}, "captured")}
 	s := redisOwnedTestServer(owner)
 	mints := 0
@@ -106,6 +107,7 @@ func (s *redisOwnershipReadStore) ScanAt(ctx context.Context, start, end []byte,
 }
 
 func TestRedisRequestAdmissionHashReads(t *testing.T) {
+	t.Parallel()
 	for _, name := range []string{cmdHGet, cmdHGetAll} {
 		t.Run(name, func(t *testing.T) {
 			owner := &redisTestOwnership{ctx: context.WithValue(context.Background(), redisOwnershipTestKey{}, "hash-owner")}
@@ -139,6 +141,7 @@ func TestRedisRequestAdmissionHashReads(t *testing.T) {
 }
 
 func TestRedisRequestAdmissionDirectReadAndResponse(t *testing.T) {
+	t.Parallel()
 	for _, revoke := range []bool{false, true} {
 		t.Run(map[bool]string{false: "live", true: "revoked"}[revoke], func(t *testing.T) {
 			owner := &redisTestOwnership{ctx: context.WithValue(context.Background(), redisOwnershipTestKey{}, "captured")}
@@ -174,6 +177,7 @@ func TestRedisRequestAdmissionDirectReadAndResponse(t *testing.T) {
 }
 
 func TestRedisRequestAdmissionFinishChecksBeforeResponse(t *testing.T) {
+	t.Parallel()
 	owner := &redisTestOwnership{ctx: context.Background()}
 	owner.onFinish = func() { owner.revoked.Store(true) }
 	s := redisOwnedTestServer(owner)
@@ -186,6 +190,7 @@ func TestRedisRequestAdmissionFinishChecksBeforeResponse(t *testing.T) {
 }
 
 func TestRedisRequestAdmissionJoinsBeforePublishing(t *testing.T) {
+	t.Parallel()
 	owner := &redisTestOwnership{ctx: context.Background()}
 	finishing, release, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	owner.onFinish = func() { close(finishing); <-release }
@@ -204,6 +209,7 @@ func TestRedisRequestAdmissionJoinsBeforePublishing(t *testing.T) {
 }
 
 func TestRedisRequestAdmissionUnknownCommandsFailClosed(t *testing.T) {
+	t.Parallel()
 	for _, name := range []string{"UNOWNED-DETACH", "FUTURE-COMMAND"} {
 		t.Run(name, func(t *testing.T) {
 			owner := &redisTestOwnership{ctx: context.Background()}
@@ -222,6 +228,7 @@ func TestRedisRequestAdmissionUnknownCommandsFailClosed(t *testing.T) {
 }
 
 func TestRedisRequestAdmissionFullSlotAndPanicRelease(t *testing.T) {
+	t.Parallel()
 	owner := &redisTestOwnership{ctx: context.Background()}
 	s := redisOwnedTestServer(owner)
 	s.heavyCommandLimiter = newRedisHeavyCommandLimiter(1)
@@ -242,6 +249,7 @@ func TestRedisRequestAdmissionFullSlotAndPanicRelease(t *testing.T) {
 }
 
 func TestRedisRequestAdmissionInvalidHookAndLegacy(t *testing.T) {
+	t.Parallel()
 	for _, hook := range []RequestAdmission{
 		func(context.Context) (RequestOwnership, error) { return nil, nil },
 		func(context.Context) (RequestOwnership, error) { return nil, errRedisAdmission },
@@ -260,6 +268,7 @@ func TestRedisRequestAdmissionInvalidHookAndLegacy(t *testing.T) {
 }
 
 func TestRedisRequestAdmissionDoesNotEnqueueDetachedMaintenance(t *testing.T) {
+	t.Parallel()
 	base := store.NewMVCCStore()
 	t.Cleanup(func() { require.NoError(t, base.Close()) })
 	compactor := NewDeltaCompactor(base, newLocalAdapterCoordinator(base))
@@ -272,6 +281,7 @@ func TestRedisRequestAdmissionDoesNotEnqueueDetachedMaintenance(t *testing.T) {
 }
 
 func TestRedisRequestAdmissionFinishPanicIsNotRetried(t *testing.T) {
+	t.Parallel()
 	owner := &redisTestOwnership{ctx: context.Background(), onFinish: func() { panic("finish panic") }}
 	s := redisOwnedTestServer(owner)
 	c := &redisOwnedTestConn{}
@@ -284,6 +294,7 @@ func TestRedisRequestAdmissionFinishPanicIsNotRetried(t *testing.T) {
 }
 
 func TestRedisRequestAdmissionCancelledCaptureDoesNotExecute(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	owner := &redisTestOwnership{ctx: ctx}

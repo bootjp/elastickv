@@ -21,6 +21,7 @@ import (
 )
 
 func TestOwnershipRefreshConsumerObsoleteProofDoesNotStarveCurrentOwner(t *testing.T) {
+	t.Parallel()
 	root, active := ownershipRefreshCatalog(t)
 	snapshot, err := root.catalog.Snapshot(t.Context())
 	require.NoError(t, err)
@@ -80,6 +81,7 @@ func seedOwnershipRefreshState(t *testing.T, writer store.MigrationOwnershipStor
 }
 
 func TestOwnershipRefreshConsumerSequentialSplitRequiresRemainingRangeReacquisition(t *testing.T) {
+	t.Parallel()
 	root, original := ownershipRefreshCatalog(t)
 	snapshot := advanceOwnershipRefreshCatalog(t, root, 12)
 	original.CatalogVersion = snapshot.Version
@@ -227,6 +229,7 @@ func ownershipRefreshConsumer(t *testing.T, st store.MVCCStore, root pb.Distribu
 }
 
 func TestOwnershipRefreshConsumerRejectsConfigurationInterleaving(t *testing.T) {
+	t.Parallel()
 	root, prior := ownershipRefreshCatalog(t)
 	rootClient, closeClient := newBufconnDistributionClient(t, root)
 	defer closeClient()
@@ -259,6 +262,7 @@ func (c refreshProbeClient) ProbeMigrationState(ctx context.Context, req *pb.Pro
 }
 
 func TestOwnershipRefreshConsumerRetriesExactAppliedAckWithoutNewProposal(t *testing.T) {
+	t.Parallel()
 	root, prior := ownershipRefreshCatalog(t)
 	rootClient, closeClient := newBufconnDistributionClient(t, root)
 	defer closeClient()
@@ -285,6 +289,7 @@ func TestOwnershipRefreshConsumerRetriesExactAppliedAckWithoutNewProposal(t *tes
 }
 
 func TestOwnershipRefreshConsumerRejectsLegacyAndGenerationMismatch(t *testing.T) {
+	t.Parallel()
 	for _, mismatch := range []string{"legacy", "legacy v1", "generation", "configuration", "exact proof", "closed readiness"} {
 		t.Run(mismatch, func(t *testing.T) {
 			root, prior := ownershipRefreshCatalog(t)
@@ -321,6 +326,7 @@ func TestOwnershipRefreshConsumerRejectsLegacyAndGenerationMismatch(t *testing.T
 }
 
 func TestOwnershipRefreshConsumerRetainsNonownerAndNativeStateOnRestart(t *testing.T) {
+	t.Parallel()
 	root, prior := ownershipRefreshCatalog(t)
 	prior = proto.CloneOf(prior)
 	prior.LocalGroupId, prior.Role = 9, pb.MigrationOwnershipRole_MIGRATION_OWNERSHIP_ROLE_NONOWNER
@@ -356,6 +362,7 @@ func TestOwnershipRefreshConsumerRetainsNonownerAndNativeStateOnRestart(t *testi
 }
 
 func TestOwnershipRefreshConsumerRejectsUnsupportedRoot(t *testing.T) {
+	t.Parallel()
 	_, prior := ownershipRefreshCatalog(t)
 	rootClient, closeClient := newBufconnDistributionClient(t, &pb.UnimplementedDistributionServer{})
 	defer closeClient()
@@ -366,6 +373,7 @@ func TestOwnershipRefreshConsumerRejectsUnsupportedRoot(t *testing.T) {
 }
 
 func TestOwnershipRefreshConsumerRotatesGroupsAfterExhaustedBudget(t *testing.T) {
+	t.Parallel()
 	root, prior := ownershipRefreshCatalog(t)
 	rootClient, closeClient := newBufconnDistributionClient(t, root)
 	defer closeClient()
@@ -385,6 +393,7 @@ func TestOwnershipRefreshConsumerRotatesGroupsAfterExhaustedBudget(t *testing.T)
 }
 
 func TestOwnershipRefreshConsumerReplicatesWithoutJobHistory(t *testing.T) {
+	t.Parallel()
 	root, prior := ownershipRefreshCatalog(t)
 	rootClient, closeClient := newBufconnDistributionClient(t, root)
 	defer closeClient()
@@ -431,6 +440,7 @@ func ownershipRefreshCatalog(t *testing.T) (*DistributionServer, *pb.MigrationOw
 }
 
 func TestOwnershipAttestationRPCUsesCommittedCatalogWithoutJobHistory(t *testing.T) {
+	t.Parallel()
 	server, prior := ownershipRefreshCatalog(t)
 	client, closeClient := newBufconnDistributionClient(t, server)
 	defer closeClient()
@@ -445,6 +455,7 @@ func TestOwnershipAttestationRPCUsesCommittedCatalogWithoutJobHistory(t *testing
 }
 
 func TestOwnershipAttestationRPCPreservesProtocolTwoSourceBoundary(t *testing.T) {
+	t.Parallel()
 	server, prior := ownershipRefreshCatalog(t)
 	prior.WriteFloorKnown, prior.SourceTrackerVersion, prior.SourceAppliedIndex = true, 1, 10
 	client, closeClient := newBufconnDistributionClient(t, server)
@@ -470,6 +481,7 @@ func (s legacyOwnershipAttestationServer) AttestMigrationOwnership(context.Conte
 }
 
 func TestOwnershipRefreshConsumerRejectsProtocolOneRoot(t *testing.T) {
+	t.Parallel()
 	_, prior := ownershipRefreshCatalog(t)
 	refreshed := proto.CloneOf(prior)
 	refreshed.CatalogVersion = 2
@@ -481,6 +493,7 @@ func TestOwnershipRefreshConsumerRejectsProtocolOneRoot(t *testing.T) {
 }
 
 func TestOwnershipAttestationRPCRequiresMigrationCredential(t *testing.T) {
+	t.Parallel()
 	for _, enforced := range []bool{false, true} {
 		unary, _ := SplitMigrationTokenAuth(t.Name(), false, enforced)
 		for _, token := range []string{"", "other", t.Name()} {

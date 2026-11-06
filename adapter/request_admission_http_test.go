@@ -32,6 +32,7 @@ func (o *testRequestOwnership) Finish(err error) error {
 func (o *testRequestOwnership) CancelAndJoin() { o.joined = true }
 
 func TestHTTPRequestAdmissionRejectsBeforeHandler(t *testing.T) {
+	t.Parallel()
 	called := false
 	handler := withHTTPRequestAdmission(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { called = true }),
 		func(context.Context) (RequestOwnership, error) { return nil, errRequestRevoked })
@@ -42,6 +43,7 @@ func TestHTTPRequestAdmissionRejectsBeforeHandler(t *testing.T) {
 }
 
 func TestHTTPRequestAdmissionRetainsRequestContext(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	owner := &testRequestOwnership{ctx: ctx}
@@ -58,6 +60,7 @@ func TestHTTPRequestAdmissionRetainsRequestContext(t *testing.T) {
 }
 
 func TestHTTPRequestAdmissionDiscardsStaleDirectRead(t *testing.T) {
+	t.Parallel()
 	owner := &testRequestOwnership{ctx: t.Context()}
 	handler := withHTTPRequestAdmission(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		owner.revoked = true
@@ -73,6 +76,7 @@ func TestHTTPRequestAdmissionDiscardsStaleDirectRead(t *testing.T) {
 }
 
 func TestHTTPRequestAdmissionAbortsStalePartialStream(t *testing.T) {
+	t.Parallel()
 	owner := &testRequestOwnership{ctx: t.Context()}
 	handler := withHTTPRequestAdmission(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, err := w.Write([]byte("current"))

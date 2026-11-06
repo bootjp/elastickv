@@ -11,6 +11,7 @@ import (
 )
 
 func TestSplitPartitionLedgerRequiresMigrationAuthentication(t *testing.T) {
+	t.Parallel()
 	key, err := distribution.CatalogOwnershipPartitionKey(3, make([]byte, 32))
 	require.NoError(t, err)
 	for _, prefix := range []string{"", "!txn|int|", "!txn|lock|"} {
@@ -36,6 +37,7 @@ func TestSplitPartitionLedgerRequiresMigrationAuthentication(t *testing.T) {
 }
 
 func TestSplitPartitionLedgerPrefixAuthorization(t *testing.T) {
+	t.Parallel()
 	for _, key := range []string{"!dist|meta|ownership_partition/", "!dist|meta|ownership_partition",
 		"!txn|int|!dist|meta|ownership_partition/", "!txn|lock|!dist|meta|ownership_partition"} {
 		require.True(t, splitJobControlMutation(&pb.Mutation{Op: pb.Op_DEL_PREFIX, Key: []byte(key)}), key)

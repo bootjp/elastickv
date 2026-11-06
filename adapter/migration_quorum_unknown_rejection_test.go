@@ -12,6 +12,7 @@ import (
 )
 
 func TestQuorumGuardRejectionProvesAbsentBeforeReattempt(t *testing.T) {
+	t.Parallel()
 	var events []string
 	attempts := 0
 	err := retryQuorumGuardRejection(t.Context(), func() error {
@@ -30,6 +31,7 @@ func TestQuorumGuardRejectionProvesAbsentBeforeReattempt(t *testing.T) {
 }
 
 func TestQuorumGuardRejectionStopsOnFailedProof(t *testing.T) {
+	t.Parallel()
 	failed := errors.New("persisted version or missing guard")
 	attempts := 0
 	err := retryQuorumGuardRejection(t.Context(), func() error {
@@ -41,6 +43,7 @@ func TestQuorumGuardRejectionStopsOnFailedProof(t *testing.T) {
 }
 
 func TestQuorumGuardRejectionDoesNotRetryOtherOutcomes(t *testing.T) {
+	t.Parallel()
 	for index, outcome := range []error{nil, kv.ErrRouteCutoverPending, errors.Join(kv.ErrTransactionOutcomeUnknown, context.DeadlineExceeded)} {
 		t.Run(fmt.Sprint(index), func(t *testing.T) {
 			attempts := 0

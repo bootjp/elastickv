@@ -23,6 +23,7 @@ func TestRedisPeerLimiterDefaultMatchesProxyPool(t *testing.T) {
 }
 
 func TestRedisPeerLimiterRejectsAndReleases(t *testing.T) {
+	t.Parallel()
 	server := NewRedisServer(nil, "", nil, nil, nil, nil, WithRedisPerPeerConnectionLimit(testPeerLimit))
 	c1 := &remoteCommandRecorder{remote: "192.168.0.64:10001"}
 	c2 := &remoteCommandRecorder{remote: "192.168.0.64:10002"}
@@ -43,6 +44,7 @@ func TestRedisPeerLimiterRejectsAndReleases(t *testing.T) {
 }
 
 func TestRedisPeerLimiterKeepsDetachedPubSubCountUntilCleanup(t *testing.T) {
+	t.Parallel()
 	server := NewRedisServer(nil, "", nil, nil, nil, nil, WithRedisPerPeerConnectionLimit(1))
 	conn := &remoteCommandRecorder{remote: "192.168.0.64:10001"}
 	next := &remoteCommandRecorder{remote: "192.168.0.64:10002"}
@@ -59,6 +61,7 @@ func TestRedisPeerLimiterKeepsDetachedPubSubCountUntilCleanup(t *testing.T) {
 }
 
 func TestRedisPeerLimiterDetachedPubSubReleaseIsIdempotent(t *testing.T) {
+	t.Parallel()
 	server := NewRedisServer(nil, "", nil, nil, nil, nil, WithRedisPerPeerConnectionLimit(testPeerLimit))
 	pubsub := &remoteCommandRecorder{remote: "192.168.0.64:10001"}
 	other := &remoteCommandRecorder{remote: "192.168.0.64:10002"}
@@ -82,6 +85,7 @@ func TestRedisPeerLimiterDetachedPubSubReleaseIsIdempotent(t *testing.T) {
 }
 
 func TestRedisLeaderClientPoolStaysBelowPeerLimit(t *testing.T) {
+	t.Parallel()
 	server := NewRedisServer(nil, "", nil, nil, nil, nil, WithRedisPerPeerConnectionLimit(2))
 	client := server.getOrCreateLeaderClient("127.0.0.1:6379")
 	defer client.Close()
@@ -90,6 +94,7 @@ func TestRedisLeaderClientPoolStaysBelowPeerLimit(t *testing.T) {
 }
 
 func TestRedisLeaderClientPoolUsesSmallDefault(t *testing.T) {
+	t.Parallel()
 	server := NewRedisServer(nil, "", nil, nil, nil, nil, WithRedisPerPeerConnectionLimit(defaultRedisPerPeerConnectionCap))
 	client := server.getOrCreateLeaderClient("127.0.0.1:6379")
 	defer client.Close()
@@ -99,6 +104,7 @@ func TestRedisLeaderClientPoolUsesSmallDefault(t *testing.T) {
 }
 
 func TestRedisLeaderClientPoolsSharePeerBudget(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name         string
 		limit        int
@@ -120,6 +126,7 @@ func TestRedisLeaderClientPoolsSharePeerBudget(t *testing.T) {
 }
 
 func TestRedisBlockingLeaderClientUsesDedicatedBudgetedPool(t *testing.T) {
+	t.Parallel()
 	server := NewRedisServer(nil, "", nil, nil, nil, nil, WithRedisPerPeerConnectionLimit(defaultRedisPerPeerConnectionCap))
 	shared := server.getOrCreateLeaderClient("127.0.0.1:6379")
 	defer shared.Close()
@@ -132,6 +139,7 @@ func TestRedisBlockingLeaderClientUsesDedicatedBudgetedPool(t *testing.T) {
 }
 
 func TestRedisPeerLimiterCanBeDisabled(t *testing.T) {
+	t.Parallel()
 	server := NewRedisServer(nil, "", nil, nil, nil, nil, WithRedisPerPeerConnectionLimit(0))
 	for _, remote := range []string{"192.168.0.64:10001", "192.168.0.64:10002", "192.168.0.64:10003"} {
 		require.True(t, server.acceptConn(&remoteCommandRecorder{remote: remote}))
@@ -139,6 +147,7 @@ func TestRedisPeerLimiterCanBeDisabled(t *testing.T) {
 }
 
 func TestRedisPeerKey(t *testing.T) {
+	t.Parallel()
 	require.Equal(t, "192.168.0.64", redisPeerKey("192.168.0.64:6379"))
 	require.Equal(t, "::1", redisPeerKey("[::1]:6379"))
 	require.Equal(t, "proxy-without-port", redisPeerKey("proxy-without-port"))

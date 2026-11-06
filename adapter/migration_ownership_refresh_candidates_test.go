@@ -9,6 +9,7 @@ import (
 )
 
 func TestPartitionCandidatesGuardedNewJobIsNotDuplicated(t *testing.T) {
+	t.Parallel()
 	h := newPartitionRefreshHarness(t, 7)
 	children := h.split(t, h.parent, 2, 3, "m")
 	require.NoError(t, h.consumer.reconcileMigrationPartitions(t.Context(), 7))

@@ -19,6 +19,7 @@ import (
 )
 
 func TestRedisMetricsObservesSuccessRequest(t *testing.T) {
+	t.Parallel()
 	registry := monitoring.NewRegistry("n1", "10.0.0.1:50051")
 	observer := registry.RedisObserver()
 
@@ -41,6 +42,7 @@ elastickv_redis_requests_total{command="GET",node_address="10.0.0.1:50051",node_
 }
 
 func TestRedisMetricsObservesErrorRequest(t *testing.T) {
+	t.Parallel()
 	registry := monitoring.NewRegistry("n1", "10.0.0.1:50051")
 	observer := registry.RedisObserver()
 
@@ -67,6 +69,7 @@ elastickv_redis_errors_total{command="SET",node_address="10.0.0.1:50051",node_id
 }
 
 func TestRedisMetricsObservesMultipleCommands(t *testing.T) {
+	t.Parallel()
 	registry := monitoring.NewRegistry("n1", "10.0.0.1:50051")
 	observer := registry.RedisObserver()
 
@@ -90,6 +93,7 @@ elastickv_redis_requests_total{command="SET",node_address="10.0.0.1:50051",node_
 }
 
 func TestRedisMetricsNormalizesUnknownCommand(t *testing.T) {
+	t.Parallel()
 	registry := monitoring.NewRegistry("n1", "10.0.0.1:50051")
 	observer := registry.RedisObserver()
 
@@ -117,6 +121,7 @@ elastickv_redis_unsupported_commands_total{command="NOTACOMMAND",node_address="1
 }
 
 func TestRedisMetricsConnDetectsError(t *testing.T) {
+	t.Parallel()
 	mc := &redisMetricsConn{Conn: &stubRedisConn{}}
 	require.False(t, mc.hadError)
 
@@ -125,12 +130,14 @@ func TestRedisMetricsConnDetectsError(t *testing.T) {
 }
 
 func TestWithRedisRequestObserverOption(t *testing.T) {
+	t.Parallel()
 	registry := monitoring.NewRegistry("n1", "10.0.0.1:50051")
 	server := NewRedisServer(nil, "", nil, nil, nil, nil, WithRedisRequestObserver(registry.RedisObserver()))
 	require.NotNil(t, server.requestObserver)
 }
 
 func TestDispatchCommandObservesSuccessMetrics(t *testing.T) {
+	t.Parallel()
 	registry := monitoring.NewRegistry("n1", "10.0.0.1:50051")
 	server := NewRedisServer(nil, "", nil, nil, nil, nil, WithRedisRequestObserver(registry.RedisObserver()))
 	conn := &stubRedisConn{}
@@ -154,6 +161,7 @@ elastickv_redis_requests_total{command="SET",node_address="10.0.0.1:50051",node_
 }
 
 func TestDispatchCommandObservesErrorMetrics(t *testing.T) {
+	t.Parallel()
 	registry := monitoring.NewRegistry("n1", "10.0.0.1:50051")
 	server := NewRedisServer(nil, "", nil, nil, nil, nil, WithRedisRequestObserver(registry.RedisObserver()))
 	conn := &stubRedisConn{}
@@ -181,6 +189,7 @@ elastickv_redis_errors_total{command="SET",node_address="10.0.0.1:50051",node_id
 }
 
 func TestObserveRedisErrorRecordsMetrics(t *testing.T) {
+	t.Parallel()
 	registry := monitoring.NewRegistry("n1", "10.0.0.1:50051")
 	server := NewRedisServer(nil, "", nil, nil, nil, nil, WithRedisRequestObserver(registry.RedisObserver()))
 
@@ -199,6 +208,7 @@ elastickv_redis_requests_total{command="unknown",node_address="10.0.0.1:50051",n
 }
 
 func TestObserveRedisSuccessRecordsMetrics(t *testing.T) {
+	t.Parallel()
 	registry := monitoring.NewRegistry("n1", "10.0.0.1:50051")
 	server := NewRedisServer(nil, "", nil, nil, nil, nil, WithRedisRequestObserver(registry.RedisObserver()))
 
@@ -217,6 +227,7 @@ elastickv_redis_requests_total{command="GET",node_address="10.0.0.1:50051",node_
 }
 
 func TestRedisMetricsUnsupportedCommandRecordsRealName(t *testing.T) {
+	t.Parallel()
 	registry := monitoring.NewRegistry("n1", "10.0.0.1:50051")
 	observer := registry.RedisObserver()
 
@@ -240,6 +251,7 @@ elastickv_redis_unsupported_commands_total{command="PROXY",node_address="10.0.0.
 }
 
 func TestRedisMetricsUnsupportedCommandTwoDistinctNames(t *testing.T) {
+	t.Parallel()
 	registry := monitoring.NewRegistry("n1", "10.0.0.1:50051")
 	observer := registry.RedisObserver()
 
@@ -267,6 +279,7 @@ elastickv_redis_unsupported_commands_total{command="FOO",node_address="10.0.0.1:
 }
 
 func TestRedisMetricsUnsupportedCommandCapSpillsToOther(t *testing.T) {
+	t.Parallel()
 	registry := monitoring.NewRegistry("n1", "10.0.0.1:50051")
 	observer := registry.RedisObserver()
 
@@ -342,6 +355,7 @@ func TestRedisMetricsUnsupportedCommandCapSpillsToOther(t *testing.T) {
 }
 
 func TestRedisMetricsUnsupportedCommandTruncatesLongName(t *testing.T) {
+	t.Parallel()
 	registry := monitoring.NewRegistry("n1", "10.0.0.1:50051")
 	observer := registry.RedisObserver()
 
@@ -386,6 +400,7 @@ func TestRedisMetricsUnsupportedCommandTruncatesLongName(t *testing.T) {
 // followed by a 2-byte rune 'é' repeated enough times to exceed the 64-byte
 // cap; a byte-boundary truncate would split the first 'é'.
 func TestRedisMetricsUnsupportedCommandTruncatesOnRuneBoundary(t *testing.T) {
+	t.Parallel()
 	registry := monitoring.NewRegistry("n1", "10.0.0.1:50051")
 	observer := registry.RedisObserver()
 
@@ -433,6 +448,7 @@ func TestRedisMetricsUnsupportedCommandTruncatesOnRuneBoundary(t *testing.T) {
 // from a misbehaving or hostile client) does not crash the observer and is
 // folded into a fixed "invalid_utf8" sentinel label.
 func TestRedisMetricsUnsupportedCommandRejectsInvalidUTF8(t *testing.T) {
+	t.Parallel()
 	registry := monitoring.NewRegistry("n1", "10.0.0.1:50051")
 	observer := registry.RedisObserver()
 
@@ -470,6 +486,7 @@ func TestRedisMetricsUnsupportedCommandRejectsInvalidUTF8(t *testing.T) {
 }
 
 func TestRedisMetricsUnsupportedCommandConcurrentObservers(t *testing.T) {
+	t.Parallel()
 	registry := monitoring.NewRegistry("n1", "10.0.0.1:50051")
 	observer := registry.RedisObserver()
 
@@ -518,6 +535,7 @@ func TestRedisMetricsUnsupportedCommandConcurrentObservers(t *testing.T) {
 // through the distinct-name slots with replacement-char garbage. The
 // command is sent as raw RESP so it goes through the real Run() call site.
 func TestRedisMetricsUnsupportedCommandRawInvalidUTF8Bytes(t *testing.T) {
+	t.Parallel()
 	registry := monitoring.NewRegistry("n1", "10.0.0.1:50051")
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -581,6 +599,7 @@ func unsupportedCommandCount(t *testing.T, registry *monitoring.Registry, comman
 // asserts the call returns quickly and does not panic under the default
 // `go test -timeout` budget.
 func TestRedisMetricsUnsupportedCommandRejectsPathologicalLength(t *testing.T) {
+	t.Parallel()
 	registry := monitoring.NewRegistry("n1", "10.0.0.1:50051")
 	observer := registry.RedisObserver()
 
@@ -625,6 +644,7 @@ func TestRedisMetricsUnsupportedCommandRejectsPathologicalLength(t *testing.T) {
 // observers hitting a mix of already-admitted names (fast path) and brand
 // new names (slow path). It is designed to run under `go test -race`.
 func TestRedisMetricsUnsupportedCommandRWMutexFastPath(t *testing.T) {
+	t.Parallel()
 	registry := monitoring.NewRegistry("n1", "10.0.0.1:50051")
 	observer := registry.RedisObserver()
 

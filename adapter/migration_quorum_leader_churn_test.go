@@ -16,6 +16,7 @@ import (
 )
 
 func TestMigrationQuorumCommitFollowsForcedLeadershipTransfer(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
 	defer cancel()
 	c := newQuorumAcceptanceCluster(t, ctx)

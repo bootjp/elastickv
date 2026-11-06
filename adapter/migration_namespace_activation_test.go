@@ -68,6 +68,7 @@ func namespaceRuntimeFixture(t *testing.T) ([]SplitMigrationVoter, []*namespaceR
 }
 
 func TestNamespaceAdmissionControllerBootstrapsBeforeOperationalGuards(t *testing.T) {
+	t.Parallel()
 	members, clients := namespaceRuntimeFixture(t)
 	for _, client := range clients {
 		probe, err := client.ProbeMigrationState(t.Context(), &pb.ProbeMigrationStateRequest{})
@@ -83,6 +84,7 @@ func TestNamespaceAdmissionControllerBootstrapsBeforeOperationalGuards(t *testin
 }
 
 func TestNamespaceAdmissionControllerActiveGroupDoesNotPropose(t *testing.T) {
+	t.Parallel()
 	members, clients := namespaceRuntimeFixture(t)
 	require.NoError(t, EnsureMigrationNamespaceAdmission(t.Context(), clients[0], members))
 	for range 3 {
@@ -116,6 +118,7 @@ func namespaceRuntimeSnapshot(members []SplitMigrationVoter) NamespaceAdmissionS
 }
 
 func TestNamespaceAdmissionNegotiationRequiresEveryMemberReady(t *testing.T) {
+	t.Parallel()
 	members, clients := namespaceRuntimeFixture(t)
 	require.NoError(t, EnsureMigrationNamespaceAdmission(t.Context(), clients[0], members))
 	state := namespaceRuntimeSnapshot(members)
@@ -133,6 +136,7 @@ func TestNamespaceAdmissionNegotiationRequiresEveryMemberReady(t *testing.T) {
 }
 
 func TestNamespaceAdmissionActiveGroupJoiningStillRefreshes(t *testing.T) {
+	t.Parallel()
 	members, clients := namespaceRuntimeFixture(t)
 	require.NoError(t, EnsureMigrationNamespaceAdmission(t.Context(), clients[0], members))
 	state := namespaceRuntimeSnapshot(members)
@@ -165,6 +169,7 @@ func TestNamespaceAdmissionActiveGroupJoiningStillRefreshes(t *testing.T) {
 }
 
 func TestNamespaceAdmissionActiveGroupStillRequiresFinalACK(t *testing.T) {
+	t.Parallel()
 	for _, failure := range []string{"ready", "version", "configuration"} {
 		t.Run(failure, func(t *testing.T) {
 			members, clients := namespaceRuntimeFixture(t)
@@ -206,6 +211,7 @@ func TestNamespaceAdmissionActiveGroupStillRequiresFinalACK(t *testing.T) {
 }
 
 func TestNamespaceAdmissionActiveGroupRevalidatesSnapshots(t *testing.T) {
+	t.Parallel()
 	for _, changeAt := range []int{2, 3} {
 		members, clients := namespaceRuntimeFixture(t)
 		require.NoError(t, EnsureMigrationNamespaceAdmission(t.Context(), clients[0], members))
@@ -229,6 +235,7 @@ func TestNamespaceAdmissionActiveGroupRevalidatesSnapshots(t *testing.T) {
 }
 
 func TestNamespaceAdmissionControllerDoesNotProposeForOldLearnerOrDifferentEpoch(t *testing.T) {
+	t.Parallel()
 	for _, old := range []bool{false, true} {
 		members, clients := namespaceRuntimeFixture(t)
 		if old {
@@ -245,6 +252,7 @@ func TestNamespaceAdmissionControllerDoesNotProposeForOldLearnerOrDifferentEpoch
 }
 
 func TestNamespaceAdmissionControllerRejectsPartialRosterAtFSM(t *testing.T) {
+	t.Parallel()
 	members, clients := namespaceRuntimeFixture(t)
 	require.Error(t, EnsureMigrationNamespaceAdmission(t.Context(), clients[0], members[:2]))
 	for _, client := range clients {
@@ -253,6 +261,7 @@ func TestNamespaceAdmissionControllerRejectsPartialRosterAtFSM(t *testing.T) {
 }
 
 func TestNamespaceAdmissionSnapshotChangePreventsControl(t *testing.T) {
+	t.Parallel()
 	members, clients := namespaceRuntimeFixture(t)
 	peer := NamespaceAdmissionPeer{MemberID: etcd.DeriveNodeID("n1"), Address: members[0].Address, Client: clients[0]}
 	calls, controls := 0, 0

@@ -153,6 +153,7 @@ func sealRaftHTTPCall(ctx context.Context, address, action string, input any) er
 }
 
 func TestDynamoDBSnapshotSealRealRaftLeaderChangeFollowerIngress(t *testing.T) {
+	t.Parallel()
 	for _, restamp := range []bool{false, true} {
 		t.Run(map[bool]string{false: "delayed-commit-watermark", true: "fresh-commit-stale-read-seal"}[restamp], func(t *testing.T) {
 			testSnapshotSealRaftLeaderChange(t, restamp)
@@ -249,6 +250,7 @@ func sealRaftAdvanceWatermark(t *testing.T, ctx context.Context, coord kv.Coordi
 }
 
 func TestDynamoDBRealRaftFollowerConcurrentCreateTable(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	nodes, _, _ := createNode(t, 3)
@@ -278,6 +280,7 @@ func TestDynamoDBRealRaftFollowerConcurrentCreateTable(t *testing.T) {
 }
 
 func TestDynamoDBSnapshotSealRealRaftTwoDataGroups(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	left, right := dedupItemTable(), dedupItemTable()

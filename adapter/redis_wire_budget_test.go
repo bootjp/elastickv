@@ -35,6 +35,7 @@ func redisBudgetFrame(args ...string) []byte {
 }
 
 func TestRedisWireBudgetConcurrentReservations(t *testing.T) {
+	t.Parallel()
 	s := &RedisServer{wireTxnBudgetLimit: 4 * redisWireTxnBaseBytes}
 	const clients = 32
 	var admitted atomic.Int32
@@ -68,6 +69,7 @@ func TestRedisWireBudgetConcurrentReservations(t *testing.T) {
 }
 
 func TestRedisWireBudgetChargesEveryRetainedCopy(t *testing.T) {
+	t.Parallel()
 	cmd := redcon.Command{Raw: redisBudgetFrame(cmdSet, "k", "value"), Args: [][]byte{[]byte(cmdSet), []byte("k"), []byte("value")}}
 	size := queuedRedisCommandSize(cmd)
 	require.Greater(t, size, len(cmd.Raw)+len("SETkvalue")+redisQueuedArgOverhead*len(cmd.Args))
@@ -94,6 +96,7 @@ func TestRedisWireBudgetChargesEveryRetainedCopy(t *testing.T) {
 }
 
 func TestRedisWireBudgetAdmissionFailureReleasesHolder(t *testing.T) {
+	t.Parallel()
 	for _, failure := range []string{"nil", "context", "error", "closing"} {
 		t.Run(failure, func(t *testing.T) {
 			o := &redisTestOwnership{ctx: context.Background()}
@@ -123,6 +126,7 @@ func TestRedisWireBudgetAdmissionFailureReleasesHolder(t *testing.T) {
 }
 
 func TestRedisWireBudgetPerConnectionAndCountOverflowAreTerminal(t *testing.T) {
+	t.Parallel()
 	for _, boundary := range []string{"bytes", "count", "arguments"} {
 		t.Run(boundary, func(t *testing.T) {
 			s, owner := redisPropagationServer(t)
@@ -159,6 +163,7 @@ func TestRedisWireBudgetPerConnectionAndCountOverflowAreTerminal(t *testing.T) {
 }
 
 func TestRedisWireBudgetOverflowPoisonsBufferedPipeline(t *testing.T) {
+	t.Parallel()
 	for _, boundary := range []string{"holder", "queue"} {
 		t.Run(boundary, func(t *testing.T) {
 			st := newRedisWireStore(t)
@@ -209,6 +214,7 @@ func TestRedisWireBudgetOverflowPoisonsBufferedPipeline(t *testing.T) {
 }
 
 func TestRedisWireBudgetConcurrentMaliciousConnections(t *testing.T) {
+	t.Parallel()
 	const clients = 8
 	st := newRedisWireStore(t)
 	g := newRedisWireTestGate(t)
@@ -265,6 +271,7 @@ func TestRedisWireBudgetConcurrentMaliciousConnections(t *testing.T) {
 }
 
 func TestRedisWireBudgetReleaseLifecycle(t *testing.T) {
+	t.Parallel()
 	for _, exit := range []string{"exec", "discard", "error", "idle", "disconnect", "close", "revoke"} {
 		t.Run(exit, func(t *testing.T) {
 			st := newRedisWireStore(t)
@@ -307,6 +314,7 @@ func TestRedisWireBudgetReleaseLifecycle(t *testing.T) {
 }
 
 func TestRedisWireBudgetRetainedThroughDetachedExec(t *testing.T) {
+	t.Parallel()
 	st := newRedisWireStore(t)
 	g := newRedisWireTestGate(t)
 	local := newLocalAdapterCoordinator(st)
@@ -343,6 +351,7 @@ func TestRedisWireBudgetRetainedThroughDetachedExec(t *testing.T) {
 }
 
 func TestRedisWireBudgetRetainedThroughChildJoin(t *testing.T) {
+	t.Parallel()
 	st := newRedisWireStore(t)
 	g := newRedisWireTestGate(t)
 	s := startRedisWireServer(t, st, newLocalAdapterCoordinator(st), g)
@@ -379,6 +388,7 @@ func TestRedisWireBudgetRetainedThroughChildJoin(t *testing.T) {
 }
 
 func TestRedisWireBudgetPanicAndLegacyControl(t *testing.T) {
+	t.Parallel()
 	s, owner := redisPropagationServer(t)
 	c := &redisOwnedTestConn{}
 	s.handleRedisCommand(c, redcon.Command{Args: [][]byte{[]byte(cmdMulti)}})

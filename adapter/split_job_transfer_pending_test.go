@@ -28,6 +28,7 @@ func (c *pendingTransferControlClient) ProbeMigrationState(ctx context.Context, 
 }
 
 func TestSplitTransferPendingLearnerACKDoesNotExhaustRunnerFailureBudget(t *testing.T) {
+	t.Parallel()
 	server, catalog, job, source := newTransferRuntimePhaseFixture(t)
 	learner := installPendingTransferLearner(server, job, source)
 	for range maxSplitJobPhaseFailures + 1 {
@@ -60,6 +61,7 @@ func installPendingTransferLearner(server *DistributionServer, job distribution.
 }
 
 func TestSplitTransferPendingLearnerACKKeepsFencedJobRunnable(t *testing.T) {
+	t.Parallel()
 	server, catalog, job, source := newTransferRuntimePhaseFixture(t)
 	learner := installPendingTransferLearner(server, job, source)
 	learner.fencedOnly = true

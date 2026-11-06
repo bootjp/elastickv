@@ -11,6 +11,7 @@ import (
 )
 
 func TestSplitJobSourceCleanupReopensCompletedMembershipProofs(t *testing.T) {
+	t.Parallel()
 	for _, dataDone := range []bool{false, true} {
 		t.Run(map[bool]string{false: "before data deletion", true: "before guard release"}[dataDone], func(t *testing.T) {
 			ctx := context.Background()

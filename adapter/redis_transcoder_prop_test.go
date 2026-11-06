@@ -9,6 +9,7 @@ import (
 )
 
 func TestRedisTranscoder_Property_Set(t *testing.T) {
+	t.Parallel()
 	rapid.Check(t, func(t *rapid.T) {
 		key := rapid.SliceOf(rapid.Byte()).Draw(t, "key")
 		value := rapid.SliceOf(rapid.Byte()).Draw(t, "value")
@@ -25,6 +26,7 @@ func TestRedisTranscoder_Property_Set(t *testing.T) {
 }
 
 func TestRedisTranscoder_Property_Delete(t *testing.T) {
+	t.Parallel()
 	rapid.Check(t, func(t *rapid.T) {
 		key := rapid.SliceOf(rapid.Byte()).Draw(t, "key")
 		tr := newRedisTranscoder()

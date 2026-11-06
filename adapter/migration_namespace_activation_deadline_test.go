@@ -71,6 +71,7 @@ func namespaceDeadlineResult(t *testing.T, result <-chan error) error {
 }
 
 func TestNamespaceAdmissionActivationAttemptBoundsHungRPC(t *testing.T) {
+	t.Parallel()
 	parent := context.Background()
 	attempt, result := startNamespaceDeadlineAttempt(t, parent)
 	deadline, bounded := attempt.ctx.Deadline()
@@ -82,6 +83,7 @@ func TestNamespaceAdmissionActivationAttemptBoundsHungRPC(t *testing.T) {
 }
 
 func TestNamespaceAdmissionActivationAttemptHonorsParentCancellation(t *testing.T) {
+	t.Parallel()
 	parent, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	attempt, result := startNamespaceDeadlineAttempt(t, parent)
@@ -91,6 +93,7 @@ func TestNamespaceAdmissionActivationAttemptHonorsParentCancellation(t *testing.
 }
 
 func TestNamespaceAdmissionActivationAttemptKeepsEarlierParentDeadline(t *testing.T) {
+	t.Parallel()
 	parent, cancel := context.WithTimeout(context.Background(), namespaceProbeTimeout/10)
 	t.Cleanup(cancel)
 	attempt, result := startNamespaceDeadlineAttempt(t, parent)
