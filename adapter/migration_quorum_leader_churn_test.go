@@ -16,7 +16,8 @@ import (
 )
 
 func TestMigrationQuorumCommitFollowsForcedLeadershipTransfer(t *testing.T) {
-	t.Parallel()
+	// Not parallel: a multi-group acceptance run with leadership transfers
+	// and election-timeout budgets that parallel clusters can exhaust.
 	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
 	defer cancel()
 	c := newQuorumAcceptanceCluster(t, ctx)

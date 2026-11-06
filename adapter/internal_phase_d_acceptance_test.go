@@ -309,7 +309,8 @@ func phaseDAcceptanceRequest(phase pb.Phase, key string, start, commit uint64) *
 }
 
 func TestInternalPhaseDAcceptanceThreeVotersThreeGroups(t *testing.T) {
-	t.Parallel()
+	// Not parallel: a multi-group acceptance run with leadership transfers
+	// and election-timeout budgets that parallel clusters can exhaust.
 	c := newPhaseDAcceptanceCluster(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
 	defer cancel()
@@ -326,7 +327,8 @@ func TestInternalPhaseDAcceptanceThreeVotersThreeGroups(t *testing.T) {
 }
 
 func TestInternalPhaseDAcceptanceReleaseLeaderColocation(t *testing.T) {
-	t.Parallel()
+	// Not parallel: a multi-group acceptance run with leadership transfers
+	// and election-timeout budgets that parallel clusters can exhaust.
 	c := newPhaseDAcceptanceCluster(t)
 	c.placeLeader(t, 2, 1)
 	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
