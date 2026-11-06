@@ -233,3 +233,83 @@ func TestShardedCoordinatorDispatchTxn_ReleasesIdentityAfterSuccessfulAbort(t *t
 	require.ErrorIs(t, err, store.ErrWriteConflict)
 	require.Len(t, g1Txn.requests, 4, "a definitive rejection and completed cleanup must release the identity")
 }
+
+func TestShardedCoordinatorDispatchTxn_RetainsIdentityAfterUnknownPhase(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		group1      func() *recordingTransactional
+		group2      func() *recordingTransactional
+		freshCommit bool
+	}{
+		{
+			name: "primary commit",
+			group1: func() *recordingTransactional {
+				return &recordingTransactional{errs: []error{nil, ErrTransactionOutcomeUnknown}}
+			},
+			group2:      func() *recordingTransactional { return &recordingTransactional{} },
+			freshCommit: true,
+		},
+		{
+			name:   "secondary commit",
+			group1: func() *recordingTransactional { return &recordingTransactional{} },
+			group2: func() *recordingTransactional {
+				errs := make([]error, 1+txnSecondaryCommitRetryAttempts)
+				for i := 1; i < len(errs); i++ {
+					errs[i] = ErrTransactionOutcomeUnknown
+				}
+				return &recordingTransactional{errs: errs}
+			},
+		},
+		{
+			name:   "nil prepare response",
+			group1: func() *recordingTransactional { return &recordingTransactional{nilAt: map[int]bool{0: true}} },
+			group2: func() *recordingTransactional { return &recordingTransactional{} },
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			engine := distribution.NewEngine()
+			applyComposed1Snapshot(t, engine, 7, []distribution.RouteDescriptor{
+				{RouteID: 1, Start: []byte("a"), End: []byte("m"), GroupID: 1},
+				{RouteID: 2, Start: []byte("m"), GroupID: 2},
+			})
+			g1Txn := tc.group1()
+			g2Txn := tc.group2()
+			coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+				1: {Txn: g1Txn},
+				2: {Txn: g2Txn},
+			}, 1, NewHLC(), nil)
+			request := func(startTS uint64) *OperationGroup[OP] {
+				return &OperationGroup[OP]{
+					IsTxn:                  true,
+					StartTS:                startTS,
+					RequireAllParticipants: true,
+					Elems: []*Elem[OP]{
+						{Op: Put, Key: []byte("b"), Value: []byte("value")},
+						{Op: Put, Key: []byte("x"), Value: []byte("value")},
+					},
+				}
+			}
+
+			_, err := coord.Dispatch(context.Background(), request(10))
+			require.ErrorIs(t, err, ErrTransactionOutcomeUnknown)
+			g1Calls, g2Calls := len(g1Txn.requests), len(g2Txn.requests)
+			require.Positive(t, g1Calls, "the failure must occur after PREPARE begins")
+			require.Equal(t, uint64(1), coord.retainedTxnCount.Load())
+
+			_, err = coord.Dispatch(context.Background(), request(10))
+			require.ErrorIs(t, err, store.ErrWriteConflict)
+			require.Len(t, g1Txn.requests, g1Calls)
+			require.Len(t, g2Txn.requests, g2Calls)
+
+			if tc.freshCommit {
+				_, err = coord.Dispatch(context.Background(), request(11))
+				require.NoError(t, err, "a fresh snapshot must remain available")
+			}
+		})
+	}
+}

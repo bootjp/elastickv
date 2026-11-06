@@ -565,6 +565,9 @@ type ShardedCoordinator struct {
 	// acquireTxnIdentity.
 	inflightTxnMu sync.Mutex
 	inflightTxns  map[txnIdentity]struct{}
+	// Retained identities cannot be safely released without a terminal proof.
+	// The counter makes their process-lifetime accumulation observable.
+	retainedTxnCount atomic.Uint64
 	// registrationGate is the Stage 7a §4.1 first-write barrier: when
 	// set, self-originated mutating writes that would land as §4.1
 	// storage envelopes block until this node's writer registration
@@ -2037,9 +2040,14 @@ func (c *ShardedCoordinator) dispatchMultiShardTxn(ctx context.Context, startTS,
 	// until this coordinator is discarded.
 	retainIdentity := false
 	defer func() {
-		if !retainIdentity {
-			releaseIdentity()
+		if retainIdentity {
+			count := c.retainedTxnCount.Add(1)
+			c.logger().Warn("txn identity retained after unresolved outcome",
+				slog.Uint64("start_ts", startTS),
+				slog.Uint64("retained_identity_count", count))
+			return
 		}
+		releaseIdentity()
 	}()
 
 	// Group read keys by shard now. The result is passed directly to
