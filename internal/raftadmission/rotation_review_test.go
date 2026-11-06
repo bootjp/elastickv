@@ -25,6 +25,7 @@ func reviewRotationRun(t *testing.T) (*Arbiter, *RotationRun, raftbootstrap.Dige
 }
 
 func TestRotationReviewCompletionRejectsChangedUsedGroup(t *testing.T) {
+	t.Parallel()
 	a, run, projection := reviewRotationRun(t)
 	_, err := a.BindProposal(run.Context(), 2, []byte{byte(Rotation)})
 	require.NoError(t, err)
@@ -43,6 +44,7 @@ func TestRotationReviewCompletionRejectsChangedUsedGroup(t *testing.T) {
 }
 
 func TestRotationReviewRejectsUnreconciledTarget(t *testing.T) {
+	t.Parallel()
 	a := newAdmission(t, true)
 	publishRotationProjection(t, a, sha256.Sum256([]byte("keys")))
 	observeAdmission(t, a, 2, 2)
@@ -67,6 +69,7 @@ func TestRotationReviewRejectsUnreconciledTarget(t *testing.T) {
 }
 
 func TestRotationReviewFinishPreservesFirstResult(t *testing.T) {
+	t.Parallel()
 	for _, failed := range []bool{false, true} {
 		t.Run(map[bool]string{false: "success", true: "failure"}[failed], func(t *testing.T) {
 			a, run, projection := reviewRotationRun(t)
@@ -99,6 +102,7 @@ func TestRotationReviewFinishPreservesFirstResult(t *testing.T) {
 }
 
 func TestRotationReviewOverflowFailsClosed(t *testing.T) {
+	t.Parallel()
 	for _, field := range []string{"sequence", "permission", "projection"} {
 		t.Run(field, func(t *testing.T) {
 			a := newAdmission(t, true)

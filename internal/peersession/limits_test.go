@@ -85,6 +85,7 @@ func (s *largeService) SendSnapshot(stream pb.EtcdRaft_SendSnapshotServer) error
 	}
 }
 func TestNativePublicAndRaftKeep64MiBContract(t *testing.T) {
+	t.Parallel()
 	f := setupNative(t, fixtureOptions{})
 	cc := f.dial(t)
 	h := f.handshake(t, cc)
@@ -157,6 +158,7 @@ func TestNativeOversizedNewFrameRejectedBeforeRecordDecode(t *testing.T) {
 }
 
 func TestStrictControlEnvelopeRejectsDuplicateUnknownAndNoncanonical(t *testing.T) {
+	t.Parallel()
 	valid, err := (StrictCodec{}).Marshal(request(Probe))
 	require.NoError(t, err)
 	for _, bad := range [][]byte{

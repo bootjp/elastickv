@@ -12,6 +12,7 @@ import (
 )
 
 func TestPackUnpackDumpTreeZstdRoundTrip(t *testing.T) {
+	t.Parallel()
 	root := writeArchiveFixture(t)
 	var buf bytes.Buffer
 	require.NoError(t, PackDumpTree(root, &buf, ArchiveCompressionZstd))
@@ -25,6 +26,7 @@ func TestPackUnpackDumpTreeZstdRoundTrip(t *testing.T) {
 }
 
 func TestPackDumpTreeFollowsSymlinkedRoot(t *testing.T) {
+	t.Parallel()
 	root := writeArchiveFixture(t)
 	link := filepath.Join(t.TempDir(), "current")
 	require.NoError(t, os.Symlink(root, link))
@@ -38,6 +40,7 @@ func TestPackDumpTreeFollowsSymlinkedRoot(t *testing.T) {
 }
 
 func TestUnpackDumpTreeRestoresReadOnlyDirectoryModesAfterChildren(t *testing.T) {
+	t.Parallel()
 	root := writeArchiveFixture(t)
 	require.NoError(t, os.Chmod(filepath.Join(root, "redis"), 0o555))
 	t.Cleanup(func() { makeArchiveTreeWritable(root) })
@@ -55,6 +58,7 @@ func TestUnpackDumpTreeRestoresReadOnlyDirectoryModesAfterChildren(t *testing.T)
 }
 
 func TestUnpackDumpTreeCleansReadOnlyTreeOnVerifyFailure(t *testing.T) {
+	t.Parallel()
 	var manifest bytes.Buffer
 	m := NewPhase0SnapshotManifest(time.Unix(0, 0))
 	m.ElastickvVersion = "test"
@@ -94,6 +98,7 @@ func TestUnpackDumpTreeCleansReadOnlyTreeOnVerifyFailure(t *testing.T) {
 }
 
 func TestUnpackDumpTreeRejectsSymlinkOutputRoot(t *testing.T) {
+	t.Parallel()
 	root := writeArchiveFixture(t)
 	var buf bytes.Buffer
 	require.NoError(t, PackDumpTree(root, &buf, ArchiveCompressionNone))
@@ -112,6 +117,7 @@ func TestUnpackDumpTreeRejectsSymlinkOutputRoot(t *testing.T) {
 }
 
 func TestUnpackDumpTreeRejectsTraversal(t *testing.T) {
+	t.Parallel()
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
 	require.NoError(t, tw.WriteHeader(&tar.Header{
@@ -131,6 +137,7 @@ func TestUnpackDumpTreeRejectsTraversal(t *testing.T) {
 }
 
 func TestUnpackDumpTreeRejectsNonDirectoryRootEntry(t *testing.T) {
+	t.Parallel()
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
 	require.NoError(t, tw.WriteHeader(&tar.Header{
@@ -151,6 +158,7 @@ func TestUnpackDumpTreeRejectsNonDirectoryRootEntry(t *testing.T) {
 }
 
 func TestReadTarTreeRejectsEntryBudgetExceeded(t *testing.T) {
+	t.Parallel()
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
 	require.NoError(t, tw.WriteHeader(&tar.Header{
@@ -168,6 +176,7 @@ func TestReadTarTreeRejectsEntryBudgetExceeded(t *testing.T) {
 }
 
 func TestExtractRegularTarEntryRejectsByteBudgetExceeded(t *testing.T) {
+	t.Parallel()
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
 	require.NoError(t, tw.WriteHeader(&tar.Header{
@@ -187,6 +196,7 @@ func TestExtractRegularTarEntryRejectsByteBudgetExceeded(t *testing.T) {
 }
 
 func TestPackDumpTreeRejectsSymlink(t *testing.T) {
+	t.Parallel()
 	root := writeArchiveFixture(t)
 	require.NoError(t, os.Symlink("MANIFEST.json", filepath.Join(root, "link")))
 	var buf bytes.Buffer
@@ -195,6 +205,7 @@ func TestPackDumpTreeRejectsSymlink(t *testing.T) {
 }
 
 func TestOpenArchiveRegularForReadRejectsSymlink(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	target := filepath.Join(root, "target")
 	require.NoError(t, os.WriteFile(target, []byte("payload"), 0o600))
@@ -211,6 +222,7 @@ func TestOpenArchiveRegularForReadRejectsSymlink(t *testing.T) {
 }
 
 func TestPackDumpTreeRejectsUnchecksummedFile(t *testing.T) {
+	t.Parallel()
 	root := writeArchiveFixture(t)
 	require.NoError(t, os.WriteFile(filepath.Join(root, "extra.bin"), []byte("extra"), 0o600))
 	var buf bytes.Buffer
@@ -219,6 +231,7 @@ func TestPackDumpTreeRejectsUnchecksummedFile(t *testing.T) {
 }
 
 func TestCleanArchiveRelPathAllowsRootDotSlash(t *testing.T) {
+	t.Parallel()
 	rel, err := cleanArchiveRelPath("./")
 	require.NoError(t, err)
 	require.Equal(t, ".", rel)
@@ -244,6 +257,7 @@ func writeArchiveFixture(t *testing.T) string {
 }
 
 func TestRemoveArchiveOutputRootRemovesNestedReadOnlyDirs(t *testing.T) {
+	t.Parallel()
 	out := filepath.Join(t.TempDir(), "out")
 	nested := filepath.Join(out, "a", "b")
 	require.NoError(t, os.MkdirAll(nested, 0o755))
@@ -259,6 +273,7 @@ func TestRemoveArchiveOutputRootRemovesNestedReadOnlyDirs(t *testing.T) {
 }
 
 func TestRemoveArchiveOutputRootLeavesSymlinkTargetModes(t *testing.T) {
+	t.Parallel()
 	target := t.TempDir()
 	readOnly := filepath.Join(target, "readonly")
 	require.NoError(t, os.Mkdir(readOnly, 0o555))
@@ -276,6 +291,7 @@ func TestRemoveArchiveOutputRootLeavesSymlinkTargetModes(t *testing.T) {
 }
 
 func TestMakeArchiveTreeWritableIgnoresRootSwappedForSymlink(t *testing.T) {
+	t.Parallel()
 	outside := filepath.Join(t.TempDir(), "outside")
 	require.NoError(t, os.Mkdir(outside, 0o555))
 	t.Cleanup(func() { _ = os.Chmod(outside, 0o755) })

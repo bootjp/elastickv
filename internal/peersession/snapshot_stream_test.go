@@ -48,6 +48,7 @@ func snapshotMethodSpec() Method {
 }
 
 func TestNativeSnapshotFirstMetadataAndScopedReceipts(t *testing.T) {
+	t.Parallel()
 	f := setupNative(t, fixtureOptions{})
 	cc := f.dial(t)
 	h := f.handshake(t, cc)

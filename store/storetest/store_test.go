@@ -11,6 +11,7 @@ import (
 )
 
 func TestNewPebbleOptionsAndCleanup(t *testing.T) {
+	t.Parallel()
 	var st store.MVCCStore
 	t.Run("owner", func(t *testing.T) {
 		st = storetest.NewPebble(t, store.WithEncryption(

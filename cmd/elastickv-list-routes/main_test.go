@@ -15,6 +15,7 @@ import (
 // (not nil) so Clojure callers don't have to special-case
 // nil-vs-empty.
 func TestEmit_Empty(t *testing.T) {
+	t.Parallel()
 	var buf bytes.Buffer
 	require.NoError(t, emit(&pb.ListRoutesResponse{CatalogVersion: 7}, &buf))
 
@@ -33,6 +34,7 @@ func TestEmit_Empty(t *testing.T) {
 // byte sequence survives — verified by round-tripping a routing-key
 // shape that contains '|' (ASCII 124, outside the base64 alphabet).
 func TestEmit_RoundTripsRouteBytes(t *testing.T) {
+	t.Parallel()
 	startBytes := []byte("!ddb|route|table|amVwc2VuX2FwcGVuZF90MQ")
 	endBytes := []byte("!ddb|route|table|amVwc2VuX2FwcGVuZF90Mw")
 
@@ -80,6 +82,7 @@ func TestEmit_RoundTripsRouteBytes(t *testing.T) {
 // than as a missing field — the Clojure setup-hook relies on this
 // to detect the rightmost route in the catalog.
 func TestEmit_EmptyEndDistinguishable(t *testing.T) {
+	t.Parallel()
 	var buf bytes.Buffer
 	require.NoError(t, emit(&pb.ListRoutesResponse{
 		Routes: []*pb.RouteDescriptor{
