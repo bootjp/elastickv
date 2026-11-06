@@ -32,6 +32,7 @@ func active(t *testing.T) (Intent, Evidence) {
 }
 
 func TestPublishAndInspect(t *testing.T) {
+	t.Parallel()
 	in, e := fixture(t)
 	dir := t.TempDir()
 	s := NewStore(dir)
@@ -62,6 +63,7 @@ func TestPublishAndInspect(t *testing.T) {
 }
 
 func TestLoadIntentIsStrictAndDoesNotClassify(t *testing.T) {
+	t.Parallel()
 	in, _ := fixture(t)
 	dir := t.TempDir()
 	s := NewStore(dir)
@@ -94,6 +96,7 @@ func TestLoadIntentIsStrictAndDoesNotClassify(t *testing.T) {
 }
 
 func TestPolicyStoreInitializeAndAdvance(t *testing.T) {
+	t.Parallel()
 	policy := policyFixture(t)
 	dir := t.TempDir()
 	s := NewStore(dir)
@@ -151,6 +154,7 @@ func TestPolicyStoreInitializeAndAdvance(t *testing.T) {
 }
 
 func TestPolicyStoreDoesNotOverwriteCorruptState(t *testing.T) {
+	t.Parallel()
 	policy := policyFixture(t)
 	dir := t.TempDir()
 	s := NewStore(dir)
@@ -169,6 +173,7 @@ func TestPolicyStoreDoesNotOverwriteCorruptState(t *testing.T) {
 }
 
 func TestClassifyPartialPairs(t *testing.T) {
+	t.Parallel()
 	in, e := fixture(t)
 	b, err := MarshalIntent(in)
 	require.NoError(t, err)
@@ -212,6 +217,7 @@ func TestClassifyPartialPairs(t *testing.T) {
 }
 
 func TestEvidenceCrossChecks(t *testing.T) {
+	t.Parallel()
 	in, e := active(t)
 	for _, tc := range []struct {
 		name    string
@@ -251,6 +257,7 @@ func TestEvidenceCrossChecks(t *testing.T) {
 }
 
 func TestPolicyFloorAndMissingMarkerRecovery(t *testing.T) {
+	t.Parallel()
 	in, e := fixture(t)
 	dir := t.TempDir()
 	s := NewStore(dir)
@@ -280,6 +287,7 @@ func TestPolicyFloorAndMissingMarkerRecovery(t *testing.T) {
 }
 
 func TestMarkerOnlyNeedsPolicy(t *testing.T) {
+	t.Parallel()
 	in, e := fixture(t)
 	dir := t.TempDir()
 	s := NewStore(dir)
@@ -290,6 +298,7 @@ func TestMarkerOnlyNeedsPolicy(t *testing.T) {
 }
 
 func TestRequiredRepairNeverRestoresLostVotingHistory(t *testing.T) {
+	t.Parallel()
 	for _, state := range []RaftState{Lost, Unverified} {
 		in, e := active(t)
 		e.RaftState = state
@@ -312,6 +321,7 @@ func TestRequiredRepairNeverRestoresLostVotingHistory(t *testing.T) {
 }
 
 func TestExplicitSeedAndLostState(t *testing.T) {
+	t.Parallel()
 	in, e := fixture(t)
 	in.BaselineKind = Seed
 	in.Baseline.Index = 0
@@ -341,6 +351,7 @@ func TestExplicitSeedAndLostState(t *testing.T) {
 }
 
 func TestRejectUnsafeFilesWithoutOverwrite(t *testing.T) {
+	t.Parallel()
 	for _, name := range []string{IntentFile, MarkerFile} {
 		for _, kind := range []string{"mode", "symlink", "directory", "oversize"} {
 			t.Run(name+"/"+kind, func(t *testing.T) {
@@ -373,6 +384,7 @@ func TestRejectUnsafeFilesWithoutOverwrite(t *testing.T) {
 }
 
 func TestConcurrentSingleOwner(t *testing.T) {
+	t.Parallel()
 	in, e := fixture(t)
 	s := NewStore(t.TempDir())
 	require.NoError(t, s.Publish(in, e))

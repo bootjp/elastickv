@@ -136,6 +136,7 @@ func instrument(s *Store, before func(string) error, after func(string), chunk i
 var steps = []string{"create", "chmod", "write", "file-sync", "file-close", "rename", "dir-open", "dir-sync", "dir-close"}
 
 func TestPublicationEveryIOFailure(t *testing.T) {
+	t.Parallel()
 	for _, name := range []string{IntentFile, MarkerFile} {
 		for _, step := range steps {
 			t.Run(name+"/"+step, func(t *testing.T) {
@@ -176,6 +177,7 @@ func TestPublicationEveryIOFailure(t *testing.T) {
 }
 
 func TestPublicationOrderingAndShortWrites(t *testing.T) {
+	t.Parallel()
 	in, e := fixture(t)
 	dir := t.TempDir()
 	s := NewStore(dir)
@@ -201,6 +203,7 @@ func TestPublicationOrderingAndShortWrites(t *testing.T) {
 }
 
 func TestWriteAllRejectsBrokenWriters(t *testing.T) {
+	t.Parallel()
 	for _, fault := range []string{"zero", "invalid", "partial-error"} {
 		t.Run(fault, func(t *testing.T) {
 			in, e := fixture(t)
@@ -240,6 +243,7 @@ func TestCrashChild(t *testing.T) {
 }
 
 func TestProcessCrashEveryBoundary(t *testing.T) {
+	t.Parallel()
 	for _, name := range []string{IntentFile, MarkerFile} {
 		for _, step := range steps {
 			t.Run(name+"/"+step, func(t *testing.T) {
@@ -276,6 +280,7 @@ func TestProcessCrashEveryBoundary(t *testing.T) {
 }
 
 func TestExistingIntentSurvivesReplacementFailure(t *testing.T) {
+	t.Parallel()
 	in, e := fixture(t)
 	dir := t.TempDir()
 	s := NewStore(dir)

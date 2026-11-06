@@ -54,6 +54,7 @@ func signBaselineFixture(t testing.TB, c BaselineContext, id uint64, signer cryp
 }
 
 func TestBaselineRoundTrip(t *testing.T) {
+	t.Parallel()
 	m, _ := baselineFixture(t)
 	raw, err := MarshalBaselineManifest(m)
 	require.NoError(t, err)
@@ -85,6 +86,7 @@ func TestBaselineRoundTrip(t *testing.T) {
 }
 
 func TestBaselineRejectsMissingDuplicateUnknownAndDivergence(t *testing.T) {
+	t.Parallel()
 	tests := map[string]func(*BaselineManifest){
 		"missing voter":         func(m *BaselineManifest) { m.Members = m.Members[1:] },
 		"missing outgoing next": func(m *BaselineManifest) { m.Members = append(m.Members[:2], m.Members[3:]...) },
@@ -120,6 +122,7 @@ func TestBaselineRejectsMissingDuplicateUnknownAndDivergence(t *testing.T) {
 }
 
 func TestBaselineContextReplay(t *testing.T) {
+	t.Parallel()
 	changes := map[string]func(*BaselineContext){
 		"identity":      func(c *BaselineContext) { c.Identity.Cluster[0]++ },
 		"group":         func(c *BaselineContext) { c.Identity.Group++ },
@@ -151,6 +154,7 @@ func TestBaselineContextReplay(t *testing.T) {
 }
 
 func TestBaselineStandardSigners(t *testing.T) {
+	t.Parallel()
 	ec, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	require.NoError(t, err)
 	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -179,6 +183,7 @@ func baselineRechecksum(b []byte) []byte {
 }
 
 func TestBaselineStrictFrames(t *testing.T) {
+	t.Parallel()
 	m, _ := baselineFixture(t)
 	raw, err := MarshalBaselineManifest(m)
 	require.NoError(t, err)
@@ -224,6 +229,7 @@ func TestBaselineStrictFrames(t *testing.T) {
 }
 
 func TestBaselineAggregateBound(t *testing.T) {
+	t.Parallel()
 	m, _ := baselineFixture(t)
 	m.Members[0].PublicKeyDER = make([]byte, baselineKeyLimit+1)
 	_, err := MarshalBaselineManifest(m)
@@ -249,6 +255,7 @@ func TestBaselineAggregateBound(t *testing.T) {
 }
 
 func TestBaselineSignatureDomainAndTrustedRoster(t *testing.T) {
+	t.Parallel()
 	m, signers := baselineFixture(t)
 	p := BaselineProbe{BaselineContext: m.BaselineContext, Evidence: m.Members[0]}
 	message := baselineSigningMessage(baselineContextDigest(p.BaselineContext), p.Evidence)

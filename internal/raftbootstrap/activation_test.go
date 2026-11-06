@@ -28,6 +28,7 @@ func activationFixture(t testing.TB) ActivationCommand {
 }
 
 func TestActivationCommandRoundTrip(t *testing.T) {
+	t.Parallel()
 	command := activationFixture(t)
 	raw, err := EncodeActivationCommand(command)
 	require.NoError(t, err)
@@ -40,6 +41,7 @@ func TestActivationCommandRoundTrip(t *testing.T) {
 }
 
 func TestActivationRequiresEveryMembersPostPreparationAcknowledgment(t *testing.T) {
+	t.Parallel()
 	command := activationFixture(t)
 	command.Readiness.Members = command.Readiness.Members[:len(command.Readiness.Members)-1]
 	_, err := EncodeActivationCommand(command)
@@ -50,6 +52,7 @@ func TestActivationRequiresEveryMembersPostPreparationAcknowledgment(t *testing.
 }
 
 func TestActivationCommandRejectsWrongWitness(t *testing.T) {
+	t.Parallel()
 	for _, field := range []string{"cluster", "group", "activation", "generation", "configuration", "digest"} {
 		t.Run(field, func(t *testing.T) {
 			command := activationFixture(t)
@@ -74,6 +77,7 @@ func TestActivationCommandRejectsWrongWitness(t *testing.T) {
 }
 
 func TestActivationCommandRejectsMalformedFrame(t *testing.T) {
+	t.Parallel()
 	raw, err := EncodeActivationCommand(activationFixture(t))
 	require.NoError(t, err)
 	for _, mutation := range []func([]byte) []byte{

@@ -29,6 +29,7 @@ func fixture(t testing.TB) (Intent, Evidence) {
 }
 
 func TestIntentCanonicalRoundTrip(t *testing.T) {
+	t.Parallel()
 	in, _ := fixture(t)
 	b, err := MarshalIntent(in)
 	require.NoError(t, err)
@@ -53,6 +54,7 @@ func rechecksum(b []byte) {
 }
 
 func TestIntentStrictFrame(t *testing.T) {
+	t.Parallel()
 	in, _ := fixture(t)
 	valid, err := MarshalIntent(in)
 	require.NoError(t, err)
@@ -95,6 +97,7 @@ func TestIntentStrictFrame(t *testing.T) {
 }
 
 func TestIntentValidation(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name   string
 		change func(*Intent)
@@ -129,6 +132,7 @@ func TestIntentValidation(t *testing.T) {
 }
 
 func TestUUIDStrict(t *testing.T) {
+	t.Parallel()
 	for _, s := range []string{"", "00000000-0000-0000-0000-000000000000", "B06f6f94-fd19-4f88-8c88-a2fd26de3427", "b06f6f94fd19-4f88-8c88-a2fd26de3427", "g06f6f94-fd19-4f88-8c88-a2fd26de3427"} {
 		_, err := ParseUUID(s)
 		require.ErrorIs(t, err, ErrInvalid)
@@ -136,6 +140,7 @@ func TestUUIDStrict(t *testing.T) {
 }
 
 func TestJointConfigurationCanonicalization(t *testing.T) {
+	t.Parallel()
 	in, _ := fixture(t)
 	in.Baseline.State = ConfState{Voters: []uint64{1}, VotersOutgoing: []uint64{3, 1}, Learners: []uint64{2}, LearnersNext: []uint64{3}}
 	b, err := MarshalIntent(in)
@@ -149,6 +154,7 @@ func TestJointConfigurationCanonicalization(t *testing.T) {
 }
 
 func TestMarkerStrict(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		data  string
 		state MarkerState
