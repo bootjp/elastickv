@@ -15,6 +15,7 @@ import (
 // TestMVCCStore_Compact_TxnCommitRecordPreserved verifies that a commit record
 // (single version) is not removed by compaction.
 func TestMVCCStore_Compact_TxnCommitRecordPreserved(t *testing.T) {
+	t.Parallel()
 	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
 		ctx := context.Background()
 		st := newStore(t)
@@ -37,6 +38,7 @@ func TestMVCCStore_Compact_TxnCommitRecordPreserved(t *testing.T) {
 // TestMVCCStore_Compact_AdvancesMinRetainedTSWithNoPending verifies that
 // minRetainedTS advances even when there are no keys to compact.
 func TestMVCCStore_Compact_AdvancesMinRetainedTSWithNoPending(t *testing.T) {
+	t.Parallel()
 	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
 		ctx := context.Background()
 		st := newStore(t)
@@ -63,6 +65,7 @@ func TestMVCCStore_Compact_AdvancesMinRetainedTSWithNoPending(t *testing.T) {
 // TestMVCCStore_Compact_AdvancesMinRetainedTSEmptyStore verifies that
 // minRetainedTS advances even with an empty store.
 func TestMVCCStore_Compact_AdvancesMinRetainedTSEmptyStore(t *testing.T) {
+	t.Parallel()
 	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
 		ctx := context.Background()
 		st := newStore(t)
@@ -80,6 +83,7 @@ func TestMVCCStore_Compact_AdvancesMinRetainedTSEmptyStore(t *testing.T) {
 // TestPebbleStore_Compact_TxnLockLifecycle verifies the full lock lifecycle:
 // PREPARE creates a version, COMMIT tombstones it, compaction cleans up.
 func TestPebbleStore_Compact_TxnLockLifecycle(t *testing.T) {
+	t.Parallel()
 	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
 		s := newStore(t)
 
@@ -111,6 +115,7 @@ func TestPebbleStore_Compact_TxnLockLifecycle(t *testing.T) {
 // TestPebbleStore_Compact_TxnIntentLifecycle verifies that intent key versions
 // are cleaned up after resolution.
 func TestPebbleStore_Compact_TxnIntentLifecycle(t *testing.T) {
+	t.Parallel()
 	dir, err := os.MkdirTemp("", "pebble-txn-intent-*")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
@@ -138,6 +143,7 @@ func TestPebbleStore_Compact_TxnIntentLifecycle(t *testing.T) {
 // TestPebbleStore_Compact_TxnActiveLockPreserved verifies that an active lock
 // (not yet committed/aborted) is preserved during compaction.
 func TestPebbleStore_Compact_TxnActiveLockPreserved(t *testing.T) {
+	t.Parallel()
 	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
 		s := newStore(t)
 
@@ -169,6 +175,7 @@ func TestPebbleStore_Compact_TxnActiveLockPreserved(t *testing.T) {
 // sharing the same startTS cannot all succeed — at least (goroutines-1) must
 // conflict.
 func TestPebbleStore_ApplyMutations_ConcurrentConflictDetection(t *testing.T) {
+	t.Parallel()
 	dir, err := os.MkdirTemp("", "pebble-apply-concurrent-*")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)

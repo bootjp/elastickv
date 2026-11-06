@@ -39,6 +39,7 @@ func baselineProbeImage(t *testing.T, s *pebbleStore) BootstrapBaselineProbe {
 }
 
 func TestBootstrapBaselineProbeFullHistoryNotLatestRows(t *testing.T) {
+	t.Parallel()
 	a, b := newBaselineProbeStore(t), newBaselineProbeStore(t)
 	for i, s := range []*pebbleStore{a, b} {
 		old := []byte("first history")
@@ -57,6 +58,7 @@ func TestBootstrapBaselineProbeFullHistoryNotLatestRows(t *testing.T) {
 }
 
 func TestBootstrapBaselineProbeCanonicalAcrossWriteOrderAndSSTLayout(t *testing.T) {
+	t.Parallel()
 	a, b := newBaselineProbeStore(t), newBaselineProbeStore(t)
 	rows := []struct {
 		key   string
@@ -79,6 +81,7 @@ func TestBootstrapBaselineProbeCanonicalAcrossWriteOrderAndSSTLayout(t *testing.
 }
 
 func TestBootstrapBaselineProbeIncludesEveryVersionAndRawMetadata(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name  string
 		alter func(*testing.T, *pebbleStore)
@@ -126,6 +129,7 @@ func TestBootstrapBaselineProbeIncludesEveryVersionAndRawMetadata(t *testing.T) 
 }
 
 func TestBootstrapBaselineProbeConfigurationProof(t *testing.T) {
+	t.Parallel()
 	s := newBaselineProbeStore(t)
 	before := baselineProbeImage(t, s)
 	require.False(t, before.ConfigurationIndexPresent)
@@ -142,6 +146,7 @@ func TestBootstrapBaselineProbeConfigurationProof(t *testing.T) {
 }
 
 func TestBootstrapBaselineProbeRejectsLivePreparedArtifacts(t *testing.T) {
+	t.Parallel()
 	for _, prefix := range []string{"!txn|lock|", "!txn|int|", "!dist|migstage|", "!migstage|"} {
 		t.Run(prefix, func(t *testing.T) {
 			s := newBaselineProbeStore(t)
@@ -163,6 +168,7 @@ func TestBootstrapBaselineProbeRejectsLivePreparedArtifacts(t *testing.T) {
 }
 
 func TestBootstrapBaselineProbeRejectsIncompleteOrUnsupportedImage(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name string
 		key  []byte
@@ -199,6 +205,7 @@ func TestBootstrapBaselineProbeRejectsIncompleteOrUnsupportedImage(t *testing.T)
 }
 
 func TestBootstrapBaselineProbeCancellationAndUnsupportedStore(t *testing.T) {
+	t.Parallel()
 	s := newBaselineProbeStore(t)
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
@@ -213,6 +220,7 @@ func TestBootstrapBaselineProbeCancellationAndUnsupportedStore(t *testing.T) {
 }
 
 func TestBootstrapBaselineProbePinnedSnapshot(t *testing.T) {
+	t.Parallel()
 	s := newBaselineProbeStore(t)
 	require.NoError(t, s.PutAt(t.Context(), []byte("k"), []byte("before"), 1, 0))
 	before := baselineProbeImage(t, s)
@@ -248,6 +256,7 @@ func baselineProbeFiles(t *testing.T, dir string) map[string][32]byte {
 }
 
 func TestBootstrapBaselineProbeReadOnlyReopenDoesNotMutateDisk(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	st, err := NewPebbleStore(dir)
 	require.NoError(t, err)
@@ -282,6 +291,7 @@ func (i baselineProbeErrorIterator) ValueAndErr() ([]byte, error) {
 func (i baselineProbeErrorIterator) Error() error { return i.iterErr }
 
 func TestBootstrapBaselineProbePropagatesIteratorIOFailures(t *testing.T) {
+	t.Parallel()
 	failure := errors.New("injected iterator I/O failure")
 	for _, iter := range []baselineProbeErrorIterator{{valueErr: failure}, {iterErr: failure}} {
 		reader := baselineProbeReader{}

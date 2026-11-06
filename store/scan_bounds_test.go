@@ -11,6 +11,7 @@ import (
 // TestMVCCStore_ScanAt_ExclusiveEndBound verifies that ScanAt uses [start, end)
 // semantics: a key exactly equal to end should NOT be returned.
 func TestMVCCStore_ScanAt_ExclusiveEndBound(t *testing.T) {
+	t.Parallel()
 	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
 		ctx := context.Background()
 		st := newStore(t)
@@ -30,6 +31,7 @@ func TestMVCCStore_ScanAt_ExclusiveEndBound(t *testing.T) {
 // TestMVCCStore_ScanAt_EndEqualsLastKey verifies that when end equals the last
 // data key, that key is excluded.
 func TestMVCCStore_ScanAt_EndEqualsLastKey(t *testing.T) {
+	t.Parallel()
 	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
 		ctx := context.Background()
 		st := newStore(t)
@@ -49,6 +51,7 @@ func TestMVCCStore_ScanAt_EndEqualsLastKey(t *testing.T) {
 
 // TestMVCCStore_ScanAt_NilEnd returns all keys from start.
 func TestMVCCStore_ScanAt_NilEnd(t *testing.T) {
+	t.Parallel()
 	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
 		ctx := context.Background()
 		st := newStore(t)
@@ -63,6 +66,7 @@ func TestMVCCStore_ScanAt_NilEnd(t *testing.T) {
 }
 
 func TestMVCCStore_ScanAtContextCanceled(t *testing.T) {
+	t.Parallel()
 	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
 		st := newStore(t)
 		ctx, cancel := context.WithCancel(context.Background())

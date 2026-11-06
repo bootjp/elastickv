@@ -9,6 +9,7 @@ import (
 )
 
 func TestExternalSnapshotRebasesOnlyRaftLineageMetadata(t *testing.T) {
+	t.Parallel()
 	for _, format := range []string{"native", "sst"} {
 		t.Run(format, func(t *testing.T) {
 			st, err := NewPebbleStore(t.TempDir(), WithSSTIngestSnapshots(format == "sst"))

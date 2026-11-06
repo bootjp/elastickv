@@ -8,6 +8,7 @@ import (
 )
 
 func TestSourceOwnershipZeroFloorBoundarySurvivesNativeRestore(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		guards, ok := st.(MigrationTargetReadinessRaftWriter)
 		require.True(t, ok)
@@ -60,6 +61,7 @@ func TestSourceOwnershipZeroFloorBoundarySurvivesNativeRestore(t *testing.T) {
 }
 
 func TestLegacyOwnershipRemainsDecodableButNotOperational(t *testing.T) {
+	t.Parallel()
 	st := NewMVCCStore()
 	state := ownershipFixture(t, st)
 	require.NoError(t, ownershipStore(t, st).ClearMigrationStateWithOwnership(t.Context(), state, 9))

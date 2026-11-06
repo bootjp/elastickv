@@ -100,6 +100,7 @@ func externalTestOwnership(role MigrationOwnershipRole) MigrationOwnershipState 
 }
 
 func TestExternalSnapshotOwnershipFixtureClone(t *testing.T) {
+	t.Parallel()
 	for _, role := range []MigrationOwnershipRole{MigrationOwner, MigrationNonOwner} {
 		state := externalTestOwnership(role)
 		require.True(t, validMigrationOwnership(state))
@@ -122,6 +123,7 @@ func TestExternalSnapshotOwnershipFixtureClone(t *testing.T) {
 }
 
 func TestExternalSnapshotMigrationMetadataRejectedBeforePublication(t *testing.T) {
+	t.Parallel()
 	for name, populate := range externalTestCases() {
 		t.Run(name, func(t *testing.T) {
 			for _, format := range []string{"mvcc", "native", "sst"} {
@@ -197,6 +199,7 @@ func assertExternalNativeMetadata(t *testing.T, destination MVCCStore, raw []byt
 }
 
 func TestExternalSnapshotTypedMigrationRows(t *testing.T) {
+	t.Parallel()
 	for _, prefix := range []string{"!dist|migstage|", "!migwrite|", "!migfence|"} {
 		t.Run(prefix, func(t *testing.T) {
 			source := externalTestMemory(t)
@@ -215,6 +218,7 @@ func TestExternalSnapshotTypedMigrationRows(t *testing.T) {
 }
 
 func TestExternalSnapshotProofFreeAndEpochOnly(t *testing.T) {
+	t.Parallel()
 	source := externalTestMemory(t)
 	// Metadata-like bytes in ordinary values or non-typed keys are not evidence.
 	require.NoError(t, source.PutAt(t.Context(), []byte("user"), []byte("!migstage|ownership !migwrite| _migack"), 20, 0))
@@ -236,6 +240,7 @@ func TestExternalSnapshotProofFreeAndEpochOnly(t *testing.T) {
 }
 
 func TestExternalSnapshotEmptyV6Metadata(t *testing.T) {
+	t.Parallel()
 	s := externalTestMemory(t)
 	f, err := os.CreateTemp(t.TempDir(), "snapshot")
 	require.NoError(t, err)
@@ -255,6 +260,7 @@ func TestExternalSnapshotEmptyV6Metadata(t *testing.T) {
 }
 
 func TestExternalSnapshotCorruptMetadataLeavesDestinationUnchanged(t *testing.T) {
+	t.Parallel()
 	for _, sst := range []bool{false, true} {
 		for _, key := range [][]byte{migrationOwnershipMetaKeyBytes, migrationRetiredMetaKeyBytes,
 			migrationAckMetaKeyBytes, migrationHLCFloorMetaKeyBytes, migrationPromoteMetaKeyBytes, migrationReadyKey(7)} {
@@ -277,6 +283,7 @@ func TestExternalSnapshotCorruptMetadataLeavesDestinationUnchanged(t *testing.T)
 }
 
 func TestExternalSnapshotCanceledBeforePublication(t *testing.T) {
+	t.Parallel()
 	source := externalTestMemory(t)
 	raw := externalTestSnapshot(t, source)
 	for _, memory := range []bool{true, false} {
@@ -294,6 +301,7 @@ func TestExternalSnapshotCanceledBeforePublication(t *testing.T) {
 }
 
 func TestExternalSnapshotCorruptMVCCMetadata(t *testing.T) {
+	t.Parallel()
 	source := externalTestMemory(t)
 	source.migrationOwnership = []MigrationOwnershipState{externalTestOwnership(MigrationOwner)}
 	raw := externalTestSnapshot(t, source)

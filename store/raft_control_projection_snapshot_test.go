@@ -11,6 +11,7 @@ import (
 )
 
 func TestRaftControlProjectionSnapshotWatermark(t *testing.T) {
+	t.Parallel()
 	for _, format := range []string{"memory", "native-row", "native-sst"} {
 		for _, blob := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/blob=%t", format, blob), func(t *testing.T) {

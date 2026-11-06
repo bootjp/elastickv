@@ -23,6 +23,7 @@ func runMigrationStoreSuite(t *testing.T, test func(t *testing.T, st MVCCStore))
 }
 
 func TestExportVersionsPreservesRawVersionMetadata(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()
 		require.NoError(t, st.PutAt(ctx, []byte("k1"), []byte("v10"), 10, 0))
@@ -51,6 +52,7 @@ func TestExportVersionsPreservesRawVersionMetadata(t *testing.T) {
 }
 
 func TestExportVersionsExcludesTxnLocks(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()
 		lockKey := append(bytes.Clone(txnLockKeyPrefix), []byte("user")...)
@@ -65,6 +67,7 @@ func TestExportVersionsExcludesTxnLocks(t *testing.T) {
 }
 
 func TestExportVersionsAcceptVersionFiltersByValue(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()
 		require.NoError(t, st.PutAt(ctx, []byte("drop"), []byte("legacy-meta"), 10, 0))
@@ -83,6 +86,7 @@ func TestExportVersionsAcceptVersionFiltersByValue(t *testing.T) {
 }
 
 func TestExportVersionsCursorResumesWithinHotKey(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()
 		require.NoError(t, st.PutAt(ctx, []byte("hot"), []byte("v10"), 10, 0))
@@ -112,6 +116,7 @@ func TestExportVersionsCursorResumesWithinHotKey(t *testing.T) {
 }
 
 func TestExportVersionsSparseScanBudgetAdvancesRejectedRows(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()
 		require.NoError(t, st.PutAt(ctx, []byte("drop-a"), []byte("a"), 10, 0))
@@ -143,6 +148,7 @@ func TestExportVersionsSparseScanBudgetAdvancesRejectedRows(t *testing.T) {
 }
 
 func TestExportVersionsPreservesEmptyKeyCursor(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()
 		require.NoError(t, st.PutAt(ctx, nil, []byte("v10"), 10, 0))
@@ -171,6 +177,7 @@ func TestExportVersionsPreservesEmptyKeyCursor(t *testing.T) {
 }
 
 func TestExportVersionsAppliesDefaultSparseScanBudget(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()
 		value := bytes.Repeat([]byte("x"), defaultSparseExportMaxScannedBytes)
@@ -203,6 +210,7 @@ func TestExportVersionsAppliesDefaultSparseScanBudget(t *testing.T) {
 }
 
 func TestExportVersionsAppliesDefaultScanBudgetForTimestampFilter(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()
 		value := bytes.Repeat([]byte("x"), defaultSparseExportMaxScannedBytes)
@@ -231,6 +239,7 @@ func TestExportVersionsAppliesDefaultScanBudgetForTimestampFilter(t *testing.T) 
 }
 
 func TestExportVersionsMinTSPruneDoesNotSkipPrefixedKeys(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()
 		prefixed := []byte{'a', 0xff, 0x00}
@@ -250,6 +259,7 @@ func TestExportVersionsMinTSPruneDoesNotSkipPrefixedKeys(t *testing.T) {
 }
 
 func TestExportVersionsMinTSSkipHonorsScanBudget(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()
 		value := bytes.Repeat([]byte("x"), defaultSparseExportMaxScannedBytes)
@@ -278,6 +288,7 @@ func TestExportVersionsMinTSSkipHonorsScanBudget(t *testing.T) {
 }
 
 func TestExportVersionsMinTSPruneCursorSkipsWholeKey(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()
 		value := bytes.Repeat([]byte("x"), defaultSparseExportMaxScannedBytes)
@@ -316,6 +327,7 @@ func TestExportVersionsMinTSPruneCursorSkipsWholeKey(t *testing.T) {
 }
 
 func TestExportVersionsUsesUserKeyRangeBounds(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()
 		require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("a-value"), 10, 0))
@@ -342,6 +354,7 @@ func TestExportVersionsUsesUserKeyRangeBounds(t *testing.T) {
 }
 
 func TestExportVersionsEmptyEndKeyIsUnbounded(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()
 		require.NoError(t, st.PutAt(ctx, []byte("m"), []byte("m-value"), 10, 0))
@@ -371,6 +384,7 @@ func TestExportVersionsEmptyEndKeyIsUnbounded(t *testing.T) {
 }
 
 func TestPebbleExportDoesNotStopBeforeTrailingEmptyKey(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	dir, err := os.MkdirTemp("", "migration-trailing-empty-key-*")
 	require.NoError(t, err)
@@ -399,6 +413,7 @@ func TestPebbleExportDoesNotStopBeforeTrailingEmptyKey(t *testing.T) {
 }
 
 func TestExportVersionsRejectsCursorOutsideRequestedRange(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()
 		require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("a10"), 10, 0))
@@ -417,6 +432,7 @@ func TestExportVersionsRejectsCursorOutsideRequestedRange(t *testing.T) {
 }
 
 func TestExportVersionsDoesNotTreatMigrationPrefixUserKeyAsMetadata(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()
 		key := append([]byte(migrationAckPrefix), bytes.Repeat([]byte{0x7}, migrationUint64Bytes)...)
@@ -430,6 +446,7 @@ func TestExportVersionsDoesNotTreatMigrationPrefixUserKeyAsMetadata(t *testing.T
 }
 
 func TestPebbleExportSkipsWriterRegistryRows(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	dir, err := os.MkdirTemp("", "migration-writer-registry-*")
 	require.NoError(t, err)
@@ -457,6 +474,7 @@ func TestPebbleExportSkipsWriterRegistryRows(t *testing.T) {
 }
 
 func TestPebbleExportSkipsWriterRegistryRowsWithoutUserVersions(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	dir, err := os.MkdirTemp("", "migration-writer-registry-only-*")
 	require.NoError(t, err)
@@ -486,6 +504,7 @@ func TestPebbleExportSkipsWriterRegistryRowsWithoutUserVersions(t *testing.T) {
 }
 
 func TestPebbleExportDoesNotDropWriterRegistryPrefixUserKey(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	dir, err := os.MkdirTemp("", "migration-writer-registry-user-key-*")
 	require.NoError(t, err)
@@ -514,6 +533,7 @@ func TestPebbleExportDoesNotDropWriterRegistryPrefixUserKey(t *testing.T) {
 }
 
 func TestPebbleRejectsMVCCKeyThatEncodesAsWriterRegistryRow(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	dir, err := os.MkdirTemp("", "migration-writer-registry-collision-*")
 	require.NoError(t, err)
@@ -542,6 +562,7 @@ func TestPebbleRejectsMVCCKeyThatEncodesAsWriterRegistryRow(t *testing.T) {
 }
 
 func TestPebbleWriterRegistryRowIsNotVisibleAsMVCCCollision(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	dir, err := os.MkdirTemp("", "migration-writer-registry-read-collision-*")
 	require.NoError(t, err)
@@ -576,6 +597,7 @@ func TestPebbleWriterRegistryRowIsNotVisibleAsMVCCCollision(t *testing.T) {
 }
 
 func TestPebbleExportAuthenticatesEncryptedTombstoneHeader(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	f := newEncryptedStoreFixture(t, 81)
 	require.NoError(t, f.mvcc.PutAt(ctx, []byte("tampered-export"), []byte("payload"), 100, 0))
@@ -590,6 +612,7 @@ func TestPebbleExportAuthenticatesEncryptedTombstoneHeader(t *testing.T) {
 }
 
 func TestPebbleExportStopsAtEndKeyWhenNoLaterInRangeKeyCanTrail(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	dir, err := os.MkdirTemp("", "migration-end-key-*")
 	require.NoError(t, err)
@@ -619,6 +642,7 @@ func TestPebbleExportStopsAtEndKeyWhenNoLaterInRangeKeyCanTrail(t *testing.T) {
 }
 
 func TestPebbleExportDoesNotStopLeadingRangeWithExplicitEmptyStartAtEndKey(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	dir, err := os.MkdirTemp("", "migration-leading-end-key-*")
 	require.NoError(t, err)
@@ -644,6 +668,7 @@ func TestPebbleExportDoesNotStopLeadingRangeWithExplicitEmptyStartAtEndKey(t *te
 }
 
 func TestPebbleExportOutOfRangeEndSkipReturnsResumableCursor(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	dir, err := os.MkdirTemp("", "migration-out-of-range-end-skip-*")
 	require.NoError(t, err)
@@ -677,6 +702,7 @@ func TestPebbleExportOutOfRangeEndSkipReturnsResumableCursor(t *testing.T) {
 }
 
 func TestPebbleExportOutOfRangeEndSkipChargesAllVersions(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	dir, err := os.MkdirTemp("", "migration-out-of-range-end-skip-versions-*")
 	require.NoError(t, err)
@@ -712,6 +738,7 @@ func TestPebbleExportOutOfRangeEndSkipChargesAllVersions(t *testing.T) {
 }
 
 func TestPebbleExportAppliesDefaultScanBudgetForRangeBoundSkip(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	dir, err := os.MkdirTemp("", "migration-range-bound-scan-budget-*")
 	require.NoError(t, err)
@@ -745,6 +772,7 @@ func TestPebbleExportAppliesDefaultScanBudgetForRangeBoundSkip(t *testing.T) {
 }
 
 func TestPebbleWriterRegistryKeyShapeRejectsOrdinaryRows(t *testing.T) {
+	t.Parallel()
 	registryKey := encryption.RegistryKey(1, 2)
 	require.True(t, isPebbleWriterRegistryKey(registryKey))
 
@@ -757,6 +785,7 @@ func TestPebbleWriterRegistryKeyShapeRejectsOrdinaryRows(t *testing.T) {
 }
 
 func TestImportVersionsIdempotencyAndMetadata(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()
 		first := ImportVersionsOptions{
@@ -826,6 +855,7 @@ func TestImportVersionsIdempotencyAndMetadata(t *testing.T) {
 }
 
 func TestRetireMigrationRemovesOnlySelectedJobMetadata(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()
 		seedPromotionState(t, ctx, st, 1, []byte("stage|job1|"), []byte("job1-promoted"))
@@ -936,6 +966,7 @@ func migrationPromotionState(t *testing.T, ctx context.Context, reader Migration
 }
 
 func TestPebbleImportMetadataPersistsAcrossReopen(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	dir, err := os.MkdirTemp("", "migration-import-persist-*")
 	require.NoError(t, err)
@@ -971,6 +1002,7 @@ func TestPebbleImportMetadataPersistsAcrossReopen(t *testing.T) {
 }
 
 func TestPebbleRetireMigrationPersistsAcrossReopen(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	dir, err := os.MkdirTemp("", "migration-retire-persist-*")
 	require.NoError(t, err)
@@ -1039,6 +1071,7 @@ func TestPebbleRetireMigrationPersistsAcrossReopen(t *testing.T) {
 }
 
 func TestPebbleSnapshotPreservesMigrationMetadata(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	srcDir, err := os.MkdirTemp("", "migration-snapshot-src-*")
 	require.NoError(t, err)
@@ -1094,6 +1127,7 @@ func TestPebbleSnapshotPreservesMigrationMetadata(t *testing.T) {
 // non-empty range as fully copied and proceed to cutover without moving a
 // single version.
 func TestExportVersionsRejectsZeroVersionBudget(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()
 		require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("v"), 10, 0))
@@ -1112,6 +1146,7 @@ func TestExportVersionsRejectsZeroVersionBudget(t *testing.T) {
 }
 
 func TestExportVersionsAppliesTimestampBoundBeforeAcceptVersion(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()
 		require.NoError(t, st.PutAt(ctx, []byte("k"), []byte("eligible"), 20, 0))
@@ -1135,6 +1170,7 @@ func TestExportVersionsAppliesTimestampBoundBeforeAcceptVersion(t *testing.T) {
 }
 
 func TestExportVersionsSkippedCursorBeforeStartResumesAtStartKey(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()
 		require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("a10"), 10, 0))
@@ -1201,6 +1237,7 @@ func TestValidatePromotionCursorForRangeAcceptsOnlyEmittedPositions(t *testing.T
 }
 
 func TestPromoteVersionsMovesStagedVersionsAndDeletesStagedRows(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()
 		promoter, ok := st.(MigrationPromoter)
@@ -1313,6 +1350,7 @@ func TestPromoteVersionsMovesStagedVersionsAndDeletesStagedRows(t *testing.T) {
 }
 
 func TestPromoteVersionsIgnoresClientCursorWhenStateMissing(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()
 		promoter, ok := st.(MigrationPromoter)
@@ -1370,6 +1408,7 @@ func TestPromoteVersionsIgnoresClientCursorWhenStateMissing(t *testing.T) {
 }
 
 func TestPebblePromoteVersionsAdvancesLastCommitTS(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	dir := t.TempDir()
 	st, err := NewPebbleStore(dir)
@@ -1474,6 +1513,7 @@ func TestPromotionStateCodecPreservesMaxPromotedTS(t *testing.T) {
 }
 
 func TestPebbleRestoreStreamingSnapshotPreservesMigrationPromotionState(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	src := NewMVCCStore()
 	promoter, ok := src.(MigrationPromoter)
@@ -1537,6 +1577,7 @@ func TestPebbleRestoreStreamingSnapshotPreservesMigrationPromotionState(t *testi
 }
 
 func TestExportVersionsSplitsBeforeOverflowingTheByteBudget(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()
 
@@ -1568,6 +1609,7 @@ func TestExportVersionsSplitsBeforeOverflowingTheByteBudget(t *testing.T) {
 }
 
 func TestExportVersionsEmitsSingleOversizedRow(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()
 
@@ -1587,6 +1629,7 @@ func TestExportVersionsEmitsSingleOversizedRow(t *testing.T) {
 }
 
 func TestExportVersionsReadTSPreservesCompactionErrors(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()
 		require.NoError(t, st.PutAt(ctx, []byte("k"), []byte("v10"), 10, 0))
@@ -1623,6 +1666,7 @@ func TestExportVersionsReadTSPreservesCompactionErrors(t *testing.T) {
 }
 
 func TestMigrationImportMetadataPresentClearsWithMigrationState(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()
 		reader, ok := st.(MigrationImportMetadataReader)
@@ -1655,6 +1699,7 @@ func TestMigrationImportMetadataPresentClearsWithMigrationState(t *testing.T) {
 }
 
 func TestTargetStagedReadinessStatePersistsAndIsCloned(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()
 		writer, ok := st.(MigrationTargetReadinessWriter)
@@ -1702,6 +1747,7 @@ func TestTargetStagedReadinessStatePersistsAndIsCloned(t *testing.T) {
 }
 
 func TestTargetStagedReadinessRejectsArmedStateWithoutWriteFloor(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		writer, ok := st.(MigrationTargetReadinessWriter)
 		require.True(t, ok)
@@ -1719,6 +1765,7 @@ func TestTargetStagedReadinessRejectsArmedStateWithoutWriteFloor(t *testing.T) {
 }
 
 func TestPebbleTargetStagedReadinessPersistsAcrossReopen(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	dir, err := os.MkdirTemp("", "migration-ready-persist-*")
 	require.NoError(t, err)
@@ -1751,6 +1798,7 @@ func TestPebbleTargetStagedReadinessPersistsAcrossReopen(t *testing.T) {
 }
 
 func TestPebbleTargetStagedReadinessIgnoresNonRecordPrefixKeys(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	dir, err := os.MkdirTemp("", "migration-ready-prefix-*")
 	require.NoError(t, err)
@@ -1787,6 +1835,7 @@ func TestPebbleTargetStagedReadinessIgnoresNonRecordPrefixKeys(t *testing.T) {
 }
 
 func TestCleanupVersionsRemovesOnlySelectedCommittedVersions(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()
 		require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("v1"), 10, 0))
@@ -1818,6 +1867,7 @@ func TestCleanupVersionsRemovesOnlySelectedCommittedVersions(t *testing.T) {
 }
 
 func TestClearMigrationStateRemovesPerJobProofs(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()
 		_, err := st.ImportVersions(ctx, ImportVersionsOptions{
@@ -1860,6 +1910,7 @@ func TestClearMigrationStateRemovesPerJobProofs(t *testing.T) {
 }
 
 func TestPebbleMigrationApplyPathsAcquireApplyMuBeforeDBMu(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	st, err := NewPebbleStore(dir)
 	require.NoError(t, err)

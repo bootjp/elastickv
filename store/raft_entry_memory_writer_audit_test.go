@@ -213,6 +213,7 @@ func waitForMemoryFenceWriter(t *testing.T, frame string, result <-chan error) {
 }
 
 func TestMemoryRaftEntryFencesEveryPublishedWriter(t *testing.T) {
+	t.Parallel()
 	for _, writer := range memoryFenceWriters() {
 		for _, journal := range []bool{false, true} {
 			mode := map[bool]string{false: "indexed", true: "journal"}[journal]

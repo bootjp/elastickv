@@ -10,6 +10,7 @@ import (
 )
 
 func TestEncryptionWriteObservationReadsInstalledPath(t *testing.T) {
+	t.Parallel()
 	keys := encryption.NewKeystore()
 	require.NoError(t, keys.Set(1, make([]byte, encryption.KeySize)))
 	cipher, err := encryption.NewCipher(keys)
@@ -40,6 +41,7 @@ func TestEncryptionWriteObservationReadsInstalledPath(t *testing.T) {
 }
 
 func TestEncryptionWriteObservationRejectsUnwiredAndClosedStore(t *testing.T) {
+	t.Parallel()
 	st, err := NewPebbleStore(filepath.Join(t.TempDir(), "db"))
 	require.NoError(t, err)
 	s, ok := st.(*pebbleStore)

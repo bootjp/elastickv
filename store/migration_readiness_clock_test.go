@@ -8,6 +8,7 @@ import (
 )
 
 func TestTargetReadinessAtomicallyAdvancesClockFloor(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()
 		writer, ok := st.(MigrationTargetReadinessRaftWriter)
