@@ -13,6 +13,7 @@ import (
 )
 
 func TestServiceMoveFileCopiesSwitchesAndCleansSource(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc, placement := newMigrationTestService(t, &testCoordinatorFactory{}, 2, 100, 101)
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -55,6 +56,7 @@ func TestServiceMoveFileCopiesSwitchesAndCleansSource(t *testing.T) {
 }
 
 func TestServiceResumeMoveFileAfterSwitchFailure(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	base := store.NewMVCCStore()
 	placement := &migrationPlacementStore{MVCCStore: base, targetHomes: map[uint64]uint64{1: 10, 2: 20}}
@@ -105,6 +107,7 @@ func TestServiceResumeMoveFileAfterSwitchFailure(t *testing.T) {
 }
 
 func TestServiceResumeMoveSourceCleanupAfterConcurrentUnlink(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc, placement := newMigrationTestService(t, &testCoordinatorFactory{}, 2, 100, 101)
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -142,6 +145,7 @@ func TestServiceResumeMoveSourceCleanupAfterConcurrentUnlink(t *testing.T) {
 }
 
 func TestServiceMoveFileRetriesConcurrentRecoveryConflict(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc, placement := newMigrationTestService(t, &testCoordinatorFactory{}, 2, 100)
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -163,6 +167,7 @@ func TestServiceMoveFileRetriesConcurrentRecoveryConflict(t *testing.T) {
 }
 
 func TestServiceMoveFileRejectsOverlappingSourceCleanup(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc, _ := newMigrationTestService(t, &testCoordinatorFactory{}, 2, 100, 101)
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -196,6 +201,7 @@ func TestServiceMoveFileRejectsOverlappingSourceCleanup(t *testing.T) {
 }
 
 func TestServiceResumeMoveFileClearsActiveObservationOnFailure(t *testing.T) {
+	t.Parallel()
 	observer := &recordingMoveObserver{}
 	svc := newTestServiceWithOptions(t, nil, WithOperationalObserver(observer))
 
@@ -205,6 +211,7 @@ func TestServiceResumeMoveFileClearsActiveObservationOnFailure(t *testing.T) {
 }
 
 func TestServiceRejectsDataMutationWhileHomeIsMigrating(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc, _ := newMigrationTestService(t, &testCoordinatorFactory{}, 2, 100)
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -233,6 +240,7 @@ func TestServiceRejectsDataMutationWhileHomeIsMigrating(t *testing.T) {
 }
 
 func TestServiceRenameRejectsMigratingReplacement(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc, _ := newMigrationTestService(t, &testCoordinatorFactory{}, 2, 3, 100, 101)
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))

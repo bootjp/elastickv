@@ -9,6 +9,7 @@ import (
 )
 
 func TestApplyConsumesFullEntryIdentity(t *testing.T) {
+	t.Parallel()
 	localStore := store.NewMVCCStore()
 	t.Cleanup(func() { require.NoError(t, localStore.Close()) })
 	fsm, ok := NewKvFSMWithHLC(localStore, nil).(*kvFSM)

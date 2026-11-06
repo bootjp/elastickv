@@ -112,6 +112,7 @@ func testWriteOperationID(t *testing.T, svc *Service, sequence uint64) Operation
 }
 
 func TestWriteWithOperationReturnsOriginalResultWithoutReplaying(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, []uint64{2})
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -134,6 +135,7 @@ func TestWriteWithOperationReturnsOriginalResultWithoutReplaying(t *testing.T) {
 }
 
 func TestWriteWithOperationRetainsSemanticFailure(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, nil)
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -150,6 +152,7 @@ func TestWriteWithOperationRetainsSemanticFailure(t *testing.T) {
 }
 
 func TestWriteWithOperationRetainsMissingInodeRejection(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, nil)
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -161,6 +164,7 @@ func TestWriteWithOperationRetainsMissingInodeRejection(t *testing.T) {
 }
 
 func TestWriteOperationEffectLimitTracksChunkCount(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, []uint64{2})
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -175,6 +179,7 @@ func TestWriteOperationEffectLimitTracksChunkCount(t *testing.T) {
 }
 
 func TestWriteWithOperationDoesNotReplayPendingAttempt(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, []uint64{2})
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -197,6 +202,7 @@ func TestWriteWithOperationDoesNotReplayPendingAttempt(t *testing.T) {
 }
 
 func TestWriteWithOperationReplansAfterDefinitiveConflict(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, []uint64{2})
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -223,6 +229,7 @@ func TestWriteWithOperationReplansAfterDefinitiveConflict(t *testing.T) {
 }
 
 func TestWriteWithOperationFinishesDecisionAfterRequestCancellation(t *testing.T) {
+	t.Parallel()
 	requestCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	svc := newTestServiceWithOptions(t, []uint64{2})
@@ -251,6 +258,7 @@ func TestWriteWithOperationFinishesDecisionAfterRequestCancellation(t *testing.T
 }
 
 func TestWriteWithOperationResolvesLostCommitReply(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, []uint64{2})
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -270,6 +278,7 @@ func TestWriteWithOperationResolvesLostCommitReply(t *testing.T) {
 }
 
 func TestWriteWithOperationResolvesLostRejectionReply(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, nil)
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -284,6 +293,7 @@ func TestWriteWithOperationResolvesLostRejectionReply(t *testing.T) {
 }
 
 func TestWriteWithOperationReplansDefinitiveRejectionConflict(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, nil)
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -298,6 +308,7 @@ func TestWriteWithOperationReplansDefinitiveRejectionConflict(t *testing.T) {
 }
 
 func TestWritePlanningFailureCancelsAttemptWithStableResult(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name string
 		err  error

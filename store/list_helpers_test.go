@@ -231,3 +231,34 @@ func deltaLookingListMetaUserKey(fakeUserKey []byte, commitTS uint64, seqInTxn u
 	// ListMetaKey of the returned user key reads as a legacy list delta key.
 	return bytes.TrimPrefix(LegacyListMetaDeltaKey(fakeUserKey, commitTS, seqInTxn), []byte(ListMetaPrefix))
 }
+
+// TestPrefixScanEnd pins the exclusive end of a prefix scan: the shortest
+// key above every key that starts with the prefix. Trailing 0xFF bytes are
+// dropped before the increment; keeping them as 0x00 would admit the key
+// equal to the incremented shorter prefix, which does not start with prefix.
+func TestPrefixScanEnd(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name   string
+		prefix []byte
+		want   []byte
+	}{
+		{name: "empty", prefix: nil, want: nil},
+		{name: "plain", prefix: []byte("ab"), want: []byte("ac")},
+		{name: "trailing 0xff", prefix: []byte("ab\xff"), want: []byte("ac")},
+		{name: "several trailing 0xff", prefix: []byte("a\xff\xff"), want: []byte("b")},
+		{name: "all 0xff", prefix: []byte("\xff\xff"), want: nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := PrefixScanEnd(tc.prefix)
+			require.Equal(t, tc.want, got)
+			if got != nil {
+				// The key equal to the end must not start with the prefix,
+				// and every key with the prefix must sort below the end.
+				require.False(t, bytes.HasPrefix(got, tc.prefix))
+				require.Negative(t, bytes.Compare(append(bytes.Clone(tc.prefix), 0xff, 0xff), got))
+			}
+		})
+	}
+}

@@ -446,6 +446,7 @@ func TestTSOStateMachineRestoreKeepsMonotonicCeiling(t *testing.T) {
 }
 
 func TestTSOStateMachineRestoresLegacyKVFSMSnapshot(t *testing.T) {
+	t.Parallel()
 	const ceilingMs = int64(1_700_000_123_456)
 	tests := []struct {
 		name string

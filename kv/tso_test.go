@@ -22,6 +22,7 @@ const (
 )
 
 func TestHLCNextBatchFencedReturnsConsecutiveWindow(t *testing.T) {
+	t.Parallel()
 	h := NewHLC()
 	h.SetPhysicalCeiling(time.Now().Add(testTSOFutureCeiling).UnixMilli())
 
@@ -31,6 +32,7 @@ func TestHLCNextBatchFencedReturnsConsecutiveWindow(t *testing.T) {
 }
 
 func TestHLCNextBatchFencedRejectsExpiredCeiling(t *testing.T) {
+	t.Parallel()
 	h := NewHLC()
 	h.SetPhysicalCeiling(time.Now().Add(-time.Millisecond).UnixMilli())
 
@@ -39,6 +41,7 @@ func TestHLCNextBatchFencedRejectsExpiredCeiling(t *testing.T) {
 }
 
 func TestHLCNextBatchFencedRejectsExhaustedCeilingWindow(t *testing.T) {
+	t.Parallel()
 	h := NewHLC()
 	ceiling := time.Now().Add(testTSOFutureCeiling).UnixMilli()
 	h.SetPhysicalCeiling(ceiling)
@@ -50,6 +53,7 @@ func TestHLCNextBatchFencedRejectsExhaustedCeilingWindow(t *testing.T) {
 }
 
 func TestHLCNextBatchFencedBumpsWallOnLogicalOverflow(t *testing.T) {
+	t.Parallel()
 	h := NewHLC()
 	futureWall := uint64(time.Now().Add(testTSOFutureCeiling).UnixMilli()) //nolint:gosec // Unix ms is non-negative.
 	h.Observe((futureWall << hlcLogicalBits) | (hlcLogicalMask - 1))
@@ -61,6 +65,7 @@ func TestHLCNextBatchFencedBumpsWallOnLogicalOverflow(t *testing.T) {
 }
 
 func TestBatchAllocatorReusesWindowUntilExhausted(t *testing.T) {
+	t.Parallel()
 	tso := &fakeTSOAllocator{nextBase: testTSOInitialBase, leader: true}
 	alloc, err := NewBatchAllocator(tso, testTSOBatchSize)
 	require.NoError(t, err)
@@ -78,6 +83,7 @@ func TestBatchAllocatorReusesWindowUntilExhausted(t *testing.T) {
 }
 
 func TestBatchAllocatorInvalidateDropsCachedWindow(t *testing.T) {
+	t.Parallel()
 	tso := &fakeTSOAllocator{nextBase: testTSOInitialBase, leader: true}
 	alloc, err := NewBatchAllocator(tso, testTSOBatchSize)
 	require.NoError(t, err)
@@ -127,6 +133,7 @@ func TestShardedCoordinatorBackupFloorDropsCachedTSOWindow(t *testing.T) {
 }
 
 func TestBatchAllocatorNextAfterSkipsCachedSlotsBelowFloor(t *testing.T) {
+	t.Parallel()
 	tso := &fakeTSOAllocator{nextBase: testTSOInitialBase, leader: true}
 	alloc, err := NewBatchAllocator(tso, testTSOBatchSize)
 	require.NoError(t, err)
@@ -142,6 +149,7 @@ func TestBatchAllocatorNextAfterSkipsCachedSlotsBelowFloor(t *testing.T) {
 }
 
 func TestBatchAllocatorRejectsInvalidatedWindowSnapshot(t *testing.T) {
+	t.Parallel()
 	tso := &fakeTSOAllocator{nextBase: testTSOInitialBase, leader: true}
 	alloc, err := NewBatchAllocator(tso, testTSOBatchSize)
 	require.NoError(t, err)
@@ -159,6 +167,7 @@ func TestBatchAllocatorRejectsInvalidatedWindowSnapshot(t *testing.T) {
 }
 
 func TestCoordinateLeaderLossInvalidatesTimestampWindow(t *testing.T) {
+	t.Parallel()
 	tso := &fakeTSOAllocator{nextBase: testTSOInitialBase, leader: true}
 	alloc, err := NewBatchAllocator(tso, testTSOBatchSize)
 	require.NoError(t, err)
@@ -179,6 +188,7 @@ func TestCoordinateLeaderLossInvalidatesTimestampWindow(t *testing.T) {
 }
 
 func TestShardedCoordinatorLeaderLossInvalidatesTimestampWindow(t *testing.T) {
+	t.Parallel()
 	tso := &fakeTSOAllocator{nextBase: testTSOInitialBase, leader: true}
 	alloc, err := NewBatchAllocator(tso, testTSOBatchSize)
 	require.NoError(t, err)
@@ -203,11 +213,13 @@ func TestShardedCoordinatorLeaderLossInvalidatesTimestampWindow(t *testing.T) {
 }
 
 func TestNewBatchAllocatorRejectsOversizedBatch(t *testing.T) {
+	t.Parallel()
 	_, err := NewBatchAllocator(&fakeTSOAllocator{leader: true}, maxHLCBatchSize+1)
 	require.ErrorIs(t, err, ErrInvalidTSOBatchSize)
 }
 
 func TestLocalTSOAllocatorWaitsForLeadership(t *testing.T) {
+	t.Parallel()
 	coord := &fakeTSOCoordinator{clock: NewHLC()}
 	alloc, err := NewLocalTSOAllocator(coord, WithTSOLeaderPollInterval(testTSOPollInterval))
 	require.NoError(t, err)
@@ -225,6 +237,7 @@ func TestLocalTSOAllocatorWaitsForLeadership(t *testing.T) {
 }
 
 func TestLocalTSOAllocatorAcceptsTimestampLeader(t *testing.T) {
+	t.Parallel()
 	coord := &fakeTimestampLeaderCoordinator{clock: NewHLC()}
 	coord.clock.SetPhysicalCeiling(time.Now().Add(testTSOFutureCeiling).UnixMilli())
 	coord.timestampLeader.Store(true)
@@ -239,6 +252,7 @@ func TestLocalTSOAllocatorAcceptsTimestampLeader(t *testing.T) {
 }
 
 func TestLocalTSOAllocatorRenewsExpiredCeilingBeforeIssuing(t *testing.T) {
+	t.Parallel()
 	coord := &renewingTSOCoordinator{clock: NewHLC()}
 	coord.leader.Store(true)
 	coord.clock.SetPhysicalCeiling(time.Now().Add(-time.Millisecond).UnixMilli())
@@ -253,6 +267,7 @@ func TestLocalTSOAllocatorRenewsExpiredCeilingBeforeIssuing(t *testing.T) {
 }
 
 func TestLocalTSOAllocatorKeepsFailClosedWhenRenewalFails(t *testing.T) {
+	t.Parallel()
 	sentinel := errors.New("renewal rejected")
 	coord := &renewingTSOCoordinator{clock: NewHLC(), proposeErr: sentinel}
 	coord.leader.Store(true)
@@ -266,6 +281,7 @@ func TestLocalTSOAllocatorKeepsFailClosedWhenRenewalFails(t *testing.T) {
 }
 
 func TestShardedCoordinatorReportsAnyShardAsTimestampLeader(t *testing.T) {
+	t.Parallel()
 	engine := distribution.NewEngine()
 	engine.UpdateRoute([]byte("a"), []byte("m"), 1)
 	engine.UpdateRoute([]byte("m"), nil, 2)
@@ -280,6 +296,7 @@ func TestShardedCoordinatorReportsAnyShardAsTimestampLeader(t *testing.T) {
 }
 
 func TestShardedCoordinatorDedicatedGroupDoesNotBlockDataLeaderTimestampBridge(t *testing.T) {
+	t.Parallel()
 	engine := distribution.NewEngine()
 	engine.UpdateRoute([]byte(""), nil, 1)
 
@@ -292,6 +309,7 @@ func TestShardedCoordinatorDedicatedGroupDoesNotBlockDataLeaderTimestampBridge(t
 }
 
 func TestShardedCoordinatorTimestampBridgeIgnoresReservedGroupLeader(t *testing.T) {
+	t.Parallel()
 	engine := distribution.NewEngine()
 	engine.UpdateRoute([]byte(""), nil, 1)
 
@@ -312,6 +330,7 @@ func TestShardedCoordinatorTimestampBridgeIgnoresReservedGroupLeader(t *testing.
 }
 
 func TestShardedCoordinatorUsesDedicatedTimestampGroupLeader(t *testing.T) {
+	t.Parallel()
 	engine := distribution.NewEngine()
 	engine.UpdateRoute([]byte("a"), []byte("m"), 1)
 	engine.UpdateRoute([]byte("m"), nil, 2)
@@ -332,6 +351,7 @@ func TestShardedCoordinatorUsesDedicatedTimestampGroupLeader(t *testing.T) {
 }
 
 func TestNextTimestampAfterThroughFallbackWithoutCoordinatorClock(t *testing.T) {
+	t.Parallel()
 	got, err := NextTimestampThrough(context.Background(), &Coordinate{}, "test")
 	require.NoError(t, err)
 	require.EqualValues(t, 1, got)
@@ -349,6 +369,7 @@ func TestNextTimestampAfterThroughFallbackWithoutCoordinatorClock(t *testing.T) 
 }
 
 func TestNextTimestampAfterThroughUsesAllocatorFloor(t *testing.T) {
+	t.Parallel()
 	tso := &fakeTSOAllocator{nextBase: testTSOInitialBase, leader: true}
 	alloc, err := NewBatchAllocator(tso, testTSOBatchSize)
 	require.NoError(t, err)
@@ -364,6 +385,7 @@ func TestNextTimestampAfterThroughUsesAllocatorFloor(t *testing.T) {
 }
 
 func TestBeginReadTimestampThroughPreservesLegacyBeforePhaseD(t *testing.T) {
+	t.Parallel()
 	alloc := &phaseDTestAllocator{next: testTSOInitialBase}
 	coord := &Coordinate{tsAllocator: alloc}
 
@@ -375,6 +397,7 @@ func TestBeginReadTimestampThroughPreservesLegacyBeforePhaseD(t *testing.T) {
 }
 
 func TestBeginReadTimestampThroughValidatesAppliedWatermarkDuringPhaseD(t *testing.T) {
+	t.Parallel()
 	alloc := &phaseDTestAllocator{next: testTSOInitialBase, phaseDActive: true, phaseDRequired: true}
 	coord := &Coordinate{tsAllocator: alloc}
 
@@ -387,6 +410,7 @@ func TestBeginReadTimestampThroughValidatesAppliedWatermarkDuringPhaseD(t *testi
 }
 
 func TestBeginReadTimestampThroughFailsClosedOnValidationError(t *testing.T) {
+	t.Parallel()
 	alloc := &phaseDTestAllocator{
 		next:           testTSOInitialBase,
 		phaseDActive:   true,
@@ -402,6 +426,7 @@ func TestBeginReadTimestampThroughFailsClosedOnValidationError(t *testing.T) {
 }
 
 func TestBeginReadTimestampThroughActivatesPhaseDBeforeValidation(t *testing.T) {
+	t.Parallel()
 	alloc := &phaseDTestAllocator{next: testTSOInitialBase, phaseDRequired: true}
 	coord := &Coordinate{tsAllocator: alloc}
 
@@ -413,6 +438,7 @@ func TestBeginReadTimestampThroughActivatesPhaseDBeforeValidation(t *testing.T) 
 }
 
 func TestBatchAllocatorDropsPrePhaseDWindowAfterActivation(t *testing.T) {
+	t.Parallel()
 	raw := &phaseDWindowTSO{nextBase: testTSOInitialBase, leader: true}
 	alloc, err := NewBatchAllocator(raw, testTSOBatchSize)
 	require.NoError(t, err)
@@ -430,6 +456,7 @@ func TestBatchAllocatorDropsPrePhaseDWindowAfterActivation(t *testing.T) {
 }
 
 func TestBeginReadTimestampThroughFindsAllocatorBehindKeyVizDecorator(t *testing.T) {
+	t.Parallel()
 	alloc := &phaseDTestAllocator{next: testTSOInitialBase, phaseDActive: true, phaseDRequired: true}
 	coord := WithKeyVizLabel(&Coordinate{tsAllocator: alloc}, keyviz.LabelRedis)
 
@@ -440,6 +467,7 @@ func TestBeginReadTimestampThroughFindsAllocatorBehindKeyVizDecorator(t *testing
 }
 
 func TestBeginReadTimestampThroughRejectsDecoratorWithoutInnerVoucher(t *testing.T) {
+	t.Parallel()
 	alloc := &phaseDTestAllocator{
 		next:           testTSOInitialBase,
 		phaseDActive:   true,
@@ -876,6 +904,7 @@ func (s *mutableTSOCutoverState) PhaseDActive() bool  { return s.phaseD.Load() }
 // shouldRenewHLCGroup retire every data group with no timestamp group to renew
 // instead, so every ceiling expired and issuance failed with ErrCeilingExpired.
 func TestShardedCoordinatorPinsCandidateTimestampGroupOnPhaseD(t *testing.T) {
+	t.Parallel()
 	engine := distribution.NewEngine()
 	engine.UpdateRoute([]byte(""), nil, 1)
 
@@ -916,6 +945,7 @@ func TestShardedCoordinatorPinsCandidateTimestampGroupOnPhaseD(t *testing.T) {
 // data groups would leave nothing renewing any ceiling at all. Keep renewing
 // rather than expiring the whole cluster.
 func TestShardedCoordinatorKeepsRenewingWithoutTimestampGroupUnderPhaseD(t *testing.T) {
+	t.Parallel()
 	engine := distribution.NewEngine()
 	engine.UpdateRoute([]byte(""), nil, 1)
 
@@ -935,6 +965,7 @@ func TestShardedCoordinatorKeepsRenewingWithoutTimestampGroupUnderPhaseD(t *test
 
 // WithTimestampGroup keeps pinning immediately, candidate or not.
 func TestShardedCoordinatorExplicitTimestampGroupStillPinsWithoutPhaseD(t *testing.T) {
+	t.Parallel()
 	engine := distribution.NewEngine()
 	engine.UpdateRoute([]byte(""), nil, 1)
 

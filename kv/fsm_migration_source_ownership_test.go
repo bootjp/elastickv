@@ -39,6 +39,7 @@ func installSourceOwnershipForTest(t *testing.T, f *kvFSM, floor uint64) {
 }
 
 func TestSourceOwnershipApplyIgnoresWatcherAndBindsConfiguration(t *testing.T) {
+	t.Parallel()
 	for _, watcher := range []RouteHistory{forbiddenApplyWatcher{}, WrapDistributionEngine(distribution.NewEngine()), WrapDistributionEngine(staleServingEngine(t, 999))} {
 		f := &kvFSM{store: store.NewMVCCStore(), shardGroupID: 1, routes: watcher}
 		installSourceOwnershipForTest(t, f, 0)
@@ -64,6 +65,7 @@ func TestSourceOwnershipApplyIgnoresWatcherAndBindsConfiguration(t *testing.T) {
 }
 
 func TestSourceOwnershipStaleControlsCannotReopenCreation(t *testing.T) {
+	t.Parallel()
 	f := &kvFSM{store: store.NewMVCCStore(), shardGroupID: 1, routes: forbiddenApplyWatcher{}}
 	installSourceOwnershipForTest(t, f, 0)
 	control := &pb.TargetStagedReadinessRequest{JobId: 11, MigrationJobId: 11, Armed: true, TrackWrites: true,

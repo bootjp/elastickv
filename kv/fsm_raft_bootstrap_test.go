@@ -42,6 +42,7 @@ func haltApplyError(t *testing.T, response any) error {
 }
 
 func TestGuardedBootstrapReservedPrefixAlwaysHaltsMalformed(t *testing.T) {
+	t.Parallel()
 	localStore := store.NewMVCCStore()
 	t.Cleanup(func() { require.NoError(t, localStore.Close()) })
 	cluster := raftbootstrap.UUID{1}
@@ -56,6 +57,7 @@ func TestGuardedBootstrapReservedPrefixAlwaysHaltsMalformed(t *testing.T) {
 }
 
 func TestGuardedBootstrapNewEntryFailsClosedWithoutReceipt(t *testing.T) {
+	t.Parallel()
 	localStore := store.NewMVCCStore()
 	t.Cleanup(func() { require.NoError(t, localStore.Close()) })
 	fsm, payload, _, _ := guardedBootstrapFixture(t, localStore)
@@ -67,6 +69,7 @@ func TestGuardedBootstrapNewEntryFailsClosedWithoutReceipt(t *testing.T) {
 }
 
 func TestGuardedBootstrapExactReceiptReplay(t *testing.T) {
+	t.Parallel()
 	localStore := store.NewMVCCStore()
 	t.Cleanup(func() { require.NoError(t, localStore.Close()) })
 	fsm, payload, command, identity := guardedBootstrapFixture(t, localStore)
@@ -94,6 +97,7 @@ func TestGuardedBootstrapExactReceiptReplay(t *testing.T) {
 }
 
 func TestGuardedBootstrapReceiptIdentityConflictHalts(t *testing.T) {
+	t.Parallel()
 	localStore := store.NewMVCCStore()
 	t.Cleanup(func() { require.NoError(t, localStore.Close()) })
 	fsm, payload, command, identity := guardedBootstrapFixture(t, localStore)
@@ -119,6 +123,7 @@ func TestGuardedBootstrapReceiptIdentityConflictHalts(t *testing.T) {
 }
 
 func TestGuardedBootstrapReceiptSlotUsesTrustedIdentity(t *testing.T) {
+	t.Parallel()
 	localStore := store.NewMVCCStore()
 	t.Cleanup(func() { require.NoError(t, localStore.Close()) })
 	fsm, payload, _, _ := guardedBootstrapFixture(t, localStore)
@@ -132,6 +137,7 @@ func TestGuardedBootstrapReceiptSlotUsesTrustedIdentity(t *testing.T) {
 }
 
 func TestGuardedBootstrapExactReceiptPrecedesCurrentParser(t *testing.T) {
+	t.Parallel()
 	localStore := store.NewMVCCStore()
 	t.Cleanup(func() { require.NoError(t, localStore.Close()) })
 	cluster := raftbootstrap.UUID{1}
@@ -170,6 +176,7 @@ func TestGuardedBootstrapExactReceiptPrecedesCurrentParser(t *testing.T) {
 }
 
 func TestGuardedBootstrapCorruptReceiptIsConflict(t *testing.T) {
+	t.Parallel()
 	localStore := store.NewMVCCStore()
 	t.Cleanup(func() { require.NoError(t, localStore.Close()) })
 	fsm, payload, _, identity := guardedBootstrapFixture(t, localStore)

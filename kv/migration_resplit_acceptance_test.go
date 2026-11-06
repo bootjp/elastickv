@@ -69,6 +69,7 @@ func resplitSourceReceiptFixture(t testing.TB) (*kvFSM, *distribution.CatalogSto
 }
 
 func TestMigrationResplitAcceptanceNewMirrorCannotReplacePartitionReceipt(t *testing.T) {
+	t.Parallel()
 	for _, rightOwner := range []uint64{2, 3} {
 		t.Run(map[uint64]string{2: "same-owner children", 3: "moving-right child"}[rightOwner], func(t *testing.T) {
 			fsm, catalog, engine, proof := resplitSourceReceiptFixture(t)
@@ -92,6 +93,7 @@ func TestMigrationResplitAcceptanceNewMirrorCannotReplacePartitionReceipt(t *tes
 }
 
 func TestMigrationResplitAcceptanceLoggedParentEntryKeepsReceiptAndFloor(t *testing.T) {
+	t.Parallel()
 	fsm, catalog, engine, proof := resplitSourceReceiptFixture(t)
 	snapshot, err := catalog.Save(t.Context(), proof.CatalogVersion, []distribution.RouteDescriptor{
 		{RouteID: 4, ParentRouteID: 3, Start: []byte("m"), End: []byte("t"), GroupID: 2, MinWriteTSExclusive: 100},

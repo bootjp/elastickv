@@ -29,6 +29,7 @@ func testPhysicalHLC(t *testing.T, physical int64, logical uint64) uint64 {
 }
 
 func TestRaftTSOAllocatorCommitsWindowEndBeforeReturning(t *testing.T) {
+	t.Parallel()
 	clock := NewHLC()
 	clock.SetPhysicalCeiling(time.Now().Add(testTSOFutureCeiling).UnixMilli())
 	fsm := NewTSOStateMachine(clock)
@@ -65,6 +66,7 @@ func TestRaftTSOAllocatorCommitsWindowEndBeforeReturning(t *testing.T) {
 }
 
 func TestRaftTSOAllocatorRequiresCommitFloorProvider(t *testing.T) {
+	t.Parallel()
 	clock := NewHLC()
 	fsm := NewTSOStateMachine(clock)
 	engine := &recordingTSOEngine{state: raftengine.StateLeader}
@@ -74,6 +76,7 @@ func TestRaftTSOAllocatorRequiresCommitFloorProvider(t *testing.T) {
 }
 
 func TestRaftTSOAllocatorDoesNotReturnFailedReservation(t *testing.T) {
+	t.Parallel()
 	clock := NewHLC()
 	clock.SetPhysicalCeiling(time.Now().Add(testTSOFutureCeiling).UnixMilli())
 	engine := &recordingTSOEngine{
@@ -98,6 +101,7 @@ func TestRaftTSOAllocatorDoesNotReturnFailedReservation(t *testing.T) {
 }
 
 func TestRaftTSOAllocatorInitializesEveryLeaderTermAboveDataFloor(t *testing.T) {
+	t.Parallel()
 	clock := NewHLC()
 	clock.SetPhysicalCeiling(time.Now().Add(testTSOFutureCeiling).UnixMilli())
 	fsm := NewTSOStateMachine(clock)
@@ -132,6 +136,7 @@ func TestRaftTSOAllocatorInitializesEveryLeaderTermAboveDataFloor(t *testing.T) 
 }
 
 func TestRaftTSOAllocatorRejectsTermChangeDuringCommitFloorRead(t *testing.T) {
+	t.Parallel()
 	clock := NewHLC()
 	clock.SetPhysicalCeiling(time.Now().Add(testTSOFutureCeiling).UnixMilli())
 	fsm := NewTSOStateMachine(clock)
@@ -155,6 +160,7 @@ func TestRaftTSOAllocatorRejectsTermChangeDuringCommitFloorRead(t *testing.T) {
 }
 
 func TestRaftTSOAllocatorDropsCommittedWindowAfterTermChange(t *testing.T) {
+	t.Parallel()
 	clock := NewHLC()
 	clock.SetPhysicalCeiling(time.Now().Add(testTSOFutureCeiling).UnixMilli())
 	fsm := NewTSOStateMachine(clock)
@@ -184,6 +190,7 @@ func TestRaftTSOAllocatorDropsCommittedWindowAfterTermChange(t *testing.T) {
 }
 
 func TestRaftTSOAllocatorRejectsTermChangeAfterPhaseDMarker(t *testing.T) {
+	t.Parallel()
 	clock := NewHLC()
 	clock.SetPhysicalCeiling(time.Now().Add(testTSOFutureCeiling).UnixMilli())
 	fsm := NewTSOStateMachine(clock)
@@ -223,6 +230,7 @@ func TestRaftTSOAllocatorRejectsTermChangeAfterPhaseDMarker(t *testing.T) {
 }
 
 func TestRaftTSOAllocatorCommitsCutoverBeforeProductionWindow(t *testing.T) {
+	t.Parallel()
 	clock := NewHLC()
 	clock.SetPhysicalCeiling(time.Now().Add(testTSOFutureCeiling).UnixMilli())
 	fsm := NewTSOStateMachine(clock)
@@ -245,6 +253,7 @@ func TestRaftTSOAllocatorCommitsCutoverBeforeProductionWindow(t *testing.T) {
 }
 
 func TestRaftTSOAllocatorCommitsPhaseDBeforeWindowAndValidatesRange(t *testing.T) {
+	t.Parallel()
 	clock := NewHLC()
 	clock.SetPhysicalCeiling(time.Now().Add(testTSOFutureCeiling).UnixMilli())
 	fsm := NewTSOStateMachine(clock)
@@ -288,6 +297,7 @@ func TestRaftTSOAllocatorCommitsPhaseDBeforeWindowAndValidatesRange(t *testing.T
 }
 
 func TestRaftTSOAllocatorPhaseDReservationsFollowWallClockJump(t *testing.T) {
+	t.Parallel()
 	clock := NewHLC()
 	clock.SetPhysicalCeiling(time.Now().Add(3 * testTSOFutureCeiling).UnixMilli())
 	fsm := NewTSOStateMachine(clock)
@@ -331,6 +341,7 @@ func TestRaftTSOAllocatorPhaseDReservationsFollowWallClockJump(t *testing.T) {
 }
 
 func TestRaftTSOAllocatorRejectsNearOverflowMinimumBeforeObserve(t *testing.T) {
+	t.Parallel()
 	clock := NewHLC()
 	clock.SetPhysicalCeiling(time.Now().Add(testTSOFutureCeiling).UnixMilli())
 	fsm := NewTSOStateMachine(clock)
@@ -351,6 +362,7 @@ func TestRaftTSOAllocatorRejectsNearOverflowMinimumBeforeObserve(t *testing.T) {
 }
 
 func TestRaftTSOAllocatorResamplesCommitFloorWhenActivatingPhaseDInInitializedTerm(t *testing.T) {
+	t.Parallel()
 	clock := NewHLC()
 	clock.SetPhysicalCeiling(time.Now().Add(testTSOFutureCeiling).UnixMilli())
 	fsm := NewTSOStateMachine(clock)
@@ -385,6 +397,7 @@ func TestRaftTSOAllocatorResamplesCommitFloorWhenActivatingPhaseDInInitializedTe
 }
 
 func TestRaftTSOAllocatorFencesAboveRestoredPhaseDFloor(t *testing.T) {
+	t.Parallel()
 	clock := NewHLC()
 	clock.SetPhysicalCeiling(time.Now().Add(testTSOFutureCeiling).UnixMilli())
 	fsm := NewTSOStateMachine(clock)
@@ -411,6 +424,7 @@ func TestRaftTSOAllocatorFencesAboveRestoredPhaseDFloor(t *testing.T) {
 }
 
 func TestLeaderRoutedTSOAllocatorReResolvesAfterStaleLeader(t *testing.T) {
+	t.Parallel()
 	local := &fakeTSOAllocator{leader: false, nextBase: testTSOInitialBase}
 	engine := &recordingTSOEngine{state: raftengine.StateFollower, leader: raftengine.LeaderInfo{Address: "old"}}
 	alloc, err := NewLeaderRoutedTSOAllocator(local, engine)
@@ -439,6 +453,7 @@ func TestLeaderRoutedTSOAllocatorReResolvesAfterStaleLeader(t *testing.T) {
 }
 
 func TestLeaderRoutedTSOAllocatorUsesLocalLeader(t *testing.T) {
+	t.Parallel()
 	local := &fakeTSOAllocator{leader: true, nextBase: testTSOInitialBase}
 	engine := &recordingTSOEngine{state: raftengine.StateLeader, leader: raftengine.LeaderInfo{Address: "self"}}
 	alloc, err := NewLeaderRoutedTSOAllocator(local, engine)
@@ -454,6 +469,7 @@ func TestLeaderRoutedTSOAllocatorUsesLocalLeader(t *testing.T) {
 }
 
 func TestLeaderRoutedTSOAllocatorRejectsLocalShadowWithoutReservationMetadata(t *testing.T) {
+	t.Parallel()
 	local := &fakeTSOAllocator{leader: true, nextBase: testTSOInitialBase}
 	engine := &recordingTSOEngine{state: raftengine.StateLeader, leader: raftengine.LeaderInfo{Address: "self"}}
 	alloc, err := NewLeaderRoutedTSOAllocator(local, engine)
@@ -464,6 +480,7 @@ func TestLeaderRoutedTSOAllocatorRejectsLocalShadowWithoutReservationMetadata(t 
 }
 
 func TestLeaderRoutedTSOAllocatorRejectsRemoteWindowAtMinimum(t *testing.T) {
+	t.Parallel()
 	local := &fakeTSOAllocator{leader: false}
 	engine := &recordingTSOEngine{state: raftengine.StateFollower, leader: raftengine.LeaderInfo{Address: "leader"}}
 	alloc, err := NewLeaderRoutedTSOAllocator(local, engine)
@@ -477,6 +494,7 @@ func TestLeaderRoutedTSOAllocatorRejectsRemoteWindowAtMinimum(t *testing.T) {
 }
 
 func TestLeaderRoutedTSOAllocatorPreservesDeadlineAfterTransientErrors(t *testing.T) {
+	t.Parallel()
 	local := &fakeTSOAllocator{leader: false}
 	engine := &recordingTSOEngine{state: raftengine.StateFollower, leader: raftengine.LeaderInfo{Address: "leader"}}
 	alloc, err := NewLeaderRoutedTSOAllocator(local, engine)
@@ -497,6 +515,7 @@ func TestLeaderRoutedTSOAllocatorPreservesDeadlineAfterTransientErrors(t *testin
 }
 
 func TestLeaderRoutedTSOAllocatorRetriesValidationAfterLocalLeadershipLoss(t *testing.T) {
+	t.Parallel()
 	local := &leadershipLosingValidationTSO{fakeTSOAllocator: &fakeTSOAllocator{leader: true}}
 	engine := &recordingTSOEngine{
 		state:  raftengine.StateFollower,
@@ -520,6 +539,7 @@ func TestLeaderRoutedTSOAllocatorRetriesValidationAfterLocalLeadershipLoss(t *te
 }
 
 func TestShadowTimestampAllocatorReturnsLegacyAndAdvancesTSO(t *testing.T) {
+	t.Parallel()
 	legacy := NewHLC()
 	legacy.SetPhysicalCeiling(time.Now().Add(testTSOFutureCeiling).UnixMilli())
 	shadow := &recordingShadowReservationAllocator{}
@@ -538,6 +558,7 @@ func TestShadowTimestampAllocatorReturnsLegacyAndAdvancesTSO(t *testing.T) {
 }
 
 func TestShadowTimestampAllocatorFailsClosedOnShadowError(t *testing.T) {
+	t.Parallel()
 	legacy := NewHLC()
 	legacy.SetPhysicalCeiling(time.Now().Add(testTSOFutureCeiling).UnixMilli())
 	shadowErr := errors.New("shadow unavailable")
@@ -551,6 +572,7 @@ func TestShadowTimestampAllocatorFailsClosedOnShadowError(t *testing.T) {
 }
 
 func TestShadowTimestampAllocatorHonorsDeadlineWhileShadowBlocked(t *testing.T) {
+	t.Parallel()
 	legacy := NewHLC()
 	legacy.SetPhysicalCeiling(time.Now().Add(testTSOFutureCeiling).UnixMilli())
 	shadow := &blockingShadowTimestampAllocator{started: make(chan struct{})}
@@ -565,6 +587,7 @@ func TestShadowTimestampAllocatorHonorsDeadlineWhileShadowBlocked(t *testing.T) 
 }
 
 func TestShadowTimestampAllocatorDiscardsCandidateBelowPriorFloor(t *testing.T) {
+	t.Parallel()
 	legacy := NewHLC()
 	legacy.SetPhysicalCeiling(time.Now().Add(testTSOFutureCeiling).UnixMilli())
 	shadow := &recordingShadowReservationAllocator{overlapFirst: true}
@@ -579,6 +602,7 @@ func TestShadowTimestampAllocatorDiscardsCandidateBelowPriorFloor(t *testing.T) 
 }
 
 func TestShadowTimestampAllocatorReturnsTSOAfterDurableCutover(t *testing.T) {
+	t.Parallel()
 	legacy := NewHLC()
 	legacy.SetPhysicalCeiling(time.Now().Add(testTSOFutureCeiling).UnixMilli())
 	shadow := &recordingShadowReservationAllocator{cutover: true}
@@ -594,6 +618,7 @@ func TestShadowTimestampAllocatorReturnsTSOAfterDurableCutover(t *testing.T) {
 }
 
 func TestShadowTimestampAllocatorBypassesLegacyAfterObservedCutover(t *testing.T) {
+	t.Parallel()
 	legacy := NewHLC()
 	fsm := NewTSOStateMachine(NewHLC())
 	require.Nil(t, fsm.Apply(marshalTSOCutover()))
@@ -614,6 +639,7 @@ func TestShadowTimestampAllocatorBypassesLegacyAfterObservedCutover(t *testing.T
 }
 
 func TestShadowAndCutoverAllocatorsSerializeMigrationOnGroupZero(t *testing.T) {
+	t.Parallel()
 	ceiling := time.Now().Add(testTSOFutureCeiling).UnixMilli()
 	tsoClock := NewHLC()
 	tsoClock.SetPhysicalCeiling(ceiling)
@@ -903,6 +929,7 @@ func (p *recordingTSOFloorProvider) setFloor(floor uint64) {
 // raised the ceiling. Distribution.GetTimestamp forwards a caller's minimum
 // straight into this path, so any caller could stall issuance for all of them.
 func TestRaftTSOAllocatorRejectsMinimumBeyondCeilingWithoutStallingIssuance(t *testing.T) {
+	t.Parallel()
 	clock := NewHLC()
 	ceilingMs := time.Now().Add(testTSOFutureCeiling).UnixMilli()
 	clock.SetPhysicalCeiling(ceilingMs)
@@ -933,6 +960,7 @@ func TestRaftTSOAllocatorRejectsMinimumBeyondCeilingWithoutStallingIssuance(t *t
 }
 
 func TestRaftTSOAllocatorRejectsMinimumWindowRolloverAtCeilingWithoutStallingIssuance(t *testing.T) {
+	t.Parallel()
 	clock := NewHLC()
 	ceilingMs := time.Now().Add(testTSOFutureCeiling).UnixMilli()
 	clock.SetPhysicalCeiling(ceilingMs)
@@ -962,6 +990,7 @@ func TestRaftTSOAllocatorRejectsMinimumWindowRolloverAtCeilingWithoutStallingIss
 
 // A minimum inside the lease is still honoured.
 func TestRaftTSOAllocatorAcceptsMinimumWithinCeiling(t *testing.T) {
+	t.Parallel()
 	clock := NewHLC()
 	ceilingMs := time.Now().Add(testTSOFutureCeiling).UnixMilli()
 	clock.SetPhysicalCeiling(ceilingMs)

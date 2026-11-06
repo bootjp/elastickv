@@ -31,6 +31,7 @@ func (p *ownedContextProposer) Propose(ctx context.Context, _ []byte) (*raftengi
 }
 
 func TestOwnedRawProposalPreservesReceiverContextThroughWrapper(t *testing.T) {
+	t.Parallel()
 	for _, wrap := range []bool{false, true} {
 		p := &ownedContextProposer{fakeProposer: &fakeProposer{}, owned: true}
 		var proposer raftengine.Proposer = p
@@ -52,6 +53,7 @@ func TestOwnedRawProposalPreservesReceiverContextThroughWrapper(t *testing.T) {
 }
 
 func TestOwnedRawProposalPreservesUnknownOutcome(t *testing.T) {
+	t.Parallel()
 	p := &ownedContextProposer{fakeProposer: &fakeProposer{}, owned: true, failure: context.DeadlineExceeded}
 	manager := NewTransactionWithProposer(p)
 	defer manager.Close()
@@ -62,6 +64,7 @@ func TestOwnedRawProposalPreservesUnknownOutcome(t *testing.T) {
 }
 
 func TestOwnedRawProposalHonorsClosedManager(t *testing.T) {
+	t.Parallel()
 	p := &ownedContextProposer{fakeProposer: &fakeProposer{}, owned: true}
 	manager := NewTransactionWithProposer(p)
 	manager.Close()

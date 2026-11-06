@@ -854,6 +854,7 @@ func TestDispatchWithReadTimestampRevokesVoucherWhenOuterGateRejects(t *testing.
 }
 
 func TestReadTimestampVoucherBindingShadowsParentCapability(t *testing.T) {
+	t.Parallel()
 	prePhaseDErr := errors.Join(ErrTSOTimestampInvalid, ErrTSOTimestampPrePhaseD)
 	coord, _, _, alloc := newPhaseDCrossShardCoordinator(t, prePhaseDErr)
 

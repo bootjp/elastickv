@@ -24,6 +24,7 @@ func encryptionAdmissionPayloads() [][]byte {
 }
 
 func TestEncryptionAdmissionCompletelyDecodesImplementedEffects(t *testing.T) {
+	t.Parallel()
 	for _, payload := range encryptionAdmissionPayloads() {
 		changed, err := BootstrapApplyChangesAdmission(t.Context(), nil, raftbootstrap.Identity{}, payload)
 		require.NoError(t, err)
@@ -37,6 +38,7 @@ func TestEncryptionAdmissionCompletelyDecodesImplementedEffects(t *testing.T) {
 }
 
 func TestEncryptionAdmissionDoesNotTreatReservedOrTSOTagsAsPermission(t *testing.T) {
+	t.Parallel()
 	for _, payload := range [][]byte{nil, {0x06}, {0x07}, []byte("\x07TSOF\x01\x00\x00\x00\x00\x00\x00\x00\x2a"), {0, 1}, {2, 1}} {
 		changed, err := EncryptionApplyChangesAdmission(payload)
 		require.NoError(t, err)
@@ -50,6 +52,7 @@ func TestEncryptionAdmissionDoesNotTreatReservedOrTSOTagsAsPermission(t *testing
 }
 
 func TestEncryptionAdmissionPreservesActivationNoop(t *testing.T) {
+	t.Parallel()
 	command, _, proof := activationApplyFixture(t)
 	payload, err := raftbootstrap.EncodeActivationCommand(command)
 	require.NoError(t, err)

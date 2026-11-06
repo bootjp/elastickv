@@ -59,6 +59,7 @@ func (s *laggingStore) LastCommitTS() uint64 {
 }
 
 func TestServiceReadTSRaisesSnapshotToAllGroupsFenceTimestamp(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := store.NewMVCCStore()
 	require.NoError(t, st.PutAt(ctx, []byte("key"), []byte("value"), 7, 0))
@@ -79,6 +80,7 @@ func TestServiceReadTSRaisesSnapshotToAllGroupsFenceTimestamp(t *testing.T) {
 }
 
 func TestServiceReadTSUsesLocalWatermarkForLegacyForwarder(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := store.NewMVCCStore()
 	require.NoError(t, st.PutAt(ctx, []byte("key"), []byte("value"), 7, 0))
@@ -98,6 +100,7 @@ func TestServiceReadTSUsesLocalWatermarkForLegacyForwarder(t *testing.T) {
 }
 
 func TestServiceReadTSPropagatesAllGroupsFenceTimestampError(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := store.NewMVCCStore()
 	coord := &allGroupsTimestampFenceCoordinator{inner: &testCoordinator{st: st}, fenceErr: kv.ErrLeaderNotFound}
@@ -110,6 +113,7 @@ func TestServiceReadTSPropagatesAllGroupsFenceTimestampError(t *testing.T) {
 }
 
 func TestServiceFollowerReadsObserveOwnForwardedWrite(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	backing := store.NewMVCCStore()
 	local := &laggingStore{MVCCStore: backing}

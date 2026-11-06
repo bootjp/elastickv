@@ -10,6 +10,7 @@ import (
 )
 
 func TestEngineRouteLookup(t *testing.T) {
+	t.Parallel()
 	e := NewEngine()
 	e.UpdateRoute([]byte("a"), []byte("m"), 1)
 	e.UpdateRoute([]byte("m"), nil, 2)
@@ -39,6 +40,7 @@ func TestEngineRouteLookup(t *testing.T) {
 }
 
 func TestEngineRouteUnmatchedAfterEnd(t *testing.T) {
+	t.Parallel()
 	e := NewEngine()
 	e.UpdateRoute([]byte("a"), []byte("m"), 1)
 	if _, ok := e.GetRoute([]byte("x")); ok {
@@ -47,6 +49,7 @@ func TestEngineRouteUnmatchedAfterEnd(t *testing.T) {
 }
 
 func TestEngineTimestampMonotonic(t *testing.T) {
+	t.Parallel()
 	e := NewEngine()
 	last := e.NextTimestamp()
 	for range 100 {
@@ -59,6 +62,7 @@ func TestEngineTimestampMonotonic(t *testing.T) {
 }
 
 func TestNewEngineWithDefaultRoute(t *testing.T) {
+	t.Parallel()
 	e := NewEngineWithDefaultRoute()
 	stats := e.Stats()
 
@@ -157,6 +161,7 @@ func requireMigrationRouteFields(t *testing.T, label string, route Route) {
 }
 
 func TestEngineGetIntersectingRoutes(t *testing.T) {
+	t.Parallel()
 	e := NewEngine()
 	e.UpdateRoute([]byte("a"), []byte("m"), 1)
 	e.UpdateRoute([]byte("m"), []byte("z"), 2)
@@ -228,6 +233,7 @@ func TestEngineGetIntersectingRoutes(t *testing.T) {
 }
 
 func TestEngineApplySnapshot_ReplacesRoutesAndVersion(t *testing.T) {
+	t.Parallel()
 	e := NewEngine()
 	e.UpdateRoute([]byte("a"), []byte("z"), 1)
 
@@ -310,6 +316,7 @@ func TestEngineRouteLookupsReturnMatchingCatalogVersion(t *testing.T) {
 }
 
 func TestEngineApplySnapshot_RejectsOldVersion(t *testing.T) {
+	t.Parallel()
 	e := NewEngine()
 
 	if err := e.ApplySnapshot(CatalogSnapshot{
@@ -344,6 +351,7 @@ func TestEngineApplySnapshot_RejectsOldVersion(t *testing.T) {
 }
 
 func TestEngineApplySnapshot_RejectsDuplicateRouteIDs(t *testing.T) {
+	t.Parallel()
 	e := NewEngine()
 
 	err := e.ApplySnapshot(CatalogSnapshot{
@@ -359,6 +367,7 @@ func TestEngineApplySnapshot_RejectsDuplicateRouteIDs(t *testing.T) {
 }
 
 func TestEngineApplySnapshot_RejectsOverlappingRoutes(t *testing.T) {
+	t.Parallel()
 	e := NewEngine()
 
 	err := e.ApplySnapshot(CatalogSnapshot{
@@ -374,6 +383,7 @@ func TestEngineApplySnapshot_RejectsOverlappingRoutes(t *testing.T) {
 }
 
 func TestEngineApplySnapshot_RejectsInvalidRouteOrder(t *testing.T) {
+	t.Parallel()
 	e := NewEngine()
 
 	err := e.ApplySnapshot(CatalogSnapshot{
@@ -389,6 +399,7 @@ func TestEngineApplySnapshot_RejectsInvalidRouteOrder(t *testing.T) {
 }
 
 func TestEngineApplySnapshot_RejectsDuplicateRouteStarts(t *testing.T) {
+	t.Parallel()
 	e := NewEngine()
 
 	err := e.ApplySnapshot(CatalogSnapshot{
@@ -404,6 +415,7 @@ func TestEngineApplySnapshot_RejectsDuplicateRouteStarts(t *testing.T) {
 }
 
 func TestEngineApplySnapshot_EmptyRoutesClearsState(t *testing.T) {
+	t.Parallel()
 	e := NewEngine()
 
 	if err := e.ApplySnapshot(CatalogSnapshot{
@@ -434,6 +446,7 @@ func TestEngineApplySnapshot_EmptyRoutesClearsState(t *testing.T) {
 }
 
 func TestEngineApplySnapshot_LookupBehavior(t *testing.T) {
+	t.Parallel()
 	e := NewEngine()
 	err := e.ApplySnapshot(CatalogSnapshot{
 		Version: 1,
@@ -525,6 +538,7 @@ func TestEngineApplySnapshot_Concurrent(t *testing.T) {
 // pair so SnapshotAt(v) can resolve OwnerOf(k) for any in-flight
 // transaction that observed v at BeginTxn.
 func TestEngineSnapshotAt_RecordsApplySnapshot(t *testing.T) {
+	t.Parallel()
 	e := NewEngine()
 	if err := e.ApplySnapshot(CatalogSnapshot{
 		Version: 1,
@@ -558,6 +572,7 @@ func TestEngineSnapshotAt_RecordsApplySnapshot(t *testing.T) {
 // resolve a txn whose observedVer is behind the current catalog —
 // exactly the case the design doc §3 G1c trace requires.
 func TestEngineSnapshotAt_PreservesHistoryAcrossVersions(t *testing.T) {
+	t.Parallel()
 	e := NewEngine()
 	if err := e.ApplySnapshot(CatalogSnapshot{
 		Version: 1,
@@ -644,6 +659,7 @@ func TestEngineSnapshotAt_FIFOEviction(t *testing.T) {
 // uses this signal to emit ErrComposed1VersionGCd and trigger a
 // coordinator retry.
 func TestEngineSnapshotAt_UnknownVersionReturnsNotFound(t *testing.T) {
+	t.Parallel()
 	e := NewEngineWithDefaultRoute()
 	if _, ok := e.SnapshotAt(42); ok {
 		t.Fatal("expected SnapshotAt for an unknown version to return false")
@@ -657,6 +673,7 @@ func TestEngineSnapshotAt_UnknownVersionReturnsNotFound(t *testing.T) {
 // to the M3 not-found path and trigger a spurious retry on its first
 // commit.
 func TestEngineSnapshotAt_SeedsVersionZeroForDefaultRoute(t *testing.T) {
+	t.Parallel()
 	e := NewEngineWithDefaultRoute()
 	snap, ok := e.SnapshotAt(0)
 	if !ok {
@@ -681,6 +698,7 @@ func TestEngineSnapshotAt_SeedsVersionZeroForDefaultRoute(t *testing.T) {
 // SnapshotAt as "not in ring" → soft-fail-as-retry, which is the
 // correct posture for unconfigured engines.
 func TestEngineSnapshotAt_BareEngineHasNoHistory(t *testing.T) {
+	t.Parallel()
 	e := &Engine{routes: make([]Route, 0)} // bare struct literal — no history
 	if err := e.ApplySnapshot(CatalogSnapshot{
 		Version: 1,

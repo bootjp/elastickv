@@ -18,6 +18,7 @@ import (
 )
 
 func TestStartupOnlyControlRPCSelectsEveryCallAndNeverFallsBackOnError(t *testing.T) {
+	t.Parallel()
 	var ready atomic.Bool
 	var calls int
 	denied := errors.New("typed private transport denied")
@@ -107,6 +108,7 @@ func startupControlBlockedTimestamp(entered chan<- struct{}, release <-chan stru
 }
 
 func TestStartupControlTimestampReadyDoesNotWaitForPrivateSerialLane(t *testing.T) {
+	t.Parallel()
 	service := &startupControlPublicTSO{}
 	cache := startupControlPublicCache(t, service)
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
@@ -153,6 +155,7 @@ func TestStartupControlTimestampReadyDoesNotWaitForPrivateSerialLane(t *testing.
 }
 
 func TestStartupControlShardAndPrepareHooksKeepExactBinding(t *testing.T) {
+	t.Parallel()
 	var calls int
 	rpc := StartupOnlyControlRPC(func(_ context.Context, group uint64, address, method string, request, _ any) error {
 		calls++
