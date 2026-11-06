@@ -16,6 +16,7 @@ import (
 )
 
 func TestLoadStateFileRejectsLargeEntryCount(t *testing.T) {
+	t.Parallel()
 	path := stateFilePath(t.TempDir())
 
 	var buf bytes.Buffer
@@ -33,6 +34,7 @@ func TestLoadStateFileRejectsLargeEntryCount(t *testing.T) {
 }
 
 func TestReadMessageRejectsLargePayload(t *testing.T) {
+	t.Parallel()
 	var buf bytes.Buffer
 	require.NoError(t, writeU32(&buf, maxPersistedEntryMessage+1))
 
@@ -43,15 +45,18 @@ func TestReadMessageRejectsLargePayload(t *testing.T) {
 }
 
 func TestPersistedEntryLimitExceedsCurrentTransportBudget(t *testing.T) {
+	t.Parallel()
 	require.Greater(t, maxPersistedEntryMessage, uint32(internalutil.GRPCMaxMessageBytes))
 }
 
 func TestLegacySnapshotLimitPreservesHistoricalBudget(t *testing.T) {
+	t.Parallel()
 	require.GreaterOrEqual(t, maxPersistedLegacySnapshot, uint32(256<<20))
 	require.Greater(t, maxPersistedLegacySnapshot, maxPersistedEntryMessage)
 }
 
 func TestLoadEntriesFileRejectsLargePayload(t *testing.T) {
+	t.Parallel()
 	path := entriesFilePath(t.TempDir())
 
 	var buf bytes.Buffer
@@ -67,6 +72,7 @@ func TestLoadEntriesFileRejectsLargePayload(t *testing.T) {
 }
 
 func TestLoadEntriesFileHandlesMoreThanEntryCapacityCap(t *testing.T) {
+	t.Parallel()
 	path := entriesFilePath(t.TempDir())
 
 	var buf bytes.Buffer
@@ -88,6 +94,7 @@ func TestLoadEntriesFileHandlesMoreThanEntryCapacityCap(t *testing.T) {
 }
 
 func TestOpenRejectsMultiNodePersistedState(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	state := persistedState{
 		Snapshot: raftTestSnapshot(1, 1, []uint64{1, 2}, nil),
@@ -107,6 +114,7 @@ func TestOpenRejectsMultiNodePersistedState(t *testing.T) {
 }
 
 func TestLoadOrCreateStateMigratesLegacyStateFile(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	legacy := persistedState{
 		Snapshot: raftTestSnapshot(5, 2, []uint64{1}, mustEncodeSnapshotData(t, [][]byte{[]byte("snap")})),
@@ -137,6 +145,7 @@ func TestLoadOrCreateStateMigratesLegacyStateFile(t *testing.T) {
 }
 
 func TestLoadLegacyOrSplitStateRemovesStaleReplaceTemps(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	legacy := persistedState{
 		Snapshot: raftTestSnapshot(1, 1, []uint64{1}, nil),
@@ -162,6 +171,7 @@ func TestLoadLegacyOrSplitStateRemovesStaleReplaceTemps(t *testing.T) {
 }
 
 func TestSnapshotBytesAndCloseReturnsCloseError(t *testing.T) {
+	t.Parallel()
 	closeErr := errors.New("close failed")
 	snapshot := &errorSnapshot{
 		data:     []byte("snap"),
@@ -175,6 +185,7 @@ func TestSnapshotBytesAndCloseReturnsCloseError(t *testing.T) {
 }
 
 func TestSnapshotBytesAndCloseClosesSnapshotWhenWriteFails(t *testing.T) {
+	t.Parallel()
 	writeErr := errors.New("write failed")
 	snapshot := &errorSnapshot{
 		data:     []byte("snap"),
@@ -189,6 +200,7 @@ func TestSnapshotBytesAndCloseClosesSnapshotWhenWriteFails(t *testing.T) {
 }
 
 func TestSnapshotBytesDoesNotCloseSnapshot(t *testing.T) {
+	t.Parallel()
 	snapshot := &errorSnapshot{data: []byte("snap")}
 
 	data, err := snapshotBytes(snapshot, t.TempDir())

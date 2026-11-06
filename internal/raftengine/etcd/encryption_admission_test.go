@@ -31,6 +31,7 @@ func (a admissionEncryptionApplier) ApplyRotation(uint64, fsmwire.RotationPayloa
 }
 
 func TestNativeEncryptionAdmissionRevokesBeforeDecryptedEffects(t *testing.T) {
+	t.Parallel()
 	for _, payload := range nativeEncryptionAdmissionPayloads() {
 		for _, encrypted := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%02x/%v", payload[0], encrypted), func(t *testing.T) {
@@ -87,6 +88,7 @@ func nativeEncryptionAdmissionPayloads() [][]byte {
 }
 
 func TestNativeEncryptionAdmissionRejectsBeforeEffects(t *testing.T) {
+	t.Parallel()
 	for _, failure := range []string{"malformed", "handoff", "unwrap"} {
 		t.Run(failure, func(t *testing.T) {
 			applied := false
@@ -118,6 +120,7 @@ func TestNativeEncryptionAdmissionRejectsBeforeEffects(t *testing.T) {
 }
 
 func TestNativeEncryptionAdmissionDoesNotRevokeDroppedDuplicate(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	t.Cleanup(func() { require.NoError(t, st.Close()) })
 	e := newTestEngine(kv.NewKvFSMWithHLC(st, nil), nil, nil)
@@ -131,6 +134,7 @@ func TestNativeEncryptionAdmissionDoesNotRevokeDroppedDuplicate(t *testing.T) {
 }
 
 func TestNativeEncryptionAdmissionRequiresProtectedVerifierAndPreservesLegacy(t *testing.T) {
+	t.Parallel()
 	payload := append([]byte{fsmwire.OpRegistration}, fsmwire.EncodeRegistration(fsmwire.RegistrationPayload{DEKID: 7})...)
 	entry := raftpb.Entry{Index: uint64Ptr(17), Type: entryTypePtr(raftpb.EntryNormal), Data: encodeProposalEnvelope(7, payload)}
 	bare := &entryIdentityFSM{}

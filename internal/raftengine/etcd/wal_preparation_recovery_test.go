@@ -11,6 +11,7 @@ import (
 )
 
 func TestPreparedIdentityRejectsMissingWALWithoutMutation(t *testing.T) {
+	t.Parallel()
 	for _, multi := range []bool{false, true} {
 		name := "single"
 		if multi {

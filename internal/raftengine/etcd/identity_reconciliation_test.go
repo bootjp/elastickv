@@ -37,6 +37,7 @@ func identityElectionEngine(t *testing.T, id uint64) *Engine {
 }
 
 func TestIdentityReconciliationAllowsProtectedElection(t *testing.T) {
+	t.Parallel()
 	nodes := map[uint64]*Engine{}
 	ready := map[uint64]bool{}
 	calls := map[uint64]int{}
@@ -78,6 +79,7 @@ func TestIdentityReconciliationAllowsProtectedElection(t *testing.T) {
 }
 
 func TestIdentityReconciliationBlocksDispatchUntilCallbackCompletes(t *testing.T) {
+	t.Parallel()
 	for _, reject := range []bool{false, true} {
 		t.Run(fmt.Sprint(reject), func(t *testing.T) {
 			e := identityElectionEngine(t, 1)

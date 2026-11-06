@@ -12,6 +12,7 @@ import (
 )
 
 func TestPrepareExternalSnapshotRestoreRejectsFIFOInput(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	input := filepath.Join(root, "encoded.fsm")
 	require.NoError(t, syscall.Mkfifo(input, 0o600))
@@ -27,6 +28,7 @@ func TestPrepareExternalSnapshotRestoreRejectsFIFOInput(t *testing.T) {
 }
 
 func TestPrepareExternalSnapshotRestoreRejectsSymlinkInput(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	target := filepath.Join(root, "target.fsm")
 	require.NoError(t, os.WriteFile(target, []byte("payload"), 0o600))

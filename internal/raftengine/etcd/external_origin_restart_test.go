@@ -61,6 +61,7 @@ func assertRestartOriginEpochAbsent(t *testing.T, st store.MVCCStore) {
 }
 
 func TestExternalOriginCrashBeforeAppliedCheckpointRevalidates(t *testing.T) {
+	t.Parallel()
 	for _, format := range []string{"mvcc", "native", "sst"} {
 		t.Run(format, func(t *testing.T) {
 			dir := prepareRestartOrigin(t, format)
@@ -107,6 +108,7 @@ func publishRestartNative(t *testing.T, dir string, disk *diskState, st store.MV
 }
 
 func TestExternalOriginNativePublicationAndOriginalFallback(t *testing.T) {
+	t.Parallel()
 	for _, format := range []string{"mvcc", "native", "sst"} {
 		t.Run(format, func(t *testing.T) {
 			dir := prepareRestartOrigin(t, format)
@@ -154,6 +156,7 @@ func (s *originOwnedSnapshot) WriteTo(w io.Writer) (int64, error) {
 func (s *originOwnedSnapshot) Close() error { s.closed = true; return nil }
 
 func TestExternalOriginDuplicateCaptureDoesNotOverwrite(t *testing.T) {
+	t.Parallel()
 	dir, result := prepareOriginFixture(t)
 	disk, err := loadOriginFixture(dir, &originRecordingFSM{})
 	require.NoError(t, err)
@@ -179,6 +182,7 @@ func TestExternalOriginDuplicateCaptureDoesNotOverwrite(t *testing.T) {
 }
 
 func TestExternalOriginNativeRequiresCompletion(t *testing.T) {
+	t.Parallel()
 	dir := prepareRestartOrigin(t, "mvcc")
 	st := restartOriginStore(t, "mvcc")
 	disk, err := loadOriginFixture(dir, kv.NewKvFSMWithHLC(st, kv.NewHLC()))
@@ -195,6 +199,7 @@ func TestExternalOriginNativeRequiresCompletion(t *testing.T) {
 }
 
 func TestExternalOriginNativeRequiresWALSelection(t *testing.T) {
+	t.Parallel()
 	dir, _ := prepareOriginFixture(t)
 	disk, err := loadOriginFixture(dir, &originRecordingFSM{})
 	require.NoError(t, err)
@@ -214,6 +219,7 @@ func TestExternalOriginNativeRequiresWALSelection(t *testing.T) {
 }
 
 func TestExternalOriginNativeValidationBeforeSkip(t *testing.T) {
+	t.Parallel()
 	for _, corruption := range []string{"token-index", "token-crc", "payload", "unsupported-legacy"} {
 		t.Run(corruption, func(t *testing.T) {
 			dir := prepareRestartOrigin(t, "mvcc")
