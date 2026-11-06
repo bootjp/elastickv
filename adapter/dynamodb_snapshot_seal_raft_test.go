@@ -153,7 +153,9 @@ func sealRaftHTTPCall(ctx context.Context, address, action string, input any) er
 }
 
 func TestDynamoDBSnapshotSealRealRaftLeaderChangeFollowerIngress(t *testing.T) {
-	t.Parallel()
+	// Not parallel: the forced leadership transfer must complete within an
+	// election timeout, and parallel 3-node clusters on a loaded runner made
+	// the target miss it ("raft leadership transfer aborted").
 	for _, restamp := range []bool{false, true} {
 		t.Run(map[bool]string{false: "delayed-commit-watermark", true: "fresh-commit-stale-read-seal"}[restamp], func(t *testing.T) {
 			testSnapshotSealRaftLeaderChange(t, restamp)
