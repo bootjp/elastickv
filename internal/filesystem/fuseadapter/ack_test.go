@@ -8,6 +8,7 @@ import (
 
 	"github.com/bootjp/elastickv/internal/filesystem"
 	"github.com/bootjp/elastickv/internal/testutil"
+	"github.com/bootjp/elastickv/kv"
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/stretchr/testify/require"
 )
@@ -79,6 +80,24 @@ func TestAcknowledgementAcceptsRetiredReceipt(t *testing.T) {
 	adapter.recordReceipt(7, id)
 	require.Zero(t, adapter.Fsync(t.Context(), 7, 9, false))
 	require.True(t, core.fsyncCalled)
+}
+
+func TestAcknowledgementKeepsUnrelatedUnknownOnSameDirectory(t *testing.T) {
+	core := newAcknowledgementCore()
+	adapter := New(core, []byte("client"), WithHandleKeepaliveInterval(0))
+	defer adapter.Close()
+	const parent = uint64(7)
+	adapter.mutations.markUnknown(parent)
+	adapter.mutations.markUnknown(parent)
+	id := filesystem.OperationID{Filesystem: [16]byte{1}, Session: [16]byte{2}, Sequence: 1}
+	// A rename within one directory enters the barrier once, despite using
+	// the same directory as both source and destination.
+	adapter.noteUnknownOperation(id, kv.ErrTransactionOutcomeUnknown, parent, parent)
+	adapter.replyMu.Lock()
+	adapter.ackPending = map[filesystem.OperationID]struct{}{id: {}}
+	adapter.replyMu.Unlock()
+	adapter.processAcknowledgementBatch(t.Context())
+	require.Equal(t, syscall.EIO, adapter.FsyncDirectory(t.Context(), parent))
 }
 
 func TestAcknowledgementRetriesAfterLostResponse(t *testing.T) {
