@@ -119,7 +119,8 @@ func TestMigrationServingAdmissionUnknownLegacyAndReceiptOnlyRestore(t *testing.
 }
 
 func TestMigrationServingAdmissionDoesNotAcquireDatabaseOrApplyLock(t *testing.T) {
-	t.Parallel()
+	// Not parallel: the reader goroutine has a 5s deadline that parallel
+	// load could exceed without any lock being taken.
 	for _, migrated := range []bool{false, true} {
 		st, err := NewPebbleStore(t.TempDir())
 		require.NoError(t, err)

@@ -260,7 +260,8 @@ func TestExternalSnapshotEmptyV6Metadata(t *testing.T) {
 }
 
 func TestExternalSnapshotCorruptMetadataLeavesDestinationUnchanged(t *testing.T) {
-	t.Parallel()
+	// Not parallel: it keeps up to 12 Pebble destinations open until the
+	// test ends, which can exhaust file descriptors alongside other tests.
 	for _, sst := range []bool{false, true} {
 		for _, key := range [][]byte{migrationOwnershipMetaKeyBytes, migrationRetiredMetaKeyBytes,
 			migrationAckMetaKeyBytes, migrationHLCFloorMetaKeyBytes, migrationPromoteMetaKeyBytes, migrationReadyKey(7)} {

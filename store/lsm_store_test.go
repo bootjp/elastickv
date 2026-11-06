@@ -5,6 +5,7 @@ import (
 	"context"
 	"math"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -514,7 +515,8 @@ func TestPebbleStore_CompactResumedPendingAdvancesToRequestedMinTS(t *testing.T)
 }
 
 func TestPebbleStore_CompactWaitsForMaintenanceLock(t *testing.T) {
-	t.Parallel()
+	// Not parallel: requireChannelBlocked gives the goroutine 1s to start,
+	// which parallel load can exceed.
 	dir, err := os.MkdirTemp("", "pebble-compact-lock-*")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
@@ -531,6 +533,10 @@ func TestPebbleStore_CompactWaitsForMaintenanceLock(t *testing.T) {
 	require.True(t, ok)
 
 	ps.maintenanceMu.Lock()
+	// Release on failure too: the deferred Close waits for maintenanceMu,
+	// so a t.Fatal while it is held would hang until the package timeout.
+	unlock := sync.OnceFunc(ps.maintenanceMu.Unlock)
+	defer unlock()
 	done := make(chan error, 1)
 	started := make(chan struct{}, 1)
 	go func() {
@@ -539,7 +545,7 @@ func TestPebbleStore_CompactWaitsForMaintenanceLock(t *testing.T) {
 	}()
 
 	requireChannelBlocked(t, done, started)
-	ps.maintenanceMu.Unlock()
+	unlock()
 
 	select {
 	case err := <-done:
@@ -550,7 +556,8 @@ func TestPebbleStore_CompactWaitsForMaintenanceLock(t *testing.T) {
 }
 
 func TestPebbleStore_RestoreWaitsForMaintenanceLock(t *testing.T) {
-	t.Parallel()
+	// Not parallel: requireChannelBlocked gives the goroutine 1s to start,
+	// which parallel load can exceed.
 	dir, err := os.MkdirTemp("", "pebble-restore-lock-*")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
@@ -563,6 +570,10 @@ func TestPebbleStore_RestoreWaitsForMaintenanceLock(t *testing.T) {
 	require.True(t, ok)
 
 	ps.maintenanceMu.Lock()
+	// Release on failure too: the deferred Close waits for maintenanceMu,
+	// so a t.Fatal while it is held would hang until the package timeout.
+	unlock := sync.OnceFunc(ps.maintenanceMu.Unlock)
+	defer unlock()
 	done := make(chan error, 1)
 	started := make(chan struct{}, 1)
 	go func() {
@@ -571,7 +582,7 @@ func TestPebbleStore_RestoreWaitsForMaintenanceLock(t *testing.T) {
 	}()
 
 	requireChannelBlocked(t, done, started)
-	ps.maintenanceMu.Unlock()
+	unlock()
 
 	select {
 	case err := <-done:
