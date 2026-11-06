@@ -33,6 +33,7 @@ func putNegativePartitionManifest(t *testing.T, st store.MVCCStore, m OwnershipP
 }
 
 func TestOwnershipPartitionNegativeLookupPinnedExactAndBounded(t *testing.T) {
+	t.Parallel()
 	st := &negativePartitionScanStore{MVCCStore: store.NewMVCCStore()}
 	catalog := NewCatalogStore(st)
 	m := ownershipPartitionManifestFixture()
@@ -54,6 +55,7 @@ func TestOwnershipPartitionNegativeLookupPinnedExactAndBounded(t *testing.T) {
 }
 
 func TestOwnershipPartitionNegativeLookupRejectsAmbiguityAndUncommittedC(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	catalog := NewCatalogStore(st)
 	m := ownershipPartitionManifestFixture()
@@ -75,6 +77,7 @@ func TestOwnershipPartitionNegativeLookupRejectsAmbiguityAndUncommittedC(t *test
 }
 
 func TestOwnershipPartitionNegativeLookupRejectsCorruptKeyIdentity(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	catalog := NewCatalogStore(st)
 	m := ownershipPartitionManifestFixture()
