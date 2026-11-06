@@ -8,6 +8,7 @@ import (
 )
 
 func TestParseRaftGroups(t *testing.T) {
+	t.Parallel()
 	t.Run("default address required", func(t *testing.T) {
 		_, err := parseRaftGroups("", "")
 		require.ErrorIs(t, err, ErrAddressRequired)
@@ -54,6 +55,7 @@ func TestParseRaftGroups(t *testing.T) {
 }
 
 func TestParseShardRanges(t *testing.T) {
+	t.Parallel()
 	t.Run("default range", func(t *testing.T) {
 		ranges, err := parseShardRanges("", 7)
 		require.NoError(t, err)
@@ -93,6 +95,7 @@ func TestParseShardRanges(t *testing.T) {
 }
 
 func TestParseRaftRedisMap(t *testing.T) {
+	t.Parallel()
 	m, err := parseRaftRedisMap("a=b, c=d")
 	require.NoError(t, err)
 	require.Equal(t, map[string]string{
@@ -116,6 +119,7 @@ func TestParseRaftRedisMap(t *testing.T) {
 }
 
 func TestParseRaftS3Map(t *testing.T) {
+	t.Parallel()
 	m, err := parseRaftS3Map("a=b, c=d")
 	require.NoError(t, err)
 	require.Equal(t, map[string]string{
@@ -342,6 +346,7 @@ func TestBuildSQSFifoPartitionMapRejectsDedicatedTSOGroup(t *testing.T) {
 }
 
 func TestParseRaftBootstrapMembers(t *testing.T) {
+	t.Parallel()
 	t.Run("parses members", func(t *testing.T) {
 		members, err := parseRaftBootstrapMembers("n1=10.0.0.11:50051, n2=10.0.0.12:50051")
 		require.NoError(t, err)
@@ -369,6 +374,7 @@ func TestParseRaftBootstrapMembers(t *testing.T) {
 }
 
 func TestParseRaftGroupPeers(t *testing.T) {
+	t.Parallel()
 	t.Run("parses groups and sorted members", func(t *testing.T) {
 		peers, err := parseRaftGroupPeers("2=n2@10.0.0.12:50052,n1@10.0.0.11:50052;1=n2@10.0.0.12:50051,n1@10.0.0.11:50051")
 		require.NoError(t, err)
@@ -402,6 +408,7 @@ func TestParseRaftGroupPeers(t *testing.T) {
 }
 
 func TestDefaultGroupID(t *testing.T) {
+	t.Parallel()
 	require.Equal(t, uint64(1), defaultGroupID(nil))
 	require.Equal(t, uint64(2), defaultGroupID([]groupSpec{{id: 3}, {id: 2}}))
 	require.Equal(t, uint64(2), defaultGroupID([]groupSpec{{id: 0}, {id: 2}}))
@@ -409,11 +416,13 @@ func TestDefaultGroupID(t *testing.T) {
 }
 
 func TestDataGroupIDsExcludeDedicatedTSOGroup(t *testing.T) {
+	t.Parallel()
 	require.Equal(t, []uint64{1, 2}, dataGroupIDs([]groupSpec{{id: 0}, {id: 2}, {id: 1}}))
 	require.Empty(t, dataGroupIDs([]groupSpec{{id: 0}}))
 }
 
 func TestParseRuntimeConfigAllowsDedicatedTSOGroupWithoutDataRoute(t *testing.T) {
+	t.Parallel()
 	cfg, err := parseRuntimeConfig(
 		"127.0.0.1:50051",
 		"", "", "", "",
@@ -429,6 +438,7 @@ func TestParseRuntimeConfigAllowsDedicatedTSOGroupWithoutDataRoute(t *testing.T)
 }
 
 func TestParseRuntimeConfigMultipleDataGroupsEnableMultiDataDirs(t *testing.T) {
+	t.Parallel()
 	cfg, err := parseRuntimeConfig(
 		"127.0.0.1:50051",
 		"", "", "", "",
@@ -440,6 +450,7 @@ func TestParseRuntimeConfigMultipleDataGroupsEnableMultiDataDirs(t *testing.T) {
 }
 
 func TestValidateShardRanges(t *testing.T) {
+	t.Parallel()
 	groups := []groupSpec{{id: 0}, {id: 1}, {id: 2}}
 
 	t.Run("valid", func(t *testing.T) {

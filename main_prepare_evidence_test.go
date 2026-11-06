@@ -51,6 +51,7 @@ func TestPrepareEvidenceCapabilityRequiresCoordinatorRuntime(t *testing.T) {
 }
 
 func TestDedicatedTimestampCutoverOptionsRejectsNilState(t *testing.T) {
+	t.Parallel()
 	require.Empty(t, dedicatedTimestampCutoverOptions(map[uint64]*kv.ShardGroup{0: {}}))
 }
 
@@ -61,6 +62,7 @@ func (f prepareSafetyNextHook) PreAddMember(ctx context.Context, id, address str
 }
 
 func TestPrepareEvidenceSafetyMainMembershipProbePrecedesExistingHook(t *testing.T) {
+	t.Parallel()
 	probeFailure, nextFailure := errors.New("unsupported member"), errors.New("existing hook rejected")
 	for _, probeErr := range []error{nil, probeFailure} {
 		var order []string
@@ -90,6 +92,7 @@ func TestPrepareEvidenceSafetyMainMembershipProbePrecedesExistingHook(t *testing
 }
 
 func TestPrepareEvidenceSafetyMainAdmissionStillRejectsOldMemberAfterMarker(t *testing.T) {
+	t.Parallel()
 	for _, kind := range []string{"old-unsupported", "hlc-only", "fresh-dedicated-learner"} {
 		t.Run(kind, func(t *testing.T) {
 			lis, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")

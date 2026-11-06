@@ -55,6 +55,7 @@ func bootstrapIngressLoadCatalog(t *testing.T, gate *startupPublicKVGate) {
 }
 
 func TestBootstrapIngressRejectsDirectReadBeforeDataReady(t *testing.T) {
+	t.Parallel()
 	gate := bootstrapIngressFixture(t)
 	called := false
 	_, err := gate.unaryInterceptor(t.Context(), nil,
@@ -65,6 +66,7 @@ func TestBootstrapIngressRejectsDirectReadBeforeDataReady(t *testing.T) {
 }
 
 func TestBootstrapIngressDiscardsReadResultAfterTermChange(t *testing.T) {
+	t.Parallel()
 	gate := bootstrapIngressFixture(t)
 	bootstrapIngressLoadCatalog(t, gate)
 	response, err := gate.unaryInterceptor(t.Context(), nil,
@@ -80,6 +82,7 @@ func TestBootstrapIngressDiscardsReadResultAfterTermChange(t *testing.T) {
 }
 
 func TestBootstrapIngressCommittedWriteResultRemainsUnknownAfterRevocation(t *testing.T) {
+	t.Parallel()
 	gate := bootstrapIngressFixture(t)
 	bootstrapIngressLoadCatalog(t, gate)
 	committed := false
@@ -108,6 +111,7 @@ func (s *bootstrapIngressTestStream) Context() context.Context { return s.ctx }
 func (s *bootstrapIngressTestStream) SendMsg(any) error        { s.sent++; return nil }
 
 func TestBootstrapIngressStreamRechecksEveryReply(t *testing.T) {
+	t.Parallel()
 	gate := bootstrapIngressFixture(t)
 	bootstrapIngressLoadCatalog(t, gate)
 	stream := &bootstrapIngressTestStream{ctx: t.Context()}

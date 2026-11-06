@@ -30,6 +30,7 @@ func bootstrapTestRotationFrame(rotation fsmwire.RotationPayload) []byte {
 }
 
 func TestBootstrapRotationPayloadExactGrantPlainAndEncrypted(t *testing.T) {
+	t.Parallel()
 	for _, purpose := range []fsmwire.Purpose{fsmwire.PurposeStorage, fsmwire.PurposeRaft} {
 		for _, subtag := range []byte{fsmwire.RotateSubRotateDEK, fsmwire.RotateSubEnableStorageEnvelope, fsmwire.RotateSubEnableRaftEnvelope} {
 			rotation := bootstrapTestRotation()
@@ -73,6 +74,7 @@ func assertBootstrapRotationGrant(t *testing.T, plain []byte) {
 }
 
 func TestBootstrapRotationPayloadGrantRejectsDifferentCompleteRecipe(t *testing.T) {
+	t.Parallel()
 	rotation := bootstrapTestRotation()
 	grant, err := newBootstrapRotationPayloadGrant(17, bootstrapTestRotationFrame(rotation))
 	require.NoError(t, err)
@@ -107,6 +109,7 @@ func TestBootstrapRotationPayloadGrantRejectsDifferentCompleteRecipe(t *testing.
 }
 
 func TestBootstrapRotationPayloadRejectsInvalidFrames(t *testing.T) {
+	t.Parallel()
 	rotation := bootstrapTestRotation()
 	for name, mutate := range map[string]func(*fsmwire.RotationPayload){
 		"unknown subtag":        func(p *fsmwire.RotationPayload) { p.SubTag = 0xff },
@@ -148,6 +151,7 @@ func (e *bootstrapEncryptedCaptureEngine) ProposeAdmin(_ context.Context, payloa
 }
 
 func TestBootstrapRotationRequestGrantMatchesActualAdminAndDynamicWrap(t *testing.T) {
+	t.Parallel()
 	request := &pb.RotateDEKRequest{NewDekId: 9, Purpose: pb.RotateDEKRequest_PURPOSE_RAFT, WrappedNewDek: []byte("fixed wrapped DEK"), ProposerNodeId: 42, ProposerLocalEpoch: 7}
 	grants, err := bootstrapRotationPayloadGrants(17, request)
 	require.NoError(t, err)

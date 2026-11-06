@@ -227,6 +227,7 @@ func bootstrapGateContext(t *testing.T, values ...string) (context.Context, cont
 }
 
 func TestBootstrapControlGateTokenExactAndDedicated(t *testing.T) {
+	t.Parallel()
 	for _, values := range [][]string{nil, {""}, {"wrong"}, {bootstrapGateTestToken + " "},
 		{bootstrapGateTestToken, bootstrapGateTestToken}} {
 		ctx := metadata.NewIncomingContext(t.Context(), metadata.MD{bootstrapControlHeader: values})
@@ -242,6 +243,7 @@ func TestBootstrapControlGateTokenExactAndDedicated(t *testing.T) {
 }
 
 func TestBootstrapControlGateHeadersCannotMintReceipt(t *testing.T) {
+	t.Parallel()
 	ctx := metadata.NewIncomingContext(t.Context(), metadata.Pairs(bootstrapControlHeader, bootstrapGateTestToken,
 		"x-elastickv-peer-session", "forged", "x-elastickv-peer-proof", "forged"))
 	_, handled, err := handleBootstrapStartupControl(ctx, bootstrapGateTestToken, nil,
@@ -251,6 +253,7 @@ func TestBootstrapControlGateHeadersCannotMintReceipt(t *testing.T) {
 }
 
 func TestBootstrapControlGateTLSBeforeDataReadyExactLanes(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		method  string
 		group   uint64
@@ -286,6 +289,7 @@ func TestBootstrapControlGateTLSBeforeDataReadyExactLanes(t *testing.T) {
 }
 
 func TestBootstrapControlGateTLSFailuresNeverFallBack(t *testing.T) {
+	t.Parallel()
 	f := newBootstrapGateFixture(t, 17)
 	for _, values := range [][]string{nil, {""}, {"wrong"}, {bootstrapGateTestToken, bootstrapGateTestToken}} {
 		ctx, cancel := bootstrapGateContext(t, values...)
@@ -306,6 +310,7 @@ func TestBootstrapControlGateTLSFailuresNeverFallBack(t *testing.T) {
 }
 
 func TestBootstrapControlGateTLSRevocationDiscardsSuccess(t *testing.T) {
+	t.Parallel()
 	f := newBootstrapGateFixture(t, 17)
 	f.service.action = func(context.Context) error { f.a.Suspend(17); return nil }
 	ctx, cancel := bootstrapGateContext(t, bootstrapGateTestToken)
@@ -319,6 +324,7 @@ func TestBootstrapControlGateTLSRevocationDiscardsSuccess(t *testing.T) {
 }
 
 func TestBootstrapControlGateDescriptorDoesNotExpandAuthority(t *testing.T) {
+	t.Parallel()
 	for _, method := range []string{pb.RawKV_RawGet_FullMethodName, pb.Internal_Forward_FullMethodName,
 		pb.EncryptionAdmin_RotateDEK_FullMethodName, pb.Admin_BeginBackup_FullMethodName, "/unknown/Control"} {
 		_, _, ok := bootstrapStartupControlDescriptor(17, method)
@@ -327,6 +333,7 @@ func TestBootstrapControlGateDescriptorDoesNotExpandAuthority(t *testing.T) {
 }
 
 func TestBootstrapControlGateTLSActivationUsesRecoveryBeforeControlReady(t *testing.T) {
+	t.Parallel()
 	f := newBootstrapGateFixture(t, 17, peersession.IdentityReady)
 	require.Equal(t, peersession.IdentityReady, f.a.Stage(17))
 	_, _, err := f.a.Begin(t.Context(), raftadmission.Control)
@@ -363,6 +370,7 @@ func TestBootstrapControlGateTLSActivationUsesRecoveryBeforeControlReady(t *test
 }
 
 func TestBootstrapControlGateTLSActivationStillRequiresDedicatedToken(t *testing.T) {
+	t.Parallel()
 	f := newBootstrapGateFixture(t, 17, peersession.IdentityReady)
 	payload := bootstrapPayloadActivation(t, 17)
 	for _, values := range [][]string{nil, {""}, {"wrong"}, {bootstrapGateTestToken, bootstrapGateTestToken}} {
@@ -378,6 +386,7 @@ func TestBootstrapControlGateTLSActivationStillRequiresDedicatedToken(t *testing
 }
 
 func TestBootstrapControlGateTLSReceiptRevocationWaitsForNativeAction(t *testing.T) {
+	t.Parallel()
 	t.Run("prepare control", func(t *testing.T) {
 		testBootstrapGateReceiptRevocation(t, peersession.ControlReady, kv.EncodePrepareEvidenceSeal())
 	})

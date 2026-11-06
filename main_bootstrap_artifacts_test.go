@@ -45,6 +45,7 @@ func bootstrapArtifactAcks(t testing.TB, manifest raftbootstrap.BaselineManifest
 }
 
 func TestBootstrapArtifactsAllMemberRoundTrip(t *testing.T) {
+	t.Parallel()
 	manifest, configs := bootstrapArtifactsFixture(t)
 	raw := bootstrapArtifactAcks(t, manifest, configs)
 	for i, data := range raw {
@@ -77,6 +78,7 @@ func TestBootstrapArtifactsAllMemberRoundTrip(t *testing.T) {
 }
 
 func TestBootstrapArtifactsSignerRejectsUntrustedIdentity(t *testing.T) {
+	t.Parallel()
 	for name, change := range map[string]func(*bootstrapPeerConfig, *raftbootstrap.BaselineManifest){
 		"missing TLS":  func(c *bootstrapPeerConfig, _ *raftbootstrap.BaselineManifest) { c.clientTLS = nil },
 		"missing cert": func(c *bootstrapPeerConfig, _ *raftbootstrap.BaselineManifest) { c.clientTLS.Certificates = nil },
@@ -111,6 +113,7 @@ func TestBootstrapArtifactsSignerRejectsUntrustedIdentity(t *testing.T) {
 }
 
 func TestBootstrapArtifactsStrictJSON(t *testing.T) {
+	t.Parallel()
 	manifest, configs := bootstrapArtifactsFixture(t)
 	valid := bootstrapArtifactAcks(t, manifest, configs)[0]
 	for name, raw := range map[string][]byte{
@@ -139,6 +142,7 @@ func TestBootstrapArtifactsStrictJSON(t *testing.T) {
 }
 
 func TestBootstrapArtifactsRejectsAlteredSignedFields(t *testing.T) {
+	t.Parallel()
 	manifest, configs := bootstrapArtifactsFixture(t)
 	valid := bootstrapArtifactAcks(t, manifest, configs)[0]
 	for name, change := range map[string]func(*bootstrapPreparedAckJSON){
@@ -169,6 +173,7 @@ func TestBootstrapArtifactsRejectsAlteredSignedFields(t *testing.T) {
 }
 
 func TestBootstrapArtifactsAssemblerRejectsIncompleteOrForeignCut(t *testing.T) {
+	t.Parallel()
 	manifest, configs := bootstrapArtifactsFixture(t)
 	acks := bootstrapArtifactAcks(t, manifest, configs)
 	for name, imported := range map[string][][]byte{

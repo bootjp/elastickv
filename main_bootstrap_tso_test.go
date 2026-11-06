@@ -71,6 +71,7 @@ func protectedTSOStore(t *testing.T) store.MVCCStore {
 }
 
 func TestProtectedTSOPolicyRecoveryUsesDurableBacking(t *testing.T) {
+	t.Parallel()
 	spec, _, policy := protectedTSOFixture(t, t.TempDir())
 	st := protectedTSOStore(t)
 	seedProtectedTSO(t, st, policy)
@@ -99,6 +100,7 @@ func TestProtectedTSOPolicyRecoveryUsesDurableBacking(t *testing.T) {
 }
 
 func TestProtectedTSORejectsMissingOrInconsistentState(t *testing.T) {
+	t.Parallel()
 	for _, kind := range []string{"empty", "policy-only", "scalars-only", "configuration-mismatch"} {
 		t.Run(kind, func(t *testing.T) {
 			_, _, policy := protectedTSOFixture(t, t.TempDir())
@@ -130,6 +132,7 @@ func TestProtectedTSORejectsMissingOrInconsistentState(t *testing.T) {
 }
 
 func TestProtectedTSOFactoryNeverAutoMigrates(t *testing.T) {
+	t.Parallel()
 	base := t.TempDir()
 	dir := groupDataDir(base, "n1", dedicatedTSORaftGroupID, true)
 	spec, domain, _ := protectedTSOFixture(t, dir)
@@ -162,6 +165,7 @@ type protectedTSOTestObserver struct{}
 func (protectedTSOTestObserver) ObserveProposalFailure() {}
 
 func TestProtectedTSOFactoryRejectsEmptyControlDatabase(t *testing.T) {
+	t.Parallel()
 	base := t.TempDir()
 	dir := groupDataDir(base, "n1", dedicatedTSORaftGroupID, true)
 	spec, domain, _ := protectedTSOFixture(t, dir)
@@ -185,6 +189,7 @@ func TestProtectedTSOFactoryRejectsEmptyControlDatabase(t *testing.T) {
 }
 
 func TestProtectedTSOStartupRegistersSharedDomain(t *testing.T) {
+	t.Parallel()
 	spec, domain, policy := protectedTSOFixture(t, t.TempDir())
 	st := protectedTSOStore(t)
 	seedProtectedTSO(t, st, policy)
@@ -241,6 +246,7 @@ func preparedTSOFixture(t *testing.T, commit uint64) (*groupBootstrapSpec, *boot
 }
 
 func TestPreparedTSOExplicitFirstActivation(t *testing.T) {
+	t.Parallel()
 	spec, _, st, prepared := preparedTSOFixture(t, 7)
 	c := prepared.Probe.BaselineContext
 	configurationDigest := prepared.Probe.Evidence.ConfigurationDigest
@@ -293,6 +299,7 @@ func TestPreparedTSOExplicitFirstActivation(t *testing.T) {
 }
 
 func TestPreparedTSORecoveryRejectsFreshNativeSource(t *testing.T) {
+	t.Parallel()
 	for _, version := range []string{"v1", "v2", "wrong-v2"} {
 		t.Run(version, func(t *testing.T) {
 			spec, domain, st, prepared := preparedTSOFixture(t, 1)

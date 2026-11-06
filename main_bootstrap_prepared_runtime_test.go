@@ -10,6 +10,7 @@ import (
 )
 
 func TestPreparedBootstrapIdentityPinsMemberAndCompleteConfiguration(t *testing.T) {
+	t.Parallel()
 	_, _, raw := baselineCLIFixture(t)
 	m, err := raftbootstrap.ParseBaselineManifest(raw)
 	require.NoError(t, err)
@@ -32,6 +33,7 @@ func TestPreparedBootstrapIdentityPinsMemberAndCompleteConfiguration(t *testing.
 }
 
 func TestRecoveredPolicyMirrorsActivationWithoutDowngrade(t *testing.T) {
+	t.Parallel()
 	_, _, raw := baselineCLIFixture(t)
 	m, err := raftbootstrap.ParseBaselineManifest(raw)
 	require.NoError(t, err)

@@ -44,6 +44,7 @@ func bootstrapFixturePayloadCluster(t *testing.T, payload []byte) raftbootstrap.
 }
 
 func TestBootstrapEncryptedPayloadUsesRealWrapperAndStrictLane(t *testing.T) {
+	t.Parallel()
 	for _, fixture := range bootstrapPayloadFixtures(t) {
 		t.Run(fixture.name, func(t *testing.T) {
 			projection, wrap := bootstrapEncryptedPayloadFixture(t, 17)
@@ -70,6 +71,7 @@ func TestBootstrapEncryptedPayloadUsesRealWrapperAndStrictLane(t *testing.T) {
 }
 
 func TestBootstrapEncryptedPayloadRejectsTamperedOrIncompleteEnvelope(t *testing.T) {
+	t.Parallel()
 	projection, wrap := bootstrapEncryptedPayloadFixture(t, 17)
 	final, err := wrap(bootstrapPayloadProto(t, bootstrapPayloadSingle, bootstrapPayloadRequest()))
 	require.NoError(t, err)
@@ -89,6 +91,7 @@ func TestBootstrapEncryptedPayloadRejectsTamperedOrIncompleteEnvelope(t *testing
 }
 
 func TestBootstrapEncryptedPayloadAuthenticatesThenParsesCompleteInner(t *testing.T) {
+	t.Parallel()
 	projection, wrap := bootstrapEncryptedPayloadFixture(t, 17)
 	plain := bootstrapPayloadProto(t, bootstrapPayloadSingle, bootstrapPayloadRequest())
 	for _, payload := range [][]byte{{0xff}, append(bytes.Clone(plain), 0), {fsmwire.OpRotation, 1}, {0x06}, {0x07}} {
@@ -110,6 +113,7 @@ func TestBootstrapEncryptedPayloadAuthenticatesThenParsesCompleteInner(t *testin
 }
 
 func TestBootstrapEncryptedPayloadRejectsWrongProjectionKeysAndScope(t *testing.T) {
+	t.Parallel()
 	projection, wrap := bootstrapEncryptedPayloadFixture(t, 17)
 	final, err := wrap(bootstrapPayloadGuarded(t, raftbootstrap.ControlGuardedWatermark))
 	require.NoError(t, err)
@@ -135,6 +139,7 @@ func TestBootstrapEncryptedPayloadRejectsWrongProjectionKeysAndScope(t *testing.
 }
 
 func TestBootstrapEncryptedPayloadRejectsLoadedButInactiveKey(t *testing.T) {
+	t.Parallel()
 	projection, wrap := bootstrapEncryptedPayloadFixture(t, 17)
 	final, err := wrap(bootstrapPayloadProto(t, bootstrapPayloadSingle, bootstrapPayloadRequest()))
 	require.NoError(t, err)
@@ -150,6 +155,7 @@ func TestBootstrapEncryptedPayloadRejectsLoadedButInactiveKey(t *testing.T) {
 }
 
 func TestBootstrapEncryptedPayloadSealBindsActualCiphertext(t *testing.T) {
+	t.Parallel()
 	projection, wrap := bootstrapEncryptedPayloadFixture(t, 17)
 	plain := binary.BigEndian.AppendUint64([]byte{bootstrapPayloadHLC}, 1000)
 	first, err := wrap(plain)
@@ -169,6 +175,7 @@ func TestBootstrapEncryptedPayloadSealBindsActualCiphertext(t *testing.T) {
 }
 
 func TestBootstrapEncryptedRegistrationRejectsInvalidIdentity(t *testing.T) {
+	t.Parallel()
 	projection, wrap := bootstrapEncryptedPayloadFixture(t, 17)
 	for _, registration := range []fsmwire.RegistrationPayload{{FullNodeID: 42}, {DEKID: 4}} {
 		plain := append([]byte{fsmwire.OpRegistration}, fsmwire.EncodeRegistration(registration)...)
@@ -180,6 +187,7 @@ func TestBootstrapEncryptedRegistrationRejectsInvalidIdentity(t *testing.T) {
 }
 
 func TestBootstrapEncryptedPayloadRejectsWrongAADPurpose(t *testing.T) {
+	t.Parallel()
 	projection, _ := bootstrapEncryptedPayloadFixture(t, 17)
 	nonce, err := encryptiontest.NewNonceFactory(t).Next()
 	require.NoError(t, err)

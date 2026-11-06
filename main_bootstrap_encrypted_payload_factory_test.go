@@ -10,6 +10,7 @@ import (
 )
 
 func TestBootstrapEncryptedPayloadFactoryExplicitDomainBinding(t *testing.T) {
+	t.Parallel()
 	cluster := raftbootstrap.UUID{1}
 	projection, wrap := bootstrapEncryptedPayloadFixture(t, 17)
 	final, err := wrap(bootstrapPayloadProto(t, bootstrapPayloadSingle, bootstrapPayloadRequest()))
@@ -37,6 +38,7 @@ func TestBootstrapEncryptedPayloadFactoryExplicitDomainBinding(t *testing.T) {
 }
 
 func TestBootstrapEncryptedPayloadFactoryRejectsChangingPublication(t *testing.T) {
+	t.Parallel()
 	projection, wrap := bootstrapEncryptedPayloadFixture(t, 17)
 	final, err := wrap(bootstrapPayloadProto(t, bootstrapPayloadSingle, bootstrapPayloadRequest()))
 	require.NoError(t, err)

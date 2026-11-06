@@ -14,6 +14,7 @@ import (
 )
 
 func TestBootstrapExternalRotationRuntimeUnknownDoesNotReissue(t *testing.T) {
+	t.Parallel()
 	for _, applied := range []bool{false, true} {
 		t.Run(map[bool]string{false: "absent", true: "applied"}[applied], func(t *testing.T) {
 			f := newRotationRuntimeFixture(t, raftengine.StateLeader)
@@ -46,6 +47,7 @@ func TestBootstrapExternalRotationRuntimeUnknownDoesNotReissue(t *testing.T) {
 }
 
 func TestBootstrapExternalRotationUnknownOverridesNestedCanceledStatus(t *testing.T) {
+	t.Parallel()
 	err := bootstrapExternalRotationUnknown(status.Error(codes.Canceled, "native owner invalidated"))
 	require.Equal(t, codes.Unknown, status.Code(err))
 	require.ErrorIs(t, err, kv.ErrTransactionOutcomeUnknown)

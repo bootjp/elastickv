@@ -109,6 +109,7 @@ func signedOfflineEncryptedPreparation(t *testing.T, proof etcd.BaselineStorePro
 }
 
 func TestBootstrapOfflineEncryptionTwoMembersLogicalEqual(t *testing.T) {
+	t.Parallel()
 	a := newOfflineEncryptionAssets(t)
 	one, _, e1 := offlineEncryptedStore(t, 1, a)
 	two, _, e2 := offlineEncryptedStore(t, 2, a)
@@ -126,6 +127,7 @@ func TestBootstrapOfflineEncryptionTwoMembersLogicalEqual(t *testing.T) {
 }
 
 func TestBootstrapOfflineEncryptionPrepareRestartPreservesCiphertext(t *testing.T) {
+	// Not parallel: store.VerifyBootstrapBaselinePhysicalEquality calls Error() on a closed pebble iterator, whose pooled allocation another test's pebble DB may be reusing.
 	a := newOfflineEncryptionAssets(t)
 	root, path, enc := offlineEncryptedStore(t, 1, a)
 	proof, err := bootstrapOfflineDataStoreProbe(t.Context(), root, enc)
@@ -159,6 +161,7 @@ func TestBootstrapOfflineEncryptionPrepareRestartPreservesCiphertext(t *testing.
 }
 
 func TestBootstrapOfflineEncryptionWrongKEKMissingKeyAndEpochDrift(t *testing.T) {
+	t.Parallel()
 	a := newOfflineEncryptionAssets(t)
 	root, path, enc := offlineEncryptedStore(t, 1, a)
 	before := offlineDataFiles(t, root)
@@ -189,6 +192,7 @@ func TestBootstrapOfflineEncryptionWrongKEKMissingKeyAndEpochDrift(t *testing.T)
 }
 
 func TestBootstrapOfflineEncryptionTamperedExpiredValueFailsReadOnly(t *testing.T) {
+	t.Parallel()
 	a := newOfflineEncryptionAssets(t)
 	root, _, enc := offlineEncryptedStore(t, 1, a)
 	require.NoError(t, bootstrapOfflineWithData(t.Context(), root, false, func(db *pebble.DB) error {
@@ -213,6 +217,7 @@ func TestBootstrapOfflineEncryptionTamperedExpiredValueFailsReadOnly(t *testing.
 }
 
 func TestBootstrapOfflineEncryptionNativeSnapshotValidation(t *testing.T) {
+	t.Parallel()
 	a := newOfflineEncryptionAssets(t)
 	root, _, enc := offlineEncryptedStore(t, 1, a)
 	var stream bytes.Buffer
@@ -270,6 +275,7 @@ func TestBootstrapOfflineEncryptionNativeSnapshotValidation(t *testing.T) {
 }
 
 func TestBootstrapOfflineEncryptionSnapshotHeaderBoundaries(t *testing.T) {
+	t.Parallel()
 	e := &bootstrapOfflineEncryption{checkpoint: encryption.SnapshotCheckpoint{Index: 10, State: [32]byte{1}}, cutover: 6}
 	for _, tc := range []struct {
 		name           string

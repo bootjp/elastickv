@@ -208,6 +208,7 @@ func TestBootstrapRotationRPCRequestBoundary(t *testing.T) {
 }
 
 func TestBootstrapRotationRPCRejectsCapturedStartupReceipt(t *testing.T) {
+	t.Parallel()
 	f := newBootstrapAuthFixture(t, 1, peersession.ControlReady, nil)
 	var checked atomic.Bool
 	f.service.action = func(ctx context.Context) error {

@@ -77,6 +77,7 @@ func (f *bootstrapProjectionFixture) register(t *testing.T, id uint32, node uint
 }
 
 func TestBootstrapEncryptionProjectionNotRequested(t *testing.T) {
+	t.Parallel()
 	got, err := readBootstrapEncryptionProjection(bootstrapEncryptionProjectionInput{})
 	require.NoError(t, err)
 	require.Equal(t, bootstrapEncryptionProjection{
@@ -92,6 +93,7 @@ func TestBootstrapEncryptionProjectionNotRequested(t *testing.T) {
 }
 
 func TestBootstrapEncryptionProjectionAppliedObservation(t *testing.T) {
+	t.Parallel()
 	f := newBootstrapProjectionFixture(t)
 	before, err := os.ReadFile(f.in.sidecarPath)
 	require.NoError(t, err)
@@ -119,6 +121,7 @@ func TestBootstrapEncryptionProjectionAppliedObservation(t *testing.T) {
 }
 
 func TestBootstrapEncryptionProjectionRejectsIncompleteProof(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name   string
 		mutate func(*testing.T, *bootstrapProjectionFixture)
@@ -188,6 +191,7 @@ func TestBootstrapEncryptionProjectionRejectsIncompleteProof(t *testing.T) {
 }
 
 func TestBootstrapEncryptionProjectionZeroEpochNeedsDurableRow(t *testing.T) {
+	t.Parallel()
 	f := newBootstrapProjectionFixture(t)
 	f.in.storageEpoch = 0
 	f.sidecar.Active.Storage = 3
@@ -204,6 +208,7 @@ func TestBootstrapEncryptionProjectionZeroEpochNeedsDurableRow(t *testing.T) {
 }
 
 func TestBootstrapEncryptionProjectionRejectsWrapperDrift(t *testing.T) {
+	t.Parallel()
 	f := newBootstrapProjectionFixture(t)
 	calls := 0
 	f.in.raftWrapperInstalled = func(uint32, uint16) bool {
@@ -216,6 +221,7 @@ func TestBootstrapEncryptionProjectionRejectsWrapperDrift(t *testing.T) {
 }
 
 func TestBootstrapEncryptionProjectionInactiveEnvelopes(t *testing.T) {
+	t.Parallel()
 	f := newBootstrapProjectionFixture(t)
 	f.sidecar.StorageEnvelopeActive = false
 	f.sidecar.StorageEnvelopeCutoverIndex = 0
@@ -249,6 +255,7 @@ func (s bootstrapProjectionReadErrorStore) LoadEncryptionSnapshotCheckpoint() (e
 }
 
 func TestBootstrapEncryptionProjectionPropagatesStoreError(t *testing.T) {
+	t.Parallel()
 	f := newBootstrapProjectionFixture(t)
 	failure := errors.New("store unavailable")
 	got, err := sampleBootstrapEncryptionProjection(f.in, bootstrapProjectionReadErrorStore{err: failure}, f.registry)
@@ -262,6 +269,7 @@ func TestBootstrapEncryptionProjectionPropagatesStoreError(t *testing.T) {
 }
 
 func TestBootstrapEncryptionProjectionCheckpointExcludesEpoch(t *testing.T) {
+	t.Parallel()
 	f := newBootstrapProjectionFixture(t)
 	for id, key := range f.sidecar.Keys {
 		key.LocalEpoch++
@@ -275,6 +283,7 @@ func TestBootstrapEncryptionProjectionCheckpointExcludesEpoch(t *testing.T) {
 }
 
 func TestBootstrapEncryptionProjectionMissingDurableProof(t *testing.T) {
+	t.Parallel()
 	f := newBootstrapProjectionFixture(t)
 	for _, source := range []bootstrapProjectionReadErrorStore{
 		{},
@@ -289,6 +298,7 @@ func TestBootstrapEncryptionProjectionMissingDurableProof(t *testing.T) {
 }
 
 func TestBootstrapEncryptionProjectionRejectsAppliedDrift(t *testing.T) {
+	t.Parallel()
 	f := newBootstrapProjectionFixture(t)
 	f.in.raftWrapperInstalled = func(uint32, uint16) bool {
 		require.NoError(t, f.sink.SetDurableAppliedIndex(41))

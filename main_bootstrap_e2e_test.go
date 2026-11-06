@@ -122,6 +122,7 @@ func (n *bootstrapE2ENode) close() error {
 }
 
 func TestRaftBootstrapMembers_E2E_FixedClusterWithoutAddVoter(t *testing.T) {
+	t.Parallel()
 	for _, engineType := range []raftEngineType{raftEngineEtcd} {
 		t.Run(string(engineType), func(t *testing.T) {
 			const (
@@ -169,6 +170,7 @@ func TestRaftBootstrapMembers_E2E_FixedClusterWithoutAddVoter(t *testing.T) {
 }
 
 func TestRaftBootstrapMembers_E2E_EtcdLeaderRestartRecovery(t *testing.T) {
+	t.Parallel()
 	const (
 		startupAttempts = 5
 		nodeCount       = 3
@@ -219,6 +221,7 @@ func TestRaftBootstrapMembers_E2E_EtcdLeaderRestartRecovery(t *testing.T) {
 }
 
 func TestRaftGroupPeers_E2E_MultiNodeMultiGroupBootstrap(t *testing.T) {
+	t.Parallel()
 	const (
 		nodeCount    = 3
 		waitTimeout  = 20 * time.Second

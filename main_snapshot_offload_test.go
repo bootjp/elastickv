@@ -73,6 +73,7 @@ func TestSnapshotOffloadBuildsALocalStore(t *testing.T) {
 // from another group's directory would ship the wrong state under the
 // right manifest identity.
 func TestSnapshotOffloadGroupsCarryPerGroupDataDirs(t *testing.T) {
+	t.Parallel()
 	raftDir := t.TempDir()
 	runtimes := []*raftGroupRuntime{
 		{spec: groupSpec{id: 1}},
@@ -99,6 +100,7 @@ func TestSnapshotOffloadGroupsCarryPerGroupDataDirs(t *testing.T) {
 // runtime whose engine has been cleared must report "not leader"
 // rather than panic or, worse, publish.
 func TestSnapshotOffloadLeadershipFailsClosedOnAClosedEngine(t *testing.T) {
+	t.Parallel()
 	rt := &raftGroupRuntime{spec: groupSpec{id: 7}} // engine never set
 
 	require.False(t, snapshotOffloadIsLeader(rt)(),

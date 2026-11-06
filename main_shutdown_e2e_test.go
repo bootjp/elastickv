@@ -32,6 +32,7 @@ func TestShutdownProcess(t *testing.T) {
 }
 
 func TestShutdownSIGTERMTransfersEveryRaftGroupE2E(t *testing.T) {
+	t.Parallel()
 	const nodeCount = 3
 	groupIDs := []uint64{1, 2}
 	baseDir := t.TempDir()

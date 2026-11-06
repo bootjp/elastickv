@@ -15,6 +15,7 @@ func offlineEncryptionFlags() []string {
 }
 
 func TestBootstrapOfflineEncryptionCLIStrictInputs(t *testing.T) {
+	t.Parallel()
 	for _, command := range []string{"inspect", "prepare", "resume"} {
 		args := baselineCLIArgs()
 		args[0] = command
@@ -49,6 +50,7 @@ func TestBootstrapOfflineEncryptionCLIStrictInputs(t *testing.T) {
 }
 
 func TestBootstrapOfflineEncryptionCLILoadIsExplicitAndReadOnly(t *testing.T) {
+	t.Parallel()
 	a := newOfflineEncryptionAssets(t)
 	root, path, _ := offlineEncryptedStore(t, 1, a)
 	cfg := bootstrapOfflineEncryptionCLI{Sidecar: path, KEKFile: a.file}
@@ -73,6 +75,7 @@ func TestBootstrapOfflineEncryptionCLILoadIsExplicitAndReadOnly(t *testing.T) {
 }
 
 func TestBootstrapOfflineEncryptionCLIRejectsHardlinkedSecret(t *testing.T) {
+	t.Parallel()
 	a := newOfflineEncryptionAssets(t)
 	root, path, _ := offlineEncryptedStore(t, 1, a)
 	require.NoError(t, os.Link(a.file, filepath.Join(root, "external-secret-alias")))

@@ -20,6 +20,7 @@ type bootstrapStartupRecoveryEngine struct {
 }
 
 func TestBootstrapEncryptionStartupInactiveStorageRejectsBeforeWorkers(t *testing.T) {
+	t.Parallel()
 	f := newEncryptionRuntimeIOFixture(t)
 	require.False(t, f.cfg.Wiring.cache.StorageEnvelopeActive())
 	var workers errgroup.Group
@@ -40,6 +41,7 @@ func (e *bootstrapStartupRecoveryEngine) RecoveryLinearizableRead(ctx context.Co
 }
 
 func TestBootstrapEncryptionStartupPlaintextAndMissingIO(t *testing.T) {
+	t.Parallel()
 	ctx, supervisor, err := configureBootstrapEncryptionStartup(t.Context(), bootstrapEncryptionStartupConfig{})
 	require.NoError(t, err)
 	require.Equal(t, t.Context(), ctx)
@@ -81,6 +83,7 @@ func bootstrapStartupRotationAdmission(t *testing.T) *bootstrapDomain {
 }
 
 func TestBootstrapEncryptionRecoveryBarrierOwnsRecoveryChildOfRotation(t *testing.T) {
+	t.Parallel()
 	domain := bootstrapStartupRotationAdmission(t)
 	engine := &bootstrapStartupRecoveryEngine{}
 	engine.read = func(ctx context.Context) (uint64, error) {
@@ -109,6 +112,7 @@ func TestBootstrapEncryptionRecoveryBarrierOwnsRecoveryChildOfRotation(t *testin
 }
 
 func TestBootstrapEncryptionRecoveryBarrierRejectsRetiredEngineAndCancellation(t *testing.T) {
+	t.Parallel()
 	domain := bootstrapIngressFixture(t).domain
 	engine := &bootstrapStartupRecoveryEngine{}
 	rt := &raftGroupRuntime{spec: groupSpec{id: 1}, engine: engine}

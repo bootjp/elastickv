@@ -14,6 +14,7 @@ import (
 )
 
 func TestGroupDataDir(t *testing.T) {
+	t.Parallel()
 	base := "/tmp/data"
 	raftID := "n1"
 
@@ -35,6 +36,7 @@ func TestGroupDataDir(t *testing.T) {
 }
 
 func TestBuildShardGroupsWithDedicatedTSOPreservesSingleDataGroupDir(t *testing.T) {
+	t.Parallel()
 	baseDir := t.TempDir()
 	raftID := "n1"
 	legacyDir := filepath.Join(baseDir, raftID)
@@ -89,6 +91,7 @@ func TestBuildShardGroupsWithDedicatedTSOPreservesSingleDataGroupDir(t *testing.
 }
 
 func TestBuildShardGroupsWithDedicatedTSOPreservesLegacyGroupZeroStore(t *testing.T) {
+	t.Parallel()
 	baseDir := t.TempDir()
 	legacyStoreDir := filepath.Join(baseDir, "n1", "group-0", "fsm.db")
 	require.NoError(t, os.MkdirAll(legacyStoreDir, raftDirPerm))
@@ -125,6 +128,7 @@ func TestBuildShardGroupsWithDedicatedTSOPreservesLegacyGroupZeroStore(t *testin
 }
 
 func TestBuildShardGroupsClosesEarlierStoresWhenLaterGroupFails(t *testing.T) {
+	t.Parallel()
 	baseDir := t.TempDir()
 	badGroupDir := groupDataDir(baseDir, "n1", 2, true)
 	require.NoError(t, os.MkdirAll(badGroupDir, raftDirPerm))
@@ -171,6 +175,7 @@ func TestBuildShardGroupsClosesEarlierStoresWhenLaterGroupFails(t *testing.T) {
 }
 
 func TestDedicatedTSOGroupContinuesAfterLegacyEncryptionEntry(t *testing.T) {
+	t.Parallel()
 	baseDir := t.TempDir()
 	factory, err := newRaftFactory(raftEngineEtcd, nil)
 	require.NoError(t, err)
@@ -212,6 +217,7 @@ func TestDedicatedTSOGroupContinuesAfterLegacyEncryptionEntry(t *testing.T) {
 }
 
 func TestParseRaftEngineType(t *testing.T) {
+	t.Parallel()
 	t.Run("default", func(t *testing.T) {
 		engineType, err := parseRaftEngineType("")
 		require.NoError(t, err)
@@ -231,6 +237,7 @@ func TestParseRaftEngineType(t *testing.T) {
 }
 
 func TestBuildShardGroupsWithEtcdEngineRoutesAcrossGroups(t *testing.T) {
+	t.Parallel()
 	baseDir := t.TempDir()
 	groups := []groupSpec{
 		{id: 1, address: "127.0.0.1:15001"},
@@ -281,6 +288,7 @@ func TestBuildShardGroupsWithEtcdEngineRoutesAcrossGroups(t *testing.T) {
 }
 
 func TestBuildShardGroupsWithEtcdEngineRestartsAcrossGroups(t *testing.T) {
+	t.Parallel()
 	baseDir := t.TempDir()
 	groups := []groupSpec{
 		{id: 1, address: "127.0.0.1:16001"},
@@ -347,6 +355,7 @@ func TestBuildShardGroupsWithEtcdEngineRestartsAcrossGroups(t *testing.T) {
 }
 
 func TestEnsureRaftEngineDataDir(t *testing.T) {
+	t.Parallel()
 	t.Run("writes marker for empty dir", func(t *testing.T) {
 		dir := t.TempDir()
 		require.NoError(t, ensureRaftEngineDataDir(dir, raftEngineEtcd))

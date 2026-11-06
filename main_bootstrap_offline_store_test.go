@@ -112,6 +112,7 @@ func offlineDataBackup(t *testing.T, source string) string {
 }
 
 func TestBootstrapOfflineDataProbeReadOnlyFullHistoryAndConfiguration(t *testing.T) {
+	t.Parallel()
 	for _, configuration := range []bool{true, false} {
 		root, _, _ := offlineDataStoreFixture(t, configuration)
 		before := offlineDataFiles(t, root)
@@ -130,6 +131,7 @@ func TestBootstrapOfflineDataProbeReadOnlyFullHistoryAndConfiguration(t *testing
 }
 
 func TestBootstrapOfflineDataProbeRejectsMissingSourcesWithoutCreating(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	before := offlineDataFiles(t, root)
 	for _, path := range []string{root, filepath.Join(root, "does-not-exist")} {
@@ -143,6 +145,7 @@ func TestBootstrapOfflineDataProbeRejectsMissingSourcesWithoutCreating(t *testin
 }
 
 func TestBootstrapOfflineDataProbeRejectsMissingLockWithoutRecreating(t *testing.T) {
+	t.Parallel()
 	root, _, _ := offlineDataStoreFixture(t, true)
 	lock := filepath.Join(root, bootstrapOfflineDataPath, "LOCK")
 	require.NoError(t, os.Remove(lock))
@@ -154,6 +157,7 @@ func TestBootstrapOfflineDataProbeRejectsMissingLockWithoutRecreating(t *testing
 }
 
 func TestBootstrapOfflineDataProbeRejectsMissingDurableMetadataAndLocks(t *testing.T) {
+	t.Parallel()
 	for _, kind := range []string{"watermark", "applied", "pending"} {
 		t.Run(kind, func(t *testing.T) {
 			root, _, _ := offlineDataStoreFixture(t, true)
@@ -181,6 +185,7 @@ func TestBootstrapOfflineDataProbeRejectsMissingDurableMetadataAndLocks(t *testi
 }
 
 func TestBootstrapOfflineDataPreparationStageVerifyAndRestart(t *testing.T) {
+	// Not parallel: store.VerifyBootstrapBaselinePhysicalEquality calls Error() on a closed pebble iterator, whose pooled allocation another test's pebble DB may be reusing.
 	root, manifest, prepared := offlineDataStoreFixture(t, true)
 	backup := offlineDataBackup(t, root)
 	backupBefore := offlineDataFiles(t, backup)
@@ -223,6 +228,7 @@ func TestBootstrapOfflineDataPreparationStageVerifyAndRestart(t *testing.T) {
 }
 
 func TestBootstrapOfflineDataPreparationRuntimeMetadataAfterRestart(t *testing.T) {
+	// Not parallel: store.VerifyBootstrapBaselinePhysicalEquality calls Error() on a closed pebble iterator, whose pooled allocation another test's pebble DB may be reusing.
 	root, manifest, prepared := offlineDataStoreFixture(t, true)
 	backup := offlineDataBackup(t, root)
 	callbacks, err := bootstrapOfflineDataPreparation(prepared)
@@ -255,6 +261,7 @@ func TestBootstrapOfflineDataPreparationRuntimeMetadataAfterRestart(t *testing.T
 }
 
 func TestBootstrapOfflineDataPreparationNeverWritesWithoutTrustedBackup(t *testing.T) {
+	// Not parallel: store.VerifyBootstrapBaselinePhysicalEquality calls Error() on a closed pebble iterator, whose pooled allocation another test's pebble DB may be reusing.
 	for _, kind := range []string{"missing backup", "same store", "wrong manifest", "edited target", "edited backup", "aliased backup", "nested backup"} {
 		t.Run(kind, func(t *testing.T) {
 			root, manifest, prepared := offlineDataStoreFixture(t, true)
@@ -297,6 +304,7 @@ func TestBootstrapOfflineDataPreparationNeverWritesWithoutTrustedBackup(t *testi
 }
 
 func TestBootstrapOfflineDataProbeCancellationAndSymlink(t *testing.T) {
+	t.Parallel()
 	root, _, _ := offlineDataStoreFixture(t, false)
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
@@ -311,6 +319,7 @@ func TestBootstrapOfflineDataProbeCancellationAndSymlink(t *testing.T) {
 }
 
 func TestBootstrapOfflineDataWalkRejectsEscapingSymlink(t *testing.T) {
+	t.Parallel()
 	root, _, _ := offlineDataStoreFixture(t, false)
 	outside := filepath.Join(t.TempDir(), "outside")
 	require.NoError(t, os.WriteFile(outside, []byte("preserved external file"), 0o600))
@@ -327,6 +336,7 @@ func TestBootstrapOfflineDataWalkRejectsEscapingSymlink(t *testing.T) {
 }
 
 func TestBootstrapOfflineDataPreparationRejectsPostStageEditsAfterRestart(t *testing.T) {
+	// Not parallel: store.VerifyBootstrapBaselinePhysicalEquality calls Error() on a closed pebble iterator, whose pooled allocation another test's pebble DB may be reusing.
 	for _, kind := range []string{"preparation", "old history", "extra metadata"} {
 		t.Run(kind, func(t *testing.T) {
 			root, manifest, prepared := offlineDataStoreFixture(t, false)
@@ -360,6 +370,7 @@ func TestBootstrapOfflineDataPreparationRejectsPostStageEditsAfterRestart(t *tes
 }
 
 func TestBootstrapOfflineDataFSNeverDeletesOrReplaces(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "preserved")
 	require.NoError(t, os.WriteFile(path, []byte("preserved"), 0o600))
@@ -386,6 +397,7 @@ func TestBootstrapOfflineDataFSNeverDeletesOrReplaces(t *testing.T) {
 }
 
 func TestBootstrapOfflineDataProbeWALReplayBound(t *testing.T) {
+	t.Parallel()
 	root, _, _ := offlineDataStoreFixture(t, false)
 	path := filepath.Join(root, bootstrapOfflineDataPath, "999999.log")
 	f, err := os.Create(path)

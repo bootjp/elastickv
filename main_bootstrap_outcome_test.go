@@ -12,6 +12,7 @@ import (
 )
 
 func TestBootstrapStartupControlPostSuccessRevocationIsUnknown(t *testing.T) {
+	t.Parallel()
 	completed := false
 	reply, err := runBootstrapStartupControl(t.Context(), nil,
 		func(context.Context, any) (any, error) {

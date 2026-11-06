@@ -180,6 +180,7 @@ func (f *bootstrapAuthFixture) publicGate(ctx context.Context, request any, info
 }
 
 func TestBootstrapAuthExceptionTLSExactStartupSkipsOnlyAdmin(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name, method string
 		group        uint64
@@ -211,6 +212,7 @@ func TestBootstrapAuthExceptionTLSExactStartupSkipsOnlyAdmin(t *testing.T) {
 }
 
 func TestBootstrapAuthExceptionTLSWrongCredentialUsesOriginalAuth(t *testing.T) {
+	t.Parallel()
 	f := newBootstrapAuthFixture(t, 17, peersession.ControlReady, nil)
 	for _, values := range [][]string{nil, {""}, {"wrong"}, {bootstrapGateTestToken, bootstrapGateTestToken}} {
 		ctx, cancel := bootstrapGateContext(t, values...)
@@ -225,6 +227,7 @@ func TestBootstrapAuthExceptionTLSWrongCredentialUsesOriginalAuth(t *testing.T) 
 }
 
 func TestBootstrapAuthExceptionTLSCapturedReceiptCannotAuthorizeDifferentPayload(t *testing.T) {
+	t.Parallel()
 	unknown := &pb.ForwardAdminProposalRequest{Payload: kv.EncodePrepareEvidenceSeal()}
 	unknown.ProtoReflect().SetUnknown([]byte{0xf8, 0x07, 0x01})
 	for name, invalid := range map[string]any{
@@ -250,6 +253,7 @@ func TestBootstrapAuthExceptionTLSCapturedReceiptCannotAuthorizeDifferentPayload
 }
 
 func TestBootstrapAuthExceptionTLSPublicTokenIsNotAdminAuthority(t *testing.T) {
+	t.Parallel()
 	f := newBootstrapAuthFixture(t, 17, peersession.ControlReady, nil)
 	ctx, cancel := bootstrapGateContext(t, bootstrapGateTestToken)
 	defer cancel()
@@ -267,6 +271,7 @@ func TestBootstrapAuthExceptionTLSPublicTokenIsNotAdminAuthority(t *testing.T) {
 }
 
 func TestBootstrapAuthExceptionTLSAdmissionStillRequired(t *testing.T) {
+	t.Parallel()
 	f := newBootstrapAuthFixture(t, 17, peersession.ControlReady, nil)
 	f.a.Suspend(17)
 	ctx, cancel := bootstrapGateContext(t, bootstrapGateTestToken)
@@ -279,6 +284,7 @@ func TestBootstrapAuthExceptionTLSAdmissionStillRequired(t *testing.T) {
 }
 
 func TestBootstrapAuthExceptionTLSNoStreamException(t *testing.T) {
+	t.Parallel()
 	f := newBootstrapAuthFixture(t, 17, peersession.ControlReady, nil)
 	ctx, cancel := bootstrapGateContext(t, bootstrapGateTestToken)
 	defer cancel()
@@ -290,6 +296,7 @@ func TestBootstrapAuthExceptionTLSNoStreamException(t *testing.T) {
 }
 
 func TestBootstrapAuthExceptionWithoutDomainKeepsOriginalAuth(t *testing.T) {
+	t.Parallel()
 	called := false
 	denied := status.Error(codes.Unauthenticated, "original auth")
 	original := func(context.Context, any, *grpc.UnaryServerInfo, grpc.UnaryHandler) (any, error) {

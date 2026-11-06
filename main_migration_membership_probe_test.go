@@ -74,6 +74,7 @@ func TestMigrationMemberProtocolProbeDoesNotBypassMissingRPCOrCancellation(t *te
 }
 
 func TestMigrationMemberProtocolProbeUsesDedicatedTLSCredential(t *testing.T) {
+	t.Parallel()
 	cert, key := writeSelfSignedCert(t)
 	require.NoError(t, internalutil.ConfigureGRPCTLS(cert, cert, key))
 	t.Cleanup(func() { require.NoError(t, internalutil.ConfigureGRPCTLS("", "", "")) })

@@ -41,6 +41,7 @@ func publishBootstrapRegistrationPreparedFixture(t *testing.T, a *raftadmission.
 }
 
 func TestBootstrapRegistrationExactDescriptor(t *testing.T) {
+	t.Parallel()
 	method := bootstrapMethodForTest(t, 17, pb.EncryptionAdmin_RegisterEncryptionWriter_FullMethodName)
 	binding := bootstrapBindingForTest(17)
 	req := registrationRequest(7, binding.From.Member, 0)
@@ -73,6 +74,7 @@ func TestBootstrapRegistrationExactDescriptor(t *testing.T) {
 }
 
 func TestBootstrapRegistrationTLSIdentityReadyWithNativeHandle(t *testing.T) {
+	t.Parallel()
 	f := newBootstrapAuthFixture(t, 17, peersession.IdentityReady, nil, bootstrapAuthRegistrationOptions{prepared: true})
 	require.True(t, f.a.NeedsActivation(17))
 	entry := registrationEntry(7, 2, 3)
@@ -95,6 +97,7 @@ func TestBootstrapRegistrationTLSIdentityReadyWithNativeHandle(t *testing.T) {
 }
 
 func TestBootstrapRegistrationTLSMissingTokenCannotReachHandler(t *testing.T) {
+	t.Parallel()
 	f := newBootstrapAuthFixture(t, 17, peersession.IdentityReady, nil)
 	for _, token := range []string{"", "incorrect"} {
 		ctx, cancel := bootstrapGateContext(t, token)
@@ -107,6 +110,7 @@ func TestBootstrapRegistrationTLSMissingTokenCannotReachHandler(t *testing.T) {
 }
 
 func TestBootstrapRegistrationTLSEpochCannotChangeAfterCapture(t *testing.T) {
+	t.Parallel()
 	f := newBootstrapAuthFixture(t, 17, peersession.IdentityReady, func(payload any) any {
 		original, ok := payload.(*pb.RegisterEncryptionWriterRequest)
 		require.True(t, ok)
@@ -124,6 +128,7 @@ func TestBootstrapRegistrationTLSEpochCannotChangeAfterCapture(t *testing.T) {
 }
 
 func TestBootstrapRegistrationTLSRequiresExplicitDefaultGroupReceiver(t *testing.T) {
+	t.Parallel()
 	otherGroup := uint64(18)
 	for _, tc := range []struct {
 		name    string
@@ -154,6 +159,7 @@ func (p bootstrapRegistrationProposer) Propose(ctx context.Context, entry []byte
 }
 
 func TestBootstrapRegistrationLocalProposalOwnsHandleAndCloseJoins(t *testing.T) {
+	t.Parallel()
 	f := newBootstrapNetworkFixture(t, false)
 	ctx, err := withBootstrapRegistration(t.Context(), f.network, bootstrapNetworkTestGroup, f.config.local.Member,
 		func(uint32, uint16) error { return nil })
@@ -194,6 +200,7 @@ func TestBootstrapRegistrationLocalProposalOwnsHandleAndCloseJoins(t *testing.T)
 }
 
 func TestBootstrapRegistrationPrivateForwardNeverUsesPublicFallback(t *testing.T) {
+	t.Parallel()
 	for _, wrongSPKI := range []bool{false, true} {
 		t.Run(map[bool]string{false: "valid", true: "wrong SPKI"}[wrongSPKI], func(t *testing.T) {
 			f := newBootstrapNetworkFixture(t, wrongSPKI)
@@ -214,6 +221,7 @@ func TestBootstrapRegistrationPrivateForwardNeverUsesPublicFallback(t *testing.T
 }
 
 func TestBootstrapRegistrationPrivateForwardCloseCancelsAndJoins(t *testing.T) {
+	t.Parallel()
 	f := newBootstrapNetworkFixture(t, false)
 	ctx, err := withBootstrapRegistration(t.Context(), f.network, bootstrapNetworkTestGroup, f.config.local.Member,
 		func(uint32, uint16) error { return nil })
@@ -247,6 +255,7 @@ func TestBootstrapRegistrationPrivateForwardCloseCancelsAndJoins(t *testing.T) {
 }
 
 func TestBootstrapRegistrationSourcePinsEpochAndPayload(t *testing.T) {
+	t.Parallel()
 	f := newBootstrapNetworkFixture(t, false)
 	ctx, err := withBootstrapRegistration(t.Context(), f.network, bootstrapNetworkTestGroup, f.config.local.Member,
 		func(dek uint32, epoch uint16) error {
@@ -272,6 +281,7 @@ func TestBootstrapRegistrationSourcePinsEpochAndPayload(t *testing.T) {
 }
 
 func TestBootstrapRegistrationTLSRevocationRetainsHandleThroughResult(t *testing.T) {
+	t.Parallel()
 	f := newBootstrapAuthFixture(t, 17, peersession.IdentityReady, nil)
 	f.service.action = func(context.Context) error { f.server.Close(); return nil }
 	// Metadata is still supplied only by the explicit startup call.
