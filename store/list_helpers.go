@@ -298,19 +298,23 @@ func extractListUserKeyFromLenPrefixedKey(trimmed []byte, suffixLen int) []byte 
 	return trimmed[wideColKeyLenSize:userEnd]
 }
 
-// PrefixScanEnd returns the exclusive end key for a prefix scan.
-// It increments the last byte of the prefix; if overflow occurs (all 0xFF),
-// it returns a nil slice which callers must interpret as "scan to end of keyspace".
+// PrefixScanEnd returns the exclusive end key for a prefix scan: the prefix
+// with its trailing 0xFF bytes dropped and the last remaining byte
+// incremented. Keeping the dropped bytes as 0x00 would admit the key equal
+// to the shorter incremented prefix, which does not start with prefix. If
+// every byte is 0xFF it returns nil, which callers must interpret as "scan to
+// end of keyspace".
 func PrefixScanEnd(prefix []byte) []byte {
 	if len(prefix) == 0 {
 		return nil
 	}
 	end := bytes.Clone(prefix)
 	for i := len(end) - 1; i >= 0; i-- {
-		end[i]++
-		if end[i] != 0 {
-			return end
+		if end[i] == ^byte(0) {
+			continue
 		}
+		end[i]++
+		return end[:i+1]
 	}
 	return nil // overflow: all bytes were 0xFF
 }
