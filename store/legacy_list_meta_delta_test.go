@@ -8,6 +8,7 @@ import (
 )
 
 func TestLegacyListMetaDeltaKey(t *testing.T) {
+	t.Parallel()
 	for _, seq := range []uint32{0, 1, 0xffffffff} {
 		key := LegacyListMetaDeltaKey([]byte{'a', 0, 'b'}, 123, seq)
 		require.Equal(t, []byte{'a', 0, 'b'}, ExtractLegacyListUserKeyFromDelta(key))

@@ -16,6 +16,7 @@ func newTestMVCCStore(t *testing.T) *mvccStore {
 }
 
 func TestMVCCStore_GetAtSnapshots(t *testing.T) {
+	t.Parallel()
 	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
 		ctx := context.Background()
 		st := newStore(t)
@@ -48,6 +49,7 @@ func TestMVCCStore_GetAtSnapshots(t *testing.T) {
 }
 
 func TestMVCCStore_DeleteAtTombstone(t *testing.T) {
+	t.Parallel()
 	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
 		ctx := context.Background()
 		st := newStore(t)
@@ -65,6 +67,7 @@ func TestMVCCStore_DeleteAtTombstone(t *testing.T) {
 }
 
 func TestMVCCStore_ScanAtSortedAndSnapshot(t *testing.T) {
+	t.Parallel()
 	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
 		ctx := context.Background()
 		st := newStore(t)
@@ -103,6 +106,7 @@ func TestMVCCStore_ScanAtSortedAndSnapshot(t *testing.T) {
 }
 
 func TestMVCCStore_TTLAt(t *testing.T) {
+	t.Parallel()
 	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
 		ctx := context.Background()
 		st := newStore(t)

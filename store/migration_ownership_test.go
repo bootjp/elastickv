@@ -48,6 +48,7 @@ func assertOwnershipCleared(t *testing.T, st MVCCStore) {
 }
 
 func TestMigrationOwnershipAtomicClearAndImmutableRetry(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		state := ownershipFixture(t, st)
 		proofs := ownershipStore(t, st)
@@ -74,6 +75,7 @@ func TestMigrationOwnershipAtomicClearAndImmutableRetry(t *testing.T) {
 }
 
 func TestMigrationOwnershipSnapshotRestoreAndReopen(t *testing.T) {
+	t.Parallel()
 	source := NewMVCCStore()
 	state := ownershipFixture(t, source)
 	require.NoError(t, ownershipStore(t, source).ClearMigrationStateWithOwnership(t.Context(), state, 9))
@@ -98,6 +100,7 @@ func TestMigrationOwnershipSnapshotRestoreAndReopen(t *testing.T) {
 }
 
 func TestMigrationOwnershipNativeAndSSTSnapshots(t *testing.T) {
+	t.Parallel()
 	for _, sst := range []bool{false, true} {
 		t.Run(map[bool]string{false: "native", true: "sst"}[sst], func(t *testing.T) {
 			source, err := NewPebbleStore(t.TempDir(), WithSSTIngestSnapshots(sst))
@@ -119,6 +122,7 @@ func TestMigrationOwnershipNativeAndSSTSnapshots(t *testing.T) {
 }
 
 func TestMigrationOwnershipFailedBatchKeepsGuardAndAppliedIndex(t *testing.T) {
+	t.Parallel()
 	db, err := pebble.Open(t.TempDir(), &pebble.Options{DisableWAL: true})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, db.Close()) })
@@ -140,6 +144,7 @@ func TestMigrationOwnershipFailedBatchKeepsGuardAndAppliedIndex(t *testing.T) {
 }
 
 func TestMigrationOwnershipCorruptionRejectsReopen(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	st, err := NewPebbleStore(dir)
 	require.NoError(t, err)
@@ -154,6 +159,7 @@ func TestMigrationOwnershipCorruptionRejectsReopen(t *testing.T) {
 }
 
 func TestMigrationOwnershipMoveBackRequiresNewerGuardBoundAcquisition(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		state := ownershipFixture(t, st)
 		proofs := ownershipStore(t, st)

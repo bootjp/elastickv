@@ -5,6 +5,7 @@ import (
 	"context"
 	"math"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -70,6 +71,7 @@ func (c *cancelAfterErrCallsContext) Err() error {
 }
 
 func TestPebbleStore_LastCommitTSPersistedAcrossRestart(t *testing.T) {
+	t.Parallel()
 	dir, err := os.MkdirTemp("", "pebble-last-ts-test")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
@@ -89,6 +91,7 @@ func TestPebbleStore_LastCommitTSPersistedAcrossRestart(t *testing.T) {
 }
 
 func TestPebbleStore_RebuildsStaleLastCommitTSOnOpen(t *testing.T) {
+	t.Parallel()
 	dir, err := os.MkdirTemp("", "pebble-last-ts-rebuild-test")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
@@ -119,6 +122,7 @@ func TestPebbleStore_RebuildsStaleLastCommitTSOnOpen(t *testing.T) {
 }
 
 func TestPebbleStore_RebuildLastCommitTSIgnoresWriterRegistryRows(t *testing.T) {
+	t.Parallel()
 	dir, err := os.MkdirTemp("", "pebble-last-ts-registry-test")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
@@ -157,6 +161,7 @@ func TestPebbleStore_RebuildLastCommitTSIgnoresWriterRegistryRows(t *testing.T) 
 }
 
 func TestPebbleStore_UserKeyWithWriterRegistryPrefixRemainsMVCCData(t *testing.T) {
+	t.Parallel()
 	dir, err := os.MkdirTemp("", "pebble-registry-prefix-user-key-test")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
@@ -208,6 +213,7 @@ func TestPebbleStore_UserKeyWithWriterRegistryPrefixRemainsMVCCData(t *testing.T
 }
 
 func TestPebbleStore_GetAtBatch(t *testing.T) {
+	t.Parallel()
 	dir, err := os.MkdirTemp("", "pebble-get-at-batch-test")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
@@ -238,6 +244,7 @@ func TestPebbleStore_GetAtBatch(t *testing.T) {
 }
 
 func TestPebbleStore_GetAtBatchReseeksFromLaterIteratorPosition(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	s, err := NewPebbleStore(dir)
 	require.NoError(t, err)
@@ -261,6 +268,7 @@ func TestPebbleStore_GetAtBatchReseeksFromLaterIteratorPosition(t *testing.T) {
 }
 
 func TestPebbleStore_LatestCommitTSWithIterReseeksWhenIteratorAhead(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	s, err := NewPebbleStore(dir)
 	require.NoError(t, err)
@@ -287,6 +295,7 @@ func TestPebbleStore_LatestCommitTSWithIterReseeksWhenIteratorAhead(t *testing.T
 }
 
 func TestPebbleStore_MinRetainedTSPersistedAcrossRestart(t *testing.T) {
+	t.Parallel()
 	dir, err := os.MkdirTemp("", "pebble-min-retained-ts-test")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
@@ -312,6 +321,7 @@ func TestPebbleStore_MinRetainedTSPersistedAcrossRestart(t *testing.T) {
 }
 
 func TestPebbleStore_Scan_TombstoneMasksOlderVersions(t *testing.T) {
+	t.Parallel()
 	dir, err := os.MkdirTemp("", "pebble-scan-tombstone-test")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
@@ -330,6 +340,7 @@ func TestPebbleStore_Scan_TombstoneMasksOlderVersions(t *testing.T) {
 }
 
 func TestPebbleStore_Scan_SkipsKeyWithOnlyFutureVersions(t *testing.T) {
+	t.Parallel()
 	dir, err := os.MkdirTemp("", "pebble-scan-future-test")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
@@ -351,6 +362,7 @@ func TestPebbleStore_Scan_SkipsKeyWithOnlyFutureVersions(t *testing.T) {
 }
 
 func TestPebbleStore_Scan_IgnoresInternalMetaKey(t *testing.T) {
+	t.Parallel()
 	dir, err := os.MkdirTemp("", "pebble-scan-meta-test")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
@@ -373,6 +385,7 @@ func TestPebbleStore_Scan_IgnoresInternalMetaKey(t *testing.T) {
 }
 
 func TestPebbleStore_CompactCanceledDoesNotAdvanceMinRetainedTS(t *testing.T) {
+	t.Parallel()
 	dir, err := os.MkdirTemp("", "pebble-compact-cancel-*")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
@@ -409,6 +422,7 @@ func TestPebbleStore_CompactCanceledDoesNotAdvanceMinRetainedTS(t *testing.T) {
 }
 
 func TestPebbleStore_CompactCanceledAfterDeleteFlushKeepsPendingMinRetainedTS(t *testing.T) {
+	t.Parallel()
 	dir, err := os.MkdirTemp("", "pebble-compact-partial-cancel-*")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
@@ -452,6 +466,7 @@ func TestPebbleStore_CompactCanceledAfterDeleteFlushKeepsPendingMinRetainedTS(t 
 }
 
 func TestPebbleStore_CompactResumedPendingAdvancesToRequestedMinTS(t *testing.T) {
+	t.Parallel()
 	dir, err := os.MkdirTemp("", "pebble-compact-resume-higher-*")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
@@ -500,6 +515,8 @@ func TestPebbleStore_CompactResumedPendingAdvancesToRequestedMinTS(t *testing.T)
 }
 
 func TestPebbleStore_CompactWaitsForMaintenanceLock(t *testing.T) {
+	// Not parallel: requireChannelBlocked gives the goroutine 1s to start,
+	// which parallel load can exceed.
 	dir, err := os.MkdirTemp("", "pebble-compact-lock-*")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
@@ -516,6 +533,10 @@ func TestPebbleStore_CompactWaitsForMaintenanceLock(t *testing.T) {
 	require.True(t, ok)
 
 	ps.maintenanceMu.Lock()
+	// Release on failure too: the deferred Close waits for maintenanceMu,
+	// so a t.Fatal while it is held would hang until the package timeout.
+	unlock := sync.OnceFunc(ps.maintenanceMu.Unlock)
+	defer unlock()
 	done := make(chan error, 1)
 	started := make(chan struct{}, 1)
 	go func() {
@@ -524,7 +545,7 @@ func TestPebbleStore_CompactWaitsForMaintenanceLock(t *testing.T) {
 	}()
 
 	requireChannelBlocked(t, done, started)
-	ps.maintenanceMu.Unlock()
+	unlock()
 
 	select {
 	case err := <-done:
@@ -535,6 +556,8 @@ func TestPebbleStore_CompactWaitsForMaintenanceLock(t *testing.T) {
 }
 
 func TestPebbleStore_RestoreWaitsForMaintenanceLock(t *testing.T) {
+	// Not parallel: requireChannelBlocked gives the goroutine 1s to start,
+	// which parallel load can exceed.
 	dir, err := os.MkdirTemp("", "pebble-restore-lock-*")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
@@ -547,6 +570,10 @@ func TestPebbleStore_RestoreWaitsForMaintenanceLock(t *testing.T) {
 	require.True(t, ok)
 
 	ps.maintenanceMu.Lock()
+	// Release on failure too: the deferred Close waits for maintenanceMu,
+	// so a t.Fatal while it is held would hang until the package timeout.
+	unlock := sync.OnceFunc(ps.maintenanceMu.Unlock)
+	defer unlock()
 	done := make(chan error, 1)
 	started := make(chan struct{}, 1)
 	go func() {
@@ -555,7 +582,7 @@ func TestPebbleStore_RestoreWaitsForMaintenanceLock(t *testing.T) {
 	}()
 
 	requireChannelBlocked(t, done, started)
-	ps.maintenanceMu.Unlock()
+	unlock()
 
 	select {
 	case err := <-done:
@@ -566,6 +593,7 @@ func TestPebbleStore_RestoreWaitsForMaintenanceLock(t *testing.T) {
 }
 
 func TestSnapshotBatchShouldFlushOnByteLimit(t *testing.T) {
+	t.Parallel()
 	dir, err := os.MkdirTemp("", "pebble-batch-flush-*")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
@@ -590,6 +618,7 @@ func TestSnapshotBatchShouldFlushOnByteLimit(t *testing.T) {
 }
 
 func TestPebbleStore_SnapshotRestoreLargeValues(t *testing.T) {
+	t.Parallel()
 	dir, err := os.MkdirTemp("", "pebble-large-snap-test")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
@@ -635,6 +664,7 @@ func TestPebbleStore_SnapshotRestoreLargeValues(t *testing.T) {
 // "EKVMVCC2" format). This is the migration path when upgrading from the
 // in-memory FSM to the Pebble-backed FSM.
 func TestPebbleStore_RestoreFromStreamingMVCC(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 
 	// Build a snapshot using the in-memory mvccStore.
@@ -707,6 +737,7 @@ func TestPebbleStore_RestoreFromStreamingMVCC(t *testing.T) {
 }
 
 func TestPebbleStore_RestoreFromStreamingMVCCPreservesMinRetainedTS(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 
 	src := NewMVCCStore()
@@ -740,6 +771,7 @@ func TestPebbleStore_RestoreFromStreamingMVCCPreservesMinRetainedTS(t *testing.T
 // TestPebbleStore_Restore_EmptySnapshot verifies that restoring from an
 // empty reader clears the DB and resets lastCommitTS to zero.
 func TestPebbleStore_Restore_EmptySnapshot(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 
 	dir, err := os.MkdirTemp("", "pebble-restore-empty-*")
@@ -768,6 +800,7 @@ func TestPebbleStore_Restore_EmptySnapshot(t *testing.T) {
 // TestPebbleStore_Restore_TruncatedHeader verifies that a partial magic
 // header (fewer than 8 bytes) is rejected as a corrupted snapshot.
 func TestPebbleStore_Restore_TruncatedHeader(t *testing.T) {
+	t.Parallel()
 	dir, err := os.MkdirTemp("", "pebble-restore-trunc-*")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
@@ -785,6 +818,7 @@ func TestPebbleStore_Restore_TruncatedHeader(t *testing.T) {
 // TestPebbleStore_Restore_PebbleMagicMismatch verifies that a stream
 // with an unknown magic header is rejected by the public restore dispatcher.
 func TestPebbleStore_Restore_PebbleMagicMismatch(t *testing.T) {
+	t.Parallel()
 	dir, err := os.MkdirTemp("", "pebble-restore-magic-*")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
@@ -803,6 +837,7 @@ func TestPebbleStore_Restore_PebbleMagicMismatch(t *testing.T) {
 // Pebble snapshot restore fails midway (truncated data), the existing DB
 // contents are preserved and not wiped.
 func TestPebbleStore_Restore_NativePebbleAtomic(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 
 	dir, err := os.MkdirTemp("", "pebble-atomic-restore-*")
@@ -883,6 +918,7 @@ func TestMVCCStore_ApplyMutations_ValueTooLarge(t *testing.T) {
 // previously the restore path used maxSnapshotKeySize as the limit and would
 // reject this key.
 func TestPebbleStore_SnapshotRestore_MaxSizeKey(t *testing.T) {
+	t.Parallel()
 	dir, err := os.MkdirTemp("", "pebble-maxkey-snap-*")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
@@ -919,6 +955,7 @@ func TestPebbleStore_SnapshotRestore_MaxSizeKey(t *testing.T) {
 }
 
 func TestPebbleStore_RestoreFromStreamingMVCCPreservesMigrationImportMetadata(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	src := NewMVCCStore()
 	_, err := src.ImportVersions(ctx, ImportVersionsOptions{

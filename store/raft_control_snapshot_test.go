@@ -10,6 +10,7 @@ import (
 )
 
 func TestRaftControlMetadataSnapshotRetention(t *testing.T) {
+	t.Parallel()
 	for _, format := range []string{"memory", "native", "sst"} {
 		t.Run(format, func(t *testing.T) {
 			var source MVCCStore
@@ -82,6 +83,7 @@ func TestRaftControlMetadataSnapshotRetention(t *testing.T) {
 }
 
 func TestRaftControlMetadataEncryptedSnapshotAndReopen(t *testing.T) {
+	t.Parallel()
 	fixture := newEncryptedStoreFixture(t, 1)
 	api := raftMetadata(t, fixture.mvcc)
 	value := []byte("protected control payload not stored in plaintext")
@@ -113,6 +115,7 @@ func TestRaftControlMetadataEncryptedSnapshotAndReopen(t *testing.T) {
 }
 
 func TestRaftControlSnapshotBoundsAndCanonicalKeys(t *testing.T) {
+	t.Parallel()
 	var payload bytes.Buffer
 	require.NoError(t, binary.Write(&payload, binary.LittleEndian, uint64(1)))
 	require.NoError(t, binary.Write(&payload, binary.LittleEndian, uint64(1)))
@@ -131,6 +134,7 @@ func TestRaftControlSnapshotBoundsAndCanonicalKeys(t *testing.T) {
 }
 
 func TestRaftControlMemorySnapshotTracksLaterInnerIndex(t *testing.T) {
+	t.Parallel()
 	s := NewMVCCStore()
 	defer s.Close()
 	require.NoError(t, raftEntryApplier(t, s).ApplyRaftEntry(t.Context(), 7, func(ctx context.Context) error {

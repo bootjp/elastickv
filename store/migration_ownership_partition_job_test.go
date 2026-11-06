@@ -8,6 +8,7 @@ import (
 )
 
 func TestOwnershipPartitionGuardedMoveBackAndClear(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		_, tx := partitionFixture(t, st)
 		proofs := ownershipStore(t, st)
@@ -64,6 +65,7 @@ func TestOwnershipPartitionGuardedMoveBackAndClear(t *testing.T) {
 }
 
 func TestOwnershipPartitionPartialGuardCannotClipFrontier(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		_, tx := partitionFixture(t, st)
 		require.NoError(t, partitionStore(t, st).ApplyMigrationOwnershipPartition(t.Context(), tx, 10))
@@ -85,6 +87,7 @@ func TestOwnershipPartitionPartialGuardCannotClipFrontier(t *testing.T) {
 }
 
 func TestOwnershipPartitionMoveBackRequiresNewerActiveCatalog(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		_, tx := partitionFixture(t, st)
 		require.NoError(t, partitionStore(t, st).ApplyMigrationOwnershipPartition(t.Context(), tx, 10))
@@ -109,6 +112,7 @@ func TestOwnershipPartitionMoveBackRequiresNewerActiveCatalog(t *testing.T) {
 }
 
 func TestOwnershipPartitionLegacyRefreshRequiresExactSingleFrontier(t *testing.T) {
+	t.Parallel()
 	for _, split := range []bool{false, true} {
 		t.Run(map[bool]string{false: "one", true: "descendants"}[split], func(t *testing.T) {
 			runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {

@@ -33,6 +33,7 @@ import (
 // dance is straightforward; reproducing it inside rapid.Check
 // would tangle with Cleanup ordering for marginal extra signal.
 func TestEncryption_Property_PutGet(t *testing.T) {
+	t.Parallel()
 	mvcc := newPropEncryptedStore(t)
 	rapid.Check(t, func(rt *rapid.T) {
 		key := nonEmptyBytes.Draw(rt, "key")

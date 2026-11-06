@@ -9,6 +9,7 @@ import (
 )
 
 func TestMVCCStore_Compact(t *testing.T) {
+	t.Parallel()
 	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
 		s := newStore(t)
 		ctx := context.Background()
@@ -64,6 +65,7 @@ func TestMVCCStore_Compact(t *testing.T) {
 }
 
 func TestMVCCStore_Compact_Delete(t *testing.T) {
+	t.Parallel()
 	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
 		s := newStore(t)
 		ctx := context.Background()
@@ -93,6 +95,7 @@ func TestMVCCStore_Compact_Delete(t *testing.T) {
 }
 
 func TestMVCCStore_Compact_KeepAll(t *testing.T) {
+	t.Parallel()
 	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
 		s := newStore(t)
 		ctx := context.Background()

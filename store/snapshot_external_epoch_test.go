@@ -16,12 +16,14 @@ func seedExternalExistingEpoch(t *testing.T, s MVCCStore) {
 }
 
 func TestMigrationConfigurationIndexKeyReturnsPrivateBytes(t *testing.T) {
+	t.Parallel()
 	key := MigrationConfigurationIndexKey()
 	key[0] = '?'
 	require.Equal(t, []byte("!txn|meta|migration_configuration_index"), MigrationConfigurationIndexKey())
 }
 
 func TestExternalSnapshotDropsOnlyConfigurationEpochAllVersions(t *testing.T) {
+	t.Parallel()
 	source := externalTestMemory(t)
 	seedExternalExistingEpoch(t, source)
 	adjacent := append(MigrationConfigurationIndexKey(), []byte("|user")...)

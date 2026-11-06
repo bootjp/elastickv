@@ -13,6 +13,7 @@ import (
 )
 
 func TestMVCCStore_ScanConcurrentWithWrites(t *testing.T) {
+	t.Parallel()
 	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
 		ctx := context.Background()
 		st := newStore(t)
@@ -588,6 +589,7 @@ func TestMVCCConcurrentScanAtSnapshotConsistency(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestMVCCStore_ApplyMutations_ReadConflict(t *testing.T) {
+	t.Parallel()
 	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
 		ctx := context.Background()
 		st := newStore(t)
@@ -611,6 +613,7 @@ func TestMVCCStore_ApplyMutations_ReadConflict(t *testing.T) {
 }
 
 func TestMVCCStore_ApplyMutations_ReadConflict_NoConflictWhenUnchanged(t *testing.T) {
+	t.Parallel()
 	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
 		ctx := context.Background()
 		st := newStore(t)
@@ -631,6 +634,7 @@ func TestMVCCStore_ApplyMutations_ReadConflict_NoConflictWhenUnchanged(t *testin
 }
 
 func TestMVCCStore_ApplyMutations_ReadConflict_NonexistentKey(t *testing.T) {
+	t.Parallel()
 	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
 		ctx := context.Background()
 		st := newStore(t)
@@ -648,6 +652,7 @@ func TestMVCCStore_ApplyMutations_ReadConflict_NonexistentKey(t *testing.T) {
 }
 
 func TestMVCCStore_ApplyMutations_ReadConflict_NilReadKeys(t *testing.T) {
+	t.Parallel()
 	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
 		ctx := context.Background()
 		st := newStore(t)
