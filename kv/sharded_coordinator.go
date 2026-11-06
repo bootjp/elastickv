@@ -560,6 +560,11 @@ type ShardedCoordinator struct {
 	// another background HLC lease proposal for the same group on the next tick.
 	hlcRenewalMu       sync.Mutex
 	hlcRenewalInFlight map[uint64]struct{}
+	// inflightTxns holds the (primaryKey, startTS) identities of cross-shard
+	// transactions between their first PREPARE and their return. See
+	// acquireTxnIdentity.
+	inflightTxnMu sync.Mutex
+	inflightTxns  map[txnIdentity]struct{}
 	// registrationGate is the Stage 7a §4.1 first-write barrier: when
 	// set, self-originated mutating writes that would land as §4.1
 	// storage envelopes block until this node's writer registration
@@ -2020,6 +2025,11 @@ func (c *ShardedCoordinator) dispatchMultiShardTxn(ctx context.Context, startTS,
 	if prevCommitTS != 0 {
 		return nil, errors.WithStack(ErrTxnDedupRequiresSingleShard)
 	}
+	releaseIdentity, err := c.acquireTxnIdentity(primaryKey, startTS)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseIdentity()
 
 	// Group read keys by shard now. The result is passed directly to
 	// prewriteTxn to avoid a second iteration inside that function. A
