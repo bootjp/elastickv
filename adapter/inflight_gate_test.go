@@ -25,7 +25,8 @@ func TestInflightGateRefusesEntryOnceDraining(t *testing.T) {
 // An operation that entered before the drain keeps it waiting until it
 // exits; only the first drain waits.
 func TestInflightGateDrainWaitsForRunningOperation(t *testing.T) {
-	t.Parallel()
+	// Not parallel: asserts a repeat call returns within 50ms, a bound
+	// CPU contention from parallel tests can exceed.
 	gate := newInflightGate()
 	require.True(t, gate.enter())
 	go func() {
@@ -48,7 +49,8 @@ func TestInflightGateDrainWaitsForRunningOperation(t *testing.T) {
 
 // join waits, once, for an operation that outlived the drain to exit.
 func TestInflightGateJoinWaitsAfterDrainGaveUp(t *testing.T) {
-	t.Parallel()
+	// Not parallel: asserts a repeat call returns within 50ms, a bound
+	// CPU contention from parallel tests can exceed.
 	gate := newInflightGate()
 	require.True(t, gate.enter())
 	require.False(t, gate.drain(10*time.Millisecond))
