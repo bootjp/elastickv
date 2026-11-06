@@ -49,10 +49,12 @@ import (
 )
 
 const (
-	heartbeatTimeout           = 200 * time.Millisecond
-	electionTimeout            = 2000 * time.Millisecond
-	raftMetricsObserveInterval = 5 * time.Second
-	dirPerm                    = raftDirPerm
+	filesystemStartupRetryBudget   = 90 * time.Second
+	filesystemStartupRetryInterval = 250 * time.Millisecond
+	heartbeatTimeout               = 200 * time.Millisecond
+	electionTimeout                = 2000 * time.Millisecond
+	raftMetricsObserveInterval     = 5 * time.Second
+	dirPerm                        = raftDirPerm
 
 	etcdTickInterval      = 10 * time.Millisecond
 	etcdHeartbeatMinTicks = 1
@@ -1082,12 +1084,11 @@ func startFilesystemIfEnabled(
 	if err != nil {
 		return errors.Wrap(err, "create filesystem service")
 	}
-	if err := service.InitializeRoot(
-		ctx,
-		config.rootMode,
-		config.rootUID,
-		config.rootGID,
-	); err != nil {
+	startupCtx, cancel := context.WithTimeout(ctx, filesystemStartupRetryBudget)
+	defer cancel()
+	if err := retryFilesystemStartup(startupCtx, filesystemStartupRetryInterval, func(ctx context.Context) error {
+		return service.InitializeRoot(ctx, config.rootMode, config.rootUID, config.rootGID)
+	}); err != nil {
 		return errors.Wrap(err, "initialize filesystem root")
 	}
 	server, serveDone, err := mountFilesystemService(ctx, service, config)
@@ -1102,6 +1103,25 @@ func startFilesystemIfEnabled(
 	startFilesystemLeaseReaper(ctx, eg, service, *filesystemLeaseReapInterval)
 	slog.Info("filesystem FUSE mounted", "mount_point", config.mountPoint, "client_id", config.clientID)
 	return nil
+}
+
+// retryFilesystemStartup waits for Raft leadership and its HLC lease during
+// cluster election. Other failures remain terminal, and the caller supplies
+// the startup deadline.
+func retryFilesystemStartup(ctx context.Context, interval time.Duration, attempt func(context.Context) error) error {
+	for {
+		err := attempt(ctx)
+		if err == nil || (!errors.Is(err, kv.ErrLeaderNotFound) && !errors.Is(err, kv.ErrCeilingExpired)) {
+			return err
+		}
+		timer := time.NewTimer(interval)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return errors.Join(err, ctx.Err())
+		}
+	}
 }
 
 // mountFilesystemService mounts service at the configured mount point. ctx
@@ -1149,7 +1169,11 @@ func strictFilesystemOptions(ctx context.Context, service *filesystem.Service, c
 		return nil, errors.Wrap(err, "identify strict filesystem")
 	}
 	if config.strictRecover {
-		if err := journal.RecoverOwnerSession(ctx, filesystemID, config.clientID); err != nil {
+		recoveryCtx, cancel := context.WithTimeout(ctx, filesystemStartupRetryBudget)
+		defer cancel()
+		if err := retryFilesystemStartup(recoveryCtx, filesystemStartupRetryInterval, func(ctx context.Context) error {
+			return journal.RecoverOwnerSession(ctx, filesystemID, config.clientID)
+		}); err != nil {
 			return nil, errors.Wrap(err, "recover previous strict filesystem session")
 		}
 	}
