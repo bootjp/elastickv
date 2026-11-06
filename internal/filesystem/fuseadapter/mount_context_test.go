@@ -14,7 +14,8 @@ import (
 // work (stale-mount detach, intent recovery) instead of running it to
 // completion. No kernel mount is attempted, so no FUSE is needed.
 func TestMountContextAbortsWhenCancelled(t *testing.T) {
-	t.Parallel()
+	// Not parallel: it reaches a real FUSE kernel mount. Concurrent mounts
+	// hung the race shard on Linux CI past the 30m test timeout.
 	svc, err := fstest.NewMemoryService()
 	require.NoError(t, err)
 	adapter := fuseadapter.New(svc, []byte("cancelled"))

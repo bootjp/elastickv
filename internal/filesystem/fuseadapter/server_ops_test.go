@@ -764,7 +764,8 @@ func TestDivideRoundUpAndSaturatingAdd(t *testing.T) {
 }
 
 func TestMountRejectsInvalidInputs(t *testing.T) {
-	t.Parallel()
+	// Not parallel: it reaches a real FUSE kernel mount. Concurrent mounts
+	// hung the race shard on Linux CI past the 30m test timeout.
 	_, err := Mount("/nonexistent", nil, nil)
 	require.ErrorContains(t, err, "adapter is required")
 
@@ -796,7 +797,8 @@ func (c *recoveringCore) RecoverIntents(context.Context, int) (filesystem.Recove
 }
 
 func TestMountFailsWhenStartupRecoveryFails(t *testing.T) {
-	t.Parallel()
+	// Not parallel: it reaches a real FUSE kernel mount. Concurrent mounts
+	// hung the race shard on Linux CI past the 30m test timeout.
 	core := &recoveringCore{fakeCore: &fakeCore{}, err: errors.New("recovery boom")}
 	adapter := New(core, []byte("mount-a"), WithHandleKeepaliveInterval(0))
 	t.Cleanup(adapter.Close)
