@@ -10,6 +10,7 @@ import (
 )
 
 func TestReleaseWithOperationSupportsLongClientID(t *testing.T) {
+	t.Parallel()
 	ctx := t.Context()
 	svc := newTestServiceWithOptions(t, []uint64{2, 3})
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -31,6 +32,7 @@ func TestReleaseWithOperationSupportsLongClientID(t *testing.T) {
 }
 
 func TestReleaseWithOperationDoesNotRemoveNewHandle(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, []uint64{2, 3, 4})
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -58,6 +60,7 @@ func TestReleaseWithOperationDoesNotRemoveNewHandle(t *testing.T) {
 }
 
 func TestReleaseWithOperationResolvesLostCommitReply(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, []uint64{2, 3})
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))

@@ -13,6 +13,7 @@ import (
 )
 
 func TestPartitionControlStrictCodec(t *testing.T) {
+	t.Parallel()
 	for _, raw := range [][]byte{nil, []byte(`{}`), []byte(`{"Transition":{},"unknown":1}`), []byte(`{} {}`), []byte(`{"Transition":{},"Transition":{}}`)} {
 		_, err := DecodeMigrationPartitionControl(raw)
 		require.Error(t, err)
@@ -59,6 +60,7 @@ func partitionControlCommand(t *testing.T, c MigrationPartitionControl) []byte {
 }
 
 func TestPartitionControlApplyAndExactReplay(t *testing.T) {
+	t.Parallel()
 	for _, local := range []uint64{1, 2} {
 		t.Run(map[uint64]string{1: "owner", 2: "nonowner"}[local], func(t *testing.T) {
 			st := store.NewMVCCStore()
@@ -92,6 +94,7 @@ func TestPartitionControlApplyAndExactReplay(t *testing.T) {
 }
 
 func TestPartitionControlRefreshStableIdentityAndNegativeRole(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	f, c := partitionControlFixture(t, st, 2)
 	f.SetApplyIndex(20)
@@ -118,6 +121,7 @@ func TestPartitionControlRefreshStableIdentityAndNegativeRole(t *testing.T) {
 }
 
 func TestPartitionControlRejectsChangedPriorAndConfiguration(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	f, c := partitionControlFixture(t, st, 1)
 	// A complete valid-looking alternate legacy CAS must still match durable state.
@@ -153,6 +157,7 @@ func (s *partitionFailureStore) ApplyMigrationOwnershipPartition(context.Context
 }
 
 func TestPartitionControlIOHaltsButSemanticRefusalDoesNot(t *testing.T) {
+	t.Parallel()
 	base := store.NewMVCCStore()
 	_, c := partitionControlFixture(t, base, 1)
 	for _, failure := range []error{errors.New("partition batch IO failure"), store.ErrMigrationOwnership, store.ErrNotSupported} {
@@ -169,6 +174,7 @@ func TestPartitionControlIOHaltsButSemanticRefusalDoesNot(t *testing.T) {
 }
 
 func TestPartitionControlCanonicalAndBoundedPayload(t *testing.T) {
+	t.Parallel()
 	_, c := partitionControlFixture(t, store.NewMVCCStore(), 1)
 	raw, err := EncodeMigrationPartitionControl(c)
 	require.NoError(t, err)
@@ -186,11 +192,13 @@ func TestPartitionControlCanonicalAndBoundedPayload(t *testing.T) {
 }
 
 func TestPartitionControlRequiresBoundConfiguration(t *testing.T) {
+	t.Parallel()
 	err := ValidateMigrationPartitionRequest(&pb.CleanupMigrationRequest{Mode: pb.MigrationCleanupMode(7)})
 	require.Error(t, err)
 }
 
 func TestPartitionControlPebbleApplyPersistsReceiptAndIndex(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	st, err := store.NewPebbleStore(dir)
 	require.NoError(t, err)

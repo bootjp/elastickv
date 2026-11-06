@@ -16,6 +16,7 @@ type partitionReadinessNilStore struct {
 }
 
 func TestMigrationPartitionProtocolReadinessRequiresInstalledRequestPath(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	f, ok := NewKvFSMWithHLC(st, nil).(*kvFSM)
 	require.True(t, ok)
@@ -48,6 +49,7 @@ func TestMigrationPartitionProtocolReadinessRequiresInstalledRequestPath(t *test
 }
 
 func TestMigrationPartitionProtocolReadinessRequiresCachedPublicReadPairing(t *testing.T) {
+	t.Parallel()
 	engine := distribution.NewEngine()
 	st := store.NewMVCCStore()
 	var nilStore *partitionReadinessNilStore

@@ -63,6 +63,7 @@ func (s *stubLeaderCoordinator) LinearizableRead(context.Context) (uint64, error
 }
 
 func TestLeaderRoutedStore_GlobalCommittedTimestampFloorWaitsForApply(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	local := store.NewMVCCStore()
 	require.NoError(t, local.PutAt(ctx, []byte("hot"), []byte("old"), 10, 0))
@@ -86,6 +87,7 @@ func TestLeaderRoutedStore_GlobalCommittedTimestampFloorWaitsForApply(t *testing
 }
 
 func TestLeaderRoutedStore_GlobalCommittedTimestampFloorProxiesFencedLeader(t *testing.T) {
+	t.Parallel()
 	fake := &fakeRawKVServer{
 		wantLatestGroupID: 1,
 		latestResp:        &pb.RawLatestCommitTSResponse{Ts: 30, GroupId: 1, LeaderFenced: true},

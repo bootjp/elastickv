@@ -70,6 +70,7 @@ func pendingTestAllocator(t *testing.T, gate TSOPhaseDActivationGate) (*RaftTSOA
 }
 
 func TestTSOPendingRequiresGateAndCapabilityBeforeMarker(t *testing.T) {
+	t.Parallel()
 	a, fsm, engine, _ := pendingTestAllocator(t, nil)
 	_, err := a.ReserveBatchAfter(context.Background(), 2, 0, true, true)
 	require.ErrorIs(t, err, ErrTSOPhaseDActivationGateRequired)
@@ -83,6 +84,7 @@ func TestTSOPendingRequiresGateAndCapabilityBeforeMarker(t *testing.T) {
 }
 
 func TestTSOPendingPreBarrierDrainAllowsEvidenceScopedResolutionAndFreshFloor(t *testing.T) {
+	t.Parallel()
 	gate := &testPhaseDGate{checkErr: ErrTSOPhaseDActivationPending}
 	a, fsm, engine, provider := pendingTestAllocator(t, gate)
 	_, err := a.ReserveBatchAfter(context.Background(), 2, 0, true, true)
@@ -101,6 +103,7 @@ func TestTSOPendingPreBarrierDrainAllowsEvidenceScopedResolutionAndFreshFloor(t 
 }
 
 func TestTSOPendingFreezesFloorAndAllowsOnlyScopedResolution(t *testing.T) {
+	t.Parallel()
 	gate := &testPhaseDGate{prepareErr: ErrTSOPhaseDActivationPending}
 	a, fsm, engine, provider := pendingTestAllocator(t, gate)
 	gate.check = func() { require.Zero(t, fsm.PendingPhaseDFloor()) }
@@ -141,6 +144,7 @@ func TestTSOPendingFreezesFloorAndAllowsOnlyScopedResolution(t *testing.T) {
 }
 
 func TestTSOPendingSnapshotAndLeaderReplacementKeepBarrier(t *testing.T) {
+	t.Parallel()
 	gate := &testPhaseDGate{prepareErr: ErrTSOPhaseDActivationPending}
 	a, fsm, _, _ := pendingTestAllocator(t, gate)
 	_, err := a.ReserveBatchAfter(context.Background(), 2, 0, true, true)
@@ -181,6 +185,7 @@ func TestTSOPendingSnapshotAndLeaderReplacementKeepBarrier(t *testing.T) {
 }
 
 func TestTSOPendingRejectsDifferentFloorAndAllocationBeforeActivation(t *testing.T) {
+	t.Parallel()
 	fsm := NewTSOStateMachine(NewHLC())
 	require.Nil(t, fsm.Apply(marshalTSOCutover()))
 	require.Nil(t, fsm.Apply(marshalTSOPendingPhaseD(100)))
@@ -192,6 +197,7 @@ func TestTSOPendingRejectsDifferentFloorAndAllocationBeforeActivation(t *testing
 }
 
 func TestTSOPendingLeaderChangeDuringGateDoesNotActivate(t *testing.T) {
+	t.Parallel()
 	gate := &testPhaseDGate{}
 	a, fsm, engine, _ := pendingTestAllocator(t, gate)
 	gate.prepare = func(uint64) { engine.setTerm(2) }
@@ -202,6 +208,7 @@ func TestTSOPendingLeaderChangeDuringGateDoesNotActivate(t *testing.T) {
 }
 
 func TestTSOPendingLegacyValidationThroughDecorators(t *testing.T) {
+	t.Parallel()
 	gate := &testPhaseDGate{prepareErr: ErrTSOPhaseDActivationPending}
 	a, fsm, _, _ := pendingTestAllocator(t, gate)
 	_, err := a.ReserveBatchAfter(context.Background(), 1, 0, true, true)

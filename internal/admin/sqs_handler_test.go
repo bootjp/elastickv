@@ -141,6 +141,7 @@ func (s *stubQueuesSource) reachedWrite() bool {
 // used to gate on the live role alone, so the stale read_only JWT
 // could delete, reconfigure and purge queues.
 func TestSqsHandler_Writes_LivePromotionDoesNotWidenJWTRole(t *testing.T) {
+	t.Parallel()
 	for name, newReq := range sqsWriteRequests() {
 		t.Run(name, func(t *testing.T) {
 			src := &stubQueuesSource{queues: []string{"orders"}}
@@ -163,6 +164,7 @@ func TestSqsHandler_Writes_LivePromotionDoesNotWidenJWTRole(t *testing.T) {
 // access cannot peek message bodies because the live role index now
 // grants read.
 func TestSqsHandler_PeekMessages_LivePromotionDoesNotWidenJWTRole(t *testing.T) {
+	t.Parallel()
 	src := &stubQueuesSource{queues: []string{"orders"}}
 	h := NewSqsHandler(src).WithRoleStore(MapRoleStore{"AKIA_PROMOTED": RoleReadOnly})
 
@@ -182,6 +184,7 @@ func TestSqsHandler_PeekMessages_LivePromotionDoesNotWidenJWTRole(t *testing.T) 
 // any handler runs, so this only fires if a routing change bypasses
 // the middleware.
 func TestSqsHandler_MissingPrincipalIsUnauthenticated(t *testing.T) {
+	t.Parallel()
 	requests := sqsWriteRequests()
 	requests["peek"] = func() *http.Request {
 		return httptest.NewRequest(http.MethodGet, pathPrefixSqsQueues+"orders/messages", nil)
@@ -206,6 +209,7 @@ func TestSqsHandler_MissingPrincipalIsUnauthenticated(t *testing.T) {
 // (or downgraded to read_only) — the request must be rejected at
 // the handler, never reaching the source.
 func TestSqsHandler_DeleteQueue_LiveRevocation(t *testing.T) {
+	t.Parallel()
 	src := &stubQueuesSource{queues: []string{"orders"}}
 	roles := MapRoleStore{"AKIA_DOWNGRADED": RoleReadOnly}
 	h := NewSqsHandler(src).WithRoleStore(roles)
@@ -226,6 +230,7 @@ func TestSqsHandler_DeleteQueue_LiveRevocation(t *testing.T) {
 // rotated credentials). The request must 403 — same shape as the
 // downgrade case — and never reach the source.
 func TestSqsHandler_DeleteQueue_KeyRemovedFromStore(t *testing.T) {
+	t.Parallel()
 	src := &stubQueuesSource{queues: []string{"orders"}}
 	roles := MapRoleStore{} // key not present at all
 	h := NewSqsHandler(src).WithRoleStore(roles)
@@ -245,6 +250,7 @@ func TestSqsHandler_DeleteQueue_KeyRemovedFromStore(t *testing.T) {
 // embedded role. A JWT-full request succeeds; a JWT-read_only
 // request is rejected at the handler.
 func TestSqsHandler_DeleteQueue_NoRoleStore(t *testing.T) {
+	t.Parallel()
 	t.Run("jwt full succeeds", func(t *testing.T) {
 		src := &stubQueuesSource{queues: []string{"orders"}}
 		h := NewSqsHandler(src) // no WithRoleStore
@@ -270,6 +276,7 @@ func TestSqsHandler_DeleteQueue_NoRoleStore(t *testing.T) {
 }
 
 func TestSqsHandler_SetQueueAttributes_HappyPath(t *testing.T) {
+	t.Parallel()
 	src := &stubQueuesSource{queues: []string{"orders"}}
 	h := NewSqsHandler(src)
 	body := `{"attributes":{"RedrivePolicy":"{\"deadLetterTargetArn\":\"arn:aws:sqs:us-east-1:000000000000:orders-dlq\",\"maxReceiveCount\":5}"}}`
@@ -286,6 +293,7 @@ func TestSqsHandler_SetQueueAttributes_HappyPath(t *testing.T) {
 }
 
 func TestSqsHandler_SetQueueAttributes_ReadOnlyForbidden(t *testing.T) {
+	t.Parallel()
 	src := &stubQueuesSource{queues: []string{"orders"}}
 	h := NewSqsHandler(src)
 	req := httptest.NewRequest(http.MethodPut, pathPrefixSqsQueues+"orders/attributes", strings.NewReader(`{"attributes":{"RedriveAllowPolicy":"{}"}}`))
@@ -303,6 +311,7 @@ func TestSqsHandler_SetQueueAttributes_ReadOnlyForbidden(t *testing.T) {
 // case serialises as `{"queues": null}` and the SPA crashes on
 // `queues.length` against null.
 func TestSqsHandler_ListQueues_EmptyArrayNotNull(t *testing.T) {
+	t.Parallel()
 	src := &stubQueuesSource{queues: nil}
 	h := NewSqsHandler(src)
 	req := httptest.NewRequest(http.MethodGet, pathSqsQueues, nil)
@@ -324,6 +333,7 @@ func TestSqsHandler_ListQueues_EmptyArrayNotNull(t *testing.T) {
 // representation, not the Go-side IsZero() check the adapter unit
 // test already pins.
 func TestSqsHandler_DescribeQueue_ZeroCreatedAtIsOmittedOnTheWire(t *testing.T) {
+	t.Parallel()
 	// AdminDescribeQueue stub returns a QueueSummary with no CreatedAt
 	// set (nil pointer, the post-bridge representation of an unknown
 	// CreatedAtMillis).
@@ -346,6 +356,7 @@ func TestSqsHandler_DescribeQueue_ZeroCreatedAtIsOmittedOnTheWire(t *testing.T) 
 // renders the response as snake_case JSON with messages and
 // next_cursor.
 func TestSqsHandler_PeekMessages_HappyPath(t *testing.T) {
+	t.Parallel()
 	src := &stubQueuesSource{
 		queues: []string{"orders"},
 		peekResult: PeekResult{
@@ -376,6 +387,7 @@ func TestSqsHandler_PeekMessages_HappyPath(t *testing.T) {
 // render as `{"messages":[]}` not `{"messages":null}` so the SPA's
 // `messages.length` iteration does not crash.
 func TestSqsHandler_PeekMessages_EmptyArrayNotNull(t *testing.T) {
+	t.Parallel()
 	src := &stubQueuesSource{
 		queues:     []string{"orders"},
 		peekResult: PeekResult{Messages: nil, NextCursor: ""},
@@ -395,6 +407,7 @@ func TestSqsHandler_PeekMessages_EmptyArrayNotNull(t *testing.T) {
 // without a RoleStore wired — peek's payload is sensitive enough
 // that the lower-bound gate fires.
 func TestSqsHandler_PeekMessages_NoRoleForbidden(t *testing.T) {
+	t.Parallel()
 	src := &stubQueuesSource{queues: []string{"orders"}}
 	h := NewSqsHandler(src)
 	req := httptest.NewRequest(http.MethodGet, pathPrefixSqsQueues+"orders/messages", nil)
@@ -409,6 +422,7 @@ func TestSqsHandler_PeekMessages_NoRoleForbidden(t *testing.T) {
 // TestSqsHandler_PeekMessages_BadLimitQueryParam pins the query
 // parsing: a non-numeric limit returns a 400 without dispatching.
 func TestSqsHandler_PeekMessages_BadLimitQueryParam(t *testing.T) {
+	t.Parallel()
 	src := &stubQueuesSource{queues: []string{"orders"}}
 	h := NewSqsHandler(src)
 	req := httptest.NewRequest(http.MethodGet, pathPrefixSqsQueues+"orders/messages?limit=NaN", nil)
@@ -424,6 +438,7 @@ func TestSqsHandler_PeekMessages_BadLimitQueryParam(t *testing.T) {
 // /queues/{name}/messages dispatches to AdminPurgeQueue (write role
 // required) and returns 204 on success.
 func TestSqsHandler_PurgeQueue_HappyPath(t *testing.T) {
+	t.Parallel()
 	src := &stubQueuesSource{
 		queues:      []string{"orders"},
 		purgeResult: PurgeResult{GenerationBefore: 1, GenerationAfter: 2},
@@ -444,6 +459,7 @@ func TestSqsHandler_PurgeQueue_HappyPath(t *testing.T) {
 // up to whole seconds, and retry_after_seconds JSON field. errors.As
 // on the *PurgeInProgressError chain feeds the duration in.
 func TestSqsHandler_PurgeQueue_RateLimited429(t *testing.T) {
+	t.Parallel()
 	src := &stubQueuesSource{
 		queues:   []string{"orders"},
 		purgeErr: &PurgeInProgressError{RetryAfter: 42*time.Second + 500*time.Millisecond},
@@ -473,6 +489,7 @@ func TestSqsHandler_PurgeQueue_RateLimited429(t *testing.T) {
 // when principalForWrite was shared between handleDelete and
 // handlePurge.
 func TestSqsHandler_PurgeQueue_ReadOnlyForbidden(t *testing.T) {
+	t.Parallel()
 	src := &stubQueuesSource{queues: []string{"orders"}}
 	h := NewSqsHandler(src)
 	req := httptest.NewRequest(http.MethodDelete, pathPrefixSqsQueues+"orders/messages", nil)
@@ -493,6 +510,7 @@ func TestSqsHandler_PurgeQueue_ReadOnlyForbidden(t *testing.T) {
 // §3.4): every input must be rejected with 400 invalid_path before
 // dispatch.
 func TestSqsHandler_Routing_PathValidation_BadInputs(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name string
 		url  string
@@ -526,6 +544,7 @@ func TestSqsHandler_Routing_PathValidation_BadInputs(t *testing.T) {
 // /queues/orders/messages — it dispatches to peek (GET) and purge
 // (DELETE) just like the un-suffixed form.
 func TestSqsHandler_Routing_TrailingSlashAccepted(t *testing.T) {
+	t.Parallel()
 	src := &stubQueuesSource{queues: []string{"orders"}, peekResult: PeekResult{}}
 	h := NewSqsHandler(src)
 
@@ -556,6 +575,7 @@ func TestSqsHandler_Routing_TrailingSlashAccepted(t *testing.T) {
 // the /queues/messages path (no /messages sub-resource segment).
 // Distinguishes "queue named messages" from "missing queue name".
 func TestSqsHandler_Routing_QueueNamedMessages(t *testing.T) {
+	t.Parallel()
 	src := &stubQueuesSource{queues: []string{"messages"}}
 	h := NewSqsHandler(src)
 	req := httptest.NewRequest(http.MethodGet, pathPrefixSqsQueues+"messages", nil)
@@ -569,6 +589,7 @@ func TestSqsHandler_Routing_QueueNamedMessages(t *testing.T) {
 // for sub-resources we don't recognise (e.g. /queues/orders/foo
 // instead of /queues/orders/messages).
 func TestSqsHandler_Routing_UnknownSubResource(t *testing.T) {
+	t.Parallel()
 	src := &stubQueuesSource{queues: []string{"orders"}}
 	h := NewSqsHandler(src)
 	req := httptest.NewRequest(http.MethodGet, pathPrefixSqsQueues+"orders/notathing", nil)
@@ -582,6 +603,7 @@ func TestSqsHandler_Routing_UnknownSubResource(t *testing.T) {
 // not through the queue-name validator that would reject them as
 // "empty queue name segment".
 func TestSqsHandler_Routing_CollectionRoot(t *testing.T) {
+	t.Parallel()
 	src := &stubQueuesSource{queues: []string{"orders"}}
 	h := NewSqsHandler(src)
 	for _, path := range []string{pathSqsQueues, pathPrefixSqsQueues} {
@@ -600,6 +622,7 @@ func TestSqsHandler_Routing_CollectionRoot(t *testing.T) {
 // typed RetryAfter duration. Without these the handler's branching
 // in writeQueuesError silently falls through to 500.
 func TestPurgeInProgressError_IsAndAs(t *testing.T) {
+	t.Parallel()
 	err := &PurgeInProgressError{RetryAfter: 30 * time.Second}
 	require.True(t, errors.Is(err, ErrQueuesPurgeInProgress))
 	var typed *PurgeInProgressError
@@ -609,6 +632,7 @@ func TestPurgeInProgressError_IsAndAs(t *testing.T) {
 
 // TestRole_AllowsRead pins the new gate.
 func TestRole_AllowsRead(t *testing.T) {
+	t.Parallel()
 	require.True(t, RoleFull.AllowsRead())
 	require.True(t, RoleReadOnly.AllowsRead())
 	require.False(t, Role("").AllowsRead())
@@ -616,6 +640,7 @@ func TestRole_AllowsRead(t *testing.T) {
 }
 
 func TestSqsHandler_CreateQueue(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name      string
 		body      string

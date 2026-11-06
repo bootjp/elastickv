@@ -14,6 +14,7 @@ import (
 // interface would miss a typed-nil, and every login would silently
 // 401 at runtime.
 func TestServer_RejectsTypedNilCredentialStore(t *testing.T) {
+	t.Parallel()
 	clk := fixedClock(time.Unix(1_700_000_000, 0).UTC())
 	signer := newSignerForTest(t, 1, clk)
 	verifier := newVerifierForTest(t, []byte{1}, clk)
@@ -34,6 +35,7 @@ func TestServer_RejectsTypedNilCredentialStore(t *testing.T) {
 }
 
 func TestIsNilCredentialStore(t *testing.T) {
+	t.Parallel()
 	var noMap MapCredentialStore
 	cases := []struct {
 		name  string

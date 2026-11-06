@@ -11,6 +11,7 @@ import (
 )
 
 func TestGRPCConnCacheRuntimeCapabilityIsImmutableAndRechecked(t *testing.T) {
+	t.Parallel()
 	var allowed atomic.Bool
 	allowed.Store(true)
 	denied := errors.New("runtime pinned roster rejected address")
@@ -45,6 +46,7 @@ func TestGRPCConnCacheRuntimeCapabilityIsImmutableAndRechecked(t *testing.T) {
 }
 
 func TestGRPCConnCacheCloseCannotPublishConcurrentProtectedDial(t *testing.T) {
+	t.Parallel()
 	entered, release := make(chan struct{}), make(chan struct{})
 	cache := NewGRPCConnCache(func(string) ([]grpc.DialOption, error) {
 		close(entered)

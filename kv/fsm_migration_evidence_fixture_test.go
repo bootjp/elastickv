@@ -58,6 +58,7 @@ func installStagedOwnershipEvidence(t *testing.T, f *kvFSM, version uint64, rout
 }
 
 func TestStagedOwnershipEvidenceRequiresDescriptorIdentity(t *testing.T) {
+	t.Parallel()
 	f := &kvFSM{store: store.NewMVCCStore(), shardGroupID: 1}
 	proof := installStagedOwnershipEvidence(t, f, 7, applyRouteContextDescriptor())
 	for _, field := range []string{"generation", "route ID", "descriptor hash", "receipt hash", "receipt"} {

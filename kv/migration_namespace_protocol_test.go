@@ -35,6 +35,7 @@ func applyNamespaceCommand(t *testing.T, f *kvFSM, index uint64, command Namespa
 }
 
 func TestMigrationNamespaceActivationRequiresEveryApplyMember(t *testing.T) {
+	t.Parallel()
 	for _, kind := range []string{"missing-learner", "old-member", "wrong-member-config", "extra-member", "duplicate", "wrong-roster", "stale-config", "zero-version", "valid"} {
 		t.Run(kind, func(t *testing.T) {
 			st := store.NewMVCCStore()
@@ -84,6 +85,7 @@ func namespaceActivationTestCommand(t *testing.T, f *kvFSM, kind string) Namespa
 }
 
 func TestMigrationNamespacePrejoinAndConfigurationMonotonicity(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	f := &kvFSM{store: st}
 	require.NoError(t, f.RecordAppliedNamespaceConfiguration(5, []uint64{1, 2}))
@@ -104,6 +106,7 @@ func TestMigrationNamespacePrejoinAndConfigurationMonotonicity(t *testing.T) {
 }
 
 func TestMigrationNamespaceActivationSnapshotRestartAndExternalRebase(t *testing.T) {
+	t.Parallel()
 	for _, backend := range []string{"mvcc", "pebble"} {
 		t.Run(backend, func(t *testing.T) {
 			source := store.NewMVCCStore()
@@ -176,6 +179,7 @@ func (s *namespaceFailStore) ApplyMutationsRaftAt(ctx context.Context, muts []*s
 }
 
 func TestMigrationNamespaceDurabilityFailureHaltsWithoutActivation(t *testing.T) {
+	t.Parallel()
 	st := &namespaceFailStore{MVCCStore: store.NewMVCCStore()}
 	f := &kvFSM{store: st}
 	require.NoError(t, f.RecordAppliedNamespaceConfiguration(5, []uint64{1}))
@@ -203,6 +207,7 @@ func (p *namespaceProposer) ProposeAdmin(_ context.Context, data []byte) (*rafte
 }
 
 func TestMigrationNamespaceActivationHelperRefusesIncompleteNegotiationBeforeProposal(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	f := &kvFSM{store: st}
 	require.NoError(t, f.RecordAppliedNamespaceConfiguration(5, []uint64{1, 2}))

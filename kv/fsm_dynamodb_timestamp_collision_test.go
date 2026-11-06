@@ -14,6 +14,7 @@ import (
 )
 
 func TestDynamoAppendDistinctRaftEntryCannotAcknowledgeTimestampCollision(t *testing.T) {
+	t.Parallel()
 	for _, encrypted := range []bool{false, true} {
 		t.Run(map[bool]string{false: "plaintext", true: "encrypted"}[encrypted], func(t *testing.T) {
 			ctx := context.Background()

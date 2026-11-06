@@ -13,6 +13,7 @@ import (
 )
 
 func TestCatalogVersionCodecRoundTrip(t *testing.T) {
+	t.Parallel()
 	raw := EncodeCatalogVersion(42)
 	got, err := DecodeCatalogVersion(raw)
 	if err != nil {
@@ -24,6 +25,7 @@ func TestCatalogVersionCodecRoundTrip(t *testing.T) {
 }
 
 func TestCatalogVersionCodecRejectsInvalidPayload(t *testing.T) {
+	t.Parallel()
 	if _, err := DecodeCatalogVersion(nil); !errors.Is(err, ErrCatalogInvalidVersionRecord) {
 		t.Fatalf("expected ErrCatalogInvalidVersionRecord, got %v", err)
 	}
@@ -33,6 +35,7 @@ func TestCatalogVersionCodecRejectsInvalidPayload(t *testing.T) {
 }
 
 func TestCatalogNextRouteIDCodecRoundTrip(t *testing.T) {
+	t.Parallel()
 	raw := EncodeCatalogNextRouteID(77)
 	got, err := DecodeCatalogNextRouteID(raw)
 	if err != nil {
@@ -44,6 +47,7 @@ func TestCatalogNextRouteIDCodecRoundTrip(t *testing.T) {
 }
 
 func TestCatalogNextRouteIDCodecRejectsInvalidPayload(t *testing.T) {
+	t.Parallel()
 	if _, err := DecodeCatalogNextRouteID(nil); !errors.Is(err, ErrCatalogInvalidNextRouteID) {
 		t.Fatalf("expected ErrCatalogInvalidNextRouteID, got %v", err)
 	}
@@ -53,6 +57,7 @@ func TestCatalogNextRouteIDCodecRejectsInvalidPayload(t *testing.T) {
 }
 
 func TestRouteDescriptorCodecRoundTrip(t *testing.T) {
+	t.Parallel()
 	route := RouteDescriptor{
 		RouteID:       7,
 		Start:         []byte("a"),
@@ -77,6 +82,7 @@ func TestRouteDescriptorCodecRoundTrip(t *testing.T) {
 }
 
 func TestRouteDescriptorCodecRoundTripNilEnd(t *testing.T) {
+	t.Parallel()
 	route := RouteDescriptor{
 		RouteID:       9,
 		Start:         []byte("m"),
@@ -101,6 +107,7 @@ func TestRouteDescriptorCodecRoundTripNilEnd(t *testing.T) {
 }
 
 func TestRouteDescriptorCodecDecodesV1WithoutSplitAtHLC(t *testing.T) {
+	t.Parallel()
 	route := RouteDescriptor{
 		RouteID:       5,
 		Start:         []byte("a"),
@@ -119,6 +126,7 @@ func TestRouteDescriptorCodecDecodesV1WithoutSplitAtHLC(t *testing.T) {
 }
 
 func TestRouteDescriptorCodecRejectsV1TrailingBytes(t *testing.T) {
+	t.Parallel()
 	route := RouteDescriptor{
 		RouteID:       6,
 		Start:         []byte("a"),
@@ -137,6 +145,7 @@ func TestRouteDescriptorCodecRejectsV1TrailingBytes(t *testing.T) {
 }
 
 func TestRouteDescriptorCodecRejectsTrailingBytes(t *testing.T) {
+	t.Parallel()
 	route := RouteDescriptor{
 		RouteID:       1,
 		Start:         []byte("a"),
@@ -158,6 +167,7 @@ func TestRouteDescriptorCodecRejectsTrailingBytes(t *testing.T) {
 }
 
 func TestRouteDescriptorCodecV3RoundTrip(t *testing.T) {
+	t.Parallel()
 	route := RouteDescriptor{
 		RouteID:                1,
 		Start:                  []byte("a"),
@@ -186,6 +196,7 @@ func TestRouteDescriptorCodecV3RoundTrip(t *testing.T) {
 }
 
 func TestRouteDescriptorCodecV3RoundTripNilEnd(t *testing.T) {
+	t.Parallel()
 	route := RouteDescriptor{
 		RouteID:             1,
 		Start:               []byte("m"),
@@ -211,6 +222,7 @@ func TestRouteDescriptorCodecV3RoundTripNilEnd(t *testing.T) {
 }
 
 func TestRouteDescriptorCodecRejectsV3TrailingBytes(t *testing.T) {
+	t.Parallel()
 	route := RouteDescriptor{
 		RouteID:                1,
 		Start:                  []byte("a"),
@@ -233,6 +245,7 @@ func TestRouteDescriptorCodecRejectsV3TrailingBytes(t *testing.T) {
 }
 
 func TestRouteDescriptorCodecRejectsTruncatedV3Tail(t *testing.T) {
+	t.Parallel()
 	route := RouteDescriptor{
 		RouteID:                1,
 		Start:                  []byte("a"),
@@ -255,6 +268,7 @@ func TestRouteDescriptorCodecRejectsTruncatedV3Tail(t *testing.T) {
 }
 
 func TestRouteDescriptorCodecRejectsTruncatedSplitAtHLC(t *testing.T) {
+	t.Parallel()
 	route := RouteDescriptor{
 		RouteID:       1,
 		Start:         []byte("a"),
@@ -277,6 +291,7 @@ func TestRouteDescriptorCodecRejectsTruncatedSplitAtHLC(t *testing.T) {
 }
 
 func TestRouteDescriptorCodecRejectsUnknownVersion(t *testing.T) {
+	t.Parallel()
 	route := RouteDescriptor{
 		RouteID:       1,
 		Start:         []byte("a"),
@@ -298,6 +313,7 @@ func TestRouteDescriptorCodecRejectsUnknownVersion(t *testing.T) {
 }
 
 func TestRouteDescriptorCodecRejectsBelowMinimumVersion(t *testing.T) {
+	t.Parallel()
 	route := RouteDescriptor{
 		RouteID:       1,
 		Start:         []byte("a"),
@@ -319,6 +335,7 @@ func TestRouteDescriptorCodecRejectsBelowMinimumVersion(t *testing.T) {
 }
 
 func TestRouteDescriptorHelpersIncludeExtensionFields(t *testing.T) {
+	t.Parallel()
 	route := RouteDescriptor{
 		RouteID:                1,
 		Start:                  []byte("a"),
@@ -360,6 +377,7 @@ func TestRouteDescriptorHelpersIncludeExtensionFields(t *testing.T) {
 }
 
 func TestRouteDescriptorSplitAtHLCPatchOffsetPreservesV3Fields(t *testing.T) {
+	t.Parallel()
 	route := RouteDescriptor{
 		RouteID:                1,
 		Start:                  []byte("a"),
@@ -389,6 +407,7 @@ func TestRouteDescriptorSplitAtHLCPatchOffsetPreservesV3Fields(t *testing.T) {
 }
 
 func TestRouteDescriptorSplitAtHLCPatchOffsetSupportsV2(t *testing.T) {
+	t.Parallel()
 	raw, offset, err := EncodeRouteDescriptorForCatalogWriteWithSplitAtHLCOffset(RouteDescriptor{
 		RouteID:    1,
 		Start:      []byte("a"),
@@ -411,6 +430,7 @@ func TestRouteDescriptorSplitAtHLCPatchOffsetSupportsV2(t *testing.T) {
 }
 
 func TestCatalogRouteKeyHelpers(t *testing.T) {
+	t.Parallel()
 	key := CatalogRouteKey(11)
 	if !IsCatalogRouteKey(key) {
 		t.Fatal("expected route key prefix match")
@@ -428,6 +448,7 @@ func TestCatalogRouteKeyHelpers(t *testing.T) {
 }
 
 func TestCatalogStoreSnapshotEmpty(t *testing.T) {
+	t.Parallel()
 	cs := NewCatalogStore(store.NewMVCCStore())
 	snapshot, err := cs.Snapshot(context.Background())
 	if err != nil {
@@ -445,6 +466,7 @@ func TestCatalogStoreSnapshotEmpty(t *testing.T) {
 }
 
 func TestCatalogStoreSaveAndSnapshot(t *testing.T) {
+	t.Parallel()
 	cs := NewCatalogStore(store.NewMVCCStore())
 	ctx := context.Background()
 
@@ -497,6 +519,7 @@ func TestCatalogStoreSaveAndSnapshot(t *testing.T) {
 }
 
 func TestCatalogStoreSnapshotAtPreservesRequestedVersion(t *testing.T) {
+	t.Parallel()
 	cs := NewCatalogStore(store.NewMVCCStore())
 	ctx := context.Background()
 	first, err := cs.Save(ctx, 0, []RouteDescriptor{{
@@ -524,6 +547,7 @@ func TestCatalogStoreSnapshotAtPreservesRequestedVersion(t *testing.T) {
 }
 
 func TestCatalogStoreSaveAndSnapshotSortsRoutesByStart(t *testing.T) {
+	t.Parallel()
 	cs := NewCatalogStore(store.NewMVCCStore())
 	ctx := context.Background()
 
@@ -568,6 +592,7 @@ func TestCatalogStoreSaveAndSnapshotSortsRoutesByStart(t *testing.T) {
 }
 
 func TestCatalogStoreNextRouteID_DefaultsToOne(t *testing.T) {
+	t.Parallel()
 	cs := NewCatalogStore(store.NewMVCCStore())
 	ctx := context.Background()
 
@@ -581,6 +606,7 @@ func TestCatalogStoreNextRouteID_DefaultsToOne(t *testing.T) {
 }
 
 func TestCatalogStoreNextRouteID_RemainsAfterDelete(t *testing.T) {
+	t.Parallel()
 	cs := NewCatalogStore(store.NewMVCCStore())
 	ctx := context.Background()
 
@@ -620,6 +646,7 @@ func TestCatalogStoreNextRouteID_RemainsAfterDelete(t *testing.T) {
 }
 
 func TestCatalogStoreNextRouteID_TracksHigherRouteID(t *testing.T) {
+	t.Parallel()
 	cs := NewCatalogStore(store.NewMVCCStore())
 	ctx := context.Background()
 
@@ -650,6 +677,7 @@ func TestCatalogStoreNextRouteID_TracksHigherRouteID(t *testing.T) {
 }
 
 func TestCatalogStoreNextRouteIDAt_FallsBackWhenMetaMissing(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	cs := NewCatalogStore(st)
 	ctx := context.Background()
@@ -693,6 +721,7 @@ func TestCatalogStoreNextRouteIDAt_FallsBackWhenMetaMissing(t *testing.T) {
 }
 
 func TestNextRouteIDFloor_RejectsOverflow(t *testing.T) {
+	t.Parallel()
 	_, err := NextRouteIDFloor([]RouteDescriptor{
 		{RouteID: math.MaxUint64},
 	})
@@ -702,6 +731,7 @@ func TestNextRouteIDFloor_RejectsOverflow(t *testing.T) {
 }
 
 func TestCatalogStoreSaveRejectsVersionMismatch(t *testing.T) {
+	t.Parallel()
 	cs := NewCatalogStore(store.NewMVCCStore())
 	ctx := context.Background()
 	routes := []RouteDescriptor{
@@ -719,6 +749,7 @@ func TestCatalogStoreSaveRejectsVersionMismatch(t *testing.T) {
 }
 
 func TestCatalogStoreSaveRejectsDuplicateRouteIDs(t *testing.T) {
+	t.Parallel()
 	cs := NewCatalogStore(store.NewMVCCStore())
 	ctx := context.Background()
 	_, err := cs.Save(ctx, 0, []RouteDescriptor{
@@ -731,6 +762,7 @@ func TestCatalogStoreSaveRejectsDuplicateRouteIDs(t *testing.T) {
 }
 
 func TestCatalogStoreSaveRejectsInvalidRouteRange(t *testing.T) {
+	t.Parallel()
 	cs := NewCatalogStore(store.NewMVCCStore())
 	ctx := context.Background()
 	_, err := cs.Save(ctx, 0, []RouteDescriptor{
@@ -742,6 +774,7 @@ func TestCatalogStoreSaveRejectsInvalidRouteRange(t *testing.T) {
 }
 
 func TestCatalogStoreSaveDeletesRemovedRoutes(t *testing.T) {
+	t.Parallel()
 	cs := NewCatalogStore(store.NewMVCCStore())
 	ctx := context.Background()
 
@@ -776,6 +809,7 @@ func TestCatalogStoreSaveDeletesRemovedRoutes(t *testing.T) {
 }
 
 func TestCatalogStoreSaveDoesNotRewriteUnchangedRoutes(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	cs := NewCatalogStore(st)
 	ctx := context.Background()
@@ -815,6 +849,7 @@ func TestCatalogStoreSaveDoesNotRewriteUnchangedRoutes(t *testing.T) {
 }
 
 func TestCatalogStoreSaveKeepsMinWriteTSExclusiveMonotone(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	cs := NewCatalogStore(st, WithCatalogRouteDescriptorV2Writes(true))
 	ctx := context.Background()
@@ -849,6 +884,7 @@ func TestCatalogStoreSaveKeepsMinWriteTSExclusiveMonotone(t *testing.T) {
 }
 
 func TestCatalogStoreSaveRejectsRouteDescriptorV2WritesWhenDisabled(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	cs := NewCatalogStore(st)
 	ctx := context.Background()
@@ -862,6 +898,7 @@ func TestCatalogStoreSaveRejectsRouteDescriptorV2WritesWhenDisabled(t *testing.T
 }
 
 func TestCatalogStoreSaveRejectsVersionOverflow(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	ctx := context.Background()
 	// Prepare current catalog version == max uint64.
@@ -878,6 +915,7 @@ func TestCatalogStoreSaveRejectsVersionOverflow(t *testing.T) {
 }
 
 func TestCatalogStoreSaveRejectsCommitTSOverflow(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	ctx := context.Background()
 
@@ -900,6 +938,7 @@ func TestCatalogStoreSaveRejectsCommitTSOverflow(t *testing.T) {
 }
 
 func TestCatalogStoreApplySaveMutations_UsesMonotonicCommitTS(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	ctx := context.Background()
 	cs := NewCatalogStore(st)

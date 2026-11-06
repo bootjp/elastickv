@@ -10,6 +10,7 @@ import (
 )
 
 func TestServiceListFilePlacementStatsDetectsStaleCrossGroupChunk(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc, placement := newMigrationTestService(t, &testCoordinatorFactory{}, 2, 100, 101)
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -34,6 +35,7 @@ func TestServiceListFilePlacementStatsDetectsStaleCrossGroupChunk(t *testing.T) 
 }
 
 func TestServiceListFilePlacementStatsAllowsMigrationDualPlacement(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc, placement := newMigrationTestService(t, &testCoordinatorFactory{}, 2, 100)
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -62,6 +64,7 @@ func TestServiceListFilePlacementStatsAllowsMigrationDualPlacement(t *testing.T)
 }
 
 func TestServiceListFilePlacementStatsUsesPhysicalSourceGroup(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc, placement := newMigrationTestService(t, &testCoordinatorFactory{}, 2, 100)
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))

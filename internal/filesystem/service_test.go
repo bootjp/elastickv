@@ -163,6 +163,7 @@ type transientWriteConflictCoordinator struct {
 }
 
 func TestServiceCreateReplansAfterDefinitiveConflict(t *testing.T) {
+	t.Parallel()
 	ctx := t.Context()
 	svc := newTestServiceWithOptions(t, []uint64{2}, WithCapacity(16))
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -180,6 +181,7 @@ func TestServiceCreateReplansAfterDefinitiveConflict(t *testing.T) {
 }
 
 func TestServiceCreateDoesNotReplayUnknownOutcome(t *testing.T) {
+	t.Parallel()
 	ctx := t.Context()
 	svc := newTestServiceWithOptions(t, []uint64{2}, WithCapacity(16))
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -196,6 +198,7 @@ func TestServiceCreateDoesNotReplayUnknownOutcome(t *testing.T) {
 }
 
 func TestServiceNamespaceMutationsReplanAfterDefinitiveConflict(t *testing.T) {
+	t.Parallel()
 	for _, operation := range []string{"unlink", "rename"} {
 		t.Run(operation, func(t *testing.T) {
 			ctx := t.Context()
@@ -226,6 +229,7 @@ func TestServiceNamespaceMutationsReplanAfterDefinitiveConflict(t *testing.T) {
 }
 
 func TestServiceReleaseReplansAfterDefinitiveConflict(t *testing.T) {
+	t.Parallel()
 	ctx := t.Context()
 	svc := newTestServiceWithOptions(t, []uint64{2, 3, 4}, WithCapacity(16))
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -344,6 +348,7 @@ func (c *failNthDispatchCoordinator) Dispatch(ctx context.Context, req *kv.Opera
 }
 
 func TestServiceWriteRebuildsAfterDefinitiveConflict(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestService(t, 2, 3)
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -364,6 +369,7 @@ func TestServiceWriteRebuildsAfterDefinitiveConflict(t *testing.T) {
 }
 
 func TestServiceWriteConflictRetainsConcurrentDisjointBytes(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestService(t, 2, 3)
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -391,6 +397,7 @@ func TestServiceWriteConflictRetainsConcurrentDisjointBytes(t *testing.T) {
 }
 
 func TestServiceWriteNeverReplaysUnknownOutcomeWithConflict(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestService(t, 2, 3)
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -410,6 +417,7 @@ func TestServiceWriteNeverReplaysUnknownOutcomeWithConflict(t *testing.T) {
 }
 
 func TestServiceWriteLostReplyDoesNotOverwriteLaterWriter(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestService(t, 2, 3)
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -435,6 +443,7 @@ func TestServiceWriteLostReplyDoesNotOverwriteLaterWriter(t *testing.T) {
 }
 
 func TestServiceOpenDoesNotRetryUnknownOutcomeWithConflict(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestService(t, 2, 3, 4)
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -454,6 +463,7 @@ func TestServiceOpenDoesNotRetryUnknownOutcomeWithConflict(t *testing.T) {
 }
 
 func TestServiceOpenRebuildsAfterDefinitiveConflicts(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestService(t, 2, 3, 4, 5, 6, 7, 8, 9, 10)
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -471,6 +481,7 @@ func TestServiceOpenRebuildsAfterDefinitiveConflicts(t *testing.T) {
 }
 
 func TestServiceOpenWaitsForPendingTransactionLock(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestService(t, 2, 3, 4)
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -488,6 +499,7 @@ func TestServiceOpenWaitsForPendingTransactionLock(t *testing.T) {
 }
 
 func TestServiceRefreshLeaseRebuildsAfterDefinitiveConflict(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestService(t, 2, 3)
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -503,6 +515,7 @@ func TestServiceRefreshLeaseRebuildsAfterDefinitiveConflict(t *testing.T) {
 }
 
 func TestServiceCreateWriteReadTruncateSparse(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestService(t, 2, 3)
 
@@ -537,6 +550,7 @@ func TestServiceCreateWriteReadTruncateSparse(t *testing.T) {
 }
 
 func TestServiceInitializeRootToleratesConcurrentWinner(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := store.NewMVCCStore()
 	inner := &testCoordinator{st: st}
@@ -555,6 +569,7 @@ func TestServiceInitializeRootToleratesConcurrentWinner(t *testing.T) {
 }
 
 func TestServiceInitializeRootResolvesUnknownForwardedConflict(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := store.NewMVCCStore()
 	coord := &rootRaceCoordinator{inner: &testCoordinator{st: st}, ambiguous: true}
@@ -570,6 +585,7 @@ func TestServiceInitializeRootResolvesUnknownForwardedConflict(t *testing.T) {
 }
 
 func TestServiceWriteReadAtSaturatedFinalChunkBoundary(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestService(t, 2)
 
@@ -595,6 +611,7 @@ func TestServiceWriteReadAtSaturatedFinalChunkBoundary(t *testing.T) {
 }
 
 func TestServiceReadTSUsesMVCCTimestampAfterLinearizableFence(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := store.NewMVCCStore()
 	inner := &testCoordinator{st: st}
@@ -610,6 +627,7 @@ func TestServiceReadTSUsesMVCCTimestampAfterLinearizableFence(t *testing.T) {
 }
 
 func TestServiceReadTSUsesAllGroupsFenceBeforeSnapshot(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := store.NewMVCCStore()
 	require.NoError(t, st.PutAt(ctx, []byte("key"), []byte("value"), 7, 0))
@@ -626,6 +644,7 @@ func TestServiceReadTSUsesAllGroupsFenceBeforeSnapshot(t *testing.T) {
 }
 
 func TestServiceFullChunkWriteSkipsChunkReadKey(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, []uint64{2}, WithCapacity(16))
 
@@ -646,6 +665,7 @@ func TestServiceFullChunkWriteSkipsChunkReadKey(t *testing.T) {
 }
 
 func TestServiceFullChunkWriteChargesSparseChunkBytes(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, []uint64{2}, WithCapacity(16))
 
@@ -674,6 +694,7 @@ func TestServiceFullChunkWriteChargesSparseChunkBytes(t *testing.T) {
 }
 
 func TestServiceSetAttrSizeAndModeUsesSingleTxn(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestService(t, 2)
 
@@ -697,6 +718,7 @@ func TestServiceSetAttrSizeAndModeUsesSingleTxn(t *testing.T) {
 }
 
 func TestServiceSetAttrSizeOnlyUpdatesMtime(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	now := time.Unix(1_700_000_000, 0)
 	svc := newTestServiceWithOptions(t, []uint64{2}, WithClock(func() time.Time { return now }))
@@ -718,6 +740,7 @@ func TestServiceSetAttrSizeOnlyUpdatesMtime(t *testing.T) {
 }
 
 func TestServiceOpenUsesRefFenceWithoutTouchingInode(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestService(t, 2, 3)
 
@@ -737,6 +760,7 @@ func TestServiceOpenUsesRefFenceWithoutTouchingInode(t *testing.T) {
 }
 
 func TestServiceOpenRetriesDuplicateHandleID(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestService(t, 2, 3, 3, 4)
 
@@ -759,6 +783,7 @@ func TestServiceOpenRetriesDuplicateHandleID(t *testing.T) {
 }
 
 func TestServiceReaddirRenameAndRmdir(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestService(t, 2, 3)
 
@@ -797,6 +822,7 @@ func TestServiceReaddirRenameAndRmdir(t *testing.T) {
 }
 
 func TestServiceReaddirRefreshesCompactedCookieSnapshot(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestService(t, 2, 3, 4)
 
@@ -823,6 +849,7 @@ func TestServiceReaddirRefreshesCompactedCookieSnapshot(t *testing.T) {
 }
 
 func TestServiceRenameSameNameStillChecksSource(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestService(t, 2)
 
@@ -832,6 +859,7 @@ func TestServiceRenameSameNameStillChecksSource(t *testing.T) {
 }
 
 func TestServiceRenameOverExistingFileGcsTarget(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, []uint64{2, 3}, WithCapacity(16), WithMaxFiles(10))
 
@@ -857,6 +885,7 @@ func TestServiceRenameOverExistingFileGcsTarget(t *testing.T) {
 }
 
 func TestServiceRenameOverOpenFileOrphansTarget(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestService(t, 2, 3, 4)
 
@@ -885,6 +914,7 @@ func TestServiceRenameOverOpenFileOrphansTarget(t *testing.T) {
 }
 
 func TestServiceRenameDirectoryOverFileIsRejected(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestService(t, 2, 3)
 
@@ -906,6 +936,7 @@ func TestServiceRenameDirectoryOverFileIsRejected(t *testing.T) {
 }
 
 func TestServiceRenameDirectoryOverEmptyDirectoryRemovesTarget(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, []uint64{2, 3}, WithMaxFiles(10))
 
@@ -932,6 +963,7 @@ func TestServiceRenameDirectoryOverEmptyDirectoryRemovesTarget(t *testing.T) {
 }
 
 func TestServiceRenameDirectoryOverNonEmptyDirectoryIsRejected(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestService(t, 2, 3, 4)
 
@@ -954,6 +986,7 @@ func TestServiceRenameDirectoryOverNonEmptyDirectoryIsRejected(t *testing.T) {
 }
 
 func TestServiceRmdirRejectsNonEmptyDirectory(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestService(t, 2, 3)
 
@@ -968,6 +1001,7 @@ func TestServiceRmdirRejectsNonEmptyDirectory(t *testing.T) {
 }
 
 func TestServiceUnlinkOpenFileKeepsInodeReadable(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestService(t, 2, 3)
 
@@ -989,6 +1023,7 @@ func TestServiceUnlinkOpenFileKeepsInodeReadable(t *testing.T) {
 }
 
 func TestServiceOpenRejectsOrphanedInode(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestService(t, 2, 3, 4)
 
@@ -1011,6 +1046,7 @@ func TestServiceOpenRejectsOrphanedInode(t *testing.T) {
 }
 
 func TestServiceUnlinkFencesObservedOpenRef(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestService(t, 2, 3)
 
@@ -1028,6 +1064,7 @@ func TestServiceUnlinkFencesObservedOpenRef(t *testing.T) {
 }
 
 func TestServiceReleaseLastOpenHandleGcsOrphan(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestService(t, 2, 3)
 
@@ -1050,6 +1087,7 @@ func TestServiceReleaseLastOpenHandleGcsOrphan(t *testing.T) {
 }
 
 func TestServiceReleaseLastOpenHandleGcsInSingleTxn(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestService(t, 2, 3)
 
@@ -1078,6 +1116,7 @@ func TestServiceReleaseLastOpenHandleGcsInSingleTxn(t *testing.T) {
 }
 
 func TestServiceReapsExpiredOpenHandleAndGcsOrphan(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	now := time.Unix(1_700_000_000, 0)
 	svc := newTestServiceWithOptions(t, []uint64{2, 3},
@@ -1105,6 +1144,7 @@ func TestServiceReapsExpiredOpenHandleAndGcsOrphan(t *testing.T) {
 }
 
 func TestServiceReapExpiredOpenHandleGcsInSingleTxn(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	now := time.Unix(1_700_000_000, 0)
 	svc := newTestServiceWithOptions(t, []uint64{2, 3},
@@ -1137,6 +1177,7 @@ func TestServiceReapExpiredOpenHandleGcsInSingleTxn(t *testing.T) {
 }
 
 func TestServiceRefreshOpenHandleLeasePreventsExpiry(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	now := time.Unix(1_700_000_000, 0)
 	svc := newTestServiceWithOptions(t, []uint64{2, 3},
@@ -1174,6 +1215,7 @@ func TestServiceRefreshOpenHandleLeasePreventsExpiry(t *testing.T) {
 }
 
 func TestServiceReapExpiredOpenHandleRevalidatesCurrentLease(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	now := time.Unix(1_700_000_000, 0)
 	svc := newTestServiceWithOptions(t, []uint64{2, 3},
@@ -1210,6 +1252,7 @@ func TestServiceReapExpiredOpenHandleRevalidatesCurrentLease(t *testing.T) {
 }
 
 func TestServiceReapExpiredOpenHandlePagesPastLiveRefs(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	now := time.Unix(1_700_000_000, 0)
 	svc := newTestServiceWithOptions(t, []uint64{2, 3, 4, 5},
@@ -1244,6 +1287,7 @@ func TestServiceReapExpiredOpenHandlePagesPastLiveRefs(t *testing.T) {
 }
 
 func TestServiceStatFSReportsConfiguredCapacityAndFileCounts(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, []uint64{2},
 		WithCapacity(16),
@@ -1266,6 +1310,7 @@ func TestServiceStatFSReportsConfiguredCapacityAndFileCounts(t *testing.T) {
 }
 
 func TestServiceStatFSReportsUnconfiguredCapacityAsUnlimited(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestService(t)
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -1278,6 +1323,7 @@ func TestServiceStatFSReportsUnconfiguredCapacityAsUnlimited(t *testing.T) {
 }
 
 func TestServiceStatFSUsesUsageCounter(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, []uint64{2}, WithCapacity(100), WithMaxFiles(100))
 
@@ -1293,6 +1339,7 @@ func TestServiceStatFSUsesUsageCounter(t *testing.T) {
 }
 
 func TestServiceUsageUpdatesUseRoutedCounter(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, []uint64{2, 3}, WithCapacity(100))
 
@@ -1318,6 +1365,7 @@ func TestServiceUsageUpdatesUseRoutedCounter(t *testing.T) {
 }
 
 func TestServiceStatFSCombinesLegacyUsageWithRoutedDeltas(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, []uint64{2}, WithCapacity(100), WithMaxFiles(100))
 
@@ -1335,6 +1383,7 @@ func TestServiceStatFSCombinesLegacyUsageWithRoutedDeltas(t *testing.T) {
 }
 
 func TestServiceTruncateSparseTailPreservesUsage(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, []uint64{2}, WithCapacity(16))
 
@@ -1352,6 +1401,7 @@ func TestServiceTruncateSparseTailPreservesUsage(t *testing.T) {
 }
 
 func TestServiceTruncatePagesLargeChunkDeletes(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	const (
 		chunkCount             = chunkDeleteTxnPageSize + 1
@@ -1379,6 +1429,7 @@ func TestServiceTruncatePagesLargeChunkDeletes(t *testing.T) {
 }
 
 func TestServiceSizeShrinkFinishesCleanupAfterCallerCancellation(t *testing.T) {
+	t.Parallel()
 	operations := map[string]func(context.Context, *Service, uint64) error{
 		"truncate": func(ctx context.Context, svc *Service, inode uint64) error {
 			return svc.Truncate(ctx, inode, 0)
@@ -1421,6 +1472,7 @@ func TestServiceSizeShrinkFinishesCleanupAfterCallerCancellation(t *testing.T) {
 }
 
 func TestServiceUnlinkLargeFileSucceedsAfterPagedDeleteFailure(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	const (
 		chunkCount             = chunkDeleteTxnPageSize + 1
@@ -1472,6 +1524,7 @@ func TestServiceUnlinkLargeFileSucceedsAfterPagedDeleteFailure(t *testing.T) {
 }
 
 func TestServiceRenameLargeReplacementSucceedsAfterPagedDeleteFailure(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	const (
 		chunkCount             = chunkDeleteTxnPageSize + 1
@@ -1518,6 +1571,7 @@ func TestServiceRenameLargeReplacementSucceedsAfterPagedDeleteFailure(t *testing
 }
 
 func TestServiceDeleteChunkPagesStopsAfterWriteConflictRetryLimit(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, []uint64{2}, WithCapacity(16))
 
@@ -1546,6 +1600,7 @@ func TestServiceDeleteChunkPagesStopsAfterWriteConflictRetryLimit(t *testing.T) 
 }
 
 func TestServiceDeleteChunkPagesContinuesUnprotectedAfterRetryLimit(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, []uint64{2}, WithCapacity(16))
 
@@ -1576,6 +1631,7 @@ func TestServiceDeleteChunkPagesContinuesUnprotectedAfterRetryLimit(t *testing.T
 }
 
 func TestServiceTruncateReclaimsStaleChunksAtCurrentEOF(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, []uint64{2}, WithCapacity(32))
 
@@ -1601,6 +1657,7 @@ func TestServiceTruncateReclaimsStaleChunksAtCurrentEOF(t *testing.T) {
 }
 
 func TestServiceTruncateRejectsHomeThatStartsMigratingDuringStaleCleanup(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, []uint64{2}, WithCapacity(32))
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -1626,6 +1683,7 @@ func TestServiceTruncateRejectsHomeThatStartsMigratingDuringStaleCleanup(t *test
 }
 
 func TestServiceTruncateShrinkReclaimsStaleChunksPastCurrentEOF(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, []uint64{2}, WithCapacity(32))
 
@@ -1654,6 +1712,7 @@ func TestServiceTruncateShrinkReclaimsStaleChunksPastCurrentEOF(t *testing.T) {
 }
 
 func TestServiceTruncateGrowReclaimsStaleChunksBeforeExpose(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, []uint64{2}, WithCapacity(32))
 
@@ -1674,6 +1733,7 @@ func TestServiceTruncateGrowReclaimsStaleChunksBeforeExpose(t *testing.T) {
 }
 
 func TestServiceWriteGrowReclaimsStaleChunksBeforeExpose(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, []uint64{2}, WithCapacity(32))
 
@@ -1695,6 +1755,7 @@ func TestServiceWriteGrowReclaimsStaleChunksBeforeExpose(t *testing.T) {
 }
 
 func TestServiceCrossParentRenameReturnsEXDEV(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestService(t, 2, 3, 4)
 

@@ -37,6 +37,7 @@ func (s *partitionHistoryStore) ClearMigrationStateWithOwnership(context.Context
 }
 
 func TestMigrationPartitionHistoryPresent(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name       string
 		partitions store.MigrationOwnershipPartitionState

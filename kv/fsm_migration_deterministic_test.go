@@ -52,6 +52,7 @@ func deterministicRawRequest(version uint64, keys ...string) *pb.Request {
 }
 
 func TestDeterministicMigrationApplyRequiresCompleteProof(t *testing.T) {
+	t.Parallel()
 	for _, kind := range []string{"target-guard", "source-tracker", "future-owner", "mixed-owner", "exact-owner"} {
 		t.Run(kind, func(t *testing.T) {
 			st := store.NewMVCCStore()
@@ -87,6 +88,7 @@ func TestDeterministicMigrationApplyRequiresCompleteProof(t *testing.T) {
 }
 
 func TestDeterministicMigrationUnaffectedLegacyRequest(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	deterministicMigrationOwner(t, st)
 	e := distribution.NewEngine()
@@ -96,6 +98,7 @@ func TestDeterministicMigrationUnaffectedLegacyRequest(t *testing.T) {
 }
 
 func TestCheckMigrationRequestIsReadOnlyAndAdvisory(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	deterministicMigrationOwner(t, st)
 	r := deterministicRawRequest(10, "n")
@@ -114,6 +117,7 @@ func TestCheckMigrationRequestIsReadOnlyAndAdvisory(t *testing.T) {
 }
 
 func TestDeterministicMigrationResolutionDrainsAndRetries(t *testing.T) {
+	t.Parallel()
 	for _, phase := range []pb.Phase{pb.Phase_COMMIT, pb.Phase_ABORT} {
 		t.Run(phase.String(), func(t *testing.T) {
 			f := &kvFSM{store: store.NewMVCCStore(), shardGroupID: 1}
@@ -138,6 +142,7 @@ func TestDeterministicMigrationResolutionDrainsAndRetries(t *testing.T) {
 }
 
 func TestDeterministicMigrationRemotePrimaryAndStagedReadAlias(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	deterministicMigrationOwner(t, st)
 	f := &kvFSM{store: st, routes: forbiddenApplyWatcher{}, shardGroupID: 1}
@@ -155,6 +160,7 @@ func TestDeterministicMigrationRemotePrimaryAndStagedReadAlias(t *testing.T) {
 }
 
 func TestDeterministicMigrationResolutionRejectsUnpreparedAndMismatchedKeys(t *testing.T) {
+	t.Parallel()
 	for _, mismatch := range []string{"start", "primary", "chosen", "missing-primary", "extra-key"} {
 		t.Run(mismatch, func(t *testing.T) {
 			f := &kvFSM{store: store.NewMVCCStore(), shardGroupID: 1}
@@ -199,6 +205,7 @@ func TestDeterministicMigrationResolutionRejectsUnpreparedAndMismatchedKeys(t *t
 }
 
 func TestDeterministicMigrationCoalescedContextIsPerRequest(t *testing.T) {
+	t.Parallel()
 	st, err := store.NewPebbleStore(t.TempDir())
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, st.Close()) })

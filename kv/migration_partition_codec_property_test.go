@@ -49,6 +49,7 @@ func codecPropertyControl(t *rapid.T, seeds []MigrationPartitionControl) Migrati
 }
 
 func TestMigrationCodecPropertyControlRoundTrip(t *testing.T) {
+	t.Parallel()
 	seeds := codecPropertyControlSeeds(t)
 	rapid.Check(t, func(t *rapid.T) {
 		control := codecPropertyControl(t, seeds)
@@ -75,6 +76,7 @@ func TestMigrationCodecPropertyControlRoundTrip(t *testing.T) {
 }
 
 func TestMigrationCodecPropertyControlRejectsMalformed(t *testing.T) {
+	t.Parallel()
 	seeds := codecPropertyControlSeeds(t)
 	rapid.Check(t, func(t *rapid.T) {
 		control := codecPropertyControl(t, seeds)

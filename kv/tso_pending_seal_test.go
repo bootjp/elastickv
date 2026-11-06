@@ -11,6 +11,7 @@ import (
 )
 
 func TestTSOPendingSealPrecedesFreshFloorAndFinishPrecedesAllocation(t *testing.T) {
+	t.Parallel()
 	gate := &testPhaseDGate{}
 	a, fsm, engine, provider := pendingTestAllocator(t, gate)
 	var steps []string
@@ -43,6 +44,7 @@ func TestTSOPendingSealPrecedesFreshFloorAndFinishPrecedesAllocation(t *testing.
 }
 
 func TestTSOPendingSealFailureResumesAfterAllocatorRestart(t *testing.T) {
+	t.Parallel()
 	gate := &testPhaseDGate{sealErr: ErrTSOPhaseDActivationPending}
 	a, fsm, engine, provider := pendingTestAllocator(t, gate)
 	_, err := a.ReserveBatchAfter(context.Background(), 1, 0, true, true)
@@ -62,6 +64,7 @@ func TestTSOPendingSealFailureResumesAfterAllocatorRestart(t *testing.T) {
 }
 
 func TestTSOPendingFinishFailureBlocksNewWindowsUntilRetry(t *testing.T) {
+	t.Parallel()
 	gate := &testPhaseDGate{finishErr: ErrTSOPhaseDActivationPending}
 	a, fsm, engine, _ := pendingTestAllocator(t, gate)
 	_, err := a.ReserveBatchAfter(context.Background(), 2, 0, true, true)
@@ -94,6 +97,7 @@ func TestTSOPendingFinishFailureBlocksNewWindowsUntilRetry(t *testing.T) {
 }
 
 func TestTSOPendingLeaderChangeDuringFinishDoesNotReturnWindow(t *testing.T) {
+	t.Parallel()
 	gate := &testPhaseDGate{}
 	a, fsm, engine, _ := pendingTestAllocator(t, gate)
 	gate.finish = func(uint64) { engine.setTerm(2) }
@@ -108,6 +112,7 @@ func TestTSOPendingLeaderChangeDuringFinishDoesNotReturnWindow(t *testing.T) {
 }
 
 func TestTSOPendingHistoricalActiveSnapshotBootstrapsProtocol(t *testing.T) {
+	t.Parallel()
 	gate := &testPhaseDGate{checkErr: ErrTSOPhaseDActivationPending}
 	a, fsm, engine, _ := pendingTestAllocator(t, gate)
 	require.Nil(t, fsm.Apply(marshalTSOCutover()))
@@ -140,6 +145,7 @@ func TestTSOPendingHistoricalActiveSnapshotBootstrapsProtocol(t *testing.T) {
 }
 
 func TestTSOPendingActiveWithoutGateFailsClosed(t *testing.T) {
+	t.Parallel()
 	a, fsm, engine, _ := pendingTestAllocator(t, nil)
 	require.Nil(t, fsm.Apply(marshalTSOCutover()))
 	require.Nil(t, fsm.Apply(marshalTSOPhaseD(100)))
@@ -149,6 +155,7 @@ func TestTSOPendingActiveWithoutGateFailsClosed(t *testing.T) {
 }
 
 func TestTSOPendingActiveSnapshotRetriesDataGatesAfterRestart(t *testing.T) {
+	t.Parallel()
 	gate := &testPhaseDGate{finishErr: ErrTSOPhaseDActivationPending}
 	a, fsm, _, provider := pendingTestAllocator(t, gate)
 	_, err := a.ReserveBatchAfter(context.Background(), 2, 0, true, true)
@@ -183,6 +190,7 @@ func TestTSOPendingActiveSnapshotRetriesDataGatesAfterRestart(t *testing.T) {
 }
 
 func TestTSOPendingLeaderChangeAfterSealResamplesBeforeFreezing(t *testing.T) {
+	t.Parallel()
 	gate := &testPhaseDGate{}
 	a, fsm, engine, provider := pendingTestAllocator(t, gate)
 	provider.afterRead = func() { engine.setTerm(2) }
@@ -198,6 +206,7 @@ func TestTSOPendingLeaderChangeAfterSealResamplesBeforeFreezing(t *testing.T) {
 }
 
 func TestTSOPendingCachedWindowsStopButRoutedActivationCanResume(t *testing.T) {
+	t.Parallel()
 	gate := &testPhaseDGate{prepareErr: ErrTSOPhaseDActivationPending}
 	a, fsm, engine, _ := pendingTestAllocator(t, gate)
 	routed, err := NewLeaderRoutedTSOAllocator(a, engine)

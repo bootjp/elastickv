@@ -9,6 +9,7 @@ import (
 )
 
 func TestSetAttrWithOperationRetainsOriginalStat(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, []uint64{2})
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -34,6 +35,7 @@ func TestSetAttrWithOperationRetainsOriginalStat(t *testing.T) {
 }
 
 func TestSetAttrWithOperationRetainsMissingInode(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, nil)
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -45,6 +47,7 @@ func TestSetAttrWithOperationRetainsMissingInode(t *testing.T) {
 }
 
 func TestSetAttrWithOperationDoesNotRepeatShrinkAfterExtension(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, []uint64{2})
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -73,6 +76,7 @@ func TestSetAttrWithOperationDoesNotRepeatShrinkAfterExtension(t *testing.T) {
 }
 
 func TestSetAttrWithOperationRetainsDirectorySizeRejection(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, nil)
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -84,6 +88,7 @@ func TestSetAttrWithOperationRetainsDirectorySizeRejection(t *testing.T) {
 }
 
 func TestSetAttrWithOperationFinishesPagedChunkDeletion(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, []uint64{2})
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))

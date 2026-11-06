@@ -22,6 +22,7 @@ func (p phaseDControlProposer) ProposeAdmin(ctx context.Context, payload []byte)
 type phaseDControlChildKey struct{}
 
 func TestPhaseDControlAdmissionPreservesDirectCallerLineage(t *testing.T) {
+	t.Parallel()
 	parent, cancel := context.WithTimeout(context.WithValue(t.Context(), operationHandleKey{}, "original-allocator-owner"), time.Second)
 	defer cancel()
 	var finished, proposals int
@@ -49,6 +50,7 @@ func TestPhaseDControlAdmissionPreservesDirectCallerLineage(t *testing.T) {
 }
 
 func TestPhaseDControlAdmissionRejectsBeforeProposer(t *testing.T) {
+	t.Parallel()
 	denied := errors.New("control closed")
 	shards := &ShardStore{operationAdmission: func(context.Context, uint64, AdmissionPurpose) (context.Context, func(error) error, error) {
 		return nil, nil, denied
@@ -63,6 +65,7 @@ func TestPhaseDControlAdmissionRejectsBeforeProposer(t *testing.T) {
 }
 
 func TestPhaseDControlAdmissionRetainsApplyAndUnknownOutcomes(t *testing.T) {
+	t.Parallel()
 	revoked := errors.New("control owner revoked")
 	applyFailed := errors.New("FSM rejected control")
 	for _, tc := range []struct {

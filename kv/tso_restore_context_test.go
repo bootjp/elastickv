@@ -14,6 +14,7 @@ import (
 )
 
 func TestTSORestoreContextRequiresOptionalCapability(t *testing.T) {
+	t.Parallel()
 	fsm := NewTSOStateMachine(nil)
 	restorer, ok := any(fsm).(raftengine.ContextSnapshotRestorer)
 	require.True(t, ok, "group-zero external restore needs explicit origin-aware validation")
@@ -36,6 +37,7 @@ func (r cancelTSORestoreReader) Read(p []byte) (int, error) {
 }
 
 func TestTSORestoreContextCancellationAndUnknownOriginDoNotMutate(t *testing.T) {
+	t.Parallel()
 	for _, scenario := range []string{"canceled", "during_read", "unknown", "nil_reader"} {
 		t.Run(scenario, func(t *testing.T) {
 			fsm := NewTSOStateMachine(nil)
@@ -68,6 +70,7 @@ func TestTSORestoreContextCancellationAndUnknownOriginDoNotMutate(t *testing.T) 
 }
 
 func TestTSORestoreContextNativeLayoutsAndPending(t *testing.T) {
+	t.Parallel()
 	for _, snap := range []tsoFSMSnapshot{
 		{ceilingMs: 100},
 		{ceilingMs: 100, allocationFloor: 200},
@@ -92,6 +95,7 @@ func TestTSORestoreContextNativeLayoutsAndPending(t *testing.T) {
 }
 
 func TestTSORestoreContextStrictNativeErrorsPreserveState(t *testing.T) {
+	t.Parallel()
 	valid := snapshotBytesFor(t, &tsoFSMSnapshot{ceilingMs: 100, allocationFloor: 200, cutoverActive: true})
 	invalidFlag := bytes.Clone(valid)
 	invalidFlag[tsoSnapshotV2Len] = 2
@@ -126,6 +130,7 @@ func tsoLegacyStorePayload(t *testing.T, format string) []byte {
 }
 
 func TestTSORestoreContextLegacyExternalRequiresDecodedGate(t *testing.T) {
+	t.Parallel()
 	probe, err := store.NewPebbleStore(t.TempDir())
 	require.NoError(t, err)
 	_, supported := probe.(tsoExternalStoreRestorer)
@@ -175,6 +180,7 @@ func (s *recordingTSOLegacyGate) RestoreExternal(ctx context.Context, r io.Reade
 }
 
 func TestTSORestoreContextLegacyGateDelegation(t *testing.T) {
+	t.Parallel()
 	body := tsoLegacyStorePayload(t, "memory")
 	rejected := errors.New("migration-bearing external restore unsupported")
 	for _, failure := range []error{nil, rejected} {

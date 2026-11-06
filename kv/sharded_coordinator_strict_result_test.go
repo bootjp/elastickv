@@ -85,6 +85,7 @@ func (t lostPrimaryCommitReplyTxn) Commit(ctx context.Context, reqs []*pb.Reques
 }
 
 func TestLostPrimaryReplyResolvesPreparedSecondaryFromDurableDecision(t *testing.T) {
+	t.Parallel()
 	lr, ss, groups, cleanup := setupLockResolverEnv(t)
 	defer cleanup()
 	groups[1].Txn = lostPrimaryCommitReplyTxn{Transactional: groups[1].Txn}
@@ -111,6 +112,7 @@ func TestLostPrimaryReplyResolvesPreparedSecondaryFromDurableDecision(t *testing
 }
 
 func TestRepeatedTwoGroupCommitReleasesSecondaryLocks(t *testing.T) {
+	t.Parallel()
 	_, ss, groups, cleanup := setupLockResolverEnv(t)
 	defer cleanup()
 	coord := NewShardedCoordinator(ss.engine, groups, 1, NewHLC(), ss)

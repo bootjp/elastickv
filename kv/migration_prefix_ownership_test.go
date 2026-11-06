@@ -79,6 +79,7 @@ func assertPrefixOwnershipValues(t *testing.T, st store.MVCCStore, prefix []byte
 }
 
 func TestMigrationPrefixOwnershipPublicDeletesAcrossRoutes(t *testing.T) {
+	t.Parallel()
 	for _, defect := range []string{"", "legacy-neighbor"} {
 		assertPrefixOwnershipPublicDeletes(t, defect)
 	}
@@ -112,6 +113,7 @@ func deletePrefixOwnershipFixture(t *testing.T, s *ShardStore, prefix []byte, mo
 }
 
 func TestMigrationPrefixOwnershipFSMAndCoordinatorAcrossRoutes(t *testing.T) {
+	t.Parallel()
 	for _, prefix := range []string{"p", ""} {
 		t.Run("FSM/"+prefix, func(t *testing.T) {
 			_, f := prefixOwnershipFixture(t, "")
@@ -140,6 +142,7 @@ func TestMigrationPrefixOwnershipFSMAndCoordinatorAcrossRoutes(t *testing.T) {
 }
 
 func TestMigrationPrefixOwnershipFSMDoesNotInventLegacyNeighborAuthority(t *testing.T) {
+	t.Parallel()
 	_, f := prefixOwnershipFixture(t, "legacy-neighbor")
 	f.SetApplyIndex(20)
 	require.ErrorIs(t, applyFSMRequest(t, f, prefixOwnershipRequest(nil, 200)), ErrRouteCutoverPending)
@@ -147,6 +150,7 @@ func TestMigrationPrefixOwnershipFSMDoesNotInventLegacyNeighborAuthority(t *test
 }
 
 func TestMigrationPrefixOwnershipRejectsIncompleteAuthorityBeforeEffects(t *testing.T) {
+	t.Parallel()
 	for _, defect := range []string{"proof-hole", "catalog-hole", "nonowner", "future-owner", "wrong-floor", "low-ts"} {
 		t.Run(defect, func(t *testing.T) {
 			for _, prefix := range []string{"p", ""} {

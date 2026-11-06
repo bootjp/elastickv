@@ -117,6 +117,7 @@ func assertJointRecoveryDataGate(t *testing.T, fsm *kvFSM, floor uint64, release
 // The pending snapshot predates the active log record. Recovery must replay
 // that record before resuming a release which already reached one data group.
 func TestTSOPendingJointRecoveryPreservesBarrierUntilAllDataGroupsRelease(t *testing.T) {
+	t.Parallel()
 	image := captureJointRecoveryImage(t)
 	for _, scenario := range []struct {
 		name     string

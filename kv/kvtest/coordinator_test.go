@@ -16,6 +16,7 @@ import (
 )
 
 func TestBaseCoordinatorsHaveNoOptionalCapabilities(t *testing.T) {
+	t.Parallel()
 	for _, value := range []kv.Coordinator{&kvtest.NopCoordinator{}, kvtest.NewLocalCoordinator(store.NewMVCCStore(), kvtest.LocalOptions{})} {
 		require.Equal(t, reflect.TypeFor[kv.Coordinator]().NumMethod(), reflect.TypeOf(value).NumMethod())
 		_, lease := value.(kv.LeaseReadableCoordinator)
@@ -30,6 +31,7 @@ func TestBaseCoordinatorsHaveNoOptionalCapabilities(t *testing.T) {
 }
 
 func TestNopCoordinator(t *testing.T) {
+	t.Parallel()
 	c := &kvtest.NopCoordinator{}
 	ctx := context.Background()
 	require.True(t, c.IsLeader())
@@ -57,6 +59,7 @@ func put(key string) *kv.Elem[kv.OP] {
 }
 
 func TestLocalCoordinatorTimestampPolicies(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name string
 		opts kvtest.LocalOptions
@@ -96,6 +99,7 @@ func TestLocalCoordinatorTimestampPolicies(t *testing.T) {
 }
 
 func TestLocalCoordinatorOCCPolicies(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name     string
 		mode     kvtest.OCCMode
@@ -126,6 +130,7 @@ func TestLocalCoordinatorOCCPolicies(t *testing.T) {
 }
 
 func TestLocalCoordinatorPrefixPolicies(t *testing.T) {
+	t.Parallel()
 	for _, mode := range []kvtest.PrefixMode{kvtest.PrefixReject, kvtest.PrefixIgnore, kvtest.PrefixApply} {
 		st := store.NewMVCCStore()
 		require.NoError(t, st.PutAt(context.Background(), []byte("prefix:key"), []byte("value"), 1, 0))
@@ -155,6 +160,7 @@ func TestLocalCoordinatorPrefixPolicies(t *testing.T) {
 }
 
 func TestLocalCoordinatorPatchAndRejectBeforeWriting(t *testing.T) {
+	t.Parallel()
 	for _, patch := range []bool{false, true} {
 		st := storetest.NewPebble(t)
 		c := kvtest.NewLocalCoordinator(st, kvtest.LocalOptions{PatchCommitTS: patch})
@@ -179,6 +185,7 @@ func TestLocalCoordinatorPatchAndRejectBeforeWriting(t *testing.T) {
 }
 
 func TestLocalCoordinatorConcurrentDispatch(t *testing.T) {
+	t.Parallel()
 	c := kvtest.NewLocalCoordinator(store.NewMVCCStore(), kvtest.LocalOptions{CommitTimestamp: kvtest.TimestampStoreIncrement})
 	var wg sync.WaitGroup
 	for range 20 {
@@ -195,6 +202,7 @@ func TestLocalCoordinatorConcurrentDispatch(t *testing.T) {
 }
 
 func TestLocalCoordinatorRejectsInvalidGroupsBeforeWriting(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	c := kvtest.NewLocalCoordinator(st, kvtest.LocalOptions{PatchCommitTS: true})
 	result, err := c.Dispatch(context.Background(), nil)
@@ -224,6 +232,7 @@ func TestLocalCoordinatorRejectsInvalidGroupsBeforeWriting(t *testing.T) {
 }
 
 func TestLocalCoordinatorOCCWriteConflictIsAtomic(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	ctx := context.Background()
 	require.NoError(t, st.PutAt(ctx, []byte("newer"), nil, 5, 0))
@@ -235,6 +244,7 @@ func TestLocalCoordinatorOCCWriteConflictIsAtomic(t *testing.T) {
 }
 
 func TestLocalCoordinatorDelete(t *testing.T) {
+	t.Parallel()
 	for _, mode := range []kvtest.OCCMode{kvtest.OCCDisabled, kvtest.OCCAllGroups} {
 		st := store.NewMVCCStore()
 		ctx := context.Background()
@@ -248,6 +258,7 @@ func TestLocalCoordinatorDelete(t *testing.T) {
 }
 
 func TestLocalCoordinatorIgnoresNonTxnStartTS(t *testing.T) {
+	t.Parallel()
 	c := kvtest.NewLocalCoordinator(store.NewMVCCStore(), kvtest.LocalOptions{})
 	const unrelatedStartTS = uint64(1) << 63
 	response, err := c.Dispatch(context.Background(), &kv.OperationGroup[kv.OP]{StartTS: unrelatedStartTS, Elems: []*kv.Elem[kv.OP]{put("key")}})
@@ -256,6 +267,7 @@ func TestLocalCoordinatorIgnoresNonTxnStartTS(t *testing.T) {
 }
 
 func TestLocalCoordinatorRejectsExhaustingTimestampsWithoutChangingClock(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name    string
 		opts    kvtest.LocalOptions
@@ -285,6 +297,7 @@ func TestLocalCoordinatorRejectsExhaustingTimestampsWithoutChangingClock(t *test
 }
 
 func TestLocalCoordinatorRejectsAutomaticTimestampAtClockBoundary(t *testing.T) {
+	t.Parallel()
 	for _, floor := range []uint64{math.MaxUint64 - 1, math.MaxUint64} {
 		st := store.NewMVCCStore()
 		c := kvtest.NewLocalCoordinator(st, kvtest.LocalOptions{})
@@ -297,6 +310,7 @@ func TestLocalCoordinatorRejectsAutomaticTimestampAtClockBoundary(t *testing.T) 
 }
 
 func TestLocalCoordinatorAllowsLastNonexhaustingTimestamp(t *testing.T) {
+	t.Parallel()
 	for _, req := range []*kv.OperationGroup[kv.OP]{
 		{CommitTS: math.MaxUint64 - 1},
 		{IsTxn: true, StartTS: math.MaxUint64 - 2},
@@ -315,6 +329,7 @@ func TestLocalCoordinatorAllowsLastNonexhaustingTimestamp(t *testing.T) {
 }
 
 func TestLocalCoordinatorSharesInjectedClock(t *testing.T) {
+	t.Parallel()
 	clock := kv.NewHLC()
 	c := kvtest.NewLocalCoordinator(store.NewMVCCStore(), kvtest.LocalOptions{Clock: clock})
 	require.Same(t, clock, c.Clock())

@@ -40,6 +40,7 @@ func (s *frontierAdmissionCountingStore) VersionExistsAtOrBefore(ctx context.Con
 }
 
 func TestMigrationFrontierAdmissionOrdinaryReadsOnlyInspectSelectedStore(t *testing.T) {
+	t.Parallel()
 	for _, backend := range []string{"memory", "pebble"} {
 		t.Run(backend, func(t *testing.T) { frontierAdmissionOrdinaryReadSuite(t, backend) })
 	}
