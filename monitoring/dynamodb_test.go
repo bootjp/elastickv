@@ -12,6 +12,7 @@ import (
 )
 
 func TestDynamoDBMetricsObserveRequest(t *testing.T) {
+	t.Parallel()
 	registry := NewRegistry("n1", "10.0.0.1:50051")
 	metrics, ok := registry.DynamoDBObserver().(*DynamoDBMetrics)
 	require.True(t, ok)
@@ -51,6 +52,7 @@ elastickv_dynamodb_written_items_total{node_address="10.0.0.1:50051",node_id="n1
 }
 
 func TestDynamoDBMetricsClassifyConditionalFailure(t *testing.T) {
+	t.Parallel()
 	registry := NewRegistry("n1", "10.0.0.1:50051")
 	metrics, ok := registry.DynamoDBObserver().(*DynamoDBMetrics)
 	require.True(t, ok)
@@ -76,6 +78,7 @@ elastickv_dynamodb_conditional_check_failed_total{node_address="10.0.0.1:50051",
 }
 
 func TestDynamoDBMetricsNormalizesUnknownOperation(t *testing.T) {
+	t.Parallel()
 	registry := NewRegistry("n1", "10.0.0.1:50051")
 	metrics, ok := registry.DynamoDBObserver().(*DynamoDBMetrics)
 	require.True(t, ok)
@@ -101,6 +104,7 @@ elastickv_dynamodb_requests_total{node_address="10.0.0.1:50051",node_id="n1",ope
 }
 
 func TestDynamoDBMetricsCollapsesOverflowTables(t *testing.T) {
+	t.Parallel()
 	registry := NewRegistry("n1", "10.0.0.1:50051")
 	metrics, ok := registry.DynamoDBObserver().(*DynamoDBMetrics)
 	require.True(t, ok)

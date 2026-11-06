@@ -11,6 +11,7 @@ import (
 )
 
 func TestRaftObserverSetMembersReplacesRemovedMembers(t *testing.T) {
+	t.Parallel()
 	registry := NewRegistry("n1", "10.0.0.1:50051")
 	observer := registry.RaftObserver()
 	require.NotNil(t, observer)
@@ -42,12 +43,14 @@ elastickv_raft_member_present{group="1",member_address="10.0.0.1:50051",member_i
 }
 
 func TestLastContactSeconds(t *testing.T) {
+	t.Parallel()
 	require.Equal(t, float64(lastContactUnknownValue), lastContactSeconds(-1))
 	require.Equal(t, 0.0, lastContactSeconds(0))
 	require.Equal(t, 0.25, lastContactSeconds(250*time.Millisecond))
 }
 
 func TestRaftMetricsNewFields(t *testing.T) {
+	t.Parallel()
 	registry := NewRegistry("n1", "10.0.0.1:50051")
 	m := registry.raft
 
@@ -87,6 +90,7 @@ elastickv_raft_num_peers{group="1",node_address="10.0.0.1:50051",node_id="n1"} 2
 }
 
 func TestRaftMetricsExportLeaderChangesAndProposalFailures(t *testing.T) {
+	t.Parallel()
 	registry := NewRegistry("n1", "10.0.0.1:50051")
 	observer := registry.RaftObserver()
 	require.NotNil(t, observer)
@@ -111,6 +115,7 @@ elastickv_raft_proposals_failed_total{group="1",node_address="10.0.0.1:50051",no
 }
 
 func TestRaftObserverSetLeaderMetricCountsLeaderReturnAfterGap(t *testing.T) {
+	t.Parallel()
 	registry := NewRegistry("n1", "10.0.0.1:50051")
 	observer := registry.RaftObserver()
 	require.NotNil(t, observer)
