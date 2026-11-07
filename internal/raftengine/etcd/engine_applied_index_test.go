@@ -110,6 +110,7 @@ func appliedIndexTestSnapshot(index uint64, data []byte) raftpb.Snapshot {
 }
 
 func TestPersistReadyWithSnapshotHoldsSnapshotMuThroughSaveSnap(t *testing.T) {
+	t.Parallel()
 	saveStarted := make(chan struct{})
 	releaseSave := make(chan struct{})
 	e := &Engine{
@@ -164,6 +165,7 @@ func TestPersistReadyWithSnapshotHoldsSnapshotMuThroughSaveSnap(t *testing.T) {
 }
 
 func TestReleaseProtectedReceivedFSMSnapshotsUpToRetriesAfterSnapshotMuUnlock(t *testing.T) {
+	t.Parallel()
 	e := &Engine{
 		protectedReceivedFSMSnaps: map[uint64]int{7: 1},
 	}
@@ -187,6 +189,7 @@ func TestReleaseProtectedReceivedFSMSnapshotsUpToRetriesAfterSnapshotMuUnlock(t 
 }
 
 func TestProtectReceivedFSMSnapshotRechecksAppliedIndexUnderLock(t *testing.T) {
+	t.Parallel()
 	e := &Engine{}
 	e.snapshotMu.Lock()
 	accepted := make(chan bool, 1)
@@ -204,6 +207,7 @@ func TestProtectReceivedFSMSnapshotRechecksAppliedIndexUnderLock(t *testing.T) {
 }
 
 func TestProtectReceivedFSMSnapshotWaitsOnSnapshotMuForAlreadyAppliedIndex(t *testing.T) {
+	t.Parallel()
 	e := &Engine{}
 	e.appliedIndex.Store(9)
 	e.snapshotMu.Lock()
@@ -230,6 +234,7 @@ func TestProtectReceivedFSMSnapshotWaitsOnSnapshotMuForAlreadyAppliedIndex(t *te
 }
 
 func TestProtectReceivedFSMSnapshotRejectsDuplicateInFlightIndex(t *testing.T) {
+	t.Parallel()
 	e := &Engine{}
 
 	require.True(t, e.protectReceivedFSMSnapshot(9))
@@ -242,6 +247,7 @@ func TestProtectReceivedFSMSnapshotRejectsDuplicateInFlightIndex(t *testing.T) {
 }
 
 func TestUnprotectReceivedFSMSnapshotTokenIfApplied(t *testing.T) {
+	t.Parallel()
 	e := &Engine{
 		protectedReceivedFSMSnaps: map[uint64]int{9: 1},
 	}
@@ -259,6 +265,7 @@ func TestUnprotectReceivedFSMSnapshotTokenIfApplied(t *testing.T) {
 }
 
 func TestUnprotectReceivedFSMSnapshotTokenIfAppliedKeepsFutureSnapshot(t *testing.T) {
+	t.Parallel()
 	e := &Engine{
 		protectedReceivedFSMSnaps: map[uint64]int{10: 1},
 	}
@@ -276,6 +283,7 @@ func TestUnprotectReceivedFSMSnapshotTokenIfAppliedKeepsFutureSnapshot(t *testin
 }
 
 func TestReleaseIgnoredReceivedFSMSnapshotStepsUnprotectsNonSnapshotReady(t *testing.T) {
+	t.Parallel()
 	e := &Engine{
 		protectedReceivedFSMSnaps: map[uint64]int{10: 1},
 		pendingReceivedFSMSnapshotStep: map[uint64]int{
@@ -290,6 +298,7 @@ func TestReleaseIgnoredReceivedFSMSnapshotStepsUnprotectsNonSnapshotReady(t *tes
 }
 
 func TestReleaseIgnoredReceivedFSMSnapshotStepsRemovesIgnoredFSMFile(t *testing.T) {
+	t.Parallel()
 	fsmSnapDir := t.TempDir()
 	writeFSMFileForTest(t, fsmSnapDir, 10, []byte("ignored snapshot"))
 	e := &Engine{
@@ -308,6 +317,7 @@ func TestReleaseIgnoredReceivedFSMSnapshotStepsRemovesIgnoredFSMFile(t *testing.
 }
 
 func TestReleaseIgnoredReceivedFSMSnapshotStepsKeepsSnapshotReadyProtected(t *testing.T) {
+	t.Parallel()
 	fsmSnapDir := t.TempDir()
 	writeFSMFileForTest(t, fsmSnapDir, 10, []byte("accepted snapshot"))
 	e := &Engine{
@@ -333,6 +343,7 @@ func TestReleaseIgnoredReceivedFSMSnapshotStepsKeepsSnapshotReadyProtected(t *te
 // directly; the engine MUST call SetDurableAppliedIndex
 // (snap.Metadata.Index) BEFORE SaveSnap.
 func TestPersistCreatedSnapshot_BumpsAppliedIndex(t *testing.T) {
+	t.Parallel()
 	rec := &applyIndexOrderRecorder{}
 	fsm := &recordingAppliedIndexFSM{rec: rec}
 	persist := &recordingPersistStorage{rec: rec}
@@ -352,6 +363,7 @@ func TestPersistCreatedSnapshot_BumpsAppliedIndex(t *testing.T) {
 // fake case: an FSM that does NOT implement AppliedIndexWriter
 // silently no-ops; snapshot persist still runs.
 func TestPersistCreatedSnapshot_NilFSMNoOp(t *testing.T) {
+	t.Parallel()
 	rec := &applyIndexOrderRecorder{}
 	persist := &recordingPersistStorage{rec: rec}
 	// testStateMachine (defined in engine_test.go) is the canonical
@@ -373,6 +385,7 @@ func TestPersistCreatedSnapshot_NilFSMNoOp(t *testing.T) {
 // preserves the (metaAppliedIndex < snapshot pointer impossible)
 // crash invariant from PR #910 design §6.
 func TestPersistCreatedSnapshot_BumpErrorAborts(t *testing.T) {
+	t.Parallel()
 	rec := &applyIndexOrderRecorder{}
 	fsm := &recordingAppliedIndexFSM{rec: rec, failNext: true, failErr: io.ErrShortBuffer}
 	persist := &recordingPersistStorage{rec: rec}
@@ -386,6 +399,7 @@ func TestPersistCreatedSnapshot_BumpErrorAborts(t *testing.T) {
 }
 
 func TestPersistReadyWithSnapshot_BumpsAppliedIndexAfterWALSnapshot(t *testing.T) {
+	t.Parallel()
 	rec := &applyIndexOrderRecorder{}
 	fsm := &recordingAppliedIndexFSM{rec: rec}
 	persist := &recordingPersistStorage{rec: rec}
@@ -415,6 +429,7 @@ func TestPersistReadyWithSnapshot_BumpsAppliedIndexAfterWALSnapshot(t *testing.T
 }
 
 func TestPersistReadyWithSnapshot_BumpErrorAfterWALSnapshotSurfaces(t *testing.T) {
+	t.Parallel()
 	rec := &applyIndexOrderRecorder{}
 	fsm := &recordingAppliedIndexFSM{rec: rec, failNext: true, failErr: io.ErrShortBuffer}
 	persist := &recordingPersistStorage{rec: rec}
@@ -484,6 +499,7 @@ func localSnapshotEngine(t *testing.T, rec *applyIndexOrderRecorder, fsm *record
 // persistLocalSnapshotPayload — which is what eventually invokes
 // persist.SaveSnap.
 func TestPersistLocalSnapshotPayload_BumpsAppliedIndex(t *testing.T) {
+	t.Parallel()
 	rec := &applyIndexOrderRecorder{}
 	fsm := &recordingAppliedIndexFSM{rec: rec}
 	const index uint64 = 123
@@ -506,6 +522,7 @@ func TestPersistLocalSnapshotPayload_BumpsAppliedIndex(t *testing.T) {
 // crash-ordering test for Site 2: a failed SetDurableAppliedIndex
 // MUST surface the error AND prevent persist.SaveSnap from running.
 func TestPersistLocalSnapshotPayload_BumpErrorAborts(t *testing.T) {
+	t.Parallel()
 	rec := &applyIndexOrderRecorder{}
 	fsm := &recordingAppliedIndexFSM{rec: rec, failNext: true, failErr: io.ErrShortBuffer}
 	const index uint64 = 456

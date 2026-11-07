@@ -19,6 +19,7 @@ import (
 )
 
 func TestProtectedDispatchCancelsTLSHandshake(t *testing.T) {
+	t.Parallel()
 	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	defer func() { _ = listener.Close() }()

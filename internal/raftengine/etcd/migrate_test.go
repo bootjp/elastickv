@@ -11,6 +11,7 @@ import (
 )
 
 func TestMigrateFSMStoreSeedsEtcdDataDir(t *testing.T) {
+	t.Parallel()
 	sourcePath := filepath.Join(t.TempDir(), "fsm.db")
 	source, err := store.NewPebbleStore(sourcePath)
 	require.NoError(t, err)
@@ -47,6 +48,7 @@ func TestMigrateFSMStoreSeedsEtcdDataDir(t *testing.T) {
 }
 
 func TestMigrateFSMStorePersistsSingleNodePeer(t *testing.T) {
+	t.Parallel()
 	sourcePath := filepath.Join(t.TempDir(), "fsm.db")
 	source, err := store.NewPebbleStore(sourcePath)
 	require.NoError(t, err)
@@ -65,6 +67,7 @@ func TestMigrateFSMStorePersistsSingleNodePeer(t *testing.T) {
 }
 
 func TestMigrateFSMStorePersistsMultiNodePeers(t *testing.T) {
+	t.Parallel()
 	sourcePath := filepath.Join(t.TempDir(), "fsm.db")
 	source, err := store.NewPebbleStore(sourcePath)
 	require.NoError(t, err)

@@ -106,6 +106,7 @@ func offlineCryptoFixture(t *testing.T, tamper bool) (OfflineBaselineOptions, ed
 }
 
 func TestOfflineBaselineCryptoAuthenticatesRetainedAndSourceReplay(t *testing.T) {
+	t.Parallel()
 	o, _ := offlineCryptoFixture(t, false)
 	before, err := baselineTreeDigest(t.Context(), o.DataDir, "")
 	require.NoError(t, err)
@@ -130,6 +131,7 @@ func TestOfflineBaselineCryptoAuthenticatesRetainedAndSourceReplay(t *testing.T)
 }
 
 func TestOfflineBaselineCryptoRejectsInvalidContextOrHistory(t *testing.T) {
+	t.Parallel()
 	for _, kind := range []string{"missing context", "wrong key", "missing historical key", "wrong cutover", "missing snapshot verifier", "partial snapshot", "snapshot authentication", "covered tamper"} {
 		t.Run(kind, func(t *testing.T) {
 			o, _ := offlineCryptoFixture(t, kind == "covered tamper")
@@ -156,6 +158,7 @@ func TestOfflineBaselineCryptoRejectsInvalidContextOrHistory(t *testing.T) {
 }
 
 func TestOfflineBaselineCryptoStorageOnlyRequiresExplicitMode(t *testing.T) {
+	t.Parallel()
 	crypto := &OfflineBaselineCrypto{ValidateSnapshot: func(_ context.Context, _ uint64, reader io.Reader) error {
 		_, err := io.Copy(io.Discard, reader)
 		return err
@@ -168,6 +171,7 @@ func TestOfflineBaselineCryptoStorageOnlyRequiresExplicitMode(t *testing.T) {
 }
 
 func TestOfflineBaselineCryptoPostCutoverHasNoPlaintextFallback(t *testing.T) {
+	t.Parallel()
 	crypto := &OfflineBaselineCrypto{RaftCipher: offlineCryptoCipher(t, true, false), RaftEnvelopeCutoverIndex: 2}
 	for _, payload := range [][]byte{nil, []byte("plaintext must not be accepted")} {
 		entry := &raftpb.Entry{Index: proto.Uint64(3), Type: raftpb.EntryNormal.Enum(), Data: encodeProposalEnvelope(1, payload)}
@@ -181,6 +185,7 @@ func TestOfflineBaselineCryptoPostCutoverHasNoPlaintextFallback(t *testing.T) {
 }
 
 func TestOfflineBaselineCryptoSourceRejectsInconsistentStoreProof(t *testing.T) {
+	t.Parallel()
 	o, _ := offlineCryptoFixture(t, false)
 	for _, kind := range []string{"unapplied", "pending", "namespace"} {
 		t.Run(kind, func(t *testing.T) {
@@ -202,6 +207,7 @@ func TestOfflineBaselineCryptoSourceRejectsInconsistentStoreProof(t *testing.T) 
 }
 
 func TestOfflineBaselineCryptoLogicalCutIsIndependentOfCiphertext(t *testing.T) {
+	t.Parallel()
 	first, _ := offlineCryptoFixture(t, false)
 	second, _ := offlineCryptoFixture(t, false)
 	second.Expected = first.Expected
@@ -216,6 +222,7 @@ func TestOfflineBaselineCryptoLogicalCutIsIndependentOfCiphertext(t *testing.T) 
 }
 
 func TestOfflineBaselineCryptoAuthenticatesSupersededRecords(t *testing.T) {
+	t.Parallel()
 	o, _ := offlineCryptoFixture(t, true)
 	require.NoError(t, o.Ownership.Close())
 	w, err := wal.Open(zap.NewNop(), filepath.Join(o.DataDir, walDirName), &walpb.Snapshot{Index: proto.Uint64(3), Term: proto.Uint64(4)})
@@ -241,6 +248,7 @@ func TestOfflineBaselineCryptoAuthenticatesSupersededRecords(t *testing.T) {
 }
 
 func TestOfflineBaselineCryptoObservationAndMigrationPreserveCiphertext(t *testing.T) {
+	t.Parallel()
 	o, signer := offlineCryptoFixture(t, false)
 	probe, err := ObserveOfflineBaseline(t.Context(), OfflineBaselineObservationOptions{
 		DataDir: o.DataDir, Ownership: o.Ownership, MemberID: o.MemberID, Crypto: o.Crypto, ProbeStore: o.ProbeStore,

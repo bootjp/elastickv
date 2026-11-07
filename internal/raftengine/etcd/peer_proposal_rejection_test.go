@@ -12,6 +12,7 @@ import (
 )
 
 func TestPeerProposalRejectedBeforeNativeDelivery(t *testing.T) {
+	t.Parallel()
 	transport := NewGRPCTransport(nil)
 	t.Cleanup(func() { require.NoError(t, transport.Close()) })
 	delivered := false

@@ -25,6 +25,7 @@ func (f *nativeConfigurationFSM) ClearApplyNativeConfiguration() {
 }
 
 func TestApplyNativeConfigurationUsesActualRawNodeRoster(t *testing.T) {
+	t.Parallel()
 	fsm := &nativeConfigurationFSM{}
 	e := newTestEngine(fsm, nil, nil)
 	raw, err := etcdraft.NewRawNode(&etcdraft.Config{ID: 1, Storage: etcdraft.NewMemoryStorage(), ElectionTick: 10, HeartbeatTick: 1, MaxInflightMsgs: 1})
@@ -47,6 +48,7 @@ func TestApplyNativeConfigurationUsesActualRawNodeRoster(t *testing.T) {
 }
 
 func TestApplyNativeConfigurationCannotReuseAnUnverifiedImage(t *testing.T) {
+	t.Parallel()
 	fsm := &nativeConfigurationFSM{configuration: raftengine.NativeConfiguration{Index: 99}}
 	e := newTestEngine(fsm, nil, nil)
 	clear := e.deliverApplyNativeConfiguration()

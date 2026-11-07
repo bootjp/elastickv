@@ -16,6 +16,7 @@ import (
 // learner's actual Match, so the value was a guess — too high fails
 // the precondition, too low promotes a replica that has not caught up.
 func TestStatusPerPeerReportsLearnerProgressOnTheLeader(t *testing.T) {
+	t.Parallel()
 	nodes, peers := newTransportTestNodes(t, 2)
 	startTransportTestServers(nodes, peers)
 	t.Cleanup(func() { cleanupTransportTestNodes(t, nodes) })
@@ -84,6 +85,7 @@ func TestStatusPerPeerReportsLearnerProgressOnTheLeader(t *testing.T) {
 // indistinguishable from a follower to any consumer testing
 // PerPeer == nil.
 func TestStatusPerPeerIsEmptyNotNilOnAPeerlessLeader(t *testing.T) {
+	t.Parallel()
 	nodes, peers := newTransportTestNodes(t, 1)
 	startTransportTestServers(nodes, peers)
 	t.Cleanup(func() { cleanupTransportTestNodes(t, nodes) })
@@ -111,6 +113,7 @@ func TestStatusPerPeerIsEmptyNotNilOnAPeerlessLeader(t *testing.T) {
 // peers" — an operator could read that as a healthy single-node
 // cluster.
 func TestStatusPerPeerIsNilOnAFollower(t *testing.T) {
+	t.Parallel()
 	nodes, peers := newTransportTestNodes(t, 2)
 	startTransportTestServers(nodes, peers)
 	t.Cleanup(func() { cleanupTransportTestNodes(t, nodes) })
@@ -138,6 +141,7 @@ func TestStatusPerPeerIsNilOnAFollower(t *testing.T) {
 // replicas. The leader's own tracker entry is about itself and would
 // invite an operator to read their own node as a promotion candidate.
 func TestStatusPerPeerExcludesTheLocalNode(t *testing.T) {
+	t.Parallel()
 	nodes, peers := newTransportTestNodes(t, 2)
 	startTransportTestServers(nodes, peers)
 	t.Cleanup(func() { cleanupTransportTestNodes(t, nodes) })

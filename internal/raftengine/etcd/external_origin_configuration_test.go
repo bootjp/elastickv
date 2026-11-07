@@ -166,6 +166,7 @@ func (f *externalConfigurationFailureFSM) RecordAppliedConfiguration(index uint6
 func (f *externalConfigurationFailureFSM) AppliedConfigurationIndex() uint64 { return 0 }
 
 func TestExternalOriginConfigurationFailureStopsOpen(t *testing.T) {
+	t.Parallel()
 	for _, bearing := range []bool{false, true} {
 		t.Run(map[bool]string{false: "configuration-write", true: "external-validation"}[bearing], func(t *testing.T) {
 			dir := prepareExternalConfigurationFixture(t, "native", bearing)

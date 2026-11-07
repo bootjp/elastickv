@@ -9,6 +9,7 @@ import (
 )
 
 func TestConformance(t *testing.T) {
+	t.Parallel()
 	factory := etcdraftengine.NewFactory(etcdraftengine.FactoryConfig{
 		TickInterval:   10 * time.Millisecond,
 		HeartbeatTick:  1,

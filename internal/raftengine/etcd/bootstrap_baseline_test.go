@@ -96,6 +96,7 @@ func signedOfflineBaseline(t *testing.T, o OfflineBaselineOptions, key ed25519.P
 }
 
 func TestOfflineBaselineInspectPreservesFilesAndActualConfiguration(t *testing.T) {
+	t.Parallel()
 	o, _ := offlineBaselineFixture(t, true)
 	before, err := baselineTreeDigest(t.Context(), o.DataDir, "")
 	require.NoError(t, err)
@@ -112,6 +113,7 @@ func TestOfflineBaselineInspectPreservesFilesAndActualConfiguration(t *testing.T
 }
 
 func TestOfflineBaselineRejectsUnverifiableConfigurationAndPendingState(t *testing.T) {
+	t.Parallel()
 	for _, kind := range []string{"missing proof", "wrong index", "prepared", "unapplied", "data mismatch", "peers ahead"} {
 		t.Run(kind, func(t *testing.T) {
 			o, _ := offlineBaselineFixture(t, false)
@@ -147,6 +149,7 @@ func TestOfflineBaselineRejectsUnverifiableConfigurationAndPendingState(t *testi
 }
 
 func TestOfflineBaselineMissingRowRequiresCompleteNativeHistory(t *testing.T) {
+	t.Parallel()
 	o, _ := offlineBaselineFixture(t, true)
 	probe := o.ProbeStore
 	o.ProbeStore = func(ctx context.Context) (BaselineStoreProof, error) {
@@ -160,6 +163,7 @@ func TestOfflineBaselineMissingRowRequiresCompleteNativeHistory(t *testing.T) {
 }
 
 func TestOfflineBaselineMigrationPreservesTermVoteAndAllRetainedEntries(t *testing.T) {
+	t.Parallel()
 	o, key := offlineBaselineFixture(t, true)
 	manifest := signedOfflineBaseline(t, o, key)
 	original, err := readBaselineWAL(filepath.Join(o.DataDir, walDirName))
@@ -199,6 +203,7 @@ func TestOfflineBaselineMigrationPreservesTermVoteAndAllRetainedEntries(t *testi
 }
 
 func TestOfflineBaselineResumeAfterExchangeBeforeJournal(t *testing.T) {
+	t.Parallel()
 	o, key := offlineBaselineFixture(t, true)
 	manifest := signedOfflineBaseline(t, o, key)
 	paths, err := PrepareOfflineBaseline(t.Context(), o, manifest)
@@ -214,6 +219,7 @@ func TestOfflineBaselineResumeAfterExchangeBeforeJournal(t *testing.T) {
 }
 
 func TestOfflineBaselineResumeInterruptedBackupAndRejectChangedSource(t *testing.T) {
+	t.Parallel()
 	o, key := offlineBaselineFixture(t, true)
 	manifest := signedOfflineBaseline(t, o, key)
 	paths := baselineMigrationPaths(o)
@@ -237,6 +243,7 @@ func TestOfflineBaselineResumeInterruptedBackupAndRejectChangedSource(t *testing
 }
 
 func TestOfflineBaselineRejectsZeroStateWithoutBootstrap(t *testing.T) {
+	t.Parallel()
 	o, _ := offlineBaselineFixture(t, true)
 	o.DataDir = t.TempDir()
 	_, err := InspectOfflineBaseline(t.Context(), o)
@@ -245,6 +252,7 @@ func TestOfflineBaselineRejectsZeroStateWithoutBootstrap(t *testing.T) {
 }
 
 func TestOfflineBaselinePreparationProofRejectsV1AndForeignCut(t *testing.T) {
+	t.Parallel()
 	legacy := identityFixture()
 	state := RecoveredState{identity: legacy}
 	digest := raftbootstrap.Digest{5}
@@ -267,6 +275,7 @@ func TestOfflineBaselinePreparationProofRejectsV1AndForeignCut(t *testing.T) {
 }
 
 func TestOfflineBaselineOwnershipRejectsRunningAndReplacedSources(t *testing.T) {
+	t.Parallel()
 	o, _ := offlineBaselineFixture(t, true)
 	before, err := baselineTreeDigest(t.Context(), o.DataDir, "")
 	require.NoError(t, err)
@@ -291,6 +300,7 @@ func TestOfflineBaselineOwnershipRejectsRunningAndReplacedSources(t *testing.T) 
 }
 
 func TestOfflineBaselinePreparedTransformationAndRestart(t *testing.T) {
+	t.Parallel()
 	o, key := offlineBaselineFixture(t, true)
 	baselineProbe := o.ProbeStore
 	metadataPath := "prepared-metadata"
@@ -380,6 +390,7 @@ func stageOfflineTestRequiredIntent(input BaselinePreparationContext) error {
 }
 
 func TestOfflineBaselineNoMarkerCannotExchangeV2(t *testing.T) {
+	t.Parallel()
 	o, key := offlineBaselineFixture(t, true)
 	o.Preparation = nil
 	manifest := signedOfflineBaseline(t, o, key)
@@ -393,6 +404,7 @@ func TestOfflineBaselineNoMarkerCannotExchangeV2(t *testing.T) {
 }
 
 func TestOfflineBaselineRemovedFormatBarrierRejectsSwapAndAck(t *testing.T) {
+	t.Parallel()
 	o, key := offlineBaselineFixture(t, true)
 	manifest := signedOfflineBaseline(t, o, key)
 	_, err := PrepareOfflineBaseline(t.Context(), o, manifest)
@@ -408,6 +420,7 @@ func TestOfflineBaselineRemovedFormatBarrierRejectsSwapAndAck(t *testing.T) {
 }
 
 func TestOfflineBaselineCorruptTailRefusesWithoutRepair(t *testing.T) {
+	t.Parallel()
 	o, _ := offlineBaselineFixture(t, true)
 	names, err := baselineWALNames(filepath.Join(o.DataDir, walDirName))
 	require.NoError(t, err)

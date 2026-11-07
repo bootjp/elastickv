@@ -16,6 +16,7 @@ import (
 )
 
 func TestPreparePhysicalSnapshotRestoreAndExportOpaquePayload(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	payload := append([]byte("EKVTHLC2opaque-header"), []byte("EKVSSTI1opaque-store-payload")...)
 	input := filepath.Join(root, "physical.fsm")
@@ -73,6 +74,7 @@ func TestPreparePhysicalSnapshotRestoreAndExportOpaquePayload(t *testing.T) {
 }
 
 func TestPreparePhysicalSnapshotRestoreNormalizesLearnerMembership(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	input := filepath.Join(root, "physical.fsm")
 	require.NoError(t, os.WriteFile(input, []byte("EKVTHLC1opaque"), 0o600))
@@ -111,6 +113,7 @@ func TestPreparePhysicalSnapshotRestoreNormalizesLearnerMembership(t *testing.T)
 }
 
 func TestPersistedSnapshotExportDetectsPayloadCorruptionDuringStream(t *testing.T) {
+	t.Parallel()
 	dataDir, result := preparePhysicalSnapshotExportFixture(t, []byte("EKVTHLC1payload-that-will-be-corrupted"))
 	file, err := os.OpenFile(result.FSMPath, os.O_RDWR, 0)
 	require.NoError(t, err)
@@ -131,6 +134,7 @@ func TestPersistedSnapshotExportDetectsPayloadCorruptionDuringStream(t *testing.
 }
 
 func TestPersistedSnapshotExportRejectsTokenFooterMismatchBeforeStream(t *testing.T) {
+	t.Parallel()
 	dataDir, result := preparePhysicalSnapshotExportFixture(t, []byte("EKVTHLC1payload-with-footer-mismatch"))
 	file, err := os.OpenFile(result.FSMPath, os.O_RDWR, 0)
 	require.NoError(t, err)
@@ -150,6 +154,7 @@ func TestPersistedSnapshotExportRejectsTokenFooterMismatchBeforeStream(t *testin
 }
 
 func TestOpenPersistedSnapshotExportValidation(t *testing.T) {
+	t.Parallel()
 	_, ok, err := OpenPersistedSnapshotExport("")
 	require.False(t, ok)
 	require.ErrorIs(t, err, ErrPersistedSnapshotExportInvalid)

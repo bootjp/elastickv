@@ -11,6 +11,7 @@ import (
 )
 
 func TestOfflineBaselineObserveUnsignedCompactedDataCut(t *testing.T) {
+	t.Parallel()
 	o, key := offlineBaselineFixture(t, false)
 	before, err := baselineTreeDigest(t.Context(), o.DataDir, "")
 	require.NoError(t, err)
@@ -33,6 +34,7 @@ func TestOfflineBaselineObserveUnsignedCompactedDataCut(t *testing.T) {
 }
 
 func TestOfflineBaselineCompactedEpochIsProvenByCommittedConfChangeTail(t *testing.T) {
+	t.Parallel()
 	change, err := proto.Marshal(&raftpb.ConfChange{Type: raftpb.ConfChangeAddLearnerNode.Enum(), NodeId: proto.Uint64(8)})
 	require.NoError(t, err)
 	image := newBaselineWALImage()
@@ -52,6 +54,7 @@ func TestOfflineBaselineCompactedEpochIsProvenByCommittedConfChangeTail(t *testi
 }
 
 func TestOfflineBaselineObserveRefusesUnprovenOrUnappliedCut(t *testing.T) {
+	t.Parallel()
 	for _, kind := range []string{"no configuration proof", "unapplied", "wrong pinned address"} {
 		t.Run(kind, func(t *testing.T) {
 			o, _ := offlineBaselineFixture(t, false)

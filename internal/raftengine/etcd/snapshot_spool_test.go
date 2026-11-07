@@ -157,6 +157,7 @@ func TestSnapshotSpoolRejectsWhenReserveWouldBeConsumed(t *testing.T) {
 // error the caller is reporting). State clearing inside FinalizeAsFSMFile
 // at each successful step makes the post-success Close() a true no-op.
 func TestFinalizeAsFSMFile_PostFinalizeCloseIsNoop(t *testing.T) {
+	t.Parallel()
 	const (
 		index uint64 = 99
 		crc   uint32 = 0x42424242
@@ -204,6 +205,7 @@ func TestFinalizeAsFSMFile_PostFinalizeCloseIsNoop(t *testing.T) {
 // caller-side Close() should still remove that orphan so we don't leak
 // disk on the unhappy path.
 func TestFinalizeAsFSMFile_RenameFailureCleansUpSpool(t *testing.T) {
+	t.Parallel()
 	spoolDir := t.TempDir()
 	// Point fsmSnapDir at a path under a directory we'll make unwritable
 	// AFTER the spool file is created. The file gets sync+close'd but the
@@ -290,6 +292,7 @@ func TestFinalizeAsFSMFile_SyncDirFailureCloseIsNoop(t *testing.T) {
 }
 
 func TestCleanupStaleSnapshotSpools(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 
 	// Create several orphaned spool files matching the pattern.
@@ -320,11 +323,13 @@ func TestCleanupStaleSnapshotSpools(t *testing.T) {
 }
 
 func TestCleanupStaleSnapshotSpoolsEmptyDir(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	require.NoError(t, cleanupStaleSnapshotSpools(dir))
 }
 
 func TestCleanupStaleSnapshotSpoolsNonExistentDir(t *testing.T) {
+	t.Parallel()
 	require.NoError(t, cleanupStaleSnapshotSpools(filepath.Join(t.TempDir(), "no-such-dir")))
 }
 
@@ -339,6 +344,7 @@ func createSnapFile(t *testing.T, dir string, index uint64) {
 }
 
 func TestPurgeOldSnapFiles(t *testing.T) {
+	t.Parallel()
 	snapDir := t.TempDir()
 	fsmSnapDir := t.TempDir()
 
@@ -417,6 +423,7 @@ func TestPurgeOldSnapFilesBudgetCanBeDisabled(t *testing.T) {
 }
 
 func TestPurgeOldSnapFilesUnderLimit(t *testing.T) {
+	t.Parallel()
 	snapDir := t.TempDir()
 	fsmSnapDir := t.TempDir()
 
@@ -432,6 +439,7 @@ func TestPurgeOldSnapFilesUnderLimit(t *testing.T) {
 }
 
 func TestPurgeOldSnapFilesEmptyDir(t *testing.T) {
+	t.Parallel()
 	snapDir := t.TempDir()
 	fsmSnapDir := t.TempDir()
 	require.NoError(t, purgeOldSnapshotFiles(snapDir, fsmSnapDir))
