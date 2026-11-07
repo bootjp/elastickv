@@ -16,6 +16,13 @@ const timestampAdmissionValidationBudget = 5 * time.Second
 // Resolution is exempt. Incoming creation epochs are never trusted, even when
 // the group has not yet activated the protocol.
 func StampTimestampAdmission(ctx context.Context, allocator TimestampAllocator, st store.MVCCStore, reqs []*pb.Request) error {
+	if requestsUseTimestampBinding(reqs) {
+		return errors.WithStack(ErrTimestampBindingInvalid)
+	}
+	return stampLegacyTimestampAdmission(ctx, allocator, st, reqs)
+}
+
+func stampLegacyTimestampAdmission(ctx context.Context, allocator TimestampAllocator, st store.MVCCStore, reqs []*pb.Request) error {
 	creation := clearTimestampAdmission(reqs)
 	if !creation || st == nil {
 		return nil

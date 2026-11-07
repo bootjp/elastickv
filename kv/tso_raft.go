@@ -69,6 +69,7 @@ type RaftTSOAllocator struct {
 	phaseDFinishedTerm     uint64
 	phaseDBootstrapTerm    uint64
 	phaseDBootstrapRetryAt time.Time
+	band                   tsoPhysicalBand
 	mu                     sync.Mutex
 }
 
@@ -144,6 +145,7 @@ func (a *RaftTSOAllocator) ReserveBatchAfter(
 	ctx = nonNilTSOContext(ctx)
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	a.band = tsoPhysicalBand{}
 	return a.reserveBatchAfterLocked(ctx, n, min, activateCutover, activatePhaseD)
 }
 
