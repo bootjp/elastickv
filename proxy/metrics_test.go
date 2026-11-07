@@ -20,6 +20,7 @@ type poolStatsMockBackend struct {
 func (b *poolStatsMockBackend) PoolStats() BackendPoolStats { return b.stats }
 
 func TestClassifySecondaryWriteError(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		err  error
@@ -54,6 +55,7 @@ func TestClassifySecondaryWriteError(t *testing.T) {
 }
 
 func TestRecordSecondaryWriteFailureEmitsBothCounters(t *testing.T) {
+	t.Parallel()
 	metrics := newTestMetrics()
 	primary := newMockBackend("primary")
 	secondary := newMockBackend("secondary")
@@ -87,6 +89,7 @@ func TestRecordSecondaryWriteFailureEmitsBothCounters(t *testing.T) {
 }
 
 func TestRedisPoolStatsSnapshot(t *testing.T) {
+	t.Parallel()
 	stats := &redis.PoolStats{
 		Hits:            11,
 		Misses:          3,
@@ -110,6 +113,7 @@ func TestRedisPoolStatsSnapshot(t *testing.T) {
 }
 
 func TestObserveBackendPoolMetrics(t *testing.T) {
+	t.Parallel()
 	metrics := newTestMetrics()
 	backend := &poolStatsMockBackend{
 		mockBackend: newMockBackend("elastickv"),
@@ -137,6 +141,7 @@ func TestObserveBackendPoolMetrics(t *testing.T) {
 }
 
 func TestDualWriterSamplesBackendPoolsOnStart(t *testing.T) {
+	t.Parallel()
 	metrics := newTestMetrics()
 	primary := &poolStatsMockBackend{
 		mockBackend: newMockBackend("redis"),

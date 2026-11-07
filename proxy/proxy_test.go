@@ -100,6 +100,7 @@ func newTestSentry() *SentryReporter {
 // ========== command.go tests ==========
 
 func TestClassifyCommand(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		cmd      string
@@ -152,6 +153,7 @@ func TestClassifyCommand(t *testing.T) {
 // ========== config.go tests ==========
 
 func TestParseProxyMode(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		input    string
 		expected ProxyMode
@@ -177,6 +179,7 @@ func TestParseProxyMode(t *testing.T) {
 }
 
 func TestProxyModeString(t *testing.T) {
+	t.Parallel()
 	assert.Equal(t, "redis-only", ModeRedisOnly.String())
 	assert.Equal(t, "dual-write", ModeDualWrite.String())
 	assert.Equal(t, "dual-write-shadow", ModeDualWriteShadow.String())
@@ -186,6 +189,7 @@ func TestProxyModeString(t *testing.T) {
 }
 
 func TestDefaultConfig(t *testing.T) {
+	t.Parallel()
 	cfg := DefaultConfig()
 	assert.Equal(t, ":6479", cfg.ListenAddr)
 	assert.Equal(t, "localhost:6379", cfg.PrimaryAddr)
@@ -198,6 +202,7 @@ func TestDefaultConfig(t *testing.T) {
 // ========== compare.go tests ==========
 
 func TestDivergenceKindString(t *testing.T) {
+	t.Parallel()
 	assert.Equal(t, "migration_gap", DivMigrationGap.String())
 	assert.Equal(t, "data_mismatch", DivDataMismatch.String())
 	assert.Equal(t, "extra_data", DivExtraData.String())
@@ -205,12 +210,14 @@ func TestDivergenceKindString(t *testing.T) {
 }
 
 func TestExtractKey(t *testing.T) {
+	t.Parallel()
 	assert.Equal(t, "mykey", extractKey([][]byte{[]byte("GET"), []byte("mykey")}))
 	assert.Equal(t, "", extractKey([][]byte{[]byte("PING")}))
 	assert.Equal(t, "", extractKey(nil))
 }
 
 func TestBytesArgsToInterfaces(t *testing.T) {
+	t.Parallel()
 	args := [][]byte{[]byte("SET"), []byte("key"), []byte("val")}
 	result := bytesArgsToInterfaces(args)
 	assert.Len(t, result, 3)
@@ -220,6 +227,7 @@ func TestBytesArgsToInterfaces(t *testing.T) {
 }
 
 func TestResponseEqual(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		a, b any
@@ -251,6 +259,7 @@ func TestResponseEqual(t *testing.T) {
 }
 
 func TestClassifyDivergence(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name                       string
 		primaryResp, secondaryResp any
@@ -271,6 +280,7 @@ func TestClassifyDivergence(t *testing.T) {
 }
 
 func TestIsNilResp(t *testing.T) {
+	t.Parallel()
 	assert.True(t, isNilResp(nil, redis.Nil))
 	assert.True(t, isNilResp(nil, nil))
 	assert.False(t, isNilResp("", nil), "empty string is NOT nil")
@@ -281,6 +291,7 @@ func TestIsNilResp(t *testing.T) {
 // ========== proxy.go tests ==========
 
 func TestCloneArgs(t *testing.T) {
+	t.Parallel()
 	original := [][]byte{[]byte("GET"), []byte("key")}
 	cloned := cloneArgs(original)
 
@@ -292,6 +303,7 @@ func TestCloneArgs(t *testing.T) {
 }
 
 func TestIsSimpleStringCommand(t *testing.T) {
+	t.Parallel()
 	assert.True(t, isSimpleStringCommand("TYPE", nil))
 	assert.True(t, isSimpleStringCommand("SET", [][]byte{[]byte("SET"), []byte("k"), []byte("v")}))
 	assert.False(t, isSimpleStringCommand("SET", [][]byte{[]byte("SET"), []byte("k"), []byte("v"), []byte("GET")}))
@@ -301,6 +313,7 @@ func TestIsSimpleStringCommand(t *testing.T) {
 // ========== sentry.go tests ==========
 
 func TestSentryReporterDisabled(t *testing.T) {
+	t.Parallel()
 	r := NewSentryReporter("", "", 1.0, nil)
 	assert.False(t, r.enabled)
 	// Should not panic
@@ -313,6 +326,7 @@ func TestSentryReporterDisabled(t *testing.T) {
 }
 
 func TestShouldReportCooldown(t *testing.T) {
+	t.Parallel()
 	now := time.Now()
 	r := &SentryReporter{
 		enabled:    true,
@@ -329,6 +343,7 @@ func TestShouldReportCooldown(t *testing.T) {
 }
 
 func TestShouldReportEvictsExpired(t *testing.T) {
+	t.Parallel()
 	now := time.Now()
 	r := &SentryReporter{
 		enabled:    true,
@@ -347,6 +362,7 @@ func TestShouldReportEvictsExpired(t *testing.T) {
 // ========== dualwrite.go tests ==========
 
 func TestHasSecondaryWrite(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		mode     ProxyMode
 		expected bool
@@ -363,6 +379,7 @@ func TestHasSecondaryWrite(t *testing.T) {
 }
 
 func TestNewDualWriter_UsesConfiguredSecondaryConcurrency(t *testing.T) {
+	t.Parallel()
 	metrics := newTestMetrics()
 	d := NewDualWriter(
 		newMockBackend("primary"),
@@ -387,6 +404,7 @@ func TestNewDualWriter_UsesConfiguredSecondaryConcurrency(t *testing.T) {
 }
 
 func TestNewDualWriter_DefaultSecondaryConcurrency(t *testing.T) {
+	t.Parallel()
 	metrics := newTestMetrics()
 	d := NewDualWriter(
 		newMockBackend("primary"),
@@ -405,6 +423,7 @@ func TestNewDualWriter_DefaultSecondaryConcurrency(t *testing.T) {
 }
 
 func TestDualWriter_Write_PrimarySuccess(t *testing.T) {
+	t.Parallel()
 	primary := newMockBackend("primary")
 	primary.doFunc = makeCmd("OK", nil)
 	secondary := newMockBackend("secondary")
@@ -424,6 +443,7 @@ func TestDualWriter_Write_PrimarySuccess(t *testing.T) {
 }
 
 func TestDualWriter_Write_PrimaryFail(t *testing.T) {
+	t.Parallel()
 	primary := newMockBackend("primary")
 	primary.doFunc = makeCmd(nil, errors.New("connection refused"))
 	secondary := newMockBackend("secondary")
@@ -440,6 +460,7 @@ func TestDualWriter_Write_PrimaryFail(t *testing.T) {
 }
 
 func TestDualWriter_Write_SecondaryFail_ClientSucceeds(t *testing.T) {
+	t.Parallel()
 	primary := newMockBackend("primary")
 	primary.doFunc = makeCmd("OK", nil)
 	secondary := newMockBackend("secondary")
@@ -457,6 +478,7 @@ func TestDualWriter_Write_SecondaryFail_ClientSucceeds(t *testing.T) {
 }
 
 func TestDualWriter_Write_RedisNil(t *testing.T) {
+	t.Parallel()
 	// SET with NX returns redis.Nil when key exists
 	primary := newMockBackend("primary")
 	primary.doFunc = makeCmd(nil, redis.Nil)
@@ -475,6 +497,7 @@ func TestDualWriter_Write_RedisNil(t *testing.T) {
 }
 
 func TestDualWriter_Write_RedisOnlyMode(t *testing.T) {
+	t.Parallel()
 	primary := newMockBackend("primary")
 	primary.doFunc = makeCmd("OK", nil)
 	secondary := newMockBackend("secondary")
@@ -489,6 +512,7 @@ func TestDualWriter_Write_RedisOnlyMode(t *testing.T) {
 }
 
 func TestDualWriter_Write_ElasticKVOnlyMode(t *testing.T) {
+	t.Parallel()
 	primary := newMockBackend("elastickv")
 	primary.doFunc = makeCmd("OK", nil)
 	secondary := newMockBackend("redis")
@@ -503,6 +527,7 @@ func TestDualWriter_Write_ElasticKVOnlyMode(t *testing.T) {
 }
 
 func TestDualWriter_Read_WithShadow(t *testing.T) {
+	t.Parallel()
 	primary := newMockBackend("primary")
 	primary.doFunc = makeCmd("hello", nil)
 	secondary := newMockBackend("secondary")
@@ -522,6 +547,7 @@ func TestDualWriter_Read_WithShadow(t *testing.T) {
 }
 
 func TestDualWriter_Read_NoShadowInDualWrite(t *testing.T) {
+	t.Parallel()
 	primary := newMockBackend("primary")
 	primary.doFunc = makeCmd("hello", nil)
 	secondary := newMockBackend("secondary")
@@ -622,6 +648,7 @@ func clonePipelineArgs(cmds [][]any) [][]any {
 }
 
 func TestBlockingCommandTimeout(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		cmd      string
@@ -668,6 +695,7 @@ func TestBlockingCommandTimeout(t *testing.T) {
 }
 
 func TestDualWriter_Blocking_UsesTimeoutAwareBackend(t *testing.T) {
+	t.Parallel()
 	primary := &timeoutCapturingBackend{name: "primary", returnValue: "OK"}
 	secondary := newMockBackend("secondary")
 
@@ -684,6 +712,7 @@ func TestDualWriter_Blocking_UsesTimeoutAwareBackend(t *testing.T) {
 }
 
 func TestDualWriter_Blocking_ReplaysBZPopAsZRem(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name          string
 		cmd           string
@@ -732,6 +761,7 @@ func TestDualWriter_Blocking_ReplaysBZPopAsZRem(t *testing.T) {
 }
 
 func TestDualWriter_Blocking_DoesNotReplayNilResult(t *testing.T) {
+	t.Parallel()
 	primary := &timeoutCapturingBackend{
 		name:      "primary",
 		returnErr: redis.Nil,
@@ -761,6 +791,7 @@ func TestDualWriter_Blocking_DoesNotReplayNilResult(t *testing.T) {
 }
 
 func TestDualWriter_Blocking_RetriesBZPopReplayUntilRemoved(t *testing.T) {
+	t.Parallel()
 	primary := &timeoutCapturingBackend{
 		name:        "primary",
 		returnValue: []any{"queue", "job-1", "12.5"},
@@ -800,6 +831,7 @@ func TestDualWriter_Blocking_RetriesBZPopReplayUntilRemoved(t *testing.T) {
 }
 
 func TestDualWriter_Blocking_ZRemFastFallsBackToZRemWhenUnsupported(t *testing.T) {
+	t.Parallel()
 	primary := &timeoutCapturingBackend{
 		name:        "primary",
 		returnValue: []any{"queue", "job-1", "12.5"},
@@ -841,6 +873,7 @@ func TestDualWriter_Blocking_ZRemFastFallsBackToZRemWhenUnsupported(t *testing.T
 }
 
 func TestDualWriter_Blocking_ZRemFastFallbackResetsNoEffectRetryBudget(t *testing.T) {
+	t.Parallel()
 	primary := &timeoutCapturingBackend{
 		name:        "primary",
 		returnValue: []any{"queue", "job-1", "12.5"},
@@ -887,6 +920,7 @@ func TestDualWriter_Blocking_ZRemFastFallbackResetsNoEffectRetryBudget(t *testin
 }
 
 func TestDualWriter_Blocking_BZPopReplayMissIsNotSecondaryWriteError(t *testing.T) {
+	t.Parallel()
 	primary := &timeoutCapturingBackend{
 		name:        "primary",
 		returnValue: []any{"queue", "job-1", "12.5"},
@@ -919,6 +953,7 @@ func TestDualWriter_Blocking_BZPopReplayMissIsNotSecondaryWriteError(t *testing.
 }
 
 func TestDualWriter_Blocking_BZPopReplayShortTimeoutStillAttemptsZRem(t *testing.T) {
+	t.Parallel()
 	primary := &timeoutCapturingBackend{
 		name:        "primary",
 		returnValue: []any{"queue", "job-1", "12.5"},
@@ -951,6 +986,7 @@ func TestDualWriter_Blocking_BZPopReplayShortTimeoutStillAttemptsZRem(t *testing
 }
 
 func TestDualWriter_Blocking_DoesNotReplayNoEffectBZPop(t *testing.T) {
+	t.Parallel()
 	primary := &timeoutCapturingBackend{
 		name:      "primary",
 		returnErr: redis.Nil,
@@ -981,6 +1017,7 @@ func TestDualWriter_Blocking_DoesNotReplayNoEffectBZPop(t *testing.T) {
 }
 
 func TestDualWriter_Blocking_ReplaysListPopAsLRem(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		cmd  string
@@ -1028,6 +1065,7 @@ func TestDualWriter_Blocking_ReplaysListPopAsLRem(t *testing.T) {
 }
 
 func TestDualWriter_Blocking_ReplaysListMoveAsEval(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		cmd  string
@@ -1099,6 +1137,7 @@ func TestDualWriter_Blocking_ReplaysListMoveAsEval(t *testing.T) {
 }
 
 func TestDualWriter_Blocking_ReplaysBLMPopAsEval(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		args [][]byte
@@ -1168,6 +1207,7 @@ func TestDualWriter_Blocking_ReplaysBLMPopAsEval(t *testing.T) {
 }
 
 func TestNoEffectReplayRetryLimitIncludesJitterBudget(t *testing.T) {
+	t.Parallel()
 	limit := noEffectReplayRetryLimit(context.Background(), blockingReplayNoEffectRetryWindow)
 	assert.Equal(t, 5, limit)
 
@@ -1183,6 +1223,7 @@ func TestNoEffectReplayRetryLimitIncludesJitterBudget(t *testing.T) {
 }
 
 func TestDualWriter_BlockingTranslatedReplayUsesWriteQueue(t *testing.T) {
+	t.Parallel()
 	primary := &timeoutCapturingBackend{
 		name:        "primary",
 		returnValue: []any{"queue", "job-1", "12.5"},
@@ -1233,6 +1274,7 @@ func TestDualWriter_BlockingTranslatedReplayUsesWriteQueue(t *testing.T) {
 }
 
 func TestDualWriter_Blocking_ReplaysXReadGroup(t *testing.T) {
+	t.Parallel()
 	primary := &timeoutCapturingBackend{
 		name:        "primary",
 		returnValue: []any{"stream-result"},
@@ -1270,6 +1312,7 @@ func TestDualWriter_Blocking_ReplaysXReadGroup(t *testing.T) {
 }
 
 func TestDualWriter_Blocking_DoesNotReplayXRead(t *testing.T) {
+	t.Parallel()
 	primary := &timeoutCapturingBackend{
 		name:        "primary",
 		returnValue: []any{"stream-result"},
@@ -1297,6 +1340,7 @@ func TestDualWriter_Blocking_DoesNotReplayXRead(t *testing.T) {
 }
 
 func TestDualWriter_Blocking_DoesNotReplayWhenBlockingReplayDisabled(t *testing.T) {
+	t.Parallel()
 	primary := &timeoutCapturingBackend{
 		name:        "primary",
 		returnValue: []any{"stream-result"},
@@ -1327,6 +1371,7 @@ func TestDualWriter_Blocking_DoesNotReplayWhenBlockingReplayDisabled(t *testing.
 }
 
 func TestDualWriter_BlockingTranslatedReplayUsesWriteQueueWhenBlockingReplayDisabled(t *testing.T) {
+	t.Parallel()
 	primary := &timeoutCapturingBackend{
 		name:        "primary",
 		returnValue: []any{"queue", "job-1", "12.5"},
@@ -1358,6 +1403,7 @@ func TestDualWriter_BlockingTranslatedReplayUsesWriteQueueWhenBlockingReplayDisa
 }
 
 func TestDualWriter_GoAsync_QueuesBurstBeforeDropping(t *testing.T) {
+	t.Parallel()
 	primary := newMockBackend("primary")
 	primary.doFunc = makeCmd("OK", nil)
 	secondary := newMockBackend("secondary")
@@ -1407,6 +1453,7 @@ func TestDualWriter_GoAsync_QueuesBurstBeforeDropping(t *testing.T) {
 }
 
 func TestDualWriter_GoAsync_DropLogsAreRateLimited(t *testing.T) {
+	t.Parallel()
 	primary := newMockBackend("primary")
 	primary.doFunc = makeCmd("OK", nil)
 	secondary := newMockBackend("secondary")
@@ -1443,6 +1490,7 @@ func TestDualWriter_GoAsync_DropLogsAreRateLimited(t *testing.T) {
 }
 
 func TestDualWriter_Script_QueuesWhenScriptLimitIsBusy(t *testing.T) {
+	t.Parallel()
 	primary := newMockBackend("primary")
 	primary.doFunc = makeCmd("OK", nil)
 	secondary := newMockBackend("secondary")
@@ -1489,6 +1537,7 @@ func TestDualWriter_Script_QueuesWhenScriptLimitIsBusy(t *testing.T) {
 }
 
 func TestDualWriter_ScriptConsumesSharedWriteConcurrency(t *testing.T) {
+	t.Parallel()
 	metrics := newTestMetrics()
 	d := NewDualWriter(
 		newMockBackend("primary"),
@@ -1524,6 +1573,7 @@ func TestDualWriter_ScriptConsumesSharedWriteConcurrency(t *testing.T) {
 }
 
 func TestDualWriter_QueuedWorkExpiresBeforeBackendDispatch(t *testing.T) {
+	t.Parallel()
 	metrics := newTestMetrics()
 	d := NewDualWriter(
 		newMockBackend("primary"),
@@ -1559,6 +1609,7 @@ func TestDualWriter_QueuedWorkExpiresBeforeBackendDispatch(t *testing.T) {
 }
 
 func TestDualWriter_ScriptQueueUsesScriptTimeout(t *testing.T) {
+	t.Parallel()
 	metrics := newTestMetrics()
 	d := NewDualWriter(
 		newMockBackend("primary"),
@@ -1596,6 +1647,7 @@ func TestDualWriter_ScriptQueueUsesScriptTimeout(t *testing.T) {
 }
 
 func TestDualWriter_SecondaryUsesPerCommandSocketTimeouts(t *testing.T) {
+	t.Parallel()
 	secondary := &timeoutCapturingBackend{name: "secondary", returnValue: "OK"}
 	d := NewDualWriter(
 		newMockBackend("primary"),
@@ -1620,6 +1672,7 @@ func TestDualWriter_SecondaryUsesPerCommandSocketTimeouts(t *testing.T) {
 }
 
 func TestDualWriter_SecondaryReadTimeoutUsesRemainingAsyncDeadline(t *testing.T) {
+	t.Parallel()
 	secondary := &timeoutCapturingBackend{name: "secondary", returnValue: "OK"}
 	d := NewDualWriter(
 		newMockBackend("primary"),
@@ -1650,6 +1703,7 @@ func TestDualWriter_SecondaryReadTimeoutUsesRemainingAsyncDeadline(t *testing.T)
 }
 
 func TestDualWriter_ExpiredSecondaryReadDeadlineSkipsDispatch(t *testing.T) {
+	t.Parallel()
 	secondary := &timeoutCapturingBackend{name: "secondary", returnValue: "OK"}
 	d := NewDualWriter(
 		newMockBackend("primary"),
@@ -1682,6 +1736,7 @@ func TestDualWriter_ExpiredSecondaryReadDeadlineSkipsDispatch(t *testing.T) {
 }
 
 func TestDualWriter_TxnReplayWithScriptUsesScriptQueueAndTimeout(t *testing.T) {
+	t.Parallel()
 	secondary := &timeoutCapturingBackend{name: "secondary", returnValue: "OK"}
 	metrics := newTestMetrics()
 	d := NewDualWriter(
@@ -1714,6 +1769,7 @@ func TestDualWriter_TxnReplayWithScriptUsesScriptQueueAndTimeout(t *testing.T) {
 }
 
 func TestDualWriter_TxnReplayWithoutScriptUsesWriteQueueAndTimeout(t *testing.T) {
+	t.Parallel()
 	secondary := &timeoutCapturingBackend{name: "secondary", returnValue: "OK"}
 	d := NewDualWriter(
 		newMockBackend("primary"),
@@ -1744,6 +1800,7 @@ func TestDualWriter_TxnReplayWithoutScriptUsesWriteQueueAndTimeout(t *testing.T)
 }
 
 func TestDualWriter_ExpiredQueuedWorkDoesNotWaitForSemaphore(t *testing.T) {
+	t.Parallel()
 	metrics := newTestMetrics()
 	d := &DualWriter{
 		metrics: metrics,
@@ -1784,6 +1841,7 @@ func TestDualWriter_ExpiredQueuedWorkDoesNotWaitForSemaphore(t *testing.T) {
 // goAsync and Close do not trigger a "WaitGroup misuse: Add called
 // concurrently with Wait" panic under the race detector.
 func TestDualWriter_Close_NoWaitGroupRace(t *testing.T) {
+	t.Parallel()
 	primary := newMockBackend("primary")
 	primary.doFunc = makeCmd("OK", nil)
 	secondary := newMockBackend("secondary")
@@ -1810,6 +1868,7 @@ func TestDualWriter_Close_NoWaitGroupRace(t *testing.T) {
 // ========== ShadowReader tests ==========
 
 func TestShadowReader_Compare_Equal(t *testing.T) {
+	t.Parallel()
 	secondary := newMockBackend("secondary")
 	secondary.doFunc = makeCmd("hello", nil)
 
@@ -1824,6 +1883,7 @@ func TestShadowReader_Compare_Equal(t *testing.T) {
 }
 
 func TestShadowReader_Compare_BothNil(t *testing.T) {
+	t.Parallel()
 	secondary := newMockBackend("secondary")
 	secondary.doFunc = makeCmd(nil, redis.Nil)
 
@@ -1837,6 +1897,7 @@ func TestShadowReader_Compare_BothNil(t *testing.T) {
 }
 
 func TestShadowReader_Compare_MigrationGap(t *testing.T) {
+	t.Parallel()
 	secondary := newMockBackend("secondary")
 	secondary.doFunc = makeCmd(nil, redis.Nil) // secondary has no data
 
@@ -1850,6 +1911,7 @@ func TestShadowReader_Compare_MigrationGap(t *testing.T) {
 }
 
 func TestShadowReader_Compare_DataMismatch(t *testing.T) {
+	t.Parallel()
 	secondary := newMockBackend("secondary")
 	secondary.doFunc = makeCmd("world", nil)
 
@@ -1862,6 +1924,7 @@ func TestShadowReader_Compare_DataMismatch(t *testing.T) {
 }
 
 func TestShadowReader_Compare_ExtraData(t *testing.T) {
+	t.Parallel()
 	secondary := newMockBackend("secondary")
 	secondary.doFunc = makeCmd("surprise", nil)
 
@@ -1874,6 +1937,7 @@ func TestShadowReader_Compare_ExtraData(t *testing.T) {
 }
 
 func TestShadowReader_Compare_EmptyStringIsNotNil(t *testing.T) {
+	t.Parallel()
 	// Primary returns "", secondary returns "" → equal, no divergence
 	secondary := newMockBackend("secondary")
 	secondary.doFunc = makeCmd("", nil)
@@ -1888,6 +1952,7 @@ func TestShadowReader_Compare_EmptyStringIsNotNil(t *testing.T) {
 }
 
 func TestShadowReader_Compare_EmptyStringVsNil(t *testing.T) {
+	t.Parallel()
 	// Primary returns "", secondary returns nil → MigrationGap
 	secondary := newMockBackend("secondary")
 	secondary.doFunc = makeCmd(nil, redis.Nil)
@@ -1901,6 +1966,7 @@ func TestShadowReader_Compare_EmptyStringVsNil(t *testing.T) {
 }
 
 func TestShadowReader_Compare_MigrationGapSampling(t *testing.T) {
+	t.Parallel()
 	secondary := newMockBackend("secondary")
 	secondary.doFunc = makeCmd(nil, redis.Nil)
 
@@ -1919,12 +1985,14 @@ func TestShadowReader_Compare_MigrationGapSampling(t *testing.T) {
 // ========== Backend tests ==========
 
 func TestDefaultBackendOptions(t *testing.T) {
+	t.Parallel()
 	opts := DefaultBackendOptions()
 	assert.Equal(t, 128, opts.PoolSize)
 	assert.Equal(t, 5*time.Second, opts.DialTimeout)
 }
 
 func TestDefaultElasticKVBackendOptions(t *testing.T) {
+	t.Parallel()
 	opts := DefaultElasticKVBackendOptions()
 	assert.Equal(t, 192, opts.PoolSize)
 	assert.Equal(t, 5*time.Second, opts.DialTimeout)
@@ -1933,6 +2001,7 @@ func TestDefaultElasticKVBackendOptions(t *testing.T) {
 }
 
 func TestNewRedisBackend_UsesRESP2(t *testing.T) {
+	t.Parallel()
 	backend := NewRedisBackend("127.0.0.1:6379", "test")
 	t.Cleanup(func() {
 		assert.NoError(t, backend.Close())
@@ -1942,12 +2011,14 @@ func TestNewRedisBackend_UsesRESP2(t *testing.T) {
 }
 
 func TestEffectiveBlockingReadTimeout(t *testing.T) {
+	t.Parallel()
 	assert.Equal(t, time.Duration(0), effectiveBlockingReadTimeout(0))
 	assert.Equal(t, 20*time.Second, effectiveBlockingReadTimeout(10*time.Second))
 	assert.Equal(t, 11*time.Second, effectiveBlockingReadTimeout(time.Second))
 }
 
 func TestRedisClientWithReadTimeoutPreservesWriteTimeout(t *testing.T) {
+	t.Parallel()
 	client := redis.NewClient(&redis.Options{
 		Addr:         "127.0.0.1:6379",
 		ReadTimeout:  3 * time.Second,
@@ -1966,6 +2037,7 @@ func TestRedisClientWithReadTimeoutPreservesWriteTimeout(t *testing.T) {
 }
 
 func TestRedisClientWithBlockingReadTimeoutZeroDisablesReadDeadline(t *testing.T) {
+	t.Parallel()
 	client := redis.NewClient(&redis.Options{
 		Addr:         "127.0.0.1:6379",
 		ReadTimeout:  3 * time.Second,
@@ -1986,6 +2058,7 @@ func TestRedisClientWithBlockingReadTimeoutZeroDisablesReadDeadline(t *testing.T
 // ========== Pipeline error handling tests ==========
 
 func TestPipeline_TransportError(t *testing.T) {
+	t.Parallel()
 	b := newMockBackend("test")
 	b.doFunc = makeCmd(nil, errors.New("connection refused"))
 
@@ -1997,6 +2070,7 @@ func TestPipeline_TransportError(t *testing.T) {
 }
 
 func TestDualWriter_Script_CachesEvalForEvalSHAFallback(t *testing.T) {
+	t.Parallel()
 	primary := newMockBackend("primary")
 	primary.doFunc = makeCmd("OK", nil)
 
@@ -2036,6 +2110,7 @@ func TestDualWriter_Script_CachesEvalForEvalSHAFallback(t *testing.T) {
 }
 
 func TestDualWriter_Script_EvalSHARO_FallsBackToEvalRO(t *testing.T) {
+	t.Parallel()
 	primary := newMockBackend("primary")
 	primary.doFunc = makeCmd("OK", nil)
 
@@ -2076,6 +2151,7 @@ func TestDualWriter_Script_EvalSHARO_FallsBackToEvalRO(t *testing.T) {
 }
 
 func TestDualWriter_writeSecondary_RetriesReadTSCompacted(t *testing.T) {
+	t.Parallel()
 	// Simulate ElasticKV returning "read timestamp has been compacted"
 	// (wrapped as gRPC FailedPrecondition and surfaced through Lua PCall).
 	// The proxy must transparently retry so the async EVALSHA replay
@@ -2108,6 +2184,7 @@ func TestDualWriter_writeSecondary_RetriesReadTSCompacted(t *testing.T) {
 }
 
 func TestDualWriter_writeSecondary_ReadTSCompactedRetriesAreBounded(t *testing.T) {
+	t.Parallel()
 	// When the compacted error is persistent, the retry loop must stop after
 	// maxCompactedRetries+1 attempts so the secondary goroutine returns
 	// instead of burning a scriptSem slot indefinitely.
@@ -2130,6 +2207,7 @@ func TestDualWriter_writeSecondary_ReadTSCompactedRetriesAreBounded(t *testing.T
 }
 
 func TestDualWriter_writeSecondary_RetriesServerOverloadedNonScript(t *testing.T) {
+	t.Parallel()
 	primary := newMockBackend("primary")
 	primary.doFunc = makeCmd("OK", nil)
 
@@ -2158,6 +2236,7 @@ func TestDualWriter_writeSecondary_RetriesServerOverloadedNonScript(t *testing.T
 }
 
 func TestDualWriter_writeSecondary_ServerOverloadedNonScriptRetriesAreBounded(t *testing.T) {
+	t.Parallel()
 	primary := newMockBackend("primary")
 	primary.doFunc = makeCmd("OK", nil)
 
@@ -2178,6 +2257,7 @@ func TestDualWriter_writeSecondary_ServerOverloadedNonScriptRetriesAreBounded(t 
 }
 
 func TestDualWriter_writeSecondary_DoesNotRetryScriptReturnedServerOverloaded(t *testing.T) {
+	t.Parallel()
 	primary := newMockBackend("primary")
 	primary.doFunc = makeCmd("OK", nil)
 
@@ -2196,6 +2276,7 @@ func TestDualWriter_writeSecondary_DoesNotRetryScriptReturnedServerOverloaded(t 
 }
 
 func TestDualWriter_writeSecondaryPipeline_RetriesServerOverloadedExec(t *testing.T) {
+	t.Parallel()
 	primary := newMockBackend("primary")
 	primary.doFunc = makeCmd("OK", nil)
 
@@ -2222,6 +2303,7 @@ func TestDualWriter_writeSecondaryPipeline_RetriesServerOverloadedExec(t *testin
 }
 
 func TestDualWriter_writeSecondaryPipeline_ServerOverloadedRetriesAreBounded(t *testing.T) {
+	t.Parallel()
 	primary := newMockBackend("primary")
 	primary.doFunc = makeCmd("OK", nil)
 
@@ -2247,6 +2329,7 @@ func TestDualWriter_writeSecondaryPipeline_ServerOverloadedRetriesAreBounded(t *
 }
 
 func TestDualWriter_writeSecondaryPipeline_DoesNotRetryCompactedExec(t *testing.T) {
+	t.Parallel()
 	primary := newMockBackend("primary")
 	primary.doFunc = makeCmd("OK", nil)
 
@@ -2268,6 +2351,7 @@ func TestDualWriter_writeSecondaryPipeline_DoesNotRetryCompactedExec(t *testing.
 }
 
 func TestDualWriter_writeSecondary_RetriesDoNotRepeatNoScriptProbe(t *testing.T) {
+	t.Parallel()
 	// After the EVAL fallback resolves a NOSCRIPT, a compacted-retry must
 	// re-send the resolved EVAL form directly — never the known-missing
 	// EVALSHA — so we never burn an extra round-trip per retry attempt.
@@ -2317,6 +2401,7 @@ func TestDualWriter_writeSecondary_RetriesDoNotRepeatNoScriptProbe(t *testing.T)
 }
 
 func TestDualWriter_Script_NoRememberOnPrimaryError(t *testing.T) {
+	t.Parallel()
 	// Verify that a failed SCRIPT FLUSH on the primary does NOT clear the proxy
 	// script cache, so that subsequent EVALSHA → EVAL fallbacks still work.
 	primary := newMockBackend("primary")
@@ -2344,6 +2429,7 @@ func TestDualWriter_Script_NoRememberOnPrimaryError(t *testing.T) {
 }
 
 func TestDualWriter_ScriptCache_BoundedEviction(t *testing.T) {
+	t.Parallel()
 	// Fill the cache beyond maxScriptCacheSize and verify it stays bounded.
 	primary := newMockBackend("primary")
 	primary.doFunc = makeCmd("OK", nil)
@@ -2419,6 +2505,7 @@ func (c *commandDocsConn) WriteArray(count int)       { c.writes = append(c.writ
 func (c *commandDocsConn) WriteNull()                 { c.writes = append(c.writes, nil) }
 
 func TestCommandDocsPreservesFlagStatus(t *testing.T) {
+	t.Parallel()
 	// go-redis decodes both RESP simple and bulk strings as Go strings. A
 	// COMMAND DOCS argument's flags must still be sent to redis-cli as
 	// simple strings, or cliAddCommandDocArg aborts while starting.
@@ -2470,6 +2557,7 @@ func (m *mockRespWriter) WriteArray(count int)       { m.writes = append(m.write
 func (m *mockRespWriter) WriteNull()                 { m.writes = append(m.writes, nil) }
 
 func TestWriteRedisValue(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name   string
 		val    any
@@ -2498,6 +2586,7 @@ func TestWriteRedisValue(t *testing.T) {
 }
 
 func TestWriteRedisError(t *testing.T) {
+	t.Parallel()
 	t.Run("redis.Error passthrough", func(t *testing.T) {
 		w := &mockRespWriter{}
 		writeRedisError(w, testRedisErr("WRONGTYPE Operation against a key"))
@@ -2512,6 +2601,7 @@ func TestWriteRedisError(t *testing.T) {
 }
 
 func TestWriteResponse(t *testing.T) {
+	t.Parallel()
 	t.Run("nil error with value", func(t *testing.T) {
 		w := &mockRespWriter{}
 		writeResponse(w, "hello", nil)
@@ -2538,6 +2628,7 @@ type testStringer struct{ s string }
 func (ts testStringer) String() string { return ts.s }
 
 func TestTruncateValue(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name   string
 		input  any
@@ -2576,6 +2667,7 @@ func TestTruncateValue(t *testing.T) {
 // ========== Additional command table tests ==========
 
 func TestClassifyCommand_NewCommands(t *testing.T) {
+	t.Parallel()
 	reads := []string{"MGET", "GETRANGE", "STRLEN", "SRANDMEMBER", "SDIFF", "SINTER", "SUNION", "XINFO", "GEODIST", "GEOSEARCH", "OBJECT", "RANDOMKEY", "TOUCH"}
 	for _, cmd := range reads {
 		assert.Equal(t, CmdRead, ClassifyCommand(cmd, nil), "expected %s to be CmdRead", cmd)
