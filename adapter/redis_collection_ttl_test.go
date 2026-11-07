@@ -13,6 +13,7 @@ import (
 )
 
 func TestRedisCollectionExpireWritesInlineMetaTTL(t *testing.T) {
+	t.Parallel()
 	nodes, _, _ := createNode(t, 3)
 	defer shutdown(nodes)
 
@@ -704,6 +705,7 @@ func TestRedisCollectionExpireDoesNotReviveDeltaEmptiedSimpleMeta(t *testing.T) 
 }
 
 func TestRedisMultiExecStagedCollectionCreateWritesInlineTTL(t *testing.T) {
+	t.Parallel()
 	nodes, _, _ := createNode(t, 3)
 	defer shutdown(nodes)
 
@@ -790,6 +792,7 @@ func TestRedisMultiExecStagedCollectionCreateWritesInlineTTL(t *testing.T) {
 }
 
 func TestRedisXAddPreservesStreamInlineTTL(t *testing.T) {
+	t.Parallel()
 	nodes, _, _ := createNode(t, 3)
 	defer shutdown(nodes)
 
@@ -1641,6 +1644,7 @@ func TestRedisHDelLegacyRewritePreservesLegacyTTL(t *testing.T) {
 }
 
 func TestRedisLuaZSetDeltaTTLCompactionPreservesCardinality(t *testing.T) {
+	t.Parallel()
 	nodes, _, _ := createNode(t, 3)
 	defer shutdown(nodes)
 
@@ -1742,6 +1746,7 @@ func TestRedisLuaNonStringTTLDeltaOnlyTruncatedReturnsError(t *testing.T) {
 }
 
 func TestRedisLuaStagedCollectionCreateWritesInlineTTL(t *testing.T) {
+	t.Parallel()
 	nodes, _, _ := createNode(t, 3)
 	defer shutdown(nodes)
 

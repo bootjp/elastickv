@@ -188,6 +188,7 @@ func newRedisWireStore(t *testing.T) store.MVCCStore {
 }
 
 func TestRedisWireTransactionHealthyPipelineAndDiscard(t *testing.T) {
+	t.Parallel()
 	st := newRedisWireStore(t)
 	g := newRedisWireTestGate(t)
 	s := startRedisWireServer(t, st, newLocalAdapterCoordinator(st), g, WithOnePhaseTxnDedup(true))
@@ -207,6 +208,7 @@ func TestRedisWireTransactionHealthyPipelineAndDiscard(t *testing.T) {
 }
 
 func TestRedisWireTransactionNativeRevocationBeforeExec(t *testing.T) {
+	t.Parallel()
 	for _, change := range []string{"term", "configuration"} {
 		t.Run(change, func(t *testing.T) {
 			st := newRedisWireStore(t)
@@ -236,6 +238,7 @@ func TestRedisWireTransactionNativeRevocationBeforeExec(t *testing.T) {
 }
 
 func TestRedisWireTransactionLifecycle(t *testing.T) {
+	t.Parallel()
 	for _, exit := range []string{"disconnect", "close", "idle"} {
 		t.Run(exit, func(t *testing.T) {
 			st := newRedisWireStore(t)
@@ -272,6 +275,7 @@ func (c *redisWireDispatchCoordinator) Dispatch(ctx context.Context, ops *kv.Ope
 }
 
 func TestRedisWireTransactionRevokedDuringCommit(t *testing.T) {
+	t.Parallel()
 	st := newRedisWireStore(t)
 	g := newRedisWireTestGate(t)
 	local := newLocalAdapterCoordinator(st)
@@ -310,6 +314,7 @@ func TestRedisWireTransactionRevokedDuringCommit(t *testing.T) {
 }
 
 func TestRedisWireTransactionQueueBoundsAndErrors(t *testing.T) {
+	t.Parallel()
 	s, owner := redisPropagationServer(t)
 	c := &redisOwnedTestConn{}
 	command := func(args ...string) {
@@ -332,6 +337,7 @@ func TestRedisWireTransactionQueueBoundsAndErrors(t *testing.T) {
 }
 
 func TestRedisWireTransactionDisconnectDuringCommitRetainsOwnerUntilJoin(t *testing.T) {
+	t.Parallel()
 	st := newRedisWireStore(t)
 	g := newRedisWireTestGate(t)
 	local := newLocalAdapterCoordinator(st)
@@ -367,6 +373,7 @@ func TestRedisWireTransactionDisconnectDuringCommitRetainsOwnerUntilJoin(t *test
 }
 
 func TestRedisWireTransactionCloseJoinsOwnedChildren(t *testing.T) {
+	t.Parallel()
 	st := newRedisWireStore(t)
 	g := newRedisWireTestGate(t)
 	s := startRedisWireServer(t, st, newLocalAdapterCoordinator(st), g)
@@ -402,6 +409,7 @@ func TestRedisWireTransactionCloseJoinsOwnedChildren(t *testing.T) {
 }
 
 func TestRedisWireTransactionIdleCancelsOwnerChildren(t *testing.T) {
+	t.Parallel()
 	st := newRedisWireStore(t)
 	g := newRedisWireTestGate(t)
 	s := startRedisWireServer(t, st, newLocalAdapterCoordinator(st), g, func(s *RedisServer) {
@@ -425,6 +433,7 @@ func TestRedisWireTransactionIdleCancelsOwnerChildren(t *testing.T) {
 }
 
 func TestRedisWireTransactionHeavyPoolFullFinishesOwner(t *testing.T) {
+	t.Parallel()
 	st := newRedisWireStore(t)
 	g := newRedisWireTestGate(t)
 	limiter := newRedisHeavyCommandLimiter(1)
@@ -440,6 +449,7 @@ func TestRedisWireTransactionHeavyPoolFullFinishesOwner(t *testing.T) {
 }
 
 func TestRedisWireTransactionPreservesTypedUnknown(t *testing.T) {
+	t.Parallel()
 	s, owner := redisPropagationServer(t)
 	calls := 0
 	s.coordinator = &redisWireDispatchCoordinator{Coordinator: s.coordinator, dispatch: func(context.Context, *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
@@ -459,6 +469,7 @@ func TestRedisWireTransactionPreservesTypedUnknown(t *testing.T) {
 }
 
 func TestRedisWireTransactionProxyReplyTypes(t *testing.T) {
+	t.Parallel()
 	queue := []redcon.Command{
 		{Args: [][]byte{[]byte(cmdSet), []byte("k"), []byte("v")}},
 		{Args: [][]byte{[]byte(cmdHMSet), []byte("h"), []byte("f"), []byte("v")}},
@@ -481,6 +492,7 @@ func TestRedisWireTransactionProxyReplyTypes(t *testing.T) {
 }
 
 func TestRedisOwnedProxyOverflowUnknownClassification(t *testing.T) {
+	t.Parallel()
 	recorder := &redisOwnedTestConn{}
 	target := &redisOwnedConn{Conn: recorder, writer: &redisReplyBuffer{err: errRedisReplyTooLarge},
 		mayWrite: true, workStarted: true}
@@ -501,6 +513,7 @@ func TestRedisOwnedProxyOverflowUnknownClassification(t *testing.T) {
 }
 
 func TestRedisOwnedProxyMutatingReplyOverflowIsTerminal(t *testing.T) {
+	t.Parallel()
 	st := newRedisWireStore(t)
 	leaderGate := newRedisWireTestGate(t)
 	leader := startRedisWireServer(t, st, newLocalAdapterCoordinator(st), leaderGate)
@@ -542,6 +555,7 @@ func TestRedisOwnedProxyMutatingReplyOverflowIsTerminal(t *testing.T) {
 }
 
 func TestRedisWireTransactionFollowerProxy(t *testing.T) {
+	t.Parallel()
 	for _, mode := range []string{"healthy", "revoked", "lost-reply", "target-unknown"} {
 		t.Run(mode, func(t *testing.T) {
 			runRedisWireTransactionFollowerProxy(t, mode)

@@ -11,6 +11,7 @@ import (
 )
 
 func TestSplitPartitionBudgetRejectsBeforeGeometryPublication(t *testing.T) {
+	t.Parallel()
 	for _, working := range []bool{false, true} {
 		name := "metadata"
 		if working {
@@ -47,6 +48,7 @@ func TestSplitPartitionBudgetRejectsBeforeGeometryPublication(t *testing.T) {
 }
 
 func TestSplitRangeWithoutAuthCannotIgnoreDurableOwnership(t *testing.T) {
+	t.Parallel()
 	r := newResplitAcceptanceRuntime(t)
 	r.migrate(t, 1, 2, "m")
 	before, err := r.server.catalog.Snapshot(t.Context())

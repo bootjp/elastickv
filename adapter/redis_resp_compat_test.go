@@ -14,6 +14,7 @@ import (
 )
 
 func TestRedisRESP2PingAndSelect(t *testing.T) {
+	t.Parallel()
 	server := &RedisServer{}
 	for _, tc := range []struct {
 		name string
@@ -44,6 +45,7 @@ func TestRedisRESP2PingAndSelect(t *testing.T) {
 }
 
 func TestRedisRESP2CommandMetadata(t *testing.T) {
+	t.Parallel()
 	info := runCommand(t, "COMMAND", "INFO", "GET")
 	require.Equal(t, commandRecorderEntry{op: "array", n: 10}, info.writes[1])
 	require.Equal(t, "array", info.writes[4].op)
@@ -61,6 +63,7 @@ func TestRedisRESP2CommandMetadata(t *testing.T) {
 }
 
 func TestRedisRESP2CommandGroups(t *testing.T) {
+	t.Parallel()
 	// Redis 8.10.1 COMMAND DOCS groups for all 82 public adapter commands,
 	// plus the two ElasticKV-only aliases.
 	groups := map[string]string{
@@ -91,6 +94,7 @@ func TestRedisRESP2CommandGroups(t *testing.T) {
 }
 
 func TestRedisRESP2NullArrayReplies(t *testing.T) {
+	t.Parallel()
 	nodes, _, _ := createNode(t, 1)
 	defer shutdown(nodes)
 	for _, tc := range []struct {

@@ -109,6 +109,7 @@ func TestS3ServerStopCancelsCleanupAfterBound(t *testing.T) {
 
 // Once Stop has begun, a new background cleanup is not started.
 func TestS3ServerStopRefusesLateCleanup(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	coord := newCleanupBlockingCoordinator(st)
 	close(coord.release)

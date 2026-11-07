@@ -52,6 +52,7 @@ func (c *redisDetachedTestConn) ReadCommand() (redcon.Command, error) {
 }
 
 func TestRedisOwnedPubSubRetainsAndJoinsOriginalOwner(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	owner := &redisTestOwnership{ctx: ctx}
@@ -84,6 +85,7 @@ func TestRedisOwnedPubSubRetainsAndJoinsOriginalOwner(t *testing.T) {
 }
 
 func TestRedisOwnedPubSubServerCloseCancelsDetachedReader(t *testing.T) {
+	t.Parallel()
 	owner := &redisTestOwnership{ctx: context.Background()}
 	s := redisOwnedTestServer(owner)
 	c := &redisDetachedTestConn{commands: make(chan redcon.Command), done: make(chan struct{})}
@@ -105,6 +107,7 @@ func TestRedisOwnedPubSubServerCloseCancelsDetachedReader(t *testing.T) {
 }
 
 func TestRedisOwnedBlockingCancellationReleasesWaiters(t *testing.T) {
+	t.Parallel()
 	for _, name := range []string{cmdXRead, cmdBZPopMin} {
 		t.Run(name, func(t *testing.T) {
 			s, owner := redisPropagationServer(t)
@@ -136,6 +139,7 @@ func TestRedisOwnedBlockingCancellationReleasesWaiters(t *testing.T) {
 }
 
 func TestRedisOwnedPubSubCloseWaitsForRetiringOwner(t *testing.T) {
+	t.Parallel()
 	finishing, release := make(chan struct{}), make(chan struct{})
 	owner := &redisTestOwnership{ctx: context.Background(), onFinish: func() { close(finishing); <-release }}
 	s := redisOwnedTestServer(owner)
@@ -160,6 +164,7 @@ func TestRedisOwnedPubSubCloseWaitsForRetiringOwner(t *testing.T) {
 }
 
 func TestRedisOwnedPeriodicCompactorCapturesBeforeWork(t *testing.T) {
+	t.Parallel()
 	owner := &redisTestOwnership{ctx: context.Background()}
 	compactor := NewDeltaCompactor(nil, nil)
 	mints := 0
@@ -212,6 +217,7 @@ func TestRedisOwnedStopRetainsContextInsensitiveIO(t *testing.T) {
 }
 
 func TestRedisOwnedPubSubNeverRetainsPooledMetricsConn(t *testing.T) {
+	t.Parallel()
 	var owners []*redisTestOwnership
 	s := NewRedisServer(nil, "", nil, nil, nil, nil,
 		WithRedisRequestObserver(monitoring.NewRegistry("metrics-sub", "local").RedisObserver()),

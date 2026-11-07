@@ -184,6 +184,7 @@ func (r *resplitAcceptanceRuntime) read(t *testing.T, key, expected string) {
 }
 
 func TestMigrationResplitAcceptanceBaselineMigratedOwner(t *testing.T) {
+	t.Parallel()
 	r := newResplitAcceptanceRuntime(t)
 	job := r.migrate(t, 1, 2, "m")
 	owners, nonowners := r.ownership(t, 2), r.ownership(t, 1)
@@ -201,6 +202,7 @@ func TestMigrationResplitAcceptanceBaselineMigratedOwner(t *testing.T) {
 }
 
 func TestMigrationResplitAcceptanceSameGroupChildren(t *testing.T) {
+	t.Parallel()
 	r := newResplitAcceptanceRuntime(t)
 	job := r.migrate(t, 1, 2, "m")
 	owners, nonowners := r.ownership(t, 2), r.ownership(t, 1)
@@ -232,6 +234,7 @@ func TestMigrationResplitAcceptanceSameGroupChildren(t *testing.T) {
 }
 
 func TestMigrationResplitAcceptanceLaterCrossGroupRetainsLeft(t *testing.T) {
+	t.Parallel()
 	r := newResplitAcceptanceRuntime(t)
 	first := r.migrate(t, 1, 2, "m")
 	owner := r.ownership(t, 2)[0]

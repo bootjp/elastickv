@@ -10,6 +10,7 @@ import (
 )
 
 func TestRedisServer_Info_LeaderRole(t *testing.T) {
+	t.Parallel()
 	r := &RedisServer{
 		redisAddr:   "10.0.0.1:6379",
 		leaderRedis: map[string]string{"raft-1": "10.0.0.1:6379"},
@@ -28,6 +29,7 @@ func TestRedisServer_Info_LeaderRole(t *testing.T) {
 }
 
 func TestRedisServer_Info_FollowerRole(t *testing.T) {
+	t.Parallel()
 	r := &RedisServer{
 		redisAddr: "10.0.0.2:6379",
 		leaderRedis: map[string]string{
@@ -53,6 +55,7 @@ func TestRedisServer_Info_FollowerRole(t *testing.T) {
 }
 
 func TestRedisServer_Info_UnknownLeader(t *testing.T) {
+	t.Parallel()
 	r := &RedisServer{
 		redisAddr:   "10.0.0.3:6379",
 		leaderRedis: map[string]string{},

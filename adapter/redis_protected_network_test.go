@@ -13,6 +13,7 @@ import (
 )
 
 func TestRedisProtectedNetworkIngress(t *testing.T) {
+	t.Parallel()
 	base := store.NewMVCCStore()
 	t.Cleanup(func() { require.NoError(t, base.Close()) })
 	listener, err := net.Listen("tcp", "127.0.0.1:0")

@@ -59,6 +59,7 @@ func (forwardConflictTxn) Abort(context.Context, []*pb.Request) (*kv.Transaction
 }
 
 func TestInternalForwardMarksOnlyDefinitiveConflictAborted(t *testing.T) {
+	t.Parallel()
 	for _, tt := range []struct {
 		name string
 		err  error
@@ -80,6 +81,7 @@ func TestInternalForwardMarksOnlyDefinitiveConflictAborted(t *testing.T) {
 }
 
 func TestForwardCommitErrorCarriesTypedLockRejection(t *testing.T) {
+	t.Parallel()
 	err := forwardCommitError(kv.NewTxnLockedError([]byte("key")))
 	require.True(t, kv.IsForwardTxnLocked(err))
 	require.False(t, kv.IsForwardWriteConflict(err))
@@ -87,6 +89,7 @@ func TestForwardCommitErrorCarriesTypedLockRejection(t *testing.T) {
 }
 
 func TestInternalForwardConflictStatusSurvivesGRPC(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name string
 		key  []byte

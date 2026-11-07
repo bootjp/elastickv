@@ -101,6 +101,7 @@ func TestDynamoDBAdminDeleteTableRefusedOnceStopBegan(t *testing.T) {
 // returns, or until it is released unused; a reservation is refused once
 // stop has begun.
 func TestBackgroundWorkersReservationHoldsStop(t *testing.T) {
+	t.Parallel()
 	w := newBackgroundWorkers()
 	started, ok := w.reserve()
 	require.True(t, ok)
@@ -132,6 +133,7 @@ func TestBackgroundWorkersReservationHoldsStop(t *testing.T) {
 // The public listener answers the stopping refusal with a retryable 503
 // ServiceUnavailable, not with the 500 an unknown error gets.
 func TestDynamoDBStoppingErrorIsServiceUnavailable(t *testing.T) {
+	t.Parallel()
 	rec := httptest.NewRecorder()
 	writeDynamoErrorFromErr(rec, errors.WithStack(ErrDynamoServerStopping))
 	require.Equal(t, http.StatusServiceUnavailable, rec.Code)

@@ -24,6 +24,7 @@ func createDelayDLQ(t *testing.T, srv *SQSServer) {
 }
 
 func TestSQSFIFODelayFencesStaleRedrive(t *testing.T) {
+	t.Parallel()
 	for _, fenceSource := range []bool{false, true} {
 		t.Run(fmt.Sprint(fenceSource), func(t *testing.T) {
 			st := store.NewMVCCStore()
@@ -86,6 +87,7 @@ func delayGroupOnPartition(meta *sqsQueueMeta, partition uint32) string {
 }
 
 func TestSQSFIFODelayRedriveCannotEnterCompletedBackfillPartition(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	t.Cleanup(func() { require.NoError(t, st.Close()) })
 	srv := newDelayTestServer(t, st)
@@ -130,6 +132,7 @@ func TestSQSFIFODelayRedriveCannotEnterCompletedBackfillPartition(t *testing.T) 
 }
 
 func TestSQSFIFOIndexedDelayedHeadPrecedesImmediateRedrive(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	t.Cleanup(func() { require.NoError(t, st.Close()) })
 	srv := newDelayTestServer(t, st)

@@ -8,6 +8,7 @@ import (
 )
 
 func TestInflightGateRefusesEntryOnceDraining(t *testing.T) {
+	t.Parallel()
 	gate := newInflightGate()
 	require.True(t, gate.enter())
 	gate.exit()
@@ -24,6 +25,8 @@ func TestInflightGateRefusesEntryOnceDraining(t *testing.T) {
 // An operation that entered before the drain keeps it waiting until it
 // exits; only the first drain waits.
 func TestInflightGateDrainWaitsForRunningOperation(t *testing.T) {
+	// Not parallel: asserts a repeat call returns within 50ms, a bound
+	// CPU contention from parallel tests can exceed.
 	gate := newInflightGate()
 	require.True(t, gate.enter())
 	go func() {
@@ -46,6 +49,8 @@ func TestInflightGateDrainWaitsForRunningOperation(t *testing.T) {
 
 // join waits, once, for an operation that outlived the drain to exit.
 func TestInflightGateJoinWaitsAfterDrainGaveUp(t *testing.T) {
+	// Not parallel: asserts a repeat call returns within 50ms, a bound
+	// CPU contention from parallel tests can exceed.
 	gate := newInflightGate()
 	require.True(t, gate.enter())
 	require.False(t, gate.drain(10*time.Millisecond))
@@ -76,6 +81,7 @@ func TestInflightGateJoinWaitsAfterDrainGaveUp(t *testing.T) {
 // call after Run returns), so a drain that starts while another is still
 // waiting must wait for the same deadline rather than spend a fresh bound.
 func TestInflightGateConcurrentDrainsShareOneDeadline(t *testing.T) {
+	t.Parallel()
 	gate := newInflightGate()
 	require.True(t, gate.enter())
 	firstDrain := make(chan bool, 1)
@@ -91,6 +97,7 @@ func TestInflightGateConcurrentDrainsShareOneDeadline(t *testing.T) {
 // for the operation too: returning at once lets that Stop caller close the
 // stores while the operation unwinds.
 func TestInflightGateConcurrentJoinsShareOneDeadline(t *testing.T) {
+	t.Parallel()
 	gate := newInflightGate()
 	require.True(t, gate.enter())
 	require.False(t, gate.drain(10*time.Millisecond))

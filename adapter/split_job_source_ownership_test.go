@@ -12,6 +12,7 @@ import (
 )
 
 func TestSplitSourceOwnershipCommitsActualZeroFloorAndDataBoundary(t *testing.T) {
+	t.Parallel()
 	root := store.NewMVCCStore()
 	catalog := distribution.NewCatalogStore(root, distribution.WithCatalogRouteDescriptorV2Writes(true))
 	snapshot, err := catalog.Save(t.Context(), 0, []distribution.RouteDescriptor{{RouteID: 1, Start: []byte("a"), End: []byte("z"), GroupID: 7}})

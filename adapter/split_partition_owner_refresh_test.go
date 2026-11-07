@@ -33,6 +33,7 @@ func splitServingSourceFixture(t *testing.T) (store.MigrationServingState, store
 }
 
 func TestSplitServingOwnerSourceFenceSelection(t *testing.T) {
+	t.Parallel()
 	view, guard := splitServingSourceFixture(t)
 	p := kv.MigrationPartitionFromLegacy(view.Ownership[0])
 	require.True(t, splitPartitionHasServingOwner(view), "an unfenced SOURCE still serves")
@@ -65,6 +66,7 @@ func TestSplitServingOwnerSourceFenceSelection(t *testing.T) {
 }
 
 func TestSplitServingOwnersRefreshLegacyCurrentRootAndRequireMembers(t *testing.T) {
+	t.Parallel()
 	h := newPartitionRefreshHarness(t, 7)
 	_, err := h.root.catalog.Save(t.Context(), 1, []distribution.RouteDescriptor{h.parent})
 	require.NoError(t, err)
@@ -82,6 +84,7 @@ func TestSplitServingOwnersRefreshLegacyCurrentRootAndRequireMembers(t *testing.
 }
 
 func TestSplitServingOwnersSkipNegativeOnlyWithoutRemoteEffects(t *testing.T) {
+	t.Parallel()
 	h := newPartitionRefreshHarness(t, 9)
 	h.consumer.ownershipRefresh.root = func(context.Context) (MigrationOwnershipAttestor, error) {
 		return nil, errors.New("unrelated negative root must not be queried")
@@ -92,6 +95,7 @@ func TestSplitServingOwnersSkipNegativeOnlyWithoutRemoteEffects(t *testing.T) {
 }
 
 func TestSplitServingOwnersProtectedSourceWithoutRemoteEffects(t *testing.T) {
+	t.Parallel()
 	h := newPartitionRefreshHarness(t, 9)
 	for _, st := range h.stores {
 		guards, ok := st.(store.MigrationTargetReadinessRaftWriter)
@@ -120,6 +124,7 @@ func TestSplitServingOwnersProtectedSourceWithoutRemoteEffects(t *testing.T) {
 }
 
 func TestSplitServingOwnersUnknownBarrierStaysInOwnerClosure(t *testing.T) {
+	t.Parallel()
 	h := newPartitionRefreshHarness(t, 7)
 	reader, ok := h.stores[0].(store.MigrationOwnershipStore)
 	require.True(t, ok)

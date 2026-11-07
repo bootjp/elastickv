@@ -12,6 +12,7 @@ import (
 )
 
 func TestMigrationResplitDoesNotWaitForOfflineHistoricalNonOwner(t *testing.T) {
+	t.Parallel()
 	r := newResplitAcceptanceRuntime(t)
 	first := r.migrate(t, 1, 2, "m")
 	before, err := r.server.catalog.Snapshot(t.Context())
@@ -50,6 +51,7 @@ func TestSplitRangeWithoutOwnershipDoesNotRequireMigrationProtocols(t *testing.T
 }
 
 func TestMigrationResplitRejectsUnsupportedMemberBeforeCatalogChange(t *testing.T) {
+	t.Parallel()
 	r := newResplitAcceptanceRuntime(t)
 	first := r.migrate(t, 1, 2, "m")
 	owner := r.ownership(t, 2)[0]
