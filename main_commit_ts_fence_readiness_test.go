@@ -80,3 +80,38 @@ func TestCommitTSFenceActivationWaitFailsClosed(t *testing.T) {
 	require.NoError(t, markPublicGateReadyAfterCommitTSFence(ctx, gate, nil, false))
 	require.False(t, gate.blocked())
 }
+
+// The dedicated TSO group never applies the KV activation entry: its runtime
+// store is the TSO control store and its ShardGroup has no KV Store, so the
+// coordinator never proposes the marker there. Readiness must only wait for
+// the KV data groups, but it must still require at least one of them.
+func TestCommitTSFenceReadinessIgnoresDedicatedTSOGroup(t *testing.T) {
+	newRuntime := func(id uint64) (*raftGroupRuntime, kv.FSM) {
+		st, err := store.NewPebbleStore(t.TempDir())
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, st.Close()) })
+		return &raftGroupRuntime{spec: groupSpec{id: id}, store: st}, kv.NewKvFSMWithHLC(st, kv.NewHLC())
+	}
+	tso, _ := newRuntime(dedicatedTSORaftGroupID)
+	data, dataFSM := newRuntime(1)
+
+	active, err := commitTSFenceRuntimesActive(t.Context(), []*raftGroupRuntime{tso})
+	require.NoError(t, err)
+	require.False(t, active, "a TSO-only node has no KV data group to fence")
+
+	runtimes := []*raftGroupRuntime{tso, data}
+	active, err = commitTSFenceRuntimesActive(t.Context(), runtimes)
+	require.NoError(t, err)
+	require.False(t, active)
+
+	require.Nil(t, dataFSM.Apply(kv.EncodeCommitTSFenceActivation()))
+	active, err = commitTSFenceRuntimesActive(t.Context(), runtimes)
+	require.NoError(t, err)
+	require.True(t, active, "the TSO control store never carries the KV marker")
+
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	gate := &startupPublicKVGate{}
+	require.NoError(t, markPublicGateReadyAfterCommitTSFence(ctx, gate, runtimes, true))
+	require.False(t, gate.blocked())
+}

@@ -744,8 +744,10 @@ paths G0 names, behind a replicated activation.
   protected Raft catalog bootstrap configured. The coordinator waits until
   every local protected group reports DataReady before proposing activation
   through maintenance admission. Public listeners stay closed until every
-  local group has applied the marker; DataReady alone does not open the
-  write path before the renewal worker's first activation tick. Legacy
+  local KV data group has applied the marker; DataReady alone does not open
+  the write path before the renewal worker's first activation tick. The
+  dedicated TSO group is excluded from that wait: it applies no KV entries,
+  so its control store never carries the marker. Legacy
   startup rejects both the flag and a previously persisted activation marker:
   its non-Raft catalog writes could
   otherwise advance the watermark on only one replica. Enablement also

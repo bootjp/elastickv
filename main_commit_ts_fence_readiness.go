@@ -58,14 +58,20 @@ func waitForCommitTSFenceActivation(ctx context.Context, runtimes []*raftGroupRu
 	}
 }
 
+// Only KV data groups carry the activation marker. The dedicated TSO group's
+// runtime store is its control store and its ShardGroup has no KV Store, so
+// the coordinator never proposes the activation there; waiting on it would
+// keep public traffic closed forever. At least one data group is required.
 func commitTSFenceRuntimesActive(ctx context.Context, runtimes []*raftGroupRuntime) (bool, error) {
-	if len(runtimes) == 0 {
-		return false, nil
-	}
+	dataGroups := 0
 	for _, runtime := range runtimes {
 		if runtime == nil || runtime.store == nil {
 			return false, nil
 		}
+		if runtime.spec.id == dedicatedTSORaftGroupID {
+			continue
+		}
+		dataGroups++
 		active, err := kv.CommitTSFenceEnabled(ctx, runtime.store)
 		if err != nil {
 			return false, errors.Wrapf(err, "read commit-ts fence activation for group %d", runtime.spec.id)
@@ -74,5 +80,5 @@ func commitTSFenceRuntimesActive(ctx context.Context, runtimes []*raftGroupRunti
 			return false, nil
 		}
 	}
-	return true, nil
+	return dataGroups > 0, nil
 }
