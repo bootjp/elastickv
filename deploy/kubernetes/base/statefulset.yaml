@@ -43,16 +43,14 @@ spec:
           type: RuntimeDefault
       containers:
         - name: elastickv
-          # Example only: pin a tested commit tag or digest before deployment.
-          image: ghcr.io/bootjp/elastickv:latest
-          imagePullPolicy: Always
+          # Built from commit 2f9a88153672d18dcc9d71abfb4b6bdd3ea9983b.
+          image: ghcr.io/bootjp/elastickv@sha256:e8e05151a6d824730b177d8c3e76006737f953bc8b11d44d405a3b0605d0e688
+          imagePullPolicy: IfNotPresent
           command: [/app]
           args:
             - --address=$(POD_NAME).elastickv-peer.$(POD_NAMESPACE).svc:50051
             - --raftId=$(POD_NAME)
             - --raftDataDir=/var/lib/elastickv
-            - --raftBootstrap
-            - --raftBootstrapMembers=elastickv-0=elastickv-0.elastickv-peer.$(POD_NAMESPACE).svc:50051,elastickv-1=elastickv-1.elastickv-peer.$(POD_NAMESPACE).svc:50051,elastickv-2=elastickv-2.elastickv-peer.$(POD_NAMESPACE).svc:50051
             - --redisAddress=0.0.0.0:6379
             - --dynamoAddress=0.0.0.0:8000
             - --raftRedisMap=elastickv-0.elastickv-peer.$(POD_NAMESPACE).svc:50051=elastickv-0.elastickv-peer.$(POD_NAMESPACE).svc:6379,elastickv-1.elastickv-peer.$(POD_NAMESPACE).svc:50051=elastickv-1.elastickv-peer.$(POD_NAMESPACE).svc:6379,elastickv-2.elastickv-peer.$(POD_NAMESPACE).svc:50051=elastickv-2.elastickv-peer.$(POD_NAMESPACE).svc:6379

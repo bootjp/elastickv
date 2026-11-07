@@ -25,8 +25,15 @@ spec:
               elastickv-client: "true"
       ports:
         - protocol: TCP
-          port: 50051
-        - protocol: TCP
           port: 6379
         - protocol: TCP
           port: 8000
+    # The shared Raft/gRPC listener includes unauthenticated RaftAdmin RPCs.
+    # Only peers and explicitly trusted operator namespaces may reach it.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              elastickv-operator: "true"
+      ports:
+        - protocol: TCP
+          port: 50051

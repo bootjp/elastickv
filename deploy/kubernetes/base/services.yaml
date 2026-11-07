@@ -20,12 +20,21 @@ spec:
   selector:
     app.kubernetes.io/name: elastickv
   ports:
-    - name: grpc
-      port: 50051
-      targetPort: raft
     - name: redis
       port: 6379
       targetPort: redis
     - name: dynamodb
       port: 8000
       targetPort: dynamodb
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: elastickv-control
+spec:
+  selector:
+    app.kubernetes.io/name: elastickv
+  ports:
+    - name: raft-admin
+      port: 50051
+      targetPort: raft
