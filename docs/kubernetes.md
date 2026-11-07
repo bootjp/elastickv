@@ -14,7 +14,7 @@ Keep environment inventories and migration execution records outside this reposi
 | --- | --- |
 | StatefulSet `elastickv` | Three voters with stable IDs `elastickv-0` through `elastickv-2` |
 | Headless Service `elastickv-peer` | Per-Pod DNS for Raft communication |
-| ClusterIP Service `elastickv` | Client Redis on 6379 and DynamoDB on 8000 |
+| ClusterIP Service `elastickv` | Client Redis on 6379, DynamoDB on 8000, S3 on 9000, and SQS on 9324 |
 | ClusterIP Service `elastickv-control` | Shared Raft/gRPC port 50051 for trusted operators only |
 | PVC `data-elastickv-N` | An independent 100 GiB persistent volume for each Pod |
 | PodDisruptionBudget | Block all voluntary evictions until maintenance is explicitly coordinated |
@@ -66,6 +66,9 @@ kubectl get pv
 kubectl kustomize deploy/kubernetes/bootstrap > /tmp/elastickv-rendered.yaml
 kubectl apply --dry-run=server -f deploy/kubernetes/base/namespace.yaml
 kubectl apply -f deploy/kubernetes/base/namespace.yaml
+# Supply a private credentials file with real keys; never commit it.
+kubectl -n elastickv create secret generic elastickv-api-credentials \
+  --from-file=credentials.json=/secure/path/credentials.json
 kubectl apply --dry-run=server -k deploy/kubernetes/bootstrap
 kubectl apply -k deploy/kubernetes/bootstrap
 kubectl -n elastickv get pods,pvc -w
@@ -82,14 +85,17 @@ If Pods remain Pending, resolve missing StorageClasses, insufficient PVs, or a l
 Do not bypass these requirements by removing anti-affinity and placing all voters on one node.
 
 Label each permitted client namespace.
-The label grants Redis and DynamoDB access to every Pod in that namespace, so apply it only to namespaces under your control.
+The label grants Redis, DynamoDB, S3, and SQS access to every Pod in that namespace, so apply it only to namespaces under your control.
 It does not grant access to port 50051, which also exposes unauthenticated RaftAdmin membership mutators.
 The client Service deliberately omits gRPC.
 RawKV/TransactionalKV clients must not receive control-port access unless they are trusted operators; supporting untrusted gRPC clients requires a separately authenticated and authorized listener or proxy.
 Do not simply add port 50051 to the client NetworkPolicy.
 Restrict namespace labeling and Pod creation in the server and operator namespaces through RBAC; creating a peer-labeled Pod in the server namespace would grant peer access.
 The CNI must enforce NetworkPolicy.
-Review network isolation and client authentication requirements before exposing Redis or DynamoDB.
+Review network isolation and client authentication requirements before exposing client APIs.
+S3 and SQS require the `elastickv-api-credentials` Secret; missing credentials block startup rather than enable anonymous service.
+The file format is `{"credentials":[{"access_key_id":"YOUR_ACCESS_KEY","secret_access_key":"YOUR_SECRET_KEY"}]}`.
+The base uses `us-east-1` and path-style S3 requests; configure clients with matching credentials and region.
 
 ```sh
 kubectl label namespace <client-namespace> elastickv-client=true
@@ -195,28 +201,113 @@ Do not recreate another member while it is active.
 A container restart of a surviving Pod uses its existing Pod specification; deleting another Pod would instead pick up the temporary learner template.
 See the [learner operations guide](raft_learner_operations.md) for membership commands and recovery constraints.
 
-## Add S3, SQS, the admin dashboard, and monitoring
+## S3 and SQS client endpoints
 
-The server enables gRPC, Redis, and DynamoDB, but ordinary clients can reach only Redis and DynamoDB.
-S3, SQS, the admin dashboard, and FUSE remain disabled.
-For an existing deployment, carry every required API and setting into an environment-specific overlay.
+The base starts S3 and SQS with SigV4 credentials mounted from a Secret.
+The ClusterIP endpoints are `elastickv.elastickv.svc:9000` and `elastickv.elastickv.svc:9324`.
+The peer maps use per-Pod DNS names for internal forwarding, and permitted client namespaces can reach both ports.
+The shared Raft/gRPC port remains isolated from ordinary clients.
+For an existing deployment, carry the existing API settings and credentials into its environment-specific overlay.
 
-- For S3, add `--s3Address=0.0.0.0:9000`, `--s3CredentialsFile`, and `--raftS3Map`, and expose port 9000 in the container, Service, and NetworkPolicy.
-- For SQS, add `--sqsAddress=0.0.0.0:9324`, `--sqsCredentialsFile`, and `--raftSqsMap`, and expose port 9324 in those resources.
-- Match each map's Raft addresses to the bootstrap member list and use individual Pod DNS names as destinations.
-- Mount credentials as files from a Secret. Preserve the existing signing regions, path-style settings, and keys.
-- Configure the admin dashboard according to [admin.md](admin.md), including signing keys, access keys, and TLS or an authenticated reverse proxy.
-- Metrics bind to loopback by default. External scraping requires `--metricsAddress`, `--metricsToken`, a Secret, and appropriate NetworkPolicy rules.
-- If gRPC TLS or authorization is enabled, apply matching settings to peers and operational CLIs.
-- FUSE requires additional host privileges; review its [dedicated guide](filesystem.md) and placement requirements separately.
+For local checks, use `kubectl -n elastickv port-forward service/elastickv 9000:9000 9324:9324`.
+With matching AWS CLI credentials configured outside the repository, test S3 bucket creation, upload, download, and deletion through `http://127.0.0.1:9000`.
+For SQS, test queue creation, send, receive, delete-message, and delete-queue through `http://127.0.0.1:9324`.
+Verify the same operations after a leader change, including the URLs returned to clients.
 
-Manage external Services, Ingress, fixed IPs, and DNS changes in the environment-specific overlay.
-For APIs that return redirects or endpoint addresses, verify that clients can reach the returned addresses.
+### Optional HTTPS exposure outside the cluster
+
+Keep the base Service as ClusterIP.
+The example at `deploy/kubernetes/examples/https/` exposes only S3 and SQS through a TLS Ingress, so the same base works for internal, LAN, or internet-facing deployments.
+The Ingress Controller, public DNS, certificate, and network boundary are deployment-specific.
+The example domains under `example.test` and `example-controller` ingress class are placeholders.
+
+Before applying the example:
+
+1. Build and publish the root Dockerfile from a source revision containing `--sqsPublicEndpoint`. The base's pinned historical image supports the internal APIs but does not contain this new flag. Replace the example's deliberately unusable image reference with the new image's immutable digest.
+2. Replace the two hostnames, ingress class, and `--sqsPublicEndpoint=https://sqs.example.test` with the intended public endpoints. Configure the same SQS public endpoint on every member. Only an HTTP(S) origin is accepted; credentials, path prefixes, query strings, and fragments are rejected.
+3. Create the `elastickv-api-tls` Secret in the server namespace from a certificate and private key covering both hosts. Keep the SigV4 credentials Secret configured as above.
+4. Label the trusted Ingress Controller namespace with `elastickv-ingress=true`. The example's NetworkPolicy allows that namespace to reach only ports 9000 and 9324. Restrict permission to change this label. Controllers using host networking or different source identities need a policy tailored to the CNI's actual traffic path.
+5. Configure the controller to reject or redirect plaintext HTTP and enforce the intended source restrictions. An Ingress `tls` stanza alone does not require HTTPS. Backend HTTP must remain inside the trusted network; use an encrypted upstream configuration if that network is untrusted.
+6. Preserve the signed Host, path, and query string; do not rewrite API paths. Configure streaming, upload limits, and timeouts for S3 objects and SQS long polling using the chosen controller's settings.
+
+```sh
+kubectl apply --dry-run=server -k deploy/kubernetes/examples/https
+kubectl apply -k deploy/kubernetes/examples/https
+```
+
+Apply this example to an initialized cluster and use the one-member update workflow.
+Its template includes the SQS public endpoint flag; keep using the environment's HTTPS overlay for subsequent updates and member replacements rather than reverting to a base that omits that setting.
+Compose the necessary learner flags with the same public settings during replacement.
+A brand-new deployment must compose its public settings with the bootstrap overlay first, then remove only the bootstrap flags before admitting writes.
+
+`--sqsPublicEndpoint` controls the URLs returned by CreateQueue, GetQueueUrl, and ListQueues.
+It does not enable TLS itself and does not trust `X-Forwarded-*` headers.
+Without it, URLs continue to derive their scheme from the request's actual TLS state and their host from the request.
+Verify that every returned QueueUrl uses the public HTTPS origin and can be used for subsequent signed requests, including when a follower forwards the request.
+
+## Share the FUSE filesystem within a Pod
+
+The example at `deploy/kubernetes/examples/fuse/` enables the filesystem on the server and shares its mount with a second container in the same Pod.
+It does not expose a filesystem network port or an NFS/SMB server.
+The file tree remains stored in Elastickv's replicated store.
+The example consumer is an idle placeholder; replace it with the application that needs filesystem access.
+
+The standard distroless image lacks `fusermount3`.
+Build the example Dockerfile, which adds `fuse3`, `util-linux`, and a named UID/GID 65532 account to a Debian runtime while copying `/app` from a pinned server image:
+
+```sh
+docker build --platform linux/amd64 \
+  --build-arg ELASTICKV_IMAGE=ghcr.io/bootjp/elastickv@sha256:<server-digest> \
+  -f deploy/kubernetes/examples/fuse/Dockerfile \
+  -t <registry>/elastickv-fuse:<version> .
+docker push <registry>/elastickv-fuse:<version>
+```
+
+Replace `example.invalid/elastickv-fuse:build-required` in the overlay with the resulting image digest before applying it.
+Choose a server image containing every flag required by the deployment; an HTTPS/FUSE combination needs the new SQS public endpoint flag as well.
+The example applies to an initialized cluster and inherits the base's Secret requirements, persistent data, and client APIs.
+
+The node must provide `/dev/fuse`.
+The server container is privileged, uses unconfined seccomp/AppArmor, and mounts `/dev/fuse` plus a memory-backed shared directory.
+Bidirectional mount propagation exports the mount to that directory; the consumer uses HostToContainer propagation to receive it.
+The mountpoint is `/shared/fs` in both containers.
+These permissions belong only in an explicitly approved namespace/node configuration; they are not added to the base.
+Pod Security admission or local policy may intentionally reject this example until that approval is in place.
+
+Both containers inherit UID/GID 65532 because the filesystem does not enable `allow_other`.
+Use the same UID for the consuming application and ensure the persisted filesystem root is owned by that UID.
+`--filesystemRootUID` and `--filesystemRootGID` set ownership only at first root creation; they do not repair an existing root.
+Readiness checks the FUSE mount and performs directory I/O rather than relying on the Redis listener alone.
+The memory-backed shared directory carries the mount; its size limit is not a quota for the replicated filesystem.
+
+```sh
+kubectl apply --dry-run=server -k deploy/kubernetes/examples/fuse
+kubectl apply -k deploy/kubernetes/examples/fuse
+# Recreate one member at a time and verify catch-up using the maintenance workflow.
+kubectl -n elastickv exec elastickv-0 -c filesystem-consumer -- \
+  sh -ec 'mkdir -p /shared/fs/check; printf "hello\n" > /shared/fs/check/file; cat /shared/fs/check/file'
+```
+
+Check that a consumer on another member sees the file through a fresh open, then verify data after a server restart and remove the test file.
+Before starting the consuming workload, check the mount's actual I/O; a stale mount can remain in the mount table after a crash.
+Applications must stop using the filesystem before the server unmounts it.
+Review [filesystem.md](filesystem.md) for supported operations, per-mount locking limits, cache behavior, and crash recovery.
+Container startup alone does not validate mount propagation: run a create/read/write/delete and restart test on the intended Linux nodes.
+If combining HTTPS and FUSE, compose both sets of settings into one environment overlay; applying either standalone example replaces the StatefulSet template and loses the other's additions.
+
+## Add the admin dashboard and monitoring
+
+The admin dashboard remains disabled in the base.
+Configure it according to [admin.md](admin.md), including signing keys, access keys, and TLS or an authenticated reverse proxy.
+Metrics bind to loopback by default; external scraping requires `--metricsAddress`, `--metricsToken`, a Secret, and appropriate NetworkPolicy rules.
+If gRPC TLS or authorization is enabled, apply matching settings to peers and operational CLIs.
 
 ## References
 
 - [Kubernetes StatefulSets](https://kubernetes.io/docs/concepts/workloads/controllers/statefulset/)
 - [Kubernetes Local volumes](https://kubernetes.io/docs/concepts/storage/volumes/#local)
+- [Kubernetes Ingress](https://kubernetes.io/docs/concepts/services-networking/ingress/)
+- [Kubernetes mount propagation](https://kubernetes.io/docs/concepts/storage/volumes/#mount-propagation)
 - [Kubernetes disruption budgets](https://kubernetes.io/docs/tasks/run-application/configure-pdb/)
 - [Live Logical Backup](operations/backup_restore.md)
 - [Snapshot Restore](operations/snapshot_restore.md)

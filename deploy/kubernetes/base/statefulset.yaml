@@ -55,6 +55,15 @@ spec:
             - --dynamoAddress=0.0.0.0:8000
             - --raftRedisMap=elastickv-0.elastickv-peer.$(POD_NAMESPACE).svc:50051=elastickv-0.elastickv-peer.$(POD_NAMESPACE).svc:6379,elastickv-1.elastickv-peer.$(POD_NAMESPACE).svc:50051=elastickv-1.elastickv-peer.$(POD_NAMESPACE).svc:6379,elastickv-2.elastickv-peer.$(POD_NAMESPACE).svc:50051=elastickv-2.elastickv-peer.$(POD_NAMESPACE).svc:6379
             - --raftDynamoMap=elastickv-0.elastickv-peer.$(POD_NAMESPACE).svc:50051=elastickv-0.elastickv-peer.$(POD_NAMESPACE).svc:8000,elastickv-1.elastickv-peer.$(POD_NAMESPACE).svc:50051=elastickv-1.elastickv-peer.$(POD_NAMESPACE).svc:8000,elastickv-2.elastickv-peer.$(POD_NAMESPACE).svc:50051=elastickv-2.elastickv-peer.$(POD_NAMESPACE).svc:8000
+            - --s3Address=0.0.0.0:9000
+            - --s3Region=us-east-1
+            - --s3PathStyleOnly=true
+            - --s3CredentialsFile=/etc/elastickv/api/credentials.json
+            - --raftS3Map=elastickv-0.elastickv-peer.$(POD_NAMESPACE).svc:50051=elastickv-0.elastickv-peer.$(POD_NAMESPACE).svc:9000,elastickv-1.elastickv-peer.$(POD_NAMESPACE).svc:50051=elastickv-1.elastickv-peer.$(POD_NAMESPACE).svc:9000,elastickv-2.elastickv-peer.$(POD_NAMESPACE).svc:50051=elastickv-2.elastickv-peer.$(POD_NAMESPACE).svc:9000
+            - --sqsAddress=0.0.0.0:9324
+            - --sqsRegion=us-east-1
+            - --sqsCredentialsFile=/etc/elastickv/api/credentials.json
+            - --raftSqsMap=elastickv-0.elastickv-peer.$(POD_NAMESPACE).svc:50051=elastickv-0.elastickv-peer.$(POD_NAMESPACE).svc:9324,elastickv-1.elastickv-peer.$(POD_NAMESPACE).svc:50051=elastickv-1.elastickv-peer.$(POD_NAMESPACE).svc:9324,elastickv-2.elastickv-peer.$(POD_NAMESPACE).svc:50051=elastickv-2.elastickv-peer.$(POD_NAMESPACE).svc:9324
             - --pprofAddress=
           env:
             - name: POD_NAME
@@ -74,6 +83,10 @@ spec:
               containerPort: 6379
             - name: dynamodb
               containerPort: 8000
+            - name: s3
+              containerPort: 9000
+            - name: sqs
+              containerPort: 9324
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -105,9 +118,16 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/elastickv
+            - name: api-credentials
+              mountPath: /etc/elastickv/api
+              readOnly: true
             - name: tmp
               mountPath: /tmp
       volumes:
+        - name: api-credentials
+          secret:
+            secretName: elastickv-api-credentials
+            defaultMode: 0440
         - name: tmp
           emptyDir:
             sizeLimit: 256Mi

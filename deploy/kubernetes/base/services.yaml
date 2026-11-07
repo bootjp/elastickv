@@ -26,6 +26,12 @@ spec:
     - name: dynamodb
       port: 8000
       targetPort: dynamodb
+    - name: s3
+      port: 9000
+      targetPort: s3
+    - name: sqs
+      port: 9324
+      targetPort: sqs
 ---
 apiVersion: v1
 kind: Service

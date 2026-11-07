@@ -175,6 +175,8 @@ go run . \
   --raftBootstrap
 ```
 
+When SQS runs behind a TLS-terminating proxy, set `--sqsPublicEndpoint "https://sqs.example.test"` to make CreateQueue, GetQueueUrl, and ListQueues return the public HTTPS origin. This setting accepts an HTTP(S) origin without a path prefix and does not enable TLS on the listener.
+
 The S3 and SQS listeners can share a static credentials file. Create `/etc/elastickv/credentials.json` before starting the server, with credentials matching the client configuration:
 
 ```json

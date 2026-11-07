@@ -19,6 +19,10 @@ spec:
           port: 6379
         - protocol: TCP
           port: 8000
+        - protocol: TCP
+          port: 9000
+        - protocol: TCP
+          port: 9324
     - from:
         - namespaceSelector:
             matchLabels:
@@ -28,6 +32,10 @@ spec:
           port: 6379
         - protocol: TCP
           port: 8000
+        - protocol: TCP
+          port: 9000
+        - protocol: TCP
+          port: 9324
     # The shared Raft/gRPC listener includes unauthenticated RaftAdmin RPCs.
     # Only peers and explicitly trusted operator namespaces may reach it.
     - from:
