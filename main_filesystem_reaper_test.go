@@ -9,6 +9,7 @@ import (
 )
 
 func TestRunFilesystemLeaseReaperSkipsCanceledContext(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	reaper := &testFilesystemLeaseReaper{cancel: cancel}
@@ -18,6 +19,7 @@ func TestRunFilesystemLeaseReaperSkipsCanceledContext(t *testing.T) {
 }
 
 func TestRunFilesystemLeaseReaperCancellationWinsOverReadyTick(t *testing.T) {
+	t.Parallel()
 	for range 50 {
 		ctx, cancel := context.WithCancel(t.Context())
 		t.Cleanup(cancel)

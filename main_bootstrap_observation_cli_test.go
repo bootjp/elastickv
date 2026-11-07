@@ -23,6 +23,7 @@ func observationSyntaxArgs(root, command string) []string {
 }
 
 func TestBootstrapObservationStrictSyntax(t *testing.T) {
+	t.Parallel()
 	for _, command := range []string{"probe", "manifest"} {
 		args := observationSyntaxArgs(t.TempDir(), command)
 		_, err := parseBootstrapObservationCommand(args)
@@ -48,6 +49,7 @@ func TestBootstrapObservationStrictSyntax(t *testing.T) {
 }
 
 func TestBootstrapObservationPinsAndMeasuredConfig(t *testing.T) {
+	t.Parallel()
 	r, raw, _, _ := baselineCLIFixtureWithSigners(t)
 	expectedRaw, err := json.Marshal(raw)
 	require.NoError(t, err)
@@ -111,6 +113,7 @@ func observationManifestFixture(t *testing.T) ([]string, string) {
 }
 
 func TestBootstrapObservationManifestExactAndExclusive(t *testing.T) {
+	t.Parallel()
 	args, root := observationManifestFixture(t)
 	before := offlineDataFiles(t, root)
 	handled, err := dispatchBootstrapOperator(args, io.Discard)
@@ -129,6 +132,7 @@ func TestBootstrapObservationManifestExactAndExclusive(t *testing.T) {
 }
 
 func TestBootstrapObservationManifestRejectsDivergence(t *testing.T) {
+	t.Parallel()
 	for _, scenario := range []string{"missing", "duplicate", "foreign operation", "bad signature", "review mismatch"} {
 		t.Run(scenario, func(t *testing.T) {
 			args, root := observationManifestFixture(t)

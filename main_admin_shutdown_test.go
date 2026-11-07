@@ -15,6 +15,7 @@ import (
 )
 
 func TestAdminHandlerDrainJoinsHandlerAfterForcedClose(t *testing.T) {
+	t.Parallel()
 	entered, release := make(chan struct{}), make(chan struct{})
 	srv := &http.Server{ReadHeaderTimeout: time.Second, Handler: http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		close(entered)

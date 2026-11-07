@@ -54,6 +54,7 @@ func loadBootstrapFixture(t *testing.T, data []byte) (*bootstrapPeerConfig, erro
 }
 
 func TestBootstrapPeerConfigValid(t *testing.T) {
+	t.Parallel()
 	raw := bootstrapConfigFixture(t)
 	raw.Members[0].Groups = []uint64{0, 1}
 	data, err := json.Marshal(raw)
@@ -74,6 +75,7 @@ func TestBootstrapPeerConfigValid(t *testing.T) {
 }
 
 func TestBootstrapPeerConfigRejectJSON(t *testing.T) {
+	t.Parallel()
 	raw := bootstrapConfigFixture(t)
 	data, err := json.Marshal(raw)
 	require.NoError(t, err)
@@ -92,6 +94,7 @@ func TestBootstrapPeerConfigRejectJSON(t *testing.T) {
 }
 
 func TestBootstrapPeerConfigRejectIdentityAndPKI(t *testing.T) {
+	t.Parallel()
 	cases := map[string]func(*bootstrapPeerJSON){
 		"zero cluster":         func(r *bootstrapPeerJSON) { r.Cluster = "00000000-0000-0000-0000-000000000000" },
 		"zero local":           func(r *bootstrapPeerJSON) { r.Local = 0 },

@@ -80,6 +80,8 @@ func ownershipRefreshRootCatalog(t *testing.T) (store.MVCCStore, *distribution.C
 }
 
 func TestOwnershipRefreshDifferentRaftLeadersRespectExplicitClosedGate(t *testing.T) {
+	// Not parallel: internalutil.ConfigureGRPCTLS replaces the process-global
+	// TLS config that every gRPC server and dialer in the process reads.
 	cert, key := writeSelfSignedCert(t)
 	require.NoError(t, internalutil.ConfigureGRPCTLS(cert, cert, key))
 	t.Cleanup(func() { require.NoError(t, internalutil.ConfigureGRPCTLS("", "", "")) })

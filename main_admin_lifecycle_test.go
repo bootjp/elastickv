@@ -84,6 +84,7 @@ func TestRegisterAdminLifecycleReturnsCleanAfterForcedClose(t *testing.T) {
 // stopping is answered like a follower's (503 with Retry-After), so the
 // client retries against another node instead of seeing a 500.
 func TestTranslateAdminObjectsErrorMapsStoppingToNotLeader(t *testing.T) {
+	t.Parallel()
 	err := translateAdminObjectsError(errors.Wrap(adapter.ErrAdminS3Stopping, "admin put"))
 	require.ErrorIs(t, err, admin.ErrObjectsNotLeader)
 }

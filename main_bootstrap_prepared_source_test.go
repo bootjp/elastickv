@@ -26,6 +26,7 @@ func bootstrapPreparedSourceFixture(t *testing.T) (kv.PreparedBootstrapActivatio
 }
 
 func TestPreparedSnapshotSourceRequiresFullIndependentArtifact(t *testing.T) {
+	t.Parallel()
 	prepared, expected, artifact, _ := bootstrapPreparedSourceFixture(t)
 	require.NotEqual(t, prepared.Probe.Evidence.MemberID, expected.NodeID)
 	require.Error(t, validatePreparedBootstrapIdentity(prepared, expected), "original local-preparation check remains strict")
@@ -43,6 +44,7 @@ func TestPreparedSnapshotSourceRequiresFullIndependentArtifact(t *testing.T) {
 }
 
 func TestPreparedSnapshotSourceRejectsConflictingBindings(t *testing.T) {
+	t.Parallel()
 	changes := map[string]func(*kv.PreparedBootstrapActivation, *etcd.WALIdentity, []byte){
 		"manifest digest": func(p *kv.PreparedBootstrapActivation, _ *etcd.WALIdentity, _ []byte) { p.ManifestDigest[0]++ },
 		"WAL digest":      func(_ *kv.PreparedBootstrapActivation, w *etcd.WALIdentity, _ []byte) { w.PreparationDigest[0]++ },
@@ -69,6 +71,7 @@ func TestPreparedSnapshotSourceRejectsConflictingBindings(t *testing.T) {
 }
 
 func TestPreparedSnapshotSourceRequiresExactSignedEvidence(t *testing.T) {
+	t.Parallel()
 	prepared, expected, artifact, source := bootstrapPreparedSourceFixture(t)
 	prepared.Probe.Evidence.NativeStateDigest[0]++
 	signer, ok := source.clientTLS.Certificates[0].PrivateKey.(crypto.Signer)
@@ -80,6 +83,7 @@ func TestPreparedSnapshotSourceRequiresExactSignedEvidence(t *testing.T) {
 }
 
 func TestPreparedSnapshotLocalCompatibilityDoesNotWeakenMemberCheck(t *testing.T) {
+	t.Parallel()
 	prepared, expected, _, _ := bootstrapPreparedSourceFixture(t)
 	expected.NodeID = prepared.Probe.Evidence.MemberID
 	require.NoError(t, validateRuntimePreparedBootstrapIdentity(prepared, expected, nil))
@@ -90,6 +94,7 @@ func TestPreparedSnapshotLocalCompatibilityDoesNotWeakenMemberCheck(t *testing.T
 }
 
 func TestPreparedSnapshotCannotPublishWithoutVerifiedLocalWAL(t *testing.T) {
+	t.Parallel()
 	_, expected, artifact, _ := bootstrapPreparedSourceFixture(t)
 	err := publishPreparedBootstrapRecovery(nil, raftadmission.RecoveryTicket{}, nil, nil, nil, expected, etcd.RecoveredState{}, artifact)
 	require.ErrorIs(t, err, etcd.ErrWALIdentity, "even a complete artifact cannot mint native lineage or readiness")

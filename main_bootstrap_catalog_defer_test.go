@@ -15,6 +15,7 @@ import (
 )
 
 func TestBootstrapCatalogDeferExactTypedClassification(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name  string
 		err   error
@@ -51,6 +52,7 @@ func TestBootstrapCatalogDeferExactTypedClassification(t *testing.T) {
 }
 
 func TestBootstrapCatalogDeferHealthyStaleNeverPublishesLoaded(t *testing.T) {
+	t.Parallel()
 	for _, observation := range []error{raftadmission.ErrStale, distribution.ErrEngineSnapshotVersionStale} {
 		t.Run(observation.Error(), func(t *testing.T) {
 			domain := bootstrapIngressFixture(t).domain
@@ -71,6 +73,7 @@ func TestBootstrapCatalogDeferHealthyStaleNeverPublishesLoaded(t *testing.T) {
 }
 
 func TestBootstrapCatalogDeferRequiresLiveContextAndHealthyTicket(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name    string
 		prepare func(*testing.T, *bootstrapDomain) (context.Context, *bootstrapDomain, uint64)
