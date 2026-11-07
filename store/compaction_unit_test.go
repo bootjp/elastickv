@@ -7,11 +7,13 @@ import (
 )
 
 func TestCompactKeepIndex_EmptyVersions(t *testing.T) {
+	t.Parallel()
 	assert.Equal(t, -1, compactKeepIndex(nil, 100))
 	assert.Equal(t, -1, compactKeepIndex([]VersionedValue{}, 100))
 }
 
 func TestCompactKeepIndex_AllNewerThanMinTS(t *testing.T) {
+	t.Parallel()
 	// Versions stored in ascending order (oldest first) as in mvccStore.
 	versions := []VersionedValue{
 		{TS: 100, Value: []byte("v100")},
@@ -21,6 +23,7 @@ func TestCompactKeepIndex_AllNewerThanMinTS(t *testing.T) {
 }
 
 func TestCompactKeepIndex_SingleVersionEqualMinTS(t *testing.T) {
+	t.Parallel()
 	versions := []VersionedValue{
 		{TS: 100, Value: []byte("v100")},
 	}
@@ -29,6 +32,7 @@ func TestCompactKeepIndex_SingleVersionEqualMinTS(t *testing.T) {
 }
 
 func TestCompactKeepIndex_SingleVersionBelowMinTS(t *testing.T) {
+	t.Parallel()
 	versions := []VersionedValue{
 		{TS: 50, Value: []byte("v50")},
 	}
@@ -37,6 +41,7 @@ func TestCompactKeepIndex_SingleVersionBelowMinTS(t *testing.T) {
 }
 
 func TestCompactKeepIndex_TwoVersionsOldestKept(t *testing.T) {
+	t.Parallel()
 	// Versions stored in ascending order (oldest first) as in mvccStore.
 	versions := []VersionedValue{
 		{TS: 100, Value: []byte("v100")},
@@ -48,6 +53,7 @@ func TestCompactKeepIndex_TwoVersionsOldestKept(t *testing.T) {
 }
 
 func TestCompactKeepIndex_MultipleVersions(t *testing.T) {
+	t.Parallel()
 	// Versions stored in ascending order (oldest first) as in mvccStore.
 	versions := []VersionedValue{
 		{TS: 100, Value: []byte("v100")},
@@ -60,6 +66,7 @@ func TestCompactKeepIndex_MultipleVersions(t *testing.T) {
 }
 
 func TestCompactKeepIndex_AllBelowMinTS(t *testing.T) {
+	t.Parallel()
 	// Versions stored in ascending order (oldest first).
 	versions := []VersionedValue{
 		{TS: 10, Value: []byte("v10")},
@@ -72,44 +79,53 @@ func TestCompactKeepIndex_AllBelowMinTS(t *testing.T) {
 }
 
 func TestKeyUpperBound_SimpleKey(t *testing.T) {
+	t.Parallel()
 	upper := keyUpperBound([]byte("abc"))
 	assert.Equal(t, []byte("abd"), upper)
 }
 
 func TestKeyUpperBound_TrailingFF(t *testing.T) {
+	t.Parallel()
 	upper := keyUpperBound([]byte("ab\xff"))
 	assert.Equal(t, []byte("ac"), upper)
 }
 
 func TestKeyUpperBound_AllFF(t *testing.T) {
+	t.Parallel()
 	upper := keyUpperBound([]byte{0xff, 0xff, 0xff})
 	assert.Nil(t, upper, "all 0xFF key has no finite upper bound")
 }
 
 func TestKeyUpperBound_SingleByte(t *testing.T) {
+	t.Parallel()
 	upper := keyUpperBound([]byte{0x00})
 	assert.Equal(t, []byte{0x01}, upper)
 }
 
 func TestKeyUpperBound_EmptyKey(t *testing.T) {
+	t.Parallel()
 	upper := keyUpperBound([]byte{})
 	// Empty key: loop doesn't execute → returns nil
 	assert.Nil(t, upper)
 }
 
 func TestPastScanEnd_NilEnd(t *testing.T) {
+	t.Parallel()
 	assert.False(t, pastScanEnd([]byte("abc"), nil))
 }
 
 func TestPastScanEnd_KeyBeforeEnd(t *testing.T) {
+	t.Parallel()
 	assert.False(t, pastScanEnd([]byte("abc"), []byte("def")))
 }
 
 func TestPastScanEnd_KeyEqualsEnd(t *testing.T) {
+	t.Parallel()
 	// Exclusive: key == end should be past the end
 	assert.True(t, pastScanEnd([]byte("abc"), []byte("abc")))
 }
 
 func TestPastScanEnd_KeyAfterEnd(t *testing.T) {
+	t.Parallel()
 	assert.True(t, pastScanEnd([]byte("def"), []byte("abc")))
 }

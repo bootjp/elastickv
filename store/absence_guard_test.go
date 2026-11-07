@@ -87,6 +87,7 @@ func TestApplyMutationsRequireAbsentAllowsOnlyOneConcurrentWinner(t *testing.T) 
 }
 
 func TestApplyRaftEntryAbsenceGuardSeesEarlierRequest(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s := newApplyIndexPebbleStore(t)
 	applier := raftEntryApplier(t, s)

@@ -11,6 +11,7 @@ import (
 )
 
 func TestSnapshotTSDoesNotUseHLC(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	require.NoError(t, st.PutAt(context.Background(), []byte("key"), []byte("v"), 10, 0))
 
@@ -25,6 +26,7 @@ func TestSnapshotTSDoesNotUseHLC(t *testing.T) {
 }
 
 func TestSnapshotTSFallbackWhenStoreEmpty(t *testing.T) {
+	t.Parallel()
 	clock := kv.NewHLC()
 	st := store.NewMVCCStore()
 
@@ -34,6 +36,7 @@ func TestSnapshotTSFallbackWhenStoreEmpty(t *testing.T) {
 }
 
 func TestSnapshotTSNilStore(t *testing.T) {
+	t.Parallel()
 	clock := kv.NewHLC()
 	ts := snapshotTS(clock, nil)
 	assert.Equal(t, ^uint64(0), ts,
@@ -41,6 +44,7 @@ func TestSnapshotTSNilStore(t *testing.T) {
 }
 
 func TestSnapshotTSNilClock(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	require.NoError(t, st.PutAt(context.Background(), []byte("k"), []byte("v"), 42, 0))
 

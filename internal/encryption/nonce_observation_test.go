@@ -8,6 +8,7 @@ import (
 )
 
 func TestNonceIdentityObservationDoesNotConsumeNonce(t *testing.T) {
+	t.Parallel()
 	f := NewDeterministicNonceFactory(123, 7)
 	node, epoch, exhausted := f.NonceIdentity()
 	require.Equal(t, uint16(123), node)

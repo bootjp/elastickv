@@ -135,6 +135,7 @@ func (c *ownershipCatalogCoordinator) LinearizableReadForKey(ctx context.Context
 }
 
 func TestSplitOwnershipRollbackActualCommittedCAndTargetDown(t *testing.T) {
+	t.Parallel()
 	for _, changeConfiguration := range []bool{false, true} {
 		t.Run(map[bool]string{false: "normal", true: "configuration interleaving"}[changeConfiguration], func(t *testing.T) {
 			catalogStore := store.NewMVCCStore()
@@ -211,6 +212,7 @@ func TestSplitOwnershipRollbackActualCommittedCAndTargetDown(t *testing.T) {
 }
 
 func TestMigrationOwnershipCapabilityDefaultDenyAndUnknownEpoch(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	client, _ := newOwnershipRuntimeClient(t, st, 7)
 	req := &pb.ProbeMigrationStateRequest{JobId: 7, Kind: pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_OWNERSHIP_CAPABILITY, RequireConfigurationIndex: true}
@@ -230,6 +232,7 @@ func TestMigrationOwnershipCapabilityDefaultDenyAndUnknownEpoch(t *testing.T) {
 }
 
 func TestSplitOwnershipCapabilityRejectsOldUnknownFieldEcho(t *testing.T) {
+	t.Parallel()
 	old := &splitMigrationClientStub{}
 	server := &DistributionServer{splitMigrationVoterFactory: func(context.Context, uint64) ([]SplitMigrationVoter, error) {
 		return []SplitMigrationVoter{{ID: "old", Address: "old:1", Client: old}}, nil
@@ -239,6 +242,7 @@ func TestSplitOwnershipCapabilityRejectsOldUnknownFieldEcho(t *testing.T) {
 }
 
 func TestAttestUnchangedMigrationOwnershipUsesCommittedDescriptor(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	catalog := distribution.NewCatalogStore(st, distribution.WithCatalogRouteDescriptorV2Writes(true))
 	routes := []distribution.RouteDescriptor{

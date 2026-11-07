@@ -645,6 +645,7 @@ func TestBeginBackupCapturesRouteSnapshotAfterReadFence(t *testing.T) {
 }
 
 func TestBeginBackupWaitsForLocalPinApplyBeforeCatalogCapture(t *testing.T) {
+	t.Parallel()
 	store := &backupTestStore{}
 	group := &backupTestGroup{status: raftengine.Status{}, every: 10_000}
 	proposer := newBackupTestProposer()

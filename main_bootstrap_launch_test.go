@@ -51,6 +51,7 @@ func TestProtectedBootstrapLaunchRequiresExactDurableFormat(t *testing.T) {
 }
 
 func TestProtectedRuntimeReadinessRemainsRevocable(t *testing.T) {
+	t.Parallel()
 	ready := false
 	runtimes := []*raftGroupRuntime{{publicReady: func() bool { return ready }}}
 	gate := &startupPublicKVGate{blockRuntime: func() bool { return protectedRuntimesBlocked(runtimes) }}

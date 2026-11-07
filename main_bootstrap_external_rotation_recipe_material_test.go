@@ -52,6 +52,7 @@ func (w *externalRotationObservedUnwrap) Unwrap(wrapped []byte) ([]byte, error) 
 }
 
 func TestBootstrapExternalRotationRecipeMaterialPlaintextCleared(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name   string
 		id     uint32
@@ -91,6 +92,7 @@ func TestBootstrapExternalRotationRecipeMaterialPlaintextCleared(t *testing.T) {
 }
 
 func TestBootstrapExternalRotationRecipeRejectsSameIDRewrappedMaterial(t *testing.T) {
+	t.Parallel()
 	f := newExternalRotationMaterialFixture(t)
 	req := externalRotationMaterialReplay(t, f, true, false, true)
 	req.NewDekId = 1
@@ -128,6 +130,7 @@ func externalRotationMaterialReplay(t *testing.T, f *rotationRecipeFixture, same
 }
 
 func TestBootstrapExternalRotationRecipeRejectsReusedMaterial(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name                            string
 		samePurpose, retired, rewrapped bool

@@ -19,6 +19,7 @@ import (
 )
 
 func TestParseRaftLeaderRedis(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		in   string
@@ -53,6 +54,7 @@ func TestParseRaftLeaderRedis(t *testing.T) {
 }
 
 func TestNormalizeSeedsDedupesAndTrims(t *testing.T) {
+	t.Parallel()
 	got := normalizeSeeds([]string{" a:1 ", "b:2", "a:1", "", "c:3 "})
 	assert.Equal(t, []string{"a:1", "b:2", "c:3"}, got)
 }
@@ -231,6 +233,7 @@ func readRESPArray(rd *bufio.Reader) ([]string, error) {
 }
 
 func TestLeaderAwareRedisBackend_FollowsLeaderChange(t *testing.T) {
+	t.Parallel()
 	nodeA := newFakeElasticKVNode(t)
 	nodeB := newFakeElasticKVNode(t)
 
@@ -276,6 +279,7 @@ func TestLeaderAwareRedisBackend_FollowsLeaderChange(t *testing.T) {
 }
 
 func TestLeaderAwareRedisBackend_NotLeaderRefreshesWithoutReplay(t *testing.T) {
+	t.Parallel()
 	nodeA := newFakeElasticKVNode(t)
 	nodeB := newFakeElasticKVNode(t)
 	nodeA.SetLeader(nodeA.addr)
@@ -305,6 +309,7 @@ func TestLeaderAwareRedisBackend_NotLeaderRefreshesWithoutReplay(t *testing.T) {
 }
 
 func TestLeaderAwareRedisBackend_ScriptNotLeaderRefreshesWithoutReplay(t *testing.T) {
+	t.Parallel()
 	nodeA := newFakeElasticKVNode(t)
 	nodeB := newFakeElasticKVNode(t)
 	nodeA.SetLeader(nodeA.addr)
@@ -334,6 +339,7 @@ func TestLeaderAwareRedisBackend_ScriptNotLeaderRefreshesWithoutReplay(t *testin
 }
 
 func TestLeaderAwareRedisBackend_DoWithReadTimeoutWaitsForInitialLeaderDiscovery(t *testing.T) {
+	t.Parallel()
 	node := newFakeElasticKVNode(t)
 	node.SetLeader(node.addr)
 	gate := make(chan struct{})
@@ -376,6 +382,7 @@ func TestLeaderAwareRedisBackend_DoWithReadTimeoutWaitsForInitialLeaderDiscovery
 }
 
 func TestLeaderAwareRedisBackend_DoesNotRetryScriptNotLeaderRedisError(t *testing.T) {
+	t.Parallel()
 	node := newFakeElasticKVNode(t)
 	node.SetLeader(node.addr)
 	node.SetScriptNotLeaderError(true)
@@ -400,6 +407,7 @@ func TestLeaderAwareRedisBackend_DoesNotRetryScriptNotLeaderRedisError(t *testin
 }
 
 func TestLeaderAwareRedisBackend_CoalescesConcurrentRefreshes(t *testing.T) {
+	t.Parallel()
 	node := newFakeElasticKVNode(t)
 	node.SetLeader(node.addr)
 
@@ -459,6 +467,7 @@ func TestLeaderAwareRedisBackend_CoalescesConcurrentRefreshes(t *testing.T) {
 }
 
 func TestLeaderAwareRedisBackend_RefreshOutlivesCallerDeadline(t *testing.T) {
+	t.Parallel()
 	node := newFakeElasticKVNode(t)
 	node.SetLeader(node.addr)
 
@@ -494,6 +503,7 @@ func TestLeaderAwareRedisBackend_RefreshOutlivesCallerDeadline(t *testing.T) {
 }
 
 func TestLeaderRefreshTransportErrorClassification(t *testing.T) {
+	t.Parallel()
 	require.True(t, isLeaderRefreshTransportError(io.EOF))
 	require.True(t, isLeaderRefreshTransportError(&net.OpError{Op: "read", Err: errors.New("connection reset by peer")}))
 	require.False(t, isLeaderRefreshTransportError(context.Canceled))
@@ -502,6 +512,7 @@ func TestLeaderRefreshTransportErrorClassification(t *testing.T) {
 }
 
 func TestElasticKVNotLeaderErrorClassification(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		err  error
@@ -531,6 +542,7 @@ func (e redisError) Error() string { return string(e) }
 func (redisError) RedisError()     {}
 
 func TestLeaderAwareRedisBackend_ConcurrentCloseIsRaceFree(t *testing.T) {
+	t.Parallel()
 	// Regression guard: Close() must not race concurrent Do() callers —
 	// currentClient and ensureClientLocked hold the lock consistently with
 	// the closed flag, and Close snapshots the client map before iterating.
@@ -590,6 +602,7 @@ func (b *LeaderAwareRedisBackend) clientAddrs() []string {
 }
 
 func TestLeaderAwareRedisBackend_EvictsOldestNonProtectedClient(t *testing.T) {
+	t.Parallel()
 	// Simulate leader churn by forcing many leader addresses through setLeader.
 	// The cached client map must stay bounded at maxLeaderAwareClients and the
 	// seed must never be evicted.
@@ -621,6 +634,7 @@ func TestLeaderAwareRedisBackend_EvictsOldestNonProtectedClient(t *testing.T) {
 }
 
 func TestLeaderAwareRedisBackend_InitialCommandWaitsForLeaderDiscovery(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		run  func(context.Context, *LeaderAwareRedisBackend) error
@@ -716,6 +730,7 @@ func subscribeAndWaitForInitialAck(ctx context.Context, backend *LeaderAwareRedi
 }
 
 func TestLeaderAwareRedisBackend_NewPubSubFallsBackToSeedWhenNoLeaderDiscovered(t *testing.T) {
+	t.Parallel()
 	seed := newFakeElasticKVNode(t)
 
 	backend := NewLeaderAwareRedisBackendWithInterval(
@@ -741,6 +756,7 @@ func TestLeaderAwareRedisBackend_NewPubSubFallsBackToSeedWhenNoLeaderDiscovered(
 }
 
 func TestLeaderAwareRedisBackend_UnknownLeaderDoesNotProbeOnEveryCommand(t *testing.T) {
+	t.Parallel()
 	seed := newFakeElasticKVNode(t)
 
 	backend := NewLeaderAwareRedisBackendWithInterval(
@@ -768,6 +784,7 @@ func TestLeaderAwareRedisBackend_UnknownLeaderDoesNotProbeOnEveryCommand(t *test
 }
 
 func TestLeaderAwareRedisBackend_FallsBackToSeedOnProbeFailure(t *testing.T) {
+	t.Parallel()
 	// Seed 1 is unreachable; seed 2 is alive and reports itself as leader.
 	aliveLeader := newFakeElasticKVNode(t)
 	aliveLeader.SetLeader(aliveLeader.addr)

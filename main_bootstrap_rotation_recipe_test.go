@@ -119,6 +119,7 @@ func (f *rotationRecipeFixture) apply(req *pb.RotateDEKRequest) {
 }
 
 func TestBootstrapRotationRecipeInterruptedCreateRetainsExactPlan(t *testing.T) {
+	t.Parallel()
 	f := newRotationRecipeFixture(t)
 	r, err := newBootstrapRotationRecipe(t.Context(), f.cfg)
 	require.NoError(t, err)
@@ -140,6 +141,7 @@ func TestBootstrapRotationRecipeInterruptedCreateRetainsExactPlan(t *testing.T) 
 }
 
 func TestBootstrapRotationRecipeLostResultUsesAppliedState(t *testing.T) {
+	t.Parallel()
 	f := newRotationRecipeFixture(t)
 	r, err := newBootstrapRotationRecipe(t.Context(), f.cfg)
 	require.NoError(t, err)
@@ -156,6 +158,7 @@ func TestBootstrapRotationRecipeLostResultUsesAppliedState(t *testing.T) {
 }
 
 func TestBootstrapRotationRecipeWrapperFailureReconcilesWithoutProposal(t *testing.T) {
+	t.Parallel()
 	f := newRotationRecipeFixture(t)
 	r, err := newBootstrapRotationRecipe(t.Context(), f.cfg)
 	require.NoError(t, err)
@@ -178,6 +181,7 @@ func TestBootstrapRotationRecipeWrapperFailureReconcilesWithoutProposal(t *testi
 }
 
 func TestBootstrapRotationRecipeTermChangeRetainsUnknownResponsibility(t *testing.T) {
+	t.Parallel()
 	f := newRotationRecipeFixture(t)
 	r, err := newBootstrapRotationRecipe(t.Context(), f.cfg)
 	require.NoError(t, err)
@@ -208,6 +212,7 @@ func TestBootstrapRotationRecipeTermChangeRetainsUnknownResponsibility(t *testin
 }
 
 func TestBootstrapRotationRecipeSupersededRequiresBarrierRegistryAndWrappers(t *testing.T) {
+	t.Parallel()
 	f := newRotationRecipeFixture(t)
 	r, err := newBootstrapRotationRecipe(t.Context(), f.cfg)
 	require.NoError(t, err)
@@ -232,6 +237,7 @@ func TestBootstrapRotationRecipeSupersededRequiresBarrierRegistryAndWrappers(t *
 }
 
 func TestBootstrapRotationRecipeRejectsUnverifiedCompletion(t *testing.T) {
+	t.Parallel()
 	for _, corruption := range []string{"material", "purpose", "registry_epoch", "registry_identity", "wrapper", "projection_change"} {
 		t.Run(corruption, func(t *testing.T) {
 			f := newRotationRecipeFixture(t)
@@ -280,6 +286,7 @@ func TestBootstrapRotationRecipeRejectsUnverifiedCompletion(t *testing.T) {
 }
 
 func TestBootstrapRotationRecipeUnknownPartialApplyDoesNotStartNextPurpose(t *testing.T) {
+	t.Parallel()
 	f := newRotationRecipeFixture(t)
 	r, err := newBootstrapRotationRecipe(t.Context(), f.cfg)
 	require.NoError(t, err)
@@ -300,6 +307,7 @@ func TestBootstrapRotationRecipeUnknownPartialApplyDoesNotStartNextPurpose(t *te
 }
 
 func TestBootstrapRotationRecipeRequiresBarrierAfterLostReply(t *testing.T) {
+	t.Parallel()
 	f := newRotationRecipeFixture(t)
 	r, err := newBootstrapRotationRecipe(t.Context(), f.cfg)
 	require.NoError(t, err)
@@ -323,6 +331,7 @@ func TestBootstrapRotationRecipeRequiresBarrierAfterLostReply(t *testing.T) {
 }
 
 func TestBootstrapRotationRecipeGrantCopiesAndCancelledInstallation(t *testing.T) {
+	t.Parallel()
 	f := newRotationRecipeFixture(t)
 	r, err := newBootstrapRotationRecipe(t.Context(), f.cfg)
 	require.NoError(t, err)
@@ -342,6 +351,7 @@ func TestBootstrapRotationRecipeGrantCopiesAndCancelledInstallation(t *testing.T
 }
 
 func TestBootstrapRotationRecipePlanningIsFencedAndLeaderOnly(t *testing.T) {
+	t.Parallel()
 	f := newRotationRecipeFixture(t)
 	f.leader = false
 	_, err := newBootstrapRotationRecipe(t.Context(), f.cfg)
@@ -355,6 +365,7 @@ func TestBootstrapRotationRecipePlanningIsFencedAndLeaderOnly(t *testing.T) {
 }
 
 func TestBootstrapRotationRecipeEveryAppliedKeyRetiresRun(t *testing.T) {
+	t.Parallel()
 	f := newRotationRecipeFixture(t)
 	r, err := newBootstrapRotationRecipe(t.Context(), f.cfg)
 	require.NoError(t, err)
@@ -380,6 +391,7 @@ func TestBootstrapRotationRecipeEveryAppliedKeyRetiresRun(t *testing.T) {
 }
 
 func TestBootstrapRotationRecipeAnotherLeaderUsesSamePlannedID(t *testing.T) {
+	t.Parallel()
 	f := newRotationRecipeFixture(t)
 	r, err := newBootstrapRotationRecipe(t.Context(), f.cfg)
 	require.NoError(t, err)
@@ -395,6 +407,7 @@ func TestBootstrapRotationRecipeAnotherLeaderUsesSamePlannedID(t *testing.T) {
 }
 
 func TestBootstrapRotationRecipeDriftAndNotLeaderAreTransient(t *testing.T) {
+	t.Parallel()
 	f := newRotationRecipeFixture(t)
 	r, err := newBootstrapRotationRecipe(t.Context(), f.cfg)
 	require.NoError(t, err)
@@ -411,6 +424,7 @@ func TestBootstrapRotationRecipeDriftAndNotLeaderAreTransient(t *testing.T) {
 }
 
 func TestBootstrapRotationRecipeUnknownCannotHideInvalidEvidence(t *testing.T) {
+	t.Parallel()
 	f := newRotationRecipeFixture(t)
 	r, err := newBootstrapRotationRecipe(t.Context(), f.cfg)
 	require.NoError(t, err)

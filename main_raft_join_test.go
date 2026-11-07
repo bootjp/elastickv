@@ -25,6 +25,7 @@ func (e *raftJoinReadyEngineStub) Status() raftengine.Status {
 }
 
 func TestRaftJoinRuntimesReady(t *testing.T) {
+	t.Parallel()
 	readyStatus := raftengine.Status{
 		Leader:       raftengine.LeaderInfo{ID: "n1"},
 		CommitIndex:  42,
@@ -74,6 +75,7 @@ func TestRaftJoinRuntimesReady(t *testing.T) {
 }
 
 func TestRaftJoinRuntimesReadyReturnsConfigurationError(t *testing.T) {
+	t.Parallel()
 	readErr := errors.New("configuration unavailable")
 	ready, err := raftJoinRuntimesReady(context.Background(), []*raftGroupRuntime{{
 		spec:   groupSpec{id: 7},
@@ -85,10 +87,12 @@ func TestRaftJoinRuntimesReadyReturnsConfigurationError(t *testing.T) {
 }
 
 func TestWaitForRaftJoinReadyDisabled(t *testing.T) {
+	t.Parallel()
 	require.NoError(t, waitForRaftJoinReady(context.Background(), nil, "n2", false))
 }
 
 func TestPreparePublicServicesAfterRaftJoinReadyDoesNotBindWhileJoinIsUnready(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	prepared := false
@@ -114,6 +118,7 @@ func TestPreparePublicServicesAfterRaftJoinReadyDoesNotBindWhileJoinIsUnready(t 
 }
 
 func TestPreparePublicServicesAfterRaftJoinReadyBindsWhenJoinIsDisabled(t *testing.T) {
+	t.Parallel()
 	prepared := false
 	err := preparePublicServicesAfterRaftJoinReady(
 		context.Background(),

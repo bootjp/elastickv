@@ -106,6 +106,7 @@ func (f *rotationRuntimeFixture) purpose(sc *encryption.Sidecar, id uint32) boot
 }
 
 func TestBootstrapRotationRuntimeLeaderResumesEachInvalidatedApply(t *testing.T) {
+	t.Parallel()
 	f := newRotationRuntimeFixture(t, raftengine.StateLeader)
 	f.io.admin = func(_ context.Context, req *pb.RotateDEKRequest) (*pb.RotateDEKResponse, error) {
 		f.io.apply(req)
@@ -128,6 +129,7 @@ func TestBootstrapRotationRuntimeLeaderResumesEachInvalidatedApply(t *testing.T)
 }
 
 func TestBootstrapRotationRuntimeFollowerPermissionWithoutLeaderCompletion(t *testing.T) {
+	t.Parallel()
 	f := newRotationRuntimeFixture(t, raftengine.StateFollower)
 	require.NoError(t, f.runtime.step(t.Context()))
 	require.True(t, f.a.LocalPermissionReady())
@@ -141,6 +143,7 @@ func TestBootstrapRotationRuntimeFollowerPermissionWithoutLeaderCompletion(t *te
 }
 
 func TestBootstrapRotationRuntimeRepairsBeforeObservingProjection(t *testing.T) {
+	t.Parallel()
 	f := newRotationRuntimeFixture(t, raftengine.StateLeader)
 	f.wrappers.Store(false)
 	install := f.io.cfg.InstallAndVerify
@@ -158,6 +161,7 @@ func TestBootstrapRotationRuntimeRepairsBeforeObservingProjection(t *testing.T) 
 }
 
 func TestBootstrapRotationRuntimeStepdownJoinsAdminBeforeFollowerPermission(t *testing.T) {
+	t.Parallel()
 	f := newRotationRuntimeFixture(t, raftengine.StateLeader)
 	entered, cancelled, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	f.io.admin = func(ctx context.Context, _ *pb.RotateDEKRequest) (*pb.RotateDEKResponse, error) {
@@ -194,6 +198,7 @@ func TestBootstrapRotationRuntimeStepdownJoinsAdminBeforeFollowerPermission(t *t
 }
 
 func TestBootstrapRotationRuntimeRunAndWaitLifetime(t *testing.T) {
+	t.Parallel()
 	f := newRotationRuntimeFixture(t, raftengine.StateFollower)
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
@@ -209,6 +214,7 @@ func TestBootstrapRotationRuntimeRunAndWaitLifetime(t *testing.T) {
 }
 
 func TestBootstrapRotationRuntimePanicClosesRecoveryOwner(t *testing.T) {
+	t.Parallel()
 	f := newRotationRuntimeFixture(t, raftengine.StateFollower)
 	var captured context.Context
 	f.runtime.config.observe = func(ctx context.Context) (bootstrapEncryptionProjection, error) {

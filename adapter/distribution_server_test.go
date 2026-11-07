@@ -288,6 +288,7 @@ func (a *pendingResolutionAllocator) ValidateLegacyResolutionTimestamps(_ contex
 }
 
 func TestDistributionServerPendingLegacyResolutionMode(t *testing.T) {
+	t.Parallel()
 	alloc := &pendingResolutionAllocator{distributionTSOAllocator: &distributionTSOAllocator{leader: true}, pendingFloor: 100}
 	s := NewDistributionServer(distribution.NewEngine(), nil, WithDistributionTimestampAllocator(alloc))
 	ctx := context.Background()
@@ -317,6 +318,7 @@ func TestDistributionServerPendingLegacyResolutionMode(t *testing.T) {
 }
 
 func TestDistributionServerPendingLegacyResolutionRoutedWrappers(t *testing.T) {
+	t.Parallel()
 	alloc := &pendingResolutionAllocator{distributionTSOAllocator: &distributionTSOAllocator{leader: true}, pendingFloor: 100}
 	addr := serveDistributionTestServer(t, NewDistributionServer(distribution.NewEngine(), nil, WithDistributionTimestampAllocator(alloc)))
 	routed, err := kv.NewLeaderRoutedTSOAllocator(&distributionTSOAllocator{}, distributionLeaderView(addr))
@@ -334,12 +336,14 @@ func TestDistributionServerPendingLegacyResolutionRoutedWrappers(t *testing.T) {
 }
 
 func TestDistributionServerPendingLegacyResolutionRejectsUnsupportedAllocator(t *testing.T) {
+	t.Parallel()
 	s := NewDistributionServer(distribution.NewEngine(), nil, WithDistributionTimestampAllocator(&distributionTSOAllocator{}))
 	_, err := s.ValidateTimestamp(context.Background(), &pb.ValidateTimestampRequest{Timestamp: 100, StartTimestamp: 50, LegacyResolution: true})
 	require.Equal(t, codes.FailedPrecondition, status.Code(err))
 }
 
 func TestDistributionServerValidateTimestamp_LeaderRoutedRPC(t *testing.T) {
+	t.Parallel()
 	serverAlloc := &distributionTSOAllocator{
 		base:        701,
 		leader:      true,
@@ -403,6 +407,7 @@ func TestDistributionServerGetTimestamp_RejectsMinimumWithoutReservationMetadata
 }
 
 func TestDistributionServerGetTimestamp_LeaderRoutedRPC(t *testing.T) {
+	t.Parallel()
 	serverAlloc := &distributionTSOAllocator{base: 501, leader: true}
 	addr := serveDistributionTestServer(t, NewDistributionServer(
 		distribution.NewEngine(),
@@ -423,6 +428,7 @@ func TestDistributionServerGetTimestamp_LeaderRoutedRPC(t *testing.T) {
 }
 
 func TestDistributionServerGetTimestamp_LeaderRoutedRejectsLegacyServer(t *testing.T) {
+	t.Parallel()
 	addr := serveDistributionTestServer(t, NewDistributionServer(distribution.NewEngine(), nil))
 	local := &distributionTSOAllocator{leader: false}
 	routed, err := kv.NewLeaderRoutedTSOAllocator(local, distributionLeaderView(addr))
@@ -458,6 +464,7 @@ func requireDeadlineExceeded(t *testing.T, err error) {
 }
 
 func TestDistributionServerGetTimestamp_LeaderRoutedActivatesCutover(t *testing.T) {
+	t.Parallel()
 	serverAlloc := &distributionTSOAllocator{base: 701, previousFloor: 699, leader: true}
 	addr := serveDistributionTestServer(t, NewDistributionServer(
 		distribution.NewEngine(),
@@ -508,6 +515,7 @@ func (legacyIgnoringTimestampValidationServer) ValidateTimestamp(context.Context
 }
 
 func TestDistributionServerPendingLegacyResolutionRejectsOldModeIgnoringServer(t *testing.T) {
+	t.Parallel()
 	addr := serveDistributionTestServer(t, legacyIgnoringTimestampValidationServer{})
 	routed, err := kv.NewLeaderRoutedTSOAllocator(&distributionTSOAllocator{}, distributionLeaderView(addr))
 	require.NoError(t, err)
@@ -2260,6 +2268,8 @@ func TestDistributionServerStartSplitMigrationReturnsCapabilityGateError(t *test
 }
 
 func TestDistributionServerStartSplitMigrationCapabilityGateRunsOutsideCatalogLock(t *testing.T) {
+	// Not parallel: its deadline/liveness budget is sized for a quiet
+	// process, and parallel peers on a loaded runner can exhaust it.
 	ctx := context.Background()
 	baseStore := store.NewMVCCStore()
 	catalog := distribution.NewCatalogStore(baseStore)

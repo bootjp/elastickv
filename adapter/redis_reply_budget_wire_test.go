@@ -93,6 +93,7 @@ func awaitRedisReplyWrite(t *testing.T, listener *redisReplyObservedListener) in
 }
 
 func TestRedisReplyBudgetWireConcurrentGETIsReceiverBounded(t *testing.T) {
+	t.Parallel()
 	st := newRedisWireStore(t)
 	want := seedRedisReplyValue(t, st)
 	g := newRedisWireTestGate(t)
@@ -127,6 +128,7 @@ func TestRedisReplyBudgetWireConcurrentGETIsReceiverBounded(t *testing.T) {
 }
 
 func TestRedisReplyBudgetWirePipelineFlushesEachTerminalReply(t *testing.T) {
+	t.Parallel()
 	st := newRedisWireStore(t)
 	want := seedRedisReplyValue(t, st)
 	other := strings.Repeat("w", redisReplyWireValueBytes)
@@ -153,6 +155,7 @@ func TestRedisReplyBudgetWirePipelineFlushesEachTerminalReply(t *testing.T) {
 }
 
 func TestRedisReplyBudgetWireSlowWriterDeadlineAndShutdownRelease(t *testing.T) {
+	t.Parallel()
 	for _, shutdown := range []bool{false, true} {
 		t.Run(map[bool]string{false: "write deadline", true: "server cancellation"}[shutdown], func(t *testing.T) {
 			st := newRedisWireStore(t)
@@ -189,6 +192,7 @@ func TestRedisReplyBudgetWireSlowWriterDeadlineAndShutdownRelease(t *testing.T) 
 }
 
 func TestRedisReplyBudgetWireDetachedReleasesEveryFlushedMessage(t *testing.T) {
+	t.Parallel()
 	st := newRedisWireStore(t)
 	g := newRedisWireTestGate(t)
 	s, _ := startRedisReplyBudgetWire(t, g, st, 2*redisReplyWireValueBytes+4096, 3*time.Second)
@@ -218,6 +222,7 @@ func TestRedisReplyBudgetWireDetachedReleasesEveryFlushedMessage(t *testing.T) {
 }
 
 func TestRedisReplyBudgetWireLegacyIsUnchanged(t *testing.T) {
+	t.Parallel()
 	st := newRedisWireStore(t)
 	want := seedRedisReplyValue(t, st)
 	g := newRedisWireTestGate(t)
@@ -231,6 +236,7 @@ func TestRedisReplyBudgetWireLegacyIsUnchanged(t *testing.T) {
 }
 
 func TestRedisReplyBudgetWireDetachedBlockedWriteRetainsReservation(t *testing.T) {
+	t.Parallel()
 	st := newRedisWireStore(t)
 	g := newRedisWireTestGate(t)
 	charge := redisReplyCapacityCharge(2 * redisReplyWireValueBytes)
@@ -265,6 +271,7 @@ func TestRedisReplyBudgetWireDetachedBlockedWriteRetainsReservation(t *testing.T
 }
 
 func TestRedisReplyBudgetWireTransactionExhaustionPoisonsPipeline(t *testing.T) {
+	t.Parallel()
 	for _, tiny := range []bool{false, true} {
 		t.Run(map[bool]string{false: "EXEC reply", true: "MULTI acknowledgment"}[tiny], func(t *testing.T) {
 			st := newRedisWireStore(t)

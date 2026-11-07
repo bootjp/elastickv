@@ -97,6 +97,7 @@ func (f *bootstrapTransportFixture) start(t *testing.T, ctx context.Context) grp
 }
 
 func TestBootstrapIngressTLSTransportRevocationUnblocks(t *testing.T) {
+	t.Parallel()
 	for _, mode := range []string{"recv", "send"} {
 		t.Run(mode, func(t *testing.T) {
 			f := bootstrapTransportServer(t, mode)
@@ -161,6 +162,7 @@ func bootstrapTransportRepublish(t *testing.T, gate *startupPublicKVGate) {
 }
 
 func TestBootstrapIngressTLSNormalCompletionKeepsTransport(t *testing.T) {
+	t.Parallel()
 	f := bootstrapTransportServer(t, "normal")
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
@@ -197,6 +199,7 @@ func TestBootstrapIngressTLSNormalCompletionKeepsTransport(t *testing.T) {
 }
 
 func TestBootstrapIngressRejectsUnownedTransportBeforeBegin(t *testing.T) {
+	t.Parallel()
 	gate := bootstrapIngressFixture(t)
 	bootstrapIngressLoadCatalog(t, gate)
 	for _, auth := range []credentials.AuthInfo{nil, &peersession.ServerAuthInfo{}, &peersession.ClientAuthInfo{}, credentials.TLSInfo{}} {
@@ -217,6 +220,7 @@ func TestBootstrapIngressRejectsUnownedTransportBeforeBegin(t *testing.T) {
 }
 
 func TestBootstrapIngressRejectsGenuineClientTransportAbort(t *testing.T) {
+	t.Parallel()
 	f := bootstrapTransportServer(t, "normal")
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()

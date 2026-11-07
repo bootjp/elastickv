@@ -8,6 +8,7 @@ import (
 )
 
 func TestClassifyWriteConflictKey(t *testing.T) {
+	t.Parallel()
 	// Table test covering every bucket in classifyWriteConflictKey. A
 	// new bucket without a test row here is intentional dead code.
 	cases := []struct {
@@ -46,6 +47,7 @@ func TestClassifyWriteConflictKey(t *testing.T) {
 }
 
 func TestWriteConflictCounterRecordAndSnapshot(t *testing.T) {
+	t.Parallel()
 	c := newWriteConflictCounter()
 	require.Zero(t, c.total())
 
@@ -65,6 +67,7 @@ func TestWriteConflictCounterRecordAndSnapshot(t *testing.T) {
 }
 
 func TestDecodeWriteConflictLabel(t *testing.T) {
+	t.Parallel()
 	kind, class, ok := DecodeWriteConflictLabel(EncodeWriteConflictLabel(WriteConflictKindWrite, writeConflictClassTxnLock))
 	require.True(t, ok)
 	assert.Equal(t, WriteConflictKindWrite, kind)
@@ -75,6 +78,7 @@ func TestDecodeWriteConflictLabel(t *testing.T) {
 }
 
 func TestWriteConflictCounterNilSafe(t *testing.T) {
+	t.Parallel()
 	var c *writeConflictCounter
 	require.NotPanics(t, func() { c.record(WriteConflictKindWrite, writeConflictClassOther) })
 	assert.Nil(t, c.snapshot())

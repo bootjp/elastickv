@@ -23,6 +23,7 @@ func bootstrapStartupFixture() (*bootstrapPeerConfig, raftbootstrap.Intent, raft
 }
 
 func TestBootstrapStartupProvisionedIdentity(t *testing.T) {
+	t.Parallel()
 	config, intent, cfg := bootstrapStartupFixture()
 	id, err := validateBootstrapStartup(config, intent, cfg)
 	require.NoError(t, err)
@@ -32,6 +33,7 @@ func TestBootstrapStartupProvisionedIdentity(t *testing.T) {
 }
 
 func TestBootstrapStartupRejectsMismatchesBeforeTransport(t *testing.T) {
+	t.Parallel()
 	for _, name := range []string{"group", "node", "address", "cluster", "unknown-group", "invalid-intent"} {
 		t.Run(name, func(t *testing.T) {
 			config, intent, cfg := bootstrapStartupFixture()
@@ -58,12 +60,14 @@ func TestBootstrapStartupRejectsMismatchesBeforeTransport(t *testing.T) {
 }
 
 func TestBootstrapStartupRejectsTSOWithoutPolicyStore(t *testing.T) {
+	t.Parallel()
 	config, intent, cfg := bootstrapStartupFixture()
 	_, err := newBootstrapStartupForGroup(config, nil, intent, nil, nil)(cfg, nil)
 	require.ErrorContains(t, err, "TSO policy recovery is not implemented")
 }
 
 func TestBootstrapStartupRejectsUnverifiedRecovery(t *testing.T) {
+	t.Parallel()
 	config, intent, cfg := bootstrapStartupFixture()
 	id, err := validateBootstrapStartup(config, intent, cfg)
 	require.NoError(t, err)
@@ -71,6 +75,7 @@ func TestBootstrapStartupRejectsUnverifiedRecovery(t *testing.T) {
 }
 
 func TestBootstrapStartupPeerAddressReconciliation(t *testing.T) {
+	t.Parallel()
 	config, intent, _ := bootstrapStartupFixture()
 	peer := etcd.Peer{NodeID: config.local.Member, Address: config.local.Address}
 	require.NoError(t, validateBootstrapPeerAddresses(intent.Baseline, []etcd.Peer{peer}))

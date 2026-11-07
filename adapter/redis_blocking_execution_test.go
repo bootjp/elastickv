@@ -21,10 +21,12 @@ func redisStreamWaiterCount(s *RedisServer, key string) int {
 }
 
 func TestRedisBlockingExecutionXREADDoesNotStarveXADD(t *testing.T) {
+	t.Parallel()
 	runRedisBlockingProducerProgress(t, []string{cmdXAdd, "events", "1-0", "f", "v"})
 }
 
 func TestRedisBlockingExecutionXREADDoesNotStarveEvalXADD(t *testing.T) {
+	t.Parallel()
 	runRedisBlockingProducerProgress(t, []string{cmdEval,
 		`return redis.call('XADD', KEYS[1], ARGV[1], ARGV[2], ARGV[3])`,
 		"1", "events", "1-0", "f", "v"})

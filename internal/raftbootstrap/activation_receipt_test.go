@@ -30,6 +30,7 @@ func uncheckedActivationReceipt(r ActivationReceipt) []byte {
 }
 
 func TestActivationReceiptGoldenAndRoundTrip(t *testing.T) {
+	t.Parallel()
 	r := testActivationReceipt()
 	encoded, err := EncodeActivationReceipt(r)
 	require.NoError(t, err)
@@ -54,6 +55,7 @@ func TestActivationReceiptGoldenAndRoundTrip(t *testing.T) {
 }
 
 func TestActivationReceiptVerdicts(t *testing.T) {
+	t.Parallel()
 	for _, verdict := range []ActivationReceiptVerdict{ActivationReceiptApplied, ActivationReceiptRejectedStale, ActivationReceiptAlreadyActive} {
 		r := testActivationReceipt()
 		r.Verdict = verdict
@@ -77,6 +79,7 @@ func TestActivationReceiptVerdicts(t *testing.T) {
 }
 
 func TestActivationReceiptRejectsInvalidFields(t *testing.T) {
+	t.Parallel()
 	cases := map[string]func(*ActivationReceipt){
 		"entry cluster":          func(r *ActivationReceipt) { r.Entry.Cluster = UUID{} },
 		"foreign cluster":        func(r *ActivationReceipt) { r.Entry.Cluster[0]++ },
@@ -109,6 +112,7 @@ func TestActivationReceiptRejectsInvalidFields(t *testing.T) {
 }
 
 func TestActivationReceiptRejectionsCanRecordFutureCut(t *testing.T) {
+	t.Parallel()
 	for _, verdict := range []ActivationReceiptVerdict{ActivationReceiptRejectedStale, ActivationReceiptAlreadyActive} {
 		r := testActivationReceipt()
 		r.Verdict = verdict
@@ -125,6 +129,7 @@ func TestActivationReceiptRejectionsCanRecordFutureCut(t *testing.T) {
 }
 
 func TestActivationReceiptStrictFrames(t *testing.T) {
+	t.Parallel()
 	r := testActivationReceipt()
 	b, err := EncodeActivationReceipt(r)
 	require.NoError(t, err)
@@ -161,6 +166,7 @@ func TestActivationReceiptStrictFrames(t *testing.T) {
 }
 
 func TestActivationReceiptUsesSameSlotAsGuardedReceipt(t *testing.T) {
+	t.Parallel()
 	r := testActivationReceipt()
 	key, err := ReceiptKey(r.Entry)
 	require.NoError(t, err)

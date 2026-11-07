@@ -69,6 +69,7 @@ func isDynamoSnapshotSealRequest(req *kv.OperationGroup[kv.OP]) bool {
 }
 
 func TestDynamoDBSnapshotSealRoutesWithItem(t *testing.T) {
+	t.Parallel()
 	schema := dedupItemTable()
 	itemKey, err := schema.itemKeyFromAttributes(map[string]attributeValue{"pk": newStringAttributeValue(dedupTestKey)})
 	require.NoError(t, err)
@@ -216,6 +217,7 @@ func dynamoHandlerStatus(t *testing.T, call func(http.ResponseWriter, *http.Requ
 }
 
 func TestDynamoDBTransactWriteWaitsForPendingItemUpdate(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := store.NewMVCCStore()
 	schema := dedupItemTable()
@@ -262,6 +264,7 @@ func TestDynamoDBTransactWriteWaitsForPendingItemUpdate(t *testing.T) {
 }
 
 func TestDynamoDBTwoServersSealPendingItemWrite(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := store.NewMVCCStore()
 	schema := dedupItemTable()
@@ -299,6 +302,7 @@ func TestDynamoDBTwoServersSealPendingItemWrite(t *testing.T) {
 }
 
 func TestDynamoDBSnapshotSealSurvivesLeaderSwitch(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := store.NewMVCCStore()
 	schema := dedupItemTable()
@@ -337,6 +341,7 @@ func TestDynamoDBSnapshotSealSurvivesLeaderSwitch(t *testing.T) {
 }
 
 func TestDynamoDBItemLockNormalizesKeyAndHonorsCancellation(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	schema := dedupItemTable()
 	seedDedupItem(t, st, schema, "1")
@@ -373,6 +378,7 @@ func TestDynamoDBItemLockNormalizesKeyAndHonorsCancellation(t *testing.T) {
 }
 
 func TestDynamoDBConditionCheckUsesItemLock(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	schema := dedupItemTable()
 	seedDedupItem(t, st, schema, "1")
@@ -410,6 +416,7 @@ func TestDynamoDBConditionCheckUsesItemLock(t *testing.T) {
 }
 
 func TestDynamoDBAdminPutUsesItemLock(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	schema := dedupItemTable()
 	seedDedupItem(t, st, schema, "1")
@@ -460,6 +467,7 @@ func (c *pendingDynamoApplyCoordinator) Dispatch(ctx context.Context, req *kv.Op
 }
 
 func TestDynamoDBUpdateItemFencesBeforeSnapshotWatermark(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := store.NewMVCCStore()
 	schema := dedupItemTable()

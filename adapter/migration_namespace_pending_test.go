@@ -26,6 +26,7 @@ func (c *pendingNamespaceACKClient) ProbeMigrationState(ctx context.Context, req
 }
 
 func TestNamespaceAdmissionPendingACKDoesNotExhaustRunnerFailureBudget(t *testing.T) {
+	t.Parallel()
 	runtime := newResplitAcceptanceRuntime(t)
 	server, catalog := runtime.server, runtime.server.catalog
 	snapshot, err := catalog.Snapshot(t.Context())

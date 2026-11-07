@@ -38,6 +38,8 @@ func (applyMemberAuthServer) ProbeMigrationState(ctx context.Context, _ *pb.Prob
 }
 
 func TestSplitMigrationApplyMemberSnapshotFactoryPreservesTLSCredentials(t *testing.T) {
+	// Not parallel: internalutil.ConfigureGRPCTLS replaces the process-global
+	// TLS config that every gRPC server and dialer in the process reads.
 	cert, key := writeSelfSignedCert(t)
 	require.NoError(t, internalutil.ConfigureGRPCTLS(cert, cert, key))
 	t.Cleanup(func() { require.NoError(t, internalutil.ConfigureGRPCTLS("", "", "")) })
@@ -91,6 +93,7 @@ func newApplyMemberEngine() *applyMemberEngine {
 }
 
 func TestSplitMigrationApplyMemberSnapshotFactoryIncludesLearners(t *testing.T) {
+	t.Parallel()
 	engine := newApplyMemberEngine()
 	var cache kv.GRPCConnCache
 	t.Cleanup(func() { require.NoError(t, cache.Close()) })
@@ -106,6 +109,7 @@ func TestSplitMigrationApplyMemberSnapshotFactoryIncludesLearners(t *testing.T) 
 }
 
 func TestSplitMigrationApplyMemberSnapshotFactoryRejectsUnstableConfiguration(t *testing.T) {
+	t.Parallel()
 	cases := map[string]func(*applyMemberEngine){
 		"zero epoch":        func(e *applyMemberEngine) { e.index = 0 },
 		"pending before":    func(e *applyMemberEngine) { e.pending = true },
@@ -130,6 +134,7 @@ func TestSplitMigrationApplyMemberSnapshotFactoryRejectsUnstableConfiguration(t 
 }
 
 func TestSplitMigrationApplyMemberSnapshotFactoryRequiresWiring(t *testing.T) {
+	t.Parallel()
 	var cache kv.GRPCConnCache
 	t.Cleanup(func() { require.NoError(t, cache.Close()) })
 	groups := map[uint64]*kv.ShardGroup{2: {Engine: newApplyMemberEngine()}}

@@ -54,6 +54,7 @@ func newTestShadowPubSubWithClock(window time.Duration, nowFunc func() time.Time
 }
 
 func TestShadowPubSub_MatchedMessage(t *testing.T) {
+	t.Parallel()
 	sp := newTestShadowPubSub(100 * time.Millisecond)
 
 	sp.RecordPrimary(&redis.Message{Channel: "ch1", Payload: "hello"})
@@ -66,6 +67,7 @@ func TestShadowPubSub_MatchedMessage(t *testing.T) {
 }
 
 func TestShadowPubSub_MissingOnSecondary(t *testing.T) {
+	t.Parallel()
 	clock := newTestClock()
 	sp := newTestShadowPubSubWithClock(10*time.Millisecond, clock.Now)
 
@@ -83,6 +85,7 @@ func TestShadowPubSub_MissingOnSecondary(t *testing.T) {
 }
 
 func TestShadowPubSub_ExtraOnSecondary(t *testing.T) {
+	t.Parallel()
 	clock := newTestClock()
 	sp := newTestShadowPubSubWithClock(10*time.Millisecond, clock.Now)
 
@@ -97,6 +100,7 @@ func TestShadowPubSub_ExtraOnSecondary(t *testing.T) {
 }
 
 func TestShadowPubSub_OutOfOrderMatching(t *testing.T) {
+	t.Parallel()
 	sp := newTestShadowPubSub(1 * time.Second)
 
 	sp.RecordPrimary(&redis.Message{Channel: "ch1", Payload: "msg1"})
@@ -113,6 +117,7 @@ func TestShadowPubSub_OutOfOrderMatching(t *testing.T) {
 }
 
 func TestShadowPubSub_DuplicateMessages(t *testing.T) {
+	t.Parallel()
 	sp := newTestShadowPubSub(1 * time.Second)
 
 	sp.RecordPrimary(&redis.Message{Channel: "ch1", Payload: "dup"})
@@ -130,6 +135,7 @@ func TestShadowPubSub_DuplicateMessages(t *testing.T) {
 }
 
 func TestShadowPubSub_RecordAfterClose(t *testing.T) {
+	t.Parallel()
 	sp := newTestShadowPubSub(1 * time.Second)
 
 	sp.mu.Lock()
@@ -144,6 +150,7 @@ func TestShadowPubSub_RecordAfterClose(t *testing.T) {
 }
 
 func TestShadowPubSub_CompareLoopExitsOnChannelClose(t *testing.T) {
+	t.Parallel()
 	clock := newTestClock()
 	sp := newTestShadowPubSubWithClock(10*time.Millisecond, clock.Now)
 
@@ -168,6 +175,7 @@ func TestShadowPubSub_CompareLoopExitsOnChannelClose(t *testing.T) {
 }
 
 func TestShadowPubSub_DuplicateSecondaryBuffered(t *testing.T) {
+	t.Parallel()
 	clock := newTestClock()
 	sp := newTestShadowPubSubWithClock(1*time.Second, clock.Now)
 
@@ -193,6 +201,7 @@ func TestShadowPubSub_DuplicateSecondaryBuffered(t *testing.T) {
 }
 
 func TestShadowPubSub_CloseCleanupUnmatchedSecondaries(t *testing.T) {
+	t.Parallel()
 	// Verify that sweepAll (called when the compare loop exits on Close) drains
 	// the per-struct unmatchedSecondaries buffer and reports DivExtraData.
 	sp := newTestShadowPubSub(1 * time.Second)
@@ -217,6 +226,7 @@ func TestShadowPubSub_CloseCleanupUnmatchedSecondaries(t *testing.T) {
 }
 
 func TestShadowPubSub_CompareLoopMatchesFromChannel(t *testing.T) {
+	t.Parallel()
 	sp := newTestShadowPubSub(1 * time.Second)
 
 	sp.RecordPrimary(&redis.Message{Channel: "ch1", Payload: "msg1"})
@@ -245,6 +255,7 @@ func TestShadowPubSub_CompareLoopMatchesFromChannel(t *testing.T) {
 // is reported. This tests the fix for false DivDataMismatch reports when
 // PubSubCompareWindow is smaller than the sweep interval.
 func TestShadowPubSub_SecondaryBeforePrimaryImmediateReconcile(t *testing.T) {
+	t.Parallel()
 	clock := newTestClock()
 	sp := newTestShadowPubSubWithClock(1*time.Second, clock.Now)
 
@@ -287,6 +298,7 @@ func TestShadowPubSub_SecondaryBeforePrimaryImmediateReconcile(t *testing.T) {
 // arriving before the comparison window properly matches its primary and
 // prevents a divergence from being reported during reconciliation.
 func TestShadowPubSub_SecondaryWithinWindowMatches(t *testing.T) {
+	t.Parallel()
 	clock := newTestClock()
 	sp := newTestShadowPubSubWithClock(50*time.Millisecond, clock.Now)
 
@@ -310,6 +322,7 @@ func TestShadowPubSub_SecondaryWithinWindowMatches(t *testing.T) {
 // primary divergence. Both a DivDataMismatch (primary) and eventually a
 // DivExtraData (secondary) should be reported.
 func TestShadowPubSub_ExpiredPrimaryThenLateSecondary(t *testing.T) {
+	t.Parallel()
 	clock := newTestClock()
 	sp := newTestShadowPubSubWithClock(10*time.Millisecond, clock.Now)
 
@@ -344,6 +357,7 @@ func TestShadowPubSub_ExpiredPrimaryThenLateSecondary(t *testing.T) {
 // correctly skips an already-expired first entry and matches the secondary against
 // a still-in-window second entry (matchIdx at position 1).
 func TestShadowPubSub_MatchSecondarySkipsExpiredHead(t *testing.T) {
+	t.Parallel()
 	clock := newTestClock()
 	window := 50 * time.Millisecond
 	sp := newTestShadowPubSubWithClock(window, clock.Now)
@@ -371,6 +385,7 @@ func TestShadowPubSub_MatchSecondarySkipsExpiredHead(t *testing.T) {
 // TestShadowPubSub_MatchSecondaryMiddleEntry verifies that matchSecondary removes
 // a middle entry (matchIdx neither 0 nor last) and leaves the others intact.
 func TestShadowPubSub_MatchSecondaryMiddleEntry(t *testing.T) {
+	t.Parallel()
 	clock := newTestClock()
 	window := 50 * time.Millisecond
 	sp := newTestShadowPubSubWithClock(window, clock.Now)
@@ -414,6 +429,7 @@ func TestShadowPubSub_MatchSecondaryMiddleEntry(t *testing.T) {
 // and remove the last entry in a multi-entry slice (matchIdx == len-1) while
 // leaving the earlier expired entries for the sweep.
 func TestShadowPubSub_MatchSecondaryLastEntry(t *testing.T) {
+	t.Parallel()
 	clock := newTestClock()
 	window := 50 * time.Millisecond
 	sp := newTestShadowPubSubWithClock(window, clock.Now)

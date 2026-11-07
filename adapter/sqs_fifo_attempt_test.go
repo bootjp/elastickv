@@ -112,6 +112,7 @@ func (f *fifoAttemptFixture) requireHeadAttempt(t *testing.T, req *kv.OperationG
 }
 
 func TestSQSFIFOOwnedHeadAfterForeignSuccessorPages(t *testing.T) {
+	t.Parallel()
 	for _, partitions := range []uint32{1, 4} {
 		t.Run(fmt.Sprintf("partitions_%d", partitions), func(t *testing.T) {
 			f := newFIFOAttemptFixture(t, partitions)
@@ -138,6 +139,7 @@ func TestSQSFIFOOwnedHeadAfterForeignSuccessorPages(t *testing.T) {
 }
 
 func TestSQSFIFOAttemptZeroVisibilityOncePerSnapshot(t *testing.T) {
+	t.Parallel()
 	for _, partitions := range []uint32{1, 4} {
 		t.Run(fmt.Sprintf("partitions_%d", partitions), func(t *testing.T) {
 			f := newFIFOAttemptFixture(t, partitions)
@@ -159,6 +161,7 @@ func TestSQSFIFOAttemptZeroVisibilityOncePerSnapshot(t *testing.T) {
 }
 
 func TestSQSFIFOAttemptRaceRetriesOnFreshReceive(t *testing.T) {
+	t.Parallel()
 	for _, race := range []struct {
 		name string
 		err  error
@@ -208,6 +211,7 @@ func runFIFOAttemptRace(t *testing.T, partitions uint32, race error) {
 }
 
 func TestSQSFIFOAttemptDispatchErrorsPropagate(t *testing.T) {
+	t.Parallel()
 	for _, fault := range []struct {
 		name string
 		err  error
@@ -236,6 +240,7 @@ func TestSQSFIFOAttemptDispatchErrorsPropagate(t *testing.T) {
 }
 
 func TestSQSFIFOAttemptStoreErrorsPropagate(t *testing.T) {
+	t.Parallel()
 	for _, location := range []string{"outer_scan", "tie_scan", "candidate_load", "head_load", "group_lock"} {
 		t.Run(location, func(t *testing.T) {
 			f := newFIFOAttemptFixture(t, 4)
@@ -265,6 +270,7 @@ func TestSQSFIFOAttemptStoreErrorsPropagate(t *testing.T) {
 }
 
 func TestSQSFIFOAttemptReceiveRaceClassification(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name string
 		err  error

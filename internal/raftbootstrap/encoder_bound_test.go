@@ -21,6 +21,7 @@ func sharedLargeAddressIntent(t *testing.T) Intent {
 }
 
 func TestEncoderRejectsSharedInputAmplification(t *testing.T) {
+	t.Parallel()
 	in := sharedLargeAddressIntent(t)
 	w := &encoder{}
 	encodeConfiguration(w, in.Baseline)
@@ -35,6 +36,7 @@ func TestEncoderRejectsSharedInputAmplification(t *testing.T) {
 }
 
 func TestEncoderErrorLatchesAllWrites(t *testing.T) {
+	t.Parallel()
 	in, _ := fixture(t)
 	w := &encoder{}
 	w.length(MaxFileSize + 1)
@@ -44,6 +46,7 @@ func TestEncoderErrorLatchesAllWrites(t *testing.T) {
 }
 
 func TestEncoderIntentExactFrameLimit(t *testing.T) {
+	t.Parallel()
 	in, _ := fixture(t)
 	in.Baseline.State = ConfState{Voters: []uint64{1}}
 	in.Baseline.Members = []Member{{ID: 1, Address: "host:9000", PublicKeyDigest: Digest{1}}}

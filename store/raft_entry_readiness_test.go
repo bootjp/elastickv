@@ -9,6 +9,7 @@ import (
 )
 
 func TestRaftEntryReadinessTracksAtomically(t *testing.T) {
+	t.Parallel()
 	for name, factory := range absenceTestStores(t) {
 		for _, abort := range []bool{false, true} {
 			t.Run(name+map[bool]string{false: "/commit", true: "/abort"}[abort], func(t *testing.T) {
@@ -96,6 +97,7 @@ func assertEntryReadinessFloors(t *testing.T, s MVCCStore, abort bool) {
 }
 
 func TestRaftEntryReadinessFailureLatches(t *testing.T) {
+	t.Parallel()
 	for name, factory := range absenceTestStores(t) {
 		for _, failure := range []string{"cancel", "index", "invalid", "retired", "journal"} {
 			t.Run(name+"/"+failure, func(t *testing.T) {
@@ -144,6 +146,7 @@ func TestRaftEntryReadinessFailureLatches(t *testing.T) {
 }
 
 func TestRaftEntryReadinessNativeReopen(t *testing.T) {
+	t.Parallel()
 	for _, abort := range []bool{false, true} {
 		t.Run(map[bool]string{false: "commit", true: "abort"}[abort], func(t *testing.T) {
 			dir := t.TempDir()

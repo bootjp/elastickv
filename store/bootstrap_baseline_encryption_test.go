@@ -52,6 +52,7 @@ func encryptedBaselineProof(t *testing.T, s *pebbleStore, d *OfflineBaselineDeco
 }
 
 func TestEncryptedBaselineLogicalEqualityIncludesAllReplicatedRows(t *testing.T) {
+	t.Parallel()
 	a, da := encryptedBaselineStore(t, 1, 3)
 	b, db := encryptedBaselineStore(t, 2, 4)
 	pa, pb := encryptedBaselineProof(t, a, da), encryptedBaselineProof(t, b, db)
@@ -72,6 +73,7 @@ func TestEncryptedBaselineLogicalEqualityIncludesAllReplicatedRows(t *testing.T)
 }
 
 func TestEncryptedBaselineWrongCipherMissingKeyTamperAndLocks(t *testing.T) {
+	t.Parallel()
 	for _, name := range []string{"wrong cipher", "missing key", "tamper", "rebadged", "pending lock"} {
 		t.Run(name, func(t *testing.T) {
 			s, d := encryptedBaselineStore(t, 1, 3)
@@ -112,6 +114,7 @@ func TestEncryptedBaselineWrongCipherMissingKeyTamperAndLocks(t *testing.T) {
 }
 
 func TestEncryptedBaselineSnapshotStreamAndExactTransform(t *testing.T) {
+	t.Parallel()
 	s, d := encryptedBaselineStore(t, 1, 3)
 	snapshot := s.db.NewSnapshot()
 	defer snapshot.Close()

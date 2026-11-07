@@ -142,6 +142,7 @@ func bootstrapNetworkCallContext(t *testing.T) (context.Context, context.CancelF
 }
 
 func TestBootstrapNetworkTLSStartupToOrdinary(t *testing.T) {
+	t.Parallel()
 	f := newBootstrapNetworkFixture(t, false)
 	ctx, cancel := bootstrapNetworkCallContext(t)
 	defer cancel()
@@ -167,6 +168,7 @@ func TestBootstrapNetworkTLSStartupToOrdinary(t *testing.T) {
 }
 
 func TestBootstrapNetworkTLSRejectsUnknownAndWrongSPKI(t *testing.T) {
+	t.Parallel()
 	f := newBootstrapNetworkFixture(t, true)
 	f.ready(t)
 	_, err := f.cache.ConnFor("unprovisioned.test:1")
@@ -181,6 +183,7 @@ func TestBootstrapNetworkTLSRejectsUnknownAndWrongSPKI(t *testing.T) {
 }
 
 func TestBootstrapNetworkPrivateFailureNeverFallsBack(t *testing.T) {
+	t.Parallel()
 	f := newBootstrapNetworkFixture(t, false)
 	f.sender.startupToken = "wrong-dedicated-credential"
 	ctx, cancel := bootstrapNetworkCallContext(t)
@@ -195,6 +198,7 @@ func TestBootstrapNetworkPrivateFailureNeverFallsBack(t *testing.T) {
 }
 
 func TestBootstrapNetworkOrdinaryCallsConcurrentAndCloseJoins(t *testing.T) {
+	t.Parallel()
 	f := newBootstrapNetworkFixture(t, false)
 	f.ready(t)
 	entered := make(chan struct{}, 2)
@@ -227,6 +231,7 @@ func TestBootstrapNetworkOrdinaryCallsConcurrentAndCloseJoins(t *testing.T) {
 }
 
 func TestBootstrapNetworkMissingInstallationFailsClosed(t *testing.T) {
+	t.Parallel()
 	cache := newBootstrapRuntimeConnCache([]*raftGroupRuntime{{bootstrapDomain: &bootstrapDomain{}}})
 	t.Cleanup(func() { require.NoError(t, cache.Close()) })
 	_, err := cache.ConnFor("127.0.0.1:1")
@@ -234,6 +239,7 @@ func TestBootstrapNetworkMissingInstallationFailsClosed(t *testing.T) {
 }
 
 func TestBootstrapNetworkSuccessThenRevocationIsUnknown(t *testing.T) {
+	t.Parallel()
 	f := newBootstrapNetworkFixture(t, false)
 	interceptor := f.network.unary(f.address)
 	err := interceptor(t.Context(), pb.RawKV_RawLatestCommitTS_FullMethodName, nil, nil, nil,
@@ -252,6 +258,7 @@ type bootstrapNetworkTestStream struct {
 func (s bootstrapNetworkTestStream) Context() context.Context { return s.ctx }
 
 func TestBootstrapNetworkCloseCancelsAndJoinsOrdinaryStream(t *testing.T) {
+	t.Parallel()
 	f := newBootstrapNetworkFixture(t, false)
 	stream, err := f.network.stream(f.address)(t.Context(), &grpc.StreamDesc{}, nil, "ordinary-stream",
 		func(ctx context.Context, _ *grpc.StreamDesc, _ *grpc.ClientConn, _ string, _ ...grpc.CallOption) (grpc.ClientStream, error) {
@@ -267,6 +274,7 @@ func TestBootstrapNetworkCloseCancelsAndJoinsOrdinaryStream(t *testing.T) {
 }
 
 func TestBootstrapNetworkPrepareControlInheritsAllocatorBeforeDataReady(t *testing.T) {
+	t.Parallel()
 	f := newBootstrapNetworkFixture(t, false)
 	a := f.sender.admission
 	require.False(t, f.network.dataReady())

@@ -35,6 +35,7 @@ func unfilteredPrepareEvidenceClient(t *testing.T, server *Internal) pb.Internal
 }
 
 func TestPrepareEvidenceRPCWithoutAdminInterceptorRequiresCredential(t *testing.T) {
+	t.Parallel()
 	leader := &prepareSafetyRPCLeader{}
 	client := unfilteredPrepareEvidenceClient(t,
 		NewInternalWithEngine(nil, leader, nil, nil, WithInternalStore(store.NewMVCCStore())))
@@ -52,6 +53,7 @@ func TestPrepareEvidenceRPCWithoutAdminInterceptorRequiresCredential(t *testing.
 }
 
 func TestPrepareEvidenceRPCChecksConfiguredCredentialWithoutInterceptor(t *testing.T) {
+	t.Parallel()
 	leader := &prepareSafetyRPCLeader{}
 	client := unfilteredPrepareEvidenceClient(t, NewInternalWithEngine(nil, leader, nil, nil,
 		WithInternalStore(store.NewMVCCStore()), WithInternalPrepareEvidenceToken(prepareEvidenceBudgetToken)))
@@ -80,6 +82,7 @@ func (l *prepareEvidenceBudgetLeader) LinearizableRead(ctx context.Context) (uin
 }
 
 func TestPrepareEvidenceRPCBoundsFenceAndPreservesEarlierDeadline(t *testing.T) {
+	t.Parallel()
 	for _, timeout := range []time.Duration{0, time.Second, time.Hour} {
 		t.Run(timeout.String(), func(t *testing.T) {
 			observed := make(chan time.Time, 1)
@@ -112,6 +115,8 @@ func TestPrepareEvidenceRPCBoundsFenceAndPreservesEarlierDeadline(t *testing.T) 
 }
 
 func TestPrepareEvidenceRPCRejectsConcurrentScansBeforeQuorumWork(t *testing.T) {
+	// Not parallel: its deadline/liveness budget is sized for a quiet
+	// process, and parallel peers on a loaded runner can exhaust it.
 	started := make(chan struct{}, 2)
 	release := make(chan struct{}, 2)
 	defer close(release)
@@ -164,6 +169,8 @@ func (s *prepareEvidenceBudgetStore) ScanAt(ctx context.Context, start, end []by
 }
 
 func TestPrepareEvidenceRPCScanSharesFenceDeadlineAndNeverReturnsPartialDrain(t *testing.T) {
+	// Not parallel: its deadline/liveness budget is sized for a quiet
+	// process, and parallel peers on a loaded runner can exhaust it.
 	base := store.NewMVCCStore()
 	require.Nil(t, kv.NewKvFSMWithHLC(base, kv.NewHLC()).Apply(kv.EncodePrepareEvidenceFence(0)))
 	st := &prepareEvidenceBudgetStore{MVCCStore: base}

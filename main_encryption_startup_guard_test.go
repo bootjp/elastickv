@@ -76,6 +76,7 @@ func snapshotPayloadWithCutover(t *testing.T, cutover uint64) []byte {
 }
 
 func TestCheckEnvelopeCutoverDivergenceSnapshotPayload_SidecarZeroRefusesSnapshotCutover(t *testing.T) {
+	t.Parallel()
 	payload := snapshotPayloadWithCutover(t, 99)
 	err := checkEnvelopeCutoverDivergenceSnapshotPayload(bytes.NewReader(payload), 0, 1)
 	if !errors.Is(err, encryption.ErrEnvelopeCutoverDivergence) {
@@ -144,6 +145,7 @@ func writeActiveStorageSidecarForStartup(t *testing.T, localEpoch uint16) string
 // fast-skip when --encryption-enabled is off. Even with a stale
 // sidecar on disk, the guard MUST return nil and never read it.
 func TestCheckSidecarBehindRaftLog_DisabledNoop(t *testing.T) {
+	t.Parallel()
 	sidecarPath := writeMinimalSidecar(t, 0) // way behind any engine
 	err := checkSidecarBehindRaftLog(nil, 1, sidecarPath, false)
 	if err != nil {
@@ -154,6 +156,7 @@ func TestCheckSidecarBehindRaftLog_DisabledNoop(t *testing.T) {
 // TestCheckSidecarBehindRaftLog_NoSidecarPathNoop pins the
 // empty-path fast-skip.
 func TestCheckSidecarBehindRaftLog_NoSidecarPathNoop(t *testing.T) {
+	t.Parallel()
 	err := checkSidecarBehindRaftLog(nil, 1, "", true)
 	if err != nil {
 		t.Fatalf("guard must skip on empty sidecar path; got %v", err)
@@ -164,6 +167,7 @@ func TestCheckSidecarBehindRaftLog_NoSidecarPathNoop(t *testing.T) {
 // "no on-disk sidecar" fast-skip. A configured sidecar path with
 // no file means bootstrap hasn't committed — no gap to refuse on.
 func TestCheckSidecarBehindRaftLog_SidecarAbsentNoop(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	err := checkSidecarBehindRaftLog(nil, 1, filepath.Join(dir, "nonexistent.json"), true)
 	if err != nil {
@@ -175,6 +179,7 @@ func TestCheckSidecarBehindRaftLog_SidecarAbsentNoop(t *testing.T) {
 // I/O error (path with NUL byte) as a wrapped error rather than
 // silently classifying it as "sidecar absent".
 func TestCheckSidecarBehindRaftLog_SidecarStatError(t *testing.T) {
+	t.Parallel()
 	err := checkSidecarBehindRaftLog(nil, 1, "/tmp/elastickv-test/\x00invalid", true)
 	if err == nil {
 		t.Fatal("guard must surface I/O error from sidecar stat")
@@ -190,6 +195,7 @@ func TestCheckSidecarBehindRaftLog_SidecarStatError(t *testing.T) {
 // group's runtime, but the defensive return prevents a nil-deref
 // on misconfigured shard maps.
 func TestCheckSidecarBehindRaftLog_NoRuntimes(t *testing.T) {
+	t.Parallel()
 	sidecarPath := writeMinimalSidecar(t, 10)
 	err := checkSidecarBehindRaftLog(nil, 1, sidecarPath, true)
 	if err != nil {
@@ -207,6 +213,7 @@ func TestCheckSidecarBehindRaftLog_NoRuntimes(t *testing.T) {
 // would let the guard pass on a node that cannot serve, defeating
 // the §9.1 fail-closed contract.
 func TestCheckSidecarBehindRaftLog_NilEngineFailsClosed(t *testing.T) {
+	t.Parallel()
 	sidecarPath := writeMinimalSidecar(t, 10)
 	rt := &raftGroupRuntime{spec: groupSpec{id: 1}} // engine field stays nil
 	err := checkSidecarBehindRaftLog([]*raftGroupRuntime{rt}, 1, sidecarPath, true)
@@ -222,6 +229,7 @@ func TestCheckSidecarBehindRaftLog_NilEngineFailsClosed(t *testing.T) {
 // "sidecar already past engine" no-op path in the per-engine
 // inner function.
 func TestRunSidecarBehindRaftLogGuard_CaughtUp(t *testing.T) {
+	t.Parallel()
 	sidecarPath := writeMinimalSidecar(t, 100) // ahead of engine
 	gap := &stubGapEngine{
 		appliedIndex: 50,
@@ -236,6 +244,7 @@ func TestRunSidecarBehindRaftLogGuard_CaughtUp(t *testing.T) {
 // TestRunSidecarBehindRaftLogGuard_GapNotCovered pins the
 // "behind but harmless" path.
 func TestRunSidecarBehindRaftLogGuard_GapNotCovered(t *testing.T) {
+	t.Parallel()
 	sidecarPath := writeMinimalSidecar(t, 10)
 	gap := &stubGapEngine{
 		appliedIndex: 50,
@@ -252,6 +261,7 @@ func TestRunSidecarBehindRaftLogGuard_GapNotCovered(t *testing.T) {
 // with the sidecar path + default_group annotation that
 // operators see in the log line.
 func TestRunSidecarBehindRaftLogGuard_GapCovered(t *testing.T) {
+	t.Parallel()
 	sidecarPath := writeMinimalSidecar(t, 10)
 	gap := &stubGapEngine{
 		appliedIndex: 50,
@@ -272,6 +282,7 @@ func TestRunSidecarBehindRaftLogGuard_GapCovered(t *testing.T) {
 // return nil for this transitional case even when the scanner
 // would otherwise classify the range as relevant (hit=true).
 func TestRunSidecarBehindRaftLogGuard_SidecarIndexZero_SkipsTransitionally(t *testing.T) {
+	t.Parallel()
 	sidecarPath := writeMinimalSidecar(t, 0) // applier-side advancement not yet shipped
 	gap := &stubGapEngine{
 		appliedIndex: 50,
@@ -288,6 +299,7 @@ func TestRunSidecarBehindRaftLogGuard_SidecarIndexZero_SkipsTransitionally(t *te
 // marked with ErrSidecarBehindRaftLog (operator triages
 // scanner failure separately).
 func TestRunSidecarBehindRaftLogGuard_ScannerError(t *testing.T) {
+	t.Parallel()
 	sidecarPath := writeMinimalSidecar(t, 10)
 	scanErr := errors.New("simulated WAL corruption")
 	gap := &stubGapEngine{
@@ -311,6 +323,7 @@ func TestRunSidecarBehindRaftLogGuard_ScannerError(t *testing.T) {
 // Pins the cyclop-reduction shape: caller is "single if err !=
 // nil" downstream of the chain helper.
 func TestChainEncryptionStartupGuard_PropagatesPrevError(t *testing.T) {
+	t.Parallel()
 	prev := errors.New("build failed")
 	got := chainEncryptionStartupGuard(prev, nil, 0, "", false)
 	if !errors.Is(got, prev) {
@@ -321,6 +334,7 @@ func TestChainEncryptionStartupGuard_PropagatesPrevError(t *testing.T) {
 // TestChainEncryptionStartupGuard_NilPrevRunsGuard verifies
 // the other half: nil prevErr forwards to checkSidecarBehindRaftLog.
 func TestChainEncryptionStartupGuard_NilPrevRunsGuard(t *testing.T) {
+	t.Parallel()
 	got := chainEncryptionStartupGuard(nil, nil, 0, "", false)
 	if got != nil {
 		t.Fatalf("chain with nil prev and skipped guard must return nil; got %v", got)

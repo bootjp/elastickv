@@ -31,6 +31,7 @@ func bootstrapBindingForTest(group uint64) peersession.RequestBinding {
 }
 
 func TestBootstrapSharedGRPCMethodsExactInventory(t *testing.T) {
+	t.Parallel()
 	methods := bootstrapSharedGRPCMethods(bootstrapMethodsTestGroup)
 	names := make([]string, 0, len(methods))
 	for _, method := range methods {
@@ -47,6 +48,7 @@ func TestBootstrapSharedGRPCMethodsExactInventory(t *testing.T) {
 }
 
 func TestBootstrapSharedGRPCMethodsBoundRoutingAndReplies(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name  string
 		group uint64
@@ -90,6 +92,7 @@ func TestBootstrapSharedGRPCMethodsBoundRoutingAndReplies(t *testing.T) {
 }
 
 func TestBootstrapFloorMethodRejectsNonFloorRequests(t *testing.T) {
+	t.Parallel()
 	method := bootstrapMethodForTest(t, bootstrapMethodsTestGroup, pb.RawKV_RawLatestCommitTS_FullMethodName)
 	for _, req := range []*pb.RawLatestCommitTSRequest{
 		nil, {}, {GroupId: bootstrapMethodsTestGroup + 1},
@@ -111,6 +114,7 @@ func TestBootstrapFloorMethodRejectsNonFloorRequests(t *testing.T) {
 }
 
 func TestBootstrapTimestampMethodRetainsBoundsAndTargetGroup(t *testing.T) {
+	t.Parallel()
 	method := bootstrapMethodForTest(t, dedicatedTSORaftGroupID, pb.Distribution_GetTimestamp_FullMethodName)
 	for _, req := range []*pb.GetTimestampRequest{{}, {Count: 1}, {Count: uint32(kv.MaxTSOBatchSize)},
 		{MinTimestamp: 10, ActivateCutover: true, ActivatePhaseD: true}} {
@@ -127,6 +131,7 @@ func TestBootstrapTimestampMethodRetainsBoundsAndTargetGroup(t *testing.T) {
 }
 
 func TestBootstrapPrepareProposalAcceptsOnlyCanonicalControls(t *testing.T) {
+	t.Parallel()
 	method := bootstrapMethodForTest(t, bootstrapMethodsTestGroup, pb.Internal_ForwardAdminProposal_FullMethodName)
 	binding := bootstrapBindingForTest(bootstrapMethodsTestGroup)
 	for _, payload := range [][]byte{kv.EncodePrepareEvidenceFence(0), kv.EncodePrepareEvidenceFence(10),
@@ -152,6 +157,7 @@ func TestBootstrapPrepareProposalAcceptsOnlyCanonicalControls(t *testing.T) {
 }
 
 func TestBootstrapPrepareMethodsRejectNilMessages(t *testing.T) {
+	t.Parallel()
 	binding := bootstrapBindingForTest(bootstrapMethodsTestGroup)
 	_, err := bootstrapPrepareStateRequest(binding, (*pb.PrepareEvidenceStateRequest)(nil))
 	require.Error(t, err)
@@ -166,6 +172,7 @@ func TestBootstrapPrepareMethodsRejectNilMessages(t *testing.T) {
 }
 
 func TestBootstrapForwardActivationUsesOnlyPolicyControl(t *testing.T) {
+	t.Parallel()
 	method := bootstrapMethodForTest(t, bootstrapMethodsTestGroup, pb.Internal_ForwardAdminProposal_FullMethodName)
 	binding := bootstrapBindingForTest(bootstrapMethodsTestGroup)
 	payload := bootstrapPayloadActivation(t, bootstrapMethodsTestGroup)

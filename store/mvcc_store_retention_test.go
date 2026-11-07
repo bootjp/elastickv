@@ -9,6 +9,7 @@ import (
 )
 
 func TestMVCCStore_ReadTSCompacted(t *testing.T) {
+	t.Parallel()
 	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
 		st := newStore(t)
 		ctx := context.Background()
@@ -34,6 +35,7 @@ func TestMVCCStore_ReadTSCompacted(t *testing.T) {
 }
 
 func TestMVCCStore_SnapshotRestorePreservesMinRetainedTS(t *testing.T) {
+	t.Parallel()
 	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
 		src := newStore(t)
 		ctx := context.Background()

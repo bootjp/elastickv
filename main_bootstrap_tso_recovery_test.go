@@ -15,6 +15,7 @@ import (
 )
 
 func TestNamespaceReplayMustRejectHaltBeforeNoop(t *testing.T) {
+	t.Parallel()
 	baseline, prepared := preparedTSOMigrationFixture(t)
 	dir := t.TempDir()
 	_, err := initializePreparedTSOBaseline(t.Context(), dir, baseline, prepared)

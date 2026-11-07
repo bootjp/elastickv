@@ -11,6 +11,7 @@ import (
 )
 
 func TestRetryFilesystemStartupWaitsForLeadershipAndHLCLease(t *testing.T) {
+	t.Parallel()
 	attempts := 0
 	err := retryFilesystemStartup(t.Context(), time.Nanosecond, func(context.Context) error {
 		attempts++
@@ -28,6 +29,7 @@ func TestRetryFilesystemStartupWaitsForLeadershipAndHLCLease(t *testing.T) {
 }
 
 func TestRetryFilesystemStartupRejectsNonTransientError(t *testing.T) {
+	t.Parallel()
 	permanent := errors.New("corrupt filesystem root")
 	attempts := 0
 	err := retryFilesystemStartup(t.Context(), time.Nanosecond, func(context.Context) error {
@@ -39,6 +41,7 @@ func TestRetryFilesystemStartupRejectsNonTransientError(t *testing.T) {
 }
 
 func TestRetryFilesystemStartupStopsAtDeadline(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithTimeout(t.Context(), time.Millisecond)
 	defer cancel()
 	err := retryFilesystemStartup(ctx, time.Millisecond, func(context.Context) error {

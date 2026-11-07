@@ -15,6 +15,7 @@ func transferSizeReadinessForTest() TargetStagedReadinessState {
 }
 
 func TestMigrationSizeGuardCodecExplicitVersion(t *testing.T) {
+	t.Parallel()
 	state := transferSizeReadinessForTest()
 	encoded := encodeTargetStagedReadinessState(state)
 	require.Equal(t, byte(3), encoded[0])
@@ -35,6 +36,7 @@ func TestMigrationSizeGuardCodecExplicitVersion(t *testing.T) {
 }
 
 func TestMigrationSizeGuardSnapshotAndReopen(t *testing.T) {
+	t.Parallel()
 	want := transferSizeReadinessForTest()
 	runMigrationStoreSuite(t, func(t *testing.T, source MVCCStore) {
 		writer, ok := source.(MigrationTargetReadinessWriter)
@@ -72,6 +74,7 @@ func TestMigrationSizeGuardSnapshotAndReopen(t *testing.T) {
 }
 
 func TestMigrationSizeGuardRejectsInvalidActivation(t *testing.T) {
+	t.Parallel()
 	for _, change := range []func(*TargetStagedReadinessState){
 		func(s *TargetStagedReadinessState) { s.TransferSizeGuardVersion = 2 },
 		func(s *TargetStagedReadinessState) { s.Armed = false },

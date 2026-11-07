@@ -72,6 +72,7 @@ func loadTransferJob(t *testing.T, ctx context.Context, catalog *distribution.Ca
 }
 
 func TestTransferPreflightPersistsEveryFamilyBeforeFence(t *testing.T) {
+	t.Parallel()
 	ctx, server, catalog, job, source := transferPreflightFixture(t)
 	// Old copy cursors, even marked done, do not attest a fresh full-history scan.
 	for i := range job.BracketProgress {
@@ -110,6 +111,7 @@ func TestTransferPreflightPersistsEveryFamilyBeforeFence(t *testing.T) {
 }
 
 func TestTransferPreflightRequiresExplicitDoneAndProgress(t *testing.T) {
+	t.Parallel()
 	for _, response := range []*pb.ExportRangeVersionsResponse{nil, {}, {NextCursor: []byte("resume")}} {
 		ctx, server, catalog, job, source := transferPreflightFixture(t)
 		require.NoError(t, server.finalizeSplitJobFence(ctx, job))
@@ -137,6 +139,7 @@ func TestTransferPreflightRequiresExplicitDoneAndProgress(t *testing.T) {
 }
 
 func TestTransferPreflightCannotTrustIncompleteVersionedEvidence(t *testing.T) {
+	t.Parallel()
 	job := splitJobForSourceGroupTest(t)
 	plan, err := distribution.PlanExportBrackets(job.SplitKey, []byte("z"))
 	require.NoError(t, err)
@@ -156,6 +159,7 @@ func TestTransferPreflightCannotTrustIncompleteVersionedEvidence(t *testing.T) {
 }
 
 func TestTransferOversizeAutoAbandonRetainsPhaseCursorAndHistory(t *testing.T) {
+	t.Parallel()
 	for _, phase := range []distribution.SplitJobPhase{distribution.SplitJobPhasePlanned, distribution.SplitJobPhaseBackfill, distribution.SplitJobPhaseFence, distribution.SplitJobPhaseDeltaCopy} {
 		ctx, server, catalog, job, _ := transferPreflightFixture(t)
 		job.Phase = phase
@@ -185,6 +189,7 @@ func TestTransferOversizeAutoAbandonRetainsPhaseCursorAndHistory(t *testing.T) {
 }
 
 func TestTransferAutoAbandonCannotCrossCutoverOrCanceledCAS(t *testing.T) {
+	t.Parallel()
 	ctx, server, catalog, job, _ := transferPreflightFixture(t)
 	canceled, cancel := context.WithCancel(ctx)
 	cancel()
@@ -202,6 +207,7 @@ func TestTransferAutoAbandonCannotCrossCutoverOrCanceledCAS(t *testing.T) {
 }
 
 func TestTransferStaleFenceCannotRunAfterAbandon(t *testing.T) {
+	t.Parallel()
 	ctx, server, catalog, job, _ := transferPreflightFixture(t)
 	require.NoError(t, server.abandonOversizedSplitTransfer(ctx, job, errors.Mark(errors.New("oversize"), errMigrationOversizedSourceVersion)))
 	snapshot, err := catalog.Snapshot(ctx)
@@ -214,6 +220,7 @@ func TestTransferStaleFenceCannotRunAfterAbandon(t *testing.T) {
 }
 
 func TestTransferFenceTransactionDependsOnLiveJob(t *testing.T) {
+	t.Parallel()
 	ctx, server, catalog, job, _ := transferPreflightFixture(t)
 	coordinator, ok := server.coordinator.(*distributionCoordinatorStub)
 	require.True(t, ok)
@@ -239,6 +246,7 @@ func TestTransferFenceTransactionDependsOnLiveJob(t *testing.T) {
 }
 
 func TestTransferPreflightFindsHistoricalOversizeBeforeAnyFence(t *testing.T) {
+	t.Parallel()
 	ctx, server, catalog, job, source := transferPreflightFixture(t)
 	data := store.NewMVCCStore()
 	t.Cleanup(func() { _ = data.Close() })
@@ -271,6 +279,7 @@ func TestTransferPreflightFindsHistoricalOversizeBeforeAnyFence(t *testing.T) {
 }
 
 func TestTransferPreflightRaceAfterCompletionAutoAbandonsDelta(t *testing.T) {
+	t.Parallel()
 	ctx, server, catalog, job, source := transferPreflightFixture(t)
 	data := store.NewMVCCStore()
 	t.Cleanup(func() { _ = data.Close() })

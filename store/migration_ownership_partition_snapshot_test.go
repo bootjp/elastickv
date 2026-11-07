@@ -13,6 +13,7 @@ import (
 )
 
 func TestOwnershipPartitionSnapshotFormatsAndReopen(t *testing.T) {
+	t.Parallel()
 	for _, format := range []string{"mvcc", "native", "sst", "encrypted-native", "encrypted-sst"} {
 		t.Run(format, func(t *testing.T) {
 			var source MVCCStore
@@ -78,6 +79,7 @@ func TestOwnershipPartitionSnapshotFormatsAndReopen(t *testing.T) {
 }
 
 func TestOwnershipPartitionExternalRestoreRejectsContainerAlone(t *testing.T) {
+	t.Parallel()
 	for _, receiptOnly := range []bool{false, true} {
 		t.Run(map[bool]string{false: "frontier", true: "receipts-only"}[receiptOnly], func(t *testing.T) {
 			memory := NewMVCCStore()
@@ -107,6 +109,7 @@ func TestOwnershipPartitionExternalRestoreRejectsContainerAlone(t *testing.T) {
 }
 
 func TestOwnershipPartitionFailedWALBatchKeepsFrontierReceiptAndIndex(t *testing.T) {
+	t.Parallel()
 	db, err := pebble.Open(t.TempDir(), &pebble.Options{DisableWAL: true})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, db.Close()) })
@@ -152,6 +155,7 @@ func TestOwnershipPartitionFailedWALBatchKeepsFrontierReceiptAndIndex(t *testing
 }
 
 func TestOwnershipPartitionCorruptionAndNamespaceProtection(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	st, err := NewPebbleStore(dir)
 	require.NoError(t, err)
@@ -173,6 +177,7 @@ func TestOwnershipPartitionCorruptionAndNamespaceProtection(t *testing.T) {
 }
 
 func TestOwnershipPartitionRefusesRawEntryScopeWithoutReenteringOrEffects(t *testing.T) {
+	t.Parallel()
 	st, err := NewPebbleStore(t.TempDir())
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, st.Close()) })

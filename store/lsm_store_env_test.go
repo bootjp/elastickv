@@ -103,6 +103,7 @@ func TestPebbleCacheEnvOverride(t *testing.T) {
 }
 
 func TestMemoryBudgetHelpers(t *testing.T) {
+	t.Parallel()
 	require.Equal(t, int64(512), minPositiveMemoryBytes(0, 1024, -1, 512, 2048))
 	require.Equal(t, int64(0), minPositiveMemoryBytes(0, -1))
 	require.Equal(t, int64(1024), parseMemoryLimitBytes([]byte("1024\n")))
@@ -286,6 +287,7 @@ func newPebbleStoreWithFSMApplyWriteOptsForTest(t *testing.T, dir string, opts *
 // what NewPebbleStore calls. Mirrors the approach taken for
 // ELASTICKV_PEBBLE_CACHE_MB to avoid mutating os.Environ at runtime.
 func TestFSMApplySyncModeEnvOverride(t *testing.T) {
+	t.Parallel()
 	t.Run("empty string uses sync default", func(t *testing.T) {
 		opts, label := resolveFSMApplyWriteOpts("")
 		require.Same(t, pebble.Sync, opts)
@@ -337,6 +339,7 @@ func TestFSMApplySyncModeEnvOverride(t *testing.T) {
 // accessor, so monitoring can read the mode off a concrete store
 // instead of a package global.
 func TestFSMApplySyncModeLabelAccessor(t *testing.T) {
+	t.Parallel()
 	t.Run("nosync", func(t *testing.T) {
 		ps := newPebbleStoreWithFSMApplyWriteOptsForTest(t, t.TempDir(), pebble.NoSync, fsmSyncModeNoSync)
 		defer ps.Close()

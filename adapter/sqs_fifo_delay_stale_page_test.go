@@ -12,6 +12,7 @@ import (
 )
 
 func TestSQSFIFODelayStalePageCannotUndoLifecycle(t *testing.T) {
+	t.Parallel()
 	for _, partitions := range []uint32{1, 4} {
 		for _, action := range []string{"purge", "delete_recreate", "delete_message"} {
 			t.Run(fmt.Sprintf("partitions_%d/%s", partitions, action), func(t *testing.T) {

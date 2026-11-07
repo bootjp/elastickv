@@ -15,6 +15,7 @@ func configurationProjection(index uint64) []*KVPairMutation {
 }
 
 func TestRaftControlProjectionWatermarkSurvivesReopen(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	s, err := NewPebbleStore(dir)
 	require.NoError(t, err)
@@ -46,6 +47,7 @@ func TestRaftControlProjectionWatermarkSurvivesReopen(t *testing.T) {
 }
 
 func TestRaftControlProjectionConflictsSeeNonAdvertisedVersions(t *testing.T) {
+	t.Parallel()
 	for name, factory := range absenceTestStores(t) {
 		for _, separateEntry := range []bool{false, true} {
 			for _, preserving := range []bool{false, true} {
@@ -101,6 +103,7 @@ func testRaftControlProjectionConflict(t *testing.T, s MVCCStore, separateEntry,
 }
 
 func TestRaftControlProjectionRejectsOrdinaryKeysAtomically(t *testing.T) {
+	t.Parallel()
 	for name, factory := range absenceTestStores(t) {
 		t.Run(name, func(t *testing.T) {
 			s := factory(t)
@@ -120,6 +123,7 @@ func TestRaftControlProjectionRejectsOrdinaryKeysAtomically(t *testing.T) {
 }
 
 func TestRaftControlProjectionRejectsMixedKeysBeforeStaging(t *testing.T) {
+	t.Parallel()
 	for name, factory := range absenceTestStores(t) {
 		for _, knownFirst := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/knownFirst=%t", name, knownFirst), func(t *testing.T) {
@@ -150,6 +154,7 @@ func TestRaftControlProjectionRejectsMixedKeysBeforeStaging(t *testing.T) {
 }
 
 func TestRaftControlProjectionDoesNotAdvertiseStagedMaximum(t *testing.T) {
+	t.Parallel()
 	for name, factory := range absenceTestStores(t) {
 		for _, projectionFirst := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/projectionFirst=%t", name, projectionFirst), func(t *testing.T) {
@@ -177,6 +182,7 @@ func TestRaftControlProjectionDoesNotAdvertiseStagedMaximum(t *testing.T) {
 }
 
 func TestNormalMutationsCheckNonAdvertisedDependencies(t *testing.T) {
+	t.Parallel()
 	for name, factory := range absenceTestStores(t) {
 		for _, key := range [][]byte{MigrationConfigurationIndexKey(), []byte("!s3|chunkblob|dependency")} {
 			for _, writeDependency := range []bool{false, true} {

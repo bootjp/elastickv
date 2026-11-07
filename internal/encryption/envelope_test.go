@@ -10,6 +10,7 @@ import (
 )
 
 func TestEnvelope_RoundTrip(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name string
 		env  encryption.Envelope
@@ -106,6 +107,7 @@ func checkDecodedFields(t *testing.T, decoded *encryption.Envelope, want encrypt
 }
 
 func TestEnvelope_Decode_TooShort(t *testing.T) {
+	t.Parallel()
 	// Anything less than HeaderSize + TagSize is invalid.
 	for _, n := range []int{0, 1, encryption.HeaderSize - 1, encryption.HeaderSize, encryption.HeaderSize + encryption.TagSize - 1} {
 		buf := make([]byte, n)
@@ -120,6 +122,7 @@ func TestEnvelope_Decode_TooShort(t *testing.T) {
 }
 
 func TestEnvelope_Decode_RejectsUnknownVersion(t *testing.T) {
+	t.Parallel()
 	for _, version := range []byte{0x00, 0x03, 0x10, 0xFE, 0xFF} {
 		buf := make([]byte, encryption.HeaderSize+encryption.TagSize)
 		buf[0] = version
@@ -174,6 +177,7 @@ func TestEnvelope_RejectsUnknownFlagBits(t *testing.T) {
 }
 
 func TestEnvelope_Decode_DoesNotAliasInput(t *testing.T) {
+	t.Parallel()
 	src := make([]byte, encryption.HeaderSize+encryption.TagSize+8)
 	src[0] = encryption.EnvelopeVersionV1
 	for i := encryption.HeaderSize; i < len(src); i++ {
@@ -191,6 +195,7 @@ func TestEnvelope_Decode_DoesNotAliasInput(t *testing.T) {
 }
 
 func TestAppendHeaderAADBytes_AppendsAndAllocFree(t *testing.T) {
+	t.Parallel()
 	// Append onto an existing buffer. The result should be the original
 	// bytes followed by the 6-byte header.
 	prefix := []byte{0xCA, 0xFE}
@@ -212,6 +217,7 @@ func TestAppendHeaderAADBytes_AppendsAndAllocFree(t *testing.T) {
 }
 
 func TestEnvelope_Encode_RejectsBadVersion(t *testing.T) {
+	t.Parallel()
 	env := encryption.Envelope{
 		Version: 0x03,
 		Body:    bytes.Repeat([]byte{0xAA}, encryption.TagSize),
@@ -223,6 +229,7 @@ func TestEnvelope_Encode_RejectsBadVersion(t *testing.T) {
 }
 
 func TestEnvelope_Encode_RejectsShortBody(t *testing.T) {
+	t.Parallel()
 	for _, n := range []int{0, 1, encryption.TagSize - 1} {
 		env := encryption.Envelope{
 			Version: encryption.EnvelopeVersionV1,

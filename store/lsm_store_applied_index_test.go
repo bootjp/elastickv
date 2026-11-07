@@ -42,6 +42,7 @@ func newApplyIndexPebbleStore(t *testing.T) MVCCStore {
 // yet been mutated through a raft-Apply (pre-upgrade fsm.db, freshly
 // restored store).
 func TestLastAppliedIndex_MissingMetaKey(t *testing.T) {
+	t.Parallel()
 	st := newApplyIndexPebbleStore(t)
 	ps := pebbleStoreApplied(t, st)
 
@@ -57,6 +58,7 @@ func TestLastAppliedIndex_MissingMetaKey(t *testing.T) {
 // pebble.Sync-unconditionally commit and the little-endian encoding
 // round-trip.
 func TestSetDurableAppliedIndex_RoundTrip(t *testing.T) {
+	t.Parallel()
 	st := newApplyIndexPebbleStore(t)
 	ps := pebbleStoreApplied(t, st)
 
@@ -74,6 +76,7 @@ func TestSetDurableAppliedIndex_RoundTrip(t *testing.T) {
 // pebble.Batch as the data (and metaLastCommitTS). After the apply,
 // LastAppliedIndex must reflect the entry index passed in.
 func TestApplyMutationsRaftAt_BundlesMetaAppliedIndex(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := newApplyIndexPebbleStore(t)
 	ps := pebbleStoreApplied(t, st)
@@ -99,6 +102,7 @@ func TestApplyMutationsRaftAt_BundlesMetaAppliedIndex(t *testing.T) {
 }
 
 func TestApplyMutationsRaftAt_DistinctEntryWithSameTimestampIsNotReplay(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := newApplyIndexPebbleStore(t)
 	key := []byte("jepsen-list")
@@ -120,6 +124,7 @@ func TestApplyMutationsRaftAt_DistinctEntryWithSameTimestampIsNotReplay(t *testi
 }
 
 func TestPromoteVersions_BundlesMetaAppliedIndex(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := newApplyIndexPebbleStore(t)
 	ps := pebbleStoreApplied(t, st)
@@ -178,6 +183,7 @@ func TestPromoteVersions_BundlesMetaAppliedIndex(t *testing.T) {
 }
 
 func TestImportVersionsRaft_BundlesMetaAppliedIndex(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := newApplyIndexPebbleStore(t)
 	ps := pebbleStoreApplied(t, st)
@@ -232,6 +238,7 @@ func TestImportVersionsRaft_BundlesMetaAppliedIndex(t *testing.T) {
 }
 
 func TestRetireMigrationRaft_BundlesMetaAppliedIndex(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := newApplyIndexPebbleStore(t)
 	ps := pebbleStoreApplied(t, st)
@@ -279,6 +286,7 @@ func TestRetireMigrationRaft_BundlesMetaAppliedIndex(t *testing.T) {
 }
 
 func TestApplyMutationsRaftAt_EqualVersionWithoutRaftIndexIsNotReplay(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := newApplyIndexPebbleStore(t)
 	ps := pebbleStoreApplied(t, st)
@@ -311,6 +319,7 @@ func TestApplyMutationsRaftAt_EqualVersionWithoutRaftIndexIsNotReplay(t *testing
 }
 
 func TestApplyMutationsRaftAt_AlreadyLandedRequiresEveryMutationKey(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := newApplyIndexPebbleStore(t)
 	ps := pebbleStoreApplied(t, st)
@@ -345,6 +354,7 @@ func TestApplyMutationsRaftAt_AlreadyLandedRequiresEveryMutationKey(t *testing.T
 }
 
 func TestApplyMutationsRaftAt_AlreadyLandedFastPathDoesNotHideConflict(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := newApplyIndexPebbleStore(t)
 	ps := pebbleStoreApplied(t, st)
@@ -366,6 +376,7 @@ func TestApplyMutationsRaftAt_AlreadyLandedFastPathDoesNotHideConflict(t *testin
 // appliedIndex==0 escape hatch — callers without a raft entry index
 // (test fakes, legacy ApplyMutationsRaft) MUST NOT bump the meta key.
 func TestApplyMutationsRaftAt_ZeroIndexLeavesMetaKey(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := newApplyIndexPebbleStore(t)
 	ps := pebbleStoreApplied(t, st)
@@ -389,6 +400,7 @@ func TestApplyMutationsRaftAt_ZeroIndexLeavesMetaKey(t *testing.T) {
 // pebble.Batch separate from applyMutationsWithOpts). Without this
 // hook, DEL_PREFIX entries silently leave LastAppliedIndex behind.
 func TestDeletePrefixAtRaftAt_BundlesMetaAppliedIndex(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := newApplyIndexPebbleStore(t)
 	ps := pebbleStoreApplied(t, st)
@@ -410,6 +422,7 @@ func TestDeletePrefixAtRaftAt_BundlesMetaAppliedIndex(t *testing.T) {
 }
 
 func TestDeletePrefixesAtRaftAt_BundlesMetaAppliedIndex(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := newApplyIndexPebbleStore(t)
 	ps := pebbleStoreApplied(t, st)
@@ -471,6 +484,7 @@ func TestSetDurableAppliedIndex_UsesPebbleSync(t *testing.T) {
 }
 
 func TestRaftApplyMetaWriteOptsSyncsAppliedIndex(t *testing.T) {
+	t.Parallel()
 	require.Same(t, pebble.Sync, raftApplyMetaWriteOpts(true, pebble.NoSync))
 	require.Same(t, pebble.NoSync, raftApplyMetaWriteOpts(false, pebble.NoSync))
 }
@@ -487,6 +501,7 @@ func TestRaftApplyMetaWriteOptsSyncsAppliedIndex(t *testing.T) {
 //
 // After step 2, LastAppliedIndex must still report N+k.
 func TestSetDurableAppliedIndex_Monotonic(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := newApplyIndexPebbleStore(t)
 	ps := pebbleStoreApplied(t, st)
@@ -518,6 +533,7 @@ func TestSetDurableAppliedIndex_Monotonic(t *testing.T) {
 // runs first (no prior apply), then a strictly-greater index lands.
 // The forward write MUST take effect.
 func TestSetDurableAppliedIndex_AdvancesOnlyForward(t *testing.T) {
+	t.Parallel()
 	st := newApplyIndexPebbleStore(t)
 	ps := pebbleStoreApplied(t, st)
 
@@ -538,6 +554,7 @@ func TestSetDurableAppliedIndex_AdvancesOnlyForward(t *testing.T) {
 // (NOT as an error) so the caller falls back to full restore rather
 // than crashing the cold start.
 func TestLastAppliedIndex_CorruptValue(t *testing.T) {
+	t.Parallel()
 	st := newApplyIndexPebbleStore(t)
 	ps := pebbleStoreApplied(t, st)
 

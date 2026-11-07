@@ -184,6 +184,7 @@ func refuseRedisReadCopies(t *testing.T, s *RedisServer, g *redisWireTestGate, o
 }
 
 func TestRedisReadAdmissionRejectsBeforeBackendCopy(t *testing.T) {
+	t.Parallel()
 	const limit, clients, valueBytes = 2, 8, 1 << 20
 	observed, want, unblock := newRedisReadSourceBarrier(t, clients)
 	defer unblock()
@@ -215,6 +216,7 @@ func TestRedisReadAdmissionRejectsBeforeBackendCopy(t *testing.T) {
 }
 
 func TestRedisReadAdmissionShutdownJoinsRetainedCopies(t *testing.T) {
+	t.Parallel()
 	observed, _, unblock := newRedisReadSourceBarrier(t, 2)
 	defer unblock()
 	g := newRedisWireTestGate(t)
@@ -232,6 +234,7 @@ func TestRedisReadAdmissionShutdownJoinsRetainedCopies(t *testing.T) {
 }
 
 func TestRedisReadAdmissionBusyEXECRetiresQueuedOwner(t *testing.T) {
+	t.Parallel()
 	observed, want, unblock := newRedisReadSourceBarrier(t, 2)
 	defer unblock()
 	g := newRedisWireTestGate(t)
@@ -262,6 +265,7 @@ func TestRedisReadAdmissionBusyEXECRetiresQueuedOwner(t *testing.T) {
 }
 
 func TestRedisReadAdmissionFollowerProxyRetainsExecutionSlot(t *testing.T) {
+	t.Parallel()
 	observed, want, unblock := newRedisReadSourceBarrier(t, 2)
 	defer unblock()
 	leaderGate := newRedisWireTestGate(t)

@@ -12,6 +12,7 @@ import (
 )
 
 func TestMetadataCleanupPermanentlyRejectsLateMigrationMutations(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()
 		cleaner, ok := st.(MigrationCleaner)
@@ -83,6 +84,7 @@ func assertLateMigrationRejected(t *testing.T, st MVCCStore) {
 }
 
 func TestMigrationRetirementSurvivesSnapshotRestoreAndReopen(t *testing.T) {
+	t.Parallel()
 	source := NewMVCCStore()
 	initial, err := source.Snapshot()
 	require.NoError(t, err)
@@ -114,6 +116,7 @@ func TestMigrationRetirementSurvivesSnapshotRestoreAndReopen(t *testing.T) {
 }
 
 func TestMigrationRetirementNativeAndSSTSnapshots(t *testing.T) {
+	t.Parallel()
 	for _, sst := range []bool{false, true} {
 		t.Run(map[bool]string{false: "native", true: "sst"}[sst], func(t *testing.T) {
 			source, err := NewPebbleStore(t.TempDir(), WithSSTIngestSnapshots(sst))
@@ -137,6 +140,7 @@ func TestMigrationRetirementNativeAndSSTSnapshots(t *testing.T) {
 }
 
 func TestMigrationRetirementCleanupBatchFailureIsAtomic(t *testing.T) {
+	t.Parallel()
 	db, err := pebble.Open(t.TempDir(), &pebble.Options{DisableWAL: true})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, db.Close()) })
@@ -172,6 +176,7 @@ func TestMigrationRetirementCleanupBatchFailureIsAtomic(t *testing.T) {
 }
 
 func TestCorruptMigrationRetirementFailsClosed(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	st, err := NewPebbleStore(dir)
 	require.NoError(t, err)
