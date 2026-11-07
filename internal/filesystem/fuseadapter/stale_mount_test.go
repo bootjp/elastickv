@@ -33,6 +33,7 @@ func statReturning(err error) func(string) error {
 }
 
 func TestStaleFUSEMountDetection(t *testing.T) {
+	t.Parallel()
 	base := t.TempDir()
 	mountPoint := filepath.Join(base, "mount point")
 	require.NoError(t, os.Mkdir(mountPoint, 0o755))
@@ -139,6 +140,7 @@ func filesystemNameForTest(base, name string) string {
 }
 
 func TestStaleFUSEMountMatchesSymlinkedParent(t *testing.T) {
+	t.Parallel()
 	base := t.TempDir()
 	real := filepath.Join(base, "real")
 	require.NoError(t, os.Mkdir(real, 0o755))
@@ -156,6 +158,7 @@ func TestStaleFUSEMountMatchesSymlinkedParent(t *testing.T) {
 }
 
 func TestStaleFUSEMountMatchesSymlinkedMountPoint(t *testing.T) {
+	t.Parallel()
 	base := t.TempDir()
 	real := filepath.Join(base, "real-mount")
 	require.NoError(t, os.Mkdir(real, 0o755))
@@ -178,6 +181,7 @@ func TestStaleFUSEMountMatchesSymlinkedMountPoint(t *testing.T) {
 // resolves the parent first and mounts on /base/real/target, so a relative
 // link target must be joined to the canonical parent, not the typed one.
 func TestStaleFUSEMountMatchesRelativeSymlinkUnderSymlinkedParent(t *testing.T) {
+	t.Parallel()
 	base, err := filepath.EvalSymlinks(t.TempDir())
 	require.NoError(t, err)
 	deep := filepath.Join(base, "real", "deep")
@@ -199,6 +203,7 @@ func TestStaleFUSEMountMatchesRelativeSymlinkUnderSymlinkedParent(t *testing.T) 
 }
 
 func TestResolveMountPointSymlinksStopsAtNonSymlink(t *testing.T) {
+	t.Parallel()
 	base := t.TempDir()
 	real := filepath.Join(base, "real")
 	require.NoError(t, os.Mkdir(real, 0o755))
@@ -214,6 +219,7 @@ func TestResolveMountPointSymlinksStopsAtNonSymlink(t *testing.T) {
 }
 
 func TestStaleFUSEMountReportsUnreadableTable(t *testing.T) {
+	t.Parallel()
 	inspector := &staleMountInspector{
 		mountTable: filepath.Join(t.TempDir(), "missing"),
 		stat:       statReturning(syscall.ENOTCONN),
@@ -225,6 +231,7 @@ func TestStaleFUSEMountReportsUnreadableTable(t *testing.T) {
 }
 
 func TestDetachAllSkipsCheckWithoutMountTable(t *testing.T) {
+	t.Parallel()
 	// A chroot or minimal container may have /dev/fuse but no /proc; the
 	// stale check must not turn that into a new mount prerequisite.
 	inspector := &staleMountInspector{
@@ -242,6 +249,7 @@ func TestDetachAllSkipsCheckWithoutMountTable(t *testing.T) {
 }
 
 func TestDetachAllDetachesUntilClean(t *testing.T) {
+	t.Parallel()
 	mountPoint := t.TempDir()
 	stale := mountTableLine("elastickv", mountPoint, "fuse.elastickv")
 	// One table per state: two stacked dead mounts, one, none. Each fake
@@ -267,6 +275,7 @@ func TestDetachAllDetachesUntilClean(t *testing.T) {
 }
 
 func TestDetachAllLeavesHealthyPathAlone(t *testing.T) {
+	t.Parallel()
 	mountPoint := t.TempDir()
 	table := writeMountTable(t, mountTableLine("/dev/sda1", mountPoint, "ext4"))
 	inspector := &staleMountInspector{mountTable: table, stat: statReturning(syscall.ENOTCONN)}
@@ -281,6 +290,7 @@ func TestDetachAllLeavesHealthyPathAlone(t *testing.T) {
 }
 
 func TestDetachAllWrapsDetachFailure(t *testing.T) {
+	t.Parallel()
 	mountPoint := t.TempDir()
 	table := writeMountTable(t, mountTableLine("elastickv", mountPoint, "fuse.elastickv"))
 	inspector := &staleMountInspector{mountTable: table, stat: statReturning(syscall.ENOTCONN)}
@@ -294,6 +304,7 @@ func TestDetachAllWrapsDetachFailure(t *testing.T) {
 }
 
 func TestDetachAllClearsExactlyTheMaximum(t *testing.T) {
+	t.Parallel()
 	mountPoint := t.TempDir()
 	stale := mountTableLine("elastickv", mountPoint, "fuse.elastickv")
 	// tables[k] holds maxStaleMountDetaches-k stacked dead mounts; the last
@@ -321,6 +332,7 @@ func TestDetachAllClearsExactlyTheMaximum(t *testing.T) {
 }
 
 func TestDetachAllBoundsTheLoop(t *testing.T) {
+	t.Parallel()
 	mountPoint := t.TempDir()
 	table := writeMountTable(t, mountTableLine("elastickv", mountPoint, "fuse.elastickv"))
 	inspector := &staleMountInspector{mountTable: table, stat: statReturning(syscall.ENOTCONN)}
@@ -354,6 +366,7 @@ func blockingStat(release <-chan struct{}) func(string) error {
 }
 
 func TestStaleFUSEMountProbeStopsOnCancellation(t *testing.T) {
+	t.Parallel()
 	mountPoint := t.TempDir()
 	release := make(chan struct{})
 	t.Cleanup(func() { close(release) })
@@ -373,6 +386,7 @@ func TestStaleFUSEMountProbeStopsOnCancellation(t *testing.T) {
 }
 
 func TestStaleFUSEMountProbeTimesOutOnWedgedServer(t *testing.T) {
+	t.Parallel()
 	mountPoint := t.TempDir()
 	release := make(chan struct{})
 	t.Cleanup(func() { close(release) })
@@ -492,6 +506,7 @@ func TestDetachFUSEMountReachesKernelFallbackWhenHelperHangs(t *testing.T) {
 }
 
 func TestDetachHelperTimeoutSharesRemainingDeadline(t *testing.T) {
+	t.Parallel()
 	require.Equal(t, detachCommandTimeout-detachHelperWaitDelay, detachHelperTimeout(context.Background()))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -633,6 +648,7 @@ func TestDetachFUSEMountRechecksBeforeKernelFallback(t *testing.T) {
 // TestDetachAllReinspectsWhenMountVanishes: a stale mount that disappears
 // between the inspection and the detach is neither counted nor an error.
 func TestDetachAllReinspectsWhenMountVanishes(t *testing.T) {
+	t.Parallel()
 	mountPoint := t.TempDir()
 	tables := []string{
 		writeMountTable(t, fuseTableLine(mountPoint)),
@@ -653,6 +669,7 @@ func TestDetachAllReinspectsWhenMountVanishes(t *testing.T) {
 }
 
 func TestUnescapeMountTableField(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		in, want string
 	}{
@@ -676,6 +693,7 @@ func TestUnescapeMountTableField(t *testing.T) {
 // not. TestMountContextTypeFollowsMountName checks the same against a real
 // kernel mount.
 func TestFUSETypeFor(t *testing.T) {
+	t.Parallel()
 	require.Equal(t, "fuse.elastickv", fuseTypeFor(filesystemName))
 	require.Equal(t, "fuse.custom", fuseTypeFor("custom"))
 	require.Equal(t, "fuse.elastickv", (&staleMountInspector{}).expectedType())

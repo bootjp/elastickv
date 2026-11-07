@@ -46,6 +46,7 @@ func (c *blockingWriteCore) Write(ctx context.Context, inode, fh, offset uint64,
 }
 
 func TestFsyncWaitsForEarlierWrite(t *testing.T) {
+	t.Parallel()
 	core := &fakeCore{}
 	blocked := &blockingWriteCore{Core: core, started: make(chan struct{}), release: make(chan struct{})}
 	adapter := New(blocked, []byte("client"), WithHandleKeepaliveInterval(0))
@@ -66,6 +67,7 @@ func TestFsyncWaitsForEarlierWrite(t *testing.T) {
 }
 
 func TestFsyncRetainsUnknownPredecessorError(t *testing.T) {
+	t.Parallel()
 	core := &fakeCore{writeErr: kv.ErrTransactionOutcomeUnknown}
 	adapter := New(core, []byte("client"), WithHandleKeepaliveInterval(0))
 	t.Cleanup(adapter.Close)
@@ -79,6 +81,7 @@ func TestFsyncRetainsUnknownPredecessorError(t *testing.T) {
 }
 
 func TestMutationTrackerRetainsOtherUnknownAfterOneResolution(t *testing.T) {
+	t.Parallel()
 	var tracker mutationTracker
 	tracker.markUnknown(7)
 	tracker.markUnknown(7)
@@ -92,6 +95,7 @@ func TestMutationTrackerRetainsOtherUnknownAfterOneResolution(t *testing.T) {
 }
 
 func TestOrdinaryWriteEIODoesNotPoisonLaterMutations(t *testing.T) {
+	t.Parallel()
 	core := &fakeCore{writeErr: errors.New("storage unavailable")}
 	adapter := New(core, []byte("client"), WithHandleKeepaliveInterval(0))
 	t.Cleanup(adapter.Close)
@@ -104,6 +108,7 @@ func TestOrdinaryWriteEIODoesNotPoisonLaterMutations(t *testing.T) {
 }
 
 func TestDirectoryFsyncWaitsForEarlierNamespaceMutation(t *testing.T) {
+	t.Parallel()
 	core := &fakeCore{}
 	blocked := &blockingMkdirCore{Core: core, started: make(chan struct{}), release: make(chan struct{})}
 	adapter := New(blocked, []byte("client"), WithHandleKeepaliveInterval(0))
@@ -124,6 +129,7 @@ func TestDirectoryFsyncWaitsForEarlierNamespaceMutation(t *testing.T) {
 }
 
 func TestMutationTrackerOrdersSameInodeAndReleasesCanceledWaiter(t *testing.T) {
+	t.Parallel()
 	var tracker mutationTracker
 	first, errno := tracker.begin(t.Context(), 7)
 	require.Zero(t, errno)
