@@ -23,6 +23,7 @@ import (
 // named pipes use a different syscall path that we don't try to
 // model here.
 func TestFileWrapper_RejectsFIFO(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	fifoPath := filepath.Join(dir, "kek.fifo")
 	if err := syscall.Mkfifo(fifoPath, 0o600); err != nil {

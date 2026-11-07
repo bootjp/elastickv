@@ -47,6 +47,7 @@ func mustCipher(t *testing.T, ks *encryption.Keystore) *encryption.Cipher {
 }
 
 func TestCipher_RoundTrip(t *testing.T) {
+	t.Parallel()
 	ks, keyID := newKeystoreWithKey(t)
 	c := mustCipher(t, ks)
 	cases := []struct {
@@ -82,6 +83,7 @@ func TestCipher_RoundTrip(t *testing.T) {
 }
 
 func TestCipher_Decrypt_TagTamper(t *testing.T) {
+	t.Parallel()
 	ks, keyID := newKeystoreWithKey(t)
 	c := mustCipher(t, ks)
 	nonce := newRandomNonce(t)
@@ -98,6 +100,7 @@ func TestCipher_Decrypt_TagTamper(t *testing.T) {
 }
 
 func TestCipher_Decrypt_AADTamper(t *testing.T) {
+	t.Parallel()
 	ks, keyID := newKeystoreWithKey(t)
 	c := mustCipher(t, ks)
 	nonce := newRandomNonce(t)
@@ -112,6 +115,7 @@ func TestCipher_Decrypt_AADTamper(t *testing.T) {
 }
 
 func TestCipher_Decrypt_CiphertextTamper(t *testing.T) {
+	t.Parallel()
 	ks, keyID := newKeystoreWithKey(t)
 	c := mustCipher(t, ks)
 	nonce := newRandomNonce(t)
@@ -128,6 +132,7 @@ func TestCipher_Decrypt_CiphertextTamper(t *testing.T) {
 }
 
 func TestCipher_Decrypt_NonceTamper(t *testing.T) {
+	t.Parallel()
 	ks, keyID := newKeystoreWithKey(t)
 	c := mustCipher(t, ks)
 	nonce := newRandomNonce(t)
@@ -145,6 +150,7 @@ func TestCipher_Decrypt_NonceTamper(t *testing.T) {
 }
 
 func TestCipher_Encrypt_RejectsReservedKeyID(t *testing.T) {
+	t.Parallel()
 	ks := encryption.NewKeystore()
 	c := mustCipher(t, ks)
 	nonce := newRandomNonce(t)
@@ -155,6 +161,7 @@ func TestCipher_Encrypt_RejectsReservedKeyID(t *testing.T) {
 }
 
 func TestCipher_Encrypt_RejectsBadNonceSize(t *testing.T) {
+	t.Parallel()
 	ks, keyID := newKeystoreWithKey(t)
 	c := mustCipher(t, ks)
 	for _, nonceLen := range []int{0, 1, 11, 13, 16} {
@@ -166,6 +173,7 @@ func TestCipher_Encrypt_RejectsBadNonceSize(t *testing.T) {
 }
 
 func TestCipher_Encrypt_UnknownKeyID(t *testing.T) {
+	t.Parallel()
 	ks := encryption.NewKeystore()
 	c := mustCipher(t, ks)
 	nonce := newRandomNonce(t)
@@ -176,6 +184,7 @@ func TestCipher_Encrypt_UnknownKeyID(t *testing.T) {
 }
 
 func TestCipher_Decrypt_UnknownKeyID(t *testing.T) {
+	t.Parallel()
 	ks, keyID := newKeystoreWithKey(t)
 	c := mustCipher(t, ks)
 	nonce := newRandomNonce(t)
@@ -192,6 +201,7 @@ func TestCipher_Decrypt_UnknownKeyID(t *testing.T) {
 }
 
 func TestCipher_Decrypt_RejectsReservedKeyID(t *testing.T) {
+	t.Parallel()
 	ks := encryption.NewKeystore()
 	c := mustCipher(t, ks)
 	nonce := newRandomNonce(t)
@@ -205,6 +215,7 @@ func TestCipher_Decrypt_RejectsReservedKeyID(t *testing.T) {
 }
 
 func TestCipher_Decrypt_RejectsBadNonceSize(t *testing.T) {
+	t.Parallel()
 	ks, keyID := newKeystoreWithKey(t)
 	c := mustCipher(t, ks)
 	body := make([]byte, encryption.TagSize+1)
@@ -217,6 +228,7 @@ func TestCipher_Decrypt_RejectsBadNonceSize(t *testing.T) {
 }
 
 func TestNewCipher_RejectsNil(t *testing.T) {
+	t.Parallel()
 	c, err := encryption.NewCipher(nil)
 	if !errors.Is(err, encryption.ErrNilKeystore) {
 		t.Fatalf("expected ErrNilKeystore, got err=%v", err)
@@ -267,6 +279,7 @@ func TestCipher_ZeroValueRejected(t *testing.T) {
 }
 
 func TestCipher_DistinctNoncesProduceDistinctCiphertexts(t *testing.T) {
+	t.Parallel()
 	ks, keyID := newKeystoreWithKey(t)
 	c := mustCipher(t, ks)
 	plaintext := []byte("same message")

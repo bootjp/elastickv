@@ -45,6 +45,7 @@ func TestNewWrapperFromSourcesFileAndEnv(t *testing.T) {
 }
 
 func TestNewURIWrapperRejectsInvalidTargetsWithoutNetwork(t *testing.T) {
+	t.Parallel()
 	for _, uri := range []string{
 		"unknown://key",
 		"aws-kms://not-an-arn",
