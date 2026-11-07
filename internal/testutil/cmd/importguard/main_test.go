@@ -16,6 +16,7 @@ func writeSource(t *testing.T, root, name, source string) {
 }
 
 func TestCheckTreeRejectsInactivePlatformAndTagImports(t *testing.T) {
+	t.Parallel()
 	for _, name := range []string{"main_windows.go", "main_darwin.go", "main_linux.go", "tagged.go", "orphan/unused.go"} {
 		t.Run(name, func(t *testing.T) {
 			root := t.TempDir()
@@ -28,6 +29,7 @@ func TestCheckTreeRejectsInactivePlatformAndTagImports(t *testing.T) {
 }
 
 func TestCheckTreeSkipsOnlyTestSourcesAndToolingDirectories(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	for _, name := range []string{
 		"main_test.go", "internal/testutil/helper.go", "kv/kvtest/helper.go", "store/storetest/helper.go",
@@ -43,6 +45,7 @@ func TestCheckTreeSkipsOnlyTestSourcesAndToolingDirectories(t *testing.T) {
 }
 
 func TestCheckTreeRejectsUnreadableOrMalformedSource(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	require.Error(t, checkTree(filepath.Join(root, "missing")))
 	writeSource(t, root, "main.go", "package app\nimport (\n")
@@ -50,6 +53,7 @@ func TestCheckTreeRejectsUnreadableOrMalformedSource(t *testing.T) {
 }
 
 func TestForbiddenImport(t *testing.T) {
+	t.Parallel()
 	for _, path := range []string{
 		"testing", "testing/quick", "github.com/stretchr/testify/require",
 		"github.com/bootjp/elastickv/internal/testutil", "github.com/bootjp/elastickv/internal/testutil/grpctest",

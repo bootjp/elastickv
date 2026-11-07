@@ -42,6 +42,7 @@ func beginOnly(t *testing.T, f *nativeFixture, cc *grpc.ClientConn) (*handshakeP
 }
 
 func TestNativePendingAndCrossPhysicalConnection(t *testing.T) {
+	t.Parallel()
 	f := setupNative(t, fixtureOptions{})
 	first := f.dial(t)
 	second := f.dial(t)
@@ -65,6 +66,7 @@ func TestNativePendingAndCrossPhysicalConnection(t *testing.T) {
 }
 
 func TestNativeUnauthenticatedSpoofAndVersions(t *testing.T) {
+	t.Parallel()
 	for _, name := range []string{"no-cert", "token-alone", "wrong-ca", "unprovisioned-key", "spoof-id", "spoof-address", "spoof-server", "wrong-group", "version-zero", "old-no-session"} {
 		t.Run(name, func(t *testing.T) {
 			f := setupNative(t, fixtureOptions{})
@@ -128,6 +130,7 @@ func spoofHello(t *testing.T, h hello, name string) []byte {
 }
 
 func TestNativePayloadMethodAndSessionBinding(t *testing.T) {
+	t.Parallel()
 	f := setupNative(t, fixtureOptions{})
 	cc := f.dial(t)
 	h := f.handshake(t, cc)
@@ -163,6 +166,7 @@ func TestNativePayloadMethodAndSessionBinding(t *testing.T) {
 }
 
 func TestNativeReconnectAndTransparentRetryRequireNewHandshake(t *testing.T) {
+	t.Parallel()
 	f := setupNative(t, fixtureOptions{})
 	tc, err := f.client.TransportCredentials(f.clientTLS, false)
 	require.NoError(t, err)
@@ -210,6 +214,7 @@ func (s *badAckServer) Finish(ctx context.Context, f *wire.Frame) (*wire.Frame, 
 	return a, err
 }
 func TestNativeOppositeAckProofRequired(t *testing.T) {
+	t.Parallel()
 	f := setupNative(t, fixtureOptions{wrap: func(o *Owner) wire.PeerSessionServer { return &badAckServer{owner: o} }})
 	cc := f.dial(t)
 	ctx, cancel := context.WithTimeout(t.Context(), testTimeout)
@@ -220,6 +225,7 @@ func TestNativeOppositeAckProofRequired(t *testing.T) {
 }
 
 func TestNativeWrongFinishProofRetiresPending(t *testing.T) {
+	t.Parallel()
 	f := setupNative(t, fixtureOptions{})
 	cc := f.dial(t)
 	pin, s := beginOnly(t, f, cc)
@@ -235,6 +241,7 @@ func TestNativeWrongFinishProofRetiresPending(t *testing.T) {
 }
 
 func TestNativeStagePendingRoleAndPolicyRevocation(t *testing.T) {
+	t.Parallel()
 	for _, kind := range []string{"pending", "stage", "role", "policy", "key-mapping"} {
 		t.Run(kind, func(t *testing.T) {
 			f := setupNative(t, fixtureOptions{})
@@ -306,6 +313,7 @@ func (a *testCatchupAuthorizer) Recheck(_ context.Context, b Binding) (CatchupSt
 	return c, nil
 }
 func TestNativePrejoinLostAndExactCatchupGate(t *testing.T) {
+	t.Parallel()
 	for _, state := range []State{Prejoin, Lost} {
 		f := setupNative(t, fixtureOptions{clientState: state, learner: true})
 		cc := f.dial(t)
@@ -346,6 +354,7 @@ func TestNativePrejoinLostAndExactCatchupGate(t *testing.T) {
 }
 
 func TestNativePreactivationIntactElectionLane(t *testing.T) {
+	t.Parallel()
 	f := setupNative(t, fixtureOptions{preactivation: true})
 	cc := f.dial(t)
 	h := f.handshake(t, cc)
@@ -384,6 +393,7 @@ func (c secureControlCredentials) GetRequestMetadata(ctx context.Context, _ ...s
 	return map[string]string{"x-test-startup-control": "test-only-control"}, nil
 }
 func TestNativeControlCredentialSecurityLevel(t *testing.T) {
+	t.Parallel()
 	f := setupNative(t, fixtureOptions{})
 	cc := f.dial(t)
 	h := f.handshake(t, cc)
@@ -398,6 +408,7 @@ func TestNativeControlCredentialSecurityLevel(t *testing.T) {
 }
 
 func TestNativeCredentialCompositionRejectsReservedHeaderCollision(t *testing.T) {
+	t.Parallel()
 	f := setupNative(t, fixtureOptions{})
 	cc := f.dial(t)
 	h := f.handshake(t, cc)
@@ -410,6 +421,7 @@ func TestNativeCredentialCompositionRejectsReservedHeaderCollision(t *testing.T)
 }
 
 func TestNativeClientConnCloseDestroysBothSides(t *testing.T) {
+	t.Parallel()
 	f := setupNative(t, fixtureOptions{})
 	cc := f.dial(t)
 	h := f.handshake(t, cc)
@@ -425,6 +437,7 @@ func TestNativeClientConnCloseDestroysBothSides(t *testing.T) {
 }
 
 func TestNativeNewBootRetiresOldNonceAndSessions(t *testing.T) {
+	t.Parallel()
 	f := setupNative(t, fixtureOptions{})
 	oldClient := f.client
 	oldCC := f.dial(t)
@@ -470,6 +483,7 @@ func TestNativeNewBootRetiresOldNonceAndSessions(t *testing.T) {
 }
 
 func TestNativeStreamValidatesEveryChunkBeforeSpooling(t *testing.T) {
+	t.Parallel()
 	for _, firstValid := range []bool{false, true} {
 		f := setupNative(t, fixtureOptions{})
 		cc := f.dial(t)
@@ -503,6 +517,7 @@ func TestNativeStreamValidatesEveryChunkBeforeSpooling(t *testing.T) {
 }
 
 func TestNativeServerOutboundPayloadValidation(t *testing.T) {
+	t.Parallel()
 	f := setupNative(t, fixtureOptions{})
 	cc := f.dial(t)
 	h := f.handshake(t, cc)

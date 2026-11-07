@@ -14,6 +14,7 @@ import (
 )
 
 func TestArchiveCLICompressesAndExtractsDump(t *testing.T) {
+	t.Parallel()
 	root := writeCLIDumpFixture(t)
 	archivePath := filepath.Join(t.TempDir(), "dump.tar.zst")
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -31,6 +32,7 @@ func TestArchiveCLICompressesAndExtractsDump(t *testing.T) {
 }
 
 func TestArchiveCLIRejectsCorruptChecksums(t *testing.T) {
+	t.Parallel()
 	root := writeCLIDumpFixture(t)
 	require.NoError(t, os.WriteFile(filepath.Join(root, "redis", "db_0", "strings", "key.bin"), []byte("tampered"), 0o600))
 	archivePath := filepath.Join(t.TempDir(), "dump.tar")
@@ -48,6 +50,7 @@ func TestArchiveCLIRejectsCorruptChecksums(t *testing.T) {
 }
 
 func TestArchiveCLIRejectsOutputInsideInputTree(t *testing.T) {
+	t.Parallel()
 	root := writeCLIDumpFixture(t)
 
 	code, err := run([]string{
@@ -60,6 +63,7 @@ func TestArchiveCLIRejectsOutputInsideInputTree(t *testing.T) {
 }
 
 func TestArchiveCLIRejectsSymlinkedOutputInsideInputTree(t *testing.T) {
+	t.Parallel()
 	root := writeCLIDumpFixture(t)
 	linkParent := filepath.Join(t.TempDir(), "archive-out")
 	require.NoError(t, os.Symlink(filepath.Join(root, "redis"), linkParent))
@@ -74,6 +78,7 @@ func TestArchiveCLIRejectsSymlinkedOutputInsideInputTree(t *testing.T) {
 }
 
 func TestCloseArchiveOutputRemovesFailedArtifact(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "dump.tar")
 	require.NoError(t, os.WriteFile(path, []byte("partial"), 0o600))
 

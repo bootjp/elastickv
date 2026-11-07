@@ -15,6 +15,7 @@ import (
 )
 
 func TestNativeBootRevocationSpansGroups(t *testing.T) {
+	t.Parallel()
 	f := setupNative(t, fixtureOptions{})
 	provisions := []Provision{{Node: f.clientNode, Groups: []uint64{testGroup, testGroup + 1}}, {Node: f.serverNode, Groups: []uint64{testGroup, testGroup + 1}}}
 	require.NoError(t, f.client.ReplaceProvisioning(provisions))
@@ -58,6 +59,7 @@ func TestNativeBootRevocationSpansGroups(t *testing.T) {
 }
 
 func TestNativeTLS12PublicCompatibilityAndEMSPeer(t *testing.T) {
+	t.Parallel()
 	f := setupNative(t, fixtureOptions{})
 	ctx, cancel := context.WithTimeout(t.Context(), testTimeout)
 	defer cancel()
@@ -84,6 +86,7 @@ func TestNativeTLS12PublicCompatibilityAndEMSPeer(t *testing.T) {
 }
 
 func TestNativeServerHostnameVerificationAndTLSConfiguration(t *testing.T) {
+	t.Parallel()
 	f := setupNative(t, fixtureOptions{})
 	for _, mutate := range []func(*tls.Config){
 		func(c *tls.Config) { c.InsecureSkipVerify = true },
@@ -113,6 +116,7 @@ func TestNativeServerHostnameVerificationAndTLSConfiguration(t *testing.T) {
 }
 
 func TestBoundContextPropagatesParentAndSessionCancellation(t *testing.T) {
+	t.Parallel()
 	parent, cancelParent := context.WithCancel(t.Context())
 	life, cancelLife := context.WithCancel(t.Context())
 	defer cancelLife()

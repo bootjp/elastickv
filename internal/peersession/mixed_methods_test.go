@@ -149,6 +149,7 @@ func (s *mixedCaptureStream) RecvMsg(payload any) error {
 }
 
 func TestMixedMethodsTLSControlBeforePublicData(t *testing.T) {
+	t.Parallel()
 	var ready atomic.Bool
 	f := setupMixed(t, &ready, ControlReady)
 	cc := f.dial(t)
@@ -168,6 +169,7 @@ func TestMixedMethodsTLSControlBeforePublicData(t *testing.T) {
 }
 
 func TestMixedMethodsTLSMalformedMetadataNeverFallsBack(t *testing.T) {
+	t.Parallel()
 	var ready atomic.Bool
 	ready.Store(true)
 	f := setupMixed(t, &ready, ControlReady)
@@ -201,6 +203,7 @@ func TestMixedMethodsTLSMalformedMetadataNeverFallsBack(t *testing.T) {
 }
 
 func TestMixedMethodsTLSBindingAndRevocation(t *testing.T) {
+	t.Parallel()
 	var ready atomic.Bool
 	ready.Store(true)
 	f := setupMixed(t, &ready, ControlReady)
@@ -224,6 +227,7 @@ func TestMixedMethodsTLSBindingAndRevocation(t *testing.T) {
 }
 
 func TestMixedMethodsTLSIdentityStageCannotIssueControl(t *testing.T) {
+	t.Parallel()
 	var ready atomic.Bool
 	ready.Store(true)
 	f := setupMixed(t, &ready, IdentityReady)
@@ -238,6 +242,7 @@ func TestMixedMethodsTLSIdentityStageCannotIssueControl(t *testing.T) {
 }
 
 func TestMixedMethodsTLSRejectsUnverifiedOrInsecurePeer(t *testing.T) {
+	t.Parallel()
 	var ready atomic.Bool
 	ready.Store(true)
 	f := setupMixed(t, &ready, ControlReady)
@@ -263,6 +268,7 @@ func TestMixedMethodsTLSRejectsUnverifiedOrInsecurePeer(t *testing.T) {
 }
 
 func TestMixedMethodsTLSAdditionalTokenGateIsConjunctive(t *testing.T) {
+	t.Parallel()
 	var ready atomic.Bool
 	ready.Store(true)
 	f := setupMixed(t, &ready, ControlReady)
@@ -282,6 +288,7 @@ func TestMixedMethodsTLSAdditionalTokenGateIsConjunctive(t *testing.T) {
 }
 
 func TestMixedMethodsStreamMetadataDoesNotDowngrade(t *testing.T) {
+	t.Parallel()
 	var ready atomic.Bool
 	f := setupMixed(t, &ready, ControlReady)
 	cc := f.dial(t)
@@ -309,6 +316,7 @@ func TestMixedMethodsStreamMetadataDoesNotDowngrade(t *testing.T) {
 }
 
 func TestMixedMethodsDecoderConfiguration(t *testing.T) {
+	t.Parallel()
 	method := mixedMethods()[0]
 	require.True(t, validDecoders(method))
 	for _, mutate := range []func(*Method){

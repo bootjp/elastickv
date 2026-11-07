@@ -21,6 +21,7 @@ func readyExternalRotation(t *testing.T) *Arbiter {
 }
 
 func TestExternalRotationTransfersOriginalOwner(t *testing.T) {
+	t.Parallel()
 	a := readyExternalRotation(t)
 	request, err := a.CaptureRotationRequest(t.Context())
 	require.NoError(t, err)
@@ -36,6 +37,7 @@ func TestExternalRotationTransfersOriginalOwner(t *testing.T) {
 }
 
 func TestExternalRotationRejectsInvalidatedRequest(t *testing.T) {
+	t.Parallel()
 	for _, cause := range []string{"term", "encryption", "caller"} {
 		t.Run(cause, func(t *testing.T) {
 			a := readyExternalRotation(t)
@@ -62,6 +64,7 @@ func TestExternalRotationRejectsInvalidatedRequest(t *testing.T) {
 }
 
 func TestExternalRotationRequiresLoadedCatalog(t *testing.T) {
+	t.Parallel()
 	a := readyExternalRotation(t)
 	a.mu.Lock()
 	a.groups[a.config.DefaultGroup].loaded = false

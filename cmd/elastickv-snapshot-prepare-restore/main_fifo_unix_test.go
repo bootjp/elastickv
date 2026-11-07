@@ -16,6 +16,7 @@ import (
 )
 
 func TestRunPrepareRestoreRejectsFIFOInputBeforeOpen(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	input := filepath.Join(dir, "encoded.fsm")
 	require.NoError(t, syscall.Mkfifo(input, 0o600))
@@ -33,6 +34,7 @@ func TestRunPrepareRestoreRejectsFIFOInputBeforeOpen(t *testing.T) {
 }
 
 func TestRunPrepareRestoreRejectsFIFOEncodeInfoBeforeOpen(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	input := writeHeaderOnlyFSM(t, filepath.Join(dir, "encoded.fsm"))
 	require.NoError(t, syscall.Mkfifo(backup.EncodeInfoSidecarPath(input), 0o600))
@@ -49,6 +51,7 @@ func TestRunPrepareRestoreRejectsFIFOEncodeInfoBeforeOpen(t *testing.T) {
 }
 
 func TestRunPrepareRestoreRejectsSymlinkInputBeforeOpen(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	target := writeHeaderOnlyFSM(t, filepath.Join(dir, "target.fsm"))
 	input := filepath.Join(dir, "encoded.fsm")

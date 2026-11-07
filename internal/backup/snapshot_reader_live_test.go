@@ -177,6 +177,7 @@ func TestIsPebbleOperationalKey_MatchesStore(t *testing.T) {
 }
 
 func TestReadSnapshotRefusesToDropProtectedControlMetadata(t *testing.T) {
+	t.Parallel()
 	for _, sst := range []bool{false, true} {
 		t.Run(map[bool]string{false: "native", true: "sst"}[sst], func(t *testing.T) {
 			st, err := store.NewPebbleStore(t.TempDir(), store.WithSSTIngestSnapshots(sst))
