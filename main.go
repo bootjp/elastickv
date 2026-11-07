@@ -149,6 +149,7 @@ var (
 	tsoBatchSize                    = flag.Int("tsoBatchSize", defaultTSOBatchSize, "Timestamp batch size used by TSO cutover and shadow validation")
 	tsoModeFile                     = flag.String("tsoModeFile", "", "Path to a runtime-reloadable TSO mode file containing legacy, shadow, cutover, or phase-d")
 	tsoModeReloadInterval           = flag.Duration("tsoModeReloadInterval", defaultTSOReload, "Polling interval for tsoModeFile")
+	commitTSFence                   = flag.Bool("commitTSFence", false, "Reserved for replicated catalog bootstrap; activation is rejected until the startup catalog no longer writes outside Raft")
 	readWatermarkAdvance            = flag.Bool("readWatermarkAdvance", false, "Raise a lagging group's commit watermark before a cross-group snapshot read so late one-phase writes cannot land below the snapshot; enable only after every node runs a binary that understands the advance entry")
 	leaderBalance                   = flag.Bool("leaderBalance", false, "Enable automatic count-based Raft-group leader balancing on the default-group leader")
 	leaderBalanceInterval           = flag.Duration("leaderBalanceInterval", defaultLeaderBalanceInterval, "Interval between leader-balance scheduler evaluations")
@@ -645,6 +646,7 @@ func run() error {
 		WithKeyVizLabelsEnabled(*keyVizFlags.LabelsEnabled).
 		WithAllShardGroups(dataGroupIDs(cfg.groups)...).
 		WithPartitionResolver(sqsPartitionResolver)
+	configureCommitTSFenceActivation(coordinate, *commitTSFence, runtimes)
 	installBootstrapCoordinator(bootstrapDomain, coordinate, &cleanup)
 	tsoWiring, err := configureCoordinatorTSOWithObserver(
 		coordinate,
@@ -770,6 +772,14 @@ func newStartupShardStore(engine *distribution.Engine, groups map[uint64]*kv.Sha
 	return shardStore
 }
 
+func configureCommitTSFenceActivation(coordinate *kv.ShardedCoordinator, enabled bool, runtimes []*raftGroupRuntime) {
+	if enabled {
+		coordinate.WithCommitTSFenceActivation().WithCommitTSFenceActivationReady(func() bool {
+			return commitTSFenceRuntimesReady(runtimes)
+		})
+	}
+}
+
 func waitRunGroup(eg *errgroup.Group) error {
 	if err := eg.Wait(); err != nil {
 		return errors.Wrapf(err, "failed to serve")
@@ -793,6 +803,9 @@ func startTSOModeReloader(ctx context.Context, eg *errgroup.Group, wiring coordi
 }
 
 func resolveValidatedRuntimeInputs() (runtimeConfig, raftEngineType, raftBootstrapConfig, bool, error) {
+	if err := validateCommitTSFenceStartup(*commitTSFence, *raftBootstrapPeerConfigDir != ""); err != nil {
+		return runtimeConfig{}, "", raftBootstrapConfig{}, false, err
+	}
 	cfg, engineType, bootstrapCfg, bootstrap, err := resolveRuntimeInputs()
 	if err != nil {
 		return runtimeConfig{}, "", raftBootstrapConfig{}, false, err
@@ -802,6 +815,13 @@ func resolveValidatedRuntimeInputs() (runtimeConfig, raftEngineType, raftBootstr
 		*backupSnapshotHeadroomEntries, *backupScanPageSize, *backupMaxActivePins,
 	)
 	return cfg, engineType, bootstrapCfg, bootstrap, err
+}
+
+func validateCommitTSFenceStartup(enabled, protected bool) error {
+	if enabled && !protected {
+		return errors.New("commitTSFence requires protected Raft catalog bootstrap; legacy startup catalog writes outside Raft")
+	}
+	return nil
 }
 
 func validateLiveBackupConfig(
@@ -2990,8 +3010,14 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 	if err := waitRotateOnStartup.Wait(in.ctx); err != nil {
 		return runner.startupFailure(errors.Wrap(err, "encryption rotate-on-startup: wait before serving"))
 	}
+	return startPublicServicesAfterCommitTSFence(in, &runner, publicKVGate, *commitTSFence)
+}
+
+func startPublicServicesAfterCommitTSFence(in serversInput, runner *runtimeServerRunner, gate *startupPublicKVGate, fenceEnabled bool) error {
 	startHLCLeaseRenewal(in.ctx, in.eg, in.coordinate)
-	publicKVGate.markReady()
+	if err := markPublicGateReadyAfterCommitTSFence(in.ctx, gate, in.runtimes, fenceEnabled); err != nil {
+		return runner.startupFailure(errors.Wrap(err, "wait for commit-ts fence activation before public service"))
+	}
 	startDistributionSplitJobRunner(in.ctx, in.eg, in.distServer)
 	startMigrationOwnershipRefresh(in.ctx, in.eg, in.distServer)
 	if err := runner.startPublicServices(); err != nil {
@@ -4694,6 +4720,9 @@ func setupDistributionCatalog(
 	runtimes []*raftGroupRuntime,
 	engine *distribution.Engine,
 ) (*distribution.CatalogStore, error) {
+	if err := validateNoExistingCommitTSFenceActivation(ctx, runtimes, bootstrapDomainForRuntimes(runtimes) != nil); err != nil {
+		return nil, err
+	}
 	catalogGroupID, err := distributionCatalogGroupID(engine)
 	if err != nil {
 		return nil, errors.Wrapf(err, "resolve distribution catalog group")
@@ -4726,6 +4755,22 @@ func setupDistributionCatalog(
 		return nil, errors.Wrapf(err, "initialize distribution catalog")
 	}
 	return distCatalog, nil
+}
+
+func validateNoExistingCommitTSFenceActivation(ctx context.Context, runtimes []*raftGroupRuntime, protected bool) error {
+	for _, rt := range runtimes {
+		if rt == nil || rt.store == nil {
+			continue
+		}
+		active, err := kv.CommitTSFenceEnabled(ctx, rt.store)
+		if err != nil {
+			return errors.Wrapf(err, "read commit-ts fence activation for group %d", rt.spec.id)
+		}
+		if active && !protected {
+			return errors.WithStack(errors.Newf("group %d has an active commit-ts fence; protected Raft catalog bootstrap is required before startup", rt.spec.id))
+		}
+	}
+	return nil
 }
 
 func distributionCatalogGroupID(engine *distribution.Engine) (uint64, error) {

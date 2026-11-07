@@ -85,6 +85,7 @@ func bootstrapPayloadFixtures(t testing.TB) []bootstrapPayloadCase {
 		{"single", bootstrapPayloadProto(t, bootstrapPayloadSingle, bootstrapPayloadRequest()), data},
 		{"batch", bootstrapPayloadProto(t, bootstrapPayloadBatch, &pb.RaftCommand{Requests: []*pb.Request{bootstrapPayloadRequest(), bootstrapPayloadRequest()}}), data},
 		{"watermark", kv.EncodeWatermarkAdvance(42), data},
+		{"commit timestamp fence activation", kv.EncodeCommitTSFenceActivation(), data},
 		{"pin", kv.EncodeBackupPinEntry(pin), data},
 		{"reserve", kv.EncodeBackupReserveEntry(pin), data},
 		{"extend", kv.EncodeBackupExtendEntry(kv.BackupExtendEntry{PinID: pin.PinID, Deadline: pin.Deadline}), data},
