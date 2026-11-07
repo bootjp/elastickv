@@ -50,6 +50,7 @@ func policyFixture(t testing.TB) PolicyRecord {
 }
 
 func TestPolicyRecordCanonicalRoundTrip(t *testing.T) {
+	t.Parallel()
 	policy := policyFixture(t)
 	encoded, err := MarshalPolicyRecord(policy)
 	require.NoError(t, err)
@@ -76,6 +77,7 @@ func TestPolicyRecordCanonicalRoundTrip(t *testing.T) {
 }
 
 func TestPolicyRecordStrictFrame(t *testing.T) {
+	t.Parallel()
 	valid, err := MarshalPolicyRecord(policyFixture(t))
 	require.NoError(t, err)
 	for n := 0; n < len(valid); n++ {
@@ -114,6 +116,7 @@ func rechecksumPolicy(data []byte) {
 }
 
 func TestPolicyRecordValidation(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name   string
 		change func(*PolicyRecord)
@@ -166,6 +169,7 @@ func TestPolicyRecordValidation(t *testing.T) {
 }
 
 func TestReservationMembershipTransitionTargets(t *testing.T) {
+	t.Parallel()
 	t.Run("remove permits complete roster removal", func(t *testing.T) {
 		policy := policyFixture(t)
 		policy.Reservation.Transition = TransitionRemove
@@ -208,6 +212,7 @@ func TestReservationMembershipTransitionTargets(t *testing.T) {
 }
 
 func TestValidatePolicyTransitionConsumesExactReservation(t *testing.T) {
+	t.Parallel()
 	previous := policyFixture(t)
 	next := previous
 	next.Reservation = nil
@@ -242,6 +247,7 @@ func TestValidatePolicyTransitionConsumesExactReservation(t *testing.T) {
 }
 
 func TestCompletedRemovalMustRetireMemberID(t *testing.T) {
+	t.Parallel()
 	previous := policyFixture(t)
 	reservation := previous.Reservation
 	reservation.Transition = TransitionRemove
@@ -274,6 +280,7 @@ func TestCompletedRemovalMustRetireMemberID(t *testing.T) {
 }
 
 func TestAbortedLearnerAdditionMustRetireCandidateID(t *testing.T) {
+	t.Parallel()
 	previous := policyFixture(t)
 	reservation := previous.Reservation
 	reservation.Transition = TransitionAddLearner
@@ -317,6 +324,7 @@ func jointTransitionFixture(t *testing.T, transition MembershipTransition) Polic
 }
 
 func TestPolicyRecordRejectsNonCanonicalWire(t *testing.T) {
+	t.Parallel()
 	policy := policyFixture(t)
 	valid, err := MarshalPolicyRecord(policy)
 	require.NoError(t, err)
@@ -337,6 +345,7 @@ func TestPolicyRecordRejectsNonCanonicalWire(t *testing.T) {
 }
 
 func TestPolicyRecordMaximumBound(t *testing.T) {
+	t.Parallel()
 	policy := policyFixture(t)
 	policy.Reservation = nil
 	policy.TerminalOperations = nil
@@ -346,6 +355,7 @@ func TestPolicyRecordMaximumBound(t *testing.T) {
 }
 
 func TestPolicyDigestCoversAuthorityState(t *testing.T) {
+	t.Parallel()
 	base := policyFixture(t)
 	digest, err := PolicyDigest(base)
 	require.NoError(t, err)

@@ -77,6 +77,7 @@ func instrumentStaging(s *Store, before func(string) error, after func(string)) 
 }
 
 func TestPublicationStagingSuccessSyncsDestinationAndPreservesOrphans(t *testing.T) {
+	t.Parallel()
 	in, evidence := fixture(t)
 	s, data, staging := stagingStore(t)
 	put(t, staging, ".bootstrap-intent-abandoned.tmp", []byte("not authority"))
@@ -110,6 +111,7 @@ func TestPublicationStagingSuccessSyncsDestinationAndPreservesOrphans(t *testing
 }
 
 func TestPublicationStagingPreRenameFailuresLeaveSourceUnchanged(t *testing.T) {
+	t.Parallel()
 	for _, step := range []string{"create", "chmod", "write", "file-sync", "file-close", "rename"} {
 		t.Run(step, func(t *testing.T) {
 			in, evidence := fixture(t)
@@ -130,6 +132,7 @@ func TestPublicationStagingPreRenameFailuresLeaveSourceUnchanged(t *testing.T) {
 }
 
 func TestPublicationStagingDestinationSyncFailureIsNotSuccess(t *testing.T) {
+	t.Parallel()
 	for _, name := range []string{IntentFile, MarkerFile} {
 		t.Run(name, func(t *testing.T) {
 			in, evidence := fixture(t)
@@ -153,6 +156,7 @@ func TestPublicationStagingDestinationSyncFailureIsNotSuccess(t *testing.T) {
 }
 
 func TestPublicationStagingCrossDeviceRenameDoesNotCopy(t *testing.T) {
+	t.Parallel()
 	in, evidence := fixture(t)
 	s, data, _ := stagingStore(t)
 	put(t, data, MarkerFile, []byte("etcd\n"))
@@ -165,6 +169,7 @@ func TestPublicationStagingCrossDeviceRenameDoesNotCopy(t *testing.T) {
 }
 
 func TestPublicationStagingRejectsInvalidOrOverlappingDirectories(t *testing.T) {
+	t.Parallel()
 	_, data, staging := stagingStore(t)
 	file := filepath.Join(t.TempDir(), "not-a-directory")
 	require.NoError(t, os.WriteFile(file, []byte("preserve"), filePerm))
@@ -189,6 +194,7 @@ func TestPublicationStagingRejectsInvalidOrOverlappingDirectories(t *testing.T) 
 }
 
 func TestPublicationStagingRevalidatesPinnedDirectories(t *testing.T) {
+	t.Parallel()
 	for _, replaced := range []string{"source", "staging"} {
 		t.Run(replaced, func(t *testing.T) {
 			in, evidence := fixture(t)
@@ -224,6 +230,7 @@ func TestPublicationStagingCrashChild(t *testing.T) {
 }
 
 func TestPublicationStagingCrashLeavesNoSourceTempsAndResumes(t *testing.T) {
+	t.Parallel()
 	// Process crashes, not power-loss persistence. The latter still depends on
 	// the unchanged file-sync -> rename -> destination-dir-sync contract.
 	for _, boundary := range []string{IntentFile + ":file-sync", IntentFile + ":rename", MarkerFile + ":file-sync"} {
