@@ -1,0 +1,30 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: elastickv-api
+spec:
+  ingressClassName: example-controller
+  tls:
+    - hosts: [s3.example.test, sqs.example.test]
+      secretName: elastickv-api-tls
+  rules:
+    - host: s3.example.test
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: elastickv
+                port:
+                  name: s3
+    - host: sqs.example.test
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: elastickv
+                port:
+                  name: sqs

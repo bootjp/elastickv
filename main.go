@@ -117,6 +117,7 @@ var (
 	s3CredsFile                     = flag.String("s3CredentialsFile", "", "Path to a JSON file containing static S3 credentials")
 	s3PathStyleOnly                 = flag.Bool("s3PathStyleOnly", true, "Only accept path-style S3 requests")
 	sqsAddr                         = flag.String("sqsAddress", "", "TCP host+port for SQS-compatible API; empty to disable")
+	sqsPublicEndpoint               = flag.String("sqsPublicEndpoint", "", "Public HTTP(S) origin used in SQS queue URLs behind a proxy; empty derives URLs from the request")
 	sqsRegion                       = flag.String("sqsRegion", "us-east-1", "SQS signing region")
 	sqsCredsFile                    = flag.String("sqsCredentialsFile", "", "Path to a JSON file containing static SQS credentials")
 	metricsAddr                     = flag.String("metricsAddress", "localhost:9090", "TCP host+port for Prometheus metrics")
@@ -2930,6 +2931,7 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 		leaderSQS:          in.cfg.leaderSQS,
 		sqsRegion:          *sqsRegion,
 		sqsCredsFile:       *sqsCredsFile,
+		sqsPublicEndpoint:  *sqsPublicEndpoint,
 		// sqsPartitionResolver is rebuilt from the same config map
 		// the coordinator's WithPartitionResolver consumes (line
 		// ~328) so the SQS server's CreateQueue capability gate
@@ -4877,6 +4879,7 @@ type runtimeServerRunner struct {
 	leaderSQS                       map[string]string
 	sqsRegion                       string
 	sqsCredsFile                    string
+	sqsPublicEndpoint               string
 	metricsAddress                  string
 	metricsToken                    string
 	pprofAddress                    string
@@ -5104,7 +5107,7 @@ func (r *runtimeServerRunner) preparePublicServices() error {
 
 	sqsServer, sqsListener, err := prepareSQSServer(
 		r.ctx, r.lc, r.sqsAddress, r.shardStore, r.coordinate,
-		r.leaderSQS, r.sqsRegion, r.sqsCredsFile,
+		r.leaderSQS, r.sqsRegion, r.sqsCredsFile, r.sqsPublicEndpoint,
 		r.sqsPartitionResolver, r.sqsPartitionObserver,
 	)
 	if err != nil {

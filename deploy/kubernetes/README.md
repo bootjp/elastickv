@@ -1,0 +1,11 @@
+# Kubernetes manifests
+
+See [the deployment guide](../../docs/kubernetes.md) for storage setup, bootstrap, verification, and maintenance.
+The base restarts an existing three-voter cluster from persistent state and refuses to bootstrap an empty volume.
+Use `bootstrap/` only for initial creation, then return every Pod to the base before admitting application writes.
+Prepare `elastickv-local` storage before applying the manifests.
+Client access includes Redis, DynamoDB, S3, and SQS; the shared Raft/gRPC control port is reserved for peers and trusted operators.
+
+S3 and SQS require the `elastickv-api-credentials` Secret.
+Optional examples cover [TLS Ingress](examples/https/) and [a FUSE mount shared within a Pod](examples/fuse/).
+The FUSE example requires a dedicated image and privileged mount propagation; neither example is installed by the base.

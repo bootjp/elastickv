@@ -51,6 +51,7 @@ Architecture diagrams are available in:
 
 Deployment/runbook documents:
 
+- [`docs/kubernetes.md`](docs/kubernetes.md) (generic Kubernetes manifests, persistent storage, verification, and operations)
 - `docs/docker_multinode_manual_run.md` (manual `docker run`, 4-5 node cluster on multiple VMs, no docker compose)
 - `docs/etcd_raft_migration_operations.md` (offline HashiCorp-to-etcd cutover runbook and verification checklist)
 - `docs/redis-proxy-deployment.md` (Redis-protocol reverse proxy for zero-downtime Redis-to-Elastickv migration)
@@ -173,6 +174,8 @@ go run . \
   --raftId "n1" \
   --raftBootstrap
 ```
+
+When SQS runs behind a TLS-terminating proxy, set `--sqsPublicEndpoint "https://sqs.example.test"` to make CreateQueue, GetQueueUrl, and ListQueues return the public HTTPS origin. This setting accepts an HTTP(S) origin without a path prefix and does not enable TLS on the listener.
 
 The S3 and SQS listeners can share a static credentials file. Create `/etc/elastickv/credentials.json` before starting the server, with credentials matching the client configuration:
 
