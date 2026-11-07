@@ -1,0 +1,124 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: elastickv
+spec:
+  serviceName: elastickv-peer
+  replicas: 3
+  podManagementPolicy: Parallel
+  # Readiness checks listener availability, not replicated progress.
+  # Operators verify quorum and catch-up before replacing another member.
+  updateStrategy:
+    type: OnDelete
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: elastickv
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: elastickv
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 90
+      nodeSelector:
+        kubernetes.io/os: linux
+        kubernetes.io/arch: amd64
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: elastickv
+              topologyKey: kubernetes.io/hostname
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: elastickv
+          # Example only: pin a tested commit tag or digest before deployment.
+          image: ghcr.io/bootjp/elastickv:latest
+          imagePullPolicy: Always
+          command: [/app]
+          args:
+            - --address=$(POD_NAME).elastickv-peer.$(POD_NAMESPACE).svc:50051
+            - --raftId=$(POD_NAME)
+            - --raftDataDir=/var/lib/elastickv
+            - --raftBootstrap
+            - --raftBootstrapMembers=elastickv-0=elastickv-0.elastickv-peer.$(POD_NAMESPACE).svc:50051,elastickv-1=elastickv-1.elastickv-peer.$(POD_NAMESPACE).svc:50051,elastickv-2=elastickv-2.elastickv-peer.$(POD_NAMESPACE).svc:50051
+            - --redisAddress=0.0.0.0:6379
+            - --dynamoAddress=0.0.0.0:8000
+            - --raftRedisMap=elastickv-0.elastickv-peer.$(POD_NAMESPACE).svc:50051=elastickv-0.elastickv-peer.$(POD_NAMESPACE).svc:6379,elastickv-1.elastickv-peer.$(POD_NAMESPACE).svc:50051=elastickv-1.elastickv-peer.$(POD_NAMESPACE).svc:6379,elastickv-2.elastickv-peer.$(POD_NAMESPACE).svc:50051=elastickv-2.elastickv-peer.$(POD_NAMESPACE).svc:6379
+            - --raftDynamoMap=elastickv-0.elastickv-peer.$(POD_NAMESPACE).svc:50051=elastickv-0.elastickv-peer.$(POD_NAMESPACE).svc:8000,elastickv-1.elastickv-peer.$(POD_NAMESPACE).svc:50051=elastickv-1.elastickv-peer.$(POD_NAMESPACE).svc:8000,elastickv-2.elastickv-peer.$(POD_NAMESPACE).svc:50051=elastickv-2.elastickv-peer.$(POD_NAMESPACE).svc:8000
+            - --pprofAddress=
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: GOMEMLIMIT
+              value: 3GiB
+          ports:
+            - name: raft
+              containerPort: 50051
+            - name: redis
+              containerPort: 6379
+            - name: dynamodb
+              containerPort: 8000
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              memory: 4Gi
+          startupProbe:
+            tcpSocket:
+              port: raft
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 120
+          readinessProbe:
+            tcpSocket:
+              port: redis
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            tcpSocket:
+              port: raft
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/elastickv
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 256Mi
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: elastickv-local
+        resources:
+          requests:
+            storage: 100Gi

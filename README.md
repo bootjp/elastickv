@@ -51,6 +51,7 @@ Architecture diagrams are available in:
 
 Deployment/runbook documents:
 
+- [`docs/kubernetes.md`](docs/kubernetes.md) (generic Kubernetes manifests, persistent storage, verification, and operations)
 - `docs/docker_multinode_manual_run.md` (manual `docker run`, 4-5 node cluster on multiple VMs, no docker compose)
 - `docs/etcd_raft_migration_operations.md` (offline HashiCorp-to-etcd cutover runbook and verification checklist)
 - `docs/redis-proxy-deployment.md` (Redis-protocol reverse proxy for zero-downtime Redis-to-Elastickv migration)
