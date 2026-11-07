@@ -14,6 +14,8 @@ import (
 )
 
 func TestUnmountHelperCancellationKillsLateDescendant(t *testing.T) {
+	// Not parallel: its 1s wall-clock budget is sized for a quiet process,
+	// and parallel peers on a loaded runner can exhaust it.
 	dir := t.TempDir()
 	helper, ready, late := filepath.Join(dir, "helper"), filepath.Join(dir, "ready"), filepath.Join(dir, "late")
 	script := fmt.Sprintf("#!/bin/sh\n( /bin/sleep 1; printf late > '%s' ) &\nprintf ready > '%s'\nwait\n", late, ready)
