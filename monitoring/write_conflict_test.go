@@ -37,6 +37,7 @@ func (f *fakeWriteConflictSource) WriteConflictCountsByPrefix() map[string]uint6
 }
 
 func TestWriteConflictCollectorEmitsPositiveDeltas(t *testing.T) {
+	t.Parallel()
 	registry := NewRegistry("n1", "10.0.0.1:50051")
 	collector := registry.WriteConflictCollector()
 	require.NotNil(t, collector)
@@ -80,6 +81,7 @@ elastickv_store_write_conflict_total{group="1",key_prefix="zset",kind="write",no
 }
 
 func TestWriteConflictCollectorHandlesSourceReset(t *testing.T) {
+	t.Parallel()
 	// A store reopen resets the underlying counters. The collector
 	// must not emit a negative delta; it rebases silently.
 	registry := NewRegistry("n2", "10.0.0.2:50051")
@@ -111,6 +113,7 @@ elastickv_store_write_conflict_total{group="7",key_prefix="txn_lock",kind="write
 }
 
 func TestWriteConflictCollectorSkipsNilSourceAndMalformedLabels(t *testing.T) {
+	t.Parallel()
 	registry := NewRegistry("n3", "10.0.0.3:50051")
 	collector := registry.WriteConflictCollector()
 	require.NotNil(t, collector)
@@ -142,6 +145,7 @@ elastickv_store_write_conflict_total{group="42",key_prefix="hash",kind="write",n
 }
 
 func TestWriteConflictCollectorZeroRegistryIsSafe(t *testing.T) {
+	t.Parallel()
 	var c *WriteConflictCollector
 	require.NotPanics(t, func() { c.ObserveOnce(nil) })
 

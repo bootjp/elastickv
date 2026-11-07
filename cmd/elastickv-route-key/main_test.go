@@ -18,6 +18,7 @@ import (
 // in the encoding (zero-pad behaviour differs between Padded and
 // RawURL variants).
 func TestRouteKey_PinsAdapterEncoding(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		tableName string
 		want      string

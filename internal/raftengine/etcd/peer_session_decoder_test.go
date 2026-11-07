@@ -24,6 +24,7 @@ func peerDecoderWire(t *testing.T, kind raftpb.MessageType, from, to uint64) []b
 }
 
 func TestPeerSessionDecoderAppliedRoleChanges(t *testing.T) {
+	t.Parallel()
 	local := peersession.Node{Cluster: raftbootstrap.UUID{1}, Member: 1, Address: "local:9000", Key: raftbootstrap.Digest{1}}
 	remote := peersession.Node{Cluster: local.Cluster, Member: 2, Address: "remote:9000", Key: raftbootstrap.Digest{2}}
 	versions := raftbootstrap.Versions{Entry: 1, Snapshot: 1, Session: 1}
@@ -84,6 +85,7 @@ func TestPeerSessionDecoderAppliedRoleChanges(t *testing.T) {
 }
 
 func TestPeerSessionDecoderUnary(t *testing.T) {
+	t.Parallel()
 	learners := []uint64{3}
 	methods := PeerSessionMethods(0, learners)
 	learners[0] = 2
@@ -118,6 +120,7 @@ func TestPeerSessionDecoderUnary(t *testing.T) {
 }
 
 func TestPeerSessionDecoderStreams(t *testing.T) {
+	t.Parallel()
 	methods := PeerSessionMethods(1, nil)
 	b := peersession.Binding{Group: 1, Local: peersession.Node{Member: 1}, Remote: peersession.Node{Member: 2}}
 	for _, method := range methods[1:] {
@@ -167,6 +170,7 @@ func TestPeerSessionDecoderStreams(t *testing.T) {
 }
 
 func TestPeerSessionDecoderConcurrentDirections(t *testing.T) {
+	t.Parallel()
 	b := peersession.Binding{Group: 1, Local: peersession.Node{Member: 1}, Remote: peersession.Node{Member: 2}}
 	s, err := PeerSessionMethods(1, nil)[1].Stream(b)
 	require.NoError(t, err)
@@ -189,6 +193,7 @@ func TestPeerSessionDecoderConcurrentDirections(t *testing.T) {
 }
 
 func TestPeerSessionDecoderSnapshotConcurrentAndMalformed(t *testing.T) {
+	t.Parallel()
 	b := peersession.Binding{Group: 1, Local: peersession.Node{Member: 1}, Remote: peersession.Node{Member: 2}}
 	factory := PeerSessionMethods(1, nil)[2].Stream
 	for _, kind := range []raftpb.MessageType{raftpb.MsgApp, raftpb.MsgSnap} {

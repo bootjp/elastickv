@@ -16,6 +16,7 @@ import (
 )
 
 func TestSnapshotOffloadCLIPublishAndRestoreLocal(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	root := t.TempDir()
 	payload := []byte("EKVTHLC1cli-physical-snapshot-payload")
@@ -66,6 +67,7 @@ func TestSnapshotOffloadCLIPublishAndRestoreLocal(t *testing.T) {
 }
 
 func TestSnapshotOffloadCLIRequiresLocalRoot(t *testing.T) {
+	t.Parallel()
 	code, err := run(context.Background(), []string{
 		commandPublish,
 		"--store", storeLocal,
@@ -78,6 +80,7 @@ func TestSnapshotOffloadCLIRequiresLocalRoot(t *testing.T) {
 }
 
 func TestSnapshotOffloadCLIRejectsPositionalArgs(t *testing.T) {
+	t.Parallel()
 	_, err := parsePublishFlags([]string{
 		"--store", storeLocal,
 		"--local-root", "objects",
@@ -99,6 +102,7 @@ func TestSnapshotOffloadCLIRejectsPositionalArgs(t *testing.T) {
 }
 
 func TestSnapshotOffloadCLIS3KMSRequiresAWSKMS(t *testing.T) {
+	t.Parallel()
 	_, err := parsePublishFlags([]string{
 		"--store", storeS3,
 		"--s3-bucket", "bucket",

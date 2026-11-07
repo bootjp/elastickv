@@ -187,6 +187,7 @@ type registrationBindingCase struct {
 }
 
 func TestRegistrationBindingEncryptedReceiptAndFinalSeal(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []registrationBindingCase{
 		{name: "exact encrypted declaration", accepted: true},
 		{name: "different plaintext declaration", plainMismatch: true},

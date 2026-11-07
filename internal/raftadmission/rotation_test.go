@@ -21,6 +21,7 @@ func observeRotationRole(t *testing.T, a *Arbiter, term uint64, role raftengine.
 }
 
 func TestRotationFinishPreservesFirstOutcome(t *testing.T) {
+	t.Parallel()
 	a := newAdmission(t, true)
 	publishRotationProjection(t, a, sha256.Sum256([]byte("keys")))
 	run, err := a.BeginRotation(t.Context(), sha256.Sum256([]byte("recipe")))
@@ -30,6 +31,7 @@ func TestRotationFinishPreservesFirstOutcome(t *testing.T) {
 }
 
 func TestRotationGenerationOverflowLatchesClosed(t *testing.T) {
+	t.Parallel()
 	for _, counter := range []string{"sequence", "permission", "projection"} {
 		t.Run(counter, func(t *testing.T) {
 			a := newAdmission(t, true)
@@ -73,6 +75,7 @@ func completeRotationFixture(t *testing.T, a *Arbiter, recipe, projection raftbo
 }
 
 func TestRotationLeaderCompletionHasOwnedGeneration(t *testing.T) {
+	t.Parallel()
 	a := newAdmission(t, true)
 	digest := sha256.Sum256([]byte("verified local key projection"))
 	publishRotationProjection(t, a, digest)
@@ -97,6 +100,7 @@ func TestRotationLeaderCompletionHasOwnedGeneration(t *testing.T) {
 }
 
 func TestRotationFollowerDoesNotFabricateLeaderCompletion(t *testing.T) {
+	t.Parallel()
 	a := newAdmission(t, true)
 	projection := sha256.Sum256([]byte("registered local wrappers"))
 	publishRotationProjection(t, a, projection)
@@ -122,6 +126,7 @@ func TestRotationFollowerDoesNotFabricateLeaderCompletion(t *testing.T) {
 }
 
 func TestRotationProjectionChangeRetainsStaleHandles(t *testing.T) {
+	t.Parallel()
 	a := newAdmission(t, true)
 	projection := sha256.Sum256([]byte("old keys"))
 	publishRotationProjection(t, a, projection)
@@ -146,6 +151,7 @@ func TestRotationProjectionChangeRetainsStaleHandles(t *testing.T) {
 }
 
 func TestRotationCompletionRejectsCancelledParentAndFatalLatch(t *testing.T) {
+	t.Parallel()
 	a := newAdmission(t, true)
 	projection := sha256.Sum256([]byte("keys"))
 	publishRotationProjection(t, a, projection)
@@ -166,6 +172,7 @@ func TestRotationCompletionRejectsCancelledParentAndFatalLatch(t *testing.T) {
 }
 
 func TestEncryptionMutationCannotRepublishCoherentOldImage(t *testing.T) {
+	t.Parallel()
 	a := newAdmission(t, true)
 	projection := sha256.Sum256([]byte("old coherent image"))
 	publishRotationProjection(t, a, projection)

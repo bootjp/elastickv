@@ -14,6 +14,7 @@ import (
 )
 
 func TestProtectedReceivedSnapshotRetainsConfigurationProof(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name    string
 		index   uint64
@@ -106,6 +107,7 @@ func TestProtectedDataSnapshotRetainsConfigurationIndex(t *testing.T) {
 }
 
 func TestProtectedSnapshotRejectsUnprovenConfigurationIndex(t *testing.T) {
+	t.Parallel()
 	for _, index := range []uint64{0, 11} {
 		fsm := kv.NewKvFSMWithHLC(store.NewMVCCStore(), nil)
 		aware, ok := fsm.(raftengine.AppliedConfigurationAware)

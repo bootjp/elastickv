@@ -25,6 +25,7 @@ import (
 )
 
 func TestTransportContextAppliesTimeoutWhenUnset(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := transportContext(context.Background(), 3*time.Second)
 	t.Cleanup(cancel)
 
@@ -34,6 +35,7 @@ func TestTransportContextAppliesTimeoutWhenUnset(t *testing.T) {
 }
 
 func TestTransportContextPreservesExistingDeadline(t *testing.T) {
+	t.Parallel()
 	parent, cancel := context.WithTimeout(context.Background(), time.Second)
 	t.Cleanup(cancel)
 
@@ -48,6 +50,7 @@ func TestTransportContextPreservesExistingDeadline(t *testing.T) {
 }
 
 func TestSplitSnapshotMessageReusesClonedPayload(t *testing.T) {
+	t.Parallel()
 	msg := raftpb.Message{
 		Type: messageTypePtr(raftpb.MsgSnap),
 		Snapshot: &raftpb.Snapshot{
@@ -66,6 +69,7 @@ func TestSplitSnapshotMessageReusesClonedPayload(t *testing.T) {
 }
 
 func TestNewSnapshotSpoolUsesConfiguredDir(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	spool, err := newSnapshotSpool(dir)
 	require.NoError(t, err)
@@ -79,6 +83,7 @@ func TestNewSnapshotSpoolUsesConfiguredDir(t *testing.T) {
 }
 
 func TestReceiveSnapshotStreamRejectsPrematureEOF(t *testing.T) {
+	t.Parallel()
 	metadata := raftpb.Message{
 		Type: messageTypePtr(raftpb.MsgSnap),
 		To:   uint64Ptr(2),
@@ -103,6 +108,7 @@ func TestReceiveSnapshotStreamRejectsPrematureEOF(t *testing.T) {
 }
 
 func TestReceiveSnapshotStreamRejectsDuplicateMetadata(t *testing.T) {
+	t.Parallel()
 	metadata := raftpb.Message{
 		Type: messageTypePtr(raftpb.MsgSnap),
 		To:   uint64Ptr(2),
@@ -127,6 +133,7 @@ func TestReceiveSnapshotStreamRejectsDuplicateMetadata(t *testing.T) {
 }
 
 func TestSnapshotSendGateAllowsOnlyOneInFlightSnapshot(t *testing.T) {
+	t.Parallel()
 	transport := NewGRPCTransport(nil)
 
 	require.True(t, transport.tryAcquireSnapshotSend())
@@ -138,6 +145,7 @@ func TestSnapshotSendGateAllowsOnlyOneInFlightSnapshot(t *testing.T) {
 }
 
 func TestReceiveSnapshotStreamRejectsProtectedIndexBeforePayload(t *testing.T) {
+	t.Parallel()
 	const index = uint64(127)
 	metadata := raftpb.Message{
 		Type: messageTypePtr(raftpb.MsgSnap),
@@ -190,6 +198,7 @@ func TestReceiveSnapshotStreamRejectsProtectedIndexBeforePayload(t *testing.T) {
 // production node that single allocation OOMs the process before
 // RestoreSnapshot ever runs (2026-05-08 incident).
 func TestReceiveSnapshotStream_StreamingTokenWhenFSMSnapDirSet(t *testing.T) {
+	t.Parallel()
 	const index = uint64(123)
 	const term = uint64(5)
 
@@ -270,6 +279,7 @@ func TestReceiveSnapshotStream_StreamingTokenWhenFSMSnapDirSet(t *testing.T) {
 }
 
 func TestReceiveSnapshotStreamPreparesBeforeSpoolCreation(t *testing.T) {
+	t.Parallel()
 	const index = uint64(124)
 	payload := []byte("payload written after cleanup")
 	metadata := raftpb.Message{
@@ -313,6 +323,7 @@ func TestReceiveSnapshotStreamPreparesBeforeSpoolCreation(t *testing.T) {
 }
 
 func TestSendSnapshotProtectsFinalizedFSMFileUntilEngineRelease(t *testing.T) {
+	t.Parallel()
 	const index = uint64(91)
 
 	senderFSM := &testStateMachine{}
@@ -368,6 +379,7 @@ func TestSendSnapshotProtectsFinalizedFSMFileUntilEngineRelease(t *testing.T) {
 }
 
 func TestDrainSnapshotChunksProtectsBeforePublishingFSMFile(t *testing.T) {
+	t.Parallel()
 	const index = uint64(125)
 	payload := []byte("payload protected before final rename")
 	metadata := raftpb.Message{
@@ -411,6 +423,7 @@ func TestDrainSnapshotChunksProtectsBeforePublishingFSMFile(t *testing.T) {
 }
 
 func TestDrainSnapshotChunksRejectsStaleFSMProtection(t *testing.T) {
+	t.Parallel()
 	const index = uint64(127)
 	payload := []byte("stale payload must not be published")
 	metadata := raftpb.Message{
@@ -513,6 +526,7 @@ func TestDrainSnapshotChunksUnprotectsWhenFinalizeFails(t *testing.T) {
 }
 
 func TestDrainSnapshotChunksPreparesBeforePayloadWrite(t *testing.T) {
+	t.Parallel()
 	const index = uint64(124)
 	payload := []byte("payload written after prepare")
 	metadata := raftpb.Message{
@@ -561,6 +575,7 @@ func TestDrainSnapshotChunksPreparesBeforePayloadWrite(t *testing.T) {
 }
 
 func TestDrainSnapshotChunksRejectsPayloadBeforeMetadata(t *testing.T) {
+	t.Parallel()
 	fsmSnapDir := t.TempDir()
 	spool, err := newSnapshotSpool(fsmSnapDir)
 	require.NoError(t, err)
@@ -661,6 +676,7 @@ func TestReceiveSnapshotStream_SpoolPlacedInFSMSnapDir(t *testing.T) {
 // os.Rename's atomic-replace, so this test exercises the cross-index
 // case where the orphan would actually persist.
 func TestSendSnapshot_ApplyFailureRemovesFinalizedFSMFile(t *testing.T) {
+	t.Parallel()
 	const index = uint64(77)
 
 	// Build a real testStateMachine payload + framed bytes so receive
@@ -735,6 +751,7 @@ func TestSendSnapshot_ApplyFailureRemovesFinalizedFSMFile(t *testing.T) {
 // pre-PR materialization path. Tests that don't wire an fsmSnapDir (most
 // of the existing suite) MUST keep behaving exactly as before this PR.
 func TestReceiveSnapshotStream_LegacyFallbackWhenNoFSMSnapDir(t *testing.T) {
+	t.Parallel()
 	payload := []byte("legacy-inline-payload")
 	metadata := raftpb.Message{
 		Type: messageTypePtr(raftpb.MsgSnap),
@@ -812,6 +829,7 @@ func TestClientForDeduplicatesConcurrentDial(t *testing.T) {
 }
 
 func TestNewGRPCTransportDerivesPeerNodeIDs(t *testing.T) {
+	t.Parallel()
 	transport := NewGRPCTransport([]Peer{{
 		ID:      "n2",
 		Address: "127.0.0.1:65530",
@@ -824,6 +842,7 @@ func TestNewGRPCTransportDerivesPeerNodeIDs(t *testing.T) {
 }
 
 func TestSendStreamReceivesRegularMessages(t *testing.T) {
+	t.Parallel()
 	reqs := []*pb.EtcdRaftMessage{
 		mustEtcdRaftMessage(t, raftpb.Message{Type: messageTypePtr(raftpb.MsgApp), From: uint64Ptr(1), To: uint64Ptr(2), Term: uint64Ptr(3), Index: uint64Ptr(10)}),
 		mustEtcdRaftMessage(t, raftpb.Message{Type: messageTypePtr(raftpb.MsgHeartbeat), From: uint64Ptr(1), To: uint64Ptr(2), Term: uint64Ptr(3), Commit: uint64Ptr(9)}),
@@ -846,6 +865,7 @@ func TestSendStreamReceivesRegularMessages(t *testing.T) {
 }
 
 func TestDispatchRegularUsesSendStream(t *testing.T) {
+	t.Parallel()
 	lis, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = lis.Close() })
@@ -906,6 +926,7 @@ func TestDispatchRegularUsesSendStream(t *testing.T) {
 }
 
 func TestDispatchRegularFallsBackToUnaryWhenSendStreamUnimplemented(t *testing.T) {
+	t.Parallel()
 	lis, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = lis.Close() })
@@ -944,6 +965,7 @@ func TestDispatchRegularFallsBackToUnaryWhenSendStreamUnimplemented(t *testing.T
 }
 
 func TestDispatchRegularUsesUnaryForPriorityMessages(t *testing.T) {
+	t.Parallel()
 	const addr = "host:2"
 	transport := NewGRPCTransport([]Peer{{NodeID: 2, Address: addr}})
 	t.Cleanup(func() { require.NoError(t, transport.Close()) })
@@ -963,6 +985,7 @@ func TestDispatchRegularUsesUnaryForPriorityMessages(t *testing.T) {
 }
 
 func TestDispatchRegularDropsCachedPeerConnAfterUnaryUnavailable(t *testing.T) {
+	t.Parallel()
 	const addr = "host:2"
 	transport := NewGRPCTransport([]Peer{{NodeID: 2, Address: addr}})
 	t.Cleanup(func() { require.NoError(t, transport.Close()) })
@@ -1011,6 +1034,7 @@ func TestDispatchRegularUsesUnaryWhenSendStreamDisabled(t *testing.T) {
 }
 
 func TestSetSendStreamEnabledClosesCachedStreams(t *testing.T) {
+	t.Parallel()
 	const addr = "host:2"
 	transport := NewGRPCTransport([]Peer{{NodeID: 2, Address: addr}})
 	t.Cleanup(func() { require.NoError(t, transport.Close()) })
@@ -1038,6 +1062,7 @@ func TestSetSendStreamEnabledClosesCachedStreams(t *testing.T) {
 }
 
 func TestStreamForAbortsCachingWhenSendStreamDisabledDuringOpen(t *testing.T) {
+	t.Parallel()
 	const addr = "host:2"
 	transport := NewGRPCTransport([]Peer{{NodeID: 2, Address: addr}})
 	t.Cleanup(func() { require.NoError(t, transport.Close()) })
@@ -1079,6 +1104,7 @@ func TestStreamForAbortsCachingWhenSendStreamDisabledDuringOpen(t *testing.T) {
 }
 
 func TestDispatchRegularFallsBackToUnaryWhenSendStreamDisabledDuringSend(t *testing.T) {
+	t.Parallel()
 	const addr = "host:2"
 	transport := NewGRPCTransport([]Peer{{NodeID: 2, Address: addr}})
 	t.Cleanup(func() { require.NoError(t, transport.Close()) })
@@ -1120,6 +1146,7 @@ func TestDispatchRegularFallsBackToUnaryWhenSendStreamDisabledDuringSend(t *test
 }
 
 func TestDispatchRegularFallsBackToUnaryWhenSendStreamDisabledDuringProbe(t *testing.T) {
+	t.Parallel()
 	const addr = "host:2"
 	transport := NewGRPCTransport([]Peer{{NodeID: 2, Address: addr}})
 	t.Cleanup(func() { require.NoError(t, transport.Close()) })
@@ -1161,6 +1188,7 @@ func TestDispatchRegularFallsBackToUnaryWhenSendStreamDisabledDuringProbe(t *tes
 }
 
 func TestDispatchRegularFallsBackToUnaryWhenSendStreamDisabledDuringOpen(t *testing.T) {
+	t.Parallel()
 	const addr = "host:2"
 	transport := NewGRPCTransport([]Peer{{NodeID: 2, Address: addr}})
 	t.Cleanup(func() { require.NoError(t, transport.Close()) })
@@ -1207,6 +1235,7 @@ func TestDispatchRegularFallsBackToUnaryWhenSendStreamDisabledDuringOpen(t *test
 }
 
 func TestDispatchRegularFallsBackToUnaryForSendStreamDisabledErrorAfterReenable(t *testing.T) {
+	t.Parallel()
 	const addr = "host:2"
 	transport := NewGRPCTransport([]Peer{{NodeID: 2, Address: addr}})
 	t.Cleanup(func() { require.NoError(t, transport.Close()) })
@@ -1232,6 +1261,7 @@ func TestDispatchRegularFallsBackToUnaryForSendStreamDisabledErrorAfterReenable(
 }
 
 func TestDispatchRegularReprobesStreamAfterUnsupportedCacheExpires(t *testing.T) {
+	t.Parallel()
 	const addr = "host:2"
 	transport := NewGRPCTransport([]Peer{{NodeID: 2, Address: addr}})
 	t.Cleanup(func() { require.NoError(t, transport.Close()) })
@@ -1275,6 +1305,7 @@ func TestDispatchRegularReprobesStreamAfterUnsupportedCacheExpires(t *testing.T)
 }
 
 func TestStreamForDeduplicatesConcurrentOpen(t *testing.T) {
+	t.Parallel()
 	const addr = "host:2"
 	transport := NewGRPCTransport([]Peer{{NodeID: 2, Address: addr}})
 	t.Cleanup(func() { require.NoError(t, transport.Close()) })
@@ -1309,6 +1340,7 @@ func TestStreamForDeduplicatesConcurrentOpen(t *testing.T) {
 }
 
 func TestDispatchRegularStreamCancelsCachedStreamWhenContextDone(t *testing.T) {
+	t.Parallel()
 	const addr = "host:2"
 	transport := NewGRPCTransport([]Peer{{NodeID: 2, Address: addr}})
 	t.Cleanup(func() { require.NoError(t, transport.Close()) })
@@ -1464,6 +1496,7 @@ func collectRaftMessages(t *testing.T, ch <-chan raftpb.Message, count int) []ra
 // --- applyBridgeMode tests ---
 
 func TestApplyBridgeModePassesNonTokenUnchanged(t *testing.T) {
+	t.Parallel()
 	transport := NewGRPCTransport(nil)
 
 	// Non-token payload must pass through unchanged.
@@ -1476,6 +1509,7 @@ func TestApplyBridgeModePassesNonTokenUnchanged(t *testing.T) {
 }
 
 func TestApplyBridgeModeNoReaderIsNoop(t *testing.T) {
+	t.Parallel()
 	transport := NewGRPCTransport(nil)
 
 	// A token with no readFSMPayload callback set → passthrough.
@@ -1489,6 +1523,7 @@ func TestApplyBridgeModeNoReaderIsNoop(t *testing.T) {
 }
 
 func TestApplyBridgeModeReconstructsPayload(t *testing.T) {
+	t.Parallel()
 	fsmSnapDir := t.TempDir()
 	payload := []byte("bridge mode payload data 12345")
 	crc, _ := writeFSMFileForTest(t, fsmSnapDir, 42, payload)
@@ -1513,6 +1548,7 @@ func TestApplyBridgeModeReconstructsPayload(t *testing.T) {
 }
 
 func TestApplyBridgeModeReaderError(t *testing.T) {
+	t.Parallel()
 	transport := NewGRPCTransport(nil)
 	transport.SetFSMPayloadReader(func(_ uint64) ([]byte, error) {
 		return nil, ErrFSMSnapshotNotFound
@@ -1531,6 +1567,7 @@ func TestApplyBridgeModeReaderError(t *testing.T) {
 // readSnapshotChunk returns (data, io.EOF) for a short final read, and the old
 // code treated that the same as an empty reader, sending an empty chunk.
 func TestSendSnapshotReaderChunksSmallPayloadPreservesData(t *testing.T) {
+	t.Parallel()
 	payload := []byte("tiny payload under one chunk")
 	header := []byte("header-bytes")
 
@@ -1548,6 +1585,7 @@ func TestSendSnapshotReaderChunksSmallPayloadPreservesData(t *testing.T) {
 }
 
 func TestSendSnapshotReaderChunksEmptyPayloadSendsHeaderOnly(t *testing.T) {
+	t.Parallel()
 	header := []byte("header-bytes")
 
 	client := &testSnapshotSendClient{}
@@ -1704,6 +1742,7 @@ func injectClient(t *testing.T, transport *GRPCTransport, address string, client
 // --- sendSnapshotReaderChunks multi-chunk tests ---
 
 func TestSendSnapshotReaderChunksMultiChunk(t *testing.T) {
+	t.Parallel()
 	// 12-byte payload with chunkSize=4 → 3 chunks.
 	chunkSize := 4
 	payload := []byte("1234abcd5678")
@@ -1733,6 +1772,7 @@ func TestSendSnapshotReaderChunksMultiChunk(t *testing.T) {
 }
 
 func TestSendSnapshotReaderChunksExactBoundary(t *testing.T) {
+	t.Parallel()
 	// 8-byte payload with chunkSize=4 → exactly 2 chunks.
 	chunkSize := 4
 	payload := []byte("12345678")
@@ -1766,6 +1806,7 @@ func TestSendSnapshotReaderChunksExactBoundary(t *testing.T) {
 // This test fixes the coverage gap: chunkSize=4 with a 9-byte payload yields
 // two full chunks plus a 1-byte tail that must arrive.
 func TestSendSnapshotReaderChunksTrailingPartialChunk(t *testing.T) {
+	t.Parallel()
 	chunkSize := 4
 	payload := []byte("12345678X")
 	header := []byte("hdr")
@@ -1818,6 +1859,7 @@ func TestSendSnapshotReaderChunksTrailingPartialChunk(t *testing.T) {
 //
 // (3) is the real acceptance criterion — (1) and (2) are stepping stones.
 func TestStreamFSMSnapshotOverGRPCRestoresFollowerFSM(t *testing.T) {
+	t.Parallel()
 	// Seed a sender-side state machine with known entries and serialize it
 	// through its own Snapshot() codec so the payload format matches what
 	// Restore expects.
@@ -1896,6 +1938,7 @@ func TestStreamFSMSnapshotOverGRPCRestoresFollowerFSM(t *testing.T) {
 // TestStreamFSMSnapshotOverGRPCAtChunkBoundary pins the exact-multiple case
 // so a future refactor cannot regress it while fixing the non-aligned case.
 func TestStreamFSMSnapshotOverGRPCAtChunkBoundary(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	payload := []byte("AAAAAAAABBBBBBBB") // 16 bytes == 2 × chunkSize(8)
 	crc, _ := writeFSMFileForTest(t, dir, 91, payload)
@@ -1939,6 +1982,7 @@ func TestStreamFSMSnapshotOverGRPCAtChunkBoundary(t *testing.T) {
 }
 
 func TestStreamFSMSnapshotSendsPayload(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	payload := []byte("stream fsm snapshot payload data for test")
 	crc, _ := writeFSMFileForTest(t, dir, 55, payload)
@@ -1981,6 +2025,7 @@ func TestStreamFSMSnapshotSendsPayload(t *testing.T) {
 }
 
 func TestStreamFSMSnapshotFileNotFound(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 
 	sendClient := &testSnapshotSendClient{}
@@ -2007,6 +2052,7 @@ func TestStreamFSMSnapshotFileNotFound(t *testing.T) {
 // --- dispatchSnapshot routing tests ---
 
 func TestDispatchSnapshotTokenRoutesToStream(t *testing.T) {
+	t.Parallel()
 	// When snapshot.Data is a token and openFSMPayload is set, dispatchSnapshot
 	// must route to streamFSMSnapshot (chunked streaming path) — not bridge mode.
 	dir := t.TempDir()
@@ -2041,6 +2087,7 @@ func TestDispatchSnapshotTokenRoutesToStream(t *testing.T) {
 }
 
 func TestDispatchSnapshotNonTokenRoutesToBridge(t *testing.T) {
+	t.Parallel()
 	// When snapshot.Data is NOT a token (legacy full payload), dispatchSnapshot
 	// must forward it unchanged via the bridge (sendSnapshot) path.
 	legacy := []byte("legacy full fsm payload not a token")
@@ -2070,6 +2117,7 @@ func TestDispatchSnapshotNonTokenRoutesToBridge(t *testing.T) {
 }
 
 func TestDispatchSnapshotTokenNoOpenerFallsBackToBridge(t *testing.T) {
+	t.Parallel()
 	// Token snapshot with NO openFSMPayload set → falls back to bridge mode.
 	// Without a readFSMPayload either, applyBridgeMode is a passthrough, so
 	// the raw token bytes are sent. This verifies the fallback branch is taken.

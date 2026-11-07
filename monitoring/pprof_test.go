@@ -10,6 +10,7 @@ import (
 )
 
 func TestNewPprofHandlerServesIndexRoute(t *testing.T) {
+	t.Parallel()
 	h := NewPprofHandler()
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/debug/pprof/", nil)
 	rec := httptest.NewRecorder()
@@ -18,6 +19,7 @@ func TestNewPprofHandlerServesIndexRoute(t *testing.T) {
 }
 
 func TestNewPprofHandlerServesProfileRoute(t *testing.T) {
+	t.Parallel()
 	h := NewPprofHandler()
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/debug/pprof/profile?seconds=1", nil)
 	rec := httptest.NewRecorder()
@@ -32,6 +34,7 @@ func TestNewPprofHandlerServesProfileRoute(t *testing.T) {
 }
 
 func TestNewPprofServerRequiresBearerToken(t *testing.T) {
+	t.Parallel()
 	server := NewPprofServer("pprof-token")
 	require.NotNil(t, server)
 	require.NotNil(t, server.Handler)
@@ -49,6 +52,7 @@ func TestNewPprofServerRequiresBearerToken(t *testing.T) {
 }
 
 func TestNewPprofServerNoTokenAllowsAllRequests(t *testing.T) {
+	t.Parallel()
 	server := NewPprofServer("")
 	require.NotNil(t, server)
 

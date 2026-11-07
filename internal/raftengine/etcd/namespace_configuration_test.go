@@ -13,6 +13,7 @@ import (
 )
 
 func TestNamespaceApplyMembersIncludesJointAndLearnerMembers(t *testing.T) {
+	t.Parallel()
 	state := raftpb.ConfState{Voters: []uint64{1, 2}, VotersOutgoing: []uint64{2, 3}, Learners: []uint64{4}, LearnersNext: []uint64{5}}
 	require.Equal(t, []uint64{1, 2, 3, 4, 5}, namespaceApplyMembers(state))
 }

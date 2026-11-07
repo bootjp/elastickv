@@ -12,6 +12,7 @@ import (
 )
 
 func TestProductionImportGuard(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	goStub := filepath.Join(dir, "go")
 	require.NoError(t, os.WriteFile(goStub, []byte("#!/bin/sh\nprintf '%s\\n' \"$WP8_DEPS\"\nexit \"${WP8_EXIT:-0}\"\n"), 0o600))

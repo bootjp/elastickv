@@ -23,6 +23,7 @@ import (
 )
 
 func TestPublishAndRestorePhysicalSnapshotRoundTripWithS3Store(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	root := t.TempDir()
 	payload := []byte("EKVTHLC1opaque-s3-physical-snapshot-payload")
@@ -58,6 +59,7 @@ func TestPublishAndRestorePhysicalSnapshotRoundTripWithS3Store(t *testing.T) {
 }
 
 func TestS3StoreUsesConfiguredHTTPClientOnlyForS3(t *testing.T) {
+	t.Parallel()
 	client := &http.Client{}
 	cfg := S3StoreConfig{
 		Bucket:               "snapshots",
@@ -128,6 +130,7 @@ func TestS3GCRequiresBucketVersioningPermissionBeforeScanning(t *testing.T) {
 }
 
 func TestS3StorePutHeadGetPreservesIntegrityMetadata(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	fake := newFakeS3Client()
 	store := newTestS3Store(t, fake)
@@ -163,6 +166,7 @@ func TestS3StorePutHeadGetPreservesIntegrityMetadata(t *testing.T) {
 }
 
 func TestS3StoreReusesIdenticalExistingObject(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	fake := newFakeS3Client()
 	store := newTestS3Store(t, fake)
@@ -184,6 +188,7 @@ func TestS3StoreReusesIdenticalExistingObject(t *testing.T) {
 }
 
 func TestS3StoreRejectsExistingObjectMismatch(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	fake := newFakeS3Client()
 	store := newTestS3Store(t, fake)
@@ -203,6 +208,7 @@ func TestS3StoreRejectsExistingObjectMismatch(t *testing.T) {
 }
 
 func TestS3StoreConflictHashesExistingObjectWithoutIntegrityMetadata(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	fake := newFakeS3Client()
 	store := newTestS3Store(t, fake)
@@ -221,6 +227,7 @@ func TestS3StoreConflictHashesExistingObjectWithoutIntegrityMetadata(t *testing.
 }
 
 func TestS3StoreConflictRejectsExistingObjectWithoutIntegrityMetadataMismatch(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	fake := newFakeS3Client()
 	store := newTestS3Store(t, fake)
@@ -238,6 +245,7 @@ func TestS3StoreConflictRejectsExistingObjectWithoutIntegrityMetadataMismatch(t 
 }
 
 func TestS3StoreRetriesConditionalRequestConflict(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	fake := newFakeS3Client()
 	fake.conditionalConflicts = 1
@@ -255,6 +263,7 @@ func TestS3StoreRetriesConditionalRequestConflict(t *testing.T) {
 }
 
 func TestS3StoreUsesMultipartForLargeObject(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	fake := newFakeS3Client()
 	store := newTestS3Store(t, fake)
@@ -278,6 +287,7 @@ func TestS3StoreUsesMultipartForLargeObject(t *testing.T) {
 }
 
 func TestS3StoreMultipartStreamsSeekableParts(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	fake := newFakeS3Client()
 	store := newTestS3Store(t, fake)
@@ -298,6 +308,7 @@ func TestS3StoreMultipartStreamsSeekableParts(t *testing.T) {
 }
 
 func TestS3StoreMultipartHonorsDisabledChecksumHeaders(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	fake := newFakeS3Client()
 	store, err := NewS3Store(ctx, S3StoreConfig{
@@ -326,6 +337,7 @@ func TestS3StoreMultipartHonorsDisabledChecksumHeaders(t *testing.T) {
 }
 
 func TestS3StoreMultipartRejectsSourceHashMismatch(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	fake := newFakeS3Client()
 	store := newTestS3Store(t, fake)
@@ -344,6 +356,7 @@ func TestS3StoreMultipartRejectsSourceHashMismatch(t *testing.T) {
 }
 
 func TestS3ObjectSHA256PrefersMetadataForCompositeMultipartChecksum(t *testing.T) {
+	t.Parallel()
 	bodySHA := hexSHA256Bytes([]byte("full-object"))
 	compositeSHA, err := sha256HexToBase64(hexSHA256Bytes([]byte("aws-composite-checksum")))
 	require.NoError(t, err)
@@ -356,6 +369,7 @@ func TestS3ObjectSHA256PrefersMetadataForCompositeMultipartChecksum(t *testing.T
 }
 
 func TestS3ObjectSHA256RejectsMetadataFullObjectChecksumMismatch(t *testing.T) {
+	t.Parallel()
 	metadataSHA := hexSHA256Bytes([]byte("metadata-body"))
 	fullObjectChecksum, err := sha256HexToBase64(hexSHA256Bytes([]byte("full-object-body")))
 	require.NoError(t, err)
@@ -367,6 +381,7 @@ func TestS3ObjectSHA256RejectsMetadataFullObjectChecksumMismatch(t *testing.T) {
 }
 
 func TestS3StoreHeadAndGetRequestChecksumModeForFullObjectValidation(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	fake := newFakeS3Client()
 	store := newTestS3Store(t, fake)
@@ -390,6 +405,7 @@ func TestS3StoreHeadAndGetRequestChecksumModeForFullObjectValidation(t *testing.
 }
 
 func TestMultipartPartSizeCapsAtS3ObjectLimit(t *testing.T) {
+	t.Parallel()
 	partSize, err := multipartPartSize(s3MaxObjectBytes, s3DefaultMultipartPart)
 	require.NoError(t, err)
 	expectedPartSize := max(s3DefaultMultipartPart, (s3MaxObjectBytes+s3MaxMultipartParts-1)/s3MaxMultipartParts)
@@ -401,6 +417,7 @@ func TestMultipartPartSizeCapsAtS3ObjectLimit(t *testing.T) {
 }
 
 func TestS3StoreRejectsInvalidKMSConfig(t *testing.T) {
+	t.Parallel()
 	_, err := NewS3Store(context.Background(), S3StoreConfig{
 		Client:               newFakeS3Client(),
 		Bucket:               "backup-bucket",
@@ -471,6 +488,7 @@ func TestS3StoreRejectsUnknownVersioningStatus(t *testing.T) {
 }
 
 func TestS3StoreRejectsParentDirectoryKeys(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	store := newTestS3Store(t, newFakeS3Client())
 	emptySHA := hexSHA256Bytes(nil)
@@ -1061,6 +1079,7 @@ func cloneStringPtr(value *string) *string {
 // truncated page would look unreferenced and be reclaimed while a
 // committed manifest still points at it.
 func TestS3StoreListObjectsPagesThroughEveryPage(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	client := newFakeS3Client()
 	client.listPageSize = 2
@@ -1093,6 +1112,7 @@ func TestS3StoreListObjectsPagesThroughEveryPage(t *testing.T) {
 }
 
 func TestS3StoreListObjectsDelimitsSubtreePrefix(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	client := newFakeS3Client()
 	store := newTestS3Store(t, client)
@@ -1116,6 +1136,7 @@ func TestS3StoreListObjectsDelimitsSubtreePrefix(t *testing.T) {
 // continuation token cannot be continued, so the lister must error
 // rather than return the partial set it has.
 func TestS3StoreListObjectsFailsClosedOnTruncatedPageWithoutToken(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	client := newFakeS3Client()
 	client.listPageSize = 1
@@ -1139,6 +1160,7 @@ func TestS3StoreListObjectsFailsClosedOnTruncatedPageWithoutToken(t *testing.T) 
 }
 
 func TestS3StoreListObjectsRejectsNonAdvancingContinuationToken(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	client := newFakeS3Client()
 	client.listPageSize = 1
@@ -1190,6 +1212,7 @@ func TestS3StoreListObjectsRejectsIncompletePage(t *testing.T) {
 }
 
 func TestS3StoreListObjectsRejectsNoncanonicalKeys(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	client := newFakeS3Client()
 	store := newTestS3Store(t, client)
@@ -1212,6 +1235,7 @@ func TestAppendListedObjectsRejectsEntryWithoutKey(t *testing.T) {
 }
 
 func TestS3StoreDeleteObjectIsIdempotentAndValidatesKeys(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	client := newFakeS3Client()
 	store := newTestS3Store(t, client)
@@ -1238,6 +1262,7 @@ func TestS3StoreDeleteObjectIsIdempotentAndValidatesKeys(t *testing.T) {
 // 412 must surface as ErrObjectModified so GC treats it as a skip
 // rather than a failure.
 func TestS3StoreConditionalDeleteUsesIfMatchAndMapsPreconditionFailure(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	client := newFakeS3Client()
 	store := newTestS3Store(t, client)
@@ -1277,6 +1302,7 @@ func TestS3StoreConditionalDeleteUsesIfMatchAndMapsPreconditionFailure(t *testin
 // silent downgrade to an unconditional delete when neither an etag nor
 // a last-modified time is available.
 func TestS3StoreConditionalDeleteRefusesAnEmptyPrecondition(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	client := newFakeS3Client()
 	store := newTestS3Store(t, client)

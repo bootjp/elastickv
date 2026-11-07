@@ -17,6 +17,7 @@ import (
 )
 
 func TestPrepareExternalSnapshotRestoreSeedsRuntimeFiles(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	input := filepath.Join(root, "encoded.fsm")
 	payload := []byte("EKVPBBL1external snapshot payload")
@@ -72,6 +73,7 @@ func TestPrepareExternalSnapshotRestoreSeedsRuntimeFiles(t *testing.T) {
 }
 
 func TestPrepareExternalSnapshotRestoreHonorsCanceledContext(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	input := filepath.Join(root, "encoded.fsm")
 	require.NoError(t, os.WriteFile(input, []byte("payload"), 0o600))
@@ -95,6 +97,7 @@ func TestPrepareExternalSnapshotRestoreHonorsCanceledContext(t *testing.T) {
 }
 
 func TestPrepareExternalSnapshotRestoreCleansTempWhenContextCanceledAfterPayload(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	dataDir := filepath.Join(root, "raft")
 	ctx, cancel := context.WithCancel(context.Background())
@@ -120,6 +123,7 @@ func TestPrepareExternalSnapshotRestoreCleansTempWhenContextCanceledAfterPayload
 }
 
 func TestPrepareExternalSnapshotRestoreFailures(t *testing.T) {
+	t.Parallel()
 	testCases := []struct {
 		name              string
 		mutate            func(t *testing.T, dataDir string, opts *ExternalSnapshotRestoreOptions)
@@ -229,6 +233,7 @@ func TestPrepareExternalSnapshotRestoreFailures(t *testing.T) {
 }
 
 func TestPrepareExternalSnapshotRestoreCreatesTempRootAtomically(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	dest := filepath.Join(root, "raft")
 	gotDest, tempDir, err := prepareExternalSnapshotRestoreDest(dest)
@@ -242,6 +247,7 @@ func TestPrepareExternalSnapshotRestoreCreatesTempRootAtomically(t *testing.T) {
 }
 
 func TestFinalizeMigrationDirRefusesExistingDestination(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	tempDir := filepath.Join(root, "temp")
 	destDir := filepath.Join(root, "dest")

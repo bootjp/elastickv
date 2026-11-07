@@ -13,6 +13,7 @@ import (
 )
 
 func TestAdmissionRevokedBeforeStatusPublication(t *testing.T) {
+	t.Parallel()
 	storage := etcdraft.NewMemoryStorage()
 	e := &Engine{nodeID: 1, rawNode: mustRawNode(t, storage, 1), storage: storage}
 	e.refreshStatus()
@@ -35,6 +36,7 @@ func TestAdmissionRevokedBeforeStatusPublication(t *testing.T) {
 }
 
 func TestProtectedConfigurationRejectedBeforeRawNodeMutation(t *testing.T) {
+	t.Parallel()
 	for _, v2 := range []bool{false, true} {
 		t.Run(map[bool]string{false: "v1", true: "v2"}[v2], func(t *testing.T) {
 			storage := etcdraft.NewMemoryStorage()
@@ -72,6 +74,7 @@ func TestProtectedConfigurationRejectedBeforeRawNodeMutation(t *testing.T) {
 }
 
 func TestAdmissionRevokedBeforeRoleAndConfigurationPublication(t *testing.T) {
+	t.Parallel()
 	for _, configuration := range []bool{false, true} {
 		t.Run(map[bool]string{false: "role", true: "configuration"}[configuration], func(t *testing.T) {
 			storage := etcdraft.NewMemoryStorage()
@@ -98,6 +101,7 @@ func TestAdmissionRevokedBeforeRoleAndConfigurationPublication(t *testing.T) {
 }
 
 func TestSnapshotInvalidatesBeforeRestore(t *testing.T) {
+	t.Parallel()
 	e := &Engine{status: raftengine.Status{Term: 9}}
 	calls := 0
 	e.admissionChanged = func() {
@@ -112,6 +116,7 @@ func TestSnapshotInvalidatesBeforeRestore(t *testing.T) {
 }
 
 func TestTerminalTransitionsRevokeBeforePublication(t *testing.T) {
+	t.Parallel()
 	for _, fatal := range []bool{false, true} {
 		t.Run(map[bool]string{false: "shutdown", true: "fatal"}[fatal], func(t *testing.T) {
 			e := &Engine{transport: NewGRPCTransport(nil), closeCh: make(chan struct{})}
@@ -135,6 +140,7 @@ func TestTerminalTransitionsRevokeBeforePublication(t *testing.T) {
 }
 
 func TestWithBootstrapStartupCopiesFactorySettings(t *testing.T) {
+	t.Parallel()
 	cipher := &encryption.Cipher{}
 	original := NewFactory(FactoryConfig{TickInterval: time.Second, RaftCipher: cipher, RaftCutoverIndex: func() uint64 { return 42 }})
 	derived := original.WithBootstrapStartup(func(raftengine.FactoryConfig, *GRPCTransport) (*BootstrapStartup, error) {

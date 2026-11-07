@@ -36,6 +36,7 @@ func preparedAdmissionProbe(t *testing.T) raftbootstrap.BaselineProbe {
 }
 
 func TestPreparedAdmissionOpensIdentityOnly(t *testing.T) {
+	t.Parallel()
 	a, err := New(Config{Cluster: raftbootstrap.UUID{1}, DefaultGroup: 1, Groups: []uint64{1},
 		ValidatePayload: func(Kind, uint64, []byte) error { return nil }})
 	require.NoError(t, err)

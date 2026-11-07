@@ -16,6 +16,7 @@ import (
 )
 
 func TestExactBaseInterfaces(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		value  any
 		target reflect.Type
@@ -43,6 +44,7 @@ func assertNoOptionalCapabilities(t *testing.T, value any) {
 }
 
 func TestStubEngineConfiguration(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	sentinel := errors.New("configured error")
 	s := &raftenginetest.StubEngine{
@@ -80,6 +82,7 @@ func TestStubEngineConfiguration(t *testing.T) {
 }
 
 func TestProposersOwnBytesAndSerialize(t *testing.T) {
+	t.Parallel()
 	p := &raftenginetest.RecordingProposer{}
 	sm := &raftenginetest.TestStateMachine{}
 	applying := raftenginetest.ApplyingProposer(sm)
@@ -122,6 +125,7 @@ func TestProposersOwnBytesAndSerialize(t *testing.T) {
 }
 
 func TestLeaseCapabilityIsOptIn(t *testing.T) {
+	t.Parallel()
 	s := &raftenginetest.StubLeaseEngine{LeaseDurationValue: time.Second, AppliedIndexValue: 7, QuorumAck: monoclock.Now()}
 	s.StateValue = raftengine.StateLeader
 	var callbacks int
@@ -137,6 +141,7 @@ func TestLeaseCapabilityIsOptIn(t *testing.T) {
 }
 
 func TestLeaseEngineNonLeadersHaveNoQuorumAck(t *testing.T) {
+	t.Parallel()
 	ack := monoclock.Now()
 	for _, state := range []raftengine.State{"", raftengine.StateUnknown, raftengine.StateFollower, raftengine.StateCandidate, raftengine.StateShutdown} {
 		s := &raftenginetest.StubLeaseEngine{QuorumAck: ack}
@@ -146,6 +151,7 @@ func TestLeaseEngineNonLeadersHaveNoQuorumAck(t *testing.T) {
 }
 
 func TestLeaseEngineContainsEachCallbackPanic(t *testing.T) {
+	t.Parallel()
 	s := &raftenginetest.StubLeaseEngine{}
 	var count int
 	s.RegisterLeaderLossCallback(func() { count++ })
@@ -156,6 +162,7 @@ func TestLeaseEngineContainsEachCallbackPanic(t *testing.T) {
 }
 
 func TestNewSingleNodeWithRealFactory(t *testing.T) {
+	t.Parallel()
 	sm := &raftenginetest.TestStateMachine{}
 	factory := etcdengine.NewFactory(etcdengine.FactoryConfig{TickInterval: 10 * time.Millisecond, HeartbeatTick: 1, ElectionTick: 10})
 	var result *raftengine.FactoryResult

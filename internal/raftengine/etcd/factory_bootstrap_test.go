@@ -11,6 +11,7 @@ import (
 )
 
 func TestFactoryRejectsIncompleteBootstrapBeforeOpeningWAL(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	closed := false
 	factory := NewFactory(FactoryConfig{BootstrapStartup: func(raftengine.FactoryConfig, *GRPCTransport) (*BootstrapStartup, error) {
@@ -23,6 +24,7 @@ func TestFactoryRejectsIncompleteBootstrapBeforeOpeningWAL(t *testing.T) {
 }
 
 func TestFactoryBootstrapGroupMustMatchConfiguredGroup(t *testing.T) {
+	t.Parallel()
 	closed := false
 	factory := NewFactory(FactoryConfig{BootstrapStartup: func(raftengine.FactoryConfig, *GRPCTransport) (*BootstrapStartup, error) {
 		return &BootstrapStartup{

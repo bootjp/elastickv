@@ -12,6 +12,7 @@ import (
 )
 
 func TestRapidConsecutivePromotionAndSplitBounds(t *testing.T) {
+	t.Parallel()
 	rapid.Check(t, func(rt *rapid.T) {
 		candidateWindows := rapid.IntRange(1, 5).Draw(rt, "candidate_windows")
 		hot := rapid.SliceOfN(rapid.Bool(), 1, 24).Draw(rt, "hot_columns")
@@ -51,6 +52,7 @@ func TestRapidConsecutivePromotionAndSplitBounds(t *testing.T) {
 }
 
 func TestRapidCooldownAndCycleBudget(t *testing.T) {
+	t.Parallel()
 	rapid.Check(t, func(rt *rapid.T) {
 		routeCount := rapid.IntRange(1, 12).Draw(rt, "route_count")
 		budget := rapid.IntRange(1, 5).Draw(rt, "budget")
