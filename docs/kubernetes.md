@@ -54,6 +54,9 @@ Recovery requires restoring the original disk or replacing the failed member thr
 Run the following commands from the repository root.
 For a deployment, maintain a copy of the manifests or an environment-specific Kustomize overlay.
 The base image is pinned by digest to the build of commit `2f9a88153672d18dcc9d71abfb4b6bdd3ea9983b`.
+This historical image predates `--sqsPublicEndpoint` and the SignedHeaders compatibility fixes required by AWS CLI S3/SQS clients.
+For authenticated S3/SQS use, build and publish this source revision and replace the base image with the resulting immutable digest before applying the manifests.
+The fixed image will be published through the normal release workflow after merge; do not assume an unmerged commit's image exists in the registry.
 For another release, update the digest in `deploy/kubernetes/base/statefulset.yaml` and validate that release before deployment.
 The published image workflow currently builds for `linux/amd64`, and the manifests select amd64 nodes.
 
@@ -223,7 +226,7 @@ The example domains under `example.test` and `example-controller` ingress class 
 
 Before applying the example:
 
-1. Build and publish the root Dockerfile from a source revision containing `--sqsPublicEndpoint`. The base's pinned historical image supports the internal APIs but does not contain this new flag. Replace the example's deliberately unusable image reference with the new image's immutable digest.
+1. Build and publish the root Dockerfile from a source revision containing `--sqsPublicEndpoint`. The base's pinned historical image predates that flag and the AWS CLI SignedHeaders compatibility fixes. Replace the example's deliberately unusable image reference with the new image's immutable digest.
 2. Replace the two hostnames, ingress class, and `--sqsPublicEndpoint=https://sqs.example.test` with the intended public endpoints. Configure the same SQS public endpoint on every member. Only an HTTP(S) origin is accepted; credentials, path prefixes, query strings, and fragments are rejected.
 3. Create the `elastickv-api-tls` Secret in the server namespace from a certificate and private key covering both hosts. Keep the SigV4 credentials Secret configured as above.
 4. Label the trusted Ingress Controller namespace with `elastickv-ingress=true`. The example's NetworkPolicy allows that namespace to reach only ports 9000 and 9324. Restrict permission to change this label. Controllers using host networking or different source identities need a policy tailored to the CNI's actual traffic path.
