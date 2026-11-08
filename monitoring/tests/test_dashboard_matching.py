@@ -11,6 +11,15 @@ import unittest
 
 
 class DashboardMatchingTest(unittest.TestCase):
+    def test_builtin_annotations_use_grafana_datasource(self):
+        dashboards = pathlib.Path(__file__).resolve().parents[1] / 'grafana' / 'dashboards'
+        for path in dashboards.glob('*.json'):
+            for annotation in json.loads(path.read_text()).get('annotations', {}).get('list', []):
+                if annotation.get('builtIn') == 1:
+                    with self.subTest(dashboard=path.name):
+                        self.assertEqual(annotation['datasource'],
+                                         {'type': 'grafana', 'uid': '-- Grafana --'})
+
     def test_raft_index_differences_with_all_deployments(self):
         dashboards = pathlib.Path(__file__).resolve().parents[1] / 'grafana' / 'dashboards'
         inputs = []

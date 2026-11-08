@@ -68,3 +68,6 @@ cluster in explicit vector matching. A regression test evaluates expressions
 extracted from both dashboard JSON files against colliding node IDs and addresses
 across deployments. It reproduced many-to-many errors before the correction.
 The Monitoring assets workflow runs that test and the existing alert fixtures.
+The built-in cluster dashboard annotation query retains the Grafana datasource
+rather than the selectable Prometheus datasource. A failing-first regression
+checks that all built-in annotation queries use Grafana's internal datasource.
