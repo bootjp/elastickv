@@ -210,6 +210,9 @@ The base starts S3 and SQS with SigV4 credentials mounted from a Secret.
 The ClusterIP endpoints are `elastickv.elastickv.svc:9000` and `elastickv.elastickv.svc:9324`.
 The peer maps use per-Pod DNS names for internal forwarding, and permitted client namespaces can reach both ports.
 The shared Raft/gRPC port remains isolated from ordinary clients.
+SigV4 verification permits unsigned transport and forwarding headers, but requires the request's `host`, `Content-MD5` when present, and `x-amz-*` headers to be signed.
+The payload hash is already part of the canonical request, so `x-amz-content-sha256` may be omitted from `SignedHeaders`.
+This keeps ACLs, metadata, checksums, and SQS operation selectors protected; see the [S3 signing requirements](https://docs.aws.amazon.com/AmazonS3/latest/developerguide/sig-v4-header-based-auth.html).
 For an existing deployment, carry the existing API settings and credentials into its environment-specific overlay.
 
 For local checks, use `kubectl -n elastickv port-forward service/elastickv 9000:9000 9324:9324`.
@@ -254,6 +257,10 @@ The example at `deploy/kubernetes/examples/fuse/` enables the filesystem on the 
 It does not expose a filesystem network port or an NFS/SMB server.
 The file tree remains stored in Elastickv's replicated store.
 The example consumer is an idle placeholder; replace it with the application that needs filesystem access.
+Only fully trusted application code may run as this consumer.
+Containers in the peer Pod share its network namespace and can reach the unauthenticated RaftAdmin listener on every peer; NetworkPolicy cannot separate them.
+Do not put an untrusted consumer in a peer Pod.
+Such consumers require a separate deployment with an authenticated filesystem service or a separately authenticated and authorized control listener, which this example does not provide.
 
 The standard distroless image lacks `fusermount3`.
 Build the example Dockerfile, which adds `fuse3`, `util-linux`, and a named UID/GID 65532 account to a Debian runtime while copying `/app` from a pinned server image:
