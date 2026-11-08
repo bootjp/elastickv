@@ -567,6 +567,11 @@ func run() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	handoff := newShutdownHandoff(cancel)
 	cleanup.Add(installShutdownSignalHandler(handoff.requestShutdown))
+	health, stopHealth, err := startRuntimeHealth(ctx, &lc, cancel, *healthAddress, *raftId)
+	if err != nil {
+		return err
+	}
+	cleanup.Add(stopHealth)
 
 	// Stage 6D-6c: buildShardGroupsWithEncryptionWiring assembles the
 	// storage-envelope write-path wiring (cipher + deterministic nonce
@@ -620,6 +625,7 @@ func run() error {
 	// The label is resolved per-pebbleStore from ELASTICKV_FSM_SYNC_MODE
 	// in NewPebbleStore; read it off the first constructed store (all
 	// shards share the same env and therefore the same label).
+	publishRuntimeHealth(health, runtimes)
 	recordFSMApplySyncMode(metricsRegistry, runtimes)
 
 	cleanup.Add(readTracker.Close)
@@ -746,6 +752,7 @@ func run() error {
 	}); err != nil {
 		return err
 	}
+	health.MarkServing()
 	balanceCtx, stopBalance := context.WithCancel(runCtx)
 	defer stopBalance()
 	balanceDone := make(chan struct{})

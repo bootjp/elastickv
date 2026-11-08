@@ -9,3 +9,7 @@ Client access includes Redis, DynamoDB, S3, and SQS; the shared Raft/gRPC contro
 S3 and SQS require the `elastickv-api-credentials` Secret.
 Optional examples cover [TLS Ingress](examples/https/) and [a FUSE mount shared within a Pod](examples/fuse/).
 The FUSE example requires a dedicated image and privileged mount propagation; neither example is installed by the base.
+
+The opt-in [runtime readiness example](examples/readiness/) separates process
+liveness from Raft membership, startup recovery, and log-application progress.
+It requires a newer image than the base pin; replace its placeholder digest first.
