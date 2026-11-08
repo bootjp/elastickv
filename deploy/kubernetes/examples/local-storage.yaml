@@ -1,0 +1,30 @@
+# Example only. Replace worker-a and the path with a dedicated mounted disk.
+# Create one PV per replica on a different node; names must be unique.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: elastickv-local
+provisioner: kubernetes.io/no-provisioner
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Retain
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: elastickv-worker-a
+spec:
+  capacity:
+    storage: 100Gi
+  volumeMode: Filesystem
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: elastickv-local
+  local:
+    path: /var/lib/elastickv-local
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values: [worker-a]
