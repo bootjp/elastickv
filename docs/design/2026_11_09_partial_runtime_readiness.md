@@ -28,7 +28,13 @@ readiness before engine shutdown is published. Startup and received snapshots
 must both be covered. This is not a full byte-level storage scrub, an fsync
 proof, or an end-to-end protocol/authentication test.
 
-Use bounded observations on each readiness request and fail closed on missing sources or observation errors.
+A single background worker samples local state once per second. HTTP requests
+read an atomic result and fail closed when it is missing or over three seconds
+old, even if an engine lock blocks the worker. Raft separately timestamps its
+status publication on every completed event-loop iteration; a frozen status
+exceeding the progress deadline is not ready, including an idle-looking status.
+Follower contact ages from that timestamp. Missing sources and observation
+errors fail closed.
 Responses expose stable reason codes without peer addresses, keys, filesystem
 paths, or internal error text. Probes perform no application writes. Use separate
 canary operations and cluster-wide quorum/membership checks for release acceptance.
@@ -61,15 +67,17 @@ The listener is opt-in and separate from existing protocol health responses.
 The startup serving gate opens only after public services and optional FUSE
 startup finish. Engine lifecycle reports initial replay completion and active
 snapshot installation; failed received snapshots leave the readiness fence set.
-The checker samples current local state per request and retains monotonic progress
-history. No cached ready result is reused after an observation failure.
+The single sampler retains progress history for every group, including groups
+after an unready group. HTTP handlers never wait on engine locks and never spawn
+workers. Cached results expire, and observation failures replace a ready result.
+A newly observed backlog starts its own progress deadline.
 
 Five review passes:
 
 1. Data loss: no persistence format, timestamp, acknowledgement, or restore order
    changes. Snapshot readiness fencing adds observability only.
-2. Concurrency: probe history is serialized; lifecycle reads use the engine lock
-   and an atomic snapshot fence, with no reverse callback into the probe. Liveness
+2. Concurrency: probe history is serialized; lifecycle and observation timestamps
+   use atomics and closed channels without the engine lock. Liveness
    does not take the readiness lock or wait for snapshot installation.
 3. Performance: local metadata reads only, no disk scans, ReadIndex calls, or
    canary writes in the handler; tracking state is bounded by configured groups.
@@ -77,7 +85,9 @@ Five review passes:
    application, local membership, and its initial committed barrier. An idle
    group is not mistaken for a stalled group, and apply regression fails closed.
 5. Coverage: race-enabled tests cover lifecycle failure, real restore failure,
-   successful snapshot plus WAL replay, membership, progress/stall/idle behavior,
+   successful snapshot plus WAL replay, blocked real FSM application, stale idle
+   observations, expired HTTP cache with a blocked single worker, negative or aged
+   follower contact, multi-group observation, progress/stall/idle behavior,
    HTTP method/privacy behavior, and a listener alive before readiness.
 
 Focused race tests and new-diff lint passed. The readiness overlay renders with

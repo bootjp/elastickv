@@ -31,6 +31,7 @@ func startRuntimeHealth(ctx context.Context, lc runtimeHealthListener, cancel co
 	}
 	server := &http.Server{Handler: probe.Handler(), ReadHeaderTimeout: time.Second, ReadTimeout: time.Second, WriteTimeout: time.Second,
 		BaseContext: func(net.Listener) context.Context { return ctx }}
+	go probe.Run(ctx)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)

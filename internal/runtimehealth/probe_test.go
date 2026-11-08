@@ -6,9 +6,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/monoclock"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/stretchr/testify/require"
 )
@@ -18,11 +20,23 @@ type testEngine struct {
 	status        raftengine.Status
 	configuration raftengine.Configuration
 	err           error
+	observed      func() monoclock.Instant
+	configure     func(context.Context) (raftengine.Configuration, error)
 }
 
 func (e *testEngine) ReadinessState() raftengine.ReadinessState { return e.state }
 func (e *testEngine) Status() raftengine.Status                 { return e.status }
-func (e *testEngine) Configuration(context.Context) (raftengine.Configuration, error) {
+func (e *testEngine) ReadinessObservedAt() monoclock.Instant {
+	if e.observed != nil {
+		return e.observed()
+	}
+	return monoclock.Now()
+}
+
+func (e *testEngine) Configuration(ctx context.Context) (raftengine.Configuration, error) {
+	if e.configure != nil {
+		return e.configure(ctx)
+	}
 	return e.configuration, e.err
 }
 
@@ -50,6 +64,7 @@ func TestReadinessRejectsUnusableMembers(t *testing.T) {
 		{"learner", "not_a_voter", func(e *testEngine) { e.configuration.Servers[0].Suffrage = "learner" }},
 		{"unknown leader", "leader_unknown", func(e *testEngine) { e.status.Leader.ID = "unknown" }},
 		{"no leader", "leader_unknown", func(e *testEngine) { e.status.Leader.ID = "" }},
+		{"unknown contact", "leader_contact_stale", func(e *testEngine) { e.status.LastContact = -1 }},
 		{"stale contact", "leader_contact_stale", func(e *testEngine) { e.status.LastContact = DefaultContactTimeout + time.Second }},
 		{"election", "not_participating", func(e *testEngine) { e.status.State = raftengine.StateCandidate }},
 		{"configuration change", "membership_changing", func(e *testEngine) { e.status.PendingConfChange = true }},
@@ -76,6 +91,7 @@ func TestIdleMembersAndProgressingBacklogsRemainReady(t *testing.T) {
 	require.True(t, p.Evaluate(t.Context()).Ready, "idle does not mean stalled")
 	e.status.CommitIndex = 20
 	e.status.FSMPending = 10
+	require.True(t, p.Evaluate(t.Context()).Ready)
 	now = now.Add(DefaultStallTimeout - time.Second)
 	require.True(t, p.Evaluate(t.Context()).Ready)
 	now = now.Add(time.Second)
@@ -140,4 +156,116 @@ func TestHTTPSeparatesLivenessAndReadinessWithoutLeakingErrors(t *testing.T) {
 			require.Empty(t, r.Body.String())
 		}
 	}
+}
+
+func TestFrozenIdleObservationIsNotReady(t *testing.T) {
+	t.Parallel()
+	p, e := fixture()
+	require.True(t, p.Evaluate(t.Context()).Ready)
+	e.observed = func() monoclock.Instant { return monoclock.Now().Add(-DefaultStallTimeout - time.Second) }
+	require.False(t, p.Evaluate(t.Context()).Ready, "cached idle status must not hide a blocked Raft loop")
+}
+
+func TestFollowerContactAgesSinceObservation(t *testing.T) {
+	t.Parallel()
+	p, e := fixture()
+	e.observed = func() monoclock.Instant { return monoclock.Now().Add(-DefaultContactTimeout - time.Second) }
+	require.Equal(t, "leader_contact_stale", p.Evaluate(t.Context()).Reason)
+}
+
+func TestBacklogTimerBeginsWhenFirstObserved(t *testing.T) {
+	t.Parallel()
+	p, e := fixture()
+	now := time.Now()
+	p.now = func() time.Time { return now }
+	require.True(t, p.Evaluate(t.Context()).Ready)
+	now = now.Add(time.Hour)
+	e.status.CommitIndex = 20
+	e.status.FSMPending = 10
+	require.True(t, p.Evaluate(t.Context()).Ready, "a new backlog is not an hour-old stall")
+	now = now.Add(DefaultStallTimeout)
+	require.Equal(t, "apply_stalled", p.Evaluate(t.Context()).Reason)
+}
+
+func TestUnreadyGroupDoesNotHideOtherGroupsProgress(t *testing.T) {
+	t.Parallel()
+	p, a := fixture()
+	_, b := fixture()
+	a.state.Restoring = true
+	p.SetSources([]Source{{GroupID: 1, Engine: func() Engine { return a }}, {GroupID: 2, Engine: func() Engine { return b }}})
+	require.False(t, p.Evaluate(t.Context()).Ready)
+	a.state.Restoring = false
+	b.status.CommitIndex = 20
+	b.status.AppliedIndex = 11
+	require.True(t, p.Evaluate(t.Context()).Ready, "group B was already observed caught up before new commits")
+}
+
+func TestHTTPReadinessDoesNotWaitForBlockedObserver(t *testing.T) {
+	t.Parallel()
+	p, e := fixture()
+	entered, release := make(chan struct{}), make(chan struct{})
+	e.configure = func(context.Context) (raftengine.Configuration, error) {
+		close(entered)
+		<-release
+		return e.configuration, nil
+	}
+	observed := make(chan struct{})
+	go func() { p.Evaluate(t.Context()); close(observed) }()
+	<-entered
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+	finished := make(chan struct{})
+	recorder := httptest.NewRecorder()
+	go func() {
+		p.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/readyz", nil).WithContext(ctx))
+		close(finished)
+	}()
+	bounded := false
+	select {
+	case <-finished:
+		bounded = true
+	case <-time.After(time.Second):
+	}
+	close(release)
+	<-observed
+	<-finished
+	require.True(t, bounded, "a blocked source must not queue readiness HTTP requests")
+	require.Equal(t, http.StatusServiceUnavailable, recorder.Code)
+}
+
+func TestCachedReadinessExpiresWithOneBlockedWorker(t *testing.T) {
+	t.Parallel()
+	p, e := fixture()
+	entered, release := make(chan struct{}), make(chan struct{})
+	var calls atomic.Int32
+	e.configure = func(ctx context.Context) (raftengine.Configuration, error) {
+		if calls.Add(1) > 1 {
+			close(entered)
+			<-release
+		}
+		return e.configuration, nil
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() { defer close(done); p.Run(ctx) }()
+	t.Cleanup(func() { cancel(); close(release); <-done })
+	require.Eventually(t, func() bool { return p.Current(t.Context()).Ready }, time.Second, time.Millisecond)
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("sampler did not enter blocked source")
+	}
+	// Age only the published result; the worker remains blocked in Configuration.
+	old := p.latest.Load()
+	p.latest.Store(&observation{result: old.result, at: time.Now().Add(-DefaultObservationMaxAge - time.Second)})
+	for range 100 {
+		recorder := httptest.NewRecorder()
+		p.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+		require.Equal(t, http.StatusServiceUnavailable, recorder.Code)
+		require.Contains(t, recorder.Body.String(), "observation_stale")
+	}
+	live := httptest.NewRecorder()
+	p.Handler().ServeHTTP(live, httptest.NewRequest(http.MethodGet, "/livez", nil))
+	require.Equal(t, http.StatusOK, live.Code)
+	require.EqualValues(t, 2, calls.Load(), "HTTP requests must not spawn observation workers")
 }

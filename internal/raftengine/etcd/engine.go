@@ -404,8 +404,10 @@ type Engine struct {
 	// startedCh is closed after startup has drained committed Ready entries.
 	// Multi-node Open must return before this so callers can register the
 	// transport listener; service startup waits through WaitStarted instead.
-	startedCh         chan struct{}
-	snapshotRestoring atomic.Bool
+	startedCh            chan struct{}
+	snapshotRestoring    atomic.Bool
+	statusObservedMonoNs atomic.Int64
+	readinessFailed      atomic.Bool
 
 	leaderReady  chan struct{}
 	leaderOnce   sync.Once
@@ -1056,12 +1058,21 @@ func waitForOpen(ctx context.Context, engine *Engine, waitForLeader bool) (*Engi
 	return engine, nil
 }
 
+// ReadinessObservedAt advances only after the Raft loop publishes current status.
+// A blocked WAL write or FSM Apply cannot refresh this independent monotonic signal.
+func (e *Engine) ReadinessObservedAt() monoclock.Instant {
+	if e == nil {
+		return monoclock.Instant{}
+	}
+	return monoclock.FromNanos(e.statusObservedMonoNs.Load())
+}
+
 // ReadinessState is safe to query while the synchronous FSM restore is blocked.
 func (e *Engine) ReadinessState() raftengine.ReadinessState {
 	if e == nil {
 		return raftengine.ReadinessState{Stopped: true}
 	}
-	state := raftengine.ReadinessState{Restoring: e.snapshotRestoring.Load()}
+	state := raftengine.ReadinessState{Restoring: e.snapshotRestoring.Load(), Failed: e.readinessFailed.Load(), Stopped: e.isClosing()}
 	select {
 	case <-e.startedCh:
 		state.Started = true
@@ -1072,10 +1083,6 @@ func (e *Engine) ReadinessState() raftengine.ReadinessState {
 		state.Stopped = true
 	default:
 	}
-	e.mu.RLock()
-	state.Stopped = state.Stopped || e.closed
-	state.Failed = e.runErr != nil
-	e.mu.RUnlock()
 	return state
 }
 
@@ -4163,6 +4170,7 @@ func (e *Engine) refreshStatus() {
 	e.invalidateChangedStatus(oldStatus, status)
 	e.mu.Lock()
 	e.status = status
+	e.statusObservedMonoNs.Store(monoclock.Now().Nanos())
 	if e.closed {
 		e.status.State = raftengine.StateShutdown
 		e.status.PerPeer = nil
@@ -4292,6 +4300,7 @@ func (e *Engine) fail(err error) {
 	wasLeader := e.status.State == raftengine.StateLeader
 	if err != nil {
 		e.runErr = err
+		e.readinessFailed.Store(true)
 	}
 	e.closed = true
 	e.status.State = raftengine.StateShutdown

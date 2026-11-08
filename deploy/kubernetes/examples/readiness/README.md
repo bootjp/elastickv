@@ -15,6 +15,13 @@ example. The base remains pinned to an older image and does not enable this flag
   observed stall lasting 30 seconds makes the node not ready. Idle nodes remain
   ready; index regression fails closed for the lifetime of the probe.
 
+A single background worker samples local state once per second. HTTP requests
+read its cached result without waiting for engine locks; a missing result or one
+older than three seconds returns not ready. A Raft status publication that has
+not advanced for 30 seconds also returns not ready, even if its cached indexes
+look idle. Unknown (negative) follower contact is rejected, and contact ages
+from the engine observation time.
+
 Readiness returns 200 or 503 with stable JSON reason codes. GET and HEAD are
 supported. No peer addresses, store paths, keys, or internal errors are returned.
 These checks perform no application writes or disk scans. Existing protocol health

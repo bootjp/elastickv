@@ -28,7 +28,7 @@ func (p *Probe) Handler() http.Handler {
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), observationTimeout)
 		defer cancel()
-		result := p.Evaluate(ctx)
+		result := p.Current(ctx)
 		w.Header().Set("Content-Type", "application/json")
 		code := http.StatusOK
 		if !result.Ready {
