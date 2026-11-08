@@ -517,3 +517,14 @@ reports the lost write instead of ignoring the read.
 ```bash
 git config --local core.hooksPath .githooks
 ```
+
+### Stateful readiness
+
+The optional `--healthAddress` flag starts a dedicated private HTTP listener.
+`/livez` checks process responsiveness; `/readyz` and `/healthz` check local Raft
+startup recovery, applied membership, leader contact, and log-application progress
+across every configured group. Followers can be ready; learners cannot. This is
+not a cluster quorum or end-to-end API compatibility proof. Keep this listener
+private and use readiness separately from liveness. See the
+[runtime readiness example](deploy/kubernetes/examples/readiness/) for the exact
+contract, bootstrap procedure, and compatible image requirements.

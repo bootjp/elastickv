@@ -1684,6 +1684,9 @@ func TestOpenRestoresLegacySnapshotState(t *testing.T) {
 	})
 
 	require.Equal(t, [][]byte{[]byte("snap"), []byte("tail")}, fsm.Applied())
+	require.True(t, engine.ReadinessState().Started)
+	require.False(t, engine.ReadinessState().Restoring)
+	require.False(t, engine.ReadinessState().Failed)
 }
 
 func TestOpenMultiNodeWaitsForCommittedTailDrain(t *testing.T) {
