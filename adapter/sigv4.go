@@ -185,6 +185,12 @@ func buildSigV4AuthorizationHeaderRestricted(
 		for _, h := range signedHeaders {
 			allowed[strings.ToLower(strings.TrimSpace(h))] = struct{}{}
 		}
+		// The SDK signs a positive ContentLength independently of Header.
+		// Botocore can send a body without including its length in SignedHeaders.
+		// Clear only the verification clone; the original framing stays intact.
+		if _, ok := allowed["content-length"]; !ok {
+			clone.ContentLength = 0
+		}
 		for name := range clone.Header {
 			if _, ok := allowed[strings.ToLower(name)]; !ok {
 				clone.Header.Del(name)
@@ -192,16 +198,5 @@ func buildSigV4AuthorizationHeaderRestricted(
 		}
 	}
 
-	signer := v4.NewSigner(func(opts *v4.SignerOptions) {
-		opts.DisableURIPathEscaping = true
-	})
-	creds := aws.Credentials{
-		AccessKeyID:     accessKeyID,
-		SecretAccessKey: secretAccessKey,
-		Source:          "elastickv-" + service,
-	}
-	if err := signer.SignHTTP(context.Background(), creds, clone, payloadHash, service, region, signingTime.UTC()); err != nil {
-		return "", errors.WithStack(err)
-	}
-	return strings.TrimSpace(clone.Header.Get("Authorization")), nil
+	return buildSigV4AuthorizationHeader(clone, accessKeyID, secretAccessKey, service, region, signingTime, payloadHash)
 }

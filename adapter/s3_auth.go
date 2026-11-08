@@ -216,7 +216,8 @@ func (s *S3Server) authorizeRequest(r *http.Request) *s3AuthError {
 		}
 	}
 
-	expectedAuth, err := buildSigV4AuthorizationHeader(r, parsed.AccessKeyID, secretAccessKey, "s3", s.effectiveRegion(), signingTime, payloadHash)
+	signedHeaders := extractSigV4SignedHeaders(authHeader)
+	expectedAuth, err := buildSigV4AuthorizationHeaderRestricted(r, parsed.AccessKeyID, secretAccessKey, "s3", s.effectiveRegion(), signingTime, payloadHash, signedHeaders)
 	if err != nil {
 		return &s3AuthError{
 			Status:  http.StatusForbidden,
