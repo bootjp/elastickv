@@ -36,3 +36,29 @@ package tests. Check the patch for environment identifiers before publishing.
 Reviewed against the requested reusable dashboard/alert scope: no application,
 storage, or production rollout changes are required. The implementation follows
 this proposal; optional protocol alerts activate only when those metrics exist.
+
+## Implementation and review evidence
+
+All seven existing dashboards now select datasource, job, and optional cluster.
+Filesystem and TSO rules preserve deployment labels. Core Raft rules detect
+unreachable scrape targets, invalid leader counts, and sustained apply lag.
+Leader counts deduplicate observations of the same node. The monitoring guide
+covers imports, file provisioning, collection labels, ruler setup, and routing.
+
+Five review passes:
+
+1. Data loss: configuration assets only; no application or live deployment writes.
+2. Concurrency and distributed failures: rules isolate job/cluster; leader counts
+   deduplicate replicas and do not claim to prove quorum availability.
+3. Performance: dashboard variable discovery runs on load/time-range refresh;
+   alert aggregations retain deployment identity but discard unneeded dimensions.
+4. Data consistency: cluster-wide filesystem gauges keep max aggregation;
+   node-local activity keeps sum aggregation. No fixed membership assumptions.
+5. Test coverage: promtool fixtures cover failure isolation, absent cluster
+   labels, duplicate scrapes, TSO mode transitions, and alert hold durations.
+
+Validation: promtool checked all 16 alert rules and all 186 panel expressions.
+All seven promtool rule scenarios and `go test ./monitoring` passed before
+publication. The full repository commit hook currently fails on a pre-existing
+cyclomatic-complexity error in `refreshOpenHandleLease` in the FUSE adapter;
+this change does not modify that implementation.

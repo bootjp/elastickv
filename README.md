@@ -89,6 +89,9 @@ Provisioned monitoring assets live under:
 - `monitoring/grafana/provisioning/`
 - `monitoring/docker-compose.yml`
 
+See [the monitoring guide](monitoring/README.md) for portable dashboard selectors,
+cluster labels, alert loading, and notification routing.
+
 The provisioned dashboards are organized by operator task:
 
 - `Elastickv Cluster` is the landing page for leader identity, cluster-wide latency/error posture, and per-node Raft health

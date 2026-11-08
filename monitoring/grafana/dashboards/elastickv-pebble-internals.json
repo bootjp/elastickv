@@ -89,7 +89,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "sum(rate(elastickv_pebble_block_cache_hits_total{job=\"elastickv\",node_id=~\"$node_id\"}[$__rate_interval])) / clamp_min(sum(rate(elastickv_pebble_block_cache_hits_total{job=\"elastickv\",node_id=~\"$node_id\"}[$__rate_interval])) + sum(rate(elastickv_pebble_block_cache_misses_total{job=\"elastickv\",node_id=~\"$node_id\"}[$__rate_interval])), 1e-9)",
+          "expr": "sum(rate(elastickv_pebble_block_cache_hits_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\"}[$__rate_interval])) / clamp_min(sum(rate(elastickv_pebble_block_cache_hits_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\"}[$__rate_interval])) + sum(rate(elastickv_pebble_block_cache_misses_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\"}[$__rate_interval])), 1e-9)",
           "legendFormat": "hit rate",
           "refId": "A",
           "instant": true
@@ -140,7 +140,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "sum(rate(elastickv_pebble_block_cache_hits_total{job=\"elastickv\",node_id=~\"$node_id\"}[$__rate_interval])) / clamp_min(sum(rate(elastickv_pebble_block_cache_hits_total{job=\"elastickv\",node_id=~\"$node_id\"}[$__rate_interval])) + sum(rate(elastickv_pebble_block_cache_misses_total{job=\"elastickv\",node_id=~\"$node_id\"}[$__rate_interval])), 1e-9)",
+          "expr": "sum(rate(elastickv_pebble_block_cache_hits_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\"}[$__rate_interval])) / clamp_min(sum(rate(elastickv_pebble_block_cache_hits_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\"}[$__rate_interval])) + sum(rate(elastickv_pebble_block_cache_misses_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\"}[$__rate_interval])), 1e-9)",
           "legendFormat": "hit rate",
           "range": true,
           "refId": "A"
@@ -189,7 +189,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "elastickv_pebble_block_cache_size_bytes{job=\"elastickv\",node_id=~\"$node_id\"}",
+          "expr": "elastickv_pebble_block_cache_size_bytes{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\"}",
           "legendFormat": "size {{node_id}}",
           "range": true,
           "refId": "A"
@@ -197,7 +197,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "elastickv_pebble_block_cache_capacity_bytes{job=\"elastickv\",node_id=~\"$node_id\"}",
+          "expr": "elastickv_pebble_block_cache_capacity_bytes{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\"}",
           "legendFormat": "capacity {{node_id}}",
           "range": true,
           "refId": "B"
@@ -246,7 +246,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "sum by (node_id) (rate(elastickv_pebble_block_cache_hits_total{job=\"elastickv\",node_id=~\"$node_id\"}[$__rate_interval]))",
+          "expr": "sum by (node_id) (rate(elastickv_pebble_block_cache_hits_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\"}[$__rate_interval]))",
           "legendFormat": "hits {{node_id}}",
           "range": true,
           "refId": "A"
@@ -254,7 +254,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "sum by (node_id) (rate(elastickv_pebble_block_cache_misses_total{job=\"elastickv\",node_id=~\"$node_id\"}[$__rate_interval]))",
+          "expr": "sum by (node_id) (rate(elastickv_pebble_block_cache_misses_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\"}[$__rate_interval]))",
           "legendFormat": "misses {{node_id}}",
           "range": true,
           "refId": "B"
@@ -325,7 +325,7 @@
             {
               "datasource": "$datasource",
               "editorMode": "code",
-              "expr": "max by (node_id) (elastickv_pebble_l0_sublevels{job=\"elastickv\",node_id=~\"$node_id\"})",
+              "expr": "max by (node_id) (elastickv_pebble_l0_sublevels{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\"})",
               "legendFormat": "{{node_id}}",
               "refId": "A",
               "instant": true
@@ -390,7 +390,7 @@
             {
               "datasource": "$datasource",
               "editorMode": "code",
-              "expr": "max by (node_id) (elastickv_pebble_l0_sublevels{job=\"elastickv\",node_id=~\"$node_id\"})",
+              "expr": "max by (node_id) (elastickv_pebble_l0_sublevels{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\"})",
               "legendFormat": "{{node_id}}",
               "range": true,
               "refId": "A"
@@ -451,7 +451,7 @@
             {
               "datasource": "$datasource",
               "editorMode": "code",
-              "expr": "max by (node_id) (elastickv_pebble_l0_num_files{job=\"elastickv\",node_id=~\"$node_id\"})",
+              "expr": "max by (node_id) (elastickv_pebble_l0_num_files{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\"})",
               "legendFormat": "{{node_id}}",
               "refId": "A",
               "instant": true
@@ -516,7 +516,7 @@
             {
               "datasource": "$datasource",
               "editorMode": "code",
-              "expr": "max by (node_id) (elastickv_pebble_l0_num_files{job=\"elastickv\",node_id=~\"$node_id\"})",
+              "expr": "max by (node_id) (elastickv_pebble_l0_num_files{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\"})",
               "legendFormat": "{{node_id}}",
               "range": true,
               "refId": "A"
@@ -577,7 +577,7 @@
             {
               "datasource": "$datasource",
               "editorMode": "code",
-              "expr": "max by (node_id) (elastickv_pebble_memtable_count{job=\"elastickv\",node_id=~\"$node_id\"})",
+              "expr": "max by (node_id) (elastickv_pebble_memtable_count{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\"})",
               "legendFormat": "{{node_id}}",
               "refId": "A",
               "instant": true
@@ -642,7 +642,7 @@
             {
               "datasource": "$datasource",
               "editorMode": "code",
-              "expr": "max by (node_id) (elastickv_pebble_memtable_count{job=\"elastickv\",node_id=~\"$node_id\"})",
+              "expr": "max by (node_id) (elastickv_pebble_memtable_count{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\"})",
               "legendFormat": "{{node_id}}",
               "range": true,
               "refId": "A"
@@ -703,7 +703,7 @@
             {
               "datasource": "$datasource",
               "editorMode": "code",
-              "expr": "sum by (node_id) (elastickv_pebble_memtable_size_bytes{job=\"elastickv\",node_id=~\"$node_id\"})",
+              "expr": "sum by (node_id) (elastickv_pebble_memtable_size_bytes{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\"})",
               "legendFormat": "{{node_id}}",
               "refId": "A",
               "instant": true
@@ -752,7 +752,7 @@
             {
               "datasource": "$datasource",
               "editorMode": "code",
-              "expr": "sum by (node_id) (elastickv_pebble_memtable_size_bytes{job=\"elastickv\",node_id=~\"$node_id\"})",
+              "expr": "sum by (node_id) (elastickv_pebble_memtable_size_bytes{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\"})",
               "legendFormat": "{{node_id}}",
               "range": true,
               "refId": "A"
@@ -813,7 +813,7 @@
             {
               "datasource": "$datasource",
               "editorMode": "code",
-              "expr": "max by (node_id) (elastickv_pebble_memtable_zombie_count{job=\"elastickv\",node_id=~\"$node_id\"})",
+              "expr": "max by (node_id) (elastickv_pebble_memtable_zombie_count{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\"})",
               "legendFormat": "{{node_id}}",
               "refId": "A",
               "instant": true
@@ -862,7 +862,7 @@
             {
               "datasource": "$datasource",
               "editorMode": "code",
-              "expr": "max by (node_id) (elastickv_pebble_memtable_zombie_count{job=\"elastickv\",node_id=~\"$node_id\"})",
+              "expr": "max by (node_id) (elastickv_pebble_memtable_zombie_count{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\"})",
               "legendFormat": "{{node_id}}",
               "range": true,
               "refId": "A"
@@ -940,7 +940,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "sum by (node_id) (elastickv_pebble_compact_estimated_debt_bytes{job=\"elastickv\",node_id=~\"$node_id\"})",
+          "expr": "sum by (node_id) (elastickv_pebble_compact_estimated_debt_bytes{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\"})",
           "legendFormat": "{{node_id}}",
           "refId": "A",
           "instant": true
@@ -989,7 +989,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "sum by (node_id) (elastickv_pebble_compact_estimated_debt_bytes{job=\"elastickv\",node_id=~\"$node_id\"})",
+          "expr": "sum by (node_id) (elastickv_pebble_compact_estimated_debt_bytes{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\"})",
           "legendFormat": "{{node_id}}",
           "range": true,
           "refId": "A"
@@ -1050,7 +1050,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "sum by (node_id) (elastickv_pebble_compact_in_progress{job=\"elastickv\",node_id=~\"$node_id\"})",
+          "expr": "sum by (node_id) (elastickv_pebble_compact_in_progress{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\"})",
           "legendFormat": "{{node_id}}",
           "refId": "A",
           "instant": true
@@ -1099,7 +1099,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "sum by (node_id) (elastickv_pebble_compact_in_progress{job=\"elastickv\",node_id=~\"$node_id\"})",
+          "expr": "sum by (node_id) (elastickv_pebble_compact_in_progress{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\"})",
           "legendFormat": "{{node_id}}",
           "range": true,
           "refId": "A"
@@ -1148,7 +1148,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "rate(elastickv_pebble_compact_count_total{job=\"elastickv\",node_id=~\"$node_id\"}[$__rate_interval])",
+          "expr": "rate(elastickv_pebble_compact_count_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\"}[$__rate_interval])",
           "legendFormat": "{{node_id}}",
           "range": true,
           "refId": "A"
@@ -1231,7 +1231,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "elastickv_pebble_fsm_apply_sync_mode{job=\"elastickv\",node_id=~\"$node_id\",mode=\"nosync\"}",
+          "expr": "elastickv_pebble_fsm_apply_sync_mode{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",mode=\"nosync\"}",
           "legendFormat": "{{node_id}} nosync",
           "refId": "A",
           "instant": true
@@ -1293,7 +1293,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "sum by (key_prefix) (rate(elastickv_store_write_conflict_total{job=\"elastickv\",node_id=~\"$node_id\"}[$__rate_interval]))",
+          "expr": "sum by (key_prefix) (rate(elastickv_store_write_conflict_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\"}[$__rate_interval]))",
           "legendFormat": "{{key_prefix}}",
           "range": true,
           "refId": "A"
@@ -1314,21 +1314,55 @@
   "templating": {
     "list": [
       {
-        "current": {
-          "selected": false,
-          "text": "default",
-          "value": "default"
-        },
-        "hide": 0,
-        "includeAll": false,
-        "label": "Datasource",
-        "multi": false,
         "name": "datasource",
-        "options": [],
+        "label": "Datasource",
+        "type": "datasource",
         "query": "prometheus",
         "refresh": 1,
-        "regex": "",
-        "type": "datasource"
+        "current": {},
+        "options": []
+      },
+      {
+        "name": "job",
+        "label": "Job",
+        "type": "query",
+        "datasource": "$datasource",
+        "query": {
+          "query": "label_values({__name__=~\"elastickv_.+\"}, job)",
+          "refId": "variable-job"
+        },
+        "definition": "label_values({__name__=~\"elastickv_.+\"}, job)",
+        "refresh": 2,
+        "sort": 1,
+        "multi": false,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "options": []
+      },
+      {
+        "name": "cluster",
+        "label": "Cluster",
+        "type": "query",
+        "datasource": "$datasource",
+        "query": {
+          "query": "label_values({__name__=~\"elastickv_.+\",job=~\"$job\"}, cluster)",
+          "refId": "variable-cluster"
+        },
+        "definition": "label_values({__name__=~\"elastickv_.+\",job=~\"$job\"}, cluster)",
+        "refresh": 2,
+        "sort": 1,
+        "multi": false,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "options": []
       },
       {
         "allValue": ".*",
@@ -1338,7 +1372,7 @@
           "value": "$__all"
         },
         "datasource": "$datasource",
-        "definition": "label_values(elastickv_pebble_l0_num_files{job=\"elastickv\"}, node_id)",
+        "definition": "label_values(elastickv_pebble_l0_num_files{job=~\"$job\",cluster=~\"$cluster\"}, node_id)",
         "includeAll": true,
         "label": "Node ID",
         "multi": true,
@@ -1346,7 +1380,7 @@
         "options": [],
         "query": {
           "qryType": 1,
-          "query": "label_values(elastickv_pebble_l0_num_files{job=\"elastickv\"}, node_id)",
+          "query": "label_values(elastickv_pebble_l0_num_files{job=~\"$job\",cluster=~\"$cluster\"}, node_id)",
           "refId": "PrometheusVariableQueryEditor-VariableQuery"
         },
         "refresh": 2,
