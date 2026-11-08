@@ -316,7 +316,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max(elastickv_raft_commit_index{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"} - on(group, node_id, node_address) elastickv_raft_applied_index{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"})",
+          "expr": "max(elastickv_raft_commit_index{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"} - on(job, cluster, group, node_id, node_address) elastickv_raft_applied_index{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"})",
           "legendFormat": "max commit-applied",
           "refId": "A",
           "instant": true
@@ -660,7 +660,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max by (group, node_id, node_address) (elastickv_raft_last_log_index{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"} - on(group, node_id, node_address) elastickv_raft_applied_index{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"})",
+          "expr": "max by (group, node_id, node_address) (elastickv_raft_last_log_index{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"} - on(job, cluster, group, node_id, node_address) elastickv_raft_applied_index{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"})",
           "format": "table",
           "instant": true,
           "refId": "E"
@@ -668,7 +668,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max by (group, node_id, node_address) (elastickv_raft_commit_index{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"} - on(group, node_id, node_address) elastickv_raft_applied_index{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"})",
+          "expr": "max by (group, node_id, node_address) (elastickv_raft_commit_index{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"} - on(job, cluster, group, node_id, node_address) elastickv_raft_applied_index{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"})",
           "format": "table",
           "instant": true,
           "refId": "F"
@@ -845,7 +845,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max by (group, node_id, node_address) (elastickv_raft_commit_index{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"} - on(group, node_id, node_address) elastickv_raft_applied_index{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"})",
+          "expr": "max by (group, node_id, node_address) (elastickv_raft_commit_index{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"} - on(job, cluster, group, node_id, node_address) elastickv_raft_applied_index{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"})",
           "legendFormat": "g{{group}} {{node_id}}",
           "range": true,
           "refId": "A"

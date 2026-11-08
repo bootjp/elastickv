@@ -88,3 +88,10 @@ independent clusters and deployments without a cluster label.
 
 References: [Grafana datasource-managed alert visibility](https://grafana.com/docs/grafana/latest/datasources/prometheus/alerting/)
 and [Prometheus rule testing](https://prometheus.io/docs/prometheus/latest/configuration/unit_testing_rules/).
+
+With `promtool` on PATH, run `python3 -m unittest discover -s monitoring/tests`
+from the repository root to evaluate the Raft index subtraction expressions
+extracted directly from the dashboard JSON. The fixtures reuse node identifiers
+and addresses across jobs and clusters, including a deployment without a cluster
+label, to catch ambiguous vector matching with the All selections. The Monitoring
+assets workflow runs this regression test and the alert-rule checks on pushes.
