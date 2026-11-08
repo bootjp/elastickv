@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/cockroachdb/errors"
@@ -40,6 +41,9 @@ func validateSQSPublicEndpoint(endpoint *url.URL) error {
 	if endpoint.Path != "" && endpoint.Path != "/" {
 		return errInvalidSQSPublicEndpoint
 	}
+	if err := validateSQSPublicEndpointPort(endpoint.Port()); err != nil {
+		return err
+	}
 	if hasSQSPublicEndpointSuffix(endpoint) {
 		return errInvalidSQSPublicEndpoint
 	}
@@ -48,4 +52,15 @@ func validateSQSPublicEndpoint(endpoint *url.URL) error {
 
 func hasSQSPublicEndpointSuffix(endpoint *url.URL) bool {
 	return endpoint.RawQuery != "" || endpoint.ForceQuery || endpoint.Fragment != "" || endpoint.RawFragment != ""
+}
+
+func validateSQSPublicEndpointPort(port string) error {
+	if port == "" {
+		return nil
+	}
+	value, err := strconv.ParseUint(port, 10, 16)
+	if err != nil || value == 0 {
+		return errors.Wrap(errInvalidSQSPublicEndpoint, "port must be between 1 and 65535")
+	}
+	return nil
 }
