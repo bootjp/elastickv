@@ -71,3 +71,7 @@ The Monitoring assets workflow runs that test and the existing alert fixtures.
 The built-in cluster dashboard annotation query retains the Grafana datasource
 rather than the selectable Prometheus datasource. A failing-first regression
 checks that all built-in annotation queries use Grafana's internal datasource.
+Coverage follow-up: filesystem move and TSO marker-ordering fixtures now verify
+both gauges/markers and exact alert labels across jobs and clusters. The move
+fixture evaluates beyond 30 minutes and distinguishes recent from stuck work.
+The alert suite now contains nine scenarios.

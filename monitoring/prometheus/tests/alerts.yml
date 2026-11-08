@@ -168,3 +168,80 @@ tests:
         summary: Elastickv metrics target is unreachable
         description: Scraping server-a:9090 has failed for two minutes. Check the
           process, metrics token, network policy, and collector.
+- name: Stuck filesystem moves isolate durable and local activity by deployment
+  interval: 1m
+  input_series:
+  - series: elastickv_fs_file_move_inflight{job="fs",cluster="durable"}
+    values: 1+0x40
+  - series: elastickv_fs_file_move_active_local{job="fs",cluster="durable"}
+    values: 0+0x40
+  - series: elastickv_fs_file_move_inflight{job="fs",cluster="local"}
+    values: 0+0x40
+  - series: elastickv_fs_file_move_active_local{job="fs",cluster="local"}
+    values: 1+0x40
+  - series: elastickv_fs_file_move_inflight{job="other",cluster="durable"}
+    values: 0+0x40
+  - series: elastickv_fs_file_move_active_local{job="other",cluster="durable"}
+    values: 0+0x40
+  - series: elastickv_fs_file_move_inflight{job="fs",cluster="recent"}
+    values: 0+0x29 1+0x10
+  - series: elastickv_fs_file_move_active_local{job="fs",cluster="recent"}
+    values: 0+0x29 1+0x10
+  alert_rule_test:
+  - eval_time: 35m
+    alertname: ElastickvFilesystemMoveStuck
+    exp_alerts:
+    - exp_labels:
+        job: fs
+        cluster: durable
+        severity: warning
+      exp_annotations:
+        summary: Filesystem migration has remained in flight
+        description: At least one durable whole-file move has not completed for 30 minutes. Run intent recovery and inspect the move job cursor and epoch fence.
+    - exp_labels:
+        job: fs
+        cluster: local
+        severity: warning
+      exp_annotations:
+        summary: Filesystem migration has remained in flight
+        description: At least one durable whole-file move has not completed for 30 minutes. Run intent recovery and inspect the move job cursor and epoch fence.
+- name: TSO marker ordering preserves job cluster and node identity
+  interval: 1m
+  input_series:
+  - series: elastickv_tso_durable_state{job="kv",cluster="bad",node_id="same",node_address="peer:50051",marker="phase_d"}
+    values: 1+0x5
+  - series: elastickv_tso_durable_state{job="kv",cluster="bad",node_id="same",node_address="peer:50051",marker="cutover"}
+    values: 0+0x5
+  - series: elastickv_tso_durable_state{job="kv",cluster="good",node_id="same",node_address="peer:50051",marker="phase_d"}
+    values: 1+0x5
+  - series: elastickv_tso_durable_state{job="kv",cluster="good",node_id="same",node_address="peer:50051",marker="cutover"}
+    values: 1+0x5
+  - series: elastickv_tso_durable_state{job="other",cluster="bad",node_id="same",node_address="peer:50051",marker="phase_d"}
+    values: 0+0x5
+  - series: elastickv_tso_durable_state{job="other",cluster="bad",node_id="same",node_address="peer:50051",marker="cutover"}
+    values: 0+0x5
+  - series: elastickv_tso_durable_state{job="kv",node_id="same",node_address="peer:50051",marker="phase_d"}
+    values: 1+0x5
+  - series: elastickv_tso_durable_state{job="kv",node_id="same",node_address="peer:50051",marker="cutover"}
+    values: 0+0x5
+  alert_rule_test:
+  - eval_time: 3m
+    alertname: ElasticKVTSOPhaseDWithoutCutover
+    exp_alerts:
+    - exp_labels:
+        job: kv
+        cluster: bad
+        node_id: same
+        node_address: peer:50051
+        severity: critical
+      exp_annotations:
+        summary: Durable TSO marker ordering is invalid
+        description: Phase D is visible without the prerequisite durable cutover marker. Stop rollout and inspect group-0 state.
+    - exp_labels:
+        job: kv
+        node_id: same
+        node_address: peer:50051
+        severity: critical
+      exp_annotations:
+        summary: Durable TSO marker ordering is invalid
+        description: Phase D is visible without the prerequisite durable cutover marker. Stop rollout and inspect group-0 state.
