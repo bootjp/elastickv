@@ -1,0 +1,32 @@
+groups:
+  - name: elastickv-raft
+    rules:
+      # Set the scrape job name here if your deployment uses another name.
+      # Keep configured targets present during failures: disappearing service
+      # discovery targets cannot be detected by an up == 0 rule.
+      - alert: ElastickvMetricsTargetDown
+        expr: up{job="elastickv"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Elastickv metrics target is unreachable
+          description: 'Scraping {{ $labels.instance }} has failed for two minutes. Check the process, metrics token, network policy, and collector.'
+
+      - alert: ElastickvRaftLeaderCountInvalid
+        expr: sum by (job, cluster, group) (max by (job, cluster, group, node_id) (elastickv_raft_local_state{state="leader"})) != 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Raft group does not report exactly one leader
+          description: 'Group {{ $labels.group }} reports {{ $value }} leaders. Check member reachability and elections; missing scrapes can also hide a leader.'
+
+      - alert: ElastickvRaftApplyLag
+        expr: max by (job, cluster, group, node_id) (elastickv_raft_commit_index - elastickv_raft_applied_index) > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Raft application is behind committed entries
+          description: 'Node {{ $labels.node_id }} in group {{ $labels.group }} is more than 1000 entries behind for five minutes. Check storage latency and FSM throughput.'

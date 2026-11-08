@@ -27,31 +27,50 @@
       "description": "Distinct queues currently reporting depth on the leader. Drops to 0 if the leader can't run its catalog scan.",
       "fieldConfig": {
         "defaults": {
-          "color": { "mode": "thresholds" },
+          "color": {
+            "mode": "thresholds"
+          },
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "red", "value": null },
-              { "color": "green", "value": 1 }
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
             ]
           },
           "unit": "short"
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 0
+      },
       "id": 1,
       "options": {
         "colorMode": "value",
         "graphMode": "area",
-        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
         "textMode": "auto"
       },
       "pluginVersion": "10.4.0",
       "targets": [
         {
           "datasource": "$datasource",
-          "expr": "count(count by (queue) (elastickv_sqs_queue_messages))",
+          "expr": "count(count by (queue) (elastickv_sqs_queue_messages{job=~\"$job\",cluster=~\"$cluster\"}))",
           "legendFormat": "queues",
           "refId": "A"
         }
@@ -64,32 +83,54 @@
       "description": "Sum across every queue of visible + in-flight + delayed messages. Use for capacity planning and as a proxy for cluster-wide work backlog.",
       "fieldConfig": {
         "defaults": {
-          "color": { "mode": "thresholds" },
+          "color": {
+            "mode": "thresholds"
+          },
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "green", "value": null },
-              { "color": "yellow", "value": 1000 },
-              { "color": "red", "value": 10000 }
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1000
+              },
+              {
+                "color": "red",
+                "value": 10000
+              }
             ]
           },
           "unit": "short"
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 0
+      },
       "id": 2,
       "options": {
         "colorMode": "value",
         "graphMode": "area",
-        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
         "textMode": "auto"
       },
       "pluginVersion": "10.4.0",
       "targets": [
         {
           "datasource": "$datasource",
-          "expr": "sum(elastickv_sqs_queue_messages)",
+          "expr": "sum(elastickv_sqs_queue_messages{job=~\"$job\",cluster=~\"$cluster\"})",
           "legendFormat": "messages",
           "refId": "A"
         }
@@ -102,28 +143,46 @@
       "description": "HT-FIFO partition operations per second across all queues. Sums send + receive + delete; split out below.",
       "fieldConfig": {
         "defaults": {
-          "color": { "mode": "thresholds" },
+          "color": {
+            "mode": "thresholds"
+          },
           "thresholds": {
             "mode": "absolute",
-            "steps": [{ "color": "green", "value": null }]
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
           },
           "unit": "ops"
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 0
+      },
       "id": 3,
       "options": {
         "colorMode": "value",
         "graphMode": "area",
-        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
         "textMode": "auto"
       },
       "pluginVersion": "10.4.0",
       "targets": [
         {
           "datasource": "$datasource",
-          "expr": "sum(rate(elastickv_sqs_partition_messages_total[$__rate_interval]))",
+          "expr": "sum(rate(elastickv_sqs_partition_messages_total{job=~\"$job\",cluster=~\"$cluster\"}[$__rate_interval]))",
           "legendFormat": "ops/s",
           "refId": "A"
         }
@@ -136,28 +195,46 @@
       "description": "Node currently emitting depth gauges. The leader runs the catalog scan; followers stay silent so this stat reads the {node_id, node_address} pair off any depth series.",
       "fieldConfig": {
         "defaults": {
-          "color": { "mode": "thresholds" },
+          "color": {
+            "mode": "thresholds"
+          },
           "thresholds": {
             "mode": "absolute",
-            "steps": [{ "color": "green", "value": null }]
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
           },
           "unit": "none"
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 0
+      },
       "id": 4,
       "options": {
         "colorMode": "none",
         "graphMode": "none",
-        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "/^node_id$/", "values": true },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "/^node_id$/",
+          "values": true
+        },
         "textMode": "value_and_name"
       },
       "pluginVersion": "10.4.0",
       "targets": [
         {
           "datasource": "$datasource",
-          "expr": "count by (node_id) (elastickv_sqs_queue_messages)",
+          "expr": "count by (node_id) (elastickv_sqs_queue_messages{job=~\"$job\",cluster=~\"$cluster\"})",
           "format": "table",
           "instant": true,
           "legendFormat": "{{node_id}}",
@@ -169,7 +246,12 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 4 },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 4
+      },
       "id": 50,
       "panels": [],
       "title": "Per-queue depth",
@@ -180,7 +262,9 @@
       "description": "Visible (= ApproximateNumberOfMessages) per queue. The number of messages waiting for ReceiveMessage. Sustained growth means consumers can't keep up.",
       "fieldConfig": {
         "defaults": {
-          "color": { "mode": "palette-classic" },
+          "color": {
+            "mode": "palette-classic"
+          },
           "custom": {
             "axisLabel": "messages",
             "fillOpacity": 10,
@@ -190,24 +274,44 @@
             "pointSize": 2,
             "showPoints": "never",
             "spanNulls": false,
-            "stacking": { "mode": "none" },
-            "thresholdsStyle": { "mode": "off" }
+            "stacking": {
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
           },
           "unit": "short"
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 5 },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 5
+      },
       "id": 5,
       "options": {
-        "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "right", "showLegend": true },
-        "tooltip": { "mode": "multi", "sort": "desc" }
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       },
       "pluginVersion": "10.4.0",
       "targets": [
         {
           "datasource": "$datasource",
-          "expr": "elastickv_sqs_queue_messages{queue=~\"$queue\", state=\"visible\"}",
+          "expr": "elastickv_sqs_queue_messages{job=~\"$job\",cluster=~\"$cluster\",queue=~\"$queue\", state=\"visible\"}",
           "legendFormat": "{{queue}}",
           "refId": "A"
         }
@@ -220,7 +324,9 @@
       "description": "In-flight (= ApproximateNumberOfMessagesNotVisible) per queue. Messages received by a consumer but not yet deleted; pinned high = consumer crashed or visibility timeout too long.",
       "fieldConfig": {
         "defaults": {
-          "color": { "mode": "palette-classic" },
+          "color": {
+            "mode": "palette-classic"
+          },
           "custom": {
             "axisLabel": "messages",
             "fillOpacity": 10,
@@ -230,23 +336,41 @@
             "pointSize": 2,
             "showPoints": "never",
             "spanNulls": false,
-            "stacking": { "mode": "none" }
+            "stacking": {
+              "mode": "none"
+            }
           },
           "unit": "short"
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 5 },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 5
+      },
       "id": 6,
       "options": {
-        "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "right", "showLegend": true },
-        "tooltip": { "mode": "multi", "sort": "desc" }
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       },
       "pluginVersion": "10.4.0",
       "targets": [
         {
           "datasource": "$datasource",
-          "expr": "elastickv_sqs_queue_messages{queue=~\"$queue\", state=\"not_visible\"}",
+          "expr": "elastickv_sqs_queue_messages{job=~\"$job\",cluster=~\"$cluster\",queue=~\"$queue\", state=\"not_visible\"}",
           "legendFormat": "{{queue}}",
           "refId": "A"
         }
@@ -259,7 +383,9 @@
       "description": "Delayed (= ApproximateNumberOfMessagesDelayed) per queue. Messages with DelaySeconds not yet expired. Usually small unless callers explicitly schedule.",
       "fieldConfig": {
         "defaults": {
-          "color": { "mode": "palette-classic" },
+          "color": {
+            "mode": "palette-classic"
+          },
           "custom": {
             "axisLabel": "messages",
             "fillOpacity": 10,
@@ -269,23 +395,41 @@
             "pointSize": 2,
             "showPoints": "never",
             "spanNulls": false,
-            "stacking": { "mode": "none" }
+            "stacking": {
+              "mode": "none"
+            }
           },
           "unit": "short"
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 13 },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 13
+      },
       "id": 7,
       "options": {
-        "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "right", "showLegend": true },
-        "tooltip": { "mode": "multi", "sort": "desc" }
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       },
       "pluginVersion": "10.4.0",
       "targets": [
         {
           "datasource": "$datasource",
-          "expr": "elastickv_sqs_queue_messages{queue=~\"$queue\", state=\"delayed\"}",
+          "expr": "elastickv_sqs_queue_messages{job=~\"$job\",cluster=~\"$cluster\",queue=~\"$queue\", state=\"delayed\"}",
           "legendFormat": "{{queue}}",
           "refId": "A"
         }
@@ -298,31 +442,60 @@
       "description": "Top queues by total backlog (visible + in-flight + delayed). Quick way to find the queue that's accumulating most work right now.",
       "fieldConfig": {
         "defaults": {
-          "color": { "mode": "thresholds" },
+          "color": {
+            "mode": "thresholds"
+          },
           "custom": {
             "align": "auto",
-            "cellOptions": { "type": "auto" },
+            "cellOptions": {
+              "type": "auto"
+            },
             "inspect": false
           },
           "mappings": [],
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
           "unit": "short"
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 13 },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 13
+      },
       "id": 8,
       "options": {
         "cellHeight": "sm",
-        "footer": { "countRows": false, "fields": "", "reducer": ["sum"], "show": false },
+        "footer": {
+          "countRows": false,
+          "fields": "",
+          "reducer": [
+            "sum"
+          ],
+          "show": false
+        },
         "showHeader": true,
-        "sortBy": [{ "desc": true, "displayName": "Backlog" }]
+        "sortBy": [
+          {
+            "desc": true,
+            "displayName": "Backlog"
+          }
+        ]
       },
       "pluginVersion": "10.4.0",
       "targets": [
         {
           "datasource": "$datasource",
-          "expr": "topk(20, sum by (queue) (elastickv_sqs_queue_messages{queue=~\"$queue\"}))",
+          "expr": "topk(20, sum by (queue) (elastickv_sqs_queue_messages{job=~\"$job\",cluster=~\"$cluster\",queue=~\"$queue\"}))",
           "format": "table",
           "instant": true,
           "legendFormat": "{{queue}}",
@@ -334,9 +507,17 @@
         {
           "id": "organize",
           "options": {
-            "excludeByName": { "Time": true, "node_id": true, "node_address": true, "__name__": true },
+            "excludeByName": {
+              "Time": true,
+              "node_id": true,
+              "node_address": true,
+              "__name__": true
+            },
             "indexByName": {},
-            "renameByName": { "Value": "Backlog", "queue": "Queue" }
+            "renameByName": {
+              "Value": "Backlog",
+              "queue": "Queue"
+            }
           }
         }
       ],
@@ -344,7 +525,12 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 21 },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 21
+      },
       "id": 51,
       "panels": [],
       "title": "HT-FIFO partition activity",
@@ -355,7 +541,9 @@
       "description": "HT-FIFO partition operation rate, broken down by action. Counter is non-zero only for queues with PartitionCount > 1.",
       "fieldConfig": {
         "defaults": {
-          "color": { "mode": "palette-classic" },
+          "color": {
+            "mode": "palette-classic"
+          },
           "custom": {
             "axisLabel": "ops/s",
             "fillOpacity": 10,
@@ -363,23 +551,41 @@
             "lineInterpolation": "linear",
             "lineWidth": 1,
             "showPoints": "never",
-            "stacking": { "mode": "normal" }
+            "stacking": {
+              "mode": "normal"
+            }
           },
           "unit": "ops"
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 22 },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 22
+      },
       "id": 9,
       "options": {
-        "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "right", "showLegend": true },
-        "tooltip": { "mode": "multi", "sort": "desc" }
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       },
       "pluginVersion": "10.4.0",
       "targets": [
         {
           "datasource": "$datasource",
-          "expr": "sum by (action) (rate(elastickv_sqs_partition_messages_total{queue=~\"$queue\"}[$__rate_interval]))",
+          "expr": "sum by (action) (rate(elastickv_sqs_partition_messages_total{job=~\"$job\",cluster=~\"$cluster\",queue=~\"$queue\"}[$__rate_interval]))",
           "legendFormat": "{{action}}",
           "refId": "A"
         }
@@ -392,7 +598,9 @@
       "description": "Per-(queue, partition) operation rate. Use to spot uneven MessageGroupId distribution across partitions: ideal hash spreads roughly evenly, hot partitions show as spikes.",
       "fieldConfig": {
         "defaults": {
-          "color": { "mode": "palette-classic" },
+          "color": {
+            "mode": "palette-classic"
+          },
           "custom": {
             "axisLabel": "ops/s",
             "fillOpacity": 10,
@@ -400,23 +608,41 @@
             "lineInterpolation": "linear",
             "lineWidth": 1,
             "showPoints": "never",
-            "stacking": { "mode": "none" }
+            "stacking": {
+              "mode": "none"
+            }
           },
           "unit": "ops"
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 22 },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 22
+      },
       "id": 10,
       "options": {
-        "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "right", "showLegend": true },
-        "tooltip": { "mode": "multi", "sort": "desc" }
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       },
       "pluginVersion": "10.4.0",
       "targets": [
         {
           "datasource": "$datasource",
-          "expr": "sum by (queue, partition) (rate(elastickv_sqs_partition_messages_total{queue=~\"$queue\"}[$__rate_interval]))",
+          "expr": "sum by (queue, partition) (rate(elastickv_sqs_partition_messages_total{job=~\"$job\",cluster=~\"$cluster\",queue=~\"$queue\"}[$__rate_interval]))",
           "legendFormat": "{{queue}}/p{{partition}}",
           "refId": "A"
         }
@@ -427,28 +653,72 @@
   ],
   "refresh": "30s",
   "schemaVersion": 39,
-  "tags": ["elastickv", "sqs"],
+  "tags": [
+    "elastickv",
+    "sqs"
+  ],
   "templating": {
     "list": [
       {
-        "current": { "selected": false, "text": "Prometheus", "value": "Prometheus" },
-        "hide": 0,
-        "includeAll": false,
-        "label": "Datasource",
-        "multi": false,
         "name": "datasource",
-        "options": [],
+        "label": "Datasource",
+        "type": "datasource",
         "query": "prometheus",
         "refresh": 1,
-        "regex": "",
-        "skipUrlSync": false,
-        "type": "datasource"
+        "current": {},
+        "options": []
+      },
+      {
+        "name": "job",
+        "label": "Job",
+        "type": "query",
+        "datasource": "$datasource",
+        "query": {
+          "query": "label_values({__name__=~\"elastickv_.+\"}, job)",
+          "refId": "variable-job"
+        },
+        "definition": "label_values({__name__=~\"elastickv_.+\"}, job)",
+        "refresh": 2,
+        "sort": 1,
+        "multi": false,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "options": []
+      },
+      {
+        "name": "cluster",
+        "label": "Cluster",
+        "type": "query",
+        "datasource": "$datasource",
+        "query": {
+          "query": "label_values({__name__=~\"elastickv_.+\",job=~\"$job\"}, cluster)",
+          "refId": "variable-cluster"
+        },
+        "definition": "label_values({__name__=~\"elastickv_.+\",job=~\"$job\"}, cluster)",
+        "refresh": 2,
+        "sort": 1,
+        "multi": false,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "options": []
       },
       {
         "allValue": ".*",
-        "current": { "selected": false, "text": "All", "value": "$__all" },
+        "current": {
+          "selected": false,
+          "text": "All",
+          "value": "$__all"
+        },
         "datasource": "$datasource",
-        "definition": "label_values(elastickv_sqs_queue_messages, queue)",
+        "definition": "label_values(elastickv_sqs_queue_messages{job=~\"$job\",cluster=~\"$cluster\"}, queue)",
         "hide": 0,
         "includeAll": true,
         "label": "Queue",
@@ -456,7 +726,7 @@
         "name": "queue",
         "options": [],
         "query": {
-          "query": "label_values(elastickv_sqs_queue_messages, queue)",
+          "query": "label_values(elastickv_sqs_queue_messages{job=~\"$job\",cluster=~\"$cluster\"}, queue)",
           "refId": "Prometheus-queue-Variable-Query"
         },
         "refresh": 2,
@@ -467,7 +737,10 @@
       }
     ]
   },
-  "time": { "from": "now-1h", "to": "now" },
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
   "timepicker": {},
   "timezone": "",
   "title": "Elastickv SQS",

@@ -64,7 +64,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "sum(rate(elastickv_dynamodb_requests_total{job=\"elastickv\",node_id=~\"$node_id\",operation=~\"$operation\"}[5m]))",
+          "expr": "sum(rate(elastickv_dynamodb_requests_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",operation=~\"$operation\"}[5m]))",
           "legendFormat": "requests/s",
           "refId": "A",
           "instant": true
@@ -124,7 +124,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "clamp_max(sum(increase(elastickv_dynamodb_requests_total{job=\"elastickv\",node_id=~\"$node_id\",operation=~\"$operation\",outcome=\"success\"}[15m])) / clamp_min(sum(increase(elastickv_dynamodb_requests_total{job=\"elastickv\",node_id=~\"$node_id\",operation=~\"$operation\"}[15m])), 1), 1)",
+          "expr": "clamp_max(sum(increase(elastickv_dynamodb_requests_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",operation=~\"$operation\",outcome=\"success\"}[15m])) / clamp_min(sum(increase(elastickv_dynamodb_requests_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",operation=~\"$operation\"}[15m])), 1), 1)",
           "legendFormat": "success rate",
           "refId": "A",
           "instant": true
@@ -176,7 +176,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "sum(increase(elastickv_dynamodb_requests_total{job=\"elastickv\",node_id=~\"$node_id\",operation=~\"$operation\",outcome=\"system_error\"}[15m]))",
+          "expr": "sum(increase(elastickv_dynamodb_requests_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",operation=~\"$operation\",outcome=\"system_error\"}[15m]))",
           "legendFormat": "system errors / 15m",
           "refId": "A",
           "instant": true
@@ -228,7 +228,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "sum(increase(elastickv_dynamodb_requests_total{job=\"elastickv\",node_id=~\"$node_id\",operation=~\"$operation\",outcome=\"user_error\"}[15m]))",
+          "expr": "sum(increase(elastickv_dynamodb_requests_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",operation=~\"$operation\",outcome=\"user_error\"}[15m]))",
           "legendFormat": "user errors / 15m",
           "refId": "A",
           "instant": true
@@ -288,7 +288,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(elastickv_dynamodb_request_duration_seconds_bucket{job=\"elastickv\",node_id=~\"$node_id\",operation=~\"$operation\",outcome=\"success\"}[5m])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(elastickv_dynamodb_request_duration_seconds_bucket{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",operation=~\"$operation\",outcome=\"success\"}[5m])))",
           "legendFormat": "p95 success",
           "refId": "A",
           "instant": true
@@ -340,7 +340,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "sum(elastickv_dynamodb_inflight_requests{job=\"elastickv\",node_id=~\"$node_id\",operation=~\"$operation\"})",
+          "expr": "sum(elastickv_dynamodb_inflight_requests{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",operation=~\"$operation\"})",
           "legendFormat": "inflight",
           "refId": "A",
           "instant": true
@@ -389,7 +389,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "sum by (operation) (rate(elastickv_dynamodb_requests_total{job=\"elastickv\",node_id=~\"$node_id\",operation=~\"$operation\"}[5m]))",
+          "expr": "sum by (operation) (rate(elastickv_dynamodb_requests_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",operation=~\"$operation\"}[5m]))",
           "legendFormat": "{{operation}}",
           "range": true,
           "refId": "A"
@@ -438,7 +438,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by (le, operation) (rate(elastickv_dynamodb_request_duration_seconds_bucket{job=\"elastickv\",node_id=~\"$node_id\",operation=~\"$operation\",outcome=\"success\"}[5m])))",
+          "expr": "histogram_quantile(0.50, sum by (le, operation) (rate(elastickv_dynamodb_request_duration_seconds_bucket{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",operation=~\"$operation\",outcome=\"success\"}[5m])))",
           "legendFormat": "p50 {{operation}}",
           "range": true,
           "refId": "A"
@@ -446,7 +446,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le, operation) (rate(elastickv_dynamodb_request_duration_seconds_bucket{job=\"elastickv\",node_id=~\"$node_id\",operation=~\"$operation\",outcome=\"success\"}[5m])))",
+          "expr": "histogram_quantile(0.95, sum by (le, operation) (rate(elastickv_dynamodb_request_duration_seconds_bucket{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",operation=~\"$operation\",outcome=\"success\"}[5m])))",
           "legendFormat": "p95 {{operation}}",
           "range": true,
           "refId": "B"
@@ -454,7 +454,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le, operation) (rate(elastickv_dynamodb_request_duration_seconds_bucket{job=\"elastickv\",node_id=~\"$node_id\",operation=~\"$operation\",outcome=\"success\"}[5m])))",
+          "expr": "histogram_quantile(0.99, sum by (le, operation) (rate(elastickv_dynamodb_request_duration_seconds_bucket{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",operation=~\"$operation\",outcome=\"success\"}[5m])))",
           "legendFormat": "p99 {{operation}}",
           "range": true,
           "refId": "C"
@@ -503,7 +503,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "sum by (operation) (rate(elastickv_dynamodb_requests_total{job=\"elastickv\",node_id=~\"$node_id\",operation=~\"$operation\",outcome=\"system_error\"}[5m]))",
+          "expr": "sum by (operation) (rate(elastickv_dynamodb_requests_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",operation=~\"$operation\",outcome=\"system_error\"}[5m]))",
           "legendFormat": "system_error {{operation}}",
           "range": true,
           "refId": "A"
@@ -511,7 +511,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "sum by (operation) (rate(elastickv_dynamodb_requests_total{job=\"elastickv\",node_id=~\"$node_id\",operation=~\"$operation\",outcome=\"user_error\"}[5m]))",
+          "expr": "sum by (operation) (rate(elastickv_dynamodb_requests_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",operation=~\"$operation\",outcome=\"user_error\"}[5m]))",
           "legendFormat": "user_error {{operation}}",
           "range": true,
           "refId": "B"
@@ -519,7 +519,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "sum by (operation) (rate(elastickv_dynamodb_requests_total{job=\"elastickv\",node_id=~\"$node_id\",operation=~\"$operation\",outcome=\"conditional_check_failed\"}[5m]))",
+          "expr": "sum by (operation) (rate(elastickv_dynamodb_requests_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",operation=~\"$operation\",outcome=\"conditional_check_failed\"}[5m]))",
           "legendFormat": "conditional {{operation}}",
           "range": true,
           "refId": "C"
@@ -568,7 +568,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "sum by (node_id, node_address) (rate(elastickv_dynamodb_requests_total{job=\"elastickv\",node_id=~\"$node_id\",operation=~\"$operation\"}[5m]))",
+          "expr": "sum by (node_id, node_address) (rate(elastickv_dynamodb_requests_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",operation=~\"$operation\"}[5m]))",
           "legendFormat": "{{node_id}} {{node_address}}",
           "range": true,
           "refId": "A"
@@ -617,7 +617,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le, node_id, node_address) (rate(elastickv_dynamodb_request_duration_seconds_bucket{job=\"elastickv\",node_id=~\"$node_id\",operation=~\"$operation\",outcome=\"success\"}[5m])))",
+          "expr": "histogram_quantile(0.95, sum by (le, node_id, node_address) (rate(elastickv_dynamodb_request_duration_seconds_bucket{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",operation=~\"$operation\",outcome=\"success\"}[5m])))",
           "legendFormat": "{{node_id}} {{node_address}}",
           "range": true,
           "refId": "A"
@@ -666,7 +666,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "sum by (operation) (elastickv_dynamodb_inflight_requests{job=\"elastickv\",node_id=~\"$node_id\",operation=~\"$operation\"})",
+          "expr": "sum by (operation) (elastickv_dynamodb_inflight_requests{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",operation=~\"$operation\"})",
           "legendFormat": "{{operation}}",
           "range": true,
           "refId": "A"
@@ -703,7 +703,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "topk(10, sum by (table) (rate(elastickv_dynamodb_table_requests_total{job=\"elastickv\",node_id=~\"$node_id\",operation=~\"$operation\",table=~\"$table\"}[5m])))",
+          "expr": "topk(10, sum by (table) (rate(elastickv_dynamodb_table_requests_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",operation=~\"$operation\",table=~\"$table\"}[5m])))",
           "format": "table",
           "instant": true,
           "refId": "A"
@@ -768,7 +768,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "sum by (table) (rate(elastickv_dynamodb_system_errors_total{job=\"elastickv\",node_id=~\"$node_id\",operation=~\"$operation\",table=~\"$table\"}[5m]))",
+          "expr": "sum by (table) (rate(elastickv_dynamodb_system_errors_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",operation=~\"$operation\",table=~\"$table\"}[5m]))",
           "format": "table",
           "instant": true,
           "refId": "A"
@@ -776,7 +776,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "sum by (table) (rate(elastickv_dynamodb_user_errors_total{job=\"elastickv\",node_id=~\"$node_id\",operation=~\"$operation\",table=~\"$table\"}[5m]))",
+          "expr": "sum by (table) (rate(elastickv_dynamodb_user_errors_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",operation=~\"$operation\",table=~\"$table\"}[5m]))",
           "format": "table",
           "instant": true,
           "refId": "B"
@@ -784,7 +784,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "sum by (table) (rate(elastickv_dynamodb_conditional_check_failed_total{job=\"elastickv\",node_id=~\"$node_id\",operation=~\"$operation\",table=~\"$table\"}[5m]))",
+          "expr": "sum by (table) (rate(elastickv_dynamodb_conditional_check_failed_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",operation=~\"$operation\",table=~\"$table\"}[5m]))",
           "format": "table",
           "instant": true,
           "refId": "C"
@@ -853,7 +853,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "sum by (table) (rate(elastickv_dynamodb_returned_items_total{job=\"elastickv\",node_id=~\"$node_id\",operation=~\"$operation\",table=~\"$table\"}[5m]))",
+          "expr": "sum by (table) (rate(elastickv_dynamodb_returned_items_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",operation=~\"$operation\",table=~\"$table\"}[5m]))",
           "format": "table",
           "instant": true,
           "refId": "A"
@@ -861,7 +861,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "sum by (table) (rate(elastickv_dynamodb_scanned_items_total{job=\"elastickv\",node_id=~\"$node_id\",operation=~\"$operation\",table=~\"$table\"}[5m]))",
+          "expr": "sum by (table) (rate(elastickv_dynamodb_scanned_items_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",operation=~\"$operation\",table=~\"$table\"}[5m]))",
           "format": "table",
           "instant": true,
           "refId": "B"
@@ -869,7 +869,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "sum by (table) (rate(elastickv_dynamodb_written_items_total{job=\"elastickv\",node_id=~\"$node_id\",operation=~\"$operation\",table=~\"$table\"}[5m]))",
+          "expr": "sum by (table) (rate(elastickv_dynamodb_written_items_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",operation=~\"$operation\",table=~\"$table\"}[5m]))",
           "format": "table",
           "instant": true,
           "refId": "C"
@@ -923,21 +923,55 @@
   "templating": {
     "list": [
       {
-        "current": {
-          "selected": false,
-          "text": "default",
-          "value": "default"
-        },
-        "hide": 0,
-        "includeAll": false,
-        "label": "Datasource",
-        "multi": false,
         "name": "datasource",
-        "options": [],
+        "label": "Datasource",
+        "type": "datasource",
         "query": "prometheus",
         "refresh": 1,
-        "regex": "",
-        "type": "datasource"
+        "current": {},
+        "options": []
+      },
+      {
+        "name": "job",
+        "label": "Job",
+        "type": "query",
+        "datasource": "$datasource",
+        "query": {
+          "query": "label_values({__name__=~\"elastickv_.+\"}, job)",
+          "refId": "variable-job"
+        },
+        "definition": "label_values({__name__=~\"elastickv_.+\"}, job)",
+        "refresh": 2,
+        "sort": 1,
+        "multi": false,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "options": []
+      },
+      {
+        "name": "cluster",
+        "label": "Cluster",
+        "type": "query",
+        "datasource": "$datasource",
+        "query": {
+          "query": "label_values({__name__=~\"elastickv_.+\",job=~\"$job\"}, cluster)",
+          "refId": "variable-cluster"
+        },
+        "definition": "label_values({__name__=~\"elastickv_.+\",job=~\"$job\"}, cluster)",
+        "refresh": 2,
+        "sort": 1,
+        "multi": false,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "options": []
       },
       {
         "allValue": ".*",
@@ -947,7 +981,7 @@
           "value": "$__all"
         },
         "datasource": "$datasource",
-        "definition": "label_values(elastickv_dynamodb_requests_total{job=\"elastickv\"}, node_id)",
+        "definition": "label_values(elastickv_dynamodb_requests_total{job=~\"$job\",cluster=~\"$cluster\"}, node_id)",
         "includeAll": true,
         "label": "Node ID",
         "multi": true,
@@ -955,7 +989,7 @@
         "options": [],
         "query": {
           "qryType": 1,
-          "query": "label_values(elastickv_dynamodb_requests_total{job=\"elastickv\"}, node_id)",
+          "query": "label_values(elastickv_dynamodb_requests_total{job=~\"$job\",cluster=~\"$cluster\"}, node_id)",
           "refId": "PrometheusVariableQueryEditor-VariableQuery"
         },
         "refresh": 2,
@@ -971,7 +1005,7 @@
           "value": "$__all"
         },
         "datasource": "$datasource",
-        "definition": "label_values(elastickv_dynamodb_requests_total{job=\"elastickv\"}, operation)",
+        "definition": "label_values(elastickv_dynamodb_requests_total{job=~\"$job\",cluster=~\"$cluster\"}, operation)",
         "includeAll": true,
         "label": "Operation",
         "multi": true,
@@ -979,7 +1013,7 @@
         "options": [],
         "query": {
           "qryType": 1,
-          "query": "label_values(elastickv_dynamodb_requests_total{job=\"elastickv\"}, operation)",
+          "query": "label_values(elastickv_dynamodb_requests_total{job=~\"$job\",cluster=~\"$cluster\"}, operation)",
           "refId": "PrometheusVariableQueryEditor-VariableQuery"
         },
         "refresh": 2,
@@ -995,7 +1029,7 @@
           "value": "$__all"
         },
         "datasource": "$datasource",
-        "definition": "label_values(elastickv_dynamodb_table_requests_total{job=\"elastickv\"}, table)",
+        "definition": "label_values(elastickv_dynamodb_table_requests_total{job=~\"$job\",cluster=~\"$cluster\"}, table)",
         "includeAll": true,
         "label": "Table",
         "multi": true,
@@ -1003,7 +1037,7 @@
         "options": [],
         "query": {
           "qryType": 1,
-          "query": "label_values(elastickv_dynamodb_table_requests_total{job=\"elastickv\"}, table)",
+          "query": "label_values(elastickv_dynamodb_table_requests_total{job=~\"$job\",cluster=~\"$cluster\"}, table)",
           "refId": "PrometheusVariableQueryEditor-VariableQuery"
         },
         "refresh": 2,
