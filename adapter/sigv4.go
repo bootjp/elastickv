@@ -200,3 +200,30 @@ func buildSigV4AuthorizationHeaderRestricted(
 
 	return buildSigV4AuthorizationHeader(clone, accessKeyID, secretAccessKey, service, region, signingTime, payloadHash)
 }
+
+var errSigV4UnsignedHeader = errors.New("required request header is not signed")
+
+// validateSigV4SignedHeaders protects operation selectors and S3 metadata while
+// allowing unsigned transport headers. The payload hash is already bound by
+// the canonical request and need not appear in SignedHeaders separately.
+// https://docs.aws.amazon.com/AmazonS3/latest/developerguide/sig-v4-header-based-auth.html
+func validateSigV4SignedHeaders(r *http.Request, signedHeaders []string) error {
+	signed := make(map[string]struct{}, len(signedHeaders))
+	for _, name := range signedHeaders {
+		signed[strings.ToLower(strings.TrimSpace(name))] = struct{}{}
+	}
+	if _, ok := signed["host"]; !ok {
+		return errSigV4UnsignedHeader
+	}
+	for name := range r.Header {
+		name = strings.ToLower(name)
+		required := name == "content-md5" || (strings.HasPrefix(name, "x-amz-") && name != "x-amz-content-sha256")
+		if !required {
+			continue
+		}
+		if _, ok := signed[name]; !ok {
+			return errSigV4UnsignedHeader
+		}
+	}
+	return nil
+}

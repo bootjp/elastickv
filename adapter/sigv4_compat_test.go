@@ -94,3 +94,19 @@ func sigV4CompatibilityAuthRejected(service string, req *http.Request) bool {
 	srv := NewSQSServer(nil, nil, nil, WithSQSRegion("us-east-1"), WithSQSStaticCredentials(creds))
 	return srv.authorizeSQSRequest(req) != nil
 }
+
+func TestSQSSignatureRejectsUnsignedOperationTarget(t *testing.T) {
+	t.Parallel()
+	req := newSigV4CompatibilityRequest(t, "sqs", false)
+	req.Header.Del("Authorization")
+	req.Header.Del("X-Amz-Target")
+	req.ContentLength = 0
+	sum := sha256.Sum256([]byte(`{"probe":"value"}`))
+	signer := v4.NewSigner(func(opts *v4.SignerOptions) { opts.DisableURIPathEscaping = true })
+	require.NoError(t, signer.SignHTTP(context.Background(), aws.Credentials{
+		AccessKeyID: "compat-access", SecretAccessKey: "compat-secret",
+	}, req, hex.EncodeToString(sum[:]), "sqs", "us-east-1", time.Now().UTC()))
+	req.ContentLength = int64(len(`{"probe":"value"}`))
+	req.Header.Set("X-Amz-Target", "AmazonSQS.CreateQueue")
+	require.True(t, sigV4CompatibilityAuthRejected("sqs", req))
+}

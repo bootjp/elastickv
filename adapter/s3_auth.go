@@ -217,6 +217,9 @@ func (s *S3Server) authorizeRequest(r *http.Request) *s3AuthError {
 	}
 
 	signedHeaders := extractSigV4SignedHeaders(authHeader)
+	if authErr := validateS3SignedHeaders(r, signedHeaders); authErr != nil {
+		return authErr
+	}
 	expectedAuth, err := buildSigV4AuthorizationHeaderRestricted(r, parsed.AccessKeyID, secretAccessKey, "s3", s.effectiveRegion(), signingTime, payloadHash, signedHeaders)
 	if err != nil {
 		return &s3AuthError{
@@ -353,6 +356,10 @@ func (s *S3Server) authorizePresignedRequest(r *http.Request) *s3AuthError {
 		return authErr
 	}
 
+	if authErr := validateS3SignedHeaders(r, strings.Split(signedHeaders, ";")); authErr != nil {
+		return authErr
+	}
+
 	// Use the SDK's PresignHTTP to rebuild the expected presigned URL.
 	// Strip all presign query params to get a clean base request,
 	// then presign it with the same parameters.
@@ -422,4 +429,11 @@ func extractPresignedSignature(presignedURL string) string {
 		return ""
 	}
 	return parsed.Query().Get("X-Amz-Signature")
+}
+
+func validateS3SignedHeaders(r *http.Request, signedHeaders []string) *s3AuthError {
+	if err := validateSigV4SignedHeaders(r, signedHeaders); err != nil {
+		return &s3AuthError{Status: http.StatusForbidden, Code: s3ErrAccessDenied, Message: err.Error()}
+	}
+	return nil
 }
