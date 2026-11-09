@@ -3,6 +3,7 @@ package kv
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -284,7 +285,7 @@ func TestShardedCoordinatorCommitTSFenceActivationIsOptIn(t *testing.T) {
 	coord := NewShardedCoordinator(distribution.NewEngine(), map[uint64]*ShardGroup{
 		1: {Engine: r, Store: st, Txn: NewLeaderProxyWithEngine(r)},
 	}, 1, NewHLC(), nil)
-	coord.activateCommitTSFencesAsync(ctx)
+	require.Nil(t, coord.activateCommitTSFencesAsync(ctx), "an opted-out coordinator starts no activation pass")
 	time.Sleep(50 * time.Millisecond)
 	enabled, err := CommitTSFenceEnabled(ctx, st)
 	require.NoError(t, err)
@@ -332,4 +333,49 @@ func TestShardedCoordinatorRetriesFencedRawWrite(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, txn.tss, 2)
 	require.Greater(t, txn.tss[1], txn.tss[0], "the retry must carry a fresh, higher timestamp")
+}
+
+// RunHLCLeaseRenewal must not return while an activation pass it started is
+// still running: shutdown closes the group stores right after it returns, and
+// the pass reads them. A cancelled pass also stops visiting further groups.
+func TestRunHLCLeaseRenewalJoinsCommitTSFenceActivation(t *testing.T) {
+	t.Parallel()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int32
+	coord := NewShardedCoordinator(distribution.NewEngine(), map[uint64]*ShardGroup{1: {}}, 1, NewHLC(), nil).
+		WithCommitTSFenceActivation().
+		WithCommitTSFenceActivationReady(func() bool {
+			// The first check runs on the renewal loop; the second runs
+			// inside the background pass, which blocks here.
+			if calls.Add(1) == 2 {
+				close(entered)
+				<-release
+			}
+			return true
+		})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	returned := make(chan struct{})
+	go func() {
+		coord.RunHLCLeaseRenewal(ctx)
+		close(returned)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("activation pass did not start")
+	}
+	cancel()
+	select {
+	case <-returned:
+		t.Fatal("RunHLCLeaseRenewal returned while the activation pass was still running")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-returned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("RunHLCLeaseRenewal did not return after the activation pass finished")
+	}
 }

@@ -46,28 +46,37 @@ func (c *ShardedCoordinator) WithCommitTSFenceActivationReady(ready func() bool)
 
 // activateCommitTSFencesAsync runs one activation pass in the background so
 // a stalled group cannot delay the HLC lease renewal that shares the tick.
-// At most one pass runs at a time.
-func (c *ShardedCoordinator) activateCommitTSFencesAsync(ctx context.Context) {
+// At most one pass runs at a time. It returns a channel closed when the pass
+// it started finishes, or nil when it started none; the caller must wait on
+// it before the group stores the pass reads can be closed.
+func (c *ShardedCoordinator) activateCommitTSFencesAsync(ctx context.Context) <-chan struct{} {
 	if c == nil || !c.commitTSFenceActivation || (c.commitTSFenceActivationReady != nil && !c.commitTSFenceActivationReady()) {
-		return
+		return nil
 	}
 	if !c.commitTSFenceActivationInFlight.CompareAndSwap(false, true) {
-		return
+		return nil
 	}
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		defer c.commitTSFenceActivationInFlight.Store(false)
 		c.activateCommitTSFences(ctx)
 	}()
+	return done
 }
 
 // activateCommitTSFences proposes the activation on every group this node
 // leads whose store has not applied it yet. A group whose store shows the
-// marker is remembered and not read again.
+// marker is remembered and not read again. A cancelled pass stops before the
+// next group.
 func (c *ShardedCoordinator) activateCommitTSFences(ctx context.Context) {
 	if c.commitTSFenceActivationReady != nil && !c.commitTSFenceActivationReady() {
 		return
 	}
 	for gid, group := range c.groups {
+		if ctx.Err() != nil {
+			return
+		}
 		if c.commitTSFenceActivationReady != nil && !c.commitTSFenceActivationReady() {
 			return
 		}

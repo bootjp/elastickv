@@ -3847,7 +3847,13 @@ func (c *ShardedCoordinator) RunHLCLeaseRenewal(ctx context.Context) {
 				defer children.Done()
 				<-done
 			}()
-			c.activateCommitTSFencesAsync(ctx)
+			if activation := c.activateCommitTSFencesAsync(ctx); activation != nil {
+				children.Add(1)
+				go func() {
+					defer children.Done()
+					<-activation
+				}()
+			}
 			timer.Reset(hlcRenewalInterval)
 		case <-ctx.Done():
 			return
