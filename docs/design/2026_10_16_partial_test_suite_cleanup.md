@@ -635,19 +635,10 @@ Record each mutation in the PR as a row: file and line, the change, the test tha
   - Fixed in `6a13fb82`: S3 SigV4 `ListObjectsV2` returned 500 for an expired continuation token. The SigV4 and admin listings now share one scan that maps `ErrReadTSCompacted` on a resumed listing to `errS3ListingTokenExpired`.
   - Fixed: `store.PrefixScanEnd` kept trailing 0xFF bytes as 0x00, so the scan end of `ab\xff` was `ac\x00` and the key `ac` fell inside it. It now truncates like the other helpers; `TestPrefixScanEnd` pins it.
   - Merge `3dfbabd8` dropped 48 feature-branch tests and left `WithGRPCReadGate`, `proxy/noop_backend.go` and `ProxyConfig.PProfAddr` orphaned. Confirm the intent.
-- **Production dead code that is only tested.** Delete it, porting live-relevant cases first:
-  - `internal/raftengine/etcd/migrate.go` (`MigrateFSMStore`; the root guard tests use it as a fixture)
-  - pre-WAL `persistence.go` writers
-  - `encryption.CheckLocalEpochRollback` (its tests contradict the live guard)
-  - `internal/backup` helpers (`ResolveCommitTS`, `peekMsgDataKey`, `IsBlobAtomicWrite*`, `HasInlineTTL`, `IsBinarySegment`, `effectivePartitionCount`, `WriteChecksumsWithVirtualFile`)
-  - `adapter/redis_transcord.go` and its property test (`CLAUDE.md` cites it)
-  - `selectXReadEntries`, `unmarshalStreamValue` and their benchmarks
-  - SQS `throttleAttributesPresent`, `sqsMsgByAgePrefixesForQueue`
-  - `fskeys.ChunkRouteHomeFromKey`
-  - `distribution.IsCatalogDeltaKey`
-  - autosplit `ObserveSnapshot` / `ReadCommittedWindows`
-  - `monitoring` `observeLeaderChange`
-  - unused options listed in the audit
+- **Production dead code that is only tested.** Done, with live-relevant cases ported first:
+  - Removed: `MigrateFSMStore` (the root startup-guard tests now seed persisted peers through `PreparePhysicalSnapshotRestore`); the pre-WAL `loadOrCreateState` path and its writers (the writers moved to `persistence_legacy_writers_test.go` to seed legacy directories); `encryption.CheckLocalEpochRollback`; the `internal/backup` helpers (`ResolveCommitTS`, `peekMsgDataKey`, `IsBlobAtomicWrite*` with the `disk_full_*.go` files, `HasInlineTTL`, `IsBinarySegment`, `effectivePartitionCount`, `WriteChecksumsWithVirtualFile`); `adapter/redis_transcord.go` and its property test; `selectXReadEntries`, `unmarshalStreamValue` and their benchmarks (`marshalStreamValue` moved to a test file as the legacy-blob fixture); SQS `throttleAttributesPresent` and `sqsMsgByAgePrefixesForQueue`; `fskeys.ChunkRouteHomeFromKey`; autosplit `ObserveSnapshot` / `ReadCommittedWindows` (their reset tests now drive `CommittedWindowsFromColumns` plus `Evaluate`, as the scheduler does); `monitoring` `observeLeaderChange`.
+  - Kept: `distribution.IsCatalogDeltaKey` has a production caller (`kv/raft_bootstrap_guard.go`).
+  - Still open: the audit's list of unused options was not recorded here. A scan finds about 70 `With*` options set only by tests; most are test seams (clocks, intervals, loggers, timeouts), so removing any needs a per-option decision.
 - **CI runtime.**
   - `adapter/grpc_test.go` `Test_consistency_satisfy_write_after_read_sequence` and `Test_grpc_transaction`: 9,999 sequential RPCs each, about 5.5 min under `-race`. Iteration count is a maintainer decision (restored on purpose in `24b9f80b`).
   - `internal/encryption/keystore_test.go` `TestKeystore_Concurrent`: no assertion, 179 s under `-race`; bounding the key space makes it about 3 s.
