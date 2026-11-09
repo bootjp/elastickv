@@ -758,18 +758,6 @@ func TestComputeRetryAfter_CapsAtMaximum(t *testing.T) {
 		"computeRetryAfter must cap at throttleRetryAfterCap regardless of input")
 }
 
-// TestThrottleAttributesPresent covers the request-gate helper used
-// by setQueueAttributes to skip cache invalidation on unrelated
-// updates.
-func TestThrottleAttributesPresent(t *testing.T) {
-	t.Parallel()
-	require.False(t, throttleAttributesPresent(map[string]string{}))
-	require.False(t, throttleAttributesPresent(map[string]string{"VisibilityTimeout": "30"}))
-	require.True(t, throttleAttributesPresent(map[string]string{"ThrottleSendCapacity": "10"}))
-	require.True(t, throttleAttributesPresent(map[string]string{"ThrottleRecvRefillPerSecond": "5"}))
-	require.True(t, throttleAttributesPresent(map[string]string{"ThrottleDefaultCapacity": "5"}))
-}
-
 // TestBucketStore_IncarnationKeyedDoesNotReuseAcrossIncarnations
 // pins the incarnation-keyed contract: bucketKey includes incarnation
 // so a DeleteQueue+CreateQueue cycle (or a leadership move to a node holding

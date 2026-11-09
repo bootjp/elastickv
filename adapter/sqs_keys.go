@@ -425,11 +425,11 @@ func sqsPartitionedMsgGroupKey(queueName string, partition uint32, gen uint64, g
 }
 
 // sqsPartitionedMsgByAgeKey builds the send-age index key for a
-// partitioned queue. The reaper enumerates both the legacy and
-// partitioned byage prefixes when reaping a queue (see
-// sqsMsgByAgePrefixesForQueue) so a queue that is partitioned today
-// — or, hypothetically, that gains partitions across a future
-// migration — does not strand its old data.
+// partitioned queue. The reaper walks the legacy byage prefix
+// (reapQueueLegacy) and each partition's byage prefix
+// (reapQueuePartition), so a queue that is partitioned today — or,
+// hypothetically, that gains partitions across a future migration —
+// does not strand its old data.
 func sqsPartitionedMsgByAgeKey(queueName string, partition uint32, gen uint64, sendTimestampMs int64, messageID string) []byte {
 	buf := make([]byte, 0, len(SqsPartitionedMsgByAgePrefix)+sqsKeyCapLarge)
 	buf = append(buf, SqsPartitionedMsgByAgePrefix...)
@@ -497,20 +497,6 @@ func sqsPartitionedMsgGroupKeyPrefix(queueName string, partition uint32, gen uin
 	buf = appendU32(buf, partition)
 	buf = appendU64(buf, gen)
 	return buf
-}
-
-// sqsMsgByAgePrefixesForQueue returns the {legacy, partitioned}
-// prefix pair for a queue's byage records. The reaper iterates both:
-// a queue created before HT-FIFO landed has only legacy entries; a
-// partitioned queue created after PR 5 has only partitioned entries;
-// no queue has both today, but enumerating both keeps the reaper
-// future-proof against an offline-rebuild migration that produces a
-// mixed-prefix queue.
-func sqsMsgByAgePrefixesForQueue(queueName string) [][]byte {
-	return [][]byte{
-		sqsMsgByAgePrefixAllGenerations(queueName),
-		sqsPartitionedMsgByAgePrefixForQueueAllPartitions(queueName),
-	}
 }
 
 // sqsPartitionedByAgeKeyHeaderLen is the byte length of the
