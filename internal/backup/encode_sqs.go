@@ -248,7 +248,7 @@ func (e *SQSRecordEncoder) encodeQueueMessages(b *snapshotBuilder, root *os.Root
 	}
 	// Fail-closed validation up-front so a malformed dump never stages
 	// partial records. Uses raw meta.PartitionCount > 1 as the
-	// partitioned-queue predicate, not effectivePartitionCount. Using
+	// partitioned-queue predicate, not adapter.effectivePartitionCount. Using
 	// the effective count would allow a perQueue dump with Partition ==
 	// nil to slip past the missing-partition gate and then be staged as
 	// partition 0 without proof that the dump was captured from the
@@ -396,7 +396,7 @@ func pickDedupWinners(meta *sqsQueueMetaPublic, records []sqsMessageRecord, isPa
 // validatePartitioning runs the message-level fail-closed gates from the M5-3
 // design doc §"Validation invariants" before any message is staged.
 // All gates use raw meta.PartitionCount > 1 as the partitioned-queue
-// predicate, never effectivePartitionCount.
+// predicate, never adapter.effectivePartitionCount.
 func validatePartitioning(meta *sqsQueueMetaPublic, records []sqsMessageRecord) error {
 	for i := range records {
 		if err := validatePartitioningOne(meta, &records[i]); err != nil {
@@ -790,7 +790,7 @@ const sqsPartitionedQueueTerminator byte = '|'
 // value, partitionFor collapses every group to partition 0
 // regardless of meta.PartitionCount; the encoder uses it for one
 // fail-closed gate (ErrSQSEncodePartitionRoutingMismatch in slice D)
-// and as an effectivePartitionCount input. CANNOT be imported from
+// and as an adapter.effectivePartitionCount input. CANNOT be imported from
 // adapter — htfifoThroughputPerQueue is unexported (M3b-3 circular
 // dependency pattern).
 const sqsFifoThroughputPerQueue = "perQueue"
@@ -817,27 +817,4 @@ func sqsPartitionedMsgDataKeyBytes(queueName string, partition uint32, generatio
 	out = binary.BigEndian.AppendUint32(out, partition)
 	out = binary.BigEndian.AppendUint64(out, generation)
 	return append(out, encodeSQSSegment(messageID)...)
-}
-
-// effectivePartitionCount mirrors adapter/sqs_keys_dispatch.go:121
-// (which operates on the unexported *adapter.sqsQueueMeta). Returns
-// 1 for nil meta or PartitionCount <= 1, 1 when FifoThroughputLimit
-// == "perQueue" (the live router collapses every group to partition
-// 0 in that mode), otherwise meta.PartitionCount.
-//
-// NOTE: this helper is NOT used by the encoder's validation gates —
-// the M5-3 design pins those gates on raw meta.PartitionCount > 1
-// (codex P2 v914 v7). Kept here for diagnostics, ReceiveMessage scan
-// fan-out cross-checks, and future symmetry with the adapter; using
-// it in a gate predicate would silently let a perQueue dump with
-// Partition == nil emit classic keys against a partitioned-keyspace
-// queue.
-func effectivePartitionCount(meta *sqsQueueMetaPublic) uint32 {
-	if meta == nil || meta.PartitionCount <= 1 {
-		return 1
-	}
-	if meta.FifoThroughputLimit == sqsFifoThroughputPerQueue {
-		return 1
-	}
-	return meta.PartitionCount
 }

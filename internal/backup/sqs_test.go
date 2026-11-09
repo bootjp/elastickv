@@ -311,27 +311,6 @@ func TestSQS_RejectsKeyWithWrongPrefix(t *testing.T) {
 	}
 }
 
-func TestSQS_PeekMsgDataKeyParsesComponents(t *testing.T) {
-	t.Parallel()
-	key := EncodeMsgDataKey("orders", 7, "msg-id")
-	got, err := peekMsgDataKey(key)
-	if err != nil {
-		t.Fatalf("peekMsgDataKey: %v", err)
-	}
-	if got.Encoded != "b3JkZXJz" { // base64url("orders")
-		t.Fatalf("encoded queue = %q", got.Encoded)
-	}
-	if len(got.GenRaw) != genBytes {
-		t.Fatalf("gen length = %d", len(got.GenRaw))
-	}
-	if got.GenRaw[7] != 7 { // BE: high bytes zero, low byte = 7
-		t.Fatalf("gen low byte = %x", got.GenRaw[7])
-	}
-	if got.MsgID != "bXNnLWlk" { // base64url("msg-id")
-		t.Fatalf("msg id = %q", got.MsgID)
-	}
-}
-
 func TestSQS_IncludeSideRecordsBuffersBetweenFinalize(t *testing.T) {
 	t.Parallel()
 	enc, root := newSQSEncoder(t)

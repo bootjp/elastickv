@@ -73,13 +73,6 @@ func WriteChecksums(root string) error {
 	return writeChecksumEntries(root, entries, false)
 }
 
-// WriteChecksumsWithVirtualFile includes one not-yet-published file in the
-// checksum set. Live backup uses this to checksum MANIFEST.json before its
-// final atomic publication, keeping the manifest both checksummed and last.
-func WriteChecksumsWithVirtualFile(root, relPath string, content []byte) error {
-	return WriteChecksumsWithVirtualFileContext(context.Background(), root, relPath, content)
-}
-
 // WriteChecksumsWithVirtualFileContext is WriteChecksumsWithVirtualFile with
 // cancellation. Hashing a dump tree is unbounded work -- it reads every byte
 // the dump wrote -- so a canceled run must stop here rather than keep going
