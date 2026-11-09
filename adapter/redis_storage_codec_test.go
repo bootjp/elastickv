@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	pb "github.com/bootjp/elastickv/proto"
 	"github.com/stretchr/testify/require"
 )
 
@@ -91,22 +92,20 @@ func TestStoredRedisZSetCodec_RoundTripProto(t *testing.T) {
 	}, decoded)
 }
 
-func TestStoredRedisStreamCodec_RoundTripProto(t *testing.T) {
-	t.Parallel()
+// marshalStreamValue encodes a stream in the legacy single-blob layout.
+// Production no longer reads or writes it (PR #620 discards legacy blobs and
+// deletes them on the next write); tests use it to seed that legacy data.
+func marshalStreamValue(v redisStreamValue) ([]byte, error) {
+	return marshalStoredRedisMessage(storedRedisStreamProtoPrefix, redisStreamValueToProto(v))
+}
 
-	value := redisStreamValue{
-		Entries: []redisStreamEntry{
-			newRedisStreamEntry("1001-0", []string{"field", "value"}),
-			newRedisStreamEntry("1002-0", []string{"field", "value-2"}),
-		},
+func redisStreamValueToProto(v redisStreamValue) *pb.RedisStreamValue {
+	entries := make([]*pb.RedisStreamEntry, 0, len(v.Entries))
+	for _, entry := range v.Entries {
+		entries = append(entries, &pb.RedisStreamEntry{
+			Id:     entry.ID,
+			Fields: cloneStringSlice(entry.Fields),
+		})
 	}
-
-	body, err := marshalStreamValue(value)
-	require.NoError(t, err)
-	require.True(t, hasStoredRedisPrefix(body, storedRedisStreamProtoPrefix))
-
-	decoded, err := unmarshalStreamValue(body)
-	require.NoError(t, err)
-	require.Equal(t, value, decoded)
-	require.True(t, decoded.Entries[0].parsedIDValid)
+	return &pb.RedisStreamValue{Entries: entries}
 }

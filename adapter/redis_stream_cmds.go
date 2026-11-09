@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -1122,21 +1121,6 @@ func (r *RedisServer) dollarIDFromState(ctx context.Context, key []byte, readTS 
 		return streamZeroID, nil
 	}
 	return strconv.FormatUint(meta.LastMs, 10) + "-" + strconv.FormatUint(meta.LastSeq, 10), nil
-}
-
-func selectXReadEntries(entries []redisStreamEntry, afterID string, count int) []redisStreamEntry {
-	afterParsedID, afterParsedValid := tryParseRedisStreamID(afterID)
-	start := sort.Search(len(entries), func(i int) bool {
-		return entries[i].compareID(afterID, afterParsedID, afterParsedValid) > 0
-	})
-	if start >= len(entries) {
-		return nil
-	}
-	end := len(entries)
-	if count > 0 && start+count < end {
-		end = start + count
-	}
-	return entries[start:end]
 }
 
 func (r *RedisServer) xreadOnce(ctx context.Context, req xreadRequest) ([]xreadResult, error) {
