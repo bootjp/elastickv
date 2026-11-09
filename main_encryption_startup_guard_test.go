@@ -406,10 +406,7 @@ func TestCheckEncryptionMembershipStartupGuardsBeforeEngine_NodeIDCollisionFromP
 		{NodeID: etcdraftengine.DeriveNodeID("n498"), ID: "n498", Address: "127.0.0.1:7001"},
 		{NodeID: etcdraftengine.DeriveNodeID("n784"), ID: "n784", Address: "127.0.0.1:7002"},
 	}
-	sourceStorePath := filepath.Join(t.TempDir(), "source-fsm.db")
-	if _, err := etcdraftengine.MigrateFSMStore(sourceStorePath, groupDataDir(raftDir, "n1", 1, false), peers); err != nil {
-		t.Fatalf("MigrateFSMStore fixture: %v", err)
-	}
+	seedPersistedPeersForStartupGuard(t, groupDataDir(raftDir, "n1", 1, false), peers)
 	err := checkEncryptionMembershipStartupGuardsBeforeEngine(encryptionMembershipStartupGuardInput{
 		raftID:            "n1",
 		raftDir:           raftDir,
@@ -434,10 +431,7 @@ func TestCheckEncryptionMembershipStartupGuardsBeforeEngine_DerivesPersistedPeer
 		{NodeID: 1, ID: "n498", Address: "127.0.0.1:7001"},
 		{NodeID: 2, ID: "n784", Address: "127.0.0.1:7002"},
 	}
-	sourceStorePath := filepath.Join(t.TempDir(), "source-fsm.db")
-	if _, err := etcdraftengine.MigrateFSMStore(sourceStorePath, groupDataDir(raftDir, "n1", 1, false), peers); err != nil {
-		t.Fatalf("MigrateFSMStore fixture: %v", err)
-	}
+	seedPersistedPeersForStartupGuard(t, groupDataDir(raftDir, "n1", 1, false), peers)
 	err := checkEncryptionMembershipStartupGuardsBeforeEngine(encryptionMembershipStartupGuardInput{
 		raftID:            "n1",
 		raftDir:           raftDir,
@@ -614,5 +608,22 @@ func TestCheckEncryptionMembershipStartupGuardsBeforeEngine_PreBootstrapSkips(t 
 	})
 	if err != nil {
 		t.Fatalf("pre-bootstrap sidecar must skip 6C-3 membership guards, got %v", err)
+	}
+}
+
+// seedPersistedPeersForStartupGuard creates a Raft data directory whose
+// persisted peer list is peers, through the production physical snapshot
+// restore path. The startup guard reads only that peer list, so the FSM
+// payload content does not matter.
+func seedPersistedPeersForStartupGuard(t *testing.T, dataDir string, peers []etcdraftengine.Peer) {
+	t.Helper()
+	input := filepath.Join(t.TempDir(), "input.fsm")
+	if err := os.WriteFile(input, []byte("startup-guard-fixture"), 0o600); err != nil {
+		t.Fatalf("write fixture payload: %v", err)
+	}
+	if _, err := etcdraftengine.PreparePhysicalSnapshotRestore(etcdraftengine.PhysicalSnapshotRestoreOptions{
+		InputFSMPath: input, DataDir: dataDir, Index: 1, Term: 1, Peers: peers,
+	}); err != nil {
+		t.Fatalf("seed persisted peers: %v", err)
 	}
 }
