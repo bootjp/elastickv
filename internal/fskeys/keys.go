@@ -241,14 +241,6 @@ func ChunkRouteAllPrefix() []byte {
 	return append([]byte(nil), chunkRoutePrefixBytes...)
 }
 
-// ChunkRouteHomeFromKey extracts the home slot from a full chunk route key.
-func ChunkRouteHomeFromKey(key []byte) (uint64, bool) {
-	if !bytes.HasPrefix(key, chunkRoutePrefixBytes) || len(key) < len(chunkRoutePrefixBytes)+u64Bytes {
-		return 0, false
-	}
-	return binary.BigEndian.Uint64(key[len(chunkRoutePrefixBytes):]), true
-}
-
 // ChunkRoutePartsFromKey decodes one exact virtual file route key.
 func ChunkRoutePartsFromKey(key []byte) (homeSlot uint64, inode uint64, ok bool) {
 	if !bytes.HasPrefix(key, chunkRoutePrefixBytes) || len(key) != chunkRouteKeyBytes {
