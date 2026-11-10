@@ -95,7 +95,9 @@ func TestRaftMetricsExportLeaderChangesAndProposalFailures(t *testing.T) {
 	observer := registry.RaftObserver()
 	require.NotNil(t, observer)
 
-	observer.observeLeaderChange("1")
+	// A leader identity change for group 1 is one observed leader change.
+	observer.setLeaderMetric("1", "n1", "10.0.0.1:50051")
+	observer.setLeaderMetric("1", "n2", "10.0.0.2:50051")
 	registry.RaftProposalObserver(1).ObserveProposalFailure()
 
 	err := testutil.GatherAndCompare(

@@ -5,11 +5,9 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"testing"
 
 	"github.com/cockroachdb/errors"
@@ -984,39 +982,5 @@ func TestRedisDB_DirsCreatedCachesMkdirAll(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("strings/ dir entries = %d want 1; map=%v", count, db.dirsCreated)
-	}
-}
-
-func TestRedisDB_IsBlobAtomicWriteOutOfSpace(t *testing.T) {
-	t.Parallel()
-	if !IsBlobAtomicWriteOutOfSpace(syscall.ENOSPC) {
-		t.Fatalf("ENOSPC must be reported as out-of-space")
-	}
-	if !IsBlobAtomicWriteOutOfSpace(cockroachdbErrorsWrap(syscall.ENOSPC)) {
-		t.Fatalf("wrapped ENOSPC must round-trip via errors.Is")
-	}
-	if IsBlobAtomicWriteOutOfSpace(io.ErrShortWrite) {
-		t.Fatalf("ErrShortWrite must NOT be reported as out-of-space")
-	}
-	// Conversely IsBlobAtomicWriteRetriable must NOT report ENOSPC.
-	if IsBlobAtomicWriteRetriable(syscall.ENOSPC) {
-		t.Fatalf("ENOSPC must NOT be retriable")
-	}
-}
-
-func cockroachdbErrorsWrap(err error) error {
-	return errors.Join(errors.New("wrapped"), err)
-}
-
-func TestRedisDB_HasInlineTTL(t *testing.T) {
-	t.Parallel()
-	if !HasInlineTTL(encodeNewStringValue(t, []byte("v"), fixedExpireMs)) {
-		t.Fatalf("HasInlineTTL = false on inline-TTL value")
-	}
-	if HasInlineTTL(encodeNewStringValue(t, []byte("v"), 0)) {
-		t.Fatalf("HasInlineTTL = true on no-TTL value")
-	}
-	if HasInlineTTL([]byte("legacy-raw")) {
-		t.Fatalf("HasInlineTTL = true on legacy value")
 	}
 }

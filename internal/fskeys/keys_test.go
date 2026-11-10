@@ -82,16 +82,6 @@ func TestHomeInodeFromKey(t *testing.T) {
 	require.False(t, ok)
 }
 
-func TestChunkRouteHomeFromKey(t *testing.T) {
-	t.Parallel()
-	home, ok := ChunkRouteHomeFromKey(ChunkRouteKey(11, 22))
-	require.True(t, ok)
-	require.EqualValues(t, 11, home)
-
-	_, ok = ChunkRouteHomeFromKey(ChunkAllPrefix())
-	require.False(t, ok)
-}
-
 func TestChunkRoutePartsFromKey(t *testing.T) {
 	t.Parallel()
 	home, inode, ok := ChunkRoutePartsFromKey(ChunkRouteKey(11, 22))
@@ -100,6 +90,9 @@ func TestChunkRoutePartsFromKey(t *testing.T) {
 	require.EqualValues(t, 22, inode)
 
 	_, _, ok = ChunkRoutePartsFromKey(append(ChunkRouteKey(11, 22), 0))
+	require.False(t, ok)
+
+	_, _, ok = ChunkRoutePartsFromKey(ChunkAllPrefix())
 	require.False(t, ok)
 }
 

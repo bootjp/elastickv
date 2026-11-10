@@ -956,26 +956,6 @@ type keyComponents struct {
 	MsgID   string
 }
 
-// peekMsgDataKey is a test/debug helper that returns the structural
-// components of a !sqs|msg|data key. Production code uses
-// parseSQSMessageDataKey directly because it never needs gen or msgID.
-func peekMsgDataKey(key []byte) (keyComponents, error) {
-	rest, err := stripPrefixSegment(key, []byte(SQSMsgDataPrefix))
-	if err != nil {
-		return keyComponents{}, err
-	}
-	idx := scanBase64URLBoundary(rest)
-	if idx == 0 || idx+genBytes > len(rest) {
-		return keyComponents{}, errors.Wrap(ErrSQSMalformedKey, "boundary not found")
-	}
-	return keyComponents{
-		Prefix:  SQSMsgDataPrefix,
-		Encoded: rest[:idx],
-		GenRaw:  []byte(rest[idx : idx+genBytes]),
-		MsgID:   rest[idx+genBytes:],
-	}, nil
-}
-
 // EncodeMsgDataKey constructs a !sqs|msg|data key for tests. Mirrors the
 // live sqsMsgDataKey constructor in adapter/sqs_messages.go.
 func EncodeMsgDataKey(queueName string, gen uint64, messageID string) []byte {

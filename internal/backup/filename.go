@@ -196,12 +196,6 @@ func IsShaFallback(seg string) bool {
 	return isShaFallback(seg)
 }
 
-// IsBinarySegment reports whether seg is a base64-url encoded binary segment
-// emitted by EncodeBinarySegment.
-func IsBinarySegment(seg string) bool {
-	return strings.HasPrefix(seg, binaryPrefix)
-}
-
 func percentEncode(raw []byte) string {
 	// Worst case: every byte expands to %HH (3 bytes). Pre-allocate.
 	var b strings.Builder

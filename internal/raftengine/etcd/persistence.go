@@ -2,7 +2,6 @@ package etcd
 
 import (
 	"bufio"
-	"bytes"
 	"encoding/binary"
 	"io"
 	"math"
@@ -57,18 +56,6 @@ type fileFormat struct {
 	version uint32
 }
 
-func bootstrapState(nodeID uint64) persistedState {
-	return persistedState{
-		Snapshot: raftpb.Snapshot{
-			Metadata: &raftpb.SnapshotMetadata{
-				ConfState: &raftpb.ConfState{Voters: []uint64{nodeID}},
-				Index:     proto.Uint64(1),
-				Term:      proto.Uint64(1),
-			},
-		},
-	}
-}
-
 func stateFilePath(dataDir string) string {
 	return filepath.Join(dataDir, stateFileName)
 }
@@ -85,41 +72,6 @@ func snapshotDataFilePath(dataDir string) string {
 	return filepath.Join(dataDir, snapshotDataFileName)
 }
 
-func loadOrCreateState(dataDir string, nodeID uint64) (persistedState, error) {
-	if err := os.MkdirAll(dataDir, defaultDirPerm); err != nil {
-		return persistedState{}, errors.WithStack(err)
-	}
-	if err := cleanupReplaceTempFiles(dataDir); err != nil {
-		return persistedState{}, err
-	}
-
-	state, err := loadStateFiles(dataDir)
-	if err == nil {
-		return state, nil
-	}
-	if !os.IsNotExist(errors.UnwrapAll(err)) {
-		return persistedState{}, err
-	}
-
-	legacyPath := stateFilePath(dataDir)
-	legacy, legacyErr := loadStateFile(legacyPath)
-	if legacyErr == nil {
-		if err := saveSplitState(dataDir, legacy); err != nil {
-			return persistedState{}, err
-		}
-		return loadStateFiles(dataDir)
-	}
-	if !os.IsNotExist(errors.UnwrapAll(legacyErr)) {
-		return persistedState{}, legacyErr
-	}
-
-	state = bootstrapState(nodeID)
-	if err := saveMetadataFile(metadataFilePath(dataDir), state.HardState, state.Snapshot); err != nil {
-		return persistedState{}, err
-	}
-	return state, nil
-}
-
 func loadStateFiles(dataDir string) (persistedState, error) {
 	state, err := loadMetadataFile(metadataFilePath(dataDir))
 	if err != nil {
@@ -131,19 +83,6 @@ func loadStateFiles(dataDir string) (persistedState, error) {
 	}
 	state.Entries = entries
 	return state, nil
-}
-
-func saveSplitState(dataDir string, state persistedState) error {
-	if err := saveMetadataFile(metadataFilePath(dataDir), state.HardState, state.Snapshot); err != nil {
-		return err
-	}
-	if err := rewriteEntriesFile(entriesFilePath(dataDir), state.Entries); err != nil {
-		return err
-	}
-	if len(state.Snapshot.Data) == 0 {
-		return removeFileIfExists(snapshotDataFilePath(dataDir))
-	}
-	return writeAndSyncFile(snapshotDataFilePath(dataDir), state.Snapshot.Data)
 }
 
 func cleanupReplaceTempFiles(dataDir string) error {
@@ -195,26 +134,6 @@ func loadMetadataFile(path string) (persistedState, error) {
 	return state, nil
 }
 
-func saveMetadataFile(path string, hardState raftpb.HardState, snapshot raftpb.Snapshot) error {
-	snapshot.Data = nil
-	return replaceFile(path, func(w io.Writer) error {
-		writer := bufio.NewWriter(w)
-		if err := writeVersionedHeader(writer, fileFormat{magic: metadataFileMagic, version: metadataFileVersion}); err != nil {
-			return err
-		}
-		if err := writeMessage(writer, &hardState); err != nil {
-			return err
-		}
-		if err := writeMessage(writer, &snapshot); err != nil {
-			return err
-		}
-		if err := writer.Flush(); err != nil {
-			return errors.WithStack(err)
-		}
-		return nil
-	})
-}
-
 func loadEntriesFile(path string) ([]raftpb.Entry, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -242,34 +161,6 @@ func loadEntriesFile(path string) ([]raftpb.Entry, error) {
 			return nil, errors.WithStack(errors.Newf("persisted entry count %d exceeds limit %d", len(entries), maxPersistedEntries))
 		}
 	}
-}
-
-func rewriteEntriesFile(path string, entries []raftpb.Entry) error {
-	return replaceFile(path, func(w io.Writer) error {
-		writer := bufio.NewWriter(w)
-		if err := writeVersionedHeader(writer, fileFormat{magic: entriesFileMagic, version: entriesFileVersion}); err != nil {
-			return err
-		}
-		for _, entry := range entries {
-			if err := writeMessage(writer, &entry); err != nil {
-				return err
-			}
-		}
-		if err := writer.Flush(); err != nil {
-			return errors.WithStack(err)
-		}
-		return nil
-	})
-}
-
-func removeFileIfExists(path string) error {
-	if err := os.Remove(path); err != nil {
-		if os.IsNotExist(errors.UnwrapAll(err)) {
-			return nil
-		}
-		return errors.WithStack(err)
-	}
-	return syncDir(filepath.Dir(path))
 }
 
 func loadStateFile(path string) (persistedState, error) {
@@ -309,45 +200,6 @@ func loadStateFile(path string) (persistedState, error) {
 	}
 
 	return state, nil
-}
-
-func saveStateFile(path string, state persistedState) error {
-	encoded, err := encodeStateFile(state)
-	if err != nil {
-		return err
-	}
-	return writeAndSyncFile(path, encoded)
-}
-
-func encodeStateFile(state persistedState) ([]byte, error) {
-	var buf bytes.Buffer
-	writer := bufio.NewWriter(&buf)
-
-	if err := writeVersionedHeader(writer, fileFormat{magic: stateFileMagic, version: stateFileVersion}); err != nil {
-		return nil, err
-	}
-	if err := writeMessage(writer, &state.HardState); err != nil {
-		return nil, err
-	}
-	if err := writeMessage(writer, &state.Snapshot); err != nil {
-		return nil, err
-	}
-	entryCount, err := uint32Len(len(state.Entries))
-	if err != nil {
-		return nil, err
-	}
-	if err := writeU32(writer, entryCount); err != nil {
-		return nil, err
-	}
-	for _, entry := range state.Entries {
-		if err := writeMessage(writer, &entry); err != nil {
-			return nil, err
-		}
-	}
-	if err := writer.Flush(); err != nil {
-		return nil, errors.WithStack(err)
-	}
-	return buf.Bytes(), nil
 }
 
 func newMemoryStorage(state persistedState) (*etcdraft.MemoryStorage, error) {
@@ -416,24 +268,6 @@ func readU64(r io.Reader) (uint64, error) {
 		return 0, errors.WithStack(err)
 	}
 	return v, nil
-}
-
-func writeMessage(w io.Writer, msg proto.Message) error {
-	raw, err := proto.Marshal(msg)
-	if err != nil {
-		return errors.WithStack(err)
-	}
-	size, err := uint32Len(len(raw))
-	if err != nil {
-		return err
-	}
-	if err := writeU32(w, size); err != nil {
-		return err
-	}
-	if _, err := w.Write(raw); err != nil {
-		return errors.WithStack(err)
-	}
-	return nil
 }
 
 func readVersionedHeader(r io.Reader, format fileFormat, kind string) error {

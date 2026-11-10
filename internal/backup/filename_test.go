@@ -138,9 +138,6 @@ func TestEncodeBinarySegment_BasicRoundTrip(t *testing.T) {
 		if !strings.HasPrefix(enc, binaryPrefix) {
 			t.Fatalf("EncodeBinarySegment(%x) = %q, missing binary prefix", raw, enc)
 		}
-		if !IsBinarySegment(enc) {
-			t.Fatalf("IsBinarySegment(%q) = false", enc)
-		}
 		dec, err := DecodeSegment(enc)
 		if err != nil {
 			t.Fatalf("DecodeSegment(%q) error: %v", enc, err)
@@ -296,7 +293,7 @@ func TestEncodeBinarySegment_FuzzRoundTripIfNotShaFallback(t *testing.T) {
 			}
 			return
 		}
-		if !IsBinarySegment(enc) {
+		if !strings.HasPrefix(enc, binaryPrefix) {
 			t.Fatalf("non-fallback binary segment missing prefix: %q", enc)
 		}
 		dec, err := DecodeSegment(enc)

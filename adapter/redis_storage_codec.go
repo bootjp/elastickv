@@ -84,24 +84,6 @@ func unmarshalZSetValue(raw []byte) (redisZSetValue, error) {
 	return out, nil
 }
 
-func marshalStreamValue(v redisStreamValue) ([]byte, error) {
-	return marshalStoredRedisMessage(storedRedisStreamProtoPrefix, redisStreamValueToProto(v))
-}
-
-func unmarshalStreamValue(raw []byte) (redisStreamValue, error) {
-	if len(raw) == 0 {
-		return redisStreamValue{}, nil
-	}
-	if !hasStoredRedisPrefix(raw, storedRedisStreamProtoPrefix) {
-		return redisStreamValue{}, errUnrecognizedStoredRedisFormat
-	}
-	msg := &pb.RedisStreamValue{}
-	if err := gproto.Unmarshal(raw[len(storedRedisStreamProtoPrefix):], msg); err != nil {
-		return redisStreamValue{}, errors.WithStack(err)
-	}
-	return redisStreamValueFromProto(msg), nil
-}
-
 // marshalStreamEntry encodes a single stream entry for the entry-per-key
 // layout. The per-entry ID is authoritatively encoded in the storage key;
 // we also serialize it into the value so unmarshalStreamEntry can return
@@ -201,28 +183,6 @@ func redisZSetValueFromProto(msg *pb.RedisZSetValue) redisZSetValue {
 		})
 	}
 	return redisZSetValue{Entries: entries}
-}
-
-func redisStreamValueToProto(v redisStreamValue) *pb.RedisStreamValue {
-	entries := make([]*pb.RedisStreamEntry, 0, len(v.Entries))
-	for _, entry := range v.Entries {
-		entries = append(entries, &pb.RedisStreamEntry{
-			Id:     entry.ID,
-			Fields: cloneStringSlice(entry.Fields),
-		})
-	}
-	return &pb.RedisStreamValue{Entries: entries}
-}
-
-func redisStreamValueFromProto(msg *pb.RedisStreamValue) redisStreamValue {
-	if msg == nil {
-		return redisStreamValue{}
-	}
-	entries := make([]redisStreamEntry, 0, len(msg.GetEntries()))
-	for _, entry := range msg.GetEntries() {
-		entries = append(entries, newRedisStreamEntry(entry.GetId(), cloneStringSlice(entry.GetFields())))
-	}
-	return redisStreamValue{Entries: entries}
 }
 
 func sortStrings(values []string) {
