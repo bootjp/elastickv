@@ -98,6 +98,11 @@ func (a *Adapter) retryAcknowledgements(ctx context.Context) {
 		case <-ticker.C:
 		case <-a.ackWake:
 		}
+		// select picks among ready cases at random: a queued wake-up can win
+		// over a cancelled context, so check it before starting a batch.
+		if ctx.Err() != nil {
+			return
+		}
 		if a.processAcknowledgementBatch(ctx) {
 			select {
 			case a.ackWake <- struct{}{}:
