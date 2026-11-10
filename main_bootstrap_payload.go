@@ -160,6 +160,9 @@ func validateBootstrapCatalogPayload(payload []byte) error {
 }
 
 func validateBootstrapDataPayload(payload []byte) error {
+	if bytes.Equal(payload, kv.EncodeCommitTSFenceActivation()) {
+		return nil
+	}
 	if _, matched, err := kv.DecodeWatermarkAdvance(payload); matched {
 		return errors.Wrap(err, "decode data read watermark")
 	}

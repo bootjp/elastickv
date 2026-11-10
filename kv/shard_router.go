@@ -167,7 +167,12 @@ func (s *ShardRouter) Register(group uint64, tm Transactional, st store.MVCCStor
 }
 
 func (s *ShardRouter) Commit(ctx context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
-	return s.process(reqs, func(g *routerGroup, rs []*pb.Request) (*TransactionResponse, error) {
+	resp, _, err := s.commitWithGroupCount(ctx, reqs)
+	return resp, err
+}
+
+func (s *ShardRouter) commitWithGroupCount(ctx context.Context, reqs []*pb.Request) (*TransactionResponse, int, error) {
+	return s.processWithGroupCount(reqs, func(g *routerGroup, rs []*pb.Request) (*TransactionResponse, error) {
 		return g.tm.Commit(ctx, rs)
 	})
 }
@@ -180,20 +185,26 @@ func (s *ShardRouter) Abort(ctx context.Context, reqs []*pb.Request) (*Transacti
 }
 
 func (s *ShardRouter) process(reqs []*pb.Request, fn func(*routerGroup, []*pb.Request) (*TransactionResponse, error)) (*TransactionResponse, error) {
+	resp, _, err := s.processWithGroupCount(reqs, fn)
+	return resp, err
+}
+
+func (s *ShardRouter) processWithGroupCount(reqs []*pb.Request, fn func(*routerGroup, []*pb.Request) (*TransactionResponse, error)) (*TransactionResponse, int, error) {
 	if len(reqs) == 0 {
-		return nil, errors.WithStack(ErrInvalidRequest)
+		return nil, 0, errors.WithStack(ErrInvalidRequest)
 	}
 
 	grouped, err := s.groupRequests(reqs)
 	if err != nil {
-		return nil, errors.WithStack(err)
+		return nil, 0, errors.WithStack(err)
 	}
 
 	if err := validateShardBatch(reqs[0], grouped); err != nil {
-		return nil, errors.WithStack(err)
+		return nil, 0, errors.WithStack(err)
 	}
 
-	return s.processGrouped(grouped, fn)
+	resp, err := s.processGrouped(grouped, fn)
+	return resp, len(grouped), err
 }
 
 func validateShardBatch(first *pb.Request, grouped map[uint64][]*pb.Request) error {

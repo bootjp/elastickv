@@ -697,16 +697,76 @@ idempotent but cost log entries and latency); skipping the repeated no-op
 forward a follower sends on every page of a long scan while its local
 apply still lags `ts`; and the read-side benchmark.
 
+**Raw and 2PC apply-order fence (branch
+`design/serializable-audit-a0-raw-commit-fence`).** Extends the one-phase
+commit-ts fence, which is all `main` carries of A0's fence, to the other two
+paths G0 names, behind a replicated activation.
+
+- **Raw.** `handleRawRequest` applies through `ApplyMutationsRaftAtFenced`,
+  so a raw entry whose timestamp is at or below the group's watermark is
+  rejected with a write conflict. Raw timestamps are coordinator-allocated
+  (never caller-chosen), so the fence only fires on reordering;
+  `ShardedCoordinator` re-dispatches a fenced single-group raw write with a
+  fresh timestamp (raw writes carry no read set, and nothing was applied).
+  Single-group eligibility requires both the group set actually dispatched
+  on that attempt and the current route to remain single-group. The same
+  rule applies to the existing raw Composed-1 version-GC retry: a partially
+  successful multi-group write must never be reissued after a route change.
+  `DEL_PREFIX` stays unfenced: a multi-prefix broadcast shares one
+  timestamp and would fence itself.
+- **2PC: fence the PREPARE, not the COMMIT.** The section above moves the
+  commit-timestamp allocation after the PREPAREs and fences the primary
+  COMMIT. This branch keeps the allocation where it is (settled before
+  PREPARE, carried in `TxnMeta.CommitTS` or, when durable PREPARE evidence
+  is enabled, `TxnMeta.PrepareCommitTS`) and fences each PREPARE against
+  the same timestamp used for its route floor and durable lock proof. A
+  PREPARE whose settled timestamp is at or below its group's
+  watermark is rejected with a write conflict, and the coordinator aborts
+  the transaction as for any PREPARE conflict. Once a PREPARE applies, its
+  write locks (at `start_ts < CommitTS`) are visible, so a reader at
+  `s >= start_ts` meets the lock and resolves it, and a reader that
+  completed before the PREPARE read at `s` no higher than the watermark
+  the PREPARE was checked against, below `CommitTS`. Neither can see the
+  COMMIT land below its snapshot, so the COMMIT needs no fence and keeps
+  its idempotent re-apply. With the read watermark advance on, a reader
+  advances a secondary group before reading, so the same check covers 2PC
+  across groups. TLC agrees: OCC.tla's `CommitFence` constant adds the
+  check to `Prepare`; `MCOCC_g0.cfg` (fence on) passes OCC-3 where
+  `MCOCC_g0_gap.cfg` (fence off) fails it, and with `MultiGroup` and 2PC
+  the check passes with `ReadAdvance` and fails without it.
+- **Activation.** A fence changes the FSM verdict, so a per-node flag would
+  let replicas of one group disagree. A replicated activation entry (FSM
+  tag `0x2f`, an invalid protobuf prefix distinct from the guarded bootstrap
+  control prefix `0x1f`; `0x18` would be a legacy
+  `Request`'s `ts` tag) persists a marker key per group, reloaded at open and after
+  a snapshot restore; the FSM fences raw entries and PREPAREs only once the
+  marker is set. Production startup accepts `--commitTSFence` only with the
+  protected Raft catalog bootstrap configured. The coordinator waits until
+  every local protected group reports DataReady before proposing activation
+  through maintenance admission. Public listeners stay closed until every
+  local KV data group has applied the marker; DataReady alone does not open
+  the write path before the renewal worker's first activation tick. The
+  dedicated TSO group is excluded from that wait: it applies no KV entries,
+  so its control store never carries the marker. Legacy
+  startup rejects both the flag and a previously persisted activation marker:
+  its non-Raft catalog writes could
+  otherwise advance the watermark on only one replica. Enablement also
+  requires every replica to understand tag `0x2f`; an older replica fails to
+  decode the entry and does not fence.
+- **Still open:** `DEL_PREFIX`; the 2PC ABORT timestamp; and G1, which the
+  fence does not touch.
+
+For multi-group 2PC, a secondary read that finishes before PREPARE raises
+that group's replicated watermark to its snapshot timestamp. A PREPARE with
+an older settled commit timestamp is then rejected before the coordinator
+commits the primary. If PREPARE applies first, the read meets its lock.
+`MCOCC_multigroup_2pc.cfg` checks both interleavings with `ReadAdvance` and
+`CommitFence`, and `TestMultiGroupPrepareRejectsCommitBelowSecondaryReadWatermark`
+checks the rejection and abort on two real Raft groups. This does not cover
+deployments that leave read-watermark advancement disabled.
+
 Open after this branch:
 
-- **2PC commit timestamps versus advanced secondaries.** The commit
-  timestamp is allocated on the primary group's leader, whose HLC and
-  watermark may sit below an `s` that a secondary group was advanced to;
-  the secondary COMMIT is unfenced, so it can land at or below `s` on that
-  group if its PREPARE applied after the read. Fix: the primary allocates
-  the commit timestamp above every participant's watermark (each PREPARE
-  reply returns its group's replicated watermark; the allocation goes
-  through the HLC's after-through path). A merge blocker for A0.
 - **Non-transactional reads stay plain.** Redis `GET` and the scans,
   DynamoDB `GetItem` / `Query` / `Scan`, S3 `GET` / `LIST`, and the SQS
   peek read at the local watermark without the capability. A single-key
