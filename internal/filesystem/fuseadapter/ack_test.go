@@ -229,3 +229,29 @@ func TestStrictSessionWaitsForUnansweredRequest(t *testing.T) {
 	require.NoError(t, adapter.finishStrictSession(ctx))
 	require.True(t, core.closed)
 }
+
+// TestRetryAcknowledgementsStopsWhenCancelledAndWoken pins that a cancelled
+// acknowledgement loop never starts another batch, even when a wake-up is
+// already queued. select picks a ready case at random, so without the check
+// a stopped loop would still call AcknowledgeOperation about half the time
+// while its owner (a test, or Close) has moved on.
+func TestRetryAcknowledgementsStopsWhenCancelledAndWoken(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	for range 64 {
+		core := newAcknowledgementCore()
+		adapter := New(core, []byte("client"), WithHandleKeepaliveInterval(0))
+		adapter.ackWake = make(chan struct{}, 1)
+		adapter.queueAcknowledgement(filesystem.OperationID{Filesystem: [16]byte{1}, Session: [16]byte{2}, Sequence: 1})
+
+		adapter.retryAcknowledgements(ctx)
+
+		select {
+		case id := <-core.acknowledged:
+			t.Fatalf("cancelled acknowledgement loop acknowledged %v", id)
+		default:
+		}
+		adapter.Close()
+	}
+}
