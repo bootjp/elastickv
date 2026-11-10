@@ -74,11 +74,6 @@ jobs:
         # fuse3 provides fusermount3 for the --filesystemMount nodes used by
         # the filesystem Jepsen workload.
         run: sudo apt-get update && sudo apt-get install -y netcat-openbsd graphviz fuse3 sqlite3
-      - name: Install Leiningen
-        run: |
-          curl -L https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein > ~/lein
-          chmod +x ~/lein
-          ~/lein version
       # Cache Maven artifacts across runs. Maven Central (repo1.maven.org)
       # serves intermittent 429s during dependency download, which
       # uncached scheduled runs trip frequently — the lein project pulls
@@ -93,6 +88,16 @@ jobs:
           key: ${{ runner.os }}-maven-${{ hashFiles('jepsen/project.clj') }}
           restore-keys: |
             ${{ runner.os }}-maven-
+      - name: Install Leiningen
+        run: |
+          curl -fL --retry 5 --retry-all-errors --retry-delay 10 \
+            https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein -o ~/lein
+          chmod +x ~/lein
+          for attempt in 1 2 3 4; do
+            if ~/lein version; then exit 0; fi
+            if ((attempt == 4)); then exit 1; fi
+            sleep "$((attempt * 15))"
+          done
       - name: Pre-fetch Go modules and build binaries
         if: matrix.workload != 'unit'
         run: |
@@ -215,13 +220,33 @@ jobs:
         if: matrix.workload == 's3'
         working-directory: jepsen
         timeout-minutes: 70
+        env:
+          S3_REQUESTED_KEYS: ${{ inputs.key-count || '16' }}
+          S3_REQUESTED_OPS_PER_KEY: ${{ inputs.max-writes-per-key || '250' }}
+          S3_TIME_LIMIT: ${{ inputs.time-limit || '300' }}
+          S3_RATE: ${{ inputs.rate || '10' }}
+          S3_CONCURRENCY: ${{ inputs.concurrency || '8' }}
         run: |
+          valid_java_positive_int() {
+            [[ "$1" =~ ^[1-9][0-9]*$ ]] || return 1
+            [[ ${#1} -lt 10 ]] && return 0
+            [[ ${#1} -eq 10 ]] || return 1
+            (( 10#$1 <= 2147483647 ))
+          }
+          if ! valid_java_positive_int "$S3_REQUESTED_KEYS" || ! valid_java_positive_int "$S3_REQUESTED_OPS_PER_KEY"; then
+            echo "key-count and max-writes-per-key must be positive 32-bit integers" >&2
+            exit 1
+          fi
+          bash test/s3_budget_test.sh
+          source ./s3_budget.sh
+          s3_budget "$S3_REQUESTED_KEYS" "$S3_REQUESTED_OPS_PER_KEY"
+          echo "S3 register budget: ${S3_KEY_COUNT} keys, ${S3_MAX_OPS_PER_KEY} operations per key"
           timeout 3600 ~/lein run -m elastickv.s3-workload --local \
-            --time-limit ${{ inputs.time-limit || '300' }} \
-            --rate ${{ inputs.rate || '10' }} \
-            --concurrency ${{ inputs.concurrency || '8' }} \
-            --key-count ${{ inputs.key-count || '16' }} \
-            --max-writes-per-key ${{ inputs.max-writes-per-key || '250' }} \
+            --time-limit "$S3_TIME_LIMIT" \
+            --rate "$S3_RATE" \
+            --concurrency "$S3_CONCURRENCY" \
+            --key-count "$S3_KEY_COUNT" \
+            --max-writes-per-key "$S3_MAX_OPS_PER_KEY" \
             --threads-per-key 4 \
             --s3-ports 63901,63902,63903 \
             --host 127.0.0.1

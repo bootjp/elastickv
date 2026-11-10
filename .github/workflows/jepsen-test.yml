@@ -39,11 +39,6 @@ jobs:
         # fuse3 provides fusermount3 for the --filesystemMount nodes used by
         # the filesystem Jepsen workload.
         run: sudo apt-get update && sudo apt-get install -y netcat-openbsd graphviz fuse3 sqlite3 strace
-      - name: Install Leiningen
-        run: |
-          curl -L https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein > ~/lein
-          chmod +x ~/lein
-          ~/lein version
       # See jepsen-test-scheduled.yml for the rationale: Maven Central
       # 429s during peak hours have been knocking the scheduled stress
       # run out, and the per-push run uses the same dependency set.
@@ -56,6 +51,16 @@ jobs:
           key: ${{ runner.os }}-maven-${{ hashFiles('jepsen/project.clj') }}
           restore-keys: |
             ${{ runner.os }}-maven-
+      - name: Install Leiningen
+        run: |
+          curl -fL --retry 5 --retry-all-errors --retry-delay 10 \
+            https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein -o ~/lein
+          chmod +x ~/lein
+          for attempt in 1 2 3 4; do
+            if ~/lein version; then exit 0; fi
+            if ((attempt == 4)); then exit 1; fi
+            sleep "$((attempt * 15))"
+          done
       - name: Pre-fetch Go modules and build binary
         run: |
           mkdir -p "$GOCACHE" /tmp/go-tmp
