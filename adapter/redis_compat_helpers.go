@@ -848,15 +848,21 @@ func (r *RedisServer) dispatchReadTimestampElems(ctx context.Context, readTimest
 // path does a single GetAt on the prefixed key (value + TTL in one read);
 // the legacy path does at most two extra reads (TTL index, then bare key).
 // Expiration is checked locally from the TTL we just decoded.
-func (r *RedisServer) readRedisStringAt(key []byte, readTS uint64) ([]byte, *time.Time, error) {
-	return r.readRedisStringWith(key, readTS, r.leaderAwareGetAt)
+func (r *RedisServer) readRedisStringAt(key []byte, readTS uint64, requestContexts ...context.Context) ([]byte, *time.Time, error) {
+	ctx := r.redisContext(requestContexts...)
+	return r.readRedisStringWith(key, readTS, func(key []byte, ts uint64) ([]byte, error) {
+		return r.doGetAtContext(ctx, key, ts, true)
+	})
 }
 
 // readRedisStringAtSnapshot reads a string without re-verifying leadership on
 // every sub-call. The caller must have already called coordinator.VerifyLeader()
 // once before invoking this (e.g. at Lua script startTS acquisition time).
-func (r *RedisServer) readRedisStringAtSnapshot(key []byte, readTS uint64) ([]byte, *time.Time, error) {
-	return r.readRedisStringWith(key, readTS, r.snapshotGetAt)
+func (r *RedisServer) readRedisStringAtSnapshot(key []byte, readTS uint64, requestContexts ...context.Context) ([]byte, *time.Time, error) {
+	ctx := r.redisContext(requestContexts...)
+	return r.readRedisStringWith(key, readTS, func(key []byte, ts uint64) ([]byte, error) {
+		return r.snapshotGetAt(key, ts, ctx)
+	})
 }
 
 func (r *RedisServer) readRedisStringWith(key []byte, readTS uint64, get rawGetFn) ([]byte, *time.Time, error) {
@@ -932,18 +938,23 @@ type rawGetFn func(key []byte, readTS uint64) ([]byte, error)
 // leaderAwareGetAt is a GetAt that honors the per-key leader routing readValueAt
 // uses, but without calling back into hasExpiredTTLAt. Callers are responsible
 // for handling expiration themselves using the TTL they just read.
-func (r *RedisServer) leaderAwareGetAt(key []byte, readTS uint64) ([]byte, error) {
-	return r.doGetAt(key, readTS, true)
+func (r *RedisServer) leaderAwareGetAt(key []byte, readTS uint64, requestContexts ...context.Context) ([]byte, error) {
+	return r.doGetAt(key, readTS, true, r.redisContext(requestContexts...))
 }
 
 // snapshotGetAt reads at readTS without re-verifying leadership on every call.
 // The caller must have already called coordinator.VerifyLeader() once (e.g. at
 // Lua script startTS acquisition time) before using this method.
-func (r *RedisServer) snapshotGetAt(key []byte, readTS uint64) ([]byte, error) {
-	return r.doGetAt(key, readTS, false)
+func (r *RedisServer) snapshotGetAt(key []byte, readTS uint64, requestContexts ...context.Context) ([]byte, error) {
+	return r.doGetAt(key, readTS, false, r.redisContext(requestContexts...))
 }
 
-func (r *RedisServer) doGetAt(key []byte, readTS uint64, verify bool) ([]byte, error) {
+func (r *RedisServer) doGetAt(key []byte, readTS uint64, verify bool, requestContexts ...context.Context) ([]byte, error) {
+	return r.doGetAtContext(r.redisContext(requestContexts...),
+		key, readTS, verify)
+}
+
+func (r *RedisServer) doGetAtContext(ctx context.Context, key []byte, readTS uint64, verify bool) ([]byte, error) {
 	// Leadership is partitioned by the logical user key, but route through a
 	// Redis wrapper so list-internal-shaped user keys remain literal.
 	routingKey := key
@@ -952,14 +963,14 @@ func (r *RedisServer) doGetAt(key []byte, readTS uint64, verify bool) ([]byte, e
 	}
 	if r.coordinator.IsLeaderForKey(routingKey) {
 		if verify {
-			if err := r.coordinator.VerifyLeaderForKey(r.handlerContext(), routingKey); err != nil {
+			if err := r.coordinator.VerifyLeaderForKey(ctx, routingKey); err != nil {
 				return nil, errors.WithStack(err)
 			}
 		}
-		v, err := r.store.GetAt(context.Background(), key, readTS)
+		v, err := r.store.GetAt(ctx, key, readTS)
 		return v, errors.WithStack(err)
 	}
-	return r.tryLeaderGetAt(key, readTS)
+	return r.tryLeaderGetAtContext(ctx, key, readTS)
 }
 
 func (r *RedisServer) saveString(ctx context.Context, key []byte, value []byte, ttl *time.Time) error {
@@ -1439,15 +1450,16 @@ func (r *RedisServer) rewriteListTxn(ctx context.Context, key []byte, readTimest
 	return errors.WithStack(err)
 }
 
-func (r *RedisServer) visibleKeys(pattern []byte) ([][]byte, error) {
-	keys, err := r.localKeys(pattern)
+func (r *RedisServer) visibleKeys(pattern []byte, requestContexts ...context.Context) ([][]byte, error) {
+	keys, err := r.localKeys(pattern, r.redisContext(requestContexts...))
 	if err != nil {
 		return nil, err
 	}
 	visible := make([][]byte, 0, len(keys))
 	readTS := r.readTS()
 	for _, key := range keys {
-		ok, err := r.logicalExistsAt(context.Background(), key, readTS)
+		ok, err := r.logicalExistsAt(r.redisContext(requestContexts...),
+			key, readTS)
 		if err != nil {
 			return nil, err
 		}
@@ -1593,8 +1605,8 @@ func (r *RedisServer) resolveListMeta(ctx context.Context, key []byte, readTS ui
 	})
 	if err != nil {
 		if errors.Is(err, ErrDeltaScanTruncated) {
-			r.triggerUrgentCompaction("list", key)
-			r.triggerUrgentCompaction("list-legacy", key)
+			r.triggerUrgentCompactionContext(ctx, "list", key)
+			r.triggerUrgentCompactionContext(ctx, "list-legacy", key)
 		}
 		return store.ListMeta{}, false, err
 	}
@@ -1669,7 +1681,7 @@ func (r *RedisServer) resolveHashMeta(ctx context.Context, key []byte, readTS ui
 		"resolveHashMeta: clamping negative Len to 0",
 	)
 	if errors.Is(err, ErrDeltaScanTruncated) {
-		r.triggerUrgentCompaction("hash", key)
+		r.triggerUrgentCompactionContext(ctx, "hash", key)
 	}
 	return n, exists, err
 }
@@ -1691,7 +1703,7 @@ func (r *RedisServer) resolveSetMeta(ctx context.Context, key []byte, readTS uin
 		"resolveSetMeta: clamping negative Len to 0",
 	)
 	if errors.Is(err, ErrDeltaScanTruncated) {
-		r.triggerUrgentCompaction("set", key)
+		r.triggerUrgentCompactionContext(ctx, "set", key)
 	}
 	return n, exists, err
 }
@@ -1713,7 +1725,7 @@ func (r *RedisServer) resolveZSetMeta(ctx context.Context, key []byte, readTS ui
 		"resolveZSetMeta: clamping negative Len to 0",
 	)
 	if errors.Is(err, ErrDeltaScanTruncated) {
-		r.triggerUrgentCompaction("zset", key)
+		r.triggerUrgentCompactionContext(ctx, "zset", key)
 	}
 	return n, exists, err
 }

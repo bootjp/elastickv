@@ -11,6 +11,7 @@ import (
 )
 
 func TestBuildLeaderForwarder_RejectsMissingDeps(t *testing.T) {
+	t.Parallel()
 	cache := &kv.GRPCConnCache{}
 	cases := []struct {
 		name      string
@@ -38,6 +39,7 @@ func TestBuildLeaderForwarder_RejectsMissingDeps(t *testing.T) {
 }
 
 func TestAdminForwardConnFactory_RejectsEmptyAddr(t *testing.T) {
+	t.Parallel()
 	// kv.GRPCConnCache.ConnFor returns ErrLeaderNotFound on "". The
 	// LeaderForwarder catches the empty address before this layer is
 	// reached, but the bridge still surfaces an error rather than a
@@ -50,6 +52,7 @@ func TestAdminForwardConnFactory_RejectsEmptyAddr(t *testing.T) {
 }
 
 func TestRoleStoreFromFlags(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name         string
 		full         []string
@@ -100,6 +103,7 @@ func TestRoleStoreFromFlags(t *testing.T) {
 }
 
 func TestAdminForwardServerDeps_ReadyForRegistration(t *testing.T) {
+	t.Parallel()
 	// The bundle's readyForRegistration gate decides whether
 	// startRaftServers wires the gRPC ForwardServer at all.
 	// RoleStore is always required (admin auth disabled means the
@@ -138,6 +142,7 @@ func TestAdminForwardServerDeps_ReadyForRegistration(t *testing.T) {
 }
 
 func TestBuildAdminLeaderForwarder_NilGateReturnsNoForwarder(t *testing.T) {
+	t.Parallel()
 	// buildAdminLeaderForwarder is the wrapper in main_admin.go that
 	// short-circuits to (nil, nil) when either coordinate or
 	// connCache is nil — the explicit "no forwarder" path for
@@ -185,6 +190,7 @@ func TestBuildAdminLeaderForwarder_NilGateReturnsNoForwarder(t *testing.T) {
 }
 
 func TestBuildAdminLeaderForwarder_HappyPathReturnsForwarder(t *testing.T) {
+	t.Parallel()
 	fwd, err := buildAdminLeaderForwarder(&kv.Coordinate{}, &kv.GRPCConnCache{}, "n1")
 	require.NoError(t, err)
 	require.NotNil(t, fwd)
@@ -203,6 +209,7 @@ func TestBuildAdminLeaderForwarder_HappyPathReturnsForwarder(t *testing.T) {
 // package stays decoupled from), so the assertion lives in main
 // where both packages are already in scope.
 func TestAdminHLCPhysicalShiftMatchesKVLogicalBits(t *testing.T) {
+	t.Parallel()
 	// FormatBucketCreatedAt(hlc) shifts hlc right by 16 to recover
 	// the wall-clock millis. Shift a known wall-clock value left by
 	// kv.HLCLogicalBits and confirm the formatter recovers exactly

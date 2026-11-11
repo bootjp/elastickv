@@ -24,6 +24,7 @@ func (s *partitionProtocolStore) ApplyMigrationOwnershipPartition(context.Contex
 }
 
 func TestMigrationPartitionProtocolSupportsUnconfiguredCandidate(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	proposer := &ownershipRuntimeProposer{fsm: kv.NewKvFSMWithHLC(st, nil)}
 	tx := kv.NewTransactionWithProposer(proposer, kv.WithMigrationRequestAdmission(st, 7))
@@ -45,6 +46,7 @@ func TestMigrationPartitionProtocolSupportsUnconfiguredCandidate(t *testing.T) {
 }
 
 func TestMigrationPartitionProtocolRequiresProposalAdmission(t *testing.T) {
+	t.Parallel()
 	st := &partitionProtocolStore{MVCCStore: store.NewMVCCStore()}
 	proposer := &ownershipRuntimeProposer{fsm: kv.NewKvFSMWithHLC(st, nil)}
 	tx := kv.NewTransactionWithProposer(proposer)
@@ -61,6 +63,7 @@ func TestMigrationPartitionProtocolRequiresProposalAdmission(t *testing.T) {
 }
 
 func TestMigrationPartitionProtocolDefaultDenyAndStorePairing(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name  string
 		store store.MVCCStore

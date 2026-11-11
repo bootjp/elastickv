@@ -15,13 +15,17 @@ import (
 )
 
 func (r *RedisServer) hset(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
 	if r.runStandaloneDedup(conn, cmd) {
 		return
 	}
-	added, err := r.applyHashFieldPairs(cmd.Args[1], cmd.Args[2:])
+	added, err := r.applyHashFieldPairs(cmd.Args[1], cmd.Args[2:], r.handlerContext(conn))
 	if err != nil {
 		writeRedisError(conn, err)
 		return
@@ -30,13 +34,17 @@ func (r *RedisServer) hset(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) hmset(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
 	if r.runStandaloneDedup(conn, cmd) {
 		return
 	}
-	if _, err := r.applyHashFieldPairs(cmd.Args[1], cmd.Args[2:]); err != nil {
+	if _, err := r.applyHashFieldPairs(cmd.Args[1], cmd.Args[2:], r.handlerContext(conn)); err != nil {
 		writeRedisError(conn, err)
 		return
 	}
@@ -153,12 +161,13 @@ func (r *RedisServer) buildHashFieldElems(key []byte, args [][]byte, existsMap m
 	return elems, newFields
 }
 
-func (r *RedisServer) applyHashFieldPairs(key []byte, args [][]byte) (int, error) {
+func (r *RedisServer) applyHashFieldPairs(key []byte, args [][]byte, requestContexts ...context.Context) (int, error) {
 	if len(args) == 0 || len(args)%redisPairWidth != 0 {
 		return 0, errors.New("ERR wrong number of arguments for hash command")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.redisContext(requestContexts...),
+		redisDispatchTimeout)
 	defer cancel()
 	var added int
 	err := r.retryRedisWrite(ctx, func() error {
@@ -226,13 +235,17 @@ func (r *RedisServer) applyHashFieldPairs(key []byte, args [][]byte) (int, error
 }
 
 func (r *RedisServer) hget(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
 	key := cmd.Args[1]
 	field := cmd.Args[2]
 	readTS := r.readTS()
-	ctx := context.Background()
+	ctx := r.handlerContext(conn)
 
 	// Fast path: look the wide-column field up directly. Live
 	// wide-column hashes resolve here in 1 seek + TTL probe versus
@@ -356,11 +369,16 @@ func (r *RedisServer) hgetSlow(conn redcon.Conn, ctx context.Context, key, field
 }
 
 func (r *RedisServer) hmget(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
 	readTS := r.readTS()
-	typ, err := r.keyTypeAtExpect(context.Background(), cmd.Args[1], readTS, redisTypeHash)
+	typ, err := r.keyTypeAtExpect(r.handlerContext(conn),
+		cmd.Args[1], readTS, redisTypeHash)
 	if err != nil {
 		writeRedisError(conn, err)
 		return
@@ -378,7 +396,8 @@ func (r *RedisServer) hmget(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 
-	value, err := r.loadHashAt(context.Background(), cmd.Args[1], readTS)
+	value, err := r.loadHashAt(r.handlerContext(conn),
+		cmd.Args[1], readTS)
 	if err != nil {
 		writeRedisError(conn, err)
 		return
@@ -395,10 +414,15 @@ func (r *RedisServer) hmget(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) hdel(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(conn),
+		redisDispatchTimeout)
 	defer cancel()
 	var removed int
 	if err := r.retryRedisWrite(ctx, func() error {
@@ -563,13 +587,17 @@ func (r *RedisServer) persistHashReadTimestampTxn(ctx context.Context, key []byt
 }
 
 func (r *RedisServer) hexists(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
 	key := cmd.Args[1]
 	field := cmd.Args[2]
 	readTS := r.readTS()
-	ctx := context.Background()
+	ctx := r.handlerContext(conn)
 
 	// Fast path: direct wide-column field existence check. ExistsAt
 	// is cheaper than GetAt since we don't need the value payload.
@@ -638,11 +666,16 @@ func (r *RedisServer) hexistsSlow(conn redcon.Conn, ctx context.Context, key, fi
 }
 
 func (r *RedisServer) hlen(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
 	readTS := r.readTS()
-	typ, err := r.keyTypeAtExpect(context.Background(), cmd.Args[1], readTS, redisTypeHash)
+	typ, err := r.keyTypeAtExpect(r.handlerContext(conn),
+		cmd.Args[1], readTS, redisTypeHash)
 	if err != nil {
 		writeRedisError(conn, err)
 		return
@@ -657,7 +690,8 @@ func (r *RedisServer) hlen(conn redcon.Conn, cmd redcon.Command) {
 	}
 
 	// Wide-column path: use delta-aggregated metadata for O(1) count.
-	count, exists, err := r.resolveHashMeta(context.Background(), cmd.Args[1], readTS)
+	count, exists, err := r.resolveHashMeta(r.handlerContext(conn),
+		cmd.Args[1], readTS)
 	if err != nil {
 		writeRedisError(conn, err)
 		return
@@ -667,7 +701,8 @@ func (r *RedisServer) hlen(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 	// Legacy blob fallback: load all fields and count.
-	value, err := r.loadHashAt(context.Background(), cmd.Args[1], readTS)
+	value, err := r.loadHashAt(r.handlerContext(conn),
+		cmd.Args[1], readTS)
 	if err != nil {
 		writeRedisError(conn, err)
 		return
@@ -676,6 +711,10 @@ func (r *RedisServer) hlen(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) hincrby(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
@@ -685,7 +724,8 @@ func (r *RedisServer) hincrby(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(conn),
+		redisDispatchTimeout)
 	defer cancel()
 	var current int64
 	if err := r.retryRedisWrite(ctx, func() error {
@@ -833,6 +873,10 @@ func (r *RedisServer) hincrbyTxn(ctx context.Context, key, field []byte, increme
 }
 
 func (r *RedisServer) incr(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
@@ -843,7 +887,16 @@ func (r *RedisServer) incr(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) incrLegacy(conn redcon.Conn, cmd redcon.Command) {
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	if !r.requireRequestContext(conn) {
+		return
+	}
+	r.incrLegacyCommand(conn, cmd)
+}
+
+func (r *RedisServer) incrLegacyCommand(conn redcon.Conn, cmd redcon.Command) {
+
+	ctx, cancel := context.WithTimeout(r.handlerContext(conn),
+		redisDispatchTimeout)
 	defer cancel()
 	var current int64
 	if err := r.retryRedisWrite(ctx, func() error {
@@ -863,7 +916,7 @@ func (r *RedisServer) incrLegacy(conn redcon.Conn, cmd redcon.Command) {
 		current = 0
 		var existingTTL *time.Time
 		if typ == redisTypeString {
-			raw, ttl, err := r.readRedisStringAt(cmd.Args[1], readTS)
+			raw, ttl, err := r.readRedisStringAt(cmd.Args[1], readTS, r.handlerContext(conn))
 			if err != nil {
 				return err
 			}
@@ -896,11 +949,16 @@ func (r *RedisServer) incrLegacy(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) hgetall(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
 	readTS := r.readTS()
-	typ, err := r.keyTypeAtExpect(context.Background(), cmd.Args[1], readTS, redisTypeHash)
+	ctx := r.handlerContext(conn)
+	typ, err := r.keyTypeAtExpect(ctx, cmd.Args[1], readTS, redisTypeHash)
 	if err != nil {
 		writeRedisError(conn, err)
 		return
@@ -914,7 +972,7 @@ func (r *RedisServer) hgetall(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 
-	value, err := r.loadHashAt(context.Background(), cmd.Args[1], readTS)
+	value, err := r.loadHashAt(ctx, cmd.Args[1], readTS)
 	if err != nil {
 		writeRedisError(conn, err)
 		return

@@ -12,6 +12,7 @@ import (
 )
 
 func TestPackDumpTreeRejectsHardLinkedFile(t *testing.T) {
+	t.Parallel()
 	root := writeArchiveFixture(t)
 	external := filepath.Join(t.TempDir(), "external.bin")
 	require.NoError(t, os.WriteFile(external, []byte("external"), 0o600))

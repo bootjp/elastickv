@@ -276,7 +276,11 @@ func (h *asyncStorageRuntime) flushFollower(t *testing.T) {
 			require.NoError(t, h.storage.SetHardState(rd.HardState))
 		}
 		for _, msg := range rd.Messages {
-			require.NoError(t, h.engine.handleTransportMessage(h.ctx, *msg))
+			if msg.GetType() == raftpb.MsgProp {
+				require.NoError(t, h.engine.enqueueStep(h.ctx, *msg))
+			} else {
+				require.NoError(t, h.engine.handleTransportMessage(h.ctx, *msg))
+			}
 		}
 		h.follower.Advance(rd)
 	}

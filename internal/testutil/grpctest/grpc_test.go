@@ -24,6 +24,7 @@ func (echoServer) UnaryCall(_ context.Context, req *grpc_testing.SimpleRequest) 
 }
 
 func TestServeDialProductionLimitsAndCleanup(t *testing.T) {
+	t.Parallel()
 	var conn *grpc.ClientConn
 	t.Run("owner", func(t *testing.T) {
 		addr := grpctest.Serve(t, func(s *grpc.Server) { grpc_testing.RegisterTestServiceServer(s, echoServer{}) })
@@ -42,6 +43,7 @@ func TestServeDialProductionLimitsAndCleanup(t *testing.T) {
 }
 
 func TestServeExplicitOptionsOverrideDefaults(t *testing.T) {
+	t.Parallel()
 	addr := grpctest.Serve(t, func(s *grpc.Server) { grpc_testing.RegisterTestServiceServer(s, echoServer{}) }, grpc.MaxRecvMsgSize(1))
 	conn := grpctest.Dial(t, addr)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)

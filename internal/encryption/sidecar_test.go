@@ -47,6 +47,7 @@ func sidecarPath(t *testing.T) string {
 }
 
 func TestWriteSidecar_RoundTrip(t *testing.T) {
+	t.Parallel()
 	path := sidecarPath(t)
 	sc := fixtureSidecar()
 
@@ -67,6 +68,7 @@ func TestWriteSidecar_RoundTrip(t *testing.T) {
 // write protocol's success path: after a clean Write, the tmp file
 // must NOT remain on disk.
 func TestWriteSidecar_NoTmpFileLeftBehind(t *testing.T) {
+	t.Parallel()
 	path := sidecarPath(t)
 	if err := encryption.WriteSidecar(path, fixtureSidecar()); err != nil {
 		t.Fatalf("WriteSidecar: %v", err)
@@ -78,6 +80,7 @@ func TestWriteSidecar_NoTmpFileLeftBehind(t *testing.T) {
 }
 
 func TestWriteSidecar_OverwriteExisting(t *testing.T) {
+	t.Parallel()
 	path := sidecarPath(t)
 	first := fixtureSidecar()
 	first.RaftAppliedIndex = 100
@@ -99,6 +102,7 @@ func TestWriteSidecar_OverwriteExisting(t *testing.T) {
 }
 
 func TestWriteSidecar_TmpFileMode(t *testing.T) {
+	t.Parallel()
 	// Windows does not preserve unix permission bits the way the
 	// mode&0o077 assertion expects (Go reports synthetic perm bits
 	// that commonly include group/other reads even on a freshly
@@ -136,6 +140,7 @@ func TestWriteSidecar_TmpFileMode(t *testing.T) {
 // caller that builds a Sidecar with Version=0 still produces a
 // well-formed on-disk file.
 func TestWriteSidecar_OnDiskVersion(t *testing.T) {
+	t.Parallel()
 	path := sidecarPath(t)
 	sc := fixtureSidecar()
 	sc.Version = 0 // caller forgot to set
@@ -158,6 +163,7 @@ func TestWriteSidecar_OnDiskVersion(t *testing.T) {
 // The mutation-as-side-effect behaviour was retracted in PR #722
 // review round 1 because it surprised callers that reuse the struct.
 func TestWriteSidecar_DoesNotMutateCaller(t *testing.T) {
+	t.Parallel()
 	path := sidecarPath(t)
 	sc := fixtureSidecar()
 	sc.Version = 0
@@ -174,6 +180,7 @@ func TestWriteSidecar_DoesNotMutateCaller(t *testing.T) {
 }
 
 func TestWriteSidecar_RejectsNil(t *testing.T) {
+	t.Parallel()
 	path := sidecarPath(t)
 	err := encryption.WriteSidecar(path, nil)
 	if err == nil {
@@ -182,6 +189,7 @@ func TestWriteSidecar_RejectsNil(t *testing.T) {
 }
 
 func TestWriteSidecar_RejectsBadPurpose(t *testing.T) {
+	t.Parallel()
 	path := sidecarPath(t)
 	sc := fixtureSidecar()
 	sc.Keys["999"] = encryption.SidecarKey{
@@ -195,6 +203,7 @@ func TestWriteSidecar_RejectsBadPurpose(t *testing.T) {
 }
 
 func TestWriteSidecar_RejectsReservedKeyIDInMap(t *testing.T) {
+	t.Parallel()
 	path := sidecarPath(t)
 	sc := fixtureSidecar()
 	sc.Keys["0"] = encryption.SidecarKey{
@@ -207,6 +216,7 @@ func TestWriteSidecar_RejectsReservedKeyIDInMap(t *testing.T) {
 }
 
 func TestWriteSidecar_RejectsNonNumericKeyID(t *testing.T) {
+	t.Parallel()
 	path := sidecarPath(t)
 	sc := fixtureSidecar()
 	sc.Keys["abc"] = encryption.SidecarKey{
@@ -219,6 +229,7 @@ func TestWriteSidecar_RejectsNonNumericKeyID(t *testing.T) {
 }
 
 func TestReadSidecar_Missing(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "does-not-exist.json")
 	_, err := encryption.ReadSidecar(path)
 	if err == nil {
@@ -230,6 +241,7 @@ func TestReadSidecar_Missing(t *testing.T) {
 }
 
 func TestReadSidecar_RejectsUnknownVersion(t *testing.T) {
+	t.Parallel()
 	path := sidecarPath(t)
 	// 0 and -1 are below MinReadableSidecarVersion; 3 / 42 are above
 	// SidecarVersion (currently 2). 1 and 2 are valid and exercised
@@ -264,6 +276,7 @@ func TestReadSidecar_RejectsUnknownVersion(t *testing.T) {
 // upgrade would refuse to boot on the upgraded node — gemini
 // medium #2 on PR804.
 func TestReadSidecar_AcceptsLegacyVersion1(t *testing.T) {
+	t.Parallel()
 	path := sidecarPath(t)
 	// Version-1 layout WITHOUT storage_envelope_cutover_index, as
 	// written by a pre-6D-4 binary.
@@ -306,6 +319,7 @@ func TestReadSidecar_AcceptsLegacyVersion1(t *testing.T) {
 }
 
 func TestReadSidecar_RejectsCorruptJSON(t *testing.T) {
+	t.Parallel()
 	path := sidecarPath(t)
 	cases := []struct {
 		name string
@@ -330,6 +344,7 @@ func TestReadSidecar_RejectsCorruptJSON(t *testing.T) {
 }
 
 func TestReadSidecar_RejectsBadPurpose(t *testing.T) {
+	t.Parallel()
 	path := sidecarPath(t)
 	raw := []byte(`{
         "version": 1,
@@ -351,6 +366,7 @@ func TestReadSidecar_RejectsBadPurpose(t *testing.T) {
 }
 
 func TestReadSidecar_RejectsReservedKeyIDInMap(t *testing.T) {
+	t.Parallel()
 	path := sidecarPath(t)
 	raw := []byte(`{
         "version": 1,
@@ -372,6 +388,7 @@ func TestReadSidecar_RejectsReservedKeyIDInMap(t *testing.T) {
 }
 
 func TestReadSidecar_RejectsNonNumericKeyID(t *testing.T) {
+	t.Parallel()
 	path := sidecarPath(t)
 	raw := []byte(`{
         "version": 1,
@@ -393,6 +410,7 @@ func TestReadSidecar_RejectsNonNumericKeyID(t *testing.T) {
 }
 
 func TestReadSidecar_RejectsKeyIDOverflowingUint32(t *testing.T) {
+	t.Parallel()
 	path := sidecarPath(t)
 	// 4294967296 == math.MaxUint32 + 1
 	raw := []byte(`{
@@ -419,6 +437,7 @@ func TestReadSidecar_RejectsKeyIDOverflowingUint32(t *testing.T) {
 // dir refuse the rename via a removed dir), no orphaned tmp file is
 // left behind.
 func TestWriteSidecar_PartialWriteCleanup(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, encryption.SidecarFilename)
 	// Pre-create path as a directory so os.Rename fails with EEXIST/EISDIR.
@@ -441,6 +460,7 @@ func TestWriteSidecar_PartialWriteCleanup(t *testing.T) {
 // a sidecar pointing Active.Storage at a key_id that does not appear
 // in the Keys map is malformed input and must not land on disk.
 func TestWriteSidecar_RejectsActiveKeyMissing(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name string
 		mut  func(*encryption.Sidecar)
@@ -472,6 +492,7 @@ func TestWriteSidecar_RejectsActiveKeyMissing(t *testing.T) {
 }
 
 func TestReadSidecar_RejectsActiveKeyMissing(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name string
 		// active is the JSON object dropped in for "active".
@@ -510,6 +531,7 @@ func TestReadSidecar_RejectsActiveKeyMissing(t *testing.T) {
 // WriteSidecar (in-memory validation) and ReadSidecar (post-unmarshal
 // validation) must reject the mismatch with ErrSidecarActivePurposeMismatch.
 func TestSidecar_RejectsActivePurposeMismatch(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name string
 		mut  func(*encryption.Sidecar)
@@ -577,6 +599,7 @@ func TestSidecar_RejectsActivePurposeMismatch(t *testing.T) {
 // matching threat model (multi-user shared filesystems with unix
 // mode bits as the access boundary).
 func TestWriteSidecar_StaleTmpDoesNotLeakPermissiveMode(t *testing.T) {
+	t.Parallel()
 	if runtime.GOOS == "windows" {
 		t.Skip("unix mode bits are not preserved by os.Chmod on Windows; threat model does not apply")
 	}
@@ -637,6 +660,7 @@ func TestWriteSidecar_StaleTmpDoesNotLeakPermissiveMode(t *testing.T) {
 // suite would be nondeterministic across CI setups (codex P2 on PR
 // #722 round-3).
 func TestWriteSidecar_StaleTmpFileIsCleanedOnWriteFailure(t *testing.T) {
+	t.Parallel()
 	if runtime.GOOS == "windows" {
 		t.Skip("dir permission bits don't gate file creation on Windows")
 	}
@@ -662,6 +686,7 @@ func TestWriteSidecar_StaleTmpFileIsCleanedOnWriteFailure(t *testing.T) {
 }
 
 func TestSidecarPurpose_Constants(t *testing.T) {
+	t.Parallel()
 	// Pin the wire format constants so a future refactor can't silently
 	// rename the JSON-visible strings.
 	if encryption.SidecarPurposeStorage != "storage" {

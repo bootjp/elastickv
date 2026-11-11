@@ -94,14 +94,10 @@ func (s *ShardStore) checkPrepareEvidenceMember(ctx context.Context, groupID uin
 	if group == nil || address == "" {
 		return errors.WithStack(ErrTSOProtocolUnsupported)
 	}
-	conn, err := s.connCache.ConnFor(address)
-	if err != nil {
-		return errors.Wrap(err, "prepare evidence capability connection")
-	}
 	probeCtx, cancel := context.WithTimeout(ctx, verifyLeaderTimeout)
 	defer cancel()
 	probeCtx = prepareEvidencePeerContext(probeCtx, group)
-	response, err := pb.NewInternalClient(conn).GetPrepareEvidenceState(probeCtx, &pb.PrepareEvidenceStateRequest{CapabilityOnly: true})
+	response, err := s.remoteStartupPrepareState(probeCtx, groupID, address, &pb.PrepareEvidenceStateRequest{CapabilityOnly: true})
 	if err != nil {
 		return errors.Wrapf(ErrTSOProtocolUnsupported, "group %d member %s lacks prepare evidence protocol: %v", groupID, address, err)
 	}
@@ -172,8 +168,9 @@ func (s *ShardStore) proposePrepareEvidenceGroups(ctx context.Context, command [
 	}
 	for _, id := range ids {
 		group := s.groups[id]
-		proposer := NewLeaderAdminProposer(group.Engine, group.Proposer(), &s.connCache, WithLeaderAdminToken(group.forwardedLeaderReadToken()))
-		result, err := proposer.ProposeAdmin(ctx, command)
+		proposer := NewLeaderAdminProposer(group.Engine, group.Proposer(), &s.connCache,
+			WithLeaderAdminToken(group.forwardedLeaderReadToken()), WithLeaderAdminStartupControlRPC(id, s.startupControlRPC))
+		result, err := s.proposePhaseDControl(ctx, id, proposer, command)
 		if err != nil {
 			return errors.Wrapf(err, "prepare evidence control group %d", id)
 		}
@@ -201,11 +198,7 @@ func (s *ShardStore) inspectPrepareEvidenceGroup(ctx context.Context, id, floor 
 	if address == "" {
 		return errors.WithStack(ErrLeaderNotFound)
 	}
-	conn, err := s.connCache.ConnFor(address)
-	if err != nil {
-		return err
-	}
-	response, err := pb.NewInternalClient(conn).GetPrepareEvidenceState(prepareEvidencePeerContext(ctx, group), &pb.PrepareEvidenceStateRequest{Floor: floor})
+	response, err := s.remoteStartupPrepareState(prepareEvidencePeerContext(ctx, group), id, address, &pb.PrepareEvidenceStateRequest{Floor: floor})
 	return prepareEvidenceDrainResult(id, response.GetProofEnabled(), response.GetUnprovenLocks(), response.GetFenceFloor(), floor, err)
 }
 

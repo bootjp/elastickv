@@ -9,93 +9,361 @@
   "links": [],
   "panels": [
     {
-      "datasource": {"type": "prometheus", "uid": "prometheus"},
-      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
-      "gridPos": {"h": 8, "w": 6, "x": 0, "y": 0},
+      "datasource": "$datasource",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 0,
+        "y": 0
+      },
       "id": 1,
-      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "wideLayout": true
+      },
       "targets": [
-        {"editorMode": "code", "expr": "max(elastickv_fs_file_move_inflight)", "legendFormat": "durable", "range": true, "refId": "A"},
-        {"editorMode": "code", "expr": "sum(elastickv_fs_file_move_active_local)", "legendFormat": "running on nodes", "range": true, "refId": "B"}
+        {
+          "editorMode": "code",
+          "expr": "max(elastickv_fs_file_move_inflight{job=~\"$job\",cluster=~\"$cluster\"})",
+          "legendFormat": "durable",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "editorMode": "code",
+          "expr": "sum(elastickv_fs_file_move_active_local{job=~\"$job\",cluster=~\"$cluster\"})",
+          "legendFormat": "running on nodes",
+          "range": true,
+          "refId": "B"
+        }
       ],
       "title": "Moves In Flight",
       "type": "stat"
     },
     {
-      "datasource": {"type": "prometheus", "uid": "prometheus"},
-      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
-      "gridPos": {"h": 8, "w": 6, "x": 6, "y": 0},
+      "datasource": "$datasource",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 6,
+        "y": 0
+      },
       "id": 2,
-      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
-      "targets": [{"editorMode": "code", "expr": "max(elastickv_fs_file_multi_shard_current)", "legendFormat": "files", "range": true, "refId": "A"}],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "max(elastickv_fs_file_multi_shard_current{job=~\"$job\",cluster=~\"$cluster\"})",
+          "legendFormat": "files",
+          "range": true,
+          "refId": "A"
+        }
+      ],
       "title": "Multi-Shard Files",
       "type": "stat"
     },
     {
-      "datasource": {"type": "prometheus", "uid": "prometheus"},
-      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
-      "gridPos": {"h": 8, "w": 6, "x": 12, "y": 0},
+      "datasource": "$datasource",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
+        "y": 0
+      },
       "id": 3,
-      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
-      "targets": [{"editorMode": "code", "expr": "max(elastickv_fs_open_handle_lease_active)", "legendFormat": "leases", "range": true, "refId": "A"}],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "max(elastickv_fs_open_handle_lease_active{job=~\"$job\",cluster=~\"$cluster\"})",
+          "legendFormat": "leases",
+          "range": true,
+          "refId": "A"
+        }
+      ],
       "title": "Open Handle Leases",
       "type": "stat"
     },
     {
-      "datasource": {"type": "prometheus", "uid": "prometheus"},
-      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
-      "gridPos": {"h": 8, "w": 6, "x": 18, "y": 0},
+      "datasource": "$datasource",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 0
+      },
       "id": 4,
-      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
-      "targets": [{"editorMode": "code", "expr": "max(elastickv_fs_orphan_inode_gc_pending)", "legendFormat": "orphans", "range": true, "refId": "A"}],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "max(elastickv_fs_orphan_inode_gc_pending{job=~\"$job\",cluster=~\"$cluster\"})",
+          "legendFormat": "orphans",
+          "range": true,
+          "refId": "A"
+        }
+      ],
       "title": "Orphan GC Pending",
       "type": "stat"
     },
     {
-      "datasource": {"type": "prometheus", "uid": "prometheus"},
-      "fieldConfig": {"defaults": {"unit": "ops"}, "overrides": []},
-      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 8},
+      "datasource": "$datasource",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
       "id": 5,
-      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
       "targets": [
-        {"editorMode": "code", "expr": "sum(rate(elastickv_fs_chunk_read_ops_total[5m]))", "legendFormat": "read", "range": true, "refId": "A"},
-        {"editorMode": "code", "expr": "sum(rate(elastickv_fs_chunk_write_ops_total[5m]))", "legendFormat": "write", "range": true, "refId": "B"}
+        {
+          "editorMode": "code",
+          "expr": "sum(rate(elastickv_fs_chunk_read_ops_total{job=~\"$job\",cluster=~\"$cluster\"}[5m]))",
+          "legendFormat": "read",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "editorMode": "code",
+          "expr": "sum(rate(elastickv_fs_chunk_write_ops_total{job=~\"$job\",cluster=~\"$cluster\"}[5m]))",
+          "legendFormat": "write",
+          "range": true,
+          "refId": "B"
+        }
       ],
       "title": "Filesystem Operations",
       "type": "timeseries"
     },
     {
-      "datasource": {"type": "prometheus", "uid": "prometheus"},
-      "fieldConfig": {"defaults": {"unit": "ms"}, "overrides": []},
-      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 8},
+      "datasource": "$datasource",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
       "id": 6,
-      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
       "targets": [
-        {"editorMode": "code", "expr": "histogram_quantile(0.99, sum by (le) (rate(elastickv_fs_chunk_read_latency_ms_bucket[5m])))", "legendFormat": "read p99", "range": true, "refId": "A"},
-        {"editorMode": "code", "expr": "histogram_quantile(0.99, sum by (le) (rate(elastickv_fs_chunk_write_latency_ms_bucket[5m])))", "legendFormat": "write p99", "range": true, "refId": "B"}
+        {
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(elastickv_fs_chunk_read_latency_ms_bucket{job=~\"$job\",cluster=~\"$cluster\"}[5m])))",
+          "legendFormat": "read p99",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(elastickv_fs_chunk_write_latency_ms_bucket{job=~\"$job\",cluster=~\"$cluster\"}[5m])))",
+          "legendFormat": "write p99",
+          "range": true,
+          "refId": "B"
+        }
       ],
       "title": "Chunk Latency",
       "type": "timeseries"
     },
     {
-      "datasource": {"type": "prometheus", "uid": "prometheus"},
-      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
-      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 17},
+      "datasource": "$datasource",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 17
+      },
       "id": 7,
-      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
-      "targets": [{"editorMode": "code", "expr": "max by (group_id) (elastickv_fs_files_by_group)", "legendFormat": "group {{group_id}}", "range": true, "refId": "A"}],
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "max by (group_id) (elastickv_fs_files_by_group{job=~\"$job\",cluster=~\"$cluster\"})",
+          "legendFormat": "group {{group_id}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
       "title": "Files by Group",
       "type": "timeseries"
     },
     {
-      "datasource": {"type": "prometheus", "uid": "prometheus"},
-      "fieldConfig": {"defaults": {"unit": "ops"}, "overrides": []},
-      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 17},
+      "datasource": "$datasource",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 17
+      },
       "id": 8,
-      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
       "targets": [
-        {"editorMode": "code", "expr": "sum(rate(elastickv_fs_home_epoch_conflict_total[5m]))", "legendFormat": "epoch conflicts", "range": true, "refId": "A"},
-        {"editorMode": "code", "expr": "sum(rate(elastickv_fs_file_pinned_hotspot_total[5m]))", "legendFormat": "pinned splits", "range": true, "refId": "B"}
+        {
+          "editorMode": "code",
+          "expr": "sum(rate(elastickv_fs_home_epoch_conflict_total{job=~\"$job\",cluster=~\"$cluster\"}[5m]))",
+          "legendFormat": "epoch conflicts",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "editorMode": "code",
+          "expr": "sum(rate(elastickv_fs_file_pinned_hotspot_total{job=~\"$job\",cluster=~\"$cluster\"}[5m]))",
+          "legendFormat": "pinned splits",
+          "range": true,
+          "refId": "B"
+        }
       ],
       "title": "Placement Guardrails",
       "type": "timeseries"
@@ -103,9 +371,69 @@
   ],
   "refresh": "10s",
   "schemaVersion": 41,
-  "tags": ["elastickv", "filesystem"],
-  "templating": {"list": []},
-  "time": {"from": "now-1h", "to": "now"},
+  "tags": [
+    "elastickv",
+    "filesystem"
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "refresh": 1,
+        "current": {},
+        "options": []
+      },
+      {
+        "name": "job",
+        "label": "Job",
+        "type": "query",
+        "datasource": "$datasource",
+        "query": {
+          "query": "label_values({__name__=~\"elastickv_.+\"}, job)",
+          "refId": "variable-job"
+        },
+        "definition": "label_values({__name__=~\"elastickv_.+\"}, job)",
+        "refresh": 2,
+        "sort": 1,
+        "multi": false,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "options": []
+      },
+      {
+        "name": "cluster",
+        "label": "Cluster",
+        "type": "query",
+        "datasource": "$datasource",
+        "query": {
+          "query": "label_values({__name__=~\"elastickv_.+\",job=~\"$job\"}, cluster)",
+          "refId": "variable-cluster"
+        },
+        "definition": "label_values({__name__=~\"elastickv_.+\",job=~\"$job\"}, cluster)",
+        "refresh": 2,
+        "sort": 1,
+        "multi": false,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "options": []
+      }
+    ]
+  },
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
   "timepicker": {},
   "timezone": "browser",
   "title": "Elastickv Filesystem",

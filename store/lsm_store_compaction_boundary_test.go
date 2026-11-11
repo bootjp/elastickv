@@ -11,6 +11,7 @@ import (
 )
 
 func TestPebbleStore_Compact_RetentionBoundary(t *testing.T) {
+	t.Parallel()
 	for _, minTS := range []uint64{1, 25, math.MaxUint64 - 1} {
 		t.Run(fmt.Sprint(minTS), func(t *testing.T) {
 			s, err := NewPebbleStore(t.TempDir())

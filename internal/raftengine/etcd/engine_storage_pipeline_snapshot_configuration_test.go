@@ -61,7 +61,7 @@ func testPipelineCapturedPrefixConfiguration(t *testing.T, v2 bool) {
 	e := c.nodes[0].engine
 	require.NoError(t, e.Close())
 	fsm := &testStateMachine{}
-	selected, err := loadWalState(zap.NewNop(), filepath.Join(e.dataDir, walDirName), filepath.Join(e.dataDir, snapDirName), e.fsmSnapDir, fsm, nil)
+	selected, err := loadWalState(zap.NewNop(), filepath.Join(e.dataDir, walDirName), filepath.Join(e.dataDir, snapDirName), e.fsmSnapDir, fsm)
 	require.NoError(t, err)
 	require.GreaterOrEqual(t, selected.LocalSnap.GetMetadata().GetIndex(), newIndex)
 	require.Equal(t, []uint64{4}, selected.LocalSnap.GetMetadata().GetConfState().GetLearners())

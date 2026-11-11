@@ -43,6 +43,7 @@ func postJSON(t *testing.T, body any) *http.Request {
 }
 
 func TestLogin_HappyPathFull(t *testing.T) {
+	t.Parallel()
 	svc, verifier := newAuthServiceForTest(t)
 	req := postJSON(t, loginRequest{AccessKey: "AKIA_ADMIN", SecretKey: "ADMIN_SECRET"})
 	rec := httptest.NewRecorder()
@@ -87,6 +88,7 @@ func TestLogin_HappyPathFull(t *testing.T) {
 }
 
 func TestLogin_ReadOnlyMappedToRoleReadOnly(t *testing.T) {
+	t.Parallel()
 	svc, verifier := newAuthServiceForTest(t)
 	req := postJSON(t, loginRequest{AccessKey: "AKIA_RO", SecretKey: "RO_SECRET"})
 	rec := httptest.NewRecorder()
@@ -106,6 +108,7 @@ func TestLogin_ReadOnlyMappedToRoleReadOnly(t *testing.T) {
 }
 
 func TestLogin_WrongSecretRejected(t *testing.T) {
+	t.Parallel()
 	svc, _ := newAuthServiceForTest(t)
 	req := postJSON(t, loginRequest{AccessKey: "AKIA_ADMIN", SecretKey: "WRONG"})
 	rec := httptest.NewRecorder()
@@ -117,6 +120,7 @@ func TestLogin_WrongSecretRejected(t *testing.T) {
 }
 
 func TestLogin_UnknownAccessKeyRejected(t *testing.T) {
+	t.Parallel()
 	svc, _ := newAuthServiceForTest(t)
 	req := postJSON(t, loginRequest{AccessKey: "AKIA_NOBODY", SecretKey: "anything"})
 	rec := httptest.NewRecorder()
@@ -126,6 +130,7 @@ func TestLogin_UnknownAccessKeyRejected(t *testing.T) {
 }
 
 func TestLogin_CredentialValidButNotAdminRejected(t *testing.T) {
+	t.Parallel()
 	svc, _ := newAuthServiceForTest(t)
 	// AKIA_OTHER is in creds but not in the role index.
 	req := postJSON(t, loginRequest{AccessKey: "AKIA_OTHER", SecretKey: "OTHER_SECRET"})
@@ -136,6 +141,7 @@ func TestLogin_CredentialValidButNotAdminRejected(t *testing.T) {
 }
 
 func TestLogin_MissingFields(t *testing.T) {
+	t.Parallel()
 	svc, _ := newAuthServiceForTest(t)
 	for _, body := range []loginRequest{
 		{AccessKey: "", SecretKey: "x"},
@@ -150,6 +156,7 @@ func TestLogin_MissingFields(t *testing.T) {
 }
 
 func TestLogin_RequiresJSON(t *testing.T) {
+	t.Parallel()
 	svc, _ := newAuthServiceForTest(t)
 	req := httptest.NewRequest(http.MethodPost, "/admin/api/v1/auth/login",
 		strings.NewReader("access_key=x&secret_key=y"))
@@ -161,6 +168,7 @@ func TestLogin_RequiresJSON(t *testing.T) {
 }
 
 func TestLogin_OnlyPOST(t *testing.T) {
+	t.Parallel()
 	svc, _ := newAuthServiceForTest(t)
 	req := httptest.NewRequest(http.MethodGet, "/admin/api/v1/auth/login", nil)
 	req.RemoteAddr = "127.0.0.1:1"
@@ -170,6 +178,7 @@ func TestLogin_OnlyPOST(t *testing.T) {
 }
 
 func TestLogin_RateLimitPerIP(t *testing.T) {
+	t.Parallel()
 	svc, _ := newAuthServiceForTest(t)
 	// Configure is already default 5/min.
 	for i := 0; i < 5; i++ {
@@ -187,6 +196,7 @@ func TestLogin_RateLimitPerIP(t *testing.T) {
 }
 
 func TestLogin_RateLimitIsPerIPNotGlobal(t *testing.T) {
+	t.Parallel()
 	svc, _ := newAuthServiceForTest(t)
 	for i := 0; i < 5; i++ {
 		req := postJSON(t, loginRequest{AccessKey: "AKIA_ADMIN", SecretKey: "WRONG"})
@@ -203,6 +213,7 @@ func TestLogin_RateLimitIsPerIPNotGlobal(t *testing.T) {
 }
 
 func TestLogin_InsecureCookieOptIn(t *testing.T) {
+	t.Parallel()
 	clk := fixedClock(time.Unix(1_700_000_000, 0).UTC())
 	signer := newSignerForTest(t, 1, clk)
 	creds := MapCredentialStore{"AKIA_ADMIN": "ADMIN_SECRET"}
@@ -219,6 +230,7 @@ func TestLogin_InsecureCookieOptIn(t *testing.T) {
 }
 
 func TestLogout_ExpiresBothCookies(t *testing.T) {
+	t.Parallel()
 	svc, _ := newAuthServiceForTest(t)
 	req := httptest.NewRequest(http.MethodPost, "/admin/api/v1/auth/logout", nil)
 	req.RemoteAddr = "127.0.0.1:1"
@@ -236,6 +248,7 @@ func TestLogout_ExpiresBothCookies(t *testing.T) {
 }
 
 func TestLogout_OnlyPOST(t *testing.T) {
+	t.Parallel()
 	svc, _ := newAuthServiceForTest(t)
 	req := httptest.NewRequest(http.MethodGet, "/admin/api/v1/auth/logout", nil)
 	req.RemoteAddr = "127.0.0.1:1"
@@ -245,6 +258,7 @@ func TestLogout_OnlyPOST(t *testing.T) {
 }
 
 func TestRateLimiter_ResetsAfterWindow(t *testing.T) {
+	t.Parallel()
 	now := time.Unix(1_700_000_000, 0).UTC()
 	clk := func() time.Time { return now }
 	rl := newRateLimiter(2, time.Minute, clk)
@@ -258,6 +272,7 @@ func TestRateLimiter_ResetsAfterWindow(t *testing.T) {
 }
 
 func TestClientIP(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		remote string
 		want   string

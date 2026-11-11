@@ -291,6 +291,7 @@ func (f *fifoProgressFixture) requireHeadDelivered(t *testing.T, message map[str
 }
 
 func TestSQSReceiveFIFOProgressAcrossExpiredPageBudget(t *testing.T) {
+	t.Parallel()
 	for _, partitions := range []uint32{1, 4} {
 		for _, count := range []int{4, 33} {
 			for _, headFirst := range []bool{true, false} {
@@ -303,6 +304,7 @@ func TestSQSReceiveFIFOProgressAcrossExpiredPageBudget(t *testing.T) {
 }
 
 func TestSQSReceiveFIFOProgressWithDelayedWorkerStart(t *testing.T) {
+	t.Parallel()
 	f := newFIFOProgressFixture(t, 1, 33, false)
 	start, joined := make(chan struct{}), make(chan struct{})
 	go func() {

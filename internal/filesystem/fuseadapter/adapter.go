@@ -78,6 +78,7 @@ type Adapter struct {
 	replyMu           sync.Mutex
 	replyIDs          map[uint64][]filesystem.OperationID
 	ackPending        map[filesystem.OperationID]struct{}
+	unknownOperations map[filesystem.OperationID][]uint64
 	ackCursor         uint64
 	ackWake           chan struct{}
 	ackCancel         context.CancelFunc
@@ -352,6 +353,7 @@ func (a *Adapter) SetAttr(
 		}
 		id := a.nextOperationID(ctx)
 		stat, err = setter.SetAttrWithOperation(ctx, id, inode, mask, attrs)
+		a.noteUnknownOperation(id, err, inode)
 		if err == nil {
 			a.recordReceipt(inode, id)
 		}
@@ -366,6 +368,33 @@ func (a *Adapter) nextOperationID(ctx context.Context) filesystem.OperationID {
 		Sequence: a.operationSequence.Add(1)}
 	a.recordReplyIdentity(ctx, id)
 	return id
+}
+
+// noteUnknownOperation binds an uncertain mutation to the inode barriers it
+// entered. A successful journal ACK is the only event that can discharge it.
+func (a *Adapter) noteUnknownOperation(id filesystem.OperationID, err error, keys ...uint64) {
+	if !errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+		return
+	}
+	a.replyMu.Lock()
+	if a.unknownOperations == nil {
+		a.unknownOperations = make(map[filesystem.OperationID][]uint64)
+	}
+	unique := make([]uint64, 0, len(keys))
+	for _, key := range keys {
+		seen := false
+		for _, prior := range unique {
+			if prior == key {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			unique = append(unique, key)
+		}
+	}
+	a.unknownOperations[id] = unique
+	a.replyMu.Unlock()
 }
 
 func (a *Adapter) Open(ctx context.Context, inode uint64) (uint64, syscall.Errno) {
@@ -403,6 +432,7 @@ func (a *Adapter) openWithOperation(ctx context.Context, inode uint64) (uint64, 
 	if err == nil {
 		a.recordReceipt(inode, id)
 	}
+	a.noteUnknownOperation(id, err, inode)
 	if err != nil && Errno(err) == syscall.EIO {
 		slog.WarnContext(ctx, "filesystem FUSE open failed", "inode", inode, "error", err.Error())
 	}
@@ -450,6 +480,7 @@ func (a *Adapter) writeWithOperation(ctx context.Context, inode, offset uint64, 
 	}
 	id := a.nextOperationID(ctx)
 	n, err := writer.WriteWithOperation(ctx, id, inode, offset, data)
+	a.noteUnknownOperation(id, err, inode)
 	if err == nil {
 		a.recordReceipt(inode, id)
 	}
@@ -519,6 +550,7 @@ func (a *Adapter) Release(ctx context.Context, inode uint64, fh uint64) syscall.
 		}
 		id := a.nextOperationID(ctx)
 		err = releaser.ReleaseWithOperation(ctx, id, inode, fh, a.clientID)
+		a.noteUnknownOperation(id, err, inode)
 		if err == nil {
 			a.recordReceipt(inode, id)
 		}
@@ -553,6 +585,7 @@ func (a *Adapter) Create(
 		}
 		id := a.nextOperationID(ctx)
 		result, err = creator.CreateWithOperation(ctx, id, parent, name, opts)
+		a.noteUnknownOperation(id, err, parent)
 		if err == nil {
 			a.recordReceipt(parent, id)
 			a.recordReceipt(result.Inode, id)
@@ -588,6 +621,7 @@ func (a *Adapter) Mknod(
 		}
 		id := a.nextOperationID(ctx)
 		result, err = creator.CreateWithOperation(ctx, id, parent, name, opts)
+		a.noteUnknownOperation(id, err, parent)
 		if err == nil {
 			a.recordReceipt(parent, id)
 			a.recordReceipt(result.Inode, id)
@@ -619,6 +653,7 @@ func (a *Adapter) Mkdir(
 		}
 		id := a.nextOperationID(ctx)
 		result, err = creator.MkdirWithOperation(ctx, id, parent, name, opts)
+		a.noteUnknownOperation(id, err, parent)
 		if err == nil {
 			a.recordReceipt(parent, id)
 		}
@@ -689,6 +724,7 @@ func (a *Adapter) removeWithOperation(
 	}
 	id := a.nextOperationID(ctx)
 	err := remove(ctx, id, parent, name)
+	a.noteUnknownOperation(id, err, parent)
 	if err == nil {
 		a.recordReceipt(parent, id)
 	}
@@ -717,6 +753,7 @@ func (a *Adapter) Rename(
 		}
 		id := a.nextOperationID(ctx)
 		err = renamer.RenameWithOperation(ctx, id, oldParent, oldName, newParent, newName)
+		a.noteUnknownOperation(id, err, oldParent, newParent)
 		if err == nil {
 			a.recordReceipt(oldParent, id)
 		}
@@ -740,17 +777,25 @@ func (a *Adapter) refreshOpenHandleLease(ctx context.Context, inode uint64, fh u
 	if !a.journaledLease {
 		return a.refreshLegacyLease(ctx, inode, fh)
 	}
-	var err error
+	var ticket *mutationTicket
 	if !alreadyTracked {
-		ticket, errno := a.mutations.begin(ctx, inode)
+		var errno syscall.Errno
+		ticket, errno = a.mutations.begin(ctx, inode)
 		if errno != 0 {
 			return errno
 		}
-		defer func() { a.mutations.end(ticket, errors.Is(err, kv.ErrTransactionOutcomeUnknown)) }()
 	}
-	err = a.refreshJournaledLease(ctx, inode, fh)
+	id, err := a.refreshJournaledLease(ctx, inode, fh)
 	if alreadyTracked && errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
 		a.mutations.markUnknown(inode)
+	}
+	if ticket != nil {
+		a.mutations.end(ticket, errors.Is(err, kv.ErrTransactionOutcomeUnknown))
+	}
+	// Background keepalives have no kernel reply. Queue their ACK only after
+	// the local unknown barrier has been recorded.
+	if ctx.Value(backgroundOperationKey{}) == true && id != (filesystem.OperationID{}) {
+		a.queueAcknowledgement(id)
 	}
 	if err != nil && Errno(err) == syscall.EIO {
 		slog.WarnContext(ctx, "filesystem FUSE lease refresh failed", "inode", inode, "fh", fh, "error", err.Error())
@@ -758,35 +803,30 @@ func (a *Adapter) refreshOpenHandleLease(ctx context.Context, inode uint64, fh u
 	return Errno(err)
 }
 
-func (a *Adapter) refreshJournaledLease(ctx context.Context, inode uint64, fh uint64) error {
+func (a *Adapter) refreshJournaledLease(ctx context.Context, inode uint64, fh uint64) (filesystem.OperationID, error) {
 	if verifier, recent := a.recentLeaseVerifier(inode, fh); recent {
-		return errors.Wrap(verifier.ValidateOpenHandleLease(ctx, inode, fh, a.clientID), "validate open handle lease")
+		return filesystem.OperationID{}, errors.Wrap(verifier.ValidateOpenHandleLease(ctx, inode, fh, a.clientID), "validate open handle lease")
 	}
 	a.leaseRenewalMu.Lock()
 	defer a.leaseRenewalMu.Unlock()
 	if verifier, recent := a.recentLeaseVerifier(inode, fh); recent {
-		return errors.Wrap(verifier.ValidateOpenHandleLease(ctx, inode, fh, a.clientID), "validate open handle lease")
+		return filesystem.OperationID{}, errors.Wrap(verifier.ValidateOpenHandleLease(ctx, inode, fh, a.clientID), "validate open handle lease")
 	}
 	refresher, ok := a.core.(interface {
 		RefreshOpenHandleLeaseWithOperation(context.Context, filesystem.OperationID, uint64, uint64, []byte) error
 	})
 	if !ok || a.sessionConflict || a.operationSession.Filesystem == [16]byte{} || a.operationSession.Session == [16]byte{} {
-		return filesystem.ErrUnsupported
+		return filesystem.OperationID{}, filesystem.ErrUnsupported
 	}
 	id := a.nextOperationID(ctx)
 	err := refresher.RefreshOpenHandleLeaseWithOperation(ctx, id, inode, fh, a.clientID)
+	a.noteUnknownOperation(id, err, inode)
 	if err == nil {
 		a.recordReceipt(inode, id)
 		a.retainLatestLeaseReceipt(ctx, inode, fh, id)
 		a.markLeaseRefreshed(inode, fh)
 	}
-	// Keepalive renewals have no kernel reply. Completion of the call is their
-	// acknowledgement boundary; the worker resolves uncertain outcomes under
-	// the journal's admission and publication fences before retirement.
-	if ctx.Value(backgroundOperationKey{}) == true {
-		a.queueAcknowledgement(id)
-	}
-	return errors.Wrap(err, "refresh journaled open handle lease")
+	return id, errors.Wrap(err, "refresh journaled open handle lease")
 }
 
 type leaseReadVerifier interface {

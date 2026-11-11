@@ -98,6 +98,7 @@ func newNamespaceGateFixture(t *testing.T, active bool) (*migrationNamespaceMemb
 }
 
 func TestMigrationNamespaceMembershipRegistersBeforeAddAndProbesEveryMember(t *testing.T) {
+	t.Parallel()
 	gate, engine, next, _, probes := newNamespaceGateFixture(t, true)
 	next.check = func() {
 		value, err := engine.store.GetAt(t.Context(), store.MigrationConfigurationIndexKey(), ^uint64(0))
@@ -114,6 +115,7 @@ func TestMigrationNamespaceMembershipRegistersBeforeAddAndProbesEveryMember(t *t
 }
 
 func TestMigrationNamespaceMembershipRejectsOldCandidateAndOldLearnerBeforeProposal(t *testing.T) {
+	t.Parallel()
 	for _, old := range []string{"candidate:7001", "learner:7001"} {
 		gate, engine, next, versions, _ := newNamespaceGateFixture(t, true)
 		versions[old] = 0
@@ -125,6 +127,7 @@ func TestMigrationNamespaceMembershipRejectsOldCandidateAndOldLearnerBeforePropo
 }
 
 func TestMigrationNamespaceMembershipPreservesInactiveAndRechecksPromotion(t *testing.T) {
+	t.Parallel()
 	gate, _, next, _, probes := newNamespaceGateFixture(t, false)
 	require.NoError(t, gate.PreAddMember(t.Context(), "candidate", "candidate:7001"))
 	require.Empty(t, probes)
@@ -140,6 +143,7 @@ func TestMigrationNamespaceMembershipPreservesInactiveAndRechecksPromotion(t *te
 type namespaceHiddenFSM struct{ raftengine.StateMachine }
 
 func TestMigrationNamespaceProductionFSMInstalledWithEncryptionOptions(t *testing.T) {
+	t.Parallel()
 	for _, encrypted := range []bool{false, true} {
 		wiring := encryptionWriteWiring{}
 		if encrypted {

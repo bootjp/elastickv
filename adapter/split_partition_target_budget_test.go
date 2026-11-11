@@ -14,6 +14,7 @@ import (
 )
 
 func TestSplitWorkingSourceRejectsHistoricalTargetControlBudget(t *testing.T) {
+	t.Parallel()
 	r := newResplitAcceptanceRuntime(t)
 	r.migrate(t, 1, 2, "m")
 	r.migrate(t, r.ownership(t, 2)[0].RouteID, 3, "t")

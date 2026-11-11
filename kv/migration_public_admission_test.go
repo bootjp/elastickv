@@ -27,6 +27,7 @@ func (p *migrationAdmissionProposer) ProposeAdmin(ctx context.Context, data []by
 }
 
 func TestMigrationProposalQueueRevalidatesIndependentRequests(t *testing.T) {
+	t.Parallel()
 	f := newComposed1FSM(t, staleServingEngine(t, 1), 1)
 	p := &migrationAdmissionProposer{fsm: f}
 	tx := NewTransactionWithProposer(p, WithMigrationRequestAdmission(f.store, 1))
@@ -53,6 +54,7 @@ func TestMigrationProposalQueueRevalidatesIndependentRequests(t *testing.T) {
 }
 
 func TestMigrationProposalAdvisoryPreservesAuthenticatedResolution(t *testing.T) {
+	t.Parallel()
 	for _, phase := range []pb.Phase{pb.Phase_COMMIT, pb.Phase_ABORT} {
 		t.Run(phase.String(), func(t *testing.T) {
 			f := &kvFSM{store: store.NewMVCCStore(), shardGroupID: 1}
@@ -72,6 +74,7 @@ func TestMigrationProposalAdvisoryPreservesAuthenticatedResolution(t *testing.T)
 }
 
 func TestMigrationPublicReadsHonorNodeFloor(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	retireServingSource(t, st)
 	shards := NewShardStore(staleServingEngine(t, 9), map[uint64]*ShardGroup{1: {Store: st}})
@@ -106,6 +109,7 @@ func TestMigrationPublicReadsHonorNodeFloor(t *testing.T) {
 }
 
 func TestLegacyUnknownOwnershipBlocksOnlyItsRange(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	writer, ok := st.(store.MigrationTargetReadinessRaftWriter)
 	require.True(t, ok)

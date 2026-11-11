@@ -23,6 +23,7 @@ type recordingTransactional struct {
 	requests  []*pb.Request
 	responses []*TransactionResponse
 	errs      []error
+	nilAt     map[int]bool
 	onCommit  func(call int, req *pb.Request)
 }
 
@@ -144,6 +145,9 @@ func (s *recordingTransactional) Commit(_ context.Context, reqs []*pb.Request) (
 	}
 	if call < len(s.errs) && s.errs[call] != nil {
 		return nil, s.errs[call]
+	}
+	if s.nilAt[call] {
+		return nil, nil
 	}
 	if call < len(s.responses) && s.responses[call] != nil {
 		return s.responses[call], nil
@@ -850,6 +854,7 @@ func TestDispatchWithReadTimestampRevokesVoucherWhenOuterGateRejects(t *testing.
 }
 
 func TestReadTimestampVoucherBindingShadowsParentCapability(t *testing.T) {
+	t.Parallel()
 	prePhaseDErr := errors.Join(ErrTSOTimestampInvalid, ErrTSOTimestampPrePhaseD)
 	coord, _, _, alloc := newPhaseDCrossShardCoordinator(t, prePhaseDErr)
 

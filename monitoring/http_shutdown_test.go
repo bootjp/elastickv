@@ -55,6 +55,7 @@ func startStalledRequest(t *testing.T, addr string, started <-chan struct{}) <-c
 }
 
 func TestShutdownHTTPServerForcesCloseAfterTimeout(t *testing.T) {
+	// Not parallel: asserts the shutdown completes within a wall-clock window (150ms..3s) that CPU contention from peer tests can push out.
 	lis := listenLoopback(t)
 	started := make(chan struct{}, 1)
 	srv := &http.Server{Handler: stalledHandler(started), ReadHeaderTimeout: time.Second}
@@ -84,6 +85,7 @@ func TestShutdownHTTPServerForcesCloseAfterTimeout(t *testing.T) {
 }
 
 func TestShutdownHTTPServerReturnsPromptlyWhenIdle(t *testing.T) {
+	// Not parallel: asserts the idle shutdown returns within a 2s wall-clock budget that CPU contention from peer tests can exceed.
 	lis := listenLoopback(t)
 	srv := &http.Server{Handler: http.NotFoundHandler(), ReadHeaderTimeout: time.Second}
 	serveDone := make(chan error, 1)
@@ -97,6 +99,7 @@ func TestShutdownHTTPServerReturnsPromptlyWhenIdle(t *testing.T) {
 }
 
 func TestShutdownHTTPServerNilIsNoop(t *testing.T) {
+	t.Parallel()
 	require.NoError(t, ShutdownHTTPServer(context.Background(), nil, "nil", time.Second))
 }
 

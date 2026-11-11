@@ -307,6 +307,15 @@ type SnapshotReader interface {
 	SnapshotEvery() uint64
 }
 
+// ReadinessState describes lifecycle facts, not leadership or end-to-end API health.
+// Started is published only after initial snapshot restore and committed replay.
+type ReadinessState struct {
+	Started   bool
+	Restoring bool
+	Stopped   bool
+	Failed    bool
+}
+
 type HealthReader interface {
 	CheckServing(ctx context.Context) error
 }

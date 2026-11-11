@@ -39,6 +39,7 @@ func (c *crashReplayCoordinator) Dispatch(ctx context.Context, req *kv.Operation
 }
 
 func TestJournalCommittedAttemptDecisionSurvivesProcessKill(t *testing.T) {
+	t.Parallel()
 	if dir := os.Getenv(operationDecisionCrashDirectory); dir != "" {
 		runOperationDecisionCrashHelper(t, dir)
 		return
@@ -121,6 +122,7 @@ func runOperationDecisionCrashHelper(t *testing.T, dir string) {
 }
 
 func TestJournalGenerationFenceSurvivesProcessKill(t *testing.T) {
+	t.Parallel()
 	if dir := os.Getenv(operationFenceCrashDirectory); dir != "" {
 		runOperationFenceCrashHelper(t, dir)
 		return
@@ -192,6 +194,7 @@ func runOperationFenceCrashHelper(t *testing.T, dir string) {
 }
 
 func TestJournalReceiptsSurviveProcessKill(t *testing.T) {
+	t.Parallel()
 	if dir := os.Getenv(operationCrashDirectory); dir != "" {
 		runOperationCrashHelper(t, dir)
 		return

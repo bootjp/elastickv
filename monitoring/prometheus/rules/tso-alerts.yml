@@ -4,12 +4,12 @@ groups:
       - alert: ElasticKVTSOAllocationErrorRateHigh
         expr: |
           (
-            sum(rate(elastickv_tso_request_duration_seconds_count{operation="reserve",outcome="error"}[5m]))
+            sum by (job, cluster) (rate(elastickv_tso_request_duration_seconds_count{operation="reserve",outcome="error"}[5m]))
             /
-            clamp_min(sum(rate(elastickv_tso_request_duration_seconds_count{operation="reserve"}[5m])), 0.001)
+            clamp_min(sum by (job, cluster) (rate(elastickv_tso_request_duration_seconds_count{operation="reserve"}[5m])), 0.001)
           ) > 0.01
           and
-          sum(rate(elastickv_tso_request_duration_seconds_count{operation="reserve"}[5m])) > 0.1
+          sum by (job, cluster) (rate(elastickv_tso_request_duration_seconds_count{operation="reserve"}[5m])) > 0.1
         for: 10m
         labels:
           severity: warning
@@ -20,12 +20,12 @@ groups:
       - alert: ElasticKVTSOAllocationErrorRateCritical
         expr: |
           (
-            sum(rate(elastickv_tso_request_duration_seconds_count{operation="reserve",outcome="error"}[5m]))
+            sum by (job, cluster) (rate(elastickv_tso_request_duration_seconds_count{operation="reserve",outcome="error"}[5m]))
             /
-            clamp_min(sum(rate(elastickv_tso_request_duration_seconds_count{operation="reserve"}[5m])), 0.001)
+            clamp_min(sum by (job, cluster) (rate(elastickv_tso_request_duration_seconds_count{operation="reserve"}[5m])), 0.001)
           ) > 0.10
           and
-          sum(rate(elastickv_tso_request_duration_seconds_count{operation="reserve"}[5m])) > 0.1
+          sum by (job, cluster) (rate(elastickv_tso_request_duration_seconds_count{operation="reserve"}[5m])) > 0.1
         for: 5m
         labels:
           severity: critical
@@ -37,7 +37,7 @@ groups:
         expr: |
           histogram_quantile(
             0.99,
-            sum by (le) (
+            sum by (job, cluster, le) (
               rate(elastickv_tso_request_duration_seconds_bucket{operation="reserve",outcome="success"}[5m])
             )
           ) > 0.05
@@ -52,7 +52,7 @@ groups:
         expr: |
           histogram_quantile(
             0.99,
-            sum by (le) (
+            sum by (job, cluster, le) (
               rate(elastickv_tso_request_duration_seconds_bucket{operation="reserve",outcome="success"}[5m])
             )
           ) > 0.20
@@ -64,7 +64,7 @@ groups:
           description: Successful dedicated TSO reserve attempts have exceeded 200 ms p99 for 5 minutes.
 
       - alert: ElasticKVTSOShadowOverlapDetected
-        expr: sum(increase(elastickv_tso_shadow_comparisons_total{result="legacy_overlap"}[15m])) > 0
+        expr: sum by (job, cluster) (increase(elastickv_tso_shadow_comparisons_total{result="legacy_overlap"}[15m])) > 0
         for: 5m
         labels:
           severity: warning
@@ -73,7 +73,7 @@ groups:
           description: At least one shadow candidate was discarded in the last 15 minutes. Keep every node in shadow mode until this remains zero for a full 15-minute window.
 
       - alert: ElasticKVTSOModeReloadRejected
-        expr: sum(increase(elastickv_tso_mode_reload_total{result=~"rejected|parse_error|read_error"}[10m])) > 0
+        expr: sum by (job, cluster) (increase(elastickv_tso_mode_reload_total{result=~"rejected|parse_error|read_error"}[10m])) > 0
         for: 1m
         labels:
           severity: warning
@@ -82,7 +82,7 @@ groups:
           description: A node could not read or parse its mode file, or the requested transition violated the one-way phase order.
 
       - alert: ElasticKVTSOModeDivergence
-        expr: count(count by (mode) (elastickv_tso_mode == 1)) > 1
+        expr: count by (job, cluster) (count by (job, cluster, mode) (elastickv_tso_mode == 1)) > 1
         for: 15m
         labels:
           severity: warning
@@ -92,9 +92,9 @@ groups:
 
       - alert: ElasticKVTSOPhaseDWithoutCutover
         expr: |
-          max by (node_id, node_address) (elastickv_tso_durable_state{marker="phase_d"})
+          max by (job, cluster, node_id, node_address) (elastickv_tso_durable_state{marker="phase_d"})
           >
-          max by (node_id, node_address) (elastickv_tso_durable_state{marker="cutover"})
+          max by (job, cluster, node_id, node_address) (elastickv_tso_durable_state{marker="cutover"})
         for: 1m
         labels:
           severity: critical

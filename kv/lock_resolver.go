@@ -40,31 +40,39 @@ var errLockResolverBudgetExhausted = errors.New("lock resolver budget exhausted"
 // them. This handles the case where secondary commit fails and leaves orphaned
 // locks that no read path would discover (e.g., cold keys).
 type LockResolver struct {
-	store             *ShardStore
-	groups            map[uint64]*ShardGroup
-	log               *slog.Logger
-	mu                sync.Mutex
-	nextLockScanStart map[uint64][]byte
-	resolveBackoff    map[uint64]time.Time
-	cancel            context.CancelFunc
-	done              chan struct{}
+	operationAdmission OperationAdmission
+	rootContext        context.Context
+	store              *ShardStore
+	groups             map[uint64]*ShardGroup
+	log                *slog.Logger
+	mu                 sync.Mutex
+	nextLockScanStart  map[uint64][]byte
+	resolveBackoff     map[uint64]time.Time
+	cancel             context.CancelFunc
+	done               chan struct{}
 }
 
 // NewLockResolver creates and starts a background lock resolver.
-func NewLockResolver(ss *ShardStore, groups map[uint64]*ShardGroup, log *slog.Logger) *LockResolver {
+func NewLockResolver(ss *ShardStore, groups map[uint64]*ShardGroup, log *slog.Logger, opts ...LockResolverOption) *LockResolver {
 	if log == nil {
 		log = slog.Default()
 	}
-	ctx, cancel := context.WithCancel(context.Background())
 	lr := &LockResolver{
+		rootContext:       context.Background(),
 		store:             ss,
 		groups:            groups,
 		log:               log,
 		nextLockScanStart: make(map[uint64][]byte),
 		resolveBackoff:    make(map[uint64]time.Time),
-		cancel:            cancel,
 		done:              make(chan struct{}),
 	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(lr)
+		}
+	}
+	ctx, cancel := context.WithCancel(lr.rootContext)
+	lr.cancel = cancel
 	go lr.run(ctx)
 	return lr
 }
@@ -122,6 +130,13 @@ func (lr *LockResolver) resolveAllGroups(ctx context.Context) {
 }
 
 func (lr *LockResolver) resolveGroupLocks(ctx context.Context, gid uint64, g *ShardGroup) error {
+	_, err := admittedOperation(ctx, lr.operationAdmission, gid, AdmissionMaintenance, func(owned context.Context) (struct{}, error) {
+		return struct{}{}, lr.resolveAdmittedGroupLocks(owned, gid, g)
+	})
+	return err
+}
+
+func (lr *LockResolver) resolveAdmittedGroupLocks(ctx context.Context, gid uint64, g *ShardGroup) error {
 	if !lr.groupReadyForBackgroundResolve(ctx, gid, g) {
 		return nil
 	}
@@ -229,13 +244,18 @@ func (lr *LockResolver) resolveScannedLock(ctx context.Context, gid uint64, g *S
 
 	opCtx, cancel := context.WithTimeout(ctx, lockResolverOperationBudget)
 	defer cancel()
-	err = lr.resolveExpiredLock(opCtx, g, userKey, lock)
+	_, err = admittedOperation(opCtx, lr.operationAdmission, gid, AdmissionMaintenance, func(owned context.Context) (struct{}, error) {
+		return struct{}{}, lr.resolveExpiredLock(owned, g, userKey, lock)
+	})
 	if err == nil {
 		return lockResolveResolved, nil
 	}
 	if lockResolverBudgetExhausted(err, opCtx, ctx) {
 		marked := errors.Mark(err, errLockResolverBudgetExhausted)
 		return lockResolveIgnored, errors.Wrap(marked, "lock resolver budget exhausted")
+	}
+	if lr.operationAdmission != nil {
+		return lockResolveIgnored, err
 	}
 	lr.log.Warn("lock resolver: resolve failed",
 		slog.Uint64("gid", gid),
@@ -442,5 +462,21 @@ func (lr *LockResolver) backgroundPrimaryTxnStatus(ctx context.Context, lock txn
 	if !lr.primaryGroupReadyForBackgroundAbort(lock.PrimaryKey) {
 		return txnStatusPending, 0, nil
 	}
-	return lr.store.expiredPrimaryTxnStatus(ctx, lock.PrimaryKey, lock.StartTS)
+	return lr.expiredPrimaryTxnStatus(ctx, lock.PrimaryKey, lock.StartTS)
+}
+
+func (lr *LockResolver) expiredPrimaryTxnStatus(ctx context.Context, primaryKey []byte, startTS uint64) (txnStatus, uint64, error) {
+	if lr.operationAdmission == nil {
+		return lr.store.expiredPrimaryTxnStatus(ctx, primaryKey, startTS)
+	}
+	// The foreground helper deliberately hides failed best-effort aborts.
+	// An admitted attempt must report its original proposal/finish outcome.
+	aborted, err := lr.store.tryAbortExpiredPrimary(ctx, primaryKey, startTS)
+	if err != nil {
+		return txnStatusPending, 0, err
+	}
+	if aborted {
+		return txnStatusRolledBack, 0, nil
+	}
+	return txnStatusPending, 0, nil
 }

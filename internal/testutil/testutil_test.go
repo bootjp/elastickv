@@ -20,6 +20,7 @@ func (failingTB) Helper()                           {}
 func (failingTB) Fatalf(format string, args ...any) { panic(fmt.Sprintf(format, args...)) }
 
 func TestWaits(t *testing.T) {
+	t.Parallel()
 	ch := make(chan int, 1)
 	ch <- 42
 	require.Equal(t, 42, testutil.Recv(t, ch, time.Second, "message %s", "ready"))
@@ -29,6 +30,7 @@ func TestWaits(t *testing.T) {
 }
 
 func TestWaitFailures(t *testing.T) {
+	t.Parallel()
 	open := make(chan int)
 	closed := make(chan int)
 	close(closed)
@@ -70,6 +72,7 @@ func failureMessage(name string) string {
 }
 
 func TestListenCleanup(t *testing.T) {
+	t.Parallel()
 	var lis net.Listener
 	t.Run("owner", func(t *testing.T) {
 		lis = testutil.Listen(t)

@@ -14,6 +14,7 @@ import (
 )
 
 func TestApplyBackupUsesSharedTracker(t *testing.T) {
+	t.Parallel()
 	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
 	fsm := newBackupTestFSM(t, tracker)
 	pinID := backupTrackerTestPinID(1)
@@ -43,6 +44,7 @@ func TestApplyBackupUsesSharedTracker(t *testing.T) {
 }
 
 func TestApplyBackupWithoutTrackerHalts(t *testing.T) {
+	t.Parallel()
 	fsm, ok := NewKvFSMWithHLC(store.NewMVCCStore(), NewHLC()).(*kvFSM)
 	require.True(t, ok)
 
@@ -55,6 +57,7 @@ func TestApplyBackupWithoutTrackerHalts(t *testing.T) {
 }
 
 func TestApplyBackupUnknownSubtypeHalts(t *testing.T) {
+	t.Parallel()
 	fsm := newBackupTestFSM(t, NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0)))
 
 	err := haltApplyOf(fsm.Apply([]byte{raftEncodeBackup, 0xff}))
@@ -63,6 +66,7 @@ func TestApplyBackupUnknownSubtypeHalts(t *testing.T) {
 }
 
 func TestApplyBackupInvalidPinReturnsNonFatalError(t *testing.T) {
+	t.Parallel()
 	fsm := newBackupTestFSM(t, NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0)))
 
 	resp := fsm.Apply(EncodeBackupPinEntry(BackupPinEntry{
@@ -77,6 +81,7 @@ func TestApplyBackupInvalidPinReturnsNonFatalError(t *testing.T) {
 }
 
 func TestApplyBackupLimitDoesNotDropCommittedPins(t *testing.T) {
+	t.Parallel()
 	tracker := NewActiveTimestampTracker(
 		WithActiveTimestampTrackerSweepInterval(0),
 		WithActiveTimestampTrackerMaxBackupPins(1),
@@ -101,6 +106,7 @@ func TestApplyBackupLimitDoesNotDropCommittedPins(t *testing.T) {
 }
 
 func TestApplyBackupMissingExtendIsNoop(t *testing.T) {
+	t.Parallel()
 	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
 	fsm := newBackupTestFSM(t, tracker)
 
@@ -115,6 +121,7 @@ func TestApplyBackupMissingExtendIsNoop(t *testing.T) {
 }
 
 func TestApplyBackupExpiredExtendRestoresCommittedFence(t *testing.T) {
+	t.Parallel()
 	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
 	fsm := newBackupTestFSM(t, tracker)
 	pinID := backupTrackerTestPinID(1)
@@ -132,6 +139,7 @@ func TestApplyBackupExpiredExtendRestoresCommittedFence(t *testing.T) {
 }
 
 func TestApplyBackupObservesPinnedReadTimestamp(t *testing.T) {
+	t.Parallel()
 	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
 	hlc := NewHLC()
 	fsm, ok := NewKvFSMWithHLCAndTracker(
@@ -147,6 +155,7 @@ func TestApplyBackupObservesPinnedReadTimestamp(t *testing.T) {
 }
 
 func TestApplyBackupFencesPreallocatedWrites(t *testing.T) {
+	t.Parallel()
 	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
 	fsm := newBackupTestFSM(t, tracker)
 	readTS := uint64(100)
@@ -191,6 +200,7 @@ func TestApplyBackupFencesPreallocatedWrites(t *testing.T) {
 }
 
 func TestApplyBackupReserveDoesNotInstallTimestampFloor(t *testing.T) {
+	t.Parallel()
 	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
 	fsm := newBackupTestFSM(t, tracker)
 	readTS := uint64(100)
@@ -211,6 +221,7 @@ func TestApplyBackupReserveDoesNotInstallTimestampFloor(t *testing.T) {
 }
 
 func TestBackupTimestampFloorKeyRejectsRawMutation(t *testing.T) {
+	t.Parallel()
 	fsm := newBackupTestFSM(t, NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0)))
 	resp := applyBackupTestRequest(t, fsm, &pb.Request{Ts: 10, Mutations: []*pb.Mutation{{
 		Op: pb.Op_PUT, Key: bytes.Clone(backupTimestampFloorKey), Value: make([]byte, backupTimestampFloorValueSize),
@@ -221,6 +232,7 @@ func TestBackupTimestampFloorKeyRejectsRawMutation(t *testing.T) {
 }
 
 func TestApplyBackupAllowsResolutionOfPrePinTransaction(t *testing.T) {
+	t.Parallel()
 	fsm := newBackupTestFSM(t, NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0)))
 	primary := []byte("primary")
 	startTS := uint64(30)
@@ -248,6 +260,7 @@ func TestApplyBackupAllowsResolutionOfPrePinTransaction(t *testing.T) {
 }
 
 func TestBackupTimestampFloorSurvivesSnapshotRestore(t *testing.T) {
+	t.Parallel()
 	srcStore := store.NewMVCCStore()
 	src, ok := NewKvFSMWithHLCAndTracker(
 		srcStore, NewHLC(), NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0)),
@@ -275,6 +288,7 @@ func TestBackupTimestampFloorSurvivesSnapshotRestore(t *testing.T) {
 }
 
 func TestFSMSnapshotRejectsActiveBackupPin(t *testing.T) {
+	t.Parallel()
 	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
 	fsm := newBackupTestFSMWithGroup(t, tracker, 7)
 	pinID := backupTrackerTestPinID(1)
@@ -298,6 +312,7 @@ func TestFSMSnapshotRejectsActiveBackupPin(t *testing.T) {
 }
 
 func TestBackupTimestampFloorRejectsDelayedRaftProposal(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
 	r, stop := newSingleRaft(t, "backup-floor-delayed", NewKvFSMWithHLCAndTracker(st, NewHLC(), tracker))
@@ -337,6 +352,7 @@ func requireBackupTimestampFenced(t *testing.T, resp any) {
 }
 
 func TestApplyBackupReserveEnforcesCapacityAndUnreserveReleases(t *testing.T) {
+	t.Parallel()
 	tracker := NewActiveTimestampTracker(
 		WithActiveTimestampTrackerSweepInterval(0),
 		WithActiveTimestampTrackerMaxBackupPins(1),
@@ -364,6 +380,7 @@ func TestApplyBackupReserveEnforcesCapacityAndUnreserveReleases(t *testing.T) {
 }
 
 func TestApplyBackupZeroDeadlineReturnsNonFatalError(t *testing.T) {
+	t.Parallel()
 	fsm := newBackupTestFSM(t, NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0)))
 
 	resp := fsm.Apply(EncodeBackupPinEntry(BackupPinEntry{
@@ -379,6 +396,7 @@ func TestApplyBackupZeroDeadlineReturnsNonFatalError(t *testing.T) {
 }
 
 func TestApplyBackupPinsAreScopedByRaftGroup(t *testing.T) {
+	t.Parallel()
 	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
 	fsm1 := newBackupTestFSMWithGroup(t, tracker, 1)
 	fsm2 := newBackupTestFSMWithGroup(t, tracker, 2)
@@ -402,6 +420,7 @@ func TestApplyBackupPinsAreScopedByRaftGroup(t *testing.T) {
 }
 
 func TestBackupPayloadIsVolatileOnly(t *testing.T) {
+	t.Parallel()
 	fsm := &kvFSM{}
 	pinID := backupTrackerTestPinID(1)
 
@@ -504,6 +523,7 @@ func TestBackupPayloadsHaltApplyWhenUnapplicable(t *testing.T) {
 // otherwise keep blocking compaction and snapshots on this replica -- and keep
 // consuming backup capacity -- until its deadline lapsed.
 func TestFSMRestoreClearsStaleBackupPins(t *testing.T) {
+	t.Parallel()
 	const groupID = uint64(7)
 	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
 	fsm := newBackupTestFSMWithGroup(t, tracker, groupID)
@@ -537,6 +557,7 @@ func TestFSMRestoreClearsStaleBackupPins(t *testing.T) {
 // Only the restoring group's pins are dropped. A pin another group holds in
 // the shared tracker is unrelated to this group's snapshot.
 func TestFSMRestoreKeepsOtherGroupsBackupPins(t *testing.T) {
+	t.Parallel()
 	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
 	fsm := newBackupTestFSMWithGroup(t, tracker, 7)
 	require.NoError(t, tracker.ApplyPinWithDeadlineForGroup(

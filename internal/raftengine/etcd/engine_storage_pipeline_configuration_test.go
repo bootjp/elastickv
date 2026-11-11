@@ -214,7 +214,7 @@ func TestEnginePipelineConfigurationHeldStages(t *testing.T) {
 func requirePipelineConfigurationReopen(t *testing.T, dir string, index uint64) {
 	t.Helper()
 	restored := &testStateMachine{}
-	disk, err := loadWalState(zap.NewNop(), filepath.Join(dir, walDirName), filepath.Join(dir, snapDirName), filepath.Join(dir, fsmSnapDirName), restored, nil)
+	disk, err := loadWalState(zap.NewNop(), filepath.Join(dir, walDirName), filepath.Join(dir, snapDirName), filepath.Join(dir, fsmSnapDirName), restored)
 	require.NoError(t, err)
 	require.Equal(t, index, disk.LocalSnap.GetMetadata().GetIndex())
 	require.Equal(t, []uint64{3}, disk.LocalSnap.GetMetadata().GetConfState().GetLearners())

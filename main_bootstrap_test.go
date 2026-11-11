@@ -9,6 +9,7 @@ import (
 )
 
 func TestResolveBootstrapServers(t *testing.T) {
+	t.Parallel()
 	t.Run("members imply fixed bootstrap servers", func(t *testing.T) {
 		servers, err := resolveBootstrapServers("n1", []groupSpec{{id: 1, address: "10.0.0.11:50051"}}, "n1=10.0.0.11:50051")
 		require.NoError(t, err)
@@ -70,6 +71,7 @@ func TestResolveBootstrapServers(t *testing.T) {
 }
 
 func TestResolveBootstrapConfigGroupPeers(t *testing.T) {
+	t.Parallel()
 	groups := []groupSpec{
 		{id: 1, address: "10.0.0.11:50051"},
 		{id: 2, address: "10.0.0.11:50052"},
@@ -116,6 +118,7 @@ func TestResolveBootstrapConfigGroupPeers(t *testing.T) {
 }
 
 func TestResolveRaftPeerConfigJoinMembers(t *testing.T) {
+	t.Parallel()
 	groups := []groupSpec{{id: 1, address: "10.0.0.12:50051"}}
 	joinMembers := "n1=10.0.0.11:50051,n2=10.0.0.12:50051,n3=10.0.0.13:50051"
 

@@ -98,6 +98,7 @@ func TestRPCTimeoutRejectsInvalidEnv(t *testing.T) {
 }
 
 func TestUsageErrorForCommand(t *testing.T) {
+	t.Parallel()
 	require.EqualError(t, usageError("add_voter"), "usage: raftadmin <addr> add_voter <id> <address> [previous_index]")
 	require.EqualError(t, usageError("add_learner"), "usage: raftadmin <addr> add_learner <id> <address> [previous_index]")
 	require.EqualError(t, usageError("promote_learner"), "usage: raftadmin <addr> promote_learner <id> [previous_index] [min_applied_index] [skip_min_applied_check]")
@@ -107,6 +108,7 @@ func TestUsageErrorForCommand(t *testing.T) {
 }
 
 func TestUsageErrorFallback(t *testing.T) {
+	t.Parallel()
 	want := "usage: raftadmin <addr> <status|leader|state|configuration|add_voter|add_learner|promote_learner|remove_server|leadership_transfer|leadership_transfer_to_server> [args]"
 	require.EqualError(t, usageError(""), want)
 	require.EqualError(t, usageError("unknown"), want)
@@ -129,6 +131,7 @@ func TestExecuteCommandPromoteLearnerPrintsIndex(t *testing.T) {
 }
 
 func TestAllowInsecurePlaintextLoopbackByDefault(t *testing.T) {
+	t.Parallel()
 	for _, addr := range []string{"127.0.0.1:50051", "[::1]:50051", "localhost:50051", "passthrough:///bufnet"} {
 		allowed, err := allowInsecurePlaintext(addr)
 		require.NoError(t, err, addr)
@@ -148,6 +151,7 @@ func TestAllowInsecurePlaintextRemoteRequiresExplicitOptIn(t *testing.T) {
 }
 
 func TestTransportCredentialsForRemotePlaintextRejectsByDefault(t *testing.T) {
+	t.Parallel()
 	_, err := transportCredentialsFor("10.0.0.12:50051")
 	require.EqualError(t, err, "plaintext raftadmin to non-loopback address requires RAFTADMIN_ALLOW_INSECURE=true or RAFTADMIN_TLS=true")
 }

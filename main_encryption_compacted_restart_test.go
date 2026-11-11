@@ -31,6 +31,7 @@ func (e *checkpointGapEngine) EncryptionSnapshot() (io.ReadCloser, uint64, error
 }
 
 func TestEncryptionCheckpointReadsSnapshotOnlyForGap(t *testing.T) {
+	t.Parallel()
 	for _, applied := range []uint64{5, 6, 7} {
 		t.Run(fmt.Sprintf("applied-%d", applied), func(t *testing.T) {
 			engine := &checkpointGapEngine{
@@ -109,6 +110,7 @@ func (s *advancingCheckpointScanner) prepareNextSnapshot() {
 }
 
 func TestEncryptionCheckpointRetriesCompactionOnlyWithNewProof(t *testing.T) {
+	t.Parallel()
 	for _, variant := range []string{"advance", "unchanged", "missing-proof", "changed-proof", "verification-error", "retained-rotation", "unavailable", "keeps-compacting", "sidecar-advanced", "sidecar-rollback", "sidecar-read-error"} {
 		t.Run(variant, func(t *testing.T) {
 			sc := &encryption.Sidecar{Version: encryption.SidecarVersion, RaftAppliedIndex: 6}
@@ -180,6 +182,7 @@ func checkpointHeader(t *testing.T, sc *encryption.Sidecar) []byte {
 }
 
 func TestEncryptionCompactedRestartCheckpoint(t *testing.T) {
+	t.Parallel()
 	for _, variant := range []string{"valid", "stale-sidecar", "mismatched-keys", "future-checkpoint", "missing-proof", "retained-rotation", "snapshot-verification-error", "truncated-proof"} {
 		t.Run(variant, func(t *testing.T) {
 			sc := &encryption.Sidecar{Version: encryption.SidecarVersion, RaftAppliedIndex: 6,
@@ -222,6 +225,7 @@ func TestEncryptionCompactedRestartCheckpoint(t *testing.T) {
 }
 
 func TestEncryptionCheckpointDoesNotAuthorizeEpochRollback(t *testing.T) {
+	t.Parallel()
 	sc := &encryption.Sidecar{RaftAppliedIndex: 6, Keys: map[string]encryption.SidecarKey{"1": {LocalEpoch: 8}}}
 	payload := checkpointHeader(t, sc)
 	_, _, before, err := kv.ReadSnapshotHeaderWithCheckpoint(bufio.NewReader(bytes.NewReader(payload)))

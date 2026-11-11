@@ -28,6 +28,7 @@ func (f *fakeGCPKMSClient) Decrypt(_ context.Context, input *kmspb.DecryptReques
 }
 
 func TestGCPKMSWrapperRequestAndResponseIntegrity(t *testing.T) {
+	t.Parallel()
 	const keyName = "projects/p/locations/global/keyRings/r/cryptoKeys/k"
 	dek := bytes.Repeat([]byte{0x52}, fileKEKSize)
 	ciphertext := []byte("gcp-wrapped")
@@ -58,6 +59,7 @@ func TestGCPKMSWrapperRequestAndResponseIntegrity(t *testing.T) {
 }
 
 func TestGCPKMSWrapperRejectsIntegrityFailures(t *testing.T) {
+	t.Parallel()
 	const keyName = "projects/p/locations/global/keyRings/r/cryptoKeys/k"
 	dek := bytes.Repeat([]byte{0x52}, fileKEKSize)
 	client := &fakeGCPKMSClient{encryptOutput: &kmspb.EncryptResponse{
@@ -75,6 +77,7 @@ func TestGCPKMSWrapperRejectsIntegrityFailures(t *testing.T) {
 }
 
 func TestValidGCPKeyName(t *testing.T) {
+	t.Parallel()
 	require.True(t, validGCPKeyName("projects/p/locations/global/keyRings/r/cryptoKeys/k"))
 	require.False(t, validGCPKeyName("projects/p/keyRings/r/cryptoKeys/k"))
 }

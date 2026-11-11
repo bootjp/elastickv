@@ -101,6 +101,7 @@ func openCrashTestGroups(t *testing.T, dir string, bootstrap bool) (*LockResolve
 }
 
 func TestMultiGroupPrimaryDecisionSurvivesProcessKill(t *testing.T) {
+	t.Parallel()
 	if dir := os.Getenv(multiGroupCrashDirectory); dir != "" {
 		_, shards, groups, _ := openCrashTestGroups(t, dir, true)
 		groups[1].Txn = killAfterPrimaryCommit{Transactional: groups[1].Txn, marker: filepath.Join(dir, "primary-committed")}

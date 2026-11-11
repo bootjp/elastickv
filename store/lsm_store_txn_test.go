@@ -15,6 +15,7 @@ import (
 // ---------------------------------------------------------------------------
 
 func TestAppendEncodedKeyReusesBuffer(t *testing.T) {
+	t.Parallel()
 	var buf []byte
 	buf = appendEncodedKey(buf, []byte("alpha"), 10)
 	firstPtr := &buf[0]
@@ -30,6 +31,7 @@ func TestAppendEncodedKeyReusesBuffer(t *testing.T) {
 }
 
 func TestAppendKeyUpperBoundReusesBuffer(t *testing.T) {
+	t.Parallel()
 	var buf []byte
 	buf = appendKeyUpperBound(buf, []byte("alpha"))
 	firstPtr := &buf[0]
@@ -49,11 +51,13 @@ func TestAppendKeyUpperBoundReusesBuffer(t *testing.T) {
 }
 
 func TestConflictCheckLinearAdvanceLimitFor(t *testing.T) {
+	t.Parallel()
 	require.Equal(t, conflictCheckSmallLinearAdvanceLimit, conflictCheckLinearAdvanceLimitFor(conflictCheckLargeBatchThreshold-1))
 	require.Equal(t, conflictCheckLargeLinearAdvanceLimit, conflictCheckLinearAdvanceLimitFor(conflictCheckLargeBatchThreshold))
 }
 
 func TestPebbleStore_HasCommitsAfter(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	st, err := NewPebbleStore(dir)
 	require.NoError(t, err)
@@ -71,6 +75,7 @@ func TestPebbleStore_HasCommitsAfter(t *testing.T) {
 }
 
 func TestPebbleStore_ApplyMutations_BasicPut(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	s, err := NewPebbleStore(dir)
 	require.NoError(t, err)
@@ -101,6 +106,7 @@ func TestPebbleStore_ApplyMutations_BasicPut(t *testing.T) {
 }
 
 func TestPebbleStore_ApplyMutations_Delete(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	s, err := NewPebbleStore(dir)
 	require.NoError(t, err)
@@ -129,6 +135,7 @@ func TestPebbleStore_ApplyMutations_Delete(t *testing.T) {
 }
 
 func TestPebbleStore_ApplyMutations_PutWithTTL(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	s, err := NewPebbleStore(dir)
 	require.NoError(t, err)
@@ -156,6 +163,7 @@ func TestPebbleStore_ApplyMutations_PutWithTTL(t *testing.T) {
 }
 
 func TestPebbleStore_ApplyMutations_WriteConflict(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	s, err := NewPebbleStore(dir)
 	require.NoError(t, err)
@@ -186,6 +194,7 @@ func TestPebbleStore_ApplyMutations_WriteConflict(t *testing.T) {
 }
 
 func TestPebbleStore_ApplyMutations_BatchedConflictCheckPreservesInputOrder(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	s, err := NewPebbleStore(dir)
 	require.NoError(t, err)
@@ -210,6 +219,7 @@ func TestPebbleStore_ApplyMutations_BatchedConflictCheckPreservesInputOrder(t *t
 }
 
 func TestPebbleStore_ApplyMutations_LargeBatchNoConflict(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	s, err := NewPebbleStore(dir)
 	require.NoError(t, err)
@@ -233,6 +243,7 @@ func TestPebbleStore_ApplyMutations_LargeBatchNoConflict(t *testing.T) {
 }
 
 func TestPebbleStore_ApplyMutations_NoConflictWhenStartTSGECommit(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	s, err := NewPebbleStore(dir)
 	require.NoError(t, err)
@@ -256,6 +267,7 @@ func TestPebbleStore_ApplyMutations_NoConflictWhenStartTSGECommit(t *testing.T) 
 }
 
 func TestPebbleStore_ApplyMutations_UpdatesLastCommitTS(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	s, err := NewPebbleStore(dir)
 	require.NoError(t, err)
@@ -280,6 +292,7 @@ func TestPebbleStore_ApplyMutations_UpdatesLastCommitTS(t *testing.T) {
 }
 
 func TestPebbleStore_ApplyMutations_Atomicity(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	s, err := NewPebbleStore(dir)
 	require.NoError(t, err)
@@ -309,6 +322,7 @@ func TestPebbleStore_ApplyMutations_Atomicity(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestPebbleStore_LatestCommitTS_SingleVersion(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	s, err := NewPebbleStore(dir)
 	require.NoError(t, err)
@@ -325,6 +339,7 @@ func TestPebbleStore_LatestCommitTS_SingleVersion(t *testing.T) {
 }
 
 func TestPebbleStore_LatestCommitTS_MultipleVersions(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	s, err := NewPebbleStore(dir)
 	require.NoError(t, err)
@@ -343,6 +358,7 @@ func TestPebbleStore_LatestCommitTS_MultipleVersions(t *testing.T) {
 }
 
 func TestPebbleStore_LatestCommitTS_NotFound(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	s, err := NewPebbleStore(dir)
 	require.NoError(t, err)
@@ -361,6 +377,7 @@ func TestPebbleStore_LatestCommitTS_NotFound(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestPebbleStore_Compact_KeepsNewestVersion(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	s, err := NewPebbleStore(dir)
 	require.NoError(t, err)
@@ -385,6 +402,7 @@ func TestPebbleStore_Compact_KeepsNewestVersion(t *testing.T) {
 }
 
 func TestPebbleStore_Compact_MetaKeyNotAffected(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	s, err := NewPebbleStore(dir)
 	require.NoError(t, err)
@@ -413,6 +431,7 @@ func TestPebbleStore_Compact_MetaKeyNotAffected(t *testing.T) {
 }
 
 func TestPebbleStore_Compact_MultipleKeys(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	s, err := NewPebbleStore(dir)
 	require.NoError(t, err)
@@ -464,6 +483,7 @@ func TestPebbleStore_Compact_MultipleKeys(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestPebbleStore_ApplyMutations_ReadConflictPreservesInputOrder(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	s, err := NewPebbleStore(dir)
 	require.NoError(t, err)
@@ -491,6 +511,7 @@ func TestPebbleStore_ApplyMutations_ReadConflictPreservesInputOrder(t *testing.T
 }
 
 func TestPebbleStore_ApplyMutations_ReadConflict_PartialConflict(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	s, err := NewPebbleStore(dir)
 	require.NoError(t, err)
@@ -516,6 +537,7 @@ func TestPebbleStore_ApplyMutations_ReadConflict_PartialConflict(t *testing.T) {
 }
 
 func TestPebbleStore_ApplyMutations_ReadKeyOverlapsWriteKey(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	s, err := NewPebbleStore(dir)
 	require.NoError(t, err)
@@ -537,6 +559,7 @@ func TestPebbleStore_ApplyMutations_ReadKeyOverlapsWriteKey(t *testing.T) {
 }
 
 func TestPebbleStore_ApplyMutations_ReadKeyOverlapsWriteKey_NoConflict(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	s, err := NewPebbleStore(dir)
 	require.NoError(t, err)

@@ -10,6 +10,7 @@ import (
 )
 
 func TestCreateWithOperationSupportsLongClientID(t *testing.T) {
+	t.Parallel()
 	ctx := t.Context()
 	svc := newTestServiceWithOptions(t, []uint64{2, 3})
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -27,6 +28,7 @@ func TestCreateWithOperationSupportsLongClientID(t *testing.T) {
 }
 
 func TestCreateWithOperationRetainsOriginalInodeAndHandle(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, []uint64{2, 3, 4})
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -47,6 +49,7 @@ func TestCreateWithOperationRetainsOriginalInodeAndHandle(t *testing.T) {
 }
 
 func TestMkdirWithOperationDoesNotCreateReplacement(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, []uint64{2, 3})
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -62,6 +65,7 @@ func TestMkdirWithOperationDoesNotCreateReplacement(t *testing.T) {
 }
 
 func TestCreateWithOperationRetainsExistingNameRejection(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, []uint64{2})
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -81,6 +85,7 @@ func TestCreateWithOperationRetainsExistingNameRejection(t *testing.T) {
 }
 
 func TestCreateWithOperationResolvesLostCommitReply(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, []uint64{2, 3})
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -101,6 +106,7 @@ func TestCreateWithOperationResolvesLostCommitReply(t *testing.T) {
 }
 
 func TestCreateWithOperationReplansDefinitiveRejectionConflict(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, []uint64{2})
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))

@@ -18,6 +18,7 @@ import (
 )
 
 func TestMilestone1SplitRange_EndToEndRefreshAndDataPath(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 
 	engine := distribution.NewEngine()
@@ -153,6 +154,7 @@ func TestMilestone1SplitRange_EndToEndRefreshAndDataPath(t *testing.T) {
 }
 
 func TestMilestone1SplitRange_RestartReloadsCatalog(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	catalogDir := filepath.Join(t.TempDir(), "catalog")
 

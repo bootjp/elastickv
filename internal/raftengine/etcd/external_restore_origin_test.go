@@ -51,10 +51,11 @@ func prepareOriginFixture(t *testing.T) (string, *ExternalSnapshotRestoreResult)
 
 func loadOriginFixture(dir string, fsm StateMachine) (*diskState, error) {
 	return loadWalState(zap.NewNop(), filepath.Join(dir, walDirName), filepath.Join(dir, snapDirName),
-		filepath.Join(dir, fsmSnapDirName), fsm, nil)
+		filepath.Join(dir, fsmSnapDirName), fsm)
 }
 
 func TestExternalOriginForcesValidatedFullRestore(t *testing.T) {
+	t.Parallel()
 	dir, _ := prepareOriginFixture(t)
 	fsm := &originRecordingFSM{skipGateFSM: skipGateFSM{applied: 100, appliedPresent: true}}
 	disk, err := loadOriginFixture(dir, fsm)
@@ -68,6 +69,7 @@ func TestExternalOriginForcesValidatedFullRestore(t *testing.T) {
 }
 
 func TestExternalOriginRejectsUnsupportedFSM(t *testing.T) {
+	t.Parallel()
 	dir, _ := prepareOriginFixture(t)
 	fsm := &skipGateFSM{}
 	disk, err := loadOriginFixture(dir, fsm)
@@ -79,6 +81,7 @@ func TestExternalOriginRejectsUnsupportedFSM(t *testing.T) {
 }
 
 func TestExternalOriginBindsWrappedHeaderAndPreservesInputHash(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	payload := []byte("EKVPBBL1ordinary-kv")
 	input := filepath.Join(root, "input")
@@ -102,6 +105,7 @@ func TestExternalOriginBindsWrappedHeaderAndPreservesInputHash(t *testing.T) {
 }
 
 func TestExternalOriginRejectsMarkerMismatchBeforeFSM(t *testing.T) {
+	t.Parallel()
 	for _, completed := range []bool{false, true} {
 		for _, field := range []string{"version", "index", "term", "crc", "sha", "truncated", "oversized"} {
 			t.Run(field+map[bool]string{false: "/pending", true: "/completed"}[completed], func(t *testing.T) {
@@ -141,6 +145,7 @@ func TestExternalOriginRejectsMarkerMismatchBeforeFSM(t *testing.T) {
 }
 
 func TestExternalOriginVerifiesCRCAndSHAOnSamePayload(t *testing.T) {
+	t.Parallel()
 	for _, repairCRC := range []bool{false, true} {
 		t.Run(map[bool]string{false: "crc", true: "sha"}[repairCRC], func(t *testing.T) {
 			dir, result := prepareOriginFixture(t)
@@ -172,6 +177,7 @@ func TestExternalOriginVerifiesCRCAndSHAOnSamePayload(t *testing.T) {
 }
 
 func TestExternalOriginValidationFailureSurvivesRetry(t *testing.T) {
+	t.Parallel()
 	dir, _ := prepareOriginFixture(t)
 	rejected := errors.New("decoded migration-bearing restore unsupported")
 	for range 2 {
@@ -184,6 +190,7 @@ func TestExternalOriginValidationFailureSurvivesRetry(t *testing.T) {
 }
 
 func TestExternalOriginMarkerlessUsesOrdinarySkip(t *testing.T) {
+	t.Parallel()
 	dir, _ := prepareOriginFixture(t)
 	require.NoError(t, os.Remove(filepath.Join(dir, externalRestoreOriginFile)))
 	fsm := &originRecordingFSM{skipGateFSM: skipGateFSM{applied: 100, appliedPresent: true}}
@@ -200,6 +207,7 @@ func TestExternalOriginMarkerlessUsesOrdinarySkip(t *testing.T) {
 type originStrippingFSM struct{ StateMachine }
 
 func TestExternalOriginWrapperMustForwardCapability(t *testing.T) {
+	t.Parallel()
 	dir, _ := prepareOriginFixture(t)
 	inner := &originRecordingFSM{}
 	_, err := loadOriginFixture(dir, &originStrippingFSM{StateMachine: inner})
@@ -208,6 +216,7 @@ func TestExternalOriginWrapperMustForwardCapability(t *testing.T) {
 }
 
 func TestExternalOriginSuccessfulOpenRetainsCompletedBinding(t *testing.T) {
+	t.Parallel()
 	dir, _ := prepareOriginFixture(t)
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
@@ -228,6 +237,7 @@ func TestExternalOriginSuccessfulOpenRetainsCompletedBinding(t *testing.T) {
 }
 
 func TestExternalOriginMissingWALCannotBootstrap(t *testing.T) {
+	t.Parallel()
 	dir, _ := prepareOriginFixture(t)
 	require.NoError(t, os.RemoveAll(filepath.Join(dir, walDirName)))
 	_, err := openDiskState(OpenConfig{DataDir: dir, StateMachine: &originRecordingFSM{}, Bootstrap: true}, nil)
@@ -235,6 +245,7 @@ func TestExternalOriginMissingWALCannotBootstrap(t *testing.T) {
 }
 
 func TestExternalOriginCompletionRetriesDirectoryFlush(t *testing.T) {
+	t.Parallel()
 	dir, _ := prepareOriginFixture(t)
 	failure := errors.New("completion directory flush failed after rename")
 	flushes, writes := 0, 0

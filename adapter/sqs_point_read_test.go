@@ -10,6 +10,7 @@ import (
 )
 
 func TestSQSPointReadPartitionFamiliesUseOwner(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	t.Cleanup(func() { require.NoError(t, st.Close()) })
 	resolver := NewSQSPartitionResolver(map[string][]uint64{fifoDelayTestQueue: {2, 3, 4, 5}})
@@ -38,6 +39,7 @@ func TestSQSPointReadPartitionFamiliesUseOwner(t *testing.T) {
 }
 
 func TestSQSPointReadOwnerFailureDoesNotBecomeAbsent(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	t.Cleanup(func() { require.NoError(t, st.Close()) })
 	srv := &SQSServer{store: st, partitionResolver: NewSQSPartitionResolver(map[string][]uint64{fifoDelayTestQueue: {2}})}

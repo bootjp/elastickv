@@ -148,6 +148,7 @@ func newS3HandlerForTest(src BucketsSource) *S3Handler {
 }
 
 func TestNewS3Handler_NilSourceReturnsNil(t *testing.T) {
+	t.Parallel()
 	// A nil source is the well-known "S3 admin disabled" signal so a
 	// build that ships without the S3 adapter can pass nil into
 	// ServerDeps.Buckets and have the routes silently disappear.
@@ -155,6 +156,7 @@ func TestNewS3Handler_NilSourceReturnsNil(t *testing.T) {
 }
 
 func TestS3Handler_ListBuckets_EmptyArrayNotNull(t *testing.T) {
+	t.Parallel()
 	h := newS3HandlerForTest(&stubBucketsSource{buckets: map[string]BucketSummary{}})
 	req := httptest.NewRequest(http.MethodGet, pathS3Buckets, nil)
 	rec := httptest.NewRecorder()
@@ -166,6 +168,7 @@ func TestS3Handler_ListBuckets_EmptyArrayNotNull(t *testing.T) {
 }
 
 func TestS3Handler_ListBuckets_HappyPath(t *testing.T) {
+	t.Parallel()
 	h := newS3HandlerForTest(&stubBucketsSource{buckets: map[string]BucketSummary{
 		"alpha": {Name: "alpha", ACL: "private", Generation: 1},
 		"bravo": {Name: "bravo", ACL: "public-read", Generation: 2},
@@ -186,6 +189,7 @@ func TestS3Handler_ListBuckets_HappyPath(t *testing.T) {
 }
 
 func TestS3Handler_ListBuckets_PaginationCursorRoundtrips(t *testing.T) {
+	t.Parallel()
 	// Three buckets + limit=2 should produce a first page of 2 +
 	// a next_token; passing that token back yields the third.
 	src := &stubBucketsSource{buckets: map[string]BucketSummary{
@@ -224,6 +228,7 @@ func TestS3Handler_ListBuckets_PaginationCursorRoundtrips(t *testing.T) {
 }
 
 func TestS3Handler_ListBuckets_RejectsInvalidLimit(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name  string
 		limit string
@@ -246,6 +251,7 @@ func TestS3Handler_ListBuckets_RejectsInvalidLimit(t *testing.T) {
 }
 
 func TestS3Handler_ListBuckets_OversizeLimitClamped(t *testing.T) {
+	t.Parallel()
 	// limit beyond the ceiling is silently clamped (not rejected) so
 	// the SPA's "request the maximum" pattern works without a probe
 	// round-trip. Mirrors the Dynamo handler's policy.
@@ -257,6 +263,7 @@ func TestS3Handler_ListBuckets_OversizeLimitClamped(t *testing.T) {
 }
 
 func TestS3Handler_ListBuckets_RejectsInvalidNextToken(t *testing.T) {
+	t.Parallel()
 	h := newS3HandlerForTest(&stubBucketsSource{})
 	req := httptest.NewRequest(http.MethodGet, pathS3Buckets+"?next_token=!!!", nil)
 	rec := httptest.NewRecorder()
@@ -266,6 +273,7 @@ func TestS3Handler_ListBuckets_RejectsInvalidNextToken(t *testing.T) {
 }
 
 func TestS3Handler_ListBuckets_StorageErrorReturns500(t *testing.T) {
+	t.Parallel()
 	src := &stubBucketsSource{listErr: errors.New("storage backing sentinel LIST-1")}
 	h := newS3HandlerForTest(src)
 	req := httptest.NewRequest(http.MethodGet, pathS3Buckets, nil)
@@ -284,6 +292,7 @@ func TestS3Handler_ListBuckets_StorageErrorReturns500(t *testing.T) {
 // sentinel match does not silently downgrade the response to a
 // generic 500.
 func TestS3Handler_ListBuckets_ForbiddenReturns403(t *testing.T) {
+	t.Parallel()
 	src := &stubBucketsSource{listErr: ErrBucketsForbidden}
 	h := newS3HandlerForTest(src)
 	req := httptest.NewRequest(http.MethodGet, pathS3Buckets, nil)
@@ -294,6 +303,7 @@ func TestS3Handler_ListBuckets_ForbiddenReturns403(t *testing.T) {
 }
 
 func TestS3Handler_ListBuckets_RejectsUnsupportedMethods(t *testing.T) {
+	t.Parallel()
 	// POST is now the create endpoint (slice 2); PUT / DELETE /
 	// PATCH on the collection root are still 405. The pinned set
 	// guards against a future routing refactor that accidentally
@@ -311,6 +321,7 @@ func TestS3Handler_ListBuckets_RejectsUnsupportedMethods(t *testing.T) {
 }
 
 func TestS3Handler_DescribeBucket_HappyPath(t *testing.T) {
+	t.Parallel()
 	src := &stubBucketsSource{buckets: map[string]BucketSummary{
 		"orders": {Name: "orders", ACL: "private", Region: "us-east-1", Generation: 7},
 	}}
@@ -328,6 +339,7 @@ func TestS3Handler_DescribeBucket_HappyPath(t *testing.T) {
 }
 
 func TestS3Handler_DescribeBucket_MissingReturns404(t *testing.T) {
+	t.Parallel()
 	h := newS3HandlerForTest(&stubBucketsSource{buckets: map[string]BucketSummary{}})
 	req := httptest.NewRequest(http.MethodGet, pathS3Buckets+"/missing", nil)
 	rec := httptest.NewRecorder()
@@ -337,6 +349,7 @@ func TestS3Handler_DescribeBucket_MissingReturns404(t *testing.T) {
 }
 
 func TestS3Handler_DescribeBucket_StorageErrorReturns500(t *testing.T) {
+	t.Parallel()
 	src := &stubBucketsSource{descErr: errors.New("storage backing sentinel DESC-1")}
 	h := newS3HandlerForTest(src)
 	req := httptest.NewRequest(http.MethodGet, pathS3Buckets+"/anything", nil)
@@ -348,6 +361,7 @@ func TestS3Handler_DescribeBucket_StorageErrorReturns500(t *testing.T) {
 }
 
 func TestS3Handler_DescribeBucket_ForbiddenReturns403(t *testing.T) {
+	t.Parallel()
 	// ErrBucketsForbidden is reserved for the next slice's role
 	// gate (read-only is fine for any authenticated session today)
 	// but the handler already maps the sentinel so the slice can
@@ -362,6 +376,7 @@ func TestS3Handler_DescribeBucket_ForbiddenReturns403(t *testing.T) {
 }
 
 func TestS3Handler_PerBucket_UnknownSubpathReturns404(t *testing.T) {
+	t.Parallel()
 	// /buckets/foo/policy (or any non-/acl sub-resource) must 404
 	// rather than mistakenly reach handleDescribe with the full
 	// "foo/policy" string — protects against a SPA bug that mis-
@@ -376,6 +391,7 @@ func TestS3Handler_PerBucket_UnknownSubpathReturns404(t *testing.T) {
 }
 
 func TestS3Handler_PerBucket_AclSubpathRejectsGet(t *testing.T) {
+	t.Parallel()
 	// /buckets/{name}/acl is a real sub-resource (PUT is the wire
 	// shape for changing the ACL); GET on that exact path must
 	// return 405 rather than mistakenly reaching handleDescribe.
@@ -389,6 +405,7 @@ func TestS3Handler_PerBucket_AclSubpathRejectsGet(t *testing.T) {
 }
 
 func TestFormatBucketCreatedAt_ZeroProducesEmpty(t *testing.T) {
+	t.Parallel()
 	// Zero HLC means "no creation time recorded" — the SPA renders
 	// it as a dash, so we emit an empty string rather than the Unix
 	// epoch (1970-01-01) which would be misleading.
@@ -396,6 +413,7 @@ func TestFormatBucketCreatedAt_ZeroProducesEmpty(t *testing.T) {
 }
 
 func TestFormatBucketCreatedAt_RoundtripsSecondPrecision(t *testing.T) {
+	t.Parallel()
 	// HLC's upper 48 bits are Unix ms. 1_777_874_400_000 ms =
 	// 2026-05-04T06:00:00Z; shift left by hlcPhysicalShift (16) to
 	// produce a wire HLC, format, and confirm the formatter recovers
@@ -432,6 +450,7 @@ func validCreateBucketBody() string {
 }
 
 func TestS3Handler_CreateBucket_HappyPath(t *testing.T) {
+	t.Parallel()
 	src := &stubBucketsSource{}
 	h := newS3HandlerForTest(src)
 	req := httptest.NewRequest(http.MethodPost, pathS3Buckets,
@@ -450,6 +469,7 @@ func TestS3Handler_CreateBucket_HappyPath(t *testing.T) {
 }
 
 func TestS3Handler_CreateBucket_ReadOnlyRoleRejected(t *testing.T) {
+	t.Parallel()
 	src := &stubBucketsSource{}
 	h := newS3HandlerForTest(src)
 	req := httptest.NewRequest(http.MethodPost, pathS3Buckets,
@@ -476,6 +496,7 @@ func TestS3Handler_CreateBucket_ReadOnlyRoleRejected(t *testing.T) {
 // the contract per-endpoint (a future op that forgets to call
 // principalForWrite would fail the relevant row immediately).
 func TestS3Handler_PrincipalForWrite_JWTGateFiresWithRoleStore(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name   string
 		method string
@@ -519,6 +540,7 @@ func TestS3Handler_PrincipalForWrite_JWTGateFiresWithRoleStore(t *testing.T) {
 // existing "ReadOnlyRoleRejected" tests for the h.roles == nil
 // path, but those leave the live-role-narrowing branch unproven.
 func TestS3Handler_PrincipalForWrite_LiveRoleNarrowsJWT(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name  string
 		roles MapRoleStore
@@ -543,6 +565,7 @@ func TestS3Handler_PrincipalForWrite_LiveRoleNarrowsJWT(t *testing.T) {
 }
 
 func TestS3Handler_CreateBucket_AlreadyExistsReturns409(t *testing.T) {
+	t.Parallel()
 	src := &stubBucketsSource{
 		buckets:   map[string]BucketSummary{"public-assets": {Name: "public-assets"}},
 		createErr: ErrBucketsAlreadyExists,
@@ -558,6 +581,7 @@ func TestS3Handler_CreateBucket_AlreadyExistsReturns409(t *testing.T) {
 }
 
 func TestS3Handler_CreateBucket_NotLeaderReturns503(t *testing.T) {
+	t.Parallel()
 	src := &stubBucketsSource{createErr: ErrBucketsNotLeader}
 	h := newS3HandlerForTest(src)
 	req := httptest.NewRequest(http.MethodPost, pathS3Buckets,
@@ -571,6 +595,7 @@ func TestS3Handler_CreateBucket_NotLeaderReturns503(t *testing.T) {
 }
 
 func TestS3Handler_CreateBucket_RejectsInvalidJSON(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name string
 		body string
@@ -600,6 +625,7 @@ func TestS3Handler_CreateBucket_RejectsInvalidJSON(t *testing.T) {
 }
 
 func TestS3Handler_CreateBucket_RejectsNULByte(t *testing.T) {
+	t.Parallel()
 	h := newS3HandlerForTest(&stubBucketsSource{})
 	body := "{\"bucket_name\":\"users\"}\x00{\"extra\":1}"
 	req := httptest.NewRequest(http.MethodPost, pathS3Buckets, strings.NewReader(body))
@@ -611,6 +637,7 @@ func TestS3Handler_CreateBucket_RejectsNULByte(t *testing.T) {
 }
 
 func TestS3Handler_CreateBucket_OversizeBodyReturns413(t *testing.T) {
+	t.Parallel()
 	h := newS3HandlerForTest(&stubBucketsSource{})
 	// 64 KiB + 1 byte: just over the limit.
 	body := strings.Repeat("a", adminS3CreateBodyLimit+1)
@@ -622,6 +649,7 @@ func TestS3Handler_CreateBucket_OversizeBodyReturns413(t *testing.T) {
 }
 
 func TestS3Handler_PutBucketAcl_HappyPath(t *testing.T) {
+	t.Parallel()
 	src := &stubBucketsSource{
 		buckets: map[string]BucketSummary{"orders": {Name: "orders", ACL: "private"}},
 	}
@@ -637,6 +665,7 @@ func TestS3Handler_PutBucketAcl_HappyPath(t *testing.T) {
 }
 
 func TestS3Handler_PutBucketAcl_ReadOnlyRoleRejected(t *testing.T) {
+	t.Parallel()
 	src := &stubBucketsSource{
 		buckets: map[string]BucketSummary{"orders": {Name: "orders"}},
 	}
@@ -652,6 +681,7 @@ func TestS3Handler_PutBucketAcl_ReadOnlyRoleRejected(t *testing.T) {
 }
 
 func TestS3Handler_PutBucketAcl_RequiresAclField(t *testing.T) {
+	t.Parallel()
 	h := newS3HandlerForTest(&stubBucketsSource{
 		buckets: map[string]BucketSummary{"orders": {Name: "orders"}},
 	})
@@ -665,6 +695,7 @@ func TestS3Handler_PutBucketAcl_RequiresAclField(t *testing.T) {
 }
 
 func TestS3Handler_PutBucketAcl_MissingBucketReturns404(t *testing.T) {
+	t.Parallel()
 	src := &stubBucketsSource{putACLErr: ErrBucketsNotFound}
 	h := newS3HandlerForTest(src)
 	req := httptest.NewRequest(http.MethodPut, pathS3Buckets+"/missing/acl",
@@ -677,6 +708,7 @@ func TestS3Handler_PutBucketAcl_MissingBucketReturns404(t *testing.T) {
 }
 
 func TestS3Handler_PutBucketAcl_RejectsNonPut(t *testing.T) {
+	t.Parallel()
 	cases := []string{http.MethodGet, http.MethodPost, http.MethodDelete, http.MethodPatch}
 	for _, m := range cases {
 		t.Run(m, func(t *testing.T) {
@@ -691,6 +723,7 @@ func TestS3Handler_PutBucketAcl_RejectsNonPut(t *testing.T) {
 }
 
 func TestS3Handler_DeleteBucket_HappyPath(t *testing.T) {
+	t.Parallel()
 	src := &stubBucketsSource{
 		buckets: map[string]BucketSummary{"orders": {Name: "orders"}},
 	}
@@ -705,6 +738,7 @@ func TestS3Handler_DeleteBucket_HappyPath(t *testing.T) {
 }
 
 func TestS3Handler_DeleteBucket_ReadOnlyRoleRejected(t *testing.T) {
+	t.Parallel()
 	src := &stubBucketsSource{
 		buckets: map[string]BucketSummary{"orders": {Name: "orders"}},
 	}
@@ -718,6 +752,7 @@ func TestS3Handler_DeleteBucket_ReadOnlyRoleRejected(t *testing.T) {
 }
 
 func TestS3Handler_DeleteBucket_NotEmptyReturns409(t *testing.T) {
+	t.Parallel()
 	src := &stubBucketsSource{deleteErr: ErrBucketsNotEmpty}
 	h := newS3HandlerForTest(src)
 	req := httptest.NewRequest(http.MethodDelete, pathS3Buckets+"/orders", nil)
@@ -729,6 +764,7 @@ func TestS3Handler_DeleteBucket_NotEmptyReturns409(t *testing.T) {
 }
 
 func TestS3Handler_DeleteBucket_MissingReturns404(t *testing.T) {
+	t.Parallel()
 	src := &stubBucketsSource{deleteErr: ErrBucketsNotFound}
 	h := newS3HandlerForTest(src)
 	req := httptest.NewRequest(http.MethodDelete, pathS3Buckets+"/missing", nil)
@@ -740,6 +776,7 @@ func TestS3Handler_DeleteBucket_MissingReturns404(t *testing.T) {
 }
 
 func TestS3Handler_DeleteBucket_NotLeaderReturns503(t *testing.T) {
+	t.Parallel()
 	src := &stubBucketsSource{deleteErr: ErrBucketsNotLeader}
 	h := newS3HandlerForTest(src)
 	req := httptest.NewRequest(http.MethodDelete, pathS3Buckets+"/orders", nil)
@@ -751,6 +788,7 @@ func TestS3Handler_DeleteBucket_NotLeaderReturns503(t *testing.T) {
 }
 
 func TestS3Handler_WriteEndpoints_ValidationErrorReturns400(t *testing.T) {
+	t.Parallel()
 	// Pin the writeBucketsError *ValidationError arm — exercised
 	// end-to-end via the bridge (adapter ErrAdminInvalid* →
 	// translateAdminBucketsError → &ValidationError{...}) but
@@ -822,6 +860,7 @@ func (s *notLeaderBucketsSource) AdminDeleteBucket(_ context.Context, _ AuthPrin
 }
 
 func TestS3Handler_CreateBucket_ForwardsOnNotLeader(t *testing.T) {
+	t.Parallel()
 	src := &notLeaderBucketsSource{}
 	fwd := &stubLeaderForwarder{createBucketRes: &ForwardResult{
 		StatusCode:  http.StatusCreated,
@@ -841,6 +880,7 @@ func TestS3Handler_CreateBucket_ForwardsOnNotLeader(t *testing.T) {
 }
 
 func TestS3Handler_DeleteBucket_ForwardsOnNotLeader(t *testing.T) {
+	t.Parallel()
 	src := &notLeaderBucketsSource{}
 	fwd := &stubLeaderForwarder{deleteBucketRes: &ForwardResult{
 		StatusCode:  http.StatusNoContent,
@@ -856,6 +896,7 @@ func TestS3Handler_DeleteBucket_ForwardsOnNotLeader(t *testing.T) {
 }
 
 func TestS3Handler_PutBucketAcl_ForwardsOnNotLeader(t *testing.T) {
+	t.Parallel()
 	src := &notLeaderBucketsSource{}
 	fwd := &stubLeaderForwarder{putACLRes: &ForwardResult{
 		StatusCode:  http.StatusNoContent,
@@ -873,6 +914,7 @@ func TestS3Handler_PutBucketAcl_ForwardsOnNotLeader(t *testing.T) {
 }
 
 func TestS3Handler_CreateBucket_ForwarderLeaderUnavailableReturns503(t *testing.T) {
+	t.Parallel()
 	// ErrLeaderUnavailable from the forwarder layer maps to 503 +
 	// Retry-After:1 — the SPA's retry contract is uniform whether
 	// the leader is briefly absent or the network hiccupped.
@@ -890,6 +932,7 @@ func TestS3Handler_CreateBucket_ForwarderLeaderUnavailableReturns503(t *testing.
 }
 
 func TestS3Handler_CreateBucket_ForwarderTransportErrorReturns503(t *testing.T) {
+	t.Parallel()
 	// Generic gRPC error → 503 + Retry-After. The error is logged
 	// on the server but never surfaces to the SPA.
 	src := &notLeaderBucketsSource{}
@@ -907,6 +950,7 @@ func TestS3Handler_CreateBucket_ForwarderTransportErrorReturns503(t *testing.T) 
 }
 
 func TestS3Handler_CreateBucket_ForwarderNotInvokedForNonNotLeader(t *testing.T) {
+	t.Parallel()
 	// The forwarder gate must run ONLY on ErrBucketsNotLeader; a
 	// generic source error or AlreadyExists must fall through to
 	// writeBucketsError. Otherwise a leader-direct 409 would be
@@ -938,6 +982,7 @@ func TestS3Handler_CreateBucket_ForwarderNotInvokedForNonNotLeader(t *testing.T)
 }
 
 func TestS3Handler_WriteEndpoints_RejectMissingPrincipal(t *testing.T) {
+	t.Parallel()
 	// Without a session principal in the context, writes must
 	// 401 — SessionAuth normally enforces this; principalForWrite
 	// is the second-line guard.

@@ -114,6 +114,7 @@ func (o *recordingObs) RestoreFallback(_ uint64, reason string) {
 // is NOT called (FSM body stays empty), but ApplySnapshotHeader IS
 // called with the parsed ceiling.
 func TestSkipGate_SkipsWhenFSMFreshEnough(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	const (
 		ceilingMs  uint64 = 1700_000_000_000
@@ -149,6 +150,7 @@ func TestSkipGate_SkipsWhenFSMFreshEnough(t *testing.T) {
 // records the executed outcome with gap-behind, header is restored
 // via fsm.Restore (which the fake captures as bodyBytes).
 func TestSkipGate_ExecutesWhenFSMStale(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	const (
 		snapIndex  uint64 = 200
@@ -178,6 +180,7 @@ func TestSkipGate_ExecutesWhenFSMStale(t *testing.T) {
 // e.applied above snapshot.Index, preventing applyCommitted from
 // re-delivering the snapshot..have tail.
 func TestSkipGate_ReturnsEffectiveAppliedOnSkip(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	const (
 		ceilingMs  uint64 = 1700_000_000_000
@@ -206,6 +209,7 @@ func TestSkipGate_ReturnsEffectiveAppliedOnSkip(t *testing.T) {
 // not before — otherwise a CRC/header failure would still register
 // a successful skip/execute outcome in the soak metrics.
 func TestSkipGate_EmitsAfterSuccess(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	const snapIndex uint64 = 100
 	// Inject a CRC that won't match the on-disk footer so
@@ -282,6 +286,7 @@ func TestColdStartCommittedGaps(t *testing.T) {
 // then RawNode/applyCommitted replays only the needed tail and drops
 // data-mutating duplicates at or below `have`.
 func TestSkipGate_SkipsWhenWALCarriesPostSnapshotTail(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	const (
 		snapIndex    uint64 = 100
@@ -316,6 +321,7 @@ func TestSkipGate_SkipsWhenWALCarriesPostSnapshotTail(t *testing.T) {
 // TestSkipGate_FallbackMissingMeta covers the strictly-additive
 // fallback when the FSM reports the meta key missing.
 func TestSkipGate_FallbackMissingMeta(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	payload := []byte("payload")
 	crc, _ := writeFSMFileForTest(t, dir, 50, payload)
@@ -335,6 +341,7 @@ func TestSkipGate_FallbackMissingMeta(t *testing.T) {
 // path. Engine MUST NOT propagate the error (we collapse to false
 // → fallback) — over-restoring is strictly safer.
 func TestSkipGate_FallbackReadErr(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	payload := []byte("payload")
 	crc, _ := writeFSMFileForTest(t, dir, 50, payload)
@@ -354,6 +361,7 @@ func TestSkipGate_FallbackReadErr(t *testing.T) {
 // FSM does not implement AppliedIndexReader, so the gate cannot
 // even attempt a decision.
 func TestSkipGate_FallbackNotReader(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	payload := []byte("payload")
 	crc, _ := writeFSMFileForTest(t, dir, 50, payload)
@@ -375,6 +383,7 @@ func TestSkipGate_FallbackNotReader(t *testing.T) {
 // (step 1) catches an empty file and surfaces ErrFSMSnapshotTooSmall
 // WITHOUT mutating FSM state.
 func TestApplyHeaderStateOnSkip_TruncatedFile(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := fsmSnapPath(dir, 1)
 	require.NoError(t, os.WriteFile(path, []byte{}, 0o600)) //nolint:mnd
@@ -388,6 +397,7 @@ func TestApplyHeaderStateOnSkip_TruncatedFile(t *testing.T) {
 // TestApplyHeaderStateOnSkip_WrongTokenCRC asserts step 2 catches a
 // footer-vs-token mismatch.
 func TestApplyHeaderStateOnSkip_WrongTokenCRC(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	crc, path := writeFSMFileForTest(t, dir, 1, []byte("payload-bytes"))
 	_ = crc
@@ -401,6 +411,7 @@ func TestApplyHeaderStateOnSkip_WrongTokenCRC(t *testing.T) {
 // TestApplyHeaderStateOnSkip_VerifiesPayloadBeforeHeaderApply asserts the skip
 // path checks payload integrity before applying header side-effects.
 func TestApplyHeaderStateOnSkip_VerifiesPayloadBeforeHeaderApply(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	const ceilingMs uint64 = 1700_000_000_001
 	payload := make([]byte, 16, 16+len("payload-bytes"))
@@ -434,6 +445,7 @@ func TestApplyHeaderStateOnSkip_VerifiesPayloadBeforeHeaderApply(t *testing.T) {
 // returns the v1 ceiling, ApplySnapshotHeader sets f.hlc and
 // f.restoredCutover. The cold-start skip path threads them through.
 func TestSkipGate_KVFSMHeaderRoundTrip(t *testing.T) {
+	t.Parallel()
 	const ceilingMs uint64 = 1700_000_000_000
 
 	// 16-byte v1 header followed by inner-store payload.

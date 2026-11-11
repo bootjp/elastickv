@@ -12,6 +12,7 @@ import (
 )
 
 func TestExternalSnapshotEncryptedPebbleBoundary(t *testing.T) {
+	t.Parallel()
 	for _, sst := range []bool{false, true} {
 		for _, bearing := range []bool{false, true} {
 			verifyExternalEncryptedSnapshot(t, sst, bearing)
@@ -80,6 +81,7 @@ func (r *cancelAfterSnapshotReader) Read(p []byte) (int, error) {
 }
 
 func TestExternalSnapshotCancellationAfterInputConsumed(t *testing.T) {
+	t.Parallel()
 	for _, format := range []string{"mvcc", "native", "sst"} {
 		source := externalTestMemory(t)
 		require.NoError(t, source.PutAt(t.Context(), []byte("new"), []byte("value"), 20, 0))

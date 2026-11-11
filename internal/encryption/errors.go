@@ -292,12 +292,13 @@ var (
 	// missing-registry-row case is NOT an unconditional skip —
 	// the §5.2 split fires based on `sidecar.StorageEnvelopeActive`:
 	// pre-cutover (active=false) the missing-row case is a
-	// freshly-joined-learner skip and `CheckLocalEpochRollback`
-	// returns nil; post-cutover (active=true) the missing-row
-	// case is a missing rollback anchor and the function fires
-	// `ErrLocalEpochRollback`. See the comprehensive doc on
-	// `CheckLocalEpochRollback` (`local_epoch_rollback.go`) for
-	// the full split.
+	// freshly-joined-learner skip; post-cutover (active=true) the
+	// missing-row case is a missing rollback anchor and fires
+	// `ErrLocalEpochRollback`. The live checks are
+	// `checkLocalEpochRollbackBeforeBump` (fires on sidecar <
+	// registry) and `checkLocalEpochRollbackAfterBump` (fires on
+	// sidecar <= registry, after raft replay) in
+	// `main_encryption_startup_guard.go`.
 	ErrLocalEpochRollback = errors.New("encryption: sidecar local_epoch for the active storage DEK is at or below the local writer-registry's last_seen_local_epoch, which would replay the GCM nonce prefix under the same DEK; refusing to start (verify the sidecar was not restored from an old backup; run `encryption resync-sidecar` if appropriate, or rotate the affected DEK — see §9.1 + §5.2 of the 6D design doc)")
 
 	// ErrEnvelopeCutoverDivergence is the Stage 6C-4 startup guard

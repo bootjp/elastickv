@@ -11,6 +11,7 @@ import (
 )
 
 func TestPersistedPeersV2RoundTripMixedSuffrage(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	peers := []Peer{
 		{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001", Suffrage: SuffrageVoter},
@@ -27,6 +28,7 @@ func TestPersistedPeersV2RoundTripMixedSuffrage(t *testing.T) {
 }
 
 func TestPersistedPeersV1FileReadsAsAllVoter(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := peersFilePath(dir)
 
@@ -89,6 +91,7 @@ func writeV1PeerEntry(w io.Writer, peer Peer) error {
 // peers keep the v2 per-peer suffrage byte, followed by the bootstrap
 // seed marker fields.
 func TestPersistedPeersWriterAlwaysEmitsV3(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	require.NoError(t, savePersistedPeers(dir, 1, []Peer{
 		{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
@@ -105,6 +108,7 @@ func TestPersistedPeersWriterAlwaysEmitsV3(t *testing.T) {
 }
 
 func TestPersistedPeersBootstrapSeedRoundTripAndDeactivate(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	peers := []Peer{
 		{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001", Suffrage: SuffrageVoter},
@@ -136,6 +140,7 @@ func TestPersistedPeersBootstrapSeedRoundTripAndDeactivate(t *testing.T) {
 }
 
 func TestPersistedPeersSnapshotSaveDeactivatesChangedBootstrapSeed(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	seed := []Peer{
 		{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001", Suffrage: SuffrageVoter},
@@ -169,6 +174,7 @@ func TestPersistedPeersSnapshotSaveDeactivatesChangedBootstrapSeed(t *testing.T)
 }
 
 func TestValidateBootstrapSeedActiveMismatchRejected(t *testing.T) {
+	t.Parallel()
 	seed := []Peer{
 		{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001", Suffrage: SuffrageVoter},
 		{NodeID: 2, ID: "n2", Address: "127.0.0.1:7002", Suffrage: SuffrageVoter},
@@ -199,6 +205,7 @@ func TestValidateBootstrapSeedActiveMismatchRejected(t *testing.T) {
 // suffrage variant cannot silently coerce its peers to voter on a
 // build that does not understand the new value.
 func TestPersistedPeersV2UnknownSuffrageRejected(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := peersFilePath(dir)
 
@@ -238,6 +245,7 @@ func TestPersistedPeersV2UnknownSuffrageRejected(t *testing.T) {
 }
 
 func TestPersistedPeersUnknownVersionRejected(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := peersFilePath(dir)
 	require.NoError(t, replaceFile(path, func(w io.Writer) error {

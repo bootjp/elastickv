@@ -10,7 +10,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
@@ -18,7 +17,7 @@ import (
 
 func migrationNamespacePeerContext(t *testing.T, authorized bool) context.Context {
 	t.Helper()
-	ctx := peer.NewContext(t.Context(), &peer.Peer{AuthInfo: credentials.TLSInfo{}})
+	ctx := peer.NewContext(t.Context(), &peer.Peer{AuthInfo: migrationTLSInfoFixture(t)})
 	if authorized {
 		ctx = metadata.NewIncomingContext(ctx, metadata.Pairs("authorization", "Bearer "+t.Name()))
 	}
@@ -26,6 +25,7 @@ func migrationNamespacePeerContext(t *testing.T, authorized bool) context.Contex
 }
 
 func TestSplitMigrationNamespaceSendFirstAuthentication(t *testing.T) {
+	t.Parallel()
 	for _, key := range [][]byte{[]byte("!migstage|ready|"), []byte("!migstage|ownership"), []byte("!migstage|retired"),
 		[]byte("!migstage|ack|"), []byte("!migwrite|source"), []byte("!migfence|source"),
 		[]byte("!dist|migstage|row"), store.MigrationConfigurationIndexKey(),
@@ -53,6 +53,7 @@ func TestSplitMigrationNamespaceSendFirstAuthentication(t *testing.T) {
 }
 
 func TestSplitMigrationNamespaceAuthorizedForwardStillRejectsInternalWrites(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	fsm := kv.NewKvFSMWithHLC(st, kv.NewHLC())
 	proposer := &applyingMigrationProposer{fsm: fsm}
@@ -75,6 +76,7 @@ func TestSplitMigrationNamespaceAuthorizedForwardStillRejectsInternalWrites(t *t
 }
 
 func TestSplitMigrationNamespacePreservesOrdinaryPeerAliases(t *testing.T) {
+	t.Parallel()
 	auth, _ := SplitMigrationTokenAuth(t.Name(), false, false)
 	for _, key := range []string{"customer", "_migack", "_mighlc", "_migpromote", "!txn|meta", "!txn|foo",
 		"!txn|backup|customer", "!txn|int|customer", "!migstage", "!migstage-user", "!hs|!migstage|ready||field"} {
@@ -90,6 +92,7 @@ func TestSplitMigrationNamespacePreservesOrdinaryPeerAliases(t *testing.T) {
 }
 
 func TestSplitMigrationNamespaceProtectsPrefixDeletes(t *testing.T) {
+	t.Parallel()
 	auth, _ := SplitMigrationTokenAuth(t.Name(), false, false)
 	for _, key := range []string{"!migs", "!migstage|", "!migwrite|", "!migfence|", "!dist|migstage|"} {
 		request := &pb.ForwardRequest{Requests: []*pb.Request{{Mutations: []*pb.Mutation{{Op: pb.Op_DEL_PREFIX, Key: []byte(key)}}}}}

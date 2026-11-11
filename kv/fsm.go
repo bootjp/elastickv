@@ -14,6 +14,7 @@ import (
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryption/fsmwire"
 	"github.com/bootjp/elastickv/internal/fskeys"
+	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/internal/s3keys"
 	pb "github.com/bootjp/elastickv/proto"
@@ -65,6 +66,17 @@ type kvFSM struct {
 	// write", preserving Stage 6A behavior for backends that did
 	// not opt in).
 	pendingApplyIdx uint64
+	// pendingApplyIdentity is the stronger replay identity supplied by engines
+	// that support protected control receipts. Direct SetApplyIndex callers
+	// clear it so a test or legacy engine cannot accidentally reuse stale term
+	// or digest evidence.
+	pendingApplyIdentity raftengine.AppliedEntryIdentity
+	// raftBootstrapIdentity is trusted local runtime configuration used to
+	// derive receipt slots. Protected payloads may only prove equality with it;
+	// they never select their own cluster or group namespace.
+	raftBootstrapIdentity          raftbootstrap.Identity
+	bootstrapActivationNativeProof func(context.Context) (BootstrapActivationNativeProof, error)
+	pendingNativeConfiguration     *raftengine.NativeConfiguration
 	// readTracker is shared with the local FSM compactor. BackupPin
 	// FSM entries mutate this tracker so compaction retains versions
 	// at the live-backup read timestamp until the pin is released or
@@ -119,6 +131,7 @@ type kvFSM struct {
 	replicatedPins                *replicatedPinJournal
 	replicatedPinLoadErr          error
 	prepareEvidenceEnabled        atomic.Bool
+	commitTSFenceEnabled          atomic.Bool
 	prepareCreationSealed         atomic.Bool
 	prepareEvidenceReleaseFloor   atomic.Uint64
 	prepareEvidenceTimestampFloor atomic.Uint64
@@ -188,6 +201,21 @@ type RouteSnapshot interface {
 // leave it at 0 to opt out, matching the pre-Stage-6C-2d default).
 func (f *kvFSM) SetApplyIndex(idx uint64) {
 	f.pendingApplyIdx = idx
+	f.pendingApplyIdentity = raftengine.AppliedEntryIdentity{}
+	f.ClearApplyNativeConfiguration()
+}
+
+// SetApplyEntryIdentity implements raftengine.ApplyEntryIdentityAware.
+func (f *kvFSM) SetApplyEntryIdentity(identity raftengine.AppliedEntryIdentity) {
+	f.pendingApplyIdx = identity.Index
+	f.pendingApplyIdentity = identity
+}
+
+// ClearApplyEntryIdentity invalidates term/hash provenance after the matching
+// normal or configuration entry finishes its serial apply attempt.
+func (f *kvFSM) ClearApplyEntryIdentity() {
+	f.pendingApplyIdentity = raftengine.AppliedEntryIdentity{}
+	f.ClearApplyNativeConfiguration()
 }
 
 // LastAppliedIndex implements raftengine.AppliedIndexReader by
@@ -292,6 +320,12 @@ func WithRouteHistory(routes RouteHistory, shardGroupID uint64) FSMOption {
 	}
 }
 
+func WithRaftBootstrapIdentity(cluster raftbootstrap.UUID, groupID uint64) FSMOption {
+	return func(f *kvFSM) {
+		f.raftBootstrapIdentity = raftbootstrap.Identity{Cluster: cluster, Group: groupID}
+	}
+}
+
 func WithActiveTimestampTracker(tracker *ActiveTimestampTracker) FSMOption {
 	return func(f *kvFSM) {
 		f.readTracker = tracker
@@ -379,6 +413,10 @@ type fsmApplyResponse struct {
 }
 
 func (f *kvFSM) Apply(data []byte) any {
+	// Full provenance is valid for exactly one engine-delivered Apply call.
+	// Keep pendingApplyIdx for legacy direct callers, but never let term/hash
+	// evidence leak into a later call that did not receive its own identity.
+	defer f.ClearApplyEntryIdentity()
 	if f.replicatedPinLoadErr != nil {
 		return replicatedBackupHalt(f.replicatedPinLoadErr, "load journal")
 	}
@@ -386,6 +424,9 @@ func (f *kvFSM) Apply(data []byte) any {
 		return haltErr(errors.Wrap(errors.Mark(f.backupFloorLoadErr, ErrBackupApply), "kv/fsm: load backup timestamp floor"))
 	}
 	ctx := context.TODO()
+	if resp, handled := f.applyGuardedBootstrap(ctx, data); handled {
+		return resp
+	}
 	if resp, handled := f.applyReservedOpcode(ctx, data); handled {
 		return resp
 	}
@@ -552,6 +593,8 @@ func (f *kvFSM) applyReservedOpcode(ctx context.Context, data []byte) (any, bool
 	switch {
 	case data[0] == raftEncodeHLCLease:
 		return f.applyHLCLease(data[1:]), true
+	case data[0] == raftEncodeCommitTSFenceActivation:
+		return f.applyCommitTSFenceActivation(ctx, data[1:]), true
 	case data[0] == raftEncodeWatermarkAdvance:
 		return f.applyWatermarkAdvance(ctx, data[1:]), true
 	case data[0] >= fsmwire.OpEncryptionMin && data[0] <= fsmwire.OpEncryptionMax:
@@ -835,10 +878,8 @@ func (f *kvFSM) handleRawRequest(ctx context.Context, r *pb.Request, commitTS ui
 	if err := f.recordMigrationWrite(ctx, r.Mutations, commitTS); err != nil {
 		return err
 	}
-	// Raw requests always commit against the latest state; use commitTS as both
-	// the validation snapshot and the commit timestamp.
-	if err := f.store.ApplyMutationsRaftAt(ctx, muts, nil, commitTS, commitTS, f.pendingApplyIdx); err != nil {
-		return errors.WithStack(err)
+	if err := f.applyRawMutations(ctx, muts, commitTS); err != nil {
+		return err
 	}
 	f.notifyApplyObservers(commitTS, r.Mutations)
 	return nil
@@ -2059,6 +2100,9 @@ func (f *kvFSM) handlePrepareRequest(ctx context.Context, r *pb.Request) error {
 
 	storeMuts, err := f.buildPrepareStoreMutations(ctx, uniq, meta.PrimaryKey, startTS, expireAt, meta.PrepareCommitTS)
 	if err != nil {
+		return err
+	}
+	if err := f.checkPrepareCommitTSFence(meta, storeMuts); err != nil {
 		return err
 	}
 	return f.recordAndApplyPrepare(ctx, uniq, storeMuts, r.ReadKeys, floorTS, startTS)

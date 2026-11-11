@@ -108,7 +108,7 @@ func testPipelineRealKVConfiguration(t *testing.T, v2 bool) {
 	t.Cleanup(func() { require.NoError(t, fresh.Close()) })
 	restoredFSM := kv.NewKvFSMWithHLC(fresh, nil)
 	selected, err := loadWalState(zap.NewNop(), filepath.Join(h.engine.dataDir, walDirName),
-		filepath.Join(h.engine.dataDir, snapDirName), filepath.Join(h.engine.dataDir, fsmSnapDirName), restoredFSM, nil)
+		filepath.Join(h.engine.dataDir, snapDirName), filepath.Join(h.engine.dataDir, fsmSnapDirName), restoredFSM)
 	require.NoError(t, err)
 	require.Equal(t, index, selected.LocalSnap.GetMetadata().GetIndex())
 	require.Equal(t, []uint64{3}, selected.LocalSnap.GetMetadata().GetConfState().GetLearners())

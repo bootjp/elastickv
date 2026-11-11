@@ -19,6 +19,7 @@ import (
 // --- Token encode/decode tests ---
 
 func TestTokenRoundTrip(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name   string
 		index  uint64
@@ -44,6 +45,7 @@ func TestTokenRoundTrip(t *testing.T) {
 }
 
 func TestTokenMagicRejection(t *testing.T) {
+	t.Parallel()
 	// isSnapshotToken returns false for non-EKVT prefixes.
 	require.False(t, isSnapshotToken(nil))
 	require.False(t, isSnapshotToken([]byte{}))
@@ -76,6 +78,7 @@ func TestTokenMagicRejection(t *testing.T) {
 // --- CRC writer tests ---
 
 func TestCRCWriterMatchesStdlib(t *testing.T) {
+	t.Parallel()
 	data := []byte("hello world, this is a test payload")
 	expected := crc32.Checksum(data, crc32cTable)
 
@@ -140,6 +143,7 @@ func (d *dummyFSM) Snapshot() (Snapshot, error) {
 // --- openAndRestoreFSMSnapshot tests ---
 
 func TestOpenAndRestoreFSMSnapshotGoodFile(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	payload := []byte("some FSM state data here")
 	crc, _ := writeFSMFileForTest(t, dir, 42, payload)
@@ -151,6 +155,7 @@ func TestOpenAndRestoreFSMSnapshotGoodFile(t *testing.T) {
 }
 
 func TestOpenAndRestoreFSMSnapshotBadFooter(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	payload := []byte("good payload bytes here")
 	_, path := writeFSMFileForTest(t, dir, 10, payload)
@@ -183,6 +188,7 @@ func TestOpenAndRestoreFSMSnapshotBadFooter(t *testing.T) {
 }
 
 func TestOpenAndRestoreFSMSnapshotTokenMismatch(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	payload := []byte("good payload")
 	crc, _ := writeFSMFileForTest(t, dir, 7, payload)
@@ -196,6 +202,7 @@ func TestOpenAndRestoreFSMSnapshotTokenMismatch(t *testing.T) {
 }
 
 func TestOpenAndRestoreFSMSnapshotTooSmall(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	// Write a file with fewer than fsmFooterSize (4) bytes.
 	path := fsmSnapPath(dir, 99)
@@ -207,6 +214,7 @@ func TestOpenAndRestoreFSMSnapshotTooSmall(t *testing.T) {
 }
 
 func TestStripFooterReaderBoundary(t *testing.T) {
+	t.Parallel()
 	// Verify that io.LimitReader(file, payloadSize) exposes exactly the payload
 	// bytes and that the CRC accumulator covers the full payload.
 	dir := t.TempDir()
@@ -236,6 +244,7 @@ func TestStripFooterReaderBoundary(t *testing.T) {
 // --- Crash safety and startup cleanup tests ---
 
 func TestCrashAfterTmpBeforeRename(t *testing.T) {
+	t.Parallel()
 	snapDir := t.TempDir()
 	fsmSnapDir := t.TempDir()
 
@@ -259,6 +268,7 @@ func TestCrashAfterTmpBeforeRename(t *testing.T) {
 }
 
 func TestCleanupStaleFSMSnapsIndexBased(t *testing.T) {
+	t.Parallel()
 	snapDir := t.TempDir()
 	fsmSnapDir := t.TempDir()
 
@@ -275,6 +285,7 @@ func TestCleanupStaleFSMSnapsIndexBased(t *testing.T) {
 }
 
 func TestSnapSavedOnlyAfterRename(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 
 	// Create a snapshot that writes to a file; if WriteTo fails, no final .fsm
@@ -301,6 +312,7 @@ func (e *failingSnapshot) WriteTo(_ io.Writer) (int64, error) { return 0, e.err 
 func (e *failingSnapshot) Close() error                       { return nil }
 
 func TestPurgeOldSnapshotFilesOrdering(t *testing.T) {
+	t.Parallel()
 	snapDir := t.TempDir()
 	fsmSnapDir := t.TempDir()
 
@@ -336,6 +348,7 @@ func TestPurgeOldSnapshotFilesOrdering(t *testing.T) {
 }
 
 func TestPrepareFSMSnapshotWriteKeepsNewestRestorablePair(t *testing.T) {
+	t.Parallel()
 	snapDir := t.TempDir()
 	fsmSnapDir := t.TempDir()
 	payload := []byte("payload")
@@ -370,6 +383,7 @@ func TestPrepareFSMSnapshotWriteKeepsNewestRestorablePair(t *testing.T) {
 }
 
 func TestPrepareFSMSnapshotWriteRejectsFooterOnlyRestorablePair(t *testing.T) {
+	t.Parallel()
 	snapDir := t.TempDir()
 	fsmSnapDir := t.TempDir()
 
@@ -471,6 +485,7 @@ func TestPrepareFSMSnapshotWriteKeepsTokenMatchingFallbackPair(t *testing.T) {
 }
 
 func TestPrewriteRestorableCheckUsesSnapshotFooterOnly(t *testing.T) {
+	t.Parallel()
 	snapDir := t.TempDir()
 	fsmSnapDir := t.TempDir()
 	payload := []byte("payload")
@@ -496,6 +511,7 @@ func TestPrewriteRestorableCheckUsesSnapshotFooterOnly(t *testing.T) {
 }
 
 func TestPrepareFSMSnapshotWriteVerifiesRetainedFooterOnlyFallbackBeforePruning(t *testing.T) {
+	t.Parallel()
 	snapDir := t.TempDir()
 	fsmSnapDir := t.TempDir()
 
@@ -543,6 +559,7 @@ func TestPrepareFSMSnapshotWriteKeepsWALValidAndRestorableFallbacksWhenWALValidC
 }
 
 func TestPrepareFSMSnapshotWriteRemovesOrphansWithoutRetainedSnapshot(t *testing.T) {
+	t.Parallel()
 	snapDir := t.TempDir()
 	fsmSnapDir := t.TempDir()
 	payload := []byte("payload")
@@ -567,6 +584,7 @@ func createTokenSnapFileWithTerm(t *testing.T, dir string, term uint64, index ui
 }
 
 func TestPrepareFSMSnapshotWritePreservesProtectedReceivedFSM(t *testing.T) {
+	t.Parallel()
 	snapDir := t.TempDir()
 	fsmSnapDir := t.TempDir()
 	payload := []byte("payload")
@@ -590,6 +608,7 @@ func TestPrepareFSMSnapshotWritePreservesProtectedReceivedFSM(t *testing.T) {
 // --- writeFSMSnapshotFile integration ---
 
 func TestWriteFSMSnapshotFileRoundTrip(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	payload := []byte("round-trip FSM state data 12345678")
 	snap := &testSnapshot{data: payload}
@@ -611,11 +630,13 @@ func TestWriteFSMSnapshotFileRoundTrip(t *testing.T) {
 }
 
 func TestFsmSnapPath(t *testing.T) {
+	t.Parallel()
 	path := fsmSnapPath("/data/fsm-snap", 0x1234ABCD)
 	require.Equal(t, "/data/fsm-snap/000000001234abcd.fsm", path)
 }
 
 func TestParseSnapFileIndex(t *testing.T) {
+	t.Parallel()
 	require.Equal(t, uint64(0x60), parseSnapFileIndex("0000000000000001-0000000000000060.snap"))
 	require.Equal(t, uint64(0), parseSnapFileIndex("badname.snap"))
 	require.Equal(t, uint64(0), parseSnapFileIndex("nohyphen.snap"))
@@ -624,6 +645,7 @@ func TestParseSnapFileIndex(t *testing.T) {
 // --- readFSMSnapshotPayload tests ---
 
 func TestReadFSMSnapshotPayloadGoodFile(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	payload := []byte("read payload test data here")
 	crc, path := writeFSMFileForTest(t, dir, 5, payload)
@@ -635,6 +657,7 @@ func TestReadFSMSnapshotPayloadGoodFile(t *testing.T) {
 }
 
 func TestReadFSMSnapshotPayloadBadCRC(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	payload := []byte("good payload data")
 	_, path := writeFSMFileForTest(t, dir, 6, payload)
@@ -651,6 +674,7 @@ func TestReadFSMSnapshotPayloadBadCRC(t *testing.T) {
 }
 
 func TestReadFSMSnapshotPayloadTooSmall(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := fsmSnapPath(dir, 7)
 	require.NoError(t, os.WriteFile(path, []byte{0x01, 0x02, 0x03}, 0o600))
@@ -660,6 +684,7 @@ func TestReadFSMSnapshotPayloadTooSmall(t *testing.T) {
 }
 
 func TestReadFSMSnapshotPayloadFileNotFound(t *testing.T) {
+	t.Parallel()
 	_, err := readFSMSnapshotPayload("/nonexistent/path/snapshot.fsm")
 	require.Error(t, err)
 }
@@ -667,6 +692,7 @@ func TestReadFSMSnapshotPayloadFileNotFound(t *testing.T) {
 // --- verifyFSMSnapshotFile tests ---
 
 func TestVerifyFSMSnapshotFileGood(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	payload := []byte("verify test payload data")
 	crc, path := writeFSMFileForTest(t, dir, 10, payload)
@@ -678,6 +704,7 @@ func TestVerifyFSMSnapshotFileGood(t *testing.T) {
 }
 
 func TestVerifyFSMSnapshotFileTokenMismatch(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	payload := []byte("verify token mismatch payload")
 	crc, path := writeFSMFileForTest(t, dir, 11, payload)
@@ -688,6 +715,7 @@ func TestVerifyFSMSnapshotFileTokenMismatch(t *testing.T) {
 }
 
 func TestVerifyFSMSnapshotFileBadFooter(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	payload := []byte("verify bad footer payload data")
 	_, path := writeFSMFileForTest(t, dir, 12, payload)
@@ -704,6 +732,7 @@ func TestVerifyFSMSnapshotFileBadFooter(t *testing.T) {
 }
 
 func TestVerifyFSMSnapshotFileTooSmall(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := fsmSnapPath(dir, 13)
 	require.NoError(t, os.WriteFile(path, []byte{0x01, 0x02}, 0o600))
@@ -713,11 +742,13 @@ func TestVerifyFSMSnapshotFileTooSmall(t *testing.T) {
 }
 
 func TestVerifyFSMSnapshotFileNotFound(t *testing.T) {
+	t.Parallel()
 	err := verifyFSMSnapshotFile("/nonexistent/path/42.fsm", 0)
 	require.ErrorIs(t, err, ErrFSMSnapshotNotFound)
 }
 
 func TestWriteFSMSnapshotFileEmptyPayload(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	// An empty snapshot writes only the 4-byte CRC footer.
 	snap := &testSnapshot{data: []byte{}}

@@ -11,6 +11,7 @@ import (
 )
 
 func TestValidateConflictsDetectsStaleWrite(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := store.NewMVCCStore()
 	require.NoError(t, st.PutAt(ctx, []byte("k"), []byte("v1"), 50, 0))
@@ -24,6 +25,7 @@ func TestValidateConflictsDetectsStaleWrite(t *testing.T) {
 }
 
 func TestApplyReturnsErrorOnConflict(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := store.NewMVCCStore()
 	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
@@ -72,6 +74,7 @@ func TestApplyReturnsErrorOnConflict(t *testing.T) {
 }
 
 func TestOnePhaseTxnDetectsWriteConflict(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := store.NewMVCCStore()
 	require.NoError(t, st.PutAt(ctx, []byte("k"), []byte("v1"), 100, 0))

@@ -15,6 +15,7 @@ import (
 )
 
 func TestGRPCSnapshotTransportRoundTripsSSTIngestPayload(t *testing.T) {
+	t.Parallel()
 	const (
 		index     = uint64(321)
 		term      = uint64(7)

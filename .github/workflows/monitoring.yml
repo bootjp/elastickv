@@ -1,0 +1,25 @@
+name: Monitoring assets
+on:
+  push:
+    paths:
+      - 'monitoring/**'
+      - '.github/workflows/monitoring.yml'
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install matching Prometheus tooling
+        run: |
+          container=$(docker create prom/prometheus:v3.15.1)
+          trap 'docker rm "$container"' EXIT
+          docker cp "$container:/bin/promtool" "$RUNNER_TEMP/promtool"
+          chmod +x "$RUNNER_TEMP/promtool"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - name: Check alert rules and deployment isolation
+        run: |
+          promtool check rules monitoring/prometheus/rules/*.yml
+          promtool test rules monitoring/prometheus/tests/alerts.yml
+          python3 -m unittest discover -s monitoring/tests

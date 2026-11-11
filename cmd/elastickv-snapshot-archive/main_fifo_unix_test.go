@@ -15,6 +15,7 @@ import (
 )
 
 func TestArchiveCLIRejectsFIFOArchiveInputBeforeOpen(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	input := filepath.Join(dir, "dump.tar")
 	require.NoError(t, syscall.Mkfifo(input, 0o600))
@@ -30,6 +31,7 @@ func TestArchiveCLIRejectsFIFOArchiveInputBeforeOpen(t *testing.T) {
 }
 
 func TestArchiveCLIRejectsSymlinkArchiveInputBeforeOpen(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	target := filepath.Join(dir, "target.tar")
 	require.NoError(t, os.WriteFile(target, nil, 0o600))

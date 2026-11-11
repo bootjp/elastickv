@@ -20,8 +20,9 @@ import (
 //
 // Writes and maintenance operations are delegated to the local store.
 type LeaderRoutedStore struct {
-	local       store.MVCCStore
-	coordinator Coordinator
+	operationAdmission OperationAdmission
+	local              store.MVCCStore
+	coordinator        Coordinator
 
 	connCache GRPCConnCache
 }
@@ -35,6 +36,12 @@ func NewLeaderRoutedStore(local store.MVCCStore, coordinator Coordinator) *Leade
 		local:       local,
 		coordinator: coordinator,
 	}
+}
+
+// SetOperationAdmission must be called before starting receiver operations.
+// LeaderRoutedStore fronts the same synthetic single group as Coordinate.
+func (s *LeaderRoutedStore) SetOperationAdmission(hook OperationAdmission) {
+	s.operationAdmission = hook
 }
 
 // leaderFenceTS prefers a linearizable read fence when the coordinator
@@ -762,7 +769,10 @@ func (s *LeaderRoutedStore) Compact(ctx context.Context, minTS uint64) error {
 	if s == nil || s.local == nil {
 		return errors.WithStack(store.ErrNotSupported)
 	}
-	return errors.WithStack(s.local.Compact(ctx, minTS))
+	_, err := admittedOperation(ctx, s.operationAdmission, coordinateSingleGroupID, AdmissionMaintenance, func(owned context.Context) (struct{}, error) {
+		return struct{}{}, s.local.Compact(owned, minTS)
+	})
+	return errors.WithStack(err)
 }
 
 func (s *LeaderRoutedStore) ExportVersions(ctx context.Context, opts store.ExportVersionsOptions) (store.ExportVersionsResult, error) {

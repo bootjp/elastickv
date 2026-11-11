@@ -9,26 +9,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-type fakeSnapshotSource struct {
-	cols []keyviz.MatrixColumn
-	from time.Time
-	to   time.Time
-}
-
-func (f *fakeSnapshotSource) Snapshot(from, to time.Time) []keyviz.MatrixColumn {
-	f.from = from
-	f.to = to
-	out := make([]keyviz.MatrixColumn, 0, len(f.cols))
-	for _, col := range f.cols {
-		if !from.IsZero() && col.At.Before(from) {
-			continue
-		}
-		if !to.IsZero() && !col.At.Before(to) {
-			continue
-		}
-		out = append(out, col)
-	}
-	return out
+// evaluateCommittedColumns mirrors the scheduler's evaluation step: it turns
+// committed keyviz columns into detector windows and runs the detector on them.
+func evaluateCommittedColumns(cfg Config, state *DetectorState, routes []distribution.RouteDescriptor, cols []keyviz.MatrixColumn, lastProcessedAt, now time.Time) (Result, []ColumnWindow, int) {
+	windows, _, skipped := CommittedWindowsFromColumns(cols, lastProcessedAt)
+	result := Evaluate(cfg, state, Input{Routes: routes, Windows: windows, Now: now})
+	return result, windows, skipped
 }
 
 func TestCommittedWindowsPreferExplicitWindowStart(t *testing.T) {
@@ -67,33 +53,10 @@ func TestCommittedWindowsFallbackRequiresPreviousBoundary(t *testing.T) {
 	require.Equal(t, time.Minute, windows[1].Duration)
 }
 
-func TestReadCommittedWindowsFetchesFromLastProcessedMinusStep(t *testing.T) {
-	t.Parallel()
-	at := time.Unix(1_700_000_300, 0)
-	source := &fakeSnapshotSource{cols: []keyviz.MatrixColumn{
-		readerColumn(at, at.Add(-time.Minute), nil),
-		readerColumn(at.Add(time.Minute), at, nil),
-		readerColumn(at.Add(2*time.Minute), at.Add(time.Minute), nil),
-	}}
-
-	result := ReadCommittedWindows(source, SnapshotReadConfig{
-		Step:             time.Minute,
-		CandidateWindows: 3,
-		LastProcessedAt:  at.Add(time.Minute),
-		Now:              at.Add(3 * time.Minute),
-	})
-
-	require.Equal(t, at, source.from)
-	require.Equal(t, at.Add(3*time.Minute), source.to)
-	require.Equal(t, at.Add(2*time.Minute), result.NewestCommittedAt)
-	require.Len(t, result.Windows, 1)
-	require.Equal(t, at.Add(2*time.Minute), result.Windows[0].Column.At)
-}
-
-func TestObserveSnapshotProcessesSilentGapAsReset(t *testing.T) {
+func TestEvaluateCommittedColumnsProcessesSilentGapAsReset(t *testing.T) {
 	t.Parallel()
 	at := time.Unix(1_700_000_400, 0)
-	source := &fakeSnapshotSource{cols: []keyviz.MatrixColumn{
+	cols := []keyviz.MatrixColumn{
 		readerColumn(at, at.Add(-time.Minute), []keyviz.MatrixRow{
 			readerRow(60),
 		}),
@@ -101,26 +64,22 @@ func TestObserveSnapshotProcessesSilentGapAsReset(t *testing.T) {
 		readerColumn(at.Add(2*time.Minute), at.Add(time.Minute), []keyviz.MatrixRow{
 			readerRow(60),
 		}),
-	}}
+	}
 	state := NewDetectorState()
 	cfg := testConfig()
 	cfg.CandidateWindows = 2
 
-	result, read := ObserveSnapshot(cfg, state, []distribution.RouteDescriptor{
+	result, windows, _ := evaluateCommittedColumns(cfg, state, []distribution.RouteDescriptor{
 		testRoute(1, 1, "a", "z"),
-	}, source, SnapshotReadConfig{
-		Step:             time.Minute,
-		CandidateWindows: 2,
-		Now:              at.Add(3 * time.Minute),
-	})
+	}, cols, time.Time{}, at.Add(3*time.Minute))
 
-	require.Len(t, read.Windows, 3)
+	require.Len(t, windows, 3)
 	require.Empty(t, result.Decisions)
 	require.Equal(t, 1, state.RouteStatus(1).ConsecutiveOver)
 	require.Equal(t, at.Add(2*time.Minute), state.RouteStatus(1).LastProcessedAt)
 }
 
-func TestObserveSnapshotResetsWhenHistoryNoLongerReachesWatermark(t *testing.T) {
+func TestEvaluateCommittedColumnsResetsWhenHistoryNoLongerReachesWatermark(t *testing.T) {
 	t.Parallel()
 	at := time.Unix(1_700_000_500, 0)
 	route := testRoute(1, 1, "a", "z")
@@ -138,32 +97,27 @@ func TestObserveSnapshotResetsWhenHistoryNoLongerReachesWatermark(t *testing.T) 
 	require.Empty(t, warmup.Decisions)
 	require.Equal(t, 2, state.RouteStatus(1).ConsecutiveOver)
 
-	source := &fakeSnapshotSource{cols: []keyviz.MatrixColumn{
+	cols := []keyviz.MatrixColumn{
 		readerColumn(at.Add(10*time.Minute), at.Add(9*time.Minute), []keyviz.MatrixRow{
 			readerRow(60),
 		}),
 		readerColumn(at.Add(11*time.Minute), at.Add(10*time.Minute), []keyviz.MatrixRow{
 			readerRow(60),
 		}),
-	}}
+	}
 
-	result, read := ObserveSnapshot(cfg, state, []distribution.RouteDescriptor{route}, source, SnapshotReadConfig{
-		Step:             time.Minute,
-		CandidateWindows: 3,
-		LastProcessedAt:  at,
-		Now:              at.Add(12 * time.Minute),
-	})
+	result, windows, _ := evaluateCommittedColumns(cfg, state, []distribution.RouteDescriptor{route}, cols, at, at.Add(12*time.Minute))
 
-	require.Len(t, read.Windows, 2)
-	require.Zero(t, read.Windows[0].Duration)
-	require.Equal(t, at.Add(10*time.Minute), read.Windows[0].Column.At)
+	require.Len(t, windows, 2)
+	require.Zero(t, windows[0].Duration)
+	require.Equal(t, at.Add(10*time.Minute), windows[0].Column.At)
 	require.Empty(t, result.Decisions)
 	require.Equal(t, 1, state.RouteStatus(1).ConsecutiveOver)
 	require.Equal(t, at.Add(11*time.Minute), state.RouteStatus(1).LastProcessedAt)
 	requireEvent(t, result.Events, 0, SkipReasonInvalidWindow)
 }
 
-func TestObserveSnapshotResetsWhenWindowOverlapsWatermark(t *testing.T) {
+func TestEvaluateCommittedColumnsResetsWhenWindowOverlapsWatermark(t *testing.T) {
 	t.Parallel()
 	at := time.Unix(1_700_000_550, 0)
 	route := testRoute(1, 1, "a", "z")
@@ -181,32 +135,27 @@ func TestObserveSnapshotResetsWhenWindowOverlapsWatermark(t *testing.T) {
 	require.Empty(t, warmup.Decisions)
 	require.Equal(t, 2, state.RouteStatus(1).ConsecutiveOver)
 
-	source := &fakeSnapshotSource{cols: []keyviz.MatrixColumn{
+	cols := []keyviz.MatrixColumn{
 		readerColumn(at.Add(2*time.Minute), at.Add(-time.Minute), []keyviz.MatrixRow{
 			readerRow(60),
 		}),
 		readerColumn(at.Add(3*time.Minute), at.Add(2*time.Minute), []keyviz.MatrixRow{
 			readerRow(60),
 		}),
-	}}
+	}
 
-	result, read := ObserveSnapshot(cfg, state, []distribution.RouteDescriptor{route}, source, SnapshotReadConfig{
-		Step:             time.Minute,
-		CandidateWindows: 3,
-		LastProcessedAt:  at,
-		Now:              at.Add(4 * time.Minute),
-	})
+	result, windows, _ := evaluateCommittedColumns(cfg, state, []distribution.RouteDescriptor{route}, cols, at, at.Add(4*time.Minute))
 
-	require.Len(t, read.Windows, 2)
-	require.Zero(t, read.Windows[0].Duration)
-	require.Equal(t, at.Add(2*time.Minute), read.Windows[0].Column.At)
+	require.Len(t, windows, 2)
+	require.Zero(t, windows[0].Duration)
+	require.Equal(t, at.Add(2*time.Minute), windows[0].Column.At)
 	require.Empty(t, result.Decisions)
 	require.Equal(t, 1, state.RouteStatus(1).ConsecutiveOver)
 	require.Equal(t, at.Add(3*time.Minute), state.RouteStatus(1).LastProcessedAt)
 	requireEvent(t, result.Events, 0, SkipReasonInvalidWindow)
 }
 
-func TestObserveSnapshotResetsOnInvalidCommittedColumn(t *testing.T) {
+func TestEvaluateCommittedColumnsResetsOnInvalidCommittedColumn(t *testing.T) {
 	t.Parallel()
 	at := time.Unix(1_700_000_600, 0)
 	route := testRoute(1, 1, "a", "z")
@@ -224,23 +173,18 @@ func TestObserveSnapshotResetsOnInvalidCommittedColumn(t *testing.T) {
 	require.Empty(t, warmup.Decisions)
 	require.Equal(t, 2, state.RouteStatus(1).ConsecutiveOver)
 
-	source := &fakeSnapshotSource{cols: []keyviz.MatrixColumn{
+	cols := []keyviz.MatrixColumn{
 		{At: at.Add(time.Minute), Rows: []keyviz.MatrixRow{readerRow(60)}},
 		readerColumn(at.Add(2*time.Minute), at.Add(time.Minute), []keyviz.MatrixRow{
 			readerRow(60),
 		}),
-	}}
+	}
 
-	result, read := ObserveSnapshot(cfg, state, []distribution.RouteDescriptor{route}, source, SnapshotReadConfig{
-		Step:             time.Minute,
-		CandidateWindows: 3,
-		LastProcessedAt:  at,
-		Now:              at.Add(3 * time.Minute),
-	})
+	result, windows, skipped := evaluateCommittedColumns(cfg, state, []distribution.RouteDescriptor{route}, cols, at, at.Add(3*time.Minute))
 
-	require.Equal(t, 1, read.SkippedInvalid)
-	require.Len(t, read.Windows, 2)
-	require.Zero(t, read.Windows[0].Duration)
+	require.Equal(t, 1, skipped)
+	require.Len(t, windows, 2)
+	require.Zero(t, windows[0].Duration)
 	require.Empty(t, result.Decisions)
 	require.Equal(t, 1, state.RouteStatus(1).ConsecutiveOver)
 	require.Equal(t, at.Add(2*time.Minute), state.RouteStatus(1).LastProcessedAt)

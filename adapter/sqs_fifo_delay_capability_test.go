@@ -12,6 +12,7 @@ import (
 )
 
 func TestSQSFIFODelayCapabilityGate(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name  string
 		caps  []string
@@ -72,6 +73,7 @@ func (c *fifoDelayMembershipFixture) RaftMembersForKey(ctx context.Context, _ []
 }
 
 func TestSQSFIFODelayRequiresCompleteActualMembership(t *testing.T) {
+	t.Parallel()
 	local := kv.RaftMember{NodeID: "local", Address: "raft-local", Suffrage: "voter"}
 	remote := kv.RaftMember{NodeID: "remote", Address: "raft-remote", Suffrage: "learner"}
 	for _, tc := range []struct {
@@ -118,6 +120,7 @@ func TestSQSFIFODelayRequiresCompleteActualMembership(t *testing.T) {
 }
 
 func TestSQSFIFODelayRejectsUnknownCoordinatorMembership(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	t.Cleanup(func() { require.NoError(t, st.Close()) })
 	srv := newDelayTestServer(t, st)
@@ -130,6 +133,7 @@ func TestSQSFIFODelayRejectsUnknownCoordinatorMembership(t *testing.T) {
 }
 
 func TestSQSFIFODelayRejectsIncompletePartitionCoverage(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	t.Cleanup(func() { require.NoError(t, st.Close()) })
 	srv := newDelayTestServer(t, st)
@@ -147,6 +151,7 @@ func TestSQSFIFODelayRejectsIncompletePartitionCoverage(t *testing.T) {
 }
 
 func TestSQSFIFODelayRejectsOldPeerAfterActivation(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	t.Cleanup(func() { require.NoError(t, st.Close()) })
 	srv := newDelayTestServer(t, st)

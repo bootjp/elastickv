@@ -33,6 +33,7 @@ func newAuthServiceWithAudit(t *testing.T) (*AuthService, *bytes.Buffer) {
 }
 
 func TestAudit_LoginSuccessRecordsActor(t *testing.T) {
+	t.Parallel()
 	svc, buf := newAuthServiceWithAudit(t)
 	req := postJSON(t, loginRequest{AccessKey: "AKIA_ADMIN", SecretKey: "ADMIN_SECRET"})
 	rec := httptest.NewRecorder()
@@ -48,6 +49,7 @@ func TestAudit_LoginSuccessRecordsActor(t *testing.T) {
 }
 
 func TestAudit_LoginFailureRecordsClaimedActor(t *testing.T) {
+	t.Parallel()
 	svc, buf := newAuthServiceWithAudit(t)
 	req := postJSON(t, loginRequest{AccessKey: "AKIA_ADMIN", SecretKey: "WRONG"})
 	rec := httptest.NewRecorder()
@@ -65,6 +67,7 @@ func TestAudit_LoginFailureRecordsClaimedActor(t *testing.T) {
 }
 
 func TestAudit_LogoutReadsActorFromContext(t *testing.T) {
+	t.Parallel()
 	svc, buf := newAuthServiceWithAudit(t)
 
 	// HandleLogout reads the principal from the request context (the
@@ -87,6 +90,7 @@ func TestAudit_LogoutReadsActorFromContext(t *testing.T) {
 }
 
 func TestAudit_LogoutWithoutCookieEmptyActor(t *testing.T) {
+	t.Parallel()
 	svc, buf := newAuthServiceWithAudit(t)
 	req := httptest.NewRequest(http.MethodPost, "/admin/api/v1/auth/logout", nil)
 	req.RemoteAddr = "127.0.0.1:1"
@@ -100,6 +104,7 @@ func TestAudit_LogoutWithoutCookieEmptyActor(t *testing.T) {
 }
 
 func TestAudit_LoginLengthTimingHashed(t *testing.T) {
+	t.Parallel()
 	// Same-length secret mismatch and different-length secret mismatch
 	// must both reach the failure path without short-circuiting on
 	// length. We cannot time them precisely in a unit test, but we can

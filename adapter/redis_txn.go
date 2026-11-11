@@ -559,6 +559,10 @@ func redisFencedSelectTS(selectTS func() uint64) uint64 {
 
 // MULTI/EXEC/DISCARD handling
 func (r *RedisServer) multi(conn redcon.Conn, _ redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	state := getConnState(conn)
 	if state.inTxn {
 		conn.WriteError("ERR MULTI calls can not be nested")
@@ -570,6 +574,10 @@ func (r *RedisServer) multi(conn redcon.Conn, _ redcon.Command) {
 }
 
 func (r *RedisServer) discard(conn redcon.Conn, _ redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	state := getConnState(conn)
 	if !state.inTxn {
 		conn.WriteError("ERR DISCARD without MULTI")
@@ -581,6 +589,10 @@ func (r *RedisServer) discard(conn redcon.Conn, _ redcon.Command) {
 }
 
 func (r *RedisServer) exec(conn redcon.Conn, _ redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	state := getConnState(conn)
 	if !state.inTxn {
 		conn.WriteError("ERR EXEC without MULTI")
@@ -591,7 +603,8 @@ func (r *RedisServer) exec(conn redcon.Conn, _ redcon.Command) {
 	state.inTxn = false
 	state.queue = nil
 
-	routeCtx, routeCancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
+	routeCtx, routeCancel := context.WithTimeout(r.handlerContext(conn),
+		redisDispatchTimeout)
 	route, err := r.retryTransactionProxyRoute(routeCtx, queue)
 	routeCancel()
 	if err != nil {
@@ -607,7 +620,7 @@ func (r *RedisServer) exec(conn redcon.Conn, _ redcon.Command) {
 		return
 	}
 
-	results, err := r.runTransaction(queue)
+	results, err := r.runTransaction(queue, r.handlerContext(conn))
 	if err != nil {
 		writeRedisError(conn, err)
 		return
@@ -817,10 +830,7 @@ func (t *txnContext) trackTypeReadKeys(key []byte) {
 }
 
 func (t *txnContext) ctxOrBackground() context.Context {
-	if t.ctx != nil {
-		return t.ctx
-	}
-	return context.Background()
+	return t.server.redisContext(t.ctx)
 }
 
 func (t *txnContext) load(key []byte) (*txnValue, error) {
@@ -848,7 +858,7 @@ func (t *txnContext) load(key []byte) (*txnValue, error) {
 			err error
 			ttl *time.Time
 		)
-		val, ttl, err = t.server.readRedisStringAt(key, t.startTS)
+		val, ttl, err = t.server.readRedisStringAt(key, t.startTS, t.ctxOrBackground())
 		if err != nil && !errors.Is(err, store.ErrKeyNotFound) {
 			return nil, errors.WithStack(err)
 		}
@@ -1130,7 +1140,8 @@ func (t *txnContext) loadTTLState(key []byte) (*ttlTxnState, error) {
 	}
 	ctx := t.ctx
 	if ctx == nil {
-		ctx = context.Background()
+		ctx = t.ctxOrBackground()
+
 	}
 	value, err := t.server.ttlAt(ctx, key, t.startTS)
 	if err != nil {
@@ -2081,10 +2092,7 @@ func (t *txnContext) dispatchContext() (context.Context, context.CancelFunc) {
 	// the final Dispatch. The parent is the txnContext's own ctx (the
 	// caller's dispatchCtx), not the server-lifetime handlerContext, so
 	// an outer cancellation interrupts the prepare+dispatch promptly.
-	parentCtx := t.ctx
-	if parentCtx == nil {
-		parentCtx = t.server.handlerContext()
-	}
+	parentCtx := t.ctxOrBackground()
 	return context.WithTimeout(parentCtx, redisDispatchTimeout)
 }
 
@@ -2886,18 +2894,18 @@ func (t *txnContext) zsetTTLRebuildWouldUseStaleBase(key string) bool {
 	return ok && st.dirty && len(st.members) > 0
 }
 
-func (r *RedisServer) runTransaction(queue []redcon.Command) ([]redisResult, error) {
+func (r *RedisServer) runTransaction(queue []redcon.Command, requestContexts ...context.Context) ([]redisResult, error) {
 	if transactionHasHeavyCommand(queue) {
 		var results []redisResult
 		var err error
 		if ok := r.runWithHeavyCommandSlot(func() {
-			results, err = r.runTransactionDirect(queue)
+			results, err = r.runTransactionDirect(queue, r.redisContext(requestContexts...))
 		}); !ok {
 			return nil, errRedisHeavyCommandPoolFull
 		}
 		return results, err
 	}
-	return r.runTransactionDirect(queue)
+	return r.runTransactionDirect(queue, r.redisContext(requestContexts...))
 }
 
 func (r *RedisServer) applyExecQueueAtSnapshot(
@@ -2936,12 +2944,13 @@ func (r *RedisServer) applyExecQueueAtSnapshot(
 	return txn, nextResults, nil
 }
 
-func (r *RedisServer) runTransactionDirect(queue []redcon.Command) ([]redisResult, error) {
+func (r *RedisServer) runTransactionDirect(queue []redcon.Command, requestContexts ...context.Context) ([]redisResult, error) {
 	if r.onePhaseTxnDedup {
-		return r.runTransactionWithDedup(queue)
+		return r.runTransactionWithDedup(queue, r.redisContext(requestContexts...))
 	}
 
-	dispatchCtx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
+	dispatchCtx, cancel := context.WithTimeout(r.redisContext(requestContexts...),
+		redisDispatchTimeout)
 	defer cancel()
 
 	var results []redisResult
@@ -3113,8 +3122,9 @@ func (r *RedisServer) ensureReusableExecRouteStable(pending *reusableExecTxn) er
 // write key, and we drop pending → rebuild from a fresh snapshot.
 //
 // Mirrors listPushCoreWithDedup at the EXEC granularity.
-func (r *RedisServer) runTransactionWithDedup(queue []redcon.Command) ([]redisResult, error) {
-	dispatchCtx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
+func (r *RedisServer) runTransactionWithDedup(queue []redcon.Command, requestContexts ...context.Context) ([]redisResult, error) {
+	dispatchCtx, cancel := context.WithTimeout(r.redisContext(requestContexts...),
+		redisDispatchTimeout)
 	defer cancel()
 
 	var results []redisResult

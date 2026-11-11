@@ -277,7 +277,7 @@ func testPipelineReceivedSnapshotFailure(t *testing.T, stage string) {
 	require.Zero(t, bytes)
 	require.Zero(t, items)
 	require.Empty(t, e.storagePipeline.snapshotResources.leases)
-	selected, err := loadWalState(zap.NewNop(), filepath.Join(e.dataDir, walDirName), filepath.Join(e.dataDir, snapDirName), e.fsmSnapDir, &testStateMachine{}, nil)
+	selected, err := loadWalState(zap.NewNop(), filepath.Join(e.dataDir, walDirName), filepath.Join(e.dataDir, snapDirName), e.fsmSnapDir, &testStateMachine{})
 	require.NoError(t, err)
 	if stage == "save" {
 		require.Less(t, selected.LocalSnap.GetMetadata().GetIndex(), index)
@@ -441,7 +441,7 @@ func TestEnginePipelineLocalCheckpointNativeHeldStages(t *testing.T) {
 				return snapshot.GetMetadata().GetIndex() >= index
 			}, "durable local checkpoint")
 			require.NoError(t, c.nodes[0].engine.Close())
-			disk, err := loadWalState(zap.NewNop(), filepath.Join(c.nodes[0].dir, walDirName), filepath.Join(c.nodes[0].dir, snapDirName), filepath.Join(c.nodes[0].dir, fsmSnapDirName), &testStateMachine{}, nil)
+			disk, err := loadWalState(zap.NewNop(), filepath.Join(c.nodes[0].dir, walDirName), filepath.Join(c.nodes[0].dir, snapDirName), filepath.Join(c.nodes[0].dir, fsmSnapDirName), &testStateMachine{})
 			require.NoError(t, err)
 			require.GreaterOrEqual(t, disk.LocalSnap.GetMetadata().GetIndex(), index)
 			require.Equal(t, []uint64{1, 2, 3}, disk.LocalSnap.GetMetadata().GetConfState().GetVoters())

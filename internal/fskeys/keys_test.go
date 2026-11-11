@@ -9,6 +9,7 @@ import (
 )
 
 func TestDirEntryKeyRoundTripAndOrder(t *testing.T) {
+	t.Parallel()
 	names := [][]byte{
 		[]byte("a"),
 		[]byte("a\x00"),
@@ -37,6 +38,7 @@ func TestDirEntryKeyRoundTripAndOrder(t *testing.T) {
 }
 
 func TestExtractRouteKeyNormalizesChunkIndex(t *testing.T) {
+	t.Parallel()
 	k1 := ChunkKey(11, 22, 1)
 	k2 := ChunkKey(11, 22, 99)
 	require.Equal(t, ExtractRouteKey(k1), ExtractRouteKey(k2))
@@ -46,6 +48,7 @@ func TestExtractRouteKeyNormalizesChunkIndex(t *testing.T) {
 }
 
 func TestChunkIndexFromKey(t *testing.T) {
+	t.Parallel()
 	key := ChunkKey(11, 22, 33)
 	index, ok := ChunkIndexFromKey(11, 22, key)
 	require.True(t, ok)
@@ -58,6 +61,7 @@ func TestChunkIndexFromKey(t *testing.T) {
 }
 
 func TestChunkPartsFromKey(t *testing.T) {
+	t.Parallel()
 	home, inode, index, ok := ChunkPartsFromKey(ChunkKey(11, 22, 33))
 	require.True(t, ok)
 	require.EqualValues(t, 11, home)
@@ -69,6 +73,7 @@ func TestChunkPartsFromKey(t *testing.T) {
 }
 
 func TestHomeInodeFromKey(t *testing.T) {
+	t.Parallel()
 	inode, ok := HomeInodeFromKey(HomeKey(42))
 	require.True(t, ok)
 	require.EqualValues(t, 42, inode)
@@ -77,16 +82,8 @@ func TestHomeInodeFromKey(t *testing.T) {
 	require.False(t, ok)
 }
 
-func TestChunkRouteHomeFromKey(t *testing.T) {
-	home, ok := ChunkRouteHomeFromKey(ChunkRouteKey(11, 22))
-	require.True(t, ok)
-	require.EqualValues(t, 11, home)
-
-	_, ok = ChunkRouteHomeFromKey(ChunkAllPrefix())
-	require.False(t, ok)
-}
-
 func TestChunkRoutePartsFromKey(t *testing.T) {
+	t.Parallel()
 	home, inode, ok := ChunkRoutePartsFromKey(ChunkRouteKey(11, 22))
 	require.True(t, ok)
 	require.EqualValues(t, 11, home)
@@ -94,9 +91,13 @@ func TestChunkRoutePartsFromKey(t *testing.T) {
 
 	_, _, ok = ChunkRoutePartsFromKey(append(ChunkRouteKey(11, 22), 0))
 	require.False(t, ok)
+
+	_, _, ok = ChunkRoutePartsFromKey(ChunkAllPrefix())
+	require.False(t, ok)
 }
 
 func TestUsageRouteKeyCarriesEmbeddedRoute(t *testing.T) {
+	t.Parallel()
 	routeKey := ChunkRouteKey(11, 22)
 	usageKey := UsageRouteKey(routeKey)
 
@@ -207,12 +208,14 @@ func TestChunkScanRouteBoundsUnboundedScanFallsBackToRawRoutes(t *testing.T) {
 }
 
 func TestRefFenceKeyIsPerInode(t *testing.T) {
+	t.Parallel()
 	require.Equal(t, RefFenceKey(7), RefFenceKey(7))
 	require.NotEqual(t, RefFenceKey(7), RefFenceKey(8))
 	require.False(t, bytes.HasPrefix(RefKey(7, []byte("client"), 9), RefFenceKey(7)))
 }
 
 func TestNormalizeSplitBoundarySnapsFilesystemChunkKeys(t *testing.T) {
+	t.Parallel()
 	rawChunk := ChunkKey(11, 22, 99)
 	routeKey := ChunkRouteKey(11, 22)
 	insideRouteKey := append(append([]byte(nil), routeKey...), 0xff)

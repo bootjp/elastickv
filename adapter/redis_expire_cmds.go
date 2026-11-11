@@ -17,6 +17,10 @@ import (
 
 // SETEX key seconds value — equivalent to SET key value EX seconds
 func (r *RedisServer) setex(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
@@ -27,7 +31,8 @@ func (r *RedisServer) setex(conn redcon.Conn, cmd redcon.Command) {
 	}
 	ttl := time.Now().Add(time.Duration(seconds) * time.Second)
 
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(conn),
+		redisDispatchTimeout)
 	defer cancel()
 	if err := r.saveString(ctx, cmd.Args[1], cmd.Args[3], &ttl); err != nil {
 		writeRedisError(conn, err)
@@ -38,12 +43,17 @@ func (r *RedisServer) setex(conn redcon.Conn, cmd redcon.Command) {
 
 // GETDEL key — get the value and delete the key atomically
 func (r *RedisServer) getdel(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
 	key := cmd.Args[1]
 
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(conn),
+		redisDispatchTimeout)
 	defer cancel()
 	var v []byte
 	err := r.retryRedisWrite(ctx, func() error {
@@ -92,7 +102,7 @@ func (r *RedisServer) getdelValueAt(ctx context.Context, key []byte, readTS uint
 	if typ != redisTypeString {
 		return nil, false, wrongTypeError()
 	}
-	raw, _, err := r.readRedisStringAt(key, readTS)
+	raw, _, err := r.readRedisStringAt(key, readTS, ctx)
 	if err != nil {
 		// Key may have expired or been deleted between type check and read.
 		return nil, false, nil //nolint:nilerr // treat not-found/expired as nil value
@@ -102,10 +112,15 @@ func (r *RedisServer) getdelValueAt(ctx context.Context, key []byte, readTS uint
 
 // SETNX key value — set if not exists, returns 1 on success, 0 on failure
 func (r *RedisServer) setnx(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(conn),
+		redisDispatchTimeout)
 	defer cancel()
 
 	opts := redisSetOptions{missingCond: true}
@@ -122,6 +137,10 @@ func (r *RedisServer) setnx(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) ttl(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
@@ -129,6 +148,10 @@ func (r *RedisServer) ttl(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) pttl(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
@@ -137,7 +160,8 @@ func (r *RedisServer) pttl(conn redcon.Conn, cmd redcon.Command) {
 
 func (r *RedisServer) writeTTL(conn redcon.Conn, key []byte, milliseconds bool) {
 	readTS := r.readTS()
-	exists, err := r.logicalExistsAt(context.Background(), key, readTS)
+	exists, err := r.logicalExistsAt(r.handlerContext(conn),
+		key, readTS)
 	if err != nil {
 		writeRedisError(conn, err)
 		return
@@ -146,7 +170,8 @@ func (r *RedisServer) writeTTL(conn redcon.Conn, key []byte, milliseconds bool) 
 		conn.WriteInt64(-2)
 		return
 	}
-	ttl, err := r.ttlAt(context.Background(), key, readTS)
+	ttl, err := r.ttlAt(r.handlerContext(conn),
+		key, readTS)
 	if err != nil {
 		writeRedisError(conn, err)
 		return
@@ -163,6 +188,10 @@ func (r *RedisServer) writeTTL(conn redcon.Conn, key []byte, milliseconds bool) 
 }
 
 func (r *RedisServer) expire(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
@@ -170,6 +199,10 @@ func (r *RedisServer) expire(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) pexpire(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
@@ -225,6 +258,10 @@ func (r *RedisServer) prepareExpireReadTimestamp(ctx context.Context, key []byte
 }
 
 func (r *RedisServer) setExpire(conn redcon.Conn, cmd redcon.Command, unit time.Duration) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	ttl, err := parseExpireTTL(cmd.Args[2])
 	if err != nil {
 		writeRedisError(conn, err)
@@ -237,7 +274,8 @@ func (r *RedisServer) setExpire(conn redcon.Conn, cmd redcon.Command, unit time.
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(conn),
+		redisDispatchTimeout)
 	defer cancel()
 
 	// Pin expireAt once before the retry loop so successive attempts all write
@@ -361,7 +399,7 @@ func (r *RedisServer) expireDeleteKeyReadTimestamp(ctx context.Context, key []by
 // guaranteed by OCC — no explicit mutex is required.
 func (r *RedisServer) dispatchStringExpireReadTimestamp(ctx context.Context, key []byte, readTimestamp kv.ReadTimestamp, expireAt time.Time) (bool, error) {
 	readTS := readTimestamp.Timestamp()
-	userValue, _, readErr := r.readRedisStringAt(key, readTS)
+	userValue, _, readErr := r.readRedisStringAt(key, readTS, ctx)
 	if readErr != nil {
 		if cockerrors.Is(readErr, store.ErrKeyNotFound) {
 			return false, nil

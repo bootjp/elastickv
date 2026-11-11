@@ -8,6 +8,7 @@ import (
 )
 
 func TestParsedProxyRESP2StringTypes(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name string
 		cmd  string
@@ -75,6 +76,7 @@ func TestParsedProxyRESP2StringTypes(t *testing.T) {
 }
 
 func TestParsedProxyCommandInfoFlagTypes(t *testing.T) {
+	t.Parallel()
 	info := []any{[]any{
 		"get", int64(2), []any{"readonly", "fast"}, int64(1), int64(1), int64(1),
 		[]any{"@read"}, []any{}, []any{[]any{"flags", []any{"RO", "access"}}}, []any{},
@@ -89,12 +91,14 @@ func TestParsedProxyCommandInfoFlagTypes(t *testing.T) {
 }
 
 func TestParsedProxyCommandGetKeysAndFlagsTypes(t *testing.T) {
+	t.Parallel()
 	w := &mockRespWriter{}
 	writeAdminResponse(w, "COMMAND", [][]byte{[]byte("COMMAND"), []byte("GETKEYSANDFLAGS"), []byte("GET"), []byte("k")}, []any{[]any{"k", []any{"RO", "access"}}}, nil)
 	require.Equal(t, []any{1, 2, "BULKSTR:k", 2, "STR:RO", "STR:access"}, w.writes)
 }
 
 func TestParsedProxyTransactionKeepsElementTypes(t *testing.T) {
+	t.Parallel()
 	w := &mockRespWriter{}
 	queue := [][][]byte{
 		{[]byte("SET"), []byte("k"), []byte("OK")},
@@ -105,6 +109,7 @@ func TestParsedProxyTransactionKeepsElementTypes(t *testing.T) {
 }
 
 func TestParsedProxyTransactionPingTypes(t *testing.T) {
+	t.Parallel()
 	w := &mockRespWriter{}
 	queue := [][][]byte{
 		{[]byte("PING")},
@@ -115,12 +120,14 @@ func TestParsedProxyTransactionPingTypes(t *testing.T) {
 }
 
 func TestParsedProxyDebugDigestValueTypes(t *testing.T) {
+	t.Parallel()
 	w := &mockRespWriter{}
 	writeCommandResponse(w, "DEBUG", [][]byte{[]byte("DEBUG"), []byte("DIGEST-VALUE"), []byte("k1"), []byte("k2")}, []any{"digest1", "digest2"}, nil)
 	require.Equal(t, []any{2, "STR:digest1", "STR:digest2"}, w.writes)
 }
 
 func TestParsedProxyNestedScriptStatusTypes(t *testing.T) {
+	t.Parallel()
 	for _, name := range []string{"EVAL", "EVALSHA", "FCALL"} {
 		t.Run(name, func(t *testing.T) {
 			w := &mockRespWriter{}
@@ -131,6 +138,7 @@ func TestParsedProxyNestedScriptStatusTypes(t *testing.T) {
 }
 
 func TestParsedProxyPingArity(t *testing.T) {
+	t.Parallel()
 	p := &ProxyServer{}
 	w := &commandDocsConn{}
 	p.handleAdmin(w, "PING", [][]byte{[]byte("PING"), []byte("a"), []byte("b")})
@@ -138,6 +146,7 @@ func TestParsedProxyPingArity(t *testing.T) {
 }
 
 func TestParsedProxyHello2(t *testing.T) {
+	t.Parallel()
 	primary := newMockBackend("redis")
 	primary.doFunc = makeCmd([]any{"server", "redis", "proto", int64(2)}, nil)
 	d := NewDualWriter(primary, nil, ProxyConfig{Mode: ModeRedisOnly}, newTestMetrics(), newTestSentry(), testLogger)
@@ -150,6 +159,7 @@ func TestParsedProxyHello2(t *testing.T) {
 }
 
 func TestParsedProxyAdminStatusReply(t *testing.T) {
+	t.Parallel()
 	primary := newMockBackend("redis")
 	primary.doFunc = makeCmd("OK", nil)
 	d := NewDualWriter(primary, nil, ProxyConfig{Mode: ModeRedisOnly}, newTestMetrics(), newTestSentry(), testLogger)

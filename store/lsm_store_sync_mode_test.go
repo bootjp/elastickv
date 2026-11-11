@@ -29,6 +29,7 @@ import (
 // because ApplyMutations is unconditionally pebble.Sync and therefore
 // independent of ELASTICKV_FSM_SYNC_MODE.
 func TestApplyMutationsRaft_NoSyncFunctionalEquivalence(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	s := newPebbleStoreWithFSMApplyWriteOptsForTest(t, dir, pebble.NoSync, fsmSyncModeNoSync)
 	defer s.Close()
@@ -65,6 +66,7 @@ func TestApplyMutationsRaft_NoSyncFunctionalEquivalence(t *testing.T) {
 // custom VFS shim that is not currently wired into Pebble at this
 // layer.
 func TestApplyMutationsRaft_NoSyncReopenVisibility(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	s := newPebbleStoreWithFSMApplyWriteOptsForTest(t, dir, pebble.NoSync, fsmSyncModeNoSync)
 
@@ -92,6 +94,7 @@ func TestApplyMutationsRaft_NoSyncReopenVisibility(t *testing.T) {
 // (ApplyMutationsRaft / DeletePrefixAtRaft) observes the knob as
 // before; the direct path must not.
 func TestDirectApplyWriteOpts_AlwaysSync(t *testing.T) {
+	t.Parallel()
 	t.Run("nosync-configured store still syncs direct ApplyMutations", func(t *testing.T) {
 		ps := newPebbleStoreWithFSMApplyWriteOptsForTest(t, t.TempDir(), pebble.NoSync, fsmSyncModeNoSync)
 		defer ps.Close()
@@ -118,6 +121,7 @@ func TestDirectApplyWriteOpts_AlwaysSync(t *testing.T) {
 }
 
 func TestPromoteVersionsWriteOptsFollowApplyContext(t *testing.T) {
+	t.Parallel()
 	t.Run("raft-applied promotion observes nosync", func(t *testing.T) {
 		ps := newPebbleStoreWithFSMApplyWriteOptsForTest(t, t.TempDir(), pebble.NoSync, fsmSyncModeNoSync)
 		defer ps.Close()
@@ -136,6 +140,7 @@ func TestPromoteVersionsWriteOptsFollowApplyContext(t *testing.T) {
 }
 
 func TestPromoteVersionsRaftNoSyncFunctionalEquivalence(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	ps := newPebbleStoreWithFSMApplyWriteOptsForTest(t, dir, pebble.NoSync, fsmSyncModeNoSync)
 	defer ps.Close()
@@ -185,6 +190,7 @@ func TestPromoteVersionsRaftNoSyncFunctionalEquivalence(t *testing.T) {
 // guarantees the public direct-path API still behaves correctly
 // under the split.
 func TestDirectApplyMutations_NoSyncConfigured_StillWritesDurably(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	s := newPebbleStoreWithFSMApplyWriteOptsForTest(t, dir, pebble.NoSync, fsmSyncModeNoSync)
 

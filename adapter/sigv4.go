@@ -185,6 +185,12 @@ func buildSigV4AuthorizationHeaderRestricted(
 		for _, h := range signedHeaders {
 			allowed[strings.ToLower(strings.TrimSpace(h))] = struct{}{}
 		}
+		// The SDK signs a positive ContentLength independently of Header.
+		// Botocore can send a body without including its length in SignedHeaders.
+		// Clear only the verification clone; the original framing stays intact.
+		if _, ok := allowed["content-length"]; !ok {
+			clone.ContentLength = 0
+		}
 		for name := range clone.Header {
 			if _, ok := allowed[strings.ToLower(name)]; !ok {
 				clone.Header.Del(name)
@@ -192,16 +198,32 @@ func buildSigV4AuthorizationHeaderRestricted(
 		}
 	}
 
-	signer := v4.NewSigner(func(opts *v4.SignerOptions) {
-		opts.DisableURIPathEscaping = true
-	})
-	creds := aws.Credentials{
-		AccessKeyID:     accessKeyID,
-		SecretAccessKey: secretAccessKey,
-		Source:          "elastickv-" + service,
+	return buildSigV4AuthorizationHeader(clone, accessKeyID, secretAccessKey, service, region, signingTime, payloadHash)
+}
+
+var errSigV4UnsignedHeader = errors.New("required request header is not signed")
+
+// validateSigV4SignedHeaders protects operation selectors and S3 metadata while
+// allowing unsigned transport headers. The payload hash is already bound by
+// the canonical request and need not appear in SignedHeaders separately.
+// https://docs.aws.amazon.com/AmazonS3/latest/developerguide/sig-v4-header-based-auth.html
+func validateSigV4SignedHeaders(r *http.Request, signedHeaders []string) error {
+	signed := make(map[string]struct{}, len(signedHeaders))
+	for _, name := range signedHeaders {
+		signed[strings.ToLower(strings.TrimSpace(name))] = struct{}{}
 	}
-	if err := signer.SignHTTP(context.Background(), creds, clone, payloadHash, service, region, signingTime.UTC()); err != nil {
-		return "", errors.WithStack(err)
+	if _, ok := signed["host"]; !ok {
+		return errSigV4UnsignedHeader
 	}
-	return strings.TrimSpace(clone.Header.Get("Authorization")), nil
+	for name := range r.Header {
+		name = strings.ToLower(name)
+		required := name == "content-md5" || (strings.HasPrefix(name, "x-amz-") && name != "x-amz-content-sha256")
+		if !required {
+			continue
+		}
+		if _, ok := signed[name]; !ok {
+			return errSigV4UnsignedHeader
+		}
+	}
+	return nil
 }

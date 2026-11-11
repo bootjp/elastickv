@@ -8,6 +8,7 @@ import (
 )
 
 func TestUnlinkWithOperationDoesNotRemoveRecreatedName(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, []uint64{2, 3})
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -26,6 +27,7 @@ func TestUnlinkWithOperationDoesNotRemoveRecreatedName(t *testing.T) {
 }
 
 func TestUnlinkWithOperationRetainsMissingName(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, []uint64{2})
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -40,6 +42,7 @@ func TestUnlinkWithOperationRetainsMissingName(t *testing.T) {
 }
 
 func TestUnlinkWithOperationRetainsDirectoryRejection(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, []uint64{2})
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -52,6 +55,7 @@ func TestUnlinkWithOperationRetainsDirectoryRejection(t *testing.T) {
 }
 
 func TestRmdirWithOperationDoesNotRemoveRecreatedDirectory(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, []uint64{2, 3})
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -69,6 +73,7 @@ func TestRmdirWithOperationDoesNotRemoveRecreatedDirectory(t *testing.T) {
 }
 
 func TestRmdirWithOperationRetainsNotEmptyRejection(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, []uint64{2, 3})
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))

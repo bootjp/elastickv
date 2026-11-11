@@ -273,6 +273,7 @@ func TestInstallEncryptionRotateOnStartupRequest_RetriesTransientWhileLeader(t *
 }
 
 func TestInstallEncryptionRotateOnStartupRequest_CallbackDoesNotBlockOnDone(t *testing.T) {
+	t.Parallel()
 	controller := &fakeRotateStartupController{state: raftengine.StateFollower}
 	runner := &blockingDoneRotateStartupRunner{
 		doneEntered: make(chan struct{}),
@@ -298,6 +299,7 @@ func TestInstallEncryptionRotateOnStartupRequest_CallbackDoesNotBlockOnDone(t *t
 }
 
 func TestInstallEncryptionRotateOnStartupRequest_WaitTracksAsyncFlight(t *testing.T) {
+	t.Parallel()
 	controller := &fakeRotateStartupController{state: raftengine.StateFollower}
 	runner := &blockingRunRotateStartupRunner{
 		started: make(chan struct{}),
@@ -334,6 +336,7 @@ func TestInstallEncryptionRotateOnStartupRequest_WaitTracksAsyncFlight(t *testin
 }
 
 func TestInstallEncryptionRotateOnStartupRequest_WaitContinuesAfterConcurrentFire(t *testing.T) {
+	t.Parallel()
 	runner := &blockingRunRotateStartupRunner{
 		started: make(chan struct{}),
 		release: make(chan struct{}),
@@ -368,6 +371,7 @@ func TestInstallEncryptionRotateOnStartupRequest_WaitContinuesAfterConcurrentFir
 }
 
 func TestInstallEncryptionRotateOnStartupRequest_BlocksMutatorsDuringAsyncStartupFlight(t *testing.T) {
+	t.Parallel()
 	controller := &fakeRotateStartupController{state: raftengine.StateFollower}
 	runner := &blockingRunRotateStartupRunner{
 		started: make(chan struct{}),

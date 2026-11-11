@@ -15,6 +15,7 @@ import (
 )
 
 func TestSQSFIFODelayUpgradesExistingUnindexedRecords(t *testing.T) {
+	t.Parallel()
 	for _, partitions := range []uint32{1, 4} {
 		t.Run(fmt.Sprint(partitions), func(t *testing.T) {
 			st := store.NewMVCCStore()
@@ -65,6 +66,7 @@ func TestSQSFIFODelayUpgradesExistingUnindexedRecords(t *testing.T) {
 }
 
 func TestSQSFIFODelayEncryptedReopen(t *testing.T) {
+	t.Parallel()
 	keys := encryption.NewKeystore()
 	dek := make([]byte, encryption.KeySize)
 	_, err := rand.Read(dek)
@@ -146,6 +148,7 @@ func (s *fifoDelayRoutedStore) ScanGroupAt(ctx context.Context, group uint64, st
 }
 
 func TestSQSFIFODelayUsesPartitionGroupForBackfillAndHead(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	t.Cleanup(func() { require.NoError(t, st.Close()) })
 	resolver := NewSQSPartitionResolver(map[string][]uint64{fifoDelayTestQueue: {10, 11, 12, 13}})

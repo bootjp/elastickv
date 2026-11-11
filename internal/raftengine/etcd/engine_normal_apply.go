@@ -17,12 +17,14 @@ import (
 // Async execution derives duplicate from the apply actor's ordered cursor,
 // not a stale owner-published applied index. Both paths capture on the owner.
 type normalApplyInput struct {
-	index     uint64
-	data      []byte
-	duplicate bool
-	cutover   RaftCutoverIndex
-	cipher    *encryption.Cipher
-	fsm       StateMachine
+	index       uint64
+	entry       raftpb.Entry
+	data        []byte
+	duplicate   bool
+	cutover     RaftCutoverIndex
+	cipher      *encryption.Cipher
+	fsm         StateMachine
+	beforeApply func(raftpb.Entry, []byte) error
 }
 
 // normalApplyReceipt is execution's verdict, not a published applied index or
@@ -39,12 +41,14 @@ type normalApplyReceipt struct {
 // cutover's current value: a preceding queued apply can enable encryption.
 func (e *Engine) prepareNormalApply(entry raftpb.Entry, duplicate bool) normalApplyInput {
 	return normalApplyInput{
-		index: entry.GetIndex(), data: entry.GetData(), duplicate: duplicate,
+		index: entry.GetIndex(), entry: entry, data: entry.GetData(), duplicate: duplicate,
 		cutover: e.raftCutoverIndex, cipher: e.raftCipher, fsm: e.fsm,
+		beforeApply: e.invalidateBeforeBootstrapPolicy,
 	}
 }
 
-// executeNormalApply has no Engine/RawNode access and never completes proposals.
+// executeNormalApply never mutates RawNode or completes proposals. Protected
+// admission callbacks may revoke authority before FSM effects.
 // HaltApply is checked even on duplicate volatile replay. Ordinary FSM verdicts
 // (including errors without HaltApply) remain committed responses.
 func executeNormalApply(input normalApplyInput) normalApplyReceipt {
@@ -91,10 +95,24 @@ func (input normalApplyInput) applyNormalEntry() (any, error) {
 	if input.duplicate && !isVolatilePayload(input.fsm, payload) {
 		return nil, nil
 	}
+	return input.applyCleartext(payload)
+}
+
+func (input normalApplyInput) applyCleartext(payload []byte) (any, error) {
 	// A volatile replay has an old index; never feed it to a durability sink.
 	if !input.duplicate {
-		if aware, ok := input.fsm.(raftengine.ApplyIndexAware); ok {
+		if aware, ok := input.fsm.(raftengine.ApplyEntryIdentityAware); ok {
+			aware.SetApplyEntryIdentity(raftengine.NewAppliedEntryIdentity(
+				input.entry.GetIndex(), input.entry.GetTerm(), int32(input.entry.GetType()), payload,
+			))
+			defer aware.ClearApplyEntryIdentity()
+		} else if aware, ok := input.fsm.(raftengine.ApplyIndexAware); ok {
 			aware.SetApplyIndex(input.index)
+		}
+	}
+	if input.beforeApply != nil {
+		if err := input.beforeApply(input.entry, payload); err != nil {
+			return nil, err
 		}
 	}
 	// Without encryption payload aliases committed data; decrypt allocates its

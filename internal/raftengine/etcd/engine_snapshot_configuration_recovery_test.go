@@ -99,7 +99,7 @@ func testSnapshotConfigurationNativeWALRecovery(t *testing.T, v2, file bool) {
 	// Read the actual WAL-selected boundary, not just the in-memory snapshot.
 	restored := &testStateMachine{}
 	selected, err := loadWalState(zap.NewNop(), filepath.Join(e.dataDir, walDirName),
-		filepath.Join(e.dataDir, snapDirName), filepath.Join(e.dataDir, fsmSnapDirName), restored, nil)
+		filepath.Join(e.dataDir, snapDirName), filepath.Join(e.dataDir, fsmSnapDirName), restored)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, closePersist(selected.Persist)) })
 	wantConf := &raftpb.ConfState{Voters: []uint64{1}, Learners: []uint64{fixture.joining.NodeID}, AutoLeave: proto.Bool(false)}

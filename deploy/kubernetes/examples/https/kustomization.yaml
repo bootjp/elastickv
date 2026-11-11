@@ -1,0 +1,21 @@
+# Set the public hostnames, ingress class, TLS Secret, and built image digest.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: elastickv
+resources:
+  - ../../base
+  - ingress.yaml
+  - networkpolicy.yaml
+patches:
+  - target:
+      group: apps
+      version: v1
+      kind: StatefulSet
+      name: elastickv
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/image
+        value: example.invalid/elastickv:public-endpoint-build-required
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: --sqsPublicEndpoint=https://sqs.example.test

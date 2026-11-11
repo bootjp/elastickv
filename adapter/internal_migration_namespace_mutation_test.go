@@ -83,6 +83,7 @@ func namespaceMutationRPCs() map[string]func(context.Context, *Internal) error {
 }
 
 func TestInternalMigrationDataOpcodesRequireExplicitGateAfterActivation(t *testing.T) {
+	t.Parallel()
 	for _, name := range []string{"import-unversioned", "promote-unversioned"} {
 		t.Run(name, func(t *testing.T) {
 			i, proposer := namespaceMutationFixture(t, true, true)
@@ -96,6 +97,7 @@ func TestInternalMigrationDataOpcodesRequireExplicitGateAfterActivation(t *testi
 }
 
 func TestInternalMigrationMutationsRetainDedicatedRPCAuthentication(t *testing.T) {
+	t.Parallel()
 	methods := map[string]string{"import-unversioned": pb.Internal_ImportRangeVersions_FullMethodName,
 		"promote-unversioned":   pb.Internal_PromoteStagedVersions_FullMethodName,
 		"readiness-unversioned": pb.Internal_ApplyTargetStagedReadiness_FullMethodName}
@@ -121,6 +123,7 @@ func TestInternalMigrationMutationsRetainDedicatedRPCAuthentication(t *testing.T
 }
 
 func TestNamespaceRuntimeFixturesUseActualActivationAndMonotonicProposals(t *testing.T) {
+	t.Parallel()
 	for _, split := range []bool{false, true} {
 		st := store.NewMVCCStore()
 		var client *ownershipRuntimeClient
@@ -160,6 +163,7 @@ func namespaceMutationSnapshot(t *testing.T, st store.MVCCStore) []byte {
 }
 
 func TestInternalMigrationMutationsRequireNamespaceBeforeProposal(t *testing.T) {
+	t.Parallel()
 	for name, call := range namespaceMutationRPCs() {
 		for _, configured := range []bool{false, true} {
 			t.Run(name+map[bool]string{false: "/unconfigured", true: "/inactive"}[configured], func(t *testing.T) {
@@ -177,6 +181,7 @@ func TestInternalMigrationMutationsRequireNamespaceBeforeProposal(t *testing.T) 
 }
 
 func TestInternalMigrationMutationsRequireInstalledHooksAfterActivation(t *testing.T) {
+	t.Parallel()
 	for name, call := range namespaceMutationRPCs() {
 		t.Run(name, func(t *testing.T) {
 			i, proposer := namespaceMutationFixture(t, true, false)
@@ -189,6 +194,7 @@ func TestInternalMigrationMutationsRequireInstalledHooksAfterActivation(t *testi
 }
 
 func TestInternalMigrationMutationsAcceptActivatedProtocol(t *testing.T) {
+	t.Parallel()
 	for name, call := range namespaceMutationRPCs() {
 		t.Run(name, func(t *testing.T) {
 			i, proposer := namespaceMutationFixture(t, true, true)

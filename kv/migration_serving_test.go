@@ -40,6 +40,7 @@ func staleServingEngine(t *testing.T, version uint64) *distribution.Engine {
 }
 
 func TestMigrationServingJoinedVoterRejectsStaleCatalogReadsAndApply(t *testing.T) {
+	t.Parallel()
 	source := store.NewMVCCStore()
 	require.NoError(t, source.PutAt(t.Context(), []byte("n"), []byte("old-source"), 90, 0))
 	retireServingSource(t, source)
@@ -88,6 +89,7 @@ func TestMigrationServingJoinedVoterRejectsStaleCatalogReadsAndApply(t *testing.
 }
 
 func TestMigrationServingCoalescedRequestsKeepIndependentResults(t *testing.T) {
+	t.Parallel()
 	st, err := store.NewPebbleStore(t.TempDir())
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, st.Close()) })
@@ -115,6 +117,7 @@ func TestMigrationServingCoalescedRequestsKeepIndependentResults(t *testing.T) {
 }
 
 func TestMigrationServingProofRejectsMixedAndFutureVersions(t *testing.T) {
+	t.Parallel()
 	states := []store.MigrationOwnershipState{{JobID: 8, LocalGroupID: 1, OwnerGroupID: 1, Role: store.MigrationOwner,
 		Generation: "0123456789abcdef0123456789abcdef", RouteID: 3, ConfigurationIndex: 3, AppliedIndex: 9, DescriptorHash: make([]byte, 32),
 		Receipts:       []store.MigrationOwnershipReceipt{{Operation: store.MigrationOwnershipClear, CatalogVersion: 12, ConfigurationIndex: 3, AppliedIndex: 9, DescriptorHash: make([]byte, 32)}},
@@ -147,6 +150,7 @@ func TestMigrationServingProofRejectsMixedAndFutureVersions(t *testing.T) {
 }
 
 func TestMigrationServingMatchingCommitAbortDrain(t *testing.T) {
+	t.Parallel()
 	for _, phase := range []pb.Phase{pb.Phase_COMMIT, pb.Phase_ABORT} {
 		t.Run(phase.String(), func(t *testing.T) {
 			fsm := newComposed1FSM(t, staleServingEngine(t, 9), 1)
@@ -165,6 +169,7 @@ func TestMigrationServingMatchingCommitAbortDrain(t *testing.T) {
 }
 
 func TestMigrationServingScopedHistoryCarriesOwnershipFloor(t *testing.T) {
+	t.Parallel()
 	fsm := newComposed1FSM(t, staleServingEngine(t, 9), 1)
 	proofs := migrationAdmissionProofs(store.MigrationServingState{Ownership: []store.MigrationOwnershipState{{
 		JobID: 8, LocalGroupID: 1, OwnerGroupID: 1, CatalogVersion: 12,

@@ -146,16 +146,15 @@ const (
 )
 
 type RedisServer struct {
-	listen          net.Listener
-	store           store.MVCCStore
-	coordinator     kv.Coordinator
-	readTracker     *kv.ActiveTimestampTracker
-	redisTranscoder *redisTranscoder
-	pubsub          *redisPubSub
-	scriptMu        sync.RWMutex
-	scriptCache     map[string]string
-	luaPool         *luaStatePool
-	luaPoolOnce     sync.Once
+	listen      net.Listener
+	store       store.MVCCStore
+	coordinator kv.Coordinator
+	readTracker *kv.ActiveTimestampTracker
+	pubsub      *redisPubSub
+	scriptMu    sync.RWMutex
+	scriptCache map[string]string
+	luaPool     *luaStatePool
+	luaPoolOnce sync.Once
 	// luaPoolMaxIdle is the configured cap on idle pooled *lua.LStates.
 	// Set via WithLuaPoolMaxIdle before NewRedisServer materializes the
 	// pool; getLuaPool falls back to DefaultLuaPoolMaxIdle when the
@@ -178,7 +177,17 @@ type RedisServer struct {
 	// heavyCommandLimiter bounds CPU-heavy Redis command families so one
 	// expensive path cannot occupy every scheduler P and starve Raft.
 	// nil preserves the historical unbounded path for narrow test fixtures.
-	heavyCommandLimiter *redisHeavyCommandLimiter
+	heavyCommandLimiter     *redisHeavyCommandLimiter
+	requestAdmission        RequestAdmission
+	replyBudget             redisReplyBudget
+	replyWriteTimeout       time.Duration
+	executionBudget         redisProtectedExecutionBudget
+	blockingExecutionBudget redisProtectedExecutionBudget
+	wireTxnMu               sync.Mutex
+	wireTxns                map[*redisWireTxn]struct{}
+	wireTxnIdleTimeout      time.Duration
+	wireTxnBudgetLimit      int
+	wireTxnBytes            int
 	// peerLimiter bounds concurrent Redis connections per remote peer IP.
 	peerLimiter *redisPeerLimiter
 	// blockWaitFallback is the safety-net polling interval used by blocking
@@ -198,9 +207,10 @@ type RedisServer struct {
 
 	// leaderClients caches go-redis clients per leader address to avoid
 	// creating a new connection pool for every proxied request.
-	leaderClientsMu       sync.RWMutex
-	leaderClients         map[string]*redis.Client
-	blockingLeaderClients map[string]*redis.Client
+	leaderClientsMu        sync.RWMutex
+	leaderClients          map[string]*redis.Client
+	blockingLeaderClients  map[string]*redis.Client
+	leaderClientsCloseOnce sync.Once
 
 	// compactor is the background DeltaCompactor for this node. When set,
 	// urgent compaction is triggered on ErrDeltaScanTruncated to unblock
@@ -401,6 +411,9 @@ func (c *redisMetricsConn) WriteError(msg string) {
 // kv.isLeadershipLossError so any sentinel those classifiers already
 // recognize as transient also flips a Redis reply to NOTLEADER.
 func writeRedisError(conn redcon.Conn, err error) {
+	if recorder, ok := conn.(interface{ recordRequestError(error) }); ok {
+		recorder.recordRequestError(err)
+	}
 	msg := err.Error()
 	if isTransientLeaderRedisError(err) {
 		if strings.HasPrefix(strings.ToUpper(msg), "NOTLEADER ") {
@@ -493,9 +506,12 @@ func (c *redisMetricsConn) reset(conn redcon.Conn) {
 }
 
 type connState struct {
-	mu    sync.Mutex
-	inTxn bool
-	queue []redcon.Command
+	mu                  sync.Mutex
+	inTxn               bool
+	transactionRefused  bool
+	transactionPoisoned bool
+	wireTxn             *redisWireTxn
+	queue               []redcon.Command
 	// connID is a monotonically increasing per-server connection
 	// identifier assigned on first access via getConnState. Exposed via
 	// HELLO's `id` field and CLIENT ID / CLIENT INFO for parity with
@@ -540,7 +556,6 @@ func NewRedisServer(listen net.Listener, redisAddr string, store store.MVCCStore
 		listen:                listen,
 		store:                 store,
 		coordinator:           kv.WithKeyVizLabel(coordinate, keyviz.LabelRedis),
-		redisTranscoder:       newRedisTranscoder(),
 		redisAddr:             redisAddr,
 		relay:                 relay,
 		leaderRedis:           leaderRedis,
@@ -581,6 +596,10 @@ func NewRedisServer(listen net.Listener, redisAddr string, store store.MVCCStore
 		if opt != nil {
 			opt(r)
 		}
+	}
+	if r.compactor != nil && r.requestAdmission != nil {
+		// Startup-only injection before the compactor's Run goroutine starts.
+		r.compactor.requestAdmission = r.requestAdmission
 	}
 	r.pubsub.detach = r.detachPubSubConn
 	r.pubsub.onClose = r.releaseDetachedPubSubConn
@@ -625,6 +644,7 @@ func (r *RedisServer) acceptConn(conn redcon.Conn) bool {
 }
 
 func (r *RedisServer) closeConn(conn redcon.Conn) {
+	r.closeWireTransaction(conn)
 	if r == nil || r.peerLimiter == nil {
 		return
 	}
@@ -712,6 +732,17 @@ func (r *RedisServer) triggerUrgentCompaction(typeName string, key []byte) {
 }
 
 func (r *RedisServer) dispatchCommand(conn redcon.Conn, name string, handler func(redcon.Conn, redcon.Command), cmd redcon.Command, start time.Time) {
+	if r.dispatchProtectedTransaction(conn, name, cmd, start) {
+		return
+	}
+	if r.requestAdmission != nil {
+		r.dispatchOwnedCommand(conn, name, handler, cmd, start)
+		return
+	}
+	r.dispatchCommandUnowned(conn, name, handler, cmd, start)
+}
+
+func (r *RedisServer) dispatchCommandUnowned(conn redcon.Conn, name string, handler func(redcon.Conn, redcon.Command), cmd redcon.Command, start time.Time) {
 	if r.shouldLimitHeavyCommand(name) {
 		if ok := r.heavyCommandLimiter.submit(func() {
 			r.dispatchCommandDirect(conn, name, handler, cmd, start)
@@ -776,20 +807,27 @@ func isRedisIdleWaitCommand(name string) bool {
 }
 
 func (r *RedisServer) rejectHeavyCommand(conn redcon.Conn, name string, cmd redcon.Command, start time.Time) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	r.traceCommandError(conn, name, cmd.Args[1:], "heavy command pool full")
 	conn.WriteError(errRedisHeavyCommandPoolFull.Error())
 	r.observeRedisError(name, time.Since(start))
 }
 
-// handlerContext returns the base context for a request handler.
-// Falls back to context.Background() when the server was constructed
-// by a test stub that bypassed NewRedisServer. Handlers that need a
-// deadline should wrap this via context.WithTimeout.
-func (r *RedisServer) handlerContext() context.Context {
-	if r == nil || r.baseCtx == nil {
-		return context.Background()
+// handlerContext extracts a command carrier without touching connection state.
+// Missing carriers fail closed in protected mode. Legacy fixtures fall back to
+// the server context; handlers may add a deadline with context.WithTimeout.
+func (r *RedisServer) handlerContext(conns ...redcon.Conn) context.Context {
+	if len(conns) != 0 {
+		if carrier, ok := conns[0].(interface{ requestContext() context.Context }); ok {
+			if ctx := carrier.requestContext(); ctx != nil {
+				return ctx
+			}
+		}
 	}
-	return r.baseCtx
+	return r.redisContext()
 }
 
 // Close cancels the base context, signalling all in-flight handlers to
@@ -802,6 +840,10 @@ func (r *RedisServer) Close() error {
 	}
 	if r.baseCancel != nil {
 		r.baseCancel()
+	}
+	r.closeWireTransactions()
+	if r.pubsub != nil {
+		r.pubsub.Close()
 	}
 	return nil
 }
@@ -833,51 +875,7 @@ func (r *RedisServer) RegisterLuaPoolMetrics(registerer prometheus.Registerer) e
 
 func (r *RedisServer) Run() error {
 	err := redcon.Serve(r.listen,
-		func(conn redcon.Conn, cmd redcon.Command) {
-			if !r.inflight.enter() {
-				conn.WriteError("ERR server is shutting down")
-				return
-			}
-			defer r.inflight.exit()
-			needsTiming := r.requestObserver != nil || r.traceCommands
-			var start time.Time
-			if needsTiming {
-				start = time.Now()
-			}
-			state := getConnState(conn)
-			name := strings.ToUpper(string(cmd.Args[0]))
-			handler, ok := r.route[name]
-			if !ok {
-				r.traceCommandError(conn, name, cmd.Args[1:], "unsupported")
-				conn.WriteError("ERR unsupported command '" + string(cmd.Args[0]) + "'")
-				// Pass the RAW command bytes (not the already-uppercased `name`)
-				// so that the unsupported-command observer can detect invalid
-				// UTF-8 before strings.ToUpper silently rewrites the bytes to
-				// the U+FFFD replacement character. See observeUnsupportedCommand
-				// in monitoring/redis.go.
-				r.observeRedisUnsupported(string(cmd.Args[0]), time.Since(start))
-				return
-			}
-
-			if err := r.validateCmd(cmd); err != nil {
-				r.traceCommandError(conn, name, cmd.Args[1:], err.Error())
-				writeRedisError(conn, err)
-				r.observeRedisError(name, time.Since(start))
-				return
-			}
-
-			if state.inTxn && name != cmdExec && name != cmdDiscard && name != cmdMulti {
-				// redcon reuses the underlying argument buffers; copy queued commands
-				// so MULTI/EXEC works reliably under concurrency and with -race.
-				state.queue = append(state.queue, cloneCommand(cmd))
-				r.traceCommandDone(conn, name, cmd.Args[1:], 0, true)
-				conn.WriteString("QUEUED")
-				r.observeRedisSuccess(name, time.Since(start))
-				return
-			}
-
-			r.dispatchCommand(conn, name, handler, cmd, start)
-		},
+		r.handleRedisCommand,
 		func(conn redcon.Conn) bool {
 			return r.acceptConn(conn)
 		},
@@ -888,6 +886,60 @@ func (r *RedisServer) Run() error {
 		})
 
 	return errors.WithStack(err)
+}
+
+func (r *RedisServer) handleRedisCommand(conn redcon.Conn, cmd redcon.Command) {
+	conn = r.replyConn(conn)
+	if !r.inflight.enter() {
+		conn.WriteError("ERR server is shutting down")
+		return
+	}
+	defer r.inflight.exit()
+	execution, admitted := r.acquireProtectedExecution(conn, cmd)
+	if !admitted {
+		return
+	}
+	defer releaseRedisExecution(execution)
+	if len(cmd.Args) == 0 {
+		conn.WriteError("ERR empty command")
+		return
+	}
+	var start time.Time
+	if r.requestObserver != nil || r.traceCommands {
+		start = time.Now()
+	}
+	name := strings.ToUpper(string(cmd.Args[0]))
+	if r.dispatchProtectedTransaction(conn, name, cmd, start) {
+		return
+	}
+	handler, ok := r.route[name]
+	if !ok {
+		r.traceCommandError(conn, name, cmd.Args[1:], "unsupported")
+		conn.WriteError("ERR unsupported command '" + string(cmd.Args[0]) + "'")
+		// Keep raw bytes for the observer's invalid UTF-8 classification.
+		r.observeRedisUnsupported(string(cmd.Args[0]), time.Since(start))
+		return
+	}
+	if err := r.validateCmd(cmd); err != nil {
+		r.traceCommandError(conn, name, cmd.Args[1:], err.Error())
+		writeRedisError(conn, err)
+		r.observeRedisError(name, time.Since(start))
+		return
+	}
+	state := getConnState(conn)
+	if redisQueueOnlyCommand(state, name) {
+		// Protected queues are handled above with their retained MULTI owner.
+		state.queue = append(state.queue, cloneCommand(cmd))
+		r.traceCommandDone(conn, name, cmd.Args[1:], 0, true)
+		conn.WriteString("QUEUED")
+		r.observeRedisSuccess(name, time.Since(start))
+		return
+	}
+	r.dispatchCommand(conn, name, handler, cmd, start)
+}
+
+func redisQueueOnlyCommand(state *connState, name string) bool {
+	return state.inTxn && name != cmdExec && name != cmdDiscard && name != cmdMulti
 }
 
 func cloneCommand(cmd redcon.Command) redcon.Command {
@@ -1029,7 +1081,25 @@ func (r *RedisServer) Stop() {
 			slog.Int64("in_flight", r.inflight.remaining()),
 			slog.Duration("timeout", redisShutdownTimeout),
 		)
+		if r.requestAdmission != nil {
+			// A protected runtime must retain ownership instead of closing
+			// storage underneath a context-insensitive I/O still in flight.
+			<-r.inflight.idle
+		}
 	}
+	r.closeLeaderClients()
+}
+
+func (r *RedisServer) closeLeaderClients() {
+	r.leaderClientsCloseOnce.Do(func() {
+		r.leaderClientsMu.Lock()
+		defer r.leaderClientsMu.Unlock()
+		for _, clients := range []map[string]*redis.Client{r.leaderClients, r.blockingLeaderClients} {
+			for _, client := range clients {
+				_ = client.Close()
+			}
+		}
+	})
 }
 
 func (r *RedisServer) publishLocal(channel, message []byte) int64 {
@@ -1126,6 +1196,10 @@ func (r *RedisServer) validateCmd(cmd redcon.Command) error {
 const pingMessageArgCount = 2
 
 func (r *RedisServer) ping(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	switch len(cmd.Args) {
 	case 1:
 		conn.WriteString("PONG")

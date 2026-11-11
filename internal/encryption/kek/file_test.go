@@ -28,6 +28,7 @@ func writeKEK(t *testing.T, n int) string {
 }
 
 func TestFileWrapper_RoundTrip(t *testing.T) {
+	t.Parallel()
 	path := writeKEK(t, 32)
 	w, err := kek.NewFileWrapper(path)
 	if err != nil {
@@ -54,6 +55,7 @@ func TestFileWrapper_RoundTrip(t *testing.T) {
 }
 
 func TestFileWrapper_DifferentNonceEachWrap(t *testing.T) {
+	t.Parallel()
 	path := writeKEK(t, 32)
 	w, err := kek.NewFileWrapper(path)
 	if err != nil {
@@ -80,6 +82,7 @@ func TestFileWrapper_DifferentNonceEachWrap(t *testing.T) {
 }
 
 func TestFileWrapper_RejectsBadKEKLength(t *testing.T) {
+	t.Parallel()
 	for _, n := range []int{0, 1, 16, 24, 31, 33, 64} {
 		path := writeKEK(t, n)
 		_, err := kek.NewFileWrapper(path)
@@ -90,6 +93,7 @@ func TestFileWrapper_RejectsBadKEKLength(t *testing.T) {
 }
 
 func TestFileWrapper_RejectsBadDEKLength(t *testing.T) {
+	t.Parallel()
 	path := writeKEK(t, 32)
 	w, err := kek.NewFileWrapper(path)
 	if err != nil {
@@ -104,6 +108,7 @@ func TestFileWrapper_RejectsBadDEKLength(t *testing.T) {
 }
 
 func TestFileWrapper_Unwrap_TamperedNonce(t *testing.T) {
+	t.Parallel()
 	path := writeKEK(t, 32)
 	w, err := kek.NewFileWrapper(path)
 	if err != nil {
@@ -122,6 +127,7 @@ func TestFileWrapper_Unwrap_TamperedNonce(t *testing.T) {
 }
 
 func TestFileWrapper_Unwrap_TamperedTag(t *testing.T) {
+	t.Parallel()
 	path := writeKEK(t, 32)
 	w, err := kek.NewFileWrapper(path)
 	if err != nil {
@@ -140,6 +146,7 @@ func TestFileWrapper_Unwrap_TamperedTag(t *testing.T) {
 }
 
 func TestFileWrapper_Unwrap_TooShort(t *testing.T) {
+	t.Parallel()
 	path := writeKEK(t, 32)
 	w, err := kek.NewFileWrapper(path)
 	if err != nil {
@@ -154,6 +161,7 @@ func TestFileWrapper_Unwrap_TooShort(t *testing.T) {
 }
 
 func TestFileWrapper_Unwrap_TooLong(t *testing.T) {
+	t.Parallel()
 	path := writeKEK(t, 32)
 	w, err := kek.NewFileWrapper(path)
 	if err != nil {
@@ -172,6 +180,7 @@ func TestFileWrapper_Unwrap_TooLong(t *testing.T) {
 }
 
 func TestFileWrapper_Name(t *testing.T) {
+	t.Parallel()
 	path := writeKEK(t, 32)
 	w, err := kek.NewFileWrapper(path)
 	if err != nil {
@@ -184,6 +193,7 @@ func TestFileWrapper_Name(t *testing.T) {
 }
 
 func TestFileWrapper_NewFileWrapper_MissingFile(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	_, err := kek.NewFileWrapper(filepath.Join(dir, "does-not-exist.bin"))
 	if err == nil {
@@ -197,6 +207,7 @@ func TestFileWrapper_NewFileWrapper_MissingFile(t *testing.T) {
 // boundary on a multi-user host. NewFileWrapper now stat()s the file
 // and refuses anything with bits in 0o077.
 func TestFileWrapper_RejectsInsecureMode(t *testing.T) {
+	t.Parallel()
 	if runtime.GOOS == "windows" {
 		t.Skip("permission bits not enforced on Windows")
 	}
@@ -241,6 +252,7 @@ func TestFileWrapper_RejectsInsecureMode(t *testing.T) {
 }
 
 func TestFileWrapper_AcceptsOwnerOnlyMode(t *testing.T) {
+	t.Parallel()
 	if runtime.GOOS == "windows" {
 		t.Skip("permission bits not enforced on Windows")
 	}
@@ -273,6 +285,7 @@ func TestFileWrapper_AcceptsOwnerOnlyMode(t *testing.T) {
 // caps the read at fileKEKSize+1 so a too-long file fails fast on
 // the length check without exhausting memory.
 func TestFileWrapper_RejectsOversizedFile(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "kek.bin")
 	// 64 KiB — large enough that an unbounded ReadAll would observably
@@ -298,6 +311,7 @@ func TestFileWrapper_RejectsOversizedFile(t *testing.T) {
 // FIFO test: a directory is also a non-regular file. Works on every
 // platform (no syscall.Mkfifo dependency).
 func TestFileWrapper_RejectsDirectory(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	_, err := kek.NewFileWrapper(dir)
 	if err == nil {

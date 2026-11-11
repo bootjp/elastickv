@@ -69,37 +69,6 @@ var ErrEncodeValueTooLarge = errors.New("backup: encoded value length exceeds li
 // emit (claude review on PR #825).
 var ErrSnapshotBuilderReused = errors.New("backup: snapshotBuilder.WriteTo called more than once")
 
-// ErrLastCommitTSRegression is returned by ResolveCommitTS when a
-// `--last-commit-ts` override is older than MANIFEST.last_commit_ts.
-// Seeding the restored node's HLC ceiling below a timestamp already
-// durable in the dump would let a post-restart leader re-issue a
-// timestamp at-or-below a restored row's commit ts — the exact
-// HLC-ceiling regression the design's §"MVCC re-encoding" forbids.
-// Raising the ceiling (T >= manifest) is always safe; lowering it is
-// not, so the override is accepted in one direction only.
-var ErrLastCommitTSRegression = errors.New("backup: --last-commit-ts override is older than manifest last_commit_ts")
-
-// ResolveCommitTS returns the commit timestamp the encoder stamps on
-// every reconstructed key (design §"MVCC re-encoding": uniform
-// stamping). manifestTS is MANIFEST.last_commit_ts; override is the
-// optional `--last-commit-ts` value (nil = no override).
-//
-// Fail-closed contract: an override is accepted only when it is
-// >= manifestTS (raising the restored HLC ceiling is safe; lowering
-// it risks a post-restart timestamp colliding with a restored row).
-// The returned value is used verbatim for BOTH the EKVPBBL1 header
-// and every key's invTS, so the two never disagree.
-func ResolveCommitTS(manifestTS uint64, override *uint64) (uint64, error) {
-	if override == nil {
-		return manifestTS, nil
-	}
-	if *override < manifestTS {
-		return 0, errors.Wrapf(ErrLastCommitTSRegression,
-			"override %d < manifest %d", *override, manifestTS)
-	}
-	return *override, nil
-}
-
 // encodeMVCCKey is the inverse of the key half of
 // snapshot_reader.go::decodeSnapshotEntry: it appends the 8-byte
 // big-endian inverted-timestamp suffix the live store's
@@ -149,7 +118,8 @@ type snapshotBuilder struct {
 }
 
 // newSnapshotBuilder constructs a builder that stamps every key with
-// commitTS (the value ResolveCommitTS returned).
+// commitTS: the manifest last_commit_ts, or the CLI --last-commit-ts
+// override that cmd/elastickv-snapshot-encode resolveLastCommitTS accepted.
 func newSnapshotBuilder(commitTS uint64) *snapshotBuilder {
 	return &snapshotBuilder{
 		commitTS: commitTS,

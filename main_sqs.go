@@ -27,9 +27,14 @@ func prepareSQSServer(
 	leaderSQS map[string]string,
 	region string,
 	credentialsFile string,
+	publicEndpoint string,
 	partitionResolver *adapter.SQSPartitionResolver,
 	partitionObserver adapter.SQSPartitionObserver,
 ) (*adapter.SQSServer, net.Listener, error) {
+	endpointOption, err := adapter.WithSQSPublicEndpoint(publicEndpoint)
+	if err != nil {
+		return nil, nil, errors.WithStack(err)
+	}
 	sqsAddr = strings.TrimSpace(sqsAddr)
 	sqsL, err := openSQSListener(ctx, lc, sqsAddr)
 	if err != nil {
@@ -56,7 +61,9 @@ func prepareSQSServer(
 		shardStore,
 		coordinate,
 		adapter.WithSQSLeaderMap(leaderSQS),
+		adapter.WithSQSRequestAdmission(bootstrapRequestAdmissionForCoordinator(coordinate)),
 		adapter.WithSQSRegion(region),
+		endpointOption,
 		adapter.WithSQSStaticCredentials(staticCreds),
 		adapter.WithSQSPartitionResolver(partitionResolver),
 		adapter.WithSQSPartitionObserver(partitionObserver),

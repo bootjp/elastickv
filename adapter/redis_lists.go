@@ -808,7 +808,7 @@ func (r *RedisServer) fenceRangeListReadGroups(ctx context.Context, key []byte, 
 		return 0, nil, nil, false, err
 	}
 	if ok {
-		proxied, err := r.proxyLRange(key, proxyKey, startRaw, endRaw)
+		proxied, err := r.proxyLRange(key, proxyKey, startRaw, endRaw, ctx)
 		return 0, nil, proxied, true, err
 	}
 	readTimestamp, readPin, err := r.redisReadFencedTimestampForTargets(
@@ -820,12 +820,16 @@ func (r *RedisServer) fenceRangeListReadGroups(ctx context.Context, key []byte, 
 }
 
 type listPushFunc func(ctx context.Context, key []byte, values [][]byte) (int64, error)
-type listProxyFunc func(key []byte, values [][]byte) (int64, error)
+type listProxyFunc func(key []byte, values [][]byte, contexts ...context.Context) (int64, error)
 
 func (r *RedisServer) listPushCmd(conn redcon.Conn, cmd redcon.Command, pushFn listPushFunc, proxyFn listProxyFunc) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	key := cmd.Args[1]
 	if !r.coordinator.IsLeaderForKey(redisUserRouteKey(key)) {
-		length, err := proxyFn(key, cmd.Args[2:])
+		length, err := proxyFn(key, cmd.Args[2:], r.handlerContext(conn))
 		if err != nil {
 			writeRedisError(conn, err)
 			return
@@ -834,7 +838,8 @@ func (r *RedisServer) listPushCmd(conn redcon.Conn, cmd redcon.Command, pushFn l
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(conn),
+		redisDispatchTimeout)
 	defer cancel()
 	readTS := r.readTS()
 	typ, err := r.keyTypeAt(ctx, key, readTS)
@@ -857,11 +862,20 @@ func (r *RedisServer) listPushCmd(conn redcon.Conn, cmd redcon.Command, pushFn l
 }
 
 func (r *RedisServer) rpush(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	r.listPushCmd(conn, cmd, r.listRPush, r.proxyRPush)
 }
 
 func (r *RedisServer) lrange(conn redcon.Conn, cmd redcon.Command) {
-	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.handlerContext(conn),
+		redisDispatchTimeout)
 	defer cancel()
 	items, err := r.rangeList(ctx, cmd.Args[1], cmd.Args[2], cmd.Args[3])
 	if err != nil {
@@ -875,10 +889,22 @@ func (r *RedisServer) lrange(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) lpush(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	r.listPushCmd(conn, cmd, r.listLPush, r.proxyLPush)
 }
 
 func (r *RedisServer) ltrim(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+	r.ltrimCommand(conn, cmd)
+}
+
+func (r *RedisServer) ltrimCommand(conn redcon.Conn, cmd redcon.Command) {
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
@@ -892,7 +918,8 @@ func (r *RedisServer) ltrim(conn redcon.Conn, cmd redcon.Command) {
 		writeRedisError(conn, err)
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(conn),
+		redisDispatchTimeout)
 	defer cancel()
 	key := cmd.Args[1]
 	if err := r.retryRedisWrite(ctx, func() error {
@@ -932,6 +959,10 @@ func trimListValues(current []string, start, stop int) []string {
 }
 
 func (r *RedisServer) lindex(conn redcon.Conn, cmd redcon.Command) {
+	if !r.requireRequestContext(conn) {
+		return
+	}
+
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
@@ -940,7 +971,8 @@ func (r *RedisServer) lindex(conn redcon.Conn, cmd redcon.Command) {
 		writeRedisError(conn, err)
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(conn),
+		redisDispatchTimeout)
 	defer cancel()
 	readTS := r.readTS()
 	typ, err := r.keyTypeAt(ctx, cmd.Args[1], readTS)

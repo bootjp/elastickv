@@ -56,6 +56,7 @@ func (stubEncryptionAdminEngine) LinearizableRead(context.Context) (uint64, erro
 // the canonical derivation is in fact distinct for the canonical
 // 3-node config (n1 / n2 / n3) the demo + Jepsen runners use.
 func TestEncryptionAdminFullNodeID_DistinctPerRaftId(t *testing.T) {
+	t.Parallel()
 	seen := make(map[uint64]string)
 	for _, id := range []string{"n1", "n2", "n3"} {
 		got := etcdraftengine.DeriveNodeID(id)
@@ -191,6 +192,7 @@ func newEncryptionAdminRegistryTestStore(t *testing.T, name string) store.MVCCSt
 // production "gate ON" case, which is tested separately by
 // TestEncryptionAdmin_MutatingRPCEnabledWhenGateOn.
 func TestEncryptionAdmin_MutatingRPCRefusedWhenGateOff(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name           string
 		enableMutators bool
@@ -227,6 +229,7 @@ func TestEncryptionAdmin_MutatingRPCRefusedWhenGateOff(t *testing.T) {
 // is no longer firing, which is the property that distinguishes
 // gate-on from gate-off.
 func TestEncryptionAdmin_MutatingRPCEnabledWhenGateOn(t *testing.T) {
+	t.Parallel()
 	err := callBootstrapAgainstNewServer(t, true, stubEncryptionAdminEngine{})
 	// Whatever the deeper error, it must not be the FailedPrecondition
 	// from the gate. The stub Propose() returns success on a malformed
@@ -277,6 +280,7 @@ func callBootstrapAgainstNewServer(t *testing.T, enableMutators bool, engine enc
 }
 
 func TestRegisterEncryptionAdminServer_Registers(t *testing.T) {
+	t.Parallel()
 	gs := grpc.NewServer()
 	registerEncryptionAdminServer(gs, newEncryptionAdminServer(1, "", false, nil, nil, nil, nil))
 	info := gs.GetServiceInfo()
@@ -290,6 +294,7 @@ func TestRegisterEncryptionAdminServer_Registers(t *testing.T) {
 }
 
 func TestRegisterEncryptionAdminServer_CanReuseInstance(t *testing.T) {
+	t.Parallel()
 	srv := newEncryptionAdminServer(1, "", false, nil, nil, nil, nil)
 	first := grpc.NewServer()
 	second := grpc.NewServer()

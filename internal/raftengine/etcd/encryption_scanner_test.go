@@ -48,6 +48,7 @@ func scannerWithEntries(t *testing.T, entries ...raftpb.Entry) *encryptionScanne
 // startExclusive >= endInclusive must short-circuit to
 // (false, nil) without touching the storage backend.
 func TestEncryptionScanner_EmptyRange(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name  string
 		start uint64
@@ -79,6 +80,7 @@ func TestEncryptionScanner_EmptyRange(t *testing.T) {
 // scanner against it ensures the predicate's exclusion is wired
 // through end-to-end.
 func TestEncryptionScanner_NoRelevantEntries(t *testing.T) {
+	t.Parallel()
 	entries := []raftpb.Entry{
 		newEntry(1, 0x00),                   // non-encryption opcode
 		newEntry(2, 0x01),                   // non-encryption opcode
@@ -99,6 +101,7 @@ func TestEncryptionScanner_NoRelevantEntries(t *testing.T) {
 // at least one OpBootstrap entry in the range triggers the
 // predicate.
 func TestEncryptionScanner_BootstrapHit(t *testing.T) {
+	t.Parallel()
 	entries := []raftpb.Entry{
 		newEntry(1, 0x00),
 		newEntry(2, fsmwire.OpBootstrap),
@@ -119,6 +122,7 @@ func TestEncryptionScanner_BootstrapHit(t *testing.T) {
 // from index 1 to keep within MemoryStorage's sequential-index
 // requirement.
 func TestEncryptionScanner_RotationHit(t *testing.T) {
+	t.Parallel()
 	entries := []raftpb.Entry{
 		newEntry(1, 0x00),
 		newEntry(2, fsmwire.OpRotation),
@@ -139,6 +143,7 @@ func TestEncryptionScanner_RotationHit(t *testing.T) {
 // range. Config changes never carry FSM payloads, so they must
 // not falsely trigger the predicate.
 func TestEncryptionScanner_NonNormalEntriesSkipped(t *testing.T) {
+	t.Parallel()
 	entries := []raftpb.Entry{
 		{Type: entryTypePtr(raftpb.EntryConfChange), Term: uint64Ptr(1), Index: uint64Ptr(1), Data: encodeProposalEnvelope(1, []byte{fsmwire.OpBootstrap})},
 		{Type: entryTypePtr(raftpb.EntryConfChangeV2), Term: uint64Ptr(1), Index: uint64Ptr(2), Data: encodeProposalEnvelope(2, []byte{fsmwire.OpRotation})},
@@ -160,6 +165,7 @@ func TestEncryptionScanner_NonNormalEntriesSkipped(t *testing.T) {
 // for both — the predicate must short-circuit cleanly without
 // nil-deref or out-of-range panic.
 func TestEncryptionScanner_EmptyDataSkipped(t *testing.T) {
+	t.Parallel()
 	entries := []raftpb.Entry{
 		{Type: entryTypePtr(raftpb.EntryNormal), Term: uint64Ptr(1), Index: uint64Ptr(1), Data: nil},
 		{Type: entryTypePtr(raftpb.EntryNormal), Term: uint64Ptr(1), Index: uint64Ptr(2), Data: []byte{}},
@@ -183,6 +189,7 @@ func TestEncryptionScanner_EmptyDataSkipped(t *testing.T) {
 // every entry whose raw byte 0 happens to land in [0x04, 0x07] —
 // the exact false-positive class the envelope strip prevents.
 func TestEncryptionScanner_EnvelopeStripping_RawBytesIgnored(t *testing.T) {
+	t.Parallel()
 	entries := []raftpb.Entry{
 		// Bare opcode byte, no envelope. decodeProposalEnvelope
 		// returns ok=false because len(data) < envelopeHeaderSize.
@@ -208,6 +215,7 @@ func TestEncryptionScanner_EnvelopeStripping_RawBytesIgnored(t *testing.T) {
 // guard surfaces it as a scanner-error refusal (distinct from
 // ErrSidecarBehindRaftLog gap-coverage refusal).
 func TestEncryptionScanner_CompactedRange(t *testing.T) {
+	t.Parallel()
 	storage := etcdraft.NewMemoryStorage()
 	// Establish a snapshot at index 10 — entries below 10 become
 	// inaccessible via Entries().
@@ -241,6 +249,7 @@ func TestEncryptionScanner_CompactedRange(t *testing.T) {
 // rather than nil-deref. The range is non-empty so the
 // empty-range short-circuit doesn't fire first.
 func TestEncryptionScanner_NilStorageError(t *testing.T) {
+	t.Parallel()
 	var s encryptionScanner
 	_, err := s.HasEncryptionRelevantEntryInRange(0, 5)
 	if err == nil {
@@ -257,6 +266,7 @@ func TestEncryptionScanner_NilStorageError(t *testing.T) {
 // guards and reintroduces the contract violation claude flagged
 // on PR #783 r3.
 func TestEncryptionScanner_NilStorageEmptyRange(t *testing.T) {
+	t.Parallel()
 	var s encryptionScanner
 	hit, err := s.HasEncryptionRelevantEntryInRange(5, 5)
 	if err != nil {
@@ -274,6 +284,7 @@ func TestEncryptionScanner_NilStorageEmptyRange(t *testing.T) {
 // forward a maybe-nil engine pointer during startup/refusal
 // triage rely on this defensive return.
 func TestEngineEncryptionScanner_NilReceiver(t *testing.T) {
+	t.Parallel()
 	var e *Engine
 	scanner := e.EncryptionScanner()
 	if scanner == nil {
@@ -291,6 +302,7 @@ func TestEngineEncryptionScanner_NilReceiver(t *testing.T) {
 // range degenerate. The scanner detects this and refuses with
 // an explicit error rather than silently scanning nothing.
 func TestEncryptionScanner_EndInclusiveMaxUint64Refused(t *testing.T) {
+	t.Parallel()
 	s := scannerWithEntries(t) // empty storage; should still hit the overflow guard before any read
 	hit, err := s.HasEncryptionRelevantEntryInRange(0, ^uint64(0))
 	if err == nil {

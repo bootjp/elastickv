@@ -16,6 +16,7 @@ import (
 )
 
 func TestChooseLeaderBalanceMove_SeedsZeroCountVoters(t *testing.T) {
+	t.Parallel()
 	now := time.Unix(100, 0)
 	obs := leaderBalanceObservation{
 		counts: map[string]int{"n1": 3, "n2": 0, "n3": 0},
@@ -41,6 +42,7 @@ func TestChooseLeaderBalanceMove_SeedsZeroCountVoters(t *testing.T) {
 }
 
 func TestChooseLeaderBalanceMove_PartialObservationSkips(t *testing.T) {
+	t.Parallel()
 	now := time.Unix(100, 0)
 	obs := leaderBalanceObservation{
 		partial: true,
@@ -53,6 +55,7 @@ func TestChooseLeaderBalanceMove_PartialObservationSkips(t *testing.T) {
 }
 
 func TestChooseLeaderBalanceMove_RespectsCooldownAndPins(t *testing.T) {
+	t.Parallel()
 	now := time.Unix(100, 0)
 	cfg := leaderBalanceTestConfig()
 	cfg.pinnedGroups = map[uint64]bool{2: true}
@@ -74,6 +77,7 @@ func TestChooseLeaderBalanceMove_RespectsCooldownAndPins(t *testing.T) {
 }
 
 func TestChooseLeaderBalanceMove_PrioritizesMostOverloadedSource(t *testing.T) {
+	t.Parallel()
 	now := time.Unix(100, 0)
 	obs := leaderBalanceObservation{
 		counts: map[string]int{"n1": 100, "n2": 2, "n3": 0},
@@ -95,18 +99,21 @@ func TestChooseLeaderBalanceMove_PrioritizesMostOverloadedSource(t *testing.T) {
 }
 
 func TestLeaderBalanceConfigNormalizeClampsOneCountThreshold(t *testing.T) {
+	t.Parallel()
 	cfg := leaderBalanceConfig{imbalanceThreshold: 1}
 	cfg.normalize()
 	require.Equal(t, defaultLeaderBalanceImbalanceThreshold, cfg.imbalanceThreshold)
 }
 
 func TestLeaderBalanceTargetCandidatesRequireObjectiveImprovement(t *testing.T) {
+	t.Parallel()
 	group := balanceGroupForLeader(2, "n1", "127.0.0.1:5001", "n1", "n2")
 	candidates := leaderBalanceTargetCandidates(group, map[string]int{"n1": 1, "n2": 0}, 1)
 	require.Empty(t, candidates)
 }
 
 func TestLeaderBalanceKillSwitchFailsClosedOnAmbiguousStatError(t *testing.T) {
+	t.Parallel()
 	badPath := filepath.Join(t.TempDir(), "kill-switch"+strings.Repeat("\x00", 1))
 	loop := &leaderBalanceLoop{cfg: leaderBalanceConfig{
 		killSwitchFile: badPath,
@@ -122,6 +129,7 @@ func TestLeaderBalanceKillSwitchFailsClosedOnAmbiguousStatError(t *testing.T) {
 }
 
 func TestBuildLeaderBalanceTransferRequestFailsClosedForOldServers(t *testing.T) {
+	t.Parallel()
 	req := buildLeaderBalanceTransferRequest([]raftengine.TransferTarget{
 		{ID: "n2", Address: "127.0.0.1:5002"},
 		{ID: "n3", Address: "127.0.0.1:5003"},
@@ -137,6 +145,7 @@ func TestBuildLeaderBalanceTransferRequestFailsClosedForOldServers(t *testing.T)
 }
 
 func TestChooseLeaderBalanceMove_StartupGraceSkips(t *testing.T) {
+	t.Parallel()
 	now := time.Unix(100, 0)
 	obs := leaderBalanceObservation{
 		counts: map[string]int{"n1": 2, "n2": 0},

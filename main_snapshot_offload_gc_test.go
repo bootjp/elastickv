@@ -123,6 +123,7 @@ func (s *blockingRetentionStore) ValidateRetention(ctx context.Context) error {
 }
 
 func TestSnapshotOffloadGCTimeoutRetriesAndShutdownClosesStore(t *testing.T) {
+	t.Parallel()
 	store, err := snapshotoffload.NewLocalStore(t.TempDir())
 	require.NoError(t, err)
 	backend := &blockingRetentionStore{snapshotOffloadStore: store}

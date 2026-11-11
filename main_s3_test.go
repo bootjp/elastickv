@@ -17,12 +17,14 @@ import (
 )
 
 func TestNewS3ServerRejectsVirtualHostedStyleConfig(t *testing.T) {
+	t.Parallel()
 	srv, err := newS3Server("localhost:9000", nil, nil, nil, "us-east-1", "", false, nil, nil, nil, nil, nil, nil)
 	require.ErrorContains(t, err, "virtual-hosted style S3 requests are not implemented")
 	require.Nil(t, srv)
 }
 
 func TestNewS3ServerAllowsEmptyAddress(t *testing.T) {
+	t.Parallel()
 	srv, err := newS3Server("", nil, nil, nil, "us-east-1", "", false, nil, nil, nil, nil, nil, nil)
 	require.NoError(t, err)
 	require.Nil(t, srv)
@@ -79,6 +81,7 @@ func (peerOnlyS3BlobCluster) FetchChunkBlob(context.Context, adapter.S3BlobRepli
 func (peerOnlyS3BlobCluster) Close() error { return nil }
 
 func TestLoadS3StaticCredentials(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "s3creds.json")
 	err := os.WriteFile(path, []byte(`{"credentials":[{"access_key_id":"akid","secret_access_key":"secret"}]}`), 0o600)
 	require.NoError(t, err)
@@ -89,6 +92,7 @@ func TestLoadS3StaticCredentials(t *testing.T) {
 }
 
 func TestLoadS3StaticCredentialsRejectsEmptyValues(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "s3creds.json")
 	err := os.WriteFile(path, []byte(`{"credentials":[{"access_key_id":" ","secret_access_key":"secret"}]}`), 0o600)
 	require.NoError(t, err)
@@ -98,6 +102,7 @@ func TestLoadS3StaticCredentialsRejectsEmptyValues(t *testing.T) {
 }
 
 func TestLoadS3StaticCredentialsRejectsDuplicateAccessKeyIDs(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "s3creds.json")
 	err := os.WriteFile(path, []byte(`{"credentials":[{"access_key_id":"akid","secret_access_key":"secret-1"},{"access_key_id":"akid","secret_access_key":"secret-2"}]}`), 0o600)
 	require.NoError(t, err)

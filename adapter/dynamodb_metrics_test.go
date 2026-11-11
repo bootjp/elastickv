@@ -16,6 +16,7 @@ import (
 )
 
 func TestDynamoDBServerHandleObservesSuccessMetrics(t *testing.T) {
+	t.Parallel()
 	registry := monitoring.NewRegistry("n1", "10.0.0.1:50051")
 	server := NewDynamoDBServer(nil, nil, &stubAdapterCoordinator{}, WithDynamoDBRequestObserver(registry.DynamoDBObserver()))
 	server.targetHandlers = map[string]func(http.ResponseWriter, *http.Request){
@@ -50,6 +51,7 @@ elastickv_dynamodb_written_items_total{node_address="10.0.0.1:50051",node_id="n1
 }
 
 func TestDynamoDBServerHandleObservesConditionalFailures(t *testing.T) {
+	t.Parallel()
 	registry := monitoring.NewRegistry("n1", "10.0.0.1:50051")
 	server := NewDynamoDBServer(nil, nil, &stubAdapterCoordinator{}, WithDynamoDBRequestObserver(registry.DynamoDBObserver()))
 	server.targetHandlers = map[string]func(http.ResponseWriter, *http.Request){
@@ -79,6 +81,7 @@ elastickv_dynamodb_conditional_check_failed_total{node_address="10.0.0.1:50051",
 }
 
 func TestDynamoDBServerHealthzSkipsDynamoMetrics(t *testing.T) {
+	t.Parallel()
 	registry := monitoring.NewRegistry("n1", "10.0.0.1:50051")
 	server := NewDynamoDBServer(nil, nil, &stubAdapterCoordinator{}, WithDynamoDBRequestObserver(registry.DynamoDBObserver()))
 
@@ -97,6 +100,7 @@ func TestDynamoDBServerHealthzSkipsDynamoMetrics(t *testing.T) {
 }
 
 func TestDynamoDBServerLeaderHealthzSkipsDynamoMetrics(t *testing.T) {
+	t.Parallel()
 	registry := monitoring.NewRegistry("n1", "10.0.0.1:50051")
 	server := NewDynamoDBServer(nil, nil, &stubAdapterCoordinator{}, WithDynamoDBRequestObserver(registry.DynamoDBObserver()))
 
@@ -115,6 +119,7 @@ func TestDynamoDBServerLeaderHealthzSkipsDynamoMetrics(t *testing.T) {
 }
 
 func TestDynamoDBServerLeaderHealthzReturnsServiceUnavailableWhenNotLeader(t *testing.T) {
+	t.Parallel()
 	coord := &stubAdapterCoordinator{
 		leaderSet:       true,
 		leader:          false,
@@ -132,6 +137,7 @@ func TestDynamoDBServerLeaderHealthzReturnsServiceUnavailableWhenNotLeader(t *te
 }
 
 func TestDynamoRequestMetricsStateAddsMetricsWithoutExplicitTableRegistration(t *testing.T) {
+	t.Parallel()
 	state := &dynamoRequestMetricsState{}
 
 	state.addTableMetrics("orders", 0, 0, 1)
@@ -141,12 +147,14 @@ func TestDynamoRequestMetricsStateAddsMetricsWithoutExplicitTableRegistration(t 
 }
 
 func TestDynamoOperationNameRejectsUnknownTargets(t *testing.T) {
+	t.Parallel()
 	require.Equal(t, "PutItem", dynamoOperationName(putItemTarget))
 	require.Equal(t, "unknown", dynamoOperationName(targetPrefix+"PutItem-random"))
 	require.Equal(t, "unknown", dynamoOperationName("random"))
 }
 
 func TestDynamoDBServerHandleObservesTableMetricsForGetItemMiss(t *testing.T) {
+	t.Parallel()
 	server, registry := newObservedDynamoMetricsTestServer(t)
 	rec := performObservedDynamoRequest(t, server, getItemTarget, `{"TableName":"orders","Key":{"pk":{"S":"missing"}}}`)
 
@@ -164,6 +172,7 @@ elastickv_dynamodb_table_requests_total{node_address="10.0.0.1:50051",node_id="n
 }
 
 func TestDynamoDBServerHandleObservesTableMetricsForDeleteItemMiss(t *testing.T) {
+	t.Parallel()
 	server, registry := newObservedDynamoMetricsTestServer(t)
 	rec := performObservedDynamoRequest(t, server, deleteItemTarget, `{"TableName":"orders","Key":{"pk":{"S":"missing"}}}`)
 
@@ -181,6 +190,7 @@ elastickv_dynamodb_table_requests_total{node_address="10.0.0.1:50051",node_id="n
 }
 
 func TestDynamoDBServerHandleObservesTableMetricsForPutItemValidationFailure(t *testing.T) {
+	t.Parallel()
 	server, registry := newObservedDynamoMetricsTestServer(t)
 	rec := performObservedDynamoRequest(t, server, putItemTarget, `{"TableName":"orders","Item":{"value":{"S":"x"}}}`)
 
@@ -202,6 +212,7 @@ elastickv_dynamodb_user_errors_total{node_address="10.0.0.1:50051",node_id="n1",
 }
 
 func TestDynamoDBServerHandleObservesTableMetricsForUpdateItemValidationFailure(t *testing.T) {
+	t.Parallel()
 	server, registry := newObservedDynamoMetricsTestServer(t)
 	rec := performObservedDynamoRequest(t, server, updateItemTarget, `{"TableName":"orders","Key":{},"UpdateExpression":"SET #v = :v","ExpressionAttributeNames":{"#v":"value"},"ExpressionAttributeValues":{":v":{"S":"x"}}}`)
 

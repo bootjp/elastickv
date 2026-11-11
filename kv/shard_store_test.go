@@ -4662,6 +4662,7 @@ func TestCaptureBackupRouteSnapshotAtReadsRowsFromCatalogOwner(t *testing.T) {
 }
 
 func TestValidateBackupSnapshotAtRejectsPreparedInsert(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := store.NewMVCCStore()
 	fsm, ok := NewKvFSMWithHLCAndTracker(
@@ -4685,6 +4686,7 @@ func TestValidateBackupSnapshotAtRejectsPreparedInsert(t *testing.T) {
 }
 
 func TestValidateBackupSnapshotAtRejectsPostCutTxnDecision(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	tests := []struct {
 		name  string
@@ -4912,6 +4914,7 @@ func TestBackupScannerFailsClosedOnUnresolvedPartitionedSQSKey(t *testing.T) {
 }
 
 func TestValidateBackupSnapshotAtResolvesStatusThroughCapturedRoute(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 
 	oldStore := store.NewMVCCStore()
@@ -4970,6 +4973,7 @@ func TestValidateBackupSnapshotAtResolvesStatusThroughCapturedRoute(t *testing.T
 }
 
 func TestValidateBackupSnapshotAtFencesCapturedRouteReads(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 
 	localStore := store.NewMVCCStore()
@@ -5183,6 +5187,7 @@ func TestShardStoreSourceWriteFenceKeepsReadsAvailable(t *testing.T) {
 }
 
 func TestShardStoreCommittedVersionAtRechecksTargetReadinessAfterFence(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st, group := newReadinessShardStore(t, distribution.RouteDescriptor{
 		RouteID: 1,
@@ -5612,6 +5617,7 @@ func TestShardStorePhysicalLimitScanChecksTargetReadiness(t *testing.T) {
 }
 
 func TestShardStorePhysicalLimitScanRechecksTargetReadinessAfterFence(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st, group := newReadinessShardStore(t, distribution.RouteDescriptor{
 		RouteID: 1,

@@ -23,6 +23,7 @@ func applyPartitionNamespaceMarker(t *testing.T, st MVCCStore, configuration, in
 }
 
 func TestOwnershipPartitionActivatedNamespaceGuardedAcquireClear(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		_, tx := partitionFixture(t, st)
 		applyPartitionNamespaceMarker(t, st, 3, 10)
@@ -60,6 +61,7 @@ func TestOwnershipPartitionActivatedNamespaceGuardedAcquireClear(t *testing.T) {
 }
 
 func TestOwnershipPartitionActivatedNamespaceConfigurationCAS(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		_, tx := partitionFixture(t, st)
 		applyPartitionNamespaceMarker(t, st, 3, 10)
@@ -89,6 +91,7 @@ func TestOwnershipPartitionActivatedNamespaceConfigurationCAS(t *testing.T) {
 }
 
 func TestOwnershipPartitionActivatedNamespaceCorruptionRejectsBeforeEffects(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		_, tx := partitionFixture(t, st)
 		marker := applyPartitionNamespaceMarker(t, st, 3, 10)
@@ -125,6 +128,7 @@ func activatedPartitionSnapshotSource(t *testing.T, format string) (MVCCStore, [
 }
 
 func TestOwnershipPartitionActivatedNamespaceSnapshotReopen(t *testing.T) {
+	t.Parallel()
 	for _, format := range []string{"mvcc", "native", "sst", "encrypted-native", "encrypted-sst"} {
 		t.Run(format, func(t *testing.T) {
 			source, options := activatedPartitionSnapshotSource(t, format)
