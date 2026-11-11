@@ -1,8 +1,11 @@
 # Raft asynchronous storage writes
 
-Status: Proposed; revised after durability and lifecycle review
+Status: Partial
 Author: bootjp
 Date: 2026-10-30
+
+The asynchronous storage infrastructure merged in PR #1362. Production
+activation and the remaining admission bounds are not complete.
 
 ## Problem And Evidence
 
