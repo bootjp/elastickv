@@ -1,6 +1,6 @@
 # Restore the full validation lint baseline
 
-Status: Proposed
+Status: Implemented
 Author: bootjp
 Date: 2026-10-28
 
@@ -23,6 +23,17 @@ using the existing phase deadline consistently and improving failure details.
 The work is separate from the test-cleanup WPs, whose production edits are
 limited to removing orphaned code. It does not implement new filesystem
 behavior or supersede PR #1344's journal accounting investigation.
+
+## Completion
+
+PR #1347 implemented the seven bounded changes and focused regressions,
+including the phase-bound native-snapshot wait. PR #1426 restored the memory
+dispatcher parity required by scope 1 and removed the remaining unfiltered
+lint findings. On the latter PR's final head, unfiltered golangci-lint v2.15.0
+reported zero issues, the race-test CI shards and Linux FUSE/Jepsen checks
+passed, and the latest-head review reported no findings. No further work is
+required for this lint-baseline slice; the other designs named below remain
+independent.
 
 ## Scope
 
