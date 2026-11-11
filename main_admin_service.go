@@ -1,0 +1,368 @@
+package main
+
+import (
+	"context"
+	"log"
+	"time"
+
+	"github.com/bootjp/elastickv/adapter"
+	"github.com/bootjp/elastickv/distribution"
+	internalutil "github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/internal/admin"
+	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/keyviz"
+	"github.com/bootjp/elastickv/kv"
+	pb "github.com/bootjp/elastickv/proto"
+	"github.com/cockroachdb/errors"
+	"google.golang.org/grpc"
+)
+
+const adminTokenMaxBytes = 4 << 10
+
+func startupRoleStoreFromFlags(enabled bool) admin.RoleStore {
+	if !enabled {
+		return nil
+	}
+	return roleStoreFromFlags(parseCSV(*adminFullAccessKeys), parseCSV(*adminReadOnlyAccessKeys))
+}
+
+func setupAdminService(
+	nodeID, grpcAddress string,
+	runtimes []*raftGroupRuntime,
+	shardGroups map[uint64]*kv.ShardGroup,
+	bootstrapServers []raftengine.Server,
+	shardStore *kv.ShardStore,
+	distCatalog *distribution.CatalogStore,
+	coordinate kv.Coordinator,
+	readTracker *kv.ActiveTimestampTracker,
+	keyvizSampler *keyviz.MemSampler,
+	connCache *kv.GRPCConnCache,
+	autoSplitRuntime adapter.AutoSplitRuntime,
+) (*adapter.AdminServer, adminGRPCInterceptors, error) {
+	members := adminMembersFromBootstrap(nodeID, bootstrapServers)
+	// In multi-group mode the process does not listen on *myAddr — each group
+	// has its own rt.spec.address. Use the lowest-group-ID listener as the
+	// canonical self address so GetClusterOverview.Self advertises an
+	// endpoint the fan-out can actually dial. Falls back to the flag value
+	// when no runtimes are registered (single-node dev runs).
+	selfAddr := canonicalSelfAddress(grpcAddress, runtimes)
+	srv, icept, err := configureAdminService(
+		*adminTokenFile,
+		*adminInsecureNoAuth,
+		*s3BlobPeerTokenFile,
+		*splitMigrationTokenFile,
+		adapter.S3BlobOffloadEnabledFromEnv(),
+		adapter.NodeIdentity{NodeID: nodeID, GRPCAddress: selfAddr},
+		members,
+		connCache,
+		adminBackupDependencies{
+			store:      &adminBackupStore{ShardStore: shardStore, catalog: distCatalog},
+			shardStore: shardStore, coordinate: coordinate, tracker: readTracker,
+		},
+	)
+	if err != nil {
+		return nil, adminGRPCInterceptors{}, err
+	}
+	if srv == nil {
+		return nil, icept, nil
+	}
+	for _, rt := range runtimes {
+		srv.RegisterGroup(rt.spec.id, rt.engine)
+		if group := shardGroups[rt.spec.id]; group != nil {
+			group.SetLeaderReadToken(icept.token)
+			srv.RegisterBackupProposer(rt.spec.id, kv.NewLeaderAdminProposer(
+				rt.engine,
+				group.Proposer(),
+				connCache,
+				kv.WithLeaderAdminToken(icept.token),
+			))
+		}
+	}
+	// Only register a real sampler. Passing a typed-nil *MemSampler
+	// would store a non-nil interface and make GetKeyVizMatrix
+	// return a successful empty response instead of Unavailable —
+	// operators want the explicit "keyviz disabled" signal.
+	if keyvizSampler != nil {
+		srv.RegisterSampler(keyvizSampler)
+	}
+	if autoSplitRuntime != nil {
+		srv.RegisterAutoSplitRuntime(autoSplitRuntime)
+	}
+	if *adminInsecureNoAuth {
+		log.Printf("WARNING: --adminInsecureNoAuth is set; Admin gRPC service exposed without authentication")
+	}
+	return srv, icept, nil
+}
+
+// canonicalSelfAddress picks the listener address AdminServer should advertise
+// as Self.GRPCAddress. The Admin gRPC service is registered on every Raft
+// group's listener in startRaftServers, so any runtime's address is reachable;
+// we pick the lowest group ID to make the choice deterministic across
+// restarts. Returns the supplied fallback when no runtimes exist (e.g., a
+// single-node dev invocation without --raftGroups).
+func canonicalSelfAddress(fallback string, runtimes []*raftGroupRuntime) string {
+	var (
+		bestID   uint64
+		bestAddr string
+		found    bool
+	)
+	for _, rt := range runtimes {
+		if rt == nil {
+			continue
+		}
+		if !found || rt.spec.id < bestID {
+			bestID, bestAddr, found = rt.spec.id, rt.spec.address, true
+		}
+	}
+	if !found {
+		return fallback
+	}
+	return bestAddr
+}
+
+// adminMembersFromBootstrap extracts the peer list (everyone except self) from
+// the Raft bootstrap configuration so GetClusterOverview returns a populated
+// members list. Without this the admin binary's membersFrom cache collapses to
+// only the responding seed and stops fanning out across the cluster.
+func adminMembersFromBootstrap(selfID string, servers []raftengine.Server) []adapter.NodeIdentity {
+	if len(servers) == 0 {
+		return nil
+	}
+	out := make([]adapter.NodeIdentity, 0, len(servers))
+	for _, s := range servers {
+		if s.ID == selfID {
+			continue
+		}
+		out = append(out, adapter.NodeIdentity{
+			NodeID:      s.ID,
+			GRPCAddress: s.Address,
+		})
+	}
+	return out
+}
+
+// adminGRPCInterceptors bundles the unary+stream interceptors that enforce the
+// Admin bearer token. Returning the raw interceptor functions (rather than
+// pre-wrapped grpc.ServerOption values via grpc.ChainUnaryInterceptor) lets
+// the registration site combine them with any other interceptors in a single
+// ChainUnaryInterceptor call, so using grpc.UnaryInterceptor alongside risks
+// silent overwrites (gRPC-Go: last option of the same type wins).
+type adminGRPCInterceptors struct {
+	unary              []grpc.UnaryServerInterceptor
+	stream             []grpc.StreamServerInterceptor
+	token              string
+	migrationToken     string
+	s3BlobFetchEnabled bool
+}
+
+func (a adminGRPCInterceptors) empty() bool {
+	return len(a.unary) == 0 && len(a.stream) == 0
+}
+
+// configureAdminService builds the node-side AdminServer plus the interceptor
+// set that enforces its bearer token, or returns (nil, {}, nil) when the
+// service is intentionally disabled. It is mutually exclusive with
+// --adminInsecureNoAuth so operators have to opt into the unauthenticated
+// mode explicitly.
+type adminBackupDependencies struct {
+	store      adapter.BackupStore
+	shardStore *kv.ShardStore
+	coordinate kv.Coordinator
+	tracker    *kv.ActiveTimestampTracker
+}
+
+type adminBackupStore struct {
+	*kv.ShardStore
+	catalog *distribution.CatalogStore
+}
+
+func (s *adminBackupStore) CaptureBackupRouteSnapshotAt(ctx context.Context, ts uint64) (kv.BackupRouteSnapshot, error) {
+	if s == nil {
+		return kv.BackupRouteSnapshot{}, errors.New("backup store is unavailable")
+	}
+	snapshot, err := kv.CaptureBackupRouteSnapshotAt(ctx, s.catalog, ts)
+	return snapshot, errors.Wrap(err, "capture backup route snapshot")
+}
+
+func configureAdminService(
+	tokenPath string,
+	insecureNoAuth bool,
+	s3BlobPeerTokenPath string,
+	migrationTokenPath string,
+	s3BlobOffloadEnabled bool,
+	self adapter.NodeIdentity,
+	members []adapter.NodeIdentity,
+	connCache *kv.GRPCConnCache,
+	backupDeps ...adminBackupDependencies,
+) (*adapter.AdminServer, adminGRPCInterceptors, error) {
+	auth, err := loadNodeGRPCAuth(tokenPath, insecureNoAuth, s3BlobPeerTokenPath, migrationTokenPath)
+	if err != nil {
+		return nil, adminGRPCInterceptors{}, err
+	}
+	var srv *adapter.AdminServer
+	if auth.adminEnabled {
+		// adminServerOptions carries the live-backup dependencies and the
+		// admin token the backup proposer forwards with, so the options have
+		// to be built here rather than at NewAdminServer's bare call.
+		opts := adminServerOptions(auth.adminToken, insecureNoAuth, connCache, backupDeps)
+		srv = adapter.NewAdminServer(self, members, opts...)
+		srv.SetCapability(
+			adapter.S3BlobOffloadCapabilityName,
+			s3BlobOffloadAdminCapability(auth.adminToken, auth.peerToken, s3BlobOffloadEnabled),
+		)
+	}
+	// token is what setupAdminService hands to SetLeaderReadToken and the
+	// per-group backup proposer, so it has to survive the interceptor build.
+	icept := adminGRPCInterceptors{token: auth.adminToken, migrationToken: auth.migrationToken}
+	adminUnary, adminStream := adapter.AdminTokenAuth(auth.adminToken)
+	appendGRPCBearerInterceptors(&icept, adminUnary, adminStream)
+	migrationUnary, migrationStream := adapter.SplitMigrationTokenAuth(auth.migrationToken, insecureNoAuth, *splitMigrationPeerAuthEnforced)
+	appendGRPCBearerInterceptors(&icept, migrationUnary, migrationStream)
+	peerUnary, peerStream := adapter.S3BlobPeerTokenAuth(auth.peerToken)
+	appendGRPCBearerInterceptors(&icept, peerUnary, peerStream)
+	icept.s3BlobFetchEnabled = auth.peerToken != ""
+	return srv, icept, nil
+}
+
+func s3BlobOffloadAdminCapability(adminToken, peerToken string, enabled bool) bool {
+	return adapter.S3BlobOffloadLocalCapability() && enabled && adminToken != "" && peerToken != ""
+}
+
+func adminServerOptions(
+	token string,
+	insecureNoAuth bool,
+	connCache *kv.GRPCConnCache,
+	backupDeps []adminBackupDependencies,
+) []adapter.AdminOption {
+	opts := []adapter.AdminOption{adapter.WithAdminNodeVersion(buildVersion())}
+	if probe := adminLeaderVersionProbe(connCache); probe != nil {
+		opts = append(opts, adapter.WithAdminLeaderVersionProbe(probe))
+	}
+	if len(backupDeps) > 0 {
+		deps := backupDeps[0]
+		tokenKey := []byte(token)
+		if insecureNoAuth {
+			tokenKey = []byte("elastickv-insecure-live-backup-token-v1")
+		}
+		opts = append(opts,
+			adapter.WithAdminBackupControl(
+				deps.store,
+				adminBackupReadFence(deps.coordinate, deps.shardStore),
+				adminBackupPeerProbe(connCache),
+				deps.tracker,
+				tokenKey,
+			),
+			adapter.WithAdminBackupConfig(adapter.AdminBackupConfig{
+				DefaultTTL:              *backupDefaultTTL,
+				MinTTL:                  time.Minute,
+				MaxTTL:                  *backupMaxTTL,
+				BeginDeadline:           *backupBeginDeadline,
+				SnapshotHeadroomEntries: *backupSnapshotHeadroomEntries,
+				ScanPageSize:            *backupScanPageSize,
+				MaxActivePins:           *backupMaxActivePins,
+			}),
+		)
+	}
+	return opts
+}
+
+func adminBackupReadFence(coordinate kv.Coordinator, shardStore *kv.ShardStore) adapter.BackupReadFence {
+	if coordinate == nil || shardStore == nil || coordinate.Clock() == nil {
+		return nil
+	}
+	return func(ctx context.Context) (uint64, error) {
+		clock := coordinate.Clock()
+		leaderCommitTS, err := kv.LeaseReadAllGroupsTimestampThrough(coordinate, ctx)
+		if err != nil {
+			return 0, errors.Wrap(err, "backup: fence raft groups")
+		}
+		lastCommitTS := shardStore.LastCommitTS()
+		if leaderCommitTS > lastCommitTS {
+			lastCommitTS = leaderCommitTS
+		}
+		clock.Observe(lastCommitTS)
+		readTS, err := allocateBackupReadTimestamp(ctx, coordinate, lastCommitTS)
+		if err != nil {
+			return 0, errors.Wrap(err, "backup: issue read timestamp")
+		}
+		return readTS, nil
+	}
+}
+
+func allocateBackupReadTimestamp(ctx context.Context, coordinate kv.Coordinator, min uint64) (uint64, error) {
+	if alloc, ok := coordinate.(kv.TimestampAfterAllocator); ok {
+		return alloc.NextAfter(ctx, min) //nolint:wrapcheck // Canonical coordinator/TSO error.
+	}
+	if alloc, ok := coordinate.(kv.TimestampAllocator); ok {
+		ts, err := alloc.Next(ctx)
+		if err != nil {
+			return 0, err //nolint:wrapcheck // Wrapped at the backup call site.
+		}
+		if ts <= min {
+			return 0, errors.Errorf("timestamp allocator returned %d, not after %d", ts, min)
+		}
+		return ts, nil
+	}
+	clock := coordinate.Clock()
+	if clock == nil {
+		return 0, errors.New("backup timestamp allocator is unavailable")
+	}
+	clock.Observe(min)
+	return clock.NextFenced() //nolint:wrapcheck // Wrapped at the backup call site.
+}
+
+func adminBackupPeerProbe(connCache *kv.GRPCConnCache) adapter.BackupPeerProbe {
+	if connCache == nil {
+		return nil
+	}
+	return func(ctx context.Context, address string) (adapter.BackupPeerVersion, error) {
+		conn, err := connCache.ConnFor(address)
+		if err != nil {
+			return adapter.BackupPeerVersion{}, errors.Wrap(err, "backup peer probe: dial peer")
+		}
+		resp, err := pb.NewAdminClient(conn).GetNodeVersion(ctx, &pb.GetNodeVersionRequest{})
+		if err != nil {
+			return adapter.BackupPeerVersion{}, errors.Wrap(err, "backup peer probe: get node version")
+		}
+		return adapter.BackupPeerVersion{
+			NodeVersion: resp.GetNodeVersion(), BackupProtocolVersion: resp.GetBackupProtocolVersion(),
+		}, nil
+	}
+}
+
+func adminLeaderVersionProbe(connCache *kv.GRPCConnCache) adapter.LeaderVersionProbe {
+	if connCache == nil {
+		return nil
+	}
+	return func(ctx context.Context, address string) (string, error) {
+		conn, err := connCache.ConnFor(address)
+		if err != nil {
+			return "", errors.Wrap(err, "admin leader version probe: dial peer")
+		}
+		resp, err := pb.NewAdminClient(conn).GetNodeVersion(ctx, &pb.GetNodeVersionRequest{})
+		if err != nil {
+			return "", errors.Wrap(err, "admin leader version probe: get node version")
+		}
+		return resp.GetNodeVersion(), nil
+	}
+}
+
+// loadAdminTokenFile materialises --adminTokenFile with a strict upper bound
+// so a misconfigured path (for example a log file) cannot force an arbitrary
+// allocation before the bearer-token check. Delegates to the shared helper in
+// internal/ so the admin binary and the node process read tokens identically.
+func loadAdminTokenFile(path string) (string, error) {
+	tok, err := internalutil.LoadBearerTokenFile(path, adminTokenMaxBytes, "admin token")
+	if err != nil {
+		return "", errors.Wrap(err, "load admin token")
+	}
+	return tok, nil
+}
+
+func loadS3BlobPeerTokenFile(path string) (string, error) {
+	tok, err := internalutil.LoadBearerTokenFile(path, adminTokenMaxBytes, "S3 blob peer token")
+	if err != nil {
+		return "", errors.Wrap(err, "load S3 blob peer token")
+	}
+	return tok, nil
+}
