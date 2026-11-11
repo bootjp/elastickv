@@ -127,7 +127,7 @@ func TestRedisReplyBufferLimitAndOriginalError(t *testing.T) {
 	require.Empty(t, c.raw.String())
 	require.Len(t, c.writes, 1)
 	require.NotContains(t, c.writes[0].s, "NOTLEADER")
-	require.Contains(t, c.writes[0].s, kv.ErrTransactionOutcomeUnknown.Error())
+	require.Equal(t, "ERR operation outcome unknown", c.writes[0].s)
 }
 
 func TestRedisOwnedInternalTransactionUsesCapturedOwner(t *testing.T) {
@@ -308,7 +308,7 @@ func TestRedisOwnedExecStylePerElementErrors(t *testing.T) {
 				require.Len(t, c.writes, 1)
 				require.Contains(t, c.writes[0].s, kv.ErrTransactionOutcomeUnknown.Error())
 			} else {
-				require.Equal(t, "*3\r\n$1\r\na\r\n-"+kv.ErrTransactionOutcomeUnknown.Error()+"\r\n:7\r\n", c.raw.String())
+				require.Equal(t, "*3\r\n$1\r\na\r\n-ERR operation outcome unknown\r\n:7\r\n", c.raw.String())
 				require.Empty(t, c.writes)
 			}
 		})

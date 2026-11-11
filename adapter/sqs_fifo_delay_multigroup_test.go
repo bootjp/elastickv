@@ -284,7 +284,8 @@ func TestSQSFIFODelayMultiGroupPrimaryReplyLoss(t *testing.T) {
 	status, out := f.call(t, ctx, sqsSetQueueAttributesTarget, map[string]any{
 		"QueueUrl": url, "Attributes": map[string]string{"DelaySeconds": "900"},
 	})
-	require.Equal(t, http.StatusInternalServerError, status, out)
+	require.Equal(t, http.StatusConflict, status, out)
+	require.Equal(t, "OperationOutcomeUnknown", out["__type"])
 	f.trace.mu.Lock()
 	pageCalls, pageError := f.trace.pageCalls, f.trace.pageError
 	f.trace.mu.Unlock()

@@ -1510,10 +1510,7 @@ func (s *DistributionServer) saveSplitPartitionViaCoordinator(
 		ReadKeys: readKeys,
 	})
 	if err != nil {
-		if errors.Is(err, store.ErrWriteConflict) {
-			return distribution.CatalogSnapshot{}, grpcStatusError(codes.Aborted, errDistributionCatalogConflict.Error())
-		}
-		return distribution.CatalogSnapshot{}, grpcStatusErrorf(codes.Internal, "commit split mutations: %v", err)
+		return distribution.CatalogSnapshot{}, splitPartitionCoordinatorStatusError(err)
 	}
 	if resp == nil || resp.CommitTS == 0 {
 		return distribution.CatalogSnapshot{}, grpcStatusError(codes.Internal, "split commit timestamp missing")
@@ -2227,8 +2224,21 @@ func splitMigrationRangeStatusError(err error) error {
 	}
 }
 
+func splitPartitionCoordinatorStatusError(err error) error {
+	switch {
+	case errors.Is(err, kv.ErrTransactionOutcomeUnknown):
+		return grpcStatusError(codes.Unknown, kv.ErrTransactionOutcomeUnknown.Error())
+	case errors.Is(err, store.ErrWriteConflict):
+		return grpcStatusError(codes.Aborted, errDistributionCatalogConflict.Error())
+	default:
+		return grpcStatusErrorf(codes.Internal, "commit split mutations: %v", err)
+	}
+}
+
 func splitJobCoordinatorStatusError(err error) error {
 	switch {
+	case errors.Is(err, kv.ErrTransactionOutcomeUnknown):
+		return grpcStatusError(codes.Unknown, kv.ErrTransactionOutcomeUnknown.Error())
 	case errors.Is(err, store.ErrWriteConflict):
 		return grpcStatusError(codes.Aborted, distribution.ErrCatalogSplitJobConflict.Error())
 	case splitJobCoordinatorLeadershipError(err):
@@ -2240,6 +2250,8 @@ func splitJobCoordinatorStatusError(err error) error {
 
 func splitJobPromotionStatusError(err error) error {
 	switch {
+	case errors.Is(err, kv.ErrTransactionOutcomeUnknown):
+		return grpcStatusError(codes.Unknown, kv.ErrTransactionOutcomeUnknown.Error())
 	case errors.Is(err, distribution.ErrCatalogVersionMismatch),
 		errors.Is(err, distribution.ErrCatalogSplitJobConflict),
 		errors.Is(err, store.ErrWriteConflict):

@@ -1611,11 +1611,11 @@ func (c *Coordinate) redirect(ctx context.Context, reqs *OperationGroup[OP]) (*C
 	defer cancel()
 	r, err := cli.Forward(fwdCtx, c.toForwardRequest(requests))
 	if err != nil {
-		return nil, errors.WithStack(err)
+		return nil, classifyForwardRPCError(err, requests)
 	}
 
 	if !r.Success {
-		return nil, ErrInvalidRequest
+		return nil, errors.WithStack(ErrTransactionOutcomeUnknown)
 	}
 
 	return &CoordinateResponse{

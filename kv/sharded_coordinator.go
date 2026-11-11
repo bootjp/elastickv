@@ -2257,6 +2257,9 @@ func (c *ShardedCoordinator) prewriteTxn(ctx context.Context, startTS, commitTS 
 			err = ErrTransactionOutcomeUnknown
 		}
 		if err != nil {
+			if errors.Is(err, ErrTransactionOutcomeUnknown) {
+				return nil, true, errors.WithStack(err)
+			}
 			// Same WithoutCancel pattern as dispatchTxn's
 			// commitPrimaryTxn-failure cleanup: a cancelled ctx is
 			// the most likely cause of Commit failing here, and the

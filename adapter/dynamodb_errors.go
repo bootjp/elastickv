@@ -16,6 +16,8 @@ type dynamoAPIError struct {
 	message   string
 }
 
+const dynamoErrOperationOutcomeUnknown = "OperationOutcomeUnknown"
+
 func (e *dynamoAPIError) Error() string {
 	if e == nil {
 		return ""
@@ -35,6 +37,10 @@ func newDynamoAPIError(status int, errorType string, message string) error {
 }
 
 func writeDynamoErrorFromErr(w http.ResponseWriter, err error) {
+	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+		writeDynamoError(w, http.StatusConflict, dynamoErrOperationOutcomeUnknown, "Operation outcome unknown")
+		return
+	}
 	var apiErr *dynamoAPIError
 	if errors.As(err, &apiErr) {
 		writeDynamoError(w, apiErr.status, apiErr.errorType, apiErr.message)

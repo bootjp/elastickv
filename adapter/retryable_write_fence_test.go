@@ -47,3 +47,39 @@ func TestWireWriteFenceMatcherRequiresSentinelSuffix(t *testing.T) {
 	require.False(t, isRouteWriteFencedError(err))
 	require.False(t, isRetryableTransactWriteError(err))
 }
+
+func TestUnknownOutcomeNeverBecomesAdapterRetryOrIgnorableRace(t *testing.T) {
+	t.Parallel()
+	for _, cause := range []error{
+		store.ErrWriteConflict,
+		kv.ErrTxnLocked,
+		kv.ErrRouteWriteFenced,
+		kv.ErrComposed1Violation,
+	} {
+		err := errors.Join(kv.ErrTransactionOutcomeUnknown, cause)
+		require.False(t, isRetryableRedisTxnErr(err))
+		require.False(t, isReusableRedisTxnErr(err))
+		require.False(t, isRedisComposedRouteErr(err))
+		require.ErrorIs(t, normalizeRetryableRedisTxnErr(err), kv.ErrTransactionOutcomeUnknown)
+		require.False(t, isRetryableS3MutationErr(err))
+		require.False(t, isRetryableTransactWriteError(err))
+		require.False(t, isIgnorableTransactRaceError(err))
+		require.False(t, isRouteWriteFencedError(err))
+		require.False(t, isAmbiguousRedisExecDispatchErr(err))
+		require.False(t, splitJobPhaseErrorRetryable(err))
+		require.Equal(t, codes.Unknown, status.Code(splitPartitionCoordinatorStatusError(err)))
+		require.Equal(t, codes.Unknown, status.Code(splitJobCoordinatorStatusError(err)))
+		require.Equal(t, codes.Unknown, status.Code(splitJobPromotionStatusError(err)))
+		require.Contains(t, status.Convert(splitJobCoordinatorStatusError(err)).Message(), kv.ErrTransactionOutcomeUnknown.Error())
+		repairRetry, repairErr := normalizeS3ChunkBlobRepairError(err)
+		require.False(t, repairRetry)
+		require.Equal(t, codes.Unknown, status.Code(repairErr))
+		calls := 0
+		retryErr := (&RedisServer{}).retryRedisWrite(t.Context(), func() error {
+			calls++
+			return err
+		})
+		require.ErrorIs(t, retryErr, kv.ErrTransactionOutcomeUnknown)
+		require.Equal(t, 1, calls)
+	}
+}

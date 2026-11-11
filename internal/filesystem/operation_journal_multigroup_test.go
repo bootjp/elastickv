@@ -291,6 +291,25 @@ func TestRetryJournalLockedKeepsUnknownOutcome(t *testing.T) {
 	require.Equal(t, 1, tries)
 }
 
+func TestRetryJournalReadRetriesUnknownLockAtSameSnapshot(t *testing.T) {
+	for _, transient := range []error{
+		kv.ErrTransactionOutcomeUnknown,
+		fmt.Errorf("%w: %w", kv.ErrTransactionOutcomeUnknown, kv.ErrTxnLocked),
+	} {
+		tries := 0
+		value, err := retryJournalRead(context.Background(), func(context.Context) ([]byte, error) {
+			tries++
+			if tries < 3 {
+				return nil, transient
+			}
+			return []byte("visible"), nil
+		})
+		require.NoError(t, err)
+		require.Equal(t, []byte("visible"), value)
+		require.Equal(t, 3, tries)
+	}
+}
+
 func TestRepeatedAcknowledgementKeepsReservation(t *testing.T) {
 	t.Parallel()
 	session := operationSession{RejectBefore: 1, AckGaps: []uint64{3}, RetainedCount: 1, RetainedBytes: 100}

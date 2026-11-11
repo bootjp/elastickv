@@ -315,23 +315,22 @@ func (p *LeaderProxy) forward(callerCtx context.Context, parentCtx context.Conte
 }
 
 func classifyForwardRPCError(err error, reqs []*pb.Request) error {
-	if isDefinitiveForwardNotLeader(err) {
-		return errors.WithStack(err)
-	}
-	if len(reqs) == 1 && reqs[0] != nil &&
-		(reqs[0].Phase == pb.Phase_NONE || reqs[0].Phase == pb.Phase_PREPARE) {
-		switch {
-		case isDefinitiveForwardConflict(err):
-			return fmt.Errorf("%w: %w", store.ErrWriteConflict, err)
-		case IsForwardTxnLocked(err):
-			return fmt.Errorf("%w: %w", ErrTxnLocked, err)
-		case IsForwardComposed1Violation(err):
-			return fmt.Errorf("%w: %w", ErrComposed1Violation, err)
-		case IsForwardComposed1VersionGCd(err):
-			return fmt.Errorf("%w: %w", ErrComposed1VersionGCd, err)
+	if phase, ok := ForwardFailurePhaseForRequests(reqs); ok {
+		reason, decision, valid := DecodeForwardDecisionStatus(err, phase)
+		if valid && decision == pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN {
+			return &ForwardFailure{Reason: reason, Decision: decision}
+		}
+		if valid && phase == pb.ForwardFailurePhase_FORWARD_FAILURE_PHASE_ONE_PHASE_APPLY &&
+			decision == pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_DEFINITIVELY_ABORTED &&
+			reason == pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CONFLICT {
+			// A possibly submitted earlier Forward attempt is terminal in
+			// runForwardCycle; it can never reach this later classification.
+			return errors.WithStack(store.ErrWriteConflict)
 		}
 	}
-	return fmt.Errorf("%w: %w", ErrTransactionOutcomeUnknown, err)
+	// Legacy ErrorInfo, malformed details, and unrecognized decisions do
+	// not prove the logical operation was absent or aborted.
+	return &ForwardFailure{Decision: pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN}
 }
 
 func isDefinitiveForwardNotLeader(err error) bool {

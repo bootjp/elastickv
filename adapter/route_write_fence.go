@@ -10,6 +10,9 @@ import (
 )
 
 func isRouteWriteFencedError(err error) bool {
+	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+		return false
+	}
 	if errors.Is(err, kv.ErrRouteWriteFenced) {
 		return true
 	}

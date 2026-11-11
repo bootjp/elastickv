@@ -13,7 +13,6 @@ import (
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
-	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -58,15 +57,89 @@ func (forwardConflictTxn) Abort(context.Context, []*pb.Request) (*kv.Transaction
 	return &kv.TransactionResponse{}, nil
 }
 
-func TestInternalForwardMarksOnlyDefinitiveConflictAborted(t *testing.T) {
+type forwardAppliedConflictProposer struct{ index uint64 }
+
+func (p forwardAppliedConflictProposer) Propose(context.Context, []byte) (*raftengine.ProposalResult, error) {
+	return &raftengine.ProposalResult{
+		CommitIndex: p.index,
+		Response:    store.NewWriteConflictError([]byte("private-key")),
+	}, nil
+}
+
+func (p forwardAppliedConflictProposer) ProposeAdmin(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
+	return p.Propose(ctx, data)
+}
+
+func TestInternalForwardCertifiesOnlyIndexedOnePhaseApplyConflict(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		phase    pb.Phase
+		index    uint64
+		decision pb.ForwardDecisionClass
+	}{
+		{name: "one phase applied", phase: pb.Phase_NONE, index: 7, decision: pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_DEFINITIVELY_ABORTED},
+		{name: "missing apply index", phase: pb.Phase_NONE, decision: pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN},
+		{name: "prepare participant", phase: pb.Phase_PREPARE, index: 7, decision: pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			txn := kv.NewTransactionWithProposer(forwardAppliedConflictProposer{index: tc.index})
+			t.Cleanup(txn.Close)
+			server := NewInternalWithEngine(txn, forwardObserverLeader{}, nil, nil)
+			req := &pb.Request{IsTxn: true, Phase: tc.phase, Mutations: []*pb.Mutation{
+				{Op: pb.Op_PUT, Key: []byte(kv.TxnMetaPrefix), Value: kv.EncodeTxnMeta(kv.TxnMeta{PrimaryKey: []byte("k")})},
+				{Op: pb.Op_PUT, Key: []byte("k"), Value: []byte("v")},
+			}}
+			_, err := server.Forward(t.Context(), &pb.ForwardRequest{IsTxn: true, Requests: []*pb.Request{req}})
+			require.Error(t, err)
+			phase, ok := kv.ForwardFailurePhaseForRequests([]*pb.Request{req})
+			require.True(t, ok)
+			reason, decision, ok := kv.DecodeForwardDecisionStatus(err, phase)
+			require.True(t, ok)
+			require.Equal(t, pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CONFLICT, reason)
+			require.Equal(t, tc.decision, decision)
+			require.NotContains(t, status.Convert(err).Message(), "private-key")
+		})
+	}
+}
+
+func TestInternalForwardAppliedConflictStatusSurvivesGRPC(t *testing.T) {
+	txn := kv.NewTransactionWithProposer(forwardAppliedConflictProposer{index: 7})
+	t.Cleanup(txn.Close)
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	server := grpc.NewServer()
+	pb.RegisterInternalServer(server, NewInternalWithEngine(txn, forwardObserverLeader{}, nil, nil))
+	go func() { _ = server.Serve(lis) }()
+	t.Cleanup(func() {
+		server.Stop()
+		_ = lis.Close()
+	})
+	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	_, err = pb.NewInternalClient(conn).Forward(t.Context(), &pb.ForwardRequest{IsTxn: true, Requests: []*pb.Request{{
+		IsTxn: true, Phase: pb.Phase_NONE, Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(kv.TxnMetaPrefix), Value: kv.EncodeTxnMeta(kv.TxnMeta{PrimaryKey: []byte("k")})},
+			{Op: pb.Op_PUT, Key: []byte("k"), Value: []byte("v")},
+		},
+	}}})
+	require.Error(t, err)
+	require.Equal(t, codes.Aborted, status.Code(err))
+	reason, decision, ok := kv.DecodeForwardDecisionStatus(err, pb.ForwardFailurePhase_FORWARD_FAILURE_PHASE_ONE_PHASE_APPLY)
+	require.True(t, ok)
+	require.Equal(t, pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CONFLICT, reason)
+	require.Equal(t, pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_DEFINITIVELY_ABORTED, decision)
+	require.NotContains(t, err.Error(), "private-key")
+}
+
+func TestInternalForwardDoesNotCertifyConflictWithoutAttemptEvidence(t *testing.T) {
 	t.Parallel()
 	for _, tt := range []struct {
 		name string
 		err  error
-		code codes.Code
 	}{
-		{name: "definitive", err: store.ErrWriteConflict, code: codes.Aborted},
-		{name: "unknown", err: errors.Join(kv.ErrTransactionOutcomeUnknown, store.ErrWriteConflict), code: codes.Unknown},
+		{name: "apply conflict", err: store.ErrWriteConflict},
+		{name: "unknown with conflict", err: errors.Join(kv.ErrTransactionOutcomeUnknown, store.ErrWriteConflict)},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			internal := NewInternalWithEngine(forwardConflictTxn{err: tt.err}, forwardObserverLeader{}, nil, nil)
@@ -74,18 +147,33 @@ func TestInternalForwardMarksOnlyDefinitiveConflictAborted(t *testing.T) {
 				Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("k"), Value: []byte("v")}},
 			}}})
 			require.Error(t, err)
-			require.Equal(t, tt.code, status.Code(err))
-			require.Equal(t, tt.name == "definitive", kv.IsForwardWriteConflict(err))
+			require.Equal(t, codes.Unknown, status.Code(err))
+			reason, decision, ok := kv.DecodeForwardDecisionStatus(err, pb.ForwardFailurePhase_FORWARD_FAILURE_PHASE_ONE_PHASE_APPLY)
+			require.True(t, ok)
+			require.Equal(t, pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CONFLICT, reason)
+			require.Equal(t, pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN, decision)
 		})
 	}
 }
 
-func TestForwardCommitErrorCarriesTypedLockRejection(t *testing.T) {
-	t.Parallel()
-	err := forwardCommitError(kv.NewTxnLockedError([]byte("key")))
-	require.True(t, kv.IsForwardTxnLocked(err))
-	require.False(t, kv.IsForwardWriteConflict(err))
-	require.False(t, kv.IsForwardTxnLocked(forwardCommitError(errors.Join(kv.ErrTransactionOutcomeUnknown, kv.ErrTxnLocked))))
+func TestForwardUnknownStatusKeepsLockCauseWithoutCertifyingOutcome(t *testing.T) {
+	reqs := []*pb.Request{{IsTxn: true, Phase: pb.Phase_PREPARE}}
+	for _, cause := range []error{kv.NewTxnLockedError([]byte("key")), errors.Join(kv.ErrTransactionOutcomeUnknown, kv.ErrTxnLocked)} {
+		err := forwardUnknownStatus(reqs, cause)
+		reason, decision, ok := kv.DecodeForwardDecisionStatus(err, pb.ForwardFailurePhase_FORWARD_FAILURE_PHASE_PREPARE)
+		require.True(t, ok)
+		require.Equal(t, pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CONFLICT, reason)
+		require.Equal(t, pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN, decision)
+		require.False(t, kv.IsForwardTxnLocked(err))
+	}
+}
+
+func TestForwardUnknownStatusOmitsDecisionForMixedBatch(t *testing.T) {
+	reqs := []*pb.Request{{IsTxn: true, Phase: pb.Phase_PREPARE}, {IsTxn: true, Phase: pb.Phase_COMMIT}}
+	err := forwardUnknownStatus(reqs, store.NewWriteConflictError([]byte("private-key")))
+	require.Equal(t, codes.Unknown, status.Code(err))
+	require.Empty(t, status.Convert(err).Details())
+	require.NotContains(t, err.Error(), "private-key")
 }
 
 func TestInternalForwardConflictStatusSurvivesGRPC(t *testing.T) {
@@ -118,14 +206,13 @@ func TestInternalForwardConflictStatusSurvivesGRPC(t *testing.T) {
 				Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("k"), Value: []byte("v")}},
 			}}})
 			require.Error(t, err)
-			require.True(t, kv.IsForwardWriteConflict(err), "gRPC must preserve structured rejection: %v", err)
+			reason, decision, ok := kv.DecodeForwardDecisionStatus(err, pb.ForwardFailurePhase_FORWARD_FAILURE_PHASE_ONE_PHASE_APPLY)
+			require.True(t, ok)
+			require.Equal(t, pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CONFLICT, reason)
+			require.Equal(t, pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN, decision)
 			require.NotContains(t, err.Error(), string(tc.key))
-			require.Contains(t, status.Convert(err).Message(), store.ErrWriteConflict.Error())
-			for _, detail := range status.Convert(err).Details() {
-				info, ok := detail.(*errdetails.ErrorInfo)
-				require.True(t, ok)
-				require.Empty(t, info.GetMetadata())
-			}
+			require.Equal(t, "forward conflict", status.Convert(err).Message())
+			require.Len(t, status.Convert(err).Details(), 1)
 		})
 	}
 }
@@ -152,14 +239,13 @@ func TestInternalForwardLockStatusSurvivesGRPC(t *testing.T) {
 		Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("k"), Value: []byte("v")}},
 	}}})
 	require.Error(t, err)
-	require.True(t, kv.IsForwardTxnLocked(err), "gRPC must preserve structured lock rejection: %v", err)
+	reason, decision, ok := kv.DecodeForwardDecisionStatus(err, pb.ForwardFailurePhase_FORWARD_FAILURE_PHASE_ONE_PHASE_APPLY)
+	require.True(t, ok)
+	require.Equal(t, pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CONFLICT, reason)
+	require.Equal(t, pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN, decision)
 	require.NotContains(t, err.Error(), string(key))
-	require.Contains(t, status.Convert(err).Message(), kv.ErrTxnLocked.Error())
-	for _, detail := range status.Convert(err).Details() {
-		info, ok := detail.(*errdetails.ErrorInfo)
-		require.True(t, ok)
-		require.Empty(t, info.GetMetadata())
-	}
+	require.Equal(t, "forward conflict", status.Convert(err).Message())
+	require.Len(t, status.Convert(err).Details(), 1)
 }
 
 func TestStampTxnTimestamps_RejectsMaxStartTS(t *testing.T) {

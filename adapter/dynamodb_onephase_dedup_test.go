@@ -192,6 +192,56 @@ func TestItemWriteDedup_SelfInflictedReuseConflict_ReturnsSuccess(t *testing.T) 
 	require.Equal(t, 0, coord.probeNoOps, "the FSM probe at the prior ts misses; the self-conflict guard is adapter-side")
 }
 
+func TestItemWriteDedup_CommitTimestampCollisionIsNotReceipt(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	_, server := newDedupItemWriteServer(st, nil, true)
+	key := []byte("item")
+	require.NoError(t, st.PutAt(ctx, key, []byte("other-writer"), 100, 0))
+	pending := &reusableItemWrite{
+		probeKey: key,
+		plan: &itemWritePlan{req: &kv.OperationGroup[kv.OP]{Elems: []*kv.Elem[kv.OP]{
+			{Op: kv.Put, Key: key, Value: []byte("our-write")},
+		}}},
+	}
+	plan, kept, err := server.resolveReuseWriteConflict(ctx, "jepsen_append", pending, 100, store.ErrWriteConflict)
+	require.Nil(t, plan)
+	require.Same(t, pending, kept)
+	require.ErrorIs(t, err, kv.ErrTransactionOutcomeUnknown)
+}
+
+func TestItemWriteDedup_SecondaryMismatchIsNotReceipt(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	_, server := newDedupItemWriteServer(st, nil, true)
+	primary, secondary := []byte("item"), []byte("index")
+	require.NoError(t, st.PutAt(ctx, primary, []byte("ours"), 100, 0))
+	require.NoError(t, st.PutAt(ctx, secondary, []byte("other"), 100, 0))
+	matches, err := server.reuseWriteSetMatches(ctx, []*kv.Elem[kv.OP]{
+		{Op: kv.Put, Key: primary, Value: []byte("ours")},
+		{Op: kv.Put, Key: secondary, Value: []byte("ours")},
+	}, 100)
+	require.NoError(t, err)
+	require.False(t, matches)
+}
+
+func TestItemWriteDedup_DeleteTombstoneIsNotReceipt(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	_, server := newDedupItemWriteServer(st, nil, true)
+	key := []byte("item")
+	require.NoError(t, st.PutAt(ctx, key, []byte("old"), 10, 0))
+	require.NoError(t, st.DeleteAt(ctx, key, 100))
+	matches, err := server.reuseWriteSetMatches(ctx, []*kv.Elem[kv.OP]{
+		{Op: kv.Del, Key: key},
+	}, 100)
+	require.NoError(t, err)
+	require.False(t, matches)
+}
+
 // TestItemWriteDedup_GenuineConflictRecomputes: attempt 1 pre-rejects; before
 // the reuse a CONCURRENT write advances the item past the reused snapshot, so
 // the reuse genuinely OCC-conflicts and the self-conflict probe misses (our

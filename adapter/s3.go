@@ -206,6 +206,10 @@ func newS3ResponseError(statusCode int, code, message, bucket, objectKey string)
 }
 
 func writeS3ResponseOrInternalError(w http.ResponseWriter, err error) {
+	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+		writeS3Error(w, http.StatusConflict, "OperationOutcomeUnknown", "Operation outcome unknown", "", "")
+		return
+	}
 	var responseErr *s3ResponseError
 	if errors.As(err, &responseErr) {
 		writeS3Error(w, responseErr.Status, responseErr.Code, responseErr.Message, responseErr.Bucket, responseErr.Key)
@@ -2346,6 +2350,10 @@ func writeS3Error(w http.ResponseWriter, status int, code string, message string
 }
 
 func writeS3InternalError(w http.ResponseWriter, err error) {
+	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+		writeS3Error(w, http.StatusConflict, "OperationOutcomeUnknown", "Operation outcome unknown", "", "")
+		return
+	}
 	if err != nil {
 		slog.Error("s3 internal error", "error", err)
 	}
@@ -2594,6 +2602,10 @@ func (s *S3Server) retryS3Mutation(ctx context.Context, fn func() error) error {
 }
 
 func writeS3MutationError(w http.ResponseWriter, err error, bucket string, key string) {
+	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+		writeS3Error(w, http.StatusConflict, "OperationOutcomeUnknown", "Operation outcome unknown", "", "")
+		return
+	}
 	var responseErr *s3ResponseError
 	if errors.As(err, &responseErr) {
 		writeS3Error(w, responseErr.Status, responseErr.Code, responseErr.Message, responseErr.Bucket, responseErr.Key)
