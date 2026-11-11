@@ -10,6 +10,7 @@ import (
 )
 
 func TestBootstrapPayloadScopeRejectsForeignNativeTarget(t *testing.T) {
+	t.Parallel()
 	for _, kind := range []raftbootstrap.ControlKind{raftbootstrap.ControlActivate, raftbootstrap.ControlGuardedWatermark, raftbootstrap.ControlGuardedCatalog} {
 		t.Run(string(rune('0'+kind)), func(t *testing.T) {
 			var payload []byte

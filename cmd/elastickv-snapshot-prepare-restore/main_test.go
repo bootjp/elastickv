@@ -17,6 +17,7 @@ import (
 )
 
 func TestRunPrepareRestoreSuccess(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	input := writeHeaderOnlyFSM(t, filepath.Join(dir, "encoded.fsm"))
 	writeEncodeInfo(t, input, "cluster-a", true, true)
@@ -41,6 +42,7 @@ func TestRunPrepareRestoreSuccess(t *testing.T) {
 }
 
 func TestRunPrepareRestoreFailureCases(t *testing.T) {
+	t.Parallel()
 	testCases := []struct {
 		name      string
 		writeInfo func(t *testing.T, input string)
@@ -97,6 +99,7 @@ func TestRunPrepareRestoreFailureCases(t *testing.T) {
 }
 
 func TestRunPrepareRestoreClassifiesTruncatedHeaderAsDataErr(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	input := filepath.Join(dir, "encoded.fsm")
 	require.NoError(t, os.WriteFile(input, nil, 0o600))
@@ -114,6 +117,7 @@ func TestRunPrepareRestoreClassifiesTruncatedHeaderAsDataErr(t *testing.T) {
 }
 
 func TestRunPrepareRestoreClassifiesMalformedEncodeInfoAsDataErr(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	input := writeHeaderOnlyFSM(t, filepath.Join(dir, "encoded.fsm"))
 	require.NoError(t, os.WriteFile(backup.EncodeInfoSidecarPath(input), []byte("{"), 0o600))
@@ -130,6 +134,7 @@ func TestRunPrepareRestoreClassifiesMalformedEncodeInfoAsDataErr(t *testing.T) {
 }
 
 func TestRunPrepareRestoreRejectsEntryTimestampAboveHeader(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	input := writeSingleEntryFSM(t, filepath.Join(dir, "encoded.fsm"), 10, 11)
 	writeEncodeInfo(t, input, "cluster-a", true, true)
@@ -146,6 +151,7 @@ func TestRunPrepareRestoreRejectsEntryTimestampAboveHeader(t *testing.T) {
 }
 
 func TestRunPrepareRestoreAcceptedFlagCombinations(t *testing.T) {
+	t.Parallel()
 	testCases := []struct {
 		name            string
 		clusterID       string
@@ -198,6 +204,7 @@ func TestRunPrepareRestoreAcceptedFlagCombinations(t *testing.T) {
 }
 
 func TestRunPrepareRestoreRejectsFreshClusterWithTargetClusterID(t *testing.T) {
+	t.Parallel()
 	code, err := run([]string{
 		"--input", "encoded.fsm",
 		"--data-dir", filepath.Join(t.TempDir(), "raft"),
@@ -211,6 +218,7 @@ func TestRunPrepareRestoreRejectsFreshClusterWithTargetClusterID(t *testing.T) {
 }
 
 func TestParsePeersNormalizesDerivedNodeIDs(t *testing.T) {
+	t.Parallel()
 	peers, err := parsePeers("n2=127.0.0.1:12002,n1=127.0.0.1:12001")
 	require.NoError(t, err)
 	require.Len(t, peers, 2)
@@ -224,11 +232,13 @@ func TestParsePeersNormalizesDerivedNodeIDs(t *testing.T) {
 }
 
 func TestParsePeersRejectsDuplicateDerivedNodeIDs(t *testing.T) {
+	t.Parallel()
 	_, err := parsePeers("n1=127.0.0.1:12001,n1=127.0.0.1:12002")
 	require.ErrorContains(t, err, "duplicate peer node id")
 }
 
 func TestClassifyErrorTreatsMalformedSnapshotEntriesAsDataErr(t *testing.T) {
+	t.Parallel()
 	for _, err := range []error{
 		backup.ErrSnapshotEncryptedEntry,
 		backup.ErrSnapshotEncryptedReserved,
@@ -246,6 +256,7 @@ func TestClassifyErrorTreatsMalformedSnapshotEntriesAsDataErr(t *testing.T) {
 }
 
 func TestHLCCeilingMsAfterLastCommitTS(t *testing.T) {
+	t.Parallel()
 	got, err := hlcCeilingMsAfterLastCommitTS(0)
 	require.NoError(t, err)
 	require.Equal(t, uint64(0), got)

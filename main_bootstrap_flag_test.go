@@ -8,6 +8,7 @@ import (
 )
 
 func TestBootstrapRuntimeFlagIsRegistered(t *testing.T) {
+	t.Parallel()
 	f := flag.Lookup("raftBootstrapPeerConfigDir")
 	require.NotNil(t, f)
 	getter, ok := f.Value.(flag.Getter)

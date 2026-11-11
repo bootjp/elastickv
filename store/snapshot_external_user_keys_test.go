@@ -39,6 +39,7 @@ func externalAliasSource(t *testing.T, format string, encrypted bool) (MVCCStore
 }
 
 func TestExternalSnapshotOrdinaryMigrationNamesRoundTrip(t *testing.T) {
+	t.Parallel()
 	for _, format := range []string{"mvcc", "native", "sst"} {
 		for _, encrypted := range []bool{false, true} {
 			if encrypted && format == "mvcc" {
@@ -121,6 +122,7 @@ func assertExternalAliasValues(t *testing.T, s MVCCStore) {
 }
 
 func TestExternalSnapshotRawMigrationNamesRemainMetadata(t *testing.T) {
+	t.Parallel()
 	for _, format := range []string{"native", "sst"} {
 		for _, encrypted := range []bool{false, true} {
 			for key, value := range externalAliasValues() {
@@ -158,6 +160,7 @@ func verifyExternalAliasRefusal(t *testing.T, raw []byte, options []PebbleStoreO
 }
 
 func TestExternalSnapshotLogicalMigrationControlKeysRemainReserved(t *testing.T) {
+	t.Parallel()
 	for _, key := range [][]byte{migrationOwnershipMetaKeyBytes, migrationRetiredMetaKeyBytes, migrationReadyKey(7)} {
 		source := externalTestMemory(t)
 		require.NoError(t, source.PutAt(t.Context(), key, []byte("legacy control"), 10, 0))

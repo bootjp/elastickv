@@ -526,3 +526,24 @@ func snapPath(snapDir string, term, index uint64) string {
 func formatSnapName(term, index uint64) string {
 	return fmt.Sprintf("%016x-%016x%s", term, index, snapFileExt)
 }
+
+// errMigrationDestinationExists reports that a restore's destination data
+// directory already exists; the restore never replaces one.
+var errMigrationDestinationExists = errors.New("etcd migration: destination already exists")
+
+// finalizeMigrationDir publishes a fully written temporary data directory at
+// destDataDir without replacing an existing one, and syncs the parent.
+func finalizeMigrationDir(tempDir string, destDataDir string) error {
+	if err := renameDirNoReplace(tempDir, destDataDir); err != nil {
+		_ = os.RemoveAll(tempDir)
+		if isRenameNoReplaceExists(err) {
+			return errors.Wrapf(errMigrationDestinationExists, "%s", destDataDir)
+		}
+		return errors.WithStack(err)
+	}
+	if err := syncDir(filepath.Dir(destDataDir)); err != nil {
+		_ = os.RemoveAll(destDataDir)
+		return err
+	}
+	return nil
+}

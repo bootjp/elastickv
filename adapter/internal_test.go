@@ -133,6 +133,7 @@ func TestInternalForwardAppliedConflictStatusSurvivesGRPC(t *testing.T) {
 }
 
 func TestInternalForwardDoesNotCertifyConflictWithoutAttemptEvidence(t *testing.T) {
+	t.Parallel()
 	for _, tt := range []struct {
 		name string
 		err  error
@@ -176,6 +177,7 @@ func TestForwardUnknownStatusOmitsDecisionForMixedBatch(t *testing.T) {
 }
 
 func TestInternalForwardConflictStatusSurvivesGRPC(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name string
 		key  []byte

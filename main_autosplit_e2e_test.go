@@ -16,6 +16,7 @@ import (
 )
 
 func TestAutoSplitE2EThreeNodeSplitKillSwitchAndLeadershipReset(t *testing.T) {
+	t.Parallel()
 	const (
 		nodeCount    = 3
 		waitTimeout  = 20 * time.Second

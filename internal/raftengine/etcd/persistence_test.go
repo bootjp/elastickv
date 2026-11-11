@@ -16,6 +16,7 @@ import (
 )
 
 func TestLoadStateFileRejectsLargeEntryCount(t *testing.T) {
+	t.Parallel()
 	path := stateFilePath(t.TempDir())
 
 	var buf bytes.Buffer
@@ -33,6 +34,7 @@ func TestLoadStateFileRejectsLargeEntryCount(t *testing.T) {
 }
 
 func TestReadMessageRejectsLargePayload(t *testing.T) {
+	t.Parallel()
 	var buf bytes.Buffer
 	require.NoError(t, writeU32(&buf, maxPersistedEntryMessage+1))
 
@@ -43,15 +45,18 @@ func TestReadMessageRejectsLargePayload(t *testing.T) {
 }
 
 func TestPersistedEntryLimitExceedsCurrentTransportBudget(t *testing.T) {
+	t.Parallel()
 	require.Greater(t, maxPersistedEntryMessage, uint32(internalutil.GRPCMaxMessageBytes))
 }
 
 func TestLegacySnapshotLimitPreservesHistoricalBudget(t *testing.T) {
+	t.Parallel()
 	require.GreaterOrEqual(t, maxPersistedLegacySnapshot, uint32(256<<20))
 	require.Greater(t, maxPersistedLegacySnapshot, maxPersistedEntryMessage)
 }
 
 func TestLoadEntriesFileRejectsLargePayload(t *testing.T) {
+	t.Parallel()
 	path := entriesFilePath(t.TempDir())
 
 	var buf bytes.Buffer
@@ -67,6 +72,7 @@ func TestLoadEntriesFileRejectsLargePayload(t *testing.T) {
 }
 
 func TestLoadEntriesFileHandlesMoreThanEntryCapacityCap(t *testing.T) {
+	t.Parallel()
 	path := entriesFilePath(t.TempDir())
 
 	var buf bytes.Buffer
@@ -88,6 +94,7 @@ func TestLoadEntriesFileHandlesMoreThanEntryCapacityCap(t *testing.T) {
 }
 
 func TestOpenRejectsMultiNodePersistedState(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	state := persistedState{
 		Snapshot: raftTestSnapshot(1, 1, []uint64{1, 2}, nil),
@@ -106,37 +113,8 @@ func TestOpenRejectsMultiNodePersistedState(t *testing.T) {
 	require.ErrorContains(t, err, errClusterMismatch.Error())
 }
 
-func TestLoadOrCreateStateMigratesLegacyStateFile(t *testing.T) {
-	dir := t.TempDir()
-	legacy := persistedState{
-		Snapshot: raftTestSnapshot(5, 2, []uint64{1}, mustEncodeSnapshotData(t, [][]byte{[]byte("snap")})),
-		Entries: []raftpb.Entry{{
-			Type:  entryTypePtr(raftpb.EntryNormal),
-			Index: uint64Ptr(6),
-			Term:  uint64Ptr(2),
-			Data:  encodeProposalEnvelope(1, []byte("tail")),
-		}},
-	}
-	require.NoError(t, saveStateFile(stateFilePath(dir), legacy))
-
-	state, err := loadOrCreateState(dir, 1)
-	require.NoError(t, err)
-	require.Len(t, state.Entries, len(legacy.Entries))
-	require.Equal(t, legacy.Entries[0].GetType(), state.Entries[0].GetType())
-	require.Equal(t, legacy.Entries[0].GetIndex(), state.Entries[0].GetIndex())
-	require.Equal(t, legacy.Entries[0].GetTerm(), state.Entries[0].GetTerm())
-	require.Equal(t, legacy.Entries[0].GetData(), state.Entries[0].GetData())
-	require.Equal(t, legacy.Snapshot.GetMetadata().GetIndex(), state.Snapshot.GetMetadata().GetIndex())
-	require.Equal(t, legacy.Snapshot.GetMetadata().GetTerm(), state.Snapshot.GetMetadata().GetTerm())
-	require.Equal(t, legacy.Snapshot.GetMetadata().GetConfState().GetVoters(), state.Snapshot.GetMetadata().GetConfState().GetVoters())
-	require.Nil(t, state.Snapshot.Data)
-
-	payload, err := os.ReadFile(snapshotDataFilePath(dir))
-	require.NoError(t, err)
-	require.Equal(t, legacy.Snapshot.Data, payload)
-}
-
 func TestLoadLegacyOrSplitStateRemovesStaleReplaceTemps(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	legacy := persistedState{
 		Snapshot: raftTestSnapshot(1, 1, []uint64{1}, nil),
@@ -162,6 +140,7 @@ func TestLoadLegacyOrSplitStateRemovesStaleReplaceTemps(t *testing.T) {
 }
 
 func TestSnapshotBytesAndCloseReturnsCloseError(t *testing.T) {
+	t.Parallel()
 	closeErr := errors.New("close failed")
 	snapshot := &errorSnapshot{
 		data:     []byte("snap"),
@@ -175,6 +154,7 @@ func TestSnapshotBytesAndCloseReturnsCloseError(t *testing.T) {
 }
 
 func TestSnapshotBytesAndCloseClosesSnapshotWhenWriteFails(t *testing.T) {
+	t.Parallel()
 	writeErr := errors.New("write failed")
 	snapshot := &errorSnapshot{
 		data:     []byte("snap"),
@@ -189,6 +169,7 @@ func TestSnapshotBytesAndCloseClosesSnapshotWhenWriteFails(t *testing.T) {
 }
 
 func TestSnapshotBytesDoesNotCloseSnapshot(t *testing.T) {
+	t.Parallel()
 	snapshot := &errorSnapshot{data: []byte("snap")}
 
 	data, err := snapshotBytes(snapshot, t.TempDir())

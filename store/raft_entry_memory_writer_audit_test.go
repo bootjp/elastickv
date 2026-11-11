@@ -202,6 +202,12 @@ func waitForMemoryFenceWriter(t *testing.T, frame string, result <-chan error) {
 		default:
 		}
 		n := runtime.Stack(buffer, true)
+		// A full buffer means the dump was truncated; with many parallel
+		// tests the writer's stack can fall past the end.
+		for n == len(buffer) {
+			buffer = make([]byte, 2*len(buffer))
+			n = runtime.Stack(buffer, true)
+		}
 		for _, stack := range strings.Split(string(buffer[:n]), "\n\n") {
 			if strings.Contains(stack, "runMemoryFenceWriter") && strings.Contains(stack, "(*mvccStore)."+frame) && strings.Contains(stack, "sync.(*Mutex).lockSlow") {
 				return
@@ -213,6 +219,7 @@ func waitForMemoryFenceWriter(t *testing.T, frame string, result <-chan error) {
 }
 
 func TestMemoryRaftEntryFencesEveryPublishedWriter(t *testing.T) {
+	t.Parallel()
 	for _, writer := range memoryFenceWriters() {
 		for _, journal := range []bool{false, true} {
 			mode := map[bool]string{false: "indexed", true: "journal"}[journal]

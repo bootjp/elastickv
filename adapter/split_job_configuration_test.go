@@ -21,6 +21,7 @@ func (l migrationConfigurationLeader) AppliedConfigurationIndex() (uint64, bool)
 }
 
 func TestMigrationConfigurationProbeRequiresOrderedRuntimeHook(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := store.NewMVCCStore()
 	fsm := kv.NewKvFSMWithHLC(st, nil)
@@ -46,6 +47,7 @@ func TestMigrationConfigurationProbeRequiresOrderedRuntimeHook(t *testing.T) {
 }
 
 func TestSplitCleanupConfigurationBarrierRejectsMixedAndMissingEpochs(t *testing.T) {
+	t.Parallel()
 	for _, secondIndex := range []uint64{0, 9, 10} {
 		t.Run(map[uint64]string{0: "old runtime", 9: "same configuration", 10: "new configuration"}[secondIndex], func(t *testing.T) {
 			n1 := &splitMigrationClientStub{probeFn: func(*pb.ProbeMigrationStateRequest) (*pb.ProbeMigrationStateResponse, error) {

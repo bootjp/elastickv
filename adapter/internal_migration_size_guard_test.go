@@ -40,6 +40,7 @@ func newTransferGuardInternal(t *testing.T, index uint64, ready func() bool) (*I
 }
 
 func TestMigrationSizeGuardCapabilitySeparatesSupportFromEpoch(t *testing.T) {
+	t.Parallel()
 	for _, index := range []uint64{0, 9} {
 		for _, ready := range []bool{false, true} {
 			i, _ := newTransferGuardInternal(t, index, func() bool { return ready })
@@ -62,6 +63,7 @@ func TestMigrationSizeGuardCapabilitySeparatesSupportFromEpoch(t *testing.T) {
 }
 
 func TestMigrationSizeGuardStaticSupportSurvivesClosedOperationalGate(t *testing.T) {
+	t.Parallel()
 	i, _ := newTransferGuardInternal(t, 0, func() bool { return true })
 	WithInternalMigrationOwnershipReady(func() bool { return false })(i)
 	require.True(t, i.MigrationTransferSizeGuardSupported(), "installed hooks do not disappear when the cluster activation gate closes")
@@ -74,6 +76,7 @@ func TestMigrationSizeGuardStaticSupportSurvivesClosedOperationalGate(t *testing
 }
 
 func TestMigrationSizeGuardActivationAndAppliedProof(t *testing.T) {
+	t.Parallel()
 	ready := false
 	i, configuration := newTransferGuardInternal(t, 9, func() bool { return ready })
 	req := &pb.TargetStagedReadinessRequest{JobId: 11, MigrationJobId: 11, RouteStart: []byte("m"), RouteEnd: []byte("z"),

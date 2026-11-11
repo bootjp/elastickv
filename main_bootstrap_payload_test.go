@@ -85,6 +85,7 @@ func bootstrapPayloadFixtures(t testing.TB) []bootstrapPayloadCase {
 		{"single", bootstrapPayloadProto(t, bootstrapPayloadSingle, bootstrapPayloadRequest()), data},
 		{"batch", bootstrapPayloadProto(t, bootstrapPayloadBatch, &pb.RaftCommand{Requests: []*pb.Request{bootstrapPayloadRequest(), bootstrapPayloadRequest()}}), data},
 		{"watermark", kv.EncodeWatermarkAdvance(42), data},
+		{"commit timestamp fence activation", kv.EncodeCommitTSFenceActivation(), data},
 		{"pin", kv.EncodeBackupPinEntry(pin), data},
 		{"reserve", kv.EncodeBackupReserveEntry(pin), data},
 		{"extend", kv.EncodeBackupExtendEntry(kv.BackupExtendEntry{PinID: pin.PinID, Deadline: pin.Deadline}), data},
@@ -112,6 +113,7 @@ func bootstrapPayloadFixtures(t testing.TB) []bootstrapPayloadCase {
 }
 
 func TestBootstrapAdmissionPayloadLaneMatrix(t *testing.T) {
+	t.Parallel()
 	for _, tc := range bootstrapPayloadFixtures(t) {
 		t.Run(tc.name, func(t *testing.T) {
 			for _, kind := range bootstrapAdmissionKinds() {
@@ -127,6 +129,7 @@ func TestBootstrapAdmissionPayloadLaneMatrix(t *testing.T) {
 }
 
 func TestBootstrapAdmissionPayloadRejectsTrailingAndControlTruncation(t *testing.T) {
+	t.Parallel()
 	for _, tc := range bootstrapPayloadFixtures(t) {
 		t.Run(tc.name, func(t *testing.T) {
 			for _, kind := range tc.kinds {
@@ -143,6 +146,7 @@ func TestBootstrapAdmissionPayloadRejectsTrailingAndControlTruncation(t *testing
 }
 
 func TestBootstrapAdmissionPayloadRejectsUnknownAndUnsupportedControls(t *testing.T) {
+	t.Parallel()
 	guarded := bootstrapPayloadGuarded(t, raftbootstrap.ControlGuardedWatermark)
 	for _, controlKind := range []raftbootstrap.ControlKind{raftbootstrap.ControlActivate, raftbootstrap.ControlReserve, raftbootstrap.ControlAbort, 255} {
 		candidate := bytes.Clone(guarded)
@@ -164,6 +168,7 @@ func TestBootstrapAdmissionPayloadRejectsUnknownAndUnsupportedControls(t *testin
 }
 
 func TestBootstrapAdmissionPayloadRejectsUnknownNestedFieldsAndEnums(t *testing.T) {
+	t.Parallel()
 	unknown := []byte{0xf8, 0x07, 0x01}
 	request := bootstrapPayloadRequest()
 	request.Mutations[0].ProtoReflect().SetUnknown(unknown)
@@ -191,6 +196,7 @@ func TestBootstrapAdmissionPayloadRejectsUnknownNestedFieldsAndEnums(t *testing.
 }
 
 func TestBootstrapAdmissionPayloadRejectsAmbiguousProtobuf(t *testing.T) {
+	t.Parallel()
 	single := bootstrapPayloadProto(t, bootstrapPayloadSingle, bootstrapPayloadRequest())
 	batch := bootstrapPayloadProto(t, bootstrapPayloadBatch, &pb.RaftCommand{Requests: []*pb.Request{bootstrapPayloadRequest()}})
 	for _, payload := range [][]byte{
@@ -204,6 +210,7 @@ func TestBootstrapAdmissionPayloadRejectsAmbiguousProtobuf(t *testing.T) {
 }
 
 func TestBootstrapAdmissionPayloadRejectsInvalidScalarsAndBackup(t *testing.T) {
+	t.Parallel()
 	for _, ceiling := range []uint64{0, uint64(1) << 48, ^uint64(0)} {
 		require.ErrorIs(t, validateBootstrapAdmissionPayload(raftadmission.HLC,
 			binary.BigEndian.AppendUint64([]byte{bootstrapPayloadHLC}, ceiling)), errBootstrapAdmissionPayload)
@@ -227,6 +234,7 @@ func TestBootstrapAdmissionPayloadRejectsInvalidScalarsAndBackup(t *testing.T) {
 }
 
 func TestBootstrapAdmissionPayloadRejectsOpaqueEncryptedNativeFrame(t *testing.T) {
+	t.Parallel()
 	// The same version byte as a KV batch must not grant permission to an
 	// envelope whose contents this keyless API cannot authenticate/decrypt.
 	envelope := encryption.Envelope{Version: encryption.EnvelopeVersionV1, KeyID: 1, Body: make([]byte, encryption.TagSize)}

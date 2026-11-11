@@ -8,6 +8,7 @@ import (
 )
 
 func TestNormalizePeers_EmptyWithoutBootstrapRejects(t *testing.T) {
+	t.Parallel()
 	// peers == [] && persistedPeersOK == false && Bootstrap == false is the
 	// scenario that produced a split-brain: a node whose data dir was wiped
 	// started against an existing cluster and elected itself as a single-node
@@ -18,6 +19,7 @@ func TestNormalizePeers_EmptyWithoutBootstrapRejects(t *testing.T) {
 }
 
 func TestNormalizePeers_EmptyWithBootstrapAllowsSelf(t *testing.T) {
+	t.Parallel()
 	// --raftBootstrap is an explicit opt-in: starting a brand-new single-node
 	// cluster is legitimate.
 	local, peers, err := normalizePeers(0, "n1", "host:1", nil, false, true)
@@ -28,6 +30,7 @@ func TestNormalizePeers_EmptyWithBootstrapAllowsSelf(t *testing.T) {
 }
 
 func TestNormalizePeers_EmptyWithPersistedAllowsSelf(t *testing.T) {
+	t.Parallel()
 	// Recovering from persisted peers where the current caller happens to be
 	// the only surviving entry must still succeed.
 	local, peers, err := normalizePeers(0, "n1", "host:1", nil, true, false)
@@ -38,6 +41,7 @@ func TestNormalizePeers_EmptyWithPersistedAllowsSelf(t *testing.T) {
 }
 
 func TestNormalizePeers_ExplicitPeerListIgnoresGuard(t *testing.T) {
+	t.Parallel()
 	// When an explicit peer list is supplied, the guard does not apply — the
 	// operator has stated cluster membership intent.
 	in := []Peer{
@@ -50,6 +54,7 @@ func TestNormalizePeers_ExplicitPeerListIgnoresGuard(t *testing.T) {
 }
 
 func TestNormalizePeersConfig_DoesNotDefaultWithoutBootstrap(t *testing.T) {
+	t.Parallel()
 	// Regression for the bypass of the self-bootstrap guard: without an
 	// explicit Bootstrap flag, normalizePeersConfig must NOT fabricate a
 	// single-peer self-list from LocalID/LocalAddress. Otherwise the guard
@@ -66,6 +71,7 @@ func TestNormalizePeersConfig_DoesNotDefaultWithoutBootstrap(t *testing.T) {
 }
 
 func TestNormalizePeersConfig_DefaultsWhenBootstrapSet(t *testing.T) {
+	t.Parallel()
 	// With Bootstrap explicitly set, a single-peer self-list is legitimate.
 	cfg := OpenConfig{
 		NodeID:       DeriveNodeID("n1"),

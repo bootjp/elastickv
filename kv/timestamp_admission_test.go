@@ -36,6 +36,7 @@ func admissionTestRequests() []*pb.Request {
 }
 
 func TestStampTimestampAdmissionClearsUntrustedEpochBeforeRelease(t *testing.T) {
+	t.Parallel()
 	for _, st := range []store.MVCCStore{nil, admissionTestStore(t, 0, 0)} {
 		requests := admissionTestRequests()
 		require.NoError(t, StampTimestampAdmission(context.Background(), nil, st, requests))
@@ -46,6 +47,7 @@ func TestStampTimestampAdmissionClearsUntrustedEpochBeforeRelease(t *testing.T) 
 }
 
 func TestStampTimestampAdmissionValidatesPersistenceNotPrepareStart(t *testing.T) {
+	t.Parallel()
 	st := admissionTestStore(t, prepareCreationReleased, 100)
 	for i, timestamp := range []uint64{110, 120, 130} {
 		request := admissionTestRequests()[i]
@@ -63,6 +65,7 @@ func TestStampTimestampAdmissionValidatesPersistenceNotPrepareStart(t *testing.T
 }
 
 func TestStampTimestampAdmissionResolutionRemainsAvailableWhileSealed(t *testing.T) {
+	t.Parallel()
 	st := admissionTestStore(t, prepareCreationSealed, 0)
 	resolution := []*pb.Request{nil,
 		{IsTxn: true, Phase: pb.Phase_COMMIT, TimestampAdmissionFloor: 777},
@@ -80,6 +83,7 @@ func TestStampTimestampAdmissionResolutionRemainsAvailableWhileSealed(t *testing
 }
 
 func TestStampTimestampAdmissionRejectsMissingValidatorAndUnissuedValues(t *testing.T) {
+	t.Parallel()
 	st := admissionTestStore(t, prepareCreationReleased, 100)
 	requests := admissionTestRequests()
 	require.ErrorIs(t, StampTimestampAdmission(context.Background(), &fakeTSOAllocator{}, st, requests), ErrTSOProtocolUnsupported)
@@ -97,6 +101,7 @@ func TestStampTimestampAdmissionRejectsMissingValidatorAndUnissuedValues(t *test
 }
 
 func TestTimestampAdmissionOwnedRequestCannotBeRetaggedByRetry(t *testing.T) {
+	t.Parallel()
 	st := admissionTestStore(t, 0, 0)
 	allocator := &phaseDTestAllocator{}
 	admission := &transactionTimestampAdmission{store: st, allocator: func() TimestampAllocator { return allocator }}
@@ -116,6 +121,7 @@ func TestTimestampAdmissionOwnedRequestCannotBeRetaggedByRetry(t *testing.T) {
 }
 
 func TestStampTimestampAdmissionDeduplicatesValidationWithinCommit(t *testing.T) {
+	t.Parallel()
 	st := admissionTestStore(t, prepareCreationReleased, 100)
 	allocator := &phaseDTestAllocator{}
 	requests := []*pb.Request{{Ts: 110}, {Ts: 110}}
@@ -127,6 +133,7 @@ func TestStampTimestampAdmissionDeduplicatesValidationWithinCommit(t *testing.T)
 }
 
 func TestTimestampAdmissionTransactionManagerAndLocalProxyAreWired(t *testing.T) {
+	t.Parallel()
 	for _, proxy := range []bool{false, true} {
 		t.Run(map[bool]string{false: "manager", true: "sharded_proxy"}[proxy], func(t *testing.T) {
 			st := admissionTestStore(t, prepareCreationReleased, 100)
@@ -164,6 +171,7 @@ func TestTimestampAdmissionTransactionManagerAndLocalProxyAreWired(t *testing.T)
 }
 
 func TestTimestampAdmissionAutomaticWiringRequiresDedicatedState(t *testing.T) {
+	t.Parallel()
 	for _, scenario := range []struct {
 		name           string
 		timestampGroup *ShardGroup
@@ -190,6 +198,7 @@ func TestTimestampAdmissionAutomaticWiringRequiresDedicatedState(t *testing.T) {
 }
 
 func TestTimestampAdmissionExplicitOptionSurvivesLegacyCoordinator(t *testing.T) {
+	t.Parallel()
 	engine := &recordingTSOEngine{state: raftengine.StateLeader, term: 1}
 	st := admissionTestStore(t, prepareCreationReleased, 100)
 	allocator := &phaseDTestAllocator{}
@@ -206,6 +215,7 @@ func TestTimestampAdmissionExplicitOptionSurvivesLegacyCoordinator(t *testing.T)
 }
 
 func TestTimestampAdmissionSingleCoordinatorUsesCurrentAllocator(t *testing.T) {
+	t.Parallel()
 	st := admissionTestStore(t, prepareCreationReleased, 100)
 	engine := &recordingTSOEngine{state: raftengine.StateLeader, term: 1}
 	tm := NewTransactionWithProposer(engine)
@@ -237,6 +247,7 @@ func (a *admissionDeadlineAllocator) ValidateDurableTimestamp(ctx context.Contex
 }
 
 func TestStampTimestampAdmissionSharesOneBudgetAndHonorsEarlierDeadline(t *testing.T) {
+	t.Parallel()
 	st := admissionTestStore(t, prepareCreationReleased, 100)
 	for _, timeout := range []time.Duration{time.Minute, time.Second} {
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
@@ -253,6 +264,7 @@ func TestStampTimestampAdmissionSharesOneBudgetAndHonorsEarlierDeadline(t *testi
 }
 
 func TestStampTimestampAdmissionStopsFurtherValidationAfterBudgetCancellation(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	allocator := &admissionDeadlineAllocator{validated: cancel}

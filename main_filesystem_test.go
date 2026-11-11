@@ -42,6 +42,7 @@ func (r *testFilesystemLeaseReaper) ReapExpiredOpenHandleLeases(
 }
 
 func TestRunFilesystemLeaseReaperRunsPeriodically(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	reaper := &testFilesystemLeaseReaper{cancel: cancel}
 
@@ -192,6 +193,7 @@ func newFilesystemTestService(t *testing.T) *filesystem.Service {
 }
 
 func TestMountFilesystemServiceFailsOnMissingMountPoint(t *testing.T) {
+	t.Parallel()
 	svc := newFilesystemTestService(t)
 	config := filesystemStartConfig{
 		mountPoint: filepath.Join(t.TempDir(), "missing"),
@@ -209,6 +211,7 @@ func TestMountFilesystemServiceFailsOnMissingMountPoint(t *testing.T) {
 // instead of letting it run to completion (or to the five-minute recovery
 // timeout) while the signal handler swallows repeat signals.
 func TestMountFilesystemServiceAbortsOnCancelledContext(t *testing.T) {
+	t.Parallel()
 	svc := newFilesystemTestService(t)
 	config := filesystemStartConfig{mountPoint: t.TempDir(), clientID: "mount-cancel"}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -232,6 +235,7 @@ func skipOrFailWithoutFuse(t *testing.T, format string, args ...any) {
 }
 
 func TestMountFilesystemServiceServesKernelMount(t *testing.T) {
+	t.Parallel()
 	if _, err := os.Stat("/dev/fuse"); err != nil {
 		skipOrFailWithoutFuse(t, "no /dev/fuse: %v", err)
 	}
@@ -266,6 +270,7 @@ func TestMountFilesystemServiceServesKernelMount(t *testing.T) {
 }
 
 func TestInstallFilesystemServerLifecycleUnmountsOnContextCancel(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	eg, egCtx := errgroup.WithContext(ctx)
 	cleanup := &internalutil.CleanupStack{}
@@ -498,6 +503,7 @@ func TestInstallFilesystemServerLifecycleCleanupBoundsHungUnmount(t *testing.T) 
 }
 
 func TestInstallFilesystemServerLifecycleTreatsServeExitAfterCancelAsClean(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	eg, egCtx := errgroup.WithContext(ctx)
 	cleanup := &internalutil.CleanupStack{}
@@ -514,6 +520,7 @@ func TestInstallFilesystemServerLifecycleTreatsServeExitAfterCancelAsClean(t *te
 }
 
 func TestInstallFilesystemServerLifecycleFailsWhenServeStops(t *testing.T) {
+	t.Parallel()
 	eg, egCtx := errgroup.WithContext(context.Background())
 	cleanup := &internalutil.CleanupStack{}
 	serveDone := make(chan struct{})
@@ -527,6 +534,7 @@ func TestInstallFilesystemServerLifecycleFailsWhenServeStops(t *testing.T) {
 }
 
 func TestStartFilesystemPlacementCollectorStopsOnCancel(t *testing.T) {
+	t.Parallel()
 	svc := newFilesystemTestService(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	eg, egCtx := errgroup.WithContext(ctx)
@@ -542,6 +550,7 @@ func TestStartFilesystemPlacementCollectorStopsOnCancel(t *testing.T) {
 }
 
 func TestFilesystemBackgroundLoopsSkipWhenDisabled(t *testing.T) {
+	t.Parallel()
 	svc := newFilesystemTestService(t)
 	eg := &errgroup.Group{}
 
@@ -556,6 +565,7 @@ func TestFilesystemBackgroundLoopsSkipWhenDisabled(t *testing.T) {
 }
 
 func TestStartFilesystemLeaseReaperStopsOnCancel(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	eg, egCtx := errgroup.WithContext(ctx)
 	reaper := &testFilesystemLeaseReaper{cancel: cancel}
@@ -567,6 +577,7 @@ func TestStartFilesystemLeaseReaperStopsOnCancel(t *testing.T) {
 }
 
 func TestRunFilesystemLeaseReaperLogsErrorsAndContinues(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	reaper := &testFilesystemLeaseReaper{cancel: cancel, err: errors.New("boom")}
 

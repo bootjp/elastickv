@@ -64,6 +64,7 @@ func TestStopGRPCServerBoundedForcesStopOnLongLivedStream(t *testing.T) {
 // A server with nothing in flight stops within GracefulStop, well before
 // the bound, and nothing is forced.
 func TestStopGRPCServerBoundedReturnsPromptlyWhenIdle(t *testing.T) {
+	t.Parallel()
 	lis, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	srv := grpc.NewServer()

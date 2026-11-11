@@ -1,0 +1,80 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: elastickv
+spec:
+  template:
+    spec:
+      initContainers:
+        - name: prepare-fuse-directory
+          image: busybox@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec
+          command: [sh, -ec, "mkdir -p /shared/fs"]
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 64Mi
+          volumeMounts:
+            - name: fuse-shared
+              mountPath: /shared
+      containers:
+        - name: elastickv
+          image: example.invalid/elastickv-fuse:build-required
+          # Append these flags to the inherited base args with a JSON patch below.
+          securityContext:
+            privileged: true
+            allowPrivilegeEscalation: true
+            capabilities: null
+            seccompProfile:
+              type: Unconfined
+            appArmorProfile:
+              type: Unconfined
+          readinessProbe:
+            tcpSocket: null
+            exec:
+              command: [sh, -ec, "mountpoint -q /shared/fs && ls /shared/fs >/dev/null"]
+          volumeMounts:
+            - name: fuse-device
+              mountPath: /dev/fuse
+            - name: fuse-shared
+              mountPath: /shared
+              mountPropagation: Bidirectional
+        - name: filesystem-consumer
+          image: busybox@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec
+          # Replace this example workload with the consuming application.
+          command: [sh, -ec, "while :; do sleep 3600; done"]
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          readinessProbe:
+            exec:
+              command: [sh, -ec, "grep -q ' /shared/fs .* - fuse.elastickv ' /proc/self/mountinfo && ls /shared/fs >/dev/null"]
+            periodSeconds: 5
+            timeoutSeconds: 3
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 64Mi
+          volumeMounts:
+            - name: fuse-shared
+              mountPath: /shared
+              mountPropagation: HostToContainer
+      volumes:
+        - name: fuse-device
+          hostPath:
+            path: /dev/fuse
+            type: CharDevice
+        - name: fuse-shared
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi

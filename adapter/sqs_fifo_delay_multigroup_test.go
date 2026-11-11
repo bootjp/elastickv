@@ -243,6 +243,7 @@ func (f *sqsDelayMultiGroup) seed(t *testing.T, ctx context.Context) (string, *s
 }
 
 func TestSQSFIFODelayMultiGroupUninterruptedPage(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	f := openSQSDelayMultiGroup(t, t.TempDir(), true)
@@ -270,6 +271,7 @@ func TestSQSFIFODelayMultiGroupUninterruptedPage(t *testing.T) {
 }
 
 func TestSQSFIFODelayMultiGroupPrimaryReplyLoss(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	dir := t.TempDir()

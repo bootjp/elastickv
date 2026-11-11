@@ -404,7 +404,10 @@ type Engine struct {
 	// startedCh is closed after startup has drained committed Ready entries.
 	// Multi-node Open must return before this so callers can register the
 	// transport listener; service startup waits through WaitStarted instead.
-	startedCh chan struct{}
+	startedCh            chan struct{}
+	snapshotRestoring    atomic.Bool
+	statusObservedMonoNs atomic.Int64
+	readinessFailed      atomic.Bool
 
 	leaderReady  chan struct{}
 	leaderOnce   sync.Once
@@ -1053,6 +1056,34 @@ func waitForOpen(ctx context.Context, engine *Engine, waitForLeader bool) (*Engi
 		return nil, err
 	}
 	return engine, nil
+}
+
+// ReadinessObservedAt advances only after the Raft loop publishes current status.
+// A blocked WAL write or FSM Apply cannot refresh this independent monotonic signal.
+func (e *Engine) ReadinessObservedAt() monoclock.Instant {
+	if e == nil {
+		return monoclock.Instant{}
+	}
+	return monoclock.FromNanos(e.statusObservedMonoNs.Load())
+}
+
+// ReadinessState is safe to query while the synchronous FSM restore is blocked.
+func (e *Engine) ReadinessState() raftengine.ReadinessState {
+	if e == nil {
+		return raftengine.ReadinessState{Stopped: true}
+	}
+	state := raftengine.ReadinessState{Restoring: e.snapshotRestoring.Load(), Failed: e.readinessFailed.Load(), Stopped: e.isClosing()}
+	select {
+	case <-e.startedCh:
+		state.Started = true
+	default:
+	}
+	select {
+	case <-e.doneCh:
+		state.Stopped = true
+	default:
+	}
+	return state
 }
 
 func (e *Engine) WaitStarted(ctx context.Context) error {
@@ -2801,6 +2832,7 @@ func (e *Engine) applyReadySnapshotLocked(snapshot *raftpb.Snapshot) error {
 	if etcdraft.IsEmptySnap(snapshot) {
 		return nil
 	}
+	e.snapshotRestoring.Store(true)
 	e.invalidateAdmission()
 	// etcdraft.IsEmptySnap only validates the raft metadata. This backend also
 	// requires FSM payload bytes so it can restore local state before applying
@@ -2857,6 +2889,8 @@ func (e *Engine) applyReadySnapshotLocked(snapshot *raftpb.Snapshot) error {
 		return err
 	}
 	e.alarmIfJoinedAsVoter(confState)
+	// Failed restores retain the not-ready fence until terminal shutdown.
+	e.snapshotRestoring.Store(false)
 	return nil
 }
 
@@ -4136,6 +4170,7 @@ func (e *Engine) refreshStatus() {
 	e.invalidateChangedStatus(oldStatus, status)
 	e.mu.Lock()
 	e.status = status
+	e.statusObservedMonoNs.Store(monoclock.Now().Nanos())
 	if e.closed {
 		e.status.State = raftengine.StateShutdown
 		e.status.PerPeer = nil
@@ -4265,6 +4300,7 @@ func (e *Engine) fail(err error) {
 	wasLeader := e.status.State == raftengine.StateLeader
 	if err != nil {
 		e.runErr = err
+		e.readinessFailed.Store(true)
 	}
 	e.closed = true
 	e.status.State = raftengine.StateShutdown

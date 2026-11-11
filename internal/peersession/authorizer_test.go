@@ -19,6 +19,7 @@ func (a *revokingAuthorizer) Recheck(_ context.Context, b Binding) (CatchupStatu
 	return CatchupStatus{Binding: b, Pending: PendingClear, Phase: GrantReciprocallyAcknowledged}, nil
 }
 func TestNativeAuthorizerMayRevokeWithoutSessionLockCycle(t *testing.T) {
+	t.Parallel()
 	a := &revokingAuthorizer{}
 	f := setupNative(t, fixtureOptions{clientState: Prejoin, learner: true, authorizer: a})
 	a.owner = f.client
@@ -48,6 +49,7 @@ func (a *blockingAuthorizer) Recheck(ctx context.Context, _ Binding) (CatchupSta
 	return CatchupStatus{}, ctx.Err()
 }
 func TestNativeRevocationCancelsAndJoinsOwnedAuthorizerCall(t *testing.T) {
+	t.Parallel()
 	a := &blockingAuthorizer{entered: make(chan struct{})}
 	f := setupNative(t, fixtureOptions{clientState: Prejoin, learner: true, authorizer: a})
 	cc := f.dial(t)

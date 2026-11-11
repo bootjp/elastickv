@@ -13,6 +13,7 @@ import (
 )
 
 func TestSplitTransferPhaseMissingFactoryBlocksTimestampAndExport(t *testing.T) {
+	t.Parallel()
 	ctx, server, catalog, job, source := transferPreflightFixture(t)
 	server.splitApplyMemberFactory = nil
 	_, err := server.preflightSplitJobTransfer(ctx, job)
@@ -70,6 +71,7 @@ func (c *transferTimestampChangeClient) IssueMigrationTimestamp(context.Context,
 }
 
 func TestSplitTransferPhaseConfigurationChangeAfterSnapshotDoesNotAdvance(t *testing.T) {
+	t.Parallel()
 	f := newTransferAdmissionFixture(t)
 	witness, err := f.server.ensureSplitTransferAdmission(t.Context(), f.job, 2, f.source, f.control, f.proof)
 	require.NoError(t, err)
@@ -80,6 +82,7 @@ func TestSplitTransferPhaseConfigurationChangeAfterSnapshotDoesNotAdvance(t *tes
 }
 
 func TestSplitTransferPhasePreflightGuardPrecedesTimestamp(t *testing.T) {
+	t.Parallel()
 	ctx, server, catalog, job, source := transferPreflightFixture(t)
 	_, err := server.preflightSplitJobTransfer(ctx, job)
 	require.NoError(t, err)
@@ -133,6 +136,7 @@ func (p *transferPartitionProtocolPeer) ProbeMigrationState(ctx context.Context,
 }
 
 func TestSplitTransferPhaseBeginGuardsBeforeLocksAndSnapshot(t *testing.T) {
+	t.Parallel()
 	server, catalog, job, source := newTransferRuntimePhaseFixture(t)
 	require.NoError(t, server.beginSplitJobBackfill(t.Context(), job))
 	require.Equal(t, []string{"control", "guard", "locks", "timestamp"}, source.events)
@@ -144,6 +148,7 @@ func TestSplitTransferPhaseBeginGuardsBeforeLocksAndSnapshot(t *testing.T) {
 }
 
 func TestSplitTransferPhaseBeginOldLearnerBlocksLocksAndSnapshot(t *testing.T) {
+	t.Parallel()
 	server, catalog, job, source := newTransferRuntimePhaseFixture(t)
 	factory := server.splitApplyMemberFactory
 	server.splitApplyMemberFactory = func(ctx context.Context, groupID uint64) (SplitMigrationApplyMemberSnapshot, error) {
@@ -159,6 +164,7 @@ func TestSplitTransferPhaseBeginOldLearnerBlocksLocksAndSnapshot(t *testing.T) {
 }
 
 func TestSplitTransferPhaseCopyConfigurationChangeAfterGuardBlocksExport(t *testing.T) {
+	t.Parallel()
 	ctx, server, _, job, source := transferPreflightFixture(t)
 	job.Phase, job.SnapshotTS = distribution.SplitJobPhaseBackfill, 10
 	clients := server.splitMigrationClientFactory
@@ -186,6 +192,7 @@ func TestSplitTransferPhaseCopyConfigurationChangeAfterGuardBlocksExport(t *test
 }
 
 func TestSplitTransferPhaseWitnessPreservesInitialOwnershipACKEpoch(t *testing.T) {
+	t.Parallel()
 	f := newTransferAdmissionFixture(t)
 	// A bound ACK at 40 cannot be relabelled to the observed configuration 41.
 	ack := encodeSplitVoterAckCursor([]splitVoterAck{{id: "voter", address: "voter:9000", acked: true, configurationIndex: 40}})

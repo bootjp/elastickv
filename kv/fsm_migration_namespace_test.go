@@ -27,6 +27,7 @@ func migrationNamespaceRequest(phase pb.Phase, key []byte) *pb.Request {
 }
 
 func TestMigrationNamespaceRejectsAllTransactionPhasesAndAdvisory(t *testing.T) {
+	t.Parallel()
 	for _, phase := range []pb.Phase{pb.Phase_NONE, pb.Phase_PREPARE, pb.Phase_COMMIT, pb.Phase_ABORT} {
 		for _, key := range migrationNamespaceKeys() {
 			t.Run(phase.String()+"/"+string(key), func(t *testing.T) {
@@ -64,6 +65,7 @@ func seedLegacyMigrationIntent(t *testing.T, st store.MVCCStore, key []byte) {
 }
 
 func TestMigrationNamespacePebbleRemainsReopenableAfterRejectedWrite(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	st, err := store.NewPebbleStore(dir)
 	require.NoError(t, err)
@@ -101,6 +103,7 @@ func TestMigrationNamespacePebbleRemainsReopenableAfterRejectedWrite(t *testing.
 }
 
 func TestMigrationNamespacePreservesOrdinaryAliases(t *testing.T) {
+	t.Parallel()
 	keys := append(legacyPrepareEvidenceUserKeys(), []byte("_migack"), []byte("_mighlc"), []byte("_migpromote"),
 		[]byte("!migstage-user"), []byte("!migstage"), []byte("!txn|foo"), []byte("!txn|backup|customer"),
 		[]byte("!hs|!migstage|ready||field"), []byte("customer"))
@@ -123,6 +126,7 @@ func TestMigrationNamespacePreservesOrdinaryAliases(t *testing.T) {
 }
 
 func TestMigrationNamespaceRejectsPrefixDeletesAndCancelledAdvisory(t *testing.T) {
+	t.Parallel()
 	for _, key := range [][]byte{[]byte("!migs"), []byte("!migstage|ready|"), []byte("!dist|migstage|"), []byte("!migwrite|"), []byte("!migfence|")} {
 		for _, phase := range []pb.Phase{pb.Phase_NONE, pb.Phase_PREPARE, pb.Phase_COMMIT, pb.Phase_ABORT} {
 			st := store.NewMVCCStore()
@@ -139,6 +143,7 @@ func TestMigrationNamespaceRejectsPrefixDeletesAndCancelledAdvisory(t *testing.T
 }
 
 func TestMigrationNamespacePreservesLegacyRawFlush(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	f := &kvFSM{store: st, shardGroupID: 1}
 	require.NoError(t, st.PutAt(t.Context(), []byte("customer"), []byte("ordinary"), 10, 0))

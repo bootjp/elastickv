@@ -2641,6 +2641,7 @@ func withWrapEnabledForTest(t *testing.T) {
 // let a fresh USER proposal land at index > proposedIdx mid-
 // cutover and halt apply cluster-wide on the §6.3 strict-`>` hook.
 func TestEncryptionAdmin_EnableRaftEnvelope_RefusesWithoutBarrier(t *testing.T) {
+	// Not parallel: toggles process-wide raftEnvelopeWrapEnabled.
 	withWrapEnabledForTest(t)
 	path := cutoverReadySidecarFixture(t)
 	proposer := &applyingProposer{
@@ -2676,6 +2677,7 @@ func TestEncryptionAdmin_EnableRaftEnvelope_RefusesWithoutBarrier(t *testing.T) 
 // Propose racing the install observed the freshly-set wrap pointer.
 // Refuse before any side effect.
 func TestEncryptionAdmin_EnableRaftEnvelope_RefusesWithoutAppliedIndex(t *testing.T) {
+	// Not parallel: toggles process-wide raftEnvelopeWrapEnabled.
 	withWrapEnabledForTest(t)
 	path := cutoverReadySidecarFixture(t)
 	proposer := &applyingProposer{
@@ -2709,6 +2711,7 @@ func TestEncryptionAdmin_EnableRaftEnvelope_RefusesWithoutAppliedIndex(t *testin
 // yet seen the cutover entry, letting a Propose-side wrap apply to
 // the cutover marker itself.
 func TestEncryptionAdmin_EnableRaftEnvelope_DrivesBarrierSequence(t *testing.T) {
+	// Not parallel: toggles process-wide raftEnvelopeWrapEnabled.
 	withWrapEnabledForTest(t)
 	path := cutoverReadySidecarFixture(t)
 	proposer := &applyingProposer{
@@ -2766,6 +2769,7 @@ func TestEncryptionAdmin_EnableRaftEnvelope_DrivesBarrierSequence(t *testing.T) 
 // stuck until restart — recoverable by operator action — but the
 // cluster-brick alternative is not.
 func TestEncryptionAdmin_EnableRaftEnvelope_BarrierStaysOpenOnProposeError(t *testing.T) {
+	// Not parallel: toggles process-wide raftEnvelopeWrapEnabled.
 	withWrapEnabledForTest(t)
 	path := cutoverReadySidecarFixture(t)
 	proposer := &recordingProposer{err: errors.New("engine refused")}
@@ -2807,6 +2811,7 @@ func TestEncryptionAdmin_EnableRaftEnvelope_BarrierStaysOpenOnProposeError(t *te
 // proposal), the handler MUST still call End() so the barrier
 // closes. Symmetric with the propose-error case above.
 func TestEncryptionAdmin_EnableRaftEnvelope_EndCalledOnDrainTimeout(t *testing.T) {
+	// Not parallel: toggles process-wide raftEnvelopeWrapEnabled.
 	withWrapEnabledForTest(t)
 	path := cutoverReadySidecarFixture(t)
 	proposer := &recordingProposer{}
@@ -2850,6 +2855,7 @@ func TestEncryptionAdmin_EnableRaftEnvelope_EndCalledOnDrainTimeout(t *testing.T
 // deferred End() so this test catches a regression that reordered
 // the flag flip back inside the apply-wait error path.
 func TestEncryptionAdmin_EnableRaftEnvelope_BarrierStaysOpenOnApplyTimeout(t *testing.T) {
+	// Not parallel: toggles process-wide raftEnvelopeWrapEnabled.
 	withWrapEnabledForTest(t)
 	path := cutoverReadySidecarFixture(t)
 	proposer := &applyingProposer{
@@ -2932,6 +2938,7 @@ func TestEncryptionAdmin_EnableRaftEnvelope_BarrierStaysOpenOnApplyTimeout(t *te
 //   - Handler returns a FailedPrecondition error so the operator's
 //     CLI can retry against the now-updated Active.Raft.
 func TestEncryptionAdmin_EnableRaftEnvelope_RefusesOnStaleDEKApplyRace(t *testing.T) {
+	// Not parallel: toggles process-wide raftEnvelopeWrapEnabled.
 	withWrapEnabledForTest(t)
 	path := cutoverReadySidecarFixture(t)
 	proposer := &applyingProposer{
@@ -3007,6 +3014,7 @@ func TestEncryptionAdmin_EnableRaftEnvelope_RefusesOnStaleDEKApplyRace(t *testin
 // decode error; the handler must propagate that as an error
 // without InstallWrap or End.
 func TestEncryptionAdmin_EnableRaftEnvelope_BarrierStaysOpenOnSidecarReadError(t *testing.T) {
+	// Not parallel: toggles process-wide raftEnvelopeWrapEnabled.
 	withWrapEnabledForTest(t)
 	path := cutoverReadySidecarFixture(t)
 	proposer := &applyingProposer{
@@ -3157,6 +3165,7 @@ func truncateFileToZero(path string) error {
 // calls and proposedIdx after that, forcing the loop to poll
 // through the ticker at least once.
 func TestEncryptionAdmin_EnableRaftEnvelope_PollsApplyIndex(t *testing.T) {
+	// Not parallel: toggles process-wide raftEnvelopeWrapEnabled.
 	withWrapEnabledForTest(t)
 	path := cutoverReadySidecarFixture(t)
 	proposer := &applyingProposer{

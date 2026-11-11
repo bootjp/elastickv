@@ -98,6 +98,11 @@ func (a *Adapter) retryAcknowledgements(ctx context.Context) {
 		case <-ticker.C:
 		case <-a.ackWake:
 		}
+		// select picks among ready cases at random: a queued wake-up can win
+		// over a cancelled context, so check it before starting a batch.
+		if ctx.Err() != nil {
+			return
+		}
 		if a.processAcknowledgementBatch(ctx) {
 			select {
 			case a.ackWake <- struct{}{}:
@@ -119,8 +124,13 @@ func (a *Adapter) processAcknowledgementBatch(ctx context.Context) bool {
 		}
 		a.replyMu.Lock()
 		delete(a.ackPending, id)
+		keys := a.unknownOperations[id]
+		delete(a.unknownOperations, id)
 		progress = true
 		a.replyMu.Unlock()
+		for _, key := range keys {
+			a.mutations.resolveUnknown(key)
+		}
 	}
 	a.replyMu.Lock()
 	remaining := len(a.ackPending)

@@ -97,6 +97,7 @@ func isTxnPeerLocalControlKey(key []byte) bool {
 		bytes.Equal(key, migrationConfigurationIndexKey) ||
 		bytes.Equal(key, backupTimestampFloorKey) ||
 		bytes.Equal(key, prepareEvidenceEnabledKey) ||
+		bytes.Equal(key, commitTSFenceEnabledKey) ||
 		bytes.Equal(key, prepareEvidenceGateKey) ||
 		bytes.Equal(key, prepareEvidenceTimestampFloorKey)
 }

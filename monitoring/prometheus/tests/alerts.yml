@@ -1,0 +1,247 @@
+---
+rule_files:
+- "../rules/filesystem.yml"
+- "../rules/tso-alerts.yml"
+- "../rules/raft.yml"
+evaluation_interval: 1m
+tests:
+- name: Raft leaders remain independent across jobs and clusters
+  interval: 1m
+  input_series:
+  - series: elastickv_raft_local_state{job="kv",cluster="healthy",group="0",state="leader",node_id="a"}
+    values: 1+0x20
+  - series: elastickv_raft_local_state{job="kv",cluster="broken",group="0",state="leader",node_id="a"}
+    values: 0+0x20
+  - series: elastickv_raft_local_state{job="other",cluster="broken",group="0",state="leader",node_id="a"}
+    values: 1+0x20
+  - series: elastickv_raft_local_state{job="legacy",group="0",state="leader",node_id="a"}
+    values: 0+0x20
+  - series: elastickv_raft_local_state{job="kv",cluster="healthy",group="0",state="leader",node_id="a",replica="duplicate"}
+    values: 1+0x20
+  alert_rule_test:
+  - eval_time: 3m
+    alertname: ElastickvRaftLeaderCountInvalid
+    exp_alerts:
+    - exp_labels:
+        job: kv
+        cluster: broken
+        group: '0'
+        severity: critical
+      exp_annotations:
+        summary: Raft group does not report exactly one leader
+        description: Group 0 reports 0 leaders. Check member reachability and elections;
+          missing scrapes can also hide a leader.
+    - exp_labels:
+        job: legacy
+        group: '0'
+        severity: critical
+      exp_annotations:
+        summary: Raft group does not report exactly one leader
+        description: Group 0 reports 0 leaders. Check member reachability and elections;
+          missing scrapes can also hide a leader.
+- name: Different deployments may use different TSO modes
+  interval: 1m
+  input_series:
+  - series: elastickv_tso_mode{job="kv",cluster="a",mode="legacy"}
+    values: 1+0x20
+  - series: elastickv_tso_mode{job="kv",cluster="b",mode="dedicated"}
+    values: 1+0x20
+  - series: elastickv_tso_mode{job="kv",mode="shadow"}
+    values: 1+0x20
+  alert_rule_test:
+  - eval_time: 20m
+    alertname: ElasticKVTSOModeDivergence
+    exp_alerts: []
+- name: Mode divergence within one deployment fires
+  interval: 1m
+  input_series:
+  - series: elastickv_tso_mode{job="kv",cluster="a",node_id="one",mode="legacy"}
+    values: 1+0x20
+  - series: elastickv_tso_mode{job="kv",cluster="a",node_id="two",mode="dedicated"}
+    values: 1+0x20
+  alert_rule_test:
+  - eval_time: 20m
+    alertname: ElasticKVTSOModeDivergence
+    exp_alerts:
+    - exp_labels:
+        job: kv
+        cluster: a
+        severity: warning
+      exp_annotations:
+        summary: Cluster nodes remain in different TSO modes
+        description: More than one process-local TSO mode has remained active for
+          15 minutes. Finish the rolling transition or investigate a rejected reload.
+- name: Healthy high traffic cannot dilute another cluster errors
+  interval: 1m
+  input_series:
+  - series: elastickv_tso_request_duration_seconds_count{job="kv",cluster="bad",operation="reserve",outcome="error"}
+    values: 0+60x20
+  - series: elastickv_tso_request_duration_seconds_count{job="kv",cluster="good",operation="reserve",outcome="success"}
+    values: 0+60000x20
+  alert_rule_test:
+  - eval_time: 20m
+    alertname: ElasticKVTSOAllocationErrorRateCritical
+    exp_alerts:
+    - exp_labels:
+        job: kv
+        cluster: bad
+        severity: critical
+      exp_annotations:
+        summary: TSO allocation error rate exceeds 10 percent
+        description: Dedicated TSO reserve attempts have exceeded a 10 percent error
+          rate for 5 minutes; writes may be failing closed.
+- name: Replicated filesystem gauge isolates clusters and accepts missing cluster
+  interval: 1m
+  input_series:
+  - series: elastickv_fs_file_multi_shard_current{job="fs",cluster="bad",instance="one"}
+    values: 1+0x20
+  - series: elastickv_fs_file_multi_shard_current{job="fs",cluster="bad",instance="two"}
+    values: 1+0x20
+  - series: elastickv_fs_file_multi_shard_current{job="fs",cluster="good"}
+    values: 0+0x20
+  - series: elastickv_fs_file_multi_shard_current{job="legacy"}
+    values: 1+0x20
+  alert_rule_test:
+  - eval_time: 10m
+    alertname: ElastickvFilesystemMultiShardFile
+    exp_alerts:
+    - exp_labels:
+        job: fs
+        cluster: bad
+        severity: critical
+      exp_annotations:
+        summary: Active filesystem file has chunks on multiple shard groups
+        description: Placement reconciliation found an active file outside the single-home
+          invariant. Pause rebalancing and inspect unfinished move jobs.
+    - exp_labels:
+        job: legacy
+        severity: critical
+      exp_annotations:
+        summary: Active filesystem file has chunks on multiple shard groups
+        description: Placement reconciliation found an active file outside the single-home
+          invariant. Pause rebalancing and inspect unfinished move jobs.
+- name: Apply lag remains local to the failing replica
+  interval: 1m
+  input_series:
+  - series: elastickv_raft_commit_index{job="kv",cluster="bad",group="0",node_id="one"}
+    values: 2000+0x20
+  - series: elastickv_raft_applied_index{job="kv",cluster="bad",group="0",node_id="one"}
+    values: 100+0x20
+  - series: elastickv_raft_commit_index{job="kv",cluster="good",group="0",node_id="one"}
+    values: 2000+0x20
+  - series: elastickv_raft_applied_index{job="kv",cluster="good",group="0",node_id="one"}
+    values: 2000+0x20
+  alert_rule_test:
+  - eval_time: 10m
+    alertname: ElastickvRaftApplyLag
+    exp_alerts:
+    - exp_labels:
+        job: kv
+        cluster: bad
+        group: '0'
+        node_id: one
+        severity: warning
+      exp_annotations:
+        summary: Raft application is behind committed entries
+        description: Node one in group 0 is more than 1000 entries behind for five
+          minutes. Check storage latency and FSM throughput.
+- name: Failed scrape retains target and cluster identity
+  interval: 1m
+  input_series:
+  - series: up{job="elastickv",cluster="test",instance="server-a:9090"}
+    values: 0+0x10
+  - series: up{job="elastickv",cluster="test",instance="server-b:9090"}
+    values: 1+0x10
+  alert_rule_test:
+  - eval_time: 1m
+    alertname: ElastickvMetricsTargetDown
+    exp_alerts: []
+  - eval_time: 3m
+    alertname: ElastickvMetricsTargetDown
+    exp_alerts:
+    - exp_labels:
+        job: elastickv
+        cluster: test
+        instance: server-a:9090
+        severity: critical
+      exp_annotations:
+        summary: Elastickv metrics target is unreachable
+        description: Scraping server-a:9090 has failed for two minutes. Check the
+          process, metrics token, network policy, and collector.
+- name: Stuck filesystem moves isolate durable and local activity by deployment
+  interval: 1m
+  input_series:
+  - series: elastickv_fs_file_move_inflight{job="fs",cluster="durable"}
+    values: 1+0x40
+  - series: elastickv_fs_file_move_active_local{job="fs",cluster="durable"}
+    values: 0+0x40
+  - series: elastickv_fs_file_move_inflight{job="fs",cluster="local"}
+    values: 0+0x40
+  - series: elastickv_fs_file_move_active_local{job="fs",cluster="local"}
+    values: 1+0x40
+  - series: elastickv_fs_file_move_inflight{job="other",cluster="durable"}
+    values: 0+0x40
+  - series: elastickv_fs_file_move_active_local{job="other",cluster="durable"}
+    values: 0+0x40
+  - series: elastickv_fs_file_move_inflight{job="fs",cluster="recent"}
+    values: 0+0x29 1+0x10
+  - series: elastickv_fs_file_move_active_local{job="fs",cluster="recent"}
+    values: 0+0x29 1+0x10
+  alert_rule_test:
+  - eval_time: 35m
+    alertname: ElastickvFilesystemMoveStuck
+    exp_alerts:
+    - exp_labels:
+        job: fs
+        cluster: durable
+        severity: warning
+      exp_annotations:
+        summary: Filesystem migration has remained in flight
+        description: At least one durable whole-file move has not completed for 30 minutes. Run intent recovery and inspect the move job cursor and epoch fence.
+    - exp_labels:
+        job: fs
+        cluster: local
+        severity: warning
+      exp_annotations:
+        summary: Filesystem migration has remained in flight
+        description: At least one durable whole-file move has not completed for 30 minutes. Run intent recovery and inspect the move job cursor and epoch fence.
+- name: TSO marker ordering preserves job cluster and node identity
+  interval: 1m
+  input_series:
+  - series: elastickv_tso_durable_state{job="kv",cluster="bad",node_id="same",node_address="peer:50051",marker="phase_d"}
+    values: 1+0x5
+  - series: elastickv_tso_durable_state{job="kv",cluster="bad",node_id="same",node_address="peer:50051",marker="cutover"}
+    values: 0+0x5
+  - series: elastickv_tso_durable_state{job="kv",cluster="good",node_id="same",node_address="peer:50051",marker="phase_d"}
+    values: 1+0x5
+  - series: elastickv_tso_durable_state{job="kv",cluster="good",node_id="same",node_address="peer:50051",marker="cutover"}
+    values: 1+0x5
+  - series: elastickv_tso_durable_state{job="other",cluster="bad",node_id="same",node_address="peer:50051",marker="phase_d"}
+    values: 0+0x5
+  - series: elastickv_tso_durable_state{job="other",cluster="bad",node_id="same",node_address="peer:50051",marker="cutover"}
+    values: 0+0x5
+  - series: elastickv_tso_durable_state{job="kv",node_id="same",node_address="peer:50051",marker="phase_d"}
+    values: 1+0x5
+  - series: elastickv_tso_durable_state{job="kv",node_id="same",node_address="peer:50051",marker="cutover"}
+    values: 0+0x5
+  alert_rule_test:
+  - eval_time: 3m
+    alertname: ElasticKVTSOPhaseDWithoutCutover
+    exp_alerts:
+    - exp_labels:
+        job: kv
+        cluster: bad
+        node_id: same
+        node_address: peer:50051
+        severity: critical
+      exp_annotations:
+        summary: Durable TSO marker ordering is invalid
+        description: Phase D is visible without the prerequisite durable cutover marker. Stop rollout and inspect group-0 state.
+    - exp_labels:
+        job: kv
+        node_id: same
+        node_address: peer:50051
+        severity: critical
+      exp_annotations:
+        summary: Durable TSO marker ordering is invalid
+        description: Phase D is visible without the prerequisite durable cutover marker. Stop rollout and inspect group-0 state.

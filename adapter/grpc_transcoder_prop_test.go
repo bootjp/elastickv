@@ -12,6 +12,7 @@ import (
 )
 
 func TestGrpcTranscoder_Property_RawPut(t *testing.T) {
+	t.Parallel()
 	rapid.Check(t, func(t *rapid.T) {
 		key := rapid.SliceOf(rapid.Byte()).Draw(t, "key")
 		value := rapid.SliceOf(rapid.Byte()).Draw(t, "value")
@@ -34,6 +35,7 @@ func TestGrpcTranscoder_Property_RawPut(t *testing.T) {
 }
 
 func TestGrpcTranscoder_Property_RawDelete(t *testing.T) {
+	t.Parallel()
 	rapid.Check(t, func(t *rapid.T) {
 		key := rapid.SliceOf(rapid.Byte()).Draw(t, "key")
 		value := rapid.SliceOf(rapid.Byte()).Draw(t, "value")
@@ -55,6 +57,7 @@ func TestGrpcTranscoder_Property_RawDelete(t *testing.T) {
 }
 
 func TestGrpcTranscoder_Property_TxnOps(t *testing.T) {
+	t.Parallel()
 	rapid.Check(t, func(t *rapid.T) {
 		key := rapid.SliceOf(rapid.Byte()).Draw(t, "key")
 		value := rapid.SliceOf(rapid.Byte()).Draw(t, "value")

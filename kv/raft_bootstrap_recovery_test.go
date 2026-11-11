@@ -10,6 +10,7 @@ import (
 )
 
 func TestLoadAppliedBootstrapPolicyFromProtectedFSM(t *testing.T) {
+	t.Parallel()
 	identity := raftbootstrap.Identity{Cluster: raftbootstrap.UUID{1}, Group: 0}
 	policy := raftbootstrap.PolicyRecord{Version: 1, Identity: identity, BaselineDigest: raftbootstrap.Digest{2},
 		Minimum: raftbootstrap.Versions{Entry: 1, Snapshot: 1, Session: 1}, ActivationIndex: 2, Generation: 1,

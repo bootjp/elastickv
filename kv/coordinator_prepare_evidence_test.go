@@ -9,6 +9,7 @@ import (
 )
 
 func TestPrepareEvidenceMetasReservesSharedTimestampOnce(t *testing.T) {
+	t.Parallel()
 	for _, phaseD := range []bool{false, true} {
 		t.Run(map[bool]string{false: "pre-phase-d", true: "phase-d"}[phaseD], func(t *testing.T) {
 			groups := make(map[uint64]*ShardGroup)

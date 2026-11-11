@@ -555,11 +555,26 @@ type ShardedCoordinator struct {
 	// hlcRenewalBlocked lets startup code temporarily suppress background HLC
 	// lease proposals while another startup-only Raft mutation must run first.
 	hlcRenewalBlocked func() bool
-	hlcRecoveryMu     sync.Mutex
+	// commitTSFenceActivation makes the coordinator propose the raw and
+	// PREPARE apply-order fence activation on groups it leads
+	// (WithCommitTSFenceActivation).
+	commitTSFenceActivation         bool
+	commitTSFenceActivationReady    func() bool
+	commitTSFenceActivationInFlight atomic.Bool
+	commitTSFenceActiveGroups       sync.Map
+	hlcRecoveryMu                   sync.Mutex
 	// hlcRenewalInFlight prevents a slow or quorum-stalled group from stacking
 	// another background HLC lease proposal for the same group on the next tick.
 	hlcRenewalMu       sync.Mutex
 	hlcRenewalInFlight map[uint64]struct{}
+	// inflightTxns holds the (primaryKey, startTS) identities of cross-shard
+	// transactions between their first PREPARE and their return. See
+	// acquireTxnIdentity.
+	inflightTxnMu sync.Mutex
+	inflightTxns  map[txnIdentity]struct{}
+	// Retained identities cannot be safely released without a terminal proof.
+	// The counter makes their process-lifetime accumulation observable.
+	retainedTxnCount atomic.Uint64
 	// registrationGate is the Stage 7a §4.1 first-write barrier: when
 	// set, self-originated mutating writes that would land as §4.1
 	// storage envelopes block until this node's writer registration
@@ -1394,22 +1409,23 @@ func isComposed1RetryableError(err error) bool {
 // dispatchNonTxn routes a non-transactional operation group through the
 // shard router. Extracted from Dispatch to keep that method's branch
 // count within the cyclop budget after the 7a registration gate landed.
-func (c *ShardedCoordinator) dispatchNonTxn(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
+func (c *ShardedCoordinator) dispatchNonTxn(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, rawDispatchShape, error) {
 	if err := c.rejectWriteFencedPointElems(reqs.Elems); err != nil {
-		return nil, err
+		return nil, rawDispatchShape{}, err
 	}
 	if hasExplicitGroupElem(reqs.Elems) {
 		return c.dispatchExplicitGroupNonTxn(ctx, reqs)
 	}
 	logs, err := c.requestLogs(ctx, reqs)
 	if err != nil {
-		return nil, err
+		return nil, rawDispatchShape{}, err
 	}
-	r, err := c.router.Commit(ctx, logs)
+	r, groupCount, err := c.router.commitWithGroupCount(ctx, logs)
+	shape := rawDispatchShape{groupCount: groupCount, requestCount: len(logs)}
 	if err != nil {
-		return nil, errors.WithStack(err)
+		return nil, shape, errors.WithStack(err)
 	}
-	return &CoordinateResponse{CommitIndex: r.CommitIndex}, nil
+	return &CoordinateResponse{CommitIndex: r.CommitIndex}, shape, nil
 }
 
 func hasExplicitGroupElem(elems []*Elem[OP]) bool {
@@ -1421,41 +1437,40 @@ func hasExplicitGroupElem(elems []*Elem[OP]) bool {
 	return false
 }
 
-func (c *ShardedCoordinator) dispatchExplicitGroupNonTxn(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
+func (c *ShardedCoordinator) dispatchExplicitGroupNonTxn(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, rawDispatchShape, error) {
 	logs, gids, err := c.rawLogsWithGroups(ctx, reqs)
 	if err != nil {
-		return nil, err
+		return nil, rawDispatchShape{}, err
 	}
+	shape := rawDispatchShape{groupCount: len(gids), requestCount: len(logs)}
 	var maxIndex uint64
 	for i, gid := range gids {
 		g, err := c.txnGroupForID(gid)
 		if err != nil {
-			return nil, err
+			return nil, shape, err
 		}
 		resp, err := g.Txn.Commit(ctx, []*pb.Request{logs[i]})
 		if err != nil {
-			return nil, errors.WithStack(err)
+			return nil, shape, errors.WithStack(err)
 		}
 		if resp != nil && resp.CommitIndex > maxIndex {
 			maxIndex = resp.CommitIndex
 		}
 	}
-	return &CoordinateResponse{CommitIndex: maxIndex}, nil
+	return &CoordinateResponse{CommitIndex: maxIndex}, shape, nil
 }
 
 func (c *ShardedCoordinator) dispatchRawWithComposed1Retry(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
 	for attempt := 0; attempt <= composed1RetryAttempts; attempt++ {
-		resp, handled, err := c.dispatchBeforeShardRouting(ctx, reqs)
-		if !handled {
-			resp, err = c.dispatchNonTxn(ctx, reqs)
-		}
+		resp, shape, err := c.dispatchRawWithFenceRetry(ctx, reqs)
 		if err == nil {
 			return resp, nil
 		}
-		if !errors.Is(err, ErrComposed1VersionGCd) || attempt == composed1RetryAttempts || c.engine == nil {
+		if errors.Is(err, ErrTransactionOutcomeUnknown) ||
+			!errors.Is(err, ErrComposed1VersionGCd) || attempt == composed1RetryAttempts || c.engine == nil {
 			return resp, err
 		}
-		if !c.canRetryRawVersionGC(reqs) {
+		if !shape.singleRequest() || !c.canRetryRawVersionGC(reqs) {
 			return resp, err
 		}
 		reqs.ObservedRouteVersion = c.engine.Version()
@@ -2020,6 +2035,27 @@ func (c *ShardedCoordinator) dispatchMultiShardTxn(ctx context.Context, startTS,
 	if prevCommitTS != 0 {
 		return nil, errors.WithStack(ErrTxnDedupRequiresSingleShard)
 	}
+	releaseIdentity, err := c.acquireTxnIdentity(primaryKey, startTS)
+	if err != nil {
+		return nil, err
+	}
+	// An uncertain PREPARE or failed cleanup may leave an in-flight proposal
+	// or lock behind. Keep its identity reserved in this coordinator rather
+	// than admitting a different attempt as an idempotent replay. A caller can
+	// still retry at a fresh snapshot, which has a different identity. Without
+	// a proof that every proposal and lock resolved, the reservation lasts
+	// until this coordinator is discarded.
+	retainIdentity := false
+	defer func() {
+		if retainIdentity {
+			count := c.retainedTxnCount.Add(1)
+			c.logger().Warn("txn identity retained after unresolved outcome",
+				slog.Uint64("start_ts", startTS),
+				slog.Uint64("retained_identity_count", count))
+			return
+		}
+		releaseIdentity()
+	}()
 
 	// Group read keys by shard now. The result is passed directly to
 	// prewriteTxn to avoid a second iteration inside that function. A
@@ -2034,8 +2070,9 @@ func (c *ShardedCoordinator) dispatchMultiShardTxn(ctx context.Context, startTS,
 	if groupedReadKeyCount(groupedReadKeys) > maxReadKeys {
 		return nil, errors.WithStack(ErrInvalidRequest)
 	}
-	prepared, err := c.prewriteTxn(ctx, startTS, commitTS, primaryKey, grouped, gids, groupedReadKeys, observedRouteVersion, bypassKeysByGroup)
+	prepared, unresolved, err := c.prewriteTxn(ctx, startTS, commitTS, primaryKey, grouped, gids, groupedReadKeys, observedRouteVersion, bypassKeysByGroup)
 	if err != nil {
+		retainIdentity = unresolved
 		return nil, err
 	}
 
@@ -2046,14 +2083,16 @@ func (c *ShardedCoordinator) dispatchMultiShardTxn(ctx context.Context, startTS,
 			// is a definitive non-commit. Release prepared intents even if the
 			// caller has since cancelled.
 			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), verifyLeaderTimeout)
-			c.abortPreparedTxn(cleanupCtx, startTS, primaryKey, prepared, c.abortTimestamp(cleanupCtx, startTS, commitTS))
+			cleaned := c.abortPreparedTxn(cleanupCtx, startTS, primaryKey, prepared, c.abortTimestamp(cleanupCtx, startTS, commitTS))
 			cancel()
+			retainIdentity = !cleaned
 			return nil, errors.WithStack(err)
 		}
 		// A lost primary COMMIT response may conceal a durable commit
 		// decision. Aborting prepared secondaries here can then turn one
 		// committed transaction into a partial commit. Lock resolution must
 		// consult the primary decision; retain the intents until it does.
+		retainIdentity = true
 		return nil, fmt.Errorf("%w: %w", ErrTransactionOutcomeUnknown, err)
 	}
 
@@ -2072,6 +2111,7 @@ func (c *ShardedCoordinator) dispatchMultiShardTxn(ctx context.Context, startTS,
 	// posture (codex P1 on d8487672 + 6202b964, PR #900).
 	maxIndex, err = c.commitSecondaryTxns(ctx, startTS, primaryGid, primaryKey, grouped, gids, commitTS, maxIndex, observedRouteVersion, bypassKeysByGroup, requireAllParticipants...)
 	if err != nil {
+		retainIdentity = true
 		return nil, errors.WithStack(err)
 	}
 	return &CoordinateResponse{CommitIndex: maxIndex, CommitTS: commitTS}, nil
@@ -2186,17 +2226,22 @@ type preparedGroup struct {
 	keys []*pb.Mutation
 }
 
-func (c *ShardedCoordinator) prewriteTxn(ctx context.Context, startTS, commitTS uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, gids []uint64, groupedReadKeys map[uint64][][]byte, observedRouteVersion uint64, bypassKeysByGroup map[uint64][][]byte) ([]preparedGroup, error) {
+// prewriteTxn reports whether an error may leave a PREPARE or lock unresolved.
+// That identity must remain reserved even after the request returns.
+func (c *ShardedCoordinator) prewriteTxn(ctx context.Context, startTS, commitTS uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, gids []uint64, groupedReadKeys map[uint64][][]byte, observedRouteVersion uint64, bypassKeysByGroup map[uint64][][]byte) ([]preparedGroup, bool, error) {
 	prepareMetas, err := c.prepareEvidenceMetas(ctx, primaryKey, commitTS, gids)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	prepared := make([]preparedGroup, 0, len(gids))
 
 	for _, gid := range gids {
 		g, err := c.txnGroupForID(gid)
 		if err != nil {
-			return nil, err
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), verifyLeaderTimeout)
+			cleaned := c.abortPreparedTxn(cleanupCtx, startTS, primaryKey, prepared, c.abortTimestamp(cleanupCtx, startTS, commitTS))
+			cancel()
+			return nil, !cleaned, err
 		}
 		req := &pb.Request{
 			IsTxn:                true,
@@ -2207,9 +2252,13 @@ func (c *ShardedCoordinator) prewriteTxn(ctx context.Context, startTS, commitTS 
 			ObservedRouteVersion: observedRouteVersion,
 			WriteFenceBypassKeys: bypassKeysByGroup[gid],
 		}
-		if _, err := g.Txn.Commit(ctx, []*pb.Request{req}); err != nil {
+		response, err := g.Txn.Commit(ctx, []*pb.Request{req})
+		if err == nil && response == nil {
+			err = ErrTransactionOutcomeUnknown
+		}
+		if err != nil {
 			if errors.Is(err, ErrTransactionOutcomeUnknown) {
-				return nil, errors.WithStack(err)
+				return nil, true, errors.WithStack(err)
 			}
 			// Same WithoutCancel pattern as dispatchTxn's
 			// commitPrimaryTxn-failure cleanup: a cancelled ctx is
@@ -2218,9 +2267,9 @@ func (c *ShardedCoordinator) prewriteTxn(ctx context.Context, startTS, commitTS 
 			// already wrote on prior shards. Otherwise LockResolver
 			// holds the bag.
 			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), verifyLeaderTimeout)
-			c.abortPreparedTxn(cleanupCtx, startTS, primaryKey, prepared, c.abortTimestamp(cleanupCtx, startTS, commitTS))
+			cleaned := c.abortPreparedTxn(cleanupCtx, startTS, primaryKey, prepared, c.abortTimestamp(cleanupCtx, startTS, commitTS))
 			cancel()
-			return nil, errors.WithStack(err)
+			return nil, !primaryCommitDefinitelyRejected(err) || !cleaned, errors.WithStack(err)
 		}
 		prepared = append(prepared, preparedGroup{gid: gid, keys: keyMutations(grouped[gid])})
 	}
@@ -2234,12 +2283,12 @@ func (c *ShardedCoordinator) prewriteTxn(ctx context.Context, startTS, commitTS 
 		// expired, so the abort needs detached cancellation to
 		// avoid stranding intents.
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), verifyLeaderTimeout)
-		c.abortPreparedTxn(cleanupCtx, startTS, primaryKey, prepared, c.abortTimestamp(cleanupCtx, startTS, commitTS))
+		cleaned := c.abortPreparedTxn(cleanupCtx, startTS, primaryKey, prepared, c.abortTimestamp(cleanupCtx, startTS, commitTS))
 		cancel()
-		return nil, err
+		return nil, !cleaned, err
 	}
 
-	return prepared, nil
+	return prepared, false, nil
 }
 
 func (c *ShardedCoordinator) commitPrimaryTxn(ctx context.Context, startTS uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, gids []uint64, commitTS uint64, observedRouteVersion uint64, bypassKeysByGroup map[uint64][][]byte) (uint64, uint64, error) {
@@ -2401,39 +2450,55 @@ func (c *ShardedCoordinator) logger() *slog.Logger {
 	return slog.Default()
 }
 
-func (c *ShardedCoordinator) abortPreparedTxn(ctx context.Context, startTS uint64, primaryKey []byte, prepared []preparedGroup, abortTS uint64) {
+// abortPreparedTxn returns true only when every prepared group has a terminal
+// cleanup result. Failed or unissued aborts keep the identity reserved.
+func (c *ShardedCoordinator) abortPreparedTxn(ctx context.Context, startTS uint64, primaryKey []byte, prepared []preparedGroup, abortTS uint64) bool {
 	if len(prepared) == 0 {
-		return
+		return true
 	}
 	if abortTS == 0 || abortTS <= startTS {
-		return
+		return false
 	}
 
+	cleaned := true
 	meta := txnMetaMutation(primaryKey, 0, abortTS)
 	for _, pg := range prepared {
-		g, ok := c.groups[pg.gid]
-		if !ok || g == nil || g.Txn == nil {
-			continue
-		}
-		req := &pb.Request{
-			IsTxn:     true,
-			Phase:     pb.Phase_ABORT,
-			Ts:        startTS,
-			Mutations: append([]*pb.Mutation{meta}, pg.keys...),
-		}
-		if _, err := g.Txn.Commit(ctx, []*pb.Request{req}); err != nil {
-			if errors.Is(err, ErrTxnAlreadyCommitted) {
-				continue
-			}
-			c.logger().Warn("txn abort failed; locks may remain until TTL expiry",
-				slog.Uint64("gid", pg.gid),
-				slog.String("primary_key", string(primaryKey)),
-				slog.Uint64("start_ts", startTS),
-				slog.Uint64("abort_ts", abortTS),
-				slog.Any("err", err),
-			)
+		if !c.abortPreparedGroup(ctx, startTS, primaryKey, abortTS, meta, pg) {
+			cleaned = false
 		}
 	}
+	return cleaned
+}
+
+func (c *ShardedCoordinator) abortPreparedGroup(ctx context.Context, startTS uint64, primaryKey []byte, abortTS uint64, meta *pb.Mutation, pg preparedGroup) bool {
+	g, ok := c.groups[pg.gid]
+	if !ok || g == nil || g.Txn == nil {
+		return false
+	}
+	req := &pb.Request{
+		IsTxn:     true,
+		Phase:     pb.Phase_ABORT,
+		Ts:        startTS,
+		Mutations: append([]*pb.Mutation{meta}, pg.keys...),
+	}
+	response, err := g.Txn.Commit(ctx, []*pb.Request{req})
+	if err == nil && response == nil {
+		err = ErrTransactionOutcomeUnknown
+	}
+	if errors.Is(err, ErrTxnAlreadyCommitted) {
+		return true
+	}
+	if err != nil {
+		c.logger().Warn("txn abort failed; locks may remain until TTL expiry",
+			slog.Uint64("gid", pg.gid),
+			slog.String("primary_key", string(primaryKey)),
+			slog.Uint64("start_ts", startTS),
+			slog.Uint64("abort_ts", abortTS),
+			slog.Any("err", err),
+		)
+		return false
+	}
+	return true
 }
 
 func (c *ShardedCoordinator) txnGroupForID(gid uint64) (*ShardGroup, error) {
@@ -3785,6 +3850,13 @@ func (c *ShardedCoordinator) RunHLCLeaseRenewal(ctx context.Context) {
 				defer children.Done()
 				<-done
 			}()
+			if activation := c.activateCommitTSFencesAsync(ctx); activation != nil {
+				children.Add(1)
+				go func() {
+					defer children.Done()
+					<-activation
+				}()
+			}
 			timer.Reset(hlcRenewalInterval)
 		case <-ctx.Done():
 			return

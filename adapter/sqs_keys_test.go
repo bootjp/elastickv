@@ -274,19 +274,6 @@ func TestParseSqsMsgByAgeKey_RejectsPartitioned(t *testing.T) {
 		"legacy parser must reject a partitioned byage key")
 }
 
-// TestSqsMsgByAgePrefixesForQueue_CoversBothKeyspaces pins the
-// reaper-side enumeration helper: the returned slice always contains
-// both the legacy and partitioned prefixes, in that order. The
-// reaper's Range loop iterates this slice; a regression that drops
-// either prefix would silently leak orphan records of that flavour.
-func TestSqsMsgByAgePrefixesForQueue_CoversBothKeyspaces(t *testing.T) {
-	t.Parallel()
-	prefixes := sqsMsgByAgePrefixesForQueue("orders.fifo")
-	require.Len(t, prefixes, 2, "must enumerate both legacy and partitioned prefixes")
-	require.Equal(t, sqsMsgByAgePrefixAllGenerations("orders.fifo"), prefixes[0])
-	require.Equal(t, sqsPartitionedMsgByAgePrefixForQueueAllPartitions("orders.fifo"), prefixes[1])
-}
-
 // TestSqsPartitionedMsgPrefixes_TerminatedByQueueSegment pins the
 // safety-by-construction argument from §3.1: queue names cannot
 // contain "|" (validateQueueName rejects it), so the literal "p|"

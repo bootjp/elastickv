@@ -4,8 +4,6 @@ import (
 	"bufio"
 	"encoding/binary"
 	"encoding/json"
-	"errors"
-	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -1224,41 +1222,4 @@ func writeFileAtomic(path string, data []byte) error {
 		return cockroachdberr.WithStack(err)
 	}
 	return nil
-}
-
-// HasInlineTTL reports whether a !redis|str| value carries the new-format
-// inline TTL header. Useful for tests asserting the producer's choice.
-func HasInlineTTL(value []byte) bool {
-	if !isNewRedisStrFormat(value) || len(value) < redisStrBaseHeader {
-		return false
-	}
-	return value[2]&redisStrHasTTL != 0
-}
-
-// IsBlobAtomicWriteRetriable reports whether err from writeFileAtomic
-// is a retriable I/O failure. Today the only retriable signal is
-// io.ErrShortWrite. ENOSPC (disk full) is intentionally NOT retriable
-// here — the master pipeline must surface it to the operator rather
-// than spin: a backup against a full disk has no business retrying.
-// IsBlobAtomicWriteOutOfSpace is the explicit out-of-space probe so
-// the pipeline can choose the right alarm wording.
-func IsBlobAtomicWriteRetriable(err error) bool {
-	if err == nil {
-		return false
-	}
-	return errors.Is(err, io.ErrShortWrite)
-}
-
-// IsBlobAtomicWriteOutOfSpace reports whether err from writeFileAtomic
-// (or any os.File write the master pipeline issues) was driven by a
-// full disk. The platform-specific error codes (POSIX ENOSPC vs.
-// Windows ERROR_DISK_FULL / ERROR_HANDLE_DISK_FULL) live in
-// disk_full_{unix,windows}.go so retry/alarm logic in callers
-// classifies disk-full uniformly across operating systems
-// (Codex P2 round 9).
-func IsBlobAtomicWriteOutOfSpace(err error) bool {
-	if err == nil {
-		return false
-	}
-	return isDiskFullError(err)
 }

@@ -9,6 +9,7 @@ import (
 )
 
 func TestRedisExecutionBudgetRetainsThroughJoinAndPanic(t *testing.T) {
+	t.Parallel()
 	for _, exit := range []string{"success", "revoked", "panic"} {
 		t.Run(exit, func(t *testing.T) {
 			owner := &redisTestOwnership{ctx: t.Context()}
@@ -47,6 +48,7 @@ func TestRedisExecutionBudgetRetainsThroughJoinAndPanic(t *testing.T) {
 }
 
 func TestRedisExecutionBudgetDefaultAndLegacy(t *testing.T) {
+	t.Parallel()
 	b := &redisProtectedExecutionBudget{}
 	for range redisDefaultProtectedExecutions {
 		require.True(t, b.acquire())

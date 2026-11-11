@@ -1,0 +1,43 @@
+# Replace the placeholder with a digest built from the runtime-readiness change.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: elastickv
+resources:
+  - ../../base
+patches:
+  - target:
+      group: apps
+      version: v1
+      kind: StatefulSet
+      name: elastickv
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/image
+        value: example.invalid/elastickv:runtime-readiness-build-required
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: --healthAddress=0.0.0.0:8081
+      - op: add
+        path: /spec/template/spec/containers/0/ports/-
+        value: {name: health, containerPort: 8081}
+      - op: replace
+        path: /spec/template/spec/containers/0/startupProbe
+        value:
+          httpGet: {path: /livez, port: health}
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 120
+      - op: replace
+        path: /spec/template/spec/containers/0/readinessProbe
+        value:
+          httpGet: {path: /readyz, port: health}
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+      - op: replace
+        path: /spec/template/spec/containers/0/livenessProbe
+        value:
+          httpGet: {path: /livez, port: health}
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 6

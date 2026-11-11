@@ -30,11 +30,13 @@ func TestDemoSamplerRouteResolverNormalizesInternalKeys(t *testing.T) {
 }
 
 func TestEffectiveDemoMetricsToken(t *testing.T) {
+	t.Parallel()
 	require.Equal(t, "custom-token", effectiveDemoMetricsToken(" custom-token "))
 	require.Equal(t, "demo-metrics-token", effectiveDemoMetricsToken(""))
 }
 
 func TestLoadS3StaticCredentials(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "s3-creds.json")
 	require.NoError(t, os.WriteFile(path, []byte(`{"credentials":[{"access_key_id":"akid","secret_access_key":"secret"}]}`), 0o600))
@@ -45,12 +47,14 @@ func TestLoadS3StaticCredentials(t *testing.T) {
 }
 
 func TestLoadS3StaticCredentialsAllowsEmptyPath(t *testing.T) {
+	t.Parallel()
 	creds, err := loadS3StaticCredentials("")
 	require.NoError(t, err)
 	require.Nil(t, creds)
 }
 
 func TestLoadS3StaticCredentialsRejectsEmptyFields(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "s3-creds.json")
 	require.NoError(t, os.WriteFile(path, []byte(`{"credentials":[{"access_key_id":"akid","secret_access_key":""}]}`), 0o600))
@@ -60,6 +64,7 @@ func TestLoadS3StaticCredentialsRejectsEmptyFields(t *testing.T) {
 }
 
 func TestSetupS3RejectsVirtualHostedStyle(t *testing.T) {
+	t.Parallel()
 	s3s, err := setupS3(context.Background(), net.ListenConfig{}, store.NewMVCCStore(), nil, "127.0.0.1:50051", "127.0.0.1:9000", "", "us-east-1", "", false, nil)
 	require.ErrorContains(t, err, "virtual-hosted style S3 requests are not implemented")
 	require.Nil(t, s3s)

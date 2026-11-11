@@ -68,6 +68,7 @@ func (f *controlSyncFile) SyncData() error {
 }
 
 func TestRaftControlMetadataForcesActualWALSync(t *testing.T) {
+	t.Parallel()
 	for _, withData := range []bool{false, true} {
 		t.Run(fmt.Sprint(withData), func(t *testing.T) {
 			dir := t.TempDir()
@@ -125,6 +126,7 @@ func (f controlFailingNonce) Next() ([encryption.NonceSize]byte, error) {
 }
 
 func TestRaftControlMetadataEncryptionFailureAbortsInnerData(t *testing.T) {
+	t.Parallel()
 	fixture := newEncryptedStoreFixture(t, 1)
 	ps := pebbleStoreApplied(t, fixture.mvcc)
 	boom := errors.New("injected nonce failure")
@@ -147,6 +149,7 @@ func TestRaftControlMetadataEncryptionFailureAbortsInnerData(t *testing.T) {
 }
 
 func TestRaftControlCrashHelper(t *testing.T) {
+	t.Parallel()
 	if os.Getenv("ELASTICKV_CONTROL_CRASH_HELPER") != "1" {
 		return
 	}
@@ -175,6 +178,7 @@ func TestRaftControlCrashHelper(t *testing.T) {
 // Process kill/reopen is not a power-loss simulation. The separate WAL-sync
 // witness checks that successful control entries actually wait for fsync.
 func TestRaftControlMetadataProcessKillReopen(t *testing.T) {
+	t.Parallel()
 	for _, phase := range []string{"before-commit", "after-commit"} {
 		t.Run(phase, func(t *testing.T) {
 			dir := t.TempDir()

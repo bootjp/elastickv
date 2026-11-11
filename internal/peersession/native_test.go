@@ -312,6 +312,7 @@ func request(traffic Traffic) *wire.Frame {
 }
 
 func TestNativeMTLSHandshakeAndPublicRPC(t *testing.T) {
+	t.Parallel()
 	f := setupNative(t, fixtureOptions{})
 	cc := f.dial(t)
 	h := f.handshake(t, cc)
@@ -346,6 +347,7 @@ func TestNativeMTLSHandshakeAndPublicRPC(t *testing.T) {
 }
 
 func TestNativeStreamChunkRevocationAndSpoolCleanup(t *testing.T) {
+	t.Parallel()
 	f := setupNative(t, fixtureOptions{})
 	cc := f.dial(t)
 	h := f.handshake(t, cc)
@@ -389,6 +391,7 @@ func TestNativeStreamChunkRevocationAndSpoolCleanup(t *testing.T) {
 }
 
 func TestNativeOldBinaryHasNoBeginService(t *testing.T) {
+	t.Parallel()
 	f := setupNative(t, fixtureOptions{old: true})
 	cc := f.dial(t)
 	ctx, cancel := context.WithTimeout(t.Context(), testTimeout)
@@ -400,6 +403,7 @@ func TestNativeOldBinaryHasNoBeginService(t *testing.T) {
 }
 
 func TestFrameDecoderRejectsTrailingPayload(t *testing.T) {
+	t.Parallel()
 	b := request(Vote)
 	b.Body = append(b.Body, 0)
 	_, err := decodeMessage(b)

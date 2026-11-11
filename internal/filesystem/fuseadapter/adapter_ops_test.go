@@ -20,6 +20,7 @@ func newIdleAdapter(t *testing.T, core Core) *Adapter {
 }
 
 func TestAdapterSetAttrForwardsMaskAndMapsErrors(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	core := &fakeCore{setAttrStat: filesystem.Stat{Inode: 7, Size: 3}}
 	adapter := newIdleAdapter(t, core)
@@ -39,6 +40,7 @@ func TestAdapterSetAttrForwardsMaskAndMapsErrors(t *testing.T) {
 }
 
 func TestAdapterWriteRefreshesLeaseThenForwards(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	core := &fakeCore{}
 	adapter := newIdleAdapter(t, core)
@@ -58,6 +60,40 @@ func TestAdapterWriteRefreshesLeaseThenForwards(t *testing.T) {
 type journalWriteCore struct {
 	*fakeCore
 	ids []filesystem.OperationID
+}
+
+type unknownThenCommittedWriteCore struct {
+	*acknowledgementCore
+	id    filesystem.OperationID
+	calls int
+}
+
+func (c *unknownThenCommittedWriteCore) WriteWithOperation(_ context.Context, id filesystem.OperationID, _ uint64, _ uint64, data []byte) (int, error) {
+	c.id = id
+	c.calls++
+	if c.calls == 1 {
+		return 0, kv.ErrTransactionOutcomeUnknown
+	}
+	return len(data), nil
+}
+
+func TestAdapterWriteRecoversAfterUnknownReplyIsAcknowledged(t *testing.T) {
+	t.Parallel()
+	session := filesystem.OperationSessionID{Filesystem: [16]byte{1}, Session: [16]byte{2}}
+	core := &unknownThenCommittedWriteCore{acknowledgementCore: newAcknowledgementCore()}
+	adapter := New(core, []byte("client"), WithHandleKeepaliveInterval(0), WithJournaledWrites(session))
+	t.Cleanup(adapter.Close)
+	_, errno := adapter.Write(t.Context(), 7, 9, 0, []byte("first"))
+	require.Equal(t, syscall.EIO, errno)
+	require.Equal(t, syscall.EIO, adapter.Fsync(t.Context(), 7, 9, false))
+	adapter.replyMu.Lock()
+	adapter.ackPending = make(map[filesystem.OperationID]struct{})
+	adapter.ackPending[core.id] = struct{}{}
+	adapter.replyMu.Unlock()
+	adapter.processAcknowledgementBatch(t.Context())
+	_, errno = adapter.Write(t.Context(), 7, 9, 0, []byte("second"))
+	require.Zero(t, errno)
+	require.Equal(t, 2, core.calls)
 }
 
 func (c *journalWriteCore) WriteWithOperation(_ context.Context, id filesystem.OperationID, _ uint64, _ uint64, data []byte) (int, error) {
@@ -89,10 +125,51 @@ type journalLifecycleCore struct {
 	releaseID filesystem.OperationID
 }
 
+type resolvingOpenCore struct {
+	*journalLifecycleCore
+	ackErr error
+}
+
+func (c *resolvingOpenCore) AcknowledgeOperation(context.Context, filesystem.OperationID) error {
+	return c.ackErr
+}
+
 type journalLeaseCore struct {
 	*receiptCore
 	leaseIDs []filesystem.OperationID
 	leaseErr error
+}
+
+type unknownThenCommittedLeaseCore struct {
+	*acknowledgementCore
+	id    filesystem.OperationID
+	calls int
+}
+
+func (c *unknownThenCommittedLeaseCore) RefreshOpenHandleLeaseWithOperation(_ context.Context, id filesystem.OperationID, _ uint64, _ uint64, _ []byte) error {
+	c.id = id
+	c.calls++
+	if c.calls == 1 {
+		return kv.ErrTransactionOutcomeUnknown
+	}
+	return nil
+}
+
+func TestAdapterLeaseRefreshRecoversAfterUnknownReplyIsAcknowledged(t *testing.T) {
+	t.Parallel()
+	session := filesystem.OperationSessionID{Filesystem: [16]byte{1}, Session: [16]byte{2}}
+	core := &unknownThenCommittedLeaseCore{acknowledgementCore: newAcknowledgementCore()}
+	adapter := New(core, []byte("client"), WithHandleKeepaliveInterval(0), WithJournaledLeaseRefresh(session))
+	adapter.ackCancel()
+	t.Cleanup(adapter.Close)
+	_, errno := adapter.Read(withReplyIdentity(t.Context(), 88), 7, 9, 0, 1)
+	require.Equal(t, syscall.EIO, errno)
+	require.Equal(t, syscall.EIO, adapter.Fsync(t.Context(), 7, 9, false))
+	adapter.replyAttempted(88)
+	adapter.processAcknowledgementBatch(t.Context())
+	_, errno = adapter.Read(t.Context(), 7, 9, 0, 1)
+	require.Zero(t, errno)
+	require.Equal(t, 2, core.calls)
 }
 
 type validatingLeaseCore struct {
@@ -110,6 +187,7 @@ func (c *validatingLeaseCore) ValidateOpenHandleLease(context.Context, uint64, u
 }
 
 func TestAdapterReadCoalescesJournaledLeaseRefresh(t *testing.T) {
+	t.Parallel()
 	session := filesystem.OperationSessionID{Filesystem: [16]byte{1}, Session: [16]byte{2}}
 	core := &validatingLeaseCore{ttl: 5 * time.Minute, journalLeaseCore: &journalLeaseCore{
 		receiptCore: &receiptCore{journalMetadataCore: &journalMetadataCore{
@@ -146,6 +224,7 @@ func (c *journalLeaseCore) RefreshOpenHandleLeaseWithOperation(_ context.Context
 }
 
 func TestAdapterJournaledLeaseRefreshPrecedesFsync(t *testing.T) {
+	t.Parallel()
 	session := filesystem.OperationSessionID{Filesystem: [16]byte{1}, Session: [16]byte{2}}
 	core := &journalLeaseCore{receiptCore: &receiptCore{journalMetadataCore: &journalMetadataCore{
 		journalWriteCore: &journalWriteCore{fakeCore: &fakeCore{}},
@@ -161,6 +240,7 @@ func TestAdapterJournaledLeaseRefreshPrecedesFsync(t *testing.T) {
 }
 
 func TestAdapterUnknownLeaseRefreshStopsLaterFsync(t *testing.T) {
+	t.Parallel()
 	session := filesystem.OperationSessionID{Filesystem: [16]byte{1}, Session: [16]byte{2}}
 	core := &journalLeaseCore{receiptCore: &receiptCore{journalMetadataCore: &journalMetadataCore{
 		journalWriteCore: &journalWriteCore{fakeCore: &fakeCore{}},
@@ -174,6 +254,7 @@ func TestAdapterUnknownLeaseRefreshStopsLaterFsync(t *testing.T) {
 }
 
 func TestAdapterKeepaliveUsesJournaledLeaseRefresh(t *testing.T) {
+	t.Parallel()
 	session := filesystem.OperationSessionID{Filesystem: [16]byte{1}, Session: [16]byte{2}}
 	core := &journalLeaseCore{receiptCore: &receiptCore{journalMetadataCore: &journalMetadataCore{
 		journalWriteCore: &journalWriteCore{fakeCore: &fakeCore{}},
@@ -192,6 +273,7 @@ func TestAdapterKeepaliveUsesJournaledLeaseRefresh(t *testing.T) {
 }
 
 func TestAdapterKeepaliveQueuesUnknownLeaseForResolution(t *testing.T) {
+	t.Parallel()
 	session := filesystem.OperationSessionID{Filesystem: [16]byte{1}, Session: [16]byte{2}}
 	core := &journalLeaseCore{receiptCore: &receiptCore{journalMetadataCore: &journalMetadataCore{
 		journalWriteCore: &journalWriteCore{fakeCore: &fakeCore{}},
@@ -218,6 +300,7 @@ func (c *journalLifecycleCore) OpenWithOperation(_ context.Context, id filesyste
 }
 
 func TestAdapterUnknownOpenStopsLaterFsync(t *testing.T) {
+	t.Parallel()
 	session := filesystem.OperationSessionID{Filesystem: [16]byte{1}, Session: [16]byte{2}}
 	core := &journalLifecycleCore{receiptCore: &receiptCore{journalMetadataCore: &journalMetadataCore{
 		journalWriteCore: &journalWriteCore{fakeCore: &fakeCore{}},
@@ -230,12 +313,42 @@ func TestAdapterUnknownOpenStopsLaterFsync(t *testing.T) {
 	require.False(t, core.fsyncCalled)
 }
 
+func TestAdapterOpenRecoversAfterUnknownReplyIsAcknowledged(t *testing.T) {
+	t.Parallel()
+	session := filesystem.OperationSessionID{Filesystem: [16]byte{1}, Session: [16]byte{2}}
+	core := &resolvingOpenCore{journalLifecycleCore: &journalLifecycleCore{
+		receiptCore: &receiptCore{journalMetadataCore: &journalMetadataCore{
+			journalWriteCore: &journalWriteCore{fakeCore: &fakeCore{}},
+		}}, openErr: kv.ErrTransactionOutcomeUnknown,
+	}}
+	adapter := New(core, []byte("fuse-session"), WithHandleKeepaliveInterval(0), WithJournaledOpen(session))
+	adapter.ackCancel()
+	t.Cleanup(adapter.Close)
+
+	_, errno := adapter.Open(withReplyIdentity(t.Context(), 77), 7)
+	require.Equal(t, syscall.EIO, errno)
+	core.openErr = nil
+	_, errno = adapter.Open(t.Context(), 7)
+	require.Equal(t, syscall.EIO, errno, "the unknown attempt must block until its reply is resolved")
+
+	adapter.replyAttempted(77)
+	core.ackErr = context.DeadlineExceeded
+	require.False(t, adapter.processAcknowledgementBatch(t.Context()))
+	_, errno = adapter.Open(t.Context(), 7)
+	require.Equal(t, syscall.EIO, errno, "an unresolved acknowledgement must retain the barrier")
+	core.ackErr = nil
+	require.False(t, adapter.processAcknowledgementBatch(t.Context()))
+	_, errno = adapter.Open(t.Context(), 7)
+	require.Zero(t, errno, "a resolved open must not poison later reads of the inode")
+}
+
 func (c *journalLifecycleCore) ReleaseWithOperation(_ context.Context, id filesystem.OperationID, _ uint64, _ uint64, _ []byte) error {
 	c.releaseID = id
 	return nil
 }
 
 func TestAdapterFsyncVerifiesCreateOpenAndReleaseReceipts(t *testing.T) {
+	t.Parallel()
 	session := filesystem.OperationSessionID{Filesystem: [16]byte{1}, Session: [16]byte{2}}
 	core := &journalLifecycleCore{receiptCore: &receiptCore{journalMetadataCore: &journalMetadataCore{
 		journalWriteCore: &journalWriteCore{fakeCore: &fakeCore{}},
@@ -261,6 +374,7 @@ func (c *journalUnlinkCore) UnlinkWithOperation(_ context.Context, id filesystem
 }
 
 func TestAdapterDirectoryFsyncVerifiesUnlinkReceipt(t *testing.T) {
+	t.Parallel()
 	session := filesystem.OperationSessionID{Filesystem: [16]byte{1}, Session: [16]byte{2}}
 	core := &journalUnlinkCore{receiptCore: &receiptCore{journalMetadataCore: &journalMetadataCore{
 		journalWriteCore: &journalWriteCore{fakeCore: &fakeCore{}},
@@ -280,6 +394,7 @@ func (c *receiptCore) VerifyOperationReceipt(_ context.Context, id filesystem.Op
 }
 
 func TestAdapterFsyncVerifiesJournalReceipts(t *testing.T) {
+	t.Parallel()
 	session := filesystem.OperationSessionID{Filesystem: [16]byte{1}, Session: [16]byte{2}}
 	core := &receiptCore{journalMetadataCore: &journalMetadataCore{
 		journalWriteCore: &journalWriteCore{fakeCore: &fakeCore{}},
@@ -300,6 +415,7 @@ func TestAdapterFsyncVerifiesJournalReceipts(t *testing.T) {
 }
 
 func TestAdapterFsyncFailsClosedOnUnverifiedReceipt(t *testing.T) {
+	t.Parallel()
 	session := filesystem.OperationSessionID{Filesystem: [16]byte{1}, Session: [16]byte{2}}
 	core := &receiptCore{journalMetadataCore: &journalMetadataCore{
 		journalWriteCore: &journalWriteCore{fakeCore: &fakeCore{}},
@@ -320,6 +436,7 @@ func (c *journalMetadataCore) SetAttrWithOperation(_ context.Context, id filesys
 }
 
 func TestAdapterJournaledMetadataSharesWriteSequence(t *testing.T) {
+	t.Parallel()
 	session := filesystem.OperationSessionID{Filesystem: [16]byte{1}, Session: [16]byte{2}}
 	core := &journalMetadataCore{journalWriteCore: &journalWriteCore{fakeCore: &fakeCore{}}}
 	adapter := New(core, []byte("fuse-session"), WithHandleKeepaliveInterval(0),
@@ -335,6 +452,7 @@ func TestAdapterJournaledMetadataSharesWriteSequence(t *testing.T) {
 }
 
 func TestAdapterRejectsDifferentJournalSessions(t *testing.T) {
+	t.Parallel()
 	first := filesystem.OperationSessionID{Filesystem: [16]byte{1}, Session: [16]byte{2}}
 	second := filesystem.OperationSessionID{Filesystem: [16]byte{1}, Session: [16]byte{3}}
 	core := &journalMetadataCore{journalWriteCore: &journalWriteCore{fakeCore: &fakeCore{}}}
@@ -350,6 +468,7 @@ func TestAdapterRejectsDifferentJournalSessions(t *testing.T) {
 }
 
 func TestAdapterJournaledWritesAllocateStableSessionSequence(t *testing.T) {
+	t.Parallel()
 	session := filesystem.OperationSessionID{Filesystem: [16]byte{1}, Session: [16]byte{2}}
 	core := &journalWriteCore{fakeCore: &fakeCore{}}
 	adapter := New(core, []byte("fuse-session"), WithHandleKeepaliveInterval(0), WithJournaledWrites(session))
@@ -370,6 +489,7 @@ func TestAdapterJournaledWritesAllocateStableSessionSequence(t *testing.T) {
 }
 
 func TestAdapterWriteStopsWhenLeaseRefreshFails(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	core := &fakeCore{refreshErr: filesystem.ErrStaleHome}
 	adapter := newIdleAdapter(t, core)
@@ -381,6 +501,7 @@ func TestAdapterWriteStopsWhenLeaseRefreshFails(t *testing.T) {
 }
 
 func TestAdapterWriteMapsBackendError(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	core := &fakeCore{writeErr: filesystem.ErrInvalid}
 	adapter := newIdleAdapter(t, core)
@@ -392,6 +513,7 @@ func TestAdapterWriteMapsBackendError(t *testing.T) {
 }
 
 func TestAdapterFlushAndFsyncRefreshLeaseFirst(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 
 	t.Run("flush forwards", func(t *testing.T) {
@@ -436,6 +558,7 @@ func TestAdapterFlushAndFsyncRefreshLeaseFirst(t *testing.T) {
 }
 
 func TestAdapterOpenDoesNotTrackFailedHandles(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	core := &fakeCore{openErr: filesystem.ErrNotFound}
 	adapter := newIdleAdapter(t, core)
@@ -447,6 +570,7 @@ func TestAdapterOpenDoesNotTrackFailedHandles(t *testing.T) {
 }
 
 func TestAdapterCreateDoesNotTrackFailedHandles(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	core := &fakeCore{createErr: filesystem.ErrExists}
 	adapter := newIdleAdapter(t, core)
@@ -457,6 +581,7 @@ func TestAdapterCreateDoesNotTrackFailedHandles(t *testing.T) {
 }
 
 func TestAdapterReleaseUntracksHandleEvenWhenBackendFails(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	core := &fakeCore{openFH: 9, releaseErr: filesystem.ErrNotFound}
 	adapter := newIdleAdapter(t, core)
@@ -470,6 +595,7 @@ func TestAdapterReleaseUntracksHandleEvenWhenBackendFails(t *testing.T) {
 }
 
 func TestAdapterMkdirForwardsOptionsWithoutClientID(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	core := &fakeCore{mkdirResult: filesystem.CreateResult{Inode: 11}}
 	adapter := newIdleAdapter(t, core)
@@ -495,6 +621,7 @@ func TestAdapterMkdirForwardsOptionsWithoutClientID(t *testing.T) {
 }
 
 func TestAdapterNamespaceMutationsForwardAndMapErrors(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 
 	t.Run("unlink", func(t *testing.T) {
@@ -536,6 +663,7 @@ func TestAdapterNamespaceMutationsForwardAndMapErrors(t *testing.T) {
 }
 
 func TestAdapterGetAttrAndStatFSMapErrors(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	core := &fakeCore{
 		stat:       filesystem.Stat{Inode: 7},
@@ -563,6 +691,7 @@ func TestAdapterGetAttrAndStatFSMapErrors(t *testing.T) {
 }
 
 func TestAdapterLookupMapsResolveAndGetAttrErrors(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 
 	core := &fakeCore{resolveErr: filesystem.ErrNotFound}
@@ -579,6 +708,7 @@ func TestAdapterLookupMapsResolveAndGetAttrErrors(t *testing.T) {
 }
 
 func TestAdapterReaddirMapsErrors(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	core := &fakeCore{readdirErr: filesystem.ErrNotDir}
 	adapter := newIdleAdapter(t, core)
@@ -589,6 +719,7 @@ func TestAdapterReaddirMapsErrors(t *testing.T) {
 }
 
 func TestAdapterOptionsIgnoreNonPositiveValues(t *testing.T) {
+	t.Parallel()
 	core := &fakeCore{}
 	adapter := New(core, []byte("fuse-session"),
 		WithReaddirLimit(0),
@@ -604,6 +735,7 @@ func TestAdapterOptionsIgnoreNonPositiveValues(t *testing.T) {
 }
 
 func TestAdapterCloseIsIdempotent(t *testing.T) {
+	t.Parallel()
 	adapter := New(&fakeCore{}, []byte("fuse-session"), WithHandleKeepaliveInterval(time.Hour))
 	require.NotNil(t, adapter.keepaliveCancel)
 	adapter.Close()
@@ -611,6 +743,7 @@ func TestAdapterCloseIsIdempotent(t *testing.T) {
 }
 
 func TestAdapterKeepaliveStopsWhenContextIsCanceled(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	core := &fakeCore{refreshErr: errors.New("boom")}
 	adapter := newIdleAdapter(t, core)
@@ -624,6 +757,7 @@ func TestAdapterKeepaliveStopsWhenContextIsCanceled(t *testing.T) {
 }
 
 func TestAdapterTrackingIgnoresZeroHandles(t *testing.T) {
+	t.Parallel()
 	adapter := newIdleAdapter(t, &fakeCore{})
 	adapter.trackOpenHandle(7, 0)
 	require.Empty(t, adapter.openHandleSnapshot())
@@ -632,6 +766,7 @@ func TestAdapterTrackingIgnoresZeroHandles(t *testing.T) {
 }
 
 func TestAdapterKeepaliveLoopRefreshesUntilClosed(t *testing.T) {
+	t.Parallel()
 	core := &fakeCore{refreshCh: make(chan openHandleRefresh, 8)}
 	adapter := New(core, []byte("fuse-session"), WithHandleKeepaliveInterval(5*time.Millisecond))
 	adapter.trackOpenHandle(7, 9)

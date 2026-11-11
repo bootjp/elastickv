@@ -55,6 +55,7 @@ func forwardedWriteConflict() error {
 }
 
 func TestServiceInitializeRootRetriesForwardedWriteConflict(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := store.NewMVCCStore()
 	coord := &forwardedRootRaceCoordinator{
@@ -74,6 +75,7 @@ func TestServiceInitializeRootRetriesForwardedWriteConflict(t *testing.T) {
 }
 
 func TestServiceInitializeRootDoesNotRetryUnrelatedWireErrors(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := store.NewMVCCStore()
 	wire := status.Error(codes.Unknown, "key: !fs|ino|: disk full")
@@ -90,6 +92,7 @@ func TestServiceInitializeRootDoesNotRetryUnrelatedWireErrors(t *testing.T) {
 }
 
 func TestIsWriteConflict(t *testing.T) {
+	t.Parallel()
 	conflictKey := []byte("!fs|ino|root")
 	tests := []struct {
 		name     string
@@ -117,6 +120,7 @@ func TestIsWriteConflict(t *testing.T) {
 }
 
 func TestRootInitializationRechecksAfterUncertainForwardedConflict(t *testing.T) {
+	t.Parallel()
 	err := errors.Join(kv.ErrTransactionOutcomeUnknown, forwardedWriteConflict())
 	require.False(t, IsWriteConflict(err))
 	require.False(t, isRootInitializationConflict(err))

@@ -76,6 +76,7 @@ func newTransferAdmissionFixture(t *testing.T) *transferAdmissionFixture {
 }
 
 func TestSplitTransferAdmissionAllMembersAndRevalidation(t *testing.T) {
+	t.Parallel()
 	f := newTransferAdmissionFixture(t)
 	witness, err := f.server.ensureSplitTransferAdmission(t.Context(), f.job, 2, f.source, f.control, f.proof)
 	require.NoError(t, err)
@@ -88,6 +89,7 @@ func TestSplitTransferAdmissionAllMembersAndRevalidation(t *testing.T) {
 }
 
 func TestSplitTransferAdmissionFailsClosedBeforeApply(t *testing.T) {
+	t.Parallel()
 	cases := map[string]func(*transferAdmissionFixture){
 		"missing factory": func(f *transferAdmissionFixture) { f.server = NewDistributionServer(nil, nil) },
 		"empty":           func(f *transferAdmissionFixture) { f.snapshot.Members = nil },
@@ -110,6 +112,7 @@ func TestSplitTransferAdmissionFailsClosedBeforeApply(t *testing.T) {
 }
 
 func TestSplitTransferAdmissionRejectsMemberEvidence(t *testing.T) {
+	t.Parallel()
 	cases := map[string]func(*pb.ProbeMigrationStateResponse){
 		"old size":      func(r *pb.ProbeMigrationStateResponse) { r.TransferSizeGuardVersion = 0 },
 		"old partition": func(r *pb.ProbeMigrationStateResponse) { r.OwnershipPartitionProtocol = 0 },
@@ -134,6 +137,7 @@ func TestSplitTransferAdmissionRejectsMemberEvidence(t *testing.T) {
 }
 
 func TestSplitTransferAdmissionRejectsNilResponseAndInvalidGroup(t *testing.T) {
+	t.Parallel()
 	f := newTransferAdmissionFixture(t)
 	_, err := f.server.ensureSplitTransferAdmission(t.Context(), f.job, 0, f.source, f.control, f.proof)
 	require.Error(t, err)
@@ -144,6 +148,7 @@ func TestSplitTransferAdmissionRejectsNilResponseAndInvalidGroup(t *testing.T) {
 }
 
 func TestSplitTransferAdmissionRejectsMissingPersistedLearnerACK(t *testing.T) {
+	t.Parallel()
 	f := newTransferAdmissionFixture(t)
 	learner, ok := f.snapshot.Members[1].Client.(*transferAdmissionClient)
 	require.True(t, ok)
@@ -167,6 +172,7 @@ func TestSplitTransferAdmissionRejectsMissingPersistedLearnerACK(t *testing.T) {
 }
 
 func TestSplitTransferAdmissionMembershipChangesBeforeApply(t *testing.T) {
+	t.Parallel()
 	f := newTransferAdmissionFixture(t)
 	calls := 0
 	WithSplitMigrationApplyMemberSnapshotFactory(func(context.Context, uint64) (SplitMigrationApplyMemberSnapshot, error) {
@@ -182,6 +188,7 @@ func TestSplitTransferAdmissionMembershipChangesBeforeApply(t *testing.T) {
 }
 
 func TestSplitTransferAdmissionRevalidationUsesFreshMembers(t *testing.T) {
+	t.Parallel()
 	f := newTransferAdmissionFixture(t)
 	witness, err := f.server.ensureSplitTransferAdmission(t.Context(), f.job, 2, f.source, f.control, f.proof)
 	require.NoError(t, err)
@@ -192,6 +199,7 @@ func TestSplitTransferAdmissionRevalidationUsesFreshMembers(t *testing.T) {
 }
 
 func TestSplitTransferAdmissionChangedControlsNeedNewWitness(t *testing.T) {
+	t.Parallel()
 	f := newTransferAdmissionFixture(t)
 	first, err := f.server.ensureSplitTransferAdmission(t.Context(), f.job, 2, f.source, f.control, f.proof)
 	require.NoError(t, err)
@@ -209,6 +217,7 @@ func TestSplitTransferAdmissionChangedControlsNeedNewWitness(t *testing.T) {
 }
 
 func TestSplitTransferAdmissionRejectsCanceledContext(t *testing.T) {
+	t.Parallel()
 	f := newTransferAdmissionFixture(t)
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()

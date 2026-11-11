@@ -13,6 +13,7 @@ import (
 )
 
 func TestPartitionNegativeDeferredUntilCommittedGeometry(t *testing.T) {
+	t.Parallel()
 	h := newPartitionRefreshHarness(t, 9)
 	changed := h.parent
 	changed.GroupID, changed.MinWriteTSExclusive = 8, 200
@@ -47,6 +48,7 @@ func TestPartitionNegativeDeferredUntilCommittedGeometry(t *testing.T) {
 }
 
 func TestPartitionNegativeCannotCatchUpToLocalOwner(t *testing.T) {
+	t.Parallel()
 	h := newPartitionRefreshHarness(t, 9)
 	changed := h.parent
 	changed.GroupID, changed.MinWriteTSExclusive = 9, 200
@@ -61,6 +63,7 @@ func TestPartitionNegativeCannotCatchUpToLocalOwner(t *testing.T) {
 }
 
 func TestPartitionNegativeFallbackDoesNotMaskLookupFailure(t *testing.T) {
+	t.Parallel()
 	for _, failure := range []error{errors.New("storage I/O failed"), distribution.ErrOwnershipPartitionManifest} {
 		t.Run(failure.Error(), func(t *testing.T) {
 			h := newPartitionRefreshHarness(t, 9)
@@ -90,6 +93,7 @@ func (s *partitionNegativeReadFailure) GetAt(ctx context.Context, key []byte, ts
 }
 
 func TestPartitionNegativeMoveBackRepeatedRefresh(t *testing.T) {
+	t.Parallel()
 	r := newResplitAcceptanceRuntime(t)
 	r.migrate(t, 1, 2, "m")
 	r.migrate(t, r.ownership(t, 2)[0].RouteID, 3, "t")

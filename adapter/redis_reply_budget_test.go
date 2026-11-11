@@ -24,6 +24,7 @@ func requireRedisReplyReleased(t *testing.T, s *RedisServer) {
 }
 
 func TestRedisReplyBudgetCapacityGrowthAndPreallocation(t *testing.T) {
+	t.Parallel()
 	old, next := redisReplyCapacityCharge(128), redisReplyCapacityCharge(256)
 	for _, fits := range []bool{false, true} {
 		t.Run(map[bool]string{false: "old plus new does not fit", true: "transient growth charged"}[fits], func(t *testing.T) {
@@ -66,6 +67,7 @@ func TestRedisReplyBudgetCapacityGrowthAndPreallocation(t *testing.T) {
 }
 
 func TestRedisReplyBudgetConcurrentReceiverReservations(t *testing.T) {
+	t.Parallel()
 	const clients, capacity, admitted = 32, 4096, 4
 	budget := &redisReplyBudget{limit: admitted * redisReplyCapacityCharge(capacity)}
 	start, release := make(chan struct{}), make(chan struct{})
@@ -104,6 +106,7 @@ type redisReplyReader func([]byte) (int, error)
 func (f redisReplyReader) Read(p []byte) (int, error) { return f(p) }
 
 func TestRedisReplyBudgetBulkFromHasNoUnchargedScratch(t *testing.T) {
+	t.Parallel()
 	budget := &redisReplyBudget{limit: redisReplyCapacityCharge(2048)}
 	b := &redisReplyBuffer{budget: budget}
 	b.WriteBulkFrom(1024, redisReplyReader(func(p []byte) (int, error) {
@@ -148,6 +151,7 @@ type redisReplyJoinOwner struct {
 func (o redisReplyJoinOwner) CancelAndJoin() { o.join(); o.RequestOwnership.CancelAndJoin() }
 
 func TestRedisReplyBudgetRetainedThroughOwnerCleanup(t *testing.T) {
+	t.Parallel()
 	for _, exit := range []string{"success", "revoked", "panic", "overflow"} {
 		t.Run(exit, func(t *testing.T) {
 			owner := &redisTestOwnership{ctx: t.Context()}
@@ -190,6 +194,7 @@ func TestRedisReplyBudgetRetainedThroughOwnerCleanup(t *testing.T) {
 }
 
 func TestRedisReplyBudgetLineEncodingHasNoSanitationCopy(t *testing.T) {
+	t.Parallel()
 	for _, prefix := range []byte{'+', '-'} {
 		budget := &redisReplyBudget{limit: redisReplyCapacityCharge(4096)}
 		b := &redisReplyBuffer{budget: budget}

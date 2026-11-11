@@ -65,6 +65,7 @@ func (h *holdPreparedTxn) Commit(ctx context.Context, reqs []*pb.Request) (*kv.T
 }
 
 func TestOperationJournalTwoGroupCreateOpenWrite(t *testing.T) {
+	t.Parallel()
 	routes := distribution.NewEngine()
 	require.NoError(t, routes.ApplySnapshot(distribution.CatalogSnapshot{
 		Version: 1,
@@ -268,6 +269,7 @@ func assertWriteAfterConcurrentAcknowledgement(t *testing.T, ctx context.Context
 }
 
 func TestRetryJournalLockedKeepsUnknownOutcome(t *testing.T) {
+	t.Parallel()
 	tries := 0
 	value, err := retryJournalLocked(context.Background(), func(context.Context) ([]byte, error) {
 		tries++
@@ -309,6 +311,7 @@ func TestRetryJournalReadRetriesUnknownLockAtSameSnapshot(t *testing.T) {
 }
 
 func TestRepeatedAcknowledgementKeepsReservation(t *testing.T) {
+	t.Parallel()
 	session := operationSession{RejectBefore: 1, AckGaps: []uint64{3}, RetainedCount: 1, RetainedBytes: 100}
 	record := operationRecord{ID: OperationID{Sequence: 3}, Reservation: 10}
 	require.ErrorIs(t, reserveAckRetirement(&session, record), ErrOperationRetired)

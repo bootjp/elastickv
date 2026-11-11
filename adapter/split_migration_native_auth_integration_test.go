@@ -164,6 +164,7 @@ func migrationNativeExportRequest() *pb.ExportRangeVersionsRequest {
 }
 
 func TestSplitMigrationNativeExportStreamTLSCompatibility(t *testing.T) {
+	t.Parallel()
 	for _, mode := range []migrationNativeAuthMode{migrationNativeLegacy, migrationNativeWrapped, migrationNativePlaintext} {
 		f := newMigrationNativeAuthFixture(t, mode)
 		var cc *grpc.ClientConn
@@ -195,6 +196,7 @@ func TestSplitMigrationNativeExportStreamTLSCompatibility(t *testing.T) {
 }
 
 func TestSplitMigrationNativeExportStreamPeerAndTokenChecks(t *testing.T) {
+	t.Parallel()
 	f := newMigrationNativeAuthFixture(t, migrationNativePeerGated)
 	cfg := &tls.Config{RootCAs: f.roots, Certificates: []tls.Certificate{f.clientCertificate}, MinVersion: tls.VersionTLS12}
 	tc, err := f.clientOwner.TransportCredentials(cfg, false)
@@ -265,6 +267,7 @@ func migrationNativeRequest() *pb.SplitRangeRequest {
 }
 
 func TestSplitMigrationNativePublicTLSCompatibility(t *testing.T) {
+	t.Parallel()
 	for _, mode := range []migrationNativeAuthMode{migrationNativeLegacy, migrationNativeWrapped} {
 		t.Run(map[migrationNativeAuthMode]string{migrationNativeLegacy: "legacy", migrationNativeWrapped: "wrapped"}[mode], func(t *testing.T) {
 			f := newMigrationNativeAuthFixture(t, mode)
@@ -309,6 +312,7 @@ func TestSplitMigrationNativePublicTLSCompatibility(t *testing.T) {
 }
 
 func TestSplitMigrationNativePlaintextRejectsToken(t *testing.T) {
+	t.Parallel()
 	f := newMigrationNativeAuthFixture(t, migrationNativePlaintext)
 	cc := f.dial(t, insecure.NewCredentials())
 	ctx, cancel := context.WithTimeout(t.Context(), migrationAuthNativeTimeout)
@@ -320,6 +324,8 @@ func TestSplitMigrationNativePlaintextRejectsToken(t *testing.T) {
 }
 
 func TestSplitMigrationNativeWrappedTransportOwnership(t *testing.T) {
+	// Not parallel: its deadline/liveness budget is sized for a quiet
+	// process, and parallel peers on a loaded runner can exhaust it.
 	for _, closeMode := range []string{"physical disconnect", "owner shutdown"} {
 		t.Run(closeMode, func(t *testing.T) {
 			f := newMigrationNativeAuthFixture(t, migrationNativeWrapped)
@@ -376,6 +382,7 @@ func TestSplitMigrationNativeWrappedTransportOwnership(t *testing.T) {
 }
 
 func TestSplitMigrationNativeClientAuthInfoCannotBecomeServerProof(t *testing.T) {
+	t.Parallel()
 	f := newMigrationNativeAuthFixture(t, migrationNativeWrapped)
 	tc, err := f.clientOwner.TransportCredentials(&tls.Config{
 		RootCAs: f.roots, Certificates: []tls.Certificate{f.clientCertificate}, MinVersion: tls.VersionTLS12,
@@ -405,6 +412,7 @@ func (m migrationNativeBearer) GetRequestMetadata(context.Context, ...string) (m
 }
 
 func TestSplitMigrationNativePeerAndTokenChecksAreConjunctive(t *testing.T) {
+	t.Parallel()
 	f := newMigrationNativeAuthFixture(t, migrationNativePeerGated)
 	ctx, cancel := context.WithTimeout(t.Context(), migrationAuthNativeTimeout)
 	defer cancel()

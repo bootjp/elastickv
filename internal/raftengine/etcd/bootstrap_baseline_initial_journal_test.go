@@ -49,6 +49,7 @@ func stageInitialBaselineCrash(t *testing.T, dir, state string, data []byte) {
 }
 
 func TestOfflineBaselineInitialJournalCrashRecovery(t *testing.T) {
+	t.Parallel()
 	for _, method := range []string{"prepare", "resume"} {
 		for _, state := range []string{"mkdir", "tmp-created", "partial-write", "tmp-fsync", "pre-rename"} {
 			t.Run(method+"/"+state, func(t *testing.T) {
@@ -83,6 +84,7 @@ func TestOfflineBaselineInitialJournalCrashRecovery(t *testing.T) {
 }
 
 func TestOfflineBaselineInitialJournalRejectsUnexpectedContents(t *testing.T) {
+	t.Parallel()
 	for _, kind := range []string{"unknown-file", "unknown-directory", "tmp-directory", "tmp-symlink", "root-symlink", "foreign-journal", "oversized", "published-journal"} {
 		t.Run(kind, func(t *testing.T) {
 			o, key := offlineBaselineFixture(t, true)
@@ -134,6 +136,7 @@ func initialBaselineUnexpectedContent(t *testing.T, dir, kind string, data []byt
 }
 
 func TestOfflineBaselineInitialJournalResumeDoesNotCreateDirectory(t *testing.T) {
+	t.Parallel()
 	o, key := offlineBaselineFixture(t, true)
 	manifest := signedOfflineBaseline(t, o, key)
 	paths := baselineMigrationPaths(o)
@@ -144,6 +147,7 @@ func TestOfflineBaselineInitialJournalResumeDoesNotCreateDirectory(t *testing.T)
 }
 
 func TestOfflineBaselineInitialJournalDoesNotTruncateLinkedTemp(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	journal := baselineMigrationJournal{phase: baselinePreparing, manifest: raftbootstrap.Digest{1}}
 	prefix := encodeBaselineJournal(journal)[:len("EKVBLJ02")]
@@ -160,6 +164,7 @@ func TestOfflineBaselineInitialJournalDoesNotTruncateLinkedTemp(t *testing.T) {
 }
 
 func TestOfflineBaselineInitialJournalRevalidatesSource(t *testing.T) {
+	t.Parallel()
 	for _, kind := range []string{"native-source", "store-proof"} {
 		t.Run(kind, func(t *testing.T) {
 			o, key := offlineBaselineFixture(t, true)

@@ -146,16 +146,15 @@ const (
 )
 
 type RedisServer struct {
-	listen          net.Listener
-	store           store.MVCCStore
-	coordinator     kv.Coordinator
-	readTracker     *kv.ActiveTimestampTracker
-	redisTranscoder *redisTranscoder
-	pubsub          *redisPubSub
-	scriptMu        sync.RWMutex
-	scriptCache     map[string]string
-	luaPool         *luaStatePool
-	luaPoolOnce     sync.Once
+	listen      net.Listener
+	store       store.MVCCStore
+	coordinator kv.Coordinator
+	readTracker *kv.ActiveTimestampTracker
+	pubsub      *redisPubSub
+	scriptMu    sync.RWMutex
+	scriptCache map[string]string
+	luaPool     *luaStatePool
+	luaPoolOnce sync.Once
 	// luaPoolMaxIdle is the configured cap on idle pooled *lua.LStates.
 	// Set via WithLuaPoolMaxIdle before NewRedisServer materializes the
 	// pool; getLuaPool falls back to DefaultLuaPoolMaxIdle when the
@@ -563,7 +562,6 @@ func NewRedisServer(listen net.Listener, redisAddr string, store store.MVCCStore
 		listen:                listen,
 		store:                 store,
 		coordinator:           kv.WithKeyVizLabel(coordinate, keyviz.LabelRedis),
-		redisTranscoder:       newRedisTranscoder(),
 		redisAddr:             redisAddr,
 		relay:                 relay,
 		leaderRedis:           leaderRedis,

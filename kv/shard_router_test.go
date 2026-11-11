@@ -20,6 +20,7 @@ func newTestRaft(t *testing.T, id string, fsm FSM) (raftengine.Engine, func()) {
 }
 
 func TestShardRouterCommit(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 
 	e := distribution.NewEngine()
@@ -60,6 +61,7 @@ func TestShardRouterCommit(t *testing.T) {
 }
 
 func TestShardRouterSplitAndMerge(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 
 	e := distribution.NewEngine()
@@ -150,6 +152,7 @@ func (f *fakeTM) Abort(_ context.Context, reqs []*pb.Request) (*TransactionRespo
 }
 
 func TestShardRouterCommitFailure(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	e := distribution.NewEngine()
 	e.UpdateRoute([]byte("a"), []byte("m"), 1)
@@ -181,6 +184,7 @@ func TestShardRouterCommitFailure(t *testing.T) {
 }
 
 func TestShardRouterRoutesListKeys(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	e := distribution.NewEngine()
 	e.UpdateRoute([]byte("a"), []byte("m"), 1)

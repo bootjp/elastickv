@@ -31,6 +31,7 @@ func bootstrapArtifactSyntaxArgs(command string, root string) []string {
 }
 
 func TestBootstrapArtifactCommandStrictSyntax(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	for _, command := range []string{bootstrapArtifactAttest, bootstrapArtifactCertify} {
 		t.Run(command, func(t *testing.T) {
@@ -102,6 +103,7 @@ func bootstrapCertifyCommandFixture(t *testing.T) ([]string, string) {
 }
 
 func TestBootstrapArtifactCommandCertifyExclusive(t *testing.T) {
+	t.Parallel()
 	args, root := bootstrapCertifyCommandFixture(t)
 	before := offlineDataFiles(t, root)
 	var output bytes.Buffer
@@ -130,6 +132,7 @@ func TestBootstrapArtifactCommandCertifyExclusive(t *testing.T) {
 }
 
 func TestBootstrapArtifactCommandRejectsPartialCertificateWithoutOutput(t *testing.T) {
+	t.Parallel()
 	for _, scenario := range []string{"missing learner", "duplicate member", "bad ack", "foreign context", "symlink output"} {
 		t.Run(scenario, func(t *testing.T) {
 			args, root := bootstrapCertifyCommandFixture(t)
@@ -157,6 +160,7 @@ func TestBootstrapArtifactCommandRejectsPartialCertificateWithoutOutput(t *testi
 }
 
 func TestBootstrapArtifactInputAggregateBoundAndPeerSigner(t *testing.T) {
+	t.Parallel()
 	raw := bootstrapConfigFixture(t)
 	// Runtime inputs are irrelevant to offline signing and must not be opened.
 	raw.StartupTokenFile, raw.ActivationFile = "/nonexistent/startup", "/nonexistent/activation"

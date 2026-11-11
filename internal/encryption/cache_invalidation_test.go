@@ -7,6 +7,7 @@ import (
 )
 
 func TestStorageCacheInvalidatesBeforeKeyAndRegistrationChanges(t *testing.T) {
+	t.Parallel()
 	c := NewStateCache()
 	sc := &Sidecar{Active: ActiveKeys{Storage: 1}, StorageEnvelopeActive: true}
 	calls := 0

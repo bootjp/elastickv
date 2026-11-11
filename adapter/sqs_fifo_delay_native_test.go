@@ -39,6 +39,7 @@ func delayNativeMessage(t *testing.T, value any) map[string]any {
 }
 
 func TestSQSFIFORetroactiveDelayNative(t *testing.T) {
+	t.Parallel()
 	nodes, _, _ := createNode(t, 1)
 	defer shutdown(nodes)
 	node := sqsLeaderNode(t, nodes)
@@ -112,6 +113,7 @@ func TestSQSFIFORetroactiveDelayNative(t *testing.T) {
 }
 
 func TestSQSStandardDelayChangeIsNotRetroactiveNative(t *testing.T) {
+	t.Parallel()
 	nodes, _, _ := createNode(t, 1)
 	defer shutdown(nodes)
 	node := sqsLeaderNode(t, nodes)
@@ -153,6 +155,7 @@ func TestSQSStandardDelayChangeIsNotRetroactiveNative(t *testing.T) {
 }
 
 func TestSQSFIFODelayNativeMembershipCoverage(t *testing.T) {
+	t.Parallel()
 	nodes, _, _ := createNode(t, 3)
 	defer shutdown(nodes)
 	node := sqsLeaderNode(t, nodes)

@@ -44,6 +44,7 @@ func refreshAdmissionPartition(t *testing.T, st MVCCStore, version uint64) {
 }
 
 func TestMigrationServingAdmissionCompactsHistoryAndOwnsSlices(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		reader := admissionReader(t, st)
 		require.Equal(t, MigrationServingSummary{}, servingSummary(t, st))
@@ -77,6 +78,7 @@ func TestMigrationServingAdmissionCompactsHistoryAndOwnsSlices(t *testing.T) {
 }
 
 func TestMigrationServingAdmissionUnknownLegacyAndReceiptOnlyRestore(t *testing.T) {
+	t.Parallel()
 	for _, receiptOnly := range []bool{false, true} {
 		source := NewMVCCStore()
 		_, tx := partitionFixture(t, source)
@@ -117,6 +119,8 @@ func TestMigrationServingAdmissionUnknownLegacyAndReceiptOnlyRestore(t *testing.
 }
 
 func TestMigrationServingAdmissionDoesNotAcquireDatabaseOrApplyLock(t *testing.T) {
+	// Not parallel: the reader goroutine has a 5s deadline that parallel
+	// load could exceed without any lock being taken.
 	for _, migrated := range []bool{false, true} {
 		st, err := NewPebbleStore(t.TempDir())
 		require.NoError(t, err)
@@ -151,6 +155,7 @@ func TestMigrationServingAdmissionDoesNotAcquireDatabaseOrApplyLock(t *testing.T
 }
 
 func TestMigrationServingAdmissionConcurrentPublication(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		_, tx := partitionFixture(t, st)
 		require.NoError(t, partitionStore(t, st).ApplyMigrationOwnershipPartition(t.Context(), tx, 10))
@@ -179,6 +184,7 @@ func TestMigrationServingAdmissionConcurrentPublication(t *testing.T) {
 }
 
 func TestMigrationServingAdmissionLegacyRefreshDoesNotBorrowCallerSlices(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		old, _ := partitionFixture(t, st)
 		old.CatalogVersion++
@@ -201,6 +207,7 @@ func TestMigrationServingAdmissionLegacyRefreshDoesNotBorrowCallerSlices(t *test
 }
 
 func TestMigrationServingAdmissionDoesNotHideUnknownAdoptedLegacy(t *testing.T) {
+	t.Parallel()
 	source := NewMVCCStore()
 	_, tx := partitionFixture(t, source)
 	require.NoError(t, partitionStore(t, source).ApplyMigrationOwnershipPartition(t.Context(), tx, 10))

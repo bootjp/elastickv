@@ -9,6 +9,7 @@ import (
 )
 
 func TestTSOPendingHistoricalCheckFailureKeepsIssuingWithBoundedRetry(t *testing.T) {
+	t.Parallel()
 	for _, checkErr := range []error{ErrTSOProtocolUnsupported, ErrTSOPhaseDActivationPending, context.DeadlineExceeded} {
 		t.Run(checkErr.Error(), func(t *testing.T) {
 			gate := &testPhaseDGate{checkErr: checkErr}
@@ -38,6 +39,7 @@ func TestTSOPendingHistoricalCheckFailureKeepsIssuingWithBoundedRetry(t *testing
 }
 
 func TestTSOPendingHistoricalMarkerPrecedesSealAndPermanentlyDisablesFallback(t *testing.T) {
+	t.Parallel()
 	gate := &testPhaseDGate{sealErr: ErrTSOPhaseDActivationPending}
 	a, fsm, engine, _ := pendingTestAllocator(t, gate)
 	require.Nil(t, fsm.Apply(marshalTSOCutover()))
@@ -72,6 +74,7 @@ func TestTSOPendingHistoricalMarkerPrecedesSealAndPermanentlyDisablesFallback(t 
 }
 
 func TestTSOPendingHistoricalFailedCheckStillFencesLeadership(t *testing.T) {
+	t.Parallel()
 	gate := &testPhaseDGate{checkErr: ErrTSOProtocolUnsupported}
 	a, fsm, engine, _ := pendingTestAllocator(t, gate)
 	require.Nil(t, fsm.Apply(marshalTSOCutover()))
@@ -84,6 +87,7 @@ func TestTSOPendingHistoricalFailedCheckStillFencesLeadership(t *testing.T) {
 }
 
 func TestTSOPendingHistoricalLateAppliedMarkerCannotFallBack(t *testing.T) {
+	t.Parallel()
 	gate := &testPhaseDGate{checkErr: ErrTSOProtocolUnsupported, sealErr: ErrTSOPhaseDActivationPending}
 	a, fsm, _, _ := pendingTestAllocator(t, gate)
 	require.Nil(t, fsm.Apply(marshalTSOCutover()))
@@ -95,6 +99,7 @@ func TestTSOPendingHistoricalLateAppliedMarkerCannotFallBack(t *testing.T) {
 }
 
 func TestTSOPendingActiveResumeEnablesNewGroupBeforeSeal(t *testing.T) {
+	t.Parallel()
 	gate := &testPhaseDGate{checkErr: ErrTSOProtocolUnsupported}
 	a, fsm, _, _ := pendingTestAllocator(t, gate)
 	require.Nil(t, fsm.Apply(marshalTSOCutover()))

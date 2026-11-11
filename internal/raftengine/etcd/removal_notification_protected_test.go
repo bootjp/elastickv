@@ -11,6 +11,7 @@ import (
 )
 
 func TestProtectedRemovalNeverUsesLegacyNotification(t *testing.T) {
+	t.Parallel()
 	payload, err := proto.Marshal(&raftpb.ConfChange{
 		Type: confChangeTypePtr(raftpb.ConfChangeRemoveNode), NodeId: uint64Ptr(2),
 	})

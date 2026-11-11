@@ -122,6 +122,9 @@ func (f *kvFSM) reloadBackupTimestampFloor(ctx context.Context) error {
 	if err := f.reloadPrepareEvidence(ctx); err != nil {
 		return err
 	}
+	if err := f.reloadCommitTSFence(ctx); err != nil {
+		return err
+	}
 	value, err := f.store.GetAt(ctx, backupTimestampFloorKey, ^uint64(0))
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {

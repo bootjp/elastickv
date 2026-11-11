@@ -30,6 +30,7 @@ func (*entryIdentityFSM) Snapshot() (Snapshot, error) { return nil, nil }
 func (*entryIdentityFSM) Restore(io.Reader) error     { return nil }
 
 func TestApplyNormalEntryDeliversPlaintextIdentity(t *testing.T) {
+	t.Parallel()
 	const index, term = uint64(17), uint64(5)
 	payload := []byte("canonical plaintext")
 	fsm := &entryIdentityFSM{}
@@ -50,6 +51,7 @@ func TestApplyNormalEntryDeliversPlaintextIdentity(t *testing.T) {
 }
 
 func TestApplyNormalEntryDoesNotDeliverIdentityForDroppedDuplicate(t *testing.T) {
+	t.Parallel()
 	fsm := &entryIdentityFSM{}
 	engine := newTestEngine(fsm, nil, nil)
 	entry := raftpb.Entry{
@@ -67,6 +69,7 @@ func TestApplyNormalEntryDoesNotDeliverIdentityForDroppedDuplicate(t *testing.T)
 }
 
 func TestAppliedEntryIdentityFramesTypeAndPayload(t *testing.T) {
+	t.Parallel()
 	base := raftengine.NewAppliedEntryIdentity(1, 2, 3, []byte("ab"))
 	require.NotEqual(t, base.Digest, raftengine.NewAppliedEntryIdentity(1, 2, 4, []byte("ab")).Digest)
 	require.NotEqual(t, base.Digest, raftengine.NewAppliedEntryIdentity(1, 2, 3, []byte("a")).Digest)
@@ -74,6 +77,7 @@ func TestAppliedEntryIdentityFramesTypeAndPayload(t *testing.T) {
 }
 
 func TestDeliverApplyIdentityCoversConfigurationEntryContext(t *testing.T) {
+	t.Parallel()
 	for _, entryType := range []raftpb.EntryType{raftpb.EntryConfChange, raftpb.EntryConfChangeV2} {
 		t.Run(entryType.String(), func(t *testing.T) {
 			payload := []byte("canonical committed configuration context")

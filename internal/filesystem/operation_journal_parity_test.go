@@ -8,6 +8,7 @@ import (
 )
 
 func TestOperationJournalAttemptIdentityParity(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name      string
 		attempt   [16]byte

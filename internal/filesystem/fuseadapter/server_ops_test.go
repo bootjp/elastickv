@@ -24,6 +24,7 @@ func newRawFileSystem(t *testing.T, core Core) (*RawFileSystem, *Adapter) {
 }
 
 func TestRawFileSystemStringReportsFilesystemName(t *testing.T) {
+	t.Parallel()
 	raw, _ := newRawFileSystem(t, &fakeCore{})
 	require.Equal(t, filesystemName, raw.String())
 	require.Equal(t, filesystemName, (*RawFileSystem)(nil).String())
@@ -32,6 +33,7 @@ func TestRawFileSystemStringReportsFilesystemName(t *testing.T) {
 }
 
 func TestRawFileSystemSetAttrTranslatesValidMask(t *testing.T) {
+	t.Parallel()
 	core := &fakeCore{setAttrStat: filesystem.Stat{
 		Inode: 7,
 		Type:  filesystem.TypeFile,
@@ -68,6 +70,7 @@ func TestRawFileSystemSetAttrTranslatesValidMask(t *testing.T) {
 }
 
 func TestRawFileSystemSetAttrSizeOnlyLeavesOtherMaskBitsClear(t *testing.T) {
+	t.Parallel()
 	core := &fakeCore{}
 	raw, _ := newRawFileSystem(t, core)
 
@@ -88,6 +91,7 @@ func TestRawFileSystemSetAttrSizeOnlyLeavesOtherMaskBitsClear(t *testing.T) {
 }
 
 func TestRawFileSystemGetAttrAndAccessMapErrors(t *testing.T) {
+	t.Parallel()
 	core := &fakeCore{stat: filesystem.Stat{Inode: 7, Type: filesystem.TypeDirectory, Mode: 0o755}}
 	raw, _ := newRawFileSystem(t, core)
 
@@ -102,6 +106,7 @@ func TestRawFileSystemGetAttrAndAccessMapErrors(t *testing.T) {
 }
 
 func TestRawFileSystemLookupMapsErrors(t *testing.T) {
+	t.Parallel()
 	core := &fakeCore{resolveErr: filesystem.ErrNotFound}
 	raw, _ := newRawFileSystem(t, core)
 
@@ -112,6 +117,7 @@ func TestRawFileSystemLookupMapsErrors(t *testing.T) {
 }
 
 func TestRawFileSystemMkdirMasksModeAndForwardsCaller(t *testing.T) {
+	t.Parallel()
 	core := &fakeCore{mkdirResult: filesystem.CreateResult{
 		Inode: 11,
 		Stat:  filesystem.Stat{Inode: 11, Generation: 1, Type: filesystem.TypeDirectory, Mode: 0o750, Nlink: 2},
@@ -139,6 +145,7 @@ func TestRawFileSystemMkdirMasksModeAndForwardsCaller(t *testing.T) {
 }
 
 func TestRawFileSystemMknodRejectsNonRegularNodes(t *testing.T) {
+	t.Parallel()
 	core := &fakeCore{}
 	raw, _ := newRawFileSystem(t, core)
 
@@ -161,6 +168,7 @@ func TestRawFileSystemMknodRejectsNonRegularNodes(t *testing.T) {
 }
 
 func TestRawFileSystemCreateMapsErrors(t *testing.T) {
+	t.Parallel()
 	core := &fakeCore{createErr: filesystem.ErrStaleHome}
 	raw, adapter := newRawFileSystem(t, core)
 
@@ -172,6 +180,7 @@ func TestRawFileSystemCreateMapsErrors(t *testing.T) {
 }
 
 func TestRawFileSystemCreateRevalidatesExistingFileWithoutExcl(t *testing.T) {
+	t.Parallel()
 	core := &fakeCore{
 		createErr:    filesystem.ErrExists,
 		resolveInode: 7,
@@ -194,6 +203,7 @@ func TestRawFileSystemCreateRevalidatesExistingFileWithoutExcl(t *testing.T) {
 }
 
 func TestRawFileSystemCreateDefersExistingTruncationToKernel(t *testing.T) {
+	t.Parallel()
 	core := &fakeCore{
 		createErr:    filesystem.ErrExists,
 		resolveInode: 7,
@@ -215,6 +225,7 @@ func TestRawFileSystemCreateDefersExistingTruncationToKernel(t *testing.T) {
 }
 
 func TestRawFileSystemCreateExclusiveExistingFileReturnsExists(t *testing.T) {
+	t.Parallel()
 	core := &fakeCore{createErr: filesystem.ErrExists, resolveInode: 7, openFH: 9}
 	raw, adapter := newRawFileSystem(t, core)
 
@@ -231,6 +242,7 @@ func TestRawFileSystemCreateExclusiveExistingFileReturnsExists(t *testing.T) {
 }
 
 func TestRawFileSystemCreateExistingDirectoryRevalidates(t *testing.T) {
+	t.Parallel()
 	core := &fakeCore{
 		createErr:    filesystem.ErrExists,
 		resolveInode: 7,
@@ -273,6 +285,7 @@ func (c *disappearingCreateCore) Create(
 }
 
 func TestRawFileSystemCreateDoesNotReplayAmbiguousWriteConflict(t *testing.T) {
+	t.Parallel()
 	for _, flags := range []uint32{syscall.O_RDWR | syscall.O_CREAT, syscall.O_RDWR | syscall.O_CREAT | syscall.O_EXCL} {
 		t.Run(fmt.Sprint(flags), func(t *testing.T) {
 			core := &disappearingCreateCore{
@@ -299,6 +312,7 @@ func TestRawFileSystemCreateDoesNotReplayAmbiguousWriteConflict(t *testing.T) {
 }
 
 func TestRawFileSystemCreateDefersVanishedEntryLookupToKernel(t *testing.T) {
+	t.Parallel()
 	core := &disappearingCreateCore{fakeCore: &fakeCore{
 		resolveErr: filesystem.ErrNotFound,
 		createResult: filesystem.CreateResult{
@@ -321,6 +335,7 @@ func TestRawFileSystemCreateDefersVanishedEntryLookupToKernel(t *testing.T) {
 }
 
 func TestRawFileSystemCreateDoesNotRetryCollisionInUserspace(t *testing.T) {
+	t.Parallel()
 	core := &disappearingCreateCore{
 		fakeCore:     &fakeCore{resolveErr: filesystem.ErrNotFound},
 		alwaysExists: true,
@@ -338,6 +353,7 @@ func TestRawFileSystemCreateDoesNotRetryCollisionInUserspace(t *testing.T) {
 }
 
 func TestRawFileSystemCreateCollisionDoesNotAllocateTruncateHandle(t *testing.T) {
+	t.Parallel()
 	core := &fakeCore{
 		createErr:    filesystem.ErrExists,
 		resolveInode: 7,
@@ -360,6 +376,7 @@ func TestRawFileSystemCreateCollisionDoesNotAllocateTruncateHandle(t *testing.T)
 }
 
 func TestRawFileSystemUnlinkAndRmdirForwardNames(t *testing.T) {
+	t.Parallel()
 	core := &fakeCore{}
 	raw, _ := newRawFileSystem(t, core)
 
@@ -378,6 +395,7 @@ func TestRawFileSystemUnlinkAndRmdirForwardNames(t *testing.T) {
 }
 
 func TestRawFileSystemRenameForwardsAndRejectsFlags(t *testing.T) {
+	t.Parallel()
 	core := &fakeCore{}
 	raw, _ := newRawFileSystem(t, core)
 
@@ -396,6 +414,7 @@ func TestRawFileSystemRenameForwardsAndRejectsFlags(t *testing.T) {
 }
 
 func TestRawFileSystemUnsupportedLinkOperations(t *testing.T) {
+	t.Parallel()
 	raw, _ := newRawFileSystem(t, &fakeCore{})
 
 	var out fuse.EntryOut
@@ -407,6 +426,7 @@ func TestRawFileSystemUnsupportedLinkOperations(t *testing.T) {
 }
 
 func TestRawFileSystemOpenTracksHandleAndMapsErrors(t *testing.T) {
+	t.Parallel()
 	core := &fakeCore{openFH: 9}
 	raw, adapter := newRawFileSystem(t, core)
 
@@ -422,6 +442,7 @@ func TestRawFileSystemOpenTracksHandleAndMapsErrors(t *testing.T) {
 }
 
 func TestRawFileSystemReadMapsErrors(t *testing.T) {
+	t.Parallel()
 	core := &fakeCore{readErr: filesystem.ErrNotFound}
 	raw, _ := newRawFileSystem(t, core)
 
@@ -433,6 +454,7 @@ func TestRawFileSystemReadMapsErrors(t *testing.T) {
 }
 
 func TestRawFileSystemWriteReturnsByteCount(t *testing.T) {
+	t.Parallel()
 	core := &fakeCore{}
 	raw, _ := newRawFileSystem(t, core)
 
@@ -447,6 +469,7 @@ func TestRawFileSystemWriteReturnsByteCount(t *testing.T) {
 }
 
 func TestRawFileSystemWriteMapsErrorsAndOverflow(t *testing.T) {
+	t.Parallel()
 	core := &fakeCore{writeErr: filesystem.ErrStaleHome}
 	raw, _ := newRawFileSystem(t, core)
 
@@ -471,6 +494,7 @@ func TestRawFileSystemWriteMapsErrorsAndOverflow(t *testing.T) {
 }
 
 func TestRawFileSystemFlushBackendCancellation(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name string
 		err  error
@@ -491,6 +515,7 @@ func TestRawFileSystemFlushBackendCancellation(t *testing.T) {
 }
 
 func TestRawFileSystemFlushAndFsyncForwardHandles(t *testing.T) {
+	t.Parallel()
 	core := &fakeCore{}
 	raw, _ := newRawFileSystem(t, core)
 
@@ -517,6 +542,7 @@ func TestRawFileSystemFlushAndFsyncForwardHandles(t *testing.T) {
 }
 
 func TestRawFileSystemReleaseUntracksHandleAndToleratesErrors(t *testing.T) {
+	t.Parallel()
 	core := &fakeCore{openFH: 9}
 	raw, adapter := newRawFileSystem(t, core)
 
@@ -533,6 +559,7 @@ func TestRawFileSystemReleaseUntracksHandleAndToleratesErrors(t *testing.T) {
 }
 
 func TestRawFileSystemOpenDirRejectsNonDirectories(t *testing.T) {
+	t.Parallel()
 	core := &fakeCore{stat: filesystem.Stat{Inode: 7, Type: filesystem.TypeFile}}
 	raw, _ := newRawFileSystem(t, core)
 
@@ -546,6 +573,7 @@ func TestRawFileSystemOpenDirRejectsNonDirectories(t *testing.T) {
 }
 
 func TestRawFileSystemReadDirRejectsUnknownOffsets(t *testing.T) {
+	t.Parallel()
 	core := &fakeCore{stat: filesystem.Stat{Inode: filesystem.RootInode, Type: filesystem.TypeDirectory}}
 	raw, _ := newRawFileSystem(t, core)
 
@@ -561,6 +589,7 @@ func TestRawFileSystemReadDirRejectsUnknownOffsets(t *testing.T) {
 }
 
 func TestRawFileSystemReadDirMapsBackendErrors(t *testing.T) {
+	t.Parallel()
 	core := &fakeCore{
 		stat:       filesystem.Stat{Inode: filesystem.RootInode, Type: filesystem.TypeDirectory},
 		readdirErr: filesystem.ErrNotDir,
@@ -578,6 +607,7 @@ func TestRawFileSystemReadDirMapsBackendErrors(t *testing.T) {
 }
 
 func TestRawFileSystemReadDirEmptyDirectoryBecomesTerminal(t *testing.T) {
+	t.Parallel()
 	core := &fakeCore{stat: filesystem.Stat{Inode: filesystem.RootInode, Type: filesystem.TypeDirectory}}
 	raw, _ := newRawFileSystem(t, core)
 
@@ -596,6 +626,7 @@ func TestRawFileSystemReadDirEmptyDirectoryBecomesTerminal(t *testing.T) {
 }
 
 func TestRawFileSystemReadDirResumesMidPageWhenBufferFills(t *testing.T) {
+	t.Parallel()
 	core := &pagedReaddirCore{fakeCore: &fakeCore{
 		stat: filesystem.Stat{Inode: filesystem.RootInode, Type: filesystem.TypeDirectory},
 	}}
@@ -624,6 +655,7 @@ func TestRawFileSystemReadDirResumesMidPageWhenBufferFills(t *testing.T) {
 }
 
 func TestAddDirEntriesRejectsSkipBeyondPage(t *testing.T) {
+	t.Parallel()
 	handle := &directoryHandle{positions: map[uint64]dirPosition{}}
 	status := addDirEntries(handle, 0, dirPosition{skip: 2}, filesystem.ReaddirResult{
 		Entries: []filesystem.Dirent{{Name: []byte("a"), Inode: 2}},
@@ -632,6 +664,7 @@ func TestAddDirEntriesRejectsSkipBeyondPage(t *testing.T) {
 }
 
 func TestAllocateDirHandleSkipsZeroOnWrap(t *testing.T) {
+	t.Parallel()
 	raw, _ := newRawFileSystem(t, &fakeCore{})
 	raw.nextDirFH = math.MaxUint64
 
@@ -644,6 +677,7 @@ func TestAllocateDirHandleSkipsZeroOnWrap(t *testing.T) {
 }
 
 func TestRequestContextCancelsWhenKernelInterrupts(t *testing.T) {
+	t.Parallel()
 	cancel := make(chan struct{})
 	ctx, done := requestContext(cancel)
 	defer done()
@@ -655,6 +689,7 @@ func TestRequestContextCancelsWhenKernelInterrupts(t *testing.T) {
 }
 
 func TestRequestContextWithoutCancelChannelEndsOnDone(t *testing.T) {
+	t.Parallel()
 	ctx, done := requestContext(nil)
 	require.NoError(t, ctx.Err())
 	done()
@@ -662,6 +697,7 @@ func TestRequestContextWithoutCancelChannelEndsOnDone(t *testing.T) {
 }
 
 func TestRawFileSystemPropagatesKernelInterruptToCore(t *testing.T) {
+	t.Parallel()
 	core := &blockingCore{fakeCore: &fakeCore{}, started: make(chan struct{})}
 	raw, _ := newRawFileSystem(t, core)
 
@@ -678,6 +714,7 @@ func TestRawFileSystemPropagatesKernelInterruptToCore(t *testing.T) {
 }
 
 func TestFuseAttrClampsNegativeTimestamps(t *testing.T) {
+	t.Parallel()
 	attr := fuseAttr(filesystem.Stat{
 		Inode:     7,
 		Type:      filesystem.TypeFile,
@@ -698,6 +735,7 @@ func TestFuseAttrClampsNegativeTimestamps(t *testing.T) {
 }
 
 func TestStatFsFallsBackToDefaultBlockSize(t *testing.T) {
+	t.Parallel()
 	core := &fakeCore{statFS: filesystem.StatFS{ChunkSize: math.MaxUint32 + 1, Capacity: 8192, Free: 4096}}
 	raw, _ := newRawFileSystem(t, core)
 
@@ -715,6 +753,7 @@ func TestStatFsFallsBackToDefaultBlockSize(t *testing.T) {
 }
 
 func TestDivideRoundUpAndSaturatingAdd(t *testing.T) {
+	t.Parallel()
 	require.Zero(t, divideRoundUp(0, 4))
 	require.Zero(t, divideRoundUp(4, 0))
 	require.EqualValues(t, 1, divideRoundUp(1, 4))
@@ -725,6 +764,8 @@ func TestDivideRoundUpAndSaturatingAdd(t *testing.T) {
 }
 
 func TestMountRejectsInvalidInputs(t *testing.T) {
+	// Not parallel: it reaches a real FUSE kernel mount. Concurrent mounts
+	// hung the race shard on Linux CI past the 30m test timeout.
 	_, err := Mount("/nonexistent", nil, nil)
 	require.ErrorContains(t, err, "adapter is required")
 
@@ -756,6 +797,8 @@ func (c *recoveringCore) RecoverIntents(context.Context, int) (filesystem.Recove
 }
 
 func TestMountFailsWhenStartupRecoveryFails(t *testing.T) {
+	// Not parallel: it reaches a real FUSE kernel mount. Concurrent mounts
+	// hung the race shard on Linux CI past the 30m test timeout.
 	core := &recoveringCore{fakeCore: &fakeCore{}, err: errors.New("recovery boom")}
 	adapter := New(core, []byte("mount-a"), WithHandleKeepaliveInterval(0))
 	t.Cleanup(adapter.Close)
@@ -766,12 +809,14 @@ func TestMountFailsWhenStartupRecoveryFails(t *testing.T) {
 }
 
 func TestRecoverIntentsBeforeMountPropagatesErrors(t *testing.T) {
+	t.Parallel()
 	core := &recoveringCore{fakeCore: &fakeCore{}, err: errors.New("recovery boom")}
 	err := recoverIntentsBeforeMount(context.Background(), core)
 	require.ErrorContains(t, err, "drain filesystem recovery batch")
 }
 
 func TestDefaultMountOptionsKeepsExistingPermissionOption(t *testing.T) {
+	t.Parallel()
 	opts := defaultMountOptions(&fuse.MountOptions{
 		FsName:  "custom",
 		Name:    "custom-name",
@@ -787,6 +832,7 @@ func TestDefaultMountOptionsKeepsExistingPermissionOption(t *testing.T) {
 }
 
 func TestServerMethodsAreNilSafe(t *testing.T) {
+	t.Parallel()
 	var server *Server
 	server.Serve()
 	server.Wait()

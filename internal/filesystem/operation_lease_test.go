@@ -10,6 +10,7 @@ import (
 )
 
 func TestValidateOpenHandleLeaseDoesNotRenewExpiredHandle(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	now := time.Unix(100, 0)
 	svc := newTestServiceWithOptions(t, []uint64{2, 3},
@@ -28,6 +29,7 @@ func TestValidateOpenHandleLeaseDoesNotRenewExpiredHandle(t *testing.T) {
 }
 
 func TestLeaseOperationCannotResurrectReleasedHandle(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, []uint64{2, 3})
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))

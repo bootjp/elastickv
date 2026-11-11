@@ -11,6 +11,7 @@ import (
 )
 
 func TestRaftMemberReplaceScriptCompletesFencedLearnerLifecycle(t *testing.T) {
+	t.Parallel()
 	repoRoot, err := os.Getwd()
 	require.NoError(t, err)
 	stateDir := t.TempDir()
@@ -102,6 +103,7 @@ func TestRaftMemberReplaceScriptCompletesFencedLearnerLifecycle(t *testing.T) {
 }
 
 func TestRaftMemberReplaceScriptStopsProcessAfterExternalFence(t *testing.T) {
+	t.Parallel()
 	repoRoot, err := os.Getwd()
 	require.NoError(t, err)
 	stateDir := t.TempDir()
@@ -139,6 +141,7 @@ func TestRaftMemberReplaceScriptStopsProcessAfterExternalFence(t *testing.T) {
 }
 
 func TestRaftMemberReplaceScriptValidatesReportedLeader(t *testing.T) {
+	t.Parallel()
 	repoRoot, err := os.Getwd()
 	require.NoError(t, err)
 	stateDir := t.TempDir()
@@ -174,6 +177,7 @@ func TestRaftMemberReplaceScriptValidatesReportedLeader(t *testing.T) {
 }
 
 func TestRaftMemberReplaceScriptAdoptsConfigIndexAfterLeadershipTransfer(t *testing.T) {
+	t.Parallel()
 	repoRoot, err := os.Getwd()
 	require.NoError(t, err)
 	stateDir := t.TempDir()
@@ -213,6 +217,7 @@ func TestRaftMemberReplaceScriptAdoptsConfigIndexAfterLeadershipTransfer(t *test
 }
 
 func TestRaftMemberReplaceScriptRequiresInvocationControls(t *testing.T) {
+	t.Parallel()
 	repoRoot, err := os.Getwd()
 	require.NoError(t, err)
 	stateDir := t.TempDir()
@@ -238,6 +243,7 @@ func TestRaftMemberReplaceScriptRequiresInvocationControls(t *testing.T) {
 }
 
 func TestRaftMemberReplaceScriptRejectsConfigChangeAfterPreflight(t *testing.T) {
+	t.Parallel()
 	repoRoot, err := os.Getwd()
 	require.NoError(t, err)
 	stateDir := t.TempDir()
@@ -277,6 +283,7 @@ func TestRaftMemberReplaceScriptRejectsConfigChangeAfterPreflight(t *testing.T) 
 }
 
 func TestRaftMemberReplaceScriptRejectsInsufficientSurvivingQuorum(t *testing.T) {
+	t.Parallel()
 	repoRoot, err := os.Getwd()
 	require.NoError(t, err)
 	stateDir := t.TempDir()
@@ -313,6 +320,7 @@ func TestRaftMemberReplaceScriptRejectsInsufficientSurvivingQuorum(t *testing.T)
 }
 
 func TestRaftMemberReplaceScriptResumesAfterLearnerCommitResponseLoss(t *testing.T) {
+	t.Parallel()
 	repoRoot, err := os.Getwd()
 	require.NoError(t, err)
 	stateDir := t.TempDir()
@@ -393,6 +401,7 @@ func TestRaftMemberReplaceScriptResumesAfterLearnerCommitResponseLoss(t *testing
 }
 
 func TestRaftMemberReplaceScriptResumesAfterJoinRolloutResponseLoss(t *testing.T) {
+	t.Parallel()
 	repoRoot, err := os.Getwd()
 	require.NoError(t, err)
 	stateDir := t.TempDir()
@@ -440,6 +449,7 @@ func TestRaftMemberReplaceScriptResumesAfterJoinRolloutResponseLoss(t *testing.T
 }
 
 func TestRaftMemberReplaceScriptDoesNotRemoveAnotherProcessLock(t *testing.T) {
+	t.Parallel()
 	repoRoot, err := os.Getwd()
 	require.NoError(t, err)
 	stateDir := t.TempDir()

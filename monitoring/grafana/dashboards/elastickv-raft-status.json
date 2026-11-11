@@ -64,7 +64,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max by (group) (elastickv_raft_term{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
+          "expr": "max by (group) (elastickv_raft_term{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"})",
           "legendFormat": "{{group}}",
           "refId": "A",
           "instant": true
@@ -116,7 +116,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max by (group) (elastickv_raft_members{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
+          "expr": "max by (group) (elastickv_raft_members{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"})",
           "legendFormat": "{{group}}",
           "refId": "A",
           "instant": true
@@ -176,7 +176,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max by (group) (elastickv_raft_last_contact_seconds{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
+          "expr": "max by (group) (elastickv_raft_last_contact_seconds{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"})",
           "legendFormat": "{{group}}",
           "refId": "A",
           "instant": true
@@ -236,7 +236,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max by (group) (elastickv_raft_commit_index{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"} - on(group, node_id, node_address) elastickv_raft_applied_index{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
+          "expr": "max by (group) (elastickv_raft_commit_index{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"} - on(job, cluster, group, node_id, node_address) elastickv_raft_applied_index{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"})",
           "legendFormat": "{{group}}",
           "refId": "A",
           "instant": true
@@ -273,7 +273,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max by (group, leader_id, leader_address) (elastickv_raft_leader_identity{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
+          "expr": "max by (group, leader_id, leader_address) (elastickv_raft_leader_identity{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"})",
           "format": "table",
           "instant": true,
           "refId": "A"
@@ -281,7 +281,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "count by (group, leader_id, leader_address) (elastickv_raft_leader_identity{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
+          "expr": "count by (group, leader_id, leader_address) (elastickv_raft_leader_identity{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"})",
           "format": "table",
           "instant": true,
           "refId": "B"
@@ -351,7 +351,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max by (group, node_id, node_address, state) (elastickv_raft_local_state{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"} == 1)",
+          "expr": "max by (group, node_id, node_address, state) (elastickv_raft_local_state{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"} == 1)",
           "format": "table",
           "instant": true,
           "refId": "A"
@@ -448,7 +448,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max by (group, member_id, member_address, suffrage) (elastickv_raft_member_present{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
+          "expr": "max by (group, member_id, member_address, suffrage) (elastickv_raft_member_present{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"})",
           "format": "table",
           "instant": true,
           "refId": "A"
@@ -456,7 +456,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max by (group, member_id, member_address) (elastickv_raft_member_is_leader{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
+          "expr": "max by (group, member_id, member_address) (elastickv_raft_member_is_leader{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"})",
           "format": "table",
           "instant": true,
           "refId": "B"
@@ -551,7 +551,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max by (group, node_id, node_address, state) (elastickv_raft_local_state{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"} == 1)",
+          "expr": "max by (group, node_id, node_address, state) (elastickv_raft_local_state{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"} == 1)",
           "format": "table",
           "instant": true,
           "refId": "A"
@@ -559,7 +559,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max by (group, node_id, node_address) (elastickv_raft_last_log_index{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
+          "expr": "max by (group, node_id, node_address) (elastickv_raft_last_log_index{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"})",
           "format": "table",
           "instant": true,
           "refId": "B"
@@ -567,7 +567,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max by (group, node_id, node_address) (elastickv_raft_commit_index{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
+          "expr": "max by (group, node_id, node_address) (elastickv_raft_commit_index{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"})",
           "format": "table",
           "instant": true,
           "refId": "C"
@@ -575,7 +575,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max by (group, node_id, node_address) (elastickv_raft_applied_index{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
+          "expr": "max by (group, node_id, node_address) (elastickv_raft_applied_index{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"})",
           "format": "table",
           "instant": true,
           "refId": "D"
@@ -583,7 +583,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max by (group, node_id, node_address) (elastickv_raft_last_snapshot_index{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
+          "expr": "max by (group, node_id, node_address) (elastickv_raft_last_snapshot_index{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"})",
           "format": "table",
           "instant": true,
           "refId": "E"
@@ -591,7 +591,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max by (group, node_id, node_address) (elastickv_raft_last_log_index{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"} - on(group, node_id, node_address) elastickv_raft_applied_index{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
+          "expr": "max by (group, node_id, node_address) (elastickv_raft_last_log_index{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"} - on(job, cluster, group, node_id, node_address) elastickv_raft_applied_index{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"})",
           "format": "table",
           "instant": true,
           "refId": "F"
@@ -599,7 +599,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max by (group, node_id, node_address) (elastickv_raft_commit_index{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"} - on(group, node_id, node_address) elastickv_raft_applied_index{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
+          "expr": "max by (group, node_id, node_address) (elastickv_raft_commit_index{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"} - on(job, cluster, group, node_id, node_address) elastickv_raft_applied_index{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"})",
           "format": "table",
           "instant": true,
           "refId": "G"
@@ -607,7 +607,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max by (group, node_id, node_address) (elastickv_raft_last_contact_seconds{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
+          "expr": "max by (group, node_id, node_address) (elastickv_raft_last_contact_seconds{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"})",
           "format": "table",
           "instant": true,
           "refId": "H"
@@ -615,7 +615,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max by (group, node_id, node_address) (elastickv_raft_fsm_pending{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
+          "expr": "max by (group, node_id, node_address) (elastickv_raft_fsm_pending{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"})",
           "format": "table",
           "instant": true,
           "refId": "I"
@@ -713,7 +713,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max by (group, node_id, node_address) (elastickv_raft_last_log_index{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
+          "expr": "max by (group, node_id, node_address) (elastickv_raft_last_log_index{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"})",
           "legendFormat": "last_log g{{group}} {{node_id}}",
           "range": true,
           "refId": "A"
@@ -721,7 +721,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max by (group, node_id, node_address) (elastickv_raft_commit_index{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
+          "expr": "max by (group, node_id, node_address) (elastickv_raft_commit_index{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"})",
           "legendFormat": "commit g{{group}} {{node_id}}",
           "range": true,
           "refId": "B"
@@ -729,7 +729,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max by (group, node_id, node_address) (elastickv_raft_applied_index{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
+          "expr": "max by (group, node_id, node_address) (elastickv_raft_applied_index{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"})",
           "legendFormat": "applied g{{group}} {{node_id}}",
           "range": true,
           "refId": "C"
@@ -737,7 +737,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max by (group, node_id, node_address) (elastickv_raft_last_snapshot_index{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
+          "expr": "max by (group, node_id, node_address) (elastickv_raft_last_snapshot_index{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"})",
           "legendFormat": "snapshot g{{group}} {{node_id}}",
           "range": true,
           "refId": "D"
@@ -786,7 +786,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max by (group, node_id, node_address) (elastickv_raft_last_log_index{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"} - on(group, node_id, node_address) elastickv_raft_applied_index{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
+          "expr": "max by (group, node_id, node_address) (elastickv_raft_last_log_index{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"} - on(job, cluster, group, node_id, node_address) elastickv_raft_applied_index{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"})",
           "legendFormat": "g{{group}} {{node_id}}",
           "range": true,
           "refId": "A"
@@ -835,7 +835,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max by (group, node_id, node_address) (elastickv_raft_commit_index{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"} - on(group, node_id, node_address) elastickv_raft_applied_index{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
+          "expr": "max by (group, node_id, node_address) (elastickv_raft_commit_index{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"} - on(job, cluster, group, node_id, node_address) elastickv_raft_applied_index{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"})",
           "legendFormat": "g{{group}} {{node_id}}",
           "range": true,
           "refId": "A"
@@ -884,7 +884,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max by (group, node_id, node_address) (elastickv_raft_last_contact_seconds{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
+          "expr": "max by (group, node_id, node_address) (elastickv_raft_last_contact_seconds{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"})",
           "legendFormat": "g{{group}} {{node_id}}",
           "range": true,
           "refId": "A"
@@ -933,7 +933,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max by (group, node_id, node_address) (elastickv_raft_fsm_pending{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"})",
+          "expr": "max by (group, node_id, node_address) (elastickv_raft_fsm_pending{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"})",
           "legendFormat": "g{{group}} {{node_id}}",
           "range": true,
           "refId": "A"
@@ -997,7 +997,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max by (group) (increase(elastickv_raft_leader_changes_seen_total{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"}[24h]))",
+          "expr": "max by (group) (increase(elastickv_raft_leader_changes_seen_total{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"}[24h]))",
           "instant": true,
           "legendFormat": "{{group}}",
           "refId": "A"
@@ -1060,7 +1060,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "sum by (group) (increase(elastickv_raft_proposals_failed_total{job=\"elastickv\",group=~\"$group\",node_id=~\"$node_id\"}[15m]))",
+          "expr": "sum by (group) (increase(elastickv_raft_proposals_failed_total{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\",node_id=~\"$node_id\"}[15m]))",
           "instant": true,
           "legendFormat": "{{group}}",
           "refId": "A"
@@ -1120,7 +1120,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max(elastickv_hlc_wall_skew_seconds{job=\"elastickv\",node_id=~\"$node_id\"} and elastickv_hlc_physical_ceiling_seconds{job=\"elastickv\",node_id=~\"$node_id\"} > 0)",
+          "expr": "max(elastickv_hlc_wall_skew_seconds{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\"} and elastickv_hlc_physical_ceiling_seconds{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\"} > 0)",
           "refId": "A",
           "instant": true
         }
@@ -1175,7 +1175,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "sum(increase(elastickv_hlc_next_fenced_rejections_total{job=\"elastickv\",node_id=~\"$node_id\"}[24h]))",
+          "expr": "sum(increase(elastickv_hlc_next_fenced_rejections_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\"}[24h]))",
           "refId": "A",
           "instant": true
         }
@@ -1230,7 +1230,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "max(time() - elastickv_hlc_physical_ceiling_seconds{job=\"elastickv\",node_id=~\"$node_id\"} and elastickv_hlc_physical_ceiling_seconds{job=\"elastickv\",node_id=~\"$node_id\"} > 0)",
+          "expr": "max(time() - elastickv_hlc_physical_ceiling_seconds{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\"} and elastickv_hlc_physical_ceiling_seconds{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\"} > 0)",
           "refId": "A",
           "instant": true
         }
@@ -1298,7 +1298,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "elastickv_hlc_wall_skew_seconds{job=\"elastickv\",node_id=~\"$node_id\"}",
+          "expr": "elastickv_hlc_wall_skew_seconds{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\"}",
           "legendFormat": "{{node_id}}",
           "range": true,
           "refId": "A"
@@ -1347,7 +1347,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "rate(elastickv_hlc_next_fenced_rejections_total{job=\"elastickv\",node_id=~\"$node_id\"}[5m])",
+          "expr": "rate(elastickv_hlc_next_fenced_rejections_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\"}[5m])",
           "legendFormat": "{{node_id}}",
           "range": true,
           "refId": "A"
@@ -1368,21 +1368,55 @@
   "templating": {
     "list": [
       {
-        "current": {
-          "selected": false,
-          "text": "default",
-          "value": "default"
-        },
-        "hide": 0,
-        "includeAll": false,
-        "label": "Datasource",
-        "multi": false,
         "name": "datasource",
-        "options": [],
+        "label": "Datasource",
+        "type": "datasource",
         "query": "prometheus",
         "refresh": 1,
-        "regex": "",
-        "type": "datasource"
+        "current": {},
+        "options": []
+      },
+      {
+        "name": "job",
+        "label": "Job",
+        "type": "query",
+        "datasource": "$datasource",
+        "query": {
+          "query": "label_values({__name__=~\"elastickv_.+\"}, job)",
+          "refId": "variable-job"
+        },
+        "definition": "label_values({__name__=~\"elastickv_.+\"}, job)",
+        "refresh": 2,
+        "sort": 1,
+        "multi": false,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "options": []
+      },
+      {
+        "name": "cluster",
+        "label": "Cluster",
+        "type": "query",
+        "datasource": "$datasource",
+        "query": {
+          "query": "label_values({__name__=~\"elastickv_.+\",job=~\"$job\"}, cluster)",
+          "refId": "variable-cluster"
+        },
+        "definition": "label_values({__name__=~\"elastickv_.+\",job=~\"$job\"}, cluster)",
+        "refresh": 2,
+        "sort": 1,
+        "multi": false,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "options": []
       },
       {
         "allValue": ".*",
@@ -1392,7 +1426,7 @@
           "value": "$__all"
         },
         "datasource": "$datasource",
-        "definition": "label_values(elastickv_raft_term{job=\"elastickv\"}, group)",
+        "definition": "label_values(elastickv_raft_term{job=~\"$job\",cluster=~\"$cluster\"}, group)",
         "includeAll": true,
         "label": "Raft Group",
         "multi": true,
@@ -1400,7 +1434,7 @@
         "options": [],
         "query": {
           "qryType": 1,
-          "query": "label_values(elastickv_raft_term{job=\"elastickv\"}, group)",
+          "query": "label_values(elastickv_raft_term{job=~\"$job\",cluster=~\"$cluster\"}, group)",
           "refId": "PrometheusVariableQueryEditor-VariableQuery"
         },
         "refresh": 2,
@@ -1416,7 +1450,7 @@
           "value": "$__all"
         },
         "datasource": "$datasource",
-        "definition": "label_values(elastickv_raft_local_state{job=\"elastickv\",group=~\"$group\"}, node_id)",
+        "definition": "label_values(elastickv_raft_local_state{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\"}, node_id)",
         "includeAll": true,
         "label": "Node ID",
         "multi": true,
@@ -1424,7 +1458,7 @@
         "options": [],
         "query": {
           "qryType": 1,
-          "query": "label_values(elastickv_raft_local_state{job=\"elastickv\",group=~\"$group\"}, node_id)",
+          "query": "label_values(elastickv_raft_local_state{job=~\"$job\",cluster=~\"$cluster\",group=~\"$group\"}, node_id)",
           "refId": "PrometheusVariableQueryEditor-VariableQuery"
         },
         "refresh": 2,

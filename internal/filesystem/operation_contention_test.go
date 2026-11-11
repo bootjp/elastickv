@@ -31,6 +31,7 @@ func (d *operationMetadataConflictDispatcher) Dispatch(ctx context.Context, req 
 }
 
 func TestOperationMetadataConflictsDoNotReportQuota(t *testing.T) {
+	t.Parallel()
 	ctx := t.Context()
 	svc := newTestServiceWithOptions(t, []uint64{2})
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -83,6 +84,7 @@ func (d *operationPublicationConflictDispatcher) Dispatch(ctx context.Context, r
 }
 
 func TestHandleContentionIsTerminalAndReplayable(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		run  func(*Service, context.Context, OperationID, uint64, uint64, []byte) error
@@ -120,6 +122,7 @@ func TestHandleContentionIsTerminalAndReplayable(t *testing.T) {
 }
 
 func TestOperationContentionResultsRemainTyped(t *testing.T) {
+	t.Parallel()
 	createResult, err := json.Marshal(createOperationResult{Version: createOperationVersion, Error: createResultContention})
 	require.NoError(t, err)
 	openResult, err := json.Marshal(openOperationResult{Version: openOperationVersion, Error: openResultContention})

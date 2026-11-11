@@ -160,6 +160,7 @@ func (s *countingSnapshotStateMachine) Restore(r io.Reader) error {
 // else the migration would visibly change semantics before
 // 6E-2d's protective barrier is in place.
 func TestProposeAdmin_EquivalentToProposeToday(t *testing.T) {
+	t.Parallel()
 	fsm := &testStateMachine{}
 	engine, err := Open(context.Background(), OpenConfig{
 		NodeID:       1,
@@ -208,6 +209,7 @@ func TestProposeAdmin_EquivalentToProposeToday(t *testing.T) {
 var _ raftengine.Proposer = (*Engine)(nil)
 
 func TestInboundQueueCapacityScalesSmallInflight(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name        string
 		peerCount   int
@@ -248,6 +250,7 @@ func TestInboundQueueCapacityScalesSmallInflight(t *testing.T) {
 }
 
 func TestOpenConfigMaxInflightSizesInboundQueues(t *testing.T) {
+	t.Parallel()
 	fsm := &testStateMachine{}
 	const maxInflight = 17
 
@@ -270,6 +273,7 @@ func TestOpenConfigMaxInflightSizesInboundQueues(t *testing.T) {
 }
 
 func TestOpenSingleNodeProposeAndReadIndex(t *testing.T) {
+	t.Parallel()
 	fsm := &testStateMachine{}
 	engine, err := Open(context.Background(), OpenConfig{
 		NodeID:       1,
@@ -315,6 +319,7 @@ func TestOpenSingleNodeProposeAndReadIndex(t *testing.T) {
 }
 
 func TestOpenSingleNodeRestartsFromPersistedLog(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 
 	firstFSM := &testStateMachine{}
@@ -360,6 +365,7 @@ func TestOpenSingleNodeRestartsFromPersistedLog(t *testing.T) {
 }
 
 func TestOpenInitializesAppliedIndexFromPersistedSnapshot(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	state := persistedState{
 		HardState: testHardState(1, 5),
@@ -389,6 +395,7 @@ func TestOpenInitializesAppliedIndexFromPersistedSnapshot(t *testing.T) {
 }
 
 func TestOpenRestoresPeersFromPersistedMetadata(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	peers := []Peer{
 		{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
@@ -435,6 +442,7 @@ func TestOpenRestoresPeersFromPersistedMetadata(t *testing.T) {
 }
 
 func TestOpenRestoresPlaceholderPersistedPeerMetadata(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	require.NoError(t, writeCurrentPersistedPeers(dir, 7, []Peer{
 		{NodeID: 1, ID: "1"},
@@ -463,6 +471,7 @@ func TestOpenRestoresPlaceholderPersistedPeerMetadata(t *testing.T) {
 }
 
 func TestVerifyLeaderUsesReadIndexPath(t *testing.T) {
+	t.Parallel()
 	engine := &Engine{
 		readCh: make(chan readRequest, 1),
 		doneCh: make(chan struct{}),
@@ -482,6 +491,7 @@ func TestVerifyLeaderUsesReadIndexPath(t *testing.T) {
 }
 
 func TestCancelPendingRequestsRemoveEntries(t *testing.T) {
+	t.Parallel()
 	engine := &Engine{
 		pendingProposals: map[uint64]proposalRequest{
 			1: {id: 1, done: make(chan proposalResult, 1)},
@@ -499,6 +509,7 @@ func TestCancelPendingRequestsRemoveEntries(t *testing.T) {
 }
 
 func TestHandleTransportMessageWaitsForStartup(t *testing.T) {
+	t.Parallel()
 	engine := &Engine{
 		startedCh: make(chan struct{}),
 		doneCh:    make(chan struct{}),
@@ -521,6 +532,7 @@ func TestHandleTransportMessageWaitsForStartup(t *testing.T) {
 }
 
 func TestEnqueueStepBestEffortReturnsQueueFull(t *testing.T) {
+	t.Parallel()
 	engine := &Engine{
 		doneCh: make(chan struct{}),
 		stepCh: make(chan raftpb.Message, 1),
@@ -544,6 +556,7 @@ func TestEnqueueStepBestEffortReturnsQueueFull(t *testing.T) {
 }
 
 func TestEnqueueStepMsgAppWaitsForQueueSlot(t *testing.T) {
+	t.Parallel()
 	engine := &Engine{
 		doneCh: make(chan struct{}),
 		stepCh: make(chan raftpb.Message, 1),
@@ -575,6 +588,7 @@ func TestEnqueueStepMsgAppWaitsForQueueSlot(t *testing.T) {
 }
 
 func TestEnqueueStepMsgAppReturnsContextDeadlineWhenQueueStaysFull(t *testing.T) {
+	t.Parallel()
 	engine := &Engine{
 		doneCh: make(chan struct{}),
 		stepCh: make(chan raftpb.Message, 1),
@@ -590,6 +604,7 @@ func TestEnqueueStepMsgAppReturnsContextDeadlineWhenQueueStaysFull(t *testing.T)
 }
 
 func TestEnqueueStepPriorityBypassesFullBulkQueue(t *testing.T) {
+	t.Parallel()
 	engine := &Engine{
 		doneCh:         make(chan struct{}),
 		stepCh:         make(chan raftpb.Message, 1),
@@ -617,6 +632,7 @@ func TestEnqueueStepPriorityBypassesFullBulkQueue(t *testing.T) {
 }
 
 func TestEnqueueStepSnapshotBypassesFullBulkQueue(t *testing.T) {
+	t.Parallel()
 	engine := &Engine{
 		doneCh:         make(chan struct{}),
 		stepCh:         make(chan raftpb.Message, 1),
@@ -639,6 +655,7 @@ func TestEnqueueStepSnapshotBypassesFullBulkQueue(t *testing.T) {
 }
 
 func TestHandleEventDrainsPriorityStepBeforeBulkStep(t *testing.T) {
+	t.Parallel()
 	engine := &Engine{
 		closeCh:          make(chan struct{}),
 		proposeCh:        make(chan proposalRequest),
@@ -663,6 +680,7 @@ func TestHandleEventDrainsPriorityStepBeforeBulkStep(t *testing.T) {
 }
 
 func TestTryHandlePriorityStepYieldsAfterBurstLimit(t *testing.T) {
+	t.Parallel()
 	engine := &Engine{
 		priorityStepCh:    make(chan raftpb.Message, 1),
 		priorityStepBurst: priorityStepBurstLimit,
@@ -679,6 +697,7 @@ func TestTryHandlePriorityStepYieldsAfterBurstLimit(t *testing.T) {
 }
 
 func TestHandleStepIgnoresPeerNotFoundResponses(t *testing.T) {
+	t.Parallel()
 	engine := &Engine{
 		rawNode: mustRawNode(t, etcdraft.NewMemoryStorage(), 1),
 	}
@@ -694,6 +713,7 @@ func TestHandleStepIgnoresPeerNotFoundResponses(t *testing.T) {
 }
 
 func TestHandleStepUnprotectsSnapshotTokenWhenCommittedAlreadyCoversIt(t *testing.T) {
+	t.Parallel()
 	storage := etcdraft.NewMemoryStorage()
 	snap := raftTestSnapshot(10, 1, []uint64{1}, nil)
 	require.NoError(t, storage.ApplySnapshot(&snap))
@@ -720,6 +740,7 @@ func TestHandleStepUnprotectsSnapshotTokenWhenCommittedAlreadyCoversIt(t *testin
 }
 
 func TestHandleStepKeepsAcceptedSnapshotTokenProtectedUntilReady(t *testing.T) {
+	t.Parallel()
 	storage := etcdraft.NewMemoryStorage()
 	snap := raftTestSnapshot(10, 1, []uint64{1}, nil)
 	require.NoError(t, storage.ApplySnapshot(&snap))
@@ -747,6 +768,7 @@ func TestHandleStepKeepsAcceptedSnapshotTokenProtectedUntilReady(t *testing.T) {
 }
 
 func TestApplyReadySnapshotAdvancesAppliedIndex(t *testing.T) {
+	t.Parallel()
 	engine := &Engine{
 		storage: etcdraft.NewMemoryStorage(),
 		fsm:     &testStateMachine{},
@@ -770,6 +792,7 @@ func TestApplyReadySnapshotAdvancesAppliedIndex(t *testing.T) {
 }
 
 func TestApplyReadySnapshotRejectsMissingPeerAddressBeforeRestore(t *testing.T) {
+	t.Parallel()
 	storage := etcdraft.NewMemoryStorage()
 	fsm := &testStateMachine{}
 	engine := &Engine{
@@ -794,6 +817,7 @@ func TestApplyReadySnapshotRejectsMissingPeerAddressBeforeRestore(t *testing.T) 
 }
 
 func TestSendMessagesDoesNotBlockWhenDispatchQueueIsFull(t *testing.T) {
+	t.Parallel()
 	hbCh := make(chan dispatchRequest, 1)
 	hbCh <- dispatchRequest{msg: raftpb.Message{Type: messageTypePtr(raftpb.MsgHeartbeat), To: uint64Ptr(2)}}
 	engine := &Engine{
@@ -821,6 +845,7 @@ func TestSendMessagesDoesNotBlockWhenDispatchQueueIsFull(t *testing.T) {
 }
 
 func TestReportFailedDispatchReliablyQueuesMsgSnapFailure(t *testing.T) {
+	t.Parallel()
 	engine := &Engine{
 		dispatchReportCh: make(chan dispatchReport, 1),
 		closeCh:          make(chan struct{}),
@@ -847,6 +872,7 @@ func TestReportFailedDispatchReliablyQueuesMsgSnapFailure(t *testing.T) {
 }
 
 func TestReportDroppedDispatchDefersMsgSnapUntilReadyAdvanced(t *testing.T) {
+	t.Parallel()
 	engine := &Engine{
 		dispatchReportCh: make(chan dispatchReport, 1),
 		closeCh:          make(chan struct{}),
@@ -869,6 +895,7 @@ func TestReportDroppedDispatchDefersMsgSnapUntilReadyAdvanced(t *testing.T) {
 }
 
 func TestStopDispatchWorkersCancelsInflightDispatch(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	engine := &Engine{
@@ -907,6 +934,7 @@ func TestStopDispatchWorkersCancelsInflightDispatch(t *testing.T) {
 }
 
 func TestUpsertPeerStartsDispatcherAndAcceptsMessages(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	dispatched := make(chan raftpb.Message, 1)
@@ -946,6 +974,7 @@ func TestUpsertPeerStartsDispatcherAndAcceptsMessages(t *testing.T) {
 }
 
 func TestRemovePeerClosesDispatcherAndDropsSubsequentMessages(t *testing.T) {
+	t.Parallel()
 	stopCh := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
 	pd := &peerQueues{
@@ -985,6 +1014,7 @@ func TestRemovePeerClosesDispatcherAndDropsSubsequentMessages(t *testing.T) {
 }
 
 func TestMaybePersistLocalSnapshotSkipsSmallAdvance(t *testing.T) {
+	t.Parallel()
 	storage := etcdraft.NewMemoryStorage()
 	snap := raftTestSnapshot(1, 1, []uint64{1}, nil)
 	require.NoError(t, storage.ApplySnapshot(&snap))
@@ -1002,6 +1032,7 @@ func TestMaybePersistLocalSnapshotSkipsSmallAdvance(t *testing.T) {
 }
 
 func TestMaybePersistLocalSnapshotRunsInBackground(t *testing.T) {
+	t.Parallel()
 	storage := etcdraft.NewMemoryStorage()
 	snap := raftTestSnapshot(1, 1, []uint64{1}, nil)
 	require.NoError(t, storage.ApplySnapshot(&snap))
@@ -1064,6 +1095,7 @@ func TestMaybePersistLocalSnapshotRunsInBackground(t *testing.T) {
 }
 
 func TestMaybePersistLocalSnapshotReturnsWhenWorkerIsStopped(t *testing.T) {
+	t.Parallel()
 	storage := etcdraft.NewMemoryStorage()
 	snap := raftTestSnapshot(1, 1, []uint64{1}, nil)
 	require.NoError(t, storage.ApplySnapshot(&snap))
@@ -1102,6 +1134,7 @@ func TestMaybePersistLocalSnapshotReturnsWhenWorkerIsStopped(t *testing.T) {
 }
 
 func TestPersistConfigStateSkipsSerializationWhenNewerSnapshotExists(t *testing.T) {
+	t.Parallel()
 	storage := etcdraft.NewMemoryStorage()
 	snap := raftTestSnapshot(9, 2, []uint64{1, 2}, []byte("newer"))
 	require.NoError(t, storage.ApplySnapshot(&snap))
@@ -1125,6 +1158,7 @@ func TestPersistConfigStateSkipsSerializationWhenNewerSnapshotExists(t *testing.
 }
 
 func TestPersistConfigStateDoesNotCompactLogs(t *testing.T) {
+	t.Parallel()
 	storage := etcdraft.NewMemoryStorage()
 	snap := raftTestSnapshot(1, 1, []uint64{1}, nil)
 	require.NoError(t, storage.ApplySnapshot(&snap))
@@ -1152,6 +1186,7 @@ func TestPersistConfigStateDoesNotCompactLogs(t *testing.T) {
 }
 
 func TestPersistConfigStateWaitsForDurablePublication(t *testing.T) {
+	t.Parallel()
 	storage := etcdraft.NewMemoryStorage()
 	snap := raftTestSnapshot(1, 1, []uint64{1}, nil)
 	require.NoError(t, storage.ApplySnapshot(&snap))
@@ -1216,6 +1251,7 @@ func TestPersistConfigStateWaitsForDurablePublication(t *testing.T) {
 }
 
 func TestConfigSnapshotUpToDateUsesCachedIndexFastPath(t *testing.T) {
+	t.Parallel()
 	engine := &Engine{}
 	engine.configIndex.Store(9)
 
@@ -1225,6 +1261,7 @@ func TestConfigSnapshotUpToDateUsesCachedIndexFastPath(t *testing.T) {
 }
 
 func TestPersistConfigStateUpdatesCachedIndex(t *testing.T) {
+	t.Parallel()
 	storage := etcdraft.NewMemoryStorage()
 	snap := raftTestSnapshot(1, 1, []uint64{1}, nil)
 	require.NoError(t, storage.ApplySnapshot(&snap))
@@ -1249,6 +1286,7 @@ func TestPersistConfigStateUpdatesCachedIndex(t *testing.T) {
 }
 
 func TestPersistConfigStateBlocksConcurrentRestore(t *testing.T) {
+	t.Parallel()
 	storage := etcdraft.NewMemoryStorage()
 	snap := raftTestSnapshot(1, 1, []uint64{1}, nil)
 	require.NoError(t, storage.ApplySnapshot(&snap))
@@ -1318,6 +1356,7 @@ func TestPersistConfigStateBlocksConcurrentRestore(t *testing.T) {
 }
 
 func TestNextPeersAfterConfigChangeKeepsLearnerMetadata(t *testing.T) {
+	t.Parallel()
 	engine := &Engine{
 		peers: map[uint64]Peer{
 			1: {NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
@@ -1349,6 +1388,7 @@ func TestNextPeersAfterConfigChangeKeepsLearnerMetadata(t *testing.T) {
 }
 
 func TestNextPeersAfterConfigChangeV2RejectsMismatchedPeerContext(t *testing.T) {
+	t.Parallel()
 	engine := &Engine{
 		peers: map[uint64]Peer{
 			1: {NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
@@ -1371,6 +1411,7 @@ func TestNextPeersAfterConfigChangeV2RejectsMismatchedPeerContext(t *testing.T) 
 }
 
 func TestNextPeersAfterConfigChangeV2PreservesExistingPeerWithoutContext(t *testing.T) {
+	t.Parallel()
 	engine := &Engine{
 		peers: map[uint64]Peer{
 			1: {NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
@@ -1392,6 +1433,7 @@ func TestNextPeersAfterConfigChangeV2PreservesExistingPeerWithoutContext(t *test
 }
 
 func TestApplyAddedPeerWithoutContextPreservesExistingMetadata(t *testing.T) {
+	t.Parallel()
 	engine := &Engine{
 		peers: map[uint64]Peer{
 			2: {NodeID: 2, ID: "n2", Address: "127.0.0.1:7002"},
@@ -1416,6 +1458,7 @@ func TestApplyAddedPeerWithoutContextPreservesExistingMetadata(t *testing.T) {
 }
 
 func TestCloneDispatchMessageDeepCopy(t *testing.T) {
+	t.Parallel()
 	original := raftpb.Message{
 		Type:    messageTypePtr(raftpb.MsgApp),
 		To:      uint64Ptr(2),
@@ -1447,6 +1490,7 @@ func TestCloneDispatchMessageDeepCopy(t *testing.T) {
 }
 
 func TestPrepareDispatchRequestClonesSnapshotPayload(t *testing.T) {
+	t.Parallel()
 	msg := raftpb.Message{
 		Type: messageTypePtr(raftpb.MsgSnap),
 		To:   uint64Ptr(2),
@@ -1612,6 +1656,7 @@ func TestEnqueueDispatchMessagePreservesIncomingReadIndexHeartbeatWhenRespLaneFu
 }
 
 func TestOpenRestoresLegacySnapshotState(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	require.NoError(t, saveStateFile(stateFilePath(dir), persistedState{
 		HardState: testHardState(2, 6),
@@ -1639,9 +1684,13 @@ func TestOpenRestoresLegacySnapshotState(t *testing.T) {
 	})
 
 	require.Equal(t, [][]byte{[]byte("snap"), []byte("tail")}, fsm.Applied())
+	require.True(t, engine.ReadinessState().Started)
+	require.False(t, engine.ReadinessState().Restoring)
+	require.False(t, engine.ReadinessState().Failed)
 }
 
 func TestOpenMultiNodeWaitsForCommittedTailDrain(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	peers := []Peer{
 		{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
@@ -1738,6 +1787,7 @@ func requireSignal(t *testing.T, ch <-chan struct{}, timeout time.Duration, msg 
 }
 
 func TestWaitStartedTimeoutDoesNotCloseEngine(t *testing.T) {
+	t.Parallel()
 	engine := &Engine{
 		startedCh: make(chan struct{}),
 		doneCh:    make(chan struct{}),
@@ -1756,6 +1806,7 @@ func TestWaitStartedTimeoutDoesNotCloseEngine(t *testing.T) {
 }
 
 func TestWaitForOpenCanceledContextClosesMultiNodeEngine(t *testing.T) {
+	t.Parallel()
 	engine := &Engine{
 		doneCh:  make(chan struct{}),
 		closeCh: make(chan struct{}),
@@ -1786,6 +1837,7 @@ func TestWaitForOpenCanceledContextClosesMultiNodeEngine(t *testing.T) {
 }
 
 func TestOpenMultiNodeReplicatesOverGRPCTransport(t *testing.T) {
+	t.Parallel()
 	nodes, peers := newTransportTestNodes(t, 3)
 	startTransportTestServers(nodes, peers)
 	t.Cleanup(func() { cleanupTransportTestNodes(t, nodes) })
@@ -1811,6 +1863,7 @@ func TestOpenMultiNodeReplicatesOverGRPCTransport(t *testing.T) {
 }
 
 func TestFollowerStatusTracksLeaderContact(t *testing.T) {
+	t.Parallel()
 	nodes, peers := newTransportTestNodes(t, 3)
 	startTransportTestServers(nodes, peers)
 	t.Cleanup(func() { cleanupTransportTestNodes(t, nodes) })
@@ -1836,6 +1889,7 @@ func TestFollowerStatusTracksLeaderContact(t *testing.T) {
 }
 
 func TestAddVoterAllowsJoiningNodeToReplicate(t *testing.T) {
+	t.Parallel()
 	nodes, peers := newTransportTestNodes(t, 2)
 	startTransportTestServers(nodes, peers)
 	t.Cleanup(func() { cleanupTransportTestNodes(t, nodes) })
@@ -1870,6 +1924,7 @@ func TestAddVoterAllowsJoiningNodeToReplicate(t *testing.T) {
 }
 
 func TestRemoveServerUpdatesConfiguration(t *testing.T) {
+	t.Parallel()
 	nodes, peers := newTransportTestNodes(t, 2)
 	startTransportTestServers(nodes, peers)
 	t.Cleanup(func() { cleanupTransportTestNodes(t, nodes) })
@@ -1902,6 +1957,7 @@ func TestRemoveServerUpdatesConfiguration(t *testing.T) {
 }
 
 func TestTransferLeadershipToServerMovesLeader(t *testing.T) {
+	t.Parallel()
 	nodes, peers := newTransportTestNodes(t, 2)
 	startTransportTestServers(nodes, peers)
 	t.Cleanup(func() { cleanupTransportTestNodes(t, nodes) })
@@ -1950,6 +2006,7 @@ func TestTransferLeadershipToServerMovesLeader(t *testing.T) {
 }
 
 func TestStorePendingConfigRejectsWhenQueueIsFull(t *testing.T) {
+	t.Parallel()
 	engine := &Engine{
 		pendingConfigs: map[uint64]adminRequest{},
 	}
@@ -1965,6 +2022,7 @@ func TestStorePendingConfigRejectsWhenQueueIsFull(t *testing.T) {
 }
 
 func TestPendingConfChangeFenceTracksUnappliedConfig(t *testing.T) {
+	t.Parallel()
 	engine := &Engine{}
 	engine.appliedIndex.Store(10)
 
@@ -1979,6 +2037,7 @@ func TestPendingConfChangeFenceTracksUnappliedConfig(t *testing.T) {
 }
 
 func TestProposeMembershipChangeRejectsPendingConfig(t *testing.T) {
+	t.Parallel()
 	engine := &Engine{}
 	engine.markPendingConfChange(12)
 	done := make(chan adminResult, 1)
@@ -1992,6 +2051,7 @@ func TestProposeMembershipChangeRejectsPendingConfig(t *testing.T) {
 }
 
 func TestReconcilePendingConfChangeFenceClearsOverwrittenProposal(t *testing.T) {
+	t.Parallel()
 	storage := committedTailStorageWithEntries(t, 10, 12, map[uint64]raftpb.Entry{
 		12: {
 			Type: entryTypePtr(raftpb.EntryNormal),
@@ -2007,6 +2067,7 @@ func TestReconcilePendingConfChangeFenceClearsOverwrittenProposal(t *testing.T) 
 }
 
 func TestReconcilePendingConfChangeFenceKeepsUnstableProposal(t *testing.T) {
+	t.Parallel()
 	storage := committedTailStorageWithEntries(t, 10, 11, nil)
 	engine := &Engine{storage: storage}
 	engine.appliedIndex.Store(10)
@@ -2017,6 +2078,7 @@ func TestReconcilePendingConfChangeFenceKeepsUnstableProposal(t *testing.T) {
 }
 
 func TestRestorePendingConfChangeFenceFromStorage(t *testing.T) {
+	t.Parallel()
 	storage := committedTailStorageWithEntries(t, 100, 150, map[uint64]raftpb.Entry{
 		130: {
 			Type: entryTypePtr(raftpb.EntryConfChange),
@@ -2034,6 +2096,7 @@ func TestRestorePendingConfChangeFenceFromStorage(t *testing.T) {
 }
 
 func TestRestorePendingConfChangeFenceFromStorageUsesReplayAppliedFloor(t *testing.T) {
+	t.Parallel()
 	storage := committedTailStorageWithEntries(t, 100, 150, map[uint64]raftpb.Entry{
 		130: {
 			Type: entryTypePtr(raftpb.EntryConfChange),
@@ -2049,6 +2112,7 @@ func TestRestorePendingConfChangeFenceFromStorageUsesReplayAppliedFloor(t *testi
 }
 
 func TestRestorePendingConfChangeFenceFromStorageIgnoresAppliedConfig(t *testing.T) {
+	t.Parallel()
 	storage := committedTailStorageWithEntries(t, 100, 150, map[uint64]raftpb.Entry{
 		130: {
 			Type: entryTypePtr(raftpb.EntryConfChange),
@@ -2282,6 +2346,7 @@ func committedTailStorageWithEntries(t *testing.T, snapIndex, commit uint64, ove
 }
 
 func TestNewRawNodeSeedsAppliedFromColdStart(t *testing.T) {
+	t.Parallel()
 	storage := committedTailStorage(t, 100, 150)
 	rawApplied, err := rawNodeAppliedForOpen(storage, 150, rawNodeTestConfig())
 	require.NoError(t, err)
@@ -2294,6 +2359,7 @@ func TestNewRawNodeSeedsAppliedFromColdStart(t *testing.T) {
 }
 
 func TestNewRawNodeWithoutAppliedRedeliversCommittedTail(t *testing.T) {
+	t.Parallel()
 	storage := committedTailStorage(t, 100, 150)
 
 	rawNode, err := newRawNode(rawNodeTestConfig(), storage, 0)
@@ -2306,6 +2372,7 @@ func TestNewRawNodeWithoutAppliedRedeliversCommittedTail(t *testing.T) {
 }
 
 func TestRawNodeAppliedForOpenClipsToCommitted(t *testing.T) {
+	t.Parallel()
 	storage := committedTailStorage(t, 100, 150)
 
 	rawApplied, err := rawNodeAppliedForOpen(storage, 200, rawNodeTestConfig())
@@ -2315,6 +2382,7 @@ func TestRawNodeAppliedForOpenClipsToCommitted(t *testing.T) {
 }
 
 func TestRawNodeAppliedForOpenPreservesVolatileReplay(t *testing.T) {
+	t.Parallel()
 	storage := committedTailStorageWithEntries(t, 100, 150, map[uint64]raftpb.Entry{
 		125: {
 			Type: entryTypePtr(raftpb.EntryNormal),
@@ -2338,6 +2406,7 @@ func TestRawNodeAppliedForOpenPreservesVolatileReplay(t *testing.T) {
 }
 
 func TestRawNodeAppliedForOpenPreservesConfChangeReplay(t *testing.T) {
+	t.Parallel()
 	storage := committedTailStorageWithEntries(t, 100, 150, map[uint64]raftpb.Entry{
 		130: {
 			Type: entryTypePtr(raftpb.EntryConfChange),
@@ -2511,6 +2580,7 @@ func TestSelectDispatchLane_MsgPropReachesDefaultFallback(t *testing.T) {
 // not prevent MsgApp from being dispatched, because they now run on
 // independent goroutines.
 func TestMultiLaneDispatcher_SnapshotDoesNotBlockReplication(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
@@ -2563,6 +2633,7 @@ func TestMultiLaneDispatcher_SnapshotDoesNotBlockReplication(t *testing.T) {
 // every lane (not just normal/heartbeat) so no worker goroutine leaks under
 // the opt-in multi-lane layout.
 func TestMultiLaneDispatcher_RemovePeerClosesAllLanes(t *testing.T) {
+	t.Parallel()
 	stopCh := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
 	pd := &peerQueues{
@@ -2644,6 +2715,7 @@ func (m *deferringSnapshotStateMachine) Snapshot() (raftengine.Snapshot, error) 
 // long-running backup pin plus ordinary writes crossing the snapshot
 // threshold would terminate replicas instead of postponing compaction.
 func TestMaybePersistLocalSnapshotSkipsDeferredSnapshot(t *testing.T) {
+	t.Parallel()
 	storage := etcdraft.NewMemoryStorage()
 	snap := raftTestSnapshot(1, 1, []uint64{1}, nil)
 	require.NoError(t, storage.ApplySnapshot(&snap))
@@ -2677,6 +2749,7 @@ func TestMaybePersistLocalSnapshotSkipsDeferredSnapshot(t *testing.T) {
 // Any other Snapshot error still stops the engine: the state machine could not
 // be captured, so continuing would run against state that cannot be persisted.
 func TestMaybePersistLocalSnapshotFailsOnNonDeferredError(t *testing.T) {
+	t.Parallel()
 	storage := etcdraft.NewMemoryStorage()
 	snap := raftTestSnapshot(1, 1, []uint64{1}, nil)
 	require.NoError(t, storage.ApplySnapshot(&snap))

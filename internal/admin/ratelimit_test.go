@@ -12,6 +12,7 @@ import (
 )
 
 func TestParseTrustedProxies(t *testing.T) {
+	t.Parallel()
 	nets, err := ParseTrustedProxies([]string{"10.0.0.0/8", "192.168.1.5", "::1", " "})
 	require.NoError(t, err)
 	require.Len(t, nets, 3)
@@ -29,6 +30,7 @@ func TestParseTrustedProxies(t *testing.T) {
 }
 
 func TestClientIPWithTrust_HonoursXFFFromTrustedPeer(t *testing.T) {
+	t.Parallel()
 	trusted, err := ParseTrustedProxies([]string{"10.0.0.0/8"})
 	require.NoError(t, err)
 
@@ -40,6 +42,7 @@ func TestClientIPWithTrust_HonoursXFFFromTrustedPeer(t *testing.T) {
 }
 
 func TestClientIPWithTrust_IgnoresXFFFromUntrustedPeer(t *testing.T) {
+	t.Parallel()
 	trusted, err := ParseTrustedProxies([]string{"10.0.0.0/8"})
 	require.NoError(t, err)
 
@@ -52,6 +55,7 @@ func TestClientIPWithTrust_IgnoresXFFFromUntrustedPeer(t *testing.T) {
 }
 
 func TestClientIPWithTrust_NoTrustedFallsThroughToPeer(t *testing.T) {
+	t.Parallel()
 	req := httptest.NewRequest(http.MethodPost, "/", nil)
 	req.RemoteAddr = "10.0.0.5:9000"
 	req.Header.Set("X-Forwarded-For", "1.2.3.4")
@@ -63,6 +67,7 @@ func TestClientIPWithTrust_NoTrustedFallsThroughToPeer(t *testing.T) {
 func net4(s string) net.IP { return net.ParseIP(s) }
 
 func TestRateLimiter_HardCapRefusesNewIPs(t *testing.T) {
+	t.Parallel()
 	now := time.Unix(1_700_000_000, 0).UTC()
 	clk := func() time.Time { return now }
 	rl := newRateLimiter(5, time.Minute, clk)
@@ -83,6 +88,7 @@ func TestRateLimiter_HardCapRefusesNewIPs(t *testing.T) {
 }
 
 func TestRateLimiter_HardCapReclaimsAfterWindow(t *testing.T) {
+	t.Parallel()
 	now := time.Unix(1_700_000_000, 0).UTC()
 	clk := func() time.Time { return now }
 	rl := newRateLimiter(5, time.Minute, clk)

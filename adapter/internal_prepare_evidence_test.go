@@ -63,6 +63,8 @@ func prepareSafetyInternalClient(t *testing.T, server *Internal) pb.InternalClie
 }
 
 func TestPrepareEvidenceSafetyRPCRequiresTokenAndLeaderFence(t *testing.T) {
+	// Not parallel: its deadline/liveness budget is sized for a quiet
+	// process, and parallel peers on a loaded runner can exhaust it.
 	st := store.NewMVCCStore()
 	fsm := kv.NewKvFSMWithHLC(st, kv.NewHLC())
 	require.Nil(t, fsm.Apply(kv.EncodePrepareEvidenceFence(0)))
@@ -94,6 +96,7 @@ func TestPrepareEvidenceSafetyRPCRequiresTokenAndLeaderFence(t *testing.T) {
 }
 
 func TestPrepareEvidenceSafetyRPCDiscardsLeadershipLostDuringRead(t *testing.T) {
+	t.Parallel()
 	leader := &prepareSafetyRPCLeader{loseRead: true}
 	client := prepareSafetyInternalClient(t, NewInternalWithEngine(nil, leader, nil, nil, WithInternalStore(store.NewMVCCStore())))
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -110,6 +113,7 @@ type prepareSafetyCutoverState struct{ active atomic.Bool }
 func (s *prepareSafetyCutoverState) CutoverActive() bool { return s.active.Load() }
 
 func TestPrepareEvidenceSafetyCapabilityReportsLocalCutoverOnFollowers(t *testing.T) {
+	t.Parallel()
 	for _, configured := range []bool{false, true} {
 		t.Run(fmt.Sprintf("configured-%t", configured), func(t *testing.T) {
 			leader := &prepareSafetyRPCLeader{}
@@ -168,6 +172,7 @@ func prepareSafetyForward(phase pb.Phase, key string, commit uint64) *pb.Forward
 }
 
 func TestPrepareEvidenceSafetyExistingResolutionBeforeAndDuringPending(t *testing.T) {
+	t.Parallel()
 	for _, bound := range []uint64{0, 100} {
 		for _, phase := range []pb.Phase{pb.Phase_COMMIT, pb.Phase_ABORT} {
 			t.Run(phase.String()+"-"+map[bool]string{true: "before-pending", false: "pending"}[bound == 0], func(t *testing.T) {
@@ -189,6 +194,7 @@ func TestPrepareEvidenceSafetyExistingResolutionBeforeAndDuringPending(t *testin
 }
 
 func TestPrepareEvidenceSafetyFirstPrimaryUsesActualDurableTimestamp(t *testing.T) {
+	t.Parallel()
 	for _, commit := range []uint64{60, 61} {
 		t.Run(map[bool]string{true: "matching", false: "forged"}[commit == 60], func(t *testing.T) {
 			st := store.NewMVCCStore()
@@ -221,6 +227,7 @@ func TestPrepareEvidenceSafetyFirstPrimaryUsesActualDurableTimestamp(t *testing.
 }
 
 func TestPrepareEvidenceSafetyPendingRejectsNewTimestampedWork(t *testing.T) {
+	t.Parallel()
 	allocator := &prepareSafetyResolutionAllocator{bound: 100}
 	txn := &forwardObserverTxn{}
 	i := NewInternalWithEngine(txn, forwardObserverLeader{}, nil, nil, WithInternalTimestampAllocator(allocator))
@@ -249,6 +256,7 @@ func (a *prepareSafetyReservationAllocator) NextAfter(_ context.Context, minimum
 }
 
 func TestPrepareEvidenceSafetyV3IngressReservesProofWithoutRetimestamp(t *testing.T) {
+	t.Parallel()
 	reservationFailure := errors.New("durable reservation failed")
 	for _, failure := range []error{nil, reservationFailure} {
 		allocator := &prepareSafetyReservationAllocator{fail: failure}

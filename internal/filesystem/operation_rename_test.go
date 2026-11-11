@@ -8,6 +8,7 @@ import (
 )
 
 func TestRenameWithOperationDoesNotMoveRecreatedSource(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, []uint64{2, 3})
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -27,6 +28,7 @@ func TestRenameWithOperationDoesNotMoveRecreatedSource(t *testing.T) {
 }
 
 func TestRenameWithOperationRetainsMissingSource(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, []uint64{2})
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -41,6 +43,7 @@ func TestRenameWithOperationRetainsMissingSource(t *testing.T) {
 }
 
 func TestRenameWithOperationNoopIsRetained(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, []uint64{2})
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))

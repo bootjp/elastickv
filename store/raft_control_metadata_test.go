@@ -21,6 +21,7 @@ func raftMetadata(t *testing.T, s MVCCStore) RaftControlMetadataStore {
 }
 
 func TestRaftControlMetadataAtomicVisibility(t *testing.T) {
+	t.Parallel()
 	for name, factory := range absenceTestStores(t) {
 		t.Run(name, func(t *testing.T) {
 			s := factory(t)
@@ -59,6 +60,7 @@ func TestRaftControlMetadataAtomicVisibility(t *testing.T) {
 }
 
 func TestRaftControlMetadataAbortAndErrorLatch(t *testing.T) {
+	t.Parallel()
 	for name, factory := range absenceTestStores(t) {
 		for _, failure := range []string{"callback", "ignored-canceled-stage", "ignored-nested-error", "ignored-invalid-control"} {
 			t.Run(name+"/"+failure, func(t *testing.T) {
@@ -94,6 +96,7 @@ func TestRaftControlMetadataAbortAndErrorLatch(t *testing.T) {
 }
 
 func TestRaftControlMetadataCanceledReadAbortsScope(t *testing.T) {
+	t.Parallel()
 	for name, factory := range absenceTestStores(t) {
 		t.Run(name, func(t *testing.T) {
 			s := factory(t)
@@ -118,6 +121,7 @@ func TestRaftControlMetadataCanceledReadAbortsScope(t *testing.T) {
 }
 
 func TestRaftControlMetadataReceiptAndJournalOnly(t *testing.T) {
+	t.Parallel()
 	for name, factory := range absenceTestStores(t) {
 		t.Run(name, func(t *testing.T) {
 			s := factory(t)
@@ -162,6 +166,7 @@ func TestRaftControlMetadataReceiptAndJournalOnly(t *testing.T) {
 }
 
 func TestRaftControlMetadataOrdinaryWritersCannotChangeRecords(t *testing.T) {
+	t.Parallel()
 	for name, factory := range absenceTestStores(t) {
 		t.Run(name, func(t *testing.T) {
 			s := factory(t)
@@ -229,6 +234,7 @@ func TestMemoryRaftEntryOverlaySharesUnmodifiedPayloads(t *testing.T) {
 }
 
 func TestMemoryRaftEntryAbortIsAtomic(t *testing.T) {
+	t.Parallel()
 	s := NewMVCCStore()
 	t.Cleanup(func() { require.NoError(t, s.Close()) })
 	want := errors.New("callback failed")
@@ -243,6 +249,7 @@ func TestMemoryRaftEntryAbortIsAtomic(t *testing.T) {
 }
 
 func TestRaftControlEntryReadOwnWritesAndPrefixDelete(t *testing.T) {
+	t.Parallel()
 	for name, factory := range absenceTestStores(t) {
 		t.Run(name, func(t *testing.T) {
 			s := factory(t)
@@ -279,6 +286,7 @@ func TestRaftControlEntryReadOwnWritesAndPrefixDelete(t *testing.T) {
 }
 
 func TestRaftControlEntryProjectionAndStaleIndex(t *testing.T) {
+	t.Parallel()
 	for name, factory := range absenceTestStores(t) {
 		t.Run(name, func(t *testing.T) {
 			s := factory(t)
@@ -305,6 +313,7 @@ func TestRaftControlEntryProjectionAndStaleIndex(t *testing.T) {
 }
 
 func TestRaftControlMetadataRejectsTimestampSuffixCollision(t *testing.T) {
+	t.Parallel()
 	physical, err := raftControlKey([]byte("P"))
 	require.NoError(t, err)
 	logical := physical[:len(physical)-timestampSize]
@@ -320,6 +329,7 @@ func TestRaftControlMetadataRejectsTimestampSuffixCollision(t *testing.T) {
 }
 
 func TestMemoryRaftEntryDirectWriterWaits(t *testing.T) {
+	t.Parallel()
 	s := NewMVCCStore()
 	defer s.Close()
 	done := make(chan error, 1)
@@ -342,6 +352,7 @@ func TestMemoryRaftEntryDirectWriterWaits(t *testing.T) {
 }
 
 func TestRaftControlMetadataMigrationRetention(t *testing.T) {
+	t.Parallel()
 	for name, factory := range absenceTestStores(t) {
 		t.Run(name, func(t *testing.T) {
 			s := factory(t)
@@ -375,6 +386,7 @@ func TestRaftControlMetadataMigrationRetention(t *testing.T) {
 }
 
 func TestRaftControlMetadataNeverActsAsMVCCVersion(t *testing.T) {
+	t.Parallel()
 	physical, err := raftControlKey([]byte("P"))
 	require.NoError(t, err)
 	alias := physical[:len(physical)-timestampSize]

@@ -473,6 +473,7 @@ func TestRetryRedisWriteDoesNotRetryUnclassifiedWireErrors(t *testing.T) {
 }
 
 func TestRetryRedisWriteDoesNotReplayOrLeakWireWriteConflict(t *testing.T) {
+	t.Parallel()
 	wireErr := errors.WithStack(kv.ForwardWriteConflictStatus())
 	attempts := 0
 	srv := &RedisServer{}

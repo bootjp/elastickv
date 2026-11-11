@@ -51,6 +51,7 @@ Architecture diagrams are available in:
 
 Deployment/runbook documents:
 
+- [`docs/kubernetes.md`](docs/kubernetes.md) (generic Kubernetes manifests, persistent storage, verification, and operations)
 - `docs/docker_multinode_manual_run.md` (manual `docker run`, 4-5 node cluster on multiple VMs, no docker compose)
 - `docs/etcd_raft_migration_operations.md` (offline HashiCorp-to-etcd cutover runbook and verification checklist)
 - `docs/redis-proxy-deployment.md` (Redis-protocol reverse proxy for zero-downtime Redis-to-Elastickv migration)
@@ -87,6 +88,9 @@ Provisioned monitoring assets live under:
 - `monitoring/grafana/dashboards/elastickv-pebble-internals.json`
 - `monitoring/grafana/provisioning/`
 - `monitoring/docker-compose.yml`
+
+See [the monitoring guide](monitoring/README.md) for portable dashboard selectors,
+cluster labels, alert loading, and notification routing.
 
 The provisioned dashboards are organized by operator task:
 
@@ -173,6 +177,8 @@ go run . \
   --raftId "n1" \
   --raftBootstrap
 ```
+
+When SQS runs behind a TLS-terminating proxy, set `--sqsPublicEndpoint "https://sqs.example.test"` to make CreateQueue, GetQueueUrl, and ListQueues return the public HTTPS origin. This setting accepts an HTTP(S) origin without a path prefix and does not enable TLS on the listener.
 
 The S3 and SQS listeners can share a static credentials file. Create `/etc/elastickv/credentials.json` before starting the server, with credentials matching the client configuration:
 
@@ -511,3 +517,14 @@ reports the lost write instead of ignoring the read.
 ```bash
 git config --local core.hooksPath .githooks
 ```
+
+### Stateful readiness
+
+The optional `--healthAddress` flag starts a dedicated private HTTP listener.
+`/livez` checks process responsiveness; `/readyz` and `/healthz` check local Raft
+startup recovery, applied membership, leader contact, and log-application progress
+across every configured group. Followers can be ready; learners cannot. This is
+not a cluster quorum or end-to-end API compatibility proof. Keep this listener
+private and use readiness separately from liveness. See the
+[runtime readiness example](deploy/kubernetes/examples/readiness/) for the exact
+contract, bootstrap procedure, and compatible image requirements.

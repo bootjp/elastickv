@@ -74,6 +74,7 @@ func testRemovalCommitAfterPeerTeardown(t *testing.T) {
 }
 
 func TestCommittedRemovalIndexes(t *testing.T) {
+	t.Parallel()
 	remove, err := proto.Marshal(&raftpb.ConfChange{
 		Type: confChangeTypePtr(raftpb.ConfChangeRemoveNode), NodeId: uint64Ptr(2),
 	})
@@ -117,6 +118,7 @@ func TestCommittedRemovalIndexes(t *testing.T) {
 }
 
 func TestRemovalNotificationPreservesReplacementConnection(t *testing.T) {
+	t.Parallel()
 	nodes, peers := newTransportTestNodes(t, 2)
 	startTransportTestServers(nodes, peers)
 	t.Cleanup(func() { cleanupTransportTestNodes(t, nodes) })
@@ -163,6 +165,7 @@ func TestRemovalNotificationPreservesReplacementConnection(t *testing.T) {
 }
 
 func TestStopDispatchWorkersCancelsRemovalNotification(t *testing.T) {
+	t.Parallel()
 	nodes, peers := newTransportTestNodes(t, 1)
 	startTransportTestServers(nodes, peers)
 	t.Cleanup(func() { cleanupTransportTestNodes(t, nodes) })
@@ -185,6 +188,7 @@ func TestStopDispatchWorkersCancelsRemovalNotification(t *testing.T) {
 }
 
 func TestRemovalNotificationHonorsDeadlineForUnreachablePeer(t *testing.T) {
+	t.Parallel()
 	nodes, peers := newTransportTestNodes(t, 1)
 	require.NoError(t, nodes[0].lis.Close())
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)

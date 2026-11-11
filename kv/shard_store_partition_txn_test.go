@@ -26,6 +26,7 @@ func newPartitionTxnTestStore(t *testing.T) (*ShardStore, []byte) {
 }
 
 func TestShardStorePartitionTxnRecordsFollowEmbeddedOwner(t *testing.T) {
+	t.Parallel()
 	s, primary := newPartitionTxnTestStore(t)
 	ctx := t.Context()
 	for _, tc := range []struct {
@@ -66,6 +67,7 @@ func TestShardStorePartitionTxnRecordsFollowEmbeddedOwner(t *testing.T) {
 }
 
 func TestShardStorePartitionTxnOwnerFailureIsNotAbsent(t *testing.T) {
+	t.Parallel()
 	for _, mode := range []string{"unresolved", "zero", "missing-group", "missing-store"} {
 		t.Run(mode, func(t *testing.T) {
 			s, primary := newPartitionTxnTestStore(t)
@@ -92,6 +94,7 @@ func TestShardStorePartitionTxnOwnerFailureIsNotAbsent(t *testing.T) {
 }
 
 func TestShardStorePartitionTxnExpiredAbortUsesOwner(t *testing.T) {
+	t.Parallel()
 	s, primary := newPartitionTxnTestStore(t)
 	for _, group := range s.groups {
 		fsm, ok := NewKvFSMWithHLC(group.Store, NewHLC()).(*kvFSM)
@@ -108,6 +111,7 @@ func TestShardStorePartitionTxnExpiredAbortUsesOwner(t *testing.T) {
 }
 
 func TestShardStorePartitionTxnRetainsCatalogStagedGuard(t *testing.T) {
+	t.Parallel()
 	s, primary := newPartitionTxnTestStore(t)
 	key := txnCommitKey(primary, 10)
 	require.NoError(t, s.groups[2].Store.PutAt(t.Context(), key, encodeTxnCommitRecord(20), 20, 0))

@@ -313,13 +313,6 @@ func (o *RaftObserver) setLeaderMetric(group string, leaderID string, leaderAddr
 	o.leaderLabels[group] = current
 }
 
-func (o *RaftObserver) observeLeaderChange(group string) {
-	if o == nil || o.metrics == nil {
-		return
-	}
-	o.metrics.leaderChanges.WithLabelValues(group).Inc()
-}
-
 func hasLeaderIdentity(labels prometheus.Labels) bool {
 	return labels["leader_id"] != "" || labels["leader_address"] != ""
 }

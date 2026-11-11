@@ -56,6 +56,7 @@ func encodeSignedAwsChunked(t *testing.T, payload []byte, chunkSize int) []byte 
 }
 
 func TestAwsChunkedReader_SingleChunk(t *testing.T) {
+	t.Parallel()
 	payload := []byte("hello aws chunked")
 	body := encodeAwsChunked(t, payload, len(payload), "", "")
 
@@ -66,6 +67,7 @@ func TestAwsChunkedReader_SingleChunk(t *testing.T) {
 }
 
 func TestAwsChunkedReader_MultipleChunks(t *testing.T) {
+	t.Parallel()
 	payload := bytes.Repeat([]byte("abcde"), 100) // 500 bytes
 	body := encodeAwsChunked(t, payload, 37, "", "")
 
@@ -76,6 +78,7 @@ func TestAwsChunkedReader_MultipleChunks(t *testing.T) {
 }
 
 func TestAwsChunkedReader_SignedChunkExtensionsIgnored(t *testing.T) {
+	t.Parallel()
 	payload := []byte("signed chunked body")
 	body := encodeSignedAwsChunked(t, payload, 8)
 
@@ -86,6 +89,7 @@ func TestAwsChunkedReader_SignedChunkExtensionsIgnored(t *testing.T) {
 }
 
 func TestAwsChunkedReader_TrailerExposed(t *testing.T) {
+	t.Parallel()
 	payload := []byte("with trailer")
 	body := encodeAwsChunked(t, payload, 5, "x-amz-checksum-crc32", "Zm9vYmFyMA==")
 
@@ -96,6 +100,7 @@ func TestAwsChunkedReader_TrailerExposed(t *testing.T) {
 }
 
 func TestAwsChunkedReader_DecodedLengthMismatch(t *testing.T) {
+	t.Parallel()
 	payload := []byte("exact length matters")
 	body := encodeAwsChunked(t, payload, 7, "", "")
 	// Declare a smaller length than the actual decoded body to ensure the
@@ -107,6 +112,7 @@ func TestAwsChunkedReader_DecodedLengthMismatch(t *testing.T) {
 }
 
 func TestAwsChunkedReader_DecodedLengthShort(t *testing.T) {
+	t.Parallel()
 	payload := []byte("shorter than declared")
 	body := encodeAwsChunked(t, payload, 6, "", "")
 	r := newAwsChunkedReader(bytes.NewReader(body), int64(len(payload)+5), 1<<20)
@@ -116,6 +122,7 @@ func TestAwsChunkedReader_DecodedLengthShort(t *testing.T) {
 }
 
 func TestAwsChunkedReader_MaxDecodedEnforced(t *testing.T) {
+	t.Parallel()
 	payload := bytes.Repeat([]byte("x"), 100)
 	body := encodeAwsChunked(t, payload, 16, "", "")
 	r := newAwsChunkedReader(bytes.NewReader(body), -1, 40)
@@ -125,6 +132,7 @@ func TestAwsChunkedReader_MaxDecodedEnforced(t *testing.T) {
 }
 
 func TestAwsChunkedReader_RejectsOversizedChunkHeader(t *testing.T) {
+	t.Parallel()
 	oversized := fmt.Sprintf("%x\r\n", s3ChunkSizeMax+1)
 	r := newAwsChunkedReader(strings.NewReader(oversized), -1, 1<<30)
 	_, err := io.ReadAll(r)
@@ -133,6 +141,7 @@ func TestAwsChunkedReader_RejectsOversizedChunkHeader(t *testing.T) {
 }
 
 func TestAwsChunkedReader_RejectsMalformedSizeLine(t *testing.T) {
+	t.Parallel()
 	body := "zz\r\npayload\r\n0\r\n\r\n"
 	r := newAwsChunkedReader(strings.NewReader(body), -1, 1<<20)
 	_, err := io.ReadAll(r)
@@ -141,6 +150,7 @@ func TestAwsChunkedReader_RejectsMalformedSizeLine(t *testing.T) {
 }
 
 func TestAwsChunkedReader_RejectsMissingTrailingCRLF(t *testing.T) {
+	t.Parallel()
 	// Chunk data without the terminating \r\n.
 	body := "5\r\nhellomore"
 	r := newAwsChunkedReader(strings.NewReader(body), -1, 1<<20)
@@ -149,6 +159,7 @@ func TestAwsChunkedReader_RejectsMissingTrailingCRLF(t *testing.T) {
 }
 
 func TestAwsChunkedReader_TruncatedInput(t *testing.T) {
+	t.Parallel()
 	// Declares 10 byte chunk but only provides 3 bytes before EOF.
 	body := "a\r\nabc"
 	r := newAwsChunkedReader(strings.NewReader(body), -1, 1<<20)
@@ -162,6 +173,7 @@ func TestAwsChunkedReader_TruncatedInput(t *testing.T) {
 // !r.finished guard the reader would happily return io.EOF and a caller
 // like io.ReadAll would treat the upload as complete.
 func TestAwsChunkedReader_TruncatedAtChunkBoundary(t *testing.T) {
+	t.Parallel()
 	// Valid first chunk followed by its CRLF, but the terminator chunk
 	// is missing.
 	body := "5\r\nhello\r\n"
@@ -171,6 +183,7 @@ func TestAwsChunkedReader_TruncatedAtChunkBoundary(t *testing.T) {
 }
 
 func TestAwsChunkedReader_OversizedLineRejectedWithoutUnboundedAlloc(t *testing.T) {
+	t.Parallel()
 	// Single line that never terminates with \n. ReadSlice must surface
 	// ErrBufferFull once the bufio buffer is saturated (8 KiB) instead of
 	// growing to accommodate the attacker-controlled input.
@@ -182,6 +195,7 @@ func TestAwsChunkedReader_OversizedLineRejectedWithoutUnboundedAlloc(t *testing.
 }
 
 func TestS3StreamingBody_VerifyTrailer_CRC32(t *testing.T) {
+	t.Parallel()
 	payload := []byte("Mary had a little lamb")
 	sum := crc32.NewIEEE()
 	_, err := sum.Write(payload)
@@ -206,6 +220,7 @@ func TestS3StreamingBody_VerifyTrailer_CRC32(t *testing.T) {
 }
 
 func TestS3StreamingBody_VerifyTrailer_Mismatch(t *testing.T) {
+	t.Parallel()
 	payload := []byte("Mary had a little lamb")
 	wrong := base64.StdEncoding.EncodeToString([]byte{0xDE, 0xAD, 0xBE, 0xEF})
 	body := encodeAwsChunked(t, payload, 5, "x-amz-checksum-crc32", wrong)
@@ -225,12 +240,14 @@ func TestS3StreamingBody_VerifyTrailer_Mismatch(t *testing.T) {
 }
 
 func TestS3StreamingBody_ZeroValueIsNoOp(t *testing.T) {
+	t.Parallel()
 	var sb s3StreamingBody
 	sb.writeDecoded([]byte("anything"))
 	require.NoError(t, sb.verifyTrailer())
 }
 
 func TestIsS3PayloadMarker(t *testing.T) {
+	t.Parallel()
 	cases := map[string]bool{
 		"UNSIGNED-PAYLOAD":                               true,
 		"unsigned-payload":                               true,
@@ -248,6 +265,7 @@ func TestIsS3PayloadMarker(t *testing.T) {
 }
 
 func TestIsS3StreamingPayloadMarker(t *testing.T) {
+	t.Parallel()
 	// Only the unsigned streaming variant is accepted today; signed
 	// variants require chained chunk-signature verification that the
 	// decoder does not implement yet.
@@ -260,6 +278,7 @@ func TestIsS3StreamingPayloadMarker(t *testing.T) {
 }
 
 func TestIsS3SignedStreamingPayloadMarker(t *testing.T) {
+	t.Parallel()
 	require.True(t, isS3SignedStreamingPayloadMarker("STREAMING-AWS4-HMAC-SHA256-PAYLOAD"))
 	require.True(t, isS3SignedStreamingPayloadMarker("streaming-aws4-hmac-sha256-payload-trailer"))
 	require.False(t, isS3SignedStreamingPayloadMarker("STREAMING-UNSIGNED-PAYLOAD-TRAILER"))
@@ -268,6 +287,7 @@ func TestIsS3SignedStreamingPayloadMarker(t *testing.T) {
 }
 
 func TestCleanStoredContentEncoding(t *testing.T) {
+	t.Parallel()
 	cases := map[string]string{
 		"":                      "",
 		"aws-chunked":           "",

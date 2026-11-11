@@ -18,6 +18,7 @@ import (
 )
 
 func TestErrnoMapsFilesystemErrors(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		err  error
@@ -59,6 +60,7 @@ func TestErrnoMapsFilesystemErrors(t *testing.T) {
 }
 
 func TestAdapterLookupResolvesThenStatsInode(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	core := &fakeCore{
 		resolveInode: 42,
@@ -82,6 +84,7 @@ func TestAdapterLookupResolvesThenStatsInode(t *testing.T) {
 }
 
 func TestAdapterCreateAndReleaseUseClientID(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	core := &fakeCore{
 		createResult: filesystem.CreateResult{Inode: 7, FH: 9},
@@ -106,6 +109,7 @@ func TestAdapterCreateAndReleaseUseClientID(t *testing.T) {
 }
 
 func TestAdapterUsesConfiguredReaddirLimit(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	core := &fakeCore{
 		readdirResult: filesystem.ReaddirResult{
@@ -124,6 +128,7 @@ func TestAdapterUsesConfiguredReaddirLimit(t *testing.T) {
 }
 
 func TestAdapterRefreshesHandleLeaseBeforeRead(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	core := &fakeCore{readData: []byte("payload")}
 	adapter := New(core, []byte("fuse-session"))
@@ -139,6 +144,7 @@ func TestAdapterRefreshesHandleLeaseBeforeRead(t *testing.T) {
 }
 
 func TestAdapterStopsReadWhenLeaseRefreshFails(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	core := &fakeCore{refreshErr: filesystem.ErrNotFound}
 	adapter := New(core, []byte("fuse-session"))
@@ -151,6 +157,7 @@ func TestAdapterStopsReadWhenLeaseRefreshFails(t *testing.T) {
 }
 
 func TestUnsupportedOperationsReturnExplicitErrno(t *testing.T) {
+	t.Parallel()
 	adapter := New(&fakeCore{}, []byte("client-a"))
 	t.Cleanup(adapter.Close)
 
@@ -161,6 +168,7 @@ func TestUnsupportedOperationsReturnExplicitErrno(t *testing.T) {
 }
 
 func TestAdapterKeepsOpenHandlesAliveWhileIdle(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	core := &fakeCore{
 		openFH:    9,
@@ -182,6 +190,7 @@ func TestAdapterKeepsOpenHandlesAliveWhileIdle(t *testing.T) {
 }
 
 func TestAdapterKeepsCreatedHandlesAliveWhileIdle(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	core := &fakeCore{
 		createResult: filesystem.CreateResult{Inode: 7, FH: 9},
@@ -206,6 +215,7 @@ func TestAdapterKeepsCreatedHandlesAliveWhileIdle(t *testing.T) {
 }
 
 func TestAdapterKeepaliveTimeoutDoesNotBlockOtherHandles(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	core := &fakeCore{
 		refreshCh:      make(chan openHandleRefresh, 8),
@@ -242,6 +252,7 @@ func TestAdapterKeepaliveTimeoutDoesNotBlockOtherHandles(t *testing.T) {
 }
 
 func TestAdapterKeepaliveUntracksMissingHandles(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	core := &fakeCore{refreshErr: filesystem.ErrNotFound}
 	adapter := New(core, []byte("fuse-session"), WithHandleKeepaliveInterval(time.Hour))

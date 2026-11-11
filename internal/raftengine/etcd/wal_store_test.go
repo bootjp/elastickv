@@ -20,6 +20,7 @@ import (
 // (Phase 1 / HashiCorp migration).
 
 func TestRestoreSnapshotStateEmptySnapshot(t *testing.T) {
+	t.Parallel()
 	// An empty (zero-value) snapshot must be a no-op: FSM not touched.
 	fsm := &dummyFSM{}
 	_, err := restoreSnapshotState(fsm, raftpb.Snapshot{}, 0, "", nil, nil)
@@ -28,6 +29,7 @@ func TestRestoreSnapshotStateEmptySnapshot(t *testing.T) {
 }
 
 func TestRestoreSnapshotStateNilData(t *testing.T) {
+	t.Parallel()
 	// Snapshot with non-zero metadata but empty Data must be a no-op.
 	snap := raftpb.Snapshot{
 		Metadata: testSnapshotMetadata(5, 1, nil),
@@ -39,6 +41,7 @@ func TestRestoreSnapshotStateNilData(t *testing.T) {
 }
 
 func TestRestoreSnapshotStateNilFSM(t *testing.T) {
+	t.Parallel()
 	// Non-empty snapshot with a nil FSM must be a no-op (not a panic).
 	snap := raftpb.Snapshot{
 		Data:     []byte("some payload"),
@@ -49,6 +52,7 @@ func TestRestoreSnapshotStateNilFSM(t *testing.T) {
 }
 
 func TestRestoreSnapshotStateLegacyFormat(t *testing.T) {
+	t.Parallel()
 	// Legacy format: raw FSM payload embedded directly in snapshot.Data.
 	// This path is taken when the Data is not a 17-byte EKVT token.
 	payload := []byte("legacy raw fsm state payload data here")
@@ -64,6 +68,7 @@ func TestRestoreSnapshotStateLegacyFormat(t *testing.T) {
 }
 
 func TestRestoreSnapshotStateTokenFormat(t *testing.T) {
+	t.Parallel()
 	// Token format: snapshot.Data is a 17-byte EKVT token referencing an .fsm file.
 	// This is the Phase 2 path used after the disk-offload migration.
 	dir := t.TempDir()
@@ -82,6 +87,7 @@ func TestRestoreSnapshotStateTokenFormat(t *testing.T) {
 }
 
 func TestRestoreSnapshotStateTokenEmptyPayload(t *testing.T) {
+	t.Parallel()
 	// Token pointing to an .fsm file with an empty payload (only CRC footer).
 	// This is valid: crc32c("") == 0.
 	dir := t.TempDir()
@@ -99,6 +105,7 @@ func TestRestoreSnapshotStateTokenEmptyPayload(t *testing.T) {
 }
 
 func TestRestoreSnapshotStateTokenCRCMismatch(t *testing.T) {
+	t.Parallel()
 	// Token CRC does not match the on-disk footer → ErrFSMSnapshotTokenCRC.
 	// The FSM must NOT be modified (fail-fast before Restore).
 	dir := t.TempDir()
@@ -118,6 +125,7 @@ func TestRestoreSnapshotStateTokenCRCMismatch(t *testing.T) {
 }
 
 func TestRestoreSnapshotStateTokenFileNotFound(t *testing.T) {
+	t.Parallel()
 	// Token references an index for which no .fsm file exists on disk.
 	// This can happen after a data-dir corruption or incomplete migration.
 	dir := t.TempDir()
@@ -207,6 +215,7 @@ func lastWALFile(t *testing.T, walDir string) string {
 }
 
 func TestLoadWalStateRepairsTruncatedTail(t *testing.T) {
+	t.Parallel()
 	// Simulates the 2026-04-24 incident: OOM-SIGKILL mid-WAL-write left
 	// the last segment with a torn trailing record. Before this fix the
 	// process could not restart; now openAndReadWAL invokes wal.Repair
@@ -241,6 +250,7 @@ func TestLoadWalStateRepairsTruncatedTail(t *testing.T) {
 }
 
 func TestLoadWalStateUnrepairableCRCMismatchReturnsError(t *testing.T) {
+	t.Parallel()
 	// wal.Repair only fixes io.ErrUnexpectedEOF (torn trailing record).
 	// A flipped byte inside a persisted record surfaces as a CRC
 	// mismatch, which is genuine corruption — repair cannot help and
@@ -273,6 +283,7 @@ func TestLoadWalStateUnrepairableCRCMismatchReturnsError(t *testing.T) {
 }
 
 func TestOpenAndReadWALSucceedsWithoutRepair(t *testing.T) {
+	t.Parallel()
 	// Happy-path sanity check: a pristine WAL opens and ReadAll returns
 	// the expected entries, no repair invoked.
 	dir := seedWAL(t, [][]byte{[]byte("one"), []byte("two")})

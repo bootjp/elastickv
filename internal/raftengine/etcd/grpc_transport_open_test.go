@@ -20,6 +20,7 @@ func (c openingRaftClient) SendStream(ctx context.Context, _ ...grpc.CallOption)
 }
 
 func TestPeerStreamOpeningCallerCancellation(t *testing.T) {
+	t.Parallel()
 	for _, returnStream := range []bool{false, true} {
 		t.Run(map[bool]string{false: "blocked", true: "success_races_cancellation"}[returnStream], func(t *testing.T) {
 			transport := NewGRPCTransport(nil)
@@ -62,6 +63,7 @@ func TestPeerStreamOpeningCallerCancellation(t *testing.T) {
 }
 
 func TestPeerStreamSurvivesOpeningCallerDeadline(t *testing.T) {
+	t.Parallel()
 	transport := NewGRPCTransport(nil)
 	t.Cleanup(func() { require.NoError(t, transport.Close()) })
 	const address = "peer:2"

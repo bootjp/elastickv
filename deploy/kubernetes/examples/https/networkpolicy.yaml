@@ -1,0 +1,19 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: elastickv-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: elastickv
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              elastickv-ingress: "true"
+      ports:
+        - protocol: TCP
+          port: 9000
+        - protocol: TCP
+          port: 9324

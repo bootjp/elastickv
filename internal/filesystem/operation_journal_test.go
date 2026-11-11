@@ -184,6 +184,7 @@ func (b *routeSwitchOperationBackend) CommitAtRouteVersion(ctx context.Context, 
 }
 
 func TestOperationJournalSelectsRecordAsTransactionPrimary(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := store.NewMVCCStore()
 	dispatch := &primaryCaptureDispatcher{inner: &testCoordinator{st: st}}
@@ -205,6 +206,7 @@ func TestOperationJournalSelectsRecordAsTransactionPrimary(t *testing.T) {
 }
 
 func TestOperationJournalGenerationFenceRejectsChangedRouteVersion(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := store.NewMVCCStore()
 	dispatch := &primaryCaptureDispatcher{inner: &testCoordinator{st: st}, routeVersion: 7}
@@ -232,6 +234,7 @@ func TestOperationJournalGenerationFenceRejectsChangedRouteVersion(t *testing.T)
 }
 
 func TestOperationJournalPublicationRejectsChangedPlanningRoute(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := store.NewMVCCStore()
 	dispatch := &primaryCaptureDispatcher{inner: &testCoordinator{st: st}, routeVersion: 7}
@@ -263,6 +266,7 @@ func TestOperationJournalPublicationRejectsChangedPlanningRoute(t *testing.T) {
 }
 
 func TestOperationJournalDuplicateResultSurvivesPlanningRouteChange(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := store.NewMVCCStore()
 	dispatch := &primaryCaptureDispatcher{inner: &testCoordinator{st: st}, routeVersion: 7}
@@ -288,6 +292,7 @@ func TestOperationJournalDuplicateResultSurvivesPlanningRouteChange(t *testing.T
 }
 
 func TestOperationJournalPublishesResultWithEffectAndRetiresIdentity(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	journal, st, coord := testOperationJournal(t)
 	id := testOperationID(t, journal, 1)
@@ -398,6 +403,7 @@ func (unavailableOperationRouteCoordinator) ResolveOperationGroupForKey([]byte) 
 }
 
 func TestOperationProofsAllowUnshardedCoordinatorWithoutRouteCapability(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	service, err := NewService(st, unavailableOperationRouteCoordinator{&testCoordinator{st: st}})
 	require.NoError(t, err)
@@ -424,6 +430,7 @@ func (b partitionedOperationProofBackend) CommittedVersionAtGroup(ctx context.Co
 }
 
 func TestOperationProofsBindRoutedEffectsToReceiptParticipants(t *testing.T) {
+	t.Parallel()
 	journal, _, _ := testOperationJournal(t)
 	journal = newOperationJournalWithBackend(partitionedOperationProofBackend{journal.backend})
 	input := []*kv.Elem[kv.OP]{
@@ -635,6 +642,7 @@ func (b *lostOperationCommitBackend) Commit(ctx context.Context, ts uint64, elem
 }
 
 func TestOperationJournalResolvesLostCommitResponseWithoutReplayingEffect(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	journal, st, _ := testOperationJournal(t)
 	id := testOperationID(t, journal, 1)
@@ -664,6 +672,7 @@ func TestOperationJournalResolvesLostCommitResponseWithoutReplayingEffect(t *tes
 }
 
 func TestOperationJournalRetriesLostSessionRegistrationWithSameIdentity(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	journal, _, _ := testOperationJournal(t)
 	filesystemID, err := journal.EnsureFilesystem(ctx)
@@ -686,6 +695,7 @@ func TestOperationJournalRetriesLostSessionRegistrationWithSameIdentity(t *testi
 }
 
 func TestOperationJournalReturnsSessionIdentityAfterLostRegistrationReply(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	journal, _, _ := testOperationJournal(t)
 	filesystemID, err := journal.EnsureFilesystem(ctx)
@@ -703,6 +713,7 @@ func TestOperationJournalReturnsSessionIdentityAfterLostRegistrationReply(t *tes
 }
 
 func TestOperationJournalWaitsForEveryEffectAfterDecision(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	journal, st, _ := testOperationJournal(t)
 	id := testOperationID(t, journal, 1)
@@ -729,6 +740,7 @@ func TestOperationJournalWaitsForEveryEffectAfterDecision(t *testing.T) {
 }
 
 func TestOperationJournalKeepsProofAfterEffectVersionCompaction(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	journal, st, _ := testOperationJournal(t)
 	id := testOperationID(t, journal, 1)
@@ -757,6 +769,7 @@ func TestOperationJournalKeepsProofAfterEffectVersionCompaction(t *testing.T) {
 }
 
 func TestOperationJournalWritesOneReceiptPerParticipant(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	journal, st, _ := testOperationJournal(t)
 	id := testOperationID(t, journal, 1)
@@ -783,6 +796,7 @@ func TestOperationJournalWritesOneReceiptPerParticipant(t *testing.T) {
 }
 
 func TestOperationJournalCancellationFencesAttempt(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	journal, st, _ := testOperationJournal(t)
 	id := testOperationID(t, journal, 1)
@@ -809,6 +823,7 @@ func TestOperationJournalCancellationFencesAttempt(t *testing.T) {
 }
 
 func TestOperationJournalCancellationReturnsWinningCommit(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	journal, st, _ := testOperationJournal(t)
 	id := testOperationID(t, journal, 1)
@@ -829,6 +844,7 @@ func TestOperationJournalCancellationReturnsWinningCommit(t *testing.T) {
 }
 
 func TestOperationJournalDuplicateRejectionReturnsOriginalResult(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	journal, st, _ := testOperationJournal(t)
 	id := testOperationID(t, journal, 1)
@@ -851,6 +867,7 @@ func TestOperationJournalDuplicateRejectionReturnsOriginalResult(t *testing.T) {
 }
 
 func TestOperationJournalPublishUsesPlanningSnapshotForReadValidation(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	journal, st, _ := testOperationJournal(t)
 	id := testOperationID(t, journal, 1)
@@ -873,6 +890,7 @@ func TestOperationJournalPublishUsesPlanningSnapshotForReadValidation(t *testing
 }
 
 func TestOperationJournalRejectUsesPlanningSnapshotForReadValidation(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	journal, st, _ := testOperationJournal(t)
 	id := testOperationID(t, journal, 1)
@@ -892,6 +910,7 @@ func TestOperationJournalRejectUsesPlanningSnapshotForReadValidation(t *testing.
 }
 
 func TestOperationJournalRejectsJournalKeysAsEffects(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	journal, _, _ := testOperationJournal(t)
 	id := testOperationID(t, journal, 1)
@@ -909,6 +928,7 @@ func TestOperationJournalRejectsJournalKeysAsEffects(t *testing.T) {
 }
 
 func TestOperationJournalOwnerFenceAndRecovery(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	journal, _, _ := testOperationJournal(t)
 	id := testOperationID(t, journal, 1)
@@ -939,6 +959,7 @@ func TestOperationJournalOwnerFenceAndRecovery(t *testing.T) {
 }
 
 func TestOperationJournalRecoverOwnerSession(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	journal, _, _ := testOperationJournal(t)
 	id := testOperationID(t, journal, 1)
@@ -957,6 +978,7 @@ func TestOperationJournalRecoverOwnerSession(t *testing.T) {
 }
 
 func TestAcknowledgeOperationCancelsPendingReply(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	journal, st, coord := testOperationJournal(t)
 	svc, err := NewService(st, coord)
@@ -973,6 +995,7 @@ func TestAcknowledgeOperationCancelsPendingReply(t *testing.T) {
 }
 
 func TestAcknowledgeOperationRetiresUnadmittedIdentity(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	journal, st, coord := testOperationJournal(t)
 	svc, err := NewService(st, coord)
@@ -998,6 +1021,7 @@ func TestAcknowledgeOperationRetiresUnadmittedIdentity(t *testing.T) {
 }
 
 func TestRetireUnadmittedDoesNotRetireAdmittedIdentity(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	journal, _, _ := testOperationJournal(t)
 	id := testOperationID(t, journal, 1)
@@ -1009,6 +1033,7 @@ func TestRetireUnadmittedDoesNotRetireAdmittedIdentity(t *testing.T) {
 }
 
 func TestOperationJournalAcknowledgementGapsRetireWithoutReuse(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	journal, _, _ := testOperationJournal(t)
 	first := testOperationID(t, journal, 1)
@@ -1034,6 +1059,7 @@ func TestOperationJournalAcknowledgementGapsRetireWithoutReuse(t *testing.T) {
 }
 
 func TestOperationJournalDoesNotAdvanceLegacyAttempt(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	journal, st, _ := testOperationJournal(t)
 	id := testOperationID(t, journal, 1)
@@ -1065,6 +1091,7 @@ func TestOperationJournalDoesNotAdvanceLegacyAttempt(t *testing.T) {
 }
 
 func TestOperationJournalNewGenerationDoesNotProveOldAttemptAborted(t *testing.T) {
+	t.Parallel()
 	id := OperationID{Filesystem: [16]byte{1}, Session: [16]byte{2}, Sequence: 1}
 	oldAttempt := [16]byte{3}
 	newAttempt := [16]byte{4}
@@ -1091,6 +1118,7 @@ func TestOperationJournalNewGenerationDoesNotProveOldAttemptAborted(t *testing.T
 }
 
 func TestOperationJournalForeignRecordNeverProvesAttemptOutcome(t *testing.T) {
+	t.Parallel()
 	id := OperationID{Filesystem: [16]byte{1}, Session: [16]byte{2}, Sequence: 1}
 	foreign := OperationID{Filesystem: id.Filesystem, Session: id.Session, Sequence: 2}
 	attempt := [16]byte{3}
@@ -1102,6 +1130,7 @@ func TestOperationJournalForeignRecordNeverProvesAttemptOutcome(t *testing.T) {
 }
 
 func TestOperationJournalGenerationFenceStopsDelayedOldCommit(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	journal, st, _ := testOperationJournal(t)
 	id := testOperationID(t, journal, 1)
@@ -1147,6 +1176,7 @@ func TestOperationJournalGenerationFenceStopsDelayedOldCommit(t *testing.T) {
 }
 
 func TestOperationJournalCommittedAttemptWinsGenerationFence(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	journal, _, _ := testOperationJournal(t)
 	id := testOperationID(t, journal, 1)
@@ -1166,6 +1196,7 @@ func TestOperationJournalCommittedAttemptWinsGenerationFence(t *testing.T) {
 }
 
 func TestOperationJournalLostGenerationFenceReplyRecoversAbortProof(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	journal, _, _ := testOperationJournal(t)
 	id := testOperationID(t, journal, 1)
@@ -1225,6 +1256,7 @@ func TestOperationJournalAdvanceGenerationUnknownWithoutSingleGroupProof(t *test
 }
 
 func TestOperationJournalGenerationFenceRespectsSessionQuota(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	journal, _, _ := testOperationJournal(t)
 	id := testOperationID(t, journal, 1)
@@ -1244,6 +1276,7 @@ func TestOperationJournalGenerationFenceRespectsSessionQuota(t *testing.T) {
 }
 
 func TestOperationJournalGenerationFenceReleasesReservedBytesOnAcknowledgement(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	journal, _, _ := testOperationJournal(t)
 	id := testOperationID(t, journal, 1)
@@ -1271,6 +1304,7 @@ func TestOperationJournalGenerationFenceReleasesReservedBytesOnAcknowledgement(t
 }
 
 func TestOperationJournalSnapshotRetainsTerminalAndPendingRecords(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	journal, st, _ := testOperationJournal(t)
 	committedID := testOperationID(t, journal, 1)
@@ -1314,6 +1348,7 @@ func TestOperationJournalSnapshotRetainsTerminalAndPendingRecords(t *testing.T) 
 }
 
 func TestOperationRecordCodecRejectsInvalidEnvelopeAndUnstampedTerminal(t *testing.T) {
+	t.Parallel()
 	journal, _, _ := testOperationJournal(t)
 	id := testOperationID(t, journal, 1)
 	record := newOperationRecord(id, []byte("write"), 128, 1024)

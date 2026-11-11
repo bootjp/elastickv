@@ -62,6 +62,7 @@ func scopeAuditFSMForStore(t *testing.T, backend store.MVCCStore, opts ...kv.FSM
 }
 
 func TestActualFSMRawMigrationTrackerScopeRouting(t *testing.T) {
+	t.Parallel()
 	for _, disk := range []bool{false, true} {
 		t.Run(map[bool]string{false: "memory", true: "pebble"}[disk], func(t *testing.T) {
 			backend := store.NewMVCCStore()
@@ -128,6 +129,7 @@ func scopeAuditTxnRequest(phase pb.Phase, primary, key string, start, commit uin
 }
 
 func TestActualFSMPrimarySecondaryDoNotEnterRawScope(t *testing.T) {
+	t.Parallel()
 	primary, primaryFSM := newScopeAuditFSM(t)
 	secondary, secondaryFSM := newScopeAuditFSM(t)
 	for _, participant := range []struct {
@@ -168,6 +170,7 @@ func TestActualFSMPrimarySecondaryDoNotEnterRawScope(t *testing.T) {
 }
 
 func TestActualFSMRawControlAndSnapshotScopeRouting(t *testing.T) {
+	t.Parallel()
 	s, fsm := newScopeAuditFSM(t)
 	applyScopeAuditRequests(t, fsm,
 		&pb.Request{Ts: 10, Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("raw-a"), Value: []byte("a")}}},
@@ -198,6 +201,7 @@ func TestActualFSMRawControlAndSnapshotScopeRouting(t *testing.T) {
 }
 
 func TestActualFSMMigrationsBypassIndexedScope(t *testing.T) {
+	t.Parallel()
 	s, fsm := newScopeAuditFSM(t)
 	importPayload, err := kv.MarshalMigrationImportCommand(&pb.ImportRangeVersionsRequest{
 		JobId: 9, BracketId: 1, BatchSeq: 1, Versions: []*pb.MVCCVersion{{Key: []byte("user|key"), Value: []byte("migrated"), CommitTs: 10, KeyFamily: distribution.MigrationFamilyUser}},

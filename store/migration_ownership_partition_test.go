@@ -51,6 +51,7 @@ func partitionStore(t *testing.T, st MVCCStore) MigrationOwnershipPartitionStore
 }
 
 func TestOwnershipPartitionAtomicSplitRefreshAndLateReplay(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		old, tx := partitionFixture(t, st)
 		proofs := partitionStore(t, st)
@@ -105,6 +106,7 @@ func TestOwnershipPartitionAtomicSplitRefreshAndLateReplay(t *testing.T) {
 }
 
 func TestOwnershipPartitionRejectsBeforeEffects(t *testing.T) {
+	t.Parallel()
 	cases := map[string]func(*MigrationOwnershipPartitionTransition){
 		"owner grant": func(tx *MigrationOwnershipPartitionTransition) {
 			tx.After[0].Role, tx.After[0].OwnerGroupID = MigrationOwner, 1
@@ -146,6 +148,7 @@ func TestOwnershipPartitionRejectsBeforeEffects(t *testing.T) {
 }
 
 func TestOwnershipPartitionRequiresAllLegacyOverlays(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		old, tx := partitionFixture(t, st)
 		newer := old
@@ -167,6 +170,7 @@ func TestOwnershipPartitionRequiresAllLegacyOverlays(t *testing.T) {
 }
 
 func TestOwnershipPartitionUnboundedUnionAndUnknownLegacy(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		old, tx := partitionFixture(t, st)
 		old.RouteStart, old.RouteEnd, old.JobID, old.CatalogVersion = nil, nil, 8, 11

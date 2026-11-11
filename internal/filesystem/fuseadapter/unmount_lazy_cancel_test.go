@@ -16,6 +16,7 @@ import (
 // Raft runtimes behind it are closed, and a request arriving afterwards
 // starts already cancelled.
 func TestUnmountLazyCancelsInFlightRequests(t *testing.T) {
+	t.Parallel()
 	fs := NewRawFileSystem(nil)
 	server := &Server{fs: fs}
 	inFlight, done := fs.requestContext(nil)

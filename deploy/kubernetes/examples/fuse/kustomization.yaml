@@ -1,0 +1,22 @@
+# Existing cluster only. Publish the FUSE image and replace its placeholder.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+patches:
+  - path: statefulset.yaml
+  - target:
+      group: apps
+      version: v1
+      kind: StatefulSet
+      name: elastickv
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: --filesystemMount=/shared/fs
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: --filesystemRootUID=65532
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: --filesystemRootGID=65532

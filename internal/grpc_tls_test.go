@@ -18,6 +18,7 @@ import (
 )
 
 func TestConfigureGRPCTLSValidatesFiles(t *testing.T) {
+	// Not parallel: ConfigureGRPCTLS sets the package-global grpcTLS.
 	require.ErrorContains(t, ConfigureGRPCTLS("ca.pem", "", ""), "certificate and key")
 	require.ErrorContains(t, ConfigureGRPCTLS("", "missing.pem", "missing.key"), "certificate/key")
 	_, err := GRPCClientTLSCredentials("missing.pem")
@@ -31,6 +32,7 @@ func TestConfigureGRPCTLSValidatesFiles(t *testing.T) {
 }
 
 func TestGRPCTLSCommonOptionsVerifyPeer(t *testing.T) {
+	// Not parallel: ConfigureGRPCTLS sets the package-global grpcTLS.
 	fixture := httptest.NewTLSServer(nil)
 	fixture.Close()
 	cert := fixture.Certificate()

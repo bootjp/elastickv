@@ -10,6 +10,7 @@ import (
 )
 
 func TestBackgroundReservationStartsLiveAfterShutdownBound(t *testing.T) {
+	t.Parallel()
 	w := newBackgroundWorkers()
 	r, ok := w.reserve()
 	require.True(t, ok)
@@ -23,6 +24,7 @@ func TestBackgroundReservationStartsLiveAfterShutdownBound(t *testing.T) {
 }
 
 func TestBackgroundReservationCannotStartAfterStopReturns(t *testing.T) {
+	t.Parallel()
 	w := newBackgroundWorkers()
 	r, ok := w.reserve()
 	require.True(t, ok)

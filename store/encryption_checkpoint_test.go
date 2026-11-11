@@ -11,6 +11,7 @@ import (
 )
 
 func TestEncryptionCheckpointDurableMetadataSurvivesReopenAndSnapshot(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "source")
 	st, err := NewPebbleStore(path)
 	require.NoError(t, err)

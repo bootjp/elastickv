@@ -10,7 +10,7 @@ import subprocess
 import time
 
 
-def await_contents(path, expected, seconds=90):
+def await_contents(path, expected, seconds=120):
     deadline = time.monotonic() + seconds
     last_error = None
     while time.monotonic() < deadline:

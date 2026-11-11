@@ -20,6 +20,7 @@ func changedNegativeManifest(t *testing.T, c MigrationPartitionControl) distribu
 }
 
 func TestPartitionNegativeGeometryPreservesHistoricalDenialAndRefresh(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	f, old := partitionControlFixture(t, st, 2)
 	m := changedNegativeManifest(t, old)
@@ -53,6 +54,7 @@ func TestPartitionNegativeGeometryPreservesHistoricalDenialAndRefresh(t *testing
 }
 
 func TestPartitionNegativeGeometryRejectsAuthorityAndGeometryChanges(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name   string
 		mutate func(*distribution.OwnershipPartitionManifest, []store.MigrationOwnershipState)
@@ -98,6 +100,7 @@ func TestPartitionNegativeGeometryRejectsAuthorityAndGeometryChanges(t *testing.
 }
 
 func TestPartitionNegativeGeometryRejectsAnyOwnerInCompletePrior(t *testing.T) {
+	t.Parallel()
 	_, old := partitionControlFixture(t, store.NewMVCCStore(), 2)
 	negative := old.PriorOwnership[0]
 	negative.CatalogVersion = 2

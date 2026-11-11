@@ -12,6 +12,7 @@ import (
 )
 
 func TestMigrationCleanupConfigurationRejectsBeforeSideEffects(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	for _, mode := range []pb.MigrationCleanupMode{pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_VERSIONS, pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_METADATA} {
 		t.Run(mode.String(), func(t *testing.T) {
@@ -78,6 +79,7 @@ func TestMigrationCleanupConfigurationRejectsBeforeSideEffects(t *testing.T) {
 }
 
 func TestMigrationConfigurationSurvivesSnapshotAndReopen(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := store.NewMVCCStore()
 	fsm, ok := NewKvFSMWithHLC(st, nil).(*kvFSM)
@@ -108,6 +110,7 @@ func TestMigrationConfigurationSurvivesSnapshotAndReopen(t *testing.T) {
 }
 
 func TestMigrationConfigurationSharesDurableAppliedBoundary(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	dir := t.TempDir()
 	st, err := store.NewPebbleStore(dir)
@@ -132,6 +135,7 @@ func TestMigrationConfigurationSharesDurableAppliedBoundary(t *testing.T) {
 }
 
 func TestMigrationConfigurationCorruptionCannotBeOverwrittenByConfChange(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	require.NoError(t, st.PutAt(t.Context(), migrationConfigurationIndexKey, []byte{1}, 100, 0))
 	fsm, ok := NewKvFSMWithHLC(st, nil).(*kvFSM)

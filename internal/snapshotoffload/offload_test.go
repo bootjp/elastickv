@@ -17,6 +17,7 @@ import (
 )
 
 func TestPublishAndRestorePhysicalSnapshotRoundTrip(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	root := t.TempDir()
 	payload := []byte("EKVTHLC1opaque-physical-snapshot-payload")
@@ -80,6 +81,7 @@ func TestPublishAndRestorePhysicalSnapshotRoundTrip(t *testing.T) {
 }
 
 func TestRestoreRejectsCorruptPayloadAndLeavesDestinationAbsent(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	root := t.TempDir()
 	payload := []byte("EKVTHLC1payload-before-corruption")
@@ -112,6 +114,7 @@ func TestRestoreRejectsCorruptPayloadAndLeavesDestinationAbsent(t *testing.T) {
 }
 
 func TestPublishRejectsExistingPayloadMismatchBeforeManifest(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	root := t.TempDir()
 	payload := []byte("EKVTHLC1payload-with-known-sha")
@@ -142,6 +145,7 @@ func TestPublishRejectsExistingPayloadMismatchBeforeManifest(t *testing.T) {
 }
 
 func TestPublishRejectsExistingManifestMismatch(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	root := t.TempDir()
 	payload := []byte("EKVTHLC1payload-with-conflicting-manifest")
@@ -169,6 +173,7 @@ func TestPublishRejectsExistingManifestMismatch(t *testing.T) {
 }
 
 func TestPublishReusesExistingObjectsWithoutHeadChecksum(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	root := t.TempDir()
 	payload := []byte("EKVTHLC1payload-reused-by-retry")
@@ -201,6 +206,7 @@ func TestPublishReusesExistingObjectsWithoutHeadChecksum(t *testing.T) {
 }
 
 func TestPublishReusesExistingManifestWhenCreatedAtOmitted(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	root := t.TempDir()
 	payload := []byte("EKVTHLC1payload-retry-with-implicit-created-at")
@@ -226,6 +232,7 @@ func TestPublishReusesExistingManifestWhenCreatedAtOmitted(t *testing.T) {
 }
 
 func TestPutManifestReusesExistingManifestAfterCreateConflict(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	store := newTestLocalStore(t, filepath.Join(t.TempDir(), "objects"))
 	key, err := manifestKey("cluster-a", 1, 20, 13)
@@ -284,6 +291,7 @@ func TestPutManifestReusesExistingManifestAfterCreateConflict(t *testing.T) {
 }
 
 func TestDecodeManifestRejectsInvalidConfStateMembership(t *testing.T) {
+	t.Parallel()
 	base := testManifestForValidation(t)
 	testCases := []ManifestConfState{
 		{Voters: nil},
@@ -308,6 +316,7 @@ func TestDecodeManifestRejectsInvalidConfStateMembership(t *testing.T) {
 }
 
 func TestDecodeManifestAcceptsJointConsensusConfState(t *testing.T) {
+	t.Parallel()
 	manifest := testManifestForValidation(t)
 	manifest.ConfState = ManifestConfState{
 		Voters:         []uint64{1, 2},
@@ -323,6 +332,7 @@ func TestDecodeManifestAcceptsJointConsensusConfState(t *testing.T) {
 }
 
 func TestPublishRejectsEveryGroupWithoutSourceClusterBeforePayload(t *testing.T) {
+	t.Parallel()
 	for _, groupID := range []uint64{0, 7} {
 		t.Run(fmt.Sprintf("group-%d", groupID), func(t *testing.T) {
 			ctx := context.Background()
@@ -349,6 +359,7 @@ func TestPublishRejectsEveryGroupWithoutSourceClusterBeforePayload(t *testing.T)
 }
 
 func TestPublishUsesDataDirLocalSpoolByDefault(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	root := t.TempDir()
 	payload := []byte("EKVTHLC1payload-spooled-near-data-dir")
@@ -367,6 +378,7 @@ func TestPublishUsesDataDirLocalSpoolByDefault(t *testing.T) {
 }
 
 func TestLoadManifestRejectsStaleSelfHash(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	root := t.TempDir()
 	payload := []byte("EKVTHLC1payload-for-stale-manifest-hash")
@@ -396,6 +408,7 @@ func TestLoadManifestRejectsStaleSelfHash(t *testing.T) {
 }
 
 func TestRestoreInlineManifestRejectsStaleSelfHashBeforePayloadDownload(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	root := t.TempDir()
 	payload := []byte("EKVTHLC1payload-for-inline-stale-manifest-hash")
@@ -426,6 +439,7 @@ func TestRestoreInlineManifestRejectsStaleSelfHashBeforePayloadDownload(t *testi
 }
 
 func TestLoadManifestRejectsOversizedBody(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	store := newTestLocalStore(t, filepath.Join(t.TempDir(), "objects"))
 	key := "cluster-a/v1/groups/1/snapshots/oversized.json"
@@ -442,6 +456,7 @@ func TestLoadManifestRejectsOversizedBody(t *testing.T) {
 }
 
 func TestLocalStoreRejectsParentDirectoryKeys(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	store := newTestLocalStore(t, filepath.Join(t.TempDir(), "objects"))
 	emptySHA := hexSHA256Bytes(nil)
@@ -453,6 +468,7 @@ func TestLocalStoreRejectsParentDirectoryKeys(t *testing.T) {
 }
 
 func TestLocalStoreHeadObjectUsesStatMetadata(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	store := newTestLocalStore(t, filepath.Join(t.TempDir(), "objects"))
 	body := []byte("metadata-only-head")
@@ -482,6 +498,7 @@ func TestLocalStoreHeadObjectUsesStatMetadata(t *testing.T) {
 }
 
 func TestPublishHonorsCancelledContextWhileSpooling(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	root := t.TempDir()
@@ -500,6 +517,7 @@ func TestPublishHonorsCancelledContextWhileSpooling(t *testing.T) {
 }
 
 func TestRestorePreflightsExistingDestinationBeforePayloadDownload(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	root := t.TempDir()
 	payload := []byte("EKVTHLC1payload-before-existing-destination")
@@ -531,6 +549,7 @@ func TestRestorePreflightsExistingDestinationBeforePayloadDownload(t *testing.T)
 }
 
 func TestRestoreRejectsInvalidPeersBeforePayloadDownload(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	root := t.TempDir()
 	payload := []byte("EKVTHLC1payload-invalid-restore-peers")
@@ -561,6 +580,7 @@ func TestRestoreRejectsInvalidPeersBeforePayloadDownload(t *testing.T) {
 }
 
 func TestRestoreHonorsCancelledContextBeforePayloadDownload(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	root := t.TempDir()
@@ -590,6 +610,7 @@ func TestRestoreHonorsCancelledContextBeforePayloadDownload(t *testing.T) {
 }
 
 func TestPrepareRestoreDownloadDirCreatesParentAndCleansOnlyStaleDirs(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	dataDir := filepath.Join(root, "missing-parent", "restored")
 
@@ -793,6 +814,7 @@ func (s *headOrderingStore) PutObject(
 // which a node demoted during that read still commits a manifest —
 // exactly the guarantee the scheduler exists to provide.
 func TestPublishVerifiesLeadershipAfterTheManifestAbsenceProbe(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	root := t.TempDir()
 	payload := []byte("EKVTHLC1ordering-payload")

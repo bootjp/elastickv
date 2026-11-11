@@ -8,6 +8,7 @@ import (
 )
 
 func TestMigrationOwnershipRefreshPreservesImmutableReceipt(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		state := ownershipFixture(t, st)
 		state.Generation, state.RouteID, state.ParentRouteID = "0123456789abcdef0123456789abcdef", 3, 1
@@ -59,6 +60,7 @@ func TestMigrationOwnershipRefreshPreservesImmutableReceipt(t *testing.T) {
 }
 
 func TestMigrationOwnershipPromotedClearKeepsAcquireReceipt(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		writer, ok := st.(MigrationTargetReadinessRaftWriter)
 		require.True(t, ok)

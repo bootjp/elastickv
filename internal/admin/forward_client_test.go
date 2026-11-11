@@ -53,6 +53,7 @@ func fixedResolver(addr string) LeaderAddressResolver {
 }
 
 func TestNewGRPCForwardClient_RejectsMissingDeps(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name     string
 		resolver LeaderAddressResolver
@@ -75,6 +76,7 @@ func TestNewGRPCForwardClient_RejectsMissingDeps(t *testing.T) {
 }
 
 func TestGRPCForwardClient_ForwardCreateTable_HappyPath(t *testing.T) {
+	t.Parallel()
 	conn := &stubForwardConn{resp: &pb.AdminForwardResponse{
 		StatusCode:  http.StatusCreated,
 		Payload:     []byte(`{"name":"users"}`),
@@ -106,6 +108,7 @@ func TestGRPCForwardClient_ForwardCreateTable_HappyPath(t *testing.T) {
 }
 
 func TestGRPCForwardClient_ForwardDeleteTable_HappyPath(t *testing.T) {
+	t.Parallel()
 	conn := &stubForwardConn{resp: &pb.AdminForwardResponse{
 		StatusCode:  http.StatusNoContent,
 		ContentType: "application/json; charset=utf-8",
@@ -123,6 +126,7 @@ func TestGRPCForwardClient_ForwardDeleteTable_HappyPath(t *testing.T) {
 }
 
 func TestGRPCForwardClient_NoLeaderReturnsErrLeaderUnavailable(t *testing.T) {
+	t.Parallel()
 	dial := &stubConnFactory{conn: &stubForwardConn{}}
 	fwd, _ := NewGRPCForwardClient(fixedResolver(""), dial, "f")
 
@@ -134,6 +138,7 @@ func TestGRPCForwardClient_NoLeaderReturnsErrLeaderUnavailable(t *testing.T) {
 }
 
 func TestGRPCForwardClient_DialErrorPropagated(t *testing.T) {
+	t.Parallel()
 	dial := &stubConnFactory{dialErr: errors.New("network unreachable")}
 	fwd, _ := NewGRPCForwardClient(fixedResolver("leader:1"), dial, "f")
 
@@ -144,6 +149,7 @@ func TestGRPCForwardClient_DialErrorPropagated(t *testing.T) {
 }
 
 func TestGRPCForwardClient_GRPCErrorPropagated(t *testing.T) {
+	t.Parallel()
 	conn := &stubForwardConn{err: errors.New("rpc deadline exceeded")}
 	dial := &stubConnFactory{conn: conn}
 	fwd, _ := NewGRPCForwardClient(fixedResolver("leader:1"), dial, "f")
@@ -154,6 +160,7 @@ func TestGRPCForwardClient_GRPCErrorPropagated(t *testing.T) {
 }
 
 func TestGRPCForwardClient_ZeroStatusUpgradesTo502(t *testing.T) {
+	t.Parallel()
 	// status_code 0 is the proto zero value — never emitted
 	// intentionally by the leader. The forwarder must not treat
 	// that as 200; mapping it to 502 surfaces the transport bug.
@@ -168,6 +175,7 @@ func TestGRPCForwardClient_ZeroStatusUpgradesTo502(t *testing.T) {
 }
 
 func TestGRPCForwardClient_FillsMissingContentType(t *testing.T) {
+	t.Parallel()
 	// A future leader-server change that omits ContentType must
 	// still produce a SPA-readable response. The forwarder fills
 	// in the default JSON content type defensively.
@@ -184,6 +192,7 @@ func TestGRPCForwardClient_FillsMissingContentType(t *testing.T) {
 }
 
 func TestGRPCForwardClient_ForwardCreateBucket_HappyPath(t *testing.T) {
+	t.Parallel()
 	conn := &stubForwardConn{resp: &pb.AdminForwardResponse{
 		StatusCode:  http.StatusCreated,
 		Payload:     []byte(`{"bucket_name":"public-assets","acl":"public-read"}`),
@@ -206,6 +215,7 @@ func TestGRPCForwardClient_ForwardCreateBucket_HappyPath(t *testing.T) {
 }
 
 func TestGRPCForwardClient_ForwardDeleteBucket_HappyPath(t *testing.T) {
+	t.Parallel()
 	conn := &stubForwardConn{resp: &pb.AdminForwardResponse{
 		StatusCode:  http.StatusNoContent,
 		ContentType: "application/json; charset=utf-8",
@@ -222,6 +232,7 @@ func TestGRPCForwardClient_ForwardDeleteBucket_HappyPath(t *testing.T) {
 }
 
 func TestGRPCForwardClient_ForwardPutBucketAcl_HappyPath(t *testing.T) {
+	t.Parallel()
 	conn := &stubForwardConn{resp: &pb.AdminForwardResponse{
 		StatusCode:  http.StatusNoContent,
 		ContentType: "application/json; charset=utf-8",
@@ -240,6 +251,7 @@ func TestGRPCForwardClient_ForwardPutBucketAcl_HappyPath(t *testing.T) {
 }
 
 func TestGRPCForwardClient_BucketOps_NoLeaderReturnsErrLeaderUnavailable(t *testing.T) {
+	t.Parallel()
 	dial := &stubConnFactory{conn: &stubForwardConn{}}
 	fwd, _ := NewGRPCForwardClient(fixedResolver(""), dial, "f")
 

@@ -10,6 +10,7 @@ import (
 )
 
 func TestHandleOperationsSupportLongClientID(t *testing.T) {
+	t.Parallel()
 	ctx := t.Context()
 	svc := newTestServiceWithOptions(t, []uint64{2, 3, 4})
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -27,6 +28,7 @@ func TestHandleOperationsSupportLongClientID(t *testing.T) {
 }
 
 func TestOpenWithOperationRetainsOneHandle(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, []uint64{2, 3, 4})
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -53,6 +55,7 @@ func TestOpenWithOperationRetainsOneHandle(t *testing.T) {
 }
 
 func TestOpenWithOperationRetainsMissingInode(t *testing.T) {
+	t.Parallel()
 	svc := newTestServiceWithOptions(t, nil)
 	require.NoError(t, svc.InitializeRoot(t.Context(), testRootMode, 1000, 1000))
 	id := testWriteOperationID(t, svc, 1)
@@ -63,6 +66,7 @@ func TestOpenWithOperationRetainsMissingInode(t *testing.T) {
 }
 
 func TestOpenWithOperationResolvesLostCommitReply(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, []uint64{2, 3})
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))

@@ -53,6 +53,7 @@ func requireObservedBeforeNotify(t *testing.T, currents []uint64, commitTS uint6
 }
 
 func TestFSMApplyObserverRawMutationsAfterSuccess(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	observer := &recordingApplyObserver{}
 	fsm, ok := NewKvFSMWithHLC(st, NewHLC(), WithApplyObserver(observer)).(*kvFSM)
@@ -87,6 +88,7 @@ func TestFSMApplyObserverRawMutationsAfterSuccess(t *testing.T) {
 }
 
 func TestFSMApplyObserverNotifiesEveryObserver(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	observerA := &recordingApplyObserver{}
 	observerB := &recordingApplyObserver{}
@@ -108,6 +110,7 @@ func TestFSMApplyObserverNotifiesEveryObserver(t *testing.T) {
 }
 
 func TestFSMApplyObserverTxnVisibleMutationsOnly(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	observer := &recordingApplyObserver{}
 	fsm, ok := NewKvFSMWithHLC(st, NewHLC(), WithApplyObserver(observer)).(*kvFSM)
@@ -146,6 +149,7 @@ func TestFSMApplyObserverTxnVisibleMutationsOnly(t *testing.T) {
 }
 
 func TestFSMApplyObserverOnePhaseTxnAfterSuccess(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	observer := &recordingApplyObserver{}
 	fsm, ok := NewKvFSMWithHLC(st, NewHLC(), WithApplyObserver(observer)).(*kvFSM)
@@ -169,6 +173,7 @@ func TestFSMApplyObserverOnePhaseTxnAfterSuccess(t *testing.T) {
 }
 
 func TestFSMApplyObserverSeesObservedCommitTS(t *testing.T) {
+	t.Parallel()
 	t.Run("raw", func(t *testing.T) {
 		st := store.NewMVCCStore()
 		hlc := NewHLC()

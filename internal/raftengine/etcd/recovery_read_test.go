@@ -93,6 +93,7 @@ func publishRecoveryReadProjection(t *testing.T, node *transportTestNode, guard 
 }
 
 func TestRecoveryReadIndexActualFollowerUsesOriginalRecoveryHandle(t *testing.T) {
+	t.Parallel()
 	nodes, guards := newRecoveryReadCluster(t)
 	leader := waitForLeaderNode(t, nodes)
 	var follower *transportTestNode
@@ -155,11 +156,13 @@ func recoveryReadFollowerBarrier(t *testing.T, follower *transportTestNode, guar
 }
 
 func TestRecoveryReadIndexRequiresNativeGuard(t *testing.T) {
+	t.Parallel()
 	_, err := (&Engine{}).RecoveryLinearizableRead(t.Context())
 	require.ErrorIs(t, err, raftengine.ErrNativeAdmissionDenied)
 }
 
 func TestRecoveryReadIndexCancellationRemovesPendingRequest(t *testing.T) {
+	t.Parallel()
 	e := identityElectionEngine(t, 1)
 	e.nativeAdmission = fixtureNativeAdmission{}
 	e.readCh = make(chan readRequest)

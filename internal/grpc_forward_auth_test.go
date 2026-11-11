@@ -11,6 +11,7 @@ import (
 )
 
 func TestGRPCForwardTokenOnlyAuthenticatesPeerForward(t *testing.T) {
+	// Not parallel: ConfigureGRPCForwardToken sets the package-global grpcForwardToken.
 	ConfigureGRPCForwardToken("peer-secret")
 	t.Cleanup(func() { ConfigureGRPCForwardToken("") })
 	ctx := metadata.NewOutgoingContext(context.Background(), metadata.Pairs("authorization", "Bearer stale", "trace-id", "keep"))

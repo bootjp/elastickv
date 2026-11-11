@@ -115,6 +115,7 @@ func alignedHotKeysWindowObserved(columns []MatrixColumn) bool {
 }
 
 func TestAlignedHotKeysWindowObservedSkipsEmptyWindows(t *testing.T) {
+	t.Parallel()
 	start := time.Unix(1_700_000_000, 0)
 	end := start.Add(5 * time.Millisecond)
 	columns := []MatrixColumn{
@@ -130,6 +131,7 @@ func TestAlignedHotKeysWindowObservedSkipsEmptyWindows(t *testing.T) {
 }
 
 func TestFlusherAlignmentProbeAfterHistoryEviction(t *testing.T) {
+	t.Parallel()
 	start := time.Unix(1_700_000_000, 0)
 	step := 5 * time.Millisecond
 	s := NewMemSampler(MemSamplerOptions{

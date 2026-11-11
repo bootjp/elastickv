@@ -179,6 +179,7 @@ func (h *partitionRefreshHarness) frontier(t *testing.T, i int) store.MigrationO
 }
 
 func TestPartitionRefreshThreeApplyMembersAndHistoricalNonowner(t *testing.T) {
+	t.Parallel()
 	for _, local := range []uint64{7, 9} {
 		t.Run(map[uint64]string{7: "owner", 9: "historical-nonowner"}[local], func(t *testing.T) {
 			h := newPartitionRefreshHarness(t, local)
@@ -206,6 +207,7 @@ func TestPartitionRefreshThreeApplyMembersAndHistoricalNonowner(t *testing.T) {
 }
 
 func TestPartitionRefreshLearnerCapabilityAndReceiptAreMandatory(t *testing.T) {
+	t.Parallel()
 	h := newPartitionRefreshHarness(t, 7)
 	h.split(t, h.parent, 2, 3, "m")
 	h.clients[2].old = true
@@ -221,6 +223,7 @@ func TestPartitionRefreshLearnerCapabilityAndReceiptAreMandatory(t *testing.T) {
 }
 
 func TestPartitionRefreshRetainedManifestChainAndCurrentC(t *testing.T) {
+	t.Parallel()
 	h := newPartitionRefreshHarness(t, 7)
 	children := h.split(t, h.parent, 2, 3, "m")
 	h.split(t, children[1], 4, 5, "t")
@@ -251,6 +254,7 @@ func TestPartitionRefreshRetainedManifestChainAndCurrentC(t *testing.T) {
 }
 
 func TestPartitionRefreshRuntimeGroundedAndChangedDescriptorRefuses(t *testing.T) {
+	t.Parallel()
 	h := newPartitionRefreshHarness(t, 7)
 	h.consumer.ownershipRefresh.partitionRuntime.members = nil
 	require.False(t, h.consumer.MigrationPartitionRuntimeConfigured(7))
@@ -265,6 +269,7 @@ func TestPartitionRefreshRuntimeGroundedAndChangedDescriptorRefuses(t *testing.T
 }
 
 func TestPartitionRefreshForegroundCanDriveRemoteSourceLeader(t *testing.T) {
+	t.Parallel()
 	h := newPartitionRefreshHarness(t, 7)
 	h.split(t, h.parent, 2, 3, "m")
 	g := h.consumer.ownershipRefresh.groups[7]
@@ -287,6 +292,7 @@ func TestPartitionRefreshForegroundCanDriveRemoteSourceLeader(t *testing.T) {
 }
 
 func TestPartitionRefreshUnadoptedLegacyUsesRootAndPreservesReceipts(t *testing.T) {
+	t.Parallel()
 	h := newPartitionRefreshHarness(t, 7)
 	writer, ok := h.stores[0].(store.MigrationOwnershipStore)
 	require.True(t, ok)
@@ -309,6 +315,7 @@ func TestPartitionRefreshUnadoptedLegacyUsesRootAndPreservesReceipts(t *testing.
 }
 
 func TestPartitionRefreshNamespaceNeedsEveryApplyMember(t *testing.T) {
+	t.Parallel()
 	h := newPartitionRefreshHarness(t, 7)
 	h.split(t, h.parent, 2, 3, "m")
 	h.clients[2].internal.migrationNamespaceReady = nil
@@ -318,6 +325,7 @@ func TestPartitionRefreshNamespaceNeedsEveryApplyMember(t *testing.T) {
 }
 
 func TestPartitionRefreshCleanupMarkerRequiredExceptNamespaceBootstrap(t *testing.T) {
+	t.Parallel()
 	h := newPartitionRefreshHarness(t, 7)
 	_, err := h.clients[0].internal.CleanupMigration(t.Context(), &pb.CleanupMigrationRequest{JobId: 11, Mode: pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_METADATA})
 	require.Error(t, err, "ordinary cleanup cannot bootstrap its own marker")

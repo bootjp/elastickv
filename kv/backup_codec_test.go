@@ -11,6 +11,7 @@ import (
 )
 
 func TestBackupCodecRoundTrip(t *testing.T) {
+	t.Parallel()
 	pinID := backupTrackerTestPinID(7)
 	deadline := time.UnixMilli(1780000000123)
 
@@ -44,6 +45,7 @@ func TestBackupCodecRoundTrip(t *testing.T) {
 }
 
 func TestBackupCodecReserveRoundTrip(t *testing.T) {
+	t.Parallel()
 	pinID := backupTrackerTestPinID(4)
 	deadline := time.UnixMilli(9000)
 
@@ -63,6 +65,7 @@ func TestBackupCodecReserveRoundTrip(t *testing.T) {
 }
 
 func TestBackupCodecRejectsMalformedWire(t *testing.T) {
+	t.Parallel()
 	pinID := backupTrackerTestPinID(1)
 	valid := EncodeBackupPinEntry(BackupPinEntry{
 		PinID:    pinID,
@@ -81,6 +84,7 @@ func TestBackupCodecRejectsMalformedWire(t *testing.T) {
 }
 
 func TestBackupCodecZeroDeadlineDecodesToZeroTime(t *testing.T) {
+	t.Parallel()
 	pinID := backupTrackerTestPinID(1)
 
 	gotPin, err := decodeBackupEntry(EncodeBackupPinEntry(BackupPinEntry{
@@ -100,6 +104,7 @@ func TestBackupCodecZeroDeadlineDecodesToZeroTime(t *testing.T) {
 }
 
 func TestBackupEnvelopeOpcodeDoesNotCollide(t *testing.T) {
+	t.Parallel()
 	require.Equal(t, byte(0x0e), raftEncodeBackup)
 	require.Greater(t, raftEncodeBackup, fsmwire.OpEncryptionMax)
 	require.NotContains(t, []byte{raftEncodeSingle, raftEncodeBatch, raftEncodeHLCLease}, raftEncodeBackup)

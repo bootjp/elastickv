@@ -15,6 +15,7 @@ import (
 )
 
 func TestBodyLimit_Allows(t *testing.T) {
+	t.Parallel()
 	var gotBody []byte
 	h := BodyLimit(128)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, err := io.ReadAll(r.Body)
@@ -30,6 +31,7 @@ func TestBodyLimit_Allows(t *testing.T) {
 }
 
 func TestBodyLimit_Exceeded(t *testing.T) {
+	t.Parallel()
 	oversize := strings.Repeat("x", 200)
 	h := BodyLimit(64)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, err := io.ReadAll(r.Body)
@@ -50,6 +52,7 @@ func TestBodyLimit_Exceeded(t *testing.T) {
 }
 
 func TestSessionAuth_MissingCookie(t *testing.T) {
+	t.Parallel()
 	clk := fixedClock(time.Unix(1_700_000_000, 0).UTC())
 	v := newVerifierForTest(t, []byte{1}, clk)
 	h := SessionAuth(v)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -64,6 +67,7 @@ func TestSessionAuth_MissingCookie(t *testing.T) {
 }
 
 func TestSessionAuth_HappyPathPutsPrincipalOnContext(t *testing.T) {
+	t.Parallel()
 	clk := fixedClock(time.Unix(1_700_000_000, 0).UTC())
 	signer := newSignerForTest(t, 1, clk)
 	v := newVerifierForTest(t, []byte{1}, clk)
@@ -89,6 +93,7 @@ func TestSessionAuth_HappyPathPutsPrincipalOnContext(t *testing.T) {
 }
 
 func TestSessionAuth_InvalidToken(t *testing.T) {
+	t.Parallel()
 	clk := fixedClock(time.Unix(1_700_000_000, 0).UTC())
 	v := newVerifierForTest(t, []byte{1}, clk)
 	h := SessionAuth(v)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -102,6 +107,7 @@ func TestSessionAuth_InvalidToken(t *testing.T) {
 }
 
 func TestRequireWriteRole_ReadOnlyRejected(t *testing.T) {
+	t.Parallel()
 	h := RequireWriteRole()(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -115,6 +121,7 @@ func TestRequireWriteRole_ReadOnlyRejected(t *testing.T) {
 }
 
 func TestRequireWriteRole_FullAllowed(t *testing.T) {
+	t.Parallel()
 	h := RequireWriteRole()(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusCreated)
 	}))
@@ -127,6 +134,7 @@ func TestRequireWriteRole_FullAllowed(t *testing.T) {
 }
 
 func TestRequireWriteRole_NoPrincipal(t *testing.T) {
+	t.Parallel()
 	h := RequireWriteRole()(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -137,6 +145,7 @@ func TestRequireWriteRole_NoPrincipal(t *testing.T) {
 }
 
 func TestCSRF_GETPasses(t *testing.T) {
+	t.Parallel()
 	called := false
 	h := CSRFDoubleSubmit()(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		called = true
@@ -150,6 +159,7 @@ func TestCSRF_GETPasses(t *testing.T) {
 }
 
 func TestCSRF_WriteMissingCookie(t *testing.T) {
+	t.Parallel()
 	h := CSRFDoubleSubmit()(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -162,6 +172,7 @@ func TestCSRF_WriteMissingCookie(t *testing.T) {
 }
 
 func TestCSRF_WriteMissingHeader(t *testing.T) {
+	t.Parallel()
 	h := CSRFDoubleSubmit()(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -174,6 +185,7 @@ func TestCSRF_WriteMissingHeader(t *testing.T) {
 }
 
 func TestCSRF_Mismatch(t *testing.T) {
+	t.Parallel()
 	h := CSRFDoubleSubmit()(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -187,6 +199,7 @@ func TestCSRF_Mismatch(t *testing.T) {
 }
 
 func TestCSRF_MatchAllows(t *testing.T) {
+	t.Parallel()
 	h := CSRFDoubleSubmit()(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusAccepted)
 	}))
@@ -199,6 +212,7 @@ func TestCSRF_MatchAllows(t *testing.T) {
 }
 
 func TestAudit_LogsWriteRequest(t *testing.T) {
+	t.Parallel()
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	ctx := context.WithValue(context.Background(), ctxKeyPrincipal,
@@ -218,6 +232,7 @@ func TestAudit_LogsWriteRequest(t *testing.T) {
 }
 
 func TestAudit_SkipsReads(t *testing.T) {
+	t.Parallel()
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	h := Audit(logger)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

@@ -22,6 +22,7 @@ func ownershipPartitionManifestFixture() OwnershipPartitionManifest {
 }
 
 func TestOwnershipPartitionManifestCanonicalCodec(t *testing.T) {
+	t.Parallel()
 	manifest := ownershipPartitionManifestFixture()
 	encoded, err := EncodeOwnershipPartitionManifest(manifest)
 	require.NoError(t, err)
@@ -43,6 +44,7 @@ func TestOwnershipPartitionManifestCanonicalCodec(t *testing.T) {
 }
 
 func TestOwnershipPartitionManifestRejectsAuthorityChanges(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name   string
 		mutate func(*OwnershipPartitionManifest)
@@ -74,6 +76,7 @@ func TestOwnershipPartitionManifestRejectsAuthorityChanges(t *testing.T) {
 }
 
 func TestOwnershipPartitionManifestSurvivesJobGCAndUnrelatedCatalogVersion(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	catalog := NewCatalogStore(st)
 	manifest := ownershipPartitionManifestFixture()
@@ -103,6 +106,7 @@ func TestOwnershipPartitionManifestSurvivesJobGCAndUnrelatedCatalogVersion(t *te
 }
 
 func TestOwnershipPartitionManifestCannotAppearAheadOfCommittedCatalog(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	catalog := NewCatalogStore(st)
 	manifest := ownershipPartitionManifestFixture()
@@ -119,6 +123,7 @@ func TestOwnershipPartitionManifestCannotAppearAheadOfCommittedCatalog(t *testin
 }
 
 func TestOwnershipPartitionManifestCatalogCASLeavesNoPartialLineage(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	catalog := NewCatalogStore(st)
 	manifest := ownershipPartitionManifestFixture()
@@ -135,6 +140,7 @@ func TestOwnershipPartitionManifestCatalogCASLeavesNoPartialLineage(t *testing.T
 }
 
 func TestOwnershipPartitionManifestNativeSnapshotRetainsLineage(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	manifest := ownershipPartitionManifestFixture()
 	digest, err := OwnershipPartitionDescriptorHash(manifest.Parent)

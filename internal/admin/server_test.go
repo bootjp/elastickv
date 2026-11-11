@@ -47,6 +47,7 @@ func newServerForTest(t *testing.T) *Server {
 }
 
 func TestServer_LoginThenCluster(t *testing.T) {
+	t.Parallel()
 	srv := newServerForTest(t)
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
@@ -81,6 +82,7 @@ func TestServer_LoginThenCluster(t *testing.T) {
 }
 
 func TestServer_ClusterRequiresSession(t *testing.T) {
+	t.Parallel()
 	srv := newServerForTest(t)
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
@@ -95,6 +97,7 @@ func TestServer_ClusterRequiresSession(t *testing.T) {
 }
 
 func TestServer_UnknownAPIReturnsJSON404(t *testing.T) {
+	t.Parallel()
 	srv := newServerForTest(t)
 	req := httptest.NewRequest(http.MethodGet, "/admin/api/v1/nope", nil)
 	rec := httptest.NewRecorder()
@@ -105,6 +108,7 @@ func TestServer_UnknownAPIReturnsJSON404(t *testing.T) {
 }
 
 func TestServer_HealthzExposed(t *testing.T) {
+	t.Parallel()
 	srv := newServerForTest(t)
 	req := httptest.NewRequest(http.MethodGet, "/admin/healthz", nil)
 	rec := httptest.NewRecorder()
@@ -119,6 +123,7 @@ func TestServer_HealthzExposed(t *testing.T) {
 // rejection with an oversize body to confirm BodyLimit fires before
 // the handler ever runs and surfaces a 413 instead.
 func TestServer_HealthzBodyLimited(t *testing.T) {
+	t.Parallel()
 	srv := newServerForTest(t)
 	oversize := strings.Repeat("x", int(defaultBodyLimit)+1024)
 	req := httptest.NewRequest(http.MethodPost, "/admin/healthz", strings.NewReader(oversize))
@@ -135,6 +140,7 @@ func TestServer_HealthzBodyLimited(t *testing.T) {
 }
 
 func TestServer_LoginBodyLimited(t *testing.T) {
+	t.Parallel()
 	srv := newServerForTest(t)
 	oversize := strings.Repeat("x", int(defaultBodyLimit)+1024)
 	req := httptest.NewRequest(http.MethodPost, "/admin/api/v1/auth/login", strings.NewReader(oversize))
@@ -146,6 +152,7 @@ func TestServer_LoginBodyLimited(t *testing.T) {
 }
 
 func TestServer_MissingDepsRejected(t *testing.T) {
+	t.Parallel()
 	_, err := NewServer(ServerDeps{})
 	require.Error(t, err)
 
@@ -158,6 +165,7 @@ func TestServer_MissingDepsRejected(t *testing.T) {
 }
 
 func TestServer_APIHandlerReturnsBareMux(t *testing.T) {
+	t.Parallel()
 	srv := newServerForTest(t)
 	h := srv.APIHandler()
 	require.NotNil(t, h)
@@ -226,6 +234,7 @@ func loginAndCookies(t *testing.T, ts *httptest.Server) []*http.Cookie {
 }
 
 func TestServer_DynamoTables_RequiresSession(t *testing.T) {
+	t.Parallel()
 	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{
 		"orders": {Name: "orders", PartitionKey: "id"},
 	}}
@@ -243,6 +252,7 @@ func TestServer_DynamoTables_RequiresSession(t *testing.T) {
 }
 
 func TestServer_DynamoTables_ReadOnlyRoleAllowed(t *testing.T) {
+	t.Parallel()
 	// Tables list is a GET — the read-only role must succeed without
 	// any extra opt-in. This guards against accidentally bolting
 	// RequireWriteRole onto the read chain.
@@ -271,6 +281,7 @@ func TestServer_DynamoTables_ReadOnlyRoleAllowed(t *testing.T) {
 }
 
 func TestServer_DynamoDescribeTable_AuthenticatedHappyPath(t *testing.T) {
+	t.Parallel()
 	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{
 		"orders": {
 			Name:         "orders",
@@ -303,6 +314,7 @@ func TestServer_DynamoDescribeTable_AuthenticatedHappyPath(t *testing.T) {
 }
 
 func TestServer_DynamoTables_NilSourceFallsThroughTo404(t *testing.T) {
+	t.Parallel()
 	// A build that ships only the cluster page (Tables nil) must keep
 	// the dynamo paths off the wire entirely. The expected response is
 	// the standard "unknown_endpoint" JSON 404 — same as any other
@@ -359,6 +371,7 @@ func csrfHeaderFromCookies(cookies []*http.Cookie) string {
 }
 
 func TestServer_DynamoCreateTable_FullRoleHappyPath(t *testing.T) {
+	t.Parallel()
 	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{}}
 	srv := newServerWithTablesForTest(t, src)
 	ts := httptest.NewServer(srv.Handler())
@@ -383,6 +396,7 @@ func TestServer_DynamoCreateTable_FullRoleHappyPath(t *testing.T) {
 }
 
 func TestServer_DynamoCreateTable_ReadOnlyRoleRejected(t *testing.T) {
+	t.Parallel()
 	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{}}
 	srv := newServerWithTablesForTest(t, src)
 	ts := httptest.NewServer(srv.Handler())
@@ -406,6 +420,7 @@ func TestServer_DynamoCreateTable_ReadOnlyRoleRejected(t *testing.T) {
 }
 
 func TestServer_DynamoCreateTable_MissingCSRFRejected(t *testing.T) {
+	t.Parallel()
 	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{}}
 	srv := newServerWithTablesForTest(t, src)
 	ts := httptest.NewServer(srv.Handler())
@@ -430,6 +445,7 @@ func TestServer_DynamoCreateTable_MissingCSRFRejected(t *testing.T) {
 }
 
 func TestServer_DynamoDeleteTable_FullRoleHappyPath(t *testing.T) {
+	t.Parallel()
 	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{
 		"users": {Name: "users", PartitionKey: "id"},
 	}}
@@ -460,6 +476,7 @@ func TestServer_DynamoDeleteTable_FullRoleHappyPath(t *testing.T) {
 // Retry-After:1 — the no-forwarder fallback path. With it, the
 // leader's response status (here, 201) is replayed verbatim.
 func TestServer_ServerDepsForwarderIsWired(t *testing.T) {
+	t.Parallel()
 	src := &notLeaderSource{}
 	fwd := &stubLeaderForwarder{createRes: &ForwardResult{
 		StatusCode:  http.StatusCreated,

@@ -393,8 +393,9 @@ func installProcessStartRegistrationGate(
 // buildProcessStartRegistrationGate implements the Stage 7a §4.1
 // process-start registration intent + first-write barrier. It runs
 // AFTER buildShardGroups (the default-group registry store is open) and
-// AFTER chainEncryptionStartupGuard (so CheckLocalEpochRollback has
-// passed — rollback and no-row-post-cutover are unreachable here).
+// AFTER chainEncryptionStartupGuard (so the local_epoch rollback
+// checks have passed — rollback and no-row-post-cutover are
+// unreachable here).
 //
 // Returns nil (ungated) in every case except the "propose" branch:
 //   - encryption off (no cipher wired),

@@ -12,6 +12,7 @@ import (
 )
 
 func TestMigrationTransferDoesNotChangeLargeWriteAdmission(t *testing.T) {
+	t.Parallel()
 	value := make([]byte, store.MigrationPagePayloadBudget+(1<<19))
 	ctx := context.Background()
 	for _, test := range []struct {

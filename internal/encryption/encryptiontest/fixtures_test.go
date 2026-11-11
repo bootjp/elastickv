@@ -12,6 +12,7 @@ import (
 )
 
 func TestCipherAndNonceFixtures(t *testing.T) {
+	t.Parallel()
 	cipher := encryptiontest.NewCipher(t, 1)
 	nonce, err := encryptiontest.NewNonceFactory(t).Next()
 	require.NoError(t, err)
@@ -25,6 +26,7 @@ func TestCipherAndNonceFixtures(t *testing.T) {
 }
 
 func TestNonceFactoriesAreDisjointAndConcurrent(t *testing.T) {
+	t.Parallel()
 	const count = 32
 	values := make(chan [encryption.NonceSize]byte, count)
 	var wg sync.WaitGroup
@@ -49,6 +51,7 @@ func TestNonceFactoriesAreDisjointAndConcurrent(t *testing.T) {
 }
 
 func TestSidecarAndKEKFile(t *testing.T) {
+	t.Parallel()
 	var path string
 	t.Run("owner", func(t *testing.T) {
 		path = encryptiontest.WriteSidecar(t, &encryption.Sidecar{Keys: map[string]encryption.SidecarKey{}})

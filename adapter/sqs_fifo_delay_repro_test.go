@@ -13,6 +13,7 @@ import (
 // Public API calls on the native Raft/SQS fixture, with no injected records,
 // fake clock, or wait for the original 900-second delay.
 func TestSQSFIFODelayChangeDoesNotOvertakeHead(t *testing.T) {
+	t.Parallel()
 	nodes, _, _ := createNode(t, 1)
 	defer shutdown(nodes)
 	node := sqsLeaderNode(t, nodes)

@@ -78,6 +78,7 @@ func (a *recordingAdmission) Check(ctx context.Context, request raftengine.Nativ
 func (a *recordingAdmission) Invalidate() { a.suspended = true }
 
 func TestNativeAdmissionObservesActualTermBeforeOwnerCallback(t *testing.T) {
+	t.Parallel()
 	e := identityElectionEngine(t, 1)
 	a := &recordingAdmission{}
 	e.nativeAdmission = a
@@ -102,6 +103,7 @@ func TestNativeAdmissionObservesActualTermBeforeOwnerCallback(t *testing.T) {
 }
 
 func TestNativeAdmissionProposalKeepsContextAndPayload(t *testing.T) {
+	t.Parallel()
 	e := identityElectionEngine(t, 1)
 	require.NoError(t, e.rawNode.Campaign())
 	for _, kind := range []raftpb.MessageType{raftpb.MsgPreVoteResp, raftpb.MsgVoteResp} {
@@ -128,6 +130,7 @@ func TestNativeAdmissionProposalKeepsContextAndPayload(t *testing.T) {
 type nativeTestHandleKey struct{}
 
 func TestNativeAdmissionInitialObservePrecedesRecoveryCallback(t *testing.T) {
+	t.Parallel()
 	e := identityElectionEngine(t, 1)
 	a := &recordingAdmission{}
 	e.nativeAdmission = a
@@ -150,17 +153,20 @@ func TestNativeAdmissionInitialObservePrecedesRecoveryCallback(t *testing.T) {
 }
 
 func TestNativeAdmissionInvalidatedResultIsUnknown(t *testing.T) {
+	t.Parallel()
 	e := &Engine{nativeAdmission: &recordingAdmission{resultError: errors.New("expired H")}}
 	require.ErrorIs(t, e.validateNativeResult(t.Context()), raftengine.ErrLeadershipLost)
 }
 
 func TestProtectedOpenRejectsMissingNativeGuard(t *testing.T) {
+	t.Parallel()
 	cfg := OpenConfig{NodeID: 7, GroupID: identityFixture().Identity.Group, NativeIdentity: identityFixture(),
 		DataDir: t.TempDir(), StateMachine: &testStateMachine{}, ElectionTick: 10, HeartbeatTick: 1}
 	require.ErrorContains(t, validateConfig(cfg), "requires admission")
 }
 
 func TestNativeProposalBindingOwnedCopy(t *testing.T) {
+	t.Parallel()
 	for _, admin := range []bool{false, true} {
 		ctx := context.WithValue(t.Context(), nativeTestHandleKey{}, "existing H")
 		a := &recordingAdmission{bind: func(got context.Context, group uint64, payload []byte) (context.Context, error) {
@@ -193,6 +199,7 @@ func TestNativeProposalBindingOwnedCopy(t *testing.T) {
 type nativeTestDigestKey struct{}
 
 func TestNativePeerAdmissionGenerationAndLockOrder(t *testing.T) {
+	t.Parallel()
 	e, owner, client := protectedQueueFixture(t)
 	a := &recordingAdmission{check: func(_ context.Context, request raftengine.NativeRequest) error {
 		require.Equal(t, raftengine.NativePeerStep, request.Operation)

@@ -8,6 +8,7 @@ import (
 )
 
 func TestRecoveryPublicationCleanupRunsOutsideAdmission(t *testing.T) {
+	t.Parallel()
 	a := newAdmission(t, false)
 	ticket, err := a.Ticket(1)
 	require.NoError(t, err)
@@ -28,6 +29,7 @@ func TestRecoveryPublicationCleanupRunsOutsideAdmission(t *testing.T) {
 }
 
 func TestPublicationFailureClosesRatherThanRetainsAuthority(t *testing.T) {
+	t.Parallel()
 	a := newAdmission(t, false)
 	loadAdmissionCatalog(t, a)
 	err := a.PublishStage(1, func(peersession.Stage, uint64) (func(), error) {
@@ -38,6 +40,7 @@ func TestPublicationFailureClosesRatherThanRetainsAuthority(t *testing.T) {
 }
 
 func TestGenerationOverflowCannotRefreshAuthority(t *testing.T) {
+	t.Parallel()
 	a := newAdmission(t, false)
 	a.mu.Lock()
 	a.groups[1].generation = ^uint64(0)
@@ -49,6 +52,7 @@ func TestGenerationOverflowCannotRefreshAuthority(t *testing.T) {
 }
 
 func TestSessionGenerationOverflowCannotPublish(t *testing.T) {
+	t.Parallel()
 	a := newAdmission(t, false)
 	a.mu.Lock()
 	a.groups[1].sessionGeneration = ^uint64(0)
@@ -65,6 +69,7 @@ func TestSessionGenerationOverflowCannotPublish(t *testing.T) {
 }
 
 func TestStageGenerationOverflowCancelsExistingOwners(t *testing.T) {
+	t.Parallel()
 	a := newAdmission(t, false)
 	loadAdmissionCatalog(t, a)
 	ctx, op, err := a.Begin(t.Context(), Data)
