@@ -8,13 +8,25 @@ import (
 )
 
 func (e *Engine) deliverApplyNativeConfiguration() func() {
-	aware, ok := e.fsm.(raftengine.ApplyNativeConfigurationAware)
+	return deliverNativeConfiguration(e.fsm, e.captureApplyNativeConfiguration())
+}
+
+func deliverNativeConfiguration(fsm StateMachine, image *raftengine.NativeConfiguration) func() {
+	aware, ok := fsm.(raftengine.ApplyNativeConfigurationAware)
 	if !ok {
 		return func() {}
 	}
-	if e.rawNode == nil || e.recoveredIdentity == nil {
+	if image == nil {
 		aware.ClearApplyNativeConfiguration()
 		return aware.ClearApplyNativeConfiguration
+	}
+	aware.SetApplyNativeConfiguration(*image)
+	return aware.ClearApplyNativeConfiguration
+}
+
+func (e *Engine) captureApplyNativeConfiguration() *raftengine.NativeConfiguration {
+	if e.rawNode == nil || e.recoveredIdentity == nil {
+		return nil
 	}
 	config := e.rawNode.Status().Config
 	image := raftengine.NativeConfiguration{Index: e.nativeConfigurationIndex, AutoLeave: config.AutoLeave}
@@ -40,6 +52,5 @@ func (e *Engine) deliverApplyNativeConfiguration() func() {
 	slices.SortFunc(image.Members, func(a, b raftengine.NativeConfigurationMember) int {
 		return cmp.Compare(a.ID, b.ID)
 	})
-	aware.SetApplyNativeConfiguration(image)
-	return aware.ClearApplyNativeConfiguration
+	return &image
 }

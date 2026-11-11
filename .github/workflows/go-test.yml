@@ -13,6 +13,8 @@ permissions:
 jobs:
   shard:
     name: test shard (${{ matrix.shard }})
+    env:
+      RAFT_NATIVE_MEMORY_TESTS: '^(TestMigrationQuorumCommitFollowsForcedLeadershipTransfer|TestMigrationQuorumPartitionAcceptance|TestEnginePipelineNativeEncryptedLargeQuorumSnapshotRestart)$'
     strategy:
       fail-fast: false
       matrix:
@@ -33,11 +35,20 @@ jobs:
         if: matrix.shard == 'rest'
         run: bash scripts/check-production-imports.sh
       - name: Run race tests
-        run: bash scripts/go-test-shard.sh "${{ matrix.shard }}"
+        run: bash scripts/go-test-shard.sh "${{ matrix.shard }}" "$RAFT_NATIVE_MEMORY_TESTS"
         env:
           # Fail, rather than skip, the kernel-mount tests when FUSE is unusable.
           ELASTICKV_REQUIRE_FUSE: "1"
           ELASTICKV_REQUIRE_SQLITE: "1"
+      # The native 64-MiB quorum fixtures retain several replicas and race
+      # shadow memory. Keep their original payloads, assertions and deadlines,
+      # but do not run them concurrently with other packages' heavy fixtures.
+      - name: Run native migration large-value race acceptance
+        if: matrix.shard == 'adapter'
+        run: go test -race -timeout=30m ./adapter -run "$RAFT_NATIVE_MEMORY_TESTS"
+      - name: Run encrypted native large-value race acceptance
+        if: matrix.shard == 'raft-crypto'
+        run: go test -race -timeout=30m ./internal/raftengine/etcd -run "$RAFT_NATIVE_MEMORY_TESTS"
   # Branch protection requires the "test (ubuntu-latest)" check, so this
   # job keeps that name and passes only when every shard passed.
   test:

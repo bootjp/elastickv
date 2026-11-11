@@ -22,13 +22,25 @@ heavy=(
   "$mod/internal/raftengine/etcd"
 )
 
-run() { go test -race -timeout=30m "$@"; }
+native_memory_tests=${2:-}
+run() {
+	local skip=$1
+	shift
+	if [[ -n "$native_memory_tests" ]]; then
+		skip="${skip:+$skip|}$native_memory_tests"
+	fi
+	if [[ -n "$skip" ]]; then
+		go test -race -timeout=30m "$@" -skip "$skip"
+  else
+    go test -race -timeout=30m "$@"
+  fi
+}
 
 case "${1:-}" in
-  adapter) run ./adapter -skip "$seq_tests" ;;
-  adapter-seq) run ./adapter -run "$seq_tests" ;;
-  root) run . ;;
-  raft-crypto) run ./internal/encryption ./internal/raftengine/etcd ;;
+	adapter) run "$seq_tests" ./adapter ;;
+	adapter-seq) run "" ./adapter -run "$seq_tests" ;;
+	root) run "" . ;;
+	raft-crypto) run "" ./internal/encryption ./internal/raftengine/etcd ;;
   rest)
     # Discover in a plain assignment so a go list failure (which omits
     # erroneous packages) aborts the shard under set -e instead of being
@@ -39,7 +51,7 @@ case "${1:-}" in
       echo "rest shard selected no packages" >&2
       exit 1
     fi
-    run "${pkgs[@]}"
+		run "" "${pkgs[@]}"
     ;;
   *)
     echo "usage: $0 adapter|adapter-seq|root|raft-crypto|rest" >&2
