@@ -33,11 +33,17 @@ func TestSQSFIFODelayFencesStaleRedrive(t *testing.T) {
 			createDelayTestQueue(t, srv, 4, 0)
 			createDelayDLQ(t, srv)
 			id := sendDelayTestMessage(t, srv, "poison", "g")
+			initialCtx, cancelInitial := context.WithTimeout(t.Context(), 5*time.Second)
+			var messages []map[string]any
+			for len(messages) == 0 && initialCtx.Err() == nil {
+				var err error
+				messages, err = srv.scanAndDeliverOnce(initialCtx, fifoDelayTestQueue, sqsReceiveOptions{Max: 1, VisibilityTimeout: 0})
+				require.NoError(t, err)
+			}
+			cancelInitial()
+			require.Len(t, messages, 1)
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
-			messages, err := srv.scanAndDeliverOnce(ctx, fifoDelayTestQueue, sqsReceiveOptions{Max: 1, VisibilityTimeout: 0})
-			require.NoError(t, err)
-			require.Len(t, messages, 1)
 			gate := &fifoDelayBarrierCoordinator{Coordinator: srv.coordinator, match: delayDataPut, entered: make(chan struct{}), release: make(chan struct{})}
 			srv.coordinator = gate
 			done, finished := make(chan error, 1), make(chan struct{})
