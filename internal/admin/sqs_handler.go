@@ -24,7 +24,7 @@ const (
 )
 
 // QueueSummary is the SPA-facing projection of a single SQS queue.
-// Mirrors adapter.AdminQueueSummary 1:1; the bridge in main_admin.go
+// Mirrors adapter.AdminQueueSummary 1:1; the bridge in internal/adminbridge
 // translates between the two so the admin package stays free of the
 // adapter dependency tree.
 //
@@ -58,7 +58,7 @@ type QueueCounters struct {
 }
 
 // QueuesSource is the contract the SQS handler depends on. Wired in
-// production to *adapter.SQSServer via a small bridge in main_admin.go;
+// production to *adapter.SQSServer via a small bridge in internal/adminbridge;
 // tests use a stub.
 //
 // AdminDescribeQueue returns (nil, false, nil) for a missing queue so
@@ -78,7 +78,7 @@ type QueuesSource interface {
 	AdminSetQueueAttributes(ctx context.Context, principal AuthPrincipal, name string, attrs map[string]string) error
 	// AdminPeekQueue returns a non-destructive sample of currently-
 	// visible messages on the queue (read role required). Wired only
-	// when the source supports it; the bridge in main_admin.go
+	// when the source supports it; the bridge in internal/adminbridge
 	// translates between adapter and admin types so the admin package
 	// stays free of the adapter dependency tree.
 	AdminPeekQueue(ctx context.Context, principal AuthPrincipal, name string, opts PeekMessageOptions) (PeekResult, error)

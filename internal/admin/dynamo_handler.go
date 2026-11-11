@@ -39,7 +39,7 @@ const (
 // Defined in the admin package — rather than reusing the adapter's
 // AdminTableSummary directly — so the admin HTTP layer does not pull
 // in the heavyweight adapter dependency tree (gRPC, Raft, etc.) and
-// remains testable in isolation. main_admin.go translates between
+// remains testable in isolation. internal/adminbridge translates between
 // adapter.AdminTableSummary and this type.
 type DynamoTableSummary struct {
 	Name                   string             `json:"name"`
@@ -59,7 +59,7 @@ type DynamoGSISummary struct {
 
 // TablesSource is the contract the dynamo handler depends on. Wired in
 // production to *adapter.DynamoDBServer via a small bridge in
-// main_admin.go; tests use a stub.
+// internal/adminbridge; tests use a stub.
 //
 // AdminDescribeTable returns (nil, false, nil) for a missing table so
 // callers can distinguish "not found" from a storage error without
@@ -76,7 +76,7 @@ type TablesSource interface {
 	// Item-level admin RPCs (Phase 3a — design §3.1.1).
 	// The handler in dynamo_items_handler.go drives these for the
 	// /tables/{name}/items{,/{key}} sub-tree. Implementations live
-	// in main_admin.go (dynamoTablesBridge) and bridge to the
+	// in internal/adminbridge (dynamoTablesBridge) and bridge to the
 	// adapter package's Admin*Item methods.
 	AdminScanItems(ctx context.Context, principal AuthPrincipal, table string, opts AdminScanItemsOptions) (AdminScanItemsResult, error)
 	AdminGetItem(ctx context.Context, principal AuthPrincipal, table string, key map[string]AdminAttributeValue) (*AdminItem, bool, error)

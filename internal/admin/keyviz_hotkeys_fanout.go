@@ -58,7 +58,7 @@ type KeyVizHotKeysFanout struct {
 // node's identity for the FanoutResult.Nodes entry. peers is the list
 // of HTTP base URLs (or host:port shorthand) to query — typically the
 // operator's --keyvizFanoutNodes list with the local entry filtered
-// out at construction (see main_admin.go::buildKeyVizHotKeysFanout).
+// out at construction (see internal/adminbridge.NewKeyVizHotKeysFanout).
 func NewKeyVizHotKeysFanout(self string, peers []string) *KeyVizHotKeysFanout {
 	return &KeyVizHotKeysFanout{
 		self:    self,

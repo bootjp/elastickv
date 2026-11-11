@@ -9,7 +9,7 @@ import (
 // BucketsSource is the in-process surface the admin S3 handler
 // dispatches into. It mirrors TablesSource on the Dynamo side
 // (Section 3.2 of the admin design): defining the contract here lets
-// the bridge in main_admin.go translate adapter errors into the
+// the bridge in internal/adminbridge translate adapter errors into the
 // admin-package vocabulary without the adapter package importing
 // internal/admin.
 //
@@ -52,7 +52,7 @@ type BucketsSource interface {
 	// Object-level admin RPCs (Phase 3b — design §3.1.2). The handler
 	// in s3_objects_handler.go drives these for the
 	// /buckets/{name}/objects{,/{key}} sub-tree. Implementations live
-	// in main_admin.go (bucketsBridge) and bridge to the adapter
+	// in internal/adminbridge (bucketsBridge) and bridge to the adapter
 	// package's Admin*Object methods.
 
 	// AdminListObjects returns a bounded page of objects under a

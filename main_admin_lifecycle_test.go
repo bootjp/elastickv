@@ -7,10 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/internal/admin"
 	"github.com/bootjp/elastickv/internal/testutil"
-	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 )
@@ -78,13 +76,4 @@ func TestRegisterAdminLifecycleReturnsCleanAfterForcedClose(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the stalled admin request was not closed")
 	}
-}
-
-// An admin object request that reaches an S3 server which already began
-// stopping is answered like a follower's (503 with Retry-After), so the
-// client retries against another node instead of seeing a 500.
-func TestTranslateAdminObjectsErrorMapsStoppingToNotLeader(t *testing.T) {
-	t.Parallel()
-	err := translateAdminObjectsError(errors.Wrap(adapter.ErrAdminS3Stopping, "admin put"))
-	require.ErrorIs(t, err, admin.ErrObjectsNotLeader)
 }

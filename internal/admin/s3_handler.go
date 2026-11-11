@@ -332,7 +332,7 @@ func (h *S3Handler) handleDescribe(w http.ResponseWriter, r *http.Request, name 
 
 // FormatBucketCreatedAt converts an HLC timestamp into the ISO-8601
 // string the SPA expects. Exposed (rather than kept package-private)
-// so the bridge in main_admin.go can call it from the BucketsSource
+// so the bridge in internal/adminbridge can call it from the BucketsSource
 // implementation — both the handler's response and any future
 // audit-log enrichment land on identical formatting.
 func FormatBucketCreatedAt(hlc uint64) string {

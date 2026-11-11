@@ -32,7 +32,7 @@ func (o *recordingQueueObserver) ObserveAdminPeekQueue(queue, outcome string) {
 }
 
 // queuesSourceWithObserver is a QueuesSource that also exposes counters, the
-// shape production uses via the main_admin.go bridge.
+// shape production uses via the internal/adminbridge bridge.
 type queuesSourceWithObserver struct {
 	*stubQueuesSource
 	observer AdminQueueObserver

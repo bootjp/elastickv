@@ -10,6 +10,7 @@ import (
 	"github.com/bootjp/elastickv/distribution"
 	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/bootjp/elastickv/internal/admin"
+	"github.com/bootjp/elastickv/internal/adminbridge"
 	internalraftadmin "github.com/bootjp/elastickv/internal/raftadmin"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
@@ -182,7 +183,7 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 	// the handler hands ErrTablesNotLeader writes to the forwarder
 	// which dials the leader over the cached gRPC pool. Without these
 	// the handler falls back to 503 + Retry-After:1.
-	fanoutCfg := keyVizFanoutConfig{
+	fanoutCfg := adminbridge.KeyVizFanoutConfig{
 		Nodes:   parseCSV(*keyvizFanoutNodes),
 		Timeout: *keyvizFanoutTimeout,
 	}
@@ -340,8 +341,8 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 		s3BlobPushBlocked = r.publicKVGate.blocked
 	}
 	forwardDeps := adminForwardServerDeps{
-		tables:  newDynamoTablesSource(r.dynamoServer),
-		buckets: newBucketsSource(r.s3Server),
+		tables:  adminbridge.NewDynamoTablesSource(r.dynamoServer),
+		buckets: adminbridge.NewBucketsSource(r.s3Server),
 		roles:   r.roleStore,
 	}
 	var sqsPartitionResolver kv.PartitionResolver
