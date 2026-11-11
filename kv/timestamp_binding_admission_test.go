@@ -1,0 +1,92 @@
+package kv
+
+import (
+	"context"
+	"testing"
+
+	"github.com/bootjp/elastickv/internal/raftengine"
+	pb "github.com/bootjp/elastickv/proto"
+	"github.com/bootjp/elastickv/store"
+	"github.com/stretchr/testify/require"
+)
+
+type homeBindingLeader struct {
+	reads    int
+	follower bool
+	lostRead bool
+}
+
+func (l *homeBindingLeader) State() raftengine.State {
+	if l.follower {
+		return raftengine.StateFollower
+	}
+	return raftengine.StateLeader
+}
+
+func (l *homeBindingLeader) Leader() raftengine.LeaderInfo { return raftengine.LeaderInfo{ID: "self"} }
+func (l *homeBindingLeader) VerifyLeader(context.Context) error {
+	return nil
+}
+func (l *homeBindingLeader) LinearizableRead(context.Context) (uint64, error) {
+	l.reads++
+	if l.lostRead {
+		l.follower = true
+	}
+	return uint64(l.reads), nil
+}
+
+func TestPrepareHomeRawTimestampBindingReusesExactOperation(t *testing.T) {
+	st := store.NewMVCCStore()
+	metadata, ok := st.(store.RaftControlMetadataStore)
+	require.True(t, ok)
+	applier, ok := st.(store.RaftEntryApplier)
+	require.True(t, ok)
+	leader := &homeBindingLeader{}
+	request := &pb.Request{TimestampBindingOperationId: append([]byte{1}, make([]byte, 15)...),
+		Mutations: []*pb.Mutation{{Key: []byte("key"), Value: []byte("value")}}}
+	issues := 0
+	issue := func(context.Context) (uint64, error) {
+		issues++
+		require.Equal(t, 1, leader.reads, "absence must be checked after an applied read")
+		return 42, nil
+	}
+	first, err := PrepareHomeRawTimestampBinding(t.Context(), leader, metadata, issue, request)
+	require.NoError(t, err)
+	require.Equal(t, uint64(42), first.Ts)
+	require.Zero(t, request.Ts, "caller request must remain unmodified")
+	binding, err := timestampBindingForCreationRequest(first)
+	require.NoError(t, err)
+	require.NoError(t, applier.ApplyRaftEntry(t.Context(), 1, func(ctx context.Context) error {
+		_, err := StageTimestampBinding(ctx, metadata, binding)
+		return err
+	}))
+	retry, err := PrepareHomeRawTimestampBinding(t.Context(), leader, metadata, issue, request)
+	require.NoError(t, err)
+	require.Equal(t, first, retry)
+	require.Equal(t, 1, issues, "exact retry must not ask group 0 for another timestamp")
+	require.Equal(t, 2, leader.reads)
+	changed := &pb.Request{TimestampBindingOperationId: request.TimestampBindingOperationId,
+		Mutations: []*pb.Mutation{{Key: []byte("key"), Value: []byte("different")}}}
+	_, err = PrepareHomeRawTimestampBinding(t.Context(), leader, metadata, issue, changed)
+	require.ErrorIs(t, err, ErrTimestampBindingConflict)
+	require.Equal(t, 1, issues)
+}
+
+func TestPrepareHomeRawTimestampBindingRejectsUnprovenCreation(t *testing.T) {
+	st := store.NewMVCCStore()
+	metadata, ok := st.(store.RaftControlMetadataStore)
+	require.True(t, ok)
+	leader := &homeBindingLeader{}
+	request := &pb.Request{Ts: 42, TimestampBindingOperationId: append([]byte{1}, make([]byte, 15)...)}
+	issues := 0
+	issue := func(context.Context) (uint64, error) { issues++; return 43, nil }
+	_, err := PrepareHomeRawTimestampBinding(t.Context(), leader, metadata, issue, request)
+	require.ErrorIs(t, err, ErrTimestampBindingInvalid)
+	require.Zero(t, leader.reads)
+	require.Zero(t, issues)
+	request.Ts = 0
+	leader.lostRead = true
+	_, err = PrepareHomeRawTimestampBinding(t.Context(), leader, metadata, issue, request)
+	require.Error(t, err)
+	require.Zero(t, issues, "a lost home leader cannot mint from stale absence")
+}

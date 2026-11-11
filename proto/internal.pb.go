@@ -3077,6 +3077,222 @@ func (x *IssueMigrationTimestampResponse) GetLastCommitTs() uint64 {
 	return 0
 }
 
+type IssueBoundTimestampRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	MinTimestamp  uint64                 `protobuf:"varint,1,opt,name=min_timestamp,json=minTimestamp,proto3" json:"min_timestamp,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *IssueBoundTimestampRequest) Reset() {
+	*x = IssueBoundTimestampRequest{}
+	mi := &file_internal_proto_msgTypes[32]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *IssueBoundTimestampRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*IssueBoundTimestampRequest) ProtoMessage() {}
+
+func (x *IssueBoundTimestampRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[32]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use IssueBoundTimestampRequest.ProtoReflect.Descriptor instead.
+func (*IssueBoundTimestampRequest) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{32}
+}
+
+func (x *IssueBoundTimestampRequest) GetMinTimestamp() uint64 {
+	if x != nil {
+		return x.MinTimestamp
+	}
+	return 0
+}
+
+type IssueBoundTimestampResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Timestamp     uint64                 `protobuf:"varint,1,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *IssueBoundTimestampResponse) Reset() {
+	*x = IssueBoundTimestampResponse{}
+	mi := &file_internal_proto_msgTypes[33]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *IssueBoundTimestampResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*IssueBoundTimestampResponse) ProtoMessage() {}
+
+func (x *IssueBoundTimestampResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[33]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use IssueBoundTimestampResponse.ProtoReflect.Descriptor instead.
+func (*IssueBoundTimestampResponse) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{33}
+}
+
+func (x *IssueBoundTimestampResponse) GetTimestamp() uint64 {
+	if x != nil {
+		return x.Timestamp
+	}
+	return 0
+}
+
+type LookupTimestampBindingRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	OperationId   []byte                 `protobuf:"bytes,1,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *LookupTimestampBindingRequest) Reset() {
+	*x = LookupTimestampBindingRequest{}
+	mi := &file_internal_proto_msgTypes[34]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LookupTimestampBindingRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LookupTimestampBindingRequest) ProtoMessage() {}
+
+func (x *LookupTimestampBindingRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[34]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LookupTimestampBindingRequest.ProtoReflect.Descriptor instead.
+func (*LookupTimestampBindingRequest) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{34}
+}
+
+func (x *LookupTimestampBindingRequest) GetOperationId() []byte {
+	if x != nil {
+		return x.OperationId
+	}
+	return nil
+}
+
+type LookupTimestampBindingResponse struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	Found          bool                   `protobuf:"varint,1,opt,name=found,proto3" json:"found,omitempty"`
+	Timestamp      uint64                 `protobuf:"varint,2,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	ManifestDigest []byte                 `protobuf:"bytes,3,opt,name=manifest_digest,json=manifestDigest,proto3" json:"manifest_digest,omitempty"`
+	IsTxn          bool                   `protobuf:"varint,4,opt,name=is_txn,json=isTxn,proto3" json:"is_txn,omitempty"`
+	Phase          Phase                  `protobuf:"varint,5,opt,name=phase,proto3,enum=Phase" json:"phase,omitempty"`
+	AppliedIndex   uint64                 `protobuf:"varint,6,opt,name=applied_index,json=appliedIndex,proto3" json:"applied_index,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *LookupTimestampBindingResponse) Reset() {
+	*x = LookupTimestampBindingResponse{}
+	mi := &file_internal_proto_msgTypes[35]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LookupTimestampBindingResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LookupTimestampBindingResponse) ProtoMessage() {}
+
+func (x *LookupTimestampBindingResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[35]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LookupTimestampBindingResponse.ProtoReflect.Descriptor instead.
+func (*LookupTimestampBindingResponse) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{35}
+}
+
+func (x *LookupTimestampBindingResponse) GetFound() bool {
+	if x != nil {
+		return x.Found
+	}
+	return false
+}
+
+func (x *LookupTimestampBindingResponse) GetTimestamp() uint64 {
+	if x != nil {
+		return x.Timestamp
+	}
+	return 0
+}
+
+func (x *LookupTimestampBindingResponse) GetManifestDigest() []byte {
+	if x != nil {
+		return x.ManifestDigest
+	}
+	return nil
+}
+
+func (x *LookupTimestampBindingResponse) GetIsTxn() bool {
+	if x != nil {
+		return x.IsTxn
+	}
+	return false
+}
+
+func (x *LookupTimestampBindingResponse) GetPhase() Phase {
+	if x != nil {
+		return x.Phase
+	}
+	return Phase_NONE
+}
+
+func (x *LookupTimestampBindingResponse) GetAppliedIndex() uint64 {
+	if x != nil {
+		return x.AppliedIndex
+	}
+	return 0
+}
+
 var File_internal_proto protoreflect.FileDescriptor
 
 const file_internal_proto_rawDesc = "" +
@@ -3311,7 +3527,20 @@ const file_internal_proto_rawDesc = "" +
 	"\x1eIssueMigrationTimestampRequest\"e\n" +
 	"\x1fIssueMigrationTimestampResponse\x12\x1c\n" +
 	"\ttimestamp\x18\x01 \x01(\x04R\ttimestamp\x12$\n" +
-	"\x0elast_commit_ts\x18\x02 \x01(\x04R\flastCommitTs*&\n" +
+	"\x0elast_commit_ts\x18\x02 \x01(\x04R\flastCommitTs\"A\n" +
+	"\x1aIssueBoundTimestampRequest\x12#\n" +
+	"\rmin_timestamp\x18\x01 \x01(\x04R\fminTimestamp\";\n" +
+	"\x1bIssueBoundTimestampResponse\x12\x1c\n" +
+	"\ttimestamp\x18\x01 \x01(\x04R\ttimestamp\"B\n" +
+	"\x1dLookupTimestampBindingRequest\x12!\n" +
+	"\foperation_id\x18\x01 \x01(\fR\voperationId\"\xd7\x01\n" +
+	"\x1eLookupTimestampBindingResponse\x12\x14\n" +
+	"\x05found\x18\x01 \x01(\bR\x05found\x12\x1c\n" +
+	"\ttimestamp\x18\x02 \x01(\x04R\ttimestamp\x12'\n" +
+	"\x0fmanifest_digest\x18\x03 \x01(\fR\x0emanifestDigest\x12\x15\n" +
+	"\x06is_txn\x18\x04 \x01(\bR\x05isTxn\x12\x1c\n" +
+	"\x05phase\x18\x05 \x01(\x0e2\x06.PhaseR\x05phase\x12#\n" +
+	"\rapplied_index\x18\x06 \x01(\x04R\fappliedIndex*&\n" +
 	"\x02Op\x12\a\n" +
 	"\x03PUT\x10\x00\x12\a\n" +
 	"\x03DEL\x10\x01\x12\x0e\n" +
@@ -3367,7 +3596,7 @@ const file_internal_proto_rawDesc = "" +
 	",MIGRATION_STATE_PROBE_KIND_OWNERSHIP_APPLIED\x10\b\x120\n" +
 	",MIGRATION_STATE_PROBE_KIND_PARTITION_APPLIED\x10\t\x122\n" +
 	".MIGRATION_STATE_PROBE_KIND_NAMESPACE_ADMISSION\x10\n" +
-	"2\xab\b\n" +
+	"2\xdc\t\n" +
 	"\bInternal\x12.\n" +
 	"\aForward\x12\x0f.ForwardRequest\x1a\x10.ForwardResponse\"\x00\x12U\n" +
 	"\x14ForwardAdminProposal\x12\x1c.ForwardAdminProposalRequest\x1a\x1d.ForwardAdminProposalResponse\"\x00\x12I\n" +
@@ -3381,7 +3610,9 @@ const file_internal_proto_rawDesc = "" +
 	"\x13ProbeMigrationLocks\x12\x1b.ProbeMigrationLocksRequest\x1a\x1c.ProbeMigrationLocksResponse\"\x00\x12I\n" +
 	"\x10CleanupMigration\x12\x18.CleanupMigrationRequest\x1a\x19.CleanupMigrationResponse\"\x00\x12R\n" +
 	"\x13ProbeMigrationState\x12\x1b.ProbeMigrationStateRequest\x1a\x1c.ProbeMigrationStateResponse\"\x00\x12^\n" +
-	"\x17IssueMigrationTimestamp\x12\x1f.IssueMigrationTimestampRequest\x1a .IssueMigrationTimestampResponse\"\x00B#Z!github.com/bootjp/elastickv/protob\x06proto3"
+	"\x17IssueMigrationTimestamp\x12\x1f.IssueMigrationTimestampRequest\x1a .IssueMigrationTimestampResponse\"\x00\x12R\n" +
+	"\x13IssueBoundTimestamp\x12\x1b.IssueBoundTimestampRequest\x1a\x1c.IssueBoundTimestampResponse\"\x00\x12[\n" +
+	"\x16LookupTimestampBinding\x12\x1e.LookupTimestampBindingRequest\x1a\x1f.LookupTimestampBindingResponse\"\x00B#Z!github.com/bootjp/elastickv/protob\x06proto3"
 
 var (
 	file_internal_proto_rawDescOnce sync.Once
@@ -3396,7 +3627,7 @@ func file_internal_proto_rawDescGZIP() []byte {
 }
 
 var file_internal_proto_enumTypes = make([]protoimpl.EnumInfo, 8)
-var file_internal_proto_msgTypes = make([]protoimpl.MessageInfo, 32)
+var file_internal_proto_msgTypes = make([]protoimpl.MessageInfo, 36)
 var file_internal_proto_goTypes = []any{
 	(Op)(0),                                 // 0: Op
 	(Phase)(0),                              // 1: Phase
@@ -3438,6 +3669,10 @@ var file_internal_proto_goTypes = []any{
 	(*ProbeMigrationStateResponse)(nil),     // 37: ProbeMigrationStateResponse
 	(*IssueMigrationTimestampRequest)(nil),  // 38: IssueMigrationTimestampRequest
 	(*IssueMigrationTimestampResponse)(nil), // 39: IssueMigrationTimestampResponse
+	(*IssueBoundTimestampRequest)(nil),      // 40: IssueBoundTimestampRequest
+	(*IssueBoundTimestampResponse)(nil),     // 41: IssueBoundTimestampResponse
+	(*LookupTimestampBindingRequest)(nil),   // 42: LookupTimestampBindingRequest
+	(*LookupTimestampBindingResponse)(nil),  // 43: LookupTimestampBindingResponse
 }
 var file_internal_proto_depIdxs = []int32{
 	0,  // 0: Mutation.op:type_name -> Op
@@ -3456,37 +3691,42 @@ var file_internal_proto_depIdxs = []int32{
 	7,  // 13: ProbeMigrationStateRequest.kind:type_name -> MigrationStateProbeKind
 	33, // 14: ProbeMigrationStateRequest.ownership:type_name -> MigrationOwnershipProof
 	33, // 15: ProbeMigrationStateResponse.ownership:type_name -> MigrationOwnershipProof
-	11, // 16: Internal.Forward:input_type -> ForwardRequest
-	14, // 17: Internal.ForwardAdminProposal:input_type -> ForwardAdminProposalRequest
-	16, // 18: Internal.ForwardLeaseRead:input_type -> ForwardLeaseReadRequest
-	18, // 19: Internal.GetPrepareEvidenceState:input_type -> PrepareEvidenceStateRequest
-	20, // 20: Internal.RelayPublish:input_type -> RelayPublishRequest
-	22, // 21: Internal.ExportRangeVersions:input_type -> ExportRangeVersionsRequest
-	25, // 22: Internal.ImportRangeVersions:input_type -> ImportRangeVersionsRequest
-	27, // 23: Internal.PromoteStagedVersions:input_type -> PromoteStagedVersionsRequest
-	29, // 24: Internal.ApplyTargetStagedReadiness:input_type -> TargetStagedReadinessRequest
-	31, // 25: Internal.ProbeMigrationLocks:input_type -> ProbeMigrationLocksRequest
-	34, // 26: Internal.CleanupMigration:input_type -> CleanupMigrationRequest
-	36, // 27: Internal.ProbeMigrationState:input_type -> ProbeMigrationStateRequest
-	38, // 28: Internal.IssueMigrationTimestamp:input_type -> IssueMigrationTimestampRequest
-	12, // 29: Internal.Forward:output_type -> ForwardResponse
-	15, // 30: Internal.ForwardAdminProposal:output_type -> ForwardAdminProposalResponse
-	17, // 31: Internal.ForwardLeaseRead:output_type -> ForwardLeaseReadResponse
-	19, // 32: Internal.GetPrepareEvidenceState:output_type -> PrepareEvidenceStateResponse
-	21, // 33: Internal.RelayPublish:output_type -> RelayPublishResponse
-	23, // 34: Internal.ExportRangeVersions:output_type -> ExportRangeVersionsResponse
-	26, // 35: Internal.ImportRangeVersions:output_type -> ImportRangeVersionsResponse
-	28, // 36: Internal.PromoteStagedVersions:output_type -> PromoteStagedVersionsResponse
-	30, // 37: Internal.ApplyTargetStagedReadiness:output_type -> TargetStagedReadinessResponse
-	32, // 38: Internal.ProbeMigrationLocks:output_type -> ProbeMigrationLocksResponse
-	35, // 39: Internal.CleanupMigration:output_type -> CleanupMigrationResponse
-	37, // 40: Internal.ProbeMigrationState:output_type -> ProbeMigrationStateResponse
-	39, // 41: Internal.IssueMigrationTimestamp:output_type -> IssueMigrationTimestampResponse
-	29, // [29:42] is the sub-list for method output_type
-	16, // [16:29] is the sub-list for method input_type
-	16, // [16:16] is the sub-list for extension type_name
-	16, // [16:16] is the sub-list for extension extendee
-	0,  // [0:16] is the sub-list for field type_name
+	1,  // 16: LookupTimestampBindingResponse.phase:type_name -> Phase
+	11, // 17: Internal.Forward:input_type -> ForwardRequest
+	14, // 18: Internal.ForwardAdminProposal:input_type -> ForwardAdminProposalRequest
+	16, // 19: Internal.ForwardLeaseRead:input_type -> ForwardLeaseReadRequest
+	18, // 20: Internal.GetPrepareEvidenceState:input_type -> PrepareEvidenceStateRequest
+	20, // 21: Internal.RelayPublish:input_type -> RelayPublishRequest
+	22, // 22: Internal.ExportRangeVersions:input_type -> ExportRangeVersionsRequest
+	25, // 23: Internal.ImportRangeVersions:input_type -> ImportRangeVersionsRequest
+	27, // 24: Internal.PromoteStagedVersions:input_type -> PromoteStagedVersionsRequest
+	29, // 25: Internal.ApplyTargetStagedReadiness:input_type -> TargetStagedReadinessRequest
+	31, // 26: Internal.ProbeMigrationLocks:input_type -> ProbeMigrationLocksRequest
+	34, // 27: Internal.CleanupMigration:input_type -> CleanupMigrationRequest
+	36, // 28: Internal.ProbeMigrationState:input_type -> ProbeMigrationStateRequest
+	38, // 29: Internal.IssueMigrationTimestamp:input_type -> IssueMigrationTimestampRequest
+	40, // 30: Internal.IssueBoundTimestamp:input_type -> IssueBoundTimestampRequest
+	42, // 31: Internal.LookupTimestampBinding:input_type -> LookupTimestampBindingRequest
+	12, // 32: Internal.Forward:output_type -> ForwardResponse
+	15, // 33: Internal.ForwardAdminProposal:output_type -> ForwardAdminProposalResponse
+	17, // 34: Internal.ForwardLeaseRead:output_type -> ForwardLeaseReadResponse
+	19, // 35: Internal.GetPrepareEvidenceState:output_type -> PrepareEvidenceStateResponse
+	21, // 36: Internal.RelayPublish:output_type -> RelayPublishResponse
+	23, // 37: Internal.ExportRangeVersions:output_type -> ExportRangeVersionsResponse
+	26, // 38: Internal.ImportRangeVersions:output_type -> ImportRangeVersionsResponse
+	28, // 39: Internal.PromoteStagedVersions:output_type -> PromoteStagedVersionsResponse
+	30, // 40: Internal.ApplyTargetStagedReadiness:output_type -> TargetStagedReadinessResponse
+	32, // 41: Internal.ProbeMigrationLocks:output_type -> ProbeMigrationLocksResponse
+	35, // 42: Internal.CleanupMigration:output_type -> CleanupMigrationResponse
+	37, // 43: Internal.ProbeMigrationState:output_type -> ProbeMigrationStateResponse
+	39, // 44: Internal.IssueMigrationTimestamp:output_type -> IssueMigrationTimestampResponse
+	41, // 45: Internal.IssueBoundTimestamp:output_type -> IssueBoundTimestampResponse
+	43, // 46: Internal.LookupTimestampBinding:output_type -> LookupTimestampBindingResponse
+	32, // [32:47] is the sub-list for method output_type
+	17, // [17:32] is the sub-list for method input_type
+	17, // [17:17] is the sub-list for extension type_name
+	17, // [17:17] is the sub-list for extension extendee
+	0,  // [0:17] is the sub-list for field type_name
 }
 
 func init() { file_internal_proto_init() }
@@ -3500,7 +3740,7 @@ func file_internal_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_internal_proto_rawDesc), len(file_internal_proto_rawDesc)),
 			NumEnums:      8,
-			NumMessages:   32,
+			NumMessages:   36,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

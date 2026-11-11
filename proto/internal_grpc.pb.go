@@ -32,6 +32,8 @@ const (
 	Internal_CleanupMigration_FullMethodName           = "/Internal/CleanupMigration"
 	Internal_ProbeMigrationState_FullMethodName        = "/Internal/ProbeMigrationState"
 	Internal_IssueMigrationTimestamp_FullMethodName    = "/Internal/IssueMigrationTimestamp"
+	Internal_IssueBoundTimestamp_FullMethodName        = "/Internal/IssueBoundTimestamp"
+	Internal_LookupTimestampBinding_FullMethodName     = "/Internal/LookupTimestampBinding"
 )
 
 // InternalClient is the client API for Internal service.
@@ -52,6 +54,8 @@ type InternalClient interface {
 	CleanupMigration(ctx context.Context, in *CleanupMigrationRequest, opts ...grpc.CallOption) (*CleanupMigrationResponse, error)
 	ProbeMigrationState(ctx context.Context, in *ProbeMigrationStateRequest, opts ...grpc.CallOption) (*ProbeMigrationStateResponse, error)
 	IssueMigrationTimestamp(ctx context.Context, in *IssueMigrationTimestampRequest, opts ...grpc.CallOption) (*IssueMigrationTimestampResponse, error)
+	IssueBoundTimestamp(ctx context.Context, in *IssueBoundTimestampRequest, opts ...grpc.CallOption) (*IssueBoundTimestampResponse, error)
+	LookupTimestampBinding(ctx context.Context, in *LookupTimestampBindingRequest, opts ...grpc.CallOption) (*LookupTimestampBindingResponse, error)
 }
 
 type internalClient struct {
@@ -201,6 +205,26 @@ func (c *internalClient) IssueMigrationTimestamp(ctx context.Context, in *IssueM
 	return out, nil
 }
 
+func (c *internalClient) IssueBoundTimestamp(ctx context.Context, in *IssueBoundTimestampRequest, opts ...grpc.CallOption) (*IssueBoundTimestampResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(IssueBoundTimestampResponse)
+	err := c.cc.Invoke(ctx, Internal_IssueBoundTimestamp_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *internalClient) LookupTimestampBinding(ctx context.Context, in *LookupTimestampBindingRequest, opts ...grpc.CallOption) (*LookupTimestampBindingResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(LookupTimestampBindingResponse)
+	err := c.cc.Invoke(ctx, Internal_LookupTimestampBinding_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // InternalServer is the server API for Internal service.
 // All implementations must embed UnimplementedInternalServer
 // for forward compatibility.
@@ -219,6 +243,8 @@ type InternalServer interface {
 	CleanupMigration(context.Context, *CleanupMigrationRequest) (*CleanupMigrationResponse, error)
 	ProbeMigrationState(context.Context, *ProbeMigrationStateRequest) (*ProbeMigrationStateResponse, error)
 	IssueMigrationTimestamp(context.Context, *IssueMigrationTimestampRequest) (*IssueMigrationTimestampResponse, error)
+	IssueBoundTimestamp(context.Context, *IssueBoundTimestampRequest) (*IssueBoundTimestampResponse, error)
+	LookupTimestampBinding(context.Context, *LookupTimestampBindingRequest) (*LookupTimestampBindingResponse, error)
 	mustEmbedUnimplementedInternalServer()
 }
 
@@ -267,6 +293,12 @@ func (UnimplementedInternalServer) ProbeMigrationState(context.Context, *ProbeMi
 }
 func (UnimplementedInternalServer) IssueMigrationTimestamp(context.Context, *IssueMigrationTimestampRequest) (*IssueMigrationTimestampResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method IssueMigrationTimestamp not implemented")
+}
+func (UnimplementedInternalServer) IssueBoundTimestamp(context.Context, *IssueBoundTimestampRequest) (*IssueBoundTimestampResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method IssueBoundTimestamp not implemented")
+}
+func (UnimplementedInternalServer) LookupTimestampBinding(context.Context, *LookupTimestampBindingRequest) (*LookupTimestampBindingResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method LookupTimestampBinding not implemented")
 }
 func (UnimplementedInternalServer) mustEmbedUnimplementedInternalServer() {}
 func (UnimplementedInternalServer) testEmbeddedByValue()                  {}
@@ -516,6 +548,42 @@ func _Internal_IssueMigrationTimestamp_Handler(srv interface{}, ctx context.Cont
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Internal_IssueBoundTimestamp_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(IssueBoundTimestampRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(InternalServer).IssueBoundTimestamp(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Internal_IssueBoundTimestamp_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(InternalServer).IssueBoundTimestamp(ctx, req.(*IssueBoundTimestampRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Internal_LookupTimestampBinding_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(LookupTimestampBindingRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(InternalServer).LookupTimestampBinding(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Internal_LookupTimestampBinding_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(InternalServer).LookupTimestampBinding(ctx, req.(*LookupTimestampBindingRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Internal_ServiceDesc is the grpc.ServiceDesc for Internal service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -570,6 +638,14 @@ var Internal_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "IssueMigrationTimestamp",
 			Handler:    _Internal_IssueMigrationTimestamp_Handler,
+		},
+		{
+			MethodName: "IssueBoundTimestamp",
+			Handler:    _Internal_IssueBoundTimestamp_Handler,
+		},
+		{
+			MethodName: "LookupTimestampBinding",
+			Handler:    _Internal_LookupTimestampBinding_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

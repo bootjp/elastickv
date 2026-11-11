@@ -176,6 +176,8 @@ type Internal struct {
 	transactionManager              kv.Transactional
 	clock                           *kv.HLC
 	tsAllocator                     kv.TimestampAllocator
+	timestampAdmissionIssuer        kv.TimestampAfterAllocator
+	timestampAdmissionToken         string
 	adminProposer                   raftengine.Proposer
 	bootstrapPolicyProposer         raftengine.Proposer
 	prepareStartupAuthorization     func(context.Context, *pb.PrepareEvidenceStateRequest) bool
@@ -249,6 +251,9 @@ func (i *Internal) Forward(ctx context.Context, req *pb.ForwardRequest) (*pb.For
 		return nil, forwardUnknownStatus(req.GetRequests(), kv.ErrLeaderNotFound)
 	}
 	if err := i.leader.VerifyLeader(ctx); err != nil {
+		return nil, forwardUnknownStatus(req.GetRequests(), err)
+	}
+	if err := rejectUnactivatedBoundForward(req.GetRequests()); err != nil {
 		return nil, forwardUnknownStatus(req.GetRequests(), err)
 	}
 
