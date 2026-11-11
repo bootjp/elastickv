@@ -1,9 +1,12 @@
 # FIFO Retroactive Delay and Sequence-Authoritative Heads
 
-Status: implemented in this branch; independent review, publication CI and
-main merge remain gates. This record describes the protocol and its observed
-local evidence, not a completed crash campaign or deployment. It addresses
-issue #1365, independently of the observation-boundary work.
+Status: Implemented
+Author: bootjp
+Date: 2026-10-30
+
+The protocol was merged in PR #1367. This record describes its implementation
+and observed local evidence, not a completed crash campaign or deployment. It
+addresses issue #1365, independently of the observation-boundary work.
 
 ## Contract
 
@@ -242,7 +245,8 @@ groups as not found; dynamic removal of a mapped serving group needs the
 separate group-lifecycle protocol, not a claim of supported transparent
 removal here. Transaction primary metadata explicitly distinguishes unavailable
 owners from absent records. No full unfiltered local Go or arbitrary crash
-campaign is claimed. Final-push review/security/CI are still required.
+campaign is claimed. This implementation status reflects the merged central
+subsystem, not completion of every operational acceptance gate.
 An export of the exact staged source, without unpublished files, also passes
 the complete SQS/FIFO race selection (26.865s), new KV owner/membership checks
 (1.820s) and full repository lint (zero issues).
@@ -275,8 +279,8 @@ purge/delete/recreate, fault injection and encrypted/durable reopen are covered.
 
 ## Changed Paths
 
-All paths below are relative to the repository, on branch
-feature/sqs-fifo-retroactive-delay.
+All paths below are relative to the repository. The implementation was merged
+from feature/sqs-fifo-retroactive-delay in PR #1367.
 
 ```text
 adapter/sqs.go
@@ -306,5 +310,5 @@ kv/coordinator_membership_test.go
 kv/shard_store.go
 kv/shard_store_partition_txn.go
 kv/shard_store_partition_txn_test.go
-docs/design/2026_10_30_proposed_sqs_fifo_retroactive_delay.md
+docs/design/2026_10_30_implemented_sqs_fifo_retroactive_delay.md
 ```
