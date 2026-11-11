@@ -442,12 +442,12 @@ func (f *kvFSM) Apply(data []byte) any {
 
 func (f *kvFSM) applyDecodedRequests(ctx context.Context, reqs []*pb.Request) any {
 	if len(reqs) == 1 {
-		if len(reqs[0].GetTimestampBindingOperationId()) != 0 {
+		if f.timestampBindingEnabled.Load() && len(reqs[0].GetTimestampBindingOperationId()) != 0 {
 			return f.applyTimestampBoundCreation(ctx, reqs[0])
 		}
 		return f.applyRequest(ctx, reqs[0])
 	}
-	if requestsUseTimestampBinding(reqs) {
+	if f.timestampBindingEnabled.Load() && requestsUseTimestampBinding(reqs) {
 		return errors.WithStack(ErrTimestampBindingInvalid)
 	}
 

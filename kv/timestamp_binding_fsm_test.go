@@ -51,16 +51,32 @@ func TestFSMTimestampBoundRawApplyAndRetry(t *testing.T) {
 }
 
 func TestFSMTimestampBindingDisabledByDefault(t *testing.T) {
-	st := store.NewMVCCStore()
-	fsm := g17FSM(t, st)
-	request := g17RawPut(100, "bound", "value")
-	request.TimestampBindingOperationId = []byte{1}
-	response, ok := fsm.Apply(g17Entry(t, request)).(error)
-	require.True(t, ok)
-	require.ErrorIs(t, response, ErrTimestampBindingInvalid)
-	_, err := st.GetAt(t.Context(), []byte("bound"), 100)
-	require.ErrorIs(t, err, store.ErrKeyNotFound)
-	require.ErrorIs(t, StampTimestampAdmission(t.Context(), nil, st, []*pb.Request{request}), ErrTimestampBindingInvalid)
+	for name, factory := range map[string]func(*testing.T) store.MVCCStore{
+		"memory": func(t *testing.T) store.MVCCStore { return store.NewMVCCStore() },
+		"pebble": func(t *testing.T) store.MVCCStore { return storetest.NewPebble(t) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			st := factory(t)
+			fsm := g17FSM(t, st)
+			first := g17RawPut(100, "bound", "value")
+			first.TimestampBindingOperationId = []byte{1}
+			require.Nil(t, fsm.Apply(g17Entry(t, first)))
+			got, err := st.GetAt(t.Context(), []byte("bound"), 100)
+			require.NoError(t, err)
+			require.Equal(t, []byte("value"), got)
+			require.ErrorIs(t, StampTimestampAdmission(t.Context(), nil, st, []*pb.Request{first}), ErrTimestampBindingInvalid)
+
+			fsm.SetApplyIndex(g17EntryIndex + 1)
+			second := g17RawPut(101, "batched", "value")
+			second.TimestampBindingOperationId = []byte{2}
+			require.Nil(t, fsm.Apply(g17Entry(t, second, g17RawPut(102, "other", "value"))))
+			for _, key := range []string{"batched", "other"} {
+				got, err = st.GetAt(t.Context(), []byte(key), 102)
+				require.NoError(t, err)
+				require.Equal(t, []byte("value"), got)
+			}
+		})
+	}
 }
 
 func TestFSMTimestampBoundTxnCreation(t *testing.T) {
