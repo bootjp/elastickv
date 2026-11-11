@@ -1,6 +1,6 @@
 # Test suite cleanup: redundant tests, live-path retargets, and shared test support
 
-Status: Partial
+Status: Implemented
 Author: bootjp
 Date: 2026-10-16
 
@@ -28,6 +28,14 @@ An audit of the Go test suite on 2026-10-16 (472 `*_test.go` files, about 198k l
 5. **FUSE end-to-end tests never run in CI.** `go-test.yml` neither installs `fuse3` nor sets `ELASTICKV_REQUIRE_FUSE`, so the kernel-mount tests always skip.
 
 Problems 3 and 5 are fixed by the PR that adds this document (WP-0). The rest are split into the work packages below.
+
+The bounded work packages are complete on `main` (see Progress and the recorded
+deviations below). The 122 receive-or-fail blocks and behavior-specific test
+fakes listed as exceptions are intentionally retained, not unfinished WP
+items. PR #1426 restored the filesystem memory dispatcher's original error
+classification and optional-capability behavior after the shared-helper
+migration; its final-head lint, race-test CI, and review passed. This document
+does not claim completion of the separately listed product-bug follow-ups.
 
 ## Goals
 
@@ -111,9 +119,9 @@ WP-9 to WP-12 results (all four directory sets were migrated together, one commi
 | Encryption fixtures | `store.CounterNonceFactory` exported from production `store`; 10 random-DEK keystore+cipher blocks; 2 byte-identical sidecar writers plus 4 temp-dir writers | `store/encryption_test_helpers.go` deleted (callers use `encryption.NewDeterministicNonceFactory`); 37 `encryptiontest` call sites | Fixed-byte DEKs, sidecar rewrites of an existing path, and `wiringEncryptionObserver` ≈ `recordingEncryptionObserver` (different packages; sharing needs a new package). |
 | Loopback gRPC servers | about 27 | 14 kv servers on `grpctest.Serve` | Servers whose tests assert the `Serve` error, need the listener address before construction, or stop the server mid-test. |
 | Fake Raft engines | 13 full fakes, about 10 `LeaderView`, about 12 `Proposer` | `stubLeaderEngine`/`noopEngine`, `stubFollowerEngine`, `membershipConfigEngine` → `raftenginetest.StubEngine`; three `LeaderView` fakes → `StaticLeaderView`; etcd `testStateMachine` aliases `raftenginetest.TestStateMachine` | Rule 4: fakes whose behaviour is the subject (toggling leader, blocking reads, lease, call recording, panicking `VerifyLeader`, error-injecting proposers). |
-| Fake coordinators | 12 full fakes, 6 in-memory apply coordinators | HELLO/INFO fakes folded into `stubAdapterCoordinator`; `testCoordinatorWrapper`, `phaseDGateCoordinator`, `fakeGroupRoutableCoordinator` embed instead of forwarding; `localAdapterCoordinator`, `occAdapterCoordinator`, `retryOnceCoordinator`, `fstest.MemoryDispatcher` and the filesystem `testCoordinator` dispatch through `kvtest.LocalCoordinator` (new `Clock` option shares the wrapper's HLC) | Rule 4 again for fakes with hooks, counters or scripted failures (`distributionCoordinatorStub`, `stubLeaderCoordinator`, `stubStartupCoordinator`, the TSO fakes). `phaseDGateCoordinator` embeds an interface of exactly its old method set, not `*ShardedCoordinator`, so it gains no optional capabilities. |
+| Fake coordinators | 12 full fakes, 6 in-memory apply coordinators | HELLO/INFO fakes folded into `stubAdapterCoordinator`; `testCoordinatorWrapper`, `phaseDGateCoordinator`, `fakeGroupRoutableCoordinator` embed instead of forwarding; `localAdapterCoordinator`, `occAdapterCoordinator`, `retryOnceCoordinator`, and the filesystem `testCoordinator` dispatch through `kvtest.LocalCoordinator` (new `Clock` option shares the wrapper's HLC) | Rule 4 again for fakes with hooks, counters or scripted failures (`distributionCoordinatorStub`, `stubLeaderCoordinator`, `stubStartupCoordinator`, the TSO fakes). `fstest.MemoryDispatcher` retains its own dispatch semantics after #1426. `phaseDGateCoordinator` embeds an interface of exactly its old method set, not `*ShardedCoordinator`, so it gains no optional capabilities. |
 
-Behaviour notes for the `LocalCoordinator` move: dispatches are serialized, elements are copied, `ctx` is checked before applying, the response carries `CommitTS`/`CommitIndex`, unknown ops return `ErrUnknownOp`, and an invalid commit-timestamp patch surfaces kv's validation error instead of `filesystem.ErrInvalid`.
+Behaviour notes for the `LocalCoordinator` move: dispatches are serialized, elements are copied, `ctx` is checked before applying, the response carries `CommitTS`/`CommitIndex`, and unknown ops return `ErrUnknownOp`. The filesystem `fstest.MemoryDispatcher` keeps its original `filesystem.ErrInvalid` classification for invalid commit-timestamp patches; #1426 restored that behavior rather than changing its callers to the shared helper's validation error.
 
 Deviations from the plan, found while implementing:
 
@@ -476,7 +484,7 @@ Go `_test.go` helpers cannot be imported across packages, and most test files he
 | `internal/raftengine/raftenginetest` (extend) | `raftengine`, `monoclock` | etcd-internal, kv-internal, adapter, root, raftadmin | Export `NewSingleNode(tb, factory, sm)` and `WaitForLeader(tb, d, views...) int`. Add `StubEngine` (configurable `State`, `Leader`, `ProposeFunc`, `ReadIndex`/`ReadErr`, `StatusValue`, `Config`), `StaticLeaderView`, `RecordingProposer`, `ApplyingProposer(sm)`. |
 | `internal/encryption/encryptiontest` | `encryption` | store-internal, etcd, kv, root, adapter, cmd | `NewCipher(tb, keyID) *encryption.Cipher`, `WriteSidecar(tb, *encryption.Sidecar) (path string)`, `NewNonceFactory(tb)`, `WriteKEKFile(tb)` |
 | `store/storetest` | `store` | kv, adapter, distribution, etcd, root, cmd (not store-internal) | `NewPebble(tb, opts...) store.MVCCStore` with `t.TempDir` and cleanup |
-| `kv/kvtest` | `kv`, `store` | adapter, filesystem, root (not kv-internal) | `NopCoordinator`: always leader, no-op `Dispatch`, lazily created `*kv.HLC`. `LocalCoordinator`: applies `OperationGroup`s to a `store.MVCCStore`, with explicit options for each behaviour the current fakes disagree on (`DEL_PREFIX` handling, commit-timestamp source, OCC read-key validation, `CommitTSValueOffset` patching). It replaces `fstest.MemoryDispatcher`, so filesystem-internal tests can drop their copy. |
+| `kv/kvtest` | `kv`, `store` | adapter, filesystem, root (not kv-internal) | `NopCoordinator`: always leader, no-op `Dispatch`, lazily created `*kv.HLC`. `LocalCoordinator`: applies `OperationGroup`s to a `store.MVCCStore`, with explicit options for each behaviour the current fakes disagree on (`DEL_PREFIX` handling, commit-timestamp source, OCC read-key validation, `CommitTSValueOffset` patching). The planned replacement of `fstest.MemoryDispatcher` was reversed in #1426 to preserve its distinct behavior. |
 | `kv/fakes_test.go` (in-package) | — | kv-internal | `nopCoordinator`, plus engines built on `raftenginetest` |
 
 Also export `store.LegacyListMetaDeltaKey(userKey, ts, seq)` next to `store.ListMetaDeltaKey` (`store/list_helpers.go:75`). It replaces five test copies of `legacyListMetaDeltaKey` / `deltaLookingListMetaUserKey`, which today disagree on `seq` (adapter uses 0, kv uses 1).
