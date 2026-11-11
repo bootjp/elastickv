@@ -26,6 +26,17 @@
         opened   (client/open! c test-map "n1")]
     (is (some? (:ddb opened)))))
 
+(deftest create-table-setup-retries-unknown-with-same-name
+  (let [calls (atom [])]
+    (with-redefs-fn {#'workload/ddb-invoke!
+                    (fn [_ op request]
+                      (swap! calls conj [op (:TableName request)])
+                      (throw (ex-info "create result" {:type (if (= 1 (count @calls))
+                                                              "OperationOutcomeUnknown"
+                                                              "ResourceInUseException")})))}
+      #(is (nil? (@#'workload/create-table! ::ddb))))
+    (is (= [[:CreateTable "jepsen_append"] [:CreateTable "jepsen_append"]] @calls))))
+
 (deftest transaction-canceled-is-indeterminate
   (let [c  (workload/->DynamoDBClient {} ::ddb)
         op {:type :invoke

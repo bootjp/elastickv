@@ -449,6 +449,9 @@ func (r *RedisServer) dispatchXAddReuse(
 	}
 
 	dispErr = normalizeRetryableRedisTxnErr(dispErr)
+	if errors.Is(dispErr, kv.ErrTransactionOutcomeUnknown) {
+		return "", false, dispErr
+	}
 	if errors.Is(dispErr, store.ErrWriteConflict) {
 		if len(pending.probeKey) == 0 {
 			return "", false, cockerrors.Wrap(dispErr, "redis xadd reuse: missing dedup probe key")

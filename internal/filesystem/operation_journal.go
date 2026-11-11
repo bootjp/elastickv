@@ -29,6 +29,7 @@ type operationJournalBackend interface {
 	ScanAt(context.Context, []byte, []byte, int, uint64) ([]*store.KVPair, error)
 	Commit(context.Context, uint64, []*kv.Elem[kv.OP], [][]byte) (*kv.CoordinateResponse, error)
 	JournalRouteVersion() (uint64, bool)
+	JournalSingleGroupAtVersion(uint64) bool
 	CommitAtRouteVersion(context.Context, uint64, []*kv.Elem[kv.OP], [][]byte, uint64) (*kv.CoordinateResponse, error)
 	CommittedVersionAt(context.Context, []byte, uint64) (bool, error)
 	CommittedVersionAtGroup(context.Context, []byte, uint64, uint64) (bool, error)
@@ -42,14 +43,14 @@ func (b serviceOperationBackend) Snapshot(ctx context.Context) (uint64, error) {
 }
 
 func (b serviceOperationBackend) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte, error) {
-	value, err := retryJournalLocked(ctx, func(ctx context.Context) ([]byte, error) {
+	value, err := retryJournalRead(ctx, func(ctx context.Context) ([]byte, error) {
 		return b.service.store.GetAt(ctx, key, ts)
 	})
 	return value, errors.Wrap(err, "read operation journal")
 }
 
 func (b serviceOperationBackend) ScanAt(ctx context.Context, start, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
-	page, err := retryJournalLocked(ctx, func(ctx context.Context) ([]*store.KVPair, error) {
+	page, err := retryJournalRead(ctx, func(ctx context.Context) ([]*store.KVPair, error) {
 		return b.service.store.ScanAt(ctx, start, end, limit, ts)
 	})
 	return page, errors.Wrap(err, "scan operation journal")
@@ -72,6 +73,13 @@ func (b serviceOperationBackend) JournalRouteVersion() (uint64, bool) {
 	}
 	_, sharded := b.service.store.(*kv.ShardStore)
 	return 0, !sharded
+}
+
+func (b serviceOperationBackend) JournalSingleGroupAtVersion(observed uint64) bool {
+	if sharded, ok := b.service.store.(*kv.ShardStore); ok {
+		return sharded.JournalSingleGroupAtVersion(observed)
+	}
+	return observed == 0
 }
 
 func (b serviceOperationBackend) CommitAtRouteVersion(ctx context.Context, ts uint64, elems []*kv.Elem[kv.OP], readKeys [][]byte, observed uint64) (*kv.CoordinateResponse, error) {
@@ -108,12 +116,26 @@ func (b serviceOperationBackend) commit(ctx context.Context, ts uint64, elems []
 
 // A lock held by another journal transaction is a transient dependency. The
 // caller retains the same snapshot and attempt identity while the owner
-// finishes. An unknown transaction outcome is never retried here.
+// finishes. An unknown write outcome is never retried here.
 func retryJournalLocked[T any](ctx context.Context, call func(context.Context) (T, error)) (T, error) {
+	return retryJournalContention(ctx, call, false)
+}
+
+// Retrying a read at the same snapshot cannot replay the journal mutation.
+// This also covers unknown results from read-watermark advancement.
+func retryJournalRead[T any](ctx context.Context, call func(context.Context) (T, error)) (T, error) {
+	return retryJournalContention(ctx, call, true)
+}
+
+func retryJournalContention[T any](ctx context.Context, call func(context.Context) (T, error), readOnly bool) (T, error) {
 	var result T
 	for retry := range operationCASRetries {
 		value, err := call(ctx)
-		if !errors.Is(err, kv.ErrTxnLocked) || errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+		if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+			if !readOnly {
+				return value, err
+			}
+		} else if !errors.Is(err, kv.ErrTxnLocked) {
 			return value, err
 		}
 		result = value
@@ -372,20 +394,55 @@ func (j *OperationJournal) Admit(ctx context.Context, id OperationID, intent []b
 	if err := validateOperationRecord(record); err != nil {
 		return operationRecord{}, err
 	}
-	for retry := range operationCASRetries {
-		admitted, err := j.admitOnce(ctx, record)
-		if IsWriteConflict(err) {
-			if err = waitOperationCASRetry(ctx, retry); err != nil {
-				return operationRecord{}, err
-			}
-			continue
-		}
-		return admitted, err
-	}
-	return operationRecord{}, errors.WithStack(ErrContentionLimit)
+	admitted, err := j.retryRecordCAS(ctx, ErrContentionLimit, func(observed uint64) (operationRecord, error) {
+		return j.admitOnce(ctx, record, observed)
+	})
+	return admitted, errors.Wrap(err, "admit operation journal")
 }
 
-func (j *OperationJournal) admitOnce(ctx context.Context, record operationRecord) (operationRecord, error) {
+// A single-group CAS can be retried at a fresh snapshot because both attempts
+// write the same primary and validate its prior version. Keep an earlier
+// unknown outcome if a later read or retry is interrupted before resolution.
+func (j *OperationJournal) retryRecordCAS(ctx context.Context, exhausted error, attempt func(uint64) (operationRecord, error)) (operationRecord, error) {
+	var priorUnknown error
+	for retry := range operationCASRetries {
+		observed, ready := j.backend.JournalRouteVersion()
+		if !ready {
+			return operationRecord{}, preserveJournalUnknown(priorUnknown, errors.WithStack(kv.ErrTransactionOutcomeUnknown))
+		}
+		record, err := attempt(observed)
+		if err == nil {
+			return record, nil
+		}
+		if j.retryUnknownSingleGroupCAS(err, observed) {
+			if priorUnknown == nil {
+				priorUnknown = err
+			}
+			if retry == operationCASRetries-1 {
+				return operationRecord{}, priorUnknown
+			}
+		} else if !IsWriteConflict(err) {
+			return record, preserveJournalUnknown(priorUnknown, err)
+		}
+		if waitErr := waitOperationCASRetry(ctx, retry); waitErr != nil {
+			return operationRecord{}, preserveJournalUnknown(priorUnknown, waitErr)
+		}
+	}
+	return operationRecord{}, preserveJournalUnknown(priorUnknown, errors.WithStack(exhausted))
+}
+
+func preserveJournalUnknown(prior, current error) error {
+	if prior == nil {
+		return current
+	}
+	return errors.Join(prior, current)
+}
+
+func (j *OperationJournal) retryUnknownSingleGroupCAS(err error, observed uint64) bool {
+	return errors.Is(err, kv.ErrTransactionOutcomeUnknown) && j.backend.JournalSingleGroupAtVersion(observed)
+}
+
+func (j *OperationJournal) admitOnce(ctx context.Context, record operationRecord, observed uint64) (operationRecord, error) {
 	ts, err := j.backend.Snapshot(ctx)
 	if err != nil {
 		return operationRecord{}, errors.Wrap(err, "fence operation admission")
@@ -411,7 +468,7 @@ func (j *OperationJournal) admitOnce(ctx context.Context, record operationRecord
 	if err = reserveOperation(&session, record); err != nil {
 		return operationRecord{}, err
 	}
-	return record, j.storeRecordAndSession(ctx, ts, record, session)
+	return record, j.storeRecordAndSessionAtRoute(ctx, ts, record, session, nil, nil, observed)
 }
 
 func reserveOperation(session *operationSession, record operationRecord) error {

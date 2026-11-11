@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc/codes"
@@ -51,6 +52,9 @@ func (s *DistributionServer) runSplitJobAttempt(ctx context.Context, job distrib
 }
 
 func splitJobPhaseErrorRetryable(err error) bool {
+	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+		return false
+	}
 	if err == nil || splitJobRunnerContextDone(err) || splitJobCoordinatorLeadershipError(err) || errors.Is(err, errSplitMigrationVoterBarrierIncomplete) || errors.Is(err, store.ErrWriteConflict) {
 		return true
 	}

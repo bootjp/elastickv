@@ -158,6 +158,9 @@ func isProxyTransactionOutcomeUnknown(err error) bool {
 	if err == nil {
 		return false
 	}
+	if err.Error() == redisOutcomeUnknownReply {
+		return true
+	}
 	message := strings.TrimPrefix(err.Error(), "ERR ")
 	unknown := kv.ErrTransactionOutcomeUnknown.Error()
 	// Match the exact terminal overflow spelling emitted by writeTerminalFailure,
