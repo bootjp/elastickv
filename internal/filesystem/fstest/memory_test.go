@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/filesystem"
 	"github.com/bootjp/elastickv/internal/filesystem/fstest"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
@@ -61,7 +62,7 @@ func TestMemoryDispatcherTimestampPatchBoundaries(t *testing.T) {
 			response, err := fstest.NewMemoryDispatcher(st).Dispatch(context.Background(), req)
 			require.Equal(t, original, value)
 			if !tc.valid {
-				require.ErrorIs(t, err, kv.ErrInvalidRequest)
+				require.ErrorIs(t, err, filesystem.ErrInvalid)
 				require.Nil(t, response)
 				require.False(t, st.called)
 				return
@@ -69,7 +70,7 @@ func TestMemoryDispatcherTimestampPatchBoundaries(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, uint64(41), response.CommitIndex)
 			require.Len(t, st.mutations, 1)
-			want := bytes.Clone(value)
+			want := append([]byte(nil), value...)
 			if tc.offset != 0 {
 				binary.BigEndian.PutUint64(want[tc.offset:], response.CommitIndex)
 			}
@@ -145,8 +146,8 @@ func TestMemoryDispatcherRejectsUnsupportedOperationsBeforeApply(t *testing.T) {
 	}{
 		{name: "prefix delete", op: kv.DelPrefix, want: store.ErrUnknownOp},
 		{name: "unknown operation", op: kv.OP(-1), want: store.ErrUnknownOp},
-		{name: "prefix rejected before patch", op: kv.DelPrefix, offset: 1, want: store.ErrUnknownOp},
-		{name: "delete patch checked", op: kv.Del, offset: 1, want: kv.ErrInvalidRequest},
+		{name: "prefix patch checked before operation", op: kv.DelPrefix, offset: 1, want: filesystem.ErrInvalid},
+		{name: "delete patch checked", op: kv.Del, offset: 1, want: filesystem.ErrInvalid},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			st := &mutationCaptureStore{}

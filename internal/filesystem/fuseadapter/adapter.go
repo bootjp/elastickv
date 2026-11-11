@@ -797,10 +797,14 @@ func (a *Adapter) refreshOpenHandleLease(ctx context.Context, inode uint64, fh u
 	if ctx.Value(backgroundOperationKey{}) == true && id != (filesystem.OperationID{}) {
 		a.queueAcknowledgement(id)
 	}
+	logLeaseRefreshError(ctx, inode, fh, err)
+	return Errno(err)
+}
+
+func logLeaseRefreshError(ctx context.Context, inode, fh uint64, err error) {
 	if err != nil && Errno(err) == syscall.EIO {
 		slog.WarnContext(ctx, "filesystem FUSE lease refresh failed", "inode", inode, "fh", fh, "error", err.Error())
 	}
-	return Errno(err)
 }
 
 func (a *Adapter) refreshJournaledLease(ctx context.Context, inode uint64, fh uint64) (filesystem.OperationID, error) {

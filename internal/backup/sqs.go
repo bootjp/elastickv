@@ -947,15 +947,6 @@ func mustMarshalIndent(v any) []byte {
 	return out
 }
 
-// keyComponents is a debugging helper exposed for tests; not used by
-// production code paths.
-type keyComponents struct {
-	Prefix  string
-	Encoded string
-	GenRaw  []byte
-	MsgID   string
-}
-
 // EncodeMsgDataKey constructs a !sqs|msg|data key for tests. Mirrors the
 // live sqsMsgDataKey constructor in adapter/sqs_messages.go.
 func EncodeMsgDataKey(queueName string, gen uint64, messageID string) []byte {

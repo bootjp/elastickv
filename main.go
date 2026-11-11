@@ -33,6 +33,7 @@ import (
 	internalraftadmin "github.com/bootjp/elastickv/internal/raftadmin"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
+	"github.com/bootjp/elastickv/internal/runtimehealth"
 	"github.com/bootjp/elastickv/internal/serverwiring"
 	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/kv"
@@ -737,7 +738,7 @@ func run() error {
 		coordinate, shardGroups[cfg.defaultGroup], encWiring.cache, *encryptionSidecarPath, etcdraftengine.DeriveNodeID)
 	rotateOnStartupDeregister, waitRotateOnStartup := installBootstrapStartupRotation(distStartup.rotationSupervisor, runCtx, encryptionStartup)
 	cleanup.Add(rotateOnStartupDeregister)
-	if err := startServersAfterStartupRotation(waitRotateOnStartup, serversInput{
+	return serveStartedRuntime(waitRotateOnStartup, serversInput{
 		ctx: runCtx, eg: eg, cancel: cancel, lc: &lc,
 		runtimes: runtimes, shardGroups: shardGroups, bootstrapServers: bootstrapCfg.adminSeed(cfg.defaultGroup),
 		shardStore: shardStore, coordinate: coordinate,
@@ -751,25 +752,29 @@ func run() error {
 		keyvizSampler:                   sampler,
 		autoSplitRuntime:                autoSplitRuntime,
 		encryptionConfChangeInterceptor: encryptionConfChangeInterceptor,
-	}); err != nil {
+	}, health, handoff)
+}
+
+func serveStartedRuntime(waitRotateOnStartup startupRotationWaiter, in serversInput, health *runtimehealth.Probe, handoff *shutdownHandoff) error {
+	if err := startServersAfterStartupRotation(waitRotateOnStartup, in); err != nil {
 		return err
 	}
 	health.MarkServing()
-	balanceCtx, stopBalance := context.WithCancel(runCtx)
+	balanceCtx, stopBalance := context.WithCancel(in.ctx)
 	defer stopBalance()
 	balanceDone := make(chan struct{})
-	handoff.arm(runCtx, eg, runtimes, func(ctx context.Context) error {
+	handoff.arm(in.ctx, in.eg, in.runtimes, func(ctx context.Context) error {
 		return stopLeaderBalanceForShutdown(ctx, stopBalance, balanceDone)
 	})
 	startLeaderBalanceScheduler(
 		balanceCtx,
-		eg,
-		runtimes,
-		leaderBalanceConfigFromFlags(*raftId, cfg.defaultGroup, cfg.sqsFifoPartitionMap, metricsRegistry.Registerer()),
+		in.eg,
+		in.runtimes,
+		leaderBalanceConfigFromFlags(*raftId, in.cfg.defaultGroup, in.cfg.sqsFifoPartitionMap, in.metricsRegistry.Registerer()),
 		balanceDone,
 	)
 
-	return waitRunGroup(eg)
+	return waitRunGroup(in.eg)
 }
 
 func newStartupShardStore(engine *distribution.Engine, groups map[uint64]*kv.ShardGroup, advanceReadWatermark bool) *kv.ShardStore {

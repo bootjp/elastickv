@@ -370,13 +370,6 @@ func (e *redisStreamEntry) cacheParsedID() {
 	e.parsedID, e.parsedIDValid = tryParseRedisStreamID(e.ID)
 }
 
-func (e redisStreamEntry) compareID(raw string, parsed redisStreamID, parsedValid bool) int {
-	if !e.parsedIDValid {
-		return compareRedisStreamID(e.ID, raw)
-	}
-	return compareParsedRedisStreamID(e.ID, e.parsedID, true, raw, parsed, parsedValid)
-}
-
 func encodeRedisTTL(expireAt time.Time) []byte {
 	ms := max(expireAt.UnixMilli(), 0)
 	buf := make([]byte, redisUint64Bytes)
