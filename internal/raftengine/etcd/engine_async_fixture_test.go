@@ -277,7 +277,16 @@ func (h *asyncStorageRuntime) flushFollower(t *testing.T) {
 		}
 		for _, msg := range rd.Messages {
 			if msg.GetType() == raftpb.MsgProp {
-				require.NoError(t, h.engine.enqueueStep(h.ctx, *msg))
+				deadline := time.Now().Add(5 * time.Second)
+				for {
+					err := h.engine.enqueueStep(h.ctx, *msg)
+					if !errors.Is(err, errStepQueueFull) {
+						require.NoError(t, err)
+						break
+					}
+					require.True(t, time.Now().Before(deadline), "local proposal admission stayed full")
+					runtime.Gosched()
+				}
 			} else {
 				require.NoError(t, h.engine.handleTransportMessage(h.ctx, *msg))
 			}

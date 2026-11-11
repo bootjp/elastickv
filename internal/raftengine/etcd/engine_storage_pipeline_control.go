@@ -1,7 +1,9 @@
 package etcd
 
 import (
+	"cmp"
 	"crypto/sha256"
+	"slices"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/cockroachdb/errors"
@@ -17,8 +19,13 @@ type pipelineReadOwnership struct {
 }
 
 type pipelineNetworkReadOwnership struct {
-	permits       []*storageWorkPermit
+	permits       []pipelineNetworkReadPermit
 	pendingCommit bool
+}
+
+type pipelineNetworkReadPermit struct {
+	permit *storageWorkPermit
+	term   uint64
 }
 
 type pipelineNetworkReadKey struct {
@@ -109,7 +116,7 @@ func (e *Engine) retainPipelineNetworkRead(input *pipelineIngress) {
 		owned = &pipelineNetworkReadOwnership{pendingCommit: !e.pipelineCurrentTermCommitted()}
 		p.networkReadOwnership[key] = owned
 	}
-	owned.permits = append(owned.permits, input.permit)
+	owned.permits = append(owned.permits, pipelineNetworkReadPermit{permit: input.permit, term: key.term})
 	input.permit = nil
 }
 
@@ -121,9 +128,13 @@ func (e *Engine) retirePipelineNetworkRead(message *raftpb.Message) {
 	key.from = message.GetTo()
 	p := e.storagePipeline
 	if owned := p.networkReadOwnership[key]; owned != nil {
-		p.readyReadRetire = append(p.readyReadRetire, owned.permits...)
+		p.readyReadRetire = append(p.readyReadRetire, owned.permits[0].permit)
+		owned.permits[0] = pipelineNetworkReadPermit{}
+		owned.permits = owned.permits[1:]
+		if len(owned.permits) == 0 {
+			delete(p.networkReadOwnership, key)
+		}
 	}
-	delete(p.networkReadOwnership, key)
 }
 
 func (p *engineStoragePipeline) retireReadyReads() {
@@ -134,8 +145,8 @@ func (p *engineStoragePipeline) retireReadyReads() {
 }
 
 func (p *engineStoragePipeline) releaseNetworkRead(key pipelineNetworkReadKey) {
-	for _, permit := range p.networkReadOwnership[key].permits {
-		permit.Release()
+	for _, owned := range p.networkReadOwnership[key].permits {
+		owned.permit.Release()
 	}
 	delete(p.networkReadOwnership, key)
 }
@@ -200,6 +211,9 @@ func (e *Engine) rebindPipelinePendingReads() {
 		key.term = term
 		if existing := p.networkReadOwnership[key]; existing != nil {
 			existing.permits = append(existing.permits, owned.permits...)
+			slices.SortStableFunc(existing.permits, func(a, b pipelineNetworkReadPermit) int {
+				return cmp.Compare(a.term, b.term)
+			})
 		} else {
 			p.networkReadOwnership[key] = owned
 		}

@@ -12,11 +12,13 @@ import (
 )
 
 type debtReadCluster struct {
-	nodes        []*etcdraft.RawNode
-	stores       []*etcdraft.MemoryStorage
-	partition    bool
-	owner        *Engine
-	holdReadAcks bool
+	nodes                []*etcdraft.RawNode
+	stores               []*etcdraft.MemoryStorage
+	partition            bool
+	owner                *Engine
+	holdReadAcks         bool
+	captureReadResponses bool
+	readResponses        []*raftpb.Message
 }
 
 func newDebtReadCluster(t *testing.T) *debtReadCluster {
@@ -63,8 +65,84 @@ func (c *debtReadCluster) pump(t *testing.T) {
 }
 
 func (c *debtReadCluster) drop(message *raftpb.Message) bool {
+	if c.captureReadResponses && message.GetType() == raftpb.MsgReadIndexResp {
+		c.readResponses = append(c.readResponses, message)
+		return true
+	}
 	return (c.partition && (message.GetType() == raftpb.MsgApp || message.GetType() == raftpb.MsgHeartbeat || message.GetType() == raftpb.MsgHeartbeatResp)) ||
 		(c.holdReadAcks && message.GetType() == raftpb.MsgHeartbeatResp)
+}
+
+func TestPipelineDuplicateNetworkReadRetiresOnePermitPerNativeResponse(t *testing.T) {
+	c := newDebtReadCluster(t)
+	c.partition = false
+	require.NoError(t, c.nodes[0].Campaign())
+	c.pump(t)
+	require.Equal(t, etcdraft.StateLeader, c.nodes[0].BasicStatus().RaftState)
+	c.captureReadResponses = true
+	e := newPipelineAdmissionFixture(t)
+	e.rawNode, e.storage, e.nodeID = c.nodes[0], c.stores[0], 1
+	t.Cleanup(func() { e.rawNode = nil; e.retirePipelineReadOwnership() })
+	p := e.storagePipeline
+	request := raftpb.Message{Type: messageTypePtr(raftpb.MsgReadIndex), From: uint64Ptr(2), To: uint64Ptr(1),
+		Entries: []*raftpb.Entry{{Data: []byte("duplicate-read")}}}
+	for i := range 2 {
+		permit, err := p.priorityIngressBudget.tryAcquire(pipelineTaskOverhead * uint64(i+1))
+		require.NoError(t, err)
+		input := &pipelineIngress{message: request, permit: permit}
+		e.retainPipelineNetworkRead(input)
+		require.Nil(t, input.permit)
+		require.NoError(t, c.nodes[0].Step(&request))
+	}
+	_, items := p.priorityIngressBudget.usage()
+	require.Equal(t, 2, items)
+	c.pump(t)
+	require.Len(t, c.readResponses, 2, "pinned raft must answer each duplicate request")
+	e.retirePipelineNetworkRead(c.readResponses[0])
+	p.retireReadyReads()
+	bytes, items := p.priorityIngressBudget.usage()
+	require.Equal(t, 1, items, "first response cannot retire the second native request")
+	require.Equal(t, uint64(2*pipelineTaskOverhead), bytes, "first response must retire the oldest request")
+	e.retirePipelineNetworkRead(c.readResponses[1])
+	p.retireReadyReads()
+	requireStorageWorkUsage(t, p.priorityIngressBudget, 0, 0)
+}
+
+func TestPipelineNetworkReadRebindKeepsOldestPermitFirst(t *testing.T) {
+	c := newDebtReadCluster(t)
+	c.partition = false
+	require.NoError(t, c.nodes[0].Campaign())
+	c.pump(t)
+	e := newPipelineAdmissionFixture(t)
+	e.rawNode, e.storage, e.nodeID = c.nodes[0], c.stores[0], 1
+	t.Cleanup(func() { e.rawNode = nil; e.retirePipelineReadOwnership() })
+	require.True(t, e.pipelineCurrentTermCommitted())
+	p := e.storagePipeline
+	oldPermit, err := p.priorityIngressBudget.tryAcquire(pipelineTaskOverhead)
+	require.NoError(t, err)
+	newPermit, err := p.priorityIngressBudget.tryAcquire(2 * pipelineTaskOverhead)
+	require.NoError(t, err)
+	response := raftpb.Message{Type: messageTypePtr(raftpb.MsgReadIndexResp), From: uint64Ptr(1), To: uint64Ptr(2),
+		Entries: []*raftpb.Entry{{Data: []byte("same-read")}}}
+	current := e.rawNode.BasicStatus().GetTerm()
+	oldKey := pipelineNetworkReadIdentity(&response, current-1)
+	oldKey.from = 2
+	newKey := oldKey
+	newKey.term = current
+	p.networkReadOwnership = map[pipelineNetworkReadKey]*pipelineNetworkReadOwnership{
+		oldKey: {permits: []pipelineNetworkReadPermit{{permit: oldPermit, term: oldKey.term}}, pendingCommit: true},
+		newKey: {permits: []pipelineNetworkReadPermit{{permit: newPermit, term: newKey.term}}},
+	}
+	e.rebindPipelinePendingReads()
+	require.NotContains(t, p.networkReadOwnership, oldKey)
+	e.retirePipelineNetworkRead(&response)
+	p.retireReadyReads()
+	bytes, items := p.priorityIngressBudget.usage()
+	require.Equal(t, 1, items)
+	require.Equal(t, uint64(2*pipelineTaskOverhead), bytes)
+	e.retirePipelineNetworkRead(&response)
+	p.retireReadyReads()
+	requireStorageWorkUsage(t, p.priorityIngressBudget, 0, 0)
 }
 
 func (c *debtReadCluster) ready(t *testing.T, i int) []*raftpb.Message {
