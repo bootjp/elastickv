@@ -187,13 +187,17 @@ Implementation order:
    unknown-outcome reconciliation, but a leader read barrier and remote
    reconciliation path are not wired. Production admission rejects the new
    operation-ID field until authenticated issuance and activation are wired.
+   Before replicated activation, FSM apply ignores that field for single and
+   batched entries so mixed-version replicas retain legacy apply semantics;
+   ingress still rejects newly bound requests.
 2. Authenticated issuance and primary/home admission path, including unknown
    outcome reconciliation and cross-group PREPARE/COMMIT/ABORT evidence.
 3. Physical-band group-0 reservation and versioned reservation response;
    prove no duplicate issuance across concurrent allocators, term changes,
    ambiguous proposals, and ceiling renewal. An opt-in local allocator now
-   commits the band end and tests those transitions. It still rejects active
-   Phase D, has no wire route, and cannot authorize writes.
+   commits the band end and tests those transitions, including advancing one
+   physical millisecond when the minimum leaves too few logical slots. It
+   still rejects active Phase D, has no wire route, and cannot authorize writes.
 4. Whole-cluster activation gate, migration and rolling-upgrade tests, native
    fault campaigns, Jepsen, and throughput/latency comparison with the old
    per-window allocator. No production activation before all gates pass.
