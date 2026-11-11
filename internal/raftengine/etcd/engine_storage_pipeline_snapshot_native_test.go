@@ -366,8 +366,15 @@ func (c *nativeSnapshotCluster) propose(t *testing.T, payload []byte) uint64 {
 	t.Helper()
 	done := make(chan proposalResult, 1)
 	go func() {
-		result, err := c.nodes[0].engine.Propose(t.Context(), payload)
-		done <- proposalResult{result: result, err: err}
+		for {
+			result, err := c.nodes[0].engine.Propose(t.Context(), payload)
+			if !errors.Is(err, errStorageWorkBackpressure) || t.Context().Err() != nil {
+				done <- proposalResult{result: result, err: err}
+				return
+			}
+			// A rejected pre-copy admission has not submitted the proposal.
+			time.Sleep(time.Millisecond)
+		}
 	}()
 	var result proposalResult
 	c.pumpUntil(t, func() bool {
