@@ -22,7 +22,7 @@ no lock. The visibility key is
 first, it takes the group lock and is delivered before the head.
 
 The test-suite cleanup audit
-(`2026_10_16_partial_test_suite_cleanup.md`, Follow-ups) found this from
+(`2026_10_16_implemented_test_suite_cleanup.md`, Follow-ups) found this from
 two flaky tests: `TestSQSServer_FifoGroupLockHoldsAcrossVisibilityExpiry`
 and `TestSQSServer_FifoSequenceNumberMonotonic` fail roughly 7/30 and 2/30
 runs without `-race`, because both send two messages back to back. A
