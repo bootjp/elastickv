@@ -25,6 +25,7 @@ type normalApplyInput struct {
 	cipher       *encryption.Cipher
 	fsm          StateMachine
 	nativeConfig *raftengine.NativeConfiguration
+	configEpoch  uint64
 	beforeApply  func(raftpb.Entry, []byte) error
 }
 
@@ -42,13 +43,18 @@ type normalApplyReceipt struct {
 // cutover's current value: a preceding queued apply can enable encryption.
 func (e *Engine) prepareNormalApply(entry raftpb.Entry, duplicate bool) normalApplyInput {
 	var nativeConfig *raftengine.NativeConfiguration
+	var configEpoch uint64
 	if !duplicate {
 		nativeConfig = e.captureApplyNativeConfiguration()
+		if e.storagePipeline != nil {
+			configEpoch = e.storagePipeline.configurationEpoch.Load()
+		}
 	}
 	return normalApplyInput{
 		index: entry.GetIndex(), entry: entry, data: entry.GetData(), duplicate: duplicate,
 		cutover: e.raftCutoverIndex, cipher: e.raftCipher, fsm: e.fsm,
 		nativeConfig: nativeConfig,
+		configEpoch:  configEpoch,
 		beforeApply:  e.invalidateBeforeBootstrapPolicy,
 	}
 }

@@ -79,6 +79,9 @@ type engineStoragePipeline struct {
 	disk    *storageWorker
 	apply   *storageWorker
 	ledger  *asyncUnstableLedger
+	// The owner advances this after publishing a native configuration image.
+	// Queued apply inputs compare it without reading RawNode from the actor.
+	configurationEpoch atomic.Uint64
 
 	diskBulk, diskControl, applyBudget *storageWorkBudget
 	diskQueueBudget, applyQueueBudget  *storageWorkBudget
@@ -545,6 +548,7 @@ func (e *Engine) queuePipelineApply(message *raftpb.Message) error {
 }
 
 func (p *engineStoragePipeline) executePipelineApply(task *pipelineTask) error {
+	var refreshed pipelineNormalConfiguration
 	for i, input := range task.inputs {
 		if err := p.firstFailure(nil); err != nil {
 			return err
@@ -561,6 +565,9 @@ func (p *engineStoragePipeline) executePipelineApply(task *pipelineTask) error {
 			continue
 		}
 		input.duplicate = input.index <= p.applyCursor
+		if err := p.refreshPipelineNormalConfiguration(task, &input, &refreshed); err != nil {
+			return err
+		}
 		receipt := executeNormalApply(input)
 		if receipt.err != nil {
 			return receipt.err
@@ -570,6 +577,29 @@ func (p *engineStoragePipeline) executePipelineApply(task *pipelineTask) error {
 			p.applyCursor = input.index
 		}
 	}
+	return nil
+}
+
+type pipelineNormalConfiguration struct {
+	epoch uint64
+	image *raftengine.NativeConfiguration
+}
+
+func (p *engineStoragePipeline) refreshPipelineNormalConfiguration(task *pipelineTask, input *normalApplyInput, refreshed *pipelineNormalConfiguration) error {
+	epoch := p.configurationEpoch.Load()
+	if input.duplicate || input.configEpoch == epoch {
+		return nil
+	}
+	if refreshed.epoch != epoch {
+		prefix := task.receipts
+		task.receipts = nil
+		image, err := p.normalApplyConfigurationAtPrefix(task, prefix)
+		if err != nil {
+			return err
+		}
+		refreshed.epoch, refreshed.image = epoch, image
+	}
+	input.nativeConfig = refreshed.image
 	return nil
 }
 

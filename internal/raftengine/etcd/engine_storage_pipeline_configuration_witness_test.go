@@ -4,10 +4,31 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/stretchr/testify/require"
+	etcdraft "go.etcd.io/raft/v3"
 	raftpb "go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
 )
+
+type pipelineNativeProofWitnessFSM struct {
+	*pipelineConfigurationFSM
+	current  raftengine.NativeConfiguration
+	observed map[string]raftengine.NativeConfiguration
+}
+
+func (f *pipelineNativeProofWitnessFSM) SetApplyNativeConfiguration(image raftengine.NativeConfiguration) {
+	f.current = image
+}
+
+func (f *pipelineNativeProofWitnessFSM) ClearApplyNativeConfiguration() {
+	f.current = raftengine.NativeConfiguration{}
+}
+
+func (f *pipelineNativeProofWitnessFSM) Apply(payload []byte) any {
+	f.observed[string(payload)] = f.current
+	return f.pipelineConfigurationFSM.Apply(payload)
+}
 
 // The test is the sole native RawNode owner, so it can inspect the authentic
 // multi-entry response's applied cursor without a production interception hook.
@@ -24,8 +45,13 @@ func TestEnginePipelineConfigurationNativeWholeTaskResponse(t *testing.T) {
 func testOwnedConfigurationResponse(t *testing.T, v2 bool) {
 	t.Helper()
 	gate := &pipelineConfigurationGate{stage: "save", entered: make(chan uint64, 1), release: make(chan struct{})}
-	fsm := &pipelineConfigurationFSM{asyncStorageFSM: &asyncStorageFSM{}, gate: gate}
+	fsm := &pipelineNativeProofWitnessFSM{
+		pipelineConfigurationFSM: &pipelineConfigurationFSM{asyncStorageFSM: &asyncStorageFSM{}, gate: gate},
+		observed:                 make(map[string]raftengine.NativeConfiguration),
+	}
 	e := newOwnedPipelineApplyWitness(t, fsm)
+	e.recoveredIdentity = &WALIdentity{}
+	e.nativeConfigurationIndex = 1
 	e.dataDir = t.TempDir()
 	e.peers = map[uint64]Peer{
 		1: {NodeID: 1, ID: "n1", Address: "127.0.0.1:7011"},
@@ -67,6 +93,14 @@ func testOwnedConfigurationResponse(t *testing.T, v2 bool) {
 	response := task.message.Responses[0]
 	require.Equal(t, raftpb.MsgStorageApplyResp, response.GetType())
 	require.Len(t, response.Entries, 3)
+	// This later task captures the old image while the configuration entry is
+	// still queued. Its apply must refresh after the first task's barrier.
+	later := &raftpb.Message{To: proto.Uint64(etcdraft.LocalApplyThread), Entries: []*raftpb.Entry{{
+		Index: proto.Uint64(5), Term: proto.Uint64(2), Data: encodeProposalEnvelope(3, []byte("later")),
+	}}}
+	require.NoError(t, e.queuePipelineApply(later))
+	require.Len(t, p.applyDeferred, 2)
+	require.Equal(t, uint64(1), p.applyDeferred[1].inputs[0].nativeConfig.Index)
 	require.NoError(t, p.flush())
 	pumpOwnedConfigurationRequest(t, e, pipelineConfigurationFront)
 	require.Equal(t, uint64(2), e.AppliedIndex(), "front callback publishes only the real earlier normal receipt")
@@ -93,10 +127,17 @@ func testOwnedConfigurationResponse(t *testing.T, v2 bool) {
 	require.Equal(t, uint64(3), e.AppliedIndex())
 	require.Equal(t, uint64(3), e.currentConfigIndex())
 	require.Equal(t, uint64(1), e.rawNode.BasicStatus().Applied, "publication alone is not a whole-task completion")
+	pumpOwnedConfigurationRequest(t, e, pipelineConfigurationNormalPrefix)
 	require.NoError(t, e.completePipelineApply(awaitOwnedPipelineCompletion(t, p.apply)))
 	require.Equal(t, uint64(4), e.rawNode.BasicStatus().Applied)
 	require.Equal(t, uint64(4), e.AppliedIndex())
 	require.Equal(t, [][]byte{[]byte("good"), []byte("tail")}, fsm.Applied())
+	require.Equal(t, uint64(3), fsm.observed["tail"].Index)
+	require.Equal(t, []uint64{3}, fsm.observed["tail"].Learners)
+	pumpOwnedConfigurationRequest(t, e, pipelineConfigurationNormalPrefix)
+	require.NoError(t, e.completePipelineApply(awaitOwnedPipelineCompletion(t, p.apply)))
+	require.Equal(t, uint64(3), fsm.observed["later"].Index)
+	require.Equal(t, []uint64{3}, fsm.observed["later"].Learners)
 	requireStorageWorkUsage(t, p.configurationBudget, 0, 0)
 }
 

@@ -11,6 +11,7 @@ type pipelineConfigurationPhase uint8
 
 const (
 	pipelineConfigurationFront pipelineConfigurationPhase = iota
+	pipelineConfigurationNormalPrefix
 	pipelineConfigurationPeers
 	pipelineConfigurationSave
 	pipelineConfigurationRelease
@@ -46,8 +47,9 @@ type pipelineConfigurationRequest struct {
 }
 
 type pipelineConfigurationReply struct {
-	plan *pipelineConfigurationPlan
-	err  error
+	plan         *pipelineConfigurationPlan
+	nativeConfig *raftengine.NativeConfiguration
+	err          error
 }
 
 type pipelineConfigurationRetention struct {
@@ -140,6 +142,16 @@ func (p *engineStoragePipeline) configurationRequest(request pipelineConfigurati
 	return reply.plan, reply.err
 }
 
+func (p *engineStoragePipeline) normalApplyConfigurationAtPrefix(task *pipelineTask, prefix []normalApplyReceipt) (*raftengine.NativeConfiguration, error) {
+	request := pipelineConfigurationRequest{
+		phase: pipelineConfigurationNormalPrefix, task: task, prefix: prefix,
+		reply: make(chan pipelineConfigurationReply, 1),
+	}
+	p.apply.completions <- storageWorkCompletion{token: &request}
+	reply := <-request.reply
+	return reply.nativeConfig, reply.err
+}
+
 func (p *engineStoragePipeline) executePipelineConfiguration(task *pipelineTask, entry *raftpb.Entry) error {
 	prefix := task.receipts
 	task.receipts = nil
@@ -213,6 +225,9 @@ func capturePipelineConfiguration(env pipelineConfigurationEnvironment, plan *pi
 }
 
 func (e *Engine) handlePipelineConfiguration(request pipelineConfigurationRequest) error {
+	if request.phase == pipelineConfigurationNormalPrefix {
+		return e.handlePipelineNormalPrefix(request)
+	}
 	if request.phase == pipelineConfigurationFront {
 		if err := e.publishPipelineReceipts(request.prefix); err != nil {
 			request.reply <- pipelineConfigurationReply{err: err}
@@ -241,6 +256,19 @@ func (e *Engine) handlePipelineConfiguration(request pipelineConfigurationReques
 		request.reply <- pipelineConfigurationReply{err: err}
 		return err
 	}
+	return nil
+}
+
+func (e *Engine) handlePipelineNormalPrefix(request pipelineConfigurationRequest) error {
+	if err := e.publishPipelineReceipts(request.prefix); err != nil {
+		request.reply <- pipelineConfigurationReply{err: err}
+		return err
+	}
+	if err := e.storagePipeline.firstFailure(nil); err != nil {
+		request.reply <- pipelineConfigurationReply{err: err}
+		return err
+	}
+	request.reply <- pipelineConfigurationReply{nativeConfig: e.captureApplyNativeConfiguration()}
 	return nil
 }
 
@@ -385,7 +413,7 @@ func runPipelineConfigurationDisk(p *engineStoragePipeline, env pipelineConfigur
 			_ = request.plan.snapshotPlan.files.purge(env)
 		}
 		return nil
-	case pipelineConfigurationFront, pipelineConfigurationPublish:
+	case pipelineConfigurationFront, pipelineConfigurationNormalPrefix, pipelineConfigurationPublish:
 		return errors.WithStack(errInvalidStorageWork)
 	}
 	return errors.WithStack(errInvalidStorageWork)
@@ -426,6 +454,7 @@ func (e *Engine) publishPipelineConfiguration(plan *pipelineConfigurationPlan) e
 	e.singleNodeLeaderAckMonoNs.Store(0)
 	e.configurationTransition.Store(false)
 	e.storagePipeline.configuration = nil
+	e.storagePipeline.configurationEpoch.Add(1)
 	if plan.snapshotPlan != nil {
 		e.retirePipelineSnapshot(plan.snapshotPlan)
 	}
