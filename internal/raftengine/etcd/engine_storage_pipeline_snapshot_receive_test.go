@@ -24,6 +24,8 @@ func TestEnginePipelineOldTermSnapshotReceiptStillAppliesSnapshot(t *testing.T) 
 	c.pumpUntil(t, func() bool { return e.Status().Term == 99 }, "higher native term before snapshot receipt")
 	c.gates[2].unblock()
 	c.pumpUntil(t, func() bool { return e.AppliedIndex() >= index }, "old-term snapshot publication")
+	require.Equal(t, index, e.nativeConfigurationIndex)
+	require.Equal(t, index, e.currentConfigIndex())
 	require.NoError(t, e.handleTransportMessage(t.Context(), raftpb.Message{Type: messageTypePtr(raftpb.MsgApp),
 		From: proto.Uint64(2), To: proto.Uint64(3), Term: proto.Uint64(99), Index: proto.Uint64(index), LogTerm: proto.Uint64(2), Commit: proto.Uint64(index + 1),
 		Entries: []*raftpb.Entry{{Type: entryTypePtr(raftpb.EntryNormal), Index: proto.Uint64(index + 1), Term: proto.Uint64(99),

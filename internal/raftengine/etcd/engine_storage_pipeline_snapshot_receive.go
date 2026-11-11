@@ -179,9 +179,14 @@ func (e *Engine) publishPipelineReceivedSnapshot(plan *pipelineSnapshotPlan) err
 		return err
 	}
 	snapshot := plan.snapshot
+	configurationIndex, err := e.receivedSnapshotConfigurationIndex(snapshot.GetMetadata().GetIndex())
+	if err != nil {
+		return err
+	}
 	if err := e.storage.ApplySnapshot(snapshot); err != nil {
 		return errors.WithStack(err)
 	}
+	e.nativeConfigurationIndex = configurationIndex
 	if p.snapshotView != nil {
 		p.snapshotView.publish(snapshot, true)
 	}
@@ -200,7 +205,8 @@ func (e *Engine) publishPipelineReceivedSnapshot(plan *pipelineSnapshotPlan) err
 	e.clearPendingConfChange(e.applied)
 	state := confStateValue(snapshot.GetMetadata().GetConfState())
 	e.refreshVoterCache(state)
-	e.setConfigurationFromConfState(state, e.applied)
+	e.setConfigurationFromConfState(state, configurationIndex)
+	p.configurationEpoch.Add(1)
 	e.snapshotTransition.Store(false)
 	p.publishedSnapshotFloor = e.applied
 	p.receiving = nil
