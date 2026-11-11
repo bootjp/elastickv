@@ -133,6 +133,7 @@ func TestApplyRouteContextReadinessOCCAndPrefixDelete(t *testing.T) {
 	for _, view := range []string{"lagging", "fenced", "other-owner"} {
 		t.Run(view, func(t *testing.T) {
 			ctx, f := newApplyRouteContextStagedFSM(t, view)
+			ctx = context.WithValue(ctx, applyReadinessContextKey{}, struct{}{})
 			key := []byte("k")
 			stagedKey := distribution.MigrationStagedDataKey(11, key)
 			require.NoError(t, f.store.PutAt(ctx, stagedKey, []byte("staged"), 120, 0))

@@ -842,6 +842,7 @@ func (f *kvFSM) applyRequestErr(ctx context.Context, r *pb.Request) error {
 }
 
 func (f *kvFSM) applyRequestData(ctx context.Context, r *pb.Request) (uint64, error) {
+	ctx = context.WithValue(ctx, applyReadinessContextKey{}, struct{}{})
 	if f.migrationNamespaceVersion.Load() != 0 {
 		if err := verifyRequestMigrationControlKeys(r); err != nil {
 			return 0, err
@@ -1333,6 +1334,9 @@ func (f *kvFSM) targetReadyRoutesForRange(ctx context.Context, start []byte, end
 }
 
 func (f *kvFSM) targetReadyRoutesForRouteRange(ctx context.Context, routeStart []byte, routeEnd []byte) ([]distribution.Route, error) {
+	if _, applying := ctx.Value(applyReadinessContextKey{}).(struct{}); applying {
+		return f.appliedTargetReadyRoutesForRouteRange(ctx, routeStart, routeEnd)
+	}
 	routes, catalogVersion, proof := f.currentShardRoutesForRouteRange(ctx, routeStart, routeEnd)
 
 	reader, ok := f.store.(store.MigrationTargetReadinessReader)
@@ -1357,6 +1361,42 @@ func (f *kvFSM) targetReadyRoutesForRouteRange(ctx context.Context, routeStart [
 	// watcher's current view -- process-local. Mark it so apply can halt on this
 	// one and only this one; see errTargetReadinessUnproven.
 	return nil, errors.WithStack(errors.Mark(ErrRouteCutoverPending, errTargetReadinessUnproven))
+}
+
+type applyReadinessContextKey struct{}
+
+func (f *kvFSM) appliedTargetReadyRoutesForRouteRange(ctx context.Context, routeStart []byte, routeEnd []byte) ([]distribution.Route, error) {
+	reader, ok := f.store.(store.MigrationTargetReadinessReader)
+	if !ok {
+		routes, _, _ := f.currentShardRoutesForRouteRange(ctx, routeStart, routeEnd)
+		return routes, nil
+	}
+	states, err := reader.MigrationTargetReadinessStates(ctx)
+	if err != nil {
+		return nil, errors.WithStack(errors.Mark(err, errTargetReadinessUnproven))
+	}
+	if !targetReadinessGuardIntersects(states, routeStart, routeEnd) {
+		routes, _, _ := f.currentShardRoutesForRouteRange(ctx, routeStart, routeEnd)
+		return routes, nil
+	}
+	if _, ok := ctx.Value(applyRouteHistoryKey{}).(applyRouteHistory); !ok {
+		return nil, errors.WithStack(ErrRouteCutoverPending)
+	}
+	routes, catalogVersion, proof := f.currentShardRoutesForRouteRange(ctx, routeStart, routeEnd)
+	if proof && targetReadinessStatesSatisfied(states, routes, routeStart, routeEnd, f.shardGroupID, catalogVersion, proof) {
+		return routes, nil
+	}
+	return nil, errors.WithStack(ErrRouteCutoverPending)
+}
+
+func targetReadinessGuardIntersects(states []store.TargetStagedReadinessState, routeStart []byte, routeEnd []byte) bool {
+	for _, ready := range states {
+		if ready.Armed && !ready.SourceWriteFence && !ready.SourceReadFence && !ready.TrackWrites &&
+			routeRangeIntersects(routeStart, routeEnd, ready.RouteStart, ready.RouteEnd) {
+			return true
+		}
+	}
+	return false
 }
 
 func (f *kvFSM) currentShardRoutesForRouteRange(ctx context.Context, routeStart []byte, routeEnd []byte) ([]distribution.Route, uint64, bool) {
