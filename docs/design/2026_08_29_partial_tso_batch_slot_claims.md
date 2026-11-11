@@ -184,14 +184,21 @@ Implementation order:
    opt-in raw, one-phase and PREPARE FSM apply paths stage the binding and
    creation in one indexed Raft entry, recompute the manifest digest on every
    replica, and skip an exact replay. A local lookup checks both indexes for
-   unknown-outcome reconciliation, but a leader read barrier and remote
-   reconciliation path are not wired. Production admission rejects the new
+   unknown-outcome reconciliation. This branch adds an opt-in applied-leader
+   read barrier and a remote lookup RPC, but no production reconciliation
+   route is wired. Production admission rejects the new
    operation-ID field until authenticated issuance and activation are wired.
    Before replicated activation, FSM apply ignores that field for single and
    batched entries so mixed-version replicas retain legacy apply semantics;
    ingress still rejects newly bound requests.
 2. Authenticated issuance and primary/home admission path, including unknown
-   outcome reconciliation and cross-group PREPARE/COMMIT/ABORT evidence.
+   outcome reconciliation and cross-group PREPARE/COMMIT/ABORT evidence. This
+   branch adds a TLS-and-bearer-guarded group-0 issuance RPC and an opt-in
+   single-home raw binding preparation helper. Neither RPC is installed in
+   production: TLS plus a bearer token does not establish peer-session
+   identity, and no replicated all-member activation gate or stable public raw
+   operation ID exists yet. The helper therefore cannot authorize production
+   writes or serve as a substitute for primary/secondary evidence.
 3. Physical-band group-0 reservation and versioned reservation response;
    prove no duplicate issuance across concurrent allocators, term changes,
    ambiguous proposals, and ceiling renewal. An opt-in local allocator now

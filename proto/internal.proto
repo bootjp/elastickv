@@ -18,6 +18,8 @@ service Internal {
   rpc CleanupMigration(CleanupMigrationRequest) returns (CleanupMigrationResponse) {}
   rpc ProbeMigrationState(ProbeMigrationStateRequest) returns (ProbeMigrationStateResponse) {}
   rpc IssueMigrationTimestamp(IssueMigrationTimestampRequest) returns (IssueMigrationTimestampResponse) {}
+  rpc IssueBoundTimestamp(IssueBoundTimestampRequest) returns (IssueBoundTimestampResponse) {}
+  rpc LookupTimestampBinding(LookupTimestampBindingRequest) returns (LookupTimestampBindingResponse) {}
 }
 
 // internal.proto is node to node communication message in raft replication.
@@ -426,4 +428,25 @@ message IssueMigrationTimestampRequest {}
 message IssueMigrationTimestampResponse {
   uint64 timestamp = 1;
   uint64 last_commit_ts = 2;
+}
+
+message IssueBoundTimestampRequest {
+  uint64 min_timestamp = 1;
+}
+
+message IssueBoundTimestampResponse {
+  uint64 timestamp = 1;
+}
+
+message LookupTimestampBindingRequest {
+  bytes operation_id = 1;
+}
+
+message LookupTimestampBindingResponse {
+  bool found = 1;
+  uint64 timestamp = 2;
+  bytes manifest_digest = 3;
+  bool is_txn = 4;
+  Phase phase = 5;
+  uint64 applied_index = 6;
 }
