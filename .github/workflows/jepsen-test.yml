@@ -35,10 +35,19 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
-      - name: Install netcat, graphviz and fuse3
+      - name: Install missing system tools
         # fuse3 provides fusermount3 for the --filesystemMount nodes used by
         # the filesystem Jepsen workload.
-        run: sudo apt-get update && sudo apt-get install -y netcat-openbsd graphviz fuse3 sqlite3 strace
+        run: |
+          packages=()
+          command -v nc >/dev/null || packages+=(netcat-openbsd)
+          command -v fusermount3 >/dev/null || packages+=(fuse3)
+          command -v sqlite3 >/dev/null || packages+=(sqlite3)
+          command -v strace >/dev/null || packages+=(strace)
+          if ((${#packages[@]})); then
+            sudo apt-get update
+            sudo apt-get install -y "${packages[@]}"
+          fi
       # See jepsen-test-scheduled.yml for the rationale: Maven Central
       # 429s during peak hours have been knocking the scheduled stress
       # run out, and the per-push run uses the same dependency set.
