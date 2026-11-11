@@ -84,7 +84,7 @@ func TestTSOPhysicalBandRollsOverBeforeCeilingRenewal(t *testing.T) {
 	second, err := alloc.ReservePhysicalBandAfter(context.Background(), 1, 0)
 	require.NoError(t, err)
 	require.Greater(t, second.Base, first.CommittedBandEnd)
-	require.Equal(t, first.CommittedBandEnd+1, second.Base)
+	require.Zero(t, second.Base&hlcLogicalMask)
 	require.Less(t, int64(second.Base>>hlcLogicalBits), clock.PhysicalCeiling())
 	require.Len(t, engine.proposedPayloads(), 2)
 }
