@@ -1,16 +1,44 @@
 package kv
 
 import (
+	"context"
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 )
 
 type forbiddenApplyWatcher struct{}
+
+type countingReadinessWatcher struct {
+	RouteHistory
+	currentCalls int
+}
+
+func (w *countingReadinessWatcher) Current() (RouteSnapshot, bool) {
+	w.currentCalls++
+	return w.RouteHistory.Current()
+}
+
+type readinessWithoutAdmissionView struct {
+	store.MVCCStore
+}
+
+func (s readinessWithoutAdmissionView) MigrationServingAdmissionState(context.Context) (store.MigrationServingState, error) {
+	return store.MigrationServingState{}, nil
+}
+
+func (s readinessWithoutAdmissionView) MigrationTargetReadinessStates(ctx context.Context) ([]store.TargetStagedReadinessState, error) {
+	reader, ok := s.MVCCStore.(store.MigrationTargetReadinessReader)
+	if !ok {
+		return nil, errors.New("test store does not implement MigrationTargetReadinessReader")
+	}
+	return reader.MigrationTargetReadinessStates(ctx)
+}
 
 func (forbiddenApplyWatcher) Current() (RouteSnapshot, bool) {
 	panic("migration apply consulted the catalog watcher")
@@ -85,6 +113,63 @@ func TestDeterministicMigrationApplyRequiresCompleteProof(t *testing.T) {
 			require.False(t, exists)
 		})
 	}
+}
+
+func TestApplyReadinessDoesNotFallbackToWatcherWithoutProof(t *testing.T) {
+	t.Parallel()
+	for _, batched := range []bool{false, true} {
+		t.Run(map[bool]string{false: "single", true: "batch"}[batched], func(t *testing.T) {
+			st := store.NewMVCCStore()
+			deterministicMigrationGuard(t, st, false)
+			e := distribution.NewEngine()
+			applyComposed1Snapshot(t, e, 10, []distribution.RouteDescriptor{{
+				RouteID: 3, Start: []byte("m"), End: []byte("z"), GroupID: 1, State: distribution.RouteStateActive,
+			}})
+			wantCalls := 2
+			if batched {
+				wantCalls = 4
+			}
+			watcher := &countingReadinessWatcher{RouteHistory: WrapDistributionEngine(e)}
+			f := &kvFSM{store: readinessWithoutAdmissionView{MVCCStore: st}, routes: watcher, shardGroupID: 1}
+			first := deterministicRawRequest(10, "n")
+			if batched {
+				second := deterministicRawRequest(10, "o")
+				second.Ts = 201
+				data, err := proto.Marshal(&pb.RaftCommand{Requests: []*pb.Request{first, second}})
+				require.NoError(t, err)
+				resp := f.Apply(data)
+				results, ok := resp.(*fsmApplyResponse)
+				require.True(t, ok)
+				require.NoError(t, haltApplyOf(resp))
+				for _, result := range results.results {
+					require.ErrorIs(t, result, ErrRouteCutoverPending)
+				}
+			} else {
+				require.ErrorIs(t, f.applyRequestErr(t.Context(), first), ErrRouteCutoverPending)
+			}
+			for _, key := range []string{"n", "o"} {
+				exists, err := st.ExistsAt(t.Context(), []byte(key), 201)
+				require.NoError(t, err)
+				require.False(t, exists)
+			}
+			require.Equal(t, wantCalls, watcher.currentCalls, "readiness must not add a watcher read")
+		})
+	}
+}
+
+func TestApplyReadinessRejectsIncompleteScopedProofWithoutHalting(t *testing.T) {
+	t.Parallel()
+	st := store.NewMVCCStore()
+	deterministicMigrationGuard(t, st, false)
+	f := &kvFSM{store: st, routes: forbiddenApplyWatcher{}, shardGroupID: 1}
+	history := applyRouteContextHistory(t, 9, distribution.RouteDescriptor{
+		RouteID: 3, Start: []byte("m"), End: []byte("z"), GroupID: 1, State: distribution.RouteStateActive,
+	})
+	ctx := context.WithValue(withApplyRouteHistory(t.Context(), history), applyReadinessContextKey{}, struct{}{})
+	_, err := f.targetReadyRoutesForRange(ctx, []byte("n"), nextScanCursor([]byte("n")))
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+	require.False(t, errors.Is(err, errTargetReadinessUnproven))
+	require.NoError(t, haltApplyOf(applyErrorResponse(err)))
 }
 
 func TestDeterministicMigrationUnaffectedLegacyRequest(t *testing.T) {
