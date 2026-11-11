@@ -70,10 +70,18 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
-      - name: Install netcat, graphviz and fuse3
+      - name: Install missing system tools
         # fuse3 provides fusermount3 for the --filesystemMount nodes used by
         # the filesystem Jepsen workload.
-        run: sudo apt-get update && sudo apt-get install -y netcat-openbsd graphviz fuse3 sqlite3
+        run: |
+          packages=()
+          command -v nc >/dev/null || packages+=(netcat-openbsd)
+          command -v fusermount3 >/dev/null || packages+=(fuse3)
+          command -v sqlite3 >/dev/null || packages+=(sqlite3)
+          if ((${#packages[@]})); then
+            sudo apt-get update
+            sudo apt-get install -y "${packages[@]}"
+          fi
       # Cache Maven artifacts across runs. Maven Central (repo1.maven.org)
       # serves intermittent 429s during dependency download, which
       # uncached scheduled runs trip frequently — the lein project pulls
