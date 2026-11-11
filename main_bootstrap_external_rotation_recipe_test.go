@@ -20,6 +20,7 @@ func externalRotationTestRequest(f *rotationRecipeFixture) *pb.RotateDEKRequest 
 }
 
 func TestBootstrapExternalRotationRecipeRejectsInvalidRequests(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name   string
 		mutate func(*pb.RotateDEKRequest) *pb.RotateDEKRequest
@@ -52,6 +53,7 @@ func TestBootstrapExternalRotationRecipeRejectsInvalidRequests(t *testing.T) {
 }
 
 func TestBootstrapExternalRotationRecipeExactImmutableRequest(t *testing.T) {
+	t.Parallel()
 	f := newRotationRecipeFixture(t)
 	req := externalRotationTestRequest(f)
 	expected := cloneBootstrapRotationRequest(req)
@@ -78,6 +80,7 @@ func TestBootstrapExternalRotationRecipeExactImmutableRequest(t *testing.T) {
 }
 
 func TestBootstrapExternalRotationRecipeCollisionAndSuperseded(t *testing.T) {
+	t.Parallel()
 	f := newRotationRecipeFixture(t)
 	req := externalRotationTestRequest(f)
 	f.apply(req)
@@ -107,6 +110,7 @@ func TestBootstrapExternalRotationRecipeCollisionAndSuperseded(t *testing.T) {
 }
 
 func TestBootstrapExternalRotationRecipeLostResultFollowerReconcile(t *testing.T) {
+	t.Parallel()
 	f := newRotationRecipeFixture(t)
 	req := externalRotationTestRequest(f)
 	r, err := newBootstrapExternalRotationRecipe(t.Context(), f.cfg, req)
@@ -129,6 +133,7 @@ func TestBootstrapExternalRotationRecipeLostResultFollowerReconcile(t *testing.T
 }
 
 func TestBootstrapExternalRotationRecipeCancelledAbsentAndTermChange(t *testing.T) {
+	t.Parallel()
 	f := newRotationRecipeFixture(t)
 	r, err := newBootstrapExternalRotationRecipe(t.Context(), f.cfg, externalRotationTestRequest(f))
 	require.NoError(t, err)
@@ -147,6 +152,7 @@ func TestBootstrapExternalRotationRecipeCancelledAbsentAndTermChange(t *testing.
 }
 
 func TestBootstrapExternalRotationRecipeFreshBarrierRequired(t *testing.T) {
+	t.Parallel()
 	f := newRotationRecipeFixture(t)
 	f.barrierErr = errors.New("read index unavailable")
 	_, err := newBootstrapExternalRotationRecipe(t.Context(), f.cfg, externalRotationTestRequest(f))
@@ -164,6 +170,7 @@ func (w externalRotationBoundedWrapper) Unwrap(wrapped []byte) ([]byte, error) {
 }
 
 func TestBootstrapExternalRotationRecipePurposeEpochAndWrappedLimit(t *testing.T) {
+	t.Parallel()
 	f := newRotationRecipeFixture(t)
 	f.cfg.Wrapper = externalRotationBoundedWrapper{}
 	req := externalRotationTestRequest(f)
@@ -179,6 +186,7 @@ func TestBootstrapExternalRotationRecipePurposeEpochAndWrappedLimit(t *testing.T
 }
 
 func TestBootstrapExternalRotationRecipeForeignPlanAfterConstruction(t *testing.T) {
+	t.Parallel()
 	f := newRotationRecipeFixture(t)
 	req := externalRotationTestRequest(f)
 	r, err := newBootstrapExternalRotationRecipe(t.Context(), f.cfg, req)

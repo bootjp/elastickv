@@ -14,6 +14,7 @@ import (
 )
 
 func TestServiceCreateAndDeleteClearDurableIntents(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestService(t, 2)
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -25,6 +26,7 @@ func TestServiceCreateAndDeleteClearDurableIntents(t *testing.T) {
 }
 
 func TestServiceRecoverIntentsAbortsPreparedNamespaceMutation(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestService(t, 2)
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -54,6 +56,7 @@ func TestServiceRecoverIntentsAbortsPreparedNamespaceMutation(t *testing.T) {
 }
 
 func TestServiceRecoverIntentsHonorsScanLimit(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestService(t, 2)
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
@@ -86,6 +89,7 @@ func TestServiceRecoverIntentsHonorsScanLimit(t *testing.T) {
 }
 
 func TestServiceRecoverIntentsPagesPastCompletedMoveJobs(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	svc := newTestService(t, 2)
 	records := []MoveJob{
@@ -129,6 +133,7 @@ func TestServiceRecoverIntentsPagesPastCompletedMoveJobs(t *testing.T) {
 }
 
 func TestServiceRecoverIntentsToleratesConcurrentJobClear(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	base := store.NewMVCCStore()

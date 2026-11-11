@@ -41,6 +41,7 @@ func (f *fakeVaultLogical) WriteWithContext(_ context.Context, path string, data
 }
 
 func TestVaultTransitWrapperRequestBinding(t *testing.T) {
+	t.Parallel()
 	dek := bytes.Repeat([]byte{0x62}, fileKEKSize)
 	logical := &fakeVaultLogical{dek: dek}
 	wrapper := newVaultTransitWrapper(logical, "security/transit", "orders")
@@ -68,6 +69,7 @@ func TestVaultTransitWrapperRequestBinding(t *testing.T) {
 }
 
 func TestParseVaultTarget(t *testing.T) {
+	t.Parallel()
 	mount, keyName, err := parseVaultTarget("transit/service/key")
 	require.NoError(t, err)
 	require.Equal(t, "transit/service", mount)
@@ -81,6 +83,7 @@ func TestParseVaultTarget(t *testing.T) {
 }
 
 func TestVaultTransitWrapperRequiresExistingKey(t *testing.T) {
+	t.Parallel()
 	logical := &fakeVaultLogical{key: &api.Secret{Data: map[string]interface{}{}}}
 	wrapper := newVaultTransitWrapper(logical, "transit", "missing")
 
@@ -91,6 +94,7 @@ func TestVaultTransitWrapperRequiresExistingKey(t *testing.T) {
 }
 
 func TestVaultTransitWrapperRejectsMalformedResponses(t *testing.T) {
+	t.Parallel()
 	logical := &fakeVaultLogical{dek: []byte("short")}
 	wrapper := newVaultTransitWrapper(logical, "transit", "key")
 	_, err := wrapper.Unwrap([]byte("vault:v1:ciphertext"))

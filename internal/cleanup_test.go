@@ -7,6 +7,7 @@ import (
 )
 
 func TestCleanupStackRunUsesLIFO(t *testing.T) {
+	t.Parallel()
 	stack := CleanupStack{}
 	var calls []string
 
@@ -18,6 +19,7 @@ func TestCleanupStackRunUsesLIFO(t *testing.T) {
 }
 
 func TestCleanupStackReleaseDropsCallbacks(t *testing.T) {
+	t.Parallel()
 	stack := CleanupStack{}
 	called := false
 

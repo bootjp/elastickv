@@ -19,6 +19,7 @@ func rotationMaterialSidecar() *encryption.Sidecar {
 }
 
 func TestRotationMaterialRejectsAliasedDomains(t *testing.T) {
+	t.Parallel()
 	sc := rotationMaterialSidecar()
 	for _, tc := range []struct {
 		name, purpose, wrapped string
@@ -57,6 +58,7 @@ func (w *rotationMaterialWrapper) Unwrap([]byte) ([]byte, error) {
 }
 
 func TestRotationMaterialDifferentWrapAndZeroing(t *testing.T) {
+	t.Parallel()
 	unwrap := &rotationMaterialWrapper{}
 	sc := &encryption.Sidecar{Keys: map[string]encryption.SidecarKey{"1": {Purpose: encryption.SidecarPurposeStorage, Wrapped: []byte("randomized-envelope-one")}}}
 	material, err := unwrap.Unwrap([]byte("randomized-envelope-two"))
@@ -70,6 +72,7 @@ func TestRotationMaterialDifferentWrapAndZeroing(t *testing.T) {
 }
 
 func TestApplyRotationMaterialRejectsBeforeMutation(t *testing.T) {
+	t.Parallel()
 	reg := newMapRegistryStore()
 	ks := encryption.NewKeystore()
 	path := t.TempDir() + "/keys.json"

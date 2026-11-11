@@ -13,6 +13,7 @@ import (
 )
 
 func TestRedis_LuaScriptCacheCompatibility(t *testing.T) {
+	t.Parallel()
 	nodes, _, _ := createNode(t, 3)
 	defer shutdown(nodes)
 
@@ -38,6 +39,7 @@ return redis.call("GET", KEYS[1])
 }
 
 func TestRedis_LuaBullMQLikeHelpers(t *testing.T) {
+	t.Parallel()
 	nodes, _, _ := createNode(t, 3)
 	defer shutdown(nodes)
 
@@ -100,6 +102,7 @@ return {eventId, redis.call("HGET", KEYS[1], "name"), cjson.encode(event), redis
 }
 
 func TestRedis_LuaXAddMaxLenExistingStream(t *testing.T) {
+	t.Parallel()
 	nodes, _, _ := createNode(t, 3)
 	defer shutdown(nodes)
 
@@ -135,6 +138,7 @@ return redis.call("XADD", KEYS[1], "MAXLEN", "~", 10, "*", "event", "waiting", "
 }
 
 func TestRedis_LuaXAddMaxLenZero(t *testing.T) {
+	t.Parallel()
 	nodes, _, _ := createNode(t, 3)
 	defer shutdown(nodes)
 
@@ -168,6 +172,7 @@ return redis.call("XADD", KEYS[1], "MAXLEN", "0", "*", "event", "trimmed")
 }
 
 func TestRedis_LuaXAddMaxLenZeroThenAppendInScript(t *testing.T) {
+	t.Parallel()
 	nodes, _, _ := createNode(t, 3)
 	defer shutdown(nodes)
 
@@ -198,6 +203,7 @@ return {trimmed, kept}
 }
 
 func TestRedis_LuaXAddMultipleMaxLenTrimsInScript(t *testing.T) {
+	t.Parallel()
 	nodes, _, _ := createNode(t, 3)
 	defer shutdown(nodes)
 
@@ -228,6 +234,7 @@ return {first, second}
 }
 
 func TestRedis_LuaXAddAndExpirePreservesUpdatedStreamMeta(t *testing.T) {
+	t.Parallel()
 	nodes, _, _ := createNode(t, 3)
 	defer shutdown(nodes)
 
@@ -280,6 +287,7 @@ return {id, applied}
 }
 
 func TestRedis_LuaXAddRecreatesTTLExpiredStream(t *testing.T) {
+	t.Parallel()
 	nodes, _, _ := createNode(t, 3)
 	defer shutdown(nodes)
 
@@ -324,6 +332,7 @@ return redis.call("XADD", KEYS[1], "MAXLEN", "~", 10, "*", "event", "new")
 }
 
 func TestRedis_LuaXAddRecreatesTTLExpiredHash(t *testing.T) {
+	t.Parallel()
 	nodes, _, _ := createNode(t, 3)
 	defer shutdown(nodes)
 
@@ -363,6 +372,7 @@ return redis.call("XADD", KEYS[1], "MAXLEN", "~", 10, "*", "event", "new")
 }
 
 func TestRedis_LuaXAddRecreatesTTLExpiredString(t *testing.T) {
+	t.Parallel()
 	nodes, _, _ := createNode(t, 3)
 	defer shutdown(nodes)
 
@@ -404,6 +414,7 @@ return redis.call("XADD", KEYS[1], "MAXLEN", "~", 10, "*", "event", "new")
 }
 
 func TestRedis_LuaXAddHonorsScriptLocalStringType(t *testing.T) {
+	t.Parallel()
 	nodes, _, _ := createNode(t, 3)
 	defer shutdown(nodes)
 
@@ -421,6 +432,7 @@ return redis.call("XADD", KEYS[1], "*", "event", "bad")
 }
 
 func TestRedis_LuaReplyHelpers(t *testing.T) {
+	t.Parallel()
 	nodes, _, _ := createNode(t, 3)
 	defer shutdown(nodes)
 
@@ -437,6 +449,7 @@ func TestRedis_LuaReplyHelpers(t *testing.T) {
 }
 
 func TestRedis_LuaRPopLPushBullMQLikeLists(t *testing.T) {
+	t.Parallel()
 	nodes, _, _ := createNode(t, 3)
 	defer shutdown(nodes)
 
@@ -474,6 +487,7 @@ return {moved, redis.call("LLEN", KEYS[1]), redis.call("LLEN", KEYS[2])}
 }
 
 func TestRedis_LuaRPopLPushPreservesTTL(t *testing.T) {
+	t.Parallel()
 	nodes, _, _ := createNode(t, 3)
 	defer shutdown(nodes)
 
@@ -504,6 +518,7 @@ return {moved, redis.call("LLEN", KEYS[1])}
 }
 
 func TestRedis_LuaDelAndRecreateListNoOrphan(t *testing.T) {
+	t.Parallel()
 	nodes, _, _ := createNode(t, 3)
 	defer shutdown(nodes)
 

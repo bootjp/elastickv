@@ -17,6 +17,7 @@ import (
 // POST /admin/api/v1/auth/logout without a valid session, which was the
 // logout-CSRF vector Codex flagged.
 func TestLogout_RejectsUnauthenticated(t *testing.T) {
+	t.Parallel()
 	srv := newServerForTest(t)
 	req := httptest.NewRequest(http.MethodPost, "/admin/api/v1/auth/logout", nil)
 	rec := httptest.NewRecorder()
@@ -31,6 +32,7 @@ func TestLogout_RejectsUnauthenticated(t *testing.T) {
 // SameSite=Strict already blocks the cross-site leg, but the server-side
 // CSRF check is an explicit belt-and-braces guard.
 func TestLogout_RequiresCSRF(t *testing.T) {
+	t.Parallel()
 	srv := newServerForTest(t)
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
@@ -55,6 +57,7 @@ func TestLogout_RequiresCSRF(t *testing.T) {
 // is intentionally skipped on the logout chain to avoid a duplicate
 // (less informative) audit entry per request.
 func TestLogout_AuditEmittedOnce(t *testing.T) {
+	t.Parallel()
 	clk := fixedClock(time.Unix(1_700_000_000, 0).UTC())
 	signer := newSignerForTest(t, 1, clk)
 	verifier := newVerifierForTest(t, []byte{1}, clk)
@@ -107,6 +110,7 @@ func TestLogout_AuditEmittedOnce(t *testing.T) {
 // TestLogout_HappyPath verifies that a well-formed logout (session
 // cookie + matching CSRF header + cookie) succeeds and returns 204.
 func TestLogout_HappyPath(t *testing.T) {
+	t.Parallel()
 	srv := newServerForTest(t)
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()

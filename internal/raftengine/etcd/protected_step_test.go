@@ -97,6 +97,7 @@ func protectedQueueFixture(t *testing.T) (*Engine, *peersession.Owner, pb.EtcdRa
 }
 
 func TestProtectedQueueRevocation(t *testing.T) {
+	t.Parallel()
 	for _, mode := range []string{"unary", "stream", "snapshot"} {
 		for _, revoke := range []bool{false, true} {
 			t.Run(mode+map[bool]string{false: "/live", true: "/revoked"}[revoke], func(t *testing.T) {
@@ -167,6 +168,7 @@ func consumeProtectedTestStep(t *testing.T, e *Engine, kind raftpb.MessageType) 
 }
 
 func TestProtectedQueueAdmissionScope(t *testing.T) {
+	t.Parallel()
 	e, owner, client := protectedQueueFixture(t)
 	raw := peerDecoderWire(t, raftpb.MsgHeartbeat, 2, 1)
 	_, err := client.Send(t.Context(), &pb.EtcdRaftMessage{Message: raw})

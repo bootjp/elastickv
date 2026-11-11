@@ -8,6 +8,7 @@ import (
 )
 
 func TestMVCCStore_PutWithTTL_Expires(t *testing.T) {
+	t.Parallel()
 	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
 		ctx := context.Background()
 		ms := newStore(t)
@@ -26,6 +27,7 @@ func TestMVCCStore_PutWithTTL_Expires(t *testing.T) {
 }
 
 func TestMVCCStore_ExpireExisting(t *testing.T) {
+	t.Parallel()
 	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
 		ctx := context.Background()
 		ms := newStore(t)

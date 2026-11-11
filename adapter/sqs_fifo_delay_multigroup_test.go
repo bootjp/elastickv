@@ -243,6 +243,7 @@ func (f *sqsDelayMultiGroup) seed(t *testing.T, ctx context.Context) (string, *s
 }
 
 func TestSQSFIFODelayMultiGroupUninterruptedPage(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	f := openSQSDelayMultiGroup(t, t.TempDir(), true)
@@ -270,6 +271,7 @@ func TestSQSFIFODelayMultiGroupUninterruptedPage(t *testing.T) {
 }
 
 func TestSQSFIFODelayMultiGroupPrimaryReplyLoss(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	dir := t.TempDir()
@@ -282,7 +284,8 @@ func TestSQSFIFODelayMultiGroupPrimaryReplyLoss(t *testing.T) {
 	status, out := f.call(t, ctx, sqsSetQueueAttributesTarget, map[string]any{
 		"QueueUrl": url, "Attributes": map[string]string{"DelaySeconds": "900"},
 	})
-	require.Equal(t, http.StatusInternalServerError, status, out)
+	require.Equal(t, http.StatusConflict, status, out)
+	require.Equal(t, "OperationOutcomeUnknown", out["__type"])
 	f.trace.mu.Lock()
 	pageCalls, pageError := f.trace.pageCalls, f.trace.pageError
 	f.trace.mu.Unlock()

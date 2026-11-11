@@ -76,5 +76,6 @@ func runCommittedVersionAtSuite(t *testing.T, newStore func(t *testing.T) MVCCSt
 }
 
 func TestCommittedVersionAt(t *testing.T) {
+	t.Parallel()
 	forEachMVCCStore(t, runCommittedVersionAtSuite)
 }

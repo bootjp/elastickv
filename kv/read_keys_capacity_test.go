@@ -132,11 +132,9 @@ func dispatchReadKeysCapacity(ctx context.Context, coord Coordinator, request *O
 }
 
 func TestReadKeysCapacityInputBoundary(t *testing.T) {
-	t.Parallel()
 	require.Equal(t, 20_480, MaxReadKeys)
 	for _, path := range []string{"coordinate", "sharded-explicit", "sharded-leader-stamped"} {
 		t.Run(path, func(t *testing.T) {
-			t.Parallel()
 			h := newReadKeysCapacityHarness(t, false, false)
 			var coord Coordinator = h.coord
 			if path == "coordinate" {

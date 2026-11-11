@@ -8,6 +8,7 @@ import (
 )
 
 func TestMigrationFrontierSelectionMatchesConservativeIntervals(t *testing.T) {
+	t.Parallel()
 	f, _, original := frontierAdmissionSplitFixture(t)
 	reader, ok := f.store.(store.MigrationOwnershipStore)
 	require.True(t, ok)

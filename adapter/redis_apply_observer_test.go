@@ -25,6 +25,7 @@ func requireWaiterQuiet(t *testing.T, ch <-chan struct{}) {
 }
 
 func TestRedisApplyObserverSignalsStreamEntryWaiters(t *testing.T) {
+	t.Parallel()
 	observer := NewRedisApplyObserver()
 	key := []byte("stream-key")
 	waiter, release := observer.streamWaiters.Register([][]byte{key})
@@ -35,6 +36,7 @@ func TestRedisApplyObserverSignalsStreamEntryWaiters(t *testing.T) {
 }
 
 func TestRedisApplyObserverIgnoresNonPutAndMalformedStreamKeys(t *testing.T) {
+	t.Parallel()
 	observer := NewRedisApplyObserver()
 	key := []byte("stream-key")
 	waiter, release := observer.streamWaiters.Register([][]byte{key})
@@ -48,6 +50,7 @@ func TestRedisApplyObserverIgnoresNonPutAndMalformedStreamKeys(t *testing.T) {
 }
 
 func TestRedisApplyObserverSignalsZSetMemberWaiters(t *testing.T) {
+	t.Parallel()
 	observer := NewRedisApplyObserver()
 	key := []byte("zset-key")
 	waiter, release := observer.zsetWaiters.Register([][]byte{key})
@@ -63,6 +66,7 @@ func TestRedisApplyObserverSignalsZSetMemberWaiters(t *testing.T) {
 }
 
 func TestRedisApplyObserverZSetSignalRequiresFullRecheck(t *testing.T) {
+	t.Parallel()
 	observer := NewRedisApplyObserver()
 	key := []byte("zset-full-recheck")
 	waiter, release := observer.zsetWaiters.Register([][]byte{key})
@@ -74,6 +78,7 @@ func TestRedisApplyObserverZSetSignalRequiresFullRecheck(t *testing.T) {
 }
 
 func TestRedisApplyObserverSignalsLegacyZSetWaiters(t *testing.T) {
+	t.Parallel()
 	observer := NewRedisApplyObserver()
 	key := []byte("legacy-zset-key")
 	waiter, release := observer.zsetWaiters.Register([][]byte{key})
@@ -84,6 +89,7 @@ func TestRedisApplyObserverSignalsLegacyZSetWaiters(t *testing.T) {
 }
 
 func TestWithRedisApplyObserverSharesRegistries(t *testing.T) {
+	t.Parallel()
 	observer := NewRedisApplyObserver()
 	server := NewRedisServer(nil, "", nil, nil, nil, nil, WithRedisApplyObserver(observer))
 

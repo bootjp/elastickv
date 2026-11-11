@@ -10,6 +10,7 @@ import (
 )
 
 func TestParseRuntimeOptionsRejectsNegativeSecondaryConcurrency(t *testing.T) {
+	t.Parallel()
 	_, err := parseRuntimeOptions("dual-write", 128, 4, -1, 0, 0, 0, 0, 0)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "secondary-write-concurrency")
@@ -24,6 +25,7 @@ func TestParseRuntimeOptionsRejectsNegativeSecondaryConcurrency(t *testing.T) {
 }
 
 func TestParseRuntimeOptionsRejectsNegativeSecondaryQueueSize(t *testing.T) {
+	t.Parallel()
 	_, err := parseRuntimeOptions("dual-write", 128, 4, 0, 0, 0, -1, 0, 0)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "secondary-write-queue-size")
@@ -38,6 +40,7 @@ func TestParseRuntimeOptionsRejectsNegativeSecondaryQueueSize(t *testing.T) {
 }
 
 func TestValidateRuntimeTimeoutsRejectsUnsupportedScriptTimeout(t *testing.T) {
+	t.Parallel()
 	require.NoError(t, validateRuntimeTimeouts(proxy.ProxyConfig{
 		SecondaryTimeout:       30 * time.Second,
 		SecondaryScriptTimeout: 0,
@@ -70,6 +73,7 @@ func TestValidateRuntimeTimeoutsRejectsUnsupportedScriptTimeout(t *testing.T) {
 }
 
 func TestValidateSecondaryConcurrency(t *testing.T) {
+	t.Parallel()
 	require.NoError(t, validateSecondaryConcurrency(proxy.ModeDualWrite, 128, 8, 4, 2, 4))
 	require.NoError(t, validateSecondaryConcurrency(proxy.ModeDualWrite, 128, 1, 1, 1, 0))
 	require.NoError(t, validateSecondaryConcurrency(proxy.ModeRedisOnly, 1, 1, 100, 100, 100))
@@ -89,6 +93,7 @@ func TestValidateSecondaryConcurrency(t *testing.T) {
 }
 
 func TestDeriveSecondaryConcurrency(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name                    string
 		mode                    proxy.ProxyMode
@@ -189,6 +194,7 @@ func TestDeriveSecondaryConcurrency(t *testing.T) {
 }
 
 func TestDeriveSecondaryConcurrencyFromDefaultElasticKVPool(t *testing.T) {
+	t.Parallel()
 	poolSize := proxy.DefaultElasticKVBackendOptions().PoolSize
 	writeConcurrency, scriptConcurrency, blockingConcurrency := deriveSecondaryConcurrency(
 		proxy.ModeDualWrite,

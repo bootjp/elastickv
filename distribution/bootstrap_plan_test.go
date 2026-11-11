@@ -60,6 +60,7 @@ func bootstrapPlanStore(t *testing.T, pebble bool) store.MVCCStore {
 }
 
 func TestCatalogBootstrapPlanReadOnlyExactSnapshot(t *testing.T) {
+	t.Parallel()
 	for _, name := range []string{"memory", "pebble"} {
 		t.Run(name, func(t *testing.T) {
 			ctx := context.Background()
@@ -103,6 +104,7 @@ func TestCatalogBootstrapPlanReadOnlyExactSnapshot(t *testing.T) {
 }
 
 func TestCatalogBootstrapPlanOneAtomicWinner(t *testing.T) {
+	t.Parallel()
 	for _, name := range []string{"memory", "pebble"} {
 		t.Run(name, func(t *testing.T) {
 			ctx := context.Background()
@@ -138,6 +140,7 @@ func TestCatalogBootstrapPlanOneAtomicWinner(t *testing.T) {
 }
 
 func TestCatalogBootstrapPlanRejectsPartialCatalog(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name  string
 		key   []byte
@@ -169,6 +172,7 @@ func TestCatalogBootstrapPlanRejectsPartialCatalog(t *testing.T) {
 }
 
 func TestCatalogBootstrapPlanRejectsInvalidSeeds(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name  string
 		seeds []Route
@@ -195,6 +199,7 @@ func TestCatalogBootstrapPlanRejectsInvalidSeeds(t *testing.T) {
 }
 
 func TestCatalogBootstrapPlanReadFailuresAndBounds(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := store.NewMVCCStore()
 	catalog := NewCatalogStore(st)
@@ -222,6 +227,7 @@ func TestCatalogBootstrapPlanReadFailuresAndBounds(t *testing.T) {
 }
 
 func TestCatalogBootstrapPlanMaximumPositiveSnapshot(t *testing.T) {
+	t.Parallel()
 	for _, name := range []string{"memory", "pebble"} {
 		t.Run(name, func(t *testing.T) {
 			st := bootstrapPlanStore(t, name == "pebble")
@@ -239,6 +245,7 @@ func TestCatalogBootstrapPlanMaximumPositiveSnapshot(t *testing.T) {
 }
 
 func TestCatalogBootstrapPlanEveryDependencyConflictsAtomically(t *testing.T) {
+	t.Parallel()
 	for _, name := range []string{"memory", "pebble"} {
 		for i := range 6 {
 			t.Run(fmt.Sprintf("%s/%d", name, i), func(t *testing.T) {
@@ -264,6 +271,7 @@ func TestCatalogBootstrapPlanEveryDependencyConflictsAtomically(t *testing.T) {
 }
 
 func TestCatalogBootstrapPlanConcurrentWinner(t *testing.T) {
+	t.Parallel()
 	for _, name := range []string{"memory", "pebble"} {
 		t.Run(name, func(t *testing.T) {
 			st := bootstrapPlanStore(t, name == "pebble")

@@ -60,6 +60,7 @@ func bootstrapExternalLifecycleEnqueue(t *testing.T, ctx context.Context, f *rot
 }
 
 func TestBootstrapExternalRotationLifecycleShutdownActiveJoins(t *testing.T) {
+	t.Parallel()
 	f := newBootstrapExternalLifecycleFixture(t)
 	prior := len(f.io.calls)
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
@@ -111,6 +112,7 @@ func TestBootstrapExternalRotationLifecycleShutdownActiveJoins(t *testing.T) {
 }
 
 func TestBootstrapExternalRotationLifecycleShutdownQueuedDoesNotPlan(t *testing.T) {
+	t.Parallel()
 	f := newBootstrapExternalLifecycleFixture(t)
 	prior := len(f.io.calls)
 	previous := f.runtime.recipe
@@ -144,6 +146,7 @@ func TestBootstrapExternalRotationLifecycleShutdownQueuedDoesNotPlan(t *testing.
 }
 
 func TestBootstrapExternalRotationLifecyclePanicJoinsOwner(t *testing.T) {
+	t.Parallel()
 	f := newBootstrapExternalLifecycleFixture(t)
 	prior := len(f.io.calls)
 	var old context.Context
@@ -173,6 +176,7 @@ func TestBootstrapExternalRotationLifecyclePanicJoinsOwner(t *testing.T) {
 }
 
 func TestBootstrapExternalRotationLifecycleOnlyVerifiedCorruptionLatchesFatal(t *testing.T) {
+	t.Parallel()
 	for _, corrupt := range []bool{false, true} {
 		t.Run(map[bool]string{false: "untrusted invalid request", true: "verified corruption through unknown wrapper"}[corrupt], func(t *testing.T) {
 			f := newBootstrapExternalLifecycleFixture(t)

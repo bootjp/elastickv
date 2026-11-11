@@ -56,6 +56,7 @@ func redisPropagationCommand(t *testing.T, s *RedisServer, args ...string) *redi
 }
 
 func TestRedisOwnedStandardCommandPropagation(t *testing.T) {
+	t.Parallel()
 	s, _ := redisPropagationServer(t)
 	cases := []struct {
 		args []string
@@ -88,6 +89,7 @@ func TestRedisOwnedStandardCommandPropagation(t *testing.T) {
 }
 
 func TestRedisOwnedMissingCarrierFailsClosed(t *testing.T) {
+	t.Parallel()
 	s, _ := redisPropagationServer(t)
 	for _, args := range [][]string{{cmdGet, "key"}, {cmdSet, "key", "value"}, {cmdHGet, "key", "field"}, {cmdEval, "return 1", "0"}} {
 		c := &redisOwnedTestConn{}
@@ -107,6 +109,7 @@ func TestRedisOwnedMissingCarrierFailsClosed(t *testing.T) {
 }
 
 func TestRedisReplyBufferLimitAndOriginalError(t *testing.T) {
+	t.Parallel()
 	b := &redisReplyBuffer{}
 	b.WriteBulkString(strings.Repeat("x", redisMaxReplyBytes))
 	require.ErrorIs(t, b.err, errRedisReplyTooLarge)
@@ -124,10 +127,11 @@ func TestRedisReplyBufferLimitAndOriginalError(t *testing.T) {
 	require.Empty(t, c.raw.String())
 	require.Len(t, c.writes, 1)
 	require.NotContains(t, c.writes[0].s, "NOTLEADER")
-	require.Contains(t, c.writes[0].s, kv.ErrTransactionOutcomeUnknown.Error())
+	require.Equal(t, "ERR operation outcome unknown", c.writes[0].s)
 }
 
 func TestRedisOwnedInternalTransactionUsesCapturedOwner(t *testing.T) {
+	t.Parallel()
 	for _, dedup := range []bool{false, true} {
 		t.Run(map[bool]string{false: "legacy", true: "dedup"}[dedup], func(t *testing.T) {
 			s, owner := redisPropagationServer(t)
@@ -152,6 +156,7 @@ func TestRedisOwnedInternalTransactionUsesCapturedOwner(t *testing.T) {
 }
 
 func TestRedisOwnedCancelledWriteDoesNotClaimSuccess(t *testing.T) {
+	t.Parallel()
 	owner := &redisTestOwnership{ctx: context.Background()}
 	c := &redisOwnedTestConn{}
 	root := &redisOwnedConn{Conn: c, owner: owner, ctx: owner.ctx, writer: &redisReplyBuffer{}, mayWrite: true, workStarted: true}
@@ -165,6 +170,7 @@ func TestRedisOwnedCancelledWriteDoesNotClaimSuccess(t *testing.T) {
 }
 
 func TestRedisOwnedNestedErrorKeepsRESPShape(t *testing.T) {
+	t.Parallel()
 	owner := &redisTestOwnership{ctx: context.Background()}
 	s := redisOwnedTestServer(owner)
 	c := &redisOwnedTestConn{}
@@ -178,6 +184,7 @@ func TestRedisOwnedNestedErrorKeepsRESPShape(t *testing.T) {
 }
 
 func TestRedisOwnedNoDetachedBackgroundContextInCommandPaths(t *testing.T) {
+	t.Parallel()
 	paths, err := filepath.Glob("redis*.go")
 	require.NoError(t, err)
 	fs := token.NewFileSet()
@@ -220,6 +227,7 @@ func assertRedisCommandContextAST(t *testing.T, fs *token.FileSet, fn *ast.FuncD
 }
 
 func TestRedisOwnedUrgentCompactionUsesOriginalContext(t *testing.T) {
+	t.Parallel()
 	s, owner := redisPropagationServer(t)
 	key := []byte("urgent")
 	require.NoError(t, s.store.PutAt(owner.ctx, store.HashMetaKey(key), store.MarshalHashMeta(store.HashMeta{Len: 1}), 1, 0))
@@ -238,6 +246,7 @@ func TestRedisOwnedUrgentCompactionUsesOriginalContext(t *testing.T) {
 }
 
 func TestRedisOwnedRegisteredAndUnsupportedCommands(t *testing.T) {
+	t.Parallel()
 	for _, spec := range redisCommandSpecs {
 		require.True(t, redisOwnedCommandSupported(spec.Constant), "registered command %s needs an ownership audit", spec.Constant)
 	}
@@ -254,6 +263,7 @@ func TestRedisOwnedRegisteredAndUnsupportedCommands(t *testing.T) {
 }
 
 func TestRedisOwnedWireTransactionCannotRemintQueuedGeneration(t *testing.T) {
+	t.Parallel()
 	s, owner := redisPropagationServer(t)
 	mints := 0
 	s.requestAdmission = func(context.Context) (RequestOwnership, error) {
@@ -281,6 +291,7 @@ func TestRedisOwnedWireTransactionCannotRemintQueuedGeneration(t *testing.T) {
 }
 
 func TestRedisOwnedExecStylePerElementErrors(t *testing.T) {
+	t.Parallel()
 	for _, revoke := range []bool{false, true} {
 		t.Run(map[bool]string{false: "live", true: "revoked"}[revoke], func(t *testing.T) {
 			owner := &redisTestOwnership{ctx: context.Background()}
@@ -297,7 +308,7 @@ func TestRedisOwnedExecStylePerElementErrors(t *testing.T) {
 				require.Len(t, c.writes, 1)
 				require.Contains(t, c.writes[0].s, kv.ErrTransactionOutcomeUnknown.Error())
 			} else {
-				require.Equal(t, "*3\r\n$1\r\na\r\n-"+kv.ErrTransactionOutcomeUnknown.Error()+"\r\n:7\r\n", c.raw.String())
+				require.Equal(t, "*3\r\n$1\r\na\r\n-ERR operation outcome unknown\r\n:7\r\n", c.raw.String())
 				require.Empty(t, c.writes)
 			}
 		})
@@ -305,6 +316,7 @@ func TestRedisOwnedExecStylePerElementErrors(t *testing.T) {
 }
 
 func TestRedisOwnedPreservesTypedErrorAndProtocolPrefix(t *testing.T) {
+	t.Parallel()
 	owner := &redisTestOwnership{ctx: context.Background()}
 	s := redisOwnedTestServer(owner)
 	c := &redisOwnedTestConn{}

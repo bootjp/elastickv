@@ -31,6 +31,7 @@ func (o *stubProposalObserver) FailureCount() int {
 }
 
 func TestFSMApplyBatchKeepsPerRequestResults(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := store.NewMVCCStore()
 	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
@@ -154,6 +155,7 @@ func TestTransactionManagerBatchesConcurrentRawCommits(t *testing.T) {
 }
 
 func TestApplyRequestsCountsProposalFailureOnRaftApplyError(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	r, stop := newSingleRaft(t, "proposal-fail", NewKvFSMWithHLC(st, NewHLC()))
 	stop()
@@ -173,6 +175,7 @@ func TestApplyRequestsCountsProposalFailureOnRaftApplyError(t *testing.T) {
 }
 
 func TestApplyRequestsDoesNotCountBusinessErrorAsProposalFailure(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	r, stop := newSingleRaft(t, "proposal-business-error", NewKvFSMWithHLC(st, NewHLC()))
 	defer stop()
@@ -194,6 +197,7 @@ func TestApplyRequestsDoesNotCountBusinessErrorAsProposalFailure(t *testing.T) {
 }
 
 func TestApplyRequestsWithEtcdEngineKeepsKVCommandSemantics(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	engine, err := etcdraftengine.Open(context.Background(), etcdraftengine.OpenConfig{
 		NodeID:       1,
@@ -240,17 +244,4 @@ func TestApplyRequestsWithEtcdEngineKeepsKVCommandSemantics(t *testing.T) {
 	require.Len(t, results, 1)
 	require.ErrorIs(t, results[0], ErrInvalidRequest)
 	require.Zero(t, observer.FailureCount())
-}
-
-func TestNeedsTxnCleanupSkipsAbortRequests(t *testing.T) {
-	t.Parallel()
-
-	reqs := []*pb.Request{
-		{IsTxn: true, Phase: pb.Phase_ABORT},
-	}
-	require.False(t, needsTxnCleanup(reqs))
-	require.True(t, needsTxnCleanup([]*pb.Request{{IsTxn: true, Phase: pb.Phase_PREPARE}}))
-	require.True(t, needsTxnCleanup([]*pb.Request{{IsTxn: true, Phase: pb.Phase_COMMIT}}))
-	require.False(t, needsTxnCleanup([]*pb.Request{{IsTxn: true, Phase: pb.Phase_NONE}}))
-	require.True(t, needsTxnCleanup([]*pb.Request{{IsTxn: true, Phase: pb.Phase(99)}}))
 }

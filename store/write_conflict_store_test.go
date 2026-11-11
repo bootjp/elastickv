@@ -11,6 +11,7 @@ import (
 // TestMVCCStoreApplyMutations_RecordsConflicts preserves the lost-update
 // write conflict and newer-read-version cases for each metric key class.
 func TestMVCCStoreApplyMutations_RecordsConflicts(t *testing.T) {
+	t.Parallel()
 	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
 		cases := []struct {
 			name  string
@@ -56,6 +57,7 @@ func TestMVCCStoreApplyMutations_RecordsConflicts(t *testing.T) {
 // TestMVCCStoreWriteConflictCountsByPrefix_EmptyByDefault guards the
 // non-nil empty map required by the monitoring collector.
 func TestMVCCStoreWriteConflictCountsByPrefix_EmptyByDefault(t *testing.T) {
+	t.Parallel()
 	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
 		snap := newStore(t).WriteConflictCountsByPrefix()
 		require.NotNil(t, snap)

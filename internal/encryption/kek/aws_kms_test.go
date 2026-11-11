@@ -29,6 +29,7 @@ func (f *fakeAWSKMSClient) Decrypt(_ context.Context, input *awskms.DecryptInput
 }
 
 func TestAWSKMSWrapperRequestBinding(t *testing.T) {
+	t.Parallel()
 	const keyARN = "arn:aws:kms:us-east-1:123456789012:key/1234abcd"
 	dek := bytes.Repeat([]byte{0x42}, fileKEKSize)
 	client := &fakeAWSKMSClient{
@@ -53,6 +54,7 @@ func TestAWSKMSWrapperRequestBinding(t *testing.T) {
 }
 
 func TestAWSKMSWrapperRejectsProviderFailures(t *testing.T) {
+	t.Parallel()
 	const keyARN = "arn:aws:kms:us-east-1:123456789012:key/1234abcd"
 	dek := bytes.Repeat([]byte{0x42}, fileKEKSize)
 	for _, tc := range []struct {
@@ -82,6 +84,7 @@ func TestAWSKMSWrapperRejectsProviderFailures(t *testing.T) {
 }
 
 func TestNewAWSKMSWrapperRejectsInvalidARNBeforeConfigLoad(t *testing.T) {
+	t.Parallel()
 	for _, keyARN := range []string{
 		"not-an-arn",
 		"arn:aws:kms:us-east-1:123456789012:key/",

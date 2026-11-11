@@ -15,6 +15,7 @@ import (
 )
 
 func TestRedisRequestAdmissionQuitWire(t *testing.T) {
+	t.Parallel()
 	for _, protected := range []bool{false, true} {
 		t.Run(map[bool]string{false: "legacy", true: "protected"}[protected], func(t *testing.T) {
 			g := newRedisWireTestGate(t)
@@ -73,6 +74,7 @@ func requireRedisQuitClosed(t *testing.T, c *redisWireClient, closed <-chan stru
 }
 
 func TestRedisRequestAdmissionQuitDiscardsPipelineAndTransaction(t *testing.T) {
+	t.Parallel()
 	for _, transaction := range []bool{false, true} {
 		t.Run(map[bool]string{false: "standalone", true: "MULTI"}[transaction], func(t *testing.T) {
 			st := newRedisWireStore(t)
@@ -114,6 +116,7 @@ func (o redisQuitFinishOwnership) Finish(err error) error {
 }
 
 func TestRedisRequestAdmissionQuitTerminalDenied(t *testing.T) {
+	t.Parallel()
 	for _, transaction := range []bool{false, true} {
 		t.Run(map[bool]string{false: "standalone", true: "MULTI"}[transaction], func(t *testing.T) {
 			st := newRedisWireStore(t)
@@ -144,6 +147,7 @@ func TestRedisRequestAdmissionQuitTerminalDenied(t *testing.T) {
 }
 
 func TestRedisRequestAdmissionQuitJoinsTransactionChildBeforePublication(t *testing.T) {
+	t.Parallel()
 	st := newRedisWireStore(t)
 	g := newRedisWireTestGate(t)
 	s, closed := startRedisQuitWireServer(t, g, st)
@@ -199,6 +203,7 @@ func (c *redisQuitOrderConn) ReadPipeline() []redcon.Command {
 }
 
 func TestRedisRequestAdmissionQuitPanicNeverPublishesSuccess(t *testing.T) {
+	t.Parallel()
 	owner := &redisTestOwnership{ctx: t.Context()}
 	s := redisOwnedTestServer(owner)
 	t.Cleanup(func() { require.NoError(t, s.Close()) })

@@ -1297,11 +1297,13 @@ func TestDynamoDB_TransactWriteItems_Concurrent_Conflicting(t *testing.T) {
 }
 
 func TestSplitTopLevelByKeyword_HandlesTokenBoundaries(t *testing.T) {
+	t.Parallel()
 	parts := splitTopLevelByKeyword("(attribute_exists(a))AND(attribute_exists(b))", "AND")
 	require.Equal(t, []string{"(attribute_exists(a))", "(attribute_exists(b))"}, parts)
 }
 
 func TestEvalConditionExpression_LogicalKeywordWithoutSpaces(t *testing.T) {
+	t.Parallel()
 	item := map[string]attributeValue{
 		"k": newStringAttributeValue("v"),
 	}
@@ -1378,6 +1380,7 @@ func TestValidateConditionOnItem_AttributeNameContainsLogicalKeywordSubstring(t 
 }
 
 func TestQueryExclusiveStartKey_AppliesAfterOrdering(t *testing.T) {
+	t.Parallel()
 	schema := &dynamoTableSchema{
 		PrimaryKey: dynamoKeySchema{
 			HashKey:  "pk",

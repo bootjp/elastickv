@@ -28,34 +28,6 @@ const (
 	bucketActionAny     = "*"
 )
 
-// throttleAttributeNames is the wire-side set of Throttle*
-// attributes a SetQueueAttributes request can carry. Used by the
-// invalidation gate in setQueueAttributes so an unrelated update
-// (e.g. VisibilityTimeout only) does not pay the cache invalidation
-// cost or, worse, give the caller a way to silently reset bucket
-// state via a no-op SetQueueAttributes.
-var throttleAttributeNames = []string{
-	"ThrottleSendCapacity",
-	"ThrottleSendRefillPerSecond",
-	"ThrottleRecvCapacity",
-	"ThrottleRecvRefillPerSecond",
-	"ThrottleDefaultCapacity",
-	"ThrottleDefaultRefillPerSecond",
-}
-
-// throttleAttributesPresent reports whether attrs carries any
-// Throttle* key. Cheap O(6) check; the throttleAttributeNames slice
-// is the source of truth so a future Throttle* attribute name added
-// in one place automatically participates in the gate.
-func throttleAttributesPresent(attrs map[string]string) bool {
-	for _, k := range throttleAttributeNames {
-		if _, ok := attrs[k]; ok {
-			return true
-		}
-	}
-	return false
-}
-
 // throttleHardCeilingPerSecond bounds any user-supplied capacity or
 // refill rate. A typo like SendCapacity=1e9 silently meaning "no limit"
 // is more dangerous than an explicit InvalidAttributeValue: a

@@ -1,0 +1,11 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: elastickv
+spec:
+  # TCP readiness cannot establish replication catch-up. Block all automated
+  # evictions; planned maintenance uses the documented one-member workflow.
+  maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: elastickv

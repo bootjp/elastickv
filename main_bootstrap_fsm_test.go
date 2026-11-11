@@ -13,6 +13,7 @@ import (
 )
 
 func TestProtectedDataGroupFSMBindsIdentityBeforeReceiptReplay(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	t.Cleanup(func() { require.NoError(t, st.Close()) })
 	cluster := raftbootstrap.UUID{1}

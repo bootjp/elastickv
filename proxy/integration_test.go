@@ -105,6 +105,7 @@ func setupProxy(t *testing.T, mode proxy.ProxyMode, secondaryAddr string) (*redi
 }
 
 func TestIntegration_RedisOnly(t *testing.T) {
+	t.Parallel()
 	skipWithoutRedis(t, testPrimaryAddr)
 
 	client, cancel := setupProxy(t, proxy.ModeRedisOnly, "localhost:16399") // secondary unused
@@ -135,6 +136,7 @@ func TestIntegration_RedisOnly(t *testing.T) {
 }
 
 func TestIntegration_DualWrite(t *testing.T) {
+	t.Parallel()
 	secondaryAddr := "localhost:6380"
 	skipWithoutRedis(t, testPrimaryAddr, secondaryAddr)
 
@@ -171,6 +173,7 @@ func TestIntegration_DualWrite(t *testing.T) {
 }
 
 func TestIntegration_HashCommands(t *testing.T) {
+	t.Parallel()
 	skipWithoutRedis(t, testPrimaryAddr)
 
 	client, cancel := setupProxy(t, proxy.ModeRedisOnly, "localhost:16399")
@@ -206,6 +209,7 @@ func TestIntegration_HashCommands(t *testing.T) {
 }
 
 func TestIntegration_ListCommands(t *testing.T) {
+	t.Parallel()
 	skipWithoutRedis(t, testPrimaryAddr)
 
 	client, cancel := setupProxy(t, proxy.ModeRedisOnly, "localhost:16399")
@@ -233,6 +237,7 @@ func TestIntegration_ListCommands(t *testing.T) {
 }
 
 func TestIntegration_Transaction(t *testing.T) {
+	t.Parallel()
 	skipWithoutRedis(t, testPrimaryAddr)
 
 	client, cancel := setupProxy(t, proxy.ModeRedisOnly, "localhost:16399")

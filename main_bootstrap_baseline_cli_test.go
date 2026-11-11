@@ -67,6 +67,7 @@ func baselineCLIFixtureWithSigners(t testing.TB) (bootstrapBaselineCLIRequest, b
 }
 
 func TestBaselineCLIRequest(t *testing.T) {
+	t.Parallel()
 	r, err := parseBootstrapBaselineCLI(baselineCLIArgs())
 	require.NoError(t, err)
 	require.Equal(t, uint64(1), r.MemberID)
@@ -79,6 +80,7 @@ func TestBaselineCLIRequest(t *testing.T) {
 }
 
 func TestBaselineCLIRejectsRequests(t *testing.T) {
+	t.Parallel()
 	cases := map[string][]string{
 		"empty": nil, "prepare": {"prepare"}, "activate": {"activate"}, "unknown": {"delete"},
 		"missing": {"inspect"}, "missing value": {"inspect", "--manifest"},
@@ -117,6 +119,7 @@ func TestBaselineCLIRejectsRequests(t *testing.T) {
 }
 
 func TestBaselineCLIConfigAndSummary(t *testing.T) {
+	t.Parallel()
 	request, raw, manifest := baselineCLIFixture(t)
 	config, err := json.Marshal(raw)
 	require.NoError(t, err)
@@ -157,6 +160,7 @@ func TestBaselineCLIConfigAndSummary(t *testing.T) {
 }
 
 func TestBaselineCLIConfigRejectsMalformedJSON(t *testing.T) {
+	t.Parallel()
 	request, raw, _ := baselineCLIFixture(t)
 	config, err := json.Marshal(raw)
 	require.NoError(t, err)
@@ -182,6 +186,7 @@ func TestBaselineCLIConfigRejectsMalformedJSON(t *testing.T) {
 }
 
 func TestBaselineCLIExpectedContextRejectsInvalidValues(t *testing.T) {
+	t.Parallel()
 	cases := map[string]func(*bootstrapBaselineExpectedJSON){
 		"version":                   func(r *bootstrapBaselineExpectedJSON) { r.Version++ },
 		"cluster":                   func(r *bootstrapBaselineExpectedJSON) { r.Cluster = strings.ToUpper(r.Cluster[:8]) + "X" },
@@ -239,6 +244,7 @@ func FuzzBootstrapBaselineExpectedConfig(f *testing.F) {
 }
 
 func TestBaselineCLIDryRunIndependentExpectation(t *testing.T) {
+	t.Parallel()
 	for _, field := range []string{"operation", "member", "pin", "cut", "group", "data", "path", "manifest"} {
 		t.Run(field, func(t *testing.T) {
 			request, raw, manifest := baselineCLIFixture(t)

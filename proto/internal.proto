@@ -107,6 +107,38 @@ message ForwardResponse {
   uint64 commit_ts = 3;
 }
 
+// ForwardFailureDetail is evidence only on a trusted Internal.Forward RPC.
+enum ForwardFailurePhase {
+  FORWARD_FAILURE_PHASE_UNSPECIFIED = 0;
+  FORWARD_FAILURE_PHASE_ONE_PHASE_APPLY = 1;
+  FORWARD_FAILURE_PHASE_PREPARE = 2;
+  FORWARD_FAILURE_PHASE_COMMIT = 3;
+  FORWARD_FAILURE_PHASE_ABORT = 4;
+}
+
+enum ForwardFailureReason {
+  FORWARD_FAILURE_REASON_UNSPECIFIED = 0;
+  FORWARD_FAILURE_REASON_CONFLICT = 1;
+  FORWARD_FAILURE_REASON_FENCE = 2;
+  FORWARD_FAILURE_REASON_NO_LEADER = 3;
+  FORWARD_FAILURE_REASON_INTERRUPTED = 4;
+  FORWARD_FAILURE_REASON_ABORTED = 5;
+}
+
+enum ForwardDecisionClass {
+  FORWARD_DECISION_CLASS_UNSPECIFIED = 0;
+  FORWARD_DECISION_CLASS_REJECTED_BEFORE_SUBMISSION = 1;
+  FORWARD_DECISION_CLASS_DEFINITIVELY_ABORTED = 2;
+  FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN = 3;
+}
+
+message ForwardFailureDetail {
+  uint32 schema_version = 1;
+  ForwardFailurePhase phase = 2;
+  ForwardFailureReason reason = 3;
+  ForwardDecisionClass decision = 4;
+}
+
 message ForwardAdminProposalRequest {
   bytes payload = 1;
   // force_entry requires the leader to propose the typed watermark payload

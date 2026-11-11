@@ -40,6 +40,7 @@ func raftEntryApplier(t *testing.T, st MVCCStore) RaftEntryApplier {
 // cannot leave a replica whose durable applied index names a half-applied
 // entry; after the scope both are durable together.
 func TestApplyRaftEntry_NothingIsDurableUntilTheEntryCommits(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := newApplyIndexPebbleStore(t)
 	applier := raftEntryApplier(t, st)
@@ -78,6 +79,7 @@ func TestApplyRaftEntry_NothingIsDurableUntilTheEntryCommits(t *testing.T) {
 }
 
 func TestApplyRaftEntry_CallbackErrorDiscardsEveryRequest(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := newApplyIndexPebbleStore(t)
 	applier := raftEntryApplier(t, st)
@@ -110,6 +112,7 @@ func TestApplyRaftEntry_CallbackErrorDiscardsEveryRequest(t *testing.T) {
 // previous request wrote, and a write below an earlier request's commit
 // timestamp on the same key is a write conflict.
 func TestApplyRaftEntry_LaterRequestSeesEarlierRequest(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := newApplyIndexPebbleStore(t)
 	applier := raftEntryApplier(t, st)
@@ -136,6 +139,7 @@ func TestApplyRaftEntry_LaterRequestSeesEarlierRequest(t *testing.T) {
 // per-request path's stale-apply fast path: the same key at the same commit
 // timestamp twice in one entry is treated as already landed the second time.
 func TestApplyRaftEntry_RepeatedRequestInsideEntryIsAReplay(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := newApplyIndexPebbleStore(t)
 	applier := raftEntryApplier(t, st)
@@ -156,6 +160,7 @@ func TestApplyRaftEntry_RepeatedRequestInsideEntryIsAReplay(t *testing.T) {
 // request rejected before staging neither taints the entry nor leaks a
 // partial write: the requests around it still land.
 func TestApplyRaftEntry_ValidationFailureLeavesBatchUntouched(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := newApplyIndexPebbleStore(t)
 	applier := raftEntryApplier(t, st)
@@ -179,6 +184,7 @@ func TestApplyRaftEntry_ValidationFailureLeavesBatchUntouched(t *testing.T) {
 }
 
 func TestApplyRaftEntry_EmptyEntryCommitsNothing(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := newApplyIndexPebbleStore(t)
 	applier := raftEntryApplier(t, st)
@@ -191,6 +197,7 @@ func TestApplyRaftEntry_EmptyEntryCommitsNothing(t *testing.T) {
 }
 
 func TestApplyRaftEntry_IndexMismatchFailsTheEntry(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := newApplyIndexPebbleStore(t)
 	applier := raftEntryApplier(t, st)
@@ -209,6 +216,7 @@ func TestApplyRaftEntry_IndexMismatchFailsTheEntry(t *testing.T) {
 }
 
 func TestApplyRaftEntry_NestedScopeReusesTheOuterEntry(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := newApplyIndexPebbleStore(t)
 	applier := raftEntryApplier(t, st)
@@ -237,6 +245,7 @@ func TestApplyRaftEntry_NestedScopeReusesTheOuterEntry(t *testing.T) {
 // serial order requires one of them to see a write conflict (found in
 // review).
 func TestApplyRaftEntry_DirectWriteWaitsForTheEntry(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := newApplyIndexPebbleStore(t)
 	applier := raftEntryApplier(t, st)
@@ -292,6 +301,7 @@ func TestApplyRaftEntry_DirectWriteWaitsForTheEntry(t *testing.T) {
 // and wait for applyMu while the second request waited for dbMu, and Raft
 // apply stopped for good (found in review).
 func TestApplyRaftEntry_SnapshotBetweenRequestsDoesNotDeadlock(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := newApplyIndexPebbleStore(t)
 	ps := pebbleStoreApplied(t, st)
@@ -338,6 +348,7 @@ func TestApplyRaftEntry_SnapshotBetweenRequestsDoesNotDeadlock(t *testing.T) {
 }
 
 func TestIsApplyVerdict(t *testing.T) {
+	t.Parallel()
 	for _, err := range []error{
 		NewWriteConflictError([]byte("k")),
 		errors.Wrap(ErrUnknownOp, "wrapped"),
@@ -357,6 +368,7 @@ func TestIsApplyVerdict(t *testing.T) {
 }
 
 func TestApplyRaftEntry_InMemoryStoreRunsTheCallback(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := NewMVCCStore()
 	applier := raftEntryApplier(t, st)

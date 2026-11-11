@@ -146,16 +146,15 @@ const (
 )
 
 type RedisServer struct {
-	listen          net.Listener
-	store           store.MVCCStore
-	coordinator     kv.Coordinator
-	readTracker     *kv.ActiveTimestampTracker
-	redisTranscoder *redisTranscoder
-	pubsub          *redisPubSub
-	scriptMu        sync.RWMutex
-	scriptCache     map[string]string
-	luaPool         *luaStatePool
-	luaPoolOnce     sync.Once
+	listen      net.Listener
+	store       store.MVCCStore
+	coordinator kv.Coordinator
+	readTracker *kv.ActiveTimestampTracker
+	pubsub      *redisPubSub
+	scriptMu    sync.RWMutex
+	scriptCache map[string]string
+	luaPool     *luaStatePool
+	luaPoolOnce sync.Once
 	// luaPoolMaxIdle is the configured cap on idle pooled *lua.LStates.
 	// Set via WithLuaPoolMaxIdle before NewRedisServer materializes the
 	// pool; getLuaPool falls back to DefaultLuaPoolMaxIdle when the
@@ -396,6 +395,8 @@ func (c *redisMetricsConn) WriteError(msg string) {
 	c.Conn.WriteError(msg)
 }
 
+const redisOutcomeUnknownReply = "ERR operation outcome unknown"
+
 // writeRedisError writes a RESP error reply for err, prepending the
 // Redis-protocol semantic code NOTLEADER when err is a transient
 // leadership-loss signal. Real Redis clients (Carmine, and through it
@@ -414,6 +415,10 @@ func (c *redisMetricsConn) WriteError(msg string) {
 func writeRedisError(conn redcon.Conn, err error) {
 	if recorder, ok := conn.(interface{ recordRequestError(error) }); ok {
 		recorder.recordRequestError(err)
+	}
+	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+		conn.WriteError(redisOutcomeUnknownReply)
+		return
 	}
 	msg := err.Error()
 	if isTransientLeaderRedisError(err) {
@@ -557,7 +562,6 @@ func NewRedisServer(listen net.Listener, redisAddr string, store store.MVCCStore
 		listen:                listen,
 		store:                 store,
 		coordinator:           kv.WithKeyVizLabel(coordinate, keyviz.LabelRedis),
-		redisTranscoder:       newRedisTranscoder(),
 		redisAddr:             redisAddr,
 		relay:                 relay,
 		leaderRedis:           leaderRedis,

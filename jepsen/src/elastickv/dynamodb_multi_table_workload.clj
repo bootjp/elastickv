@@ -129,17 +129,23 @@
       resp)))
 
 (defn- create-one-table!
-  "Create one of the N tables; ignore ResourceInUseException."
+  "Ensure a fixed-name setup table exists without replaying workload writes."
   [ddb tname]
-  (try
-    (ddb-invoke! ddb :CreateTable
-                 {:TableName             tname
-                  :KeySchema             [{:AttributeName pk-attr :KeyType "HASH"}]
-                  :AttributeDefinitions  [{:AttributeName pk-attr :AttributeType "S"}]
-                  :ProvisionedThroughput {:ReadCapacityUnits 5 :WriteCapacityUnits 5}})
-    (catch clojure.lang.ExceptionInfo e
-      (when-not (= "ResourceInUseException" (:type (ex-data e)))
-        (throw e)))))
+  (loop [delays [100 250 500 1000 2000]]
+    (let [[ok result]
+          (try
+            [true (ddb-invoke! ddb :CreateTable
+                               {:TableName             tname
+                                :KeySchema             [{:AttributeName pk-attr :KeyType "HASH"}]
+                                :AttributeDefinitions  [{:AttributeName pk-attr :AttributeType "S"}]
+                                :ProvisionedThroughput {:ReadCapacityUnits 5 :WriteCapacityUnits 5}})]
+            (catch clojure.lang.ExceptionInfo e [false e]))]
+      (cond
+        ok nil
+        (= "ResourceInUseException" (:type (ex-data result))) nil
+        (and (= "OperationOutcomeUnknown" (:type (ex-data result))) (seq delays))
+        (do (Thread/sleep (first delays)) (recur (rest delays)))
+        :else (throw result)))))
 
 (defn- create-all-tables!
   "Create every table this workload owns.  Idempotent."

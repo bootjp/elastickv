@@ -9,6 +9,7 @@ import (
 )
 
 func TestEntryIdentityGoldenAndRoundTrip(t *testing.T) {
+	t.Parallel()
 	identity := EntryIdentity{
 		Cluster: UUID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
 		Group:   0x1112131415161718,
@@ -32,6 +33,7 @@ func TestEntryIdentityGoldenAndRoundTrip(t *testing.T) {
 }
 
 func TestEntryIdentityRejectsInvalidAndTruncated(t *testing.T) {
+	t.Parallel()
 	valid := EntryIdentity{Cluster: UUID{1}, Index: 1, Term: 1, Digest: Digest{1}}
 	encoded, err := EncodeEntryIdentity(valid)
 	require.NoError(t, err)
@@ -53,6 +55,7 @@ func TestEntryIdentityRejectsInvalidAndTruncated(t *testing.T) {
 }
 
 func TestReceiptKeyCollidesOnlyOnEntrySlot(t *testing.T) {
+	t.Parallel()
 	base := EntryIdentity{Cluster: UUID{1}, Group: 7, Index: 9, Term: 2, Digest: Digest{3}}
 	key, err := ReceiptKey(base)
 	require.NoError(t, err)
@@ -74,6 +77,7 @@ func TestReceiptKeyCollidesOnlyOnEntrySlot(t *testing.T) {
 }
 
 func TestGuardedReceiptRoundTripAndGoldenSize(t *testing.T) {
+	t.Parallel()
 	command := testGuardedCommand(ControlGuardedWatermark)
 	receipt := GuardedReceipt{
 		Entry: EntryIdentity{Cluster: command.Witness.Cluster, Group: command.Witness.Group, Index: 21, Term: 8, Digest: Digest{9}},
@@ -93,6 +97,7 @@ func TestGuardedReceiptRoundTripAndGoldenSize(t *testing.T) {
 }
 
 func TestGuardedReceiptRejectsMalformedAndInconsistentRecords(t *testing.T) {
+	t.Parallel()
 	command := testGuardedCommand(ControlGuardedCatalog)
 	valid := GuardedReceipt{
 		Entry: EntryIdentity{Cluster: command.Witness.Cluster, Group: command.Witness.Group, Index: 21, Term: 8, Digest: Digest{9}},
@@ -128,6 +133,7 @@ func TestGuardedReceiptRejectsMalformedAndInconsistentRecords(t *testing.T) {
 }
 
 func TestGuardedReceiptRejectionsCannotCarryInnerResult(t *testing.T) {
+	t.Parallel()
 	command := testGuardedCommand(ControlGuardedWatermark)
 	for _, verdict := range []GuardedReceiptVerdict{GuardedReceiptRejectedStaleWitness, GuardedReceiptRejectedReservation} {
 		receipt := GuardedReceipt{
@@ -147,6 +153,7 @@ func TestGuardedReceiptRejectionsCannotCarryInnerResult(t *testing.T) {
 }
 
 func TestGuardedWatermarkReceiptMustCoverRequestedValue(t *testing.T) {
+	t.Parallel()
 	command := testGuardedCommand(ControlGuardedWatermark)
 	receipt := GuardedReceipt{
 		Entry: EntryIdentity{Cluster: command.Witness.Cluster, Group: command.Witness.Group, Index: 21, Term: 8, Digest: Digest{9}},

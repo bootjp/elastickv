@@ -11,6 +11,7 @@ import (
 )
 
 func TestRuntimeNamespacePreallocationPreservesStrictOfflineRules(t *testing.T) {
+	t.Parallel()
 	o, _ := offlineBaselineFixture(t, true)
 	require.NoError(t, o.Ownership.Close())
 	wdir := filepath.Join(o.DataDir, walDirName)
@@ -42,6 +43,7 @@ func TestRuntimeNamespacePreallocationPreservesStrictOfflineRules(t *testing.T) 
 }
 
 func TestRuntimeNamespacePreallocationNativeRecoveryAndFence(t *testing.T) {
+	t.Parallel()
 	o, identity, oldGuard := namespaceRecoveryFixture(t)
 	require.NoError(t, oldGuard.Close())
 	wdir := filepath.Join(o.DataDir, walDirName)
@@ -79,6 +81,7 @@ func TestRuntimeNamespacePreallocationNativeRecoveryAndFence(t *testing.T) {
 }
 
 func TestRuntimeNamespacePreallocationRejectsUnsafeFiles(t *testing.T) {
+	t.Parallel()
 	for _, kind := range []string{"unknown", "symlink", "directory", "wal-alias", "snapshot-alias", "external-alias", "temporary-alias"} {
 		t.Run(kind, func(t *testing.T) {
 			o, _ := offlineBaselineFixture(t, true)
@@ -129,6 +132,7 @@ func stageUnsafeNamespacePreallocation(t *testing.T, dir, kind string) {
 }
 
 func TestRuntimeNamespaceOwnershipRechecksBeforeHandoff(t *testing.T) {
+	t.Parallel()
 	o, _ := offlineBaselineFixture(t, true)
 	require.NoError(t, o.Ownership.Close())
 	path := filepath.Join(o.DataDir, walDirName, "0.tmp")

@@ -75,6 +75,7 @@ func newEncryptionRuntimeIOFixture(t *testing.T) *encryptionRuntimeIOFixture {
 }
 
 func TestBootstrapEncryptionRuntimeIOObserveDoesNotMutate(t *testing.T) {
+	t.Parallel()
 	f := newEncryptionRuntimeIOFixture(t)
 	before, err := f.io.Observe(t.Context())
 	require.NoError(t, err)
@@ -91,6 +92,7 @@ func TestBootstrapEncryptionRuntimeIOObserveDoesNotMutate(t *testing.T) {
 }
 
 func TestBootstrapEncryptionRuntimeIORegistrationEpoch(t *testing.T) {
+	t.Parallel()
 	f := newEncryptionRuntimeIOFixture(t)
 	require.NoError(t, f.io.ValidateEpoch(1, 7))
 	require.NoError(t, f.io.ValidateEpoch(2, 9))
@@ -99,6 +101,7 @@ func TestBootstrapEncryptionRuntimeIORegistrationEpoch(t *testing.T) {
 }
 
 func TestBootstrapEncryptionRuntimeIORejectsWrongActualMaterial(t *testing.T) {
+	t.Parallel()
 	f := newEncryptionRuntimeIOFixture(t)
 	key := f.sidecar.Keys["1"]
 	key.Wrapped[16] = 1
@@ -110,6 +113,7 @@ func TestBootstrapEncryptionRuntimeIORejectsWrongActualMaterial(t *testing.T) {
 }
 
 func TestBootstrapEncryptionRuntimeIORepairsWrapperOnlyOnce(t *testing.T) {
+	t.Parallel()
 	f := newEncryptionRuntimeIOFixture(t)
 	f.group.SetRaftPayloadWrap(nil)
 	_, err := f.io.Observe(t.Context())
@@ -125,6 +129,7 @@ func TestBootstrapEncryptionRuntimeIORepairsWrapperOnlyOnce(t *testing.T) {
 }
 
 func TestBootstrapEncryptionRuntimeIOPayloadUsesActualPendingWrapper(t *testing.T) {
+	t.Parallel()
 	f := newEncryptionRuntimeIOFixture(t)
 	f.runtime.registration.MarkRegistered(3, 9)
 	f.sidecar.Active.Raft = 3
@@ -151,6 +156,7 @@ func TestBootstrapEncryptionRuntimeIOPayloadUsesActualPendingWrapper(t *testing.
 }
 
 func TestBootstrapEncryptionRuntimeIOAdminUsesWrappedProposer(t *testing.T) {
+	t.Parallel()
 	f := newEncryptionRuntimeIOFixture(t)
 	cfg := f.io.RecipeConfig(func(context.Context) (uint64, error) { return 40, nil }, func(ctx context.Context) error { return ctx.Err() })
 	wrapped, err := f.cfg.Wrapper.Wrap(make([]byte, encryption.KeySize))
@@ -164,6 +170,7 @@ func TestBootstrapEncryptionRuntimeIOAdminUsesWrappedProposer(t *testing.T) {
 }
 
 func TestBootstrapEncryptionRuntimeIOCancellationAndBinding(t *testing.T) {
+	t.Parallel()
 	f := newEncryptionRuntimeIOFixture(t)
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
@@ -180,6 +187,7 @@ func TestBootstrapEncryptionRuntimeIOCancellationAndBinding(t *testing.T) {
 }
 
 func TestBootstrapEncryptionRuntimeIORejectsStaleInstallWithoutOverwriting(t *testing.T) {
+	t.Parallel()
 	f := newEncryptionRuntimeIOFixture(t)
 	before := f.group.RaftPayloadWrap()
 	key := f.sidecar.Keys["2"]
@@ -201,6 +209,7 @@ func TestBootstrapEncryptionRuntimeIORejectsStaleInstallWithoutOverwriting(t *te
 }
 
 func TestBootstrapEncryptionRuntimeIOPayloadRejectsStaleGenerationAndNonce(t *testing.T) {
+	t.Parallel()
 	f := newEncryptionRuntimeIOFixture(t)
 	gen, err := f.cfg.Domain.admission.EncryptionFence()
 	require.NoError(t, err)
@@ -219,6 +228,7 @@ func TestBootstrapEncryptionRuntimeIOPayloadRejectsStaleGenerationAndNonce(t *te
 }
 
 func TestBootstrapEncryptionRuntimeIORecipeOrderRepairsLaterRaftPurpose(t *testing.T) {
+	t.Parallel()
 	f := newEncryptionRuntimeIOFixture(t)
 	f.group.SetRaftPayloadWrap(nil)
 	config := f.io.RecipeConfig(func(context.Context) (uint64, error) { return 40, nil }, func(ctx context.Context) error { return ctx.Err() })

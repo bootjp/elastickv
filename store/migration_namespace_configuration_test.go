@@ -8,6 +8,7 @@ import (
 )
 
 func TestMigrationNamespaceSharedConfigurationCodec(t *testing.T) {
+	t.Parallel()
 	for _, active := range []bool{false, true} {
 		state := MigrationNamespaceConfiguration{Index: 5}
 		if active {

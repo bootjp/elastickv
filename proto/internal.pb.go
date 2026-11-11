@@ -128,6 +128,172 @@ func (Phase) EnumDescriptor() ([]byte, []int) {
 	return file_internal_proto_rawDescGZIP(), []int{1}
 }
 
+// ForwardFailureDetail is evidence only on a trusted Internal.Forward RPC.
+type ForwardFailurePhase int32
+
+const (
+	ForwardFailurePhase_FORWARD_FAILURE_PHASE_UNSPECIFIED     ForwardFailurePhase = 0
+	ForwardFailurePhase_FORWARD_FAILURE_PHASE_ONE_PHASE_APPLY ForwardFailurePhase = 1
+	ForwardFailurePhase_FORWARD_FAILURE_PHASE_PREPARE         ForwardFailurePhase = 2
+	ForwardFailurePhase_FORWARD_FAILURE_PHASE_COMMIT          ForwardFailurePhase = 3
+	ForwardFailurePhase_FORWARD_FAILURE_PHASE_ABORT           ForwardFailurePhase = 4
+)
+
+// Enum value maps for ForwardFailurePhase.
+var (
+	ForwardFailurePhase_name = map[int32]string{
+		0: "FORWARD_FAILURE_PHASE_UNSPECIFIED",
+		1: "FORWARD_FAILURE_PHASE_ONE_PHASE_APPLY",
+		2: "FORWARD_FAILURE_PHASE_PREPARE",
+		3: "FORWARD_FAILURE_PHASE_COMMIT",
+		4: "FORWARD_FAILURE_PHASE_ABORT",
+	}
+	ForwardFailurePhase_value = map[string]int32{
+		"FORWARD_FAILURE_PHASE_UNSPECIFIED":     0,
+		"FORWARD_FAILURE_PHASE_ONE_PHASE_APPLY": 1,
+		"FORWARD_FAILURE_PHASE_PREPARE":         2,
+		"FORWARD_FAILURE_PHASE_COMMIT":          3,
+		"FORWARD_FAILURE_PHASE_ABORT":           4,
+	}
+)
+
+func (x ForwardFailurePhase) Enum() *ForwardFailurePhase {
+	p := new(ForwardFailurePhase)
+	*p = x
+	return p
+}
+
+func (x ForwardFailurePhase) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (ForwardFailurePhase) Descriptor() protoreflect.EnumDescriptor {
+	return file_internal_proto_enumTypes[2].Descriptor()
+}
+
+func (ForwardFailurePhase) Type() protoreflect.EnumType {
+	return &file_internal_proto_enumTypes[2]
+}
+
+func (x ForwardFailurePhase) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use ForwardFailurePhase.Descriptor instead.
+func (ForwardFailurePhase) EnumDescriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{2}
+}
+
+type ForwardFailureReason int32
+
+const (
+	ForwardFailureReason_FORWARD_FAILURE_REASON_UNSPECIFIED ForwardFailureReason = 0
+	ForwardFailureReason_FORWARD_FAILURE_REASON_CONFLICT    ForwardFailureReason = 1
+	ForwardFailureReason_FORWARD_FAILURE_REASON_FENCE       ForwardFailureReason = 2
+	ForwardFailureReason_FORWARD_FAILURE_REASON_NO_LEADER   ForwardFailureReason = 3
+	ForwardFailureReason_FORWARD_FAILURE_REASON_INTERRUPTED ForwardFailureReason = 4
+	ForwardFailureReason_FORWARD_FAILURE_REASON_ABORTED     ForwardFailureReason = 5
+)
+
+// Enum value maps for ForwardFailureReason.
+var (
+	ForwardFailureReason_name = map[int32]string{
+		0: "FORWARD_FAILURE_REASON_UNSPECIFIED",
+		1: "FORWARD_FAILURE_REASON_CONFLICT",
+		2: "FORWARD_FAILURE_REASON_FENCE",
+		3: "FORWARD_FAILURE_REASON_NO_LEADER",
+		4: "FORWARD_FAILURE_REASON_INTERRUPTED",
+		5: "FORWARD_FAILURE_REASON_ABORTED",
+	}
+	ForwardFailureReason_value = map[string]int32{
+		"FORWARD_FAILURE_REASON_UNSPECIFIED": 0,
+		"FORWARD_FAILURE_REASON_CONFLICT":    1,
+		"FORWARD_FAILURE_REASON_FENCE":       2,
+		"FORWARD_FAILURE_REASON_NO_LEADER":   3,
+		"FORWARD_FAILURE_REASON_INTERRUPTED": 4,
+		"FORWARD_FAILURE_REASON_ABORTED":     5,
+	}
+)
+
+func (x ForwardFailureReason) Enum() *ForwardFailureReason {
+	p := new(ForwardFailureReason)
+	*p = x
+	return p
+}
+
+func (x ForwardFailureReason) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (ForwardFailureReason) Descriptor() protoreflect.EnumDescriptor {
+	return file_internal_proto_enumTypes[3].Descriptor()
+}
+
+func (ForwardFailureReason) Type() protoreflect.EnumType {
+	return &file_internal_proto_enumTypes[3]
+}
+
+func (x ForwardFailureReason) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use ForwardFailureReason.Descriptor instead.
+func (ForwardFailureReason) EnumDescriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{3}
+}
+
+type ForwardDecisionClass int32
+
+const (
+	ForwardDecisionClass_FORWARD_DECISION_CLASS_UNSPECIFIED                ForwardDecisionClass = 0
+	ForwardDecisionClass_FORWARD_DECISION_CLASS_REJECTED_BEFORE_SUBMISSION ForwardDecisionClass = 1
+	ForwardDecisionClass_FORWARD_DECISION_CLASS_DEFINITIVELY_ABORTED       ForwardDecisionClass = 2
+	ForwardDecisionClass_FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN            ForwardDecisionClass = 3
+)
+
+// Enum value maps for ForwardDecisionClass.
+var (
+	ForwardDecisionClass_name = map[int32]string{
+		0: "FORWARD_DECISION_CLASS_UNSPECIFIED",
+		1: "FORWARD_DECISION_CLASS_REJECTED_BEFORE_SUBMISSION",
+		2: "FORWARD_DECISION_CLASS_DEFINITIVELY_ABORTED",
+		3: "FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN",
+	}
+	ForwardDecisionClass_value = map[string]int32{
+		"FORWARD_DECISION_CLASS_UNSPECIFIED":                0,
+		"FORWARD_DECISION_CLASS_REJECTED_BEFORE_SUBMISSION": 1,
+		"FORWARD_DECISION_CLASS_DEFINITIVELY_ABORTED":       2,
+		"FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN":            3,
+	}
+)
+
+func (x ForwardDecisionClass) Enum() *ForwardDecisionClass {
+	p := new(ForwardDecisionClass)
+	*p = x
+	return p
+}
+
+func (x ForwardDecisionClass) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (ForwardDecisionClass) Descriptor() protoreflect.EnumDescriptor {
+	return file_internal_proto_enumTypes[4].Descriptor()
+}
+
+func (ForwardDecisionClass) Type() protoreflect.EnumType {
+	return &file_internal_proto_enumTypes[4]
+}
+
+func (x ForwardDecisionClass) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use ForwardDecisionClass.Descriptor instead.
+func (ForwardDecisionClass) EnumDescriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{4}
+}
+
 type MigrationCleanupMode int32
 
 const (
@@ -181,11 +347,11 @@ func (x MigrationCleanupMode) String() string {
 }
 
 func (MigrationCleanupMode) Descriptor() protoreflect.EnumDescriptor {
-	return file_internal_proto_enumTypes[2].Descriptor()
+	return file_internal_proto_enumTypes[5].Descriptor()
 }
 
 func (MigrationCleanupMode) Type() protoreflect.EnumType {
-	return &file_internal_proto_enumTypes[2]
+	return &file_internal_proto_enumTypes[5]
 }
 
 func (x MigrationCleanupMode) Number() protoreflect.EnumNumber {
@@ -194,7 +360,7 @@ func (x MigrationCleanupMode) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use MigrationCleanupMode.Descriptor instead.
 func (MigrationCleanupMode) EnumDescriptor() ([]byte, []int) {
-	return file_internal_proto_rawDescGZIP(), []int{2}
+	return file_internal_proto_rawDescGZIP(), []int{5}
 }
 
 type MigrationOwnershipRole int32
@@ -230,11 +396,11 @@ func (x MigrationOwnershipRole) String() string {
 }
 
 func (MigrationOwnershipRole) Descriptor() protoreflect.EnumDescriptor {
-	return file_internal_proto_enumTypes[3].Descriptor()
+	return file_internal_proto_enumTypes[6].Descriptor()
 }
 
 func (MigrationOwnershipRole) Type() protoreflect.EnumType {
-	return &file_internal_proto_enumTypes[3]
+	return &file_internal_proto_enumTypes[6]
 }
 
 func (x MigrationOwnershipRole) Number() protoreflect.EnumNumber {
@@ -243,7 +409,7 @@ func (x MigrationOwnershipRole) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use MigrationOwnershipRole.Descriptor instead.
 func (MigrationOwnershipRole) EnumDescriptor() ([]byte, []int) {
-	return file_internal_proto_rawDescGZIP(), []int{3}
+	return file_internal_proto_rawDescGZIP(), []int{6}
 }
 
 type MigrationStateProbeKind int32
@@ -305,11 +471,11 @@ func (x MigrationStateProbeKind) String() string {
 }
 
 func (MigrationStateProbeKind) Descriptor() protoreflect.EnumDescriptor {
-	return file_internal_proto_enumTypes[4].Descriptor()
+	return file_internal_proto_enumTypes[7].Descriptor()
 }
 
 func (MigrationStateProbeKind) Type() protoreflect.EnumType {
-	return &file_internal_proto_enumTypes[4]
+	return &file_internal_proto_enumTypes[7]
 }
 
 func (x MigrationStateProbeKind) Number() protoreflect.EnumNumber {
@@ -318,7 +484,7 @@ func (x MigrationStateProbeKind) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use MigrationStateProbeKind.Descriptor instead.
 func (MigrationStateProbeKind) EnumDescriptor() ([]byte, []int) {
-	return file_internal_proto_rawDescGZIP(), []int{4}
+	return file_internal_proto_rawDescGZIP(), []int{7}
 }
 
 type Mutation struct {
@@ -694,6 +860,74 @@ func (x *ForwardResponse) GetCommitTs() uint64 {
 	return 0
 }
 
+type ForwardFailureDetail struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	SchemaVersion uint32                 `protobuf:"varint,1,opt,name=schema_version,json=schemaVersion,proto3" json:"schema_version,omitempty"`
+	Phase         ForwardFailurePhase    `protobuf:"varint,2,opt,name=phase,proto3,enum=ForwardFailurePhase" json:"phase,omitempty"`
+	Reason        ForwardFailureReason   `protobuf:"varint,3,opt,name=reason,proto3,enum=ForwardFailureReason" json:"reason,omitempty"`
+	Decision      ForwardDecisionClass   `protobuf:"varint,4,opt,name=decision,proto3,enum=ForwardDecisionClass" json:"decision,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ForwardFailureDetail) Reset() {
+	*x = ForwardFailureDetail{}
+	mi := &file_internal_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ForwardFailureDetail) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ForwardFailureDetail) ProtoMessage() {}
+
+func (x *ForwardFailureDetail) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ForwardFailureDetail.ProtoReflect.Descriptor instead.
+func (*ForwardFailureDetail) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *ForwardFailureDetail) GetSchemaVersion() uint32 {
+	if x != nil {
+		return x.SchemaVersion
+	}
+	return 0
+}
+
+func (x *ForwardFailureDetail) GetPhase() ForwardFailurePhase {
+	if x != nil {
+		return x.Phase
+	}
+	return ForwardFailurePhase_FORWARD_FAILURE_PHASE_UNSPECIFIED
+}
+
+func (x *ForwardFailureDetail) GetReason() ForwardFailureReason {
+	if x != nil {
+		return x.Reason
+	}
+	return ForwardFailureReason_FORWARD_FAILURE_REASON_UNSPECIFIED
+}
+
+func (x *ForwardFailureDetail) GetDecision() ForwardDecisionClass {
+	if x != nil {
+		return x.Decision
+	}
+	return ForwardDecisionClass_FORWARD_DECISION_CLASS_UNSPECIFIED
+}
+
 type ForwardAdminProposalRequest struct {
 	state   protoimpl.MessageState `protogen:"open.v1"`
 	Payload []byte                 `protobuf:"bytes,1,opt,name=payload,proto3" json:"payload,omitempty"`
@@ -707,7 +941,7 @@ type ForwardAdminProposalRequest struct {
 
 func (x *ForwardAdminProposalRequest) Reset() {
 	*x = ForwardAdminProposalRequest{}
-	mi := &file_internal_proto_msgTypes[5]
+	mi := &file_internal_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -719,7 +953,7 @@ func (x *ForwardAdminProposalRequest) String() string {
 func (*ForwardAdminProposalRequest) ProtoMessage() {}
 
 func (x *ForwardAdminProposalRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_proto_msgTypes[5]
+	mi := &file_internal_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -732,7 +966,7 @@ func (x *ForwardAdminProposalRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ForwardAdminProposalRequest.ProtoReflect.Descriptor instead.
 func (*ForwardAdminProposalRequest) Descriptor() ([]byte, []int) {
-	return file_internal_proto_rawDescGZIP(), []int{5}
+	return file_internal_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *ForwardAdminProposalRequest) GetPayload() []byte {
@@ -758,7 +992,7 @@ type ForwardAdminProposalResponse struct {
 
 func (x *ForwardAdminProposalResponse) Reset() {
 	*x = ForwardAdminProposalResponse{}
-	mi := &file_internal_proto_msgTypes[6]
+	mi := &file_internal_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -770,7 +1004,7 @@ func (x *ForwardAdminProposalResponse) String() string {
 func (*ForwardAdminProposalResponse) ProtoMessage() {}
 
 func (x *ForwardAdminProposalResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_proto_msgTypes[6]
+	mi := &file_internal_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -783,7 +1017,7 @@ func (x *ForwardAdminProposalResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ForwardAdminProposalResponse.ProtoReflect.Descriptor instead.
 func (*ForwardAdminProposalResponse) Descriptor() ([]byte, []int) {
-	return file_internal_proto_rawDescGZIP(), []int{6}
+	return file_internal_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *ForwardAdminProposalResponse) GetCommitIndex() uint64 {
@@ -801,7 +1035,7 @@ type ForwardLeaseReadRequest struct {
 
 func (x *ForwardLeaseReadRequest) Reset() {
 	*x = ForwardLeaseReadRequest{}
-	mi := &file_internal_proto_msgTypes[7]
+	mi := &file_internal_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -813,7 +1047,7 @@ func (x *ForwardLeaseReadRequest) String() string {
 func (*ForwardLeaseReadRequest) ProtoMessage() {}
 
 func (x *ForwardLeaseReadRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_proto_msgTypes[7]
+	mi := &file_internal_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -826,7 +1060,7 @@ func (x *ForwardLeaseReadRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ForwardLeaseReadRequest.ProtoReflect.Descriptor instead.
 func (*ForwardLeaseReadRequest) Descriptor() ([]byte, []int) {
-	return file_internal_proto_rawDescGZIP(), []int{7}
+	return file_internal_proto_rawDescGZIP(), []int{8}
 }
 
 type ForwardLeaseReadResponse struct {
@@ -839,7 +1073,7 @@ type ForwardLeaseReadResponse struct {
 
 func (x *ForwardLeaseReadResponse) Reset() {
 	*x = ForwardLeaseReadResponse{}
-	mi := &file_internal_proto_msgTypes[8]
+	mi := &file_internal_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -851,7 +1085,7 @@ func (x *ForwardLeaseReadResponse) String() string {
 func (*ForwardLeaseReadResponse) ProtoMessage() {}
 
 func (x *ForwardLeaseReadResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_proto_msgTypes[8]
+	mi := &file_internal_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -864,7 +1098,7 @@ func (x *ForwardLeaseReadResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ForwardLeaseReadResponse.ProtoReflect.Descriptor instead.
 func (*ForwardLeaseReadResponse) Descriptor() ([]byte, []int) {
-	return file_internal_proto_rawDescGZIP(), []int{8}
+	return file_internal_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *ForwardLeaseReadResponse) GetAppliedIndex() uint64 {
@@ -892,7 +1126,7 @@ type PrepareEvidenceStateRequest struct {
 
 func (x *PrepareEvidenceStateRequest) Reset() {
 	*x = PrepareEvidenceStateRequest{}
-	mi := &file_internal_proto_msgTypes[9]
+	mi := &file_internal_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -904,7 +1138,7 @@ func (x *PrepareEvidenceStateRequest) String() string {
 func (*PrepareEvidenceStateRequest) ProtoMessage() {}
 
 func (x *PrepareEvidenceStateRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_proto_msgTypes[9]
+	mi := &file_internal_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -917,7 +1151,7 @@ func (x *PrepareEvidenceStateRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PrepareEvidenceStateRequest.ProtoReflect.Descriptor instead.
 func (*PrepareEvidenceStateRequest) Descriptor() ([]byte, []int) {
-	return file_internal_proto_rawDescGZIP(), []int{9}
+	return file_internal_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *PrepareEvidenceStateRequest) GetFloor() uint64 {
@@ -949,7 +1183,7 @@ type PrepareEvidenceStateResponse struct {
 
 func (x *PrepareEvidenceStateResponse) Reset() {
 	*x = PrepareEvidenceStateResponse{}
-	mi := &file_internal_proto_msgTypes[10]
+	mi := &file_internal_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -961,7 +1195,7 @@ func (x *PrepareEvidenceStateResponse) String() string {
 func (*PrepareEvidenceStateResponse) ProtoMessage() {}
 
 func (x *PrepareEvidenceStateResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_proto_msgTypes[10]
+	mi := &file_internal_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -974,7 +1208,7 @@ func (x *PrepareEvidenceStateResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PrepareEvidenceStateResponse.ProtoReflect.Descriptor instead.
 func (*PrepareEvidenceStateResponse) Descriptor() ([]byte, []int) {
-	return file_internal_proto_rawDescGZIP(), []int{10}
+	return file_internal_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *PrepareEvidenceStateResponse) GetSupported() bool {
@@ -1036,7 +1270,7 @@ type RelayPublishRequest struct {
 
 func (x *RelayPublishRequest) Reset() {
 	*x = RelayPublishRequest{}
-	mi := &file_internal_proto_msgTypes[11]
+	mi := &file_internal_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1048,7 +1282,7 @@ func (x *RelayPublishRequest) String() string {
 func (*RelayPublishRequest) ProtoMessage() {}
 
 func (x *RelayPublishRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_proto_msgTypes[11]
+	mi := &file_internal_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1061,7 +1295,7 @@ func (x *RelayPublishRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RelayPublishRequest.ProtoReflect.Descriptor instead.
 func (*RelayPublishRequest) Descriptor() ([]byte, []int) {
-	return file_internal_proto_rawDescGZIP(), []int{11}
+	return file_internal_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *RelayPublishRequest) GetChannel() []byte {
@@ -1087,7 +1321,7 @@ type RelayPublishResponse struct {
 
 func (x *RelayPublishResponse) Reset() {
 	*x = RelayPublishResponse{}
-	mi := &file_internal_proto_msgTypes[12]
+	mi := &file_internal_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1099,7 +1333,7 @@ func (x *RelayPublishResponse) String() string {
 func (*RelayPublishResponse) ProtoMessage() {}
 
 func (x *RelayPublishResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_proto_msgTypes[12]
+	mi := &file_internal_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1112,7 +1346,7 @@ func (x *RelayPublishResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RelayPublishResponse.ProtoReflect.Descriptor instead.
 func (*RelayPublishResponse) Descriptor() ([]byte, []int) {
-	return file_internal_proto_rawDescGZIP(), []int{12}
+	return file_internal_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *RelayPublishResponse) GetSubscribers() int64 {
@@ -1148,7 +1382,7 @@ type ExportRangeVersionsRequest struct {
 
 func (x *ExportRangeVersionsRequest) Reset() {
 	*x = ExportRangeVersionsRequest{}
-	mi := &file_internal_proto_msgTypes[13]
+	mi := &file_internal_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1160,7 +1394,7 @@ func (x *ExportRangeVersionsRequest) String() string {
 func (*ExportRangeVersionsRequest) ProtoMessage() {}
 
 func (x *ExportRangeVersionsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_proto_msgTypes[13]
+	mi := &file_internal_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1173,7 +1407,7 @@ func (x *ExportRangeVersionsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExportRangeVersionsRequest.ProtoReflect.Descriptor instead.
 func (*ExportRangeVersionsRequest) Descriptor() ([]byte, []int) {
-	return file_internal_proto_rawDescGZIP(), []int{13}
+	return file_internal_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *ExportRangeVersionsRequest) GetRangeStart() []byte {
@@ -1271,7 +1505,7 @@ type ExportRangeVersionsResponse struct {
 
 func (x *ExportRangeVersionsResponse) Reset() {
 	*x = ExportRangeVersionsResponse{}
-	mi := &file_internal_proto_msgTypes[14]
+	mi := &file_internal_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1283,7 +1517,7 @@ func (x *ExportRangeVersionsResponse) String() string {
 func (*ExportRangeVersionsResponse) ProtoMessage() {}
 
 func (x *ExportRangeVersionsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_proto_msgTypes[14]
+	mi := &file_internal_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1296,7 +1530,7 @@ func (x *ExportRangeVersionsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExportRangeVersionsResponse.ProtoReflect.Descriptor instead.
 func (*ExportRangeVersionsResponse) Descriptor() ([]byte, []int) {
-	return file_internal_proto_rawDescGZIP(), []int{14}
+	return file_internal_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *ExportRangeVersionsResponse) GetVersions() []*MVCCVersion {
@@ -1334,7 +1568,7 @@ type MVCCVersion struct {
 
 func (x *MVCCVersion) Reset() {
 	*x = MVCCVersion{}
-	mi := &file_internal_proto_msgTypes[15]
+	mi := &file_internal_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1346,7 +1580,7 @@ func (x *MVCCVersion) String() string {
 func (*MVCCVersion) ProtoMessage() {}
 
 func (x *MVCCVersion) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_proto_msgTypes[15]
+	mi := &file_internal_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1359,7 +1593,7 @@ func (x *MVCCVersion) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MVCCVersion.ProtoReflect.Descriptor instead.
 func (*MVCCVersion) Descriptor() ([]byte, []int) {
-	return file_internal_proto_rawDescGZIP(), []int{15}
+	return file_internal_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *MVCCVersion) GetKey() []byte {
@@ -1417,7 +1651,7 @@ type ImportRangeVersionsRequest struct {
 
 func (x *ImportRangeVersionsRequest) Reset() {
 	*x = ImportRangeVersionsRequest{}
-	mi := &file_internal_proto_msgTypes[16]
+	mi := &file_internal_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1429,7 +1663,7 @@ func (x *ImportRangeVersionsRequest) String() string {
 func (*ImportRangeVersionsRequest) ProtoMessage() {}
 
 func (x *ImportRangeVersionsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_proto_msgTypes[16]
+	mi := &file_internal_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1442,7 +1676,7 @@ func (x *ImportRangeVersionsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ImportRangeVersionsRequest.ProtoReflect.Descriptor instead.
 func (*ImportRangeVersionsRequest) Descriptor() ([]byte, []int) {
-	return file_internal_proto_rawDescGZIP(), []int{16}
+	return file_internal_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *ImportRangeVersionsRequest) GetJobId() uint64 {
@@ -1494,7 +1728,7 @@ type ImportRangeVersionsResponse struct {
 
 func (x *ImportRangeVersionsResponse) Reset() {
 	*x = ImportRangeVersionsResponse{}
-	mi := &file_internal_proto_msgTypes[17]
+	mi := &file_internal_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1506,7 +1740,7 @@ func (x *ImportRangeVersionsResponse) String() string {
 func (*ImportRangeVersionsResponse) ProtoMessage() {}
 
 func (x *ImportRangeVersionsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_proto_msgTypes[17]
+	mi := &file_internal_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1519,7 +1753,7 @@ func (x *ImportRangeVersionsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ImportRangeVersionsResponse.ProtoReflect.Descriptor instead.
 func (*ImportRangeVersionsResponse) Descriptor() ([]byte, []int) {
-	return file_internal_proto_rawDescGZIP(), []int{17}
+	return file_internal_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *ImportRangeVersionsResponse) GetAckedCursor() []byte {
@@ -1549,7 +1783,7 @@ type PromoteStagedVersionsRequest struct {
 
 func (x *PromoteStagedVersionsRequest) Reset() {
 	*x = PromoteStagedVersionsRequest{}
-	mi := &file_internal_proto_msgTypes[18]
+	mi := &file_internal_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1561,7 +1795,7 @@ func (x *PromoteStagedVersionsRequest) String() string {
 func (*PromoteStagedVersionsRequest) ProtoMessage() {}
 
 func (x *PromoteStagedVersionsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_proto_msgTypes[18]
+	mi := &file_internal_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1574,7 +1808,7 @@ func (x *PromoteStagedVersionsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PromoteStagedVersionsRequest.ProtoReflect.Descriptor instead.
 func (*PromoteStagedVersionsRequest) Descriptor() ([]byte, []int) {
-	return file_internal_proto_rawDescGZIP(), []int{18}
+	return file_internal_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *PromoteStagedVersionsRequest) GetJobId() uint64 {
@@ -1624,7 +1858,7 @@ type PromoteStagedVersionsResponse struct {
 
 func (x *PromoteStagedVersionsResponse) Reset() {
 	*x = PromoteStagedVersionsResponse{}
-	mi := &file_internal_proto_msgTypes[19]
+	mi := &file_internal_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1636,7 +1870,7 @@ func (x *PromoteStagedVersionsResponse) String() string {
 func (*PromoteStagedVersionsResponse) ProtoMessage() {}
 
 func (x *PromoteStagedVersionsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_proto_msgTypes[19]
+	mi := &file_internal_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1649,7 +1883,7 @@ func (x *PromoteStagedVersionsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PromoteStagedVersionsResponse.ProtoReflect.Descriptor instead.
 func (*PromoteStagedVersionsResponse) Descriptor() ([]byte, []int) {
-	return file_internal_proto_rawDescGZIP(), []int{19}
+	return file_internal_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *PromoteStagedVersionsResponse) GetNextCursor() []byte {
@@ -1706,7 +1940,7 @@ type TargetStagedReadinessRequest struct {
 
 func (x *TargetStagedReadinessRequest) Reset() {
 	*x = TargetStagedReadinessRequest{}
-	mi := &file_internal_proto_msgTypes[20]
+	mi := &file_internal_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1718,7 +1952,7 @@ func (x *TargetStagedReadinessRequest) String() string {
 func (*TargetStagedReadinessRequest) ProtoMessage() {}
 
 func (x *TargetStagedReadinessRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_proto_msgTypes[20]
+	mi := &file_internal_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1731,7 +1965,7 @@ func (x *TargetStagedReadinessRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TargetStagedReadinessRequest.ProtoReflect.Descriptor instead.
 func (*TargetStagedReadinessRequest) Descriptor() ([]byte, []int) {
-	return file_internal_proto_rawDescGZIP(), []int{20}
+	return file_internal_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *TargetStagedReadinessRequest) GetJobId() uint64 {
@@ -1848,7 +2082,7 @@ type TargetStagedReadinessResponse struct {
 
 func (x *TargetStagedReadinessResponse) Reset() {
 	*x = TargetStagedReadinessResponse{}
-	mi := &file_internal_proto_msgTypes[21]
+	mi := &file_internal_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1860,7 +2094,7 @@ func (x *TargetStagedReadinessResponse) String() string {
 func (*TargetStagedReadinessResponse) ProtoMessage() {}
 
 func (x *TargetStagedReadinessResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_proto_msgTypes[21]
+	mi := &file_internal_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1873,7 +2107,7 @@ func (x *TargetStagedReadinessResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TargetStagedReadinessResponse.ProtoReflect.Descriptor instead.
 func (*TargetStagedReadinessResponse) Descriptor() ([]byte, []int) {
-	return file_internal_proto_rawDescGZIP(), []int{21}
+	return file_internal_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *TargetStagedReadinessResponse) GetMinAdmittedTs() uint64 {
@@ -1894,7 +2128,7 @@ type ProbeMigrationLocksRequest struct {
 
 func (x *ProbeMigrationLocksRequest) Reset() {
 	*x = ProbeMigrationLocksRequest{}
-	mi := &file_internal_proto_msgTypes[22]
+	mi := &file_internal_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1906,7 +2140,7 @@ func (x *ProbeMigrationLocksRequest) String() string {
 func (*ProbeMigrationLocksRequest) ProtoMessage() {}
 
 func (x *ProbeMigrationLocksRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_proto_msgTypes[22]
+	mi := &file_internal_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1919,7 +2153,7 @@ func (x *ProbeMigrationLocksRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ProbeMigrationLocksRequest.ProtoReflect.Descriptor instead.
 func (*ProbeMigrationLocksRequest) Descriptor() ([]byte, []int) {
-	return file_internal_proto_rawDescGZIP(), []int{22}
+	return file_internal_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *ProbeMigrationLocksRequest) GetRouteStart() []byte {
@@ -1952,7 +2186,7 @@ type ProbeMigrationLocksResponse struct {
 
 func (x *ProbeMigrationLocksResponse) Reset() {
 	*x = ProbeMigrationLocksResponse{}
-	mi := &file_internal_proto_msgTypes[23]
+	mi := &file_internal_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1964,7 +2198,7 @@ func (x *ProbeMigrationLocksResponse) String() string {
 func (*ProbeMigrationLocksResponse) ProtoMessage() {}
 
 func (x *ProbeMigrationLocksResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_proto_msgTypes[23]
+	mi := &file_internal_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1977,7 +2211,7 @@ func (x *ProbeMigrationLocksResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ProbeMigrationLocksResponse.ProtoReflect.Descriptor instead.
 func (*ProbeMigrationLocksResponse) Descriptor() ([]byte, []int) {
-	return file_internal_proto_rawDescGZIP(), []int{23}
+	return file_internal_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *ProbeMigrationLocksResponse) GetPendingCount() uint32 {
@@ -2010,7 +2244,7 @@ type MigrationOwnershipProof struct {
 
 func (x *MigrationOwnershipProof) Reset() {
 	*x = MigrationOwnershipProof{}
-	mi := &file_internal_proto_msgTypes[24]
+	mi := &file_internal_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2022,7 +2256,7 @@ func (x *MigrationOwnershipProof) String() string {
 func (*MigrationOwnershipProof) ProtoMessage() {}
 
 func (x *MigrationOwnershipProof) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_proto_msgTypes[24]
+	mi := &file_internal_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2035,7 +2269,7 @@ func (x *MigrationOwnershipProof) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MigrationOwnershipProof.ProtoReflect.Descriptor instead.
 func (*MigrationOwnershipProof) Descriptor() ([]byte, []int) {
-	return file_internal_proto_rawDescGZIP(), []int{24}
+	return file_internal_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *MigrationOwnershipProof) GetGeneration() string {
@@ -2177,7 +2411,7 @@ type CleanupMigrationRequest struct {
 
 func (x *CleanupMigrationRequest) Reset() {
 	*x = CleanupMigrationRequest{}
-	mi := &file_internal_proto_msgTypes[25]
+	mi := &file_internal_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2189,7 +2423,7 @@ func (x *CleanupMigrationRequest) String() string {
 func (*CleanupMigrationRequest) ProtoMessage() {}
 
 func (x *CleanupMigrationRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_proto_msgTypes[25]
+	mi := &file_internal_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2202,7 +2436,7 @@ func (x *CleanupMigrationRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CleanupMigrationRequest.ProtoReflect.Descriptor instead.
 func (*CleanupMigrationRequest) Descriptor() ([]byte, []int) {
-	return file_internal_proto_rawDescGZIP(), []int{25}
+	return file_internal_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *CleanupMigrationRequest) GetJobId() uint64 {
@@ -2365,7 +2599,7 @@ type CleanupMigrationResponse struct {
 
 func (x *CleanupMigrationResponse) Reset() {
 	*x = CleanupMigrationResponse{}
-	mi := &file_internal_proto_msgTypes[26]
+	mi := &file_internal_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2377,7 +2611,7 @@ func (x *CleanupMigrationResponse) String() string {
 func (*CleanupMigrationResponse) ProtoMessage() {}
 
 func (x *CleanupMigrationResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_proto_msgTypes[26]
+	mi := &file_internal_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2390,7 +2624,7 @@ func (x *CleanupMigrationResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CleanupMigrationResponse.ProtoReflect.Descriptor instead.
 func (*CleanupMigrationResponse) Descriptor() ([]byte, []int) {
-	return file_internal_proto_rawDescGZIP(), []int{26}
+	return file_internal_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *CleanupMigrationResponse) GetNextCursor() []byte {
@@ -2458,7 +2692,7 @@ type ProbeMigrationStateRequest struct {
 
 func (x *ProbeMigrationStateRequest) Reset() {
 	*x = ProbeMigrationStateRequest{}
-	mi := &file_internal_proto_msgTypes[27]
+	mi := &file_internal_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2470,7 +2704,7 @@ func (x *ProbeMigrationStateRequest) String() string {
 func (*ProbeMigrationStateRequest) ProtoMessage() {}
 
 func (x *ProbeMigrationStateRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_proto_msgTypes[27]
+	mi := &file_internal_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2483,7 +2717,7 @@ func (x *ProbeMigrationStateRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ProbeMigrationStateRequest.ProtoReflect.Descriptor instead.
 func (*ProbeMigrationStateRequest) Descriptor() ([]byte, []int) {
-	return file_internal_proto_rawDescGZIP(), []int{27}
+	return file_internal_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *ProbeMigrationStateRequest) GetJobId() uint64 {
@@ -2643,7 +2877,7 @@ type ProbeMigrationStateResponse struct {
 
 func (x *ProbeMigrationStateResponse) Reset() {
 	*x = ProbeMigrationStateResponse{}
-	mi := &file_internal_proto_msgTypes[28]
+	mi := &file_internal_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2655,7 +2889,7 @@ func (x *ProbeMigrationStateResponse) String() string {
 func (*ProbeMigrationStateResponse) ProtoMessage() {}
 
 func (x *ProbeMigrationStateResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_proto_msgTypes[28]
+	mi := &file_internal_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2668,7 +2902,7 @@ func (x *ProbeMigrationStateResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ProbeMigrationStateResponse.ProtoReflect.Descriptor instead.
 func (*ProbeMigrationStateResponse) Descriptor() ([]byte, []int) {
-	return file_internal_proto_rawDescGZIP(), []int{28}
+	return file_internal_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *ProbeMigrationStateResponse) GetReady() bool {
@@ -2763,7 +2997,7 @@ type IssueMigrationTimestampRequest struct {
 
 func (x *IssueMigrationTimestampRequest) Reset() {
 	*x = IssueMigrationTimestampRequest{}
-	mi := &file_internal_proto_msgTypes[29]
+	mi := &file_internal_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2775,7 +3009,7 @@ func (x *IssueMigrationTimestampRequest) String() string {
 func (*IssueMigrationTimestampRequest) ProtoMessage() {}
 
 func (x *IssueMigrationTimestampRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_proto_msgTypes[29]
+	mi := &file_internal_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2788,7 +3022,7 @@ func (x *IssueMigrationTimestampRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use IssueMigrationTimestampRequest.ProtoReflect.Descriptor instead.
 func (*IssueMigrationTimestampRequest) Descriptor() ([]byte, []int) {
-	return file_internal_proto_rawDescGZIP(), []int{29}
+	return file_internal_proto_rawDescGZIP(), []int{30}
 }
 
 type IssueMigrationTimestampResponse struct {
@@ -2801,7 +3035,7 @@ type IssueMigrationTimestampResponse struct {
 
 func (x *IssueMigrationTimestampResponse) Reset() {
 	*x = IssueMigrationTimestampResponse{}
-	mi := &file_internal_proto_msgTypes[30]
+	mi := &file_internal_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2813,7 +3047,7 @@ func (x *IssueMigrationTimestampResponse) String() string {
 func (*IssueMigrationTimestampResponse) ProtoMessage() {}
 
 func (x *IssueMigrationTimestampResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_proto_msgTypes[30]
+	mi := &file_internal_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2826,7 +3060,7 @@ func (x *IssueMigrationTimestampResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use IssueMigrationTimestampResponse.ProtoReflect.Descriptor instead.
 func (*IssueMigrationTimestampResponse) Descriptor() ([]byte, []int) {
-	return file_internal_proto_rawDescGZIP(), []int{30}
+	return file_internal_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *IssueMigrationTimestampResponse) GetTimestamp() uint64 {
@@ -2872,7 +3106,12 @@ const file_internal_proto_rawDesc = "" +
 	"\x0fForwardResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12!\n" +
 	"\fcommit_index\x18\x02 \x01(\x04R\vcommitIndex\x12\x1b\n" +
-	"\tcommit_ts\x18\x03 \x01(\x04R\bcommitTs\"X\n" +
+	"\tcommit_ts\x18\x03 \x01(\x04R\bcommitTs\"\xcb\x01\n" +
+	"\x14ForwardFailureDetail\x12%\n" +
+	"\x0eschema_version\x18\x01 \x01(\rR\rschemaVersion\x12*\n" +
+	"\x05phase\x18\x02 \x01(\x0e2\x14.ForwardFailurePhaseR\x05phase\x12-\n" +
+	"\x06reason\x18\x03 \x01(\x0e2\x15.ForwardFailureReasonR\x06reason\x121\n" +
+	"\bdecision\x18\x04 \x01(\x0e2\x15.ForwardDecisionClassR\bdecision\"X\n" +
 	"\x1bForwardAdminProposalRequest\x12\x18\n" +
 	"\apayload\x18\x01 \x01(\fR\apayload\x12\x1f\n" +
 	"\vforce_entry\x18\x02 \x01(\bR\n" +
@@ -3083,7 +3322,25 @@ const file_internal_proto_rawDesc = "" +
 	"\aPREPARE\x10\x01\x12\n" +
 	"\n" +
 	"\x06COMMIT\x10\x02\x12\t\n" +
-	"\x05ABORT\x10\x03*\xa5\x03\n" +
+	"\x05ABORT\x10\x03*\xcd\x01\n" +
+	"\x13ForwardFailurePhase\x12%\n" +
+	"!FORWARD_FAILURE_PHASE_UNSPECIFIED\x10\x00\x12)\n" +
+	"%FORWARD_FAILURE_PHASE_ONE_PHASE_APPLY\x10\x01\x12!\n" +
+	"\x1dFORWARD_FAILURE_PHASE_PREPARE\x10\x02\x12 \n" +
+	"\x1cFORWARD_FAILURE_PHASE_COMMIT\x10\x03\x12\x1f\n" +
+	"\x1bFORWARD_FAILURE_PHASE_ABORT\x10\x04*\xf7\x01\n" +
+	"\x14ForwardFailureReason\x12&\n" +
+	"\"FORWARD_FAILURE_REASON_UNSPECIFIED\x10\x00\x12#\n" +
+	"\x1fFORWARD_FAILURE_REASON_CONFLICT\x10\x01\x12 \n" +
+	"\x1cFORWARD_FAILURE_REASON_FENCE\x10\x02\x12$\n" +
+	" FORWARD_FAILURE_REASON_NO_LEADER\x10\x03\x12&\n" +
+	"\"FORWARD_FAILURE_REASON_INTERRUPTED\x10\x04\x12\"\n" +
+	"\x1eFORWARD_FAILURE_REASON_ABORTED\x10\x05*\xd2\x01\n" +
+	"\x14ForwardDecisionClass\x12&\n" +
+	"\"FORWARD_DECISION_CLASS_UNSPECIFIED\x10\x00\x125\n" +
+	"1FORWARD_DECISION_CLASS_REJECTED_BEFORE_SUBMISSION\x10\x01\x12/\n" +
+	"+FORWARD_DECISION_CLASS_DEFINITIVELY_ABORTED\x10\x02\x12*\n" +
+	"&FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN\x10\x03*\xa5\x03\n" +
 	"\x14MigrationCleanupMode\x12&\n" +
 	"\"MIGRATION_CLEANUP_MODE_UNSPECIFIED\x10\x00\x12#\n" +
 	"\x1fMIGRATION_CLEANUP_MODE_VERSIONS\x10\x01\x12#\n" +
@@ -3138,91 +3395,98 @@ func file_internal_proto_rawDescGZIP() []byte {
 	return file_internal_proto_rawDescData
 }
 
-var file_internal_proto_enumTypes = make([]protoimpl.EnumInfo, 5)
-var file_internal_proto_msgTypes = make([]protoimpl.MessageInfo, 31)
+var file_internal_proto_enumTypes = make([]protoimpl.EnumInfo, 8)
+var file_internal_proto_msgTypes = make([]protoimpl.MessageInfo, 32)
 var file_internal_proto_goTypes = []any{
 	(Op)(0),                                 // 0: Op
 	(Phase)(0),                              // 1: Phase
-	(MigrationCleanupMode)(0),               // 2: MigrationCleanupMode
-	(MigrationOwnershipRole)(0),             // 3: MigrationOwnershipRole
-	(MigrationStateProbeKind)(0),            // 4: MigrationStateProbeKind
-	(*Mutation)(nil),                        // 5: Mutation
-	(*Request)(nil),                         // 6: Request
-	(*RaftCommand)(nil),                     // 7: RaftCommand
-	(*ForwardRequest)(nil),                  // 8: ForwardRequest
-	(*ForwardResponse)(nil),                 // 9: ForwardResponse
-	(*ForwardAdminProposalRequest)(nil),     // 10: ForwardAdminProposalRequest
-	(*ForwardAdminProposalResponse)(nil),    // 11: ForwardAdminProposalResponse
-	(*ForwardLeaseReadRequest)(nil),         // 12: ForwardLeaseReadRequest
-	(*ForwardLeaseReadResponse)(nil),        // 13: ForwardLeaseReadResponse
-	(*PrepareEvidenceStateRequest)(nil),     // 14: PrepareEvidenceStateRequest
-	(*PrepareEvidenceStateResponse)(nil),    // 15: PrepareEvidenceStateResponse
-	(*RelayPublishRequest)(nil),             // 16: RelayPublishRequest
-	(*RelayPublishResponse)(nil),            // 17: RelayPublishResponse
-	(*ExportRangeVersionsRequest)(nil),      // 18: ExportRangeVersionsRequest
-	(*ExportRangeVersionsResponse)(nil),     // 19: ExportRangeVersionsResponse
-	(*MVCCVersion)(nil),                     // 20: MVCCVersion
-	(*ImportRangeVersionsRequest)(nil),      // 21: ImportRangeVersionsRequest
-	(*ImportRangeVersionsResponse)(nil),     // 22: ImportRangeVersionsResponse
-	(*PromoteStagedVersionsRequest)(nil),    // 23: PromoteStagedVersionsRequest
-	(*PromoteStagedVersionsResponse)(nil),   // 24: PromoteStagedVersionsResponse
-	(*TargetStagedReadinessRequest)(nil),    // 25: TargetStagedReadinessRequest
-	(*TargetStagedReadinessResponse)(nil),   // 26: TargetStagedReadinessResponse
-	(*ProbeMigrationLocksRequest)(nil),      // 27: ProbeMigrationLocksRequest
-	(*ProbeMigrationLocksResponse)(nil),     // 28: ProbeMigrationLocksResponse
-	(*MigrationOwnershipProof)(nil),         // 29: MigrationOwnershipProof
-	(*CleanupMigrationRequest)(nil),         // 30: CleanupMigrationRequest
-	(*CleanupMigrationResponse)(nil),        // 31: CleanupMigrationResponse
-	(*ProbeMigrationStateRequest)(nil),      // 32: ProbeMigrationStateRequest
-	(*ProbeMigrationStateResponse)(nil),     // 33: ProbeMigrationStateResponse
-	(*IssueMigrationTimestampRequest)(nil),  // 34: IssueMigrationTimestampRequest
-	(*IssueMigrationTimestampResponse)(nil), // 35: IssueMigrationTimestampResponse
+	(ForwardFailurePhase)(0),                // 2: ForwardFailurePhase
+	(ForwardFailureReason)(0),               // 3: ForwardFailureReason
+	(ForwardDecisionClass)(0),               // 4: ForwardDecisionClass
+	(MigrationCleanupMode)(0),               // 5: MigrationCleanupMode
+	(MigrationOwnershipRole)(0),             // 6: MigrationOwnershipRole
+	(MigrationStateProbeKind)(0),            // 7: MigrationStateProbeKind
+	(*Mutation)(nil),                        // 8: Mutation
+	(*Request)(nil),                         // 9: Request
+	(*RaftCommand)(nil),                     // 10: RaftCommand
+	(*ForwardRequest)(nil),                  // 11: ForwardRequest
+	(*ForwardResponse)(nil),                 // 12: ForwardResponse
+	(*ForwardFailureDetail)(nil),            // 13: ForwardFailureDetail
+	(*ForwardAdminProposalRequest)(nil),     // 14: ForwardAdminProposalRequest
+	(*ForwardAdminProposalResponse)(nil),    // 15: ForwardAdminProposalResponse
+	(*ForwardLeaseReadRequest)(nil),         // 16: ForwardLeaseReadRequest
+	(*ForwardLeaseReadResponse)(nil),        // 17: ForwardLeaseReadResponse
+	(*PrepareEvidenceStateRequest)(nil),     // 18: PrepareEvidenceStateRequest
+	(*PrepareEvidenceStateResponse)(nil),    // 19: PrepareEvidenceStateResponse
+	(*RelayPublishRequest)(nil),             // 20: RelayPublishRequest
+	(*RelayPublishResponse)(nil),            // 21: RelayPublishResponse
+	(*ExportRangeVersionsRequest)(nil),      // 22: ExportRangeVersionsRequest
+	(*ExportRangeVersionsResponse)(nil),     // 23: ExportRangeVersionsResponse
+	(*MVCCVersion)(nil),                     // 24: MVCCVersion
+	(*ImportRangeVersionsRequest)(nil),      // 25: ImportRangeVersionsRequest
+	(*ImportRangeVersionsResponse)(nil),     // 26: ImportRangeVersionsResponse
+	(*PromoteStagedVersionsRequest)(nil),    // 27: PromoteStagedVersionsRequest
+	(*PromoteStagedVersionsResponse)(nil),   // 28: PromoteStagedVersionsResponse
+	(*TargetStagedReadinessRequest)(nil),    // 29: TargetStagedReadinessRequest
+	(*TargetStagedReadinessResponse)(nil),   // 30: TargetStagedReadinessResponse
+	(*ProbeMigrationLocksRequest)(nil),      // 31: ProbeMigrationLocksRequest
+	(*ProbeMigrationLocksResponse)(nil),     // 32: ProbeMigrationLocksResponse
+	(*MigrationOwnershipProof)(nil),         // 33: MigrationOwnershipProof
+	(*CleanupMigrationRequest)(nil),         // 34: CleanupMigrationRequest
+	(*CleanupMigrationResponse)(nil),        // 35: CleanupMigrationResponse
+	(*ProbeMigrationStateRequest)(nil),      // 36: ProbeMigrationStateRequest
+	(*ProbeMigrationStateResponse)(nil),     // 37: ProbeMigrationStateResponse
+	(*IssueMigrationTimestampRequest)(nil),  // 38: IssueMigrationTimestampRequest
+	(*IssueMigrationTimestampResponse)(nil), // 39: IssueMigrationTimestampResponse
 }
 var file_internal_proto_depIdxs = []int32{
 	0,  // 0: Mutation.op:type_name -> Op
 	1,  // 1: Request.phase:type_name -> Phase
-	5,  // 2: Request.mutations:type_name -> Mutation
-	6,  // 3: RaftCommand.requests:type_name -> Request
-	6,  // 4: ForwardRequest.requests:type_name -> Request
-	20, // 5: ExportRangeVersionsResponse.versions:type_name -> MVCCVersion
-	20, // 6: ImportRangeVersionsRequest.versions:type_name -> MVCCVersion
-	3,  // 7: MigrationOwnershipProof.role:type_name -> MigrationOwnershipRole
-	2,  // 8: CleanupMigrationRequest.mode:type_name -> MigrationCleanupMode
-	29, // 9: CleanupMigrationRequest.ownership:type_name -> MigrationOwnershipProof
-	4,  // 10: ProbeMigrationStateRequest.kind:type_name -> MigrationStateProbeKind
-	29, // 11: ProbeMigrationStateRequest.ownership:type_name -> MigrationOwnershipProof
-	29, // 12: ProbeMigrationStateResponse.ownership:type_name -> MigrationOwnershipProof
-	8,  // 13: Internal.Forward:input_type -> ForwardRequest
-	10, // 14: Internal.ForwardAdminProposal:input_type -> ForwardAdminProposalRequest
-	12, // 15: Internal.ForwardLeaseRead:input_type -> ForwardLeaseReadRequest
-	14, // 16: Internal.GetPrepareEvidenceState:input_type -> PrepareEvidenceStateRequest
-	16, // 17: Internal.RelayPublish:input_type -> RelayPublishRequest
-	18, // 18: Internal.ExportRangeVersions:input_type -> ExportRangeVersionsRequest
-	21, // 19: Internal.ImportRangeVersions:input_type -> ImportRangeVersionsRequest
-	23, // 20: Internal.PromoteStagedVersions:input_type -> PromoteStagedVersionsRequest
-	25, // 21: Internal.ApplyTargetStagedReadiness:input_type -> TargetStagedReadinessRequest
-	27, // 22: Internal.ProbeMigrationLocks:input_type -> ProbeMigrationLocksRequest
-	30, // 23: Internal.CleanupMigration:input_type -> CleanupMigrationRequest
-	32, // 24: Internal.ProbeMigrationState:input_type -> ProbeMigrationStateRequest
-	34, // 25: Internal.IssueMigrationTimestamp:input_type -> IssueMigrationTimestampRequest
-	9,  // 26: Internal.Forward:output_type -> ForwardResponse
-	11, // 27: Internal.ForwardAdminProposal:output_type -> ForwardAdminProposalResponse
-	13, // 28: Internal.ForwardLeaseRead:output_type -> ForwardLeaseReadResponse
-	15, // 29: Internal.GetPrepareEvidenceState:output_type -> PrepareEvidenceStateResponse
-	17, // 30: Internal.RelayPublish:output_type -> RelayPublishResponse
-	19, // 31: Internal.ExportRangeVersions:output_type -> ExportRangeVersionsResponse
-	22, // 32: Internal.ImportRangeVersions:output_type -> ImportRangeVersionsResponse
-	24, // 33: Internal.PromoteStagedVersions:output_type -> PromoteStagedVersionsResponse
-	26, // 34: Internal.ApplyTargetStagedReadiness:output_type -> TargetStagedReadinessResponse
-	28, // 35: Internal.ProbeMigrationLocks:output_type -> ProbeMigrationLocksResponse
-	31, // 36: Internal.CleanupMigration:output_type -> CleanupMigrationResponse
-	33, // 37: Internal.ProbeMigrationState:output_type -> ProbeMigrationStateResponse
-	35, // 38: Internal.IssueMigrationTimestamp:output_type -> IssueMigrationTimestampResponse
-	26, // [26:39] is the sub-list for method output_type
-	13, // [13:26] is the sub-list for method input_type
-	13, // [13:13] is the sub-list for extension type_name
-	13, // [13:13] is the sub-list for extension extendee
-	0,  // [0:13] is the sub-list for field type_name
+	8,  // 2: Request.mutations:type_name -> Mutation
+	9,  // 3: RaftCommand.requests:type_name -> Request
+	9,  // 4: ForwardRequest.requests:type_name -> Request
+	2,  // 5: ForwardFailureDetail.phase:type_name -> ForwardFailurePhase
+	3,  // 6: ForwardFailureDetail.reason:type_name -> ForwardFailureReason
+	4,  // 7: ForwardFailureDetail.decision:type_name -> ForwardDecisionClass
+	24, // 8: ExportRangeVersionsResponse.versions:type_name -> MVCCVersion
+	24, // 9: ImportRangeVersionsRequest.versions:type_name -> MVCCVersion
+	6,  // 10: MigrationOwnershipProof.role:type_name -> MigrationOwnershipRole
+	5,  // 11: CleanupMigrationRequest.mode:type_name -> MigrationCleanupMode
+	33, // 12: CleanupMigrationRequest.ownership:type_name -> MigrationOwnershipProof
+	7,  // 13: ProbeMigrationStateRequest.kind:type_name -> MigrationStateProbeKind
+	33, // 14: ProbeMigrationStateRequest.ownership:type_name -> MigrationOwnershipProof
+	33, // 15: ProbeMigrationStateResponse.ownership:type_name -> MigrationOwnershipProof
+	11, // 16: Internal.Forward:input_type -> ForwardRequest
+	14, // 17: Internal.ForwardAdminProposal:input_type -> ForwardAdminProposalRequest
+	16, // 18: Internal.ForwardLeaseRead:input_type -> ForwardLeaseReadRequest
+	18, // 19: Internal.GetPrepareEvidenceState:input_type -> PrepareEvidenceStateRequest
+	20, // 20: Internal.RelayPublish:input_type -> RelayPublishRequest
+	22, // 21: Internal.ExportRangeVersions:input_type -> ExportRangeVersionsRequest
+	25, // 22: Internal.ImportRangeVersions:input_type -> ImportRangeVersionsRequest
+	27, // 23: Internal.PromoteStagedVersions:input_type -> PromoteStagedVersionsRequest
+	29, // 24: Internal.ApplyTargetStagedReadiness:input_type -> TargetStagedReadinessRequest
+	31, // 25: Internal.ProbeMigrationLocks:input_type -> ProbeMigrationLocksRequest
+	34, // 26: Internal.CleanupMigration:input_type -> CleanupMigrationRequest
+	36, // 27: Internal.ProbeMigrationState:input_type -> ProbeMigrationStateRequest
+	38, // 28: Internal.IssueMigrationTimestamp:input_type -> IssueMigrationTimestampRequest
+	12, // 29: Internal.Forward:output_type -> ForwardResponse
+	15, // 30: Internal.ForwardAdminProposal:output_type -> ForwardAdminProposalResponse
+	17, // 31: Internal.ForwardLeaseRead:output_type -> ForwardLeaseReadResponse
+	19, // 32: Internal.GetPrepareEvidenceState:output_type -> PrepareEvidenceStateResponse
+	21, // 33: Internal.RelayPublish:output_type -> RelayPublishResponse
+	23, // 34: Internal.ExportRangeVersions:output_type -> ExportRangeVersionsResponse
+	26, // 35: Internal.ImportRangeVersions:output_type -> ImportRangeVersionsResponse
+	28, // 36: Internal.PromoteStagedVersions:output_type -> PromoteStagedVersionsResponse
+	30, // 37: Internal.ApplyTargetStagedReadiness:output_type -> TargetStagedReadinessResponse
+	32, // 38: Internal.ProbeMigrationLocks:output_type -> ProbeMigrationLocksResponse
+	35, // 39: Internal.CleanupMigration:output_type -> CleanupMigrationResponse
+	37, // 40: Internal.ProbeMigrationState:output_type -> ProbeMigrationStateResponse
+	39, // 41: Internal.IssueMigrationTimestamp:output_type -> IssueMigrationTimestampResponse
+	29, // [29:42] is the sub-list for method output_type
+	16, // [16:29] is the sub-list for method input_type
+	16, // [16:16] is the sub-list for extension type_name
+	16, // [16:16] is the sub-list for extension extendee
+	0,  // [0:16] is the sub-list for field type_name
 }
 
 func init() { file_internal_proto_init() }
@@ -3235,8 +3499,8 @@ func file_internal_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_internal_proto_rawDesc), len(file_internal_proto_rawDesc)),
-			NumEnums:      5,
-			NumMessages:   31,
+			NumEnums:      8,
+			NumMessages:   32,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

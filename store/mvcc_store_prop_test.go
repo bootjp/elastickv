@@ -12,6 +12,7 @@ import (
 var nonEmptyBytes = rapid.SliceOf(rapid.Byte()).Filter(func(b []byte) bool { return len(b) > 0 })
 
 func TestMVCCStore_Property_PutGet(t *testing.T) {
+	t.Parallel()
 	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
 		s := newStore(t)
 		var iteration uint64
@@ -52,6 +53,7 @@ func TestMVCCStore_Property_PutGet(t *testing.T) {
 }
 
 func TestMVCCStore_Property_Delete(t *testing.T) {
+	t.Parallel()
 	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
 		s := newStore(t)
 		var iteration uint64

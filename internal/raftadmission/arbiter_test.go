@@ -65,6 +65,7 @@ func loadAdmissionCatalog(t *testing.T, a *Arbiter) {
 }
 
 func TestAdmissionStagesAndExactPayload(t *testing.T) {
+	t.Parallel()
 	a := newAdmission(t, false)
 	require.Equal(t, peersession.ControlReady, a.Stage(1))
 	_, _, err := a.Begin(t.Context(), Data)
@@ -88,6 +89,7 @@ func TestAdmissionStagesAndExactPayload(t *testing.T) {
 }
 
 func TestAdmissionTermChangeRetiresQueuedOperationAndPeer(t *testing.T) {
+	t.Parallel()
 	a := newAdmission(t, false)
 	loadAdmissionCatalog(t, a)
 	ctx, op, err := a.Begin(t.Context(), Data)
@@ -110,6 +112,7 @@ func TestAdmissionTermChangeRetiresQueuedOperationAndPeer(t *testing.T) {
 }
 
 func TestAdmissionDirectReadIsRevokedBeforeTargetRouting(t *testing.T) {
+	t.Parallel()
 	a := newAdmission(t, false)
 	loadAdmissionCatalog(t, a)
 	ctx, op, err := a.Begin(t.Context(), Data)
@@ -132,6 +135,7 @@ func TestAdmissionDirectReadIsRevokedBeforeTargetRouting(t *testing.T) {
 }
 
 func TestAdmissionDefaultTermRevokesPermissionAndCatalogReceipt(t *testing.T) {
+	t.Parallel()
 	a := newAdmission(t, false)
 	loadAdmissionCatalog(t, a)
 	old, err := a.Ticket(1)
@@ -149,6 +153,7 @@ func TestAdmissionDefaultTermRevokesPermissionAndCatalogReceipt(t *testing.T) {
 }
 
 func TestAdmissionRetiredChildrenJoinBeforeReadiness(t *testing.T) {
+	t.Parallel()
 	a := newAdmission(t, false)
 	loadAdmissionCatalog(t, a)
 	_, op, err := a.Begin(t.Context(), Maintenance)
@@ -177,6 +182,7 @@ func TestAdmissionRetiredChildrenJoinBeforeReadiness(t *testing.T) {
 }
 
 func TestAdmissionCancellationAndFatalRemainClosed(t *testing.T) {
+	t.Parallel()
 	a := newAdmission(t, false)
 	loadAdmissionCatalog(t, a)
 	parent, cancel := context.WithCancel(t.Context())
@@ -193,6 +199,7 @@ func TestAdmissionCancellationAndFatalRemainClosed(t *testing.T) {
 }
 
 func TestAdmissionRequestedRotationIsNotNotRequested(t *testing.T) {
+	t.Parallel()
 	a := newAdmission(t, true)
 	loadAdmissionCatalog(t, a)
 	require.Equal(t, peersession.IdentityReady, a.Stage(1))

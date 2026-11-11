@@ -31,6 +31,7 @@ func codecPropertyNamespaceState(t *rapid.T) MigrationNamespaceConfiguration {
 }
 
 func TestMigrationCodecPropertyNamespaceRoundTrip(t *testing.T) {
+	t.Parallel()
 	rapid.Check(t, func(t *rapid.T) {
 		legacy := MigrationNamespaceConfiguration{Index: rapid.Uint64Range(1, ^uint64(0)).Draw(t, "legacy index")}
 		active := codecPropertyNamespaceState(t)
@@ -65,6 +66,7 @@ func TestMigrationCodecPropertyNamespaceRoundTrip(t *testing.T) {
 }
 
 func TestMigrationCodecPropertyNamespaceRejectsMalformed(t *testing.T) {
+	t.Parallel()
 	rapid.Check(t, func(t *rapid.T) {
 		state := codecPropertyNamespaceState(t)
 		mutations := []struct {

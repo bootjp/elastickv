@@ -17,6 +17,7 @@ func identityFixture() *WALIdentity {
 }
 
 func TestNativeWALIdentityRoundTrip(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	wdir, sdir, fdir := filepath.Join(dir, "wal"), filepath.Join(dir, "snap"), filepath.Join(dir, "fsm")
 	id := identityFixture()
@@ -51,6 +52,7 @@ func TestNativeWALIdentityRoundTrip(t *testing.T) {
 }
 
 func TestNativeWALRejectsMissingOrCorruptMetadata(t *testing.T) {
+	t.Parallel()
 	canonical, err := encodeWALIdentity(identityFixture())
 	require.NoError(t, err)
 	corrupt := append([]byte(nil), canonical...)
@@ -83,6 +85,7 @@ func stringSize(b []byte) string {
 }
 
 func TestProtectedWALConfigRejectsUnsafePaths(t *testing.T) {
+	t.Parallel()
 	id := identityFixture()
 	require.ErrorIs(t, validateNativeIdentityConfig(OpenConfig{NodeID: id.NodeID + 1, NativeIdentity: id}), ErrWALIdentity)
 	require.NoError(t, validateNativeIdentityConfig(OpenConfig{NodeID: id.NodeID, NativeIdentity: id}))

@@ -22,6 +22,7 @@ func controlFixture(t testing.TB) (hello, answer) {
 	return h, answer{Request: sha256.Sum256(b), Boot: Nonce{3}, Challenge: Nonce{4}, View: v}
 }
 func TestCanonicalControlRecordBoundaries(t *testing.T) {
+	t.Parallel()
 	h, a := controlFixture(t)
 	hb, err := encodeHello(h)
 	require.NoError(t, err)
@@ -83,6 +84,7 @@ func TestCanonicalControlRecordBoundaries(t *testing.T) {
 }
 
 func TestOwnerConfigAndZeroHandleDeny(t *testing.T) {
+	t.Parallel()
 	h, _ := controlFixture(t)
 	cfg := Config{Local: h.Client, Versions: h.View.Installed, Provisioned: []Provision{{Node: h.Client, Groups: []uint64{testGroup}}, {Node: h.Server, Groups: []uint64{testGroup}}}}
 	o, err := NewOwner(cfg)

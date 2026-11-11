@@ -52,6 +52,7 @@ func newStubLeaderEngine() *testEngine {
 var _ Coordinator = (*nopCoordinator)(nil)
 
 func TestSharedFakesPreserveFallbacks(t *testing.T) {
+	t.Parallel()
 	c := &nopCoordinator{}
 	require.True(t, c.IsLeader())
 	require.Same(t, c.Clock(), c.Clock())

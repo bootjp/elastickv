@@ -1,0 +1,18 @@
+# Initial creation only. Return to the base before admitting application writes.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../base
+patches:
+  - target:
+      group: apps
+      version: v1
+      kind: StatefulSet
+      name: elastickv
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: --raftBootstrap
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: --raftBootstrapMembers=elastickv-0=elastickv-0.elastickv-peer.$(POD_NAMESPACE).svc:50051,elastickv-1=elastickv-1.elastickv-peer.$(POD_NAMESPACE).svc:50051,elastickv-2=elastickv-2.elastickv-peer.$(POD_NAMESPACE).svc:50051

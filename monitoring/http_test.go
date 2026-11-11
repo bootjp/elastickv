@@ -10,6 +10,7 @@ import (
 )
 
 func TestAddressRequiresToken(t *testing.T) {
+	t.Parallel()
 	require.False(t, AddressRequiresToken("localhost:9090"))
 	require.False(t, AddressRequiresToken("127.0.0.1:9090"))
 	require.False(t, AddressRequiresToken("[::1]:9090"))
@@ -19,6 +20,7 @@ func TestAddressRequiresToken(t *testing.T) {
 }
 
 func TestProtectHandlerRequiresBearerToken(t *testing.T) {
+	t.Parallel()
 	protected := ProtectHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	}), "secret-token")

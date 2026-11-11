@@ -239,14 +239,14 @@ func TestSQSEncodeRejectsNonZeroPartitionOnClassicQueue(t *testing.T) {
 // TestSQSEncodeGateUsesRawPartitionCount is the regression for codex
 // P2 v914 v7. The four validation gates MUST use raw
 // meta.PartitionCount > 1 as the partitioned-queue predicate, never
-// effectivePartitionCount. A perQueue queue with PartitionCount=2
-// collapses effectivePartitionCount to 1; if the missing-partition
+// adapter.effectivePartitionCount. A perQueue queue with PartitionCount=2
+// collapses adapter.effectivePartitionCount to 1; if the missing-partition
 // gate used the effective count, a message with Partition==nil
 // would slip past validation and be staged as partition 0 without
 // proof that the decoder captured a partitioned-keyspace row.
 //
 // This test would silently pass if the gate predicate were changed
-// to effectivePartitionCount(&meta) > 1.
+// to the effective partition count > 1.
 func TestSQSEncodeGateUsesRawPartitionCount(t *testing.T) {
 	t.Parallel()
 	in := t.TempDir()
@@ -255,7 +255,7 @@ func TestSQSEncodeGateUsesRawPartitionCount(t *testing.T) {
 			`"visibility_timeout_seconds":30,"message_retention_seconds":345600,`+
 			`"delay_seconds":0,"partition_count":2,"fifo_throughput_limit":"perQueue"}`),
 		[][]byte{
-			// partition_count=2 + perQueue: effectivePartitionCount==1.
+			// partition_count=2 + perQueue: adapter.effectivePartitionCount==1.
 			// No "partition" field. Raw-PartitionCount gate must fire
 			// before the perQueue routing gate has a chance to inspect
 			// a nil Partition.
@@ -972,31 +972,3 @@ func TestSQSEncodePartitionedSortStableAcrossPartitions(t *testing.T) {
 }
 
 func u32ptr(v uint32) *uint32 { return &v }
-
-// TestSQSEffectivePartitionCount pins the local mirror of
-// adapter/sqs_keys_dispatch.go:effectivePartitionCount: nil meta,
-// PartitionCount<=1, and perQueue all collapse to 1; otherwise the
-// declared PartitionCount is returned.
-func TestSQSEffectivePartitionCount(t *testing.T) {
-	t.Parallel()
-	cases := []struct {
-		name string
-		meta *sqsQueueMetaPublic
-		want uint32
-	}{
-		{"nil meta", nil, 1},
-		{"PartitionCount=0", &sqsQueueMetaPublic{PartitionCount: 0}, 1},
-		{"PartitionCount=1", &sqsQueueMetaPublic{PartitionCount: 1}, 1},
-		{"PartitionCount=4 perQueue", &sqsQueueMetaPublic{PartitionCount: 4, FifoThroughputLimit: sqsFifoThroughputPerQueue}, 1},
-		{"PartitionCount=4 perGroup", &sqsQueueMetaPublic{PartitionCount: 4, FifoThroughputLimit: "perMessageGroupId"}, 4},
-		{"PartitionCount=4 unset throughput", &sqsQueueMetaPublic{PartitionCount: 4}, 4},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			t.Parallel()
-			if got := effectivePartitionCount(c.meta); got != c.want {
-				t.Fatalf("effectivePartitionCount(%+v) = %d, want %d", c.meta, got, c.want)
-			}
-		})
-	}
-}

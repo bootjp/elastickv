@@ -15,6 +15,7 @@ import (
 // recovers the exact plaintext. CLAUDE.md flags this kind of test as the
 // canonical safety net for envelope-format / compress-then-encrypt bugs.
 func TestCipher_RoundTripProperty(t *testing.T) {
+	t.Parallel()
 	rapid.Check(t, func(t *rapid.T) {
 		ks := encryption.NewKeystore()
 		// Random 32-byte DEK installed at a random non-reserved key_id.
@@ -62,6 +63,7 @@ func TestCipher_RoundTripProperty(t *testing.T) {
 // at decrypt time causes ErrIntegrity. This is the property that backs the
 // §4.1 cut-and-paste / blob-relocation defence.
 func TestCipher_AADTamperProperty(t *testing.T) {
+	t.Parallel()
 	rapid.Check(t, func(t *rapid.T) {
 		ks := encryption.NewKeystore()
 		dek := make([]byte, encryption.KeySize)

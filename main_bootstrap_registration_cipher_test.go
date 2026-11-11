@@ -15,6 +15,7 @@ import (
 )
 
 func TestBootstrapRegistrationTLSCipherBoundDeclaration(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name                                                       string
 		dek                                                        uint32

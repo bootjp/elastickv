@@ -66,6 +66,7 @@ func newFakeMetrics(l0Sub int32, l0Files int64, debt uint64, inProg int64, compa
 }
 
 func TestPebbleCollectorMirrorsGaugesAndCounters(t *testing.T) {
+	t.Parallel()
 	registry := NewRegistry("n1", "10.0.0.1:50051")
 	collector := registry.PebbleCollector()
 	require.NotNil(t, collector)
@@ -148,6 +149,7 @@ elastickv_pebble_memtable_zombie_count{group="1",node_address="10.0.0.1:50051",n
 }
 
 func TestPebbleCollectorHandlesSourceReset(t *testing.T) {
+	t.Parallel()
 	// If the underlying DB is replaced (Restore reopens it) the
 	// monotonic counters may go DOWN. The collector must not emit
 	// negative deltas; instead, it rebases silently.
@@ -185,6 +187,7 @@ elastickv_pebble_compact_count_total{group="7",node_address="10.0.0.1:50051",nod
 }
 
 func TestPebbleCollectorSkipsNilSnapshot(t *testing.T) {
+	t.Parallel()
 	// A source that returns nil (store closed mid-restore) must not
 	// panic and must not populate any series for that group.
 	registry := NewRegistry("n1", "10.0.0.1:50051")
@@ -204,6 +207,7 @@ func TestPebbleCollectorSkipsNilSnapshot(t *testing.T) {
 }
 
 func TestPebbleCollectorEmitsBlockCacheCapacity(t *testing.T) {
+	t.Parallel()
 	// When the source implements PebbleCacheCapacitySource, the
 	// collector mirrors the configured capacity into
 	// elastickv_pebble_block_cache_capacity_bytes alongside the current
@@ -239,6 +243,7 @@ elastickv_pebble_block_cache_size_bytes{node_address="10.0.0.1:50051",node_id="n
 }
 
 func TestPebbleCollectorEmitsSharedBlockCacheOnce(t *testing.T) {
+	t.Parallel()
 	registry := NewRegistry("n1", "10.0.0.1:50051")
 	collector := registry.PebbleCollector()
 	require.NotNil(t, collector)
@@ -288,6 +293,7 @@ elastickv_pebble_block_cache_size_bytes{node_address="10.0.0.1:50051",node_id="n
 }
 
 func TestPebbleCollectorSkipsCapacityWhenUnsupported(t *testing.T) {
+	t.Parallel()
 	// A PebbleMetricsSource that does NOT additionally implement
 	// PebbleCacheCapacitySource must not cause the capacity gauge to be
 	// populated. This preserves backward compatibility with sources that
@@ -305,6 +311,7 @@ func TestPebbleCollectorSkipsCapacityWhenUnsupported(t *testing.T) {
 }
 
 func TestPebbleCollectorZeroRegistryIsSafe(t *testing.T) {
+	t.Parallel()
 	// Code paths that bypass the registry (tests, bootstrap helpers)
 	// must tolerate a nil collector / empty sources without panicking.
 	var c *PebbleCollector
@@ -321,6 +328,7 @@ func TestPebbleCollectorZeroRegistryIsSafe(t *testing.T) {
 // gauge to alert on unexpected durability posture changes, so the
 // two-row shape must stay stable across successive calls.
 func TestSetFSMApplySyncMode_LabelsAreMutuallyExclusive(t *testing.T) {
+	t.Parallel()
 	registry := NewRegistry("n1", "10.0.0.1:50051")
 
 	registry.SetFSMApplySyncMode("sync")
@@ -352,6 +360,7 @@ func TestSetFSMApplySyncMode_LabelsAreMutuallyExclusive(t *testing.T) {
 // other monitoring helpers: bootstrap paths that construct an engine
 // without a registry (tests, the redis-proxy binary) must not panic.
 func TestSetFSMApplySyncMode_NilRegistryIsSafe(t *testing.T) {
+	t.Parallel()
 	var r *Registry
 	require.NotPanics(t, func() { r.SetFSMApplySyncMode("sync") })
 }
@@ -363,6 +372,7 @@ func TestSetFSMApplySyncMode_NilRegistryIsSafe(t *testing.T) {
 // or the gauge will disagree with the actual WriteOptions the store
 // uses.
 func TestSetFSMApplySyncMode_UnknownLabelCoercesToSync(t *testing.T) {
+	t.Parallel()
 	registry := NewRegistry("n1", "10.0.0.1:50051")
 
 	// Prime the gauge with a legitimate nosync posture so we can prove

@@ -16,6 +16,7 @@ import (
 // criterion 1: a learner attached to a 1-voter cluster receives log
 // entries, but does not count toward the voter quorum.
 func TestAddLearnerReplicatesWithoutCountingAsVoter(t *testing.T) {
+	t.Parallel()
 	nodes, peers := newTransportTestNodes(t, 2)
 	startTransportTestServers(nodes, peers)
 	t.Cleanup(func() { cleanupTransportTestNodes(t, nodes) })
@@ -74,6 +75,7 @@ func TestAddLearnerReplicatesWithoutCountingAsVoter(t *testing.T) {
 // path: AddLearner → wait for catch-up → PromoteLearner → suffrage
 // flips to "voter".
 func TestPromoteLearnerSwapsRoleToVoter(t *testing.T) {
+	t.Parallel()
 	nodes, peers := newTransportTestNodes(t, 2)
 	startTransportTestServers(nodes, peers)
 	t.Cleanup(func() { cleanupTransportTestNodes(t, nodes) })
@@ -139,6 +141,7 @@ func TestPromoteLearnerSwapsRoleToVoter(t *testing.T) {
 }
 
 func TestFreshLearnerJoinPromotesAndRestartsFromPersistedMembership(t *testing.T) {
+	t.Parallel()
 	nodes, peers := newTransportTestNodes(t, 3)
 	activeNodes := nodes[:2]
 	startTransportTestServers(nodes, peers)
@@ -181,6 +184,7 @@ func TestFreshLearnerJoinPromotesAndRestartsFromPersistedMembership(t *testing.T
 }
 
 func TestFreshLearnerJoinReusesRemovedVoterID(t *testing.T) {
+	t.Parallel()
 	nodes, peers := newTransportTestNodes(t, 3)
 	for i := range nodes {
 		peers[i].NodeID = DeriveNodeID(peers[i].ID)
@@ -342,6 +346,7 @@ func requireTransportNodesConfigSize(t *testing.T, ctx context.Context, nodes []
 // TestPromoteLearnerRejectsNonLearner ensures the precondition
 // (target must be in ConfState.Learners) is enforced before propose.
 func TestPromoteLearnerRejectsNonLearner(t *testing.T) {
+	t.Parallel()
 	nodes, peers := newTransportTestNodes(t, 2)
 	startTransportTestServers(nodes, peers)
 	t.Cleanup(func() { cleanupTransportTestNodes(t, nodes) })
@@ -374,6 +379,7 @@ func TestPromoteLearnerRejectsNonLearner(t *testing.T) {
 // nextPeersAfterConfigChange annotates Peer.Suffrage from the
 // post-change ConfState before persistConfigState writes the file.
 func TestLearnerPeersFilePersistsSuffrageAcrossRestart(t *testing.T) {
+	t.Parallel()
 	nodes, peers := newTransportTestNodes(t, 2)
 	startTransportTestServers(nodes, peers)
 	t.Cleanup(func() { cleanupTransportTestNodes(t, nodes) })
@@ -448,6 +454,7 @@ func TestLearnerPeersFilePersistsSuffrageAcrossRestart(t *testing.T) {
 // skip_min_applied_check returns a clean FailedPrecondition rather
 // than silently disabling the catch-up safety check.
 func TestPromoteLearnerRejectsZeroMinAppliedWithoutSkip(t *testing.T) {
+	t.Parallel()
 	nodes, peers := newTransportTestNodes(t, 2)
 	startTransportTestServers(nodes, peers)
 	t.Cleanup(func() { cleanupTransportTestNodes(t, nodes) })
@@ -473,6 +480,7 @@ func TestPromoteLearnerRejectsZeroMinAppliedWithoutSkip(t *testing.T) {
 // TestPromoteLearnerRejectsNotCaughtUp ensures the
 // minAppliedIndex precondition is enforced pre-propose.
 func TestPromoteLearnerRejectsNotCaughtUp(t *testing.T) {
+	t.Parallel()
 	nodes, peers := newTransportTestNodes(t, 2)
 	startTransportTestServers(nodes, peers)
 	t.Cleanup(func() { cleanupTransportTestNodes(t, nodes) })
@@ -500,6 +508,7 @@ func TestPromoteLearnerRejectsNotCaughtUp(t *testing.T) {
 // then sees itself in ConfState.Voters logs an ERROR and bumps the
 // process-wide JoinRoleViolationCount counter, but keeps running.
 func TestJoinAsLearnerAlarmFiresWhenAddedAsVoter(t *testing.T) {
+	t.Parallel()
 	nodes, peers := newTransportTestNodes(t, 2)
 	startTransportTestServers(nodes, peers)
 	t.Cleanup(func() { cleanupTransportTestNodes(t, nodes) })
@@ -538,6 +547,7 @@ func TestJoinAsLearnerAlarmFiresWhenAddedAsVoter(t *testing.T) {
 // "learner LinearizableRead" is the same code path as a voter
 // follower's: it forwards to the leader.
 func TestLinearizableReadOnLearnerForwardsToLeader(t *testing.T) {
+	t.Parallel()
 	nodes, peers := newTransportTestNodes(t, 2)
 	startTransportTestServers(nodes, peers)
 	t.Cleanup(func() { cleanupTransportTestNodes(t, nodes) })
@@ -590,6 +600,7 @@ func TestLinearizableReadOnLearnerForwardsToLeader(t *testing.T) {
 // Verifies that JoinRoleViolationCount increments on the second
 // Open and that the joiner stays running.
 func TestJoinAsLearnerAlarmFiresAtStartupForPersistedVoterRole(t *testing.T) {
+	t.Parallel()
 	nodes, peers := newTransportTestNodes(t, 2)
 	startTransportTestServers(nodes, peers)
 	t.Cleanup(func() { cleanupTransportTestNodes(t, nodes) })
@@ -646,6 +657,7 @@ func TestJoinAsLearnerAlarmFiresAtStartupForPersistedVoterRole(t *testing.T) {
 // implicitly by the AddLearner test above succeeding without a
 // quorum-ack timeout.
 func TestRemovePeerLearnerKeepsSingleNodeFastPath(t *testing.T) {
+	t.Parallel()
 	nodes, peers := newTransportTestNodes(t, 2)
 	startTransportTestServers(nodes, peers)
 	t.Cleanup(func() { cleanupTransportTestNodes(t, nodes) })

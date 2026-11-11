@@ -81,6 +81,7 @@ func requireDelayUnavailable(t *testing.T, err error) {
 }
 
 func TestSQSFIFODelayRecoveryFromPebble(t *testing.T) {
+	t.Parallel()
 	for _, partitions := range []uint32{1, 4} {
 		for _, initial := range []int64{0, 900} {
 			t.Run(fmt.Sprintf("partitions_%d/from_%d", partitions, initial), func(t *testing.T) {
@@ -194,6 +195,7 @@ func delayDataPut(req *kv.OperationGroup[kv.OP]) bool {
 }
 
 func TestSQSFIFODelayFencesStaleReceive(t *testing.T) {
+	t.Parallel()
 	for _, partitions := range []uint32{1, 4} {
 		t.Run(fmt.Sprint(partitions), func(t *testing.T) {
 			st := store.NewMVCCStore()
@@ -232,6 +234,7 @@ func TestSQSFIFODelayFencesStaleReceive(t *testing.T) {
 }
 
 func TestSQSFIFODelayFencesStaleSend(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	t.Cleanup(func() { require.NoError(t, st.Close()) })
 	srv := newDelayTestServer(t, st)
@@ -270,6 +273,7 @@ func TestSQSFIFODelayFencesStaleSend(t *testing.T) {
 }
 
 func TestSQSFIFODelayPageByteBudget(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	t.Cleanup(func() { require.NoError(t, st.Close()) })
 	srv := newDelayTestServer(t, st)
@@ -299,6 +303,7 @@ func TestSQSFIFODelayPageByteBudget(t *testing.T) {
 }
 
 func TestSQSFIFODelayPageAllowsOneAcceptedRecordOvershoot(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	t.Cleanup(func() { require.NoError(t, st.Close()) })
 	srv := newDelayTestServer(t, st)
@@ -366,6 +371,7 @@ func TestSQSFIFODelayPageAllowsOneAcceptedRecordOvershoot(t *testing.T) {
 }
 
 func TestSQSFIFODelayPurgeCancelsJob(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	t.Cleanup(func() { require.NoError(t, st.Close()) })
 	srv := newDelayTestServer(t, st)

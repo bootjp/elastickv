@@ -7,6 +7,7 @@ import (
 )
 
 func TestMethodFactoryBindsConstructedOwner(t *testing.T) {
+	t.Parallel()
 	h, _ := controlFixture(t)
 	cfg := Config{Local: h.Client, Versions: h.View.Installed, Provisioned: []Provision{{Node: h.Client, Groups: []uint64{testGroup}}}}
 	var bound *Owner

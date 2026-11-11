@@ -16,6 +16,7 @@ import (
 )
 
 func TestProtectedPeerDialDoesNotFallBackWithoutIdentity(t *testing.T) {
+	t.Parallel()
 	peer := Peer{NodeID: 2, ID: "n2", Address: "127.0.0.1:1"}
 	transport := NewGRPCTransport([]Peer{peer})
 	t.Cleanup(func() { require.NoError(t, transport.Close()) })
@@ -58,6 +59,7 @@ func TestProtectedStreamSkipsEmptyProbeAndKeepsUnaryClient(t *testing.T) {
 }
 
 func TestProtectedDialWaitHonorsCancellation(t *testing.T) {
+	t.Parallel()
 	peer := Peer{NodeID: 2, ID: "n2", Address: "peer:9000"}
 	transport := NewGRPCTransport([]Peer{peer})
 	t.Cleanup(func() { require.NoError(t, transport.Close()) })
@@ -74,6 +76,7 @@ func TestProtectedDialWaitHonorsCancellation(t *testing.T) {
 }
 
 func TestProtectedPublicationRejectsPeerChanges(t *testing.T) {
+	t.Parallel()
 	for _, change := range []string{"remove", "address", "remove-readd", "shutdown", "cancel"} {
 		t.Run(change, func(t *testing.T) {
 			peer := Peer{NodeID: 2, ID: "n2", Address: "127.0.0.1:1"}
@@ -110,6 +113,7 @@ func TestProtectedPublicationRejectsPeerChanges(t *testing.T) {
 }
 
 func TestProtectedPeerWithoutNodeIDUsesDerivedIdentity(t *testing.T) {
+	t.Parallel()
 	peer := Peer{ID: "n2", Address: "peer:9000"}
 	transport := NewGRPCTransport([]Peer{peer})
 	t.Cleanup(func() { require.NoError(t, transport.Close()) })
@@ -123,6 +127,7 @@ func TestProtectedPeerWithoutNodeIDUsesDerivedIdentity(t *testing.T) {
 }
 
 func TestProtectedStreamWaitHonorsCancellation(t *testing.T) {
+	t.Parallel()
 	transport := NewGRPCTransport(nil)
 	t.Cleanup(func() { require.NoError(t, transport.Close()) })
 	gate := make(chan struct{}, 1)
@@ -136,6 +141,7 @@ func TestProtectedStreamWaitHonorsCancellation(t *testing.T) {
 }
 
 func TestPeerClientCacheDiscardsExpiredSession(t *testing.T) {
+	t.Parallel()
 	transport := NewGRPCTransport(nil)
 	t.Cleanup(func() { require.NoError(t, transport.Close()) })
 	transport.clients["peer:9000"] = &sessionRaftClient{handle: &peersession.Handle{}}
@@ -147,12 +153,14 @@ func TestPeerClientCacheDiscardsExpiredSession(t *testing.T) {
 }
 
 func TestPeerSessionConfigurationRejectsMissingOwner(t *testing.T) {
+	t.Parallel()
 	transport := NewGRPCTransport(nil)
 	t.Cleanup(func() { require.NoError(t, transport.Close()) })
 	require.ErrorIs(t, transport.ConfigurePeerSessions(nil, 1, nil, nil), peersession.ErrDenied)
 }
 
 func TestClosedTransportCannotDialOrPublishPeerClient(t *testing.T) {
+	t.Parallel()
 	transport := NewGRPCTransport(nil)
 	transport.peerSession = &peerSessionTransport{}
 	require.NoError(t, transport.Close())
@@ -164,6 +172,7 @@ func TestClosedTransportCannotDialOrPublishPeerClient(t *testing.T) {
 }
 
 func TestLegacyTransportCanCreateFreshClientAfterClose(t *testing.T) {
+	t.Parallel()
 	peer := Peer{NodeID: 2, Address: "127.0.0.1:1"}
 	transport := NewGRPCTransport([]Peer{peer})
 	t.Cleanup(func() { require.NoError(t, transport.Close()) })

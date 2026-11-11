@@ -10,6 +10,7 @@ import (
 )
 
 func TestTSOLeaderWaitsForAppliedPendingState(t *testing.T) {
+	t.Parallel()
 	for _, operation := range []string{"reserve", "validate", "resolve"} {
 		t.Run(operation, func(t *testing.T) {
 			allocator, state, engine, _ := pendingTestAllocator(t, &testPhaseDGate{})

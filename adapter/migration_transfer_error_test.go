@@ -19,6 +19,7 @@ import (
 )
 
 func TestMigrationExportOversizeHasExplicitDetail(t *testing.T) {
+	t.Parallel()
 	resp := &pb.ExportRangeVersionsResponse{Versions: []*pb.MVCCVersion{{
 		Key: []byte("n"), Value: make([]byte, store.MigrationPagePayloadBudget+1), CommitTs: 17,
 	}}}
@@ -33,6 +34,7 @@ func TestMigrationExportOversizeHasExplicitDetail(t *testing.T) {
 }
 
 func TestMigrationTransferBoundaryFitsExportAndImportRequests(t *testing.T) {
+	t.Parallel()
 	key := make([]byte, store.MaxSnapshotKeySize)
 	value := make([]byte, store.MigrationPagePayloadBudget-2*len(key)-128)
 	version := &pb.MVCCVersion{Key: key, Value: value, CommitTs: ^uint64(0), KeyFamily: distribution.MigrationFamilyUser}
@@ -50,6 +52,7 @@ func TestMigrationTransferBoundaryFitsExportAndImportRequests(t *testing.T) {
 }
 
 func TestMigrationTransferErrorDetailsAreNotGenericBackpressure(t *testing.T) {
+	t.Parallel()
 	typed := migrationOversizedVersionError(&pb.MVCCVersion{Key: []byte("n"), CommitTs: 17})
 	wire, err := proto.Marshal(status.Convert(typed).Proto())
 	require.NoError(t, err)
@@ -79,6 +82,7 @@ func (s *transferFailureStream) Recv() (*pb.ExportRangeVersionsResponse, error) 
 }
 
 func TestMigrationTypedSourceFailureAfterAcknowledgedPageAutoAbandons(t *testing.T) {
+	t.Parallel()
 	ctx, server, catalog, job, source := transferPreflightFixture(t)
 	job.Phase = distribution.SplitJobPhaseBackfill
 	require.NoError(t, server.updateSplitJobViaCoordinator(ctx, job.JobID, func(distribution.SplitJob) (distribution.SplitJob, error) { return job, nil }))
@@ -103,6 +107,7 @@ func (c *transferTargetFailure) ImportRangeVersions(context.Context, *pb.ImportR
 }
 
 func TestMigrationTargetFailureCannotAuthorizeAbandon(t *testing.T) {
+	t.Parallel()
 	ctx, server, _, job, _, _ := importReplayFixture(t)
 	err := migrationOversizedVersionError(&pb.MVCCVersion{Key: []byte("n")})
 	target := &transferTargetFailure{err: err}
@@ -113,6 +118,7 @@ func TestMigrationTargetFailureCannotAuthorizeAbandon(t *testing.T) {
 }
 
 func TestMigrationLegacySourceErrorKeepsExplicitFailure(t *testing.T) {
+	t.Parallel()
 	ctx, server, catalog, job, source := transferPreflightFixture(t)
 	require.NoError(t, server.finalizeSplitJobFence(ctx, job))
 	job = loadTransferJob(t, ctx, catalog, job.JobID)

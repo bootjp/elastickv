@@ -10,6 +10,7 @@ import (
 )
 
 func TestVerifyOperationReceiptAfterPebbleReopen(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	dir := filepath.Join(t.TempDir(), "pebble")
 	st, err := store.NewPebbleStore(dir)
@@ -37,6 +38,7 @@ func TestVerifyOperationReceiptAfterPebbleReopen(t *testing.T) {
 }
 
 func TestNamespaceAndMetadataReceiptsAfterPebbleReopen(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	dir := filepath.Join(t.TempDir(), "pebble")
 	st, err := store.NewPebbleStore(dir)
@@ -93,6 +95,7 @@ func TestNamespaceAndMetadataReceiptsAfterPebbleReopen(t *testing.T) {
 }
 
 func TestCreateReceiptsAfterPebbleReopen(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	dir := filepath.Join(t.TempDir(), "pebble")
 	st, err := store.NewPebbleStore(dir)

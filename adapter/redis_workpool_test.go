@@ -13,6 +13,7 @@ import (
 )
 
 func TestRedisHeavyCommandLimiterRejectsWhenFull(t *testing.T) {
+	t.Parallel()
 	registry := monitoring.NewRegistry("n1", "10.0.0.1:50051")
 	server := NewRedisServer(nil, "", nil, nil, nil, nil,
 		WithRedisHeavyCommandSlots(1),
@@ -50,6 +51,7 @@ elastickv_redis_errors_total{command="HGETALL",node_address="10.0.0.1:50051",nod
 }
 
 func TestRedisHeavyCommandLimiterReleasesSlot(t *testing.T) {
+	t.Parallel()
 	server := NewRedisServer(nil, "", nil, nil, nil, nil, WithRedisHeavyCommandSlots(1))
 	conn := &commandRecorder{}
 	cmd := redcon.Command{Args: [][]byte{[]byte(cmdHGetAll), []byte("hash")}}
@@ -70,6 +72,7 @@ func TestRedisHeavyCommandLimiterReleasesSlot(t *testing.T) {
 }
 
 func TestRedisHeavyCommandLimiterDoesNotGateCheapCommand(t *testing.T) {
+	t.Parallel()
 	server := NewRedisServer(nil, "", nil, nil, nil, nil, WithRedisHeavyCommandSlots(1))
 	require.True(t, server.heavyCommandLimiter.submit(func() {
 		conn := &commandRecorder{}
@@ -87,6 +90,7 @@ func TestRedisHeavyCommandLimiterDoesNotGateCheapCommand(t *testing.T) {
 }
 
 func TestRedisHeavyCommandClassification(t *testing.T) {
+	t.Parallel()
 	for _, cmd := range []string{
 		cmdEval, cmdEvalSHA, cmdKeys, cmdScan, cmdHGetAll, cmdLRange,
 		cmdSMembers, cmdXRead, cmdXRange, cmdXRevRange, cmdZRange,
@@ -103,6 +107,7 @@ func TestRedisHeavyCommandClassification(t *testing.T) {
 }
 
 func TestRedisHeavyCommandLimiterRejectsQueuedExecWhenFull(t *testing.T) {
+	t.Parallel()
 	server := NewRedisServer(nil, "", nil, nil, nil, nil, WithRedisHeavyCommandSlots(1))
 	require.True(t, server.heavyCommandLimiter.submit(func() {
 		_, err := server.runTransaction([]redcon.Command{{
@@ -113,6 +118,7 @@ func TestRedisHeavyCommandLimiterRejectsQueuedExecWhenFull(t *testing.T) {
 }
 
 func TestRedisHeavyCommandLimiterClassifiesQueuedExecCaseInsensitively(t *testing.T) {
+	t.Parallel()
 	require.True(t, transactionHasHeavyCommand([]redcon.Command{{
 		Args: [][]byte{[]byte(strings.ToLower(cmdLRange)), []byte("list"), []byte("0"), []byte("-1")},
 	}}))
@@ -122,6 +128,7 @@ func TestRedisHeavyCommandLimiterClassifiesQueuedExecCaseInsensitively(t *testin
 }
 
 func TestRedisIdleWaitCommandsUseIterationGate(t *testing.T) {
+	t.Parallel()
 	server := NewRedisServer(nil, "", nil, nil, nil, nil, WithRedisHeavyCommandSlots(1))
 	require.False(t, server.shouldLimitHeavyCommand(cmdXRead))
 	require.False(t, server.shouldLimitHeavyCommand(cmdBZPopMin))
@@ -129,6 +136,7 @@ func TestRedisIdleWaitCommandsUseIterationGate(t *testing.T) {
 }
 
 func TestRedisXReadPollIterationRejectsWhenHeavyPoolFull(t *testing.T) {
+	t.Parallel()
 	server := NewRedisServer(nil, "", nil, nil, nil, nil, WithRedisHeavyCommandSlots(1))
 	conn := &commandRecorder{}
 	req := xreadRequest{
@@ -146,6 +154,7 @@ func TestRedisXReadPollIterationRejectsWhenHeavyPoolFull(t *testing.T) {
 }
 
 func TestRedisBZPopMinPollIterationRejectsWhenHeavyPoolFull(t *testing.T) {
+	t.Parallel()
 	server := NewRedisServer(nil, "", nil, nil, nil, nil, WithRedisHeavyCommandSlots(1))
 	conn := &commandRecorder{}
 

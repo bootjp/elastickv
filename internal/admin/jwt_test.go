@@ -35,6 +35,7 @@ func newVerifierForTest(t *testing.T, seeds []byte, clk Clock) *Verifier {
 }
 
 func TestJWT_SignVerifyRoundTrip(t *testing.T) {
+	t.Parallel()
 	clk := fixedClock(time.Unix(1_700_000_000, 0).UTC())
 	signer := newSignerForTest(t, 1, clk)
 	verifier := newVerifierForTest(t, []byte{1}, clk)
@@ -50,6 +51,7 @@ func TestJWT_SignVerifyRoundTrip(t *testing.T) {
 }
 
 func TestJWT_RejectsExpired(t *testing.T) {
+	t.Parallel()
 	signClk := fixedClock(time.Unix(1_700_000_000, 0).UTC())
 	verifyClk := fixedClock(time.Unix(1_700_000_000+int64(sessionTTL.Seconds()+1), 0).UTC())
 	signer := newSignerForTest(t, 1, signClk)
@@ -64,6 +66,7 @@ func TestJWT_RejectsExpired(t *testing.T) {
 }
 
 func TestJWT_RejectsFutureIssued(t *testing.T) {
+	t.Parallel()
 	// Sign in the future; verifier clock is now.
 	signClk := fixedClock(time.Unix(1_700_000_000+600, 0).UTC())
 	verifyClk := fixedClock(time.Unix(1_700_000_000, 0).UTC())
@@ -82,6 +85,7 @@ func TestJWT_RejectsFutureIssued(t *testing.T) {
 // widens the future-issuance grace window so a verifier whose clock
 // trails the signer by more than 30s can still accept its tokens.
 func TestJWT_ClockSkewToleranceConfigurable(t *testing.T) {
+	t.Parallel()
 	signClk := fixedClock(time.Unix(1_700_000_000+120, 0).UTC()) // 2 min ahead of verifier
 	verifyClk := fixedClock(time.Unix(1_700_000_000, 0).UTC())
 	signer := newSignerForTest(t, 1, signClk)
@@ -101,6 +105,7 @@ func TestJWT_ClockSkewToleranceConfigurable(t *testing.T) {
 }
 
 func TestJWT_RejectsWrongSignature(t *testing.T) {
+	t.Parallel()
 	clk := fixedClock(time.Unix(1_700_000_000, 0).UTC())
 	signer := newSignerForTest(t, 1, clk)
 	verifier := newVerifierForTest(t, []byte{9}, clk) // different key
@@ -114,6 +119,7 @@ func TestJWT_RejectsWrongSignature(t *testing.T) {
 }
 
 func TestJWT_PreviousKeyAccepted(t *testing.T) {
+	t.Parallel()
 	clk := fixedClock(time.Unix(1_700_000_000, 0).UTC())
 	// Previous key signs the token.
 	oldSigner := newSignerForTest(t, 2, clk)
@@ -129,6 +135,7 @@ func TestJWT_PreviousKeyAccepted(t *testing.T) {
 }
 
 func TestJWT_AfterRotationOldPreviousRejected(t *testing.T) {
+	t.Parallel()
 	clk := fixedClock(time.Unix(1_700_000_000, 0).UTC())
 	// Token minted with key seed=7.
 	signer := newSignerForTest(t, 7, clk)
@@ -143,6 +150,7 @@ func TestJWT_AfterRotationOldPreviousRejected(t *testing.T) {
 }
 
 func TestJWT_MalformedTokens(t *testing.T) {
+	t.Parallel()
 	clk := fixedClock(time.Unix(1_700_000_000, 0).UTC())
 	verifier := newVerifierForTest(t, []byte{1}, clk)
 
@@ -161,6 +169,7 @@ func TestJWT_MalformedTokens(t *testing.T) {
 }
 
 func TestJWT_RejectsUnknownRole(t *testing.T) {
+	t.Parallel()
 	clk := fixedClock(time.Unix(1_700_000_000, 0).UTC())
 	key := bytes.Repeat([]byte{3}, sessionSigningKeyLen)
 	// Manually craft a token with role=admin (unsupported).
@@ -179,6 +188,7 @@ func TestJWT_RejectsUnknownRole(t *testing.T) {
 }
 
 func TestJWT_RejectsMissingSub(t *testing.T) {
+	t.Parallel()
 	clk := fixedClock(time.Unix(1_700_000_000, 0).UTC())
 	key := bytes.Repeat([]byte{4}, sessionSigningKeyLen)
 	payload := []byte(`{"sub":"","role":"full","iat":1700000000,"exp":1700003600,"jti":"j"}`)
@@ -196,11 +206,13 @@ func TestJWT_RejectsMissingSub(t *testing.T) {
 }
 
 func TestNewSigner_RejectsWrongKeyLength(t *testing.T) {
+	t.Parallel()
 	_, err := NewSigner([]byte("short"), nil)
 	require.Error(t, err)
 }
 
 func TestNewVerifier_RejectsEmptyKeys(t *testing.T) {
+	t.Parallel()
 	_, err := NewVerifier(nil, nil)
 	require.Error(t, err)
 }

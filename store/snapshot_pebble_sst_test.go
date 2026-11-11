@@ -327,6 +327,7 @@ func TestSwapInTempDBRollsBackOnMetadataFailure(t *testing.T) {
 }
 
 func TestSSTIngestSnapshotConfigurationAndManifestValidation(t *testing.T) {
+	t.Parallel()
 	require.False(t, resolveSSTIngestSnapshots(""))
 	require.False(t, resolveSSTIngestSnapshots("invalid"))
 	require.True(t, resolveSSTIngestSnapshots(" true "))
@@ -358,6 +359,7 @@ func TestSSTIngestManifestRejectsNegativeLength(t *testing.T) {
 }
 
 func TestCountingWriterRejectsShortWrites(t *testing.T) {
+	t.Parallel()
 	var dst shortWriteBuffer
 	writer := &countingWriter{w: &dst}
 	n, err := writer.Write([]byte("transport"))

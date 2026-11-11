@@ -12,6 +12,7 @@ import (
 )
 
 func TestMigrationPromoteRestoredStagingPreservesLocalControl(t *testing.T) {
+	t.Parallel()
 	for _, key := range [][]byte{backupTimestampFloorKey, prepareEvidenceEnabledKey, prepareEvidenceGateKey, prepareEvidenceTimestampFloorKey, replicatedPinStateKey} {
 		for _, tombstone := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s-delete-%t", key, tombstone), func(t *testing.T) {

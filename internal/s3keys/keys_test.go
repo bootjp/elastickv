@@ -546,6 +546,7 @@ func TestBucketGenerationRoutePrefixForCleanupPrefixIncludesChunkRefs(t *testing
 }
 
 func TestBucketScopedRoutePrefix_ProjectsEveryDeleteFamily(t *testing.T) {
+	t.Parallel()
 	const (
 		bucket     = "bkt"
 		generation = uint64(3)
@@ -574,6 +575,7 @@ func TestBucketScopedRoutePrefix_ProjectsEveryDeleteFamily(t *testing.T) {
 // prefix it produces, otherwise the write floor it admits against is the wrong
 // one.
 func TestBucketScopedRoutePrefix_CoversTheKeysUnderIt(t *testing.T) {
+	t.Parallel()
 	const (
 		bucket     = "bkt"
 		generation = uint64(3)
@@ -604,6 +606,7 @@ func TestBucketScopedRoutePrefix_CoversTheKeysUnderIt(t *testing.T) {
 // one that reaches into the object segment is not this function's shape. Both
 // must decline rather than collapse onto a single route range.
 func TestBucketScopedRoutePrefix_RejectsPartialAndDeeperPrefixes(t *testing.T) {
+	t.Parallel()
 	const (
 		bucket     = "bkt"
 		generation = uint64(3)

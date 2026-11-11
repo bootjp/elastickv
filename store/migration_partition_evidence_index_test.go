@@ -20,6 +20,7 @@ func sealedPartitionEvidenceFixture(t *testing.T, st MVCCStore) MigrationServing
 }
 
 func TestPartitionEvidenceIndexRejectsCallerForgedAttestation(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		view := sealedPartitionEvidenceFixture(t, st)
 		receipt := view.Partitions.Receipts[0]
@@ -43,6 +44,7 @@ func TestPartitionEvidenceIndexRejectsCallerForgedAttestation(t *testing.T) {
 }
 
 func TestPartitionEvidenceIndexRequiresCurrentActiveMember(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		view := sealedPartitionEvidenceFixture(t, st)
 		left, right := view.Partitions.Partitions[0], view.Partitions.Partitions[1]
@@ -59,6 +61,7 @@ func TestPartitionEvidenceIndexRequiresCurrentActiveMember(t *testing.T) {
 }
 
 func TestPartitionEvidenceIndexNeverSerializesTrust(t *testing.T) {
+	t.Parallel()
 	view := sealedPartitionEvidenceFixture(t, NewMVCCStore())
 	encoded, err := json.Marshal(view.Partitions)
 	require.NoError(t, err)
@@ -78,6 +81,7 @@ func TestPartitionEvidenceIndexNeverSerializesTrust(t *testing.T) {
 }
 
 func TestPartitionEvidenceIndexClonesIsolateConcurrentMutation(t *testing.T) {
+	t.Parallel()
 	st := NewMVCCStore()
 	mutated := sealedPartitionEvidenceFixture(t, st)
 	stable, err := admissionReader(t, st).MigrationServingAdmissionState(t.Context())

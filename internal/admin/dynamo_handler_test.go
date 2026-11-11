@@ -120,6 +120,7 @@ func newDynamoHandlerForTest(src TablesSource) *DynamoHandler {
 }
 
 func TestDynamoHandler_ListTables_EmptyArrayNotNull(t *testing.T) {
+	t.Parallel()
 	h := newDynamoHandlerForTest(&stubTablesSource{tables: map[string]*DynamoTableSummary{}})
 	req := httptest.NewRequest(http.MethodGet, pathDynamoTables, nil)
 	rec := httptest.NewRecorder()
@@ -131,6 +132,7 @@ func TestDynamoHandler_ListTables_EmptyArrayNotNull(t *testing.T) {
 }
 
 func TestDynamoHandler_ListTables_DefaultLimitAppliesAt100(t *testing.T) {
+	t.Parallel()
 	tables := make(map[string]*DynamoTableSummary, 250)
 	for i := 0; i < 250; i++ {
 		name := tableNameForIndex(i)
@@ -156,6 +158,7 @@ func TestDynamoHandler_ListTables_DefaultLimitAppliesAt100(t *testing.T) {
 }
 
 func TestDynamoHandler_ListTables_LimitClampedToMax(t *testing.T) {
+	t.Parallel()
 	tables := make(map[string]*DynamoTableSummary, 1500)
 	for i := 0; i < 1500; i++ {
 		name := tableNameForIndex(i)
@@ -173,6 +176,7 @@ func TestDynamoHandler_ListTables_LimitClampedToMax(t *testing.T) {
 }
 
 func TestDynamoHandler_ListTables_PaginationResumesAfterCursor(t *testing.T) {
+	t.Parallel()
 	tables := map[string]*DynamoTableSummary{
 		"alpha":   {Name: "alpha"},
 		"bravo":   {Name: "bravo"},
@@ -212,6 +216,7 @@ func TestDynamoHandler_ListTables_PaginationResumesAfterCursor(t *testing.T) {
 }
 
 func TestDynamoHandler_ListTables_NextTokenForVanishedNameFastForwards(t *testing.T) {
+	t.Parallel()
 	// A cursor for a name that was deleted between pages must resume
 	// at the next surviving entry, not silently swallow the page.
 	tables := map[string]*DynamoTableSummary{
@@ -232,6 +237,7 @@ func TestDynamoHandler_ListTables_NextTokenForVanishedNameFastForwards(t *testin
 }
 
 func TestDynamoHandler_ListTables_RejectsBadLimit(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		raw    string
 		expect string
@@ -253,6 +259,7 @@ func TestDynamoHandler_ListTables_RejectsBadLimit(t *testing.T) {
 }
 
 func TestDynamoHandler_ListTables_RejectsBadNextToken(t *testing.T) {
+	t.Parallel()
 	h := newDynamoHandlerForTest(&stubTablesSource{tables: map[string]*DynamoTableSummary{}})
 	req := httptest.NewRequest(http.MethodGet, pathDynamoTables+"?next_token=!!!not-base64!!!", nil)
 	rec := httptest.NewRecorder()
@@ -262,6 +269,7 @@ func TestDynamoHandler_ListTables_RejectsBadNextToken(t *testing.T) {
 }
 
 func TestDynamoHandler_ListTables_SourceErrorIsHidden(t *testing.T) {
+	t.Parallel()
 	h := newDynamoHandlerForTest(&stubTablesSource{listErr: errors.New("kv backing sentinel ZZZ-471")})
 	req := httptest.NewRequest(http.MethodGet, pathDynamoTables, nil)
 	rec := httptest.NewRecorder()
@@ -274,6 +282,7 @@ func TestDynamoHandler_ListTables_SourceErrorIsHidden(t *testing.T) {
 }
 
 func TestDynamoHandler_DescribeTable_HappyPath(t *testing.T) {
+	t.Parallel()
 	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{
 		"orders": {
 			Name:         "orders",
@@ -303,6 +312,7 @@ func TestDynamoHandler_DescribeTable_HappyPath(t *testing.T) {
 }
 
 func TestDynamoHandler_DescribeTable_MissingReturns404(t *testing.T) {
+	t.Parallel()
 	h := newDynamoHandlerForTest(&stubTablesSource{tables: map[string]*DynamoTableSummary{}})
 	req := httptest.NewRequest(http.MethodGet, pathDynamoTables+"/absent", nil)
 	rec := httptest.NewRecorder()
@@ -313,6 +323,7 @@ func TestDynamoHandler_DescribeTable_MissingReturns404(t *testing.T) {
 }
 
 func TestDynamoHandler_DescribeTable_RejectsSlashInName(t *testing.T) {
+	t.Parallel()
 	// /admin/api/v1/dynamo/tables/foo/bar must not let the handler
 	// call AdminDescribeTable with a "/"-bearing name. Returning 404
 	// is preferable to 400 here because the URL itself is the only
@@ -329,6 +340,7 @@ func TestDynamoHandler_DescribeTable_RejectsSlashInName(t *testing.T) {
 }
 
 func TestDynamoHandler_DescribeTable_SourceErrorIsHidden(t *testing.T) {
+	t.Parallel()
 	h := newDynamoHandlerForTest(&stubTablesSource{descErr: errors.New("storage sentinel QQ-808")})
 	req := httptest.NewRequest(http.MethodGet, pathDynamoTables+"/orders", nil)
 	rec := httptest.NewRecorder()
@@ -340,6 +352,7 @@ func TestDynamoHandler_DescribeTable_SourceErrorIsHidden(t *testing.T) {
 }
 
 func TestDynamoHandler_RejectsUnsupportedMethods(t *testing.T) {
+	t.Parallel()
 	h := newDynamoHandlerForTest(&stubTablesSource{tables: map[string]*DynamoTableSummary{}})
 	// /tables accepts GET + POST; PUT/PATCH/DELETE on the
 	// collection root are 405. Wrapping the principal lets the
@@ -363,6 +376,7 @@ func TestDynamoHandler_RejectsUnsupportedMethods(t *testing.T) {
 }
 
 func TestDynamoHandler_UnknownSubpathReturns404(t *testing.T) {
+	t.Parallel()
 	h := newDynamoHandlerForTest(&stubTablesSource{tables: map[string]*DynamoTableSummary{}})
 	// /admin/api/v1/dynamo/something-else falls outside the prefix the
 	// handler owns; the handler must answer 404 so the admin router's
@@ -374,6 +388,7 @@ func TestDynamoHandler_UnknownSubpathReturns404(t *testing.T) {
 }
 
 func TestDynamoHandler_DescribeTable_TrailingSlashIsRejected(t *testing.T) {
+	t.Parallel()
 	// /admin/api/v1/dynamo/tables/ with an empty trailing component
 	// would otherwise pass an empty name down to the source.
 	// After Phase 3a's 6-step segment-validation dispatch the empty
@@ -413,6 +428,7 @@ func validCreateBody() string {
 // describe/delete URL segments (which are matched literally)
 // resolve the same table.
 func TestDynamoHandler_CreateTable_TrimsWhitespaceFromTableName(t *testing.T) {
+	t.Parallel()
 	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{}}
 	h := newDynamoHandlerForTest(src)
 	body := `{"table_name":"  users  ","partition_key":{"name":"id","type":"S"}}`
@@ -429,6 +445,7 @@ func TestDynamoHandler_CreateTable_TrimsWhitespaceFromTableName(t *testing.T) {
 // that a name consisting solely of whitespace still fails after
 // the trim — i.e., trimming does not weaken the empty-name guard.
 func TestDynamoHandler_CreateTable_WhitespaceOnlyNameRejected(t *testing.T) {
+	t.Parallel()
 	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{}}
 	h := newDynamoHandlerForTest(src)
 	body := `{"table_name":"   ","partition_key":{"name":"id","type":"S"}}`
@@ -450,6 +467,7 @@ func TestDynamoHandler_CreateTable_WhitespaceOnlyNameRejected(t *testing.T) {
 // before the source is reached. Mirrors the slash-rejection guard
 // already in validateCreateTableRequest (PR #634).
 func TestDynamoHandler_CreateTable_RejectsDotSegmentNames(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name string
 		raw  string
@@ -480,6 +498,7 @@ func TestDynamoHandler_CreateTable_RejectsDotSegmentNames(t *testing.T) {
 // or downgraded. The handler re-validates against the live
 // RoleStore on every write.
 func TestDynamoHandler_CreateTable_LiveRoleRevocation(t *testing.T) {
+	t.Parallel()
 	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{}}
 	// Live role map says the access key is read-only — even though
 	// the JWT in withWritePrincipal carries role=full.
@@ -500,6 +519,7 @@ func TestDynamoHandler_CreateTable_LiveRoleRevocation(t *testing.T) {
 // the harder case: the access key was deleted entirely from the
 // role index. Same 403, same defence-in-depth.
 func TestDynamoHandler_CreateTable_LiveRoleAccessKeyRemoved(t *testing.T) {
+	t.Parallel()
 	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{}}
 	roles := MapRoleStore{} // AKIA_FULL is absent
 	h := NewDynamoHandler(src).WithRoleStore(roles)
@@ -515,6 +535,7 @@ func TestDynamoHandler_CreateTable_LiveRoleAccessKeyRemoved(t *testing.T) {
 // TestDynamoHandler_DeleteTable_LiveRoleRevocation mirrors the
 // create-side coverage on the delete path.
 func TestDynamoHandler_DeleteTable_LiveRoleRevocation(t *testing.T) {
+	t.Parallel()
 	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{
 		"users": {Name: "users"},
 	}}
@@ -530,6 +551,7 @@ func TestDynamoHandler_DeleteTable_LiveRoleRevocation(t *testing.T) {
 }
 
 func TestDynamoHandler_CreateTable_HappyPath(t *testing.T) {
+	t.Parallel()
 	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{}}
 	h := newDynamoHandlerForTest(src)
 	req := httptest.NewRequest(http.MethodPost, pathDynamoTables, strings.NewReader(validCreateBody()))
@@ -553,6 +575,7 @@ func TestDynamoHandler_CreateTable_HappyPath(t *testing.T) {
 // adapter as ValidationException ("invalid projection") — exactly
 // the boundary mismatch Codex P2 flagged on PR #635.
 func TestDynamoHandler_CreateTable_CanonicalisesProjectionType(t *testing.T) {
+	t.Parallel()
 	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{}}
 	h := newDynamoHandlerForTest(src)
 	body := `{
@@ -577,6 +600,7 @@ func TestDynamoHandler_CreateTable_CanonicalisesProjectionType(t *testing.T) {
 // TestDynamoHandler_CreateTable_AcceptsMixedCaseProjection covers
 // the same canonicalisation for KEYS_ONLY / Keys_Only / keys_only.
 func TestDynamoHandler_CreateTable_AcceptsMixedCaseProjection(t *testing.T) {
+	t.Parallel()
 	cases := []struct{ in, want string }{
 		{"all", "ALL"},
 		{"All", "ALL"},
@@ -608,6 +632,7 @@ func TestDynamoHandler_CreateTable_AcceptsMixedCaseProjection(t *testing.T) {
 }
 
 func TestDynamoHandler_CreateTable_RejectsReadOnlyPrincipal(t *testing.T) {
+	t.Parallel()
 	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{}}
 	h := newDynamoHandlerForTest(src)
 	req := httptest.NewRequest(http.MethodPost, pathDynamoTables, strings.NewReader(validCreateBody()))
@@ -623,6 +648,7 @@ func TestDynamoHandler_CreateTable_RejectsReadOnlyPrincipal(t *testing.T) {
 }
 
 func TestDynamoHandler_CreateTable_RejectsMissingPrincipal(t *testing.T) {
+	t.Parallel()
 	// Without a principal in context (SessionAuth would normally
 	// reject earlier, but defence-in-depth here matters), the
 	// handler must answer 401 rather than crashing on a zero
@@ -643,6 +669,7 @@ func TestDynamoHandler_CreateTable_RejectsMissingPrincipal(t *testing.T) {
 // 413; the previous wholesale "decode failure → 400" path
 // silently broke that for this endpoint.
 func TestDynamoHandler_CreateTable_OversizedBodyReturns413(t *testing.T) {
+	t.Parallel()
 	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{}}
 	h := newDynamoHandlerForTest(src)
 	// Build a body just over the limit. Padding a real-shape
@@ -664,6 +691,7 @@ func TestDynamoHandler_CreateTable_OversizedBodyReturns413(t *testing.T) {
 }
 
 func TestDynamoHandler_CreateTable_RejectsBadJSON(t *testing.T) {
+	t.Parallel()
 	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{}}
 	h := newDynamoHandlerForTest(src)
 	cases := []string{
@@ -698,6 +726,7 @@ func TestDynamoHandler_CreateTable_RejectsBadJSON(t *testing.T) {
 }
 
 func TestDynamoHandler_CreateTable_AlreadyExistsReturns409(t *testing.T) {
+	t.Parallel()
 	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{
 		"users": {Name: "users", PartitionKey: "id"},
 	}}
@@ -711,6 +740,7 @@ func TestDynamoHandler_CreateTable_AlreadyExistsReturns409(t *testing.T) {
 }
 
 func TestDynamoHandler_CreateTable_NotLeaderReturns503WithRetryAfter(t *testing.T) {
+	t.Parallel()
 	src := &stubTablesSource{
 		tables:    map[string]*DynamoTableSummary{},
 		createErr: ErrTablesNotLeader,
@@ -726,6 +756,7 @@ func TestDynamoHandler_CreateTable_NotLeaderReturns503WithRetryAfter(t *testing.
 }
 
 func TestDynamoHandler_CreateTable_ForbiddenFromSourceMaps403(t *testing.T) {
+	t.Parallel()
 	src := &stubTablesSource{
 		tables:    map[string]*DynamoTableSummary{},
 		createErr: ErrTablesForbidden,
@@ -739,6 +770,7 @@ func TestDynamoHandler_CreateTable_ForbiddenFromSourceMaps403(t *testing.T) {
 }
 
 func TestDynamoHandler_CreateTable_ValidationErrorMaps400(t *testing.T) {
+	t.Parallel()
 	src := &stubTablesSource{
 		tables:    map[string]*DynamoTableSummary{},
 		createErr: &ValidationError{Message: "conflicting attribute type for id"},
@@ -753,6 +785,7 @@ func TestDynamoHandler_CreateTable_ValidationErrorMaps400(t *testing.T) {
 }
 
 func TestDynamoHandler_CreateTable_GenericErrorIsHidden(t *testing.T) {
+	t.Parallel()
 	src := &stubTablesSource{
 		tables:    map[string]*DynamoTableSummary{},
 		createErr: errors.New("storage backing sentinel ZQ-993"),
@@ -768,6 +801,7 @@ func TestDynamoHandler_CreateTable_GenericErrorIsHidden(t *testing.T) {
 }
 
 func TestDynamoHandler_DeleteTable_HappyPath(t *testing.T) {
+	t.Parallel()
 	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{
 		"users": {Name: "users", PartitionKey: "id"},
 	}}
@@ -783,6 +817,7 @@ func TestDynamoHandler_DeleteTable_HappyPath(t *testing.T) {
 }
 
 func TestDynamoHandler_DeleteTable_ReadOnlyPrincipalRejected(t *testing.T) {
+	t.Parallel()
 	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{
 		"users": {Name: "users", PartitionKey: "id"},
 	}}
@@ -796,6 +831,7 @@ func TestDynamoHandler_DeleteTable_ReadOnlyPrincipalRejected(t *testing.T) {
 }
 
 func TestDynamoHandler_DeleteTable_MissingReturns404(t *testing.T) {
+	t.Parallel()
 	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{}}
 	h := newDynamoHandlerForTest(src)
 	req := httptest.NewRequest(http.MethodDelete, pathDynamoTables+"/absent", nil)
@@ -807,6 +843,7 @@ func TestDynamoHandler_DeleteTable_MissingReturns404(t *testing.T) {
 }
 
 func TestDynamoHandler_DeleteTable_NotLeaderReturns503WithRetryAfter(t *testing.T) {
+	t.Parallel()
 	src := &stubTablesSource{
 		tables:    map[string]*DynamoTableSummary{"users": {Name: "users"}},
 		deleteErr: ErrTablesNotLeader,
@@ -821,6 +858,7 @@ func TestDynamoHandler_DeleteTable_NotLeaderReturns503WithRetryAfter(t *testing.
 }
 
 func TestDynamoHandler_DeleteTable_RejectsTrailingSlash(t *testing.T) {
+	t.Parallel()
 	// See TestDynamoHandler_DescribeTable_TrailingSlashIsRejected for
 	// the 404 → 400 rationale (Phase 3a 6-step dispatch).
 	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{}}
@@ -847,6 +885,7 @@ func tableNameForIndex(i int) string {
 // Sanity check on the helper itself so the pagination assertions
 // have a stable backing dataset.
 func TestTableNameForIndex_LexSortable(t *testing.T) {
+	t.Parallel()
 	prev := ""
 	for i := 0; i < 20; i++ {
 		cur := tableNameForIndex(i)

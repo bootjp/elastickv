@@ -258,6 +258,7 @@ func TestS3NextTxnCommitTSFailsClosedOnExpiredCeiling(t *testing.T) {
 }
 
 func TestS3CommitUploadPartProtectsUploadRemovedAfterStartTS(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	const generation = uint64(1)
 	uploadMetaKey := s3keys.UploadMetaKey("bucket", generation, "object", "upload")
@@ -282,6 +283,7 @@ func TestS3CommitUploadPartProtectsUploadRemovedAfterStartTS(t *testing.T) {
 }
 
 func TestS3CommitUploadPartIncludesUploadMetaInReadSet(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	const generation = uint64(1)
 	uploadMetaKey := s3keys.UploadMetaKey("bucket", generation, "object", "upload")

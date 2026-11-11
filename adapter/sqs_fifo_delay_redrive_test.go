@@ -24,6 +24,7 @@ func createDelayDLQ(t *testing.T, srv *SQSServer) {
 }
 
 func TestSQSFIFODelayFencesStaleRedrive(t *testing.T) {
+	t.Parallel()
 	for _, fenceSource := range []bool{false, true} {
 		t.Run(fmt.Sprint(fenceSource), func(t *testing.T) {
 			st := store.NewMVCCStore()
@@ -32,11 +33,17 @@ func TestSQSFIFODelayFencesStaleRedrive(t *testing.T) {
 			createDelayTestQueue(t, srv, 4, 0)
 			createDelayDLQ(t, srv)
 			id := sendDelayTestMessage(t, srv, "poison", "g")
+			initialCtx, cancelInitial := context.WithTimeout(t.Context(), 5*time.Second)
+			var messages []map[string]any
+			for len(messages) == 0 && initialCtx.Err() == nil {
+				var err error
+				messages, err = srv.scanAndDeliverOnce(initialCtx, fifoDelayTestQueue, sqsReceiveOptions{Max: 1, VisibilityTimeout: 0})
+				require.NoError(t, err)
+			}
+			cancelInitial()
+			require.Len(t, messages, 1)
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
-			messages, err := srv.scanAndDeliverOnce(ctx, fifoDelayTestQueue, sqsReceiveOptions{Max: 1, VisibilityTimeout: 0})
-			require.NoError(t, err)
-			require.Len(t, messages, 1)
 			gate := &fifoDelayBarrierCoordinator{Coordinator: srv.coordinator, match: delayDataPut, entered: make(chan struct{}), release: make(chan struct{})}
 			srv.coordinator = gate
 			done, finished := make(chan error, 1), make(chan struct{})
@@ -86,6 +93,7 @@ func delayGroupOnPartition(meta *sqsQueueMeta, partition uint32) string {
 }
 
 func TestSQSFIFODelayRedriveCannotEnterCompletedBackfillPartition(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	t.Cleanup(func() { require.NoError(t, st.Close()) })
 	srv := newDelayTestServer(t, st)
@@ -130,6 +138,7 @@ func TestSQSFIFODelayRedriveCannotEnterCompletedBackfillPartition(t *testing.T) 
 }
 
 func TestSQSFIFOIndexedDelayedHeadPrecedesImmediateRedrive(t *testing.T) {
+	t.Parallel()
 	st := store.NewMVCCStore()
 	t.Cleanup(func() { require.NoError(t, st.Close()) })
 	srv := newDelayTestServer(t, st)

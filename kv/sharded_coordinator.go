@@ -555,7 +555,14 @@ type ShardedCoordinator struct {
 	// hlcRenewalBlocked lets startup code temporarily suppress background HLC
 	// lease proposals while another startup-only Raft mutation must run first.
 	hlcRenewalBlocked func() bool
-	hlcRecoveryMu     sync.Mutex
+	// commitTSFenceActivation makes the coordinator propose the raw and
+	// PREPARE apply-order fence activation on groups it leads
+	// (WithCommitTSFenceActivation).
+	commitTSFenceActivation         bool
+	commitTSFenceActivationReady    func() bool
+	commitTSFenceActivationInFlight atomic.Bool
+	commitTSFenceActiveGroups       sync.Map
+	hlcRecoveryMu                   sync.Mutex
 	// hlcRenewalInFlight prevents a slow or quorum-stalled group from stacking
 	// another background HLC lease proposal for the same group on the next tick.
 	hlcRenewalMu       sync.Mutex
@@ -1402,22 +1409,23 @@ func isComposed1RetryableError(err error) bool {
 // dispatchNonTxn routes a non-transactional operation group through the
 // shard router. Extracted from Dispatch to keep that method's branch
 // count within the cyclop budget after the 7a registration gate landed.
-func (c *ShardedCoordinator) dispatchNonTxn(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
+func (c *ShardedCoordinator) dispatchNonTxn(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, rawDispatchShape, error) {
 	if err := c.rejectWriteFencedPointElems(reqs.Elems); err != nil {
-		return nil, err
+		return nil, rawDispatchShape{}, err
 	}
 	if hasExplicitGroupElem(reqs.Elems) {
 		return c.dispatchExplicitGroupNonTxn(ctx, reqs)
 	}
 	logs, err := c.requestLogs(ctx, reqs)
 	if err != nil {
-		return nil, err
+		return nil, rawDispatchShape{}, err
 	}
-	r, err := c.router.Commit(ctx, logs)
+	r, groupCount, err := c.router.commitWithGroupCount(ctx, logs)
+	shape := rawDispatchShape{groupCount: groupCount, requestCount: len(logs)}
 	if err != nil {
-		return nil, errors.WithStack(err)
+		return nil, shape, errors.WithStack(err)
 	}
-	return &CoordinateResponse{CommitIndex: r.CommitIndex}, nil
+	return &CoordinateResponse{CommitIndex: r.CommitIndex}, shape, nil
 }
 
 func hasExplicitGroupElem(elems []*Elem[OP]) bool {
@@ -1429,41 +1437,40 @@ func hasExplicitGroupElem(elems []*Elem[OP]) bool {
 	return false
 }
 
-func (c *ShardedCoordinator) dispatchExplicitGroupNonTxn(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
+func (c *ShardedCoordinator) dispatchExplicitGroupNonTxn(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, rawDispatchShape, error) {
 	logs, gids, err := c.rawLogsWithGroups(ctx, reqs)
 	if err != nil {
-		return nil, err
+		return nil, rawDispatchShape{}, err
 	}
+	shape := rawDispatchShape{groupCount: len(gids), requestCount: len(logs)}
 	var maxIndex uint64
 	for i, gid := range gids {
 		g, err := c.txnGroupForID(gid)
 		if err != nil {
-			return nil, err
+			return nil, shape, err
 		}
 		resp, err := g.Txn.Commit(ctx, []*pb.Request{logs[i]})
 		if err != nil {
-			return nil, errors.WithStack(err)
+			return nil, shape, errors.WithStack(err)
 		}
 		if resp != nil && resp.CommitIndex > maxIndex {
 			maxIndex = resp.CommitIndex
 		}
 	}
-	return &CoordinateResponse{CommitIndex: maxIndex}, nil
+	return &CoordinateResponse{CommitIndex: maxIndex}, shape, nil
 }
 
 func (c *ShardedCoordinator) dispatchRawWithComposed1Retry(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
 	for attempt := 0; attempt <= composed1RetryAttempts; attempt++ {
-		resp, handled, err := c.dispatchBeforeShardRouting(ctx, reqs)
-		if !handled {
-			resp, err = c.dispatchNonTxn(ctx, reqs)
-		}
+		resp, shape, err := c.dispatchRawWithFenceRetry(ctx, reqs)
 		if err == nil {
 			return resp, nil
 		}
-		if !errors.Is(err, ErrComposed1VersionGCd) || attempt == composed1RetryAttempts || c.engine == nil {
+		if errors.Is(err, ErrTransactionOutcomeUnknown) ||
+			!errors.Is(err, ErrComposed1VersionGCd) || attempt == composed1RetryAttempts || c.engine == nil {
 			return resp, err
 		}
-		if !c.canRetryRawVersionGC(reqs) {
+		if !shape.singleRequest() || !c.canRetryRawVersionGC(reqs) {
 			return resp, err
 		}
 		reqs.ObservedRouteVersion = c.engine.Version()
@@ -2250,6 +2257,9 @@ func (c *ShardedCoordinator) prewriteTxn(ctx context.Context, startTS, commitTS 
 			err = ErrTransactionOutcomeUnknown
 		}
 		if err != nil {
+			if errors.Is(err, ErrTransactionOutcomeUnknown) {
+				return nil, true, errors.WithStack(err)
+			}
 			// Same WithoutCancel pattern as dispatchTxn's
 			// commitPrimaryTxn-failure cleanup: a cancelled ctx is
 			// the most likely cause of Commit failing here, and the
@@ -3840,6 +3850,13 @@ func (c *ShardedCoordinator) RunHLCLeaseRenewal(ctx context.Context) {
 				defer children.Done()
 				<-done
 			}()
+			if activation := c.activateCommitTSFencesAsync(ctx); activation != nil {
+				children.Add(1)
+				go func() {
+					defer children.Done()
+					<-activation
+				}()
+			}
 			timer.Reset(hlcRenewalInterval)
 		case <-ctx.Done():
 			return

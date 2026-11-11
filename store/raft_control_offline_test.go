@@ -10,6 +10,7 @@ import (
 )
 
 func TestOfflinePlainControlMetadataUsesRuntimeValueCodec(t *testing.T) {
+	t.Parallel()
 	st, err := NewPebbleStore(t.TempDir())
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, st.Close()) })
@@ -29,6 +30,7 @@ func TestOfflinePlainControlMetadataUsesRuntimeValueCodec(t *testing.T) {
 }
 
 func TestOfflinePlainControlMetadataRejectsUnboundedBodies(t *testing.T) {
+	t.Parallel()
 	_, err := EncodeOfflinePlainControlMetadata(nil)
 	require.Error(t, err)
 	_, err = EncodeOfflinePlainControlMetadata(bytes.Repeat([]byte{1}, raftbootstrap.MaxFileSize+1))

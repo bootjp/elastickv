@@ -393,6 +393,7 @@ assert(reply.err:find("redis.pcall invoked without an active script context") ~=
 // pool in isolation) holds the security invariant. Script A tries to
 // leak GLOBAL_LEAK; script B asserts the leak is gone.
 func TestRedis_LuaPoolNoGlobalLeakEndToEnd(t *testing.T) {
+	t.Parallel()
 	nodes, _, _ := createNode(t, 3)
 	defer shutdown(nodes)
 

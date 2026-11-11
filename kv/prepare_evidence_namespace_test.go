@@ -56,6 +56,7 @@ func assertPrepareNamespaceHistory(t *testing.T, want, got []store.MVCCVersion) 
 }
 
 func TestPrepareEvidenceUpgradePreservesPreviouslyValidUserNames(t *testing.T) {
+	t.Parallel()
 	for _, pebble := range []bool{false, true} {
 		t.Run(map[bool]string{false: "memory", true: "pebble"}[pebble], func(t *testing.T) {
 			for _, profile := range []string{"ordinary-values", "wire-shaped-values", "tombstones"} {

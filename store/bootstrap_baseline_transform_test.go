@@ -47,6 +47,7 @@ func verifyBaselineTransform(t *testing.T, source, target *pebbleStore, allowed 
 }
 
 func TestBootstrapBaselinePreparedTransformExactAddition(t *testing.T) {
+	t.Parallel()
 	source, target := baselineTransformPair(t)
 	key, expected := baselineTransformKey(1), []byte("independently trusted prepared bytes")
 	beforeSource, beforeTarget := baselineProbeImage(t, source), baselineProbeImage(t, target)
@@ -59,6 +60,7 @@ func TestBootstrapBaselinePreparedTransformExactAddition(t *testing.T) {
 }
 
 func TestBootstrapBaselinePreparedTransformRejectsAllOtherDeltas(t *testing.T) {
+	t.Parallel()
 	key, expected := baselineTransformKey(1), []byte("trusted bytes")
 	cases := []struct {
 		name   string
@@ -124,6 +126,7 @@ func TestBootstrapBaselinePreparedTransformRejectsAllOtherDeltas(t *testing.T) {
 }
 
 func TestBootstrapBaselinePreparedTransformBoundsAndScope(t *testing.T) {
+	t.Parallel()
 	key := baselineTransformKey(1)
 	zeroCluster := append([]byte(baselinePreparedRawPrefix), make([]byte, len(raftbootstrap.UUID{})+timestampSize)...)
 	for _, allowed := range []map[string][]byte{
@@ -149,6 +152,7 @@ func TestBootstrapBaselinePreparedTransformBoundsAndScope(t *testing.T) {
 }
 
 func TestBootstrapBaselinePreparedTransformPreservesBaseRefusals(t *testing.T) {
+	t.Parallel()
 	for _, mutateSource := range []bool{true, false} {
 		for _, encrypted := range []bool{true, false} {
 			source, target := baselineTransformPair(t)
@@ -171,6 +175,7 @@ func TestBootstrapBaselinePreparedTransformPreservesBaseRefusals(t *testing.T) {
 }
 
 func TestBootstrapBaselinePreparedTransformCancellationAndMissingSnapshot(t *testing.T) {
+	t.Parallel()
 	source, target := baselineTransformPair(t)
 	src, dst := source.db.NewSnapshot(), target.db.NewSnapshot()
 	defer src.Close()
@@ -184,6 +189,7 @@ func TestBootstrapBaselinePreparedTransformCancellationAndMissingSnapshot(t *tes
 }
 
 func TestBootstrapBaselinePreparedTransformReadOnlyImagesDoNotMutateDisk(t *testing.T) {
+	t.Parallel()
 	key, value := baselineTransformKey(1), []byte("independently trusted")
 	var dirs []string
 	for _, target := range []bool{false, true} {
@@ -217,6 +223,7 @@ func TestBootstrapBaselinePreparedTransformReadOnlyImagesDoNotMutateDisk(t *test
 }
 
 func TestBootstrapBaselinePreparedTransformPropagatesReadFailures(t *testing.T) {
+	t.Parallel()
 	failure := errors.New("injected transform I/O failure")
 	good := baselineProbeErrorIterator{}
 	broken := baselineProbeErrorIterator{iterErr: failure}

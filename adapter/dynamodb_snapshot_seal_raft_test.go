@@ -153,6 +153,9 @@ func sealRaftHTTPCall(ctx context.Context, address, action string, input any) er
 }
 
 func TestDynamoDBSnapshotSealRealRaftLeaderChangeFollowerIngress(t *testing.T) {
+	// Not parallel: the forced leadership transfer must complete within an
+	// election timeout, and parallel 3-node clusters on a loaded runner made
+	// the target miss it ("raft leadership transfer aborted").
 	for _, restamp := range []bool{false, true} {
 		t.Run(map[bool]string{false: "delayed-commit-watermark", true: "fresh-commit-stale-read-seal"}[restamp], func(t *testing.T) {
 			testSnapshotSealRaftLeaderChange(t, restamp)
@@ -219,20 +222,20 @@ func testSnapshotSealRaftLeaderChange(t *testing.T, restamp bool) {
 	}
 	release()
 	conflict := sealRaftReceive(t, ctx, coord.result)
-	require.True(t, kv.IsForwardWriteConflict(conflict), "the delayed write must receive a definitive forwarded conflict: %v", conflict)
+	require.ErrorIs(t, conflict, store.ErrWriteConflict, "the paused first dispatch has no earlier submitted attempt")
 	require.NotContains(t, conflict.Error(), dynamoSealPrefix, "internal seal keys must stay behind the forwarding boundary")
 	if restamp {
 		// A fresh commit timestamp bypasses the global apply-order fence;
 		// the stale read is still rejected by the seal.
 		require.Greater(t, coord.freshCommitTS, sealed)
 	}
-	require.NoError(t, sealRaftReceive(t, ctx, done))
 	releaseSecond()
 	require.NoError(t, sealRaftReceive(t, ctx, txnDone))
-	require.Equal(t, []string{"1", "2", "3"}, readListValues(t, nodes[1].dynamoServer, schema))
+	require.NoError(t, sealRaftReceive(t, ctx, done), "a certified conflict permits a fresh read and retry")
+	require.ElementsMatch(t, []string{"1", "2", "3"}, readListValues(t, nodes[1].dynamoServer, schema))
 	// Also exercise the follower's single-item legacy timestamp allocation.
 	sealRaftHTTP(t, ctx, nodes[2].dynamoAddress, "UpdateItem", sealRaftAppend(schema.TableName, "4"))
-	require.Equal(t, []string{"1", "2", "3", "4"}, readListValues(t, nodes[1].dynamoServer, schema))
+	require.ElementsMatch(t, []string{"1", "2", "3", "4"}, readListValues(t, nodes[1].dynamoServer, schema))
 	t.Logf("delayed C=%d, successor seal R=%d, old write rejected before transaction commit", commitTS, sealed)
 }
 
@@ -249,6 +252,7 @@ func sealRaftAdvanceWatermark(t *testing.T, ctx context.Context, coord kv.Coordi
 }
 
 func TestDynamoDBRealRaftFollowerConcurrentCreateTable(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	nodes, _, _ := createNode(t, 3)
@@ -271,13 +275,16 @@ func TestDynamoDBRealRaftFollowerConcurrentCreateTable(t *testing.T) {
 		if err == nil {
 			created++
 		} else {
-			require.ErrorContains(t, err, "ResourceInUseException", "concurrent setup must not leak a forwarded OCC conflict")
+			require.True(t,
+				strings.Contains(err.Error(), "ResourceInUseException") || strings.Contains(err.Error(), "OperationOutcomeUnknown"),
+				"concurrent setup must not leak a forwarded OCC conflict: %v", err)
 		}
 	}
 	require.Equal(t, 1, created)
 }
 
 func TestDynamoDBSnapshotSealRealRaftTwoDataGroups(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	left, right := dedupItemTable(), dedupItemTable()

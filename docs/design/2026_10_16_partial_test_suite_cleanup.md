@@ -630,24 +630,15 @@ Record each mutation in the PR as a row: file and line, the change, the test tha
 
 - **Product bugs found by the audit.** Each needs its own PR with a failing test first.
   - Fixed: SQS FIFO messages in one group sent within the same millisecond could be received out of order, because the visibility key orders by `(visibleAtMillis, random messageID)`. See `2026_10_29_implemented_sqs_fifo_same_millisecond_order.md`.
-  - The Redis TTL-inline migration builds zero scan plans in production. `startupGatedCoordinator` does not forward `LocalLeaderGroupIDs`, and `keyVizLabeledCoordinator` returns nil when the inner value lacks it. Regression since `a36dac7f`.
+  - Fixed in `47f852ed`: the Redis TTL-inline migration built zero scan plans in production, because `startupGatedCoordinator` and `keyVizLabeledCoordinator` dropped `LocalLeaderGroupIDs`. Both now embed `kv.CoordinatorForwarder`.
   - Admin write authorization: SQS trusts the live role alone; S3 and DynamoDB require both the JWT role and the live role. Tests pin both. A policy decision is needed.
-  - S3 SigV4 `ListObjectsV2` returns 500 for an expired continuation token; only the admin path translates `ErrReadTSCompacted`.
-  - `store.PrefixScanEnd` returns a looser bound than the other six prefix-end helpers (not yet verified).
+  - Fixed in `6a13fb82`: S3 SigV4 `ListObjectsV2` returned 500 for an expired continuation token. The SigV4 and admin listings now share one scan that maps `ErrReadTSCompacted` on a resumed listing to `errS3ListingTokenExpired`.
+  - Fixed: `store.PrefixScanEnd` kept trailing 0xFF bytes as 0x00, so the scan end of `ab\xff` was `ac\x00` and the key `ac` fell inside it. It now truncates like the other helpers; `TestPrefixScanEnd` pins it.
   - Merge `3dfbabd8` dropped 48 feature-branch tests and left `WithGRPCReadGate`, `proxy/noop_backend.go` and `ProxyConfig.PProfAddr` orphaned. Confirm the intent.
-- **Production dead code that is only tested.** Delete it, porting live-relevant cases first:
-  - `internal/raftengine/etcd/migrate.go` (`MigrateFSMStore`; the root guard tests use it as a fixture)
-  - pre-WAL `persistence.go` writers
-  - `encryption.CheckLocalEpochRollback` (its tests contradict the live guard)
-  - `internal/backup` helpers (`ResolveCommitTS`, `peekMsgDataKey`, `IsBlobAtomicWrite*`, `HasInlineTTL`, `IsBinarySegment`, `effectivePartitionCount`, `WriteChecksumsWithVirtualFile`)
-  - `adapter/redis_transcord.go` and its property test (`CLAUDE.md` cites it)
-  - `selectXReadEntries`, `unmarshalStreamValue` and their benchmarks
-  - SQS `throttleAttributesPresent`, `sqsMsgByAgePrefixesForQueue`
-  - `fskeys.ChunkRouteHomeFromKey`
-  - `distribution.IsCatalogDeltaKey`
-  - autosplit `ObserveSnapshot` / `ReadCommittedWindows`
-  - `monitoring` `observeLeaderChange`
-  - unused options listed in the audit
+- **Production dead code that is only tested.** Done, with live-relevant cases ported first:
+  - Removed: `MigrateFSMStore` (the root startup-guard tests now seed persisted peers through `PreparePhysicalSnapshotRestore`); the pre-WAL `loadOrCreateState` path and its writers (the writers moved to `persistence_legacy_writers_test.go` to seed legacy directories); `encryption.CheckLocalEpochRollback`; the `internal/backup` helpers (`ResolveCommitTS`, `peekMsgDataKey`, `IsBlobAtomicWrite*` with the `disk_full_*.go` files, `HasInlineTTL`, `IsBinarySegment`, `effectivePartitionCount`, `WriteChecksumsWithVirtualFile`); `adapter/redis_transcord.go` and its property test; `selectXReadEntries`, `unmarshalStreamValue` and their benchmarks (`marshalStreamValue` moved to a test file as the legacy-blob fixture); SQS `throttleAttributesPresent` and `sqsMsgByAgePrefixesForQueue`; `fskeys.ChunkRouteHomeFromKey`; autosplit `ObserveSnapshot` / `ReadCommittedWindows` (their reset tests now drive `CommittedWindowsFromColumns` plus `Evaluate`, as the scheduler does); `monitoring` `observeLeaderChange`.
+  - Kept: `distribution.IsCatalogDeltaKey` has a production caller (`kv/raft_bootstrap_guard.go`).
+  - Still open: the audit's list of unused options was not recorded here. A scan finds about 70 `With*` options set only by tests; most are test seams (clocks, intervals, loggers, timeouts), so removing any needs a per-option decision.
 - **CI runtime.**
   - `adapter/grpc_test.go` `Test_consistency_satisfy_write_after_read_sequence` and `Test_grpc_transaction`: 9,999 sequential RPCs each, about 5.5 min under `-race`. Iteration count is a maintainer decision (restored on purpose in `24b9f80b`).
   - `internal/encryption/keystore_test.go` `TestKeystore_Concurrent`: no assertion, 179 s under `-race`; bounding the key space makes it about 3 s.

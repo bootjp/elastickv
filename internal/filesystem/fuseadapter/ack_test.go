@@ -64,6 +64,7 @@ func newAcknowledgementCore() *acknowledgementCore {
 }
 
 func TestAcknowledgementAcceptsRetiredReceipt(t *testing.T) {
+	t.Parallel()
 	core := newAcknowledgementCore()
 	core.verifyErr = filesystem.ErrOperationRetired
 	adapter := New(core, []byte("client"), WithHandleKeepaliveInterval(0))
@@ -83,6 +84,7 @@ func TestAcknowledgementAcceptsRetiredReceipt(t *testing.T) {
 }
 
 func TestAcknowledgementKeepsUnrelatedUnknownOnSameDirectory(t *testing.T) {
+	t.Parallel()
 	core := newAcknowledgementCore()
 	adapter := New(core, []byte("client"), WithHandleKeepaliveInterval(0))
 	defer adapter.Close()
@@ -101,6 +103,7 @@ func TestAcknowledgementKeepsUnrelatedUnknownOnSameDirectory(t *testing.T) {
 }
 
 func TestAcknowledgementRetriesAfterLostResponse(t *testing.T) {
+	t.Parallel()
 	core := &lostAcknowledgementCore{receiptCore: newAcknowledgementCore().receiptCore}
 	adapter := New(core, []byte("client"), WithHandleKeepaliveInterval(0))
 	id := filesystem.OperationID{Filesystem: [16]byte{1}, Session: [16]byte{2}, Sequence: 1}
@@ -124,6 +127,7 @@ func (c *blockingAcknowledgementCore) VerifyOperationReceipt(_ context.Context, 
 }
 
 func TestAcknowledgementDoesNotHoldReceiptLockDuringVerification(t *testing.T) {
+	t.Parallel()
 	core := &blockingAcknowledgementCore{
 		acknowledgementCore: newAcknowledgementCore(),
 		verifying:           make(chan struct{}),
@@ -146,6 +150,7 @@ func TestAcknowledgementDoesNotHoldReceiptLockDuringVerification(t *testing.T) {
 }
 
 func TestFsyncDoesNotHoldReceiptLockDuringVerification(t *testing.T) {
+	t.Parallel()
 	core := &blockingAcknowledgementCore{
 		acknowledgementCore: newAcknowledgementCore(),
 		verifying:           make(chan struct{}),
@@ -168,6 +173,7 @@ func TestFsyncDoesNotHoldReceiptLockDuringVerification(t *testing.T) {
 }
 
 func TestStrictCloseDrainsAcknowledgements(t *testing.T) {
+	t.Parallel()
 	core := newAcknowledgementCore()
 	session := filesystem.OperationSessionID{Filesystem: [16]byte{1}, Session: [16]byte{2}}
 	adapter := New(core, []byte("client"), WithHandleKeepaliveInterval(0), WithStrictMode(session))
@@ -177,6 +183,7 @@ func TestStrictCloseDrainsAcknowledgements(t *testing.T) {
 }
 
 func TestAcknowledgementBatchRotatesPastFailures(t *testing.T) {
+	t.Parallel()
 	adapter := New(&fakeCore{}, []byte("client"), WithHandleKeepaliveInterval(0))
 	adapter.ackPending = make(map[filesystem.OperationID]struct{})
 	for sequence := uint64(1); sequence <= 70; sequence++ {
@@ -194,6 +201,7 @@ func TestAcknowledgementBatchRotatesPastFailures(t *testing.T) {
 }
 
 func TestSuppressedReplyQueuesOperationIdentity(t *testing.T) {
+	t.Parallel()
 	adapter := New(&fakeCore{}, []byte("client"), WithHandleKeepaliveInterval(0))
 	fs := NewRawFileSystem(adapter)
 	id := filesystem.OperationID{Filesystem: [16]byte{1}, Session: [16]byte{2}, Sequence: 1}
@@ -204,6 +212,7 @@ func TestSuppressedReplyQueuesOperationIdentity(t *testing.T) {
 }
 
 func TestStrictSessionWaitsForUnansweredRequest(t *testing.T) {
+	t.Parallel()
 	core := newAcknowledgementCore()
 	session := filesystem.OperationSessionID{Filesystem: [16]byte{1}, Session: [16]byte{2}}
 	adapter := New(core, []byte("client"), WithHandleKeepaliveInterval(0), WithStrictMode(session))
@@ -219,4 +228,30 @@ func TestStrictSessionWaitsForUnansweredRequest(t *testing.T) {
 	defer cancel()
 	require.NoError(t, adapter.finishStrictSession(ctx))
 	require.True(t, core.closed)
+}
+
+// TestRetryAcknowledgementsStopsWhenCancelledAndWoken pins that a cancelled
+// acknowledgement loop never starts another batch, even when a wake-up is
+// already queued. select picks a ready case at random, so without the check
+// a stopped loop would still call AcknowledgeOperation about half the time
+// while its owner (a test, or Close) has moved on.
+func TestRetryAcknowledgementsStopsWhenCancelledAndWoken(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	for range 64 {
+		core := newAcknowledgementCore()
+		adapter := New(core, []byte("client"), WithHandleKeepaliveInterval(0))
+		adapter.ackWake = make(chan struct{}, 1)
+		adapter.queueAcknowledgement(filesystem.OperationID{Filesystem: [16]byte{1}, Session: [16]byte{2}, Sequence: 1})
+
+		adapter.retryAcknowledgements(ctx)
+
+		select {
+		case id := <-core.acknowledged:
+			t.Fatalf("cancelled acknowledgement loop acknowledged %v", id)
+		default:
+		}
+		adapter.Close()
+	}
 }

@@ -117,6 +117,7 @@ var (
 	s3CredsFile                     = flag.String("s3CredentialsFile", "", "Path to a JSON file containing static S3 credentials")
 	s3PathStyleOnly                 = flag.Bool("s3PathStyleOnly", true, "Only accept path-style S3 requests")
 	sqsAddr                         = flag.String("sqsAddress", "", "TCP host+port for SQS-compatible API; empty to disable")
+	sqsPublicEndpoint               = flag.String("sqsPublicEndpoint", "", "Public HTTP(S) origin used in SQS queue URLs behind a proxy; empty derives URLs from the request")
 	sqsRegion                       = flag.String("sqsRegion", "us-east-1", "SQS signing region")
 	sqsCredsFile                    = flag.String("sqsCredentialsFile", "", "Path to a JSON file containing static SQS credentials")
 	metricsAddr                     = flag.String("metricsAddress", "localhost:9090", "TCP host+port for Prometheus metrics")
@@ -149,6 +150,7 @@ var (
 	tsoBatchSize                    = flag.Int("tsoBatchSize", defaultTSOBatchSize, "Timestamp batch size used by TSO cutover and shadow validation")
 	tsoModeFile                     = flag.String("tsoModeFile", "", "Path to a runtime-reloadable TSO mode file containing legacy, shadow, cutover, or phase-d")
 	tsoModeReloadInterval           = flag.Duration("tsoModeReloadInterval", defaultTSOReload, "Polling interval for tsoModeFile")
+	commitTSFence                   = flag.Bool("commitTSFence", false, "Reserved for replicated catalog bootstrap; activation is rejected until the startup catalog no longer writes outside Raft")
 	readWatermarkAdvance            = flag.Bool("readWatermarkAdvance", false, "Raise a lagging group's commit watermark before a cross-group snapshot read so late one-phase writes cannot land below the snapshot; enable only after every node runs a binary that understands the advance entry")
 	leaderBalance                   = flag.Bool("leaderBalance", false, "Enable automatic count-based Raft-group leader balancing on the default-group leader")
 	leaderBalanceInterval           = flag.Duration("leaderBalanceInterval", defaultLeaderBalanceInterval, "Interval between leader-balance scheduler evaluations")
@@ -566,6 +568,11 @@ func run() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	handoff := newShutdownHandoff(cancel)
 	cleanup.Add(installShutdownSignalHandler(handoff.requestShutdown))
+	health, stopHealth, err := startRuntimeHealth(ctx, &lc, cancel, *healthAddress, *raftId)
+	if err != nil {
+		return err
+	}
+	cleanup.Add(stopHealth)
 
 	// Stage 6D-6c: buildShardGroupsWithEncryptionWiring assembles the
 	// storage-envelope write-path wiring (cipher + deterministic nonce
@@ -619,6 +626,7 @@ func run() error {
 	// The label is resolved per-pebbleStore from ELASTICKV_FSM_SYNC_MODE
 	// in NewPebbleStore; read it off the first constructed store (all
 	// shards share the same env and therefore the same label).
+	publishRuntimeHealth(health, runtimes)
 	recordFSMApplySyncMode(metricsRegistry, runtimes)
 
 	cleanup.Add(readTracker.Close)
@@ -645,6 +653,7 @@ func run() error {
 		WithKeyVizLabelsEnabled(*keyVizFlags.LabelsEnabled).
 		WithAllShardGroups(dataGroupIDs(cfg.groups)...).
 		WithPartitionResolver(sqsPartitionResolver)
+	configureCommitTSFenceActivation(coordinate, *commitTSFence, runtimes)
 	installBootstrapCoordinator(bootstrapDomain, coordinate, &cleanup)
 	tsoWiring, err := configureCoordinatorTSOWithObserver(
 		coordinate,
@@ -745,6 +754,7 @@ func run() error {
 	}); err != nil {
 		return err
 	}
+	health.MarkServing()
 	balanceCtx, stopBalance := context.WithCancel(runCtx)
 	defer stopBalance()
 	balanceDone := make(chan struct{})
@@ -770,6 +780,14 @@ func newStartupShardStore(engine *distribution.Engine, groups map[uint64]*kv.Sha
 	return shardStore
 }
 
+func configureCommitTSFenceActivation(coordinate *kv.ShardedCoordinator, enabled bool, runtimes []*raftGroupRuntime) {
+	if enabled {
+		coordinate.WithCommitTSFenceActivation().WithCommitTSFenceActivationReady(func() bool {
+			return commitTSFenceRuntimesReady(runtimes)
+		})
+	}
+}
+
 func waitRunGroup(eg *errgroup.Group) error {
 	if err := eg.Wait(); err != nil {
 		return errors.Wrapf(err, "failed to serve")
@@ -793,6 +811,9 @@ func startTSOModeReloader(ctx context.Context, eg *errgroup.Group, wiring coordi
 }
 
 func resolveValidatedRuntimeInputs() (runtimeConfig, raftEngineType, raftBootstrapConfig, bool, error) {
+	if err := validateCommitTSFenceStartup(*commitTSFence, *raftBootstrapPeerConfigDir != ""); err != nil {
+		return runtimeConfig{}, "", raftBootstrapConfig{}, false, err
+	}
 	cfg, engineType, bootstrapCfg, bootstrap, err := resolveRuntimeInputs()
 	if err != nil {
 		return runtimeConfig{}, "", raftBootstrapConfig{}, false, err
@@ -802,6 +823,13 @@ func resolveValidatedRuntimeInputs() (runtimeConfig, raftEngineType, raftBootstr
 		*backupSnapshotHeadroomEntries, *backupScanPageSize, *backupMaxActivePins,
 	)
 	return cfg, engineType, bootstrapCfg, bootstrap, err
+}
+
+func validateCommitTSFenceStartup(enabled, protected bool) error {
+	if enabled && !protected {
+		return errors.New("commitTSFence requires protected Raft catalog bootstrap; legacy startup catalog writes outside Raft")
+	}
+	return nil
 }
 
 func validateLiveBackupConfig(
@@ -2930,6 +2958,7 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 		leaderSQS:          in.cfg.leaderSQS,
 		sqsRegion:          *sqsRegion,
 		sqsCredsFile:       *sqsCredsFile,
+		sqsPublicEndpoint:  *sqsPublicEndpoint,
 		// sqsPartitionResolver is rebuilt from the same config map
 		// the coordinator's WithPartitionResolver consumes (line
 		// ~328) so the SQS server's CreateQueue capability gate
@@ -2990,8 +3019,14 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 	if err := waitRotateOnStartup.Wait(in.ctx); err != nil {
 		return runner.startupFailure(errors.Wrap(err, "encryption rotate-on-startup: wait before serving"))
 	}
+	return startPublicServicesAfterCommitTSFence(in, &runner, publicKVGate, *commitTSFence)
+}
+
+func startPublicServicesAfterCommitTSFence(in serversInput, runner *runtimeServerRunner, gate *startupPublicKVGate, fenceEnabled bool) error {
 	startHLCLeaseRenewal(in.ctx, in.eg, in.coordinate)
-	publicKVGate.markReady()
+	if err := markPublicGateReadyAfterCommitTSFence(in.ctx, gate, in.runtimes, fenceEnabled); err != nil {
+		return runner.startupFailure(errors.Wrap(err, "wait for commit-ts fence activation before public service"))
+	}
 	startDistributionSplitJobRunner(in.ctx, in.eg, in.distServer)
 	startMigrationOwnershipRefresh(in.ctx, in.eg, in.distServer)
 	if err := runner.startPublicServices(); err != nil {
@@ -4694,6 +4729,9 @@ func setupDistributionCatalog(
 	runtimes []*raftGroupRuntime,
 	engine *distribution.Engine,
 ) (*distribution.CatalogStore, error) {
+	if err := validateNoExistingCommitTSFenceActivation(ctx, runtimes, bootstrapDomainForRuntimes(runtimes) != nil); err != nil {
+		return nil, err
+	}
 	catalogGroupID, err := distributionCatalogGroupID(engine)
 	if err != nil {
 		return nil, errors.Wrapf(err, "resolve distribution catalog group")
@@ -4726,6 +4764,22 @@ func setupDistributionCatalog(
 		return nil, errors.Wrapf(err, "initialize distribution catalog")
 	}
 	return distCatalog, nil
+}
+
+func validateNoExistingCommitTSFenceActivation(ctx context.Context, runtimes []*raftGroupRuntime, protected bool) error {
+	for _, rt := range runtimes {
+		if rt == nil || rt.store == nil {
+			continue
+		}
+		active, err := kv.CommitTSFenceEnabled(ctx, rt.store)
+		if err != nil {
+			return errors.Wrapf(err, "read commit-ts fence activation for group %d", rt.spec.id)
+		}
+		if active && !protected {
+			return errors.WithStack(errors.Newf("group %d has an active commit-ts fence; protected Raft catalog bootstrap is required before startup", rt.spec.id))
+		}
+	}
+	return nil
 }
 
 func distributionCatalogGroupID(engine *distribution.Engine) (uint64, error) {
@@ -4877,6 +4931,7 @@ type runtimeServerRunner struct {
 	leaderSQS                       map[string]string
 	sqsRegion                       string
 	sqsCredsFile                    string
+	sqsPublicEndpoint               string
 	metricsAddress                  string
 	metricsToken                    string
 	pprofAddress                    string
@@ -5104,7 +5159,7 @@ func (r *runtimeServerRunner) preparePublicServices() error {
 
 	sqsServer, sqsListener, err := prepareSQSServer(
 		r.ctx, r.lc, r.sqsAddress, r.shardStore, r.coordinate,
-		r.leaderSQS, r.sqsRegion, r.sqsCredsFile,
+		r.leaderSQS, r.sqsRegion, r.sqsCredsFile, r.sqsPublicEndpoint,
 		r.sqsPartitionResolver, r.sqsPartitionObserver,
 	)
 	if err != nil {

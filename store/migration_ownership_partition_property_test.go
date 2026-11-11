@@ -73,6 +73,7 @@ func codecPropertyPermute[T any](t *rapid.T, values []T) {
 }
 
 func TestMigrationCodecPropertyPartitionRoundTripAndHashes(t *testing.T) {
+	t.Parallel()
 	ledger, seed := codecPropertyPartitionFixture(t)
 	rapid.Check(t, func(t *rapid.T) {
 		state := codecPropertyPartitionState(t, ledger, seed)
@@ -127,6 +128,7 @@ func codecPropertyPartitionHashBinding(t *rapid.T, transition MigrationOwnership
 }
 
 func TestMigrationCodecPropertyPartitionRejectsMalformed(t *testing.T) {
+	t.Parallel()
 	ledger, seed := codecPropertyPartitionFixture(t)
 	rapid.Check(t, func(t *rapid.T) {
 		state := codecPropertyPartitionState(t, ledger, seed)

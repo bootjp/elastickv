@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/bootjp/elastickv/internal/testutil/grpctest"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
 )
 
 type stubLeaderCoordinator struct {
@@ -63,6 +65,7 @@ func (s *stubLeaderCoordinator) LinearizableRead(context.Context) (uint64, error
 }
 
 func TestLeaderRoutedStore_GlobalCommittedTimestampFloorWaitsForApply(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	local := store.NewMVCCStore()
 	require.NoError(t, local.PutAt(ctx, []byte("hot"), []byte("old"), 10, 0))
@@ -86,6 +89,7 @@ func TestLeaderRoutedStore_GlobalCommittedTimestampFloorWaitsForApply(t *testing
 }
 
 func TestLeaderRoutedStore_GlobalCommittedTimestampFloorProxiesFencedLeader(t *testing.T) {
+	t.Parallel()
 	fake := &fakeRawKVServer{
 		wantLatestGroupID: 1,
 		latestResp:        &pb.RawLatestCommitTSResponse{Ts: 30, GroupId: 1, LeaderFenced: true},
@@ -445,6 +449,14 @@ func TestLeaderRoutedStore_GlobalLastCommitTS_ProxiesToLeader(t *testing.T) {
 	coord := &stubLeaderCoordinator{isLeader: false, leader: addr, clock: NewHLC()}
 	s := NewLeaderRoutedStore(store.NewMVCCStore(), coord)
 	t.Cleanup(func() { _ = s.Close() })
+
+	// GlobalLastCommitTS gives the proxy RPC globalLastCommitTSTimeout and
+	// falls back to the local value on timeout. Connect first so the dial
+	// does not spend that budget under a loaded parallel -race run.
+	conn, err := s.connCache.ConnFor(addr)
+	require.NoError(t, err)
+	conn.Connect()
+	require.Eventually(t, func() bool { return conn.GetState() == connectivity.Ready }, 5*time.Second, 10*time.Millisecond)
 
 	ts := s.GlobalLastCommitTS(context.Background())
 	require.Equal(t, uint64(99), ts)

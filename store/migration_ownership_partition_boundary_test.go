@@ -10,6 +10,7 @@ import (
 )
 
 func TestOwnershipPartitionSourceZeroFloorAndConfigurationCAS(t *testing.T) {
+	t.Parallel()
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		writer, ok := st.(MigrationTargetReadinessRaftWriter)
 		require.True(t, ok)
@@ -64,6 +65,7 @@ func TestOwnershipPartitionSourceZeroFloorAndConfigurationCAS(t *testing.T) {
 }
 
 func TestOwnershipPartitionRootManifestExternalRefusal(t *testing.T) {
+	t.Parallel()
 	key := append([]byte("!dist|meta|ownership_partition/"), make([]byte, 40)...)
 	for _, format := range []string{"mvcc", "native", "sst", "encrypted-native", "encrypted-sst"} {
 		t.Run(format, func(t *testing.T) {
@@ -99,6 +101,7 @@ func TestOwnershipPartitionRootManifestExternalRefusal(t *testing.T) {
 }
 
 func TestOwnershipPartitionHashesCanonicalAndBound(t *testing.T) {
+	t.Parallel()
 	st := NewMVCCStore()
 	_, tx := partitionFixture(t, st)
 	id, err := MigrationOwnershipPartitionReceiptIDFor(tx)

@@ -73,6 +73,7 @@ func (c *collidingMountCore) Create(ctx context.Context, parent uint64, name []b
 }
 
 func TestCollidingMountCoreInterruptedFlush(t *testing.T) {
+	t.Parallel()
 	backend := &fakeCore{}
 	core := &collidingMountCore{Core: backend}
 	core.interruptFlush.Store(true)

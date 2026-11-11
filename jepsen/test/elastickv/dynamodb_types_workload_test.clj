@@ -53,6 +53,9 @@
   (is (@#'workload/setup-retryable?
         (ex-info "DynamoDB InternalServerError: no raft leader currently available"
                  {:type "InternalServerError"})))
+  (is (@#'workload/setup-retryable?
+        (ex-info "DynamoDB OperationOutcomeUnknown: Operation outcome unknown"
+                 {:type "OperationOutcomeUnknown"})))
   (is (not (@#'workload/setup-retryable?
              (ex-info "DynamoDB ValidationException: bad request"
                       {:type "ValidationException"})))))
@@ -66,3 +69,25 @@
                                 {:type "InternalServerError"}))
                 :ok))))
     (is (= 2 @calls))))
+
+(deftest create-table-setup-retries-unknown-with-same-name
+  (let [calls (atom [])]
+    (with-redefs-fn {#'workload/ddb-invoke!
+                    (fn [_ op request]
+                      (swap! calls conj [op (:TableName request)])
+                      (throw (ex-info "create result" {:type (if (= 1 (count @calls))
+                                                              "OperationOutcomeUnknown"
+                                                              "ResourceInUseException")})))}
+      #(is (nil? (@#'workload/create-table! ::ddb "jepsen-type-string" 5 5))))
+    (is (= [[:CreateTable "jepsen-type-string"] [:CreateTable "jepsen-type-string"]] @calls))))
+
+(deftest clear-keys-setup-retries-unknown-with-same-key
+  (let [calls (atom [])]
+    (with-redefs-fn {#'workload/ddb-invoke!
+                    (fn [_ op request]
+                      (swap! calls conj [op (:TableName request) (:Key request)])
+                      (when (= 1 (count @calls))
+                        (throw (ex-info "delete result" {:type "OperationOutcomeUnknown"}))))}
+      #(@#'workload/clear-keys! ::ddb "jepsen-type-string" 1))
+    (is (= 2 (count @calls)))
+    (is (apply = @calls))))

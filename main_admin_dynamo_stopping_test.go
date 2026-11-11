@@ -14,6 +14,7 @@ import (
 // Retry-After), so the client retries against another node instead of
 // seeing a 500.
 func TestTranslateAdminDynamoErrorsMapStoppingToNotLeader(t *testing.T) {
+	t.Parallel()
 	err := errors.Wrap(adapter.ErrDynamoServerStopping, "admin delete table")
 	require.ErrorIs(t, translateAdminTablesError(err), admin.ErrTablesNotLeader)
 	require.ErrorIs(t, translateAdminItemsError(err), admin.ErrItemsNotLeader)

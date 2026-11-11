@@ -232,7 +232,16 @@ func newSQSAPIError(status int, errorType string, message string) error {
 	return &sqsAPIError{status: status, errorType: errorType, message: message}
 }
 
+const (
+	sqsErrOperationOutcomeUnknown = "OperationOutcomeUnknown"
+	sqsMsgOperationOutcomeUnknown = "Operation outcome unknown"
+)
+
 func writeSQSErrorFromErr(w http.ResponseWriter, err error) {
+	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+		writeSQSError(w, http.StatusConflict, sqsErrOperationOutcomeUnknown, sqsMsgOperationOutcomeUnknown)
+		return
+	}
 	var throttled *sqsThrottlingError
 	if errors.As(err, &throttled) {
 		writeSQSThrottlingError(w, throttled.queue, throttled.action, throttled.retryAfter)
@@ -331,6 +340,9 @@ func decodeSQSJSONInput(r *http.Request, v any) error {
 // the endpoint the client addressed so SDKs that re-sign subsequent requests
 // against the same URL keep working behind reverse proxies.
 func (s *SQSServer) queueURL(r *http.Request, queueName string) string {
+	if s.publicEndpoint != "" {
+		return s.publicEndpoint + "/" + queueName
+	}
 	scheme := httpSchemePlain
 	if r.TLS != nil {
 		scheme = "https"

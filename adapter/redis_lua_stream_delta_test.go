@@ -125,6 +125,7 @@ func newLuaStreamDeltaTestServer(
 }
 
 func TestLuaStreamXAddDeltaCommitAvoidsFullScanAndRewrite(t *testing.T) {
+	t.Parallel()
 	key := []byte("lua:stream:delta")
 	server, base, counting := newLuaStreamDeltaTestServer(t, key)
 	seedLuaWideStream(t, base, key, 128, 0)
@@ -150,6 +151,7 @@ return redis.call("XLEN", KEYS[1])
 }
 
 func TestLuaStreamXAddMaxLenUsesBoundedDeltaTrim(t *testing.T) {
+	t.Parallel()
 	key := []byte("lua:stream:maxlen-delta")
 	server, base, counting := newLuaStreamDeltaTestServer(t, key)
 	seedLuaWideStream(t, base, key, 128, 0)
@@ -176,6 +178,7 @@ return redis.call("XADD", KEYS[1], "MAXLEN", "~", 128, "130-0", "field", "b")
 }
 
 func TestLuaStreamXAddMaxLenZeroKeepsLastIDWithoutRows(t *testing.T) {
+	t.Parallel()
 	key := []byte("lua:stream:maxlen-zero")
 	server, base, counting := newLuaStreamDeltaTestServer(t, key)
 	seedLuaWideStream(t, base, key, 2, 0)
@@ -203,6 +206,7 @@ return next
 }
 
 func TestLuaStreamXTrimMaxLenZeroKeepsEmptyStreamMetadata(t *testing.T) {
+	t.Parallel()
 	key := []byte("lua:stream:xtrim-empty")
 	server, base, counting := newLuaStreamDeltaTestServer(t, key)
 	expireAt := time.Now().Add(time.Hour)
@@ -259,6 +263,7 @@ func TestLuaStreamXTrimMaxLenZeroKeepsEmptyStreamMetadata(t *testing.T) {
 }
 
 func TestLuaStreamXAddMaxLenUsesTrimCursorForNextHeadScan(t *testing.T) {
+	t.Parallel()
 	key := []byte("lua:stream:trim-cursor")
 	server, base, counting := newLuaStreamDeltaTestServer(t, key)
 	seedLuaWideStream(t, base, key, 4, 0)
@@ -292,6 +297,7 @@ func TestLuaStreamXAddMaxLenUsesTrimCursorForNextHeadScan(t *testing.T) {
 }
 
 func TestTrimLuaStreamHeadMaxLenZeroAtStorageCapRemovesPendingAppend(t *testing.T) {
+	t.Parallel()
 	st := &luaStreamState{
 		baseMeta: store.StreamMeta{Length: maxWideColumnItems},
 		meta:     store.StreamMeta{Length: maxWideColumnItems + 1},
@@ -306,6 +312,7 @@ func TestTrimLuaStreamHeadMaxLenZeroAtStorageCapRemovesPendingAppend(t *testing.
 }
 
 func TestLuaStreamTTLAndExplicitIDDeltaSemantics(t *testing.T) {
+	t.Parallel()
 	key := []byte("lua:stream:ttl")
 	expireAt := time.Now().Add(time.Minute)
 	server, base, counting := newLuaStreamDeltaTestServer(t, key)
@@ -341,6 +348,7 @@ return id
 }
 
 func TestLuaStreamRangeForcesFullFallbackAndSeesScriptMutations(t *testing.T) {
+	t.Parallel()
 	key := []byte("lua:stream:range-fallback")
 	server, base, counting := newLuaStreamDeltaTestServer(t, key)
 	seedLuaWideStream(t, base, key, 3, 0)
@@ -381,6 +389,7 @@ func TestLuaStreamRangeForcesFullFallbackAndSeesScriptMutations(t *testing.T) {
 }
 
 func TestLuaStreamDeleteRecreateAndExpiredFallbackCleanOldRows(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		key      []byte
@@ -437,6 +446,7 @@ func TestLuaStreamDeleteRecreateAndExpiredFallbackCleanOldRows(t *testing.T) {
 }
 
 func TestLuaStreamLegacyFallbackDiscardsBlobAndWritesDeltaLayout(t *testing.T) {
+	t.Parallel()
 	key := []byte("lua:stream:legacy")
 	server, base, _ := newLuaStreamDeltaTestServer(t, key)
 	legacyRaw, err := marshalStreamValue(redisStreamValue{Entries: []redisStreamEntry{
@@ -461,6 +471,7 @@ func TestLuaStreamLegacyFallbackDiscardsBlobAndWritesDeltaLayout(t *testing.T) {
 }
 
 func TestLuaStreamDeltaCommitCarriesTypeAndMetaReadFences(t *testing.T) {
+	t.Parallel()
 	key := []byte("lua:stream:read-fences")
 	st := store.NewMVCCStore()
 	coord := newReadKeyRecordingCoordinator(st)
@@ -487,6 +498,7 @@ func TestLuaStreamDeltaCommitCarriesTypeAndMetaReadFences(t *testing.T) {
 }
 
 func TestLuaStreamAbsentCreateReadFenceRejectsConcurrentString(t *testing.T) {
+	t.Parallel()
 	key := []byte("lua:stream:read-fence-race")
 	st := store.NewMVCCStore()
 	coord := &luaStreamFenceRaceCoordinator{
@@ -510,6 +522,7 @@ func TestLuaStreamAbsentCreateReadFenceRejectsConcurrentString(t *testing.T) {
 }
 
 func TestLuaStreamXAddRetryDoesNotDuplicateEntries(t *testing.T) {
+	t.Parallel()
 	key := []byte("lua:stream:retry")
 	st := store.NewMVCCStore()
 	seedLuaWideStream(t, st, key, 1, 0)
@@ -533,6 +546,7 @@ func TestLuaStreamXAddRetryDoesNotDuplicateEntries(t *testing.T) {
 }
 
 func TestLuaStreamXAddAmbiguousWireConflictFailsClosed(t *testing.T) {
+	t.Parallel()
 	key := []byte("lua:stream:wire-conflict")
 	st := store.NewMVCCStore()
 	seedLuaWideStream(t, st, key, 1, 0)

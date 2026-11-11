@@ -188,6 +188,7 @@ func newRedisWireStore(t *testing.T) store.MVCCStore {
 }
 
 func TestRedisWireTransactionHealthyPipelineAndDiscard(t *testing.T) {
+	t.Parallel()
 	st := newRedisWireStore(t)
 	g := newRedisWireTestGate(t)
 	s := startRedisWireServer(t, st, newLocalAdapterCoordinator(st), g, WithOnePhaseTxnDedup(true))
@@ -207,6 +208,7 @@ func TestRedisWireTransactionHealthyPipelineAndDiscard(t *testing.T) {
 }
 
 func TestRedisWireTransactionNativeRevocationBeforeExec(t *testing.T) {
+	t.Parallel()
 	for _, change := range []string{"term", "configuration"} {
 		t.Run(change, func(t *testing.T) {
 			st := newRedisWireStore(t)
@@ -236,6 +238,7 @@ func TestRedisWireTransactionNativeRevocationBeforeExec(t *testing.T) {
 }
 
 func TestRedisWireTransactionLifecycle(t *testing.T) {
+	t.Parallel()
 	for _, exit := range []string{"disconnect", "close", "idle"} {
 		t.Run(exit, func(t *testing.T) {
 			st := newRedisWireStore(t)
@@ -272,6 +275,7 @@ func (c *redisWireDispatchCoordinator) Dispatch(ctx context.Context, ops *kv.Ope
 }
 
 func TestRedisWireTransactionRevokedDuringCommit(t *testing.T) {
+	t.Parallel()
 	st := newRedisWireStore(t)
 	g := newRedisWireTestGate(t)
 	local := newLocalAdapterCoordinator(st)
@@ -310,6 +314,7 @@ func TestRedisWireTransactionRevokedDuringCommit(t *testing.T) {
 }
 
 func TestRedisWireTransactionQueueBoundsAndErrors(t *testing.T) {
+	t.Parallel()
 	s, owner := redisPropagationServer(t)
 	c := &redisOwnedTestConn{}
 	command := func(args ...string) {
@@ -332,6 +337,7 @@ func TestRedisWireTransactionQueueBoundsAndErrors(t *testing.T) {
 }
 
 func TestRedisWireTransactionDisconnectDuringCommitRetainsOwnerUntilJoin(t *testing.T) {
+	t.Parallel()
 	st := newRedisWireStore(t)
 	g := newRedisWireTestGate(t)
 	local := newLocalAdapterCoordinator(st)
@@ -367,6 +373,7 @@ func TestRedisWireTransactionDisconnectDuringCommitRetainsOwnerUntilJoin(t *test
 }
 
 func TestRedisWireTransactionCloseJoinsOwnedChildren(t *testing.T) {
+	t.Parallel()
 	st := newRedisWireStore(t)
 	g := newRedisWireTestGate(t)
 	s := startRedisWireServer(t, st, newLocalAdapterCoordinator(st), g)
@@ -402,6 +409,7 @@ func TestRedisWireTransactionCloseJoinsOwnedChildren(t *testing.T) {
 }
 
 func TestRedisWireTransactionIdleCancelsOwnerChildren(t *testing.T) {
+	t.Parallel()
 	st := newRedisWireStore(t)
 	g := newRedisWireTestGate(t)
 	s := startRedisWireServer(t, st, newLocalAdapterCoordinator(st), g, func(s *RedisServer) {
@@ -425,6 +433,7 @@ func TestRedisWireTransactionIdleCancelsOwnerChildren(t *testing.T) {
 }
 
 func TestRedisWireTransactionHeavyPoolFullFinishesOwner(t *testing.T) {
+	t.Parallel()
 	st := newRedisWireStore(t)
 	g := newRedisWireTestGate(t)
 	limiter := newRedisHeavyCommandLimiter(1)
@@ -440,6 +449,7 @@ func TestRedisWireTransactionHeavyPoolFullFinishesOwner(t *testing.T) {
 }
 
 func TestRedisWireTransactionPreservesTypedUnknown(t *testing.T) {
+	t.Parallel()
 	s, owner := redisPropagationServer(t)
 	calls := 0
 	s.coordinator = &redisWireDispatchCoordinator{Coordinator: s.coordinator, dispatch: func(context.Context, *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
@@ -453,12 +463,13 @@ func TestRedisWireTransactionPreservesTypedUnknown(t *testing.T) {
 	require.Equal(t, 1, calls)
 	require.ErrorIs(t, owner.original, kv.ErrTransactionOutcomeUnknown)
 	require.Len(t, c.writes, 1)
-	require.Contains(t, c.writes[0].s, kv.ErrTransactionOutcomeUnknown.Error())
+	require.Equal(t, "ERR operation outcome unknown", c.writes[0].s)
 	require.Equal(t, 1, owner.finishes)
 	require.Equal(t, 1, owner.joins)
 }
 
 func TestRedisWireTransactionProxyReplyTypes(t *testing.T) {
+	t.Parallel()
 	queue := []redcon.Command{
 		{Args: [][]byte{[]byte(cmdSet), []byte("k"), []byte("v")}},
 		{Args: [][]byte{[]byte(cmdHMSet), []byte("h"), []byte("f"), []byte("v")}},
@@ -481,6 +492,7 @@ func TestRedisWireTransactionProxyReplyTypes(t *testing.T) {
 }
 
 func TestRedisOwnedProxyOverflowUnknownClassification(t *testing.T) {
+	t.Parallel()
 	recorder := &redisOwnedTestConn{}
 	target := &redisOwnedConn{Conn: recorder, writer: &redisReplyBuffer{err: errRedisReplyTooLarge},
 		mayWrite: true, workStarted: true}
@@ -495,12 +507,18 @@ func TestRedisOwnedProxyOverflowUnknownClassification(t *testing.T) {
 		cmd.SetErr(remote)
 		require.ErrorIs(t, ownedProxyTransactionError(nil, []*redis.Cmd{cmd}), kv.ErrTransactionOutcomeUnknown)
 	}
-	for _, other := range []string{"prefix " + message, kv.ErrTransactionOutcomeUnknown.Error() + "; unrelated", kv.ErrTransactionOutcomeUnknown.Error() + "ish"} {
+	require.True(t, isProxyTransactionOutcomeUnknown(errors.New("ERR operation outcome unknown")))
+	require.ErrorIs(t, ownedProxyTransactionError(errors.New("ERR operation outcome unknown"), nil), kv.ErrTransactionOutcomeUnknown)
+	cmd := redis.NewCmd(t.Context())
+	cmd.SetErr(errors.New("ERR operation outcome unknown"))
+	require.ErrorIs(t, ownedProxyTransactionError(nil, []*redis.Cmd{cmd}), kv.ErrTransactionOutcomeUnknown)
+	for _, other := range []string{"prefix " + message, kv.ErrTransactionOutcomeUnknown.Error() + "; unrelated", kv.ErrTransactionOutcomeUnknown.Error() + "ish", "ERR operation outcome unknownish"} {
 		require.False(t, isProxyTransactionOutcomeUnknown(errors.New(other)))
 	}
 }
 
 func TestRedisOwnedProxyMutatingReplyOverflowIsTerminal(t *testing.T) {
+	t.Parallel()
 	st := newRedisWireStore(t)
 	leaderGate := newRedisWireTestGate(t)
 	leader := startRedisWireServer(t, st, newLocalAdapterCoordinator(st), leaderGate)
@@ -528,8 +546,7 @@ func TestRedisOwnedProxyMutatingReplyOverflowIsTerminal(t *testing.T) {
 	line, err := c.r.ReadString('\n')
 	require.NoError(t, err)
 	require.True(t, strings.HasPrefix(line, "-"), "overflow must be a top-level EXEC error, not an array: %q", line)
-	require.Contains(t, line, kv.ErrTransactionOutcomeUnknown.Error())
-	require.Contains(t, line, errRedisReplyTooLarge.Error())
+	require.Equal(t, "-ERR operation outcome unknown\r\n", line)
 	requireRedisWireJoined(t, followerGate.next(t))
 	require.Empty(t, followerGate.owners, "overflow must not retry or remint receiver H")
 	value, err := st.GetAt(t.Context(), redisStrKey([]byte("committed")), ^uint64(0))
@@ -542,6 +559,7 @@ func TestRedisOwnedProxyMutatingReplyOverflowIsTerminal(t *testing.T) {
 }
 
 func TestRedisWireTransactionFollowerProxy(t *testing.T) {
+	t.Parallel()
 	for _, mode := range []string{"healthy", "revoked", "lost-reply", "target-unknown"} {
 		t.Run(mode, func(t *testing.T) {
 			runRedisWireTransactionFollowerProxy(t, mode)
@@ -610,7 +628,7 @@ func runRedisWireTransactionFollowerProxy(t *testing.T, mode string) {
 	} else {
 		line, err := c.r.ReadString('\n')
 		require.NoError(t, err)
-		require.Contains(t, line, kv.ErrTransactionOutcomeUnknown.Error())
+		require.Equal(t, "-ERR operation outcome unknown\r\n", line)
 	}
 	requireRedisWireJoined(t, o)
 	require.Empty(t, followerGate.owners, "proxy must retain MULTI's receiver H")

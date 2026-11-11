@@ -33,6 +33,7 @@ func readinessFixture(t testing.TB) (PreparedCertificate, BaselineManifest, []cr
 }
 
 func TestPreparedCertificateRoundTrip(t *testing.T) {
+	t.Parallel()
 	cert, manifest, _ := readinessFixture(t)
 	raw, err := MarshalPreparedCertificate(cert, manifest)
 	require.NoError(t, err)
@@ -51,6 +52,7 @@ func TestPreparedCertificateRoundTrip(t *testing.T) {
 }
 
 func TestPreparedCertificateRequiresAllMembersAndExactFields(t *testing.T) {
+	t.Parallel()
 	tests := map[string]func(*PreparedCertificate){
 		"quorum only":        func(c *PreparedCertificate) { c.Members = c.Members[:2] },
 		"outgoing next":      func(c *PreparedCertificate) { c.Members = append(c.Members[:2], c.Members[3:]...) },
@@ -82,6 +84,7 @@ func TestPreparedCertificateRequiresAllMembersAndExactFields(t *testing.T) {
 }
 
 func TestPreparedCertificateSignatureDomainAndManifestBinding(t *testing.T) {
+	t.Parallel()
 	cert, manifest, signers := readinessFixture(t)
 	cert.Members[0].Signature = manifest.Members[0].Signature
 	require.Error(t, VerifyPreparedCertificate(cert, manifest), "baseline signature is not a ready ack")
@@ -101,6 +104,7 @@ func TestPreparedCertificateSignatureDomainAndManifestBinding(t *testing.T) {
 }
 
 func TestPreparedMemberAckCanonicalRosterAndInvalidSigningInputs(t *testing.T) {
+	t.Parallel()
 	cert, manifest, signers := readinessFixture(t)
 	slices.Reverse(manifest.Configuration.Members)
 	slices.Reverse(manifest.Members)
@@ -122,6 +126,7 @@ func TestPreparedMemberAckCanonicalRosterAndInvalidSigningInputs(t *testing.T) {
 }
 
 func TestPreparedMemberAckSignsEveryField(t *testing.T) {
+	t.Parallel()
 	cert, _, signers := readinessFixture(t)
 	ack := cert.Members[0]
 	mutations := []func(*PreparedMemberAck){
@@ -141,6 +146,7 @@ func TestPreparedMemberAckSignsEveryField(t *testing.T) {
 }
 
 func TestPreparedCertificateWireBoundsAndCanonicalOrder(t *testing.T) {
+	t.Parallel()
 	cert, manifest, _ := readinessFixture(t)
 	raw, err := MarshalPreparedCertificate(cert, manifest)
 	require.NoError(t, err)
@@ -184,6 +190,7 @@ func TestPreparedCertificateWireBoundsAndCanonicalOrder(t *testing.T) {
 }
 
 func TestPreparedCertificateAggregateBounds(t *testing.T) {
+	t.Parallel()
 	cert, manifest, signers := readinessFixture(t)
 	cert.Members[0].PublicKeyDER = make([]byte, baselineKeyLimit+1)
 	_, err := MarshalPreparedCertificate(cert, manifest)
@@ -201,6 +208,7 @@ func TestPreparedCertificateAggregateBounds(t *testing.T) {
 }
 
 func TestPreparedMemberAckSigningAlgorithms(t *testing.T) {
+	t.Parallel()
 	ecdsaKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	require.NoError(t, err)
 	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)

@@ -124,6 +124,7 @@ func newHTTPTransportDynamo(t *testing.T, admission RequestAdmission, options ..
 }
 
 func TestHTTPRequestAdmissionConstructorsAbortStalledUpload(t *testing.T) {
+	t.Parallel()
 	constructors := map[string]struct {
 		newServer func(*testing.T, RequestAdmission) *http.Server
 		head      string
@@ -185,6 +186,7 @@ func TestHTTPRequestAdmissionConstructorsAbortStalledUpload(t *testing.T) {
 }
 
 func TestHTTPRequestAdmissionPostCommitFinishFailureHasUnknownOutcome(t *testing.T) {
+	t.Parallel()
 	for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodDelete} {
 		t.Run(method, func(t *testing.T) {
 			owners := make(chan *httpTransportTestOwner, 1)
@@ -219,6 +221,7 @@ func TestHTTPRequestAdmissionPostCommitFinishFailureHasUnknownOutcome(t *testing
 }
 
 func TestHTTPRequestAdmissionPreservesConnContextAndHealthyKeepAlive(t *testing.T) {
+	t.Parallel()
 	type priorContextKey struct{}
 	owners := make(chan *httpTransportTestOwner, 2)
 	priorValue := make(chan bool, 2)
@@ -297,6 +300,7 @@ func (c *httpAdmissionLatchedConn) Close() error {
 }
 
 func TestHTTPRequestAdmissionJoinsTransportCloseBeforeRetiringOwner(t *testing.T) {
+	t.Parallel()
 	owners := make(chan *httpTransportTestOwner, 1)
 	latch := newHTTPAdmissionCloseLatch(t)
 	server := newHTTPTransportDynamo(t, func(ctx context.Context) (RequestOwnership, error) {
@@ -328,6 +332,7 @@ func TestHTTPRequestAdmissionJoinsTransportCloseBeforeRetiringOwner(t *testing.T
 }
 
 func TestHTTPRequestAdmissionPanicStopsTransportCallbackBeforeOwnerCancellation(t *testing.T) {
+	t.Parallel()
 	owners := make(chan *httpTransportTestOwner, 1)
 	allowJoin := make(chan struct{})
 	var release sync.Once
@@ -366,6 +371,7 @@ func TestHTTPRequestAdmissionPanicStopsTransportCallbackBeforeOwnerCancellation(
 }
 
 func TestHTTPRequestAdmissionNilHookPreservesServer(t *testing.T) {
+	t.Parallel()
 	handler := http.NewServeMux()
 	server := &http.Server{Handler: handler}
 	installHTTPRequestAdmission(server, nil)
@@ -407,6 +413,7 @@ func (c *httpAdmissionWriteConn) Write(payload []byte) (int, error) {
 }
 
 func TestHTTPRequestAdmissionAbortsBlockedResponseWrite(t *testing.T) {
+	t.Parallel()
 	owners := make(chan *httpTransportTestOwner, 1)
 	entered, writeResult := make(chan struct{}), make(chan error, 1)
 	server := newHTTPTransportDynamo(t, func(ctx context.Context) (RequestOwnership, error) {

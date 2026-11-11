@@ -51,6 +51,7 @@ func TestOfflineTSOBaselineFromVerifiedBootstrapGenesis(t *testing.T) {
 }
 
 func TestOfflineTSOBaselineFromNativeWithoutControlDB(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	require.NoError(t, os.Mkdir(filepath.Join(dir, "snap"), tsoBaselineDirectoryPerm))
 	change, err := proto.Marshal(&raftpb.ConfChange{Type: raftpb.ConfChangeAddNode.Enum(), NodeId: proto.Uint64(7)})
@@ -113,6 +114,7 @@ func preparedTSOMigrationFixture(t *testing.T) (kv.TSOBaselineState, kv.Prepared
 }
 
 func TestExplicitTSOBaselineMigrationAndExactRetry(t *testing.T) {
+	t.Parallel()
 	state, prepared := preparedTSOMigrationFixture(t)
 	dir := t.TempDir()
 	digest, err := initializePreparedTSOBaseline(t.Context(), dir, state, prepared)
@@ -141,6 +143,7 @@ func TestExplicitTSOBaselineMigrationAndExactRetry(t *testing.T) {
 }
 
 func TestExplicitTSOBaselineMigrationRejectsChangedDigestBeforeCreatingDB(t *testing.T) {
+	t.Parallel()
 	state, prepared := preparedTSOMigrationFixture(t)
 	state.DataDigest[0]++
 	dir := t.TempDir()
@@ -150,6 +153,7 @@ func TestExplicitTSOBaselineMigrationRejectsChangedDigestBeforeCreatingDB(t *tes
 }
 
 func TestExplicitTSOBaselineMigrationResumesEmptyDB(t *testing.T) {
+	t.Parallel()
 	state, prepared := preparedTSOMigrationFixture(t)
 	dir := t.TempDir()
 	st, err := store.NewPebbleStore(filepath.Join(dir, dedicatedTSOControlStoreName))

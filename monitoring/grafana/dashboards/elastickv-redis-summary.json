@@ -64,7 +64,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "sum(rate(elastickv_redis_requests_total{job=\"elastickv\",node_id=~\"$node_id\",command=~\"$command\"}[5m]))",
+          "expr": "sum(rate(elastickv_redis_requests_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",command=~\"$command\"}[5m]))",
           "legendFormat": "requests/s",
           "refId": "A",
           "instant": true
@@ -124,7 +124,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "clamp_max(sum(increase(elastickv_redis_requests_total{job=\"elastickv\",node_id=~\"$node_id\",command=~\"$command\",outcome=\"success\"}[15m])) / clamp_min(sum(increase(elastickv_redis_requests_total{job=\"elastickv\",node_id=~\"$node_id\",command=~\"$command\"}[15m])), 1), 1)",
+          "expr": "clamp_max(sum(increase(elastickv_redis_requests_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",command=~\"$command\",outcome=\"success\"}[15m])) / clamp_min(sum(increase(elastickv_redis_requests_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",command=~\"$command\"}[15m])), 1), 1)",
           "legendFormat": "success rate",
           "refId": "A",
           "instant": true
@@ -184,7 +184,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "sum(increase(elastickv_redis_errors_total{job=\"elastickv\",node_id=~\"$node_id\",command=~\"$command\"}[15m]))",
+          "expr": "sum(increase(elastickv_redis_errors_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",command=~\"$command\"}[15m]))",
           "legendFormat": "errors / 15m",
           "refId": "A",
           "instant": true
@@ -244,7 +244,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(elastickv_redis_request_duration_seconds_bucket{job=\"elastickv\",node_id=~\"$node_id\",command=~\"$command\",outcome=\"success\"}[5m])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(elastickv_redis_request_duration_seconds_bucket{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",command=~\"$command\",outcome=\"success\"}[5m])))",
           "legendFormat": "p95 success",
           "refId": "A",
           "instant": true
@@ -293,7 +293,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "sum by (command) (rate(elastickv_redis_requests_total{job=\"elastickv\",node_id=~\"$node_id\",command=~\"$command\"}[5m]))",
+          "expr": "sum by (command) (rate(elastickv_redis_requests_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",command=~\"$command\"}[5m]))",
           "legendFormat": "{{command}}",
           "range": true,
           "refId": "A"
@@ -342,7 +342,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by (le, command) (rate(elastickv_redis_request_duration_seconds_bucket{job=\"elastickv\",node_id=~\"$node_id\",command=~\"$command\",outcome=\"success\"}[5m])))",
+          "expr": "histogram_quantile(0.50, sum by (le, command) (rate(elastickv_redis_request_duration_seconds_bucket{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",command=~\"$command\",outcome=\"success\"}[5m])))",
           "legendFormat": "p50 {{command}}",
           "range": true,
           "refId": "A"
@@ -350,7 +350,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le, command) (rate(elastickv_redis_request_duration_seconds_bucket{job=\"elastickv\",node_id=~\"$node_id\",command=~\"$command\",outcome=\"success\"}[5m])))",
+          "expr": "histogram_quantile(0.95, sum by (le, command) (rate(elastickv_redis_request_duration_seconds_bucket{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",command=~\"$command\",outcome=\"success\"}[5m])))",
           "legendFormat": "p95 {{command}}",
           "range": true,
           "refId": "B"
@@ -358,7 +358,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le, command) (rate(elastickv_redis_request_duration_seconds_bucket{job=\"elastickv\",node_id=~\"$node_id\",command=~\"$command\",outcome=\"success\"}[5m])))",
+          "expr": "histogram_quantile(0.99, sum by (le, command) (rate(elastickv_redis_request_duration_seconds_bucket{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",command=~\"$command\",outcome=\"success\"}[5m])))",
           "legendFormat": "p99 {{command}}",
           "range": true,
           "refId": "C"
@@ -407,7 +407,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "sum by (command) (rate(elastickv_redis_errors_total{job=\"elastickv\",node_id=~\"$node_id\",command=~\"$command\"}[5m]))",
+          "expr": "sum by (command) (rate(elastickv_redis_errors_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",command=~\"$command\"}[5m]))",
           "legendFormat": "{{command}}",
           "range": true,
           "refId": "A"
@@ -456,7 +456,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "sum by (node_id, node_address) (rate(elastickv_redis_requests_total{job=\"elastickv\",node_id=~\"$node_id\",command=~\"$command\"}[5m]))",
+          "expr": "sum by (node_id, node_address) (rate(elastickv_redis_requests_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",command=~\"$command\"}[5m]))",
           "legendFormat": "{{node_id}} {{node_address}}",
           "range": true,
           "refId": "A"
@@ -505,7 +505,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le, node_id, node_address) (rate(elastickv_redis_request_duration_seconds_bucket{job=\"elastickv\",node_id=~\"$node_id\",command=~\"$command\",outcome=\"success\"}[5m])))",
+          "expr": "histogram_quantile(0.95, sum by (le, node_id, node_address) (rate(elastickv_redis_request_duration_seconds_bucket{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",command=~\"$command\",outcome=\"success\"}[5m])))",
           "legendFormat": "{{node_id}} {{node_address}}",
           "range": true,
           "refId": "A"
@@ -554,7 +554,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "sum by (node_id, node_address) (rate(elastickv_redis_errors_total{job=\"elastickv\",node_id=~\"$node_id\",command=~\"$command\"}[5m]))",
+          "expr": "sum by (node_id, node_address) (rate(elastickv_redis_errors_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",command=~\"$command\"}[5m]))",
           "legendFormat": "{{node_id}} {{node_address}}",
           "range": true,
           "refId": "A"
@@ -742,7 +742,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by (le) (rate(elastickv_lua_exec_duration_seconds_bucket{job=\"elastickv\", outcome=\"success\"}[5m])))",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(elastickv_lua_exec_duration_seconds_bucket{job=~\"$job\",cluster=~\"$cluster\",outcome=\"success\"}[5m])))",
           "legendFormat": "p50",
           "range": true,
           "refId": "A"
@@ -750,7 +750,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(elastickv_lua_exec_duration_seconds_bucket{job=\"elastickv\", outcome=\"success\"}[5m])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(elastickv_lua_exec_duration_seconds_bucket{job=~\"$job\",cluster=~\"$cluster\",outcome=\"success\"}[5m])))",
           "legendFormat": "p95",
           "range": true,
           "refId": "B"
@@ -758,7 +758,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(elastickv_lua_exec_duration_seconds_bucket{job=\"elastickv\", outcome=\"success\"}[5m])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(elastickv_lua_exec_duration_seconds_bucket{job=~\"$job\",cluster=~\"$cluster\",outcome=\"success\"}[5m])))",
           "legendFormat": "p99",
           "range": true,
           "refId": "C"
@@ -807,7 +807,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by (le) (rate(elastickv_lua_commit_duration_seconds_bucket{job=\"elastickv\", outcome=\"success\"}[5m])))",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(elastickv_lua_commit_duration_seconds_bucket{job=~\"$job\",cluster=~\"$cluster\",outcome=\"success\"}[5m])))",
           "legendFormat": "p50",
           "range": true,
           "refId": "A"
@@ -815,7 +815,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(elastickv_lua_commit_duration_seconds_bucket{job=\"elastickv\", outcome=\"success\"}[5m])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(elastickv_lua_commit_duration_seconds_bucket{job=~\"$job\",cluster=~\"$cluster\",outcome=\"success\"}[5m])))",
           "legendFormat": "p95",
           "range": true,
           "refId": "B"
@@ -823,7 +823,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(elastickv_lua_commit_duration_seconds_bucket{job=\"elastickv\", outcome=\"success\"}[5m])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(elastickv_lua_commit_duration_seconds_bucket{job=~\"$job\",cluster=~\"$cluster\",outcome=\"success\"}[5m])))",
           "legendFormat": "p99",
           "range": true,
           "refId": "C"
@@ -873,7 +873,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by (le) (rate(elastickv_lua_conflict_retries_bucket{job=\"elastickv\"}[5m])))",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(elastickv_lua_conflict_retries_bucket{job=~\"$job\",cluster=~\"$cluster\"}[5m])))",
           "legendFormat": "p50 retries",
           "range": true,
           "refId": "A"
@@ -881,7 +881,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(elastickv_lua_conflict_retries_bucket{job=\"elastickv\"}[5m])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(elastickv_lua_conflict_retries_bucket{job=~\"$job\",cluster=~\"$cluster\"}[5m])))",
           "legendFormat": "p95 retries",
           "range": true,
           "refId": "B"
@@ -889,7 +889,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(elastickv_lua_conflict_retries_bucket{job=\"elastickv\"}[5m])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(elastickv_lua_conflict_retries_bucket{job=~\"$job\",cluster=~\"$cluster\"}[5m])))",
           "legendFormat": "p99 retries",
           "range": true,
           "refId": "C"
@@ -938,7 +938,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by (le) (rate(elastickv_lua_redis_call_duration_seconds_bucket{job=\"elastickv\", outcome=\"success\"}[5m])))",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(elastickv_lua_redis_call_duration_seconds_bucket{job=~\"$job\",cluster=~\"$cluster\",outcome=\"success\"}[5m])))",
           "legendFormat": "p50 redis.call()",
           "range": true,
           "refId": "A"
@@ -946,7 +946,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(elastickv_lua_redis_call_duration_seconds_bucket{job=\"elastickv\", outcome=\"success\"}[5m])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(elastickv_lua_redis_call_duration_seconds_bucket{job=~\"$job\",cluster=~\"$cluster\",outcome=\"success\"}[5m])))",
           "legendFormat": "p95 redis.call()",
           "range": true,
           "refId": "B"
@@ -954,7 +954,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(elastickv_lua_redis_call_duration_seconds_bucket{job=\"elastickv\", outcome=\"success\"}[5m])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(elastickv_lua_redis_call_duration_seconds_bucket{job=~\"$job\",cluster=~\"$cluster\",outcome=\"success\"}[5m])))",
           "legendFormat": "p99 redis.call()",
           "range": true,
           "refId": "C"
@@ -1005,7 +1005,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by (le) (rate(elastickv_lua_redis_call_duration_seconds_bucket{job=\"elastickv\", outcome=\"success\"}[5m]))) / histogram_quantile(0.50, sum by (le) (rate(elastickv_lua_exec_duration_seconds_bucket{job=\"elastickv\", outcome=\"success\"}[5m])))",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(elastickv_lua_redis_call_duration_seconds_bucket{job=~\"$job\",cluster=~\"$cluster\",outcome=\"success\"}[5m]))) / histogram_quantile(0.50, sum by (le) (rate(elastickv_lua_exec_duration_seconds_bucket{job=~\"$job\",cluster=~\"$cluster\",outcome=\"success\"}[5m])))",
           "legendFormat": "p50 redis.call() fraction",
           "range": true,
           "refId": "A"
@@ -1013,7 +1013,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(elastickv_lua_redis_call_duration_seconds_bucket{job=\"elastickv\", outcome=\"success\"}[5m]))) / histogram_quantile(0.99, sum by (le) (rate(elastickv_lua_exec_duration_seconds_bucket{job=\"elastickv\", outcome=\"success\"}[5m])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(elastickv_lua_redis_call_duration_seconds_bucket{job=~\"$job\",cluster=~\"$cluster\",outcome=\"success\"}[5m]))) / histogram_quantile(0.99, sum by (le) (rate(elastickv_lua_exec_duration_seconds_bucket{job=~\"$job\",cluster=~\"$cluster\",outcome=\"success\"}[5m])))",
           "legendFormat": "p99 redis.call() fraction",
           "range": true,
           "refId": "B"
@@ -1024,7 +1024,7 @@
     },
     {
       "datasource": "$datasource",
-      "description": "Number of redis.call()/pcall() invocations per Lua script execution. High count \u00d7 per-call latency = total redis.call() time. If p99 count is large (e.g. >100), the script is iterating many keys and each Raft read compounds the latency.",
+      "description": "Number of redis.call()/pcall() invocations per Lua script execution. High count × per-call latency = total redis.call() time. If p99 count is large (e.g. >100), the script is iterating many keys and each Raft read compounds the latency.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1062,7 +1062,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by (le) (rate(elastickv_lua_redis_call_count_bucket{job=\"elastickv\"}[5m])))",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(elastickv_lua_redis_call_count_bucket{job=~\"$job\",cluster=~\"$cluster\"}[5m])))",
           "legendFormat": "p50 calls",
           "range": true,
           "refId": "A"
@@ -1070,7 +1070,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(elastickv_lua_redis_call_count_bucket{job=\"elastickv\"}[5m])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(elastickv_lua_redis_call_count_bucket{job=~\"$job\",cluster=~\"$cluster\"}[5m])))",
           "legendFormat": "p95 calls",
           "range": true,
           "refId": "B"
@@ -1078,7 +1078,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(elastickv_lua_redis_call_count_bucket{job=\"elastickv\"}[5m])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(elastickv_lua_redis_call_count_bucket{job=~\"$job\",cluster=~\"$cluster\"}[5m])))",
           "legendFormat": "p99 calls",
           "range": true,
           "refId": "C"
@@ -1127,7 +1127,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "rate(elastickv_lua_redis_call_duration_seconds_sum{job=\"elastickv\"}[5m]) / rate(elastickv_lua_redis_call_count_sum{job=\"elastickv\"}[5m])",
+          "expr": "rate(elastickv_lua_redis_call_duration_seconds_sum{job=~\"$job\",cluster=~\"$cluster\"}[5m]) / rate(elastickv_lua_redis_call_count_sum{job=~\"$job\",cluster=~\"$cluster\"}[5m])",
           "legendFormat": "avg per redis.call()",
           "range": true,
           "refId": "A"
@@ -1176,7 +1176,7 @@
         {
           "datasource": "$datasource",
           "editorMode": "code",
-          "expr": "sum by (command) (rate(elastickv_redis_unsupported_commands_total{job=\"elastickv\",node_id=~\"$node_id\"}[$__rate_interval]))",
+          "expr": "sum by (command) (rate(elastickv_redis_unsupported_commands_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\"}[$__rate_interval]))",
           "legendFormat": "{{command}}",
           "range": true,
           "refId": "A"
@@ -1247,7 +1247,7 @@
             {
               "datasource": "$datasource",
               "editorMode": "code",
-              "expr": "sum(rate(elastickv_lease_read_total{job=\"$job\",node_id=~\"$node_id\",outcome=\"hit\"}[5m])) / clamp_min(sum(rate(elastickv_lease_read_total{job=\"$job\",node_id=~\"$node_id\"}[5m])), 1e-9)",
+              "expr": "sum(rate(elastickv_lease_read_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",outcome=\"hit\"}[5m])) / clamp_min(sum(rate(elastickv_lease_read_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\"}[5m])), 1e-9)",
               "legendFormat": "hit ratio",
               "refId": "A",
               "instant": true
@@ -1307,7 +1307,7 @@
             {
               "datasource": "$datasource",
               "editorMode": "code",
-              "expr": "histogram_quantile(0.99, sum by (le) (rate(elastickv_redis_request_duration_seconds_bucket{job=\"$job\",node_id=~\"$node_id\",command=\"GET\",outcome=\"success\"}[5m])))",
+              "expr": "histogram_quantile(0.99, sum by (le) (rate(elastickv_redis_request_duration_seconds_bucket{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",command=\"GET\",outcome=\"success\"}[5m])))",
               "legendFormat": "GET p99",
               "refId": "A",
               "instant": true
@@ -1367,7 +1367,7 @@
             {
               "datasource": "$datasource",
               "editorMode": "code",
-              "expr": "sum(rate(elastickv_lease_read_total{job=\"$job\",node_id=~\"$node_id\",outcome=\"miss\"}[5m]))",
+              "expr": "sum(rate(elastickv_lease_read_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",outcome=\"miss\"}[5m]))",
               "legendFormat": "lease misses/s",
               "refId": "A",
               "instant": true
@@ -1427,7 +1427,7 @@
             {
               "datasource": "$datasource",
               "editorMode": "code",
-              "expr": "sum(rate(elastickv_redis_errors_total{job=\"$job\",node_id=~\"$node_id\",command=\"GET\"}[5m])) / clamp_min(sum(rate(elastickv_redis_requests_total{job=\"$job\",node_id=~\"$node_id\",command=\"GET\"}[5m])), 1e-9)",
+              "expr": "sum(rate(elastickv_redis_errors_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",command=\"GET\"}[5m])) / clamp_min(sum(rate(elastickv_redis_requests_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",command=\"GET\"}[5m])), 1e-9)",
               "legendFormat": "GET error ratio",
               "refId": "A",
               "instant": true
@@ -1476,7 +1476,7 @@
             {
               "datasource": "$datasource",
               "editorMode": "code",
-              "expr": "histogram_quantile(0.50, sum by (le) (rate(elastickv_redis_request_duration_seconds_bucket{job=\"$job\",node_id=~\"$node_id\",command=\"GET\",outcome=\"success\"}[5m])))",
+              "expr": "histogram_quantile(0.50, sum by (le) (rate(elastickv_redis_request_duration_seconds_bucket{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",command=\"GET\",outcome=\"success\"}[5m])))",
               "legendFormat": "p50",
               "range": true,
               "refId": "A"
@@ -1484,7 +1484,7 @@
             {
               "datasource": "$datasource",
               "editorMode": "code",
-              "expr": "histogram_quantile(0.95, sum by (le) (rate(elastickv_redis_request_duration_seconds_bucket{job=\"$job\",node_id=~\"$node_id\",command=\"GET\",outcome=\"success\"}[5m])))",
+              "expr": "histogram_quantile(0.95, sum by (le) (rate(elastickv_redis_request_duration_seconds_bucket{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",command=\"GET\",outcome=\"success\"}[5m])))",
               "legendFormat": "p95",
               "range": true,
               "refId": "B"
@@ -1492,7 +1492,7 @@
             {
               "datasource": "$datasource",
               "editorMode": "code",
-              "expr": "histogram_quantile(0.99, sum by (le) (rate(elastickv_redis_request_duration_seconds_bucket{job=\"$job\",node_id=~\"$node_id\",command=\"GET\",outcome=\"success\"}[5m])))",
+              "expr": "histogram_quantile(0.99, sum by (le) (rate(elastickv_redis_request_duration_seconds_bucket{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",command=\"GET\",outcome=\"success\"}[5m])))",
               "legendFormat": "p99",
               "range": true,
               "refId": "C"
@@ -1541,7 +1541,7 @@
             {
               "datasource": "$datasource",
               "editorMode": "code",
-              "expr": "sum by (node_id) (rate(elastickv_redis_requests_total{job=\"$job\",node_id=~\"$node_id\",command=\"GET\",outcome=\"success\"}[5m]))",
+              "expr": "sum by (node_id) (rate(elastickv_redis_requests_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",command=\"GET\",outcome=\"success\"}[5m]))",
               "legendFormat": "{{node_id}} success",
               "range": true,
               "refId": "A"
@@ -1549,7 +1549,7 @@
             {
               "datasource": "$datasource",
               "editorMode": "code",
-              "expr": "sum by (node_id) (rate(elastickv_redis_requests_total{job=\"$job\",node_id=~\"$node_id\",command=\"GET\",outcome=\"error\"}[5m]))",
+              "expr": "sum by (node_id) (rate(elastickv_redis_requests_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",command=\"GET\",outcome=\"error\"}[5m]))",
               "legendFormat": "{{node_id}} error",
               "range": true,
               "refId": "B"
@@ -1602,7 +1602,7 @@
             {
               "datasource": "$datasource",
               "editorMode": "code",
-              "expr": "sum(rate(elastickv_lease_read_total{job=\"$job\",node_id=~\"$node_id\",outcome=\"hit\"}[5m]))",
+              "expr": "sum(rate(elastickv_lease_read_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",outcome=\"hit\"}[5m]))",
               "legendFormat": "hits",
               "range": true,
               "refId": "A"
@@ -1610,7 +1610,7 @@
             {
               "datasource": "$datasource",
               "editorMode": "code",
-              "expr": "sum(rate(elastickv_lease_read_total{job=\"$job\",node_id=~\"$node_id\",outcome=\"miss\"}[5m]))",
+              "expr": "sum(rate(elastickv_lease_read_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",outcome=\"miss\"}[5m]))",
               "legendFormat": "misses (= LinearizableRead)",
               "range": true,
               "refId": "B"
@@ -1659,7 +1659,7 @@
             {
               "datasource": "$datasource",
               "editorMode": "code",
-              "expr": "sum by (group) (rate(elastickv_raft_step_queue_full_total{job=\"$job\",node_id=~\"$node_id\"}[5m]))",
+              "expr": "sum by (group) (rate(elastickv_raft_step_queue_full_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\"}[5m]))",
               "legendFormat": "stepCh full (group {{group}})",
               "range": true,
               "refId": "A"
@@ -1667,7 +1667,7 @@
             {
               "datasource": "$datasource",
               "editorMode": "code",
-              "expr": "sum by (group) (rate(elastickv_raft_dispatch_dropped_total{job=\"$job\",node_id=~\"$node_id\"}[5m]))",
+              "expr": "sum by (group) (rate(elastickv_raft_dispatch_dropped_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\"}[5m]))",
               "legendFormat": "dispatch dropped (group {{group}})",
               "range": true,
               "refId": "B"
@@ -1675,7 +1675,7 @@
             {
               "datasource": "$datasource",
               "editorMode": "code",
-              "expr": "sum by (group) (rate(elastickv_raft_dispatch_errors_total{job=\"$job\",node_id=~\"$node_id\"}[5m]))",
+              "expr": "sum by (group) (rate(elastickv_raft_dispatch_errors_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\"}[5m]))",
               "legendFormat": "dispatch errors (group {{group}})",
               "range": true,
               "refId": "C"
@@ -1724,7 +1724,7 @@
             {
               "datasource": "$datasource",
               "editorMode": "code",
-              "expr": "sum by (command) (rate(elastickv_redis_requests_total{job=\"$job\",node_id=~\"$node_id\",command=~\"GET|SET|TYPE|EXISTS\"}[5m]))",
+              "expr": "sum by (command) (rate(elastickv_redis_requests_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\",command=~\"GET|SET|TYPE|EXISTS\"}[5m]))",
               "legendFormat": "{{command}}",
               "range": true,
               "refId": "A"
@@ -1814,7 +1814,7 @@
             {
               "datasource": "$datasource",
               "editorMode": "code",
-              "expr": "elastickv_lua_pool_idle{job=\"elastickv\",node_id=~\"$node_id\"}",
+              "expr": "elastickv_lua_pool_idle{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\"}",
               "legendFormat": "idle {{node_id}}",
               "range": true,
               "refId": "A"
@@ -1822,7 +1822,7 @@
             {
               "datasource": "$datasource",
               "editorMode": "code",
-              "expr": "elastickv_lua_pool_max_idle{job=\"elastickv\",node_id=~\"$node_id\"}",
+              "expr": "elastickv_lua_pool_max_idle{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\"}",
               "legendFormat": "max_idle {{node_id}}",
               "range": true,
               "refId": "B"
@@ -1887,7 +1887,7 @@
             {
               "datasource": "$datasource",
               "editorMode": "code",
-              "expr": "sum by (node_id) (rate(elastickv_lua_pool_hits_total{job=\"elastickv\",node_id=~\"$node_id\"}[5m]))",
+              "expr": "sum by (node_id) (rate(elastickv_lua_pool_hits_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\"}[5m]))",
               "legendFormat": "hits {{node_id}}",
               "range": true,
               "refId": "A"
@@ -1895,7 +1895,7 @@
             {
               "datasource": "$datasource",
               "editorMode": "code",
-              "expr": "sum by (node_id) (rate(elastickv_lua_pool_misses_total{job=\"elastickv\",node_id=~\"$node_id\"}[5m]))",
+              "expr": "sum by (node_id) (rate(elastickv_lua_pool_misses_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\"}[5m]))",
               "legendFormat": "misses {{node_id}}",
               "range": true,
               "refId": "B"
@@ -1903,7 +1903,7 @@
             {
               "datasource": "$datasource",
               "editorMode": "code",
-              "expr": "sum by (node_id) (rate(elastickv_lua_pool_drops_total{job=\"elastickv\",node_id=~\"$node_id\"}[5m]))",
+              "expr": "sum by (node_id) (rate(elastickv_lua_pool_drops_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\"}[5m]))",
               "legendFormat": "drops {{node_id}}",
               "range": true,
               "refId": "C"
@@ -1967,7 +1967,7 @@
             {
               "datasource": "$datasource",
               "editorMode": "code",
-              "expr": "sum by (node_id) (increase(elastickv_lua_pool_drops_total{job=\"elastickv\",node_id=~\"$node_id\"}[$__range]))",
+              "expr": "sum by (node_id) (increase(elastickv_lua_pool_drops_total{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\"}[$__range]))",
               "legendFormat": "{{node_id}}",
               "range": true,
               "refId": "A"
@@ -2033,7 +2033,7 @@
             {
               "datasource": "$datasource",
               "editorMode": "code",
-              "expr": "elastickv_lua_pool_idle{job=\"elastickv\",node_id=~\"$node_id\"} / elastickv_lua_pool_max_idle{job=\"elastickv\",node_id=~\"$node_id\"}",
+              "expr": "elastickv_lua_pool_idle{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\"} / elastickv_lua_pool_max_idle{job=~\"$job\",cluster=~\"$cluster\",node_id=~\"$node_id\"}",
               "legendFormat": "{{node_id}}",
               "range": true,
               "refId": "A"
@@ -2058,42 +2058,55 @@
   "templating": {
     "list": [
       {
-        "current": {
-          "selected": false,
-          "text": "default",
-          "value": "default"
-        },
-        "hide": 0,
-        "includeAll": false,
-        "label": "Datasource",
-        "multi": false,
         "name": "datasource",
-        "options": [],
+        "label": "Datasource",
+        "type": "datasource",
         "query": "prometheus",
         "refresh": 1,
-        "regex": "",
-        "type": "datasource"
+        "current": {},
+        "options": []
       },
       {
-        "current": {
-          "selected": false,
-          "text": "elastickv",
-          "value": "elastickv"
-        },
-        "hide": 0,
-        "includeAll": false,
-        "label": "Job",
-        "multi": false,
         "name": "job",
-        "options": [
-          {
-            "selected": true,
-            "text": "elastickv",
-            "value": "elastickv"
-          }
-        ],
-        "query": "elastickv",
-        "type": "custom"
+        "label": "Job",
+        "type": "query",
+        "datasource": "$datasource",
+        "query": {
+          "query": "label_values({__name__=~\"elastickv_.+\"}, job)",
+          "refId": "variable-job"
+        },
+        "definition": "label_values({__name__=~\"elastickv_.+\"}, job)",
+        "refresh": 2,
+        "sort": 1,
+        "multi": false,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "options": []
+      },
+      {
+        "name": "cluster",
+        "label": "Cluster",
+        "type": "query",
+        "datasource": "$datasource",
+        "query": {
+          "query": "label_values({__name__=~\"elastickv_.+\",job=~\"$job\"}, cluster)",
+          "refId": "variable-cluster"
+        },
+        "definition": "label_values({__name__=~\"elastickv_.+\",job=~\"$job\"}, cluster)",
+        "refresh": 2,
+        "sort": 1,
+        "multi": false,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "options": []
       },
       {
         "allValue": ".*",
@@ -2103,7 +2116,7 @@
           "value": "$__all"
         },
         "datasource": "$datasource",
-        "definition": "label_values(elastickv_redis_requests_total{job=\"elastickv\"}, node_id)",
+        "definition": "label_values(elastickv_redis_requests_total{job=~\"$job\",cluster=~\"$cluster\"}, node_id)",
         "includeAll": true,
         "label": "Node ID",
         "multi": true,
@@ -2111,7 +2124,7 @@
         "options": [],
         "query": {
           "qryType": 1,
-          "query": "label_values(elastickv_redis_requests_total{job=\"elastickv\"}, node_id)",
+          "query": "label_values(elastickv_redis_requests_total{job=~\"$job\",cluster=~\"$cluster\"}, node_id)",
           "refId": "PrometheusVariableQueryEditor-VariableQuery"
         },
         "refresh": 2,
@@ -2127,7 +2140,7 @@
           "value": "$__all"
         },
         "datasource": "$datasource",
-        "definition": "label_values(elastickv_redis_requests_total{job=\"elastickv\"}, command)",
+        "definition": "label_values(elastickv_redis_requests_total{job=~\"$job\",cluster=~\"$cluster\"}, command)",
         "includeAll": true,
         "label": "Command",
         "multi": true,
@@ -2135,7 +2148,7 @@
         "options": [],
         "query": {
           "qryType": 1,
-          "query": "label_values(elastickv_redis_requests_total{job=\"elastickv\"}, command)",
+          "query": "label_values(elastickv_redis_requests_total{job=~\"$job\",cluster=~\"$cluster\"}, command)",
           "refId": "PrometheusVariableQueryEditor-VariableQuery"
         },
         "refresh": 2,

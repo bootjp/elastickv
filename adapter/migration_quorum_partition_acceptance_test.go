@@ -32,7 +32,7 @@ const (
 	quorumAcceptanceGroup          = uint64(7)
 	quorumAcceptanceCatalogVersion = uint64(4)
 	quorumAcceptanceTick           = 10 * time.Millisecond
-	quorumAcceptanceElectionTicks  = 500
+	quorumAcceptanceElectionTicks  = 1000
 	quorumAcceptanceHeartbeatTicks = 10
 	quorumAcceptanceElectionWait   = 3 * quorumAcceptanceTick * quorumAcceptanceElectionTicks
 	quorumAcceptanceSnapshotEvery  = 8
@@ -899,6 +899,8 @@ func (c *quorumAcceptanceCluster) checkNoQuorum(t *testing.T, ctx context.Contex
 }
 
 func TestMigrationQuorumPreparedDrainAndHistoricalPreflight(t *testing.T) {
+	// Not parallel: a multi-group acceptance run with leadership transfers
+	// and election-timeout budgets that parallel clusters can exhaust.
 	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
 	defer cancel()
 	c := newQuorumAcceptanceCluster(t, ctx)

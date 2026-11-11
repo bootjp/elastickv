@@ -42,6 +42,7 @@ func namespaceRecoveryFixture(t *testing.T) (OfflineBaselineOptions, *WALIdentit
 }
 
 func TestNativeNamespaceRecoveryChecksProvenanceAndBounds(t *testing.T) {
+	t.Parallel()
 	for _, mode := range []string{"verified", "reject", "out-of-range", "ordinary-restore", "unbound"} {
 		t.Run(mode, func(t *testing.T) {
 			o, identity, _ := namespaceRecoveryFixture(t)
@@ -96,6 +97,7 @@ func assertNamespaceRecoveryResult(t *testing.T, mode string, disk *diskState, e
 }
 
 func TestNativeNamespaceRecoveryOwnershipHandoff(t *testing.T) {
+	t.Parallel()
 	o, _, guard := namespaceRecoveryFixture(t)
 	require.NoError(t, o.Ownership.Close(), "closing the transferred offline token must not unlock the engine root")
 	other, err := AcquireOfflineBaselineOwnership(o.DataDir)

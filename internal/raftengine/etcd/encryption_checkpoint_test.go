@@ -13,6 +13,7 @@ import (
 )
 
 func TestEncryptionScannerEncryptedRetainedTail(t *testing.T) {
+	t.Parallel()
 	for _, corrupt := range []bool{false, true} {
 		t.Run(map[bool]string{false: "rotation", true: "invalid-tag"}[corrupt], func(t *testing.T) {
 			cipher, id := raftCipherFixture(t)
@@ -34,6 +35,7 @@ func TestEncryptionScannerEncryptedRetainedTail(t *testing.T) {
 }
 
 func TestEncryptionSnapshotRequiresMatchingPhysicalEnvelope(t *testing.T) {
+	t.Parallel()
 	for _, variant := range []string{"valid", "stale-token", "mismatched-index", "corrupt-payload"} {
 		t.Run(variant, func(t *testing.T) {
 			dir := t.TempDir()

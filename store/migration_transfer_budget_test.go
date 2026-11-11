@@ -7,6 +7,7 @@ import (
 )
 
 func TestMigrationTransferBudgetIncludesFullKeyCursor(t *testing.T) {
+	t.Parallel()
 	key := make([]byte, 1<<20)
 	value := make([]byte, MigrationPagePayloadBudget-2*len(key)-128)
 	require.True(t, MigrationVersionFitsTransfer(key, value))

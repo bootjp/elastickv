@@ -53,6 +53,7 @@ func encryptedRestorePayload(t *testing.T, st store.MVCCStore, mode string) []by
 }
 
 func TestExternalRestoreEncryptedKVAndTSOLineage(t *testing.T) {
+	t.Parallel()
 	for _, format := range []string{"native", "sst"} {
 		for _, mode := range []string{"proof-free", "epoch-only", "migration-bearing"} {
 			t.Run(format+"/"+mode, func(t *testing.T) {

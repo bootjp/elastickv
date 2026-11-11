@@ -86,7 +86,38 @@ func TestShardedAbortRollback_PrepareFailOnShard2_CleansShard1Locks(t *testing.T
 	require.ErrorIs(t, err, store.ErrKeyNotFound, "user data for key 'x' should not exist on shard2")
 }
 
+func TestShardedPrepareUnknownKeepsPriorParticipantIntents(t *testing.T) {
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte("a"), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+
+	s1 := store.NewMVCCStore()
+	r1, stop1 := newSingleRaft(t, "unknown-prepare-g1", NewKvFSMWithHLC(s1, NewHLC()))
+	t.Cleanup(stop1)
+	s2 := store.NewMVCCStore()
+	groups := map[uint64]*ShardGroup{
+		1: {Engine: r1, Store: s1, Txn: NewLeaderProxyWithEngine(r1)},
+		2: {Store: s2, Txn: &failingTransactional{err: ErrTransactionOutcomeUnknown}},
+	}
+	shardStore := NewShardStore(engine, groups)
+	coord := NewShardedCoordinator(engine, groups, 1, NewHLC(), shardStore)
+	_, err := coord.Dispatch(ctx, &OperationGroup[OP]{
+		IsTxn: true,
+		Elems: []*Elem[OP]{
+			{Op: Put, Key: []byte("b"), Value: []byte("val-b")},
+			{Op: Put, Key: []byte("x"), Value: []byte("val-x")},
+		},
+	})
+	require.ErrorIs(t, err, ErrTransactionOutcomeUnknown)
+	_, err = s1.GetAt(ctx, txnLockKey([]byte("b")), ^uint64(0))
+	require.NoError(t, err, "an unknown participant must not abort a prior intent")
+	_, err = s1.GetAt(ctx, txnIntentKey([]byte("b")), ^uint64(0))
+	require.NoError(t, err)
+}
+
 func TestAbortPreparedTxn_DoesNotWarnWhenTxnAlreadyCommitted(t *testing.T) {
+	t.Parallel()
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
 

@@ -97,6 +97,8 @@ func (a migrationNamedAuthInfo) AuthType() string { return a.kind }
 type migrationSpoofedTLSInfo struct{ credentials.TLSInfo }
 
 func TestSplitMigrationTLSProtectedTransportContract(t *testing.T) {
+	// Not parallel: its deadline/liveness budget is sized for a quiet
+	// process, and parallel peers on a loaded runner can exhaust it.
 	secure := migrationTLSInfoFixture(t)
 	zeroCommon := secure
 	zeroCommon.SecurityLevel = credentials.InvalidSecurityLevel

@@ -2337,6 +2337,9 @@ func (s *DistributionServer) commitSplitJobCutover(
 		StartTS:  snapshot.ReadTS,
 		ReadKeys: [][]byte{routeKey, versionKey, jobKey},
 	}); err != nil {
+		if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+			return grpcStatusError(codes.Unknown, kv.ErrTransactionOutcomeUnknown.Error())
+		}
 		if errors.Is(err, store.ErrWriteConflict) {
 			return grpcStatusError(codes.Aborted, errDistributionCatalogConflict.Error())
 		}

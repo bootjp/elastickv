@@ -179,6 +179,7 @@ type SQSServer struct {
 	targetHandlers   map[string]func(http.ResponseWriter, *http.Request)
 	leaderSQS        map[string]string
 	region           string
+	publicEndpoint   string
 	staticCreds      map[string]string
 	// reaperCtx / reaperCancel drive the retention sweeper goroutine.
 	// Both are initialized in NewSQSServer (never reassigned) so a

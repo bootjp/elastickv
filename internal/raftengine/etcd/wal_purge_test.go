@@ -41,6 +41,7 @@ func listWALFiles(t *testing.T, dir string) []string {
 }
 
 func TestPurgeOldWALFiles_NoOpWhenBelowLimit(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	writeDummyWALSegment(t, dir, 0, 0)
 	writeDummyWALSegment(t, dir, 1, 100)
@@ -52,6 +53,7 @@ func TestPurgeOldWALFiles_NoOpWhenBelowLimit(t *testing.T) {
 }
 
 func TestPurgeOldWALFiles_KeepsMostRecentN(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	for i := uint64(0); i < 10; i++ {
 		writeDummyWALSegment(t, dir, i, i*100)
@@ -70,6 +72,7 @@ func TestPurgeOldWALFiles_KeepsMostRecentN(t *testing.T) {
 }
 
 func TestPurgeOldWALFiles_NewestSurvivesKeepCutoff(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	// Create 5 segments with keep=1. The newest is already excluded by the
 	// lexicographic cutoff (victims := names[:len(names)-keep]), so this
@@ -92,6 +95,7 @@ func TestPurgeOldWALFiles_NewestSurvivesKeepCutoff(t *testing.T) {
 // must skip that segment while still deleting older unlocked ones around
 // it. This specifically covers the TryLockFile path in purgeOldWALFiles.
 func TestPurgeOldWALFiles_SkipsLockedMidListSegment(t *testing.T) {
+	t.Parallel()
 	// fileutil flock semantics differ on Windows (per-handle mandatory
 	// locking via LockFileEx). Our production target is Linux/macOS, and
 	// wiring a second-process lock acquirer just to exercise Windows is
@@ -137,11 +141,13 @@ func TestPurgeOldWALFiles_SkipsLockedMidListSegment(t *testing.T) {
 }
 
 func TestPurgeOldWALFiles_MissingDirIsNoOp(t *testing.T) {
+	t.Parallel()
 	// Directory that doesn't exist -> nil error, not a failure.
 	require.NoError(t, purgeOldWALFiles(filepath.Join(t.TempDir(), "no-such-dir"), 3))
 }
 
 func TestPurgeOldWALFiles_ClampsKeepToOne(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	for i := uint64(0); i < 4; i++ {
 		writeDummyWALSegment(t, dir, i, i*100)
@@ -155,6 +161,7 @@ func TestPurgeOldWALFiles_ClampsKeepToOne(t *testing.T) {
 }
 
 func TestPurgeOldWALFiles_IgnoresNonWALEntries(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	writeDummyWALSegment(t, dir, 0, 0)
 	writeDummyWALSegment(t, dir, 1, 100)
@@ -215,6 +222,7 @@ func TestSnapshotEveryFromEnv_FallsBackOnInvalid(t *testing.T) {
 }
 
 func TestEngineSnapshotEveryReadsConfiguredThreshold(t *testing.T) {
+	t.Parallel()
 	require.Equal(t, uint64(defaultSnapshotEvery), (&Engine{}).SnapshotEvery())
 	require.Equal(t, uint64(5000), (&Engine{snapshotEvery: 5000}).SnapshotEvery())
 }

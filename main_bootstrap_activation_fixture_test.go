@@ -45,6 +45,7 @@ func bootstrapActivationFixture(t testing.TB, group uint64) raftbootstrap.Activa
 }
 
 func TestBootstrapActivationFixtureRequiresDistinctAllMemberReadiness(t *testing.T) {
+	t.Parallel()
 	command := bootstrapActivationFixture(t, 17)
 	require.Len(t, command.Readiness.Members, 4)
 	for i, ack := range command.Readiness.Members {

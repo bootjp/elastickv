@@ -8,6 +8,7 @@ import (
 )
 
 func TestOnePhaseApplyRejectsTimestampAtAppliedWatermark(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name string
 		new  func(*testing.T) MVCCStore
@@ -35,6 +36,7 @@ func TestOnePhaseApplyRejectsTimestampAtAppliedWatermark(t *testing.T) {
 }
 
 func TestOnePhaseRaftEntryRejectsCollidingAppend(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := newApplyIndexPebbleStore(t)
 	applier := raftEntryApplier(t, st)
@@ -56,6 +58,7 @@ func TestOnePhaseRaftEntryRejectsCollidingAppend(t *testing.T) {
 }
 
 func TestOnePhaseRaftEntryRejectsCollidingWriteInSameBatch(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	st := newApplyIndexPebbleStore(t)
 	applier := raftEntryApplier(t, st)

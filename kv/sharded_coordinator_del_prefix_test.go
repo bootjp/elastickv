@@ -1058,6 +1058,7 @@ func TestShardedCoordinator_DelPrefixSingleShard(t *testing.T) {
 // TestShardedCoordinator_DelPrefixIntegration uses real raft instances to
 // verify that DEL_PREFIX actually deletes data across multiple shards.
 func TestShardedCoordinator_DelPrefixIntegration(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 
 	engine := distribution.NewEngine()
@@ -1127,6 +1128,7 @@ func TestShardedCoordinator_DelPrefixIntegration(t *testing.T) {
 // TestShardedCoordinator_DelPrefixPreservesTxnKeys verifies that transaction-
 // internal keys (!txn|*) are not deleted by DEL_PREFIX.
 func TestShardedCoordinator_DelPrefixPreservesTxnKeys(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 
 	engine := distribution.NewEngine()

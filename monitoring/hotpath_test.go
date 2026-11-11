@@ -11,6 +11,7 @@ import (
 )
 
 func TestLeaseReadObserverHitsAndMisses(t *testing.T) {
+	t.Parallel()
 	registry := NewRegistry("n1", "10.0.0.1:50051")
 	observer := registry.LeaseReadObserver()
 
@@ -32,6 +33,7 @@ elastickv_lease_read_total{node_address="10.0.0.1:50051",node_id="n1",outcome="m
 }
 
 func TestLuaFastPathObserverCountsByCmdAndOutcome(t *testing.T) {
+	t.Parallel()
 	registry := NewRegistry("n1", "10.0.0.1:50051")
 	cmd := registry.LuaFastPathObserver().ForCommand("zrangebyscore")
 
@@ -63,6 +65,7 @@ elastickv_lua_cmd_fastpath_total{cmd="zrangebyscore",node_address="10.0.0.1:5005
 }
 
 func TestLuaFastPathObserverZeroValueIsNoop(t *testing.T) {
+	t.Parallel()
 	var observer LuaFastPathObserver
 	cmd := observer.ForCommand("zrangebyscore")
 	require.NotPanics(t, func() {
@@ -75,6 +78,7 @@ func TestLuaFastPathObserverZeroValueIsNoop(t *testing.T) {
 }
 
 func TestLeaseReadObserverZeroValueIsNoop(t *testing.T) {
+	t.Parallel()
 	// LeaseReadObserver{} is documented as safe; the Coordinator
 	// falls back to this when monitoring is disabled. Calling
 	// ObserveLeaseRead must not panic.
@@ -136,6 +140,7 @@ func (f *fakeDispatchSource) setByCode(m map[string]uint64) {
 }
 
 func TestDispatchCollectorMirrorsDeltas(t *testing.T) {
+	t.Parallel()
 	registry := NewRegistry("n1", "10.0.0.1:50051")
 	collector := registry.DispatchCollector()
 	require.NotNil(t, collector)
@@ -200,6 +205,7 @@ elastickv_raft_snapshot_stream_payload_bytes_total{group="1",node_address="10.0.
 }
 
 func TestDispatchCollectorEmitsPerCodeDeltas(t *testing.T) {
+	t.Parallel()
 	registry := NewRegistry("n1", "10.0.0.1:50051")
 	collector := registry.DispatchCollector()
 	require.NotNil(t, collector)
@@ -240,6 +246,7 @@ elastickv_raft_dispatch_errors_by_code_total{code="Unavailable",group="1",node_a
 }
 
 func TestDispatchCollectorHandlesSourceReset(t *testing.T) {
+	t.Parallel()
 	// If the engine's counter is replaced (e.g. a test reopens it)
 	// the snapshot may go DOWN. The collector must not emit negative
 	// deltas; instead, it rebases silently.

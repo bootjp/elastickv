@@ -8,6 +8,7 @@ import (
 )
 
 func TestRecoveredPolicyPublicationRequiresDurableMirroredIntent(t *testing.T) {
+	t.Parallel()
 	h, _ := controlFixture(t)
 	o, err := NewOwner(Config{Local: h.Client, Versions: h.View.Installed, Provisioned: []Provision{
 		{Node: h.Client, Groups: []uint64{testGroup}}, {Node: h.Server, Groups: []uint64{testGroup}},

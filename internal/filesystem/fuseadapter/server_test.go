@@ -29,6 +29,7 @@ func (r *recoverySequence) RecoverIntents(_ context.Context, limit int) (filesys
 }
 
 func TestRecoverIntentsBeforeMountDrainsEveryBatch(t *testing.T) {
+	t.Parallel()
 	recoverer := &recoverySequence{stats: []filesystem.RecoveryStats{
 		{MoveJobsResumed: startupRecoveryBatch, MoveJobsCleared: startupRecoveryBatch},
 		{IntentsCleared: 1},
@@ -40,6 +41,7 @@ func TestRecoverIntentsBeforeMountDrainsEveryBatch(t *testing.T) {
 }
 
 func TestRawFileSystemLookupMapsStableInodeAndAttributes(t *testing.T) {
+	t.Parallel()
 	core := &fakeCore{
 		resolveInode: 42,
 		stat: filesystem.Stat{
@@ -77,6 +79,7 @@ func TestRawFileSystemLookupMapsStableInodeAndAttributes(t *testing.T) {
 }
 
 func TestRawFileSystemCreateAndReadUseFuseHandles(t *testing.T) {
+	t.Parallel()
 	core := &fakeCore{
 		createResult: filesystem.CreateResult{
 			Inode: 7,
@@ -118,6 +121,7 @@ func TestRawFileSystemCreateAndReadUseFuseHandles(t *testing.T) {
 }
 
 func TestRawFileSystemMknodDoesNotAllocateOpenHandle(t *testing.T) {
+	t.Parallel()
 	core := &fakeCore{createResult: filesystem.CreateResult{
 		Inode: 7,
 		FH:    9,
@@ -146,6 +150,7 @@ func TestRawFileSystemMknodDoesNotAllocateOpenHandle(t *testing.T) {
 }
 
 func TestRawFileSystemReadDirResumesWithinBackendPage(t *testing.T) {
+	t.Parallel()
 	core := &pagedReaddirCore{fakeCore: &fakeCore{
 		stat: filesystem.Stat{Inode: filesystem.RootInode, Type: filesystem.TypeDirectory},
 	}}
@@ -194,6 +199,7 @@ func TestRawFileSystemReadDirResumesWithinBackendPage(t *testing.T) {
 }
 
 func TestRawFileSystemReadDirKeepsEOFOffsetTerminal(t *testing.T) {
+	t.Parallel()
 	core := &pagedReaddirCore{fakeCore: &fakeCore{
 		stat: filesystem.Stat{Inode: filesystem.RootInode, Type: filesystem.TypeDirectory},
 	}}
@@ -235,6 +241,7 @@ func TestRawFileSystemReadDirKeepsEOFOffsetTerminal(t *testing.T) {
 }
 
 func TestDefaultMountOptionsEnableKernelPermissionChecks(t *testing.T) {
+	t.Parallel()
 	input := &fuse.MountOptions{Options: []string{"ro"}}
 	opts := defaultMountOptions(input)
 
@@ -247,6 +254,7 @@ func TestDefaultMountOptionsEnableKernelPermissionChecks(t *testing.T) {
 }
 
 func TestRawFileSystemStatFsMapsCapacityAndTotalInodes(t *testing.T) {
+	t.Parallel()
 	core := &fakeCore{statFS: filesystem.StatFS{
 		ChunkSize: 4,
 		Files:     2,

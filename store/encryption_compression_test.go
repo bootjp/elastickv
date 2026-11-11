@@ -236,6 +236,7 @@ func TestEncryption_RejectsAuthenticatedOversizedSnappyBeforeDecode(t *testing.T
 }
 
 func TestCompressionRoundTripProperty(t *testing.T) {
+	t.Parallel()
 	rapid.Check(t, func(t *rapid.T) {
 		plaintext := rapid.SliceOfN(rapid.Byte(), 0, 16<<10).Draw(t, "plaintext")
 		payload, flag := compressForEncryption(plaintext)

@@ -59,6 +59,7 @@ func newBootstrapInstalledFixture(t *testing.T) *bootstrapInstalledFixture {
 }
 
 func TestBootstrapEncryptionInstalledRotationIsNotCompletion(t *testing.T) {
+	t.Parallel()
 	f := newBootstrapInstalledFixture(t)
 	got, err := readBootstrapEncryptionProjection(f.in)
 	require.NoError(t, err)
@@ -77,6 +78,7 @@ func TestBootstrapEncryptionInstalledRotationIsNotCompletion(t *testing.T) {
 }
 
 func TestBootstrapEncryptionInstalledRejectsMissingEvidence(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name   string
 		mutate func(*testing.T, *bootstrapInstalledFixture)
@@ -125,6 +127,7 @@ func TestBootstrapEncryptionInstalledRejectsMissingEvidence(t *testing.T) {
 }
 
 func TestBootstrapEncryptionInstalledRotationRefreshesActualWrapper(t *testing.T) {
+	t.Parallel()
 	f := newBootstrapInstalledFixture(t)
 	before, err := readBootstrapEncryptionProjection(f.in)
 	require.NoError(t, err)
@@ -155,6 +158,7 @@ func TestBootstrapEncryptionInstalledRotationRefreshesActualWrapper(t *testing.T
 }
 
 func TestBootstrapEncryptionProjectionGenerationAndFatalFence(t *testing.T) {
+	t.Parallel()
 	for _, fatal := range []bool{false, true} {
 		t.Run(map[bool]string{false: "drift", true: "fatal"}[fatal], func(t *testing.T) {
 			f := newBootstrapInstalledFixture(t)
@@ -178,6 +182,7 @@ func TestBootstrapEncryptionProjectionGenerationAndFatalFence(t *testing.T) {
 }
 
 func TestBootstrapEncryptionProjectionDigestTracksRegistryAndGeneration(t *testing.T) {
+	t.Parallel()
 	f := newBootstrapInstalledFixture(t)
 	first, err := readBootstrapEncryptionProjection(f.in)
 	require.NoError(t, err)
@@ -193,6 +198,7 @@ func TestBootstrapEncryptionProjectionDigestTracksRegistryAndGeneration(t *testi
 }
 
 func TestBootstrapEncryptionProjectionDigestExcludesApplyProgress(t *testing.T) {
+	t.Parallel()
 	f := newBootstrapInstalledFixture(t)
 	before, err := readBootstrapEncryptionProjection(f.in)
 	require.NoError(t, err)
@@ -207,6 +213,7 @@ func TestBootstrapEncryptionProjectionDigestExcludesApplyProgress(t *testing.T) 
 }
 
 func TestBootstrapEncryptionRuntimeInvalidatesBeforeMutation(t *testing.T) {
+	t.Parallel()
 	f := newBootstrapInstalledFixture(t)
 	calls := 0
 	ended := 0
@@ -232,6 +239,7 @@ func TestBootstrapEncryptionRuntimeInvalidatesBeforeMutation(t *testing.T) {
 }
 
 func TestBootstrapEncryptionProjectionTypedPendingAndFatal(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name    string
 		pending bool
@@ -278,6 +286,7 @@ func TestBootstrapEncryptionProjectionTypedPendingAndFatal(t *testing.T) {
 }
 
 func TestNewBootstrapEncryptionProjectionInputBindsActualWiring(t *testing.T) {
+	t.Parallel()
 	f := newBootstrapInstalledFixture(t)
 	w := encryptionWriteWiring{cipher: f.runtime.cipher, raftEnvelope: f.runtime, epoch: 7, raftEpoch: 9}
 	in, err := newBootstrapEncryptionProjectionInput(true, true, f.in.sidecarPath, f.group, w, 123, f.in.runtimeFence)
@@ -296,6 +305,7 @@ func TestNewBootstrapEncryptionProjectionInputBindsActualWiring(t *testing.T) {
 }
 
 func TestBootstrapEncryptionPairedMutationClosesOldCoherentImage(t *testing.T) {
+	t.Parallel()
 	f := newBootstrapInstalledFixture(t)
 	var mu sync.Mutex
 	generation := uint64(1)

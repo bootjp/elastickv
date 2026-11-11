@@ -165,6 +165,9 @@ func drainAndHashSQSBody(r *http.Request) (string, *sqsAuthError) {
 // (Accept-Encoding etc.) do not leak into the canonical request.
 func verifySQSSignatureMatches(r *http.Request, authHeader, accessKeyID, secretAccessKey, region string, signingTime time.Time, payloadHash string) *sqsAuthError {
 	signedHeaders := extractSigV4SignedHeaders(authHeader)
+	if err := validateSigV4SignedHeaders(r, signedHeaders); err != nil {
+		return &sqsAuthError{Status: http.StatusForbidden, Code: sqsErrSignatureDoesNotMatch, Message: err.Error()}
+	}
 	expectedAuth, err := buildSigV4AuthorizationHeaderRestricted(r, accessKeyID, secretAccessKey, sqsSigV4Service, region, signingTime, payloadHash, signedHeaders)
 	if err != nil {
 		return &sqsAuthError{Status: http.StatusForbidden, Code: "SignatureDoesNotMatch", Message: "failed to verify request signature"}

@@ -268,7 +268,7 @@ func TestConfigureAdminServiceInsecureNoAuth(t *testing.T) {
 }
 
 func TestConfigureAdminServiceWiresLeaderVersionProbe(t *testing.T) {
-	t.Parallel()
+	// Not parallel: the 1s Eventually budget for the remote leader-version probe timed out under the parallel e2e load.
 	var lc net.ListenConfig
 	lis, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -434,6 +434,7 @@ func freshKey() string {
 }
 
 func TestBuildAdminConfig_Passthrough(t *testing.T) {
+	t.Parallel()
 	in := adminListenerConfig{
 		enabled:                   true,
 		listen:                    "127.0.0.1:18080",
@@ -460,12 +461,14 @@ func TestBuildAdminConfig_Passthrough(t *testing.T) {
 }
 
 func TestParseCSV(t *testing.T) {
+	t.Parallel()
 	require.Equal(t, []string{"a", "b", "c"}, parseCSV("a,b,c"))
 	require.Equal(t, []string{"a", "b"}, parseCSV("  a ,, b ,"))
 	require.Equal(t, []string{}, parseCSV(""))
 }
 
 func TestStartAdminServer_DisabledNoOp(t *testing.T) {
+	t.Parallel()
 	var lc net.ListenConfig
 	prepared, err := prepareAdminServer(context.Background(), &lc, adminListenerConfig{enabled: false}, nil, nil, nil, nil, nil, nil, nil, nil, keyVizFanoutConfig{}, "")
 	require.NoError(t, err)
@@ -473,6 +476,7 @@ func TestStartAdminServer_DisabledNoOp(t *testing.T) {
 }
 
 func TestStartAdminServer_InvalidConfigRejected(t *testing.T) {
+	t.Parallel()
 	var lc net.ListenConfig
 	cfg := adminListenerConfig{
 		enabled: true,
@@ -484,6 +488,7 @@ func TestStartAdminServer_InvalidConfigRejected(t *testing.T) {
 }
 
 func TestStartAdminServer_NonLoopbackWithoutTLSRejected(t *testing.T) {
+	t.Parallel()
 	var lc net.ListenConfig
 	cfg := adminListenerConfig{
 		enabled:           true,
@@ -496,6 +501,7 @@ func TestStartAdminServer_NonLoopbackWithoutTLSRejected(t *testing.T) {
 }
 
 func TestStartAdminServer_RejectsMissingClusterSource(t *testing.T) {
+	t.Parallel()
 	var lc net.ListenConfig
 	cfg := adminListenerConfig{
 		enabled:           true,
@@ -508,6 +514,7 @@ func TestStartAdminServer_RejectsMissingClusterSource(t *testing.T) {
 }
 
 func TestStartAdminServer_ServesHealthz(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	eg, eCtx := errgroup.WithContext(ctx)
 	defer func() {
@@ -552,6 +559,7 @@ func TestStartAdminServer_ServesHealthz(t *testing.T) {
 }
 
 func TestStartAdminServer_ServesTLS(t *testing.T) {
+	t.Parallel()
 	certFile, keyFile := writeSelfSignedCert(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	eg, eCtx := errgroup.WithContext(ctx)
@@ -642,6 +650,7 @@ func writeSelfSignedCert(t *testing.T) (string, string) {
 // initial isVerifiedDynamoLeader check) to admin.ErrTablesNotLeader
 // rather than the generic 500 fallthrough. P2 review on PR #634.
 func TestTranslateAdminTablesError_LeaderChurn(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name string
 		in   error
@@ -670,6 +679,7 @@ func TestTranslateAdminTablesError_LeaderChurn(t *testing.T) {
 // be classified as leader-churn. Switching from strings.Contains
 // to strings.HasSuffix is what makes this test pass.
 func TestTranslateAdminTablesError_LeaderPhraseInMiddleOfMessage(t *testing.T) {
+	t.Parallel()
 	cases := []string{
 		// Phrase mid-message — kv-internal sentinels never look
 		// like this; they always end with the canonical phrase.
@@ -690,6 +700,7 @@ func TestTranslateAdminTablesError_LeaderPhraseInMiddleOfMessage(t *testing.T) {
 // the leader-churn detector does not swallow unrelated errors that
 // happen to mention the word "leader" outside the canonical phrases.
 func TestTranslateAdminTablesError_UnrelatedErrorPassesThrough(t *testing.T) {
+	t.Parallel()
 	in := errors.New("team leader misconfigured")
 	out := translateAdminTablesError(in)
 	// Falls through to default — same error returned, NOT
@@ -738,6 +749,7 @@ func TestTranslateAdminObjectsError(t *testing.T) {
 // election mid-AdminPutItem / AdminGetItem would 500 instead of
 // surfacing through the SPA's retry path.
 func TestTranslateAdminItemsError_LeaderChurn(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name string
 		in   error
@@ -765,6 +777,7 @@ func TestTranslateAdminItemsError_LeaderChurn(t *testing.T) {
 // the leader-churn detector narrow enough that an unrelated error
 // mentioning "leader" still surfaces as a 500.
 func TestTranslateAdminItemsError_UnrelatedErrorPassesThrough(t *testing.T) {
+	t.Parallel()
 	in := errors.New("team leader misconfigured")
 	out := translateAdminItemsError(in)
 	require.NotErrorIs(t, out, admin.ErrItemsNotLeader)
@@ -780,6 +793,7 @@ func TestTranslateAdminItemsError_UnrelatedErrorPassesThrough(t *testing.T) {
 // table) is the most operator-useful 400 message in the adapter
 // vocabulary; dropping it at the bridge made the SPA unhelpful.
 func TestTranslateAdminItemsError_ValidationPreservesAdapterMessage(t *testing.T) {
+	t.Parallel()
 	in := fmt.Errorf("%w: table requires a one-time legacy-key migration before admin read endpoints are available",
 		adapter.ErrAdminDynamoValidation)
 	out := translateAdminItemsError(in)
@@ -796,6 +810,7 @@ func TestTranslateAdminItemsError_ValidationPreservesAdapterMessage(t *testing.T
 // resulting ErrLeaderNotFound / ErrNotLeader / wrapped suffixes must
 // classify as 503 leader_unavailable, not the generic 500 fallthrough.
 func TestTranslateAdminQueuesError_LeaderChurn(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name string
 		in   error
@@ -825,6 +840,7 @@ func TestTranslateAdminQueuesError_LeaderChurn(t *testing.T) {
 // phrase mid-string (e.g. a queue name or attribute value that
 // happens to contain "not leader").
 func TestTranslateAdminQueuesError_LeaderPhraseInMiddleOfMessage(t *testing.T) {
+	t.Parallel()
 	cases := []string{
 		"not leader: actually a downstream error",
 		"leader not found, but recovered automatically",
@@ -843,6 +859,7 @@ func TestTranslateAdminQueuesError_LeaderPhraseInMiddleOfMessage(t *testing.T) {
 // the leader-churn detector does not swallow unrelated errors that
 // happen to mention the word "leader" outside the canonical phrases.
 func TestTranslateAdminQueuesError_UnrelatedErrorPassesThrough(t *testing.T) {
+	t.Parallel()
 	in := errors.New("team leader misconfigured")
 	out := translateAdminQueuesError(in)
 	require.NotErrorIs(t, out, admin.ErrQueuesNotLeader)
