@@ -149,7 +149,12 @@ func (a *RaftTSOAllocator) selectPhysicalBand(floor uint64, ceiling int64, n int
 	end := start | hlcLogicalMask
 	base := max(start, min+1)
 	if base > end || positiveIntToUint64(n)-1 > end-base {
-		return 0, 0, errors.WithStack(ErrCeilingExpired)
+		physical++
+		if physical > nonNegativeUint64(ceiling) || physical >= (1<<hlcPhysicalBits)-1 {
+			return 0, 0, errors.WithStack(ErrCeilingExpired)
+		}
+		base = physical << hlcLogicalBits
+		end = base | hlcLogicalMask
 	}
 	return base, end, nil
 }

@@ -89,6 +89,28 @@ func TestTSOPhysicalBandRollsOverBeforeCeilingRenewal(t *testing.T) {
 	require.Len(t, engine.proposedPayloads(), 2)
 }
 
+func TestTSOPhysicalBandAdvancesWhenMinimumLeavesTooFewSlots(t *testing.T) {
+	alloc, engine, clock := newBandTSOFixture(t)
+	physical := uint64(time.Now().Add(time.Second).UnixMilli())
+	minimum := (physical << hlcLogicalBits) | (hlcLogicalMask - 1)
+	reservation, err := alloc.ReservePhysicalBandAfter(context.Background(), 2, minimum)
+	require.NoError(t, err)
+	require.Equal(t, (physical+1)<<hlcLogicalBits, reservation.Base)
+	require.Equal(t, reservation.Base|hlcLogicalMask, reservation.CommittedBandEnd)
+	require.Equal(t, reservation.CommittedBandEnd, alloc.AllocationFloor())
+	require.Len(t, engine.proposedPayloads(), 1)
+	require.Less(t, int64(physical+1), clock.PhysicalCeiling())
+}
+
+func TestTSOPhysicalBandRejectsNextBandPastCeiling(t *testing.T) {
+	alloc, engine, clock := newBandTSOFixture(t)
+	physical := uint64(clock.PhysicalCeiling())
+	minimum := (physical << hlcLogicalBits) | (hlcLogicalMask - 1)
+	_, err := alloc.ReservePhysicalBandAfter(context.Background(), 2, minimum)
+	require.ErrorIs(t, err, ErrCeilingExpired)
+	require.Empty(t, engine.proposedPayloads())
+}
+
 func TestTSOPhysicalBandDiscardsOnTermAndCeilingChange(t *testing.T) {
 	alloc, engine, clock := newBandTSOFixture(t)
 	first, err := alloc.ReservePhysicalBandAfter(context.Background(), 1, 0)
