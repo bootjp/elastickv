@@ -51,7 +51,7 @@ func prepareOriginFixture(t *testing.T) (string, *ExternalSnapshotRestoreResult)
 
 func loadOriginFixture(dir string, fsm StateMachine) (*diskState, error) {
 	return loadWalState(zap.NewNop(), filepath.Join(dir, walDirName), filepath.Join(dir, snapDirName),
-		filepath.Join(dir, fsmSnapDirName), fsm, nil)
+		filepath.Join(dir, fsmSnapDirName), fsm)
 }
 
 func TestExternalOriginForcesValidatedFullRestore(t *testing.T) {
