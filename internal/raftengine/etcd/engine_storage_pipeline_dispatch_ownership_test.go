@@ -79,7 +79,7 @@ func admitPipelineDispatchConfiguration(t *testing.T, c *nativeSnapshotCluster) 
 	t.Helper()
 	message := nativeSnapshotConfigurationProposal(t, true)
 	c.pumpUntil(t, func() bool {
-		err := c.nodes[0].engine.handleTransportMessage(t.Context(), message)
+		err := c.nodes[0].engine.enqueuePipelineStep(t.Context(), message)
 		if errors.Is(err, errStepQueueFull) {
 			return false
 		}

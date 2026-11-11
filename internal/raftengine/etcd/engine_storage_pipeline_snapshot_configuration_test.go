@@ -31,7 +31,7 @@ func testPipelineCapturedPrefixConfiguration(t *testing.T, v2 bool) {
 	}
 	message := nativeSnapshotConfigurationProposal(t, v2)
 	c.pumpUntil(t, func() bool {
-		err := c.nodes[0].engine.handleTransportMessage(t.Context(), message)
+		err := c.nodes[0].engine.enqueuePipelineStep(t.Context(), message)
 		if errors.Is(err, errStepQueueFull) {
 			return false // Explicit rejection precedes Step; there was no proposal.
 		}
@@ -85,5 +85,5 @@ func nativeSnapshotConfigurationProposal(t *testing.T, v2 bool) raftpb.Message {
 	}
 	entry.Data, err = proto.Marshal(change)
 	require.NoError(t, err)
-	return raftpb.Message{Type: messageTypePtr(raftpb.MsgProp), From: proto.Uint64(2), To: proto.Uint64(1), Entries: []*raftpb.Entry{entry}}
+	return raftpb.Message{Type: messageTypePtr(raftpb.MsgProp), From: proto.Uint64(1), To: proto.Uint64(1), Entries: []*raftpb.Entry{entry}}
 }

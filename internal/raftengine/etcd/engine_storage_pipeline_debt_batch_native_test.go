@@ -15,9 +15,9 @@ func TestPipelineDebtNativeBatchThousand(t *testing.T) {
 	for i := range entries {
 		entries[i] = &raftpb.Entry{Data: encodeProposalEnvelope(uint64(i+100), []byte("native-small"))}
 	}
-	// Genuine native gRPC proposal batch, not manufactured append/storage ACKs.
-	require.NoError(t, c.nodes[1].transport.Dispatch(t.Context(), raftpb.Message{
-		Type: messageTypePtr(raftpb.MsgProp), From: uint64Ptr(2), To: uint64Ptr(1), Entries: entries,
+	// Admit one native proposal batch on the leader; peer proposal forwarding is disabled.
+	require.NoError(t, e.enqueuePipelineStep(t.Context(), raftpb.Message{
+		Type: messageTypePtr(raftpb.MsgProp), From: uint64Ptr(1), To: uint64Ptr(1), Entries: entries,
 	}))
 	c.pumpUntil(t, func() bool {
 		require.NoError(t, e.Err(), "one 1000-entry Ready must not exhaust a per-entry work quota")
