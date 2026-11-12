@@ -102,6 +102,17 @@ Tests move with the code they cover.
   `internal/clusterbootstrap`. `main` keeps only the
   `dispatchBootstrapOperator` call.
 
+## Progress
+
+- M1: admin bridges moved to `internal/adminbridge`.
+- M4 (partial): the leader-balance scheduler moved to `internal/leaderbalance`
+  and FUSE mounting to `internal/fsmount`. Both see the node through narrow
+  inputs (a `Group` interface with `GroupID` / `Engine`, and a resolved
+  `fsmount.Config`) rather than `*raftGroupRuntime` or flag globals, so
+  neither waited for M3.
+- Snapshot-offload wiring is deferred until M2: it reads about twenty flags
+  directly, and its tests set those flags.
+
 ## Decisions
 
 - **Internal packages, not exported library packages.** These packages
@@ -111,6 +122,11 @@ Tests move with the code they cover.
   Only identifiers are exported, and signatures change only where M2
   makes inputs explicit, so reviewers can follow a move with
   `git diff --color-moved`.
+- **Narrow inputs instead of shared types.** An extracted area declares
+  the small interface or config it needs (for example
+  `leaderbalance.Group`) and `main` adapts its runtime to it. This lets an
+  area leave `main` without first moving `raftGroupRuntime`, which embeds
+  bootstrap types and would otherwise drag the bootstrap area along.
 - **No design changes inside a milestone.** If a move exposes a defect,
   fix it in a separate PR with a failing test first, per the repository
   convention.
