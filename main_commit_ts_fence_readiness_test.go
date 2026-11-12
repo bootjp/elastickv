@@ -22,12 +22,12 @@ func TestCommitTSFenceRuntimesReady(t *testing.T) {
 	}{
 		{name: "no runtimes"},
 		{name: "nil runtime", runtimes: []*raftGroupRuntime{nil}},
-		{name: "legacy runtime", runtimes: []*raftGroupRuntime{{publicReady: ready}}},
-		{name: "missing callback", runtimes: []*raftGroupRuntime{{bootstrapDomain: domain}}},
-		{name: "not ready", runtimes: []*raftGroupRuntime{{bootstrapDomain: domain, publicReady: blocked}}},
-		{name: "mixed domains", runtimes: []*raftGroupRuntime{{bootstrapDomain: domain, publicReady: ready}, {bootstrapDomain: &bootstrapDomain{}, publicReady: ready}}},
-		{name: "missing group", runtimes: []*raftGroupRuntime{{bootstrapDomain: domain, publicReady: ready}, nil}},
-		{name: "all protected groups ready", runtimes: []*raftGroupRuntime{{bootstrapDomain: domain, publicReady: ready}, {bootstrapDomain: domain, publicReady: ready}}, want: true},
+		{name: "legacy runtime", runtimes: []*raftGroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{PublicReady: ready}}}},
+		{name: "missing callback", runtimes: []*raftGroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{}, bootstrapDomain: domain}}},
+		{name: "not ready", runtimes: []*raftGroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{PublicReady: blocked}, bootstrapDomain: domain}}},
+		{name: "mixed domains", runtimes: []*raftGroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{PublicReady: ready}, bootstrapDomain: domain}, {GroupRuntime: &noderuntime.GroupRuntime{PublicReady: ready}, bootstrapDomain: &bootstrapDomain{}}}},
+		{name: "missing group", runtimes: []*raftGroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{PublicReady: ready}, bootstrapDomain: domain}, nil}},
+		{name: "all protected groups ready", runtimes: []*raftGroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{PublicReady: ready}, bootstrapDomain: domain}, {GroupRuntime: &noderuntime.GroupRuntime{PublicReady: ready}, bootstrapDomain: domain}}, want: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -43,7 +43,7 @@ func TestPublicGateWaitsForEveryCommitTSFenceActivation(t *testing.T) {
 		st, err := store.NewPebbleStore(t.TempDir())
 		require.NoError(t, err)
 		t.Cleanup(func() { require.NoError(t, st.Close()) })
-		runtimes[i] = &raftGroupRuntime{spec: noderuntime.GroupSpec{ID: uint64(i + 1)}, store: st}
+		runtimes[i] = &raftGroupRuntime{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: uint64(i + 1)}, Store: st}}
 		fsms[i] = kv.NewKvFSMWithHLC(st, kv.NewHLC())
 	}
 	gate := &startupPublicKVGate{}
@@ -74,7 +74,7 @@ func TestCommitTSFenceActivationWaitFailsClosed(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	require.ErrorIs(t, waitForCommitTSFenceActivation(ctx, nil), context.Canceled)
-	require.ErrorIs(t, waitForCommitTSFenceActivation(ctx, []*raftGroupRuntime{{}}), context.Canceled)
+	require.ErrorIs(t, waitForCommitTSFenceActivation(ctx, []*raftGroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{}}}), context.Canceled)
 	gate := &startupPublicKVGate{}
 	require.ErrorIs(t, markPublicGateReadyAfterCommitTSFence(ctx, gate, nil, true), context.Canceled)
 	require.True(t, gate.blocked())
@@ -91,7 +91,7 @@ func TestCommitTSFenceReadinessIgnoresDedicatedTSOGroup(t *testing.T) {
 		st, err := store.NewPebbleStore(t.TempDir())
 		require.NoError(t, err)
 		t.Cleanup(func() { require.NoError(t, st.Close()) })
-		return &raftGroupRuntime{spec: noderuntime.GroupSpec{ID: id}, store: st}, kv.NewKvFSMWithHLC(st, kv.NewHLC())
+		return &raftGroupRuntime{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: id}, Store: st}}, kv.NewKvFSMWithHLC(st, kv.NewHLC())
 	}
 	tso, _ := newRuntime(noderuntime.DedicatedTSORaftGroupID)
 	data, dataFSM := newRuntime(1)

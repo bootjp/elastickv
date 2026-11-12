@@ -59,7 +59,7 @@ func newBootstrapRotationE2EFixture(t *testing.T, active ...bool) *bootstrapRota
 	require.NoError(t, err)
 	f := &bootstrapRotationE2EFixture{base: t.TempDir(), configDir: t.TempDir(), config: cfg,
 		group: noderuntime.GroupSpec{ID: 1, Address: cfg.local.Address}, listener: listener, activeEnvelopes: len(active) != 0 && active[0]}
-	f.dir = groupDataDir(f.base, "n1", f.group.ID, false)
+	f.dir = noderuntime.GroupDataDir(f.base, "n1", f.group.ID, false)
 	f.sidecarPath = filepath.Join(f.dir, "encryption", "keys.json")
 	require.NoError(t, os.MkdirAll(filepath.Dir(f.sidecarPath), 0o700))
 	kekPath := filepath.Join(t.TempDir(), "kek")
@@ -98,8 +98,8 @@ func (f *bootstrapRotationE2EFixture) prepareLegacyCut(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(runtime.Close)
 	wiring.attachRaftEnvelopeGroup(f.group.ID, shard)
-	require.Eventually(t, func() bool { return runtime.engine.State() == raftengine.StateLeader }, enablementE2EWait, 10*time.Millisecond)
-	enablementLegacyPut(t, runtime.engine, clock.Next(), "legacy-key", "original-value")
+	require.Eventually(t, func() bool { return runtime.Engine.State() == raftengine.StateLeader }, enablementE2EWait, 10*time.Millisecond)
+	enablementLegacyPut(t, runtime.Engine, clock.Next(), "legacy-key", "original-value")
 	catalog, err := setupDistributionCatalog(t.Context(), []*raftGroupRuntime{runtime}, routes)
 	require.NoError(t, err)
 	snapshot, err := catalog.Snapshot(t.Context())
@@ -111,24 +111,24 @@ func (f *bootstrapRotationE2EFixture) prepareLegacyCut(t *testing.T) {
 	if f.activeEnvelopes {
 		f.enableEnvelopes(t, runtime, shard, wiring)
 	} else {
-		enablementLegacyPut(t, runtime.engine, clock.Next(), "cut-key", "quiesced")
+		enablementLegacyPut(t, runtime.Engine, clock.Next(), "cut-key", "quiesced")
 	}
-	cut := runtime.engine.Status().AppliedIndex
-	require.Eventually(t, func() bool { return runtime.engine.Status().LastSnapshotIndex >= cut }, enablementE2EWait, 10*time.Millisecond)
+	cut := runtime.Engine.Status().AppliedIndex
+	require.Eventually(t, func() bool { return runtime.Engine.Status().LastSnapshotIndex >= cut }, enablementE2EWait, 10*time.Millisecond)
 	runtime.Close()
 	_ = f.listener.Close()
 }
 
 func (f *bootstrapRotationE2EFixture) bootstrapKeys(t *testing.T, runtime *raftGroupRuntime, shard *kv.ShardGroup, wiring encryptionWriteWiring, ks *encryption.Keystore) {
 	t.Helper()
-	registry, err := store.WriterRegistryFor(runtime.store)
+	registry, err := store.WriterRegistryFor(runtime.Store)
 	require.NoError(t, err)
 	server := adapter.NewEncryptionAdminServer(
 		adapter.WithEncryptionAdminSidecarPath(f.sidecarPath),
 		adapter.WithEncryptionAdminFullNodeID(f.config.local.Member),
-		adapter.WithEncryptionAdminProposer(runtime.engine),
+		adapter.WithEncryptionAdminProposer(runtime.Engine),
 		adapter.WithEncryptionAdminPostCutoverProposer(shard.Proposer()),
-		adapter.WithEncryptionAdminLeaderView(runtime.engine))
+		adapter.WithEncryptionAdminLeaderView(runtime.Engine))
 	require.NoError(t, server.Validate())
 	f.storageWrapped, err = wrapFreshStartupDEK(f.wrapper)
 	require.NoError(t, err)
@@ -143,10 +143,10 @@ func (f *bootstrapRotationE2EFixture) bootstrapKeys(t *testing.T, runtime *raftG
 	})
 	require.NoError(t, err)
 	require.NotZero(t, response.AppliedIndex)
-	fence, err := runtime.engine.LinearizableRead(ctx)
+	fence, err := runtime.Engine.LinearizableRead(ctx)
 	require.NoError(t, err)
 	require.GreaterOrEqual(t, fence, response.AppliedIndex)
-	require.Eventually(t, func() bool { return runtime.engine.Status().AppliedIndex >= response.AppliedIndex }, enablementE2EWait, time.Millisecond)
+	require.Eventually(t, func() bool { return runtime.Engine.Status().AppliedIndex >= response.AppliedIndex }, enablementE2EWait, time.Millisecond)
 	for _, id := range []uint32{e2eStorageDEKID, e2eRaftDEKID} {
 		raw, present, err := registry.GetRegistryRow(encryption.RegistryKey(id, encryption.NodeID16(f.config.local.Member)))
 		require.NoError(t, err)
@@ -171,7 +171,7 @@ func (f *bootstrapRotationE2EFixture) bootstrapKeys(t *testing.T, runtime *raftG
 	require.NoError(t, err)
 	expected, err := encryption.SidecarCheckpoint(sc)
 	require.NoError(t, err)
-	checkpoints, ok := runtime.store.(bootstrapEncryptionProjectionStore)
+	checkpoints, ok := runtime.Store.(bootstrapEncryptionProjectionStore)
 	require.True(t, ok)
 	checkpoint, present, err := checkpoints.LoadEncryptionSnapshotCheckpoint()
 	require.NoError(t, err)
@@ -187,9 +187,9 @@ func (f *bootstrapRotationE2EFixture) enableEnvelopes(t *testing.T, runtime *raf
 	fanout := buildCapabilityFanoutFn([]*raftGroupRuntime{runtime}, cache, capabilityFanoutTimeout)
 	server := adapter.NewEncryptionAdminServer(
 		adapter.WithEncryptionAdminSidecarPath(f.sidecarPath), adapter.WithEncryptionAdminFullNodeID(f.config.local.Member),
-		adapter.WithEncryptionAdminProposer(runtime.engine), adapter.WithEncryptionAdminPostCutoverProposer(shard.Proposer()),
-		adapter.WithEncryptionAdminLeaderView(runtime.engine), adapter.WithEncryptionAdminCapabilityFanout(fanout),
-		adapter.WithEncryptionAdminLatestAppliedIndex(func() uint64 { return runtime.engine.Status().AppliedIndex }),
+		adapter.WithEncryptionAdminProposer(runtime.Engine), adapter.WithEncryptionAdminPostCutoverProposer(shard.Proposer()),
+		adapter.WithEncryptionAdminLeaderView(runtime.Engine), adapter.WithEncryptionAdminCapabilityFanout(fanout),
+		adapter.WithEncryptionAdminLatestAppliedIndex(func() uint64 { return runtime.Engine.Status().AppliedIndex }),
 		adapter.WithEncryptionAdminCutoverBarrier(wiring.raftEnvelope.barrier()))
 	require.NoError(t, server.Validate())
 	grpcServer := grpc.NewServer()
@@ -315,7 +315,7 @@ func (f *bootstrapRotationE2EFixture) protected(t *testing.T) *bootstrapRotation
 	node.registrationCtx, node.group = registered, groups[1]
 	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", f.group.Address)
 	require.NoError(t, err)
-	server = grpc.NewServer(runtime.transportServerOptions...)
+	server = grpc.NewServer(runtime.TransportServerOptions...)
 	runtime.registerGRPC(server)
 	served = make(chan error, 1)
 	go func() { served <- server.Serve(listener) }()
@@ -330,7 +330,7 @@ func (f *bootstrapRotationE2EFixture) protected(t *testing.T) *bootstrapRotation
 	wait, stop := context.WithTimeout(t.Context(), 30*time.Second)
 	defer stop()
 	require.NoError(t, supervisor.Wait(wait), "actual protected encryption supervisor must publish owned completion")
-	require.Eventually(t, runtime.publicReady, enablementE2EWait, 10*time.Millisecond)
+	require.Eventually(t, runtime.PublicReady, enablementE2EWait, 10*time.Millisecond)
 	return node
 }
 
@@ -354,7 +354,7 @@ func TestBootstrapRotationE2EActiveEnvelopesBusinessRestart(t *testing.T) {
 	require.NotZero(t, sc.RaftEnvelopeCutoverIndex)
 	require.Greater(t, sc.Active.Storage, e2eRaftDEKID)
 	require.Greater(t, sc.Active.Raft, e2eRaftDEKID)
-	policy, err := kv.LoadAppliedBootstrapPolicy(t.Context(), node.runtime.store, f.manifest.Identity, node.runtime.engine.Status().AppliedIndex)
+	policy, err := kv.LoadAppliedBootstrapPolicy(t.Context(), node.runtime.Store, f.manifest.Identity, node.runtime.Engine.Status().AppliedIndex)
 	require.NoError(t, err)
 	ctx, cancel := context.WithTimeout(t.Context(), enablementE2EWait)
 	defer cancel()
@@ -371,7 +371,7 @@ func TestBootstrapRotationE2EActiveEnvelopesBusinessRestart(t *testing.T) {
 	restarted := f.protected(t)
 	restarted.read(t, "rotated-business", "encrypted-durable")
 	restarted.read(t, "legacy-key", "original-value")
-	recovered, err := kv.LoadAppliedBootstrapPolicy(t.Context(), restarted.runtime.store, f.manifest.Identity, restarted.runtime.engine.Status().AppliedIndex)
+	recovered, err := kv.LoadAppliedBootstrapPolicy(t.Context(), restarted.runtime.Store, f.manifest.Identity, restarted.runtime.Engine.Status().AppliedIndex)
 	require.NoError(t, err)
 	require.Equal(t, policy.ActivationIndex, recovered.ActivationIndex)
 	require.Equal(t, policy.Generation, recovered.Generation)

@@ -18,9 +18,9 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-func newRaftFactory(engineType raftEngineType, coldStartObs raftengine.ColdStartObserver) (raftengine.Factory, error) {
+func newRaftFactory(engineType noderuntime.RaftEngineType, coldStartObs raftengine.ColdStartObserver) (raftengine.Factory, error) {
 	switch engineType {
-	case raftEngineEtcd:
+	case noderuntime.RaftEngineEtcd:
 		return etcdraftengine.NewFactory(etcdraftengine.FactoryConfig{
 			TickInterval:      etcdTickInterval,
 			HeartbeatTick:     durationToTicks(heartbeatTimeout, etcdTickInterval, etcdHeartbeatMinTicks),
@@ -30,7 +30,7 @@ func newRaftFactory(engineType raftEngineType, coldStartObs raftengine.ColdStart
 			ColdStartObserver: coldStartObs,
 		}), nil
 	default:
-		return nil, errors.Wrapf(ErrUnsupportedRaftEngine, "%q", engineType)
+		return nil, errors.Wrapf(noderuntime.ErrUnsupportedRaftEngine, "%q", engineType)
 	}
 }
 
@@ -62,7 +62,7 @@ func startRaftEngineLifecycleWatchers(ctx context.Context, eg *errgroup.Group, r
 		if done == nil {
 			continue
 		}
-		groupID := rt.spec.ID
+		groupID := rt.Spec.ID
 		eg.Go(func() error {
 			select {
 			case <-ctx.Done():
@@ -202,7 +202,7 @@ func (b shardGroupBuilder) buildDataGroup(
 	bootstrapSeed []raftengine.Server,
 	proposalObserver kv.ProposalObserver,
 ) (*raftGroupRuntime, *kv.ShardGroup, error) {
-	dir := groupDataDir(b.raftDir, b.raftID, group.ID, b.multi)
+	dir := noderuntime.GroupDataDir(b.raftDir, b.raftID, group.ID, b.multi)
 	bootstrapSpec, err := b.bootstrapSpecForGroup(group.ID)
 	if err != nil {
 		return nil, nil, err
@@ -231,7 +231,7 @@ func (b shardGroupBuilder) buildDataGroup(
 		return nil, nil, errors.Wrapf(err, "failed to construct encryption applier for group %d", group.ID)
 	}
 	sm := b.newDataGroupFSM(st, applier, group.ID, bootstrapSpec)
-	runtime, err := buildRuntimeForGroup(
+	inner, err := noderuntime.BuildRuntimeForGroup(
 		b.raftID, group, b.raftDir, b.multi, bootstrap,
 		bootstrapServers, bootstrapSeed,
 		st, sm, factory, b.bootstrapCfg.JoinAsLearner,
@@ -240,9 +240,10 @@ func (b shardGroupBuilder) buildDataGroup(
 		_ = st.Close()
 		return nil, nil, errors.Wrapf(err, "failed to start raft group %d", group.ID)
 	}
+	runtime := &raftGroupRuntime{GroupRuntime: inner}
 	// Every group goes through the wrap-aware proposer so HLC renewals and
 	// transactional proposals observe raft-envelope cutovers uniformly.
-	sg := &kv.ShardGroup{Engine: runtime.engine, Store: st}
+	sg := &kv.ShardGroup{Engine: runtime.Engine, Store: st}
 	if bootstrapSpec != nil {
 		runtime.bootstrapDomain = bootstrapSpec.domain
 		runtime.bootstrapPeerConfig = bootstrapSpec.config
@@ -285,15 +286,16 @@ func buildDedicatedTSOGroup(
 	proposalObserver kv.ProposalObserver,
 ) (*raftGroupRuntime, *kv.ShardGroup, error) {
 	sm := kv.NewTSOStateMachine(clock)
-	runtime, err := buildRuntimeForGroup(
+	inner, err := noderuntime.BuildRuntimeForGroup(
 		raftID, group, baseDir, multi, bootstrap,
 		bootstrapServers, bootstrapSeed,
 		nil, sm, factory, joinAsLearner,
 	)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, errors.WithStack(err)
 	}
-	sg := &kv.ShardGroup{Engine: runtime.engine, TSOState: sm}
+	runtime := &raftGroupRuntime{GroupRuntime: inner}
+	sg := &kv.ShardGroup{Engine: runtime.Engine, TSOState: sm}
 	sg.Txn = kv.NewLeaderProxyForShardGroup(sg, kv.WithProposalObserver(proposalObserver))
 	return runtime, sg, nil
 }
@@ -330,10 +332,10 @@ func observerForGroup(factory func(uint64) kv.ProposalObserver, groupID uint64) 
 // guarantee to the Internal.Forward path that follower-forwarded
 // writes ride (codex P1 round-1 r2).
 func proposerForGroup(rt *raftGroupRuntime, shardGroups map[uint64]*kv.ShardGroup) raftengine.Proposer {
-	if sg, ok := shardGroups[rt.spec.ID]; ok && sg != nil {
+	if sg, ok := shardGroups[rt.Spec.ID]; ok && sg != nil {
 		return sg.Proposer()
 	}
-	return rt.engine
+	return rt.Engine
 }
 
 func postCutoverProposerForRuntime(rt *raftGroupRuntime, shardGroups map[uint64]*kv.ShardGroup) raftengine.Proposer {

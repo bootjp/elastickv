@@ -123,12 +123,12 @@ func transferShutdownLeaderRound(ctx context.Context, runtimes []*raftGroupRunti
 		}
 		foundLeader = true
 		transfers.Go(func() {
-			slog.Info("transferring leadership before shutdown", "group", rt.spec.ID)
+			slog.Info("transferring leadership before shutdown", "group", rt.Spec.ID)
 			if err := transferGroupLeadershipOnShutdown(ctx, admin); err != nil {
-				slog.Warn("shutdown leadership transfer failed; continuing shutdown", "group", rt.spec.ID, "error", err)
+				slog.Warn("shutdown leadership transfer failed; continuing shutdown", "group", rt.Spec.ID, "error", err)
 				return
 			}
-			slog.Info("shutdown leadership transfer completed", "group", rt.spec.ID)
+			slog.Info("shutdown leadership transfer completed", "group", rt.Spec.ID)
 		})
 	}
 	// All groups share one deadline, so an unavailable group does not delay

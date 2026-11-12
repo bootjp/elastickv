@@ -48,7 +48,7 @@ func TestBootstrapEncryptionStartupPlaintextAndMissingIO(t *testing.T) {
 	require.Equal(t, t.Context(), ctx)
 	require.Nil(t, supervisor)
 	domain := bootstrapIngressFixture(t).domain
-	runtimes := []*raftGroupRuntime{{bootstrapDomain: domain}}
+	runtimes := []*raftGroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{}, bootstrapDomain: domain}}
 	for _, cfg := range []bootstrapEncryptionStartupConfig{
 		{runtimes: runtimes, requested: true},
 		{runtimes: runtimes, sidecarPath: "configured-but-no-cipher"},
@@ -93,7 +93,7 @@ func TestBootstrapEncryptionRecoveryBarrierOwnsRecoveryChildOfRotation(t *testin
 		})
 		return 17, err
 	}
-	rt := &raftGroupRuntime{spec: noderuntime.GroupSpec{ID: 1}, engine: engine}
+	rt := &raftGroupRuntime{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 1}, Engine: engine}}
 	barrier, err := bootstrapEncryptionRecoveryBarrier(domain, rt)
 	require.NoError(t, err)
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
@@ -116,11 +116,11 @@ func TestBootstrapEncryptionRecoveryBarrierRejectsRetiredEngineAndCancellation(t
 	t.Parallel()
 	domain := bootstrapIngressFixture(t).domain
 	engine := &bootstrapStartupRecoveryEngine{}
-	rt := &raftGroupRuntime{spec: noderuntime.GroupSpec{ID: 1}, engine: engine}
+	rt := &raftGroupRuntime{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 1}, Engine: engine}}
 	engine.read = func(context.Context) (uint64, error) {
-		rt.engineMu.Lock()
-		rt.engine = nil
-		rt.engineMu.Unlock()
+		rt.EngineMu.Lock()
+		rt.Engine = nil
+		rt.EngineMu.Unlock()
 		return 17, nil
 	}
 	barrier, err := bootstrapEncryptionRecoveryBarrier(domain, rt)

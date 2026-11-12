@@ -105,7 +105,7 @@ func multiEnablementIdentities(t *testing.T, base string) []*multiEnablementIden
 		memberID := etcd.DeriveNodeID(id)
 		members = append(members, bootstrapPeerMemberJSON{ID: memberID, Address: listener.Addr().String(), Key: hex.EncodeToString(pin[:]), Groups: []uint64{1}})
 		identities = append(identities, &multiEnablementIdentity{id: id, address: listener.Addr().String(),
-			dir: groupDataDir(base, id, 1, false), configDir: t.TempDir(), listener: listener,
+			dir: noderuntime.GroupDataDir(base, id, 1, false), configDir: t.TempDir(), listener: listener,
 			raw: bootstrapPeerJSON{Cluster: "12345678-1234-1234-1234-123456789abc", Local: memberID,
 				CA: caPath, Cert: certPath, Key: keyPath, StartupTokenFile: tokenPath}})
 	}
@@ -151,13 +151,13 @@ func multiEnablementStart(t *testing.T, base string, identities []*multiEnableme
 func multiEnablementQuorumSnapshot(t *testing.T, processes []*multiEnablementProcess) {
 	t.Helper()
 	leader := multiEnablementLeader(t, processes)
-	metadata, ok := leader.runtime.store.(store.RaftControlMetadataStore)
+	metadata, ok := leader.runtime.Store.(store.RaftControlMetadataStore)
 	require.True(t, ok)
 	identity := raftbootstrap.Identity{Cluster: leader.runtime.bootstrapPeerConfig.local.Cluster, Group: 1}
 	prepared, err := kv.ReadPreparedBootstrapActivation(t.Context(), metadata, identity)
 	require.NoError(t, err)
 	require.Eventually(t, func() bool {
-		return leader.runtime.engine.Status().LastSnapshotIndex > prepared.Probe.CommitIndex
+		return leader.runtime.Engine.Status().LastSnapshotIndex > prepared.Probe.CommitIndex
 	}, bootstrapE2EWaitTimeout, 10*time.Millisecond, "real quorum snapshot precedes the delayed prepared member's startup")
 }
 
@@ -195,7 +195,7 @@ func multiEnablementStartMember(t *testing.T, base string, identity *multiEnable
 	process := &multiEnablementProcess{runtime: runtime, shard: shard, domain: domain, served: make(chan error, 1)}
 	process.ctx, process.cancel = context.WithCancel(t.Context())
 	process.eg, process.ctx = errgroup.WithContext(process.ctx)
-	options := append([]grpc.ServerOption{}, runtime.transportServerOptions...)
+	options := append([]grpc.ServerOption{}, runtime.TransportServerOptions...)
 	if protected {
 		options = append(options, multiEnablementNetwork(t, process, routes, clock)...)
 	}
@@ -210,7 +210,7 @@ func multiEnablementStartMember(t *testing.T, base string, identity *multiEnable
 
 func multiEnablementNetwork(t *testing.T, process *multiEnablementProcess, routes *distribution.Engine, clock *kv.HLC) []grpc.ServerOption {
 	t.Helper()
-	id := process.runtime.spec.ID
+	id := process.runtime.Spec.ID
 	groups := map[uint64]*kv.ShardGroup{id: process.shard}
 	process.shards = kv.NewShardStore(routes, groups)
 	process.shards.SetOperationAdmission(process.domain.operationAdmission)
@@ -225,7 +225,7 @@ func multiEnablementNetwork(t *testing.T, process *multiEnablementProcess, route
 }
 
 func multiEnablementGate(process *multiEnablementProcess) *startupPublicKVGate {
-	gate := &startupPublicKVGate{domain: process.domain, blockRuntime: func() bool { return !process.runtime.publicReady() }}
+	gate := &startupPublicKVGate{domain: process.domain, blockRuntime: func() bool { return !process.runtime.PublicReady() }}
 	gate.markReady()
 	return gate
 }
@@ -236,10 +236,10 @@ func multiEnablementServices(process *multiEnablementProcess, clock *kv.HLC) {
 	pb.RegisterRawKVServer(process.server, service)
 	pb.RegisterTransactionalKVServer(process.server, service)
 	proposer := process.shard.Proposer()
-	process.transaction = newInternalMigrationTransaction(proposer, nil, process.runtime.store, process.runtime.spec.ID)
-	options := internalServerOptions(coordinate, nil, proposer, process.shard, process.runtime.spec.ID)
-	options = append(options, adapter.WithInternalStore(process.runtime.store), adapter.WithInternalPrimaryCommitEvidence(process.shards))
-	pb.RegisterInternalServer(process.server, adapter.NewInternalWithEngine(process.transaction, process.runtime.engine, clock, nil, options...))
+	process.transaction = newInternalMigrationTransaction(proposer, nil, process.runtime.Store, process.runtime.Spec.ID)
+	options := internalServerOptions(coordinate, nil, proposer, process.shard, process.runtime.Spec.ID)
+	options = append(options, adapter.WithInternalStore(process.runtime.Store), adapter.WithInternalPrimaryCommitEvidence(process.shards))
+	pb.RegisterInternalServer(process.server, adapter.NewInternalWithEngine(process.transaction, process.runtime.Engine, clock, nil, options...))
 }
 
 func multiEnablementStop(t *testing.T, processes []*multiEnablementProcess) {
@@ -301,7 +301,7 @@ func multiEnablementLeader(t *testing.T, processes []*multiEnablementProcess) *m
 	require.Eventually(t, func() bool {
 		count := 0
 		for _, process := range processes {
-			if process.runtime.engine.State() == raftengine.StateLeader {
+			if process.runtime.Engine.State() == raftengine.StateLeader {
 				leader = process
 				count++
 			}
@@ -315,7 +315,7 @@ func multiEnablementPopulate(t *testing.T, processes []*multiEnablementProcess) 
 	t.Helper()
 	leader := multiEnablementLeader(t, processes)
 	clock := kv.NewHLC()
-	enablementLegacyPut(t, leader.runtime.engine, clock.Next(), "legacy-key", "replicated-original")
+	enablementLegacyPut(t, leader.runtime.Engine, clock.Next(), "legacy-key", "replicated-original")
 	route, err := distribution.EncodeRouteDescriptor(distribution.RouteDescriptor{RouteID: 1, GroupID: 1, State: distribution.RouteStateActive})
 	require.NoError(t, err)
 	start, commit := clock.Next(), clock.Next()
@@ -328,14 +328,14 @@ func multiEnablementPopulate(t *testing.T, processes []*multiEnablementProcess) 
 	require.NoError(t, err)
 	ctx, cancel := context.WithTimeout(t.Context(), bootstrapE2EWaitTimeout)
 	defer cancel()
-	result, err := leader.runtime.engine.Propose(ctx, payload)
+	result, err := leader.runtime.Engine.Propose(ctx, payload)
 	require.NoError(t, err)
 	if applyErr, ok := result.Response.(error); ok {
 		require.NoError(t, applyErr, "native commit must also have successful FSM effects")
 	}
 	for _, process := range processes {
 		require.Eventually(t, func() bool {
-			status := process.runtime.engine.Status()
+			status := process.runtime.Engine.Status()
 			return status.AppliedIndex == result.CommitIndex && status.CommitIndex == result.CommitIndex && status.LastSnapshotIndex >= result.CommitIndex
 		}, bootstrapE2EWaitTimeout, 10*time.Millisecond)
 		catalog := distributionCatalogStoreForGroup([]*raftGroupRuntime{process.runtime}, 1)
@@ -343,7 +343,7 @@ func multiEnablementPopulate(t *testing.T, processes []*multiEnablementProcess) 
 		require.NoError(t, err)
 		require.Equal(t, uint64(1), snapshot.Version, "the original cut contains a replicated catalog")
 		require.Len(t, snapshot.Routes, 1)
-		value, err := process.runtime.store.GetAt(t.Context(), []byte("legacy-key"), ^uint64(0))
+		value, err := process.runtime.Store.GetAt(t.Context(), []byte("legacy-key"), ^uint64(0))
 		require.NoError(t, err)
 		require.Equal(t, "replicated-original", string(value))
 	}
@@ -458,7 +458,7 @@ func multiEnablementReplicatedRead(t *testing.T, process *multiEnablementProcess
 			return false
 		}
 		defer op.CancelAndJoin()
-		got, err := process.runtime.store.GetAt(ctx, []byte(key), ^uint64(0))
+		got, err := process.runtime.Store.GetAt(ctx, []byte(key), ^uint64(0))
 		return finishBootstrapIngress(op, err) == nil && bytes.Equal(got, []byte(value))
 	}, bootstrapE2EWaitTimeout, 10*time.Millisecond, "read each member's own Pebble, not a forwarded leader result")
 }
@@ -512,7 +512,7 @@ func multiEnablementRun(t *testing.T, lagging bool) {
 	}
 	leader := multiEnablementLeader(t, protected)
 	for _, process := range protected {
-		_, err := kv.LoadAppliedBootstrapPolicy(t.Context(), process.runtime.store, manifest.Identity, process.runtime.engine.Status().AppliedIndex)
+		_, err := kv.LoadAppliedBootstrapPolicy(t.Context(), process.runtime.Store, manifest.Identity, process.runtime.Engine.Status().AppliedIndex)
 		require.ErrorIs(t, err, store.ErrKeyNotFound, "no activation worker has started")
 	}
 	startBootstrapActivationWorkers(leader.ctx, leader.eg, []*raftGroupRuntime{leader.runtime}, map[uint64]*kv.ShardGroup{1: leader.shard})
@@ -534,12 +534,12 @@ func multiEnablementAssertActivePolicy(t *testing.T, protected []*multiEnablemen
 	t.Helper()
 	var activation uint64
 	for _, process := range protected {
-		if !assert.Eventually(t, process.runtime.publicReady, bootstrapE2EWaitTimeout, 10*time.Millisecond) {
+		if !assert.Eventually(t, process.runtime.PublicReady, bootstrapE2EWaitTimeout, 10*time.Millisecond) {
 			multiEnablementReadinessDiagnostics(t, protected, manifest)
 			t.FailNow()
 		}
 		require.Equal(t, peersession.DataReady, process.domain.admission.Stage(1))
-		policy, err := kv.LoadAppliedBootstrapPolicy(t.Context(), process.runtime.store, manifest.Identity, process.runtime.engine.Status().AppliedIndex)
+		policy, err := kv.LoadAppliedBootstrapPolicy(t.Context(), process.runtime.Store, manifest.Identity, process.runtime.Engine.Status().AppliedIndex)
 		require.NoError(t, err)
 		if activation == 0 {
 			activation = policy.ActivationIndex
@@ -557,15 +557,15 @@ func multiEnablementActiveSnapshotRestart(t *testing.T, base string, identities 
 	source := multiEnablementSnapshotPreparation(t, protected[2], manifest)
 	for _, process := range protected {
 		require.Eventually(t, func() bool {
-			return process.runtime.engine.Status().LastSnapshotIndex >= activation
+			return process.runtime.Engine.Status().LastSnapshotIndex >= activation
 		}, bootstrapE2EWaitTimeout, 10*time.Millisecond, "persist active P in real native snapshots before cold restart")
 	}
 	multiEnablementStop(t, protected)
 	protected = multiEnablementStart(t, base, identities, true)
 	require.Equal(t, source, multiEnablementSnapshotPreparation(t, protected[2], manifest))
 	for _, process := range protected {
-		require.Eventually(t, process.runtime.publicReady, bootstrapE2EWaitTimeout, 10*time.Millisecond)
-		policy, err := kv.LoadAppliedBootstrapPolicy(t.Context(), process.runtime.store, manifest.Identity, process.runtime.engine.Status().AppliedIndex)
+		require.Eventually(t, process.runtime.PublicReady, bootstrapE2EWaitTimeout, 10*time.Millisecond)
+		policy, err := kv.LoadAppliedBootstrapPolicy(t.Context(), process.runtime.Store, manifest.Identity, process.runtime.Engine.Status().AppliedIndex)
 		require.NoError(t, err)
 		require.Equal(t, activation, policy.ActivationIndex, "cold recovery cannot downgrade or reactivate P")
 		require.Equal(t, uint64(1), policy.Generation)
@@ -577,14 +577,14 @@ func multiEnablementActiveSnapshotRestart(t *testing.T, base string, identities 
 
 func multiEnablementSnapshotPreparation(t *testing.T, process *multiEnablementProcess, manifest raftbootstrap.BaselineManifest) kv.PreparedBootstrapActivation {
 	t.Helper()
-	metadata, ok := process.runtime.store.(store.RaftControlMetadataStore)
+	metadata, ok := process.runtime.Store.(store.RaftControlMetadataStore)
 	require.True(t, ok)
 	var prepared kv.PreparedBootstrapActivation
 	require.Eventually(t, func() bool {
 		var err error
 		prepared, err = kv.ReadPreparedBootstrapActivation(t.Context(), metadata, manifest.Identity)
 		return err == nil && prepared.Probe.Evidence.MemberID != process.runtime.bootstrapPeerConfig.local.Member &&
-			process.runtime.engine.Status().LastSnapshotIndex > manifest.CommitIndex
+			process.runtime.Engine.Status().LastSnapshotIndex > manifest.CommitIndex
 	}, bootstrapE2EWaitTimeout, 10*time.Millisecond, "receiver must actually import another member's signed J via native snapshot")
 	digest, err := raftbootstrap.BaselineManifestDigest(manifest)
 	require.NoError(t, err)
@@ -596,17 +596,17 @@ func multiEnablementReadinessDiagnostics(t *testing.T, processes []*multiEnablem
 	t.Helper()
 	expected, digestErr := raftbootstrap.ConfigurationDigest(manifest.Configuration)
 	for _, process := range processes {
-		metadata, ok := process.runtime.store.(store.RaftControlMetadataStore)
+		metadata, ok := process.runtime.Store.(store.RaftControlMetadataStore)
 		if !ok {
 			t.Logf("member=%d lacks metadata reader", process.runtime.bootstrapPeerConfig.local.Member)
 			continue
 		}
 		prepared, prepErr := kv.ReadPreparedBootstrapActivation(t.Context(), metadata, manifest.Identity)
 		configuration, confErr := raftbootstrap.ConfigurationDigest(prepared.Probe.Configuration)
-		policy, policyErr := kv.LoadAppliedBootstrapPolicy(t.Context(), process.runtime.store, manifest.Identity, process.runtime.engine.Status().AppliedIndex)
+		policy, policyErr := kv.LoadAppliedBootstrapPolicy(t.Context(), process.runtime.Store, manifest.Identity, process.runtime.Engine.Status().AppliedIndex)
 		t.Logf("member=%d stored_prepared_member=%d prepared_identity=%+v stage=%v native=%+v prep_error=%v configuration=%x expected_configuration=%x conf_error=%v digest_error=%v P_activation=%d P_error=%v",
 			process.runtime.bootstrapPeerConfig.local.Member, prepared.Probe.Evidence.MemberID, prepared.Probe.Identity,
-			process.domain.admission.Stage(1), process.runtime.engine.Status(), prepErr, configuration, expected, confErr, digestErr, policy.ActivationIndex, policyErr)
+			process.domain.admission.Stage(1), process.runtime.Engine.Status(), prepErr, configuration, expected, confErr, digestErr, policy.ActivationIndex, policyErr)
 	}
 }
 
@@ -620,7 +620,7 @@ func multiEnablementFollowerForward(t *testing.T, processes []*multiEnablementPr
 		}
 	}
 	require.NotNil(t, follower)
-	require.Equal(t, raftengine.StateFollower, follower.runtime.engine.State())
+	require.Equal(t, raftengine.StateFollower, follower.runtime.Engine.State())
 	ctx, cancel := context.WithTimeout(t.Context(), bootstrapE2EWaitTimeout)
 	defer cancel()
 	_, err := follower.coordinate.Dispatch(ctx, &kv.OperationGroup[kv.OP]{Elems: []*kv.Elem[kv.OP]{{Op: kv.Put,

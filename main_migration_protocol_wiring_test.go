@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftadmin"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
@@ -17,14 +18,14 @@ import (
 func TestMigrationMembershipWiringKeepsEnvelopeProposerAndTSOIsolation(t *testing.T) {
 	t.Parallel()
 	proposer := &capabilityConfigEngine{}
-	runtime := &raftGroupRuntime{store: store.NewMVCCStore(), engine: capabilityConfigEngine{}}
-	runtime.spec.ID = 7
+	runtime := &raftGroupRuntime{GroupRuntime: &noderuntime.GroupRuntime{Store: store.NewMVCCStore(), Engine: capabilityConfigEngine{}}}
+	runtime.Spec.ID = 7
 	gate, ok := migrationMembershipInterceptor(runtime, nil, proposer, t.Name(), nil).(*migrationNamespaceMembershipGate)
 	require.True(t, ok)
 	require.Same(t, proposer, gate.proposer, "namespace prejoin must use the envelope-aware proposer passed by main")
 	_, ok = gate.next.(*migrationMembershipGate)
 	require.True(t, ok)
-	runtime.spec.ID = 0
+	runtime.Spec.ID = 0
 	_, namespace := migrationMembershipInterceptor(runtime, nil, proposer, t.Name(), nil).(*migrationNamespaceMembershipGate)
 	require.False(t, namespace, "TSO must not require a KV namespace or KV capability")
 	_, prepare := migrationMembershipInterceptor(runtime, nil, proposer, t.Name(), nil).(*prepareEvidenceMembershipGate)

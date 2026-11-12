@@ -54,7 +54,7 @@ func publishRuntimeHealth(probe *runtimehealth.Probe, runtimes []*raftGroupRunti
 		if rt == nil {
 			continue
 		}
-		sources = append(sources, runtimehealth.Source{GroupID: rt.spec.ID, Engine: func() runtimehealth.Engine {
+		sources = append(sources, runtimehealth.Source{GroupID: rt.Spec.ID, Engine: func() runtimehealth.Engine {
 			engine, ok := rt.snapshotEngine().(runtimehealth.Engine)
 			if !ok {
 				return nil

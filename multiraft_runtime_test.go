@@ -14,34 +14,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestGroupDataDir(t *testing.T) {
-	t.Parallel()
-	base := "/tmp/data"
-	raftID := "n1"
-
-	cases := []struct {
-		name    string
-		groupID uint64
-		multi   bool
-		want    string
-	}{
-		{name: "single", groupID: 1, want: filepath.Join(base, raftID)},
-		{name: "reserved TSO group stays isolated in single data-group mode", groupID: 0, want: filepath.Join(base, raftID, "group-0")},
-		{name: "multi", groupID: 2, multi: true, want: filepath.Join(base, raftID, "group-2")},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			require.Equal(t, tc.want, groupDataDir(base, raftID, tc.groupID, tc.multi))
-		})
-	}
-}
-
 func TestBuildShardGroupsWithDedicatedTSOPreservesSingleDataGroupDir(t *testing.T) {
 	t.Parallel()
 	baseDir := t.TempDir()
 	raftID := "n1"
 	legacyDir := filepath.Join(baseDir, raftID)
-	require.NoError(t, os.MkdirAll(legacyDir, raftDirPerm))
+	require.NoError(t, os.MkdirAll(legacyDir, noderuntime.RaftDirPerm))
 	legacyMarker := filepath.Join(legacyDir, "legacy.marker")
 	require.NoError(t, os.WriteFile(legacyMarker, []byte("keep"), 0o600))
 
@@ -51,7 +29,7 @@ func TestBuildShardGroupsWithDedicatedTSOPreservesSingleDataGroupDir(t *testing.
 	}
 	engine := distribution.NewEngine()
 	engine.UpdateRoute([]byte(""), nil, 1)
-	factory, err := newRaftFactory(raftEngineEtcd, nil)
+	factory, err := newRaftFactory(noderuntime.RaftEngineEtcd, nil)
 	require.NoError(t, err)
 
 	runtimes, shardGroups, err := buildShardGroups(
@@ -80,8 +58,8 @@ func TestBuildShardGroupsWithDedicatedTSOPreservesSingleDataGroupDir(t *testing.
 	require.Contains(t, shardGroups, uint64(noderuntime.DedicatedTSORaftGroupID))
 	require.Contains(t, shardGroups, uint64(1))
 	require.Nil(t, shardGroups[noderuntime.DedicatedTSORaftGroupID].Store)
-	require.IsType(t, &kv.TSOStateMachine{}, runtimes[0].stateMachine)
-	require.Nil(t, runtimes[0].store)
+	require.IsType(t, &kv.TSOStateMachine{}, runtimes[0].StateMachine)
+	require.Nil(t, runtimes[0].Store)
 	require.DirExists(t, filepath.Join(legacyDir, "fsm.db"))
 	require.DirExists(t, filepath.Join(legacyDir, "group-0"))
 	require.NoDirExists(t, filepath.Join(legacyDir, "group-0", "fsm.db"))
@@ -95,11 +73,11 @@ func TestBuildShardGroupsWithDedicatedTSOPreservesLegacyGroupZeroStore(t *testin
 	t.Parallel()
 	baseDir := t.TempDir()
 	legacyStoreDir := filepath.Join(baseDir, "n1", "group-0", "fsm.db")
-	require.NoError(t, os.MkdirAll(legacyStoreDir, raftDirPerm))
+	require.NoError(t, os.MkdirAll(legacyStoreDir, noderuntime.RaftDirPerm))
 	legacyMarker := filepath.Join(legacyStoreDir, "legacy.marker")
 	require.NoError(t, os.WriteFile(legacyMarker, []byte("preserve"), 0o600))
 
-	factory, err := newRaftFactory(raftEngineEtcd, nil)
+	factory, err := newRaftFactory(noderuntime.RaftEngineEtcd, nil)
 	require.NoError(t, err)
 	runtimes, shardGroups, err := buildShardGroups(
 		"n1",
@@ -121,7 +99,7 @@ func TestBuildShardGroupsWithDedicatedTSOPreservesLegacyGroupZeroStore(t *testin
 	require.NoError(t, err)
 	t.Cleanup(func() { closeRaftGroupRuntimes(runtimes) })
 	require.Nil(t, shardGroups[noderuntime.DedicatedTSORaftGroupID].Store)
-	require.Nil(t, runtimes[0].store)
+	require.Nil(t, runtimes[0].Store)
 
 	got, err := os.ReadFile(legacyMarker)
 	require.NoError(t, err)
@@ -131,15 +109,15 @@ func TestBuildShardGroupsWithDedicatedTSOPreservesLegacyGroupZeroStore(t *testin
 func TestBuildShardGroupsClosesEarlierStoresWhenLaterGroupFails(t *testing.T) {
 	t.Parallel()
 	baseDir := t.TempDir()
-	badGroupDir := groupDataDir(baseDir, "n1", 2, true)
-	require.NoError(t, os.MkdirAll(badGroupDir, raftDirPerm))
+	badGroupDir := noderuntime.GroupDataDir(baseDir, "n1", 2, true)
+	require.NoError(t, os.MkdirAll(badGroupDir, noderuntime.RaftDirPerm))
 	require.NoError(t, os.WriteFile(
-		filepath.Join(badGroupDir, raftEngineMarkerFile),
+		filepath.Join(badGroupDir, noderuntime.RaftEngineMarkerFile),
 		[]byte("unsupported\n"),
-		raftEngineMarkerPerm,
+		noderuntime.RaftEngineMarkerPerm,
 	))
 
-	factory, err := newRaftFactory(raftEngineEtcd, nil)
+	factory, err := newRaftFactory(noderuntime.RaftEngineEtcd, nil)
 	require.NoError(t, err)
 	runtimes, shardGroups, err := buildShardGroups(
 		"n1",
@@ -161,14 +139,14 @@ func TestBuildShardGroupsClosesEarlierStoresWhenLaterGroupFails(t *testing.T) {
 		encryptionWriteWiring{},
 		nil,
 	)
-	require.ErrorIs(t, err, ErrUnsupportedRaftEngine)
+	require.ErrorIs(t, err, noderuntime.ErrUnsupportedRaftEngine)
 	require.Nil(t, runtimes)
 	require.Nil(t, shardGroups)
 
 	// Reopening the first group's Pebble directory proves the error path ran
 	// raftGroupRuntime.Close, which owns both engine and store cleanup.
 	reopened, err := store.NewPebbleStore(filepath.Join(
-		groupDataDir(baseDir, "n1", 1, true),
+		noderuntime.GroupDataDir(baseDir, "n1", 1, true),
 		"fsm.db",
 	))
 	require.NoError(t, err)
@@ -178,7 +156,7 @@ func TestBuildShardGroupsClosesEarlierStoresWhenLaterGroupFails(t *testing.T) {
 func TestDedicatedTSOGroupContinuesAfterLegacyEncryptionEntry(t *testing.T) {
 	t.Parallel()
 	baseDir := t.TempDir()
-	factory, err := newRaftFactory(raftEngineEtcd, nil)
+	factory, err := newRaftFactory(noderuntime.RaftEngineEtcd, nil)
 	require.NoError(t, err)
 	clock := kv.NewHLC()
 	runtimes, _, err := buildShardGroups(
@@ -204,37 +182,17 @@ func TestDedicatedTSOGroupContinuesAfterLegacyEncryptionEntry(t *testing.T) {
 	legacyEntry := append([]byte{fsmwire.OpRegistration}, fsmwire.EncodeRegistration(
 		fsmwire.RegistrationPayload{DEKID: 1, FullNodeID: 2, LocalEpoch: 3},
 	)...)
-	result, err := runtimes[0].engine.ProposeAdmin(context.Background(), legacyEntry)
+	result, err := runtimes[0].Engine.ProposeAdmin(context.Background(), legacyEntry)
 	require.NoError(t, err)
 	legacyErr, ok := result.Response.(error)
 	require.Truef(t, ok, "legacy response type = %T, want error", result.Response)
 	require.ErrorIs(t, legacyErr, kv.ErrTSOLegacyEncryptionEntryRejected)
 
 	const ceilingMs = int64(1_700_000_123_456)
-	coordinator := kv.NewCoordinatorWithEngine(nil, runtimes[0].engine)
+	coordinator := kv.NewCoordinatorWithEngine(nil, runtimes[0].Engine)
 	t.Cleanup(func() { require.NoError(t, coordinator.Close()) })
 	require.NoError(t, coordinator.ProposeHLCLease(context.Background(), ceilingMs))
 	require.Equal(t, ceilingMs, clock.PhysicalCeiling())
-}
-
-func TestParseRaftEngineType(t *testing.T) {
-	t.Parallel()
-	t.Run("default", func(t *testing.T) {
-		engineType, err := parseRaftEngineType("")
-		require.NoError(t, err)
-		require.Equal(t, raftEngineEtcd, engineType)
-	})
-
-	t.Run("etcd", func(t *testing.T) {
-		engineType, err := parseRaftEngineType("etcd")
-		require.NoError(t, err)
-		require.Equal(t, raftEngineEtcd, engineType)
-	})
-
-	t.Run("invalid", func(t *testing.T) {
-		_, err := parseRaftEngineType("nope")
-		require.ErrorIs(t, err, ErrUnsupportedRaftEngine)
-	})
 }
 
 func TestBuildShardGroupsWithEtcdEngineRoutesAcrossGroups(t *testing.T) {
@@ -245,7 +203,7 @@ func TestBuildShardGroupsWithEtcdEngineRoutesAcrossGroups(t *testing.T) {
 		{ID: 2, Address: "127.0.0.1:15002"},
 	}
 
-	factory, err := newRaftFactory(raftEngineEtcd, nil)
+	factory, err := newRaftFactory(noderuntime.RaftEngineEtcd, nil)
 	require.NoError(t, err)
 	clock := kv.NewHLC()
 	runtimes, shardGroups, err := buildShardGroups("n1", baseDir, groups, true, true, noderuntime.BootstrapConfig{},
@@ -302,7 +260,7 @@ func TestBuildShardGroupsWithEtcdEngineRestartsAcrossGroups(t *testing.T) {
 
 	sharedClock := kv.NewHLC()
 	openShardStore := func(bootstrap bool) ([]*raftGroupRuntime, map[uint64]*kv.ShardGroup, *kv.ShardStore) {
-		factory, err := newRaftFactory(raftEngineEtcd, nil)
+		factory, err := newRaftFactory(noderuntime.RaftEngineEtcd, nil)
 		require.NoError(t, err)
 		runtimes, shardGroups, err := buildShardGroups("n1", baseDir, groups, true, bootstrap,
 			noderuntime.BootstrapConfig{}, factory, nil, sharedClock, kv.NewActiveTimestampTracker(), nil, nil, "",
@@ -353,65 +311,4 @@ func TestBuildShardGroupsWithEtcdEngineRestartsAcrossGroups(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
-}
-
-func TestEnsureRaftEngineDataDir(t *testing.T) {
-	t.Parallel()
-	t.Run("writes marker for empty dir", func(t *testing.T) {
-		dir := t.TempDir()
-		require.NoError(t, ensureRaftEngineDataDir(dir, raftEngineEtcd))
-		data, err := os.ReadFile(filepath.Join(dir, raftEngineMarkerFile))
-		require.NoError(t, err)
-		require.Equal(t, "etcd\n", string(data))
-	})
-
-	t.Run("detects etcd peers metadata artifact", func(t *testing.T) {
-		dir := t.TempDir()
-		require.NoError(t, os.WriteFile(filepath.Join(dir, "etcd-raft-peers.bin"), []byte("placeholder"), 0o600))
-
-		engineType, ok, err := detectRaftEngineFromDataDir(dir)
-		require.NoError(t, err)
-		require.True(t, ok)
-		require.Equal(t, raftEngineEtcd, engineType)
-	})
-
-	t.Run("detects bare wal dir as etcd artifact", func(t *testing.T) {
-		dir := t.TempDir()
-		require.NoError(t, os.MkdirAll(filepath.Join(dir, "wal"), 0o755))
-		engineType, ok, err := detectRaftEngineFromDataDir(dir)
-		require.NoError(t, err)
-		require.True(t, ok)
-		require.Equal(t, raftEngineEtcd, engineType)
-	})
-
-	t.Run("detects bare snap dir as etcd artifact", func(t *testing.T) {
-		dir := t.TempDir()
-		require.NoError(t, os.MkdirAll(filepath.Join(dir, "snap"), 0o755))
-		engineType, ok, err := detectRaftEngineFromDataDir(dir)
-		require.NoError(t, err)
-		require.True(t, ok)
-		require.Equal(t, raftEngineEtcd, engineType)
-	})
-
-	t.Run("rejects legacy hashicorp raft.db", func(t *testing.T) {
-		dir := t.TempDir()
-		require.NoError(t, os.WriteFile(filepath.Join(dir, "raft.db"), []byte("legacy"), 0o600))
-		err := ensureRaftEngineDataDir(dir, raftEngineEtcd)
-		require.ErrorIs(t, err, ErrLegacyHashicorpDataDir)
-	})
-
-	t.Run("rejects legacy hashicorp logs.dat", func(t *testing.T) {
-		dir := t.TempDir()
-		require.NoError(t, os.WriteFile(filepath.Join(dir, "logs.dat"), []byte("legacy"), 0o600))
-		err := ensureRaftEngineDataDir(dir, raftEngineEtcd)
-		require.ErrorIs(t, err, ErrLegacyHashicorpDataDir)
-	})
-
-	t.Run("rejects legacy hashicorp stable.dat", func(t *testing.T) {
-		dir := t.TempDir()
-		require.NoError(t, os.WriteFile(filepath.Join(dir, "stable.dat"), []byte("legacy"), 0o600))
-		err := ensureRaftEngineDataDir(dir, raftEngineEtcd)
-		require.ErrorIs(t, err, ErrLegacyHashicorpDataDir)
-	})
-
 }

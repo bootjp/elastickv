@@ -7,6 +7,7 @@ import (
 
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
@@ -58,7 +59,7 @@ func TestMigrationOwnershipProviderWiringRequiresAppliedConfiguration(t *testing
 	server := adapter.NewDistributionServer(routes, nil,
 		adapter.WithSplitMigrationGroupClientFactory(splitMigrationGroupClientFactory(splitMigrationGroupLeaderResolver(groups), &cache, t.Name())),
 		adapter.WithSplitMigrationVoterFactory(splitMigrationVoterFactory(groups, &cache, t.Name())),
-		migrationOwnershipRefreshOption(groups, &raftGroupRuntime{engine: engine}, &cache, t.Name(), true),
+		migrationOwnershipRefreshOption(groups, &raftGroupRuntime{GroupRuntime: &noderuntime.GroupRuntime{Engine: engine}}, &cache, t.Name(), true),
 		migrationPartitionRuntimeOption(shards, groups, &cache, t.Name(), true))
 	require.True(t, kv.MigrationRequestAdmissionReady(tx))
 	require.True(t, shards.MigrationReadAdmissionReady(7))
@@ -176,7 +177,7 @@ func TestMigrationOwnershipRuntimeRequiresInstalledHooksFlagsAndAppliedConfigura
 	server := adapter.NewDistributionServer(routes, nil,
 		adapter.WithSplitMigrationGroupClientFactory(splitMigrationGroupClientFactory(splitMigrationGroupLeaderResolver(groups), &cache, t.Name())),
 		adapter.WithSplitMigrationVoterFactory(splitMigrationVoterFactory(groups, &cache, t.Name())),
-		migrationOwnershipRefreshOption(groups, &raftGroupRuntime{engine: engine}, &cache, t.Name(), true),
+		migrationOwnershipRefreshOption(groups, &raftGroupRuntime{GroupRuntime: &noderuntime.GroupRuntime{Engine: engine}}, &cache, t.Name(), true),
 		migrationPartitionRuntimeOption(shards, groups, &cache, t.Name(), true))
 	reader, ok := engine.(raftengine.AppliedConfigurationReader)
 	require.True(t, ok)

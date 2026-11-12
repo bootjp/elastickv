@@ -236,10 +236,10 @@ func installSQSLeadershipRefusalAcrossGroups(
 	}
 	deregisters := make([]func(), 0, len(runtimes))
 	for _, rt := range runtimes {
-		if rt == nil || rt.engine == nil {
+		if rt == nil || rt.Engine == nil {
 			continue
 		}
-		admin, ok := rt.engine.(sqsLeadershipController)
+		admin, ok := rt.Engine.(sqsLeadershipController)
 		if !ok {
 			// Engine implementation lacks Admin surface — log and
 			// skip rather than refusing to start. This branch is
@@ -249,12 +249,12 @@ func installSQSLeadershipRefusalAcrossGroups(
 			if logger != nil {
 				logger.Warn("sqs: skipping leadership-refusal install for group "+
 					"— engine does not implement leader-acquired observer",
-					"group", rt.spec.ID)
+					"group", rt.Spec.ID)
 			}
 			continue
 		}
 		dereg := installSQSLeadershipRefusal(
-			ctx, admin, rt.spec.ID, partGroups, advertisesHTFIFO, logger)
+			ctx, admin, rt.Spec.ID, partGroups, advertisesHTFIFO, logger)
 		deregisters = append(deregisters, dereg)
 	}
 	return func() {

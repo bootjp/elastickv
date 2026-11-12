@@ -30,7 +30,7 @@ func validateProtectedBootstrapDomain(raftID, baseDir string, groups []noderunti
 	}
 	var cluster raftbootstrap.UUID
 	for _, group := range groups {
-		spec, err := loadGroupBootstrapSpec(raftID, group, groupDataDir(baseDir, raftID, group.ID, multi), peerConfigDir)
+		spec, err := loadGroupBootstrapSpec(raftID, group, noderuntime.GroupDataDir(baseDir, raftID, group.ID, multi), peerConfigDir)
 		if err != nil {
 			return err
 		}
@@ -52,7 +52,7 @@ func loadProtectedBootstrapDomain(raftID, baseDir string, groups []noderuntime.G
 	specs := make(map[uint64]*groupBootstrapSpec, len(groups))
 	var cluster raftbootstrap.UUID
 	for _, group := range groups {
-		spec, err := loadGroupBootstrapSpec(raftID, group, groupDataDir(baseDir, raftID, group.ID, multi), bootstrapCfg.PeerConfigDir)
+		spec, err := loadGroupBootstrapSpec(raftID, group, noderuntime.GroupDataDir(baseDir, raftID, group.ID, multi), bootstrapCfg.PeerConfigDir)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -134,8 +134,8 @@ func bootstrapFactoryForGroup(base raftengine.Factory, spec *groupBootstrapSpec,
 	return &protectedGroupFactory{Factory: native.WithBootstrapStartup(setup), spec: spec}, nil
 }
 
-func (f *protectedGroupFactory) PreflightRaftDataDir(dir string, engineType raftEngineType) error {
-	if dir != f.spec.dir || engineType != raftEngineEtcd {
+func (f *protectedGroupFactory) PreflightRaftDataDir(dir string, engineType noderuntime.RaftEngineType) error {
+	if dir != f.spec.dir || engineType != noderuntime.RaftEngineEtcd {
 		return errors.WithStack(raftbootstrap.ErrInconsistent)
 	}
 	inspection, err := f.spec.files.Inspect(raftbootstrap.Evidence{Identity: &f.spec.intent.Identity})
@@ -161,7 +161,7 @@ func (f *protectedGroupFactory) PreflightRaftDataDir(dir string, engineType raft
 
 func protectedRuntimesBlocked(runtimes []*raftGroupRuntime) bool {
 	for _, runtime := range runtimes {
-		if runtime != nil && runtime.publicReady != nil && !runtime.publicReady() {
+		if runtime != nil && runtime.PublicReady != nil && !runtime.PublicReady() {
 			return true
 		}
 	}
@@ -198,7 +198,7 @@ func bootstrapCatalogObservationStale(err error) bool {
 
 func loadProtectedCatalog(ctx context.Context, runtimes []*raftGroupRuntime, id uint64, catalog *distribution.CatalogStore, engine *distribution.Engine) (bool, error) {
 	for _, runtime := range runtimes {
-		if runtime == nil || runtime.spec.ID != id || runtime.publicReady == nil {
+		if runtime == nil || runtime.Spec.ID != id || runtime.PublicReady == nil {
 			continue
 		}
 		return true, loadProtectedRuntimeCatalog(ctx, runtime, catalog, engine)
@@ -210,7 +210,7 @@ func loadProtectedRuntimeCatalog(ctx context.Context, runtime *raftGroupRuntime,
 	if runtime.bootstrapDomain == nil {
 		return errors.New("protected catalog lacks the process-wide admission domain")
 	}
-	ticket, err := runtime.bootstrapDomain.admission.Ticket(runtime.spec.ID)
+	ticket, err := runtime.bootstrapDomain.admission.Ticket(runtime.Spec.ID)
 	if err != nil {
 		return errors.WithStack(err)
 	}

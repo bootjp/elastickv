@@ -77,11 +77,11 @@ func installEncryptionRotateOnStartup(
 	if logger == nil {
 		logger = slog.Default()
 	}
-	if rt == nil || rt.engine == nil {
+	if rt == nil || rt.Engine == nil {
 		logger.Warn("encryption rotate-on-startup skipped: default raft group is not available")
 		return func() {}, startupRotationWaiter{}
 	}
-	controller, ok := rt.engine.(encryptionRotateOnStartupController)
+	controller, ok := rt.Engine.(encryptionRotateOnStartupController)
 	if !ok {
 		logger.Warn("encryption rotate-on-startup skipped: engine does not implement leader-acquired observer")
 		return func() {}, startupRotationWaiter{}
@@ -93,8 +93,8 @@ func installEncryptionRotateOnStartup(
 	server := adapter.NewEncryptionAdminServer(
 		adapter.WithEncryptionAdminSidecarPath(sidecarPath),
 		adapter.WithEncryptionAdminFullNodeID(fullNodeID),
-		adapter.WithEncryptionAdminProposer(rt.engine),
-		adapter.WithEncryptionAdminLeaderView(rt.engine),
+		adapter.WithEncryptionAdminProposer(rt.Engine),
+		adapter.WithEncryptionAdminLeaderView(rt.Engine),
 		adapter.WithEncryptionAdminPostCutoverProposer(postCutoverProposer),
 	)
 	if err := server.Validate(); err != nil {

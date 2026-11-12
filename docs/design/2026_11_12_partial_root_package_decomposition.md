@@ -1,6 +1,6 @@
 # Root package decomposition
 
-Status: Partial (M1, M2, M3a and part of M4 implemented)
+Status: Partial (M1, M2, M3 and part of M4 implemented)
 Author: bootjp
 Date: 2026-11-12
 
@@ -102,11 +102,16 @@ Tests move with the code they cover.
     parsing, the HT-FIFO partition map, `runtimeConfig` and its parsing,
     and `raftBootstrapConfig` with the bootstrap / join peer resolution.
     This is pure configuration that every area reads.
-  - **M3b — runtime.** `raftGroupRuntime` and the shard-group builder.
-    `raftGroupRuntime` holds bootstrap types (`bootstrapDomain`,
-    `bootstrapPeerConfig`, `bootstrapNetwork`) and the builder wires
-    encryption and the protected TSO group, so they move once those areas
-    expose narrow interfaces (see Decisions), or together with M5/M6.
+  - **M3b — runtime.** The group runtime core moves as
+    `noderuntime.GroupRuntime`: engine, store, state machine, transport
+    hooks, `Close`, the engine-type data-dir marker checks and
+    `BuildRuntimeForGroup`. `raftGroupRuntime` stays in `main` as a thin
+    wrapper that embeds `*noderuntime.GroupRuntime` and adds the three
+    protected-bootstrap fields (`bootstrapDomain`, `bootstrapPeerConfig`,
+    `bootstrapNetwork`); those leave with the bootstrap area (M6). The
+    shard-group builder also stays in `main`: it composes the encryption
+    applier, the protected bootstrap specs and the protected TSO group,
+    so it moves with M5/M6.
 - **M4 — Mid-sized areas.** Move leader balance, filesystem wiring,
   snapshot-offload wiring, split-migration wiring, TSO wiring, the startup
   gate and node gRPC auth. Each area may be its own PR.
@@ -181,6 +186,16 @@ Tests move with the code they cover.
   them in. The package is restricted to binaries in the import guard, and
   its tests moved with it (`shard_config_test.go`, the peer-resolution
   tests, the DynamoDB leader-map and SQS resolver tests).
+- M3b: `noderuntime.GroupRuntime` holds the engine (behind `EngineMu`,
+  read by long-lived goroutines through `SnapshotEngine`), store, state
+  machine and transport hooks, with `Close` and `RegisterGRPC`.
+  `BuildRuntimeForGroup`, `GroupDataDir`, `RaftEngineType` and the
+  data-dir marker checks moved with it. `main`'s `raftGroupRuntime`
+  embeds it and keeps only the bootstrap attachments.
+  `leaderbalance.Group` now asks for `SnapshotEngine()` instead of
+  `Engine()`: a wrapper method named `Engine` would shadow the promoted
+  `Engine` field, and `SnapshotEngine` already reads the engine under the
+  lock the same way.
 - Snapshot-offload wiring can now move (M4): its helpers take
   `snapshotOffloadFlags` instead of reading about twenty flags.
 

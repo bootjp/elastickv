@@ -75,7 +75,7 @@ func (cfg bootstrapEncryptionRuntimeIOConfig) validate() error {
 func (cfg bootstrapEncryptionRuntimeIOConfig) validateBinding() error {
 	rt := cfg.DefaultRuntime
 	engine := rt.snapshotEngine()
-	if engine == nil || cfg.Group.Engine != engine || cfg.Group.Store != rt.store || rt.bootstrapDomain != cfg.Domain || rt.spec.ID == 0 {
+	if engine == nil || cfg.Group.Engine != engine || cfg.Group.Store != rt.Store || rt.bootstrapDomain != cfg.Domain || rt.Spec.ID == 0 {
 		return errors.Wrap(errBootstrapEncryptionUnsupported, "runtime/group/domain binding mismatch")
 	}
 	if cfg.Group.Proposer() == engine {
@@ -84,7 +84,7 @@ func (cfg bootstrapEncryptionRuntimeIOConfig) validateBinding() error {
 	r := cfg.Wiring.raftEnvelope
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.fullNodeID != cfg.NodeID || r.cipher != cfg.Wiring.cipher || r.groups[rt.spec.ID] != cfg.Group {
+	if r.fullNodeID != cfg.NodeID || r.cipher != cfg.Wiring.cipher || r.groups[rt.Spec.ID] != cfg.Group {
 		return errors.Wrap(errBootstrapEncryptionUnsupported, "installed raft runtime binding mismatch")
 	}
 	return nil
@@ -360,7 +360,7 @@ func (io *bootstrapEncryptionRuntimeIO) PayloadProjection(group, generation uint
 	if err != nil {
 		return zero, errors.WithStack(err)
 	}
-	if group != io.config.DefaultRuntime.spec.ID || generation != before {
+	if group != io.config.DefaultRuntime.Spec.ID || generation != before {
 		return zero, errors.WithStack(errBootstrapPayloadProjection)
 	}
 	cipher, id, active, err := io.installedPayload()

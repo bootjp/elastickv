@@ -8,12 +8,12 @@ import (
 )
 
 func migrationInternalProtocolOptions(tx kv.Transactional, shards *kv.ShardStore, server *adapter.DistributionServer, runtime *raftGroupRuntime) []adapter.InternalOption {
-	installed := func() bool { return migrationOwnershipRuntimeHooksInstalled(tx, shards, server, runtime.spec.ID) }
+	installed := func() bool { return migrationOwnershipRuntimeHooksInstalled(tx, shards, server, runtime.Spec.ID) }
 	return []adapter.InternalOption{
 		adapter.WithInternalMigrationTransferSizeGuardReady(installed),
 		adapter.WithInternalMigrationPartitionProtocolReady(installed),
 		adapter.WithMigrationNamespaceAdmissionReady(func() bool {
-			return installed() && kv.MigrationNamespaceInstalledVersion(runtime.store, runtime.stateMachine) == kv.MigrationNamespaceVersion
+			return installed() && kv.MigrationNamespaceInstalledVersion(runtime.Store, runtime.StateMachine) == kv.MigrationNamespaceVersion
 		}),
 	}
 }

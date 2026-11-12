@@ -135,7 +135,7 @@ func TestProtectedTSORejectsMissingOrInconsistentState(t *testing.T) {
 func TestProtectedTSOFactoryNeverAutoMigrates(t *testing.T) {
 	t.Parallel()
 	base := t.TempDir()
-	dir := groupDataDir(base, "n1", noderuntime.DedicatedTSORaftGroupID, true)
+	dir := noderuntime.GroupDataDir(base, "n1", noderuntime.DedicatedTSORaftGroupID, true)
 	spec, domain, _ := protectedTSOFixture(t, dir)
 	group := noderuntime.GroupSpec{ID: noderuntime.DedicatedTSORaftGroupID, Address: spec.config.local.Address}
 	factory := etcd.NewFactory(etcd.FactoryConfig{})
@@ -168,7 +168,7 @@ func (protectedTSOTestObserver) ObserveProposalFailure() {}
 func TestProtectedTSOFactoryRejectsEmptyControlDatabase(t *testing.T) {
 	t.Parallel()
 	base := t.TempDir()
-	dir := groupDataDir(base, "n1", noderuntime.DedicatedTSORaftGroupID, true)
+	dir := noderuntime.GroupDataDir(base, "n1", noderuntime.DedicatedTSORaftGroupID, true)
 	spec, domain, _ := protectedTSOFixture(t, dir)
 	path := filepath.Join(dir, dedicatedTSOControlStoreName)
 	st, err := store.NewPebbleStore(path)

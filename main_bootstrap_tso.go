@@ -35,7 +35,7 @@ func buildProtectedDedicatedTSOGroup(
 	spec *groupBootstrapSpec, domain *bootstrapDomain, publicMethods []string,
 	options ...store.PebbleStoreOption,
 ) (*raftGroupRuntime, *kv.ShardGroup, error) {
-	dir := groupDataDir(baseDir, raftID, group.ID, multi)
+	dir := noderuntime.GroupDataDir(baseDir, raftID, group.ID, multi)
 	native, err := validateProtectedTSOFactory(raftID, group, dir, factory, spec, domain)
 	if err != nil {
 		return nil, nil, err
@@ -64,14 +64,15 @@ func buildProtectedDedicatedTSOGroup(
 	setup := newProtectedTSOStartup(spec, st, sm, domain, publicMethods)
 	native = native.WithNamespaceRecovery(ownership, protectedTSONamespaceVerifier(dir, spec, sm))
 	protected := &protectedGroupFactory{Factory: native.WithBootstrapStartup(setup), spec: spec}
-	runtime, err := buildRuntimeForGroup(raftID, group, baseDir, multi, bootstrap,
+	inner, err := noderuntime.BuildRuntimeForGroup(raftID, group, baseDir, multi, bootstrap,
 		bootstrapServers, bootstrapSeed, st, sm, protected, joinAsLearner)
 	if err != nil {
 		return nil, nil, errors.Join(err, st.Close())
 	}
+	runtime := &raftGroupRuntime{GroupRuntime: inner}
 	runtime.bootstrapDomain = domain
 	runtime.bootstrapPeerConfig = spec.config
-	sg := &kv.ShardGroup{Engine: runtime.engine, TSOState: sm.TSOStateMachine}
+	sg := &kv.ShardGroup{Engine: runtime.Engine, TSOState: sm.TSOStateMachine}
 	sg.Txn = kv.NewLeaderProxyForShardGroup(sg, kv.WithProposalObserver(proposalObserver))
 	return runtime, sg, nil
 }
@@ -88,7 +89,7 @@ func validateProtectedTSOFactory(raftID string, group noderuntime.GroupSpec, dir
 		return nil, errors.WithStack(err)
 	}
 	preflight := &protectedGroupFactory{spec: spec}
-	if err := preflight.PreflightRaftDataDir(dir, raftEngineEtcd); err != nil {
+	if err := preflight.PreflightRaftDataDir(dir, noderuntime.RaftEngineEtcd); err != nil {
 		return nil, err
 	}
 	return native, nil

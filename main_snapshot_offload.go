@@ -13,6 +13,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/internal/snapshotoffload"
 	"github.com/cockroachdb/errors"
@@ -322,8 +323,8 @@ func snapshotOffloadGroups(
 			continue
 		}
 		groups = append(groups, snapshotoffload.OffloadGroup{
-			GroupID:      rt.spec.ID,
-			DataDir:      groupDataDir(raftDir, raftID, rt.spec.ID, multi),
+			GroupID:      rt.Spec.ID,
+			DataDir:      noderuntime.GroupDataDir(raftDir, raftID, rt.Spec.ID, multi),
 			IsLeader:     snapshotOffloadIsLeader(rt),
 			VerifyLeader: snapshotOffloadVerifyLeader(rt),
 		})

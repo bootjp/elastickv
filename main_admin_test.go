@@ -375,9 +375,9 @@ func TestAdminMembersFromBootstrapEmpty(t *testing.T) {
 func TestCanonicalSelfAddressPicksLowestGroup(t *testing.T) {
 	t.Parallel()
 	runtimes := []*raftGroupRuntime{
-		{spec: noderuntime.GroupSpec{ID: 5, Address: "10.0.0.1:50055"}},
-		{spec: noderuntime.GroupSpec{ID: 2, Address: "10.0.0.1:50052"}},
-		{spec: noderuntime.GroupSpec{ID: 9, Address: "10.0.0.1:50059"}},
+		{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 5, Address: "10.0.0.1:50055"}}},
+		{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 2, Address: "10.0.0.1:50052"}}},
+		{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 9, Address: "10.0.0.1:50059"}}},
 	}
 	got := canonicalSelfAddress("localhost:50051", runtimes)
 	if got != "10.0.0.1:50052" {

@@ -48,7 +48,7 @@ func bootstrapNetworkRedisClients(t *testing.T, processes []*multiEnablementProc
 	start := make([]func(), 0, len(processes))
 	for _, process := range processes {
 		launch, address, client := bootstrapNetworkPrepareRedis(t, process, leaders)
-		leaders[process.runtime.spec.Address] = address
+		leaders[process.runtime.Spec.Address] = address
 		clients[process] = client
 		start = append(start, launch)
 	}
@@ -61,7 +61,7 @@ func bootstrapNetworkRedisClients(t *testing.T, processes []*multiEnablementProc
 
 func bootstrapNetworkPrepareRedis(t *testing.T, process *multiEnablementProcess, leaders map[string]string) (func(), string, *redis.Client) {
 	t.Helper()
-	registry := monitoring.NewRegistry("network-redis", process.runtime.spec.Address)
+	registry := monitoring.NewRegistry("network-redis", process.runtime.Spec.Address)
 	tracker := kv.NewActiveTimestampTracker()
 	t.Cleanup(tracker.Close)
 	server, compactor, listener, err := prepareRedisServer(process.ctx, &net.ListenConfig{}, "127.0.0.1:0", process.shards,
@@ -90,16 +90,16 @@ func TestBootstrapNetworkRedisFollowerAfterAcceptedBaseline(t *testing.T) {
 	defer cancel()
 	require.Error(t, client.Set(ctx, "network-before-ready", "must-not-commit", 0).Err())
 	for _, process := range processes {
-		require.False(t, process.runtime.publicReady())
+		require.False(t, process.runtime.PublicReady())
 	}
 	startBootstrapActivationWorkers(leader.ctx, leader.eg, []*raftGroupRuntime{leader.runtime}, map[uint64]*kv.ShardGroup{1: leader.shard})
 	for _, process := range processes {
-		require.Eventually(t, process.runtime.publicReady, bootstrapE2EWaitTimeout, 10*time.Millisecond)
+		require.Eventually(t, process.runtime.PublicReady, bootstrapE2EWaitTimeout, 10*time.Millisecond)
 		require.True(t, process.runtime.bootstrapNetwork.dataReady())
 	}
 	// Real Redis ingress/forwarding retains Data ownership at each receiver.
 	// Redis TCP forwarding is distinct from the pinned gRPC network tests.
-	require.NotEqual(t, raftengine.StateLeader, follower.runtime.engine.State())
+	require.NotEqual(t, raftengine.StateLeader, follower.runtime.Engine.State())
 	require.NoError(t, client.Set(ctx, "network-redis-key", "forwarded-through-TLS", 0).Err())
 	value, err := client.Get(ctx, "network-redis-key").Result()
 	require.NoError(t, err)
@@ -112,7 +112,7 @@ func TestBootstrapNetworkRedisFollowerAfterAcceptedBaseline(t *testing.T) {
 	require.ErrorIs(t, err, redis.Nil)
 	for _, process := range processes {
 		multiEnablementReplicatedRead(t, process, "legacy-key", "replicated-original")
-		policy, err := kv.LoadAppliedBootstrapPolicy(ctx, process.runtime.store, manifest.Identity, process.runtime.engine.Status().AppliedIndex)
+		policy, err := kv.LoadAppliedBootstrapPolicy(ctx, process.runtime.Store, manifest.Identity, process.runtime.Engine.Status().AppliedIndex)
 		require.NoError(t, err)
 		require.EqualValues(t, 1, policy.Generation)
 	}

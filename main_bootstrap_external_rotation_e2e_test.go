@@ -48,8 +48,8 @@ func externalRotationE2EClient(t *testing.T, f *bootstrapRotationE2EFixture, nod
 	gate.markReady()
 	server := grpc.NewServer(append(options, grpc.ChainUnaryInterceptor(rpc, gate.unaryInterceptor))...)
 	admin := adapter.NewEncryptionAdminServer(adapter.WithEncryptionAdminSidecarPath(f.sidecarPath),
-		adapter.WithEncryptionAdminFullNodeID(f.config.local.Member), adapter.WithEncryptionAdminProposer(node.runtime.engine),
-		adapter.WithEncryptionAdminPostCutoverProposer(node.group.Proposer()), adapter.WithEncryptionAdminLeaderView(node.runtime.engine))
+		adapter.WithEncryptionAdminFullNodeID(f.config.local.Member), adapter.WithEncryptionAdminProposer(node.runtime.Engine),
+		adapter.WithEncryptionAdminPostCutoverProposer(node.group.Proposer()), adapter.WithEncryptionAdminLeaderView(node.runtime.Engine))
 	require.NoError(t, admin.Validate())
 	pb.RegisterEncryptionAdminServer(server, admin)
 	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
@@ -94,7 +94,7 @@ func externalRotationE2EApplied(t *testing.T, f *bootstrapRotationE2EFixture, no
 		key := sc.Keys[strconv.FormatUint(uint64(req.NewDekId), 10)]
 		return key.Purpose == encryption.SidecarPurposeStorage && bytes.Equal(key.Wrapped, req.WrappedNewDek) && uint32(key.LocalEpoch) == req.ProposerLocalEpoch
 	}, enablementE2EWait, 10*time.Millisecond, "actual committed sidecar must match the exact external request")
-	require.Eventually(t, node.runtime.publicReady, enablementE2EWait, 10*time.Millisecond, "read-only recovery must settle responsibility and restore DataReady")
+	require.Eventually(t, node.runtime.PublicReady, enablementE2EWait, 10*time.Millisecond, "read-only recovery must settle responsibility and restore DataReady")
 }
 
 func TestBootstrapExternalRotationE2EEncryptedBusinessRestart(t *testing.T) {
@@ -162,7 +162,7 @@ func TestBootstrapExternalRotationE2ERejectedRequestsDoNotMutate(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, before.Active, after.Active)
 	require.Equal(t, before.Keys, after.Keys, "rejected network requests cannot install any key material")
-	require.True(t, node.runtime.publicReady())
+	require.True(t, node.runtime.PublicReady())
 }
 
 func TestBootstrapExternalRotationE2ELostReplyReconcilesExactRequest(t *testing.T) {

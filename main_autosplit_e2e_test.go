@@ -8,6 +8,7 @@ import (
 
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/distribution/autosplit"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/internal/serverwiring"
 	"github.com/bootjp/elastickv/keyviz"
@@ -24,7 +25,7 @@ func TestAutoSplitE2EThreeNodeSplitKillSwitchAndLeadershipReset(t *testing.T) {
 		rpcTimeout   = 2 * time.Second
 	)
 	baseDir := t.TempDir()
-	_, endpoints, nodes := startBootstrapE2ECluster(t, baseDir, nodeCount, 5, raftEngineEtcd)
+	_, endpoints, nodes := startBootstrapE2ECluster(t, baseDir, nodeCount, 5, noderuntime.RaftEngineEtcd)
 	t.Cleanup(func() { closeBootstrapE2ENodes(t, nodes) })
 	waitForBootstrapClusterConfig(t, nodes, bootstrapExpectedConfiguration(endpoints))
 	leaderIdx := waitForSingleLeader(t, nodes)

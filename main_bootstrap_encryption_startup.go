@@ -129,7 +129,7 @@ func bootstrapEncryptionRecoveryBarrier(domain *bootstrapDomain, rt *raftGroupRu
 		return nil, errors.New("protected encryption requires native Recovery read barrier")
 	}
 	return func(ctx context.Context) (uint64, error) {
-		owned, finish, err := domain.admission.Enter(ctx, raftadmission.Recovery, rt.spec.ID)
+		owned, finish, err := domain.admission.Enter(ctx, raftadmission.Recovery, rt.Spec.ID)
 		if err != nil {
 			return 0, errors.WithStack(err)
 		}

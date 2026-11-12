@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/stretchr/testify/require"
 )
 
@@ -29,6 +30,6 @@ func TestDurationToTicks(t *testing.T) {
 
 func TestNewRaftFactory_UnsupportedEngine(t *testing.T) {
 	t.Parallel()
-	_, err := newRaftFactory(raftEngineType("unknown"), nil)
-	require.ErrorIs(t, err, ErrUnsupportedRaftEngine)
+	_, err := newRaftFactory(noderuntime.RaftEngineType("unknown"), nil)
+	require.ErrorIs(t, err, noderuntime.ErrUnsupportedRaftEngine)
 }

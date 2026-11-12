@@ -12,13 +12,13 @@ import (
 func raftMonitorRuntimes(runtimes []*raftGroupRuntime) []monitoring.RaftRuntime {
 	out := make([]monitoring.RaftRuntime, 0, len(runtimes))
 	for _, runtime := range runtimes {
-		if runtime == nil || runtime.engine == nil {
+		if runtime == nil || runtime.Engine == nil {
 			continue
 		}
 		out = append(out, monitoring.RaftRuntime{
-			GroupID:      runtime.spec.ID,
-			StatusReader: runtime.engine,
-			ConfigReader: runtime.engine,
+			GroupID:      runtime.Spec.ID,
+			StatusReader: runtime.Engine,
+			ConfigReader: runtime.Engine,
 		})
 	}
 	return out
@@ -41,10 +41,10 @@ type fsmApplySyncModeLabeler interface {
 // gauge to avoid publishing a misleading default.
 func fsmApplySyncModeLabelFromRuntimes(runtimes []*raftGroupRuntime) string {
 	for _, runtime := range runtimes {
-		if runtime == nil || runtime.store == nil {
+		if runtime == nil || runtime.Store == nil {
 			continue
 		}
-		src, ok := runtime.store.(fsmApplySyncModeLabeler)
+		src, ok := runtime.Store.(fsmApplySyncModeLabeler)
 		if !ok {
 			continue
 		}
@@ -68,16 +68,16 @@ func recordFSMApplySyncMode(reg *monitoring.Registry, runtimes []*raftGroupRunti
 func pebbleMonitorSources(runtimes []*raftGroupRuntime) []monitoring.PebbleSource {
 	out := make([]monitoring.PebbleSource, 0, len(runtimes))
 	for _, runtime := range runtimes {
-		if runtime == nil || runtime.store == nil {
+		if runtime == nil || runtime.Store == nil {
 			continue
 		}
-		src, ok := runtime.store.(monitoring.PebbleMetricsSource)
+		src, ok := runtime.Store.(monitoring.PebbleMetricsSource)
 		if !ok {
 			continue
 		}
 		out = append(out, monitoring.PebbleSource{
-			GroupID:    runtime.spec.ID,
-			GroupIDStr: strconv.FormatUint(runtime.spec.ID, 10),
+			GroupID:    runtime.Spec.ID,
+			GroupIDStr: strconv.FormatUint(runtime.Spec.ID, 10),
 			Source:     src,
 		})
 	}
@@ -92,15 +92,15 @@ func pebbleMonitorSources(runtimes []*raftGroupRuntime) []monitoring.PebbleSourc
 func dispatchMonitorSources(runtimes []*raftGroupRuntime) []monitoring.DispatchSource {
 	out := make([]monitoring.DispatchSource, 0, len(runtimes))
 	for _, runtime := range runtimes {
-		if runtime == nil || runtime.engine == nil {
+		if runtime == nil || runtime.Engine == nil {
 			continue
 		}
-		src, ok := runtime.engine.(monitoring.DispatchCounterSource)
+		src, ok := runtime.Engine.(monitoring.DispatchCounterSource)
 		if !ok {
 			continue
 		}
 		out = append(out, monitoring.DispatchSource{
-			GroupID: runtime.spec.ID,
+			GroupID: runtime.Spec.ID,
 			Source:  src,
 		})
 	}
@@ -205,16 +205,16 @@ func (a sqsDepthSourceAdapter) SnapshotQueueDepths(ctx context.Context) ([]monit
 func writeConflictMonitorSources(runtimes []*raftGroupRuntime) []monitoring.WriteConflictSource {
 	out := make([]monitoring.WriteConflictSource, 0, len(runtimes))
 	for _, runtime := range runtimes {
-		if runtime == nil || runtime.store == nil {
+		if runtime == nil || runtime.Store == nil {
 			continue
 		}
-		src, ok := runtime.store.(monitoring.WriteConflictCounterSource)
+		src, ok := runtime.Store.(monitoring.WriteConflictCounterSource)
 		if !ok {
 			continue
 		}
 		out = append(out, monitoring.WriteConflictSource{
-			GroupID:    runtime.spec.ID,
-			GroupIDStr: strconv.FormatUint(runtime.spec.ID, 10),
+			GroupID:    runtime.Spec.ID,
+			GroupIDStr: strconv.FormatUint(runtime.Spec.ID, 10),
 			Source:     src,
 		})
 	}

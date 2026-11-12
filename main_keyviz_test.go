@@ -53,7 +53,7 @@ func TestStartKeyVizLeaderTermPublisherSkipsWhenSamplerNil(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	eg, _ := errgroup.WithContext(ctx)
-	startKeyVizLeaderTermPublisher(ctx, eg, nil, []*raftGroupRuntime{{spec: noderuntime.GroupSpec{ID: 1}}})
+	startKeyVizLeaderTermPublisher(ctx, eg, nil, []*raftGroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 1}}}})
 	require.NoError(t, eg.Wait(),
 		"errgroup must close immediately because no goroutine should have launched")
 }

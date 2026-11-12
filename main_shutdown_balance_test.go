@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/internal/testutil"
 	"github.com/stretchr/testify/require"
@@ -42,7 +43,7 @@ func TestShutdownJoinsBalancerBeforeHandoff(t *testing.T) {
 	close(requests)
 	go func() {
 		defer close(finished)
-		shutdownAfterRequest(ctx, cancel, []*raftGroupRuntime{{engine: engine}}, requests, time.Second,
+		shutdownAfterRequest(ctx, cancel, []*raftGroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{Engine: engine}}}, requests, time.Second,
 			func(ctx context.Context) error { return stopLeaderBalanceForShutdown(ctx, stopBalance, balanceDone) })
 	}()
 	testutil.Closed(t, stopping, shutdownTestTimeout, "balancing was not cancelled")
@@ -67,7 +68,7 @@ func TestShutdownBalancerJoinSharesHandoffDeadline(t *testing.T) {
 	})
 	requests, balanceDone := make(chan struct{}), make(chan struct{})
 	close(requests)
-	shutdownAfterRequest(ctx, cancel, []*raftGroupRuntime{{engine: engine}}, requests, 20*time.Millisecond,
+	shutdownAfterRequest(ctx, cancel, []*raftGroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{Engine: engine}}}, requests, 20*time.Millisecond,
 		func(ctx context.Context) error { return stopLeaderBalanceForShutdown(ctx, stopBalance, balanceDone) })
 	require.ErrorIs(t, balanceCtx.Err(), context.Canceled)
 	require.ErrorIs(t, ctx.Err(), context.Canceled)

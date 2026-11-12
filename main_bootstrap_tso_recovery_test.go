@@ -44,7 +44,7 @@ func TestNamespaceReplayMustRejectHaltBeforeNoop(t *testing.T) {
 
 func TestProtectedTSOLegacyRecoveryRejectsAdditionalControlState(t *testing.T) {
 	base, profile, _, configDir := prepareTSOEnablementProfile(t)
-	dir := groupDataDir(base, "n1", 0, true)
+	dir := noderuntime.GroupDataDir(base, "n1", 0, true)
 	ownership, err := etcd.AcquireOfflineBaselineOwnership(dir)
 	require.NoError(t, err)
 	st, err := store.NewPebbleStore(filepath.Join(dir, dedicatedTSOControlStoreName))
@@ -61,7 +61,7 @@ func TestProtectedTSOLegacyRecoveryRejectsAdditionalControlState(t *testing.T) {
 
 func assertTSOLegacyRecoveryRefused(t *testing.T, base, peerConfigDir string, profile []noderuntime.GroupSpec) {
 	t.Helper()
-	path := filepath.Join(groupDataDir(base, "n1", 0, true), dedicatedTSOControlStoreName)
+	path := filepath.Join(noderuntime.GroupDataDir(base, "n1", 0, true), dedicatedTSOControlStoreName)
 	before, err := readOnlyTSOStoreDigest(t.Context(), path)
 	require.NoError(t, err)
 	bootstrapCfg := noderuntime.BootstrapConfig{PeerConfigDir: peerConfigDir}
@@ -81,7 +81,7 @@ func assertTSOLegacyRecoveryRefused(t *testing.T, base, peerConfigDir string, pr
 
 func assertTSOMissingReceiptRefusesRecovery(t *testing.T, base, configDir string, profile []noderuntime.GroupSpec) {
 	t.Helper()
-	dir := groupDataDir(base, "n1", 0, true)
+	dir := noderuntime.GroupDataDir(base, "n1", 0, true)
 	path := filepath.Join(dir, dedicatedTSOControlStoreName)
 	ownership, err := etcd.AcquireOfflineBaselineOwnership(dir)
 	require.NoError(t, err)

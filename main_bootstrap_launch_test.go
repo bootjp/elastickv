@@ -41,10 +41,10 @@ func TestProtectedBootstrapLaunchRequiresExactDurableFormat(t *testing.T) {
 	require.NoError(t, err)
 	factory, err := bootstrapFactoryForGroup(etcd.NewFactory(etcd.FactoryConfig{}), spec, nil)
 	require.NoError(t, err)
-	require.NoError(t, ensureRaftEngineDataDirForFactory(dir, raftEngineEtcd, factory))
+	require.NoError(t, noderuntime.EnsureRaftEngineDataDirForFactory(dir, noderuntime.RaftEngineEtcd, factory))
 	marker := filepath.Join(dir, raftbootstrap.MarkerFile)
 	require.NoError(t, os.WriteFile(marker, []byte("etcd\n"), 0600))
-	require.Error(t, ensureRaftEngineDataDirForFactory(dir, raftEngineEtcd, factory))
+	require.Error(t, noderuntime.EnsureRaftEngineDataDirForFactory(dir, noderuntime.RaftEngineEtcd, factory))
 	got, err := os.ReadFile(marker)
 	require.NoError(t, err)
 	require.Equal(t, []byte("etcd\n"), got, "preflight must not rewrite an invalid protected marker")
@@ -53,7 +53,7 @@ func TestProtectedBootstrapLaunchRequiresExactDurableFormat(t *testing.T) {
 func TestProtectedRuntimeReadinessRemainsRevocable(t *testing.T) {
 	t.Parallel()
 	ready := false
-	runtimes := []*raftGroupRuntime{{publicReady: func() bool { return ready }}}
+	runtimes := []*raftGroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{PublicReady: func() bool { return ready }}}}
 	gate := &startupPublicKVGate{blockRuntime: func() bool { return protectedRuntimesBlocked(runtimes) }}
 	gate.markReady()
 	require.True(t, gate.blocked())
@@ -69,8 +69,8 @@ func TestProtectedDomainRejectsIncompleteConfigurationBeforeCreatingState(t *tes
 	base := t.TempDir()
 	err := validateProtectedBootstrapDomain("n1", base, []noderuntime.GroupSpec{{ID: 1, Address: "localhost:50051"}}, true, peerConfigDir)
 	require.Error(t, err)
-	require.NoDirExists(t, groupDataDir(base, "n1", 1, true))
+	require.NoDirExists(t, noderuntime.GroupDataDir(base, "n1", 1, true))
 	err = validateProtectedBootstrapDomain("n1", base, []noderuntime.GroupSpec{{ID: noderuntime.DedicatedTSORaftGroupID}}, true, peerConfigDir)
 	require.Error(t, err, "a missing group-zero configuration must not fall back to legacy startup")
-	require.NoDirExists(t, groupDataDir(base, "n1", noderuntime.DedicatedTSORaftGroupID, true))
+	require.NoDirExists(t, noderuntime.GroupDataDir(base, "n1", noderuntime.DedicatedTSORaftGroupID, true))
 }

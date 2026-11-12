@@ -9,7 +9,6 @@ import (
 
 	"github.com/bootjp/elastickv/internal/leaderbalance"
 	"github.com/bootjp/elastickv/internal/noderuntime"
-	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/errgroup"
@@ -78,12 +77,7 @@ func leaderBalanceGroups(runtimes []*raftGroupRuntime) []leaderbalance.Group {
 
 // GroupID is the Raft group this runtime serves.
 func (r *raftGroupRuntime) GroupID() uint64 {
-	return r.spec.ID
-}
-
-// Engine is the group's Raft engine, or nil while it is not open.
-func (r *raftGroupRuntime) Engine() raftengine.Engine {
-	return r.snapshotEngine()
+	return r.Spec.ID
 }
 
 func startLeaderBalance(ctx context.Context, eg *errgroup.Group, runtimes []*raftGroupRuntime, opts leaderbalance.Options, done chan<- struct{}) {
