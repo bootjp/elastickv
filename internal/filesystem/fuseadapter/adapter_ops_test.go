@@ -62,6 +62,43 @@ type journalWriteCore struct {
 	ids []filesystem.OperationID
 }
 
+type contentionMkdirCore struct {
+	*fakeCore
+	err error
+}
+
+func (c *contentionMkdirCore) MkdirWithOperation(context.Context, filesystem.OperationID, uint64, []byte, filesystem.CreateOptions) (filesystem.CreateResult, error) {
+	return filesystem.CreateResult{}, c.err
+}
+
+func (c *contentionMkdirCore) CloseOperationSession(context.Context, filesystem.OperationSessionID) error {
+	return nil
+}
+
+func TestStrictMkdirMapsProvenContentionWithoutMaskingUnknownOutcome(t *testing.T) {
+	t.Parallel()
+	session := filesystem.OperationSessionID{Filesystem: [16]byte{1}, Session: [16]byte{2}}
+	for _, tt := range []struct {
+		name string
+		err  error
+		want syscall.Errno
+	}{
+		{"proven contention", filesystem.ErrContentionLimit, syscall.EBUSY},
+		{"unknown outcome", errors.Join(filesystem.ErrContentionLimit, kv.ErrTransactionOutcomeUnknown), syscall.EIO},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			core := &contentionMkdirCore{fakeCore: &fakeCore{}, err: tt.err}
+			adapter := New(core, []byte("client"), WithHandleKeepaliveInterval(0), WithStrictMode(session))
+			t.Cleanup(adapter.Close)
+			_, errno := adapter.Mkdir(t.Context(), filesystem.RootInode, []byte("dir"), filesystem.CreateOptions{Mode: 0o755})
+			require.Equal(t, tt.want, errno)
+		})
+	}
+	legacy := newIdleAdapter(t, &fakeCore{mkdirErr: filesystem.ErrContentionLimit})
+	_, errno := legacy.Mkdir(t.Context(), filesystem.RootInode, []byte("dir"), filesystem.CreateOptions{Mode: 0o755})
+	require.Equal(t, syscall.EAGAIN, errno)
+}
+
 type unknownThenCommittedWriteCore struct {
 	*acknowledgementCore
 	id    filesystem.OperationID

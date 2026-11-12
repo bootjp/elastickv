@@ -438,6 +438,11 @@ regression tests.
 
 ### Remaining work after the bounded legacy-path changes
 
+Strict-mode FUSE mutations now report `EBUSY` for a terminal
+`ErrContentionLimit`, while legacy mutations retain `EAGAIN` and an outcome
+marked unknown remains `EIO`. This errno projection does not by itself prove
+the broader M3 contention and availability gates.
+
 The merged baseline forwards definitive write conflicts, retries several
 filesystem service operations within bounds, tracks local FUSE predecessors,
 and tests mounted SQLite PERSIST/DELETE workloads.
