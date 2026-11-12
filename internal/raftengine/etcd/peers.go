@@ -1,11 +1,11 @@
 package etcd
 
 import (
-	"hash/fnv"
 	"sort"
 	"strconv"
 	"strings"
 
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/cockroachdb/errors"
 	raftpb "go.etcd.io/raft/v3/raftpb"
 )
@@ -43,17 +43,10 @@ type Peer struct {
 	Suffrage string
 }
 
+// DeriveNodeID is raftengine.DeriveNodeID; the etcd backend keeps the
+// name so its callers and the wiring code need no change.
 func DeriveNodeID(id string) uint64 {
-	if id == "" {
-		return 0
-	}
-	sum := fnv.New64a()
-	_, _ = sum.Write([]byte(id))
-	nodeID := sum.Sum64()
-	if nodeID == 0 {
-		return 1
-	}
-	return nodeID
+	return raftengine.DeriveNodeID(id)
 }
 
 func ParsePeers(raw string) ([]Peer, error) {
