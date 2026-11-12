@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/tsowiring"
 	"github.com/stretchr/testify/require"
 )
 
@@ -48,7 +49,7 @@ func TestRegisterServerFlagsBindsCommandLineNames(t *testing.T) {
 	require.Equal(t, "127.0.0.1:0", f.healthAddress)
 	require.Equal(t, "/mnt/ekv", f.filesystem.mount)
 	require.True(t, f.leaderBalance.enabled)
-	require.Equal(t, "/etc/tso-mode", f.tso.modeFile)
+	require.Equal(t, "/etc/tso-mode", f.tso.ModeFile)
 	require.Equal(t, "/var/offload", f.snapshotOffload.LocalDir)
 	require.True(t, f.snapshotOffload.Retention.Enabled)
 	require.True(t, f.adminHTTP.enabled)
@@ -60,8 +61,8 @@ func TestRegisterServerFlagsBindsCommandLineNames(t *testing.T) {
 	require.Equal(t, "/etc/ekv/tls.crt", f.nodeAuth.grpcTLSCertFile)
 
 	defaults := defaultServerFlags()
-	require.Equal(t, defaultTSOBatchSize, defaults.tso.batchSize)
-	require.Equal(t, defaultTSOReload, defaults.tso.modeReloadInterval)
+	require.Equal(t, tsowiring.DefaultBatchSize, defaults.tso.BatchSize)
+	require.Equal(t, tsowiring.DefaultReloadInterval, defaults.tso.ModeReloadInterval)
 	require.Equal(t, uint(defaultFilesystemRootMode), defaults.filesystem.rootMode)
 	require.Equal(t, keyvizFanoutDefaultTimeout, defaults.adminHTTP.keyvizFanoutTimeout)
 	require.Equal(t, uint64(defaultBackupHeadroom), defaults.backup.snapshotHeadroomEntries)

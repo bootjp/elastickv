@@ -253,6 +253,16 @@ Tests move with the code they cover.
   so the package does not import the concrete etcd backend, and the
   uncached peer dial helper moved to `kv.NewGRPCClient` next to the
   connection cache that already dials the same way.
+- M4, TSO: the timestamp-oracle wiring moved to `internal/tsowiring`
+  (its own package rather than `internal/serverwiring`, whose tests would
+  collide with the moved fakes). It owns `Flags`, mode and mode-file
+  validation, the legacy local bridge, the dedicated allocator with leader
+  routing and the runtime mode controller, `Wiring.AuthorizeActivation`,
+  the mode reloader and the HLC lease renewal helpers. `Configure` takes the
+  dedicated group ID and group explicitly plus extra routing options;
+  `main`'s `configureCoordinatorTSOWithObserver` looks the group up by
+  `noderuntime.DedicatedTSORaftGroupID` and turns the protected-bootstrap
+  networks into those routing options.
 
 ## Decisions
 

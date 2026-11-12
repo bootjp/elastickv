@@ -46,6 +46,7 @@ var upperLayers = []string{
 	"internal/serverwiring",
 	"internal/snapshotoffload",
 	"internal/snapshotoffloadwiring",
+	"internal/tsowiring",
 }
 
 func withUpper(extra ...string) []string {
@@ -130,6 +131,7 @@ var restrictedPackages = []restrictedPackage{
 	{Pkg: "internal/adminbridge", AllowedFrom: []string{".", "cmd"}, Why: "admin bridges are wired by binaries only"},
 	{Pkg: "internal/noderuntime", AllowedFrom: []string{".", "cmd"}, Why: "node runtime configuration is resolved by binaries only"},
 	{Pkg: "internal/snapshotoffloadwiring", AllowedFrom: []string{".", "cmd"}, Why: "snapshot offload start-up is wired by binaries only"},
+	{Pkg: "internal/tsowiring", AllowedFrom: []string{".", "cmd"}, Why: "TSO wiring is configured by binaries only"},
 }
 
 // checkLayering reports a layer violation when a production file in the

@@ -16,6 +16,7 @@ import (
 	"github.com/bootjp/elastickv/internal/raftengine"
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/bootjp/elastickv/internal/serverwiring"
+	"github.com/bootjp/elastickv/internal/tsowiring"
 	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/monitoring"
@@ -117,7 +118,7 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 	if in.distServer != nil {
 		in.distServer.SetReadGate(publicKVGate.blocked)
 	}
-	installHLCLeaseRenewalBlocker(in.coordinate, waitRotateOnStartup.BlockMutators)
+	tsowiring.InstallHLCLeaseRenewalBlocker(in.coordinate, waitRotateOnStartup.BlockMutators)
 	adapterCoordinate := newStartupGatedCoordinator(in.coordinate, publicKVGate)
 	runner := runtimeServerRunner{
 		ctx:                in.ctx,
@@ -222,7 +223,7 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 }
 
 func startPublicServicesAfterCommitTSFence(in serversInput, runner *runtimeServerRunner, gate *startupPublicKVGate, fenceEnabled bool) error {
-	startHLCLeaseRenewal(in.ctx, in.eg, in.coordinate)
+	tsowiring.StartHLCLeaseRenewal(in.ctx, in.eg, in.coordinate)
 	if err := markPublicGateReadyAfterCommitTSFence(in.ctx, gate, in.runtimes, fenceEnabled); err != nil {
 		return runner.startupFailure(errors.Wrap(err, "wait for commit-ts fence activation before public service"))
 	}

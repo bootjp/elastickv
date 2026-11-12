@@ -2,68 +2,23 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"path/filepath"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/bootjp/elastickv/adapter"
-	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
-	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
-func TestConfigureCoordinatorTSORejectsConflictingModes(t *testing.T) {
-	cfg := testTSOFlags(true, true)
-	coord := newMainTSOCoordinator(kv.NewHLC(), nil)
-
-	_, err := configureCoordinatorTSO(cfg, coord, nil)
-	require.ErrorContains(t, err, "mutually exclusive")
-}
-
-func TestConfigureCoordinatorTSOShadowRequiresDedicatedGroup(t *testing.T) {
-	cfg := testTSOFlags(false, true)
-	coord := newMainTSOCoordinator(kv.NewHLC(), nil)
-
-	_, err := configureCoordinatorTSO(cfg, coord, nil)
-	require.ErrorIs(t, err, kv.ErrTSOGroupRequired)
-}
-
-func TestConfigureCoordinatorTSOCutoverRoutesThroughDedicatedGroup(t *testing.T) {
-	cfg := testTSOFlags(true, false)
-	clock := kv.NewHLC()
-	clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
-	fsm := kv.NewTSOStateMachine(clock)
-	engine := &mainTSOEngine{state: raftengine.StateLeader, tsoState: fsm}
-	groups := map[uint64]*kv.ShardGroup{
-		noderuntime.DedicatedTSORaftGroupID: {Engine: engine, TSOState: fsm},
-	}
-	coord := newMainTSOCoordinator(clock, groups)
-
-	wiring, err := configureCoordinatorTSO(cfg, coord, groups, mainTSOFloorProvider{})
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, wiring.Close()) })
-	require.NotNil(t, wiring.serverAllocator)
-	require.NotNil(t, wiring.routedAllocator)
-	require.True(t, coord.IsTimestampLeader())
-
-	ts, err := kv.NextTimestampThrough(context.Background(), coord, "test dedicated tso")
-	require.NoError(t, err)
-	require.NotZero(t, ts)
-	require.Equal(t, uint64(2), engine.proposals.Load(), "cutover marker must commit before the first window")
-	require.True(t, fsm.CutoverActive())
-}
-
 func TestConfigureCoordinatorTSOPhaseDWorksThroughAdapterDecorators(t *testing.T) {
 	cfg := testTSOFlags(true, false)
-	cfg.phaseDEnabled = true
+	cfg.PhaseDEnabled = true
 	clock := kv.NewHLC()
 	clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
 	fsm := kv.NewTSOStateMachine(clock)
@@ -85,93 +40,6 @@ func TestConfigureCoordinatorTSOPhaseDWorksThroughAdapterDecorators(t *testing.T
 	require.True(t, fsm.PhaseDActive())
 	require.Equal(t, uint64(4), engine.proposals.Load(),
 		"cutover, pending, and phase-D markers must commit before the timestamp window")
-}
-
-func TestConfigureCoordinatorTSOPhaseDRequiresCutoverMode(t *testing.T) {
-	cfg := testTSOFlags(false, false)
-	cfg.phaseDEnabled = true
-	coord := newMainTSOCoordinator(kv.NewHLC(), nil)
-
-	_, err := configureCoordinatorTSO(cfg, coord, nil)
-	require.ErrorContains(t, err, "requires --tsoEnabled")
-}
-
-func TestConfigureCoordinatorTSOShadowReturnsLegacyTimestamp(t *testing.T) {
-	cfg := testTSOFlags(false, true)
-	clock := kv.NewHLC()
-	clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
-	fsm := kv.NewTSOStateMachine(clock)
-	engine := &mainTSOEngine{state: raftengine.StateLeader, tsoState: fsm}
-	groups := map[uint64]*kv.ShardGroup{
-		noderuntime.DedicatedTSORaftGroupID: {Engine: engine, TSOState: fsm},
-	}
-	coord := newMainTSOCoordinator(clock, groups)
-
-	wiring, err := configureCoordinatorTSO(cfg, coord, groups, mainTSOFloorProvider{})
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, wiring.Close()) })
-
-	legacyTS, err := kv.NextTimestampThrough(context.Background(), coord, "test shadow tso")
-	require.NoError(t, err)
-	require.NotZero(t, legacyTS)
-	require.Greater(t, clock.Current(), legacyTS)
-	require.Equal(t, uint64(1), engine.proposals.Load())
-}
-
-func TestConfigureCoordinatorTSOExposesDedicatedServerWithoutCutover(t *testing.T) {
-	cfg := testTSOFlags(false, false)
-	clock := kv.NewHLC()
-	fsm := kv.NewTSOStateMachine(clock)
-	engine := &mainTSOEngine{state: raftengine.StateFollower, tsoState: fsm}
-	groups := map[uint64]*kv.ShardGroup{
-		noderuntime.DedicatedTSORaftGroupID: {Engine: engine, TSOState: fsm},
-	}
-	coord := newMainTSOCoordinator(clock, groups)
-
-	wiring, err := configureCoordinatorTSO(cfg, coord, groups, mainTSOFloorProvider{})
-	require.NoError(t, err)
-	require.NotNil(t, wiring.serverAllocator)
-	require.Nil(t, wiring.routedAllocator)
-	require.False(t, coord.IsTimestampLeader(), "timestamp leadership stays on the compatibility bridge until a mode is enabled")
-}
-
-func TestConfigureCoordinatorTSORestoresDurableCutoverWithoutFlags(t *testing.T) {
-	cfg := testTSOFlags(false, false)
-	clock, fsm, engine, groups := newActiveMainTSOCutover(t)
-	coord := newMainTSOCoordinator(clock, groups)
-
-	wiring, err := configureCoordinatorTSO(cfg, coord, groups, mainTSOFloorProvider{})
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, wiring.Close()) })
-	require.NotNil(t, wiring.serverAllocator)
-	require.NotNil(t, wiring.routedAllocator)
-	require.True(t, coord.IsTimestampLeader())
-	require.True(t, fsm.CutoverActive())
-
-	ts, err := kv.NextTimestampThrough(context.Background(), coord, "test restored tso cutover")
-	require.NoError(t, err)
-	require.NotZero(t, ts)
-	require.Equal(t, uint64(1), engine.proposals.Load(), "restored cutover must only commit the allocation floor")
-}
-
-func TestConfigureCoordinatorTSODurableCutoverOverridesShadowFlag(t *testing.T) {
-	cfg := testTSOFlags(false, true)
-	clock, fsm, engine, groups := newActiveMainTSOCutover(t)
-	coord := newMainTSOCoordinator(clock, groups)
-
-	wiring, err := configureCoordinatorTSO(cfg, coord, groups, mainTSOFloorProvider{})
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, wiring.Close()) })
-	require.NotNil(t, wiring.routedAllocator)
-	require.Equal(t, kv.TSOModeCutover, wiring.runtimeController.CurrentMode(),
-		"durable cutover cannot return to legacy shadow issuance")
-	require.True(t, coord.IsTimestampLeader())
-	require.True(t, fsm.CutoverActive())
-
-	ts, err := kv.NextTimestampThrough(context.Background(), coord, "test shadow flag after cutover")
-	require.NoError(t, err)
-	require.NotZero(t, ts)
-	require.Equal(t, uint64(1), engine.proposals.Load(), "restored cutover must only commit the allocation floor")
 }
 
 func TestInternalTimestampOptionsPreservesTSOThroughStartupGate(t *testing.T) {
@@ -234,7 +102,7 @@ func TestInternalForwardUsesRuntimeAllocatorAfterModeReload(t *testing.T) {
 	cfg := testTSOFlags(false, false)
 	path := filepath.Join(t.TempDir(), "tso-mode")
 	require.NoError(t, os.WriteFile(path, []byte("legacy\n"), 0o600))
-	cfg.modeFile = path
+	cfg.ModeFile = path
 
 	clock := kv.NewHLC()
 	clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
@@ -247,7 +115,7 @@ func TestInternalForwardUsesRuntimeAllocatorAfterModeReload(t *testing.T) {
 	wiring, err := configureCoordinatorTSO(cfg, coord, groups, mainTSOFloorProvider{})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, wiring.Close()) })
-	require.Equal(t, kv.TSOModeLegacy, wiring.runtimeController.CurrentMode())
+	require.Equal(t, kv.TSOModeLegacy, wiring.RuntimeController.CurrentMode())
 
 	gated := newStartupGatedCoordinator(coord, &startupPublicKVGate{})
 	opts := internalTimestampOptions(gated)
@@ -256,8 +124,8 @@ func TestInternalForwardUsesRuntimeAllocatorAfterModeReload(t *testing.T) {
 	txn := &mainForwardTxn{}
 	internal := adapter.NewInternalWithEngine(txn, engine, nil, nil, opts...)
 
-	require.NoError(t, wiring.runtimeController.ApplyMode(kv.TSOModeShadow))
-	require.NoError(t, wiring.runtimeController.ApplyMode(kv.TSOModeCutover))
+	require.NoError(t, wiring.RuntimeController.ApplyMode(kv.TSOModeShadow))
+	require.NoError(t, wiring.RuntimeController.ApplyMode(kv.TSOModeCutover))
 
 	reqs := []*pb.Request{{
 		Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("k"), Value: []byte("v")}},
@@ -269,283 +137,6 @@ func TestInternalForwardUsesRuntimeAllocatorAfterModeReload(t *testing.T) {
 	require.Greater(t, txn.requests[0].GetTs(), uint64(1),
 		"timestamp 1 would mean the long-lived Internal server lost the runtime allocator and used its nil-clock fallback")
 }
-
-func TestConfigureCoordinatorTSOModeFileStartsRuntimeController(t *testing.T) {
-	cfg := testTSOFlags(false, false)
-	path := filepath.Join(t.TempDir(), "tso-mode")
-	require.NoError(t, os.WriteFile(path, []byte("shadow\n"), 0o600))
-	cfg.modeFile = path
-	cfg.modeReloadInterval = time.Millisecond
-	clock := kv.NewHLC()
-	clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
-	fsm := kv.NewTSOStateMachine(clock)
-	engine := &mainTSOEngine{state: raftengine.StateLeader, tsoState: fsm}
-	groups := map[uint64]*kv.ShardGroup{
-		noderuntime.DedicatedTSORaftGroupID: {Engine: engine, TSOState: fsm},
-	}
-	coord := newMainTSOCoordinator(clock, groups)
-
-	wiring, err := configureCoordinatorTSO(cfg, coord, groups, mainTSOFloorProvider{})
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, wiring.Close()) })
-	require.NotNil(t, wiring.runtimeController)
-	require.Equal(t, kv.TSOModeShadow, wiring.runtimeController.CurrentMode())
-	_, configured := kv.TimestampAllocatorThrough(coord)
-	require.True(t, configured)
-}
-
-func TestConfigureCoordinatorTSOModeFileRequiresDedicatedGroup(t *testing.T) {
-	cfg := testTSOFlags(false, false)
-	path := filepath.Join(t.TempDir(), "tso-mode")
-	require.NoError(t, os.WriteFile(path, []byte("legacy\n"), 0o600))
-	cfg.modeFile = path
-	coord := newMainTSOCoordinator(kv.NewHLC(), nil)
-
-	_, err := configureCoordinatorTSO(cfg, coord, nil)
-	require.ErrorIs(t, err, kv.ErrTSOGroupRequired)
-}
-
-func newActiveMainTSOCutover(t *testing.T) (*kv.HLC, *kv.TSOStateMachine, *mainTSOEngine, map[uint64]*kv.ShardGroup) {
-	t.Helper()
-	clock := kv.NewHLC()
-	clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
-	fsm := kv.NewTSOStateMachine(clock)
-	engine := &mainTSOEngine{state: raftengine.StateLeader, tsoState: fsm}
-	group := &kv.ShardGroup{Engine: engine, TSOState: fsm}
-	allocator, err := kv.NewRaftTSOAllocator(group, clock, kv.WithTSOCutoverFloorProvider(mainTSOFloorProvider{}))
-	require.NoError(t, err)
-	_, err = allocator.ReserveBatchAfter(context.Background(), 1, 0, true, false)
-	require.NoError(t, err)
-	require.True(t, fsm.CutoverActive())
-	engine.proposals.Store(0)
-	return clock, fsm, engine, map[uint64]*kv.ShardGroup{noderuntime.DedicatedTSORaftGroupID: group}
-}
-
-// testTSOFlags returns the registered TSO flag defaults with the given
-// legacy stage and a small batch size.
-func testTSOFlags(enabled, shadow bool) tsoFlags {
-	f := defaultFlags[tsoFlags]()
-	f.enabled = enabled
-	f.shadowEnabled = shadow
-	f.batchSize = 8
-	return f
-}
-
-func newMainTSOCoordinator(clock *kv.HLC, groups map[uint64]*kv.ShardGroup) *kv.ShardedCoordinator {
-	return kv.NewShardedCoordinator(distribution.NewEngine(), groups, 1, clock, nil)
-}
-
-type mainTSOEngine struct {
-	state     raftengine.State
-	proposals atomic.Uint64
-	tsoState  *kv.TSOStateMachine
-}
-
-type mainTSOFloorProvider struct {
-	floor uint64
-}
-
-type mainTimestampAllocator struct {
-	next uint64
-}
-
-func (a *mainTimestampAllocator) Next(context.Context) (uint64, error) {
-	return a.next, nil
-}
-
-type mainForwardTxn struct {
-	requests []*pb.Request
-}
-
-type mainForwardObservingCoordinator struct {
-	*kv.ShardedCoordinator
-	observed atomic.Uint64
-}
-
-func (c *mainForwardObservingCoordinator) ObserveForwardedRequests(reqs []*pb.Request) {
-	for range reqs {
-		c.observed.Add(1)
-	}
-}
-
-func (t *mainForwardTxn) Commit(_ context.Context, reqs []*pb.Request) (*kv.TransactionResponse, error) {
-	t.requests = reqs
-	return &kv.TransactionResponse{CommitIndex: 1}, nil
-}
-
-func (t *mainForwardTxn) Abort(context.Context, []*pb.Request) (*kv.TransactionResponse, error) {
-	return &kv.TransactionResponse{}, nil
-}
-
-func (p mainTSOFloorProvider) GlobalCommittedTimestampFloor(context.Context) (uint64, error) {
-	return p.floor, nil
-}
-
-// These fixtures have no data groups; the tests exercise allocator/decorator
-// wiring rather than the production data-group activation gate.
-func (mainTSOFloorProvider) CheckPhaseDProtocol(context.Context) error   { return nil }
-func (mainTSOFloorProvider) SealPhaseDCreation(context.Context) error    { return nil }
-func (mainTSOFloorProvider) PreparePhaseD(context.Context, uint64) error { return nil }
-func (mainTSOFloorProvider) FinishPhaseD(context.Context, uint64) error  { return nil }
-
-func (e *mainTSOEngine) Propose(_ context.Context, payload []byte) (*raftengine.ProposalResult, error) {
-	e.proposals.Add(1)
-	if e.tsoState != nil {
-		if result := e.tsoState.Apply(payload); result != nil {
-			if err, ok := result.(error); ok {
-				return nil, err
-			}
-			return nil, fmt.Errorf("unexpected TSO apply result %T", result)
-		}
-	}
-	return &raftengine.ProposalResult{}, nil
-}
-
-func (e *mainTSOEngine) ProposeAdmin(ctx context.Context, payload []byte) (*raftengine.ProposalResult, error) {
-	return e.Propose(ctx, payload)
-}
-
-func (e *mainTSOEngine) State() raftengine.State { return e.state }
-
-func (e *mainTSOEngine) Leader() raftengine.LeaderInfo {
-	return raftengine.LeaderInfo{ID: "self", Address: "127.0.0.1:50051"}
-}
-
-func (e *mainTSOEngine) VerifyLeader(context.Context) error {
-	if e.state != raftengine.StateLeader {
-		return raftengine.ErrNotLeader
-	}
-	return nil
-}
-
-func (e *mainTSOEngine) LinearizableRead(context.Context) (uint64, error) { return 0, nil }
-
-func (e *mainTSOEngine) Status() raftengine.Status {
-	return raftengine.Status{State: e.state, Term: 1}
-}
-
-func (e *mainTSOEngine) Configuration(context.Context) (raftengine.Configuration, error) {
-	return raftengine.Configuration{}, nil
-}
-
-func (e *mainTSOEngine) SnapshotEvery() uint64 { return 0 }
-
-func (e *mainTSOEngine) Close() error { return nil }
-
-// Legacy warm-up must not narrow timestamp leadership, lease renewal, or lease
-// recovery to group 0. In legacy mode persistence timestamps still come from
-// the data groups' local HLC path, so pinning the timestamp group stops
-// renewing those groups: a group-0 quorum loss then expires their ceilings and
-// legacy writes fail with ErrCeilingExpired while the data groups are healthy.
-// That contradicts the no-path-change warm-up contract.
-//
-// timestampLeaseRenewalGroupIDs is unexported; IsTimestampLeader is driven by
-// the same timestampGroupConfigured flag and is the observable proxy. Group 0
-// is a follower here and the data group is the leader, so the pinned and
-// unpinned answers differ.
-func TestConfigureCoordinatorTSOLegacyDoesNotPinTimestampGroup(t *testing.T) {
-	cfg := testTSOFlags(false, false)
-	clock := kv.NewHLC()
-	clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
-	fsm := kv.NewTSOStateMachine(clock)
-	groups := map[uint64]*kv.ShardGroup{
-		noderuntime.DedicatedTSORaftGroupID: {
-			Engine:   &mainTSOEngine{state: raftengine.StateFollower, tsoState: fsm},
-			TSOState: fsm,
-		},
-		1: {Engine: &mainTSOEngine{state: raftengine.StateLeader}},
-	}
-	coord := newMainTSOCoordinator(clock, groups)
-
-	wiring, err := configureCoordinatorTSO(cfg, coord, groups, mainTSOFloorProvider{})
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, wiring.Close()) })
-
-	require.Nil(t, wiring.routedAllocator,
-		"legacy mode must not stand up the routed allocator")
-	require.False(t, fsm.CutoverActive())
-	require.True(t, coord.IsTimestampLeader(),
-		"legacy warm-up must keep answering from the data groups, not group 0 alone")
-}
-
-func TestConfigureCoordinatorTSOModeFileLegacyDoesNotPinTimestampGroup(t *testing.T) {
-	cfg := testTSOFlags(false, false)
-	path := filepath.Join(t.TempDir(), "tso-mode")
-	require.NoError(t, os.WriteFile(path, []byte("legacy\n"), 0o600))
-	cfg.modeFile = path
-
-	clock := kv.NewHLC()
-	clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
-	fsm := kv.NewTSOStateMachine(clock)
-	groups := map[uint64]*kv.ShardGroup{
-		noderuntime.DedicatedTSORaftGroupID: {
-			Engine:   &mainTSOEngine{state: raftengine.StateFollower, tsoState: fsm},
-			TSOState: fsm,
-		},
-		1: {Engine: &mainTSOEngine{state: raftengine.StateLeader}},
-	}
-	coord := newMainTSOCoordinator(clock, groups)
-
-	wiring, err := configureCoordinatorTSO(cfg, coord, groups, mainTSOFloorProvider{})
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, wiring.Close()) })
-
-	require.NotNil(t, wiring.runtimeController,
-		"mode-file legacy still needs the runtime controller for later reloads")
-	require.Equal(t, kv.TSOModeLegacy, wiring.runtimeController.CurrentMode())
-	require.True(t, coord.IsTimestampLeader(),
-		"legacy mode file must not narrow timestamp leadership to group 0")
-	_, active := kv.TimestampAllocatorThrough(coord)
-	require.False(t, active,
-		"legacy mode file should keep persistence writes on the data-group HLC path")
-	_, configured := kv.ConfiguredTimestampAllocatorThrough(coord)
-	require.True(t, configured,
-		"long-lived internal servers must retain the dynamic allocator for later reloads")
-}
-
-// Once the dedicated allocator is actually required, the pin must apply.
-func TestConfigureCoordinatorTSOCutoverPinsTimestampGroup(t *testing.T) {
-	cfg := testTSOFlags(true, false)
-	clock := kv.NewHLC()
-	clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
-	fsm := kv.NewTSOStateMachine(clock)
-	groups := map[uint64]*kv.ShardGroup{
-		noderuntime.DedicatedTSORaftGroupID: {
-			Engine:   &mainTSOEngine{state: raftengine.StateFollower, tsoState: fsm},
-			TSOState: fsm,
-		},
-		1: {Engine: &mainTSOEngine{state: raftengine.StateLeader}},
-	}
-	coord := newMainTSOCoordinator(clock, groups)
-
-	wiring, err := configureCoordinatorTSO(cfg, coord, groups, mainTSOFloorProvider{})
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, wiring.Close()) })
-
-	require.False(t, coord.IsTimestampLeader(),
-		"with the dedicated allocator active, leadership must come from group 0 only")
-}
-
-// phaseDMainAllocator carries the Phase-D surfaces the forwarded-timestamp
-// validation depends on.
-type phaseDMainAllocator struct {
-	floor uint64
-	next  atomic.Uint64
-}
-
-func (a *phaseDMainAllocator) Next(context.Context) (uint64, error) {
-	return a.floor + a.next.Add(1), nil
-}
-
-func (a *phaseDMainAllocator) ValidateDurableTimestamp(_ context.Context, timestamp uint64) error {
-	if timestamp <= a.floor {
-		return errors.Join(kv.ErrTSOTimestampInvalid, kv.ErrTSOTimestampPrePhaseD)
-	}
-	return nil
-}
-
-func (a *phaseDMainAllocator) PhaseDActive() bool   { return true }
-func (a *phaseDMainAllocator) PhaseDRequired() bool { return true }
 
 // Internal.Forward validates a pre-stamped persistence timestamp through the
 // allocator internalTimestampOptions installs. main.go hands the adapters a
@@ -579,83 +170,4 @@ func TestInternalTimestampOptionsPreservesPhaseDValidatorThroughStartupGate(t *t
 	)
 	require.NoError(t,
 		kv.ValidateDurablePersistenceTimestamp(context.Background(), installed, 101, "test"))
-}
-
-// The activation gate answers from this node's own runtime mode, so a caller
-// cannot drive the group-0 leader past the stage the operator configured.
-func TestCoordinatorTSOWiringAuthorizeActivation(t *testing.T) {
-	// No dedicated TSO runtime at all: nothing to authorize against.
-	var bare coordinatorTSOWiring
-	require.NoError(t, bare.authorizeActivation(false, false))
-	require.Error(t, bare.authorizeActivation(true, false))
-	require.Error(t, bare.authorizeActivation(true, true))
-
-	cfg := testTSOFlags(false, false)
-	path := filepath.Join(t.TempDir(), "tso-mode")
-	require.NoError(t, os.WriteFile(path, []byte("legacy\n"), 0o600))
-	cfg.modeFile = path
-
-	newWiring := func(t *testing.T, mode kv.TSOMode) coordinatorTSOWiring {
-		t.Helper()
-		clock := kv.NewHLC()
-		clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
-		fsm := kv.NewTSOStateMachine(clock)
-		engine := &mainTSOEngine{state: raftengine.StateLeader, tsoState: fsm}
-		groups := map[uint64]*kv.ShardGroup{
-			noderuntime.DedicatedTSORaftGroupID: {Engine: engine, TSOState: fsm},
-		}
-		coord := newMainTSOCoordinator(clock, groups)
-		wiring, err := configureCoordinatorTSO(cfg, coord, groups, mainTSOFloorProvider{})
-		require.NoError(t, err)
-		t.Cleanup(func() { require.NoError(t, wiring.Close()) })
-		for next := kv.TSOModeShadow; next <= mode; next++ {
-			require.NoError(t, wiring.runtimeController.ApplyMode(next))
-		}
-		return wiring
-	}
-
-	legacy := newWiring(t, kv.TSOModeLegacy)
-	require.Error(t, legacy.authorizeActivation(true, false), "legacy mode may not activate cutover")
-	require.Error(t, legacy.authorizeActivation(true, true))
-
-	cutover := newWiring(t, kv.TSOModeCutover)
-	require.NoError(t, cutover.authorizeActivation(true, false))
-	require.Error(t, cutover.authorizeActivation(true, true), "cutover mode may not activate phase D")
-
-	phaseD := newWiring(t, kv.TSOModePhaseD)
-	require.NoError(t, phaseD.authorizeActivation(true, false))
-	require.NoError(t, phaseD.authorizeActivation(true, true))
-}
-
-// The distribution server decides whether a requested activation would change
-// anything by probing the allocator it was handed. main.go hands it the
-// concrete *kv.RaftTSOAllocator, so if that type stops exposing either marker
-// the probe silently reports "still pending" and a node following a marker
-// another leader committed answers PermissionDenied -- stalling allocation
-// cluster-wide. A stub that happens to implement both cannot catch that.
-func TestServerAllocatorExposesDurableMarkerState(t *testing.T) {
-	cfg := testTSOFlags(false, false)
-
-	clock := kv.NewHLC()
-	clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
-	fsm := kv.NewTSOStateMachine(clock)
-	engine := &mainTSOEngine{state: raftengine.StateLeader, tsoState: fsm}
-	groups := map[uint64]*kv.ShardGroup{
-		noderuntime.DedicatedTSORaftGroupID: {Engine: engine, TSOState: fsm},
-	}
-	coord := newMainTSOCoordinator(clock, groups)
-	wiring, err := configureCoordinatorTSO(cfg, coord, groups, mainTSOFloorProvider{})
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, wiring.Close()) })
-	require.NotNil(t, wiring.serverAllocator)
-
-	cutover, ok := any(wiring.serverAllocator).(interface{ CutoverActive() bool })
-	require.True(t, ok, "the server allocator must expose the durable cutover marker")
-	phaseD, ok := any(wiring.serverAllocator).(interface{ PhaseDActive() bool })
-	require.True(t, ok, "the server allocator must expose the durable phase-D marker")
-
-	// Nothing is durable yet, so both still read false and a request to activate
-	// them is a genuine activation the gate should see.
-	require.False(t, cutover.CutoverActive())
-	require.False(t, phaseD.PhaseDActive())
 }

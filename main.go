@@ -15,6 +15,7 @@ import (
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/bootjp/elastickv/internal/runtimehealth"
 	"github.com/bootjp/elastickv/internal/serverwiring"
+	"github.com/bootjp/elastickv/internal/tsowiring"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/monitoring"
 	"github.com/cockroachdb/errors"
@@ -276,7 +277,7 @@ func run(flags *serverFlags) error {
 		sqsAdvertisesHTFIFO(), slog.Default())
 	cleanup.Add(leadershipRefusalDeregister)
 	eg, runCtx := errgroup.WithContext(ctx)
-	startTSOModeReloader(runCtx, eg, flags.tso, tsoWiring)
+	tsowiring.StartModeReloader(runCtx, eg, flags.tso, tsoWiring)
 	startRaftEngineLifecycleWatchers(runCtx, eg, runtimes)
 	// setupDistributionCatalog + the Stage 7a process-start registration
 	// gate are bundled so run() has a single startup-fault path: a
