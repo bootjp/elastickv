@@ -424,6 +424,8 @@ func TestAdapterFsyncFailsClosedOnUnverifiedReceipt(t *testing.T) {
 	t.Cleanup(adapter.Close)
 	_, errno := adapter.Write(t.Context(), 7, 9, 0, []byte("x"))
 	require.Zero(t, errno)
+	_, verifyErr := adapter.verifyReceipts(t.Context(), 7)
+	require.ErrorIs(t, verifyErr, filesystem.ErrOperationPending)
 	require.Equal(t, syscall.EIO, adapter.Fsync(t.Context(), 7, 9, false))
 	require.False(t, core.fsyncCalled)
 	require.Equal(t, syscall.EIO, adapter.Flush(t.Context(), 7, 9))

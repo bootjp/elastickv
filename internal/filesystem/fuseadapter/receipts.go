@@ -3,7 +3,6 @@ package fuseadapter
 import (
 	"context"
 	"log/slog"
-	"syscall"
 
 	"github.com/bootjp/elastickv/internal/filesystem"
 	"github.com/cockroachdb/errors"
@@ -50,7 +49,7 @@ func (a *Adapter) retainLatestLeaseReceipt(ctx context.Context, inode, fh uint64
 	a.leaseReceipts[key] = []filesystem.OperationID{id}
 }
 
-func (a *Adapter) verifyReceipts(ctx context.Context, inode uint64) ([]filesystem.OperationID, syscall.Errno) {
+func (a *Adapter) verifyReceipts(ctx context.Context, inode uint64) ([]filesystem.OperationID, error) {
 	a.receiptMu.Lock()
 	receipts := make([]filesystem.OperationID, 0, len(a.receipts[inode]))
 	for id := range a.receipts[inode] {
@@ -58,18 +57,18 @@ func (a *Adapter) verifyReceipts(ctx context.Context, inode uint64) ([]filesyste
 	}
 	a.receiptMu.Unlock()
 	if len(receipts) == 0 {
-		return receipts, 0
+		return receipts, nil
 	}
 	verifier, ok := a.core.(operationReceiptVerifier)
 	if !ok {
-		return nil, syscall.EOPNOTSUPP
+		return nil, filesystem.ErrUnsupported
 	}
 	for _, id := range receipts {
 		if err := verifier.VerifyOperationReceipt(ctx, id); err != nil && !errors.Is(err, filesystem.ErrOperationRetired) {
-			return nil, Errno(err)
+			return nil, err
 		}
 	}
-	return receipts, 0
+	return receipts, nil
 }
 
 func (a *Adapter) clearReceipts(inode uint64, receipts []filesystem.OperationID) {

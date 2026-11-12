@@ -497,8 +497,8 @@ func (a *Adapter) Flush(ctx context.Context, inode uint64, fh uint64) syscall.Er
 	if errno := a.refreshOpenHandleLease(ctx, inode, fh, false); errno != 0 {
 		return errno
 	}
-	if _, errno := a.verifyReceipts(ctx, inode); errno != 0 {
-		return errno
+	if _, err := a.verifyReceipts(ctx, inode); err != nil {
+		return Errno(err)
 	}
 	return Errno(a.core.Flush(ctx, inode, fh))
 }
@@ -513,10 +513,11 @@ func (a *Adapter) Fsync(ctx context.Context, inode uint64, fh uint64, datasync b
 	if errno := a.refreshOpenHandleLease(ctx, inode, fh, false); errno != 0 {
 		return errno
 	}
-	receipts, errno := a.verifyReceipts(ctx, inode)
-	if errno != 0 {
+	receipts, err := a.verifyReceipts(ctx, inode)
+	if err != nil {
+		errno := Errno(err)
 		if errno == syscall.EIO {
-			slog.WarnContext(ctx, "filesystem FUSE fsync receipt verification failed", "inode", inode, "fh", fh)
+			slog.WarnContext(ctx, "filesystem FUSE fsync receipt verification failed", "inode", inode, "fh", fh, "error", err.Error())
 		}
 		return errno
 	}
@@ -535,8 +536,12 @@ func (a *Adapter) FsyncDirectory(ctx context.Context, inode uint64) syscall.Errn
 	if errno := a.mutations.wait(ctx, inode); errno != 0 {
 		return errno
 	}
-	receipts, errno := a.verifyReceipts(ctx, inode)
-	if errno != 0 {
+	receipts, err := a.verifyReceipts(ctx, inode)
+	if err != nil {
+		errno := Errno(err)
+		if errno == syscall.EIO {
+			slog.WarnContext(ctx, "filesystem FUSE directory fsync receipt verification failed", "inode", inode, "error", err.Error())
+		}
 		return errno
 	}
 	if errno := Errno(a.core.Fsync(ctx, inode, 0, false)); errno != 0 {
