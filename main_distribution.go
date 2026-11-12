@@ -11,6 +11,7 @@ import (
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/internal/serverwiring"
+	"github.com/bootjp/elastickv/internal/snapshotoffloadwiring"
 	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/monitoring"
@@ -50,7 +51,7 @@ type distributionStartupInput struct {
 	// shardGroups feeds the split-migration promotion/voter factories, which
 	// resolve per-group leaders rather than going through the coordinator.
 	shardGroups     map[uint64]*kv.ShardGroup
-	snapshotOffload snapshotOffloadFlags
+	snapshotOffload snapshotoffloadwiring.Flags
 	keyViz          *serverwiring.KeyVizFlags
 	autoSplit       *serverwiring.AutoSplitFlags
 	nodeAuth        nodeAuthFlags
