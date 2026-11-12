@@ -6,6 +6,7 @@ import (
 
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/serverwiring"
+	"github.com/bootjp/elastickv/internal/snapshotoffloadwiring"
 )
 
 const (
@@ -46,7 +47,7 @@ type serverFlags struct {
 	filesystem      filesystemFlags
 	leaderBalance   leaderBalanceFlags
 	tso             tsoFlags
-	snapshotOffload snapshotOffloadFlags
+	snapshotOffload snapshotoffloadwiring.Flags
 	adminHTTP       adminHTTPFlags
 	backup          backupFlags
 	nodeAuth        nodeAuthFlags
@@ -70,7 +71,7 @@ func registerServerFlags(fs *flag.FlagSet) *serverFlags {
 	f.filesystem.register(fs)
 	f.leaderBalance.register(fs)
 	f.tso.register(fs)
-	f.snapshotOffload.register(fs)
+	f.snapshotOffload.Register(fs)
 	f.adminHTTP.register(fs)
 	f.backup.register(fs)
 	f.nodeAuth.register(fs)

@@ -1,4 +1,4 @@
-package main
+package snapshotoffloadwiring
 
 import (
 	"context"
@@ -16,34 +16,34 @@ import (
 
 // snapshotGCTestFlags returns offload flags with fast, permissive retention
 // and no destination; callers set bucket or localDir.
-func snapshotGCTestFlags() snapshotOffloadFlags {
-	f := defaultFlags[snapshotOffloadFlags]()
-	f.retention.enabled, f.retention.claimsComplete = true, true
-	f.retention.interval, f.retention.timeout = 10*time.Millisecond, time.Second
-	f.retention.minGenerations, f.retention.maxAge = 1, time.Nanosecond
-	f.retention.payloadGrace, f.retention.minMarkAge = time.Nanosecond, time.Nanosecond
-	f.prefix, f.sourceCluster = "cluster-a", "cluster-a"
+func snapshotGCTestFlags() Flags {
+	f := defaultOffloadFlags()
+	f.Retention.Enabled, f.Retention.ClaimsComplete = true, true
+	f.Retention.Interval, f.Retention.Timeout = 10*time.Millisecond, time.Second
+	f.Retention.MinGenerations, f.Retention.MaxAge = 1, time.Nanosecond
+	f.Retention.PayloadGrace, f.Retention.MinMarkAge = time.Nanosecond, time.Nanosecond
+	f.Prefix, f.SourceCluster = "cluster-a", "cluster-a"
 	return f
 }
 
 func TestSnapshotOffloadGCRuntimeRequiresExplicitRolloutAndDestination(t *testing.T) {
 	cfg := snapshotGCTestFlags()
-	err := startSnapshotOffload(context.Background(), nil, cfg, nil, t.TempDir(), "n1", false, nil, testLogger(t))
+	err := Start(context.Background(), nil, cfg, nil, "test", nil, testLogger(t))
 	require.ErrorContains(t, err, "requires an offload destination")
 
-	cfg.localDir = t.TempDir()
-	cfg.retention.claimsComplete = false
-	err = startSnapshotOffload(context.Background(), nil, cfg, nil, t.TempDir(), "n1", false, nil, testLogger(t))
+	cfg.LocalDir = t.TempDir()
+	cfg.Retention.ClaimsComplete = false
+	err = Start(context.Background(), nil, cfg, nil, "test", nil, testLogger(t))
 	require.ErrorContains(t, err, "snapshotOffloadGCClaimsRolloutComplete")
-	cfg.retention.enabled = false
+	cfg.Retention.Enabled = false
 	store, err := buildSnapshotOffloadStore(context.Background(), cfg)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, closeSnapshotOffloadStore(store)) })
 	retention, err := buildSnapshotOffloadRetention(context.Background(), cfg, store, testLogger(t))
 	require.NoError(t, err)
 	require.Nil(t, retention, "publication-only configuration must never enable reclamation")
-	cfg.retention.enabled, cfg.retention.claimsComplete = true, true
-	cfg.retention.interval = 0
+	cfg.Retention.Enabled, cfg.Retention.ClaimsComplete = true, true
+	cfg.Retention.Interval = 0
 	_, err = buildSnapshotOffloadRetention(context.Background(), cfg, store, testLogger(t))
 	require.ErrorIs(t, err, snapshotoffload.ErrInvalidOptions)
 }
@@ -70,7 +70,7 @@ func seedRuntimeOffloadSnapshot(t *testing.T, store snapshotoffload.PublishStore
 func TestSnapshotOffloadRuntimeReclaimsAndRestoresRetainedSnapshot(t *testing.T) {
 	cfg := snapshotGCTestFlags()
 	root := t.TempDir()
-	cfg.localDir = root
+	cfg.LocalDir = root
 	objects, err := snapshotoffload.NewLocalStore(root)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, objects.Close()) })
@@ -79,7 +79,7 @@ func TestSnapshotOffloadRuntimeReclaimsAndRestoresRetainedSnapshot(t *testing.T)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	workers, workerCtx := errgroup.WithContext(ctx)
-	require.NoError(t, startSnapshotOffload(workerCtx, workers, cfg, nil, t.TempDir(), "n1", false, nil, testLogger(t)))
+	require.NoError(t, Start(workerCtx, workers, cfg, nil, "test", nil, testLogger(t)))
 	require.Eventually(t, func() bool {
 		_, exists, headErr := objects.HeadObject(context.Background(), stale.Payload.Key)
 		return headErr == nil && !exists

@@ -1,4 +1,4 @@
-package main
+package snapshotoffloadwiring
 
 import (
 	"context"
@@ -15,30 +15,30 @@ import (
 
 const defaultSnapshotRetentionTimeout = 10 * time.Minute
 
-// snapshotRetentionFlags configures snapshot retention (GC) on top of
+// RetentionFlags configures snapshot retention (GC) on top of
 // the offload destination.
-type snapshotRetentionFlags struct {
-	enabled                 bool
-	claimsComplete          bool
-	interval                time.Duration
-	timeout                 time.Duration
-	minGenerations          int
-	maxAge                  time.Duration
-	payloadGrace            time.Duration
-	minMarkAge              time.Duration
-	allowVersionedLifecycle bool
+type RetentionFlags struct {
+	Enabled                 bool
+	ClaimsComplete          bool
+	Interval                time.Duration
+	Timeout                 time.Duration
+	MinGenerations          int
+	MaxAge                  time.Duration
+	PayloadGrace            time.Duration
+	MinMarkAge              time.Duration
+	AllowVersionedLifecycle bool
 }
 
-func (f *snapshotRetentionFlags) register(fs *flag.FlagSet) {
-	fs.BoolVar(&f.enabled, "snapshotOffloadGCEnabled", false, "enable snapshot retention on this worker after completing the publisher claims rollout")
-	fs.BoolVar(&f.claimsComplete, "snapshotOffloadGCClaimsRolloutComplete", false, "operator assertion: every publisher sharing the destination/prefix uses claims and all legacy publications have drained")
-	fs.DurationVar(&f.interval, "snapshotOffloadGCInterval", time.Hour, "interval between serial snapshot retention passes")
-	fs.DurationVar(&f.timeout, "snapshotOffloadGCTimeout", defaultSnapshotRetentionTimeout, "deadline for one snapshot retention pass")
-	fs.IntVar(&f.minGenerations, "snapshotOffloadGCMinGenerations", snapshotoffload.DefaultMinGenerations, "minimum snapshot generations retained per Raft group")
-	fs.DurationVar(&f.maxAge, "snapshotOffloadGCMaxAge", snapshotoffload.DefaultMaxAge, "age window retained in addition to minimum generations")
-	fs.DurationVar(&f.payloadGrace, "snapshotOffloadGCPayloadGrace", snapshotoffload.DefaultPayloadGrace, "minimum age of an unreferenced snapshot payload before marking")
-	fs.DurationVar(&f.minMarkAge, "snapshotOffloadGCMinMarkAge", snapshotoffload.DefaultMinMarkAge, "minimum delay between marking and reclaiming a snapshot payload")
-	fs.BoolVar(&f.allowVersionedLifecycle, "snapshotOffloadAllowVersionedWithLifecycle", false, "allow retention in a versioned S3 bucket after confirming noncurrent-version expiration")
+func (f *RetentionFlags) register(fs *flag.FlagSet) {
+	fs.BoolVar(&f.Enabled, "snapshotOffloadGCEnabled", false, "enable snapshot retention on this worker after completing the publisher claims rollout")
+	fs.BoolVar(&f.ClaimsComplete, "snapshotOffloadGCClaimsRolloutComplete", false, "operator assertion: every publisher sharing the destination/prefix uses claims and all legacy publications have drained")
+	fs.DurationVar(&f.Interval, "snapshotOffloadGCInterval", time.Hour, "interval between serial snapshot retention passes")
+	fs.DurationVar(&f.Timeout, "snapshotOffloadGCTimeout", defaultSnapshotRetentionTimeout, "deadline for one snapshot retention pass")
+	fs.IntVar(&f.MinGenerations, "snapshotOffloadGCMinGenerations", snapshotoffload.DefaultMinGenerations, "minimum snapshot generations retained per Raft group")
+	fs.DurationVar(&f.MaxAge, "snapshotOffloadGCMaxAge", snapshotoffload.DefaultMaxAge, "age window retained in addition to minimum generations")
+	fs.DurationVar(&f.PayloadGrace, "snapshotOffloadGCPayloadGrace", snapshotoffload.DefaultPayloadGrace, "minimum age of an unreferenced snapshot payload before marking")
+	fs.DurationVar(&f.MinMarkAge, "snapshotOffloadGCMinMarkAge", snapshotoffload.DefaultMinMarkAge, "minimum delay between marking and reclaiming a snapshot payload")
+	fs.BoolVar(&f.AllowVersionedLifecycle, "snapshotOffloadAllowVersionedWithLifecycle", false, "allow retention in a versioned S3 bucket after confirming noncurrent-version expiration")
 }
 
 type snapshotOffloadStore interface {
@@ -53,15 +53,15 @@ type snapshotOffloadRetention struct {
 	logger   *slog.Logger
 }
 
-func buildSnapshotOffloadRetention(ctx context.Context, offload snapshotOffloadFlags, store snapshotOffloadStore, logger *slog.Logger) (*snapshotOffloadRetention, error) {
-	f := offload.retention
-	if !f.enabled {
+func buildSnapshotOffloadRetention(ctx context.Context, offload Flags, store snapshotOffloadStore, logger *slog.Logger) (*snapshotOffloadRetention, error) {
+	f := offload.Retention
+	if !f.Enabled {
 		return nil, nil
 	}
 	if err := validateSnapshotRetentionConfig(f); err != nil {
 		return nil, err
 	}
-	confirmed := f.claimsComplete
+	confirmed := f.ClaimsComplete
 	verify := func(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return errors.WithStack(err)
@@ -75,28 +75,28 @@ func buildSnapshotOffloadRetention(ctx context.Context, offload snapshotOffloadF
 		return nil, err
 	}
 	gc, err := snapshotoffload.NewGC(snapshotoffload.GCOptions{
-		Store: store, Prefix: strings.TrimSpace(offload.prefix),
+		Store: store, Prefix: strings.TrimSpace(offload.Prefix),
 		Policy: snapshotoffload.RetentionPolicy{
-			MinGenerations: f.minGenerations, MaxAge: f.maxAge,
-			PayloadGrace: f.payloadGrace, MinMarkAge: f.minMarkAge,
+			MinGenerations: f.MinGenerations, MaxAge: f.MaxAge,
+			PayloadGrace: f.PayloadGrace, MinMarkAge: f.MinMarkAge,
 		},
 		VerifyPublishersUseClaims: verify, Logger: logger,
 	})
 	if err != nil {
 		return nil, errors.Wrap(err, "snapshot retention: create GC")
 	}
-	bounded, cancel := context.WithTimeout(ctx, f.timeout)
+	bounded, cancel := context.WithTimeout(ctx, f.Timeout)
 	defer cancel()
 	if err := store.ValidateRetention(bounded); err != nil {
 		return nil, errors.Wrap(err, "snapshot retention: validate bucket policy")
 	}
-	return &snapshotOffloadRetention{gc: gc, interval: f.interval, timeout: f.timeout, logger: logger}, nil
+	return &snapshotOffloadRetention{gc: gc, interval: f.Interval, timeout: f.Timeout, logger: logger}, nil
 }
 
-func validateSnapshotRetentionConfig(f snapshotRetentionFlags) error {
-	if f.interval <= 0 || f.timeout <= 0 ||
-		f.minGenerations < 1 || f.maxAge <= 0 ||
-		f.payloadGrace <= 0 || f.minMarkAge <= 0 {
+func validateSnapshotRetentionConfig(f RetentionFlags) error {
+	if f.Interval <= 0 || f.Timeout <= 0 ||
+		f.MinGenerations < 1 || f.MaxAge <= 0 ||
+		f.PayloadGrace <= 0 || f.MinMarkAge <= 0 {
 		return errors.Wrap(snapshotoffload.ErrInvalidOptions, "snapshot retention intervals, deadlines and policy must be positive")
 	}
 	return nil

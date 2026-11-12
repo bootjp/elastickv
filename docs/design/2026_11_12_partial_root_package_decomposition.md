@@ -66,7 +66,7 @@ internal/noderuntime/           raftGroupRuntime, groupSpec, raft bootstrap/peer
 internal/serverwiring/          (existing) plus TSO wiring, distribution start-up, startup gate, node auth
 internal/leaderbalance/         leader-balance scheduler wiring
 internal/fswiring/              FUSE filesystem start-up and lifecycle
-internal/snapshotoffload/       (existing package) gains the start-up wiring now in main_snapshot_offload*.go
+internal/snapshotoffloadwiring/  snapshot-offload start-up wiring (flags, store, spool cleanup, scheduler and retention workers)
 internal/splitmigration/        split-migration capability gate, clients, membership/ownership wiring
 internal/encryptionwiring/      KEK loading, start-up guards, registration, rotation, fan-out
 internal/clusterbootstrap/      the `elastickv bootstrap ...` operator CLI and runtime
@@ -125,7 +125,7 @@ Tests move with the code they cover.
 - M1: admin bridges moved to `internal/adminbridge`.
 - M4 (partial): the leader-balance scheduler moved to `internal/leaderbalance`
   and FUSE mounting to `internal/fsmount`. Both see the node through narrow
-  inputs (a `Group` interface with `GroupID` / `Engine`, and a resolved
+  inputs (a `Group` interface with `GroupID` / `SnapshotEngine`, and a resolved
   `fsmount.Config`) rather than `*raftGroupRuntime` or flag globals, so
   neither waited for M3.
 - M2: `serverFlags` in `main_flags.go` groups the flags of the
@@ -196,8 +196,16 @@ Tests move with the code they cover.
   `Engine()`: a wrapper method named `Engine` would shadow the promoted
   `Engine` field, and `SnapshotEngine` already reads the engine under the
   lock the same way.
-- Snapshot-offload wiring can now move (M4): its helpers take
-  `snapshotOffloadFlags` instead of reading about twenty flags.
+- M4, snapshot offload: the start-up wiring moved to
+  `internal/snapshotoffloadwiring` (a sibling of the `snapshotoffload`
+  library rather than part of it, so flag and start-up code stays out of
+  the library and clear of its test fakes). It owns `Flags` /
+  `RetentionFlags`, endpoint and spool validation, the TLS-enforcing HTTP
+  client, store construction, stale-spool cleanup and the scheduler and
+  retention workers. `Start` takes `[]snapshotoffload.OffloadGroup` and the
+  build version; `main` keeps only `snapshotOffloadGroups`, which reduces
+  the runtimes to offload groups with their leadership callbacks. The
+  package is restricted to binaries in the import guard.
 
 ## Decisions
 
