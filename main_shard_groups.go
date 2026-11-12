@@ -401,3 +401,11 @@ func buildShardGroupsWithEncryptionWiring(
 	// Stage 7a process-start registration after the shard stores open.
 	return runtimes, shardGroups, encWiring, nil
 }
+
+func (b shardGroupBuilder) bootstrapSpecForGroup(id uint64) (*groupBootstrapSpec, error) {
+	spec := b.bootstrapSpecs[id]
+	if b.bootstrapCfg.PeerConfigDir != "" && (spec == nil || spec.domain == nil) {
+		return nil, errors.New("protected group missing the process-wide bootstrap domain")
+	}
+	return spec, nil
+}

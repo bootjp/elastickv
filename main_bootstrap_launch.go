@@ -81,14 +81,6 @@ func attachBootstrapDomain(specs map[uint64]*groupBootstrapSpec, domain *bootstr
 	return validateBootstrapStartupToken(domain.startupToken, serviceTokenFiles)
 }
 
-func (b shardGroupBuilder) bootstrapSpecForGroup(id uint64) (*groupBootstrapSpec, error) {
-	spec := b.bootstrapSpecs[id]
-	if b.bootstrapCfg.PeerConfigDir != "" && (spec == nil || spec.domain == nil) {
-		return nil, errors.New("protected group missing the process-wide bootstrap domain")
-	}
-	return spec, nil
-}
-
 // loadGroupBootstrapSpec loads group's prepared peer configuration from
 // peerConfigDir (--raftBootstrapPeerConfigDir); empty means the group is not
 // protected.

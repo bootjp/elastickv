@@ -5,21 +5,10 @@ import (
 
 	"github.com/bootjp/elastickv/adapter"
 	internalutil "github.com/bootjp/elastickv/internal"
-	"github.com/bootjp/elastickv/internal/nodeauth"
-	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc"
 )
-
-func resolveNetworkRuntimeInputs(flags *serverFlags) (noderuntime.RuntimeConfig, noderuntime.RaftEngineType, noderuntime.BootstrapConfig, bool, error) {
-	if err := nodeauth.ConfigureGRPCTransport(flags.nodeAuth); err != nil {
-		return noderuntime.RuntimeConfig{}, "", noderuntime.BootstrapConfig{}, false, errors.WithStack(err)
-	}
-	cfg, engineType, bootstrapCfg, bootstrap, err := resolveValidatedRuntimeInputs(flags)
-	bootstrapCfg.ServiceTokenFiles = flags.nodeAuth.ServiceTokenFiles()
-	return cfg, engineType, bootstrapCfg, bootstrap, err
-}
 
 func configureBootstrapNetwork(ctx context.Context, runtimes []*raftGroupRuntime, shards *kv.ShardStore, groups map[uint64]*kv.ShardGroup, cleanup *internalutil.CleanupStack) (*bootstrapNetwork, error) {
 	domain := bootstrapDomainForRuntimes(runtimes)
