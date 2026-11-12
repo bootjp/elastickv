@@ -13,6 +13,7 @@ func TestBootstrapRuntimeFlagIsRegistered(t *testing.T) {
 	require.NotNil(t, f)
 	getter, ok := f.Value.(flag.Getter)
 	require.True(t, ok)
-	require.Equal(t, *raftBootstrapPeerConfigDir, getter.Get())
+	require.Empty(t, getter.Get())
 	require.Empty(t, f.DefValue)
+	require.Empty(t, defaultFlags[raftBootstrapFlags]().peerConfigDir)
 }

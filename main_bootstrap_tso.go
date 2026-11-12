@@ -28,7 +28,7 @@ type tsoBootstrapRecoveryLoader func(context.Context, raftbootstrap.Identity, ui
 // publicMethods belongs to the parent listener; options may carry its at-rest
 // encryption wiring. The ShardGroup never exposes this backing as a data store.
 func buildProtectedDedicatedTSOGroup(
-	raftID string, group groupSpec, baseDir string, multi, bootstrap bool,
+	raftID string, group groupSpec, baseDir string, multi, bootstrap, joinAsLearner bool,
 	bootstrapServers, bootstrapSeed []raftengine.Server, factory raftengine.Factory,
 	clock *kv.HLC, proposalObserver kv.ProposalObserver,
 	spec *groupBootstrapSpec, domain *bootstrapDomain, publicMethods []string,
@@ -64,7 +64,7 @@ func buildProtectedDedicatedTSOGroup(
 	native = native.WithNamespaceRecovery(ownership, protectedTSONamespaceVerifier(dir, spec, sm))
 	protected := &protectedGroupFactory{Factory: native.WithBootstrapStartup(setup), spec: spec}
 	runtime, err := buildRuntimeForGroup(raftID, group, baseDir, multi, bootstrap,
-		bootstrapServers, bootstrapSeed, st, sm, protected, *raftJoinAsLearner)
+		bootstrapServers, bootstrapSeed, st, sm, protected, joinAsLearner)
 	if err != nil {
 		return nil, nil, errors.Join(err, st.Close())
 	}

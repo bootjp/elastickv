@@ -138,23 +138,23 @@ func TestProtectedTSOFactoryNeverAutoMigrates(t *testing.T) {
 	spec, domain, _ := protectedTSOFixture(t, dir)
 	group := groupSpec{id: dedicatedTSORaftGroupID, address: spec.config.local.Address}
 	factory := etcd.NewFactory(etcd.FactoryConfig{})
-	runtime, shard, err := buildProtectedDedicatedTSOGroup("n1", group, base, true, false,
+	runtime, shard, err := buildProtectedDedicatedTSOGroup("n1", group, base, true, false, false,
 		nil, nil, factory, nil, nil, spec, domain, nil)
 	require.ErrorContains(t, err, "explicitly migrated control store")
 	require.Nil(t, runtime)
 	require.Nil(t, shard)
 	require.NoDirExists(t, filepath.Join(dir, dedicatedTSOControlStoreName))
-	_, _, err = buildProtectedDedicatedTSOGroup("n1", group, base, true, false,
+	_, _, err = buildProtectedDedicatedTSOGroup("n1", group, base, true, false, false,
 		nil, nil, factory, nil, nil, nil, domain, nil)
 	require.Error(t, err)
-	_, _, err = buildProtectedDedicatedTSOGroup("n1", group, base, true, false,
+	_, _, err = buildProtectedDedicatedTSOGroup("n1", group, base, true, false, false,
 		nil, nil, factory, nil, nil, spec, nil, nil)
 	require.Error(t, err)
-	_, _, err = buildProtectedDedicatedTSOGroup("n1", group, base, true, false,
+	_, _, err = buildProtectedDedicatedTSOGroup("n1", group, base, true, false, false,
 		nil, nil, nil, nil, nil, spec, domain, nil)
 	require.Error(t, err)
 	servers := []raftengine.Server{{ID: "wrong-node", Address: group.address}}
-	_, _, err = buildProtectedDedicatedTSOGroup("wrong-node", group, base, false, true,
+	_, _, err = buildProtectedDedicatedTSOGroup("wrong-node", group, base, false, true, false,
 		servers, servers, factory, kv.NewHLC(), protectedTSOTestObserver{}, spec, domain,
 		[]string{"/explicit/public/method"}, store.WithSSTIngestSnapshots(true))
 	require.Error(t, err)
@@ -175,7 +175,7 @@ func TestProtectedTSOFactoryRejectsEmptyControlDatabase(t *testing.T) {
 	require.NoError(t, st.Close())
 	factory := etcd.NewFactory(etcd.FactoryConfig{})
 	group := groupSpec{id: dedicatedTSORaftGroupID, address: spec.config.local.Address}
-	_, _, err = buildProtectedDedicatedTSOGroup("n1", group, base, true, false,
+	_, _, err = buildProtectedDedicatedTSOGroup("n1", group, base, true, false, false,
 		nil, nil, factory, nil, nil, spec, domain, nil)
 	require.Error(t, err)
 	// A failed constructor releases the DB lock and never imports scalar state.

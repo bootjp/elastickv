@@ -213,7 +213,7 @@ func bootstrapArtifactNativeFixture(t *testing.T) (bootstrapBaselineCLIRequest, 
 	require.NoError(t, err)
 	base := t.TempDir()
 	runtime, _, err := buildDedicatedTSOGroup("n1", groupSpec{id: dedicatedTSORaftGroupID, address: config.local.Address},
-		base, true, true, nil, nil, etcd.NewFactory(etcd.FactoryConfig{}), kv.NewHLC(), nil)
+		base, true, true, false, nil, nil, etcd.NewFactory(etcd.FactoryConfig{}), kv.NewHLC(), nil)
 	require.NoError(t, err)
 	t.Cleanup(runtime.Close)
 	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)

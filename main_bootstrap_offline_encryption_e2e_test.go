@@ -24,7 +24,6 @@ import (
 
 func newOfflineEncryptedE2EFixture(t *testing.T) (*bootstrapRotationE2EFixture, bootstrapOfflineEncryptionCLI) {
 	t.Helper()
-	require.Empty(t, *raftBootstrapPeerConfigDir)
 	raw, _ := enablementPeerConfig(t)
 	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -130,9 +129,6 @@ func migrateOfflineEncryptedE2E(t *testing.T, f *bootstrapRotationE2EFixture, en
 func TestBootstrapOfflineEncryptionLegacyCiphertextToProtectedRestart(t *testing.T) {
 	t.Setenv("ELASTICKV_RAFT_SNAPSHOT_COUNT", "1")
 	f, _ := newOfflineEncryptedE2EFixture(t)
-	oldDir := *raftBootstrapPeerConfigDir
-	t.Cleanup(func() { *raftBootstrapPeerConfigDir = oldDir })
-	*raftBootstrapPeerConfigDir = f.configDir
 	node := f.protected(t)
 	node.read(t, "encrypted-before-migration", "encrypted-original")
 	policy, err := kv.LoadAppliedBootstrapPolicy(t.Context(), node.runtime.store, f.manifest.Identity, node.runtime.engine.Status().AppliedIndex)

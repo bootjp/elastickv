@@ -1,6 +1,6 @@
 # Root package decomposition
 
-Status: Partial (M1, part of M2 and part of M4 implemented)
+Status: Partial (M1, M2 and part of M4 implemented)
 Author: bootjp
 Date: 2026-11-12
 
@@ -114,7 +114,7 @@ Tests move with the code they cover.
   inputs (a `Group` interface with `GroupID` / `Engine`, and a resolved
   `fsmount.Config`) rather than `*raftGroupRuntime` or flag globals, so
   neither waited for M3.
-- M2 (partial): `serverFlags` in `main_flags.go` groups the flags of the
+- M2: `serverFlags` in `main_flags.go` groups the flags of the
   health listener, FUSE mount, leader balance, TSO and snapshot offload.
   Each area's struct (`filesystemFlags`, `leaderBalanceFlags`, `tsoFlags`,
   `snapshotOffloadFlags` with its nested `snapshotRetentionFlags`)
@@ -155,10 +155,15 @@ Tests move with the code they cover.
   the cross-group ordering rollout gates (`consistencyFlags`:
   `commitTSFence`, `readWatermarkAdvance`). The runtime-input resolvers
   take `*serverFlags`.
-  Still package globals: the Raft bootstrap and join flags
-  (`raftBootstrap`, `raftBootstrapMembers`, `raftGroupPeers`,
-  `raftJoinMembers`, `raftJoinAsLearner`) and the bootstrap peer-config
-  dir, which the protected-bootstrap e2e fixtures still overwrite.
+  Part 7 adds the bootstrap and join flags (`raftBootstrapFlags`:
+  `raftBootstrap`, `raftBootstrapMembers`, `raftGroupPeers`,
+  `raftJoinMembers`, `raftJoinAsLearner`, `raftBootstrapPeerConfigDir`).
+  The peer-config dir and learner expectation travel in
+  `raftBootstrapConfig` to protected-domain loading and the shard-group
+  builder, including the dedicated TSO group. The protected-bootstrap e2e
+  fixtures pass the dir instead of overwriting a process global.
+  With part 7 the root package registers no flag as a package global:
+  every server flag hangs off `serverFlags`, and M2 is complete.
 - Snapshot-offload wiring can now move (M4): its helpers take
   `snapshotOffloadFlags` instead of reading about twenty flags.
 

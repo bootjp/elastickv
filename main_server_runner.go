@@ -80,6 +80,9 @@ type serversInput struct {
 	// nodeAddress is this node's --address.
 	nodeAddress string
 	consistency consistencyFlags
+	// raftJoining is set when the node joins an existing cluster through
+	// --raftJoinMembers.
+	raftJoining bool
 }
 
 // startServersAfterStartupRotation wires up the AdminServer, starts the
@@ -184,7 +187,7 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 		in.ctx,
 		in.runtimes,
 		in.raftID,
-		strings.TrimSpace(*raftJoinMembers) != "",
+		in.raftJoining,
 		runner.preparePublicServices,
 	); err != nil {
 		return runner.startupFailure(err)

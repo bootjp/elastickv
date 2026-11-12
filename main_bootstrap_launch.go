@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	stderrors "errors"
-	"flag"
 	"fmt"
 	"path/filepath"
 
@@ -16,9 +15,6 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-// This opt-in requires explicit accepted-baseline preparation for every group.
-var raftBootstrapPeerConfigDir = flag.String("raftBootstrapPeerConfigDir", "", "Directory of prepared protected Raft group peer configurations")
-
 type groupBootstrapSpec struct {
 	config *bootstrapPeerConfig
 	files  *raftbootstrap.Store
@@ -27,13 +23,13 @@ type groupBootstrapSpec struct {
 	domain *bootstrapDomain
 }
 
-func validateProtectedBootstrapDomain(raftID, baseDir string, groups []groupSpec, multi bool) error {
-	if *raftBootstrapPeerConfigDir == "" {
+func validateProtectedBootstrapDomain(raftID, baseDir string, groups []groupSpec, multi bool, peerConfigDir string) error {
+	if peerConfigDir == "" {
 		return nil
 	}
 	var cluster raftbootstrap.UUID
 	for _, group := range groups {
-		spec, err := loadGroupBootstrapSpec(raftID, group, groupDataDir(baseDir, raftID, group.id, multi))
+		spec, err := loadGroupBootstrapSpec(raftID, group, groupDataDir(baseDir, raftID, group.id, multi), peerConfigDir)
 		if err != nil {
 			return err
 		}
@@ -46,16 +42,16 @@ func validateProtectedBootstrapDomain(raftID, baseDir string, groups []groupSpec
 }
 
 func loadProtectedBootstrapDomain(raftID, baseDir string, groups []groupSpec, multi bool, bootstrapCfg raftBootstrapConfig, encWiring ...encryptionWriteWiring) (map[uint64]*groupBootstrapSpec, *bootstrapDomain, error) {
-	if *raftBootstrapPeerConfigDir == "" {
+	if bootstrapCfg.peerConfigDir == "" {
 		return nil, nil, nil
 	}
-	if err := validateProtectedBootstrapDomain(raftID, baseDir, groups, multi); err != nil {
+	if err := validateProtectedBootstrapDomain(raftID, baseDir, groups, multi, bootstrapCfg.peerConfigDir); err != nil {
 		return nil, nil, err
 	}
 	specs := make(map[uint64]*groupBootstrapSpec, len(groups))
 	var cluster raftbootstrap.UUID
 	for _, group := range groups {
-		spec, err := loadGroupBootstrapSpec(raftID, group, groupDataDir(baseDir, raftID, group.id, multi))
+		spec, err := loadGroupBootstrapSpec(raftID, group, groupDataDir(baseDir, raftID, group.id, multi), bootstrapCfg.peerConfigDir)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -85,17 +81,20 @@ func attachBootstrapDomain(specs map[uint64]*groupBootstrapSpec, domain *bootstr
 
 func (b shardGroupBuilder) bootstrapSpecForGroup(id uint64) (*groupBootstrapSpec, error) {
 	spec := b.bootstrapSpecs[id]
-	if *raftBootstrapPeerConfigDir != "" && (spec == nil || spec.domain == nil) {
+	if b.bootstrapCfg.peerConfigDir != "" && (spec == nil || spec.domain == nil) {
 		return nil, errors.New("protected group missing the process-wide bootstrap domain")
 	}
 	return spec, nil
 }
 
-func loadGroupBootstrapSpec(raftID string, group groupSpec, dir string) (*groupBootstrapSpec, error) {
-	if *raftBootstrapPeerConfigDir == "" {
+// loadGroupBootstrapSpec loads group's prepared peer configuration from
+// peerConfigDir (--raftBootstrapPeerConfigDir); empty means the group is not
+// protected.
+func loadGroupBootstrapSpec(raftID string, group groupSpec, dir, peerConfigDir string) (*groupBootstrapSpec, error) {
+	if peerConfigDir == "" {
 		return nil, nil
 	}
-	config, err := loadBootstrapPeerConfig(filepath.Join(*raftBootstrapPeerConfigDir, fmt.Sprintf("group-%d.json", group.id)))
+	config, err := loadBootstrapPeerConfig(filepath.Join(peerConfigDir, fmt.Sprintf("group-%d.json", group.id)))
 	if err != nil {
 		return nil, err
 	}

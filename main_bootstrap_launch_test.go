@@ -12,15 +12,14 @@ import (
 )
 
 func TestProtectedBootstrapLaunchRequiresExactDurableFormat(t *testing.T) {
-	old := *raftBootstrapPeerConfigDir
-	t.Cleanup(func() { *raftBootstrapPeerConfigDir = old })
-	*raftBootstrapPeerConfigDir = t.TempDir()
+	t.Parallel()
+	peerConfigDir := t.TempDir()
 	raw := bootstrapConfigFixture(t)
 	raw.Local = etcd.DeriveNodeID("n1")
 	raw.Members[0].ID = raw.Local
 	encoded, err := json.Marshal(raw)
 	require.NoError(t, err)
-	require.NoError(t, os.WriteFile(filepath.Join(*raftBootstrapPeerConfigDir, "group-1.json"), encoded, 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(peerConfigDir, "group-1.json"), encoded, 0600))
 	config, err := buildBootstrapPeerConfig(raw)
 	require.NoError(t, err)
 	dir := t.TempDir()
@@ -33,11 +32,11 @@ func TestProtectedBootstrapLaunchRequiresExactDurableFormat(t *testing.T) {
 	digest, err := raftbootstrap.ConfigurationDigest(intent.Baseline)
 	require.NoError(t, err)
 	group := groupSpec{id: 1, address: config.local.Address}
-	_, err = loadGroupBootstrapSpec("n1", group, dir)
+	_, err = loadGroupBootstrapSpec("n1", group, dir, peerConfigDir)
 	require.Error(t, err)
 	policy := raftbootstrap.Policy{Identity: identity, BaselineDigest: digest, Minimum: intent.Minimum, Floor: intent.Floor}
 	require.NoError(t, files.Publish(intent, raftbootstrap.Evidence{Identity: &identity, BaselineDigest: &digest, RaftState: raftbootstrap.Intact, Policy: &policy}))
-	spec, err := loadGroupBootstrapSpec("n1", group, dir)
+	spec, err := loadGroupBootstrapSpec("n1", group, dir, peerConfigDir)
 	require.NoError(t, err)
 	factory, err := bootstrapFactoryForGroup(etcd.NewFactory(etcd.FactoryConfig{}), spec, nil)
 	require.NoError(t, err)
@@ -64,14 +63,13 @@ func TestProtectedRuntimeReadinessRemainsRevocable(t *testing.T) {
 }
 
 func TestProtectedDomainRejectsIncompleteConfigurationBeforeCreatingState(t *testing.T) {
-	old := *raftBootstrapPeerConfigDir
-	t.Cleanup(func() { *raftBootstrapPeerConfigDir = old })
-	*raftBootstrapPeerConfigDir = t.TempDir()
+	t.Parallel()
+	peerConfigDir := t.TempDir()
 	base := t.TempDir()
-	err := validateProtectedBootstrapDomain("n1", base, []groupSpec{{id: 1, address: "localhost:50051"}}, true)
+	err := validateProtectedBootstrapDomain("n1", base, []groupSpec{{id: 1, address: "localhost:50051"}}, true, peerConfigDir)
 	require.Error(t, err)
 	require.NoDirExists(t, groupDataDir(base, "n1", 1, true))
-	err = validateProtectedBootstrapDomain("n1", base, []groupSpec{{id: dedicatedTSORaftGroupID}}, true)
+	err = validateProtectedBootstrapDomain("n1", base, []groupSpec{{id: dedicatedTSORaftGroupID}}, true, peerConfigDir)
 	require.Error(t, err, "a missing group-zero configuration must not fall back to legacy startup")
 	require.NoDirExists(t, groupDataDir(base, "n1", dedicatedTSORaftGroupID, true))
 }

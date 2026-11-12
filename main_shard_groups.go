@@ -177,15 +177,15 @@ func (b shardGroupBuilder) build(group groupSpec) (*raftGroupRuntime, *kv.ShardG
 	observer := observerForGroup(b.proposalObserverForGroup, group.id)
 	if group.id == dedicatedTSORaftGroupID {
 		if spec := b.bootstrapSpecs[group.id]; spec != nil {
-			return buildProtectedDedicatedTSOGroup(b.raftID, group, b.raftDir, b.multi, groupBootstrap,
+			return buildProtectedDedicatedTSOGroup(b.raftID, group, b.raftDir, b.multi, groupBootstrap, b.bootstrapCfg.joinAsLearner,
 				groupBootstrapServers, groupBootstrapSeed, b.factory, b.clock, observer,
 				spec, spec.domain, bootstrapPublicGRPCMethods(), b.encWiring.pebbleOptions()...)
 		}
-		if *raftBootstrapPeerConfigDir != "" {
+		if b.bootstrapCfg.peerConfigDir != "" {
 			return nil, nil, errors.New("protected timestamp group missing bootstrap domain configuration")
 		}
 		runtime, sg, err := buildDedicatedTSOGroup(
-			b.raftID, group, b.raftDir, b.multi, groupBootstrap,
+			b.raftID, group, b.raftDir, b.multi, groupBootstrap, b.bootstrapCfg.joinAsLearner,
 			groupBootstrapServers, groupBootstrapSeed,
 			b.factory, b.clock, observer,
 		)
@@ -233,7 +233,7 @@ func (b shardGroupBuilder) buildDataGroup(
 	runtime, err := buildRuntimeForGroup(
 		b.raftID, group, b.raftDir, b.multi, bootstrap,
 		bootstrapServers, bootstrapSeed,
-		st, sm, factory, *raftJoinAsLearner,
+		st, sm, factory, b.bootstrapCfg.joinAsLearner,
 	)
 	if err != nil {
 		_ = st.Close()
@@ -276,6 +276,7 @@ func buildDedicatedTSOGroup(
 	baseDir string,
 	multi bool,
 	bootstrap bool,
+	joinAsLearner bool,
 	bootstrapServers []raftengine.Server,
 	bootstrapSeed []raftengine.Server,
 	factory raftengine.Factory,
@@ -286,7 +287,7 @@ func buildDedicatedTSOGroup(
 	runtime, err := buildRuntimeForGroup(
 		raftID, group, baseDir, multi, bootstrap,
 		bootstrapServers, bootstrapSeed,
-		nil, sm, factory, *raftJoinAsLearner,
+		nil, sm, factory, joinAsLearner,
 	)
 	if err != nil {
 		return nil, nil, err
