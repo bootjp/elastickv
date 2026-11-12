@@ -6,6 +6,7 @@ import (
 
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftadmin"
+	"github.com/bootjp/elastickv/internal/splitmigration"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -20,13 +21,13 @@ func TestMigrationMembershipWiringKeepsEnvelopeProposerAndTSOIsolation(t *testin
 	proposer := &capabilityConfigEngine{}
 	runtime := &raftGroupRuntime{GroupRuntime: &noderuntime.GroupRuntime{Store: store.NewMVCCStore(), Engine: capabilityConfigEngine{}}}
 	runtime.Spec.ID = 7
-	gate, ok := migrationMembershipInterceptor(runtime, nil, proposer, t.Name(), nil).(*migrationNamespaceMembershipGate)
+	gate, ok := migrationMembershipInterceptor(runtime, nil, proposer, t.Name(), nil).(*splitmigration.NamespaceMembershipGate)
 	require.True(t, ok)
-	require.Same(t, proposer, gate.proposer, "namespace prejoin must use the envelope-aware proposer passed by main")
-	_, ok = gate.next.(*migrationMembershipGate)
+	require.Same(t, proposer, gate.Proposer, "namespace prejoin must use the envelope-aware proposer passed by main")
+	_, ok = gate.Next.(*splitmigration.MembershipGate)
 	require.True(t, ok)
 	runtime.Spec.ID = 0
-	_, namespace := migrationMembershipInterceptor(runtime, nil, proposer, t.Name(), nil).(*migrationNamespaceMembershipGate)
+	_, namespace := migrationMembershipInterceptor(runtime, nil, proposer, t.Name(), nil).(*splitmigration.NamespaceMembershipGate)
 	require.False(t, namespace, "TSO must not require a KV namespace or KV capability")
 	_, prepare := migrationMembershipInterceptor(runtime, nil, proposer, t.Name(), nil).(*prepareEvidenceMembershipGate)
 	require.True(t, prepare, "existing TSO membership safety hooks must remain installed")
@@ -43,11 +44,11 @@ func TestMigrationCoverageGateAllowsOnlyTypedNamespaceBootstrap(t *testing.T) {
 	require.NoError(t, err)
 	info := &grpc.UnaryServerInfo{FullMethod: pb.Internal_CleanupMigration_FullMethodName}
 	called := false
-	_, err = migrationCoverageUnaryGate(t.Context(), request, info, func(context.Context, any) (any, error) { called = true; return nil, nil }, migrationAuth.splitMigrationLocalReadinessGate)
+	_, err = splitmigration.CoverageUnaryGate(t.Context(), request, info, func(context.Context, any) (any, error) { called = true; return nil, nil }, migrationAuth.splitMigrationLocalReadinessGate)
 	require.NoError(t, err)
 	require.True(t, called)
 	request.NamespaceAdmission = []byte("invalid")
-	_, err = migrationCoverageUnaryGate(t.Context(), request, info, func(context.Context, any) (any, error) {
+	_, err = splitmigration.CoverageUnaryGate(t.Context(), request, info, func(context.Context, any) (any, error) {
 		t.Fatal("malformed bootstrap reached the handler")
 		return nil, nil
 	}, migrationAuth.splitMigrationLocalReadinessGate)

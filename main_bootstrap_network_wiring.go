@@ -5,6 +5,7 @@ import (
 
 	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/bootjp/elastickv/internal/noderuntime"
+	"github.com/bootjp/elastickv/internal/splitmigration"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc"
@@ -96,19 +97,6 @@ func bootstrapRuntimeDialOptions(runtimes []*raftGroupRuntime) kv.GRPCDialOption
 	return nil
 }
 
-func newBootstrapOrdinaryClient(address string, providers ...kv.GRPCDialOptionsForAddress) (*grpc.ClientConn, error) {
-	options := internalutil.GRPCDialOptions()
-	if len(providers) != 0 && providers[0] != nil {
-		var err error
-		options, err = providers[0](address)
-		if err != nil {
-			return nil, err
-		}
-	}
-	conn, err := grpc.NewClient(address, options...)
-	return conn, errors.WithStack(err)
-}
-
 func bootstrapTSORoutingOptions(networks []*bootstrapNetwork) []kv.LeaderRoutedTSOAllocatorOption {
 	if len(networks) == 0 || networks[0] == nil {
 		return nil
@@ -117,9 +105,9 @@ func bootstrapTSORoutingOptions(networks []*bootstrapNetwork) []kv.LeaderRoutedT
 	return []kv.LeaderRoutedTSOAllocatorOption{kv.WithTSOInternalGRPCDialOptions(network.DialOptions), kv.WithTSOStartupControlRPC(network.startup)}
 }
 
-func bootstrapSplitMigrationProbe(runtimes []*raftGroupRuntime) splitMigrationCapabilityProbe {
+func bootstrapSplitMigrationProbe(runtimes []*raftGroupRuntime) splitmigration.CapabilityProbe {
 	provider := bootstrapRuntimeDialOptions(runtimes)
 	return func(ctx context.Context, address string) error {
-		return probeSplitMigrationCapabilityPeerWithDial(ctx, address, provider)
+		return splitmigration.ProbeCapabilityPeerWithDial(ctx, address, provider)
 	}
 }

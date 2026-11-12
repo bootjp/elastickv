@@ -9,6 +9,7 @@ import (
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/internal/splitmigration"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -20,20 +21,6 @@ import (
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 )
-
-type migrationProviderConfigEngine struct{ capabilityConfigEngine }
-
-func (migrationProviderConfigEngine) AppliedConfigurationIndex() (uint64, bool) { return 0, false }
-
-type migrationReadinessConfigurationOverride struct {
-	raftengine.Engine
-	index     uint64
-	supported bool
-}
-
-func (e migrationReadinessConfigurationOverride) AppliedConfigurationIndex() (uint64, bool) {
-	return e.index, e.supported
-}
 
 // enableMigrationRuntimeFlags turns on the migration opcodes for the test
 // and returns node auth with peer-auth enforcement complete.
@@ -49,7 +36,7 @@ func TestMigrationOwnershipProviderWiringRequiresAppliedConfiguration(t *testing
 	migrationAuth := enableMigrationRuntimeFlags(t)
 	st := store.NewMVCCStore()
 	engine := migrationProviderConfigEngine{}
-	tx := newInternalMigrationTransaction(engine, nil, st, 7)
+	tx := splitmigration.NewInternalTransaction(engine, nil, st, 7)
 	t.Cleanup(tx.Close)
 	groups := map[uint64]*kv.ShardGroup{7: {Engine: engine, Store: st, Txn: tx}}
 	routes := distribution.NewEngine()
@@ -57,18 +44,18 @@ func TestMigrationOwnershipProviderWiringRequiresAppliedConfiguration(t *testing
 	var cache kv.GRPCConnCache
 	t.Cleanup(func() { require.NoError(t, cache.Close()) })
 	server := adapter.NewDistributionServer(routes, nil,
-		adapter.WithSplitMigrationGroupClientFactory(splitMigrationGroupClientFactory(splitMigrationGroupLeaderResolver(groups), &cache, t.Name())),
-		adapter.WithSplitMigrationVoterFactory(splitMigrationVoterFactory(groups, &cache, t.Name())),
+		adapter.WithSplitMigrationGroupClientFactory(splitmigration.GroupClientFactory(splitmigration.GroupLeaderResolver(groups), &cache, t.Name())),
+		adapter.WithSplitMigrationVoterFactory(splitmigration.VoterFactory(groups, &cache, t.Name())),
 		migrationOwnershipRefreshOption(groups, &raftGroupRuntime{GroupRuntime: &noderuntime.GroupRuntime{Engine: engine}}, &cache, t.Name(), true),
-		migrationPartitionRuntimeOption(shards, groups, &cache, t.Name(), true))
+		splitmigration.PartitionRuntimeOption(shards, groups, &cache, t.Name(), true))
 	require.True(t, kv.MigrationRequestAdmissionReady(tx))
 	require.True(t, shards.MigrationReadAdmissionReady(7))
 	require.True(t, server.MigrationOwnershipRefreshConfigured(7))
-	require.True(t, migrationOwnershipRuntimeHooksInstalled(tx, shards, server, 7))
-	require.False(t, migrationOwnershipRuntimeReady(tx, shards, server, 7, engine, migrationAuth.splitMigrationLocalReadinessGate), "installed hooks alone do not prove an applied configuration")
+	require.True(t, splitmigration.OwnershipRuntimeHooksInstalled(tx, shards, server, 7))
+	require.False(t, splitmigration.OwnershipRuntimeReady(tx, shards, server, 7, engine, migrationAuth.splitMigrationLocalReadinessGate), "installed hooks alone do not prove an applied configuration")
 	internal := adapter.NewInternalWithEngine(tx, engine, nil, nil, adapter.WithInternalStore(st),
 		adapter.WithInternalMigrationOwnershipReady(func() bool {
-			return migrationOwnershipRuntimeReady(tx, shards, server, 7, engine, migrationAuth.splitMigrationLocalReadinessGate)
+			return splitmigration.OwnershipRuntimeReady(tx, shards, server, 7, engine, migrationAuth.splitMigrationLocalReadinessGate)
 		}))
 	resp, err := internal.ProbeMigrationState(t.Context(), &pb.ProbeMigrationStateRequest{JobId: 7,
 		Kind: pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_OWNERSHIP_CAPABILITY})
@@ -76,10 +63,10 @@ func TestMigrationOwnershipProviderWiringRequiresAppliedConfiguration(t *testing
 	require.False(t, resp.GetReady())
 	legacy := kv.NewTransactionWithProposer(engine)
 	t.Cleanup(legacy.Close)
-	require.False(t, migrationOwnershipRuntimeHooksInstalled(legacy, shards, server, 7))
-	require.False(t, migrationOwnershipRuntimeHooksInstalled(tx, nil, server, 7))
-	require.False(t, migrationOwnershipRuntimeHooksInstalled(tx, shards, nil, 7))
-	zero := newInternalMigrationTransaction(engine, nil, st, 0)
+	require.False(t, splitmigration.OwnershipRuntimeHooksInstalled(legacy, shards, server, 7))
+	require.False(t, splitmigration.OwnershipRuntimeHooksInstalled(tx, nil, server, 7))
+	require.False(t, splitmigration.OwnershipRuntimeHooksInstalled(tx, shards, nil, 7))
+	zero := splitmigration.NewInternalTransaction(engine, nil, st, 0)
 	t.Cleanup(zero.Close)
 	require.False(t, kv.MigrationRequestAdmissionReady(zero))
 }
@@ -94,12 +81,12 @@ func TestMigrationDisabledFlagsCloseLegacyCapabilityAndRunners(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, resp.GetMigrationCapable())
 	require.NotContains(t, resp.GetCapabilities(), adapter.SplitMigrationCapabilityV2)
-	for _, start := range []func(context.Context, *errgroup.Group, *adapter.DistributionServer, migrationReadinessGate){startDistributionSplitJobRunner, startMigrationOwnershipRefresh} {
+	for _, start := range []func(context.Context, *errgroup.Group, *adapter.DistributionServer, splitmigration.ReadinessGate){startDistributionSplitJobRunner, splitmigration.StartOwnershipRefresh} {
 		assertMigrationCoverageRunnerNotStarted(t, start, server, migrationAuth.splitMigrationLocalReadinessGate)
 	}
 }
 
-func assertMigrationCoverageRunnerNotStarted(t *testing.T, start func(context.Context, *errgroup.Group, *adapter.DistributionServer, migrationReadinessGate), server *adapter.DistributionServer, ready migrationReadinessGate) {
+func assertMigrationCoverageRunnerNotStarted(t *testing.T, start func(context.Context, *errgroup.Group, *adapter.DistributionServer, splitmigration.ReadinessGate), server *adapter.DistributionServer, ready splitmigration.ReadinessGate) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -125,7 +112,7 @@ func TestMigrationCoverageRPCGateLeavesOrdinaryAndResolutionPathsAvailable(t *te
 		pb.Internal_ApplyTargetStagedReadiness_FullMethodName, pb.Internal_ImportRangeVersions_FullMethodName,
 		pb.Internal_PromoteStagedVersions_FullMethodName, pb.Internal_CleanupMigration_FullMethodName, pb.Internal_IssueMigrationTimestamp_FullMethodName,
 	} {
-		_, err := migrationCoverageUnaryGate(t.Context(), nil, &grpc.UnaryServerInfo{FullMethod: method}, func(context.Context, any) (any, error) {
+		_, err := splitmigration.CoverageUnaryGate(t.Context(), nil, &grpc.UnaryServerInfo{FullMethod: method}, func(context.Context, any) (any, error) {
 			t.Fatal("disabled migration reached its handler")
 			return nil, nil
 		}, migrationAuth.splitMigrationLocalReadinessGate)
@@ -135,7 +122,7 @@ func TestMigrationCoverageRPCGateLeavesOrdinaryAndResolutionPathsAvailable(t *te
 		pb.Distribution_SplitRange_FullMethodName, pb.Distribution_ListRoutes_FullMethodName, pb.Distribution_AttestMigrationOwnership_FullMethodName,
 		pb.RawKV_RawPut_FullMethodName} {
 		called := false
-		_, err := migrationCoverageUnaryGate(t.Context(), nil, &grpc.UnaryServerInfo{FullMethod: method}, func(context.Context, any) (any, error) {
+		_, err := splitmigration.CoverageUnaryGate(t.Context(), nil, &grpc.UnaryServerInfo{FullMethod: method}, func(context.Context, any) (any, error) {
 			called = true
 			return nil, nil
 		}, migrationAuth.splitMigrationLocalReadinessGate)
@@ -152,7 +139,7 @@ func TestMigrationCoverageRPCGateUsesLocalFlags(t *testing.T) {
 		pb.Internal_PromoteStagedVersions_FullMethodName, pb.Internal_CleanupMigration_FullMethodName, pb.Internal_IssueMigrationTimestamp_FullMethodName,
 	} {
 		called := false
-		_, err := migrationCoverageUnaryGate(t.Context(), nil, &grpc.UnaryServerInfo{FullMethod: method}, func(context.Context, any) (any, error) {
+		_, err := splitmigration.CoverageUnaryGate(t.Context(), nil, &grpc.UnaryServerInfo{FullMethod: method}, func(context.Context, any) (any, error) {
 			called = true
 			return nil, nil
 		}, migrationAuth.splitMigrationLocalReadinessGate)
@@ -166,7 +153,7 @@ func TestMigrationOwnershipRuntimeRequiresInstalledHooksFlagsAndAppliedConfigura
 	st := store.NewMVCCStore()
 	node := newOwnershipRefreshRaftNode(t, "readiness", 7, st, t.Name(), migrationAuth.splitMigrationLocalReadinessGate)
 	engine := node.group.Engine
-	tx := newInternalMigrationTransaction(engine, nil, st, 7)
+	tx := splitmigration.NewInternalTransaction(engine, nil, st, 7)
 	t.Cleanup(tx.Close)
 	node.group.Txn = tx
 	groups := map[uint64]*kv.ShardGroup{7: node.group}
@@ -175,19 +162,19 @@ func TestMigrationOwnershipRuntimeRequiresInstalledHooksFlagsAndAppliedConfigura
 	var cache kv.GRPCConnCache
 	t.Cleanup(func() { require.NoError(t, cache.Close()) })
 	server := adapter.NewDistributionServer(routes, nil,
-		adapter.WithSplitMigrationGroupClientFactory(splitMigrationGroupClientFactory(splitMigrationGroupLeaderResolver(groups), &cache, t.Name())),
-		adapter.WithSplitMigrationVoterFactory(splitMigrationVoterFactory(groups, &cache, t.Name())),
+		adapter.WithSplitMigrationGroupClientFactory(splitmigration.GroupClientFactory(splitmigration.GroupLeaderResolver(groups), &cache, t.Name())),
+		adapter.WithSplitMigrationVoterFactory(splitmigration.VoterFactory(groups, &cache, t.Name())),
 		migrationOwnershipRefreshOption(groups, &raftGroupRuntime{GroupRuntime: &noderuntime.GroupRuntime{Engine: engine}}, &cache, t.Name(), true),
-		migrationPartitionRuntimeOption(shards, groups, &cache, t.Name(), true))
+		splitmigration.PartitionRuntimeOption(shards, groups, &cache, t.Name(), true))
 	reader, ok := engine.(raftengine.AppliedConfigurationReader)
 	require.True(t, ok)
 	index, supported := reader.AppliedConfigurationIndex()
 	require.True(t, supported)
 	require.NotZero(t, index)
-	require.True(t, migrationOwnershipRuntimeReady(tx, shards, server, 7, engine, migrationAuth.splitMigrationLocalReadinessGate))
+	require.True(t, splitmigration.OwnershipRuntimeReady(tx, shards, server, 7, engine, migrationAuth.splitMigrationLocalReadinessGate))
 	internal := adapter.NewInternalWithEngine(tx, engine, nil, nil, adapter.WithInternalStore(st),
 		adapter.WithInternalMigrationOwnershipReady(func() bool {
-			return migrationOwnershipRuntimeReady(tx, shards, server, 7, engine, migrationAuth.splitMigrationLocalReadinessGate)
+			return splitmigration.OwnershipRuntimeReady(tx, shards, server, 7, engine, migrationAuth.splitMigrationLocalReadinessGate)
 		}))
 	probe, err := internal.ProbeMigrationState(t.Context(), &pb.ProbeMigrationStateRequest{JobId: 1,
 		Kind:                      pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_OWNERSHIP_CAPABILITY,
@@ -195,17 +182,17 @@ func TestMigrationOwnershipRuntimeRequiresInstalledHooksFlagsAndAppliedConfigura
 	require.NoError(t, err)
 	require.True(t, probe.GetReady())
 	require.Equal(t, index, probe.GetAppliedConfigurationIndex())
-	require.False(t, migrationOwnershipRuntimeReady(tx, nil, server, 7, engine, migrationAuth.splitMigrationLocalReadinessGate))
-	require.False(t, migrationOwnershipRuntimeReady(tx, shards, nil, 7, engine, migrationAuth.splitMigrationLocalReadinessGate))
-	require.False(t, migrationOwnershipRuntimeReady(tx, shards, server, 0, engine, migrationAuth.splitMigrationLocalReadinessGate))
+	require.False(t, splitmigration.OwnershipRuntimeReady(tx, nil, server, 7, engine, migrationAuth.splitMigrationLocalReadinessGate))
+	require.False(t, splitmigration.OwnershipRuntimeReady(tx, shards, nil, 7, engine, migrationAuth.splitMigrationLocalReadinessGate))
+	require.False(t, splitmigration.OwnershipRuntimeReady(tx, shards, server, 0, engine, migrationAuth.splitMigrationLocalReadinessGate))
 	for _, missing := range []raftengine.Engine{nil, capabilityConfigEngine{}, migrationProviderConfigEngine{},
 		migrationReadinessConfigurationOverride{Engine: engine, supported: true},
 		migrationReadinessConfigurationOverride{Engine: engine, index: index}} {
-		require.False(t, migrationOwnershipRuntimeReady(tx, shards, server, 7, missing, migrationAuth.splitMigrationLocalReadinessGate))
+		require.False(t, splitmigration.OwnershipRuntimeReady(tx, shards, server, 7, missing, migrationAuth.splitMigrationLocalReadinessGate))
 	}
 	legacy := kv.NewTransactionWithProposer(engine)
 	t.Cleanup(legacy.Close)
-	require.False(t, migrationOwnershipRuntimeReady(legacy, shards, server, 7, engine, migrationAuth.splitMigrationLocalReadinessGate))
+	require.False(t, splitmigration.OwnershipRuntimeReady(legacy, shards, server, 7, engine, migrationAuth.splitMigrationLocalReadinessGate))
 	assertMigrationRuntimeFlagsRequired(t, tx, shards, server, engine, &migrationAuth)
 }
 
@@ -214,8 +201,8 @@ func assertMigrationRuntimeFlagsRequired(t *testing.T, tx kv.Transactional, shar
 	for _, env := range []string{adapter.MigrationImportOpcodeEnv, adapter.MigrationPromoteOpcodeEnv, adapter.MigrationCleanupOpcodeEnv} {
 		t.Run(env, func(t *testing.T) {
 			t.Setenv(env, "false")
-			require.False(t, migrationOwnershipRuntimeReady(tx, shards, server, 7, engine, migrationAuth.splitMigrationLocalReadinessGate))
-			_, err := migrationCoverageUnaryGate(t.Context(), nil, &grpc.UnaryServerInfo{FullMethod: pb.Internal_ImportRangeVersions_FullMethodName},
+			require.False(t, splitmigration.OwnershipRuntimeReady(tx, shards, server, 7, engine, migrationAuth.splitMigrationLocalReadinessGate))
+			_, err := splitmigration.CoverageUnaryGate(t.Context(), nil, &grpc.UnaryServerInfo{FullMethod: pb.Internal_ImportRangeVersions_FullMethodName},
 				func(context.Context, any) (any, error) {
 					t.Fatal("disabled flags reached mutation handler")
 					return nil, nil
@@ -224,7 +211,7 @@ func assertMigrationRuntimeFlagsRequired(t *testing.T, tx kv.Transactional, shar
 		})
 	}
 	migrationAuth.splitMigrationPeerAuthEnforced = false
-	require.False(t, migrationOwnershipRuntimeReady(tx, shards, server, 7, engine, migrationAuth.splitMigrationLocalReadinessGate))
+	require.False(t, splitmigration.OwnershipRuntimeReady(tx, shards, server, 7, engine, migrationAuth.splitMigrationLocalReadinessGate))
 	migrationAuth.splitMigrationPeerAuthEnforced = true
 }
 
@@ -244,7 +231,7 @@ func TestMigrationCoverageEnabledFlagsRetainRPCAuthenticationAndNamespaceGuards(
 	auth, _ := adapter.SplitMigrationTokenAuth(t.Name(), false, true)
 	info := &grpc.UnaryServerInfo{FullMethod: pb.Internal_ImportRangeVersions_FullMethodName}
 	handler := func(ctx context.Context, req any) (any, error) {
-		return migrationCoverageUnaryGate(ctx, req, info, func(ctx context.Context, _ any) (any, error) {
+		return splitmigration.CoverageUnaryGate(ctx, req, info, func(ctx context.Context, _ any) (any, error) {
 			return internal.ImportRangeVersions(ctx, request)
 		}, migrationAuth.splitMigrationLocalReadinessGate)
 	}

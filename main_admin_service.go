@@ -11,6 +11,7 @@ import (
 	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/bootjp/elastickv/internal/admin"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/internal/splitmigration"
 	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
@@ -156,7 +157,7 @@ type adminGRPCInterceptors struct {
 	s3BlobFetchEnabled bool
 	// migrationReady is the split-migration readiness gate the raft gRPC
 	// servers apply to migration RPCs and to ownership readiness.
-	migrationReady migrationReadinessGate
+	migrationReady splitmigration.ReadinessGate
 }
 
 func (a adminGRPCInterceptors) empty() bool {

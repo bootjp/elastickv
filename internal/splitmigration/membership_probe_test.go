@@ -1,4 +1,4 @@
-package main
+package splitmigration
 
 import (
 	"context"
@@ -51,7 +51,7 @@ func TestMigrationMemberProtocolProbeAcceptsFreshLearnerNotLegacyEcho(t *testing
 					TransferSizeGuardVersion: test.transfer, OwnershipPartitionProtocol: test.partition,
 				}})
 			})
-			probe := newMigrationMemberProtocolProbe("")
+			probe := NewMemberProtocolProbe("")
 			err := probe(t.Context(), address)
 			require.Equal(t, test.want, status.Code(err), "%v", err)
 		})
@@ -63,7 +63,7 @@ func TestMigrationMemberProtocolProbeDoesNotBypassMissingRPCOrCancellation(t *te
 	address := grpctest.Serve(t, func(server *grpc.Server) {
 		pb.RegisterInternalServer(server, &pb.UnimplementedInternalServer{})
 	})
-	probe := newMigrationMemberProtocolProbe("")
+	probe := NewMemberProtocolProbe("")
 	require.Equal(t, codes.Unimplemented, status.Code(probe(t.Context(), address)))
 	require.Equal(t, codes.FailedPrecondition, status.Code(probe(t.Context(), " ")))
 	ctx, cancel := context.WithCancel(t.Context())
@@ -91,8 +91,8 @@ func TestMigrationMemberProtocolProbeUsesDedicatedTLSCredential(t *testing.T) {
 		return handler(ctx, req)
 	}))
 	ctx := metadata.NewOutgoingContext(t.Context(), metadata.Pairs("authorization", "Bearer stale", "trace-id", "preserved"))
-	require.NoError(t, newMigrationMemberProtocolProbe("migration-secret")(ctx, address))
-	require.Equal(t, codes.Unauthenticated, status.Code(newMigrationMemberProtocolProbe("wrong-token")(ctx, address)))
+	require.NoError(t, NewMemberProtocolProbe("migration-secret")(ctx, address))
+	require.Equal(t, codes.Unauthenticated, status.Code(NewMemberProtocolProbe("wrong-token")(ctx, address)))
 	md, _ := metadata.FromOutgoingContext(ctx)
 	require.Equal(t, []string{"Bearer stale"}, md.Get("authorization"))
 }
@@ -104,5 +104,5 @@ func TestMigrationMemberProtocolProbeRefusesCredentialOnPlaintext(t *testing.T) 
 			TransferSizeGuardVersion: 1, OwnershipPartitionProtocol: 1,
 		}})
 	})
-	require.Error(t, newMigrationMemberProtocolProbe("migration-secret")(t.Context(), address))
+	require.Error(t, NewMemberProtocolProbe("migration-secret")(t.Context(), address))
 }

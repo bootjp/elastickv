@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/sha256"
 	"net"
 	"testing"
 	"time"
@@ -13,6 +12,7 @@ import (
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	etcdraft "github.com/bootjp/elastickv/internal/raftengine/etcd"
+	"github.com/bootjp/elastickv/internal/splitmigration"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -23,14 +23,7 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-type ownershipRefreshRaftNode struct {
-	group    *kv.ShardGroup
-	fsm      kv.FSM
-	server   *grpc.Server
-	listener net.Listener
-}
-
-func newOwnershipRefreshRaftNode(t *testing.T, id string, groupID uint64, st store.MVCCStore, token string, ready migrationReadinessGate) ownershipRefreshRaftNode {
+func newOwnershipRefreshRaftNode(t *testing.T, id string, groupID uint64, st store.MVCCStore, token string, ready splitmigration.ReadinessGate) ownershipRefreshRaftNode {
 	t.Helper()
 	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -56,30 +49,6 @@ func newOwnershipRefreshRaftNode(t *testing.T, id string, groupID uint64, st sto
 	return ownershipRefreshRaftNode{group: &kv.ShardGroup{Store: st, Engine: result.Engine}, fsm: fsm, server: server, listener: listener}
 }
 
-func ownershipRefreshRootCatalog(t *testing.T) (store.MVCCStore, *distribution.CatalogStore, *pb.MigrationOwnershipProof) {
-	t.Helper()
-	st := store.NewMVCCStore()
-	catalog := distribution.NewCatalogStore(st, distribution.WithCatalogRouteDescriptorV2Writes(true))
-	routes := []distribution.RouteDescriptor{
-		{RouteID: 1, End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
-		{RouteID: 2, Start: []byte("m"), GroupID: 7, State: distribution.RouteStateActive, MinWriteTSExclusive: 100},
-	}
-	_, err := catalog.Save(t.Context(), 0, routes)
-	require.NoError(t, err)
-	encoded, err := distribution.EncodeRouteDescriptorForCatalogWrite(routes[1], true)
-	require.NoError(t, err)
-	digest := sha256.Sum256(encoded)
-	proof := &pb.MigrationOwnershipProof{Generation: "native-generation-for-refresh", LocalGroupId: 7, OwnerGroupId: 7,
-		CatalogVersion: 1, RouteStart: []byte("m"), RouteId: 2, MinWriteTsExclusive: 100, WriteFloorKnown: true,
-		Role: pb.MigrationOwnershipRole_MIGRATION_OWNERSHIP_ROLE_OWNER, DescriptorHash: digest[:]}
-	// Bootstrap the root store at a later C with the migrated descriptor intact.
-	// No SplitJob/history is created: the terminal job may already have been GC'd.
-	routes[0].MinWriteTSExclusive = 80
-	_, err = catalog.Save(t.Context(), 1, routes)
-	require.NoError(t, err)
-	return st, catalog, proof
-}
-
 func TestOwnershipRefreshDifferentRaftLeadersRespectExplicitClosedGate(t *testing.T) {
 	// Not parallel: internalutil.ConfigureGRPCTLS replaces the process-global
 	// TLS config that every gRPC server and dialer in the process reads.
@@ -100,13 +69,13 @@ func TestOwnershipRefreshDifferentRaftLeadersRespectExplicitClosedGate(t *testin
 	dataRoutes := distribution.NewEngine()
 	dataRoutes.UpdateRoute(nil, nil, 7)
 	dataShards := kv.NewShardStore(dataRoutes, groups)
-	dataTx := newInternalMigrationTransaction(data.group.Engine, nil, data.group.Store, 7)
+	dataTx := splitmigration.NewInternalTransaction(data.group.Engine, nil, data.group.Store, 7)
 	t.Cleanup(dataTx.Close)
 	data.group.Txn = dataTx
 	var cache kv.GRPCConnCache
 	t.Cleanup(func() { require.NoError(t, cache.Close()) })
-	groupFactory := splitMigrationGroupClientFactory(splitMigrationGroupLeaderResolver(groups), &cache, token)
-	rootFactory := migrationOwnershipRootClientFactory(migrationOwnershipRootLeaderResolver(&raftGroupRuntime{GroupRuntime: &noderuntime.GroupRuntime{Engine: root.group.Engine}}), &cache, token)
+	groupFactory := splitmigration.GroupClientFactory(splitmigration.GroupLeaderResolver(groups), &cache, token)
+	rootFactory := splitmigration.OwnershipRootClientFactory(migrationOwnershipRootLeaderResolver(&raftGroupRuntime{GroupRuntime: &noderuntime.GroupRuntime{Engine: root.group.Engine}}), &cache, token)
 	mirror := distribution.NewEngine()
 	require.NoError(t, mirror.ApplySnapshot(distribution.CatalogSnapshot{Version: 2, Routes: []distribution.RouteDescriptor{{RouteID: 99, GroupID: 99}}}))
 	closedGate := func(context.Context) error {
@@ -115,10 +84,10 @@ func TestOwnershipRefreshDifferentRaftLeadersRespectExplicitClosedGate(t *testin
 	consumer := adapter.NewDistributionServer(mirror, nil,
 		adapter.WithSplitJobRunnerReadinessGate(closedGate),
 		adapter.WithSplitMigrationGroupClientFactory(groupFactory),
-		adapter.WithSplitMigrationVoterFactory(splitMigrationVoterFactory(groups, &cache, token)),
+		adapter.WithSplitMigrationVoterFactory(splitmigration.VoterFactory(groups, &cache, token)),
 		adapter.WithMigrationOwnershipRefresh(groups, rootFactory),
-		migrationPartitionRuntimeOption(dataShards, groups, &cache, token, true))
-	require.True(t, migrationOwnershipRuntimeHooksInstalled(dataTx, dataShards, consumer, 7))
+		splitmigration.PartitionRuntimeOption(dataShards, groups, &cache, token, true))
+	require.True(t, splitmigration.OwnershipRuntimeHooksInstalled(dataTx, dataShards, consumer, 7))
 	pb.RegisterInternalServer(data.server, adapter.NewInternalWithEngine(nil, data.group.Engine, nil, nil,
 		adapter.WithInternalStore(data.group.Store), adapter.WithInternalMigrationProposer(data.group.Engine),
 		adapter.WithInternalMigrationOwnershipReady(func() bool { return closedGate(t.Context()) == nil })))
@@ -158,15 +127,4 @@ func TestOwnershipRefreshDifferentRaftLeadersRespectExplicitClosedGate(t *testin
 	require.NoError(t, err)
 	require.Empty(t, view.Ownership, "explicit closed gate must prevent all data-side ownership writes")
 	assertOwnershipRootRejectsAnonymous(t, ctx, &cache, root.listener.Addr().String(), prior)
-}
-
-func assertOwnershipRootRejectsAnonymous(t *testing.T, ctx context.Context, cache *kv.GRPCConnCache, address string, prior *pb.MigrationOwnershipProof) {
-	t.Helper()
-	conn, err := cache.ConnFor(address)
-	require.NoError(t, err)
-	ctx = migrationCredentialContext(ctx)
-	_, err = pb.NewDistributionClient(conn).AttestMigrationOwnership(ctx, &pb.AttestMigrationOwnershipRequest{JobId: 77, Prior: prior})
-	require.Equal(t, codes.Unauthenticated, status.Code(err))
-	_, err = migrationOwnershipRootClientFactory(func() (string, error) { return address, nil }, cache, "")(ctx)
-	require.Error(t, err, "no anonymous fallback even with a reachable root")
 }

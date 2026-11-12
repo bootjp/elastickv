@@ -1,4 +1,4 @@
-package main
+package splitmigration
 
 import (
 	"context"
@@ -10,7 +10,7 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-func splitMigrationApplyMemberSnapshotFactory(groups map[uint64]*kv.ShardGroup, cache *kv.GRPCConnCache, token string) adapter.SplitMigrationApplyMemberSnapshotFactory {
+func ApplyMemberSnapshotFactory(groups map[uint64]*kv.ShardGroup, cache *kv.GRPCConnCache, token string) adapter.SplitMigrationApplyMemberSnapshotFactory {
 	return func(ctx context.Context, groupID uint64) (adapter.SplitMigrationApplyMemberSnapshot, error) {
 		group := groups[groupID]
 		if group == nil || group.Engine == nil || cache == nil {
