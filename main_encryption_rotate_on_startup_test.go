@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/adapter"
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/monitoring"
 	pb "github.com/bootjp/elastickv/proto"
@@ -18,7 +19,7 @@ import (
 
 func TestStartupPublicKVGate_BlocksMutatorsUntilReady(t *testing.T) {
 	t.Parallel()
-	gate := &startupPublicKVGate{}
+	gate := &clusterbootstrap.StartupPublicKVGate{}
 
 	blockedMethods := []string{
 		pb.RawKV_RawGet_FullMethodName,
@@ -58,7 +59,7 @@ func TestStartupPublicKVGate_BlocksMutatorsUntilReady(t *testing.T) {
 				handlerCalled = true
 				return "ok", nil
 			}
-			if _, err := gate.unaryInterceptor(
+			if _, err := gate.UnaryInterceptor(
 				context.Background(), nil,
 				&grpc.UnaryServerInfo{FullMethod: method},
 				handler,
@@ -85,7 +86,7 @@ func TestStartupPublicKVGate_BlocksMutatorsUntilReady(t *testing.T) {
 				handlerCalled = true
 				return "ok", nil
 			}
-			if _, err := gate.unaryInterceptor(
+			if _, err := gate.UnaryInterceptor(
 				context.Background(), nil,
 				&grpc.UnaryServerInfo{FullMethod: method},
 				handler,
@@ -98,7 +99,7 @@ func TestStartupPublicKVGate_BlocksMutatorsUntilReady(t *testing.T) {
 		})
 	}
 
-	gate.markReady()
+	gate.MarkReady()
 	for _, method := range blockedMethods {
 		t.Run("ready/"+method, func(t *testing.T) {
 			handlerCalled := false
@@ -106,7 +107,7 @@ func TestStartupPublicKVGate_BlocksMutatorsUntilReady(t *testing.T) {
 				handlerCalled = true
 				return "ok", nil
 			}
-			if _, err := gate.unaryInterceptor(
+			if _, err := gate.UnaryInterceptor(
 				context.Background(), nil,
 				&grpc.UnaryServerInfo{FullMethod: method},
 				handler,
@@ -122,14 +123,14 @@ func TestStartupPublicKVGate_BlocksMutatorsUntilReady(t *testing.T) {
 
 func TestStartupPublicKVGate_BlocksMutatorStreamsUntilReady(t *testing.T) {
 	t.Parallel()
-	gate := &startupPublicKVGate{}
+	gate := &clusterbootstrap.StartupPublicKVGate{}
 
 	handlerCalled := false
 	handler := func(interface{}, grpc.ServerStream) error {
 		handlerCalled = true
 		return nil
 	}
-	err := gate.streamInterceptor(
+	err := gate.StreamInterceptor(
 		nil,
 		nil,
 		&grpc.StreamServerInfo{FullMethod: pb.S3BlobFetch_PushChunkBlob_FullMethodName},
@@ -142,8 +143,8 @@ func TestStartupPublicKVGate_BlocksMutatorStreamsUntilReady(t *testing.T) {
 		t.Fatal("stream handler ran before startup gate opened")
 	}
 
-	gate.markReady()
-	if err := gate.streamInterceptor(
+	gate.MarkReady()
+	if err := gate.StreamInterceptor(
 		nil,
 		nil,
 		&grpc.StreamServerInfo{FullMethod: pb.S3BlobFetch_PushChunkBlob_FullMethodName},
@@ -159,15 +160,15 @@ func TestStartupPublicKVGate_BlocksMutatorStreamsUntilReady(t *testing.T) {
 func TestStartupPublicKVGate_BlocksAfterReadyWhenStartupRotationPending(t *testing.T) {
 	t.Parallel()
 	blocked := true
-	gate := &startupPublicKVGate{blockMutator: func() bool { return blocked }}
-	gate.markReady()
+	gate := &clusterbootstrap.StartupPublicKVGate{BlockMutator: func() bool { return blocked }}
+	gate.MarkReady()
 
 	handlerCalled := false
 	handler := func(context.Context, interface{}) (interface{}, error) {
 		handlerCalled = true
 		return "ok", nil
 	}
-	if _, err := gate.unaryInterceptor(
+	if _, err := gate.UnaryInterceptor(
 		context.Background(), nil,
 		&grpc.UnaryServerInfo{FullMethod: pb.RaftAdmin_AddVoter_FullMethodName},
 		handler,
@@ -179,7 +180,7 @@ func TestStartupPublicKVGate_BlocksAfterReadyWhenStartupRotationPending(t *testi
 	}
 
 	blocked = false
-	if _, err := gate.unaryInterceptor(
+	if _, err := gate.UnaryInterceptor(
 		context.Background(), nil,
 		&grpc.UnaryServerInfo{FullMethod: pb.RaftAdmin_AddVoter_FullMethodName},
 		handler,
@@ -195,9 +196,9 @@ func TestStartupGatedCoordinator_BlocksAdapterDispatchDuringAsyncRotation(t *tes
 	t.Parallel()
 	inner := &stubStartupCoordinator{clock: kv.NewHLC()}
 	blocked := true
-	gate := &startupPublicKVGate{blockMutator: func() bool { return blocked }}
-	gate.markReady()
-	coord := newStartupGatedCoordinator(inner, gate)
+	gate := &clusterbootstrap.StartupPublicKVGate{BlockMutator: func() bool { return blocked }}
+	gate.MarkReady()
+	coord := clusterbootstrap.NewStartupGatedCoordinator(inner, gate)
 
 	if _, err := coord.Dispatch(context.Background(), nil); status.Code(err) != codes.Unavailable {
 		t.Fatalf("blocked Dispatch err=%v, want Unavailable", err)
@@ -223,16 +224,16 @@ func TestStartupGatedCoordinator_ForwardsTimestampCapabilities(t *testing.T) {
 	sentinel := errors.New("recover failed")
 	inner := &stubStartupCoordinator{clock: kv.NewHLC(), recoverErr: sentinel}
 	blocked := true
-	gate := &startupPublicKVGate{blockMutator: func() bool { return blocked }}
-	gate.markReady()
-	coord := newStartupGatedCoordinator(inner, gate)
+	gate := &clusterbootstrap.StartupPublicKVGate{BlockMutator: func() bool { return blocked }}
+	gate.MarkReady()
+	coord := clusterbootstrap.NewStartupGatedCoordinator(inner, gate)
 
 	assertStartupGatedTimestampBlocked(t, coord)
 	blocked = false
 	assertStartupGatedTimestampForwarding(t, coord, inner, sentinel)
 }
 
-func assertStartupGatedTimestampBlocked(t *testing.T, coord startupGatedCoordinator) {
+func assertStartupGatedTimestampBlocked(t *testing.T, coord clusterbootstrap.StartupGatedCoordinator) {
 	t.Helper()
 	if _, err := coord.Next(context.Background()); status.Code(err) != codes.Unavailable {
 		t.Fatalf("blocked Next() err=%v, want Unavailable", err)
@@ -244,7 +245,7 @@ func assertStartupGatedTimestampBlocked(t *testing.T, coord startupGatedCoordina
 
 func assertStartupGatedTimestampForwarding(
 	t *testing.T,
-	coord startupGatedCoordinator,
+	coord clusterbootstrap.StartupGatedCoordinator,
 	inner *stubStartupCoordinator,
 	recoverErr error,
 ) {
@@ -296,7 +297,7 @@ func TestRuntimeServerRunner_PrepareAdminForwardServersDoesNotBindPublicListener
 		s3Address:       heldS3.Addr().String(),
 		s3PathStyleOnly: true,
 		metricsRegistry: monitoring.NewRegistry("test-node", "127.0.0.1:0"),
-		coordinate:      newStartupGatedCoordinator(&stubStartupCoordinator{clock: kv.NewHLC()}, nil),
+		coordinate:      clusterbootstrap.NewStartupGatedCoordinator(&stubStartupCoordinator{clock: kv.NewHLC()}, nil),
 	}
 	if err := runner.prepareAdminForwardServers(); err != nil {
 		t.Fatalf("prepareAdminForwardServers: %v", err)

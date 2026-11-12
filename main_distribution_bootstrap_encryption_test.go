@@ -6,6 +6,7 @@ import (
 	"time"
 
 	internalutil "github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftadmission"
@@ -28,8 +29,8 @@ func TestBootstrapEncryptionStartupInactiveStorageRejectsBeforeWorkers(t *testin
 	var workers errgroup.Group
 	var cleanup internalutil.CleanupStack
 	_, supervisor, err := configureBootstrapEncryptionStartup(t.Context(), bootstrapEncryptionStartupConfig{
-		runtimes: []*raftGroupRuntime{f.cfg.DefaultRuntime}, groups: map[uint64]*kv.ShardGroup{1: f.cfg.Group}, defaultGroup: 1,
-		network: &bootstrapNetwork{}, wiring: f.cfg.Wiring, sidecarPath: f.cfg.SidecarPath,
+		runtimes: []*clusterbootstrap.GroupRuntime{f.cfg.DefaultRuntime}, groups: map[uint64]*kv.ShardGroup{1: f.cfg.Group}, defaultGroup: 1,
+		network: &clusterbootstrap.BootstrapNetwork{}, wiring: f.cfg.Wiring, sidecarPath: f.cfg.SidecarPath,
 		wrapper: f.cfg.Wrapper, nodeID: f.cfg.NodeID, requested: true, eg: &workers, cleanup: &cleanup,
 	})
 	require.ErrorIs(t, err, encryptionwiring.ErrBootstrapEncryptionUnsupported)
@@ -48,8 +49,8 @@ func TestBootstrapEncryptionStartupPlaintextAndMissingIO(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, t.Context(), ctx)
 	require.Nil(t, supervisor)
-	domain := bootstrapIngressFixture(t).domain
-	runtimes := []*raftGroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{}, bootstrapDomain: domain}}
+	domain := bootstrapIngressFixture(t).Domain
+	runtimes := []*clusterbootstrap.GroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{}, BootstrapDomain: domain}}
 	for _, cfg := range []bootstrapEncryptionStartupConfig{
 		{runtimes: runtimes, requested: true},
 		{runtimes: runtimes, sidecarPath: "configured-but-no-cipher"},
@@ -60,11 +61,11 @@ func TestBootstrapEncryptionStartupPlaintextAndMissingIO(t *testing.T) {
 	}
 }
 
-func bootstrapStartupRotationAdmission(t *testing.T) *bootstrapDomain {
+func bootstrapStartupRotationAdmission(t *testing.T) *clusterbootstrap.BootstrapDomain {
 	t.Helper()
 	cluster := raftbootstrap.UUID{1}
 	a, err := raftadmission.New(raftadmission.Config{Cluster: cluster, DefaultGroup: 1, Groups: []uint64{1},
-		RotationRequested: true, ValidatePayload: bootstrapPayloadValidator(cluster)})
+		RotationRequested: true, ValidatePayload: clusterbootstrap.BootstrapPayloadValidator(cluster)})
 	require.NoError(t, err)
 	t.Cleanup(a.Close)
 	bootstrapIngressObserve(t, a, 1)
@@ -81,7 +82,7 @@ func bootstrapStartupRotationAdmission(t *testing.T) *bootstrapDomain {
 	enc, err := a.EncryptionTicket()
 	require.NoError(t, err)
 	require.NoError(t, a.PublishEncryption(enc, raftbootstrap.Digest{2}))
-	return &bootstrapDomain{admission: a}
+	return &clusterbootstrap.BootstrapDomain{Admission: a}
 }
 
 func TestBootstrapEncryptionRecoveryBarrierOwnsRecoveryChildOfRotation(t *testing.T) {
@@ -89,17 +90,17 @@ func TestBootstrapEncryptionRecoveryBarrierOwnsRecoveryChildOfRotation(t *testin
 	domain := bootstrapStartupRotationAdmission(t)
 	engine := &bootstrapStartupRecoveryEngine{}
 	engine.read = func(ctx context.Context) (uint64, error) {
-		err := domain.admission.WithNative(ctx, 1, func(scope raftengine.NativeScope) error {
+		err := domain.Admission.WithNative(ctx, 1, func(scope raftengine.NativeScope) error {
 			return scope.Check(ctx, raftengine.NativeRequest{Operation: raftengine.NativeRecoveryReadIndex})
 		})
 		return 17, err
 	}
-	rt := &raftGroupRuntime{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 1}, Engine: engine}}
+	rt := &clusterbootstrap.GroupRuntime{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 1}, Engine: engine}}
 	barrier, err := bootstrapEncryptionRecoveryBarrier(domain, rt)
 	require.NoError(t, err)
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
-	run, err := domain.admission.BeginRotation(ctx, raftbootstrap.Digest{3})
+	run, err := domain.Admission.BeginRotation(ctx, raftbootstrap.Digest{3})
 	require.NoError(t, err)
 	defer func() { _ = run.Finish(raftadmission.ErrClosed) }()
 	_, err = engine.RecoveryLinearizableRead(run.Context())
@@ -107,17 +108,17 @@ func TestBootstrapEncryptionRecoveryBarrierOwnsRecoveryChildOfRotation(t *testin
 	index, err := barrier(run.Context())
 	require.NoError(t, err, "barrier must create the owned Recovery child")
 	require.EqualValues(t, 17, index)
-	require.NoError(t, domain.admission.ValidateResult(run.Context()))
-	_, finish, err := domain.admission.Enter(ctx, raftadmission.Recovery, 1)
+	require.NoError(t, domain.Admission.ValidateResult(run.Context()))
+	_, finish, err := domain.Admission.Enter(ctx, raftadmission.Recovery, 1)
 	require.NoError(t, err)
 	require.NoError(t, finish(nil))
 }
 
 func TestBootstrapEncryptionRecoveryBarrierRejectsRetiredEngineAndCancellation(t *testing.T) {
 	t.Parallel()
-	domain := bootstrapIngressFixture(t).domain
+	domain := bootstrapIngressFixture(t).Domain
 	engine := &bootstrapStartupRecoveryEngine{}
-	rt := &raftGroupRuntime{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 1}, Engine: engine}}
+	rt := &clusterbootstrap.GroupRuntime{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 1}, Engine: engine}}
 	engine.read = func(context.Context) (uint64, error) {
 		rt.EngineMu.Lock()
 		rt.Engine = nil

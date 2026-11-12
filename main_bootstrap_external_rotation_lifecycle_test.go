@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/raftadmission"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
@@ -19,10 +20,10 @@ import (
 func newBootstrapExternalLifecycleFixture(t *testing.T) *rotationRuntimeFixture {
 	t.Helper()
 	f := newRotationRuntimeFixture(t, raftengine.StateLeader)
-	require.NoError(t, f.runtime.step(t.Context()))
+	require.NoError(t, f.runtime.Step(t.Context()))
 	require.True(t, f.a.LocalPermissionReady())
-	f.runtime.config.planExternal = func(ctx context.Context, request *pb.RotateDEKRequest) (*bootstrapRotationRecipe, error) {
-		return newBootstrapExternalRotationRecipe(ctx, f.io.cfg, request)
+	f.runtime.Config.PlanExternal = func(ctx context.Context, request *pb.RotateDEKRequest) (*clusterbootstrap.BootstrapRotationRecipe, error) {
+		return clusterbootstrap.NewBootstrapExternalRotationRecipe(ctx, f.io.cfg, request)
 	}
 	return f
 }
@@ -37,7 +38,7 @@ func bootstrapExternalLifecycleWorker(t *testing.T, f *rotationRuntimeFixture, r
 		release()
 		start()
 		select {
-		case <-f.runtime.done:
+		case <-f.runtime.Done:
 		case <-time.After(5 * time.Second):
 			t.Error("external supervisor leaked ownership during cleanup")
 		}
@@ -47,15 +48,15 @@ func bootstrapExternalLifecycleWorker(t *testing.T, f *rotationRuntimeFixture, r
 
 // Take the already captured call before starting the worker so queue/active
 // boundaries are deterministic, without sleeping or renewing its original H.
-func bootstrapExternalLifecycleEnqueue(t *testing.T, ctx context.Context, f *rotationRuntimeFixture) (bootstrapExternalRotationCall, <-chan bootstrapExternalRotationResult) {
+func bootstrapExternalLifecycleEnqueue(t *testing.T, ctx context.Context, f *rotationRuntimeFixture) (clusterbootstrap.BootstrapExternalRotationCall, <-chan clusterbootstrap.BootstrapExternalRotationResult) {
 	t.Helper()
-	result := make(chan bootstrapExternalRotationResult, 1)
+	result := make(chan clusterbootstrap.BootstrapExternalRotationResult, 1)
 	request := externalRotationTestRequest(f.io)
 	go func() {
 		response, err := f.runtime.RotateDEK(ctx, request)
-		result <- bootstrapExternalRotationResult{response: response, err: err}
+		result <- clusterbootstrap.BootstrapExternalRotationResult{Response: response, Err: err}
 	}()
-	call := awaitBootstrapGateResult(t, ctx, f.runtime.requests, "external request did not enter its bounded queue")
+	call := awaitBootstrapGateResult(t, ctx, f.runtime.Requests, "external request did not enter its bounded queue")
 	return call, result
 }
 
@@ -78,9 +79,9 @@ func TestBootstrapExternalRotationLifecycleShutdownActiveJoins(t *testing.T) {
 	start, stopSupervisor, supervisor := bootstrapExternalLifecycleWorker(t, f, release)
 	call, rpc := bootstrapExternalLifecycleEnqueue(t, ctx, f)
 	shutdownCancelled := make(chan struct{})
-	originalCancel := call.cancel
-	call.cancel = func() { originalCancel(); close(shutdownCancelled) }
-	f.runtime.requests <- call
+	originalCancel := call.Cancel
+	call.Cancel = func() { originalCancel(); close(shutdownCancelled) }
+	f.runtime.Requests <- call
 	start()
 	old := awaitBootstrapGateResult(t, ctx, entered, "external proposal not entered")
 	stopSupervisor()
@@ -101,8 +102,8 @@ func TestBootstrapExternalRotationLifecycleShutdownActiveJoins(t *testing.T) {
 	release()
 	require.NoError(t, awaitBootstrapGateResult(t, ctx, supervisor, "supervisor failed to join external proposal"))
 	result := awaitBootstrapGateResult(t, ctx, rpc, "RPC failed to retire after shutdown join")
-	require.Nil(t, result.response)
-	require.ErrorIs(t, result.err, kv.ErrTransactionOutcomeUnknown, "an attempted rotation cannot become a definitive rejection")
+	require.Nil(t, result.Response)
+	require.ErrorIs(t, result.Err, kv.ErrTransactionOutcomeUnknown, "an attempted rotation cannot become a definitive rejection")
 	require.ErrorIs(t, f.a.ValidateResult(old), raftadmission.ErrStale)
 	state, err = f.a.RotationStatus()
 	require.NoError(t, err)
@@ -115,9 +116,9 @@ func TestBootstrapExternalRotationLifecycleShutdownQueuedDoesNotPlan(t *testing.
 	t.Parallel()
 	f := newBootstrapExternalLifecycleFixture(t)
 	prior := len(f.io.calls)
-	previous := f.runtime.recipe
+	previous := f.runtime.Recipe
 	var plans atomic.Int64
-	f.runtime.config.planExternal = func(context.Context, *pb.RotateDEKRequest) (*bootstrapRotationRecipe, error) {
+	f.runtime.Config.PlanExternal = func(context.Context, *pb.RotateDEKRequest) (*clusterbootstrap.BootstrapRotationRecipe, error) {
 		plans.Add(1)
 		return nil, raftadmission.ErrClosed
 	}
@@ -125,19 +126,19 @@ func TestBootstrapExternalRotationLifecycleShutdownQueuedDoesNotPlan(t *testing.
 	defer cancel()
 	start, stopSupervisor, supervisor := bootstrapExternalLifecycleWorker(t, f, func() {})
 	call, rpc := bootstrapExternalLifecycleEnqueue(t, ctx, f)
-	require.NoError(t, f.a.ValidateResult(call.intent.Context()))
-	f.runtime.requests <- call
+	require.NoError(t, f.a.ValidateResult(call.Intent.Context()))
+	f.runtime.Requests <- call
 	stopSupervisor()
 	start()
 	require.NoError(t, awaitBootstrapGateResult(t, ctx, supervisor, "queued shutdown did not finish supervisor"))
 	result := awaitBootstrapGateResult(t, ctx, rpc, "queued shutdown did not retire RPC intent")
-	require.Nil(t, result.response)
-	require.ErrorIs(t, result.err, raftadmission.ErrClosed)
+	require.Nil(t, result.Response)
+	require.ErrorIs(t, result.Err, raftadmission.ErrClosed)
 	require.NoError(t, ctx.Err(), "shutdown must not depend on the caller deadline")
-	require.ErrorIs(t, f.a.ValidateResult(call.intent.Context()), raftadmission.ErrStale)
-	require.Error(t, call.intent.Context().Err())
+	require.ErrorIs(t, f.a.ValidateResult(call.Intent.Context()), raftadmission.ErrStale)
+	require.Error(t, call.Intent.Context().Err())
 	require.Zero(t, plans.Load(), "queued shutdown must never plan under a fresh owner")
-	require.Same(t, previous, f.runtime.recipe)
+	require.Same(t, previous, f.runtime.Recipe)
 	require.Len(t, f.io.calls, prior, "queued shutdown must not submit a proposal")
 	state, err := f.a.RotationStatus()
 	require.NoError(t, err)
@@ -157,8 +158,8 @@ func TestBootstrapExternalRotationLifecyclePanicJoinsOwner(t *testing.T) {
 	intent, err := f.a.CaptureRotationRequest(t.Context())
 	require.NoError(t, err)
 	defer intent.CancelAndJoin()
-	call := bootstrapExternalRotationCall{intent: intent, request: externalRotationTestRequest(f.io)}
-	require.Panics(t, func() { _, _ = f.runtime.executeExternal(call) })
+	call := clusterbootstrap.BootstrapExternalRotationCall{Intent: intent, Request: externalRotationTestRequest(f.io)}
+	require.Panics(t, func() { _, _ = f.runtime.ExecuteExternal(call) })
 	require.NotNil(t, old)
 	require.Error(t, old.Err())
 	require.ErrorIs(t, f.a.ValidateResult(old), raftadmission.ErrStale)
@@ -181,32 +182,32 @@ func TestBootstrapExternalRotationLifecycleOnlyVerifiedCorruptionLatchesFatal(t 
 		t.Run(map[bool]string{false: "untrusted invalid request", true: "verified corruption through unknown wrapper"}[corrupt], func(t *testing.T) {
 			f := newBootstrapExternalLifecycleFixture(t)
 			prior := len(f.io.calls)
-			f.runtime.config.planExternal = func(context.Context, *pb.RotateDEKRequest) (*bootstrapRotationRecipe, error) {
+			f.runtime.Config.PlanExternal = func(context.Context, *pb.RotateDEKRequest) (*clusterbootstrap.BootstrapRotationRecipe, error) {
 				if corrupt {
-					return nil, bootstrapExternalRotationUnknown(errBootstrapRotationInvalidEvidence)
+					return nil, clusterbootstrap.BootstrapExternalRotationUnknown(clusterbootstrap.ErrBootstrapRotationInvalidEvidence)
 				}
-				return nil, errBootstrapExternalRotationRequest
+				return nil, clusterbootstrap.ErrBootstrapExternalRotationRequest
 			}
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
 			intent, err := f.a.CaptureRotationRequest(ctx)
 			require.NoError(t, err)
 			defer intent.CancelAndJoin()
-			call := bootstrapExternalRotationCall{intent: intent, request: externalRotationTestRequest(f.io),
-				result: make(chan bootstrapExternalRotationResult, 1), cancel: cancel}
-			f.runtime.handleExternal(t.Context(), call)
-			result := <-call.result
-			require.Nil(t, result.response)
-			require.Error(t, result.err)
+			call := clusterbootstrap.BootstrapExternalRotationCall{Intent: intent, Request: externalRotationTestRequest(f.io),
+				Result: make(chan clusterbootstrap.BootstrapExternalRotationResult, 1), Cancel: cancel}
+			f.runtime.HandleExternal(t.Context(), call)
+			result := <-call.Result
+			require.Nil(t, result.Response)
+			require.Error(t, result.Err)
 			_, stateErr := f.a.RotationStatus()
 			if corrupt {
-				require.ErrorIs(t, result.err, errBootstrapRotationInvalidEvidence)
-				require.ErrorIs(t, result.err, kv.ErrTransactionOutcomeUnknown)
+				require.ErrorIs(t, result.Err, clusterbootstrap.ErrBootstrapRotationInvalidEvidence)
+				require.ErrorIs(t, result.Err, kv.ErrTransactionOutcomeUnknown)
 				require.ErrorIs(t, stateErr, raftadmission.ErrClosed)
-				require.ErrorIs(t, stateErr, errBootstrapRotationInvalidEvidence)
+				require.ErrorIs(t, stateErr, clusterbootstrap.ErrBootstrapRotationInvalidEvidence)
 				require.False(t, f.a.LocalPermissionReady())
 			} else {
-				require.Equal(t, codes.InvalidArgument, status.Code(result.err))
+				require.Equal(t, codes.InvalidArgument, status.Code(result.Err))
 				require.NoError(t, stateErr)
 				require.True(t, f.a.LocalPermissionReady())
 			}

@@ -3,6 +3,7 @@ package main
 import (
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/kv"
@@ -19,7 +20,7 @@ func TestEncryptionAdminDefaultRuntimeOptionsUsesDefaultGroupRuntime(t *testing.
 	_ = kv.NewLeaderProxyForShardGroup(otherGroup)
 
 	got, err := encryptionwiring.AdminDefaultRuntimeOptions(
-		runtimeCores([]*raftGroupRuntime{
+		clusterbootstrap.RuntimeCores([]*clusterbootstrap.GroupRuntime{
 			{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 1}, Engine: defaultEngine}},
 			{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 2}, Engine: otherEngine}},
 		}),

@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/encryption/fsmwire"
 	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/internal/noderuntime"
@@ -260,7 +261,7 @@ func TestBuildShardGroupsWithEtcdEngineRestartsAcrossGroups(t *testing.T) {
 	engine.UpdateRoute([]byte("m"), nil, 2)
 
 	sharedClock := kv.NewHLC()
-	openShardStore := func(bootstrap bool) ([]*raftGroupRuntime, map[uint64]*kv.ShardGroup, *kv.ShardStore) {
+	openShardStore := func(bootstrap bool) ([]*clusterbootstrap.GroupRuntime, map[uint64]*kv.ShardGroup, *kv.ShardStore) {
 		factory, err := newRaftFactory(noderuntime.RaftEngineEtcd, nil)
 		require.NoError(t, err)
 		runtimes, shardGroups, err := buildShardGroups("n1", baseDir, groups, true, bootstrap,

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryption/kek"
 	"github.com/bootjp/elastickv/internal/encryptionwiring"
@@ -24,7 +25,7 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-func newOfflineEncryptedE2EFixture(t *testing.T) (*bootstrapRotationE2EFixture, bootstrapOfflineEncryptionCLI) {
+func newOfflineEncryptedE2EFixture(t *testing.T) (*bootstrapRotationE2EFixture, clusterbootstrap.BootstrapOfflineEncryptionCLI) {
 	t.Helper()
 	raw, _ := enablementPeerConfig(t)
 	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
@@ -37,7 +38,7 @@ func newOfflineEncryptedE2EFixture(t *testing.T) (*bootstrapRotationE2EFixture, 
 	require.NoError(t, err)
 	cfg, err := loadBootstrapFixture(t, encoded)
 	require.NoError(t, err)
-	f := &bootstrapRotationE2EFixture{base: t.TempDir(), configDir: t.TempDir(), config: cfg, group: noderuntime.GroupSpec{ID: 1, Address: cfg.local.Address}, listener: listener, activeEnvelopes: true}
+	f := &bootstrapRotationE2EFixture{base: t.TempDir(), configDir: t.TempDir(), config: cfg, group: noderuntime.GroupSpec{ID: 1, Address: cfg.Local.Address}, listener: listener, activeEnvelopes: true}
 	f.dir = noderuntime.GroupDataDir(f.base, "n1", 1, false)
 	f.sidecarPath = filepath.Join(f.dir, "encryption", "keys.json")
 	require.NoError(t, os.MkdirAll(filepath.Dir(f.sidecarPath), 0o700))
@@ -46,9 +47,9 @@ func newOfflineEncryptedE2EFixture(t *testing.T) (*bootstrapRotationE2EFixture, 
 	require.True(t, ok)
 	f.wrapper = wrapper
 	prepareOfflineEncryptedLegacy(t, f)
-	encryptionOptions := bootstrapOfflineEncryptionCLI{Sidecar: f.sidecarPath, KEKFile: assets.file}
-	pins := raftbootstrap.BaselineContext{Version: 1, Identity: raftbootstrap.Identity{Cluster: cfg.local.Cluster, Group: 1}, Minimum: raftbootstrap.Versions{Entry: 1, Snapshot: 1, Session: 1}, Configuration: raftbootstrap.Configuration{State: raftbootstrap.ConfState{Voters: []uint64{cfg.local.Member}}, Members: []raftbootstrap.Member{{ID: cfg.local.Member, Address: cfg.local.Address, PublicKeyDigest: cfg.local.Key}}}}
-	probe, err := observeBootstrapOriginal(t.Context(), bootstrapObservationCommand{DataDir: f.dir, MemberID: cfg.local.Member, OperationID: raftbootstrap.OperationID{71}, Encryption: encryptionOptions}, pins, cfg)
+	encryptionOptions := clusterbootstrap.BootstrapOfflineEncryptionCLI{Sidecar: f.sidecarPath, KEKFile: assets.file}
+	pins := raftbootstrap.BaselineContext{Version: 1, Identity: raftbootstrap.Identity{Cluster: cfg.Local.Cluster, Group: 1}, Minimum: raftbootstrap.Versions{Entry: 1, Snapshot: 1, Session: 1}, Configuration: raftbootstrap.Configuration{State: raftbootstrap.ConfState{Voters: []uint64{cfg.Local.Member}}, Members: []raftbootstrap.Member{{ID: cfg.Local.Member, Address: cfg.Local.Address, PublicKeyDigest: cfg.Local.Key}}}}
+	probe, err := clusterbootstrap.ObserveBootstrapOriginal(t.Context(), clusterbootstrap.BootstrapObservationCommand{DataDir: f.dir, MemberID: cfg.Local.Member, OperationID: raftbootstrap.OperationID{71}, Encryption: encryptionOptions}, pins, cfg)
 	require.NoError(t, err)
 	f.manifest = raftbootstrap.BaselineManifest{BaselineContext: probe.BaselineContext, Members: []raftbootstrap.BaselineMemberEvidence{probe.Evidence}}
 	f.activation = migrateOfflineEncryptedE2E(t, f, encryptionOptions)
@@ -76,7 +77,7 @@ func prepareOfflineEncryptedLegacy(t *testing.T, f *bootstrapRotationE2EFixture)
 	w.AttachRaftEnvelopeGroup(1, group)
 	require.Eventually(t, func() bool { return rt.Engine.State() == raftengine.StateLeader }, enablementE2EWait, 10*time.Millisecond)
 	enablementLegacyPut(t, rt.Engine, clock.Next(), "legacy-key", "original-value")
-	_, err = setupDistributionCatalog(t.Context(), []*raftGroupRuntime{rt}, routes)
+	_, err = setupDistributionCatalog(t.Context(), []*clusterbootstrap.GroupRuntime{rt}, routes)
 	require.NoError(t, err)
 	f.bootstrapKeys(t, rt, group, w, keys)
 	f.enableEnvelopes(t, rt, group, w)
@@ -97,33 +98,33 @@ func prepareOfflineEncryptedLegacy(t *testing.T, f *bootstrapRotationE2EFixture)
 	require.NoError(t, plain.Close())
 }
 
-func migrateOfflineEncryptedE2E(t *testing.T, f *bootstrapRotationE2EFixture, enc bootstrapOfflineEncryptionCLI) []byte {
+func migrateOfflineEncryptedE2E(t *testing.T, f *bootstrapRotationE2EFixture, enc clusterbootstrap.BootstrapOfflineEncryptionCLI) []byte {
 	t.Helper()
 	before := offlineDataFiles(t, f.dir)
-	r := bootstrapBaselineCLIRequest{Command: "prepare", RaftDataDir: f.dir, MemberID: f.config.local.Member, OperationID: f.manifest.OperationID, Encryption: enc}
-	prepared, err := executeBootstrapMigration(t.Context(), r, f.manifest.BaselineContext, f.manifest)
+	r := clusterbootstrap.BootstrapBaselineCLIRequest{Command: "prepare", RaftDataDir: f.dir, MemberID: f.config.Local.Member, OperationID: f.manifest.OperationID, Encryption: enc}
+	prepared, err := clusterbootstrap.ExecuteBootstrapMigration(t.Context(), r, f.manifest.BaselineContext, f.manifest)
 	require.NoError(t, err)
 	require.Equal(t, before, offlineDataFiles(t, prepared.BackupDir))
 	r.Command = "resume"
-	bound, err := executeBootstrapMigration(t.Context(), r, f.manifest.BaselineContext, f.manifest)
+	bound, err := clusterbootstrap.ExecuteBootstrapMigration(t.Context(), r, f.manifest.BaselineContext, f.manifest)
 	require.NoError(t, err)
 	require.Equal(t, "bound", bound.Phase)
-	again, err := executeBootstrapMigration(t.Context(), r, f.manifest.BaselineContext, f.manifest)
+	again, err := clusterbootstrap.ExecuteBootstrapMigration(t.Context(), r, f.manifest.BaselineContext, f.manifest)
 	require.NoError(t, err)
 	require.Equal(t, bound, again)
 	require.Equal(t, before, offlineDataFiles(t, bound.BackupDir))
 	ownership, err := etcd.AcquireOfflineBaselineOwnership(f.dir)
 	require.NoError(t, err)
 	defer func() { require.NoError(t, ownership.Close()) }()
-	options, err := bootstrapOfflineOptions(r, f.manifest.BaselineContext, f.manifest, ownership)
+	options, err := clusterbootstrap.BootstrapOfflineOptions(r, f.manifest.BaselineContext, f.manifest, ownership)
 	require.NoError(t, err)
 	evidence, err := etcd.VerifyOfflineBaselinePrepared(t.Context(), options, f.manifest)
 	require.NoError(t, err)
-	ack, err := signBootstrapPreparedAck(f.config, f.manifest, f.config.local.Member, evidence.DurableProofDigest)
+	ack, err := clusterbootstrap.SignBootstrapPreparedAck(f.config, f.manifest, f.config.Local.Member, evidence.DurableProofDigest)
 	require.NoError(t, err)
-	encoded, err := marshalBootstrapPreparedAck(ack, f.manifest)
+	encoded, err := clusterbootstrap.MarshalBootstrapPreparedAck(ack, f.manifest)
 	require.NoError(t, err)
-	activation, err := assembleBootstrapActivation(f.manifest, f.manifest.BaselineContext, [][]byte{encoded})
+	activation, err := clusterbootstrap.AssembleBootstrapActivation(f.manifest, f.manifest.BaselineContext, [][]byte{encoded})
 	require.NoError(t, err)
 	return activation
 }

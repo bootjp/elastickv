@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/internal/peersession"
 	"github.com/bootjp/elastickv/internal/raftadmission"
@@ -162,16 +163,16 @@ func (p bootstrapRegistrationProposer) Propose(ctx context.Context, entry []byte
 func TestBootstrapRegistrationLocalProposalOwnsHandleAndCloseJoins(t *testing.T) {
 	t.Parallel()
 	f := newBootstrapNetworkFixture(t, false)
-	ctx, err := withBootstrapRegistration(t.Context(), f.network, bootstrapNetworkTestGroup, f.config.local.Member,
+	ctx, err := clusterbootstrap.WithBootstrapRegistration(t.Context(), f.network, bootstrapNetworkTestGroup, f.config.Local.Member,
 		func(uint32, uint16) error { return nil })
 	require.NoError(t, err)
 	entered := make(chan struct{})
 	proposer := bootstrapRegistrationProposer{action: func(ctx context.Context, entry []byte) (*raftengine.ProposalResult, error) {
-		bound, err := f.sender.admission.BindProposal(ctx, bootstrapNetworkTestGroup, entry)
+		bound, err := f.sender.Admission.BindProposal(ctx, bootstrapNetworkTestGroup, entry)
 		if err != nil {
 			return nil, err
 		}
-		err = f.sender.admission.WithNative(bound, bootstrapNetworkTestGroup, func(scope raftengine.NativeScope) error {
+		err = f.sender.Admission.WithNative(bound, bootstrapNetworkTestGroup, func(scope raftengine.NativeScope) error {
 			return scope.Check(bound, raftengine.NativeRequest{Operation: raftengine.NativeProposal, PayloadDigest: sha256.Sum256(entry)})
 		})
 		if err != nil {
@@ -186,8 +187,8 @@ func TestBootstrapRegistrationLocalProposalOwnsHandleAndCloseJoins(t *testing.T)
 	}, bootstrapNetworkTestGroup, kv.NewHLC(), nil)
 	done := make(chan error, 1)
 	go func() {
-		done <- encryptionwiring.ProposeWriterRegistration(ctx, coord, proposer, nil, encryptionwiring.RegistrationEntry(7, f.config.local.Member, 3),
-			encryptionwiring.RegistrationRequest(7, f.config.local.Member, 3))
+		done <- encryptionwiring.ProposeWriterRegistration(ctx, coord, proposer, nil, encryptionwiring.RegistrationEntry(7, f.config.Local.Member, 3),
+			encryptionwiring.RegistrationRequest(7, f.config.Local.Member, 3))
 	}()
 	select {
 	case <-entered:
@@ -205,18 +206,18 @@ func TestBootstrapRegistrationPrivateForwardNeverUsesPublicFallback(t *testing.T
 	for _, wrongSPKI := range []bool{false, true} {
 		t.Run(map[bool]string{false: "valid", true: "wrong SPKI"}[wrongSPKI], func(t *testing.T) {
 			f := newBootstrapNetworkFixture(t, wrongSPKI)
-			ctx, err := withBootstrapRegistration(t.Context(), f.network, bootstrapNetworkTestGroup, f.config.local.Member,
+			ctx, err := clusterbootstrap.WithBootstrapRegistration(t.Context(), f.network, bootstrapNetworkTestGroup, f.config.Local.Member,
 				func(uint32, uint16) error { return nil })
 			require.NoError(t, err)
-			source := bootstrapRegistrationFromContext(ctx)
-			err = source.Forward(ctx, f.address, encryptionwiring.RegistrationRequest(7, f.config.local.Member, 3))
+			source := clusterbootstrap.BootstrapRegistrationFromContext(ctx)
+			err = source.Forward(ctx, f.address, encryptionwiring.RegistrationRequest(7, f.config.Local.Member, 3))
 			if wrongSPKI {
 				require.Error(t, err)
 			} else {
 				require.NoError(t, err)
 			}
 			require.Zero(t, f.ordinary.Load())
-			require.Error(t, source.Forward(ctx, "unprovisioned.test:9001", encryptionwiring.RegistrationRequest(7, f.config.local.Member, 3)))
+			require.Error(t, source.Forward(ctx, "unprovisioned.test:9001", encryptionwiring.RegistrationRequest(7, f.config.Local.Member, 3)))
 		})
 	}
 }
@@ -224,7 +225,7 @@ func TestBootstrapRegistrationPrivateForwardNeverUsesPublicFallback(t *testing.T
 func TestBootstrapRegistrationPrivateForwardCloseCancelsAndJoins(t *testing.T) {
 	t.Parallel()
 	f := newBootstrapNetworkFixture(t, false)
-	ctx, err := withBootstrapRegistration(t.Context(), f.network, bootstrapNetworkTestGroup, f.config.local.Member,
+	ctx, err := clusterbootstrap.WithBootstrapRegistration(t.Context(), f.network, bootstrapNetworkTestGroup, f.config.Local.Member,
 		func(uint32, uint16) error { return nil })
 	require.NoError(t, err)
 	entered, handlerDone := make(chan struct{}), make(chan struct{})
@@ -236,8 +237,8 @@ func TestBootstrapRegistrationPrivateForwardCloseCancelsAndJoins(t *testing.T) {
 	}
 	done := make(chan error, 1)
 	go func() {
-		done <- bootstrapRegistrationFromContext(ctx).Forward(ctx, f.address,
-			encryptionwiring.RegistrationRequest(7, f.config.local.Member, 3))
+		done <- clusterbootstrap.BootstrapRegistrationFromContext(ctx).Forward(ctx, f.address,
+			encryptionwiring.RegistrationRequest(7, f.config.Local.Member, 3))
 	}()
 	select {
 	case <-entered:
@@ -258,7 +259,7 @@ func TestBootstrapRegistrationPrivateForwardCloseCancelsAndJoins(t *testing.T) {
 func TestBootstrapRegistrationSourcePinsEpochAndPayload(t *testing.T) {
 	t.Parallel()
 	f := newBootstrapNetworkFixture(t, false)
-	ctx, err := withBootstrapRegistration(t.Context(), f.network, bootstrapNetworkTestGroup, f.config.local.Member,
+	ctx, err := clusterbootstrap.WithBootstrapRegistration(t.Context(), f.network, bootstrapNetworkTestGroup, f.config.Local.Member,
 		func(dek uint32, epoch uint16) error {
 			if dek != 7 || epoch != 3 {
 				return errors.New("durable epoch mismatch")
@@ -266,19 +267,19 @@ func TestBootstrapRegistrationSourcePinsEpochAndPayload(t *testing.T) {
 			return nil
 		})
 	require.NoError(t, err)
-	source := bootstrapRegistrationFromContext(ctx)
-	req := encryptionwiring.RegistrationRequest(7, f.config.local.Member, 3)
-	entry := encryptionwiring.RegistrationEntry(7, f.config.local.Member, 3)
+	source := clusterbootstrap.BootstrapRegistrationFromContext(ctx)
+	req := encryptionwiring.RegistrationRequest(7, f.config.Local.Member, 3)
+	entry := encryptionwiring.RegistrationEntry(7, f.config.Local.Member, 3)
 	require.NoError(t, source.Validate(entry, req))
 	require.Error(t, source.Validate(append(entry, 0), req))
-	require.Error(t, source.Validate(encryptionwiring.RegistrationEntry(7, f.config.local.Member, 4), encryptionwiring.RegistrationRequest(7, f.config.local.Member, 4)))
-	_, err = withBootstrapRegistration(t.Context(), f.network, bootstrapNetworkTestGroup, 999, source.validateEpoch)
+	require.Error(t, source.Validate(encryptionwiring.RegistrationEntry(7, f.config.Local.Member, 4), encryptionwiring.RegistrationRequest(7, f.config.Local.Member, 4)))
+	_, err = clusterbootstrap.WithBootstrapRegistration(t.Context(), f.network, bootstrapNetworkTestGroup, 999, source.ValidateEpoch)
 	require.Error(t, err)
-	_, err = withBootstrapRegistration(t.Context(), f.network, bootstrapNetworkTestGroup+1, f.config.local.Member, source.validateEpoch)
+	_, err = clusterbootstrap.WithBootstrapRegistration(t.Context(), f.network, bootstrapNetworkTestGroup+1, f.config.Local.Member, source.ValidateEpoch)
 	require.Error(t, err)
-	_, err = withBootstrapRegistration(t.Context(), f.network, bootstrapNetworkTestGroup, f.config.local.Member, nil)
+	_, err = clusterbootstrap.WithBootstrapRegistration(t.Context(), f.network, bootstrapNetworkTestGroup, f.config.Local.Member, nil)
 	require.Error(t, err)
-	require.Nil(t, bootstrapRegistrationFromContext(t.Context()), "legacy profile is unchanged")
+	require.Nil(t, clusterbootstrap.BootstrapRegistrationFromContext(t.Context()), "legacy profile is unchanged")
 }
 
 func TestBootstrapRegistrationTLSRevocationRetainsHandleThroughResult(t *testing.T) {

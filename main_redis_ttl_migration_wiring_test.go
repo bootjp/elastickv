@@ -7,6 +7,7 @@ import (
 
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/kv"
@@ -79,9 +80,9 @@ func TestRedisTTLInlineMigrationScansLocalLeaderGroupsThroughStartupGate(t *test
 	require.True(t, known)
 	require.Equal(t, localLeaders, ids)
 
-	gate := &startupPublicKVGate{}
-	gate.markReady()
-	gated := newStartupGatedCoordinator(coord, gate)
+	gate := &clusterbootstrap.StartupPublicKVGate{}
+	gate.MarkReady()
+	gated := clusterbootstrap.NewStartupGatedCoordinator(coord, gate)
 
 	ids, known = kv.LocalLeaderGroupIDsThrough(kv.WithKeyVizLabel(gated, keyviz.LabelRedis))
 	require.True(t, known, "the Redis compactor's coordinator must know its local leader groups")

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/peersession"
 	"github.com/bootjp/elastickv/internal/raftadmission"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
@@ -21,11 +22,11 @@ import (
 const bootstrapTransportTestMethod = "/S3BlobFetch/Hold"
 
 type bootstrapTransportFixture struct {
-	gate    *startupPublicKVGate
+	gate    *clusterbootstrap.StartupPublicKVGate
 	conn    *grpc.ClientConn
 	server  *grpc.Server
 	owner   *peersession.Owner
-	config  *bootstrapPeerConfig
+	config  *clusterbootstrap.BootstrapPeerConfig
 	address string
 	entered chan context.Context
 	ended   chan error
@@ -36,17 +37,17 @@ func bootstrapTransportServer(t *testing.T, mode string) *bootstrapTransportFixt
 	t.Helper()
 	f := &bootstrapTransportFixture{gate: bootstrapIngressFixture(t), entered: make(chan context.Context, 1), ended: make(chan error, 1)}
 	bootstrapIngressLoadCatalog(t, f.gate)
-	config, err := buildBootstrapPeerConfig(bootstrapConfigFixture(t))
+	config, err := clusterbootstrap.BuildBootstrapPeerConfig(bootstrapConfigFixture(t))
 	require.NoError(t, err)
 	f.config = config
-	owner, err := peersession.NewOwner(peersession.Config{Local: config.local, Provisioned: config.provisions,
+	owner, err := peersession.NewOwner(peersession.Config{Local: config.Local, Provisioned: config.Provisions,
 		Versions: raftbootstrap.Versions{Entry: 1, Snapshot: 1, Session: 1}, PublicMethods: []string{bootstrapTransportTestMethod}})
 	require.NoError(t, err)
 	f.owner = owner
 	t.Cleanup(owner.Close)
-	options, err := owner.ServerOptions(config.serverTLS)
+	options, err := owner.ServerOptions(config.ServerTLS)
 	require.NoError(t, err)
-	options = append(options, grpc.ChainStreamInterceptor(f.gate.streamInterceptor))
+	options = append(options, grpc.ChainStreamInterceptor(f.gate.StreamInterceptor))
 	f.server = grpc.NewServer(options...)
 	descriptor := grpc.StreamDesc{StreamName: "Hold", ClientStreams: true, ServerStreams: true,
 		Handler: func(_ any, stream grpc.ServerStream) (err error) {
@@ -78,7 +79,7 @@ func bootstrapTransportServer(t *testing.T, mode string) *bootstrapTransportFixt
 	go func() { defer close(served); _ = f.server.Serve(listener) }()
 	t.Cleanup(func() { f.server.Stop(); <-served })
 	// Ordinary public TLS does not require a client certificate or peer session.
-	clientTLS := config.clientTLS.Clone()
+	clientTLS := config.ClientTLS.Clone()
 	clientTLS.Certificates = nil
 	f.conn, err = grpc.NewClient(listener.Addr().String(), grpc.WithAuthority("localhost"),
 		grpc.WithTransportCredentials(credentials.NewTLS(clientTLS)),
@@ -132,7 +133,7 @@ func TestBootstrapIngressTLSTransportRevocationUnblocks(t *testing.T) {
 				t.Fatalf("handler returned before revocation: %v", err)
 			default:
 			}
-			bootstrapIngressObserve(t, f.gate.domain.admission, 2)
+			bootstrapIngressObserve(t, f.gate.Domain.Admission, 2)
 			select {
 			case err := <-f.ended:
 				require.Error(t, err)
@@ -144,19 +145,19 @@ func TestBootstrapIngressTLSTransportRevocationUnblocks(t *testing.T) {
 			_, err = peersession.CaptureServerTransportAbort(authenticated)
 			require.ErrorIs(t, err, peersession.ErrDenied, "retired physical connection must be rejected")
 			bootstrapTransportRepublish(t, f.gate)
-			require.Eventually(t, func() bool { return f.gate.domain.admission.Stage(1) == peersession.DataReady }, 3*time.Second, time.Millisecond, "revoked stream must leave no draining operation")
+			require.Eventually(t, func() bool { return f.gate.Domain.Admission.Stage(1) == peersession.DataReady }, 3*time.Second, time.Millisecond, "revoked stream must leave no draining operation")
 		})
 	}
 }
 
-func bootstrapTransportRepublish(t *testing.T, gate *startupPublicKVGate) {
+func bootstrapTransportRepublish(t *testing.T, gate *clusterbootstrap.StartupPublicKVGate) {
 	t.Helper()
-	ticket, err := gate.domain.admission.Ticket(1)
+	ticket, err := gate.Domain.Admission.Ticket(1)
 	require.NoError(t, err)
 	configuration := raftbootstrap.Configuration{Index: 1, State: raftbootstrap.ConfState{Voters: []uint64{1}}, Members: []raftbootstrap.Member{{ID: 1, Address: "localhost:9000", PublicKeyDigest: raftbootstrap.Digest{1}}}}
 	digest, err := raftbootstrap.ConfigurationDigest(configuration)
 	require.NoError(t, err)
-	require.NoError(t, gate.domain.admission.PublishRecovery(ticket, raftbootstrap.PolicyRecord{Version: 1, Identity: raftbootstrap.Identity{Cluster: raftbootstrap.UUID{1}, Group: 1}, BaselineDigest: digest,
+	require.NoError(t, gate.Domain.Admission.PublishRecovery(ticket, raftbootstrap.PolicyRecord{Version: 1, Identity: raftbootstrap.Identity{Cluster: raftbootstrap.UUID{1}, Group: 1}, BaselineDigest: digest,
 		Minimum: raftbootstrap.Versions{Entry: 1, Snapshot: 1, Session: 1}, ActivationIndex: 1, Generation: 1, LastConfigurationIndex: 1, Configuration: configuration}, 2, raftadmission.RegistrationNotConfigured))
 	bootstrapIngressLoadCatalog(t, gate)
 }
@@ -205,7 +206,7 @@ func TestBootstrapIngressRejectsUnownedTransportBeforeBegin(t *testing.T) {
 	for _, auth := range []credentials.AuthInfo{nil, &peersession.ServerAuthInfo{}, &peersession.ClientAuthInfo{}, credentials.TLSInfo{}} {
 		ctx := peer.NewContext(t.Context(), &peer.Peer{AuthInfo: auth})
 		called := false
-		err := gate.protectedStream(nil, &bootstrapIngressTestStream{ctx: ctx}, &grpc.StreamServerInfo{FullMethod: bootstrapTransportTestMethod}, func(any, grpc.ServerStream) error { called = true; return nil })
+		err := gate.ProtectedStream(nil, &bootstrapIngressTestStream{ctx: ctx}, &grpc.StreamServerInfo{FullMethod: bootstrapTransportTestMethod}, func(any, grpc.ServerStream) error { called = true; return nil })
 		require.Error(t, err)
 		require.False(t, called)
 	}
@@ -213,9 +214,9 @@ func TestBootstrapIngressRejectsUnownedTransportBeforeBegin(t *testing.T) {
 		_, err := peersession.CaptureServerTransportAbort(ctx)
 		require.ErrorIs(t, err, peersession.ErrDenied)
 	}
-	owned, op, err := gate.domain.admission.Begin(t.Context(), raftadmission.Data)
+	owned, op, err := gate.Domain.Admission.Begin(t.Context(), raftadmission.Data)
 	require.NoError(t, err)
-	require.NoError(t, gate.domain.admission.ValidateResult(owned))
+	require.NoError(t, gate.Domain.Admission.ValidateResult(owned))
 	op.CancelAndJoin()
 }
 
@@ -224,7 +225,7 @@ func TestBootstrapIngressRejectsGenuineClientTransportAbort(t *testing.T) {
 	f := bootstrapTransportServer(t, "normal")
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	creds, err := f.owner.TransportCredentials(f.config.clientTLS, false)
+	creds, err := f.owner.TransportCredentials(f.config.ClientTLS, false)
 	require.NoError(t, err)
 	raw, err := (&net.Dialer{}).DialContext(ctx, "tcp", f.address)
 	require.NoError(t, err)

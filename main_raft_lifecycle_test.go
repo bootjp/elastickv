@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/stretchr/testify/require"
@@ -24,7 +25,7 @@ func TestStartRaftEngineLifecycleWatchersReportsEngineFailure(t *testing.T) {
 	t.Parallel()
 	engineErr := errors.New("snapshot write failed")
 	engine := &lifecycleEngineStub{done: make(chan struct{}), err: engineErr}
-	runtimes := []*raftGroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 7}, Engine: engine}}}
+	runtimes := []*clusterbootstrap.GroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 7}, Engine: engine}}}
 
 	eg, ctx := errgroup.WithContext(context.Background())
 	startRaftEngineLifecycleWatchers(ctx, eg, runtimes)
@@ -38,7 +39,7 @@ func TestStartRaftEngineLifecycleWatchersReportsEngineFailure(t *testing.T) {
 func TestStartRaftEngineLifecycleWatchersIgnoresCleanEngineStop(t *testing.T) {
 	t.Parallel()
 	engine := &lifecycleEngineStub{done: make(chan struct{})}
-	runtimes := []*raftGroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 9}, Engine: engine}}}
+	runtimes := []*clusterbootstrap.GroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 9}, Engine: engine}}}
 
 	eg, ctx := errgroup.WithContext(context.Background())
 	startRaftEngineLifecycleWatchers(ctx, eg, runtimes)
@@ -50,7 +51,7 @@ func TestStartRaftEngineLifecycleWatchersIgnoresCleanEngineStop(t *testing.T) {
 func TestStartRaftEngineLifecycleWatchersIgnoresContextCancellation(t *testing.T) {
 	t.Parallel()
 	engine := &lifecycleEngineStub{done: make(chan struct{})}
-	runtimes := []*raftGroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 8}, Engine: engine}}}
+	runtimes := []*clusterbootstrap.GroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 8}, Engine: engine}}}
 	ctx, cancel := context.WithCancel(context.Background())
 	eg, runCtx := errgroup.WithContext(ctx)
 	startRaftEngineLifecycleWatchers(runCtx, eg, runtimes)

@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -49,7 +50,7 @@ type rotationRecipeFixture struct {
 	path                   string
 	registry               rotationRecipeTestRegistry
 	loaded                 map[uint32][]byte
-	cfg                    bootstrapRotationRecipeConfig
+	cfg                    clusterbootstrap.BootstrapRotationRecipeConfig
 	index                  uint64
 	leader                 bool
 	barriers, installs     int
@@ -61,7 +62,7 @@ type rotationRecipeFixture struct {
 func newRotationRecipeFixture(t *testing.T) *rotationRecipeFixture {
 	t.Helper()
 	f := &rotationRecipeFixture{t: t, path: filepath.Join(t.TempDir(), "keys.json"), registry: rotationRecipeTestRegistry{}, loaded: map[uint32][]byte{}, index: 10, leader: true}
-	f.cfg = bootstrapRotationRecipeConfig{NodeID: 91, StorageEpoch: 3, RaftEpoch: 5, Wrapper: rotationRecipeTestKEK{}, Registry: f.registry,
+	f.cfg = clusterbootstrap.BootstrapRotationRecipeConfig{NodeID: 91, StorageEpoch: 3, RaftEpoch: 5, Wrapper: rotationRecipeTestKEK{}, Registry: f.registry,
 		IsLeader: func() bool { return f.leader }, Validate: func(ctx context.Context) error { return ctx.Err() },
 		ReadSidecar: func() (*encryption.Sidecar, error) { return encryption.ReadSidecar(f.path) },
 		Barrier: func(ctx context.Context) (uint64, error) {
@@ -79,7 +80,7 @@ func newRotationRecipeFixture(t *testing.T) *rotationRecipeFixture {
 			return errors.Join(ctx.Err(), f.installErr)
 		}}
 	f.cfg.Admin = rotationRecipeTestAdmin(func(ctx context.Context, req *pb.RotateDEKRequest) (*pb.RotateDEKResponse, error) {
-		f.calls = append(f.calls, cloneBootstrapRotationRequest(req))
+		f.calls = append(f.calls, clusterbootstrap.CloneBootstrapRotationRequest(req))
 		if f.admin != nil {
 			return f.admin(ctx, req)
 		}
@@ -122,21 +123,21 @@ func (f *rotationRecipeFixture) apply(req *pb.RotateDEKRequest) {
 func TestBootstrapRotationRecipeInterruptedCreateRetainsExactPlan(t *testing.T) {
 	t.Parallel()
 	f := newRotationRecipeFixture(t)
-	r, err := newBootstrapRotationRecipe(t.Context(), f.cfg)
+	r, err := clusterbootstrap.NewBootstrapRotationRecipe(t.Context(), f.cfg)
 	require.NoError(t, err)
 	digest := r.Digest()
 	lost := errors.New("outcome unknown")
 	f.admin = func(context.Context, *pb.RotateDEKRequest) (*pb.RotateDEKResponse, error) { return nil, lost }
 	result, err := r.Run(t.Context())
 	require.ErrorIs(t, err, lost)
-	require.Equal(t, bootstrapRotationPending, result.Outcome)
+	require.Equal(t, clusterbootstrap.BootstrapRotationPending, result.Outcome)
 	require.Len(t, f.calls, 1)
 	f.admin = nil
 	result, err = r.Run(t.Context())
 	require.NoError(t, err)
 	require.True(t, proto.Equal(f.calls[0], f.calls[1]), "retry must retain key ID and wrapped material")
 	require.Equal(t, digest, result.RecipeDigest)
-	require.Equal(t, bootstrapRotationReconciled, result.Outcome)
+	require.Equal(t, clusterbootstrap.BootstrapRotationReconciled, result.Outcome)
 	require.True(t, result.Complete)
 	require.Equal(t, encryption.ActiveKeys{Storage: 3, Raft: 4}, result.Active)
 }
@@ -144,7 +145,7 @@ func TestBootstrapRotationRecipeInterruptedCreateRetainsExactPlan(t *testing.T) 
 func TestBootstrapRotationRecipeLostResultUsesAppliedState(t *testing.T) {
 	t.Parallel()
 	f := newRotationRecipeFixture(t)
-	r, err := newBootstrapRotationRecipe(t.Context(), f.cfg)
+	r, err := clusterbootstrap.NewBootstrapRotationRecipe(t.Context(), f.cfg)
 	require.NoError(t, err)
 	f.admin = func(ctx context.Context, req *pb.RotateDEKRequest) (*pb.RotateDEKResponse, error) {
 		require.Same(t, t.Context(), ctx)
@@ -153,7 +154,7 @@ func TestBootstrapRotationRecipeLostResultUsesAppliedState(t *testing.T) {
 	}
 	result, err := r.Run(t.Context())
 	require.NoError(t, err)
-	require.Equal(t, bootstrapRotationReconciled, result.Outcome)
+	require.Equal(t, clusterbootstrap.BootstrapRotationReconciled, result.Outcome)
 	require.Len(t, f.calls, 2)
 	require.GreaterOrEqual(t, f.barriers, 7, "planning, each result and wrapper completion all require barriers")
 }
@@ -161,30 +162,30 @@ func TestBootstrapRotationRecipeLostResultUsesAppliedState(t *testing.T) {
 func TestBootstrapRotationRecipeWrapperFailureReconcilesWithoutProposal(t *testing.T) {
 	t.Parallel()
 	f := newRotationRecipeFixture(t)
-	r, err := newBootstrapRotationRecipe(t.Context(), f.cfg)
+	r, err := clusterbootstrap.NewBootstrapRotationRecipe(t.Context(), f.cfg)
 	require.NoError(t, err)
 	f.installErr = errors.New("wrapper installation interrupted")
 	result, err := r.Run(t.Context())
 	require.ErrorIs(t, err, f.installErr)
-	require.Equal(t, bootstrapRotationPending, result.Outcome)
+	require.Equal(t, clusterbootstrap.BootstrapRotationPending, result.Outcome)
 	require.Len(t, f.calls, 1)
 	f.leader, f.installErr = false, nil
 	result, err = r.Reconcile(t.Context())
 	require.NoError(t, err, "the current applied barrier resolves the unfinished second purpose as absent")
-	require.Equal(t, bootstrapRotationReconciled, result.Outcome)
+	require.Equal(t, clusterbootstrap.BootstrapRotationReconciled, result.Outcome)
 	require.False(t, result.Complete)
 	require.Len(t, f.calls, 1, "follower reconciliation cannot call RotateDEK")
 	f.leader = true
 	result, err = r.Run(t.Context())
 	require.NoError(t, err)
-	require.Equal(t, bootstrapRotationReconciled, result.Outcome)
+	require.Equal(t, clusterbootstrap.BootstrapRotationReconciled, result.Outcome)
 	require.Len(t, f.calls, 2)
 }
 
 func TestBootstrapRotationRecipeTermChangeRetainsUnknownResponsibility(t *testing.T) {
 	t.Parallel()
 	f := newRotationRecipeFixture(t)
-	r, err := newBootstrapRotationRecipe(t.Context(), f.cfg)
+	r, err := clusterbootstrap.NewBootstrapRotationRecipe(t.Context(), f.cfg)
 	require.NoError(t, err)
 	old, cancel := context.WithCancel(t.Context())
 	f.admin = func(ctx context.Context, req *pb.RotateDEKRequest) (*pb.RotateDEKResponse, error) {
@@ -196,10 +197,10 @@ func TestBootstrapRotationRecipeTermChangeRetainsUnknownResponsibility(t *testin
 	}
 	result, err := r.Run(old)
 	require.ErrorIs(t, err, context.Canceled)
-	require.Equal(t, bootstrapRotationPending, result.Outcome)
+	require.Equal(t, clusterbootstrap.BootstrapRotationPending, result.Outcome)
 	result, err = r.Reconcile(t.Context())
 	require.NoError(t, err)
-	require.Equal(t, bootstrapRotationReconciled, result.Outcome)
+	require.Equal(t, clusterbootstrap.BootstrapRotationReconciled, result.Outcome)
 	require.False(t, result.Complete, "follower resolves responsibility but cannot claim unfinished rotation complete")
 	_, err = r.Run(t.Context())
 	require.Error(t, err)
@@ -207,17 +208,17 @@ func TestBootstrapRotationRecipeTermChangeRetainsUnknownResponsibility(t *testin
 	f.leader, f.admin = true, nil
 	result, err = r.Run(t.Context())
 	require.NoError(t, err)
-	require.Equal(t, bootstrapRotationReconciled, result.Outcome)
+	require.Equal(t, clusterbootstrap.BootstrapRotationReconciled, result.Outcome)
 	require.Len(t, f.calls, 2)
-	require.True(t, proto.Equal(r.requests[1], f.calls[1]))
+	require.True(t, proto.Equal(r.RequestsList[1], f.calls[1]))
 }
 
 func TestBootstrapRotationRecipeSupersededRequiresBarrierRegistryAndWrappers(t *testing.T) {
 	t.Parallel()
 	f := newRotationRecipeFixture(t)
-	r, err := newBootstrapRotationRecipe(t.Context(), f.cfg)
+	r, err := clusterbootstrap.NewBootstrapRotationRecipe(t.Context(), f.cfg)
 	require.NoError(t, err)
-	remote := cloneBootstrapRotationRequest(r.requests[0])
+	remote := clusterbootstrap.CloneBootstrapRotationRequest(r.RequestsList[0])
 	remote.NewDekId, remote.WrappedNewDek = 8, bytes.Repeat([]byte{8}, 40)
 	f.apply(remote)
 	f.leader = false
@@ -232,7 +233,7 @@ func TestBootstrapRotationRecipeSupersededRequiresBarrierRegistryAndWrappers(t *
 	f.register(8, 3)
 	result, err := r.Reconcile(t.Context())
 	require.NoError(t, err)
-	require.Equal(t, bootstrapRotationSuperseded, result.Outcome)
+	require.Equal(t, clusterbootstrap.BootstrapRotationSuperseded, result.Outcome)
 	require.Empty(t, f.calls)
 	require.Greater(t, f.installs, 0)
 }
@@ -242,7 +243,7 @@ func TestBootstrapRotationRecipeRejectsUnverifiedCompletion(t *testing.T) {
 	for _, corruption := range []string{"material", "purpose", "registry_epoch", "registry_identity", "wrapper", "projection_change"} {
 		t.Run(corruption, func(t *testing.T) {
 			f := newRotationRecipeFixture(t)
-			r, err := newBootstrapRotationRecipe(t.Context(), f.cfg)
+			r, err := clusterbootstrap.NewBootstrapRotationRecipe(t.Context(), f.cfg)
 			require.NoError(t, err)
 			_, err = r.Run(t.Context())
 			require.NoError(t, err)
@@ -261,7 +262,7 @@ func TestBootstrapRotationRecipeRejectsUnverifiedCompletion(t *testing.T) {
 			case "wrapper":
 				f.installErr = errors.New("wrong installed wrapper")
 			case "projection_change":
-				r.config.InstallAndVerify = func(context.Context, uint32, encryption.SidecarKey) error {
+				r.Config.InstallAndVerify = func(context.Context, uint32, encryption.SidecarKey) error {
 					f.index++
 					sc.RaftAppliedIndex = f.index
 					return encryption.WriteSidecar(f.path, sc)
@@ -277,10 +278,10 @@ func TestBootstrapRotationRecipeRejectsUnverifiedCompletion(t *testing.T) {
 			}
 			result, err := r.Reconcile(t.Context())
 			require.Error(t, err)
-			require.Equal(t, bootstrapRotationPending, result.Outcome)
+			require.Equal(t, clusterbootstrap.BootstrapRotationPending, result.Outcome)
 			if corruption == "projection_change" {
 				require.ErrorIs(t, err, encryptionwiring.ErrBootstrapEncryptionProjectionPending)
-				require.True(t, bootstrapRotationTransient(err))
+				require.True(t, clusterbootstrap.BootstrapRotationTransient(err))
 			}
 		})
 	}
@@ -289,7 +290,7 @@ func TestBootstrapRotationRecipeRejectsUnverifiedCompletion(t *testing.T) {
 func TestBootstrapRotationRecipeUnknownPartialApplyDoesNotStartNextPurpose(t *testing.T) {
 	t.Parallel()
 	f := newRotationRecipeFixture(t)
-	r, err := newBootstrapRotationRecipe(t.Context(), f.cfg)
+	r, err := clusterbootstrap.NewBootstrapRotationRecipe(t.Context(), f.cfg)
 	require.NoError(t, err)
 	unknown := errors.New("result lost during registry persistence")
 	f.admin = func(_ context.Context, req *pb.RotateDEKRequest) (*pb.RotateDEKResponse, error) {
@@ -299,7 +300,7 @@ func TestBootstrapRotationRecipeUnknownPartialApplyDoesNotStartNextPurpose(t *te
 	}
 	result, err := r.Run(t.Context())
 	require.ErrorIs(t, err, unknown)
-	require.Equal(t, bootstrapRotationPending, result.Outcome)
+	require.Equal(t, clusterbootstrap.BootstrapRotationPending, result.Outcome)
 	require.Len(t, f.calls, 1)
 	f.admin = nil
 	_, err = r.Run(t.Context())
@@ -310,7 +311,7 @@ func TestBootstrapRotationRecipeUnknownPartialApplyDoesNotStartNextPurpose(t *te
 func TestBootstrapRotationRecipeRequiresBarrierAfterLostReply(t *testing.T) {
 	t.Parallel()
 	f := newRotationRecipeFixture(t)
-	r, err := newBootstrapRotationRecipe(t.Context(), f.cfg)
+	r, err := clusterbootstrap.NewBootstrapRotationRecipe(t.Context(), f.cfg)
 	require.NoError(t, err)
 	unknown := errors.New("lost reply")
 	f.admin = func(_ context.Context, req *pb.RotateDEKRequest) (*pb.RotateDEKResponse, error) {
@@ -326,7 +327,7 @@ func TestBootstrapRotationRecipeRequiresBarrierAfterLostReply(t *testing.T) {
 	f.leader, f.barrierErr = false, nil
 	result, err = r.Reconcile(t.Context())
 	require.NoError(t, err)
-	require.Equal(t, bootstrapRotationReconciled, result.Outcome)
+	require.Equal(t, clusterbootstrap.BootstrapRotationReconciled, result.Outcome)
 	require.False(t, result.Complete)
 	require.Len(t, f.calls, 1)
 }
@@ -334,7 +335,7 @@ func TestBootstrapRotationRecipeRequiresBarrierAfterLostReply(t *testing.T) {
 func TestBootstrapRotationRecipeGrantCopiesAndCancelledInstallation(t *testing.T) {
 	t.Parallel()
 	f := newRotationRecipeFixture(t)
-	r, err := newBootstrapRotationRecipe(t.Context(), f.cfg)
+	r, err := clusterbootstrap.NewBootstrapRotationRecipe(t.Context(), f.cfg)
 	require.NoError(t, err)
 	requests := r.Requests()
 	digest := r.Digest()
@@ -344,7 +345,7 @@ func TestBootstrapRotationRecipeGrantCopiesAndCancelledInstallation(t *testing.T
 	require.NotEqual(t, requests[0].WrappedNewDek, r.Requests()[0].WrappedNewDek)
 	require.Equal(t, digest, r.Digest())
 	ctx, cancel := context.WithCancel(t.Context())
-	r.config.InstallAndVerify = func(context.Context, uint32, encryption.SidecarKey) error { cancel(); return nil }
+	r.Config.InstallAndVerify = func(context.Context, uint32, encryption.SidecarKey) error { cancel(); return nil }
 	result, err := r.Run(ctx)
 	require.ErrorIs(t, err, context.Canceled)
 	require.False(t, result.Complete)
@@ -355,12 +356,12 @@ func TestBootstrapRotationRecipePlanningIsFencedAndLeaderOnly(t *testing.T) {
 	t.Parallel()
 	f := newRotationRecipeFixture(t)
 	f.leader = false
-	_, err := newBootstrapRotationRecipe(t.Context(), f.cfg)
+	_, err := clusterbootstrap.NewBootstrapRotationRecipe(t.Context(), f.cfg)
 	require.ErrorContains(t, err, "only a leader")
 	require.Zero(t, f.barriers)
 	f.leader = true
 	f.barrierErr = errors.New("no read quorum")
-	_, err = newBootstrapRotationRecipe(t.Context(), f.cfg)
+	_, err = clusterbootstrap.NewBootstrapRotationRecipe(t.Context(), f.cfg)
 	require.ErrorIs(t, err, f.barrierErr)
 	require.Empty(t, f.calls)
 }
@@ -368,7 +369,7 @@ func TestBootstrapRotationRecipePlanningIsFencedAndLeaderOnly(t *testing.T) {
 func TestBootstrapRotationRecipeEveryAppliedKeyRetiresRun(t *testing.T) {
 	t.Parallel()
 	f := newRotationRecipeFixture(t)
-	r, err := newBootstrapRotationRecipe(t.Context(), f.cfg)
+	r, err := clusterbootstrap.NewBootstrapRotationRecipe(t.Context(), f.cfg)
 	require.NoError(t, err)
 	for i := range 2 {
 		ctx, cancel := context.WithCancel(t.Context())
@@ -386,7 +387,7 @@ func TestBootstrapRotationRecipeEveryAppliedKeyRetiresRun(t *testing.T) {
 	}
 	result, err := r.Run(t.Context())
 	require.NoError(t, err)
-	require.Equal(t, bootstrapRotationReconciled, result.Outcome)
+	require.Equal(t, clusterbootstrap.BootstrapRotationReconciled, result.Outcome)
 	require.True(t, result.Complete, "fresh generation observes exact completion without another rotation")
 	require.Len(t, f.calls, 2)
 }
@@ -394,15 +395,15 @@ func TestBootstrapRotationRecipeEveryAppliedKeyRetiresRun(t *testing.T) {
 func TestBootstrapRotationRecipeAnotherLeaderUsesSamePlannedID(t *testing.T) {
 	t.Parallel()
 	f := newRotationRecipeFixture(t)
-	r, err := newBootstrapRotationRecipe(t.Context(), f.cfg)
+	r, err := clusterbootstrap.NewBootstrapRotationRecipe(t.Context(), f.cfg)
 	require.NoError(t, err)
-	remote := cloneBootstrapRotationRequest(r.Requests()[0])
+	remote := clusterbootstrap.CloneBootstrapRotationRequest(r.Requests()[0])
 	remote.WrappedNewDek = bytes.Repeat([]byte{9}, 40)
 	f.apply(remote)
 	f.leader = false
 	result, err := r.Reconcile(t.Context())
 	require.NoError(t, err)
-	require.Equal(t, bootstrapRotationSuperseded, result.Outcome)
+	require.Equal(t, clusterbootstrap.BootstrapRotationSuperseded, result.Outcome)
 	require.False(t, result.Complete, "current material is verified but is not our recipe's completion")
 	require.Empty(t, f.calls)
 }
@@ -410,24 +411,24 @@ func TestBootstrapRotationRecipeAnotherLeaderUsesSamePlannedID(t *testing.T) {
 func TestBootstrapRotationRecipeDriftAndNotLeaderAreTransient(t *testing.T) {
 	t.Parallel()
 	f := newRotationRecipeFixture(t)
-	r, err := newBootstrapRotationRecipe(t.Context(), f.cfg)
+	r, err := clusterbootstrap.NewBootstrapRotationRecipe(t.Context(), f.cfg)
 	require.NoError(t, err)
-	r.config.Barrier = func(context.Context) (uint64, error) { return f.index - 1, nil }
+	r.Config.Barrier = func(context.Context) (uint64, error) { return f.index - 1, nil }
 	_, err = r.Run(t.Context())
 	require.ErrorIs(t, err, encryptionwiring.ErrBootstrapEncryptionProjectionPending)
-	require.True(t, bootstrapRotationTransient(err))
-	r.config.Barrier = f.cfg.Barrier
+	require.True(t, clusterbootstrap.BootstrapRotationTransient(err))
+	r.Config.Barrier = f.cfg.Barrier
 	f.leader = false
 	_, err = r.Run(t.Context())
 	require.ErrorIs(t, err, raftengine.ErrNotLeader)
-	require.True(t, bootstrapRotationTransient(err))
+	require.True(t, clusterbootstrap.BootstrapRotationTransient(err))
 	require.Empty(t, f.calls)
 }
 
 func TestBootstrapRotationRecipeUnknownCannotHideInvalidEvidence(t *testing.T) {
 	t.Parallel()
 	f := newRotationRecipeFixture(t)
-	r, err := newBootstrapRotationRecipe(t.Context(), f.cfg)
+	r, err := clusterbootstrap.NewBootstrapRotationRecipe(t.Context(), f.cfg)
 	require.NoError(t, err)
 	f.admin = func(_ context.Context, req *pb.RotateDEKRequest) (*pb.RotateDEKResponse, error) {
 		f.apply(req)
@@ -436,5 +437,5 @@ func TestBootstrapRotationRecipeUnknownCannotHideInvalidEvidence(t *testing.T) {
 	}
 	_, err = r.Run(t.Context())
 	require.ErrorIs(t, err, encryption.ErrLocalEpochRollback)
-	require.False(t, bootstrapRotationTransient(err), "unknown original result must not mask a proven rollback")
+	require.False(t, clusterbootstrap.BootstrapRotationTransient(err), "unknown original result must not mask a proven rollback")
 }

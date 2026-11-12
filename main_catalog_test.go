@@ -9,6 +9,7 @@ import (
 
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	pb "github.com/bootjp/elastickv/proto"
@@ -25,7 +26,7 @@ func TestSetupDistributionCatalog_FailsWhenRuntimeMissingForResolvedGroup(t *tes
 	engine := distribution.NewEngine()
 	engine.UpdateRoute([]byte(""), nil, 9)
 
-	_, err := setupDistributionCatalog(context.Background(), []*raftGroupRuntime{}, engine)
+	_, err := setupDistributionCatalog(context.Background(), []*clusterbootstrap.GroupRuntime{}, engine)
 	require.Error(t, err)
 	require.ErrorContains(t, err, "distribution catalog store is not available for group 9")
 }
@@ -35,7 +36,7 @@ func TestSetupDistributionCatalog_UsesResolvedCatalogGroup(t *testing.T) {
 
 	engine := distribution.NewEngine()
 	engine.UpdateRoute([]byte(""), nil, 5)
-	rt := &raftGroupRuntime{
+	rt := &clusterbootstrap.GroupRuntime{
 		GroupRuntime: &noderuntime.GroupRuntime{
 			Spec:  noderuntime.GroupSpec{ID: 5},
 			Store: store.NewMVCCStore(),
@@ -45,7 +46,7 @@ func TestSetupDistributionCatalog_UsesResolvedCatalogGroup(t *testing.T) {
 		rt.Close()
 	})
 
-	catalog, err := setupDistributionCatalog(context.Background(), []*raftGroupRuntime{rt}, engine)
+	catalog, err := setupDistributionCatalog(context.Background(), []*clusterbootstrap.GroupRuntime{rt}, engine)
 	require.NoError(t, err)
 	require.NotNil(t, catalog)
 }
@@ -53,7 +54,7 @@ func TestSetupDistributionCatalog_UsesResolvedCatalogGroup(t *testing.T) {
 func TestDistributionCatalogStoreForGroupEnablesRouteDescriptorV2Writes(t *testing.T) {
 	t.Parallel()
 
-	rt := &raftGroupRuntime{
+	rt := &clusterbootstrap.GroupRuntime{
 		GroupRuntime: &noderuntime.GroupRuntime{
 			Spec:  noderuntime.GroupSpec{ID: 5},
 			Store: store.NewMVCCStore(),
@@ -63,7 +64,7 @@ func TestDistributionCatalogStoreForGroupEnablesRouteDescriptorV2Writes(t *testi
 		rt.Close()
 	})
 
-	catalog := distributionCatalogStoreForGroup([]*raftGroupRuntime{rt}, 5)
+	catalog := distributionCatalogStoreForGroup([]*clusterbootstrap.GroupRuntime{rt}, 5)
 	require.NotNil(t, catalog)
 	require.True(t, catalog.AllowsRouteDescriptorV2Writes())
 }
@@ -177,7 +178,7 @@ func TestSplitMigrationCapabilityPeersFromConfigurationUsesCurrentMembers(t *tes
 func TestSplitMigrationCapabilityPeerSourceForRuntimesChecksAllGroups(t *testing.T) {
 	t.Parallel()
 
-	runtimes := []*raftGroupRuntime{
+	runtimes := []*clusterbootstrap.GroupRuntime{
 		{
 			GroupRuntime: &noderuntime.GroupRuntime{
 				Spec: noderuntime.GroupSpec{ID: 1},
@@ -210,7 +211,7 @@ func TestSplitMigrationCapabilityPeerSourceForRuntimesChecksAllGroups(t *testing
 func TestSplitMigrationCapabilityPeerSourceForRuntimesFailsClosedOnEmptyGroup(t *testing.T) {
 	t.Parallel()
 
-	runtimes := []*raftGroupRuntime{
+	runtimes := []*clusterbootstrap.GroupRuntime{
 		{
 			GroupRuntime: &noderuntime.GroupRuntime{
 				Spec: noderuntime.GroupSpec{ID: 1},

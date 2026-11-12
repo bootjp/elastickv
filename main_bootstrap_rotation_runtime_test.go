@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/internal/raftadmission"
@@ -23,7 +24,7 @@ import (
 type rotationRuntimeFixture struct {
 	io               *rotationRecipeFixture
 	a                *raftadmission.Arbiter
-	runtime          *bootstrapRotationRuntime
+	runtime          *clusterbootstrap.BootstrapRotationRuntime
 	policy           raftbootstrap.PolicyRecord
 	session          uint64
 	plans, refreshes atomic.Int64
@@ -38,7 +39,7 @@ func newRotationRuntimeFixture(t *testing.T, role raftengine.State) *rotationRun
 	require.NoError(t, err)
 	f.policy = raftbootstrap.PolicyRecord{Version: raftbootstrap.PolicyVersion, Identity: raftbootstrap.Identity{Cluster: raftbootstrap.UUID{1}, Group: 1},
 		BaselineDigest: digest, Minimum: raftbootstrap.Versions{Entry: 1, Snapshot: 1, Session: 1}, ActivationIndex: 1, Generation: 1, LastConfigurationIndex: 1, Configuration: configuration}
-	f.a, err = raftadmission.New(raftadmission.Config{Cluster: f.policy.Identity.Cluster, Groups: []uint64{1}, DefaultGroup: 1, EncryptionConfigured: true, RotationRequested: true, ValidatePayload: bootstrapPayloadValidator(f.policy.Identity.Cluster)})
+	f.a, err = raftadmission.New(raftadmission.Config{Cluster: f.policy.Identity.Cluster, Groups: []uint64{1}, DefaultGroup: 1, EncryptionConfigured: true, RotationRequested: true, ValidatePayload: clusterbootstrap.BootstrapPayloadValidator(f.policy.Identity.Cluster)})
 	require.NoError(t, err)
 	t.Cleanup(f.a.Close)
 	f.role(t, 1, role)
@@ -56,16 +57,16 @@ func newRotationRuntimeFixture(t *testing.T, role raftengine.State) *rotationRun
 		status, err := f.a.RotationStatus()
 		return err == nil && status.Native.Role == raftengine.StateLeader
 	}
-	f.runtime, err = newBootstrapRotationRuntime(bootstrapRotationRuntimeConfig{
-		admission: f.a, group: 1, requested: true,
-		barrier: func(ctx context.Context) (uint64, error) { return f.io.index, f.a.ValidateResult(ctx) },
-		observe: f.observe,
-		plan: func(ctx context.Context) (*bootstrapRotationRecipe, error) {
+	f.runtime, err = clusterbootstrap.NewBootstrapRotationRuntime(clusterbootstrap.BootstrapRotationRuntimeConfig{
+		Admission: f.a, Group: 1, Requested: true,
+		Barrier: func(ctx context.Context) (uint64, error) { return f.io.index, f.a.ValidateResult(ctx) },
+		Observe: f.observe,
+		Plan: func(ctx context.Context) (*clusterbootstrap.BootstrapRotationRecipe, error) {
 			f.plans.Add(1)
-			return newBootstrapRotationRecipe(ctx, f.io.cfg)
+			return clusterbootstrap.NewBootstrapRotationRecipe(ctx, f.io.cfg)
 		},
-		authorize: func(*bootstrapRotationRecipe) error { return nil },
-		refresh:   func() error { f.refreshes.Add(1); return nil },
+		Authorize: func(*clusterbootstrap.BootstrapRotationRecipe) error { return nil },
+		Refresh:   func() error { f.refreshes.Add(1); return nil },
 	})
 	require.NoError(t, err)
 	return f
@@ -115,7 +116,7 @@ func TestBootstrapRotationRuntimeLeaderResumesEachInvalidatedApply(t *testing.T)
 		return nil, raftadmission.ErrStale
 	}
 	for i := range 2 {
-		require.ErrorIs(t, f.runtime.step(t.Context()), raftadmission.ErrStale)
+		require.ErrorIs(t, f.runtime.Step(t.Context()), raftadmission.ErrStale)
 		state, err := f.a.RotationStatus()
 		require.NoError(t, err)
 		require.True(t, state.Responsibility)
@@ -123,7 +124,7 @@ func TestBootstrapRotationRuntimeLeaderResumesEachInvalidatedApply(t *testing.T)
 		require.False(t, f.a.LocalPermissionReady())
 		require.Len(t, f.io.calls, i+1)
 	}
-	require.NoError(t, f.runtime.step(t.Context()))
+	require.NoError(t, f.runtime.Step(t.Context()))
 	require.True(t, f.a.LocalPermissionReady())
 	require.Equal(t, int64(1), f.plans.Load(), "apply invalidation cannot replace the original plan")
 	require.Len(t, f.io.calls, 2)
@@ -132,13 +133,13 @@ func TestBootstrapRotationRuntimeLeaderResumesEachInvalidatedApply(t *testing.T)
 func TestBootstrapRotationRuntimeFollowerPermissionWithoutLeaderCompletion(t *testing.T) {
 	t.Parallel()
 	f := newRotationRuntimeFixture(t, raftengine.StateFollower)
-	require.NoError(t, f.runtime.step(t.Context()))
+	require.NoError(t, f.runtime.Step(t.Context()))
 	require.True(t, f.a.LocalPermissionReady())
 	require.Zero(t, f.plans.Load())
 	require.Empty(t, f.io.calls)
 	f.role(t, 2, raftengine.StateLeader)
 	require.False(t, f.a.LocalPermissionReady(), "F cannot become leader completion")
-	require.NoError(t, f.runtime.step(t.Context()))
+	require.NoError(t, f.runtime.Step(t.Context()))
 	require.True(t, f.a.LocalPermissionReady())
 	require.Len(t, f.io.calls, 2)
 }
@@ -155,9 +156,9 @@ func TestBootstrapRotationRuntimeRepairsBeforeObservingProjection(t *testing.T) 
 		}
 		return install(ctx, id, key)
 	}
-	require.Error(t, f.runtime.step(t.Context()), "repair revokes the old observation owner")
+	require.Error(t, f.runtime.Step(t.Context()), "repair revokes the old observation owner")
 	require.Empty(t, f.io.calls)
-	require.NoError(t, f.runtime.step(t.Context()))
+	require.NoError(t, f.runtime.Step(t.Context()))
 	require.True(t, f.a.LocalPermissionReady(), "new observation must reach the repaired wrapper rather than loop on pending")
 }
 
@@ -173,7 +174,7 @@ func TestBootstrapRotationRuntimeStepdownJoinsAdminBeforeFollowerPermission(t *t
 		return nil, ctx.Err()
 	}
 	done := make(chan error, 1)
-	go func() { done <- f.runtime.step(t.Context()) }()
+	go func() { done <- f.runtime.Step(t.Context()) }()
 	<-entered
 	require.NoError(t, f.a.WithNative(t.Context(), 1, func(scope raftengine.NativeScope) error {
 		scope.Observe(raftengine.NativeState{Term: 2, Role: raftengine.StateFollower, LeaderID: 92, ConfigurationIndex: 1})
@@ -189,7 +190,7 @@ func TestBootstrapRotationRuntimeStepdownJoinsAdminBeforeFollowerPermission(t *t
 	close(release)
 	require.Error(t, <-done)
 	f.role(t, 2, raftengine.StateFollower)
-	require.NoError(t, f.runtime.step(t.Context()))
+	require.NoError(t, f.runtime.Step(t.Context()))
 	require.True(t, f.a.LocalPermissionReady())
 	state, err := f.a.RotationStatus()
 	require.NoError(t, err)
@@ -218,11 +219,11 @@ func TestBootstrapRotationRuntimePanicClosesRecoveryOwner(t *testing.T) {
 	t.Parallel()
 	f := newRotationRuntimeFixture(t, raftengine.StateFollower)
 	var captured context.Context
-	f.runtime.config.observe = func(ctx context.Context) (encryptionwiring.BootstrapEncryptionProjection, error) {
+	f.runtime.Config.Observe = func(ctx context.Context) (encryptionwiring.BootstrapEncryptionProjection, error) {
 		captured = ctx
 		panic("projection panic")
 	}
-	require.Panics(t, func() { _ = f.runtime.step(t.Context()) })
+	require.Panics(t, func() { _ = f.runtime.Step(t.Context()) })
 	require.NotNil(t, captured)
 	require.Error(t, captured.Err())
 	done := make(chan struct{})

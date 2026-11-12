@@ -7,6 +7,7 @@ import (
 
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
@@ -90,7 +91,7 @@ func TestInternalReadWatermarkOptions(t *testing.T) {
 			t.Parallel()
 			raft := &startupWatermarkEngine{index: 17}
 			selected := &startupWatermarkEngine{index: 23, err: tc.err}
-			rt := &raftGroupRuntime{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 7}, Engine: raft}}
+			rt := &clusterbootstrap.GroupRuntime{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 7}, Engine: raft}}
 			groups := map[uint64]*kv.ShardGroup{}
 			if tc.wrapped || tc.err != nil {
 				group := &kv.ShardGroup{Engine: selected}

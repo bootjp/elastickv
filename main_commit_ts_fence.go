@@ -4,11 +4,12 @@ import (
 	"context"
 	"flag"
 
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/cockroachdb/errors"
 )
 
-func configureCommitTSFenceActivation(coordinate *kv.ShardedCoordinator, enabled bool, runtimes []*raftGroupRuntime) {
+func configureCommitTSFenceActivation(coordinate *kv.ShardedCoordinator, enabled bool, runtimes []*clusterbootstrap.GroupRuntime) {
 	if enabled {
 		coordinate.WithCommitTSFenceActivation().WithCommitTSFenceActivationReady(func() bool {
 			return commitTSFenceRuntimesReady(runtimes)
@@ -36,7 +37,7 @@ func validateCommitTSFenceStartup(enabled, protected bool) error {
 	return nil
 }
 
-func validateNoExistingCommitTSFenceActivation(ctx context.Context, runtimes []*raftGroupRuntime, protected bool) error {
+func validateNoExistingCommitTSFenceActivation(ctx context.Context, runtimes []*clusterbootstrap.GroupRuntime, protected bool) error {
 	for _, rt := range runtimes {
 		if rt == nil || rt.Store == nil {
 			continue

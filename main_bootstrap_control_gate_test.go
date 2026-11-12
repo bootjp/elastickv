@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/peersession"
 	"github.com/bootjp/elastickv/internal/raftadmission"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
@@ -141,7 +142,7 @@ func newBootstrapGateFixture(t *testing.T, group uint64, stages ...peersession.S
 	remote := peersession.Node{Cluster: cluster, Member: 2, Address: "client.test:9001", Key: clientKey}
 	provisions := []peersession.Provision{{Node: local, Groups: []uint64{group}}, {Node: remote, Groups: []uint64{group}}}
 	versions := raftbootstrap.Versions{Entry: 1, Snapshot: 1, Session: 1}
-	methods := bootstrapSharedGRPCMethods(group)
+	methods := clusterbootstrap.BootstrapSharedGRPCMethods(group)
 	server, err := peersession.NewOwner(peersession.Config{Local: local, Provisioned: provisions, Versions: versions, Methods: methods})
 	require.NoError(t, err)
 	client, err := peersession.NewOwner(peersession.Config{Local: remote, Provisioned: provisions, Versions: versions, Methods: methods})
@@ -163,7 +164,7 @@ func newBootstrapGateFixture(t *testing.T, group uint64, stages ...peersession.S
 		Stage: stage, Pending: peersession.PendingClear, MarkerReady: true}
 	require.NoError(t, server.UpdateGroup(projection))
 	require.NoError(t, client.UpdateGroup(projection))
-	a, err := raftadmission.New(raftadmission.Config{Cluster: cluster, DefaultGroup: group, Groups: []uint64{group}, ValidatePayload: bootstrapPayloadValidator(cluster)})
+	a, err := raftadmission.New(raftadmission.Config{Cluster: cluster, DefaultGroup: group, Groups: []uint64{group}, ValidatePayload: clusterbootstrap.BootstrapPayloadValidator(cluster)})
 	require.NoError(t, err)
 	require.NoError(t, a.WithNative(t.Context(), group, func(scope raftengine.NativeScope) error {
 		scope.Observe(raftengine.NativeState{Term: 1, Role: raftengine.StateLeader, LeaderID: 1, ConfigurationIndex: 1})
@@ -180,8 +181,8 @@ func newBootstrapGateFixture(t *testing.T, group uint64, stages ...peersession.S
 	options, err := server.ServerOptions(&tls.Config{Certificates: []tls.Certificate{serverCert}, ClientCAs: pki.roots,
 		ClientAuth: tls.RequireAndVerifyClientCert, MinVersion: tls.VersionTLS13})
 	require.NoError(t, err)
-	options = append(options, grpc.ChainUnaryInterceptor(bootstrapRegistrationReceiverInterceptor(group), func(ctx context.Context, request any, info *grpc.UnaryServerInfo, next grpc.UnaryHandler) (any, error) {
-		reply, handled, err := handleBootstrapStartupControl(ctx, bootstrapGateTestToken, a, info.FullMethod, request, next)
+	options = append(options, grpc.ChainUnaryInterceptor(clusterbootstrap.BootstrapRegistrationReceiverInterceptor(group), func(ctx context.Context, request any, info *grpc.UnaryServerInfo, next grpc.UnaryHandler) (any, error) {
+		reply, handled, err := clusterbootstrap.HandleBootstrapStartupControl(ctx, bootstrapGateTestToken, a, info.FullMethod, request, next)
 		f.handled.Store(handled)
 		if handled {
 			return reply, err
@@ -223,30 +224,30 @@ func newBootstrapGateFixture(t *testing.T, group uint64, stages ...peersession.S
 func bootstrapGateContext(t *testing.T, values ...string) (context.Context, context.CancelFunc) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-	return metadata.NewOutgoingContext(ctx, metadata.MD{bootstrapControlHeader: values}), cancel
+	return metadata.NewOutgoingContext(ctx, metadata.MD{clusterbootstrap.BootstrapControlHeader: values}), cancel
 }
 
 func TestBootstrapControlGateTokenExactAndDedicated(t *testing.T) {
 	t.Parallel()
 	for _, values := range [][]string{nil, {""}, {"wrong"}, {bootstrapGateTestToken + " "},
 		{bootstrapGateTestToken, bootstrapGateTestToken}} {
-		ctx := metadata.NewIncomingContext(t.Context(), metadata.MD{bootstrapControlHeader: values})
-		require.False(t, bootstrapStartupTokenMatches(ctx, bootstrapGateTestToken))
+		ctx := metadata.NewIncomingContext(t.Context(), metadata.MD{clusterbootstrap.BootstrapControlHeader: values})
+		require.False(t, clusterbootstrap.BootstrapStartupTokenMatches(ctx, bootstrapGateTestToken))
 	}
-	ctx := metadata.NewIncomingContext(t.Context(), metadata.Pairs(bootstrapControlHeader, bootstrapGateTestToken))
-	require.True(t, bootstrapStartupTokenMatches(ctx, bootstrapGateTestToken))
-	require.False(t, bootstrapStartupTokenMatches(ctx, ""))
+	ctx := metadata.NewIncomingContext(t.Context(), metadata.Pairs(clusterbootstrap.BootstrapControlHeader, bootstrapGateTestToken))
+	require.True(t, clusterbootstrap.BootstrapStartupTokenMatches(ctx, bootstrapGateTestToken))
+	require.False(t, clusterbootstrap.BootstrapStartupTokenMatches(ctx, ""))
 	for _, header := range []string{"authorization", "x-elastickv-migration-token", "x-elastickv-s3-blob-token"} {
 		ctx = metadata.NewIncomingContext(t.Context(), metadata.Pairs(header, bootstrapGateTestToken))
-		require.False(t, bootstrapStartupTokenMatches(ctx, bootstrapGateTestToken))
+		require.False(t, clusterbootstrap.BootstrapStartupTokenMatches(ctx, bootstrapGateTestToken))
 	}
 }
 
 func TestBootstrapControlGateHeadersCannotMintReceipt(t *testing.T) {
 	t.Parallel()
-	ctx := metadata.NewIncomingContext(t.Context(), metadata.Pairs(bootstrapControlHeader, bootstrapGateTestToken,
+	ctx := metadata.NewIncomingContext(t.Context(), metadata.Pairs(clusterbootstrap.BootstrapControlHeader, bootstrapGateTestToken,
 		"x-elastickv-peer-session", "forged", "x-elastickv-peer-proof", "forged"))
-	_, handled, err := handleBootstrapStartupControl(ctx, bootstrapGateTestToken, nil,
+	_, handled, err := clusterbootstrap.HandleBootstrapStartupControl(ctx, bootstrapGateTestToken, nil,
 		pb.Distribution_GetTimestamp_FullMethodName, &pb.GetTimestampRequest{}, nil)
 	require.NoError(t, err)
 	require.False(t, handled)
@@ -327,7 +328,7 @@ func TestBootstrapControlGateDescriptorDoesNotExpandAuthority(t *testing.T) {
 	t.Parallel()
 	for _, method := range []string{pb.RawKV_RawGet_FullMethodName, pb.Internal_Forward_FullMethodName,
 		pb.EncryptionAdmin_RotateDEK_FullMethodName, pb.Admin_BeginBackup_FullMethodName, "/unknown/Control"} {
-		_, _, ok := bootstrapStartupControlDescriptor(17, method)
+		_, _, ok := clusterbootstrap.BootstrapStartupControlDescriptor(17, method)
 		require.False(t, ok)
 	}
 }
@@ -347,7 +348,7 @@ func TestBootstrapControlGateTLSActivationUsesRecoveryBeforeControlReady(t *test
 		}
 		// Reusing a real PolicyControl receipt for a prepare Control request
 		// must fail descriptor-derived traffic comparison, not gain authority.
-		if err := validateBootstrapStartupControl(ctx, bootstrapGateTestToken, descriptor.Name,
+		if err := clusterbootstrap.ValidateBootstrapStartupControl(ctx, bootstrapGateTestToken, descriptor.Name,
 			&pb.ForwardAdminProposalRequest{Payload: kv.EncodePrepareEvidenceSeal()}, receipt, descriptor); err == nil {
 			return status.Error(codes.Internal, "policy receipt authorized a prepare control")
 		}

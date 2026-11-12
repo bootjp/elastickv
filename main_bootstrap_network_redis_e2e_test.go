@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
@@ -30,7 +31,7 @@ func bootstrapNetworkRedisProfile(t *testing.T) ([]*multiEnablementProcess, raft
 	for _, identity := range identities {
 		acks = append(acks, multiEnablementPrepareAck(t, identity, manifest))
 	}
-	payload, err := assembleBootstrapActivation(manifest, manifest.BaselineContext, acks)
+	payload, err := clusterbootstrap.AssembleBootstrapActivation(manifest, manifest.BaselineContext, acks)
 	require.NoError(t, err)
 	activationPath := filepath.Join(t.TempDir(), "activation.bin")
 	require.NoError(t, os.WriteFile(activationPath, payload, 0o600))
@@ -65,7 +66,7 @@ func bootstrapNetworkPrepareRedis(t *testing.T, process *multiEnablementProcess,
 	tracker := kv.NewActiveTimestampTracker()
 	t.Cleanup(tracker.Close)
 	server, compactor, listener, err := prepareRedisServer(process.ctx, &net.ListenConfig{}, "127.0.0.1:0", process.shards,
-		newStartupGatedCoordinator(process.coordinate, process.gate), leaders, nil, registry, tracker, nil, 0)
+		clusterbootstrap.NewStartupGatedCoordinator(process.coordinate, process.gate), leaders, nil, registry, tracker, nil, 0)
 	require.NoError(t, err)
 	t.Cleanup(server.Stop)
 	client := redis.NewClient(&redis.Options{Addr: listener.Addr().String(), Protocol: 2, DisableIdentity: true, MaxRetries: -1, ContextTimeoutEnabled: true})
@@ -92,10 +93,10 @@ func TestBootstrapNetworkRedisFollowerAfterAcceptedBaseline(t *testing.T) {
 	for _, process := range processes {
 		require.False(t, process.runtime.PublicReady())
 	}
-	startBootstrapActivationWorkers(leader.ctx, leader.eg, []*raftGroupRuntime{leader.runtime}, map[uint64]*kv.ShardGroup{1: leader.shard})
+	clusterbootstrap.StartBootstrapActivationWorkers(leader.ctx, leader.eg, []*clusterbootstrap.GroupRuntime{leader.runtime}, map[uint64]*kv.ShardGroup{1: leader.shard})
 	for _, process := range processes {
 		require.Eventually(t, process.runtime.PublicReady, bootstrapE2EWaitTimeout, 10*time.Millisecond)
-		require.True(t, process.runtime.bootstrapNetwork.dataReady())
+		require.True(t, process.runtime.BootstrapNetwork.DataReady())
 	}
 	// Real Redis ingress/forwarding retains Data ownership at each receiver.
 	// Redis TCP forwarding is distinct from the pinned gRPC network tests.

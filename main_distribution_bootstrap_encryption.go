@@ -5,6 +5,7 @@ import (
 	"log/slog"
 
 	internalutil "github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/encryption/kek"
 	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/internal/raftadmission"
@@ -15,10 +16,10 @@ import (
 )
 
 type bootstrapEncryptionStartupConfig struct {
-	runtimes     []*raftGroupRuntime
+	runtimes     []*clusterbootstrap.GroupRuntime
 	groups       map[uint64]*kv.ShardGroup
 	defaultGroup uint64
-	network      *bootstrapNetwork
+	network      *clusterbootstrap.BootstrapNetwork
 	wiring       encryptionwiring.WriteWiring
 	sidecarPath  string
 	wrapper      kek.Wrapper
@@ -45,7 +46,7 @@ func startDistributionWithBootstrapEncryption(in distributionStartupInput, cfg b
 // Construct real IO under startup exclusivity, before registration watchers.
 // The supervisor may retry registration-dependent observations before listeners
 // start; Wait is consumed only after the normal Raft listeners have started.
-func configureBootstrapEncryptionStartup(ctx context.Context, cfg bootstrapEncryptionStartupConfig) (context.Context, *bootstrapRotationRuntime, error) {
+func configureBootstrapEncryptionStartup(ctx context.Context, cfg bootstrapEncryptionStartupConfig) (context.Context, *clusterbootstrap.BootstrapRotationRuntime, error) {
 	domain, err := cfg.protectedDomain()
 	if err != nil {
 		return nil, nil, err
@@ -56,41 +57,41 @@ func configureBootstrapEncryptionStartup(ctx context.Context, cfg bootstrapEncry
 	if err := cfg.validateOwnership(); err != nil {
 		return nil, nil, err
 	}
-	rt := findDefaultGroupRuntime(cfg.runtimes, cfg.defaultGroup)
-	io, err := newBootstrapEncryptionRuntimeIO(bootstrapEncryptionRuntimeIOConfig{
+	rt := clusterbootstrap.FindDefaultGroupRuntime(cfg.runtimes, cfg.defaultGroup)
+	io, err := clusterbootstrap.NewBootstrapEncryptionRuntimeIO(clusterbootstrap.BootstrapEncryptionRuntimeIOConfig{
 		DefaultRuntime: rt, Group: cfg.groups[cfg.defaultGroup], Wiring: cfg.wiring,
 		SidecarPath: cfg.sidecarPath, Wrapper: cfg.wrapper, Domain: domain, NodeID: cfg.nodeID, RotationRequested: cfg.requested,
 	})
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, errors.WithStack(err)
 	}
 	if !cfg.wiring.Cache.StorageEnvelopeActive() {
 		return nil, nil, errors.Wrap(encryptionwiring.ErrBootstrapEncryptionUnsupported, "protected encrypted startup requires an already active storage envelope; inactive-key registration is unsupported")
 	}
-	registered, err := withBootstrapRegistration(ctx, cfg.network, cfg.defaultGroup, cfg.nodeID, io.ValidateEpoch)
+	registered, err := clusterbootstrap.WithBootstrapRegistration(ctx, cfg.network, cfg.defaultGroup, cfg.nodeID, io.ValidateEpoch)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, errors.WithStack(err)
 	}
 	barrier, err := bootstrapEncryptionRecoveryBarrier(domain, rt)
 	if err != nil {
 		return nil, nil, err
 	}
-	recipeConfig := io.RecipeConfig(barrier, domain.admission.ValidateResult)
-	supervisor, err := newBootstrapRotationRuntime(bootstrapRotationRuntimeConfig{
-		admission: domain.admission, group: cfg.defaultGroup, requested: cfg.requested,
-		barrier: barrier, observe: io.Observe,
-		plan: func(ctx context.Context) (*bootstrapRotationRecipe, error) {
-			return newBootstrapRotationRecipe(ctx, recipeConfig)
+	recipeConfig := io.RecipeConfig(barrier, domain.Admission.ValidateResult)
+	supervisor, err := clusterbootstrap.NewBootstrapRotationRuntime(clusterbootstrap.BootstrapRotationRuntimeConfig{
+		Admission: domain.Admission, Group: cfg.defaultGroup, Requested: cfg.requested,
+		Barrier: barrier, Observe: io.Observe,
+		Plan: func(ctx context.Context) (*clusterbootstrap.BootstrapRotationRecipe, error) {
+			return clusterbootstrap.NewBootstrapRotationRecipe(ctx, recipeConfig)
 		},
-		planExternal: func(ctx context.Context, request *pb.RotateDEKRequest) (*bootstrapRotationRecipe, error) {
-			return newBootstrapExternalRotationRecipe(ctx, recipeConfig, request)
+		PlanExternal: func(ctx context.Context, request *pb.RotateDEKRequest) (*clusterbootstrap.BootstrapRotationRecipe, error) {
+			return clusterbootstrap.NewBootstrapExternalRotationRecipe(ctx, recipeConfig, request)
 		},
-		authorize: domain.authorizeRotationRecipe, refresh: domain.refresh,
+		Authorize: domain.AuthorizeRotationRecipe, Refresh: domain.Refresh,
 	})
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, errors.WithStack(err)
 	}
-	domain.setProtectedRotationHandler(supervisor.RotateDEK)
+	domain.SetProtectedRotationHandler(supervisor.RotateDEK)
 	worker, cancel := context.WithCancel(registered)
 	done := make(chan struct{})
 	cfg.eg.Go(func() error { defer close(done); return supervisor.Run(worker) })
@@ -98,8 +99,8 @@ func configureBootstrapEncryptionStartup(ctx context.Context, cfg bootstrapEncry
 	return registered, supervisor, nil
 }
 
-func (cfg bootstrapEncryptionStartupConfig) protectedDomain() (*bootstrapDomain, error) {
-	domain := bootstrapDomainForRuntimes(cfg.runtimes)
+func (cfg bootstrapEncryptionStartupConfig) protectedDomain() (*clusterbootstrap.BootstrapDomain, error) {
+	domain := clusterbootstrap.BootstrapDomainForRuntimes(cfg.runtimes)
 	if domain == nil || cfg.wiring.EncryptionConfigured() {
 		return domain, nil
 	}
@@ -120,44 +121,44 @@ type bootstrapRecoveryReader interface {
 	RecoveryLinearizableRead(context.Context) (uint64, error)
 }
 
-func bootstrapEncryptionRecoveryBarrier(domain *bootstrapDomain, rt *raftGroupRuntime) (func(context.Context) (uint64, error), error) {
-	if domain == nil || domain.admission == nil || rt == nil {
+func bootstrapEncryptionRecoveryBarrier(domain *clusterbootstrap.BootstrapDomain, rt *clusterbootstrap.GroupRuntime) (func(context.Context) (uint64, error), error) {
+	if domain == nil || domain.Admission == nil || rt == nil {
 		return nil, errors.New("protected encryption recovery barrier lacks runtime")
 	}
-	engine := rt.snapshotEngine()
+	engine := clusterbootstrap.RuntimeCore(rt).SnapshotEngine()
 	reader, ok := engine.(bootstrapRecoveryReader)
 	if !ok {
 		return nil, errors.New("protected encryption requires native Recovery read barrier")
 	}
 	return func(ctx context.Context) (uint64, error) {
-		owned, finish, err := domain.admission.Enter(ctx, raftadmission.Recovery, rt.Spec.ID)
+		owned, finish, err := domain.Admission.Enter(ctx, raftadmission.Recovery, rt.Spec.ID)
 		if err != nil {
 			return 0, errors.WithStack(err)
 		}
 		var index uint64
-		_, err = runBootstrapStartupControl(owned, nil, func(ctx context.Context, _ any) (any, error) {
-			if rt.snapshotEngine() != engine {
+		_, err = clusterbootstrap.RunBootstrapStartupControl(owned, nil, func(ctx context.Context, _ any) (any, error) {
+			if clusterbootstrap.RuntimeCore(rt).SnapshotEngine() != engine {
 				return nil, errors.New("protected encryption recovery engine retired")
 			}
 			var err error
 			index, err = reader.RecoveryLinearizableRead(ctx)
-			if err == nil && rt.snapshotEngine() != engine {
+			if err == nil && clusterbootstrap.RuntimeCore(rt).SnapshotEngine() != engine {
 				return nil, errors.New("protected encryption recovery engine retired")
 			}
 			return nil, errors.WithStack(err)
 		}, finish)
 		if err != nil {
-			return 0, err
+			return 0, errors.WithStack(err)
 		}
 		return index, nil
 	}, nil
 }
 
-func installBootstrapStartupRotation(supervisor *bootstrapRotationRuntime, ctx context.Context, cfg bootstrapEncryptionStartupConfig) (func(), encryptionwiring.StartupRotationWaiter) {
+func installBootstrapStartupRotation(supervisor *clusterbootstrap.BootstrapRotationRuntime, ctx context.Context, cfg bootstrapEncryptionStartupConfig) (func(), encryptionwiring.StartupRotationWaiter) {
 	if supervisor != nil {
-		return func() {}, encryptionwiring.StartupRotationWaiter{WaitFunc: supervisor.Wait, BlockMutator: func() bool { return !supervisor.config.admission.LocalPermissionReady() }}
+		return func() {}, encryptionwiring.StartupRotationWaiter{WaitFunc: supervisor.Wait, BlockMutator: func() bool { return !supervisor.Config.Admission.LocalPermissionReady() }}
 	}
-	rt := findDefaultGroupRuntime(cfg.runtimes, cfg.defaultGroup)
-	return encryptionwiring.InstallRotateOnStartup(ctx, cfg.requested, runtimeCore(rt), postCutoverProposerForRuntime(rt, cfg.groups), cfg.sidecarPath,
+	rt := clusterbootstrap.FindDefaultGroupRuntime(cfg.runtimes, cfg.defaultGroup)
+	return encryptionwiring.InstallRotateOnStartup(ctx, cfg.requested, clusterbootstrap.RuntimeCore(rt), postCutoverProposerForRuntime(rt, cfg.groups), cfg.sidecarPath,
 		cfg.wrapper, cfg.wiring.RaftEnvelope, cfg.nodeID, cfg.wiring.Epoch, cfg.wiring.RaftEpoch, slog.Default())
 }

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/internal/noderuntime"
@@ -25,8 +26,8 @@ import (
 func TestCheckSidecarBehindRaftLog_NilEngineFailsClosed(t *testing.T) {
 	t.Parallel()
 	sidecarPath := writeMinimalSidecar(t, 10)
-	rt := &raftGroupRuntime{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 1}}} // engine field stays nil
-	err := encryptionwiring.CheckSidecarBehindRaftLog(runtimeCores([]*raftGroupRuntime{rt}), 1, sidecarPath, true)
+	rt := &clusterbootstrap.GroupRuntime{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 1}}} // engine field stays nil
+	err := encryptionwiring.CheckSidecarBehindRaftLog(clusterbootstrap.RuntimeCores([]*clusterbootstrap.GroupRuntime{rt}), 1, sidecarPath, true)
 	if err == nil {
 		t.Fatal("guard must fail-closed when default-group engine is nil")
 	}
@@ -38,13 +39,13 @@ func TestCheckSidecarBehindRaftLog_NilEngineFailsClosed(t *testing.T) {
 func TestCheckEnvelopeCutoverDivergenceStartupGuard_Fires(t *testing.T) {
 	t.Parallel()
 	sidecarPath := writeRaftCutoverSidecarForStartup(t, 8, 3, 100)
-	rt := &raftGroupRuntime{
+	rt := &clusterbootstrap.GroupRuntime{
 		GroupRuntime: &noderuntime.GroupRuntime{
 			Spec:         noderuntime.GroupSpec{ID: 1},
 			StateMachine: &stubRestoredCutoverStateMachine{cutover: 200},
 		},
 	}
-	err := encryptionwiring.CheckEnvelopeCutoverDivergenceStartupGuard(runtimeCores([]*raftGroupRuntime{rt}), 1, sidecarPath, true)
+	err := encryptionwiring.CheckEnvelopeCutoverDivergenceStartupGuard(clusterbootstrap.RuntimeCores([]*clusterbootstrap.GroupRuntime{rt}), 1, sidecarPath, true)
 	if !errors.Is(err, encryption.ErrEnvelopeCutoverDivergence) {
 		t.Fatalf("cutover guard must fire ErrEnvelopeCutoverDivergence, got %v", err)
 	}
@@ -53,13 +54,13 @@ func TestCheckEnvelopeCutoverDivergenceStartupGuard_Fires(t *testing.T) {
 func TestCheckEnvelopeCutoverDivergenceStartupGuard_Match(t *testing.T) {
 	t.Parallel()
 	sidecarPath := writeRaftCutoverSidecarForStartup(t, 8, 3, 100)
-	rt := &raftGroupRuntime{
+	rt := &clusterbootstrap.GroupRuntime{
 		GroupRuntime: &noderuntime.GroupRuntime{
 			Spec:         noderuntime.GroupSpec{ID: 1},
 			StateMachine: &stubRestoredCutoverStateMachine{cutover: 100},
 		},
 	}
-	if err := encryptionwiring.CheckEnvelopeCutoverDivergenceStartupGuard(runtimeCores([]*raftGroupRuntime{rt}), 1, sidecarPath, true); err != nil {
+	if err := encryptionwiring.CheckEnvelopeCutoverDivergenceStartupGuard(clusterbootstrap.RuntimeCores([]*clusterbootstrap.GroupRuntime{rt}), 1, sidecarPath, true); err != nil {
 		t.Fatalf("matching snapshot/sidecar cutover must pass, got %v", err)
 	}
 }
@@ -67,13 +68,13 @@ func TestCheckEnvelopeCutoverDivergenceStartupGuard_Match(t *testing.T) {
 func TestCheckEnvelopeCutoverDivergenceStartupGuard_PreBootstrapSkips(t *testing.T) {
 	t.Parallel()
 	sidecarPath := writeMinimalSidecar(t, 1)
-	rt := &raftGroupRuntime{
+	rt := &clusterbootstrap.GroupRuntime{
 		GroupRuntime: &noderuntime.GroupRuntime{
 			Spec:         noderuntime.GroupSpec{ID: 1},
 			StateMachine: &stubRestoredCutoverStateMachine{cutover: 0},
 		},
 	}
-	if err := encryptionwiring.CheckEnvelopeCutoverDivergenceStartupGuard(runtimeCores([]*raftGroupRuntime{rt}), 1, sidecarPath, true); err != nil {
+	if err := encryptionwiring.CheckEnvelopeCutoverDivergenceStartupGuard(clusterbootstrap.RuntimeCores([]*clusterbootstrap.GroupRuntime{rt}), 1, sidecarPath, true); err != nil {
 		t.Fatalf("pre-bootstrap sidecar must skip cutover divergence guard, got %v", err)
 	}
 }
@@ -162,7 +163,7 @@ func TestCheckLocalEpochRollbackAfterReplay_RejectsEqualEpochAfterBump(t *testin
 
 	err = encryptionwiring.CheckLocalEpochRollbackAfterReplay(
 		"n1",
-		runtimeCores([]*raftGroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 1}, Store: st}}}),
+		clusterbootstrap.RuntimeCores([]*clusterbootstrap.GroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 1}, Store: st}}}),
 		1,
 		sidecarPath,
 		true,
@@ -189,7 +190,7 @@ func TestCheckLocalEpochRollbackAfterReplay_AllowsBumpedAheadEpoch(t *testing.T)
 
 	err = encryptionwiring.CheckLocalEpochRollbackAfterReplay(
 		"n1",
-		runtimeCores([]*raftGroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 1}, Store: st}}}),
+		clusterbootstrap.RuntimeCores([]*clusterbootstrap.GroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 1}, Store: st}}}),
 		1,
 		sidecarPath,
 		true,

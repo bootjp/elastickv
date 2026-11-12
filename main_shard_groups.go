@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryption/kek"
 	"github.com/bootjp/elastickv/internal/encryptionwiring"
@@ -49,12 +50,12 @@ func durationToTicks(timeout time.Duration, tick time.Duration, min int) int {
 	return ticks
 }
 
-func startRaftEngineLifecycleWatchers(ctx context.Context, eg *errgroup.Group, runtimes []*raftGroupRuntime) {
+func startRaftEngineLifecycleWatchers(ctx context.Context, eg *errgroup.Group, runtimes []*clusterbootstrap.GroupRuntime) {
 	for _, rt := range runtimes {
 		if rt == nil {
 			continue
 		}
-		engine := rt.snapshotEngine()
+		engine := clusterbootstrap.RuntimeCore(rt).SnapshotEngine()
 		lifecycle, ok := engine.(raftengine.Lifecycle)
 		if !ok {
 			continue
@@ -100,7 +101,7 @@ func buildShardGroups(
 	encWiring encryptionwiring.WriteWiring,
 	routeEngine *distribution.Engine,
 	applyObservers ...kv.ApplyObserver,
-) ([]*raftGroupRuntime, map[uint64]*kv.ShardGroup, error) {
+) ([]*clusterbootstrap.GroupRuntime, map[uint64]*kv.ShardGroup, error) {
 	// Defend the "cache is always non-nil" contract for callers that
 	// pass a zero-value encryptionwiring.WriteWiring{} (the encryption-off
 	// test harnesses). WithStateCache(nil) would otherwise make
@@ -108,9 +109,9 @@ func buildShardGroups(
 	// breaking the shared-cache invariant 6D-6c-1 relies on.
 	encWiring = encWiring.WithDefaultedCache()
 	multi = noderuntime.EffectiveMultiDataDirs(groups, multi)
-	bootstrapSpecs, bootstrapDomain, err := loadProtectedBootstrapDomain(raftID, raftDir, groups, multi, bootstrapCfg, encWiring)
+	bootstrapSpecs, bootstrapDomain, err := clusterbootstrap.LoadProtectedBootstrapDomain(raftID, raftDir, groups, multi, bootstrapCfg, encWiring)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, errors.WithStack(err)
 	}
 	builder := shardGroupBuilder{
 		raftID:                   raftID,
@@ -130,14 +131,14 @@ func buildShardGroups(
 		applyObservers:           applyObservers,
 		bootstrapSpecs:           bootstrapSpecs,
 	}
-	runtimes := make([]*raftGroupRuntime, 0, len(groups))
+	runtimes := make([]*clusterbootstrap.GroupRuntime, 0, len(groups))
 	shardGroups := make(map[uint64]*kv.ShardGroup, len(groups))
 	for _, g := range groups {
 		runtime, sg, err := builder.build(g)
 		if err != nil {
 			closeRaftGroupRuntimes(runtimes)
 			if bootstrapDomain != nil {
-				bootstrapDomain.admission.Close()
+				bootstrapDomain.Admission.Close()
 			}
 			return nil, nil, err
 		}
@@ -145,10 +146,10 @@ func buildShardGroups(
 		shardGroups[g.ID] = sg
 		encWiring.AttachRaftEnvelopeGroup(g.ID, sg)
 		if bootstrapDomain != nil {
-			if err := bootstrapDomain.attachEncryptionGroup(g.ID, sg); err != nil {
+			if err := bootstrapDomain.AttachEncryptionGroup(g.ID, sg); err != nil {
 				closeRaftGroupRuntimes(runtimes)
-				bootstrapDomain.admission.Close()
-				return nil, nil, err
+				bootstrapDomain.Admission.Close()
+				return nil, nil, errors.WithStack(err)
 			}
 		}
 	}
@@ -171,17 +172,18 @@ type shardGroupBuilder struct {
 	encWiring                encryptionwiring.WriteWiring
 	routeEngine              *distribution.Engine
 	applyObservers           []kv.ApplyObserver
-	bootstrapSpecs           map[uint64]*groupBootstrapSpec
+	bootstrapSpecs           map[uint64]*clusterbootstrap.GroupBootstrapSpec
 }
 
-func (b shardGroupBuilder) build(group noderuntime.GroupSpec) (*raftGroupRuntime, *kv.ShardGroup, error) {
+func (b shardGroupBuilder) build(group noderuntime.GroupSpec) (*clusterbootstrap.GroupRuntime, *kv.ShardGroup, error) {
 	groupBootstrap, groupBootstrapServers, groupBootstrapSeed := noderuntime.BootstrapSettingsForGroup(b.bootstrapCfg, group.ID, b.bootstrap)
 	observer := observerForGroup(b.proposalObserverForGroup, group.ID)
 	if group.ID == noderuntime.DedicatedTSORaftGroupID {
 		if spec := b.bootstrapSpecs[group.ID]; spec != nil {
-			return buildProtectedDedicatedTSOGroup(b.raftID, group, b.raftDir, b.multi, groupBootstrap, b.bootstrapCfg.JoinAsLearner,
+			runtime, sg, err := clusterbootstrap.BuildProtectedDedicatedTSOGroup(b.raftID, group, b.raftDir, b.multi, groupBootstrap, b.bootstrapCfg.JoinAsLearner,
 				groupBootstrapServers, groupBootstrapSeed, b.factory, b.clock, observer,
-				spec, spec.domain, bootstrapPublicGRPCMethods(), b.encWiring.PebbleOptions()...)
+				spec, spec.Domain, clusterbootstrap.BootstrapPublicGRPCMethods(), b.encWiring.PebbleOptions()...)
+			return runtime, sg, errors.WithStack(err)
 		}
 		if b.bootstrapCfg.PeerConfigDir != "" {
 			return nil, nil, errors.New("protected timestamp group missing bootstrap domain configuration")
@@ -202,7 +204,7 @@ func (b shardGroupBuilder) buildDataGroup(
 	bootstrapServers []raftengine.Server,
 	bootstrapSeed []raftengine.Server,
 	proposalObserver kv.ProposalObserver,
-) (*raftGroupRuntime, *kv.ShardGroup, error) {
+) (*clusterbootstrap.GroupRuntime, *kv.ShardGroup, error) {
 	dir := noderuntime.GroupDataDir(b.raftDir, b.raftID, group.ID, b.multi)
 	bootstrapSpec, err := b.bootstrapSpecForGroup(group.ID)
 	if err != nil {
@@ -215,10 +217,10 @@ func (b shardGroupBuilder) buildDataGroup(
 	if err != nil {
 		return nil, nil, errors.Wrapf(err, "failed to open pebble fsm store for group %d", group.ID)
 	}
-	factory, err := bootstrapFactoryForGroup(b.factory, bootstrapSpec, st)
+	factory, err := clusterbootstrap.BootstrapFactoryForGroup(b.factory, bootstrapSpec, st)
 	if err != nil {
 		_ = st.Close()
-		return nil, nil, err
+		return nil, nil, errors.WithStack(err)
 	}
 	reg, err := store.WriterRegistryFor(st)
 	if err != nil {
@@ -241,27 +243,27 @@ func (b shardGroupBuilder) buildDataGroup(
 		_ = st.Close()
 		return nil, nil, errors.Wrapf(err, "failed to start raft group %d", group.ID)
 	}
-	runtime := &raftGroupRuntime{GroupRuntime: inner}
+	runtime := &clusterbootstrap.GroupRuntime{GroupRuntime: inner}
 	// Every group goes through the wrap-aware proposer so HLC renewals and
 	// transactional proposals observe raft-envelope cutovers uniformly.
 	sg := &kv.ShardGroup{Engine: runtime.Engine, Store: st}
 	if bootstrapSpec != nil {
-		runtime.bootstrapDomain = bootstrapSpec.domain
-		runtime.bootstrapPeerConfig = bootstrapSpec.config
+		runtime.BootstrapDomain = bootstrapSpec.Domain
+		runtime.BootstrapPeerConfig = bootstrapSpec.Config
 	}
 	sg.Txn = kv.NewLeaderProxyForShardGroup(sg, kv.WithProposalObserver(proposalObserver))
 	return runtime, sg, nil
 }
 
-func (b shardGroupBuilder) newDataGroupFSM(st store.MVCCStore, applier *encryption.Applier, groupID uint64, bootstrapSpec *groupBootstrapSpec) raftengine.StateMachine {
+func (b shardGroupBuilder) newDataGroupFSM(st store.MVCCStore, applier *encryption.Applier, groupID uint64, bootstrapSpec *clusterbootstrap.GroupBootstrapSpec) raftengine.StateMachine {
 	opts := fsmOptionsForGroup(applier, b.routeEngine, groupID, b.encWiring, b.applyObservers...)
 	if bootstrapSpec != nil {
-		opts = append(opts, kv.WithRaftBootstrapIdentity(bootstrapSpec.config.local.Cluster, groupID))
+		opts = append(opts, kv.WithRaftBootstrapIdentity(bootstrapSpec.Config.Local.Cluster, groupID))
 	}
 	return kv.NewKvFSMWithHLCAndTracker(st, b.clock, b.readTracker, opts...)
 }
 
-func closeRaftGroupRuntimes(runtimes []*raftGroupRuntime) {
+func closeRaftGroupRuntimes(runtimes []*clusterbootstrap.GroupRuntime) {
 	for _, runtime := range runtimes {
 		runtime.Close()
 	}
@@ -285,7 +287,7 @@ func buildDedicatedTSOGroup(
 	factory raftengine.Factory,
 	clock *kv.HLC,
 	proposalObserver kv.ProposalObserver,
-) (*raftGroupRuntime, *kv.ShardGroup, error) {
+) (*clusterbootstrap.GroupRuntime, *kv.ShardGroup, error) {
 	sm := kv.NewTSOStateMachine(clock)
 	inner, err := noderuntime.BuildRuntimeForGroup(
 		raftID, group, baseDir, multi, bootstrap,
@@ -295,7 +297,7 @@ func buildDedicatedTSOGroup(
 	if err != nil {
 		return nil, nil, errors.WithStack(err)
 	}
-	runtime := &raftGroupRuntime{GroupRuntime: inner}
+	runtime := &clusterbootstrap.GroupRuntime{GroupRuntime: inner}
 	sg := &kv.ShardGroup{Engine: runtime.Engine, TSOState: sm}
 	sg.Txn = kv.NewLeaderProxyForShardGroup(sg, kv.WithProposalObserver(proposalObserver))
 	return runtime, sg, nil
@@ -332,12 +334,12 @@ func observerForGroup(factory func(uint64) kv.ProposalObserver, groupID uint64) 
 // NewLeaderProxyForShardGroup; this helper extends the same
 // guarantee to the Internal.Forward path that follower-forwarded
 // writes ride (codex P1 round-1 r2).
-func proposerForGroup(rt *raftGroupRuntime, shardGroups map[uint64]*kv.ShardGroup) raftengine.Proposer {
+func proposerForGroup(rt *clusterbootstrap.GroupRuntime, shardGroups map[uint64]*kv.ShardGroup) raftengine.Proposer {
 	return noderuntime.ProposerForGroup(rt.GroupRuntime, shardGroups)
 }
 
-func postCutoverProposerForRuntime(rt *raftGroupRuntime, shardGroups map[uint64]*kv.ShardGroup) raftengine.Proposer {
-	return noderuntime.PostCutoverProposer(runtimeCore(rt), shardGroups)
+func postCutoverProposerForRuntime(rt *clusterbootstrap.GroupRuntime, shardGroups map[uint64]*kv.ShardGroup) raftengine.Proposer {
+	return noderuntime.PostCutoverProposer(clusterbootstrap.RuntimeCore(rt), shardGroups)
 }
 
 // buildShardGroupsWithEncryptionWiring assembles the storage-envelope
@@ -365,7 +367,7 @@ func buildShardGroupsWithEncryptionWiring(
 	routeEngine *distribution.Engine,
 	encryptionObserver store.EncryptionObserver,
 	applyObservers ...kv.ApplyObserver,
-) ([]*raftGroupRuntime, map[uint64]*kv.ShardGroup, encryptionwiring.WriteWiring, error) {
+) ([]*clusterbootstrap.GroupRuntime, map[uint64]*kv.ShardGroup, encryptionwiring.WriteWiring, error) {
 	if guardErr := encryptionwiring.CheckMembershipStartupGuardsBeforeEngine(encryptionwiring.MembershipStartupGuardInput{
 		RaftID:            raftID,
 		RaftDir:           raftDir,
@@ -389,7 +391,7 @@ func buildShardGroupsWithEncryptionWiring(
 	if err != nil {
 		return runtimes, shardGroups, encWiring, err
 	}
-	if guardErr := encryptionwiring.CheckLocalEpochRollbackAfterReplay(raftID, runtimeCores(runtimes), defaultGroup, sidecarPath, encryptionEnabled); guardErr != nil {
+	if guardErr := encryptionwiring.CheckLocalEpochRollbackAfterReplay(raftID, clusterbootstrap.RuntimeCores(runtimes), defaultGroup, sidecarPath, encryptionEnabled); guardErr != nil {
 		for _, rt := range runtimes {
 			if rt != nil {
 				rt.Close()
@@ -402,9 +404,9 @@ func buildShardGroupsWithEncryptionWiring(
 	return runtimes, shardGroups, encWiring, nil
 }
 
-func (b shardGroupBuilder) bootstrapSpecForGroup(id uint64) (*groupBootstrapSpec, error) {
+func (b shardGroupBuilder) bootstrapSpecForGroup(id uint64) (*clusterbootstrap.GroupBootstrapSpec, error) {
 	spec := b.bootstrapSpecs[id]
-	if b.bootstrapCfg.PeerConfigDir != "" && (spec == nil || spec.domain == nil) {
+	if b.bootstrapCfg.PeerConfigDir != "" && (spec == nil || spec.Domain == nil) {
 		return nil, errors.New("protected group missing the process-wide bootstrap domain")
 	}
 	return spec, nil

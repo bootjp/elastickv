@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/bootjp/elastickv/kv"
@@ -24,7 +25,7 @@ import (
 func offlineDataStoreFixture(t *testing.T, configuration bool) (string, raftbootstrap.BaselineManifest, kv.PreparedBootstrapActivation) {
 	t.Helper()
 	root := t.TempDir()
-	st, err := store.NewPebbleStore(filepath.Join(root, bootstrapOfflineDataPath))
+	st, err := store.NewPebbleStore(filepath.Join(root, clusterbootstrap.BootstrapOfflineDataPath))
 	require.NoError(t, err)
 	require.NoError(t, st.PutAt(t.Context(), []byte("k"), []byte("old history"), 10, 0))
 	require.NoError(t, st.PutAt(t.Context(), []byte("k"), []byte("latest"), 20, 0))
@@ -35,7 +36,7 @@ func offlineDataStoreFixture(t *testing.T, configuration bool) (string, raftboot
 	require.True(t, ok)
 	require.NoError(t, indexed.SetDurableAppliedIndex(10))
 	require.NoError(t, st.Close())
-	proof, err := bootstrapOfflineDataStoreProbe(t.Context(), root)
+	proof, err := clusterbootstrap.BootstrapOfflineDataStoreProbe(t.Context(), root)
 	require.NoError(t, err)
 	public, private, err := ed25519.GenerateKey(rand.Reader)
 	require.NoError(t, err)
@@ -116,7 +117,7 @@ func TestBootstrapOfflineDataProbeReadOnlyFullHistoryAndConfiguration(t *testing
 	for _, configuration := range []bool{true, false} {
 		root, _, _ := offlineDataStoreFixture(t, configuration)
 		before := offlineDataFiles(t, root)
-		proof, err := bootstrapOfflineDataStoreProbe(t.Context(), root)
+		proof, err := clusterbootstrap.BootstrapOfflineDataStoreProbe(t.Context(), root)
 		require.NoError(t, err)
 		require.Equal(t, uint64(10), proof.AppliedIndex)
 		require.Equal(t, uint64(20), proof.Watermark)
@@ -135,22 +136,22 @@ func TestBootstrapOfflineDataProbeRejectsMissingSourcesWithoutCreating(t *testin
 	root := t.TempDir()
 	before := offlineDataFiles(t, root)
 	for _, path := range []string{root, filepath.Join(root, "does-not-exist")} {
-		proof, err := bootstrapOfflineDataStoreProbe(t.Context(), path)
+		proof, err := clusterbootstrap.BootstrapOfflineDataStoreProbe(t.Context(), path)
 		require.Error(t, err)
 		require.Equal(t, etcd.BaselineStoreProof{}, proof)
 	}
 	require.Equal(t, before, offlineDataFiles(t, root))
-	require.NoDirExists(t, filepath.Join(root, bootstrapOfflineDataPath))
+	require.NoDirExists(t, filepath.Join(root, clusterbootstrap.BootstrapOfflineDataPath))
 	require.NoDirExists(t, filepath.Join(root, "does-not-exist"))
 }
 
 func TestBootstrapOfflineDataProbeRejectsMissingLockWithoutRecreating(t *testing.T) {
 	t.Parallel()
 	root, _, _ := offlineDataStoreFixture(t, true)
-	lock := filepath.Join(root, bootstrapOfflineDataPath, "LOCK")
+	lock := filepath.Join(root, clusterbootstrap.BootstrapOfflineDataPath, "LOCK")
 	require.NoError(t, os.Remove(lock))
 	before := offlineDataFiles(t, root)
-	_, err := bootstrapOfflineDataStoreProbe(t.Context(), root)
+	_, err := clusterbootstrap.BootstrapOfflineDataStoreProbe(t.Context(), root)
 	require.Error(t, err)
 	require.NoFileExists(t, lock)
 	require.Equal(t, before, offlineDataFiles(t, root))
@@ -161,7 +162,7 @@ func TestBootstrapOfflineDataProbeRejectsMissingDurableMetadataAndLocks(t *testi
 	for _, kind := range []string{"watermark", "applied", "pending"} {
 		t.Run(kind, func(t *testing.T) {
 			root, _, _ := offlineDataStoreFixture(t, true)
-			db, err := pebble.Open(filepath.Join(root, bootstrapOfflineDataPath), &pebble.Options{ErrorIfNotExists: true})
+			db, err := pebble.Open(filepath.Join(root, clusterbootstrap.BootstrapOfflineDataPath), &pebble.Options{ErrorIfNotExists: true})
 			require.NoError(t, err)
 			switch kind {
 			case "watermark":
@@ -176,7 +177,7 @@ func TestBootstrapOfflineDataProbeRejectsMissingDurableMetadataAndLocks(t *testi
 			}
 			require.NoError(t, db.Close())
 			before := offlineDataFiles(t, root)
-			proof, err := bootstrapOfflineDataStoreProbe(t.Context(), root)
+			proof, err := clusterbootstrap.BootstrapOfflineDataStoreProbe(t.Context(), root)
 			require.Error(t, err)
 			require.Equal(t, etcd.BaselineStoreProof{}, proof)
 			require.Equal(t, before, offlineDataFiles(t, root))
@@ -189,9 +190,9 @@ func TestBootstrapOfflineDataPreparationStageVerifyAndRestart(t *testing.T) {
 	root, manifest, prepared := offlineDataStoreFixture(t, true)
 	backup := offlineDataBackup(t, root)
 	backupBefore := offlineDataFiles(t, backup)
-	callbacks, err := bootstrapOfflineDataPreparation(prepared)
+	callbacks, err := clusterbootstrap.BootstrapOfflineDataPreparation(prepared)
 	require.NoError(t, err)
-	require.Equal(t, []string{bootstrapOfflineDataPath}, callbacks.MutablePaths)
+	require.Equal(t, []string{clusterbootstrap.BootstrapOfflineDataPath}, callbacks.MutablePaths)
 	c := etcd.BaselinePreparationContext{DataDir: root, BackupDir: backup, Manifest: manifest}
 	_, err = callbacks.VerifyPreparedStore(t.Context(), c)
 	require.Error(t, err, "original image is not prepared")
@@ -204,7 +205,7 @@ func TestBootstrapOfflineDataPreparationStageVerifyAndRestart(t *testing.T) {
 	preparedFiles := offlineDataFiles(t, root)
 	// A fresh callback owner after restart recognizes only the exact transform
 	// and does not reopen RW merely to repeat an already completed stage.
-	restarted, err := bootstrapOfflineDataPreparation(prepared)
+	restarted, err := clusterbootstrap.BootstrapOfflineDataPreparation(prepared)
 	require.NoError(t, err)
 	require.NoError(t, restarted.StagePreparation(t.Context(), c))
 	again, err := restarted.VerifyPreparedStore(t.Context(), c)
@@ -216,10 +217,10 @@ func TestBootstrapOfflineDataPreparationStageVerifyAndRestart(t *testing.T) {
 	require.NoError(t, err)
 	physicalValue, err := store.EncodeOfflinePlainControlMetadata(value)
 	require.NoError(t, err)
-	require.NoError(t, bootstrapOfflineWithData(t.Context(), root, true, func(db *pebble.DB) error {
+	require.NoError(t, clusterbootstrap.BootstrapOfflineWithData(t.Context(), root, true, func(db *pebble.DB) error {
 		snapshot := db.NewSnapshot()
 		defer snapshot.Close()
-		raw, present, err := bootstrapOfflineGet(snapshot, append([]byte(store.RaftControlMetadataPrefix), key...))
+		raw, present, err := clusterbootstrap.BootstrapOfflineGet(snapshot, append([]byte(store.RaftControlMetadataPrefix), key...))
 		require.NoError(t, err)
 		require.True(t, present)
 		require.Equal(t, physicalValue, raw)
@@ -231,7 +232,7 @@ func TestBootstrapOfflineDataPreparationRuntimeMetadataAfterRestart(t *testing.T
 	// Not parallel: store.VerifyBootstrapBaselinePhysicalEquality calls Error() on a closed pebble iterator, whose pooled allocation another test's pebble DB may be reusing.
 	root, manifest, prepared := offlineDataStoreFixture(t, true)
 	backup := offlineDataBackup(t, root)
-	callbacks, err := bootstrapOfflineDataPreparation(prepared)
+	callbacks, err := clusterbootstrap.BootstrapOfflineDataPreparation(prepared)
 	require.NoError(t, err)
 	c := etcd.BaselinePreparationContext{DataDir: root, BackupDir: backup, Manifest: manifest}
 	require.NoError(t, callbacks.StagePreparation(t.Context(), c))
@@ -240,7 +241,7 @@ func TestBootstrapOfflineDataPreparationRuntimeMetadataAfterRestart(t *testing.T
 	// Reopen through the runtime codec, not the raw offline snapshot reader.
 	// Canonical BAP1 bytes without the physical value header must fail here.
 	for range 2 {
-		st, err := store.NewPebbleStore(filepath.Join(root, bootstrapOfflineDataPath))
+		st, err := store.NewPebbleStore(filepath.Join(root, clusterbootstrap.BootstrapOfflineDataPath))
 		require.NoError(t, err)
 		func() {
 			defer func() { require.NoError(t, st.Close()) }()
@@ -275,10 +276,10 @@ func TestBootstrapOfflineDataPreparationNeverWritesWithoutTrustedBackup(t *testi
 			case "wrong manifest":
 				c.Manifest.OperationID[0]++
 			case "aliased backup":
-				description, err := pebble.Peek(filepath.Join(root, bootstrapOfflineDataPath), vfs.Default)
+				description, err := pebble.Peek(filepath.Join(root, clusterbootstrap.BootstrapOfflineDataPath), vfs.Default)
 				require.NoError(t, err)
 				original := description.ManifestFilename
-				alias := filepath.Join(backup, bootstrapOfflineDataPath, filepath.Base(original))
+				alias := filepath.Join(backup, clusterbootstrap.BootstrapOfflineDataPath, filepath.Base(original))
 				require.NoError(t, os.Remove(alias))
 				require.NoError(t, os.Link(original, alias))
 			case "nested backup":
@@ -289,13 +290,13 @@ func TestBootstrapOfflineDataPreparationNeverWritesWithoutTrustedBackup(t *testi
 				if kind == "edited backup" {
 					changed = backup
 				}
-				st, err := store.NewPebbleStore(filepath.Join(changed, bootstrapOfflineDataPath))
+				st, err := store.NewPebbleStore(filepath.Join(changed, clusterbootstrap.BootstrapOfflineDataPath))
 				require.NoError(t, err)
 				require.NoError(t, st.PutAt(t.Context(), []byte("k"), []byte("changed old history"), 10, 0))
 				require.NoError(t, st.Close())
 			}
 			before := offlineDataFiles(t, root)
-			callbacks, err := bootstrapOfflineDataPreparation(prepared)
+			callbacks, err := clusterbootstrap.BootstrapOfflineDataPreparation(prepared)
 			require.NoError(t, err)
 			require.Error(t, callbacks.StagePreparation(t.Context(), c))
 			require.Equal(t, before, offlineDataFiles(t, root), "all RO refusals precede RW open")
@@ -308,13 +309,13 @@ func TestBootstrapOfflineDataProbeCancellationAndSymlink(t *testing.T) {
 	root, _, _ := offlineDataStoreFixture(t, false)
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	_, err := bootstrapOfflineDataStoreProbe(ctx, root)
+	_, err := clusterbootstrap.BootstrapOfflineDataStoreProbe(ctx, root)
 	require.ErrorIs(t, err, context.Canceled)
 	alias := filepath.Join(t.TempDir(), "alias")
 	require.NoError(t, os.Symlink(root, alias))
-	_, err = bootstrapOfflineDataStoreProbe(t.Context(), alias)
+	_, err = clusterbootstrap.BootstrapOfflineDataStoreProbe(t.Context(), alias)
 	require.Error(t, err)
-	_, err = bootstrapOfflineDataStoreProbe(t.Context(), alias+string(filepath.Separator))
+	_, err = clusterbootstrap.BootstrapOfflineDataStoreProbe(t.Context(), alias+string(filepath.Separator))
 	require.Error(t, err, "trailing separators cannot hide a symlink root")
 }
 
@@ -323,9 +324,9 @@ func TestBootstrapOfflineDataWalkRejectsEscapingSymlink(t *testing.T) {
 	root, _, _ := offlineDataStoreFixture(t, false)
 	outside := filepath.Join(t.TempDir(), "outside")
 	require.NoError(t, os.WriteFile(outside, []byte("preserved external file"), 0o600))
-	link := filepath.Join(root, bootstrapOfflineDataPath, "foreign-table")
+	link := filepath.Join(root, clusterbootstrap.BootstrapOfflineDataPath, "foreign-table")
 	require.NoError(t, os.Symlink(outside, link))
-	_, err := bootstrapOfflineDataStoreProbe(t.Context(), root)
+	_, err := clusterbootstrap.BootstrapOfflineDataStoreProbe(t.Context(), root)
 	require.ErrorContains(t, err, "unsupported store tree")
 	value, err := os.ReadFile(outside)
 	require.NoError(t, err)
@@ -341,11 +342,11 @@ func TestBootstrapOfflineDataPreparationRejectsPostStageEditsAfterRestart(t *tes
 		t.Run(kind, func(t *testing.T) {
 			root, manifest, prepared := offlineDataStoreFixture(t, false)
 			backup := offlineDataBackup(t, root)
-			callbacks, err := bootstrapOfflineDataPreparation(prepared)
+			callbacks, err := clusterbootstrap.BootstrapOfflineDataPreparation(prepared)
 			require.NoError(t, err)
 			c := etcd.BaselinePreparationContext{DataDir: root, BackupDir: backup, Manifest: manifest}
 			require.NoError(t, callbacks.StagePreparation(t.Context(), c))
-			db, err := pebble.Open(filepath.Join(root, bootstrapOfflineDataPath), &pebble.Options{ErrorIfNotExists: true})
+			db, err := pebble.Open(filepath.Join(root, clusterbootstrap.BootstrapOfflineDataPath), &pebble.Options{ErrorIfNotExists: true})
 			require.NoError(t, err)
 			switch kind {
 			case "preparation":
@@ -359,7 +360,7 @@ func TestBootstrapOfflineDataPreparationRejectsPostStageEditsAfterRestart(t *tes
 			}
 			require.NoError(t, db.Close())
 			before := offlineDataFiles(t, root)
-			restarted, err := bootstrapOfflineDataPreparation(prepared)
+			restarted, err := clusterbootstrap.BootstrapOfflineDataPreparation(prepared)
 			require.NoError(t, err)
 			_, err = restarted.VerifyPreparedStore(t.Context(), c)
 			require.Error(t, err)
@@ -374,7 +375,7 @@ func TestBootstrapOfflineDataFSNeverDeletesOrReplaces(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "preserved")
 	require.NoError(t, os.WriteFile(path, []byte("preserved"), 0o600))
-	f := bootstrapOfflineFS{FS: vfs.Default}
+	f := clusterbootstrap.BootstrapOfflineFS{FS: vfs.Default}
 	require.Error(t, f.Remove(path))
 	require.Error(t, f.RemoveAll(dir))
 	_, err := f.Create(path, vfs.WriteCategoryUnspecified)
@@ -383,7 +384,7 @@ func TestBootstrapOfflineDataFSNeverDeletesOrReplaces(t *testing.T) {
 	_, err = f.ReuseForWrite(path, filepath.Join(dir, "reused"), vfs.WriteCategoryUnspecified)
 	require.Error(t, err)
 	require.Error(t, f.MkdirAll(filepath.Join(dir, "missing"), 0o700))
-	readOnly := bootstrapOfflineFS{FS: vfs.Default, readOnly: true}
+	readOnly := clusterbootstrap.BootstrapOfflineFS{FS: vfs.Default, ReadOnly: true}
 	_, err = readOnly.OpenReadWrite(path, vfs.WriteCategoryUnspecified)
 	require.Error(t, err)
 	_, err = readOnly.Create(filepath.Join(dir, "new"), vfs.WriteCategoryUnspecified)
@@ -399,14 +400,14 @@ func TestBootstrapOfflineDataFSNeverDeletesOrReplaces(t *testing.T) {
 func TestBootstrapOfflineDataProbeWALReplayBound(t *testing.T) {
 	t.Parallel()
 	root, _, _ := offlineDataStoreFixture(t, false)
-	path := filepath.Join(root, bootstrapOfflineDataPath, "999999.log")
+	path := filepath.Join(root, clusterbootstrap.BootstrapOfflineDataPath, "999999.log")
 	f, err := os.Create(path)
 	require.NoError(t, err)
-	require.NoError(t, f.Truncate(bootstrapOfflineWALLimit+1))
+	require.NoError(t, f.Truncate(clusterbootstrap.BootstrapOfflineWALLimit+1))
 	require.NoError(t, f.Close())
-	_, err = bootstrapOfflineDataStoreProbe(t.Context(), root)
+	_, err = clusterbootstrap.BootstrapOfflineDataStoreProbe(t.Context(), root)
 	require.ErrorContains(t, err, "WAL replay byte bound")
 	info, err := os.Stat(path)
 	require.NoError(t, err)
-	require.Equal(t, int64(bootstrapOfflineWALLimit+1), info.Size())
+	require.Equal(t, int64(clusterbootstrap.BootstrapOfflineWALLimit+1), info.Size())
 }

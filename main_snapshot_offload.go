@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/internal/snapshotoffload"
@@ -15,7 +16,7 @@ import (
 // snapshotOffloadGroups uses snapshotEngine() for leadership callbacks so
 // scheduler reads are synchronized with runtime shutdown.
 func snapshotOffloadGroups(
-	runtimes []*raftGroupRuntime, raftDir, raftID string, multi bool,
+	runtimes []*clusterbootstrap.GroupRuntime, raftDir, raftID string, multi bool,
 ) []snapshotoffload.OffloadGroup {
 	groups := make([]snapshotoffload.OffloadGroup, 0, len(runtimes))
 	for _, rt := range runtimes {
@@ -32,9 +33,9 @@ func snapshotOffloadGroups(
 	return groups
 }
 
-func snapshotOffloadIsLeader(rt *raftGroupRuntime) func() bool {
+func snapshotOffloadIsLeader(rt *clusterbootstrap.GroupRuntime) func() bool {
 	return func() bool {
-		engine := rt.snapshotEngine()
+		engine := clusterbootstrap.RuntimeCore(rt).SnapshotEngine()
 		return engine != nil && engine.State() == raftengine.StateLeader
 	}
 }
@@ -43,9 +44,9 @@ func snapshotOffloadIsLeader(rt *raftGroupRuntime) func() bool {
 // multi-gigabyte spool takes long enough to lose an election, so
 // leadership must hold at the instant the manifest commits, not merely
 // when the snapshot was opened.
-func snapshotOffloadVerifyLeader(rt *raftGroupRuntime) func(context.Context) error {
+func snapshotOffloadVerifyLeader(rt *clusterbootstrap.GroupRuntime) func(context.Context) error {
 	return func(ctx context.Context) error {
-		engine := rt.snapshotEngine()
+		engine := clusterbootstrap.RuntimeCore(rt).SnapshotEngine()
 		if engine == nil {
 			return errors.Wrap(snapshotoffload.ErrInvalidOptions,
 				"snapshot offload: raft engine closed")
@@ -68,7 +69,7 @@ func startSnapshotOffload(
 	ctx context.Context,
 	eg *errgroup.Group,
 	f snapshotoffloadwiring.Flags,
-	runtimes []*raftGroupRuntime,
+	runtimes []*clusterbootstrap.GroupRuntime,
 	raftDir, raftID string,
 	multi bool,
 	observer snapshotoffload.SchedulerObserver,

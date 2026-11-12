@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/peersession"
 	"github.com/bootjp/elastickv/internal/raftadmission"
@@ -25,9 +26,9 @@ import (
 )
 
 type tsoEnablementNode struct {
-	runtimes []*raftGroupRuntime
+	runtimes []*clusterbootstrap.GroupRuntime
 	groups   map[uint64]*kv.ShardGroup
-	domain   *bootstrapDomain
+	domain   *clusterbootstrap.BootstrapDomain
 	cluster  raftbootstrap.UUID
 	data     *enablementProtectedNode
 	wiring   tsowiring.Wiring
@@ -53,11 +54,11 @@ func tsoEnablementLegacyProfile(t *testing.T, base string, groups []noderuntime.
 	tso, shard, err := builder.build(groups[0])
 	require.NoError(t, err)
 	t.Cleanup(tso.Close)
-	for _, runtime := range []*raftGroupRuntime{tso, data} {
+	for _, runtime := range []*clusterbootstrap.GroupRuntime{tso, data} {
 		require.Eventually(t, func() bool { return runtime.Engine.State() == raftengine.StateLeader }, enablementE2EWait, 10*time.Millisecond)
 	}
 	enablementLegacyPut(t, data.Engine, clock.Next(), "legacy-key", "original-value")
-	catalog, err := setupDistributionCatalog(t.Context(), []*raftGroupRuntime{tso, data}, routes)
+	catalog, err := setupDistributionCatalog(t.Context(), []*clusterbootstrap.GroupRuntime{tso, data}, routes)
 	require.NoError(t, err)
 	image, err := catalog.Snapshot(t.Context())
 	require.NoError(t, err)
@@ -72,38 +73,38 @@ func tsoEnablementLegacyProfile(t *testing.T, base string, groups []noderuntime.
 	require.True(t, reservation.CutoverActive)
 	require.NotZero(t, reservation.Base)
 	enablementLegacyPut(t, data.Engine, clock.Next(), "cut-key", "quiesced")
-	for _, runtime := range []*raftGroupRuntime{tso, data} {
+	for _, runtime := range []*clusterbootstrap.GroupRuntime{tso, data} {
 		cut := runtime.Engine.Status().AppliedIndex
 		require.Eventually(t, func() bool { return runtime.Engine.Status().LastSnapshotIndex >= cut }, enablementE2EWait, 10*time.Millisecond)
 		runtime.Close()
 	}
 	tsoDir := noderuntime.GroupDataDir(base, "n1", 0, true)
-	require.NoDirExists(t, filepath.Join(tsoDir, dedicatedTSOControlStoreName))
+	require.NoDirExists(t, filepath.Join(tsoDir, clusterbootstrap.DedicatedTSOControlStoreName))
 	require.NoDirExists(t, filepath.Join(tsoDir, "fsm.db"))
 }
 
-func tsoEnablementSignedBaseline(t *testing.T, dir string, cfg *bootstrapPeerConfig) raftbootstrap.BaselineManifest {
+func tsoEnablementSignedBaseline(t *testing.T, dir string, cfg *clusterbootstrap.BootstrapPeerConfig) raftbootstrap.BaselineManifest {
 	t.Helper()
 	ownership, err := etcd.AcquireOfflineBaselineOwnership(dir)
 	require.NoError(t, err)
 	defer func() { require.NoError(t, ownership.Close()) }()
-	state, proof, err := probeOfflineTSOBaseline(t.Context(), dir, ownership)
+	state, proof, err := clusterbootstrap.ProbeOfflineTSOBaseline(t.Context(), dir, ownership)
 	require.NoError(t, err)
 	source, err := etcd.ReadOfflineBaselineWALSource(t.Context(), dir, ownership)
 	require.NoError(t, err)
 	defer func() { require.NoError(t, source.Snapshot.Close()) }()
 	c := raftbootstrap.BaselineContext{Version: raftbootstrap.BaselineVersion,
-		Identity: raftbootstrap.Identity{Cluster: cfg.local.Cluster, Group: noderuntime.DedicatedTSORaftGroupID}, OperationID: raftbootstrap.OperationID{72},
+		Identity: raftbootstrap.Identity{Cluster: cfg.Local.Cluster, Group: noderuntime.DedicatedTSORaftGroupID}, OperationID: raftbootstrap.OperationID{72},
 		Configuration: raftbootstrap.Configuration{Index: source.ConfigurationIndex,
 			State: raftbootstrap.ConfState{Voters: source.Configuration.GetVoters(), VotersOutgoing: source.Configuration.GetVotersOutgoing(),
 				Learners: source.Configuration.GetLearners(), LearnersNext: source.Configuration.GetLearnersNext(), AutoLeave: source.Configuration.GetAutoLeave()},
-			Members: []raftbootstrap.Member{{ID: cfg.local.Member, Address: cfg.local.Address, PublicKeyDigest: cfg.local.Key}}},
+			Members: []raftbootstrap.Member{{ID: cfg.Local.Member, Address: cfg.Local.Address, PublicKeyDigest: cfg.Local.Key}}},
 		Minimum:     raftbootstrap.Versions{Entry: 1, Snapshot: 1, Session: 1},
 		CommitIndex: state.AppliedIndex, CommitTerm: source.CommitTerm, Watermark: state.Watermark, DataDigest: state.DataDigest}
 	inspection, err := etcd.InspectOfflineBaseline(t.Context(), etcd.OfflineBaselineOptions{Ownership: ownership, DataDir: dir,
-		MemberID: cfg.local.Member, Expected: c, ProbeStore: func(context.Context) (etcd.BaselineStoreProof, error) { return proof, nil }})
+		MemberID: cfg.Local.Member, Expected: c, ProbeStore: func(context.Context) (etcd.BaselineStoreProof, error) { return proof, nil }})
 	require.NoError(t, err)
-	signer, ok := cfg.clientTLS.Certificates[0].PrivateKey.(crypto.Signer)
+	signer, ok := cfg.ClientTLS.Certificates[0].PrivateKey.(crypto.Signer)
 	require.True(t, ok)
 	probe, err := raftbootstrap.SignBaselineProbe(raftbootstrap.BaselineProbe{BaselineContext: c, Evidence: inspection.Evidence}, signer)
 	require.NoError(t, err)
@@ -113,15 +114,15 @@ func tsoEnablementSignedBaseline(t *testing.T, dir string, cfg *bootstrapPeerCon
 func tsoEnablementStart(t *testing.T, base, peerConfigDir string, profile []noderuntime.GroupSpec) *tsoEnablementNode {
 	t.Helper()
 	bootstrapCfg := noderuntime.BootstrapConfig{PeerConfigDir: peerConfigDir}
-	specs, domain, err := loadProtectedBootstrapDomain("n1", base, profile, true, bootstrapCfg)
+	specs, domain, err := clusterbootstrap.LoadProtectedBootstrapDomain("n1", base, profile, true, bootstrapCfg)
 	require.NoError(t, err)
-	t.Cleanup(domain.admission.Close)
+	t.Cleanup(domain.Admission.Close)
 	routes := distribution.NewEngine()
 	routes.UpdateRoute(nil, nil, 1)
 	clock := kv.NewHLC()
 	builder := shardGroupBuilder{raftID: "n1", raftDir: base, multi: true, factory: enablementFactory(), bootstrapCfg: bootstrapCfg,
 		clock: clock, readTracker: kv.NewActiveTimestampTracker(), routeEngine: routes, bootstrapSpecs: specs}
-	node := &tsoEnablementNode{domain: domain, cluster: specs[0].intent.Identity.Cluster, groups: make(map[uint64]*kv.ShardGroup)}
+	node := &tsoEnablementNode{domain: domain, cluster: specs[0].Intent.Identity.Cluster, groups: make(map[uint64]*kv.ShardGroup)}
 	for _, group := range profile {
 		runtime, shard, err := builder.build(group)
 		require.NoError(t, err, "group %d protected Open must use real migrated native proof", group.ID)
@@ -129,22 +130,22 @@ func tsoEnablementStart(t *testing.T, base, peerConfigDir string, profile []node
 		node.runtimes = append(node.runtimes, runtime)
 		node.groups[group.ID] = shard
 	}
-	_, premature, err := domain.admission.Begin(t.Context(), raftadmission.Data)
+	_, premature, err := domain.Admission.Begin(t.Context(), raftadmission.Data)
 	if premature != nil {
 		premature.CancelAndJoin()
 	}
 	require.Error(t, err, "both groups and catalog must be ready before any user operation")
 	shards := kv.NewShardStore(routes, node.groups)
-	shards.SetOperationAdmission(domain.operationAdmission)
-	coordinate := kv.NewShardedCoordinator(routes, node.groups, 1, clock, shards).WithOperationAdmission(domain.operationAdmission)
+	shards.SetOperationAdmission(domain.OperationAdmission)
+	coordinate := kv.NewShardedCoordinator(routes, node.groups, 1, clock, shards).WithOperationAdmission(domain.OperationAdmission)
 	node.wiring, err = configureCoordinatorTSO(defaultServerFlags().tso, coordinate, node.groups, shards)
 	require.NoError(t, err)
 	node.data = &enablementProtectedNode{runtime: node.runtimes[1], domain: domain, coordinate: coordinate, shards: shards}
 	ctx, cancel := context.WithCancel(t.Context())
 	eg, runCtx := errgroup.WithContext(ctx)
-	startBootstrapActivationWorkers(runCtx, eg, node.runtimes, node.groups)
+	clusterbootstrap.StartBootstrapActivationWorkers(runCtx, eg, node.runtimes, node.groups)
 	catalog := distributionCatalogStoreForGroup(node.runtimes, 1)
-	startBootstrapReadinessReconciler(runCtx, eg, node.runtimes, catalog, routes)
+	clusterbootstrap.StartBootstrapReadinessReconciler(runCtx, eg, node.runtimes, catalog, routes)
 	var once sync.Once
 	node.close = func() {
 		once.Do(func() {
@@ -152,7 +153,7 @@ func tsoEnablementStart(t *testing.T, base, peerConfigDir string, profile []node
 			require.NoError(t, eg.Wait())
 			require.NoError(t, node.wiring.Close())
 			require.NoError(t, coordinate.Close())
-			domain.admission.Close()
+			domain.Admission.Close()
 			for _, runtime := range node.runtimes {
 				runtime.Close()
 			}
@@ -163,7 +164,7 @@ func tsoEnablementStart(t *testing.T, base, peerConfigDir string, profile []node
 		return node.runtimes[0].PublicReady() && node.runtimes[1].PublicReady()
 	}, enablementE2EWait, 10*time.Millisecond, "both protected groups must reach DataReady without synthetic recovery publication")
 	for _, group := range profile {
-		require.Equal(t, peersession.DataReady, domain.admission.Stage(group.ID))
+		require.Equal(t, peersession.DataReady, domain.Admission.Stage(group.ID))
 	}
 	return node
 }
@@ -187,7 +188,7 @@ func tsoEnablementAllocate(t *testing.T, node *tsoEnablementNode, min uint64, ac
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), enablementE2EWait)
 	defer cancel()
-	owned, finish, err := node.domain.operationAdmission(ctx, 0, kv.AdmissionAllocator)
+	owned, finish, err := node.domain.OperationAdmission(ctx, 0, kv.AdmissionAllocator)
 	require.NoError(t, err)
 	allocator, ok := node.wiring.ServerAllocator.(kv.TSOReservationAllocator)
 	require.True(t, ok)
@@ -210,7 +211,7 @@ func prepareTSOEnablementProfile(t *testing.T) (string, []noderuntime.GroupSpec,
 	require.NoError(t, err)
 	cfg, err := loadBootstrapFixture(t, encoded)
 	require.NoError(t, err)
-	profile := []noderuntime.GroupSpec{{ID: 0, Address: cfg.local.Address}, {ID: 1, Address: cfg.local.Address}}
+	profile := []noderuntime.GroupSpec{{ID: 0, Address: cfg.Local.Address}, {ID: 1, Address: cfg.Local.Address}}
 	tsoEnablementLegacyProfile(t, base, profile)
 	t.Log("legacy profile quiesced with populated data and snapshot-only dedicated TSO")
 	tsoManifest := tsoEnablementSignedBaseline(t, noderuntime.GroupDataDir(base, "n1", 0, true), cfg)

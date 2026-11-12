@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/adapter"
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/keyviz"
@@ -31,7 +32,7 @@ func TestConfigureCoordinatorTSOPhaseDWorksThroughAdapterDecorators(t *testing.T
 	wiring, err := configureCoordinatorTSO(cfg, coord, groups, mainTSOFloorProvider{floor: 42})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, wiring.Close()) })
-	decorated := kv.WithKeyVizLabel(newStartupGatedCoordinator(coord, nil), keyviz.LabelRedis)
+	decorated := kv.WithKeyVizLabel(clusterbootstrap.NewStartupGatedCoordinator(coord, nil), keyviz.LabelRedis)
 
 	readTS, err := kv.BeginReadTimestampThrough(context.Background(), decorated, 42, "test decorated phase D")
 	require.NoError(t, err)
@@ -46,11 +47,11 @@ func TestInternalTimestampOptionsPreservesTSOThroughStartupGate(t *testing.T) {
 	t.Parallel()
 	allocator := &mainTimestampAllocator{next: 123}
 	coord := newMainTSOCoordinator(kv.NewHLC(), nil).WithTSOAllocator(allocator)
-	gated := newStartupGatedCoordinator(coord, &startupPublicKVGate{})
+	gated := clusterbootstrap.NewStartupGatedCoordinator(coord, &clusterbootstrap.StartupPublicKVGate{})
 
 	got, ok := kv.TimestampAllocatorThrough(gated)
 	require.True(t, ok)
-	require.IsType(t, startupGatedCoordinator{}, got)
+	require.IsType(t, clusterbootstrap.StartupGatedCoordinator{}, got)
 	_, err := got.Next(context.Background())
 	require.Error(t, err)
 	// startupGatedCoordinator forwards the write gate and the forwarded-write
@@ -61,16 +62,16 @@ func TestInternalTimestampOptionsPreservesTSOThroughStartupGate(t *testing.T) {
 
 	runtimeAllocator := kv.NewDynamicTimestampAllocator(nil)
 	runtimeCoord := newMainTSOCoordinator(kv.NewHLC(), nil).WithTSOAllocator(runtimeAllocator)
-	runtimeGated := newStartupGatedCoordinator(runtimeCoord, &startupPublicKVGate{})
+	runtimeGated := clusterbootstrap.NewStartupGatedCoordinator(runtimeCoord, &clusterbootstrap.StartupPublicKVGate{})
 	got, ok = kv.TimestampAllocatorThrough(runtimeGated)
 	require.True(t, ok)
-	require.IsType(t, startupGatedCoordinator{}, got)
+	require.IsType(t, clusterbootstrap.StartupGatedCoordinator{}, got)
 	configured, ok := kv.ConfiguredTimestampAllocatorThrough(runtimeGated)
 	require.True(t, ok)
 	require.Same(t, runtimeAllocator, configured)
 	require.Len(t, internalTimestampOptions(runtimeGated), 3)
 
-	legacy := newStartupGatedCoordinator(newMainTSOCoordinator(kv.NewHLC(), nil), nil)
+	legacy := clusterbootstrap.NewStartupGatedCoordinator(newMainTSOCoordinator(kv.NewHLC(), nil), nil)
 	// No TSO allocator underneath: only the write gate and the forwarded-write
 	// observer, which the gate wrapper satisfies unconditionally.
 	require.Len(t, internalTimestampOptions(legacy), 2)
@@ -81,7 +82,7 @@ func TestInternalTimestampOptionsPreservesForwardObserverThroughStartupGate(t *t
 	allocator := &mainTimestampAllocator{next: 123}
 	inner := newMainTSOCoordinator(kv.NewHLC(), nil).WithTSOAllocator(allocator)
 	observing := &mainForwardObservingCoordinator{ShardedCoordinator: inner}
-	gated := newStartupGatedCoordinator(observing, nil)
+	gated := clusterbootstrap.NewStartupGatedCoordinator(observing, nil)
 	opts := internalTimestampOptions(gated)
 	require.Len(t, opts, 3)
 
@@ -117,7 +118,7 @@ func TestInternalForwardUsesRuntimeAllocatorAfterModeReload(t *testing.T) {
 	t.Cleanup(func() { require.NoError(t, wiring.Close()) })
 	require.Equal(t, kv.TSOModeLegacy, wiring.RuntimeController.CurrentMode())
 
-	gated := newStartupGatedCoordinator(coord, &startupPublicKVGate{})
+	gated := clusterbootstrap.NewStartupGatedCoordinator(coord, &clusterbootstrap.StartupPublicKVGate{})
 	opts := internalTimestampOptions(gated)
 	require.Len(t, opts, 3)
 
@@ -150,7 +151,7 @@ func TestInternalTimestampOptionsPreservesPhaseDValidatorThroughStartupGate(t *t
 
 	allocator := &phaseDMainAllocator{floor: 100}
 	inner := newMainTSOCoordinator(kv.NewHLC(), nil).WithTSOAllocator(allocator)
-	gated := newStartupGatedCoordinator(inner, &startupPublicKVGate{})
+	gated := clusterbootstrap.NewStartupGatedCoordinator(inner, &clusterbootstrap.StartupPublicKVGate{})
 
 	installed, ok := kv.ConfiguredTimestampAllocatorThrough(gated)
 	require.True(t, ok)

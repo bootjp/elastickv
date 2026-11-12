@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/bootjp/elastickv/adapter"
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/serverwiring"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/cockroachdb/errors"
@@ -48,7 +49,7 @@ func newS3Server(
 		return nil, errors.WithStack(err)
 	}
 	options := []adapter.S3ServerOption{
-		adapter.WithS3RequestAdmission(bootstrapRequestAdmissionForCoordinator(coordinate)),
+		adapter.WithS3RequestAdmission(clusterbootstrap.BootstrapRequestAdmissionForCoordinator(coordinate)),
 		adapter.WithS3Region(region),
 		adapter.WithS3StaticCredentials(staticCreds),
 		adapter.WithS3ActiveTimestampTracker(readTracker),
