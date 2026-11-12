@@ -5,6 +5,7 @@ import importlib.util
 import multiprocessing
 import pathlib
 import unittest
+from unittest import mock
 
 
 SCRIPT = pathlib.Path(__file__).with_name("benchmark-fuse.py")
@@ -18,6 +19,17 @@ def send_large_result(queue):
 
 
 class BenchmarkWorkerResultsTest(unittest.TestCase):
+    def test_write_failure_identifies_syscall_and_offset(self):
+        with mock.patch.object(benchmark.os, "pwrite", side_effect=OSError(5, "Input/output error")):
+            with self.assertRaisesRegex(OSError, "pwrite offset=4096 length=4"):
+                benchmark.write_and_sync(1, 4096, b"data")
+
+    def test_fsync_failure_identifies_syscall_and_offset(self):
+        with mock.patch.object(benchmark.os, "pwrite", return_value=4), \
+             mock.patch.object(benchmark.os, "fsync", side_effect=OSError(5, "Input/output error")):
+            with self.assertRaisesRegex(OSError, "fsync after offset=4096 length=4"):
+                benchmark.write_and_sync(1, 4096, b"data")
+
     def test_large_sample_queue_does_not_block_worker_exit(self):
         queue = multiprocessing.Queue()
         processes = [multiprocessing.Process(target=send_large_result, args=(queue,)) for _ in range(2)]

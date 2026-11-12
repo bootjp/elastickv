@@ -35,10 +35,16 @@ def summary(samples, elapsed):
 
 def write_and_sync(fd, offset, payload):
     started = time.perf_counter_ns()
-    written = os.pwrite(fd, payload, offset)
+    try:
+        written = os.pwrite(fd, payload, offset)
+    except OSError as exc:
+        raise OSError(exc.errno, f"pwrite offset={offset} length={len(payload)}: {exc.strerror}") from exc
     if written != len(payload):
         raise OSError(f"short pwrite: {written}/{len(payload)}")
-    os.fsync(fd)
+    try:
+        os.fsync(fd)
+    except OSError as exc:
+        raise OSError(exc.errno, f"fsync after offset={offset} length={len(payload)}: {exc.strerror}") from exc
     return time.perf_counter_ns() - started
 
 
@@ -56,7 +62,7 @@ def hot_writer(path, worker, writes, workers, start, results):
             os.close(fd)
         results.put((samples, None))
     except Exception as exc:
-        results.put((samples, repr(exc)))
+        results.put((samples, f"worker={worker} completed={len(samples)}: {exc!r}"))
 
 
 def collect_worker_results(processes, results, timeout=300):

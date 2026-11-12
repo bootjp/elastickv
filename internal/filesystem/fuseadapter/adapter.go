@@ -450,6 +450,9 @@ func (a *Adapter) Read(ctx context.Context, inode uint64, fh uint64, offset uint
 func (a *Adapter) Write(ctx context.Context, inode uint64, fh uint64, offset uint64, data []byte) (n int, errno syscall.Errno) {
 	ticket, errno := a.mutations.begin(ctx, inode)
 	if errno != 0 {
+		if errno == syscall.EIO {
+			slog.WarnContext(ctx, "filesystem FUSE write blocked by prior unknown mutation", "inode", inode, "offset", offset)
+		}
 		return 0, errno
 	}
 	var writeErr error
@@ -502,6 +505,9 @@ func (a *Adapter) Flush(ctx context.Context, inode uint64, fh uint64) syscall.Er
 
 func (a *Adapter) Fsync(ctx context.Context, inode uint64, fh uint64, datasync bool) syscall.Errno {
 	if errno := a.mutations.wait(ctx, inode); errno != 0 {
+		if errno == syscall.EIO {
+			slog.WarnContext(ctx, "filesystem FUSE fsync blocked by prior unknown mutation", "inode", inode, "fh", fh)
+		}
 		return errno
 	}
 	if errno := a.refreshOpenHandleLease(ctx, inode, fh, false); errno != 0 {
@@ -509,9 +515,16 @@ func (a *Adapter) Fsync(ctx context.Context, inode uint64, fh uint64, datasync b
 	}
 	receipts, errno := a.verifyReceipts(ctx, inode)
 	if errno != 0 {
+		if errno == syscall.EIO {
+			slog.WarnContext(ctx, "filesystem FUSE fsync receipt verification failed", "inode", inode, "fh", fh)
+		}
 		return errno
 	}
-	if errno := Errno(a.core.Fsync(ctx, inode, fh, datasync)); errno != 0 {
+	if err := a.core.Fsync(ctx, inode, fh, datasync); err != nil {
+		errno := Errno(err)
+		if errno == syscall.EIO {
+			slog.WarnContext(ctx, "filesystem FUSE fsync failed", "inode", inode, "fh", fh, "error", err.Error())
+		}
 		return errno
 	}
 	a.clearReceipts(inode, receipts)
