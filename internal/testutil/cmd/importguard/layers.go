@@ -42,6 +42,8 @@ var upperLayers = []string{
 	"distribution/autosplit",
 	"internal/admin",
 	"internal/adminbridge",
+	"internal/fsmount",
+	"internal/leaderbalance",
 	"internal/noderuntime",
 	"internal/serverwiring",
 	"internal/snapshotoffload",
@@ -130,6 +132,8 @@ var restrictedPackages = []restrictedPackage{
 	{Pkg: "internal/serverwiring", AllowedFrom: []string{".", "cmd"}, Why: "server wiring is for binaries only"},
 	{Pkg: "internal/adminbridge", AllowedFrom: []string{".", "cmd"}, Why: "admin bridges are wired by binaries only"},
 	{Pkg: "internal/noderuntime", AllowedFrom: []string{".", "cmd"}, Why: "node runtime configuration is resolved by binaries only"},
+	{Pkg: "internal/leaderbalance", AllowedFrom: []string{".", "cmd"}, Why: "the leader-balance scheduler is started by binaries only"},
+	{Pkg: "internal/fsmount", AllowedFrom: []string{".", "cmd"}, Why: "the FUSE mount is started by binaries only"},
 	{Pkg: "internal/snapshotoffloadwiring", AllowedFrom: []string{".", "cmd"}, Why: "snapshot offload start-up is wired by binaries only"},
 	{Pkg: "internal/tsowiring", AllowedFrom: []string{".", "cmd"}, Why: "TSO wiring is configured by binaries only"},
 }
