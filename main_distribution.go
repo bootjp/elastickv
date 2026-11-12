@@ -49,6 +49,8 @@ type distributionStartupInput struct {
 	// resolve per-group leaders rather than going through the coordinator.
 	shardGroups     map[uint64]*kv.ShardGroup
 	snapshotOffload snapshotOffloadFlags
+	keyViz          *serverwiring.KeyVizFlags
+	autoSplit       *serverwiring.AutoSplitFlags
 }
 
 type distributionStartup struct {
@@ -153,6 +155,8 @@ func startDistributionStartup(in distributionStartupInput) (distributionStartup,
 		in.coordinate,
 		in.sampler,
 		autosplit.NewPrometheusObserver(in.metricsRegistry.Registerer()),
+		in.keyViz,
+		in.autoSplit,
 	)
 	if err != nil {
 		return distributionStartup{}, err

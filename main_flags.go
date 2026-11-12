@@ -47,6 +47,14 @@ type serverFlags struct {
 	leaderBalance   leaderBalanceFlags
 	tso             tsoFlags
 	snapshotOffload snapshotOffloadFlags
+	adminHTTP       adminHTTPFlags
+	backup          backupFlags
+	// keyViz and autoSplit are shared with the cmd/server demo through
+	// internal/serverwiring. The sampler runs entirely in-memory on each
+	// node, feeds AdminServer.GetKeyVizMatrix, and is disabled unless
+	// --keyvizEnabled or --autoSplit is set.
+	keyViz    *serverwiring.KeyVizFlags
+	autoSplit *serverwiring.AutoSplitFlags
 }
 
 func registerServerFlags(fs *flag.FlagSet) *serverFlags {
@@ -56,6 +64,10 @@ func registerServerFlags(fs *flag.FlagSet) *serverFlags {
 	f.leaderBalance.register(fs)
 	f.tso.register(fs)
 	f.snapshotOffload.register(fs)
+	f.adminHTTP.register(fs)
+	f.backup.register(fs)
+	f.keyViz = serverwiring.RegisterKeyVizFlags(fs)
+	f.autoSplit = serverwiring.RegisterAutoSplitFlags(fs)
 	return f
 }
 
@@ -122,30 +134,6 @@ var (
 	grpcTLSCertFile                = flag.String("grpcTLSCertFile", "", "PEM certificate enabling TLS on group gRPC listeners and peer clients")
 	grpcTLSKeyFile                 = flag.String("grpcTLSKeyFile", "", "PEM private key for group gRPC TLS")
 	s3BlobPeerTokenFile            = flag.String("s3BlobPeerTokenFile", "", "Path to the cluster-shared bearer token for peer S3 chunkblob RPCs")
-	backupDefaultTTL               = flag.Duration("backupDefaultTTL", defaultBackupTTL, "Default live-backup pin TTL")
-	backupMaxTTL                   = flag.Duration("backupMaxTTL", defaultBackupMaxTTL, "Maximum live-backup pin TTL per renewal")
-	backupBeginDeadline            = flag.Duration("backupBeginDeadline", defaultBackupDeadline, "Deadline for live-backup peer gates and pin fan-out")
-	backupSnapshotHeadroomEntries  = flag.Uint64(
-		"backupSnapshotHeadroomEntries", defaultBackupHeadroom,
-		"Minimum Raft entries remaining before the next snapshot when a live backup begins",
-	)
-	backupScanPageSize  = flag.Int("backupScanPageSize", defaultBackupPageSize, "Count-only scan page size used by live-backup baselines")
-	backupMaxActivePins = flag.Int("backupMaxActivePins", defaultBackupPinLimit, "Maximum concurrent logical live-backup pins")
-
-	// Admin HTTP listener flags (PR #545's parallel work merged into
-	// main; serves the cookie/SigV4-authenticated admin dashboard).
-	adminEnabled                       = flag.Bool("adminEnabled", false, "Enable the admin HTTP listener")
-	adminListen                        = flag.String("adminListen", "127.0.0.1:8080", "host:port for the admin HTTP listener (loopback by default)")
-	adminTLSCertFile                   = flag.String("adminTLSCertFile", "", "PEM-encoded TLS certificate for the admin listener")
-	adminTLSKeyFile                    = flag.String("adminTLSKeyFile", "", "PEM-encoded TLS private key for the admin listener")
-	adminAllowPlaintextNonLoopback     = flag.Bool("adminAllowPlaintextNonLoopback", false, "Allow the admin listener to bind a non-loopback address without TLS (strongly discouraged)")
-	adminAllowInsecureDevCookie        = flag.Bool("adminAllowInsecureDevCookie", false, "Mint admin cookies without the Secure attribute (local plaintext dev only)")
-	adminSessionSigningKey             = flag.String("adminSessionSigningKey", "", "Cluster-shared base64 HS256 key (64 bytes decoded); prefer -adminSessionSigningKeyFile / ELASTICKV_ADMIN_SESSION_SIGNING_KEY so the value does not appear in /proc/<pid>/cmdline")
-	adminSessionSigningKeyFile         = flag.String("adminSessionSigningKeyFile", "", "Path to a file containing the base64-encoded primary admin HS256 key; avoids leaking the secret via argv")
-	adminSessionSigningKeyPrevious     = flag.String("adminSessionSigningKeyPrevious", "", "Optional previous admin HS256 key accepted only for verification during rotation; prefer -adminSessionSigningKeyPreviousFile")
-	adminSessionSigningKeyPreviousFile = flag.String("adminSessionSigningKeyPreviousFile", "", "Path to a file containing the base64-encoded previous admin HS256 key used for rotation")
-	adminReadOnlyAccessKeys            = flag.String("adminReadOnlyAccessKeys", "", "Comma-separated SigV4 access keys granted read-only admin access")
-	adminFullAccessKeys                = flag.String("adminFullAccessKeys", "", "Comma-separated SigV4 access keys granted full-access admin role")
 
 	// Data-at-rest encryption admin RPC wiring (Stage 5D). The
 	// EncryptionAdmin gRPC service is reachable on every shard's
@@ -192,24 +180,4 @@ var (
 	// RPC boundary by the mutator gate documented above.
 	kekFile = flag.String("kekFile", "", "§5.1 KEK file path (32 raw bytes, owner-only mode). When set, the file-backed kek.Wrapper is constructed at startup and threaded into the §6.3 EncryptionApplier so ApplyBootstrap and ApplyRotation can KEK-unwrap.")
 	kekURI  = flag.String("kekUri", "", "§5.1 remote KEK URI: aws-kms://<key-arn>, gcp-kms://<crypto-key-resource>, or vault-transit://<mount>/<key>. Mutually exclusive with --kekFile and ELASTICKV_KEK_BASE64.")
-
-	// Key visualizer sampler and auto-split flags. Both groups are shared
-	// with the cmd/server demo through internal/serverwiring. The sampler
-	// runs entirely in-memory on each node, feeds
-	// AdminServer.GetKeyVizMatrix, and is disabled unless --keyvizEnabled
-	// or --autoSplit is set.
-	keyVizFlags    = serverwiring.RegisterKeyVizFlags(flag.CommandLine)
-	autoSplitFlags = serverwiring.RegisterAutoSplitFlags(flag.CommandLine)
-
-	// Phase 2-C cluster fan-out: comma-separated list of admin
-	// HTTP endpoints (host:port or scheme://host:port). When set,
-	// the admin keyviz handler aggregates the local matrix with
-	// peer responses; when empty, behaviour is unchanged
-	// (single-node view). See docs/design/2026_04_27_implemented_keyviz_cluster_fanout.md.
-	keyvizFanoutNodes   = flag.String("keyvizFanoutNodes", "", "Comma-separated peer admin endpoints (host:port) for keyviz cluster-wide fan-out; empty disables")
-	keyvizFanoutTimeout = flag.Duration("keyvizFanoutTimeout", keyvizFanoutDefaultTimeout, "Per-peer timeout for keyviz fan-out HTTP calls")
 )
-
-// keyvizFanoutDefaultTimeout matches design 9 open-question 2: 2 s
-// per peer call. Operators on weird networks override via the flag.
-const keyvizFanoutDefaultTimeout = 2 * time.Second

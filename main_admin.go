@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"flag"
 	"log/slog"
 	"net"
 	"net/http"
@@ -97,9 +98,55 @@ type adminListenerConfig struct {
 // without touching --s3CredentialsFile: pulling the admin feature into
 // a hard dependency on that file would break deployments that never
 // intended to use it.
+// adminHTTPFlags configures the cookie/SigV4-authenticated admin dashboard
+// listener and its keyviz cluster fan-out.
+type adminHTTPFlags struct {
+	enabled                       bool
+	listen                        string
+	tlsCertFile                   string
+	tlsKeyFile                    string
+	allowPlaintextNonLoopback     bool
+	allowInsecureDevCookie        bool
+	sessionSigningKey             string
+	sessionSigningKeyFile         string
+	sessionSigningKeyPrevious     string
+	sessionSigningKeyPreviousFile string
+	readOnlyAccessKeys            string
+	fullAccessKeys                string
+	// keyvizFanoutNodes lists peer admin endpoints (host:port or
+	// scheme://host:port). When set, the admin keyviz handler aggregates
+	// the local matrix with peer responses; when empty it serves the
+	// single-node view. See
+	// docs/design/2026_04_27_implemented_keyviz_cluster_fanout.md.
+	keyvizFanoutNodes   string
+	keyvizFanoutTimeout time.Duration
+}
+
+// keyvizFanoutDefaultTimeout matches design 9 open-question 2: 2 s
+// per peer call. Operators on weird networks override via the flag.
+const keyvizFanoutDefaultTimeout = 2 * time.Second
+
+func (f *adminHTTPFlags) register(fs *flag.FlagSet) {
+	fs.BoolVar(&f.enabled, "adminEnabled", false, "Enable the admin HTTP listener")
+	fs.StringVar(&f.listen, "adminListen", "127.0.0.1:8080", "host:port for the admin HTTP listener (loopback by default)")
+	fs.StringVar(&f.tlsCertFile, "adminTLSCertFile", "", "PEM-encoded TLS certificate for the admin listener")
+	fs.StringVar(&f.tlsKeyFile, "adminTLSKeyFile", "", "PEM-encoded TLS private key for the admin listener")
+	fs.BoolVar(&f.allowPlaintextNonLoopback, "adminAllowPlaintextNonLoopback", false, "Allow the admin listener to bind a non-loopback address without TLS (strongly discouraged)")
+	fs.BoolVar(&f.allowInsecureDevCookie, "adminAllowInsecureDevCookie", false, "Mint admin cookies without the Secure attribute (local plaintext dev only)")
+	fs.StringVar(&f.sessionSigningKey, "adminSessionSigningKey", "", "Cluster-shared base64 HS256 key (64 bytes decoded); prefer -adminSessionSigningKeyFile / ELASTICKV_ADMIN_SESSION_SIGNING_KEY so the value does not appear in /proc/<pid>/cmdline")
+	fs.StringVar(&f.sessionSigningKeyFile, "adminSessionSigningKeyFile", "", "Path to a file containing the base64-encoded primary admin HS256 key; avoids leaking the secret via argv")
+	fs.StringVar(&f.sessionSigningKeyPrevious, "adminSessionSigningKeyPrevious", "", "Optional previous admin HS256 key accepted only for verification during rotation; prefer -adminSessionSigningKeyPreviousFile")
+	fs.StringVar(&f.sessionSigningKeyPreviousFile, "adminSessionSigningKeyPreviousFile", "", "Path to a file containing the base64-encoded previous admin HS256 key used for rotation")
+	fs.StringVar(&f.readOnlyAccessKeys, "adminReadOnlyAccessKeys", "", "Comma-separated SigV4 access keys granted read-only admin access")
+	fs.StringVar(&f.fullAccessKeys, "adminFullAccessKeys", "", "Comma-separated SigV4 access keys granted full-access admin role")
+	fs.StringVar(&f.keyvizFanoutNodes, "keyvizFanoutNodes", "", "Comma-separated peer admin endpoints (host:port) for keyviz cluster-wide fan-out; empty disables")
+	fs.DurationVar(&f.keyvizFanoutTimeout, "keyvizFanoutTimeout", keyvizFanoutDefaultTimeout, "Per-peer timeout for keyviz fan-out HTTP calls")
+}
+
 func prepareAdminFromFlags(
 	ctx context.Context,
 	lc *net.ListenConfig,
+	f adminHTTPFlags,
 	runtimes []*raftGroupRuntime,
 	dynamoServer *adapter.DynamoDBServer,
 	s3Server *adapter.S3Server,
@@ -109,7 +156,7 @@ func prepareAdminFromFlags(
 	keyvizSampler *keyviz.MemSampler,
 	keyvizFanoutCfg adminbridge.KeyVizFanoutConfig,
 ) (*preparedAdminServer, error) {
-	if !*adminEnabled {
+	if !f.enabled {
 		return nil, nil
 	}
 	staticCreds, err := loadS3StaticCredentials(*s3CredsFile)
@@ -127,25 +174,25 @@ func prepareAdminFromFlags(
 		return nil, errors.New("admin listener is enabled but no static credentials are configured; " +
 			"set -s3CredentialsFile to a file with at least one entry")
 	}
-	primaryKey, err := resolveSigningKey(*adminSessionSigningKey, *adminSessionSigningKeyFile, envAdminSessionSigningKey)
+	primaryKey, err := resolveSigningKey(f.sessionSigningKey, f.sessionSigningKeyFile, envAdminSessionSigningKey)
 	if err != nil {
 		return nil, errors.Wrap(err, "resolve -adminSessionSigningKey")
 	}
-	previousKey, err := resolveSigningKey(*adminSessionSigningKeyPrevious, *adminSessionSigningKeyPreviousFile, envAdminSessionSigningKeyPrevious)
+	previousKey, err := resolveSigningKey(f.sessionSigningKeyPrevious, f.sessionSigningKeyPreviousFile, envAdminSessionSigningKeyPrevious)
 	if err != nil {
 		return nil, errors.Wrap(err, "resolve -adminSessionSigningKeyPrevious")
 	}
 	cfg := adminListenerConfig{
-		enabled:                   *adminEnabled,
-		listen:                    *adminListen,
-		tlsCertFile:               *adminTLSCertFile,
-		tlsKeyFile:                *adminTLSKeyFile,
-		allowPlaintextNonLoopback: *adminAllowPlaintextNonLoopback,
-		allowInsecureDevCookie:    *adminAllowInsecureDevCookie,
+		enabled:                   f.enabled,
+		listen:                    f.listen,
+		tlsCertFile:               f.tlsCertFile,
+		tlsKeyFile:                f.tlsKeyFile,
+		allowPlaintextNonLoopback: f.allowPlaintextNonLoopback,
+		allowInsecureDevCookie:    f.allowInsecureDevCookie,
 		sessionSigningKey:         primaryKey,
 		sessionSigningKeyPrevious: previousKey,
-		readOnlyAccessKeys:        parseCSV(*adminReadOnlyAccessKeys),
-		fullAccessKeys:            parseCSV(*adminFullAccessKeys),
+		readOnlyAccessKeys:        parseCSV(f.readOnlyAccessKeys),
+		fullAccessKeys:            parseCSV(f.fullAccessKeys),
 	}
 	clusterSrc := newClusterInfoSource(*raftId, buildVersion(), runtimes)
 	tablesSrc := adminbridge.NewDynamoTablesSource(dynamoServer)

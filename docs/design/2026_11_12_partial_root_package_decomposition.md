@@ -123,9 +123,14 @@ Tests move with the code they cover.
   its own value. `TestCLIFlagsReadOnlyByMain` fails if any other file
   reads `cliFlags`. Tests build values with `defaultFlags[T]()`, so the
   TSO and snapshot-offload tests no longer overwrite process globals.
+  Part 2 adds the admin HTTP listener with its keyviz fan-out
+  (`adminHTTPFlags`), live backup (`backupFlags`, carried to the Admin
+  service through `adminBackupDependencies`), and the keyviz / auto-split
+  flag groups that `internal/serverwiring` already defined, which now hang
+  off `serverFlags` instead of package globals.
   Still package globals: listener addresses, Raft and shard topology,
-  admin HTTP/gRPC and node auth, split migration, backups, encryption and
-  KEK, keyviz/auto-split, and the bootstrap peer-config dir.
+  admin gRPC and node auth, split migration, encryption and KEK, and the
+  bootstrap peer-config dir.
 - Snapshot-offload wiring can now move (M4): its helpers take
   `snapshotOffloadFlags` instead of reading about twenty flags.
 
