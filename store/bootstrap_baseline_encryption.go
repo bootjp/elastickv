@@ -218,7 +218,10 @@ func VerifyBootstrapBaselinePhysicalEquality(ctx context.Context, source, target
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	defer func() { err = errors.Join(err, b.Close(), a.Error(), b.Error()) }()
+	defer func() {
+		aErr, bErr := a.Error(), b.Error()
+		err = errors.Join(err, aErr, bErr, b.Close())
+	}()
 	valid := a.First()
 	for other := b.First(); other; other = b.Next() {
 		if err := ctx.Err(); err != nil {
