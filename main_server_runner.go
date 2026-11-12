@@ -16,7 +16,6 @@ import (
 	"github.com/bootjp/elastickv/internal/raftengine"
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/bootjp/elastickv/internal/serverwiring"
-	"github.com/bootjp/elastickv/internal/splitmigration"
 	"github.com/bootjp/elastickv/internal/tsowiring"
 	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/kv"
@@ -229,7 +228,7 @@ func startPublicServicesAfterCommitTSFence(in serversInput, runner *runtimeServe
 		return runner.startupFailure(errors.Wrap(err, "wait for commit-ts fence activation before public service"))
 	}
 	startDistributionSplitJobRunner(in.ctx, in.eg, in.distServer, in.nodeAuth.splitMigrationLocalReadinessGate)
-	splitmigration.StartOwnershipRefresh(in.ctx, in.eg, in.distServer, in.nodeAuth.splitMigrationLocalReadinessGate)
+	adapter.StartMigrationOwnershipRefresh(in.ctx, in.eg, in.distServer, in.nodeAuth.splitMigrationLocalReadinessGate)
 	if err := runner.startPublicServices(); err != nil {
 		return err
 	}

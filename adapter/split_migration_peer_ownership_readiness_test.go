@@ -1,4 +1,4 @@
-package splitmigration
+package adapter
 
 import (
 	"context"
@@ -13,10 +13,10 @@ import (
 
 func TestMigrationReadinessGateMissingFailsClosed(t *testing.T) {
 	t.Parallel()
-	var missing ReadinessGate
-	require.ErrorIs(t, missing.Check(t.Context()), ErrReadinessGateMissing)
+	var missing MigrationReadinessGate
+	require.ErrorIs(t, missing.Check(t.Context()), ErrMigrationReadinessGateMissing)
 
-	interceptor := NewCoverageUnaryGate(nil)
+	interceptor := NewMigrationCoverageUnaryGate(nil)
 	_, err := interceptor(t.Context(), nil, &grpc.UnaryServerInfo{FullMethod: pb.Internal_ImportRangeVersions_FullMethodName},
 		func(context.Context, any) (any, error) {
 			t.Fatal("a server without a readiness gate must not run migration mutations")

@@ -1,4 +1,4 @@
-package splitmigration
+package adapter
 
 import (
 	"context"
@@ -14,7 +14,7 @@ import (
 
 const migrationMemberProbeTimeout = 2 * time.Second
 
-func NewMemberProtocolProbe(token string, providers ...kv.GRPCDialOptionsForAddress) func(context.Context, string) error {
+func NewMigrationMemberProtocolProbe(token string, providers ...kv.GRPCDialOptionsForAddress) func(context.Context, string) error {
 	return func(ctx context.Context, address string) error {
 		if strings.TrimSpace(address) == "" {
 			return errors.WithStack(status.Error(codes.FailedPrecondition, "migration member address is empty"))

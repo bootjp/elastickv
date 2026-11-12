@@ -11,7 +11,6 @@ import (
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
-	"github.com/bootjp/elastickv/internal/splitmigration"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
@@ -103,12 +102,12 @@ func TestDistributionCatalogStoreForGroupEnablesRouteDescriptorV2Writes(t *testi
 func TestSplitMigrationCapabilityGateChecksAllPeers(t *testing.T) {
 	t.Parallel()
 
-	peers := []splitmigration.CapabilityPeer{
+	peers := []adapter.SplitMigrationCapabilityPeer{
 		{ID: "n1", Address: "10.0.0.11:50051"},
 		{ID: "n2", Address: "10.0.0.12:50051"},
 	}
 	var probed []string
-	gate := splitmigration.NewCapabilityGate(staticSplitMigrationCapabilityPeerSource(peers), time.Second, func(_ context.Context, address string) error {
+	gate := adapter.NewSplitMigrationCapabilityGate(staticSplitMigrationCapabilityPeerSource(peers), time.Second, func(_ context.Context, address string) error {
 		probed = append(probed, address)
 		return nil
 	}, nil)
@@ -120,7 +119,7 @@ func TestSplitMigrationCapabilityGateChecksAllPeers(t *testing.T) {
 func TestSplitMigrationCapabilityGateFailsClosedWithoutPeers(t *testing.T) {
 	t.Parallel()
 
-	gate := splitmigration.NewCapabilityGate(nil, time.Second, func(context.Context, string) error {
+	gate := adapter.NewSplitMigrationCapabilityGate(nil, time.Second, func(context.Context, string) error {
 		t.Fatal("probe must not run without peers")
 		return nil
 	}, nil)
@@ -134,11 +133,11 @@ func TestSplitMigrationCapabilityGateFailsClosedWithoutPeers(t *testing.T) {
 func TestSplitMigrationCapabilityGateFailsClosedWhenPeerMissingCapability(t *testing.T) {
 	t.Parallel()
 
-	peers := []splitmigration.CapabilityPeer{
+	peers := []adapter.SplitMigrationCapabilityPeer{
 		{ID: "n1", Address: "10.0.0.11:50051"},
 		{ID: "n2", Address: "10.0.0.12:50051"},
 	}
-	gate := splitmigration.NewCapabilityGate(staticSplitMigrationCapabilityPeerSource(peers), time.Second, func(_ context.Context, address string) error {
+	gate := adapter.NewSplitMigrationCapabilityGate(staticSplitMigrationCapabilityPeerSource(peers), time.Second, func(_ context.Context, address string) error {
 		if address == "10.0.0.12:50051" {
 			return status.Error(codes.Unimplemented, "method not found")
 		}
@@ -156,7 +155,7 @@ func TestSplitMigrationCapabilityGateFailsClosedWhenPeerSourceErrors(t *testing.
 	t.Parallel()
 
 	errPeerSourceUnavailable := errors.New("configuration unavailable")
-	gate := splitmigration.NewCapabilityGate(func(context.Context) ([]splitmigration.CapabilityPeer, error) {
+	gate := adapter.NewSplitMigrationCapabilityGate(func(context.Context) ([]adapter.SplitMigrationCapabilityPeer, error) {
 		return nil, errPeerSourceUnavailable
 	}, time.Second, func(context.Context, string) error {
 		t.Fatal("probe must not run when peer source fails")
@@ -172,10 +171,10 @@ func TestSplitMigrationCapabilityGateFailsClosedWhenPeerSourceErrors(t *testing.
 func TestSplitMigrationCapabilityGateFailsClosedWhenLocalReadinessFails(t *testing.T) {
 	t.Parallel()
 
-	peers := []splitmigration.CapabilityPeer{
+	peers := []adapter.SplitMigrationCapabilityPeer{
 		{ID: "n1", Address: "10.0.0.11:50051"},
 	}
-	gate := splitmigration.NewCapabilityGate(staticSplitMigrationCapabilityPeerSource(peers), time.Second, func(context.Context, string) error {
+	gate := adapter.NewSplitMigrationCapabilityGate(staticSplitMigrationCapabilityPeerSource(peers), time.Second, func(context.Context, string) error {
 		t.Fatal("probe must not run when local readiness is closed")
 		return nil
 	}, func(context.Context) error {
@@ -224,11 +223,11 @@ func TestSplitMigrationCapabilityPeersFromConfigurationUsesCurrentMembers(t *tes
 		{Suffrage: "voter", ID: "n1", Address: "10.0.0.11:50051"},
 	}}
 
-	require.Equal(t, []splitmigration.CapabilityPeer{
+	require.Equal(t, []adapter.SplitMigrationCapabilityPeer{
 		{ID: "n1", Address: "10.0.0.11:50051"},
 		{ID: "n2", Address: "10.0.0.12:50051"},
 		{ID: "n3", Address: "10.0.0.13:50051"},
-	}, splitmigration.CapabilityPeersFromConfiguration(cfg))
+	}, adapter.SplitMigrationCapabilityPeersFromConfiguration(cfg))
 }
 
 func TestSplitMigrationCapabilityPeerSourceForRuntimesChecksAllGroups(t *testing.T) {
@@ -257,7 +256,7 @@ func TestSplitMigrationCapabilityPeerSourceForRuntimesChecksAllGroups(t *testing
 
 	peers, err := splitMigrationCapabilityPeerSourceForRuntimes(runtimes)(context.Background())
 	require.NoError(t, err)
-	require.Equal(t, []splitmigration.CapabilityPeer{
+	require.Equal(t, []adapter.SplitMigrationCapabilityPeer{
 		{ID: "n1", Address: "10.0.0.11:50051"},
 		{ID: "n2", Address: "10.0.0.12:50051"},
 		{ID: "n3", Address: "10.0.0.13:50051"},
@@ -299,7 +298,7 @@ func TestProbeSplitMigrationCapabilityPeerRequiresDocumentedToken(t *testing.T) 
 		Capabilities:     []string{"split_migration_v2"},
 	})
 
-	err := splitmigration.ProbeCapabilityPeer(context.Background(), addr)
+	err := adapter.ProbeSplitMigrationCapabilityPeer(context.Background(), addr)
 	require.Error(t, err)
 	require.ErrorContains(t, err, adapter.SplitMigrationCapabilityV2)
 }
@@ -312,12 +311,12 @@ func TestProbeSplitMigrationCapabilityPeerAcceptsDocumentedToken(t *testing.T) {
 		Capabilities:     []string{adapter.SplitMigrationCapabilityV2},
 	})
 
-	require.NoError(t, splitmigration.ProbeCapabilityPeer(context.Background(), addr))
+	require.NoError(t, adapter.ProbeSplitMigrationCapabilityPeer(context.Background(), addr))
 }
 
-func staticSplitMigrationCapabilityPeerSource(peers []splitmigration.CapabilityPeer) splitmigration.CapabilityPeerSource {
-	return func(context.Context) ([]splitmigration.CapabilityPeer, error) {
-		out := make([]splitmigration.CapabilityPeer, len(peers))
+func staticSplitMigrationCapabilityPeerSource(peers []adapter.SplitMigrationCapabilityPeer) adapter.SplitMigrationCapabilityPeerSource {
+	return func(context.Context) ([]adapter.SplitMigrationCapabilityPeer, error) {
+		out := make([]adapter.SplitMigrationCapabilityPeer, len(peers))
 		copy(out, peers)
 		return out, nil
 	}

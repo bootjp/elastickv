@@ -12,7 +12,6 @@ import (
 	"github.com/bootjp/elastickv/distribution"
 	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/bootjp/elastickv/internal/raftengine"
-	"github.com/bootjp/elastickv/internal/splitmigration"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/stretchr/testify/require"
@@ -117,16 +116,16 @@ func TestSplitMigrationFactoriesPropagateCredentials(t *testing.T) {
 	ctx = metadata.NewOutgoingContext(ctx, metadata.Pairs("authorization", "Bearer stale", "trace-id", "preserved"))
 	job := distribution.SplitJob{TargetGroupID: 2}
 	resolve := func(uint64) (string, error) { return lis.Addr().String(), nil }
-	source, target, err := splitmigration.ClientFactory(resolve, &cache, "migration-secret")(ctx, job, 1)
+	source, target, err := adapter.NewSplitMigrationGRPCClientFactory(resolve, &cache, "migration-secret")(ctx, job, 1)
 	require.NoError(t, err)
-	voters, err := splitmigration.VoterFactory(map[uint64]*kv.ShardGroup{
+	voters, err := adapter.NewSplitMigrationGRPCVoterFactory(map[uint64]*kv.ShardGroup{
 		2: {Engine: capabilityConfigEngine{cfg: raftengine.Configuration{Servers: []raftengine.Server{
 			{ID: "voter", Address: lis.Addr().String(), Suffrage: raftMemberSuffrageVoter},
 		}}}},
 	}, &cache, "migration-secret")(ctx, 2)
 	require.NoError(t, err)
 	require.Len(t, voters, 1)
-	sourceOnly, err := splitmigration.GroupClientFactory(func(groupID uint64) (string, error) {
+	sourceOnly, err := adapter.NewSplitMigrationGroupGRPCClientFactory(func(groupID uint64) (string, error) {
 		if groupID != 1 {
 			return "", status.Error(codes.Unavailable, "target leader unavailable")
 		}
@@ -154,7 +153,7 @@ func TestSplitMigrationFactoriesPropagateCredentials(t *testing.T) {
 		require.NoError(t, recvErr)
 		require.True(t, page.GetDone())
 	}
-	promoter, err := splitmigration.PromotionClientFactory(func(distribution.SplitJob) (string, error) {
+	promoter, err := adapter.NewSplitPromotionGRPCClientFactory(func(distribution.SplitJob) (string, error) {
 		return lis.Addr().String(), nil
 	}, &cache, "migration-secret")(ctx, job)
 	require.NoError(t, err)

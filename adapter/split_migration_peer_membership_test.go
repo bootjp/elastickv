@@ -1,4 +1,4 @@
-package splitmigration
+package adapter
 
 import (
 	"context"
@@ -52,7 +52,7 @@ func TestMigrationMembershipRequiresSupportBeforeNextHook(t *testing.T) {
 			t.Parallel()
 			var order []string
 			next := migrationMembershipNext{add: func() { order = append(order, "add") }, promote: func() { order = append(order, "promote") }}
-			gate := NewMembershipGate(migrationMembershipStore{view: test.view}, test.enabled,
+			gate := NewMigrationMembershipGate(migrationMembershipStore{view: test.view}, test.enabled,
 				func(_ context.Context, address string) error {
 					require.Equal(t, "candidate:50051", address)
 					order = append(order, "probe")
@@ -69,7 +69,7 @@ func TestMigrationMembershipRefusalStopsNextHook(t *testing.T) {
 	t.Parallel()
 	sentinel := errors.New("unsupported protocol")
 	next := migrationMembershipNext{add: func() { t.Fatal("add hook ran") }, promote: func() { t.Fatal("promotion hook ran") }}
-	gate := NewMembershipGate(nil, true, func(context.Context, string) error { return sentinel }, next)
+	gate := NewMigrationMembershipGate(nil, true, func(context.Context, string) error { return sentinel }, next)
 	require.ErrorIs(t, gate.PreAddMember(t.Context(), "candidate", "candidate:50051"), sentinel)
 	require.ErrorIs(t, gate.PrePromoteMember(t.Context(), "candidate", "candidate:50051"), sentinel)
 	gate.probe = nil
@@ -81,7 +81,7 @@ func TestMigrationMembershipPreservesUnconfiguredClusters(t *testing.T) {
 	for _, st := range []store.MVCCStore{nil, store.NewMVCCStore(), migrationMembershipStore{}} {
 		calls := 0
 		var next raftadmin.MembershipChangeInterceptor = migrationMembershipNext{add: func() { calls++ }}
-		gate := NewMembershipGate(st, false, func(context.Context, string) error {
+		gate := NewMigrationMembershipGate(st, false, func(context.Context, string) error {
 			t.Fatal("ordinary cluster must not probe migration support")
 			return nil
 		}, next)
@@ -93,7 +93,7 @@ func TestMigrationMembershipPreservesUnconfiguredClusters(t *testing.T) {
 func TestMigrationMembershipMetadataErrorAndCancellationStopAdmission(t *testing.T) {
 	t.Parallel()
 	sentinel := errors.New("ownership metadata unavailable")
-	gate := NewMembershipGate(migrationMembershipStore{err: sentinel}, false, nil, nil)
+	gate := NewMigrationMembershipGate(migrationMembershipStore{err: sentinel}, false, nil, nil)
 	require.ErrorIs(t, gate.PreAddMember(t.Context(), "candidate", "candidate:50051"), sentinel)
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
@@ -104,7 +104,7 @@ func TestMigrationMembershipPreservesNextHookErrors(t *testing.T) {
 	t.Parallel()
 	sentinel := errors.New("prepare evidence protocol unsupported")
 	next := migrationMembershipNext{add: func() {}, promote: func() {}, err: sentinel}
-	gate := NewMembershipGate(nil, false, nil, next)
+	gate := NewMigrationMembershipGate(nil, false, nil, next)
 	require.ErrorIs(t, gate.PreAddMember(t.Context(), "candidate", "candidate:50051"), sentinel)
 	require.ErrorIs(t, gate.PrePromoteMember(t.Context(), "candidate", "candidate:50051"), sentinel)
 }

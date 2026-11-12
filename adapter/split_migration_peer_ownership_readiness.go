@@ -1,9 +1,8 @@
-package splitmigration
+package adapter
 
 import (
 	"context"
 
-	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
@@ -14,7 +13,7 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-func NewInternalTransaction(proposer raftengine.Proposer, observer kv.ProposalObserver, st store.MVCCStore, groupID uint64) *kv.TransactionManager {
+func NewInternalMigrationTransaction(proposer raftengine.Proposer, observer kv.ProposalObserver, st store.MVCCStore, groupID uint64) *kv.TransactionManager {
 	opts := []kv.TransactionOption{kv.WithProposalObserver(observer)}
 	if groupID != 0 {
 		opts = append(opts, kv.WithMigrationRequestAdmission(st, groupID))
@@ -22,27 +21,27 @@ func NewInternalTransaction(proposer raftengine.Proposer, observer kv.ProposalOb
 	return kv.NewTransactionWithProposer(proposer, opts...)
 }
 
-func OwnershipRuntimeHooksInstalled(tx kv.Transactional, shards *kv.ShardStore, server *adapter.DistributionServer, groupID uint64) bool {
+func MigrationOwnershipRuntimeHooksInstalled(tx kv.Transactional, shards *kv.ShardStore, server *DistributionServer, groupID uint64) bool {
 	return kv.MigrationPartitionRequestAdmissionReady(tx) && shards.MigrationPartitionReadAdmissionReady(groupID) && server.MigrationPartitionRuntimeConfigured(groupID)
 }
 
-// ReadinessGate reports whether split migration may run on this
+// MigrationReadinessGate reports whether split migration may run on this
 // node (nodeAuthFlags.splitMigrationLocalReadinessGate in production).
-type ReadinessGate func(context.Context) error
+type MigrationReadinessGate func(context.Context) error
 
-var ErrReadinessGateMissing = errors.New("split migration readiness gate is not configured")
+var ErrMigrationReadinessGateMissing = errors.New("split migration readiness gate is not configured")
 
 // Check treats a missing gate as migration disabled, so a caller that was not
 // handed one fails closed.
-func (g ReadinessGate) Check(ctx context.Context) error {
+func (g MigrationReadinessGate) Check(ctx context.Context) error {
 	if g == nil {
-		return ErrReadinessGateMissing
+		return ErrMigrationReadinessGateMissing
 	}
 	return g(ctx)
 }
 
-func OwnershipRuntimeReady(tx kv.Transactional, shards *kv.ShardStore, server *adapter.DistributionServer, groupID uint64, engine raftengine.Engine, ready ReadinessGate) bool {
-	if !OwnershipRuntimeHooksInstalled(tx, shards, server, groupID) || ready.Check(context.Background()) != nil {
+func MigrationOwnershipRuntimeReady(tx kv.Transactional, shards *kv.ShardStore, server *DistributionServer, groupID uint64, engine raftengine.Engine, ready MigrationReadinessGate) bool {
+	if !MigrationOwnershipRuntimeHooksInstalled(tx, shards, server, groupID) || ready.Check(context.Background()) != nil {
 		return false
 	}
 	reader, ok := engine.(raftengine.AppliedConfigurationReader)
@@ -56,13 +55,13 @@ func OwnershipRuntimeReady(tx kv.Transactional, shards *kv.ShardStore, server *a
 // Old controllers may cache cap_migration_v2. Refuse their side-effecting RPCs
 // when local flags are disabled, while leaving ordinary KV, authenticated 2PC
 // resolution, same-group SplitRange, and general Admin traffic unchanged.
-func NewCoverageUnaryGate(ready ReadinessGate) grpc.UnaryServerInterceptor {
+func NewMigrationCoverageUnaryGate(ready MigrationReadinessGate) grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
-		return CoverageUnaryGate(ctx, req, info, handler, ready)
+		return MigrationCoverageUnaryGate(ctx, req, info, handler, ready)
 	}
 }
 
-func CoverageUnaryGate(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler, ready ReadinessGate) (any, error) {
+func MigrationCoverageUnaryGate(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler, ready MigrationReadinessGate) (any, error) {
 	if info.FullMethod == pb.Internal_CleanupMigration_FullMethodName {
 		if control, ok := req.(*pb.CleanupMigrationRequest); ok && control.GetMode() == pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_NAMESPACE_ADMISSION {
 			if err := kv.ValidateNamespaceAdmissionRequest(control); err != nil {

@@ -1,4 +1,4 @@
-package splitmigration
+package adapter
 
 import (
 	"context"
@@ -65,7 +65,7 @@ func (n *namespaceGateNext) PrePromoteMember(context.Context, string, string) er
 	return nil
 }
 
-func newNamespaceGateFixture(t *testing.T, active bool) (*NamespaceMembershipGate, *namespaceGateEngine, *namespaceGateNext, map[string]uint32, map[string]int) {
+func newNamespaceGateFixture(t *testing.T, active bool) (*MigrationNamespaceMembershipGate, *namespaceGateEngine, *namespaceGateNext, map[string]uint32, map[string]int) {
 	t.Helper()
 	st := store.NewMVCCStore()
 	fsm := kv.NewKvFSMWithHLC(st, nil)
@@ -83,7 +83,7 @@ func newNamespaceGateFixture(t *testing.T, active bool) (*NamespaceMembershipGat
 		require.NoError(t, kv.ActivateMigrationNamespace(t.Context(), st, engine, command))
 	}
 	next := &namespaceGateNext{check: func() {}}
-	gate := NewNamespaceMembershipGate(st, engine, engine, "secret", next, etcd.DeriveNodeID)
+	gate := NewMigrationNamespaceMembershipGate(st, engine, engine, "secret", next, etcd.DeriveNodeID)
 	versions := map[string]uint32{"n1:7001": 1, "learner:7001": 1, "candidate:7001": 1}
 	probes := map[string]int{}
 	gate.probe = func(ctx context.Context, address string, _ *pb.ProbeMigrationStateRequest) (*pb.ProbeMigrationStateResponse, error) {

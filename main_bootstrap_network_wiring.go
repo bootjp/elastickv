@@ -3,9 +3,9 @@ package main
 import (
 	"context"
 
+	"github.com/bootjp/elastickv/adapter"
 	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/bootjp/elastickv/internal/noderuntime"
-	"github.com/bootjp/elastickv/internal/splitmigration"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc"
@@ -105,9 +105,9 @@ func bootstrapTSORoutingOptions(networks []*bootstrapNetwork) []kv.LeaderRoutedT
 	return []kv.LeaderRoutedTSOAllocatorOption{kv.WithTSOInternalGRPCDialOptions(network.DialOptions), kv.WithTSOStartupControlRPC(network.startup)}
 }
 
-func bootstrapSplitMigrationProbe(runtimes []*raftGroupRuntime) splitmigration.CapabilityProbe {
+func bootstrapSplitMigrationProbe(runtimes []*raftGroupRuntime) adapter.SplitMigrationCapabilityProbe {
 	provider := bootstrapRuntimeDialOptions(runtimes)
 	return func(ctx context.Context, address string) error {
-		return splitmigration.ProbeCapabilityPeerWithDial(ctx, address, provider)
+		return adapter.ProbeSplitMigrationCapabilityPeerWithDial(ctx, address, provider)
 	}
 }

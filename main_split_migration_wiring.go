@@ -8,17 +8,16 @@ import (
 	"github.com/bootjp/elastickv/internal/raftadmin"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
-	"github.com/bootjp/elastickv/internal/splitmigration"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/cockroachdb/errors"
 )
 
-func splitMigrationCapabilityPeerSourceForRuntimes(runtimes []*raftGroupRuntime) splitmigration.CapabilityPeerSource {
-	return func(ctx context.Context) ([]splitmigration.CapabilityPeer, error) {
+func splitMigrationCapabilityPeerSourceForRuntimes(runtimes []*raftGroupRuntime) adapter.SplitMigrationCapabilityPeerSource {
+	return func(ctx context.Context) ([]adapter.SplitMigrationCapabilityPeer, error) {
 		if len(runtimes) == 0 {
 			return nil, errors.New("raft group runtimes are not configured")
 		}
-		peers := make([]splitmigration.CapabilityPeer, 0)
+		peers := make([]adapter.SplitMigrationCapabilityPeer, 0)
 		seen := make(map[string]struct{})
 		for _, rt := range runtimes {
 			if rt == nil {
@@ -32,7 +31,7 @@ func splitMigrationCapabilityPeerSourceForRuntimes(runtimes []*raftGroupRuntime)
 			if err != nil {
 				return nil, errors.Wrapf(err, "raft group %d configuration", rt.Spec.ID)
 			}
-			groupPeers := splitmigration.CapabilityPeersFromConfiguration(cfg)
+			groupPeers := adapter.SplitMigrationCapabilityPeersFromConfiguration(cfg)
 			if len(groupPeers) == 0 {
 				return nil, errors.Errorf("raft group %d configuration has no split migration capability peers", rt.Spec.ID)
 			}
@@ -76,7 +75,9 @@ func (f nodeAuthFlags) splitMigrationPeerAuthReadinessGate(context.Context) erro
 }
 
 func migrationInternalProtocolOptions(tx kv.Transactional, shards *kv.ShardStore, server *adapter.DistributionServer, runtime *raftGroupRuntime) []adapter.InternalOption {
-	installed := func() bool { return splitmigration.OwnershipRuntimeHooksInstalled(tx, shards, server, runtime.Spec.ID) }
+	installed := func() bool {
+		return adapter.MigrationOwnershipRuntimeHooksInstalled(tx, shards, server, runtime.Spec.ID)
+	}
 	return []adapter.InternalOption{
 		adapter.WithInternalMigrationTransferSizeGuardReady(installed),
 		adapter.WithInternalMigrationPartitionProtocolReady(installed),
@@ -110,7 +111,7 @@ func migrationOwnershipRefreshOption(groups map[uint64]*kv.ShardGroup, root *raf
 		// client or advertise a configured refresh runtime in this case.
 		return adapter.WithMigrationOwnershipRefresh(groups, nil)
 	}
-	return adapter.WithMigrationOwnershipRefresh(groups, splitmigration.OwnershipRootClientFactory(migrationOwnershipRootLeaderResolver(root), cache, token))
+	return adapter.WithMigrationOwnershipRefresh(groups, adapter.NewMigrationOwnershipRootGRPCClientFactory(migrationOwnershipRootLeaderResolver(root), cache, token))
 }
 
 func migrationMembershipInterceptor(runtime *raftGroupRuntime, shards *kv.ShardStore, proposer raftengine.Proposer,
@@ -124,7 +125,7 @@ func migrationMembershipInterceptor(runtime *raftGroupRuntime, shards *kv.ShardS
 	if runtime.Spec.ID == 0 {
 		return prepare
 	}
-	protocols := splitmigration.NewMembershipGate(runtime.Store, splitmigration.MemberProtocolsConfigured(),
-		splitmigration.NewMemberProtocolProbe(token, bootstrapRuntimeDialOptions([]*raftGroupRuntime{runtime})), prepare)
-	return splitmigration.NewNamespaceMembershipGate(runtime.Store, runtime.snapshotEngine(), proposer, token, protocols, etcdraftengine.DeriveNodeID, bootstrapRuntimeDialOptions([]*raftGroupRuntime{runtime}))
+	protocols := adapter.NewMigrationMembershipGate(runtime.Store, adapter.MigrationMemberProtocolsConfigured(),
+		adapter.NewMigrationMemberProtocolProbe(token, bootstrapRuntimeDialOptions([]*raftGroupRuntime{runtime})), prepare)
+	return adapter.NewMigrationNamespaceMembershipGate(runtime.Store, runtime.snapshotEngine(), proposer, token, protocols, etcdraftengine.DeriveNodeID, bootstrapRuntimeDialOptions([]*raftGroupRuntime{runtime}))
 }
