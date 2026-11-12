@@ -1,6 +1,6 @@
 # Root package decomposition
 
-Status: Proposed
+Status: Partial (M1 and part of M4 implemented)
 Author: bootjp
 Date: 2026-11-12
 
