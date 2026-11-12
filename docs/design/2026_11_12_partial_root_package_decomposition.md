@@ -1,6 +1,6 @@
 # Root package decomposition
 
-Status: Partial (M1 and part of M4 implemented)
+Status: Partial (M1, part of M2 and part of M4 implemented)
 Author: bootjp
 Date: 2026-11-12
 
@@ -91,6 +91,8 @@ Tests move with the code they cover.
   are registered on a `*flag.FlagSet`. `run()` builds plain config values
   from those structs and passes them down. Helpers stop dereferencing
   globals. Tests construct config values instead of mutating globals.
+  About 130 flags across some 25 files is too much for one reviewable
+  PR, so M2 lands one group of areas per PR.
 - **M3 — `internal/noderuntime`.** Move `raftGroupRuntime`, `groupSpec`,
   the raft bootstrap/peer config resolution, `runtimeConfig` parsing and
   the shard-group builder. This unblocks every remaining milestone.
@@ -110,8 +112,20 @@ Tests move with the code they cover.
   inputs (a `Group` interface with `GroupID` / `Engine`, and a resolved
   `fsmount.Config`) rather than `*raftGroupRuntime` or flag globals, so
   neither waited for M3.
-- Snapshot-offload wiring is deferred until M2: it reads about twenty flags
-  directly, and its tests set those flags.
+- M2 (partial): `serverFlags` in `main_flags.go` groups the flags of the
+  health listener, FUSE mount, leader balance, TSO and snapshot offload.
+  Each area's struct (`filesystemFlags`, `leaderBalanceFlags`, `tsoFlags`,
+  `snapshotOffloadFlags` with its nested `snapshotRetentionFlags`)
+  registers itself on a `*flag.FlagSet` and sits next to the wiring that
+  reads it. `main()` passes `cliFlags` to `run()`, which hands each area
+  its own value. `TestCLIFlagsReadOnlyByMain` fails if any other file
+  reads `cliFlags`. Tests build values with `defaultFlags[T]()`, so the
+  TSO and snapshot-offload tests no longer overwrite process globals.
+  Still package globals: listener addresses, Raft and shard topology,
+  admin HTTP/gRPC and node auth, split migration, backups, encryption and
+  KEK, keyviz/auto-split, and the bootstrap peer-config dir.
+- Snapshot-offload wiring can now move (M4): its helpers take
+  `snapshotOffloadFlags` instead of reading about twenty flags.
 
 ## Decisions
 
