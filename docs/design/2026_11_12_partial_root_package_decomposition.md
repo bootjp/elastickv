@@ -77,7 +77,9 @@ the doc is updated when that happens.
 
 ## Milestones
 
-Each milestone is one PR, compiles on its own and is behavior-neutral.
+Each milestone is one PR, except M2 and M4, which land one area (or one
+group of areas) per PR. Every PR compiles on its own and is
+behavior-neutral.
 Tests move with the code they cover.
 
 - **M1 — Admin bridges.** Move `sqsQueuesBridge`, `bucketsBridge`,
