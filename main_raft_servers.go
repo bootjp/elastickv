@@ -56,7 +56,7 @@ func raftGRPCServerOptions(adminGRPCOpts adminGRPCInterceptors) []grpc.ServerOpt
 	// silently overwrite the admin auth gate — gRPC-Go keeps only the
 	// last option of the same type.
 	unary := append([]grpc.UnaryServerInterceptor{}, adminGRPCOpts.unary...)
-	unary = append(unary, migrationCoverageUnaryGate)
+	unary = append(unary, newMigrationCoverageUnaryGate(adminGRPCOpts.migrationReady))
 	opts = append(opts, grpc.ChainUnaryInterceptor(unary...))
 	if len(adminGRPCOpts.stream) > 0 {
 		opts = append(opts, grpc.ChainStreamInterceptor(adminGRPCOpts.stream...))
@@ -128,7 +128,7 @@ func startRaftServers(
 		internalOpts = append(internalOpts, bootstrapInternalPolicyOptions(rt, proposerForGroup(rt, shardGroups))...)
 		internalOpts = append(internalOpts, dedicatedTimestampCutoverOptions(shardGroups)...)
 		internalOpts = append(internalOpts, adapter.WithInternalMigrationOwnershipReady(func() bool {
-			return migrationOwnershipRuntimeReady(trx, shardStore, distServer, rt.spec.id, rt.snapshotEngine())
+			return migrationOwnershipRuntimeReady(trx, shardStore, distServer, rt.spec.id, rt.snapshotEngine(), adminGRPCOpts.migrationReady)
 		}))
 		internalOpts = append(internalOpts, migrationInternalProtocolOptions(trx, shardStore, distServer, rt)...)
 		internalOpts = append(internalOpts, internalReadWatermarkOptions(*readWatermarkAdvance, rt, shardGroups)...)

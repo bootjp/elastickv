@@ -63,7 +63,7 @@ func assertTSOLegacyRecoveryRefused(t *testing.T, base string, profile []groupSp
 	path := filepath.Join(groupDataDir(base, "n1", 0, true), dedicatedTSOControlStoreName)
 	before, err := readOnlyTSOStoreDigest(t.Context(), path)
 	require.NoError(t, err)
-	specs, domain, err := loadProtectedBootstrapDomain("n1", base, profile, true)
+	specs, domain, err := loadProtectedBootstrapDomain("n1", base, profile, true, nil)
 	require.NoError(t, err)
 	t.Cleanup(domain.admission.Close)
 	builder := shardGroupBuilder{raftID: "n1", raftDir: base, multi: true, factory: enablementFactory(), clock: kv.NewHLC(), bootstrapSpecs: specs}

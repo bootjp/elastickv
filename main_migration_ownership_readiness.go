@@ -26,8 +26,23 @@ func migrationOwnershipRuntimeHooksInstalled(tx kv.Transactional, shards *kv.Sha
 	return kv.MigrationPartitionRequestAdmissionReady(tx) && shards.MigrationPartitionReadAdmissionReady(groupID) && server.MigrationPartitionRuntimeConfigured(groupID)
 }
 
-func migrationOwnershipRuntimeReady(tx kv.Transactional, shards *kv.ShardStore, server *adapter.DistributionServer, groupID uint64, engine raftengine.Engine) bool {
-	if !migrationOwnershipRuntimeHooksInstalled(tx, shards, server, groupID) || splitMigrationLocalReadinessGate(context.Background()) != nil {
+// migrationReadinessGate reports whether split migration may run on this
+// node (nodeAuthFlags.splitMigrationLocalReadinessGate in production).
+type migrationReadinessGate func(context.Context) error
+
+var errMigrationReadinessGateMissing = errors.New("split migration readiness gate is not configured")
+
+// check treats a missing gate as migration disabled, so a caller that was not
+// handed one fails closed.
+func (g migrationReadinessGate) check(ctx context.Context) error {
+	if g == nil {
+		return errMigrationReadinessGateMissing
+	}
+	return g(ctx)
+}
+
+func migrationOwnershipRuntimeReady(tx kv.Transactional, shards *kv.ShardStore, server *adapter.DistributionServer, groupID uint64, engine raftengine.Engine, ready migrationReadinessGate) bool {
+	if !migrationOwnershipRuntimeHooksInstalled(tx, shards, server, groupID) || ready.check(context.Background()) != nil {
 		return false
 	}
 	reader, ok := engine.(raftengine.AppliedConfigurationReader)
@@ -41,7 +56,13 @@ func migrationOwnershipRuntimeReady(tx kv.Transactional, shards *kv.ShardStore, 
 // Old controllers may cache cap_migration_v2. Refuse their side-effecting RPCs
 // when local flags are disabled, while leaving ordinary KV, authenticated 2PC
 // resolution, same-group SplitRange, and general Admin traffic unchanged.
-func migrationCoverageUnaryGate(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+func newMigrationCoverageUnaryGate(ready migrationReadinessGate) grpc.UnaryServerInterceptor {
+	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		return migrationCoverageUnaryGate(ctx, req, info, handler, ready)
+	}
+}
+
+func migrationCoverageUnaryGate(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler, ready migrationReadinessGate) (any, error) {
 	if info.FullMethod == pb.Internal_CleanupMigration_FullMethodName {
 		if control, ok := req.(*pb.CleanupMigrationRequest); ok && control.GetMode() == pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_NAMESPACE_ADMISSION {
 			if err := kv.ValidateNamespaceAdmissionRequest(control); err != nil {
@@ -51,7 +72,7 @@ func migrationCoverageUnaryGate(ctx context.Context, req any, info *grpc.UnarySe
 		}
 	}
 	if migrationCoverageMutationMethod(info.FullMethod) {
-		if err := splitMigrationLocalReadinessGate(ctx); err != nil {
+		if err := ready.check(ctx); err != nil {
 			return nil, errors.WithStack(status.Error(codes.FailedPrecondition, err.Error()))
 		}
 	}

@@ -36,7 +36,7 @@ import (
 
 func TestConfigureAdminServiceDisabledByDefault(t *testing.T) {
 	t.Parallel()
-	srv, icept, err := configureAdminService("", false, "", "", false, adapter.NodeIdentity{NodeID: "n1"}, nil, nil)
+	srv, icept, err := configureAdminService(nodeAuthFlags{}, false, adapter.NodeIdentity{NodeID: "n1"}, nil, nil)
 	if err != nil {
 		t.Fatalf("disabled-by-default should not error: %v", err)
 	}
@@ -161,7 +161,7 @@ func TestConfigureAdminServiceRejectsMutualExclusion(t *testing.T) {
 	if err := os.WriteFile(tokPath, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := configureAdminService(tokPath, true, "", "", false, adapter.NodeIdentity{}, nil, nil); err == nil {
+	if _, _, err := configureAdminService(nodeAuthFlags{adminTokenFile: tokPath, adminInsecureNoAuth: true}, false, adapter.NodeIdentity{}, nil, nil); err == nil {
 		t.Fatal("expected mutual-exclusion error")
 	}
 }
@@ -177,7 +177,7 @@ func TestConfigureAdminServiceTokenFile(t *testing.T) {
 	if err := os.WriteFile(peerPath, []byte("peer-secret\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	srv, icept, err := configureAdminService(tokPath, false, peerPath, "", true, adapter.NodeIdentity{NodeID: "n1"}, nil, nil)
+	srv, icept, err := configureAdminService(nodeAuthFlags{adminTokenFile: tokPath, s3BlobPeerTokenFile: peerPath}, true, adapter.NodeIdentity{NodeID: "n1"}, nil, nil)
 	if err != nil {
 		t.Fatalf("configureAdminService: %v", err)
 	}
@@ -209,7 +209,7 @@ func TestConfigureAdminServiceRejectsSharedAdminAndPeerToken(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, _, err := configureAdminService(adminPath, false, peerPath, "", true, adapter.NodeIdentity{}, nil, nil); err == nil {
+	if _, _, err := configureAdminService(nodeAuthFlags{adminTokenFile: adminPath, s3BlobPeerTokenFile: peerPath}, true, adapter.NodeIdentity{}, nil, nil); err == nil {
 		t.Fatal("expected shared admin and peer token to be rejected")
 	}
 }
@@ -225,7 +225,7 @@ func TestConfigureAdminServiceDoesNotAdvertiseDisabledS3BlobOffload(t *testing.T
 	if err := os.WriteFile(peerPath, []byte("peer-secret\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	srv, icept, err := configureAdminService(tokPath, false, peerPath, "", false, adapter.NodeIdentity{NodeID: "n1"}, nil, nil)
+	srv, icept, err := configureAdminService(nodeAuthFlags{adminTokenFile: tokPath, s3BlobPeerTokenFile: peerPath}, false, adapter.NodeIdentity{NodeID: "n1"}, nil, nil)
 	if err != nil {
 		t.Fatalf("configureAdminService: %v", err)
 	}
@@ -243,7 +243,7 @@ func TestConfigureAdminServiceDoesNotAdvertiseDisabledS3BlobOffload(t *testing.T
 
 func TestConfigureAdminServiceInsecureNoAuth(t *testing.T) {
 	t.Parallel()
-	srv, icept, err := configureAdminService("", true, "", "", true, adapter.NodeIdentity{NodeID: "n1"}, nil, nil)
+	srv, icept, err := configureAdminService(nodeAuthFlags{adminInsecureNoAuth: true}, true, adapter.NodeIdentity{NodeID: "n1"}, nil, nil)
 	if err != nil {
 		t.Fatalf("insecure mode should succeed: %v", err)
 	}
@@ -289,16 +289,7 @@ func TestConfigureAdminServiceWiresLeaderVersionProbe(t *testing.T) {
 
 	var cache kv.GRPCConnCache
 	t.Cleanup(func() { require.NoError(t, cache.Close()) })
-	srv, _, err := configureAdminService(
-		"",
-		true,
-		"",
-		"",
-		false,
-		adapter.NodeIdentity{NodeID: "n1", GRPCAddress: "127.0.0.1:50051"},
-		nil,
-		&cache,
-	)
+	srv, _, err := configureAdminService(nodeAuthFlags{adminInsecureNoAuth: true}, false, adapter.NodeIdentity{NodeID: "n1", GRPCAddress: "127.0.0.1:50051"}, nil, &cache)
 	require.NoError(t, err)
 	require.NotNil(t, srv)
 	srv.RegisterGroup(1, adminVersionProbeGroup{leader: raftengine.LeaderInfo{
@@ -324,16 +315,7 @@ func TestConfigureAdminServiceUsesStampedBuildVersion(t *testing.T) {
 	if got := buildVersion(); got != "v-admin-test" {
 		t.Fatalf("buildVersion = %q, want v-admin-test", got)
 	}
-	srv, _, err := configureAdminService(
-		"",
-		true,
-		"",
-		"",
-		false,
-		adapter.NodeIdentity{NodeID: "n1", GRPCAddress: "127.0.0.1:50051"},
-		nil,
-		nil,
-	)
+	srv, _, err := configureAdminService(nodeAuthFlags{adminInsecureNoAuth: true}, false, adapter.NodeIdentity{NodeID: "n1", GRPCAddress: "127.0.0.1:50051"}, nil, nil)
 	require.NoError(t, err)
 	require.NotNil(t, srv)
 	resp, err := srv.GetNodeVersion(context.Background(), &pb.GetNodeVersionRequest{})

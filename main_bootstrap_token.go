@@ -5,11 +5,11 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-func validateBootstrapStartupToken(token string) error {
+func validateBootstrapStartupToken(token string, serviceTokenFiles []string) error {
 	if token == "" {
 		return errors.New("protected runtime requires a dedicated startup token")
 	}
-	for _, path := range []string{*adminTokenFile, *splitMigrationTokenFile, *s3BlobPeerTokenFile} {
+	for _, path := range serviceTokenFiles {
 		if path == "" {
 			continue
 		}

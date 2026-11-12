@@ -128,9 +128,16 @@ Tests move with the code they cover.
   service through `adminBackupDependencies`), and the keyviz / auto-split
   flag groups that `internal/serverwiring` already defined, which now hang
   off `serverFlags` instead of package globals.
+  Part 3 adds node auth (`nodeAuthFlags`: Admin gRPC token and insecure
+  mode, split-migration token and enforcement, peer gRPC TLS, S3 blob peer
+  token). The split-migration readiness gate becomes a method on it; the
+  distribution server, background runners and raft gRPC servers receive
+  its method value (the raft servers through `adminGRPCInterceptors`),
+  and a missing gate fails closed. The protected-bootstrap check that the
+  startup token differs from the service tokens gets the token files
+  through `raftBootstrapConfig`, so it still runs before any group opens.
   Still package globals: listener addresses, Raft and shard topology,
-  admin gRPC and node auth, split migration, encryption and KEK, and the
-  bootstrap peer-config dir.
+  encryption and KEK, and the bootstrap peer-config dir.
 - Snapshot-offload wiring can now move (M4): its helpers take
   `snapshotOffloadFlags` instead of reading about twenty flags.
 

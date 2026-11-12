@@ -45,7 +45,7 @@ func validateProtectedBootstrapDomain(raftID, baseDir string, groups []groupSpec
 	return nil
 }
 
-func loadProtectedBootstrapDomain(raftID, baseDir string, groups []groupSpec, multi bool, encWiring ...encryptionWriteWiring) (map[uint64]*groupBootstrapSpec, *bootstrapDomain, error) {
+func loadProtectedBootstrapDomain(raftID, baseDir string, groups []groupSpec, multi bool, serviceTokenFiles []string, encWiring ...encryptionWriteWiring) (map[uint64]*groupBootstrapSpec, *bootstrapDomain, error) {
 	if *raftBootstrapPeerConfigDir == "" {
 		return nil, nil, nil
 	}
@@ -65,14 +65,14 @@ func loadProtectedBootstrapDomain(raftID, baseDir string, groups []groupSpec, mu
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := attachBootstrapDomain(specs, domain); err != nil {
+	if err := attachBootstrapDomain(specs, domain, serviceTokenFiles); err != nil {
 		domain.admission.Close()
 		return nil, nil, err
 	}
 	return specs, domain, nil
 }
 
-func attachBootstrapDomain(specs map[uint64]*groupBootstrapSpec, domain *bootstrapDomain) error {
+func attachBootstrapDomain(specs map[uint64]*groupBootstrapSpec, domain *bootstrapDomain, serviceTokenFiles []string) error {
 	for _, spec := range specs {
 		if spec.config.startupToken == "" || (domain.startupToken != "" && domain.startupToken != spec.config.startupToken) {
 			return errors.New("all protected groups require the same dedicated startup token")
@@ -80,7 +80,7 @@ func attachBootstrapDomain(specs map[uint64]*groupBootstrapSpec, domain *bootstr
 		domain.startupToken = spec.config.startupToken
 		spec.domain = domain
 	}
-	return validateBootstrapStartupToken(domain.startupToken)
+	return validateBootstrapStartupToken(domain.startupToken, serviceTokenFiles)
 }
 
 func (b shardGroupBuilder) bootstrapSpecForGroup(id uint64) (*groupBootstrapSpec, error) {

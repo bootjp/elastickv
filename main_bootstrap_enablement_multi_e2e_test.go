@@ -180,7 +180,7 @@ func multiEnablementStartMember(t *testing.T, base string, identity *multiEnable
 	if protected {
 		*raftBootstrapPeerConfigDir = identity.configDir
 		var err error
-		builder.bootstrapSpecs, domain, err = loadProtectedBootstrapDomain(identity.id, base, []groupSpec{group}, false)
+		builder.bootstrapSpecs, domain, err = loadProtectedBootstrapDomain(identity.id, base, []groupSpec{group}, false, nil)
 		require.NoError(t, err)
 		t.Cleanup(domain.admission.Close)
 		loaded := builder.bootstrapSpecs[group.id].config

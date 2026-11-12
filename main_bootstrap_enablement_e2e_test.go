@@ -164,7 +164,7 @@ type enablementProtectedNode struct {
 
 func enablementStartProtected(t *testing.T, base string, group groupSpec) *enablementProtectedNode {
 	t.Helper()
-	specs, domain, err := loadProtectedBootstrapDomain("n1", base, []groupSpec{group}, false)
+	specs, domain, err := loadProtectedBootstrapDomain("n1", base, []groupSpec{group}, false, nil)
 	require.NoError(t, err)
 	t.Cleanup(domain.admission.Close)
 	routes := distribution.NewEngine()

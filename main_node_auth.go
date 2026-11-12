@@ -1,11 +1,50 @@
 package main
 
 import (
+	"flag"
+
 	"github.com/bootjp/elastickv/adapter"
 	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc"
 )
+
+// nodeAuthFlags configures authentication between nodes and toward the
+// node-local Admin gRPC service: bearer-token files, the development-only
+// insecure mode, the split-migration rollout switch, and peer gRPC TLS.
+// They are independent of the admin HTTP listener flags; operators can
+// enable either auth path, or both.
+type nodeAuthFlags struct {
+	adminTokenFile                 string
+	adminInsecureNoAuth            bool
+	splitMigrationTokenFile        string
+	splitMigrationPeerAuthEnforced bool
+	grpcTLSCAFile                  string
+	grpcTLSCertFile                string
+	grpcTLSKeyFile                 string
+	s3BlobPeerTokenFile            string
+}
+
+func (f *nodeAuthFlags) register(fs *flag.FlagSet) {
+	fs.StringVar(&f.adminTokenFile, "adminTokenFile", "", "Path to the read-only Admin bearer token; does not authorize split migration")
+	fs.BoolVar(&f.adminInsecureNoAuth, "adminInsecureNoAuth", false, "Register the Admin gRPC service without bearer-token authentication; development only")
+	fs.StringVar(&f.splitMigrationTokenFile, "splitMigrationTokenFile", "", "Path to a dedicated cluster-shared migration controller/node token, distinct from Admin and S3 peer tokens")
+	fs.BoolVar(&f.splitMigrationPeerAuthEnforced, "splitMigrationPeerAuthEnforced", false, "Require TLS peer Forward credentials and enable migration only after every node sends the migration token")
+	fs.StringVar(&f.grpcTLSCAFile, "grpcTLSCAFile", "", "CA certificates for verifying peer gRPC TLS; requires grpcTLSCertFile and grpcTLSKeyFile")
+	fs.StringVar(&f.grpcTLSCertFile, "grpcTLSCertFile", "", "PEM certificate enabling TLS on group gRPC listeners and peer clients")
+	fs.StringVar(&f.grpcTLSKeyFile, "grpcTLSKeyFile", "", "PEM private key for group gRPC TLS")
+	fs.StringVar(&f.s3BlobPeerTokenFile, "s3BlobPeerTokenFile", "", "Path to the cluster-shared bearer token for peer S3 chunkblob RPCs")
+}
+
+// serviceTokenFiles lists the token files a protected bootstrap startup
+// token must not reuse.
+func (f nodeAuthFlags) serviceTokenFiles() []string {
+	return []string{f.adminTokenFile, f.splitMigrationTokenFile, f.s3BlobPeerTokenFile}
+}
+
+func (f nodeAuthFlags) loadGRPCAuth() (nodeGRPCAuthConfig, error) {
+	return loadNodeGRPCAuth(f.adminTokenFile, f.adminInsecureNoAuth, f.s3BlobPeerTokenFile, f.splitMigrationTokenFile)
+}
 
 type nodeGRPCAuthConfig struct {
 	adminToken     string
@@ -55,19 +94,19 @@ func validateMigrationOpcodeAuth(token string, insecureNoAuth bool) error {
 	return nil
 }
 
-func validateMigrationStartupAuth() error {
-	auth, err := loadNodeGRPCAuth(*adminTokenFile, *adminInsecureNoAuth, *s3BlobPeerTokenFile, *splitMigrationTokenFile)
+func validateMigrationStartupAuth(f nodeAuthFlags) error {
+	auth, err := f.loadGRPCAuth()
 	if err != nil {
 		return err
 	}
-	return validateMigrationPeerSecurity(auth.migrationToken, *adminInsecureNoAuth, *splitMigrationPeerAuthEnforced, *grpcTLSCertFile != "" && *grpcTLSKeyFile != "")
+	return validateMigrationPeerSecurity(auth.migrationToken, f.adminInsecureNoAuth, f.splitMigrationPeerAuthEnforced, f.grpcTLSCertFile != "" && f.grpcTLSKeyFile != "")
 }
 
-func configureNodeGRPCTransport() error {
-	if err := internalutil.ConfigureGRPCTLS(*grpcTLSCAFile, *grpcTLSCertFile, *grpcTLSKeyFile); err != nil {
+func configureNodeGRPCTransport(f nodeAuthFlags) error {
+	if err := internalutil.ConfigureGRPCTLS(f.grpcTLSCAFile, f.grpcTLSCertFile, f.grpcTLSKeyFile); err != nil {
 		return errors.Wrap(err, "configure peer gRPC transport")
 	}
-	return validateMigrationStartupAuth()
+	return validateMigrationStartupAuth(f)
 }
 
 func validateMigrationPeerSecurity(token string, insecureNoAuth, enforced, tlsEnabled bool) error {

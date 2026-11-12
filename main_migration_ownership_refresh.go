@@ -57,8 +57,8 @@ func migrationOwnershipRefreshOption(groups map[uint64]*kv.ShardGroup, root *raf
 	return adapter.WithMigrationOwnershipRefresh(groups, migrationOwnershipRootClientFactory(migrationOwnershipRootLeaderResolver(root), cache, token))
 }
 
-func startMigrationOwnershipRefresh(ctx context.Context, eg *errgroup.Group, server *adapter.DistributionServer) {
-	if eg == nil || server == nil || splitMigrationLocalReadinessGate(ctx) != nil {
+func startMigrationOwnershipRefresh(ctx context.Context, eg *errgroup.Group, server *adapter.DistributionServer, ready migrationReadinessGate) {
+	if eg == nil || server == nil || ready.check(ctx) != nil {
 		return
 	}
 	eg.Go(func() error { return server.RunMigrationOwnershipRefresh(ctx) })

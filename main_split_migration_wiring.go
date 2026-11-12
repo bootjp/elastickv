@@ -286,8 +286,11 @@ func splitMigrationVoter(groupID uint64, member raftengine.Server, connCache *kv
 	return adapter.SplitMigrationVoter{ID: member.ID, Address: addr, Client: newSplitMigrationInternalClient(conn, token)}, nil
 }
 
-func splitMigrationLocalReadinessGate(ctx context.Context) error {
-	if err := splitMigrationPeerAuthReadinessGate(ctx); err != nil {
+// splitMigrationLocalReadinessGate reports whether this node may run split
+// migration. Its method value is the readiness callback handed to the
+// distribution server, the gRPC coverage gate and the background runners.
+func (f nodeAuthFlags) splitMigrationLocalReadinessGate(ctx context.Context) error {
+	if err := f.splitMigrationPeerAuthReadinessGate(ctx); err != nil {
 		return err
 	}
 	if !adapter.MigrationImportOpcodeEnabledFromEnv() {
@@ -302,8 +305,8 @@ func splitMigrationLocalReadinessGate(ctx context.Context) error {
 	return nil
 }
 
-func splitMigrationPeerAuthReadinessGate(context.Context) error {
-	if *adminInsecureNoAuth || *splitMigrationPeerAuthEnforced {
+func (f nodeAuthFlags) splitMigrationPeerAuthReadinessGate(context.Context) error {
+	if f.adminInsecureNoAuth || f.splitMigrationPeerAuthEnforced {
 		return nil
 	}
 	return errors.New("migration is paused during peer auth rollout; enable --splitMigrationPeerAuthEnforced only after every node sends the token")

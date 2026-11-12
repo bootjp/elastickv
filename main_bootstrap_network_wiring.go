@@ -9,11 +9,13 @@ import (
 	"google.golang.org/grpc"
 )
 
-func resolveNetworkRuntimeInputs(backup backupFlags) (runtimeConfig, raftEngineType, raftBootstrapConfig, bool, error) {
-	if err := configureNodeGRPCTransport(); err != nil {
+func resolveNetworkRuntimeInputs(backup backupFlags, nodeAuth nodeAuthFlags) (runtimeConfig, raftEngineType, raftBootstrapConfig, bool, error) {
+	if err := configureNodeGRPCTransport(nodeAuth); err != nil {
 		return runtimeConfig{}, "", raftBootstrapConfig{}, false, err
 	}
-	return resolveValidatedRuntimeInputs(backup)
+	cfg, engineType, bootstrapCfg, bootstrap, err := resolveValidatedRuntimeInputs(backup)
+	bootstrapCfg.serviceTokenFiles = nodeAuth.serviceTokenFiles()
+	return cfg, engineType, bootstrapCfg, bootstrap, err
 }
 
 func configureBootstrapNetwork(ctx context.Context, runtimes []*raftGroupRuntime, shards *kv.ShardStore, groups map[uint64]*kv.ShardGroup, cleanup *internalutil.CleanupStack) (*bootstrapNetwork, error) {
