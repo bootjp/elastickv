@@ -5,6 +5,7 @@ import (
 	"slices"
 
 	"github.com/bootjp/elastickv/internal/encryption"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftadmission"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/bootjp/elastickv/kv"
@@ -24,21 +25,7 @@ type bootstrapEncryptionDomain struct {
 	grants       []bootstrapRotationPayloadGrant
 }
 
-// bootstrapEncryptionRequest is the part of the encryption flags protected
-// bootstrap admission depends on.
-type bootstrapEncryptionRequest struct {
-	// configured is --encryption-enabled or a non-empty
-	// --encryptionSidecarPath.
-	configured bool
-	// rotateOnStartup is --encryption-rotate-on-startup.
-	rotateOnStartup bool
-}
-
-func (r bootstrapEncryptionRequest) requested() bool {
-	return r.configured || r.rotateOnStartup
-}
-
-func newBootstrapEncryptionDomain(groups []groupSpec, request bootstrapEncryptionRequest, optional []encryptionWriteWiring) (*bootstrapEncryptionDomain, error) {
+func newBootstrapEncryptionDomain(groups []noderuntime.GroupSpec, request noderuntime.BootstrapEncryptionRequest, optional []encryptionWriteWiring) (*bootstrapEncryptionDomain, error) {
 	if len(optional) > 1 {
 		return nil, errors.Wrap(errBootstrapEncryptionUnsupported, "multiple encryption wirings")
 	}
@@ -46,7 +33,7 @@ func newBootstrapEncryptionDomain(groups []groupSpec, request bootstrapEncryptio
 	if len(optional) == 1 {
 		w = optional[0]
 	}
-	if !request.requested() && !w.encryptionConfigured() {
+	if !request.Requested() && !w.encryptionConfigured() {
 		return nil, nil
 	}
 	if err := validateBootstrapDomainEncryptionWiring(w, groups); err != nil {
@@ -54,13 +41,13 @@ func newBootstrapEncryptionDomain(groups []groupSpec, request bootstrapEncryptio
 	}
 	allowed := make(map[uint64]bool, len(groups))
 	for _, group := range groups {
-		allowed[group.id] = true
+		allowed[group.ID] = true
 	}
-	return &bootstrapEncryptionDomain{wiring: w, nodeID: w.raftEnvelope.fullNodeID, defaultGroup: defaultGroupID(groups), allowed: allowed,
+	return &bootstrapEncryptionDomain{wiring: w, nodeID: w.raftEnvelope.fullNodeID, defaultGroup: noderuntime.DefaultGroupID(groups), allowed: allowed,
 		groups: make(map[uint64]*kv.ShardGroup)}, nil
 }
 
-func validateBootstrapDomainEncryptionWiring(w encryptionWriteWiring, groups []groupSpec) error {
+func validateBootstrapDomainEncryptionWiring(w encryptionWriteWiring, groups []noderuntime.GroupSpec) error {
 	if w.cache == nil || w.cipher == nil || w.raftEnvelope == nil || w.raftRegistration == nil {
 		return errors.Wrap(errBootstrapEncryptionUnsupported, "protected encryption requires actual complete write wiring")
 	}

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
@@ -23,7 +24,7 @@ func TestStartRaftEngineLifecycleWatchersReportsEngineFailure(t *testing.T) {
 	t.Parallel()
 	engineErr := errors.New("snapshot write failed")
 	engine := &lifecycleEngineStub{done: make(chan struct{}), err: engineErr}
-	runtimes := []*raftGroupRuntime{{spec: groupSpec{id: 7}, engine: engine}}
+	runtimes := []*raftGroupRuntime{{spec: noderuntime.GroupSpec{ID: 7}, engine: engine}}
 
 	eg, ctx := errgroup.WithContext(context.Background())
 	startRaftEngineLifecycleWatchers(ctx, eg, runtimes)
@@ -37,7 +38,7 @@ func TestStartRaftEngineLifecycleWatchersReportsEngineFailure(t *testing.T) {
 func TestStartRaftEngineLifecycleWatchersIgnoresCleanEngineStop(t *testing.T) {
 	t.Parallel()
 	engine := &lifecycleEngineStub{done: make(chan struct{})}
-	runtimes := []*raftGroupRuntime{{spec: groupSpec{id: 9}, engine: engine}}
+	runtimes := []*raftGroupRuntime{{spec: noderuntime.GroupSpec{ID: 9}, engine: engine}}
 
 	eg, ctx := errgroup.WithContext(context.Background())
 	startRaftEngineLifecycleWatchers(ctx, eg, runtimes)
@@ -49,7 +50,7 @@ func TestStartRaftEngineLifecycleWatchersIgnoresCleanEngineStop(t *testing.T) {
 func TestStartRaftEngineLifecycleWatchersIgnoresContextCancellation(t *testing.T) {
 	t.Parallel()
 	engine := &lifecycleEngineStub{done: make(chan struct{})}
-	runtimes := []*raftGroupRuntime{{spec: groupSpec{id: 8}, engine: engine}}
+	runtimes := []*raftGroupRuntime{{spec: noderuntime.GroupSpec{ID: 8}, engine: engine}}
 	ctx, cancel := context.WithCancel(context.Background())
 	eg, runCtx := errgroup.WithContext(ctx)
 	startRaftEngineLifecycleWatchers(runCtx, eg, runtimes)

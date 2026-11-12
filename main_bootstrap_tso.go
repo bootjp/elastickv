@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"slices"
 
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/internal/raftengine/etcd"
@@ -28,13 +29,13 @@ type tsoBootstrapRecoveryLoader func(context.Context, raftbootstrap.Identity, ui
 // publicMethods belongs to the parent listener; options may carry its at-rest
 // encryption wiring. The ShardGroup never exposes this backing as a data store.
 func buildProtectedDedicatedTSOGroup(
-	raftID string, group groupSpec, baseDir string, multi, bootstrap, joinAsLearner bool,
+	raftID string, group noderuntime.GroupSpec, baseDir string, multi, bootstrap, joinAsLearner bool,
 	bootstrapServers, bootstrapSeed []raftengine.Server, factory raftengine.Factory,
 	clock *kv.HLC, proposalObserver kv.ProposalObserver,
 	spec *groupBootstrapSpec, domain *bootstrapDomain, publicMethods []string,
 	options ...store.PebbleStoreOption,
 ) (*raftGroupRuntime, *kv.ShardGroup, error) {
-	dir := groupDataDir(baseDir, raftID, group.id, multi)
+	dir := groupDataDir(baseDir, raftID, group.ID, multi)
 	native, err := validateProtectedTSOFactory(raftID, group, dir, factory, spec, domain)
 	if err != nil {
 		return nil, nil, err
@@ -75,7 +76,7 @@ func buildProtectedDedicatedTSOGroup(
 	return runtime, sg, nil
 }
 
-func validateProtectedTSOFactory(raftID string, group groupSpec, dir string, factory raftengine.Factory, spec *groupBootstrapSpec, domain *bootstrapDomain) (*etcd.Factory, error) {
+func validateProtectedTSOFactory(raftID string, group noderuntime.GroupSpec, dir string, factory raftengine.Factory, spec *groupBootstrapSpec, domain *bootstrapDomain) (*etcd.Factory, error) {
 	if !validProtectedTSOWiring(group, dir, spec, domain) {
 		return nil, errors.WithStack(raftbootstrap.ErrInconsistent)
 	}
@@ -83,7 +84,7 @@ func validateProtectedTSOFactory(raftID string, group groupSpec, dir string, fac
 	if !ok || native == nil {
 		return nil, errors.New("protected TSO requires the native etcd factory")
 	}
-	if _, err := validateBootstrapStartup(spec.config, spec.intent, raftengine.FactoryConfig{GroupID: group.id, LocalID: raftID, LocalAddress: group.address}); err != nil {
+	if _, err := validateBootstrapStartup(spec.config, spec.intent, raftengine.FactoryConfig{GroupID: group.ID, LocalID: raftID, LocalAddress: group.Address}); err != nil {
 		return nil, errors.WithStack(err)
 	}
 	preflight := &protectedGroupFactory{spec: spec}
@@ -93,8 +94,8 @@ func validateProtectedTSOFactory(raftID string, group groupSpec, dir string, fac
 	return native, nil
 }
 
-func validProtectedTSOWiring(group groupSpec, dir string, spec *groupBootstrapSpec, domain *bootstrapDomain) bool {
-	return group.id == dedicatedTSORaftGroupID && spec != nil && spec.config != nil && spec.files != nil && spec.dir == dir && domain != nil && domain.admission != nil
+func validProtectedTSOWiring(group noderuntime.GroupSpec, dir string, spec *groupBootstrapSpec, domain *bootstrapDomain) bool {
+	return group.ID == noderuntime.DedicatedTSORaftGroupID && spec != nil && spec.config != nil && spec.files != nil && spec.dir == dir && domain != nil && domain.admission != nil
 }
 
 type protectedTSOStateMachine struct {

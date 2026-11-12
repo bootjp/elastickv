@@ -17,6 +17,7 @@ import (
 	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryption/kek"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftadmission"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -33,7 +34,7 @@ import (
 // projection and supervisor wiring; tests must not synthesize admission state.
 type bootstrapRotationE2EFixture struct {
 	base, dir, configDir, sidecarPath string
-	group                             groupSpec
+	group                             noderuntime.GroupSpec
 	config                            *bootstrapPeerConfig
 	manifest                          raftbootstrap.BaselineManifest
 	activation                        []byte
@@ -57,8 +58,8 @@ func newBootstrapRotationE2EFixture(t *testing.T, active ...bool) *bootstrapRota
 	cfg, err := loadBootstrapFixture(t, encoded)
 	require.NoError(t, err)
 	f := &bootstrapRotationE2EFixture{base: t.TempDir(), configDir: t.TempDir(), config: cfg,
-		group: groupSpec{id: 1, address: cfg.local.Address}, listener: listener, activeEnvelopes: len(active) != 0 && active[0]}
-	f.dir = groupDataDir(f.base, "n1", f.group.id, false)
+		group: noderuntime.GroupSpec{ID: 1, Address: cfg.local.Address}, listener: listener, activeEnvelopes: len(active) != 0 && active[0]}
+	f.dir = groupDataDir(f.base, "n1", f.group.ID, false)
 	f.sidecarPath = filepath.Join(f.dir, "encryption", "keys.json")
 	require.NoError(t, os.MkdirAll(filepath.Dir(f.sidecarPath), 0o700))
 	kekPath := filepath.Join(t.TempDir(), "kek")
@@ -84,9 +85,9 @@ func (f *bootstrapRotationE2EFixture) prepareLegacyCut(t *testing.T) {
 	t.Helper()
 	clock := kv.NewHLC()
 	routes := distribution.NewEngine()
-	routes.UpdateRoute(nil, nil, f.group.id)
+	routes.UpdateRoute(nil, nil, f.group.ID)
 	keystore := encryption.NewKeystore()
-	wiring, err := buildEncryptionWriteWiring(true, "n1", f.sidecarPath, f.wrapper, keystore, []groupSpec{f.group}, nil)
+	wiring, err := buildEncryptionWriteWiring(true, "n1", f.sidecarPath, f.wrapper, keystore, []noderuntime.GroupSpec{f.group}, nil)
 	require.NoError(t, err)
 	factory := enablementFactory()
 	configureRaftEnvelopeFactory(factory, wiring)
@@ -96,7 +97,7 @@ func (f *bootstrapRotationE2EFixture) prepareLegacyCut(t *testing.T) {
 	runtime, shard, err := builder.build(f.group)
 	require.NoError(t, err)
 	t.Cleanup(runtime.Close)
-	wiring.attachRaftEnvelopeGroup(f.group.id, shard)
+	wiring.attachRaftEnvelopeGroup(f.group.ID, shard)
 	require.Eventually(t, func() bool { return runtime.engine.State() == raftengine.StateLeader }, enablementE2EWait, 10*time.Millisecond)
 	enablementLegacyPut(t, runtime.engine, clock.Next(), "legacy-key", "original-value")
 	catalog, err := setupDistributionCatalog(t.Context(), []*raftGroupRuntime{runtime}, routes)
@@ -269,9 +270,9 @@ type bootstrapRotationE2ENode struct {
 func (f *bootstrapRotationE2EFixture) protected(t *testing.T) *bootstrapRotationE2ENode {
 	t.Helper()
 	clock, routes := kv.NewHLC(), distribution.NewEngine()
-	routes.UpdateRoute(nil, nil, f.group.id)
-	runtimes, groups, wiring, err := buildShardGroupsWithEncryptionWiring("n1", f.base, []groupSpec{f.group}, 1, false, false,
-		raftBootstrapConfig{peerConfigDir: f.configDir, encryption: bootstrapEncryptionRequest{configured: true, rotateOnStartup: true}},
+	routes.UpdateRoute(nil, nil, f.group.ID)
+	runtimes, groups, wiring, err := buildShardGroupsWithEncryptionWiring("n1", f.base, []noderuntime.GroupSpec{f.group}, 1, false, false,
+		noderuntime.BootstrapConfig{PeerConfigDir: f.configDir, Encryption: noderuntime.BootstrapEncryptionRequest{Configured: true, RotateOnStartup: true}},
 		enablementFactory(), nil, clock, f.wrapper, encryption.NewKeystore(), f.sidecarPath, true,
 		kv.NewActiveTimestampTracker(), routes, nil)
 	require.NoError(t, err)
@@ -312,7 +313,7 @@ func (f *bootstrapRotationE2EFixture) protected(t *testing.T) *bootstrapRotation
 	require.NotNil(t, supervisor)
 	node.supervisor = supervisor
 	node.registrationCtx, node.group = registered, groups[1]
-	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", f.group.address)
+	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", f.group.Address)
 	require.NoError(t, err)
 	server = grpc.NewServer(runtime.transportServerOptions...)
 	runtime.registerGRPC(server)

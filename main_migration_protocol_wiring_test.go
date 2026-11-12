@@ -18,13 +18,13 @@ func TestMigrationMembershipWiringKeepsEnvelopeProposerAndTSOIsolation(t *testin
 	t.Parallel()
 	proposer := &capabilityConfigEngine{}
 	runtime := &raftGroupRuntime{store: store.NewMVCCStore(), engine: capabilityConfigEngine{}}
-	runtime.spec.id = 7
+	runtime.spec.ID = 7
 	gate, ok := migrationMembershipInterceptor(runtime, nil, proposer, t.Name(), nil).(*migrationNamespaceMembershipGate)
 	require.True(t, ok)
 	require.Same(t, proposer, gate.proposer, "namespace prejoin must use the envelope-aware proposer passed by main")
 	_, ok = gate.next.(*migrationMembershipGate)
 	require.True(t, ok)
-	runtime.spec.id = 0
+	runtime.spec.ID = 0
 	_, namespace := migrationMembershipInterceptor(runtime, nil, proposer, t.Name(), nil).(*migrationNamespaceMembershipGate)
 	require.False(t, namespace, "TSO must not require a KV namespace or KV capability")
 	_, prepare := migrationMembershipInterceptor(runtime, nil, proposer, t.Name(), nil).(*prepareEvidenceMembershipGate)

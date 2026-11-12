@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
@@ -42,7 +43,7 @@ func TestPublicGateWaitsForEveryCommitTSFenceActivation(t *testing.T) {
 		st, err := store.NewPebbleStore(t.TempDir())
 		require.NoError(t, err)
 		t.Cleanup(func() { require.NoError(t, st.Close()) })
-		runtimes[i] = &raftGroupRuntime{spec: groupSpec{id: uint64(i + 1)}, store: st}
+		runtimes[i] = &raftGroupRuntime{spec: noderuntime.GroupSpec{ID: uint64(i + 1)}, store: st}
 		fsms[i] = kv.NewKvFSMWithHLC(st, kv.NewHLC())
 	}
 	gate := &startupPublicKVGate{}
@@ -90,9 +91,9 @@ func TestCommitTSFenceReadinessIgnoresDedicatedTSOGroup(t *testing.T) {
 		st, err := store.NewPebbleStore(t.TempDir())
 		require.NoError(t, err)
 		t.Cleanup(func() { require.NoError(t, st.Close()) })
-		return &raftGroupRuntime{spec: groupSpec{id: id}, store: st}, kv.NewKvFSMWithHLC(st, kv.NewHLC())
+		return &raftGroupRuntime{spec: noderuntime.GroupSpec{ID: id}, store: st}, kv.NewKvFSMWithHLC(st, kv.NewHLC())
 	}
-	tso, _ := newRuntime(dedicatedTSORaftGroupID)
+	tso, _ := newRuntime(noderuntime.DedicatedTSORaftGroupID)
 	data, dataFSM := newRuntime(1)
 
 	active, err := commitTSFenceRuntimesActive(t.Context(), []*raftGroupRuntime{tso})

@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/bootjp/elastickv/kv"
@@ -208,11 +209,11 @@ func bootstrapArtifactNativeFixture(t *testing.T) (bootstrapBaselineCLIRequest, 
 	t.Setenv("ELASTICKV_RAFT_SNAPSHOT_COUNT", "1")
 	raw := bootstrapConfigFixture(t)
 	raw.Local, raw.Members[0].ID = etcd.DeriveNodeID("n1"), etcd.DeriveNodeID("n1")
-	raw.Members[0].Groups = []uint64{dedicatedTSORaftGroupID}
+	raw.Members[0].Groups = []uint64{noderuntime.DedicatedTSORaftGroupID}
 	config, err := buildBootstrapPeerConfig(raw)
 	require.NoError(t, err)
 	base := t.TempDir()
-	runtime, _, err := buildDedicatedTSOGroup("n1", groupSpec{id: dedicatedTSORaftGroupID, address: config.local.Address},
+	runtime, _, err := buildDedicatedTSOGroup("n1", noderuntime.GroupSpec{ID: noderuntime.DedicatedTSORaftGroupID, Address: config.local.Address},
 		base, true, true, false, nil, nil, etcd.NewFactory(etcd.FactoryConfig{}), kv.NewHLC(), nil)
 	require.NoError(t, err)
 	t.Cleanup(runtime.Close)
@@ -222,7 +223,7 @@ func bootstrapArtifactNativeFixture(t *testing.T) (bootstrapBaselineCLIRequest, 
 	require.NoError(t, err)
 	require.Eventually(t, func() bool { return runtime.engine.Status().LastSnapshotIndex != 0 }, 5*time.Second, 10*time.Millisecond)
 	runtime.Close()
-	dir := groupDataDir(base, "n1", dedicatedTSORaftGroupID, true)
+	dir := groupDataDir(base, "n1", noderuntime.DedicatedTSORaftGroupID, true)
 	owner, err := etcd.AcquireOfflineBaselineOwnership(dir)
 	require.NoError(t, err)
 	defer func() { require.NoError(t, owner.Close()) }()
@@ -233,7 +234,7 @@ func bootstrapArtifactNativeFixture(t *testing.T) (bootstrapBaselineCLIRequest, 
 	term := source.CommitTerm
 	require.NoError(t, source.Snapshot.Close())
 	expected := raftbootstrap.BaselineContext{Version: raftbootstrap.BaselineVersion,
-		Identity: raftbootstrap.Identity{Cluster: config.local.Cluster, Group: dedicatedTSORaftGroupID}, OperationID: raftbootstrap.OperationID{1},
+		Identity: raftbootstrap.Identity{Cluster: config.local.Cluster, Group: noderuntime.DedicatedTSORaftGroupID}, OperationID: raftbootstrap.OperationID{1},
 		Minimum: raftbootstrap.Versions{Entry: 1, Snapshot: 1, Session: 1}, CommitIndex: state.AppliedIndex, CommitTerm: term,
 		DataDigest: state.DataDigest, Watermark: state.Watermark, Configuration: raftbootstrap.Configuration{Index: proof.ConfigurationIndex,
 			State: raftbootstrap.ConfState{Voters: []uint64{config.local.Member}}, Members: []raftbootstrap.Member{

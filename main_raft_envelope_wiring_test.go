@@ -10,6 +10,7 @@ import (
 
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryption/fsmwire"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
@@ -278,7 +279,7 @@ func TestRaftEnvelopeRuntime_InstallFromApplySeedsCommittedRegistration(t *testi
 
 func TestValidateRaftEnvelopeStartupScopeRefusesActiveMultiGroup(t *testing.T) {
 	t.Parallel()
-	err := validateRaftEnvelopeStartupScope(99, []groupSpec{{id: 1}, {id: 2}})
+	err := validateRaftEnvelopeStartupScope(99, []noderuntime.GroupSpec{{ID: 1}, {ID: 2}})
 	if err == nil {
 		t.Fatal("validateRaftEnvelopeStartupScope returned nil for active cutover with multiple groups")
 	}

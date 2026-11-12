@@ -8,6 +8,7 @@ import (
 
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/encryption/fsmwire"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
@@ -44,9 +45,9 @@ func TestBuildShardGroupsWithDedicatedTSOPreservesSingleDataGroupDir(t *testing.
 	legacyMarker := filepath.Join(legacyDir, "legacy.marker")
 	require.NoError(t, os.WriteFile(legacyMarker, []byte("keep"), 0o600))
 
-	groups := []groupSpec{
-		{id: dedicatedTSORaftGroupID, address: "127.0.0.1:17000"},
-		{id: 1, address: "127.0.0.1:17001"},
+	groups := []noderuntime.GroupSpec{
+		{ID: noderuntime.DedicatedTSORaftGroupID, Address: "127.0.0.1:17000"},
+		{ID: 1, Address: "127.0.0.1:17001"},
 	}
 	engine := distribution.NewEngine()
 	engine.UpdateRoute([]byte(""), nil, 1)
@@ -59,7 +60,7 @@ func TestBuildShardGroupsWithDedicatedTSOPreservesSingleDataGroupDir(t *testing.
 		groups,
 		true,
 		true,
-		raftBootstrapConfig{},
+		noderuntime.BootstrapConfig{},
 		factory,
 		nil,
 		kv.NewHLC(),
@@ -76,9 +77,9 @@ func TestBuildShardGroupsWithDedicatedTSOPreservesSingleDataGroupDir(t *testing.
 			rt.Close()
 		}
 	})
-	require.Contains(t, shardGroups, uint64(dedicatedTSORaftGroupID))
+	require.Contains(t, shardGroups, uint64(noderuntime.DedicatedTSORaftGroupID))
 	require.Contains(t, shardGroups, uint64(1))
-	require.Nil(t, shardGroups[dedicatedTSORaftGroupID].Store)
+	require.Nil(t, shardGroups[noderuntime.DedicatedTSORaftGroupID].Store)
 	require.IsType(t, &kv.TSOStateMachine{}, runtimes[0].stateMachine)
 	require.Nil(t, runtimes[0].store)
 	require.DirExists(t, filepath.Join(legacyDir, "fsm.db"))
@@ -103,10 +104,10 @@ func TestBuildShardGroupsWithDedicatedTSOPreservesLegacyGroupZeroStore(t *testin
 	runtimes, shardGroups, err := buildShardGroups(
 		"n1",
 		baseDir,
-		[]groupSpec{{id: dedicatedTSORaftGroupID, address: "127.0.0.1:17002"}},
+		[]noderuntime.GroupSpec{{ID: noderuntime.DedicatedTSORaftGroupID, Address: "127.0.0.1:17002"}},
 		true,
 		true,
-		raftBootstrapConfig{},
+		noderuntime.BootstrapConfig{},
 		factory,
 		nil,
 		kv.NewHLC(),
@@ -119,7 +120,7 @@ func TestBuildShardGroupsWithDedicatedTSOPreservesLegacyGroupZeroStore(t *testin
 	)
 	require.NoError(t, err)
 	t.Cleanup(func() { closeRaftGroupRuntimes(runtimes) })
-	require.Nil(t, shardGroups[dedicatedTSORaftGroupID].Store)
+	require.Nil(t, shardGroups[noderuntime.DedicatedTSORaftGroupID].Store)
 	require.Nil(t, runtimes[0].store)
 
 	got, err := os.ReadFile(legacyMarker)
@@ -143,13 +144,13 @@ func TestBuildShardGroupsClosesEarlierStoresWhenLaterGroupFails(t *testing.T) {
 	runtimes, shardGroups, err := buildShardGroups(
 		"n1",
 		baseDir,
-		[]groupSpec{
-			{id: 1, address: "127.0.0.1:17011"},
-			{id: 2, address: "127.0.0.1:17012"},
+		[]noderuntime.GroupSpec{
+			{ID: 1, Address: "127.0.0.1:17011"},
+			{ID: 2, Address: "127.0.0.1:17012"},
 		},
 		true,
 		true,
-		raftBootstrapConfig{},
+		noderuntime.BootstrapConfig{},
 		factory,
 		nil,
 		kv.NewHLC(),
@@ -183,10 +184,10 @@ func TestDedicatedTSOGroupContinuesAfterLegacyEncryptionEntry(t *testing.T) {
 	runtimes, _, err := buildShardGroups(
 		"n1",
 		baseDir,
-		[]groupSpec{{id: dedicatedTSORaftGroupID, address: "127.0.0.1:17020"}},
+		[]noderuntime.GroupSpec{{ID: noderuntime.DedicatedTSORaftGroupID, Address: "127.0.0.1:17020"}},
 		true,
 		true,
-		raftBootstrapConfig{},
+		noderuntime.BootstrapConfig{},
 		factory,
 		nil,
 		clock,
@@ -239,15 +240,15 @@ func TestParseRaftEngineType(t *testing.T) {
 func TestBuildShardGroupsWithEtcdEngineRoutesAcrossGroups(t *testing.T) {
 	t.Parallel()
 	baseDir := t.TempDir()
-	groups := []groupSpec{
-		{id: 1, address: "127.0.0.1:15001"},
-		{id: 2, address: "127.0.0.1:15002"},
+	groups := []noderuntime.GroupSpec{
+		{ID: 1, Address: "127.0.0.1:15001"},
+		{ID: 2, Address: "127.0.0.1:15002"},
 	}
 
 	factory, err := newRaftFactory(raftEngineEtcd, nil)
 	require.NoError(t, err)
 	clock := kv.NewHLC()
-	runtimes, shardGroups, err := buildShardGroups("n1", baseDir, groups, true, true, raftBootstrapConfig{},
+	runtimes, shardGroups, err := buildShardGroups("n1", baseDir, groups, true, true, noderuntime.BootstrapConfig{},
 		factory, nil, clock, kv.NewActiveTimestampTracker(), nil, nil, "", encryptionWriteWiring{}, nil)
 	require.NoError(t, err)
 
@@ -290,9 +291,9 @@ func TestBuildShardGroupsWithEtcdEngineRoutesAcrossGroups(t *testing.T) {
 func TestBuildShardGroupsWithEtcdEngineRestartsAcrossGroups(t *testing.T) {
 	t.Parallel()
 	baseDir := t.TempDir()
-	groups := []groupSpec{
-		{id: 1, address: "127.0.0.1:16001"},
-		{id: 2, address: "127.0.0.1:16002"},
+	groups := []noderuntime.GroupSpec{
+		{ID: 1, Address: "127.0.0.1:16001"},
+		{ID: 2, Address: "127.0.0.1:16002"},
 	}
 
 	engine := distribution.NewEngine()
@@ -304,7 +305,7 @@ func TestBuildShardGroupsWithEtcdEngineRestartsAcrossGroups(t *testing.T) {
 		factory, err := newRaftFactory(raftEngineEtcd, nil)
 		require.NoError(t, err)
 		runtimes, shardGroups, err := buildShardGroups("n1", baseDir, groups, true, bootstrap,
-			raftBootstrapConfig{}, factory, nil, sharedClock, kv.NewActiveTimestampTracker(), nil, nil, "",
+			noderuntime.BootstrapConfig{}, factory, nil, sharedClock, kv.NewActiveTimestampTracker(), nil, nil, "",
 			encryptionWriteWiring{}, nil)
 		require.NoError(t, err)
 		shardStore := kv.NewShardStore(engine, shardGroups)

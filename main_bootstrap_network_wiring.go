@@ -4,17 +4,18 @@ import (
 	"context"
 
 	internalutil "github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc"
 )
 
-func resolveNetworkRuntimeInputs(flags *serverFlags) (runtimeConfig, raftEngineType, raftBootstrapConfig, bool, error) {
+func resolveNetworkRuntimeInputs(flags *serverFlags) (noderuntime.RuntimeConfig, raftEngineType, noderuntime.BootstrapConfig, bool, error) {
 	if err := configureNodeGRPCTransport(flags.nodeAuth); err != nil {
-		return runtimeConfig{}, "", raftBootstrapConfig{}, false, err
+		return noderuntime.RuntimeConfig{}, "", noderuntime.BootstrapConfig{}, false, err
 	}
 	cfg, engineType, bootstrapCfg, bootstrap, err := resolveValidatedRuntimeInputs(flags)
-	bootstrapCfg.serviceTokenFiles = flags.nodeAuth.serviceTokenFiles()
+	bootstrapCfg.ServiceTokenFiles = flags.nodeAuth.serviceTokenFiles()
 	return cfg, engineType, bootstrapCfg, bootstrap, err
 }
 
@@ -51,7 +52,7 @@ func bootstrapNetworkConfigs(runtimes []*raftGroupRuntime, domain *bootstrapDoma
 		if runtime == nil || runtime.bootstrapDomain != domain || runtime.bootstrapPeerConfig == nil {
 			return nil, errors.New("protected network requires every runtime's original peer configuration")
 		}
-		configs[runtime.spec.id] = runtime.bootstrapPeerConfig
+		configs[runtime.spec.ID] = runtime.bootstrapPeerConfig
 	}
 	return configs, nil
 }

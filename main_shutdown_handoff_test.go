@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/internal/testutil"
 	"github.com/stretchr/testify/require"
@@ -51,7 +52,7 @@ func TestShutdownHandoffSignalWaitsForTransferAndIgnoresRepeats(t *testing.T) {
 	stop := installShutdownSignalHandler(handoff.requestShutdown, syscall.SIGUSR2)
 	t.Cleanup(stop)
 	eg, runCtx := errgroup.WithContext(ctx)
-	handoff.arm(runCtx, eg, []*raftGroupRuntime{{spec: groupSpec{id: 1}, engine: engine}}, nil)
+	handoff.arm(runCtx, eg, []*raftGroupRuntime{{spec: noderuntime.GroupSpec{ID: 1}, engine: engine}}, nil)
 	require.NoError(t, syscall.Kill(os.Getpid(), syscall.SIGUSR2))
 	testutil.Closed(t, started, shutdownTestTimeout, "the signal did not start the leadership handoff")
 	require.NoError(t, ctx.Err(), "root cancellation must wait until the handoff finishes")

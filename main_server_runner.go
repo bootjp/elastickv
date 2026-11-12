@@ -11,6 +11,7 @@ import (
 	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/bootjp/elastickv/internal/admin"
 	"github.com/bootjp/elastickv/internal/adminbridge"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	internalraftadmin "github.com/bootjp/elastickv/internal/raftadmin"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
@@ -45,7 +46,7 @@ type serversInput struct {
 	distCatalog        *distribution.CatalogStore
 	readTracker        *kv.ActiveTimestampTracker
 	metricsRegistry    *monitoring.Registry
-	cfg                runtimeConfig
+	cfg                noderuntime.RuntimeConfig
 	encWiring          encryptionWriteWiring
 	encryption         encryptionFlags
 	kekConfigured      bool
@@ -112,7 +113,7 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 	roleStore := startupRoleStoreFromFlags(in.adminHTTP)
 	publicKVGate := &startupPublicKVGate{blockRuntime: func() bool { return protectedRuntimesBlocked(in.runtimes) }}
 	publicKVGate.domain = bootstrapDomainForRuntimes(in.runtimes)
-	startBootstrapReadinessReconciler(in.ctx, in.eg, in.runtimes, in.distCatalog, in.cfg.engine)
+	startBootstrapReadinessReconciler(in.ctx, in.eg, in.runtimes, in.distCatalog, in.cfg.Engine)
 	if in.distServer != nil {
 		in.distServer.SetReadGate(publicKVGate.blocked)
 	}
@@ -128,29 +129,29 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 		shardStore:         in.shardStore,
 		coordinate:         adapterCoordinate,
 		distServer:         in.distServer,
-		routeEngine:        in.cfg.engine,
+		routeEngine:        in.cfg.Engine,
 		adminServer:        adminServer,
 		adminGRPCOpts:      adminGRPCOpts,
 		redisAddress:       in.listeners.redisAddress,
 		redisLuaMaxIdle:    in.listeners.redisLuaMaxIdleStates,
-		leaderRedis:        in.cfg.leaderRedis,
+		leaderRedis:        in.cfg.LeaderRedis,
 		pubsubRelay:        adapter.NewRedisPubSubRelay(),
 		readTracker:        in.readTracker,
 		encWiring:          in.encWiring,
 		encryption:         in.encryption,
 		kekConfigured:      in.kekConfigured,
-		defaultGroupID:     in.cfg.defaultGroup,
+		defaultGroupID:     in.cfg.DefaultGroup,
 		redisApplyObserver: in.redisApplyObserver,
 		s3BlobBackfiller:   in.s3BlobBackfiller,
 		dynamoAddress:      in.listeners.dynamoAddress,
-		leaderDynamo:       in.cfg.leaderDynamo,
+		leaderDynamo:       in.cfg.LeaderDynamo,
 		s3Address:          in.listeners.s3Address,
-		leaderS3:           in.cfg.leaderS3,
+		leaderS3:           in.cfg.LeaderS3,
 		s3Region:           in.listeners.s3Region,
 		s3CredsFile:        in.listeners.s3CredentialsFile,
 		s3PathStyleOnly:    in.listeners.s3PathStyleOnly,
 		sqsAddress:         in.listeners.sqsAddress,
-		leaderSQS:          in.cfg.leaderSQS,
+		leaderSQS:          in.cfg.LeaderSQS,
 		sqsRegion:          in.listeners.sqsRegion,
 		sqsCredsFile:       in.listeners.sqsCredentialsFile,
 		sqsPublicEndpoint:  in.listeners.sqsPublicEndpoint,
@@ -162,7 +163,7 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 		// dispatch. Returns nil on a non-partitioned cluster, in
 		// which case validateHTFIFOCapability skips the routing-
 		// coverage check (Codex P1 review on PR #734, round 2).
-		sqsPartitionResolver: buildSQSPartitionResolverConcrete(in.cfg.sqsFifoPartitionMap),
+		sqsPartitionResolver: noderuntime.BuildSQSPartitionResolverConcrete(in.cfg.SQSFifoPartitionMap),
 		// sqsPartitionObserver: the metrics registry's HT-FIFO
 		// partition counter observer. nil when --metricsAddress is
 		// empty (the adapter then no-ops the observe call).

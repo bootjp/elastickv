@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/internal/testutil"
 	"github.com/stretchr/testify/require"
@@ -74,9 +75,9 @@ func TestShutdownSignalTransfersAllLeadersBeforeCancellation(t *testing.T) {
 	runtimes := []*raftGroupRuntime{
 		nil,
 		{},
-		{spec: groupSpec{id: 1}, engine: shutdownTestEngine(transfer)},
-		{spec: groupSpec{id: 2}, engine: shutdownTestEngine(transfer)},
-		{spec: groupSpec{id: 3}, engine: follower},
+		{spec: noderuntime.GroupSpec{ID: 1}, engine: shutdownTestEngine(transfer)},
+		{spec: noderuntime.GroupSpec{ID: 2}, engine: shutdownTestEngine(transfer)},
+		{spec: noderuntime.GroupSpec{ID: 3}, engine: follower},
 	}
 	requests := make(chan struct{})
 	close(requests)
@@ -105,8 +106,8 @@ func TestShutdownSignalTransfersLeadershipAcquiredDuringHandoff(t *testing.T) {
 	requests := make(chan struct{})
 	close(requests)
 	shutdownAfterRequest(ctx, cancel, []*raftGroupRuntime{
-		{spec: groupSpec{id: 1}, engine: follower},
-		{spec: groupSpec{id: 2}, engine: leader},
+		{spec: noderuntime.GroupSpec{ID: 1}, engine: follower},
+		{spec: noderuntime.GroupSpec{ID: 2}, engine: leader},
 	}, requests, time.Second, nil)
 	require.Equal(t, int32(1), followerTransfers.Load())
 	require.Equal(t, raftengine.StateFollower, follower.State())
@@ -124,8 +125,8 @@ func TestShutdownSignalSharesDeadlineAcrossGroups(t *testing.T) {
 		return transferCtx.Err()
 	}
 	runtimes := []*raftGroupRuntime{
-		{spec: groupSpec{id: 1}, engine: shutdownTestEngine(transfer)},
-		{spec: groupSpec{id: 2}, engine: shutdownTestEngine(transfer)},
+		{spec: noderuntime.GroupSpec{ID: 1}, engine: shutdownTestEngine(transfer)},
+		{spec: noderuntime.GroupSpec{ID: 2}, engine: shutdownTestEngine(transfer)},
 	}
 	requests := make(chan struct{})
 	close(requests)

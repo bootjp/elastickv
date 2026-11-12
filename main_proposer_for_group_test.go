@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/cockroachdb/errors"
@@ -43,7 +44,7 @@ func TestProposerForGroup_UsesShardGroupProposerWhenPresent(t *testing.T) {
 	// sibling test below.
 	_ = kv.NewLeaderProxyForShardGroup(sg)
 
-	rt := &raftGroupRuntime{spec: groupSpec{id: 7}, engine: engine}
+	rt := &raftGroupRuntime{spec: noderuntime.GroupSpec{ID: 7}, engine: engine}
 	got := proposerForGroup(rt, map[uint64]*kv.ShardGroup{7: sg})
 	if got == nil {
 		t.Fatal("proposerForGroup returned nil")
@@ -70,7 +71,7 @@ func TestProposerForGroup_UsesShardGroupProposerWhenPresent(t *testing.T) {
 func TestProposerForGroup_FallsBackToEngineWhenShardGroupMissing(t *testing.T) {
 	t.Parallel()
 	engine := &stubEngineForProposerTest{}
-	rt := &raftGroupRuntime{spec: groupSpec{id: 7}, engine: engine}
+	rt := &raftGroupRuntime{spec: noderuntime.GroupSpec{ID: 7}, engine: engine}
 
 	got := proposerForGroup(rt, map[uint64]*kv.ShardGroup{})
 	if got != raftengine.Proposer(engine) {
@@ -87,7 +88,7 @@ func TestProposerForGroup_FallsBackToEngineWhenShardGroupMissing(t *testing.T) {
 func TestProposerForGroup_FallsBackToEngineWhenShardGroupNil(t *testing.T) {
 	t.Parallel()
 	engine := &stubEngineForProposerTest{}
-	rt := &raftGroupRuntime{spec: groupSpec{id: 7}, engine: engine}
+	rt := &raftGroupRuntime{spec: noderuntime.GroupSpec{ID: 7}, engine: engine}
 
 	got := proposerForGroup(rt, map[uint64]*kv.ShardGroup{7: nil})
 	if got != raftengine.Proposer(engine) {

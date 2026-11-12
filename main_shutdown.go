@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/cockroachdb/errors"
 	"golang.org/x/sync/errgroup"
@@ -15,7 +16,7 @@ import (
 const (
 	shutdownTransferTimeout    = 5 * time.Second
 	shutdownTransferRetryDelay = 50 * time.Millisecond
-	shutdownVoterSuffrage      = "voter"
+	shutdownVoterSuffrage      = noderuntime.VoterSuffrage
 )
 
 type shutdownLeadershipController interface {
@@ -122,12 +123,12 @@ func transferShutdownLeaderRound(ctx context.Context, runtimes []*raftGroupRunti
 		}
 		foundLeader = true
 		transfers.Go(func() {
-			slog.Info("transferring leadership before shutdown", "group", rt.spec.id)
+			slog.Info("transferring leadership before shutdown", "group", rt.spec.ID)
 			if err := transferGroupLeadershipOnShutdown(ctx, admin); err != nil {
-				slog.Warn("shutdown leadership transfer failed; continuing shutdown", "group", rt.spec.id, "error", err)
+				slog.Warn("shutdown leadership transfer failed; continuing shutdown", "group", rt.spec.ID, "error", err)
 				return
 			}
-			slog.Info("shutdown leadership transfer completed", "group", rt.spec.id)
+			slog.Info("shutdown leadership transfer completed", "group", rt.spec.ID)
 		})
 	}
 	// All groups share one deadline, so an unavailable group does not delay

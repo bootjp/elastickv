@@ -4,13 +4,14 @@ import (
 	"context"
 
 	"github.com/bootjp/elastickv/adapter"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftadmin"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/cockroachdb/errors"
 )
 
 func dedicatedTimestampCutoverOptions(groups map[uint64]*kv.ShardGroup) []adapter.InternalOption {
-	if group := groups[dedicatedTSORaftGroupID]; group != nil && group.TSOState != nil {
+	if group := groups[noderuntime.DedicatedTSORaftGroupID]; group != nil && group.TSOState != nil {
 		return []adapter.InternalOption{adapter.WithInternalTSOCutoverState(group.TSOState)}
 	}
 	return nil

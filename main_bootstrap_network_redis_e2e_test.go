@@ -48,7 +48,7 @@ func bootstrapNetworkRedisClients(t *testing.T, processes []*multiEnablementProc
 	start := make([]func(), 0, len(processes))
 	for _, process := range processes {
 		launch, address, client := bootstrapNetworkPrepareRedis(t, process, leaders)
-		leaders[process.runtime.spec.address] = address
+		leaders[process.runtime.spec.Address] = address
 		clients[process] = client
 		start = append(start, launch)
 	}
@@ -61,7 +61,7 @@ func bootstrapNetworkRedisClients(t *testing.T, processes []*multiEnablementProc
 
 func bootstrapNetworkPrepareRedis(t *testing.T, process *multiEnablementProcess, leaders map[string]string) (func(), string, *redis.Client) {
 	t.Helper()
-	registry := monitoring.NewRegistry("network-redis", process.runtime.spec.address)
+	registry := monitoring.NewRegistry("network-redis", process.runtime.spec.Address)
 	tracker := kv.NewActiveTimestampTracker()
 	t.Cleanup(tracker.Close)
 	server, compactor, listener, err := prepareRedisServer(process.ctx, &net.ListenConfig{}, "127.0.0.1:0", process.shards,

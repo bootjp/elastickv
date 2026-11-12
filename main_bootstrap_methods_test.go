@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/peersession"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/bootjp/elastickv/kv"
@@ -57,7 +58,7 @@ func TestBootstrapSharedGRPCMethodsBoundRoutingAndReplies(t *testing.T) {
 	}{
 		{pb.RawKV_RawLatestCommitTS_FullMethodName, bootstrapMethodsTestGroup,
 			&pb.RawLatestCommitTSRequest{GroupId: bootstrapMethodsTestGroup}, &pb.RawLatestCommitTSResponse{GroupId: bootstrapMethodsTestGroup, LeaderFenced: true}},
-		{pb.Distribution_GetTimestamp_FullMethodName, dedicatedTSORaftGroupID, &pb.GetTimestampRequest{Count: 1}, &pb.GetTimestampResponse{Timestamp: 10, Count: 1}},
+		{pb.Distribution_GetTimestamp_FullMethodName, noderuntime.DedicatedTSORaftGroupID, &pb.GetTimestampRequest{Count: 1}, &pb.GetTimestampResponse{Timestamp: 10, Count: 1}},
 		{pb.Internal_GetPrepareEvidenceState_FullMethodName, bootstrapMethodsTestGroup, &pb.PrepareEvidenceStateRequest{Floor: 10}, &pb.PrepareEvidenceStateResponse{}},
 		{pb.Internal_ForwardAdminProposal_FullMethodName, bootstrapMethodsTestGroup,
 			&pb.ForwardAdminProposalRequest{Payload: kv.EncodePrepareEvidenceFence(0)}, &pb.ForwardAdminProposalResponse{CommitIndex: 1}},
@@ -115,14 +116,14 @@ func TestBootstrapFloorMethodRejectsNonFloorRequests(t *testing.T) {
 
 func TestBootstrapTimestampMethodRetainsBoundsAndTargetGroup(t *testing.T) {
 	t.Parallel()
-	method := bootstrapMethodForTest(t, dedicatedTSORaftGroupID, pb.Distribution_GetTimestamp_FullMethodName)
+	method := bootstrapMethodForTest(t, noderuntime.DedicatedTSORaftGroupID, pb.Distribution_GetTimestamp_FullMethodName)
 	for _, req := range []*pb.GetTimestampRequest{{}, {Count: 1}, {Count: uint32(kv.MaxTSOBatchSize)},
 		{MinTimestamp: 10, ActivateCutover: true, ActivatePhaseD: true}} {
-		_, err := method.BoundRequest(bootstrapBindingForTest(dedicatedTSORaftGroupID), req)
+		_, err := method.BoundRequest(bootstrapBindingForTest(noderuntime.DedicatedTSORaftGroupID), req)
 		require.NoError(t, err)
 	}
 	for _, req := range []*pb.GetTimestampRequest{nil, {Count: uint32(kv.MaxTSOBatchSize) + 1}, {ActivatePhaseD: true}} {
-		_, err := method.BoundRequest(bootstrapBindingForTest(dedicatedTSORaftGroupID), req)
+		_, err := method.BoundRequest(bootstrapBindingForTest(noderuntime.DedicatedTSORaftGroupID), req)
 		require.Error(t, err)
 	}
 	wrong := bootstrapMethodForTest(t, bootstrapMethodsTestGroup, pb.Distribution_GetTimestamp_FullMethodName)

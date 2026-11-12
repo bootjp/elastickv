@@ -8,7 +8,7 @@ import (
 )
 
 func migrationInternalProtocolOptions(tx kv.Transactional, shards *kv.ShardStore, server *adapter.DistributionServer, runtime *raftGroupRuntime) []adapter.InternalOption {
-	installed := func() bool { return migrationOwnershipRuntimeHooksInstalled(tx, shards, server, runtime.spec.id) }
+	installed := func() bool { return migrationOwnershipRuntimeHooksInstalled(tx, shards, server, runtime.spec.ID) }
 	return []adapter.InternalOption{
 		adapter.WithInternalMigrationTransferSizeGuardReady(installed),
 		adapter.WithInternalMigrationPartitionProtocolReady(installed),

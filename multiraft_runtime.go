@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
@@ -15,7 +16,7 @@ import (
 )
 
 type raftGroupRuntime struct {
-	spec                groupSpec
+	spec                noderuntime.GroupSpec
 	bootstrapDomain     *bootstrapDomain
 	bootstrapPeerConfig *bootstrapPeerConfig
 	bootstrapNetwork    *bootstrapNetwork
@@ -233,7 +234,7 @@ func syncDataDir(path string) error {
 
 func buildRuntimeForGroup(
 	raftID string,
-	group groupSpec,
+	group noderuntime.GroupSpec,
 	baseDir string,
 	multi bool,
 	bootstrap bool,
@@ -244,16 +245,16 @@ func buildRuntimeForGroup(
 	factory raftengine.Factory,
 	joinAsLearner bool,
 ) (*raftGroupRuntime, error) {
-	dir := groupDataDir(baseDir, raftID, group.id, multi)
+	dir := groupDataDir(baseDir, raftID, group.ID, multi)
 	engineType := raftEngineType(factory.EngineType())
 	if err := ensureRaftEngineDataDirForFactory(dir, engineType, factory); err != nil {
 		return nil, err
 	}
 
 	result, err := factory.Create(raftengine.FactoryConfig{
-		GroupID:       group.id,
+		GroupID:       group.ID,
 		LocalID:       raftID,
-		LocalAddress:  group.address,
+		LocalAddress:  group.Address,
 		DataDir:       dir,
 		Peers:         bootstrapServers,
 		BootstrapSeed: bootstrapSeed,

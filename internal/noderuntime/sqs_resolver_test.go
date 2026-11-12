@@ -1,4 +1,4 @@
-package main
+package noderuntime
 
 import (
 	"testing"
@@ -31,15 +31,15 @@ func TestBuildSQSPartitionResolver_NilOnEmpty(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
 		name string
-		in   map[string]sqsFifoQueueRouting
+		in   map[string]SQSFifoQueueRouting
 	}{
 		{"nil map", nil},
-		{"empty map", map[string]sqsFifoQueueRouting{}},
+		{"empty map", map[string]SQSFifoQueueRouting{}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			requireNilInterface(t, buildSQSPartitionResolver(tc.in),
+			requireNilInterface(t, BuildSQSPartitionResolver(tc.in),
 				"buildSQSPartitionResolver("+tc.name+
 					") must produce a true nil interface, "+
 					"not a typed-nil pointer wrapper")
@@ -52,10 +52,10 @@ func TestBuildSQSPartitionResolver_NilOnEmpty(t *testing.T) {
 // that dispatches partition keys correctly.
 func TestBuildSQSPartitionResolver_NonEmptyReturnsResolver(t *testing.T) {
 	t.Parallel()
-	in := map[string]sqsFifoQueueRouting{
-		"orders.fifo": {partitionCount: 2, groups: []string{"10", "11"}},
+	in := map[string]SQSFifoQueueRouting{
+		"orders.fifo": {PartitionCount: 2, Groups: []string{"10", "11"}},
 	}
-	r := buildSQSPartitionResolver(in)
+	r := BuildSQSPartitionResolver(in)
 	require.NotNil(t, r,
 		"non-empty partition map must produce a non-nil resolver")
 }

@@ -68,10 +68,10 @@ func setupAdminService(
 		return nil, icept, nil
 	}
 	for _, rt := range runtimes {
-		srv.RegisterGroup(rt.spec.id, rt.engine)
-		if group := shardGroups[rt.spec.id]; group != nil {
+		srv.RegisterGroup(rt.spec.ID, rt.engine)
+		if group := shardGroups[rt.spec.ID]; group != nil {
 			group.SetLeaderReadToken(icept.token)
-			srv.RegisterBackupProposer(rt.spec.id, kv.NewLeaderAdminProposer(
+			srv.RegisterBackupProposer(rt.spec.ID, kv.NewLeaderAdminProposer(
 				rt.engine,
 				group.Proposer(),
 				connCache,
@@ -111,8 +111,8 @@ func canonicalSelfAddress(fallback string, runtimes []*raftGroupRuntime) string 
 		if rt == nil {
 			continue
 		}
-		if !found || rt.spec.id < bestID {
-			bestID, bestAddr, found = rt.spec.id, rt.spec.address, true
+		if !found || rt.spec.ID < bestID {
+			bestID, bestAddr, found = rt.spec.ID, rt.spec.Address, true
 		}
 	}
 	if !found {

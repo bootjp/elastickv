@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/cockroachdb/errors"
 )
@@ -68,13 +69,13 @@ func commitTSFenceRuntimesActive(ctx context.Context, runtimes []*raftGroupRunti
 		if runtime == nil || runtime.store == nil {
 			return false, nil
 		}
-		if runtime.spec.id == dedicatedTSORaftGroupID {
+		if runtime.spec.ID == noderuntime.DedicatedTSORaftGroupID {
 			continue
 		}
 		dataGroups++
 		active, err := kv.CommitTSFenceEnabled(ctx, runtime.store)
 		if err != nil {
-			return false, errors.Wrapf(err, "read commit-ts fence activation for group %d", runtime.spec.id)
+			return false, errors.Wrapf(err, "read commit-ts fence activation for group %d", runtime.spec.ID)
 		}
 		if !active {
 			return false, nil

@@ -6,6 +6,7 @@ import (
 
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryption/kek"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/monitoring"
 	"github.com/cockroachdb/errors"
 )
@@ -61,19 +62,19 @@ func (f encryptionFlags) configured() bool {
 
 // bootstrapRequest is the part of the encryption flags protected bootstrap
 // admission depends on.
-func (f encryptionFlags) bootstrapRequest() bootstrapEncryptionRequest {
-	return bootstrapEncryptionRequest{configured: f.configured(), rotateOnStartup: f.rotateOnStartup}
+func (f encryptionFlags) bootstrapRequest() noderuntime.BootstrapEncryptionRequest {
+	return noderuntime.BootstrapEncryptionRequest{Configured: f.configured(), RotateOnStartup: f.rotateOnStartup}
 }
 
 func loadKEKAfterPreNonceStartupGuards(
-	cfg runtimeConfig, raft raftFlags, f encryptionFlags, unwrapObserver monitoring.KEKUnwrapObserver,
+	cfg noderuntime.RuntimeConfig, raft raftFlags, f encryptionFlags, unwrapObserver monitoring.KEKUnwrapObserver,
 ) (kek.Wrapper, error) {
 	if err := checkEnvelopeCutoverDivergenceBeforeNonceBump(
 		raft.id,
 		raft.dataDir,
-		cfg.groups,
-		cfg.defaultGroup,
-		cfg.multi,
+		cfg.Groups,
+		cfg.DefaultGroup,
+		cfg.Multi,
 		f.sidecarPath,
 		f.enabled,
 	); err != nil {

@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/encryption"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftadmission"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	pb "github.com/bootjp/elastickv/proto"
@@ -19,7 +20,7 @@ func bootstrapEncryptionDomainWiring(f *encryptionRuntimeIOFixture) encryptionWr
 	return w
 }
 
-func bootstrapEncryptionDomainRequest(enabled, requested bool, path string) bootstrapEncryptionRequest {
+func bootstrapEncryptionDomainRequest(enabled, requested bool, path string) noderuntime.BootstrapEncryptionRequest {
 	return encryptionFlags{enabled: enabled, rotateOnStartup: requested, sidecarPath: path}.bootstrapRequest()
 }
 
@@ -33,9 +34,9 @@ func TestBootstrapEncryptionDomainRejectsMissingActualWiring(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			request := bootstrapEncryptionDomainRequest(tc.enabled, tc.rotation, tc.path)
-			_, err := newBootstrapDomain(raftbootstrap.UUID{1}, []groupSpec{{id: 1}}, request)
+			_, err := newBootstrapDomain(raftbootstrap.UUID{1}, []noderuntime.GroupSpec{{ID: 1}}, request)
 			require.ErrorIs(t, err, errBootstrapEncryptionUnsupported)
-			_, err = newBootstrapDomain(raftbootstrap.UUID{1}, []groupSpec{{id: 1}}, request, encryptionWriteWiring{})
+			_, err = newBootstrapDomain(raftbootstrap.UUID{1}, []noderuntime.GroupSpec{{ID: 1}}, request, encryptionWriteWiring{})
 			require.ErrorIs(t, err, errBootstrapEncryptionUnsupported)
 		})
 	}
@@ -45,7 +46,7 @@ func newEncryptedDomainFixture(t *testing.T) (*bootstrapDomain, *encryptionRunti
 	t.Helper()
 	f := newEncryptionRuntimeIOFixture(t)
 	request := bootstrapEncryptionDomainRequest(true, true, f.cfg.SidecarPath)
-	d, err := newBootstrapDomain(raftbootstrap.UUID{1}, []groupSpec{{id: 1}}, request, bootstrapEncryptionDomainWiring(f))
+	d, err := newBootstrapDomain(raftbootstrap.UUID{1}, []noderuntime.GroupSpec{{ID: 1}}, request, bootstrapEncryptionDomainWiring(f))
 	require.NoError(t, err)
 	t.Cleanup(d.admission.Close)
 	bootstrapIngressObserve(t, d.admission, 1)
@@ -126,7 +127,7 @@ func TestBootstrapEncryptionDomainRecipeGrantsAreExactAndIsolated(t *testing.T) 
 }
 
 func TestBootstrapEncryptionDomainPlaintextCompatibility(t *testing.T) {
-	d, err := newBootstrapDomain(raftbootstrap.UUID{1}, []groupSpec{{id: 1}}, bootstrapEncryptionRequest{}, encryptionWriteWiring{})
+	d, err := newBootstrapDomain(raftbootstrap.UUID{1}, []noderuntime.GroupSpec{{ID: 1}}, noderuntime.BootstrapEncryptionRequest{}, encryptionWriteWiring{})
 	require.NoError(t, err)
 	defer d.admission.Close()
 	require.Nil(t, d.encryption)

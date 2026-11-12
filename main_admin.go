@@ -506,7 +506,7 @@ func newClusterInfoSource(nodeID, version string, runtimes []*raftGroupRuntime) 
 				}
 			}
 			groups = append(groups, admin.GroupInfo{
-				GroupID:  rt.spec.id,
+				GroupID:  rt.spec.ID,
 				LeaderID: status.Leader.ID,
 				IsLeader: status.State == raftengine.StateLeader,
 				Members:  members,

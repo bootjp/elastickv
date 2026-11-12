@@ -9,6 +9,7 @@ import (
 
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -66,7 +67,7 @@ func TestSetupDistributionCatalog_UsesResolvedCatalogGroup(t *testing.T) {
 	engine := distribution.NewEngine()
 	engine.UpdateRoute([]byte(""), nil, 5)
 	rt := &raftGroupRuntime{
-		spec:  groupSpec{id: 5},
+		spec:  noderuntime.GroupSpec{ID: 5},
 		store: store.NewMVCCStore(),
 	}
 	t.Cleanup(func() {
@@ -82,7 +83,7 @@ func TestDistributionCatalogStoreForGroupEnablesRouteDescriptorV2Writes(t *testi
 	t.Parallel()
 
 	rt := &raftGroupRuntime{
-		spec:  groupSpec{id: 5},
+		spec:  noderuntime.GroupSpec{ID: 5},
 		store: store.NewMVCCStore(),
 	}
 	t.Cleanup(func() {
@@ -230,14 +231,14 @@ func TestSplitMigrationCapabilityPeerSourceForRuntimesChecksAllGroups(t *testing
 
 	runtimes := []*raftGroupRuntime{
 		{
-			spec: groupSpec{id: 1},
+			spec: noderuntime.GroupSpec{ID: 1},
 			engine: capabilityConfigEngine{cfg: raftengine.Configuration{Servers: []raftengine.Server{
 				{Suffrage: "voter", ID: "n1", Address: "10.0.0.11:50051"},
 				{Suffrage: "learner", ID: "n2", Address: "10.0.0.12:50051"},
 			}}},
 		},
 		{
-			spec: groupSpec{id: 2},
+			spec: noderuntime.GroupSpec{ID: 2},
 			engine: capabilityConfigEngine{cfg: raftengine.Configuration{Servers: []raftengine.Server{
 				{Suffrage: "voter", ID: "n1", Address: "10.0.0.11:50051"},
 				{Suffrage: "voter", ID: "n3", Address: "10.0.0.13:50051"},
@@ -259,13 +260,13 @@ func TestSplitMigrationCapabilityPeerSourceForRuntimesFailsClosedOnEmptyGroup(t 
 
 	runtimes := []*raftGroupRuntime{
 		{
-			spec: groupSpec{id: 1},
+			spec: noderuntime.GroupSpec{ID: 1},
 			engine: capabilityConfigEngine{cfg: raftengine.Configuration{Servers: []raftengine.Server{
 				{Suffrage: "voter", ID: "n1", Address: "10.0.0.11:50051"},
 			}}},
 		},
 		{
-			spec:   groupSpec{id: 2},
+			spec:   noderuntime.GroupSpec{ID: 2},
 			engine: capabilityConfigEngine{cfg: raftengine.Configuration{}},
 		},
 	}

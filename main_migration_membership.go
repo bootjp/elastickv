@@ -22,9 +22,9 @@ func migrationMembershipInterceptor(runtime *raftGroupRuntime, shards *kv.ShardS
 	if runtime == nil {
 		return next
 	}
-	prepare := newPrepareEvidenceMembershipGate(shards, runtime.spec.id, next)
+	prepare := newPrepareEvidenceMembershipGate(shards, runtime.spec.ID, next)
 	// Dedicated TSO has neither KV migration controls nor an MVCC namespace.
-	if runtime.spec.id == 0 {
+	if runtime.spec.ID == 0 {
 		return prepare
 	}
 	protocols := newMigrationMembershipGate(runtime.store, migrationMemberProtocolsConfigured(),

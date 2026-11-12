@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/internal/raftengine/etcd"
@@ -23,10 +24,10 @@ func protectedTSOFixture(t *testing.T, dir string) (*groupBootstrapSpec, *bootst
 	raw := bootstrapConfigFixture(t)
 	raw.Local = etcd.DeriveNodeID("n1")
 	raw.Members[0].ID = raw.Local
-	raw.Members[0].Groups = []uint64{dedicatedTSORaftGroupID}
+	raw.Members[0].Groups = []uint64{noderuntime.DedicatedTSORaftGroupID}
 	config, err := buildBootstrapPeerConfig(raw)
 	require.NoError(t, err)
-	intent := raftbootstrap.Intent{Identity: raftbootstrap.Identity{Cluster: config.local.Cluster, Group: dedicatedTSORaftGroupID},
+	intent := raftbootstrap.Intent{Identity: raftbootstrap.Identity{Cluster: config.local.Cluster, Group: noderuntime.DedicatedTSORaftGroupID},
 		BaselineKind: raftbootstrap.Accepted, Minimum: raftbootstrap.Versions{Entry: 1, Snapshot: 1, Session: 1},
 		Floor: raftbootstrap.Floor{ActivationIndex: 2, Generation: 1},
 		Baseline: raftbootstrap.Configuration{Index: 1, State: raftbootstrap.ConfState{Voters: []uint64{config.local.Member}},
@@ -38,7 +39,7 @@ func protectedTSOFixture(t *testing.T, dir string) (*groupBootstrapSpec, *bootst
 	files := raftbootstrap.NewStore(dir)
 	projection := raftbootstrap.Policy{Identity: intent.Identity, BaselineDigest: digest, Minimum: intent.Minimum, Floor: intent.Floor}
 	require.NoError(t, files.Publish(intent, raftbootstrap.Evidence{Identity: &intent.Identity, BaselineDigest: &digest, RaftState: raftbootstrap.Intact, Policy: &projection}))
-	domain, err := newBootstrapDomain(intent.Identity.Cluster, []groupSpec{{id: dedicatedTSORaftGroupID}, {id: 1}}, bootstrapEncryptionRequest{})
+	domain, err := newBootstrapDomain(intent.Identity.Cluster, []noderuntime.GroupSpec{{ID: noderuntime.DedicatedTSORaftGroupID}, {ID: 1}}, noderuntime.BootstrapEncryptionRequest{})
 	require.NoError(t, err)
 	t.Cleanup(domain.admission.Close)
 	return &groupBootstrapSpec{config: config, files: files, intent: intent, dir: dir, domain: domain}, domain, policy
@@ -134,9 +135,9 @@ func TestProtectedTSORejectsMissingOrInconsistentState(t *testing.T) {
 func TestProtectedTSOFactoryNeverAutoMigrates(t *testing.T) {
 	t.Parallel()
 	base := t.TempDir()
-	dir := groupDataDir(base, "n1", dedicatedTSORaftGroupID, true)
+	dir := groupDataDir(base, "n1", noderuntime.DedicatedTSORaftGroupID, true)
 	spec, domain, _ := protectedTSOFixture(t, dir)
-	group := groupSpec{id: dedicatedTSORaftGroupID, address: spec.config.local.Address}
+	group := noderuntime.GroupSpec{ID: noderuntime.DedicatedTSORaftGroupID, Address: spec.config.local.Address}
 	factory := etcd.NewFactory(etcd.FactoryConfig{})
 	runtime, shard, err := buildProtectedDedicatedTSOGroup("n1", group, base, true, false, false,
 		nil, nil, factory, nil, nil, spec, domain, nil)
@@ -153,7 +154,7 @@ func TestProtectedTSOFactoryNeverAutoMigrates(t *testing.T) {
 	_, _, err = buildProtectedDedicatedTSOGroup("n1", group, base, true, false, false,
 		nil, nil, nil, nil, nil, spec, domain, nil)
 	require.Error(t, err)
-	servers := []raftengine.Server{{ID: "wrong-node", Address: group.address}}
+	servers := []raftengine.Server{{ID: "wrong-node", Address: group.Address}}
 	_, _, err = buildProtectedDedicatedTSOGroup("wrong-node", group, base, false, true, false,
 		servers, servers, factory, kv.NewHLC(), protectedTSOTestObserver{}, spec, domain,
 		[]string{"/explicit/public/method"}, store.WithSSTIngestSnapshots(true))
@@ -167,14 +168,14 @@ func (protectedTSOTestObserver) ObserveProposalFailure() {}
 func TestProtectedTSOFactoryRejectsEmptyControlDatabase(t *testing.T) {
 	t.Parallel()
 	base := t.TempDir()
-	dir := groupDataDir(base, "n1", dedicatedTSORaftGroupID, true)
+	dir := groupDataDir(base, "n1", noderuntime.DedicatedTSORaftGroupID, true)
 	spec, domain, _ := protectedTSOFixture(t, dir)
 	path := filepath.Join(dir, dedicatedTSOControlStoreName)
 	st, err := store.NewPebbleStore(path)
 	require.NoError(t, err)
 	require.NoError(t, st.Close())
 	factory := etcd.NewFactory(etcd.FactoryConfig{})
-	group := groupSpec{id: dedicatedTSORaftGroupID, address: spec.config.local.Address}
+	group := noderuntime.GroupSpec{ID: noderuntime.DedicatedTSORaftGroupID, Address: spec.config.local.Address}
 	_, _, err = buildProtectedDedicatedTSOGroup("n1", group, base, true, false, false,
 		nil, nil, factory, nil, nil, spec, domain, nil)
 	require.Error(t, err)
@@ -198,11 +199,11 @@ func TestProtectedTSOStartupRegistersSharedDomain(t *testing.T) {
 	transport := etcd.NewGRPCTransport([]etcd.Peer{{ID: "n1", NodeID: spec.config.local.Member, Address: spec.config.local.Address}})
 	t.Cleanup(func() { require.NoError(t, transport.Close()) })
 	setup := newProtectedTSOStartup(spec, st, sm, domain, nil)
-	startup, err := setup(raftengine.FactoryConfig{GroupID: dedicatedTSORaftGroupID, LocalID: "n1", LocalAddress: spec.config.local.Address}, transport)
+	startup, err := setup(raftengine.FactoryConfig{GroupID: noderuntime.DedicatedTSORaftGroupID, LocalID: "n1", LocalAddress: spec.config.local.Address}, transport)
 	require.NoError(t, err)
 	t.Cleanup(startup.Close)
 	require.Same(t, domain.admission, startup.NativeAdmission)
-	require.NotNil(t, domain.owners[dedicatedTSORaftGroupID])
+	require.NotNil(t, domain.owners[noderuntime.DedicatedTSORaftGroupID])
 	require.False(t, startup.PublicReady())
 	require.ErrorIs(t, startup.RecoveredAdmission(etcd.RecoveredState{}), etcd.ErrWALIdentity)
 	require.False(t, startup.PublicReady())
@@ -314,7 +315,7 @@ func TestPreparedTSORecoveryRejectsFreshNativeSource(t *testing.T) {
 				expected.PreparationDigest = raftbootstrap.Digest{99}
 			}
 			called := false
-			engine, err := etcd.Open(t.Context(), etcd.OpenConfig{GroupID: dedicatedTSORaftGroupID,
+			engine, err := etcd.Open(t.Context(), etcd.OpenConfig{GroupID: noderuntime.DedicatedTSORaftGroupID,
 				NodeID: spec.config.local.Member, LocalID: "n1", LocalAddress: spec.config.local.Address,
 				DataDir: t.TempDir(), Bootstrap: true, StateMachine: sm, NativeIdentity: &expected, NativeAdmission: domain.admission,
 				RecoveredAdmission: func(state etcd.RecoveredState) error {

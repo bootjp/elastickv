@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/stretchr/testify/require"
 )
@@ -173,7 +174,7 @@ func TestBootstrapObservationProbeRealLegacyTSO(t *testing.T) {
 func TestBootstrapObservationProbeRealLegacyData(t *testing.T) {
 	t.Setenv("ELASTICKV_RAFT_SNAPSHOT_COUNT", "1")
 	peer, config := enablementPeerConfig(t)
-	group := groupSpec{id: 1, address: config.local.Address}
+	group := noderuntime.GroupSpec{ID: 1, Address: config.local.Address}
 	dir := enablementLegacyCut(t, t.TempDir(), group)
 	manifest := enablementSignedBaseline(t, dir, config, group)
 	exerciseBootstrapObservationProbe(t, bootstrapBaselineCLIRequest{RaftDataDir: dir, MemberID: config.local.Member, OperationID: manifest.OperationID}, manifest, peer)

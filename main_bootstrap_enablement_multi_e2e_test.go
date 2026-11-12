@@ -24,6 +24,7 @@ import (
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
 	internalutil "github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/peersession"
 	"github.com/bootjp/elastickv/internal/raftadmission"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
@@ -162,26 +163,26 @@ func multiEnablementQuorumSnapshot(t *testing.T, processes []*multiEnablementPro
 
 func multiEnablementStartMember(t *testing.T, base string, identity *multiEnablementIdentity, servers []raftengine.Server, protected bool) *multiEnablementProcess {
 	t.Helper()
-	group := groupSpec{id: 1, address: identity.address}
+	group := noderuntime.GroupSpec{ID: 1, Address: identity.address}
 	routes := distribution.NewEngine()
-	routes.UpdateRoute(nil, nil, group.id)
+	routes.UpdateRoute(nil, nil, group.ID)
 	clock := kv.NewHLC()
 	factory := etcd.NewFactory(etcd.FactoryConfig{TickInterval: 50 * time.Millisecond, HeartbeatTick: 1, ElectionTick: 20})
 	builder := shardGroupBuilder{raftID: identity.id, raftDir: base, bootstrap: !protected,
 		factory: factory,
 		clock:   clock, readTracker: kv.NewActiveTimestampTracker(), routeEngine: routes}
 	if !protected {
-		builder.bootstrapCfg = raftBootstrapConfig{legacyServers: servers}
+		builder.bootstrapCfg = noderuntime.BootstrapConfig{LegacyServers: servers}
 	}
 	var domain *bootstrapDomain
 	listener := identity.listener
 	if protected {
-		builder.bootstrapCfg = raftBootstrapConfig{peerConfigDir: identity.configDir}
+		builder.bootstrapCfg = noderuntime.BootstrapConfig{PeerConfigDir: identity.configDir}
 		var err error
-		builder.bootstrapSpecs, domain, err = loadProtectedBootstrapDomain(identity.id, base, []groupSpec{group}, false, builder.bootstrapCfg)
+		builder.bootstrapSpecs, domain, err = loadProtectedBootstrapDomain(identity.id, base, []noderuntime.GroupSpec{group}, false, builder.bootstrapCfg)
 		require.NoError(t, err)
 		t.Cleanup(domain.admission.Close)
-		loaded := builder.bootstrapSpecs[group.id].config
+		loaded := builder.bootstrapSpecs[group.ID].config
 		require.Equal(t, identity.config.local, loaded.local)
 		require.Equal(t, identity.config.provisions, loaded.provisions, "restart retains all original CA/SPKI provisions")
 		listener, err = (&net.ListenConfig{}).Listen(t.Context(), "tcp", identity.address)
@@ -209,7 +210,7 @@ func multiEnablementStartMember(t *testing.T, base string, identity *multiEnable
 
 func multiEnablementNetwork(t *testing.T, process *multiEnablementProcess, routes *distribution.Engine, clock *kv.HLC) []grpc.ServerOption {
 	t.Helper()
-	id := process.runtime.spec.id
+	id := process.runtime.spec.ID
 	groups := map[uint64]*kv.ShardGroup{id: process.shard}
 	process.shards = kv.NewShardStore(routes, groups)
 	process.shards.SetOperationAdmission(process.domain.operationAdmission)
@@ -235,8 +236,8 @@ func multiEnablementServices(process *multiEnablementProcess, clock *kv.HLC) {
 	pb.RegisterRawKVServer(process.server, service)
 	pb.RegisterTransactionalKVServer(process.server, service)
 	proposer := process.shard.Proposer()
-	process.transaction = newInternalMigrationTransaction(proposer, nil, process.runtime.store, process.runtime.spec.id)
-	options := internalServerOptions(coordinate, nil, proposer, process.shard, process.runtime.spec.id)
+	process.transaction = newInternalMigrationTransaction(proposer, nil, process.runtime.store, process.runtime.spec.ID)
+	options := internalServerOptions(coordinate, nil, proposer, process.shard, process.runtime.spec.ID)
 	options = append(options, adapter.WithInternalStore(process.runtime.store), adapter.WithInternalPrimaryCommitEvidence(process.shards))
 	pb.RegisterInternalServer(process.server, adapter.NewInternalWithEngine(process.transaction, process.runtime.engine, clock, nil, options...))
 }

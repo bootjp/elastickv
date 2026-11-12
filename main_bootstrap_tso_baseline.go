@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/bootjp/elastickv/kv"
@@ -25,7 +26,7 @@ type bootstrapOfflineTSOPlan struct {
 }
 
 func bootstrapOfflineTSOPreparation(prepared kv.PreparedBootstrapActivation) (*etcd.BaselinePreparationCallbacks, error) {
-	if prepared.Probe.Identity.Group != dedicatedTSORaftGroupID {
+	if prepared.Probe.Identity.Group != noderuntime.DedicatedTSORaftGroupID {
 		return nil, errors.WithStack(kv.ErrTSOBaseline)
 	}
 	encoded, err := raftbootstrap.MarshalBaselineProbe(prepared.Probe)
@@ -258,7 +259,7 @@ func emptyPreparedTSOStore(path string) (empty bool, err error) {
 
 func validateTSOBaselinePreparation(ctx context.Context, state kv.TSOBaselineState, prepared kv.PreparedBootstrapActivation) error {
 	probe := prepared.Probe
-	if probe.Identity.Group != dedicatedTSORaftGroupID || state.AppliedIndex != probe.CommitIndex || state.ConfigurationIndex != probe.Configuration.Index || state.Watermark != probe.Watermark || state.DataDigest != probe.DataDigest {
+	if probe.Identity.Group != noderuntime.DedicatedTSORaftGroupID || state.AppliedIndex != probe.CommitIndex || state.ConfigurationIndex != probe.Configuration.Index || state.Watermark != probe.Watermark || state.DataDigest != probe.DataDigest {
 		return errors.WithStack(kv.ErrTSOBaseline)
 	}
 	if _, _, err := kv.PreparedBootstrapActivationMetadata(probe.Identity, prepared); err != nil {

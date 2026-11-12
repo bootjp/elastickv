@@ -34,7 +34,7 @@ func TestSnapshotOffloadThreeNodeRecoveryAcceptance(t *testing.T) {
 	t.Cleanup(func() { closeBootstrapE2ENodes(t, nodes) })
 	waitForBootstrapClusterConfig(t, nodes, bootstrapExpectedConfiguration(endpoints))
 	leader := waitForSingleLeader(t, nodes)
-	groupID := nodes[leader].runtimes[0].spec.id
+	groupID := nodes[leader].runtimes[0].spec.ID
 	objects, err := snapshotoffload.NewLocalStore(cfg.localDir)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, objects.Close()) })

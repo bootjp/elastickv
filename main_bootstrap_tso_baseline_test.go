@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/bootjp/elastickv/kv"
@@ -26,7 +27,7 @@ import (
 func TestOfflineTSOBaselineFromVerifiedBootstrapGenesis(t *testing.T) {
 	t.Setenv("ELASTICKV_RAFT_SNAPSHOT_COUNT", "1")
 	base := t.TempDir()
-	group := groupSpec{id: dedicatedTSORaftGroupID, address: "127.0.0.1:50051"}
+	group := noderuntime.GroupSpec{ID: noderuntime.DedicatedTSORaftGroupID, Address: "127.0.0.1:50051"}
 	runtime, _, err := buildDedicatedTSOGroup("n1", group, base, true, true, false, nil, nil, etcd.NewFactory(etcd.FactoryConfig{}), kv.NewHLC(), nil)
 	require.NoError(t, err)
 	t.Cleanup(runtime.Close)
@@ -36,7 +37,7 @@ func TestOfflineTSOBaselineFromVerifiedBootstrapGenesis(t *testing.T) {
 	require.NoError(t, err)
 	require.Eventually(t, func() bool { return runtime.engine.Status().LastSnapshotIndex != 0 }, 5*time.Second, 10*time.Millisecond)
 	runtime.Close()
-	dir := groupDataDir(base, "n1", dedicatedTSORaftGroupID, true)
+	dir := groupDataDir(base, "n1", noderuntime.DedicatedTSORaftGroupID, true)
 	path := filepath.Join(dir, dedicatedTSOControlStoreName)
 	require.NoDirExists(t, path)
 	ownership, err := etcd.AcquireOfflineBaselineOwnership(dir)
@@ -171,7 +172,7 @@ func tsoPreparationCallbackFixture(t *testing.T) (*etcd.BaselinePreparationCallb
 	t.Setenv("ELASTICKV_RAFT_SNAPSHOT_COUNT", "1")
 	spec, _, _ := protectedTSOFixture(t, t.TempDir())
 	base := t.TempDir()
-	group := groupSpec{id: dedicatedTSORaftGroupID, address: spec.config.local.Address}
+	group := noderuntime.GroupSpec{ID: noderuntime.DedicatedTSORaftGroupID, Address: spec.config.local.Address}
 	runtime, _, err := buildDedicatedTSOGroup("n1", group, base, true, true, false, nil, nil, etcd.NewFactory(etcd.FactoryConfig{}), kv.NewHLC(), nil)
 	require.NoError(t, err)
 	t.Cleanup(runtime.Close)
@@ -181,7 +182,7 @@ func tsoPreparationCallbackFixture(t *testing.T) (*etcd.BaselinePreparationCallb
 	require.NoError(t, err)
 	require.Eventually(t, func() bool { return runtime.engine.Status().LastSnapshotIndex != 0 }, 5*time.Second, 10*time.Millisecond)
 	runtime.Close()
-	backup := groupDataDir(base, "n1", dedicatedTSORaftGroupID, true)
+	backup := groupDataDir(base, "n1", noderuntime.DedicatedTSORaftGroupID, true)
 	ownership, err := etcd.AcquireOfflineBaselineOwnership(backup)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, ownership.Close()) })

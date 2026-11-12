@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/cockroachdb/errors"
 	"golang.org/x/sync/errgroup"
@@ -132,7 +133,7 @@ func configureCoordinatorTSOWithObserver(
 		return wiring, err
 	}
 
-	tsoGroup, dedicated := shardGroups[dedicatedTSORaftGroupID]
+	tsoGroup, dedicated := shardGroups[noderuntime.DedicatedTSORaftGroupID]
 	if !dedicated {
 		return configureLegacyCoordinatorTSO(f, coordinate, mode)
 	}
@@ -253,7 +254,7 @@ func configureDedicatedCoordinatorTSO(
 	// from a --tsoModeFile reload or from another node -- pins group 0 without
 	// the process having to mutate the coordinator at runtime.
 	coordinate.WithTSOCutoverState(tsoGroup.TSOState)
-	coordinate.WithTimestampGroupCandidate(dedicatedTSORaftGroupID)
+	coordinate.WithTimestampGroupCandidate(noderuntime.DedicatedTSORaftGroupID)
 	if !dedicatedTSORuntimeRequired(f, tsoGroup.TSOState, mode) {
 		return wiring, nil
 	}
@@ -268,7 +269,7 @@ func configureDedicatedCoordinatorTSO(
 		// legacy writes with ErrCeilingExpired even though those groups were
 		// healthy -- contrary to the no-path-change warm-up contract in
 		// docs/design/2026_04_16_implemented_centralized_tso.md.
-		coordinate.WithTimestampGroup(dedicatedTSORaftGroupID)
+		coordinate.WithTimestampGroup(noderuntime.DedicatedTSORaftGroupID)
 	}
 
 	routedOpts := dedicatedTSORoutingOptions(coordinate.Clock(), observer)

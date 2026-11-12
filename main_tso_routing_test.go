@@ -11,6 +11,7 @@ import (
 
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/kv"
@@ -42,7 +43,7 @@ func TestConfigureCoordinatorTSOCutoverRoutesThroughDedicatedGroup(t *testing.T)
 	fsm := kv.NewTSOStateMachine(clock)
 	engine := &mainTSOEngine{state: raftengine.StateLeader, tsoState: fsm}
 	groups := map[uint64]*kv.ShardGroup{
-		dedicatedTSORaftGroupID: {Engine: engine, TSOState: fsm},
+		noderuntime.DedicatedTSORaftGroupID: {Engine: engine, TSOState: fsm},
 	}
 	coord := newMainTSOCoordinator(clock, groups)
 
@@ -68,7 +69,7 @@ func TestConfigureCoordinatorTSOPhaseDWorksThroughAdapterDecorators(t *testing.T
 	fsm := kv.NewTSOStateMachine(clock)
 	engine := &mainTSOEngine{state: raftengine.StateLeader, tsoState: fsm}
 	groups := map[uint64]*kv.ShardGroup{
-		dedicatedTSORaftGroupID: {Engine: engine, TSOState: fsm},
+		noderuntime.DedicatedTSORaftGroupID: {Engine: engine, TSOState: fsm},
 	}
 	coord := newMainTSOCoordinator(clock, groups)
 
@@ -102,7 +103,7 @@ func TestConfigureCoordinatorTSOShadowReturnsLegacyTimestamp(t *testing.T) {
 	fsm := kv.NewTSOStateMachine(clock)
 	engine := &mainTSOEngine{state: raftengine.StateLeader, tsoState: fsm}
 	groups := map[uint64]*kv.ShardGroup{
-		dedicatedTSORaftGroupID: {Engine: engine, TSOState: fsm},
+		noderuntime.DedicatedTSORaftGroupID: {Engine: engine, TSOState: fsm},
 	}
 	coord := newMainTSOCoordinator(clock, groups)
 
@@ -123,7 +124,7 @@ func TestConfigureCoordinatorTSOExposesDedicatedServerWithoutCutover(t *testing.
 	fsm := kv.NewTSOStateMachine(clock)
 	engine := &mainTSOEngine{state: raftengine.StateFollower, tsoState: fsm}
 	groups := map[uint64]*kv.ShardGroup{
-		dedicatedTSORaftGroupID: {Engine: engine, TSOState: fsm},
+		noderuntime.DedicatedTSORaftGroupID: {Engine: engine, TSOState: fsm},
 	}
 	coord := newMainTSOCoordinator(clock, groups)
 
@@ -240,7 +241,7 @@ func TestInternalForwardUsesRuntimeAllocatorAfterModeReload(t *testing.T) {
 	fsm := kv.NewTSOStateMachine(clock)
 	engine := &mainTSOEngine{state: raftengine.StateLeader, tsoState: fsm}
 	groups := map[uint64]*kv.ShardGroup{
-		dedicatedTSORaftGroupID: {Engine: engine, TSOState: fsm},
+		noderuntime.DedicatedTSORaftGroupID: {Engine: engine, TSOState: fsm},
 	}
 	coord := newMainTSOCoordinator(clock, groups)
 	wiring, err := configureCoordinatorTSO(cfg, coord, groups, mainTSOFloorProvider{})
@@ -280,7 +281,7 @@ func TestConfigureCoordinatorTSOModeFileStartsRuntimeController(t *testing.T) {
 	fsm := kv.NewTSOStateMachine(clock)
 	engine := &mainTSOEngine{state: raftengine.StateLeader, tsoState: fsm}
 	groups := map[uint64]*kv.ShardGroup{
-		dedicatedTSORaftGroupID: {Engine: engine, TSOState: fsm},
+		noderuntime.DedicatedTSORaftGroupID: {Engine: engine, TSOState: fsm},
 	}
 	coord := newMainTSOCoordinator(clock, groups)
 
@@ -317,7 +318,7 @@ func newActiveMainTSOCutover(t *testing.T) (*kv.HLC, *kv.TSOStateMachine, *mainT
 	require.NoError(t, err)
 	require.True(t, fsm.CutoverActive())
 	engine.proposals.Store(0)
-	return clock, fsm, engine, map[uint64]*kv.ShardGroup{dedicatedTSORaftGroupID: group}
+	return clock, fsm, engine, map[uint64]*kv.ShardGroup{noderuntime.DedicatedTSORaftGroupID: group}
 }
 
 // testTSOFlags returns the registered TSO flag defaults with the given
@@ -448,7 +449,7 @@ func TestConfigureCoordinatorTSOLegacyDoesNotPinTimestampGroup(t *testing.T) {
 	clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
 	fsm := kv.NewTSOStateMachine(clock)
 	groups := map[uint64]*kv.ShardGroup{
-		dedicatedTSORaftGroupID: {
+		noderuntime.DedicatedTSORaftGroupID: {
 			Engine:   &mainTSOEngine{state: raftengine.StateFollower, tsoState: fsm},
 			TSOState: fsm,
 		},
@@ -477,7 +478,7 @@ func TestConfigureCoordinatorTSOModeFileLegacyDoesNotPinTimestampGroup(t *testin
 	clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
 	fsm := kv.NewTSOStateMachine(clock)
 	groups := map[uint64]*kv.ShardGroup{
-		dedicatedTSORaftGroupID: {
+		noderuntime.DedicatedTSORaftGroupID: {
 			Engine:   &mainTSOEngine{state: raftengine.StateFollower, tsoState: fsm},
 			TSOState: fsm,
 		},
@@ -509,7 +510,7 @@ func TestConfigureCoordinatorTSOCutoverPinsTimestampGroup(t *testing.T) {
 	clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
 	fsm := kv.NewTSOStateMachine(clock)
 	groups := map[uint64]*kv.ShardGroup{
-		dedicatedTSORaftGroupID: {
+		noderuntime.DedicatedTSORaftGroupID: {
 			Engine:   &mainTSOEngine{state: raftengine.StateFollower, tsoState: fsm},
 			TSOState: fsm,
 		},
@@ -601,7 +602,7 @@ func TestCoordinatorTSOWiringAuthorizeActivation(t *testing.T) {
 		fsm := kv.NewTSOStateMachine(clock)
 		engine := &mainTSOEngine{state: raftengine.StateLeader, tsoState: fsm}
 		groups := map[uint64]*kv.ShardGroup{
-			dedicatedTSORaftGroupID: {Engine: engine, TSOState: fsm},
+			noderuntime.DedicatedTSORaftGroupID: {Engine: engine, TSOState: fsm},
 		}
 		coord := newMainTSOCoordinator(clock, groups)
 		wiring, err := configureCoordinatorTSO(cfg, coord, groups, mainTSOFloorProvider{})
@@ -640,7 +641,7 @@ func TestServerAllocatorExposesDurableMarkerState(t *testing.T) {
 	fsm := kv.NewTSOStateMachine(clock)
 	engine := &mainTSOEngine{state: raftengine.StateLeader, tsoState: fsm}
 	groups := map[uint64]*kv.ShardGroup{
-		dedicatedTSORaftGroupID: {Engine: engine, TSOState: fsm},
+		noderuntime.DedicatedTSORaftGroupID: {Engine: engine, TSOState: fsm},
 	}
 	coord := newMainTSOCoordinator(clock, groups)
 	wiring, err := configureCoordinatorTSO(cfg, coord, groups, mainTSOFloorProvider{})

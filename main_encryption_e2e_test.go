@@ -8,6 +8,7 @@ import (
 
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryption/fsmwire"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/bootjp/elastickv/store"
 )
@@ -103,7 +104,7 @@ func TestEncryption_E2E_BootstrapCutoverPutReadback(t *testing.T) {
 func newE2EEncryptionFixture(t *testing.T, sidecarPath, pebbleDir string) (store.MVCCStore, *encryption.Applier, *encryption.StateCache, func()) {
 	t.Helper()
 	keystore := encryption.NewKeystore()
-	encWiring, err := buildEncryptionWriteWiring(true, "n1", sidecarPath, wiringFakeKEK{}, keystore, []groupSpec{{id: 1}}, nil)
+	encWiring, err := buildEncryptionWriteWiring(true, "n1", sidecarPath, wiringFakeKEK{}, keystore, []noderuntime.GroupSpec{{ID: 1}}, nil)
 	if err != nil {
 		t.Fatalf("buildEncryptionWriteWiring: %v", err)
 	}

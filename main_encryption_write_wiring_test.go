@@ -7,6 +7,7 @@ import (
 
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryption/encryptiontest"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 )
 
 // wiringFakeKEK is a deterministic KEKUnwrapper for the write-wiring
@@ -195,7 +196,7 @@ func TestBuildEncryptionWriteWiring_ActiveDEK_WiresCipher(t *testing.T) {
 	t.Parallel()
 	path := writeActiveStorageSidecar(t, 2)
 	markRaftEnvelopeCutoverInSidecar(t, path, 55)
-	w, err := buildEncryptionWriteWiring(true, "n1", path, wiringFakeKEK{}, encryption.NewKeystore(), []groupSpec{{id: 1}}, nil)
+	w, err := buildEncryptionWriteWiring(true, "n1", path, wiringFakeKEK{}, encryption.NewKeystore(), []noderuntime.GroupSpec{{ID: 1}}, nil)
 	if err != nil {
 		t.Fatalf("buildEncryptionWriteWiring: %v", err)
 	}
@@ -244,7 +245,7 @@ func TestBuildEncryptionWriteWiring_ActiveCutoverWithoutRaftDEKRefusesBeforeStor
 		t.Fatalf("WriteSidecar: %v", err)
 	}
 
-	_, err = buildEncryptionWriteWiring(true, "n1", path, wiringFakeKEK{}, encryption.NewKeystore(), []groupSpec{{id: 1}}, nil)
+	_, err = buildEncryptionWriteWiring(true, "n1", path, wiringFakeKEK{}, encryption.NewKeystore(), []noderuntime.GroupSpec{{ID: 1}}, nil)
 	if err == nil {
 		t.Fatal("buildEncryptionWriteWiring succeeded with active raft cutover but no active raft DEK")
 	}

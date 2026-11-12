@@ -10,6 +10,7 @@ import (
 	"strconv"
 
 	"github.com/bootjp/elastickv/internal/encryption"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/bootjp/elastickv/kv"
@@ -232,7 +233,7 @@ func checkEnvelopeCutoverDivergenceStartupGuard(
 func checkEnvelopeCutoverDivergenceBeforeNonceBump(
 	raftID string,
 	raftDir string,
-	groups []groupSpec,
+	groups []noderuntime.GroupSpec,
 	defaultGroup uint64,
 	multi bool,
 	sidecarPath string,
@@ -241,7 +242,7 @@ func checkEnvelopeCutoverDivergenceBeforeNonceBump(
 	if !encryptionEnabled || sidecarPath == "" {
 		return nil
 	}
-	multi = effectiveMultiDataDirs(groups, multi)
+	multi = noderuntime.EffectiveMultiDataDirs(groups, multi)
 	sc, err := readExistingSidecarForStartupGuard(sidecarPath)
 	if err != nil {
 		return err
@@ -275,9 +276,9 @@ func checkEnvelopeCutoverDivergenceSnapshotPayload(payload io.Reader, sidecarCut
 		snapshotCutover, sidecarCutover, defaultGroup)
 }
 
-func hasGroup(groupID uint64, groups []groupSpec) bool {
+func hasGroup(groupID uint64, groups []noderuntime.GroupSpec) bool {
 	for _, g := range groups {
-		if g.id == groupID {
+		if g.ID == groupID {
 			return true
 		}
 	}
@@ -339,7 +340,7 @@ func checkEnvelopeCutoverDivergenceForRuntime(
 type encryptionMembershipStartupGuardInput struct {
 	raftID            string
 	raftDir           string
-	groups            []groupSpec
+	groups            []noderuntime.GroupSpec
 	multi             bool
 	defaultGroup      uint64
 	sidecarPath       string
@@ -365,7 +366,7 @@ func checkEncryptionMembershipStartupGuardsBeforeEngine(in encryptionMembershipS
 	if !in.encryptionEnabled || in.sidecarPath == "" {
 		return nil
 	}
-	in.multi = effectiveMultiDataDirs(in.groups, in.multi)
+	in.multi = noderuntime.EffectiveMultiDataDirs(in.groups, in.multi)
 	sc, err := readExistingSidecarForStartupGuard(in.sidecarPath)
 	if err != nil || sc == nil {
 		return err
@@ -382,7 +383,7 @@ func checkEncryptionMembershipStartupGuardsBeforeEngine(in encryptionMembershipS
 func checkNodeIDCollisionFromDisk(
 	raftID string,
 	raftDir string,
-	groups []groupSpec,
+	groups []noderuntime.GroupSpec,
 	multi bool,
 	bootstrapServers []raftengine.Server,
 ) error {
@@ -399,7 +400,7 @@ func checkNodeIDCollisionFromDisk(
 func memberFullNodeIDsFromDisk(
 	raftID string,
 	raftDir string,
-	groups []groupSpec,
+	groups []noderuntime.GroupSpec,
 	multi bool,
 	bootstrapServers []raftengine.Server,
 ) ([]uint64, error) {
@@ -416,12 +417,12 @@ func memberFullNodeIDsFromDisk(
 		out = append(out, fullNodeID)
 	}
 	for _, g := range groups {
-		dir := groupDataDir(raftDir, raftID, g.id, multi)
+		dir := groupDataDir(raftDir, raftID, g.ID, multi)
 		peers, ok, err := etcdraftengine.LoadPersistedPeers(dir)
 		if err != nil {
 			return nil, pkgerrors.Wrapf(err,
 				"encryption startup guard: read persisted peers for group %d",
-				g.id)
+				g.ID)
 		}
 		if ok {
 			for _, peer := range peers {
@@ -661,7 +662,7 @@ func (missingWriterRegistry) SetRegistryRow(_, _ []byte) error {
 // sidecar's raft_applied_index.
 func findDefaultGroupRuntime(runtimes []*raftGroupRuntime, defaultGroup uint64) *raftGroupRuntime {
 	for _, rt := range runtimes {
-		if rt != nil && rt.spec.id == defaultGroup {
+		if rt != nil && rt.spec.ID == defaultGroup {
 			return rt
 		}
 	}

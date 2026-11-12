@@ -11,6 +11,7 @@ import (
 
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryption/encryptiontest"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/bootjp/elastickv/kv"
@@ -215,7 +216,7 @@ func TestCheckSidecarBehindRaftLog_NoRuntimes(t *testing.T) {
 func TestCheckSidecarBehindRaftLog_NilEngineFailsClosed(t *testing.T) {
 	t.Parallel()
 	sidecarPath := writeMinimalSidecar(t, 10)
-	rt := &raftGroupRuntime{spec: groupSpec{id: 1}} // engine field stays nil
+	rt := &raftGroupRuntime{spec: noderuntime.GroupSpec{ID: 1}} // engine field stays nil
 	err := checkSidecarBehindRaftLog([]*raftGroupRuntime{rt}, 1, sidecarPath, true)
 	if err == nil {
 		t.Fatal("guard must fail-closed when default-group engine is nil")
@@ -345,7 +346,7 @@ func TestCheckEnvelopeCutoverDivergenceStartupGuard_Fires(t *testing.T) {
 	t.Parallel()
 	sidecarPath := writeRaftCutoverSidecarForStartup(t, 8, 3, 100)
 	rt := &raftGroupRuntime{
-		spec:         groupSpec{id: 1},
+		spec:         noderuntime.GroupSpec{ID: 1},
 		stateMachine: &stubRestoredCutoverStateMachine{cutover: 200},
 	}
 	err := checkEnvelopeCutoverDivergenceStartupGuard([]*raftGroupRuntime{rt}, 1, sidecarPath, true)
@@ -358,7 +359,7 @@ func TestCheckEnvelopeCutoverDivergenceStartupGuard_Match(t *testing.T) {
 	t.Parallel()
 	sidecarPath := writeRaftCutoverSidecarForStartup(t, 8, 3, 100)
 	rt := &raftGroupRuntime{
-		spec:         groupSpec{id: 1},
+		spec:         noderuntime.GroupSpec{ID: 1},
 		stateMachine: &stubRestoredCutoverStateMachine{cutover: 100},
 	}
 	if err := checkEnvelopeCutoverDivergenceStartupGuard([]*raftGroupRuntime{rt}, 1, sidecarPath, true); err != nil {
@@ -387,7 +388,7 @@ func TestCheckEnvelopeCutoverDivergenceStartupGuard_PreBootstrapSkips(t *testing
 	t.Parallel()
 	sidecarPath := writeMinimalSidecar(t, 1)
 	rt := &raftGroupRuntime{
-		spec:         groupSpec{id: 1},
+		spec:         noderuntime.GroupSpec{ID: 1},
 		stateMachine: &stubRestoredCutoverStateMachine{cutover: 0},
 	}
 	if err := checkEnvelopeCutoverDivergenceStartupGuard([]*raftGroupRuntime{rt}, 1, sidecarPath, true); err != nil {
@@ -410,7 +411,7 @@ func TestCheckEncryptionMembershipStartupGuardsBeforeEngine_NodeIDCollisionFromP
 	err := checkEncryptionMembershipStartupGuardsBeforeEngine(encryptionMembershipStartupGuardInput{
 		raftID:            "n1",
 		raftDir:           raftDir,
-		groups:            []groupSpec{{id: 1}},
+		groups:            []noderuntime.GroupSpec{{ID: 1}},
 		defaultGroup:      1,
 		sidecarPath:       sidecarPath,
 		encryptionEnabled: true,
@@ -435,7 +436,7 @@ func TestCheckEncryptionMembershipStartupGuardsBeforeEngine_DerivesPersistedPeer
 	err := checkEncryptionMembershipStartupGuardsBeforeEngine(encryptionMembershipStartupGuardInput{
 		raftID:            "n1",
 		raftDir:           raftDir,
-		groups:            []groupSpec{{id: 1}},
+		groups:            []noderuntime.GroupSpec{{ID: 1}},
 		defaultGroup:      1,
 		sidecarPath:       sidecarPath,
 		encryptionEnabled: true,
@@ -465,7 +466,7 @@ func TestCheckEncryptionMembershipStartupGuardsBeforeEngine_LocalEpochEqualAllow
 	err = checkEncryptionMembershipStartupGuardsBeforeEngine(encryptionMembershipStartupGuardInput{
 		raftID:            "n1",
 		raftDir:           raftDir,
-		groups:            []groupSpec{{id: 1}},
+		groups:            []noderuntime.GroupSpec{{ID: 1}},
 		defaultGroup:      1,
 		sidecarPath:       sidecarPath,
 		encryptionEnabled: true,
@@ -502,7 +503,7 @@ func TestCheckEncryptionMembershipStartupGuardsBeforeEngine_LocalEpochBehindRoll
 	err = checkEncryptionMembershipStartupGuardsBeforeEngine(encryptionMembershipStartupGuardInput{
 		raftID:            "n1",
 		raftDir:           raftDir,
-		groups:            []groupSpec{{id: 1}},
+		groups:            []noderuntime.GroupSpec{{ID: 1}},
 		defaultGroup:      1,
 		sidecarPath:       sidecarPath,
 		encryptionEnabled: true,
@@ -554,7 +555,7 @@ func TestCheckLocalEpochRollbackAfterReplay_RejectsEqualEpochAfterBump(t *testin
 
 	err = checkLocalEpochRollbackAfterReplay(
 		"n1",
-		[]*raftGroupRuntime{{spec: groupSpec{id: 1}, store: st}},
+		[]*raftGroupRuntime{{spec: noderuntime.GroupSpec{ID: 1}, store: st}},
 		1,
 		sidecarPath,
 		true,
@@ -581,7 +582,7 @@ func TestCheckLocalEpochRollbackAfterReplay_AllowsBumpedAheadEpoch(t *testing.T)
 
 	err = checkLocalEpochRollbackAfterReplay(
 		"n1",
-		[]*raftGroupRuntime{{spec: groupSpec{id: 1}, store: st}},
+		[]*raftGroupRuntime{{spec: noderuntime.GroupSpec{ID: 1}, store: st}},
 		1,
 		sidecarPath,
 		true,
@@ -597,7 +598,7 @@ func TestCheckEncryptionMembershipStartupGuardsBeforeEngine_PreBootstrapSkips(t 
 	err := checkEncryptionMembershipStartupGuardsBeforeEngine(encryptionMembershipStartupGuardInput{
 		raftID:            "n1",
 		raftDir:           t.TempDir(),
-		groups:            []groupSpec{{id: 1}},
+		groups:            []noderuntime.GroupSpec{{ID: 1}},
 		defaultGroup:      1,
 		sidecarPath:       sidecarPath,
 		encryptionEnabled: true,

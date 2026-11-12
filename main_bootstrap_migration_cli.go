@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/bootjp/elastickv/kv"
@@ -59,7 +60,7 @@ func bootstrapOfflineOptionsWithContext(ctx context.Context, request bootstrapBa
 		options.Crypto = enc.NativeCrypto()
 	}
 	options.ProbeStore = func(ctx context.Context) (etcd.BaselineStoreProof, error) {
-		if manifest.Identity.Group == dedicatedTSORaftGroupID {
+		if manifest.Identity.Group == noderuntime.DedicatedTSORaftGroupID {
 			_, proof, err := probeOfflineTSOBaseline(ctx, request.RaftDataDir, ownership)
 			return proof, err
 		}
@@ -69,7 +70,7 @@ func bootstrapOfflineOptionsWithContext(ctx context.Context, request bootstrapBa
 }
 
 func bootstrapMigrationDataCallbacks(prepared kv.PreparedBootstrapActivation, enc ...*bootstrapOfflineEncryption) (*etcd.BaselinePreparationCallbacks, error) {
-	if prepared.Probe.Identity.Group == dedicatedTSORaftGroupID {
+	if prepared.Probe.Identity.Group == noderuntime.DedicatedTSORaftGroupID {
 		return bootstrapOfflineTSOPreparation(prepared)
 	}
 	return bootstrapOfflineDataPreparation(prepared, enc...)

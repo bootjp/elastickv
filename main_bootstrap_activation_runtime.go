@@ -54,7 +54,7 @@ func startBootstrapActivationWorkers(ctx context.Context, eg *errgroup.Group, ru
 		}
 		domain := runtime.bootstrapDomain
 		domain.mu.Lock()
-		payload := bytes.Clone(domain.activations[runtime.spec.id])
+		payload := bytes.Clone(domain.activations[runtime.spec.ID])
 		domain.mu.Unlock()
 		if len(payload) == 0 {
 			continue
@@ -71,7 +71,7 @@ func runBootstrapActivation(ctx context.Context, runtime *raftGroupRuntime, grou
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			if !runtime.bootstrapDomain.admission.NeedsActivation(runtime.spec.id) {
+			if !runtime.bootstrapDomain.admission.NeedsActivation(runtime.spec.ID) {
 				continue
 			}
 			attemptBootstrapActivation(ctx, runtime, groups, payload)
@@ -80,7 +80,7 @@ func runBootstrapActivation(ctx context.Context, runtime *raftGroupRuntime, grou
 }
 
 func attemptBootstrapActivation(ctx context.Context, runtime *raftGroupRuntime, groups map[uint64]*kv.ShardGroup, payload []byte) {
-	owned, finish, err := runtime.bootstrapDomain.admission.Enter(ctx, raftadmission.Recovery, runtime.spec.id)
+	owned, finish, err := runtime.bootstrapDomain.admission.Enter(ctx, raftadmission.Recovery, runtime.spec.ID)
 	if err != nil {
 		return
 	}
@@ -105,7 +105,7 @@ func attemptBootstrapActivation(ctx context.Context, runtime *raftGroupRuntime, 
 }
 
 func bootstrapActivationProposer(runtime *raftGroupRuntime, groups map[uint64]*kv.ShardGroup) raftengine.Proposer {
-	if group := groups[runtime.spec.id]; group != nil {
+	if group := groups[runtime.spec.ID]; group != nil {
 		return group.Proposer()
 	}
 	return runtime.snapshotEngine()

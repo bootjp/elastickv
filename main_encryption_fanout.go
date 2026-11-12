@@ -200,7 +200,7 @@ func capabilityRouteSnapshot(ctx context.Context, runtimes []*raftGroupRuntime) 
 		if eng == nil {
 			continue
 		}
-		sources = append(sources, groupConfigSource{groupID: rt.spec.id, engine: eng})
+		sources = append(sources, groupConfigSource{groupID: rt.spec.ID, engine: eng})
 	}
 	return routeSnapshotFromSources(ctx, sources)
 }

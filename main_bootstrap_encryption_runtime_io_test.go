@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/encryption"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
@@ -67,7 +68,7 @@ func newEncryptionRuntimeIOFixture(t *testing.T) *encryptionRuntimeIOFixture {
 	_ = kv.NewLeaderProxyForShardGroup(f.group)
 	domain := bootstrapIngressFixture(t).domain
 	w := encryptionWriteWiring{cache: encryption.NewStateCache(), cipher: f.runtime.cipher, raftEnvelope: f.runtime, epoch: 7, raftEpoch: 9}
-	rt := &raftGroupRuntime{spec: groupSpec{id: 1}, engine: engine, store: f.in.localStore, bootstrapDomain: domain}
+	rt := &raftGroupRuntime{spec: noderuntime.GroupSpec{ID: 1}, engine: engine, store: f.in.localStore, bootstrapDomain: domain}
 	cfg := bootstrapEncryptionRuntimeIOConfig{DefaultRuntime: rt, Group: f.group, Wiring: w, SidecarPath: f.in.sidecarPath, Wrapper: encryptionRuntimeIOTestKEK{}, Domain: domain, NodeID: 123, RotationRequested: true}
 	io, err := newBootstrapEncryptionRuntimeIO(cfg)
 	require.NoError(t, err)
