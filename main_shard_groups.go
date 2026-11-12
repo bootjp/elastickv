@@ -106,7 +106,7 @@ func buildShardGroups(
 	// breaking the shared-cache invariant 6D-6c-1 relies on.
 	encWiring = encWiring.withDefaultedCache()
 	multi = effectiveMultiDataDirs(groups, multi)
-	bootstrapSpecs, bootstrapDomain, err := loadProtectedBootstrapDomain(raftID, raftDir, groups, multi, bootstrapCfg.serviceTokenFiles, encWiring)
+	bootstrapSpecs, bootstrapDomain, err := loadProtectedBootstrapDomain(raftID, raftDir, groups, multi, bootstrapCfg, encWiring)
 	if err != nil {
 		return nil, nil, err
 	}

@@ -272,7 +272,8 @@ func (f *bootstrapRotationE2EFixture) protected(t *testing.T) *bootstrapRotation
 	clock, routes := kv.NewHLC(), distribution.NewEngine()
 	routes.UpdateRoute(nil, nil, f.group.id)
 	runtimes, groups, wiring, err := buildShardGroupsWithEncryptionWiring("n1", f.base, []groupSpec{f.group}, 1, false, false,
-		raftBootstrapConfig{}, enablementFactory(), nil, clock, f.wrapper, encryption.NewKeystore(), f.sidecarPath, true,
+		raftBootstrapConfig{encryption: bootstrapEncryptionRequest{configured: true, rotateOnStartup: true}},
+		enablementFactory(), nil, clock, f.wrapper, encryption.NewKeystore(), f.sidecarPath, true,
 		kv.NewActiveTimestampTracker(), routes, nil)
 	require.NoError(t, err)
 	runtime := runtimes[0]
@@ -346,14 +347,9 @@ func (n *bootstrapRotationE2ENode) read(t *testing.T, key, expected string) {
 func TestBootstrapRotationE2EActiveEnvelopesBusinessRestart(t *testing.T) {
 	t.Setenv("ELASTICKV_RAFT_SNAPSHOT_COUNT", "1")
 	f := newBootstrapRotationE2EFixture(t, true)
-	oldDir, oldSidecar := *raftBootstrapPeerConfigDir, *encryptionSidecarPath
-	oldEnabled, oldRotation := *encryptionEnabled, *encryptionRotateOnStartup
-	t.Cleanup(func() {
-		*raftBootstrapPeerConfigDir, *encryptionSidecarPath = oldDir, oldSidecar
-		*encryptionEnabled, *encryptionRotateOnStartup = oldEnabled, oldRotation
-	})
-	*raftBootstrapPeerConfigDir, *encryptionSidecarPath = f.configDir, f.sidecarPath
-	*encryptionEnabled, *encryptionRotateOnStartup = true, true
+	oldDir := *raftBootstrapPeerConfigDir
+	t.Cleanup(func() { *raftBootstrapPeerConfigDir = oldDir })
+	*raftBootstrapPeerConfigDir = f.configDir
 	node := f.protected(t)
 	sc, err := encryption.ReadSidecar(f.sidecarPath)
 	require.NoError(t, err)

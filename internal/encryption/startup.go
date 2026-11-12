@@ -32,7 +32,7 @@ type StartupConfig struct {
 	// itself is supplied via KEK below; KEKConfigured exists
 	// independently so the helper can distinguish "operator did
 	// not supply a KEK source" from "supplied but failed to load"
-	// (the latter is handled at main.go's loadKEKWrapperFromFlag()
+	// (the latter is handled at main.go's loadKEKWrapperFromFlags()
 	// call site, before this guard runs).
 	KEKConfigured bool
 

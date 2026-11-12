@@ -38,7 +38,7 @@ func protectedTSOFixture(t *testing.T, dir string) (*groupBootstrapSpec, *bootst
 	files := raftbootstrap.NewStore(dir)
 	projection := raftbootstrap.Policy{Identity: intent.Identity, BaselineDigest: digest, Minimum: intent.Minimum, Floor: intent.Floor}
 	require.NoError(t, files.Publish(intent, raftbootstrap.Evidence{Identity: &intent.Identity, BaselineDigest: &digest, RaftState: raftbootstrap.Intact, Policy: &projection}))
-	domain, err := newBootstrapDomain(intent.Identity.Cluster, []groupSpec{{id: dedicatedTSORaftGroupID}, {id: 1}})
+	domain, err := newBootstrapDomain(intent.Identity.Cluster, []groupSpec{{id: dedicatedTSORaftGroupID}, {id: 1}}, bootstrapEncryptionRequest{})
 	require.NoError(t, err)
 	t.Cleanup(domain.admission.Close)
 	return &groupBootstrapSpec{config: config, files: files, intent: intent, dir: dir, domain: domain}, domain, policy

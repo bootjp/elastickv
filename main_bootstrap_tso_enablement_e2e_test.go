@@ -110,7 +110,7 @@ func tsoEnablementSignedBaseline(t *testing.T, dir string, cfg *bootstrapPeerCon
 
 func tsoEnablementStart(t *testing.T, base string, profile []groupSpec) *tsoEnablementNode {
 	t.Helper()
-	specs, domain, err := loadProtectedBootstrapDomain("n1", base, profile, true, nil)
+	specs, domain, err := loadProtectedBootstrapDomain("n1", base, profile, true, raftBootstrapConfig{})
 	require.NoError(t, err)
 	t.Cleanup(domain.admission.Close)
 	routes := distribution.NewEngine()

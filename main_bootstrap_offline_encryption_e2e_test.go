@@ -130,11 +130,9 @@ func migrateOfflineEncryptedE2E(t *testing.T, f *bootstrapRotationE2EFixture, en
 func TestBootstrapOfflineEncryptionLegacyCiphertextToProtectedRestart(t *testing.T) {
 	t.Setenv("ELASTICKV_RAFT_SNAPSHOT_COUNT", "1")
 	f, _ := newOfflineEncryptedE2EFixture(t)
-	oldDir, oldPath, oldEnabled, oldRotation := *raftBootstrapPeerConfigDir, *encryptionSidecarPath, *encryptionEnabled, *encryptionRotateOnStartup
-	t.Cleanup(func() {
-		*raftBootstrapPeerConfigDir, *encryptionSidecarPath, *encryptionEnabled, *encryptionRotateOnStartup = oldDir, oldPath, oldEnabled, oldRotation
-	})
-	*raftBootstrapPeerConfigDir, *encryptionSidecarPath, *encryptionEnabled, *encryptionRotateOnStartup = f.configDir, f.sidecarPath, true, true
+	oldDir := *raftBootstrapPeerConfigDir
+	t.Cleanup(func() { *raftBootstrapPeerConfigDir = oldDir })
+	*raftBootstrapPeerConfigDir = f.configDir
 	node := f.protected(t)
 	node.read(t, "encrypted-before-migration", "encrypted-original")
 	policy, err := kv.LoadAppliedBootstrapPolicy(t.Context(), node.runtime.store, f.manifest.Identity, node.runtime.engine.Status().AppliedIndex)

@@ -19,13 +19,8 @@ func bootstrapEncryptionDomainWiring(f *encryptionRuntimeIOFixture) encryptionWr
 	return w
 }
 
-func setBootstrapEncryptionDomainFlags(t *testing.T, enabled, requested bool, path string) {
-	t.Helper()
-	oldEnabled, oldRequested, oldPath := *encryptionEnabled, *encryptionRotateOnStartup, *encryptionSidecarPath
-	*encryptionEnabled, *encryptionRotateOnStartup, *encryptionSidecarPath = enabled, requested, path
-	t.Cleanup(func() {
-		*encryptionEnabled, *encryptionRotateOnStartup, *encryptionSidecarPath = oldEnabled, oldRequested, oldPath
-	})
+func bootstrapEncryptionDomainRequest(enabled, requested bool, path string) bootstrapEncryptionRequest {
+	return encryptionFlags{enabled: enabled, rotateOnStartup: requested, sidecarPath: path}.bootstrapRequest()
 }
 
 func TestBootstrapEncryptionDomainRejectsMissingActualWiring(t *testing.T) {
@@ -37,10 +32,10 @@ func TestBootstrapEncryptionDomainRejectsMissingActualWiring(t *testing.T) {
 		{"enabled", true, false, ""}, {"rotation", false, true, ""}, {"sidecar", false, false, "keys.json"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			setBootstrapEncryptionDomainFlags(t, tc.enabled, tc.rotation, tc.path)
-			_, err := newBootstrapDomain(raftbootstrap.UUID{1}, []groupSpec{{id: 1}})
+			request := bootstrapEncryptionDomainRequest(tc.enabled, tc.rotation, tc.path)
+			_, err := newBootstrapDomain(raftbootstrap.UUID{1}, []groupSpec{{id: 1}}, request)
 			require.ErrorIs(t, err, errBootstrapEncryptionUnsupported)
-			_, err = newBootstrapDomain(raftbootstrap.UUID{1}, []groupSpec{{id: 1}}, encryptionWriteWiring{})
+			_, err = newBootstrapDomain(raftbootstrap.UUID{1}, []groupSpec{{id: 1}}, request, encryptionWriteWiring{})
 			require.ErrorIs(t, err, errBootstrapEncryptionUnsupported)
 		})
 	}
@@ -49,8 +44,8 @@ func TestBootstrapEncryptionDomainRejectsMissingActualWiring(t *testing.T) {
 func newEncryptedDomainFixture(t *testing.T) (*bootstrapDomain, *encryptionRuntimeIOFixture) {
 	t.Helper()
 	f := newEncryptionRuntimeIOFixture(t)
-	setBootstrapEncryptionDomainFlags(t, true, true, f.cfg.SidecarPath)
-	d, err := newBootstrapDomain(raftbootstrap.UUID{1}, []groupSpec{{id: 1}}, bootstrapEncryptionDomainWiring(f))
+	request := bootstrapEncryptionDomainRequest(true, true, f.cfg.SidecarPath)
+	d, err := newBootstrapDomain(raftbootstrap.UUID{1}, []groupSpec{{id: 1}}, request, bootstrapEncryptionDomainWiring(f))
 	require.NoError(t, err)
 	t.Cleanup(d.admission.Close)
 	bootstrapIngressObserve(t, d.admission, 1)
@@ -131,8 +126,7 @@ func TestBootstrapEncryptionDomainRecipeGrantsAreExactAndIsolated(t *testing.T) 
 }
 
 func TestBootstrapEncryptionDomainPlaintextCompatibility(t *testing.T) {
-	setBootstrapEncryptionDomainFlags(t, false, false, "")
-	d, err := newBootstrapDomain(raftbootstrap.UUID{1}, []groupSpec{{id: 1}}, encryptionWriteWiring{})
+	d, err := newBootstrapDomain(raftbootstrap.UUID{1}, []groupSpec{{id: 1}}, bootstrapEncryptionRequest{}, encryptionWriteWiring{})
 	require.NoError(t, err)
 	defer d.admission.Close()
 	require.Nil(t, d.encryption)

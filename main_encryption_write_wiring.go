@@ -248,7 +248,7 @@ func (w encryptionWriteWiring) activateStorageEnvelopeV2Writes() {
 // globals so the nonce factory's node_id is provably derived from the
 // same raftID the shard stores use, and so the helper is testable in
 // isolation. run()'s orchestrator buildShardGroupsWithEncryptionWiring
-// threads its own raftID / sidecarPath params plus *encryptionEnabled in.
+// threads its own raftID / sidecarPath / encryptionEnabled params in.
 //
 // When a storage DEK is already active on disk (the restart path),
 // the function hydrates the keystore from the sidecar so the cipher

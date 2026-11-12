@@ -57,14 +57,9 @@ func (s *bootstrapRecoveryCatalogRead) GetAt(ctx context.Context, key []byte, ts
 
 func bootstrapRecoveryRaceFlags(t *testing.T, f *bootstrapRotationE2EFixture) {
 	t.Helper()
-	dir, path := *raftBootstrapPeerConfigDir, *encryptionSidecarPath
-	enabled, rotation := *encryptionEnabled, *encryptionRotateOnStartup
-	t.Cleanup(func() {
-		*raftBootstrapPeerConfigDir, *encryptionSidecarPath = dir, path
-		*encryptionEnabled, *encryptionRotateOnStartup = enabled, rotation
-	})
-	*raftBootstrapPeerConfigDir, *encryptionSidecarPath = f.configDir, f.sidecarPath
-	*encryptionEnabled, *encryptionRotateOnStartup = true, true
+	dir := *raftBootstrapPeerConfigDir
+	t.Cleanup(func() { *raftBootstrapPeerConfigDir = dir })
+	*raftBootstrapPeerConfigDir = f.configDir
 }
 
 func bootstrapRecoveryCatalogView(node *bootstrapRotationE2ENode, reader store.MVCCStore) []*raftGroupRuntime {

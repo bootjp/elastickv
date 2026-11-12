@@ -96,6 +96,7 @@ func run(flags *serverFlags) error {
 	if err != nil {
 		return err
 	}
+	bootstrapCfg.encryption = flags.encryption.bootstrapRequest()
 
 	var lc net.ListenConfig
 
@@ -137,7 +138,7 @@ func run(flags *serverFlags) error {
 	// The KEK source is decorated for §9.2
 	// elastickv_encryption_kek_unwrap_seconds inside this call, before
 	// the startup guards run their own unwraps.
-	kekUnwrapper, err := loadKEKAfterPreNonceStartupGuards(cfg, metricsRegistry.KEKUnwrapObserver())
+	kekUnwrapper, err := loadKEKAfterPreNonceStartupGuards(cfg, flags.encryption, metricsRegistry.KEKUnwrapObserver())
 	if err != nil {
 		return err
 	}
@@ -188,8 +189,8 @@ func run(flags *serverFlags) error {
 		clock,
 		kekUnwrapper,
 		keystore,
-		*encryptionSidecarPath,
-		*encryptionEnabled,
+		flags.encryption.sidecarPath,
+		flags.encryption.enabled,
 		readTracker,
 		cfg.engine,
 		metricsRegistry.EncryptionObserver(),
@@ -200,8 +201,8 @@ func run(flags *serverFlags) error {
 		err,
 		runtimes,
 		cfg.defaultGroup,
-		*encryptionSidecarPath,
-		*encryptionEnabled,
+		flags.encryption.sidecarPath,
+		flags.encryption.enabled,
 	); err != nil {
 		return err
 	}
@@ -283,8 +284,8 @@ func run(flags *serverFlags) error {
 	// run with no registration gate installed.
 	encryptionStartup := bootstrapEncryptionStartupConfig{
 		runtimes: runtimes, groups: shardGroups, defaultGroup: cfg.defaultGroup,
-		network: bootstrapNetwork, wiring: encWiring, sidecarPath: *encryptionSidecarPath,
-		wrapper: kekUnwrapper, nodeID: etcdraftengine.DeriveNodeID(*raftId), requested: *encryptionRotateOnStartup,
+		network: bootstrapNetwork, wiring: encWiring, sidecarPath: flags.encryption.sidecarPath,
+		wrapper: kekUnwrapper, nodeID: etcdraftengine.DeriveNodeID(*raftId), requested: flags.encryption.rotateOnStartup,
 		eg: eg, cleanup: &cleanup,
 	}
 	distStartup, err := startDistributionWithBootstrapEncryption(distributionStartupInput{
@@ -299,7 +300,7 @@ func run(flags *serverFlags) error {
 		defaultGroup:    shardGroups[cfg.defaultGroup],
 		encWiring:       encWiring,
 		raftID:          *raftId,
-		sidecarPath:     *encryptionSidecarPath,
+		sidecarPath:     flags.encryption.sidecarPath,
 		sampler:         sampler,
 		readTracker:     readTracker,
 		metricsRegistry: metricsRegistry,
@@ -330,7 +331,7 @@ func run(flags *serverFlags) error {
 	// group), in which case raftadmin.Server skips the pre-step.
 	encryptionConfChangeInterceptor := newEncryptionConfChangeInterceptor(
 		encWiring.encryptionConfigured(),
-		coordinate, shardGroups[cfg.defaultGroup], encWiring.cache, *encryptionSidecarPath, etcdraftengine.DeriveNodeID)
+		coordinate, shardGroups[cfg.defaultGroup], encWiring.cache, flags.encryption.sidecarPath, etcdraftengine.DeriveNodeID)
 	rotateOnStartupDeregister, waitRotateOnStartup := installBootstrapStartupRotation(distStartup.rotationSupervisor, runCtx, encryptionStartup)
 	cleanup.Add(rotateOnStartupDeregister)
 	return serveStartedRuntime(waitRotateOnStartup, serversInput{
@@ -343,6 +344,7 @@ func run(flags *serverFlags) error {
 		cleanup:                         &cleanup,
 		s3BlobBackfiller:                s3BlobBackfiller,
 		encWiring:                       encWiring,
+		encryption:                      flags.encryption,
 		kekConfigured:                   kekUnwrapper != nil,
 		keyvizSampler:                   sampler,
 		autoSplitRuntime:                autoSplitRuntime,

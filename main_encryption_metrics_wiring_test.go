@@ -136,27 +136,13 @@ func (o *countingKEKObserver) total() int {
 // elastickv_encryption_kek_unwrap_seconds empty despite completed KMS
 // calls, so the decorator must wrap the source before they run.
 func TestTimedKEKUnwrapperCoversStartupPreflightUnwraps(t *testing.T) {
-	previousEnabled := *encryptionEnabled
-	previousSidecar := *encryptionSidecarPath
-	previousFile := *kekFile
-	previousURI := *kekURI
-	t.Cleanup(func() {
-		*encryptionEnabled = previousEnabled
-		*encryptionSidecarPath = previousSidecar
-		*kekFile = previousFile
-		*kekURI = previousURI
-	})
-
 	// A fresh node: the KEK comes from the environment and the sidecar
 	// does not exist yet, so the KEK preflight is the only unwrap.
 	t.Setenv(kek.EnvVar, base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x5a}, encryption.KeySize)))
-	*kekFile = ""
-	*kekURI = ""
-	*encryptionEnabled = true
-	*encryptionSidecarPath = filepath.Join(t.TempDir(), encryption.SidecarFilename)
+	f := encryptionFlags{enabled: true, sidecarPath: filepath.Join(t.TempDir(), encryption.SidecarFilename)}
 
 	obs := &countingKEKObserver{}
-	wrapper, err := loadKEKAndRunStartupGuards(obs)
+	wrapper, err := loadKEKAndRunStartupGuards(f, obs)
 	require.NoError(t, err)
 	require.NotNil(t, wrapper)
 	require.Positive(t, obs.total(),

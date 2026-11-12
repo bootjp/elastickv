@@ -47,6 +47,7 @@ type serversInput struct {
 	metricsRegistry    *monitoring.Registry
 	cfg                runtimeConfig
 	encWiring          encryptionWriteWiring
+	encryption         encryptionFlags
 	kekConfigured      bool
 	redisApplyObserver *adapter.RedisApplyObserver
 	cleanup            *internalutil.CleanupStack
@@ -128,6 +129,7 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 		pubsubRelay:        adapter.NewRedisPubSubRelay(),
 		readTracker:        in.readTracker,
 		encWiring:          in.encWiring,
+		encryption:         in.encryption,
 		kekConfigured:      in.kekConfigured,
 		defaultGroupID:     in.cfg.defaultGroup,
 		redisApplyObserver: in.redisApplyObserver,
@@ -242,6 +244,7 @@ type runtimeServerRunner struct {
 	redisApplyObserver              *adapter.RedisApplyObserver
 	s3BlobBackfiller                *adapter.S3BlobBackfiller
 	encWiring                       encryptionWriteWiring
+	encryption                      encryptionFlags
 	kekConfigured                   bool
 	defaultGroupID                  uint64
 	dynamoAddress                   string
@@ -381,6 +384,7 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 		sqsPartitionResolver,
 		r.routeEngine,
 		r.readTracker,
+		r.encryption,
 		r.kekConfigured,
 		r.defaultGroupID,
 		r.metricsRegistry.S3BlobOffloadObserver(),
