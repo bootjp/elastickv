@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/stretchr/testify/require"
 )
@@ -65,7 +66,7 @@ func TestRaftJoinRuntimesReady(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			ready, err := raftJoinRuntimesReady(context.Background(), []*raftGroupRuntime{{
-				spec:   groupSpec{id: 1},
+				spec:   noderuntime.GroupSpec{ID: 1},
 				engine: tc.engine,
 			}}, "n2")
 			require.NoError(t, err)
@@ -78,7 +79,7 @@ func TestRaftJoinRuntimesReadyReturnsConfigurationError(t *testing.T) {
 	t.Parallel()
 	readErr := errors.New("configuration unavailable")
 	ready, err := raftJoinRuntimesReady(context.Background(), []*raftGroupRuntime{{
-		spec:   groupSpec{id: 7},
+		spec:   noderuntime.GroupSpec{ID: 7},
 		engine: &raftJoinReadyEngineStub{err: readErr},
 	}}, "n2")
 	require.False(t, ready)
@@ -100,7 +101,7 @@ func TestPreparePublicServicesAfterRaftJoinReadyDoesNotBindWhileJoinIsUnready(t 
 	err := preparePublicServicesAfterRaftJoinReady(
 		ctx,
 		[]*raftGroupRuntime{{
-			spec: groupSpec{id: 1},
+			spec: noderuntime.GroupSpec{ID: 1},
 			engine: &raftJoinReadyEngineStub{
 				status: raftengine.Status{Leader: raftengine.LeaderInfo{ID: "n1"}},
 			},

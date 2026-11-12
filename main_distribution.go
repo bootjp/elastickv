@@ -8,6 +8,7 @@ import (
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/distribution/autosplit"
 	internalutil "github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/internal/serverwiring"
 	"github.com/bootjp/elastickv/keyviz"
@@ -33,7 +34,7 @@ type distributionStartupInput struct {
 	cancel          context.CancelFunc
 	cleanup         *internalutil.CleanupStack
 	runtimes        []*raftGroupRuntime
-	cfg             runtimeConfig
+	cfg             noderuntime.RuntimeConfig
 	raftDir         string
 	coordinate      *kv.ShardedCoordinator
 	shardStore      *kv.ShardStore
@@ -74,8 +75,8 @@ func startDistributionStartup(in distributionStartupInput) (distributionStartup,
 	}
 	internalutil.ConfigureGRPCForwardToken(auth.migrationToken)
 	distCatalog, catalogRuntime, defaultRuntime, err := setupDistributionRuntimeDependencies(
-		in.ctx, in.eg, in.runtimes, in.cfg.engine,
-		in.coordinate, in.defaultGroup, in.cfg.defaultGroup,
+		in.ctx, in.eg, in.runtimes, in.cfg.Engine,
+		in.coordinate, in.defaultGroup, in.cfg.DefaultGroup,
 		in.encWiring, in.raftID, in.sidecarPath)
 	if err != nil {
 		in.cancel()
@@ -87,12 +88,12 @@ func startDistributionStartup(in distributionStartupInput) (distributionStartup,
 	// with durable non-zero RouteIDs; seeding earlier would register
 	// the placeholder zero IDs from buildEngine and Observe would miss
 	// every dispatched mutation.
-	serverwiring.SeedRoutes(in.sampler, in.cfg.engine)
+	serverwiring.SeedRoutes(in.sampler, in.cfg.Engine)
 
 	catalogWatchConns := newBootstrapRuntimeConnCache(in.runtimes)
 	in.cleanup.Add(func() { _ = catalogWatchConns.Close() })
 	in.eg.Go(func() error {
-		return runDistributionCatalogStream(in.ctx, catalogRuntime, catalogWatchConns, in.cfg.engine)
+		return runDistributionCatalogStream(in.ctx, catalogRuntime, catalogWatchConns, in.cfg.Engine)
 	})
 	serverwiring.StartFlusher(in.ctx, in.eg, in.sampler)
 	startKeyVizLeaderTermPublisher(in.ctx, in.eg, in.sampler, in.runtimes)
@@ -100,7 +101,7 @@ func startDistributionStartup(in distributionStartupInput) (distributionStartup,
 	splitMigrationConnCache := newBootstrapRuntimeConnCache(in.runtimes)
 	in.cleanup.Add(func() { _ = splitMigrationConnCache.Close() })
 	distServer := adapter.NewDistributionServer(
-		in.cfg.engine,
+		in.cfg.Engine,
 		distCatalog,
 		adapter.WithDistributionCoordinator(in.coordinate),
 		adapter.WithDistributionTimestampAllocator(in.tsoWiring.serverAllocator),
@@ -111,7 +112,7 @@ func startDistributionStartup(in distributionStartupInput) (distributionStartup,
 			return engine != nil && engine.State() == raftengine.StateLeader
 		}),
 		adapter.WithDistributionFilesystemObserver(in.metricsRegistry.FileSystemObserver()),
-		adapter.WithDistributionKnownRaftGroups(shardGroupIDs(in.shardGroups)...),
+		adapter.WithDistributionKnownRaftGroups(noderuntime.ShardGroupIDs(in.shardGroups)...),
 		adapter.WithSplitMigrationCapabilityGate(newSplitMigrationCapabilityGate(
 			splitMigrationCapabilityPeerSourceForRuntimes(in.runtimes),
 			splitMigrationCapabilityProbeTimeout,
@@ -152,7 +153,7 @@ func startDistributionStartup(in distributionStartupInput) (distributionStartup,
 		in.ctx,
 		in.eg,
 		distCatalog,
-		in.cfg.engine,
+		in.cfg.Engine,
 		distServer,
 		in.coordinate,
 		in.sampler,
@@ -170,7 +171,7 @@ func startDistributionStartup(in distributionStartupInput) (distributionStartup,
 	// destination and silently got no backups is worse off than one
 	// whose node refused to start.
 	if err := startSnapshotOffload(
-		in.ctx, in.eg, in.snapshotOffload, in.runtimes, in.raftDir, in.raftID, in.cfg.multi,
+		in.ctx, in.eg, in.snapshotOffload, in.runtimes, in.raftDir, in.raftID, in.cfg.Multi,
 		in.metricsRegistry.SnapshotOffloadObserver(), slog.Default(),
 	); err != nil {
 		in.cancel()
@@ -201,7 +202,7 @@ func distributionCatalogStoreForGroup(runtimes []*raftGroupRuntime, groupID uint
 		if rt == nil || rt.store == nil {
 			continue
 		}
-		if rt.spec.id == groupID {
+		if rt.spec.ID == groupID {
 			return distribution.NewCatalogStore(rt.store,
 				distribution.WithCatalogRouteDescriptorV2Writes(true),
 				distribution.WithCatalogMigrationStoreResolver(catalogMigrationStoreResolver(runtimes)),
@@ -218,7 +219,7 @@ func catalogMigrationStoreResolver(runtimes []*raftGroupRuntime) distribution.Ca
 			if rt == nil || rt.store == nil {
 				continue
 			}
-			if rt.spec.id == groupID {
+			if rt.spec.ID == groupID {
 				return rt.store, nil
 			}
 		}
@@ -229,7 +230,7 @@ func catalogMigrationStoreResolver(runtimes []*raftGroupRuntime) distribution.Ca
 func catalogMigrationRetireResolver(runtimes []*raftGroupRuntime) distribution.CatalogMigrationRetireResolver {
 	return func(ctx context.Context, groupID, jobID uint64) error {
 		for _, rt := range runtimes {
-			if rt == nil || rt.spec.id != groupID {
+			if rt == nil || rt.spec.ID != groupID {
 				continue
 			}
 			engine := rt.snapshotEngine()

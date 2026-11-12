@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/stretchr/testify/require"
 )
@@ -366,11 +367,11 @@ func TestInstallSQSLeadershipRefusalAcrossGroups_ComposesDeregisters(t *testing.
 	admin1 := &fakeLeadershipController{state: raftengine.StateFollower}
 	admin2 := &fakeLeadershipController{state: raftengine.StateFollower}
 	runtimes := []*raftGroupRuntime{
-		{spec: groupSpec{id: 10}, engine: admin1},
-		{spec: groupSpec{id: 11}, engine: admin2},
+		{spec: noderuntime.GroupSpec{ID: 10}, engine: admin1},
+		{spec: noderuntime.GroupSpec{ID: 11}, engine: admin2},
 	}
-	partitionMap := map[string]sqsFifoQueueRouting{
-		"q.fifo": {partitionCount: 2, groups: []string{"10", "11"}},
+	partitionMap := map[string]noderuntime.SQSFifoQueueRouting{
+		"q.fifo": {PartitionCount: 2, Groups: []string{"10", "11"}},
 	}
 	dereg := installSQSLeadershipRefusalAcrossGroups(
 		context.Background(), runtimes, partitionMap,
@@ -396,7 +397,7 @@ func TestInstallSQSLeadershipRefusalAcrossGroups_NoPartitionedQueueIsNoOp(t *tes
 	t.Parallel()
 	admin := &fakeLeadershipController{state: raftengine.StateFollower}
 	runtimes := []*raftGroupRuntime{
-		{spec: groupSpec{id: 10}, engine: admin},
+		{spec: noderuntime.GroupSpec{ID: 10}, engine: admin},
 	}
 	dereg := installSQSLeadershipRefusalAcrossGroups(
 		context.Background(), runtimes, nil, // empty partition map
@@ -416,14 +417,14 @@ func TestInstallSQSLeadershipRefusalAcrossGroups_SkipsNilRuntimes(t *testing.T) 
 	t.Parallel()
 	admin := &fakeLeadershipController{state: raftengine.StateFollower}
 	runtimes := []*raftGroupRuntime{
-		nil,                                      // entire entry nil
-		{spec: groupSpec{id: 11}, engine: nil},   // engine nil
-		{spec: groupSpec{id: 10}, engine: admin}, // valid
+		nil, // entire entry nil
+		{spec: noderuntime.GroupSpec{ID: 11}, engine: nil},   // engine nil
+		{spec: noderuntime.GroupSpec{ID: 10}, engine: admin}, // valid
 	}
 	dereg := installSQSLeadershipRefusalAcrossGroups(
 		context.Background(), runtimes,
-		map[string]sqsFifoQueueRouting{
-			"q.fifo": {partitionCount: 1, groups: []string{"10"}},
+		map[string]noderuntime.SQSFifoQueueRouting{
+			"q.fifo": {PartitionCount: 1, Groups: []string{"10"}},
 		},
 		false,
 		slog.Default(),
@@ -450,13 +451,13 @@ type engineWithoutAcquiredObserver struct {
 func TestInstallSQSLeadershipRefusalAcrossGroups_SkipsEngineWithoutObserver(t *testing.T) {
 	t.Parallel()
 	runtimes := []*raftGroupRuntime{
-		{spec: groupSpec{id: 10}, engine: &engineWithoutAcquiredObserver{}},
+		{spec: noderuntime.GroupSpec{ID: 10}, engine: &engineWithoutAcquiredObserver{}},
 	}
 	require.NotPanics(t, func() {
 		dereg := installSQSLeadershipRefusalAcrossGroups(
 			context.Background(), runtimes,
-			map[string]sqsFifoQueueRouting{
-				"q.fifo": {partitionCount: 1, groups: []string{"10"}},
+			map[string]noderuntime.SQSFifoQueueRouting{
+				"q.fifo": {PartitionCount: 1, Groups: []string{"10"}},
 			},
 			false,
 			slog.Default(),
@@ -470,9 +471,9 @@ func TestInstallSQSLeadershipRefusalAcrossGroups_SkipsEngineWithoutObserver(t *t
 // {gid → bool} set the leadership-refusal hook consumes.
 func TestPartitionedGroupSet_FlattensRouting(t *testing.T) {
 	t.Parallel()
-	in := map[string]sqsFifoQueueRouting{
-		"orders.fifo": {partitionCount: 4, groups: []string{"10", "11", "12", "13"}},
-		"events.fifo": {partitionCount: 2, groups: []string{"20", "21"}},
+	in := map[string]noderuntime.SQSFifoQueueRouting{
+		"orders.fifo": {PartitionCount: 4, Groups: []string{"10", "11", "12", "13"}},
+		"events.fifo": {PartitionCount: 2, Groups: []string{"20", "21"}},
 	}
 	got := partitionedGroupSet(in, slog.Default())
 	require.Equal(t, map[uint64]bool{
@@ -487,7 +488,7 @@ func TestPartitionedGroupSet_FlattensRouting(t *testing.T) {
 func TestPartitionedGroupSet_EmptyReturnsNil(t *testing.T) {
 	t.Parallel()
 	require.Nil(t, partitionedGroupSet(nil, slog.Default()))
-	require.Nil(t, partitionedGroupSet(map[string]sqsFifoQueueRouting{}, slog.Default()))
+	require.Nil(t, partitionedGroupSet(map[string]noderuntime.SQSFifoQueueRouting{}, slog.Default()))
 }
 
 // TestPartitionedGroupSet_SkipsMalformedGroupRef pins the
@@ -496,8 +497,8 @@ func TestPartitionedGroupSet_EmptyReturnsNil(t *testing.T) {
 // does not panic. The valid groups still end up in the set.
 func TestPartitionedGroupSet_SkipsMalformedGroupRef(t *testing.T) {
 	t.Parallel()
-	in := map[string]sqsFifoQueueRouting{
-		"q.fifo": {partitionCount: 2, groups: []string{"42", "not-a-uint64"}},
+	in := map[string]noderuntime.SQSFifoQueueRouting{
+		"q.fifo": {PartitionCount: 2, Groups: []string{"42", "not-a-uint64"}},
 	}
 	got := partitionedGroupSet(in, slog.Default())
 	require.Equal(t, map[uint64]bool{42: true}, got,

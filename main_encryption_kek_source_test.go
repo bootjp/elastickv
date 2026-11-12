@@ -12,6 +12,7 @@ import (
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryption/fsmwire"
 	"github.com/bootjp/elastickv/internal/encryption/kek"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 )
@@ -107,7 +108,7 @@ func TestEnvKEKBootstrapCutoverSnapshotRestore(t *testing.T) {
 	dir := t.TempDir()
 	sidecarPath := dir + "/keys.json"
 	keystore := encryption.NewKeystore()
-	wiring, err := buildEncryptionWriteWiring(true, "n1", sidecarPath, wrapper, keystore, []groupSpec{{id: 1}}, nil)
+	wiring, err := buildEncryptionWriteWiring(true, "n1", sidecarPath, wrapper, keystore, []noderuntime.GroupSpec{{ID: 1}}, nil)
 	require.NoError(t, err)
 	source, err := store.NewPebbleStore(dir+"/source", wiring.pebbleOptions()...)
 	require.NoError(t, err)
@@ -163,19 +164,19 @@ func TestEncryptionFlagsBootstrapRequest(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		flags encryptionFlags
-		want  bootstrapEncryptionRequest
+		want  noderuntime.BootstrapEncryptionRequest
 	}{
-		{"off", encryptionFlags{}, bootstrapEncryptionRequest{}},
-		{"kek only", encryptionFlags{kekFile: "kek"}, bootstrapEncryptionRequest{}},
-		{"enabled", encryptionFlags{enabled: true}, bootstrapEncryptionRequest{configured: true}},
-		{"sidecar", encryptionFlags{sidecarPath: "keys.json"}, bootstrapEncryptionRequest{configured: true}},
-		{"rotation", encryptionFlags{rotateOnStartup: true}, bootstrapEncryptionRequest{rotateOnStartup: true}},
+		{"off", encryptionFlags{}, noderuntime.BootstrapEncryptionRequest{}},
+		{"kek only", encryptionFlags{kekFile: "kek"}, noderuntime.BootstrapEncryptionRequest{}},
+		{"enabled", encryptionFlags{enabled: true}, noderuntime.BootstrapEncryptionRequest{Configured: true}},
+		{"sidecar", encryptionFlags{sidecarPath: "keys.json"}, noderuntime.BootstrapEncryptionRequest{Configured: true}},
+		{"rotation", encryptionFlags{rotateOnStartup: true}, noderuntime.BootstrapEncryptionRequest{RotateOnStartup: true}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			got := tc.flags.bootstrapRequest()
 			require.Equal(t, tc.want, got)
-			require.Equal(t, tc.want != bootstrapEncryptionRequest{}, got.requested())
+			require.Equal(t, tc.want != noderuntime.BootstrapEncryptionRequest{}, got.Requested())
 		})
 	}
 }

@@ -1,4 +1,4 @@
-package main
+package noderuntime
 
 import (
 	"bytes"
@@ -12,9 +12,9 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-type groupSpec struct {
-	id      uint64
-	address string
+type GroupSpec struct {
+	ID      uint64
+	Address string
 }
 
 type rangeSpec struct {
@@ -25,7 +25,7 @@ type rangeSpec struct {
 
 const (
 	splitParts              = 2
-	dedicatedTSORaftGroupID = 0
+	DedicatedTSORaftGroupID = 0
 )
 
 var (
@@ -54,25 +54,25 @@ var (
 // raising this value.
 const sqsFifoPartitionMaxPartitions = 32
 
-// sqsFifoQueueRouting captures the operator-supplied partition-to-
+// SQSFifoQueueRouting captures the operator-supplied partition-to-
 // group assignment for a single FIFO queue. Groups are listed in
 // partition-index order — Groups[k] owns partition k. The validator
 // (validateSQSFifoPartitionMap) checks that PartitionCount matches
 // len(Groups), is a power of two, and is within the per-queue cap.
-type sqsFifoQueueRouting struct {
-	partitionCount uint32
-	groups         []string
+type SQSFifoQueueRouting struct {
+	PartitionCount uint32
+	Groups         []string
 }
 
-func parseRaftGroups(raw, defaultAddr string) ([]groupSpec, error) {
+func parseRaftGroups(raw, defaultAddr string) ([]GroupSpec, error) {
 	if raw == "" {
 		if defaultAddr == "" {
 			return nil, errors.WithStack(ErrAddressRequired)
 		}
-		return []groupSpec{{id: 1, address: defaultAddr}}, nil
+		return []GroupSpec{{ID: 1, Address: defaultAddr}}, nil
 	}
 	parts := strings.Split(raw, ",")
-	groups := make([]groupSpec, 0, len(parts))
+	groups := make([]GroupSpec, 0, len(parts))
 	seen := map[uint64]struct{}{}
 	for _, part := range parts {
 		part = strings.TrimSpace(part)
@@ -96,7 +96,7 @@ func parseRaftGroups(raw, defaultAddr string) ([]groupSpec, error) {
 			return nil, errors.Wrapf(ErrInvalidRaftGroupsEntry, "duplicate group id %d", id)
 		}
 		seen[id] = struct{}{}
-		groups = append(groups, groupSpec{id: id, address: addr})
+		groups = append(groups, GroupSpec{ID: id, Address: addr})
 	}
 	if len(groups) == 0 {
 		return nil, errors.WithStack(ErrNoRaftGroupsConfigured)
@@ -177,8 +177,8 @@ func parseRaftSQSMap(raw string) (map[string]string, error) {
 // validateSQSFifoPartitionMap's job and runs against the parsed
 // runtime config after both --raftGroups and --sqsFifoPartitionMap
 // have been parsed.
-func parseSQSFifoPartitionMap(raw string) (map[string]sqsFifoQueueRouting, error) {
-	out := make(map[string]sqsFifoQueueRouting)
+func parseSQSFifoPartitionMap(raw string) (map[string]SQSFifoQueueRouting, error) {
+	out := make(map[string]SQSFifoQueueRouting)
 	if raw == "" {
 		return out, nil
 	}
@@ -201,28 +201,28 @@ func parseSQSFifoPartitionMap(raw string) (map[string]sqsFifoQueueRouting, error
 	return out, nil
 }
 
-func parseSQSFifoPartitionMapEntry(entry string) (string, sqsFifoQueueRouting, error) {
+func parseSQSFifoPartitionMapEntry(entry string) (string, SQSFifoQueueRouting, error) {
 	// Shape: queue.fifo:N=g0,g1,...,g{N-1}
 	colonIdx := strings.Index(entry, ":")
 	eqIdx := strings.Index(entry, "=")
 	if colonIdx <= 0 || eqIdx <= colonIdx+1 {
-		return "", sqsFifoQueueRouting{}, errors.Wrapf(ErrInvalidSQSFifoPartitionMapEntry,
+		return "", SQSFifoQueueRouting{}, errors.Wrapf(ErrInvalidSQSFifoPartitionMapEntry,
 			"%q: expected queue.fifo:N=group_0,...,group_{N-1}", entry)
 	}
 	queue := strings.TrimSpace(entry[:colonIdx])
 	if queue == "" {
-		return "", sqsFifoQueueRouting{}, errors.Wrapf(ErrInvalidSQSFifoPartitionMapEntry,
+		return "", SQSFifoQueueRouting{}, errors.Wrapf(ErrInvalidSQSFifoPartitionMapEntry,
 			"%q: empty queue name", entry)
 	}
 	count, err := parseSQSFifoPartitionCount(entry, entry[colonIdx+1:eqIdx])
 	if err != nil {
-		return "", sqsFifoQueueRouting{}, err
+		return "", SQSFifoQueueRouting{}, err
 	}
 	groups, err := parseSQSFifoGroupList(entry, entry[eqIdx+1:], count)
 	if err != nil {
-		return "", sqsFifoQueueRouting{}, err
+		return "", SQSFifoQueueRouting{}, err
 	}
-	return queue, sqsFifoQueueRouting{partitionCount: count, groups: groups}, nil
+	return queue, SQSFifoQueueRouting{PartitionCount: count, Groups: groups}, nil
 }
 
 // parseSQSFifoPartitionCount validates the N in `queue.fifo:N=...`.
@@ -311,7 +311,7 @@ func parseSQSFifoGroupList(entry, groupRaw string, count uint32) ([]string, erro
 // parseRaftGroups; partition-map group references are normalized to
 // the same canonical form by parseSQSFifoGroupList, so the lookup is
 // a plain set-membership check.
-func validateSQSFifoPartitionMap(m map[string]sqsFifoQueueRouting, raftGroupIDs map[string]struct{}) error {
+func validateSQSFifoPartitionMap(m map[string]SQSFifoQueueRouting, raftGroupIDs map[string]struct{}) error {
 	// Sort the queue names so a config with multiple misconfigured
 	// queues always reports the lexicographically-first failure —
 	// otherwise Go's randomised map iteration would surface a
@@ -319,7 +319,7 @@ func validateSQSFifoPartitionMap(m map[string]sqsFifoQueueRouting, raftGroupIDs 
 	// (and golden-test asserts) flaky for no benefit.
 	for _, queue := range slices.Sorted(maps.Keys(m)) {
 		routing := m[queue]
-		for partition, group := range routing.groups {
+		for partition, group := range routing.Groups {
 			if _, ok := raftGroupIDs[group]; !ok {
 				return errors.Wrapf(ErrInvalidSQSFifoPartitionMapEntry,
 					"queue %q partition %d: group %q is not in --raftGroups",
@@ -355,6 +355,9 @@ func parseRaftAddressMap(raw string, invalidEntry error) (map[string]string, err
 	return out, nil
 }
 
+// VoterSuffrage is the raftengine.Server suffrage of a bootstrap voter.
+const VoterSuffrage = "voter"
+
 func parseRaftBootstrapMembers(raw string) ([]raftengine.Server, error) {
 	servers := make([]raftengine.Server, 0)
 	if raw == "" {
@@ -381,7 +384,7 @@ func parseRaftBootstrapMembers(raw string) ([]raftengine.Server, error) {
 		}
 		seen[id] = struct{}{}
 		servers = append(servers, raftengine.Server{
-			Suffrage: shutdownVoterSuffrage,
+			Suffrage: VoterSuffrage,
 			ID:       id,
 			Address:  addr,
 		})
@@ -480,14 +483,14 @@ func parseRaftGroupPeer(entry, part string) (raftengine.Server, error) {
 	}, nil
 }
 
-func defaultGroupID(groups []groupSpec) uint64 {
+func DefaultGroupID(groups []GroupSpec) uint64 {
 	min := uint64(0)
 	for _, g := range groups {
-		if g.id == dedicatedTSORaftGroupID {
+		if g.ID == DedicatedTSORaftGroupID {
 			continue
 		}
-		if min == 0 || g.id < min {
-			min = g.id
+		if min == 0 || g.ID < min {
+			min = g.ID
 		}
 	}
 	if min == 0 {
@@ -496,33 +499,33 @@ func defaultGroupID(groups []groupSpec) uint64 {
 	return min
 }
 
-func dataGroupIDs(groups []groupSpec) []uint64 {
+func DataGroupIDs(groups []GroupSpec) []uint64 {
 	ids := make([]uint64, 0, len(groups))
 	for _, g := range groups {
-		if g.id == dedicatedTSORaftGroupID {
+		if g.ID == DedicatedTSORaftGroupID {
 			continue
 		}
-		ids = append(ids, g.id)
+		ids = append(ids, g.ID)
 	}
 	slices.Sort(ids)
 	return slices.Compact(ids)
 }
 
-func dataGroupsNeedMultiDirs(groups []groupSpec) bool {
-	return len(dataGroupIDs(groups)) > 1
+func dataGroupsNeedMultiDirs(groups []GroupSpec) bool {
+	return len(DataGroupIDs(groups)) > 1
 }
 
-func effectiveMultiDataDirs(groups []groupSpec, requested bool) bool {
+func EffectiveMultiDataDirs(groups []GroupSpec, requested bool) bool {
 	return requested && dataGroupsNeedMultiDirs(groups)
 }
 
-func validateShardRanges(ranges []rangeSpec, groups []groupSpec) error {
+func validateShardRanges(ranges []rangeSpec, groups []GroupSpec) error {
 	ids := map[uint64]struct{}{}
 	for _, g := range groups {
-		ids[g.id] = struct{}{}
+		ids[g.ID] = struct{}{}
 	}
 	for _, r := range ranges {
-		if r.groupID == dedicatedTSORaftGroupID {
+		if r.groupID == DedicatedTSORaftGroupID {
 			return errors.Wrapf(ErrShardRangeReservedTSOGroup, "group %d", r.groupID)
 		}
 		if _, ok := ids[r.groupID]; !ok {

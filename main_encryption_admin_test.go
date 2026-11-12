@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/encryption"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/bootjp/elastickv/kv"
@@ -129,8 +130,8 @@ func TestEncryptionAdminDefaultRuntimeOptionsUsesDefaultGroupRuntime(t *testing.
 
 	got, err := encryptionAdminDefaultRuntimeOptions(
 		[]*raftGroupRuntime{
-			{spec: groupSpec{id: 1}, engine: defaultEngine},
-			{spec: groupSpec{id: 2}, engine: otherEngine},
+			{spec: noderuntime.GroupSpec{ID: 1}, engine: defaultEngine},
+			{spec: noderuntime.GroupSpec{ID: 2}, engine: otherEngine},
 		},
 		map[uint64]*kv.ShardGroup{
 			1: defaultGroup,

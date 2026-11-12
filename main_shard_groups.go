@@ -9,6 +9,7 @@ import (
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryption/kek"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/bootjp/elastickv/kv"
@@ -61,7 +62,7 @@ func startRaftEngineLifecycleWatchers(ctx context.Context, eg *errgroup.Group, r
 		if done == nil {
 			continue
 		}
-		groupID := rt.spec.id
+		groupID := rt.spec.ID
 		eg.Go(func() error {
 			select {
 			case <-ctx.Done():
@@ -84,10 +85,10 @@ func startRaftEngineLifecycleWatchers(ctx context.Context, eg *errgroup.Group, r
 func buildShardGroups(
 	raftID string,
 	raftDir string,
-	groups []groupSpec,
+	groups []noderuntime.GroupSpec,
 	multi bool,
 	bootstrap bool,
-	bootstrapCfg raftBootstrapConfig,
+	bootstrapCfg noderuntime.BootstrapConfig,
 	factory raftengine.Factory,
 	proposalObserverForGroup func(uint64) kv.ProposalObserver,
 	clock *kv.HLC,
@@ -105,7 +106,7 @@ func buildShardGroups(
 	// NewApplier install a private per-applier cache, silently
 	// breaking the shared-cache invariant 6D-6c-1 relies on.
 	encWiring = encWiring.withDefaultedCache()
-	multi = effectiveMultiDataDirs(groups, multi)
+	multi = noderuntime.EffectiveMultiDataDirs(groups, multi)
 	bootstrapSpecs, bootstrapDomain, err := loadProtectedBootstrapDomain(raftID, raftDir, groups, multi, bootstrapCfg, encWiring)
 	if err != nil {
 		return nil, nil, err
@@ -140,10 +141,10 @@ func buildShardGroups(
 			return nil, nil, err
 		}
 		runtimes = append(runtimes, runtime)
-		shardGroups[g.id] = sg
-		encWiring.attachRaftEnvelopeGroup(g.id, sg)
+		shardGroups[g.ID] = sg
+		encWiring.attachRaftEnvelopeGroup(g.ID, sg)
 		if bootstrapDomain != nil {
-			if err := bootstrapDomain.attachEncryptionGroup(g.id, sg); err != nil {
+			if err := bootstrapDomain.attachEncryptionGroup(g.ID, sg); err != nil {
 				closeRaftGroupRuntimes(runtimes)
 				bootstrapDomain.admission.Close()
 				return nil, nil, err
@@ -158,7 +159,7 @@ type shardGroupBuilder struct {
 	raftDir                  string
 	multi                    bool
 	bootstrap                bool
-	bootstrapCfg             raftBootstrapConfig
+	bootstrapCfg             noderuntime.BootstrapConfig
 	factory                  raftengine.Factory
 	proposalObserverForGroup func(uint64) kv.ProposalObserver
 	clock                    *kv.HLC
@@ -172,20 +173,20 @@ type shardGroupBuilder struct {
 	bootstrapSpecs           map[uint64]*groupBootstrapSpec
 }
 
-func (b shardGroupBuilder) build(group groupSpec) (*raftGroupRuntime, *kv.ShardGroup, error) {
-	groupBootstrap, groupBootstrapServers, groupBootstrapSeed := bootstrapSettingsForGroup(b.bootstrapCfg, group.id, b.bootstrap)
-	observer := observerForGroup(b.proposalObserverForGroup, group.id)
-	if group.id == dedicatedTSORaftGroupID {
-		if spec := b.bootstrapSpecs[group.id]; spec != nil {
-			return buildProtectedDedicatedTSOGroup(b.raftID, group, b.raftDir, b.multi, groupBootstrap, b.bootstrapCfg.joinAsLearner,
+func (b shardGroupBuilder) build(group noderuntime.GroupSpec) (*raftGroupRuntime, *kv.ShardGroup, error) {
+	groupBootstrap, groupBootstrapServers, groupBootstrapSeed := noderuntime.BootstrapSettingsForGroup(b.bootstrapCfg, group.ID, b.bootstrap)
+	observer := observerForGroup(b.proposalObserverForGroup, group.ID)
+	if group.ID == noderuntime.DedicatedTSORaftGroupID {
+		if spec := b.bootstrapSpecs[group.ID]; spec != nil {
+			return buildProtectedDedicatedTSOGroup(b.raftID, group, b.raftDir, b.multi, groupBootstrap, b.bootstrapCfg.JoinAsLearner,
 				groupBootstrapServers, groupBootstrapSeed, b.factory, b.clock, observer,
 				spec, spec.domain, bootstrapPublicGRPCMethods(), b.encWiring.pebbleOptions()...)
 		}
-		if b.bootstrapCfg.peerConfigDir != "" {
+		if b.bootstrapCfg.PeerConfigDir != "" {
 			return nil, nil, errors.New("protected timestamp group missing bootstrap domain configuration")
 		}
 		runtime, sg, err := buildDedicatedTSOGroup(
-			b.raftID, group, b.raftDir, b.multi, groupBootstrap, b.bootstrapCfg.joinAsLearner,
+			b.raftID, group, b.raftDir, b.multi, groupBootstrap, b.bootstrapCfg.JoinAsLearner,
 			groupBootstrapServers, groupBootstrapSeed,
 			b.factory, b.clock, observer,
 		)
@@ -195,23 +196,23 @@ func (b shardGroupBuilder) build(group groupSpec) (*raftGroupRuntime, *kv.ShardG
 }
 
 func (b shardGroupBuilder) buildDataGroup(
-	group groupSpec,
+	group noderuntime.GroupSpec,
 	bootstrap bool,
 	bootstrapServers []raftengine.Server,
 	bootstrapSeed []raftengine.Server,
 	proposalObserver kv.ProposalObserver,
 ) (*raftGroupRuntime, *kv.ShardGroup, error) {
-	dir := groupDataDir(b.raftDir, b.raftID, group.id, b.multi)
-	bootstrapSpec, err := b.bootstrapSpecForGroup(group.id)
+	dir := groupDataDir(b.raftDir, b.raftID, group.ID, b.multi)
+	bootstrapSpec, err := b.bootstrapSpecForGroup(group.ID)
 	if err != nil {
 		return nil, nil, err
 	}
 	if err := os.MkdirAll(dir, dirPerm); err != nil {
-		return nil, nil, errors.Wrapf(err, "failed to create fsm store dir for group %d", group.id)
+		return nil, nil, errors.Wrapf(err, "failed to create fsm store dir for group %d", group.ID)
 	}
 	st, err := store.NewPebbleStore(filepath.Join(dir, "fsm.db"), b.encWiring.pebbleOptions()...)
 	if err != nil {
-		return nil, nil, errors.Wrapf(err, "failed to open pebble fsm store for group %d", group.id)
+		return nil, nil, errors.Wrapf(err, "failed to open pebble fsm store for group %d", group.ID)
 	}
 	factory, err := bootstrapFactoryForGroup(b.factory, bootstrapSpec, st)
 	if err != nil {
@@ -221,23 +222,23 @@ func (b shardGroupBuilder) buildDataGroup(
 	reg, err := store.WriterRegistryFor(st)
 	if err != nil {
 		_ = st.Close()
-		return nil, nil, errors.Wrapf(err, "failed to construct writer registry for group %d", group.id)
+		return nil, nil, errors.Wrapf(err, "failed to construct writer registry for group %d", group.ID)
 	}
 	applierOpts := encryptionApplierOptionsFor(b.kekWrapper, b.keystore, b.sidecarPath, b.encWiring)
 	applier, err := encryption.NewApplier(reg, applierOpts...)
 	if err != nil {
 		_ = st.Close()
-		return nil, nil, errors.Wrapf(err, "failed to construct encryption applier for group %d", group.id)
+		return nil, nil, errors.Wrapf(err, "failed to construct encryption applier for group %d", group.ID)
 	}
-	sm := b.newDataGroupFSM(st, applier, group.id, bootstrapSpec)
+	sm := b.newDataGroupFSM(st, applier, group.ID, bootstrapSpec)
 	runtime, err := buildRuntimeForGroup(
 		b.raftID, group, b.raftDir, b.multi, bootstrap,
 		bootstrapServers, bootstrapSeed,
-		st, sm, factory, b.bootstrapCfg.joinAsLearner,
+		st, sm, factory, b.bootstrapCfg.JoinAsLearner,
 	)
 	if err != nil {
 		_ = st.Close()
-		return nil, nil, errors.Wrapf(err, "failed to start raft group %d", group.id)
+		return nil, nil, errors.Wrapf(err, "failed to start raft group %d", group.ID)
 	}
 	// Every group goes through the wrap-aware proposer so HLC renewals and
 	// transactional proposals observe raft-envelope cutovers uniformly.
@@ -272,7 +273,7 @@ func closeRaftGroupRuntimes(runtimes []*raftGroupRuntime) {
 // participate in raft-envelope cutovers exactly like data-group proposals.
 func buildDedicatedTSOGroup(
 	raftID string,
-	group groupSpec,
+	group noderuntime.GroupSpec,
 	baseDir string,
 	multi bool,
 	bootstrap bool,
@@ -295,15 +296,6 @@ func buildDedicatedTSOGroup(
 	sg := &kv.ShardGroup{Engine: runtime.engine, TSOState: sm}
 	sg.Txn = kv.NewLeaderProxyForShardGroup(sg, kv.WithProposalObserver(proposalObserver))
 	return runtime, sg, nil
-}
-
-func bootstrapSettingsForGroup(
-	cfg raftBootstrapConfig,
-	groupID uint64,
-	explicitBootstrap bool,
-) (bool, []raftengine.Server, []raftengine.Server) {
-	servers := cfg.serversForGroup(groupID)
-	return explicitBootstrap || cfg.bootstrapsGroup(groupID), servers, cfg.bootstrapSeedForGroup(groupID)
 }
 
 func fsmOptionsForGroup(applier *encryption.Applier, routeEngine *distribution.Engine, groupID uint64, encWiring encryptionWriteWiring, applyObservers ...kv.ApplyObserver) []kv.FSMOption {
@@ -338,7 +330,7 @@ func observerForGroup(factory func(uint64) kv.ProposalObserver, groupID uint64) 
 // guarantee to the Internal.Forward path that follower-forwarded
 // writes ride (codex P1 round-1 r2).
 func proposerForGroup(rt *raftGroupRuntime, shardGroups map[uint64]*kv.ShardGroup) raftengine.Proposer {
-	if sg, ok := shardGroups[rt.spec.id]; ok && sg != nil {
+	if sg, ok := shardGroups[rt.spec.ID]; ok && sg != nil {
 		return sg.Proposer()
 	}
 	return rt.engine

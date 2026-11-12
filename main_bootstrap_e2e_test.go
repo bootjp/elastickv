@@ -16,6 +16,7 @@ import (
 
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	internalraftadmin "github.com/bootjp/elastickv/internal/raftadmin"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
@@ -84,7 +85,7 @@ func (n *bootstrapE2ENode) engineForGroup(groupID uint64) raftengine.Engine {
 		return nil
 	}
 	for _, rt := range n.runtimes {
-		if rt != nil && rt.spec.id == groupID {
+		if rt != nil && rt.spec.ID == groupID {
 			return rt.engine
 		}
 	}
@@ -542,15 +543,16 @@ func startBootstrapE2ENode(
 	bootstrapMembers string,
 	engineType raftEngineType,
 ) (*bootstrapE2ENode, error) {
-	cfg, err := parseRuntimeConfig(ep.raftAddr, ep.redisAddr, "", "", "", "", "", "", "", "", "", "")
+	cfg, err := noderuntime.ParseRuntimeConfig(ep.raftAddr, ep.redisAddr, "", "", "", "", "", "", "", "", "", "")
 	if err != nil {
 		return nil, err
 	}
 
-	bootstrapServers, err := resolveBootstrapServers(ep.id, cfg.groups, bootstrapMembers)
+	peerCfg, err := noderuntime.ResolveRaftPeerConfig(ep.id, cfg.Groups, bootstrapMembers, "", "", false, false)
 	if err != nil {
 		return nil, err
 	}
+	bootstrapServers := peerCfg.LegacyServers
 	bootstrap = bootstrap || len(bootstrapServers) > 0
 
 	factory, err := newRaftFactory(engineType, nil)
@@ -558,18 +560,18 @@ func startBootstrapE2ENode(
 		return nil, err
 	}
 	clock := kv.NewHLC()
-	runtimes, shardGroups, err := buildShardGroups(ep.id, baseDir, cfg.groups, cfg.multi, bootstrap,
-		raftBootstrapConfig{legacyServers: bootstrapServers}, factory, nil, clock, kv.NewActiveTimestampTracker(),
-		nil, nil, "", encryptionWriteWiring{}, cfg.engine)
+	runtimes, shardGroups, err := buildShardGroups(ep.id, baseDir, cfg.Groups, cfg.Multi, bootstrap,
+		noderuntime.BootstrapConfig{LegacyServers: bootstrapServers}, factory, nil, clock, kv.NewActiveTimestampTracker(),
+		nil, nil, "", encryptionWriteWiring{}, cfg.Engine)
 	if err != nil {
 		return nil, err
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	eg, runCtx := errgroup.WithContext(ctx)
-	shardStore := kv.NewShardStore(cfg.engine, shardGroups)
-	coordinate := kv.NewShardedCoordinator(cfg.engine, shardGroups, cfg.defaultGroup, clock, shardStore)
-	distCatalog, err := setupDistributionCatalog(runCtx, runtimes, cfg.engine)
+	shardStore := kv.NewShardStore(cfg.Engine, shardGroups)
+	coordinate := kv.NewShardedCoordinator(cfg.Engine, shardGroups, cfg.DefaultGroup, clock, shardStore)
+	distCatalog, err := setupDistributionCatalog(runCtx, runtimes, cfg.Engine)
 	if err != nil {
 		cancel()
 		_ = shardStore.Close()
@@ -580,11 +582,11 @@ func startBootstrapE2ENode(
 	}
 
 	eg.Go(func() error {
-		return runDistributionCatalogWatcher(runCtx, distCatalog, cfg.engine)
+		return runDistributionCatalogWatcher(runCtx, distCatalog, cfg.Engine)
 	})
 
 	distServer := adapter.NewDistributionServer(
-		cfg.engine,
+		cfg.Engine,
 		distCatalog,
 		adapter.WithDistributionCoordinator(coordinate),
 	)
@@ -597,7 +599,7 @@ func startBootstrapE2ENode(
 		shardStore,
 		coordinate,
 		distServer,
-		cfg.leaderRedis,
+		cfg.LeaderRedis,
 		listeners,
 	)
 	if err != nil {
@@ -613,7 +615,7 @@ func startBootstrapE2ENode(
 		runtimes:    runtimes,
 		shardStore:  shardStore,
 		coordinate:  coordinate,
-		distEngine:  cfg.engine,
+		distEngine:  cfg.Engine,
 		distCatalog: distCatalog,
 		distServer:  distServer,
 		cancel:      cancel,
@@ -630,35 +632,35 @@ func startBootstrapE2EMultiGroupNode(
 	groupPeers string,
 	engineType raftEngineType,
 ) (*bootstrapE2ENode, error) {
-	cfg, err := parseRuntimeConfig(ep.raftAddrs[groupIDs[0]], ep.redisAddr, "", ep.dynamoAddr, "",
+	cfg, err := noderuntime.ParseRuntimeConfig(ep.raftAddrs[groupIDs[0]], ep.redisAddr, "", ep.dynamoAddr, "",
 		raftGroupsArg(ep, groupIDs), "", "", "", "", "", "")
 	if err != nil {
 		return nil, err
 	}
 
-	bootstrapCfg, err := resolveBootstrapConfig(ep.id, cfg.groups, "", groupPeers)
+	bootstrapCfg, err := noderuntime.ResolveRaftPeerConfig(ep.id, cfg.Groups, "", groupPeers, "", false, false)
 	if err != nil {
 		return nil, err
 	}
-	bootstrap = bootstrap || bootstrapCfg.anyBootstrapServers()
+	bootstrap = bootstrap || bootstrapCfg.AnyBootstrapServers()
 
 	factory, err := newRaftFactory(engineType, nil)
 	if err != nil {
 		return nil, err
 	}
 	clock := kv.NewHLC()
-	runtimes, shardGroups, err := buildShardGroups(ep.id, baseDir, cfg.groups, cfg.multi, bootstrap,
+	runtimes, shardGroups, err := buildShardGroups(ep.id, baseDir, cfg.Groups, cfg.Multi, bootstrap,
 		bootstrapCfg, factory, nil, clock, kv.NewActiveTimestampTracker(), nil, nil, "",
-		encryptionWriteWiring{}, cfg.engine)
+		encryptionWriteWiring{}, cfg.Engine)
 	if err != nil {
 		return nil, err
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	eg, runCtx := errgroup.WithContext(ctx)
-	shardStore := kv.NewShardStore(cfg.engine, shardGroups)
-	coordinate := kv.NewShardedCoordinator(cfg.engine, shardGroups, cfg.defaultGroup, clock, shardStore)
-	distCatalog, err := setupDistributionCatalog(runCtx, runtimes, cfg.engine)
+	shardStore := kv.NewShardStore(cfg.Engine, shardGroups)
+	coordinate := kv.NewShardedCoordinator(cfg.Engine, shardGroups, cfg.DefaultGroup, clock, shardStore)
+	distCatalog, err := setupDistributionCatalog(runCtx, runtimes, cfg.Engine)
 	if err != nil {
 		cancel()
 		_ = shardStore.Close()
@@ -669,11 +671,11 @@ func startBootstrapE2EMultiGroupNode(
 	}
 
 	eg.Go(func() error {
-		return runDistributionCatalogWatcher(runCtx, distCatalog, cfg.engine)
+		return runDistributionCatalogWatcher(runCtx, distCatalog, cfg.Engine)
 	})
 
 	distServer := adapter.NewDistributionServer(
-		cfg.engine,
+		cfg.Engine,
 		distCatalog,
 		adapter.WithDistributionCoordinator(coordinate),
 	)
@@ -686,7 +688,7 @@ func startBootstrapE2EMultiGroupNode(
 		shardStore,
 		coordinate,
 		distServer,
-		cfg.leaderRedis,
+		cfg.LeaderRedis,
 		listeners,
 	)
 	if err != nil {
@@ -702,7 +704,7 @@ func startBootstrapE2EMultiGroupNode(
 		runtimes:    runtimes,
 		shardStore:  shardStore,
 		coordinate:  coordinate,
-		distEngine:  cfg.engine,
+		distEngine:  cfg.Engine,
 		distCatalog: distCatalog,
 		distServer:  distServer,
 		cancel:      cancel,
@@ -726,7 +728,7 @@ func startRuntimeServersWithBoundListeners(
 	}
 	rt := runtimes[0]
 	relay := adapter.NewRedisPubSubRelay()
-	redisAddr := leaderRedis[rt.spec.address]
+	redisAddr := leaderRedis[rt.spec.Address]
 
 	if err := startBoundRedisServer(ctx, eg, listeners.redis, shardStore, coordinate, leaderRedis, redisAddr, relay); err != nil {
 		return waitErrgroupAfterStartupFailure(cancel, eg, err)
@@ -755,12 +757,12 @@ func startRuntimeServersWithBoundMultiGroupListeners(
 		return waitErrgroupAfterStartupFailure(cancel, eg, fmt.Errorf("expected at least one runtime"))
 	}
 	relay := adapter.NewRedisPubSubRelay()
-	redisAddr := leaderRedis[runtimes[0].spec.address]
+	redisAddr := leaderRedis[runtimes[0].spec.Address]
 	if err := startBoundRedisServer(ctx, eg, listeners.redis, shardStore, coordinate, leaderRedis, redisAddr, relay); err != nil {
 		return waitErrgroupAfterStartupFailure(cancel, eg, err)
 	}
 	for _, rt := range runtimes {
-		if err := startBoundGRPCServer(ctx, eg, rt, shardStore, coordinate, distServer, relay, nil, listeners.grpc[rt.spec.id]); err != nil {
+		if err := startBoundGRPCServer(ctx, eg, rt, shardStore, coordinate, distServer, relay, nil, listeners.grpc[rt.spec.ID]); err != nil {
 			return waitErrgroupAfterStartupFailure(cancel, eg, err)
 		}
 	}
@@ -800,7 +802,7 @@ func startBoundGRPCServer(
 		relay,
 		adapter.WithInternalStore(rt.store),
 		adapter.WithInternalMigrationProposer(rt.engine),
-		adapter.WithInternalMigrationExportRouting(rt.spec.id, sqsPartitionResolver),
+		adapter.WithInternalMigrationExportRouting(rt.spec.ID, sqsPartitionResolver),
 	))
 	pb.RegisterDistributionServer(gs, distServer)
 	rt.registerGRPC(gs)

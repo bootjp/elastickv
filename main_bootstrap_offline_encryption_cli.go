@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/bootjp/elastickv/internal/encryption/kek"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/cockroachdb/errors"
 )
 
@@ -66,7 +67,7 @@ func (c bootstrapOfflineEncryptionCLI) load(ctx context.Context, member, group u
 	if c == (bootstrapOfflineEncryptionCLI{}) {
 		return nil, nil
 	}
-	if group == dedicatedTSORaftGroupID {
+	if group == noderuntime.DedicatedTSORaftGroupID {
 		return nil, errors.Wrap(errBootstrapOfflineStore, "encrypted scalar TSO offline migration is unsupported")
 	}
 	if c.KEKFile != "" {

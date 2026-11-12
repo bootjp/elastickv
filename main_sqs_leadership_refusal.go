@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/adapter"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 )
 
@@ -180,7 +181,7 @@ func retryableSQSLeadershipTransferError(err error) bool {
 // validateSQSFifoPartitionMap would have already rejected an
 // unknown group, so reaching this branch implies a programmer
 // bypassed validation — which is a test-only concern).
-func partitionedGroupSet(partitionMap map[string]sqsFifoQueueRouting, logger *slog.Logger) map[uint64]bool {
+func partitionedGroupSet(partitionMap map[string]noderuntime.SQSFifoQueueRouting, logger *slog.Logger) map[uint64]bool {
 	if len(partitionMap) == 0 {
 		return nil
 	}
@@ -189,7 +190,7 @@ func partitionedGroupSet(partitionMap map[string]sqsFifoQueueRouting, logger *sl
 	}
 	out := make(map[uint64]bool)
 	for queue, routing := range partitionMap {
-		for _, groupRef := range routing.groups {
+		for _, groupRef := range routing.Groups {
 			id, err := strconv.ParseUint(groupRef, 10, 64)
 			if err != nil {
 				logger.Warn("sqs: leadership-refusal: skipping non-uint64 group reference (config validation bypass?)",
@@ -225,7 +226,7 @@ func sqsAdvertisesHTFIFO() bool {
 func installSQSLeadershipRefusalAcrossGroups(
 	ctx context.Context,
 	runtimes []*raftGroupRuntime,
-	partitionMap map[string]sqsFifoQueueRouting,
+	partitionMap map[string]noderuntime.SQSFifoQueueRouting,
 	advertisesHTFIFO bool,
 	logger *slog.Logger,
 ) func() {
@@ -248,12 +249,12 @@ func installSQSLeadershipRefusalAcrossGroups(
 			if logger != nil {
 				logger.Warn("sqs: skipping leadership-refusal install for group "+
 					"— engine does not implement leader-acquired observer",
-					"group", rt.spec.id)
+					"group", rt.spec.ID)
 			}
 			continue
 		}
 		dereg := installSQSLeadershipRefusal(
-			ctx, admin, rt.spec.id, partGroups, advertisesHTFIFO, logger)
+			ctx, admin, rt.spec.ID, partGroups, advertisesHTFIFO, logger)
 		deregisters = append(deregisters, dereg)
 	}
 	return func() {

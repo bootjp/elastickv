@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/stretchr/testify/require"
@@ -31,7 +32,7 @@ func TestProtectedBootstrapLaunchRequiresExactDurableFormat(t *testing.T) {
 			Members: []raftbootstrap.Member{{ID: raw.Local, Address: config.local.Address, PublicKeyDigest: config.local.Key}}}}
 	digest, err := raftbootstrap.ConfigurationDigest(intent.Baseline)
 	require.NoError(t, err)
-	group := groupSpec{id: 1, address: config.local.Address}
+	group := noderuntime.GroupSpec{ID: 1, Address: config.local.Address}
 	_, err = loadGroupBootstrapSpec("n1", group, dir, peerConfigDir)
 	require.Error(t, err)
 	policy := raftbootstrap.Policy{Identity: identity, BaselineDigest: digest, Minimum: intent.Minimum, Floor: intent.Floor}
@@ -66,10 +67,10 @@ func TestProtectedDomainRejectsIncompleteConfigurationBeforeCreatingState(t *tes
 	t.Parallel()
 	peerConfigDir := t.TempDir()
 	base := t.TempDir()
-	err := validateProtectedBootstrapDomain("n1", base, []groupSpec{{id: 1, address: "localhost:50051"}}, true, peerConfigDir)
+	err := validateProtectedBootstrapDomain("n1", base, []noderuntime.GroupSpec{{ID: 1, Address: "localhost:50051"}}, true, peerConfigDir)
 	require.Error(t, err)
 	require.NoDirExists(t, groupDataDir(base, "n1", 1, true))
-	err = validateProtectedBootstrapDomain("n1", base, []groupSpec{{id: dedicatedTSORaftGroupID}}, true, peerConfigDir)
+	err = validateProtectedBootstrapDomain("n1", base, []noderuntime.GroupSpec{{ID: noderuntime.DedicatedTSORaftGroupID}}, true, peerConfigDir)
 	require.Error(t, err, "a missing group-zero configuration must not fall back to legacy startup")
-	require.NoDirExists(t, groupDataDir(base, "n1", dedicatedTSORaftGroupID, true))
+	require.NoDirExists(t, groupDataDir(base, "n1", noderuntime.DedicatedTSORaftGroupID, true))
 }

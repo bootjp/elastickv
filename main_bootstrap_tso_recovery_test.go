@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/bootjp/elastickv/kv"
@@ -58,12 +59,12 @@ func TestProtectedTSOLegacyRecoveryRejectsAdditionalControlState(t *testing.T) {
 	assertTSOLegacyRecoveryRefused(t, base, configDir, profile)
 }
 
-func assertTSOLegacyRecoveryRefused(t *testing.T, base, peerConfigDir string, profile []groupSpec) {
+func assertTSOLegacyRecoveryRefused(t *testing.T, base, peerConfigDir string, profile []noderuntime.GroupSpec) {
 	t.Helper()
 	path := filepath.Join(groupDataDir(base, "n1", 0, true), dedicatedTSOControlStoreName)
 	before, err := readOnlyTSOStoreDigest(t.Context(), path)
 	require.NoError(t, err)
-	bootstrapCfg := raftBootstrapConfig{peerConfigDir: peerConfigDir}
+	bootstrapCfg := noderuntime.BootstrapConfig{PeerConfigDir: peerConfigDir}
 	specs, domain, err := loadProtectedBootstrapDomain("n1", base, profile, true, bootstrapCfg)
 	require.NoError(t, err)
 	t.Cleanup(domain.admission.Close)
@@ -78,7 +79,7 @@ func assertTSOLegacyRecoveryRefused(t *testing.T, base, peerConfigDir string, pr
 	require.Equal(t, before, after, "rejected startup must not import, erase or merge scalar/control state")
 }
 
-func assertTSOMissingReceiptRefusesRecovery(t *testing.T, base, configDir string, profile []groupSpec) {
+func assertTSOMissingReceiptRefusesRecovery(t *testing.T, base, configDir string, profile []noderuntime.GroupSpec) {
 	t.Helper()
 	dir := groupDataDir(base, "n1", 0, true)
 	path := filepath.Join(dir, dedicatedTSOControlStoreName)

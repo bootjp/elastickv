@@ -25,6 +25,7 @@ import (
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/admin"
 	"github.com/bootjp/elastickv/internal/adminbridge"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
@@ -374,9 +375,9 @@ func TestAdminMembersFromBootstrapEmpty(t *testing.T) {
 func TestCanonicalSelfAddressPicksLowestGroup(t *testing.T) {
 	t.Parallel()
 	runtimes := []*raftGroupRuntime{
-		{spec: groupSpec{id: 5, address: "10.0.0.1:50055"}},
-		{spec: groupSpec{id: 2, address: "10.0.0.1:50052"}},
-		{spec: groupSpec{id: 9, address: "10.0.0.1:50059"}},
+		{spec: noderuntime.GroupSpec{ID: 5, Address: "10.0.0.1:50055"}},
+		{spec: noderuntime.GroupSpec{ID: 2, Address: "10.0.0.1:50052"}},
+		{spec: noderuntime.GroupSpec{ID: 9, Address: "10.0.0.1:50059"}},
 	}
 	got := canonicalSelfAddress("localhost:50051", runtimes)
 	if got != "10.0.0.1:50052" {

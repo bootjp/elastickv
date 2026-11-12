@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftadmission"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -23,13 +24,13 @@ type groupBootstrapSpec struct {
 	domain *bootstrapDomain
 }
 
-func validateProtectedBootstrapDomain(raftID, baseDir string, groups []groupSpec, multi bool, peerConfigDir string) error {
+func validateProtectedBootstrapDomain(raftID, baseDir string, groups []noderuntime.GroupSpec, multi bool, peerConfigDir string) error {
 	if peerConfigDir == "" {
 		return nil
 	}
 	var cluster raftbootstrap.UUID
 	for _, group := range groups {
-		spec, err := loadGroupBootstrapSpec(raftID, group, groupDataDir(baseDir, raftID, group.id, multi), peerConfigDir)
+		spec, err := loadGroupBootstrapSpec(raftID, group, groupDataDir(baseDir, raftID, group.ID, multi), peerConfigDir)
 		if err != nil {
 			return err
 		}
@@ -41,27 +42,27 @@ func validateProtectedBootstrapDomain(raftID, baseDir string, groups []groupSpec
 	return nil
 }
 
-func loadProtectedBootstrapDomain(raftID, baseDir string, groups []groupSpec, multi bool, bootstrapCfg raftBootstrapConfig, encWiring ...encryptionWriteWiring) (map[uint64]*groupBootstrapSpec, *bootstrapDomain, error) {
-	if bootstrapCfg.peerConfigDir == "" {
+func loadProtectedBootstrapDomain(raftID, baseDir string, groups []noderuntime.GroupSpec, multi bool, bootstrapCfg noderuntime.BootstrapConfig, encWiring ...encryptionWriteWiring) (map[uint64]*groupBootstrapSpec, *bootstrapDomain, error) {
+	if bootstrapCfg.PeerConfigDir == "" {
 		return nil, nil, nil
 	}
-	if err := validateProtectedBootstrapDomain(raftID, baseDir, groups, multi, bootstrapCfg.peerConfigDir); err != nil {
+	if err := validateProtectedBootstrapDomain(raftID, baseDir, groups, multi, bootstrapCfg.PeerConfigDir); err != nil {
 		return nil, nil, err
 	}
 	specs := make(map[uint64]*groupBootstrapSpec, len(groups))
 	var cluster raftbootstrap.UUID
 	for _, group := range groups {
-		spec, err := loadGroupBootstrapSpec(raftID, group, groupDataDir(baseDir, raftID, group.id, multi), bootstrapCfg.peerConfigDir)
+		spec, err := loadGroupBootstrapSpec(raftID, group, groupDataDir(baseDir, raftID, group.ID, multi), bootstrapCfg.PeerConfigDir)
 		if err != nil {
 			return nil, nil, err
 		}
-		specs[group.id], cluster = spec, spec.intent.Identity.Cluster
+		specs[group.ID], cluster = spec, spec.intent.Identity.Cluster
 	}
-	domain, err := newBootstrapDomain(cluster, groups, bootstrapCfg.encryption, encWiring...)
+	domain, err := newBootstrapDomain(cluster, groups, bootstrapCfg.Encryption, encWiring...)
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := attachBootstrapDomain(specs, domain, bootstrapCfg.serviceTokenFiles); err != nil {
+	if err := attachBootstrapDomain(specs, domain, bootstrapCfg.ServiceTokenFiles); err != nil {
 		domain.admission.Close()
 		return nil, nil, err
 	}
@@ -81,7 +82,7 @@ func attachBootstrapDomain(specs map[uint64]*groupBootstrapSpec, domain *bootstr
 
 func (b shardGroupBuilder) bootstrapSpecForGroup(id uint64) (*groupBootstrapSpec, error) {
 	spec := b.bootstrapSpecs[id]
-	if b.bootstrapCfg.peerConfigDir != "" && (spec == nil || spec.domain == nil) {
+	if b.bootstrapCfg.PeerConfigDir != "" && (spec == nil || spec.domain == nil) {
 		return nil, errors.New("protected group missing the process-wide bootstrap domain")
 	}
 	return spec, nil
@@ -90,19 +91,19 @@ func (b shardGroupBuilder) bootstrapSpecForGroup(id uint64) (*groupBootstrapSpec
 // loadGroupBootstrapSpec loads group's prepared peer configuration from
 // peerConfigDir (--raftBootstrapPeerConfigDir); empty means the group is not
 // protected.
-func loadGroupBootstrapSpec(raftID string, group groupSpec, dir, peerConfigDir string) (*groupBootstrapSpec, error) {
+func loadGroupBootstrapSpec(raftID string, group noderuntime.GroupSpec, dir, peerConfigDir string) (*groupBootstrapSpec, error) {
 	if peerConfigDir == "" {
 		return nil, nil
 	}
-	config, err := loadBootstrapPeerConfig(filepath.Join(peerConfigDir, fmt.Sprintf("group-%d.json", group.id)))
+	config, err := loadBootstrapPeerConfig(filepath.Join(peerConfigDir, fmt.Sprintf("group-%d.json", group.ID)))
 	if err != nil {
 		return nil, err
 	}
-	if config.local.Member != etcdraftengine.DeriveNodeID(raftID) || config.local.Address != group.address {
+	if config.local.Member != etcdraftengine.DeriveNodeID(raftID) || config.local.Address != group.Address {
 		return nil, errors.New("protected local identity does not match configured raft listener")
 	}
 	files := raftbootstrap.NewStore(dir)
-	identity := raftbootstrap.Identity{Cluster: config.local.Cluster, Group: group.id}
+	identity := raftbootstrap.Identity{Cluster: config.local.Cluster, Group: group.ID}
 	inspection, err := files.Inspect(raftbootstrap.Evidence{Identity: &identity})
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -197,7 +198,7 @@ func bootstrapCatalogObservationStale(err error) bool {
 
 func loadProtectedCatalog(ctx context.Context, runtimes []*raftGroupRuntime, id uint64, catalog *distribution.CatalogStore, engine *distribution.Engine) (bool, error) {
 	for _, runtime := range runtimes {
-		if runtime == nil || runtime.spec.id != id || runtime.publicReady == nil {
+		if runtime == nil || runtime.spec.ID != id || runtime.publicReady == nil {
 			continue
 		}
 		return true, loadProtectedRuntimeCatalog(ctx, runtime, catalog, engine)
@@ -209,7 +210,7 @@ func loadProtectedRuntimeCatalog(ctx context.Context, runtime *raftGroupRuntime,
 	if runtime.bootstrapDomain == nil {
 		return errors.New("protected catalog lacks the process-wide admission domain")
 	}
-	ticket, err := runtime.bootstrapDomain.admission.Ticket(runtime.spec.id)
+	ticket, err := runtime.bootstrapDomain.admission.Ticket(runtime.spec.ID)
 	if err != nil {
 		return errors.WithStack(err)
 	}

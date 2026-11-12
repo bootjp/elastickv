@@ -11,6 +11,7 @@ import (
 	"github.com/bootjp/elastickv/adapter"
 	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/bootjp/elastickv/internal/encryption"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/bootjp/elastickv/internal/runtimehealth"
 	"github.com/bootjp/elastickv/internal/serverwiring"
@@ -96,7 +97,7 @@ func run(flags *serverFlags) error {
 	if err != nil {
 		return err
 	}
-	bootstrapCfg.encryption = flags.encryption.bootstrapRequest()
+	bootstrapCfg.Encryption = flags.encryption.bootstrapRequest()
 
 	var lc net.ListenConfig
 
@@ -145,7 +146,7 @@ func run(flags *serverFlags) error {
 	keystore := encryption.NewKeystore()
 	redisApplyObserver := adapter.NewRedisApplyObserver()
 	readTracker := kv.NewActiveTimestampTracker(kv.WithActiveTimestampTrackerMaxBackupPins(flags.backup.maxActivePins))
-	s3BlobBackfiller := adapter.NewS3BlobBackfiller(cfg.s3BlobBackfillConfig)
+	s3BlobBackfiller := adapter.NewS3BlobBackfiller(cfg.S3BlobBackfillConfig)
 
 	cleanup := internalutil.CleanupStack{}
 	defer cleanup.Run()
@@ -177,9 +178,9 @@ func run(flags *serverFlags) error {
 	runtimes, shardGroups, encWiring, err := buildShardGroupsWithEncryptionWiring(
 		flags.raft.id,
 		flags.raft.dataDir,
-		cfg.groups,
-		cfg.defaultGroup,
-		cfg.multi,
+		cfg.Groups,
+		cfg.DefaultGroup,
+		cfg.Multi,
 		bootstrap,
 		bootstrapCfg,
 		factory,
@@ -192,7 +193,7 @@ func run(flags *serverFlags) error {
 		flags.encryption.sidecarPath,
 		flags.encryption.enabled,
 		readTracker,
-		cfg.engine,
+		cfg.Engine,
 		metricsRegistry.EncryptionObserver(),
 		redisApplyObserver,
 		s3BlobBackfiller,
@@ -200,7 +201,7 @@ func run(flags *serverFlags) error {
 	if err = chainEncryptionStartupGuard(
 		err,
 		runtimes,
-		cfg.defaultGroup,
+		cfg.DefaultGroup,
 		flags.encryption.sidecarPath,
 		flags.encryption.enabled,
 	); err != nil {
@@ -222,7 +223,7 @@ func run(flags *serverFlags) error {
 	recordFSMApplySyncMode(metricsRegistry, runtimes)
 
 	cleanup.Add(readTracker.Close)
-	shardStore := newStartupShardStore(cfg.engine, shardGroups, flags.consistency.readWatermarkAdvance)
+	shardStore := newStartupShardStore(cfg.Engine, shardGroups, flags.consistency.readWatermarkAdvance)
 	cleanup.Add(func() {
 		_ = shardStore.Close()
 		for _, rt := range runtimes {
@@ -237,13 +238,13 @@ func run(flags *serverFlags) error {
 	cleanup.Add(cancel)
 	startLockResolverIfEnabled(shardStore, shardGroups, &cleanup, resolverOptions...)
 	sampler := serverwiring.BuildSampler(flags.keyViz, flags.autoSplit)
-	sqsPartitionResolver := buildSQSPartitionResolver(cfg.sqsFifoPartitionMap)
+	sqsPartitionResolver := noderuntime.BuildSQSPartitionResolver(cfg.SQSFifoPartitionMap)
 	shardStore.WithPartitionResolver(sqsPartitionResolver)
-	coordinate := kv.NewShardedCoordinator(cfg.engine, shardGroups, cfg.defaultGroup, clock, shardStore).
+	coordinate := kv.NewShardedCoordinator(cfg.Engine, shardGroups, cfg.DefaultGroup, clock, shardStore).
 		WithLeaseReadObserver(metricsRegistry.LeaseReadObserver()).
 		WithSampler(keyVizSamplerForCoordinator(sampler)).
 		WithKeyVizLabelsEnabled(*flags.keyViz.LabelsEnabled).
-		WithAllShardGroups(dataGroupIDs(cfg.groups)...).
+		WithAllShardGroups(noderuntime.DataGroupIDs(cfg.Groups)...).
 		WithPartitionResolver(sqsPartitionResolver)
 	configureCommitTSFenceActivation(coordinate, flags.consistency.commitTSFence, runtimes)
 	installBootstrapCoordinator(bootstrapDomain, coordinate, &cleanup)
@@ -271,7 +272,7 @@ func run(flags *serverFlags) error {
 	// binary advertises htfifo (the steady-state production
 	// case post-PR-4-B-3b).
 	leadershipRefusalDeregister := installSQSLeadershipRefusalAcrossGroups(
-		ctx, runtimes, cfg.sqsFifoPartitionMap,
+		ctx, runtimes, cfg.SQSFifoPartitionMap,
 		sqsAdvertisesHTFIFO(), slog.Default())
 	cleanup.Add(leadershipRefusalDeregister)
 	eg, runCtx := errgroup.WithContext(ctx)
@@ -283,7 +284,7 @@ func run(flags *serverFlags) error {
 	// synchronously here, BEFORE the gRPC servers serve, so writes never
 	// run with no registration gate installed.
 	encryptionStartup := bootstrapEncryptionStartupConfig{
-		runtimes: runtimes, groups: shardGroups, defaultGroup: cfg.defaultGroup,
+		runtimes: runtimes, groups: shardGroups, defaultGroup: cfg.DefaultGroup,
 		network: bootstrapNetwork, wiring: encWiring, sidecarPath: flags.encryption.sidecarPath,
 		wrapper: kekUnwrapper, nodeID: etcdraftengine.DeriveNodeID(flags.raft.id), requested: flags.encryption.rotateOnStartup,
 		eg: eg, cleanup: &cleanup,
@@ -297,7 +298,7 @@ func run(flags *serverFlags) error {
 		cfg:             cfg,
 		coordinate:      coordinate,
 		shardStore:      shardStore,
-		defaultGroup:    shardGroups[cfg.defaultGroup],
+		defaultGroup:    shardGroups[cfg.DefaultGroup],
 		encWiring:       encWiring,
 		raftID:          flags.raft.id,
 		raftDir:         flags.raft.dataDir,
@@ -332,12 +333,12 @@ func run(flags *serverFlags) error {
 	// group), in which case raftadmin.Server skips the pre-step.
 	encryptionConfChangeInterceptor := newEncryptionConfChangeInterceptor(
 		encWiring.encryptionConfigured(),
-		coordinate, shardGroups[cfg.defaultGroup], encWiring.cache, flags.encryption.sidecarPath, etcdraftengine.DeriveNodeID)
+		coordinate, shardGroups[cfg.DefaultGroup], encWiring.cache, flags.encryption.sidecarPath, etcdraftengine.DeriveNodeID)
 	rotateOnStartupDeregister, waitRotateOnStartup := installBootstrapStartupRotation(distStartup.rotationSupervisor, runCtx, encryptionStartup)
 	cleanup.Add(rotateOnStartupDeregister)
 	return serveStartedRuntime(waitRotateOnStartup, serversInput{
 		ctx: runCtx, eg: eg, cancel: cancel, lc: &lc,
-		runtimes: runtimes, shardGroups: shardGroups, bootstrapServers: bootstrapCfg.adminSeed(cfg.defaultGroup),
+		runtimes: runtimes, shardGroups: shardGroups, bootstrapServers: bootstrapCfg.AdminSeed(cfg.DefaultGroup),
 		shardStore: shardStore, coordinate: coordinate,
 		distServer: distServer, distCatalog: distCatalog, readTracker: readTracker,
 		metricsRegistry: metricsRegistry, cfg: cfg,
@@ -378,7 +379,7 @@ func serveStartedRuntime(waitRotateOnStartup startupRotationWaiter, in serversIn
 		balanceCtx,
 		in.eg,
 		in.runtimes,
-		leaderBalanceOptions(in.leaderBalance, in.raftID, in.cfg.defaultGroup, in.cfg.sqsFifoPartitionMap, in.metricsRegistry.Registerer()),
+		leaderBalanceOptions(in.leaderBalance, in.raftID, in.cfg.DefaultGroup, in.cfg.SQSFifoPartitionMap, in.metricsRegistry.Registerer()),
 		balanceDone,
 	)
 

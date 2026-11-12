@@ -7,6 +7,7 @@ import (
 
 	"github.com/bootjp/elastickv/distribution"
 	internalutil "github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/peersession"
 	"github.com/bootjp/elastickv/internal/raftadmission"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
@@ -25,7 +26,7 @@ type bootstrapDomain struct {
 	activations              map[uint64][]byte
 	cluster                  raftbootstrap.UUID
 	encryption               *bootstrapEncryptionDomain
-	encryptionRequest        bootstrapEncryptionRequest
+	encryptionRequest        noderuntime.BootstrapEncryptionRequest
 	protectedRotationHandler bootstrapRotationRPCHandler
 }
 
@@ -76,19 +77,19 @@ func bootstrapDomainForRuntimes(runtimes []*raftGroupRuntime) *bootstrapDomain {
 	return nil
 }
 
-func newBootstrapDomain(cluster raftbootstrap.UUID, groups []groupSpec, request bootstrapEncryptionRequest, encWiring ...encryptionWriteWiring) (*bootstrapDomain, error) {
+func newBootstrapDomain(cluster raftbootstrap.UUID, groups []noderuntime.GroupSpec, request noderuntime.BootstrapEncryptionRequest, encWiring ...encryptionWriteWiring) (*bootstrapDomain, error) {
 	enc, err := newBootstrapEncryptionDomain(groups, request, encWiring)
 	if err != nil {
 		return nil, err
 	}
 	ids := make([]uint64, 0, len(groups))
 	for _, group := range groups {
-		ids = append(ids, group.id)
+		ids = append(ids, group.ID)
 	}
 	d := &bootstrapDomain{cluster: cluster, encryption: enc, encryptionRequest: request, owners: make(map[uint64]*peersession.Owner), activations: make(map[uint64][]byte)}
 	cfg := raftadmission.Config{
-		Cluster: cluster, Groups: ids, DefaultGroup: defaultGroupID(groups),
-		RotationRequested:    request.rotateOnStartup,
+		Cluster: cluster, Groups: ids, DefaultGroup: noderuntime.DefaultGroupID(groups),
+		RotationRequested:    request.RotateOnStartup,
 		ValidatePayload:      bootstrapPayloadValidator(cluster),
 		EncryptionConfigured: enc != nil,
 	}

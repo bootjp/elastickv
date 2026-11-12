@@ -1,4 +1,4 @@
-package main
+package noderuntime
 
 import (
 	"testing"
@@ -17,24 +17,24 @@ func TestParseRaftGroups(t *testing.T) {
 	t.Run("default group from default address", func(t *testing.T) {
 		groups, err := parseRaftGroups("", "127.0.0.1:50051")
 		require.NoError(t, err)
-		require.Equal(t, []groupSpec{{id: 1, address: "127.0.0.1:50051"}}, groups)
+		require.Equal(t, []GroupSpec{{ID: 1, Address: "127.0.0.1:50051"}}, groups)
 	})
 
 	t.Run("multiple groups", func(t *testing.T) {
 		groups, err := parseRaftGroups("1=127.0.0.1:50051, 2=127.0.0.1:50052", "")
 		require.NoError(t, err)
-		require.Equal(t, []groupSpec{
-			{id: 1, address: "127.0.0.1:50051"},
-			{id: 2, address: "127.0.0.1:50052"},
+		require.Equal(t, []GroupSpec{
+			{ID: 1, Address: "127.0.0.1:50051"},
+			{ID: 2, Address: "127.0.0.1:50052"},
 		}, groups)
 	})
 
 	t.Run("trims whitespace around id", func(t *testing.T) {
 		groups, err := parseRaftGroups("1 = 127.0.0.1:50051, 2=127.0.0.1:50052", "")
 		require.NoError(t, err)
-		require.Equal(t, []groupSpec{
-			{id: 1, address: "127.0.0.1:50051"},
-			{id: 2, address: "127.0.0.1:50052"},
+		require.Equal(t, []GroupSpec{
+			{ID: 1, Address: "127.0.0.1:50051"},
+			{ID: 2, Address: "127.0.0.1:50052"},
 		}, groups)
 	})
 
@@ -156,9 +156,9 @@ func TestParseSQSFifoPartitionMap(t *testing.T) {
 		m, err := parseSQSFifoPartitionMap("orders.fifo:8=10,11,12,13,14,15,16,17")
 		require.NoError(t, err)
 		require.Len(t, m, 1)
-		require.Equal(t, sqsFifoQueueRouting{
-			partitionCount: 8,
-			groups:         []string{"10", "11", "12", "13", "14", "15", "16", "17"},
+		require.Equal(t, SQSFifoQueueRouting{
+			PartitionCount: 8,
+			Groups:         []string{"10", "11", "12", "13", "14", "15", "16", "17"},
 		}, m["orders.fifo"])
 	})
 
@@ -167,15 +167,15 @@ func TestParseSQSFifoPartitionMap(t *testing.T) {
 		m, err := parseSQSFifoPartitionMap("orders.fifo:2=1,2;events.fifo:4=3,4,5,6")
 		require.NoError(t, err)
 		require.Len(t, m, 2)
-		require.Equal(t, uint32(2), m["orders.fifo"].partitionCount)
-		require.Equal(t, []string{"3", "4", "5", "6"}, m["events.fifo"].groups)
+		require.Equal(t, uint32(2), m["orders.fifo"].PartitionCount)
+		require.Equal(t, []string{"3", "4", "5", "6"}, m["events.fifo"].Groups)
 	})
 
 	t.Run("trims whitespace", func(t *testing.T) {
 		t.Parallel()
 		m, err := parseSQSFifoPartitionMap(" orders.fifo : 2 = 1 , 2 ")
 		require.NoError(t, err)
-		require.Equal(t, []string{"1", "2"}, m["orders.fifo"].groups)
+		require.Equal(t, []string{"1", "2"}, m["orders.fifo"].Groups)
 	})
 
 	t.Run("normalizes leading-zero group IDs", func(t *testing.T) {
@@ -187,7 +187,7 @@ func TestParseSQSFifoPartitionMap(t *testing.T) {
 		// q.fifo:2=01,02" would be rejected as group-not-found.
 		m, err := parseSQSFifoPartitionMap("q.fifo:2=01,002")
 		require.NoError(t, err)
-		require.Equal(t, []string{"1", "2"}, m["q.fifo"].groups)
+		require.Equal(t, []string{"1", "2"}, m["q.fifo"].Groups)
 	})
 
 	t.Run("rejects non-uint64 group reference", func(t *testing.T) {
@@ -278,8 +278,8 @@ func TestValidateSQSFifoPartitionMap(t *testing.T) {
 	t.Parallel()
 	t.Run("all groups present passes", func(t *testing.T) {
 		t.Parallel()
-		m := map[string]sqsFifoQueueRouting{
-			"q.fifo": {partitionCount: 2, groups: []string{"1", "2"}},
+		m := map[string]SQSFifoQueueRouting{
+			"q.fifo": {PartitionCount: 2, Groups: []string{"1", "2"}},
 		}
 		groups := map[string]struct{}{"1": {}, "2": {}}
 		require.NoError(t, validateSQSFifoPartitionMap(m, groups))
@@ -290,8 +290,8 @@ func TestValidateSQSFifoPartitionMap(t *testing.T) {
 		// Operator typed "99" but only IDs 1-4 exist in --raftGroups.
 		// The validator must surface the queue and partition index so
 		// the operator can fix the typo without re-counting.
-		m := map[string]sqsFifoQueueRouting{
-			"orders.fifo": {partitionCount: 4, groups: []string{"1", "99", "3", "4"}},
+		m := map[string]SQSFifoQueueRouting{
+			"orders.fifo": {PartitionCount: 4, Groups: []string{"1", "99", "3", "4"}},
 		}
 		groups := map[string]struct{}{
 			"1": {}, "2": {}, "3": {}, "4": {},
@@ -333,7 +333,7 @@ func TestBuildSQSFifoPartitionMapRejectsDedicatedTSOGroup(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			_, err := buildSQSFifoPartitionMap([]groupSpec{{id: 0}, {id: 1}}, tc.spec)
+			_, err := buildSQSFifoPartitionMap([]GroupSpec{{ID: 0}, {ID: 1}}, tc.spec)
 			require.ErrorIs(t, err, ErrInvalidSQSFifoPartitionMapEntry)
 			for _, want := range tc.wantContains {
 				require.Contains(t, err.Error(), want)
@@ -409,49 +409,49 @@ func TestParseRaftGroupPeers(t *testing.T) {
 
 func TestDefaultGroupID(t *testing.T) {
 	t.Parallel()
-	require.Equal(t, uint64(1), defaultGroupID(nil))
-	require.Equal(t, uint64(2), defaultGroupID([]groupSpec{{id: 3}, {id: 2}}))
-	require.Equal(t, uint64(2), defaultGroupID([]groupSpec{{id: 0}, {id: 2}}))
-	require.Equal(t, uint64(1), defaultGroupID([]groupSpec{{id: 0}}))
+	require.Equal(t, uint64(1), DefaultGroupID(nil))
+	require.Equal(t, uint64(2), DefaultGroupID([]GroupSpec{{ID: 3}, {ID: 2}}))
+	require.Equal(t, uint64(2), DefaultGroupID([]GroupSpec{{ID: 0}, {ID: 2}}))
+	require.Equal(t, uint64(1), DefaultGroupID([]GroupSpec{{ID: 0}}))
 }
 
 func TestDataGroupIDsExcludeDedicatedTSOGroup(t *testing.T) {
 	t.Parallel()
-	require.Equal(t, []uint64{1, 2}, dataGroupIDs([]groupSpec{{id: 0}, {id: 2}, {id: 1}}))
-	require.Empty(t, dataGroupIDs([]groupSpec{{id: 0}}))
+	require.Equal(t, []uint64{1, 2}, DataGroupIDs([]GroupSpec{{ID: 0}, {ID: 2}, {ID: 1}}))
+	require.Empty(t, DataGroupIDs([]GroupSpec{{ID: 0}}))
 }
 
 func TestParseRuntimeConfigAllowsDedicatedTSOGroupWithoutDataRoute(t *testing.T) {
 	t.Parallel()
-	cfg, err := parseRuntimeConfig(
+	cfg, err := ParseRuntimeConfig(
 		"127.0.0.1:50051",
 		"", "", "", "",
 		"0=127.0.0.1:50050,2=127.0.0.1:50052",
 		"", "", "", "", "", "",
 	)
 	require.NoError(t, err)
-	require.Equal(t, uint64(2), cfg.defaultGroup)
-	route, ok := cfg.engine.GetRoute([]byte("user-key"))
+	require.Equal(t, uint64(2), cfg.DefaultGroup)
+	route, ok := cfg.Engine.GetRoute([]byte("user-key"))
 	require.True(t, ok)
 	require.Equal(t, uint64(2), route.GroupID)
-	require.False(t, cfg.multi)
+	require.False(t, cfg.Multi)
 }
 
 func TestParseRuntimeConfigMultipleDataGroupsEnableMultiDataDirs(t *testing.T) {
 	t.Parallel()
-	cfg, err := parseRuntimeConfig(
+	cfg, err := ParseRuntimeConfig(
 		"127.0.0.1:50051",
 		"", "", "", "",
 		"0=127.0.0.1:50050,1=127.0.0.1:50051,2=127.0.0.1:50052",
 		"", "", "", "", "", "",
 	)
 	require.NoError(t, err)
-	require.True(t, cfg.multi)
+	require.True(t, cfg.Multi)
 }
 
 func TestValidateShardRanges(t *testing.T) {
 	t.Parallel()
-	groups := []groupSpec{{id: 0}, {id: 1}, {id: 2}}
+	groups := []GroupSpec{{ID: 0}, {ID: 1}, {ID: 2}}
 
 	t.Run("valid", func(t *testing.T) {
 		err := validateShardRanges([]rangeSpec{{groupID: 1}}, groups)

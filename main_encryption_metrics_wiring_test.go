@@ -11,6 +11,7 @@ import (
 
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryption/kek"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 )
@@ -58,7 +59,7 @@ func TestEncryptionObserverReachesStoreThroughProductionWiring(t *testing.T) {
 	obs := &wiringEncryptionObserver{}
 	keystore := encryption.NewKeystore()
 	encWiring, err := buildEncryptionWriteWiring(
-		true, "n1", sidecarPath, wiringFakeKEK{}, keystore, []groupSpec{{id: 1}}, obs)
+		true, "n1", sidecarPath, wiringFakeKEK{}, keystore, []noderuntime.GroupSpec{{ID: 1}}, obs)
 	if err != nil {
 		t.Fatalf("buildEncryptionWriteWiring: %v", err)
 	}

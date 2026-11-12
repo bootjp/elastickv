@@ -43,10 +43,10 @@ func validateNoExistingCommitTSFenceActivation(ctx context.Context, runtimes []*
 		}
 		active, err := kv.CommitTSFenceEnabled(ctx, rt.store)
 		if err != nil {
-			return errors.Wrapf(err, "read commit-ts fence activation for group %d", rt.spec.id)
+			return errors.Wrapf(err, "read commit-ts fence activation for group %d", rt.spec.ID)
 		}
 		if active && !protected {
-			return errors.WithStack(errors.Newf("group %d has an active commit-ts fence; protected Raft catalog bootstrap is required before startup", rt.spec.id))
+			return errors.WithStack(errors.Newf("group %d has an active commit-ts fence; protected Raft catalog bootstrap is required before startup", rt.spec.ID))
 		}
 	}
 	return nil

@@ -8,6 +8,7 @@ import (
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryption/kek"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/bootjp/elastickv/kv"
@@ -24,11 +25,11 @@ import (
 func buildShardGroupsWithEncryptionWiring(
 	raftID string,
 	raftDir string,
-	groups []groupSpec,
+	groups []noderuntime.GroupSpec,
 	defaultGroup uint64,
 	multi bool,
 	bootstrap bool,
-	bootstrapCfg raftBootstrapConfig,
+	bootstrapCfg noderuntime.BootstrapConfig,
 	factory raftengine.Factory,
 	proposalObserverForGroup func(uint64) kv.ProposalObserver,
 	clock *kv.HLC,
@@ -49,7 +50,7 @@ func buildShardGroupsWithEncryptionWiring(
 		defaultGroup:      defaultGroup,
 		sidecarPath:       sidecarPath,
 		encryptionEnabled: encryptionEnabled,
-		bootstrapServers:  bootstrapCfg.adminSeed(defaultGroup),
+		bootstrapServers:  bootstrapCfg.AdminSeed(defaultGroup),
 	}); guardErr != nil {
 		return nil, nil, encryptionWriteWiring{}, guardErr
 	}
@@ -92,7 +93,7 @@ func configureRaftEnvelopeFactory(factory raftengine.Factory, w encryptionWriteW
 	configurable.SetRaftEnvelope(w.cipher, w.raftEnvelope.engineCutoverIndex)
 }
 
-func validateRaftEnvelopeStartupScope(cutoverIdx uint64, groups []groupSpec) error {
+func validateRaftEnvelopeStartupScope(cutoverIdx uint64, groups []noderuntime.GroupSpec) error {
 	if cutoverIdx == 0 {
 		return nil
 	}
@@ -261,7 +262,7 @@ func (w encryptionWriteWiring) activateStorageEnvelopeV2Writes() {
 // future runtime Bootstrap assigns to the freshly minted DEK, which is that
 // DEK's first-ever use and therefore nonce-safe; a later restart will then
 // take the bump path.
-func buildEncryptionWriteWiring(encryptionEnabled bool, raftID, sidecarPath string, kekWrapper encryption.KEKUnwrapper, keystore *encryption.Keystore, groups []groupSpec, encryptionObserver store.EncryptionObserver) (encryptionWriteWiring, error) {
+func buildEncryptionWriteWiring(encryptionEnabled bool, raftID, sidecarPath string, kekWrapper encryption.KEKUnwrapper, keystore *encryption.Keystore, groups []noderuntime.GroupSpec, encryptionObserver store.EncryptionObserver) (encryptionWriteWiring, error) {
 	w := encryptionWriteWiring{cache: encryption.NewStateCache(), encryptionObserver: encryptionObserver}
 	if !encryptionEnabled || kekWrapper == nil || sidecarPath == "" {
 		return w, nil
@@ -319,7 +320,7 @@ func readRaftEnvelopeStartupState(sidecarPath string) (cutoverIdx uint64, active
 	return sc.RaftEnvelopeCutoverIndex, sc.Active.Raft, nil
 }
 
-func validateRaftEnvelopeStartupState(cutoverIdx uint64, activeRaftDEKID uint32, groups []groupSpec) error {
+func validateRaftEnvelopeStartupState(cutoverIdx uint64, activeRaftDEKID uint32, groups []noderuntime.GroupSpec) error {
 	if cutoverIdx == 0 {
 		return nil
 	}

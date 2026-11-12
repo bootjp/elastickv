@@ -55,7 +55,7 @@ func raftJoinRuntimesReady(ctx context.Context, runtimes []*raftGroupRuntime, lo
 		}
 		configuration, err := runtime.engine.Configuration(ctx)
 		if err != nil {
-			return false, errors.Wrapf(err, "read raft group %d join configuration", runtime.spec.id)
+			return false, errors.Wrapf(err, "read raft group %d join configuration", runtime.spec.ID)
 		}
 		if !configurationContainsMember(configuration, localID) {
 			return false, nil

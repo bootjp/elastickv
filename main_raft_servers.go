@@ -10,6 +10,7 @@ import (
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
 	internalutil "github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	internalraftadmin "github.com/bootjp/elastickv/internal/raftadmin"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
@@ -123,15 +124,15 @@ func startRaftServers(
 	for _, rt := range runtimes {
 		serverOptions := append(slices.Clone(rt.transportServerOptions), raftGRPCServerOptions(adminGRPCOpts)...)
 		gs := grpc.NewServer(serverOptions...)
-		trx := newInternalMigrationTransaction(proposerForGroup(rt, shardGroups), observerForGroup(proposalObserverForGroup, rt.spec.id), rt.store, rt.spec.id)
+		trx := newInternalMigrationTransaction(proposerForGroup(rt, shardGroups), observerForGroup(proposalObserverForGroup, rt.spec.ID), rt.store, rt.spec.ID)
 		grpcSvc := adapter.NewGRPCServer(shardStore, coordinate)
 		pb.RegisterRawKVServer(gs, grpcSvc)
 		pb.RegisterTransactionalKVServer(gs, grpcSvc)
-		internalOpts := internalServerOptions(coordinate, adminServer, proposerForGroup(rt, shardGroups), shardGroups[rt.spec.id], rt.spec.id)
+		internalOpts := internalServerOptions(coordinate, adminServer, proposerForGroup(rt, shardGroups), shardGroups[rt.spec.ID], rt.spec.ID)
 		internalOpts = append(internalOpts, bootstrapInternalPolicyOptions(rt, proposerForGroup(rt, shardGroups))...)
 		internalOpts = append(internalOpts, dedicatedTimestampCutoverOptions(shardGroups)...)
 		internalOpts = append(internalOpts, adapter.WithInternalMigrationOwnershipReady(func() bool {
-			return migrationOwnershipRuntimeReady(trx, shardStore, distServer, rt.spec.id, rt.snapshotEngine(), adminGRPCOpts.migrationReady)
+			return migrationOwnershipRuntimeReady(trx, shardStore, distServer, rt.spec.ID, rt.snapshotEngine(), adminGRPCOpts.migrationReady)
 		}))
 		internalOpts = append(internalOpts, migrationInternalProtocolOptions(trx, shardStore, distServer, rt)...)
 		internalOpts = append(internalOpts, internalReadWatermarkOptions(readWatermarkAdvance, rt, shardGroups)...)
@@ -155,7 +156,7 @@ func startRaftServers(
 				adapter.WithInternalMigrationProposer(proposerForGroup(rt, shardGroups)),
 				adapter.WithInternalRouteEngine(routeEngine),
 				adapter.WithInternalActiveTimestampTracker(readTracker),
-				adapter.WithInternalMigrationExportRouting(rt.spec.id, sqsPartitionResolver),
+				adapter.WithInternalMigrationExportRouting(rt.spec.ID, sqsPartitionResolver),
 			)...,
 		))
 		pb.RegisterDistributionServer(gs, distServer)
@@ -193,9 +194,9 @@ func startRaftServers(
 		)
 		reflection.Register(gs)
 
-		grpcSock, err := lc.Listen(ctx, "tcp", rt.spec.address)
+		grpcSock, err := lc.Listen(ctx, "tcp", rt.spec.Address)
 		if err != nil {
-			return errors.Wrapf(err, "failed to listen on %s", rt.spec.address)
+			return errors.Wrapf(err, "failed to listen on %s", rt.spec.Address)
 		}
 		srv := gs
 		lis := grpcSock
@@ -209,7 +210,7 @@ func startRaftServers(
 			go func() {
 				select {
 				case <-ctx.Done():
-					stopGRPCServerBounded(ctx, srv, rt.spec.address)
+					stopGRPCServerBounded(ctx, srv, rt.spec.Address)
 					_ = lis.Close()
 					closeService()
 				case <-stop:
@@ -248,7 +249,7 @@ func internalServerOptions(
 	if group != nil && group.Store != nil {
 		opts = append(opts, adapter.WithInternalLastCommitTimestamp(group.Store.LastCommitTS))
 	}
-	if groupID == dedicatedTSORaftGroupID {
+	if groupID == noderuntime.DedicatedTSORaftGroupID {
 		opts = append(opts, adapter.WithKVForwardRejected())
 	}
 	return opts

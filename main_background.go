@@ -179,7 +179,7 @@ func fsmCompactionRuntimes(runtimes []*raftGroupRuntime) []kv.FSMCompactRuntime 
 			continue
 		}
 		out = append(out, kv.FSMCompactRuntime{
-			GroupID:      runtime.spec.id,
+			GroupID:      runtime.spec.ID,
 			StatusReader: runtime.engine,
 			Store:        runtime.store,
 		})

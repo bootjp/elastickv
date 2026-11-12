@@ -1,4 +1,4 @@
-package main
+package noderuntime
 
 import (
 	"testing"
@@ -8,7 +8,7 @@ import (
 
 func TestBuildLeaderDynamoWithoutHTTPMap(t *testing.T) {
 	t.Parallel()
-	groups := []groupSpec{{id: 1, address: "127.0.0.1:50051"}}
+	groups := []GroupSpec{{ID: 1, Address: "127.0.0.1:50051"}}
 	for _, raw := range []string{"", "  "} {
 		got, err := buildLeaderDynamo(groups, "127.0.0.1:8000", raw)
 		require.NoError(t, err)

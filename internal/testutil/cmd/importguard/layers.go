@@ -42,6 +42,7 @@ var upperLayers = []string{
 	"distribution/autosplit",
 	"internal/admin",
 	"internal/adminbridge",
+	"internal/noderuntime",
 	"internal/serverwiring",
 	"internal/snapshotoffload",
 }
@@ -126,6 +127,7 @@ var restrictedPackages = []restrictedPackage{
 	},
 	{Pkg: "internal/serverwiring", AllowedFrom: []string{".", "cmd"}, Why: "server wiring is for binaries only"},
 	{Pkg: "internal/adminbridge", AllowedFrom: []string{".", "cmd"}, Why: "admin bridges are wired by binaries only"},
+	{Pkg: "internal/noderuntime", AllowedFrom: []string{".", "cmd"}, Why: "node runtime configuration is resolved by binaries only"},
 }
 
 // checkLayering reports a layer violation when a production file in the

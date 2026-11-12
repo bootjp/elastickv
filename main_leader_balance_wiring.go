@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/internal/leaderbalance"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/prometheus/client_golang/prometheus"
@@ -43,7 +44,7 @@ func (f *leaderBalanceFlags) register(fs *flag.FlagSet) {
 	fs.StringVar(&f.killSwitchFile, "leaderBalanceKillSwitchFile", "", "If non-empty and the file exists, the leader-balance scheduler observes but skips transfers")
 }
 
-func leaderBalanceOptions(f leaderBalanceFlags, localNodeID string, defaultGroupID uint64, partitionMap map[string]sqsFifoQueueRouting, registerer prometheus.Registerer) leaderbalance.Options {
+func leaderBalanceOptions(f leaderBalanceFlags, localNodeID string, defaultGroupID uint64, partitionMap map[string]noderuntime.SQSFifoQueueRouting, registerer prometheus.Registerer) leaderbalance.Options {
 	return leaderbalance.Options{
 		Enabled:            f.enabled,
 		LocalNodeID:        localNodeID,
@@ -77,7 +78,7 @@ func leaderBalanceGroups(runtimes []*raftGroupRuntime) []leaderbalance.Group {
 
 // GroupID is the Raft group this runtime serves.
 func (r *raftGroupRuntime) GroupID() uint64 {
-	return r.spec.id
+	return r.spec.ID
 }
 
 // Engine is the group's Raft engine, or nil while it is not open.

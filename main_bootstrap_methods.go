@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"math"
 
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/peersession"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/bootjp/elastickv/kv"
@@ -93,7 +94,7 @@ func bootstrapFloorReply(request peersession.Message, payload any) (peersession.
 
 func bootstrapTimestampRequest(binding peersession.RequestBinding, payload any) (peersession.Message, error) {
 	req, ok := payload.(*pb.GetTimestampRequest)
-	if !ok || !bootstrapExactProto(req) || binding.Group != dedicatedTSORaftGroupID ||
+	if !ok || !bootstrapExactProto(req) || binding.Group != noderuntime.DedicatedTSORaftGroupID ||
 		req.GetCount() > uint32(kv.MaxTSOBatchSize) || (req.GetActivatePhaseD() && !req.GetActivateCutover()) {
 		return peersession.Message{}, peersession.ErrFormat
 	}

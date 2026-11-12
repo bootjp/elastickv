@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/cockroachdb/errors"
@@ -53,7 +54,7 @@ func TestPublishedBootstrapMarkerRejectsLegacyEngineBeforeFactory(t *testing.T) 
 	_, _, err = readRaftEngineMarker(marker)
 	require.ErrorIs(t, err, ErrUnsupportedRaftEngine)
 	factory := &bootstrapFormatFactory{}
-	runtime, err := buildRuntimeForGroup("n1", groupSpec{id: 1}, base, false, true, nil, nil, nil, nil, factory, false)
+	runtime, err := buildRuntimeForGroup("n1", noderuntime.GroupSpec{ID: 1}, base, false, true, nil, nil, nil, nil, factory, false)
 	require.ErrorIs(t, err, ErrUnsupportedRaftEngine)
 	require.Nil(t, runtime)
 	require.Zero(t, factory.creates)

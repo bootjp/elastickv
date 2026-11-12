@@ -12,6 +12,7 @@ import (
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryption/kek"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/internal/raftengine/etcd"
@@ -35,7 +36,7 @@ func newOfflineEncryptedE2EFixture(t *testing.T) (*bootstrapRotationE2EFixture, 
 	require.NoError(t, err)
 	cfg, err := loadBootstrapFixture(t, encoded)
 	require.NoError(t, err)
-	f := &bootstrapRotationE2EFixture{base: t.TempDir(), configDir: t.TempDir(), config: cfg, group: groupSpec{id: 1, address: cfg.local.Address}, listener: listener, activeEnvelopes: true}
+	f := &bootstrapRotationE2EFixture{base: t.TempDir(), configDir: t.TempDir(), config: cfg, group: noderuntime.GroupSpec{ID: 1, Address: cfg.local.Address}, listener: listener, activeEnvelopes: true}
 	f.dir = groupDataDir(f.base, "n1", 1, false)
 	f.sidecarPath = filepath.Join(f.dir, "encryption", "keys.json")
 	require.NoError(t, os.MkdirAll(filepath.Dir(f.sidecarPath), 0o700))
@@ -63,7 +64,7 @@ func prepareOfflineEncryptedLegacy(t *testing.T, f *bootstrapRotationE2EFixture)
 	clock, routes := kv.NewHLC(), distribution.NewEngine()
 	routes.UpdateRoute(nil, nil, 1)
 	keys := encryption.NewKeystore()
-	w, err := buildEncryptionWriteWiring(true, "n1", f.sidecarPath, f.wrapper, keys, []groupSpec{f.group}, nil)
+	w, err := buildEncryptionWriteWiring(true, "n1", f.sidecarPath, f.wrapper, keys, []noderuntime.GroupSpec{f.group}, nil)
 	require.NoError(t, err)
 	factory := enablementFactory()
 	configureRaftEnvelopeFactory(factory, w)

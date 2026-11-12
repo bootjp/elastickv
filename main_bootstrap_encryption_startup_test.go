@@ -6,6 +6,7 @@ import (
 	"time"
 
 	internalutil "github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftadmission"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -92,7 +93,7 @@ func TestBootstrapEncryptionRecoveryBarrierOwnsRecoveryChildOfRotation(t *testin
 		})
 		return 17, err
 	}
-	rt := &raftGroupRuntime{spec: groupSpec{id: 1}, engine: engine}
+	rt := &raftGroupRuntime{spec: noderuntime.GroupSpec{ID: 1}, engine: engine}
 	barrier, err := bootstrapEncryptionRecoveryBarrier(domain, rt)
 	require.NoError(t, err)
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
@@ -115,7 +116,7 @@ func TestBootstrapEncryptionRecoveryBarrierRejectsRetiredEngineAndCancellation(t
 	t.Parallel()
 	domain := bootstrapIngressFixture(t).domain
 	engine := &bootstrapStartupRecoveryEngine{}
-	rt := &raftGroupRuntime{spec: groupSpec{id: 1}, engine: engine}
+	rt := &raftGroupRuntime{spec: noderuntime.GroupSpec{ID: 1}, engine: engine}
 	engine.read = func(context.Context) (uint64, error) {
 		rt.engineMu.Lock()
 		rt.engine = nil

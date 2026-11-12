@@ -322,8 +322,8 @@ func snapshotOffloadGroups(
 			continue
 		}
 		groups = append(groups, snapshotoffload.OffloadGroup{
-			GroupID:      rt.spec.id,
-			DataDir:      groupDataDir(raftDir, raftID, rt.spec.id, multi),
+			GroupID:      rt.spec.ID,
+			DataDir:      groupDataDir(raftDir, raftID, rt.spec.ID, multi),
 			IsLeader:     snapshotOffloadIsLeader(rt),
 			VerifyLeader: snapshotOffloadVerifyLeader(rt),
 		})

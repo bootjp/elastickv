@@ -16,7 +16,7 @@ func raftMonitorRuntimes(runtimes []*raftGroupRuntime) []monitoring.RaftRuntime 
 			continue
 		}
 		out = append(out, monitoring.RaftRuntime{
-			GroupID:      runtime.spec.id,
+			GroupID:      runtime.spec.ID,
 			StatusReader: runtime.engine,
 			ConfigReader: runtime.engine,
 		})
@@ -76,8 +76,8 @@ func pebbleMonitorSources(runtimes []*raftGroupRuntime) []monitoring.PebbleSourc
 			continue
 		}
 		out = append(out, monitoring.PebbleSource{
-			GroupID:    runtime.spec.id,
-			GroupIDStr: strconv.FormatUint(runtime.spec.id, 10),
+			GroupID:    runtime.spec.ID,
+			GroupIDStr: strconv.FormatUint(runtime.spec.ID, 10),
 			Source:     src,
 		})
 	}
@@ -100,7 +100,7 @@ func dispatchMonitorSources(runtimes []*raftGroupRuntime) []monitoring.DispatchS
 			continue
 		}
 		out = append(out, monitoring.DispatchSource{
-			GroupID: runtime.spec.id,
+			GroupID: runtime.spec.ID,
 			Source:  src,
 		})
 	}
@@ -213,8 +213,8 @@ func writeConflictMonitorSources(runtimes []*raftGroupRuntime) []monitoring.Writ
 			continue
 		}
 		out = append(out, monitoring.WriteConflictSource{
-			GroupID:    runtime.spec.id,
-			GroupIDStr: strconv.FormatUint(runtime.spec.id, 10),
+			GroupID:    runtime.spec.ID,
+			GroupIDStr: strconv.FormatUint(runtime.spec.ID, 10),
 			Source:     src,
 		})
 	}

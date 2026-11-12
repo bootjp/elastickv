@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/peersession"
 	"github.com/bootjp/elastickv/internal/raftadmission"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
@@ -38,7 +39,7 @@ type tsoEnablementState struct {
 	policies                         map[uint64]raftbootstrap.PolicyRecord
 }
 
-func tsoEnablementLegacyProfile(t *testing.T, base string, groups []groupSpec) {
+func tsoEnablementLegacyProfile(t *testing.T, base string, groups []noderuntime.GroupSpec) {
 	t.Helper()
 	clock := kv.NewHLC()
 	routes := distribution.NewEngine()
@@ -91,7 +92,7 @@ func tsoEnablementSignedBaseline(t *testing.T, dir string, cfg *bootstrapPeerCon
 	require.NoError(t, err)
 	defer func() { require.NoError(t, source.Snapshot.Close()) }()
 	c := raftbootstrap.BaselineContext{Version: raftbootstrap.BaselineVersion,
-		Identity: raftbootstrap.Identity{Cluster: cfg.local.Cluster, Group: dedicatedTSORaftGroupID}, OperationID: raftbootstrap.OperationID{72},
+		Identity: raftbootstrap.Identity{Cluster: cfg.local.Cluster, Group: noderuntime.DedicatedTSORaftGroupID}, OperationID: raftbootstrap.OperationID{72},
 		Configuration: raftbootstrap.Configuration{Index: source.ConfigurationIndex,
 			State: raftbootstrap.ConfState{Voters: source.Configuration.GetVoters(), VotersOutgoing: source.Configuration.GetVotersOutgoing(),
 				Learners: source.Configuration.GetLearners(), LearnersNext: source.Configuration.GetLearnersNext(), AutoLeave: source.Configuration.GetAutoLeave()},
@@ -108,9 +109,9 @@ func tsoEnablementSignedBaseline(t *testing.T, dir string, cfg *bootstrapPeerCon
 	return raftbootstrap.BaselineManifest{BaselineContext: c, Members: []raftbootstrap.BaselineMemberEvidence{probe.Evidence}}
 }
 
-func tsoEnablementStart(t *testing.T, base, peerConfigDir string, profile []groupSpec) *tsoEnablementNode {
+func tsoEnablementStart(t *testing.T, base, peerConfigDir string, profile []noderuntime.GroupSpec) *tsoEnablementNode {
 	t.Helper()
-	bootstrapCfg := raftBootstrapConfig{peerConfigDir: peerConfigDir}
+	bootstrapCfg := noderuntime.BootstrapConfig{PeerConfigDir: peerConfigDir}
 	specs, domain, err := loadProtectedBootstrapDomain("n1", base, profile, true, bootstrapCfg)
 	require.NoError(t, err)
 	t.Cleanup(domain.admission.Close)
@@ -122,10 +123,10 @@ func tsoEnablementStart(t *testing.T, base, peerConfigDir string, profile []grou
 	node := &tsoEnablementNode{domain: domain, cluster: specs[0].intent.Identity.Cluster, groups: make(map[uint64]*kv.ShardGroup)}
 	for _, group := range profile {
 		runtime, shard, err := builder.build(group)
-		require.NoError(t, err, "group %d protected Open must use real migrated native proof", group.id)
+		require.NoError(t, err, "group %d protected Open must use real migrated native proof", group.ID)
 		t.Cleanup(runtime.Close)
 		node.runtimes = append(node.runtimes, runtime)
-		node.groups[group.id] = shard
+		node.groups[group.ID] = shard
 	}
 	_, premature, err := domain.admission.Begin(t.Context(), raftadmission.Data)
 	if premature != nil {
@@ -161,7 +162,7 @@ func tsoEnablementStart(t *testing.T, base, peerConfigDir string, profile []grou
 		return node.runtimes[0].publicReady() && node.runtimes[1].publicReady()
 	}, enablementE2EWait, 10*time.Millisecond, "both protected groups must reach DataReady without synthetic recovery publication")
 	for _, group := range profile {
-		require.Equal(t, peersession.DataReady, domain.admission.Stage(group.id))
+		require.Equal(t, peersession.DataReady, domain.admission.Stage(group.ID))
 	}
 	return node
 }
@@ -174,9 +175,9 @@ func tsoEnablementCapture(t *testing.T, node *tsoEnablementNode) tsoEnablementSt
 		policies: make(map[uint64]raftbootstrap.PolicyRecord)}
 	for _, runtime := range node.runtimes {
 		policy, err := kv.LoadAppliedBootstrapPolicy(t.Context(), runtime.store,
-			raftbootstrap.Identity{Cluster: node.cluster, Group: runtime.spec.id}, runtime.engine.Status().AppliedIndex)
+			raftbootstrap.Identity{Cluster: node.cluster, Group: runtime.spec.ID}, runtime.engine.Status().AppliedIndex)
 		require.NoError(t, err)
-		image.policies[runtime.spec.id] = policy
+		image.policies[runtime.spec.ID] = policy
 	}
 	return image
 }
@@ -198,7 +199,7 @@ func tsoEnablementAllocate(t *testing.T, node *tsoEnablementNode, min uint64, ac
 
 // prepareTSOEnablementProfile returns the data base dir, the group profile,
 // the TSO baseline manifest and the prepared peer config dir.
-func prepareTSOEnablementProfile(t *testing.T) (string, []groupSpec, raftbootstrap.BaselineManifest, string) {
+func prepareTSOEnablementProfile(t *testing.T) (string, []noderuntime.GroupSpec, raftbootstrap.BaselineManifest, string) {
 	t.Helper()
 	t.Setenv("ELASTICKV_RAFT_SNAPSHOT_COUNT", "1")
 	base := t.TempDir()
@@ -208,7 +209,7 @@ func prepareTSOEnablementProfile(t *testing.T) (string, []groupSpec, raftbootstr
 	require.NoError(t, err)
 	cfg, err := loadBootstrapFixture(t, encoded)
 	require.NoError(t, err)
-	profile := []groupSpec{{id: 0, address: cfg.local.Address}, {id: 1, address: cfg.local.Address}}
+	profile := []noderuntime.GroupSpec{{ID: 0, Address: cfg.local.Address}, {ID: 1, Address: cfg.local.Address}}
 	tsoEnablementLegacyProfile(t, base, profile)
 	t.Log("legacy profile quiesced with populated data and snapshot-only dedicated TSO")
 	tsoManifest := tsoEnablementSignedBaseline(t, groupDataDir(base, "n1", 0, true), cfg)

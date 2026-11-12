@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/peersession"
 	"github.com/bootjp/elastickv/internal/raftadmission"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
@@ -43,11 +44,11 @@ func enablementPeerConfig(t *testing.T) (bootstrapPeerJSON, *bootstrapPeerConfig
 	return raw, cfg
 }
 
-func enablementLegacyCut(t *testing.T, base string, group groupSpec) string {
+func enablementLegacyCut(t *testing.T, base string, group noderuntime.GroupSpec) string {
 	t.Helper()
 	clock := kv.NewHLC()
 	routes := distribution.NewEngine()
-	routes.UpdateRoute(nil, nil, group.id)
+	routes.UpdateRoute(nil, nil, group.ID)
 	builder := shardGroupBuilder{raftID: "n1", raftDir: base, bootstrap: true, factory: enablementFactory(),
 		clock: clock, readTracker: kv.NewActiveTimestampTracker(), routeEngine: routes}
 	runtime, _, err := builder.build(group)
@@ -67,7 +68,7 @@ func enablementLegacyCut(t *testing.T, base string, group groupSpec) string {
 	cut := runtime.engine.Status().AppliedIndex
 	require.Eventually(t, func() bool { return runtime.engine.Status().LastSnapshotIndex >= cut }, enablementE2EWait, 10*time.Millisecond)
 	runtime.Close()
-	return groupDataDir(base, "n1", group.id, false)
+	return groupDataDir(base, "n1", group.ID, false)
 }
 
 func enablementLegacyPut(t *testing.T, engine raftengine.Engine, ts uint64, key, value string) {
@@ -80,7 +81,7 @@ func enablementLegacyPut(t *testing.T, engine raftengine.Engine, ts uint64, key,
 	require.NoError(t, err)
 }
 
-func enablementSignedBaseline(t *testing.T, dir string, cfg *bootstrapPeerConfig, group groupSpec) raftbootstrap.BaselineManifest {
+func enablementSignedBaseline(t *testing.T, dir string, cfg *bootstrapPeerConfig, group noderuntime.GroupSpec) raftbootstrap.BaselineManifest {
 	t.Helper()
 	ownership, err := etcd.AcquireOfflineBaselineOwnership(dir)
 	require.NoError(t, err)
@@ -97,7 +98,7 @@ func enablementSignedBaseline(t *testing.T, dir string, cfg *bootstrapPeerConfig
 			Learners: source.Configuration.GetLearners(), LearnersNext: source.Configuration.GetLearnersNext(), AutoLeave: source.Configuration.GetAutoLeave()},
 		Members: []raftbootstrap.Member{{ID: cfg.local.Member, Address: cfg.local.Address, PublicKeyDigest: cfg.local.Key}}}
 	cut := raftbootstrap.BaselineContext{Version: raftbootstrap.BaselineVersion,
-		Identity: raftbootstrap.Identity{Cluster: cfg.local.Cluster, Group: group.id}, OperationID: raftbootstrap.OperationID{71},
+		Identity: raftbootstrap.Identity{Cluster: cfg.local.Cluster, Group: group.ID}, OperationID: raftbootstrap.OperationID{71},
 		Configuration: configuration, Minimum: raftbootstrap.Versions{Entry: 1, Snapshot: 1, Session: 1},
 		CommitIndex: source.CommitIndex, CommitTerm: source.CommitTerm, Watermark: proof.Watermark, DataDigest: proof.DataDigest}
 	inspection, err := etcd.InspectOfflineBaseline(t.Context(), etcd.OfflineBaselineOptions{Ownership: ownership, DataDir: dir,
@@ -162,14 +163,14 @@ type enablementProtectedNode struct {
 	close      func()
 }
 
-func enablementStartProtected(t *testing.T, base, peerConfigDir string, group groupSpec) *enablementProtectedNode {
+func enablementStartProtected(t *testing.T, base, peerConfigDir string, group noderuntime.GroupSpec) *enablementProtectedNode {
 	t.Helper()
-	bootstrapCfg := raftBootstrapConfig{peerConfigDir: peerConfigDir}
-	specs, domain, err := loadProtectedBootstrapDomain("n1", base, []groupSpec{group}, false, bootstrapCfg)
+	bootstrapCfg := noderuntime.BootstrapConfig{PeerConfigDir: peerConfigDir}
+	specs, domain, err := loadProtectedBootstrapDomain("n1", base, []noderuntime.GroupSpec{group}, false, bootstrapCfg)
 	require.NoError(t, err)
 	t.Cleanup(domain.admission.Close)
 	routes := distribution.NewEngine()
-	routes.UpdateRoute(nil, nil, group.id)
+	routes.UpdateRoute(nil, nil, group.ID)
 	clock := kv.NewHLC()
 	builder := shardGroupBuilder{raftID: "n1", raftDir: base, factory: enablementFactory(), bootstrapCfg: bootstrapCfg,
 		clock: clock, readTracker: kv.NewActiveTimestampTracker(), routeEngine: routes, bootstrapSpecs: specs}
@@ -185,14 +186,14 @@ func enablementStartProtected(t *testing.T, base, peerConfigDir string, group gr
 		}
 		require.Error(t, err, "process-wide DataReady is required before target routing")
 	}
-	groups := map[uint64]*kv.ShardGroup{group.id: shard}
+	groups := map[uint64]*kv.ShardGroup{group.ID: shard}
 	shards := kv.NewShardStore(routes, groups)
 	shards.SetOperationAdmission(domain.operationAdmission)
-	coordinate := kv.NewShardedCoordinator(routes, groups, group.id, clock, shards).WithOperationAdmission(domain.operationAdmission)
+	coordinate := kv.NewShardedCoordinator(routes, groups, group.ID, clock, shards).WithOperationAdmission(domain.operationAdmission)
 	ctx, cancel := context.WithCancel(t.Context())
 	eg, runCtx := errgroup.WithContext(ctx)
 	startBootstrapActivationWorkers(runCtx, eg, []*raftGroupRuntime{runtime}, groups)
-	catalog := distributionCatalogStoreForGroup([]*raftGroupRuntime{runtime}, group.id)
+	catalog := distributionCatalogStoreForGroup([]*raftGroupRuntime{runtime}, group.ID)
 	startBootstrapReadinessReconciler(runCtx, eg, []*raftGroupRuntime{runtime}, catalog, routes)
 	var once sync.Once
 	node := &enablementProtectedNode{runtime: runtime, domain: domain, coordinate: coordinate, shards: shards}
@@ -208,7 +209,7 @@ func enablementStartProtected(t *testing.T, base, peerConfigDir string, group gr
 	t.Cleanup(node.close)
 	require.Eventually(t, func() bool { return runtime.publicReady() }, enablementE2EWait, 10*time.Millisecond,
 		"activation/recovery/catalog must reach DataReady without synthetic publication")
-	require.Equal(t, peersession.DataReady, domain.admission.Stage(group.id))
+	require.Equal(t, peersession.DataReady, domain.admission.Stage(group.ID))
 	snapshot, err := catalog.Snapshot(t.Context())
 	require.NoError(t, err)
 	require.NotZero(t, snapshot.Version)
@@ -233,7 +234,7 @@ func TestBootstrapEnablementLegacyDataToProtectedDataReady(t *testing.T) {
 	t.Setenv("ELASTICKV_RAFT_SNAPSHOT_COUNT", "1")
 	base := t.TempDir()
 	raw, cfg := enablementPeerConfig(t)
-	group := groupSpec{id: 1, address: cfg.local.Address}
+	group := noderuntime.GroupSpec{ID: 1, Address: cfg.local.Address}
 	dir := enablementLegacyCut(t, base, group)
 	manifest := enablementSignedBaseline(t, dir, cfg, group)
 	payload := enablementMigrateAndCertify(t, dir, cfg, manifest)

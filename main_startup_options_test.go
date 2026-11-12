@@ -7,6 +7,7 @@ import (
 
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
@@ -89,13 +90,13 @@ func TestInternalReadWatermarkOptions(t *testing.T) {
 			t.Parallel()
 			raft := &startupWatermarkEngine{index: 17}
 			selected := &startupWatermarkEngine{index: 23, err: tc.err}
-			rt := &raftGroupRuntime{spec: groupSpec{id: 7}, engine: raft}
+			rt := &raftGroupRuntime{spec: noderuntime.GroupSpec{ID: 7}, engine: raft}
 			groups := map[uint64]*kv.ShardGroup{}
 			if tc.wrapped || tc.err != nil {
 				group := &kv.ShardGroup{Engine: selected}
 				_ = kv.NewLeaderProxyForShardGroup(group)
 				require.NotSame(t, selected, group.Proposer())
-				groups[rt.spec.id] = group
+				groups[rt.spec.ID] = group
 			}
 			clock := kv.NewHLC()
 			opts := []adapter.InternalOption{adapter.WithInternalAdminProposer(raft)}

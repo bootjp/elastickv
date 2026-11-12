@@ -44,15 +44,15 @@ func TestRuntimeInputsCarryBootstrapFlagsIntoBootstrapConfig(t *testing.T) {
 	bootstrap := raftBootstrapFlags{peerConfigDir: "/etc/elastickv/peers", joinAsLearner: true}
 	_, _, bootstrapCfg, bootstrapping, err := resolveRuntimeInputs(raft, defaultFlags[topologyFlags](), defaultFlags[listenerFlags](), bootstrap)
 	require.NoError(t, err)
-	require.Equal(t, "/etc/elastickv/peers", bootstrapCfg.peerConfigDir)
-	require.True(t, bootstrapCfg.joinAsLearner)
+	require.Equal(t, "/etc/elastickv/peers", bootstrapCfg.PeerConfigDir)
+	require.True(t, bootstrapCfg.JoinAsLearner)
 	require.False(t, bootstrapping)
 
 	bootstrap = raftBootstrapFlags{bootstrap: true}
 	_, _, bootstrapCfg, bootstrapping, err = resolveRuntimeInputs(raft, defaultFlags[topologyFlags](), defaultFlags[listenerFlags](), bootstrap)
 	require.NoError(t, err)
-	require.Empty(t, bootstrapCfg.peerConfigDir)
-	require.False(t, bootstrapCfg.joinAsLearner)
+	require.Empty(t, bootstrapCfg.PeerConfigDir)
+	require.False(t, bootstrapCfg.JoinAsLearner)
 	require.True(t, bootstrapping)
 }
 
