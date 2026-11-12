@@ -5,16 +5,15 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/adapter"
+	"github.com/bootjp/elastickv/internal/leaderbalance"
 	"github.com/bootjp/elastickv/internal/serverwiring"
 )
 
 const (
-	filesystemStartupRetryBudget   = 90 * time.Second
-	filesystemStartupRetryInterval = 250 * time.Millisecond
-	heartbeatTimeout               = 200 * time.Millisecond
-	electionTimeout                = 2000 * time.Millisecond
-	raftMetricsObserveInterval     = 5 * time.Second
-	dirPerm                        = raftDirPerm
+	heartbeatTimeout           = 200 * time.Millisecond
+	electionTimeout            = 2000 * time.Millisecond
+	raftMetricsObserveInterval = 5 * time.Second
+	dirPerm                    = raftDirPerm
 
 	etcdTickInterval      = 10 * time.Millisecond
 	etcdHeartbeatMinTicks = 1
@@ -81,12 +80,12 @@ var (
 	commitTSFence                   = flag.Bool("commitTSFence", false, "Reserved for replicated catalog bootstrap; activation is rejected until the startup catalog no longer writes outside Raft")
 	readWatermarkAdvance            = flag.Bool("readWatermarkAdvance", false, "Raise a lagging group's commit watermark before a cross-group snapshot read so late one-phase writes cannot land below the snapshot; enable only after every node runs a binary that understands the advance entry")
 	leaderBalance                   = flag.Bool("leaderBalance", false, "Enable automatic count-based Raft-group leader balancing on the default-group leader")
-	leaderBalanceInterval           = flag.Duration("leaderBalanceInterval", defaultLeaderBalanceInterval, "Interval between leader-balance scheduler evaluations")
-	leaderBalanceGroupCooldown      = flag.Duration("leaderBalanceGroupCooldown", defaultLeaderBalanceGroupCooldown, "Minimum time before the scheduler can move the same raft group again")
-	leaderBalanceGlobalCooldown     = flag.Duration("leaderBalanceGlobalCooldown", defaultLeaderBalanceGlobalCooldown, "Minimum time between any two automatic leadership transfers")
+	leaderBalanceInterval           = flag.Duration("leaderBalanceInterval", leaderbalance.DefaultInterval, "Interval between leader-balance scheduler evaluations")
+	leaderBalanceGroupCooldown      = flag.Duration("leaderBalanceGroupCooldown", leaderbalance.DefaultGroupCooldown, "Minimum time before the scheduler can move the same raft group again")
+	leaderBalanceGlobalCooldown     = flag.Duration("leaderBalanceGlobalCooldown", leaderbalance.DefaultGlobalCooldown, "Minimum time between any two automatic leadership transfers")
 	leaderBalanceStartupGrace       = flag.Duration("leaderBalanceStartupGrace", 0, "Grace period after acquiring default-group leadership before issuing transfers; 0 uses max(interval, global cooldown)")
-	leaderBalanceImbalanceThreshold = flag.Int("leaderBalanceImbalanceThreshold", defaultLeaderBalanceImbalanceThreshold, "Minimum leader-count spread required before balancing")
-	leaderBalanceMaxTargetLag       = flag.Uint64("leaderBalanceMaxTargetLag", defaultLeaderBalanceMaxTargetLag, "Maximum target lag in raft log entries for gated automatic leadership transfers; 0 requires the target to match the leader's last log index")
+	leaderBalanceImbalanceThreshold = flag.Int("leaderBalanceImbalanceThreshold", leaderbalance.DefaultImbalanceThreshold, "Minimum leader-count spread required before balancing")
+	leaderBalanceMaxTargetLag       = flag.Uint64("leaderBalanceMaxTargetLag", leaderbalance.DefaultMaxTargetLag, "Maximum target lag in raft log entries for gated automatic leadership transfers; 0 requires the target to match the leader's last log index")
 	leaderBalancePinGroups          = flag.String("leaderBalancePinGroups", "", "Comma-separated raft group IDs excluded from automatic leader balancing")
 	leaderBalanceKillSwitchFile     = flag.String("leaderBalanceKillSwitchFile", "", "If non-empty and the file exists, the leader-balance scheduler observes but skips transfers")
 	raftGroups                      = flag.String("raftGroups", "", "Comma-separated raft groups (groupID=host:port,...)")

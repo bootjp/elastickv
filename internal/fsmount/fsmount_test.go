@@ -1,9 +1,8 @@
-package main
+package fsmount
 
 import (
 	"context"
 	"errors"
-	"math"
 	"os"
 	"path/filepath"
 	"sync"
@@ -15,6 +14,7 @@ import (
 	"github.com/bootjp/elastickv/internal/filesystem/fstest"
 	"github.com/bootjp/elastickv/internal/filesystem/fuseadapter"
 	"github.com/bootjp/elastickv/internal/testutil"
+	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 )
@@ -51,156 +51,24 @@ func TestRunFilesystemLeaseReaperRunsPeriodically(t *testing.T) {
 	require.Equal(t, []int{0, 0}, reaper.limits)
 }
 
-func TestFilesystemStartConfigFromFlags(t *testing.T) {
-	oldMount, oldClientID, oldRaftID := *filesystemMount, *filesystemClientID, *raftId
-	oldStrict := *filesystemStrict
-	oldStrictRecover := *filesystemStrictRecover
-	oldMode, oldUID, oldGID := *filesystemRootMode, *filesystemRootUID, *filesystemRootGID
-	t.Cleanup(func() {
-		*filesystemMount, *filesystemClientID, *raftId = oldMount, oldClientID, oldRaftID
-		*filesystemStrict = oldStrict
-		*filesystemStrictRecover = oldStrictRecover
-		*filesystemRootMode, *filesystemRootUID, *filesystemRootGID = oldMode, oldUID, oldGID
-	})
-
-	tests := []struct {
-		name          string
-		mount         string
-		clientID      string
-		raftID        string
-		mode          uint
-		uid           uint
-		gid           uint
-		want          filesystemStartConfig
-		wantErr       string
-		strict        bool
-		strictRecover bool
-	}{
-		{
-			name:  "disabled when mount point is blank",
-			mount: "   ",
-			mode:  0o7777 + 1,
-			want:  filesystemStartConfig{},
-		},
-		{
-			name:   "client id defaults to raft id",
-			mount:  " /mnt/fs ",
-			raftID: " n1 ",
-			mode:   0o750,
-			uid:    1000,
-			gid:    1001,
-			want:   filesystemStartConfig{mountPoint: "/mnt/fs", clientID: "n1", rootMode: 0o750, rootUID: 1000, rootGID: 1001},
-		},
-		{
-			name:     "explicit client id wins",
-			mount:    "/mnt/fs",
-			clientID: "mount-a",
-			raftID:   "n1",
-			mode:     0o755,
-			want:     filesystemStartConfig{mountPoint: "/mnt/fs", clientID: "mount-a", rootMode: 0o755},
-		},
-		{
-			name:   "strict mount is explicit",
-			mount:  "/mnt/fs",
-			raftID: "n1",
-			mode:   0o755,
-			strict: true,
-			want:   filesystemStartConfig{mountPoint: "/mnt/fs", clientID: "n1", strict: true, rootMode: 0o755},
-		},
-		{
-			name:          "strict recovery needs strict mount",
-			mount:         "/mnt/fs",
-			raftID:        "n1",
-			mode:          0o755,
-			strictRecover: true,
-			wantErr:       "requires filesystemStrict",
-		},
-		{
-			name:    "client id required",
-			mount:   "/mnt/fs",
-			mode:    0o755,
-			wantErr: "client ID is required",
-		},
-		{
-			name:    "root mode out of range",
-			mount:   "/mnt/fs",
-			raftID:  "n1",
-			mode:    0o7777 + 1,
-			wantErr: "out of range",
-		},
-		{
-			name:    "root uid out of range",
-			mount:   "/mnt/fs",
-			raftID:  "n1",
-			mode:    0o755,
-			uid:     math.MaxUint32 + 1,
-			wantErr: "out of range",
-		},
-		{
-			name:    "root gid out of range",
-			mount:   "/mnt/fs",
-			raftID:  "n1",
-			mode:    0o755,
-			gid:     math.MaxUint32 + 1,
-			wantErr: "out of range",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			*filesystemMount, *filesystemClientID, *raftId = tt.mount, tt.clientID, tt.raftID
-			*filesystemStrict = tt.strict
-			*filesystemStrictRecover = tt.strictRecover
-			*filesystemRootMode, *filesystemRootUID, *filesystemRootGID = tt.mode, tt.uid, tt.gid
-
-			got, err := filesystemStartConfigFromFlags()
-			if tt.wantErr != "" {
-				require.ErrorContains(t, err, tt.wantErr)
-				require.Equal(t, filesystemStartConfig{}, got)
-				return
-			}
-			require.NoError(t, err)
-			require.Equal(t, tt.want, got)
-		})
-	}
-}
-
-func TestStartFilesystemIfEnabledIsNoopWithoutMountPoint(t *testing.T) {
-	oldMount := *filesystemMount
-	t.Cleanup(func() { *filesystemMount = oldMount })
-	*filesystemMount = ""
-
-	require.NoError(t, startFilesystemIfEnabled(context.Background(), nil, nil, nil, nil, nil))
-}
-
-func TestStartFilesystemIfEnabledRequiresLifecycle(t *testing.T) {
-	oldMount, oldRaftID := *filesystemMount, *raftId
-	t.Cleanup(func() { *filesystemMount, *raftId = oldMount, oldRaftID })
-	*filesystemMount = t.TempDir()
-	*raftId = "n1"
-
-	err := startFilesystemIfEnabled(context.Background(), nil, nil, nil, nil, nil)
-	require.ErrorContains(t, err, "filesystem lifecycle is required")
-}
-
 func newFilesystemTestService(t *testing.T) *filesystem.Service {
 	t.Helper()
 	svc, err := fstest.NewMemoryService()
 	require.NoError(t, err)
 	uid, gid := uint32(os.Getuid()), uint32(os.Getgid()) //nolint:gosec // test process ids fit uint32.
-	require.NoError(t, svc.InitializeRoot(context.Background(), defaultFilesystemRootMode, uid, gid))
+	require.NoError(t, svc.InitializeRoot(context.Background(), 0o755, uid, gid))
 	return svc
 }
 
 func TestMountFilesystemServiceFailsOnMissingMountPoint(t *testing.T) {
 	t.Parallel()
 	svc := newFilesystemTestService(t)
-	config := filesystemStartConfig{
-		mountPoint: filepath.Join(t.TempDir(), "missing"),
-		clientID:   "mount-a",
+	config := Config{
+		MountPoint: filepath.Join(t.TempDir(), "missing"),
+		ClientID:   "mount-a",
 	}
 
-	server, serveDone, err := mountFilesystemService(context.Background(), svc, config)
+	server, serveDone, err := MountService(context.Background(), svc, config)
 	require.ErrorContains(t, err, "mount filesystem frontend")
 	require.Nil(t, server)
 	require.Nil(t, serveDone)
@@ -213,11 +81,11 @@ func TestMountFilesystemServiceFailsOnMissingMountPoint(t *testing.T) {
 func TestMountFilesystemServiceAbortsOnCancelledContext(t *testing.T) {
 	t.Parallel()
 	svc := newFilesystemTestService(t)
-	config := filesystemStartConfig{mountPoint: t.TempDir(), clientID: "mount-cancel"}
+	config := Config{MountPoint: t.TempDir(), ClientID: "mount-cancel"}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	server, serveDone, err := mountFilesystemService(ctx, svc, config)
+	server, serveDone, err := MountService(ctx, svc, config)
 	require.ErrorIs(t, err, context.Canceled)
 	require.ErrorContains(t, err, "mount filesystem frontend")
 	require.Nil(t, server)
@@ -240,9 +108,9 @@ func TestMountFilesystemServiceServesKernelMount(t *testing.T) {
 		skipOrFailWithoutFuse(t, "no /dev/fuse: %v", err)
 	}
 	svc := newFilesystemTestService(t)
-	config := filesystemStartConfig{mountPoint: t.TempDir(), clientID: "mount-a", mountOptions: testFUSEMountOptions()}
+	config := Config{MountPoint: t.TempDir(), ClientID: "mount-a", MountOptions: testFUSEMountOptions()}
 
-	server, serveDone, err := mountFilesystemService(context.Background(), svc, config)
+	server, serveDone, err := MountService(context.Background(), svc, config)
 	if err != nil {
 		skipOrFailWithoutFuse(t, "FUSE mount unavailable: %v", err)
 	}
@@ -259,7 +127,7 @@ func TestMountFilesystemServiceServesKernelMount(t *testing.T) {
 		}
 	})
 
-	path := filepath.Join(config.mountPoint, "probe")
+	path := filepath.Join(config.MountPoint, "probe")
 	require.NoError(t, os.WriteFile(path, []byte("probe"), 0o600))
 	got, err := os.ReadFile(path)
 	require.NoError(t, err)
@@ -277,7 +145,7 @@ func TestInstallFilesystemServerLifecycleUnmountsOnContextCancel(t *testing.T) {
 	server := &fuseadapter.Server{}
 	serveDone := make(chan struct{})
 
-	installFilesystemServerLifecycle(egCtx, eg, cleanup, server, serveDone, "/mnt/fs")
+	InstallLifecycle(egCtx, eg, cleanup, server, serveDone, "/mnt/fs")
 
 	waitDone := make(chan error, 1)
 	go func() { waitDone <- eg.Wait() }()
@@ -341,9 +209,7 @@ func (f *fakeFilesystemMountServer) UnmountLazy(context.Context) error {
 
 func shortenFilesystemServeStopTimeout(t *testing.T, d time.Duration) {
 	t.Helper()
-	old := filesystemServeStopTimeout
-	filesystemServeStopTimeout = d
-	t.Cleanup(func() { filesystemServeStopTimeout = old })
+	t.Cleanup(OverrideServeStopTimeout(d))
 }
 
 // A plain unmount that fails (EBUSY: a client holds a file open) must fall
@@ -358,7 +224,7 @@ func TestInstallFilesystemServerLifecycleDetachesLazilyWhenUnmountFails(t *testi
 	server := &fakeFilesystemMountServer{unmountErr: errors.New("umount: device or resource busy")}
 	server.onLazy = func() { close(serveDone) }
 
-	installFilesystemServerLifecycle(egCtx, eg, cleanup, server, serveDone, "/mnt/fs")
+	InstallLifecycle(egCtx, eg, cleanup, server, serveDone, "/mnt/fs")
 	cancel()
 
 	waitDone := make(chan error, 1)
@@ -383,7 +249,7 @@ func TestInstallFilesystemServerLifecycleBoundsWaitWhenServeLoopStalls(t *testin
 		lazyErr:    errors.New("fusermount: not permitted"),
 	}
 
-	installFilesystemServerLifecycle(egCtx, eg, cleanup, server, serveDone, "/mnt/fs")
+	InstallLifecycle(egCtx, eg, cleanup, server, serveDone, "/mnt/fs")
 	cancel()
 
 	waitDone := make(chan error, 1)
@@ -407,7 +273,7 @@ func TestInstallFilesystemServerLifecycleBoundsHungUnmount(t *testing.T) {
 	t.Cleanup(release)
 	server := &fakeFilesystemMountServer{unmountBlock: block}
 
-	installFilesystemServerLifecycle(egCtx, eg, cleanup, server, serveDone, "/mnt/fs")
+	InstallLifecycle(egCtx, eg, cleanup, server, serveDone, "/mnt/fs")
 	cancel()
 
 	waitDone := make(chan error, 1)
@@ -453,7 +319,7 @@ func TestInstallFilesystemServerLifecycleWaitsForServeLoopAfterHungUnmount(t *te
 		}()
 	}
 
-	installFilesystemServerLifecycle(egCtx, eg, cleanup, server, serveDone, "/mnt/fs")
+	InstallLifecycle(egCtx, eg, cleanup, server, serveDone, "/mnt/fs")
 	start := time.Now()
 	cancel()
 
@@ -484,7 +350,7 @@ func TestInstallFilesystemServerLifecycleCleanupBoundsHungUnmount(t *testing.T) 
 	release := sync.OnceFunc(func() { close(block) })
 	t.Cleanup(release)
 	server := &fakeFilesystemMountServer{unmountBlock: block}
-	installFilesystemServerLifecycle(egCtx, eg, cleanup, server, serveDone, "/mnt/fs")
+	InstallLifecycle(egCtx, eg, cleanup, server, serveDone, "/mnt/fs")
 
 	cleanupDone := make(chan struct{})
 	go func() {
@@ -513,7 +379,7 @@ func TestInstallFilesystemServerLifecycleTreatsServeExitAfterCancelAsClean(t *te
 	// sees both cases ready from the start.
 	cancel()
 	close(serveDone)
-	installFilesystemServerLifecycle(egCtx, eg, cleanup, &fuseadapter.Server{}, serveDone, "/mnt/fs")
+	InstallLifecycle(egCtx, eg, cleanup, &fuseadapter.Server{}, serveDone, "/mnt/fs")
 
 	require.NoError(t, eg.Wait())
 	cleanup.Run()
@@ -525,7 +391,7 @@ func TestInstallFilesystemServerLifecycleFailsWhenServeStops(t *testing.T) {
 	cleanup := &internalutil.CleanupStack{}
 	serveDone := make(chan struct{})
 
-	installFilesystemServerLifecycle(egCtx, eg, cleanup, &fuseadapter.Server{}, serveDone, "/mnt/fs")
+	InstallLifecycle(egCtx, eg, cleanup, &fuseadapter.Server{}, serveDone, "/mnt/fs")
 	close(serveDone)
 
 	err := eg.Wait()
@@ -583,4 +449,10 @@ func TestRunFilesystemLeaseReaperLogsErrorsAndContinues(t *testing.T) {
 
 	require.NoError(t, runFilesystemLeaseReaper(ctx, reaper, time.Millisecond))
 	require.Equal(t, 2, reaper.calls)
+}
+
+// testFUSEMountOptions mounts directly when the test runs as root, which
+// lets the kernel-mount tests run in containers without fusermount3.
+func testFUSEMountOptions() *fuse.MountOptions {
+	return &fuse.MountOptions{DirectMount: os.Geteuid() == 0}
 }

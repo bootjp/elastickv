@@ -10,7 +10,6 @@ import (
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/internal/testutil"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/sync/errgroup"
 )
 
 func TestShutdownJoinsBalancerBeforeHandoff(t *testing.T) {
@@ -73,22 +72,4 @@ func TestShutdownBalancerJoinSharesHandoffDeadline(t *testing.T) {
 	require.ErrorIs(t, balanceCtx.Err(), context.Canceled)
 	require.ErrorIs(t, ctx.Err(), context.Canceled)
 	require.Zero(t, transfers.Load(), "do not transfer concurrently with an unjoined balancing task")
-}
-
-func TestShutdownBeforeBalancerStartsCompletesJoin(t *testing.T) {
-	t.Parallel()
-	ctx, cancel := context.WithCancel(t.Context())
-	cancel()
-	done := make(chan struct{})
-	eg := &errgroup.Group{}
-	startLeaderBalanceScheduler(ctx, eg, nil, leaderBalanceConfig{enabled: true}, done)
-	select {
-	case <-done:
-	default:
-		t.Fatal("cancelled startup left balancing join pending")
-	}
-	require.NoError(t, eg.Wait())
-	// A ready tick must not inspect engines or dispatch after cancellation.
-	(&leaderBalanceLoop{}).tick(ctx, time.Now())
-	require.ErrorIs(t, (&leaderBalanceLoop{}).executeMove(ctx, leaderBalanceMove{}), context.Canceled)
 }

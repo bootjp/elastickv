@@ -1,10 +1,13 @@
-package main
+// Package fsmount mounts the Elastickv filesystem service over FUSE for
+// the server binary and runs its background collectors and lease reaper.
+// It owns the mount lifecycle: startup retries while Raft elects a
+// leader, strict-mode journal recovery, and a bounded unmount (with lazy
+// detach) on shutdown.
+package fsmount
 
 import (
 	"context"
 	"log/slog"
-	"math"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -18,58 +21,49 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-type filesystemStartConfig struct {
-	mountPoint    string
-	clientID      string
-	strict        bool
-	strictRecover bool
-	rootMode      uint32
-	rootUID       uint32
-	rootGID       uint32
-	// mountOptions overrides go-fuse's mount options. Production leaves it
+// Startup waits up to startupRetryBudget for Raft leadership and its HLC
+// lease, retrying every startupRetryInterval.
+const (
+	startupRetryBudget   = 90 * time.Second
+	startupRetryInterval = 250 * time.Millisecond
+)
+
+// Config is the resolved mount configuration. An empty MountPoint
+// disables the filesystem.
+type Config struct {
+	MountPoint    string
+	ClientID      string
+	Strict        bool
+	StrictRecover bool
+	RootMode      uint32
+	RootUID       uint32
+	RootGID       uint32
+	// Capacity and MaxFiles are the byte and inode capacity reported by
+	// statfs; zero leaves the service default.
+	Capacity uint64
+	MaxFiles uint64
+	// PlacementScanInterval paces the placement and journal collectors;
+	// LeaseReapInterval paces the open-handle lease reaper.
+	PlacementScanInterval time.Duration
+	LeaseReapInterval     time.Duration
+	// MountOptions overrides go-fuse's mount options. Production leaves it
 	// nil (fusermount3 path); tests set DirectMount where no helper exists.
-	mountOptions *fuse.MountOptions
+	MountOptions *fuse.MountOptions
 }
 
-func filesystemStartConfigFromFlags() (filesystemStartConfig, error) {
-	config := filesystemStartConfig{mountPoint: strings.TrimSpace(*filesystemMount)}
-	if config.mountPoint == "" {
-		return config, nil
-	}
-	if *filesystemRootMode > 0o7777 || *filesystemRootUID > math.MaxUint32 || *filesystemRootGID > math.MaxUint32 {
-		return filesystemStartConfig{}, errors.New("filesystem root mode, uid, or gid is out of range")
-	}
-	config.clientID = strings.TrimSpace(*filesystemClientID)
-	config.strict = *filesystemStrict
-	config.strictRecover = *filesystemStrictRecover
-	if config.strictRecover && !config.strict {
-		return filesystemStartConfig{}, errors.New("filesystemStrictRecover requires filesystemStrict")
-	}
-	if config.clientID == "" {
-		config.clientID = strings.TrimSpace(*raftId)
-	}
-	if config.clientID == "" {
-		return filesystemStartConfig{}, errors.New("filesystem client ID is required")
-	}
-	config.rootMode = uint32(*filesystemRootMode)
-	config.rootUID = uint32(*filesystemRootUID)
-	config.rootGID = uint32(*filesystemRootGID)
-	return config, nil
-}
-
-func startFilesystemIfEnabled(
+// Start mounts the filesystem described by config and registers its
+// lifecycle on eg and cleanup. It is a no-op when config.MountPoint is
+// empty.
+func Start(
 	ctx context.Context,
 	eg *errgroup.Group,
 	cleanup *internalutil.CleanupStack,
 	shardStore *kv.ShardStore,
 	coordinate kv.Coordinator,
 	observer monitoring.FileSystemObserver,
+	config Config,
 ) error {
-	config, err := filesystemStartConfigFromFlags()
-	if err != nil {
-		return err
-	}
-	if config.mountPoint == "" {
+	if config.MountPoint == "" {
 		return nil
 	}
 	if eg == nil || cleanup == nil {
@@ -78,31 +72,31 @@ func startFilesystemIfEnabled(
 	service, err := filesystem.NewService(
 		shardStore,
 		coordinate,
-		filesystem.WithCapacity(*filesystemCapacity),
-		filesystem.WithMaxFiles(*filesystemMaxFiles),
+		filesystem.WithCapacity(config.Capacity),
+		filesystem.WithMaxFiles(config.MaxFiles),
 		filesystem.WithOperationalObserver(observer),
 	)
 	if err != nil {
 		return errors.Wrap(err, "create filesystem service")
 	}
-	startupCtx, cancel := context.WithTimeout(ctx, filesystemStartupRetryBudget)
+	startupCtx, cancel := context.WithTimeout(ctx, startupRetryBudget)
 	defer cancel()
-	if err := retryFilesystemStartup(startupCtx, filesystemStartupRetryInterval, func(ctx context.Context) error {
-		return service.InitializeRoot(ctx, config.rootMode, config.rootUID, config.rootGID)
+	if err := retryFilesystemStartup(startupCtx, startupRetryInterval, func(ctx context.Context) error {
+		return service.InitializeRoot(ctx, config.RootMode, config.RootUID, config.RootGID)
 	}); err != nil {
 		return errors.Wrap(err, "initialize filesystem root")
 	}
-	server, serveDone, err := mountFilesystemService(ctx, service, config)
+	server, serveDone, err := MountService(ctx, service, config)
 	if err != nil {
 		return err
 	}
-	installFilesystemServerLifecycle(ctx, eg, cleanup, server, serveDone, config.mountPoint)
-	startFilesystemPlacementCollector(ctx, eg, service, *filesystemPlacementScanInterval)
-	if config.strict {
-		startFilesystemJournalCollector(ctx, eg, service, observer, *filesystemPlacementScanInterval)
+	InstallLifecycle(ctx, eg, cleanup, server, serveDone, config.MountPoint)
+	startFilesystemPlacementCollector(ctx, eg, service, config.PlacementScanInterval)
+	if config.Strict {
+		startFilesystemJournalCollector(ctx, eg, service, observer, config.PlacementScanInterval)
 	}
-	startFilesystemLeaseReaper(ctx, eg, service, *filesystemLeaseReapInterval)
-	slog.Info("filesystem FUSE mounted", "mount_point", config.mountPoint, "client_id", config.clientID)
+	startFilesystemLeaseReaper(ctx, eg, service, config.LeaseReapInterval)
+	slog.Info("filesystem FUSE mounted", "mount_point", config.MountPoint, "client_id", config.ClientID)
 	return nil
 }
 
@@ -125,21 +119,21 @@ func retryFilesystemStartup(ctx context.Context, interval time.Duration, attempt
 	}
 }
 
-// mountFilesystemService mounts service at the configured mount point. ctx
+// MountService mounts service at the configured mount point. ctx
 // bounds only the pre-mount work (stale-mount detach, intent recovery) so a
 // shutdown signal during startup is not held up by it; the mount itself is
 // ended by the lifecycle installed afterwards.
-func mountFilesystemService(
+func MountService(
 	ctx context.Context,
 	service *filesystem.Service,
-	config filesystemStartConfig,
+	config Config,
 ) (*fuseadapter.Server, <-chan struct{}, error) {
 	adapterOptions, err := strictFilesystemOptions(ctx, service, config)
 	if err != nil {
 		return nil, nil, err
 	}
-	frontend := fuseadapter.New(service, []byte(config.clientID), adapterOptions...)
-	server, err := fuseadapter.MountContext(ctx, config.mountPoint, frontend, config.mountOptions)
+	frontend := fuseadapter.New(service, []byte(config.ClientID), adapterOptions...)
+	server, err := fuseadapter.MountContext(ctx, config.MountPoint, frontend, config.MountOptions)
 	if err != nil {
 		frontend.Close()
 		return nil, nil, errors.Wrap(err, "mount filesystem frontend")
@@ -157,8 +151,8 @@ func mountFilesystemService(
 	return server, serveDone, nil
 }
 
-func strictFilesystemOptions(ctx context.Context, service *filesystem.Service, config filesystemStartConfig) ([]fuseadapter.Option, error) {
-	if !config.strict {
+func strictFilesystemOptions(ctx context.Context, service *filesystem.Service, config Config) ([]fuseadapter.Option, error) {
+	if !config.Strict {
 		return nil, nil
 	}
 	journal, err := filesystem.NewOperationJournal(service)
@@ -169,25 +163,25 @@ func strictFilesystemOptions(ctx context.Context, service *filesystem.Service, c
 	if err != nil {
 		return nil, errors.Wrap(err, "identify strict filesystem")
 	}
-	if config.strictRecover {
-		recoveryCtx, cancel := context.WithTimeout(ctx, filesystemStartupRetryBudget)
+	if config.StrictRecover {
+		recoveryCtx, cancel := context.WithTimeout(ctx, startupRetryBudget)
 		defer cancel()
-		if err := retryFilesystemStartup(recoveryCtx, filesystemStartupRetryInterval, func(ctx context.Context) error {
-			return journal.RecoverOwnerSession(ctx, filesystemID, config.clientID)
+		if err := retryFilesystemStartup(recoveryCtx, startupRetryInterval, func(ctx context.Context) error {
+			return journal.RecoverOwnerSession(ctx, filesystemID, config.ClientID)
 		}); err != nil {
 			return nil, errors.Wrap(err, "recover previous strict filesystem session")
 		}
 	}
-	session, err := journal.RegisterSession(ctx, filesystemID, config.clientID)
+	session, err := journal.RegisterSession(ctx, filesystemID, config.ClientID)
 	if err != nil {
 		return nil, errors.Wrap(err, "register strict filesystem session")
 	}
 	return []fuseadapter.Option{fuseadapter.WithStrictMode(session)}, nil
 }
 
-// filesystemMountServer is the part of *fuseadapter.Server the shutdown
+// MountServer is the part of *fuseadapter.Server the shutdown
 // lifecycle drives; tests substitute a fake to exercise the failure paths.
-type filesystemMountServer interface {
+type MountServer interface {
 	Unmount() error
 	UnmountContext(context.Context) error
 	UnmountLazy(context.Context) error
@@ -201,11 +195,26 @@ type filesystemMountServer interface {
 // SIGKILL. A variable so tests can shorten it.
 var filesystemServeStopTimeout = 10 * time.Second
 
-func installFilesystemServerLifecycle(
+// OverrideServeStopTimeout replaces the serve-loop stop bound and returns
+// a function restoring the previous value. It exists so kernel-mount tests
+// in other packages can run the shutdown path quickly; it must not be
+// called while a mount lifecycle is running.
+func OverrideServeStopTimeout(d time.Duration) (restore func()) {
+	old := filesystemServeStopTimeout
+	filesystemServeStopTimeout = d
+	return func() { filesystemServeStopTimeout = old }
+}
+
+// InstallLifecycle ties a mounted server to ctx: when ctx ends it unmounts
+// (falling back to a lazy detach when the mount is busy), waits a bounded
+// time for the serve loop, and reports a serve loop that stops on its own
+// as an errgroup failure. cleanup runs a bounded unmount if the lifecycle
+// never started one.
+func InstallLifecycle(
 	ctx context.Context,
 	eg *errgroup.Group,
 	cleanup *internalutil.CleanupStack,
-	server filesystemMountServer,
+	server MountServer,
 	serveDone <-chan struct{},
 	mountPoint string,
 ) {
@@ -265,7 +274,7 @@ func installFilesystemServerLifecycle(
 func stopFilesystemServer(
 	ctx context.Context,
 	unmounter *filesystemUnmounter,
-	server filesystemMountServer,
+	server MountServer,
 	serveDone <-chan struct{},
 	mountPoint string,
 ) {
@@ -365,7 +374,7 @@ const filesystemLazyDetachShare = 5
 
 // lazyDetachFilesystem runs the lazy detach fallback within the shutdown's
 // remaining budget (stopCtx); logCtx only correlates the log line.
-func lazyDetachFilesystem(logCtx, stopCtx context.Context, server filesystemMountServer, mountPoint string) {
+func lazyDetachFilesystem(logCtx, stopCtx context.Context, server MountServer, mountPoint string) {
 	if err := server.UnmountLazy(stopCtx); err != nil {
 		slog.WarnContext(logCtx, "filesystem FUSE lazy detach failed", "mount_point", mountPoint, "err", err)
 	}
@@ -472,23 +481,4 @@ func runFilesystemLeaseReaper(
 		case <-ticker.C:
 		}
 	}
-}
-
-// startFilesystemAfterServing mounts the optional FUSE filesystem once the
-// public services are up. On failure the public services are already serving
-// on eg, so they are drained before the deferred CleanupStack closes the
-// stores they use; a shutdown signal during the FUSE pre-mount work surfaces
-// here as context.Canceled and must not skip that drain either.
-func startFilesystemAfterServing(in serversInput) error {
-	if err := startFilesystemIfEnabled(
-		in.ctx,
-		in.eg,
-		in.cleanup,
-		in.shardStore,
-		in.coordinate,
-		in.metricsRegistry.FileSystemObserver(),
-	); err != nil {
-		return waitErrgroupAfterStartupFailure(in.cancel, in.eg, err)
-	}
-	return nil
 }

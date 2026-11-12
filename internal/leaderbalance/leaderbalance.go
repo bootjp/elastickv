@@ -1,4 +1,8 @@
-package main
+// Package leaderbalance spreads Raft group leadership evenly across the
+// voters of a node set. The scheduler runs on the default group's leader,
+// observes every group, and moves at most one leadership per tick through
+// the gated RaftAdmin transfer.
+package leaderbalance
 
 import (
 	"context"
@@ -18,13 +22,13 @@ import (
 )
 
 const (
-	defaultLeaderBalanceInterval           = 30 * time.Second
-	defaultLeaderBalanceGroupCooldown      = 30 * time.Second
-	defaultLeaderBalanceGlobalCooldown     = 10 * time.Second
-	defaultLeaderBalanceImbalanceThreshold = 2
-	defaultLeaderBalanceMaxTargetLag       = 1024
-	defaultLeaderBalanceRPCTimeout         = 5 * time.Second
-	raftMemberSuffrageVoter                = "voter"
+	DefaultInterval           = 30 * time.Second
+	DefaultGroupCooldown      = 30 * time.Second
+	DefaultGlobalCooldown     = 10 * time.Second
+	DefaultImbalanceThreshold = 2
+	DefaultMaxTargetLag       = 1024
+	rpcTimeout                = 5 * time.Second
+	suffrageVoter             = "voter"
 )
 
 type leaderBalanceConfig struct {
@@ -41,13 +45,13 @@ type leaderBalanceConfig struct {
 	partitionedGroups  map[uint64]bool
 	killSwitchFile     string
 	logger             *slog.Logger
-	metrics            *leaderBalanceMetrics
+	metrics            *Metrics
 }
 
 type leaderBalanceLoop struct {
 	cfg                 leaderBalanceConfig
-	runtimes            []*raftGroupRuntime
-	defaultRuntime      *raftGroupRuntime
+	runtimes            []Group
+	defaultRuntime      Group
 	connCache           *kv.GRPCConnCache
 	groupCooldownUntil  map[uint64]time.Time
 	globalCooldownUntil time.Time
@@ -87,7 +91,61 @@ type leaderBalanceDecision struct {
 	reason string
 }
 
-func startLeaderBalanceScheduler(ctx context.Context, eg *errgroup.Group, runtimes []*raftGroupRuntime, cfg leaderBalanceConfig, done chan<- struct{}) {
+// Group is one Raft group the balancer observes and may move leadership
+// of. Engine may return nil while the group's engine is not open.
+type Group interface {
+	GroupID() uint64
+	Engine() raftengine.Engine
+}
+
+// Options configures the scheduler. Zero durations and thresholds fall
+// back to the Default* values.
+type Options struct {
+	Enabled            bool
+	LocalNodeID        string
+	DefaultGroupID     uint64
+	Interval           time.Duration
+	GroupCooldown      time.Duration
+	GlobalCooldown     time.Duration
+	StartupGrace       time.Duration
+	ImbalanceThreshold int
+	MaxTargetLag       uint64
+	PinnedGroups       map[uint64]bool
+	PartitionedGroups  map[uint64]bool
+	KillSwitchFile     string
+	Logger             *slog.Logger
+	Metrics            *Metrics
+}
+
+func (o Options) config() leaderBalanceConfig {
+	return leaderBalanceConfig{
+		enabled:            o.Enabled,
+		localNodeID:        o.LocalNodeID,
+		defaultGroupID:     o.DefaultGroupID,
+		interval:           o.Interval,
+		groupCooldown:      o.GroupCooldown,
+		globalCooldown:     o.GlobalCooldown,
+		startupGrace:       o.StartupGrace,
+		imbalanceThreshold: o.ImbalanceThreshold,
+		maxTargetLag:       o.MaxTargetLag,
+		pinnedGroups:       o.PinnedGroups,
+		partitionedGroups:  o.PartitionedGroups,
+		killSwitchFile:     o.KillSwitchFile,
+		logger:             o.Logger,
+		metrics:            o.Metrics,
+	}
+}
+
+// Start runs the leader-balance scheduler on eg until ctx is cancelled and
+// closes done when it has stopped (immediately when disabled).
+// newConnCache supplies the gRPC connection cache used for remote
+// transfers; it is called only when the scheduler actually runs, and the
+// scheduler closes the cache on exit.
+func Start(ctx context.Context, eg *errgroup.Group, groups []Group, opts Options, newConnCache func() *kv.GRPCConnCache, done chan<- struct{}) {
+	start(ctx, eg, groups, opts.config(), newConnCache, done)
+}
+
+func start(ctx context.Context, eg *errgroup.Group, runtimes []Group, cfg leaderBalanceConfig, newConnCache func() *kv.GRPCConnCache, done chan<- struct{}) {
 	if cfg.logger == nil {
 		cfg.logger = slog.Default()
 	}
@@ -103,7 +161,7 @@ func startLeaderBalanceScheduler(ctx context.Context, eg *errgroup.Group, runtim
 		cfg:                cfg,
 		runtimes:           runtimes,
 		defaultRuntime:     runtimeForGroup(runtimes, cfg.defaultGroupID),
-		connCache:          newBootstrapRuntimeConnCache(runtimes),
+		connCache:          connCacheFrom(newConnCache),
 		groupCooldownUntil: make(map[uint64]time.Time),
 	}
 	eg.Go(func() error {
@@ -118,36 +176,24 @@ func startLeaderBalanceScheduler(ctx context.Context, eg *errgroup.Group, runtim
 	})
 }
 
-func leaderBalanceConfigFromFlags(localNodeID string, defaultGroupID uint64, partitionMap map[string]sqsFifoQueueRouting, registerer prometheus.Registerer) leaderBalanceConfig {
-	cfg := leaderBalanceConfig{
-		enabled:            *leaderBalance,
-		localNodeID:        localNodeID,
-		defaultGroupID:     defaultGroupID,
-		interval:           *leaderBalanceInterval,
-		groupCooldown:      *leaderBalanceGroupCooldown,
-		globalCooldown:     *leaderBalanceGlobalCooldown,
-		startupGrace:       *leaderBalanceStartupGrace,
-		imbalanceThreshold: *leaderBalanceImbalanceThreshold,
-		maxTargetLag:       *leaderBalanceMaxTargetLag,
-		pinnedGroups:       parseLeaderBalancePinnedGroups(*leaderBalancePinGroups, slog.Default()),
-		partitionedGroups:  partitionedGroupSet(partitionMap, slog.Default()),
-		killSwitchFile:     strings.TrimSpace(*leaderBalanceKillSwitchFile),
-		logger:             slog.Default(),
-		metrics:            newLeaderBalanceMetrics(registerer),
+func connCacheFrom(newConnCache func() *kv.GRPCConnCache) *kv.GRPCConnCache {
+	if newConnCache != nil {
+		if cache := newConnCache(); cache != nil {
+			return cache
+		}
 	}
-	cfg.normalize()
-	return cfg
+	return kv.NewGRPCConnCache(nil)
 }
 
 func (c *leaderBalanceConfig) normalize() {
 	if c.interval <= 0 {
-		c.interval = defaultLeaderBalanceInterval
+		c.interval = DefaultInterval
 	}
 	if c.groupCooldown <= 0 {
-		c.groupCooldown = defaultLeaderBalanceGroupCooldown
+		c.groupCooldown = DefaultGroupCooldown
 	}
 	if c.globalCooldown <= 0 {
-		c.globalCooldown = defaultLeaderBalanceGlobalCooldown
+		c.globalCooldown = DefaultGlobalCooldown
 	}
 	if c.startupGrace <= 0 {
 		c.startupGrace = c.interval
@@ -155,8 +201,8 @@ func (c *leaderBalanceConfig) normalize() {
 			c.startupGrace = c.globalCooldown
 		}
 	}
-	if c.imbalanceThreshold < defaultLeaderBalanceImbalanceThreshold {
-		c.imbalanceThreshold = defaultLeaderBalanceImbalanceThreshold
+	if c.imbalanceThreshold < DefaultImbalanceThreshold {
+		c.imbalanceThreshold = DefaultImbalanceThreshold
 	}
 }
 
@@ -182,7 +228,7 @@ func (l *leaderBalanceLoop) run(ctx context.Context) {
 }
 
 func (l *leaderBalanceLoop) checkDefaultLeader(now time.Time) bool {
-	defaultEngine := l.defaultRuntime.snapshotEngine()
+	defaultEngine := l.defaultRuntime.Engine()
 	if defaultEngine == nil || defaultEngine.State() != raftengine.StateLeader {
 		l.wasDefaultLeader = false
 		return false
@@ -269,7 +315,7 @@ func (l *leaderBalanceLoop) executeMove(ctx context.Context, move leaderBalanceM
 	if len(move.candidates) == 0 {
 		return errors.New("leader-balance: move has no target candidates")
 	}
-	execCtx, cancel := context.WithTimeout(ctx, defaultLeaderBalanceRPCTimeout)
+	execCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
 	defer cancel()
 	if move.localSource {
 		admin, ok := move.engine.(raftengine.Admin)
@@ -318,7 +364,7 @@ func buildLeaderBalanceTransferRequest(candidates []raftengine.TransferTarget, m
 	return req
 }
 
-func observeLeaderBalance(ctx context.Context, runtimes []*raftGroupRuntime, localNodeID string) leaderBalanceObservation {
+func observeLeaderBalance(ctx context.Context, runtimes []Group, localNodeID string) leaderBalanceObservation {
 	obs := leaderBalanceObservation{
 		counts: make(map[string]int),
 		voters: make(map[string]raftengine.Server),
@@ -327,7 +373,7 @@ func observeLeaderBalance(ctx context.Context, runtimes []*raftGroupRuntime, loc
 		if rt == nil {
 			continue
 		}
-		engine := rt.snapshotEngine()
+		engine := rt.Engine()
 		if engine == nil {
 			continue
 		}
@@ -339,14 +385,14 @@ func observeLeaderBalance(ctx context.Context, runtimes []*raftGroupRuntime, loc
 		}
 		status := engine.Status()
 		snap := leaderBalanceGroupSnapshot{
-			groupID:     rt.spec.id,
+			groupID:     rt.GroupID(),
 			engine:      engine,
 			status:      status,
 			leader:      status.Leader,
 			localLeader: status.State == raftengine.StateLeader && status.Leader.ID == localNodeID,
 		}
 		for _, server := range cfg.Servers {
-			if server.Suffrage != raftMemberSuffrageVoter {
+			if server.Suffrage != suffrageVoter {
 				continue
 			}
 			obs.voters[server.ID] = server
@@ -483,8 +529,8 @@ func leaderBalanceGroupEligible(
 
 func leaderBalanceTargetCandidates(group leaderBalanceGroupSnapshot, counts map[string]int, threshold int) []raftengine.TransferTarget {
 	sourceCount := counts[group.leader.ID]
-	if threshold < defaultLeaderBalanceImbalanceThreshold {
-		threshold = defaultLeaderBalanceImbalanceThreshold
+	if threshold < DefaultImbalanceThreshold {
+		threshold = DefaultImbalanceThreshold
 	}
 	servers := append([]raftengine.Server(nil), group.voters...)
 	sort.Slice(servers, func(i, j int) bool {
@@ -530,16 +576,16 @@ func leaderBalanceMinMax(counts map[string]int) (int, int) {
 	return minCount, maxCount
 }
 
-func runtimeForGroup(runtimes []*raftGroupRuntime, groupID uint64) *raftGroupRuntime {
+func runtimeForGroup(runtimes []Group, groupID uint64) Group {
 	for _, rt := range runtimes {
-		if rt != nil && rt.spec.id == groupID {
+		if rt != nil && rt.GroupID() == groupID {
 			return rt
 		}
 	}
 	return nil
 }
 
-func parseLeaderBalancePinnedGroups(raw string, logger *slog.Logger) map[uint64]bool {
+func ParsePinnedGroups(raw string, logger *slog.Logger) map[uint64]bool {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return nil
@@ -563,7 +609,7 @@ func parseLeaderBalancePinnedGroups(raw string, logger *slog.Logger) map[uint64]
 	return out
 }
 
-type leaderBalanceMetrics struct {
+type Metrics struct {
 	enabled            prometheus.Gauge
 	leadersPerNode     *prometheus.GaugeVec
 	unobservableGroups prometheus.Gauge
@@ -571,11 +617,11 @@ type leaderBalanceMetrics struct {
 	transfers          *prometheus.CounterVec
 }
 
-func newLeaderBalanceMetrics(registerer prometheus.Registerer) *leaderBalanceMetrics {
+func NewMetrics(registerer prometheus.Registerer) *Metrics {
 	if registerer == nil {
 		return nil
 	}
-	m := &leaderBalanceMetrics{
+	m := &Metrics{
 		enabled: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "elastickv_leaderbalance_enabled",
 			Help: "Whether the leader balance scheduler is enabled on this node.",
@@ -610,7 +656,7 @@ func newLeaderBalanceMetrics(registerer prometheus.Registerer) *leaderBalanceMet
 	return m
 }
 
-func (m *leaderBalanceMetrics) setEnabled(enabled bool) {
+func (m *Metrics) setEnabled(enabled bool) {
 	if m == nil {
 		return
 	}
@@ -621,7 +667,7 @@ func (m *leaderBalanceMetrics) setEnabled(enabled bool) {
 	m.enabled.Set(0)
 }
 
-func (m *leaderBalanceMetrics) observe(obs leaderBalanceObservation) {
+func (m *Metrics) observe(obs leaderBalanceObservation) {
 	if m == nil {
 		return
 	}
@@ -637,14 +683,14 @@ func (m *leaderBalanceMetrics) observe(obs leaderBalanceObservation) {
 	m.unobservableGroups.Set(float64(obs.partialCount))
 }
 
-func (m *leaderBalanceMetrics) observeSkip(reason string) {
+func (m *Metrics) observeSkip(reason string) {
 	if m == nil {
 		return
 	}
 	m.skipped.WithLabelValues(reason).Inc()
 }
 
-func (m *leaderBalanceMetrics) observeTransfer(result string) {
+func (m *Metrics) observeTransfer(result string) {
 	if m == nil {
 		return
 	}

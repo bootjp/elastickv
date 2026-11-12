@@ -9,6 +9,9 @@ import (
 	"time"
 
 	internalutil "github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/internal/filesystem"
+	"github.com/bootjp/elastickv/internal/filesystem/fstest"
+	"github.com/bootjp/elastickv/internal/fsmount"
 	"github.com/bootjp/elastickv/internal/testutil"
 	"github.com/cockroachdb/errors"
 	"github.com/hanwen/go-fuse/v2/fuse"
@@ -119,14 +122,14 @@ func TestShutdownSignalWithOpenFileDetachesLazily(t *testing.T) {
 		skipOrFailWithoutFuse(t, "no /dev/fuse: %v", err)
 	}
 	resetSignalShutdown(t)
-	shortenFilesystemServeStopTimeout(t, 2*time.Second)
+	t.Cleanup(fsmount.OverrideServeStopTimeout(2 * time.Second))
 	svc := newFilesystemTestService(t)
-	config := filesystemStartConfig{
-		mountPoint:   t.TempDir(),
-		clientID:     "mount-busy",
-		mountOptions: testFUSEMountOptions(),
+	config := fsmount.Config{
+		MountPoint:   t.TempDir(),
+		ClientID:     "mount-busy",
+		MountOptions: testFUSEMountOptions(),
 	}
-	server, serveDone, err := mountFilesystemService(context.Background(), svc, config)
+	server, serveDone, err := fsmount.MountService(context.Background(), svc, config)
 	if err != nil {
 		skipOrFailWithoutFuse(t, "FUSE mount unavailable: %v", err)
 	}
@@ -137,9 +140,9 @@ func TestShutdownSignalWithOpenFileDetachesLazily(t *testing.T) {
 	cleanup.Add(installShutdownSignalHandler(cancel, syscall.SIGTERM))
 	cleanup.Add(cancel)
 	eg, egCtx := errgroup.WithContext(ctx)
-	installFilesystemServerLifecycle(egCtx, eg, cleanup, server, serveDone, config.mountPoint)
+	fsmount.InstallLifecycle(egCtx, eg, cleanup, server, serveDone, config.MountPoint)
 
-	held, err := os.OpenFile(filepath.Join(config.mountPoint, "held"), os.O_CREATE|os.O_RDWR, 0o600)
+	held, err := os.OpenFile(filepath.Join(config.MountPoint, "held"), os.O_CREATE|os.O_RDWR, 0o600)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = held.Close() })
 	_, err = held.Write([]byte("held"))
@@ -165,7 +168,7 @@ func TestShutdownSignalWithOpenFileDetachesLazily(t *testing.T) {
 	case <-time.After(shutdownTestTimeout):
 		t.Fatal("FUSE serve loop did not stop after the last handle closed")
 	}
-	entries, err := os.ReadDir(config.mountPoint)
+	entries, err := os.ReadDir(config.MountPoint)
 	require.NoError(t, err)
 	require.Empty(t, entries)
 }
@@ -179,12 +182,12 @@ func TestShutdownSignalUnmountsFilesystem(t *testing.T) {
 	}
 	resetSignalShutdown(t)
 	svc := newFilesystemTestService(t)
-	config := filesystemStartConfig{
-		mountPoint:   t.TempDir(),
-		clientID:     "mount-signal",
-		mountOptions: testFUSEMountOptions(),
+	config := fsmount.Config{
+		MountPoint:   t.TempDir(),
+		ClientID:     "mount-signal",
+		MountOptions: testFUSEMountOptions(),
 	}
-	server, serveDone, err := mountFilesystemService(context.Background(), svc, config)
+	server, serveDone, err := fsmount.MountService(context.Background(), svc, config)
 	if err != nil {
 		skipOrFailWithoutFuse(t, "FUSE mount unavailable: %v", err)
 	}
@@ -195,9 +198,9 @@ func TestShutdownSignalUnmountsFilesystem(t *testing.T) {
 	cleanup.Add(installShutdownSignalHandler(cancel, syscall.SIGTERM))
 	cleanup.Add(cancel)
 	eg, egCtx := errgroup.WithContext(ctx)
-	installFilesystemServerLifecycle(egCtx, eg, cleanup, server, serveDone, config.mountPoint)
+	fsmount.InstallLifecycle(egCtx, eg, cleanup, server, serveDone, config.MountPoint)
 
-	probe := filepath.Join(config.mountPoint, "probe")
+	probe := filepath.Join(config.MountPoint, "probe")
 	require.NoError(t, os.WriteFile(probe, []byte("probe"), 0o600))
 
 	require.NoError(t, syscall.Kill(os.Getpid(), syscall.SIGTERM))
@@ -219,7 +222,24 @@ func TestShutdownSignalUnmountsFilesystem(t *testing.T) {
 	// The mount is gone: the path is the bare temp directory again, so the
 	// probe written through the mount is no longer visible and stat works.
 	require.NoError(t, ignoreCanceledAfterSignal(egCtx.Err()))
-	entries, err := os.ReadDir(config.mountPoint)
+	entries, err := os.ReadDir(config.MountPoint)
 	require.NoError(t, err)
 	require.Empty(t, entries)
+}
+
+func newFilesystemTestService(t *testing.T) *filesystem.Service {
+	t.Helper()
+	svc, err := fstest.NewMemoryService()
+	require.NoError(t, err)
+	uid, gid := uint32(os.Getuid()), uint32(os.Getgid()) //nolint:gosec // test process ids fit uint32.
+	require.NoError(t, svc.InitializeRoot(context.Background(), 0o755, uid, gid))
+	return svc
+}
+
+func skipOrFailWithoutFuse(t *testing.T, format string, args ...any) {
+	t.Helper()
+	if os.Getenv("ELASTICKV_REQUIRE_FUSE") != "" {
+		t.Fatalf(format, args...)
+	}
+	t.Skipf(format, args...)
 }

@@ -1,4 +1,4 @@
-package main
+package fsmount
 
 import (
 	"context"
