@@ -23,20 +23,20 @@ func TestWriteFenceErrorsAreAdapterRetryable(t *testing.T) {
 	require.True(t, isIgnorableTransactRaceError(kv.ErrTxnLocked))
 }
 
-func TestWireWriteFenceErrorsAreAdapterRetryable(t *testing.T) {
+func TestUnprovenWireWriteFenceErrorsAreNotAdapterRetryable(t *testing.T) {
 	t.Parallel()
 
-	err := errors.WithStack(status.Error(
-		codes.Unknown,
-		"commit-version v=12: key \"k\" routeKey \"k\": "+kv.ErrRouteWriteFenced.Error(),
-	))
-
-	require.True(t, isRetryableRedisTxnErr(err))
-	require.True(t, isRetryableS3MutationErr(err))
-	require.True(t, isRetryableTransactWriteError(err))
-	require.False(t, shouldPreserveRedisTxnAttempt(err))
-	require.False(t, shouldPreserveTransactWriteAttempt(err))
-	require.False(t, isIgnorableTransactRaceError(err))
+	for _, code := range []codes.Code{codes.Unknown, codes.Aborted, codes.FailedPrecondition} {
+		err := errors.WithStack(status.Error(
+			code,
+			"commit-version v=12: key \"k\" routeKey \"k\": "+kv.ErrRouteWriteFenced.Error(),
+		))
+		require.False(t, isRetryableRedisTxnErr(err))
+		require.False(t, isRetryableS3MutationErr(err))
+		require.False(t, isRetryableTransactWriteError(err))
+		require.False(t, isRouteWriteFencedError(err))
+		require.False(t, isIgnorableTransactRaceError(err))
+	}
 }
 
 func TestWireWriteFenceMatcherRequiresSentinelSuffix(t *testing.T) {
