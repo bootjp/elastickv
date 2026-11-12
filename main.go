@@ -353,6 +353,7 @@ func run(flags *serverFlags) error {
 		raftID:                          flags.raft.id,
 		nodeAddress:                     flags.raft.address,
 		consistency:                     flags.consistency,
+		raftJoining:                     flags.bootstrap.joining(),
 		filesystem:                      flags.filesystem,
 		leaderBalance:                   flags.leaderBalance,
 		adminHTTP:                       flags.adminHTTP,

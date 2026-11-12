@@ -55,13 +55,6 @@ func (s *bootstrapRecoveryCatalogRead) GetAt(ctx context.Context, key []byte, ts
 	return s.MVCCStore.GetAt(ctx, key, ts)
 }
 
-func bootstrapRecoveryRaceFlags(t *testing.T, f *bootstrapRotationE2EFixture) {
-	t.Helper()
-	dir := *raftBootstrapPeerConfigDir
-	t.Cleanup(func() { *raftBootstrapPeerConfigDir = dir })
-	*raftBootstrapPeerConfigDir = f.configDir
-}
-
 func bootstrapRecoveryCatalogView(node *bootstrapRotationE2ENode, reader store.MVCCStore) []*raftGroupRuntime {
 	return []*raftGroupRuntime{{spec: node.runtime.spec, engine: node.runtime.engine, store: reader,
 		bootstrapDomain: node.domain, publicReady: node.runtime.publicReady}}
@@ -123,7 +116,6 @@ func forceBootstrapRecoveryOverlap(t *testing.T, f *bootstrapRotationE2EFixture,
 func TestBootstrapRecoveryCatalogSnapshotRegistrationOverlap(t *testing.T) {
 	t.Setenv("ELASTICKV_RAFT_SNAPSHOT_COUNT", "1")
 	f := newBootstrapRotationE2EFixture(t, true)
-	bootstrapRecoveryRaceFlags(t, f)
 	node := f.protected(t)
 	overlap := forceBootstrapRecoveryOverlap(t, f, node, nil)
 	require.NoError(t, reconcileBootstrapReadiness(t.Context(), node.domain, overlap.runtimes, overlap.catalog, overlap.routes))
@@ -141,7 +133,6 @@ func TestBootstrapRecoveryCatalogSnapshotRegistrationOverlap(t *testing.T) {
 func TestBootstrapRecoveryCatalogSameVersionMalformedReload(t *testing.T) {
 	t.Setenv("ELASTICKV_RAFT_SNAPSHOT_COUNT", "1")
 	f := newBootstrapRotationE2EFixture(t, true)
-	bootstrapRecoveryRaceFlags(t, f)
 	node := f.protected(t)
 	overlap := forceBootstrapRecoveryOverlap(t, f, node, nil)
 	version, err := overlap.catalog.Version(t.Context())
@@ -158,7 +149,6 @@ func TestBootstrapRecoveryCatalogSameVersionMalformedReload(t *testing.T) {
 func TestBootstrapRecoveryCatalogNewerWatcherVersionDefersUntilLocalCommit(t *testing.T) {
 	t.Setenv("ELASTICKV_RAFT_SNAPSHOT_COUNT", "1")
 	f := newBootstrapRotationE2EFixture(t, true)
-	bootstrapRecoveryRaceFlags(t, f)
 	node := f.protected(t)
 	overlap := forceBootstrapRecoveryOverlap(t, f, node, func(routes *distribution.Engine) {
 		latest, err := distribution.NewCatalogStore(node.runtime.store).Snapshot(t.Context())
@@ -216,7 +206,6 @@ func commitBootstrapRecoveryCatalogVersion(t *testing.T, f *bootstrapRotationE2E
 func TestBootstrapRecoveryCatalogCorruptionRemainsTerminal(t *testing.T) {
 	t.Setenv("ELASTICKV_RAFT_SNAPSHOT_COUNT", "1")
 	f := newBootstrapRotationE2EFixture(t, true)
-	bootstrapRecoveryRaceFlags(t, f)
 	node := f.protected(t)
 	node.stopReadiness()
 	reader := &bootstrapRecoveryCatalogRead{MVCCStore: node.runtime.store, corrupt: true}

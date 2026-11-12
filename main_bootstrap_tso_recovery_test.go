@@ -42,7 +42,7 @@ func TestNamespaceReplayMustRejectHaltBeforeNoop(t *testing.T) {
 }
 
 func TestProtectedTSOLegacyRecoveryRejectsAdditionalControlState(t *testing.T) {
-	base, profile, _ := prepareTSOEnablementProfile(t)
+	base, profile, _, configDir := prepareTSOEnablementProfile(t)
 	dir := groupDataDir(base, "n1", 0, true)
 	ownership, err := etcd.AcquireOfflineBaselineOwnership(dir)
 	require.NoError(t, err)
@@ -55,18 +55,19 @@ func TestProtectedTSOLegacyRecoveryRejectsAdditionalControlState(t *testing.T) {
 	}))
 	require.NoError(t, st.Close())
 	require.NoError(t, ownership.Close())
-	assertTSOLegacyRecoveryRefused(t, base, profile)
+	assertTSOLegacyRecoveryRefused(t, base, configDir, profile)
 }
 
-func assertTSOLegacyRecoveryRefused(t *testing.T, base string, profile []groupSpec) {
+func assertTSOLegacyRecoveryRefused(t *testing.T, base, peerConfigDir string, profile []groupSpec) {
 	t.Helper()
 	path := filepath.Join(groupDataDir(base, "n1", 0, true), dedicatedTSOControlStoreName)
 	before, err := readOnlyTSOStoreDigest(t.Context(), path)
 	require.NoError(t, err)
-	specs, domain, err := loadProtectedBootstrapDomain("n1", base, profile, true, raftBootstrapConfig{})
+	bootstrapCfg := raftBootstrapConfig{peerConfigDir: peerConfigDir}
+	specs, domain, err := loadProtectedBootstrapDomain("n1", base, profile, true, bootstrapCfg)
 	require.NoError(t, err)
 	t.Cleanup(domain.admission.Close)
-	builder := shardGroupBuilder{raftID: "n1", raftDir: base, multi: true, factory: enablementFactory(), clock: kv.NewHLC(), bootstrapSpecs: specs}
+	builder := shardGroupBuilder{raftID: "n1", raftDir: base, multi: true, factory: enablementFactory(), clock: kv.NewHLC(), bootstrapSpecs: specs, bootstrapCfg: bootstrapCfg}
 	runtime, _, err := builder.build(profile[0])
 	if runtime != nil {
 		runtime.Close()
@@ -77,7 +78,7 @@ func assertTSOLegacyRecoveryRefused(t *testing.T, base string, profile []groupSp
 	require.Equal(t, before, after, "rejected startup must not import, erase or merge scalar/control state")
 }
 
-func assertTSOMissingReceiptRefusesRecovery(t *testing.T, base string, profile []groupSpec) {
+func assertTSOMissingReceiptRefusesRecovery(t *testing.T, base, configDir string, profile []groupSpec) {
 	t.Helper()
 	dir := groupDataDir(base, "n1", 0, true)
 	path := filepath.Join(dir, dedicatedTSOControlStoreName)
@@ -98,7 +99,7 @@ func assertTSOMissingReceiptRefusesRecovery(t *testing.T, base string, profile [
 	require.NoError(t, db.Delete(key, pebble.Sync))
 	require.NoError(t, db.Close())
 	require.NoError(t, ownership.Close())
-	assertTSOLegacyRecoveryRefused(t, base, profile)
+	assertTSOLegacyRecoveryRefused(t, base, configDir, profile)
 	// Restore only the exact receipt removed by this fault injection, without
 	// changing P, scalars, the applied index, or any native snapshot/WAL bytes.
 	ownership, err = etcd.AcquireOfflineBaselineOwnership(dir)

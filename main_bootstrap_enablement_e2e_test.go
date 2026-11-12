@@ -162,15 +162,16 @@ type enablementProtectedNode struct {
 	close      func()
 }
 
-func enablementStartProtected(t *testing.T, base string, group groupSpec) *enablementProtectedNode {
+func enablementStartProtected(t *testing.T, base, peerConfigDir string, group groupSpec) *enablementProtectedNode {
 	t.Helper()
-	specs, domain, err := loadProtectedBootstrapDomain("n1", base, []groupSpec{group}, false, raftBootstrapConfig{})
+	bootstrapCfg := raftBootstrapConfig{peerConfigDir: peerConfigDir}
+	specs, domain, err := loadProtectedBootstrapDomain("n1", base, []groupSpec{group}, false, bootstrapCfg)
 	require.NoError(t, err)
 	t.Cleanup(domain.admission.Close)
 	routes := distribution.NewEngine()
 	routes.UpdateRoute(nil, nil, group.id)
 	clock := kv.NewHLC()
-	builder := shardGroupBuilder{raftID: "n1", raftDir: base, factory: enablementFactory(),
+	builder := shardGroupBuilder{raftID: "n1", raftDir: base, factory: enablementFactory(), bootstrapCfg: bootstrapCfg,
 		clock: clock, readTracker: kv.NewActiveTimestampTracker(), routeEngine: routes, bootstrapSpecs: specs}
 	runtime, shard, err := builder.build(group)
 	require.NoError(t, err, "protected Open must recover from the real prepared native image")
@@ -230,7 +231,6 @@ func enablementRead(t *testing.T, node *enablementProtectedNode, key, value stri
 
 func TestBootstrapEnablementLegacyDataToProtectedDataReady(t *testing.T) {
 	t.Setenv("ELASTICKV_RAFT_SNAPSHOT_COUNT", "1")
-	require.Empty(t, *raftBootstrapPeerConfigDir)
 	base := t.TempDir()
 	raw, cfg := enablementPeerConfig(t)
 	group := groupSpec{id: 1, address: cfg.local.Address}
@@ -243,10 +243,7 @@ func TestBootstrapEnablementLegacyDataToProtectedDataReady(t *testing.T) {
 	encoded, err := json.Marshal(raw)
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(configDir, "group-1.json"), encoded, 0o600))
-	old := *raftBootstrapPeerConfigDir
-	*raftBootstrapPeerConfigDir = configDir
-	t.Cleanup(func() { *raftBootstrapPeerConfigDir = old })
-	node := enablementStartProtected(t, base, group)
+	node := enablementStartProtected(t, base, configDir, group)
 	enablementRead(t, node, "legacy-key", "original-value")
 	ctx, cancel := context.WithTimeout(t.Context(), enablementE2EWait)
 	defer cancel()
@@ -258,7 +255,7 @@ func TestBootstrapEnablementLegacyDataToProtectedDataReady(t *testing.T) {
 	require.Greater(t, policy.ActivationIndex, manifest.CommitIndex)
 	require.Equal(t, uint64(1), policy.Generation)
 	node.close()
-	restarted := enablementStartProtected(t, base, group)
+	restarted := enablementStartProtected(t, base, configDir, group)
 	enablementRead(t, restarted, "legacy-key", "original-value")
 	enablementRead(t, restarted, "protected-key", "durable-value")
 	recovered, err := kv.LoadAppliedBootstrapPolicy(t.Context(), restarted.runtime.store, manifest.Identity, restarted.runtime.engine.Status().AppliedIndex)

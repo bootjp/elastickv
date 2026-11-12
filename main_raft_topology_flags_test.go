@@ -33,6 +33,32 @@ func TestRaftTopologyConsistencyFlagsDefaultsAndParsing(t *testing.T) {
 
 func TestRuntimeInputsRequireRaftID(t *testing.T) {
 	t.Parallel()
-	_, _, _, _, err := resolveRuntimeInputs(defaultFlags[raftFlags](), defaultFlags[topologyFlags](), defaultFlags[listenerFlags]())
+	_, _, _, _, err := resolveRuntimeInputs(defaultFlags[raftFlags](), defaultFlags[topologyFlags](), defaultFlags[listenerFlags](), defaultFlags[raftBootstrapFlags]())
 	require.ErrorContains(t, err, "flag --raftId is required")
+}
+
+func TestRuntimeInputsCarryBootstrapFlagsIntoBootstrapConfig(t *testing.T) {
+	t.Parallel()
+	raft := defaultFlags[raftFlags]()
+	raft.id = "n1"
+	bootstrap := raftBootstrapFlags{peerConfigDir: "/etc/elastickv/peers", joinAsLearner: true}
+	_, _, bootstrapCfg, bootstrapping, err := resolveRuntimeInputs(raft, defaultFlags[topologyFlags](), defaultFlags[listenerFlags](), bootstrap)
+	require.NoError(t, err)
+	require.Equal(t, "/etc/elastickv/peers", bootstrapCfg.peerConfigDir)
+	require.True(t, bootstrapCfg.joinAsLearner)
+	require.False(t, bootstrapping)
+
+	bootstrap = raftBootstrapFlags{bootstrap: true}
+	_, _, bootstrapCfg, bootstrapping, err = resolveRuntimeInputs(raft, defaultFlags[topologyFlags](), defaultFlags[listenerFlags](), bootstrap)
+	require.NoError(t, err)
+	require.Empty(t, bootstrapCfg.peerConfigDir)
+	require.False(t, bootstrapCfg.joinAsLearner)
+	require.True(t, bootstrapping)
+}
+
+func TestRaftBootstrapFlagsJoining(t *testing.T) {
+	t.Parallel()
+	require.False(t, raftBootstrapFlags{}.joining())
+	require.False(t, raftBootstrapFlags{joinMembers: "  "}.joining())
+	require.True(t, raftBootstrapFlags{joinMembers: "n1=127.0.0.1:50051"}.joining())
 }

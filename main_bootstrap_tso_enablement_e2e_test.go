@@ -108,15 +108,16 @@ func tsoEnablementSignedBaseline(t *testing.T, dir string, cfg *bootstrapPeerCon
 	return raftbootstrap.BaselineManifest{BaselineContext: c, Members: []raftbootstrap.BaselineMemberEvidence{probe.Evidence}}
 }
 
-func tsoEnablementStart(t *testing.T, base string, profile []groupSpec) *tsoEnablementNode {
+func tsoEnablementStart(t *testing.T, base, peerConfigDir string, profile []groupSpec) *tsoEnablementNode {
 	t.Helper()
-	specs, domain, err := loadProtectedBootstrapDomain("n1", base, profile, true, raftBootstrapConfig{})
+	bootstrapCfg := raftBootstrapConfig{peerConfigDir: peerConfigDir}
+	specs, domain, err := loadProtectedBootstrapDomain("n1", base, profile, true, bootstrapCfg)
 	require.NoError(t, err)
 	t.Cleanup(domain.admission.Close)
 	routes := distribution.NewEngine()
 	routes.UpdateRoute(nil, nil, 1)
 	clock := kv.NewHLC()
-	builder := shardGroupBuilder{raftID: "n1", raftDir: base, multi: true, factory: enablementFactory(),
+	builder := shardGroupBuilder{raftID: "n1", raftDir: base, multi: true, factory: enablementFactory(), bootstrapCfg: bootstrapCfg,
 		clock: clock, readTracker: kv.NewActiveTimestampTracker(), routeEngine: routes, bootstrapSpecs: specs}
 	node := &tsoEnablementNode{domain: domain, cluster: specs[0].intent.Identity.Cluster, groups: make(map[uint64]*kv.ShardGroup)}
 	for _, group := range profile {
@@ -195,10 +196,11 @@ func tsoEnablementAllocate(t *testing.T, node *tsoEnablementNode, min uint64, ac
 	return ts
 }
 
-func prepareTSOEnablementProfile(t *testing.T) (string, []groupSpec, raftbootstrap.BaselineManifest) {
+// prepareTSOEnablementProfile returns the data base dir, the group profile,
+// the TSO baseline manifest and the prepared peer config dir.
+func prepareTSOEnablementProfile(t *testing.T) (string, []groupSpec, raftbootstrap.BaselineManifest, string) {
 	t.Helper()
 	t.Setenv("ELASTICKV_RAFT_SNAPSHOT_COUNT", "1")
-	require.Empty(t, *raftBootstrapPeerConfigDir)
 	base := t.TempDir()
 	raw, _ := enablementPeerConfig(t)
 	raw.Members[0].Groups = []uint64{0, 1}
@@ -223,18 +225,15 @@ func prepareTSOEnablementProfile(t *testing.T) (string, []groupSpec, raftbootstr
 		require.NoError(t, err)
 		require.NoError(t, os.WriteFile(filepath.Join(configDir, fmt.Sprintf("group-%d.json", manifest.Identity.Group)), encoded, 0o600))
 	}
-	old := *raftBootstrapPeerConfigDir
-	*raftBootstrapPeerConfigDir = configDir
-	t.Cleanup(func() { *raftBootstrapPeerConfigDir = old })
-	return base, profile, tsoManifest
+	return base, profile, tsoManifest, configDir
 }
 
 func TestBootstrapEnablementLegacyTSOAndDataProfile(t *testing.T) {
-	base, profile, tsoManifest := prepareTSOEnablementProfile(t)
+	base, profile, tsoManifest, configDir := prepareTSOEnablementProfile(t)
 	// Keep the original native legacy snapshot across protected writes/restart:
 	// success must come from exact suffix proof, not a convenient new snapshot.
 	t.Setenv("ELASTICKV_RAFT_SNAPSHOT_COUNT", "100000")
-	node := tsoEnablementStart(t, base, profile)
+	node := tsoEnablementStart(t, base, configDir, profile)
 	enablementRead(t, node.data, "legacy-key", "original-value")
 	ts := tsoEnablementAllocate(t, node, tsoManifest.Watermark, false)
 	ctx, cancel := context.WithTimeout(t.Context(), enablementE2EWait)
@@ -253,8 +252,8 @@ func TestBootstrapEnablementLegacyTSOAndDataProfile(t *testing.T) {
 	require.NotZero(t, before.phaseDFloor)
 	require.Zero(t, before.pending, "completed real Phase-D protocol must clear pending before restart")
 	node.close()
-	assertTSOMissingReceiptRefusesRecovery(t, base, profile)
-	restarted := tsoEnablementStart(t, base, profile)
+	assertTSOMissingReceiptRefusesRecovery(t, base, configDir, profile)
+	restarted := tsoEnablementStart(t, base, configDir, profile)
 	after := tsoEnablementCapture(t, restarted)
 	require.GreaterOrEqual(t, after.allocation, before.allocation)
 	require.Equal(t, before.cutover, after.cutover)

@@ -20,7 +20,6 @@ func bootstrapNetworkRedisProfile(t *testing.T) ([]*multiEnablementProcess, raft
 	t.Helper()
 	t.Setenv("ELASTICKV_RAFT_SNAPSHOT_COUNT", "1")
 	t.Setenv(redisDeltaCompactorEnabledEnvVar, "false")
-	require.Empty(t, *raftBootstrapPeerConfigDir)
 	base := t.TempDir()
 	identities := multiEnablementIdentities(t, base)
 	legacy := multiEnablementStart(t, base, identities, false, false)

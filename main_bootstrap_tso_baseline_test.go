@@ -27,7 +27,7 @@ func TestOfflineTSOBaselineFromVerifiedBootstrapGenesis(t *testing.T) {
 	t.Setenv("ELASTICKV_RAFT_SNAPSHOT_COUNT", "1")
 	base := t.TempDir()
 	group := groupSpec{id: dedicatedTSORaftGroupID, address: "127.0.0.1:50051"}
-	runtime, _, err := buildDedicatedTSOGroup("n1", group, base, true, true, nil, nil, etcd.NewFactory(etcd.FactoryConfig{}), kv.NewHLC(), nil)
+	runtime, _, err := buildDedicatedTSOGroup("n1", group, base, true, true, false, nil, nil, etcd.NewFactory(etcd.FactoryConfig{}), kv.NewHLC(), nil)
 	require.NoError(t, err)
 	t.Cleanup(runtime.Close)
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
@@ -172,7 +172,7 @@ func tsoPreparationCallbackFixture(t *testing.T) (*etcd.BaselinePreparationCallb
 	spec, _, _ := protectedTSOFixture(t, t.TempDir())
 	base := t.TempDir()
 	group := groupSpec{id: dedicatedTSORaftGroupID, address: spec.config.local.Address}
-	runtime, _, err := buildDedicatedTSOGroup("n1", group, base, true, true, nil, nil, etcd.NewFactory(etcd.FactoryConfig{}), kv.NewHLC(), nil)
+	runtime, _, err := buildDedicatedTSOGroup("n1", group, base, true, true, false, nil, nil, etcd.NewFactory(etcd.FactoryConfig{}), kv.NewHLC(), nil)
 	require.NoError(t, err)
 	t.Cleanup(runtime.Close)
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)

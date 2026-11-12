@@ -173,14 +173,12 @@ func multiEnablementStartMember(t *testing.T, base string, identity *multiEnable
 	if !protected {
 		builder.bootstrapCfg = raftBootstrapConfig{legacyServers: servers}
 	}
-	previous := *raftBootstrapPeerConfigDir
-	defer func() { *raftBootstrapPeerConfigDir = previous }()
 	var domain *bootstrapDomain
 	listener := identity.listener
 	if protected {
-		*raftBootstrapPeerConfigDir = identity.configDir
+		builder.bootstrapCfg = raftBootstrapConfig{peerConfigDir: identity.configDir}
 		var err error
-		builder.bootstrapSpecs, domain, err = loadProtectedBootstrapDomain(identity.id, base, []groupSpec{group}, false, raftBootstrapConfig{})
+		builder.bootstrapSpecs, domain, err = loadProtectedBootstrapDomain(identity.id, base, []groupSpec{group}, false, builder.bootstrapCfg)
 		require.NoError(t, err)
 		t.Cleanup(domain.admission.Close)
 		loaded := builder.bootstrapSpecs[group.id].config
@@ -475,7 +473,6 @@ func TestBootstrapEnablementThreeMembersPreparedSnapshotCatchup(t *testing.T) {
 func multiEnablementRun(t *testing.T, lagging bool) {
 	t.Helper()
 	t.Setenv("ELASTICKV_RAFT_SNAPSHOT_COUNT", "1")
-	require.Empty(t, *raftBootstrapPeerConfigDir)
 	base := t.TempDir()
 	identities := multiEnablementIdentities(t, base)
 	legacy := multiEnablementStart(t, base, identities, false, false)

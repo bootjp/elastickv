@@ -100,7 +100,6 @@ func externalRotationE2EApplied(t *testing.T, f *bootstrapRotationE2EFixture, no
 func TestBootstrapExternalRotationE2EEncryptedBusinessRestart(t *testing.T) {
 	t.Setenv("ELASTICKV_RAFT_SNAPSHOT_COUNT", "1")
 	f := newBootstrapRotationE2EFixture(t, true)
-	bootstrapRecoveryRaceFlags(t, f)
 	node := f.protected(t)
 	client := externalRotationE2EClient(t, f, node, nil)
 	req := externalRotationE2ERequest(t, f, node)
@@ -132,7 +131,6 @@ func TestBootstrapExternalRotationE2EEncryptedBusinessRestart(t *testing.T) {
 func TestBootstrapExternalRotationE2ERejectedRequestsDoNotMutate(t *testing.T) {
 	t.Setenv("ELASTICKV_RAFT_SNAPSHOT_COUNT", "1")
 	f := newBootstrapRotationE2EFixture(t, true)
-	bootstrapRecoveryRaceFlags(t, f)
 	node := f.protected(t)
 	client := externalRotationE2EClient(t, f, node, nil)
 	req := externalRotationE2ERequest(t, f, node)
@@ -170,7 +168,6 @@ func TestBootstrapExternalRotationE2ERejectedRequestsDoNotMutate(t *testing.T) {
 func TestBootstrapExternalRotationE2ELostReplyReconcilesExactRequest(t *testing.T) {
 	t.Setenv("ELASTICKV_RAFT_SNAPSHOT_COUNT", "1")
 	f := newBootstrapRotationE2EFixture(t, true)
-	bootstrapRecoveryRaceFlags(t, f)
 	node := f.protected(t)
 	completed := make(chan struct{})
 	client := externalRotationE2EClient(t, f, node, func(ctx context.Context, _ *pb.RotateDEKRequest) {
@@ -196,7 +193,6 @@ func TestBootstrapExternalRotationE2ELostReplyReconcilesExactRequest(t *testing.
 func TestBootstrapExternalRotationE2ERejectsReplayedSidecarMaterial(t *testing.T) {
 	t.Setenv("ELASTICKV_RAFT_SNAPSHOT_COUNT", "1")
 	f := newBootstrapRotationE2EFixture(t, true)
-	bootstrapRecoveryRaceFlags(t, f)
 	node := f.protected(t)
 	client := externalRotationE2EClient(t, f, node, nil)
 	report, err := client.GetSidecarState(externalRotationE2EContext(t), &pb.Empty{})

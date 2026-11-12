@@ -65,10 +65,10 @@ func (f *topologyFlags) register(fs *flag.FlagSet) {
 }
 
 func resolveValidatedRuntimeInputs(flags *serverFlags) (runtimeConfig, raftEngineType, raftBootstrapConfig, bool, error) {
-	if err := validateCommitTSFenceStartup(flags.consistency.commitTSFence, *raftBootstrapPeerConfigDir != ""); err != nil {
+	if err := validateCommitTSFenceStartup(flags.consistency.commitTSFence, flags.bootstrap.peerConfigDir != ""); err != nil {
 		return runtimeConfig{}, "", raftBootstrapConfig{}, false, err
 	}
-	cfg, engineType, bootstrapCfg, bootstrap, err := resolveRuntimeInputs(flags.raft, flags.topology, flags.listeners)
+	cfg, engineType, bootstrapCfg, bootstrap, err := resolveRuntimeInputs(flags.raft, flags.topology, flags.listeners, flags.bootstrap)
 	if err != nil {
 		return runtimeConfig{}, "", raftBootstrapConfig{}, false, err
 	}
@@ -109,7 +109,7 @@ func validateLiveBackupConfig(
 	}
 }
 
-func resolveRuntimeInputs(raft raftFlags, topology topologyFlags, listeners listenerFlags) (runtimeConfig, raftEngineType, raftBootstrapConfig, bool, error) {
+func resolveRuntimeInputs(raft raftFlags, topology topologyFlags, listeners listenerFlags, bootstrap raftBootstrapFlags) (runtimeConfig, raftEngineType, raftBootstrapConfig, bool, error) {
 	if raft.id == "" {
 		return runtimeConfig{}, "", raftBootstrapConfig{}, false, errors.New("flag --raftId is required")
 	}
@@ -132,17 +132,19 @@ func resolveRuntimeInputs(raft raftFlags, topology topologyFlags, listeners list
 	bootstrapCfg, err := resolveRaftPeerConfig(
 		raft.id,
 		cfg.groups,
-		*raftBootstrapMembers,
-		*raftGroupPeers,
-		*raftJoinMembers,
-		*raftJoinAsLearner,
-		*raftBootstrap,
+		bootstrap.bootstrapMembers,
+		bootstrap.groupPeers,
+		bootstrap.joinMembers,
+		bootstrap.joinAsLearner,
+		bootstrap.bootstrap,
 	)
 	if err != nil {
 		return runtimeConfig{}, "", raftBootstrapConfig{}, false, err
 	}
+	bootstrapCfg.peerConfigDir = bootstrap.peerConfigDir
+	bootstrapCfg.joinAsLearner = bootstrap.joinAsLearner
 
-	return cfg, engineType, bootstrapCfg, *raftBootstrap || bootstrapCfg.anyBootstrapServers(), nil
+	return cfg, engineType, bootstrapCfg, bootstrap.bootstrap || bootstrapCfg.anyBootstrapServers(), nil
 }
 
 type runtimeConfig struct {
