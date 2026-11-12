@@ -63,7 +63,8 @@ and `cmd/server/demo.go` through explicit parameters.
 main.go, main_flags.go          flag registration, main(), run()
 internal/adminbridge/           adapter <-> internal/admin DTO bridges (SQS, S3, DynamoDB, keyviz)
 internal/noderuntime/           raftGroupRuntime, groupSpec, raft bootstrap/peer config, runtimeConfig parsing
-internal/serverwiring/          (existing) plus TSO wiring, distribution start-up, startup gate, node auth
+internal/serverwiring/          (existing) plus distribution start-up, startup gate, node auth
+internal/tsowiring/             timestamp-oracle rollout wiring (TSO flags, allocator / routing / mode controller, HLC lease renewal)
 internal/leaderbalance/         leader-balance scheduler wiring
 internal/fswiring/              FUSE filesystem start-up and lifecycle
 internal/snapshotoffloadwiring/  snapshot-offload start-up wiring (flags, store, spool cleanup, scheduler and retention workers)
@@ -219,6 +220,16 @@ Tests move with the code they cover.
   so the package does not import the concrete etcd backend, and the
   uncached peer dial helper moved to `kv.NewGRPCClient` next to the
   connection cache that already dials the same way.
+- M4, TSO: the timestamp-oracle wiring moved to `internal/tsowiring`
+  (its own package rather than `internal/serverwiring`, whose tests would
+  collide with the moved fakes). It owns `Flags`, mode and mode-file
+  validation, the legacy local bridge, the dedicated allocator with leader
+  routing and the runtime mode controller, `Wiring.AuthorizeActivation`,
+  the mode reloader and the HLC lease renewal helpers. `Configure` takes the
+  dedicated group ID and group explicitly plus extra routing options;
+  `main`'s `configureCoordinatorTSOWithObserver` looks the group up by
+  `noderuntime.DedicatedTSORaftGroupID` and turns the protected-bootstrap
+  networks into those routing options.
 
 ## Decisions
 
