@@ -12,6 +12,7 @@ import (
 	"github.com/bootjp/elastickv/distribution"
 	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/bootjp/elastickv/internal/nodeauth"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
@@ -121,7 +122,7 @@ func TestSplitMigrationFactoriesPropagateCredentials(t *testing.T) {
 	require.NoError(t, err)
 	voters, err := adapter.NewSplitMigrationGRPCVoterFactory(map[uint64]*kv.ShardGroup{
 		2: {Engine: capabilityConfigEngine{cfg: raftengine.Configuration{Servers: []raftengine.Server{
-			{ID: "voter", Address: lis.Addr().String(), Suffrage: raftMemberSuffrageVoter},
+			{ID: "voter", Address: lis.Addr().String(), Suffrage: noderuntime.VoterSuffrage},
 		}}}},
 	}, &cache, "migration-secret")(ctx, 2)
 	require.NoError(t, err)

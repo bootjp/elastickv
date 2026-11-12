@@ -13,7 +13,6 @@ import (
 	"google.golang.org/grpc"
 )
 
-type bootstrapRegistrationKey struct{}
 type bootstrapRegistrationReceiverKey struct{}
 
 // Install before the startup auth exception on every listener, using the
@@ -51,17 +50,19 @@ func withBootstrapRegistration(ctx context.Context, network *bootstrapNetwork, g
 	if !ok || member == 0 || local.local.Member != member {
 		return nil, errors.WithStack(peersession.ErrDenied)
 	}
-	return context.WithValue(ctx, bootstrapRegistrationKey{}, &bootstrapRegistrationSource{
+	return withWriterRegistrationSource(ctx, &bootstrapRegistrationSource{
 		network: network, group: group, member: member, validateEpoch: validateEpoch,
 	}), nil
 }
 
+// bootstrapRegistrationFromContext returns the protected-bootstrap source
+// installed by withBootstrapRegistration, or nil.
 func bootstrapRegistrationFromContext(ctx context.Context) *bootstrapRegistrationSource {
-	source, _ := ctx.Value(bootstrapRegistrationKey{}).(*bootstrapRegistrationSource)
+	source, _ := writerRegistrationSourceFromContext(ctx).(*bootstrapRegistrationSource)
 	return source
 }
 
-func (s *bootstrapRegistrationSource) validate(entry []byte, req *pb.RegisterEncryptionWriterRequest) error {
+func (s *bootstrapRegistrationSource) Validate(entry []byte, req *pb.RegisterEncryptionWriterRequest) error {
 	_, err := bootstrapRegistrationRequest(peersession.RequestBinding{From: peersession.Node{Member: s.member}}, req)
 	if err != nil {
 		return errors.WithStack(err)
@@ -85,11 +86,11 @@ func bootstrapRegistrationEpoch(epoch uint32) (uint16, error) {
 	return uint16(epoch), nil
 }
 
-func (s *bootstrapRegistrationSource) propose(ctx context.Context, proposer raftengine.Proposer, entry []byte, req *pb.RegisterEncryptionWriterRequest) error {
+func (s *bootstrapRegistrationSource) Propose(ctx context.Context, proposer raftengine.Proposer, entry []byte, req *pb.RegisterEncryptionWriterRequest) error {
 	if proposer == nil {
 		return errors.New("protected registration requires local proposer")
 	}
-	if err := s.validate(entry, req); err != nil {
+	if err := s.Validate(entry, req); err != nil {
 		return err
 	}
 	call, stop, err := s.network.control.begin(ctx)
@@ -102,7 +103,7 @@ func (s *bootstrapRegistrationSource) propose(ctx context.Context, proposer raft
 		return errors.WithStack(err)
 	}
 	_, err = runBootstrapStartupControl(owned, req, func(ctx context.Context, _ any) (any, error) {
-		if err := s.validate(entry, req); err != nil {
+		if err := s.Validate(entry, req); err != nil {
 			return nil, err
 		}
 		result, err := proposer.Propose(ctx, entry)
@@ -117,7 +118,7 @@ func (s *bootstrapRegistrationSource) propose(ctx context.Context, proposer raft
 	return err
 }
 
-func (s *bootstrapRegistrationSource) forward(ctx context.Context, address string, req *pb.RegisterEncryptionWriterRequest) error {
+func (s *bootstrapRegistrationSource) Forward(ctx context.Context, address string, req *pb.RegisterEncryptionWriterRequest) error {
 	w := req.GetWriters()
 	if len(w) != 1 {
 		return errors.WithStack(peersession.ErrDenied)
@@ -126,7 +127,7 @@ func (s *bootstrapRegistrationSource) forward(ctx context.Context, address strin
 	if err != nil {
 		return err
 	}
-	if err := s.validate(registrationEntry(req.GetDekId(), s.member, epoch), req); err != nil {
+	if err := s.Validate(registrationEntry(req.GetDekId(), s.member, epoch), req); err != nil {
 		return err
 	}
 	return s.network.control.Invoke(ctx, s.group, address, pb.EncryptionAdmin_RegisterEncryptionWriter_FullMethodName,

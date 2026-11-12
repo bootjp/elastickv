@@ -14,10 +14,6 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// raftMemberSuffrageVoter is the Suffrage value of a voting member in a
-// raftengine.Configuration.
-const raftMemberSuffrageVoter = "voter"
-
 // leaderBalanceFlags configures the automatic leader-balance scheduler.
 type leaderBalanceFlags struct {
 	enabled            bool

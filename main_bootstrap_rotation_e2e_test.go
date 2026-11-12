@@ -184,7 +184,7 @@ func (f *bootstrapRotationE2EFixture) enableEnvelopes(t *testing.T, runtime *raf
 	installRaftRegistrationVerifier(shard, wiring, "n1")
 	cache := kv.NewGRPCConnCache(nil)
 	defer func() { require.NoError(t, cache.Close()) }()
-	fanout := buildCapabilityFanoutFn([]*raftGroupRuntime{runtime}, cache, capabilityFanoutTimeout)
+	fanout := buildCapabilityFanoutFn(runtimeCores([]*raftGroupRuntime{runtime}), cache, capabilityFanoutTimeout)
 	server := adapter.NewEncryptionAdminServer(
 		adapter.WithEncryptionAdminSidecarPath(f.sidecarPath), adapter.WithEncryptionAdminFullNodeID(f.config.local.Member),
 		adapter.WithEncryptionAdminProposer(runtime.Engine), adapter.WithEncryptionAdminPostCutoverProposer(shard.Proposer()),

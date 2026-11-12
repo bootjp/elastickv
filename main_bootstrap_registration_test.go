@@ -208,14 +208,14 @@ func TestBootstrapRegistrationPrivateForwardNeverUsesPublicFallback(t *testing.T
 				func(uint32, uint16) error { return nil })
 			require.NoError(t, err)
 			source := bootstrapRegistrationFromContext(ctx)
-			err = source.forward(ctx, f.address, registrationRequest(7, f.config.local.Member, 3))
+			err = source.Forward(ctx, f.address, registrationRequest(7, f.config.local.Member, 3))
 			if wrongSPKI {
 				require.Error(t, err)
 			} else {
 				require.NoError(t, err)
 			}
 			require.Zero(t, f.ordinary.Load())
-			require.Error(t, source.forward(ctx, "unprovisioned.test:9001", registrationRequest(7, f.config.local.Member, 3)))
+			require.Error(t, source.Forward(ctx, "unprovisioned.test:9001", registrationRequest(7, f.config.local.Member, 3)))
 		})
 	}
 }
@@ -235,7 +235,7 @@ func TestBootstrapRegistrationPrivateForwardCloseCancelsAndJoins(t *testing.T) {
 	}
 	done := make(chan error, 1)
 	go func() {
-		done <- bootstrapRegistrationFromContext(ctx).forward(ctx, f.address,
+		done <- bootstrapRegistrationFromContext(ctx).Forward(ctx, f.address,
 			registrationRequest(7, f.config.local.Member, 3))
 	}()
 	select {
@@ -268,9 +268,9 @@ func TestBootstrapRegistrationSourcePinsEpochAndPayload(t *testing.T) {
 	source := bootstrapRegistrationFromContext(ctx)
 	req := registrationRequest(7, f.config.local.Member, 3)
 	entry := registrationEntry(7, f.config.local.Member, 3)
-	require.NoError(t, source.validate(entry, req))
-	require.Error(t, source.validate(append(entry, 0), req))
-	require.Error(t, source.validate(registrationEntry(7, f.config.local.Member, 4), registrationRequest(7, f.config.local.Member, 4)))
+	require.NoError(t, source.Validate(entry, req))
+	require.Error(t, source.Validate(append(entry, 0), req))
+	require.Error(t, source.Validate(registrationEntry(7, f.config.local.Member, 4), registrationRequest(7, f.config.local.Member, 4)))
 	_, err = withBootstrapRegistration(t.Context(), f.network, bootstrapNetworkTestGroup, 999, source.validateEpoch)
 	require.Error(t, err)
 	_, err = withBootstrapRegistration(t.Context(), f.network, bootstrapNetworkTestGroup+1, f.config.local.Member, source.validateEpoch)

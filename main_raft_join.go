@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/cockroachdb/errors"
 )
@@ -70,7 +71,7 @@ func raftJoinRuntimesReady(ctx context.Context, runtimes []*raftGroupRuntime, lo
 
 func configurationContainsMember(configuration raftengine.Configuration, localID string) bool {
 	for _, server := range configuration.Servers {
-		if server.ID == localID && (server.Suffrage == "learner" || server.Suffrage == raftMemberSuffrageVoter) {
+		if server.ID == localID && (server.Suffrage == "learner" || server.Suffrage == noderuntime.VoterSuffrage) {
 			return true
 		}
 	}

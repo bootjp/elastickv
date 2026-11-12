@@ -274,6 +274,31 @@ Tests move with the code they cover.
   the wiring tests that build the admin service or call `run()` stay in
   `main`.
 
+- M5a (seams before the encryption move, still in `package main`):
+  - The writer-registration source is an interface owned by encryption
+    (`writerRegistrationSource` with `Validate` / `Propose` / `Forward`,
+    installed with `withWriterRegistrationSource`); protected bootstrap
+    stores its `*bootstrapRegistrationSource` under it. Encryption no
+    longer calls into bootstrap for registration.
+  - The capability fan-out builders take a `kv.GRPCDialOptionsForAddress`
+    and build their own `kv.GRPCConnCache`; the raft-server wiring passes
+    the protected-bootstrap dial options.
+  - Encryption functions take `*noderuntime.GroupRuntime` cores instead of
+    the root wrapper (`runtimeCores` / `runtimeCore` adapt the callers), and
+    `noderuntime` gains `ProposerForGroup`, `PostCutoverProposer`,
+    `AppliedIndexForEngine` and `FindGroupRuntime`.
+  - Assembly code left encryption-named files
+    (`buildShardGroupsWithEncryptionWiring` → shard groups,
+    `setupDistributionAndRegistration` → distribution start-up), and the
+    bootstrap start-up that starts distribution is now
+    `main_distribution_bootstrap_encryption.go`. The raft-envelope
+    installed / projection code and the domain wiring validators, which
+    use only encryption types, are now encryption-named files.
+  - `distribution.CatalogGroupID` replaces the root helper, and
+    `noderuntime.VoterSuffrage` replaces the root voter constant.
+  - A trial compile of the encryption files as their own package leaves no
+    undefined identifier, so M5b is a pure move.
+
 ## Decisions
 
 - **Internal packages, not exported library packages.** These packages

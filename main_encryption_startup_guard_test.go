@@ -217,7 +217,7 @@ func TestCheckSidecarBehindRaftLog_NilEngineFailsClosed(t *testing.T) {
 	t.Parallel()
 	sidecarPath := writeMinimalSidecar(t, 10)
 	rt := &raftGroupRuntime{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 1}}} // engine field stays nil
-	err := checkSidecarBehindRaftLog([]*raftGroupRuntime{rt}, 1, sidecarPath, true)
+	err := checkSidecarBehindRaftLog(runtimeCores([]*raftGroupRuntime{rt}), 1, sidecarPath, true)
 	if err == nil {
 		t.Fatal("guard must fail-closed when default-group engine is nil")
 	}
@@ -351,7 +351,7 @@ func TestCheckEnvelopeCutoverDivergenceStartupGuard_Fires(t *testing.T) {
 			StateMachine: &stubRestoredCutoverStateMachine{cutover: 200},
 		},
 	}
-	err := checkEnvelopeCutoverDivergenceStartupGuard([]*raftGroupRuntime{rt}, 1, sidecarPath, true)
+	err := checkEnvelopeCutoverDivergenceStartupGuard(runtimeCores([]*raftGroupRuntime{rt}), 1, sidecarPath, true)
 	if !errors.Is(err, encryption.ErrEnvelopeCutoverDivergence) {
 		t.Fatalf("cutover guard must fire ErrEnvelopeCutoverDivergence, got %v", err)
 	}
@@ -366,7 +366,7 @@ func TestCheckEnvelopeCutoverDivergenceStartupGuard_Match(t *testing.T) {
 			StateMachine: &stubRestoredCutoverStateMachine{cutover: 100},
 		},
 	}
-	if err := checkEnvelopeCutoverDivergenceStartupGuard([]*raftGroupRuntime{rt}, 1, sidecarPath, true); err != nil {
+	if err := checkEnvelopeCutoverDivergenceStartupGuard(runtimeCores([]*raftGroupRuntime{rt}), 1, sidecarPath, true); err != nil {
 		t.Fatalf("matching snapshot/sidecar cutover must pass, got %v", err)
 	}
 }
@@ -397,7 +397,7 @@ func TestCheckEnvelopeCutoverDivergenceStartupGuard_PreBootstrapSkips(t *testing
 			StateMachine: &stubRestoredCutoverStateMachine{cutover: 0},
 		},
 	}
-	if err := checkEnvelopeCutoverDivergenceStartupGuard([]*raftGroupRuntime{rt}, 1, sidecarPath, true); err != nil {
+	if err := checkEnvelopeCutoverDivergenceStartupGuard(runtimeCores([]*raftGroupRuntime{rt}), 1, sidecarPath, true); err != nil {
 		t.Fatalf("pre-bootstrap sidecar must skip cutover divergence guard, got %v", err)
 	}
 }
@@ -561,7 +561,7 @@ func TestCheckLocalEpochRollbackAfterReplay_RejectsEqualEpochAfterBump(t *testin
 
 	err = checkLocalEpochRollbackAfterReplay(
 		"n1",
-		[]*raftGroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 1}, Store: st}}},
+		runtimeCores([]*raftGroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 1}, Store: st}}}),
 		1,
 		sidecarPath,
 		true,
@@ -588,7 +588,7 @@ func TestCheckLocalEpochRollbackAfterReplay_AllowsBumpedAheadEpoch(t *testing.T)
 
 	err = checkLocalEpochRollbackAfterReplay(
 		"n1",
-		[]*raftGroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 1}, Store: st}}},
+		runtimeCores([]*raftGroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 1}, Store: st}}}),
 		1,
 		sidecarPath,
 		true,

@@ -16,6 +16,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/cockroachdb/errors"
@@ -402,7 +403,7 @@ func bootstrapObservedRoles(state raftbootstrap.ConfState, id uint64) []string {
 	for _, role := range []struct {
 		name string
 		ids  []uint64
-	}{{raftMemberSuffrageVoter, state.Voters}, {"outgoing", state.VotersOutgoing}, {bootstrapObservationLearner, state.Learners}, {"next", state.LearnersNext}} {
+	}{{noderuntime.VoterSuffrage, state.Voters}, {"outgoing", state.VotersOutgoing}, {bootstrapObservationLearner, state.Learners}, {"next", state.LearnersNext}} {
 		for _, member := range role.ids {
 			if member == id {
 				roles = append(roles, role.name)

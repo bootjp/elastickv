@@ -140,7 +140,7 @@ func run(flags *serverFlags) error {
 	// The KEK source is decorated for §9.2
 	// elastickv_encryption_kek_unwrap_seconds inside this call, before
 	// the startup guards run their own unwraps.
-	kekUnwrapper, err := loadKEKAfterPreNonceStartupGuards(cfg, flags.raft, flags.encryption, metricsRegistry.KEKUnwrapObserver())
+	kekUnwrapper, err := loadKEKAfterPreNonceStartupGuards(cfg, flags.raft.id, flags.raft.dataDir, flags.encryption, metricsRegistry.KEKUnwrapObserver())
 	if err != nil {
 		return err
 	}
@@ -201,7 +201,7 @@ func run(flags *serverFlags) error {
 	)
 	if err = chainEncryptionStartupGuard(
 		err,
-		runtimes,
+		runtimeCores(runtimes),
 		cfg.DefaultGroup,
 		flags.encryption.sidecarPath,
 		flags.encryption.enabled,

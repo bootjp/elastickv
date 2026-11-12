@@ -95,7 +95,7 @@ func forceBootstrapRecoveryOverlap(t *testing.T, f *bootstrapRotationE2EFixture,
 		defer cancel()
 		entry := registrationEntry(sc.Active.Raft, f.config.local.Member, node.wiring.raftEpoch)
 		req := registrationRequest(sc.Active.Raft, f.config.local.Member, node.wiring.raftEpoch)
-		err = source.propose(ctx, node.group.Proposer(), entry, req)
+		err = source.Propose(ctx, node.group.Proposer(), entry, req)
 		require.True(t, err == nil || errors.Is(err, raftadmission.ErrStale) || errors.Is(err, kv.ErrTransactionOutcomeUnknown) || errors.Is(err, context.Canceled) || errors.Is(err, raftengine.ErrLeadershipLost), "registration may lose its reply during native recovery: %v", err)
 		require.Eventually(t, func() bool { return node.runtime.Engine.Status().AppliedIndex > before }, enablementE2EWait, time.Millisecond)
 		require.Eventually(t, func() bool { return node.domain.admission.Stage(1) == peersession.ControlReady }, enablementE2EWait, time.Millisecond)

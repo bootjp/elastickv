@@ -7,6 +7,7 @@ import (
 
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/internal/admin"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/bootjp/elastickv/kv"
@@ -34,11 +35,11 @@ const storageEnvelopeV2CapabilityRetryInterval = 5 * time.Second
 // so the fan-out dials whenever encryption mutators are enabled,
 // independent of the admin HTTP surface; the cache is drained on
 // context cancellation via eg.
-func buildEncryptionCapabilityFanout(ctx context.Context, eg *errgroup.Group, runtimes []*raftGroupRuntime, enableMutators bool) adapter.CapabilityFanoutFn {
+func buildEncryptionCapabilityFanout(ctx context.Context, eg *errgroup.Group, runtimes []*noderuntime.GroupRuntime, dial kv.GRPCDialOptionsForAddress, enableMutators bool) adapter.CapabilityFanoutFn {
 	if !enableMutators {
 		return nil
 	}
-	fanoutConnCache := newBootstrapRuntimeConnCache(runtimes)
+	fanoutConnCache := kv.NewGRPCConnCache(dial)
 	eg.Go(func() error {
 		<-ctx.Done()
 		if err := fanoutConnCache.Close(); err != nil {
@@ -62,13 +63,14 @@ func buildEncryptionCapabilityFanout(ctx context.Context, eg *errgroup.Group, ru
 // that is over. With its own cache the monitor drops those connections when it
 // exits, and the cutover dials again if it is ever used.
 func buildStorageEnvelopeV2MonitorFanout(
-	runtimes []*raftGroupRuntime,
+	runtimes []*noderuntime.GroupRuntime,
+	dial kv.GRPCDialOptionsForAddress,
 	enableMutators bool,
 ) (adapter.CapabilityFanoutFn, func() error) {
 	if !enableMutators {
 		return nil, nil
 	}
-	connCache := newBootstrapRuntimeConnCache(runtimes)
+	connCache := kv.NewGRPCConnCache(dial)
 	return buildCapabilityFanoutFn(runtimes, connCache, capabilityFanoutTimeout), connCache.Close
 }
 
@@ -152,7 +154,7 @@ func tryActivateStorageEnvelopeV2Writes(
 // caller, not per-probe). A snapshot-build error fails the closure so
 // the cutover refuses rather than proposing against a membership view
 // it could not fully enumerate (fail-closed, §4.3 no-partial-success).
-func buildCapabilityFanoutFn(runtimes []*raftGroupRuntime, connCache *kv.GRPCConnCache, timeout time.Duration) adapter.CapabilityFanoutFn {
+func buildCapabilityFanoutFn(runtimes []*noderuntime.GroupRuntime, connCache *kv.GRPCConnCache, timeout time.Duration) adapter.CapabilityFanoutFn {
 	dial := func(_ context.Context, address string) (pb.EncryptionAdminClient, func(), error) {
 		conn, err := connCache.ConnFor(address)
 		if err != nil {
@@ -190,13 +192,13 @@ type groupConfigSource struct {
 // runs during live EnableStorageEnvelope RPCs, concurrently with a
 // possible Close() that clears the engine field — a direct field read
 // would be a data race. A nil runtime/engine is skipped.
-func capabilityRouteSnapshot(ctx context.Context, runtimes []*raftGroupRuntime) (admin.RouteSnapshot, error) {
+func capabilityRouteSnapshot(ctx context.Context, runtimes []*noderuntime.GroupRuntime) (admin.RouteSnapshot, error) {
 	sources := make([]groupConfigSource, 0, len(runtimes))
 	for _, rt := range runtimes {
 		if rt == nil {
 			continue
 		}
-		eng := rt.snapshotEngine()
+		eng := rt.SnapshotEngine()
 		if eng == nil {
 			continue
 		}

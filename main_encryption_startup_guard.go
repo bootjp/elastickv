@@ -89,7 +89,7 @@ type restoredCutoverReader interface {
 // caught-up (gap == 0 because the default group's WriteSidecar
 // doesn't bump the sidecar's index relative to OTHER shards).
 func checkSidecarBehindRaftLog(
-	runtimes []*raftGroupRuntime,
+	runtimes []*noderuntime.GroupRuntime,
 	defaultGroup uint64,
 	sidecarPath string,
 	encryptionEnabled bool,
@@ -107,11 +107,11 @@ func checkSidecarBehindRaftLog(
 		return pkgerrors.Wrapf(err, "encryption startup guard: stat sidecar %q", sidecarPath)
 	}
 
-	rt := findDefaultGroupRuntime(runtimes, defaultGroup)
+	rt := noderuntime.FindGroupRuntime(runtimes, defaultGroup)
 	if rt == nil {
 		return nil
 	}
-	engine := rt.snapshotEngine()
+	engine := rt.SnapshotEngine()
 	if engine == nil {
 		// A nil engine at the §9.1 phase means buildShardGroups
 		// reported success but did not actually populate this
@@ -200,7 +200,7 @@ func runSidecarBehindRaftLogGuard(
 // budget intact.
 func chainEncryptionStartupGuard(
 	prevErr error,
-	runtimes []*raftGroupRuntime,
+	runtimes []*noderuntime.GroupRuntime,
 	defaultGroup uint64,
 	sidecarPath string,
 	encryptionEnabled bool,
@@ -215,7 +215,7 @@ func chainEncryptionStartupGuard(
 }
 
 func checkEnvelopeCutoverDivergenceStartupGuard(
-	runtimes []*raftGroupRuntime,
+	runtimes []*noderuntime.GroupRuntime,
 	defaultGroup uint64,
 	sidecarPath string,
 	encryptionEnabled bool,
@@ -300,11 +300,11 @@ func readExistingSidecarForStartupGuard(sidecarPath string) (*encryption.Sidecar
 }
 
 func checkEnvelopeCutoverDivergenceForRuntime(
-	runtimes []*raftGroupRuntime,
+	runtimes []*noderuntime.GroupRuntime,
 	defaultGroup uint64,
 	sc *encryption.Sidecar,
 ) error {
-	rt := findDefaultGroupRuntime(runtimes, defaultGroup)
+	rt := noderuntime.FindGroupRuntime(runtimes, defaultGroup)
 	if rt == nil {
 		return nil
 	}
@@ -537,7 +537,7 @@ func checkLocalEpochRollbackBeforeBump(
 
 func checkLocalEpochRollbackAfterReplay(
 	raftID string,
-	runtimes []*raftGroupRuntime,
+	runtimes []*noderuntime.GroupRuntime,
 	defaultGroup uint64,
 	sidecarPath string,
 	encryptionEnabled bool,
@@ -586,8 +586,8 @@ func activeStorageKeyForStartupGuard(sidecarPath string) (*encryption.Sidecar, e
 	return sc, key, true, nil
 }
 
-func writerRegistryAfterReplay(runtimes []*raftGroupRuntime, defaultGroup uint64) (encryption.WriterRegistryStore, error) {
-	defaultRuntime := findDefaultGroupRuntime(runtimes, defaultGroup)
+func writerRegistryAfterReplay(runtimes []*noderuntime.GroupRuntime, defaultGroup uint64) (encryption.WriterRegistryStore, error) {
+	defaultRuntime := noderuntime.FindGroupRuntime(runtimes, defaultGroup)
 	if defaultRuntime == nil || defaultRuntime.Store == nil {
 		return nil, pkgerrors.Errorf("encryption startup guard: default group %d runtime unavailable after raft replay", defaultGroup)
 	}
@@ -653,18 +653,4 @@ func (missingWriterRegistry) GetRegistryRow([]byte) ([]byte, bool, error) { retu
 
 func (missingWriterRegistry) SetRegistryRow(_, _ []byte) error {
 	return pkgerrors.New("missing writer registry is read-only")
-}
-
-// findDefaultGroupRuntime returns the runtime whose spec.id
-// matches defaultGroup, or nil if no such runtime is present in
-// the supplied slice. Used by the startup-guard phase to scope
-// the §9.1 gap check to the group whose Raft log advances the
-// sidecar's raft_applied_index.
-func findDefaultGroupRuntime(runtimes []*raftGroupRuntime, defaultGroup uint64) *raftGroupRuntime {
-	for _, rt := range runtimes {
-		if rt != nil && rt.Spec.ID == defaultGroup {
-			return rt
-		}
-	}
-	return nil
 }
