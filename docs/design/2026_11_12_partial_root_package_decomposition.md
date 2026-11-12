@@ -264,6 +264,16 @@ Tests move with the code they cover.
   `noderuntime.DedicatedTSORaftGroupID` and turns the protected-bootstrap
   networks into those routing options.
 
+- M4, node auth: `internal/nodeauth` holds the node / admin gRPC
+  authentication: `Flags` (admin token, insecure mode, split-migration
+  token and enforcement, peer gRPC TLS, S3 blob peer token) with
+  `ServiceTokenFiles`, `LoadGRPCAuth` and the split-migration readiness
+  gates, the token-file loaders and validators, `ConfigureGRPCTransport`,
+  the bearer-token interceptor helper and `AdminGRPCInterceptors`. It
+  imports only `internal` and `adapter`. Its unit tests moved with it;
+  the wiring tests that build the admin service or call `run()` stay in
+  `main`.
+
 ## Decisions
 
 - **Internal packages, not exported library packages.** These packages
