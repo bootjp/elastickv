@@ -19,6 +19,7 @@ import (
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	json "github.com/goccy/go-json"
+	"google.golang.org/grpc/status"
 )
 
 // Message-keyspace prefixes. The data record holds the message body and
@@ -1281,7 +1282,13 @@ func (s *SQSServer) loadCandidateRecord(ctx context.Context, queueName string, m
 // Unknown outcomes and route fences take precedence over any nested expected
 // race: an empty receive must not stand in for a lost decision or a moved route.
 func isIgnorableSQSReceiveRace(err error) bool {
-	return !errors.Is(err, kv.ErrTransactionOutcomeUnknown) && !isRouteWriteFencedError(err) && isIgnorableTransactRaceError(err)
+	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) || isRouteWriteFencedError(err) {
+		return false
+	}
+	// A status joined with a local conflict does not prove the remote outcome.
+	type grpcStatusCarrier interface{ GRPCStatus() *status.Status }
+	var carrier grpcStatusCarrier
+	return !errors.As(err, &carrier) && isIgnorableTransactRaceError(err)
 }
 
 // expireMessage removes a retention-expired record and both indexes atomically.
