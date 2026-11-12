@@ -299,7 +299,12 @@ func TestSQSFIFODelayMultiGroupPrimaryReplyLoss(t *testing.T) {
 	require.True(t, dropped)
 	require.NotNil(t, primary)
 	require.NotZero(t, index)
-	require.GreaterOrEqual(t, f.groups[2].Engine.Status().AppliedIndex, index)
+	// Status() is a snapshot the run loop refreshes only after the whole Ready
+	// batch, so a proposal waiter can wake before it reflects the entry. The
+	// atomic AppliedIndex is advanced before the proposal resolves.
+	applied, ok := f.groups[2].Engine.(raftengine.LeaseProvider)
+	require.True(t, ok, "group 2 engine must expose its apply-time AppliedIndex")
+	require.GreaterOrEqual(t, applied.AppliedIndex(), index)
 	require.NotNil(t, metaPrepare)
 	require.NotNil(t, dataPrepare)
 	require.Equal(t, primary.Ts, metaPrepare.Ts)
