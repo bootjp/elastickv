@@ -34,6 +34,7 @@ type distributionStartupInput struct {
 	cleanup         *internalutil.CleanupStack
 	runtimes        []*raftGroupRuntime
 	cfg             runtimeConfig
+	raftDir         string
 	coordinate      *kv.ShardedCoordinator
 	shardStore      *kv.ShardStore
 	defaultGroup    *kv.ShardGroup
@@ -169,7 +170,7 @@ func startDistributionStartup(in distributionStartupInput) (distributionStartup,
 	// destination and silently got no backups is worse off than one
 	// whose node refused to start.
 	if err := startSnapshotOffload(
-		in.ctx, in.eg, in.snapshotOffload, in.runtimes, *raftDir, in.raftID, in.cfg.multi,
+		in.ctx, in.eg, in.snapshotOffload, in.runtimes, in.raftDir, in.raftID, in.cfg.multi,
 		in.metricsRegistry.SnapshotOffloadObserver(), slog.Default(),
 	); err != nil {
 		in.cancel()

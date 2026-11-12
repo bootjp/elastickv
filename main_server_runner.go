@@ -77,6 +77,9 @@ type serversInput struct {
 	backup        backupFlags
 	nodeAuth      nodeAuthFlags
 	listeners     listenerFlags
+	// nodeAddress is this node's --address.
+	nodeAddress string
+	consistency consistencyFlags
 }
 
 // startServersAfterStartupRotation wires up the AdminServer, starts the
@@ -96,7 +99,7 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 	// it when either admin HTTP or gRPC Admin is enabled.
 	connCache := prepareAdminConnCache(in.ctx, in.eg, in.adminHTTP.enabled || adminGRPCEnabled, in.runtimes...)
 	adminServer, adminGRPCOpts, err := setupAdminService(
-		*raftId, *myAddr, in.runtimes, in.shardGroups, in.bootstrapServers,
+		in.raftID, in.nodeAddress, in.runtimes, in.shardGroups, in.bootstrapServers,
 		in.shardStore, in.distCatalog, in.coordinate, in.readTracker, in.keyvizSampler, connCache,
 		in.autoSplitRuntime, in.backup, in.nodeAuth,
 	)
@@ -170,6 +173,8 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 		encryptionConfChangeInterceptor: in.encryptionConfChangeInterceptor,
 		publicKVGate:                    publicKVGate,
 		nodeAuth:                        in.nodeAuth,
+		raftID:                          in.raftID,
+		readWatermarkAdvance:            in.consistency.readWatermarkAdvance,
 	}
 	if err := runner.startRaftTransport(); err != nil {
 		return err
@@ -178,7 +183,7 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 	if err := preparePublicServicesAfterRaftJoinReady(
 		in.ctx,
 		in.runtimes,
-		*raftId,
+		in.raftID,
 		strings.TrimSpace(*raftJoinMembers) != "",
 		runner.preparePublicServices,
 	); err != nil {
@@ -200,7 +205,7 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 		Nodes:   parseCSV(in.adminHTTP.keyvizFanoutNodes),
 		Timeout: in.adminHTTP.keyvizFanoutTimeout,
 	}
-	adminHTTP, err := prepareAdminFromFlags(in.ctx, in.lc, in.adminHTTP, in.listeners.s3CredentialsFile, in.runtimes, runner.dynamoServer, runner.s3Server, runner.sqsServer, runner.coordinate, connCache, in.keyvizSampler, fanoutCfg)
+	adminHTTP, err := prepareAdminFromFlags(in.ctx, in.lc, in.adminHTTP, in.raftID, in.listeners.s3CredentialsFile, in.runtimes, runner.dynamoServer, runner.s3Server, runner.sqsServer, runner.coordinate, connCache, in.keyvizSampler, fanoutCfg)
 	if err != nil {
 		return runner.startupFailure(err)
 	}
@@ -209,7 +214,7 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 	if err := waitRotateOnStartup.Wait(in.ctx); err != nil {
 		return runner.startupFailure(errors.Wrap(err, "encryption rotate-on-startup: wait before serving"))
 	}
-	return startPublicServicesAfterCommitTSFence(in, &runner, publicKVGate, *commitTSFence)
+	return startPublicServicesAfterCommitTSFence(in, &runner, publicKVGate, in.consistency.commitTSFence)
 }
 
 func startPublicServicesAfterCommitTSFence(in serversInput, runner *runtimeServerRunner, gate *startupPublicKVGate, fenceEnabled bool) error {
@@ -334,6 +339,9 @@ type runtimeServerRunner struct {
 	publicKVGate *startupPublicKVGate
 	// nodeAuth supplies the token files the S3 blob cluster dials peers with.
 	nodeAuth nodeAuthFlags
+	raftID   string
+	// readWatermarkAdvance enables the Internal watermark-advance RPC.
+	readWatermarkAdvance bool
 }
 
 func (r *runtimeServerRunner) startRaftTransport() error {
@@ -345,7 +353,7 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 	if domain != nil {
 		adminGRPCOpts.unary = append([]grpc.UnaryServerInterceptor{bootstrapRegistrationReceiverInterceptor(r.defaultGroupID)}, adminGRPCOpts.unary...)
 	}
-	adminGRPCOpts, err := bootstrapRotationRPCOptions(adminGRPCOpts, domain, etcdraftengine.DeriveNodeID(*raftId), domain.rotationRPCHandler())
+	adminGRPCOpts, err := bootstrapRotationRPCOptions(adminGRPCOpts, domain, etcdraftengine.DeriveNodeID(r.raftID), domain.rotationRPCHandler())
 	if err != nil {
 		return r.startupFailure(err)
 	}
@@ -390,6 +398,8 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 		r.encryption,
 		r.kekConfigured,
 		r.defaultGroupID,
+		r.raftID,
+		r.readWatermarkAdvance,
 		r.metricsRegistry.S3BlobOffloadObserver(),
 		s3BlobPushBlocked,
 	); err != nil {
@@ -462,7 +472,7 @@ func (r *runtimeServerRunner) newS3BlobCluster() (adapter.S3BlobCluster, error) 
 		}
 		peerToken = loaded
 	}
-	return adapter.NewGRPCS3BlobCluster(*raftId, members, adminToken, peerToken, bootstrapRuntimeDialOptions(r.runtimes)), nil
+	return adapter.NewGRPCS3BlobCluster(r.raftID, members, adminToken, peerToken, bootstrapRuntimeDialOptions(r.runtimes)), nil
 }
 
 func (r *runtimeServerRunner) preparePublicServices() error {

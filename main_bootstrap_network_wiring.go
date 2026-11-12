@@ -9,12 +9,12 @@ import (
 	"google.golang.org/grpc"
 )
 
-func resolveNetworkRuntimeInputs(backup backupFlags, nodeAuth nodeAuthFlags, listeners listenerFlags) (runtimeConfig, raftEngineType, raftBootstrapConfig, bool, error) {
-	if err := configureNodeGRPCTransport(nodeAuth); err != nil {
+func resolveNetworkRuntimeInputs(flags *serverFlags) (runtimeConfig, raftEngineType, raftBootstrapConfig, bool, error) {
+	if err := configureNodeGRPCTransport(flags.nodeAuth); err != nil {
 		return runtimeConfig{}, "", raftBootstrapConfig{}, false, err
 	}
-	cfg, engineType, bootstrapCfg, bootstrap, err := resolveValidatedRuntimeInputs(backup, listeners)
-	bootstrapCfg.serviceTokenFiles = nodeAuth.serviceTokenFiles()
+	cfg, engineType, bootstrapCfg, bootstrap, err := resolveValidatedRuntimeInputs(flags)
+	bootstrapCfg.serviceTokenFiles = flags.nodeAuth.serviceTokenFiles()
 	return cfg, engineType, bootstrapCfg, bootstrap, err
 }
 

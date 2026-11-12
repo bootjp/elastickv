@@ -92,7 +92,7 @@ func onlyContextCanceled(err error) bool {
 }
 
 func run(flags *serverFlags) error {
-	cfg, engineType, bootstrapCfg, bootstrap, err := resolveNetworkRuntimeInputs(flags.backup, flags.nodeAuth, flags.listeners)
+	cfg, engineType, bootstrapCfg, bootstrap, err := resolveNetworkRuntimeInputs(flags)
 	if err != nil {
 		return err
 	}
@@ -100,7 +100,7 @@ func run(flags *serverFlags) error {
 
 	var lc net.ListenConfig
 
-	metricsRegistry := monitoring.NewRegistry(*raftId, *myAddr)
+	metricsRegistry := monitoring.NewRegistry(flags.raft.id, flags.raft.address)
 
 	// Factory needs the cold-start observer from the registry so the
 	// engine's restoreSnapshotState path can emit
@@ -138,7 +138,7 @@ func run(flags *serverFlags) error {
 	// The KEK source is decorated for §9.2
 	// elastickv_encryption_kek_unwrap_seconds inside this call, before
 	// the startup guards run their own unwraps.
-	kekUnwrapper, err := loadKEKAfterPreNonceStartupGuards(cfg, flags.encryption, metricsRegistry.KEKUnwrapObserver())
+	kekUnwrapper, err := loadKEKAfterPreNonceStartupGuards(cfg, flags.raft, flags.encryption, metricsRegistry.KEKUnwrapObserver())
 	if err != nil {
 		return err
 	}
@@ -160,7 +160,7 @@ func run(flags *serverFlags) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	handoff := newShutdownHandoff(cancel)
 	cleanup.Add(installShutdownSignalHandler(handoff.requestShutdown))
-	health, stopHealth, err := startRuntimeHealth(ctx, &lc, cancel, flags.healthAddress, *raftId)
+	health, stopHealth, err := startRuntimeHealth(ctx, &lc, cancel, flags.healthAddress, flags.raft.id)
 	if err != nil {
 		return err
 	}
@@ -175,8 +175,8 @@ func run(flags *serverFlags) error {
 	// pre-bootstrap binary the per-Put gate stays cleartext until a
 	// runtime Bootstrap + EnableStorageEnvelope flips it.
 	runtimes, shardGroups, encWiring, err := buildShardGroupsWithEncryptionWiring(
-		*raftId,
-		*raftDir,
+		flags.raft.id,
+		flags.raft.dataDir,
 		cfg.groups,
 		cfg.defaultGroup,
 		cfg.multi,
@@ -222,7 +222,7 @@ func run(flags *serverFlags) error {
 	recordFSMApplySyncMode(metricsRegistry, runtimes)
 
 	cleanup.Add(readTracker.Close)
-	shardStore := newStartupShardStore(cfg.engine, shardGroups, *readWatermarkAdvance)
+	shardStore := newStartupShardStore(cfg.engine, shardGroups, flags.consistency.readWatermarkAdvance)
 	cleanup.Add(func() {
 		_ = shardStore.Close()
 		for _, rt := range runtimes {
@@ -245,7 +245,7 @@ func run(flags *serverFlags) error {
 		WithKeyVizLabelsEnabled(*flags.keyViz.LabelsEnabled).
 		WithAllShardGroups(dataGroupIDs(cfg.groups)...).
 		WithPartitionResolver(sqsPartitionResolver)
-	configureCommitTSFenceActivation(coordinate, *commitTSFence, runtimes)
+	configureCommitTSFenceActivation(coordinate, flags.consistency.commitTSFence, runtimes)
 	installBootstrapCoordinator(bootstrapDomain, coordinate, &cleanup)
 	tsoWiring, err := configureCoordinatorTSOWithObserver(
 		flags.tso,
@@ -285,7 +285,7 @@ func run(flags *serverFlags) error {
 	encryptionStartup := bootstrapEncryptionStartupConfig{
 		runtimes: runtimes, groups: shardGroups, defaultGroup: cfg.defaultGroup,
 		network: bootstrapNetwork, wiring: encWiring, sidecarPath: flags.encryption.sidecarPath,
-		wrapper: kekUnwrapper, nodeID: etcdraftengine.DeriveNodeID(*raftId), requested: flags.encryption.rotateOnStartup,
+		wrapper: kekUnwrapper, nodeID: etcdraftengine.DeriveNodeID(flags.raft.id), requested: flags.encryption.rotateOnStartup,
 		eg: eg, cleanup: &cleanup,
 	}
 	distStartup, err := startDistributionWithBootstrapEncryption(distributionStartupInput{
@@ -299,7 +299,8 @@ func run(flags *serverFlags) error {
 		shardStore:      shardStore,
 		defaultGroup:    shardGroups[cfg.defaultGroup],
 		encWiring:       encWiring,
-		raftID:          *raftId,
+		raftID:          flags.raft.id,
+		raftDir:         flags.raft.dataDir,
 		sidecarPath:     flags.encryption.sidecarPath,
 		sampler:         sampler,
 		readTracker:     readTracker,
@@ -349,7 +350,9 @@ func run(flags *serverFlags) error {
 		keyvizSampler:                   sampler,
 		autoSplitRuntime:                autoSplitRuntime,
 		encryptionConfChangeInterceptor: encryptionConfChangeInterceptor,
-		raftID:                          *raftId,
+		raftID:                          flags.raft.id,
+		nodeAddress:                     flags.raft.address,
+		consistency:                     flags.consistency,
 		filesystem:                      flags.filesystem,
 		leaderBalance:                   flags.leaderBalance,
 		adminHTTP:                       flags.adminHTTP,

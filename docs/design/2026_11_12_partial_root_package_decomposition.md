@@ -149,9 +149,16 @@ Tests move with the code they cover.
   files, and the metrics and pprof endpoints with their tokens). Runtime
   config parsing, the server runner and the admin listener (which reuses
   the S3 credentials file) receive it as a value.
-  Still package globals: the node address, Raft and shard topology,
-  `commitTSFence`, `readWatermarkAdvance`, and the bootstrap peer-config
-  dir.
+  Part 6 adds the node's Raft identity (`raftFlags`: address, Raft ID,
+  engine, data dir), the cluster layout (`topologyFlags`: Raft groups,
+  shard ranges, Raft-to-protocol address maps, HT-FIFO partition map) and
+  the cross-group ordering rollout gates (`consistencyFlags`:
+  `commitTSFence`, `readWatermarkAdvance`). The runtime-input resolvers
+  take `*serverFlags`.
+  Still package globals: the Raft bootstrap and join flags
+  (`raftBootstrap`, `raftBootstrapMembers`, `raftGroupPeers`,
+  `raftJoinMembers`, `raftJoinAsLearner`) and the bootstrap peer-config
+  dir, which the protected-bootstrap e2e fixtures still overwrite.
 - Snapshot-offload wiring can now move (M4): its helpers take
   `snapshotOffloadFlags` instead of reading about twenty flags.
 

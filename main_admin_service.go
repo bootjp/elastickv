@@ -43,7 +43,7 @@ func setupAdminService(
 	nodeAuth nodeAuthFlags,
 ) (*adapter.AdminServer, adminGRPCInterceptors, error) {
 	members := adminMembersFromBootstrap(nodeID, bootstrapServers)
-	// In multi-group mode the process does not listen on *myAddr — each group
+	// In multi-group mode the process does not listen on --address — each group
 	// has its own rt.spec.address. Use the lowest-group-ID listener as the
 	// canonical self address so GetClusterOverview.Self advertises an
 	// endpoint the fan-out can actually dial. Falls back to the flag value
