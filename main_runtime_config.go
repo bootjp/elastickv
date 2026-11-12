@@ -15,7 +15,7 @@ import (
 
 var errInvalidLiveBackupConfig = errors.New("invalid live backup configuration")
 
-func resolveValidatedRuntimeInputs() (runtimeConfig, raftEngineType, raftBootstrapConfig, bool, error) {
+func resolveValidatedRuntimeInputs(backup backupFlags) (runtimeConfig, raftEngineType, raftBootstrapConfig, bool, error) {
 	if err := validateCommitTSFenceStartup(*commitTSFence, *raftBootstrapPeerConfigDir != ""); err != nil {
 		return runtimeConfig{}, "", raftBootstrapConfig{}, false, err
 	}
@@ -24,8 +24,8 @@ func resolveValidatedRuntimeInputs() (runtimeConfig, raftEngineType, raftBootstr
 		return runtimeConfig{}, "", raftBootstrapConfig{}, false, err
 	}
 	err = validateLiveBackupConfig(
-		*backupDefaultTTL, *backupMaxTTL, *backupBeginDeadline,
-		*backupSnapshotHeadroomEntries, *backupScanPageSize, *backupMaxActivePins,
+		backup.defaultTTL, backup.maxTTL, backup.beginDeadline,
+		backup.snapshotHeadroomEntries, backup.scanPageSize, backup.maxActivePins,
 	)
 	return cfg, engineType, bootstrapCfg, bootstrap, err
 }

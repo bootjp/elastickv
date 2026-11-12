@@ -72,6 +72,8 @@ type serversInput struct {
 	raftID        string
 	filesystem    filesystemFlags
 	leaderBalance leaderBalanceFlags
+	adminHTTP     adminHTTPFlags
+	backup        backupFlags
 }
 
 // startServersAfterStartupRotation wires up the AdminServer, starts the
@@ -89,16 +91,16 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 	//
 	// connCache is also used by the gRPC Admin GetNodeVersion probe, so create
 	// it when either admin HTTP or gRPC Admin is enabled.
-	connCache := prepareAdminConnCache(in.ctx, in.eg, *adminEnabled || adminGRPCEnabled, in.runtimes...)
+	connCache := prepareAdminConnCache(in.ctx, in.eg, in.adminHTTP.enabled || adminGRPCEnabled, in.runtimes...)
 	adminServer, adminGRPCOpts, err := setupAdminService(
 		*raftId, *myAddr, in.runtimes, in.shardGroups, in.bootstrapServers,
 		in.shardStore, in.distCatalog, in.coordinate, in.readTracker, in.keyvizSampler, connCache,
-		in.autoSplitRuntime,
+		in.autoSplitRuntime, in.backup,
 	)
 	if err != nil {
 		return err
 	}
-	roleStore := startupRoleStoreFromFlags(*adminEnabled)
+	roleStore := startupRoleStoreFromFlags(in.adminHTTP)
 	publicKVGate := &startupPublicKVGate{blockRuntime: func() bool { return protectedRuntimesBlocked(in.runtimes) }}
 	publicKVGate.domain = bootstrapDomainForRuntimes(in.runtimes)
 	startBootstrapReadinessReconciler(in.ctx, in.eg, in.runtimes, in.distCatalog, in.cfg.engine)
@@ -189,10 +191,10 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 	// which dials the leader over the cached gRPC pool. Without these
 	// the handler falls back to 503 + Retry-After:1.
 	fanoutCfg := adminbridge.KeyVizFanoutConfig{
-		Nodes:   parseCSV(*keyvizFanoutNodes),
-		Timeout: *keyvizFanoutTimeout,
+		Nodes:   parseCSV(in.adminHTTP.keyvizFanoutNodes),
+		Timeout: in.adminHTTP.keyvizFanoutTimeout,
 	}
-	adminHTTP, err := prepareAdminFromFlags(in.ctx, in.lc, in.runtimes, runner.dynamoServer, runner.s3Server, runner.sqsServer, runner.coordinate, connCache, in.keyvizSampler, fanoutCfg)
+	adminHTTP, err := prepareAdminFromFlags(in.ctx, in.lc, in.adminHTTP, in.runtimes, runner.dynamoServer, runner.s3Server, runner.sqsServer, runner.coordinate, connCache, in.keyvizSampler, fanoutCfg)
 	if err != nil {
 		return runner.startupFailure(err)
 	}

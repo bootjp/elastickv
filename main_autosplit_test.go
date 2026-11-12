@@ -23,11 +23,8 @@ func TestAutoSplitCanonicalFlagsAreRegistered(t *testing.T) {
 }
 
 func TestSetupDistributionWatcherAndAutoSplitReturnsNilRuntimeWhenDisabled(t *testing.T) {
-	oldAutoSplit := *autoSplitFlags.Enabled
-	*autoSplitFlags.Enabled = false
-	t.Cleanup(func() {
-		*autoSplitFlags.Enabled = oldAutoSplit
-	})
+	flags := defaultServerFlags()
+	*flags.autoSplit.Enabled = false
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -42,7 +39,7 @@ func TestSetupDistributionWatcherAndAutoSplitReturnsNilRuntimeWhenDisabled(t *te
 	require.NoError(t, err)
 
 	var eg errgroup.Group
-	runtime, err := setupDistributionWatcherAndAutoSplit(ctx, &eg, catalog, distribution.NewEngine(), nil, nil, nil, nil)
+	runtime, err := setupDistributionWatcherAndAutoSplit(ctx, &eg, catalog, distribution.NewEngine(), nil, nil, nil, nil, flags.keyViz, flags.autoSplit)
 	require.NoError(t, err)
 	require.Nil(t, runtime)
 

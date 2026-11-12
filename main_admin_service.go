@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"log"
 	"time"
 
@@ -19,11 +20,11 @@ import (
 
 const adminTokenMaxBytes = 4 << 10
 
-func startupRoleStoreFromFlags(enabled bool) admin.RoleStore {
-	if !enabled {
+func startupRoleStoreFromFlags(f adminHTTPFlags) admin.RoleStore {
+	if !f.enabled {
 		return nil
 	}
-	return roleStoreFromFlags(parseCSV(*adminFullAccessKeys), parseCSV(*adminReadOnlyAccessKeys))
+	return roleStoreFromFlags(parseCSV(f.fullAccessKeys), parseCSV(f.readOnlyAccessKeys))
 }
 
 func setupAdminService(
@@ -38,6 +39,7 @@ func setupAdminService(
 	keyvizSampler *keyviz.MemSampler,
 	connCache *kv.GRPCConnCache,
 	autoSplitRuntime adapter.AutoSplitRuntime,
+	backup backupFlags,
 ) (*adapter.AdminServer, adminGRPCInterceptors, error) {
 	members := adminMembersFromBootstrap(nodeID, bootstrapServers)
 	// In multi-group mode the process does not listen on *myAddr — each group
@@ -58,6 +60,7 @@ func setupAdminService(
 		adminBackupDependencies{
 			store:      &adminBackupStore{ShardStore: shardStore, catalog: distCatalog},
 			shardStore: shardStore, coordinate: coordinate, tracker: readTracker,
+			config: backup,
 		},
 	)
 	if err != nil {
@@ -164,11 +167,34 @@ func (a adminGRPCInterceptors) empty() bool {
 // service is intentionally disabled. It is mutually exclusive with
 // --adminInsecureNoAuth so operators have to opt into the unauthenticated
 // mode explicitly.
+// backupFlags bounds live-backup pins and the peer fan-out that starts them.
+type backupFlags struct {
+	defaultTTL              time.Duration
+	maxTTL                  time.Duration
+	beginDeadline           time.Duration
+	snapshotHeadroomEntries uint64
+	scanPageSize            int
+	maxActivePins           int
+}
+
+func (f *backupFlags) register(fs *flag.FlagSet) {
+	fs.DurationVar(&f.defaultTTL, "backupDefaultTTL", defaultBackupTTL, "Default live-backup pin TTL")
+	fs.DurationVar(&f.maxTTL, "backupMaxTTL", defaultBackupMaxTTL, "Maximum live-backup pin TTL per renewal")
+	fs.DurationVar(&f.beginDeadline, "backupBeginDeadline", defaultBackupDeadline, "Deadline for live-backup peer gates and pin fan-out")
+	fs.Uint64Var(&f.snapshotHeadroomEntries,
+		"backupSnapshotHeadroomEntries", defaultBackupHeadroom,
+		"Minimum Raft entries remaining before the next snapshot when a live backup begins",
+	)
+	fs.IntVar(&f.scanPageSize, "backupScanPageSize", defaultBackupPageSize, "Count-only scan page size used by live-backup baselines")
+	fs.IntVar(&f.maxActivePins, "backupMaxActivePins", defaultBackupPinLimit, "Maximum concurrent logical live-backup pins")
+}
+
 type adminBackupDependencies struct {
 	store      adapter.BackupStore
 	shardStore *kv.ShardStore
 	coordinate kv.Coordinator
 	tracker    *kv.ActiveTimestampTracker
+	config     backupFlags
 }
 
 type adminBackupStore struct {
@@ -253,13 +279,13 @@ func adminServerOptions(
 				tokenKey,
 			),
 			adapter.WithAdminBackupConfig(adapter.AdminBackupConfig{
-				DefaultTTL:              *backupDefaultTTL,
+				DefaultTTL:              deps.config.defaultTTL,
 				MinTTL:                  time.Minute,
-				MaxTTL:                  *backupMaxTTL,
-				BeginDeadline:           *backupBeginDeadline,
-				SnapshotHeadroomEntries: *backupSnapshotHeadroomEntries,
-				ScanPageSize:            *backupScanPageSize,
-				MaxActivePins:           *backupMaxActivePins,
+				MaxTTL:                  deps.config.maxTTL,
+				BeginDeadline:           deps.config.beginDeadline,
+				SnapshotHeadroomEntries: deps.config.snapshotHeadroomEntries,
+				ScanPageSize:            deps.config.scanPageSize,
+				MaxActivePins:           deps.config.maxActivePins,
 			}),
 		)
 	}

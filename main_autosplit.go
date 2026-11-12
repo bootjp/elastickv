@@ -28,6 +28,8 @@ func setupDistributionWatcherAndAutoSplit(
 	coordinate *kv.ShardedCoordinator,
 	sampler *keyviz.MemSampler,
 	observer autosplit.Observer,
+	keyVizFlags *serverwiring.KeyVizFlags,
+	autoSplitFlags *serverwiring.AutoSplitFlags,
 ) (adapter.AutoSplitRuntime, error) {
 	cfg, err := autoSplitFlags.SchedulerConfig(coordinate, keyVizFlags)
 	if err != nil {

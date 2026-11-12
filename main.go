@@ -34,7 +34,7 @@ func main() {
 		return
 	}
 	flag.Parse()
-	keyVizFlags.RecordExplicit(flag.CommandLine)
+	cliFlags.keyViz.RecordExplicit(flag.CommandLine)
 
 	err := run(cliFlags)
 	if memoryPressureExit.Load() {
@@ -92,7 +92,7 @@ func onlyContextCanceled(err error) bool {
 }
 
 func run(flags *serverFlags) error {
-	cfg, engineType, bootstrapCfg, bootstrap, err := resolveNetworkRuntimeInputs()
+	cfg, engineType, bootstrapCfg, bootstrap, err := resolveNetworkRuntimeInputs(flags.backup)
 	if err != nil {
 		return err
 	}
@@ -143,7 +143,7 @@ func run(flags *serverFlags) error {
 	}
 	keystore := encryption.NewKeystore()
 	redisApplyObserver := adapter.NewRedisApplyObserver()
-	readTracker := kv.NewActiveTimestampTracker(kv.WithActiveTimestampTrackerMaxBackupPins(*backupMaxActivePins))
+	readTracker := kv.NewActiveTimestampTracker(kv.WithActiveTimestampTrackerMaxBackupPins(flags.backup.maxActivePins))
 	s3BlobBackfiller := adapter.NewS3BlobBackfiller(cfg.s3BlobBackfillConfig)
 
 	cleanup := internalutil.CleanupStack{}
@@ -235,13 +235,13 @@ func run(flags *serverFlags) error {
 	}
 	cleanup.Add(cancel)
 	startLockResolverIfEnabled(shardStore, shardGroups, &cleanup, resolverOptions...)
-	sampler := serverwiring.BuildSampler(keyVizFlags, autoSplitFlags)
+	sampler := serverwiring.BuildSampler(flags.keyViz, flags.autoSplit)
 	sqsPartitionResolver := buildSQSPartitionResolver(cfg.sqsFifoPartitionMap)
 	shardStore.WithPartitionResolver(sqsPartitionResolver)
 	coordinate := kv.NewShardedCoordinator(cfg.engine, shardGroups, cfg.defaultGroup, clock, shardStore).
 		WithLeaseReadObserver(metricsRegistry.LeaseReadObserver()).
 		WithSampler(keyVizSamplerForCoordinator(sampler)).
-		WithKeyVizLabelsEnabled(*keyVizFlags.LabelsEnabled).
+		WithKeyVizLabelsEnabled(*flags.keyViz.LabelsEnabled).
 		WithAllShardGroups(dataGroupIDs(cfg.groups)...).
 		WithPartitionResolver(sqsPartitionResolver)
 	configureCommitTSFenceActivation(coordinate, *commitTSFence, runtimes)
@@ -307,6 +307,8 @@ func run(flags *serverFlags) error {
 		tsoWiring:       tsoWiring,
 		shardGroups:     shardGroups,
 		snapshotOffload: flags.snapshotOffload,
+		keyViz:          flags.keyViz,
+		autoSplit:       flags.autoSplit,
 	}, encryptionStartup)
 	if err != nil {
 		// Members already run on eg (TSO reloader, raft lifecycle
@@ -347,6 +349,8 @@ func run(flags *serverFlags) error {
 		raftID:                          *raftId,
 		filesystem:                      flags.filesystem,
 		leaderBalance:                   flags.leaderBalance,
+		adminHTTP:                       flags.adminHTTP,
+		backup:                          flags.backup,
 	}, health, handoff)
 }
 

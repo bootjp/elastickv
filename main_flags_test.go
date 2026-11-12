@@ -37,6 +37,10 @@ func TestRegisterServerFlagsBindsCommandLineNames(t *testing.T) {
 		"-tsoModeFile", "/etc/tso-mode",
 		"-snapshotOffloadLocalDir", "/var/offload",
 		"-snapshotOffloadGCEnabled",
+		"-adminEnabled",
+		"-keyvizFanoutNodes", "peer-a:8080",
+		"-backupMaxActivePins", "7",
+		"-autoSplit",
 	}))
 	require.Equal(t, "127.0.0.1:0", f.healthAddress)
 	require.Equal(t, "/mnt/ekv", f.filesystem.mount)
@@ -44,11 +48,21 @@ func TestRegisterServerFlagsBindsCommandLineNames(t *testing.T) {
 	require.Equal(t, "/etc/tso-mode", f.tso.modeFile)
 	require.Equal(t, "/var/offload", f.snapshotOffload.localDir)
 	require.True(t, f.snapshotOffload.retention.enabled)
+	require.True(t, f.adminHTTP.enabled)
+	require.Equal(t, "peer-a:8080", f.adminHTTP.keyvizFanoutNodes)
+	require.Equal(t, 7, f.backup.maxActivePins)
+	require.True(t, *f.autoSplit.Enabled)
 
 	defaults := defaultServerFlags()
 	require.Equal(t, defaultTSOBatchSize, defaults.tso.batchSize)
 	require.Equal(t, defaultTSOReload, defaults.tso.modeReloadInterval)
 	require.Equal(t, uint(defaultFilesystemRootMode), defaults.filesystem.rootMode)
+	require.Equal(t, keyvizFanoutDefaultTimeout, defaults.adminHTTP.keyvizFanoutTimeout)
+	require.Equal(t, uint64(defaultBackupHeadroom), defaults.backup.snapshotHeadroomEntries)
+	require.NoError(t, validateLiveBackupConfig(
+		defaults.backup.defaultTTL, defaults.backup.maxTTL, defaults.backup.beginDeadline,
+		defaults.backup.snapshotHeadroomEntries, defaults.backup.scanPageSize, defaults.backup.maxActivePins,
+	), "registered backup defaults must pass start-up validation")
 }
 
 // TestCLIFlagsReadOnlyByMain keeps grouped flag values flowing down from
