@@ -17,22 +17,15 @@ import (
 )
 
 func TestEncryptionMutatorsEnabledUsesLoadedKEKState(t *testing.T) {
-	previousEnabled := *encryptionEnabled
-	previousSidecar := *encryptionSidecarPath
-	t.Cleanup(func() {
-		*encryptionEnabled = previousEnabled
-		*encryptionSidecarPath = previousSidecar
-	})
-
-	*encryptionEnabled = true
-	*encryptionSidecarPath = "/data/encryption/keys.json"
-	require.True(t, encryptionMutatorsEnabled(true))
-	require.False(t, encryptionMutatorsEnabled(false))
-	*encryptionEnabled = false
-	require.False(t, encryptionMutatorsEnabled(true))
-	*encryptionEnabled = true
-	*encryptionSidecarPath = ""
-	require.False(t, encryptionMutatorsEnabled(true))
+	t.Parallel()
+	f := encryptionFlags{enabled: true, sidecarPath: "/data/encryption/keys.json"}
+	require.True(t, encryptionMutatorsEnabled(f, true))
+	require.False(t, encryptionMutatorsEnabled(f, false))
+	f.enabled = false
+	require.False(t, encryptionMutatorsEnabled(f, true))
+	f.enabled = true
+	f.sidecarPath = ""
+	require.False(t, encryptionMutatorsEnabled(f, true))
 }
 
 type failingStartupKEK struct{}
@@ -44,44 +37,27 @@ func (failingStartupKEK) Unwrap([]byte) ([]byte, error) {
 func (failingStartupKEK) Name() string { return "failing" }
 
 func TestVerifyKEKBeforeMutators(t *testing.T) {
-	previousEnabled := *encryptionEnabled
-	previousSidecar := *encryptionSidecarPath
-	t.Cleanup(func() {
-		*encryptionEnabled = previousEnabled
-		*encryptionSidecarPath = previousSidecar
-	})
+	t.Parallel()
+	f := encryptionFlags{enabled: true, sidecarPath: "/data/encryption/keys.json"}
+	require.ErrorIs(t, verifyKEKBeforeMutators(f, failingStartupKEK{}), kek.ErrKEKPreflightFailed)
 
-	*encryptionEnabled = true
-	*encryptionSidecarPath = "/data/encryption/keys.json"
-	require.ErrorIs(t, verifyKEKBeforeMutators(failingStartupKEK{}), kek.ErrKEKPreflightFailed)
-
-	*encryptionEnabled = false
-	require.NoError(t, verifyKEKBeforeMutators(failingStartupKEK{}))
-	*encryptionEnabled = true
-	*encryptionSidecarPath = ""
-	require.NoError(t, verifyKEKBeforeMutators(failingStartupKEK{}))
+	f.enabled = false
+	require.NoError(t, verifyKEKBeforeMutators(f, failingStartupKEK{}))
+	f.enabled = true
+	f.sidecarPath = ""
+	require.NoError(t, verifyKEKBeforeMutators(f, failingStartupKEK{}))
 }
 
 func TestStartupKEKSourceWiringCachesGuardUnwrapThroughHydration(t *testing.T) {
-	previousEnabled := *encryptionEnabled
-	previousSidecar := *encryptionSidecarPath
-	previousFile := *kekFile
-	previousURI := *kekURI
-	t.Cleanup(func() {
-		*encryptionEnabled = previousEnabled
-		*encryptionSidecarPath = previousSidecar
-		*kekFile = previousFile
-		*kekURI = previousURI
-	})
-
 	staticKEK := bytes.Repeat([]byte{0x71}, encryption.KeySize)
-	*kekFile = filepath.Join(t.TempDir(), "kek")
-	require.NoError(t, os.WriteFile(*kekFile, staticKEK, 0o600))
-	*kekURI = ""
-	*encryptionEnabled = true
-	*encryptionSidecarPath = filepath.Join(t.TempDir(), encryption.SidecarFilename)
+	f := encryptionFlags{
+		enabled:     true,
+		kekFile:     filepath.Join(t.TempDir(), "kek"),
+		sidecarPath: filepath.Join(t.TempDir(), encryption.SidecarFilename),
+	}
+	require.NoError(t, os.WriteFile(f.kekFile, staticKEK, 0o600))
 
-	source, err := kek.NewWrapperFromSources(context.Background(), *kekFile, "")
+	source, err := kek.NewWrapperFromSources(context.Background(), f.kekFile, "")
 	require.NoError(t, err)
 	dek := bytes.Repeat([]byte{0x72}, encryption.KeySize)
 	wrapped, err := source.Wrap(dek)
@@ -92,10 +68,10 @@ func TestStartupKEKSourceWiringCachesGuardUnwrapThroughHydration(t *testing.T) {
 			"7": {Purpose: encryption.SidecarPurposeStorage, Wrapped: wrapped},
 		},
 	}
-	require.NoError(t, encryption.WriteSidecar(*encryptionSidecarPath, sidecar))
+	require.NoError(t, encryption.WriteSidecar(f.sidecarPath, sidecar))
 
 	observer := &countingKEKObserver{}
-	wrapper, err := loadKEKAndRunStartupGuards(observer)
+	wrapper, err := loadKEKAndRunStartupGuards(f, observer)
 	require.NoError(t, err)
 	require.IsType(t, &encryption.StartupUnwrapCache{}, wrapper,
 		"production source wiring must retain the startup cache")
@@ -180,4 +156,26 @@ func TestEnvKEKBootstrapCutoverSnapshotRestore(t *testing.T) {
 	got, err := target.GetAt(context.Background(), []byte("env-kek"), 100)
 	require.NoError(t, err)
 	require.Equal(t, []byte("secret"), got)
+}
+
+func TestEncryptionFlagsBootstrapRequest(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name  string
+		flags encryptionFlags
+		want  bootstrapEncryptionRequest
+	}{
+		{"off", encryptionFlags{}, bootstrapEncryptionRequest{}},
+		{"kek only", encryptionFlags{kekFile: "kek"}, bootstrapEncryptionRequest{}},
+		{"enabled", encryptionFlags{enabled: true}, bootstrapEncryptionRequest{configured: true}},
+		{"sidecar", encryptionFlags{sidecarPath: "keys.json"}, bootstrapEncryptionRequest{configured: true}},
+		{"rotation", encryptionFlags{rotateOnStartup: true}, bootstrapEncryptionRequest{rotateOnStartup: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := tc.flags.bootstrapRequest()
+			require.Equal(t, tc.want, got)
+			require.Equal(t, tc.want != bootstrapEncryptionRequest{}, got.requested())
+		})
+	}
 }

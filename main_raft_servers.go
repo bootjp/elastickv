@@ -88,17 +88,18 @@ func startRaftServers(
 	sqsPartitionResolver kv.PartitionResolver,
 	routeEngine *distribution.Engine,
 	readTracker *kv.ActiveTimestampTracker,
+	encryptionCfg encryptionFlags,
 	kekConfigured bool,
 	defaultGroupID uint64,
 	s3BlobObserver adapter.S3BlobOffloadObserver,
 	s3BlobPushBlocked func() bool,
 ) error {
 	forwardLogger := slog.Default().With(slog.String("component", "admin"))
-	enableMutators := encryptionMutatorsEnabled(kekConfigured)
+	enableMutators := encryptionMutatorsEnabled(encryptionCfg, kekConfigured)
 	encryptionCapabilityFanout := buildEncryptionCapabilityFanout(ctx, eg, runtimes, enableMutators)
 	monitorFanout, releaseMonitorConns := buildStorageEnvelopeV2MonitorFanout(runtimes, enableMutators)
 	startStorageEnvelopeV2CapabilityMonitor(ctx, eg, monitorFanout, releaseMonitorConns, encWiring)
-	writerRegistry, err := encryptionAdminDefaultWriterRegistry(*encryptionSidecarPath, shardGroups, defaultGroupID)
+	writerRegistry, err := encryptionAdminDefaultWriterRegistry(encryptionCfg.sidecarPath, shardGroups, defaultGroupID)
 	if err != nil {
 		return err
 	}
@@ -108,7 +109,7 @@ func startRaftServers(
 	}
 	encryptionAdminServer := newEncryptionAdminServer(
 		etcdraftengine.DeriveNodeID(*raftId),
-		*encryptionSidecarPath,
+		encryptionCfg.sidecarPath,
 		enableMutators,
 		defaultAdmin.engine,
 		encryptionCapabilityFanout,

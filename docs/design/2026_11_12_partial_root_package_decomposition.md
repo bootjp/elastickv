@@ -136,8 +136,16 @@ Tests move with the code they cover.
   and a missing gate fails closed. The protected-bootstrap check that the
   startup token differs from the service tokens gets the token files
   through `raftBootstrapConfig`, so it still runs before any group opens.
-  Still package globals: listener addresses, Raft and shard topology,
-  encryption and KEK, and the bootstrap peer-config dir.
+  Part 4 adds encryption (`encryptionFlags`: sidecar path, opt-in,
+  rotate-on-startup, KEK file and URI). The KEK load, start-up guards,
+  KEK preflight and EncryptionAdmin mutator gate take it as a parameter.
+  Protected bootstrap admission only needs two facts from it (encryption
+  configured, rotation requested), so those travel as
+  `bootstrapEncryptionRequest` in `raftBootstrapConfig` and are kept on the
+  bootstrap domain for WAL recovery. The bootstrap e2e fixtures pass the
+  request instead of overwriting process globals.
+  Still package globals: listener addresses, Raft and shard topology, and
+  the bootstrap peer-config dir.
 - Snapshot-offload wiring can now move (M4): its helpers take
   `snapshotOffloadFlags` instead of reading about twenty flags.
 

@@ -50,6 +50,7 @@ type serverFlags struct {
 	adminHTTP       adminHTTPFlags
 	backup          backupFlags
 	nodeAuth        nodeAuthFlags
+	encryption      encryptionFlags
 	// keyViz and autoSplit are shared with the cmd/server demo through
 	// internal/serverwiring. The sampler runs entirely in-memory on each
 	// node, feeds AdminServer.GetKeyVizMatrix, and is disabled unless
@@ -68,6 +69,7 @@ func registerServerFlags(fs *flag.FlagSet) *serverFlags {
 	f.adminHTTP.register(fs)
 	f.backup.register(fs)
 	f.nodeAuth.register(fs)
+	f.encryption.register(fs)
 	f.keyViz = serverwiring.RegisterKeyVizFlags(fs)
 	f.autoSplit = serverwiring.RegisterAutoSplitFlags(fs)
 	return f
@@ -122,50 +124,4 @@ var (
 	// flag, so populating it has no effect on production traffic
 	// until PR 5 lands.
 	sqsFifoPartitionMap = flag.String("sqsFifoPartitionMap", "", "HT-FIFO partition map (queue.fifo:N=group_0,...,group_{N-1};...)")
-
-	// Data-at-rest encryption admin RPC wiring (Stage 5D). The
-	// EncryptionAdmin gRPC service is reachable on every shard's
-	// gRPC listener so the §7.1 Phase-0 GetCapability fan-out can
-	// poll any member.
-	//
-	// This flag gates ONLY the read-only capability surface:
-	// empty → GetCapability reports encryption_capable=false (the
-	// §7.1 cutover refuses with ErrCapabilityCheckFailed);
-	// set   → capability probing reads the §5.1 keys.json and
-	// reports encryption_capable=true.
-	//
-	// Mutating RPCs (BootstrapEncryption / RotateDEK /
-	// RegisterEncryptionWriter) are gated by Stage 6B-2 on the
-	// AND of --encryption-enabled and a successfully loaded KEK source.
-	// Setting --encryptionSidecarPath ALONE no longer enables
-	// mutators; the operator must explicitly opt in to encryption
-	// AND supply a KEK source. With either gate condition false,
-	// registerEncryptionAdminServer omits the Proposer + LeaderView
-	// options and every mutator short-circuits at the gRPC boundary
-	// with FailedPrecondition before any Raft proposal is created.
-	encryptionSidecarPath = flag.String("encryptionSidecarPath", "", "§5.1 keys.json path; enables read-only EncryptionAdmin capability probing. Mutating RPCs additionally require --encryption-enabled and one loaded KEK source.")
-
-	// Stage 6B-2: cluster-wide encryption opt-in flag. The mutating
-	// EncryptionAdmin RPCs (BootstrapEncryption, RotateDEK,
-	// RegisterEncryptionWriter) become reachable only when this
-	// flag is set AND exactly one configured KEK source loads successfully.
-	// Default off; pre-Stage-6 clusters and operators who have
-	// not yet committed to encryption are unaffected.
-	encryptionEnabled = flag.Bool("encryption-enabled", false, "§6.5 opt-in to encryption-mutating EncryptionAdmin RPCs. Requires exactly one KEK source from --kekFile, --kekUri, or ELASTICKV_KEK_BASE64. Default off.")
-
-	// Stage 6F: operator-requested DEK rotation at boot. The flag is
-	// intentionally a request, not a guarantee: only the leader of the
-	// default encryption Raft group proposes the rotation; followers
-	// keep the request in memory and fire it only if they acquire
-	// leadership during this process uptime.
-	encryptionRotateOnStartup = flag.Bool("encryption-rotate-on-startup", false, "§6.5 request a one-shot DEK rotation after this node becomes leader of the default Raft group. Safe for rolling restarts: followers keep the request in memory and only fire if they acquire leadership during this process uptime.")
-
-	// KEK sources. The KEK never appears in elastickv's
-	// data dir; it is held externally and exercised only at process
-	// boot and at DEK bootstrap/rotation per §5.1. Empty disables KEK loading; the
-	// applier's ApplyBootstrap and ApplyRotation paths then return
-	// ErrKEKNotConfigured at apply time, which is masked at the
-	// RPC boundary by the mutator gate documented above.
-	kekFile = flag.String("kekFile", "", "§5.1 KEK file path (32 raw bytes, owner-only mode). When set, the file-backed kek.Wrapper is constructed at startup and threaded into the §6.3 EncryptionApplier so ApplyBootstrap and ApplyRotation can KEK-unwrap.")
-	kekURI  = flag.String("kekUri", "", "§5.1 remote KEK URI: aws-kms://<key-arn>, gcp-kms://<crypto-key-resource>, or vault-transit://<mount>/<key>. Mutually exclusive with --kekFile and ELASTICKV_KEK_BASE64.")
 )

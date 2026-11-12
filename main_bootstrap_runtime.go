@@ -72,7 +72,7 @@ func newBootstrapStartupForGroup(config *bootstrapPeerConfig, files *raftbootstr
 				defer mu.Unlock()
 				// Any failed re-publication permanently closes this owner rather than
 				// retaining an earlier projection's authority.
-				if err := publishBootstrapAdmissionRecovery(admission, owner, files, st, identity, state, config.activation); err != nil {
+				if err := publishBootstrapAdmissionRecovery(admission, owner, files, st, identity, state, config.activation, domain.encryptionRequest.configured); err != nil {
 					admission.LatchFatal(err)
 					owner.Close()
 					return err
@@ -88,7 +88,9 @@ func bootstrapPublicReady(admission *raftadmission.Arbiter, owner *peersession.O
 	return admission.Stage(id) == peersession.DataReady && ok && group.Stage == peersession.DataReady && group.Pending == peersession.PendingClear
 }
 
-func publishBootstrapAdmissionRecovery(admission *raftadmission.Arbiter, owner *peersession.Owner, files *raftbootstrap.Store, st store.MVCCStore, expected etcd.WALIdentity, state etcd.RecoveredState, activation []byte) error {
+// encryptionConfigured is bootstrapEncryptionRequest.configured: without it
+// the recovered registration is published as not configured.
+func publishBootstrapAdmissionRecovery(admission *raftadmission.Arbiter, owner *peersession.Owner, files *raftbootstrap.Store, st store.MVCCStore, expected etcd.WALIdentity, state etcd.RecoveredState, activation []byte, encryptionConfigured bool) error {
 	ticket, err := admission.Ticket(expected.Identity.Group)
 	if err != nil {
 		return errors.WithStack(err)
@@ -107,7 +109,7 @@ func publishBootstrapAdmissionRecovery(admission *raftadmission.Arbiter, owner *
 	// Configured encryption remains closed until independent epoch/wrapper
 	// inspection publishes its evidence; process-wide "Done" is not proof.
 	registration := raftadmission.RegistrationUnknown
-	if !*encryptionEnabled && *encryptionSidecarPath == "" {
+	if !encryptionConfigured {
 		registration = raftadmission.RegistrationNotConfigured
 	}
 	return errors.WithStack(admission.PublishRecoveryWith(ticket, policy, registration,

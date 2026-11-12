@@ -24,7 +24,21 @@ type bootstrapEncryptionDomain struct {
 	grants       []bootstrapRotationPayloadGrant
 }
 
-func newBootstrapEncryptionDomain(groups []groupSpec, optional []encryptionWriteWiring) (*bootstrapEncryptionDomain, error) {
+// bootstrapEncryptionRequest is the part of the encryption flags protected
+// bootstrap admission depends on.
+type bootstrapEncryptionRequest struct {
+	// configured is --encryption-enabled or a non-empty
+	// --encryptionSidecarPath.
+	configured bool
+	// rotateOnStartup is --encryption-rotate-on-startup.
+	rotateOnStartup bool
+}
+
+func (r bootstrapEncryptionRequest) requested() bool {
+	return r.configured || r.rotateOnStartup
+}
+
+func newBootstrapEncryptionDomain(groups []groupSpec, request bootstrapEncryptionRequest, optional []encryptionWriteWiring) (*bootstrapEncryptionDomain, error) {
 	if len(optional) > 1 {
 		return nil, errors.Wrap(errBootstrapEncryptionUnsupported, "multiple encryption wirings")
 	}
@@ -32,8 +46,7 @@ func newBootstrapEncryptionDomain(groups []groupSpec, optional []encryptionWrite
 	if len(optional) == 1 {
 		w = optional[0]
 	}
-	requested := *encryptionRotateOnStartup || *encryptionEnabled || *encryptionSidecarPath != ""
-	if !requested && !w.encryptionConfigured() {
+	if !request.requested() && !w.encryptionConfigured() {
 		return nil, nil
 	}
 	if err := validateBootstrapDomainEncryptionWiring(w, groups); err != nil {

@@ -17,6 +17,9 @@ type raftBootstrapConfig struct {
 	// serviceTokenFiles are the node's Admin, migration and S3 peer token
 	// files; a protected bootstrap startup token must differ from each.
 	serviceTokenFiles []string
+	// encryption is what protected bootstrap admission needs from the
+	// encryption flags.
+	encryption bootstrapEncryptionRequest
 }
 
 func (c raftBootstrapConfig) anyBootstrapServers() bool {

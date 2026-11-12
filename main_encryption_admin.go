@@ -63,8 +63,8 @@ import (
 // Kept in this file (not main.go) so the flag-driven gate logic
 // is colocated with the registerEncryptionAdminServer helper
 // that consumes it.
-func encryptionMutatorsEnabled(kekConfigured bool) bool {
-	return *encryptionEnabled && kekConfigured && *encryptionSidecarPath != ""
+func encryptionMutatorsEnabled(f encryptionFlags, kekConfigured bool) bool {
+	return f.enabled && kekConfigured && f.sidecarPath != ""
 }
 
 // encryptionAdminEngine is the subset of raftengine.Engine the

@@ -45,7 +45,7 @@ func validateProtectedBootstrapDomain(raftID, baseDir string, groups []groupSpec
 	return nil
 }
 
-func loadProtectedBootstrapDomain(raftID, baseDir string, groups []groupSpec, multi bool, serviceTokenFiles []string, encWiring ...encryptionWriteWiring) (map[uint64]*groupBootstrapSpec, *bootstrapDomain, error) {
+func loadProtectedBootstrapDomain(raftID, baseDir string, groups []groupSpec, multi bool, bootstrapCfg raftBootstrapConfig, encWiring ...encryptionWriteWiring) (map[uint64]*groupBootstrapSpec, *bootstrapDomain, error) {
 	if *raftBootstrapPeerConfigDir == "" {
 		return nil, nil, nil
 	}
@@ -61,11 +61,11 @@ func loadProtectedBootstrapDomain(raftID, baseDir string, groups []groupSpec, mu
 		}
 		specs[group.id], cluster = spec, spec.intent.Identity.Cluster
 	}
-	domain, err := newBootstrapDomain(cluster, groups, encWiring...)
+	domain, err := newBootstrapDomain(cluster, groups, bootstrapCfg.encryption, encWiring...)
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := attachBootstrapDomain(specs, domain, serviceTokenFiles); err != nil {
+	if err := attachBootstrapDomain(specs, domain, bootstrapCfg.serviceTokenFiles); err != nil {
 		domain.admission.Close()
 		return nil, nil, err
 	}

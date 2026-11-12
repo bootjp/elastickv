@@ -25,6 +25,7 @@ type bootstrapDomain struct {
 	activations              map[uint64][]byte
 	cluster                  raftbootstrap.UUID
 	encryption               *bootstrapEncryptionDomain
+	encryptionRequest        bootstrapEncryptionRequest
 	protectedRotationHandler bootstrapRotationRPCHandler
 }
 
@@ -75,8 +76,8 @@ func bootstrapDomainForRuntimes(runtimes []*raftGroupRuntime) *bootstrapDomain {
 	return nil
 }
 
-func newBootstrapDomain(cluster raftbootstrap.UUID, groups []groupSpec, encWiring ...encryptionWriteWiring) (*bootstrapDomain, error) {
-	enc, err := newBootstrapEncryptionDomain(groups, encWiring)
+func newBootstrapDomain(cluster raftbootstrap.UUID, groups []groupSpec, request bootstrapEncryptionRequest, encWiring ...encryptionWriteWiring) (*bootstrapDomain, error) {
+	enc, err := newBootstrapEncryptionDomain(groups, request, encWiring)
 	if err != nil {
 		return nil, err
 	}
@@ -84,10 +85,10 @@ func newBootstrapDomain(cluster raftbootstrap.UUID, groups []groupSpec, encWirin
 	for _, group := range groups {
 		ids = append(ids, group.id)
 	}
-	d := &bootstrapDomain{cluster: cluster, encryption: enc, owners: make(map[uint64]*peersession.Owner), activations: make(map[uint64][]byte)}
+	d := &bootstrapDomain{cluster: cluster, encryption: enc, encryptionRequest: request, owners: make(map[uint64]*peersession.Owner), activations: make(map[uint64][]byte)}
 	cfg := raftadmission.Config{
 		Cluster: cluster, Groups: ids, DefaultGroup: defaultGroupID(groups),
-		RotationRequested:    *encryptionRotateOnStartup,
+		RotationRequested:    request.rotateOnStartup,
 		ValidatePayload:      bootstrapPayloadValidator(cluster),
 		EncryptionConfigured: enc != nil,
 	}
