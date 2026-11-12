@@ -56,9 +56,9 @@ func TestRegisterServerFlagsBindsCommandLineNames(t *testing.T) {
 	require.Equal(t, "peer-a:8080", f.adminHTTP.keyvizFanoutNodes)
 	require.Equal(t, 7, f.backup.maxActivePins)
 	require.True(t, *f.autoSplit.Enabled)
-	require.Equal(t, "/etc/ekv/admin-token", f.nodeAuth.adminTokenFile)
-	require.True(t, f.nodeAuth.splitMigrationPeerAuthEnforced)
-	require.Equal(t, "/etc/ekv/tls.crt", f.nodeAuth.grpcTLSCertFile)
+	require.Equal(t, "/etc/ekv/admin-token", f.nodeAuth.AdminTokenFile)
+	require.True(t, f.nodeAuth.SplitMigrationPeerAuthEnforced)
+	require.Equal(t, "/etc/ekv/tls.crt", f.nodeAuth.GRPCTLSCertFile)
 
 	defaults := defaultServerFlags()
 	require.Equal(t, tsowiring.DefaultBatchSize, defaults.tso.BatchSize)

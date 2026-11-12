@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/adapter"
+	"github.com/bootjp/elastickv/internal/nodeauth"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftadmin"
 	"github.com/bootjp/elastickv/kv"
@@ -37,20 +38,20 @@ func TestMigrationMembershipWiringKeepsEnvelopeProposerAndTSOIsolation(t *testin
 
 func TestMigrationCoverageGateAllowsOnlyTypedNamespaceBootstrap(t *testing.T) {
 	t.Parallel()
-	var migrationAuth nodeAuthFlags
+	var migrationAuth nodeauth.Flags
 	request, err := kv.NewNamespaceAdmissionRequest(1, kv.NamespaceAdmissionCommand{Version: kv.MigrationNamespaceVersion,
 		ConfigurationIndex: 9, ApplyMembers: []uint64{7},
 		Members: []kv.NamespaceMemberCapability{{MemberID: 7, Version: kv.MigrationNamespaceVersion, ConfigurationIndex: 9}}})
 	require.NoError(t, err)
 	info := &grpc.UnaryServerInfo{FullMethod: pb.Internal_CleanupMigration_FullMethodName}
 	called := false
-	_, err = adapter.MigrationCoverageUnaryGate(t.Context(), request, info, func(context.Context, any) (any, error) { called = true; return nil, nil }, migrationAuth.splitMigrationLocalReadinessGate)
+	_, err = adapter.MigrationCoverageUnaryGate(t.Context(), request, info, func(context.Context, any) (any, error) { called = true; return nil, nil }, migrationAuth.SplitMigrationLocalReadinessGate)
 	require.NoError(t, err)
 	require.True(t, called)
 	request.NamespaceAdmission = []byte("invalid")
 	_, err = adapter.MigrationCoverageUnaryGate(t.Context(), request, info, func(context.Context, any) (any, error) {
 		t.Fatal("malformed bootstrap reached the handler")
 		return nil, nil
-	}, migrationAuth.splitMigrationLocalReadinessGate)
+	}, migrationAuth.SplitMigrationLocalReadinessGate)
 	require.Equal(t, codes.InvalidArgument, status.Code(err))
 }

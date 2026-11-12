@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/adapter"
+	"github.com/bootjp/elastickv/internal/nodeauth"
 	"github.com/bootjp/elastickv/internal/peersession"
 	"github.com/bootjp/elastickv/internal/raftadmission"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
@@ -62,9 +63,9 @@ func newBootstrapRotationRPCFixture(t *testing.T, run bootstrapRotationRPCHandle
 	if len(credentialOverride) != 0 {
 		credential = credentialOverride[0]
 	}
-	rotation, err := bootstrapRotationRPCOptions(adminGRPCInterceptors{token: credential}, gate.domain, bootstrapRotationRPCNode, run)
+	rotation, err := bootstrapRotationRPCOptions(nodeauth.AdminGRPCInterceptors{Token: credential}, gate.domain, bootstrapRotationRPCNode, run)
 	require.NoError(t, err)
-	options = append(options, grpc.ChainUnaryInterceptor(bootstrapStartupAuthException(gate.domain, admin), rotation.unary[0], gate.unaryInterceptor))
+	options = append(options, grpc.ChainUnaryInterceptor(bootstrapStartupAuthException(gate.domain, admin), rotation.Unary[0], gate.unaryInterceptor))
 	server := grpc.NewServer(options...)
 	owner.Register(server)
 	service := &bootstrapGateService{}
@@ -230,17 +231,17 @@ func TestBootstrapRotationRPCOptionsLegacyAndIsolation(t *testing.T) {
 	backing[0] = func(ctx context.Context, request any, _ *grpc.UnaryServerInfo, next grpc.UnaryHandler) (any, error) {
 		return next(ctx, request)
 	}
-	options := adminGRPCInterceptors{token: bootstrapRotationRPCAdmin, unary: backing[:1]}
+	options := nodeauth.AdminGRPCInterceptors{Token: bootstrapRotationRPCAdmin, Unary: backing[:1]}
 	legacy, err := bootstrapRotationRPCOptions(options, nil, 0, nil)
 	require.NoError(t, err, "nil legacy profile does not require a controller or identity")
-	require.Equal(t, &options.unary[0], &legacy.unary[0])
+	require.Equal(t, &options.Unary[0], &legacy.Unary[0])
 	configured, err := bootstrapRotationRPCOptions(options, &bootstrapDomain{}, bootstrapRotationRPCNode,
 		func(context.Context, *pb.RotateDEKRequest) (*pb.RotateDEKResponse, error) {
 			return &pb.RotateDEKResponse{AppliedIndex: 1}, nil
 		})
 	require.NoError(t, err)
-	require.Len(t, configured.unary, 2)
-	require.Len(t, options.unary, 1)
+	require.Len(t, configured.Unary, 2)
+	require.Len(t, options.Unary, 1)
 	require.Nil(t, backing[1], "do not modify the original service-auth backing array")
 	var domain *bootstrapDomain
 	require.Nil(t, domain.rotationRPCHandler())
@@ -257,17 +258,17 @@ func TestBootstrapRotationRPCOptionsLegacyAndIsolation(t *testing.T) {
 func TestBootstrapRotationRPCUnconfiguredDoesNotBreakStartup(t *testing.T) {
 	for _, credential := range []string{"", bootstrapRotationRPCAdmin} {
 		t.Run(map[bool]string{true: "missing ADMIN", false: "protected plaintext"}[credential == ""], func(t *testing.T) {
-			options, err := bootstrapRotationRPCOptions(adminGRPCInterceptors{token: credential}, &bootstrapDomain{}, bootstrapRotationRPCNode, nil)
+			options, err := bootstrapRotationRPCOptions(nodeauth.AdminGRPCInterceptors{Token: credential}, &bootstrapDomain{}, bootstrapRotationRPCNode, nil)
 			require.NoError(t, err)
-			require.Len(t, options.unary, 1)
+			require.Len(t, options.Unary, 1)
 			ordinaryCalled := false
 			next := func(context.Context, any) (any, error) { ordinaryCalled = true; return "ordinary", nil }
-			reply, err := options.unary[0](t.Context(), nil, &grpc.UnaryServerInfo{FullMethod: pb.RawKV_RawGet_FullMethodName}, next)
+			reply, err := options.Unary[0](t.Context(), nil, &grpc.UnaryServerInfo{FullMethod: pb.RawKV_RawGet_FullMethodName}, next)
 			require.NoError(t, err)
 			require.Equal(t, "ordinary", reply)
 			require.True(t, ordinaryCalled)
 			ordinaryCalled = false
-			_, err = options.unary[0](t.Context(), bootstrapRotationRPCRequest(), &grpc.UnaryServerInfo{FullMethod: pb.EncryptionAdmin_RotateDEK_FullMethodName}, next)
+			_, err = options.Unary[0](t.Context(), bootstrapRotationRPCRequest(), &grpc.UnaryServerInfo{FullMethod: pb.EncryptionAdmin_RotateDEK_FullMethodName}, next)
 			require.Equal(t, codes.Unauthenticated, status.Code(err))
 			require.False(t, ordinaryCalled, "disabled rotation cannot fall back to the adapter")
 			f := newBootstrapRotationRPCFixture(t, nil, credential)

@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/bootjp/elastickv/internal/nodeauth"
 	"github.com/bootjp/elastickv/internal/peersession"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
@@ -42,12 +43,12 @@ func (d *bootstrapDomain) rotationRPCHandler() bootstrapRotationRPCHandler {
 // Call once in startRaftTransport after bootstrapServiceAuthOptions and the
 // registration receiver hook, before appending the public gate. Legacy options
 // are untouched. Sharing the returned options shares one process-wide bound.
-func bootstrapRotationRPCOptions(options adminGRPCInterceptors, domain *bootstrapDomain, localNodeID uint64, run bootstrapRotationRPCHandler) (adminGRPCInterceptors, error) {
+func bootstrapRotationRPCOptions(options nodeauth.AdminGRPCInterceptors, domain *bootstrapDomain, localNodeID uint64, run bootstrapRotationRPCHandler) (nodeauth.AdminGRPCInterceptors, error) {
 	if domain == nil {
 		return options, nil
 	}
-	if options.token == "" {
-		options.unary = append(slices.Clone(options.unary), denyBootstrapRotationRPC)
+	if options.Token == "" {
+		options.Unary = append(slices.Clone(options.Unary), denyBootstrapRotationRPC)
 		return options, nil
 	}
 	if run == nil {
@@ -55,11 +56,11 @@ func bootstrapRotationRPCOptions(options adminGRPCInterceptors, domain *bootstra
 			return nil, bootstrapRotationRPCError(codes.FailedPrecondition, "protected rotation controller is not configured")
 		}
 	}
-	rotation, err := newBootstrapRotationRPC(options.token, localNodeID, run)
+	rotation, err := newBootstrapRotationRPC(options.Token, localNodeID, run)
 	if err != nil {
 		return options, err
 	}
-	options.unary = append(slices.Clone(options.unary), rotation)
+	options.Unary = append(slices.Clone(options.Unary), rotation)
 	return options, nil
 }
 

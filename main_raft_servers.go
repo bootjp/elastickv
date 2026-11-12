@@ -10,6 +10,7 @@ import (
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
 	internalutil "github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/internal/nodeauth"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	internalraftadmin "github.com/bootjp/elastickv/internal/raftadmin"
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -43,7 +44,7 @@ func registerS3BlobFetchServer(
 	return []string{"S3BlobFetch"}
 }
 
-func raftGRPCServerOptions(adminGRPCOpts adminGRPCInterceptors) []grpc.ServerOption {
+func raftGRPCServerOptions(adminGRPCOpts nodeauth.AdminGRPCInterceptors) []grpc.ServerOption {
 	baseOpts := internalutil.GRPCServerOptions()
 	// extraOptsCap reserves slots for the unary + stream admin
 	// interceptor options appended below. Sized as a constant so the
@@ -56,11 +57,11 @@ func raftGRPCServerOptions(adminGRPCOpts adminGRPCInterceptors) []grpc.ServerOpt
 	// (single-interceptor) option added anywhere in this chain cannot
 	// silently overwrite the admin auth gate — gRPC-Go keeps only the
 	// last option of the same type.
-	unary := append([]grpc.UnaryServerInterceptor{}, adminGRPCOpts.unary...)
-	unary = append(unary, adapter.NewMigrationCoverageUnaryGate(adminGRPCOpts.migrationReady))
+	unary := append([]grpc.UnaryServerInterceptor{}, adminGRPCOpts.Unary...)
+	unary = append(unary, adapter.NewMigrationCoverageUnaryGate(adminGRPCOpts.MigrationReady))
 	opts = append(opts, grpc.ChainUnaryInterceptor(unary...))
-	if len(adminGRPCOpts.stream) > 0 {
-		opts = append(opts, grpc.ChainStreamInterceptor(adminGRPCOpts.stream...))
+	if len(adminGRPCOpts.Stream) > 0 {
+		opts = append(opts, grpc.ChainStreamInterceptor(adminGRPCOpts.Stream...))
 	}
 	return opts
 }
@@ -82,7 +83,7 @@ func startRaftServers(
 	relay *adapter.RedisPubSubRelay,
 	proposalObserverForGroup func(uint64) kv.ProposalObserver,
 	adminServer *adapter.AdminServer,
-	adminGRPCOpts adminGRPCInterceptors,
+	adminGRPCOpts nodeauth.AdminGRPCInterceptors,
 	forwardDeps adminForwardServerDeps,
 	confChangeInterceptor internalraftadmin.MembershipChangeInterceptor,
 	encWiring encryptionWriteWiring,
@@ -132,13 +133,13 @@ func startRaftServers(
 		internalOpts = append(internalOpts, bootstrapInternalPolicyOptions(rt, proposerForGroup(rt, shardGroups))...)
 		internalOpts = append(internalOpts, dedicatedTimestampCutoverOptions(shardGroups)...)
 		internalOpts = append(internalOpts, adapter.WithInternalMigrationOwnershipReady(func() bool {
-			return adapter.MigrationOwnershipRuntimeReady(trx, shardStore, distServer, rt.Spec.ID, rt.snapshotEngine(), adminGRPCOpts.migrationReady)
+			return adapter.MigrationOwnershipRuntimeReady(trx, shardStore, distServer, rt.Spec.ID, rt.snapshotEngine(), adminGRPCOpts.MigrationReady)
 		}))
 		internalOpts = append(internalOpts, migrationInternalProtocolOptions(trx, shardStore, distServer, rt)...)
 		internalOpts = append(internalOpts, internalReadWatermarkOptions(readWatermarkAdvance, rt, shardGroups)...)
 		staticServingServices := registerS3BlobFetchServer(
 			gs,
-			adminGRPCOpts.s3BlobFetchEnabled,
+			adminGRPCOpts.S3BlobFetchEnabled,
 			rt.Store,
 			s3BlobObserver,
 			coordinate.Clock(),
@@ -150,7 +151,7 @@ func startRaftServers(
 			coordinate.Clock(),
 			relay,
 			append(internalOpts,
-				adapter.WithInternalPrepareEvidenceToken(adminGRPCOpts.token),
+				adapter.WithInternalPrepareEvidenceToken(adminGRPCOpts.Token),
 				adapter.WithInternalStore(rt.Store),
 				adapter.WithInternalPrimaryCommitEvidence(shardStore),
 				adapter.WithInternalMigrationProposer(proposerForGroup(rt, shardGroups)),
@@ -190,7 +191,7 @@ func startRaftServers(
 			rt.Engine,
 			[]string{"RawKV"},
 			staticServingServices,
-			migrationMembershipInterceptor(rt, shardStore, proposerForGroup(rt, shardGroups), adminGRPCOpts.migrationToken, confChangeInterceptor),
+			migrationMembershipInterceptor(rt, shardStore, proposerForGroup(rt, shardGroups), adminGRPCOpts.MigrationToken, confChangeInterceptor),
 		)
 		reflection.Register(gs)
 

@@ -11,6 +11,7 @@ import (
 	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/bootjp/elastickv/internal/admin"
 	"github.com/bootjp/elastickv/internal/adminbridge"
+	"github.com/bootjp/elastickv/internal/nodeauth"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	internalraftadmin "github.com/bootjp/elastickv/internal/raftadmin"
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -77,7 +78,7 @@ type serversInput struct {
 	leaderBalance leaderBalanceFlags
 	adminHTTP     adminHTTPFlags
 	backup        backupFlags
-	nodeAuth      nodeAuthFlags
+	nodeAuth      nodeauth.Flags
 	listeners     listenerFlags
 	// nodeAddress is this node's --address.
 	nodeAddress string
@@ -92,7 +93,7 @@ type serversInput struct {
 // to catch up, prepares the public listeners, waits for any requested startup
 // rotation, then starts serving public traffic.
 func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter, in serversInput) error {
-	adminGRPCEnabled := in.nodeAuth.adminTokenFile != "" || in.nodeAuth.adminInsecureNoAuth
+	adminGRPCEnabled := in.nodeAuth.AdminTokenFile != "" || in.nodeAuth.AdminInsecureNoAuth
 	// roleStore is gated on *adminEnabled. With admin HTTP disabled, building
 	// it is wasted work AND a security regression risk: a non-empty
 	// -adminFullAccessKeys flag would otherwise still flip
@@ -227,8 +228,8 @@ func startPublicServicesAfterCommitTSFence(in serversInput, runner *runtimeServe
 	if err := markPublicGateReadyAfterCommitTSFence(in.ctx, gate, in.runtimes, fenceEnabled); err != nil {
 		return runner.startupFailure(errors.Wrap(err, "wait for commit-ts fence activation before public service"))
 	}
-	startDistributionSplitJobRunner(in.ctx, in.eg, in.distServer, in.nodeAuth.splitMigrationLocalReadinessGate)
-	adapter.StartMigrationOwnershipRefresh(in.ctx, in.eg, in.distServer, in.nodeAuth.splitMigrationLocalReadinessGate)
+	startDistributionSplitJobRunner(in.ctx, in.eg, in.distServer, in.nodeAuth.SplitMigrationLocalReadinessGate)
+	adapter.StartMigrationOwnershipRefresh(in.ctx, in.eg, in.distServer, in.nodeAuth.SplitMigrationLocalReadinessGate)
 	if err := runner.startPublicServices(); err != nil {
 		return err
 	}
@@ -248,7 +249,7 @@ type runtimeServerRunner struct {
 	distServer                      *adapter.DistributionServer
 	routeEngine                     *distribution.Engine
 	adminServer                     *adapter.AdminServer
-	adminGRPCOpts                   adminGRPCInterceptors
+	adminGRPCOpts                   nodeauth.AdminGRPCInterceptors
 	redisAddress                    string
 	redisLuaMaxIdle                 int
 	leaderRedis                     map[string]string
@@ -343,7 +344,7 @@ type runtimeServerRunner struct {
 
 	publicKVGate *startupPublicKVGate
 	// nodeAuth supplies the token files the S3 blob cluster dials peers with.
-	nodeAuth nodeAuthFlags
+	nodeAuth nodeauth.Flags
 	raftID   string
 	// readWatermarkAdvance enables the Internal watermark-advance RPC.
 	readWatermarkAdvance bool
@@ -356,15 +357,15 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 	domain := bootstrapDomainForRuntimes(r.runtimes)
 	adminGRPCOpts := bootstrapServiceAuthOptions(r.adminGRPCOpts, domain)
 	if domain != nil {
-		adminGRPCOpts.unary = append([]grpc.UnaryServerInterceptor{bootstrapRegistrationReceiverInterceptor(r.defaultGroupID)}, adminGRPCOpts.unary...)
+		adminGRPCOpts.Unary = append([]grpc.UnaryServerInterceptor{bootstrapRegistrationReceiverInterceptor(r.defaultGroupID)}, adminGRPCOpts.Unary...)
 	}
 	adminGRPCOpts, err := bootstrapRotationRPCOptions(adminGRPCOpts, domain, etcdraftengine.DeriveNodeID(r.raftID), domain.rotationRPCHandler())
 	if err != nil {
 		return r.startupFailure(err)
 	}
 	if r.publicKVGate != nil {
-		adminGRPCOpts.unary = append(adminGRPCOpts.unary, r.publicKVGate.unaryInterceptor)
-		adminGRPCOpts.stream = append(adminGRPCOpts.stream, r.publicKVGate.streamInterceptor)
+		adminGRPCOpts.Unary = append(adminGRPCOpts.Unary, r.publicKVGate.unaryInterceptor)
+		adminGRPCOpts.Stream = append(adminGRPCOpts.Stream, r.publicKVGate.streamInterceptor)
 	}
 	var s3BlobPushBlocked func() bool
 	if r.publicKVGate != nil {
@@ -454,7 +455,7 @@ func (r *runtimeServerRunner) prepareAdminForwardServers() error {
 }
 
 func (r *runtimeServerRunner) newS3BlobCluster() (adapter.S3BlobCluster, error) {
-	if r == nil || !s3BlobNodeEnabled(r.s3Address, r.nodeAuth.s3BlobPeerTokenFile) {
+	if r == nil || !s3BlobNodeEnabled(r.s3Address, r.nodeAuth.S3BlobPeerTokenFile) {
 		return nil, nil
 	}
 	members, ok := r.coordinate.(kv.RaftMembershipCoordinator)
@@ -462,18 +463,18 @@ func (r *runtimeServerRunner) newS3BlobCluster() (adapter.S3BlobCluster, error) 
 		return nil, errors.New("S3 blob offload requires raft membership discovery")
 	}
 	adminToken := ""
-	if strings.TrimSpace(r.nodeAuth.adminTokenFile) != "" {
-		loaded, err := loadAdminTokenFile(r.nodeAuth.adminTokenFile)
+	if strings.TrimSpace(r.nodeAuth.AdminTokenFile) != "" {
+		loaded, err := nodeauth.LoadAdminTokenFile(r.nodeAuth.AdminTokenFile)
 		if err != nil {
-			return nil, err
+			return nil, errors.WithStack(err)
 		}
 		adminToken = loaded
 	}
 	peerToken := ""
-	if strings.TrimSpace(r.nodeAuth.s3BlobPeerTokenFile) != "" {
-		loaded, err := loadS3BlobPeerTokenFile(r.nodeAuth.s3BlobPeerTokenFile)
+	if strings.TrimSpace(r.nodeAuth.S3BlobPeerTokenFile) != "" {
+		loaded, err := nodeauth.LoadS3BlobPeerTokenFile(r.nodeAuth.S3BlobPeerTokenFile)
 		if err != nil {
-			return nil, err
+			return nil, errors.WithStack(err)
 		}
 		peerToken = loaded
 	}

@@ -48,32 +48,6 @@ func splitMigrationCapabilityPeerSourceForRuntimes(runtimes []*raftGroupRuntime)
 	}
 }
 
-// splitMigrationLocalReadinessGate reports whether this node may run split
-// migration. Its method value is the readiness callback handed to the
-// distribution server, the gRPC coverage gate and the background runners.
-func (f nodeAuthFlags) splitMigrationLocalReadinessGate(ctx context.Context) error {
-	if err := f.splitMigrationPeerAuthReadinessGate(ctx); err != nil {
-		return err
-	}
-	if !adapter.MigrationImportOpcodeEnabledFromEnv() {
-		return errors.Errorf("%s is disabled", adapter.MigrationImportOpcodeEnv)
-	}
-	if !adapter.MigrationPromoteOpcodeEnabledFromEnv() {
-		return errors.Errorf("%s is disabled", adapter.MigrationPromoteOpcodeEnv)
-	}
-	if !adapter.MigrationCleanupOpcodeEnabledFromEnv() {
-		return errors.Errorf("%s is disabled", adapter.MigrationCleanupOpcodeEnv)
-	}
-	return nil
-}
-
-func (f nodeAuthFlags) splitMigrationPeerAuthReadinessGate(context.Context) error {
-	if f.adminInsecureNoAuth || f.splitMigrationPeerAuthEnforced {
-		return nil
-	}
-	return errors.New("migration is paused during peer auth rollout; enable --splitMigrationPeerAuthEnforced only after every node sends the token")
-}
-
 func migrationInternalProtocolOptions(tx kv.Transactional, shards *kv.ShardStore, server *adapter.DistributionServer, runtime *raftGroupRuntime) []adapter.InternalOption {
 	installed := func() bool {
 		return adapter.MigrationOwnershipRuntimeHooksInstalled(tx, shards, server, runtime.Spec.ID)

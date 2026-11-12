@@ -2,6 +2,7 @@ package main
 
 import (
 	internalutil "github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/internal/nodeauth"
 	"github.com/cockroachdb/errors"
 )
 
@@ -13,7 +14,7 @@ func validateBootstrapStartupToken(token string, serviceTokenFiles []string) err
 		if path == "" {
 			continue
 		}
-		other, err := internalutil.LoadBearerTokenFile(path, adminTokenMaxBytes, "existing service token")
+		other, err := internalutil.LoadBearerTokenFile(path, nodeauth.AdminTokenMaxBytes, "existing service token")
 		if err != nil {
 			return errors.Wrap(err, "verify startup token separation")
 		}

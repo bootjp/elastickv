@@ -1,17 +1,21 @@
 package main
 
-import "slices"
+import (
+	"slices"
+
+	"github.com/bootjp/elastickv/internal/nodeauth"
+)
 
 // Wrap only the original service-auth interceptors, before the public/runtime
 // gate is appended. The startup exception must never skip A.Enter itself.
-func bootstrapServiceAuthOptions(options adminGRPCInterceptors, domain *bootstrapDomain) adminGRPCInterceptors {
+func bootstrapServiceAuthOptions(options nodeauth.AdminGRPCInterceptors, domain *bootstrapDomain) nodeauth.AdminGRPCInterceptors {
 	if domain == nil {
 		return options
 	}
-	options.unary = slices.Clone(options.unary)
-	options.stream = slices.Clone(options.stream)
-	for i, original := range options.unary {
-		options.unary[i] = bootstrapStartupAuthException(domain, original)
+	options.Unary = slices.Clone(options.Unary)
+	options.Stream = slices.Clone(options.Stream)
+	for i, original := range options.Unary {
+		options.Unary[i] = bootstrapStartupAuthException(domain, original)
 	}
 	return options
 }

@@ -5,6 +5,7 @@ import (
 
 	"github.com/bootjp/elastickv/adapter"
 	internalutil "github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/internal/nodeauth"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/cockroachdb/errors"
@@ -12,11 +13,11 @@ import (
 )
 
 func resolveNetworkRuntimeInputs(flags *serverFlags) (noderuntime.RuntimeConfig, noderuntime.RaftEngineType, noderuntime.BootstrapConfig, bool, error) {
-	if err := configureNodeGRPCTransport(flags.nodeAuth); err != nil {
-		return noderuntime.RuntimeConfig{}, "", noderuntime.BootstrapConfig{}, false, err
+	if err := nodeauth.ConfigureGRPCTransport(flags.nodeAuth); err != nil {
+		return noderuntime.RuntimeConfig{}, "", noderuntime.BootstrapConfig{}, false, errors.WithStack(err)
 	}
 	cfg, engineType, bootstrapCfg, bootstrap, err := resolveValidatedRuntimeInputs(flags)
-	bootstrapCfg.ServiceTokenFiles = flags.nodeAuth.serviceTokenFiles()
+	bootstrapCfg.ServiceTokenFiles = flags.nodeAuth.ServiceTokenFiles()
 	return cfg, engineType, bootstrapCfg, bootstrap, err
 }
 

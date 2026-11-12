@@ -8,6 +8,7 @@ import (
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/distribution/autosplit"
 	internalutil "github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/internal/nodeauth"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/internal/serverwiring"
@@ -55,7 +56,7 @@ type distributionStartupInput struct {
 	snapshotOffload snapshotoffloadwiring.Flags
 	keyViz          *serverwiring.KeyVizFlags
 	autoSplit       *serverwiring.AutoSplitFlags
-	nodeAuth        nodeAuthFlags
+	nodeAuth        nodeauth.Flags
 }
 
 type distributionStartup struct {
@@ -71,11 +72,11 @@ type distributionStartup struct {
 }
 
 func startDistributionStartup(in distributionStartupInput) (distributionStartup, error) {
-	auth, err := in.nodeAuth.loadGRPCAuth()
+	auth, err := in.nodeAuth.LoadGRPCAuth()
 	if err != nil {
-		return distributionStartup{}, err
+		return distributionStartup{}, errors.WithStack(err)
 	}
-	internalutil.ConfigureGRPCForwardToken(auth.migrationToken)
+	internalutil.ConfigureGRPCForwardToken(auth.MigrationToken)
 	distCatalog, catalogRuntime, defaultRuntime, err := setupDistributionRuntimeDependencies(
 		in.ctx, in.eg, in.runtimes, in.cfg.Engine,
 		in.coordinate, in.defaultGroup, in.cfg.DefaultGroup,
@@ -119,37 +120,37 @@ func startDistributionStartup(in distributionStartupInput) (distributionStartup,
 			splitMigrationCapabilityPeerSourceForRuntimes(in.runtimes),
 			splitMigrationCapabilityProbeTimeout,
 			bootstrapSplitMigrationProbe(in.runtimes),
-			in.nodeAuth.splitMigrationLocalReadinessGate,
+			in.nodeAuth.SplitMigrationLocalReadinessGate,
 		)),
 		adapter.WithSplitPromotionClientFactory(adapter.NewSplitPromotionGRPCClientFactory(
 			adapter.SplitPromotionTargetLeaderResolver(in.shardGroups),
 			splitMigrationConnCache,
-			auth.migrationToken,
+			auth.MigrationToken,
 		)),
 		adapter.WithSplitMigrationClientFactory(adapter.NewSplitMigrationGRPCClientFactory(
 			adapter.SplitMigrationGroupLeaderResolver(in.shardGroups),
 			splitMigrationConnCache,
-			auth.migrationToken,
+			auth.MigrationToken,
 		)),
 		adapter.WithSplitMigrationVoterFactory(adapter.NewSplitMigrationGRPCVoterFactory(
 			in.shardGroups,
 			splitMigrationConnCache,
-			auth.migrationToken,
+			auth.MigrationToken,
 		)),
 		adapter.WithSplitMigrationApplyMemberSnapshotFactory(adapter.NewSplitMigrationApplyMemberSnapshotGRPCFactory(
 			in.shardGroups,
 			splitMigrationConnCache,
-			auth.migrationToken,
+			auth.MigrationToken,
 		)),
 		adapter.WithSplitMigrationGroupClientFactory(adapter.NewSplitMigrationGroupGRPCClientFactory(
 			adapter.SplitMigrationGroupLeaderResolver(in.shardGroups),
 			splitMigrationConnCache,
-			auth.migrationToken,
+			auth.MigrationToken,
 		)),
 		// Do not advertise cap_migration_v2 before protocol coverage is accepted.
-		adapter.WithSplitJobRunnerReadinessGate(in.nodeAuth.splitMigrationLocalReadinessGate),
-		migrationOwnershipRefreshOption(in.shardGroups, catalogRuntime, splitMigrationConnCache, auth.migrationToken, in.nodeAuth.splitMigrationPeerAuthEnforced),
-		adapter.MigrationPartitionRuntimeOption(in.shardStore, in.shardGroups, splitMigrationConnCache, auth.migrationToken, in.nodeAuth.splitMigrationPeerAuthEnforced),
+		adapter.WithSplitJobRunnerReadinessGate(in.nodeAuth.SplitMigrationLocalReadinessGate),
+		migrationOwnershipRefreshOption(in.shardGroups, catalogRuntime, splitMigrationConnCache, auth.MigrationToken, in.nodeAuth.SplitMigrationPeerAuthEnforced),
+		adapter.MigrationPartitionRuntimeOption(in.shardStore, in.shardGroups, splitMigrationConnCache, auth.MigrationToken, in.nodeAuth.SplitMigrationPeerAuthEnforced),
 	)
 	autoSplitRuntime, err := setupDistributionWatcherAndAutoSplit(
 		in.ctx,

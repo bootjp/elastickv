@@ -4,6 +4,7 @@ import (
 	"flag"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/nodeauth"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/serverwiring"
 	"github.com/bootjp/elastickv/internal/snapshotoffloadwiring"
@@ -49,7 +50,7 @@ type serverFlags struct {
 	snapshotOffload snapshotoffloadwiring.Flags
 	adminHTTP       adminHTTPFlags
 	backup          backupFlags
-	nodeAuth        nodeAuthFlags
+	nodeAuth        nodeauth.Flags
 	encryption      encryptionFlags
 	listeners       listenerFlags
 	raft            raftFlags
@@ -73,7 +74,7 @@ func registerServerFlags(fs *flag.FlagSet) *serverFlags {
 	f.snapshotOffload.Register(fs)
 	f.adminHTTP.register(fs)
 	f.backup.register(fs)
-	f.nodeAuth.register(fs)
+	f.nodeAuth.Register(fs)
 	f.encryption.register(fs)
 	f.listeners.register(fs)
 	f.raft.register(fs)

@@ -9,6 +9,7 @@ import (
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
 	internalutil "github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/internal/nodeauth"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	etcdraft "github.com/bootjp/elastickv/internal/raftengine/etcd"
@@ -32,7 +33,7 @@ func newOwnershipRefreshRaftNode(t *testing.T, id string, groupID uint64, st sto
 		DataDir: t.TempDir(), Peers: []raftengine.Server{{ID: id, Address: listener.Addr().String(), Suffrage: "voter"}}, Bootstrap: true, StateMachine: fsm})
 	require.NoError(t, err)
 	auth, _ := adapter.SplitMigrationTokenAuth(token, false, true)
-	options := raftGRPCServerOptions(adminGRPCInterceptors{unary: []grpc.UnaryServerInterceptor{auth}, migrationReady: ready})
+	options := raftGRPCServerOptions(nodeauth.AdminGRPCInterceptors{Unary: []grpc.UnaryServerInterceptor{auth}, MigrationReady: ready})
 	server := grpc.NewServer(options...)
 	if result.RegisterTransport != nil {
 		result.RegisterTransport(server)
@@ -56,8 +57,8 @@ func TestOwnershipRefreshDifferentRaftLeadersRespectExplicitClosedGate(t *testin
 	t.Cleanup(func() { require.NoError(t, internalutil.ConfigureGRPCTLS("", "", "")) })
 	token := t.Name()
 	rootStore, catalog, prior := ownershipRefreshRootCatalog(t)
-	root := newOwnershipRefreshRaftNode(t, "root", 1, rootStore, token, nodeAuthFlags{}.splitMigrationLocalReadinessGate)
-	data := newOwnershipRefreshRaftNode(t, "data", 7, store.NewMVCCStore(), token, nodeAuthFlags{}.splitMigrationLocalReadinessGate)
+	root := newOwnershipRefreshRaftNode(t, "root", 1, rootStore, token, nodeauth.Flags{}.SplitMigrationLocalReadinessGate)
+	data := newOwnershipRefreshRaftNode(t, "data", 7, store.NewMVCCStore(), token, nodeauth.Flags{}.SplitMigrationLocalReadinessGate)
 	rootRoutes := distribution.NewEngine()
 	rootRoutes.UpdateRoute(nil, nil, 1)
 	rootGroups := map[uint64]*kv.ShardGroup{1: root.group}

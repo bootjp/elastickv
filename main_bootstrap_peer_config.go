@@ -15,6 +15,7 @@ import (
 	"unicode/utf8"
 
 	internalutil "github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/internal/nodeauth"
 	"github.com/bootjp/elastickv/internal/peersession"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/cockroachdb/errors"
@@ -170,7 +171,7 @@ func (out *bootstrapPeerConfig) loadRuntimeCredentials(raw bootstrapPeerJSON) er
 		return err
 	}
 	if raw.StartupTokenFile != "" {
-		token, err := internalutil.LoadBearerTokenFile(raw.StartupTokenFile, adminTokenMaxBytes, "startup token")
+		token, err := internalutil.LoadBearerTokenFile(raw.StartupTokenFile, nodeauth.AdminTokenMaxBytes, "startup token")
 		if err != nil {
 			return errors.Wrap(err, "load protected startup token")
 		}

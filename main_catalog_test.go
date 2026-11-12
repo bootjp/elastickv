@@ -188,31 +188,6 @@ func TestSplitMigrationCapabilityGateFailsClosedWhenLocalReadinessFails(t *testi
 	require.ErrorContains(t, err, "migration opcode disabled")
 }
 
-func TestSplitMigrationLocalReadinessGateRequiresMigrationOpcodes(t *testing.T) {
-	nodeAuth := nodeAuthFlags{splitMigrationPeerAuthEnforced: true}
-	t.Setenv(adapter.MigrationImportOpcodeEnv, "")
-	t.Setenv(adapter.MigrationPromoteOpcodeEnv, "1")
-	t.Setenv(adapter.MigrationCleanupOpcodeEnv, "1")
-	err := nodeAuth.splitMigrationLocalReadinessGate(context.Background())
-	require.Error(t, err)
-	require.ErrorContains(t, err, adapter.MigrationImportOpcodeEnv)
-
-	t.Setenv(adapter.MigrationImportOpcodeEnv, "1")
-	t.Setenv(adapter.MigrationPromoteOpcodeEnv, "")
-	err = nodeAuth.splitMigrationLocalReadinessGate(context.Background())
-	require.Error(t, err)
-	require.ErrorContains(t, err, adapter.MigrationPromoteOpcodeEnv)
-
-	t.Setenv(adapter.MigrationPromoteOpcodeEnv, "1")
-	t.Setenv(adapter.MigrationCleanupOpcodeEnv, "")
-	err = nodeAuth.splitMigrationLocalReadinessGate(context.Background())
-	require.Error(t, err)
-	require.ErrorContains(t, err, adapter.MigrationCleanupOpcodeEnv)
-
-	t.Setenv(adapter.MigrationCleanupOpcodeEnv, "1")
-	require.NoError(t, nodeAuth.splitMigrationLocalReadinessGate(context.Background()))
-}
-
 func TestSplitMigrationCapabilityPeersFromConfigurationUsesCurrentMembers(t *testing.T) {
 	t.Parallel()
 
