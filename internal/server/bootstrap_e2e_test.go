@@ -1,0 +1,1116 @@
+package server
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/bootjp/elastickv/adapter"
+	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
+	"github.com/bootjp/elastickv/internal/encryptionwiring"
+	"github.com/bootjp/elastickv/internal/noderuntime"
+	internalraftadmin "github.com/bootjp/elastickv/internal/raftadmin"
+	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/kv"
+	pb "github.com/bootjp/elastickv/proto"
+	"github.com/stretchr/testify/require"
+	"golang.org/x/sync/errgroup"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/reflection"
+)
+
+const (
+	bootstrapE2EWaitTimeout       = 20 * time.Second
+	bootstrapE2EWaitInterval      = 100 * time.Millisecond
+	bootstrapE2ERPCRequestTimeout = 2 * time.Second
+)
+
+type bootstrapE2EEndpoint struct {
+	id         string
+	raftAddr   string
+	redisAddr  string
+	dynamoAddr string
+}
+
+type bootstrapE2EListeners struct {
+	grpc   net.Listener
+	redis  net.Listener
+	dynamo net.Listener
+}
+
+type bootstrapE2EMultiGroupEndpoint struct {
+	id         string
+	raftAddrs  map[uint64]string
+	redisAddr  string
+	dynamoAddr string
+}
+
+type bootstrapE2EMultiGroupListeners struct {
+	grpc   map[uint64]net.Listener
+	redis  net.Listener
+	dynamo net.Listener
+}
+
+type bootstrapE2ENode struct {
+	id       string
+	runtimes []*clusterbootstrap.GroupRuntime
+
+	shardStore  *kv.ShardStore
+	coordinate  *kv.ShardedCoordinator
+	distEngine  *distribution.Engine
+	distCatalog *distribution.CatalogStore
+	distServer  *adapter.DistributionServer
+	cancel      context.CancelFunc
+	eg          *errgroup.Group
+}
+
+func (n *bootstrapE2ENode) engine() raftengine.Engine {
+	if n == nil || len(n.runtimes) == 0 {
+		return nil
+	}
+	return n.runtimes[0].Engine
+}
+
+func (n *bootstrapE2ENode) engineForGroup(groupID uint64) raftengine.Engine {
+	if n == nil {
+		return nil
+	}
+	for _, rt := range n.runtimes {
+		if rt != nil && rt.Spec.ID == groupID {
+			return rt.Engine
+		}
+	}
+	return nil
+}
+
+func (n *bootstrapE2ENode) close() error {
+	if n == nil {
+		return nil
+	}
+	if n.cancel != nil {
+		n.cancel()
+	}
+
+	var waitErr error
+	if n.eg != nil {
+		waitErr = n.eg.Wait()
+	}
+
+	if n.shardStore != nil {
+		_ = n.shardStore.Close()
+		n.shardStore = nil
+	}
+	if n.coordinate != nil {
+		_ = n.coordinate.Close()
+		n.coordinate = nil
+	}
+	for _, rt := range n.runtimes {
+		if rt != nil {
+			rt.Close()
+		}
+	}
+	n.runtimes = nil
+	return waitErr
+}
+
+func TestRaftBootstrapMembers_E2E_FixedClusterWithoutAddVoter(t *testing.T) {
+	t.Parallel()
+	for _, engineType := range []noderuntime.RaftEngineType{noderuntime.RaftEngineEtcd} {
+		t.Run(string(engineType), func(t *testing.T) {
+			const (
+				startupAttempts = 5
+				nodeCount       = 4
+				waitTimeout     = 20 * time.Second
+				waitInterval    = 100 * time.Millisecond
+				rpcTimeout      = 2 * time.Second
+			)
+
+			baseDir := t.TempDir()
+			_, endpoints, nodes := startBootstrapE2ECluster(t, baseDir, nodeCount, startupAttempts, engineType)
+			t.Cleanup(func() { closeBootstrapE2ENodes(t, nodes) })
+
+			expected := bootstrapExpectedConfiguration(endpoints)
+			waitForBootstrapClusterConfig(t, nodes, expected)
+			leaderIdx := waitForSingleLeader(t, nodes)
+
+			clients, conns := rawKVClients(t, endpoints)
+			t.Cleanup(func() { closeGRPCConns(conns) })
+
+			writerIdx := (leaderIdx + 1) % len(clients)
+			key := []byte("bootstrap-members-e2e-key")
+			value := []byte("bootstrap-members-e2e-value")
+
+			// Retry the first Put: the gRPC connection to a freshly started node
+			// may not be ready immediately, causing "context canceled while waiting
+			// for connections to become ready".
+			require.Eventually(t, func() bool {
+				return rawPutWithTimeout(clients[writerIdx], key, value) == nil
+			}, waitTimeout, waitInterval)
+
+			for i := range clients {
+				client := clients[i]
+				require.Eventually(t, func() bool {
+					resp, getErr := rawGetWithTimeout(client, key, rpcTimeout)
+					if getErr != nil {
+						return false
+					}
+					return resp.Exists && bytes.Equal(resp.Value, value)
+				}, waitTimeout, waitInterval)
+			}
+		})
+	}
+}
+
+func TestRaftBootstrapMembers_E2E_EtcdLeaderRestartRecovery(t *testing.T) {
+	t.Parallel()
+	const (
+		startupAttempts = 5
+		nodeCount       = 3
+		waitTimeout     = 20 * time.Second
+		waitInterval    = 100 * time.Millisecond
+		rpcTimeout      = 2 * time.Second
+	)
+
+	baseDir := t.TempDir()
+	clusterDir, endpoints, nodes := startBootstrapE2ECluster(t, baseDir, nodeCount, startupAttempts, noderuntime.RaftEngineEtcd)
+	t.Cleanup(func() { closeBootstrapE2ENodes(t, nodes) })
+
+	expected := bootstrapExpectedConfiguration(endpoints)
+	waitForBootstrapClusterConfig(t, nodes, expected)
+	leaderIdx := waitForSingleLeader(t, nodes)
+
+	clients, conns := rawKVClients(t, endpoints)
+	defer closeGRPCConns(conns)
+
+	keyA := []byte("bootstrap-etcd-restart-key-a")
+	valueA := []byte("bootstrap-etcd-restart-value-a")
+	// Retry the first Put: the gRPC connection to a freshly started node may not
+	// be ready immediately, causing "context canceled while waiting for connections".
+	require.Eventually(t, func() bool {
+		return rawPutWithTimeout(clients[(leaderIdx+1)%len(clients)], keyA, valueA) == nil
+	}, bootstrapE2EWaitTimeout, waitInterval)
+	waitForValueOnAllClients(t, clients, keyA, valueA, waitTimeout, waitInterval, rpcTimeout)
+
+	require.NoError(t, nodes[leaderIdx].close())
+	restartListeners := bindBootstrapE2EEndpointListeners(t, endpoints[leaderIdx])
+	restartedNode, err := startBootstrapE2ENode(clusterDir, endpoints[leaderIdx], restartListeners, false, "", noderuntime.RaftEngineEtcd)
+	require.NoError(t, err)
+	nodes[leaderIdx] = restartedNode
+
+	waitForBootstrapClusterConfig(t, nodes, expected)
+	leaderIdx = waitForSingleLeader(t, nodes)
+
+	restartedClients, restartedConns := rawKVClients(t, endpoints)
+	defer closeGRPCConns(restartedConns)
+	waitForValueOnAllClients(t, restartedClients, keyA, valueA, waitTimeout, waitInterval, rpcTimeout)
+
+	keyB := []byte("bootstrap-etcd-restart-key-b")
+	valueB := []byte("bootstrap-etcd-restart-value-b")
+	require.Eventually(t, func() bool {
+		return rawPutWithTimeout(restartedClients[(leaderIdx+1)%len(restartedClients)], keyB, valueB) == nil
+	}, bootstrapE2EWaitTimeout, waitInterval)
+	waitForValueOnAllClients(t, restartedClients, keyB, valueB, waitTimeout, waitInterval, rpcTimeout)
+}
+
+func TestRaftGroupPeers_E2E_MultiNodeMultiGroupBootstrap(t *testing.T) {
+	t.Parallel()
+	const (
+		nodeCount    = 3
+		waitTimeout  = 20 * time.Second
+		waitInterval = 100 * time.Millisecond
+		rpcTimeout   = 2 * time.Second
+	)
+	groupIDs := []uint64{1, 2}
+
+	baseDir := t.TempDir()
+	endpoints, listeners := allocateBootstrapE2EMultiGroupEndpoints(t, nodeCount, groupIDs)
+	groupPeers := bootstrapGroupPeersArg(endpoints, groupIDs)
+	nodes := make([]*bootstrapE2ENode, 0, len(endpoints))
+	for i := range endpoints {
+		node, err := startBootstrapE2EMultiGroupNode(baseDir, endpoints[i], listeners[i], true, groupIDs, groupPeers, noderuntime.RaftEngineEtcd)
+		if err != nil {
+			closeBootstrapE2ENodesIgnoreError(nodes)
+			closeBootstrapE2EMultiGroupListeners(listeners)
+			require.NoError(t, err)
+		}
+		nodes = append(nodes, node)
+	}
+	t.Cleanup(func() { closeBootstrapE2ENodes(t, nodes) })
+
+	waitForMultiGroupBootstrapClusterConfig(t, nodes, endpoints, groupIDs, waitTimeout, waitInterval)
+	leaderIdx := waitForGroupLeader(t, nodes, 1, waitTimeout, waitInterval)
+	targetIdx := (leaderIdx + 1) % len(nodes)
+	require.Eventually(t, func() bool {
+		admin, ok := nodes[leaderIdx].engineForGroup(1).(raftengine.Admin)
+		if !ok {
+			return false
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
+		defer cancel()
+		return admin.TransferLeadershipToServer(ctx, endpoints[targetIdx].id, endpoints[targetIdx].raftAddrs[1]) == nil
+	}, waitTimeout, waitInterval)
+	waitForGroupLeaderOnNode(t, nodes, 1, targetIdx, waitTimeout, waitInterval)
+
+	require.NoError(t, nodes[targetIdx].close())
+	restartListeners := bindBootstrapE2EMultiGroupEndpointListeners(t, endpoints[targetIdx], groupIDs)
+	restarted, err := startBootstrapE2EMultiGroupNode(baseDir, endpoints[targetIdx], restartListeners, false, groupIDs, groupPeers, noderuntime.RaftEngineEtcd)
+	require.NoError(t, err)
+	nodes[targetIdx] = restarted
+	waitForMultiGroupBootstrapClusterConfig(t, nodes, endpoints, groupIDs, waitTimeout, waitInterval)
+	waitForGroupLeader(t, nodes, 1, waitTimeout, waitInterval)
+}
+
+func startBootstrapE2ECluster(
+	t *testing.T,
+	baseDir string,
+	nodeCount int,
+	startupAttempts int,
+	engineType noderuntime.RaftEngineType,
+) (string, []bootstrapE2EEndpoint, []*bootstrapE2ENode) {
+	t.Helper()
+
+	var (
+		lastErr error
+		nodes   []*bootstrapE2ENode
+	)
+
+	for attempt := range startupAttempts {
+		endpoints, listeners := allocateBootstrapE2EEndpoints(t, nodeCount)
+		attemptDir := filepath.Join(baseDir, fmt.Sprintf("attempt-%d", attempt))
+		started, err := tryStartBootstrapE2ECluster(attemptDir, endpoints, listeners, engineType)
+		if err == nil {
+			return attemptDir, endpoints, started
+		}
+		closeBootstrapE2ENodesIgnoreError(started)
+		closeBootstrapE2EListeners(listeners)
+		lastErr = err
+		if !isAddressInUseError(err) {
+			break
+		}
+		nodes = nil
+	}
+
+	require.NoError(t, lastErr)
+	return "", nil, nodes
+}
+
+func allocateBootstrapE2EEndpoints(t *testing.T, nodeCount int) ([]bootstrapE2EEndpoint, []bootstrapE2EListeners) {
+	t.Helper()
+
+	var lc net.ListenConfig
+	endpoints := make([]bootstrapE2EEndpoint, 0, nodeCount)
+	listeners := make([]bootstrapE2EListeners, 0, nodeCount)
+	for i := range nodeCount {
+		grpcL, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		redisL, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		dynamoL, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+
+		endpoints = append(endpoints, bootstrapE2EEndpoint{
+			id:         fmt.Sprintf("n%d", i+1),
+			raftAddr:   grpcL.Addr().String(),
+			redisAddr:  redisL.Addr().String(),
+			dynamoAddr: dynamoL.Addr().String(),
+		})
+		listeners = append(listeners, bootstrapE2EListeners{
+			grpc:   grpcL,
+			redis:  redisL,
+			dynamo: dynamoL,
+		})
+	}
+	return endpoints, listeners
+}
+
+func allocateBootstrapE2EMultiGroupEndpoints(
+	t *testing.T,
+	nodeCount int,
+	groupIDs []uint64,
+) ([]bootstrapE2EMultiGroupEndpoint, []bootstrapE2EMultiGroupListeners) {
+	t.Helper()
+
+	var lc net.ListenConfig
+	endpoints := make([]bootstrapE2EMultiGroupEndpoint, 0, nodeCount)
+	listeners := make([]bootstrapE2EMultiGroupListeners, 0, nodeCount)
+	for i := range nodeCount {
+		grpcListeners := make(map[uint64]net.Listener, len(groupIDs))
+		raftAddrs := make(map[uint64]string, len(groupIDs))
+		for _, groupID := range groupIDs {
+			grpcL, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+			require.NoError(t, err)
+			grpcListeners[groupID] = grpcL
+			raftAddrs[groupID] = grpcL.Addr().String()
+		}
+		redisL, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		dynamoL, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+
+		endpoints = append(endpoints, bootstrapE2EMultiGroupEndpoint{
+			id:         fmt.Sprintf("n%d", i+1),
+			raftAddrs:  raftAddrs,
+			redisAddr:  redisL.Addr().String(),
+			dynamoAddr: dynamoL.Addr().String(),
+		})
+		listeners = append(listeners, bootstrapE2EMultiGroupListeners{
+			grpc:   grpcListeners,
+			redis:  redisL,
+			dynamo: dynamoL,
+		})
+	}
+	return endpoints, listeners
+}
+
+func bindBootstrapE2EEndpointListeners(t *testing.T, ep bootstrapE2EEndpoint) bootstrapE2EListeners {
+	t.Helper()
+
+	var lc net.ListenConfig
+	grpcL, err := lc.Listen(context.Background(), "tcp", ep.raftAddr)
+	require.NoError(t, err)
+	redisL, err := lc.Listen(context.Background(), "tcp", ep.redisAddr)
+	require.NoError(t, err)
+	dynamoL, err := lc.Listen(context.Background(), "tcp", ep.dynamoAddr)
+	require.NoError(t, err)
+	return bootstrapE2EListeners{
+		grpc:   grpcL,
+		redis:  redisL,
+		dynamo: dynamoL,
+	}
+}
+
+func bindBootstrapE2EMultiGroupEndpointListeners(
+	t *testing.T,
+	ep bootstrapE2EMultiGroupEndpoint,
+	groupIDs []uint64,
+) bootstrapE2EMultiGroupListeners {
+	t.Helper()
+
+	var lc net.ListenConfig
+	grpcListeners := make(map[uint64]net.Listener, len(groupIDs))
+	for _, groupID := range groupIDs {
+		grpcL, err := lc.Listen(context.Background(), "tcp", ep.raftAddrs[groupID])
+		require.NoError(t, err)
+		grpcListeners[groupID] = grpcL
+	}
+	redisL, err := lc.Listen(context.Background(), "tcp", ep.redisAddr)
+	require.NoError(t, err)
+	dynamoL, err := lc.Listen(context.Background(), "tcp", ep.dynamoAddr)
+	require.NoError(t, err)
+	return bootstrapE2EMultiGroupListeners{
+		grpc:   grpcListeners,
+		redis:  redisL,
+		dynamo: dynamoL,
+	}
+}
+
+func tryStartBootstrapE2ECluster(baseDir string, endpoints []bootstrapE2EEndpoint, listeners []bootstrapE2EListeners, engineType noderuntime.RaftEngineType) ([]*bootstrapE2ENode, error) {
+	bootstrapMembers := bootstrapMembersArg(endpoints)
+	nodes := make([]*bootstrapE2ENode, 0, len(endpoints))
+	for i := range endpoints {
+		node, err := startBootstrapE2ENode(baseDir, endpoints[i], listeners[i], true, bootstrapMembers, engineType)
+		if err != nil {
+			return nodes, err
+		}
+		nodes = append(nodes, node)
+	}
+	return nodes, nil
+}
+
+func closeBootstrapE2EListeners(listeners []bootstrapE2EListeners) {
+	for _, lis := range listeners {
+		if lis.grpc != nil {
+			_ = lis.grpc.Close()
+		}
+		if lis.redis != nil {
+			_ = lis.redis.Close()
+		}
+		if lis.dynamo != nil {
+			_ = lis.dynamo.Close()
+		}
+	}
+}
+
+func closeBootstrapE2EMultiGroupListeners(listeners []bootstrapE2EMultiGroupListeners) {
+	for _, lis := range listeners {
+		for _, grpcL := range lis.grpc {
+			if grpcL != nil {
+				_ = grpcL.Close()
+			}
+		}
+		if lis.redis != nil {
+			_ = lis.redis.Close()
+		}
+		if lis.dynamo != nil {
+			_ = lis.dynamo.Close()
+		}
+	}
+}
+
+func closeBootstrapE2ENodesIgnoreError(nodes []*bootstrapE2ENode) {
+	for _, n := range nodes {
+		if n == nil {
+			continue
+		}
+		_ = n.close()
+	}
+}
+
+func isAddressInUseError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, syscall.EADDRINUSE) {
+		return true
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && errors.Is(opErr.Err, syscall.EADDRINUSE) {
+		return true
+	}
+	var sysErr *os.SyscallError
+	if errors.As(err, &sysErr) && errors.Is(sysErr.Err, syscall.EADDRINUSE) {
+		return true
+	}
+	return false
+}
+
+func bootstrapMembersArg(endpoints []bootstrapE2EEndpoint) string {
+	parts := make([]string, 0, len(endpoints))
+	for _, ep := range endpoints {
+		parts = append(parts, fmt.Sprintf("%s=%s", ep.id, ep.raftAddr))
+	}
+	return strings.Join(parts, ",")
+}
+
+func bootstrapGroupPeersArg(endpoints []bootstrapE2EMultiGroupEndpoint, groupIDs []uint64) string {
+	groupEntries := make([]string, 0, len(groupIDs))
+	for _, groupID := range groupIDs {
+		members := make([]string, 0, len(endpoints))
+		for _, ep := range endpoints {
+			members = append(members, fmt.Sprintf("%s@%s", ep.id, ep.raftAddrs[groupID]))
+		}
+		groupEntries = append(groupEntries, fmt.Sprintf("%d=%s", groupID, strings.Join(members, ",")))
+	}
+	return strings.Join(groupEntries, ";")
+}
+
+func raftGroupsArg(ep bootstrapE2EMultiGroupEndpoint, groupIDs []uint64) string {
+	entries := make([]string, 0, len(groupIDs))
+	for _, groupID := range groupIDs {
+		entries = append(entries, fmt.Sprintf("%d=%s", groupID, ep.raftAddrs[groupID]))
+	}
+	return strings.Join(entries, ",")
+}
+
+func bootstrapExpectedConfiguration(endpoints []bootstrapE2EEndpoint) raftengine.Configuration {
+	servers := make([]raftengine.Server, 0, len(endpoints))
+	for _, ep := range endpoints {
+		servers = append(servers, raftengine.Server{
+			Suffrage: "voter",
+			ID:       ep.id,
+			Address:  ep.raftAddr,
+		})
+	}
+	return raftengine.Configuration{Servers: servers}
+}
+
+func bootstrapGroupExpectedConfiguration(endpoints []bootstrapE2EMultiGroupEndpoint, groupID uint64) raftengine.Configuration {
+	servers := make([]raftengine.Server, 0, len(endpoints))
+	for _, ep := range endpoints {
+		servers = append(servers, raftengine.Server{
+			Suffrage: "voter",
+			ID:       ep.id,
+			Address:  ep.raftAddrs[groupID],
+		})
+	}
+	return raftengine.Configuration{Servers: servers}
+}
+
+func startBootstrapE2ENode(
+	baseDir string,
+	ep bootstrapE2EEndpoint,
+	listeners bootstrapE2EListeners,
+	bootstrap bool,
+	bootstrapMembers string,
+	engineType noderuntime.RaftEngineType,
+) (*bootstrapE2ENode, error) {
+	cfg, err := noderuntime.ParseRuntimeConfig(ep.raftAddr, ep.redisAddr, "", "", "", "", "", "", "", "", "", "")
+	if err != nil {
+		return nil, err
+	}
+
+	peerCfg, err := noderuntime.ResolveRaftPeerConfig(ep.id, cfg.Groups, bootstrapMembers, "", "", false, false)
+	if err != nil {
+		return nil, err
+	}
+	bootstrapServers := peerCfg.LegacyServers
+	bootstrap = bootstrap || len(bootstrapServers) > 0
+
+	factory, err := newRaftFactory(engineType, nil)
+	if err != nil {
+		return nil, err
+	}
+	clock := kv.NewHLC()
+	runtimes, shardGroups, err := buildShardGroups(ep.id, baseDir, cfg.Groups, cfg.Multi, bootstrap,
+		noderuntime.BootstrapConfig{LegacyServers: bootstrapServers}, factory, nil, clock, kv.NewActiveTimestampTracker(),
+		nil, nil, "", encryptionwiring.WriteWiring{}, cfg.Engine)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	eg, runCtx := errgroup.WithContext(ctx)
+	shardStore := kv.NewShardStore(cfg.Engine, shardGroups)
+	coordinate := kv.NewShardedCoordinator(cfg.Engine, shardGroups, cfg.DefaultGroup, clock, shardStore)
+	distCatalog, err := setupDistributionCatalog(runCtx, runtimes, cfg.Engine)
+	if err != nil {
+		cancel()
+		_ = shardStore.Close()
+		for _, rt := range runtimes {
+			rt.Close()
+		}
+		return nil, err
+	}
+
+	eg.Go(func() error {
+		return runDistributionCatalogWatcher(runCtx, distCatalog, cfg.Engine)
+	})
+
+	distServer := adapter.NewDistributionServer(
+		cfg.Engine,
+		distCatalog,
+		adapter.WithDistributionCoordinator(coordinate),
+	)
+
+	err = startRuntimeServersWithBoundListeners(
+		runCtx,
+		eg,
+		cancel,
+		runtimes,
+		shardStore,
+		coordinate,
+		distServer,
+		cfg.LeaderRedis,
+		listeners,
+	)
+	if err != nil {
+		_ = shardStore.Close()
+		for _, rt := range runtimes {
+			rt.Close()
+		}
+		return nil, err
+	}
+
+	return &bootstrapE2ENode{
+		id:          ep.id,
+		runtimes:    runtimes,
+		shardStore:  shardStore,
+		coordinate:  coordinate,
+		distEngine:  cfg.Engine,
+		distCatalog: distCatalog,
+		distServer:  distServer,
+		cancel:      cancel,
+		eg:          eg,
+	}, nil
+}
+
+func startBootstrapE2EMultiGroupNode(
+	baseDir string,
+	ep bootstrapE2EMultiGroupEndpoint,
+	listeners bootstrapE2EMultiGroupListeners,
+	bootstrap bool,
+	groupIDs []uint64,
+	groupPeers string,
+	engineType noderuntime.RaftEngineType,
+) (*bootstrapE2ENode, error) {
+	cfg, err := noderuntime.ParseRuntimeConfig(ep.raftAddrs[groupIDs[0]], ep.redisAddr, "", ep.dynamoAddr, "",
+		raftGroupsArg(ep, groupIDs), "", "", "", "", "", "")
+	if err != nil {
+		return nil, err
+	}
+
+	bootstrapCfg, err := noderuntime.ResolveRaftPeerConfig(ep.id, cfg.Groups, "", groupPeers, "", false, false)
+	if err != nil {
+		return nil, err
+	}
+	bootstrap = bootstrap || bootstrapCfg.AnyBootstrapServers()
+
+	factory, err := newRaftFactory(engineType, nil)
+	if err != nil {
+		return nil, err
+	}
+	clock := kv.NewHLC()
+	runtimes, shardGroups, err := buildShardGroups(ep.id, baseDir, cfg.Groups, cfg.Multi, bootstrap,
+		bootstrapCfg, factory, nil, clock, kv.NewActiveTimestampTracker(), nil, nil, "",
+		encryptionwiring.WriteWiring{}, cfg.Engine)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	eg, runCtx := errgroup.WithContext(ctx)
+	shardStore := kv.NewShardStore(cfg.Engine, shardGroups)
+	coordinate := kv.NewShardedCoordinator(cfg.Engine, shardGroups, cfg.DefaultGroup, clock, shardStore)
+	distCatalog, err := setupDistributionCatalog(runCtx, runtimes, cfg.Engine)
+	if err != nil {
+		cancel()
+		_ = shardStore.Close()
+		for _, rt := range runtimes {
+			rt.Close()
+		}
+		return nil, err
+	}
+
+	eg.Go(func() error {
+		return runDistributionCatalogWatcher(runCtx, distCatalog, cfg.Engine)
+	})
+
+	distServer := adapter.NewDistributionServer(
+		cfg.Engine,
+		distCatalog,
+		adapter.WithDistributionCoordinator(coordinate),
+	)
+
+	err = startRuntimeServersWithBoundMultiGroupListeners(
+		runCtx,
+		eg,
+		cancel,
+		runtimes,
+		shardStore,
+		coordinate,
+		distServer,
+		cfg.LeaderRedis,
+		listeners,
+	)
+	if err != nil {
+		_ = shardStore.Close()
+		for _, rt := range runtimes {
+			rt.Close()
+		}
+		return nil, err
+	}
+
+	return &bootstrapE2ENode{
+		id:          ep.id,
+		runtimes:    runtimes,
+		shardStore:  shardStore,
+		coordinate:  coordinate,
+		distEngine:  cfg.Engine,
+		distCatalog: distCatalog,
+		distServer:  distServer,
+		cancel:      cancel,
+		eg:          eg,
+	}, nil
+}
+
+func startRuntimeServersWithBoundListeners(
+	ctx context.Context,
+	eg *errgroup.Group,
+	cancel context.CancelFunc,
+	runtimes []*clusterbootstrap.GroupRuntime,
+	shardStore *kv.ShardStore,
+	coordinate kv.Coordinator,
+	distServer *adapter.DistributionServer,
+	leaderRedis map[string]string,
+	listeners bootstrapE2EListeners,
+) error {
+	if len(runtimes) != 1 {
+		return waitErrgroupAfterStartupFailure(cancel, eg, fmt.Errorf("expected exactly one runtime, got %d", len(runtimes)))
+	}
+	rt := runtimes[0]
+	relay := adapter.NewRedisPubSubRelay()
+	redisAddr := leaderRedis[rt.Spec.Address]
+
+	if err := startBoundRedisServer(ctx, eg, listeners.redis, shardStore, coordinate, leaderRedis, redisAddr, relay); err != nil {
+		return waitErrgroupAfterStartupFailure(cancel, eg, err)
+	}
+	if err := startBoundGRPCServer(ctx, eg, rt, shardStore, coordinate, distServer, relay, nil, listeners.grpc); err != nil {
+		return waitErrgroupAfterStartupFailure(cancel, eg, err)
+	}
+	if err := startBoundDynamoDBServer(ctx, eg, listeners.dynamo, shardStore, coordinate); err != nil {
+		return waitErrgroupAfterStartupFailure(cancel, eg, err)
+	}
+	return nil
+}
+
+func startRuntimeServersWithBoundMultiGroupListeners(
+	ctx context.Context,
+	eg *errgroup.Group,
+	cancel context.CancelFunc,
+	runtimes []*clusterbootstrap.GroupRuntime,
+	shardStore *kv.ShardStore,
+	coordinate kv.Coordinator,
+	distServer *adapter.DistributionServer,
+	leaderRedis map[string]string,
+	listeners bootstrapE2EMultiGroupListeners,
+) error {
+	if len(runtimes) == 0 {
+		return waitErrgroupAfterStartupFailure(cancel, eg, fmt.Errorf("expected at least one runtime"))
+	}
+	relay := adapter.NewRedisPubSubRelay()
+	redisAddr := leaderRedis[runtimes[0].Spec.Address]
+	if err := startBoundRedisServer(ctx, eg, listeners.redis, shardStore, coordinate, leaderRedis, redisAddr, relay); err != nil {
+		return waitErrgroupAfterStartupFailure(cancel, eg, err)
+	}
+	for _, rt := range runtimes {
+		if err := startBoundGRPCServer(ctx, eg, rt, shardStore, coordinate, distServer, relay, nil, listeners.grpc[rt.Spec.ID]); err != nil {
+			return waitErrgroupAfterStartupFailure(cancel, eg, err)
+		}
+	}
+	if err := startBoundDynamoDBServer(ctx, eg, listeners.dynamo, shardStore, coordinate); err != nil {
+		return waitErrgroupAfterStartupFailure(cancel, eg, err)
+	}
+	return nil
+}
+
+func startBoundGRPCServer(
+	ctx context.Context,
+	eg *errgroup.Group,
+	rt *clusterbootstrap.GroupRuntime,
+	shardStore *kv.ShardStore,
+	coordinate kv.Coordinator,
+	distServer *adapter.DistributionServer,
+	relay *adapter.RedisPubSubRelay,
+	sqsPartitionResolver kv.PartitionResolver,
+	listener net.Listener,
+) error {
+	if rt == nil || rt.Engine == nil {
+		return fmt.Errorf("raft runtime is not ready")
+	}
+	if listener == nil {
+		return fmt.Errorf("grpc listener is required")
+	}
+
+	gs := grpc.NewServer()
+	trx := kv.NewTransactionWithProposer(rt.Engine)
+	grpcSvc := adapter.NewGRPCServer(shardStore, coordinate)
+	pb.RegisterRawKVServer(gs, grpcSvc)
+	pb.RegisterTransactionalKVServer(gs, grpcSvc)
+	pb.RegisterInternalServer(gs, adapter.NewInternalWithEngine(
+		trx,
+		rt.Engine,
+		coordinate.Clock(),
+		relay,
+		adapter.WithInternalStore(rt.Store),
+		adapter.WithInternalMigrationProposer(rt.Engine),
+		adapter.WithInternalMigrationExportRouting(rt.Spec.ID, sqsPartitionResolver),
+	))
+	pb.RegisterDistributionServer(gs, distServer)
+	clusterbootstrap.RuntimeCore(rt).RegisterGRPC(gs)
+	internalraftadmin.RegisterOperationalServices(ctx, gs, rt.Engine, []string{"RawKV"})
+	reflection.Register(gs)
+
+	srv := gs
+	lis := listener
+	grpcService := grpcSvc
+	eg.Go(func() error {
+		var closeOnce sync.Once
+		closeService := func() {
+			closeOnce.Do(func() { _ = grpcService.Close() })
+		}
+		stop := make(chan struct{})
+		go func() {
+			select {
+			case <-ctx.Done():
+				// Force-stop to avoid cleanup hangs when long-lived raft RPC streams
+				// keep GracefulStop waiting indefinitely under -race/CI load.
+				srv.Stop()
+				_ = lis.Close()
+				closeService()
+			case <-stop:
+			}
+		}()
+		err := srv.Serve(lis)
+		close(stop)
+		closeService()
+		if errors.Is(err, grpc.ErrServerStopped) || errors.Is(err, net.ErrClosed) {
+			return nil
+		}
+		return err
+	})
+	return nil
+}
+
+func startBoundRedisServer(
+	ctx context.Context,
+	eg *errgroup.Group,
+	listener net.Listener,
+	shardStore *kv.ShardStore,
+	coordinate kv.Coordinator,
+	leaderRedis map[string]string,
+	redisAddr string,
+	relay *adapter.RedisPubSubRelay,
+) error {
+	if listener == nil {
+		return fmt.Errorf("redis listener is required")
+	}
+	redisServer := adapter.NewRedisServer(listener, redisAddr, shardStore, coordinate, leaderRedis, relay)
+	eg.Go(func() error {
+		defer redisServer.Stop()
+		stop := make(chan struct{})
+		go func() {
+			select {
+			case <-ctx.Done():
+				redisServer.Stop()
+			case <-stop:
+			}
+		}()
+		err := redisServer.Run()
+		close(stop)
+		if errors.Is(err, net.ErrClosed) {
+			return nil
+		}
+		return err
+	})
+	return nil
+}
+
+func startBoundDynamoDBServer(
+	ctx context.Context,
+	eg *errgroup.Group,
+	listener net.Listener,
+	shardStore *kv.ShardStore,
+	coordinate kv.Coordinator,
+) error {
+	if listener == nil {
+		return fmt.Errorf("dynamodb listener is required")
+	}
+	dynamoServer := adapter.NewDynamoDBServer(listener, shardStore, coordinate)
+	eg.Go(func() error {
+		defer dynamoServer.Stop()
+		stop := make(chan struct{})
+		go func() {
+			select {
+			case <-ctx.Done():
+				dynamoServer.Stop()
+			case <-stop:
+			}
+		}()
+		err := dynamoServer.Run()
+		close(stop)
+		if errors.Is(err, net.ErrClosed) {
+			return nil
+		}
+		return err
+	})
+	return nil
+}
+
+func closeBootstrapE2ENodes(t *testing.T, nodes []*bootstrapE2ENode) {
+	t.Helper()
+	for _, n := range nodes {
+		require.NoError(t, n.close())
+	}
+}
+
+func waitForBootstrapClusterConfig(t *testing.T, nodes []*bootstrapE2ENode, expected raftengine.Configuration) {
+	t.Helper()
+
+	require.Eventually(t, func() bool {
+		for _, n := range nodes {
+			engine := n.engine()
+			if engine == nil {
+				return false
+			}
+			current, err := engine.Configuration(context.Background())
+			if err != nil {
+				return false
+			}
+			if len(current.Servers) != len(expected.Servers) {
+				return false
+			}
+			for _, server := range expected.Servers {
+				if !containsConfigServer(current.Servers, server) {
+					return false
+				}
+			}
+		}
+		return true
+	}, bootstrapE2EWaitTimeout, bootstrapE2EWaitInterval)
+}
+
+func waitForMultiGroupBootstrapClusterConfig(
+	t *testing.T,
+	nodes []*bootstrapE2ENode,
+	endpoints []bootstrapE2EMultiGroupEndpoint,
+	groupIDs []uint64,
+	waitTimeout time.Duration,
+	waitInterval time.Duration,
+) {
+	t.Helper()
+
+	expectedByGroup := make(map[uint64]raftengine.Configuration, len(groupIDs))
+	for _, groupID := range groupIDs {
+		expectedByGroup[groupID] = bootstrapGroupExpectedConfiguration(endpoints, groupID)
+	}
+
+	require.Eventually(t, func() bool {
+		for _, n := range nodes {
+			for _, groupID := range groupIDs {
+				engine := n.engineForGroup(groupID)
+				if engine == nil {
+					return false
+				}
+				current, err := engine.Configuration(context.Background())
+				if err != nil {
+					return false
+				}
+				expected := expectedByGroup[groupID]
+				if len(current.Servers) != len(expected.Servers) {
+					return false
+				}
+				for _, server := range expected.Servers {
+					if !containsConfigServer(current.Servers, server) {
+						return false
+					}
+				}
+			}
+		}
+		return true
+	}, waitTimeout, waitInterval)
+}
+
+func waitForSingleLeader(t *testing.T, nodes []*bootstrapE2ENode) int {
+	t.Helper()
+
+	leaderIdx := -1
+	require.Eventually(t, func() bool {
+		idx := -1
+		leaders := 0
+		for i, n := range nodes {
+			engine := n.engine()
+			if engine == nil {
+				return false
+			}
+			if engine.State() == raftengine.StateLeader {
+				idx = i
+				leaders++
+			}
+		}
+		if leaders != 1 {
+			return false
+		}
+		leaderIdx = idx
+		return true
+	}, bootstrapE2EWaitTimeout, bootstrapE2EWaitInterval)
+	return leaderIdx
+}
+
+func waitForGroupLeader(t *testing.T, nodes []*bootstrapE2ENode, groupID uint64, waitTimeout, waitInterval time.Duration) int {
+	t.Helper()
+
+	leaderIdx := -1
+	require.Eventually(t, func() bool {
+		idx := -1
+		leaders := 0
+		for i, n := range nodes {
+			engine := n.engineForGroup(groupID)
+			if engine == nil {
+				return false
+			}
+			if engine.State() == raftengine.StateLeader {
+				idx = i
+				leaders++
+			}
+		}
+		if leaders != 1 {
+			return false
+		}
+		leaderIdx = idx
+		return true
+	}, waitTimeout, waitInterval)
+	return leaderIdx
+}
+
+func waitForGroupLeaderOnNode(
+	t *testing.T,
+	nodes []*bootstrapE2ENode,
+	groupID uint64,
+	wantIdx int,
+	waitTimeout time.Duration,
+	waitInterval time.Duration,
+) {
+	t.Helper()
+
+	require.Eventually(t, func() bool {
+		for i, n := range nodes {
+			engine := n.engineForGroup(groupID)
+			if engine == nil {
+				return false
+			}
+			if i == wantIdx {
+				return engine.State() == raftengine.StateLeader
+			}
+		}
+		return false
+	}, waitTimeout, waitInterval)
+}
+
+func closeGRPCConns(conns []*grpc.ClientConn) {
+	for _, conn := range conns {
+		_ = conn.Close()
+	}
+}
+
+func waitForValueOnAllClients(t *testing.T, clients []pb.RawKVClient, key []byte, value []byte, waitTimeout, waitInterval, rpcTimeout time.Duration) {
+	t.Helper()
+	for i := range clients {
+		client := clients[i]
+		require.Eventually(t, func() bool {
+			resp, err := rawGetWithTimeout(client, key, rpcTimeout)
+			if err != nil {
+				return false
+			}
+			return resp.Exists && bytes.Equal(resp.Value, value)
+		}, waitTimeout, waitInterval)
+	}
+}
+
+func rawKVClients(t *testing.T, endpoints []bootstrapE2EEndpoint) ([]pb.RawKVClient, []*grpc.ClientConn) {
+	t.Helper()
+
+	clients := make([]pb.RawKVClient, 0, len(endpoints))
+	conns := make([]*grpc.ClientConn, 0, len(endpoints))
+	for _, ep := range endpoints {
+		conn, err := grpc.NewClient(ep.raftAddr,
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+		)
+		require.NoError(t, err)
+		conns = append(conns, conn)
+		clients = append(clients, pb.NewRawKVClient(conn))
+	}
+	return clients, conns
+}
+
+func rawPutWithTimeout(client pb.RawKVClient, key []byte, value []byte) error {
+	ctx, cancel := context.WithTimeout(context.Background(), bootstrapE2ERPCRequestTimeout)
+	defer cancel()
+	_, err := client.RawPut(ctx, &pb.RawPutRequest{Key: key, Value: value})
+	return err
+}
+
+func rawGetWithTimeout(client pb.RawKVClient, key []byte, timeout time.Duration) (*pb.RawGetResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return client.RawGet(ctx, &pb.RawGetRequest{Key: key})
+}
+
+func containsConfigServer(servers []raftengine.Server, expected raftengine.Server) bool {
+	for _, s := range servers {
+		if s.ID == expected.ID && s.Address == expected.Address && s.Suffrage == expected.Suffrage {
+			return true
+		}
+	}
+	return false
+}

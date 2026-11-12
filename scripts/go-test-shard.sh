@@ -6,7 +6,7 @@ set -euo pipefail
 #
 #   adapter      ./adapter without the full-length gRPC sequences
 #   adapter-seq  the full-length gRPC sequences, in a fresh package budget
-#   root         the server package (.)
+#   root         the server binary (.) and its assembly (internal/server)
 #   raft-crypto  internal/encryption and internal/raftengine/etcd
 #   rest         every other package
 #
@@ -18,6 +18,7 @@ mod=$(go list -m)
 heavy=(
   "$mod/adapter"
   "$mod"
+  "$mod/internal/server"
   "$mod/internal/encryption"
   "$mod/internal/raftengine/etcd"
 )
@@ -39,7 +40,7 @@ run() {
 case "${1:-}" in
 	adapter) run "$seq_tests" ./adapter ;;
 	adapter-seq) run "" ./adapter -run "$seq_tests" ;;
-	root) run "" . ;;
+	root) run "" . ./internal/server ;;
 	raft-crypto) run "" ./internal/encryption ./internal/raftengine/etcd ;;
   rest)
     # Discover in a plain assignment so a go list failure (which omits

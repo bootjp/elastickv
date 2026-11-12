@@ -33,29 +33,37 @@ func TestCheckLayering(t *testing.T) {
 		{"leaf may use its own subpackage", "proto", m + "proto/sub", false},
 		{"etcd backend from adapter", "adapter", m + "internal/raftengine/etcd", true},
 		{"etcd backend from kv", "kv", m + "internal/raftengine/etcd", true},
-		{"etcd backend from root main", ".", m + "internal/raftengine/etcd", false},
+		{"etcd backend from the server assembly", "internal/server", m + "internal/raftengine/etcd", false},
 		{"etcd backend from a cmd", "cmd/elastickv-snapshot-offload", m + "internal/raftengine/etcd", false},
 		{"etcd backend from snapshot offload", "internal/snapshotoffload", m + "internal/raftengine/etcd", false},
 		{"etcd subpackage from inside the engine", "internal/raftengine/etcd/transportsoak", m + "internal/raftengine/etcd", false},
 		{"engine-neutral raftengine from adapter", "adapter", m + "internal/raftengine", false},
 		{"serverwiring only from binaries", "adapter", m + "internal/serverwiring", true},
-		{"serverwiring from root main", ".", m + "internal/serverwiring", false},
+		{"serverwiring from the server assembly", "internal/server", m + "internal/serverwiring", false},
 		{"serverwiring root rule is not a subtree", "kv", m + "internal/serverwiring", true},
 		{"noderuntime only from binaries", "adapter", m + "internal/noderuntime", true},
-		{"noderuntime from root main", ".", m + "internal/noderuntime", false},
+		{"noderuntime from the server assembly", "internal/server", m + "internal/noderuntime", false},
 		{"adminbridge only from binaries", "internal/admin", m + "internal/adminbridge", true},
 		{"snapshotoffloadwiring only from binaries", "internal/snapshotoffload", m + "internal/snapshotoffloadwiring", true},
 		{"leaderbalance only from binaries", "kv", m + "internal/leaderbalance", true},
-		{"leaderbalance from root main", ".", m + "internal/leaderbalance", false},
+		{"leaderbalance from the server assembly", "internal/server", m + "internal/leaderbalance", false},
 		{"fsmount only from binaries", "internal/filesystem", m + "internal/fsmount", true},
 		{"fsmount from a cmd", "cmd/server", m + "internal/fsmount", false},
 		{"encryptionwiring only from binaries", "kv", m + "internal/encryptionwiring", true},
-		{"encryptionwiring from root main", ".", m + "internal/encryptionwiring", false},
+		{"encryptionwiring from the server assembly", "internal/server", m + "internal/encryptionwiring", false},
 		{"encryptionwiring may use noderuntime", "internal/encryptionwiring", m + "internal/noderuntime", false},
 		{"encryptionwiring may use the etcd backend", "internal/encryptionwiring", m + "internal/raftengine/etcd", false},
 		{"adapter may not use encryptionwiring", "adapter", m + "internal/encryptionwiring", true},
 		{"clusterbootstrap only from binaries", "kv", m + "internal/clusterbootstrap", true},
-		{"clusterbootstrap from root main", ".", m + "internal/clusterbootstrap", false},
+		{"clusterbootstrap from the server assembly", "internal/server", m + "internal/clusterbootstrap", false},
+		{"root main may import the server assembly", ".", m + "internal/server", false},
+		{"root main may not import kv", ".", m + "kv", true},
+		{"root main may not import wiring below the server", ".", m + "internal/clusterbootstrap", true},
+		{"root main may not import the etcd backend", ".", m + "internal/raftengine/etcd", true},
+		{"server assembly only from root main", "cmd/server", m + "internal/server", true},
+		{"adapter may not use the server assembly", "adapter", m + "internal/server", true},
+		{"kv may not use the server assembly", "kv", m + "internal/server", true},
+		{"serverwiring is not the server assembly", "internal/serverwiring", m + "internal/adminbridge", true},
 		{"clusterbootstrap may use encryptionwiring", "internal/clusterbootstrap", m + "internal/encryptionwiring", false},
 		{"clusterbootstrap may use nodeauth", "internal/clusterbootstrap", m + "internal/nodeauth", false},
 		{"encryptionwiring may not use clusterbootstrap", "internal/encryptionwiring", m + "internal/clusterbootstrap", true},
@@ -86,7 +94,8 @@ func TestModuleDir(t *testing.T) {
 func TestCheckTreeReportsEveryLayerViolation(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
-	writeSource(t, root, "main.go", "package main\nimport _ \""+modulePath+"/internal/raftengine/etcd\"\n")
+	writeSource(t, root, "main.go", "package main\nimport _ \""+modulePath+"/internal/server\"\n")
+	writeSource(t, root, "internal/server/backend.go", "package server\nimport _ \""+modulePath+"/internal/raftengine/etcd\"\n")
 	writeSource(t, root, "kv/ok.go", "package kv\nimport _ \""+modulePath+"/store\"\n")
 	writeSource(t, root, "adapter/backend.go", "package adapter\nimport _ \""+modulePath+"/internal/raftengine/etcd\"\n")
 	writeSource(t, root, "store/upward.go", "package store\nimport _ \""+modulePath+"/kv\"\n")
@@ -94,5 +103,6 @@ func TestCheckTreeReportsEveryLayerViolation(t *testing.T) {
 	require.ErrorContains(t, err, filepath.Join("adapter", "backend.go"))
 	require.ErrorContains(t, err, filepath.Join("store", "upward.go"))
 	require.NotContains(t, err.Error(), "main.go")
+	require.NotContains(t, err.Error(), filepath.Join("server", "backend.go"))
 	require.NotContains(t, err.Error(), "ok.go")
 }
