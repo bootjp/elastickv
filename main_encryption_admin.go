@@ -130,7 +130,7 @@ func encryptionAdminDefaultRuntimeOptions(runtimes []*raftGroupRuntime, shardGro
 // fullNodeID MUST be per-node-stable (every replica of the same
 // group sees a distinct value), NOT the Raft group id (which is
 // shared across replicas). Production callers derive it via
-// etcd.DeriveNodeID(*raftId) at the call site so the value
+// etcd.DeriveNodeID(raftID) at the call site so the value
 // matches what raftengine itself uses for peer identification.
 // A wrong-shape value here makes BootstrapEncryption fail with
 // "duplicate full_node_id" because every node reports the same

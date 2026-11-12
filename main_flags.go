@@ -51,6 +51,9 @@ type serverFlags struct {
 	nodeAuth        nodeAuthFlags
 	encryption      encryptionFlags
 	listeners       listenerFlags
+	raft            raftFlags
+	topology        topologyFlags
+	consistency     consistencyFlags
 	// keyViz and autoSplit are shared with the cmd/server demo through
 	// internal/serverwiring. The sampler runs entirely in-memory on each
 	// node, feeds AdminServer.GetKeyVizMatrix, and is disabled unless
@@ -71,6 +74,9 @@ func registerServerFlags(fs *flag.FlagSet) *serverFlags {
 	f.nodeAuth.register(fs)
 	f.encryption.register(fs)
 	f.listeners.register(fs)
+	f.raft.register(fs)
+	f.topology.register(fs)
+	f.consistency.register(fs)
 	f.keyViz = serverwiring.RegisterKeyVizFlags(fs)
 	f.autoSplit = serverwiring.RegisterAutoSplitFlags(fs)
 	return f
@@ -80,34 +86,9 @@ func registerServerFlags(fs *flag.FlagSet) *serverFlags {
 var cliFlags = registerServerFlags(flag.CommandLine)
 
 var (
-	myAddr               = flag.String("address", "localhost:50051", "TCP host+port for this node")
-	raftId               = flag.String("raftId", "", "Node id used by Raft")
-	raftEngineName       = flag.String("raftEngine", string(raftEngineEtcd), "Raft engine implementation (etcd)")
-	raftDir              = flag.String("raftDataDir", "data/", "Raft data dir")
 	raftBootstrap        = flag.Bool("raftBootstrap", false, "Whether to bootstrap the Raft cluster")
 	raftBootstrapMembers = flag.String("raftBootstrapMembers", "", "Comma-separated bootstrap raft members (raftID=host:port,...)")
 	raftGroupPeers       = flag.String("raftGroupPeers", "", "Semicolon-separated per-group bootstrap members (groupID=raftID@host:port,...)")
 	raftJoinMembers      = flag.String("raftJoinMembers", "", "Comma-separated raft members used only for transport discovery while this fresh node joins an existing single-group cluster (raftID=host:port,...); requires --raftJoinAsLearner")
 	raftJoinAsLearner    = flag.Bool("raftJoinAsLearner", false, "Local node expects to join an existing cluster as a learner; if a post-apply ConfState lists this node as a voter instead, an ERROR-level alarm fires (the node keeps running -- the flag is an operator alarm, not a consensus veto). See docs/design/2026_04_26_implemented_raft_learner.md §4.5.")
-	commitTSFence        = flag.Bool("commitTSFence", false, "Reserved for replicated catalog bootstrap; activation is rejected until the startup catalog no longer writes outside Raft")
-	readWatermarkAdvance = flag.Bool("readWatermarkAdvance", false, "Raise a lagging group's commit watermark before a cross-group snapshot read so late one-phase writes cannot land below the snapshot; enable only after every node runs a binary that understands the advance entry")
-	raftGroups           = flag.String("raftGroups", "", "Comma-separated raft groups (groupID=host:port,...)")
-	shardRanges          = flag.String("shardRanges", "", "Comma-separated shard ranges (start:end=groupID,...)")
-	raftRedisMap         = flag.String("raftRedisMap", "", "Map of Raft address to Redis address (raftAddr=redisAddr,...)")
-	raftS3Map            = flag.String("raftS3Map", "", "Map of Raft address to S3 address (raftAddr=s3Addr,...)")
-	raftDynamoMap        = flag.String("raftDynamoMap", "", "Map of Raft address to DynamoDB address (raftAddr=dynamoAddr,...)")
-	raftSqsMap           = flag.String("raftSqsMap", "", "Map of Raft address to SQS address (raftAddr=sqsAddr,...)")
-	// HT-FIFO partition assignment (Phase 3.D §5). Distinct from
-	// --raftSqsMap (which maps raftAddr=sqsAddr for the
-	// proxyToLeader endpoint resolution). The grammar is
-	// `queue.fifo:N=group_0,...,group_{N-1}` with multiple queues
-	// separated by `;`. Empty by default — leaving the flag empty
-	// means no FIFO queue is partitioned and the legacy
-	// single-partition layout applies to every queue. PR 5 of the
-	// rollout plan consumes this map to dispatch SendMessage and
-	// fan out ReceiveMessage; the §11 PR 2 dormancy gate currently
-	// rejects PartitionCount > 1 on CreateQueue regardless of this
-	// flag, so populating it has no effect on production traffic
-	// until PR 5 lands.
-	sqsFifoPartitionMap = flag.String("sqsFifoPartitionMap", "", "HT-FIFO partition map (queue.fifo:N=group_0,...,group_{N-1};...)")
 )

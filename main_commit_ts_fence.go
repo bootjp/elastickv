@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 
 	"github.com/bootjp/elastickv/kv"
 	"github.com/cockroachdb/errors"
@@ -13,6 +14,19 @@ func configureCommitTSFenceActivation(coordinate *kv.ShardedCoordinator, enabled
 			return commitTSFenceRuntimesReady(runtimes)
 		})
 	}
+}
+
+// consistencyFlags are rollout gates for cross-group read and commit
+// ordering features that every node must understand before they are
+// enabled.
+type consistencyFlags struct {
+	commitTSFence        bool
+	readWatermarkAdvance bool
+}
+
+func (f *consistencyFlags) register(fs *flag.FlagSet) {
+	fs.BoolVar(&f.commitTSFence, "commitTSFence", false, "Reserved for replicated catalog bootstrap; activation is rejected until the startup catalog no longer writes outside Raft")
+	fs.BoolVar(&f.readWatermarkAdvance, "readWatermarkAdvance", false, "Raise a lagging group's commit watermark before a cross-group snapshot read so late one-phase writes cannot land below the snapshot; enable only after every node runs a binary that understands the advance entry")
 }
 
 func validateCommitTSFenceStartup(enabled, protected bool) error {

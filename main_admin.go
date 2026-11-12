@@ -147,6 +147,7 @@ func prepareAdminFromFlags(
 	ctx context.Context,
 	lc *net.ListenConfig,
 	f adminHTTPFlags,
+	raftID string,
 	s3CredentialsFile string,
 	runtimes []*raftGroupRuntime,
 	dynamoServer *adapter.DynamoDBServer,
@@ -195,11 +196,11 @@ func prepareAdminFromFlags(
 		readOnlyAccessKeys:        parseCSV(f.readOnlyAccessKeys),
 		fullAccessKeys:            parseCSV(f.fullAccessKeys),
 	}
-	clusterSrc := newClusterInfoSource(*raftId, buildVersion(), runtimes)
+	clusterSrc := newClusterInfoSource(raftID, buildVersion(), runtimes)
 	tablesSrc := adminbridge.NewDynamoTablesSource(dynamoServer)
 	bucketsSrc := adminbridge.NewBucketsSource(s3Server)
 	queuesSrc := adminbridge.NewSQSQueuesSource(sqsServer)
-	forwarder, err := buildAdminLeaderForwarder(coordinate, connCache, *raftId)
+	forwarder, err := buildAdminLeaderForwarder(coordinate, connCache, raftID)
 	if err != nil {
 		return nil, errors.Wrap(err, "build admin leader forwarder")
 	}

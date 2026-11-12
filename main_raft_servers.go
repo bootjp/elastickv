@@ -91,6 +91,8 @@ func startRaftServers(
 	encryptionCfg encryptionFlags,
 	kekConfigured bool,
 	defaultGroupID uint64,
+	raftID string,
+	readWatermarkAdvance bool,
 	s3BlobObserver adapter.S3BlobOffloadObserver,
 	s3BlobPushBlocked func() bool,
 ) error {
@@ -108,7 +110,7 @@ func startRaftServers(
 		return err
 	}
 	encryptionAdminServer := newEncryptionAdminServer(
-		etcdraftengine.DeriveNodeID(*raftId),
+		etcdraftengine.DeriveNodeID(raftID),
 		encryptionCfg.sidecarPath,
 		enableMutators,
 		defaultAdmin.engine,
@@ -132,7 +134,7 @@ func startRaftServers(
 			return migrationOwnershipRuntimeReady(trx, shardStore, distServer, rt.spec.id, rt.snapshotEngine(), adminGRPCOpts.migrationReady)
 		}))
 		internalOpts = append(internalOpts, migrationInternalProtocolOptions(trx, shardStore, distServer, rt)...)
-		internalOpts = append(internalOpts, internalReadWatermarkOptions(*readWatermarkAdvance, rt, shardGroups)...)
+		internalOpts = append(internalOpts, internalReadWatermarkOptions(readWatermarkAdvance, rt, shardGroups)...)
 		staticServingServices := registerS3BlobFetchServer(
 			gs,
 			adminGRPCOpts.s3BlobFetchEnabled,

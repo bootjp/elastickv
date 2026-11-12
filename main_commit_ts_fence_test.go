@@ -17,11 +17,11 @@ func TestCommitTSFenceStartupRequiresProtectedCatalogBootstrap(t *testing.T) {
 }
 
 func TestRuntimeInputsRejectCommitTSFenceBeforeOpeningStores(t *testing.T) {
-	previous := *commitTSFence
-	*commitTSFence = true
-	t.Cleanup(func() { *commitTSFence = previous })
+	t.Parallel()
+	flags := defaultServerFlags()
+	flags.consistency.commitTSFence = true
 
-	_, _, _, _, err := resolveValidatedRuntimeInputs(defaultFlags[backupFlags](), defaultFlags[listenerFlags]())
+	_, _, _, _, err := resolveValidatedRuntimeInputs(flags)
 	require.ErrorContains(t, err, "requires protected Raft catalog bootstrap")
 }
 
