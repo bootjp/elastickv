@@ -1,4 +1,4 @@
-package main
+package adapter
 
 import (
 	"context"
@@ -6,10 +6,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/internal/raftadmin"
 	"github.com/bootjp/elastickv/internal/raftengine"
-	"github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -19,22 +17,26 @@ import (
 
 const namespaceMembershipHandshakeTimeout = 2 * time.Second
 
-type migrationNamespaceMembershipGate struct {
+type MigrationNamespaceMembershipGate struct {
 	mu       sync.Mutex
 	store    store.MVCCStore
 	engine   raftengine.Engine
-	proposer raftengine.Proposer
+	Proposer raftengine.Proposer
 	probe    func(context.Context, string, *pb.ProbeMigrationStateRequest) (*pb.ProbeMigrationStateResponse, error)
-	next     raftadmin.MembershipChangeInterceptor
+	Next     raftadmin.MembershipChangeInterceptor
+	// deriveNodeID maps a Raft member ID to its numeric node ID; the binary
+	// passes the concrete engine's derivation.
+	deriveNodeID func(string) uint64
 }
 
-var _ raftadmin.MembershipChangeInterceptor = (*migrationNamespaceMembershipGate)(nil)
-var _ raftadmin.MembershipPromotionInterceptor = (*migrationNamespaceMembershipGate)(nil)
+var _ raftadmin.MembershipChangeInterceptor = (*MigrationNamespaceMembershipGate)(nil)
 
-func newMigrationNamespaceMembershipGate(st store.MVCCStore, engine raftengine.Engine, proposer raftengine.Proposer, token string, next raftadmin.MembershipChangeInterceptor, providers ...kv.GRPCDialOptionsForAddress) *migrationNamespaceMembershipGate {
-	return &migrationNamespaceMembershipGate{store: st, engine: engine, proposer: proposer, next: next,
+var _ raftadmin.MembershipPromotionInterceptor = (*MigrationNamespaceMembershipGate)(nil)
+
+func NewMigrationNamespaceMembershipGate(st store.MVCCStore, engine raftengine.Engine, proposer raftengine.Proposer, token string, next raftadmin.MembershipChangeInterceptor, deriveNodeID func(string) uint64, providers ...kv.GRPCDialOptionsForAddress) *MigrationNamespaceMembershipGate {
+	return &MigrationNamespaceMembershipGate{store: st, engine: engine, Proposer: proposer, Next: next, deriveNodeID: deriveNodeID,
 		probe: func(ctx context.Context, address string, request *pb.ProbeMigrationStateRequest) (*pb.ProbeMigrationStateResponse, error) {
-			conn, err := newBootstrapOrdinaryClient(address, providers...)
+			conn, err := kv.NewGRPCClient(address, providers...)
 			if err != nil {
 				return nil, errors.WithStack(err)
 			}
@@ -44,31 +46,31 @@ func newMigrationNamespaceMembershipGate(st store.MVCCStore, engine raftengine.E
 		}}
 }
 
-func (g *migrationNamespaceMembershipGate) PreAddMember(ctx context.Context, id, address string) error {
+func (g *MigrationNamespaceMembershipGate) PreAddMember(ctx context.Context, id, address string) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if err := g.authorize(ctx, id, address); err != nil {
 		return err
 	}
-	if g.next != nil {
-		return errors.WithStack(g.next.PreAddMember(ctx, id, address))
+	if g.Next != nil {
+		return errors.WithStack(g.Next.PreAddMember(ctx, id, address))
 	}
 	return nil
 }
 
-func (g *migrationNamespaceMembershipGate) PrePromoteMember(ctx context.Context, id, address string) error {
+func (g *MigrationNamespaceMembershipGate) PrePromoteMember(ctx context.Context, id, address string) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if err := g.authorize(ctx, id, address); err != nil {
 		return err
 	}
-	if next, ok := g.next.(raftadmin.MembershipPromotionInterceptor); ok {
+	if next, ok := g.Next.(raftadmin.MembershipPromotionInterceptor); ok {
 		return errors.WithStack(next.PrePromoteMember(ctx, id, address))
 	}
 	return nil
 }
 
-func (g *migrationNamespaceMembershipGate) authorize(ctx context.Context, id, address string) error {
+func (g *MigrationNamespaceMembershipGate) authorize(ctx context.Context, id, address string) error {
 	if err := ctx.Err(); err != nil {
 		return errors.WithStack(err)
 	}
@@ -80,7 +82,7 @@ func (g *migrationNamespaceMembershipGate) authorize(ctx context.Context, id, ad
 	if err != nil {
 		return err
 	}
-	snapshot := func(ctx context.Context) (adapter.NamespaceAdmissionSnapshot, error) { return g.snapshot(ctx) }
+	snapshot := func(ctx context.Context) (NamespaceAdmissionSnapshot, error) { return g.snapshot(ctx) }
 	current, err := snapshot(ctx)
 	if err != nil {
 		return err
@@ -90,9 +92,9 @@ func (g *migrationNamespaceMembershipGate) authorize(ctx context.Context, id, ad
 		return err
 	}
 	activate := func(ctx context.Context, command kv.NamespaceAdmissionCommand) error {
-		return errors.WithStack(kv.ActivateMigrationNamespace(ctx, g.store, g.proposer, command))
+		return errors.WithStack(kv.ActivateMigrationNamespace(ctx, g.store, g.Proposer, command))
 	}
-	if err := adapter.EnsureMigrationNamespaceAdmissionWithSnapshot(ctx, snapshot, activate, joining); err != nil {
+	if err := EnsureMigrationNamespaceAdmissionWithSnapshot(ctx, snapshot, activate, joining); err != nil {
 		return errors.WithStack(err)
 	}
 	configuration, err := kv.MigrationConfigurationIndex(ctx, g.store)
@@ -102,11 +104,11 @@ func (g *migrationNamespaceMembershipGate) authorize(ctx context.Context, id, ad
 	return errors.WithStack(kv.CheckMigrationNamespacePrejoin(ctx, g.store, configuration, peer.MemberID, installedVersion))
 }
 
-func (g *migrationNamespaceMembershipGate) probeNamespaceCandidate(ctx context.Context, id, address string, version uint32) (adapter.NamespaceAdmissionPeer, uint32, error) {
-	if strings.TrimSpace(id) == "" || id != strings.TrimSpace(id) || address == "" || g.engine == nil || g.proposer == nil || g.probe == nil {
-		return adapter.NamespaceAdmissionPeer{}, 0, errors.WithStack(kv.ErrMigrationNamespaceProtocol)
+func (g *MigrationNamespaceMembershipGate) probeNamespaceCandidate(ctx context.Context, id, address string, version uint32) (NamespaceAdmissionPeer, uint32, error) {
+	if strings.TrimSpace(id) == "" || id != strings.TrimSpace(id) || address == "" || g.engine == nil || g.Proposer == nil || g.probe == nil {
+		return NamespaceAdmissionPeer{}, 0, errors.WithStack(kv.ErrMigrationNamespaceProtocol)
 	}
-	peer := g.peer(etcd.DeriveNodeID(id), address)
+	peer := g.peer(g.deriveNodeID(id), address)
 	attempt, cancel := context.WithTimeout(ctx, namespaceMembershipHandshakeTimeout)
 	response, err := peer.Client.ProbeMigrationState(attempt, &pb.ProbeMigrationStateRequest{JobId: 1, Kind: pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_NAMESPACE_ADMISSION})
 	cancel()
@@ -119,8 +121,8 @@ func (g *migrationNamespaceMembershipGate) probeNamespaceCandidate(ctx context.C
 	return peer, response.GetNamespaceAdmissionVersion(), nil
 }
 
-func namespaceJoiningCandidate(current adapter.NamespaceAdmissionSnapshot, peer adapter.NamespaceAdmissionPeer) ([]adapter.NamespaceAdmissionPeer, error) {
-	joining := []adapter.NamespaceAdmissionPeer{peer}
+func namespaceJoiningCandidate(current NamespaceAdmissionSnapshot, peer NamespaceAdmissionPeer) ([]NamespaceAdmissionPeer, error) {
+	joining := []NamespaceAdmissionPeer{peer}
 	for _, member := range current.Members {
 		if member.MemberID == peer.MemberID {
 			if member.Address != peer.Address {
@@ -141,32 +143,32 @@ func (c namespaceMembershipProbeClient) ProbeMigrationState(ctx context.Context,
 	return c.probe(ctx, c.address, request)
 }
 
-func (g *migrationNamespaceMembershipGate) peer(id uint64, address string) adapter.NamespaceAdmissionPeer {
-	return adapter.NamespaceAdmissionPeer{MemberID: id, Address: address, Client: namespaceMembershipProbeClient{address: address, probe: g.probe}}
+func (g *MigrationNamespaceMembershipGate) peer(id uint64, address string) NamespaceAdmissionPeer {
+	return NamespaceAdmissionPeer{MemberID: id, Address: address, Client: namespaceMembershipProbeClient{address: address, probe: g.probe}}
 }
 
-func (g *migrationNamespaceMembershipGate) snapshot(ctx context.Context) (adapter.NamespaceAdmissionSnapshot, error) {
+func (g *MigrationNamespaceMembershipGate) snapshot(ctx context.Context) (NamespaceAdmissionSnapshot, error) {
 	if _, err := g.engine.LinearizableRead(ctx); err != nil {
-		return adapter.NamespaceAdmissionSnapshot{}, errors.WithStack(err)
+		return NamespaceAdmissionSnapshot{}, errors.WithStack(err)
 	}
 	reader, ok := g.engine.(raftengine.AppliedConfigurationReader)
 	if !ok {
-		return adapter.NamespaceAdmissionSnapshot{}, errors.WithStack(kv.ErrMigrationNamespaceProtocol)
+		return NamespaceAdmissionSnapshot{}, errors.WithStack(kv.ErrMigrationNamespaceProtocol)
 	}
 	before, err := g.namespaceSnapshotConfigurationIndex(reader)
 	if err != nil {
-		return adapter.NamespaceAdmissionSnapshot{}, err
+		return NamespaceAdmissionSnapshot{}, err
 	}
 	configuration, err := g.engine.Configuration(ctx)
 	if err != nil {
-		return adapter.NamespaceAdmissionSnapshot{}, errors.WithStack(err)
+		return NamespaceAdmissionSnapshot{}, errors.WithStack(err)
 	}
-	result := adapter.NamespaceAdmissionSnapshot{ConfigurationIndex: before}
+	result := NamespaceAdmissionSnapshot{ConfigurationIndex: before}
 	for _, member := range configuration.Servers {
 		if member.ID == "" || member.ID != strings.TrimSpace(member.ID) {
 			return result, errors.WithStack(kv.ErrMigrationNamespaceProtocol)
 		}
-		result.Members = append(result.Members, g.peer(etcd.DeriveNodeID(member.ID), member.Address))
+		result.Members = append(result.Members, g.peer(g.deriveNodeID(member.ID), member.Address))
 	}
 	after, err := g.namespaceSnapshotConfigurationIndex(reader)
 	if err != nil {
@@ -178,7 +180,7 @@ func (g *migrationNamespaceMembershipGate) snapshot(ctx context.Context) (adapte
 	return result, nil
 }
 
-func (g *migrationNamespaceMembershipGate) namespaceSnapshotConfigurationIndex(reader raftengine.AppliedConfigurationReader) (uint64, error) {
+func (g *MigrationNamespaceMembershipGate) namespaceSnapshotConfigurationIndex(reader raftengine.AppliedConfigurationReader) (uint64, error) {
 	index, supported := reader.AppliedConfigurationIndex()
 	if !supported || index == 0 || g.engine.Status().PendingConfChange {
 		return 0, errors.WithStack(kv.ErrMigrationNamespaceProtocol)

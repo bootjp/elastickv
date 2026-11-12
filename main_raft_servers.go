@@ -57,7 +57,7 @@ func raftGRPCServerOptions(adminGRPCOpts adminGRPCInterceptors) []grpc.ServerOpt
 	// silently overwrite the admin auth gate — gRPC-Go keeps only the
 	// last option of the same type.
 	unary := append([]grpc.UnaryServerInterceptor{}, adminGRPCOpts.unary...)
-	unary = append(unary, newMigrationCoverageUnaryGate(adminGRPCOpts.migrationReady))
+	unary = append(unary, adapter.NewMigrationCoverageUnaryGate(adminGRPCOpts.migrationReady))
 	opts = append(opts, grpc.ChainUnaryInterceptor(unary...))
 	if len(adminGRPCOpts.stream) > 0 {
 		opts = append(opts, grpc.ChainStreamInterceptor(adminGRPCOpts.stream...))
@@ -124,7 +124,7 @@ func startRaftServers(
 	for _, rt := range runtimes {
 		serverOptions := append(slices.Clone(rt.TransportServerOptions), raftGRPCServerOptions(adminGRPCOpts)...)
 		gs := grpc.NewServer(serverOptions...)
-		trx := newInternalMigrationTransaction(proposerForGroup(rt, shardGroups), observerForGroup(proposalObserverForGroup, rt.Spec.ID), rt.Store, rt.Spec.ID)
+		trx := adapter.NewInternalMigrationTransaction(proposerForGroup(rt, shardGroups), observerForGroup(proposalObserverForGroup, rt.Spec.ID), rt.Store, rt.Spec.ID)
 		grpcSvc := adapter.NewGRPCServer(shardStore, coordinate)
 		pb.RegisterRawKVServer(gs, grpcSvc)
 		pb.RegisterTransactionalKVServer(gs, grpcSvc)
@@ -132,7 +132,7 @@ func startRaftServers(
 		internalOpts = append(internalOpts, bootstrapInternalPolicyOptions(rt, proposerForGroup(rt, shardGroups))...)
 		internalOpts = append(internalOpts, dedicatedTimestampCutoverOptions(shardGroups)...)
 		internalOpts = append(internalOpts, adapter.WithInternalMigrationOwnershipReady(func() bool {
-			return migrationOwnershipRuntimeReady(trx, shardStore, distServer, rt.Spec.ID, rt.snapshotEngine(), adminGRPCOpts.migrationReady)
+			return adapter.MigrationOwnershipRuntimeReady(trx, shardStore, distServer, rt.Spec.ID, rt.snapshotEngine(), adminGRPCOpts.migrationReady)
 		}))
 		internalOpts = append(internalOpts, migrationInternalProtocolOptions(trx, shardStore, distServer, rt)...)
 		internalOpts = append(internalOpts, internalReadWatermarkOptions(readWatermarkAdvance, rt, shardGroups)...)

@@ -114,41 +114,41 @@ func startDistributionStartup(in distributionStartupInput) (distributionStartup,
 		}),
 		adapter.WithDistributionFilesystemObserver(in.metricsRegistry.FileSystemObserver()),
 		adapter.WithDistributionKnownRaftGroups(noderuntime.ShardGroupIDs(in.shardGroups)...),
-		adapter.WithSplitMigrationCapabilityGate(newSplitMigrationCapabilityGate(
+		adapter.WithSplitMigrationCapabilityGate(adapter.NewSplitMigrationCapabilityGate(
 			splitMigrationCapabilityPeerSourceForRuntimes(in.runtimes),
 			splitMigrationCapabilityProbeTimeout,
 			bootstrapSplitMigrationProbe(in.runtimes),
 			in.nodeAuth.splitMigrationLocalReadinessGate,
 		)),
-		adapter.WithSplitPromotionClientFactory(splitPromotionClientFactory(
-			splitPromotionTargetLeaderResolver(in.shardGroups),
+		adapter.WithSplitPromotionClientFactory(adapter.NewSplitPromotionGRPCClientFactory(
+			adapter.SplitPromotionTargetLeaderResolver(in.shardGroups),
 			splitMigrationConnCache,
 			auth.migrationToken,
 		)),
-		adapter.WithSplitMigrationClientFactory(splitMigrationClientFactory(
-			splitMigrationGroupLeaderResolver(in.shardGroups),
+		adapter.WithSplitMigrationClientFactory(adapter.NewSplitMigrationGRPCClientFactory(
+			adapter.SplitMigrationGroupLeaderResolver(in.shardGroups),
 			splitMigrationConnCache,
 			auth.migrationToken,
 		)),
-		adapter.WithSplitMigrationVoterFactory(splitMigrationVoterFactory(
+		adapter.WithSplitMigrationVoterFactory(adapter.NewSplitMigrationGRPCVoterFactory(
 			in.shardGroups,
 			splitMigrationConnCache,
 			auth.migrationToken,
 		)),
-		adapter.WithSplitMigrationApplyMemberSnapshotFactory(splitMigrationApplyMemberSnapshotFactory(
+		adapter.WithSplitMigrationApplyMemberSnapshotFactory(adapter.NewSplitMigrationApplyMemberSnapshotGRPCFactory(
 			in.shardGroups,
 			splitMigrationConnCache,
 			auth.migrationToken,
 		)),
-		adapter.WithSplitMigrationGroupClientFactory(splitMigrationGroupClientFactory(
-			splitMigrationGroupLeaderResolver(in.shardGroups),
+		adapter.WithSplitMigrationGroupClientFactory(adapter.NewSplitMigrationGroupGRPCClientFactory(
+			adapter.SplitMigrationGroupLeaderResolver(in.shardGroups),
 			splitMigrationConnCache,
 			auth.migrationToken,
 		)),
 		// Do not advertise cap_migration_v2 before protocol coverage is accepted.
 		adapter.WithSplitJobRunnerReadinessGate(in.nodeAuth.splitMigrationLocalReadinessGate),
 		migrationOwnershipRefreshOption(in.shardGroups, catalogRuntime, splitMigrationConnCache, auth.migrationToken, in.nodeAuth.splitMigrationPeerAuthEnforced),
-		migrationPartitionRuntimeOption(in.shardStore, in.shardGroups, splitMigrationConnCache, auth.migrationToken, in.nodeAuth.splitMigrationPeerAuthEnforced),
+		adapter.MigrationPartitionRuntimeOption(in.shardStore, in.shardGroups, splitMigrationConnCache, auth.migrationToken, in.nodeAuth.splitMigrationPeerAuthEnforced),
 	)
 	autoSplitRuntime, err := setupDistributionWatcherAndAutoSplit(
 		in.ctx,
@@ -186,11 +186,11 @@ func startDistributionStartup(in distributionStartupInput) (distributionStartup,
 	}, nil
 }
 
-func startDistributionSplitJobRunner(ctx context.Context, eg *errgroup.Group, server *adapter.DistributionServer, ready migrationReadinessGate) {
+func startDistributionSplitJobRunner(ctx context.Context, eg *errgroup.Group, server *adapter.DistributionServer, ready adapter.MigrationReadinessGate) {
 	if eg == nil || server == nil {
 		return
 	}
-	if ready.check(ctx) != nil {
+	if ready.Check(ctx) != nil {
 		return
 	}
 	eg.Go(func() error {

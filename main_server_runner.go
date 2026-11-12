@@ -227,7 +227,7 @@ func startPublicServicesAfterCommitTSFence(in serversInput, runner *runtimeServe
 		return runner.startupFailure(errors.Wrap(err, "wait for commit-ts fence activation before public service"))
 	}
 	startDistributionSplitJobRunner(in.ctx, in.eg, in.distServer, in.nodeAuth.splitMigrationLocalReadinessGate)
-	startMigrationOwnershipRefresh(in.ctx, in.eg, in.distServer, in.nodeAuth.splitMigrationLocalReadinessGate)
+	adapter.StartMigrationOwnershipRefresh(in.ctx, in.eg, in.distServer, in.nodeAuth.splitMigrationLocalReadinessGate)
 	if err := runner.startPublicServices(); err != nil {
 		return err
 	}

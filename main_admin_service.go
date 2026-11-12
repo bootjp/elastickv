@@ -156,7 +156,7 @@ type adminGRPCInterceptors struct {
 	s3BlobFetchEnabled bool
 	// migrationReady is the split-migration readiness gate the raft gRPC
 	// servers apply to migration RPCs and to ownership readiness.
-	migrationReady migrationReadinessGate
+	migrationReady adapter.MigrationReadinessGate
 }
 
 func (a adminGRPCInterceptors) empty() bool {

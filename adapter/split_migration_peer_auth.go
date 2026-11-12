@@ -1,4 +1,4 @@
-package main
+package adapter
 
 import (
 	"context"
@@ -17,19 +17,19 @@ type splitMigrationAuthConn struct {
 }
 
 func (c splitMigrationAuthConn) Invoke(ctx context.Context, method string, args, reply any, opts ...grpc.CallOption) error {
-	ctx = migrationCredentialContext(ctx)
+	ctx = MigrationCredentialContext(ctx)
 	opts = append(opts, grpc.PerRPCCredentials(internalutil.GRPCBearerToken(c.token)))
 	return errors.WithStack(c.ClientConnInterface.Invoke(ctx, method, args, reply, opts...))
 }
 
 func (c splitMigrationAuthConn) NewStream(ctx context.Context, desc *grpc.StreamDesc, method string, opts ...grpc.CallOption) (grpc.ClientStream, error) {
-	ctx = migrationCredentialContext(ctx)
+	ctx = MigrationCredentialContext(ctx)
 	opts = append(opts, grpc.PerRPCCredentials(internalutil.GRPCBearerToken(c.token)))
 	stream, err := c.ClientConnInterface.NewStream(ctx, desc, method, opts...)
 	return stream, errors.WithStack(err)
 }
 
-func migrationCredentialContext(ctx context.Context) context.Context {
+func MigrationCredentialContext(ctx context.Context) context.Context {
 	md, _ := metadata.FromOutgoingContext(ctx)
 	md = md.Copy()
 	md.Delete("authorization")

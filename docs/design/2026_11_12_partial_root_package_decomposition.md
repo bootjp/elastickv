@@ -43,8 +43,11 @@ and `cmd/server/demo.go` through explicit parameters.
   documented API, and keep its unexported details inside that package.
 - Make every input to a wiring helper visible in its signature. No helper
   below `main` reads a flag global.
-- Shrink the root package to flag registration, `main()` and the
-  top-level `run()` assembly.
+- Leave only `main.go` in the root package: `main()`, the flag
+  registration call, the `adminBuildVersion` link variable and a thin
+  `run()` that delegates to `internal/server`. Every other root file,
+  production or test, moves to a package whose allowed importers the
+  import guard enforces.
 - Change no runtime behavior: the flags, defaults, start-up order, wire
   formats and on-disk formats all stay as they are.
 
@@ -59,18 +62,29 @@ and `cmd/server/demo.go` through explicit parameters.
 
 ## Target layout
 
+Layers, bottom to top (each layer may import only the layers below it):
+
 ```text
-main.go, main_flags.go          flag registration, main(), run()
-internal/adminbridge/           adapter <-> internal/admin DTO bridges (SQS, S3, DynamoDB, keyviz)
-internal/noderuntime/           raftGroupRuntime, groupSpec, raft bootstrap/peer config, runtimeConfig parsing
-internal/serverwiring/          (existing) plus TSO wiring, distribution start-up, startup gate, node auth
-internal/leaderbalance/         leader-balance scheduler wiring
-internal/fswiring/              FUSE filesystem start-up and lifecycle
-internal/snapshotoffloadwiring/  snapshot-offload start-up wiring (flags, store, spool cleanup, scheduler and retention workers)
-internal/splitmigration/        split-migration capability gate, clients, membership/ownership wiring
-internal/encryptionwiring/      KEK loading, start-up guards, registration, rotation, fan-out
-internal/clusterbootstrap/      the `elastickv bootstrap ...` operator CLI and runtime
+libraries            kv, store, adapter, distribution, internal/encryption,
+                     internal/raftengine[/etcd], raftbootstrap, raftadmission, ...
+node layer           internal/noderuntime   group spec, runtime config, peer config, GroupRuntime core
+                     internal/nodeauth      node/admin gRPC auth flags, token files, interceptors
+leaf components      internal/adminbridge, internal/leaderbalance, internal/fsmount,
+                     internal/snapshotoffloadwiring, internal/tsowiring, internal/serverwiring
+encryption wiring    internal/encryptionwiring   KEK loading, start-up guards, registration,
+                                                 rotation, fan-out, raft-envelope runtime
+protected bootstrap  internal/clusterbootstrap   `elastickv bootstrap ...` CLI, protected
+                                                 bootstrap runtime, startup gate, GroupRuntime
+                                                 with its bootstrap attachments
+server assembly      internal/server        shard-group builder, distribution start-up, raft
+                                            and public servers, admin, shutdown, monitoring,
+                                            run() body, server flag aggregation
+root                 main.go                main(), flag registration, thin run()
 ```
+
+Split-migration peer clients, membership gates and the readiness gate
+implement interfaces that `adapter` declares, so they live in `adapter`
+next to those interfaces rather than in a feature-named package.
 
 Package names are working names. Each milestone may adjust them, and
 the doc is updated when that happens.
@@ -112,13 +126,29 @@ Tests move with the code they cover.
     shard-group builder also stays in `main`: it composes the encryption
     applier, the protected bootstrap specs and the protected TSO group,
     so it moves with M5/M6.
-- **M4 — Mid-sized areas.** Move leader balance, filesystem wiring,
-  snapshot-offload wiring, split-migration wiring, TSO wiring, the startup
-  gate and node gRPC auth. Each area may be its own PR.
-- **M5 — Encryption wiring.** Move it to `internal/encryptionwiring`.
-- **M6 — Bootstrap.** Move the bootstrap operator CLI and runtime to
-  `internal/clusterbootstrap`. `main` keeps only the
-  `dispatchBootstrapOperator` call.
+- **M4 — Mid-sized areas.** Move leader balance, filesystem mounting,
+  snapshot-offload wiring, TSO wiring and node gRPC auth
+  (`internal/nodeauth`); re-home the split-migration peer code into
+  `adapter`; encode every extracted package in the import guard. Each
+  area may be its own PR. The startup gate moves with M6 because it
+  holds the bootstrap domain.
+- **M5 — Encryption wiring.** M5a cuts the two encryption → bootstrap
+  edges in place (the registration source becomes an interface owned by
+  encryption; the capability fan-out takes a dial-option provider) and
+  moves assembly code out of encryption-named files. M5b moves the
+  encryption wiring to `internal/encryptionwiring`.
+- **M6 — Bootstrap.** M6a moves assembly code out of bootstrap-named
+  files and folds the startup gate and `raftGroupRuntime` into the
+  bootstrap set. M6b moves the bootstrap operator CLI and runtime to
+  `internal/clusterbootstrap`, with `raftGroupRuntime` as
+  `clusterbootstrap.GroupRuntime`. An optional M6c splits the offline
+  operator CLI into a subpackage.
+- **M7 — Server assembly and thin root.** Move every remaining root file
+  (shard-group builder, distribution start-up, raft and public servers,
+  admin, shutdown, monitoring, the `run()` body, the flag aggregation and
+  the root tests) to `internal/server`, leaving `main.go` alone in the
+  root, and make the import guard allow the root to import only
+  `internal/server`.
 
 ## Progress
 
@@ -206,6 +236,23 @@ Tests move with the code they cover.
   build version; `main` keeps only `snapshotOffloadGroups`, which reduces
   the runtimes to offload groups with their leadership callbacks. The
   package is restricted to binaries in the import guard.
+- M4, split migration: the capability gate and peer probe, the promotion /
+  migration / group / voter / apply-member gRPC client factories, the
+  membership and namespace admission gates, the ownership-refresh runner,
+  the readiness gate and the gRPC coverage interceptor moved to `adapter`
+  (`adapter/split_migration_peer_*.go`), next to the interfaces they
+  implement; `adapter` gains an `internal/raftadmin` import. (An earlier
+  revision of this PR put them in a feature-named
+  `internal/splitmigration` package; that fails the extraction criterion
+  because every export took or returned an `adapter` type.) `main` keeps the glue that needs the runtime
+  or protected-bootstrap types: the capability peer source over runtimes,
+  the Internal protocol options, the ownership-refresh root resolver and
+  option, the membership interceptor (which adds the prepare-evidence
+  gate and bootstrap dial options), and the two `nodeAuthFlags` readiness
+  methods. The namespace gate takes the node-ID derivation as a function
+  so the package does not import the concrete etcd backend, and the
+  uncached peer dial helper moved to `kv.NewGRPCClient` next to the
+  connection cache that already dials the same way.
 
 ## Decisions
 
@@ -224,6 +271,32 @@ Tests move with the code they cover.
 - **No design changes inside a milestone.** If a move exposes a defect,
   fix it in a separate PR with a failing test first, per the repository
   convention.
+- **Extraction criterion.** A package is a real cut when it imports only
+  lower layers, takes narrow inputs (no runtime or bootstrap wrapper
+  types), and the code left above it only adapts the runtime to those
+  inputs. Code with wide inputs is assembly and belongs in
+  `internal/server`, not in a per-feature package.
+- **Implementations live with the interface owner.** Default
+  implementations of interfaces declared by a library package (for
+  example the split-migration client factories and membership gates for
+  `adapter`) live in that package. This is the one exception to "internal
+  packages": `adapter` gains them because it owns their interfaces.
+- **`<lib>wiring` siblings.** An `internal/<lib>wiring` package is
+  justified only when it imports just that library (plus leaves) and
+  exposes `Flags` and one `Start`/`Configure` (`snapshotoffloadwiring`,
+  `tsowiring`, `encryptionwiring`).
+- **Dependency direction.** noderuntime / nodeauth → encryptionwiring →
+  clusterbootstrap → server → root. An edge that points the other way is
+  inverted with an interface or callback owned by the lower package.
+- **Exported fields on moved types.** Types moved as-is may export their
+  fields, including a mutex (as `noderuntime.GroupRuntime.EngineMu`
+  does); encapsulating them is a separate, non-move change.
+- **`adminBuildVersion` stays in `package main`** because release builds
+  set it with `-ldflags -X main.adminBuildVersion=...`; `main` passes it
+  down.
+- **Every extracted package is guarded.** Each one has a
+  `restrictedPackages` entry naming the layers that may import it, and
+  the root may import only `internal/server` once M7 lands.
 
 ## Verification
 
@@ -231,10 +304,14 @@ For every milestone:
 
 - `go build ./...`, `go vet`, `make lint`
 - `go test -race` for the root package and each package that gains code
+- `-help` output (and `elastickv bootstrap` help from M6 on) is
+  byte-identical to the base, and the set of test names is unchanged
+  apart from documented guard tests
+- `./scripts/check-production-imports.sh`
 - Jepsen is not required for M1 and M2, which leave start-up order and
-  runtime paths unchanged. M3–M6 touch Raft/encryption/bootstrap start-up
+  runtime paths unchanged. M3–M7 touch Raft/encryption/bootstrap start-up
   wiring, so they run `./scripts/run-jepsen-local.sh`, plus `--encrypted`
-  for M5 and M6.
+  for M5–M7.
 
 ## Risks
 
@@ -244,6 +321,12 @@ For every milestone:
 - **Import cycles.** `internal/noderuntime` must not import any of the
   area packages. M3 lands before M4 so a cycle shows up as a compile
   error early.
+- **End-to-end fixtures span every layer** (the bootstrap e2e fixtures
+  build shard groups, the distribution catalog and the raft servers), so
+  they stay in the assembly package; tests move to the lowest package
+  that owns everything they touch.
+- **CI test shards** (`scripts/go-test-shard.sh`) name the root package;
+  M7 points the root shard at `internal/server`.
 - **Merge conflicts with in-flight branches** (serializable audit
   stack). Each milestone is kept small and rebased right before it is
   merged.

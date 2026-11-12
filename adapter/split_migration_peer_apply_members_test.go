@@ -1,4 +1,4 @@
-package main
+package adapter
 
 import (
 	"context"
@@ -60,7 +60,7 @@ func TestSplitMigrationApplyMemberSnapshotFactoryPreservesTLSCredentials(t *test
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	ctx = metadata.NewOutgoingContext(ctx, metadata.Pairs("authorization", "Bearer stale", "trace-id", "preserved"))
-	snapshot, err := splitMigrationApplyMemberSnapshotFactory(map[uint64]*kv.ShardGroup{2: {Engine: engine}}, &cache, "migration-secret")(ctx, 2)
+	snapshot, err := NewSplitMigrationApplyMemberSnapshotGRPCFactory(map[uint64]*kv.ShardGroup{2: {Engine: engine}}, &cache, "migration-secret")(ctx, 2)
 	require.NoError(t, err)
 	for _, member := range snapshot.Members {
 		_, err := member.Client.ProbeMigrationState(ctx, &pb.ProbeMigrationStateRequest{JobId: 11})
@@ -75,9 +75,11 @@ func TestSplitMigrationApplyMemberSnapshotFactoryPreservesTLSCredentials(t *test
 }
 
 func (e *applyMemberEngine) AppliedConfigurationIndex() (uint64, bool) { return e.index, true }
+
 func (e *applyMemberEngine) Status() raftengine.Status {
 	return raftengine.Status{ConfigurationIndex: e.index, PendingConfChange: e.pending}
 }
+
 func (e *applyMemberEngine) Configuration(context.Context) (raftengine.Configuration, error) {
 	if e.configured != nil {
 		e.configured()
@@ -87,7 +89,7 @@ func (e *applyMemberEngine) Configuration(context.Context) (raftengine.Configura
 
 func newApplyMemberEngine() *applyMemberEngine {
 	return &applyMemberEngine{index: 41, capabilityConfigEngine: capabilityConfigEngine{cfg: raftengine.Configuration{Servers: []raftengine.Server{
-		{ID: "voter", Address: "127.0.0.1:19001", Suffrage: raftMemberSuffrageVoter},
+		{ID: "voter", Address: "127.0.0.1:19001", Suffrage: voterSuffrage},
 		{ID: "learner", Address: "127.0.0.1:19002", Suffrage: "Nonvoter"},
 	}}}}
 }
@@ -97,7 +99,7 @@ func TestSplitMigrationApplyMemberSnapshotFactoryIncludesLearners(t *testing.T) 
 	engine := newApplyMemberEngine()
 	var cache kv.GRPCConnCache
 	t.Cleanup(func() { require.NoError(t, cache.Close()) })
-	factory := splitMigrationApplyMemberSnapshotFactory(map[uint64]*kv.ShardGroup{2: {Engine: engine}}, &cache, "migration-secret")
+	factory := NewSplitMigrationApplyMemberSnapshotGRPCFactory(map[uint64]*kv.ShardGroup{2: {Engine: engine}}, &cache, "migration-secret")
 	snapshot, err := factory(t.Context(), 2)
 	require.NoError(t, err)
 	require.Equal(t, uint64(41), snapshot.ConfigurationIndex)
@@ -127,7 +129,7 @@ func TestSplitMigrationApplyMemberSnapshotFactoryRejectsUnstableConfiguration(t 
 			t.Cleanup(func() { require.NoError(t, cache.Close()) })
 			groups := map[uint64]*kv.ShardGroup{2: {Engine: engine}}
 			change(engine)
-			_, err := splitMigrationApplyMemberSnapshotFactory(groups, &cache, "migration-secret")(t.Context(), 2)
+			_, err := NewSplitMigrationApplyMemberSnapshotGRPCFactory(groups, &cache, "migration-secret")(t.Context(), 2)
 			require.Error(t, err)
 		})
 	}
@@ -138,11 +140,11 @@ func TestSplitMigrationApplyMemberSnapshotFactoryRequiresWiring(t *testing.T) {
 	var cache kv.GRPCConnCache
 	t.Cleanup(func() { require.NoError(t, cache.Close()) })
 	groups := map[uint64]*kv.ShardGroup{2: {Engine: newApplyMemberEngine()}}
-	_, err := splitMigrationApplyMemberSnapshotFactory(groups, nil, "migration-secret")(t.Context(), 2)
+	_, err := NewSplitMigrationApplyMemberSnapshotGRPCFactory(groups, nil, "migration-secret")(t.Context(), 2)
 	require.Error(t, err)
-	_, err = splitMigrationApplyMemberSnapshotFactory(groups, &cache, "migration-secret")(t.Context(), 3)
+	_, err = NewSplitMigrationApplyMemberSnapshotGRPCFactory(groups, &cache, "migration-secret")(t.Context(), 3)
 	require.Error(t, err)
 	groups[2].Engine = capabilityConfigEngine{}
-	_, err = splitMigrationApplyMemberSnapshotFactory(groups, &cache, "migration-secret")(t.Context(), 2)
+	_, err = NewSplitMigrationApplyMemberSnapshotGRPCFactory(groups, &cache, "migration-secret")(t.Context(), 2)
 	require.Error(t, err)
 }

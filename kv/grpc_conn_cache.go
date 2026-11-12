@@ -152,3 +152,19 @@ func (c *GRPCConnCache) Close() error {
 	}
 	return first
 }
+
+// NewGRPCClient dials address with the first non-nil dial-option provider,
+// or with the process-wide gRPC dial options when none is given. Unlike
+// GRPCConnCache it returns an uncached connection the caller must close.
+func NewGRPCClient(address string, providers ...GRPCDialOptionsForAddress) (*grpc.ClientConn, error) {
+	options := internalutil.GRPCDialOptions()
+	if len(providers) != 0 && providers[0] != nil {
+		var err error
+		options, err = providers[0](address)
+		if err != nil {
+			return nil, err
+		}
+	}
+	conn, err := grpc.NewClient(address, options...)
+	return conn, errors.WithStack(err)
+}

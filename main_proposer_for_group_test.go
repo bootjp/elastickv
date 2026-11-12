@@ -3,6 +3,7 @@ package main
 import (
 	"testing"
 
+	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -101,7 +102,7 @@ func TestSplitPromotionTargetLeaderResolverUsesTargetGroup(t *testing.T) {
 
 	source := capabilityConfigEngine{leader: raftengine.LeaderInfo{Address: "source:50051"}}
 	target := capabilityConfigEngine{leader: raftengine.LeaderInfo{Address: "target:50051"}}
-	resolve := splitPromotionTargetLeaderResolver(map[uint64]*kv.ShardGroup{
+	resolve := adapter.SplitPromotionTargetLeaderResolver(map[uint64]*kv.ShardGroup{
 		1: {Engine: source},
 		2: {Engine: target},
 	})
@@ -121,7 +122,7 @@ func TestSplitPromotionTargetLeaderResolverUsesTargetGroup(t *testing.T) {
 func TestSplitPromotionTargetLeaderResolverRejectsMissingLeader(t *testing.T) {
 	t.Parallel()
 
-	resolve := splitPromotionTargetLeaderResolver(map[uint64]*kv.ShardGroup{
+	resolve := adapter.SplitPromotionTargetLeaderResolver(map[uint64]*kv.ShardGroup{
 		2: {Engine: capabilityConfigEngine{}},
 	})
 	_, err := resolve(distribution.SplitJob{TargetGroupID: 2})

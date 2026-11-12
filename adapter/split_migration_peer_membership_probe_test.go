@@ -1,11 +1,10 @@
-package main
+package adapter
 
 import (
 	"context"
 	"testing"
 	"time"
 
-	"github.com/bootjp/elastickv/adapter"
 	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/bootjp/elastickv/internal/testutil/grpctest"
 	pb "github.com/bootjp/elastickv/proto"
@@ -51,7 +50,7 @@ func TestMigrationMemberProtocolProbeAcceptsFreshLearnerNotLegacyEcho(t *testing
 					TransferSizeGuardVersion: test.transfer, OwnershipPartitionProtocol: test.partition,
 				}})
 			})
-			probe := newMigrationMemberProtocolProbe("")
+			probe := NewMigrationMemberProtocolProbe("")
 			err := probe(t.Context(), address)
 			require.Equal(t, test.want, status.Code(err), "%v", err)
 		})
@@ -63,7 +62,7 @@ func TestMigrationMemberProtocolProbeDoesNotBypassMissingRPCOrCancellation(t *te
 	address := grpctest.Serve(t, func(server *grpc.Server) {
 		pb.RegisterInternalServer(server, &pb.UnimplementedInternalServer{})
 	})
-	probe := newMigrationMemberProtocolProbe("")
+	probe := NewMigrationMemberProtocolProbe("")
 	require.Equal(t, codes.Unimplemented, status.Code(probe(t.Context(), address)))
 	require.Equal(t, codes.FailedPrecondition, status.Code(probe(t.Context(), " ")))
 	ctx, cancel := context.WithCancel(t.Context())
@@ -79,7 +78,7 @@ func TestMigrationMemberProtocolProbeUsesDedicatedTLSCredential(t *testing.T) {
 	cert, key := writeSelfSignedCert(t)
 	require.NoError(t, internalutil.ConfigureGRPCTLS(cert, cert, key))
 	t.Cleanup(func() { require.NoError(t, internalutil.ConfigureGRPCTLS("", "", "")) })
-	auth, _ := adapter.SplitMigrationTokenAuth("migration-secret", false, true)
+	auth, _ := SplitMigrationTokenAuth("migration-secret", false, true)
 	address := grpctest.Serve(t, func(server *grpc.Server) {
 		pb.RegisterInternalServer(server, migrationMemberProbeServer{response: &pb.ProbeMigrationStateResponse{
 			TransferSizeGuardVersion: 1, OwnershipPartitionProtocol: 1,
@@ -91,8 +90,8 @@ func TestMigrationMemberProtocolProbeUsesDedicatedTLSCredential(t *testing.T) {
 		return handler(ctx, req)
 	}))
 	ctx := metadata.NewOutgoingContext(t.Context(), metadata.Pairs("authorization", "Bearer stale", "trace-id", "preserved"))
-	require.NoError(t, newMigrationMemberProtocolProbe("migration-secret")(ctx, address))
-	require.Equal(t, codes.Unauthenticated, status.Code(newMigrationMemberProtocolProbe("wrong-token")(ctx, address)))
+	require.NoError(t, NewMigrationMemberProtocolProbe("migration-secret")(ctx, address))
+	require.Equal(t, codes.Unauthenticated, status.Code(NewMigrationMemberProtocolProbe("wrong-token")(ctx, address)))
 	md, _ := metadata.FromOutgoingContext(ctx)
 	require.Equal(t, []string{"Bearer stale"}, md.Get("authorization"))
 }
@@ -104,5 +103,5 @@ func TestMigrationMemberProtocolProbeRefusesCredentialOnPlaintext(t *testing.T) 
 			TransferSizeGuardVersion: 1, OwnershipPartitionProtocol: 1,
 		}})
 	})
-	require.Error(t, newMigrationMemberProtocolProbe("migration-secret")(t.Context(), address))
+	require.Error(t, NewMigrationMemberProtocolProbe("migration-secret")(t.Context(), address))
 }

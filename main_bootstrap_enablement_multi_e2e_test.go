@@ -236,7 +236,7 @@ func multiEnablementServices(process *multiEnablementProcess, clock *kv.HLC) {
 	pb.RegisterRawKVServer(process.server, service)
 	pb.RegisterTransactionalKVServer(process.server, service)
 	proposer := process.shard.Proposer()
-	process.transaction = newInternalMigrationTransaction(proposer, nil, process.runtime.Store, process.runtime.Spec.ID)
+	process.transaction = adapter.NewInternalMigrationTransaction(proposer, nil, process.runtime.Store, process.runtime.Spec.ID)
 	options := internalServerOptions(coordinate, nil, proposer, process.shard, process.runtime.Spec.ID)
 	options = append(options, adapter.WithInternalStore(process.runtime.Store), adapter.WithInternalPrimaryCommitEvidence(process.shards))
 	pb.RegisterInternalServer(process.server, adapter.NewInternalWithEngine(process.transaction, process.runtime.Engine, clock, nil, options...))
