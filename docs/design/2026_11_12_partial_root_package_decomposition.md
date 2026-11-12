@@ -264,6 +264,11 @@ Tests move with the code they cover.
   `noderuntime.DedicatedTSORaftGroupID` and turns the protected-bootstrap
   networks into those routing options.
 
+- Import guard: `internal/leaderbalance` and `internal/fsmount`, extracted
+  before the guard existed, are now listed in `upperLayers` and restricted
+  to binaries like the other extracted packages, and the guard's table
+  test covers every extracted package.
+
 - M4, node auth: `internal/nodeauth` holds the node / admin gRPC
   authentication: `Flags` (admin token, insecure mode, split-migration
   token and enforcement, peer gRPC TLS, S3 blob peer token) with
