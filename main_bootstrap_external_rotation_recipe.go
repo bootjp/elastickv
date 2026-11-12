@@ -8,6 +8,7 @@ import (
 	"strconv"
 
 	"github.com/bootjp/elastickv/internal/encryption"
+	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	pb "github.com/bootjp/elastickv/proto"
 )
@@ -24,7 +25,7 @@ func newBootstrapExternalRotationRecipe(ctx context.Context, cfg bootstrapRotati
 	if err != nil {
 		return nil, err
 	}
-	defer zeroBytes(material)
+	defer encryptionwiring.ZeroBytes(material)
 	req := cloneBootstrapRotationRequest(request)
 	if !cfg.IsLeader() {
 		return nil, fmt.Errorf("external rotation: only a leader may plan: %w", raftengine.ErrNotLeader)
@@ -67,11 +68,11 @@ func validateBootstrapExternalRotationRequest(cfg bootstrapRotationRecipeConfig,
 	}
 	dek, err := cfg.Wrapper.Unwrap(bytes.Clone(request.WrappedNewDek))
 	if err != nil {
-		zeroBytes(dek)
+		encryptionwiring.ZeroBytes(dek)
 		return nil, errors.Join(errBootstrapExternalRotationRequest, fmt.Errorf("external rotation: unwrap requested key: %w", err))
 	}
 	if len(dek) != encryption.KeySize {
-		zeroBytes(dek)
+		encryptionwiring.ZeroBytes(dek)
 		return nil, fmt.Errorf("%w: invalid unwrapped key size", errBootstrapExternalRotationRequest)
 	}
 	return dek, nil

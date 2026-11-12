@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"slices"
 
+	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftadmission"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
@@ -15,7 +16,7 @@ import (
 // Protected by the enclosing domain mutex. The serial supervisor retains only
 // the current immutable recipe commitment, never a union or unbounded registry.
 type bootstrapEncryptionDomain struct {
-	wiring       encryptionWriteWiring
+	wiring       encryptionwiring.WriteWiring
 	nodeID       uint64
 	defaultGroup uint64
 	allowed      map[uint64]bool
@@ -24,25 +25,25 @@ type bootstrapEncryptionDomain struct {
 	grants       []bootstrapRotationPayloadGrant
 }
 
-func newBootstrapEncryptionDomain(groups []noderuntime.GroupSpec, request noderuntime.BootstrapEncryptionRequest, optional []encryptionWriteWiring) (*bootstrapEncryptionDomain, error) {
+func newBootstrapEncryptionDomain(groups []noderuntime.GroupSpec, request noderuntime.BootstrapEncryptionRequest, optional []encryptionwiring.WriteWiring) (*bootstrapEncryptionDomain, error) {
 	if len(optional) > 1 {
-		return nil, errors.Wrap(errBootstrapEncryptionUnsupported, "multiple encryption wirings")
+		return nil, errors.Wrap(encryptionwiring.ErrBootstrapEncryptionUnsupported, "multiple encryption wirings")
 	}
-	var w encryptionWriteWiring
+	var w encryptionwiring.WriteWiring
 	if len(optional) == 1 {
 		w = optional[0]
 	}
-	if !request.Requested() && !w.encryptionConfigured() {
+	if !request.Requested() && !w.EncryptionConfigured() {
 		return nil, nil
 	}
-	if err := validateBootstrapDomainEncryptionWiring(w, groups); err != nil {
-		return nil, err
+	if err := encryptionwiring.ValidateBootstrapDomainEncryptionWiring(w, groups); err != nil {
+		return nil, errors.WithStack(err)
 	}
 	allowed := make(map[uint64]bool, len(groups))
 	for _, group := range groups {
 		allowed[group.ID] = true
 	}
-	return &bootstrapEncryptionDomain{wiring: w, nodeID: w.raftEnvelope.fullNodeID, defaultGroup: noderuntime.DefaultGroupID(groups), allowed: allowed,
+	return &bootstrapEncryptionDomain{wiring: w, nodeID: w.RaftEnvelope.FullNodeID, defaultGroup: noderuntime.DefaultGroupID(groups), allowed: allowed,
 		groups: make(map[uint64]*kv.ShardGroup)}, nil
 }
 
@@ -66,19 +67,19 @@ func (d *bootstrapDomain) attachEncryptionGroup(id uint64, group *kv.ShardGroup)
 		if previous == group {
 			return nil
 		}
-		return errors.Wrap(errBootstrapEncryptionUnsupported, "duplicate encryption group")
+		return errors.Wrap(encryptionwiring.ErrBootstrapEncryptionUnsupported, "duplicate encryption group")
 	}
 	end := d.admission.BeginEncryptionMutation()
 	defer end()
-	r := enc.wiring.raftEnvelope
-	r.mu.Lock()
-	attached := r.groups[id]
-	r.mu.Unlock()
+	r := enc.wiring.RaftEnvelope
+	r.Mu.Lock()
+	attached := r.Groups[id]
+	r.Mu.Unlock()
 	if attached != nil && attached != group {
-		return errors.Wrap(errBootstrapEncryptionUnsupported, "foreign raft wrapper group")
+		return errors.Wrap(encryptionwiring.ErrBootstrapEncryptionUnsupported, "foreign raft wrapper group")
 	}
 	if attached == nil {
-		r.attachGroup(id, group)
+		r.AttachGroup(id, group)
 	}
 	d.mu.Lock()
 	enc.groups[id] = group
@@ -88,10 +89,10 @@ func (d *bootstrapDomain) attachEncryptionGroup(id uint64, group *kv.ShardGroup)
 
 func validateBootstrapEncryptionGroup(group *kv.ShardGroup) error {
 	if group == nil || group.Store == nil || group.Engine == nil {
-		return errors.Wrap(errBootstrapEncryptionUnsupported, "missing actual encryption group")
+		return errors.Wrap(encryptionwiring.ErrBootstrapEncryptionUnsupported, "missing actual encryption group")
 	}
 	if group.Proposer() == group.Engine {
-		return errors.Wrap(errBootstrapEncryptionUnsupported, "unwrapped encryption group proposer")
+		return errors.Wrap(encryptionwiring.ErrBootstrapEncryptionUnsupported, "unwrapped encryption group proposer")
 	}
 	return nil
 }
@@ -132,16 +133,16 @@ func (d *bootstrapDomain) authorizeRotationRecipe(recipe *bootstrapRotationRecip
 }
 
 func (enc *bootstrapEncryptionDomain) validateRecipeIdentity(recipe *bootstrapRotationRecipe) error {
-	if recipe.config.NodeID != enc.nodeID || recipe.config.StorageEpoch != enc.wiring.epoch || recipe.config.RaftEpoch != enc.wiring.raftEpoch {
+	if recipe.config.NodeID != enc.nodeID || recipe.config.StorageEpoch != enc.wiring.Epoch || recipe.config.RaftEpoch != enc.wiring.RaftEpoch {
 		return errors.WithStack(errBootstrapRotationRecipe)
 	}
 	for _, req := range recipe.requests {
 		if req == nil || req.ProposerNodeId != enc.nodeID {
 			return errors.WithStack(errBootstrapRotationRecipe)
 		}
-		epoch := enc.wiring.epoch
+		epoch := enc.wiring.Epoch
 		if req.Purpose == pb.RotateDEKRequest_PURPOSE_RAFT {
-			epoch = enc.wiring.raftEpoch
+			epoch = enc.wiring.RaftEpoch
 		}
 		if req.ProposerLocalEpoch != uint32(epoch) {
 			return errors.WithStack(errBootstrapRotationRecipe)
@@ -189,7 +190,7 @@ func (d *bootstrapDomain) loadEncryptionPayloadProjection(id uint64, recipe raft
 	}
 	d.mu.Unlock()
 	if group == nil {
-		return zero, errors.Wrap(errBootstrapEncryptionProjectionPending, "actual encrypted group is not attached")
+		return zero, errors.Wrap(encryptionwiring.ErrBootstrapEncryptionProjectionPending, "actual encrypted group is not attached")
 	}
 	// This endpoint-only view does not create IO/admin authority. It reuses the
 	// actual atomic-cell and pinned-nonce probes, including registration-pending

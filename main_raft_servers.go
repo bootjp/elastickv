@@ -10,6 +10,7 @@ import (
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
 	internalutil "github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/internal/nodeauth"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	internalraftadmin "github.com/bootjp/elastickv/internal/raftadmin"
@@ -86,11 +87,11 @@ func startRaftServers(
 	adminGRPCOpts nodeauth.AdminGRPCInterceptors,
 	forwardDeps adminForwardServerDeps,
 	confChangeInterceptor internalraftadmin.MembershipChangeInterceptor,
-	encWiring encryptionWriteWiring,
+	encWiring encryptionwiring.WriteWiring,
 	sqsPartitionResolver kv.PartitionResolver,
 	routeEngine *distribution.Engine,
 	readTracker *kv.ActiveTimestampTracker,
-	encryptionCfg encryptionFlags,
+	encryptionCfg encryptionwiring.Flags,
 	kekConfigured bool,
 	defaultGroupID uint64,
 	raftID string,
@@ -99,28 +100,28 @@ func startRaftServers(
 	s3BlobPushBlocked func() bool,
 ) error {
 	forwardLogger := slog.Default().With(slog.String("component", "admin"))
-	enableMutators := encryptionMutatorsEnabled(encryptionCfg, kekConfigured)
-	encryptionCapabilityFanout := buildEncryptionCapabilityFanout(ctx, eg, runtimeCores(runtimes), bootstrapRuntimeDialOptions(runtimes), enableMutators)
-	monitorFanout, releaseMonitorConns := buildStorageEnvelopeV2MonitorFanout(runtimeCores(runtimes), bootstrapRuntimeDialOptions(runtimes), enableMutators)
-	startStorageEnvelopeV2CapabilityMonitor(ctx, eg, monitorFanout, releaseMonitorConns, encWiring)
-	writerRegistry, err := encryptionAdminDefaultWriterRegistry(encryptionCfg.sidecarPath, shardGroups, defaultGroupID)
+	enableMutators := encryptionwiring.MutatorsEnabled(encryptionCfg, kekConfigured)
+	encryptionCapabilityFanout := encryptionwiring.BuildCapabilityFanout(ctx, eg, runtimeCores(runtimes), bootstrapRuntimeDialOptions(runtimes), enableMutators)
+	monitorFanout, releaseMonitorConns := encryptionwiring.BuildStorageEnvelopeV2MonitorFanout(runtimeCores(runtimes), bootstrapRuntimeDialOptions(runtimes), enableMutators)
+	encryptionwiring.StartStorageEnvelopeV2CapabilityMonitor(ctx, eg, monitorFanout, releaseMonitorConns, encWiring)
+	writerRegistry, err := encryptionwiring.AdminDefaultWriterRegistry(encryptionCfg.SidecarPath, shardGroups, defaultGroupID)
 	if err != nil {
-		return err
+		return errors.WithStack(err)
 	}
-	defaultAdmin, err := encryptionAdminDefaultRuntimeOptions(runtimeCores(runtimes), shardGroups, defaultGroupID, enableMutators || writerRegistry != nil)
+	defaultAdmin, err := encryptionwiring.AdminDefaultRuntimeOptions(runtimeCores(runtimes), shardGroups, defaultGroupID, enableMutators || writerRegistry != nil)
 	if err != nil {
-		return err
+		return errors.WithStack(err)
 	}
-	encryptionAdminServer := newEncryptionAdminServer(
+	encryptionAdminServer := encryptionwiring.NewAdminServer(
 		etcdraftengine.DeriveNodeID(raftID),
-		encryptionCfg.sidecarPath,
+		encryptionCfg.SidecarPath,
 		enableMutators,
-		defaultAdmin.engine,
+		defaultAdmin.Engine,
 		encryptionCapabilityFanout,
 		writerRegistry,
-		defaultAdmin.latestAppliedIndex,
-		adapter.WithEncryptionAdminPostCutoverProposer(defaultAdmin.postCutoverProposer),
-		adapter.WithEncryptionAdminCutoverBarrier(encWiring.raftEnvelope.barrier()),
+		defaultAdmin.LatestAppliedIndex,
+		adapter.WithEncryptionAdminPostCutoverProposer(defaultAdmin.PostCutoverProposer),
+		adapter.WithEncryptionAdminCutoverBarrier(encWiring.RaftEnvelope.Barrier()),
 	)
 	for _, rt := range runtimes {
 		serverOptions := append(slices.Clone(rt.TransportServerOptions), raftGRPCServerOptions(adminGRPCOpts)...)
@@ -179,7 +180,7 @@ func startRaftServers(
 		// ResyncSidecar's freshness gate must verify that group's
 		// leader, and all mutating admin RPCs must commit into the
 		// same FSM whose registry GetSidecarState/ResyncSidecar read.
-		registerEncryptionAdminServer(gs, encryptionAdminServer)
+		encryptionwiring.RegisterAdminServer(gs, encryptionAdminServer)
 		registerAdminForwardServer(gs, forwardDeps, forwardLogger)
 		rt.registerGRPC(gs)
 		// Stage 7c §3.1: pass the encryption-aware pre-register hook

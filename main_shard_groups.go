@@ -9,6 +9,7 @@ import (
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryption/kek"
+	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
@@ -96,16 +97,16 @@ func buildShardGroups(
 	kekWrapper kek.Wrapper,
 	keystore *encryption.Keystore,
 	sidecarPath string,
-	encWiring encryptionWriteWiring,
+	encWiring encryptionwiring.WriteWiring,
 	routeEngine *distribution.Engine,
 	applyObservers ...kv.ApplyObserver,
 ) ([]*raftGroupRuntime, map[uint64]*kv.ShardGroup, error) {
 	// Defend the "cache is always non-nil" contract for callers that
-	// pass a zero-value encryptionWriteWiring{} (the encryption-off
+	// pass a zero-value encryptionwiring.WriteWiring{} (the encryption-off
 	// test harnesses). WithStateCache(nil) would otherwise make
 	// NewApplier install a private per-applier cache, silently
 	// breaking the shared-cache invariant 6D-6c-1 relies on.
-	encWiring = encWiring.withDefaultedCache()
+	encWiring = encWiring.WithDefaultedCache()
 	multi = noderuntime.EffectiveMultiDataDirs(groups, multi)
 	bootstrapSpecs, bootstrapDomain, err := loadProtectedBootstrapDomain(raftID, raftDir, groups, multi, bootstrapCfg, encWiring)
 	if err != nil {
@@ -142,7 +143,7 @@ func buildShardGroups(
 		}
 		runtimes = append(runtimes, runtime)
 		shardGroups[g.ID] = sg
-		encWiring.attachRaftEnvelopeGroup(g.ID, sg)
+		encWiring.AttachRaftEnvelopeGroup(g.ID, sg)
 		if bootstrapDomain != nil {
 			if err := bootstrapDomain.attachEncryptionGroup(g.ID, sg); err != nil {
 				closeRaftGroupRuntimes(runtimes)
@@ -167,7 +168,7 @@ type shardGroupBuilder struct {
 	kekWrapper               kek.Wrapper
 	keystore                 *encryption.Keystore
 	sidecarPath              string
-	encWiring                encryptionWriteWiring
+	encWiring                encryptionwiring.WriteWiring
 	routeEngine              *distribution.Engine
 	applyObservers           []kv.ApplyObserver
 	bootstrapSpecs           map[uint64]*groupBootstrapSpec
@@ -180,7 +181,7 @@ func (b shardGroupBuilder) build(group noderuntime.GroupSpec) (*raftGroupRuntime
 		if spec := b.bootstrapSpecs[group.ID]; spec != nil {
 			return buildProtectedDedicatedTSOGroup(b.raftID, group, b.raftDir, b.multi, groupBootstrap, b.bootstrapCfg.JoinAsLearner,
 				groupBootstrapServers, groupBootstrapSeed, b.factory, b.clock, observer,
-				spec, spec.domain, bootstrapPublicGRPCMethods(), b.encWiring.pebbleOptions()...)
+				spec, spec.domain, bootstrapPublicGRPCMethods(), b.encWiring.PebbleOptions()...)
 		}
 		if b.bootstrapCfg.PeerConfigDir != "" {
 			return nil, nil, errors.New("protected timestamp group missing bootstrap domain configuration")
@@ -210,7 +211,7 @@ func (b shardGroupBuilder) buildDataGroup(
 	if err := os.MkdirAll(dir, dirPerm); err != nil {
 		return nil, nil, errors.Wrapf(err, "failed to create fsm store dir for group %d", group.ID)
 	}
-	st, err := store.NewPebbleStore(filepath.Join(dir, "fsm.db"), b.encWiring.pebbleOptions()...)
+	st, err := store.NewPebbleStore(filepath.Join(dir, "fsm.db"), b.encWiring.PebbleOptions()...)
 	if err != nil {
 		return nil, nil, errors.Wrapf(err, "failed to open pebble fsm store for group %d", group.ID)
 	}
@@ -224,7 +225,7 @@ func (b shardGroupBuilder) buildDataGroup(
 		_ = st.Close()
 		return nil, nil, errors.Wrapf(err, "failed to construct writer registry for group %d", group.ID)
 	}
-	applierOpts := encryptionApplierOptionsFor(b.kekWrapper, b.keystore, b.sidecarPath, b.encWiring)
+	applierOpts := encryptionwiring.ApplierOptionsFor(b.kekWrapper, b.keystore, b.sidecarPath, b.encWiring)
 	applier, err := encryption.NewApplier(reg, applierOpts...)
 	if err != nil {
 		_ = st.Close()
@@ -300,13 +301,13 @@ func buildDedicatedTSOGroup(
 	return runtime, sg, nil
 }
 
-func fsmOptionsForGroup(applier *encryption.Applier, routeEngine *distribution.Engine, groupID uint64, encWiring encryptionWriteWiring, applyObservers ...kv.ApplyObserver) []kv.FSMOption {
+func fsmOptionsForGroup(applier *encryption.Applier, routeEngine *distribution.Engine, groupID uint64, encWiring encryptionwiring.WriteWiring, applyObservers ...kv.ApplyObserver) []kv.FSMOption {
 	opts := []kv.FSMOption{
 		kv.WithEncryption(applier),
 		kv.WithRouteHistory(kv.WrapDistributionEngine(routeEngine), groupID),
 	}
-	if encWiring.raftEnvelope != nil {
-		opts = append(opts, kv.WithCutoverSource(encWiring.raftEnvelope))
+	if encWiring.RaftEnvelope != nil {
+		opts = append(opts, kv.WithCutoverSource(encWiring.RaftEnvelope))
 	}
 	for _, observer := range applyObservers {
 		opts = append(opts, kv.WithApplyObserver(observer))
@@ -342,7 +343,7 @@ func postCutoverProposerForRuntime(rt *raftGroupRuntime, shardGroups map[uint64]
 // buildShardGroupsWithEncryptionWiring assembles the storage-envelope
 // write wiring from the process flags and then constructs the shard
 // groups with it. The Stage 6C-3 membership guards run here before
-// buildEncryptionWriteWiring can bump sidecar local_epoch and before
+// encryptionwiring.BuildWriteWiring can bump sidecar local_epoch and before
 // buildShardGroups can replay committed Raft entries into encrypted
 // stores. The helper keeps run() to a single startup-fault branch.
 func buildShardGroupsWithEncryptionWiring(
@@ -364,37 +365,37 @@ func buildShardGroupsWithEncryptionWiring(
 	routeEngine *distribution.Engine,
 	encryptionObserver store.EncryptionObserver,
 	applyObservers ...kv.ApplyObserver,
-) ([]*raftGroupRuntime, map[uint64]*kv.ShardGroup, encryptionWriteWiring, error) {
-	if guardErr := checkEncryptionMembershipStartupGuardsBeforeEngine(encryptionMembershipStartupGuardInput{
-		raftID:            raftID,
-		raftDir:           raftDir,
-		groups:            groups,
-		multi:             multi,
-		defaultGroup:      defaultGroup,
-		sidecarPath:       sidecarPath,
-		encryptionEnabled: encryptionEnabled,
-		bootstrapServers:  bootstrapCfg.AdminSeed(defaultGroup),
+) ([]*raftGroupRuntime, map[uint64]*kv.ShardGroup, encryptionwiring.WriteWiring, error) {
+	if guardErr := encryptionwiring.CheckMembershipStartupGuardsBeforeEngine(encryptionwiring.MembershipStartupGuardInput{
+		RaftID:            raftID,
+		RaftDir:           raftDir,
+		Groups:            groups,
+		Multi:             multi,
+		DefaultGroup:      defaultGroup,
+		SidecarPath:       sidecarPath,
+		EncryptionEnabled: encryptionEnabled,
+		BootstrapServers:  bootstrapCfg.AdminSeed(defaultGroup),
 	}); guardErr != nil {
-		return nil, nil, encryptionWriteWiring{}, guardErr
+		return nil, nil, encryptionwiring.WriteWiring{}, errors.WithStack(guardErr)
 	}
-	encWiring, err := buildEncryptionWriteWiring(encryptionEnabled, raftID, sidecarPath, kekWrapper, keystore, groups, encryptionObserver)
+	encWiring, err := encryptionwiring.BuildWriteWiring(encryptionEnabled, raftID, sidecarPath, kekWrapper, keystore, groups, encryptionObserver)
 	if err != nil {
-		return nil, nil, encryptionWriteWiring{}, err
+		return nil, nil, encryptionwiring.WriteWiring{}, errors.WithStack(err)
 	}
-	configureRaftEnvelopeFactory(factory, encWiring)
+	encryptionwiring.ConfigureRaftEnvelopeFactory(factory, encWiring)
 	runtimes, shardGroups, err := buildShardGroups(raftID, raftDir, groups, multi, bootstrap, bootstrapCfg,
 		factory, proposalObserverForGroup, clock, readTracker, kekWrapper, keystore, sidecarPath, encWiring,
 		routeEngine, applyObservers...)
 	if err != nil {
 		return runtimes, shardGroups, encWiring, err
 	}
-	if guardErr := checkLocalEpochRollbackAfterReplay(raftID, runtimeCores(runtimes), defaultGroup, sidecarPath, encryptionEnabled); guardErr != nil {
+	if guardErr := encryptionwiring.CheckLocalEpochRollbackAfterReplay(raftID, runtimeCores(runtimes), defaultGroup, sidecarPath, encryptionEnabled); guardErr != nil {
 		for _, rt := range runtimes {
 			if rt != nil {
 				rt.Close()
 			}
 		}
-		return nil, nil, encryptionWriteWiring{}, guardErr
+		return nil, nil, encryptionwiring.WriteWiring{}, errors.WithStack(guardErr)
 	}
 	// Return the wiring (cache + bumped epoch) so run() can drive the
 	// Stage 7a process-start registration after the shard stores open.

@@ -10,6 +10,7 @@ import (
 
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/encryption"
+	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/peersession"
 	"github.com/bootjp/elastickv/internal/raftadmission"
@@ -93,8 +94,8 @@ func forceBootstrapRecoveryOverlap(t *testing.T, f *bootstrapRotationE2EFixture,
 		before := node.runtime.Engine.Status().AppliedIndex
 		ctx, cancel := context.WithTimeout(node.registrationCtx, enablementE2EWait)
 		defer cancel()
-		entry := registrationEntry(sc.Active.Raft, f.config.local.Member, node.wiring.raftEpoch)
-		req := registrationRequest(sc.Active.Raft, f.config.local.Member, node.wiring.raftEpoch)
+		entry := encryptionwiring.RegistrationEntry(sc.Active.Raft, f.config.local.Member, node.wiring.RaftEpoch)
+		req := encryptionwiring.RegistrationRequest(sc.Active.Raft, f.config.local.Member, node.wiring.RaftEpoch)
 		err = source.Propose(ctx, node.group.Proposer(), entry, req)
 		require.True(t, err == nil || errors.Is(err, raftadmission.ErrStale) || errors.Is(err, kv.ErrTransactionOutcomeUnknown) || errors.Is(err, context.Canceled) || errors.Is(err, raftengine.ErrLeadershipLost), "registration may lose its reply during native recovery: %v", err)
 		require.Eventually(t, func() bool { return node.runtime.Engine.Status().AppliedIndex > before }, enablementE2EWait, time.Millisecond)

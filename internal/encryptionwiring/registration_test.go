@@ -1,4 +1,4 @@
-package main
+package encryptionwiring
 
 import (
 	"context"
@@ -36,7 +36,7 @@ func TestRunWriterRegistration_VerifyCommittedClosesBarrier(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		runWriterRegistration(context.Background(), nil, nil, cache, testRegDEKID, nil,
-			registrationRequest(testRegDEKID, 1, 3), barrier, verify)
+			RegistrationRequest(testRegDEKID, 1, 3), barrier, verify)
 		close(done)
 	}()
 	select {
@@ -64,7 +64,7 @@ func TestRetryUntilRegistered(t *testing.T) {
 	t.Run("converges after transient ErrWriterNotRegistered", func(t *testing.T) {
 		t.Parallel()
 		calls := 0
-		err := retryUntilRegistered(context.Background(), "test", func() error {
+		err := RetryUntilRegistered(context.Background(), "test", func() error {
 			calls++
 			if calls < 3 {
 				return errors.WithStack(store.ErrWriterNotRegistered)
@@ -83,7 +83,7 @@ func TestRetryUntilRegistered(t *testing.T) {
 		t.Parallel()
 		sentinel := errors.New("some other failure")
 		calls := 0
-		err := retryUntilRegistered(context.Background(), "test", func() error {
+		err := RetryUntilRegistered(context.Background(), "test", func() error {
 			calls++
 			return sentinel
 		})
@@ -98,7 +98,7 @@ func TestRetryUntilRegistered(t *testing.T) {
 	t.Run("immediate success", func(t *testing.T) {
 		t.Parallel()
 		calls := 0
-		err := retryUntilRegistered(context.Background(), "test", func() error {
+		err := RetryUntilRegistered(context.Background(), "test", func() error {
 			calls++
 			return nil
 		})
@@ -111,7 +111,7 @@ func TestRetryUntilRegistered(t *testing.T) {
 		t.Parallel()
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel() // already cancelled → first gate failure then ctx.Done()
-		err := retryUntilRegistered(ctx, "test", func() error {
+		err := RetryUntilRegistered(ctx, "test", func() error {
 			return errors.WithStack(store.ErrWriterNotRegistered)
 		})
 		if !errors.Is(err, context.Canceled) {
@@ -122,7 +122,7 @@ func TestRetryUntilRegistered(t *testing.T) {
 
 func TestRegistrationEntry_RoundTrips(t *testing.T) {
 	t.Parallel()
-	entry := registrationEntry(7, 0xABCD, 3)
+	entry := RegistrationEntry(7, 0xABCD, 3)
 	if entry[0] != fsmwire.OpRegistration {
 		t.Fatalf("opcode = 0x%02x, want OpRegistration 0x%02x", entry[0], fsmwire.OpRegistration)
 	}
@@ -137,7 +137,7 @@ func TestRegistrationEntry_RoundTrips(t *testing.T) {
 
 func TestRegistrationRequest_Fields(t *testing.T) {
 	t.Parallel()
-	req := registrationRequest(7, 0xABCD, 3)
+	req := RegistrationRequest(7, 0xABCD, 3)
 	if req.GetDekId() != 7 {
 		t.Errorf("DekId = %d, want 7", req.GetDekId())
 	}
@@ -300,7 +300,7 @@ func assertFullNodeIDMismatchReturnsFalse(t *testing.T) {
 
 // wiringFor builds an encryptionWriteWiring with a non-nil cipher and a
 // StateCache reflecting the given (activeDEK, envelopeActive) state.
-func wiringFor(t *testing.T, activeDEK uint32, envelopeActive bool, epoch uint16) encryptionWriteWiring {
+func wiringFor(t *testing.T, activeDEK uint32, envelopeActive bool, epoch uint16) WriteWiring {
 	t.Helper()
 	cipher, err := encryption.NewCipher(encryption.NewKeystore())
 	if err != nil {
@@ -310,7 +310,7 @@ func wiringFor(t *testing.T, activeDEK uint32, envelopeActive bool, epoch uint16
 	sc := &encryption.Sidecar{Version: encryption.SidecarVersion, StorageEnvelopeActive: envelopeActive}
 	sc.Active.Storage = activeDEK
 	cache.RefreshFromSidecar(sc)
-	return encryptionWriteWiring{cache: cache, cipher: cipher, epoch: epoch}
+	return WriteWiring{Cache: cache, Cipher: cipher, Epoch: epoch}
 }
 
 func TestBuildProcessStartRegistrationGate_NilGateBranches(t *testing.T) {
@@ -318,7 +318,7 @@ func TestBuildProcessStartRegistrationGate_NilGateBranches(t *testing.T) {
 	fullNodeID := etcdraftengine.DeriveNodeID("n1")
 	for _, tc := range []struct {
 		name string
-		w    encryptionWriteWiring
+		w    WriteWiring
 		seed func(t *testing.T, st store.MVCCStore)
 		// expectRegistered is the Stage 7a-2 direct-path gate state after
 		// the ungated branch returns. Only the already-registered restart
@@ -327,7 +327,7 @@ func TestBuildProcessStartRegistrationGate_NilGateBranches(t *testing.T) {
 		// anyway, so encryptForKey never consults it).
 		expectRegistered bool
 	}{
-		{name: "encryption_off", w: encryptionWriteWiring{cache: encryption.NewStateCache()}}, // cipher nil
+		{name: "encryption_off", w: WriteWiring{Cache: encryption.NewStateCache()}}, // cipher nil
 		// Design §2.3 fail-closed posture: a node that boots in Phase 0
 		// (envelope inactive) skips registration without seeding
 		// Registered(), so the per-DEK gate is NOT registered for the
@@ -363,7 +363,7 @@ func TestBuildProcessStartRegistrationGate_NilGateBranches(t *testing.T) {
 			if gate == nil || gate.Barrier != nil {
 				t.Errorf("%s: expected ungated gate (nil Barrier), got %+v", tc.name, gate)
 			}
-			if got := tc.w.cache.Registered(); got != tc.expectRegistered {
+			if got := tc.w.Cache.Registered(); got != tc.expectRegistered {
 				t.Errorf("%s: Registered() = %v, want %v", tc.name, got, tc.expectRegistered)
 			}
 		})
@@ -378,10 +378,10 @@ func TestRuntimeRegistrationTick_AlreadyRegisteredIsNoOp(t *testing.T) {
 	t.Parallel()
 	st := newRegistrationTestStore(t)
 	w := wiringFor(t, testRegDEKID, true, 5)
-	w.cache.MarkRegistered(testRegDEKID) // pre-marked
+	w.Cache.MarkRegistered(testRegDEKID) // pre-marked
 	runtimeRegistrationTick(context.Background(), &kv.ShardedCoordinator{},
 		&kv.ShardGroup{Store: st}, w, testRegDEKID, etcdraftengine.DeriveNodeID("n1"))
-	if !w.cache.Registered() {
+	if !w.Cache.Registered() {
 		t.Error("pre-marked Registered() flipped to false")
 	}
 }
@@ -395,7 +395,7 @@ func TestRuntimeRegistrationTick_EnvelopeInactiveIsNoOp(t *testing.T) {
 	w := wiringFor(t, testRegDEKID, false /*envelope inactive*/, 5)
 	runtimeRegistrationTick(context.Background(), &kv.ShardedCoordinator{},
 		&kv.ShardGroup{Store: st}, w, testRegDEKID, etcdraftengine.DeriveNodeID("n1"))
-	if w.cache.Registered() {
+	if w.Cache.Registered() {
 		t.Error("envelope inactive but Registered() flipped true")
 	}
 }
@@ -411,7 +411,7 @@ func TestRuntimeRegistrationTick_NotBootstrappedIsNoOp(t *testing.T) {
 	w := wiringFor(t, 0 /*no active DEK*/, true, 0)
 	runtimeRegistrationTick(context.Background(), &kv.ShardedCoordinator{},
 		&kv.ShardGroup{Store: st}, w, 0, etcdraftengine.DeriveNodeID("n1"))
-	if w.cache.Registered() {
+	if w.Cache.Registered() {
 		t.Error("no active DEK but Registered() flipped true")
 	}
 }
@@ -433,7 +433,7 @@ func TestRuntimeRegistrationTick_CutoverInScopeProposes(t *testing.T) {
 	w := wiringFor(t, testRegDEKID, true /*envelope active*/, epoch)
 	runtimeRegistrationTick(context.Background(), &kv.ShardedCoordinator{},
 		&kv.ShardGroup{Store: st}, w, testRegDEKID /*bootDEK==activeDEK*/, fullNodeID)
-	if !w.cache.Registered() {
+	if !w.Cache.Registered() {
 		t.Error("cutover branch did not MarkRegistered (Registered=false)")
 	}
 }
@@ -454,7 +454,7 @@ func TestRuntimeRegistrationTick_PreBootstrapInScopeProposes(t *testing.T) {
 	w := wiringFor(t, testRegDEKID /*activeDEK=X*/, true, 0 /*w.epoch=0*/)
 	runtimeRegistrationTick(context.Background(), &kv.ShardedCoordinator{},
 		&kv.ShardGroup{Store: st}, w, 0 /*bootDEK=0*/, fullNodeID)
-	if !w.cache.Registered() {
+	if !w.Cache.Registered() {
 		t.Error("pre-bootstrap branch did not MarkRegistered (Registered=false)")
 	}
 }
@@ -486,7 +486,7 @@ func TestRuntimeRegistrationTick_PreBootstrapRotateBeforeCutoverProposes(t *test
 	w := wiringFor(t, rotatedDEK, true, 0 /*w.epoch=0*/)
 	runtimeRegistrationTick(context.Background(), &kv.ShardedCoordinator{},
 		&kv.ShardGroup{Store: st}, w, 0 /*bootDEK=0*/, fullNodeID)
-	if !w.cache.Registered() {
+	if !w.Cache.Registered() {
 		t.Error("bootstrap→rotate→cutover sub-path did not MarkRegistered (Registered=false); bootDEKID==0 should keep the rotation branch off")
 	}
 }
@@ -514,7 +514,7 @@ func TestRuntimeRegistrationTick_RotationInScopeVerifyShortCircuits(t *testing.T
 	w := wiringFor(t, rotatedDEK, true, wepoch)
 	runtimeRegistrationTick(context.Background(), &kv.ShardedCoordinator{},
 		&kv.ShardGroup{Store: st}, w, bootDEK, fullNodeID)
-	if !w.cache.Registered() {
+	if !w.Cache.Registered() {
 		t.Error("7b' rotation in-scope path did not MarkRegistered (Registered=false); applyRotateDEK + verifyRegistered short-circuit + MarkRegistered should flip the cache")
 	}
 }
@@ -536,7 +536,7 @@ func TestRuntimeRegistrationTick_RotationAlreadyRegisteredIsNoOp(t *testing.T) {
 	// First tick: registers.
 	runtimeRegistrationTick(context.Background(), &kv.ShardedCoordinator{},
 		&kv.ShardGroup{Store: st}, w, bootDEK, fullNodeID)
-	if !w.cache.Registered() {
+	if !w.Cache.Registered() {
 		t.Fatalf("first tick failed prerequisite: Registered=false")
 	}
 	// Second tick: no-op via cache.Registered() short-circuit (step 1).
@@ -546,7 +546,7 @@ func TestRuntimeRegistrationTick_RotationAlreadyRegisteredIsNoOp(t *testing.T) {
 	// the tick would attempt to read from a nil coordinator and panic.
 	runtimeRegistrationTick(context.Background(), nil, /*nil coordinator pins the short-circuit*/
 		&kv.ShardGroup{Store: st}, w, bootDEK, fullNodeID)
-	if !w.cache.Registered() {
+	if !w.Cache.Registered() {
 		t.Error("second tick unexpectedly cleared Registered()")
 	}
 }
@@ -570,20 +570,20 @@ func TestRuntimeRegistrationTick_RotationToYetAnotherDEKReProposes(t *testing.T)
 	// Register Y.
 	runtimeRegistrationTick(context.Background(), &kv.ShardedCoordinator{},
 		&kv.ShardGroup{Store: st}, w, bootDEK, fullNodeID)
-	if !w.cache.Registered() {
+	if !w.Cache.Registered() {
 		t.Fatalf("first tick (Y) failed: Registered=false")
 	}
 	// Rotation Y→Z: refresh sidecar to flip activeStorageDEKID.
 	sc := &encryption.Sidecar{Version: encryption.SidecarVersion, StorageEnvelopeActive: true}
 	sc.Active.Storage = rotateZ
-	w.cache.RefreshFromSidecar(sc)
-	if w.cache.Registered() {
+	w.Cache.RefreshFromSidecar(sc)
+	if w.Cache.Registered() {
 		t.Fatalf("after rotation Y→Z: cache.Registered() unexpectedly true; the single-DEK cache should report mismatch")
 	}
 	// Second tick on Z: re-proposes, MarkRegistered(Z) flips cache.
 	runtimeRegistrationTick(context.Background(), &kv.ShardedCoordinator{},
 		&kv.ShardGroup{Store: st}, w, bootDEK, fullNodeID)
-	if !w.cache.Registered() {
+	if !w.Cache.Registered() {
 		t.Error("rotation-to-Z tick did not MarkRegistered")
 	}
 }
@@ -608,16 +608,16 @@ func TestRuntimeRegistrationTick_RotationOscillationBtoCtoBReProposes(t *testing
 	// Register B.
 	runtimeRegistrationTick(context.Background(), &kv.ShardedCoordinator{},
 		&kv.ShardGroup{Store: st}, w, bootDEK, fullNodeID)
-	if !w.cache.Registered() {
+	if !w.Cache.Registered() {
 		t.Fatalf("register B failed: Registered=false")
 	}
 	// Rotate B → C; tick registers C.
 	scC := &encryption.Sidecar{Version: encryption.SidecarVersion, StorageEnvelopeActive: true}
 	scC.Active.Storage = dekC
-	w.cache.RefreshFromSidecar(scC)
+	w.Cache.RefreshFromSidecar(scC)
 	runtimeRegistrationTick(context.Background(), &kv.ShardedCoordinator{},
 		&kv.ShardGroup{Store: st}, w, bootDEK, fullNodeID)
-	if !w.cache.Registered() {
+	if !w.Cache.Registered() {
 		t.Fatalf("register C failed: Registered=false")
 	}
 	// Rotate C → B: §3.2.2 — cache holds C; Registered() == false
@@ -625,13 +625,13 @@ func TestRuntimeRegistrationTick_RotationOscillationBtoCtoBReProposes(t *testing
 	// MarkRegisters B.
 	scB := &encryption.Sidecar{Version: encryption.SidecarVersion, StorageEnvelopeActive: true}
 	scB.Active.Storage = dekB
-	w.cache.RefreshFromSidecar(scB)
-	if w.cache.Registered() {
+	w.Cache.RefreshFromSidecar(scB)
+	if w.Cache.Registered() {
 		t.Fatalf("after rotation C→B: cache.Registered() unexpectedly true; single-DEK cache should mismatch")
 	}
 	runtimeRegistrationTick(context.Background(), &kv.ShardedCoordinator{},
 		&kv.ShardGroup{Store: st}, w, bootDEK, fullNodeID)
-	if !w.cache.Registered() {
+	if !w.Cache.Registered() {
 		t.Error("rotation C→B re-propose did not MarkRegistered (Registered=false)")
 	}
 }
@@ -659,15 +659,15 @@ func TestRuntimeRegistrationTick_StaleMarkRegisteredRecoveryReProposes(t *testin
 	// 7b' tick registers for the new DEK.
 	runtimeRegistrationTick(context.Background(), &kv.ShardedCoordinator{},
 		&kv.ShardGroup{Store: st}, w, bootDEK, fullNodeID)
-	if !w.cache.Registered() {
+	if !w.Cache.Registered() {
 		t.Fatalf("initial registration failed: Registered=false")
 	}
 	// Simulate a stale MarkRegistered(oldDEK) from a long-running
 	// 7a process-start goroutine that was racing with the cluster's
 	// rotation. This overwrites registeredStorageDEKID; the cache
 	// now reports Registered() == false (active=newDEK != oldDEK).
-	w.cache.MarkRegistered(oldDEK)
-	if w.cache.Registered() {
+	w.Cache.MarkRegistered(oldDEK)
+	if w.Cache.Registered() {
 		t.Fatalf("after stale MarkRegistered(%d): cache.Registered() should be false (active=%d != registered=%d)", oldDEK, newDEK, oldDEK)
 	}
 	// Next watcher tick MUST recover by re-proposing for newDEK.
@@ -678,7 +678,7 @@ func TestRuntimeRegistrationTick_StaleMarkRegisteredRecoveryReProposes(t *testin
 	// branch propose → MarkRegistered(newDEK) → Registered() true.
 	runtimeRegistrationTick(context.Background(), &kv.ShardedCoordinator{},
 		&kv.ShardGroup{Store: st}, w, bootDEK, fullNodeID)
-	if !w.cache.Registered() {
+	if !w.Cache.Registered() {
 		t.Error("recovery tick did not re-MarkRegistered after stale MarkRegistered race; gemini CRITICAL on PR #864 fail-closed regression")
 	}
 }
@@ -720,13 +720,13 @@ func TestRuntimeRaftRegistrationTick_WaitsForInstalledWrap(t *testing.T) {
 	}
 
 	var cutover atomic.Uint64
-	gate := &raftRegistrationGate{}
-	w := encryptionWriteWiring{
-		raftEpoch:        raftEpoch,
-		raftRegistration: gate,
-		raftEnvelope: &raftEnvelopeRuntime{
-			groups:       map[uint64]*kv.ShardGroup{},
-			cutoverIndex: &cutover,
+	gate := &RaftRegistrationGate{}
+	w := WriteWiring{
+		RaftEpoch:        raftEpoch,
+		RaftRegistration: gate,
+		RaftEnvelope: &RaftEnvelopeRuntime{
+			Groups:       map[uint64]*kv.ShardGroup{},
+			CutoverIndex: &cutover,
 		},
 	}
 	runtimeRaftRegistrationTick(context.Background(), nil, nil, w, etcdraftengine.DeriveNodeID("n1"), path)
@@ -756,15 +756,15 @@ func TestRuntimeRaftRegistrationTick_MarksCommittedRegistrationAfterWrapInstall(
 
 	cipher, nonceFactory := newTestRaftEnvelopeRuntimeDeps(t)
 	var cutover atomic.Uint64
-	gate := &raftRegistrationGate{}
-	runtime, err := newRaftEnvelopeRuntime(cipher, nonceFactory, 99, raftDEKID, &cutover, raftEpoch, fullNodeID, gate)
+	gate := &RaftRegistrationGate{}
+	runtime, err := NewRaftEnvelopeRuntime(cipher, nonceFactory, 99, raftDEKID, &cutover, raftEpoch, fullNodeID, gate)
 	if err != nil {
 		t.Fatalf("newRaftEnvelopeRuntime: %v", err)
 	}
-	w := encryptionWriteWiring{
-		raftEpoch:        raftEpoch,
-		raftRegistration: gate,
-		raftEnvelope:     runtime,
+	w := WriteWiring{
+		RaftEpoch:        raftEpoch,
+		RaftRegistration: gate,
+		RaftEnvelope:     runtime,
 	}
 	runtimeRaftRegistrationTick(context.Background(), &kv.ShardedCoordinator{}, &kv.ShardGroup{Store: st}, w, fullNodeID, path)
 	if !gate.Registered(raftDEKID, raftEpoch) {
@@ -782,15 +782,15 @@ func TestRuntimeRaftRegistrationTick_LeaderUsesBarrieredPropose(t *testing.T) {
 
 	cipher, nonceFactory := newTestRaftEnvelopeRuntimeDeps(t)
 	var cutover atomic.Uint64
-	gate := &raftRegistrationGate{}
-	runtime, err := newRaftEnvelopeRuntime(cipher, nonceFactory, 99, raftDEKID, &cutover, raftEpoch, fullNodeID, gate)
+	gate := &RaftRegistrationGate{}
+	runtime, err := NewRaftEnvelopeRuntime(cipher, nonceFactory, 99, raftDEKID, &cutover, raftEpoch, fullNodeID, gate)
 	if err != nil {
 		t.Fatalf("newRaftEnvelopeRuntime: %v", err)
 	}
-	w := encryptionWriteWiring{
-		raftEpoch:        raftEpoch,
-		raftRegistration: gate,
-		raftEnvelope:     runtime,
+	w := WriteWiring{
+		RaftEpoch:        raftEpoch,
+		RaftRegistration: gate,
+		RaftEnvelope:     runtime,
 	}
 	proposer := &recordingMembershipProposer{}
 	group := &kv.ShardGroup{Store: st, Engine: proposer}
@@ -818,11 +818,11 @@ func TestValidateRaftRegistrationStartupEpochRejectsEqualRegistryRow(t *testing.
 	fullNodeID := etcdraftengine.DeriveNodeID("n1")
 	preSeedRegistryRow(t, st, raftDEKID, fullNodeID, raftEpoch)
 
-	w := encryptionWriteWiring{
-		raftEpoch:    raftEpoch,
-		raftEnvelope: &raftEnvelopeRuntime{},
+	w := WriteWiring{
+		RaftEpoch:    raftEpoch,
+		RaftEnvelope: &RaftEnvelopeRuntime{},
 	}
-	err := validateRaftRegistrationStartupEpoch(&kv.ShardGroup{Store: st}, w, "n1", path)
+	err := ValidateRaftRegistrationStartupEpoch(&kv.ShardGroup{Store: st}, w, "n1", path)
 	if !errors.Is(err, encryption.ErrLocalEpochRollback) {
 		t.Fatalf("validateRaftRegistrationStartupEpoch: want ErrLocalEpochRollback, got %v", err)
 	}
@@ -837,11 +837,11 @@ func TestValidateRaftRegistrationStartupEpochAllowsStrictlyAhead(t *testing.T) {
 	fullNodeID := etcdraftengine.DeriveNodeID("n1")
 	preSeedRegistryRow(t, st, raftDEKID, fullNodeID, raftEpoch-1)
 
-	w := encryptionWriteWiring{
-		raftEpoch:    raftEpoch,
-		raftEnvelope: &raftEnvelopeRuntime{},
+	w := WriteWiring{
+		RaftEpoch:    raftEpoch,
+		RaftEnvelope: &RaftEnvelopeRuntime{},
 	}
-	if err := validateRaftRegistrationStartupEpoch(&kv.ShardGroup{Store: st}, w, "n1", path); err != nil {
+	if err := ValidateRaftRegistrationStartupEpoch(&kv.ShardGroup{Store: st}, w, "n1", path); err != nil {
 		t.Fatalf("validateRaftRegistrationStartupEpoch: %v", err)
 	}
 }
@@ -914,14 +914,14 @@ func TestProposeWriterRegistration_LeaderUsesBarrieredPropose(t *testing.T) {
 	proposer := &recordingMembershipProposer{}
 	groups := map[uint64]*kv.ShardGroup{1: {Engine: proposer}}
 	coord := kv.NewShardedCoordinator(engine, groups, 1, kv.NewHLC(), nil)
-	req := registrationRequest(testRegDEKID, 0x1234, 3)
+	req := RegistrationRequest(testRegDEKID, 0x1234, 3)
 
-	err := proposeWriterRegistration(
+	err := ProposeWriterRegistration(
 		context.Background(),
 		coord,
 		proposer,
 		&kv.GRPCConnCache{},
-		registrationEntry(testRegDEKID, 0x1234, 3),
+		RegistrationEntry(testRegDEKID, 0x1234, 3),
 		req,
 	)
 	if err != nil {

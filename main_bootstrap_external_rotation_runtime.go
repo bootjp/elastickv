@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 
+	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/internal/raftadmission"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
@@ -79,8 +80,8 @@ func (r *bootstrapRotationRuntime) executeExternal(call bootstrapExternalRotatio
 	return r.finishExternal(run, recipe, projection)
 }
 
-func (r *bootstrapRotationRuntime) planExternal(call bootstrapExternalRotationCall) (*bootstrapRotationRecipe, bootstrapEncryptionProjection, error) {
-	var projection bootstrapEncryptionProjection
+func (r *bootstrapRotationRuntime) planExternal(call bootstrapExternalRotationCall) (*bootstrapRotationRecipe, encryptionwiring.BootstrapEncryptionProjection, error) {
+	var projection encryptionwiring.BootstrapEncryptionProjection
 	ctx := call.intent.Context()
 	if err := ctx.Err(); err != nil {
 		return nil, projection, errors.WithStack(err)
@@ -102,7 +103,7 @@ func (r *bootstrapRotationRuntime) planExternal(call bootstrapExternalRotationCa
 	return recipe, projection, nil
 }
 
-func (r *bootstrapRotationRuntime) finishExternal(run *raftadmission.RotationRun, recipe *bootstrapRotationRecipe, projection bootstrapEncryptionProjection) (*pb.RotateDEKResponse, error) {
+func (r *bootstrapRotationRuntime) finishExternal(run *raftadmission.RotationRun, recipe *bootstrapRotationRecipe, projection encryptionwiring.BootstrapEncryptionProjection) (*pb.RotateDEKResponse, error) {
 	finished := false
 	defer func() {
 		if !finished {
@@ -122,7 +123,7 @@ func (r *bootstrapRotationRuntime) finishExternal(run *raftadmission.RotationRun
 	}
 	ticket, err := r.config.admission.EncryptionTicket()
 	if err == nil {
-		err = r.config.admission.CompleteRotation(run, ticket, projection.digest())
+		err = r.config.admission.CompleteRotation(run, ticket, projection.Digest())
 	}
 	if err != nil {
 		return nil, bootstrapExternalRotationUnknown(err)

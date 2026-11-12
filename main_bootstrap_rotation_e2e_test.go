@@ -17,6 +17,7 @@ import (
 	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryption/kek"
+	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftadmission"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
@@ -67,7 +68,7 @@ func newBootstrapRotationE2EFixture(t *testing.T, active ...bool) *bootstrapRota
 	_, err = rand.Read(key)
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(kekPath, key, 0o600))
-	zeroBytes(key)
+	encryptionwiring.ZeroBytes(key)
 	f.wrapper, err = kek.NewFileWrapper(kekPath)
 	require.NoError(t, err)
 	f.prepareLegacyCut(t)
@@ -87,17 +88,17 @@ func (f *bootstrapRotationE2EFixture) prepareLegacyCut(t *testing.T) {
 	routes := distribution.NewEngine()
 	routes.UpdateRoute(nil, nil, f.group.ID)
 	keystore := encryption.NewKeystore()
-	wiring, err := buildEncryptionWriteWiring(true, "n1", f.sidecarPath, f.wrapper, keystore, []noderuntime.GroupSpec{f.group}, nil)
+	wiring, err := encryptionwiring.BuildWriteWiring(true, "n1", f.sidecarPath, f.wrapper, keystore, []noderuntime.GroupSpec{f.group}, nil)
 	require.NoError(t, err)
 	factory := enablementFactory()
-	configureRaftEnvelopeFactory(factory, wiring)
+	encryptionwiring.ConfigureRaftEnvelopeFactory(factory, wiring)
 	builder := shardGroupBuilder{raftID: "n1", raftDir: f.base, bootstrap: true, factory: factory,
 		clock: clock, readTracker: kv.NewActiveTimestampTracker(), routeEngine: routes,
 		kekWrapper: f.wrapper, keystore: keystore, sidecarPath: f.sidecarPath, encWiring: wiring}
 	runtime, shard, err := builder.build(f.group)
 	require.NoError(t, err)
 	t.Cleanup(runtime.Close)
-	wiring.attachRaftEnvelopeGroup(f.group.ID, shard)
+	wiring.AttachRaftEnvelopeGroup(f.group.ID, shard)
 	require.Eventually(t, func() bool { return runtime.Engine.State() == raftengine.StateLeader }, enablementE2EWait, 10*time.Millisecond)
 	enablementLegacyPut(t, runtime.Engine, clock.Next(), "legacy-key", "original-value")
 	catalog, err := setupDistributionCatalog(t.Context(), []*raftGroupRuntime{runtime}, routes)
@@ -119,7 +120,7 @@ func (f *bootstrapRotationE2EFixture) prepareLegacyCut(t *testing.T) {
 	_ = f.listener.Close()
 }
 
-func (f *bootstrapRotationE2EFixture) bootstrapKeys(t *testing.T, runtime *raftGroupRuntime, shard *kv.ShardGroup, wiring encryptionWriteWiring, ks *encryption.Keystore) {
+func (f *bootstrapRotationE2EFixture) bootstrapKeys(t *testing.T, runtime *raftGroupRuntime, shard *kv.ShardGroup, wiring encryptionwiring.WriteWiring, ks *encryption.Keystore) {
 	t.Helper()
 	registry, err := store.WriterRegistryFor(runtime.Store)
 	require.NoError(t, err)
@@ -130,16 +131,16 @@ func (f *bootstrapRotationE2EFixture) bootstrapKeys(t *testing.T, runtime *raftG
 		adapter.WithEncryptionAdminPostCutoverProposer(shard.Proposer()),
 		adapter.WithEncryptionAdminLeaderView(runtime.Engine))
 	require.NoError(t, server.Validate())
-	f.storageWrapped, err = wrapFreshStartupDEK(f.wrapper)
+	f.storageWrapped, err = encryptionwiring.WrapFreshStartupDEK(f.wrapper)
 	require.NoError(t, err)
-	f.raftWrapped, err = wrapFreshStartupDEK(f.wrapper)
+	f.raftWrapped, err = encryptionwiring.WrapFreshStartupDEK(f.wrapper)
 	require.NoError(t, err)
 	ctx, cancel := context.WithTimeout(t.Context(), enablementE2EWait)
 	defer cancel()
 	response, err := server.BootstrapEncryption(ctx, &pb.BootstrapEncryptionRequest{
 		StorageDekId: e2eStorageDEKID, RaftDekId: e2eRaftDEKID,
 		WrappedStorageDek: f.storageWrapped, WrappedRaftDek: f.raftWrapped,
-		WriterBatch: []*pb.WriterRegistryEntry{{FullNodeId: f.config.local.Member, LocalEpoch: uint32(wiring.epoch)}},
+		WriterBatch: []*pb.WriterRegistryEntry{{FullNodeId: f.config.local.Member, LocalEpoch: uint32(wiring.Epoch)}},
 	})
 	require.NoError(t, err)
 	require.NotZero(t, response.AppliedIndex)
@@ -164,14 +165,14 @@ func (f *bootstrapRotationE2EFixture) bootstrapKeys(t *testing.T, runtime *raftG
 		expected, err := f.wrapper.Unwrap(wrapped)
 		require.NoError(t, err)
 		require.Equal(t, expected, dek[:])
-		zeroBytes(expected)
+		encryptionwiring.ZeroBytes(expected)
 	}
 	f.assertInactiveKeys(t)
 	sc, err := encryption.ReadSidecar(f.sidecarPath)
 	require.NoError(t, err)
 	expected, err := encryption.SidecarCheckpoint(sc)
 	require.NoError(t, err)
-	checkpoints, ok := runtime.Store.(bootstrapEncryptionProjectionStore)
+	checkpoints, ok := runtime.Store.(encryptionwiring.BootstrapEncryptionProjectionStore)
 	require.True(t, ok)
 	checkpoint, present, err := checkpoints.LoadEncryptionSnapshotCheckpoint()
 	require.NoError(t, err)
@@ -179,18 +180,18 @@ func (f *bootstrapRotationE2EFixture) bootstrapKeys(t *testing.T, runtime *raftG
 	require.Equal(t, expected, checkpoint, "committed sidecar and durable Pebble checkpoint must agree")
 }
 
-func (f *bootstrapRotationE2EFixture) enableEnvelopes(t *testing.T, runtime *raftGroupRuntime, shard *kv.ShardGroup, wiring encryptionWriteWiring) {
+func (f *bootstrapRotationE2EFixture) enableEnvelopes(t *testing.T, runtime *raftGroupRuntime, shard *kv.ShardGroup, wiring encryptionwiring.WriteWiring) {
 	t.Helper()
-	installRaftRegistrationVerifier(shard, wiring, "n1")
+	encryptionwiring.InstallRaftRegistrationVerifier(shard, wiring, "n1")
 	cache := kv.NewGRPCConnCache(nil)
 	defer func() { require.NoError(t, cache.Close()) }()
-	fanout := buildCapabilityFanoutFn(runtimeCores([]*raftGroupRuntime{runtime}), cache, capabilityFanoutTimeout)
+	fanout := encryptionwiring.BuildCapabilityFanoutFn(runtimeCores([]*raftGroupRuntime{runtime}), cache, encryptionwiring.CapabilityFanoutTimeout)
 	server := adapter.NewEncryptionAdminServer(
 		adapter.WithEncryptionAdminSidecarPath(f.sidecarPath), adapter.WithEncryptionAdminFullNodeID(f.config.local.Member),
 		adapter.WithEncryptionAdminProposer(runtime.Engine), adapter.WithEncryptionAdminPostCutoverProposer(shard.Proposer()),
 		adapter.WithEncryptionAdminLeaderView(runtime.Engine), adapter.WithEncryptionAdminCapabilityFanout(fanout),
 		adapter.WithEncryptionAdminLatestAppliedIndex(func() uint64 { return runtime.Engine.Status().AppliedIndex }),
-		adapter.WithEncryptionAdminCutoverBarrier(wiring.raftEnvelope.barrier()))
+		adapter.WithEncryptionAdminCutoverBarrier(wiring.RaftEnvelope.Barrier()))
 	require.NoError(t, server.Validate())
 	grpcServer := grpc.NewServer()
 	runtime.registerGRPC(grpcServer)
@@ -200,9 +201,9 @@ func (f *bootstrapRotationE2EFixture) enableEnvelopes(t *testing.T, runtime *raf
 	defer func() { grpcServer.Stop(); require.NoError(t, <-served) }()
 	ctx, cancel := context.WithTimeout(t.Context(), enablementE2EWait)
 	defer cancel()
-	_, err := server.EnableStorageEnvelope(ctx, &pb.EnableStorageEnvelopeRequest{ProposerNodeId: f.config.local.Member, ProposerLocalEpoch: uint32(wiring.epoch)})
+	_, err := server.EnableStorageEnvelope(ctx, &pb.EnableStorageEnvelopeRequest{ProposerNodeId: f.config.local.Member, ProposerLocalEpoch: uint32(wiring.Epoch)})
 	require.NoError(t, err)
-	_, err = server.EnableRaftEnvelope(ctx, &pb.EnableRaftEnvelopeRequest{ProposerNodeId: f.config.local.Member, ProposerLocalEpoch: uint32(wiring.raftEpoch)})
+	_, err = server.EnableRaftEnvelope(ctx, &pb.EnableRaftEnvelopeRequest{ProposerNodeId: f.config.local.Member, ProposerLocalEpoch: uint32(wiring.RaftEpoch)})
 	require.NoError(t, err)
 	sc, err := encryption.ReadSidecar(f.sidecarPath)
 	require.NoError(t, err)
@@ -259,7 +260,7 @@ type bootstrapRotationE2ENode struct {
 	domain          *bootstrapDomain
 	coordinate      *kv.ShardedCoordinator
 	shards          *kv.ShardStore
-	wiring          encryptionWriteWiring
+	wiring          encryptionwiring.WriteWiring
 	registrationCtx context.Context
 	group           *kv.ShardGroup
 	stopReadiness   func()

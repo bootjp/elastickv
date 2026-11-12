@@ -1,4 +1,4 @@
-package main
+package encryptionwiring
 
 import (
 	"github.com/bootjp/elastickv/adapter"
@@ -12,7 +12,7 @@ import (
 	"google.golang.org/grpc"
 )
 
-// encryptionMutatorsEnabled is the Stage 6B-2 triple-gate
+// MutatorsEnabled is the Stage 6B-2 triple-gate
 // readback. Returns true iff THIS NODE has all three of:
 //
 //   - --encryption-enabled (explicit operator opt-in)
@@ -64,18 +64,18 @@ import (
 // Kept in this file (not main.go) so the flag-driven gate logic
 // is colocated with the registerEncryptionAdminServer helper
 // that consumes it.
-func encryptionMutatorsEnabled(f encryptionFlags, kekConfigured bool) bool {
-	return f.enabled && kekConfigured && f.sidecarPath != ""
+func MutatorsEnabled(f Flags, kekConfigured bool) bool {
+	return f.Enabled && kekConfigured && f.SidecarPath != ""
 }
 
-// encryptionAdminEngine is the subset of raftengine.Engine the
+// AdminEngine is the subset of raftengine.Engine the
 // EncryptionAdminServer needs: a Proposer (for the mutating RPCs)
 // and a LeaderView (for the requireLeader gate). Every shard's
 // raftengine.Engine satisfies both interfaces; declaring a local
 // intersection keeps the construction site decoupled from the
 // concrete engine type and lets tests substitute a stub without
 // pulling in the full engine surface.
-type encryptionAdminEngine interface {
+type AdminEngine interface {
 	raftengine.Proposer
 	raftengine.LeaderView
 }
@@ -91,7 +91,7 @@ func encryptionAdminWriterRegistry(sidecarPath string, st store.MVCCStore, group
 	return reg, nil
 }
 
-func encryptionAdminDefaultWriterRegistry(sidecarPath string, shardGroups map[uint64]*kv.ShardGroup, defaultGroupID uint64) (encryption.WriterRegistryStore, error) {
+func AdminDefaultWriterRegistry(sidecarPath string, shardGroups map[uint64]*kv.ShardGroup, defaultGroupID uint64) (encryption.WriterRegistryStore, error) {
 	if sidecarPath == "" {
 		return nil, nil
 	}
@@ -103,12 +103,12 @@ func encryptionAdminDefaultWriterRegistry(sidecarPath string, shardGroups map[ui
 }
 
 type encryptionAdminRuntimeOptions struct {
-	engine              encryptionAdminEngine
-	latestAppliedIndex  func() uint64
-	postCutoverProposer raftengine.Proposer
+	Engine              AdminEngine
+	LatestAppliedIndex  func() uint64
+	PostCutoverProposer raftengine.Proposer
 }
 
-func encryptionAdminDefaultRuntimeOptions(runtimes []*noderuntime.GroupRuntime, shardGroups map[uint64]*kv.ShardGroup, defaultGroupID uint64, requireDefault bool) (encryptionAdminRuntimeOptions, error) {
+func AdminDefaultRuntimeOptions(runtimes []*noderuntime.GroupRuntime, shardGroups map[uint64]*kv.ShardGroup, defaultGroupID uint64, requireDefault bool) (encryptionAdminRuntimeOptions, error) {
 	defaultRuntime := noderuntime.FindGroupRuntime(runtimes, defaultGroupID)
 	if defaultRuntime == nil || defaultRuntime.Engine == nil {
 		if requireDefault {
@@ -117,13 +117,13 @@ func encryptionAdminDefaultRuntimeOptions(runtimes []*noderuntime.GroupRuntime, 
 		return encryptionAdminRuntimeOptions{}, nil
 	}
 	return encryptionAdminRuntimeOptions{
-		engine:              defaultRuntime.Engine,
-		latestAppliedIndex:  noderuntime.AppliedIndexForEngine(defaultRuntime.Engine),
-		postCutoverProposer: noderuntime.PostCutoverProposer(defaultRuntime, shardGroups),
+		Engine:              defaultRuntime.Engine,
+		LatestAppliedIndex:  noderuntime.AppliedIndexForEngine(defaultRuntime.Engine),
+		PostCutoverProposer: noderuntime.PostCutoverProposer(defaultRuntime, shardGroups),
 	}, nil
 }
 
-// newEncryptionAdminServer constructs the per-node EncryptionAdminServer.
+// NewAdminServer constructs the per-node EncryptionAdminServer.
 // Production registers the returned instance on every group listener so
 // the default-group admin runtime also shares its cutover serialization
 // and unsafe-cutover latch across those frontends.
@@ -179,7 +179,7 @@ func encryptionAdminDefaultRuntimeOptions(runtimes []*noderuntime.GroupRuntime, 
 // (the §7.1 cutover refuses with ErrCapabilityCheckFailed);
 // when set, capability probing reads the §5.1 keys.json and
 // reports encryption_capable=true.
-func newEncryptionAdminServer(fullNodeID uint64, sidecarPath string, enableMutators bool, engine encryptionAdminEngine, capabilityFanout adapter.CapabilityFanoutFn, writerRegistry encryption.WriterRegistryStore, latestAppliedIndex func() uint64, extraOpts ...adapter.EncryptionAdminServerOption) *adapter.EncryptionAdminServer {
+func NewAdminServer(fullNodeID uint64, sidecarPath string, enableMutators bool, engine AdminEngine, capabilityFanout adapter.CapabilityFanoutFn, writerRegistry encryption.WriterRegistryStore, latestAppliedIndex func() uint64, extraOpts ...adapter.EncryptionAdminServerOption) *adapter.EncryptionAdminServer {
 	opts := []adapter.EncryptionAdminServerOption{
 		adapter.WithEncryptionAdminFullNodeID(fullNodeID),
 	}
@@ -218,6 +218,6 @@ func newEncryptionAdminServer(fullNodeID uint64, sidecarPath string, enableMutat
 	return srv
 }
 
-func registerEncryptionAdminServer(gs *grpc.Server, srv pb.EncryptionAdminServer) {
+func RegisterAdminServer(gs *grpc.Server, srv pb.EncryptionAdminServer) {
 	pb.RegisterEncryptionAdminServer(gs, srv)
 }

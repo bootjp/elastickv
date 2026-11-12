@@ -11,6 +11,7 @@ import (
 
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryption/kek"
+	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/bootjp/elastickv/kv"
@@ -101,8 +102,8 @@ func bootstrapOfflineValidateSidecar(sc *encryption.Sidecar) error {
 	if len(sc.Keys) == 0 || (sc.Active.Storage == 0 && sc.Active.Raft == 0) {
 		return errors.Wrap(errBootstrapOfflineStore, "encryption context has no active keys")
 	}
-	if err := validateBootstrapEncryptionKeyPurposes(sc); err != nil {
-		return err
+	if err := encryptionwiring.ValidateBootstrapEncryptionKeyPurposes(sc); err != nil {
+		return errors.WithStack(err)
 	}
 	if sc.StorageEnvelopeActive != (sc.StorageEnvelopeCutoverIndex != 0) || (sc.RaftEnvelopeCutoverIndex != 0 && sc.Active.Raft == 0) {
 		return errors.Wrap(errBootstrapOfflineStore, "sidecar envelope state is inconsistent")

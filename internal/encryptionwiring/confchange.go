@@ -1,4 +1,4 @@
-package main
+package encryptionwiring
 
 import (
 	"context"
@@ -39,9 +39,9 @@ const membershipCapabilityProbeTimeout = 5 * time.Second
 // See docs/design/2026_05_29_implemented_7c_confchange_time_registration.md.
 type encryptionPreRegister struct {
 	coordinate   *kv.ShardedCoordinator
-	defaultGroup *kv.ShardGroup
-	cache        *encryption.StateCache
-	sidecarPath  string
+	DefaultGroup *kv.ShardGroup
+	Cache        *encryption.StateCache
+	SidecarPath  string
 	// deriveNodeID is injected so the adapter is engine-neutral —
 	// main.go supplies etcdraftengine.DeriveNodeID today; a future
 	// engine swap is a one-line wiring change here, not an adapter
@@ -59,13 +59,13 @@ type storageEnvelopeV2CapabilityRPC func(context.Context, string) (*pb.Capabilit
 // group). A nil interceptor causes raftadmin.Server to skip the
 // pre-step, matching the pre-7c behavior on encryption-disabled
 // clusters.
-// newEncryptionConfChangeInterceptor installs the membership pre-step only when
+// NewConfChangeInterceptor installs the membership pre-step only when
 // encryption is actually configured. A cluster running without encryption still
 // gets a defaulted StateCache and a default group store, so gating on those
 // alone left the V2 capability probe running on plain deployments: every target
 // node there reports full_node_id=0 / encryption_capable=false, and
 // AddVoter/AddLearner failed even though the interceptor is meant to be inert.
-func newEncryptionConfChangeInterceptor(
+func NewConfChangeInterceptor(
 	encryptionConfigured bool,
 	coordinate *kv.ShardedCoordinator,
 	defaultGroup *kv.ShardGroup,
@@ -97,9 +97,9 @@ func newEncryptionPreRegister(
 	}
 	return &encryptionPreRegister{
 		coordinate:      coordinate,
-		defaultGroup:    defaultGroup,
-		cache:           cache,
-		sidecarPath:     sidecarPath,
+		DefaultGroup:    defaultGroup,
+		Cache:           cache,
+		SidecarPath:     sidecarPath,
 		deriveNodeID:    deriveNodeID,
 		capabilityProbe: capabilityProbe,
 	}
@@ -119,7 +119,7 @@ func (e *encryptionPreRegister) PreAddMember(ctx context.Context, raftID, addres
 	if err := e.capabilityProbe(ctx, address, newNodeFullID); err != nil {
 		return errors.Wrap(err, "encryption: refuse member before V2 capability confirmation")
 	}
-	activeDEK, ok := e.cache.ActiveStorageKeyID()
+	activeDEK, ok := e.Cache.ActiveStorageKeyID()
 	if !ok {
 		// Pre-bootstrap clusters have no registry row to create, but the
 		// capability probe above still prevents a future V2 latch from
@@ -211,10 +211,10 @@ func getStorageEnvelopeV2Capability(ctx context.Context, address string) (*pb.Ca
 }
 
 func (e *encryptionPreRegister) activeRaftDEKForPreRegister() (uint32, bool, error) {
-	if e.sidecarPath == "" {
+	if e.SidecarPath == "" {
 		return 0, false, nil
 	}
-	sc, err := encryption.ReadSidecar(e.sidecarPath)
+	sc, err := encryption.ReadSidecar(e.SidecarPath)
 	if err != nil {
 		if encryption.IsNotExist(err) {
 			return 0, false, nil
@@ -231,7 +231,7 @@ func (e *encryptionPreRegister) preRegisterDEK(ctx context.Context, activeDEK ui
 	// store.WriterRegistryFor is a stateless wrapper (same idiom as
 	// 7a §3.1 startup check); avoiding a cached field on the adapter
 	// keeps construction simple and the dependency surface narrow.
-	reg, err := store.WriterRegistryFor(e.defaultGroup.Store)
+	reg, err := store.WriterRegistryFor(e.DefaultGroup.Store)
 	if err != nil {
 		return errors.Wrapf(err, "7c pre-register: %s registry handle", purpose)
 	}
@@ -273,8 +273,8 @@ func (e *encryptionPreRegister) preRegisterDEK(ctx context.Context, activeDEK ui
 		}
 		return encryption.ErrWriterUint16Collision
 	}
-	entry := registrationEntry(activeDEK, newNodeFullID, 0)
-	req := registrationRequest(activeDEK, newNodeFullID, 0)
+	entry := RegistrationEntry(activeDEK, newNodeFullID, 0)
+	req := RegistrationRequest(activeDEK, newNodeFullID, 0)
 	// Always allocate connCache (NOT lazy-on-non-leader): a lazy
 	// allocation guarded by `if !e.coordinate.IsLeader()` would race
 	// with leadership change inside proposeWriterRegistration, which
@@ -306,5 +306,5 @@ func (e *encryptionPreRegister) preRegisterDEK(ctx context.Context, activeDEK ui
 	// collision TOCTOU — different FullNodeID at the same NodeID16
 	// — is the genuine case-4 halt-apply residual; see §3.3 of the
 	// design doc.)
-	return proposeWriterRegistrationBlockingOnCutover(ctx, e.coordinate, e.defaultGroup.Proposer(), connCache, entry, req)
+	return proposeWriterRegistrationBlockingOnCutover(ctx, e.coordinate, e.DefaultGroup.Proposer(), connCache, entry, req)
 }

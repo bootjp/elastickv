@@ -1,4 +1,4 @@
-package main
+package encryptionwiring
 
 import (
 	"bytes"
@@ -58,13 +58,13 @@ func TestEncryptionObserverReachesStoreThroughProductionWiring(t *testing.T) {
 
 	obs := &wiringEncryptionObserver{}
 	keystore := encryption.NewKeystore()
-	encWiring, err := buildEncryptionWriteWiring(
+	encWiring, err := BuildWriteWiring(
 		true, "n1", sidecarPath, wiringFakeKEK{}, keystore, []noderuntime.GroupSpec{{ID: 1}}, obs)
 	if err != nil {
 		t.Fatalf("buildEncryptionWriteWiring: %v", err)
 	}
 
-	st, err := store.NewPebbleStore(pebbleDir, encWiring.pebbleOptions()...)
+	st, err := store.NewPebbleStore(pebbleDir, encWiring.PebbleOptions()...)
 	if err != nil {
 		t.Fatalf("NewPebbleStore: %v", err)
 	}
@@ -78,7 +78,7 @@ func TestEncryptionObserverReachesStoreThroughProductionWiring(t *testing.T) {
 		encryption.WithKEK(wiringFakeKEK{}),
 		encryption.WithKeystore(keystore),
 		encryption.WithSidecarPath(sidecarPath),
-		encryption.WithStateCache(encWiring.cache),
+		encryption.WithStateCache(encWiring.Cache),
 	)
 	if err != nil {
 		t.Fatalf("NewApplier: %v", err)
@@ -93,7 +93,7 @@ func TestEncryptionObserverReachesStoreThroughProductionWiring(t *testing.T) {
 	// Drive the production rollout to Phase 1 so writes are encrypted.
 	applyE2EBootstrap(t, applier)
 	applyE2ECutover(t, applier)
-	encWiring.cache.MarkRegistered(e2eStorageDEKID)
+	encWiring.Cache.MarkRegistered(e2eStorageDEKID)
 
 	mustPut(t, ctx, st, "after", "plain-after", 120)
 
@@ -140,7 +140,7 @@ func TestTimedKEKUnwrapperCoversStartupPreflightUnwraps(t *testing.T) {
 	// A fresh node: the KEK comes from the environment and the sidecar
 	// does not exist yet, so the KEK preflight is the only unwrap.
 	t.Setenv(kek.EnvVar, base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x5a}, encryption.KeySize)))
-	f := encryptionFlags{enabled: true, sidecarPath: filepath.Join(t.TempDir(), encryption.SidecarFilename)}
+	f := Flags{Enabled: true, SidecarPath: filepath.Join(t.TempDir(), encryption.SidecarFilename)}
 
 	obs := &countingKEKObserver{}
 	wrapper, err := loadKEKAndRunStartupGuards(f, obs)

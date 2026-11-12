@@ -1,4 +1,4 @@
-package main
+package encryptionwiring
 
 import (
 	"context"
@@ -56,7 +56,7 @@ const (
 	runtimeRegistrationTickTimeout = 30 * time.Second
 )
 
-// retryUntilRegistered runs fn, retrying with bounded backoff while it
+// RetryUntilRegistered runs fn, retrying with bounded backoff while it
 // returns store.ErrWriterNotRegistered — the Stage 7a-2 §4.1
 // fail-closed signal that the §7.1 envelope is active but this load's
 // writer registration has not yet committed. Any other error (or nil)
@@ -68,7 +68,7 @@ const (
 // returns rather than hanging. There is deliberately no fail-OPEN
 // fallback: letting the bootstrap Save proceed unregistered is the
 // exact hazard 7a-2 closes (§2.3).
-func retryUntilRegistered(ctx context.Context, what string, fn func() error) error {
+func RetryUntilRegistered(ctx context.Context, what string, fn func() error) error {
 	backoff := registrationRetryInitial
 	start := time.Now()
 	var lastWarn time.Time
@@ -106,12 +106,12 @@ func retryUntilRegistered(ctx context.Context, what string, fn func() error) err
 	}
 }
 
-func installRaftRegistrationVerifier(defaultGroup *kv.ShardGroup, w encryptionWriteWiring, raftID string) {
-	if defaultGroup == nil || defaultGroup.Store == nil || w.raftEnvelope == nil || w.raftRegistration == nil {
+func InstallRaftRegistrationVerifier(defaultGroup *kv.ShardGroup, w WriteWiring, raftID string) {
+	if defaultGroup == nil || defaultGroup.Store == nil || w.RaftEnvelope == nil || w.RaftRegistration == nil {
 		return
 	}
 	fullNodeID := etcdraftengine.DeriveNodeID(raftID)
-	w.raftEnvelope.setRegistrationVerifier(func(activeRaftDEKID uint32, raftEpoch uint16) bool {
+	w.RaftEnvelope.setRegistrationVerifier(func(activeRaftDEKID uint32, raftEpoch uint16) bool {
 		reg, err := store.WriterRegistryFor(defaultGroup.Store)
 		if err != nil {
 			slog.Warn("encryption: raft writer registration verifier failed to obtain writer registry handle",
@@ -128,8 +128,8 @@ func installRaftRegistrationVerifier(defaultGroup *kv.ShardGroup, w encryptionWr
 	})
 }
 
-func validateRaftRegistrationStartupEpoch(defaultGroup *kv.ShardGroup, w encryptionWriteWiring, raftID, sidecarPath string) error {
-	if defaultGroup == nil || defaultGroup.Store == nil || w.raftEnvelope == nil {
+func ValidateRaftRegistrationStartupEpoch(defaultGroup *kv.ShardGroup, w WriteWiring, raftID, sidecarPath string) error {
+	if defaultGroup == nil || defaultGroup.Store == nil || w.RaftEnvelope == nil {
 		return nil
 	}
 	activeRaftDEKID, inScope, err := activeRaftDEKForRegistration(sidecarPath)
@@ -148,24 +148,24 @@ func validateRaftRegistrationStartupEpoch(defaultGroup *kv.ShardGroup, w encrypt
 	if err != nil {
 		return err
 	}
-	if w.raftEpoch <= lastSeen {
+	if w.RaftEpoch <= lastSeen {
 		return errors.Wrapf(encryption.ErrLocalEpochRollback,
 			"encryption: raft writer registration: local_epoch %d is not ahead of registry last_seen %d for dek_id %d node %#x",
-			w.raftEpoch, lastSeen, activeRaftDEKID, fullNodeID)
+			w.RaftEpoch, lastSeen, activeRaftDEKID, fullNodeID)
 	}
 	return nil
 }
 
-func installRuntimeRaftRegistrationWatcher(
+func InstallRuntimeRaftRegistrationWatcher(
 	ctx context.Context,
 	eg *errgroup.Group,
 	coordinate *kv.ShardedCoordinator,
 	defaultGroup *kv.ShardGroup,
-	w encryptionWriteWiring,
+	w WriteWiring,
 	raftID string,
 	sidecarPath string,
 ) {
-	if w.cipher == nil || w.raftEnvelope == nil || w.raftRegistration == nil || defaultGroup == nil || sidecarPath == "" {
+	if w.Cipher == nil || w.RaftEnvelope == nil || w.RaftRegistration == nil || defaultGroup == nil || sidecarPath == "" {
 		return
 	}
 	fullNodeID := etcdraftengine.DeriveNodeID(raftID)
@@ -179,7 +179,7 @@ func runRuntimeRaftRegistrationWatcher(
 	ctx context.Context,
 	coordinate *kv.ShardedCoordinator,
 	defaultGroup *kv.ShardGroup,
-	w encryptionWriteWiring,
+	w WriteWiring,
 	fullNodeID uint64,
 	sidecarPath string,
 ) {
@@ -200,22 +200,22 @@ func runtimeRaftRegistrationTick(
 	ctx context.Context,
 	coordinate *kv.ShardedCoordinator,
 	defaultGroup *kv.ShardGroup,
-	w encryptionWriteWiring,
+	w WriteWiring,
 	fullNodeID uint64,
 	sidecarPath string,
 ) {
-	activeRaftDEKID, ok := runtimeRaftRegistrationTarget(sidecarPath, w.raftRegistration, w.raftEpoch)
+	activeRaftDEKID, ok := runtimeRaftRegistrationTarget(sidecarPath, w.RaftRegistration, w.RaftEpoch)
 	if !ok {
 		return
 	}
-	if !w.raftEnvelope.wrapInstalledFor(activeRaftDEKID) {
+	if !w.RaftEnvelope.wrapInstalledFor(activeRaftDEKID) {
 		return
 	}
 	reg, ok := writerRegistryForRaftRegistration(defaultGroup)
 	if !ok {
 		return
 	}
-	if markRaftRegistrationIfCommitted(reg, w.raftRegistration, activeRaftDEKID, fullNodeID, w.raftEpoch) {
+	if markRaftRegistrationIfCommitted(reg, w.RaftRegistration, activeRaftDEKID, fullNodeID, w.RaftEpoch) {
 		return
 	}
 	lastSeen, err := registryLastSeen(reg, activeRaftDEKID, fullNodeID)
@@ -224,7 +224,7 @@ func runtimeRaftRegistrationTick(
 			slog.String("error", err.Error()))
 		return
 	}
-	if err := validateRaftRegistrationEpoch(activeRaftDEKID, w.raftEpoch, lastSeen, fullNodeID); err != nil {
+	if err := validateRaftRegistrationEpoch(activeRaftDEKID, w.RaftEpoch, lastSeen, fullNodeID); err != nil {
 		slog.Error("encryption: raft writer registration refused",
 			slog.String("error", err.Error()))
 		return
@@ -232,25 +232,25 @@ func runtimeRaftRegistrationTick(
 	slog.Info("encryption: raft writer registration watcher proposing registration",
 		slog.Uint64("active_raft_dek_id", uint64(activeRaftDEKID)),
 		slog.Uint64("full_node_id", fullNodeID),
-		slog.Uint64("local_epoch", uint64(w.raftEpoch)))
+		slog.Uint64("local_epoch", uint64(w.RaftEpoch)))
 	tickCtx, cancel := context.WithTimeout(ctx, runtimeRegistrationTickTimeout)
 	defer cancel()
 	barrier := make(chan struct{})
-	entry := registrationEntry(activeRaftDEKID, fullNodeID, w.raftEpoch)
-	req := registrationRequest(activeRaftDEKID, fullNodeID, w.raftEpoch)
+	entry := RegistrationEntry(activeRaftDEKID, fullNodeID, w.RaftEpoch)
+	req := RegistrationRequest(activeRaftDEKID, fullNodeID, w.RaftEpoch)
 	verifyRegistered := func() (bool, error) {
-		return registrationCommittedAtEpoch(reg, activeRaftDEKID, fullNodeID, w.raftEpoch)
+		return registrationCommittedAtEpoch(reg, activeRaftDEKID, fullNodeID, w.RaftEpoch)
 	}
 	runWriterRegistrationWithProposer(tickCtx, coordinate, defaultGroup.Proposer(), nil, 0, entry, req, barrier, verifyRegistered,
 		proposeWriterRegistrationBlockingOnCutover)
 	select {
 	case <-barrier:
-		w.raftRegistration.MarkRegistered(activeRaftDEKID, w.raftEpoch)
+		w.RaftRegistration.MarkRegistered(activeRaftDEKID, w.RaftEpoch)
 	default:
 	}
 }
 
-func runtimeRaftRegistrationTarget(sidecarPath string, gate *raftRegistrationGate, raftEpoch uint16) (uint32, bool) {
+func runtimeRaftRegistrationTarget(sidecarPath string, gate *RaftRegistrationGate, raftEpoch uint16) (uint32, bool) {
 	activeRaftDEKID, inScope, err := activeRaftDEKForRegistration(sidecarPath)
 	if err != nil {
 		slog.Warn("encryption: raft writer registration watcher failed to read sidecar; will retry",
@@ -273,7 +273,7 @@ func writerRegistryForRaftRegistration(defaultGroup *kv.ShardGroup) (encryption.
 	return reg, true
 }
 
-func markRaftRegistrationIfCommitted(reg encryption.WriterRegistryStore, gate *raftRegistrationGate, activeRaftDEKID uint32, fullNodeID uint64, raftEpoch uint16) bool {
+func markRaftRegistrationIfCommitted(reg encryption.WriterRegistryStore, gate *RaftRegistrationGate, activeRaftDEKID uint32, fullNodeID uint64, raftEpoch uint16) bool {
 	registered, err := registrationCommittedAtEpoch(reg, activeRaftDEKID, fullNodeID, raftEpoch)
 	if err != nil {
 		slog.Warn("encryption: raft writer registration watcher failed to verify registry row; will retry",
@@ -314,18 +314,18 @@ func validateRaftRegistrationEpoch(activeRaftDEKID uint32, raftEpoch, lastSeen u
 		raftEpoch, lastSeen, activeRaftDEKID, fullNodeID)
 }
 
-// installProcessStartRegistrationGate builds the Stage 7a registration
+// InstallProcessStartRegistrationGate builds the Stage 7a registration
 // gate and wires it onto the coordinator. A registry-read / behind-epoch
 // failure here is a startup fault that MUST fail the process
 // synchronously — before run() brings up the gRPC servers — so writes
 // never serve with no gate installed. The caller returns the error from
 // run() before serving.
-func installProcessStartRegistrationGate(
+func InstallProcessStartRegistrationGate(
 	ctx context.Context,
 	eg *errgroup.Group,
 	coordinate *kv.ShardedCoordinator,
 	defaultGroup *kv.ShardGroup,
-	w encryptionWriteWiring,
+	w WriteWiring,
 	raftID string,
 ) error {
 	gate, err := buildProcessStartRegistrationGate(ctx, eg, coordinate, defaultGroup, w, raftID)
@@ -360,20 +360,20 @@ func buildProcessStartRegistrationGate(
 	eg *errgroup.Group,
 	coordinate *kv.ShardedCoordinator,
 	defaultGroup *kv.ShardGroup,
-	w encryptionWriteWiring,
+	w WriteWiring,
 	raftID string,
 ) (*kv.RegistrationGate, error) {
 	// An empty &RegistrationGate{} (nil Barrier) is the "ungated" state
 	// — awaitRegistration short-circuits on a nil Barrier. Returning it
 	// (rather than a nil gate) keeps the no-error/no-registration
 	// branches free of //nolint:nilnil.
-	if w.cipher == nil || defaultGroup == nil {
+	if w.Cipher == nil || defaultGroup == nil {
 		return &kv.RegistrationGate{}, nil
 	}
-	if !w.cache.StorageEnvelopeActive() {
+	if !w.Cache.StorageEnvelopeActive() {
 		return &kv.RegistrationGate{}, nil // Phase 0: no encrypted writes yet
 	}
-	activeDEK, ok := w.cache.ActiveStorageKeyID()
+	activeDEK, ok := w.Cache.ActiveStorageKeyID()
 	if !ok {
 		return &kv.RegistrationGate{}, nil // not bootstrapped
 	}
@@ -400,7 +400,7 @@ func buildProcessStartRegistrationGate(
 	//     under a recycled (node_id, local_epoch) (codex P1).
 	//   - epoch  > last_seen → propose (the trigger).
 	switch {
-	case w.epoch == lastSeen:
+	case w.Epoch == lastSeen:
 		// Already registered (bootstrap cohort / no-op restart). This
 		// branch returns ungated WITHOUT starting runWriterRegistration,
 		// so it must seed the Stage 7a-2 direct-path gate itself —
@@ -409,21 +409,21 @@ func buildProcessStartRegistrationGate(
 		// with ErrWriterNotRegistered despite a current registry (codex
 		// P1 on PR #843). MarkRegistered is a no-op when activeDEK == 0,
 		// but we are past the not-bootstrapped guard so it is non-zero.
-		w.cache.MarkRegistered(activeDEK)
+		w.Cache.MarkRegistered(activeDEK)
 		slog.Info("encryption: writer registration skipped (already current)",
 			slog.Uint64("dek_id", uint64(activeDEK)),
 			slog.Uint64("full_node_id", fullNodeID),
-			slog.Uint64("local_epoch", uint64(w.epoch)))
+			slog.Uint64("local_epoch", uint64(w.Epoch)))
 		return &kv.RegistrationGate{}, nil
-	case w.epoch < lastSeen:
+	case w.Epoch < lastSeen:
 		return nil, errors.Errorf(
 			"encryption: writer registration: local_epoch %d is behind registry last_seen %d for dek_id %d node %#x (stale sidecar past the §9.1 rollback guard)",
-			w.epoch, lastSeen, activeDEK, fullNodeID)
+			w.Epoch, lastSeen, activeDEK, fullNodeID)
 	}
 
 	barrier := make(chan struct{})
-	entry := registrationEntry(activeDEK, fullNodeID, w.epoch)
-	req := registrationRequest(activeDEK, fullNodeID, w.epoch)
+	entry := RegistrationEntry(activeDEK, fullNodeID, w.Epoch)
+	req := RegistrationRequest(activeDEK, fullNodeID, w.Epoch)
 	// verifyRegistered re-reads the local registry to detect whether
 	// our epoch has actually committed — covers a Propose attempt that
 	// timed out (the waiter was removed) but whose entry Raft still
@@ -440,16 +440,16 @@ func buildProcessStartRegistrationGate(
 	// 7a propose branch, so the strict check is defense-in-depth that
 	// stays consistent with the 7b runtime watcher's verifyRegistered.
 	verifyRegistered := func() (bool, error) {
-		return registrationCommittedAtEpoch(reg, activeDEK, fullNodeID, w.epoch)
+		return registrationCommittedAtEpoch(reg, activeDEK, fullNodeID, w.Epoch)
 	}
 	eg.Go(func() error {
-		runWriterRegistration(ctx, coordinate, defaultGroup.Proposer(), w.cache, activeDEK, entry, req, barrier, verifyRegistered)
+		runWriterRegistration(ctx, coordinate, defaultGroup.Proposer(), w.Cache, activeDEK, entry, req, barrier, verifyRegistered)
 		return nil
 	})
 	return &kv.RegistrationGate{
 		Barrier:               barrier,
-		StorageEnvelopeActive: w.cache.StorageEnvelopeActive,
-		ActiveStorageKeyID:    w.cache.ActiveStorageKeyID,
+		StorageEnvelopeActive: w.Cache.StorageEnvelopeActive,
+		ActiveStorageKeyID:    w.Cache.ActiveStorageKeyID,
 	}, nil
 }
 
@@ -506,9 +506,9 @@ func registrationCommittedAtEpoch(reg encryption.WriterRegistryStore, dekID uint
 	return val.LastSeenLocalEpoch == epoch, nil
 }
 
-// registrationEntry composes the §11.3 0x03 OpRegistration Raft entry
+// RegistrationEntry composes the §11.3 0x03 OpRegistration Raft entry
 // for the local-leader propose path.
-func registrationEntry(dekID uint32, fullNodeID uint64, epoch uint16) []byte {
+func RegistrationEntry(dekID uint32, fullNodeID uint64, epoch uint16) []byte {
 	body := fsmwire.EncodeRegistration(fsmwire.RegistrationPayload{
 		DEKID: dekID, FullNodeID: fullNodeID, LocalEpoch: epoch,
 	})
@@ -517,9 +517,9 @@ func registrationEntry(dekID uint32, fullNodeID uint64, epoch uint16) []byte {
 	return append(entry, body...)
 }
 
-// registrationRequest composes the EncryptionAdmin RPC request for the
+// RegistrationRequest composes the EncryptionAdmin RPC request for the
 // follower-forward path.
-func registrationRequest(dekID uint32, fullNodeID uint64, epoch uint16) *pb.RegisterEncryptionWriterRequest {
+func RegistrationRequest(dekID uint32, fullNodeID uint64, epoch uint16) *pb.RegisterEncryptionWriterRequest {
 	return &pb.RegisterEncryptionWriterRequest{
 		DekId:   dekID,
 		Writers: []*pb.WriterRegistryEntry{{FullNodeId: fullNodeID, LocalEpoch: uint32(epoch)}},
@@ -560,7 +560,7 @@ func runWriterRegistration(
 	verifyRegistered func() (bool, error),
 ) {
 	runWriterRegistrationWithProposer(ctx, coordinate, defaultProposer, cache, dekID, entry, req, barrier, verifyRegistered,
-		proposeWriterRegistration)
+		ProposeWriterRegistration)
 }
 
 type writerRegistrationProposeFunc func(
@@ -657,20 +657,20 @@ type writerRegistrationSource interface {
 
 type writerRegistrationSourceKey struct{}
 
-// withWriterRegistrationSource returns ctx carrying source for the writer
+// WithWriterRegistrationSource returns ctx carrying source for the writer
 // registration paths below.
-func withWriterRegistrationSource(ctx context.Context, source writerRegistrationSource) context.Context {
+func WithWriterRegistrationSource(ctx context.Context, source writerRegistrationSource) context.Context {
 	return context.WithValue(ctx, writerRegistrationSourceKey{}, source)
 }
 
-// writerRegistrationSourceFromContext returns the installed source, or a nil
+// WriterRegistrationSourceFromContext returns the installed source, or a nil
 // interface when none is installed.
-func writerRegistrationSourceFromContext(ctx context.Context) writerRegistrationSource {
+func WriterRegistrationSourceFromContext(ctx context.Context) writerRegistrationSource {
 	source, _ := ctx.Value(writerRegistrationSourceKey{}).(writerRegistrationSource)
 	return source
 }
 
-func proposeWriterRegistration(
+func ProposeWriterRegistration(
 	ctx context.Context,
 	coordinate *kv.ShardedCoordinator,
 	defaultProposer raftengine.Proposer,
@@ -680,7 +680,7 @@ func proposeWriterRegistration(
 ) error {
 	attemptCtx, cancel := context.WithTimeout(ctx, registrationAttemptTimeout)
 	defer cancel()
-	if source := writerRegistrationSourceFromContext(attemptCtx); source != nil {
+	if source := WriterRegistrationSourceFromContext(attemptCtx); source != nil {
 		if err := source.Validate(entry, req); err != nil {
 			return errors.WithStack(err)
 		}
@@ -691,7 +691,7 @@ func proposeWriterRegistration(
 		// the cutover marker itself; using it here could append a
 		// cleartext registration at index > cutover while the raft
 		// wrapper is not installed yet.
-		if source := writerRegistrationSourceFromContext(attemptCtx); source != nil {
+		if source := WriterRegistrationSourceFromContext(attemptCtx); source != nil {
 			return errors.WithStack(source.Propose(attemptCtx, defaultProposer, entry, req))
 		}
 		if _, err := defaultProposer.Propose(attemptCtx, entry); err != nil {
@@ -712,13 +712,13 @@ func proposeWriterRegistrationBlockingOnCutover(
 ) error {
 	attemptCtx, cancel := context.WithTimeout(ctx, registrationAttemptTimeout)
 	defer cancel()
-	if source := writerRegistrationSourceFromContext(attemptCtx); source != nil {
+	if source := WriterRegistrationSourceFromContext(attemptCtx); source != nil {
 		if err := source.Validate(entry, req); err != nil {
 			return errors.WithStack(err)
 		}
 	}
 	if coordinate.IsLeader() {
-		if source := writerRegistrationSourceFromContext(attemptCtx); source != nil {
+		if source := WriterRegistrationSourceFromContext(attemptCtx); source != nil {
 			return errors.WithStack(source.Propose(attemptCtx, defaultProposer, entry, req))
 		}
 		if _, err := defaultProposer.Propose(attemptCtx, entry); err != nil {
@@ -739,7 +739,7 @@ func forwardWriterRegistrationToLeader(
 	if addr == "" {
 		return errors.New("writer registration: no default-group leader known yet")
 	}
-	if source := writerRegistrationSourceFromContext(attemptCtx); source != nil {
+	if source := WriterRegistrationSourceFromContext(attemptCtx); source != nil {
 		return errors.WithStack(source.Forward(attemptCtx, addr, req))
 	}
 	conn, err := connCache.ConnFor(addr)
@@ -752,22 +752,22 @@ func forwardWriterRegistrationToLeader(
 	return nil
 }
 
-// installRuntimeRegistrationWatcher arms the Stage 7b runtime watcher
+// InstallRuntimeRegistrationWatcher arms the Stage 7b runtime watcher
 // from setupDistributionAndRegistration (AFTER installProcessStartRegistrationGate).
 // It captures the boot-time active storage DEK and starts the watcher
 // goroutine under runCtx. A no-op when encryption is not wired.
-func installRuntimeRegistrationWatcher(
+func InstallRuntimeRegistrationWatcher(
 	ctx context.Context,
 	eg *errgroup.Group,
 	coordinate *kv.ShardedCoordinator,
 	defaultGroup *kv.ShardGroup,
-	w encryptionWriteWiring,
+	w WriteWiring,
 	raftID string,
 ) {
 	// Encryption not wired (no cipher → no nonce factory → no direct-path
 	// gate to clear). The 7a-2 storage gate is also un-armed in this
 	// case, so there is nothing the runtime watcher could usefully do.
-	if w.cipher == nil || defaultGroup == nil {
+	if w.Cipher == nil || defaultGroup == nil {
 		return
 	}
 	// Capture the boot-time active DEK once at watcher construction
@@ -776,7 +776,7 @@ func installRuntimeRegistrationWatcher(
 	// value on every tick, NOT a re-read of the current DEK. The cache
 	// reports (0, false) on pre-bootstrap; that 0 is the load-bearing
 	// signal for the bootDEKID==0 branch.
-	bootDEKID, _ := w.cache.ActiveStorageKeyID()
+	bootDEKID, _ := w.Cache.ActiveStorageKeyID()
 	fullNodeID := etcdraftengine.DeriveNodeID(raftID)
 	eg.Go(func() error {
 		runRuntimeRegistrationWatcher(ctx, coordinate, defaultGroup, w, bootDEKID, fullNodeID)
@@ -800,7 +800,7 @@ func runRuntimeRegistrationWatcher(
 	ctx context.Context,
 	coordinate *kv.ShardedCoordinator,
 	defaultGroup *kv.ShardGroup,
-	w encryptionWriteWiring,
+	w WriteWiring,
 	bootDEKID uint32,
 	fullNodeID uint64,
 ) {
@@ -891,11 +891,11 @@ func runtimeRegistrationTick(
 	ctx context.Context,
 	coordinate *kv.ShardedCoordinator,
 	defaultGroup *kv.ShardGroup,
-	w encryptionWriteWiring,
+	w WriteWiring,
 	bootDEKID uint32,
 	fullNodeID uint64,
 ) {
-	activeDEK, inScope := runtimeRegistrationInScope(w.cache)
+	activeDEK, inScope := runtimeRegistrationInScope(w.Cache)
 	if !inScope {
 		return
 	}
@@ -909,7 +909,7 @@ func runtimeRegistrationTick(
 	slog.Info("encryption: 7b runtime watcher proposing registration",
 		slog.Uint64("active_dek_id", uint64(activeDEK)),
 		slog.Uint64("full_node_id", fullNodeID),
-		slog.Uint64("local_epoch", uint64(w.epoch)),
+		slog.Uint64("local_epoch", uint64(w.Epoch)),
 		slog.Uint64("boot_dek_id", uint64(bootDEKID)))
 	reg, err := store.WriterRegistryFor(defaultGroup.Store)
 	if err != nil {
@@ -935,7 +935,7 @@ func runtimeRegistrationTick(
 	// >epoch, which Raft applies via §4.1 case 3 (rollback halt) —
 	// loud, fail-closed, no nonce reuse.
 	verifyRegistered := func() (bool, error) {
-		return registrationCommittedAtEpoch(reg, activeDEK, fullNodeID, w.epoch)
+		return registrationCommittedAtEpoch(reg, activeDEK, fullNodeID, w.Epoch)
 	}
 	// Synchronous propose in this goroutine. The barrier passed to
 	// runWriterRegistration is solely to satisfy its signature; this
@@ -951,9 +951,9 @@ func runtimeRegistrationTick(
 	tickCtx, cancel := context.WithTimeout(ctx, runtimeRegistrationTickTimeout)
 	defer cancel()
 	barrier := make(chan struct{})
-	entry := registrationEntry(activeDEK, fullNodeID, w.epoch)
-	req := registrationRequest(activeDEK, fullNodeID, w.epoch)
-	runWriterRegistration(tickCtx, coordinate, defaultGroup.Proposer(), w.cache, activeDEK,
+	entry := RegistrationEntry(activeDEK, fullNodeID, w.Epoch)
+	req := RegistrationRequest(activeDEK, fullNodeID, w.Epoch)
+	runWriterRegistration(tickCtx, coordinate, defaultGroup.Proposer(), w.Cache, activeDEK,
 		entry, req, barrier, verifyRegistered)
 	// No success-bookkeeping needed: cache.Registered() flips true via
 	// runWriterRegistration's MarkRegistered side effect on the success

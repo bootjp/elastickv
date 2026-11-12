@@ -1,4 +1,4 @@
-package main
+package encryptionwiring
 
 import (
 	"context"
@@ -11,7 +11,7 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-// encryptionFlags configures data-at-rest encryption.
+// Flags configures data-at-rest encryption.
 //
 // sidecarPath gates ONLY the read-only EncryptionAdmin capability surface,
 // which is reachable on every shard's gRPC listener so the §7.1 Phase-0
@@ -38,36 +38,36 @@ import (
 // boot and at DEK bootstrap/rotation per §5.1. With no source the applier's
 // ApplyBootstrap and ApplyRotation paths return ErrKEKNotConfigured at apply
 // time, which the mutator gate masks at the RPC boundary.
-type encryptionFlags struct {
-	sidecarPath     string
-	enabled         bool
-	rotateOnStartup bool
+type Flags struct {
+	SidecarPath     string
+	Enabled         bool
+	RotateOnStartup bool
 	kekFile         string
 	kekURI          string
 }
 
-func (f *encryptionFlags) register(fs *flag.FlagSet) {
-	fs.StringVar(&f.sidecarPath, "encryptionSidecarPath", "", "§5.1 keys.json path; enables read-only EncryptionAdmin capability probing. Mutating RPCs additionally require --encryption-enabled and one loaded KEK source.")
-	fs.BoolVar(&f.enabled, "encryption-enabled", false, "§6.5 opt-in to encryption-mutating EncryptionAdmin RPCs. Requires exactly one KEK source from --kekFile, --kekUri, or ELASTICKV_KEK_BASE64. Default off.")
-	fs.BoolVar(&f.rotateOnStartup, "encryption-rotate-on-startup", false, "§6.5 request a one-shot DEK rotation after this node becomes leader of the default Raft group. Safe for rolling restarts: followers keep the request in memory and only fire if they acquire leadership during this process uptime.")
+func (f *Flags) Register(fs *flag.FlagSet) {
+	fs.StringVar(&f.SidecarPath, "encryptionSidecarPath", "", "§5.1 keys.json path; enables read-only EncryptionAdmin capability probing. Mutating RPCs additionally require --encryption-enabled and one loaded KEK source.")
+	fs.BoolVar(&f.Enabled, "encryption-enabled", false, "§6.5 opt-in to encryption-mutating EncryptionAdmin RPCs. Requires exactly one KEK source from --kekFile, --kekUri, or ELASTICKV_KEK_BASE64. Default off.")
+	fs.BoolVar(&f.RotateOnStartup, "encryption-rotate-on-startup", false, "§6.5 request a one-shot DEK rotation after this node becomes leader of the default Raft group. Safe for rolling restarts: followers keep the request in memory and only fire if they acquire leadership during this process uptime.")
 	fs.StringVar(&f.kekFile, "kekFile", "", "§5.1 KEK file path (32 raw bytes, owner-only mode). When set, the file-backed kek.Wrapper is constructed at startup and threaded into the §6.3 EncryptionApplier so ApplyBootstrap and ApplyRotation can KEK-unwrap.")
 	fs.StringVar(&f.kekURI, "kekUri", "", "§5.1 remote KEK URI: aws-kms://<key-arn>, gcp-kms://<crypto-key-resource>, or vault-transit://<mount>/<key>. Mutually exclusive with --kekFile and ELASTICKV_KEK_BASE64.")
 }
 
 // configured reports whether the operator opted in to encryption or pointed
 // the node at a sidecar.
-func (f encryptionFlags) configured() bool {
-	return f.enabled || f.sidecarPath != ""
+func (f Flags) configured() bool {
+	return f.Enabled || f.SidecarPath != ""
 }
 
-// bootstrapRequest is the part of the encryption flags protected bootstrap
+// BootstrapRequest is the part of the encryption flags protected bootstrap
 // admission depends on.
-func (f encryptionFlags) bootstrapRequest() noderuntime.BootstrapEncryptionRequest {
-	return noderuntime.BootstrapEncryptionRequest{Configured: f.configured(), RotateOnStartup: f.rotateOnStartup}
+func (f Flags) BootstrapRequest() noderuntime.BootstrapEncryptionRequest {
+	return noderuntime.BootstrapEncryptionRequest{Configured: f.configured(), RotateOnStartup: f.RotateOnStartup}
 }
 
-func loadKEKAfterPreNonceStartupGuards(
-	cfg noderuntime.RuntimeConfig, raftID, raftDir string, f encryptionFlags, unwrapObserver monitoring.KEKUnwrapObserver,
+func LoadKEKAfterPreNonceStartupGuards(
+	cfg noderuntime.RuntimeConfig, raftID, raftDir string, f Flags, unwrapObserver monitoring.KEKUnwrapObserver,
 ) (kek.Wrapper, error) {
 	if err := checkEnvelopeCutoverDivergenceBeforeNonceBump(
 		raftID,
@@ -75,8 +75,8 @@ func loadKEKAfterPreNonceStartupGuards(
 		cfg.Groups,
 		cfg.DefaultGroup,
 		cfg.Multi,
-		f.sidecarPath,
-		f.enabled,
+		f.SidecarPath,
+		f.Enabled,
 	); err != nil {
 		return nil, err
 	}
@@ -105,7 +105,7 @@ func loadKEKAfterPreNonceStartupGuards(
 // buildShardGroupsWithEncryptionWiring, still before Raft engine
 // startup; the sidecar-behind-raft-log gap guard remains later
 // because it needs an opened engine's applied index and scanner.
-func loadKEKAndRunStartupGuards(f encryptionFlags, unwrapObserver monitoring.KEKUnwrapObserver) (kek.Wrapper, error) {
+func loadKEKAndRunStartupGuards(f Flags, unwrapObserver monitoring.KEKUnwrapObserver) (kek.Wrapper, error) {
 	kekWrapper, err := loadKEKWrapperFromFlags(f)
 	if err != nil {
 		return nil, err
@@ -127,10 +127,10 @@ func loadKEKAndRunStartupGuards(f encryptionFlags, unwrapObserver monitoring.KEK
 	// elastickv_encryption_kek_unwrap_seconds.
 	kekWrapper = encryption.NewStartupUnwrapCache(kekWrapper)
 	if err := encryption.CheckStartupGuards(encryption.StartupConfig{
-		EncryptionEnabled: f.enabled,
+		EncryptionEnabled: f.Enabled,
 		KEKConfigured:     kekWrapper != nil,
 		KEK:               kekWrapper,
-		SidecarPath:       f.sidecarPath,
+		SidecarPath:       f.SidecarPath,
 	}); err != nil {
 		return nil, errors.Wrap(err, "encryption startup guards refused process start")
 	}
@@ -140,8 +140,8 @@ func loadKEKAndRunStartupGuards(f encryptionFlags, unwrapObserver monitoring.KEK
 	return kekWrapper, nil
 }
 
-func verifyKEKBeforeMutators(f encryptionFlags, wrapper kek.Wrapper) error {
-	if !f.enabled || f.sidecarPath == "" || wrapper == nil {
+func verifyKEKBeforeMutators(f Flags, wrapper kek.Wrapper) error {
+	if !f.Enabled || f.SidecarPath == "" || wrapper == nil {
 		return nil
 	}
 	if err := kek.VerifyWrapper(wrapper); err != nil {
@@ -157,7 +157,7 @@ func verifyKEKBeforeMutators(f encryptionFlags, wrapper kek.Wrapper) error {
 // stays decoupled from the file-mode provider — Stage 9 KMS
 // providers (AWS KMS, GCP KMS, Vault) will satisfy the same
 // interface and slot in without rewriting the dispatch site.
-func loadKEKWrapperFromFlags(f encryptionFlags) (kek.Wrapper, error) {
+func loadKEKWrapperFromFlags(f Flags) (kek.Wrapper, error) {
 	w, err := kek.NewWrapperFromSources(context.Background(), f.kekFile, f.kekURI)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to load KEK source")

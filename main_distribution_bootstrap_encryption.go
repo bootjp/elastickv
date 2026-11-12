@@ -6,6 +6,7 @@ import (
 
 	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/bootjp/elastickv/internal/encryption/kek"
+	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/internal/raftadmission"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
@@ -18,7 +19,7 @@ type bootstrapEncryptionStartupConfig struct {
 	groups       map[uint64]*kv.ShardGroup
 	defaultGroup uint64
 	network      *bootstrapNetwork
-	wiring       encryptionWriteWiring
+	wiring       encryptionwiring.WriteWiring
 	sidecarPath  string
 	wrapper      kek.Wrapper
 	nodeID       uint64
@@ -63,8 +64,8 @@ func configureBootstrapEncryptionStartup(ctx context.Context, cfg bootstrapEncry
 	if err != nil {
 		return nil, nil, err
 	}
-	if !cfg.wiring.cache.StorageEnvelopeActive() {
-		return nil, nil, errors.Wrap(errBootstrapEncryptionUnsupported, "protected encrypted startup requires an already active storage envelope; inactive-key registration is unsupported")
+	if !cfg.wiring.Cache.StorageEnvelopeActive() {
+		return nil, nil, errors.Wrap(encryptionwiring.ErrBootstrapEncryptionUnsupported, "protected encrypted startup requires an already active storage envelope; inactive-key registration is unsupported")
 	}
 	registered, err := withBootstrapRegistration(ctx, cfg.network, cfg.defaultGroup, cfg.nodeID, io.ValidateEpoch)
 	if err != nil {
@@ -99,7 +100,7 @@ func configureBootstrapEncryptionStartup(ctx context.Context, cfg bootstrapEncry
 
 func (cfg bootstrapEncryptionStartupConfig) protectedDomain() (*bootstrapDomain, error) {
 	domain := bootstrapDomainForRuntimes(cfg.runtimes)
-	if domain == nil || cfg.wiring.encryptionConfigured() {
+	if domain == nil || cfg.wiring.EncryptionConfigured() {
 		return domain, nil
 	}
 	if cfg.requested || cfg.sidecarPath != "" {
@@ -152,11 +153,11 @@ func bootstrapEncryptionRecoveryBarrier(domain *bootstrapDomain, rt *raftGroupRu
 	}, nil
 }
 
-func installBootstrapStartupRotation(supervisor *bootstrapRotationRuntime, ctx context.Context, cfg bootstrapEncryptionStartupConfig) (func(), startupRotationWaiter) {
+func installBootstrapStartupRotation(supervisor *bootstrapRotationRuntime, ctx context.Context, cfg bootstrapEncryptionStartupConfig) (func(), encryptionwiring.StartupRotationWaiter) {
 	if supervisor != nil {
-		return func() {}, startupRotationWaiter{wait: supervisor.Wait, blockMutator: func() bool { return !supervisor.config.admission.LocalPermissionReady() }}
+		return func() {}, encryptionwiring.StartupRotationWaiter{WaitFunc: supervisor.Wait, BlockMutator: func() bool { return !supervisor.config.admission.LocalPermissionReady() }}
 	}
 	rt := findDefaultGroupRuntime(cfg.runtimes, cfg.defaultGroup)
-	return installEncryptionRotateOnStartup(ctx, cfg.requested, runtimeCore(rt), postCutoverProposerForRuntime(rt, cfg.groups), cfg.sidecarPath,
-		cfg.wrapper, cfg.wiring.raftEnvelope, cfg.nodeID, cfg.wiring.epoch, cfg.wiring.raftEpoch, slog.Default())
+	return encryptionwiring.InstallRotateOnStartup(ctx, cfg.requested, runtimeCore(rt), postCutoverProposerForRuntime(rt, cfg.groups), cfg.sidecarPath,
+		cfg.wrapper, cfg.wiring.RaftEnvelope, cfg.nodeID, cfg.wiring.Epoch, cfg.wiring.RaftEpoch, slog.Default())
 }

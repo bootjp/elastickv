@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/internal/encryption"
+	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/internal/raftadmission"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -20,7 +21,7 @@ type bootstrapRotationRuntimeConfig struct {
 	group        uint64
 	requested    bool
 	barrier      func(context.Context) (uint64, error)
-	observe      func(context.Context) (bootstrapEncryptionProjection, error)
+	observe      func(context.Context) (encryptionwiring.BootstrapEncryptionProjection, error)
 	plan         func(context.Context) (*bootstrapRotationRecipe, error)
 	planExternal func(context.Context, *pb.RotateDEKRequest) (*bootstrapRotationRecipe, error)
 	authorize    func(*bootstrapRotationRecipe) error
@@ -41,7 +42,7 @@ type bootstrapRotationRuntime struct {
 type bootstrapRotationObservation struct {
 	status     raftadmission.RotationStatus
 	ticket     raftadmission.EncryptionTicket
-	projection bootstrapEncryptionProjection
+	projection encryptionwiring.BootstrapEncryptionProjection
 	receipt    bootstrapRotationReceipt
 	reconciled bool
 	planned    *bootstrapRotationRecipe
@@ -90,10 +91,10 @@ func bootstrapRotationTransient(err error) bool {
 		return false
 	}
 	return errors.Is(err, raftadmission.ErrClosed) || errors.Is(err, raftadmission.ErrStale) ||
-		errors.Is(err, errBootstrapEncryptionProjectionPending) || errors.Is(err, context.Canceled) ||
+		errors.Is(err, encryptionwiring.ErrBootstrapEncryptionProjectionPending) || errors.Is(err, context.Canceled) ||
 		errors.Is(err, context.DeadlineExceeded) || errors.Is(err, kv.ErrTransactionOutcomeUnknown) ||
 		errors.Is(err, raftengine.ErrNotLeader) || errors.Is(err, raftengine.ErrLeadershipLost) ||
-		retryableEncryptionRotateOnStartupError(err)
+		encryptionwiring.RetryableRotateOnStartupError(err)
 }
 
 func bootstrapRotationInvalidEvidence(err error) bool {
@@ -118,7 +119,7 @@ func (r *bootstrapRotationRuntime) step(ctx context.Context) error {
 	if observation.reconciled && observation.receipt.Outcome == bootstrapRotationSuperseded {
 		r.superseded = true
 	}
-	if err := r.config.admission.PublishEncryption(observation.ticket, observation.projection.digest()); err != nil {
+	if err := r.config.admission.PublishEncryption(observation.ticket, observation.projection.Digest()); err != nil {
 		return errors.WithStack(err)
 	}
 	if err := r.resolvePrevious(observation); err != nil {
@@ -198,7 +199,7 @@ func (r *bootstrapRotationRuntime) resolvePrevious(observation bootstrapRotation
 	if state.Recipe != (raftbootstrap.Digest{}) && (!observation.reconciled || observation.receipt.RecipeDigest != state.Recipe) {
 		return errors.Wrap(raftadmission.ErrClosed, "owned rotation outcome still unresolved")
 	}
-	if err := r.config.admission.ResolveRotationResponsibility(observation.ticket, state.Recipe, observation.projection.digest()); err != nil {
+	if err := r.config.admission.ResolveRotationResponsibility(observation.ticket, state.Recipe, observation.projection.Digest()); err != nil {
 		return errors.WithStack(err)
 	}
 	r.restoreAfterResolution(observation.receipt)
@@ -217,12 +218,12 @@ func (r *bootstrapRotationRuntime) restoreAfterResolution(receipt bootstrapRotat
 func (r *bootstrapRotationRuntime) advance(ctx context.Context, observation bootstrapRotationObservation) error {
 	switch observation.status.Native.Role {
 	case raftengine.StateFollower:
-		if err := r.config.admission.PublishFollowerPermission(observation.ticket, observation.projection.digest()); err != nil {
+		if err := r.config.admission.PublishFollowerPermission(observation.ticket, observation.projection.Digest()); err != nil {
 			return errors.WithStack(err)
 		}
 	case raftengine.StateLeader:
 		if r.config.requested || observation.status.Responsibility {
-			if err := r.runLeader(ctx, observation.projection.digest()); err != nil {
+			if err := r.runLeader(ctx, observation.projection.Digest()); err != nil {
 				return err
 			}
 		}

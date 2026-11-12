@@ -6,6 +6,7 @@ import (
 	"time"
 
 	internalutil "github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftadmission"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
@@ -23,7 +24,7 @@ type bootstrapStartupRecoveryEngine struct {
 func TestBootstrapEncryptionStartupInactiveStorageRejectsBeforeWorkers(t *testing.T) {
 	t.Parallel()
 	f := newEncryptionRuntimeIOFixture(t)
-	require.False(t, f.cfg.Wiring.cache.StorageEnvelopeActive())
+	require.False(t, f.cfg.Wiring.Cache.StorageEnvelopeActive())
 	var workers errgroup.Group
 	var cleanup internalutil.CleanupStack
 	_, supervisor, err := configureBootstrapEncryptionStartup(t.Context(), bootstrapEncryptionStartupConfig{
@@ -31,7 +32,7 @@ func TestBootstrapEncryptionStartupInactiveStorageRejectsBeforeWorkers(t *testin
 		network: &bootstrapNetwork{}, wiring: f.cfg.Wiring, sidecarPath: f.cfg.SidecarPath,
 		wrapper: f.cfg.Wrapper, nodeID: f.cfg.NodeID, requested: true, eg: &workers, cleanup: &cleanup,
 	})
-	require.ErrorIs(t, err, errBootstrapEncryptionUnsupported)
+	require.ErrorIs(t, err, encryptionwiring.ErrBootstrapEncryptionUnsupported)
 	require.Nil(t, supervisor)
 	require.NoError(t, workers.Wait(), "unsupported profile must not leave background work")
 	cleanup.Run()

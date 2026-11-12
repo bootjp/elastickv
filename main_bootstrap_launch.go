@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftadmission"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
@@ -42,7 +43,7 @@ func validateProtectedBootstrapDomain(raftID, baseDir string, groups []noderunti
 	return nil
 }
 
-func loadProtectedBootstrapDomain(raftID, baseDir string, groups []noderuntime.GroupSpec, multi bool, bootstrapCfg noderuntime.BootstrapConfig, encWiring ...encryptionWriteWiring) (map[uint64]*groupBootstrapSpec, *bootstrapDomain, error) {
+func loadProtectedBootstrapDomain(raftID, baseDir string, groups []noderuntime.GroupSpec, multi bool, bootstrapCfg noderuntime.BootstrapConfig, encWiring ...encryptionwiring.WriteWiring) (map[uint64]*groupBootstrapSpec, *bootstrapDomain, error) {
 	if bootstrapCfg.PeerConfigDir == "" {
 		return nil, nil, nil
 	}

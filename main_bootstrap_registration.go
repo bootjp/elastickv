@@ -5,6 +5,7 @@ import (
 	"context"
 	"math"
 
+	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/internal/peersession"
 	"github.com/bootjp/elastickv/internal/raftadmission"
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -50,7 +51,7 @@ func withBootstrapRegistration(ctx context.Context, network *bootstrapNetwork, g
 	if !ok || member == 0 || local.local.Member != member {
 		return nil, errors.WithStack(peersession.ErrDenied)
 	}
-	return withWriterRegistrationSource(ctx, &bootstrapRegistrationSource{
+	return encryptionwiring.WithWriterRegistrationSource(ctx, &bootstrapRegistrationSource{
 		network: network, group: group, member: member, validateEpoch: validateEpoch,
 	}), nil
 }
@@ -58,7 +59,7 @@ func withBootstrapRegistration(ctx context.Context, network *bootstrapNetwork, g
 // bootstrapRegistrationFromContext returns the protected-bootstrap source
 // installed by withBootstrapRegistration, or nil.
 func bootstrapRegistrationFromContext(ctx context.Context) *bootstrapRegistrationSource {
-	source, _ := writerRegistrationSourceFromContext(ctx).(*bootstrapRegistrationSource)
+	source, _ := encryptionwiring.WriterRegistrationSourceFromContext(ctx).(*bootstrapRegistrationSource)
 	return source
 }
 
@@ -73,7 +74,7 @@ func (s *bootstrapRegistrationSource) Validate(entry []byte, req *pb.RegisterEnc
 	if err != nil {
 		return err
 	}
-	if !bytes.Equal(entry, registrationEntry(req.GetDekId(), s.member, epoch)) {
+	if !bytes.Equal(entry, encryptionwiring.RegistrationEntry(req.GetDekId(), s.member, epoch)) {
 		return errors.WithStack(peersession.ErrDenied)
 	}
 	return errors.WithStack(s.validateEpoch(req.GetDekId(), epoch))
@@ -127,7 +128,7 @@ func (s *bootstrapRegistrationSource) Forward(ctx context.Context, address strin
 	if err != nil {
 		return err
 	}
-	if err := s.Validate(registrationEntry(req.GetDekId(), s.member, epoch), req); err != nil {
+	if err := s.Validate(encryptionwiring.RegistrationEntry(req.GetDekId(), s.member, epoch), req); err != nil {
 		return err
 	}
 	return s.network.control.Invoke(ctx, s.group, address, pb.EncryptionAdmin_RegisterEncryptionWriter_FullMethodName,
