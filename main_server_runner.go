@@ -67,6 +67,11 @@ type serversInput struct {
 	// wired or the cluster is not bootstrapped, in which case
 	// raftadmin.Server skips the pre-step.
 	encryptionConfChangeInterceptor internalraftadmin.MembershipChangeInterceptor
+	// raftID is this node's Raft ID; the FUSE mount falls back to it as
+	// its lease client ID.
+	raftID        string
+	filesystem    filesystemFlags
+	leaderBalance leaderBalanceFlags
 }
 
 // startServersAfterStartupRotation wires up the AdminServer, starts the

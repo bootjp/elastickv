@@ -20,23 +20,23 @@ import (
 )
 
 func TestConfigureCoordinatorTSORejectsConflictingModes(t *testing.T) {
-	setTSOModeFlags(t, true, true)
+	cfg := testTSOFlags(true, true)
 	coord := newMainTSOCoordinator(kv.NewHLC(), nil)
 
-	_, err := configureCoordinatorTSO(coord, nil)
+	_, err := configureCoordinatorTSO(cfg, coord, nil)
 	require.ErrorContains(t, err, "mutually exclusive")
 }
 
 func TestConfigureCoordinatorTSOShadowRequiresDedicatedGroup(t *testing.T) {
-	setTSOModeFlags(t, false, true)
+	cfg := testTSOFlags(false, true)
 	coord := newMainTSOCoordinator(kv.NewHLC(), nil)
 
-	_, err := configureCoordinatorTSO(coord, nil)
+	_, err := configureCoordinatorTSO(cfg, coord, nil)
 	require.ErrorIs(t, err, kv.ErrTSOGroupRequired)
 }
 
 func TestConfigureCoordinatorTSOCutoverRoutesThroughDedicatedGroup(t *testing.T) {
-	setTSOModeFlags(t, true, false)
+	cfg := testTSOFlags(true, false)
 	clock := kv.NewHLC()
 	clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
 	fsm := kv.NewTSOStateMachine(clock)
@@ -46,7 +46,7 @@ func TestConfigureCoordinatorTSOCutoverRoutesThroughDedicatedGroup(t *testing.T)
 	}
 	coord := newMainTSOCoordinator(clock, groups)
 
-	wiring, err := configureCoordinatorTSO(coord, groups, mainTSOFloorProvider{})
+	wiring, err := configureCoordinatorTSO(cfg, coord, groups, mainTSOFloorProvider{})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, wiring.Close()) })
 	require.NotNil(t, wiring.serverAllocator)
@@ -61,8 +61,8 @@ func TestConfigureCoordinatorTSOCutoverRoutesThroughDedicatedGroup(t *testing.T)
 }
 
 func TestConfigureCoordinatorTSOPhaseDWorksThroughAdapterDecorators(t *testing.T) {
-	setTSOModeFlags(t, true, false)
-	*tsoPhaseDEnabled = true
+	cfg := testTSOFlags(true, false)
+	cfg.phaseDEnabled = true
 	clock := kv.NewHLC()
 	clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
 	fsm := kv.NewTSOStateMachine(clock)
@@ -72,7 +72,7 @@ func TestConfigureCoordinatorTSOPhaseDWorksThroughAdapterDecorators(t *testing.T
 	}
 	coord := newMainTSOCoordinator(clock, groups)
 
-	wiring, err := configureCoordinatorTSO(coord, groups, mainTSOFloorProvider{floor: 42})
+	wiring, err := configureCoordinatorTSO(cfg, coord, groups, mainTSOFloorProvider{floor: 42})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, wiring.Close()) })
 	decorated := kv.WithKeyVizLabel(newStartupGatedCoordinator(coord, nil), keyviz.LabelRedis)
@@ -87,16 +87,16 @@ func TestConfigureCoordinatorTSOPhaseDWorksThroughAdapterDecorators(t *testing.T
 }
 
 func TestConfigureCoordinatorTSOPhaseDRequiresCutoverMode(t *testing.T) {
-	setTSOModeFlags(t, false, false)
-	*tsoPhaseDEnabled = true
+	cfg := testTSOFlags(false, false)
+	cfg.phaseDEnabled = true
 	coord := newMainTSOCoordinator(kv.NewHLC(), nil)
 
-	_, err := configureCoordinatorTSO(coord, nil)
+	_, err := configureCoordinatorTSO(cfg, coord, nil)
 	require.ErrorContains(t, err, "requires --tsoEnabled")
 }
 
 func TestConfigureCoordinatorTSOShadowReturnsLegacyTimestamp(t *testing.T) {
-	setTSOModeFlags(t, false, true)
+	cfg := testTSOFlags(false, true)
 	clock := kv.NewHLC()
 	clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
 	fsm := kv.NewTSOStateMachine(clock)
@@ -106,7 +106,7 @@ func TestConfigureCoordinatorTSOShadowReturnsLegacyTimestamp(t *testing.T) {
 	}
 	coord := newMainTSOCoordinator(clock, groups)
 
-	wiring, err := configureCoordinatorTSO(coord, groups, mainTSOFloorProvider{})
+	wiring, err := configureCoordinatorTSO(cfg, coord, groups, mainTSOFloorProvider{})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, wiring.Close()) })
 
@@ -118,7 +118,7 @@ func TestConfigureCoordinatorTSOShadowReturnsLegacyTimestamp(t *testing.T) {
 }
 
 func TestConfigureCoordinatorTSOExposesDedicatedServerWithoutCutover(t *testing.T) {
-	setTSOModeFlags(t, false, false)
+	cfg := testTSOFlags(false, false)
 	clock := kv.NewHLC()
 	fsm := kv.NewTSOStateMachine(clock)
 	engine := &mainTSOEngine{state: raftengine.StateFollower, tsoState: fsm}
@@ -127,7 +127,7 @@ func TestConfigureCoordinatorTSOExposesDedicatedServerWithoutCutover(t *testing.
 	}
 	coord := newMainTSOCoordinator(clock, groups)
 
-	wiring, err := configureCoordinatorTSO(coord, groups, mainTSOFloorProvider{})
+	wiring, err := configureCoordinatorTSO(cfg, coord, groups, mainTSOFloorProvider{})
 	require.NoError(t, err)
 	require.NotNil(t, wiring.serverAllocator)
 	require.Nil(t, wiring.routedAllocator)
@@ -135,11 +135,11 @@ func TestConfigureCoordinatorTSOExposesDedicatedServerWithoutCutover(t *testing.
 }
 
 func TestConfigureCoordinatorTSORestoresDurableCutoverWithoutFlags(t *testing.T) {
-	setTSOModeFlags(t, false, false)
+	cfg := testTSOFlags(false, false)
 	clock, fsm, engine, groups := newActiveMainTSOCutover(t)
 	coord := newMainTSOCoordinator(clock, groups)
 
-	wiring, err := configureCoordinatorTSO(coord, groups, mainTSOFloorProvider{})
+	wiring, err := configureCoordinatorTSO(cfg, coord, groups, mainTSOFloorProvider{})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, wiring.Close()) })
 	require.NotNil(t, wiring.serverAllocator)
@@ -154,11 +154,11 @@ func TestConfigureCoordinatorTSORestoresDurableCutoverWithoutFlags(t *testing.T)
 }
 
 func TestConfigureCoordinatorTSODurableCutoverOverridesShadowFlag(t *testing.T) {
-	setTSOModeFlags(t, false, true)
+	cfg := testTSOFlags(false, true)
 	clock, fsm, engine, groups := newActiveMainTSOCutover(t)
 	coord := newMainTSOCoordinator(clock, groups)
 
-	wiring, err := configureCoordinatorTSO(coord, groups, mainTSOFloorProvider{})
+	wiring, err := configureCoordinatorTSO(cfg, coord, groups, mainTSOFloorProvider{})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, wiring.Close()) })
 	require.NotNil(t, wiring.routedAllocator)
@@ -230,10 +230,10 @@ func TestInternalTimestampOptionsPreservesForwardObserverThroughStartupGate(t *t
 func TestInternalForwardUsesRuntimeAllocatorAfterModeReload(t *testing.T) {
 	t.Parallel()
 
-	setTSOModeFlags(t, false, false)
+	cfg := testTSOFlags(false, false)
 	path := filepath.Join(t.TempDir(), "tso-mode")
 	require.NoError(t, os.WriteFile(path, []byte("legacy\n"), 0o600))
-	*tsoModeFile = path
+	cfg.modeFile = path
 
 	clock := kv.NewHLC()
 	clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
@@ -243,7 +243,7 @@ func TestInternalForwardUsesRuntimeAllocatorAfterModeReload(t *testing.T) {
 		dedicatedTSORaftGroupID: {Engine: engine, TSOState: fsm},
 	}
 	coord := newMainTSOCoordinator(clock, groups)
-	wiring, err := configureCoordinatorTSO(coord, groups, mainTSOFloorProvider{})
+	wiring, err := configureCoordinatorTSO(cfg, coord, groups, mainTSOFloorProvider{})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, wiring.Close()) })
 	require.Equal(t, kv.TSOModeLegacy, wiring.runtimeController.CurrentMode())
@@ -270,11 +270,11 @@ func TestInternalForwardUsesRuntimeAllocatorAfterModeReload(t *testing.T) {
 }
 
 func TestConfigureCoordinatorTSOModeFileStartsRuntimeController(t *testing.T) {
-	setTSOModeFlags(t, false, false)
+	cfg := testTSOFlags(false, false)
 	path := filepath.Join(t.TempDir(), "tso-mode")
 	require.NoError(t, os.WriteFile(path, []byte("shadow\n"), 0o600))
-	*tsoModeFile = path
-	*tsoModeReloadInterval = time.Millisecond
+	cfg.modeFile = path
+	cfg.modeReloadInterval = time.Millisecond
 	clock := kv.NewHLC()
 	clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
 	fsm := kv.NewTSOStateMachine(clock)
@@ -284,7 +284,7 @@ func TestConfigureCoordinatorTSOModeFileStartsRuntimeController(t *testing.T) {
 	}
 	coord := newMainTSOCoordinator(clock, groups)
 
-	wiring, err := configureCoordinatorTSO(coord, groups, mainTSOFloorProvider{})
+	wiring, err := configureCoordinatorTSO(cfg, coord, groups, mainTSOFloorProvider{})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, wiring.Close()) })
 	require.NotNil(t, wiring.runtimeController)
@@ -294,13 +294,13 @@ func TestConfigureCoordinatorTSOModeFileStartsRuntimeController(t *testing.T) {
 }
 
 func TestConfigureCoordinatorTSOModeFileRequiresDedicatedGroup(t *testing.T) {
-	setTSOModeFlags(t, false, false)
+	cfg := testTSOFlags(false, false)
 	path := filepath.Join(t.TempDir(), "tso-mode")
 	require.NoError(t, os.WriteFile(path, []byte("legacy\n"), 0o600))
-	*tsoModeFile = path
+	cfg.modeFile = path
 	coord := newMainTSOCoordinator(kv.NewHLC(), nil)
 
-	_, err := configureCoordinatorTSO(coord, nil)
+	_, err := configureCoordinatorTSO(cfg, coord, nil)
 	require.ErrorIs(t, err, kv.ErrTSOGroupRequired)
 }
 
@@ -320,37 +320,14 @@ func newActiveMainTSOCutover(t *testing.T) (*kv.HLC, *kv.TSOStateMachine, *mainT
 	return clock, fsm, engine, map[uint64]*kv.ShardGroup{dedicatedTSORaftGroupID: group}
 }
 
-// setTSOModeFlags overwrites process-global flag values for the duration of one
-// test.
-//
-// A caller must therefore NOT be parallel. Go runs sequential tests to
-// completion before the parallel ones resume, so a single parallel caller is
-// safe on its own -- but the moment a second one exists the two overwrite each
-// other's flags and -race reports it, which is what happened when
-// TestCoordinatorTSOWiringAuthorizeActivation was first written with
-// t.Parallel(). Every other caller in this file is sequential.
-func setTSOModeFlags(t *testing.T, enabled, shadow bool) {
-	t.Helper()
-	oldEnabled := *tsoEnabled
-	oldShadow := *tsoShadowEnabled
-	oldPhaseD := *tsoPhaseDEnabled
-	oldBatchSize := *tsoBatchSize
-	oldModeFile := *tsoModeFile
-	oldReloadInterval := *tsoModeReloadInterval
-	*tsoEnabled = enabled
-	*tsoShadowEnabled = shadow
-	*tsoPhaseDEnabled = false
-	*tsoBatchSize = 8
-	*tsoModeFile = ""
-	*tsoModeReloadInterval = defaultTSOReload
-	t.Cleanup(func() {
-		*tsoEnabled = oldEnabled
-		*tsoShadowEnabled = oldShadow
-		*tsoPhaseDEnabled = oldPhaseD
-		*tsoBatchSize = oldBatchSize
-		*tsoModeFile = oldModeFile
-		*tsoModeReloadInterval = oldReloadInterval
-	})
+// testTSOFlags returns the registered TSO flag defaults with the given
+// legacy stage and a small batch size.
+func testTSOFlags(enabled, shadow bool) tsoFlags {
+	f := defaultFlags[tsoFlags]()
+	f.enabled = enabled
+	f.shadowEnabled = shadow
+	f.batchSize = 8
+	return f
 }
 
 func newMainTSOCoordinator(clock *kv.HLC, groups map[uint64]*kv.ShardGroup) *kv.ShardedCoordinator {
@@ -466,7 +443,7 @@ func (e *mainTSOEngine) Close() error { return nil }
 // is a follower here and the data group is the leader, so the pinned and
 // unpinned answers differ.
 func TestConfigureCoordinatorTSOLegacyDoesNotPinTimestampGroup(t *testing.T) {
-	setTSOModeFlags(t, false, false)
+	cfg := testTSOFlags(false, false)
 	clock := kv.NewHLC()
 	clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
 	fsm := kv.NewTSOStateMachine(clock)
@@ -479,7 +456,7 @@ func TestConfigureCoordinatorTSOLegacyDoesNotPinTimestampGroup(t *testing.T) {
 	}
 	coord := newMainTSOCoordinator(clock, groups)
 
-	wiring, err := configureCoordinatorTSO(coord, groups, mainTSOFloorProvider{})
+	wiring, err := configureCoordinatorTSO(cfg, coord, groups, mainTSOFloorProvider{})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, wiring.Close()) })
 
@@ -491,10 +468,10 @@ func TestConfigureCoordinatorTSOLegacyDoesNotPinTimestampGroup(t *testing.T) {
 }
 
 func TestConfigureCoordinatorTSOModeFileLegacyDoesNotPinTimestampGroup(t *testing.T) {
-	setTSOModeFlags(t, false, false)
+	cfg := testTSOFlags(false, false)
 	path := filepath.Join(t.TempDir(), "tso-mode")
 	require.NoError(t, os.WriteFile(path, []byte("legacy\n"), 0o600))
-	*tsoModeFile = path
+	cfg.modeFile = path
 
 	clock := kv.NewHLC()
 	clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
@@ -508,7 +485,7 @@ func TestConfigureCoordinatorTSOModeFileLegacyDoesNotPinTimestampGroup(t *testin
 	}
 	coord := newMainTSOCoordinator(clock, groups)
 
-	wiring, err := configureCoordinatorTSO(coord, groups, mainTSOFloorProvider{})
+	wiring, err := configureCoordinatorTSO(cfg, coord, groups, mainTSOFloorProvider{})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, wiring.Close()) })
 
@@ -527,7 +504,7 @@ func TestConfigureCoordinatorTSOModeFileLegacyDoesNotPinTimestampGroup(t *testin
 
 // Once the dedicated allocator is actually required, the pin must apply.
 func TestConfigureCoordinatorTSOCutoverPinsTimestampGroup(t *testing.T) {
-	setTSOModeFlags(t, true, false)
+	cfg := testTSOFlags(true, false)
 	clock := kv.NewHLC()
 	clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
 	fsm := kv.NewTSOStateMachine(clock)
@@ -540,7 +517,7 @@ func TestConfigureCoordinatorTSOCutoverPinsTimestampGroup(t *testing.T) {
 	}
 	coord := newMainTSOCoordinator(clock, groups)
 
-	wiring, err := configureCoordinatorTSO(coord, groups, mainTSOFloorProvider{})
+	wiring, err := configureCoordinatorTSO(cfg, coord, groups, mainTSOFloorProvider{})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, wiring.Close()) })
 
@@ -605,13 +582,17 @@ func TestInternalTimestampOptionsPreservesPhaseDValidatorThroughStartupGate(t *t
 
 // The activation gate answers from this node's own runtime mode, so a caller
 // cannot drive the group-0 leader past the stage the operator configured.
-// Not parallel: setTSOModeFlags mutates process-global flags.
 func TestCoordinatorTSOWiringAuthorizeActivation(t *testing.T) {
 	// No dedicated TSO runtime at all: nothing to authorize against.
 	var bare coordinatorTSOWiring
 	require.NoError(t, bare.authorizeActivation(false, false))
 	require.Error(t, bare.authorizeActivation(true, false))
 	require.Error(t, bare.authorizeActivation(true, true))
+
+	cfg := testTSOFlags(false, false)
+	path := filepath.Join(t.TempDir(), "tso-mode")
+	require.NoError(t, os.WriteFile(path, []byte("legacy\n"), 0o600))
+	cfg.modeFile = path
 
 	newWiring := func(t *testing.T, mode kv.TSOMode) coordinatorTSOWiring {
 		t.Helper()
@@ -623,7 +604,7 @@ func TestCoordinatorTSOWiringAuthorizeActivation(t *testing.T) {
 			dedicatedTSORaftGroupID: {Engine: engine, TSOState: fsm},
 		}
 		coord := newMainTSOCoordinator(clock, groups)
-		wiring, err := configureCoordinatorTSO(coord, groups, mainTSOFloorProvider{})
+		wiring, err := configureCoordinatorTSO(cfg, coord, groups, mainTSOFloorProvider{})
 		require.NoError(t, err)
 		t.Cleanup(func() { require.NoError(t, wiring.Close()) })
 		for next := kv.TSOModeShadow; next <= mode; next++ {
@@ -631,11 +612,6 @@ func TestCoordinatorTSOWiringAuthorizeActivation(t *testing.T) {
 		}
 		return wiring
 	}
-
-	setTSOModeFlags(t, false, false)
-	path := filepath.Join(t.TempDir(), "tso-mode")
-	require.NoError(t, os.WriteFile(path, []byte("legacy\n"), 0o600))
-	*tsoModeFile = path
 
 	legacy := newWiring(t, kv.TSOModeLegacy)
 	require.Error(t, legacy.authorizeActivation(true, false), "legacy mode may not activate cutover")
@@ -657,7 +633,7 @@ func TestCoordinatorTSOWiringAuthorizeActivation(t *testing.T) {
 // another leader committed answers PermissionDenied -- stalling allocation
 // cluster-wide. A stub that happens to implement both cannot catch that.
 func TestServerAllocatorExposesDurableMarkerState(t *testing.T) {
-	setTSOModeFlags(t, false, false)
+	cfg := testTSOFlags(false, false)
 
 	clock := kv.NewHLC()
 	clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
@@ -667,7 +643,7 @@ func TestServerAllocatorExposesDurableMarkerState(t *testing.T) {
 		dedicatedTSORaftGroupID: {Engine: engine, TSOState: fsm},
 	}
 	coord := newMainTSOCoordinator(clock, groups)
-	wiring, err := configureCoordinatorTSO(coord, groups, mainTSOFloorProvider{})
+	wiring, err := configureCoordinatorTSO(cfg, coord, groups, mainTSOFloorProvider{})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, wiring.Close()) })
 	require.NotNil(t, wiring.serverAllocator)

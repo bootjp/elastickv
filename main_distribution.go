@@ -47,7 +47,8 @@ type distributionStartupInput struct {
 	tsoWiring       coordinatorTSOWiring
 	// shardGroups feeds the split-migration promotion/voter factories, which
 	// resolve per-group leaders rather than going through the coordinator.
-	shardGroups map[uint64]*kv.ShardGroup
+	shardGroups     map[uint64]*kv.ShardGroup
+	snapshotOffload snapshotOffloadFlags
 }
 
 type distributionStartup struct {
@@ -163,7 +164,7 @@ func startDistributionStartup(in distributionStartupInput) (distributionStartup,
 	// destination and silently got no backups is worse off than one
 	// whose node refused to start.
 	if err := startSnapshotOffload(
-		in.ctx, in.eg, in.runtimes, *raftDir, in.raftID, in.cfg.multi,
+		in.ctx, in.eg, in.snapshotOffload, in.runtimes, *raftDir, in.raftID, in.cfg.multi,
 		in.metricsRegistry.SnapshotOffloadObserver(), slog.Default(),
 	); err != nil {
 		in.cancel()

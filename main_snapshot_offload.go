@@ -32,45 +32,65 @@ const (
 // The design requires that only a group's current leader publishes, so
 // each group contributes both a cheap pre-check and a pre-commit
 // leadership re-verification; the scheduler bounds the latter itself.
-var (
-	snapshotOffloadBucket = flag.String("snapshotOffloadBucket", "",
-		"S3 bucket for physical snapshot offload; empty to disable")
-	snapshotOffloadLocalDir = flag.String("snapshotOffloadLocalDir", "",
-		"filesystem root for physical snapshot offload; an alternative to --snapshotOffloadBucket, mainly for testing")
-	snapshotOffloadPrefix = flag.String("snapshotOffloadPrefix", "",
-		"key prefix below which snapshot artifacts are written")
-	snapshotOffloadRegion = flag.String("snapshotOffloadRegion", "",
-		"AWS region for the snapshot offload bucket")
-	snapshotOffloadEndpoint = flag.String("snapshotOffloadEndpoint", "",
-		"custom S3 endpoint for snapshot offload; empty uses the AWS default")
-	snapshotOffloadProfile = flag.String("snapshotOffloadProfile", "",
-		"shared-credentials profile for snapshot offload")
-	snapshotOffloadForcePathStyle = flag.Bool("snapshotOffloadForcePathStyle", false,
-		"use path-style addressing for the snapshot offload endpoint")
-	snapshotOffloadSSE = flag.String("snapshotOffloadServerSideEncryption", "",
-		"server-side encryption mode for snapshot objects (AES256 or aws:kms)")
-	snapshotOffloadSSEKMSKeyID = flag.String("snapshotOffloadSSEKMSKeyId", "",
-		"KMS key ARN when --snapshotOffloadServerSideEncryption is aws:kms")
-	snapshotOffloadInterval = flag.Duration("snapshotOffloadInterval", snapshotoffload.DefaultSchedulerInterval,
-		"how often to scan local groups for a publishable snapshot")
-	snapshotOffloadJitter = flag.Duration("snapshotOffloadJitter", 0,
-		"random spread applied to the offload schedule; zero uses a quarter of the interval")
-	snapshotOffloadConcurrency = flag.Int("snapshotOffloadConcurrency", snapshotoffload.DefaultSchedulerConcurrency,
-		"maximum concurrent snapshot uploads for this process")
-	snapshotOffloadPublishTimeout = flag.Duration("snapshotOffloadPublishTimeout", snapshotoffload.DefaultSchedulerPublishTimeout,
-		"deadline for each physical snapshot publication")
-	snapshotOffloadSpoolDir = flag.String("snapshotOffloadSpoolDir", "",
-		"directory for snapshot spool files; empty uses the data dir's filesystem")
-	snapshotOffloadSourceCluster = flag.String("snapshotOffloadSourceCluster", "",
-		"source cluster identity recorded in every manifest; required when offload is enabled")
-)
+type snapshotOffloadFlags struct {
+	bucket         string
+	localDir       string
+	prefix         string
+	region         string
+	endpoint       string
+	profile        string
+	forcePathStyle bool
+	sse            string
+	sseKMSKeyID    string
+	interval       time.Duration
+	jitter         time.Duration
+	concurrency    int
+	publishTimeout time.Duration
+	spoolDir       string
+	sourceCluster  string
+	// allowInsecureEndpoint is the narrow development opt-in for a
+	// plaintext offload endpoint. Off by default, and named so it cannot
+	// be mistaken for a tuning knob.
+	allowInsecureEndpoint bool
+	retention             snapshotRetentionFlags
+}
 
-// snapshotOffloadAllowInsecureEndpoint is the narrow development opt-in for a
-// plaintext offload endpoint. Off by default, and named so it cannot be
-// mistaken for a tuning knob.
-var snapshotOffloadAllowInsecureEndpoint = flag.Bool("snapshotOffloadAllowInsecureEndpoint", false,
-	"allow a plaintext http:// --snapshotOffloadEndpoint. DEVELOPMENT ONLY: snapshot "+
-		"payloads and session credentials would cross the network unencrypted.")
+func (f *snapshotOffloadFlags) register(fs *flag.FlagSet) {
+	fs.StringVar(&f.bucket, "snapshotOffloadBucket", "",
+		"S3 bucket for physical snapshot offload; empty to disable")
+	fs.StringVar(&f.localDir, "snapshotOffloadLocalDir", "",
+		"filesystem root for physical snapshot offload; an alternative to --snapshotOffloadBucket, mainly for testing")
+	fs.StringVar(&f.prefix, "snapshotOffloadPrefix", "",
+		"key prefix below which snapshot artifacts are written")
+	fs.StringVar(&f.region, "snapshotOffloadRegion", "",
+		"AWS region for the snapshot offload bucket")
+	fs.StringVar(&f.endpoint, "snapshotOffloadEndpoint", "",
+		"custom S3 endpoint for snapshot offload; empty uses the AWS default")
+	fs.StringVar(&f.profile, "snapshotOffloadProfile", "",
+		"shared-credentials profile for snapshot offload")
+	fs.BoolVar(&f.forcePathStyle, "snapshotOffloadForcePathStyle", false,
+		"use path-style addressing for the snapshot offload endpoint")
+	fs.StringVar(&f.sse, "snapshotOffloadServerSideEncryption", "",
+		"server-side encryption mode for snapshot objects (AES256 or aws:kms)")
+	fs.StringVar(&f.sseKMSKeyID, "snapshotOffloadSSEKMSKeyId", "",
+		"KMS key ARN when --snapshotOffloadServerSideEncryption is aws:kms")
+	fs.DurationVar(&f.interval, "snapshotOffloadInterval", snapshotoffload.DefaultSchedulerInterval,
+		"how often to scan local groups for a publishable snapshot")
+	fs.DurationVar(&f.jitter, "snapshotOffloadJitter", 0,
+		"random spread applied to the offload schedule; zero uses a quarter of the interval")
+	fs.IntVar(&f.concurrency, "snapshotOffloadConcurrency", snapshotoffload.DefaultSchedulerConcurrency,
+		"maximum concurrent snapshot uploads for this process")
+	fs.DurationVar(&f.publishTimeout, "snapshotOffloadPublishTimeout", snapshotoffload.DefaultSchedulerPublishTimeout,
+		"deadline for each physical snapshot publication")
+	fs.StringVar(&f.spoolDir, "snapshotOffloadSpoolDir", "",
+		"directory for snapshot spool files; empty uses the data dir's filesystem")
+	fs.StringVar(&f.sourceCluster, "snapshotOffloadSourceCluster", "",
+		"source cluster identity recorded in every manifest; required when offload is enabled")
+	fs.BoolVar(&f.allowInsecureEndpoint, "snapshotOffloadAllowInsecureEndpoint", false,
+		"allow a plaintext http:// --snapshotOffloadEndpoint. DEVELOPMENT ONLY: snapshot "+
+			"payloads and session credentials would cross the network unencrypted.")
+	f.retention.register(fs)
+}
 
 // rejectPlaintextOffloadEndpoint refuses an http:// endpoint unless the
 // operator explicitly opted in.
@@ -80,8 +100,8 @@ var snapshotOffloadAllowInsecureEndpoint = flag.Bool("snapshotOffloadAllowInsecu
 // to write them. An endpoint that silently downgraded to plaintext is the kind
 // of misconfiguration that is invisible until someone captures the traffic, so
 // it fails startup instead.
-func rejectPlaintextOffloadEndpoint() error {
-	endpoint := strings.TrimSpace(*snapshotOffloadEndpoint)
+func rejectPlaintextOffloadEndpoint(f snapshotOffloadFlags) error {
+	endpoint := strings.TrimSpace(f.endpoint)
 	if endpoint == "" {
 		return nil
 	}
@@ -92,7 +112,7 @@ func rejectPlaintextOffloadEndpoint() error {
 	// A scheme-less host:port is ambiguous rather than known-plaintext, but
 	// the AWS SDK resolves it as http, so it is refused too.
 	allowedScheme := strings.EqualFold(parsed.Scheme, "https") ||
-		(*snapshotOffloadAllowInsecureEndpoint && strings.EqualFold(parsed.Scheme, "http"))
+		(f.allowInsecureEndpoint && strings.EqualFold(parsed.Scheme, "http"))
 	if !allowedScheme || parsed.Hostname() == "" || parsed.Opaque != "" {
 		return errors.Wrapf(snapshotoffload.ErrInvalidOptions,
 			"--snapshotOffloadEndpoint %q is not a valid https URL; snapshot payloads and credentials "+
@@ -103,7 +123,7 @@ func rejectPlaintextOffloadEndpoint() error {
 	return nil
 }
 
-func snapshotOffloadHTTPClient(base aws.HTTPClient) (aws.HTTPClient, error) {
+func snapshotOffloadHTTPClient(base aws.HTTPClient, allowInsecure bool) (aws.HTTPClient, error) {
 	var client http.Client
 	switch resolved := base.(type) {
 	case nil:
@@ -121,7 +141,6 @@ func snapshotOffloadHTTPClient(base aws.HTTPClient) (aws.HTTPClient, error) {
 	if transport == nil {
 		transport = http.DefaultTransport
 	}
-	allowInsecure := *snapshotOffloadAllowInsecureEndpoint
 	client.Transport = snapshotOffloadHTTPSTransport{next: transport, allowInsecure: allowInsecure}
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		return checkSnapshotOffloadRedirect(req, via, allowInsecure)
@@ -190,8 +209,8 @@ func validateSnapshotOffloadPrefix(prefix string) error {
 	return nil
 }
 
-func validateSnapshotOffloadSpoolDir() error {
-	dir := strings.TrimSpace(*snapshotOffloadSpoolDir)
+func validateSnapshotOffloadSpoolDir(f snapshotOffloadFlags) error {
+	dir := strings.TrimSpace(f.spoolDir)
 	if dir == "" {
 		return nil
 	}
@@ -212,9 +231,9 @@ func validateSnapshotOffloadSpoolDir() error {
 // snapshotOffloadEnabled reports whether the operator configured a
 // destination. Checked before any other offload flag is validated so a
 // node that never opts in cannot fail startup on offload config.
-func snapshotOffloadEnabled() bool {
-	return strings.TrimSpace(*snapshotOffloadBucket) != "" ||
-		strings.TrimSpace(*snapshotOffloadLocalDir) != ""
+func snapshotOffloadEnabled(f snapshotOffloadFlags) bool {
+	return strings.TrimSpace(f.bucket) != "" ||
+		strings.TrimSpace(f.localDir) != ""
 }
 
 // buildSnapshotOffloadStore constructs the configured object store.
@@ -223,9 +242,9 @@ func snapshotOffloadEnabled() bool {
 // leave which destination actually receives the artifacts ambiguous,
 // and a backup written to the wrong place is discovered only when a
 // restore is attempted.
-func buildSnapshotOffloadStore(ctx context.Context) (snapshotOffloadStore, error) {
-	bucket := strings.TrimSpace(*snapshotOffloadBucket)
-	localDir := strings.TrimSpace(*snapshotOffloadLocalDir)
+func buildSnapshotOffloadStore(ctx context.Context, f snapshotOffloadFlags) (snapshotOffloadStore, error) {
+	bucket := strings.TrimSpace(f.bucket)
+	localDir := strings.TrimSpace(f.localDir)
 	if bucket != "" && localDir != "" {
 		return nil, errors.Wrap(snapshotoffload.ErrInvalidOptions,
 			"--snapshotOffloadBucket and --snapshotOffloadLocalDir are mutually exclusive")
@@ -237,19 +256,21 @@ func buildSnapshotOffloadStore(ctx context.Context) (snapshotOffloadStore, error
 		}
 		return store, nil
 	}
-	if err := rejectPlaintextOffloadEndpoint(); err != nil {
+	if err := rejectPlaintextOffloadEndpoint(f); err != nil {
 		return nil, err
 	}
 	store, err := snapshotoffload.NewS3Store(ctx, snapshotoffload.S3StoreConfig{
-		Bucket:                            bucket,
-		Region:                            strings.TrimSpace(*snapshotOffloadRegion),
-		Endpoint:                          strings.TrimSpace(*snapshotOffloadEndpoint),
-		Profile:                           strings.TrimSpace(*snapshotOffloadProfile),
-		ForcePathStyle:                    *snapshotOffloadForcePathStyle,
-		ServerSideEncryption:              strings.TrimSpace(*snapshotOffloadSSE),
-		SSEKMSKeyID:                       strings.TrimSpace(*snapshotOffloadSSEKMSKeyID),
-		HTTPClientDecorator:               snapshotOffloadHTTPClient,
-		AllowVersionedBucketWithLifecycle: *snapshotOffloadAllowVersionedLifecycle,
+		Bucket:               bucket,
+		Region:               strings.TrimSpace(f.region),
+		Endpoint:             strings.TrimSpace(f.endpoint),
+		Profile:              strings.TrimSpace(f.profile),
+		ForcePathStyle:       f.forcePathStyle,
+		ServerSideEncryption: strings.TrimSpace(f.sse),
+		SSEKMSKeyID:          strings.TrimSpace(f.sseKMSKeyID),
+		HTTPClientDecorator: func(base aws.HTTPClient) (aws.HTTPClient, error) {
+			return snapshotOffloadHTTPClient(base, f.allowInsecureEndpoint)
+		},
+		AllowVersionedBucketWithLifecycle: f.retention.allowVersionedLifecycle,
 	})
 	if err != nil {
 		return nil, errors.Wrap(err, "snapshot offload: s3 store")
@@ -263,12 +284,13 @@ func buildSnapshotOffloadStore(ctx context.Context) (snapshotOffloadStore, error
 // Files younger than snapshotOffloadStaleSpoolAge may belong to another
 // process sharing the configured spool directory and are left untouched.
 func cleanStaleOffloadSpool(
+	f snapshotOffloadFlags,
 	runtimes []*raftGroupRuntime,
 	raftDir, raftID string,
 	multi bool,
 	logger *slog.Logger,
 ) {
-	configured := strings.TrimSpace(*snapshotOffloadSpoolDir)
+	configured := strings.TrimSpace(f.spoolDir)
 	seen := make(map[string]struct{})
 	cutoff := time.Now().Add(-snapshotOffloadStaleSpoolAge)
 	for _, group := range snapshotOffloadGroups(runtimes, raftDir, raftID, multi) {
@@ -345,25 +367,26 @@ func snapshotOffloadVerifyLeader(rt *raftGroupRuntime) func(context.Context) err
 func startSnapshotOffload(
 	ctx context.Context,
 	eg *errgroup.Group,
+	f snapshotOffloadFlags,
 	runtimes []*raftGroupRuntime,
 	raftDir, raftID string,
 	multi bool,
 	observer snapshotoffload.SchedulerObserver,
 	logger *slog.Logger,
 ) (retErr error) {
-	if *snapshotOffloadGCEnabled && !snapshotOffloadEnabled() {
+	if f.retention.enabled && !snapshotOffloadEnabled(f) {
 		return errors.Wrap(snapshotoffload.ErrInvalidOptions, "snapshot retention requires an offload destination")
 	}
-	if !snapshotOffloadEnabled() {
+	if !snapshotOffloadEnabled(f) {
 		return nil
 	}
-	if err := validateSnapshotOffloadPrefix(*snapshotOffloadPrefix); err != nil {
+	if err := validateSnapshotOffloadPrefix(f.prefix); err != nil {
 		return err
 	}
-	if err := validateSnapshotOffloadSpoolDir(); err != nil {
+	if err := validateSnapshotOffloadSpoolDir(f); err != nil {
 		return err
 	}
-	store, err := buildSnapshotOffloadStore(ctx)
+	store, err := buildSnapshotOffloadStore(ctx, f)
 	if err != nil {
 		return err
 	}
@@ -377,26 +400,26 @@ func startSnapshotOffload(
 	scheduler, err := snapshotoffload.NewScheduler(
 		store,
 		snapshotOffloadGroups(runtimes, raftDir, raftID, multi),
-		strings.TrimSpace(*snapshotOffloadPrefix),
-		strings.TrimSpace(*snapshotOffloadSourceCluster),
+		strings.TrimSpace(f.prefix),
+		strings.TrimSpace(f.sourceCluster),
 		buildVersion(),
-		snapshotOffloadSchedulerOptions(observer, logger)...,
+		snapshotOffloadSchedulerOptions(f, observer, logger)...,
 	)
 	if err != nil {
 		return errors.Wrap(err, "snapshot offload: scheduler")
 	}
-	retention, err := buildSnapshotOffloadRetention(ctx, store, logger)
+	retention, err := buildSnapshotOffloadRetention(ctx, f, store, logger)
 	if err != nil {
 		return err
 	}
 
 	// Clean only aged leftovers before starting this process's publishers.
-	cleanStaleOffloadSpool(runtimes, raftDir, raftID, multi, logger)
+	cleanStaleOffloadSpool(f, runtimes, raftDir, raftID, multi, logger)
 
 	logger.Info("snapshot offload enabled",
 		slog.Int("groups", len(runtimes)),
-		slog.Duration("interval", *snapshotOffloadInterval),
-		slog.Int("concurrency", *snapshotOffloadConcurrency))
+		slog.Duration("interval", f.interval),
+		slog.Int("concurrency", f.concurrency))
 
 	eg.Go(func() error {
 		// Run returns only on context cancellation; a failing group is
@@ -408,18 +431,18 @@ func startSnapshotOffload(
 	return nil
 }
 
-func snapshotOffloadSchedulerOptions(observer snapshotoffload.SchedulerObserver, logger *slog.Logger) []snapshotoffload.SchedulerOption {
+func snapshotOffloadSchedulerOptions(f snapshotOffloadFlags, observer snapshotoffload.SchedulerObserver, logger *slog.Logger) []snapshotoffload.SchedulerOption {
 	opts := []snapshotoffload.SchedulerOption{
-		snapshotoffload.WithSchedulerInterval(*snapshotOffloadInterval),
-		snapshotoffload.WithSchedulerConcurrency(*snapshotOffloadConcurrency),
-		snapshotoffload.WithSchedulerPublishTimeout(*snapshotOffloadPublishTimeout),
+		snapshotoffload.WithSchedulerInterval(f.interval),
+		snapshotoffload.WithSchedulerConcurrency(f.concurrency),
+		snapshotoffload.WithSchedulerPublishTimeout(f.publishTimeout),
 		snapshotoffload.WithSchedulerObserver(observer),
 		snapshotoffload.WithSchedulerLogger(logger),
 	}
-	if *snapshotOffloadJitter > 0 {
-		opts = append(opts, snapshotoffload.WithSchedulerJitter(*snapshotOffloadJitter))
+	if f.jitter > 0 {
+		opts = append(opts, snapshotoffload.WithSchedulerJitter(f.jitter))
 	}
-	if dir := strings.TrimSpace(*snapshotOffloadSpoolDir); dir != "" {
+	if dir := strings.TrimSpace(f.spoolDir); dir != "" {
 		opts = append(opts, snapshotoffload.WithSchedulerSpoolDir(dir))
 	}
 	return opts

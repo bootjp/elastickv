@@ -10,17 +10,6 @@ import (
 )
 
 func TestFilesystemStartConfigFromFlags(t *testing.T) {
-	oldMount, oldClientID, oldRaftID := *filesystemMount, *filesystemClientID, *raftId
-	oldStrict := *filesystemStrict
-	oldStrictRecover := *filesystemStrictRecover
-	oldMode, oldUID, oldGID := *filesystemRootMode, *filesystemRootUID, *filesystemRootGID
-	t.Cleanup(func() {
-		*filesystemMount, *filesystemClientID, *raftId = oldMount, oldClientID, oldRaftID
-		*filesystemStrict = oldStrict
-		*filesystemStrictRecover = oldStrictRecover
-		*filesystemRootMode, *filesystemRootUID, *filesystemRootGID = oldMode, oldUID, oldGID
-	})
-
 	tests := []struct {
 		name          string
 		mount         string
@@ -106,12 +95,12 @@ func TestFilesystemStartConfigFromFlags(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			*filesystemMount, *filesystemClientID, *raftId = tt.mount, tt.clientID, tt.raftID
-			*filesystemStrict = tt.strict
-			*filesystemStrictRecover = tt.strictRecover
-			*filesystemRootMode, *filesystemRootUID, *filesystemRootGID = tt.mode, tt.uid, tt.gid
+			f := defaultFlags[filesystemFlags]()
+			f.mount, f.clientID = tt.mount, tt.clientID
+			f.strict, f.strictRecover = tt.strict, tt.strictRecover
+			f.rootMode, f.rootUID, f.rootGID = tt.mode, tt.uid, tt.gid
 
-			got, err := filesystemStartConfigFromFlags()
+			got, err := filesystemStartConfig(f, tt.raftID)
 			if tt.wantErr != "" {
 				require.ErrorContains(t, err, tt.wantErr)
 				require.Equal(t, fsmount.Config{}, got)
@@ -124,19 +113,16 @@ func TestFilesystemStartConfigFromFlags(t *testing.T) {
 }
 
 func TestStartFilesystemIfEnabledIsNoopWithoutMountPoint(t *testing.T) {
-	oldMount := *filesystemMount
-	t.Cleanup(func() { *filesystemMount = oldMount })
-	*filesystemMount = ""
+	f := defaultFlags[filesystemFlags]()
+	f.mount = ""
 
-	require.NoError(t, startFilesystemIfEnabled(context.Background(), nil, nil, nil, nil, nil))
+	require.NoError(t, startFilesystemIfEnabled(context.Background(), nil, nil, nil, nil, nil, f, "n1"))
 }
 
 func TestStartFilesystemIfEnabledRequiresLifecycle(t *testing.T) {
-	oldMount, oldRaftID := *filesystemMount, *raftId
-	t.Cleanup(func() { *filesystemMount, *raftId = oldMount, oldRaftID })
-	*filesystemMount = t.TempDir()
-	*raftId = "n1"
+	f := defaultFlags[filesystemFlags]()
+	f.mount = t.TempDir()
 
-	err := startFilesystemIfEnabled(context.Background(), nil, nil, nil, nil, nil)
+	err := startFilesystemIfEnabled(context.Background(), nil, nil, nil, nil, nil, f, "n1")
 	require.ErrorContains(t, err, "filesystem lifecycle is required")
 }

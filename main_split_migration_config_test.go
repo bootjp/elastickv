@@ -59,7 +59,7 @@ func TestRunRejectsUnsafeMigrationAuthBeforeStartingServices(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "migration-token")
 	require.NoError(t, os.WriteFile(path, []byte("migration-secret"), 0o600))
 	*splitMigrationTokenFile = path
-	require.ErrorContains(t, run(), "requires gRPC TLS")
+	require.ErrorContains(t, run(defaultServerFlags()), "requires gRPC TLS")
 	*splitMigrationTokenFile, *splitMigrationPeerAuthEnforced = "", true
-	require.ErrorContains(t, run(), "requires --splitMigrationTokenFile")
+	require.ErrorContains(t, run(defaultServerFlags()), "requires --splitMigrationTokenFile")
 }

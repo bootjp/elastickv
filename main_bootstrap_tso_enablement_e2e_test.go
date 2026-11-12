@@ -134,7 +134,7 @@ func tsoEnablementStart(t *testing.T, base string, profile []groupSpec) *tsoEnab
 	shards := kv.NewShardStore(routes, node.groups)
 	shards.SetOperationAdmission(domain.operationAdmission)
 	coordinate := kv.NewShardedCoordinator(routes, node.groups, 1, clock, shards).WithOperationAdmission(domain.operationAdmission)
-	node.wiring, err = configureCoordinatorTSO(coordinate, node.groups, shards)
+	node.wiring, err = configureCoordinatorTSO(defaultFlags[tsoFlags](), coordinate, node.groups, shards)
 	require.NoError(t, err)
 	node.data = &enablementProtectedNode{runtime: node.runtimes[1], domain: domain, coordinate: coordinate, shards: shards}
 	ctx, cancel := context.WithCancel(t.Context())
