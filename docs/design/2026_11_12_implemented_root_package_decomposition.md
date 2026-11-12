@@ -1,6 +1,6 @@
 # Root package decomposition
 
-Status: Partial (M1, M2, M3 and part of M4 implemented)
+Status: Implemented (M1–M7; the optional M6c was not taken)
 Author: bootjp
 Date: 2026-11-12
 
@@ -333,6 +333,32 @@ Tests move with the code they cover.
   the base. The package may import `noderuntime`, `nodeauth`,
   `encryptionwiring` and the etcd backend; only binaries may import it.
 
+- M7: every remaining root file moved to `internal/server` with its
+  `main_` prefix dropped (`main_shard_groups.go` → `shard_groups.go`, ...),
+  tests included. `main.go` is the only file left in the root package
+  (`TestRootPackageHoldsOnlyMainGo`): it registers `server.Flags` on the
+  process command line, dispatches `elastickv bootstrap ...` through
+  `server.DispatchBootstrapOperator`, passes `adminBuildVersion` in with
+  `server.SetBuildVersion`, calls `server.Run`, and maps
+  `server.MemoryPressureExit` to exit code 2. `run()`'s body is
+  `server.Run`; `serverFlags` / `registerServerFlags` /
+  `ignoreCanceledAfterSignal` are now `Flags` / `RegisterFlags` /
+  `IgnoreCanceledAfterSignal`. `TestCLIFlagsReadOnlyByMain` moved to the
+  root and allows only `main.go`; `TestServerFlagsNotBoundToCommandLine`
+  keeps `flag.CommandLine` and `cliFlags` out of the server package's
+  production code (the subprocess half of `TestShutdownProcess` binds its
+  own copy in a test file). The import guard lists `internal/server` as
+  an upper layer, lets the root import only `internal/server`, and
+  replaces the root with `internal/server` in every other
+  `restrictedPackages` entry; `scripts/go-test-shard.sh` runs
+  `./internal/server` in the root shard. `elastickv -help` and the
+  `elastickv bootstrap ...` usage and subcommand errors are identical to
+  the base.
+- M6c (splitting the offline bootstrap operator CLI into a subpackage) was
+  optional and was not taken: the CLI already sits behind
+  `clusterbootstrap.DispatchBootstrapOperator`, and the root reaches it
+  only through `internal/server`.
+
 ## Decisions
 
 - **Internal packages, not exported library packages.** These packages
@@ -375,7 +401,7 @@ Tests move with the code they cover.
   down.
 - **Every extracted package is guarded.** Each one has a
   `restrictedPackages` entry naming the layers that may import it, and
-  the root may import only `internal/server` once M7 lands.
+  the root may import only `internal/server`.
 
 ## Verification
 
