@@ -74,6 +74,7 @@ type serversInput struct {
 	leaderBalance leaderBalanceFlags
 	adminHTTP     adminHTTPFlags
 	backup        backupFlags
+	nodeAuth      nodeAuthFlags
 }
 
 // startServersAfterStartupRotation wires up the AdminServer, starts the
@@ -81,7 +82,7 @@ type serversInput struct {
 // to catch up, prepares the public listeners, waits for any requested startup
 // rotation, then starts serving public traffic.
 func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter, in serversInput) error {
-	adminGRPCEnabled := *adminTokenFile != "" || *adminInsecureNoAuth
+	adminGRPCEnabled := in.nodeAuth.adminTokenFile != "" || in.nodeAuth.adminInsecureNoAuth
 	// roleStore is gated on *adminEnabled. With admin HTTP disabled, building
 	// it is wasted work AND a security regression risk: a non-empty
 	// -adminFullAccessKeys flag would otherwise still flip
@@ -95,7 +96,7 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 	adminServer, adminGRPCOpts, err := setupAdminService(
 		*raftId, *myAddr, in.runtimes, in.shardGroups, in.bootstrapServers,
 		in.shardStore, in.distCatalog, in.coordinate, in.readTracker, in.keyvizSampler, connCache,
-		in.autoSplitRuntime, in.backup,
+		in.autoSplitRuntime, in.backup, in.nodeAuth,
 	)
 	if err != nil {
 		return err
@@ -164,6 +165,7 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 		roleStore:                       roleStore,
 		encryptionConfChangeInterceptor: in.encryptionConfChangeInterceptor,
 		publicKVGate:                    publicKVGate,
+		nodeAuth:                        in.nodeAuth,
 	}
 	if err := runner.startRaftTransport(); err != nil {
 		return err
@@ -211,8 +213,8 @@ func startPublicServicesAfterCommitTSFence(in serversInput, runner *runtimeServe
 	if err := markPublicGateReadyAfterCommitTSFence(in.ctx, gate, in.runtimes, fenceEnabled); err != nil {
 		return runner.startupFailure(errors.Wrap(err, "wait for commit-ts fence activation before public service"))
 	}
-	startDistributionSplitJobRunner(in.ctx, in.eg, in.distServer)
-	startMigrationOwnershipRefresh(in.ctx, in.eg, in.distServer)
+	startDistributionSplitJobRunner(in.ctx, in.eg, in.distServer, in.nodeAuth.splitMigrationLocalReadinessGate)
+	startMigrationOwnershipRefresh(in.ctx, in.eg, in.distServer, in.nodeAuth.splitMigrationLocalReadinessGate)
 	if err := runner.startPublicServices(); err != nil {
 		return err
 	}
@@ -324,6 +326,8 @@ type runtimeServerRunner struct {
 	roleStore admin.RoleStore
 
 	publicKVGate *startupPublicKVGate
+	// nodeAuth supplies the token files the S3 blob cluster dials peers with.
+	nodeAuth nodeAuthFlags
 }
 
 func (r *runtimeServerRunner) startRaftTransport() error {
@@ -428,7 +432,7 @@ func (r *runtimeServerRunner) prepareAdminForwardServers() error {
 }
 
 func (r *runtimeServerRunner) newS3BlobCluster() (adapter.S3BlobCluster, error) {
-	if r == nil || !s3BlobNodeEnabled(r.s3Address, *s3BlobPeerTokenFile) {
+	if r == nil || !s3BlobNodeEnabled(r.s3Address, r.nodeAuth.s3BlobPeerTokenFile) {
 		return nil, nil
 	}
 	members, ok := r.coordinate.(kv.RaftMembershipCoordinator)
@@ -436,16 +440,16 @@ func (r *runtimeServerRunner) newS3BlobCluster() (adapter.S3BlobCluster, error) 
 		return nil, errors.New("S3 blob offload requires raft membership discovery")
 	}
 	adminToken := ""
-	if strings.TrimSpace(*adminTokenFile) != "" {
-		loaded, err := loadAdminTokenFile(*adminTokenFile)
+	if strings.TrimSpace(r.nodeAuth.adminTokenFile) != "" {
+		loaded, err := loadAdminTokenFile(r.nodeAuth.adminTokenFile)
 		if err != nil {
 			return nil, err
 		}
 		adminToken = loaded
 	}
 	peerToken := ""
-	if strings.TrimSpace(*s3BlobPeerTokenFile) != "" {
-		loaded, err := loadS3BlobPeerTokenFile(*s3BlobPeerTokenFile)
+	if strings.TrimSpace(r.nodeAuth.s3BlobPeerTokenFile) != "" {
+		loaded, err := loadS3BlobPeerTokenFile(r.nodeAuth.s3BlobPeerTokenFile)
 		if err != nil {
 			return nil, err
 		}

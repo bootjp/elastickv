@@ -40,6 +40,7 @@ func setupAdminService(
 	connCache *kv.GRPCConnCache,
 	autoSplitRuntime adapter.AutoSplitRuntime,
 	backup backupFlags,
+	nodeAuth nodeAuthFlags,
 ) (*adapter.AdminServer, adminGRPCInterceptors, error) {
 	members := adminMembersFromBootstrap(nodeID, bootstrapServers)
 	// In multi-group mode the process does not listen on *myAddr — each group
@@ -49,10 +50,7 @@ func setupAdminService(
 	// when no runtimes are registered (single-node dev runs).
 	selfAddr := canonicalSelfAddress(grpcAddress, runtimes)
 	srv, icept, err := configureAdminService(
-		*adminTokenFile,
-		*adminInsecureNoAuth,
-		*s3BlobPeerTokenFile,
-		*splitMigrationTokenFile,
+		nodeAuth,
 		adapter.S3BlobOffloadEnabledFromEnv(),
 		adapter.NodeIdentity{NodeID: nodeID, GRPCAddress: selfAddr},
 		members,
@@ -91,7 +89,7 @@ func setupAdminService(
 	if autoSplitRuntime != nil {
 		srv.RegisterAutoSplitRuntime(autoSplitRuntime)
 	}
-	if *adminInsecureNoAuth {
+	if nodeAuth.adminInsecureNoAuth {
 		log.Printf("WARNING: --adminInsecureNoAuth is set; Admin gRPC service exposed without authentication")
 	}
 	return srv, icept, nil
@@ -156,6 +154,9 @@ type adminGRPCInterceptors struct {
 	token              string
 	migrationToken     string
 	s3BlobFetchEnabled bool
+	// migrationReady is the split-migration readiness gate the raft gRPC
+	// servers apply to migration RPCs and to ownership readiness.
+	migrationReady migrationReadinessGate
 }
 
 func (a adminGRPCInterceptors) empty() bool {
@@ -211,20 +212,18 @@ func (s *adminBackupStore) CaptureBackupRouteSnapshotAt(ctx context.Context, ts 
 }
 
 func configureAdminService(
-	tokenPath string,
-	insecureNoAuth bool,
-	s3BlobPeerTokenPath string,
-	migrationTokenPath string,
+	nodeAuth nodeAuthFlags,
 	s3BlobOffloadEnabled bool,
 	self adapter.NodeIdentity,
 	members []adapter.NodeIdentity,
 	connCache *kv.GRPCConnCache,
 	backupDeps ...adminBackupDependencies,
 ) (*adapter.AdminServer, adminGRPCInterceptors, error) {
-	auth, err := loadNodeGRPCAuth(tokenPath, insecureNoAuth, s3BlobPeerTokenPath, migrationTokenPath)
+	auth, err := nodeAuth.loadGRPCAuth()
 	if err != nil {
 		return nil, adminGRPCInterceptors{}, err
 	}
+	insecureNoAuth := nodeAuth.adminInsecureNoAuth
 	var srv *adapter.AdminServer
 	if auth.adminEnabled {
 		// adminServerOptions carries the live-backup dependencies and the
@@ -239,10 +238,10 @@ func configureAdminService(
 	}
 	// token is what setupAdminService hands to SetLeaderReadToken and the
 	// per-group backup proposer, so it has to survive the interceptor build.
-	icept := adminGRPCInterceptors{token: auth.adminToken, migrationToken: auth.migrationToken}
+	icept := adminGRPCInterceptors{token: auth.adminToken, migrationToken: auth.migrationToken, migrationReady: nodeAuth.splitMigrationLocalReadinessGate}
 	adminUnary, adminStream := adapter.AdminTokenAuth(auth.adminToken)
 	appendGRPCBearerInterceptors(&icept, adminUnary, adminStream)
-	migrationUnary, migrationStream := adapter.SplitMigrationTokenAuth(auth.migrationToken, insecureNoAuth, *splitMigrationPeerAuthEnforced)
+	migrationUnary, migrationStream := adapter.SplitMigrationTokenAuth(auth.migrationToken, insecureNoAuth, nodeAuth.splitMigrationPeerAuthEnforced)
 	appendGRPCBearerInterceptors(&icept, migrationUnary, migrationStream)
 	peerUnary, peerStream := adapter.S3BlobPeerTokenAuth(auth.peerToken)
 	appendGRPCBearerInterceptors(&icept, peerUnary, peerStream)

@@ -14,6 +14,9 @@ type raftBootstrapConfig struct {
 	legacyServers []raftengine.Server
 	groupServers  map[uint64][]raftengine.Server
 	joinServers   []raftengine.Server
+	// serviceTokenFiles are the node's Admin, migration and S3 peer token
+	// files; a protected bootstrap startup token must differ from each.
+	serviceTokenFiles []string
 }
 
 func (c raftBootstrapConfig) anyBootstrapServers() bool {

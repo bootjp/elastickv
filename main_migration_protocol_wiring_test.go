@@ -35,19 +35,20 @@ func TestMigrationMembershipWiringKeepsEnvelopeProposerAndTSOIsolation(t *testin
 
 func TestMigrationCoverageGateAllowsOnlyTypedNamespaceBootstrap(t *testing.T) {
 	t.Parallel()
+	var migrationAuth nodeAuthFlags
 	request, err := kv.NewNamespaceAdmissionRequest(1, kv.NamespaceAdmissionCommand{Version: kv.MigrationNamespaceVersion,
 		ConfigurationIndex: 9, ApplyMembers: []uint64{7},
 		Members: []kv.NamespaceMemberCapability{{MemberID: 7, Version: kv.MigrationNamespaceVersion, ConfigurationIndex: 9}}})
 	require.NoError(t, err)
 	info := &grpc.UnaryServerInfo{FullMethod: pb.Internal_CleanupMigration_FullMethodName}
 	called := false
-	_, err = migrationCoverageUnaryGate(t.Context(), request, info, func(context.Context, any) (any, error) { called = true; return nil, nil })
+	_, err = migrationCoverageUnaryGate(t.Context(), request, info, func(context.Context, any) (any, error) { called = true; return nil, nil }, migrationAuth.splitMigrationLocalReadinessGate)
 	require.NoError(t, err)
 	require.True(t, called)
 	request.NamespaceAdmission = []byte("invalid")
 	_, err = migrationCoverageUnaryGate(t.Context(), request, info, func(context.Context, any) (any, error) {
 		t.Fatal("malformed bootstrap reached the handler")
 		return nil, nil
-	})
+	}, migrationAuth.splitMigrationLocalReadinessGate)
 	require.Equal(t, codes.InvalidArgument, status.Code(err))
 }

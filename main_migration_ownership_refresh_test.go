@@ -29,7 +29,7 @@ type ownershipRefreshRaftNode struct {
 	listener net.Listener
 }
 
-func newOwnershipRefreshRaftNode(t *testing.T, id string, groupID uint64, st store.MVCCStore, token string) ownershipRefreshRaftNode {
+func newOwnershipRefreshRaftNode(t *testing.T, id string, groupID uint64, st store.MVCCStore, token string, ready migrationReadinessGate) ownershipRefreshRaftNode {
 	t.Helper()
 	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -39,7 +39,7 @@ func newOwnershipRefreshRaftNode(t *testing.T, id string, groupID uint64, st sto
 		DataDir: t.TempDir(), Peers: []raftengine.Server{{ID: id, Address: listener.Addr().String(), Suffrage: "voter"}}, Bootstrap: true, StateMachine: fsm})
 	require.NoError(t, err)
 	auth, _ := adapter.SplitMigrationTokenAuth(token, false, true)
-	options := raftGRPCServerOptions(adminGRPCInterceptors{unary: []grpc.UnaryServerInterceptor{auth}})
+	options := raftGRPCServerOptions(adminGRPCInterceptors{unary: []grpc.UnaryServerInterceptor{auth}, migrationReady: ready})
 	server := grpc.NewServer(options...)
 	if result.RegisterTransport != nil {
 		result.RegisterTransport(server)
@@ -87,8 +87,8 @@ func TestOwnershipRefreshDifferentRaftLeadersRespectExplicitClosedGate(t *testin
 	t.Cleanup(func() { require.NoError(t, internalutil.ConfigureGRPCTLS("", "", "")) })
 	token := t.Name()
 	rootStore, catalog, prior := ownershipRefreshRootCatalog(t)
-	root := newOwnershipRefreshRaftNode(t, "root", 1, rootStore, token)
-	data := newOwnershipRefreshRaftNode(t, "data", 7, store.NewMVCCStore(), token)
+	root := newOwnershipRefreshRaftNode(t, "root", 1, rootStore, token, nodeAuthFlags{}.splitMigrationLocalReadinessGate)
+	data := newOwnershipRefreshRaftNode(t, "data", 7, store.NewMVCCStore(), token, nodeAuthFlags{}.splitMigrationLocalReadinessGate)
 	rootRoutes := distribution.NewEngine()
 	rootRoutes.UpdateRoute(nil, nil, 1)
 	rootGroups := map[uint64]*kv.ShardGroup{1: root.group}

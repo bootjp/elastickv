@@ -41,25 +41,16 @@ func TestSplitMigrationPeerSecurityConfiguration(t *testing.T) {
 }
 
 func TestRunRejectsUnsafeMigrationAuthBeforeStartingServices(t *testing.T) {
-	paths := []*string{adminTokenFile, s3BlobPeerTokenFile, splitMigrationTokenFile, grpcTLSCAFile, grpcTLSCertFile, grpcTLSKeyFile}
-	for _, path := range paths {
-		old := *path
-		*path = ""
-		t.Cleanup(func() { *path = old })
-	}
-	oldNoAuth, oldEnforced := *adminInsecureNoAuth, *splitMigrationPeerAuthEnforced
-	*adminInsecureNoAuth, *splitMigrationPeerAuthEnforced = false, false
-	t.Cleanup(func() {
-		*adminInsecureNoAuth, *splitMigrationPeerAuthEnforced = oldNoAuth, oldEnforced
-		require.NoError(t, internalutil.ConfigureGRPCTLS("", "", ""))
-	})
+	t.Cleanup(func() { require.NoError(t, internalutil.ConfigureGRPCTLS("", "", "")) })
 	for _, env := range []string{adapter.MigrationImportOpcodeEnv, adapter.MigrationPromoteOpcodeEnv, adapter.MigrationCleanupOpcodeEnv} {
 		t.Setenv(env, "false")
 	}
 	path := filepath.Join(t.TempDir(), "migration-token")
 	require.NoError(t, os.WriteFile(path, []byte("migration-secret"), 0o600))
-	*splitMigrationTokenFile = path
-	require.ErrorContains(t, run(defaultServerFlags()), "requires gRPC TLS")
-	*splitMigrationTokenFile, *splitMigrationPeerAuthEnforced = "", true
-	require.ErrorContains(t, run(defaultServerFlags()), "requires --splitMigrationTokenFile")
+	flags := defaultServerFlags()
+	flags.nodeAuth.splitMigrationTokenFile = path
+	require.ErrorContains(t, run(flags), "requires gRPC TLS")
+	flags = defaultServerFlags()
+	flags.nodeAuth.splitMigrationPeerAuthEnforced = true
+	require.ErrorContains(t, run(flags), "requires --splitMigrationTokenFile")
 }

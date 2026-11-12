@@ -51,6 +51,7 @@ type distributionStartupInput struct {
 	snapshotOffload snapshotOffloadFlags
 	keyViz          *serverwiring.KeyVizFlags
 	autoSplit       *serverwiring.AutoSplitFlags
+	nodeAuth        nodeAuthFlags
 }
 
 type distributionStartup struct {
@@ -66,7 +67,7 @@ type distributionStartup struct {
 }
 
 func startDistributionStartup(in distributionStartupInput) (distributionStartup, error) {
-	auth, err := loadNodeGRPCAuth(*adminTokenFile, *adminInsecureNoAuth, *s3BlobPeerTokenFile, *splitMigrationTokenFile)
+	auth, err := in.nodeAuth.loadGRPCAuth()
 	if err != nil {
 		return distributionStartup{}, err
 	}
@@ -114,7 +115,7 @@ func startDistributionStartup(in distributionStartupInput) (distributionStartup,
 			splitMigrationCapabilityPeerSourceForRuntimes(in.runtimes),
 			splitMigrationCapabilityProbeTimeout,
 			bootstrapSplitMigrationProbe(in.runtimes),
-			splitMigrationLocalReadinessGate,
+			in.nodeAuth.splitMigrationLocalReadinessGate,
 		)),
 		adapter.WithSplitPromotionClientFactory(splitPromotionClientFactory(
 			splitPromotionTargetLeaderResolver(in.shardGroups),
@@ -142,9 +143,9 @@ func startDistributionStartup(in distributionStartupInput) (distributionStartup,
 			auth.migrationToken,
 		)),
 		// Do not advertise cap_migration_v2 before protocol coverage is accepted.
-		adapter.WithSplitJobRunnerReadinessGate(splitMigrationLocalReadinessGate),
-		migrationOwnershipRefreshOption(in.shardGroups, catalogRuntime, splitMigrationConnCache, auth.migrationToken, *splitMigrationPeerAuthEnforced),
-		migrationPartitionRuntimeOption(in.shardStore, in.shardGroups, splitMigrationConnCache, auth.migrationToken, *splitMigrationPeerAuthEnforced),
+		adapter.WithSplitJobRunnerReadinessGate(in.nodeAuth.splitMigrationLocalReadinessGate),
+		migrationOwnershipRefreshOption(in.shardGroups, catalogRuntime, splitMigrationConnCache, auth.migrationToken, in.nodeAuth.splitMigrationPeerAuthEnforced),
+		migrationPartitionRuntimeOption(in.shardStore, in.shardGroups, splitMigrationConnCache, auth.migrationToken, in.nodeAuth.splitMigrationPeerAuthEnforced),
 	)
 	autoSplitRuntime, err := setupDistributionWatcherAndAutoSplit(
 		in.ctx,
@@ -182,11 +183,11 @@ func startDistributionStartup(in distributionStartupInput) (distributionStartup,
 	}, nil
 }
 
-func startDistributionSplitJobRunner(ctx context.Context, eg *errgroup.Group, server *adapter.DistributionServer) {
+func startDistributionSplitJobRunner(ctx context.Context, eg *errgroup.Group, server *adapter.DistributionServer, ready migrationReadinessGate) {
 	if eg == nil || server == nil {
 		return
 	}
-	if splitMigrationLocalReadinessGate(ctx) != nil {
+	if ready.check(ctx) != nil {
 		return
 	}
 	eg.Go(func() error {

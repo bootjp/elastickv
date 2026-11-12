@@ -92,7 +92,7 @@ func onlyContextCanceled(err error) bool {
 }
 
 func run(flags *serverFlags) error {
-	cfg, engineType, bootstrapCfg, bootstrap, err := resolveNetworkRuntimeInputs(flags.backup)
+	cfg, engineType, bootstrapCfg, bootstrap, err := resolveNetworkRuntimeInputs(flags.backup, flags.nodeAuth)
 	if err != nil {
 		return err
 	}
@@ -309,6 +309,7 @@ func run(flags *serverFlags) error {
 		snapshotOffload: flags.snapshotOffload,
 		keyViz:          flags.keyViz,
 		autoSplit:       flags.autoSplit,
+		nodeAuth:        flags.nodeAuth,
 	}, encryptionStartup)
 	if err != nil {
 		// Members already run on eg (TSO reloader, raft lifecycle
@@ -351,6 +352,7 @@ func run(flags *serverFlags) error {
 		leaderBalance:                   flags.leaderBalance,
 		adminHTTP:                       flags.adminHTTP,
 		backup:                          flags.backup,
+		nodeAuth:                        flags.nodeAuth,
 	}, health, handoff)
 }
 

@@ -37,9 +37,6 @@ func (splitRangeAuthRPCServer) ListRoutes(context.Context, *pb.ListRoutesRequest
 }
 
 func TestSplitRangeProductionAuthRequiresDedicatedTokenDuringSendFirst(t *testing.T) {
-	oldEnforced := *splitMigrationPeerAuthEnforced
-	*splitMigrationPeerAuthEnforced = false
-	t.Cleanup(func() { *splitMigrationPeerAuthEnforced = oldEnforced })
 	for _, env := range []string{adapter.MigrationImportOpcodeEnv, adapter.MigrationPromoteOpcodeEnv, adapter.MigrationCleanupOpcodeEnv} {
 		t.Setenv(env, "false")
 	}
@@ -50,8 +47,7 @@ func TestSplitRangeProductionAuthRequiresDedicatedTokenDuringSendFirst(t *testin
 	for name, token := range map[string]string{"admin": "read-only-admin", "peer": "blob-peer", "migration": "migration-secret"} {
 		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte(token), 0o600))
 	}
-	adminServer, auth, err := configureAdminService(filepath.Join(dir, "admin"), false, filepath.Join(dir, "peer"), filepath.Join(dir, "migration"),
-		false, adapter.NodeIdentity{}, nil, nil)
+	adminServer, auth, err := configureAdminService(nodeAuthFlags{adminTokenFile: filepath.Join(dir, "admin"), s3BlobPeerTokenFile: filepath.Join(dir, "peer"), splitMigrationTokenFile: filepath.Join(dir, "migration")}, false, adapter.NodeIdentity{}, nil, nil)
 	require.NoError(t, err)
 	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -91,9 +87,6 @@ func TestSplitRangeProductionAuthRequiresDedicatedTokenDuringSendFirst(t *testin
 }
 
 func TestSplitMigrationFactoriesPropagateCredentials(t *testing.T) {
-	oldEnforced := *splitMigrationPeerAuthEnforced
-	*splitMigrationPeerAuthEnforced = true
-	t.Cleanup(func() { *splitMigrationPeerAuthEnforced = oldEnforced })
 	cert, key := writeSelfSignedCert(t)
 	require.NoError(t, internalutil.ConfigureGRPCTLS(cert, cert, key))
 	t.Cleanup(func() { require.NoError(t, internalutil.ConfigureGRPCTLS("", "", "")) })
@@ -106,7 +99,7 @@ func TestSplitMigrationFactoriesPropagateCredentials(t *testing.T) {
 	migrationPath := filepath.Join(t.TempDir(), "migration-token")
 	require.NoError(t, os.WriteFile(adminPath, []byte("read-only-admin"), 0o600))
 	require.NoError(t, os.WriteFile(migrationPath, []byte("migration-secret"), 0o600))
-	adminServer, auth, err := configureAdminService(adminPath, false, "", migrationPath, false, adapter.NodeIdentity{}, nil, nil)
+	adminServer, auth, err := configureAdminService(nodeAuthFlags{adminTokenFile: adminPath, splitMigrationTokenFile: migrationPath, splitMigrationPeerAuthEnforced: true}, false, adapter.NodeIdentity{}, nil, nil)
 	require.NoError(t, err)
 	serverOpts := append(raftGRPCServerOptions(auth), grpc.ChainUnaryInterceptor(
 		func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
@@ -219,19 +212,15 @@ func TestSplitMigrationOpcodesRequireExplicitAuthentication(t *testing.T) {
 }
 
 func TestSplitMigrationPeerAuthRolloutPausesRunnerAndCapability(t *testing.T) {
-	oldEnforced, oldNoAuth := *splitMigrationPeerAuthEnforced, *adminInsecureNoAuth
-	*splitMigrationPeerAuthEnforced, *adminInsecureNoAuth = false, false
-	t.Cleanup(func() {
-		*splitMigrationPeerAuthEnforced, *adminInsecureNoAuth = oldEnforced, oldNoAuth
-	})
+	var nodeAuth nodeAuthFlags
 	for _, env := range []string{adapter.MigrationImportOpcodeEnv, adapter.MigrationPromoteOpcodeEnv, adapter.MigrationCleanupOpcodeEnv} {
 		t.Setenv(env, "true")
 	}
-	require.ErrorContains(t, splitMigrationLocalReadinessGate(context.Background()), "peer auth rollout")
+	require.ErrorContains(t, nodeAuth.splitMigrationLocalReadinessGate(context.Background()), "peer auth rollout")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	group := new(errgroup.Group)
-	startDistributionSplitJobRunner(ctx, group, adapter.NewDistributionServer(nil, nil))
+	startDistributionSplitJobRunner(ctx, group, adapter.NewDistributionServer(nil, nil), nodeAuth.splitMigrationLocalReadinessGate)
 	done := make(chan error, 1)
 	go func() { done <- group.Wait() }()
 	select {
@@ -242,10 +231,10 @@ func TestSplitMigrationPeerAuthRolloutPausesRunnerAndCapability(t *testing.T) {
 		<-done
 		t.Fatal("send-only rollout stage must not start a privileged runner")
 	}
-	*splitMigrationPeerAuthEnforced = true
-	require.NoError(t, splitMigrationLocalReadinessGate(context.Background()))
-	*splitMigrationPeerAuthEnforced, *adminInsecureNoAuth = false, true
-	require.NoError(t, splitMigrationLocalReadinessGate(context.Background()), "explicit insecure mode retains its existing auth-rollout exception")
+	nodeAuth.splitMigrationPeerAuthEnforced = true
+	require.NoError(t, nodeAuth.splitMigrationLocalReadinessGate(context.Background()))
+	nodeAuth.splitMigrationPeerAuthEnforced, nodeAuth.adminInsecureNoAuth = false, true
+	require.NoError(t, nodeAuth.splitMigrationLocalReadinessGate(context.Background()), "explicit insecure mode retains its existing auth-rollout exception")
 }
 
 func TestSplitMigrationTokenMustBeDedicated(t *testing.T) {
