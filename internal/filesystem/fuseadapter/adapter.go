@@ -318,6 +318,15 @@ func Errno(err error) syscall.Errno {
 	return syscall.EIO
 }
 
+func (a *Adapter) mutationErrno(err error) syscall.Errno {
+	errno := Errno(err)
+	// Unknown outcomes map to EIO before a terminal contention result can become EBUSY.
+	if a.strictMode && errno == syscall.EAGAIN && errors.Is(err, filesystem.ErrContentionLimit) {
+		return syscall.EBUSY
+	}
+	return errno
+}
+
 func (a *Adapter) Lookup(ctx context.Context, parent uint64, name []byte) (filesystem.Stat, syscall.Errno) {
 	inode, err := a.core.Resolve(ctx, parent, name)
 	if errno := Errno(err); errno != 0 {
@@ -360,7 +369,7 @@ func (a *Adapter) SetAttr(
 	} else {
 		stat, err = a.core.SetAttr(ctx, inode, mask, attrs)
 	}
-	return stat, Errno(err)
+	return stat, a.mutationErrno(err)
 }
 
 func (a *Adapter) nextOperationID(ctx context.Context) filesystem.OperationID {
@@ -436,7 +445,7 @@ func (a *Adapter) openWithOperation(ctx context.Context, inode uint64) (uint64, 
 	if err != nil && Errno(err) == syscall.EIO {
 		slog.WarnContext(ctx, "filesystem FUSE open failed", "inode", inode, "error", err.Error())
 	}
-	return fh, Errno(err)
+	return fh, a.mutationErrno(err)
 }
 
 func (a *Adapter) Read(ctx context.Context, inode uint64, fh uint64, offset uint64, size uint64) ([]byte, syscall.Errno) {
@@ -471,7 +480,7 @@ func (a *Adapter) Write(ctx context.Context, inode uint64, fh uint64, offset uin
 	if writeErr != nil && Errno(writeErr) == syscall.EIO {
 		slog.WarnContext(ctx, "filesystem FUSE write failed", "inode", inode, "offset", offset, "length", len(data), "error", writeErr.Error())
 	}
-	return n, Errno(writeErr)
+	return n, a.mutationErrno(writeErr)
 }
 
 func (a *Adapter) writeWithOperation(ctx context.Context, inode, offset uint64, data []byte) (int, error) {
@@ -578,7 +587,7 @@ func (a *Adapter) Release(ctx context.Context, inode uint64, fh uint64) syscall.
 	if err != nil && Errno(err) == syscall.EIO {
 		slog.WarnContext(ctx, "filesystem FUSE release uncertain", "inode", inode, "fh", fh, "error", err.Error())
 	}
-	return Errno(err)
+	return a.mutationErrno(err)
 }
 
 func (a *Adapter) Create(
@@ -614,7 +623,7 @@ func (a *Adapter) Create(
 	if err == nil {
 		a.trackOpenHandle(result.Inode, result.FH)
 	}
-	return result, Errno(err)
+	return result, a.mutationErrno(err)
 }
 
 func (a *Adapter) Mknod(
@@ -647,7 +656,7 @@ func (a *Adapter) Mknod(
 	} else {
 		result, err = a.core.Create(ctx, parent, name, opts)
 	}
-	return result, Errno(err)
+	return result, a.mutationErrno(err)
 }
 
 func (a *Adapter) Mkdir(
@@ -678,7 +687,7 @@ func (a *Adapter) Mkdir(
 	} else {
 		result, err = a.core.Mkdir(ctx, parent, name, opts)
 	}
-	return result, Errno(err)
+	return result, a.mutationErrno(err)
 }
 
 func (a *Adapter) Unlink(ctx context.Context, parent uint64, name []byte) (errno syscall.Errno) {
@@ -702,7 +711,7 @@ func (a *Adapter) removeEntry(
 	var err error
 	defer func() { a.mutations.end(ticket, errors.Is(err, kv.ErrTransactionOutcomeUnknown)) }()
 	err = remove(ctx, parent, name)
-	return Errno(err)
+	return a.mutationErrno(err)
 }
 
 func (a *Adapter) unlink(ctx context.Context, parent uint64, name []byte) error {
@@ -778,7 +787,7 @@ func (a *Adapter) Rename(
 	} else {
 		err = a.core.Rename(ctx, oldParent, oldName, newParent, newName)
 	}
-	return Errno(err)
+	return a.mutationErrno(err)
 }
 
 func (a *Adapter) Readdir(ctx context.Context, inode uint64, cookie string) (filesystem.ReaddirResult, syscall.Errno) {
@@ -816,7 +825,7 @@ func (a *Adapter) refreshOpenHandleLease(ctx context.Context, inode uint64, fh u
 		a.queueAcknowledgement(id)
 	}
 	logLeaseRefreshError(ctx, inode, fh, err)
-	return Errno(err)
+	return a.mutationErrno(err)
 }
 
 func logLeaseRefreshError(ctx context.Context, inode, fh uint64, err error) {
