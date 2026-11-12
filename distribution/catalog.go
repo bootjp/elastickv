@@ -1059,3 +1059,19 @@ func nextScanCursor(lastKey []byte) []byte {
 	copy(next, lastKey)
 	return next
 }
+
+// CatalogGroupID returns the Raft group that owns the distribution catalog
+// key in engine's current routes.
+func CatalogGroupID(engine *Engine) (uint64, error) {
+	if engine == nil {
+		return 0, errors.New("distribution engine is required")
+	}
+	route, ok := engine.GetRoute(CatalogVersionKey())
+	if !ok {
+		return 0, errors.New("no shard route for distribution catalog key")
+	}
+	if route.GroupID == 0 {
+		return 0, errors.New("invalid shard route for distribution catalog key")
+	}
+	return route.GroupID, nil
+}

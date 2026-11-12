@@ -157,6 +157,6 @@ func installBootstrapStartupRotation(supervisor *bootstrapRotationRuntime, ctx c
 		return func() {}, startupRotationWaiter{wait: supervisor.Wait, blockMutator: func() bool { return !supervisor.config.admission.LocalPermissionReady() }}
 	}
 	rt := findDefaultGroupRuntime(cfg.runtimes, cfg.defaultGroup)
-	return installEncryptionRotateOnStartup(ctx, cfg.requested, rt, postCutoverProposerForRuntime(rt, cfg.groups), cfg.sidecarPath,
+	return installEncryptionRotateOnStartup(ctx, cfg.requested, runtimeCore(rt), postCutoverProposerForRuntime(rt, cfg.groups), cfg.sidecarPath,
 		cfg.wrapper, cfg.wiring.raftEnvelope, cfg.nodeID, cfg.wiring.epoch, cfg.wiring.raftEpoch, slog.Default())
 }

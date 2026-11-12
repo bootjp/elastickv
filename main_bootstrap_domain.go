@@ -172,9 +172,9 @@ func startBootstrapReadinessReconciler(ctx context.Context, eg *errgroup.Group, 
 }
 
 func reconcileBootstrapReadiness(ctx context.Context, domain *bootstrapDomain, runtimes []*raftGroupRuntime, catalog *distribution.CatalogStore, engine *distribution.Engine) error {
-	id, err := distributionCatalogGroupID(engine)
+	id, err := distribution.CatalogGroupID(engine)
 	if err != nil {
-		return err
+		return errors.WithStack(err)
 	}
 	if domain.admission.Stage(id) == peersession.ControlReady {
 		if _, err := loadProtectedCatalog(ctx, runtimes, id, catalog, engine); err != nil {

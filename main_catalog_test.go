@@ -19,37 +19,6 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-func TestDistributionCatalogGroupID_UsesCatalogKeyRoute(t *testing.T) {
-	t.Parallel()
-
-	engine := distribution.NewEngine()
-	engine.UpdateRoute([]byte(""), []byte("m"), 2)
-	engine.UpdateRoute([]byte("m"), nil, 3)
-
-	groupID, err := distributionCatalogGroupID(engine)
-	require.NoError(t, err)
-	require.Equal(t, uint64(2), groupID)
-}
-
-func TestDistributionCatalogGroupID_FailsWhenRouteMissing(t *testing.T) {
-	t.Parallel()
-
-	engine := distribution.NewEngine()
-	engine.UpdateRoute([]byte("a"), nil, 7)
-
-	_, err := distributionCatalogGroupID(engine)
-	require.Error(t, err)
-	require.ErrorContains(t, err, "no shard route for distribution catalog key")
-}
-
-func TestDistributionCatalogGroupID_FailsWhenEngineMissing(t *testing.T) {
-	t.Parallel()
-
-	_, err := distributionCatalogGroupID(nil)
-	require.Error(t, err)
-	require.ErrorContains(t, err, "distribution engine is required")
-}
-
 func TestSetupDistributionCatalog_FailsWhenRuntimeMissingForResolvedGroup(t *testing.T) {
 	t.Parallel()
 

@@ -100,14 +100,14 @@ func startRaftServers(
 ) error {
 	forwardLogger := slog.Default().With(slog.String("component", "admin"))
 	enableMutators := encryptionMutatorsEnabled(encryptionCfg, kekConfigured)
-	encryptionCapabilityFanout := buildEncryptionCapabilityFanout(ctx, eg, runtimes, enableMutators)
-	monitorFanout, releaseMonitorConns := buildStorageEnvelopeV2MonitorFanout(runtimes, enableMutators)
+	encryptionCapabilityFanout := buildEncryptionCapabilityFanout(ctx, eg, runtimeCores(runtimes), bootstrapRuntimeDialOptions(runtimes), enableMutators)
+	monitorFanout, releaseMonitorConns := buildStorageEnvelopeV2MonitorFanout(runtimeCores(runtimes), bootstrapRuntimeDialOptions(runtimes), enableMutators)
 	startStorageEnvelopeV2CapabilityMonitor(ctx, eg, monitorFanout, releaseMonitorConns, encWiring)
 	writerRegistry, err := encryptionAdminDefaultWriterRegistry(encryptionCfg.sidecarPath, shardGroups, defaultGroupID)
 	if err != nil {
 		return err
 	}
-	defaultAdmin, err := encryptionAdminDefaultRuntimeOptions(runtimes, shardGroups, defaultGroupID, enableMutators || writerRegistry != nil)
+	defaultAdmin, err := encryptionAdminDefaultRuntimeOptions(runtimeCores(runtimes), shardGroups, defaultGroupID, enableMutators || writerRegistry != nil)
 	if err != nil {
 		return err
 	}

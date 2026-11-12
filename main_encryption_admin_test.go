@@ -129,10 +129,10 @@ func TestEncryptionAdminDefaultRuntimeOptionsUsesDefaultGroupRuntime(t *testing.
 	_ = kv.NewLeaderProxyForShardGroup(otherGroup)
 
 	got, err := encryptionAdminDefaultRuntimeOptions(
-		[]*raftGroupRuntime{
+		runtimeCores([]*raftGroupRuntime{
 			{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 1}, Engine: defaultEngine}},
 			{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 2}, Engine: otherEngine}},
-		},
+		}),
 		map[uint64]*kv.ShardGroup{
 			1: defaultGroup,
 			2: otherGroup,

@@ -268,7 +268,7 @@ func setupDistributionCatalog(
 	if err := validateNoExistingCommitTSFenceActivation(ctx, runtimes, bootstrapDomainForRuntimes(runtimes) != nil); err != nil {
 		return nil, err
 	}
-	catalogGroupID, err := distributionCatalogGroupID(engine)
+	catalogGroupID, err := distribution.CatalogGroupID(engine)
 	if err != nil {
 		return nil, errors.Wrapf(err, "resolve distribution catalog group")
 	}
@@ -300,20 +300,6 @@ func setupDistributionCatalog(
 		return nil, errors.Wrapf(err, "initialize distribution catalog")
 	}
 	return distCatalog, nil
-}
-
-func distributionCatalogGroupID(engine *distribution.Engine) (uint64, error) {
-	if engine == nil {
-		return 0, errors.New("distribution engine is required")
-	}
-	route, ok := engine.GetRoute(distribution.CatalogVersionKey())
-	if !ok {
-		return 0, errors.New("no shard route for distribution catalog key")
-	}
-	if route.GroupID == 0 {
-		return 0, errors.New("invalid shard route for distribution catalog key")
-	}
-	return route.GroupID, nil
 }
 
 func runDistributionCatalogWatcher(
@@ -355,7 +341,7 @@ func setupDistributionRuntimeDependencies(
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	catalogGroupID, err := distributionCatalogGroupID(engine)
+	catalogGroupID, err := distribution.CatalogGroupID(engine)
 	if err != nil {
 		return nil, nil, nil, errors.Wrap(err, "resolve distribution catalog group runtime")
 	}
@@ -404,4 +390,57 @@ func runDistributionCatalogStream(
 		return errors.Wrap(err, "catalog stream watcher failed")
 	}
 	return nil
+}
+
+// setupDistributionAndRegistration installs the Stage 7a process-start
+// registration gate and then sets up the distribution catalog,
+// returning the catalog store. Bundling the two lets run() handle both
+// startup faults through a single error path (keeping run() within the
+// cyclop budget) while preserving the fail-synchronously-before-serving
+// guarantee for the registration gate.
+//
+// Ordering (Stage 7a-2 §2.3): the registration gate is armed FIRST,
+// then EnsureCatalogSnapshot runs. The catalog bootstrap Save is a
+// direct encrypted write that 7a-2 gates on Registered(); arming the
+// gate (which starts the registration goroutine) before the bootstrap
+// lets the empty-catalog + active-envelope edge clear once registration
+// commits, via the bounded retryUntilRegistered wrapper inside
+// setupDistributionCatalog. Registration has no dependency on the route
+// catalog (the OpRegistration apply writes a writer-registry row, not a
+// route), so arm-before-bootstrap cannot deadlock.
+func setupDistributionAndRegistration(
+	runCtx context.Context,
+	eg *errgroup.Group,
+	runtimes []*raftGroupRuntime,
+	engine *distribution.Engine,
+	coordinate *kv.ShardedCoordinator,
+	defaultGroup *kv.ShardGroup,
+	w encryptionWriteWiring,
+	raftID string,
+	sidecarPath string,
+) (*distribution.CatalogStore, error) {
+	if err := validateRaftRegistrationStartupEpoch(defaultGroup, w, raftID, sidecarPath); err != nil {
+		return nil, err
+	}
+	if err := installProcessStartRegistrationGate(runCtx, eg, coordinate, defaultGroup, w, raftID); err != nil {
+		return nil, err
+	}
+	installRaftRegistrationVerifier(defaultGroup, w, raftID)
+	installRuntimeRaftRegistrationWatcher(runCtx, eg, coordinate, defaultGroup, w, raftID, sidecarPath)
+	// Stage 7b/7b': arm the runtime watcher. Handles all three runtime
+	// registration triggers — cutover (Phase-0 → EnableStorageEnvelope),
+	// pre-bootstrap (no DEK → runtime Bootstrap), and rotation (RotateDEK
+	// from a non-proposer's perspective). All three collapse to the same
+	// in-scope propose under the cache.Registered() gate in
+	// runtimeRegistrationInScope. Must run AFTER
+	// installProcessStartRegistrationGate so the gate is in place before
+	// any runtime trigger can fire.
+	installRuntimeRegistrationWatcher(runCtx, eg, coordinate, defaultGroup, w, raftID)
+	// Bootstrap + registration both run under runCtx so a shutdown
+	// cancels the bounded retry rather than hanging.
+	distCatalog, err := setupDistributionCatalog(runCtx, runtimes, engine)
+	if err != nil {
+		return nil, err
+	}
+	return distCatalog, nil
 }

@@ -67,11 +67,11 @@ func (f encryptionFlags) bootstrapRequest() noderuntime.BootstrapEncryptionReque
 }
 
 func loadKEKAfterPreNonceStartupGuards(
-	cfg noderuntime.RuntimeConfig, raft raftFlags, f encryptionFlags, unwrapObserver monitoring.KEKUnwrapObserver,
+	cfg noderuntime.RuntimeConfig, raftID, raftDir string, f encryptionFlags, unwrapObserver monitoring.KEKUnwrapObserver,
 ) (kek.Wrapper, error) {
 	if err := checkEnvelopeCutoverDivergenceBeforeNonceBump(
-		raft.id,
-		raft.dataDir,
+		raftID,
+		raftDir,
 		cfg.Groups,
 		cfg.DefaultGroup,
 		cfg.Multi,

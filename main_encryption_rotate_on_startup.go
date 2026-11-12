@@ -14,6 +14,7 @@ import (
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryption/kek"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
@@ -61,7 +62,7 @@ type encryptionRotateOnStartupTask struct {
 func installEncryptionRotateOnStartup(
 	ctx context.Context,
 	requested bool,
-	rt *raftGroupRuntime,
+	rt *noderuntime.GroupRuntime,
 	postCutoverProposer raftengine.Proposer,
 	sidecarPath string,
 	kekWrapper kek.Wrapper,

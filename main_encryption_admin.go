@@ -3,6 +3,7 @@ package main
 import (
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/internal/encryption"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
@@ -107,8 +108,8 @@ type encryptionAdminRuntimeOptions struct {
 	postCutoverProposer raftengine.Proposer
 }
 
-func encryptionAdminDefaultRuntimeOptions(runtimes []*raftGroupRuntime, shardGroups map[uint64]*kv.ShardGroup, defaultGroupID uint64, requireDefault bool) (encryptionAdminRuntimeOptions, error) {
-	defaultRuntime := findDefaultGroupRuntime(runtimes, defaultGroupID)
+func encryptionAdminDefaultRuntimeOptions(runtimes []*noderuntime.GroupRuntime, shardGroups map[uint64]*kv.ShardGroup, defaultGroupID uint64, requireDefault bool) (encryptionAdminRuntimeOptions, error) {
+	defaultRuntime := noderuntime.FindGroupRuntime(runtimes, defaultGroupID)
 	if defaultRuntime == nil || defaultRuntime.Engine == nil {
 		if requireDefault {
 			return encryptionAdminRuntimeOptions{}, errors.Errorf("failed to wire encryption admin default group %d: runtime is unavailable", defaultGroupID)
@@ -117,8 +118,8 @@ func encryptionAdminDefaultRuntimeOptions(runtimes []*raftGroupRuntime, shardGro
 	}
 	return encryptionAdminRuntimeOptions{
 		engine:              defaultRuntime.Engine,
-		latestAppliedIndex:  appliedIndexForEngine(defaultRuntime.Engine),
-		postCutoverProposer: postCutoverProposerForRuntime(defaultRuntime, shardGroups),
+		latestAppliedIndex:  noderuntime.AppliedIndexForEngine(defaultRuntime.Engine),
+		postCutoverProposer: noderuntime.PostCutoverProposer(defaultRuntime, shardGroups),
 	}, nil
 }
 

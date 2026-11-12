@@ -135,7 +135,7 @@ func multiEnablementStart(t *testing.T, base string, identities []*multiEnableme
 	t.Cleanup(closeAll)
 	servers := make([]raftengine.Server, 0, len(identities))
 	for _, identity := range identities {
-		servers = append(servers, raftengine.Server{ID: identity.id, Address: identity.address, Suffrage: raftMemberSuffrageVoter})
+		servers = append(servers, raftengine.Server{ID: identity.id, Address: identity.address, Suffrage: noderuntime.VoterSuffrage})
 	}
 	for i, identity := range identities {
 		if protected && delayLastMember && i == multiEnablementMembers-1 {

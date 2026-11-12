@@ -140,7 +140,7 @@ func TestRouteGroupFromConfiguration_Empty(t *testing.T) {
 // RPC is then unreachable, so wiring a fan-out would be dead weight.
 func TestBuildEncryptionCapabilityFanout_DisabledReturnsNil(t *testing.T) {
 	t.Parallel()
-	if fn := buildEncryptionCapabilityFanout(context.Background(), nil, nil, false); fn != nil {
+	if fn := buildEncryptionCapabilityFanout(context.Background(), nil, nil, nil, false); fn != nil {
 		t.Error("buildEncryptionCapabilityFanout(enableMutators=false) = non-nil, want nil")
 	}
 }
@@ -321,7 +321,7 @@ func TestStorageEnvelopeV2CapabilityMonitorReleasesConnectionsOnActivation(t *te
 // an operator may call at any time.
 func TestStorageEnvelopeV2MonitorFanoutOwnsItsConnections(t *testing.T) {
 	t.Parallel()
-	fn, release := buildStorageEnvelopeV2MonitorFanout(nil, true)
+	fn, release := buildStorageEnvelopeV2MonitorFanout(nil, nil, true)
 	if fn == nil || release == nil {
 		t.Fatal("monitor fan-out and its release must both be present when mutators are enabled")
 	}
@@ -329,7 +329,7 @@ func TestStorageEnvelopeV2MonitorFanoutOwnsItsConnections(t *testing.T) {
 		t.Fatalf("release: %v", err)
 	}
 
-	if fn, release := buildStorageEnvelopeV2MonitorFanout(nil, false); fn != nil || release != nil {
+	if fn, release := buildStorageEnvelopeV2MonitorFanout(nil, nil, false); fn != nil || release != nil {
 		t.Error("monitor fan-out must be absent when encryption mutators are disabled")
 	}
 }
