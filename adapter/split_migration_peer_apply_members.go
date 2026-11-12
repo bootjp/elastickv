@@ -1,42 +1,41 @@
-package splitmigration
+package adapter
 
 import (
 	"context"
 	"strings"
 
-	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/cockroachdb/errors"
 )
 
-func ApplyMemberSnapshotFactory(groups map[uint64]*kv.ShardGroup, cache *kv.GRPCConnCache, token string) adapter.SplitMigrationApplyMemberSnapshotFactory {
-	return func(ctx context.Context, groupID uint64) (adapter.SplitMigrationApplyMemberSnapshot, error) {
+func NewSplitMigrationApplyMemberSnapshotGRPCFactory(groups map[uint64]*kv.ShardGroup, cache *kv.GRPCConnCache, token string) SplitMigrationApplyMemberSnapshotFactory {
+	return func(ctx context.Context, groupID uint64) (SplitMigrationApplyMemberSnapshot, error) {
 		group := groups[groupID]
 		if group == nil || group.Engine == nil || cache == nil {
-			return adapter.SplitMigrationApplyMemberSnapshot{}, errors.New("migration apply-member group or connection cache is missing")
+			return SplitMigrationApplyMemberSnapshot{}, errors.New("migration apply-member group or connection cache is missing")
 		}
 		engine := group.Engine
 		before, err := splitMigrationApplyConfiguration(engine)
 		if err != nil {
-			return adapter.SplitMigrationApplyMemberSnapshot{}, err
+			return SplitMigrationApplyMemberSnapshot{}, err
 		}
 		cfg, err := engine.Configuration(ctx)
 		if err != nil {
-			return adapter.SplitMigrationApplyMemberSnapshot{}, errors.WithStack(err)
+			return SplitMigrationApplyMemberSnapshot{}, errors.WithStack(err)
 		}
 		members, err := splitMigrationApplyMembers(groupID, cfg.Servers, cache, token)
 		if err != nil {
-			return adapter.SplitMigrationApplyMemberSnapshot{}, err
+			return SplitMigrationApplyMemberSnapshot{}, err
 		}
 		after, err := splitMigrationApplyConfiguration(engine)
 		if err != nil {
-			return adapter.SplitMigrationApplyMemberSnapshot{}, err
+			return SplitMigrationApplyMemberSnapshot{}, err
 		}
 		if before != after {
-			return adapter.SplitMigrationApplyMemberSnapshot{}, errors.New("migration apply-member configuration changed during resolution")
+			return SplitMigrationApplyMemberSnapshot{}, errors.New("migration apply-member configuration changed during resolution")
 		}
-		return adapter.SplitMigrationApplyMemberSnapshot{ConfigurationIndex: before, Members: members}, nil
+		return SplitMigrationApplyMemberSnapshot{ConfigurationIndex: before, Members: members}, nil
 	}
 }
 
@@ -55,11 +54,11 @@ func splitMigrationApplyConfiguration(engine raftengine.Engine) (uint64, error) 
 	return index, nil
 }
 
-func splitMigrationApplyMembers(groupID uint64, servers []raftengine.Server, cache *kv.GRPCConnCache, token string) ([]adapter.SplitMigrationVoter, error) {
+func splitMigrationApplyMembers(groupID uint64, servers []raftengine.Server, cache *kv.GRPCConnCache, token string) ([]SplitMigrationVoter, error) {
 	if len(servers) == 0 {
 		return nil, errors.New("migration apply-member configuration is empty")
 	}
-	members := make([]adapter.SplitMigrationVoter, 0, len(servers))
+	members := make([]SplitMigrationVoter, 0, len(servers))
 	ids, addresses := make(map[string]struct{}, len(servers)), make(map[string]struct{}, len(servers))
 	for _, server := range servers {
 		server.ID, server.Address = strings.TrimSpace(server.ID), strings.TrimSpace(server.Address)

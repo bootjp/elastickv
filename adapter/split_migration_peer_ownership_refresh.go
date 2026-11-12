@@ -1,17 +1,16 @@
-package splitmigration
+package adapter
 
 import (
 	"context"
 
-	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
 	"golang.org/x/sync/errgroup"
 )
 
-func OwnershipRootClientFactory(resolve func() (string, error), cache *kv.GRPCConnCache, token string) adapter.MigrationOwnershipAttestorFactory {
-	return func(context.Context) (adapter.MigrationOwnershipAttestor, error) {
+func NewMigrationOwnershipRootGRPCClientFactory(resolve func() (string, error), cache *kv.GRPCConnCache, token string) MigrationOwnershipAttestorFactory {
+	return func(context.Context) (MigrationOwnershipAttestor, error) {
 		// This endpoint is never downgraded to anonymous catalog reads, even
 		// during peer send-first rollout or on an unsupported old root binary.
 		if token == "" || resolve == nil || cache == nil {
@@ -29,7 +28,7 @@ func OwnershipRootClientFactory(resolve func() (string, error), cache *kv.GRPCCo
 	}
 }
 
-func StartOwnershipRefresh(ctx context.Context, eg *errgroup.Group, server *adapter.DistributionServer, ready ReadinessGate) {
+func StartMigrationOwnershipRefresh(ctx context.Context, eg *errgroup.Group, server *DistributionServer, ready MigrationReadinessGate) {
 	if eg == nil || server == nil || ready.Check(ctx) != nil {
 		return
 	}

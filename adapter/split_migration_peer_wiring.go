@@ -1,4 +1,4 @@
-package splitmigration
+package adapter
 
 import (
 	"context"
@@ -6,7 +6,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
@@ -19,21 +18,21 @@ import (
 // voterSuffrage is the raftengine.Server suffrage of a voting member.
 const voterSuffrage = "voter"
 
-type CapabilityPeer struct {
+type SplitMigrationCapabilityPeer struct {
 	ID      string
 	Address string
 }
 
-type CapabilityPeerSource func(context.Context) ([]CapabilityPeer, error)
+type SplitMigrationCapabilityPeerSource func(context.Context) ([]SplitMigrationCapabilityPeer, error)
 
-type CapabilityProbe func(context.Context, string) error
+type SplitMigrationCapabilityProbe func(context.Context, string) error
 
-func CapabilityPeersFromConfiguration(cfg raftengine.Configuration) []CapabilityPeer {
+func SplitMigrationCapabilityPeersFromConfiguration(cfg raftengine.Configuration) []SplitMigrationCapabilityPeer {
 	servers := cfg.Servers
 	if len(servers) == 0 {
 		return nil
 	}
-	peers := make([]CapabilityPeer, 0, len(servers))
+	peers := make([]SplitMigrationCapabilityPeer, 0, len(servers))
 	seen := make(map[string]struct{}, len(servers))
 	for _, server := range servers {
 		key := server.ID + "\x00" + server.Address
@@ -45,7 +44,7 @@ func CapabilityPeersFromConfiguration(cfg raftengine.Configuration) []Capability
 		if id == "" {
 			id = server.Address
 		}
-		peers = append(peers, CapabilityPeer{
+		peers = append(peers, SplitMigrationCapabilityPeer{
 			ID:      id,
 			Address: server.Address,
 		})
@@ -53,14 +52,14 @@ func CapabilityPeersFromConfiguration(cfg raftengine.Configuration) []Capability
 	return peers
 }
 
-func NewCapabilityGate(
-	source CapabilityPeerSource,
+func NewSplitMigrationCapabilityGate(
+	source SplitMigrationCapabilityPeerSource,
 	timeout time.Duration,
-	probe CapabilityProbe,
-	localGate adapter.SplitMigrationCapabilityGate,
-) adapter.SplitMigrationCapabilityGate {
+	probe SplitMigrationCapabilityProbe,
+	localGate SplitMigrationCapabilityGate,
+) SplitMigrationCapabilityGate {
 	if probe == nil {
-		probe = ProbeCapabilityPeer
+		probe = ProbeSplitMigrationCapabilityPeer
 	}
 	return func(ctx context.Context) error {
 		if localGate != nil {
@@ -96,11 +95,11 @@ func NewCapabilityGate(
 	}
 }
 
-func ProbeCapabilityPeer(ctx context.Context, address string) error {
-	return ProbeCapabilityPeerWithDial(ctx, address)
+func ProbeSplitMigrationCapabilityPeer(ctx context.Context, address string) error {
+	return ProbeSplitMigrationCapabilityPeerWithDial(ctx, address)
 }
 
-func ProbeCapabilityPeerWithDial(ctx context.Context, address string, providers ...kv.GRPCDialOptionsForAddress) error {
+func ProbeSplitMigrationCapabilityPeerWithDial(ctx context.Context, address string, providers ...kv.GRPCDialOptionsForAddress) error {
 	if strings.TrimSpace(address) == "" {
 		return errors.New("empty split migration capability peer address")
 	}
@@ -118,17 +117,17 @@ func ProbeCapabilityPeerWithDial(ctx context.Context, address string, providers 
 	if resp == nil || !resp.GetMigrationCapable() {
 		return errors.New("peer does not advertise split migration capability")
 	}
-	if !slices.Contains(resp.GetCapabilities(), adapter.SplitMigrationCapabilityV2) {
-		return errors.Errorf("peer does not advertise %s", adapter.SplitMigrationCapabilityV2)
+	if !slices.Contains(resp.GetCapabilities(), SplitMigrationCapabilityV2) {
+		return errors.Errorf("peer does not advertise %s", SplitMigrationCapabilityV2)
 	}
 	return nil
 }
 
-type PromotionLeaderResolver func(distribution.SplitJob) (string, error)
+type SplitPromotionLeaderResolver func(distribution.SplitJob) (string, error)
 
-type LeaderResolver func(uint64) (string, error)
+type SplitMigrationLeaderResolver func(uint64) (string, error)
 
-func PromotionTargetLeaderResolver(shardGroups map[uint64]*kv.ShardGroup) PromotionLeaderResolver {
+func SplitPromotionTargetLeaderResolver(shardGroups map[uint64]*kv.ShardGroup) SplitPromotionLeaderResolver {
 	return func(job distribution.SplitJob) (string, error) {
 		sg := shardGroups[job.TargetGroupID]
 		if sg == nil || sg.Engine == nil {
@@ -142,7 +141,7 @@ func PromotionTargetLeaderResolver(shardGroups map[uint64]*kv.ShardGroup) Promot
 	}
 }
 
-func GroupLeaderResolver(shardGroups map[uint64]*kv.ShardGroup) LeaderResolver {
+func SplitMigrationGroupLeaderResolver(shardGroups map[uint64]*kv.ShardGroup) SplitMigrationLeaderResolver {
 	return func(groupID uint64) (string, error) {
 		sg := shardGroups[groupID]
 		if sg == nil || sg.Engine == nil {
@@ -156,8 +155,8 @@ func GroupLeaderResolver(shardGroups map[uint64]*kv.ShardGroup) LeaderResolver {
 	}
 }
 
-func PromotionClientFactory(resolve PromotionLeaderResolver, connCache *kv.GRPCConnCache, token string) adapter.SplitPromotionClientFactory {
-	return func(_ context.Context, job distribution.SplitJob) (adapter.SplitPromotionClient, error) {
+func NewSplitPromotionGRPCClientFactory(resolve SplitPromotionLeaderResolver, connCache *kv.GRPCConnCache, token string) SplitPromotionClientFactory {
+	return func(_ context.Context, job distribution.SplitJob) (SplitPromotionClient, error) {
 		if resolve == nil {
 			return nil, errors.New("split promotion leader resolver is not configured")
 		}
@@ -176,9 +175,9 @@ func PromotionClientFactory(resolve PromotionLeaderResolver, connCache *kv.GRPCC
 	}
 }
 
-func ClientFactory(resolve LeaderResolver, connCache *kv.GRPCConnCache, token string) adapter.SplitMigrationClientFactory {
-	groupClient := GroupClientFactory(resolve, connCache, token)
-	return func(ctx context.Context, job distribution.SplitJob, sourceGroupID uint64) (adapter.SplitMigrationClient, adapter.SplitMigrationClient, error) {
+func NewSplitMigrationGRPCClientFactory(resolve SplitMigrationLeaderResolver, connCache *kv.GRPCConnCache, token string) SplitMigrationClientFactory {
+	groupClient := NewSplitMigrationGroupGRPCClientFactory(resolve, connCache, token)
+	return func(ctx context.Context, job distribution.SplitJob, sourceGroupID uint64) (SplitMigrationClient, SplitMigrationClient, error) {
 		source, err := groupClient(ctx, sourceGroupID)
 		if err != nil {
 			return nil, nil, err
@@ -191,8 +190,8 @@ func ClientFactory(resolve LeaderResolver, connCache *kv.GRPCConnCache, token st
 	}
 }
 
-func GroupClientFactory(resolve LeaderResolver, connCache *kv.GRPCConnCache, token string) adapter.SplitMigrationGroupClientFactory {
-	return func(_ context.Context, groupID uint64) (adapter.SplitMigrationClient, error) {
+func NewSplitMigrationGroupGRPCClientFactory(resolve SplitMigrationLeaderResolver, connCache *kv.GRPCConnCache, token string) SplitMigrationGroupClientFactory {
+	return func(_ context.Context, groupID uint64) (SplitMigrationClient, error) {
 		if resolve == nil {
 			return nil, errors.New("split migration leader resolver is not configured")
 		}
@@ -211,8 +210,8 @@ func GroupClientFactory(resolve LeaderResolver, connCache *kv.GRPCConnCache, tok
 	}
 }
 
-func VoterFactory(shardGroups map[uint64]*kv.ShardGroup, connCache *kv.GRPCConnCache, token string) adapter.SplitMigrationVoterFactory {
-	return func(ctx context.Context, groupID uint64) ([]adapter.SplitMigrationVoter, error) {
+func NewSplitMigrationGRPCVoterFactory(shardGroups map[uint64]*kv.ShardGroup, connCache *kv.GRPCConnCache, token string) SplitMigrationVoterFactory {
+	return func(ctx context.Context, groupID uint64) ([]SplitMigrationVoter, error) {
 		sg := shardGroups[groupID]
 		if sg == nil || sg.Engine == nil {
 			return nil, errors.Wrapf(kv.ErrLeaderNotFound, "split migration group %d", groupID)
@@ -224,7 +223,7 @@ func VoterFactory(shardGroups map[uint64]*kv.ShardGroup, connCache *kv.GRPCConnC
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}
-		voters := make([]adapter.SplitMigrationVoter, 0, len(cfg.Servers))
+		voters := make([]SplitMigrationVoter, 0, len(cfg.Servers))
 		for _, member := range cfg.Servers {
 			if member.Suffrage != voterSuffrage {
 				continue
@@ -242,14 +241,14 @@ func VoterFactory(shardGroups map[uint64]*kv.ShardGroup, connCache *kv.GRPCConnC
 	}
 }
 
-func splitMigrationVoter(groupID uint64, member raftengine.Server, connCache *kv.GRPCConnCache, token string) (adapter.SplitMigrationVoter, error) {
+func splitMigrationVoter(groupID uint64, member raftengine.Server, connCache *kv.GRPCConnCache, token string) (SplitMigrationVoter, error) {
 	addr := strings.TrimSpace(member.Address)
 	if member.ID == "" || addr == "" {
-		return adapter.SplitMigrationVoter{}, errors.Errorf("split migration group %d has voter with missing id/address", groupID)
+		return SplitMigrationVoter{}, errors.Errorf("split migration group %d has voter with missing id/address", groupID)
 	}
 	conn, err := connCache.ConnFor(addr)
 	if err != nil {
-		return adapter.SplitMigrationVoter{}, errors.WithStack(err)
+		return SplitMigrationVoter{}, errors.WithStack(err)
 	}
-	return adapter.SplitMigrationVoter{ID: member.ID, Address: addr, Client: newSplitMigrationInternalClient(conn, token)}, nil
+	return SplitMigrationVoter{ID: member.ID, Address: addr, Client: newSplitMigrationInternalClient(conn, token)}, nil
 }

@@ -1,4 +1,4 @@
-package splitmigration
+package adapter
 
 import (
 	"context"

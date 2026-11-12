@@ -1,4 +1,4 @@
-package splitmigration
+package adapter
 
 import (
 	"context"
@@ -60,7 +60,7 @@ func TestSplitMigrationApplyMemberSnapshotFactoryPreservesTLSCredentials(t *test
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	ctx = metadata.NewOutgoingContext(ctx, metadata.Pairs("authorization", "Bearer stale", "trace-id", "preserved"))
-	snapshot, err := ApplyMemberSnapshotFactory(map[uint64]*kv.ShardGroup{2: {Engine: engine}}, &cache, "migration-secret")(ctx, 2)
+	snapshot, err := NewSplitMigrationApplyMemberSnapshotGRPCFactory(map[uint64]*kv.ShardGroup{2: {Engine: engine}}, &cache, "migration-secret")(ctx, 2)
 	require.NoError(t, err)
 	for _, member := range snapshot.Members {
 		_, err := member.Client.ProbeMigrationState(ctx, &pb.ProbeMigrationStateRequest{JobId: 11})
@@ -99,7 +99,7 @@ func TestSplitMigrationApplyMemberSnapshotFactoryIncludesLearners(t *testing.T) 
 	engine := newApplyMemberEngine()
 	var cache kv.GRPCConnCache
 	t.Cleanup(func() { require.NoError(t, cache.Close()) })
-	factory := ApplyMemberSnapshotFactory(map[uint64]*kv.ShardGroup{2: {Engine: engine}}, &cache, "migration-secret")
+	factory := NewSplitMigrationApplyMemberSnapshotGRPCFactory(map[uint64]*kv.ShardGroup{2: {Engine: engine}}, &cache, "migration-secret")
 	snapshot, err := factory(t.Context(), 2)
 	require.NoError(t, err)
 	require.Equal(t, uint64(41), snapshot.ConfigurationIndex)
@@ -129,7 +129,7 @@ func TestSplitMigrationApplyMemberSnapshotFactoryRejectsUnstableConfiguration(t 
 			t.Cleanup(func() { require.NoError(t, cache.Close()) })
 			groups := map[uint64]*kv.ShardGroup{2: {Engine: engine}}
 			change(engine)
-			_, err := ApplyMemberSnapshotFactory(groups, &cache, "migration-secret")(t.Context(), 2)
+			_, err := NewSplitMigrationApplyMemberSnapshotGRPCFactory(groups, &cache, "migration-secret")(t.Context(), 2)
 			require.Error(t, err)
 		})
 	}
@@ -140,11 +140,11 @@ func TestSplitMigrationApplyMemberSnapshotFactoryRequiresWiring(t *testing.T) {
 	var cache kv.GRPCConnCache
 	t.Cleanup(func() { require.NoError(t, cache.Close()) })
 	groups := map[uint64]*kv.ShardGroup{2: {Engine: newApplyMemberEngine()}}
-	_, err := ApplyMemberSnapshotFactory(groups, nil, "migration-secret")(t.Context(), 2)
+	_, err := NewSplitMigrationApplyMemberSnapshotGRPCFactory(groups, nil, "migration-secret")(t.Context(), 2)
 	require.Error(t, err)
-	_, err = ApplyMemberSnapshotFactory(groups, &cache, "migration-secret")(t.Context(), 3)
+	_, err = NewSplitMigrationApplyMemberSnapshotGRPCFactory(groups, &cache, "migration-secret")(t.Context(), 3)
 	require.Error(t, err)
 	groups[2].Engine = capabilityConfigEngine{}
-	_, err = ApplyMemberSnapshotFactory(groups, &cache, "migration-secret")(t.Context(), 2)
+	_, err = NewSplitMigrationApplyMemberSnapshotGRPCFactory(groups, &cache, "migration-secret")(t.Context(), 2)
 	require.Error(t, err)
 }

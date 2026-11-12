@@ -30,7 +30,6 @@ import (
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/internal/raftengine/etcd"
-	"github.com/bootjp/elastickv/internal/splitmigration"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -237,7 +236,7 @@ func multiEnablementServices(process *multiEnablementProcess, clock *kv.HLC) {
 	pb.RegisterRawKVServer(process.server, service)
 	pb.RegisterTransactionalKVServer(process.server, service)
 	proposer := process.shard.Proposer()
-	process.transaction = splitmigration.NewInternalTransaction(proposer, nil, process.runtime.Store, process.runtime.Spec.ID)
+	process.transaction = adapter.NewInternalMigrationTransaction(proposer, nil, process.runtime.Store, process.runtime.Spec.ID)
 	options := internalServerOptions(coordinate, nil, proposer, process.shard, process.runtime.Spec.ID)
 	options = append(options, adapter.WithInternalStore(process.runtime.Store), adapter.WithInternalPrimaryCommitEvidence(process.shards))
 	pb.RegisterInternalServer(process.server, adapter.NewInternalWithEngine(process.transaction, process.runtime.Engine, clock, nil, options...))

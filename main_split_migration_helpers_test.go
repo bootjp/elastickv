@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/raftengine"
-	"github.com/bootjp/elastickv/internal/splitmigration"
 	"github.com/bootjp/elastickv/internal/testutil/grpctest"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
@@ -28,7 +28,7 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// Test fakes also defined in internal/splitmigration's own tests; the
+// Test fakes also defined in adapter's split-migration peer tests; the
 // wiring tests that stay in main need them too.
 type splitRangeAuthRPCServer struct {
 	pb.UnimplementedDistributionServer
@@ -191,10 +191,10 @@ func assertOwnershipRootRejectsAnonymous(t *testing.T, ctx context.Context, cach
 	t.Helper()
 	conn, err := cache.ConnFor(address)
 	require.NoError(t, err)
-	ctx = splitmigration.CredentialContext(ctx)
+	ctx = adapter.MigrationCredentialContext(ctx)
 	_, err = pb.NewDistributionClient(conn).AttestMigrationOwnership(ctx, &pb.AttestMigrationOwnershipRequest{JobId: 77, Prior: prior})
 	require.Equal(t, codes.Unauthenticated, status.Code(err))
-	_, err = splitmigration.OwnershipRootClientFactory(func() (string, error) { return address, nil }, cache, "")(ctx)
+	_, err = adapter.NewMigrationOwnershipRootGRPCClientFactory(func() (string, error) { return address, nil }, cache, "")(ctx)
 	require.Error(t, err, "no anonymous fallback even with a reachable root")
 }
 

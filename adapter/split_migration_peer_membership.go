@@ -1,34 +1,33 @@
-package splitmigration
+package adapter
 
 import (
 	"context"
 
-	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/internal/raftadmin"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 )
 
-func MemberProtocolsConfigured() bool {
-	return adapter.MigrationImportOpcodeEnabledFromEnv() || adapter.MigrationPromoteOpcodeEnabledFromEnv() ||
-		adapter.MigrationCleanupOpcodeEnabledFromEnv()
+func MigrationMemberProtocolsConfigured() bool {
+	return MigrationImportOpcodeEnabledFromEnv() || MigrationPromoteOpcodeEnabledFromEnv() ||
+		MigrationCleanupOpcodeEnabledFromEnv()
 }
 
 // Check support before any new member can race a guarded-control proposal.
 // Existing durable evidence keeps the requirement after feature flags change.
-type MembershipGate struct {
+type MigrationMembershipGate struct {
 	store   store.MVCCStore
 	enabled bool
 	probe   func(context.Context, string) error
 	next    raftadmin.MembershipChangeInterceptor
 }
 
-func NewMembershipGate(st store.MVCCStore, enabled bool, probe func(context.Context, string) error, next raftadmin.MembershipChangeInterceptor) *MembershipGate {
-	return &MembershipGate{store: st, enabled: enabled, probe: probe, next: next}
+func NewMigrationMembershipGate(st store.MVCCStore, enabled bool, probe func(context.Context, string) error, next raftadmin.MembershipChangeInterceptor) *MigrationMembershipGate {
+	return &MigrationMembershipGate{store: st, enabled: enabled, probe: probe, next: next}
 }
 
-func (g *MembershipGate) PreAddMember(ctx context.Context, id, address string) error {
+func (g *MigrationMembershipGate) PreAddMember(ctx context.Context, id, address string) error {
 	if err := g.check(ctx, address); err != nil {
 		return err
 	}
@@ -38,7 +37,7 @@ func (g *MembershipGate) PreAddMember(ctx context.Context, id, address string) e
 	return nil
 }
 
-func (g *MembershipGate) PrePromoteMember(ctx context.Context, id, address string) error {
+func (g *MigrationMembershipGate) PrePromoteMember(ctx context.Context, id, address string) error {
 	if err := g.check(ctx, address); err != nil {
 		return err
 	}
@@ -48,7 +47,7 @@ func (g *MembershipGate) PrePromoteMember(ctx context.Context, id, address strin
 	return nil
 }
 
-func (g *MembershipGate) check(ctx context.Context, address string) error {
+func (g *MigrationMembershipGate) check(ctx context.Context, address string) error {
 	if err := ctx.Err(); err != nil {
 		return errors.WithStack(err)
 	}
@@ -62,7 +61,7 @@ func (g *MembershipGate) check(ctx context.Context, address string) error {
 	return errors.WithStack(g.probe(ctx, address))
 }
 
-func (g *MembershipGate) protocolRequired(ctx context.Context) (bool, error) {
+func (g *MigrationMembershipGate) protocolRequired(ctx context.Context) (bool, error) {
 	if g.enabled {
 		return true, nil
 	}

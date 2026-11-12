@@ -12,7 +12,6 @@ import (
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	etcdraft "github.com/bootjp/elastickv/internal/raftengine/etcd"
-	"github.com/bootjp/elastickv/internal/splitmigration"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -23,7 +22,7 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-func newOwnershipRefreshRaftNode(t *testing.T, id string, groupID uint64, st store.MVCCStore, token string, ready splitmigration.ReadinessGate) ownershipRefreshRaftNode {
+func newOwnershipRefreshRaftNode(t *testing.T, id string, groupID uint64, st store.MVCCStore, token string, ready adapter.MigrationReadinessGate) ownershipRefreshRaftNode {
 	t.Helper()
 	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -69,13 +68,13 @@ func TestOwnershipRefreshDifferentRaftLeadersRespectExplicitClosedGate(t *testin
 	dataRoutes := distribution.NewEngine()
 	dataRoutes.UpdateRoute(nil, nil, 7)
 	dataShards := kv.NewShardStore(dataRoutes, groups)
-	dataTx := splitmigration.NewInternalTransaction(data.group.Engine, nil, data.group.Store, 7)
+	dataTx := adapter.NewInternalMigrationTransaction(data.group.Engine, nil, data.group.Store, 7)
 	t.Cleanup(dataTx.Close)
 	data.group.Txn = dataTx
 	var cache kv.GRPCConnCache
 	t.Cleanup(func() { require.NoError(t, cache.Close()) })
-	groupFactory := splitmigration.GroupClientFactory(splitmigration.GroupLeaderResolver(groups), &cache, token)
-	rootFactory := splitmigration.OwnershipRootClientFactory(migrationOwnershipRootLeaderResolver(&raftGroupRuntime{GroupRuntime: &noderuntime.GroupRuntime{Engine: root.group.Engine}}), &cache, token)
+	groupFactory := adapter.NewSplitMigrationGroupGRPCClientFactory(adapter.SplitMigrationGroupLeaderResolver(groups), &cache, token)
+	rootFactory := adapter.NewMigrationOwnershipRootGRPCClientFactory(migrationOwnershipRootLeaderResolver(&raftGroupRuntime{GroupRuntime: &noderuntime.GroupRuntime{Engine: root.group.Engine}}), &cache, token)
 	mirror := distribution.NewEngine()
 	require.NoError(t, mirror.ApplySnapshot(distribution.CatalogSnapshot{Version: 2, Routes: []distribution.RouteDescriptor{{RouteID: 99, GroupID: 99}}}))
 	closedGate := func(context.Context) error {
@@ -84,10 +83,10 @@ func TestOwnershipRefreshDifferentRaftLeadersRespectExplicitClosedGate(t *testin
 	consumer := adapter.NewDistributionServer(mirror, nil,
 		adapter.WithSplitJobRunnerReadinessGate(closedGate),
 		adapter.WithSplitMigrationGroupClientFactory(groupFactory),
-		adapter.WithSplitMigrationVoterFactory(splitmigration.VoterFactory(groups, &cache, token)),
+		adapter.WithSplitMigrationVoterFactory(adapter.NewSplitMigrationGRPCVoterFactory(groups, &cache, token)),
 		adapter.WithMigrationOwnershipRefresh(groups, rootFactory),
-		splitmigration.PartitionRuntimeOption(dataShards, groups, &cache, token, true))
-	require.True(t, splitmigration.OwnershipRuntimeHooksInstalled(dataTx, dataShards, consumer, 7))
+		adapter.MigrationPartitionRuntimeOption(dataShards, groups, &cache, token, true))
+	require.True(t, adapter.MigrationOwnershipRuntimeHooksInstalled(dataTx, dataShards, consumer, 7))
 	pb.RegisterInternalServer(data.server, adapter.NewInternalWithEngine(nil, data.group.Engine, nil, nil,
 		adapter.WithInternalStore(data.group.Store), adapter.WithInternalMigrationProposer(data.group.Engine),
 		adapter.WithInternalMigrationOwnershipReady(func() bool { return closedGate(t.Context()) == nil })))

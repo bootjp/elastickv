@@ -1,4 +1,4 @@
-package splitmigration
+package adapter
 
 import (
 	"context"
@@ -6,7 +6,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/internal/raftadmin"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
@@ -18,7 +17,7 @@ import (
 
 const namespaceMembershipHandshakeTimeout = 2 * time.Second
 
-type NamespaceMembershipGate struct {
+type MigrationNamespaceMembershipGate struct {
 	mu       sync.Mutex
 	store    store.MVCCStore
 	engine   raftengine.Engine
@@ -30,12 +29,12 @@ type NamespaceMembershipGate struct {
 	deriveNodeID func(string) uint64
 }
 
-var _ raftadmin.MembershipChangeInterceptor = (*NamespaceMembershipGate)(nil)
+var _ raftadmin.MembershipChangeInterceptor = (*MigrationNamespaceMembershipGate)(nil)
 
-var _ raftadmin.MembershipPromotionInterceptor = (*NamespaceMembershipGate)(nil)
+var _ raftadmin.MembershipPromotionInterceptor = (*MigrationNamespaceMembershipGate)(nil)
 
-func NewNamespaceMembershipGate(st store.MVCCStore, engine raftengine.Engine, proposer raftengine.Proposer, token string, next raftadmin.MembershipChangeInterceptor, deriveNodeID func(string) uint64, providers ...kv.GRPCDialOptionsForAddress) *NamespaceMembershipGate {
-	return &NamespaceMembershipGate{store: st, engine: engine, Proposer: proposer, Next: next, deriveNodeID: deriveNodeID,
+func NewMigrationNamespaceMembershipGate(st store.MVCCStore, engine raftengine.Engine, proposer raftengine.Proposer, token string, next raftadmin.MembershipChangeInterceptor, deriveNodeID func(string) uint64, providers ...kv.GRPCDialOptionsForAddress) *MigrationNamespaceMembershipGate {
+	return &MigrationNamespaceMembershipGate{store: st, engine: engine, Proposer: proposer, Next: next, deriveNodeID: deriveNodeID,
 		probe: func(ctx context.Context, address string, request *pb.ProbeMigrationStateRequest) (*pb.ProbeMigrationStateResponse, error) {
 			conn, err := kv.NewGRPCClient(address, providers...)
 			if err != nil {
@@ -47,7 +46,7 @@ func NewNamespaceMembershipGate(st store.MVCCStore, engine raftengine.Engine, pr
 		}}
 }
 
-func (g *NamespaceMembershipGate) PreAddMember(ctx context.Context, id, address string) error {
+func (g *MigrationNamespaceMembershipGate) PreAddMember(ctx context.Context, id, address string) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if err := g.authorize(ctx, id, address); err != nil {
@@ -59,7 +58,7 @@ func (g *NamespaceMembershipGate) PreAddMember(ctx context.Context, id, address 
 	return nil
 }
 
-func (g *NamespaceMembershipGate) PrePromoteMember(ctx context.Context, id, address string) error {
+func (g *MigrationNamespaceMembershipGate) PrePromoteMember(ctx context.Context, id, address string) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if err := g.authorize(ctx, id, address); err != nil {
@@ -71,7 +70,7 @@ func (g *NamespaceMembershipGate) PrePromoteMember(ctx context.Context, id, addr
 	return nil
 }
 
-func (g *NamespaceMembershipGate) authorize(ctx context.Context, id, address string) error {
+func (g *MigrationNamespaceMembershipGate) authorize(ctx context.Context, id, address string) error {
 	if err := ctx.Err(); err != nil {
 		return errors.WithStack(err)
 	}
@@ -83,7 +82,7 @@ func (g *NamespaceMembershipGate) authorize(ctx context.Context, id, address str
 	if err != nil {
 		return err
 	}
-	snapshot := func(ctx context.Context) (adapter.NamespaceAdmissionSnapshot, error) { return g.snapshot(ctx) }
+	snapshot := func(ctx context.Context) (NamespaceAdmissionSnapshot, error) { return g.snapshot(ctx) }
 	current, err := snapshot(ctx)
 	if err != nil {
 		return err
@@ -95,7 +94,7 @@ func (g *NamespaceMembershipGate) authorize(ctx context.Context, id, address str
 	activate := func(ctx context.Context, command kv.NamespaceAdmissionCommand) error {
 		return errors.WithStack(kv.ActivateMigrationNamespace(ctx, g.store, g.Proposer, command))
 	}
-	if err := adapter.EnsureMigrationNamespaceAdmissionWithSnapshot(ctx, snapshot, activate, joining); err != nil {
+	if err := EnsureMigrationNamespaceAdmissionWithSnapshot(ctx, snapshot, activate, joining); err != nil {
 		return errors.WithStack(err)
 	}
 	configuration, err := kv.MigrationConfigurationIndex(ctx, g.store)
@@ -105,9 +104,9 @@ func (g *NamespaceMembershipGate) authorize(ctx context.Context, id, address str
 	return errors.WithStack(kv.CheckMigrationNamespacePrejoin(ctx, g.store, configuration, peer.MemberID, installedVersion))
 }
 
-func (g *NamespaceMembershipGate) probeNamespaceCandidate(ctx context.Context, id, address string, version uint32) (adapter.NamespaceAdmissionPeer, uint32, error) {
+func (g *MigrationNamespaceMembershipGate) probeNamespaceCandidate(ctx context.Context, id, address string, version uint32) (NamespaceAdmissionPeer, uint32, error) {
 	if strings.TrimSpace(id) == "" || id != strings.TrimSpace(id) || address == "" || g.engine == nil || g.Proposer == nil || g.probe == nil {
-		return adapter.NamespaceAdmissionPeer{}, 0, errors.WithStack(kv.ErrMigrationNamespaceProtocol)
+		return NamespaceAdmissionPeer{}, 0, errors.WithStack(kv.ErrMigrationNamespaceProtocol)
 	}
 	peer := g.peer(g.deriveNodeID(id), address)
 	attempt, cancel := context.WithTimeout(ctx, namespaceMembershipHandshakeTimeout)
@@ -122,8 +121,8 @@ func (g *NamespaceMembershipGate) probeNamespaceCandidate(ctx context.Context, i
 	return peer, response.GetNamespaceAdmissionVersion(), nil
 }
 
-func namespaceJoiningCandidate(current adapter.NamespaceAdmissionSnapshot, peer adapter.NamespaceAdmissionPeer) ([]adapter.NamespaceAdmissionPeer, error) {
-	joining := []adapter.NamespaceAdmissionPeer{peer}
+func namespaceJoiningCandidate(current NamespaceAdmissionSnapshot, peer NamespaceAdmissionPeer) ([]NamespaceAdmissionPeer, error) {
+	joining := []NamespaceAdmissionPeer{peer}
 	for _, member := range current.Members {
 		if member.MemberID == peer.MemberID {
 			if member.Address != peer.Address {
@@ -144,27 +143,27 @@ func (c namespaceMembershipProbeClient) ProbeMigrationState(ctx context.Context,
 	return c.probe(ctx, c.address, request)
 }
 
-func (g *NamespaceMembershipGate) peer(id uint64, address string) adapter.NamespaceAdmissionPeer {
-	return adapter.NamespaceAdmissionPeer{MemberID: id, Address: address, Client: namespaceMembershipProbeClient{address: address, probe: g.probe}}
+func (g *MigrationNamespaceMembershipGate) peer(id uint64, address string) NamespaceAdmissionPeer {
+	return NamespaceAdmissionPeer{MemberID: id, Address: address, Client: namespaceMembershipProbeClient{address: address, probe: g.probe}}
 }
 
-func (g *NamespaceMembershipGate) snapshot(ctx context.Context) (adapter.NamespaceAdmissionSnapshot, error) {
+func (g *MigrationNamespaceMembershipGate) snapshot(ctx context.Context) (NamespaceAdmissionSnapshot, error) {
 	if _, err := g.engine.LinearizableRead(ctx); err != nil {
-		return adapter.NamespaceAdmissionSnapshot{}, errors.WithStack(err)
+		return NamespaceAdmissionSnapshot{}, errors.WithStack(err)
 	}
 	reader, ok := g.engine.(raftengine.AppliedConfigurationReader)
 	if !ok {
-		return adapter.NamespaceAdmissionSnapshot{}, errors.WithStack(kv.ErrMigrationNamespaceProtocol)
+		return NamespaceAdmissionSnapshot{}, errors.WithStack(kv.ErrMigrationNamespaceProtocol)
 	}
 	before, err := g.namespaceSnapshotConfigurationIndex(reader)
 	if err != nil {
-		return adapter.NamespaceAdmissionSnapshot{}, err
+		return NamespaceAdmissionSnapshot{}, err
 	}
 	configuration, err := g.engine.Configuration(ctx)
 	if err != nil {
-		return adapter.NamespaceAdmissionSnapshot{}, errors.WithStack(err)
+		return NamespaceAdmissionSnapshot{}, errors.WithStack(err)
 	}
-	result := adapter.NamespaceAdmissionSnapshot{ConfigurationIndex: before}
+	result := NamespaceAdmissionSnapshot{ConfigurationIndex: before}
 	for _, member := range configuration.Servers {
 		if member.ID == "" || member.ID != strings.TrimSpace(member.ID) {
 			return result, errors.WithStack(kv.ErrMigrationNamespaceProtocol)
@@ -181,7 +180,7 @@ func (g *NamespaceMembershipGate) snapshot(ctx context.Context) (adapter.Namespa
 	return result, nil
 }
 
-func (g *NamespaceMembershipGate) namespaceSnapshotConfigurationIndex(reader raftengine.AppliedConfigurationReader) (uint64, error) {
+func (g *MigrationNamespaceMembershipGate) namespaceSnapshotConfigurationIndex(reader raftengine.AppliedConfigurationReader) (uint64, error) {
 	index, supported := reader.AppliedConfigurationIndex()
 	if !supported || index == 0 || g.engine.Status().PendingConfChange {
 		return 0, errors.WithStack(kv.ErrMigrationNamespaceProtocol)
