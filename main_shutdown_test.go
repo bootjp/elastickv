@@ -74,10 +74,10 @@ func TestShutdownSignalTransfersAllLeadersBeforeCancellation(t *testing.T) {
 	follower.leader.Store(false)
 	runtimes := []*raftGroupRuntime{
 		nil,
-		{},
-		{spec: noderuntime.GroupSpec{ID: 1}, engine: shutdownTestEngine(transfer)},
-		{spec: noderuntime.GroupSpec{ID: 2}, engine: shutdownTestEngine(transfer)},
-		{spec: noderuntime.GroupSpec{ID: 3}, engine: follower},
+		{GroupRuntime: &noderuntime.GroupRuntime{}},
+		{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 1}, Engine: shutdownTestEngine(transfer)}},
+		{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 2}, Engine: shutdownTestEngine(transfer)}},
+		{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 3}, Engine: follower}},
 	}
 	requests := make(chan struct{})
 	close(requests)
@@ -106,8 +106,8 @@ func TestShutdownSignalTransfersLeadershipAcquiredDuringHandoff(t *testing.T) {
 	requests := make(chan struct{})
 	close(requests)
 	shutdownAfterRequest(ctx, cancel, []*raftGroupRuntime{
-		{spec: noderuntime.GroupSpec{ID: 1}, engine: follower},
-		{spec: noderuntime.GroupSpec{ID: 2}, engine: leader},
+		{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 1}, Engine: follower}},
+		{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 2}, Engine: leader}},
 	}, requests, time.Second, nil)
 	require.Equal(t, int32(1), followerTransfers.Load())
 	require.Equal(t, raftengine.StateFollower, follower.State())
@@ -125,8 +125,8 @@ func TestShutdownSignalSharesDeadlineAcrossGroups(t *testing.T) {
 		return transferCtx.Err()
 	}
 	runtimes := []*raftGroupRuntime{
-		{spec: noderuntime.GroupSpec{ID: 1}, engine: shutdownTestEngine(transfer)},
-		{spec: noderuntime.GroupSpec{ID: 2}, engine: shutdownTestEngine(transfer)},
+		{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 1}, Engine: shutdownTestEngine(transfer)}},
+		{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 2}, Engine: shutdownTestEngine(transfer)}},
 	}
 	requests := make(chan struct{})
 	close(requests)
@@ -198,5 +198,5 @@ func TestShutdownAlreadyCanceledDoesNotTransfer(t *testing.T) {
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	shutdownAfterRequest(ctx, cancel, []*raftGroupRuntime{{engine: engine}}, make(chan struct{}), time.Second, nil)
+	shutdownAfterRequest(ctx, cancel, []*raftGroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{Engine: engine}}}, make(chan struct{}), time.Second, nil)
 }

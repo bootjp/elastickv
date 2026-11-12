@@ -216,7 +216,7 @@ func TestCheckSidecarBehindRaftLog_NoRuntimes(t *testing.T) {
 func TestCheckSidecarBehindRaftLog_NilEngineFailsClosed(t *testing.T) {
 	t.Parallel()
 	sidecarPath := writeMinimalSidecar(t, 10)
-	rt := &raftGroupRuntime{spec: noderuntime.GroupSpec{ID: 1}} // engine field stays nil
+	rt := &raftGroupRuntime{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 1}}} // engine field stays nil
 	err := checkSidecarBehindRaftLog([]*raftGroupRuntime{rt}, 1, sidecarPath, true)
 	if err == nil {
 		t.Fatal("guard must fail-closed when default-group engine is nil")
@@ -346,8 +346,10 @@ func TestCheckEnvelopeCutoverDivergenceStartupGuard_Fires(t *testing.T) {
 	t.Parallel()
 	sidecarPath := writeRaftCutoverSidecarForStartup(t, 8, 3, 100)
 	rt := &raftGroupRuntime{
-		spec:         noderuntime.GroupSpec{ID: 1},
-		stateMachine: &stubRestoredCutoverStateMachine{cutover: 200},
+		GroupRuntime: &noderuntime.GroupRuntime{
+			Spec:         noderuntime.GroupSpec{ID: 1},
+			StateMachine: &stubRestoredCutoverStateMachine{cutover: 200},
+		},
 	}
 	err := checkEnvelopeCutoverDivergenceStartupGuard([]*raftGroupRuntime{rt}, 1, sidecarPath, true)
 	if !errors.Is(err, encryption.ErrEnvelopeCutoverDivergence) {
@@ -359,8 +361,10 @@ func TestCheckEnvelopeCutoverDivergenceStartupGuard_Match(t *testing.T) {
 	t.Parallel()
 	sidecarPath := writeRaftCutoverSidecarForStartup(t, 8, 3, 100)
 	rt := &raftGroupRuntime{
-		spec:         noderuntime.GroupSpec{ID: 1},
-		stateMachine: &stubRestoredCutoverStateMachine{cutover: 100},
+		GroupRuntime: &noderuntime.GroupRuntime{
+			Spec:         noderuntime.GroupSpec{ID: 1},
+			StateMachine: &stubRestoredCutoverStateMachine{cutover: 100},
+		},
 	}
 	if err := checkEnvelopeCutoverDivergenceStartupGuard([]*raftGroupRuntime{rt}, 1, sidecarPath, true); err != nil {
 		t.Fatalf("matching snapshot/sidecar cutover must pass, got %v", err)
@@ -388,8 +392,10 @@ func TestCheckEnvelopeCutoverDivergenceStartupGuard_PreBootstrapSkips(t *testing
 	t.Parallel()
 	sidecarPath := writeMinimalSidecar(t, 1)
 	rt := &raftGroupRuntime{
-		spec:         noderuntime.GroupSpec{ID: 1},
-		stateMachine: &stubRestoredCutoverStateMachine{cutover: 0},
+		GroupRuntime: &noderuntime.GroupRuntime{
+			Spec:         noderuntime.GroupSpec{ID: 1},
+			StateMachine: &stubRestoredCutoverStateMachine{cutover: 0},
+		},
 	}
 	if err := checkEnvelopeCutoverDivergenceStartupGuard([]*raftGroupRuntime{rt}, 1, sidecarPath, true); err != nil {
 		t.Fatalf("pre-bootstrap sidecar must skip cutover divergence guard, got %v", err)
@@ -407,7 +413,7 @@ func TestCheckEncryptionMembershipStartupGuardsBeforeEngine_NodeIDCollisionFromP
 		{NodeID: etcdraftengine.DeriveNodeID("n498"), ID: "n498", Address: "127.0.0.1:7001"},
 		{NodeID: etcdraftengine.DeriveNodeID("n784"), ID: "n784", Address: "127.0.0.1:7002"},
 	}
-	seedPersistedPeersForStartupGuard(t, groupDataDir(raftDir, "n1", 1, false), peers)
+	seedPersistedPeersForStartupGuard(t, noderuntime.GroupDataDir(raftDir, "n1", 1, false), peers)
 	err := checkEncryptionMembershipStartupGuardsBeforeEngine(encryptionMembershipStartupGuardInput{
 		raftID:            "n1",
 		raftDir:           raftDir,
@@ -432,7 +438,7 @@ func TestCheckEncryptionMembershipStartupGuardsBeforeEngine_DerivesPersistedPeer
 		{NodeID: 1, ID: "n498", Address: "127.0.0.1:7001"},
 		{NodeID: 2, ID: "n784", Address: "127.0.0.1:7002"},
 	}
-	seedPersistedPeersForStartupGuard(t, groupDataDir(raftDir, "n1", 1, false), peers)
+	seedPersistedPeersForStartupGuard(t, noderuntime.GroupDataDir(raftDir, "n1", 1, false), peers)
 	err := checkEncryptionMembershipStartupGuardsBeforeEngine(encryptionMembershipStartupGuardInput{
 		raftID:            "n1",
 		raftDir:           raftDir,
@@ -450,7 +456,7 @@ func TestCheckEncryptionMembershipStartupGuardsBeforeEngine_LocalEpochEqualAllow
 	t.Parallel()
 	sidecarPath := writeActiveStorageSidecarForStartup(t, 2)
 	raftDir := t.TempDir()
-	storePath := filepath.Join(groupDataDir(raftDir, "n1", 1, false), "fsm.db")
+	storePath := filepath.Join(noderuntime.GroupDataDir(raftDir, "n1", 1, false), "fsm.db")
 	if err := os.MkdirAll(filepath.Dir(storePath), dirPerm); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
 	}
@@ -487,7 +493,7 @@ func TestCheckEncryptionMembershipStartupGuardsBeforeEngine_LocalEpochBehindRoll
 	t.Parallel()
 	sidecarPath := writeActiveStorageSidecarForStartup(t, 1)
 	raftDir := t.TempDir()
-	storePath := filepath.Join(groupDataDir(raftDir, "n1", 1, false), "fsm.db")
+	storePath := filepath.Join(noderuntime.GroupDataDir(raftDir, "n1", 1, false), "fsm.db")
 	if err := os.MkdirAll(filepath.Dir(storePath), dirPerm); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
 	}
@@ -555,7 +561,7 @@ func TestCheckLocalEpochRollbackAfterReplay_RejectsEqualEpochAfterBump(t *testin
 
 	err = checkLocalEpochRollbackAfterReplay(
 		"n1",
-		[]*raftGroupRuntime{{spec: noderuntime.GroupSpec{ID: 1}, store: st}},
+		[]*raftGroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 1}, Store: st}}},
 		1,
 		sidecarPath,
 		true,
@@ -582,7 +588,7 @@ func TestCheckLocalEpochRollbackAfterReplay_AllowsBumpedAheadEpoch(t *testing.T)
 
 	err = checkLocalEpochRollbackAfterReplay(
 		"n1",
-		[]*raftGroupRuntime{{spec: noderuntime.GroupSpec{ID: 1}, store: st}},
+		[]*raftGroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 1}, Store: st}}},
 		1,
 		sidecarPath,
 		true,

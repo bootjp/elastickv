@@ -251,7 +251,7 @@ func checkEnvelopeCutoverDivergenceBeforeNonceBump(
 	if sc != nil {
 		sidecarCutover = sc.RaftEnvelopeCutoverIndex
 	}
-	dir := groupDataDir(raftDir, raftID, defaultGroup, multi)
+	dir := noderuntime.GroupDataDir(raftDir, raftID, defaultGroup, multi)
 	if !hasGroup(defaultGroup, groups) {
 		return nil
 	}
@@ -308,7 +308,7 @@ func checkEnvelopeCutoverDivergenceForRuntime(
 	if rt == nil {
 		return nil
 	}
-	if rt.stateMachine == nil {
+	if rt.StateMachine == nil {
 		if sc.RaftEnvelopeCutoverIndex == 0 {
 			return nil
 		}
@@ -316,7 +316,7 @@ func checkEnvelopeCutoverDivergenceForRuntime(
 			"encryption startup guard: state machine for default group %d is nil (cannot compare restored raft envelope cutover)",
 			defaultGroup)
 	}
-	source, ok := rt.stateMachine.(restoredCutoverReader)
+	source, ok := rt.StateMachine.(restoredCutoverReader)
 	if !ok {
 		if sc.RaftEnvelopeCutoverIndex == 0 {
 			return nil
@@ -417,7 +417,7 @@ func memberFullNodeIDsFromDisk(
 		out = append(out, fullNodeID)
 	}
 	for _, g := range groups {
-		dir := groupDataDir(raftDir, raftID, g.ID, multi)
+		dir := noderuntime.GroupDataDir(raftDir, raftID, g.ID, multi)
 		peers, ok, err := etcdraftengine.LoadPersistedPeers(dir)
 		if err != nil {
 			return nil, pkgerrors.Wrapf(err,
@@ -458,7 +458,7 @@ func checkLocalEpochRollbackFromDisk(
 			sc.Active.Storage)
 	}
 	fullNodeID := etcdraftengine.DeriveNodeID(raftID)
-	storePath := filepath.Join(groupDataDir(raftDir, raftID, defaultGroup, multi), "fsm.db")
+	storePath := filepath.Join(noderuntime.GroupDataDir(raftDir, raftID, defaultGroup, multi), "fsm.db")
 	if _, err := os.Stat(storePath); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			if err := checkLocalEpochRollbackBeforeBump(
@@ -588,10 +588,10 @@ func activeStorageKeyForStartupGuard(sidecarPath string) (*encryption.Sidecar, e
 
 func writerRegistryAfterReplay(runtimes []*raftGroupRuntime, defaultGroup uint64) (encryption.WriterRegistryStore, error) {
 	defaultRuntime := findDefaultGroupRuntime(runtimes, defaultGroup)
-	if defaultRuntime == nil || defaultRuntime.store == nil {
+	if defaultRuntime == nil || defaultRuntime.Store == nil {
 		return nil, pkgerrors.Errorf("encryption startup guard: default group %d runtime unavailable after raft replay", defaultGroup)
 	}
-	reg, err := store.WriterRegistryFor(defaultRuntime.store)
+	reg, err := store.WriterRegistryFor(defaultRuntime.Store)
 	if err != nil {
 		return nil, pkgerrors.Wrap(err, "encryption startup guard: writer registry after raft replay")
 	}
@@ -662,7 +662,7 @@ func (missingWriterRegistry) SetRegistryRow(_, _ []byte) error {
 // sidecar's raft_applied_index.
 func findDefaultGroupRuntime(runtimes []*raftGroupRuntime, defaultGroup uint64) *raftGroupRuntime {
 	for _, rt := range runtimes {
-		if rt != nil && rt.spec.ID == defaultGroup {
+		if rt != nil && rt.Spec.ID == defaultGroup {
 			return rt
 		}
 	}

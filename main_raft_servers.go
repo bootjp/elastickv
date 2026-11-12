@@ -122,41 +122,41 @@ func startRaftServers(
 		adapter.WithEncryptionAdminCutoverBarrier(encWiring.raftEnvelope.barrier()),
 	)
 	for _, rt := range runtimes {
-		serverOptions := append(slices.Clone(rt.transportServerOptions), raftGRPCServerOptions(adminGRPCOpts)...)
+		serverOptions := append(slices.Clone(rt.TransportServerOptions), raftGRPCServerOptions(adminGRPCOpts)...)
 		gs := grpc.NewServer(serverOptions...)
-		trx := newInternalMigrationTransaction(proposerForGroup(rt, shardGroups), observerForGroup(proposalObserverForGroup, rt.spec.ID), rt.store, rt.spec.ID)
+		trx := newInternalMigrationTransaction(proposerForGroup(rt, shardGroups), observerForGroup(proposalObserverForGroup, rt.Spec.ID), rt.Store, rt.Spec.ID)
 		grpcSvc := adapter.NewGRPCServer(shardStore, coordinate)
 		pb.RegisterRawKVServer(gs, grpcSvc)
 		pb.RegisterTransactionalKVServer(gs, grpcSvc)
-		internalOpts := internalServerOptions(coordinate, adminServer, proposerForGroup(rt, shardGroups), shardGroups[rt.spec.ID], rt.spec.ID)
+		internalOpts := internalServerOptions(coordinate, adminServer, proposerForGroup(rt, shardGroups), shardGroups[rt.Spec.ID], rt.Spec.ID)
 		internalOpts = append(internalOpts, bootstrapInternalPolicyOptions(rt, proposerForGroup(rt, shardGroups))...)
 		internalOpts = append(internalOpts, dedicatedTimestampCutoverOptions(shardGroups)...)
 		internalOpts = append(internalOpts, adapter.WithInternalMigrationOwnershipReady(func() bool {
-			return migrationOwnershipRuntimeReady(trx, shardStore, distServer, rt.spec.ID, rt.snapshotEngine(), adminGRPCOpts.migrationReady)
+			return migrationOwnershipRuntimeReady(trx, shardStore, distServer, rt.Spec.ID, rt.snapshotEngine(), adminGRPCOpts.migrationReady)
 		}))
 		internalOpts = append(internalOpts, migrationInternalProtocolOptions(trx, shardStore, distServer, rt)...)
 		internalOpts = append(internalOpts, internalReadWatermarkOptions(readWatermarkAdvance, rt, shardGroups)...)
 		staticServingServices := registerS3BlobFetchServer(
 			gs,
 			adminGRPCOpts.s3BlobFetchEnabled,
-			rt.store,
+			rt.Store,
 			s3BlobObserver,
 			coordinate.Clock(),
 			s3BlobPushBlocked,
 		)
 		pb.RegisterInternalServer(gs, adapter.NewInternalWithEngine(
 			trx,
-			rt.engine,
+			rt.Engine,
 			coordinate.Clock(),
 			relay,
 			append(internalOpts,
 				adapter.WithInternalPrepareEvidenceToken(adminGRPCOpts.token),
-				adapter.WithInternalStore(rt.store),
+				adapter.WithInternalStore(rt.Store),
 				adapter.WithInternalPrimaryCommitEvidence(shardStore),
 				adapter.WithInternalMigrationProposer(proposerForGroup(rt, shardGroups)),
 				adapter.WithInternalRouteEngine(routeEngine),
 				adapter.WithInternalActiveTimestampTracker(readTracker),
-				adapter.WithInternalMigrationExportRouting(rt.spec.ID, sqsPartitionResolver),
+				adapter.WithInternalMigrationExportRouting(rt.Spec.ID, sqsPartitionResolver),
 			)...,
 		))
 		pb.RegisterDistributionServer(gs, distServer)
@@ -187,16 +187,16 @@ func startRaftServers(
 		internalraftadmin.RegisterOperationalServicesWithInterceptorAndStaticServing(
 			ctx,
 			gs,
-			rt.engine,
+			rt.Engine,
 			[]string{"RawKV"},
 			staticServingServices,
 			migrationMembershipInterceptor(rt, shardStore, proposerForGroup(rt, shardGroups), adminGRPCOpts.migrationToken, confChangeInterceptor),
 		)
 		reflection.Register(gs)
 
-		grpcSock, err := lc.Listen(ctx, "tcp", rt.spec.Address)
+		grpcSock, err := lc.Listen(ctx, "tcp", rt.Spec.Address)
 		if err != nil {
-			return errors.Wrapf(err, "failed to listen on %s", rt.spec.Address)
+			return errors.Wrapf(err, "failed to listen on %s", rt.Spec.Address)
 		}
 		srv := gs
 		lis := grpcSock
@@ -210,7 +210,7 @@ func startRaftServers(
 			go func() {
 				select {
 				case <-ctx.Done():
-					stopGRPCServerBounded(ctx, srv, rt.spec.Address)
+					stopGRPCServerBounded(ctx, srv, rt.Spec.Address)
 					_ = lis.Close()
 					closeService()
 				case <-stop:

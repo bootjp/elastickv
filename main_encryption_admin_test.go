@@ -130,8 +130,8 @@ func TestEncryptionAdminDefaultRuntimeOptionsUsesDefaultGroupRuntime(t *testing.
 
 	got, err := encryptionAdminDefaultRuntimeOptions(
 		[]*raftGroupRuntime{
-			{spec: noderuntime.GroupSpec{ID: 1}, engine: defaultEngine},
-			{spec: noderuntime.GroupSpec{ID: 2}, engine: otherEngine},
+			{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 1}, Engine: defaultEngine}},
+			{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 2}, Engine: otherEngine}},
 		},
 		map[uint64]*kv.ShardGroup{
 			1: defaultGroup,

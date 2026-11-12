@@ -4,6 +4,7 @@ import (
 	"flag"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/serverwiring"
 )
 
@@ -11,7 +12,7 @@ const (
 	heartbeatTimeout           = 200 * time.Millisecond
 	electionTimeout            = 2000 * time.Millisecond
 	raftMetricsObserveInterval = 5 * time.Second
-	dirPerm                    = raftDirPerm
+	dirPerm                    = noderuntime.RaftDirPerm
 
 	etcdTickInterval      = 10 * time.Millisecond
 	etcdHeartbeatMinTicks = 1

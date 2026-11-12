@@ -23,7 +23,7 @@ type raftFlags struct {
 func (f *raftFlags) register(fs *flag.FlagSet) {
 	fs.StringVar(&f.address, "address", "localhost:50051", "TCP host+port for this node")
 	fs.StringVar(&f.id, "raftId", "", "Node id used by Raft")
-	fs.StringVar(&f.engine, "raftEngine", string(raftEngineEtcd), "Raft engine implementation (etcd)")
+	fs.StringVar(&f.engine, "raftEngine", string(noderuntime.RaftEngineEtcd), "Raft engine implementation (etcd)")
 	fs.StringVar(&f.dataDir, "raftDataDir", "data/", "Raft data dir")
 }
 
@@ -59,7 +59,7 @@ func (f *topologyFlags) register(fs *flag.FlagSet) {
 	fs.StringVar(&f.sqsFifoPartitionMap, "sqsFifoPartitionMap", "", "HT-FIFO partition map (queue.fifo:N=group_0,...,group_{N-1};...)")
 }
 
-func resolveValidatedRuntimeInputs(flags *serverFlags) (noderuntime.RuntimeConfig, raftEngineType, noderuntime.BootstrapConfig, bool, error) {
+func resolveValidatedRuntimeInputs(flags *serverFlags) (noderuntime.RuntimeConfig, noderuntime.RaftEngineType, noderuntime.BootstrapConfig, bool, error) {
 	if err := validateCommitTSFenceStartup(flags.consistency.commitTSFence, flags.bootstrap.peerConfigDir != ""); err != nil {
 		return noderuntime.RuntimeConfig{}, "", noderuntime.BootstrapConfig{}, false, err
 	}
@@ -104,14 +104,14 @@ func validateLiveBackupConfig(
 	}
 }
 
-func resolveRuntimeInputs(raft raftFlags, topology topologyFlags, listeners listenerFlags, bootstrap raftBootstrapFlags) (noderuntime.RuntimeConfig, raftEngineType, noderuntime.BootstrapConfig, bool, error) {
+func resolveRuntimeInputs(raft raftFlags, topology topologyFlags, listeners listenerFlags, bootstrap raftBootstrapFlags) (noderuntime.RuntimeConfig, noderuntime.RaftEngineType, noderuntime.BootstrapConfig, bool, error) {
 	if raft.id == "" {
 		return noderuntime.RuntimeConfig{}, "", noderuntime.BootstrapConfig{}, false, errors.New("flag --raftId is required")
 	}
 
-	engineType, err := parseRaftEngineType(raft.engine)
+	engineType, err := noderuntime.ParseRaftEngineType(raft.engine)
 	if err != nil {
-		return noderuntime.RuntimeConfig{}, "", noderuntime.BootstrapConfig{}, false, err
+		return noderuntime.RuntimeConfig{}, "", noderuntime.BootstrapConfig{}, false, errors.WithStack(err)
 	}
 
 	cfg, err := noderuntime.ParseRuntimeConfig(raft.address, listeners.redisAddress, listeners.s3Address, listeners.dynamoAddress, listeners.sqsAddress,

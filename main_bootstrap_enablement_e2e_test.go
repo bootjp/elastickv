@@ -54,8 +54,8 @@ func enablementLegacyCut(t *testing.T, base string, group noderuntime.GroupSpec)
 	runtime, _, err := builder.build(group)
 	require.NoError(t, err)
 	t.Cleanup(runtime.Close)
-	require.Eventually(t, func() bool { return runtime.engine.State() == raftengine.StateLeader }, enablementE2EWait, 10*time.Millisecond)
-	enablementLegacyPut(t, runtime.engine, clock.Next(), "legacy-key", "original-value")
+	require.Eventually(t, func() bool { return runtime.Engine.State() == raftengine.StateLeader }, enablementE2EWait, 10*time.Millisecond)
+	enablementLegacyPut(t, runtime.Engine, clock.Next(), "legacy-key", "original-value")
 	catalog, err := setupDistributionCatalog(t.Context(), []*raftGroupRuntime{runtime}, routes)
 	require.NoError(t, err)
 	snapshot, err := catalog.Snapshot(t.Context())
@@ -64,11 +64,11 @@ func enablementLegacyCut(t *testing.T, base string, group noderuntime.GroupSpec)
 	require.Len(t, snapshot.Routes, 1)
 	// A real proposal after legacy catalog initialization snapshots the complete
 	// populated store. No fabricated applied index or native recovery image.
-	enablementLegacyPut(t, runtime.engine, clock.Next(), "cut-key", "quiesced")
-	cut := runtime.engine.Status().AppliedIndex
-	require.Eventually(t, func() bool { return runtime.engine.Status().LastSnapshotIndex >= cut }, enablementE2EWait, 10*time.Millisecond)
+	enablementLegacyPut(t, runtime.Engine, clock.Next(), "cut-key", "quiesced")
+	cut := runtime.Engine.Status().AppliedIndex
+	require.Eventually(t, func() bool { return runtime.Engine.Status().LastSnapshotIndex >= cut }, enablementE2EWait, 10*time.Millisecond)
 	runtime.Close()
-	return groupDataDir(base, "n1", group.ID, false)
+	return noderuntime.GroupDataDir(base, "n1", group.ID, false)
 }
 
 func enablementLegacyPut(t *testing.T, engine raftengine.Engine, ts uint64, key, value string) {
@@ -207,7 +207,7 @@ func enablementStartProtected(t *testing.T, base, peerConfigDir string, group no
 		})
 	}
 	t.Cleanup(node.close)
-	require.Eventually(t, func() bool { return runtime.publicReady() }, enablementE2EWait, 10*time.Millisecond,
+	require.Eventually(t, func() bool { return runtime.PublicReady() }, enablementE2EWait, 10*time.Millisecond,
 		"activation/recovery/catalog must reach DataReady without synthetic publication")
 	require.Equal(t, peersession.DataReady, domain.admission.Stage(group.ID))
 	snapshot, err := catalog.Snapshot(t.Context())
@@ -251,7 +251,7 @@ func TestBootstrapEnablementLegacyDataToProtectedDataReady(t *testing.T) {
 	_, err = node.coordinate.Dispatch(ctx, &kv.OperationGroup[kv.OP]{Elems: []*kv.Elem[kv.OP]{{Op: kv.Put, Key: []byte("protected-key"), Value: []byte("durable-value")}}})
 	require.NoError(t, err)
 	enablementRead(t, node, "protected-key", "durable-value")
-	policy, err := kv.LoadAppliedBootstrapPolicy(t.Context(), node.runtime.store, manifest.Identity, node.runtime.engine.Status().AppliedIndex)
+	policy, err := kv.LoadAppliedBootstrapPolicy(t.Context(), node.runtime.Store, manifest.Identity, node.runtime.Engine.Status().AppliedIndex)
 	require.NoError(t, err)
 	require.Greater(t, policy.ActivationIndex, manifest.CommitIndex)
 	require.Equal(t, uint64(1), policy.Generation)
@@ -259,7 +259,7 @@ func TestBootstrapEnablementLegacyDataToProtectedDataReady(t *testing.T) {
 	restarted := enablementStartProtected(t, base, configDir, group)
 	enablementRead(t, restarted, "legacy-key", "original-value")
 	enablementRead(t, restarted, "protected-key", "durable-value")
-	recovered, err := kv.LoadAppliedBootstrapPolicy(t.Context(), restarted.runtime.store, manifest.Identity, restarted.runtime.engine.Status().AppliedIndex)
+	recovered, err := kv.LoadAppliedBootstrapPolicy(t.Context(), restarted.runtime.Store, manifest.Identity, restarted.runtime.Engine.Status().AppliedIndex)
 	require.NoError(t, err)
 	require.Equal(t, policy.ActivationIndex, recovered.ActivationIndex, "restart must not reactivate or downgrade P")
 	require.Equal(t, policy.Generation, recovered.Generation)

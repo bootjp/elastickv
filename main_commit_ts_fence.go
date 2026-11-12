@@ -38,15 +38,15 @@ func validateCommitTSFenceStartup(enabled, protected bool) error {
 
 func validateNoExistingCommitTSFenceActivation(ctx context.Context, runtimes []*raftGroupRuntime, protected bool) error {
 	for _, rt := range runtimes {
-		if rt == nil || rt.store == nil {
+		if rt == nil || rt.Store == nil {
 			continue
 		}
-		active, err := kv.CommitTSFenceEnabled(ctx, rt.store)
+		active, err := kv.CommitTSFenceEnabled(ctx, rt.Store)
 		if err != nil {
-			return errors.Wrapf(err, "read commit-ts fence activation for group %d", rt.spec.ID)
+			return errors.Wrapf(err, "read commit-ts fence activation for group %d", rt.Spec.ID)
 		}
 		if active && !protected {
-			return errors.WithStack(errors.Newf("group %d has an active commit-ts fence; protected Raft catalog bootstrap is required before startup", rt.spec.ID))
+			return errors.WithStack(errors.Newf("group %d has an active commit-ts fence; protected Raft catalog bootstrap is required before startup", rt.Spec.ID))
 		}
 	}
 	return nil

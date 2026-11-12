@@ -175,13 +175,13 @@ func startMemoryWatchdog(ctx context.Context, eg *errgroup.Group, cancel context
 func fsmCompactionRuntimes(runtimes []*raftGroupRuntime) []kv.FSMCompactRuntime {
 	out := make([]kv.FSMCompactRuntime, 0, len(runtimes))
 	for _, runtime := range runtimes {
-		if runtime == nil || runtime.engine == nil || runtime.store == nil {
+		if runtime == nil || runtime.Engine == nil || runtime.Store == nil {
 			continue
 		}
 		out = append(out, kv.FSMCompactRuntime{
-			GroupID:      runtime.spec.ID,
-			StatusReader: runtime.engine,
-			Store:        runtime.store,
+			GroupID:      runtime.Spec.ID,
+			StatusReader: runtime.Engine,
+			Store:        runtime.Store,
 		})
 	}
 	return out

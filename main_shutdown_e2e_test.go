@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/stretchr/testify/require"
@@ -42,7 +43,7 @@ func TestShutdownSIGTERMTransfersEveryRaftGroupE2E(t *testing.T) {
 	nodes := make([]*bootstrapE2ENode, 0, nodeCount-1)
 	t.Cleanup(func() { closeBootstrapE2ENodes(t, nodes) })
 	for i := range nodeCount - 1 {
-		node, err := startBootstrapE2EMultiGroupNode(baseDir, endpoints[i], listeners[i], true, groupIDs, groupPeers, raftEngineEtcd)
+		node, err := startBootstrapE2EMultiGroupNode(baseDir, endpoints[i], listeners[i], true, groupIDs, groupPeers, noderuntime.RaftEngineEtcd)
 		require.NoError(t, err)
 		nodes = append(nodes, node)
 	}

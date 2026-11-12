@@ -67,8 +67,10 @@ func TestSetupDistributionCatalog_UsesResolvedCatalogGroup(t *testing.T) {
 	engine := distribution.NewEngine()
 	engine.UpdateRoute([]byte(""), nil, 5)
 	rt := &raftGroupRuntime{
-		spec:  noderuntime.GroupSpec{ID: 5},
-		store: store.NewMVCCStore(),
+		GroupRuntime: &noderuntime.GroupRuntime{
+			Spec:  noderuntime.GroupSpec{ID: 5},
+			Store: store.NewMVCCStore(),
+		},
 	}
 	t.Cleanup(func() {
 		rt.Close()
@@ -83,8 +85,10 @@ func TestDistributionCatalogStoreForGroupEnablesRouteDescriptorV2Writes(t *testi
 	t.Parallel()
 
 	rt := &raftGroupRuntime{
-		spec:  noderuntime.GroupSpec{ID: 5},
-		store: store.NewMVCCStore(),
+		GroupRuntime: &noderuntime.GroupRuntime{
+			Spec:  noderuntime.GroupSpec{ID: 5},
+			Store: store.NewMVCCStore(),
+		},
 	}
 	t.Cleanup(func() {
 		rt.Close()
@@ -231,18 +235,22 @@ func TestSplitMigrationCapabilityPeerSourceForRuntimesChecksAllGroups(t *testing
 
 	runtimes := []*raftGroupRuntime{
 		{
-			spec: noderuntime.GroupSpec{ID: 1},
-			engine: capabilityConfigEngine{cfg: raftengine.Configuration{Servers: []raftengine.Server{
-				{Suffrage: "voter", ID: "n1", Address: "10.0.0.11:50051"},
-				{Suffrage: "learner", ID: "n2", Address: "10.0.0.12:50051"},
-			}}},
+			GroupRuntime: &noderuntime.GroupRuntime{
+				Spec: noderuntime.GroupSpec{ID: 1},
+				Engine: capabilityConfigEngine{cfg: raftengine.Configuration{Servers: []raftengine.Server{
+					{Suffrage: "voter", ID: "n1", Address: "10.0.0.11:50051"},
+					{Suffrage: "learner", ID: "n2", Address: "10.0.0.12:50051"},
+				}}},
+			},
 		},
 		{
-			spec: noderuntime.GroupSpec{ID: 2},
-			engine: capabilityConfigEngine{cfg: raftengine.Configuration{Servers: []raftengine.Server{
-				{Suffrage: "voter", ID: "n1", Address: "10.0.0.11:50051"},
-				{Suffrage: "voter", ID: "n3", Address: "10.0.0.13:50051"},
-			}}},
+			GroupRuntime: &noderuntime.GroupRuntime{
+				Spec: noderuntime.GroupSpec{ID: 2},
+				Engine: capabilityConfigEngine{cfg: raftengine.Configuration{Servers: []raftengine.Server{
+					{Suffrage: "voter", ID: "n1", Address: "10.0.0.11:50051"},
+					{Suffrage: "voter", ID: "n3", Address: "10.0.0.13:50051"},
+				}}},
+			},
 		},
 	}
 
@@ -260,14 +268,18 @@ func TestSplitMigrationCapabilityPeerSourceForRuntimesFailsClosedOnEmptyGroup(t 
 
 	runtimes := []*raftGroupRuntime{
 		{
-			spec: noderuntime.GroupSpec{ID: 1},
-			engine: capabilityConfigEngine{cfg: raftengine.Configuration{Servers: []raftengine.Server{
-				{Suffrage: "voter", ID: "n1", Address: "10.0.0.11:50051"},
-			}}},
+			GroupRuntime: &noderuntime.GroupRuntime{
+				Spec: noderuntime.GroupSpec{ID: 1},
+				Engine: capabilityConfigEngine{cfg: raftengine.Configuration{Servers: []raftengine.Server{
+					{Suffrage: "voter", ID: "n1", Address: "10.0.0.11:50051"},
+				}}},
+			},
 		},
 		{
-			spec:   noderuntime.GroupSpec{ID: 2},
-			engine: capabilityConfigEngine{cfg: raftengine.Configuration{}},
+			GroupRuntime: &noderuntime.GroupRuntime{
+				Spec:   noderuntime.GroupSpec{ID: 2},
+				Engine: capabilityConfigEngine{cfg: raftengine.Configuration{}},
+			},
 		},
 	}
 

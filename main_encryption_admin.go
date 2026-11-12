@@ -109,15 +109,15 @@ type encryptionAdminRuntimeOptions struct {
 
 func encryptionAdminDefaultRuntimeOptions(runtimes []*raftGroupRuntime, shardGroups map[uint64]*kv.ShardGroup, defaultGroupID uint64, requireDefault bool) (encryptionAdminRuntimeOptions, error) {
 	defaultRuntime := findDefaultGroupRuntime(runtimes, defaultGroupID)
-	if defaultRuntime == nil || defaultRuntime.engine == nil {
+	if defaultRuntime == nil || defaultRuntime.Engine == nil {
 		if requireDefault {
 			return encryptionAdminRuntimeOptions{}, errors.Errorf("failed to wire encryption admin default group %d: runtime is unavailable", defaultGroupID)
 		}
 		return encryptionAdminRuntimeOptions{}, nil
 	}
 	return encryptionAdminRuntimeOptions{
-		engine:              defaultRuntime.engine,
-		latestAppliedIndex:  appliedIndexForEngine(defaultRuntime.engine),
+		engine:              defaultRuntime.Engine,
+		latestAppliedIndex:  appliedIndexForEngine(defaultRuntime.Engine),
 		postCutoverProposer: postCutoverProposerForRuntime(defaultRuntime, shardGroups),
 	}, nil
 }

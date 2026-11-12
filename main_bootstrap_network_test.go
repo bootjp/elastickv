@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/peersession"
 	"github.com/bootjp/elastickv/internal/raftadmission"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
@@ -232,7 +233,7 @@ func TestBootstrapNetworkOrdinaryCallsConcurrentAndCloseJoins(t *testing.T) {
 
 func TestBootstrapNetworkMissingInstallationFailsClosed(t *testing.T) {
 	t.Parallel()
-	cache := newBootstrapRuntimeConnCache([]*raftGroupRuntime{{bootstrapDomain: &bootstrapDomain{}}})
+	cache := newBootstrapRuntimeConnCache([]*raftGroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{}, bootstrapDomain: &bootstrapDomain{}}})
 	t.Cleanup(func() { require.NoError(t, cache.Close()) })
 	_, err := cache.ConnFor("127.0.0.1:1")
 	require.ErrorContains(t, err, "network was not installed")

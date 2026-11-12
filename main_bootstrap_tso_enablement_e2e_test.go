@@ -53,9 +53,9 @@ func tsoEnablementLegacyProfile(t *testing.T, base string, groups []noderuntime.
 	require.NoError(t, err)
 	t.Cleanup(tso.Close)
 	for _, runtime := range []*raftGroupRuntime{tso, data} {
-		require.Eventually(t, func() bool { return runtime.engine.State() == raftengine.StateLeader }, enablementE2EWait, 10*time.Millisecond)
+		require.Eventually(t, func() bool { return runtime.Engine.State() == raftengine.StateLeader }, enablementE2EWait, 10*time.Millisecond)
 	}
-	enablementLegacyPut(t, data.engine, clock.Next(), "legacy-key", "original-value")
+	enablementLegacyPut(t, data.Engine, clock.Next(), "legacy-key", "original-value")
 	catalog, err := setupDistributionCatalog(t.Context(), []*raftGroupRuntime{tso, data}, routes)
 	require.NoError(t, err)
 	image, err := catalog.Snapshot(t.Context())
@@ -70,13 +70,13 @@ func tsoEnablementLegacyProfile(t *testing.T, base string, groups []noderuntime.
 	require.NoError(t, err)
 	require.True(t, reservation.CutoverActive)
 	require.NotZero(t, reservation.Base)
-	enablementLegacyPut(t, data.engine, clock.Next(), "cut-key", "quiesced")
+	enablementLegacyPut(t, data.Engine, clock.Next(), "cut-key", "quiesced")
 	for _, runtime := range []*raftGroupRuntime{tso, data} {
-		cut := runtime.engine.Status().AppliedIndex
-		require.Eventually(t, func() bool { return runtime.engine.Status().LastSnapshotIndex >= cut }, enablementE2EWait, 10*time.Millisecond)
+		cut := runtime.Engine.Status().AppliedIndex
+		require.Eventually(t, func() bool { return runtime.Engine.Status().LastSnapshotIndex >= cut }, enablementE2EWait, 10*time.Millisecond)
 		runtime.Close()
 	}
-	tsoDir := groupDataDir(base, "n1", 0, true)
+	tsoDir := noderuntime.GroupDataDir(base, "n1", 0, true)
 	require.NoDirExists(t, filepath.Join(tsoDir, dedicatedTSOControlStoreName))
 	require.NoDirExists(t, filepath.Join(tsoDir, "fsm.db"))
 }
@@ -159,7 +159,7 @@ func tsoEnablementStart(t *testing.T, base, peerConfigDir string, profile []node
 	}
 	t.Cleanup(node.close)
 	require.Eventually(t, func() bool {
-		return node.runtimes[0].publicReady() && node.runtimes[1].publicReady()
+		return node.runtimes[0].PublicReady() && node.runtimes[1].PublicReady()
 	}, enablementE2EWait, 10*time.Millisecond, "both protected groups must reach DataReady without synthetic recovery publication")
 	for _, group := range profile {
 		require.Equal(t, peersession.DataReady, domain.admission.Stage(group.ID))
@@ -174,10 +174,10 @@ func tsoEnablementCapture(t *testing.T, node *tsoEnablementNode) tsoEnablementSt
 		cutover: state.CutoverActive(), phaseD: state.PhaseDActive(), phaseDFloor: state.PhaseDFloor(),
 		policies: make(map[uint64]raftbootstrap.PolicyRecord)}
 	for _, runtime := range node.runtimes {
-		policy, err := kv.LoadAppliedBootstrapPolicy(t.Context(), runtime.store,
-			raftbootstrap.Identity{Cluster: node.cluster, Group: runtime.spec.ID}, runtime.engine.Status().AppliedIndex)
+		policy, err := kv.LoadAppliedBootstrapPolicy(t.Context(), runtime.Store,
+			raftbootstrap.Identity{Cluster: node.cluster, Group: runtime.Spec.ID}, runtime.Engine.Status().AppliedIndex)
 		require.NoError(t, err)
-		image.policies[runtime.spec.ID] = policy
+		image.policies[runtime.Spec.ID] = policy
 	}
 	return image
 }
@@ -212,11 +212,11 @@ func prepareTSOEnablementProfile(t *testing.T) (string, []noderuntime.GroupSpec,
 	profile := []noderuntime.GroupSpec{{ID: 0, Address: cfg.local.Address}, {ID: 1, Address: cfg.local.Address}}
 	tsoEnablementLegacyProfile(t, base, profile)
 	t.Log("legacy profile quiesced with populated data and snapshot-only dedicated TSO")
-	tsoManifest := tsoEnablementSignedBaseline(t, groupDataDir(base, "n1", 0, true), cfg)
-	dataManifest := enablementSignedBaseline(t, groupDataDir(base, "n1", 1, true), cfg, profile[1])
+	tsoManifest := tsoEnablementSignedBaseline(t, noderuntime.GroupDataDir(base, "n1", 0, true), cfg)
+	dataManifest := enablementSignedBaseline(t, noderuntime.GroupDataDir(base, "n1", 1, true), cfg, profile[1])
 	configDir := t.TempDir()
 	for _, manifest := range []raftbootstrap.BaselineManifest{tsoManifest, dataManifest} {
-		dir := groupDataDir(base, "n1", manifest.Identity.Group, true)
+		dir := noderuntime.GroupDataDir(base, "n1", manifest.Identity.Group, true)
 		payload := enablementMigrateAndCertify(t, dir, cfg, manifest)
 		t.Logf("group %d migrated to bound with required marker, native v2 and signed final readiness", manifest.Identity.Group)
 		local := raw

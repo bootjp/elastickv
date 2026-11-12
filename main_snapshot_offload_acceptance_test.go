@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/bootjp/elastickv/internal/snapshotoffload"
@@ -30,11 +31,11 @@ const (
 func TestSnapshotOffloadThreeNodeRecoveryAcceptance(t *testing.T) {
 	t.Setenv("ELASTICKV_RAFT_SNAPSHOT_COUNT", "4")
 	cfg := offloadAcceptanceFlags(t)
-	baseDir, endpoints, nodes := startBootstrapE2ECluster(t, t.TempDir(), offloadAcceptanceNodeCount, 1, raftEngineEtcd)
+	baseDir, endpoints, nodes := startBootstrapE2ECluster(t, t.TempDir(), offloadAcceptanceNodeCount, 1, noderuntime.RaftEngineEtcd)
 	t.Cleanup(func() { closeBootstrapE2ENodes(t, nodes) })
 	waitForBootstrapClusterConfig(t, nodes, bootstrapExpectedConfiguration(endpoints))
 	leader := waitForSingleLeader(t, nodes)
-	groupID := nodes[leader].runtimes[0].spec.ID
+	groupID := nodes[leader].runtimes[0].Spec.ID
 	objects, err := snapshotoffload.NewLocalStore(cfg.localDir)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, objects.Close()) })
@@ -152,7 +153,7 @@ func requireOffloadAcceptanceLocalValues(t *testing.T, node *bootstrapE2ENode, e
 	// too, so forwarding or a healthy peer cannot hide missing restored data.
 	require.Eventually(t, func() bool {
 		for key, value := range expected {
-			got, err := node.runtimes[0].store.GetAt(context.Background(), []byte(key), math.MaxUint64)
+			got, err := node.runtimes[0].Store.GetAt(context.Background(), []byte(key), math.MaxUint64)
 			if err != nil || string(got) != value {
 				return false
 			}
@@ -205,7 +206,7 @@ func restoreOffloadAcceptanceCluster(t *testing.T, objects *snapshotoffload.Loca
 		}
 	}
 	for _, endpoint := range endpoints {
-		dest := groupDataDir(root, endpoint.id, manifest.GroupID, false)
+		dest := noderuntime.GroupDataDir(root, endpoint.id, manifest.GroupID, false)
 		_, err := os.Stat(dest)
 		require.True(t, os.IsNotExist(err))
 		result, err := snapshotoffload.RestorePhysicalSnapshot(context.Background(), snapshotoffload.RestoreOptions{
@@ -225,7 +226,7 @@ func restoreOffloadAcceptanceCluster(t *testing.T, objects *snapshotoffload.Loca
 	nodes := make([]*bootstrapE2ENode, len(endpoints))
 	t.Cleanup(func() { closeBootstrapE2ENodes(t, nodes) })
 	for i, endpoint := range endpoints {
-		node, err := startBootstrapE2ENode(root, endpoint, listeners[i], false, "", raftEngineEtcd)
+		node, err := startBootstrapE2ENode(root, endpoint, listeners[i], false, "", noderuntime.RaftEngineEtcd)
 		require.NoError(t, err)
 		nodes[i] = node
 	}
@@ -235,7 +236,7 @@ func restoreOffloadAcceptanceCluster(t *testing.T, objects *snapshotoffload.Loca
 	t.Cleanup(func() { closeGRPCConns(conns) })
 	for i, node := range nodes {
 		require.GreaterOrEqual(t, node.engine().Status().AppliedIndex, manifest.SnapshotIndex)
-		reader, ok := node.runtimes[0].stateMachine.(raftengine.AppliedIndexReader)
+		reader, ok := node.runtimes[0].StateMachine.(raftengine.AppliedIndexReader)
 		require.True(t, ok)
 		index, present, err := reader.LastAppliedIndex()
 		require.NoError(t, err)

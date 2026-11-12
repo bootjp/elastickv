@@ -73,8 +73,8 @@ func TestSnapshotOffloadGroupsCarryPerGroupDataDirs(t *testing.T) {
 	t.Parallel()
 	raftDir := t.TempDir()
 	runtimes := []*raftGroupRuntime{
-		{spec: noderuntime.GroupSpec{ID: 1}},
-		{spec: noderuntime.GroupSpec{ID: 2}},
+		{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 1}}},
+		{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 2}}},
 		nil, // a nil runtime must be skipped, not panic
 	}
 
@@ -98,7 +98,7 @@ func TestSnapshotOffloadGroupsCarryPerGroupDataDirs(t *testing.T) {
 // rather than panic or, worse, publish.
 func TestSnapshotOffloadLeadershipFailsClosedOnAClosedEngine(t *testing.T) {
 	t.Parallel()
-	rt := &raftGroupRuntime{spec: noderuntime.GroupSpec{ID: 7}} // engine never set
+	rt := &raftGroupRuntime{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 7}}} // engine never set
 
 	require.False(t, snapshotOffloadIsLeader(rt)(),
 		"a closed engine must never look like a leader")
@@ -117,7 +117,7 @@ func TestStartSnapshotOffloadRejectsIncompleteConfiguration(t *testing.T) {
 
 	err := startSnapshotOffload(
 		context.Background(), nil, cfg,
-		[]*raftGroupRuntime{{spec: noderuntime.GroupSpec{ID: 1}}},
+		[]*raftGroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 1}}}},
 		t.TempDir(), "n1", false, nil, testLogger(t))
 	require.Error(t, err)
 	require.True(t, errors.Is(err, snapshotoffload.ErrInvalidOptions))
@@ -158,7 +158,7 @@ func TestRunbookRestorePathsMatchGroupDataDir(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			require.Equal(t, tc.want, groupDataDir(raftDir, raftID, tc.groupID, tc.multi),
+			require.Equal(t, tc.want, noderuntime.GroupDataDir(raftDir, raftID, tc.groupID, tc.multi),
 				"docs/snapshot_offload_operations.md documents this path for restore")
 		})
 	}
@@ -239,7 +239,7 @@ func TestRunbookRestorePathsFollowFromTheGroupTopology(t *testing.T) {
 			// requested=true is the operator asking for per-group dirs; the
 			// topology decides whether that takes effect.
 			multi := noderuntime.EffectiveMultiDataDirs(tc.groups, true)
-			require.Equal(t, tc.want, groupDataDir(raftDir, raftID, tc.groupID, multi),
+			require.Equal(t, tc.want, noderuntime.GroupDataDir(raftDir, raftID, tc.groupID, multi),
 				"docs/snapshot_offload_operations.md documents this path for restore")
 		})
 	}
@@ -433,7 +433,7 @@ func TestSnapshotOffloadCleanupSparesRecentSharedSpoolFiles(t *testing.T) {
 
 	cfg := testOffloadFlags("", "")
 	cfg.spoolDir = spoolDir
-	runtimes := []*raftGroupRuntime{{spec: noderuntime.GroupSpec{ID: 1}}}
+	runtimes := []*raftGroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 1}}}}
 
 	cleanStaleOffloadSpool(cfg, runtimes, t.TempDir(), "n1", false, testLogger(t))
 	require.FileExists(t, spoolFile)

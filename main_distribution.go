@@ -199,11 +199,11 @@ func startDistributionSplitJobRunner(ctx context.Context, eg *errgroup.Group, se
 
 func distributionCatalogStoreForGroup(runtimes []*raftGroupRuntime, groupID uint64) *distribution.CatalogStore {
 	for _, rt := range runtimes {
-		if rt == nil || rt.store == nil {
+		if rt == nil || rt.Store == nil {
 			continue
 		}
-		if rt.spec.ID == groupID {
-			return distribution.NewCatalogStore(rt.store,
+		if rt.Spec.ID == groupID {
+			return distribution.NewCatalogStore(rt.Store,
 				distribution.WithCatalogRouteDescriptorV2Writes(true),
 				distribution.WithCatalogMigrationStoreResolver(catalogMigrationStoreResolver(runtimes)),
 				distribution.WithCatalogMigrationRetireResolver(catalogMigrationRetireResolver(runtimes)),
@@ -216,11 +216,11 @@ func distributionCatalogStoreForGroup(runtimes []*raftGroupRuntime, groupID uint
 func catalogMigrationStoreResolver(runtimes []*raftGroupRuntime) distribution.CatalogMigrationStoreResolver {
 	return func(groupID uint64) (store.MVCCStore, error) {
 		for _, rt := range runtimes {
-			if rt == nil || rt.store == nil {
+			if rt == nil || rt.Store == nil {
 				continue
 			}
-			if rt.spec.ID == groupID {
-				return rt.store, nil
+			if rt.Spec.ID == groupID {
+				return rt.Store, nil
 			}
 		}
 		return nil, errors.Newf("migration target store is not available for group %d", groupID)
@@ -230,7 +230,7 @@ func catalogMigrationStoreResolver(runtimes []*raftGroupRuntime) distribution.Ca
 func catalogMigrationRetireResolver(runtimes []*raftGroupRuntime) distribution.CatalogMigrationRetireResolver {
 	return func(ctx context.Context, groupID, jobID uint64) error {
 		for _, rt := range runtimes {
-			if rt == nil || rt.spec.ID != groupID {
+			if rt == nil || rt.Spec.ID != groupID {
 				continue
 			}
 			engine := rt.snapshotEngine()

@@ -50,17 +50,17 @@ func raftJoinRuntimesReady(ctx context.Context, runtimes []*raftGroupRuntime, lo
 		return false, nil
 	}
 	for _, runtime := range runtimes {
-		if runtime == nil || runtime.engine == nil {
+		if runtime == nil || runtime.Engine == nil {
 			return false, nil
 		}
-		configuration, err := runtime.engine.Configuration(ctx)
+		configuration, err := runtime.Engine.Configuration(ctx)
 		if err != nil {
-			return false, errors.Wrapf(err, "read raft group %d join configuration", runtime.spec.ID)
+			return false, errors.Wrapf(err, "read raft group %d join configuration", runtime.Spec.ID)
 		}
 		if !configurationContainsMember(configuration, localID) {
 			return false, nil
 		}
-		status := runtime.engine.Status()
+		status := runtime.Engine.Status()
 		if status.Leader.ID == "" || status.PendingConfChange || status.AppliedIndex < status.CommitIndex {
 			return false, nil
 		}

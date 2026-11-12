@@ -4,12 +4,13 @@ import (
 	"flag"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/stretchr/testify/require"
 )
 
 func TestRaftTopologyConsistencyFlagsDefaultsAndParsing(t *testing.T) {
 	t.Parallel()
-	require.Equal(t, raftFlags{address: "localhost:50051", engine: string(raftEngineEtcd), dataDir: "data/"}, defaultFlags[raftFlags]())
+	require.Equal(t, raftFlags{address: "localhost:50051", engine: string(noderuntime.RaftEngineEtcd), dataDir: "data/"}, defaultFlags[raftFlags]())
 	require.Equal(t, topologyFlags{}, defaultFlags[topologyFlags]())
 	require.Equal(t, consistencyFlags{}, defaultFlags[consistencyFlags]())
 

@@ -90,13 +90,13 @@ func TestInternalReadWatermarkOptions(t *testing.T) {
 			t.Parallel()
 			raft := &startupWatermarkEngine{index: 17}
 			selected := &startupWatermarkEngine{index: 23, err: tc.err}
-			rt := &raftGroupRuntime{spec: noderuntime.GroupSpec{ID: 7}, engine: raft}
+			rt := &raftGroupRuntime{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 7}, Engine: raft}}
 			groups := map[uint64]*kv.ShardGroup{}
 			if tc.wrapped || tc.err != nil {
 				group := &kv.ShardGroup{Engine: selected}
 				_ = kv.NewLeaderProxyForShardGroup(group)
 				require.NotSame(t, selected, group.Proposer())
-				groups[rt.spec.ID] = group
+				groups[rt.Spec.ID] = group
 			}
 			clock := kv.NewHLC()
 			opts := []adapter.InternalOption{adapter.WithInternalAdminProposer(raft)}

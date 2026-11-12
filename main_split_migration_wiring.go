@@ -38,15 +38,15 @@ func splitMigrationCapabilityPeerSourceForRuntimes(runtimes []*raftGroupRuntime)
 			}
 			engine := rt.snapshotEngine()
 			if engine == nil {
-				return nil, errors.Errorf("raft group %d engine is not configured", rt.spec.ID)
+				return nil, errors.Errorf("raft group %d engine is not configured", rt.Spec.ID)
 			}
 			cfg, err := engine.Configuration(ctx)
 			if err != nil {
-				return nil, errors.Wrapf(err, "raft group %d configuration", rt.spec.ID)
+				return nil, errors.Wrapf(err, "raft group %d configuration", rt.Spec.ID)
 			}
 			groupPeers := splitMigrationCapabilityPeersFromConfiguration(cfg)
 			if len(groupPeers) == 0 {
-				return nil, errors.Errorf("raft group %d configuration has no split migration capability peers", rt.spec.ID)
+				return nil, errors.Errorf("raft group %d configuration has no split migration capability peers", rt.Spec.ID)
 			}
 			for _, peer := range groupPeers {
 				key := peer.ID + "\x00" + peer.Address

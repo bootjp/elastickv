@@ -52,7 +52,7 @@ func TestShutdownHandoffSignalWaitsForTransferAndIgnoresRepeats(t *testing.T) {
 	stop := installShutdownSignalHandler(handoff.requestShutdown, syscall.SIGUSR2)
 	t.Cleanup(stop)
 	eg, runCtx := errgroup.WithContext(ctx)
-	handoff.arm(runCtx, eg, []*raftGroupRuntime{{spec: noderuntime.GroupSpec{ID: 1}, engine: engine}}, nil)
+	handoff.arm(runCtx, eg, []*raftGroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 1}, Engine: engine}}}, nil)
 	require.NoError(t, syscall.Kill(os.Getpid(), syscall.SIGUSR2))
 	testutil.Closed(t, started, shutdownTestTimeout, "the signal did not start the leadership handoff")
 	require.NoError(t, ctx.Err(), "root cancellation must wait until the handoff finishes")
@@ -87,7 +87,7 @@ func TestShutdownHandoffDeadlineSurvivesBlockedLogging(t *testing.T) {
 	close(requests)
 	done := make(chan struct{})
 	go func() {
-		shutdownAfterRequest(ctx, cancel, []*raftGroupRuntime{{engine: engine}}, requests, shutdownTransferRetryDelay, nil)
+		shutdownAfterRequest(ctx, cancel, []*raftGroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{Engine: engine}}}, requests, shutdownTransferRetryDelay, nil)
 		close(done)
 	}()
 	select {

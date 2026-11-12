@@ -92,10 +92,10 @@ type leaderBalanceDecision struct {
 }
 
 // Group is one Raft group the balancer observes and may move leadership
-// of. Engine may return nil while the group's engine is not open.
+// of. SnapshotEngine may return nil while the group's engine is not open.
 type Group interface {
 	GroupID() uint64
-	Engine() raftengine.Engine
+	SnapshotEngine() raftengine.Engine
 }
 
 // Options configures the scheduler. Zero durations and thresholds fall
@@ -228,7 +228,7 @@ func (l *leaderBalanceLoop) run(ctx context.Context) {
 }
 
 func (l *leaderBalanceLoop) checkDefaultLeader(now time.Time) bool {
-	defaultEngine := l.defaultRuntime.Engine()
+	defaultEngine := l.defaultRuntime.SnapshotEngine()
 	if defaultEngine == nil || defaultEngine.State() != raftengine.StateLeader {
 		l.wasDefaultLeader = false
 		return false
@@ -373,7 +373,7 @@ func observeLeaderBalance(ctx context.Context, runtimes []Group, localNodeID str
 		if rt == nil {
 			continue
 		}
-		engine := rt.Engine()
+		engine := rt.SnapshotEngine()
 		if engine == nil {
 			continue
 		}

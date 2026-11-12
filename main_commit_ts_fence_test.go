@@ -35,11 +35,11 @@ func TestCatalogSetupRejectsPreviouslyActivatedCommitTSFence(t *testing.T) {
 
 	engine := distribution.NewEngine()
 	engine.UpdateRoute(nil, nil, 1)
-	_, err = setupDistributionCatalog(t.Context(), []*raftGroupRuntime{{spec: noderuntime.GroupSpec{ID: 1}, store: st}}, engine)
+	_, err = setupDistributionCatalog(t.Context(), []*raftGroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 1}, Store: st}}}, engine)
 	require.ErrorContains(t, err, "active commit-ts fence")
 
 	version, err := distribution.NewCatalogStore(st).Version(t.Context())
 	require.NoError(t, err)
 	require.Zero(t, version)
-	require.NoError(t, validateNoExistingCommitTSFenceActivation(t.Context(), []*raftGroupRuntime{{spec: noderuntime.GroupSpec{ID: 1}, store: st}}, true))
+	require.NoError(t, validateNoExistingCommitTSFenceActivation(t.Context(), []*raftGroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 1}, Store: st}}}, true))
 }

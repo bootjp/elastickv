@@ -87,7 +87,7 @@ func publishLeaderTerms(s *keyviz.MemSampler, runtimes []*raftGroupRuntime) {
 		if engine == nil {
 			continue
 		}
-		snaps = append(snaps, groupTermSnapshot{groupID: rt.spec.ID, term: engine.Status().Term})
+		snaps = append(snaps, groupTermSnapshot{groupID: rt.Spec.ID, term: engine.Status().Term})
 	}
 	publishLeaderTermsFromSnapshots(s, snaps)
 }

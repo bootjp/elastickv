@@ -24,8 +24,8 @@ func (f *bootstrapFormatFactory) Create(raftengine.FactoryConfig) (*raftengine.F
 func TestPublishedBootstrapMarkerRejectsLegacyEngineBeforeFactory(t *testing.T) {
 	t.Parallel()
 	base := t.TempDir()
-	dir := groupDataDir(base, "n1", 1, false)
-	require.NoError(t, os.MkdirAll(dir, raftDirPerm))
+	dir := noderuntime.GroupDataDir(base, "n1", 1, false)
+	require.NoError(t, os.MkdirAll(dir, noderuntime.RaftDirPerm))
 	intent := raftbootstrap.Intent{
 		Identity:     raftbootstrap.Identity{Cluster: raftbootstrap.UUID{1}, Group: 1},
 		BaselineKind: raftbootstrap.Seed,
@@ -47,15 +47,15 @@ func TestPublishedBootstrapMarkerRejectsLegacyEngineBeforeFactory(t *testing.T) 
 	inspection, err := files.Inspect(evidence)
 	require.NoError(t, err)
 	require.Equal(t, raftbootstrap.Required, inspection.Class)
-	marker := filepath.Join(dir, raftEngineMarkerFile)
+	marker := filepath.Join(dir, noderuntime.RaftEngineMarkerFile)
 	raw, err := os.ReadFile(marker)
 	require.NoError(t, err)
 	require.Equal(t, []byte("etcd-bootstrap-v1\n"), raw)
-	_, _, err = readRaftEngineMarker(marker)
-	require.ErrorIs(t, err, ErrUnsupportedRaftEngine)
+	_, _, err = noderuntime.ReadRaftEngineMarker(marker)
+	require.ErrorIs(t, err, noderuntime.ErrUnsupportedRaftEngine)
 	factory := &bootstrapFormatFactory{}
-	runtime, err := buildRuntimeForGroup("n1", noderuntime.GroupSpec{ID: 1}, base, false, true, nil, nil, nil, nil, factory, false)
-	require.ErrorIs(t, err, ErrUnsupportedRaftEngine)
+	runtime, err := noderuntime.BuildRuntimeForGroup("n1", noderuntime.GroupSpec{ID: 1}, base, false, true, nil, nil, nil, nil, factory, false)
+	require.ErrorIs(t, err, noderuntime.ErrUnsupportedRaftEngine)
 	require.Nil(t, runtime)
 	require.Zero(t, factory.creates)
 	retained, err := os.ReadFile(marker)

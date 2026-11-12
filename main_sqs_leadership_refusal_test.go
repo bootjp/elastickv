@@ -367,8 +367,8 @@ func TestInstallSQSLeadershipRefusalAcrossGroups_ComposesDeregisters(t *testing.
 	admin1 := &fakeLeadershipController{state: raftengine.StateFollower}
 	admin2 := &fakeLeadershipController{state: raftengine.StateFollower}
 	runtimes := []*raftGroupRuntime{
-		{spec: noderuntime.GroupSpec{ID: 10}, engine: admin1},
-		{spec: noderuntime.GroupSpec{ID: 11}, engine: admin2},
+		{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 10}, Engine: admin1}},
+		{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 11}, Engine: admin2}},
 	}
 	partitionMap := map[string]noderuntime.SQSFifoQueueRouting{
 		"q.fifo": {PartitionCount: 2, Groups: []string{"10", "11"}},
@@ -397,7 +397,7 @@ func TestInstallSQSLeadershipRefusalAcrossGroups_NoPartitionedQueueIsNoOp(t *tes
 	t.Parallel()
 	admin := &fakeLeadershipController{state: raftengine.StateFollower}
 	runtimes := []*raftGroupRuntime{
-		{spec: noderuntime.GroupSpec{ID: 10}, engine: admin},
+		{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 10}, Engine: admin}},
 	}
 	dereg := installSQSLeadershipRefusalAcrossGroups(
 		context.Background(), runtimes, nil, // empty partition map
@@ -418,8 +418,8 @@ func TestInstallSQSLeadershipRefusalAcrossGroups_SkipsNilRuntimes(t *testing.T) 
 	admin := &fakeLeadershipController{state: raftengine.StateFollower}
 	runtimes := []*raftGroupRuntime{
 		nil, // entire entry nil
-		{spec: noderuntime.GroupSpec{ID: 11}, engine: nil},   // engine nil
-		{spec: noderuntime.GroupSpec{ID: 10}, engine: admin}, // valid
+		{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 11}, Engine: nil}},   // engine nil
+		{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 10}, Engine: admin}}, // valid
 	}
 	dereg := installSQSLeadershipRefusalAcrossGroups(
 		context.Background(), runtimes,
@@ -451,7 +451,7 @@ type engineWithoutAcquiredObserver struct {
 func TestInstallSQSLeadershipRefusalAcrossGroups_SkipsEngineWithoutObserver(t *testing.T) {
 	t.Parallel()
 	runtimes := []*raftGroupRuntime{
-		{spec: noderuntime.GroupSpec{ID: 10}, engine: &engineWithoutAcquiredObserver{}},
+		{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 10}, Engine: &engineWithoutAcquiredObserver{}}},
 	}
 	require.NotPanics(t, func() {
 		dereg := installSQSLeadershipRefusalAcrossGroups(

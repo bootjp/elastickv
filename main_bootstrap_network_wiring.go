@@ -10,7 +10,7 @@ import (
 	"google.golang.org/grpc"
 )
 
-func resolveNetworkRuntimeInputs(flags *serverFlags) (noderuntime.RuntimeConfig, raftEngineType, noderuntime.BootstrapConfig, bool, error) {
+func resolveNetworkRuntimeInputs(flags *serverFlags) (noderuntime.RuntimeConfig, noderuntime.RaftEngineType, noderuntime.BootstrapConfig, bool, error) {
 	if err := configureNodeGRPCTransport(flags.nodeAuth); err != nil {
 		return noderuntime.RuntimeConfig{}, "", noderuntime.BootstrapConfig{}, false, err
 	}
@@ -52,7 +52,7 @@ func bootstrapNetworkConfigs(runtimes []*raftGroupRuntime, domain *bootstrapDoma
 		if runtime == nil || runtime.bootstrapDomain != domain || runtime.bootstrapPeerConfig == nil {
 			return nil, errors.New("protected network requires every runtime's original peer configuration")
 		}
-		configs[runtime.spec.ID] = runtime.bootstrapPeerConfig
+		configs[runtime.Spec.ID] = runtime.bootstrapPeerConfig
 	}
 	return configs, nil
 }

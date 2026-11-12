@@ -66,8 +66,10 @@ func TestRaftJoinRuntimesReady(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			ready, err := raftJoinRuntimesReady(context.Background(), []*raftGroupRuntime{{
-				spec:   noderuntime.GroupSpec{ID: 1},
-				engine: tc.engine,
+				GroupRuntime: &noderuntime.GroupRuntime{
+					Spec:   noderuntime.GroupSpec{ID: 1},
+					Engine: tc.engine,
+				},
 			}}, "n2")
 			require.NoError(t, err)
 			require.Equal(t, tc.ready, ready)
@@ -79,8 +81,10 @@ func TestRaftJoinRuntimesReadyReturnsConfigurationError(t *testing.T) {
 	t.Parallel()
 	readErr := errors.New("configuration unavailable")
 	ready, err := raftJoinRuntimesReady(context.Background(), []*raftGroupRuntime{{
-		spec:   noderuntime.GroupSpec{ID: 7},
-		engine: &raftJoinReadyEngineStub{err: readErr},
+		GroupRuntime: &noderuntime.GroupRuntime{
+			Spec:   noderuntime.GroupSpec{ID: 7},
+			Engine: &raftJoinReadyEngineStub{err: readErr},
+		},
 	}}, "n2")
 	require.False(t, ready)
 	require.ErrorIs(t, err, readErr)
@@ -101,9 +105,11 @@ func TestPreparePublicServicesAfterRaftJoinReadyDoesNotBindWhileJoinIsUnready(t 
 	err := preparePublicServicesAfterRaftJoinReady(
 		ctx,
 		[]*raftGroupRuntime{{
-			spec: noderuntime.GroupSpec{ID: 1},
-			engine: &raftJoinReadyEngineStub{
-				status: raftengine.Status{Leader: raftengine.LeaderInfo{ID: "n1"}},
+			GroupRuntime: &noderuntime.GroupRuntime{
+				Spec: noderuntime.GroupSpec{ID: 1},
+				Engine: &raftJoinReadyEngineStub{
+					status: raftengine.Status{Leader: raftengine.LeaderInfo{ID: "n1"}},
+				},
 			},
 		}},
 		"n2",

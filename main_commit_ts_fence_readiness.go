@@ -20,7 +20,7 @@ func commitTSFenceRuntimesReady(runtimes []*raftGroupRuntime) bool {
 		return false
 	}
 	for _, runtime := range runtimes {
-		if runtime == nil || runtime.bootstrapDomain != domain || runtime.publicReady == nil || !runtime.publicReady() {
+		if runtime == nil || runtime.bootstrapDomain != domain || runtime.PublicReady == nil || !runtime.PublicReady() {
 			return false
 		}
 	}
@@ -66,16 +66,16 @@ func waitForCommitTSFenceActivation(ctx context.Context, runtimes []*raftGroupRu
 func commitTSFenceRuntimesActive(ctx context.Context, runtimes []*raftGroupRuntime) (bool, error) {
 	dataGroups := 0
 	for _, runtime := range runtimes {
-		if runtime == nil || runtime.store == nil {
+		if runtime == nil || runtime.Store == nil {
 			return false, nil
 		}
-		if runtime.spec.ID == noderuntime.DedicatedTSORaftGroupID {
+		if runtime.Spec.ID == noderuntime.DedicatedTSORaftGroupID {
 			continue
 		}
 		dataGroups++
-		active, err := kv.CommitTSFenceEnabled(ctx, runtime.store)
+		active, err := kv.CommitTSFenceEnabled(ctx, runtime.Store)
 		if err != nil {
-			return false, errors.Wrapf(err, "read commit-ts fence activation for group %d", runtime.spec.ID)
+			return false, errors.Wrapf(err, "read commit-ts fence activation for group %d", runtime.Spec.ID)
 		}
 		if !active {
 			return false, nil

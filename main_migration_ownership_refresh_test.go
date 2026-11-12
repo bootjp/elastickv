@@ -10,6 +10,7 @@ import (
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
 	internalutil "github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	etcdraft "github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/bootjp/elastickv/kv"
@@ -105,7 +106,7 @@ func TestOwnershipRefreshDifferentRaftLeadersRespectExplicitClosedGate(t *testin
 	var cache kv.GRPCConnCache
 	t.Cleanup(func() { require.NoError(t, cache.Close()) })
 	groupFactory := splitMigrationGroupClientFactory(splitMigrationGroupLeaderResolver(groups), &cache, token)
-	rootFactory := migrationOwnershipRootClientFactory(migrationOwnershipRootLeaderResolver(&raftGroupRuntime{engine: root.group.Engine}), &cache, token)
+	rootFactory := migrationOwnershipRootClientFactory(migrationOwnershipRootLeaderResolver(&raftGroupRuntime{GroupRuntime: &noderuntime.GroupRuntime{Engine: root.group.Engine}}), &cache, token)
 	mirror := distribution.NewEngine()
 	require.NoError(t, mirror.ApplySnapshot(distribution.CatalogSnapshot{Version: 2, Routes: []distribution.RouteDescriptor{{RouteID: 99, GroupID: 99}}}))
 	closedGate := func(context.Context) error {
