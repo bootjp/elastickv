@@ -493,26 +493,28 @@ func TestRedisWireTransactionProxyReplyTypes(t *testing.T) {
 
 func TestRedisOwnedProxyOverflowUnknownClassification(t *testing.T) {
 	t.Parallel()
-	recorder := &redisOwnedTestConn{}
-	target := &redisOwnedConn{Conn: recorder, writer: &redisReplyBuffer{err: errRedisReplyTooLarge},
-		mayWrite: true, workStarted: true}
-	target.writeTerminalFailure()
-	require.Len(t, recorder.writes, 1)
-	message := recorder.writes[0].s
-	for _, wireMessage := range []string{message, "ERR " + message} {
-		remote := errors.New(wireMessage)
-		require.True(t, isProxyTransactionOutcomeUnknown(remote))
-		require.ErrorIs(t, ownedProxyTransactionError(remote, nil), kv.ErrTransactionOutcomeUnknown)
-		cmd := redis.NewCmd(t.Context())
-		cmd.SetErr(remote)
-		require.ErrorIs(t, ownedProxyTransactionError(nil, []*redis.Cmd{cmd}), kv.ErrTransactionOutcomeUnknown)
+	for _, failure := range []error{errRedisReplyTooLarge, errRedisReplyBudget} {
+		recorder := &redisOwnedTestConn{}
+		target := &redisOwnedConn{Conn: recorder, writer: &redisReplyBuffer{err: failure},
+			mayWrite: true, workStarted: true}
+		target.writeTerminalFailure()
+		require.Len(t, recorder.writes, 1)
+		message := recorder.writes[0].s
+		for _, wireMessage := range []string{message, "ERR " + message} {
+			remote := errors.New(wireMessage)
+			require.True(t, isProxyTransactionOutcomeUnknown(remote))
+			require.ErrorIs(t, ownedProxyTransactionError(remote, nil), kv.ErrTransactionOutcomeUnknown)
+			cmd := redis.NewCmd(t.Context())
+			cmd.SetErr(remote)
+			require.ErrorIs(t, ownedProxyTransactionError(nil, []*redis.Cmd{cmd}), kv.ErrTransactionOutcomeUnknown)
+		}
 	}
 	require.True(t, isProxyTransactionOutcomeUnknown(errors.New("ERR operation outcome unknown")))
 	require.ErrorIs(t, ownedProxyTransactionError(errors.New("ERR operation outcome unknown"), nil), kv.ErrTransactionOutcomeUnknown)
 	cmd := redis.NewCmd(t.Context())
 	cmd.SetErr(errors.New("ERR operation outcome unknown"))
 	require.ErrorIs(t, ownedProxyTransactionError(nil, []*redis.Cmd{cmd}), kv.ErrTransactionOutcomeUnknown)
-	for _, other := range []string{"prefix " + message, kv.ErrTransactionOutcomeUnknown.Error() + "; unrelated", kv.ErrTransactionOutcomeUnknown.Error() + "ish", "ERR operation outcome unknownish"} {
+	for _, other := range []string{"prefix " + kv.ErrTransactionOutcomeUnknown.Error(), kv.ErrTransactionOutcomeUnknown.Error() + "; unrelated", kv.ErrTransactionOutcomeUnknown.Error() + "ish", "ERR operation outcome unknownish"} {
 		require.False(t, isProxyTransactionOutcomeUnknown(errors.New(other)))
 	}
 }

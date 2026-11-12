@@ -163,10 +163,11 @@ func isProxyTransactionOutcomeUnknown(err error) bool {
 	}
 	message := strings.TrimPrefix(err.Error(), "ERR ")
 	unknown := kv.ErrTransactionOutcomeUnknown.Error()
-	// Match the exact terminal overflow spelling emitted by writeTerminalFailure,
-	// not arbitrary semicolon-bearing command errors from a peer.
-	overflow := unknown + "; " + errRedisReplyTooLarge.Error()
-	return message == unknown || message == overflow || strings.HasPrefix(message, unknown+" ") || strings.HasPrefix(message, unknown+"\n")
+	// Only the terminal reply failures emitted by writeTerminalFailure may
+	// carry a semicolon suffix; arbitrary command errors are not proof.
+	tooLarge := unknown + "; " + errRedisReplyTooLarge.Error()
+	budget := unknown + "; " + errRedisReplyBudget.Error()
+	return message == unknown || message == tooLarge || message == budget || strings.HasPrefix(message, unknown+" ") || strings.HasPrefix(message, unknown+"\n")
 }
 
 // resolveLeaderRedisAddr looks up the Redis address of the current Raft leader,
