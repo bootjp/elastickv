@@ -5,7 +5,7 @@ import (
 	"slices"
 	"time"
 
-	"github.com/bootjp/elastickv/internal/raftengine/etcd"
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
@@ -42,7 +42,7 @@ func EnsureMigrationNamespaceAdmission(ctx context.Context, client SplitMigratio
 			if member.ID == "" {
 				return state, errors.WithStack(kv.ErrMigrationNamespaceProtocol)
 			}
-			peer := NamespaceAdmissionPeer{MemberID: etcd.DeriveNodeID(member.ID), Address: member.Address, Client: member.Client}
+			peer := NamespaceAdmissionPeer{MemberID: raftengine.DeriveNodeID(member.ID), Address: member.Address, Client: member.Client}
 			response, err := probeNamespacePeer(ctx, peer, 0, false)
 			if err != nil {
 				return state, err
