@@ -10,7 +10,12 @@ import (
 )
 
 func pollHack(mountPoint string) error {
-	fd, err := syscall.Open(filepath.Join(mountPoint, pollHackName), syscall.O_RDONLY, 0)
+	var fd int
+	err := handleEINTR(func() error {
+		var openErr error
+		fd, openErr = syscall.Open(filepath.Join(mountPoint, pollHackName), syscall.O_RDONLY, 0)
+		return openErr
+	})
 	if err != nil {
 		return err
 	}
