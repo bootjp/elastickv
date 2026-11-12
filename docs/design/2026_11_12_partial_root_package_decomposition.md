@@ -207,6 +207,11 @@ Tests move with the code they cover.
   the runtimes to offload groups with their leadership callbacks. The
   package is restricted to binaries in the import guard.
 
+- Import guard: `internal/leaderbalance` and `internal/fsmount`, extracted
+  before the guard existed, are now listed in `upperLayers` and restricted
+  to binaries like the other extracted packages, and the guard's table
+  test covers every extracted package.
+
 ## Decisions
 
 - **Internal packages, not exported library packages.** These packages

@@ -41,6 +41,14 @@ func TestCheckLayering(t *testing.T) {
 		{"serverwiring only from binaries", "adapter", m + "internal/serverwiring", true},
 		{"serverwiring from root main", ".", m + "internal/serverwiring", false},
 		{"serverwiring root rule is not a subtree", "kv", m + "internal/serverwiring", true},
+		{"noderuntime only from binaries", "adapter", m + "internal/noderuntime", true},
+		{"noderuntime from root main", ".", m + "internal/noderuntime", false},
+		{"adminbridge only from binaries", "internal/admin", m + "internal/adminbridge", true},
+		{"snapshotoffloadwiring only from binaries", "internal/snapshotoffload", m + "internal/snapshotoffloadwiring", true},
+		{"leaderbalance only from binaries", "kv", m + "internal/leaderbalance", true},
+		{"leaderbalance from root main", ".", m + "internal/leaderbalance", false},
+		{"fsmount only from binaries", "internal/filesystem", m + "internal/fsmount", true},
+		{"fsmount from a cmd", "cmd/server", m + "internal/fsmount", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
