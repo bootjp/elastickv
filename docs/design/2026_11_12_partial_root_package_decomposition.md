@@ -299,6 +299,19 @@ Tests move with the code they cover.
   - A trial compile of the encryption files as their own package leaves no
     undefined identifier, so M5b is a pure move.
 
+- M5b: the encryption wiring moved to `internal/encryptionwiring` as a
+  move with exported identifiers (`Flags`, `WriteWiring`,
+  `RaftEnvelopeRuntime`, `BuildWriteWiring`, `LoadKEKAfterPreNonceStartupGuards`,
+  the start-up guards, registration, rotate-on-startup, the EncryptionAdmin
+  server and fan-out, `NewConfChangeInterceptor`, ...). Fields that the
+  root still reads or builds are exported as-is, including
+  `RaftEnvelopeRuntime.Mu`, per the exported-fields decision. Tests moved
+  with the code; the wiring tests that build `raftGroupRuntime` literals or
+  the startup gate stay in `main` with copies of the shared fixtures. The
+  package may import `noderuntime` and the concrete etcd backend; only
+  binaries may import it until M6 and M7 widen that to `clusterbootstrap`
+  and `server`, and `adapter` may not import it.
+
 ## Decisions
 
 - **Internal packages, not exported library packages.** These packages
