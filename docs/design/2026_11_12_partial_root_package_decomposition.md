@@ -1,6 +1,6 @@
 # Root package decomposition
 
-Status: Partial (M1, M2 and part of M4 implemented)
+Status: Partial (M1, M2, M3a and part of M4 implemented)
 Author: bootjp
 Date: 2026-11-12
 
@@ -97,7 +97,16 @@ Tests move with the code they cover.
   PR, so M2 lands one group of areas per PR.
 - **M3 — `internal/noderuntime`.** Move `raftGroupRuntime`, `groupSpec`,
   the raft bootstrap/peer config resolution, `runtimeConfig` parsing and
-  the shard-group builder. This unblocks every remaining milestone.
+  the shard-group builder. It lands in two PRs:
+  - **M3a — configuration.** `groupSpec`, the shard-range and address-map
+    parsing, the HT-FIFO partition map, `runtimeConfig` and its parsing,
+    and `raftBootstrapConfig` with the bootstrap / join peer resolution.
+    This is pure configuration that every area reads.
+  - **M3b — runtime.** `raftGroupRuntime` and the shard-group builder.
+    `raftGroupRuntime` holds bootstrap types (`bootstrapDomain`,
+    `bootstrapPeerConfig`, `bootstrapNetwork`) and the builder wires
+    encryption and the protected TSO group, so they move once those areas
+    expose narrow interfaces (see Decisions), or together with M5/M6.
 - **M4 — Mid-sized areas.** Move leader balance, filesystem wiring,
   snapshot-offload wiring, split-migration wiring, TSO wiring, the startup
   gate and node gRPC auth. Each area may be its own PR.
@@ -164,6 +173,14 @@ Tests move with the code they cover.
   fixtures pass the dir instead of overwriting a process global.
   With part 7 the root package registers no flag as a package global:
   every server flag hangs off `serverFlags`, and M2 is complete.
+- M3a: `internal/noderuntime` holds `GroupSpec`, `RuntimeConfig` and
+  `ParseRuntimeConfig` (Raft groups, shard ranges, leader address maps,
+  HT-FIFO partition map), `BootstrapConfig` with `ResolveRaftPeerConfig`
+  and `BootstrapSettingsForGroup`, and `BootstrapEncryptionRequest`. The
+  root package keeps only the flag structs and the resolver that feeds
+  them in. The package is restricted to binaries in the import guard, and
+  its tests moved with it (`shard_config_test.go`, the peer-resolution
+  tests, the DynamoDB leader-map and SQS resolver tests).
 - Snapshot-offload wiring can now move (M4): its helpers take
   `snapshotOffloadFlags` instead of reading about twenty flags.
 
