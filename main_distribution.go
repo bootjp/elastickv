@@ -13,6 +13,7 @@ import (
 	"github.com/bootjp/elastickv/internal/serverwiring"
 	"github.com/bootjp/elastickv/internal/snapshotoffloadwiring"
 	"github.com/bootjp/elastickv/internal/splitmigration"
+	"github.com/bootjp/elastickv/internal/tsowiring"
 	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/monitoring"
@@ -48,7 +49,7 @@ type distributionStartupInput struct {
 	readTracker     *kv.ActiveTimestampTracker
 	metricsRegistry *monitoring.Registry
 	clock           *kv.HLC
-	tsoWiring       coordinatorTSOWiring
+	tsoWiring       tsowiring.Wiring
 	// shardGroups feeds the split-migration promotion/voter factories, which
 	// resolve per-group leaders rather than going through the coordinator.
 	shardGroups     map[uint64]*kv.ShardGroup
@@ -106,8 +107,8 @@ func startDistributionStartup(in distributionStartupInput) (distributionStartup,
 		in.cfg.Engine,
 		distCatalog,
 		adapter.WithDistributionCoordinator(in.coordinate),
-		adapter.WithDistributionTimestampAllocator(in.tsoWiring.serverAllocator),
-		adapter.WithDistributionTSOActivationGate(in.tsoWiring.authorizeActivation),
+		adapter.WithDistributionTimestampAllocator(in.tsoWiring.ServerAllocator),
+		adapter.WithDistributionTSOActivationGate(in.tsoWiring.AuthorizeActivation),
 		adapter.WithDistributionActiveTimestampTracker(in.readTracker),
 		adapter.WithCatalogWatchLeaderCheck(func() bool {
 			engine := catalogRuntime.snapshotEngine()

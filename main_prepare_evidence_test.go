@@ -36,7 +36,7 @@ func TestPrepareEvidenceCapabilityRequiresCoordinatorRuntime(t *testing.T) {
 			ctx := metadata.NewIncomingContext(t.Context(), metadata.Pairs("authorization", "Bearer runtime-token"))
 			for _, cutover := range []bool{false, true} {
 				if cutover {
-					allocator, ok := wiring.serverAllocator.(kv.TSOReservationAllocator)
+					allocator, ok := wiring.ServerAllocator.(kv.TSOReservationAllocator)
 					require.True(t, ok)
 					_, err = allocator.ReserveBatchAfter(t.Context(), 1, 0, true, false)
 					require.NoError(t, err)

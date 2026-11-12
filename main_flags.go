@@ -7,6 +7,7 @@ import (
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/serverwiring"
 	"github.com/bootjp/elastickv/internal/snapshotoffloadwiring"
+	"github.com/bootjp/elastickv/internal/tsowiring"
 )
 
 const (
@@ -20,8 +21,6 @@ const (
 	etcdElectionMinTicks  = 2
 	etcdMaxSizePerMsg     = 1 << 20
 	etcdMaxInflightMsg    = 1024
-	defaultTSOBatchSize   = 256
-	defaultTSOReload      = 5 * time.Second
 	defaultBackupTTL      = 30 * time.Minute
 	defaultBackupMaxTTL   = time.Hour
 	defaultBackupDeadline = 5 * time.Second
@@ -46,7 +45,7 @@ type serverFlags struct {
 	healthAddress   string
 	filesystem      filesystemFlags
 	leaderBalance   leaderBalanceFlags
-	tso             tsoFlags
+	tso             tsowiring.Flags
 	snapshotOffload snapshotoffloadwiring.Flags
 	adminHTTP       adminHTTPFlags
 	backup          backupFlags
@@ -70,7 +69,7 @@ func registerServerFlags(fs *flag.FlagSet) *serverFlags {
 	fs.StringVar(&f.healthAddress, "healthAddress", "", "private HTTP health listener (empty disables); exposes /livez and /readyz")
 	f.filesystem.register(fs)
 	f.leaderBalance.register(fs)
-	f.tso.register(fs)
+	f.tso.Register(fs)
 	f.snapshotOffload.Register(fs)
 	f.adminHTTP.register(fs)
 	f.backup.register(fs)

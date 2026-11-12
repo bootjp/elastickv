@@ -18,6 +18,7 @@ import (
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/internal/raftengine/etcd"
+	"github.com/bootjp/elastickv/internal/tsowiring"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
@@ -29,7 +30,7 @@ type tsoEnablementNode struct {
 	domain   *bootstrapDomain
 	cluster  raftbootstrap.UUID
 	data     *enablementProtectedNode
-	wiring   coordinatorTSOWiring
+	wiring   tsowiring.Wiring
 	close    func()
 }
 
@@ -136,7 +137,7 @@ func tsoEnablementStart(t *testing.T, base, peerConfigDir string, profile []node
 	shards := kv.NewShardStore(routes, node.groups)
 	shards.SetOperationAdmission(domain.operationAdmission)
 	coordinate := kv.NewShardedCoordinator(routes, node.groups, 1, clock, shards).WithOperationAdmission(domain.operationAdmission)
-	node.wiring, err = configureCoordinatorTSO(defaultFlags[tsoFlags](), coordinate, node.groups, shards)
+	node.wiring, err = configureCoordinatorTSO(defaultServerFlags().tso, coordinate, node.groups, shards)
 	require.NoError(t, err)
 	node.data = &enablementProtectedNode{runtime: node.runtimes[1], domain: domain, coordinate: coordinate, shards: shards}
 	ctx, cancel := context.WithCancel(t.Context())
@@ -188,7 +189,7 @@ func tsoEnablementAllocate(t *testing.T, node *tsoEnablementNode, min uint64, ac
 	defer cancel()
 	owned, finish, err := node.domain.operationAdmission(ctx, 0, kv.AdmissionAllocator)
 	require.NoError(t, err)
-	allocator, ok := node.wiring.serverAllocator.(kv.TSOReservationAllocator)
+	allocator, ok := node.wiring.ServerAllocator.(kv.TSOReservationAllocator)
 	require.True(t, ok)
 	reservation, err := allocator.ReserveBatchAfter(owned, 1, min, false, activatePhaseD)
 	require.NoError(t, finish(err))
