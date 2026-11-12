@@ -10,12 +10,10 @@ import (
 )
 
 const (
-	filesystemStartupRetryBudget   = 90 * time.Second
-	filesystemStartupRetryInterval = 250 * time.Millisecond
-	heartbeatTimeout               = 200 * time.Millisecond
-	electionTimeout                = 2000 * time.Millisecond
-	raftMetricsObserveInterval     = 5 * time.Second
-	dirPerm                        = raftDirPerm
+	heartbeatTimeout           = 200 * time.Millisecond
+	electionTimeout            = 2000 * time.Millisecond
+	raftMetricsObserveInterval = 5 * time.Second
+	dirPerm                    = raftDirPerm
 
 	etcdTickInterval      = 10 * time.Millisecond
 	etcdHeartbeatMinTicks = 1
