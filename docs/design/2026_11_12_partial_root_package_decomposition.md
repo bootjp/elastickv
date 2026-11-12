@@ -144,8 +144,14 @@ Tests move with the code they cover.
   `bootstrapEncryptionRequest` in `raftBootstrapConfig` and are kept on the
   bootstrap domain for WAL recovery. The bootstrap e2e fixtures pass the
   request instead of overwriting process globals.
-  Still package globals: listener addresses, Raft and shard topology, and
-  the bootstrap peer-config dir.
+  Part 5 adds the client-facing listeners (`listenerFlags`: Redis and its
+  Lua pool size, DynamoDB, S3 and SQS addresses, regions and credential
+  files, and the metrics and pprof endpoints with their tokens). Runtime
+  config parsing, the server runner and the admin listener (which reuses
+  the S3 credentials file) receive it as a value.
+  Still package globals: the node address, Raft and shard topology,
+  `commitTSFence`, `readWatermarkAdvance`, and the bootstrap peer-config
+  dir.
 - Snapshot-offload wiring can now move (M4): its helpers take
   `snapshotOffloadFlags` instead of reading about twenty flags.
 
