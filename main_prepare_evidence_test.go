@@ -20,14 +20,14 @@ import (
 func TestPrepareEvidenceCapabilityRequiresCoordinatorRuntime(t *testing.T) {
 	for _, routed := range []bool{false, true} {
 		t.Run(map[bool]string{false: "legacy-warmup", true: "wired-cutover"}[routed], func(t *testing.T) {
-			setTSOModeFlags(t, routed, false)
+			cfg := testTSOFlags(routed, false)
 			clock := kv.NewHLC()
 			clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
 			state := kv.NewTSOStateMachine(clock)
 			engine := &mainTSOEngine{state: raftengine.StateLeader, tsoState: state}
 			groups := map[uint64]*kv.ShardGroup{0: {Engine: engine, TSOState: state}}
 			coord := newMainTSOCoordinator(clock, groups)
-			wiring, err := configureCoordinatorTSO(coord, groups, mainTSOFloorProvider{})
+			wiring, err := configureCoordinatorTSO(cfg, coord, groups, mainTSOFloorProvider{})
 			require.NoError(t, err)
 			t.Cleanup(func() { require.NoError(t, wiring.Close()) })
 			options := append(internalTimestampOptions(newStartupGatedCoordinator(coord, nil)), dedicatedTimestampCutoverOptions(groups)...)

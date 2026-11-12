@@ -28,7 +28,7 @@ func TestShutdownProcess(t *testing.T) {
 		return
 	}
 	require.NoError(t, flag.CommandLine.Parse(flag.Args()))
-	require.NoError(t, ignoreCanceledAfterSignal(run()))
+	require.NoError(t, ignoreCanceledAfterSignal(run(cliFlags)))
 }
 
 func TestShutdownSIGTERMTransfersEveryRaftGroupE2E(t *testing.T) {

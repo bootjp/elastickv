@@ -20,26 +20,22 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// withOffloadFlags sets the offload flags for one test and restores
-// them afterwards. The flags are process globals, so a test that left
-// them set would enable offload for every later test in the package.
-func withOffloadFlags(t *testing.T, bucket, localDir string) {
-	t.Helper()
-	origBucket, origLocal := *snapshotOffloadBucket, *snapshotOffloadLocalDir
-	*snapshotOffloadBucket, *snapshotOffloadLocalDir = bucket, localDir
-	t.Cleanup(func() {
-		*snapshotOffloadBucket, *snapshotOffloadLocalDir = origBucket, origLocal
-	})
+// testOffloadFlags returns the registered offload defaults with the given
+// destination.
+func testOffloadFlags(bucket, localDir string) snapshotOffloadFlags {
+	f := defaultFlags[snapshotOffloadFlags]()
+	f.bucket, f.localDir = bucket, localDir
+	return f
 }
 
 // TestSnapshotOffloadIsOptIn pins that a node which configured no
 // destination does no offload work and cannot fail startup on offload
 // configuration.
 func TestSnapshotOffloadIsOptIn(t *testing.T) {
-	withOffloadFlags(t, "", "")
-	require.False(t, snapshotOffloadEnabled())
+	cfg := testOffloadFlags("", "")
+	require.False(t, snapshotOffloadEnabled(cfg))
 	require.NoError(t, startSnapshotOffload(
-		context.Background(), nil, nil, t.TempDir(), "n1", false, nil, testLogger(t)))
+		context.Background(), nil, cfg, nil, t.TempDir(), "n1", false, nil, testLogger(t)))
 }
 
 // TestSnapshotOffloadRejectsAmbiguousDestination guards against
@@ -47,10 +43,10 @@ func TestSnapshotOffloadIsOptIn(t *testing.T) {
 // receives the artifacts would be ambiguous, and a backup written to
 // the wrong place is discovered only when a restore is attempted.
 func TestSnapshotOffloadRejectsAmbiguousDestination(t *testing.T) {
-	withOffloadFlags(t, "some-bucket", t.TempDir())
-	require.True(t, snapshotOffloadEnabled())
+	cfg := testOffloadFlags("some-bucket", t.TempDir())
+	require.True(t, snapshotOffloadEnabled(cfg))
 
-	_, err := buildSnapshotOffloadStore(context.Background())
+	_, err := buildSnapshotOffloadStore(context.Background(), cfg)
 	require.Error(t, err)
 	require.True(t, errors.Is(err, snapshotoffload.ErrInvalidOptions))
 	require.ErrorContains(t, err, "mutually exclusive")
@@ -58,9 +54,9 @@ func TestSnapshotOffloadRejectsAmbiguousDestination(t *testing.T) {
 
 func TestSnapshotOffloadBuildsALocalStore(t *testing.T) {
 	root := t.TempDir()
-	withOffloadFlags(t, "", root)
+	cfg := testOffloadFlags("", root)
 
-	store, err := buildSnapshotOffloadStore(context.Background())
+	store, err := buildSnapshotOffloadStore(context.Background(), cfg)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, closeSnapshotOffloadStore(store)) })
 	require.NotNil(t, store)
@@ -115,13 +111,11 @@ func TestSnapshotOffloadLeadershipFailsClosedOnAClosedEngine(t *testing.T) {
 // configured-but-invalid offload fails startup rather than logging and
 // leaving the operator with no backups.
 func TestStartSnapshotOffloadRejectsIncompleteConfiguration(t *testing.T) {
-	withOffloadFlags(t, "", t.TempDir())
-	origCluster := *snapshotOffloadSourceCluster
-	*snapshotOffloadSourceCluster = "   " // whitespace-only: no identity
-	t.Cleanup(func() { *snapshotOffloadSourceCluster = origCluster })
+	cfg := testOffloadFlags("", t.TempDir())
+	cfg.sourceCluster = "   " // whitespace-only: no identity
 
 	err := startSnapshotOffload(
-		context.Background(), nil,
+		context.Background(), nil, cfg,
 		[]*raftGroupRuntime{{spec: groupSpec{id: 1}}},
 		t.TempDir(), "n1", false, nil, testLogger(t))
 	require.Error(t, err)
@@ -257,17 +251,6 @@ func TestRunbookRestorePathsFollowFromTheGroupTopology(t *testing.T) {
 // An http:// endpoint was forwarded straight to the AWS client, so the
 // downgrade was invisible until someone captured the traffic.
 func TestRejectPlaintextOffloadEndpoint(t *testing.T) {
-	restore := func(endpoint string, allow bool) func() {
-		prevEndpoint := *snapshotOffloadEndpoint
-		prevAllow := *snapshotOffloadAllowInsecureEndpoint
-		*snapshotOffloadEndpoint = endpoint
-		*snapshotOffloadAllowInsecureEndpoint = allow
-		return func() {
-			*snapshotOffloadEndpoint = prevEndpoint
-			*snapshotOffloadAllowInsecureEndpoint = prevAllow
-		}
-	}
-
 	for _, tc := range []struct {
 		name     string
 		endpoint string
@@ -292,8 +275,9 @@ func TestRejectPlaintextOffloadEndpoint(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			defer restore(tc.endpoint, tc.allow)()
-			err := rejectPlaintextOffloadEndpoint()
+			cfg := testOffloadFlags("", "")
+			cfg.endpoint, cfg.allowInsecureEndpoint = tc.endpoint, tc.allow
+			err := rejectPlaintextOffloadEndpoint(cfg)
 			if tc.wantErr {
 				require.Error(t, err, "endpoint %q", tc.endpoint)
 				require.ErrorIs(t, err, snapshotoffload.ErrInvalidOptions)
@@ -340,12 +324,8 @@ func TestSnapshotOffloadRedirectPolicy(t *testing.T) {
 }
 
 func TestSnapshotOffloadInsecureClientStillRestrictsRedirects(t *testing.T) {
-	previous := *snapshotOffloadAllowInsecureEndpoint
-	*snapshotOffloadAllowInsecureEndpoint = true
-	t.Cleanup(func() { *snapshotOffloadAllowInsecureEndpoint = previous })
-
 	base := &http.Client{Transport: &recordingRoundTripper{}}
-	wrapped, err := snapshotOffloadHTTPClient(base)
+	wrapped, err := snapshotOffloadHTTPClient(base, true)
 	require.NoError(t, err)
 	client, ok := wrapped.(*http.Client)
 	require.True(t, ok)
@@ -374,10 +354,6 @@ func TestSnapshotOffloadPreservesSDKCABundle(t *testing.T) {
 	}), 0o600))
 	t.Setenv("AWS_CA_BUNDLE", caPath)
 	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
-	previous := *snapshotOffloadAllowInsecureEndpoint
-	*snapshotOffloadAllowInsecureEndpoint = false
-	t.Cleanup(func() { *snapshotOffloadAllowInsecureEndpoint = previous })
-
 	var resolved aws.HTTPClient
 	store, err := snapshotoffload.NewS3Store(context.Background(), snapshotoffload.S3StoreConfig{
 		Bucket: "snapshot-test", Region: "us-east-1", Endpoint: server.URL,
@@ -385,7 +361,7 @@ func TestSnapshotOffloadPreservesSDKCABundle(t *testing.T) {
 		AccessKeyID: "test-key", SecretAccessKey: "test-secret",
 		HTTPClientDecorator: func(base aws.HTTPClient) (aws.HTTPClient, error) {
 			resolved = base
-			return snapshotOffloadHTTPClient(base)
+			return snapshotOffloadHTTPClient(base, false)
 		},
 	})
 	require.NoError(t, err)
@@ -443,11 +419,10 @@ func TestSnapshotOffloadRejectsSpoolPathThatIsAFile(t *testing.T) {
 	spoolFile := filepath.Join(t.TempDir(), "spool")
 	require.NoError(t, os.WriteFile(spoolFile, []byte("not a directory"), 0o600))
 
-	previous := *snapshotOffloadSpoolDir
-	*snapshotOffloadSpoolDir = spoolFile
-	t.Cleanup(func() { *snapshotOffloadSpoolDir = previous })
+	cfg := testOffloadFlags("", "")
+	cfg.spoolDir = spoolFile
 
-	require.Error(t, validateSnapshotOffloadSpoolDir())
+	require.Error(t, validateSnapshotOffloadSpoolDir(cfg))
 }
 
 func TestSnapshotOffloadCleanupSparesRecentSharedSpoolFiles(t *testing.T) {
@@ -455,16 +430,15 @@ func TestSnapshotOffloadCleanupSparesRecentSharedSpoolFiles(t *testing.T) {
 	spoolFile := filepath.Join(spoolDir, "elastickv-snapshot-offload-shared.fsm")
 	require.NoError(t, os.WriteFile(spoolFile, []byte("in flight"), 0o600))
 
-	previous := *snapshotOffloadSpoolDir
-	*snapshotOffloadSpoolDir = spoolDir
-	t.Cleanup(func() { *snapshotOffloadSpoolDir = previous })
+	cfg := testOffloadFlags("", "")
+	cfg.spoolDir = spoolDir
 	runtimes := []*raftGroupRuntime{{spec: groupSpec{id: 1}}}
 
-	cleanStaleOffloadSpool(runtimes, t.TempDir(), "n1", false, testLogger(t))
+	cleanStaleOffloadSpool(cfg, runtimes, t.TempDir(), "n1", false, testLogger(t))
 	require.FileExists(t, spoolFile)
 
 	stale := time.Now().Add(-snapshotOffloadStaleSpoolAge - time.Hour)
 	require.NoError(t, os.Chtimes(spoolFile, stale, stale))
-	cleanStaleOffloadSpool(runtimes, t.TempDir(), "n1", false, testLogger(t))
+	cleanStaleOffloadSpool(cfg, runtimes, t.TempDir(), "n1", false, testLogger(t))
 	require.NoFileExists(t, spoolFile)
 }

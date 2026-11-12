@@ -5,7 +5,6 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/adapter"
-	"github.com/bootjp/elastickv/internal/leaderbalance"
 	"github.com/bootjp/elastickv/internal/serverwiring"
 )
 
@@ -35,65 +34,67 @@ const (
 	splitMigrationCapabilityProbeTimeout   = 2 * time.Second
 )
 
+// serverFlags holds the command-line flags of the server, grouped by
+// area. Each area's struct registers its own flags and lives next to the
+// wiring that consumes it. Only main reads cliFlags; run() hands each
+// area its own values, so helpers never read flag state.
+//
+// Areas not listed here are still package-level flag globals and move
+// into serverFlags one area at a time (root package decomposition, M2).
+type serverFlags struct {
+	healthAddress   string
+	filesystem      filesystemFlags
+	leaderBalance   leaderBalanceFlags
+	tso             tsoFlags
+	snapshotOffload snapshotOffloadFlags
+}
+
+func registerServerFlags(fs *flag.FlagSet) *serverFlags {
+	f := &serverFlags{}
+	fs.StringVar(&f.healthAddress, "healthAddress", "", "private HTTP health listener (empty disables); exposes /livez and /readyz")
+	f.filesystem.register(fs)
+	f.leaderBalance.register(fs)
+	f.tso.register(fs)
+	f.snapshotOffload.register(fs)
+	return f
+}
+
+// cliFlags is bound to the process command line. Only main() reads it.
+var cliFlags = registerServerFlags(flag.CommandLine)
+
 var (
-	myAddr                          = flag.String("address", "localhost:50051", "TCP host+port for this node")
-	redisAddr                       = flag.String("redisAddress", "localhost:6379", "TCP host+port for redis")
-	dynamoAddr                      = flag.String("dynamoAddress", "localhost:8000", "TCP host+port for DynamoDB-compatible API")
-	s3Addr                          = flag.String("s3Address", "", "TCP host+port for S3-compatible API; empty to disable")
-	s3Region                        = flag.String("s3Region", "us-east-1", "S3 signing region")
-	s3CredsFile                     = flag.String("s3CredentialsFile", "", "Path to a JSON file containing static S3 credentials")
-	s3PathStyleOnly                 = flag.Bool("s3PathStyleOnly", true, "Only accept path-style S3 requests")
-	sqsAddr                         = flag.String("sqsAddress", "", "TCP host+port for SQS-compatible API; empty to disable")
-	sqsPublicEndpoint               = flag.String("sqsPublicEndpoint", "", "Public HTTP(S) origin used in SQS queue URLs behind a proxy; empty derives URLs from the request")
-	sqsRegion                       = flag.String("sqsRegion", "us-east-1", "SQS signing region")
-	sqsCredsFile                    = flag.String("sqsCredentialsFile", "", "Path to a JSON file containing static SQS credentials")
-	metricsAddr                     = flag.String("metricsAddress", "localhost:9090", "TCP host+port for Prometheus metrics")
-	metricsToken                    = flag.String("metricsToken", "", "Bearer token for Prometheus metrics; required for non-loopback metricsAddress")
-	pprofAddr                       = flag.String("pprofAddress", "localhost:6060", "TCP host+port for pprof debug endpoints; empty to disable")
-	pprofToken                      = flag.String("pprofToken", "", "Bearer token for pprof; required for non-loopback pprofAddress")
-	filesystemMount                 = flag.String("filesystemMount", "", "FUSE mount point for the Elastickv filesystem; empty to disable")
-	filesystemClientID              = flag.String("filesystemClientID", "", "Stable open-handle lease client ID for the FUSE mount; empty uses raftId")
-	filesystemStrict                = flag.Bool("filesystemStrict", false, "Use the operation journal for supported FUSE mutations")
-	filesystemStrictRecover         = flag.Bool("filesystemStrictRecover", false, "Fence and recover a previous strict FUSE session for the same client ID; use only after the previous mount has stopped")
-	filesystemCapacity              = flag.Uint64("filesystemCapacity", 0, "Filesystem byte capacity reported by statfs; zero reports unlimited")
-	filesystemMaxFiles              = flag.Uint64("filesystemMaxFiles", 0, "Filesystem inode capacity reported by statfs; zero reports unlimited")
-	filesystemRootMode              = flag.Uint("filesystemRootMode", defaultFilesystemRootMode, "Root directory permission mode for first initialization")
-	filesystemRootUID               = flag.Uint("filesystemRootUID", 0, "Root directory owner UID for first initialization")
-	filesystemRootGID               = flag.Uint("filesystemRootGID", 0, "Root directory owner GID for first initialization")
-	filesystemPlacementScanInterval = flag.Duration("filesystemPlacementScanInterval", defaultFilesystemPlacementScanInterval, "Interval for filesystem placement and recovery-state metrics; non-positive disables periodic scans")
-	filesystemLeaseReapInterval     = flag.Duration("filesystemLeaseReapInterval", defaultFilesystemLeaseReapInterval, "Interval for reclaiming expired filesystem open-handle leases; non-positive disables periodic reaping")
-	raftId                          = flag.String("raftId", "", "Node id used by Raft")
-	raftEngineName                  = flag.String("raftEngine", string(raftEngineEtcd), "Raft engine implementation (etcd)")
-	raftDir                         = flag.String("raftDataDir", "data/", "Raft data dir")
-	redisLuaMaxIdleStates           = flag.Int("redisLuaMaxIdleStates", adapter.DefaultLuaPoolMaxIdle, "Maximum number of idle *lua.LState instances retained by the Redis Lua VM pool. Each state holds ~200 KiB; lower values reduce steady-state memory at the cost of more allocations under burst, higher values absorb bursts at the cost of memory floor. Non-positive values clamp to the default.")
-	raftBootstrap                   = flag.Bool("raftBootstrap", false, "Whether to bootstrap the Raft cluster")
-	raftBootstrapMembers            = flag.String("raftBootstrapMembers", "", "Comma-separated bootstrap raft members (raftID=host:port,...)")
-	raftGroupPeers                  = flag.String("raftGroupPeers", "", "Semicolon-separated per-group bootstrap members (groupID=raftID@host:port,...)")
-	raftJoinMembers                 = flag.String("raftJoinMembers", "", "Comma-separated raft members used only for transport discovery while this fresh node joins an existing single-group cluster (raftID=host:port,...); requires --raftJoinAsLearner")
-	raftJoinAsLearner               = flag.Bool("raftJoinAsLearner", false, "Local node expects to join an existing cluster as a learner; if a post-apply ConfState lists this node as a voter instead, an ERROR-level alarm fires (the node keeps running -- the flag is an operator alarm, not a consensus veto). See docs/design/2026_04_26_implemented_raft_learner.md §4.5.")
-	tsoEnabled                      = flag.Bool("tsoEnabled", false, "Commit the one-way cutover marker and issue coordinator-owned persistence timestamps through the dedicated TSO leader when group 0 is configured")
-	tsoShadowEnabled                = flag.Bool("tsoShadowEnabled", false, "Serialize legacy HLC issuance through the dedicated TSO; fail closed on TSO errors and switch to TSO values after cutover")
-	tsoPhaseDEnabled                = flag.Bool("tsoPhaseDEnabled", false, "Close the centralized-TSO compatibility window after every group-0 member understands the M7 marker")
-	tsoBatchSize                    = flag.Int("tsoBatchSize", defaultTSOBatchSize, "Timestamp batch size used by TSO cutover and shadow validation")
-	tsoModeFile                     = flag.String("tsoModeFile", "", "Path to a runtime-reloadable TSO mode file containing legacy, shadow, cutover, or phase-d")
-	tsoModeReloadInterval           = flag.Duration("tsoModeReloadInterval", defaultTSOReload, "Polling interval for tsoModeFile")
-	commitTSFence                   = flag.Bool("commitTSFence", false, "Reserved for replicated catalog bootstrap; activation is rejected until the startup catalog no longer writes outside Raft")
-	readWatermarkAdvance            = flag.Bool("readWatermarkAdvance", false, "Raise a lagging group's commit watermark before a cross-group snapshot read so late one-phase writes cannot land below the snapshot; enable only after every node runs a binary that understands the advance entry")
-	leaderBalance                   = flag.Bool("leaderBalance", false, "Enable automatic count-based Raft-group leader balancing on the default-group leader")
-	leaderBalanceInterval           = flag.Duration("leaderBalanceInterval", leaderbalance.DefaultInterval, "Interval between leader-balance scheduler evaluations")
-	leaderBalanceGroupCooldown      = flag.Duration("leaderBalanceGroupCooldown", leaderbalance.DefaultGroupCooldown, "Minimum time before the scheduler can move the same raft group again")
-	leaderBalanceGlobalCooldown     = flag.Duration("leaderBalanceGlobalCooldown", leaderbalance.DefaultGlobalCooldown, "Minimum time between any two automatic leadership transfers")
-	leaderBalanceStartupGrace       = flag.Duration("leaderBalanceStartupGrace", 0, "Grace period after acquiring default-group leadership before issuing transfers; 0 uses max(interval, global cooldown)")
-	leaderBalanceImbalanceThreshold = flag.Int("leaderBalanceImbalanceThreshold", leaderbalance.DefaultImbalanceThreshold, "Minimum leader-count spread required before balancing")
-	leaderBalanceMaxTargetLag       = flag.Uint64("leaderBalanceMaxTargetLag", leaderbalance.DefaultMaxTargetLag, "Maximum target lag in raft log entries for gated automatic leadership transfers; 0 requires the target to match the leader's last log index")
-	leaderBalancePinGroups          = flag.String("leaderBalancePinGroups", "", "Comma-separated raft group IDs excluded from automatic leader balancing")
-	leaderBalanceKillSwitchFile     = flag.String("leaderBalanceKillSwitchFile", "", "If non-empty and the file exists, the leader-balance scheduler observes but skips transfers")
-	raftGroups                      = flag.String("raftGroups", "", "Comma-separated raft groups (groupID=host:port,...)")
-	shardRanges                     = flag.String("shardRanges", "", "Comma-separated shard ranges (start:end=groupID,...)")
-	raftRedisMap                    = flag.String("raftRedisMap", "", "Map of Raft address to Redis address (raftAddr=redisAddr,...)")
-	raftS3Map                       = flag.String("raftS3Map", "", "Map of Raft address to S3 address (raftAddr=s3Addr,...)")
-	raftDynamoMap                   = flag.String("raftDynamoMap", "", "Map of Raft address to DynamoDB address (raftAddr=dynamoAddr,...)")
-	raftSqsMap                      = flag.String("raftSqsMap", "", "Map of Raft address to SQS address (raftAddr=sqsAddr,...)")
+	myAddr                = flag.String("address", "localhost:50051", "TCP host+port for this node")
+	redisAddr             = flag.String("redisAddress", "localhost:6379", "TCP host+port for redis")
+	dynamoAddr            = flag.String("dynamoAddress", "localhost:8000", "TCP host+port for DynamoDB-compatible API")
+	s3Addr                = flag.String("s3Address", "", "TCP host+port for S3-compatible API; empty to disable")
+	s3Region              = flag.String("s3Region", "us-east-1", "S3 signing region")
+	s3CredsFile           = flag.String("s3CredentialsFile", "", "Path to a JSON file containing static S3 credentials")
+	s3PathStyleOnly       = flag.Bool("s3PathStyleOnly", true, "Only accept path-style S3 requests")
+	sqsAddr               = flag.String("sqsAddress", "", "TCP host+port for SQS-compatible API; empty to disable")
+	sqsPublicEndpoint     = flag.String("sqsPublicEndpoint", "", "Public HTTP(S) origin used in SQS queue URLs behind a proxy; empty derives URLs from the request")
+	sqsRegion             = flag.String("sqsRegion", "us-east-1", "SQS signing region")
+	sqsCredsFile          = flag.String("sqsCredentialsFile", "", "Path to a JSON file containing static SQS credentials")
+	metricsAddr           = flag.String("metricsAddress", "localhost:9090", "TCP host+port for Prometheus metrics")
+	metricsToken          = flag.String("metricsToken", "", "Bearer token for Prometheus metrics; required for non-loopback metricsAddress")
+	pprofAddr             = flag.String("pprofAddress", "localhost:6060", "TCP host+port for pprof debug endpoints; empty to disable")
+	pprofToken            = flag.String("pprofToken", "", "Bearer token for pprof; required for non-loopback pprofAddress")
+	raftId                = flag.String("raftId", "", "Node id used by Raft")
+	raftEngineName        = flag.String("raftEngine", string(raftEngineEtcd), "Raft engine implementation (etcd)")
+	raftDir               = flag.String("raftDataDir", "data/", "Raft data dir")
+	redisLuaMaxIdleStates = flag.Int("redisLuaMaxIdleStates", adapter.DefaultLuaPoolMaxIdle, "Maximum number of idle *lua.LState instances retained by the Redis Lua VM pool. Each state holds ~200 KiB; lower values reduce steady-state memory at the cost of more allocations under burst, higher values absorb bursts at the cost of memory floor. Non-positive values clamp to the default.")
+	raftBootstrap         = flag.Bool("raftBootstrap", false, "Whether to bootstrap the Raft cluster")
+	raftBootstrapMembers  = flag.String("raftBootstrapMembers", "", "Comma-separated bootstrap raft members (raftID=host:port,...)")
+	raftGroupPeers        = flag.String("raftGroupPeers", "", "Semicolon-separated per-group bootstrap members (groupID=raftID@host:port,...)")
+	raftJoinMembers       = flag.String("raftJoinMembers", "", "Comma-separated raft members used only for transport discovery while this fresh node joins an existing single-group cluster (raftID=host:port,...); requires --raftJoinAsLearner")
+	raftJoinAsLearner     = flag.Bool("raftJoinAsLearner", false, "Local node expects to join an existing cluster as a learner; if a post-apply ConfState lists this node as a voter instead, an ERROR-level alarm fires (the node keeps running -- the flag is an operator alarm, not a consensus veto). See docs/design/2026_04_26_implemented_raft_learner.md §4.5.")
+	commitTSFence         = flag.Bool("commitTSFence", false, "Reserved for replicated catalog bootstrap; activation is rejected until the startup catalog no longer writes outside Raft")
+	readWatermarkAdvance  = flag.Bool("readWatermarkAdvance", false, "Raise a lagging group's commit watermark before a cross-group snapshot read so late one-phase writes cannot land below the snapshot; enable only after every node runs a binary that understands the advance entry")
+	raftGroups            = flag.String("raftGroups", "", "Comma-separated raft groups (groupID=host:port,...)")
+	shardRanges           = flag.String("shardRanges", "", "Comma-separated shard ranges (start:end=groupID,...)")
+	raftRedisMap          = flag.String("raftRedisMap", "", "Map of Raft address to Redis address (raftAddr=redisAddr,...)")
+	raftS3Map             = flag.String("raftS3Map", "", "Map of Raft address to S3 address (raftAddr=s3Addr,...)")
+	raftDynamoMap         = flag.String("raftDynamoMap", "", "Map of Raft address to DynamoDB address (raftAddr=dynamoAddr,...)")
+	raftSqsMap            = flag.String("raftSqsMap", "", "Map of Raft address to SQS address (raftAddr=sqsAddr,...)")
 	// HT-FIFO partition assignment (Phase 3.D §5). Distinct from
 	// --raftSqsMap (which maps raftAddr=sqsAddr for the
 	// proxyToLeader endpoint resolution). The grammar is

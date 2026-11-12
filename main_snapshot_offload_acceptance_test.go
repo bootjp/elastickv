@@ -29,13 +29,13 @@ const (
 // mocked leadership, in-memory object backend or manual publication call.
 func TestSnapshotOffloadThreeNodeRecoveryAcceptance(t *testing.T) {
 	t.Setenv("ELASTICKV_RAFT_SNAPSHOT_COUNT", "4")
-	configureOffloadAcceptance(t)
+	cfg := offloadAcceptanceFlags(t)
 	baseDir, endpoints, nodes := startBootstrapE2ECluster(t, t.TempDir(), offloadAcceptanceNodeCount, 1, raftEngineEtcd)
 	t.Cleanup(func() { closeBootstrapE2ENodes(t, nodes) })
 	waitForBootstrapClusterConfig(t, nodes, bootstrapExpectedConfiguration(endpoints))
 	leader := waitForSingleLeader(t, nodes)
 	groupID := nodes[leader].runtimes[0].spec.id
-	objects, err := snapshotoffload.NewLocalStore(*snapshotOffloadLocalDir)
+	objects, err := snapshotoffload.NewLocalStore(cfg.localDir)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, objects.Close()) })
 	clients, conns := rawKVClients(t, endpoints)
@@ -43,7 +43,7 @@ func TestSnapshotOffloadThreeNodeRecoveryAcceptance(t *testing.T) {
 
 	workers := make([]func(), len(nodes))
 	for i, node := range nodes {
-		workers[i] = startOffloadAcceptanceWorker(t, baseDir, node)
+		workers[i] = startOffloadAcceptanceWorker(t, cfg, baseDir, node)
 	}
 	expected := make(map[string]string)
 	writeOffloadAcceptanceBatch(t, clients[leader], expected, 0)
@@ -61,8 +61,8 @@ func TestSnapshotOffloadThreeNodeRecoveryAcceptance(t *testing.T) {
 			continue
 		}
 		workers[i]()
-		*snapshotOffloadGCEnabled = i == leader
-		workers[i] = startOffloadAcceptanceWorker(t, baseDir, node)
+		cfg.retention.enabled = i == leader
+		workers[i] = startOffloadAcceptanceWorker(t, cfg, baseDir, node)
 	}
 	writeOffloadAcceptanceBatch(t, clients[leader], expected, offloadAcceptanceBatchSize)
 	second := checkpointOffloadAcceptance(t, objects, nodes[leader], clients[leader], groupID)
@@ -90,7 +90,7 @@ func TestSnapshotOffloadThreeNodeRecoveryAcceptance(t *testing.T) {
 	// Re-open the object root after all publishers/GC stop. Recovery must use
 	// durable bytes, not a live publisher's memory or the source's data dir.
 	require.NoError(t, objects.Close())
-	objects, err = snapshotoffload.NewLocalStore(*snapshotOffloadLocalDir)
+	objects, err = snapshotoffload.NewLocalStore(cfg.localDir)
 	require.NoError(t, err)
 	latest = waitForOffloadAcceptanceManifest(t, objects, groupID, latest.SnapshotIndex)
 	t.Logf("source: three voters, one stopped; %d verified user keys plus checkpoint writes; periodic indexes %d -> %d -> %d; old manifest/payload reclaimed",
@@ -98,25 +98,22 @@ func TestSnapshotOffloadThreeNodeRecoveryAcceptance(t *testing.T) {
 	restoreOffloadAcceptanceCluster(t, objects, latest, expected)
 }
 
-func configureOffloadAcceptance(t *testing.T) {
+func offloadAcceptanceFlags(t *testing.T) snapshotOffloadFlags {
 	t.Helper()
-	configureSnapshotGC(t)
-	withOffloadFlags(t, "", t.TempDir())
-	interval, jitter, timeout := *snapshotOffloadInterval, *snapshotOffloadJitter, *snapshotOffloadPublishTimeout
-	t.Cleanup(func() {
-		*snapshotOffloadInterval, *snapshotOffloadJitter, *snapshotOffloadPublishTimeout = interval, jitter, timeout
-	})
-	*snapshotOffloadInterval, *snapshotOffloadJitter, *snapshotOffloadPublishTimeout = offloadAcceptancePoll, time.Nanosecond, 5*time.Second
-	*snapshotOffloadGCEnabled = false
-	*snapshotOffloadGCInterval = offloadAcceptancePoll
-	*snapshotOffloadGCPayloadGrace, *snapshotOffloadGCMinMarkAge = 100*time.Millisecond, 100*time.Millisecond
+	f := snapshotGCTestFlags()
+	f.localDir = t.TempDir()
+	f.interval, f.jitter, f.publishTimeout = offloadAcceptancePoll, time.Nanosecond, 5*time.Second
+	f.retention.enabled = false
+	f.retention.interval = offloadAcceptancePoll
+	f.retention.payloadGrace, f.retention.minMarkAge = 100*time.Millisecond, 100*time.Millisecond
+	return f
 }
 
-func startOffloadAcceptanceWorker(t *testing.T, baseDir string, node *bootstrapE2ENode) func() {
+func startOffloadAcceptanceWorker(t *testing.T, cfg snapshotOffloadFlags, baseDir string, node *bootstrapE2ENode) func() {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	workers, workerCtx := errgroup.WithContext(ctx)
-	require.NoError(t, startSnapshotOffload(workerCtx, workers, node.runtimes, baseDir, node.id, false, nil, testLogger(t)))
+	require.NoError(t, startSnapshotOffload(workerCtx, workers, cfg, node.runtimes, baseDir, node.id, false, nil, testLogger(t)))
 	stop := func() {
 		cancel()
 		require.NoError(t, workers.Wait())

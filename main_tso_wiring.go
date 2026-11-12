@@ -2,23 +2,45 @@ package main
 
 import (
 	"context"
+	"flag"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/bootjp/elastickv/kv"
 	"github.com/cockroachdb/errors"
 	"golang.org/x/sync/errgroup"
 )
 
-func startTSOModeReloader(ctx context.Context, eg *errgroup.Group, wiring coordinatorTSOWiring) {
-	if eg == nil || wiring.runtimeController == nil || strings.TrimSpace(*tsoModeFile) == "" {
+// tsoFlags selects the timestamp-oracle rollout stage, either through the
+// legacy booleans or through a runtime-reloadable mode file.
+type tsoFlags struct {
+	enabled            bool
+	shadowEnabled      bool
+	phaseDEnabled      bool
+	batchSize          int
+	modeFile           string
+	modeReloadInterval time.Duration
+}
+
+func (f *tsoFlags) register(fs *flag.FlagSet) {
+	fs.BoolVar(&f.enabled, "tsoEnabled", false, "Commit the one-way cutover marker and issue coordinator-owned persistence timestamps through the dedicated TSO leader when group 0 is configured")
+	fs.BoolVar(&f.shadowEnabled, "tsoShadowEnabled", false, "Serialize legacy HLC issuance through the dedicated TSO; fail closed on TSO errors and switch to TSO values after cutover")
+	fs.BoolVar(&f.phaseDEnabled, "tsoPhaseDEnabled", false, "Close the centralized-TSO compatibility window after every group-0 member understands the M7 marker")
+	fs.IntVar(&f.batchSize, "tsoBatchSize", defaultTSOBatchSize, "Timestamp batch size used by TSO cutover and shadow validation")
+	fs.StringVar(&f.modeFile, "tsoModeFile", "", "Path to a runtime-reloadable TSO mode file containing legacy, shadow, cutover, or phase-d")
+	fs.DurationVar(&f.modeReloadInterval, "tsoModeReloadInterval", defaultTSOReload, "Polling interval for tsoModeFile")
+}
+
+func startTSOModeReloader(ctx context.Context, eg *errgroup.Group, f tsoFlags, wiring coordinatorTSOWiring) {
+	if eg == nil || wiring.runtimeController == nil || strings.TrimSpace(f.modeFile) == "" {
 		return
 	}
 	eg.Go(func() error {
 		return kv.RunTSOModeFileReload(
 			ctx,
-			*tsoModeFile,
-			*tsoModeReloadInterval,
+			f.modeFile,
+			f.modeReloadInterval,
 			wiring.runtimeController,
 			slog.Default(),
 		)
@@ -81,6 +103,7 @@ func (w coordinatorTSOWiring) CloseWithLog() {
 }
 
 func configureCoordinatorTSO(
+	f tsoFlags,
 	coordinate *kv.ShardedCoordinator,
 	shardGroups map[uint64]*kv.ShardGroup,
 	floorProviders ...kv.TSOCutoverFloorProvider,
@@ -89,10 +112,11 @@ func configureCoordinatorTSO(
 	if len(floorProviders) > 0 {
 		floorProvider = floorProviders[0]
 	}
-	return configureCoordinatorTSOWithObserver(coordinate, shardGroups, floorProvider, nil)
+	return configureCoordinatorTSOWithObserver(f, coordinate, shardGroups, floorProvider, nil)
 }
 
 func configureCoordinatorTSOWithObserver(
+	f tsoFlags,
 	coordinate *kv.ShardedCoordinator,
 	shardGroups map[uint64]*kv.ShardGroup,
 	floorProvider kv.TSOCutoverFloorProvider,
@@ -103,14 +127,14 @@ func configureCoordinatorTSOWithObserver(
 	if coordinate == nil {
 		return wiring, errors.Wrap(kv.ErrTSOCoordinatorNil, "configure tso allocator")
 	}
-	mode, err := configuredTSOMode()
+	mode, err := configuredTSOMode(f)
 	if err != nil {
 		return wiring, err
 	}
 
 	tsoGroup, dedicated := shardGroups[dedicatedTSORaftGroupID]
 	if !dedicated {
-		return configureLegacyCoordinatorTSO(coordinate, mode)
+		return configureLegacyCoordinatorTSO(f, coordinate, mode)
 	}
 	// Let the state machine publish cutover / phase-D from its own apply and
 	// restore paths. Otherwise a replica that applies a marker but serves no
@@ -119,62 +143,62 @@ func configureCoordinatorTSOWithObserver(
 	if tsoGroup != nil && tsoGroup.TSOState != nil && observer != nil {
 		tsoGroup.TSOState.SetDurableStateObserver(observer)
 	}
-	return configureDedicatedCoordinatorTSO(coordinate, tsoGroup, floorProvider, mode, observer, networks...)
+	return configureDedicatedCoordinatorTSO(f, coordinate, tsoGroup, floorProvider, mode, observer, networks...)
 }
 
-func configuredTSOMode() (kv.TSOMode, error) {
-	if err := validateTSOModeFlags(); err != nil {
+func configuredTSOMode(f tsoFlags) (kv.TSOMode, error) {
+	if err := validateTSOModeFlags(f); err != nil {
 		return kv.TSOModeLegacy, err
 	}
-	if strings.TrimSpace(*tsoModeFile) != "" {
-		mode, err := kv.ReadTSOModeFile(*tsoModeFile)
+	if strings.TrimSpace(f.modeFile) != "" {
+		mode, err := kv.ReadTSOModeFile(f.modeFile)
 		return mode, errors.Wrap(err, "load initial tso runtime mode")
 	}
-	return tsoModeFromLegacyFlags(), nil
+	return tsoModeFromLegacyFlags(f), nil
 }
 
-func validateTSOModeFlags() error {
-	if err := validateLegacyTSOModeFlags(); err != nil {
+func validateTSOModeFlags(f tsoFlags) error {
+	if err := validateLegacyTSOModeFlags(f); err != nil {
 		return err
 	}
-	if strings.TrimSpace(*tsoModeFile) == "" {
+	if strings.TrimSpace(f.modeFile) == "" {
 		return nil
 	}
-	if *tsoEnabled || *tsoShadowEnabled || *tsoPhaseDEnabled {
+	if f.enabled || f.shadowEnabled || f.phaseDEnabled {
 		return errors.New("--tsoModeFile cannot be combined with tsoEnabled, tsoShadowEnabled, or tsoPhaseDEnabled")
 	}
-	if *tsoModeReloadInterval <= 0 {
+	if f.modeReloadInterval <= 0 {
 		return errors.New("--tsoModeReloadInterval must be positive")
 	}
 	return nil
 }
 
-func validateLegacyTSOModeFlags() error {
-	if *tsoEnabled && *tsoShadowEnabled {
+func validateLegacyTSOModeFlags(f tsoFlags) error {
+	if f.enabled && f.shadowEnabled {
 		return errors.New("--tsoEnabled and --tsoShadowEnabled are mutually exclusive")
 	}
-	if *tsoPhaseDEnabled && !*tsoEnabled {
+	if f.phaseDEnabled && !f.enabled {
 		return errors.New("--tsoPhaseDEnabled requires --tsoEnabled")
 	}
 	return nil
 }
 
-func tsoModeFromLegacyFlags() kv.TSOMode {
+func tsoModeFromLegacyFlags(f tsoFlags) kv.TSOMode {
 	switch {
-	case *tsoPhaseDEnabled:
+	case f.phaseDEnabled:
 		return kv.TSOModePhaseD
-	case *tsoEnabled:
+	case f.enabled:
 		return kv.TSOModeCutover
-	case *tsoShadowEnabled:
+	case f.shadowEnabled:
 		return kv.TSOModeShadow
 	default:
 		return kv.TSOModeLegacy
 	}
 }
 
-func configureLegacyCoordinatorTSO(coordinate *kv.ShardedCoordinator, mode kv.TSOMode) (coordinatorTSOWiring, error) {
+func configureLegacyCoordinatorTSO(f tsoFlags, coordinate *kv.ShardedCoordinator, mode kv.TSOMode) (coordinatorTSOWiring, error) {
 	var wiring coordinatorTSOWiring
-	if strings.TrimSpace(*tsoModeFile) != "" {
+	if strings.TrimSpace(f.modeFile) != "" {
 		return wiring, errors.Wrap(kv.ErrTSOGroupRequired, "configure tso mode reload")
 	}
 	if mode == kv.TSOModePhaseD {
@@ -192,7 +216,7 @@ func configureLegacyCoordinatorTSO(coordinate *kv.ShardedCoordinator, mode kv.TS
 	if err != nil {
 		return wiring, errors.Wrap(err, "configure local tso bridge")
 	}
-	batch, err := kv.NewBatchAllocator(local, *tsoBatchSize)
+	batch, err := kv.NewBatchAllocator(local, f.batchSize)
 	if err != nil {
 		return wiring, errors.Wrap(err, "configure local tso bridge batch")
 	}
@@ -201,6 +225,7 @@ func configureLegacyCoordinatorTSO(coordinate *kv.ShardedCoordinator, mode kv.TS
 }
 
 func configureDedicatedCoordinatorTSO(
+	f tsoFlags,
 	coordinate *kv.ShardedCoordinator,
 	tsoGroup *kv.ShardGroup,
 	floorProvider kv.TSOCutoverFloorProvider,
@@ -229,7 +254,7 @@ func configureDedicatedCoordinatorTSO(
 	// the process having to mutate the coordinator at runtime.
 	coordinate.WithTSOCutoverState(tsoGroup.TSOState)
 	coordinate.WithTimestampGroupCandidate(dedicatedTSORaftGroupID)
-	if !dedicatedTSORuntimeRequired(tsoGroup.TSOState, mode) {
+	if !dedicatedTSORuntimeRequired(f, tsoGroup.TSOState, mode) {
 		return wiring, nil
 	}
 	if dedicatedTSOTimestampGroupRequired(tsoGroup.TSOState, mode) {
@@ -257,7 +282,7 @@ func configureDedicatedCoordinatorTSO(
 		Clock:       coordinate.Clock(),
 		Routed:      routed,
 		State:       tsoGroup.TSOState,
-		BatchSize:   *tsoBatchSize,
+		BatchSize:   f.batchSize,
 		InitialMode: mode,
 		Logger:      slog.Default(),
 		Observer:    observer,
@@ -271,8 +296,8 @@ func configureDedicatedCoordinatorTSO(
 	return wiring, nil
 }
 
-func dedicatedTSORuntimeRequired(state *kv.TSOStateMachine, mode kv.TSOMode) bool {
-	return strings.TrimSpace(*tsoModeFile) != "" || dedicatedTSOTimestampGroupRequired(state, mode)
+func dedicatedTSORuntimeRequired(f tsoFlags, state *kv.TSOStateMachine, mode kv.TSOMode) bool {
+	return strings.TrimSpace(f.modeFile) != "" || dedicatedTSOTimestampGroupRequired(state, mode)
 }
 
 func dedicatedTSOTimestampGroupRequired(state *kv.TSOStateMachine, mode kv.TSOMode) bool {

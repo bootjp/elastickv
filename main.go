@@ -36,7 +36,7 @@ func main() {
 	flag.Parse()
 	keyVizFlags.RecordExplicit(flag.CommandLine)
 
-	err := run()
+	err := run(cliFlags)
 	if memoryPressureExit.Load() {
 		// memwatch fired: surface exit code 2 regardless of whether run()
 		// returned a nil or an error (cancel() can cause in-flight
@@ -91,7 +91,7 @@ func onlyContextCanceled(err error) bool {
 	return errors.Is(err, context.Canceled)
 }
 
-func run() error {
+func run(flags *serverFlags) error {
 	cfg, engineType, bootstrapCfg, bootstrap, err := resolveNetworkRuntimeInputs()
 	if err != nil {
 		return err
@@ -159,7 +159,7 @@ func run() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	handoff := newShutdownHandoff(cancel)
 	cleanup.Add(installShutdownSignalHandler(handoff.requestShutdown))
-	health, stopHealth, err := startRuntimeHealth(ctx, &lc, cancel, *healthAddress, *raftId)
+	health, stopHealth, err := startRuntimeHealth(ctx, &lc, cancel, flags.healthAddress, *raftId)
 	if err != nil {
 		return err
 	}
@@ -247,6 +247,7 @@ func run() error {
 	configureCommitTSFenceActivation(coordinate, *commitTSFence, runtimes)
 	installBootstrapCoordinator(bootstrapDomain, coordinate, &cleanup)
 	tsoWiring, err := configureCoordinatorTSOWithObserver(
+		flags.tso,
 		coordinate,
 		shardGroups,
 		shardStore,
@@ -273,7 +274,7 @@ func run() error {
 		sqsAdvertisesHTFIFO(), slog.Default())
 	cleanup.Add(leadershipRefusalDeregister)
 	eg, runCtx := errgroup.WithContext(ctx)
-	startTSOModeReloader(runCtx, eg, tsoWiring)
+	startTSOModeReloader(runCtx, eg, flags.tso, tsoWiring)
 	startRaftEngineLifecycleWatchers(runCtx, eg, runtimes)
 	// setupDistributionCatalog + the Stage 7a process-start registration
 	// gate are bundled so run() has a single startup-fault path: a
@@ -305,6 +306,7 @@ func run() error {
 		clock:           clock,
 		tsoWiring:       tsoWiring,
 		shardGroups:     shardGroups,
+		snapshotOffload: flags.snapshotOffload,
 	}, encryptionStartup)
 	if err != nil {
 		// Members already run on eg (TSO reloader, raft lifecycle
@@ -342,6 +344,9 @@ func run() error {
 		keyvizSampler:                   sampler,
 		autoSplitRuntime:                autoSplitRuntime,
 		encryptionConfChangeInterceptor: encryptionConfChangeInterceptor,
+		raftID:                          *raftId,
+		filesystem:                      flags.filesystem,
+		leaderBalance:                   flags.leaderBalance,
 	}, health, handoff)
 }
 
@@ -360,7 +365,7 @@ func serveStartedRuntime(waitRotateOnStartup startupRotationWaiter, in serversIn
 		balanceCtx,
 		in.eg,
 		in.runtimes,
-		leaderBalanceConfigFromFlags(*raftId, in.cfg.defaultGroup, in.cfg.sqsFifoPartitionMap, in.metricsRegistry.Registerer()),
+		leaderBalanceOptions(in.leaderBalance, in.raftID, in.cfg.defaultGroup, in.cfg.sqsFifoPartitionMap, in.metricsRegistry.Registerer()),
 		balanceDone,
 	)
 

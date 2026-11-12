@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"flag"
 	"log/slog"
 	"net"
 	"net/http"
@@ -11,8 +10,6 @@ import (
 	"github.com/bootjp/elastickv/internal/runtimehealth"
 	"github.com/cockroachdb/errors"
 )
-
-var healthAddress = flag.String("healthAddress", "", "private HTTP health listener (empty disables); exposes /livez and /readyz")
 
 const healthShutdownTimeout = 5 * time.Second
 
