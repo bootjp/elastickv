@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/keyviz"
 	"golang.org/x/sync/errgroup"
 )
@@ -34,7 +35,7 @@ func keyVizSamplerForCoordinator(s *keyviz.MemSampler) keyviz.Sampler {
 // publisher running, MatrixRow.LeaderTerm stays zero and the fan-out
 // aggregator falls back to the legacy max-merge — no behavior change
 // versus PR #709.
-func startKeyVizLeaderTermPublisher(ctx context.Context, eg *errgroup.Group, s *keyviz.MemSampler, runtimes []*raftGroupRuntime) {
+func startKeyVizLeaderTermPublisher(ctx context.Context, eg *errgroup.Group, s *keyviz.MemSampler, runtimes []*clusterbootstrap.GroupRuntime) {
 	if s == nil || len(runtimes) == 0 {
 		return
 	}
@@ -72,7 +73,7 @@ type groupTermSnapshot struct {
 	term    uint64
 }
 
-func publishLeaderTerms(s *keyviz.MemSampler, runtimes []*raftGroupRuntime) {
+func publishLeaderTerms(s *keyviz.MemSampler, runtimes []*clusterbootstrap.GroupRuntime) {
 	snaps := make([]groupTermSnapshot, 0, len(runtimes))
 	for _, rt := range runtimes {
 		// snapshotEngine takes engineMu.RLock so a concurrent
@@ -83,7 +84,7 @@ func publishLeaderTerms(s *keyviz.MemSampler, runtimes []*raftGroupRuntime) {
 		// race-detector failure and the undefined-behavior
 		// nil-pointer dereference Codex round-1/round-2 P2
 		// flagged on PR #720.
-		engine := rt.snapshotEngine()
+		engine := clusterbootstrap.RuntimeCore(rt).SnapshotEngine()
 		if engine == nil {
 			continue
 		}

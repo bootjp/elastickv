@@ -15,6 +15,7 @@ import (
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
 	internalutil "github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryption/kek"
 	"github.com/bootjp/elastickv/internal/encryptionwiring"
@@ -36,7 +37,7 @@ import (
 type bootstrapRotationE2EFixture struct {
 	base, dir, configDir, sidecarPath string
 	group                             noderuntime.GroupSpec
-	config                            *bootstrapPeerConfig
+	config                            *clusterbootstrap.BootstrapPeerConfig
 	manifest                          raftbootstrap.BaselineManifest
 	activation                        []byte
 	wrapper                           *kek.FileWrapper
@@ -59,7 +60,7 @@ func newBootstrapRotationE2EFixture(t *testing.T, active ...bool) *bootstrapRota
 	cfg, err := loadBootstrapFixture(t, encoded)
 	require.NoError(t, err)
 	f := &bootstrapRotationE2EFixture{base: t.TempDir(), configDir: t.TempDir(), config: cfg,
-		group: noderuntime.GroupSpec{ID: 1, Address: cfg.local.Address}, listener: listener, activeEnvelopes: len(active) != 0 && active[0]}
+		group: noderuntime.GroupSpec{ID: 1, Address: cfg.Local.Address}, listener: listener, activeEnvelopes: len(active) != 0 && active[0]}
 	f.dir = noderuntime.GroupDataDir(f.base, "n1", f.group.ID, false)
 	f.sidecarPath = filepath.Join(f.dir, "encryption", "keys.json")
 	require.NoError(t, os.MkdirAll(filepath.Dir(f.sidecarPath), 0o700))
@@ -101,7 +102,7 @@ func (f *bootstrapRotationE2EFixture) prepareLegacyCut(t *testing.T) {
 	wiring.AttachRaftEnvelopeGroup(f.group.ID, shard)
 	require.Eventually(t, func() bool { return runtime.Engine.State() == raftengine.StateLeader }, enablementE2EWait, 10*time.Millisecond)
 	enablementLegacyPut(t, runtime.Engine, clock.Next(), "legacy-key", "original-value")
-	catalog, err := setupDistributionCatalog(t.Context(), []*raftGroupRuntime{runtime}, routes)
+	catalog, err := setupDistributionCatalog(t.Context(), []*clusterbootstrap.GroupRuntime{runtime}, routes)
 	require.NoError(t, err)
 	snapshot, err := catalog.Snapshot(t.Context())
 	require.NoError(t, err)
@@ -120,13 +121,13 @@ func (f *bootstrapRotationE2EFixture) prepareLegacyCut(t *testing.T) {
 	_ = f.listener.Close()
 }
 
-func (f *bootstrapRotationE2EFixture) bootstrapKeys(t *testing.T, runtime *raftGroupRuntime, shard *kv.ShardGroup, wiring encryptionwiring.WriteWiring, ks *encryption.Keystore) {
+func (f *bootstrapRotationE2EFixture) bootstrapKeys(t *testing.T, runtime *clusterbootstrap.GroupRuntime, shard *kv.ShardGroup, wiring encryptionwiring.WriteWiring, ks *encryption.Keystore) {
 	t.Helper()
 	registry, err := store.WriterRegistryFor(runtime.Store)
 	require.NoError(t, err)
 	server := adapter.NewEncryptionAdminServer(
 		adapter.WithEncryptionAdminSidecarPath(f.sidecarPath),
-		adapter.WithEncryptionAdminFullNodeID(f.config.local.Member),
+		adapter.WithEncryptionAdminFullNodeID(f.config.Local.Member),
 		adapter.WithEncryptionAdminProposer(runtime.Engine),
 		adapter.WithEncryptionAdminPostCutoverProposer(shard.Proposer()),
 		adapter.WithEncryptionAdminLeaderView(runtime.Engine))
@@ -140,7 +141,7 @@ func (f *bootstrapRotationE2EFixture) bootstrapKeys(t *testing.T, runtime *raftG
 	response, err := server.BootstrapEncryption(ctx, &pb.BootstrapEncryptionRequest{
 		StorageDekId: e2eStorageDEKID, RaftDekId: e2eRaftDEKID,
 		WrappedStorageDek: f.storageWrapped, WrappedRaftDek: f.raftWrapped,
-		WriterBatch: []*pb.WriterRegistryEntry{{FullNodeId: f.config.local.Member, LocalEpoch: uint32(wiring.Epoch)}},
+		WriterBatch: []*pb.WriterRegistryEntry{{FullNodeId: f.config.Local.Member, LocalEpoch: uint32(wiring.Epoch)}},
 	})
 	require.NoError(t, err)
 	require.NotZero(t, response.AppliedIndex)
@@ -149,12 +150,12 @@ func (f *bootstrapRotationE2EFixture) bootstrapKeys(t *testing.T, runtime *raftG
 	require.GreaterOrEqual(t, fence, response.AppliedIndex)
 	require.Eventually(t, func() bool { return runtime.Engine.Status().AppliedIndex >= response.AppliedIndex }, enablementE2EWait, time.Millisecond)
 	for _, id := range []uint32{e2eStorageDEKID, e2eRaftDEKID} {
-		raw, present, err := registry.GetRegistryRow(encryption.RegistryKey(id, encryption.NodeID16(f.config.local.Member)))
+		raw, present, err := registry.GetRegistryRow(encryption.RegistryKey(id, encryption.NodeID16(f.config.Local.Member)))
 		require.NoError(t, err)
 		require.True(t, present)
 		row, err := encryption.DecodeRegistryValue(raw)
 		require.NoError(t, err)
-		require.Equal(t, f.config.local.Member, row.FullNodeID)
+		require.Equal(t, f.config.Local.Member, row.FullNodeID)
 		require.Zero(t, row.LastSeenLocalEpoch)
 		dek, loaded := ks.DEK(id)
 		require.True(t, loaded, "actual committed apply must hydrate the live keystore")
@@ -180,30 +181,30 @@ func (f *bootstrapRotationE2EFixture) bootstrapKeys(t *testing.T, runtime *raftG
 	require.Equal(t, expected, checkpoint, "committed sidecar and durable Pebble checkpoint must agree")
 }
 
-func (f *bootstrapRotationE2EFixture) enableEnvelopes(t *testing.T, runtime *raftGroupRuntime, shard *kv.ShardGroup, wiring encryptionwiring.WriteWiring) {
+func (f *bootstrapRotationE2EFixture) enableEnvelopes(t *testing.T, runtime *clusterbootstrap.GroupRuntime, shard *kv.ShardGroup, wiring encryptionwiring.WriteWiring) {
 	t.Helper()
 	encryptionwiring.InstallRaftRegistrationVerifier(shard, wiring, "n1")
 	cache := kv.NewGRPCConnCache(nil)
 	defer func() { require.NoError(t, cache.Close()) }()
-	fanout := encryptionwiring.BuildCapabilityFanoutFn(runtimeCores([]*raftGroupRuntime{runtime}), cache, encryptionwiring.CapabilityFanoutTimeout)
+	fanout := encryptionwiring.BuildCapabilityFanoutFn(clusterbootstrap.RuntimeCores([]*clusterbootstrap.GroupRuntime{runtime}), cache, encryptionwiring.CapabilityFanoutTimeout)
 	server := adapter.NewEncryptionAdminServer(
-		adapter.WithEncryptionAdminSidecarPath(f.sidecarPath), adapter.WithEncryptionAdminFullNodeID(f.config.local.Member),
+		adapter.WithEncryptionAdminSidecarPath(f.sidecarPath), adapter.WithEncryptionAdminFullNodeID(f.config.Local.Member),
 		adapter.WithEncryptionAdminProposer(runtime.Engine), adapter.WithEncryptionAdminPostCutoverProposer(shard.Proposer()),
 		adapter.WithEncryptionAdminLeaderView(runtime.Engine), adapter.WithEncryptionAdminCapabilityFanout(fanout),
 		adapter.WithEncryptionAdminLatestAppliedIndex(func() uint64 { return runtime.Engine.Status().AppliedIndex }),
 		adapter.WithEncryptionAdminCutoverBarrier(wiring.RaftEnvelope.Barrier()))
 	require.NoError(t, server.Validate())
 	grpcServer := grpc.NewServer()
-	runtime.registerGRPC(grpcServer)
+	clusterbootstrap.RuntimeCore(runtime).RegisterGRPC(grpcServer)
 	pb.RegisterEncryptionAdminServer(grpcServer, server)
 	served := make(chan error, 1)
 	go func() { served <- grpcServer.Serve(f.listener) }()
 	defer func() { grpcServer.Stop(); require.NoError(t, <-served) }()
 	ctx, cancel := context.WithTimeout(t.Context(), enablementE2EWait)
 	defer cancel()
-	_, err := server.EnableStorageEnvelope(ctx, &pb.EnableStorageEnvelopeRequest{ProposerNodeId: f.config.local.Member, ProposerLocalEpoch: uint32(wiring.Epoch)})
+	_, err := server.EnableStorageEnvelope(ctx, &pb.EnableStorageEnvelopeRequest{ProposerNodeId: f.config.Local.Member, ProposerLocalEpoch: uint32(wiring.Epoch)})
 	require.NoError(t, err)
-	_, err = server.EnableRaftEnvelope(ctx, &pb.EnableRaftEnvelopeRequest{ProposerNodeId: f.config.local.Member, ProposerLocalEpoch: uint32(wiring.RaftEpoch)})
+	_, err = server.EnableRaftEnvelope(ctx, &pb.EnableRaftEnvelopeRequest{ProposerNodeId: f.config.Local.Member, ProposerLocalEpoch: uint32(wiring.RaftEpoch)})
 	require.NoError(t, err)
 	sc, err := encryption.ReadSidecar(f.sidecarPath)
 	require.NoError(t, err)
@@ -256,15 +257,15 @@ func TestBootstrapRotationE2EPreparedActiveEnvelopes(t *testing.T) {
 }
 
 type bootstrapRotationE2ENode struct {
-	runtime         *raftGroupRuntime
-	domain          *bootstrapDomain
+	runtime         *clusterbootstrap.GroupRuntime
+	domain          *clusterbootstrap.BootstrapDomain
 	coordinate      *kv.ShardedCoordinator
 	shards          *kv.ShardStore
 	wiring          encryptionwiring.WriteWiring
 	registrationCtx context.Context
 	group           *kv.ShardGroup
 	stopReadiness   func()
-	supervisor      *bootstrapRotationRuntime
+	supervisor      *clusterbootstrap.BootstrapRotationRuntime
 	close           func()
 }
 
@@ -278,14 +279,14 @@ func (f *bootstrapRotationE2EFixture) protected(t *testing.T) *bootstrapRotation
 		kv.NewActiveTimestampTracker(), routes, nil)
 	require.NoError(t, err)
 	runtime := runtimes[0]
-	domain := runtime.bootstrapDomain
+	domain := runtime.BootstrapDomain
 	t.Cleanup(runtime.Close)
 	ctx, cancel := context.WithCancel(t.Context())
 	eg, ctx := errgroup.WithContext(ctx)
 	var cleanup internalutil.CleanupStack
 	shards := kv.NewShardStore(routes, groups)
-	shards.SetOperationAdmission(domain.operationAdmission)
-	coordinate := kv.NewShardedCoordinator(routes, groups, 1, clock, shards).WithOperationAdmission(domain.operationAdmission)
+	shards.SetOperationAdmission(domain.OperationAdmission)
+	coordinate := kv.NewShardedCoordinator(routes, groups, 1, clock, shards).WithOperationAdmission(domain.OperationAdmission)
 	node := &bootstrapRotationE2ENode{runtime: runtime, domain: domain, coordinate: coordinate, shards: shards, wiring: wiring}
 	var once sync.Once
 	var server *grpc.Server
@@ -300,16 +301,16 @@ func (f *bootstrapRotationE2EFixture) protected(t *testing.T) *bootstrapRotation
 			cleanup.Run()
 			require.NoError(t, eg.Wait())
 			require.NoError(t, coordinate.Close())
-			domain.admission.Close()
+			domain.Admission.Close()
 			runtime.Close()
 		})
 	}
 	t.Cleanup(node.close)
-	network, err := configureBootstrapNetwork(ctx, runtimes, shards, groups, &cleanup)
+	network, err := clusterbootstrap.ConfigureBootstrapNetwork(ctx, runtimes, shards, groups, &cleanup)
 	require.NoError(t, err)
 	registered, supervisor, err := configureBootstrapEncryptionStartup(ctx, bootstrapEncryptionStartupConfig{
 		runtimes: runtimes, groups: groups, defaultGroup: 1, network: network, wiring: wiring, sidecarPath: f.sidecarPath,
-		wrapper: f.wrapper, nodeID: f.config.local.Member, requested: true, eg: eg, cleanup: &cleanup})
+		wrapper: f.wrapper, nodeID: f.config.Local.Member, requested: true, eg: eg, cleanup: &cleanup})
 	require.NoError(t, err)
 	require.NotNil(t, supervisor)
 	node.supervisor = supervisor
@@ -317,15 +318,15 @@ func (f *bootstrapRotationE2EFixture) protected(t *testing.T) *bootstrapRotation
 	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", f.group.Address)
 	require.NoError(t, err)
 	server = grpc.NewServer(runtime.TransportServerOptions...)
-	runtime.registerGRPC(server)
+	clusterbootstrap.RuntimeCore(runtime).RegisterGRPC(server)
 	served = make(chan error, 1)
 	go func() { served <- server.Serve(listener) }()
-	startBootstrapActivationWorkers(registered, eg, runtimes, groups)
+	clusterbootstrap.StartBootstrapActivationWorkers(registered, eg, runtimes, groups)
 	catalog, err := setupDistributionAndRegistration(registered, eg, runtimes, routes, coordinate, groups[1], wiring, "n1", f.sidecarPath)
 	require.NoError(t, err)
 	readinessCtx, stopReadiness := context.WithCancel(registered)
 	var readiness errgroup.Group
-	startBootstrapReadinessReconciler(readinessCtx, &readiness, runtimes, catalog, routes)
+	clusterbootstrap.StartBootstrapReadinessReconciler(readinessCtx, &readiness, runtimes, catalog, routes)
 	eg.Go(readiness.Wait)
 	node.stopReadiness = func() { stopReadiness(); require.NoError(t, readiness.Wait()) }
 	wait, stop := context.WithTimeout(t.Context(), 30*time.Second)
@@ -337,11 +338,11 @@ func (f *bootstrapRotationE2EFixture) protected(t *testing.T) *bootstrapRotation
 
 func (n *bootstrapRotationE2ENode) read(t *testing.T, key, expected string) {
 	t.Helper()
-	ctx, op, err := n.domain.admission.Begin(t.Context(), raftadmission.Data)
+	ctx, op, err := n.domain.Admission.Begin(t.Context(), raftadmission.Data)
 	require.NoError(t, err)
 	defer op.CancelAndJoin()
 	value, err := n.shards.GetAt(ctx, []byte(key), ^uint64(0))
-	require.NoError(t, finishBootstrapIngress(op, err))
+	require.NoError(t, clusterbootstrap.FinishBootstrapIngress(op, err))
 	require.Equal(t, expected, string(value))
 }
 

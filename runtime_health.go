@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/runtimehealth"
 	"github.com/cockroachdb/errors"
 )
@@ -48,14 +49,14 @@ func startRuntimeHealth(ctx context.Context, lc runtimeHealthListener, cancel co
 	return probe, stop, nil
 }
 
-func publishRuntimeHealth(probe *runtimehealth.Probe, runtimes []*raftGroupRuntime) {
+func publishRuntimeHealth(probe *runtimehealth.Probe, runtimes []*clusterbootstrap.GroupRuntime) {
 	sources := make([]runtimehealth.Source, 0, len(runtimes))
 	for _, rt := range runtimes {
 		if rt == nil {
 			continue
 		}
 		sources = append(sources, runtimehealth.Source{GroupID: rt.Spec.ID, Engine: func() runtimehealth.Engine {
-			engine, ok := rt.snapshotEngine().(runtimehealth.Engine)
+			engine, ok := clusterbootstrap.RuntimeCore(rt).SnapshotEngine().(runtimehealth.Engine)
 			if !ok {
 				return nil
 			}

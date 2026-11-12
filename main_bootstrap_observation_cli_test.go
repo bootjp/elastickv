@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/stretchr/testify/require"
@@ -27,7 +28,7 @@ func TestBootstrapObservationStrictSyntax(t *testing.T) {
 	t.Parallel()
 	for _, command := range []string{"probe", "manifest"} {
 		args := observationSyntaxArgs(t.TempDir(), command)
-		_, err := parseBootstrapObservationCommand(args)
+		_, err := clusterbootstrap.ParseBootstrapObservationCommand(args)
 		require.NoError(t, err)
 		for name, invalid := range map[string][]string{
 			"missing": {command}, "unknown": append(append([]string{}, args...), "--cut=5"),
@@ -37,14 +38,14 @@ func TestBootstrapObservationStrictSyntax(t *testing.T) {
 		} {
 			t.Run(command+"/"+name, func(t *testing.T) {
 				var output bytes.Buffer
-				handled, err := dispatchBootstrapObservationCommand(invalid, &output)
+				handled, err := clusterbootstrap.DispatchBootstrapObservationCommand(invalid, &output)
 				require.True(t, handled)
 				require.Error(t, err)
 				require.Empty(t, output.Bytes())
 			})
 		}
 	}
-	handled, err := dispatchBootstrapObservationCommand([]string{"attest"}, nil)
+	handled, err := clusterbootstrap.DispatchBootstrapObservationCommand([]string{"attest"}, nil)
 	require.NoError(t, err)
 	require.False(t, handled)
 }
@@ -54,19 +55,19 @@ func TestBootstrapObservationPinsAndMeasuredConfig(t *testing.T) {
 	r, raw, _, _ := baselineCLIFixtureWithSigners(t)
 	expectedRaw, err := json.Marshal(raw)
 	require.NoError(t, err)
-	expected, err := parseBootstrapBaselineExpectedConfig(expectedRaw, r.OperationID)
+	expected, err := clusterbootstrap.ParseBootstrapBaselineExpectedConfig(expectedRaw, r.OperationID)
 	require.NoError(t, err)
-	pins := bootstrapObservationPinsJSON{Version: raw.Version, Cluster: raw.Cluster, Group: raw.Group, Minimum: raw.Minimum, Members: raw.Members}
+	pins := clusterbootstrap.BootstrapObservationPinsJSON{Version: raw.Version, Cluster: raw.Cluster, Group: raw.Group, Minimum: raw.Minimum, Members: raw.Members}
 	encoded, err := json.Marshal(pins)
 	require.NoError(t, err)
-	parsed, err := parseBootstrapObservationPins(encoded)
+	parsed, err := clusterbootstrap.ParseBootstrapObservationPins(encoded)
 	require.NoError(t, err)
 	require.Zero(t, parsed.CommitIndex)
 	require.Zero(t, parsed.Configuration.Index)
 	require.Empty(t, parsed.DataDigest)
-	measured, err := marshalBootstrapObservedConfig(expected)
+	measured, err := clusterbootstrap.MarshalBootstrapObservedConfig(expected)
 	require.NoError(t, err)
-	roundtrip, err := parseBootstrapBaselineExpectedConfig(measured, r.OperationID)
+	roundtrip, err := clusterbootstrap.ParseBootstrapBaselineExpectedConfig(measured, r.OperationID)
 	require.NoError(t, err)
 	require.Equal(t, expected, roundtrip)
 	require.Contains(t, string(measured), `"auto_leave": false`)
@@ -75,19 +76,19 @@ func TestBootstrapObservationPinsAndMeasuredConfig(t *testing.T) {
 	raw.AutoLeave = true
 	unstable, err := json.Marshal(raw)
 	require.NoError(t, err)
-	_, err = parseBootstrapBaselineExpectedConfig(unstable, r.OperationID)
+	_, err = clusterbootstrap.ParseBootstrapBaselineExpectedConfig(unstable, r.OperationID)
 	require.Error(t, err)
 	pins.AutoLeave = true
 	unstable, err = json.Marshal(pins)
 	require.NoError(t, err)
-	_, err = parseBootstrapObservationPins(unstable)
+	_, err = clusterbootstrap.ParseBootstrapObservationPins(unstable)
 	require.Error(t, err, "auto-leave must not silently become false")
 	expected.Configuration.State.AutoLeave = true
-	unstable, err = marshalBootstrapObservedConfig(expected)
+	unstable, err = clusterbootstrap.MarshalBootstrapObservedConfig(expected)
 	require.NoError(t, err)
 	require.Contains(t, string(unstable), `"auto_leave": true`)
 	for _, invalid := range [][]byte{expectedRaw, append(encoded[:len(encoded)-1:len(encoded)-1], []byte(`,"group_id":"0"}`)...), []byte(`{} {}`)} {
-		_, err := parseBootstrapObservationPins(invalid)
+		_, err := clusterbootstrap.ParseBootstrapObservationPins(invalid)
 		require.Error(t, err)
 	}
 }
@@ -117,7 +118,7 @@ func TestBootstrapObservationManifestExactAndExclusive(t *testing.T) {
 	t.Parallel()
 	args, root := observationManifestFixture(t)
 	before := offlineDataFiles(t, root)
-	handled, err := dispatchBootstrapOperator(args, io.Discard)
+	handled, err := clusterbootstrap.DispatchBootstrapOperator(args, io.Discard)
 	require.True(t, handled)
 	require.NoError(t, err)
 	encoded, err := os.ReadFile(filepath.Join(root, "manifest.bin"))
@@ -128,7 +129,7 @@ func TestBootstrapObservationManifestExactAndExclusive(t *testing.T) {
 	after := offlineDataFiles(t, root)
 	delete(after, "manifest.bin")
 	require.Equal(t, before, after)
-	_, err = dispatchBootstrapOperator(args, io.Discard)
+	_, err = clusterbootstrap.DispatchBootstrapOperator(args, io.Discard)
 	require.ErrorIs(t, err, os.ErrExist)
 }
 
@@ -151,7 +152,7 @@ func TestBootstrapObservationManifestRejectsDivergence(t *testing.T) {
 			case "review mismatch":
 				data, err := os.ReadFile(filepath.Join(root, "expected.json"))
 				require.NoError(t, err)
-				var expected bootstrapBaselineExpectedJSON
+				var expected clusterbootstrap.BootstrapBaselineExpectedJSON
 				require.NoError(t, json.Unmarshal(data, &expected))
 				expected.Watermark = "999999"
 				data, err = json.Marshal(expected)
@@ -159,7 +160,7 @@ func TestBootstrapObservationManifestRejectsDivergence(t *testing.T) {
 				require.NoError(t, os.WriteFile(filepath.Join(root, "expected.json"), data, 0o600))
 			}
 			before := offlineDataFiles(t, root)
-			_, err := dispatchBootstrapOperator(args, io.Discard)
+			_, err := clusterbootstrap.DispatchBootstrapOperator(args, io.Discard)
 			require.Error(t, err)
 			require.Equal(t, before, offlineDataFiles(t, root))
 		})
@@ -174,19 +175,19 @@ func TestBootstrapObservationProbeRealLegacyTSO(t *testing.T) {
 func TestBootstrapObservationProbeRealLegacyData(t *testing.T) {
 	t.Setenv("ELASTICKV_RAFT_SNAPSHOT_COUNT", "1")
 	peer, config := enablementPeerConfig(t)
-	group := noderuntime.GroupSpec{ID: 1, Address: config.local.Address}
+	group := noderuntime.GroupSpec{ID: 1, Address: config.Local.Address}
 	dir := enablementLegacyCut(t, t.TempDir(), group)
 	manifest := enablementSignedBaseline(t, dir, config, group)
-	exerciseBootstrapObservationProbe(t, bootstrapBaselineCLIRequest{RaftDataDir: dir, MemberID: config.local.Member, OperationID: manifest.OperationID}, manifest, peer)
+	exerciseBootstrapObservationProbe(t, clusterbootstrap.BootstrapBaselineCLIRequest{RaftDataDir: dir, MemberID: config.Local.Member, OperationID: manifest.OperationID}, manifest, peer)
 }
 
-func exerciseBootstrapObservationProbe(t *testing.T, r bootstrapBaselineCLIRequest, manifest raftbootstrap.BaselineManifest, peer bootstrapPeerJSON) {
+func exerciseBootstrapObservationProbe(t *testing.T, r clusterbootstrap.BootstrapBaselineCLIRequest, manifest raftbootstrap.BaselineManifest, peer clusterbootstrap.BootstrapPeerJSON) {
 	t.Helper()
-	measured, err := marshalBootstrapObservedConfig(manifest.BaselineContext)
+	measured, err := clusterbootstrap.MarshalBootstrapObservedConfig(manifest.BaselineContext)
 	require.NoError(t, err)
-	var expected bootstrapBaselineExpectedJSON
+	var expected clusterbootstrap.BootstrapBaselineExpectedJSON
 	require.NoError(t, json.Unmarshal(measured, &expected))
-	pins, err := json.Marshal(bootstrapObservationPinsJSON{Version: expected.Version, Cluster: expected.Cluster, Group: expected.Group, Minimum: expected.Minimum, Members: expected.Members})
+	pins, err := json.Marshal(clusterbootstrap.BootstrapObservationPinsJSON{Version: expected.Version, Cluster: expected.Cluster, Group: expected.Group, Minimum: expected.Minimum, Members: expected.Members})
 	require.NoError(t, err)
 	root := t.TempDir()
 	pinsPath, peersPath, artifact := filepath.Join(root, "pins.json"), filepath.Join(root, "peers.json"), filepath.Join(root, "probe.bin")
@@ -200,13 +201,13 @@ func exerciseBootstrapObservationProbe(t *testing.T, r bootstrapBaselineCLIReque
 	wrongMember := append([]string{}, args...)
 	wrongMember[len(wrongMember)-3] = "99999"
 	var rejected bytes.Buffer
-	_, err = dispatchBootstrapOperator(wrongMember, &rejected)
+	_, err = clusterbootstrap.DispatchBootstrapOperator(wrongMember, &rejected)
 	require.Error(t, err)
 	require.Empty(t, rejected.Bytes())
 	_, err = os.Stat(artifact)
 	require.ErrorIs(t, err, os.ErrNotExist)
 	var output bytes.Buffer
-	handled, err := dispatchBootstrapOperator(args, &output)
+	handled, err := clusterbootstrap.DispatchBootstrapOperator(args, &output)
 	require.True(t, handled)
 	require.NoError(t, err)
 	data, err := os.ReadFile(artifact)
@@ -214,10 +215,10 @@ func exerciseBootstrapObservationProbe(t *testing.T, r bootstrapBaselineCLIReque
 	probe, err := raftbootstrap.ParseBaselineProbe(data)
 	require.NoError(t, err)
 	require.NoError(t, raftbootstrap.VerifyBaselineProbe(probe, manifest.BaselineContext))
-	reviewed, err := parseBootstrapBaselineExpectedConfig(output.Bytes(), r.OperationID)
+	reviewed, err := clusterbootstrap.ParseBootstrapBaselineExpectedConfig(output.Bytes(), r.OperationID)
 	require.NoError(t, err)
 	require.NoError(t, raftbootstrap.VerifyBaselineProbe(probe, reviewed))
 	require.Equal(t, before, offlineDataFiles(t, r.RaftDataDir))
-	_, err = dispatchBootstrapOperator(args, io.Discard)
+	_, err = clusterbootstrap.DispatchBootstrapOperator(args, io.Discard)
 	require.ErrorIs(t, err, os.ErrExist)
 }

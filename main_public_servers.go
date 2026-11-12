@@ -8,6 +8,7 @@ import (
 	"net/http"
 
 	"github.com/bootjp/elastickv/adapter"
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/monitoring"
 	"github.com/cockroachdb/errors"
@@ -60,7 +61,7 @@ func prepareRedisServer(ctx context.Context, lc *net.ListenConfig, redisAddr str
 	}
 	deltaCompactor := newRedisDeltaCompactorIfEnabled(shardStore, coordinate, metricsRegistry)
 	redisOpts := []adapter.RedisServerOption{
-		adapter.WithRedisRequestAdmission(bootstrapRequestAdmissionForCoordinator(coordinate)),
+		adapter.WithRedisRequestAdmission(clusterbootstrap.BootstrapRequestAdmissionForCoordinator(coordinate)),
 		adapter.WithRedisActiveTimestampTracker(readTracker),
 		adapter.WithRedisRequestObserver(metricsRegistry.RedisObserver()),
 		adapter.WithLuaObserver(metricsRegistry.LuaObserver()),
@@ -126,7 +127,7 @@ func newDynamoDBServer(shardStore *kv.ShardStore, coordinate kv.Coordinator, lea
 		adapter.WithDynamoDBActiveTimestampTracker(readTracker),
 		adapter.WithDynamoDBRequestObserver(metricsRegistry.DynamoDBObserver()),
 		adapter.WithDynamoDBLeaderMap(leaderDynamo),
-		adapter.WithDynamoDBRequestAdmission(bootstrapRequestAdmissionForCoordinator(coordinate)),
+		adapter.WithDynamoDBRequestAdmission(clusterbootstrap.BootstrapRequestAdmissionForCoordinator(coordinate)),
 	)
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/stretchr/testify/require"
@@ -31,7 +32,7 @@ func TestInternalTimestampOptions_WiresShardedWriteGate(t *testing.T) {
 func TestStartupGatedCoordinatorForwardsGroupRouting(t *testing.T) {
 	t.Parallel()
 
-	var c any = startupGatedCoordinator{}
+	var c any = clusterbootstrap.StartupGatedCoordinator{}
 	if _, ok := c.(kv.GroupLeaderRoutableCoordinator); !ok {
 		t.Fatal("startupGatedCoordinator must satisfy kv.GroupLeaderRoutableCoordinator")
 	}
@@ -82,7 +83,7 @@ func TestStartupGatedCoordinatorForwardsWriteGateAndObserver(t *testing.T) {
 	t.Parallel()
 
 	inner := &writeGateStubCoordinator{}
-	wrapped := newStartupGatedCoordinator(inner, nil)
+	wrapped := clusterbootstrap.NewStartupGatedCoordinator(inner, nil)
 
 	gate, ok := any(wrapped).(kv.MutationWriteGate)
 	require.True(t, ok, "startupGatedCoordinator must satisfy kv.MutationWriteGate")
@@ -110,7 +111,7 @@ func TestStartupGatedCoordinatorForwardsWriteGateAndObserver(t *testing.T) {
 func TestStartupGatedCoordinatorWriteGateAllowsWithoutRouteTable(t *testing.T) {
 	t.Parallel()
 
-	wrapped := newStartupGatedCoordinator(struct{ kv.Coordinator }{}, nil)
+	wrapped := clusterbootstrap.NewStartupGatedCoordinator(struct{ kv.Coordinator }{}, nil)
 	gate, ok := any(wrapped).(kv.MutationWriteGate)
 	require.True(t, ok)
 	require.NoError(t, gate.EnsureMutationsWriteAllowed([]*pb.Mutation{{Key: []byte("k")}}, 1))

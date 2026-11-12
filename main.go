@@ -10,6 +10,7 @@ import (
 
 	"github.com/bootjp/elastickv/adapter"
 	internalutil "github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/internal/noderuntime"
@@ -30,7 +31,7 @@ import (
 const exitCodeMemoryPressure = 2
 
 func main() {
-	if handled, err := dispatchBootstrapOperator(os.Args[1:], os.Stdout); handled {
+	if handled, err := clusterbootstrap.DispatchBootstrapOperator(os.Args[1:], os.Stdout); handled {
 		if err != nil {
 			log.Fatalf("%v", err)
 		}
@@ -202,7 +203,7 @@ func run(flags *serverFlags) error {
 	)
 	if err = encryptionwiring.ChainStartupGuard(
 		err,
-		runtimeCores(runtimes),
+		clusterbootstrap.RuntimeCores(runtimes),
 		cfg.DefaultGroup,
 		flags.encryption.SidecarPath,
 		flags.encryption.Enabled,
@@ -232,10 +233,10 @@ func run(flags *serverFlags) error {
 			rt.Close()
 		}
 	})
-	bootstrapDomain, resolverOptions := configureBootstrapOperations(ctx, runtimes, shardStore, &cleanup)
-	bootstrapNetwork, err := configureBootstrapNetwork(ctx, runtimes, shardStore, shardGroups, &cleanup)
+	bootstrapDomain, resolverOptions := clusterbootstrap.ConfigureBootstrapOperations(ctx, runtimes, shardStore, &cleanup)
+	bootstrapNetwork, err := clusterbootstrap.ConfigureBootstrapNetwork(ctx, runtimes, shardStore, shardGroups, &cleanup)
 	if err != nil {
-		return err
+		return errors.WithStack(err)
 	}
 	cleanup.Add(cancel)
 	startLockResolverIfEnabled(shardStore, shardGroups, &cleanup, resolverOptions...)
@@ -249,7 +250,7 @@ func run(flags *serverFlags) error {
 		WithAllShardGroups(noderuntime.DataGroupIDs(cfg.Groups)...).
 		WithPartitionResolver(sqsPartitionResolver)
 	configureCommitTSFenceActivation(coordinate, flags.consistency.commitTSFence, runtimes)
-	installBootstrapCoordinator(bootstrapDomain, coordinate, &cleanup)
+	clusterbootstrap.InstallBootstrapCoordinator(bootstrapDomain, coordinate, &cleanup)
 	tsoWiring, err := configureCoordinatorTSOWithObserver(
 		flags.tso,
 		coordinate,

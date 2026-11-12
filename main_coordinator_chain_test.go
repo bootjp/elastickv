@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/stretchr/testify/require"
@@ -30,7 +31,7 @@ func TestAdapterCoordinatorChainForwardsLocalLeaderGroups(t *testing.T) {
 	t.Parallel()
 
 	inner := localLeaderGroupsCoordinator{groups: []uint64{1, 3}}
-	chain := kv.WithKeyVizLabel(newStartupGatedCoordinator(inner, &startupPublicKVGate{}), keyviz.LabelRedis)
+	chain := kv.WithKeyVizLabel(clusterbootstrap.NewStartupGatedCoordinator(inner, &clusterbootstrap.StartupPublicKVGate{}), keyviz.LabelRedis)
 
 	groups, known := kv.LocalLeaderGroupIDsThrough(chain)
 	require.True(t, known, "the adapter coordinator chain must report LocalLeaderGroupIDs")
@@ -63,8 +64,8 @@ func TestAdapterCoordinatorWrappersForwardShardedCapabilities(t *testing.T) {
 
 	sharded := reflect.TypeOf(&kv.ShardedCoordinator{})
 	wrappers := map[string]reflect.Type{
-		"startupGatedCoordinator": reflect.TypeOf(startupGatedCoordinator{}),
-		"WithKeyVizLabel":         reflect.TypeOf(kv.WithKeyVizLabel(startupGatedCoordinator{}, keyviz.LabelRedis)),
+		"startupGatedCoordinator": reflect.TypeOf(clusterbootstrap.StartupGatedCoordinator{}),
+		"WithKeyVizLabel":         reflect.TypeOf(kv.WithKeyVizLabel(clusterbootstrap.StartupGatedCoordinator{}, keyviz.LabelRedis)),
 	}
 	for i := range sharded.NumMethod() {
 		method := sharded.Method(i)

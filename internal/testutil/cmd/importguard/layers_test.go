@@ -46,6 +46,11 @@ func TestCheckLayering(t *testing.T) {
 		{"encryptionwiring may use noderuntime", "internal/encryptionwiring", m + "internal/noderuntime", false},
 		{"encryptionwiring may use the etcd backend", "internal/encryptionwiring", m + "internal/raftengine/etcd", false},
 		{"adapter may not use encryptionwiring", "adapter", m + "internal/encryptionwiring", true},
+		{"clusterbootstrap only from binaries", "kv", m + "internal/clusterbootstrap", true},
+		{"clusterbootstrap from root main", ".", m + "internal/clusterbootstrap", false},
+		{"clusterbootstrap may use encryptionwiring", "internal/clusterbootstrap", m + "internal/encryptionwiring", false},
+		{"clusterbootstrap may use nodeauth", "internal/clusterbootstrap", m + "internal/nodeauth", false},
+		{"encryptionwiring may not use clusterbootstrap", "internal/encryptionwiring", m + "internal/clusterbootstrap", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()

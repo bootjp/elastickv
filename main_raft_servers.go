@@ -10,6 +10,7 @@ import (
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
 	internalutil "github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/internal/nodeauth"
 	"github.com/bootjp/elastickv/internal/noderuntime"
@@ -76,7 +77,7 @@ func startRaftServers(
 	ctx context.Context,
 	lc *net.ListenConfig,
 	eg *errgroup.Group,
-	runtimes []*raftGroupRuntime,
+	runtimes []*clusterbootstrap.GroupRuntime,
 	shardGroups map[uint64]*kv.ShardGroup,
 	shardStore *kv.ShardStore,
 	coordinate kv.Coordinator,
@@ -101,14 +102,14 @@ func startRaftServers(
 ) error {
 	forwardLogger := slog.Default().With(slog.String("component", "admin"))
 	enableMutators := encryptionwiring.MutatorsEnabled(encryptionCfg, kekConfigured)
-	encryptionCapabilityFanout := encryptionwiring.BuildCapabilityFanout(ctx, eg, runtimeCores(runtimes), bootstrapRuntimeDialOptions(runtimes), enableMutators)
-	monitorFanout, releaseMonitorConns := encryptionwiring.BuildStorageEnvelopeV2MonitorFanout(runtimeCores(runtimes), bootstrapRuntimeDialOptions(runtimes), enableMutators)
+	encryptionCapabilityFanout := encryptionwiring.BuildCapabilityFanout(ctx, eg, clusterbootstrap.RuntimeCores(runtimes), clusterbootstrap.BootstrapRuntimeDialOptions(runtimes), enableMutators)
+	monitorFanout, releaseMonitorConns := encryptionwiring.BuildStorageEnvelopeV2MonitorFanout(clusterbootstrap.RuntimeCores(runtimes), clusterbootstrap.BootstrapRuntimeDialOptions(runtimes), enableMutators)
 	encryptionwiring.StartStorageEnvelopeV2CapabilityMonitor(ctx, eg, monitorFanout, releaseMonitorConns, encWiring)
 	writerRegistry, err := encryptionwiring.AdminDefaultWriterRegistry(encryptionCfg.SidecarPath, shardGroups, defaultGroupID)
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	defaultAdmin, err := encryptionwiring.AdminDefaultRuntimeOptions(runtimeCores(runtimes), shardGroups, defaultGroupID, enableMutators || writerRegistry != nil)
+	defaultAdmin, err := encryptionwiring.AdminDefaultRuntimeOptions(clusterbootstrap.RuntimeCores(runtimes), shardGroups, defaultGroupID, enableMutators || writerRegistry != nil)
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -131,10 +132,10 @@ func startRaftServers(
 		pb.RegisterRawKVServer(gs, grpcSvc)
 		pb.RegisterTransactionalKVServer(gs, grpcSvc)
 		internalOpts := internalServerOptions(coordinate, adminServer, proposerForGroup(rt, shardGroups), shardGroups[rt.Spec.ID], rt.Spec.ID)
-		internalOpts = append(internalOpts, bootstrapInternalPolicyOptions(rt, proposerForGroup(rt, shardGroups))...)
+		internalOpts = append(internalOpts, clusterbootstrap.BootstrapInternalPolicyOptions(rt, proposerForGroup(rt, shardGroups))...)
 		internalOpts = append(internalOpts, dedicatedTimestampCutoverOptions(shardGroups)...)
 		internalOpts = append(internalOpts, adapter.WithInternalMigrationOwnershipReady(func() bool {
-			return adapter.MigrationOwnershipRuntimeReady(trx, shardStore, distServer, rt.Spec.ID, rt.snapshotEngine(), adminGRPCOpts.MigrationReady)
+			return adapter.MigrationOwnershipRuntimeReady(trx, shardStore, distServer, rt.Spec.ID, clusterbootstrap.RuntimeCore(rt).SnapshotEngine(), adminGRPCOpts.MigrationReady)
 		}))
 		internalOpts = append(internalOpts, migrationInternalProtocolOptions(trx, shardStore, distServer, rt)...)
 		internalOpts = append(internalOpts, internalReadWatermarkOptions(readWatermarkAdvance, rt, shardGroups)...)
@@ -182,7 +183,7 @@ func startRaftServers(
 		// same FSM whose registry GetSidecarState/ResyncSidecar read.
 		encryptionwiring.RegisterAdminServer(gs, encryptionAdminServer)
 		registerAdminForwardServer(gs, forwardDeps, forwardLogger)
-		rt.registerGRPC(gs)
+		clusterbootstrap.RuntimeCore(rt).RegisterGRPC(gs)
 		// Stage 7c §3.1: pass the encryption-aware pre-register hook
 		// (nil when encryption is not wired); raftadmin.Server invokes
 		// it before AddVoter/AddLearner propose the conf-change.
@@ -230,7 +231,7 @@ func startRaftServers(
 	return nil
 }
 
-func internalReadWatermarkOptions(enabled bool, rt *raftGroupRuntime, groups map[uint64]*kv.ShardGroup) []adapter.InternalOption {
+func internalReadWatermarkOptions(enabled bool, rt *clusterbootstrap.GroupRuntime, groups map[uint64]*kv.ShardGroup) []adapter.InternalOption {
 	if !enabled {
 		return nil
 	}

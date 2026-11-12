@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/stretchr/testify/require"
@@ -366,7 +367,7 @@ func TestInstallSQSLeadershipRefusalAcrossGroups_ComposesDeregisters(t *testing.
 	t.Parallel()
 	admin1 := &fakeLeadershipController{state: raftengine.StateFollower}
 	admin2 := &fakeLeadershipController{state: raftengine.StateFollower}
-	runtimes := []*raftGroupRuntime{
+	runtimes := []*clusterbootstrap.GroupRuntime{
 		{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 10}, Engine: admin1}},
 		{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 11}, Engine: admin2}},
 	}
@@ -396,7 +397,7 @@ func TestInstallSQSLeadershipRefusalAcrossGroups_ComposesDeregisters(t *testing.
 func TestInstallSQSLeadershipRefusalAcrossGroups_NoPartitionedQueueIsNoOp(t *testing.T) {
 	t.Parallel()
 	admin := &fakeLeadershipController{state: raftengine.StateFollower}
-	runtimes := []*raftGroupRuntime{
+	runtimes := []*clusterbootstrap.GroupRuntime{
 		{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 10}, Engine: admin}},
 	}
 	dereg := installSQSLeadershipRefusalAcrossGroups(
@@ -416,7 +417,7 @@ func TestInstallSQSLeadershipRefusalAcrossGroups_NoPartitionedQueueIsNoOp(t *tes
 func TestInstallSQSLeadershipRefusalAcrossGroups_SkipsNilRuntimes(t *testing.T) {
 	t.Parallel()
 	admin := &fakeLeadershipController{state: raftengine.StateFollower}
-	runtimes := []*raftGroupRuntime{
+	runtimes := []*clusterbootstrap.GroupRuntime{
 		nil, // entire entry nil
 		{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 11}, Engine: nil}},   // engine nil
 		{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 10}, Engine: admin}}, // valid
@@ -450,7 +451,7 @@ type engineWithoutAcquiredObserver struct {
 // rather than crashing the iterator.
 func TestInstallSQSLeadershipRefusalAcrossGroups_SkipsEngineWithoutObserver(t *testing.T) {
 	t.Parallel()
-	runtimes := []*raftGroupRuntime{
+	runtimes := []*clusterbootstrap.GroupRuntime{
 		{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 10}, Engine: &engineWithoutAcquiredObserver{}}},
 	}
 	require.NotPanics(t, func() {

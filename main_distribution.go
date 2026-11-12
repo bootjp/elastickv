@@ -8,6 +8,7 @@ import (
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/distribution/autosplit"
 	internalutil "github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/internal/nodeauth"
 	"github.com/bootjp/elastickv/internal/noderuntime"
@@ -37,7 +38,7 @@ type distributionStartupInput struct {
 	eg              *errgroup.Group
 	cancel          context.CancelFunc
 	cleanup         *internalutil.CleanupStack
-	runtimes        []*raftGroupRuntime
+	runtimes        []*clusterbootstrap.GroupRuntime
 	cfg             noderuntime.RuntimeConfig
 	raftDir         string
 	coordinate      *kv.ShardedCoordinator
@@ -61,10 +62,10 @@ type distributionStartupInput struct {
 }
 
 type distributionStartup struct {
-	defaultRuntime     *raftGroupRuntime
+	defaultRuntime     *clusterbootstrap.GroupRuntime
 	distServer         *adapter.DistributionServer
 	registrationCtx    context.Context
-	rotationSupervisor *bootstrapRotationRuntime
+	rotationSupervisor *clusterbootstrap.BootstrapRotationRuntime
 	// distCatalog is the durable route catalog the admin backup store reads
 	// to capture a route snapshot at a pinned timestamp. It is built here, so
 	// it has to travel back out rather than be rebuilt at the call site.
@@ -94,7 +95,7 @@ func startDistributionStartup(in distributionStartupInput) (distributionStartup,
 	// every dispatched mutation.
 	serverwiring.SeedRoutes(in.sampler, in.cfg.Engine)
 
-	catalogWatchConns := newBootstrapRuntimeConnCache(in.runtimes)
+	catalogWatchConns := clusterbootstrap.NewBootstrapRuntimeConnCache(in.runtimes)
 	in.cleanup.Add(func() { _ = catalogWatchConns.Close() })
 	in.eg.Go(func() error {
 		return runDistributionCatalogStream(in.ctx, catalogRuntime, catalogWatchConns, in.cfg.Engine)
@@ -102,7 +103,7 @@ func startDistributionStartup(in distributionStartupInput) (distributionStartup,
 	serverwiring.StartFlusher(in.ctx, in.eg, in.sampler)
 	startKeyVizLeaderTermPublisher(in.ctx, in.eg, in.sampler, in.runtimes)
 	startMemoryWatchdog(in.ctx, in.eg, in.cancel)
-	splitMigrationConnCache := newBootstrapRuntimeConnCache(in.runtimes)
+	splitMigrationConnCache := clusterbootstrap.NewBootstrapRuntimeConnCache(in.runtimes)
 	in.cleanup.Add(func() { _ = splitMigrationConnCache.Close() })
 	distServer := adapter.NewDistributionServer(
 		in.cfg.Engine,
@@ -112,7 +113,7 @@ func startDistributionStartup(in distributionStartupInput) (distributionStartup,
 		adapter.WithDistributionTSOActivationGate(in.tsoWiring.AuthorizeActivation),
 		adapter.WithDistributionActiveTimestampTracker(in.readTracker),
 		adapter.WithCatalogWatchLeaderCheck(func() bool {
-			engine := catalogRuntime.snapshotEngine()
+			engine := clusterbootstrap.RuntimeCore(catalogRuntime).SnapshotEngine()
 			return engine != nil && engine.State() == raftengine.StateLeader
 		}),
 		adapter.WithDistributionFilesystemObserver(in.metricsRegistry.FileSystemObserver()),
@@ -120,7 +121,7 @@ func startDistributionStartup(in distributionStartupInput) (distributionStartup,
 		adapter.WithSplitMigrationCapabilityGate(adapter.NewSplitMigrationCapabilityGate(
 			splitMigrationCapabilityPeerSourceForRuntimes(in.runtimes),
 			splitMigrationCapabilityProbeTimeout,
-			bootstrapSplitMigrationProbe(in.runtimes),
+			clusterbootstrap.BootstrapSplitMigrationProbe(in.runtimes),
 			in.nodeAuth.SplitMigrationLocalReadinessGate,
 		)),
 		adapter.WithSplitPromotionClientFactory(adapter.NewSplitPromotionGRPCClientFactory(
@@ -201,7 +202,7 @@ func startDistributionSplitJobRunner(ctx context.Context, eg *errgroup.Group, se
 	})
 }
 
-func distributionCatalogStoreForGroup(runtimes []*raftGroupRuntime, groupID uint64) *distribution.CatalogStore {
+func distributionCatalogStoreForGroup(runtimes []*clusterbootstrap.GroupRuntime, groupID uint64) *distribution.CatalogStore {
 	for _, rt := range runtimes {
 		if rt == nil || rt.Store == nil {
 			continue
@@ -217,7 +218,7 @@ func distributionCatalogStoreForGroup(runtimes []*raftGroupRuntime, groupID uint
 	return nil
 }
 
-func catalogMigrationStoreResolver(runtimes []*raftGroupRuntime) distribution.CatalogMigrationStoreResolver {
+func catalogMigrationStoreResolver(runtimes []*clusterbootstrap.GroupRuntime) distribution.CatalogMigrationStoreResolver {
 	return func(groupID uint64) (store.MVCCStore, error) {
 		for _, rt := range runtimes {
 			if rt == nil || rt.Store == nil {
@@ -231,13 +232,13 @@ func catalogMigrationStoreResolver(runtimes []*raftGroupRuntime) distribution.Ca
 	}
 }
 
-func catalogMigrationRetireResolver(runtimes []*raftGroupRuntime) distribution.CatalogMigrationRetireResolver {
+func catalogMigrationRetireResolver(runtimes []*clusterbootstrap.GroupRuntime) distribution.CatalogMigrationRetireResolver {
 	return func(ctx context.Context, groupID, jobID uint64) error {
 		for _, rt := range runtimes {
 			if rt == nil || rt.Spec.ID != groupID {
 				continue
 			}
-			engine := rt.snapshotEngine()
+			engine := clusterbootstrap.RuntimeCore(rt).SnapshotEngine()
 			if engine == nil {
 				break
 			}
@@ -263,10 +264,10 @@ func catalogMigrationRetireResolver(runtimes []*raftGroupRuntime) distribution.C
 
 func setupDistributionCatalog(
 	ctx context.Context,
-	runtimes []*raftGroupRuntime,
+	runtimes []*clusterbootstrap.GroupRuntime,
 	engine *distribution.Engine,
 ) (*distribution.CatalogStore, error) {
-	if err := validateNoExistingCommitTSFenceActivation(ctx, runtimes, bootstrapDomainForRuntimes(runtimes) != nil); err != nil {
+	if err := validateNoExistingCommitTSFenceActivation(ctx, runtimes, clusterbootstrap.BootstrapDomainForRuntimes(runtimes) != nil); err != nil {
 		return nil, err
 	}
 	catalogGroupID, err := distribution.CatalogGroupID(engine)
@@ -277,8 +278,8 @@ func setupDistributionCatalog(
 	if distCatalog == nil {
 		return nil, errors.WithStack(errors.Newf("distribution catalog store is not available for group %d", catalogGroupID))
 	}
-	if handled, err := loadProtectedStartupCatalog(ctx, runtimes, catalogGroupID, distCatalog, engine); handled {
-		return distCatalog, err
+	if handled, err := clusterbootstrap.LoadProtectedStartupCatalog(ctx, runtimes, catalogGroupID, distCatalog, engine); handled {
+		return distCatalog, errors.WithStack(err)
 	}
 	// EnsureCatalogSnapshot may Save through the direct (non-raft) write
 	// path. When the §7.1 storage envelope is active and this load's
@@ -328,7 +329,7 @@ func runDistributionCatalogWatcher(
 func setupDistributionRuntimeDependencies(
 	runCtx context.Context,
 	eg *errgroup.Group,
-	runtimes []*raftGroupRuntime,
+	runtimes []*clusterbootstrap.GroupRuntime,
 	engine *distribution.Engine,
 	coordinate *kv.ShardedCoordinator,
 	defaultGroup *kv.ShardGroup,
@@ -336,7 +337,7 @@ func setupDistributionRuntimeDependencies(
 	encWiring encryptionwiring.WriteWiring,
 	raftID string,
 	sidecarPath string,
-) (*distribution.CatalogStore, *raftGroupRuntime, *raftGroupRuntime, error) {
+) (*distribution.CatalogStore, *clusterbootstrap.GroupRuntime, *clusterbootstrap.GroupRuntime, error) {
 	catalog, err := setupDistributionAndRegistration(
 		runCtx, eg, runtimes, engine, coordinate, defaultGroup, encWiring, raftID, sidecarPath)
 	if err != nil {
@@ -346,14 +347,14 @@ func setupDistributionRuntimeDependencies(
 	if err != nil {
 		return nil, nil, nil, errors.Wrap(err, "resolve distribution catalog group runtime")
 	}
-	catalogRuntime := findDefaultGroupRuntime(runtimes, catalogGroupID)
+	catalogRuntime := clusterbootstrap.FindDefaultGroupRuntime(runtimes, catalogGroupID)
 	if catalogRuntime == nil {
 		return nil, nil, nil, errors.WithStack(errors.Newf(
 			"distribution catalog raft group %d runtime is unavailable",
 			catalogGroupID,
 		))
 	}
-	defaultRuntime := findDefaultGroupRuntime(runtimes, defaultGroupID)
+	defaultRuntime := clusterbootstrap.FindDefaultGroupRuntime(runtimes, defaultGroupID)
 	if defaultRuntime == nil {
 		return nil, nil, nil, errors.WithStack(errors.Newf(
 			"default raft group %d runtime is unavailable",
@@ -365,13 +366,13 @@ func setupDistributionRuntimeDependencies(
 
 func runDistributionCatalogStream(
 	ctx context.Context,
-	runtime *raftGroupRuntime,
+	runtime *clusterbootstrap.GroupRuntime,
 	conns *kv.GRPCConnCache,
 	engine *distribution.Engine,
 ) error {
 	watcher := distribution.NewResolvingGRPCCatalogWatcher(
 		func(context.Context) (pb.DistributionClient, error) {
-			raftEngine := runtime.snapshotEngine()
+			raftEngine := clusterbootstrap.RuntimeCore(runtime).SnapshotEngine()
 			if raftEngine == nil {
 				return nil, errors.New("default raft group engine is unavailable")
 			}
@@ -412,7 +413,7 @@ func runDistributionCatalogStream(
 func setupDistributionAndRegistration(
 	runCtx context.Context,
 	eg *errgroup.Group,
-	runtimes []*raftGroupRuntime,
+	runtimes []*clusterbootstrap.GroupRuntime,
 	engine *distribution.Engine,
 	coordinate *kv.ShardedCoordinator,
 	defaultGroup *kv.ShardGroup,

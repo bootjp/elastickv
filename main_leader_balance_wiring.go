@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/leaderbalance"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/kv"
@@ -61,7 +62,7 @@ func leaderBalanceOptions(f leaderBalanceFlags, localNodeID string, defaultGroup
 // leaderBalanceGroups adapts the node's Raft group runtimes to the
 // balancer's view, dropping nil entries so no typed-nil interface reaches
 // the scheduler.
-func leaderBalanceGroups(runtimes []*raftGroupRuntime) []leaderbalance.Group {
+func leaderBalanceGroups(runtimes []*clusterbootstrap.GroupRuntime) []leaderbalance.Group {
 	groups := make([]leaderbalance.Group, 0, len(runtimes))
 	for _, rt := range runtimes {
 		if rt != nil {
@@ -71,13 +72,8 @@ func leaderBalanceGroups(runtimes []*raftGroupRuntime) []leaderbalance.Group {
 	return groups
 }
 
-// GroupID is the Raft group this runtime serves.
-func (r *raftGroupRuntime) GroupID() uint64 {
-	return r.Spec.ID
-}
-
-func startLeaderBalance(ctx context.Context, eg *errgroup.Group, runtimes []*raftGroupRuntime, opts leaderbalance.Options, done chan<- struct{}) {
+func startLeaderBalance(ctx context.Context, eg *errgroup.Group, runtimes []*clusterbootstrap.GroupRuntime, opts leaderbalance.Options, done chan<- struct{}) {
 	leaderbalance.Start(ctx, eg, leaderBalanceGroups(runtimes), opts, func() *kv.GRPCConnCache {
-		return newBootstrapRuntimeConnCache(runtimes)
+		return clusterbootstrap.NewBootstrapRuntimeConnCache(runtimes)
 	}, done)
 }

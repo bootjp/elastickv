@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/internal/testutil"
@@ -72,7 +73,7 @@ func TestShutdownSignalTransfersAllLeadersBeforeCancellation(t *testing.T) {
 		return nil
 	})
 	follower.leader.Store(false)
-	runtimes := []*raftGroupRuntime{
+	runtimes := []*clusterbootstrap.GroupRuntime{
 		nil,
 		{GroupRuntime: &noderuntime.GroupRuntime{}},
 		{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 1}, Engine: shutdownTestEngine(transfer)}},
@@ -105,7 +106,7 @@ func TestShutdownSignalTransfersLeadershipAcquiredDuringHandoff(t *testing.T) {
 	})
 	requests := make(chan struct{})
 	close(requests)
-	shutdownAfterRequest(ctx, cancel, []*raftGroupRuntime{
+	shutdownAfterRequest(ctx, cancel, []*clusterbootstrap.GroupRuntime{
 		{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 1}, Engine: follower}},
 		{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 2}, Engine: leader}},
 	}, requests, time.Second, nil)
@@ -124,7 +125,7 @@ func TestShutdownSignalSharesDeadlineAcrossGroups(t *testing.T) {
 		<-transferCtx.Done()
 		return transferCtx.Err()
 	}
-	runtimes := []*raftGroupRuntime{
+	runtimes := []*clusterbootstrap.GroupRuntime{
 		{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 1}, Engine: shutdownTestEngine(transfer)}},
 		{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 2}, Engine: shutdownTestEngine(transfer)}},
 	}
@@ -198,5 +199,5 @@ func TestShutdownAlreadyCanceledDoesNotTransfer(t *testing.T) {
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	shutdownAfterRequest(ctx, cancel, []*raftGroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{Engine: engine}}}, make(chan struct{}), time.Second, nil)
+	shutdownAfterRequest(ctx, cancel, []*clusterbootstrap.GroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{Engine: engine}}}, make(chan struct{}), time.Second, nil)
 }

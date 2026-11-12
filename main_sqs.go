@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/bootjp/elastickv/adapter"
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/serverwiring"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/cockroachdb/errors"
@@ -61,7 +62,7 @@ func prepareSQSServer(
 		shardStore,
 		coordinate,
 		adapter.WithSQSLeaderMap(leaderSQS),
-		adapter.WithSQSRequestAdmission(bootstrapRequestAdmissionForCoordinator(coordinate)),
+		adapter.WithSQSRequestAdmission(clusterbootstrap.BootstrapRequestAdmissionForCoordinator(coordinate)),
 		adapter.WithSQSRegion(region),
 		endpointOption,
 		adapter.WithSQSStaticCredentials(staticCreds),

@@ -12,6 +12,7 @@ import (
 
 	"github.com/bootjp/elastickv/adapter"
 	internalutil "github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/memwatch"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/monitoring"
@@ -113,11 +114,11 @@ func startLockResolverIfEnabled(shardStore *kv.ShardStore, shardGroups map[uint6
 	slog.Info("background lock resolver disabled", "env", lockResolverEnabledEnvVar)
 }
 
-func startFSMCompactorIfEnabled(ctx context.Context, eg *errgroup.Group, runtimes []*raftGroupRuntime, readTracker *kv.ActiveTimestampTracker) {
+func startFSMCompactorIfEnabled(ctx context.Context, eg *errgroup.Group, runtimes []*clusterbootstrap.GroupRuntime, readTracker *kv.ActiveTimestampTracker) {
 	if enabledEnv(fsmCompactorEnabledEnvVar) {
 		var admission kv.OperationAdmission
-		if domain := bootstrapDomainForRuntimes(runtimes); domain != nil {
-			admission = domain.operationAdmission
+		if domain := clusterbootstrap.BootstrapDomainForRuntimes(runtimes); domain != nil {
+			admission = domain.OperationAdmission
 		}
 		compactor := kv.NewFSMCompactor(
 			fsmCompactionRuntimes(runtimes),
@@ -172,7 +173,7 @@ func startMemoryWatchdog(ctx context.Context, eg *errgroup.Group, cancel context
 	})
 }
 
-func fsmCompactionRuntimes(runtimes []*raftGroupRuntime) []kv.FSMCompactRuntime {
+func fsmCompactionRuntimes(runtimes []*clusterbootstrap.GroupRuntime) []kv.FSMCompactRuntime {
 	out := make([]kv.FSMCompactRuntime, 0, len(runtimes))
 	for _, runtime := range runtimes {
 		if runtime == nil || runtime.Engine == nil || runtime.Store == nil {

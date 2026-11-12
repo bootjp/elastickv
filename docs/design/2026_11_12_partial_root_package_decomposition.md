@@ -312,6 +312,22 @@ Tests move with the code they cover.
   binaries may import it until M6 and M7 widen that to `clusterbootstrap`
   and `server`, and `adapter` may not import it.
 
+- M6a / M6b: assembly code left bootstrap-named files
+  (`shardGroupBuilder.bootstrapSpecForGroup` → shard groups,
+  `resolveNetworkRuntimeInputs` → runtime config), after which the
+  bootstrap files, the startup gate and the root runtime wrapper compiled
+  as a package of their own. They moved to `internal/clusterbootstrap`;
+  `raftGroupRuntime` is now `clusterbootstrap.GroupRuntime` (with
+  `GroupID`, and `RuntimeCore` / `RuntimeCores` for the nil-safe core), and
+  the engine is read through `RuntimeCore(rt).SnapshotEngine()`. Test files
+  moved at file granularity: the three that compile against the package
+  alone moved, and the rest (e2e fixtures and tests that need the
+  shard-group builder, distribution start-up or the raft servers) stay in
+  `main` and use the exported API. `elastickv -help` and the
+  `elastickv bootstrap ...` usage and subcommand errors are identical to
+  the base. The package may import `noderuntime`, `nodeauth`,
+  `encryptionwiring` and the etcd backend; only binaries may import it.
+
 ## Decisions
 
 - **Internal packages, not exported library packages.** These packages

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/stretchr/testify/require"
@@ -65,7 +66,7 @@ func TestRaftJoinRuntimesReady(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			ready, err := raftJoinRuntimesReady(context.Background(), []*raftGroupRuntime{{
+			ready, err := raftJoinRuntimesReady(context.Background(), []*clusterbootstrap.GroupRuntime{{
 				GroupRuntime: &noderuntime.GroupRuntime{
 					Spec:   noderuntime.GroupSpec{ID: 1},
 					Engine: tc.engine,
@@ -80,7 +81,7 @@ func TestRaftJoinRuntimesReady(t *testing.T) {
 func TestRaftJoinRuntimesReadyReturnsConfigurationError(t *testing.T) {
 	t.Parallel()
 	readErr := errors.New("configuration unavailable")
-	ready, err := raftJoinRuntimesReady(context.Background(), []*raftGroupRuntime{{
+	ready, err := raftJoinRuntimesReady(context.Background(), []*clusterbootstrap.GroupRuntime{{
 		GroupRuntime: &noderuntime.GroupRuntime{
 			Spec:   noderuntime.GroupSpec{ID: 7},
 			Engine: &raftJoinReadyEngineStub{err: readErr},
@@ -104,7 +105,7 @@ func TestPreparePublicServicesAfterRaftJoinReadyDoesNotBindWhileJoinIsUnready(t 
 
 	err := preparePublicServicesAfterRaftJoinReady(
 		ctx,
-		[]*raftGroupRuntime{{
+		[]*clusterbootstrap.GroupRuntime{{
 			GroupRuntime: &noderuntime.GroupRuntime{
 				Spec: noderuntime.GroupSpec{ID: 1},
 				Engine: &raftJoinReadyEngineStub{

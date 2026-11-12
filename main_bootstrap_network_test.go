@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/peersession"
 	"github.com/bootjp/elastickv/internal/raftadmission"
@@ -27,9 +28,9 @@ import (
 const bootstrapNetworkTestGroup = 17
 
 type bootstrapNetworkFixture struct {
-	network           *bootstrapNetwork
-	sender, receiver  *bootstrapDomain
-	config            *bootstrapPeerConfig
+	network           *clusterbootstrap.BootstrapNetwork
+	sender, receiver  *clusterbootstrap.BootstrapDomain
+	config            *clusterbootstrap.BootstrapPeerConfig
 	address           string
 	cache             *kv.GRPCConnCache
 	service           *bootstrapGateService
@@ -46,16 +47,16 @@ func bootstrapNetworkTestPolicy(t *testing.T, server, client peersession.Node) r
 		BaselineDigest: digest, Minimum: raftbootstrap.Versions{Entry: 1, Snapshot: 1, Session: 1}, ActivationIndex: 1, Generation: 1, LastConfigurationIndex: 1, Configuration: configuration}
 }
 
-func bootstrapNetworkTestDomain(t *testing.T, local peersession.Node, provisions []peersession.Provision, policy raftbootstrap.PolicyRecord) *bootstrapDomain {
+func bootstrapNetworkTestDomain(t *testing.T, local peersession.Node, provisions []peersession.Provision, policy raftbootstrap.PolicyRecord) *clusterbootstrap.BootstrapDomain {
 	t.Helper()
-	owner, err := peersession.NewOwner(peersession.Config{Local: local, Provisioned: provisions, Versions: policy.Minimum, Methods: bootstrapSharedGRPCMethods(bootstrapNetworkTestGroup)})
+	owner, err := peersession.NewOwner(peersession.Config{Local: local, Provisioned: provisions, Versions: policy.Minimum, Methods: clusterbootstrap.BootstrapSharedGRPCMethods(bootstrapNetworkTestGroup)})
 	require.NoError(t, err)
 	t.Cleanup(owner.Close)
 	digest, err := raftbootstrap.PolicyDigest(policy)
 	require.NoError(t, err)
 	require.NoError(t, owner.UpdateGroup(peersession.Group{ID: bootstrapNetworkTestGroup, Generation: 1, Configuration: policy.Configuration, Policy: digest,
 		Floor: raftbootstrap.Floor{ActivationIndex: 1, Generation: 1}, Minimum: policy.Minimum, State: peersession.Intact, Stage: peersession.ControlReady, Pending: peersession.PendingClear, MarkerReady: true}))
-	a, err := raftadmission.New(raftadmission.Config{Cluster: policy.Identity.Cluster, DefaultGroup: bootstrapNetworkTestGroup, Groups: []uint64{bootstrapNetworkTestGroup}, ValidatePayload: bootstrapPayloadValidator(policy.Identity.Cluster)})
+	a, err := raftadmission.New(raftadmission.Config{Cluster: policy.Identity.Cluster, DefaultGroup: bootstrapNetworkTestGroup, Groups: []uint64{bootstrapNetworkTestGroup}, ValidatePayload: clusterbootstrap.BootstrapPayloadValidator(policy.Identity.Cluster)})
 	require.NoError(t, err)
 	t.Cleanup(a.Close)
 	require.NoError(t, a.WithNative(t.Context(), bootstrapNetworkTestGroup, func(scope raftengine.NativeScope) error {
@@ -65,7 +66,7 @@ func bootstrapNetworkTestDomain(t *testing.T, local peersession.Node, provisions
 	ticket, err := a.Ticket(bootstrapNetworkTestGroup)
 	require.NoError(t, err)
 	require.NoError(t, a.PublishRecovery(ticket, policy, 1, raftadmission.RegistrationNotConfigured))
-	return &bootstrapDomain{admission: a, owners: map[uint64]*peersession.Owner{bootstrapNetworkTestGroup: owner}, startupToken: bootstrapGateTestToken}
+	return &clusterbootstrap.BootstrapDomain{Admission: a, Owners: map[uint64]*peersession.Owner{bootstrapNetworkTestGroup: owner}, StartupToken: bootstrapGateTestToken}
 }
 
 func newBootstrapNetworkFixture(t *testing.T, wrongSPKI bool) *bootstrapNetworkFixture {
@@ -85,8 +86,8 @@ func newBootstrapNetworkFixture(t *testing.T, wrongSPKI bool) *bootstrapNetworkF
 	}
 	clientProvisions := []peersession.Provision{{Node: expected, Groups: []uint64{bootstrapNetworkTestGroup}}, {Node: client, Groups: []uint64{bootstrapNetworkTestGroup}}}
 	sender := bootstrapNetworkTestDomain(t, client, clientProvisions, bootstrapNetworkTestPolicy(t, expected, client))
-	config := &bootstrapPeerConfig{local: client, provisions: clientProvisions, startupToken: bootstrapGateTestToken,
-		clientTLS: &tls.Config{MinVersion: tls.VersionTLS13, ServerName: "server.test", Certificates: []tls.Certificate{clientCert}, RootCAs: pki.roots}}
+	config := &clusterbootstrap.BootstrapPeerConfig{Local: client, Provisions: clientProvisions, StartupToken: bootstrapGateTestToken,
+		ClientTLS: &tls.Config{MinVersion: tls.VersionTLS13, ServerName: "server.test", Certificates: []tls.Certificate{clientCert}, RootCAs: pki.roots}}
 	f := &bootstrapNetworkFixture{sender: sender, receiver: receiver, config: config, address: server.Address, service: &bootstrapGateService{}}
 	f.service.action = func(ctx context.Context) error {
 		if peersession.CapturedReceipt(ctx) != nil {
@@ -95,7 +96,7 @@ func newBootstrapNetworkFixture(t *testing.T, wrongSPKI bool) *bootstrapNetworkF
 		}
 		f.ordinary.Add(1)
 		md, _ := metadata.FromIncomingContext(ctx)
-		for _, header := range []string{bootstrapControlHeader, "x-elastickv-peer-session", "x-elastickv-peer-proof"} {
+		for _, header := range []string{clusterbootstrap.BootstrapControlHeader, "x-elastickv-peer-session", "x-elastickv-peer-proof"} {
 			if len(md.Get(header)) != 0 {
 				return errors.New("private metadata leaked onto ordinary transport")
 			}
@@ -105,12 +106,12 @@ func newBootstrapNetworkFixture(t *testing.T, wrongSPKI bool) *bootstrapNetworkF
 		}
 		return nil
 	}
-	options, err := receiver.owners[bootstrapNetworkTestGroup].ServerOptions(&tls.Config{MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{serverCert}, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: pki.roots})
+	options, err := receiver.Owners[bootstrapNetworkTestGroup].ServerOptions(&tls.Config{MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{serverCert}, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: pki.roots})
 	require.NoError(t, err)
-	gate := &startupPublicKVGate{domain: receiver}
-	gate.markReady()
-	serverGRPC := grpc.NewServer(append(options, grpc.ChainUnaryInterceptor(bootstrapRegistrationReceiverInterceptor(bootstrapNetworkTestGroup), gate.unaryInterceptor), grpc.ChainStreamInterceptor(gate.streamInterceptor))...)
-	receiver.owners[bootstrapNetworkTestGroup].Register(serverGRPC)
+	gate := &clusterbootstrap.StartupPublicKVGate{Domain: receiver}
+	gate.MarkReady()
+	serverGRPC := grpc.NewServer(append(options, grpc.ChainUnaryInterceptor(clusterbootstrap.BootstrapRegistrationReceiverInterceptor(bootstrapNetworkTestGroup), gate.UnaryInterceptor), grpc.ChainStreamInterceptor(gate.StreamInterceptor))...)
+	receiver.Owners[bootstrapNetworkTestGroup].Register(serverGRPC)
 	pb.RegisterRawKVServer(serverGRPC, f.service)
 	pb.RegisterDistributionServer(serverGRPC, f.service)
 	pb.RegisterInternalServer(serverGRPC, f.service)
@@ -118,7 +119,7 @@ func newBootstrapNetworkFixture(t *testing.T, wrongSPKI bool) *bootstrapNetworkF
 	done := make(chan struct{})
 	go func() { defer close(done); _ = serverGRPC.Serve(listener) }()
 	t.Cleanup(func() { serverGRPC.Stop(); _ = listener.Close(); <-done })
-	f.network, err = newBootstrapNetwork(t.Context(), sender, map[uint64]*bootstrapPeerConfig{bootstrapNetworkTestGroup: config})
+	f.network, err = clusterbootstrap.NewBootstrapNetwork(t.Context(), sender, map[uint64]*clusterbootstrap.BootstrapPeerConfig{bootstrapNetworkTestGroup: config})
 	require.NoError(t, err)
 	t.Cleanup(f.network.Close)
 	f.cache = kv.NewGRPCConnCache(f.network.DialOptions)
@@ -128,12 +129,12 @@ func newBootstrapNetworkFixture(t *testing.T, wrongSPKI bool) *bootstrapNetworkF
 
 func (f *bootstrapNetworkFixture) ready(t *testing.T) {
 	t.Helper()
-	for _, domain := range []*bootstrapDomain{f.sender, f.receiver} {
-		ticket, err := domain.admission.Ticket(bootstrapNetworkTestGroup)
+	for _, domain := range []*clusterbootstrap.BootstrapDomain{f.sender, f.receiver} {
+		ticket, err := domain.Admission.Ticket(bootstrapNetworkTestGroup)
 		require.NoError(t, err)
-		require.NoError(t, domain.catalogLoaded(ticket))
+		require.NoError(t, domain.CatalogLoaded(ticket))
 	}
-	require.True(t, f.network.dataReady())
+	require.True(t, f.network.DataReady())
 }
 
 func bootstrapNetworkCallContext(t *testing.T) (context.Context, context.CancelFunc) {
@@ -153,13 +154,13 @@ func TestBootstrapNetworkTLSStartupToOrdinary(t *testing.T) {
 	_, err = pb.NewRawKVClient(conn).RawLatestCommitTS(ctx, request)
 	require.Equal(t, codes.Unavailable, status.Code(err), "TLS alone cannot open DataReady")
 	var reply pb.RawLatestCommitTSResponse
-	handled, err := f.network.startup(ctx, bootstrapNetworkTestGroup, f.address, pb.RawKV_RawLatestCommitTS_FullMethodName, request, &reply)
+	handled, err := f.network.Startup(ctx, bootstrapNetworkTestGroup, f.address, pb.RawKV_RawLatestCommitTS_FullMethodName, request, &reply)
 	require.True(t, handled)
 	require.NoError(t, err)
 	require.EqualValues(t, 1, f.private.Load())
 	require.Zero(t, f.ordinary.Load())
 	f.ready(t)
-	handled, err = f.network.startup(ctx, bootstrapNetworkTestGroup, f.address, pb.RawKV_RawLatestCommitTS_FullMethodName, request, &reply)
+	handled, err = f.network.Startup(ctx, bootstrapNetworkTestGroup, f.address, pb.RawKV_RawLatestCommitTS_FullMethodName, request, &reply)
 	require.False(t, handled, "full process readiness chooses the original public path before sending")
 	require.NoError(t, err)
 	_, err = pb.NewRawKVClient(conn).RawLatestCommitTS(ctx, request)
@@ -186,11 +187,11 @@ func TestBootstrapNetworkTLSRejectsUnknownAndWrongSPKI(t *testing.T) {
 func TestBootstrapNetworkPrivateFailureNeverFallsBack(t *testing.T) {
 	t.Parallel()
 	f := newBootstrapNetworkFixture(t, false)
-	f.sender.startupToken = "wrong-dedicated-credential"
+	f.sender.StartupToken = "wrong-dedicated-credential"
 	ctx, cancel := bootstrapNetworkCallContext(t)
 	defer cancel()
 	var reply pb.RawLatestCommitTSResponse
-	handled, err := f.network.startup(ctx, bootstrapNetworkTestGroup, f.address, pb.RawKV_RawLatestCommitTS_FullMethodName,
+	handled, err := f.network.Startup(ctx, bootstrapNetworkTestGroup, f.address, pb.RawKV_RawLatestCommitTS_FullMethodName,
 		&pb.RawLatestCommitTSRequest{GroupId: bootstrapNetworkTestGroup}, &reply)
 	require.True(t, handled)
 	require.Error(t, err)
@@ -233,7 +234,7 @@ func TestBootstrapNetworkOrdinaryCallsConcurrentAndCloseJoins(t *testing.T) {
 
 func TestBootstrapNetworkMissingInstallationFailsClosed(t *testing.T) {
 	t.Parallel()
-	cache := newBootstrapRuntimeConnCache([]*raftGroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{}, bootstrapDomain: &bootstrapDomain{}}})
+	cache := clusterbootstrap.NewBootstrapRuntimeConnCache([]*clusterbootstrap.GroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{}, BootstrapDomain: &clusterbootstrap.BootstrapDomain{}}})
 	t.Cleanup(func() { require.NoError(t, cache.Close()) })
 	_, err := cache.ConnFor("127.0.0.1:1")
 	require.ErrorContains(t, err, "network was not installed")
@@ -242,10 +243,10 @@ func TestBootstrapNetworkMissingInstallationFailsClosed(t *testing.T) {
 func TestBootstrapNetworkSuccessThenRevocationIsUnknown(t *testing.T) {
 	t.Parallel()
 	f := newBootstrapNetworkFixture(t, false)
-	interceptor := f.network.unary(f.address)
+	interceptor := f.network.Unary(f.address)
 	err := interceptor(t.Context(), pb.RawKV_RawLatestCommitTS_FullMethodName, nil, nil, nil,
 		func(context.Context, string, any, any, *grpc.ClientConn, ...grpc.CallOption) error {
-			f.network.control.cancel()
+			f.network.Control.Cancel()
 			return nil
 		})
 	require.ErrorIs(t, err, kv.ErrTransactionOutcomeUnknown)
@@ -261,7 +262,7 @@ func (s bootstrapNetworkTestStream) Context() context.Context { return s.ctx }
 func TestBootstrapNetworkCloseCancelsAndJoinsOrdinaryStream(t *testing.T) {
 	t.Parallel()
 	f := newBootstrapNetworkFixture(t, false)
-	stream, err := f.network.stream(f.address)(t.Context(), &grpc.StreamDesc{}, nil, "ordinary-stream",
+	stream, err := f.network.Stream(f.address)(t.Context(), &grpc.StreamDesc{}, nil, "ordinary-stream",
 		func(ctx context.Context, _ *grpc.StreamDesc, _ *grpc.ClientConn, _ string, _ ...grpc.CallOption) (grpc.ClientStream, error) {
 			return bootstrapNetworkTestStream{ctx: ctx}, nil
 		})
@@ -277,11 +278,11 @@ func TestBootstrapNetworkCloseCancelsAndJoinsOrdinaryStream(t *testing.T) {
 func TestBootstrapNetworkPrepareControlInheritsAllocatorBeforeDataReady(t *testing.T) {
 	t.Parallel()
 	f := newBootstrapNetworkFixture(t, false)
-	a := f.sender.admission
-	require.False(t, f.network.dataReady())
+	a := f.sender.Admission
+	require.False(t, f.network.DataReady())
 	parent, finishParent, err := a.Enter(t.Context(), raftadmission.Allocator, bootstrapNetworkTestGroup)
 	require.NoError(t, err)
-	child, finishChild, err := f.sender.operationAdmission(parent, bootstrapNetworkTestGroup, kv.AdmissionControl)
+	child, finishChild, err := f.sender.OperationAdmission(parent, bootstrapNetworkTestGroup, kv.AdmissionControl)
 	require.NoError(t, err)
 	payload := kv.EncodePrepareEvidenceSeal()
 	bound, err := a.BindProposal(child, bootstrapNetworkTestGroup, payload)

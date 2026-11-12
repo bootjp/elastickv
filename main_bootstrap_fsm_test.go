@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/peersession"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -41,7 +42,7 @@ func TestProtectedDataGroupFSMBindsIdentityBeforeReceiptReplay(t *testing.T) {
 		return metadata.StageRaftControlMetadata(ctx, key, encoded)
 	}))
 	builder := shardGroupBuilder{clock: kv.NewHLC()}
-	spec := &groupBootstrapSpec{config: &bootstrapPeerConfig{local: peersession.Node{Cluster: cluster}}}
+	spec := &clusterbootstrap.GroupBootstrapSpec{Config: &clusterbootstrap.BootstrapPeerConfig{Local: peersession.Node{Cluster: cluster}}}
 	fsm := builder.newDataGroupFSM(st, nil, 7, spec)
 	aware, ok := fsm.(raftengine.ApplyEntryIdentityAware)
 	require.True(t, ok)

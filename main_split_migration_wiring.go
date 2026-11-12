@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/bootjp/elastickv/adapter"
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/raftadmin"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
@@ -12,7 +13,7 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-func splitMigrationCapabilityPeerSourceForRuntimes(runtimes []*raftGroupRuntime) adapter.SplitMigrationCapabilityPeerSource {
+func splitMigrationCapabilityPeerSourceForRuntimes(runtimes []*clusterbootstrap.GroupRuntime) adapter.SplitMigrationCapabilityPeerSource {
 	return func(ctx context.Context) ([]adapter.SplitMigrationCapabilityPeer, error) {
 		if len(runtimes) == 0 {
 			return nil, errors.New("raft group runtimes are not configured")
@@ -23,7 +24,7 @@ func splitMigrationCapabilityPeerSourceForRuntimes(runtimes []*raftGroupRuntime)
 			if rt == nil {
 				return nil, errors.New("raft group runtime is not configured")
 			}
-			engine := rt.snapshotEngine()
+			engine := clusterbootstrap.RuntimeCore(rt).SnapshotEngine()
 			if engine == nil {
 				return nil, errors.Errorf("raft group %d engine is not configured", rt.Spec.ID)
 			}
@@ -48,7 +49,7 @@ func splitMigrationCapabilityPeerSourceForRuntimes(runtimes []*raftGroupRuntime)
 	}
 }
 
-func migrationInternalProtocolOptions(tx kv.Transactional, shards *kv.ShardStore, server *adapter.DistributionServer, runtime *raftGroupRuntime) []adapter.InternalOption {
+func migrationInternalProtocolOptions(tx kv.Transactional, shards *kv.ShardStore, server *adapter.DistributionServer, runtime *clusterbootstrap.GroupRuntime) []adapter.InternalOption {
 	installed := func() bool {
 		return adapter.MigrationOwnershipRuntimeHooksInstalled(tx, shards, server, runtime.Spec.ID)
 	}
@@ -61,12 +62,12 @@ func migrationInternalProtocolOptions(tx kv.Transactional, shards *kv.ShardStore
 	}
 }
 
-func migrationOwnershipRootLeaderResolver(runtime *raftGroupRuntime) func() (string, error) {
+func migrationOwnershipRootLeaderResolver(runtime *clusterbootstrap.GroupRuntime) func() (string, error) {
 	return func() (string, error) {
 		if runtime == nil {
 			return "", errors.WithStack(kv.ErrLeaderNotFound)
 		}
-		engine := runtime.snapshotEngine()
+		engine := clusterbootstrap.RuntimeCore(runtime).SnapshotEngine()
 		if engine == nil {
 			return "", errors.WithStack(kv.ErrLeaderNotFound)
 		}
@@ -78,7 +79,7 @@ func migrationOwnershipRootLeaderResolver(runtime *raftGroupRuntime) func() (str
 	}
 }
 
-func migrationOwnershipRefreshOption(groups map[uint64]*kv.ShardGroup, root *raftGroupRuntime, cache *kv.GRPCConnCache, token string, enforced bool) adapter.DistributionServerOption {
+func migrationOwnershipRefreshOption(groups map[uint64]*kv.ShardGroup, root *clusterbootstrap.GroupRuntime, cache *kv.GRPCConnCache, token string, enforced bool) adapter.DistributionServerOption {
 	if token == "" || !enforced {
 		// Keep durable ownership visible to metadata preflight even when the
 		// authenticated mutation protocol is disabled. Do not install a root
@@ -88,7 +89,7 @@ func migrationOwnershipRefreshOption(groups map[uint64]*kv.ShardGroup, root *raf
 	return adapter.WithMigrationOwnershipRefresh(groups, adapter.NewMigrationOwnershipRootGRPCClientFactory(migrationOwnershipRootLeaderResolver(root), cache, token))
 }
 
-func migrationMembershipInterceptor(runtime *raftGroupRuntime, shards *kv.ShardStore, proposer raftengine.Proposer,
+func migrationMembershipInterceptor(runtime *clusterbootstrap.GroupRuntime, shards *kv.ShardStore, proposer raftengine.Proposer,
 	token string, next raftadmin.MembershipChangeInterceptor,
 ) raftadmin.MembershipChangeInterceptor {
 	if runtime == nil {
@@ -100,6 +101,6 @@ func migrationMembershipInterceptor(runtime *raftGroupRuntime, shards *kv.ShardS
 		return prepare
 	}
 	protocols := adapter.NewMigrationMembershipGate(runtime.Store, adapter.MigrationMemberProtocolsConfigured(),
-		adapter.NewMigrationMemberProtocolProbe(token, bootstrapRuntimeDialOptions([]*raftGroupRuntime{runtime})), prepare)
-	return adapter.NewMigrationNamespaceMembershipGate(runtime.Store, runtime.snapshotEngine(), proposer, token, protocols, etcdraftengine.DeriveNodeID, bootstrapRuntimeDialOptions([]*raftGroupRuntime{runtime}))
+		adapter.NewMigrationMemberProtocolProbe(token, clusterbootstrap.BootstrapRuntimeDialOptions([]*clusterbootstrap.GroupRuntime{runtime})), prepare)
+	return adapter.NewMigrationNamespaceMembershipGate(runtime.Store, clusterbootstrap.RuntimeCore(runtime).SnapshotEngine(), proposer, token, protocols, etcdraftengine.DeriveNodeID, clusterbootstrap.BootstrapRuntimeDialOptions([]*clusterbootstrap.GroupRuntime{runtime}))
 }

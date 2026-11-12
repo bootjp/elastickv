@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/adapter"
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/peersession"
 	"github.com/bootjp/elastickv/internal/peersession/wire"
 	"github.com/bootjp/elastickv/internal/raftadmission"
@@ -50,7 +51,7 @@ func bootstrapAuthRegistrationInterceptor(group uint64, options bootstrapAuthReg
 	if options.receiverGroup != nil {
 		group = *options.receiverGroup
 	}
-	return bootstrapRegistrationReceiverInterceptor(group)
+	return clusterbootstrap.BootstrapRegistrationReceiverInterceptor(group)
 }
 
 // Exercise the production order on a real mTLS/session connection:
@@ -71,7 +72,7 @@ func newBootstrapAuthFixture(t *testing.T, group uint64, stage peersession.Stage
 	remote := peersession.Node{Cluster: cluster, Member: 2, Address: "client.test:9001", Key: clientKey}
 	provisions := []peersession.Provision{{Node: local, Groups: []uint64{group}}, {Node: remote, Groups: []uint64{group}}}
 	versions := raftbootstrap.Versions{Entry: 1, Snapshot: 1, Session: 1}
-	methods := bootstrapSharedGRPCMethods(group)
+	methods := clusterbootstrap.BootstrapSharedGRPCMethods(group)
 	server, err := peersession.NewOwner(peersession.Config{Local: local, Provisioned: provisions, Versions: versions, Methods: methods,
 		PublicMethods: []string{pb.Admin_StreamEvents_FullMethodName, pb.RawKV_RawGet_FullMethodName}})
 	require.NoError(t, err)
@@ -95,7 +96,7 @@ func newBootstrapAuthFixture(t *testing.T, group uint64, stage peersession.Stage
 	require.NoError(t, server.UpdateGroup(projection))
 	require.NoError(t, client.UpdateGroup(projection))
 	a, err := raftadmission.New(raftadmission.Config{Cluster: cluster, DefaultGroup: group, Groups: []uint64{group},
-		ValidatePayload: bootstrapPayloadValidator(cluster), InspectPayload: registrationConfig.inspectPayload})
+		ValidatePayload: clusterbootstrap.BootstrapPayloadValidator(cluster), InspectPayload: registrationConfig.inspectPayload})
 	require.NoError(t, err)
 	require.NoError(t, a.WithNative(t.Context(), group, func(scope raftengine.NativeScope) error {
 		scope.Observe(raftengine.NativeState{Term: 1, Role: raftengine.StateLeader, LeaderID: 1, ConfigurationIndex: 1})
@@ -114,7 +115,7 @@ func newBootstrapAuthFixture(t *testing.T, group uint64, stage peersession.Stage
 	}
 	f := &bootstrapAuthFixture{bootstrapGateFixture: &bootstrapGateFixture{a: a, server: server, client: client,
 		service: &bootstrapGateService{}, group: group}}
-	domain := &bootstrapDomain{admission: a, startupToken: bootstrapGateTestToken}
+	domain := &clusterbootstrap.BootstrapDomain{Admission: a, StartupToken: bootstrapGateTestToken}
 	options, err := server.ServerOptions(&tls.Config{Certificates: []tls.Certificate{serverCert}, ClientCAs: pki.roots,
 		ClientAuth: tls.RequireAndVerifyClientCert, MinVersion: tls.VersionTLS13})
 	require.NoError(t, err)
@@ -124,7 +125,7 @@ func newBootstrapAuthFixture(t *testing.T, group uint64, stage peersession.Stage
 		return admin(ctx, request, info, next)
 	}
 	options = append(options, grpc.ChainUnaryInterceptor(
-		bootstrapAuthRegistrationInterceptor(group, registrationConfig), bootstrapAuthRewrite(rewrite), bootstrapStartupAuthException(domain, countedAdmin), f.publicGate,
+		bootstrapAuthRegistrationInterceptor(group, registrationConfig), bootstrapAuthRewrite(rewrite), clusterbootstrap.BootstrapStartupAuthException(domain, countedAdmin), f.publicGate,
 	), grpc.ChainStreamInterceptor(adminStream))
 	gs := grpc.NewServer(options...)
 	server.Register(gs)
@@ -172,7 +173,7 @@ func (f *bootstrapAuthFixture) publicGate(ctx context.Context, request any, info
 		return next(ctx, request)
 	}
 	f.gateCalls.Add(1)
-	reply, handled, err := handleBootstrapStartupControl(ctx, bootstrapGateTestToken, f.a, info.FullMethod, request, next)
+	reply, handled, err := clusterbootstrap.HandleBootstrapStartupControl(ctx, bootstrapGateTestToken, f.a, info.FullMethod, request, next)
 	if handled {
 		return reply, err
 	}
@@ -303,7 +304,7 @@ func TestBootstrapAuthExceptionWithoutDomainKeepsOriginalAuth(t *testing.T) {
 		called = true
 		return nil, denied
 	}
-	wrapped := bootstrapStartupAuthException(nil, original)
+	wrapped := clusterbootstrap.BootstrapStartupAuthException(nil, original)
 	_, err := wrapped(t.Context(), &pb.PrepareEvidenceStateRequest{}, &grpc.UnaryServerInfo{FullMethod: pb.Internal_GetPrepareEvidenceState_FullMethodName},
 		func(context.Context, any) (any, error) {
 			t.Fatal("original authentication was bypassed")

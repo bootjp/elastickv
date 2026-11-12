@@ -9,6 +9,7 @@ import (
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/admin"
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/nodeauth"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/keyviz"
@@ -26,7 +27,7 @@ func startupRoleStoreFromFlags(f adminHTTPFlags) admin.RoleStore {
 
 func setupAdminService(
 	nodeID, grpcAddress string,
-	runtimes []*raftGroupRuntime,
+	runtimes []*clusterbootstrap.GroupRuntime,
 	shardGroups map[uint64]*kv.ShardGroup,
 	bootstrapServers []raftengine.Server,
 	shardStore *kv.ShardStore,
@@ -98,7 +99,7 @@ func setupAdminService(
 // we pick the lowest group ID to make the choice deterministic across
 // restarts. Returns the supplied fallback when no runtimes exist (e.g., a
 // single-node dev invocation without --raftGroups).
-func canonicalSelfAddress(fallback string, runtimes []*raftGroupRuntime) string {
+func canonicalSelfAddress(fallback string, runtimes []*clusterbootstrap.GroupRuntime) string {
 	var (
 		bestID   uint64
 		bestAddr string

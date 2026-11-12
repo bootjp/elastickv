@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/adapter"
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/nodeauth"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftadmin"
@@ -20,7 +21,7 @@ import (
 func TestMigrationMembershipWiringKeepsEnvelopeProposerAndTSOIsolation(t *testing.T) {
 	t.Parallel()
 	proposer := &capabilityConfigEngine{}
-	runtime := &raftGroupRuntime{GroupRuntime: &noderuntime.GroupRuntime{Store: store.NewMVCCStore(), Engine: capabilityConfigEngine{}}}
+	runtime := &clusterbootstrap.GroupRuntime{GroupRuntime: &noderuntime.GroupRuntime{Store: store.NewMVCCStore(), Engine: capabilityConfigEngine{}}}
 	runtime.Spec.ID = 7
 	gate, ok := migrationMembershipInterceptor(runtime, nil, proposer, t.Name(), nil).(*adapter.MigrationNamespaceMembershipGate)
 	require.True(t, ok)

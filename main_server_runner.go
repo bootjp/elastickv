@@ -11,6 +11,7 @@ import (
 	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/bootjp/elastickv/internal/admin"
 	"github.com/bootjp/elastickv/internal/adminbridge"
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/internal/nodeauth"
 	"github.com/bootjp/elastickv/internal/noderuntime"
@@ -40,7 +41,7 @@ type serversInput struct {
 	eg                 *errgroup.Group
 	cancel             context.CancelFunc
 	lc                 *net.ListenConfig
-	runtimes           []*raftGroupRuntime
+	runtimes           []*clusterbootstrap.GroupRuntime
 	shardGroups        map[uint64]*kv.ShardGroup
 	bootstrapServers   []raftengine.Server
 	shardStore         *kv.ShardStore
@@ -114,14 +115,14 @@ func startServersAfterStartupRotation(waitRotateOnStartup encryptionwiring.Start
 		return err
 	}
 	roleStore := startupRoleStoreFromFlags(in.adminHTTP)
-	publicKVGate := &startupPublicKVGate{blockRuntime: func() bool { return protectedRuntimesBlocked(in.runtimes) }}
-	publicKVGate.domain = bootstrapDomainForRuntimes(in.runtimes)
-	startBootstrapReadinessReconciler(in.ctx, in.eg, in.runtimes, in.distCatalog, in.cfg.Engine)
+	publicKVGate := &clusterbootstrap.StartupPublicKVGate{BlockRuntime: func() bool { return clusterbootstrap.ProtectedRuntimesBlocked(in.runtimes) }}
+	publicKVGate.Domain = clusterbootstrap.BootstrapDomainForRuntimes(in.runtimes)
+	clusterbootstrap.StartBootstrapReadinessReconciler(in.ctx, in.eg, in.runtimes, in.distCatalog, in.cfg.Engine)
 	if in.distServer != nil {
-		in.distServer.SetReadGate(publicKVGate.blocked)
+		in.distServer.SetReadGate(publicKVGate.Blocked)
 	}
 	tsowiring.InstallHLCLeaseRenewalBlocker(in.coordinate, waitRotateOnStartup.BlockMutators)
-	adapterCoordinate := newStartupGatedCoordinator(in.coordinate, publicKVGate)
+	adapterCoordinate := clusterbootstrap.NewStartupGatedCoordinator(in.coordinate, publicKVGate)
 	runner := runtimeServerRunner{
 		ctx:                in.ctx,
 		lc:                 in.lc,
@@ -186,7 +187,7 @@ func startServersAfterStartupRotation(waitRotateOnStartup encryptionwiring.Start
 	if err := runner.startRaftTransport(); err != nil {
 		return err
 	}
-	startBootstrapActivationWorkers(in.ctx, in.eg, in.runtimes, in.shardGroups)
+	clusterbootstrap.StartBootstrapActivationWorkers(in.ctx, in.eg, in.runtimes, in.shardGroups)
 	if err := preparePublicServicesAfterRaftJoinReady(
 		in.ctx,
 		in.runtimes,
@@ -217,14 +218,14 @@ func startServersAfterStartupRotation(waitRotateOnStartup encryptionwiring.Start
 		return runner.startupFailure(err)
 	}
 	runner.adminHTTP = adminHTTP
-	publicKVGate.blockMutator = waitRotateOnStartup.BlockMutators
+	publicKVGate.BlockMutator = waitRotateOnStartup.BlockMutators
 	if err := waitRotateOnStartup.Wait(in.ctx); err != nil {
 		return runner.startupFailure(errors.Wrap(err, "encryption rotate-on-startup: wait before serving"))
 	}
 	return startPublicServicesAfterCommitTSFence(in, &runner, publicKVGate, in.consistency.commitTSFence)
 }
 
-func startPublicServicesAfterCommitTSFence(in serversInput, runner *runtimeServerRunner, gate *startupPublicKVGate, fenceEnabled bool) error {
+func startPublicServicesAfterCommitTSFence(in serversInput, runner *runtimeServerRunner, gate *clusterbootstrap.StartupPublicKVGate, fenceEnabled bool) error {
 	tsowiring.StartHLCLeaseRenewal(in.ctx, in.eg, in.coordinate)
 	if err := markPublicGateReadyAfterCommitTSFence(in.ctx, gate, in.runtimes, fenceEnabled); err != nil {
 		return runner.startupFailure(errors.Wrap(err, "wait for commit-ts fence activation before public service"))
@@ -243,7 +244,7 @@ type runtimeServerRunner struct {
 	lc                              *net.ListenConfig
 	eg                              *errgroup.Group
 	cancel                          context.CancelFunc
-	runtimes                        []*raftGroupRuntime
+	runtimes                        []*clusterbootstrap.GroupRuntime
 	shardGroups                     map[uint64]*kv.ShardGroup
 	shardStore                      *kv.ShardStore
 	coordinate                      kv.Coordinator
@@ -343,7 +344,7 @@ type runtimeServerRunner struct {
 	// Nil when no admin access keys are configured.
 	roleStore admin.RoleStore
 
-	publicKVGate *startupPublicKVGate
+	publicKVGate *clusterbootstrap.StartupPublicKVGate
 	// nodeAuth supplies the token files the S3 blob cluster dials peers with.
 	nodeAuth nodeauth.Flags
 	raftID   string
@@ -355,22 +356,22 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 	if err := r.prepareAdminForwardServers(); err != nil {
 		return r.startupFailure(err)
 	}
-	domain := bootstrapDomainForRuntimes(r.runtimes)
-	adminGRPCOpts := bootstrapServiceAuthOptions(r.adminGRPCOpts, domain)
+	domain := clusterbootstrap.BootstrapDomainForRuntimes(r.runtimes)
+	adminGRPCOpts := clusterbootstrap.BootstrapServiceAuthOptions(r.adminGRPCOpts, domain)
 	if domain != nil {
-		adminGRPCOpts.Unary = append([]grpc.UnaryServerInterceptor{bootstrapRegistrationReceiverInterceptor(r.defaultGroupID)}, adminGRPCOpts.Unary...)
+		adminGRPCOpts.Unary = append([]grpc.UnaryServerInterceptor{clusterbootstrap.BootstrapRegistrationReceiverInterceptor(r.defaultGroupID)}, adminGRPCOpts.Unary...)
 	}
-	adminGRPCOpts, err := bootstrapRotationRPCOptions(adminGRPCOpts, domain, etcdraftengine.DeriveNodeID(r.raftID), domain.rotationRPCHandler())
+	adminGRPCOpts, err := clusterbootstrap.BootstrapRotationRPCOptions(adminGRPCOpts, domain, etcdraftengine.DeriveNodeID(r.raftID), domain.RotationRPCHandler())
 	if err != nil {
 		return r.startupFailure(err)
 	}
 	if r.publicKVGate != nil {
-		adminGRPCOpts.Unary = append(adminGRPCOpts.Unary, r.publicKVGate.unaryInterceptor)
-		adminGRPCOpts.Stream = append(adminGRPCOpts.Stream, r.publicKVGate.streamInterceptor)
+		adminGRPCOpts.Unary = append(adminGRPCOpts.Unary, r.publicKVGate.UnaryInterceptor)
+		adminGRPCOpts.Stream = append(adminGRPCOpts.Stream, r.publicKVGate.StreamInterceptor)
 	}
 	var s3BlobPushBlocked func() bool
 	if r.publicKVGate != nil {
-		s3BlobPushBlocked = r.publicKVGate.blocked
+		s3BlobPushBlocked = r.publicKVGate.Blocked
 	}
 	forwardDeps := adminForwardServerDeps{
 		tables:  adminbridge.NewDynamoTablesSource(r.dynamoServer),
@@ -415,11 +416,11 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 	return nil
 }
 
-func prepareAdminConnCache(ctx context.Context, eg *errgroup.Group, enabled bool, runtimes ...*raftGroupRuntime) *kv.GRPCConnCache {
+func prepareAdminConnCache(ctx context.Context, eg *errgroup.Group, enabled bool, runtimes ...*clusterbootstrap.GroupRuntime) *kv.GRPCConnCache {
 	if !enabled {
 		return nil
 	}
-	connCache := newBootstrapRuntimeConnCache(runtimes)
+	connCache := clusterbootstrap.NewBootstrapRuntimeConnCache(runtimes)
 	eg.Go(func() error {
 		<-ctx.Done()
 		if err := connCache.Close(); err != nil {
@@ -442,7 +443,7 @@ func (r *runtimeServerRunner) prepareAdminForwardServers() error {
 		r.metricsRegistry.S3PutAdmissionObserver(),
 		r.metricsRegistry.S3BlobOffloadObserver(),
 		blobCluster,
-		r.publicKVGate.blocked,
+		r.publicKVGate.Blocked,
 		r.s3BlobBackfiller,
 	)
 	if err != nil {
@@ -479,7 +480,7 @@ func (r *runtimeServerRunner) newS3BlobCluster() (adapter.S3BlobCluster, error) 
 		}
 		peerToken = loaded
 	}
-	return adapter.NewGRPCS3BlobCluster(r.raftID, members, adminToken, peerToken, bootstrapRuntimeDialOptions(r.runtimes)), nil
+	return adapter.NewGRPCS3BlobCluster(r.raftID, members, adminToken, peerToken, clusterbootstrap.BootstrapRuntimeDialOptions(r.runtimes)), nil
 }
 
 func (r *runtimeServerRunner) preparePublicServices() error {

@@ -15,6 +15,7 @@ import (
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/internal/admin"
 	"github.com/bootjp/elastickv/internal/adminbridge"
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/kv"
@@ -149,7 +150,7 @@ func prepareAdminFromFlags(
 	f adminHTTPFlags,
 	raftID string,
 	s3CredentialsFile string,
-	runtimes []*raftGroupRuntime,
+	runtimes []*clusterbootstrap.GroupRuntime,
 	dynamoServer *adapter.DynamoDBServer,
 	s3Server *adapter.S3Server,
 	sqsServer *adapter.SQSServer,
@@ -480,7 +481,7 @@ func registerAdminLifecycle(
 // best-effort — if it fails (for instance because the engine is in the
 // middle of a leadership transition) we leave Members empty rather
 // than fail the whole cluster snapshot.
-func newClusterInfoSource(nodeID, version string, runtimes []*raftGroupRuntime) admin.ClusterInfoSource {
+func newClusterInfoSource(nodeID, version string, runtimes []*clusterbootstrap.GroupRuntime) admin.ClusterInfoSource {
 	return admin.ClusterInfoFunc(func(ctx context.Context) (admin.ClusterInfo, error) {
 		groups := make([]admin.GroupInfo, 0, len(runtimes))
 		for _, rt := range runtimes {
@@ -489,7 +490,7 @@ func newClusterInfoSource(nodeID, version string, runtimes []*raftGroupRuntime) 
 			// cannot race rt.Close() clearing the field on
 			// shutdown. Same race class as the keyviz
 			// leader-term publisher (P2 review on PR #720).
-			engine := rt.snapshotEngine()
+			engine := clusterbootstrap.RuntimeCore(rt).SnapshotEngine()
 			if engine == nil {
 				continue
 			}

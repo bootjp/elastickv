@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/adapter"
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 )
@@ -225,7 +226,7 @@ func sqsAdvertisesHTFIFO() bool {
 // no-op and the outer wrapper returns immediately.
 func installSQSLeadershipRefusalAcrossGroups(
 	ctx context.Context,
-	runtimes []*raftGroupRuntime,
+	runtimes []*clusterbootstrap.GroupRuntime,
 	partitionMap map[string]noderuntime.SQSFifoQueueRouting,
 	advertisesHTFIFO bool,
 	logger *slog.Logger,

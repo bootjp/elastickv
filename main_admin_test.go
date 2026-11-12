@@ -24,6 +24,7 @@ import (
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/admin"
 	"github.com/bootjp/elastickv/internal/adminbridge"
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/nodeauth"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -374,7 +375,7 @@ func TestAdminMembersFromBootstrapEmpty(t *testing.T) {
 // unrelated) must not win over the real group listeners.
 func TestCanonicalSelfAddressPicksLowestGroup(t *testing.T) {
 	t.Parallel()
-	runtimes := []*raftGroupRuntime{
+	runtimes := []*clusterbootstrap.GroupRuntime{
 		{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 5, Address: "10.0.0.1:50055"}}},
 		{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 2, Address: "10.0.0.1:50052"}}},
 		{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 9, Address: "10.0.0.1:50059"}}},

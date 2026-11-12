@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
@@ -35,11 +36,11 @@ func TestCatalogSetupRejectsPreviouslyActivatedCommitTSFence(t *testing.T) {
 
 	engine := distribution.NewEngine()
 	engine.UpdateRoute(nil, nil, 1)
-	_, err = setupDistributionCatalog(t.Context(), []*raftGroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 1}, Store: st}}}, engine)
+	_, err = setupDistributionCatalog(t.Context(), []*clusterbootstrap.GroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 1}, Store: st}}}, engine)
 	require.ErrorContains(t, err, "active commit-ts fence")
 
 	version, err := distribution.NewCatalogStore(st).Version(t.Context())
 	require.NoError(t, err)
 	require.Zero(t, version)
-	require.NoError(t, validateNoExistingCommitTSFenceActivation(t.Context(), []*raftGroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 1}, Store: st}}}, true))
+	require.NoError(t, validateNoExistingCommitTSFenceActivation(t.Context(), []*clusterbootstrap.GroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 1}, Store: st}}}, true))
 }

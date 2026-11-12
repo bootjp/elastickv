@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/internal/noderuntime"
@@ -35,28 +36,28 @@ func TestBootstrapEncryptionDomainRejectsMissingActualWiring(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			request := bootstrapEncryptionDomainRequest(tc.enabled, tc.rotation, tc.path)
-			_, err := newBootstrapDomain(raftbootstrap.UUID{1}, []noderuntime.GroupSpec{{ID: 1}}, request)
+			_, err := clusterbootstrap.NewBootstrapDomain(raftbootstrap.UUID{1}, []noderuntime.GroupSpec{{ID: 1}}, request)
 			require.ErrorIs(t, err, encryptionwiring.ErrBootstrapEncryptionUnsupported)
-			_, err = newBootstrapDomain(raftbootstrap.UUID{1}, []noderuntime.GroupSpec{{ID: 1}}, request, encryptionwiring.WriteWiring{})
+			_, err = clusterbootstrap.NewBootstrapDomain(raftbootstrap.UUID{1}, []noderuntime.GroupSpec{{ID: 1}}, request, encryptionwiring.WriteWiring{})
 			require.ErrorIs(t, err, encryptionwiring.ErrBootstrapEncryptionUnsupported)
 		})
 	}
 }
 
-func newEncryptedDomainFixture(t *testing.T) (*bootstrapDomain, *encryptionRuntimeIOFixture) {
+func newEncryptedDomainFixture(t *testing.T) (*clusterbootstrap.BootstrapDomain, *encryptionRuntimeIOFixture) {
 	t.Helper()
 	f := newEncryptionRuntimeIOFixture(t)
 	request := bootstrapEncryptionDomainRequest(true, true, f.cfg.SidecarPath)
-	d, err := newBootstrapDomain(raftbootstrap.UUID{1}, []noderuntime.GroupSpec{{ID: 1}}, request, bootstrapEncryptionDomainWiring(f))
+	d, err := clusterbootstrap.NewBootstrapDomain(raftbootstrap.UUID{1}, []noderuntime.GroupSpec{{ID: 1}}, request, bootstrapEncryptionDomainWiring(f))
 	require.NoError(t, err)
-	t.Cleanup(d.admission.Close)
-	bootstrapIngressObserve(t, d.admission, 1)
-	ticket, err := d.admission.Ticket(1)
+	t.Cleanup(d.Admission.Close)
+	bootstrapIngressObserve(t, d.Admission, 1)
+	ticket, err := d.Admission.Ticket(1)
 	require.NoError(t, err)
 	configuration := raftbootstrap.Configuration{Index: 1, State: raftbootstrap.ConfState{Voters: []uint64{1}}, Members: []raftbootstrap.Member{{ID: 1, Address: "localhost:9000", PublicKeyDigest: raftbootstrap.Digest{1}}}}
 	digest, err := raftbootstrap.ConfigurationDigest(configuration)
 	require.NoError(t, err)
-	require.NoError(t, d.admission.PublishRecovery(ticket, raftbootstrap.PolicyRecord{Version: raftbootstrap.PolicyVersion,
+	require.NoError(t, d.Admission.PublishRecovery(ticket, raftbootstrap.PolicyRecord{Version: raftbootstrap.PolicyVersion,
 		Identity: raftbootstrap.Identity{Cluster: raftbootstrap.UUID{1}, Group: 1}, BaselineDigest: digest, Minimum: raftbootstrap.Versions{Entry: 1, Snapshot: 1, Session: 1},
 		ActivationIndex: 1, Generation: 1, LastConfigurationIndex: 1, Configuration: configuration}, 1, raftadmission.RegistrationVerified))
 	return d, f
@@ -67,70 +68,70 @@ func TestBootstrapEncryptionDomainAttachAndActualInspection(t *testing.T) {
 	plain := encryptionwiring.RegistrationEntry(2, 123, 9)
 	final, err := f.group.RaftPayloadWrap()(plain)
 	require.NoError(t, err)
-	_, err = d.inspectPayload(raftadmission.Registration, 1, final, raftbootstrap.Digest{})
+	_, err = d.InspectPayload(raftadmission.Registration, 1, final, raftbootstrap.Digest{})
 	require.ErrorIs(t, err, encryptionwiring.ErrBootstrapEncryptionProjectionPending)
-	require.NoError(t, d.attachEncryptionGroup(1, f.group))
-	proof, err := d.inspectPayload(raftadmission.Registration, 1, final, raftbootstrap.Digest{})
+	require.NoError(t, d.AttachEncryptionGroup(1, f.group))
+	proof, err := d.InspectPayload(raftadmission.Registration, 1, final, raftbootstrap.Digest{})
 	require.NoError(t, err)
 	require.Equal(t, raftbootstrap.Digest(sha256.Sum256(plain)), proof.PlaintextDigest)
 	require.NotZero(t, proof.ProjectionGeneration)
 	gen := proof.ProjectionGeneration
-	require.NoError(t, d.attachEncryptionGroup(1, f.group))
-	after, err := d.admission.EncryptionFence()
+	require.NoError(t, d.AttachEncryptionGroup(1, f.group))
+	after, err := d.Admission.EncryptionFence()
 	require.NoError(t, err)
 	require.Equal(t, gen, after, "same-group attach must not continuously invalidate")
-	_, err = d.inspectPayload(raftadmission.Registration, 1, plain, raftbootstrap.Digest{})
+	_, err = d.InspectPayload(raftadmission.Registration, 1, plain, raftbootstrap.Digest{})
 	require.Error(t, err, "active envelope may not fall back to plaintext")
 	final[len(final)-1] ^= 1
-	_, err = d.inspectPayload(raftadmission.Registration, 1, final, raftbootstrap.Digest{})
+	_, err = d.InspectPayload(raftadmission.Registration, 1, final, raftbootstrap.Digest{})
 	require.Error(t, err)
 }
 
 func TestBootstrapEncryptionDomainRecipeGrantsAreExactAndIsolated(t *testing.T) {
 	d, f := newEncryptedDomainFixture(t)
-	require.NoError(t, d.attachEncryptionGroup(1, f.group))
-	makeRecipe := func(id uint32) *bootstrapRotationRecipe {
+	require.NoError(t, d.AttachEncryptionGroup(1, f.group))
+	makeRecipe := func(id uint32) *clusterbootstrap.BootstrapRotationRecipe {
 		wrapped, err := f.cfg.Wrapper.Wrap(make([]byte, encryption.KeySize))
 		require.NoError(t, err)
-		r := &bootstrapRotationRecipe{config: bootstrapRotationRecipeConfig{NodeID: 123, StorageEpoch: 7, RaftEpoch: 9}, baseline: encryption.ActiveKeys{Storage: 1, Raft: 2}, requests: []*pb.RotateDEKRequest{
+		r := &clusterbootstrap.BootstrapRotationRecipe{Config: clusterbootstrap.BootstrapRotationRecipeConfig{NodeID: 123, StorageEpoch: 7, RaftEpoch: 9}, Baseline: encryption.ActiveKeys{Storage: 1, Raft: 2}, RequestsList: []*pb.RotateDEKRequest{
 			{Purpose: pb.RotateDEKRequest_PURPOSE_STORAGE, NewDekId: id, WrappedNewDek: wrapped, ProposerNodeId: 123, ProposerLocalEpoch: 7},
 		}}
-		require.NoError(t, r.hash())
+		require.NoError(t, r.Hash())
 		return r
 	}
 	first, second := makeRecipe(3), makeRecipe(4)
-	require.NoError(t, d.authorizeRotationRecipe(first))
-	require.NoError(t, d.authorizeRotationRecipe(first), "exact same recipe retry is idempotent")
-	plain, err := bootstrapRotationPayloadFromRequest(first.Requests()[0])
+	require.NoError(t, d.AuthorizeRotationRecipe(first))
+	require.NoError(t, d.AuthorizeRotationRecipe(first), "exact same recipe retry is idempotent")
+	plain, err := clusterbootstrap.BootstrapRotationPayloadFromRequest(first.Requests()[0])
 	require.NoError(t, err)
 	final, err := f.group.RaftPayloadWrap()(plain)
 	require.NoError(t, err)
-	_, err = d.inspectPayload(raftadmission.Rotation, 1, final, first.Digest())
+	_, err = d.InspectPayload(raftadmission.Rotation, 1, final, first.Digest())
 	require.NoError(t, err)
 	for _, digest := range []raftbootstrap.Digest{{}, second.Digest(), {9}} {
-		_, err = d.inspectPayload(raftadmission.Rotation, 1, final, digest)
+		_, err = d.InspectPayload(raftadmission.Rotation, 1, final, digest)
 		require.Error(t, err, "a grant for another recipe must not authorize this payload")
 	}
-	first.requests[0].WrappedNewDek[0] ^= 1
-	require.ErrorIs(t, d.authorizeRotationRecipe(first), errBootstrapRotationRecipe, "tampered recipe may not reuse committed digest")
-	_, err = d.inspectPayload(raftadmission.Rotation, 1, final, first.Digest())
+	first.RequestsList[0].WrappedNewDek[0] ^= 1
+	require.ErrorIs(t, d.AuthorizeRotationRecipe(first), clusterbootstrap.ErrBootstrapRotationRecipe, "tampered recipe may not reuse committed digest")
+	_, err = d.InspectPayload(raftadmission.Rotation, 1, final, first.Digest())
 	require.NoError(t, err, "stored grant is immutable and does not alias recipe bytes")
-	require.NoError(t, d.authorizeRotationRecipe(second))
-	_, err = d.inspectPayload(raftadmission.Rotation, 1, final, first.Digest())
+	require.NoError(t, d.AuthorizeRotationRecipe(second))
+	_, err = d.InspectPayload(raftadmission.Rotation, 1, final, first.Digest())
 	require.Error(t, err, "replacing current recipe drops old grants rather than accumulating them")
-	secondPlain, err := bootstrapRotationPayloadFromRequest(second.Requests()[0])
+	secondPlain, err := clusterbootstrap.BootstrapRotationPayloadFromRequest(second.Requests()[0])
 	require.NoError(t, err)
 	secondFinal, err := f.group.RaftPayloadWrap()(secondPlain)
 	require.NoError(t, err)
-	_, err = d.inspectPayload(raftadmission.Rotation, 1, secondFinal, second.Digest())
+	_, err = d.InspectPayload(raftadmission.Rotation, 1, secondFinal, second.Digest())
 	require.NoError(t, err)
-	require.Len(t, d.encryption.grants, 1)
+	require.Len(t, d.Encryption.Grants, 1)
 }
 
 func TestBootstrapEncryptionDomainPlaintextCompatibility(t *testing.T) {
-	d, err := newBootstrapDomain(raftbootstrap.UUID{1}, []noderuntime.GroupSpec{{ID: 1}}, noderuntime.BootstrapEncryptionRequest{}, encryptionwiring.WriteWiring{})
+	d, err := clusterbootstrap.NewBootstrapDomain(raftbootstrap.UUID{1}, []noderuntime.GroupSpec{{ID: 1}}, noderuntime.BootstrapEncryptionRequest{}, encryptionwiring.WriteWiring{})
 	require.NoError(t, err)
-	defer d.admission.Close()
-	require.Nil(t, d.encryption)
-	require.NoError(t, d.attachEncryptionGroup(1, nil))
+	defer d.Admission.Close()
+	require.Nil(t, d.Encryption)
+	require.NoError(t, d.AttachEncryptionGroup(1, nil))
 }

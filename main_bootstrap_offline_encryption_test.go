@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryption/kek"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
@@ -48,7 +49,7 @@ func newOfflineEncryptionAssets(t *testing.T) *offlineEncryptionTestAssets {
 	return a
 }
 
-func offlineEncryptedStore(t *testing.T, member uint64, a *offlineEncryptionTestAssets) (string, string, *bootstrapOfflineEncryption) {
+func offlineEncryptedStore(t *testing.T, member uint64, a *offlineEncryptionTestAssets) (string, string, *clusterbootstrap.BootstrapOfflineEncryption) {
 	t.Helper()
 	root, _, _ := offlineDataStoreFixture(t, true)
 	sepoch, repoch := uint16(member+2), uint16(member+4)
@@ -57,7 +58,7 @@ func offlineEncryptedStore(t *testing.T, member uint64, a *offlineEncryptionTest
 	require.NoError(t, keys.Set(8, bytes.Repeat([]byte{8}, encryption.KeySize)))
 	cipher, err := encryption.NewCipher(keys)
 	require.NoError(t, err)
-	st, err := store.NewPebbleStore(filepath.Join(root, bootstrapOfflineDataPath), store.WithEncryption(cipher, encryption.NewDeterministicNonceFactory(uint16(member), sepoch), func() (uint32, bool) { return 7, true }), store.WithStorageEnvelopeGate(func() bool { return true }))
+	st, err := store.NewPebbleStore(filepath.Join(root, clusterbootstrap.BootstrapOfflineDataPath), store.WithEncryption(cipher, encryption.NewDeterministicNonceFactory(uint16(member), sepoch), func() (uint32, bool) { return 7, true }), store.WithStorageEnvelopeGate(func() bool { return true }))
 	require.NoError(t, err)
 	require.NoError(t, st.PutAt(t.Context(), []byte("encrypted-history"), []byte("first"), 24, 0))
 	require.NoError(t, st.PutAt(t.Context(), []byte("encrypted-history"), []byte("second"), 25, 0))
@@ -85,7 +86,7 @@ func offlineEncryptedStore(t *testing.T, member uint64, a *offlineEncryptionTest
 	require.True(t, ok)
 	require.NoError(t, sink.SaveEncryptionSnapshotCheckpoint(cp))
 	require.NoError(t, st.Close())
-	enc, err := newBootstrapOfflineEncryption(bootstrapOfflineEncryptionConfig{SidecarPath: path, Wrapper: a.wrapper, MemberID: member})
+	enc, err := clusterbootstrap.NewBootstrapOfflineEncryption(clusterbootstrap.BootstrapOfflineEncryptionConfig{SidecarPath: path, Wrapper: a.wrapper, MemberID: member})
 	require.NoError(t, err)
 	return root, path, enc
 }
@@ -114,15 +115,15 @@ func TestBootstrapOfflineEncryptionTwoMembersLogicalEqual(t *testing.T) {
 	one, _, e1 := offlineEncryptedStore(t, 1, a)
 	two, _, e2 := offlineEncryptedStore(t, 2, a)
 	before := offlineDataFiles(t, one)
-	p1, err := bootstrapOfflineDataStoreProbe(t.Context(), one, e1)
+	p1, err := clusterbootstrap.BootstrapOfflineDataStoreProbe(t.Context(), one, e1)
 	require.NoError(t, err)
-	p2, err := bootstrapOfflineDataStoreProbe(t.Context(), two, e2)
+	p2, err := clusterbootstrap.BootstrapOfflineDataStoreProbe(t.Context(), two, e2)
 	require.NoError(t, err)
 	require.Equal(t, p1.DataDigest, p2.DataDigest, "local epoch differs but checkpoint excludes it; complete common registry remains included")
 	require.True(t, p1.EncryptionContextRequired)
 	require.Equal(t, uint64(6), p1.RaftEnvelopeCutoverIndex)
 	require.Equal(t, before, offlineDataFiles(t, one))
-	_, err = bootstrapOfflineDataStoreProbe(t.Context(), one)
+	_, err = clusterbootstrap.BootstrapOfflineDataStoreProbe(t.Context(), one)
 	require.Error(t, err, "no automatic encrypted-prefix mode selection")
 }
 
@@ -130,14 +131,14 @@ func TestBootstrapOfflineEncryptionPrepareRestartPreservesCiphertext(t *testing.
 	// Not parallel: store.VerifyBootstrapBaselinePhysicalEquality calls Error() on a closed pebble iterator, whose pooled allocation another test's pebble DB may be reusing.
 	a := newOfflineEncryptionAssets(t)
 	root, path, enc := offlineEncryptedStore(t, 1, a)
-	proof, err := bootstrapOfflineDataStoreProbe(t.Context(), root, enc)
+	proof, err := clusterbootstrap.BootstrapOfflineDataStoreProbe(t.Context(), root, enc)
 	require.NoError(t, err)
 	m, prepared := signedOfflineEncryptedPreparation(t, proof)
 	backup := offlineDataBackup(t, root)
 	before := offlineDataFiles(t, backup)
 	sidecarBefore, err := os.ReadFile(path)
 	require.NoError(t, err)
-	callbacks, err := bootstrapOfflineDataPreparation(prepared, enc)
+	callbacks, err := clusterbootstrap.BootstrapOfflineDataPreparation(prepared, enc)
 	require.NoError(t, err)
 	c := etcd.BaselinePreparationContext{DataDir: root, BackupDir: backup, Manifest: m}
 	require.NoError(t, callbacks.StagePreparation(t.Context(), c))
@@ -145,9 +146,9 @@ func TestBootstrapOfflineEncryptionPrepareRestartPreservesCiphertext(t *testing.
 	require.NoError(t, err)
 	require.Equal(t, proof.DataDigest, staged.Baseline.DataDigest)
 	frozen := offlineDataFiles(t, root)
-	restartedContext, err := newBootstrapOfflineEncryption(bootstrapOfflineEncryptionConfig{SidecarPath: path, Wrapper: a.wrapper, MemberID: 1})
+	restartedContext, err := clusterbootstrap.NewBootstrapOfflineEncryption(clusterbootstrap.BootstrapOfflineEncryptionConfig{SidecarPath: path, Wrapper: a.wrapper, MemberID: 1})
 	require.NoError(t, err)
-	restarted, err := bootstrapOfflineDataPreparation(prepared, restartedContext)
+	restarted, err := clusterbootstrap.BootstrapOfflineDataPreparation(prepared, restartedContext)
 	require.NoError(t, err)
 	require.NoError(t, restarted.StagePreparation(t.Context(), c))
 	again, err := restarted.VerifyPreparedStore(t.Context(), c)
@@ -166,7 +167,7 @@ func TestBootstrapOfflineEncryptionWrongKEKMissingKeyAndEpochDrift(t *testing.T)
 	root, path, enc := offlineEncryptedStore(t, 1, a)
 	before := offlineDataFiles(t, root)
 	wrong := newOfflineEncryptionAssets(t)
-	_, err := newBootstrapOfflineEncryption(bootstrapOfflineEncryptionConfig{SidecarPath: path, Wrapper: wrong.wrapper, MemberID: 1})
+	_, err := clusterbootstrap.NewBootstrapOfflineEncryption(clusterbootstrap.BootstrapOfflineEncryptionConfig{SidecarPath: path, Wrapper: wrong.wrapper, MemberID: 1})
 	require.Error(t, err)
 	sc, err := encryption.ReadSidecar(path)
 	require.NoError(t, err)
@@ -174,11 +175,11 @@ func TestBootstrapOfflineEncryptionWrongKEKMissingKeyAndEpochDrift(t *testing.T)
 	key.LocalEpoch++
 	sc.Keys["7"] = key
 	require.NoError(t, encryption.WriteSidecar(path, sc))
-	_, err = bootstrapOfflineDataStoreProbe(t.Context(), root, enc)
+	_, err = clusterbootstrap.BootstrapOfflineDataStoreProbe(t.Context(), root, enc)
 	require.Error(t, err, "frozen context detects sidecar changes even when checkpoint intentionally excludes epochs")
-	changed, err := newBootstrapOfflineEncryption(bootstrapOfflineEncryptionConfig{SidecarPath: path, Wrapper: a.wrapper, MemberID: 1})
+	changed, err := clusterbootstrap.NewBootstrapOfflineEncryption(clusterbootstrap.BootstrapOfflineEncryptionConfig{SidecarPath: path, Wrapper: a.wrapper, MemberID: 1})
 	require.NoError(t, err)
-	_, err = bootstrapOfflineDataStoreProbe(t.Context(), root, changed)
+	_, err = clusterbootstrap.BootstrapOfflineDataStoreProbe(t.Context(), root, changed)
 	require.Error(t, err, "actual registry rejects an unregistered local epoch")
 	delete(sc.Keys, "8")
 	// The production writer correctly refuses this invalid fixture; write its
@@ -186,7 +187,7 @@ func TestBootstrapOfflineEncryptionWrongKEKMissingKeyAndEpochDrift(t *testing.T)
 	data, err := json.Marshal(sc)
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(path, data, 0o600))
-	_, err = newBootstrapOfflineEncryption(bootstrapOfflineEncryptionConfig{SidecarPath: path, Wrapper: a.wrapper, MemberID: 1})
+	_, err = clusterbootstrap.NewBootstrapOfflineEncryption(clusterbootstrap.BootstrapOfflineEncryptionConfig{SidecarPath: path, Wrapper: a.wrapper, MemberID: 1})
 	require.Error(t, err)
 	require.Equal(t, before, offlineDataFiles(t, root))
 }
@@ -195,7 +196,7 @@ func TestBootstrapOfflineEncryptionTamperedExpiredValueFailsReadOnly(t *testing.
 	t.Parallel()
 	a := newOfflineEncryptionAssets(t)
 	root, _, enc := offlineEncryptedStore(t, 1, a)
-	require.NoError(t, bootstrapOfflineWithData(t.Context(), root, false, func(db *pebble.DB) error {
+	require.NoError(t, clusterbootstrap.BootstrapOfflineWithData(t.Context(), root, false, func(db *pebble.DB) error {
 		it, err := db.NewIter(nil)
 		if err != nil {
 			return err
@@ -211,7 +212,7 @@ func TestBootstrapOfflineEncryptionTamperedExpiredValueFailsReadOnly(t *testing.
 		return context.Canceled
 	}))
 	before := offlineDataFiles(t, root)
-	_, err := bootstrapOfflineDataStoreProbe(t.Context(), root, enc)
+	_, err := clusterbootstrap.BootstrapOfflineDataStoreProbe(t.Context(), root, enc)
 	require.Error(t, err)
 	require.Equal(t, before, offlineDataFiles(t, root))
 }
@@ -224,15 +225,15 @@ func TestBootstrapOfflineEncryptionNativeSnapshotValidation(t *testing.T) {
 	stream.WriteString("EKVTHLC2")
 	stream.Write(binary.BigEndian.AppendUint16(nil, 64))
 	stream.Write(binary.BigEndian.AppendUint64(nil, 100))
-	stream.Write(binary.BigEndian.AppendUint64(nil, enc.cutover))
+	stream.Write(binary.BigEndian.AppendUint64(nil, enc.Cutover))
 	stream.WriteString("EKVENCP1")
-	stream.Write(binary.BigEndian.AppendUint64(nil, enc.checkpoint.Index))
-	stream.Write(enc.checkpoint.State[:])
-	p, err := bootstrapOfflineDataStoreProbe(t.Context(), root, enc)
+	stream.Write(binary.BigEndian.AppendUint64(nil, enc.Checkpoint.Index))
+	stream.Write(enc.Checkpoint.State[:])
+	p, err := clusterbootstrap.BootstrapOfflineDataStoreProbe(t.Context(), root, enc)
 	require.NoError(t, err)
 	stream.WriteString("EKVPBBL1")
 	stream.Write(binary.LittleEndian.AppendUint64(nil, p.Watermark))
-	require.NoError(t, bootstrapOfflineWithData(t.Context(), root, true, func(db *pebble.DB) error {
+	require.NoError(t, clusterbootstrap.BootstrapOfflineWithData(t.Context(), root, true, func(db *pebble.DB) error {
 		it, err := db.NewIter(nil)
 		if err != nil {
 			return err
@@ -253,8 +254,8 @@ func TestBootstrapOfflineEncryptionNativeSnapshotValidation(t *testing.T) {
 	require.Error(t, enc.NativeCrypto().ValidateSnapshot(t.Context(), 10, bytes.NewReader(bad)))
 	// A self-consistent header AND raw checkpoint is not sufficient at the
 	// same encryption-entry index: it must match the independently pinned state.
-	rawCheckpoint := binary.BigEndian.AppendUint64(nil, enc.checkpoint.Index)
-	rawCheckpoint = append(rawCheckpoint, enc.checkpoint.State[:]...)
+	rawCheckpoint := binary.BigEndian.AppendUint64(nil, enc.Checkpoint.Index)
+	rawCheckpoint = append(rawCheckpoint, enc.Checkpoint.State[:]...)
 	consistentTamper := bytes.Clone(stream.Bytes())
 	occurrences := 0
 	for start := 0; start < len(consistentTamper); {
@@ -276,24 +277,24 @@ func TestBootstrapOfflineEncryptionNativeSnapshotValidation(t *testing.T) {
 
 func TestBootstrapOfflineEncryptionSnapshotHeaderBoundaries(t *testing.T) {
 	t.Parallel()
-	e := &bootstrapOfflineEncryption{checkpoint: encryption.SnapshotCheckpoint{Index: 10, State: [32]byte{1}}, cutover: 6}
+	e := &clusterbootstrap.BootstrapOfflineEncryption{Checkpoint: encryption.SnapshotCheckpoint{Index: 10, State: [32]byte{1}}, Cutover: 6}
 	for _, tc := range []struct {
 		name           string
 		index, cutover uint64
 		checkpoint     encryption.SnapshotCheckpoint
 		valid          bool
 	}{
-		{"current matching", 10, 6, e.checkpoint, true},
+		{"current matching", 10, 6, e.Checkpoint, true},
 		{"current state mismatch", 10, 6, encryption.SnapshotCheckpoint{Index: 10, State: [32]byte{2}}, false},
 		{"historical checkpoint allowed", 8, 6, encryption.SnapshotCheckpoint{Index: 7, State: [32]byte{2}}, true},
 		{"before cutover remains plaintext", 5, 0, encryption.SnapshotCheckpoint{Index: 4, State: [32]byte{2}}, true},
 		{"future cutover beyond snapshot", 5, 6, encryption.SnapshotCheckpoint{Index: 4}, false},
 		{"cutover beyond checkpoint", 8, 6, encryption.SnapshotCheckpoint{Index: 5}, false},
 		{"missing cutover at boundary", 6, 0, encryption.SnapshotCheckpoint{Index: 6}, false},
-		{"checkpoint beyond snapshot", 8, 6, e.checkpoint, false},
+		{"checkpoint beyond snapshot", 8, 6, e.Checkpoint, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			err := e.validateSnapshotHeader(tc.index, tc.cutover, tc.checkpoint)
+			err := e.ValidateSnapshotHeader(tc.index, tc.cutover, tc.checkpoint)
 			if tc.valid {
 				require.NoError(t, err)
 			} else {

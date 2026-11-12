@@ -5,6 +5,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/internal/noderuntime"
@@ -49,8 +50,8 @@ func (e *encryptionRuntimeIOTestEngine) ProposeAdmin(ctx context.Context, p []by
 
 type encryptionRuntimeIOFixture struct {
 	*bootstrapInstalledFixture
-	io     *bootstrapEncryptionRuntimeIO
-	cfg    bootstrapEncryptionRuntimeIOConfig
+	io     *clusterbootstrap.BootstrapEncryptionRuntimeIO
+	cfg    clusterbootstrap.BootstrapEncryptionRuntimeIOConfig
 	engine *encryptionRuntimeIOTestEngine
 }
 
@@ -67,11 +68,11 @@ func newEncryptionRuntimeIOFixture(t *testing.T) *encryptionRuntimeIOFixture {
 	engine := &encryptionRuntimeIOTestEngine{}
 	f.group.Engine = engine
 	_ = kv.NewLeaderProxyForShardGroup(f.group)
-	domain := bootstrapIngressFixture(t).domain
+	domain := bootstrapIngressFixture(t).Domain
 	w := encryptionwiring.WriteWiring{Cache: encryption.NewStateCache(), Cipher: f.runtime.Cipher, RaftEnvelope: f.runtime, Epoch: 7, RaftEpoch: 9}
-	rt := &raftGroupRuntime{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 1}, Engine: engine, Store: f.in.LocalStore}, bootstrapDomain: domain}
-	cfg := bootstrapEncryptionRuntimeIOConfig{DefaultRuntime: rt, Group: f.group, Wiring: w, SidecarPath: f.in.SidecarPath, Wrapper: encryptionRuntimeIOTestKEK{}, Domain: domain, NodeID: 123, RotationRequested: true}
-	io, err := newBootstrapEncryptionRuntimeIO(cfg)
+	rt := &clusterbootstrap.GroupRuntime{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 1}, Engine: engine, Store: f.in.LocalStore}, BootstrapDomain: domain}
+	cfg := clusterbootstrap.BootstrapEncryptionRuntimeIOConfig{DefaultRuntime: rt, Group: f.group, Wiring: w, SidecarPath: f.in.SidecarPath, Wrapper: encryptionRuntimeIOTestKEK{}, Domain: domain, NodeID: 123, RotationRequested: true}
+	io, err := clusterbootstrap.NewBootstrapEncryptionRuntimeIO(cfg)
 	require.NoError(t, err)
 	return &encryptionRuntimeIOFixture{bootstrapInstalledFixture: f, io: io, cfg: cfg, engine: engine}
 }
@@ -85,10 +86,10 @@ func TestBootstrapEncryptionRuntimeIOObserveDoesNotMutate(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, before, after)
 	require.Equal(t, encryptionwiring.BootstrapRotationRequestedUnproven, after.Rotation)
-	gen, err := f.cfg.Domain.admission.EncryptionFence()
+	gen, err := f.cfg.Domain.Admission.EncryptionFence()
 	require.NoError(t, err)
 	f.cfg.Wiring.Cache.MarkRegistered(1)
-	changed, err := f.cfg.Domain.admission.EncryptionFence()
+	changed, err := f.cfg.Domain.Admission.EncryptionFence()
 	require.NoError(t, err)
 	require.NotEqual(t, gen, changed, "constructor must bind storage async mutation hooks")
 }
@@ -139,7 +140,7 @@ func TestBootstrapEncryptionRuntimeIOPayloadUsesActualPendingWrapper(t *testing.
 	f.persist(t)
 	_, err := f.io.Observe(t.Context())
 	require.ErrorIs(t, err, encryptionwiring.ErrBootstrapEncryptionProjectionPending)
-	gen, err := f.cfg.Domain.admission.EncryptionFence()
+	gen, err := f.cfg.Domain.Admission.EncryptionFence()
 	require.NoError(t, err)
 	p, err := f.io.PayloadProjection(1, gen)
 	require.NoError(t, err)
@@ -147,11 +148,11 @@ func TestBootstrapEncryptionRuntimeIOPayloadUsesActualPendingWrapper(t *testing.
 	plain := encryptionwiring.RegistrationEntry(2, 123, 9)
 	encoded, err := f.group.RaftPayloadWrap()(plain)
 	require.NoError(t, err)
-	decoded, err := p.plaintext(encoded)
+	decoded, err := p.Plaintext(encoded)
 	require.NoError(t, err)
 	require.Equal(t, plain, decoded)
 	f.group.SetRaftPayloadWrap(nil)
-	gen, err = f.cfg.Domain.admission.EncryptionFence()
+	gen, err = f.cfg.Domain.Admission.EncryptionFence()
 	require.NoError(t, err)
 	_, err = f.io.PayloadProjection(1, gen)
 	require.ErrorIs(t, err, encryptionwiring.ErrBootstrapEncryptionProjectionPending)
@@ -180,11 +181,11 @@ func TestBootstrapEncryptionRuntimeIOCancellationAndBinding(t *testing.T) {
 	require.ErrorIs(t, err, context.Canceled)
 	bad := f.cfg
 	bad.NodeID = 124
-	_, err = newBootstrapEncryptionRuntimeIO(bad)
+	_, err = clusterbootstrap.NewBootstrapEncryptionRuntimeIO(bad)
 	require.ErrorIs(t, err, encryptionwiring.ErrBootstrapEncryptionUnsupported)
 	bad = f.cfg
 	bad.Group = &kv.ShardGroup{Engine: f.engine, Store: f.cfg.Group.Store}
-	_, err = newBootstrapEncryptionRuntimeIO(bad)
+	_, err = clusterbootstrap.NewBootstrapEncryptionRuntimeIO(bad)
 	require.ErrorIs(t, err, encryptionwiring.ErrBootstrapEncryptionUnsupported)
 }
 
@@ -213,14 +214,14 @@ func TestBootstrapEncryptionRuntimeIORejectsStaleInstallWithoutOverwriting(t *te
 func TestBootstrapEncryptionRuntimeIOPayloadRejectsStaleGenerationAndNonce(t *testing.T) {
 	t.Parallel()
 	f := newEncryptionRuntimeIOFixture(t)
-	gen, err := f.cfg.Domain.admission.EncryptionFence()
+	gen, err := f.cfg.Domain.Admission.EncryptionFence()
 	require.NoError(t, err)
 	_, err = f.io.PayloadProjection(2, gen)
-	require.ErrorIs(t, err, errBootstrapPayloadProjection)
+	require.ErrorIs(t, err, clusterbootstrap.ErrBootstrapPayloadProjection)
 	f.runtime.Registration.MarkRegistered(2, 9)
 	_, err = f.io.PayloadProjection(1, gen)
-	require.ErrorIs(t, err, errBootstrapPayloadProjection)
-	gen, err = f.cfg.Domain.admission.EncryptionFence()
+	require.ErrorIs(t, err, clusterbootstrap.ErrBootstrapPayloadProjection)
+	gen, err = f.cfg.Domain.Admission.EncryptionFence()
 	require.NoError(t, err)
 	f.runtime.Mu.Lock()
 	f.runtime.NonceFactory = encryption.NewDeterministicNonceFactory(123, 10)
@@ -234,8 +235,8 @@ func TestBootstrapEncryptionRuntimeIORecipeOrderRepairsLaterRaftPurpose(t *testi
 	f := newEncryptionRuntimeIOFixture(t)
 	f.group.SetRaftPayloadWrap(nil)
 	config := f.io.RecipeConfig(func(context.Context) (uint64, error) { return 40, nil }, func(ctx context.Context) error { return ctx.Err() })
-	r := &bootstrapRotationRecipe{config: config, baseline: f.sidecar.Active}
-	require.NoError(t, r.verifyActive(t.Context(), f.sidecar), "storage verification must reach the later raft repair")
+	r := &clusterbootstrap.BootstrapRotationRecipe{Config: config, Baseline: f.sidecar.Active}
+	require.NoError(t, r.VerifyActive(t.Context(), f.sidecar), "storage verification must reach the later raft repair")
 	_, err := f.io.Observe(t.Context())
 	require.NoError(t, err)
 }

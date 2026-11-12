@@ -7,6 +7,7 @@ import (
 
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/nodeauth"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -46,7 +47,7 @@ func TestMigrationOwnershipProviderWiringRequiresAppliedConfiguration(t *testing
 	server := adapter.NewDistributionServer(routes, nil,
 		adapter.WithSplitMigrationGroupClientFactory(adapter.NewSplitMigrationGroupGRPCClientFactory(adapter.SplitMigrationGroupLeaderResolver(groups), &cache, t.Name())),
 		adapter.WithSplitMigrationVoterFactory(adapter.NewSplitMigrationGRPCVoterFactory(groups, &cache, t.Name())),
-		migrationOwnershipRefreshOption(groups, &raftGroupRuntime{GroupRuntime: &noderuntime.GroupRuntime{Engine: engine}}, &cache, t.Name(), true),
+		migrationOwnershipRefreshOption(groups, &clusterbootstrap.GroupRuntime{GroupRuntime: &noderuntime.GroupRuntime{Engine: engine}}, &cache, t.Name(), true),
 		adapter.MigrationPartitionRuntimeOption(shards, groups, &cache, t.Name(), true))
 	require.True(t, kv.MigrationRequestAdmissionReady(tx))
 	require.True(t, shards.MigrationReadAdmissionReady(7))
@@ -164,7 +165,7 @@ func TestMigrationOwnershipRuntimeRequiresInstalledHooksFlagsAndAppliedConfigura
 	server := adapter.NewDistributionServer(routes, nil,
 		adapter.WithSplitMigrationGroupClientFactory(adapter.NewSplitMigrationGroupGRPCClientFactory(adapter.SplitMigrationGroupLeaderResolver(groups), &cache, t.Name())),
 		adapter.WithSplitMigrationVoterFactory(adapter.NewSplitMigrationGRPCVoterFactory(groups, &cache, t.Name())),
-		migrationOwnershipRefreshOption(groups, &raftGroupRuntime{GroupRuntime: &noderuntime.GroupRuntime{Engine: engine}}, &cache, t.Name(), true),
+		migrationOwnershipRefreshOption(groups, &clusterbootstrap.GroupRuntime{GroupRuntime: &noderuntime.GroupRuntime{Engine: engine}}, &cache, t.Name(), true),
 		adapter.MigrationPartitionRuntimeOption(shards, groups, &cache, t.Name(), true))
 	reader, ok := engine.(raftengine.AppliedConfigurationReader)
 	require.True(t, ok)

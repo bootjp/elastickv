@@ -3,6 +3,7 @@ package main
 import (
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/bootjp/elastickv/kv"
@@ -20,16 +21,16 @@ func TestPreparedBootstrapIdentityPinsMemberAndCompleteConfiguration(t *testing.
 	require.NoError(t, err)
 	prepared := kv.PreparedBootstrapActivation{Probe: raftbootstrap.BaselineProbe{BaselineContext: m.BaselineContext, Evidence: m.Members[0]}, ManifestDigest: manifestDigest}
 	identity := etcd.WALIdentity{Identity: m.Identity, NodeID: prepared.Probe.Evidence.MemberID, BaselineDigest: digest}
-	require.NoError(t, validatePreparedBootstrapIdentity(prepared, identity))
+	require.NoError(t, clusterbootstrap.ValidatePreparedBootstrapIdentity(prepared, identity))
 	wrongMember := identity
 	wrongMember.NodeID++
-	require.Error(t, validatePreparedBootstrapIdentity(prepared, wrongMember))
+	require.Error(t, clusterbootstrap.ValidatePreparedBootstrapIdentity(prepared, wrongMember))
 	wrongGroup := identity
 	wrongGroup.Identity.Group++
-	require.Error(t, validatePreparedBootstrapIdentity(prepared, wrongGroup))
+	require.Error(t, clusterbootstrap.ValidatePreparedBootstrapIdentity(prepared, wrongGroup))
 	wrongConfig := identity
 	wrongConfig.BaselineDigest[0]++
-	require.Error(t, validatePreparedBootstrapIdentity(prepared, wrongConfig))
+	require.Error(t, clusterbootstrap.ValidatePreparedBootstrapIdentity(prepared, wrongConfig))
 }
 
 func TestRecoveredPolicyMirrorsActivationWithoutDowngrade(t *testing.T) {
@@ -46,14 +47,14 @@ func TestRecoveredPolicyMirrorsActivationWithoutDowngrade(t *testing.T) {
 	policy := raftbootstrap.PolicyRecord{Version: raftbootstrap.PolicyVersion, Identity: m.Identity,
 		BaselineDigest: digest, Minimum: m.Minimum, ActivationIndex: m.CommitIndex + 1, Generation: 1,
 		LastConfigurationIndex: m.Configuration.Index, Configuration: m.Configuration}
-	require.NoError(t, mirrorRecoveredBootstrapFloor(files, policy))
+	require.NoError(t, clusterbootstrap.MirrorRecoveredBootstrapFloor(files, policy))
 	got, present, err := files.LoadIntent()
 	require.NoError(t, err)
 	require.True(t, present)
 	require.Equal(t, raftbootstrap.Floor{ActivationIndex: policy.ActivationIndex, Generation: policy.Generation}, got.Floor)
 	regressed := policy
 	regressed.ActivationIndex = 0
-	require.Error(t, mirrorRecoveredBootstrapFloor(files, regressed))
+	require.Error(t, clusterbootstrap.MirrorRecoveredBootstrapFloor(files, regressed))
 	unchanged, _, err := files.LoadIntent()
 	require.NoError(t, err)
 	require.Equal(t, got, unchanged)

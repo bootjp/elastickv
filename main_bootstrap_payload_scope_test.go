@@ -3,6 +3,7 @@ package main
 import (
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/raftadmission"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/bootjp/elastickv/kv"
@@ -30,12 +31,12 @@ func TestBootstrapPayloadScopeRejectsForeignNativeTarget(t *testing.T) {
 				require.True(t, matched)
 				witness = command.Witness
 			}
-			validator := bootstrapPayloadValidator(witness.Cluster)
+			validator := clusterbootstrap.BootstrapPayloadValidator(witness.Cluster)
 			require.NoError(t, validator(lane, witness.Group, payload))
 			require.ErrorIs(t, validator(lane, witness.Group+1, payload), raftadmission.ErrClosed)
 			otherCluster := witness.Cluster
 			otherCluster[0]++
-			require.ErrorIs(t, bootstrapPayloadValidator(otherCluster)(lane, witness.Group, payload), raftadmission.ErrClosed)
+			require.ErrorIs(t, clusterbootstrap.BootstrapPayloadValidator(otherCluster)(lane, witness.Group, payload), raftadmission.ErrClosed)
 			require.Error(t, validator(raftadmission.Data, witness.Group, payload))
 		})
 	}
