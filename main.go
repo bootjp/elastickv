@@ -92,7 +92,7 @@ func onlyContextCanceled(err error) bool {
 }
 
 func run(flags *serverFlags) error {
-	cfg, engineType, bootstrapCfg, bootstrap, err := resolveNetworkRuntimeInputs(flags.backup, flags.nodeAuth)
+	cfg, engineType, bootstrapCfg, bootstrap, err := resolveNetworkRuntimeInputs(flags.backup, flags.nodeAuth, flags.listeners)
 	if err != nil {
 		return err
 	}
@@ -355,6 +355,7 @@ func run(flags *serverFlags) error {
 		adminHTTP:                       flags.adminHTTP,
 		backup:                          flags.backup,
 		nodeAuth:                        flags.nodeAuth,
+		listeners:                       flags.listeners,
 	}, health, handoff)
 }
 

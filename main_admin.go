@@ -147,6 +147,7 @@ func prepareAdminFromFlags(
 	ctx context.Context,
 	lc *net.ListenConfig,
 	f adminHTTPFlags,
+	s3CredentialsFile string,
 	runtimes []*raftGroupRuntime,
 	dynamoServer *adapter.DynamoDBServer,
 	s3Server *adapter.S3Server,
@@ -159,7 +160,7 @@ func prepareAdminFromFlags(
 	if !f.enabled {
 		return nil, nil
 	}
-	staticCreds, err := loadS3StaticCredentials(*s3CredsFile)
+	staticCreds, err := loadS3StaticCredentials(s3CredentialsFile)
 	if err != nil {
 		return nil, errors.Wrapf(err, "load static credentials for admin listener")
 	}

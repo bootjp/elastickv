@@ -66,7 +66,7 @@ func bootstrapNetworkPrepareRedis(t *testing.T, process *multiEnablementProcess,
 	tracker := kv.NewActiveTimestampTracker()
 	t.Cleanup(tracker.Close)
 	server, compactor, listener, err := prepareRedisServer(process.ctx, &net.ListenConfig{}, "127.0.0.1:0", process.shards,
-		newStartupGatedCoordinator(process.coordinate, process.gate), leaders, nil, registry, tracker, nil)
+		newStartupGatedCoordinator(process.coordinate, process.gate), leaders, nil, registry, tracker, nil, 0)
 	require.NoError(t, err)
 	t.Cleanup(server.Stop)
 	client := redis.NewClient(&redis.Options{Addr: listener.Addr().String(), Protocol: 2, DisableIdentity: true, MaxRetries: -1, ContextTimeoutEnabled: true})

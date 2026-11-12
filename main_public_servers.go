@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"log/slog"
 	"net"
 	"net/http"
@@ -13,7 +14,46 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-func prepareRedisServer(ctx context.Context, lc *net.ListenConfig, redisAddr string, shardStore *kv.ShardStore, coordinate kv.Coordinator, leaderRedis map[string]string, relay *adapter.RedisPubSubRelay, metricsRegistry *monitoring.Registry, readTracker *kv.ActiveTimestampTracker, redisApplyObserver *adapter.RedisApplyObserver) (*adapter.RedisServer, *adapter.DeltaCompactor, net.Listener, error) {
+// listenerFlags configures the client-facing protocol listeners (Redis,
+// DynamoDB, S3, SQS) and the metrics and pprof endpoints. The node's own
+// gRPC/Raft address (--address) belongs to the Raft topology, not here.
+type listenerFlags struct {
+	redisAddress          string
+	redisLuaMaxIdleStates int
+	dynamoAddress         string
+	s3Address             string
+	s3Region              string
+	s3CredentialsFile     string
+	s3PathStyleOnly       bool
+	sqsAddress            string
+	sqsPublicEndpoint     string
+	sqsRegion             string
+	sqsCredentialsFile    string
+	metricsAddress        string
+	metricsToken          string
+	pprofAddress          string
+	pprofToken            string
+}
+
+func (f *listenerFlags) register(fs *flag.FlagSet) {
+	fs.StringVar(&f.redisAddress, "redisAddress", "localhost:6379", "TCP host+port for redis")
+	fs.IntVar(&f.redisLuaMaxIdleStates, "redisLuaMaxIdleStates", adapter.DefaultLuaPoolMaxIdle, "Maximum number of idle *lua.LState instances retained by the Redis Lua VM pool. Each state holds ~200 KiB; lower values reduce steady-state memory at the cost of more allocations under burst, higher values absorb bursts at the cost of memory floor. Non-positive values clamp to the default.")
+	fs.StringVar(&f.dynamoAddress, "dynamoAddress", "localhost:8000", "TCP host+port for DynamoDB-compatible API")
+	fs.StringVar(&f.s3Address, "s3Address", "", "TCP host+port for S3-compatible API; empty to disable")
+	fs.StringVar(&f.s3Region, "s3Region", "us-east-1", "S3 signing region")
+	fs.StringVar(&f.s3CredentialsFile, "s3CredentialsFile", "", "Path to a JSON file containing static S3 credentials")
+	fs.BoolVar(&f.s3PathStyleOnly, "s3PathStyleOnly", true, "Only accept path-style S3 requests")
+	fs.StringVar(&f.sqsAddress, "sqsAddress", "", "TCP host+port for SQS-compatible API; empty to disable")
+	fs.StringVar(&f.sqsPublicEndpoint, "sqsPublicEndpoint", "", "Public HTTP(S) origin used in SQS queue URLs behind a proxy; empty derives URLs from the request")
+	fs.StringVar(&f.sqsRegion, "sqsRegion", "us-east-1", "SQS signing region")
+	fs.StringVar(&f.sqsCredentialsFile, "sqsCredentialsFile", "", "Path to a JSON file containing static SQS credentials")
+	fs.StringVar(&f.metricsAddress, "metricsAddress", "localhost:9090", "TCP host+port for Prometheus metrics")
+	fs.StringVar(&f.metricsToken, "metricsToken", "", "Bearer token for Prometheus metrics; required for non-loopback metricsAddress")
+	fs.StringVar(&f.pprofAddress, "pprofAddress", "localhost:6060", "TCP host+port for pprof debug endpoints; empty to disable")
+	fs.StringVar(&f.pprofToken, "pprofToken", "", "Bearer token for pprof; required for non-loopback pprofAddress")
+}
+
+func prepareRedisServer(ctx context.Context, lc *net.ListenConfig, redisAddr string, shardStore *kv.ShardStore, coordinate kv.Coordinator, leaderRedis map[string]string, relay *adapter.RedisPubSubRelay, metricsRegistry *monitoring.Registry, readTracker *kv.ActiveTimestampTracker, redisApplyObserver *adapter.RedisApplyObserver, luaPoolMaxIdle int) (*adapter.RedisServer, *adapter.DeltaCompactor, net.Listener, error) {
 	redisL, err := lc.Listen(ctx, "tcp", redisAddr)
 	if err != nil {
 		return nil, nil, nil, errors.Wrapf(err, "failed to listen on %s", redisAddr)
@@ -25,7 +65,7 @@ func prepareRedisServer(ctx context.Context, lc *net.ListenConfig, redisAddr str
 		adapter.WithRedisRequestObserver(metricsRegistry.RedisObserver()),
 		adapter.WithLuaObserver(metricsRegistry.LuaObserver()),
 		adapter.WithLuaFastPathObserver(metricsRegistry.LuaFastPathObserver()),
-		adapter.WithLuaPoolMaxIdle(*redisLuaMaxIdleStates),
+		adapter.WithLuaPoolMaxIdle(luaPoolMaxIdle),
 		adapter.WithRedisApplyObserver(redisApplyObserver),
 	}
 	if deltaCompactor != nil {
