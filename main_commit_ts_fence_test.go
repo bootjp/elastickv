@@ -21,7 +21,7 @@ func TestRuntimeInputsRejectCommitTSFenceBeforeOpeningStores(t *testing.T) {
 	*commitTSFence = true
 	t.Cleanup(func() { *commitTSFence = previous })
 
-	_, _, _, _, err := resolveValidatedRuntimeInputs(defaultFlags[backupFlags]())
+	_, _, _, _, err := resolveValidatedRuntimeInputs(defaultFlags[backupFlags](), defaultFlags[listenerFlags]())
 	require.ErrorContains(t, err, "requires protected Raft catalog bootstrap")
 }
 

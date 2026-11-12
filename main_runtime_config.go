@@ -15,11 +15,11 @@ import (
 
 var errInvalidLiveBackupConfig = errors.New("invalid live backup configuration")
 
-func resolveValidatedRuntimeInputs(backup backupFlags) (runtimeConfig, raftEngineType, raftBootstrapConfig, bool, error) {
+func resolveValidatedRuntimeInputs(backup backupFlags, listeners listenerFlags) (runtimeConfig, raftEngineType, raftBootstrapConfig, bool, error) {
 	if err := validateCommitTSFenceStartup(*commitTSFence, *raftBootstrapPeerConfigDir != ""); err != nil {
 		return runtimeConfig{}, "", raftBootstrapConfig{}, false, err
 	}
-	cfg, engineType, bootstrapCfg, bootstrap, err := resolveRuntimeInputs()
+	cfg, engineType, bootstrapCfg, bootstrap, err := resolveRuntimeInputs(listeners)
 	if err != nil {
 		return runtimeConfig{}, "", raftBootstrapConfig{}, false, err
 	}
@@ -59,7 +59,7 @@ func validateLiveBackupConfig(
 	}
 }
 
-func resolveRuntimeInputs() (runtimeConfig, raftEngineType, raftBootstrapConfig, bool, error) {
+func resolveRuntimeInputs(listeners listenerFlags) (runtimeConfig, raftEngineType, raftBootstrapConfig, bool, error) {
 	if *raftId == "" {
 		return runtimeConfig{}, "", raftBootstrapConfig{}, false, errors.New("flag --raftId is required")
 	}
@@ -69,7 +69,7 @@ func resolveRuntimeInputs() (runtimeConfig, raftEngineType, raftBootstrapConfig,
 		return runtimeConfig{}, "", raftBootstrapConfig{}, false, err
 	}
 
-	cfg, err := parseRuntimeConfig(*myAddr, *redisAddr, *s3Addr, *dynamoAddr, *sqsAddr, *raftGroups, *shardRanges, *raftRedisMap, *raftS3Map, *raftDynamoMap, *raftSqsMap, *sqsFifoPartitionMap)
+	cfg, err := parseRuntimeConfig(*myAddr, listeners.redisAddress, listeners.s3Address, listeners.dynamoAddress, listeners.sqsAddress, *raftGroups, *shardRanges, *raftRedisMap, *raftS3Map, *raftDynamoMap, *raftSqsMap, *sqsFifoPartitionMap)
 	if err != nil {
 		return runtimeConfig{}, "", raftBootstrapConfig{}, false, err
 	}

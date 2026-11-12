@@ -76,6 +76,7 @@ type serversInput struct {
 	adminHTTP     adminHTTPFlags
 	backup        backupFlags
 	nodeAuth      nodeAuthFlags
+	listeners     listenerFlags
 }
 
 // startServersAfterStartupRotation wires up the AdminServer, starts the
@@ -124,7 +125,8 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 		routeEngine:        in.cfg.engine,
 		adminServer:        adminServer,
 		adminGRPCOpts:      adminGRPCOpts,
-		redisAddress:       *redisAddr,
+		redisAddress:       in.listeners.redisAddress,
+		redisLuaMaxIdle:    in.listeners.redisLuaMaxIdleStates,
 		leaderRedis:        in.cfg.leaderRedis,
 		pubsubRelay:        adapter.NewRedisPubSubRelay(),
 		readTracker:        in.readTracker,
@@ -134,18 +136,18 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 		defaultGroupID:     in.cfg.defaultGroup,
 		redisApplyObserver: in.redisApplyObserver,
 		s3BlobBackfiller:   in.s3BlobBackfiller,
-		dynamoAddress:      *dynamoAddr,
+		dynamoAddress:      in.listeners.dynamoAddress,
 		leaderDynamo:       in.cfg.leaderDynamo,
-		s3Address:          *s3Addr,
+		s3Address:          in.listeners.s3Address,
 		leaderS3:           in.cfg.leaderS3,
-		s3Region:           *s3Region,
-		s3CredsFile:        *s3CredsFile,
-		s3PathStyleOnly:    *s3PathStyleOnly,
-		sqsAddress:         *sqsAddr,
+		s3Region:           in.listeners.s3Region,
+		s3CredsFile:        in.listeners.s3CredentialsFile,
+		s3PathStyleOnly:    in.listeners.s3PathStyleOnly,
+		sqsAddress:         in.listeners.sqsAddress,
 		leaderSQS:          in.cfg.leaderSQS,
-		sqsRegion:          *sqsRegion,
-		sqsCredsFile:       *sqsCredsFile,
-		sqsPublicEndpoint:  *sqsPublicEndpoint,
+		sqsRegion:          in.listeners.sqsRegion,
+		sqsCredsFile:       in.listeners.sqsCredentialsFile,
+		sqsPublicEndpoint:  in.listeners.sqsPublicEndpoint,
 		// sqsPartitionResolver is rebuilt from the same config map
 		// the coordinator's WithPartitionResolver consumes (line
 		// ~328) so the SQS server's CreateQueue capability gate
@@ -159,10 +161,10 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 		// partition counter observer. nil when --metricsAddress is
 		// empty (the adapter then no-ops the observe call).
 		sqsPartitionObserver:            in.metricsRegistry.SQSPartitionObserver(),
-		metricsAddress:                  *metricsAddr,
-		metricsToken:                    *metricsToken,
-		pprofAddress:                    *pprofAddr,
-		pprofToken:                      *pprofToken,
+		metricsAddress:                  in.listeners.metricsAddress,
+		metricsToken:                    in.listeners.metricsToken,
+		pprofAddress:                    in.listeners.pprofAddress,
+		pprofToken:                      in.listeners.pprofToken,
 		metricsRegistry:                 in.metricsRegistry,
 		roleStore:                       roleStore,
 		encryptionConfChangeInterceptor: in.encryptionConfChangeInterceptor,
@@ -198,7 +200,7 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 		Nodes:   parseCSV(in.adminHTTP.keyvizFanoutNodes),
 		Timeout: in.adminHTTP.keyvizFanoutTimeout,
 	}
-	adminHTTP, err := prepareAdminFromFlags(in.ctx, in.lc, in.adminHTTP, in.runtimes, runner.dynamoServer, runner.s3Server, runner.sqsServer, runner.coordinate, connCache, in.keyvizSampler, fanoutCfg)
+	adminHTTP, err := prepareAdminFromFlags(in.ctx, in.lc, in.adminHTTP, in.listeners.s3CredentialsFile, in.runtimes, runner.dynamoServer, runner.s3Server, runner.sqsServer, runner.coordinate, connCache, in.keyvizSampler, fanoutCfg)
 	if err != nil {
 		return runner.startupFailure(err)
 	}
@@ -238,6 +240,7 @@ type runtimeServerRunner struct {
 	adminServer                     *adapter.AdminServer
 	adminGRPCOpts                   adminGRPCInterceptors
 	redisAddress                    string
+	redisLuaMaxIdle                 int
 	leaderRedis                     map[string]string
 	pubsubRelay                     *adapter.RedisPubSubRelay
 	readTracker                     *kv.ActiveTimestampTracker
@@ -466,7 +469,7 @@ func (r *runtimeServerRunner) preparePublicServices() error {
 	redisServer, redisCompactor, redisListener, err := prepareRedisServer(
 		r.ctx, r.lc, r.redisAddress, r.shardStore, r.coordinate,
 		r.leaderRedis, r.pubsubRelay, r.metricsRegistry, r.readTracker,
-		r.redisApplyObserver,
+		r.redisApplyObserver, r.redisLuaMaxIdle,
 	)
 	if err != nil {
 		return err
