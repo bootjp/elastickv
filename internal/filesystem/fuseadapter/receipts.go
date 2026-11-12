@@ -65,7 +65,7 @@ func (a *Adapter) verifyReceipts(ctx context.Context, inode uint64) ([]filesyste
 	}
 	for _, id := range receipts {
 		if err := verifier.VerifyOperationReceipt(ctx, id); err != nil && !errors.Is(err, filesystem.ErrOperationRetired) {
-			return nil, err
+			return nil, errors.Wrap(err, "verify filesystem operation receipt")
 		}
 	}
 	return receipts, nil
