@@ -206,6 +206,19 @@ Tests move with the code they cover.
   build version; `main` keeps only `snapshotOffloadGroups`, which reduces
   the runtimes to offload groups with their leadership callbacks. The
   package is restricted to binaries in the import guard.
+- M4, split migration: the capability gate and peer probe, the promotion /
+  migration / group / voter / apply-member client factories, the
+  membership and namespace admission gates, the ownership-refresh runner,
+  the readiness gate and the gRPC coverage interceptor moved to
+  `internal/splitmigration`. `main` keeps the glue that needs the runtime
+  or protected-bootstrap types: the capability peer source over runtimes,
+  the Internal protocol options, the ownership-refresh root resolver and
+  option, the membership interceptor (which adds the prepare-evidence
+  gate and bootstrap dial options), and the two `nodeAuthFlags` readiness
+  methods. The namespace gate takes the node-ID derivation as a function
+  so the package does not import the concrete etcd backend, and the
+  uncached peer dial helper moved to `kv.NewGRPCClient` next to the
+  connection cache that already dials the same way.
 
 ## Decisions
 
