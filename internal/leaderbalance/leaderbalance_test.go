@@ -1,4 +1,4 @@
-package main
+package leaderbalance
 
 import (
 	"fmt"
@@ -102,7 +102,7 @@ func TestLeaderBalanceConfigNormalizeClampsOneCountThreshold(t *testing.T) {
 	t.Parallel()
 	cfg := leaderBalanceConfig{imbalanceThreshold: 1}
 	cfg.normalize()
-	require.Equal(t, defaultLeaderBalanceImbalanceThreshold, cfg.imbalanceThreshold)
+	require.Equal(t, DefaultImbalanceThreshold, cfg.imbalanceThreshold)
 }
 
 func TestLeaderBalanceTargetCandidatesRequireObjectiveImprovement(t *testing.T) {

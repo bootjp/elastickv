@@ -356,7 +356,7 @@ func serveStartedRuntime(waitRotateOnStartup startupRotationWaiter, in serversIn
 	handoff.arm(in.ctx, in.eg, in.runtimes, func(ctx context.Context) error {
 		return stopLeaderBalanceForShutdown(ctx, stopBalance, balanceDone)
 	})
-	startLeaderBalanceScheduler(
+	startLeaderBalance(
 		balanceCtx,
 		in.eg,
 		in.runtimes,
