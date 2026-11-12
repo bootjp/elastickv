@@ -120,7 +120,7 @@ var ErrAdminForbidden = errors.New("dynamodb admin: principal lacks required rol
 
 // IsAdminTableAlreadyExists reports whether err is the adapter's
 // "table already exists" failure (ResourceInUseException). The
-// bridge in main_admin.go uses this to map the adapter's internal
+// bridge in internal/adminbridge uses this to map the adapter's internal
 // error vocabulary onto admin's HTTP-facing sentinels without
 // importing the package-private dynamoAPIError type.
 func IsAdminTableAlreadyExists(err error) bool {

@@ -13,6 +13,7 @@ import (
 
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/internal/admin"
+	"github.com/bootjp/elastickv/internal/adminbridge"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/kv"
@@ -106,7 +107,7 @@ func prepareAdminFromFlags(
 	coordinate kv.Coordinator,
 	connCache *kv.GRPCConnCache,
 	keyvizSampler *keyviz.MemSampler,
-	keyvizFanoutCfg keyVizFanoutConfig,
+	keyvizFanoutCfg adminbridge.KeyVizFanoutConfig,
 ) (*preparedAdminServer, error) {
 	if !*adminEnabled {
 		return nil, nil
@@ -147,9 +148,9 @@ func prepareAdminFromFlags(
 		fullAccessKeys:            parseCSV(*adminFullAccessKeys),
 	}
 	clusterSrc := newClusterInfoSource(*raftId, buildVersion(), runtimes)
-	tablesSrc := newDynamoTablesSource(dynamoServer)
-	bucketsSrc := newBucketsSource(s3Server)
-	queuesSrc := newSqsQueuesSource(sqsServer)
+	tablesSrc := adminbridge.NewDynamoTablesSource(dynamoServer)
+	bucketsSrc := adminbridge.NewBucketsSource(s3Server)
+	queuesSrc := adminbridge.NewSQSQueuesSource(sqsServer)
 	forwarder, err := buildAdminLeaderForwarder(coordinate, connCache, *raftId)
 	if err != nil {
 		return nil, errors.Wrap(err, "build admin leader forwarder")
@@ -224,54 +225,6 @@ func buildAdminLeaderForwarder(coordinate kv.Coordinator, connCache *kv.GRPCConn
 	return buildLeaderForwarder(coordinate, connCache, nodeID)
 }
 
-// convertAdminPrincipal mirrors admin.AuthPrincipal onto the
-// adapter's parallel struct. Both packages keep the principal type
-// independent so the adapter stays free of internal/admin
-// dependencies, but the role / access-key fields are deliberately
-// 1:1 — any drift is a wiring bug, not a feature.
-func convertAdminPrincipal(p admin.AuthPrincipal) adapter.AdminPrincipal {
-	role := adapter.AdminRoleReadOnly
-	if p.Role.AllowsWrite() {
-		role = adapter.AdminRoleFull
-	}
-	return adapter.AdminPrincipal{AccessKey: p.AccessKey, Role: role}
-}
-
-// isLeaderChurnError reports whether err looks like one of the
-// transient leader sentinels the kv coordinator and adapter
-// internals emit during a leadership change. The suffix set mirrors the
-// closed list in kv.leaderErrorPhrases and also includes availability
-// sentinels that intentionally bypass coordinator retry, such as the
-// leader-proxy circuit.
-//
-// Phrase matching uses HasSuffix (not Contains) on the standard
-// canonical strings because every kv-internal sentinel emits the
-// phrase at the END of its error chain (e.g.,
-// "raft engine: not leader", "dispatch failed: leader not found").
-// A user-supplied string that happens to contain a leader phrase
-// in the MIDDLE of an unrelated error message therefore does not
-// false-positive — P2 review on PR #634 flagged the original
-// strings.Contains form for misclassifying validation messages
-// like "conflicting attribute type for <user-name>" when the
-// name itself was "not leader".
-func isLeaderChurnError(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, kv.ErrLeaderNotFound) ||
-		errors.Is(err, kv.ErrLeaderProxyCircuitOpen) ||
-		errors.Is(err, adapter.ErrNotLeader) ||
-		errors.Is(err, adapter.ErrLeaderNotFound) {
-		return true
-	}
-	msg := err.Error()
-	return strings.HasSuffix(msg, "not leader") ||
-		strings.HasSuffix(msg, "leader not found") ||
-		strings.HasSuffix(msg, "leadership lost") ||
-		strings.HasSuffix(msg, "leadership transfer in progress") ||
-		strings.HasSuffix(msg, "leader proxy circuit open")
-}
-
 // buildAdminConfig translates flag values into an admin.Config.
 func buildAdminConfig(in adminListenerConfig) admin.Config {
 	return admin.Config{
@@ -308,7 +261,7 @@ func prepareAdminServer(
 	forwarder admin.LeaderForwarder,
 	leaderProbe admin.LeaderProbe,
 	keyvizSampler *keyviz.MemSampler,
-	keyvizFanoutCfg keyVizFanoutConfig,
+	keyvizFanoutCfg adminbridge.KeyVizFanoutConfig,
 	version string,
 ) (*preparedAdminServer, error) {
 	adminCfg := buildAdminConfig(cfg)
@@ -379,7 +332,7 @@ func checkAdminConfig(adminCfg *admin.Config, cluster admin.ClusterInfoSource) (
 	return true, nil
 }
 
-func buildAdminHTTPServer(adminCfg *admin.Config, creds map[string]string, cluster admin.ClusterInfoSource, tables admin.TablesSource, buckets admin.BucketsSource, queues admin.QueuesSource, forwarder admin.LeaderForwarder, leaderProbe admin.LeaderProbe, keyvizSampler *keyviz.MemSampler, keyvizFanoutCfg keyVizFanoutConfig) (*admin.Server, error) {
+func buildAdminHTTPServer(adminCfg *admin.Config, creds map[string]string, cluster admin.ClusterInfoSource, tables admin.TablesSource, buckets admin.BucketsSource, queues admin.QueuesSource, forwarder admin.LeaderForwarder, leaderProbe admin.LeaderProbe, keyvizSampler *keyviz.MemSampler, keyvizFanoutCfg adminbridge.KeyVizFanoutConfig) (*admin.Server, error) {
 	primaryKeys, err := adminCfg.DecodedSigningKeys()
 	if err != nil {
 		return nil, errors.Wrap(err, "decode admin signing keys")
@@ -406,10 +359,10 @@ func buildAdminHTTPServer(adminCfg *admin.Config, creds map[string]string, clust
 		Buckets:             buckets,
 		Queues:              queues,
 		Forwarder:           forwarder,
-		KeyViz:              keyvizSourceFromSampler(keyvizSampler),
-		KeyVizFanout:        buildKeyVizFanout(adminCfg.Listen, keyvizFanoutCfg),
-		KeyVizHotKeys:       keyvizHotKeysSourceFromSampler(keyvizSampler),
-		KeyVizHotKeysFanout: buildKeyVizHotKeysFanout(adminCfg.Listen, keyvizFanoutCfg),
+		KeyViz:              adminbridge.KeyVizSource(keyvizSampler),
+		KeyVizFanout:        adminbridge.NewKeyVizFanout(adminCfg.Listen, keyvizFanoutCfg),
+		KeyVizHotKeys:       adminbridge.KeyVizHotKeysSource(keyvizSampler),
+		KeyVizHotKeysFanout: adminbridge.NewKeyVizHotKeysFanout(adminCfg.Listen, keyvizFanoutCfg),
 		StaticFS:            staticFS,
 		LeaderProbe:         leaderProbe,
 		AuthOpts: admin.AuthServiceOpts{
@@ -536,4 +489,18 @@ func resolveSigningKey(flagValue, filePath, envVar string) (string, error) {
 		return v, nil
 	}
 	return strings.TrimSpace(flagValue), nil
+}
+
+// parseCSV splits a flag value like "a,b,c" into a slice with empty and
+// whitespace-only entries dropped. It is not in shard_config.go because
+// admin's comma-separated list format is simpler than raft groups.
+func parseCSV(raw string) []string {
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if trim := strings.TrimSpace(p); trim != "" {
+			out = append(out, trim)
+		}
+	}
+	return out
 }

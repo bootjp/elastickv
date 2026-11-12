@@ -48,7 +48,7 @@ const (
 
 // AdminObject is the metadata projection the SPA receives on list
 // pages and on the GET-object header set. The wire shape mirrors
-// adapter.AdminObject field-for-field; the bridge in main_admin.go
+// adapter.AdminObject field-for-field; the bridge in internal/adminbridge
 // converts between the two so internal/admin stays adapter-free.
 type AdminObject struct {
 	Key          string    `json:"key"`

@@ -32,7 +32,7 @@ const adminForwardPayloadLimit = 64 << 10
 // The server is deliberately kept independent of the dynamo HTTP
 // handler: it runs in the gRPC server's goroutine pool, not in the
 // HTTP server's, and shares only the TablesSource interface (which
-// the bridge in main_admin.go already implements for the local
+// the bridge in internal/adminbridge already implements for the local
 // adapter).
 type ForwardServer struct {
 	pb.UnimplementedAdminForwardServer

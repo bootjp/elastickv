@@ -52,7 +52,7 @@ const (
 // AdminAttributeValue mirrors the adapter package's wire shape
 // (S/N/B/BOOL/NULL scalars, SS/NS/BS sets, L/M containers).
 // Defined in this package so the admin HTTP layer stays free of
-// the adapter dependency; the main_admin.go bridge converts
+// the adapter dependency; the internal/adminbridge bridge converts
 // between this type and adapter.AdminAttributeValue field-for-
 // field.
 // Struct tags here are the wire-shape contract. MarshalJSON
@@ -83,7 +83,7 @@ type AdminAttributeValue struct {
 //
 // Mirrors the adapter package's AdminAttributeValue.MarshalJSON
 // invariant in the same way, except this side does not enforce the
-// "exactly-one-field" kind check (the bridge in main_admin.go calls
+// "exactly-one-field" kind check (the bridge in internal/adminbridge calls
 // into the adapter, which performs that validation as part of its
 // own marshal-time depth/kind audit). Imposing the kind check here
 // too would reject legitimate responses constructed by tests where

@@ -1,4 +1,4 @@
-package main
+package adminbridge
 
 import (
 	"context"
@@ -9,11 +9,11 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-// newBucketsSource is the S3 counterpart of newDynamoTablesSource.
+// NewBucketsSource is the S3 counterpart of NewDynamoTablesSource.
 // Returns nil when s3Server is nil so a build that ships without the
 // S3 adapter (--s3Address empty) silently disables the
 // /admin/api/v1/s3/buckets routes.
-func newBucketsSource(s3Server *adapter.S3Server) admin.BucketsSource {
+func NewBucketsSource(s3Server *adapter.S3Server) admin.BucketsSource {
 	if s3Server == nil {
 		return nil
 	}

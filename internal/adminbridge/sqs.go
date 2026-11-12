@@ -1,4 +1,4 @@
-package main
+package adminbridge
 
 import (
 	"context"
@@ -9,9 +9,9 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-// newSqsQueuesSource adapts *adapter.SQSServer to admin.QueuesSource.
-// Same architectural reasoning as newDynamoTablesSource and
-// newBucketsSource: the bridge stays in this file (rather than
+// NewSQSQueuesSource adapts *adapter.SQSServer to admin.QueuesSource.
+// Same architectural reasoning as NewDynamoTablesSource and
+// NewBucketsSource: the bridge lives in this package (rather than
 // internal/admin) so the admin package stays free of the heavy
 // adapter-package dependency tree.
 //
@@ -22,7 +22,7 @@ import (
 // server without a SQS adapter wired in; an unreachable-in-prod
 // nil here would otherwise crash the admin handler chain instead
 // of cleanly omitting /admin/api/v1/sqs/* from the wire.
-func newSqsQueuesSource(sqsServer *adapter.SQSServer) admin.QueuesSource {
+func NewSQSQueuesSource(sqsServer *adapter.SQSServer) admin.QueuesSource {
 	if sqsServer == nil {
 		return nil
 	}

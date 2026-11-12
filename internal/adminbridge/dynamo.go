@@ -1,4 +1,4 @@
-package main
+package adminbridge
 
 import (
 	"context"
@@ -8,7 +8,7 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-// newDynamoTablesSource adapts *adapter.DynamoDBServer to the
+// NewDynamoTablesSource adapts *adapter.DynamoDBServer to the
 // admin.TablesSource interface. The bridge stays in this file (rather
 // than internal/admin) so the admin package stays free of the heavy
 // adapter-package dependency tree (gRPC, Raft, store).
@@ -17,7 +17,7 @@ import (
 // Tables field by leaving the dynamo paths off the wire entirely,
 // which is the right behaviour for builds that ship without the
 // Dynamo adapter.
-func newDynamoTablesSource(dynamoServer *adapter.DynamoDBServer) admin.TablesSource {
+func NewDynamoTablesSource(dynamoServer *adapter.DynamoDBServer) admin.TablesSource {
 	if dynamoServer == nil {
 		return nil
 	}

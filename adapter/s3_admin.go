@@ -180,7 +180,7 @@ func summaryFromBucketMeta(name string, meta *s3BucketMeta) AdminBucketSummary {
 }
 
 // Sentinel errors the admin write methods return so the bridge in
-// main_admin.go can translate them into admin-package vocabulary
+// internal/adminbridge can translate them into admin-package vocabulary
 // without sniffing strings. Named separately from
 // ErrAdminTableAlreadyExists / ErrAdminTableNotFound on the Dynamo
 // side so a future per-resource role / status divergence does not

@@ -1,4 +1,4 @@
-package main
+package adminbridge
 
 import (
 	"log/slog"
@@ -10,28 +10,28 @@ import (
 	"github.com/bootjp/elastickv/keyviz"
 )
 
-// keyVizFanoutConfig bundles the operator-supplied fan-out flags.
+// KeyVizFanoutConfig bundles the operator-supplied fan-out flags.
 // Empty Nodes leaves the keyviz handler in single-node mode.
-type keyVizFanoutConfig struct {
+type KeyVizFanoutConfig struct {
 	Nodes   []string
 	Timeout time.Duration
 }
 
-// keyvizSourceFromSampler boxes a *keyviz.MemSampler into the
+// KeyVizSource boxes a *keyviz.MemSampler into the
 // admin.KeyVizSource interface understood by ServerDeps. Returning a
 // nil interface (not a typed-nil) when the sampler is disabled is
 // load-bearing: the admin handler's "keyviz disabled → 503" branch
 // only fires on an interface-nil; a typed-nil *MemSampler stored as
 // a non-nil interface would silently return an empty matrix instead
 // of the explicit "feature off" signal the SPA expects.
-func keyvizSourceFromSampler(s *keyviz.MemSampler) admin.KeyVizSource {
+func KeyVizSource(s *keyviz.MemSampler) admin.KeyVizSource {
 	if s == nil {
 		return nil
 	}
 	return s
 }
 
-// keyvizHotKeysSourceFromSampler is the keyvizSourceFromSampler twin
+// KeyVizHotKeysSource is the KeyVizSource twin
 // for the per-cell hot-key drill-down handler. Returning an interface-nil
 // (not a typed-nil) when the sampler is disabled is again load-bearing:
 // the hot-keys handler's "keyviz disabled → 503" branch checks for
@@ -39,14 +39,14 @@ func keyvizSourceFromSampler(s *keyviz.MemSampler) admin.KeyVizSource {
 // interface would route the request into MemSampler methods that
 // already nil-check internally — correct but masking the explicit
 // "feature off" signal we want the SPA to render.
-func keyvizHotKeysSourceFromSampler(s *keyviz.MemSampler) admin.KeyVizHotKeysSource {
+func KeyVizHotKeysSource(s *keyviz.MemSampler) admin.KeyVizHotKeysSource {
 	if s == nil {
 		return nil
 	}
 	return s
 }
 
-// buildKeyVizFanout assembles the Phase 2-C fan-out aggregator from
+// NewKeyVizFanout assembles the Phase 2-C fan-out aggregator from
 // the operator-supplied flag values. selfListen is the local admin
 // listener address (used to filter the local node out of the peer
 // list so symmetric `--keyvizFanoutNodes=node1,node2,node3` configs
@@ -59,7 +59,7 @@ func keyvizHotKeysSourceFromSampler(s *keyviz.MemSampler) admin.KeyVizHotKeysSou
 // selfListen with the host normalised to 127.0.0.1 (operators
 // commonly bind admin to 0.0.0.0 but list 127.0.0.1 as the
 // per-host fan-out entry). Anything else is treated as a peer.
-func buildKeyVizFanout(selfListen string, cfg keyVizFanoutConfig) *admin.KeyVizFanout {
+func NewKeyVizFanout(selfListen string, cfg KeyVizFanoutConfig) *admin.KeyVizFanout {
 	if len(cfg.Nodes) == 0 {
 		return nil
 	}
@@ -80,13 +80,13 @@ func buildKeyVizFanout(selfListen string, cfg keyVizFanoutConfig) *admin.KeyVizF
 	return f.WithLogger(slog.Default().With(slog.String("component", "admin.keyviz.fanout")))
 }
 
-// buildKeyVizHotKeysFanout is the hot-keys companion of
-// buildKeyVizFanout: same peer-list reuse, same self-filter rule.
+// NewKeyVizHotKeysFanout is the hot-keys companion of
+// NewKeyVizFanout: same peer-list reuse, same self-filter rule.
 // Returns nil when no peers remain after filtering (single-node
 // hot-keys behaviour preserved). Operators get the cluster-wide
 // drill-down for free by leaving --keyvizFanoutNodes set — no
 // separate flag, matching design §6.
-func buildKeyVizHotKeysFanout(selfListen string, cfg keyVizFanoutConfig) *admin.KeyVizHotKeysFanout {
+func NewKeyVizHotKeysFanout(selfListen string, cfg KeyVizFanoutConfig) *admin.KeyVizHotKeysFanout {
 	if len(cfg.Nodes) == 0 {
 		return nil
 	}
@@ -145,18 +145,4 @@ func stripScheme(raw string) string {
 		return raw[i+3:]
 	}
 	return raw
-}
-
-// parseCSV splits a flag value like "a,b,c" into a slice with empty and
-// whitespace-only entries dropped. It is not in shard_config.go because
-// admin's comma-separated list format is simpler than raft groups.
-func parseCSV(raw string) []string {
-	parts := strings.Split(raw, ",")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		if trim := strings.TrimSpace(p); trim != "" {
-			out = append(out, trim)
-		}
-	}
-	return out
 }
