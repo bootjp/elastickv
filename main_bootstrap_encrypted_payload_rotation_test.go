@@ -11,6 +11,7 @@ import (
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryption/encryptiontest"
 	"github.com/bootjp/elastickv/internal/encryption/fsmwire"
+	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/internal/raftadmission"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -157,12 +158,12 @@ func TestBootstrapRotationRequestGrantMatchesActualAdminAndDynamicWrap(t *testin
 	require.NoError(t, err)
 	cipher := encryptiontest.NewCipher(t, bootstrapEncryptedTestKey)
 	var cutover atomic.Uint64
-	runtime, err := newRaftEnvelopeRuntime(cipher, encryptiontest.NewNonceFactory(t), 1, bootstrapEncryptedTestKey, &cutover, 7, 42, nil)
+	runtime, err := encryptionwiring.NewRaftEnvelopeRuntime(cipher, encryptiontest.NewNonceFactory(t), 1, bootstrapEncryptedTestKey, &cutover, 7, 42, nil)
 	require.NoError(t, err)
 	engine := &bootstrapEncryptedCaptureEngine{}
 	shard := &kv.ShardGroup{Engine: engine}
 	shard.Txn = kv.NewLeaderProxyForShardGroup(shard)
-	runtime.attachGroup(17, shard)
+	runtime.AttachGroup(17, shard)
 	admin := adapter.NewEncryptionAdminServer(adapter.WithEncryptionAdminProposer(shard.Proposer()), adapter.WithEncryptionAdminLeaderView(rotateStartupLeader{}))
 	_, err = admin.RotateDEK(t.Context(), request)
 	require.NoError(t, err)

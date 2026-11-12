@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/internal/encryption"
+	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/internal/raftadmission"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -85,24 +86,24 @@ func (f *rotationRuntimeFixture) role(t *testing.T, term uint64, role raftengine
 	require.NoError(t, f.a.MarkCatalogLoaded(ticket))
 }
 
-func (f *rotationRuntimeFixture) observe(ctx context.Context) (bootstrapEncryptionProjection, error) {
+func (f *rotationRuntimeFixture) observe(ctx context.Context) (encryptionwiring.BootstrapEncryptionProjection, error) {
 	if !f.wrappers.Load() {
-		return bootstrapEncryptionProjection{}, errBootstrapEncryptionProjectionPending
+		return encryptionwiring.BootstrapEncryptionProjection{}, encryptionwiring.ErrBootstrapEncryptionProjectionPending
 	}
 	sc, err := f.io.cfg.ReadSidecar()
 	if err != nil {
-		return bootstrapEncryptionProjection{}, err
+		return encryptionwiring.BootstrapEncryptionProjection{}, err
 	}
-	p := bootstrapEncryptionProjection{kind: bootstrapEncryptionObserved, rotation: bootstrapRotationRequestedUnproven, fullNodeID: 91, appliedIndex: f.io.index, installedEvidence: true}
-	p.storage = f.purpose(sc, sc.Active.Storage)
-	p.raft = f.purpose(sc, sc.Active.Raft)
+	p := encryptionwiring.BootstrapEncryptionProjection{Kind: encryptionwiring.BootstrapEncryptionObserved, Rotation: encryptionwiring.BootstrapRotationRequestedUnproven, FullNodeID: 91, AppliedIndex: f.io.index, InstalledEvidence: true}
+	p.Storage = f.purpose(sc, sc.Active.Storage)
+	p.Raft = f.purpose(sc, sc.Active.Raft)
 	return p, f.a.ValidateResult(ctx)
 }
 
-func (f *rotationRuntimeFixture) purpose(sc *encryption.Sidecar, id uint32) bootstrapEncryptionPurposeProjection {
+func (f *rotationRuntimeFixture) purpose(sc *encryption.Sidecar, id uint32) encryptionwiring.BootstrapEncryptionPurposeProjection {
 	key := sc.Keys[strconv.FormatUint(uint64(id), 10)]
-	return bootstrapEncryptionPurposeProjection{dekID: id, epoch: key.LocalEpoch, registered: true, wrapperInstalled: true, keyDigest: sha256.Sum256(key.Wrapped),
-		registry: encryption.RegistryValue{FullNodeID: 91, FirstSeenLocalEpoch: key.LocalEpoch, LastSeenLocalEpoch: key.LocalEpoch}}
+	return encryptionwiring.BootstrapEncryptionPurposeProjection{DekID: id, Epoch: key.LocalEpoch, Registered: true, WrapperInstalled: true, KeyDigest: sha256.Sum256(key.Wrapped),
+		Registry: encryption.RegistryValue{FullNodeID: 91, FirstSeenLocalEpoch: key.LocalEpoch, LastSeenLocalEpoch: key.LocalEpoch}}
 }
 
 func TestBootstrapRotationRuntimeLeaderResumesEachInvalidatedApply(t *testing.T) {
@@ -217,7 +218,7 @@ func TestBootstrapRotationRuntimePanicClosesRecoveryOwner(t *testing.T) {
 	t.Parallel()
 	f := newRotationRuntimeFixture(t, raftengine.StateFollower)
 	var captured context.Context
-	f.runtime.config.observe = func(ctx context.Context) (bootstrapEncryptionProjection, error) {
+	f.runtime.config.observe = func(ctx context.Context) (encryptionwiring.BootstrapEncryptionProjection, error) {
 		captured = ctx
 		panic("projection panic")
 	}

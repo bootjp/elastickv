@@ -1,4 +1,4 @@
-package main
+package encryptionwiring
 
 import (
 	"bytes"
@@ -19,42 +19,44 @@ import (
 
 func TestEncryptionMutatorsEnabledUsesLoadedKEKState(t *testing.T) {
 	t.Parallel()
-	f := encryptionFlags{enabled: true, sidecarPath: "/data/encryption/keys.json"}
-	require.True(t, encryptionMutatorsEnabled(f, true))
-	require.False(t, encryptionMutatorsEnabled(f, false))
-	f.enabled = false
-	require.False(t, encryptionMutatorsEnabled(f, true))
-	f.enabled = true
-	f.sidecarPath = ""
-	require.False(t, encryptionMutatorsEnabled(f, true))
+	f := Flags{Enabled: true, SidecarPath: "/data/encryption/keys.json"}
+	require.True(t, MutatorsEnabled(f, true))
+	require.False(t, MutatorsEnabled(f, false))
+	f.Enabled = false
+	require.False(t, MutatorsEnabled(f, true))
+	f.Enabled = true
+	f.SidecarPath = ""
+	require.False(t, MutatorsEnabled(f, true))
 }
 
 type failingStartupKEK struct{}
 
 func (failingStartupKEK) Wrap([]byte) ([]byte, error) { return nil, errors.New("provider unavailable") }
+
 func (failingStartupKEK) Unwrap([]byte) ([]byte, error) {
 	return nil, errors.New("provider unavailable")
 }
+
 func (failingStartupKEK) Name() string { return "failing" }
 
 func TestVerifyKEKBeforeMutators(t *testing.T) {
 	t.Parallel()
-	f := encryptionFlags{enabled: true, sidecarPath: "/data/encryption/keys.json"}
+	f := Flags{Enabled: true, SidecarPath: "/data/encryption/keys.json"}
 	require.ErrorIs(t, verifyKEKBeforeMutators(f, failingStartupKEK{}), kek.ErrKEKPreflightFailed)
 
-	f.enabled = false
+	f.Enabled = false
 	require.NoError(t, verifyKEKBeforeMutators(f, failingStartupKEK{}))
-	f.enabled = true
-	f.sidecarPath = ""
+	f.Enabled = true
+	f.SidecarPath = ""
 	require.NoError(t, verifyKEKBeforeMutators(f, failingStartupKEK{}))
 }
 
 func TestStartupKEKSourceWiringCachesGuardUnwrapThroughHydration(t *testing.T) {
 	staticKEK := bytes.Repeat([]byte{0x71}, encryption.KeySize)
-	f := encryptionFlags{
-		enabled:     true,
+	f := Flags{
+		Enabled:     true,
 		kekFile:     filepath.Join(t.TempDir(), "kek"),
-		sidecarPath: filepath.Join(t.TempDir(), encryption.SidecarFilename),
+		SidecarPath: filepath.Join(t.TempDir(), encryption.SidecarFilename),
 	}
 	require.NoError(t, os.WriteFile(f.kekFile, staticKEK, 0o600))
 
@@ -69,7 +71,7 @@ func TestStartupKEKSourceWiringCachesGuardUnwrapThroughHydration(t *testing.T) {
 			"7": {Purpose: encryption.SidecarPurposeStorage, Wrapped: wrapped},
 		},
 	}
-	require.NoError(t, encryption.WriteSidecar(f.sidecarPath, sidecar))
+	require.NoError(t, encryption.WriteSidecar(f.SidecarPath, sidecar))
 
 	observer := &countingKEKObserver{}
 	wrapper, err := loadKEKAndRunStartupGuards(f, observer)
@@ -108,9 +110,9 @@ func TestEnvKEKBootstrapCutoverSnapshotRestore(t *testing.T) {
 	dir := t.TempDir()
 	sidecarPath := dir + "/keys.json"
 	keystore := encryption.NewKeystore()
-	wiring, err := buildEncryptionWriteWiring(true, "n1", sidecarPath, wrapper, keystore, []noderuntime.GroupSpec{{ID: 1}}, nil)
+	wiring, err := BuildWriteWiring(true, "n1", sidecarPath, wrapper, keystore, []noderuntime.GroupSpec{{ID: 1}}, nil)
 	require.NoError(t, err)
-	source, err := store.NewPebbleStore(dir+"/source", wiring.pebbleOptions()...)
+	source, err := store.NewPebbleStore(dir+"/source", wiring.PebbleOptions()...)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = source.Close() })
 	registry, err := store.WriterRegistryFor(source)
@@ -120,7 +122,7 @@ func TestEnvKEKBootstrapCutoverSnapshotRestore(t *testing.T) {
 		encryption.WithKEK(wrapper),
 		encryption.WithKeystore(keystore),
 		encryption.WithSidecarPath(sidecarPath),
-		encryption.WithStateCache(wiring.cache),
+		encryption.WithStateCache(wiring.Cache),
 	)
 	require.NoError(t, err)
 
@@ -140,7 +142,7 @@ func TestEnvKEKBootstrapCutoverSnapshotRestore(t *testing.T) {
 		Wrapped:              []byte{},
 		ProposerRegistration: fsmwire.RegistrationPayload{DEKID: e2eStorageDEKID, FullNodeID: e2eNodeID, LocalEpoch: 1},
 	}))
-	wiring.cache.MarkRegistered(e2eStorageDEKID)
+	wiring.Cache.MarkRegistered(e2eStorageDEKID)
 	require.NoError(t, source.PutAt(context.Background(), []byte("env-kek"), []byte("secret"), 100, 0))
 
 	snapshot, err := source.Snapshot()
@@ -150,7 +152,7 @@ func TestEnvKEKBootstrapCutoverSnapshotRestore(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, snapshot.Close())
 
-	target, err := store.NewPebbleStore(dir+"/target", wiring.pebbleOptions()...)
+	target, err := store.NewPebbleStore(dir+"/target", wiring.PebbleOptions()...)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = target.Close() })
 	require.NoError(t, target.Restore(bytes.NewReader(snapshotBytes.Bytes())))
@@ -163,18 +165,18 @@ func TestEncryptionFlagsBootstrapRequest(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
 		name  string
-		flags encryptionFlags
+		flags Flags
 		want  noderuntime.BootstrapEncryptionRequest
 	}{
-		{"off", encryptionFlags{}, noderuntime.BootstrapEncryptionRequest{}},
-		{"kek only", encryptionFlags{kekFile: "kek"}, noderuntime.BootstrapEncryptionRequest{}},
-		{"enabled", encryptionFlags{enabled: true}, noderuntime.BootstrapEncryptionRequest{Configured: true}},
-		{"sidecar", encryptionFlags{sidecarPath: "keys.json"}, noderuntime.BootstrapEncryptionRequest{Configured: true}},
-		{"rotation", encryptionFlags{rotateOnStartup: true}, noderuntime.BootstrapEncryptionRequest{RotateOnStartup: true}},
+		{"off", Flags{}, noderuntime.BootstrapEncryptionRequest{}},
+		{"kek only", Flags{kekFile: "kek"}, noderuntime.BootstrapEncryptionRequest{}},
+		{"enabled", Flags{Enabled: true}, noderuntime.BootstrapEncryptionRequest{Configured: true}},
+		{"sidecar", Flags{SidecarPath: "keys.json"}, noderuntime.BootstrapEncryptionRequest{Configured: true}},
+		{"rotation", Flags{RotateOnStartup: true}, noderuntime.BootstrapEncryptionRequest{RotateOnStartup: true}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			got := tc.flags.bootstrapRequest()
+			got := tc.flags.BootstrapRequest()
 			require.Equal(t, tc.want, got)
 			require.Equal(t, tc.want != noderuntime.BootstrapEncryptionRequest{}, got.Requested())
 		})

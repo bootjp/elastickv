@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"math"
 
+	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/peersession"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
@@ -43,7 +44,7 @@ func bootstrapRegistrationRequest(binding peersession.RequestBinding, payload an
 	if err != nil {
 		return peersession.Message{}, peersession.ErrFormat
 	}
-	message.Declaration = sha256.Sum256(registrationEntry(req.GetDekId(), writer.GetFullNodeId(), epoch))
+	message.Declaration = sha256.Sum256(encryptionwiring.RegistrationEntry(req.GetDekId(), writer.GetFullNodeId(), epoch))
 	return message, nil
 }
 

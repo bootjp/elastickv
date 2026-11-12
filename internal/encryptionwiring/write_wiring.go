@@ -1,4 +1,4 @@
-package main
+package encryptionwiring
 
 import (
 	"errors"
@@ -18,15 +18,15 @@ type raftEnvelopeConfigurableFactory interface {
 	SetRaftEnvelope(*encryption.Cipher, etcdraftengine.RaftCutoverIndex)
 }
 
-func configureRaftEnvelopeFactory(factory raftengine.Factory, w encryptionWriteWiring) {
-	if factory == nil || w.raftEnvelope == nil {
+func ConfigureRaftEnvelopeFactory(factory raftengine.Factory, w WriteWiring) {
+	if factory == nil || w.RaftEnvelope == nil {
 		return
 	}
 	configurable, ok := factory.(raftEnvelopeConfigurableFactory)
 	if !ok {
 		return
 	}
-	configurable.SetRaftEnvelope(w.cipher, w.raftEnvelope.engineCutoverIndex)
+	configurable.SetRaftEnvelope(w.Cipher, w.RaftEnvelope.engineCutoverIndex)
 }
 
 func validateRaftEnvelopeStartupScope(cutoverIdx uint64, groups []noderuntime.GroupSpec) error {
@@ -41,22 +41,22 @@ func validateRaftEnvelopeStartupScope(cutoverIdx uint64, groups []noderuntime.Gr
 		len(groups))
 }
 
-func encryptionApplierOptionsFor(kekWrapper encryption.KEKUnwrapper, keystore *encryption.Keystore, sidecarPath string, w encryptionWriteWiring) []encryption.ApplierOption {
+func ApplierOptionsFor(kekWrapper encryption.KEKUnwrapper, keystore *encryption.Keystore, sidecarPath string, w WriteWiring) []encryption.ApplierOption {
 	opts := append(applierOptionsFor(kekWrapper, keystore, sidecarPath),
-		encryption.WithStateCache(w.cache),
-		encryption.WithLocalEpoch(w.epoch),
-		encryption.WithRaftLocalEpoch(w.raftEpoch))
-	if w.raftEnvelope != nil {
-		opts = append(opts, encryption.WithRaftCutoverWrapInstaller(w.raftEnvelope.installFromApply))
+		encryption.WithStateCache(w.Cache),
+		encryption.WithLocalEpoch(w.Epoch),
+		encryption.WithRaftLocalEpoch(w.RaftEpoch))
+	if w.RaftEnvelope != nil {
+		opts = append(opts, encryption.WithRaftCutoverWrapInstaller(w.RaftEnvelope.installFromApply))
 	}
 	return opts
 }
 
-func (w encryptionWriteWiring) attachRaftEnvelopeGroup(groupID uint64, sg *kv.ShardGroup) {
-	if w.raftEnvelope == nil {
+func (w WriteWiring) AttachRaftEnvelopeGroup(groupID uint64, sg *kv.ShardGroup) {
+	if w.RaftEnvelope == nil {
 		return
 	}
-	w.raftEnvelope.attachGroup(groupID, sg)
+	w.RaftEnvelope.AttachGroup(groupID, sg)
 }
 
 // encryptionWriteWiring bundles the Stage 6D-6c storage-envelope
@@ -75,79 +75,79 @@ func (w encryptionWriteWiring) attachRaftEnvelopeGroup(groupID uint64, sg *kv.Sh
 //     shard's PebbleStore; the gate still keeps writes cleartext
 //     until a Bootstrap + EnableStorageEnvelope has flipped the cache.
 //
-// encryptionConfigured reports whether this process actually has encryption
+// EncryptionConfigured reports whether this process actually has encryption
 // wired: buildEncryptionWriteWiring only builds a cipher when encryption is
 // enabled AND a KEK wrapper AND a sidecar path are all present. The cache is
 // always non-nil, so it cannot be used for this test.
-func (w encryptionWriteWiring) encryptionConfigured() bool {
-	return w.cipher != nil
+func (w WriteWiring) EncryptionConfigured() bool {
+	return w.Cipher != nil
 }
 
-type encryptionWriteWiring struct {
-	cache        *encryption.StateCache
-	cipher       *encryption.Cipher
-	nonceFactory store.NonceFactory
+type WriteWiring struct {
+	Cache        *encryption.StateCache
+	Cipher       *encryption.Cipher
+	NonceFactory store.NonceFactory
 	// storageEnvelopeV2Active stays false until the live membership fan-out
 	// confirms that every voter and learner can read compressed V2 envelopes.
 	storageEnvelopeV2Active *atomic.Bool
-	// epoch is the §4.1 local_epoch this process load pinned into the
+	// Epoch is the §4.1 local_epoch this process load pinned into the
 	// nonce factory (the value BumpLocalEpoch advanced to, or 0 in the
 	// pre-bootstrap case). Stage 7a's process-start registration
-	// proposes RegisterEncryptionWriter with this epoch so the writer
+	// proposes RegisterEncryptionWriter with this Epoch so the writer
 	// registry's last_seen advances in lockstep with the nonces this
 	// load emits. Zero when encryption is off or pre-bootstrap.
-	epoch uint16
-	// raftEpoch is the §4.2 local_epoch this process load pins into
+	Epoch uint16
+	// RaftEpoch is the §4.2 local_epoch this process load pins into
 	// the raft-envelope nonce factory. It is independent from epoch
 	// because storage and raft envelopes use separate DEKs and
 	// write_count streams.
-	raftEpoch uint16
-	// raftNonceFactory emits §4.2 raft-envelope nonces. nil means
+	RaftEpoch uint16
+	// RaftNonceFactory emits §4.2 raft-envelope nonces. nil means
 	// raft envelope wrapping is not configured for this process.
-	raftNonceFactory store.NonceFactory
+	RaftNonceFactory store.NonceFactory
 	// raftCutoverIndex is the process-shared source for the etcd
 	// pre-apply unwrap hook. A zero value means inactive; the
 	// callback exposed to etcd maps it to the inert max-uint sentinel.
 	raftCutoverIndex *atomic.Uint64
-	// raftEnvelope coordinates wrap publication across shard groups
+	// RaftEnvelope coordinates wrap publication across shard groups
 	// and supplies the applier installer hook.
-	raftEnvelope *raftEnvelopeRuntime
-	// raftRegistration gates raft-envelope wrapping until this load has
+	RaftEnvelope *RaftEnvelopeRuntime
+	// RaftRegistration gates raft-envelope wrapping until this load has
 	// committed a writer-registry row for (active raft DEK, raftEpoch).
-	raftRegistration *raftRegistrationGate
+	RaftRegistration *RaftRegistrationGate
 	// encryptionObserver receives the §9.2 storage-envelope telemetry.
 	// nil on a node without a metrics registry; the store treats that
 	// as "no telemetry" rather than as an error.
 	encryptionObserver store.EncryptionObserver
 }
 
-// withDefaultedCache returns a copy of w with a non-nil StateCache.
+// WithDefaultedCache returns a copy of w with a non-nil StateCache.
 // Zero-value wirings (the encryption-off test harnesses pass
 // encryptionWriteWiring{}) carry a nil cache; defaulting it here keeps
 // the "cache is always non-nil" contract that buildShardGroups'
 // WithStateCache wiring depends on, without adding a branch to
 // buildShardGroups itself.
-func (w encryptionWriteWiring) withDefaultedCache() encryptionWriteWiring {
-	if w.cache == nil {
-		w.cache = encryption.NewStateCache()
+func (w WriteWiring) WithDefaultedCache() WriteWiring {
+	if w.Cache == nil {
+		w.Cache = encryption.NewStateCache()
 	}
 	return w
 }
 
-// pebbleOptions returns the PebbleStore options for the storage
+// PebbleOptions returns the PebbleStore options for the storage
 // envelope. When the cipher is nil (encryption not enabled) it
 // returns no options, leaving the store in cleartext mode. When set,
 // it wires WithEncryption (cipher + nonce factory + active-key gate)
 // and WithStorageEnvelopeGate (the §7.1 cutover gate); both read the
 // shared cache so runtime Bootstrap / cutover applies take effect
 // without a restart.
-func (w encryptionWriteWiring) pebbleOptions() []store.PebbleStoreOption {
-	if w.cipher == nil || w.nonceFactory == nil {
+func (w WriteWiring) PebbleOptions() []store.PebbleStoreOption {
+	if w.Cipher == nil || w.NonceFactory == nil {
 		return nil
 	}
 	return []store.PebbleStoreOption{
-		store.WithEncryption(w.cipher, w.nonceFactory, w.cache.ActiveStorageKeyID),
-		store.WithStorageEnvelopeGate(w.cache.StorageEnvelopeActive),
+		store.WithEncryption(w.Cipher, w.NonceFactory, w.Cache.ActiveStorageKeyID),
+		store.WithStorageEnvelopeGate(w.Cache.StorageEnvelopeActive),
 		store.WithStorageEnvelopeV2Gate(w.storageEnvelopeV2WritesActive),
 		// Stage 7a-2 §4.1 direct-path registration gate: the store
 		// refuses to emit an encrypted envelope on a self-originated
@@ -157,7 +157,7 @@ func (w encryptionWriteWiring) pebbleOptions() []store.PebbleStoreOption {
 		// the registration paths MarkRegistered. Design §2.3 forbids any
 		// fail-OPEN fallback, so unregistered loads are gated — see the
 		// Registered() doc for the deferred runtime-registration cases.
-		store.WithStorageRegistrationGate(w.cache.Registered),
+		store.WithStorageRegistrationGate(w.Cache.Registered),
 		// §9.2 telemetry. Metrics-only: nothing in the storage
 		// path reads it back, so a nil observer changes no bytes
 		// and no apply outcome.
@@ -165,17 +165,17 @@ func (w encryptionWriteWiring) pebbleOptions() []store.PebbleStoreOption {
 	}
 }
 
-func (w encryptionWriteWiring) storageEnvelopeV2WritesActive() bool {
+func (w WriteWiring) storageEnvelopeV2WritesActive() bool {
 	return w.storageEnvelopeV2Active != nil && w.storageEnvelopeV2Active.Load()
 }
 
-func (w encryptionWriteWiring) activateStorageEnvelopeV2Writes() {
+func (w WriteWiring) activateStorageEnvelopeV2Writes() {
 	if w.storageEnvelopeV2Active != nil {
 		w.storageEnvelopeV2Active.Store(true)
 	}
 }
 
-// buildEncryptionWriteWiring assembles the storage-envelope write-path
+// BuildWriteWiring assembles the storage-envelope write-path
 // wiring. It always returns a wiring with a non-nil StateCache (the
 // per-shard appliers need it regardless of encryption state); the
 // cipher + nonce factory are populated only when encryption is enabled
@@ -198,8 +198,8 @@ func (w encryptionWriteWiring) activateStorageEnvelopeV2Writes() {
 // future runtime Bootstrap assigns to the freshly minted DEK, which is that
 // DEK's first-ever use and therefore nonce-safe; a later restart will then
 // take the bump path.
-func buildEncryptionWriteWiring(encryptionEnabled bool, raftID, sidecarPath string, kekWrapper encryption.KEKUnwrapper, keystore *encryption.Keystore, groups []noderuntime.GroupSpec, encryptionObserver store.EncryptionObserver) (encryptionWriteWiring, error) {
-	w := encryptionWriteWiring{cache: encryption.NewStateCache(), encryptionObserver: encryptionObserver}
+func BuildWriteWiring(encryptionEnabled bool, raftID, sidecarPath string, kekWrapper encryption.KEKUnwrapper, keystore *encryption.Keystore, groups []noderuntime.GroupSpec, encryptionObserver store.EncryptionObserver) (WriteWiring, error) {
+	w := WriteWiring{Cache: encryption.NewStateCache(), encryptionObserver: encryptionObserver}
 	if !encryptionEnabled || kekWrapper == nil || sidecarPath == "" {
 		return w, nil
 	}
@@ -219,7 +219,7 @@ func buildEncryptionWriteWiring(encryptionEnabled bool, raftID, sidecarPath stri
 	if err := validateRaftEnvelopeStartupState(cutoverIdx, activeRaftDEKID, groups); err != nil {
 		return w, err
 	}
-	epoch, err := prepareStorageNonceEpoch(sidecarPath, kekWrapper, keystore, w.cache)
+	epoch, err := prepareStorageNonceEpoch(sidecarPath, kekWrapper, keystore, w.Cache)
 	if err != nil {
 		return w, err
 	}
@@ -229,19 +229,19 @@ func buildEncryptionWriteWiring(encryptionEnabled bool, raftID, sidecarPath stri
 	}
 	fullNodeID := etcdraftengine.DeriveNodeID(raftID)
 	nodeID := encryption.NodeID16(fullNodeID)
-	w.cipher = cipher
+	w.Cipher = cipher
 	w.storageEnvelopeV2Active = &atomic.Bool{}
-	w.epoch = epoch
-	w.raftEpoch = raftEpoch
-	w.nonceFactory = encryption.NewDeterministicNonceFactory(nodeID, epoch)
-	w.raftNonceFactory = encryption.NewDeterministicNonceFactory(nodeID, raftEpoch)
+	w.Epoch = epoch
+	w.RaftEpoch = raftEpoch
+	w.NonceFactory = encryption.NewDeterministicNonceFactory(nodeID, epoch)
+	w.RaftNonceFactory = encryption.NewDeterministicNonceFactory(nodeID, raftEpoch)
 	w.raftCutoverIndex = &atomic.Uint64{}
-	w.raftRegistration = &raftRegistrationGate{}
-	runtime, err := newRaftEnvelopeRuntime(cipher, w.raftNonceFactory, cutoverIdx, activeRaftDEKID, w.raftCutoverIndex, w.raftEpoch, fullNodeID, w.raftRegistration)
+	w.RaftRegistration = &RaftRegistrationGate{}
+	runtime, err := NewRaftEnvelopeRuntime(cipher, w.RaftNonceFactory, cutoverIdx, activeRaftDEKID, w.raftCutoverIndex, w.RaftEpoch, fullNodeID, w.RaftRegistration)
 	if err != nil {
 		return w, err
 	}
-	w.raftEnvelope = runtime
+	w.RaftEnvelope = runtime
 	return w, nil
 }
 

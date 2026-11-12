@@ -1,4 +1,4 @@
-package main
+package encryptionwiring
 
 import (
 	"errors"
@@ -175,17 +175,17 @@ func TestBuildEncryptionWriteWiring_DisabledOrUnconfigured_Cleartext(t *testing.
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			w, err := buildEncryptionWriteWiring(tc.enabled, "n1", tc.sidecarPath, tc.kek, encryption.NewKeystore(), nil, nil)
+			w, err := BuildWriteWiring(tc.enabled, "n1", tc.sidecarPath, tc.kek, encryption.NewKeystore(), nil, nil)
 			if err != nil {
 				t.Fatalf("buildEncryptionWriteWiring: %v", err)
 			}
-			if w.cache == nil {
+			if w.Cache == nil {
 				t.Error("cache is nil; must be non-nil on every return path")
 			}
-			if w.cipher != nil || w.nonceFactory != nil || w.raftNonceFactory != nil {
+			if w.Cipher != nil || w.NonceFactory != nil || w.RaftNonceFactory != nil {
 				t.Errorf("cipher/nonce factories should be nil when encryption is off/unconfigured")
 			}
-			if opts := w.pebbleOptions(); opts != nil {
+			if opts := w.PebbleOptions(); opts != nil {
 				t.Errorf("pebbleOptions = %d, want nil (cleartext)", len(opts))
 			}
 		})
@@ -196,32 +196,32 @@ func TestBuildEncryptionWriteWiring_ActiveDEK_WiresCipher(t *testing.T) {
 	t.Parallel()
 	path := writeActiveStorageSidecar(t, 2)
 	markRaftEnvelopeCutoverInSidecar(t, path, 55)
-	w, err := buildEncryptionWriteWiring(true, "n1", path, wiringFakeKEK{}, encryption.NewKeystore(), []noderuntime.GroupSpec{{ID: 1}}, nil)
+	w, err := BuildWriteWiring(true, "n1", path, wiringFakeKEK{}, encryption.NewKeystore(), []noderuntime.GroupSpec{{ID: 1}}, nil)
 	if err != nil {
 		t.Fatalf("buildEncryptionWriteWiring: %v", err)
 	}
-	if w.cipher == nil || w.nonceFactory == nil || w.raftNonceFactory == nil {
+	if w.Cipher == nil || w.NonceFactory == nil || w.RaftNonceFactory == nil {
 		t.Fatal("cipher/storage nonce/raft nonce factories must be wired when encryption is enabled with active DEKs")
 	}
-	if w.epoch != 3 {
-		t.Errorf("storage epoch = %d, want 3 (bumped from 2)", w.epoch)
+	if w.Epoch != 3 {
+		t.Errorf("storage epoch = %d, want 3 (bumped from 2)", w.Epoch)
 	}
-	if w.raftEpoch != 1 {
-		t.Errorf("raft epoch = %d, want 1 (bumped from 0)", w.raftEpoch)
+	if w.RaftEpoch != 1 {
+		t.Errorf("raft epoch = %d, want 1 (bumped from 0)", w.RaftEpoch)
 	}
 	// WithEncryption plus storage cutover, V2 capability, and
 	// registration gates, plus the §9.2 metrics observer.
-	if opts := w.pebbleOptions(); len(opts) != 5 {
+	if opts := w.PebbleOptions(); len(opts) != 5 {
 		t.Errorf("pebbleOptions = %d, want 5", len(opts))
 	}
 	assertStorageEnvelopeV2Activation(t, w)
 	// Cache must reflect the on-disk active DEK + cutover gate.
-	if id, ok := w.cache.ActiveStorageKeyID(); !ok || id != 3 {
+	if id, ok := w.Cache.ActiveStorageKeyID(); !ok || id != 3 {
 		t.Errorf("cache ActiveStorageKeyID = (%d, %v), want (3, true)", id, ok)
 	}
 }
 
-func assertStorageEnvelopeV2Activation(t *testing.T, w encryptionWriteWiring) {
+func assertStorageEnvelopeV2Activation(t *testing.T, w WriteWiring) {
 	t.Helper()
 	if w.storageEnvelopeV2WritesActive() {
 		t.Error("V2 writes started active before cluster capability confirmation")
@@ -245,7 +245,7 @@ func TestBuildEncryptionWriteWiring_ActiveCutoverWithoutRaftDEKRefusesBeforeStor
 		t.Fatalf("WriteSidecar: %v", err)
 	}
 
-	_, err = buildEncryptionWriteWiring(true, "n1", path, wiringFakeKEK{}, encryption.NewKeystore(), []noderuntime.GroupSpec{{ID: 1}}, nil)
+	_, err = BuildWriteWiring(true, "n1", path, wiringFakeKEK{}, encryption.NewKeystore(), []noderuntime.GroupSpec{{ID: 1}}, nil)
 	if err == nil {
 		t.Fatal("buildEncryptionWriteWiring succeeded with active raft cutover but no active raft DEK")
 	}

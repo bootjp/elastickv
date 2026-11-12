@@ -9,6 +9,7 @@ import (
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryption/kek"
+	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
@@ -18,7 +19,7 @@ import (
 type bootstrapEncryptionRuntimeIOConfig struct {
 	DefaultRuntime    *raftGroupRuntime
 	Group             *kv.ShardGroup
-	Wiring            encryptionWriteWiring
+	Wiring            encryptionwiring.WriteWiring
 	SidecarPath       string
 	Wrapper           kek.Wrapper
 	Domain            *bootstrapDomain
@@ -30,7 +31,7 @@ type bootstrapEncryptionRuntimeIO struct {
 	config   bootstrapEncryptionRuntimeIOConfig
 	engine   raftengine.Engine
 	registry encryption.WriterRegistryStore
-	input    bootstrapEncryptionProjectionInput
+	input    encryptionwiring.BootstrapEncryptionProjectionInput
 	admin    *adapter.EncryptionAdminServer
 }
 
@@ -45,9 +46,9 @@ func newBootstrapEncryptionRuntimeIO(cfg bootstrapEncryptionRuntimeIOConfig) (*b
 	if err != nil {
 		return nil, errors.Wrap(err, "encryption runtime IO registry")
 	}
-	in, err := newBootstrapEncryptionProjectionInput(true, cfg.RotationRequested, cfg.SidecarPath, cfg.Group, cfg.Wiring, cfg.NodeID, cfg.Domain.admission.EncryptionFence)
+	in, err := encryptionwiring.NewBootstrapEncryptionProjectionInput(true, cfg.RotationRequested, cfg.SidecarPath, cfg.Group, cfg.Wiring, cfg.NodeID, cfg.Domain.admission.EncryptionFence)
 	if err != nil {
-		return nil, err
+		return nil, errors.WithStack(err)
 	}
 	admin := adapter.NewEncryptionAdminServer(
 		adapter.WithEncryptionAdminFullNodeID(cfg.NodeID), adapter.WithEncryptionAdminSidecarPath(cfg.SidecarPath),
@@ -57,17 +58,17 @@ func newBootstrapEncryptionRuntimeIO(cfg bootstrapEncryptionRuntimeIOConfig) (*b
 	if err := admin.Validate(); err != nil {
 		return nil, errors.Wrap(err, "encryption runtime IO admin")
 	}
-	cfg.Wiring.cache.SetBeforeEncryptionChange(cfg.Domain.admission.BeginEncryptionMutation)
-	cfg.Wiring.raftEnvelope.setBeforeEncryptionChange(cfg.Domain.admission.BeginEncryptionMutation)
+	cfg.Wiring.Cache.SetBeforeEncryptionChange(cfg.Domain.admission.BeginEncryptionMutation)
+	cfg.Wiring.RaftEnvelope.SetBeforeEncryptionChange(cfg.Domain.admission.BeginEncryptionMutation)
 	return &bootstrapEncryptionRuntimeIO{config: cfg, engine: engine, registry: registry, input: in, admin: admin}, nil
 }
 
 func (cfg bootstrapEncryptionRuntimeIOConfig) validate() error {
 	if cfg.DefaultRuntime == nil || cfg.Group == nil || cfg.Domain == nil || cfg.Domain.admission == nil {
-		return errors.Wrap(errBootstrapEncryptionUnsupported, "missing protected runtime/group/domain")
+		return errors.Wrap(encryptionwiring.ErrBootstrapEncryptionUnsupported, "missing protected runtime/group/domain")
 	}
-	if cfg.NodeID == 0 || cfg.SidecarPath == "" || cfg.Wrapper == nil || cfg.Wiring.cache == nil || cfg.Wiring.raftEnvelope == nil {
-		return errors.Wrap(errBootstrapEncryptionUnsupported, "missing encryption IO dependencies")
+	if cfg.NodeID == 0 || cfg.SidecarPath == "" || cfg.Wrapper == nil || cfg.Wiring.Cache == nil || cfg.Wiring.RaftEnvelope == nil {
+		return errors.Wrap(encryptionwiring.ErrBootstrapEncryptionUnsupported, "missing encryption IO dependencies")
 	}
 	return cfg.validateBinding()
 }
@@ -76,56 +77,58 @@ func (cfg bootstrapEncryptionRuntimeIOConfig) validateBinding() error {
 	rt := cfg.DefaultRuntime
 	engine := rt.snapshotEngine()
 	if engine == nil || cfg.Group.Engine != engine || cfg.Group.Store != rt.Store || rt.bootstrapDomain != cfg.Domain || rt.Spec.ID == 0 {
-		return errors.Wrap(errBootstrapEncryptionUnsupported, "runtime/group/domain binding mismatch")
+		return errors.Wrap(encryptionwiring.ErrBootstrapEncryptionUnsupported, "runtime/group/domain binding mismatch")
 	}
 	if cfg.Group.Proposer() == engine {
-		return errors.Wrap(errBootstrapEncryptionUnsupported, "raw proposer fallback is not a protected wrapped path")
+		return errors.Wrap(encryptionwiring.ErrBootstrapEncryptionUnsupported, "raw proposer fallback is not a protected wrapped path")
 	}
-	r := cfg.Wiring.raftEnvelope
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.fullNodeID != cfg.NodeID || r.cipher != cfg.Wiring.cipher || r.groups[rt.Spec.ID] != cfg.Group {
-		return errors.Wrap(errBootstrapEncryptionUnsupported, "installed raft runtime binding mismatch")
+	r := cfg.Wiring.RaftEnvelope
+	r.Mu.Lock()
+	defer r.Mu.Unlock()
+	if r.FullNodeID != cfg.NodeID || r.Cipher != cfg.Wiring.Cipher || r.Groups[rt.Spec.ID] != cfg.Group {
+		return errors.Wrap(encryptionwiring.ErrBootstrapEncryptionUnsupported, "installed raft runtime binding mismatch")
 	}
 	return nil
 }
 
-func (io *bootstrapEncryptionRuntimeIO) Input() bootstrapEncryptionProjectionInput { return io.input }
+func (io *bootstrapEncryptionRuntimeIO) Input() encryptionwiring.BootstrapEncryptionProjectionInput {
+	return io.input
+}
 
 func (io *bootstrapEncryptionRuntimeIO) check(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return errors.WithStack(err)
 	}
 	if io.config.DefaultRuntime.snapshotEngine() != io.engine {
-		return errors.Wrap(errBootstrapEncryptionUnsupported, "runtime engine retired")
+		return errors.Wrap(encryptionwiring.ErrBootstrapEncryptionUnsupported, "runtime engine retired")
 	}
 	return nil
 }
 
-func (io *bootstrapEncryptionRuntimeIO) Observe(ctx context.Context) (bootstrapEncryptionProjection, error) {
+func (io *bootstrapEncryptionRuntimeIO) Observe(ctx context.Context) (encryptionwiring.BootstrapEncryptionProjection, error) {
 	if err := io.check(ctx); err != nil {
-		return bootstrapEncryptionProjection{}, err
+		return encryptionwiring.BootstrapEncryptionProjection{}, err
 	}
-	p, err := readBootstrapEncryptionProjection(io.input)
+	p, err := encryptionwiring.ReadBootstrapEncryptionProjection(io.input)
 	if err != nil {
-		return bootstrapEncryptionProjection{}, err
+		return encryptionwiring.BootstrapEncryptionProjection{}, errors.WithStack(err)
 	}
 	sc, err := io.readSidecarAt(p)
 	if err != nil {
-		return bootstrapEncryptionProjection{}, err
+		return encryptionwiring.BootstrapEncryptionProjection{}, err
 	}
 	if err := io.verifyActiveMaterial(ctx, sc); err != nil {
-		return bootstrapEncryptionProjection{}, err
+		return encryptionwiring.BootstrapEncryptionProjection{}, err
 	}
-	after, err := readBootstrapEncryptionProjection(io.input)
+	after, err := encryptionwiring.ReadBootstrapEncryptionProjection(io.input)
 	if err != nil {
-		return bootstrapEncryptionProjection{}, err
+		return encryptionwiring.BootstrapEncryptionProjection{}, errors.WithStack(err)
 	}
-	if p.generation != after.generation || p.digest() != after.digest() {
-		return bootstrapEncryptionProjection{}, errors.Wrap(errBootstrapEncryptionProjectionPending, "encryption changed during material verification")
+	if p.Generation != after.Generation || p.Digest() != after.Digest() {
+		return encryptionwiring.BootstrapEncryptionProjection{}, errors.Wrap(encryptionwiring.ErrBootstrapEncryptionProjectionPending, "encryption changed during material verification")
 	}
 	if err := io.check(ctx); err != nil {
-		return bootstrapEncryptionProjection{}, err
+		return encryptionwiring.BootstrapEncryptionProjection{}, err
 	}
 	return after, nil
 }
@@ -141,7 +144,7 @@ func (io *bootstrapEncryptionRuntimeIO) verifyActiveMaterial(ctx context.Context
 	return nil
 }
 
-func (io *bootstrapEncryptionRuntimeIO) readSidecarAt(p bootstrapEncryptionProjection) (*encryption.Sidecar, error) {
+func (io *bootstrapEncryptionRuntimeIO) readSidecarAt(p encryptionwiring.BootstrapEncryptionProjection) (*encryption.Sidecar, error) {
 	sc, err := encryption.ReadSidecar(io.config.SidecarPath)
 	if err != nil {
 		return nil, errors.Wrap(err, "encryption runtime IO sidecar")
@@ -150,8 +153,8 @@ func (io *bootstrapEncryptionRuntimeIO) readSidecarAt(p bootstrapEncryptionProje
 	if err != nil {
 		return nil, errors.Wrap(err, "encryption runtime IO checkpoint")
 	}
-	if cp != p.checkpoint {
-		return nil, errors.Wrap(errBootstrapEncryptionProjectionPending, "sidecar changed after applied observation")
+	if cp != p.Checkpoint {
+		return nil, errors.Wrap(encryptionwiring.ErrBootstrapEncryptionProjectionPending, "sidecar changed after applied observation")
 	}
 	return sc, nil
 }
@@ -165,7 +168,7 @@ func (io *bootstrapEncryptionRuntimeIO) RecipeConfig(barrier func(context.Contex
 			sc, err := encryption.ReadSidecar(io.config.SidecarPath)
 			return sc, errors.Wrap(err, "rotation runtime sidecar")
 		},
-		Registry: io.registry, Wrapper: io.config.Wrapper, NodeID: io.config.NodeID, StorageEpoch: io.config.Wiring.epoch, RaftEpoch: io.config.Wiring.raftEpoch,
+		Registry: io.registry, Wrapper: io.config.Wrapper, NodeID: io.config.NodeID, StorageEpoch: io.config.Wiring.Epoch, RaftEpoch: io.config.Wiring.RaftEpoch,
 		InstallAndVerify: io.installAndVerify,
 	}
 }
@@ -180,7 +183,7 @@ func (io *bootstrapEncryptionRuntimeIO) ValidateEpoch(id uint32, epoch uint16) e
 	}
 	key, ok := sc.Keys[strconv.FormatUint(uint64(id), 10)]
 	if !ok || id == 0 || len(key.Wrapped) == 0 {
-		return errors.Wrap(errBootstrapEncryptionUnsupported, "registration DEK is not locally owned")
+		return errors.Wrap(encryptionwiring.ErrBootstrapEncryptionUnsupported, "registration DEK is not locally owned")
 	}
 	pinned, err := io.purposeEpoch(key.Purpose)
 	if err != nil {
@@ -195,11 +198,11 @@ func (io *bootstrapEncryptionRuntimeIO) ValidateEpoch(id uint32, epoch uint16) e
 func (io *bootstrapEncryptionRuntimeIO) purposeEpoch(purpose string) (uint16, error) {
 	switch purpose {
 	case encryption.SidecarPurposeStorage:
-		return io.config.Wiring.epoch, nil
+		return io.config.Wiring.Epoch, nil
 	case encryption.SidecarPurposeRaft:
-		return io.config.Wiring.raftEpoch, nil
+		return io.config.Wiring.RaftEpoch, nil
 	default:
-		return 0, errors.Wrap(errBootstrapEncryptionUnsupported, "unknown DEK purpose")
+		return 0, errors.Wrap(encryptionwiring.ErrBootstrapEncryptionUnsupported, "unknown DEK purpose")
 	}
 }
 
@@ -232,7 +235,7 @@ func (io *bootstrapEncryptionRuntimeIO) verifyMaterial(ctx context.Context, id u
 	if err != nil {
 		return errors.Wrap(err, "encryption material challenge")
 	}
-	plain, err := io.config.Wiring.cipher.Decrypt(sealed, nil, id, nonce[:])
+	plain, err := io.config.Wiring.Cipher.Decrypt(sealed, nil, id, nonce[:])
 	if err != nil || !bytes.Equal(plain, challenge) {
 		return errors.New("encryption runtime IO: installed cipher material mismatch")
 	}
@@ -250,8 +253,8 @@ func (io *bootstrapEncryptionRuntimeIO) installAndVerify(ctx context.Context, id
 	if err := io.verifyMaterial(ctx, id, key); err != nil {
 		return err
 	}
-	if _, err := readBootstrapWriterRegistration(io.registry, id, io.config.NodeID, key.LocalEpoch); err != nil {
-		return err
+	if _, err := encryptionwiring.ReadBootstrapWriterRegistration(io.registry, id, io.config.NodeID, key.LocalEpoch); err != nil {
+		return errors.WithStack(err)
 	}
 	if key.Purpose == encryption.SidecarPurposeRaft && sc.RaftEnvelopeCutoverIndex != 0 {
 		if err := io.repairRaftWrapper(ctx, id, sc.RaftEnvelopeCutoverIndex); err != nil {
@@ -268,71 +271,71 @@ func (io *bootstrapEncryptionRuntimeIO) installAndVerify(ctx context.Context, id
 // Reconcile verifies storage before raft. A per-purpose installer must not
 // demand the complete projection before the later purpose can be repaired.
 func (io *bootstrapEncryptionRuntimeIO) verifyInstalledPurpose(id uint32, key encryption.SidecarKey, sc *encryption.Sidecar) error {
-	p := bootstrapEncryptionProjection{fullNodeID: io.config.NodeID}
+	p := encryptionwiring.BootstrapEncryptionProjection{FullNodeID: io.config.NodeID}
 	if key.Purpose == encryption.SidecarPurposeRaft {
-		p.raft = bootstrapEncryptionPurposeProjection{dekID: id, epoch: key.LocalEpoch, envelopeActive: sc.RaftEnvelopeCutoverIndex != 0, cutoverIndex: sc.RaftEnvelopeCutoverIndex}
-		actual, err := io.config.Wiring.raftEnvelope.observeInstalled(io.config.Group, id)
+		p.Raft = encryptionwiring.BootstrapEncryptionPurposeProjection{DekID: id, Epoch: key.LocalEpoch, EnvelopeActive: sc.RaftEnvelopeCutoverIndex != 0, CutoverIndex: sc.RaftEnvelopeCutoverIndex}
+		actual, err := io.config.Wiring.RaftEnvelope.ObserveInstalled(io.config.Group, id)
 		if err != nil {
-			return err
+			return errors.WithStack(err)
 		}
-		return p.validateInstalledRaft(actual)
+		return errors.WithStack(p.ValidateInstalledRaft(actual))
 	}
-	p.storage = bootstrapEncryptionPurposeProjection{dekID: id, epoch: key.LocalEpoch, envelopeActive: sc.StorageEnvelopeActive, cutoverIndex: sc.StorageEnvelopeCutoverIndex}
+	p.Storage = encryptionwiring.BootstrapEncryptionPurposeProjection{DekID: id, Epoch: key.LocalEpoch, EnvelopeActive: sc.StorageEnvelopeActive, CutoverIndex: sc.StorageEnvelopeCutoverIndex}
 	source, ok := io.config.Group.Store.(interface {
 		ObserveEncryptionWritePath() (store.EncryptionWriteObservation, error)
 	})
 	if !ok {
-		return errors.Wrap(errBootstrapEncryptionUnsupported, "missing storage installed-path observer")
+		return errors.Wrap(encryptionwiring.ErrBootstrapEncryptionUnsupported, "missing storage installed-path observer")
 	}
 	actual, err := source.ObserveEncryptionWritePath()
 	if err != nil {
 		return errors.Wrap(err, "rotation installed storage purpose")
 	}
-	return p.validateInstalledStorage(actual)
+	return errors.WithStack(p.ValidateInstalledStorage(actual))
 }
 
 func (io *bootstrapEncryptionRuntimeIO) activeKey(ctx context.Context, id uint32, key encryption.SidecarKey) (*encryption.Sidecar, error) {
 	if err := io.check(ctx); err != nil {
 		return nil, err
 	}
-	source, ok := io.input.localStore.(bootstrapEncryptionProjectionStore)
+	source, ok := io.input.LocalStore.(encryptionwiring.BootstrapEncryptionProjectionStore)
 	if !ok {
-		return nil, errors.Wrap(errBootstrapEncryptionUnsupported, "missing checkpoint store")
+		return nil, errors.Wrap(encryptionwiring.ErrBootstrapEncryptionUnsupported, "missing checkpoint store")
 	}
-	applied, cp, err := readBootstrapEncryptionCheckpoint(source)
+	applied, cp, err := encryptionwiring.ReadBootstrapEncryptionCheckpoint(source)
 	if err != nil {
-		return nil, err
+		return nil, errors.WithStack(err)
 	}
-	sc, err := io.readSidecarAt(bootstrapEncryptionProjection{appliedIndex: applied, checkpoint: cp})
+	sc, err := io.readSidecarAt(encryptionwiring.BootstrapEncryptionProjection{AppliedIndex: applied, Checkpoint: cp})
 	if err != nil {
 		return nil, err
 	}
 	actual := sc.Keys[strconv.FormatUint(uint64(id), 10)]
 	if actual.Purpose != key.Purpose || actual.LocalEpoch != key.LocalEpoch || !bytes.Equal(actual.Wrapped, key.Wrapped) {
-		return nil, errors.Wrap(errBootstrapEncryptionProjectionPending, "active key changed before installation")
+		return nil, errors.Wrap(encryptionwiring.ErrBootstrapEncryptionProjectionPending, "active key changed before installation")
 	}
 	active := sc.Active.Storage
 	if key.Purpose == encryption.SidecarPurposeRaft {
 		active = sc.Active.Raft
 	}
 	if active != id {
-		return nil, errors.Wrap(errBootstrapEncryptionProjectionPending, "key is no longer active")
+		return nil, errors.Wrap(encryptionwiring.ErrBootstrapEncryptionProjectionPending, "key is no longer active")
 	}
 	return sc, nil
 }
 
 func (io *bootstrapEncryptionRuntimeIO) repairRaftWrapper(ctx context.Context, id uint32, cutover uint64) error {
-	r := io.config.Wiring.raftEnvelope
-	r.mu.Lock()
-	installed := r.activeRaftDEKID == id && r.groupWrapInstalled(io.config.Group)
-	actualKey := r.activeRaftDEKID
-	actualCutover := r.cutoverIndex.Load()
-	r.mu.Unlock()
+	r := io.config.Wiring.RaftEnvelope
+	r.Mu.Lock()
+	installed := r.ActiveRaftDEKID == id && r.GroupWrapInstalled(io.config.Group)
+	actualKey := r.ActiveRaftDEKID
+	actualCutover := r.CutoverIndex.Load()
+	r.Mu.Unlock()
 	if actualCutover != cutover {
-		return errors.Wrap(errBootstrapEncryptionProjectionPending, "raft cutover not installed by applier")
+		return errors.Wrap(encryptionwiring.ErrBootstrapEncryptionProjectionPending, "raft cutover not installed by applier")
 	}
 	if actualKey != id {
-		return errors.Wrap(errBootstrapEncryptionProjectionPending, "active raft key awaits applier installation")
+		return errors.Wrap(encryptionwiring.ErrBootstrapEncryptionProjectionPending, "active raft key awaits applier installation")
 	}
 	if err := io.check(ctx); err != nil {
 		return err
@@ -340,10 +343,10 @@ func (io *bootstrapEncryptionRuntimeIO) repairRaftWrapper(ctx context.Context, i
 	if !installed {
 		// Re-publish the CURRENT installer-owned closure under its mutex. Never
 		// overwrite a newer applier-installed key with an old sidecar sample.
-		r.reinstallActiveWrap()
+		r.ReinstallActiveWrap()
 	}
-	if !r.registration.Registered(id, io.config.Wiring.raftEpoch) {
-		r.registration.MarkRegistered(id, io.config.Wiring.raftEpoch)
+	if !r.Registration.Registered(id, io.config.Wiring.RaftEpoch) {
+		r.Registration.MarkRegistered(id, io.config.Wiring.RaftEpoch)
 	}
 	return nil
 }
@@ -372,40 +375,40 @@ func (io *bootstrapEncryptionRuntimeIO) PayloadProjection(group, generation uint
 		return zero, errors.WithStack(err)
 	}
 	if before != after {
-		return zero, errors.Wrap(errBootstrapEncryptionProjectionPending, "payload projection changed")
+		return zero, errors.Wrap(encryptionwiring.ErrBootstrapEncryptionProjectionPending, "payload projection changed")
 	}
 	return newBootstrapPayloadProjection(group, generation, cipher, id, active, grants...)
 }
 
 func (io *bootstrapEncryptionRuntimeIO) installedPayload() (*encryption.Cipher, uint32, bool, error) {
-	r := io.config.Wiring.raftEnvelope
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r := io.config.Wiring.RaftEnvelope
+	r.Mu.Lock()
+	defer r.Mu.Unlock()
 	if err := io.validatePayloadNonce(r); err != nil {
 		return nil, 0, false, err
 	}
-	id, active := r.activeRaftDEKID, r.cutoverIndex.Load() != 0
-	if active && (!r.groupWrapInstalled(io.config.Group) || !r.cipher.HasKey(id)) {
-		return nil, 0, false, errors.Wrap(errBootstrapEncryptionProjectionPending, "actual raft payload wrapper missing")
+	id, active := r.ActiveRaftDEKID, r.CutoverIndex.Load() != 0
+	if active && (!r.GroupWrapInstalled(io.config.Group) || !r.Cipher.HasKey(id)) {
+		return nil, 0, false, errors.Wrap(encryptionwiring.ErrBootstrapEncryptionProjectionPending, "actual raft payload wrapper missing")
 	}
 	if !active && io.config.Group.RaftPayloadWrap() != nil {
-		return nil, 0, false, errors.Wrap(errBootstrapEncryptionProjectionPending, "unexpected raft wrapper before cutover")
+		return nil, 0, false, errors.Wrap(encryptionwiring.ErrBootstrapEncryptionProjectionPending, "unexpected raft wrapper before cutover")
 	}
-	return r.cipher, id, active, nil
+	return r.Cipher, id, active, nil
 }
 
 // Called only while r.mu is held; no admission callback or I/O is performed.
-func (io *bootstrapEncryptionRuntimeIO) validatePayloadNonce(r *raftEnvelopeRuntime) error {
-	factory, ok := r.nonceFactory.(*encryption.DeterministicNonceFactory)
+func (io *bootstrapEncryptionRuntimeIO) validatePayloadNonce(r *encryptionwiring.RaftEnvelopeRuntime) error {
+	factory, ok := r.NonceFactory.(*encryption.DeterministicNonceFactory)
 	if !ok || factory == nil {
-		return errors.Wrap(errBootstrapEncryptionUnsupported, "unsupported installed raft nonce factory")
+		return errors.Wrap(encryptionwiring.ErrBootstrapEncryptionUnsupported, "unsupported installed raft nonce factory")
 	}
 	node, epoch, exhausted := factory.NonceIdentity()
 	if exhausted {
 		return errors.WithStack(encryption.ErrWriteCountExhausted)
 	}
-	if node != encryption.NodeID16(io.config.NodeID) || epoch != io.config.Wiring.raftEpoch || r.raftEpoch != epoch || r.fullNodeID != io.config.NodeID {
-		return errors.Wrap(errBootstrapEncryptionUnsupported, "installed raft nonce identity mismatch")
+	if node != encryption.NodeID16(io.config.NodeID) || epoch != io.config.Wiring.RaftEpoch || r.RaftEpoch != epoch || r.FullNodeID != io.config.NodeID {
+		return errors.Wrap(encryptionwiring.ErrBootstrapEncryptionUnsupported, "installed raft nonce identity mismatch")
 	}
 	return nil
 }

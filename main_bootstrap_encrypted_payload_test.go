@@ -11,6 +11,7 @@ import (
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryption/encryptiontest"
 	"github.com/bootjp/elastickv/internal/encryption/fsmwire"
+	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/internal/raftadmission"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/bootjp/elastickv/kv"
@@ -23,10 +24,10 @@ func bootstrapEncryptedPayloadFixture(t *testing.T, group uint64, grants ...boot
 	t.Helper()
 	cipher := encryptiontest.NewCipher(t, bootstrapEncryptedTestKey)
 	var cutover atomic.Uint64
-	runtime, err := newRaftEnvelopeRuntime(cipher, encryptiontest.NewNonceFactory(t), 1, bootstrapEncryptedTestKey, &cutover, 1, 42, nil)
+	runtime, err := encryptionwiring.NewRaftEnvelopeRuntime(cipher, encryptiontest.NewNonceFactory(t), 1, bootstrapEncryptedTestKey, &cutover, 1, 42, nil)
 	require.NoError(t, err)
 	shard := &kv.ShardGroup{}
-	runtime.attachGroup(group, shard)
+	runtime.AttachGroup(group, shard)
 	projection, err := newBootstrapPayloadProjection(group, 1, cipher, bootstrapEncryptedTestKey, true, grants...)
 	require.NoError(t, err)
 	require.NotNil(t, shard.RaftPayloadWrap())

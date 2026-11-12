@@ -1,4 +1,4 @@
-package main
+package encryptionwiring
 
 import (
 	"context"
@@ -29,9 +29,9 @@ func TestStorageEnvelopeV2CapabilityMonitorActivatesOnce(t *testing.T) {
 	sidecar := &encryption.Sidecar{Version: encryption.SidecarVersion}
 	sidecar.Active.Storage = 1
 	cache.RefreshFromSidecar(sidecar)
-	wiring := encryptionWriteWiring{cache: cache, storageEnvelopeV2Active: &atomic.Bool{}}
+	wiring := WriteWiring{Cache: cache, storageEnvelopeV2Active: &atomic.Bool{}}
 	var calls atomic.Int32
-	startStorageEnvelopeV2CapabilityMonitor(groupCtx, eg, func(context.Context) (admin.CapabilityFanoutResult, error) {
+	StartStorageEnvelopeV2CapabilityMonitor(groupCtx, eg, func(context.Context) (admin.CapabilityFanoutResult, error) {
 		calls.Add(1)
 		return admin.CapabilityFanoutResult{Verdicts: []admin.CapabilityVerdict{{
 			Reachable: true, EncryptionCapable: true, StorageEnvelopeV2Capable: true,
@@ -57,12 +57,12 @@ func TestStorageEnvelopeV2CapabilityMonitorWaitsForBootstrap(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	eg, groupCtx := errgroup.WithContext(ctx)
-	wiring := encryptionWriteWiring{
-		cache:                   encryption.NewStateCache(),
+	wiring := WriteWiring{
+		Cache:                   encryption.NewStateCache(),
 		storageEnvelopeV2Active: &atomic.Bool{},
 	}
 	var calls atomic.Int32
-	startStorageEnvelopeV2CapabilityMonitor(groupCtx, eg, func(context.Context) (admin.CapabilityFanoutResult, error) {
+	StartStorageEnvelopeV2CapabilityMonitor(groupCtx, eg, func(context.Context) (admin.CapabilityFanoutResult, error) {
 		calls.Add(1)
 		return admin.CapabilityFanoutResult{Verdicts: []admin.CapabilityVerdict{{
 			Reachable: true, EncryptionCapable: true, StorageEnvelopeV2Capable: true,
@@ -140,7 +140,7 @@ func TestRouteGroupFromConfiguration_Empty(t *testing.T) {
 // RPC is then unreachable, so wiring a fan-out would be dead weight.
 func TestBuildEncryptionCapabilityFanout_DisabledReturnsNil(t *testing.T) {
 	t.Parallel()
-	if fn := buildEncryptionCapabilityFanout(context.Background(), nil, nil, nil, false); fn != nil {
+	if fn := BuildCapabilityFanout(context.Background(), nil, nil, nil, false); fn != nil {
 		t.Error("buildEncryptionCapabilityFanout(enableMutators=false) = non-nil, want nil")
 	}
 }
@@ -148,10 +148,10 @@ func TestBuildEncryptionCapabilityFanout_DisabledReturnsNil(t *testing.T) {
 func TestRouteSnapshotFromSources_MapsAllGroups(t *testing.T) {
 	t.Parallel()
 	sources := []groupConfigSource{
-		{groupID: 1, engine: stubConfigReader{cfg: raftengine.Configuration{Servers: []raftengine.Server{
+		{groupID: 1, Engine: stubConfigReader{cfg: raftengine.Configuration{Servers: []raftengine.Server{
 			{ID: "n1", Address: "a:1", Suffrage: etcdraftengine.SuffrageVoter},
 		}}}},
-		{groupID: 2, engine: stubConfigReader{cfg: raftengine.Configuration{Servers: []raftengine.Server{
+		{groupID: 2, Engine: stubConfigReader{cfg: raftengine.Configuration{Servers: []raftengine.Server{
 			{ID: "n2", Address: "b:2", Suffrage: etcdraftengine.SuffrageLearner},
 		}}}},
 	}
@@ -178,10 +178,10 @@ func TestRouteSnapshotFromSources_ConfigurationErrorFailsClosed(t *testing.T) {
 	t.Parallel()
 	boom := errors.New("configuration unavailable")
 	sources := []groupConfigSource{
-		{groupID: 1, engine: stubConfigReader{cfg: raftengine.Configuration{Servers: []raftengine.Server{
+		{groupID: 1, Engine: stubConfigReader{cfg: raftengine.Configuration{Servers: []raftengine.Server{
 			{ID: "n1", Address: "a:1", Suffrage: etcdraftengine.SuffrageVoter},
 		}}}},
-		{groupID: 2, engine: stubConfigReader{err: boom}},
+		{groupID: 2, Engine: stubConfigReader{err: boom}},
 	}
 	_, err := routeSnapshotFromSources(context.Background(), sources)
 	if err == nil {
@@ -212,7 +212,8 @@ func (h *capturingLogHandler) Handle(_ context.Context, rec slog.Record) error {
 }
 
 func (h *capturingLogHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
-func (h *capturingLogHandler) WithGroup(string) slog.Handler      { return h }
+
+func (h *capturingLogHandler) WithGroup(string) slog.Handler { return h }
 
 // attrFor returns the named attribute of the first record whose message
 // contains want.
@@ -256,7 +257,7 @@ func TestStorageEnvelopeV2ActivationLogsActiveKeyID(t *testing.T) {
 	sidecar := &encryption.Sidecar{Version: encryption.SidecarVersion}
 	sidecar.Active.Storage = activeKeyID
 	cache.RefreshFromSidecar(sidecar)
-	wiring := encryptionWriteWiring{cache: cache, storageEnvelopeV2Active: &atomic.Bool{}}
+	wiring := WriteWiring{Cache: cache, storageEnvelopeV2Active: &atomic.Bool{}}
 
 	activated := tryActivateStorageEnvelopeV2Writes(
 		context.Background(),
@@ -294,10 +295,10 @@ func TestStorageEnvelopeV2CapabilityMonitorReleasesConnectionsOnActivation(t *te
 	sidecar := &encryption.Sidecar{Version: encryption.SidecarVersion}
 	sidecar.Active.Storage = 1
 	cache.RefreshFromSidecar(sidecar)
-	wiring := encryptionWriteWiring{cache: cache, storageEnvelopeV2Active: &atomic.Bool{}}
+	wiring := WriteWiring{Cache: cache, storageEnvelopeV2Active: &atomic.Bool{}}
 
 	released := make(chan struct{})
-	startStorageEnvelopeV2CapabilityMonitor(groupCtx, eg, func(context.Context) (admin.CapabilityFanoutResult, error) {
+	StartStorageEnvelopeV2CapabilityMonitor(groupCtx, eg, func(context.Context) (admin.CapabilityFanoutResult, error) {
 		return admin.CapabilityFanoutResult{Verdicts: []admin.CapabilityVerdict{{
 			Reachable: true, EncryptionCapable: true, StorageEnvelopeV2Capable: true,
 		}}}, nil
@@ -321,7 +322,7 @@ func TestStorageEnvelopeV2CapabilityMonitorReleasesConnectionsOnActivation(t *te
 // an operator may call at any time.
 func TestStorageEnvelopeV2MonitorFanoutOwnsItsConnections(t *testing.T) {
 	t.Parallel()
-	fn, release := buildStorageEnvelopeV2MonitorFanout(nil, nil, true)
+	fn, release := BuildStorageEnvelopeV2MonitorFanout(nil, nil, true)
 	if fn == nil || release == nil {
 		t.Fatal("monitor fan-out and its release must both be present when mutators are enabled")
 	}
@@ -329,7 +330,7 @@ func TestStorageEnvelopeV2MonitorFanoutOwnsItsConnections(t *testing.T) {
 		t.Fatalf("release: %v", err)
 	}
 
-	if fn, release := buildStorageEnvelopeV2MonitorFanout(nil, nil, false); fn != nil || release != nil {
+	if fn, release := BuildStorageEnvelopeV2MonitorFanout(nil, nil, false); fn != nil || release != nil {
 		t.Error("monitor fan-out must be absent when encryption mutators are disabled")
 	}
 }

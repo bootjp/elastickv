@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/internal/peersession"
 	"github.com/bootjp/elastickv/internal/raftadmission"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
@@ -44,11 +45,11 @@ func TestBootstrapRegistrationExactDescriptor(t *testing.T) {
 	t.Parallel()
 	method := bootstrapMethodForTest(t, 17, pb.EncryptionAdmin_RegisterEncryptionWriter_FullMethodName)
 	binding := bootstrapBindingForTest(17)
-	req := registrationRequest(7, binding.From.Member, 0)
+	req := encryptionwiring.RegistrationRequest(7, binding.From.Member, 0)
 	message, err := method.BoundRequest(binding, req)
 	require.NoError(t, err)
 	require.Equal(t, peersession.Registration, message.Traffic)
-	require.Equal(t, raftbootstrap.Digest(sha256.Sum256(registrationEntry(7, binding.From.Member, 0))), message.Declaration)
+	require.Equal(t, raftbootstrap.Digest(sha256.Sum256(encryptionwiring.RegistrationEntry(7, binding.From.Member, 0))), message.Declaration)
 	reply, err := method.Reply(message, &pb.RegisterEncryptionWriterResponse{AppliedIndex: 1})
 	require.NoError(t, err)
 	require.Equal(t, message.From, reply.To)
@@ -77,7 +78,7 @@ func TestBootstrapRegistrationTLSIdentityReadyWithNativeHandle(t *testing.T) {
 	t.Parallel()
 	f := newBootstrapAuthFixture(t, 17, peersession.IdentityReady, nil, bootstrapAuthRegistrationOptions{prepared: true})
 	require.True(t, f.a.NeedsActivation(17))
-	entry := registrationEntry(7, 2, 3)
+	entry := encryptionwiring.RegistrationEntry(7, 2, 3)
 	f.service.action = func(ctx context.Context) error {
 		bound, err := f.a.BindProposal(ctx, f.group, entry)
 		if err != nil {
@@ -90,7 +91,7 @@ func TestBootstrapRegistrationTLSIdentityReadyWithNativeHandle(t *testing.T) {
 	ctx, cancel := bootstrapGateContext(t, bootstrapGateTestToken)
 	defer cancel()
 	err := f.handle.Invoke(ctx, f.cc, pb.EncryptionAdmin_RegisterEncryptionWriter_FullMethodName,
-		registrationRequest(7, 2, 3), &pb.RegisterEncryptionWriterResponse{})
+		encryptionwiring.RegistrationRequest(7, 2, 3), &pb.RegisterEncryptionWriterResponse{})
 	require.NoError(t, err)
 	require.Zero(t, f.authCalls.Load(), "only exact typed registration bypasses independent admin auth")
 	require.EqualValues(t, 1, f.service.calls.Load())
@@ -102,7 +103,7 @@ func TestBootstrapRegistrationTLSMissingTokenCannotReachHandler(t *testing.T) {
 	for _, token := range []string{"", "incorrect"} {
 		ctx, cancel := bootstrapGateContext(t, token)
 		err := f.handle.Invoke(ctx, f.cc, pb.EncryptionAdmin_RegisterEncryptionWriter_FullMethodName,
-			registrationRequest(7, 2, 3), &pb.RegisterEncryptionWriterResponse{})
+			encryptionwiring.RegistrationRequest(7, 2, 3), &pb.RegisterEncryptionWriterResponse{})
 		cancel()
 		require.Error(t, err)
 	}
@@ -122,7 +123,7 @@ func TestBootstrapRegistrationTLSEpochCannotChangeAfterCapture(t *testing.T) {
 	ctx, cancel := bootstrapGateContext(t, bootstrapGateTestToken)
 	defer cancel()
 	require.Error(t, f.handle.Invoke(ctx, f.cc, pb.EncryptionAdmin_RegisterEncryptionWriter_FullMethodName,
-		registrationRequest(7, 2, 3), &pb.RegisterEncryptionWriterResponse{}))
+		encryptionwiring.RegistrationRequest(7, 2, 3), &pb.RegisterEncryptionWriterResponse{}))
 	require.Zero(t, f.service.calls.Load())
 	require.EqualValues(t, 1, f.authCalls.Load(), "changed declaration must not bypass original auth")
 }
@@ -142,7 +143,7 @@ func TestBootstrapRegistrationTLSRequiresExplicitDefaultGroupReceiver(t *testing
 			ctx, cancel := bootstrapGateContext(t, bootstrapGateTestToken)
 			defer cancel()
 			require.Error(t, f.handle.Invoke(ctx, f.cc, pb.EncryptionAdmin_RegisterEncryptionWriter_FullMethodName,
-				registrationRequest(7, 2, 3), &pb.RegisterEncryptionWriterResponse{}))
+				encryptionwiring.RegistrationRequest(7, 2, 3), &pb.RegisterEncryptionWriterResponse{}))
 			require.Zero(t, f.service.calls.Load())
 			require.EqualValues(t, 1, f.authCalls.Load(), "nondefault session must retain original auth")
 		})
@@ -185,8 +186,8 @@ func TestBootstrapRegistrationLocalProposalOwnsHandleAndCloseJoins(t *testing.T)
 	}, bootstrapNetworkTestGroup, kv.NewHLC(), nil)
 	done := make(chan error, 1)
 	go func() {
-		done <- proposeWriterRegistration(ctx, coord, proposer, nil, registrationEntry(7, f.config.local.Member, 3),
-			registrationRequest(7, f.config.local.Member, 3))
+		done <- encryptionwiring.ProposeWriterRegistration(ctx, coord, proposer, nil, encryptionwiring.RegistrationEntry(7, f.config.local.Member, 3),
+			encryptionwiring.RegistrationRequest(7, f.config.local.Member, 3))
 	}()
 	select {
 	case <-entered:
@@ -208,14 +209,14 @@ func TestBootstrapRegistrationPrivateForwardNeverUsesPublicFallback(t *testing.T
 				func(uint32, uint16) error { return nil })
 			require.NoError(t, err)
 			source := bootstrapRegistrationFromContext(ctx)
-			err = source.Forward(ctx, f.address, registrationRequest(7, f.config.local.Member, 3))
+			err = source.Forward(ctx, f.address, encryptionwiring.RegistrationRequest(7, f.config.local.Member, 3))
 			if wrongSPKI {
 				require.Error(t, err)
 			} else {
 				require.NoError(t, err)
 			}
 			require.Zero(t, f.ordinary.Load())
-			require.Error(t, source.Forward(ctx, "unprovisioned.test:9001", registrationRequest(7, f.config.local.Member, 3)))
+			require.Error(t, source.Forward(ctx, "unprovisioned.test:9001", encryptionwiring.RegistrationRequest(7, f.config.local.Member, 3)))
 		})
 	}
 }
@@ -236,7 +237,7 @@ func TestBootstrapRegistrationPrivateForwardCloseCancelsAndJoins(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- bootstrapRegistrationFromContext(ctx).Forward(ctx, f.address,
-			registrationRequest(7, f.config.local.Member, 3))
+			encryptionwiring.RegistrationRequest(7, f.config.local.Member, 3))
 	}()
 	select {
 	case <-entered:
@@ -266,11 +267,11 @@ func TestBootstrapRegistrationSourcePinsEpochAndPayload(t *testing.T) {
 		})
 	require.NoError(t, err)
 	source := bootstrapRegistrationFromContext(ctx)
-	req := registrationRequest(7, f.config.local.Member, 3)
-	entry := registrationEntry(7, f.config.local.Member, 3)
+	req := encryptionwiring.RegistrationRequest(7, f.config.local.Member, 3)
+	entry := encryptionwiring.RegistrationEntry(7, f.config.local.Member, 3)
 	require.NoError(t, source.Validate(entry, req))
 	require.Error(t, source.Validate(append(entry, 0), req))
-	require.Error(t, source.Validate(registrationEntry(7, f.config.local.Member, 4), registrationRequest(7, f.config.local.Member, 4)))
+	require.Error(t, source.Validate(encryptionwiring.RegistrationEntry(7, f.config.local.Member, 4), encryptionwiring.RegistrationRequest(7, f.config.local.Member, 4)))
 	_, err = withBootstrapRegistration(t.Context(), f.network, bootstrapNetworkTestGroup, 999, source.validateEpoch)
 	require.Error(t, err)
 	_, err = withBootstrapRegistration(t.Context(), f.network, bootstrapNetworkTestGroup+1, f.config.local.Member, source.validateEpoch)
@@ -288,6 +289,6 @@ func TestBootstrapRegistrationTLSRevocationRetainsHandleThroughResult(t *testing
 	startup, stop := bootstrapGateContext(t, bootstrapGateTestToken)
 	defer stop()
 	err := f.handle.Invoke(startup, f.cc, pb.EncryptionAdmin_RegisterEncryptionWriter_FullMethodName,
-		registrationRequest(7, 2, 3), &pb.RegisterEncryptionWriterResponse{})
+		encryptionwiring.RegistrationRequest(7, 2, 3), &pb.RegisterEncryptionWriterResponse{})
 	require.Error(t, err)
 }

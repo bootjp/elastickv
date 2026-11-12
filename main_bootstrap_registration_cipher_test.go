@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/internal/peersession"
 	"github.com/bootjp/elastickv/internal/raftadmission"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
@@ -37,7 +38,7 @@ func TestBootstrapRegistrationTLSCipherBoundDeclaration(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			projection, wrap := bootstrapEncryptedPayloadFixture(t, 17)
-			plain := registrationEntry(tc.dek, tc.member, tc.epoch)
+			plain := encryptionwiring.RegistrationEntry(tc.dek, tc.member, tc.epoch)
 			final, err := wrap(plain)
 			require.NoError(t, err)
 			second, err := wrap(plain)
@@ -73,7 +74,7 @@ func TestBootstrapRegistrationTLSCipherBoundDeclaration(t *testing.T) {
 			ctx, cancel := bootstrapGateContext(t, bootstrapGateTestToken)
 			defer cancel()
 			err = fixture.handle.Invoke(ctx, fixture.cc, pb.EncryptionAdmin_RegisterEncryptionWriter_FullMethodName,
-				registrationRequest(7, 2, 3), &pb.RegisterEncryptionWriterResponse{})
+				encryptionwiring.RegistrationRequest(7, 2, 3), &pb.RegisterEncryptionWriterResponse{})
 			if tc.accepted {
 				require.NoError(t, err)
 			} else {

@@ -1,4 +1,4 @@
-package main
+package encryptionwiring
 
 import (
 	"context"
@@ -238,7 +238,7 @@ func TestEncryptionPreRegister_ActiveRaftDEKForPreRegister(t *testing.T) {
 	t.Parallel()
 	const activeRaftDEK uint32 = 22
 	sidecarPath := writeRaftCutoverSidecarForStartup(t, activeRaftDEK, 0, 100)
-	pre := &encryptionPreRegister{sidecarPath: sidecarPath}
+	pre := &encryptionPreRegister{SidecarPath: sidecarPath}
 	got, ok, err := pre.activeRaftDEKForPreRegister()
 	if err != nil {
 		t.Fatalf("activeRaftDEKForPreRegister: %v", err)
@@ -255,7 +255,7 @@ func TestEncryptionPreRegister_ActiveRaftDEKForPreRegisterBeforeCutover(t *testi
 	t.Parallel()
 	const activeRaftDEK uint32 = 22
 	sidecarPath := writeRaftCutoverSidecarForStartup(t, activeRaftDEK, 0, 0)
-	pre := &encryptionPreRegister{sidecarPath: sidecarPath}
+	pre := &encryptionPreRegister{SidecarPath: sidecarPath}
 	got, ok, err := pre.activeRaftDEKForPreRegister()
 	if err != nil {
 		t.Fatalf("activeRaftDEKForPreRegister: %v", err)
@@ -285,19 +285,25 @@ func (p *recordingMembershipProposer) ProposeAdmin(context.Context, []byte) (*ra
 }
 
 func (p *recordingMembershipProposer) State() raftengine.State { return raftengine.StateLeader }
+
 func (p *recordingMembershipProposer) Leader() raftengine.LeaderInfo {
 	return raftengine.LeaderInfo{ID: "self", Address: "127.0.0.1:0"}
 }
+
 func (p *recordingMembershipProposer) VerifyLeader(context.Context) error { return nil }
+
 func (p *recordingMembershipProposer) LinearizableRead(context.Context) (uint64, error) {
 	return 0, nil
 }
+
 func (p *recordingMembershipProposer) Status() raftengine.Status {
 	return raftengine.Status{State: raftengine.StateLeader}
 }
+
 func (p *recordingMembershipProposer) Configuration(context.Context) (raftengine.Configuration, error) {
 	return raftengine.Configuration{}, nil
 }
+
 func (p *recordingMembershipProposer) Close() error { return nil }
 
 func TestProposeWriterRegistrationBlockingOnCutover_LeaderUsesPropose(t *testing.T) {
@@ -340,14 +346,14 @@ func TestNewEncryptionConfChangeInterceptorGatedOnEncryptionConfigured(t *testin
 	t.Cleanup(func() { _ = st.Close() })
 	cache := encryption.NewStateCache()
 
-	if got := newEncryptionConfChangeInterceptor(
+	if got := NewConfChangeInterceptor(
 		false, &kv.ShardedCoordinator{}, &kv.ShardGroup{Store: st}, cache, "", stubDeriveNodeID,
 		allowStorageEnvelopeV2Capability,
 	); got != nil {
 		t.Fatalf("interceptor = %v, want nil when encryption is not configured", got)
 	}
 
-	if got := newEncryptionConfChangeInterceptor(
+	if got := NewConfChangeInterceptor(
 		true, &kv.ShardedCoordinator{}, &kv.ShardGroup{Store: st}, cache, "", stubDeriveNodeID,
 		allowStorageEnvelopeV2Capability,
 	); got == nil {
@@ -355,7 +361,7 @@ func TestNewEncryptionConfChangeInterceptorGatedOnEncryptionConfigured(t *testin
 	}
 
 	// The nil guards inside newEncryptionPreRegister still apply.
-	if got := newEncryptionConfChangeInterceptor(
+	if got := NewConfChangeInterceptor(
 		true, nil, nil, nil, "", nil,
 	); got != nil {
 		t.Fatalf("interceptor = %v, want nil when the dependencies are missing", got)
@@ -365,17 +371,17 @@ func TestNewEncryptionConfChangeInterceptorGatedOnEncryptionConfigured(t *testin
 func TestEncryptionWriteWiringEncryptionConfigured(t *testing.T) {
 	t.Parallel()
 
-	var off encryptionWriteWiring
-	if off.encryptionConfigured() {
+	var off WriteWiring
+	if off.EncryptionConfigured() {
 		t.Fatal("zero wiring reported encryption configured")
 	}
 	// The cache is always populated, so it must not be what decides.
-	defaulted := encryptionWriteWiring{cache: encryption.NewStateCache()}
-	if defaulted.encryptionConfigured() {
+	defaulted := WriteWiring{Cache: encryption.NewStateCache()}
+	if defaulted.EncryptionConfigured() {
 		t.Fatal("a defaulted cache alone reported encryption configured")
 	}
-	on := encryptionWriteWiring{cache: encryption.NewStateCache(), cipher: &encryption.Cipher{}}
-	if !on.encryptionConfigured() {
+	on := WriteWiring{Cache: encryption.NewStateCache(), Cipher: &encryption.Cipher{}}
+	if !on.EncryptionConfigured() {
 		t.Fatal("wiring with a cipher did not report encryption configured")
 	}
 }

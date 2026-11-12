@@ -1,4 +1,4 @@
-package main
+package encryptionwiring
 
 import (
 	"bytes"
@@ -36,7 +36,7 @@ func TestRaftEnvelopeRuntime_StartupCutoverInstallsWrapOnAttach(t *testing.T) {
 	const keyID uint32 = 4
 	cipher, nonceFactory := newTestRaftEnvelopeRuntimeDeps(t)
 	var cutover atomic.Uint64
-	runtime, err := newRaftEnvelopeRuntime(cipher, nonceFactory, 1234, keyID, &cutover, 7, 0, nil)
+	runtime, err := NewRaftEnvelopeRuntime(cipher, nonceFactory, 1234, keyID, &cutover, 7, 0, nil)
 	if err != nil {
 		t.Fatalf("newRaftEnvelopeRuntime: %v", err)
 	}
@@ -44,7 +44,7 @@ func TestRaftEnvelopeRuntime_StartupCutoverInstallsWrapOnAttach(t *testing.T) {
 		t.Fatalf("engineCutoverIndex = %d, want 1234", got)
 	}
 	sg := &kv.ShardGroup{}
-	runtime.attachGroup(7, sg)
+	runtime.AttachGroup(7, sg)
 	wrap := sg.RaftPayloadWrap()
 	if wrap == nil {
 		t.Fatal("attached shard group has nil wrap after startup cutover")
@@ -67,7 +67,7 @@ func TestRaftEnvelopeRuntime_InactiveCutoverIsInert(t *testing.T) {
 	t.Parallel()
 	cipher, nonceFactory := newTestRaftEnvelopeRuntimeDeps(t)
 	var cutover atomic.Uint64
-	runtime, err := newRaftEnvelopeRuntime(cipher, nonceFactory, 0, 0, &cutover, 7, 0, nil)
+	runtime, err := NewRaftEnvelopeRuntime(cipher, nonceFactory, 0, 0, &cutover, 7, 0, nil)
 	if err != nil {
 		t.Fatalf("newRaftEnvelopeRuntime: %v", err)
 	}
@@ -75,7 +75,7 @@ func TestRaftEnvelopeRuntime_InactiveCutoverIsInert(t *testing.T) {
 		t.Fatalf("engineCutoverIndex = %d, want inert sentinel", got)
 	}
 	sg := &kv.ShardGroup{}
-	runtime.attachGroup(7, sg)
+	runtime.AttachGroup(7, sg)
 	if wrap := sg.RaftPayloadWrap(); wrap != nil {
 		t.Fatalf("inactive cutover installed wrap %p, want nil", wrap)
 	}
@@ -86,12 +86,12 @@ func TestRaftEnvelopeRuntime_InstallFromApplyPublishesWrap(t *testing.T) {
 	const keyID uint32 = 4
 	cipher, nonceFactory := newTestRaftEnvelopeRuntimeDeps(t)
 	var cutover atomic.Uint64
-	runtime, err := newRaftEnvelopeRuntime(cipher, nonceFactory, 0, 0, &cutover, 7, 0, nil)
+	runtime, err := NewRaftEnvelopeRuntime(cipher, nonceFactory, 0, 0, &cutover, 7, 0, nil)
 	if err != nil {
 		t.Fatalf("newRaftEnvelopeRuntime: %v", err)
 	}
 	sg := &kv.ShardGroup{}
-	runtime.attachGroup(7, sg)
+	runtime.AttachGroup(7, sg)
 	if err := runtime.installFromApply(5678, keyID); err != nil {
 		t.Fatalf("installFromApply: %v", err)
 	}
@@ -122,7 +122,7 @@ func TestRaftEnvelopeRuntime_InstallRotatedRaftDEKRepublishesWrap(t *testing.T) 
 		t.Fatalf("NewCipher: %v", err)
 	}
 	var cutover atomic.Uint64
-	runtime, err := newRaftEnvelopeRuntime(
+	runtime, err := NewRaftEnvelopeRuntime(
 		cipher,
 		encryption.NewDeterministicNonceFactory(0xCAFE, 7),
 		1234,
@@ -136,7 +136,7 @@ func TestRaftEnvelopeRuntime_InstallRotatedRaftDEKRepublishesWrap(t *testing.T) 
 		t.Fatalf("newRaftEnvelopeRuntime: %v", err)
 	}
 	sg := &kv.ShardGroup{}
-	runtime.attachGroup(7, sg)
+	runtime.AttachGroup(7, sg)
 	if err := runtime.installRotatedRaftDEK(newKeyID); err != nil {
 		t.Fatalf("installRotatedRaftDEK: %v", err)
 	}
@@ -163,14 +163,14 @@ func TestRaftEnvelopeRuntime_WrapRequiresRaftWriterRegistration(t *testing.T) {
 	const raftEpoch uint16 = 9
 	cipher, nonceFactory := newTestRaftEnvelopeRuntimeDeps(t)
 	var cutover atomic.Uint64
-	gate := &raftRegistrationGate{}
+	gate := &RaftRegistrationGate{}
 	const fullNodeID uint64 = 0x1234
-	runtime, err := newRaftEnvelopeRuntime(cipher, nonceFactory, 0, 0, &cutover, raftEpoch, fullNodeID, gate)
+	runtime, err := NewRaftEnvelopeRuntime(cipher, nonceFactory, 0, 0, &cutover, raftEpoch, fullNodeID, gate)
 	if err != nil {
 		t.Fatalf("newRaftEnvelopeRuntime: %v", err)
 	}
 	sg := &kv.ShardGroup{}
-	runtime.attachGroup(7, sg)
+	runtime.AttachGroup(7, sg)
 	if err := runtime.installFromApply(5678, keyID); err != nil {
 		t.Fatalf("installFromApply: %v", err)
 	}
@@ -214,12 +214,12 @@ func TestRaftEnvelopeRuntime_WrapBypassRequiresLocalRaftRegistration(t *testing.
 	const fullNodeID uint64 = 0x1234
 	cipher, nonceFactory := newTestRaftEnvelopeRuntimeDeps(t)
 	var cutover atomic.Uint64
-	runtime, err := newRaftEnvelopeRuntime(cipher, nonceFactory, 0, 0, &cutover, raftEpoch, fullNodeID, &raftRegistrationGate{})
+	runtime, err := NewRaftEnvelopeRuntime(cipher, nonceFactory, 0, 0, &cutover, raftEpoch, fullNodeID, &RaftRegistrationGate{})
 	if err != nil {
 		t.Fatalf("newRaftEnvelopeRuntime: %v", err)
 	}
 	sg := &kv.ShardGroup{}
-	runtime.attachGroup(7, sg)
+	runtime.AttachGroup(7, sg)
 	if err := runtime.installFromApply(5678, keyID); err != nil {
 		t.Fatalf("installFromApply: %v", err)
 	}
@@ -251,8 +251,8 @@ func TestRaftEnvelopeRuntime_InstallFromApplySeedsCommittedRegistration(t *testi
 	const raftEpoch uint16 = 9
 	cipher, nonceFactory := newTestRaftEnvelopeRuntimeDeps(t)
 	var cutover atomic.Uint64
-	gate := &raftRegistrationGate{}
-	runtime, err := newRaftEnvelopeRuntime(cipher, nonceFactory, 0, 0, &cutover, raftEpoch, 0x1234, gate)
+	gate := &RaftRegistrationGate{}
+	runtime, err := NewRaftEnvelopeRuntime(cipher, nonceFactory, 0, 0, &cutover, raftEpoch, 0x1234, gate)
 	if err != nil {
 		t.Fatalf("newRaftEnvelopeRuntime: %v", err)
 	}
@@ -260,7 +260,7 @@ func TestRaftEnvelopeRuntime_InstallFromApplySeedsCommittedRegistration(t *testi
 		return dekID == keyID && epoch == raftEpoch
 	})
 	sg := &kv.ShardGroup{}
-	runtime.attachGroup(7, sg)
+	runtime.AttachGroup(7, sg)
 	if err := runtime.installFromApply(5678, keyID); err != nil {
 		t.Fatalf("installFromApply: %v", err)
 	}
@@ -301,8 +301,8 @@ func (nilChannelCutoverEngine) EndCutoverBarrier() {}
 
 func TestRaftEnvelopeCutoverBarrier_BeginTreatsNilGroupChannelAsDrained(t *testing.T) {
 	t.Parallel()
-	runtime := &raftEnvelopeRuntime{
-		groups: map[uint64]*kv.ShardGroup{
+	runtime := &RaftEnvelopeRuntime{
+		Groups: map[uint64]*kv.ShardGroup{
 			7: {Engine: nilChannelCutoverEngine{}},
 		},
 	}
@@ -316,8 +316,8 @@ func TestRaftEnvelopeCutoverBarrier_BeginTreatsNilGroupChannelAsDrained(t *testi
 
 func TestRaftEnvelopeCutoverBarrier_ValidateCutoverScopeRefusesMultipleGroups(t *testing.T) {
 	t.Parallel()
-	runtime := &raftEnvelopeRuntime{
-		groups: map[uint64]*kv.ShardGroup{
+	runtime := &RaftEnvelopeRuntime{
+		Groups: map[uint64]*kv.ShardGroup{
 			7: {},
 			8: {},
 		},

@@ -1,4 +1,4 @@
-package main
+package encryptionwiring
 
 import (
 	"context"
@@ -104,14 +104,14 @@ func TestEncryption_E2E_BootstrapCutoverPutReadback(t *testing.T) {
 func newE2EEncryptionFixture(t *testing.T, sidecarPath, pebbleDir string) (store.MVCCStore, *encryption.Applier, *encryption.StateCache, func()) {
 	t.Helper()
 	keystore := encryption.NewKeystore()
-	encWiring, err := buildEncryptionWriteWiring(true, "n1", sidecarPath, wiringFakeKEK{}, keystore, []noderuntime.GroupSpec{{ID: 1}}, nil)
+	encWiring, err := BuildWriteWiring(true, "n1", sidecarPath, wiringFakeKEK{}, keystore, []noderuntime.GroupSpec{{ID: 1}}, nil)
 	if err != nil {
 		t.Fatalf("buildEncryptionWriteWiring: %v", err)
 	}
-	if encWiring.cipher == nil || encWiring.nonceFactory == nil {
+	if encWiring.Cipher == nil || encWiring.NonceFactory == nil {
 		t.Fatal("expected cipher + nonce factory wired when encryption enabled")
 	}
-	st, err := store.NewPebbleStore(pebbleDir, encWiring.pebbleOptions()...)
+	st, err := store.NewPebbleStore(pebbleDir, encWiring.PebbleOptions()...)
 	if err != nil {
 		t.Fatalf("NewPebbleStore: %v", err)
 	}
@@ -132,12 +132,12 @@ func newE2EEncryptionFixture(t *testing.T, sidecarPath, pebbleDir string) (store
 		encryption.WithKEK(wiringFakeKEK{}),
 		encryption.WithKeystore(keystore),
 		encryption.WithSidecarPath(sidecarPath),
-		encryption.WithStateCache(encWiring.cache),
+		encryption.WithStateCache(encWiring.Cache),
 	)
 	if err != nil {
 		t.Fatalf("NewApplier: %v", err)
 	}
-	return st, applier, encWiring.cache, closeStore
+	return st, applier, encWiring.Cache, closeStore
 }
 
 func applyE2EBootstrap(t *testing.T, applier *encryption.Applier) {

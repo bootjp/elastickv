@@ -7,6 +7,7 @@ import (
 
 	"github.com/bootjp/elastickv/distribution"
 	internalutil "github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/peersession"
 	"github.com/bootjp/elastickv/internal/raftadmission"
@@ -77,7 +78,7 @@ func bootstrapDomainForRuntimes(runtimes []*raftGroupRuntime) *bootstrapDomain {
 	return nil
 }
 
-func newBootstrapDomain(cluster raftbootstrap.UUID, groups []noderuntime.GroupSpec, request noderuntime.BootstrapEncryptionRequest, encWiring ...encryptionWriteWiring) (*bootstrapDomain, error) {
+func newBootstrapDomain(cluster raftbootstrap.UUID, groups []noderuntime.GroupSpec, request noderuntime.BootstrapEncryptionRequest, encWiring ...encryptionwiring.WriteWiring) (*bootstrapDomain, error) {
 	enc, err := newBootstrapEncryptionDomain(groups, request, encWiring)
 	if err != nil {
 		return nil, err
@@ -102,8 +103,8 @@ func newBootstrapDomain(cluster raftbootstrap.UUID, groups []noderuntime.GroupSp
 	}
 	d.admission = a
 	if enc != nil {
-		enc.wiring.cache.SetBeforeEncryptionChange(a.BeginEncryptionMutation)
-		enc.wiring.raftEnvelope.setBeforeEncryptionChange(a.BeginEncryptionMutation)
+		enc.wiring.Cache.SetBeforeEncryptionChange(a.BeginEncryptionMutation)
+		enc.wiring.RaftEnvelope.SetBeforeEncryptionChange(a.BeginEncryptionMutation)
 	}
 	return d, nil
 }

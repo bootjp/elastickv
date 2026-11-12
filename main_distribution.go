@@ -8,6 +8,7 @@ import (
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/distribution/autosplit"
 	internalutil "github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/internal/nodeauth"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -42,7 +43,7 @@ type distributionStartupInput struct {
 	coordinate      *kv.ShardedCoordinator
 	shardStore      *kv.ShardStore
 	defaultGroup    *kv.ShardGroup
-	encWiring       encryptionWriteWiring
+	encWiring       encryptionwiring.WriteWiring
 	raftID          string
 	sidecarPath     string
 	sampler         *keyviz.MemSampler
@@ -167,7 +168,7 @@ func startDistributionStartup(in distributionStartupInput) (distributionStartup,
 	if err != nil {
 		return distributionStartup{}, err
 	}
-	startMonitoringCollectors(in.ctx, in.metricsRegistry, in.runtimes, in.clock, in.encWiring.cache)
+	startMonitoringCollectors(in.ctx, in.metricsRegistry, in.runtimes, in.clock, in.encWiring.Cache)
 	startFSMCompactorIfEnabled(in.ctx, in.eg, in.runtimes, in.readTracker)
 	// §4 physical snapshot offload. Opt-in, and a hard error when
 	// configured-but-unbuildable: an operator who set a backup
@@ -282,7 +283,7 @@ func setupDistributionCatalog(
 	// EnsureCatalogSnapshot may Save through the direct (non-raft) write
 	// path. When the §7.1 storage envelope is active and this load's
 	// writer registration has not yet committed, that Save fails closed
-	// with store.ErrWriterNotRegistered (Stage 7a-2). retryUntilRegistered
+	// with store.ErrWriterNotRegistered (Stage 7a-2). encryptionwiring.RetryUntilRegistered
 	// retries the bootstrap until the registration goroutine — armed
 	// before this call in setupDistributionAndRegistration — commits and
 	// the gate clears. The common cases (populated catalog → no-op Save,
@@ -293,7 +294,7 @@ func setupDistributionCatalog(
 	// from scratch on each ErrWriterNotRegistered, so it MUST be
 	// re-entrant — on the populated-catalog path it is a version-unchanged
 	// no-op Save (no mutation, no nonce), so re-running it is safe.
-	if err := retryUntilRegistered(ctx, "distribution catalog bootstrap", func() error {
+	if err := encryptionwiring.RetryUntilRegistered(ctx, "distribution catalog bootstrap", func() error {
 		_, e := distribution.EnsureCatalogSnapshot(ctx, distCatalog, engine)
 		return errors.Wrap(e, "ensure catalog snapshot")
 	}); err != nil {
@@ -332,7 +333,7 @@ func setupDistributionRuntimeDependencies(
 	coordinate *kv.ShardedCoordinator,
 	defaultGroup *kv.ShardGroup,
 	defaultGroupID uint64,
-	encWiring encryptionWriteWiring,
+	encWiring encryptionwiring.WriteWiring,
 	raftID string,
 	sidecarPath string,
 ) (*distribution.CatalogStore, *raftGroupRuntime, *raftGroupRuntime, error) {
@@ -404,7 +405,7 @@ func runDistributionCatalogStream(
 // direct encrypted write that 7a-2 gates on Registered(); arming the
 // gate (which starts the registration goroutine) before the bootstrap
 // lets the empty-catalog + active-envelope edge clear once registration
-// commits, via the bounded retryUntilRegistered wrapper inside
+// commits, via the bounded encryptionwiring.RetryUntilRegistered wrapper inside
 // setupDistributionCatalog. Registration has no dependency on the route
 // catalog (the OpRegistration apply writes a writer-registry row, not a
 // route), so arm-before-bootstrap cannot deadlock.
@@ -415,27 +416,27 @@ func setupDistributionAndRegistration(
 	engine *distribution.Engine,
 	coordinate *kv.ShardedCoordinator,
 	defaultGroup *kv.ShardGroup,
-	w encryptionWriteWiring,
+	w encryptionwiring.WriteWiring,
 	raftID string,
 	sidecarPath string,
 ) (*distribution.CatalogStore, error) {
-	if err := validateRaftRegistrationStartupEpoch(defaultGroup, w, raftID, sidecarPath); err != nil {
-		return nil, err
+	if err := encryptionwiring.ValidateRaftRegistrationStartupEpoch(defaultGroup, w, raftID, sidecarPath); err != nil {
+		return nil, errors.WithStack(err)
 	}
-	if err := installProcessStartRegistrationGate(runCtx, eg, coordinate, defaultGroup, w, raftID); err != nil {
-		return nil, err
+	if err := encryptionwiring.InstallProcessStartRegistrationGate(runCtx, eg, coordinate, defaultGroup, w, raftID); err != nil {
+		return nil, errors.WithStack(err)
 	}
-	installRaftRegistrationVerifier(defaultGroup, w, raftID)
-	installRuntimeRaftRegistrationWatcher(runCtx, eg, coordinate, defaultGroup, w, raftID, sidecarPath)
+	encryptionwiring.InstallRaftRegistrationVerifier(defaultGroup, w, raftID)
+	encryptionwiring.InstallRuntimeRaftRegistrationWatcher(runCtx, eg, coordinate, defaultGroup, w, raftID, sidecarPath)
 	// Stage 7b/7b': arm the runtime watcher. Handles all three runtime
 	// registration triggers — cutover (Phase-0 → EnableStorageEnvelope),
 	// pre-bootstrap (no DEK → runtime Bootstrap), and rotation (RotateDEK
 	// from a non-proposer's perspective). All three collapse to the same
 	// in-scope propose under the cache.Registered() gate in
 	// runtimeRegistrationInScope. Must run AFTER
-	// installProcessStartRegistrationGate so the gate is in place before
+	// encryptionwiring.InstallProcessStartRegistrationGate so the gate is in place before
 	// any runtime trigger can fire.
-	installRuntimeRegistrationWatcher(runCtx, eg, coordinate, defaultGroup, w, raftID)
+	encryptionwiring.InstallRuntimeRegistrationWatcher(runCtx, eg, coordinate, defaultGroup, w, raftID)
 	// Bootstrap + registration both run under runCtx so a shutdown
 	// cancels the bounded retry rather than hanging.
 	distCatalog, err := setupDistributionCatalog(runCtx, runtimes, engine)

@@ -42,6 +42,7 @@ var upperLayers = []string{
 	"distribution/autosplit",
 	"internal/admin",
 	"internal/adminbridge",
+	"internal/encryptionwiring",
 	"internal/nodeauth",
 	"internal/noderuntime",
 	"internal/serverwiring",
@@ -116,7 +117,7 @@ var layerRules = []layerRule{
 	},
 	{
 		Dir:  "adapter",
-		Deny: []string{"proxy", "internal/adminbridge", "internal/serverwiring", "internal/snapshotoffload"},
+		Deny: []string{"proxy", "internal/adminbridge", "internal/serverwiring", "internal/snapshotoffload", "internal/noderuntime", "internal/nodeauth", "internal/encryptionwiring"},
 		Why:  "protocol adapters must not depend on binary wiring",
 	},
 }
@@ -125,12 +126,13 @@ var layerRules = []layerRule{
 var restrictedPackages = []restrictedPackage{
 	{
 		Pkg:         "internal/raftengine/etcd",
-		AllowedFrom: []string{".", "cmd", "internal/raftengine", "internal/snapshotoffload"},
+		AllowedFrom: []string{".", "cmd", "internal/raftengine", "internal/snapshotoffload", "internal/encryptionwiring"},
 		Why:         "the concrete Raft backend is chosen at the wiring edge; everything else uses internal/raftengine",
 	},
 	{Pkg: "internal/serverwiring", AllowedFrom: []string{".", "cmd"}, Why: "server wiring is for binaries only"},
 	{Pkg: "internal/adminbridge", AllowedFrom: []string{".", "cmd"}, Why: "admin bridges are wired by binaries only"},
-	{Pkg: "internal/noderuntime", AllowedFrom: []string{".", "cmd"}, Why: "node runtime configuration is resolved by binaries only"},
+	{Pkg: "internal/noderuntime", AllowedFrom: []string{".", "cmd", "internal/encryptionwiring"}, Why: "node runtime configuration is resolved by binaries and the wiring layers above it"},
+	{Pkg: "internal/encryptionwiring", AllowedFrom: []string{".", "cmd"}, Why: "encryption wiring is assembled by binaries only"},
 	{Pkg: "internal/snapshotoffloadwiring", AllowedFrom: []string{".", "cmd"}, Why: "snapshot offload start-up is wired by binaries only"},
 	{Pkg: "internal/tsowiring", AllowedFrom: []string{".", "cmd"}, Why: "TSO wiring is configured by binaries only"},
 	{Pkg: "internal/nodeauth", AllowedFrom: []string{".", "cmd"}, Why: "node and admin gRPC authentication is configured by binaries only"},

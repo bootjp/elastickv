@@ -11,6 +11,7 @@ import (
 	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/bootjp/elastickv/internal/admin"
 	"github.com/bootjp/elastickv/internal/adminbridge"
+	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/internal/nodeauth"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	internalraftadmin "github.com/bootjp/elastickv/internal/raftadmin"
@@ -49,8 +50,8 @@ type serversInput struct {
 	readTracker        *kv.ActiveTimestampTracker
 	metricsRegistry    *monitoring.Registry
 	cfg                noderuntime.RuntimeConfig
-	encWiring          encryptionWriteWiring
-	encryption         encryptionFlags
+	encWiring          encryptionwiring.WriteWiring
+	encryption         encryptionwiring.Flags
 	kekConfigured      bool
 	redisApplyObserver *adapter.RedisApplyObserver
 	cleanup            *internalutil.CleanupStack
@@ -92,7 +93,7 @@ type serversInput struct {
 // per-group Raft listeners needed for quorum traffic, waits for a fresh join
 // to catch up, prepares the public listeners, waits for any requested startup
 // rotation, then starts serving public traffic.
-func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter, in serversInput) error {
+func startServersAfterStartupRotation(waitRotateOnStartup encryptionwiring.StartupRotationWaiter, in serversInput) error {
 	adminGRPCEnabled := in.nodeAuth.AdminTokenFile != "" || in.nodeAuth.AdminInsecureNoAuth
 	// roleStore is gated on *adminEnabled. With admin HTTP disabled, building
 	// it is wasted work AND a security regression risk: a non-empty
@@ -257,8 +258,8 @@ type runtimeServerRunner struct {
 	readTracker                     *kv.ActiveTimestampTracker
 	redisApplyObserver              *adapter.RedisApplyObserver
 	s3BlobBackfiller                *adapter.S3BlobBackfiller
-	encWiring                       encryptionWriteWiring
-	encryption                      encryptionFlags
+	encWiring                       encryptionwiring.WriteWiring
+	encryption                      encryptionwiring.Flags
 	kekConfigured                   bool
 	defaultGroupID                  uint64
 	dynamoAddress                   string

@@ -9,6 +9,7 @@ import (
 
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryption/kek"
+	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/stretchr/testify/require"
 )
@@ -27,7 +28,7 @@ func newExternalRotationMaterialFixture(t *testing.T) *rotationRecipeFixture {
 		key := sc.Keys[id]
 		material := bytes.Clone(key.Wrapped[:encryption.KeySize])
 		key.Wrapped, err = wrapper.Wrap(material)
-		zeroBytes(material)
+		encryptionwiring.ZeroBytes(material)
 		require.NoError(t, err)
 		sc.Keys[id] = key
 	}
@@ -110,7 +111,7 @@ func externalRotationMaterialReplay(t *testing.T, f *rotationRecipeFixture, same
 		material, err := f.cfg.Wrapper.Unwrap(wrapped)
 		require.NoError(t, err)
 		wrapped, err = f.cfg.Wrapper.Wrap(material)
-		zeroBytes(material)
+		encryptionwiring.ZeroBytes(material)
 		require.NoError(t, err)
 		require.NotEqual(t, sc.Keys["1"].Wrapped, wrapped, "randomized KEK envelopes must differ for the SAME AES key")
 	}

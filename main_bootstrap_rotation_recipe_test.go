@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/encryption"
+	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
@@ -278,7 +279,7 @@ func TestBootstrapRotationRecipeRejectsUnverifiedCompletion(t *testing.T) {
 			require.Error(t, err)
 			require.Equal(t, bootstrapRotationPending, result.Outcome)
 			if corruption == "projection_change" {
-				require.ErrorIs(t, err, errBootstrapEncryptionProjectionPending)
+				require.ErrorIs(t, err, encryptionwiring.ErrBootstrapEncryptionProjectionPending)
 				require.True(t, bootstrapRotationTransient(err))
 			}
 		})
@@ -413,7 +414,7 @@ func TestBootstrapRotationRecipeDriftAndNotLeaderAreTransient(t *testing.T) {
 	require.NoError(t, err)
 	r.config.Barrier = func(context.Context) (uint64, error) { return f.index - 1, nil }
 	_, err = r.Run(t.Context())
-	require.ErrorIs(t, err, errBootstrapEncryptionProjectionPending)
+	require.ErrorIs(t, err, encryptionwiring.ErrBootstrapEncryptionProjectionPending)
 	require.True(t, bootstrapRotationTransient(err))
 	r.config.Barrier = f.cfg.Barrier
 	f.leader = false

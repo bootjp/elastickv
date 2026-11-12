@@ -1,4 +1,4 @@
-package main
+package encryptionwiring
 
 import (
 	"context"
@@ -15,30 +15,30 @@ import (
 
 const inertRaftEnvelopeCutoverIndex = ^uint64(0)
 
-type raftEnvelopeRuntime struct {
-	cipher       *encryption.Cipher
-	nonceFactory store.NonceFactory
-	raftEpoch    uint16
-	fullNodeID   uint64
-	registration *raftRegistrationGate
-	registered   func(dekID uint32, epoch uint16) bool
+type RaftEnvelopeRuntime struct {
+	Cipher       *encryption.Cipher
+	NonceFactory store.NonceFactory
+	RaftEpoch    uint16
+	FullNodeID   uint64
+	Registration *RaftRegistrationGate
+	Registered   func(dekID uint32, epoch uint16) bool
 
-	mu                     sync.Mutex
-	groups                 map[uint64]*kv.ShardGroup
+	Mu                     sync.Mutex
+	Groups                 map[uint64]*kv.ShardGroup
 	installedWraps         map[*kv.ShardGroup]kv.RaftPayloadWrapObservation
 	beforeEncryptionChange atomic.Pointer[func() func()]
 	activeWrap             kv.RaftPayloadWrapper
-	activeRaftDEKID        uint32
+	ActiveRaftDEKID        uint32
 
-	cutoverIndex *atomic.Uint64
+	CutoverIndex *atomic.Uint64
 }
 
-type raftRegistrationGate struct {
+type RaftRegistrationGate struct {
 	registered             atomic.Uint64
 	beforeEncryptionChange atomic.Pointer[func() func()]
 }
 
-func (g *raftRegistrationGate) MarkRegistered(dekID uint32, epoch uint16) {
+func (g *RaftRegistrationGate) MarkRegistered(dekID uint32, epoch uint16) {
 	if g == nil || dekID == 0 {
 		return
 	}
@@ -52,7 +52,7 @@ func (g *raftRegistrationGate) MarkRegistered(dekID uint32, epoch uint16) {
 	g.registered.Store(packRaftRegistration(dekID, epoch))
 }
 
-func (g *raftRegistrationGate) Registered(dekID uint32, epoch uint16) bool {
+func (g *RaftRegistrationGate) Registered(dekID uint32, epoch uint16) bool {
 	if g == nil || dekID == 0 {
 		return false
 	}
@@ -63,19 +63,19 @@ func packRaftRegistration(dekID uint32, epoch uint16) uint64 {
 	return uint64(dekID)<<16 | uint64(epoch)
 }
 
-func newRaftEnvelopeRuntime(cipher *encryption.Cipher, nonceFactory store.NonceFactory, initialCutover uint64, activeRaftDEKID uint32, cell *atomic.Uint64, raftEpoch uint16, fullNodeID uint64, registration *raftRegistrationGate) (*raftEnvelopeRuntime, error) {
+func NewRaftEnvelopeRuntime(cipher *encryption.Cipher, nonceFactory store.NonceFactory, initialCutover uint64, activeRaftDEKID uint32, cell *atomic.Uint64, raftEpoch uint16, fullNodeID uint64, registration *RaftRegistrationGate) (*RaftEnvelopeRuntime, error) {
 	if cell == nil {
 		return nil, errors.New("raft envelope runtime: nil cutover cell")
 	}
-	r := &raftEnvelopeRuntime{
-		cipher:         cipher,
-		nonceFactory:   nonceFactory,
-		raftEpoch:      raftEpoch,
-		fullNodeID:     fullNodeID,
-		registration:   registration,
-		groups:         map[uint64]*kv.ShardGroup{},
+	r := &RaftEnvelopeRuntime{
+		Cipher:         cipher,
+		NonceFactory:   nonceFactory,
+		RaftEpoch:      raftEpoch,
+		FullNodeID:     fullNodeID,
+		Registration:   registration,
+		Groups:         map[uint64]*kv.ShardGroup{},
 		installedWraps: map[*kv.ShardGroup]kv.RaftPayloadWrapObservation{},
-		cutoverIndex:   cell,
+		CutoverIndex:   cell,
 	}
 	if initialCutover == 0 {
 		return r, nil
@@ -88,50 +88,50 @@ func newRaftEnvelopeRuntime(cipher *encryption.Cipher, nonceFactory store.NonceF
 		return nil, err
 	}
 	r.activeWrap = wrap
-	r.activeRaftDEKID = activeRaftDEKID
-	r.cutoverIndex.Store(initialCutover)
+	r.ActiveRaftDEKID = activeRaftDEKID
+	r.CutoverIndex.Store(initialCutover)
 	return r, nil
 }
 
-func (r *raftEnvelopeRuntime) setRegistrationVerifier(registered func(dekID uint32, epoch uint16) bool) {
-	r.mu.Lock()
-	r.registered = registered
-	r.mu.Unlock()
+func (r *RaftEnvelopeRuntime) setRegistrationVerifier(registered func(dekID uint32, epoch uint16) bool) {
+	r.Mu.Lock()
+	r.Registered = registered
+	r.Mu.Unlock()
 }
 
-func (r *raftEnvelopeRuntime) engineCutoverIndex() uint64 {
-	idx := r.cutoverIndex.Load()
+func (r *RaftEnvelopeRuntime) engineCutoverIndex() uint64 {
+	idx := r.CutoverIndex.Load()
 	if idx == 0 {
 		return inertRaftEnvelopeCutoverIndex
 	}
 	return idx
 }
 
-func (r *raftEnvelopeRuntime) RaftEnvelopeCutoverIndex() uint64 {
-	if r == nil || r.cutoverIndex == nil {
+func (r *RaftEnvelopeRuntime) RaftEnvelopeCutoverIndex() uint64 {
+	if r == nil || r.CutoverIndex == nil {
 		return 0
 	}
-	return r.cutoverIndex.Load()
+	return r.CutoverIndex.Load()
 }
 
-func (r *raftEnvelopeRuntime) attachGroup(groupID uint64, g *kv.ShardGroup) {
+func (r *RaftEnvelopeRuntime) AttachGroup(groupID uint64, g *kv.ShardGroup) {
 	mutation := r.beginEncryptionChange()
 	defer mutation.Close()
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.Mu.Lock()
+	defer r.Mu.Unlock()
 	var begin func() func()
 	if callback := r.beforeEncryptionChange.Load(); callback != nil {
 		begin = *callback
 	}
 	g.SetRaftPayloadWrapInvalidator(begin)
-	r.groups[groupID] = g
+	r.Groups[groupID] = g
 	wrap := r.activeWrap
 	if wrap != nil {
 		r.installObservedWrap(g, wrap, mutation)
 	}
 }
 
-func (r *raftEnvelopeRuntime) installFromApply(cutoverIdx uint64, activeRaftDEKID uint32) error {
+func (r *RaftEnvelopeRuntime) installFromApply(cutoverIdx uint64, activeRaftDEKID uint32) error {
 	if cutoverIdx == 0 {
 		return errors.New("raft envelope runtime: cutover index must be non-zero")
 	}
@@ -144,31 +144,31 @@ func (r *raftEnvelopeRuntime) installFromApply(cutoverIdx uint64, activeRaftDEKI
 	}
 	mutation := r.beginEncryptionChange()
 	defer mutation.Close()
-	r.mu.Lock()
-	registered := r.registered
-	r.mu.Unlock()
-	if r.registration != nil && registered != nil && registered(activeRaftDEKID, r.raftEpoch) {
-		r.registration.MarkRegistered(activeRaftDEKID, r.raftEpoch)
+	r.Mu.Lock()
+	registered := r.Registered
+	r.Mu.Unlock()
+	if r.Registration != nil && registered != nil && registered(activeRaftDEKID, r.RaftEpoch) {
+		r.Registration.MarkRegistered(activeRaftDEKID, r.RaftEpoch)
 	}
-	r.mu.Lock()
+	r.Mu.Lock()
 	r.activeWrap = wrap
-	defer r.mu.Unlock()
-	r.activeRaftDEKID = activeRaftDEKID
-	for _, g := range r.groups {
+	defer r.Mu.Unlock()
+	r.ActiveRaftDEKID = activeRaftDEKID
+	for _, g := range r.Groups {
 		r.installObservedWrap(g, wrap, mutation)
 	}
-	r.cutoverIndex.Store(cutoverIdx)
+	r.CutoverIndex.Store(cutoverIdx)
 	return nil
 }
 
-func (r *raftEnvelopeRuntime) installRotatedRaftDEK(activeRaftDEKID uint32) error {
+func (r *RaftEnvelopeRuntime) installRotatedRaftDEK(activeRaftDEKID uint32) error {
 	if r == nil {
 		return nil
 	}
-	if r.cutoverIndex == nil {
+	if r.CutoverIndex == nil {
 		return errors.New("raft envelope runtime: nil cutover cell")
 	}
-	if r.cutoverIndex.Load() == 0 {
+	if r.CutoverIndex.Load() == 0 {
 		return nil
 	}
 	if activeRaftDEKID == 0 {
@@ -180,67 +180,67 @@ func (r *raftEnvelopeRuntime) installRotatedRaftDEK(activeRaftDEKID uint32) erro
 	}
 	mutation := r.beginEncryptionChange()
 	defer mutation.Close()
-	r.mu.Lock()
-	registered := r.registered
-	r.mu.Unlock()
-	if r.registration != nil && registered != nil && registered(activeRaftDEKID, r.raftEpoch) {
-		r.registration.MarkRegistered(activeRaftDEKID, r.raftEpoch)
+	r.Mu.Lock()
+	registered := r.Registered
+	r.Mu.Unlock()
+	if r.Registration != nil && registered != nil && registered(activeRaftDEKID, r.RaftEpoch) {
+		r.Registration.MarkRegistered(activeRaftDEKID, r.RaftEpoch)
 	}
-	r.mu.Lock()
+	r.Mu.Lock()
 	r.activeWrap = wrap
-	defer r.mu.Unlock()
-	r.activeRaftDEKID = activeRaftDEKID
-	for _, g := range r.groups {
+	defer r.Mu.Unlock()
+	r.ActiveRaftDEKID = activeRaftDEKID
+	for _, g := range r.Groups {
 		r.installObservedWrap(g, wrap, mutation)
 	}
 	return nil
 }
 
-func (r *raftEnvelopeRuntime) wrapInstalledFor(activeRaftDEKID uint32) bool {
-	if r == nil || activeRaftDEKID == 0 || r.cutoverIndex == nil {
+func (r *RaftEnvelopeRuntime) wrapInstalledFor(activeRaftDEKID uint32) bool {
+	if r == nil || activeRaftDEKID == 0 || r.CutoverIndex == nil {
 		return false
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.Mu.Lock()
+	defer r.Mu.Unlock()
 	return r.activeWrap != nil &&
-		r.activeRaftDEKID == activeRaftDEKID &&
-		r.cutoverIndex.Load() != 0
+		r.ActiveRaftDEKID == activeRaftDEKID &&
+		r.CutoverIndex.Load() != 0
 }
 
-func (r *raftEnvelopeRuntime) reinstallActiveWrap() {
+func (r *RaftEnvelopeRuntime) ReinstallActiveWrap() {
 	if r == nil {
 		return
 	}
 	mutation := r.beginEncryptionChange()
 	defer mutation.Close()
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.Mu.Lock()
+	defer r.Mu.Unlock()
 	wrap := r.activeWrap
-	for _, g := range r.groups {
+	for _, g := range r.Groups {
 		if wrap != nil {
 			r.installObservedWrap(g, wrap, mutation)
 		}
 	}
 }
 
-func (r *raftEnvelopeRuntime) wrapFor(activeRaftDEKID uint32) (kv.RaftPayloadWrapper, error) {
-	if r.cipher == nil {
+func (r *RaftEnvelopeRuntime) wrapFor(activeRaftDEKID uint32) (kv.RaftPayloadWrapper, error) {
+	if r.Cipher == nil {
 		return nil, errors.New("raft envelope runtime: cipher is not configured")
 	}
-	if r.nonceFactory == nil {
+	if r.NonceFactory == nil {
 		return nil, errors.New("raft envelope runtime: raft nonce factory is not configured")
 	}
 	return func(payload []byte) ([]byte, error) {
-		if r.registration != nil && !r.registration.Registered(activeRaftDEKID, r.raftEpoch) && !isLocalRaftWriterRegistrationPayload(payload, activeRaftDEKID, r.raftEpoch, r.fullNodeID) {
+		if r.Registration != nil && !r.Registration.Registered(activeRaftDEKID, r.RaftEpoch) && !isLocalRaftWriterRegistrationPayload(payload, activeRaftDEKID, r.RaftEpoch, r.FullNodeID) {
 			return nil, errors.Wrapf(store.ErrWriterNotRegistered,
 				"raft envelope runtime: writer registration not committed for raft dek_id %d local_epoch %d",
-				activeRaftDEKID, r.raftEpoch)
+				activeRaftDEKID, r.RaftEpoch)
 		}
-		nonce, err := r.nonceFactory.Next()
+		nonce, err := r.NonceFactory.Next()
 		if err != nil {
 			return nil, errors.Wrap(err, "raft envelope runtime: next nonce")
 		}
-		return encryption.WrapRaftPayload(r.cipher, activeRaftDEKID, nonce[:], payload)
+		return encryption.WrapRaftPayload(r.Cipher, activeRaftDEKID, nonce[:], payload)
 	}, nil
 }
 
@@ -257,18 +257,18 @@ func isLocalRaftWriterRegistrationPayload(payload []byte, activeRaftDEKID uint32
 		registration.FullNodeID == fullNodeID
 }
 
-func (r *raftEnvelopeRuntime) barrier() adapter.CutoverBarrierController {
+func (r *RaftEnvelopeRuntime) Barrier() adapter.CutoverBarrierController {
 	if r == nil {
 		return nil
 	}
 	return &raftEnvelopeCutoverBarrier{runtime: r}
 }
 
-func (r *raftEnvelopeRuntime) snapshotGroups() []*kv.ShardGroup {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	groups := make([]*kv.ShardGroup, 0, len(r.groups))
-	for _, g := range r.groups {
+func (r *RaftEnvelopeRuntime) snapshotGroups() []*kv.ShardGroup {
+	r.Mu.Lock()
+	defer r.Mu.Unlock()
+	groups := make([]*kv.ShardGroup, 0, len(r.Groups))
+	for _, g := range r.Groups {
 		if g != nil {
 			groups = append(groups, g)
 		}
@@ -277,7 +277,7 @@ func (r *raftEnvelopeRuntime) snapshotGroups() []*kv.ShardGroup {
 }
 
 type raftEnvelopeCutoverBarrier struct {
-	runtime *raftEnvelopeRuntime
+	runtime *RaftEnvelopeRuntime
 }
 
 func (b *raftEnvelopeCutoverBarrier) Begin() <-chan struct{} {
@@ -326,7 +326,7 @@ func (b *raftEnvelopeCutoverBarrier) ValidateCutoverScope() error {
 }
 
 func (b *raftEnvelopeCutoverBarrier) InstallWrap() {
-	b.runtime.reinstallActiveWrap()
+	b.runtime.ReinstallActiveWrap()
 }
 
 func (b *raftEnvelopeCutoverBarrier) End() {

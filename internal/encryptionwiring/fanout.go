@@ -1,4 +1,4 @@
-package main
+package encryptionwiring
 
 import (
 	"context"
@@ -16,18 +16,18 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// capabilityFanoutTimeout bounds the whole §4 GetCapability fan-out the
+// CapabilityFanoutTimeout bounds the whole §4 GetCapability fan-out the
 // EnableStorageEnvelope cutover runs before proposing. The helper
 // caps the entire fan-out (not per-probe) by this value regardless of
 // member count, so a slow/unreachable peer cannot stall the operator's
 // cutover RPC indefinitely — it surfaces as a Reachable=false verdict
 // and the cutover fails closed. 5s is generous for a small-cluster
 // GetCapability round-trip.
-const capabilityFanoutTimeout = 5 * time.Second
+const CapabilityFanoutTimeout = 5 * time.Second
 
 const storageEnvelopeV2CapabilityRetryInterval = 5 * time.Second
 
-// buildEncryptionCapabilityFanout builds the §4 capability fan-out
+// BuildCapabilityFanout builds the §4 capability fan-out
 // closure shared across every shard's EncryptionAdmin server, or nil
 // when encryption mutators are disabled (the cutover RPC is then
 // unreachable, so the fan-out would never run). It owns a dedicated
@@ -35,7 +35,7 @@ const storageEnvelopeV2CapabilityRetryInterval = 5 * time.Second
 // so the fan-out dials whenever encryption mutators are enabled,
 // independent of the admin HTTP surface; the cache is drained on
 // context cancellation via eg.
-func buildEncryptionCapabilityFanout(ctx context.Context, eg *errgroup.Group, runtimes []*noderuntime.GroupRuntime, dial kv.GRPCDialOptionsForAddress, enableMutators bool) adapter.CapabilityFanoutFn {
+func BuildCapabilityFanout(ctx context.Context, eg *errgroup.Group, runtimes []*noderuntime.GroupRuntime, dial kv.GRPCDialOptionsForAddress, enableMutators bool) adapter.CapabilityFanoutFn {
 	if !enableMutators {
 		return nil
 	}
@@ -47,10 +47,10 @@ func buildEncryptionCapabilityFanout(ctx context.Context, eg *errgroup.Group, ru
 		}
 		return nil
 	})
-	return buildCapabilityFanoutFn(runtimes, fanoutConnCache, capabilityFanoutTimeout)
+	return BuildCapabilityFanoutFn(runtimes, fanoutConnCache, CapabilityFanoutTimeout)
 }
 
-// buildStorageEnvelopeV2MonitorFanout builds the fan-out the startup monitor
+// BuildStorageEnvelopeV2MonitorFanout builds the fan-out the startup monitor
 // uses, on a connection cache of its own, and returns the closer for it.
 //
 // It deliberately does not share buildEncryptionCapabilityFanout's cache. That
@@ -62,7 +62,7 @@ func buildEncryptionCapabilityFanout(ctx context.Context, eg *errgroup.Group, ru
 // peer on every node -- an all-to-all mesh, built unconditionally, for a probe
 // that is over. With its own cache the monitor drops those connections when it
 // exits, and the cutover dials again if it is ever used.
-func buildStorageEnvelopeV2MonitorFanout(
+func BuildStorageEnvelopeV2MonitorFanout(
 	runtimes []*noderuntime.GroupRuntime,
 	dial kv.GRPCDialOptionsForAddress,
 	enableMutators bool,
@@ -71,24 +71,24 @@ func buildStorageEnvelopeV2MonitorFanout(
 		return nil, nil
 	}
 	connCache := kv.NewGRPCConnCache(dial)
-	return buildCapabilityFanoutFn(runtimes, connCache, capabilityFanoutTimeout), connCache.Close
+	return BuildCapabilityFanoutFn(runtimes, connCache, CapabilityFanoutTimeout), connCache.Close
 }
 
-// startStorageEnvelopeV2CapabilityMonitor keeps encrypted writes on V1 until
+// StartStorageEnvelopeV2CapabilityMonitor keeps encrypted writes on V1 until
 // a fresh live-membership fan-out confirms V2 reader support on every voter
 // and learner. Activation is sticky because existing V2 rows remain part of
 // snapshots after the first V2 write.
 //
 // release, when non-nil, is called once the monitor stops -- on activation or
 // on shutdown -- so the connections the probe opened do not outlive it.
-func startStorageEnvelopeV2CapabilityMonitor(
+func StartStorageEnvelopeV2CapabilityMonitor(
 	ctx context.Context,
 	eg *errgroup.Group,
 	capabilityFanout adapter.CapabilityFanoutFn,
 	release func() error,
-	wiring encryptionWriteWiring,
+	wiring WriteWiring,
 ) {
-	if eg == nil || capabilityFanout == nil || wiring.cache == nil || wiring.storageEnvelopeV2Active == nil {
+	if eg == nil || capabilityFanout == nil || wiring.Cache == nil || wiring.storageEnvelopeV2Active == nil {
 		return
 	}
 	eg.Go(func() error {
@@ -126,9 +126,9 @@ func releaseCapabilityMonitorConns(release func() error) {
 func tryActivateStorageEnvelopeV2Writes(
 	ctx context.Context,
 	capabilityFanout adapter.CapabilityFanoutFn,
-	wiring encryptionWriteWiring,
+	wiring WriteWiring,
 ) bool {
-	keyID, bootstrapped := wiring.cache.ActiveStorageKeyID()
+	keyID, bootstrapped := wiring.Cache.ActiveStorageKeyID()
 	if !bootstrapped {
 		return false
 	}
@@ -142,7 +142,7 @@ func tryActivateStorageEnvelopeV2Writes(
 	return true
 }
 
-// buildCapabilityFanoutFn assembles the adapter.CapabilityFanoutFn the
+// BuildCapabilityFanoutFn assembles the adapter.CapabilityFanoutFn the
 // EnableStorageEnvelope server invokes for its §4 pre-flight check. The
 // returned closure snapshots the live membership of every Raft group
 // (the §4.1 "voter ∪ learner of every group" contract) and fans
@@ -154,7 +154,7 @@ func tryActivateStorageEnvelopeV2Writes(
 // caller, not per-probe). A snapshot-build error fails the closure so
 // the cutover refuses rather than proposing against a membership view
 // it could not fully enumerate (fail-closed, §4.3 no-partial-success).
-func buildCapabilityFanoutFn(runtimes []*noderuntime.GroupRuntime, connCache *kv.GRPCConnCache, timeout time.Duration) adapter.CapabilityFanoutFn {
+func BuildCapabilityFanoutFn(runtimes []*noderuntime.GroupRuntime, connCache *kv.GRPCConnCache, timeout time.Duration) adapter.CapabilityFanoutFn {
 	dial := func(_ context.Context, address string) (pb.EncryptionAdminClient, func(), error) {
 		conn, err := connCache.ConnFor(address)
 		if err != nil {
@@ -183,7 +183,7 @@ type configReader interface {
 // groupConfigSource pairs a group id with its membership reader.
 type groupConfigSource struct {
 	groupID uint64
-	engine  configReader
+	Engine  configReader
 }
 
 // capabilityRouteSnapshot builds the all-groups admin.RouteSnapshot
@@ -202,7 +202,7 @@ func capabilityRouteSnapshot(ctx context.Context, runtimes []*noderuntime.GroupR
 		if eng == nil {
 			continue
 		}
-		sources = append(sources, groupConfigSource{groupID: rt.Spec.ID, engine: eng})
+		sources = append(sources, groupConfigSource{groupID: rt.Spec.ID, Engine: eng})
 	}
 	return routeSnapshotFromSources(ctx, sources)
 }
@@ -214,7 +214,7 @@ func capabilityRouteSnapshot(ctx context.Context, runtimes []*noderuntime.GroupR
 func routeSnapshotFromSources(ctx context.Context, sources []groupConfigSource) (admin.RouteSnapshot, error) {
 	groups := make([]admin.RouteGroup, 0, len(sources))
 	for _, s := range sources {
-		cfg, err := s.engine.Configuration(ctx)
+		cfg, err := s.Engine.Configuration(ctx)
 		if err != nil {
 			return admin.RouteSnapshot{}, errors.Wrapf(err, "capability fan-out: configuration for group %d", s.groupID)
 		}

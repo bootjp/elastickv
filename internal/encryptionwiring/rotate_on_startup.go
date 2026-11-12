@@ -1,4 +1,4 @@
-package main
+package encryptionwiring
 
 import (
 	"context"
@@ -38,58 +38,58 @@ type encryptionRotateOnStartupRunner interface {
 type encryptionRotateOnStartupFlightState struct {
 	inFlight atomic.Bool
 
-	mu          sync.Mutex
+	Mu          sync.Mutex
 	done        <-chan struct{}
 	terminalErr error
 }
 
 type encryptionRotateOnStartupTask struct {
 	server       *adapter.EncryptionAdminServer
-	sidecarPath  string
+	SidecarPath  string
 	kekWrapper   kek.Wrapper
-	raftEnvelope *raftEnvelopeRuntime
+	RaftEnvelope *RaftEnvelopeRuntime
 	readFence    func(context.Context) (uint64, error)
-	fullNodeID   uint64
-	storageEpoch uint16
-	raftEpoch    uint16
+	FullNodeID   uint64
+	StorageEpoch uint16
+	RaftEpoch    uint16
 
-	mu          sync.Mutex
+	Mu          sync.Mutex
 	nextKeyID   uint32
 	storageDone bool
 	raftDone    bool
 }
 
-func installEncryptionRotateOnStartup(
+func InstallRotateOnStartup(
 	ctx context.Context,
 	requested bool,
 	rt *noderuntime.GroupRuntime,
 	postCutoverProposer raftengine.Proposer,
 	sidecarPath string,
 	kekWrapper kek.Wrapper,
-	raftEnvelope *raftEnvelopeRuntime,
+	raftEnvelope *RaftEnvelopeRuntime,
 	fullNodeID uint64,
 	storageEpoch uint16,
 	raftEpoch uint16,
 	logger *slog.Logger,
-) (func(), startupRotationWaiter) {
+) (func(), StartupRotationWaiter) {
 	if !requested {
-		return func() {}, startupRotationWaiter{}
+		return func() {}, StartupRotationWaiter{}
 	}
 	if logger == nil {
 		logger = slog.Default()
 	}
 	if rt == nil || rt.Engine == nil {
 		logger.Warn("encryption rotate-on-startup skipped: default raft group is not available")
-		return func() {}, startupRotationWaiter{}
+		return func() {}, StartupRotationWaiter{}
 	}
 	controller, ok := rt.Engine.(encryptionRotateOnStartupController)
 	if !ok {
 		logger.Warn("encryption rotate-on-startup skipped: engine does not implement leader-acquired observer")
-		return func() {}, startupRotationWaiter{}
+		return func() {}, StartupRotationWaiter{}
 	}
 	if sidecarPath == "" || kekWrapper == nil {
 		logger.Warn("encryption rotate-on-startup skipped: encryption sidecar or KEK is not configured")
-		return func() {}, startupRotationWaiter{}
+		return func() {}, StartupRotationWaiter{}
 	}
 	server := adapter.NewEncryptionAdminServer(
 		adapter.WithEncryptionAdminSidecarPath(sidecarPath),
@@ -100,35 +100,35 @@ func installEncryptionRotateOnStartup(
 	)
 	if err := server.Validate(); err != nil {
 		logger.Warn("encryption rotate-on-startup skipped: admin server wiring invalid", "err", err)
-		return func() {}, startupRotationWaiter{}
+		return func() {}, StartupRotationWaiter{}
 	}
 	task := &encryptionRotateOnStartupTask{
 		server:       server,
-		sidecarPath:  sidecarPath,
+		SidecarPath:  sidecarPath,
 		kekWrapper:   kekWrapper,
-		raftEnvelope: raftEnvelope,
+		RaftEnvelope: raftEnvelope,
 		readFence:    controller.LinearizableRead,
-		fullNodeID:   fullNodeID,
-		storageEpoch: storageEpoch,
-		raftEpoch:    raftEpoch,
+		FullNodeID:   fullNodeID,
+		StorageEpoch: storageEpoch,
+		RaftEpoch:    raftEpoch,
 	}
 	return installEncryptionRotateOnStartupRequestWithWait(ctx, controller, task, logger)
 }
 
-type startupRotationWaiter struct {
-	wait         func(context.Context) error
-	blockMutator func() bool
+type StartupRotationWaiter struct {
+	WaitFunc     func(context.Context) error
+	BlockMutator func() bool
 }
 
-func (w startupRotationWaiter) Wait(ctx context.Context) error {
-	if w.wait == nil {
+func (w StartupRotationWaiter) Wait(ctx context.Context) error {
+	if w.WaitFunc == nil {
 		return nil
 	}
-	return w.wait(ctx)
+	return w.WaitFunc(ctx)
 }
 
-func (w startupRotationWaiter) BlockMutators() bool {
-	return w.blockMutator != nil && w.blockMutator()
+func (w StartupRotationWaiter) BlockMutators() bool {
+	return w.BlockMutator != nil && w.BlockMutator()
 }
 
 func installEncryptionRotateOnStartupRequestWithWait(
@@ -136,9 +136,9 @@ func installEncryptionRotateOnStartupRequestWithWait(
 	controller encryptionRotateOnStartupController,
 	task encryptionRotateOnStartupRunner,
 	logger *slog.Logger,
-) (func(), startupRotationWaiter) {
+) (func(), StartupRotationWaiter) {
 	if controller == nil || task == nil {
-		return func() {}, startupRotationWaiter{}
+		return func() {}, StartupRotationWaiter{}
 	}
 	if logger == nil {
 		logger = slog.Default()
@@ -164,24 +164,24 @@ func installEncryptionRotateOnStartupRequestWithWait(
 		}
 		return controller.State() == raftengine.StateLeader && !task.Done()
 	}
-	return deregister, startupRotationWaiter{wait: waitStartup, blockMutator: blockMutators}
+	return deregister, StartupRotationWaiter{WaitFunc: waitStartup, BlockMutator: blockMutators}
 }
 
 func (s *encryptionRotateOnStartupFlightState) publishDone(done <-chan struct{}) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
 	s.done = done
 }
 
 func (s *encryptionRotateOnStartupFlightState) currentDone() <-chan struct{} {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
 	return s.done
 }
 
 func (s *encryptionRotateOnStartupFlightState) clearDone(done <-chan struct{}) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
 	if s.done == done {
 		s.done = nil
 	}
@@ -191,16 +191,16 @@ func (s *encryptionRotateOnStartupFlightState) setTerminalError(err error) {
 	if err == nil {
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
 	if s.terminalErr == nil {
 		s.terminalErr = err
 	}
 }
 
 func (s *encryptionRotateOnStartupFlightState) terminalError() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
 	return s.terminalErr
 }
 
@@ -252,7 +252,7 @@ func runEncryptionRotateOnStartup(
 			return nil
 		}
 		logEncryptionRotateOnStartupError(logger, err)
-		if !retryableEncryptionRotateOnStartupError(err) {
+		if !RetryableRotateOnStartupError(err) {
 			return errors.Wrap(err, "encryption rotate-on-startup: permanent failure")
 		}
 		timer := time.NewTimer(encryptionRotateOnStartupRetryDelay)
@@ -325,7 +325,7 @@ func waitEncryptionRotateOnStartupFlightPublish(ctx context.Context) error {
 }
 
 func logEncryptionRotateOnStartupError(logger *slog.Logger, err error) {
-	if retryableEncryptionRotateOnStartupError(err) {
+	if RetryableRotateOnStartupError(err) {
 		logger.Warn("encryption rotate-on-startup deferred after transient error", "err", err)
 		return
 	}
@@ -333,8 +333,8 @@ func logEncryptionRotateOnStartupError(logger *slog.Logger, err error) {
 }
 
 func (t *encryptionRotateOnStartupTask) Done() bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	t.Mu.Lock()
+	defer t.Mu.Unlock()
 	return t.storageDone && t.raftDone
 }
 
@@ -342,7 +342,7 @@ func (t *encryptionRotateOnStartupTask) Run(ctx context.Context) error {
 	if err := t.fenceSidecarRead(ctx); err != nil {
 		return err
 	}
-	sc, err := encryption.ReadSidecar(t.sidecarPath)
+	sc, err := encryption.ReadSidecar(t.SidecarPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) || encryption.IsNotExist(err) {
 			t.markAllDone()
@@ -356,13 +356,13 @@ func (t *encryptionRotateOnStartupTask) Run(ctx context.Context) error {
 	}
 	if err := t.rotatePurposeIfActive(
 		ctx, sc.Active.Storage,
-		pb.RotateDEKRequest_PURPOSE_STORAGE, t.storageEpoch,
+		pb.RotateDEKRequest_PURPOSE_STORAGE, t.StorageEpoch,
 	); err != nil {
 		return err
 	}
 	if err := t.rotatePurposeIfActive(
 		ctx, sc.Active.Raft,
-		pb.RotateDEKRequest_PURPOSE_RAFT, t.raftEpoch,
+		pb.RotateDEKRequest_PURPOSE_RAFT, t.RaftEpoch,
 	); err != nil {
 		return err
 	}
@@ -380,20 +380,20 @@ func (t *encryptionRotateOnStartupTask) fenceSidecarRead(ctx context.Context) er
 }
 
 func (t *encryptionRotateOnStartupTask) markAllDone() {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	t.Mu.Lock()
+	defer t.Mu.Unlock()
 	t.storageDone = true
 	t.raftDone = true
 }
 
 func (t *encryptionRotateOnStartupTask) prepareNextKeyID(sc *encryption.Sidecar) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	t.Mu.Lock()
+	defer t.Mu.Unlock()
 	return t.prepareNextKeyIDLocked(sc)
 }
 
 func (t *encryptionRotateOnStartupTask) prepareNextKeyIDLocked(sc *encryption.Sidecar) error {
-	next, err := nextEncryptionRotateOnStartupKeyID(sc)
+	next, err := NextRotateOnStartupKeyID(sc)
 	if err != nil {
 		return err
 	}
@@ -430,11 +430,11 @@ func (t *encryptionRotateOnStartupTask) rotatePurposeIfActive(
 	if err := t.rotateWithKeyID(ctx, purpose, localEpoch, keyID); err != nil {
 		return err
 	}
-	t.mu.Lock()
+	t.Mu.Lock()
 	t.advanceNextKeyIDLocked(keyID)
-	t.mu.Unlock()
-	if purpose == pb.RotateDEKRequest_PURPOSE_RAFT && t.raftEnvelope != nil {
-		if err := t.raftEnvelope.installRotatedRaftDEK(keyID); err != nil {
+	t.Mu.Unlock()
+	if purpose == pb.RotateDEKRequest_PURPOSE_RAFT && t.RaftEnvelope != nil {
+		if err := t.RaftEnvelope.installRotatedRaftDEK(keyID); err != nil {
 			return errors.Wrap(err, "encryption rotate-on-startup: install rotated raft envelope wrapper")
 		}
 	}
@@ -446,8 +446,8 @@ func (t *encryptionRotateOnStartupTask) reserveRotateKey(
 	activeID uint32,
 	purpose pb.RotateDEKRequest_Purpose,
 ) (uint32, bool, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	t.Mu.Lock()
+	defer t.Mu.Unlock()
 	done := t.purposeDoneLocked(purpose)
 	if activeID == encryption.ReservedKeyID {
 		t.markPurposeDoneLocked(purpose)
@@ -470,8 +470,8 @@ func (t *encryptionRotateOnStartupTask) purposeDoneLocked(purpose pb.RotateDEKRe
 }
 
 func (t *encryptionRotateOnStartupTask) markPurposeDone(purpose pb.RotateDEKRequest_Purpose) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	t.Mu.Lock()
+	defer t.Mu.Unlock()
 	t.markPurposeDoneLocked(purpose)
 }
 
@@ -487,7 +487,7 @@ func (t *encryptionRotateOnStartupTask) rotateWithKeyID(ctx context.Context, pur
 	if keyID == encryption.ReservedKeyID {
 		return errors.New("encryption rotate-on-startup: key_id space exhausted")
 	}
-	wrapped, err := wrapFreshStartupDEK(t.kekWrapper)
+	wrapped, err := WrapFreshStartupDEK(t.kekWrapper)
 	if err != nil {
 		return err
 	}
@@ -495,7 +495,7 @@ func (t *encryptionRotateOnStartupTask) rotateWithKeyID(ctx context.Context, pur
 		Purpose:            purpose,
 		NewDekId:           keyID,
 		WrappedNewDek:      wrapped,
-		ProposerNodeId:     t.fullNodeID,
+		ProposerNodeId:     t.FullNodeID,
 		ProposerLocalEpoch: uint32(localEpoch),
 	})
 	if err != nil {
@@ -512,7 +512,7 @@ func (t *encryptionRotateOnStartupTask) advanceNextKeyIDLocked(keyID uint32) {
 	}
 }
 
-func nextEncryptionRotateOnStartupKeyID(sc *encryption.Sidecar) (uint32, error) {
+func NextRotateOnStartupKeyID(sc *encryption.Sidecar) (uint32, error) {
 	var maxID uint32
 	for raw := range sc.Keys {
 		id64, err := strconv.ParseUint(raw, 10, 32)
@@ -529,7 +529,7 @@ func nextEncryptionRotateOnStartupKeyID(sc *encryption.Sidecar) (uint32, error) 
 	return maxID + 1, nil
 }
 
-func wrapFreshStartupDEK(wrapper kek.Wrapper) ([]byte, error) {
+func WrapFreshStartupDEK(wrapper kek.Wrapper) ([]byte, error) {
 	if wrapper == nil {
 		return nil, errors.New("encryption rotate-on-startup: KEK wrapper is nil")
 	}
@@ -537,7 +537,7 @@ func wrapFreshStartupDEK(wrapper kek.Wrapper) ([]byte, error) {
 	if _, err := rand.Read(dek); err != nil {
 		return nil, errors.Wrap(err, "encryption rotate-on-startup: generate DEK")
 	}
-	defer zeroBytes(dek)
+	defer ZeroBytes(dek)
 	wrapped, err := wrapper.Wrap(dek)
 	if err != nil {
 		return nil, errors.Wrap(err, "encryption rotate-on-startup: wrap DEK")
@@ -545,13 +545,13 @@ func wrapFreshStartupDEK(wrapper kek.Wrapper) ([]byte, error) {
 	return wrapped, nil
 }
 
-func zeroBytes(b []byte) {
+func ZeroBytes(b []byte) {
 	for i := range b {
 		b[i] = 0
 	}
 }
 
-func retryableEncryptionRotateOnStartupError(err error) bool {
+func RetryableRotateOnStartupError(err error) bool {
 	switch {
 	case errors.Is(err, raftengine.ErrNotLeader),
 		errors.Is(err, raftengine.ErrLeadershipLost),

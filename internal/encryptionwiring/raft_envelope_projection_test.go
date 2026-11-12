@@ -1,4 +1,4 @@
-package main
+package encryptionwiring
 
 import (
 	"crypto/sha256"
@@ -13,7 +13,7 @@ import (
 )
 
 type bootstrapProjectionFixture struct {
-	in       bootstrapEncryptionProjectionInput
+	in       BootstrapEncryptionProjectionInput
 	sidecar  *encryption.Sidecar
 	registry encryption.WriterRegistryStore
 	sink     interface {
@@ -35,12 +35,12 @@ func newBootstrapProjectionFixture(t *testing.T) *bootstrapProjectionFixture {
 	})
 	require.True(t, ok)
 	f := &bootstrapProjectionFixture{
-		in: bootstrapEncryptionProjectionInput{
-			runtimeFence: func() (uint64, error) { return 1, nil },
-			configured:   true, sidecarPath: filepath.Join(t.TempDir(), "keys.json"),
-			localStore: st, fullNodeID: 123, storageEpoch: 7, raftEpoch: 9,
-			storageWrapperInstalled: func(id uint32, epoch uint16) bool { return id == 1 && epoch == 7 },
-			raftWrapperInstalled:    func(id uint32, epoch uint16) bool { return id == 2 && epoch == 9 },
+		in: BootstrapEncryptionProjectionInput{
+			RuntimeFence: func() (uint64, error) { return 1, nil },
+			Configured:   true, SidecarPath: filepath.Join(t.TempDir(), "keys.json"),
+			LocalStore: st, FullNodeID: 123, StorageEpoch: 7, RaftEpoch: 9,
+			StorageWrapperInstalled: func(id uint32, epoch uint16) bool { return id == 1 && epoch == 7 },
+			RaftWrapperInstalled:    func(id uint32, epoch uint16) bool { return id == 2 && epoch == 9 },
 		},
 		sidecar: &encryption.Sidecar{
 			Version: encryption.SidecarVersion, RaftAppliedIndex: 30,
@@ -62,7 +62,7 @@ func newBootstrapProjectionFixture(t *testing.T) *bootstrapProjectionFixture {
 
 func (f *bootstrapProjectionFixture) persist(t *testing.T) {
 	t.Helper()
-	require.NoError(t, encryption.WriteSidecar(f.in.sidecarPath, f.sidecar))
+	require.NoError(t, encryption.WriteSidecar(f.in.SidecarPath, f.sidecar))
 	cp, err := encryption.SidecarCheckpoint(f.sidecar)
 	require.NoError(t, err)
 	require.NoError(t, f.sink.SaveEncryptionSnapshotCheckpoint(cp))
@@ -78,41 +78,41 @@ func (f *bootstrapProjectionFixture) register(t *testing.T, id uint32, node uint
 
 func TestBootstrapEncryptionProjectionNotRequested(t *testing.T) {
 	t.Parallel()
-	got, err := readBootstrapEncryptionProjection(bootstrapEncryptionProjectionInput{})
+	got, err := ReadBootstrapEncryptionProjection(BootstrapEncryptionProjectionInput{})
 	require.NoError(t, err)
-	require.Equal(t, bootstrapEncryptionProjection{
-		kind: bootstrapEncryptionNotRequested, rotation: bootstrapRotationNotRequested,
+	require.Equal(t, BootstrapEncryptionProjection{
+		Kind: bootstrapEncryptionNotRequested, Rotation: bootstrapRotationNotRequested,
 	}, got)
 	for _, configured := range []bool{false, true} {
-		got, err = readBootstrapEncryptionProjection(bootstrapEncryptionProjectionInput{
-			configured: configured, rotationRequested: true,
+		got, err = ReadBootstrapEncryptionProjection(BootstrapEncryptionProjectionInput{
+			Configured: configured, RotationRequested: true,
 		})
-		require.ErrorIs(t, err, errBootstrapEncryptionUnsupported)
-		require.Equal(t, bootstrapEncryptionProjection{}, got)
+		require.ErrorIs(t, err, ErrBootstrapEncryptionUnsupported)
+		require.Equal(t, BootstrapEncryptionProjection{}, got)
 	}
 }
 
 func TestBootstrapEncryptionProjectionAppliedObservation(t *testing.T) {
 	t.Parallel()
 	f := newBootstrapProjectionFixture(t)
-	before, err := os.ReadFile(f.in.sidecarPath)
+	before, err := os.ReadFile(f.in.SidecarPath)
 	require.NoError(t, err)
-	got, err := readBootstrapEncryptionProjection(f.in)
+	got, err := ReadBootstrapEncryptionProjection(f.in)
 	require.NoError(t, err)
-	require.Equal(t, bootstrapEncryptionObserved, got.kind)
-	require.Equal(t, bootstrapRotationNotRequested, got.rotation)
-	require.Equal(t, uint64(123), got.fullNodeID)
-	require.Equal(t, uint64(40), got.appliedIndex)
-	require.Equal(t, uint64(30), got.checkpoint.Index)
-	require.Equal(t, bootstrapEncryptionPurposeProjection{
-		dekID: 1, epoch: 7, registered: true, envelopeActive: true, cutoverIndex: 10, wrapperInstalled: true,
-		keyDigest: sha256.Sum256([]byte{1}), registry: encryption.RegistryValue{FullNodeID: 123, FirstSeenLocalEpoch: 7, LastSeenLocalEpoch: 7},
-	}, got.storage)
-	require.Equal(t, bootstrapEncryptionPurposeProjection{
-		dekID: 2, epoch: 9, registered: true, envelopeActive: true, cutoverIndex: 20, wrapperInstalled: true,
-		keyDigest: sha256.Sum256([]byte{2}), registry: encryption.RegistryValue{FullNodeID: 123, FirstSeenLocalEpoch: 9, LastSeenLocalEpoch: 9},
-	}, got.raft)
-	after, err := os.ReadFile(f.in.sidecarPath)
+	require.Equal(t, BootstrapEncryptionObserved, got.Kind)
+	require.Equal(t, bootstrapRotationNotRequested, got.Rotation)
+	require.Equal(t, uint64(123), got.FullNodeID)
+	require.Equal(t, uint64(40), got.AppliedIndex)
+	require.Equal(t, uint64(30), got.Checkpoint.Index)
+	require.Equal(t, BootstrapEncryptionPurposeProjection{
+		DekID: 1, Epoch: 7, Registered: true, EnvelopeActive: true, CutoverIndex: 10, WrapperInstalled: true,
+		KeyDigest: sha256.Sum256([]byte{1}), Registry: encryption.RegistryValue{FullNodeID: 123, FirstSeenLocalEpoch: 7, LastSeenLocalEpoch: 7},
+	}, got.Storage)
+	require.Equal(t, BootstrapEncryptionPurposeProjection{
+		DekID: 2, Epoch: 9, Registered: true, EnvelopeActive: true, CutoverIndex: 20, WrapperInstalled: true,
+		KeyDigest: sha256.Sum256([]byte{2}), Registry: encryption.RegistryValue{FullNodeID: 123, FirstSeenLocalEpoch: 9, LastSeenLocalEpoch: 9},
+	}, got.Raft)
+	after, err := os.ReadFile(f.in.SidecarPath)
 	require.NoError(t, err)
 	require.Equal(t, before, after, "observation must not rewrite sidecar or epochs")
 	registered, err := registrationCommittedAtEpoch(f.registry, 1, 123, 7)
@@ -126,39 +126,39 @@ func TestBootstrapEncryptionProjectionRejectsIncompleteProof(t *testing.T) {
 		name   string
 		mutate func(*testing.T, *bootstrapProjectionFixture)
 	}{
-		{"missing path", func(_ *testing.T, f *bootstrapProjectionFixture) { f.in.sidecarPath = "" }},
-		{"missing store", func(_ *testing.T, f *bootstrapProjectionFixture) { f.in.localStore = nil }},
-		{"missing identity", func(_ *testing.T, f *bootstrapProjectionFixture) { f.in.fullNodeID = 0 }},
-		{"missing sidecar", func(t *testing.T, f *bootstrapProjectionFixture) { require.NoError(t, os.Remove(f.in.sidecarPath)) }},
+		{"missing path", func(_ *testing.T, f *bootstrapProjectionFixture) { f.in.SidecarPath = "" }},
+		{"missing store", func(_ *testing.T, f *bootstrapProjectionFixture) { f.in.LocalStore = nil }},
+		{"missing identity", func(_ *testing.T, f *bootstrapProjectionFixture) { f.in.FullNodeID = 0 }},
+		{"missing sidecar", func(t *testing.T, f *bootstrapProjectionFixture) { require.NoError(t, os.Remove(f.in.SidecarPath)) }},
 		{"malformed sidecar", func(t *testing.T, f *bootstrapProjectionFixture) {
-			require.NoError(t, os.WriteFile(f.in.sidecarPath, []byte("{"), 0o600))
+			require.NoError(t, os.WriteFile(f.in.SidecarPath, []byte("{"), 0o600))
 		}},
 		{"checkpoint mismatch", func(t *testing.T, f *bootstrapProjectionFixture) {
 			require.NoError(t, f.sink.SaveEncryptionSnapshotCheckpoint(encryption.SnapshotCheckpoint{Index: 30}))
 		}},
 		{"sidecar ahead of checkpoint", func(t *testing.T, f *bootstrapProjectionFixture) {
 			f.sidecar.RaftAppliedIndex++
-			require.NoError(t, encryption.WriteSidecar(f.in.sidecarPath, f.sidecar))
+			require.NoError(t, encryption.WriteSidecar(f.in.SidecarPath, f.sidecar))
 		}},
 		{"checkpoint ahead of apply", func(t *testing.T, f *bootstrapProjectionFixture) {
 			f.sidecar.RaftAppliedIndex = 41
 			f.persist(t)
 		}},
-		{"storage epoch differs", func(_ *testing.T, f *bootstrapProjectionFixture) { f.in.storageEpoch++ }},
-		{"raft epoch differs", func(_ *testing.T, f *bootstrapProjectionFixture) { f.in.raftEpoch++ }},
+		{"storage epoch differs", func(_ *testing.T, f *bootstrapProjectionFixture) { f.in.StorageEpoch++ }},
+		{"raft epoch differs", func(_ *testing.T, f *bootstrapProjectionFixture) { f.in.RaftEpoch++ }},
 		{"storage registry newer", func(t *testing.T, f *bootstrapProjectionFixture) { f.register(t, 1, 123, 8) }},
 		{"raft registry older", func(t *testing.T, f *bootstrapProjectionFixture) { f.register(t, 2, 123, 8) }},
 		{"full identity collision", func(t *testing.T, f *bootstrapProjectionFixture) { f.register(t, 1, 123+65536, 7) }},
 		{"corrupt registry", func(t *testing.T, f *bootstrapProjectionFixture) {
 			require.NoError(t, f.registry.SetRegistryRow(encryption.RegistryKey(1, 123), []byte{1}))
 		}},
-		{"missing storage probe", func(_ *testing.T, f *bootstrapProjectionFixture) { f.in.storageWrapperInstalled = nil }},
-		{"missing raft probe", func(_ *testing.T, f *bootstrapProjectionFixture) { f.in.raftWrapperInstalled = nil }},
+		{"missing storage probe", func(_ *testing.T, f *bootstrapProjectionFixture) { f.in.StorageWrapperInstalled = nil }},
+		{"missing raft probe", func(_ *testing.T, f *bootstrapProjectionFixture) { f.in.RaftWrapperInstalled = nil }},
 		{"storage wrapper absent", func(_ *testing.T, f *bootstrapProjectionFixture) {
-			f.in.storageWrapperInstalled = func(uint32, uint16) bool { return false }
+			f.in.StorageWrapperInstalled = func(uint32, uint16) bool { return false }
 		}},
 		{"raft wrapper absent", func(_ *testing.T, f *bootstrapProjectionFixture) {
-			f.in.raftWrapperInstalled = func(uint32, uint16) bool { return false }
+			f.in.RaftWrapperInstalled = func(uint32, uint16) bool { return false }
 		}},
 		{"empty wrapped material", func(t *testing.T, f *bootstrapProjectionFixture) {
 			key := f.sidecar.Keys["1"]
@@ -183,9 +183,9 @@ func TestBootstrapEncryptionProjectionRejectsIncompleteProof(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newBootstrapProjectionFixture(t)
 			tc.mutate(t, f)
-			got, err := readBootstrapEncryptionProjection(f.in)
+			got, err := ReadBootstrapEncryptionProjection(f.in)
 			require.Error(t, err)
-			require.Equal(t, bootstrapEncryptionProjection{}, got)
+			require.Equal(t, BootstrapEncryptionProjection{}, got)
 		})
 	}
 }
@@ -193,31 +193,31 @@ func TestBootstrapEncryptionProjectionRejectsIncompleteProof(t *testing.T) {
 func TestBootstrapEncryptionProjectionZeroEpochNeedsDurableRow(t *testing.T) {
 	t.Parallel()
 	f := newBootstrapProjectionFixture(t)
-	f.in.storageEpoch = 0
+	f.in.StorageEpoch = 0
 	f.sidecar.Active.Storage = 3
 	f.sidecar.Keys["3"] = encryption.SidecarKey{Purpose: encryption.SidecarPurposeStorage, Wrapped: []byte{3}}
-	f.in.storageWrapperInstalled = func(id uint32, epoch uint16) bool { return id == 3 && epoch == 0 }
+	f.in.StorageWrapperInstalled = func(id uint32, epoch uint16) bool { return id == 3 && epoch == 0 }
 	f.persist(t)
-	got, err := readBootstrapEncryptionProjection(f.in)
+	got, err := ReadBootstrapEncryptionProjection(f.in)
 	require.Error(t, err)
-	require.Equal(t, bootstrapEncryptionProjection{}, got)
+	require.Equal(t, BootstrapEncryptionProjection{}, got)
 	f.register(t, 3, 123, 0)
-	got, err = readBootstrapEncryptionProjection(f.in)
+	got, err = ReadBootstrapEncryptionProjection(f.in)
 	require.NoError(t, err)
-	require.True(t, got.storage.registered)
+	require.True(t, got.Storage.Registered)
 }
 
 func TestBootstrapEncryptionProjectionRejectsWrapperDrift(t *testing.T) {
 	t.Parallel()
 	f := newBootstrapProjectionFixture(t)
 	calls := 0
-	f.in.raftWrapperInstalled = func(uint32, uint16) bool {
+	f.in.RaftWrapperInstalled = func(uint32, uint16) bool {
 		calls++
 		return calls == 1
 	}
-	got, err := readBootstrapEncryptionProjection(f.in)
+	got, err := ReadBootstrapEncryptionProjection(f.in)
 	require.Error(t, err)
-	require.Equal(t, bootstrapEncryptionProjection{}, got)
+	require.Equal(t, BootstrapEncryptionProjection{}, got)
 }
 
 func TestBootstrapEncryptionProjectionInactiveEnvelopes(t *testing.T) {
@@ -226,15 +226,15 @@ func TestBootstrapEncryptionProjectionInactiveEnvelopes(t *testing.T) {
 	f.sidecar.StorageEnvelopeActive = false
 	f.sidecar.StorageEnvelopeCutoverIndex = 0
 	f.sidecar.RaftEnvelopeCutoverIndex = 0
-	f.in.storageWrapperInstalled = nil
-	f.in.raftWrapperInstalled = nil
+	f.in.StorageWrapperInstalled = nil
+	f.in.RaftWrapperInstalled = nil
 	f.persist(t)
-	got, err := readBootstrapEncryptionProjection(f.in)
+	got, err := ReadBootstrapEncryptionProjection(f.in)
 	require.NoError(t, err)
-	require.False(t, got.storage.wrapperInstalled)
-	require.False(t, got.raft.wrapperInstalled)
-	require.True(t, got.storage.registered)
-	require.True(t, got.raft.registered)
+	require.False(t, got.Storage.WrapperInstalled)
+	require.False(t, got.Raft.WrapperInstalled)
+	require.True(t, got.Storage.Registered)
+	require.True(t, got.Raft.Registered)
 }
 
 type bootstrapProjectionReadErrorStore struct {
@@ -260,12 +260,12 @@ func TestBootstrapEncryptionProjectionPropagatesStoreError(t *testing.T) {
 	failure := errors.New("store unavailable")
 	got, err := sampleBootstrapEncryptionProjection(f.in, bootstrapProjectionReadErrorStore{err: failure}, f.registry)
 	require.ErrorIs(t, err, failure)
-	require.Equal(t, bootstrapEncryptionProjection{}, got)
+	require.Equal(t, BootstrapEncryptionProjection{}, got)
 	got, err = sampleBootstrapEncryptionProjection(f.in, bootstrapProjectionReadErrorStore{
 		applied: 40, appliedPresent: true, checkpointErr: failure,
 	}, f.registry)
 	require.ErrorIs(t, err, failure)
-	require.Equal(t, bootstrapEncryptionProjection{}, got)
+	require.Equal(t, BootstrapEncryptionProjection{}, got)
 }
 
 func TestBootstrapEncryptionProjectionCheckpointExcludesEpoch(t *testing.T) {
@@ -276,10 +276,10 @@ func TestBootstrapEncryptionProjectionCheckpointExcludesEpoch(t *testing.T) {
 		f.sidecar.Keys[id] = key
 	}
 	// The durable checkpoint still matches: epoch validation is independent.
-	require.NoError(t, encryption.WriteSidecar(f.in.sidecarPath, f.sidecar))
-	got, err := readBootstrapEncryptionProjection(f.in)
+	require.NoError(t, encryption.WriteSidecar(f.in.SidecarPath, f.sidecar))
+	got, err := ReadBootstrapEncryptionProjection(f.in)
 	require.ErrorContains(t, err, "epoch mismatch")
-	require.Equal(t, bootstrapEncryptionProjection{}, got)
+	require.Equal(t, BootstrapEncryptionProjection{}, got)
 }
 
 func TestBootstrapEncryptionProjectionMissingDurableProof(t *testing.T) {
@@ -293,18 +293,18 @@ func TestBootstrapEncryptionProjectionMissingDurableProof(t *testing.T) {
 	} {
 		got, err := sampleBootstrapEncryptionProjection(f.in, source, f.registry)
 		require.Error(t, err)
-		require.Equal(t, bootstrapEncryptionProjection{}, got)
+		require.Equal(t, BootstrapEncryptionProjection{}, got)
 	}
 }
 
 func TestBootstrapEncryptionProjectionRejectsAppliedDrift(t *testing.T) {
 	t.Parallel()
 	f := newBootstrapProjectionFixture(t)
-	f.in.raftWrapperInstalled = func(uint32, uint16) bool {
+	f.in.RaftWrapperInstalled = func(uint32, uint16) bool {
 		require.NoError(t, f.sink.SetDurableAppliedIndex(41))
 		return true
 	}
-	got, err := readBootstrapEncryptionProjection(f.in)
+	got, err := ReadBootstrapEncryptionProjection(f.in)
 	require.ErrorContains(t, err, "changed during observation")
-	require.Equal(t, bootstrapEncryptionProjection{}, got)
+	require.Equal(t, BootstrapEncryptionProjection{}, got)
 }

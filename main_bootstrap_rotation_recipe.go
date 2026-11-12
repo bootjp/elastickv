@@ -5,16 +5,17 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"math"
 	"strconv"
 
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryption/kek"
+	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
+	"github.com/cockroachdb/errors"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -114,9 +115,9 @@ func (cfg bootstrapRotationRecipeConfig) validateIO() error {
 }
 
 func (r *bootstrapRotationRecipe) plan(sc *encryption.Sidecar) error {
-	next, err := nextEncryptionRotateOnStartupKeyID(sc)
+	next, err := encryptionwiring.NextRotateOnStartupKeyID(sc)
 	if err != nil {
-		return err
+		return errors.WithStack(err)
 	}
 	for _, purpose := range []pb.RotateDEKRequest_Purpose{pb.RotateDEKRequest_PURPOSE_STORAGE, pb.RotateDEKRequest_PURPOSE_RAFT} {
 		active, epoch := sc.Active.Storage, r.config.StorageEpoch
@@ -129,9 +130,9 @@ func (r *bootstrapRotationRecipe) plan(sc *encryption.Sidecar) error {
 		if next == 0 {
 			return errors.New("rotation recipe: key ID space exhausted")
 		}
-		wrapped, err := wrapFreshStartupDEK(r.config.Wrapper)
+		wrapped, err := encryptionwiring.WrapFreshStartupDEK(r.config.Wrapper)
 		if err != nil {
-			return err
+			return errors.WithStack(err)
 		}
 		r.requests = append(r.requests, &pb.RotateDEKRequest{Purpose: purpose, NewDekId: next, WrappedNewDek: bytes.Clone(wrapped), ProposerNodeId: r.config.NodeID, ProposerLocalEpoch: uint32(epoch)})
 		if next == math.MaxUint32 {
@@ -192,7 +193,7 @@ func (r *bootstrapRotationRecipe) read(ctx context.Context) (*encryption.Sidecar
 		return nil, 0, errBootstrapRotationInvalidEvidence
 	}
 	if sc.RaftAppliedIndex > index {
-		return nil, 0, fmt.Errorf("rotation recipe: sidecar advanced after barrier: %w", errBootstrapEncryptionProjectionPending)
+		return nil, 0, fmt.Errorf("rotation recipe: sidecar advanced after barrier: %w", encryptionwiring.ErrBootstrapEncryptionProjectionPending)
 	}
 	if err := r.config.Validate(ctx); err != nil {
 		return nil, 0, err
@@ -330,7 +331,7 @@ func (r *bootstrapRotationRecipe) Reconcile(ctx context.Context) (bootstrapRotat
 		return r.pending(), err
 	}
 	if !rotationActiveEqual(sc, after) {
-		return r.pending(), fmt.Errorf("rotation recipe: durable projection changed during wrapper installation: %w", errBootstrapEncryptionProjectionPending)
+		return r.pending(), fmt.Errorf("rotation recipe: durable projection changed during wrapper installation: %w", encryptionwiring.ErrBootstrapEncryptionProjectionPending)
 	}
 	if err := r.verifyActive(ctx, after); err != nil {
 		return r.pending(), bootstrapRotationEvidenceError(err)
@@ -401,7 +402,7 @@ func (r *bootstrapRotationRecipe) verifyRegistry(id uint32, epoch uint16) error 
 		return fmt.Errorf("rotation recipe: registry read: %w", err)
 	}
 	if !present {
-		return fmt.Errorf("rotation recipe: missing registry for key %d: %w", id, errBootstrapEncryptionProjectionPending)
+		return fmt.Errorf("rotation recipe: missing registry for key %d: %w", id, encryptionwiring.ErrBootstrapEncryptionProjectionPending)
 	}
 	row, err := encryption.DecodeRegistryValue(raw)
 	if err != nil {
@@ -414,7 +415,7 @@ func (r *bootstrapRotationRecipe) verifyRegistry(id uint32, epoch uint16) error 
 		return fmt.Errorf("rotation recipe: registry epoch rollback: %w", encryption.ErrLocalEpochRollback)
 	}
 	if row.LastSeenLocalEpoch < epoch {
-		return fmt.Errorf("rotation recipe: local epoch not registered: %w", errBootstrapEncryptionProjectionPending)
+		return fmt.Errorf("rotation recipe: local epoch not registered: %w", encryptionwiring.ErrBootstrapEncryptionProjectionPending)
 	}
 	return nil
 }

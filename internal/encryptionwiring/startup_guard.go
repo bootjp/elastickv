@@ -1,4 +1,4 @@
-package main
+package encryptionwiring
 
 import (
 	"bufio"
@@ -39,7 +39,7 @@ type restoredCutoverReader interface {
 	RestoredCutover() uint64
 }
 
-// checkSidecarBehindRaftLog implements the §9.1 ErrSidecarBehindRaftLog
+// CheckSidecarBehindRaftLog implements the §9.1 ErrSidecarBehindRaftLog
 // startup-guard phase (Stage 6C-2d). It runs AFTER buildShardGroups
 // has opened each shard's engine and BEFORE any gRPC server starts
 // serving, in a different lifecycle phase from the §9.1 6C-1 / 6C-2
@@ -88,7 +88,7 @@ type restoredCutoverReader interface {
 // guard against a non-default shard would always report
 // caught-up (gap == 0 because the default group's WriteSidecar
 // doesn't bump the sidecar's index relative to OTHER shards).
-func checkSidecarBehindRaftLog(
+func CheckSidecarBehindRaftLog(
 	runtimes []*noderuntime.GroupRuntime,
 	defaultGroup uint64,
 	sidecarPath string,
@@ -193,12 +193,12 @@ func runSidecarBehindRaftLogGuard(
 	return nil
 }
 
-// chainEncryptionStartupGuard runs checkSidecarBehindRaftLog
+// ChainStartupGuard runs checkSidecarBehindRaftLog
 // only if prevErr is nil, returning whichever error fires
 // first. Lets the caller compose buildShardGroups + the Stage
 // 6C-2d guard in a single conditional, keeping run()'s cyclop
 // budget intact.
-func chainEncryptionStartupGuard(
+func ChainStartupGuard(
 	prevErr error,
 	runtimes []*noderuntime.GroupRuntime,
 	defaultGroup uint64,
@@ -208,13 +208,13 @@ func chainEncryptionStartupGuard(
 	if prevErr != nil {
 		return prevErr
 	}
-	if err := checkSidecarBehindRaftLog(runtimes, defaultGroup, sidecarPath, encryptionEnabled); err != nil {
+	if err := CheckSidecarBehindRaftLog(runtimes, defaultGroup, sidecarPath, encryptionEnabled); err != nil {
 		return err
 	}
-	return checkEnvelopeCutoverDivergenceStartupGuard(runtimes, defaultGroup, sidecarPath, encryptionEnabled)
+	return CheckEnvelopeCutoverDivergenceStartupGuard(runtimes, defaultGroup, sidecarPath, encryptionEnabled)
 }
 
-func checkEnvelopeCutoverDivergenceStartupGuard(
+func CheckEnvelopeCutoverDivergenceStartupGuard(
 	runtimes []*noderuntime.GroupRuntime,
 	defaultGroup uint64,
 	sidecarPath string,
@@ -337,18 +337,18 @@ func checkEnvelopeCutoverDivergenceForRuntime(
 	return nil
 }
 
-type encryptionMembershipStartupGuardInput struct {
-	raftID            string
-	raftDir           string
-	groups            []noderuntime.GroupSpec
-	multi             bool
-	defaultGroup      uint64
-	sidecarPath       string
-	encryptionEnabled bool
-	bootstrapServers  []raftengine.Server
+type MembershipStartupGuardInput struct {
+	RaftID            string
+	RaftDir           string
+	Groups            []noderuntime.GroupSpec
+	Multi             bool
+	DefaultGroup      uint64
+	SidecarPath       string
+	EncryptionEnabled bool
+	BootstrapServers  []raftengine.Server
 }
 
-// checkEncryptionMembershipStartupGuardsBeforeEngine implements the
+// CheckMembershipStartupGuardsBeforeEngine implements the
 // Stage 6C-3 startup-refusal phase before buildEncryptionWriteWiring
 // bumps local_epoch and before buildShardGroups opens Raft engines:
 //
@@ -362,22 +362,22 @@ type encryptionMembershipStartupGuardInput struct {
 //     a healthy restart has sidecar == registry from the previous
 //     process load, and prepareStorageNonceEpoch will bump the sidecar
 //     before any encrypted write path opens.
-func checkEncryptionMembershipStartupGuardsBeforeEngine(in encryptionMembershipStartupGuardInput) error {
-	if !in.encryptionEnabled || in.sidecarPath == "" {
+func CheckMembershipStartupGuardsBeforeEngine(in MembershipStartupGuardInput) error {
+	if !in.EncryptionEnabled || in.SidecarPath == "" {
 		return nil
 	}
-	in.multi = noderuntime.EffectiveMultiDataDirs(in.groups, in.multi)
-	sc, err := readExistingSidecarForStartupGuard(in.sidecarPath)
+	in.Multi = noderuntime.EffectiveMultiDataDirs(in.Groups, in.Multi)
+	sc, err := readExistingSidecarForStartupGuard(in.SidecarPath)
 	if err != nil || sc == nil {
 		return err
 	}
 	if sc.Active.Storage == 0 {
 		return nil
 	}
-	if err := checkNodeIDCollisionFromDisk(in.raftID, in.raftDir, in.groups, in.multi, in.bootstrapServers); err != nil {
+	if err := checkNodeIDCollisionFromDisk(in.RaftID, in.RaftDir, in.Groups, in.Multi, in.BootstrapServers); err != nil {
 		return err
 	}
-	return checkLocalEpochRollbackFromDisk(in.raftID, in.raftDir, in.defaultGroup, in.multi, sc)
+	return checkLocalEpochRollbackFromDisk(in.RaftID, in.RaftDir, in.DefaultGroup, in.Multi, sc)
 }
 
 func checkNodeIDCollisionFromDisk(
@@ -535,7 +535,7 @@ func checkLocalEpochRollbackBeforeBump(
 	return nil
 }
 
-func checkLocalEpochRollbackAfterReplay(
+func CheckLocalEpochRollbackAfterReplay(
 	raftID string,
 	runtimes []*noderuntime.GroupRuntime,
 	defaultGroup uint64,

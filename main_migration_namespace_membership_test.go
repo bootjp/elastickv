@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/encryption"
+	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
@@ -12,13 +13,13 @@ import (
 func TestMigrationNamespaceProductionFSMInstalledWithEncryptionOptions(t *testing.T) {
 	t.Parallel()
 	for _, encrypted := range []bool{false, true} {
-		wiring := encryptionWriteWiring{}
+		wiring := encryptionwiring.WriteWiring{}
 		if encrypted {
 			cipher, err := encryption.NewCipher(encryption.NewKeystore())
 			require.NoError(t, err)
-			wiring = encryptionWriteWiring{cache: encryption.NewStateCache(), cipher: cipher, nonceFactory: encryption.NewDeterministicNonceFactory(1, 1)}
+			wiring = encryptionwiring.WriteWiring{Cache: encryption.NewStateCache(), Cipher: cipher, NonceFactory: encryption.NewDeterministicNonceFactory(1, 1)}
 		}
-		st, err := store.NewPebbleStore(t.TempDir(), wiring.pebbleOptions()...)
+		st, err := store.NewPebbleStore(t.TempDir(), wiring.PebbleOptions()...)
 		require.NoError(t, err)
 		registry, err := store.WriterRegistryFor(st)
 		require.NoError(t, err)

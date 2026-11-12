@@ -41,6 +41,11 @@ func TestCheckLayering(t *testing.T) {
 		{"serverwiring only from binaries", "adapter", m + "internal/serverwiring", true},
 		{"serverwiring from root main", ".", m + "internal/serverwiring", false},
 		{"serverwiring root rule is not a subtree", "kv", m + "internal/serverwiring", true},
+		{"encryptionwiring only from binaries", "kv", m + "internal/encryptionwiring", true},
+		{"encryptionwiring from root main", ".", m + "internal/encryptionwiring", false},
+		{"encryptionwiring may use noderuntime", "internal/encryptionwiring", m + "internal/noderuntime", false},
+		{"encryptionwiring may use the etcd backend", "internal/encryptionwiring", m + "internal/raftengine/etcd", false},
+		{"adapter may not use encryptionwiring", "adapter", m + "internal/encryptionwiring", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()

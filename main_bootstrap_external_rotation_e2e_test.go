@@ -11,6 +11,7 @@ import (
 
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/internal/encryption"
+	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -76,12 +77,12 @@ func externalRotationE2ERequest(t *testing.T, f *bootstrapRotationE2EFixture, no
 	t.Helper()
 	sc, err := encryption.ReadSidecar(f.sidecarPath)
 	require.NoError(t, err)
-	id, err := nextEncryptionRotateOnStartupKeyID(sc)
+	id, err := encryptionwiring.NextRotateOnStartupKeyID(sc)
 	require.NoError(t, err)
-	wrapped, err := wrapFreshStartupDEK(f.wrapper)
+	wrapped, err := encryptionwiring.WrapFreshStartupDEK(f.wrapper)
 	require.NoError(t, err)
 	return &pb.RotateDEKRequest{Purpose: pb.RotateDEKRequest_PURPOSE_STORAGE, NewDekId: id, WrappedNewDek: wrapped,
-		ProposerNodeId: f.config.local.Member, ProposerLocalEpoch: uint32(node.wiring.epoch)}
+		ProposerNodeId: f.config.local.Member, ProposerLocalEpoch: uint32(node.wiring.Epoch)}
 }
 
 func externalRotationE2EApplied(t *testing.T, f *bootstrapRotationE2EFixture, node *bootstrapRotationE2ENode, req *pb.RotateDEKRequest) {
@@ -208,13 +209,13 @@ func TestBootstrapExternalRotationE2ERejectsReplayedSidecarMaterial(t *testing.T
 					req := externalRotationE2ERequest(t, f, node)
 					req.Purpose, req.WrappedNewDek = purpose, bytes.Clone(wrapped)
 					if purpose == pb.RotateDEKRequest_PURPOSE_RAFT {
-						req.ProposerLocalEpoch = uint32(node.wiring.raftEpoch)
+						req.ProposerLocalEpoch = uint32(node.wiring.RaftEpoch)
 					}
 					if rewrapped {
 						material, err := f.wrapper.Unwrap(wrapped)
 						require.NoError(t, err)
 						req.WrappedNewDek, err = f.wrapper.Wrap(material)
-						zeroBytes(material)
+						encryptionwiring.ZeroBytes(material)
 						require.NoError(t, err)
 						require.NotEqual(t, wrapped, req.WrappedNewDek)
 					}

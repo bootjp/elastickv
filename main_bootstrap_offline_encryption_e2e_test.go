@@ -12,6 +12,7 @@ import (
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryption/kek"
+	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -64,15 +65,15 @@ func prepareOfflineEncryptedLegacy(t *testing.T, f *bootstrapRotationE2EFixture)
 	clock, routes := kv.NewHLC(), distribution.NewEngine()
 	routes.UpdateRoute(nil, nil, 1)
 	keys := encryption.NewKeystore()
-	w, err := buildEncryptionWriteWiring(true, "n1", f.sidecarPath, f.wrapper, keys, []noderuntime.GroupSpec{f.group}, nil)
+	w, err := encryptionwiring.BuildWriteWiring(true, "n1", f.sidecarPath, f.wrapper, keys, []noderuntime.GroupSpec{f.group}, nil)
 	require.NoError(t, err)
 	factory := enablementFactory()
-	configureRaftEnvelopeFactory(factory, w)
+	encryptionwiring.ConfigureRaftEnvelopeFactory(factory, w)
 	builder := shardGroupBuilder{raftID: "n1", raftDir: f.base, bootstrap: true, factory: factory, clock: clock, readTracker: kv.NewActiveTimestampTracker(), routeEngine: routes, kekWrapper: f.wrapper, keystore: keys, sidecarPath: f.sidecarPath, encWiring: w}
 	rt, group, err := builder.build(f.group)
 	require.NoError(t, err)
 	t.Cleanup(rt.Close)
-	w.attachRaftEnvelopeGroup(1, group)
+	w.AttachRaftEnvelopeGroup(1, group)
 	require.Eventually(t, func() bool { return rt.Engine.State() == raftengine.StateLeader }, enablementE2EWait, 10*time.Millisecond)
 	enablementLegacyPut(t, rt.Engine, clock.Next(), "legacy-key", "original-value")
 	_, err = setupDistributionCatalog(t.Context(), []*raftGroupRuntime{rt}, routes)
