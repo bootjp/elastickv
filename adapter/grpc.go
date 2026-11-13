@@ -292,7 +292,14 @@ func (r *GRPCServer) RawLatestCommitTS(ctx context.Context, req *pb.RawLatestCom
 	}
 	readRouteVersion := r.readRouteVersion(req.GetReadRouteVersion())
 	if len(req.GetKeyBatch()) > 0 {
-		visible, visibleSupported, err := r.rawVersionsVisibleAt(ctx, req, readRouteVersion)
+		keys, err := pb.DecodeRawLatestCommitTSKeyBatch(req.GetKeyBatch(), maxGRPCScanLimit)
+		if err != nil {
+			return nil, errors.WithStack(status.Error(codes.InvalidArgument, err.Error()))
+		}
+		for _, key := range keys {
+			r.observeGRPCPointRead(ctx, key, req.GetGroupId())
+		}
+		visible, visibleSupported, err := r.rawVersionsVisibleAt(ctx, req, keys, readRouteVersion)
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}
@@ -300,6 +307,11 @@ func (r *GRPCServer) RawLatestCommitTS(ctx context.Context, req *pb.RawLatestCom
 			VersionVisibleResults:   visible,
 			VersionVisibleSupported: visibleSupported,
 		}, nil
+	}
+	if len(req.GetKey()) == 0 {
+		kv.MarkUnattributableClientReadThrough(r.coordinator, 0)
+	} else {
+		r.observeGRPCPointRead(ctx, req.GetKey(), req.GetGroupId())
 	}
 	return r.rawLatestCommitTSSingle(ctx, req, readRouteVersion)
 }
@@ -373,11 +385,7 @@ func (r *GRPCServer) rawExactVersionAt(ctx context.Context, req *pb.RawLatestCom
 	return exists, true, errors.Wrap(err, "probe committed version")
 }
 
-func (r *GRPCServer) rawVersionsVisibleAt(ctx context.Context, req *pb.RawLatestCommitTSRequest, readRouteVersion uint64) ([]bool, bool, error) {
-	keys, err := pb.DecodeRawLatestCommitTSKeyBatch(req.GetKeyBatch(), maxGRPCScanLimit)
-	if err != nil {
-		return nil, false, errors.WithStack(status.Error(codes.InvalidArgument, err.Error()))
-	}
+func (r *GRPCServer) rawVersionsVisibleAt(ctx context.Context, req *pb.RawLatestCommitTSRequest, keys [][]byte, readRouteVersion uint64) ([]bool, bool, error) {
 	out := make([]bool, len(keys))
 	at := req.GetVersionVisibleAtTs()
 	if at == 0 {

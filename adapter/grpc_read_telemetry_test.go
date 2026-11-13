@@ -144,7 +144,7 @@ func TestGRPCReadTelemetryEmptyCrossGroupScanMarksLocalLeader(t *testing.T) {
 	require.Equal(t, []uint64{0, 0}, coord.marks)
 }
 
-func TestGRPCReadTelemetryExcludesMetadataAndBlockedReads(t *testing.T) {
+func TestGRPCReadTelemetryVersionProbesAndBlockedReads(t *testing.T) {
 	ctx := context.Background()
 	st := store.NewMVCCStore()
 	defer st.Close()
@@ -154,14 +154,19 @@ func TestGRPCReadTelemetryExcludesMetadataAndBlockedReads(t *testing.T) {
 	require.NoError(t, err)
 	_, err = srv.RawLatestCommitTS(ctx, &pb.RawLatestCommitTSRequest{})
 	require.NoError(t, err)
-	require.Empty(t, coord.keys)
-	require.Empty(t, coord.marks)
+	_, err = srv.RawLatestCommitTS(ctx, &pb.RawLatestCommitTSRequest{
+		KeyBatch:           pb.EncodeRawLatestCommitTSKeyBatch([][]byte{[]byte("a"), []byte("b")}),
+		VersionVisibleAtTs: 1,
+	})
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{[]byte("k"), []byte("a"), []byte("b")}, coord.keys)
+	require.Equal(t, []uint64{0}, coord.marks)
 
 	blocked := NewGRPCServer(st, coord, WithGRPCReadGate(func() bool { return true }))
 	_, err = blocked.RawGet(ctx, &pb.RawGetRequest{Key: []byte("k")})
 	require.Error(t, err)
 	_, err = blocked.RawScanAt(ctx, &pb.RawScanAtRequest{Limit: 1})
 	require.Error(t, err)
-	require.Empty(t, coord.keys)
-	require.Empty(t, coord.marks)
+	require.Equal(t, [][]byte{[]byte("k"), []byte("a"), []byte("b")}, coord.keys)
+	require.Equal(t, []uint64{0}, coord.marks)
 }
