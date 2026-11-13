@@ -137,16 +137,12 @@ func (r *RedisServer) loadRedisSetState(ctx context.Context, key []byte, readTS 
 // reads the string-family anchors.
 func (r *RedisServer) replaceWithStringReadTimestampTxn(ctx context.Context, key, value []byte, ttl *time.Time, state redisSetState, readTimestamp kv.ReadTimestamp) error {
 	readTS := readTimestamp.Timestamp()
-	var elems []*kv.Elem[kv.OP]
 	// Use rawTyp for cleanup so expired-but-lingering internal keys are
 	// deleted. deleteLogicalKeyElems also Puts the four txn-wide fences.
 	collectionReplaced := isNonStringCollectionType(state.rawTyp)
-	if collectionReplaced {
-		delElems, _, err := r.deleteLogicalKeyElems(ctx, key, readTS)
-		if err != nil {
-			return err
-		}
-		elems = append(elems, delElems...)
+	elems, err := r.stringReplaceCleanupElems(ctx, key, readTS, state.rawTyp)
+	if err != nil {
+		return err
 	}
 	encoded := encodeRedisStr(bytes.Clone(value), ttl)
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisStrKey(key), Value: encoded})
@@ -161,6 +157,22 @@ func (r *RedisServer) replaceWithStringReadTimestampTxn(ctx context.Context, key
 		elems = append(elems, fences...)
 	}
 	return r.dispatchReadTimestampElemsWithReadKeys(ctx, readTimestamp, elems, readKeys)
+}
+
+// stringReplaceCleanupElems deletes what a string write replaces besides the
+// prefixed string key it Puts: a collection's rows (through
+// deleteLogicalKeyElems, which also Puts the four txn-wide fences), or, for a
+// string-typed value, the HyperLogLog and legacy bare anchors, which would
+// otherwise survive next to the new value.
+func (r *RedisServer) stringReplaceCleanupElems(ctx context.Context, key []byte, readTS uint64, rawTyp redisValueType) ([]*kv.Elem[kv.OP], error) {
+	switch {
+	case isNonStringCollectionType(rawTyp):
+		elems, _, err := r.deleteLogicalKeyElems(ctx, key, readTS)
+		return elems, err
+	case rawTyp == redisTypeString:
+		return r.existingKeyDelElems(ctx, readTS, redisHLLKey(key), key)
+	}
+	return nil, nil
 }
 
 func (r *RedisServer) executeSet(ctx context.Context, key, value []byte, opts redisSetOptions) (redisSetExecution, error) {

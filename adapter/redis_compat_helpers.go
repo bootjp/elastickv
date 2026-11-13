@@ -1282,13 +1282,19 @@ func (r *RedisServer) deleteLogicalKeyElemsForType(ctx context.Context, key []by
 }
 
 func (r *RedisServer) deleteStringLikeElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
-	var elems []*kv.Elem[kv.OP]
-	for _, internalKey := range [][]byte{
+	return r.existingKeyDelElems(ctx, readTS,
 		redisStrKey(key),
 		key, // legacy bare string key
 		redisHLLKey(key),
 		redisTTLKey(key),
-	} {
+	)
+}
+
+// existingKeyDelElems returns a Del for each of internalKeys that exists at
+// readTS, in order.
+func (r *RedisServer) existingKeyDelElems(ctx context.Context, readTS uint64, internalKeys ...[]byte) ([]*kv.Elem[kv.OP], error) {
+	var elems []*kv.Elem[kv.OP]
+	for _, internalKey := range internalKeys {
 		ok, err := r.store.ExistsAt(ctx, internalKey, readTS)
 		if err != nil {
 			return nil, errors.WithStack(err)
