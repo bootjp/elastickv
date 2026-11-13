@@ -199,6 +199,14 @@ func (s *shardedCapabilitySpy) ObserveForwardedRequests([]*pb.Request) {
 	s.record("ObserveForwardedRequests")
 }
 
+func (s *shardedCapabilitySpy) ObserveReadForKey(context.Context, []byte) {
+	s.record("ObserveReadForKey")
+}
+
+func (s *shardedCapabilitySpy) MarkUnattributableClientRead(uint64) {
+	s.record("MarkUnattributableClientRead")
+}
+
 func (s *shardedCapabilitySpy) RaftMembers(context.Context) ([]kv.RaftMember, error) {
 	s.record("RaftMembers")
 	return []kv.RaftMember{{NodeID: spyLeader}}, errSpyForwarded

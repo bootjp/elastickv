@@ -332,6 +332,29 @@ type LeaseReadableCoordinator interface {
 	LeaseReadForKey(ctx context.Context, key []byte) (uint64, error)
 }
 
+// ReadObserver records a key-routed read for KeyViz only. It does
+// not establish freshness or fetch data. Callers must not use it for a read
+// already observed by LeaseReadForKey or LinearizableReadForKey.
+type ReadObserver interface {
+	ObserveReadForKey(ctx context.Context, key []byte)
+}
+
+// ObserveReadForKeyThrough is a no-op for coordinators without telemetry support.
+func ObserveReadForKeyThrough(c Coordinator, ctx context.Context, key []byte) {
+	if observer, ok := c.(ReadObserver); ok {
+		observer.ObserveReadForKey(ctx, key)
+	}
+}
+
+// MarkUnattributableClientReadThrough is a no-op without sampler support.
+// A zero route ID invalidates read attribution across all routes in the
+// serving node's sampler; this does not propagate to other nodes.
+func MarkUnattributableClientReadThrough(c Coordinator, routeID uint64) {
+	if marker, ok := c.(keyviz.UnattributableClientReadMarker); ok {
+		marker.MarkUnattributableClientRead(routeID)
+	}
+}
+
 // LeaseReadThrough is a helper that calls LeaseRead when the
 // coordinator supports it, falling back to LinearizableRead otherwise.
 // Adapter call sites use this so they don't have to repeat the
@@ -1083,6 +1106,21 @@ func (c *Coordinate) LinearizableRead(ctx context.Context) (uint64, error) {
 func (c *Coordinate) LinearizableReadForKey(ctx context.Context, key []byte) (uint64, error) {
 	c.observeRead(ctx, key)
 	return c.LinearizableRead(ctx)
+}
+
+// ObserveReadForKey records leader-local KeyViz evidence without a Raft read.
+func (c *Coordinate) ObserveReadForKey(ctx context.Context, key []byte) {
+	if c != nil && c.IsLeaderForKey(key) {
+		c.observeRead(ctx, key)
+	}
+}
+
+func (c *Coordinate) MarkUnattributableClientRead(routeID uint64) {
+	if cfg := c.samplerSnapshot(); cfg != nil {
+		if marker, ok := cfg.sampler.(keyviz.UnattributableClientReadMarker); ok {
+			marker.MarkUnattributableClientRead(routeID)
+		}
+	}
 }
 
 // LeaseRead returns a read fence backed by a leader-local lease when

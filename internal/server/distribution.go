@@ -157,6 +157,7 @@ func startDistributionStartup(in distributionStartupInput) (distributionStartup,
 	autoSplitRuntime, err := setupDistributionWatcherAndAutoSplit(
 		in.ctx,
 		in.eg,
+		in.nodeAuth.SplitMigrationLocalReadinessGate,
 		distCatalog,
 		in.cfg.Engine,
 		distServer,
@@ -165,6 +166,7 @@ func startDistributionStartup(in distributionStartupInput) (distributionStartup,
 		autosplit.NewPrometheusObserver(in.metricsRegistry.Registerer()),
 		in.keyViz,
 		in.autoSplit,
+		noderuntime.ShardGroupIDs(in.shardGroups),
 	)
 	if err != nil {
 		return distributionStartup{}, err

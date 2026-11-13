@@ -139,6 +139,7 @@ func (d *DynamoDBServer) resolveGetItemTarget(w http.ResponseWriter, r *http.Req
 }
 
 func (d *DynamoDBServer) readItemAtKeyAt(ctx context.Context, key []byte, ts uint64) (map[string]attributeValue, bool, error) {
+	kv.ObserveReadForKeyThrough(d.coordinator, ctx, key)
 	b, err := d.store.GetAt(ctx, key, ts)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {

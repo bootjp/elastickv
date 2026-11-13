@@ -187,10 +187,20 @@ func (s *DistributionServer) commitWorkingSourceFence(ctx context.Context, job d
 		return snapshot, route, errors.WithStack(err)
 	}
 	routeKey, versionKey, jobKey := distribution.CatalogRouteKey(route.RouteID), distribution.CatalogVersionKey(), distribution.CatalogSplitJobKey(job.JobID)
+	deltaOps, err := s.catalogDeltaMutationOps(ctx, read.Timestamp(), distribution.CatalogDelta{
+		PreviousVersion: snapshot.Version,
+		Version:         nextVersion,
+		Mutations:       []distribution.CatalogRouteMutation{{Op: distribution.CatalogMutationUpsert, RouteID: route.RouteID, Route: route}},
+	})
+	if err != nil {
+		return snapshot, route, err
+	}
+	ops := []*kv.Elem[kv.OP]{{Op: kv.Put, Key: routeKey, Value: encoded},
+		{Op: kv.Put, Key: versionKey, Value: distribution.EncodeCatalogVersion(nextVersion)}}
+	ops = append(ops, deltaOps...)
 	resp, err := kv.DispatchWithReadTimestamp(read.WithDispatchVoucher(ctx), s.coordinator, &kv.OperationGroup[kv.OP]{
-		Elems: []*kv.Elem[kv.OP]{{Op: kv.Put, Key: routeKey, Value: encoded},
-			{Op: kv.Put, Key: versionKey, Value: distribution.EncodeCatalogVersion(nextVersion)}},
-		IsTxn: true, StartTS: read.Timestamp(), ReadKeys: [][]byte{routeKey, versionKey, jobKey},
+		Elems: ops, IsTxn: true, StartTS: read.Timestamp(),
+		ReadKeys: [][]byte{routeKey, versionKey, jobKey, distribution.CatalogDeltaKey(nextVersion), distribution.CatalogDeltaFloorKey()},
 	})
 	if err != nil {
 		return snapshot, route, errors.WithStack(err)

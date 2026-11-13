@@ -388,6 +388,9 @@ func (d *DynamoDBServer) handle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	target := r.Header.Get("X-Amz-Target")
+	if isReadOnlyDynamoRequest(r) {
+		kv.MarkUnattributableClientReadThrough(d.coordinator, 0)
+	}
 	if d.requestObserver == nil {
 		d.dispatchOrWriteUnsupported(target, w, r)
 		return

@@ -2,6 +2,8 @@ package etcd
 
 import (
 	"io"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -244,6 +246,63 @@ func TestProtectReceivedFSMSnapshotRejectsDuplicateInFlightIndex(t *testing.T) {
 	e.unprotectReceivedFSMSnapshot(9)
 	require.Empty(t, e.protectedReceivedFSMSnaps)
 	require.True(t, e.protectReceivedFSMSnapshot(9))
+}
+
+func TestReceivedFSMSnapshotKeepsDurableSnapshotWhileAppliedLags(t *testing.T) {
+	t.Parallel()
+	storage := etcdraft.NewMemoryStorage()
+	snapshot := appliedIndexTestSnapshot(9, encodeSnapshotToken(9, 0))
+	require.NoError(t, storage.ApplySnapshot(&snapshot))
+	fsmSnapDir := t.TempDir()
+	writeFSMFileForTest(t, fsmSnapDir, 9, []byte("durable snapshot"))
+	e := &Engine{storage: storage, fsmSnapDir: fsmSnapDir}
+	e.appliedIndex.Store(8)
+
+	require.False(t, e.protectReceivedFSMSnapshot(9), "a durable snapshot cannot be overwritten before its FSM apply completes")
+	e.removeReceivedFSMSnapshotIndex(9)
+	require.FileExists(t, fsmSnapPath(fsmSnapDir, 9), "ignored receive cleanup must not remove the durable snapshot")
+
+	writeFSMFileForTest(t, fsmSnapDir, 8, []byte("superseded snapshot"))
+	e.removeReceivedFSMSnapshotIndex(8)
+	require.NoFileExists(t, fsmSnapPath(fsmSnapDir, 8))
+}
+
+func TestPrepareReceivedFSMSnapshotReplacesOnlyUnreferencedSameIndexFile(t *testing.T) {
+	t.Parallel()
+	dataDir := t.TempDir()
+	fsmSnapDir := filepath.Join(dataDir, fsmSnapDirName)
+	require.NoError(t, os.MkdirAll(fsmSnapDir, 0o700))
+	e := &Engine{dataDir: dataDir, fsmSnapDir: fsmSnapDir, storage: etcdraft.NewMemoryStorage()}
+	const index uint64 = 9
+	path := fsmSnapPath(fsmSnapDir, index)
+	write := func() { writeFSMFileForTest(t, fsmSnapDir, index, []byte("unreferenced")) }
+
+	write()
+	e.protectedReceivedFSMSnaps = map[uint64]int{index: 1}
+	require.NoError(t, e.prepareFSMSnapshotWriteLocked(index))
+	require.FileExists(t, path, "an in-flight receive still owns this file")
+	e.protectedReceivedFSMSnaps = nil
+	require.NoError(t, e.prepareFSMSnapshotWriteLocked(index))
+	require.NoFileExists(t, path, "a stale same-index file must not block the next receive")
+
+	write()
+	snapshot := appliedIndexTestSnapshot(index, encodeSnapshotToken(index, 0))
+	require.NoError(t, e.storage.ApplySnapshot(&snapshot))
+	require.NoError(t, e.prepareFSMSnapshotWriteLocked(index))
+	require.FileExists(t, path, "the durable local snapshot owns this file")
+}
+
+func TestPersistLocalSnapshotWaitsForProtectedReceive(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	e := &Engine{
+		dataDir:                   dir,
+		fsmSnapDir:                filepath.Join(dir, fsmSnapDirName),
+		storage:                   etcdraft.NewMemoryStorage(),
+		protectedReceivedFSMSnaps: map[uint64]int{9: 1},
+	}
+	require.NoError(t, e.persistLocalSnapshot(snapshotRequest{index: 9, snapshot: &testSnapshot{data: []byte("local")}}))
+	require.NoFileExists(t, fsmSnapPath(e.fsmSnapDir, 9))
 }
 
 func TestUnprotectReceivedFSMSnapshotTokenIfApplied(t *testing.T) {

@@ -20,6 +20,8 @@ func TestPrometheusObserverRegistersBoundedMetrics(t *testing.T) {
 	observer.ObserveSplitFailed("unexpected_detail")
 	observer.ObserveSkipped(SkipReasonRouteCap)
 	observer.ObserveSkipped(SkipReasonCooldown)
+	observer.ObserveTargetSkipped("load_unknown")
+	observer.ObserveTargetSkipped("unexpected_detail")
 	observer.ObserveIsolationDeclined(IsolationDeclineTopKErrorBound)
 	observer.ObserveCompoundPartial()
 	observer.ObserveState(true, 7, 2, 250*time.Millisecond)
@@ -29,6 +31,7 @@ func TestPrometheusObserverRegistersBoundedMetrics(t *testing.T) {
 	require.Equal(t, float64(1), testutil.ToFloat64(observer.splitsFailed.WithLabelValues("rpc_error")))
 	require.Equal(t, float64(1), testutil.ToFloat64(observer.skipped.WithLabelValues(string(SkipReasonRouteCap))))
 	require.Equal(t, float64(0), testutil.ToFloat64(observer.skipped.WithLabelValues(string(SkipReasonCooldown))))
+	require.Equal(t, float64(1), testutil.ToFloat64(observer.targetSkipped.WithLabelValues("load_unknown")))
 	require.Equal(t, float64(1), testutil.ToFloat64(observer.isolationDeclined.WithLabelValues(string(IsolationDeclineTopKErrorBound))))
 	require.Equal(t, float64(1), testutil.ToFloat64(observer.compoundPartial))
 	require.Equal(t, float64(1), testutil.ToFloat64(observer.enabled))
@@ -38,5 +41,5 @@ func TestPrometheusObserverRegistersBoundedMetrics(t *testing.T) {
 
 	families, err := registry.Gather()
 	require.NoError(t, err)
-	require.Len(t, families, 10)
+	require.Len(t, families, 11)
 }

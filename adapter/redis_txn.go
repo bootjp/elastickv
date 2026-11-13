@@ -2895,17 +2895,24 @@ func (t *txnContext) zsetTTLRebuildWouldUseStaleBase(key string) bool {
 }
 
 func (r *RedisServer) runTransaction(queue []redcon.Command, requestContexts ...context.Context) ([]redisResult, error) {
+	ctx := r.redisContext(requestContexts...)
+	var results []redisResult
+	var err error
 	if transactionHasHeavyCommand(queue) {
-		var results []redisResult
-		var err error
 		if ok := r.runWithHeavyCommandSlot(func() {
-			results, err = r.runTransactionDirect(queue, r.redisContext(requestContexts...))
+			results, err = r.runTransactionDirect(queue, ctx)
 		}); !ok {
 			return nil, errRedisHeavyCommandPoolFull
 		}
-		return results, err
+	} else {
+		results, err = r.runTransactionDirect(queue, ctx)
 	}
-	return r.runTransactionDirect(queue, r.redisContext(requestContexts...))
+	for _, cmd := range queue {
+		if len(cmd.Args) != 0 {
+			r.observeRedisRead(ctx, strings.ToUpper(string(cmd.Args[0])), cmd.Args, false)
+		}
+	}
+	return results, err
 }
 
 func (r *RedisServer) applyExecQueueAtSnapshot(

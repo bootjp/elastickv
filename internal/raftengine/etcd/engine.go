@@ -3653,7 +3653,35 @@ func (e *Engine) prepareFSMSnapshotWriteLocked(index uint64) error {
 
 func (e *Engine) prepareFSMSnapshotWrite(index uint64) error {
 	snapDir := filepath.Join(e.dataDir, snapDirName)
+	if err := e.removeUnreferencedFSMSnapshot(index, snapDir); err != nil {
+		return err
+	}
 	return prepareFSMSnapshotWriteProtected(snapDir, e.fsmSnapDir, index, e.protectedReceivedFSMSnapshotIndexesLocked())
+}
+
+func (e *Engine) removeUnreferencedFSMSnapshot(index uint64, snapDir string) error {
+	if e.fsmSnapDir == "" || e.protectedReceivedFSMSnaps[index] > 0 || e.storage == nil {
+		return nil
+	}
+	current, err := e.storage.Snapshot()
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if index <= snapshotIndex(current) {
+		return nil
+	}
+	live, err := collectLiveSnapIndexes(snapDir)
+	if err != nil {
+		return err
+	}
+	if live[index] {
+		return nil
+	}
+	err = os.Remove(fsmSnapPath(e.fsmSnapDir, index))
+	if err != nil && !os.IsNotExist(err) {
+		return errors.WithStack(err)
+	}
+	return nil
 }
 
 func (e *Engine) protectReceivedFSMSnapshot(index uint64) bool {
@@ -3664,6 +3692,12 @@ func (e *Engine) protectReceivedFSMSnapshot(index uint64) bool {
 	defer e.snapshotMu.Unlock()
 	if index <= e.appliedIndex.Load() {
 		return false
+	}
+	if e.storage != nil {
+		current, err := e.storage.Snapshot()
+		if err != nil || index <= snapshotIndex(current) {
+			return false
+		}
 	}
 	if e.protectedReceivedFSMSnaps == nil {
 		e.protectedReceivedFSMSnaps = make(map[uint64]int, 1)
@@ -3823,6 +3857,14 @@ func (e *Engine) removeReceivedFSMSnapshotIndex(index uint64) {
 	}
 	e.snapshotMu.Lock()
 	defer e.snapshotMu.Unlock()
+	if e.storage != nil {
+		current, err := e.storage.Snapshot()
+		if err != nil || index == snapshotIndex(current) {
+			// An ignored receive may share the canonical path with the durable
+			// local snapshot, including while its applied index still lags.
+			return
+		}
+	}
 	removeWithWarn(fsmSnapPath(e.fsmSnapDir, index), "ignored received fsm snapshot")
 }
 
@@ -3863,7 +3905,7 @@ func (e *Engine) snapshotPayloadLocked(index uint64) ([]byte, error) {
 	}
 	// A cold-start FSM can lead the configuration replay. Never serialize its
 	// newer contents under an older configuration entry's snapshot index.
-	if index < e.applied || index <= current.GetMetadata().GetIndex() {
+	if e.localSnapshotBlocked(index, current.GetMetadata().GetIndex()) {
 		return nil, errors.WithStack(raftengine.ErrSnapshotDeferred)
 	}
 	if e.fsmSnapDir == "" {
@@ -3892,6 +3934,10 @@ func (e *Engine) snapshotPayloadLocked(index uint64) ([]byte, error) {
 		return nil, errors.WithStack(closeErr)
 	}
 	return encodeSnapshotToken(index, crc32c), nil
+}
+
+func (e *Engine) localSnapshotBlocked(index, current uint64) bool {
+	return index < e.applied || index <= current || e.protectedReceivedFSMSnaps[index] > 0
 }
 
 func (e *Engine) configSnapshotUpToDate(index uint64, confState raftpb.ConfState) (bool, error) {
@@ -5591,6 +5637,9 @@ func (e *Engine) persistLocalSnapshot(req snapshotRequest) error {
 		return errors.Join(errors.WithStack(err), errors.WithStack(req.snapshot.Close()))
 	}
 	if req.index <= current.GetMetadata().GetIndex() {
+		return errors.WithStack(req.snapshot.Close())
+	}
+	if e.protectedReceivedFSMSnaps[req.index] > 0 {
 		return errors.WithStack(req.snapshot.Close())
 	}
 	if err := e.prepareFSMSnapshotWrite(req.index); err != nil {

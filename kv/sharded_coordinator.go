@@ -2849,6 +2849,25 @@ func (c *ShardedCoordinator) LinearizableReadForKey(ctx context.Context, key []b
 	return linearizableReadEngineCtx(ctx, engineForGroup(g))
 }
 
+// ObserveReadForKey records only on the local leader of the key's group.
+func (c *ShardedCoordinator) ObserveReadForKey(ctx context.Context, key []byte) {
+	if c == nil {
+		return
+	}
+	routeID, g, ok := c.routeAndGroupForKey(key)
+	if ok && isLeaderEngine(engineForGroup(g)) {
+		c.observeRead(ctx, routeID, key)
+	}
+}
+
+func (c *ShardedCoordinator) MarkUnattributableClientRead(routeID uint64) {
+	if c != nil {
+		if marker, ok := c.sampler.(keyviz.UnattributableClientReadMarker); ok {
+			marker.MarkUnattributableClientRead(routeID)
+		}
+	}
+}
+
 // LeaseRead routes through the default group's lease. See Coordinate.LeaseRead
 // for semantics.
 func (c *ShardedCoordinator) LeaseRead(ctx context.Context) (uint64, error) {

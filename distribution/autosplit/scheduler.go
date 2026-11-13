@@ -41,8 +41,7 @@ type Splitter interface {
 	SplitRange(ctx context.Context, req SplitRequest) (SplitResult, error)
 }
 
-// SplitRequest is the scheduler's stable request surface. TargetGroupID is
-// carried for the post-M2 hook; M3 standalone always sends zero.
+// SplitRequest is the scheduler's stable request surface.
 type SplitRequest struct {
 	ExpectedCatalogVersion uint64
 	RouteID                uint64
@@ -53,10 +52,11 @@ type SplitRequest struct {
 	ParentGroupID          uint64
 }
 
-// SplitResult contains the committed catalog version and children when
-// SplitRange succeeds.
+// SplitResult contains the catalog version and either same-group children or
+// the job ID of a started cross-group migration.
 type SplitResult struct {
 	CatalogVersion uint64
+	JobID          uint64
 	Left           distribution.RouteDescriptor
 	Right          distribution.RouteDescriptor
 }
@@ -91,19 +91,21 @@ type GroupLeadershipSnapshot func(groupID uint64) (bool, uint64)
 
 // SchedulerConfig controls background auto-split execution.
 type SchedulerConfig struct {
-	Enabled         bool
-	Detector        Config
-	EvalInterval    time.Duration
-	SplitCooldown   time.Duration
-	SplitTimeout    time.Duration
-	KillSwitchFile  string
-	KillSwitch      KillSwitch
-	IsLeader        func() bool
-	Leadership      LeadershipSnapshot
-	GroupLeadership GroupLeadershipSnapshot
-	Logger          *slog.Logger
-	Reconciler      *RouteReconciler
-	Observer        Observer
+	Enabled           bool
+	CrossGroupEnabled bool
+	CandidateGroupIDs []uint64
+	Detector          Config
+	EvalInterval      time.Duration
+	SplitCooldown     time.Duration
+	SplitTimeout      time.Duration
+	KillSwitchFile    string
+	KillSwitch        KillSwitch
+	IsLeader          func() bool
+	Leadership        LeadershipSnapshot
+	GroupLeadership   GroupLeadershipSnapshot
+	Logger            *slog.Logger
+	Reconciler        *RouteReconciler
+	Observer          Observer
 	// Now supplies the wall clock a cycle is stamped with. Defaults to
 	// time.Now. It exists so tests can prove Run stamps cycles at processing
 	// time rather than with the ticker payload.
@@ -287,18 +289,42 @@ func (s *Scheduler) Tick(ctx context.Context, now time.Time) (SchedulerResult, e
 	if err != nil {
 		return out, err
 	}
-	prep.result.Detector = s.evaluateTick(now, prep)
+	if err := s.excludeBusySplitJobsAndReserve(ctx, &prep); err != nil {
+		return out, err
+	}
+	prep.result.Detector = s.evaluateTick(now, &prep)
+	s.prepareCrossGroupTick(&prep, now, runtimeEnabled)
 	return s.finishTick(ctx, runtimeEnabled, prep), nil
 }
 
 type tickPreparation struct {
 	snapshot         distribution.CatalogSnapshot
 	routes           []distribution.RouteDescriptor
+	windows          []ColumnWindow
 	fences           map[uint64]EvidenceFence
 	usedBudget       int
+	reservedRoutes   int
 	catalogGap       bool
 	stopAfterPrepare bool
 	result           SchedulerResult
+}
+
+func (s *Scheduler) excludeBusySplitJobsAndReserve(ctx context.Context, prep *tickPreparation) error {
+	if !s.cfg.CrossGroupEnabled || prep.stopAfterPrepare {
+		return nil
+	}
+	busy, reserved, err := activeSplitJobRoutesAndReservedDelta(ctx, s.source, prep.snapshot)
+	if err != nil {
+		return err
+	}
+	prep.reservedRoutes = reserved
+	for i := range prep.routes {
+		if _, exists := busy[prep.routes[i].RouteID]; exists {
+			prep.routes[i].State = distribution.RouteStateMigratingSource
+			s.state.ResetConfidence(prep.routes[i].RouteID)
+		}
+	}
+	return nil
 }
 
 func (s *Scheduler) ensureLeadership(now time.Time) bool {
@@ -339,7 +365,10 @@ func (s *Scheduler) prepareTick(
 	}
 	if runtimeEnabled {
 		var pendingScheduled, pendingFailed int
-		prep.snapshot, pendingScheduled, pendingFailed, prep.usedBudget, prep.stopAfterPrepare = s.finalizePendingCompounds(ctx, snapshot)
+		prep.snapshot, pendingScheduled, pendingFailed, prep.usedBudget, prep.stopAfterPrepare, err = s.finalizePendingCompounds(ctx, snapshot)
+		if err != nil {
+			return tickPreparation{}, err
+		}
 		prep.result.CatalogVersion = prep.snapshot.Version
 		prep.result.Scheduled += pendingScheduled
 		prep.result.Failed += pendingFailed
@@ -362,11 +391,12 @@ func (s *Scheduler) syncCatalogSnapshot(
 	return s.routesLedLocally(snapshot.Routes, now)
 }
 
-func (s *Scheduler) evaluateTick(now time.Time, prep tickPreparation) Result {
+func (s *Scheduler) evaluateTick(now time.Time, prep *tickPreparation) Result {
 	if prep.stopAfterPrepare {
 		return Result{}
 	}
 	windows := s.committedWindows(prep.routes, now)
+	prep.windows = windows
 	s.resetConfidenceForHistoryGaps(prep.routes, windows)
 	if prep.catalogGap {
 		if prep.fences == nil {
@@ -379,7 +409,7 @@ func (s *Scheduler) evaluateTick(now time.Time, prep tickPreparation) Result {
 		Windows:        windows,
 		EvidenceFences: prep.fences,
 		Now:            now,
-		LiveRouteCount: len(prep.snapshot.Routes),
+		LiveRouteCount: len(prep.snapshot.Routes) + prep.reservedRoutes,
 	})
 	s.observeDetectorResult(result)
 	return result
@@ -520,9 +550,14 @@ func (s *Scheduler) executeSplit(
 		}
 		return SplitResult{}, errors.Wrap(err, "autosplit: split range")
 	}
-	s.cfg.Logger.InfoContext(ctx, "autosplit: split committed",
+	message := "autosplit: split committed"
+	if result.JobID != 0 {
+		message = "autosplit: migration job started"
+	}
+	s.cfg.Logger.InfoContext(ctx, message,
 		slog.Uint64("route_id", routeID),
 		slog.Uint64("catalog_version", result.CatalogVersion),
+		slog.Uint64("job_id", result.JobID),
 		slog.String("split_key", loggedSplitKey(splitKey)),
 		slog.String("split_origin", string(splitOrigin)))
 	return result, nil
@@ -554,12 +589,16 @@ func (s *Scheduler) executeDecisions(ctx context.Context, catalogVersion uint64,
 }
 
 func (s *Scheduler) executeDecision(ctx context.Context, catalogVersion uint64, decision Decision) (uint64, error) {
+	targetGroupID := decision.TargetGroupID
+	if decision.SplitOrigin == SplitOriginIsolationCompound {
+		targetGroupID = 0
+	}
 	first, err := s.executeSplit(
 		ctx,
 		catalogVersion,
 		decision.RouteID,
 		decision.SplitKey,
-		decision.TargetGroupID,
+		targetGroupID,
 		decision.RouteStart,
 		decision.RouteEnd,
 		decision.RouteGroupID,
@@ -636,9 +675,9 @@ func (s *Scheduler) executePendingCompound(
 func (s *Scheduler) finalizePendingCompounds(
 	ctx context.Context,
 	snapshot distribution.CatalogSnapshot,
-) (distribution.CatalogSnapshot, int, int, int, bool) {
+) (distribution.CatalogSnapshot, int, int, int, bool, error) {
 	if len(s.pendingCompounds) == 0 {
-		return snapshot, 0, 0, 0, false
+		return snapshot, 0, 0, 0, false, nil
 	}
 	parentIDs := make([]uint64, 0, len(s.pendingCompounds))
 	for parentID := range s.pendingCompounds {
@@ -654,7 +693,10 @@ func (s *Scheduler) finalizePendingCompounds(
 			break
 		}
 		pending := s.pendingCompounds[parentID]
-		intermediate, ok := s.resolvePendingCompound(ctx, parentID, pending, snapshot)
+		intermediate, ok, err := s.resolvePendingCompound(ctx, parentID, pending, snapshot)
+		if err != nil {
+			return snapshot, scheduled, failed, attempted, true, err
+		}
 		if !ok {
 			continue
 		}
@@ -677,11 +719,11 @@ func (s *Scheduler) finalizePendingCompounds(
 		if refreshErr != nil {
 			s.cfg.Logger.WarnContext(ctx, "autosplit: refresh after compound finalization failed",
 				slog.Any("err", refreshErr))
-			return snapshot, scheduled, failed, attempted, true
+			return snapshot, scheduled, failed, attempted, true, nil
 		}
 		snapshot = refreshed
 	}
-	return snapshot, scheduled, failed, attempted, false
+	return snapshot, scheduled, failed, attempted, false, nil
 }
 
 // resolvePendingCompound validates one pending entry immediately before it is
@@ -692,14 +734,14 @@ func (s *Scheduler) resolvePendingCompound(
 	parentID uint64,
 	pending pendingCompound,
 	snapshot distribution.CatalogSnapshot,
-) (distribution.RouteDescriptor, bool) {
+) (distribution.RouteDescriptor, bool, error) {
 	if !s.leadsPendingCompoundGroup(pending) {
 		delete(s.pendingCompounds, parentID)
 		s.cfg.Logger.WarnContext(ctx, "autosplit: dropping compound finalization without shard leadership",
 			slog.Uint64("parent_route_id", parentID),
 			slog.Uint64("intermediate_route_id", pending.intermediate.RouteID),
 			slog.Uint64("group_id", pending.intermediate.GroupID))
-		return distribution.RouteDescriptor{}, false
+		return distribution.RouteDescriptor{}, false, nil
 	}
 	intermediate, ok := findActiveRoute(snapshot.Routes, pending.intermediate.RouteID)
 	if !ok || !samePendingIntermediate(intermediate, pending) ||
@@ -708,9 +750,18 @@ func (s *Scheduler) resolvePendingCompound(
 		s.cfg.Logger.WarnContext(ctx, "autosplit: dropping invalid compound finalization",
 			slog.Uint64("parent_route_id", parentID),
 			slog.Uint64("intermediate_route_id", pending.intermediate.RouteID))
-		return distribution.RouteDescriptor{}, false
+		return distribution.RouteDescriptor{}, false, nil
 	}
-	return intermediate, true
+	if s.cfg.CrossGroupEnabled {
+		_, reserved, err := activeSplitJobRoutesAndReservedDelta(ctx, s.source, snapshot)
+		if err != nil {
+			return distribution.RouteDescriptor{}, false, err
+		}
+		if len(snapshot.Routes)+reserved+1 > s.cfg.Detector.MaxRoutes {
+			return distribution.RouteDescriptor{}, false, nil
+		}
+	}
+	return intermediate, true, nil
 }
 
 // leadsPendingCompoundGroup rechecks shard leadership immediately before a

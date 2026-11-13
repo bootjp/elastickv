@@ -119,13 +119,16 @@ func (s *Service) planUnlinkOperation(ctx context.Context, snapshot operationPla
 	plan := operationAttemptPlan{Intent: intent, ReadTS: ts, RouteVersion: snapshot.RouteVersion,
 		ReadKeys: [][]byte{fskeys.InodeKey(parent), entryKey}}
 	parentMeta, semanticErr, err := s.unlinkParentAt(ctx, parent, ts)
+	if err == nil {
+		s.observeReadKey(ctx, fskeys.InodeKey(parent))
+	}
 	if err != nil {
 		return operationAttemptPlan{}, nil, nil, err
 	}
 	if semanticErr != nil {
 		return plan, nil, semanticErr, nil
 	}
-	meta, targetKey, semanticErr, err := s.unlinkTargetAt(ctx, parent, name, ts, directory)
+	meta, targetKey, semanticErr, err := s.unlinkTargetForOperation(ctx, parent, name, ts, directory)
 	if err != nil {
 		return operationAttemptPlan{}, nil, nil, err
 	}
@@ -155,6 +158,41 @@ func (s *Service) planUnlinkOperation(ctx context.Context, snapshot operationPla
 	}
 	plan.Result = []byte{unlinkResultSuccess}
 	return plan, cleanup, nil, nil
+}
+
+func (s *Service) unlinkTargetForOperation(ctx context.Context, parent uint64, name []byte, ts uint64, directory bool) (*InodeMeta, []byte, error, error) {
+	if s.readObserver == nil {
+		return s.unlinkTargetAt(ctx, parent, name, ts, directory)
+	}
+	entryKey := fskeys.DirEntryKey(parent, name)
+	entry, err := s.dirEntryAt(ctx, parent, name, ts)
+	s.observeReadResult(ctx, entryKey, err)
+	if errors.Is(err, ErrNotFound) {
+		return nil, nil, ErrNotFound, nil
+	}
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	targetKey := fskeys.InodeKey(entry.Inode)
+	meta, err := s.inodeAt(ctx, entry.Inode, ts)
+	s.observeReadResult(ctx, targetKey, err)
+	if errors.Is(err, ErrNotFound) {
+		return nil, targetKey, ErrNotFound, nil
+	}
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	semanticErr, err := s.validateUnlinkTarget(ctx, meta, ts, directory)
+	if !directory && meta.Type != TypeDirectory {
+		s.observeHomeRead(ctx, meta.Inode, err)
+	}
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if semanticErr != nil {
+		return meta, targetKey, semanticErr, nil
+	}
+	return meta, targetKey, nil, nil
 }
 
 func appendUnlinkDirectoryPredicate(plan *operationAttemptPlan, meta *InodeMeta, directory bool, semanticErr error) {

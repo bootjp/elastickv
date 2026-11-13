@@ -2,12 +2,15 @@ package serverwiring
 
 import (
 	"bytes"
+	"context"
 	"math"
 	"testing"
 
+	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/distribution/autosplit"
 	"github.com/bootjp/elastickv/keyviz"
+	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/stretchr/testify/require"
 )
@@ -29,6 +32,19 @@ func TestSchedulerConfigRejectsRouteCapAboveKeyVizCapacity(t *testing.T) {
 	k, a := parseWiringFlags(t, "-autoSplit", "-autoSplitMaxRoutes=10", "-keyvizMaxTrackedRoutes=5")
 	_, err := a.SchedulerConfig(nil, k)
 	require.ErrorContains(t, err, "--keyvizMaxTrackedRoutes")
+}
+
+func TestSchedulerConfigCrossGroupRequiresAutoSplit(t *testing.T) {
+	t.Parallel()
+	k, a := parseWiringFlags(t, "-autoSplitCrossGroup")
+	_, err := a.SchedulerConfig(nil, k)
+	require.ErrorContains(t, err, "requires --autoSplit")
+
+	k, a = parseWiringFlags(t, "-autoSplit", "-autoSplitCrossGroup")
+	cfg, err := a.SchedulerConfig(nil, k)
+	require.NoError(t, err)
+	require.True(t, cfg.Enabled)
+	require.True(t, cfg.CrossGroupEnabled)
 }
 
 // An explicit --keyvizKeyBucketsPerRoute means --autoSplitDefaultBuckets is
@@ -142,6 +158,60 @@ func TestSplitResultFromProtoRejectsMissingChild(t *testing.T) {
 	_, err := splitResultFromProto(&pb.SplitRangeResponse{CatalogVersion: 5})
 	require.ErrorContains(t, err, "decode left child")
 }
+
+func TestSplitMigrationResultFromProto(t *testing.T) {
+	t.Parallel()
+	got, err := splitMigrationResultFromProto(&pb.StartSplitMigrationResponse{CatalogVersion: 7, JobId: 42})
+	require.NoError(t, err)
+	require.Equal(t, uint64(7), got.CatalogVersion)
+	require.Equal(t, uint64(42), got.JobID)
+	require.Equal(t, distribution.RouteDescriptor{}, got.Left)
+	require.Equal(t, distribution.RouteDescriptor{}, got.Right)
+}
+
+func TestSplitMigrationResultFromProtoRejectsMissingJob(t *testing.T) {
+	t.Parallel()
+	for _, resp := range []*pb.StartSplitMigrationResponse{nil, {CatalogVersion: 7}} {
+		_, err := splitMigrationResultFromProto(resp)
+		require.ErrorContains(t, err, "no job ID")
+	}
+}
+
+func TestSplitMigrationRequest(t *testing.T) {
+	t.Parallel()
+	splitKey := []byte("m")
+	got := splitMigrationRequest(autosplit.SplitRequest{
+		ExpectedCatalogVersion: 7,
+		RouteID:                3,
+		SplitKey:               splitKey,
+		TargetGroupID:          2,
+	})
+	require.Equal(t, uint64(7), got.GetExpectedCatalogVersion())
+	require.Equal(t, uint64(3), got.GetRouteId())
+	require.Equal(t, []byte("m"), got.GetSplitKey())
+	require.Equal(t, uint64(2), got.GetTargetGroupId())
+	splitKey[0] = 'x'
+	require.Equal(t, []byte("m"), got.GetSplitKey())
+}
+
+func TestDistributionSplitterCrossGroupUsesMigrationPreflight(t *testing.T) {
+	t.Parallel()
+	server := adapter.NewDistributionServer(nil, nil, adapter.WithDistributionCoordinator(readyCatalogLeader{}))
+	_, err := (DistributionSplitter{Server: server}).SplitRange(context.Background(), autosplit.SplitRequest{
+		ExpectedCatalogVersion: 7,
+		RouteID:                1,
+		SplitKey:               []byte("m"),
+		TargetGroupID:          2,
+	})
+	require.ErrorContains(t, err, "autosplit: start split migration")
+	require.ErrorContains(t, err, "route catalog is not configured")
+}
+
+type readyCatalogLeader struct{ kv.Coordinator }
+
+func (readyCatalogLeader) IsLeaderForKey([]byte) bool { return true }
+
+func (readyCatalogLeader) VerifyLeaderForKey(context.Context, []byte) error { return nil }
 
 type fakeLeader struct {
 	leader bool

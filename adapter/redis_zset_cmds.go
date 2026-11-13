@@ -1641,6 +1641,7 @@ func (r *RedisServer) bzpopminWaitLoop(conn redcon.Conn, keys [][]byte, deadline
 // the full check.
 func (r *RedisServer) bzpopminTryAllKeys(conn redcon.Conn, keys [][]byte, fast bool) bool {
 	for _, key := range keys {
+		r.observeBlockingRedisKeys(r.handlerContext(conn), [][]byte{key})
 		result, err := r.tryBZPopMinWithMode(key, fast, r.handlerContext(conn))
 		if err != nil {
 			writeRedisError(conn, err)

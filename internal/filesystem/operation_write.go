@@ -83,6 +83,7 @@ func (s *Service) writeOperationEffectLimit(ctx context.Context, inode, offset, 
 	chunkSize := s.chunkSize
 	homeSlot := inode
 	meta, err := s.inodeAt(ctx, inode, ts)
+	s.observeReadResult(ctx, fskeys.InodeKey(inode), err)
 	if err == nil {
 		chunkSize = meta.effectiveChunkSize(s.chunkSize)
 		homeSlot = meta.HomeSlot
@@ -326,6 +327,7 @@ func (s *Service) planJournalWrite(ctx context.Context, journal *OperationJourna
 func (s *Service) planJournalWriteAt(ctx context.Context, snapshot operationPlanningSnapshot, cleaned *InodeMeta, inode, offset, end uint64, data, intent []byte) (operationAttemptPlan, error, error) {
 	plan := operationAttemptPlan{Intent: intent, ReadTS: snapshot.ReadTS, RouteVersion: snapshot.RouteVersion}
 	meta, err := s.inodeAt(ctx, inode, snapshot.ReadTS)
+	s.observeReadResult(ctx, fskeys.InodeKey(inode), err)
 	if errors.Is(err, ErrNotFound) {
 		plan.ReadKeys = [][]byte{fskeys.InodeKey(inode)}
 		return plan, ErrNotFound, nil
@@ -338,8 +340,10 @@ func (s *Service) planJournalWriteAt(ctx context.Context, snapshot operationPlan
 		return plan, ErrIsDir, nil
 	}
 	if err = s.ensureActiveHomeAt(ctx, meta, snapshot.ReadTS); err != nil {
+		s.observeHomeRead(ctx, inode, err)
 		return operationAttemptPlan{}, nil, err
 	}
+	s.observeHomeRead(ctx, inode, nil)
 	if end > meta.Size && (meta.Size != cleaned.Size || meta.HomeSlot != cleaned.HomeSlot) {
 		return operationAttemptPlan{}, nil, errWriteCleanupChanged
 	}
@@ -357,6 +361,7 @@ func (s *Service) prepareWriteCleanup(ctx context.Context, inode, end uint64) (*
 		return nil, err
 	}
 	meta, err := s.inodeAt(ctx, inode, ts)
+	s.observeReadResult(ctx, fskeys.InodeKey(inode), err)
 	if errors.Is(err, ErrNotFound) {
 		return &InodeMeta{}, nil
 	}
@@ -367,8 +372,18 @@ func (s *Service) prepareWriteCleanup(ctx context.Context, inode, end uint64) (*
 		return meta, nil
 	}
 	if err = s.ensureActiveHomeAt(ctx, meta, ts); err != nil {
+		s.observeHomeRead(ctx, inode, err)
 		return nil, err
 	}
+	s.observeHomeRead(ctx, inode, nil)
+	prefix := fskeys.ChunkPrefix(meta.HomeSlot, inode)
+	s.markUnattributableReadForRange(prefix, prefixEnd(prefix))
 	_, cleaned, _, err := s.cleanupStaleChunksBeforeSizeChange(ctx, inode, meta)
 	return cleaned, err
+}
+
+func (s *Service) observeHomeRead(ctx context.Context, inode uint64, err error) {
+	if err == nil || errors.Is(err, ErrNotFound) || errors.Is(err, ErrStaleHome) {
+		s.observeReadKey(ctx, fskeys.HomeKey(inode))
+	}
 }

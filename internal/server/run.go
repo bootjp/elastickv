@@ -316,6 +316,7 @@ func Run(flags *Flags) error {
 		encryption:                      flags.encryption,
 		kekConfigured:                   kekUnwrapper != nil,
 		keyvizSampler:                   sampler,
+		autoSplitCrossGroup:             *flags.autoSplit.CrossGroup,
 		autoSplitRuntime:                autoSplitRuntime,
 		encryptionConfChangeInterceptor: encryptionConfChangeInterceptor,
 		raftID:                          flags.raft.id,
