@@ -2225,7 +2225,7 @@ func TestRedisTxnCollectionExpireDeltaOnlyTruncatedReturnsError(t *testing.T) {
 			txn.startTS = store.MaxDeltaScanLimit + 2
 			expireRes, err := txn.applyExpire(redcon.Command{Args: [][]byte{[]byte(cmdPExpire), key, []byte("50000")}}, time.Millisecond)
 			require.ErrorIs(t, err, ErrDeltaScanTruncated)
-			require.Nil(t, expireRes)
+			require.Zero(t, expireRes)
 		})
 	}
 }
