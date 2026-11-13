@@ -180,7 +180,7 @@ func (s *S3Server) commitS3UploadPart(ctx context.Context, state *s3UploadPartSt
 	elems = append(elems, upload.ChunkRefElems...)
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: partKey, Value: body})
 	dispatchCtx := version.readTimestamp.WithDispatchVoucher(ctx)
-	_, err = kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, &kv.OperationGroup[kv.OP]{
+	err = s.dispatchS3MetadataMutation(dispatchCtx, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
 		StartTS:  version.startTS,
 		CommitTS: version.commitTS,

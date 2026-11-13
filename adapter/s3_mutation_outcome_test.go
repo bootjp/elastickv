@@ -2,15 +2,63 @@ package adapter
 
 import (
 	"context"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"sync/atomic"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
+
+func TestNormalizeS3MetadataDispatchError(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name        string
+		err         error
+		wantUnknown bool
+	}{
+		{"nil", nil, false},
+		{"local conflict", store.ErrWriteConflict, false},
+		{"local circuit open before dispatch", kv.ErrLeaderProxyCircuitOpen, false},
+		{"already unknown", kv.ErrTransactionOutcomeUnknown, true},
+		{"unmarked unavailable", status.Error(codes.Unavailable, "private-key"), true},
+		{"unmarked aborted", status.Error(codes.Aborted, "private-key"), true},
+		{"lost response", io.EOF, true},
+		{"deadline", context.DeadlineExceeded, true},
+		{"leadership lost", raftengine.ErrLeadershipLost, true},
+		{"transport loss with conflict", errors.Join(io.EOF, store.ErrWriteConflict), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := normalizeS3MetadataDispatchError(tc.err)
+			if tc.wantUnknown {
+				require.ErrorIs(t, got, kv.ErrTransactionOutcomeUnknown)
+				require.False(t, isRetryableS3MutationErr(got))
+				return
+			}
+			require.Equal(t, tc.err, got)
+		})
+	}
+}
+
+func TestS3UnmarkedMetadataDispatchProjectsUnknownOutcome(t *testing.T) {
+	t.Parallel()
+	err := normalizeS3MetadataDispatchError(status.Error(codes.Unavailable, "private-key: leader not found"))
+	rec := httptest.NewRecorder()
+	writeS3MutationError(rec, err, "bucket", "object")
+	require.Equal(t, http.StatusConflict, rec.Code)
+	require.Contains(t, rec.Body.String(), "<Code>OperationOutcomeUnknown</Code>")
+	require.Contains(t, rec.Body.String(), "<Message>Operation outcome unknown</Message>")
+	require.NotContains(t, rec.Body.String(), "private-key")
+	require.NotContains(t, rec.Body.String(), "bucket")
+}
 
 func TestS3MutationRetryPreservesUnknownOutcome(t *testing.T) {
 	t.Parallel()
@@ -92,6 +140,9 @@ func testS3LostPartReplyOutcomes(t *testing.T, offloaded bool) {
 		{"unknown joined lock", errors.Join(kv.ErrTransactionOutcomeUnknown, kv.ErrTxnLocked)},
 		{"unknown joined fence", errors.Join(kv.ErrTransactionOutcomeUnknown, kv.ErrRouteWriteFenced)},
 		{"deadline after commit", context.DeadlineExceeded},
+		{"unmarked unavailable after commit", status.Error(codes.Unavailable, "private-key: not leader")},
+		{"lost transport reply after commit", io.EOF},
+		{"leadership lost after commit", raftengine.ErrLeadershipLost},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -105,7 +156,9 @@ func testS3LostPartReplyOutcomes(t *testing.T, offloaded bool) {
 			h.server.coordinator = coord
 
 			response := h.uploadPart1(u, "replacement")
-			require.NotEqual(t, http.StatusOK, response.Code, "the success reply was lost")
+			require.Equal(t, http.StatusConflict, response.Code, "the success reply was lost")
+			require.Contains(t, response.Body.String(), "<Code>OperationOutcomeUnknown</Code>")
+			require.NotContains(t, response.Body.String(), "private-key")
 			require.True(t, coord.lost.Load(), "the failure must follow a real descriptor commit")
 			h.waitCleanups()
 			committed, exists := h.part1Descriptor(u)

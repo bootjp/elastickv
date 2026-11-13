@@ -160,7 +160,7 @@ func (s *S3Server) adminDeleteObjectTxn(ctx context.Context, bucket, key string)
 		return nil, 0, nil
 	}
 	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
-	_, err = kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, &kv.OperationGroup[kv.OP]{
+	err = s.dispatchS3MetadataMutation(dispatchCtx, &kv.OperationGroup[kv.OP]{
 		IsTxn:   true,
 		StartTS: startTS,
 		Elems: []*kv.Elem[kv.OP]{
