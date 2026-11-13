@@ -2,9 +2,13 @@ package adapter
 
 import (
 	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"sync/atomic"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
@@ -25,33 +29,51 @@ func TestNormalizeDynamoWriteDispatchError(t *testing.T) {
 		{"typed forwarded conflict", kv.ForwardWriteConflictStatus(), store.ErrWriteConflict},
 		{"wrapped typed forwarded conflict", errors.WithStack(kv.ForwardWriteConflictStatus()), store.ErrWriteConflict},
 		{"unknown outcome with typed conflict detail", errors.Join(kv.ErrTransactionOutcomeUnknown, kv.ForwardWriteConflictStatus()), nil},
-		{"unknown conflict", status.Error(codes.Unknown, "key: k: write conflict"), nil},
-		{"aborted without detail", status.Error(codes.Aborted, "key: k: write conflict"), nil},
+		{"unknown conflict", status.Error(codes.Unknown, "key: k: write conflict"), kv.ErrTransactionOutcomeUnknown},
+		{"aborted without detail", status.Error(codes.Aborted, "key: k: write conflict"), kv.ErrTransactionOutcomeUnknown},
 		{"local lock", kv.NewTxnLockedError([]byte("k")), kv.ErrTxnLocked},
 		{"typed forwarded lock", kv.ForwardTxnLockedStatus(), kv.ErrTxnLocked},
-		{"unknown lock", status.Error(codes.Unknown, "key: k: txn locked"), nil},
-		{"wrapped aborted lock without detail", errors.WithStack(status.Error(codes.Aborted, "key: k (pending): txn locked")), nil},
+		{"unknown lock", status.Error(codes.Unknown, "key: k: txn locked"), kv.ErrTransactionOutcomeUnknown},
+		{"wrapped aborted lock without detail", errors.WithStack(status.Error(codes.Aborted, "key: k (pending): txn locked")), kv.ErrTransactionOutcomeUnknown},
 		{"plain text", errors.New("key: k: write conflict"), nil},
-		{"missing key envelope", status.Error(codes.Unknown, "write conflict"), nil},
-		{"wrong code", status.Error(codes.Internal, "key: k: write conflict"), nil},
-		{"embedded sentinel", status.Error(codes.Unknown, "key: write conflict: invalid value"), nil},
-		{"plain lock", status.Error(codes.Unknown, "txn locked"), nil},
-		{"wrong lock code", status.Error(codes.Internal, "key: k: txn locked"), nil},
+		{"missing key envelope", status.Error(codes.Unknown, "write conflict"), kv.ErrTransactionOutcomeUnknown},
+		{"wrong code", status.Error(codes.Internal, "key: k: write conflict"), kv.ErrTransactionOutcomeUnknown},
+		{"embedded sentinel", status.Error(codes.Unknown, "key: write conflict: invalid value"), kv.ErrTransactionOutcomeUnknown},
+		{"plain lock", status.Error(codes.Unknown, "txn locked"), kv.ErrTransactionOutcomeUnknown},
+		{"wrong lock code", status.Error(codes.Internal, "key: k: txn locked"), kv.ErrTransactionOutcomeUnknown},
+		{"unmarked unavailable", status.Error(codes.Unavailable, "private-key"), kv.ErrTransactionOutcomeUnknown},
+		{"lost response", io.EOF, kv.ErrTransactionOutcomeUnknown},
+		{"deadline after dispatch", context.DeadlineExceeded, kv.ErrTransactionOutcomeUnknown},
+		{"leadership lost after proposal", raftengine.ErrLeadershipLost, kv.ErrTransactionOutcomeUnknown},
+		{"local circuit open before dispatch", kv.ErrLeaderProxyCircuitOpen, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			normalized := normalizeDynamoWriteDispatchError(tc.err)
 			switch {
+			case errors.Is(tc.want, kv.ErrTransactionOutcomeUnknown):
+				require.ErrorIs(t, normalized, kv.ErrTransactionOutcomeUnknown)
+				require.False(t, isRetryableTransactWriteError(normalized))
 			case tc.want != nil:
 				require.True(t, errors.Is(normalized, tc.want), "missing normalized sentinel %v: %v", tc.want, normalized)
 				require.True(t, shouldPreserveTransactWriteAttempt(normalized))
 			case tc.err != nil:
 				require.False(t, isRetryableTransactWriteError(normalized))
-				require.Same(t, tc.err, normalized)
+				require.Equal(t, tc.err, normalized)
 			default:
 				require.NoError(t, normalized)
 			}
 		})
 	}
+}
+
+func TestDynamoUnmarkedDispatchStatusProjectsUnknownOutcome(t *testing.T) {
+	t.Parallel()
+	err := normalizeDynamoWriteDispatchError(status.Error(codes.Unavailable, "private-key: leader not found"))
+	rec := httptest.NewRecorder()
+	writeDynamoErrorFromErr(rec, err)
+	require.Equal(t, http.StatusConflict, rec.Code)
+	require.Equal(t, dynamoErrOperationOutcomeUnknown, rec.Header().Get("x-amzn-ErrorType"))
+	require.JSONEq(t, `{"__type":"OperationOutcomeUnknown","message":"Operation outcome unknown"}`, rec.Body.String())
 }
 
 type forwardedDynamoLockCoordinator struct {
