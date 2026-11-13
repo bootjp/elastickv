@@ -55,12 +55,12 @@ const (
 	MigrationFamilyS3GCUpload
 	MigrationFamilyLegacyListMetaDelta
 	MigrationFamilyS3ChunkRef
-	// MigrationFamilyFilesystemChunk is appended last on purpose: the values
-	// above are the migration wire contract, so inserting anywhere earlier
-	// would renumber families that peers already use.
+	// New families must be appended: these values are the migration wire
+	// contract, so inserting among existing families would renumber peers.
 	MigrationFamilyFilesystemChunk
 	MigrationFamilyFilesystemUsage
 	MigrationFamilyDynamoSnapshotSeal
+	MigrationFamilyS3BucketCleanup
 )
 
 const (
@@ -234,6 +234,7 @@ var migrationInternalFamilyPrefixes = [][]byte{
 	[]byte(migrationSQSMsgByAgePrefix),
 	[]byte(s3keys.BucketMetaPrefix),
 	[]byte(s3keys.BucketGenerationPrefix),
+	[]byte(s3keys.BucketCleanupPrefix),
 	[]byte(s3keys.ObjectManifestPrefix),
 	[]byte(s3keys.UploadMetaPrefix),
 	[]byte(s3keys.UploadPartPrefix),
@@ -502,6 +503,9 @@ func (b MigrationBracket) decodedS3Bucket(rawKey []byte) (string, bool) {
 		return s3keys.ParseBucketMetaKey(rawKey)
 	case MigrationFamilyS3BucketGeneration:
 		return s3keys.ParseBucketGenerationKey(rawKey)
+	case MigrationFamilyS3BucketCleanup:
+		bucket, _, ok := s3keys.ParseBucketCleanupKey(rawKey)
+		return bucket, ok
 	default:
 		return "", false
 	}
@@ -665,6 +669,7 @@ func migrationFamilyBrackets() []MigrationBracket {
 		{family: MigrationFamilySQSPartitionedMessageByAge, prefix: migrationSQSMsgByAgePrefix + migrationSQSPartitionedSuffix},
 		{family: MigrationFamilyS3BucketMeta, prefix: s3keys.BucketMetaPrefix},
 		{family: MigrationFamilyS3BucketGeneration, prefix: s3keys.BucketGenerationPrefix},
+		{family: MigrationFamilyS3BucketCleanup, prefix: s3keys.BucketCleanupPrefix},
 		{family: MigrationFamilyS3ObjectManifest, prefix: s3keys.ObjectManifestPrefix},
 		{family: MigrationFamilyS3UploadMeta, prefix: s3keys.UploadMetaPrefix},
 		{family: MigrationFamilyS3UploadPart, prefix: s3keys.UploadPartPrefix},
@@ -709,7 +714,7 @@ func migrationFamilyBrackets() []MigrationBracket {
 
 func migrationBracketRouteCheck(family uint32) (requiresRouteKeyCheck bool, requiresDecodedS3 bool) {
 	switch family {
-	case MigrationFamilyS3BucketMeta, MigrationFamilyS3BucketGeneration:
+	case MigrationFamilyS3BucketMeta, MigrationFamilyS3BucketGeneration, MigrationFamilyS3BucketCleanup:
 		return false, true
 	default:
 		return true, false

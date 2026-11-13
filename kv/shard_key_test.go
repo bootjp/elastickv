@@ -38,8 +38,10 @@ func TestRouteOwnershipKey_NormalizesS3BucketAuxiliaryKeys(t *testing.T) {
 	want := s3keys.RoutePrefixForBucketAnyGeneration("bucket-a")
 	require.Equal(t, want, RouteOwnershipKey(s3keys.BucketMetaKey("bucket-a")))
 	require.Equal(t, want, RouteOwnershipKey(s3keys.BucketGenerationKey("bucket-a")))
+	require.Equal(t, want, RouteOwnershipKey(s3keys.BucketCleanupKey("bucket-a", 7)))
 	require.Equal(t, want, RouteOwnershipKey(txnLockKey(s3keys.BucketMetaKey("bucket-a"))))
 	require.Equal(t, want, RouteOwnershipKey(txnLockKey(s3keys.BucketGenerationKey("bucket-a"))))
+	require.Equal(t, want, RouteOwnershipKey(txnLockKey(s3keys.BucketCleanupKey("bucket-a", 7))))
 }
 
 func TestRouteKey_NormalizesFilesystemChunkKey(t *testing.T) {

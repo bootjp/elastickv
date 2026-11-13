@@ -158,7 +158,7 @@ func TestS3BucketDeleteAccountsOrphanChunkRefs(t *testing.T) {
 			h := newS3OCCReproModeHarness(t, false, true)
 			require.Equal(t, http.StatusOK, h.do(http.MethodPut, "/bucket", "").Code)
 			key, sha := seedS3CleanupChunkRef(t, h)
-			h.server.blobOffloadGCReady = gcReady
+			h.server.blobOffloadGCReady.Store(gcReady)
 			require.Equal(t, uint64(1), readS3ChunkRefRCTest(t, h, sha).Count)
 			require.NoError(t, h.server.AdminDeleteBucket(t.Context(), fullAdminBucketsPrincipal(), "bucket"))
 			_, err := h.st.GetAt(t.Context(), key, ^uint64(0))

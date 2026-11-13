@@ -19,6 +19,22 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestS3BucketCleanupScanUsesAuxiliaryRoutes(t *testing.T) {
+	t.Parallel()
+
+	start := []byte(s3keys.BucketCleanupPrefix)
+	end := prefixScanEnd(start)
+	require.True(t, s3BucketAuxiliaryScanBounds(start, end))
+	routeStart, routeEnd := s3BucketAuxiliaryScanRouteRange(start, end)
+	require.Equal(t, []byte(s3keys.RoutePrefix), routeStart)
+	require.Equal(t, prefixScanEnd(routeStart), routeEnd)
+
+	key := s3keys.BucketCleanupKey("bucket-a", 7)
+	routeStart, routeEnd = s3BucketAuxiliaryScanRouteRange(key, prefixScanEnd(key))
+	require.Equal(t, s3keys.RoutePrefixForBucketAnyGeneration("bucket-a"), routeStart)
+	require.Equal(t, prefixScanEnd(routeStart), routeEnd)
+}
+
 type exportCountingStore struct {
 	store.MVCCStore
 	exportCalls int
@@ -605,6 +621,7 @@ func TestShardStoreScanAt_RoutesS3BucketAuxiliaryStagedVisibility(t *testing.T) 
 	}{
 		{name: "bucket meta", prefix: s3keys.BucketMetaPrefix, key: s3keys.BucketMetaKey(bucket), value: []byte("meta")},
 		{name: "bucket generation", prefix: s3keys.BucketGenerationPrefix, key: s3keys.BucketGenerationKey(bucket), value: []byte("generation")},
+		{name: "bucket cleanup", prefix: s3keys.BucketCleanupPrefix, key: s3keys.BucketCleanupKey(bucket, 7), value: []byte("cleanup")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			require.NoError(t, groups[2].Store.PutAt(ctx, distribution.MigrationStagedDataKey(9, tc.key), tc.value, 20, 0))

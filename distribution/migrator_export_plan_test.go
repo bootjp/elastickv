@@ -57,6 +57,7 @@ func TestPlanMigrationBracketsIncludesRequiredFamilies(t *testing.T) {
 		MigrationFamilySQSPartitionedMessageByAge:      migrationSQSMsgByAgePrefix + migrationSQSPartitionedSuffix,
 		MigrationFamilyS3BucketMeta:                    s3keys.BucketMetaPrefix,
 		MigrationFamilyS3BucketGeneration:              s3keys.BucketGenerationPrefix,
+		MigrationFamilyS3BucketCleanup:                 s3keys.BucketCleanupPrefix,
 		MigrationFamilyS3ObjectManifest:                s3keys.ObjectManifestPrefix,
 		MigrationFamilyS3UploadMeta:                    s3keys.UploadMetaPrefix,
 		MigrationFamilyS3UploadPart:                    s3keys.UploadPartPrefix,
@@ -71,7 +72,7 @@ func TestPlanMigrationBracketsIncludesRequiredFamilies(t *testing.T) {
 		bracket, ok := byFamily[family]
 		require.True(t, ok, "missing family %d", family)
 		require.Equal(t, uint64(family), bracket.BracketID)
-		if family == MigrationFamilyS3BucketMeta || family == MigrationFamilyS3BucketGeneration {
+		if family == MigrationFamilyS3BucketMeta || family == MigrationFamilyS3BucketGeneration || family == MigrationFamilyS3BucketCleanup {
 			require.False(t, bracket.RequiresRouteKeyCheck)
 			require.True(t, bracket.RequiresDecodedS3)
 		} else {
@@ -220,10 +221,13 @@ func TestMigrationBracketContainsRoutedKeyForS3BucketAuxiliaryState(t *testing.T
 	}{
 		{name: "meta inside slice is not the owner", family: MigrationFamilyS3BucketMeta, key: s3keys.BucketMetaKey("bucket-b"), start: routeStart, end: routeEnd, want: false},
 		{name: "generation inside slice is not the owner", family: MigrationFamilyS3BucketGeneration, key: s3keys.BucketGenerationKey("bucket-b"), start: routeStart, end: routeEnd, want: false},
+		{name: "cleanup inside slice is not the owner", family: MigrationFamilyS3BucketCleanup, key: s3keys.BucketCleanupKey("bucket-b", 7), start: routeStart, end: routeEnd, want: false},
 		{name: "meta owning slice", family: MigrationFamilyS3BucketMeta, key: s3keys.BucketMetaKey("bucket-b"), start: ownerStart, end: routeEnd, want: true},
 		{name: "generation owning slice", family: MigrationFamilyS3BucketGeneration, key: s3keys.BucketGenerationKey("bucket-b"), start: ownerStart, end: routeEnd, want: true},
+		{name: "cleanup owning slice", family: MigrationFamilyS3BucketCleanup, key: s3keys.BucketCleanupKey("bucket-b", 7), start: ownerStart, end: routeEnd, want: true},
 		{name: "meta different bucket", family: MigrationFamilyS3BucketMeta, key: s3keys.BucketMetaKey("bucket-c"), start: routeStart, end: routeEnd, want: false},
 		{name: "generation different bucket", family: MigrationFamilyS3BucketGeneration, key: s3keys.BucketGenerationKey("bucket-c"), start: routeStart, end: routeEnd, want: false},
+		{name: "cleanup different bucket", family: MigrationFamilyS3BucketCleanup, key: s3keys.BucketCleanupKey("bucket-c", 7), start: routeStart, end: routeEnd, want: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -246,6 +250,9 @@ func TestMigrationBracketContainsRoutedKeyForS3BucketRawRoute(t *testing.T) {
 	))
 	require.True(t, byFamily[MigrationFamilyS3BucketGeneration].ContainsRoutedKey(
 		s3keys.BucketGenerationKey("bucket-b"), routeStart, nil, s3keys.ExtractRouteKey,
+	))
+	require.True(t, byFamily[MigrationFamilyS3BucketCleanup].ContainsRoutedKey(
+		s3keys.BucketCleanupKey("bucket-b", 7), routeStart, nil, s3keys.ExtractRouteKey,
 	))
 }
 

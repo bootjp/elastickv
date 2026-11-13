@@ -196,9 +196,8 @@ func TestConfigureAdminServiceTokenFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetClusterOverview: %v", err)
 	}
-	if !overview.GetCapabilities()[adapter.S3BlobOffloadCapabilityName] {
-		t.Fatal("enabled authenticated configuration should advertise S3 blob offload")
-	}
+	require.True(t, overview.GetCapabilities()[adapter.S3BlobOffloadCapabilityName])
+	require.True(t, overview.GetCapabilities()[adapter.S3BlobGCCapabilityName])
 }
 
 func TestConfigureAdminServiceRejectsSharedAdminAndPeerToken(t *testing.T) {
@@ -241,6 +240,9 @@ func TestConfigureAdminServiceDoesNotAdvertiseDisabledS3BlobOffload(t *testing.T
 	if overview.GetCapabilities()[adapter.S3BlobOffloadCapabilityName] {
 		t.Fatal("disabled rollout flag must remove S3 blob offload capability")
 	}
+	if overview.GetCapabilities()[adapter.S3BlobGCCapabilityName] {
+		t.Fatal("disabled rollout flag must remove S3 blob GC capability")
+	}
 }
 
 func TestConfigureAdminServiceInsecureNoAuth(t *testing.T) {
@@ -264,6 +266,9 @@ func TestConfigureAdminServiceInsecureNoAuth(t *testing.T) {
 	}
 	if overview.GetCapabilities()[adapter.S3BlobOffloadCapabilityName] {
 		t.Fatal("insecure admin mode must not advertise S3 blob offload capability")
+	}
+	if overview.GetCapabilities()[adapter.S3BlobGCCapabilityName] {
+		t.Fatal("insecure admin mode must not advertise S3 blob GC capability")
 	}
 }
 
