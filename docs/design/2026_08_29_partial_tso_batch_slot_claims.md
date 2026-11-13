@@ -204,7 +204,11 @@ Implementation order:
    ambiguous proposals, and ceiling renewal. An opt-in local allocator now
    commits the band end and tests those transitions, including advancing one
    physical millisecond when the minimum leaves too few logical slots. It
-   still rejects active Phase D, has no wire route, and cannot authorize writes.
+   now has a versioned, default-deny wire route with explicit committed-band
+   end and previous-issued cursor fields. An old peer response is rejected
+   instead of being interpreted as the new contract. The route still rejects
+   active Phase D and cannot authorize writes; production peer identity,
+   activation, and data-group admission remain open.
 4. Whole-cluster activation gate, migration and rolling-upgrade tests, native
    fault campaigns, Jepsen, and throughput/latency comparison with the old
    per-window allocator. No production activation before all gates pass.
@@ -222,8 +226,10 @@ Implementation order:
 4. How does the primary/home group attest a committed binding to secondary
    groups through authenticated peer transport, including primary failover and
    an unknown proposal outcome?
-5. How are physical-band reservation response fields versioned so old peers
-   cannot mistake the committed band end for a prior-issued cursor?
+5. ~~How are physical-band reservation response fields versioned so old peers
+   cannot mistake the committed band end for a prior-issued cursor?~~ Resolved
+   by the opt-in versioned response and explicit fields in step 3. Production
+   activation remains gated on the other requirements above.
 
 ## 6. Test plan
 

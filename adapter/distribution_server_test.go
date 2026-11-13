@@ -206,6 +206,57 @@ func TestDistributionServerGetTimestamp_CommitsCutoverAndReturnsPriorFloor(t *te
 	require.Equal(t, uint64(499), resp.GetPreviousAllocationFloor())
 }
 
+type bandDistributionAllocator struct {
+	*distributionTSOAllocator
+	reservations []kv.TSOPhysicalBandReservation
+}
+
+func (a *bandDistributionAllocator) ReservePhysicalBandAfter(_ context.Context, _ int, _ uint64) (kv.TSOPhysicalBandReservation, error) {
+	r := a.reservations[0]
+	a.reservations = a.reservations[1:]
+	return r, nil
+}
+
+func TestDistributionServerPhysicalBandWireContract(t *testing.T) {
+	bandEnd := uint64(10<<16 | 0xffff)
+	base := uint64(10 << 16)
+	alloc := &bandDistributionAllocator{distributionTSOAllocator: &distributionTSOAllocator{leader: true},
+		reservations: []kv.TSOPhysicalBandReservation{
+			{Base: base, Count: 2, CommittedBandEnd: bandEnd},
+			{Base: base + 11, Count: 2, CommittedBandEnd: bandEnd, PreviousIssuedCursor: base + 1},
+		}}
+	s := NewDistributionServer(distribution.NewEngine(), nil, WithDistributionTimestampAllocator(alloc))
+	req := &pb.GetTimestampRequest{Count: 2, ReservationProtocolVersion: kv.TSOPhysicalBandProtocolVersion}
+	_, err := s.GetTimestamp(t.Context(), req)
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	require.Len(t, alloc.reservations, 2)
+	s.physicalBandGate = func(context.Context) error { return errors.New("private peer identity") }
+	_, err = s.GetTimestamp(t.Context(), req)
+	require.Equal(t, codes.PermissionDenied, status.Code(err))
+	require.NotContains(t, err.Error(), "private peer identity")
+	require.Len(t, alloc.reservations, 2)
+	s.physicalBandGate = func(context.Context) error { return nil }
+	first, err := s.GetTimestamp(t.Context(), req)
+	require.NoError(t, err)
+	require.Equal(t, kv.TSOPhysicalBandProtocolVersion, first.GetReservationProtocolVersion())
+	require.Equal(t, bandEnd, first.GetCommittedBandEnd())
+	require.Zero(t, first.GetPreviousIssuedCursor())
+	req.MinTimestamp = base + 10
+	second, err := s.GetTimestamp(t.Context(), req)
+	require.NoError(t, err)
+	require.Equal(t, base+1, second.GetPreviousIssuedCursor())
+	require.Equal(t, base+11, second.GetTimestamp())
+	for _, version := range []uint32{2, 99} {
+		req.ReservationProtocolVersion = version
+		_, err = s.GetTimestamp(t.Context(), req)
+		require.Equal(t, codes.InvalidArgument, status.Code(err))
+	}
+	req.ReservationProtocolVersion = kv.TSOPhysicalBandProtocolVersion
+	req.ActivatePhaseD = true
+	_, err = s.GetTimestamp(t.Context(), req)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+}
+
 func TestDistributionServerGetTimestamp_CommitsPhaseDAndReturnsFloor(t *testing.T) {
 	t.Parallel()
 

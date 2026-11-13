@@ -26,6 +26,7 @@ import (
 
 // DistributionServer serves distribution related gRPC APIs.
 type DistributionServer struct {
+	physicalBandGate            func(context.Context) error
 	mu                          sync.Mutex
 	engine                      *distribution.Engine
 	catalog                     *distribution.CatalogStore
@@ -59,6 +60,12 @@ type DistributionServer struct {
 
 // DistributionServerOption configures DistributionServer behavior.
 type DistributionServerOption func(*DistributionServer)
+
+// WithDistributionPhysicalBandGate enables the versioned protocol only when
+// a future production peer-identity and rollout gate explicitly admits it.
+func WithDistributionPhysicalBandGate(gate func(context.Context) error) DistributionServerOption {
+	return func(s *DistributionServer) { s.physicalBandGate = gate }
+}
 
 type splitJobRunnerRun struct{ ctx context.Context }
 
@@ -610,6 +617,9 @@ func (s *DistributionServer) GetTimestamp(ctx context.Context, req *pb.GetTimest
 	if err != nil {
 		return nil, err
 	}
+	if req != nil && req.GetReservationProtocolVersion() != 0 {
+		return s.physicalBandTimestamp(ctx, req, count, minTimestamp)
+	}
 	activateCutover, activatePhaseD, err := timestampActivationValues(req)
 	if err != nil {
 		return nil, err
@@ -637,6 +647,53 @@ func (s *DistributionServer) GetTimestamp(ctx context.Context, req *pb.GetTimest
 		PhaseDActive:            reservation.PhaseDActive,
 		PhaseDFloor:             reservation.PhaseDFloor,
 	}, nil
+}
+
+func (s *DistributionServer) physicalBandTimestamp(ctx context.Context, req *pb.GetTimestampRequest, count int, min uint64) (*pb.GetTimestampResponse, error) {
+	if req.GetReservationProtocolVersion() != kv.TSOPhysicalBandProtocolVersion {
+		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "unsupported TSO reservation protocol version"))
+	}
+	if req.GetActivateCutover() || req.GetActivatePhaseD() {
+		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "physical-band reservation cannot activate TSO modes"))
+	}
+	if s.physicalBandGate == nil {
+		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "physical-band reservation is not activated"))
+	}
+	if err := s.physicalBandGate(ctx); err != nil {
+		return nil, errors.WithStack(status.Error(codes.PermissionDenied, "physical-band reservation is not authorized"))
+	}
+	allocator, ok := s.timestampAllocator.(kv.TSOPhysicalBandAllocator)
+	if !ok {
+		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "physical-band reservation is unavailable"))
+	}
+	reservation, err := allocator.ReservePhysicalBandAfter(ctx, count, min)
+	if err != nil {
+		return nil, timestampRPCError(err)
+	}
+	if err := validatePhysicalBandReservation(reservation, count, min); err != nil {
+		return nil, errors.WithStack(status.Error(codes.Internal, err.Error()))
+	}
+	return &pb.GetTimestampResponse{
+		Timestamp:                  reservation.Base,
+		Count:                      uint32(count), //nolint:gosec // timestampRequestValues bounds count.
+		CommittedByDedicatedTso:    true,
+		ReservationProtocolVersion: kv.TSOPhysicalBandProtocolVersion,
+		CommittedBandEnd:           reservation.CommittedBandEnd,
+		PreviousIssuedCursor:       reservation.PreviousIssuedCursor,
+	}, nil
+}
+
+func validatePhysicalBandReservation(r kv.TSOPhysicalBandReservation, count int, min uint64) error {
+	if err := validateTimestampWindow(r.Base, count, min); err != nil {
+		return err
+	}
+	end := r.Base + uint64(count) - 1 //nolint:gosec // count is positive, bounded, and overflow was checked above.
+	if r.Count != count || r.CommittedBandEnd < end || r.CommittedBandEnd&0xffff != 0xffff ||
+		r.Base>>16 != r.CommittedBandEnd>>16 || r.PreviousIssuedCursor >= r.Base ||
+		(r.PreviousIssuedCursor != 0 && r.PreviousIssuedCursor>>16 != r.Base>>16) {
+		return errors.New("invalid physical-band reservation metadata")
+	}
+	return nil
 }
 
 func timestampActivationValues(req *pb.GetTimestampRequest) (bool, bool, error) {

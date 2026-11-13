@@ -5,16 +5,24 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
+	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
 )
+
+const TSOPhysicalBandProtocolVersion uint32 = 1
+
+type TSOPhysicalBandAllocator interface {
+	ReservePhysicalBandAfter(context.Context, int, uint64) (TSOPhysicalBandReservation, error)
+}
 
 // TSOPhysicalBandReservation is an opt-in, leader-local allocation from a
 // whole physical millisecond band whose end was committed by group 0.
 // It is not a TSOReservation: its prior floor is not a shadow-migration floor.
 type TSOPhysicalBandReservation struct {
-	Base             uint64
-	Count            int
-	CommittedBandEnd uint64
+	Base                 uint64
+	Count                int
+	CommittedBandEnd     uint64
+	PreviousIssuedCursor uint64
 }
 
 type tsoPhysicalBand struct {
@@ -101,8 +109,9 @@ func (a *RaftTSOAllocator) reserveCachedPhysicalBand(
 		a.band = tsoPhysicalBand{}
 		return empty, false, errors.WithStack(ErrCeilingExpired)
 	}
+	previous := a.band.next - 1
 	a.band.next = base + positiveIntToUint64(n)
-	return TSOPhysicalBandReservation{Base: base, Count: n, CommittedBandEnd: a.band.end}, true, nil
+	return TSOPhysicalBandReservation{Base: base, Count: n, CommittedBandEnd: a.band.end, PreviousIssuedCursor: previous}, true, nil
 }
 
 func (a *RaftTSOAllocator) commitPhysicalBandLocked(
@@ -157,4 +166,55 @@ func (a *RaftTSOAllocator) selectPhysicalBand(floor uint64, ceiling int64, n int
 		end = base | hlcLogicalMask
 	}
 	return base, end, nil
+}
+
+// requestRemotePhysicalBand is an opt-in wire client. It never falls back to
+// the legacy response when a peer ignores the versioned request.
+func (a *LeaderRoutedTSOAllocator) requestRemotePhysicalBand(ctx context.Context, addr string, n int, min uint64) (TSOPhysicalBandReservation, error) {
+	var empty TSOPhysicalBandReservation
+	if err := validateTSOMinimumWindow(min, n); err != nil {
+		return empty, err
+	}
+	resp, err := a.remoteStartupTimestamp(ctx, addr, &pb.GetTimestampRequest{
+		Count:                      uint32(n), //nolint:gosec // validateTSOMinimumWindow bounds n.
+		MinTimestamp:               min,
+		ReservationProtocolVersion: TSOPhysicalBandProtocolVersion,
+	})
+	if err != nil {
+		return empty, err
+	}
+	return physicalBandReservationFromResponse(resp, n, min)
+}
+
+func physicalBandReservationFromResponse(resp *pb.GetTimestampResponse, n int, min uint64) (TSOPhysicalBandReservation, error) {
+	var empty TSOPhysicalBandReservation
+	if err := validateTSOMinimumWindow(min, n); err != nil {
+		return empty, err
+	}
+	if !validPhysicalBandResponseHeader(resp, uint32(n)) { //nolint:gosec // n was validated above.
+		return empty, errors.WithStack(ErrTSOProtocolUnsupported)
+	}
+	r := TSOPhysicalBandReservation{Base: resp.GetTimestamp(), Count: n,
+		CommittedBandEnd: resp.GetCommittedBandEnd(), PreviousIssuedCursor: resp.GetPreviousIssuedCursor()}
+	if !validPhysicalBandResponseWindow(r, n, min) {
+		return empty, errors.WithStack(ErrTSOProtocolUnsupported)
+	}
+	return r, nil
+}
+
+func validPhysicalBandResponseHeader(resp *pb.GetTimestampResponse, count uint32) bool {
+	return resp != nil && resp.GetReservationProtocolVersion() == TSOPhysicalBandProtocolVersion &&
+		resp.GetCommittedByDedicatedTso() && resp.GetCount() == count &&
+		!resp.GetCutoverActive() && !resp.GetPhaseDActive() && resp.GetPhaseDFloor() == 0 &&
+		resp.GetPreviousAllocationFloor() == 0
+}
+
+func validPhysicalBandResponseWindow(r TSOPhysicalBandReservation, n int, min uint64) bool {
+	size := uint64(n - 1) //nolint:gosec // n was validated before this helper is called.
+	return r.Base != 0 && r.Base > min && r.Base <= ^uint64(0)-size &&
+		r.Base+size <= r.CommittedBandEnd &&
+		r.CommittedBandEnd&hlcLogicalMask == hlcLogicalMask &&
+		r.Base>>hlcLogicalBits == r.CommittedBandEnd>>hlcLogicalBits &&
+		r.PreviousIssuedCursor < r.Base &&
+		(r.PreviousIssuedCursor == 0 || r.PreviousIssuedCursor>>hlcLogicalBits == r.Base>>hlcLogicalBits)
 }
