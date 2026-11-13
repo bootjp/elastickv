@@ -80,6 +80,33 @@ func TestRedis_LuaRecreateEmptyHashClearsDeltas(t *testing.T) {
 	require.Equal(t, int64(1), length)
 }
 
+func TestRedis_LuaRecreateEmptyHashDropsOldTTL(t *testing.T) {
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	ctx := context.Background()
+	client := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = client.Close() }()
+
+	key := "empty-wide:lua-recreate-ttl"
+	require.NoError(t, client.HSet(ctx, key, "field", "value").Err())
+	require.NoError(t, client.Expire(ctx, key, time.Minute).Err())
+	require.NoError(t, client.HDel(ctx, key, "field").Err())
+	require.NoError(t, client.Eval(ctx, `return redis.call('SADD', KEYS[1], 'member')`, []string{key}).Err())
+	ttl, err := client.TTL(ctx, key).Result()
+	require.NoError(t, err)
+	require.Equal(t, time.Duration(-1), ttl)
+	require.Equal(t, int64(1), client.SCard(ctx, key).Val())
+
+	withTTL := key + ":explicit"
+	require.NoError(t, client.HSet(ctx, withTTL, "field", "value").Err())
+	require.NoError(t, client.Expire(ctx, withTTL, time.Minute).Err())
+	require.NoError(t, client.HDel(ctx, withTTL, "field").Err())
+	require.NoError(t, client.Eval(ctx, `redis.call('SADD', KEYS[1], 'member'); return redis.call('PEXPIRE', KEYS[1], 30000)`, []string{withTTL}).Err())
+	ttl, err = client.TTL(ctx, withTTL).Result()
+	require.NoError(t, err)
+	require.Positive(t, ttl)
+}
+
 func TestRedis_EmptyWideCollectionRecreateDropsOldTTL(t *testing.T) {
 	nodes, _, _ := createNode(t, 1)
 	defer shutdown(nodes)
