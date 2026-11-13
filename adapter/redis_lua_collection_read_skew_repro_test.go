@@ -629,3 +629,72 @@ func TestHDel_PutsHashFence(t *testing.T) {
 		})
 	}
 }
+
+// TestLua_CaughtWrongTypeDoesNotPoisonKeyState checks that a WRONGTYPE a
+// script catches leaves no state behind for the key: a later command on the
+// same key in the same script sees the key as it is.
+//
+// Each state loader (string, list, hash, set, zset, stream) put an empty,
+// unloaded state into the script's cache before it checked the type, and left
+// it there when it returned WRONGTYPE. The next command of that type found the
+// cached state and treated the key as an absent value of the wrong type: a
+// second read replied nil / 0 instead of WRONGTYPE, and a write (HSET on a
+// string, INCR on a hash) succeeded and, at commit, replaced the key's value
+// with the new encoding.
+func TestLua_CaughtWrongTypeDoesNotPoisonKeyState(t *testing.T) {
+	t.Parallel()
+
+	const reply = `if type(r) == "table" then return r["err"] end; return tostring(r)`
+	const seedString = `redis.call("SET", KEYS[1], "s")`
+	const seedHash = `redis.call("HSET", KEYS[1], "f", "v")`
+	const checkString = `return redis.call("GET", KEYS[1])`
+	const checkHash = `return redis.call("HGET", KEYS[1], "f")`
+	cases := []struct {
+		name  string
+		seed  string
+		probe string
+		then  string
+		// check reads the key back after the script; it must be unchanged.
+		check string
+		want  string
+	}{
+		{name: "HGET then HGET on a string", seed: seedString, probe: `pcall(redis.call, "HGET", KEYS[1], "f")`,
+			then: `redis.pcall("HGET", KEYS[1], "f")`, check: checkString, want: "s"},
+		{name: "HGET then HSET on a string", seed: seedString, probe: `pcall(redis.call, "HGET", KEYS[1], "f")`,
+			then: `redis.pcall("HSET", KEYS[1], "f", "v")`, check: checkString, want: "s"},
+		{name: "LLEN then RPUSH on a string", seed: seedString, probe: `pcall(redis.call, "LLEN", KEYS[1])`,
+			then: `redis.pcall("RPUSH", KEYS[1], "x")`, check: checkString, want: "s"},
+		{name: "SMEMBERS then SADD on a string", seed: seedString, probe: `pcall(redis.call, "SMEMBERS", KEYS[1])`,
+			then: `redis.pcall("SADD", KEYS[1], "m")`, check: checkString, want: "s"},
+		{name: "ZSCORE then ZADD on a string", seed: seedString, probe: `pcall(redis.call, "ZSCORE", KEYS[1], "m")`,
+			then: `redis.pcall("ZADD", KEYS[1], 1, "m")`, check: checkString, want: "s"},
+		{name: "XLEN then XADD on a string", seed: seedString, probe: `pcall(redis.call, "XLEN", KEYS[1])`,
+			then: `redis.pcall("XADD", KEYS[1], "1-1", "f", "v")`, check: checkString, want: "s"},
+		{name: "GET then GET on a hash", seed: seedHash, probe: `pcall(redis.call, "GET", KEYS[1])`,
+			then: `redis.pcall("GET", KEYS[1])`, check: checkHash, want: "v"},
+		{name: "GET then INCR on a hash", seed: seedHash, probe: `pcall(redis.call, "GET", KEYS[1])`,
+			then: `redis.pcall("INCR", KEYS[1])`, check: checkHash, want: "v"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			st := store.NewMVCCStore()
+			server := NewRedisServer(nil, "", st, newReadKeyRecordingCoordinator(st), nil, nil)
+			keys := [][]byte{[]byte("1"), []byte("lua:wrongtype:key")}
+
+			conn := &recordingConn{}
+			server.runLuaScript(conn, tc.seed, keys)
+			require.Empty(t, conn.err)
+
+			conn = &recordingConn{}
+			server.runLuaScript(conn, tc.probe+"; local r = "+tc.then+"; "+reply, keys)
+			require.Empty(t, conn.err)
+			require.Contains(t, string(conn.bulk), "WRONGTYPE", "the second command must still see the key's real type")
+
+			conn = &recordingConn{}
+			server.runLuaScript(conn, tc.check, keys)
+			require.Empty(t, conn.err)
+			require.Equal(t, tc.want, string(conn.bulk), "the key's value must survive the caught WRONGTYPE")
+		})
+	}
+}
