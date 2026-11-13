@@ -55,6 +55,14 @@ func (c keyVizLabeledCoordinator) LinearizableReadForKey(ctx context.Context, ke
 	return c.CoordinatorForwarder.LinearizableReadForKey(contextWithKeyVizLabel(ctx, c.label), key)
 }
 
+func (c keyVizLabeledCoordinator) ObserveReadForKey(ctx context.Context, key []byte) {
+	c.CoordinatorForwarder.ObserveReadForKey(contextWithKeyVizLabel(ctx, c.label), key)
+}
+
+func (c keyVizLabeledCoordinator) MarkUnattributableClientRead(routeID uint64) {
+	c.CoordinatorForwarder.MarkUnattributableClientRead(routeID)
+}
+
 func (c keyVizLabeledCoordinator) Next(ctx context.Context) (uint64, error) {
 	return c.CoordinatorForwarder.Next(contextWithKeyVizLabel(ctx, c.label))
 }

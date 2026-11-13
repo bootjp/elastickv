@@ -14,11 +14,9 @@
 //
 // Hot-path properties (see design §5.1, §10):
 //
-//   - With hot-key tracking disabled, Observe is a single
-//     atomic.Pointer[routeTable].Load, a plain map lookup against an immutable
-//     snapshot, and at most two atomic.AddUint64 calls. Hot-key tracking adds a
-//     read lock to writes so sampled events stay aligned with their counter
-//     window.
+//   - Writes without hot-key tracking use a single route-table load, map
+//     lookup, and atomic counter updates. Reads take the flush read lock so
+//     their counter updates cannot cross a committed-window boundary.
 //   - Flush drains the per-route counters with atomic.SwapUint64; no
 //     pointer retirement, so a late writer cannot race past the snapshot
 //     and lose counts.
@@ -79,6 +77,12 @@ type Sampler interface {
 	// size is irrelevant. Implementations must no-op (not panic) when
 	// invoked on a typed-nil receiver.
 	Observe(routeID uint64, key []byte, op Op, valueLen int, label Label)
+}
+
+// UnattributableClientReadMarker is an optional interface for a kv-facing
+// caller. A zero route ID marks reads whose key or route cannot be resolved.
+type UnattributableClientReadMarker interface {
+	MarkUnattributableClientRead(routeID uint64)
 }
 
 // Defaults for MemSamplerOptions when fields are left zero.
@@ -205,8 +209,11 @@ type MemSampler struct {
 	// flushMu serializes explicit and background flushes, protects the
 	// committed window lower boundary, and aligns enabled hot-key events with
 	// the counter window drained by that flush.
-	flushMu     sync.RWMutex
-	lastFlushAt time.Time
+	flushMu                 sync.RWMutex
+	lastFlushAt             time.Time
+	readCoverageEnabled     bool
+	readCoverageWholeWindow bool
+	unattributableReads     map[uint64]bool
 
 	// table holds the immutable map of currently-tracked routes. The
 	// hot path Observe() does a single Load + map lookup; mutations
@@ -262,6 +269,79 @@ type MemSampler struct {
 	// happen at most a few times per second across the whole cluster.
 	groupTermsMu sync.RWMutex
 	groupTerms   map[uint64]uint64
+}
+
+// ReadCoverageEnrollment is an explicit assertion by the protocol ingress
+// owner. In particular, leader-local observations do not cover forwarded
+// reads. This must not be enabled until every client read path is instrumented.
+type ReadCoverageEnrollment struct {
+	LocalKeyedReadsObserved bool
+	ForwardedReadsObserved  bool
+	UnkeyedReadsMarked      bool
+}
+
+// EnrollReadCoverage changes the assertion for future complete windows only.
+// A transition in the current window leaves that window unproven.
+func (s *MemSampler) EnrollReadCoverage(enrollment ReadCoverageEnrollment) {
+	if s == nil {
+		return
+	}
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
+	enabled := enrollment.LocalKeyedReadsObserved && enrollment.ForwardedReadsObserved && enrollment.UnkeyedReadsMarked
+	if s.readCoverageEnabled != enabled {
+		s.readCoverageWholeWindow = false
+	}
+	s.readCoverageEnabled = enabled
+}
+
+// MarkUnattributableClientRead records a client read not represented by a
+// keyed Observe. routeID == 0 marks a global read (e.g. KEYS/SCAN/DBSIZE)
+// and invalidates coverage for every route in this committed window.
+func (s *MemSampler) MarkUnattributableClientRead(routeID uint64) {
+	if s == nil {
+		return
+	}
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
+	if s.unattributableReads == nil {
+		s.unattributableReads = make(map[uint64]bool)
+	}
+	s.unattributableReads[routeID] = true
+}
+
+// NoUnattributableClientReads proves only absence of marks in an exact,
+// retained committed window. It does not prove that all read paths were
+// instrumented; use ReadCoverageCoversWindow for target admission.
+func (s *MemSampler) NoUnattributableClientReads(routeID uint64, start, end time.Time) bool {
+	col, ok := s.readCoverageColumn(start, end)
+	return ok && !col.unattributableReads[0] && !col.unattributableReads[routeID]
+}
+
+// ReadCoverageCoversWindow requires explicit protocol enrollment throughout
+// the exact committed window and no route-local or global uncovered read.
+func (s *MemSampler) ReadCoverageCoversWindow(routeID uint64, start, end time.Time) bool {
+	col, ok := s.readCoverageColumn(start, end)
+	return ok && col.readCoverageComplete && !col.unattributableReads[0] && !col.unattributableReads[routeID]
+}
+
+func (s *MemSampler) readCoverageColumn(start, end time.Time) (MatrixColumn, bool) {
+	if s == nil || !start.Before(end) {
+		return MatrixColumn{}, false
+	}
+	s.historyMu.Lock()
+	defer s.historyMu.Unlock()
+	var found MatrixColumn
+	matched := false
+	for _, col := range s.history.snapshotOrdered() {
+		if col.WindowStart.Equal(start) && col.At.Equal(end) {
+			if matched {
+				return MatrixColumn{}, false
+			}
+			found, matched = col, true
+		}
+	}
+	return found, matched
 }
 
 // retiredSlot tracks a removed slot through its post-removal grace
@@ -448,11 +528,13 @@ type MatrixColumn struct {
 	// WindowStart and At delimit the committed half-open sampler
 	// interval. Rows and HotKeys contain evidence drained for
 	// (WindowStart, At].
-	WindowStart  time.Time
-	At           time.Time
-	Rows         []MatrixRow
-	HotKeys      []KeyvizHotKeysSnapshot
-	openRouteSeq uint64
+	WindowStart          time.Time
+	At                   time.Time
+	Rows                 []MatrixRow
+	HotKeys              []KeyvizHotKeysSnapshot
+	openRouteSeq         uint64
+	readCoverageComplete bool
+	unattributableReads  map[uint64]bool
 }
 
 // MatrixRow is a single route or virtual bucket's counter snapshot
@@ -677,7 +759,7 @@ func (s *MemSampler) Observe(routeID uint64, key []byte, op Op, valueLen int, la
 	if s == nil {
 		return
 	}
-	if s.hotKeys != nil && op == OpWrite {
+	if op == OpRead || s.hotKeys != nil && op == OpWrite {
 		s.flushMu.RLock()
 		defer s.flushMu.RUnlock()
 	}
@@ -1278,12 +1360,16 @@ func (s *MemSampler) flushAtLocked(at time.Time, hotKeys []KeyvizHotKeysSnapshot
 	s.windowOpenSeq = s.routeMutationSeq
 	s.routesMu.Unlock()
 	col := MatrixColumn{
-		WindowStart:  s.lastFlushAt,
-		At:           at,
-		HotKeys:      hotKeys,
-		openRouteSeq: openSeq,
+		WindowStart:          s.lastFlushAt,
+		At:                   at,
+		HotKeys:              hotKeys,
+		openRouteSeq:         openSeq,
+		readCoverageComplete: s.readCoverageWholeWindow && s.readCoverageEnabled,
+		unattributableReads:  s.unattributableReads,
 	}
 	s.lastFlushAt = at
+	s.readCoverageWholeWindow = s.readCoverageEnabled
+	s.unattributableReads = nil
 	// Snapshot the per-group leader-term map once at the top of
 	// Flush so every row in this column sees a consistent view, even
 	// if SetLeaderTerm fires concurrently. Later rows can never
@@ -1309,6 +1395,7 @@ func (s *MemSampler) flushAtLocked(at time.Time, hotKeys []KeyvizHotKeysSnapshot
 	s.historyMu.Lock()
 	if !col.WindowStart.Before(col.At) {
 		col.WindowStart = col.At.Add(-s.opts.Step)
+		col.readCoverageComplete = false
 	}
 	s.history.Push(col)
 	s.historyMu.Unlock()

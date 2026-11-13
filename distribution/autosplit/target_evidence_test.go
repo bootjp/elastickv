@@ -11,6 +11,13 @@ import (
 
 type registrationProofFunc func(uint64, uint64, []byte, []byte, time.Time, time.Time) bool
 
+type completeProof struct {
+	registrationProofFunc
+	covered bool
+}
+
+func (p completeProof) ReadCoverageCoversWindow(uint64, time.Time, time.Time) bool { return p.covered }
+
 func (f registrationProofFunc) RouteRegistrationCoversWindow(
 	routeID, groupID uint64, start, end []byte, windowStart, windowEnd time.Time,
 ) bool {
@@ -49,12 +56,17 @@ func TestBuildLocalTargetEvidence(t *testing.T) {
 		return true
 	}
 	cfg := Config{WriteWeight: 1, ReadWeight: 2}
-	got := BuildLocalTargetEvidence(col, []distribution.RouteDescriptor{route}, registered, serving, cfg)
+	got := BuildLocalTargetEvidence(col, []distribution.RouteDescriptor{route}, completeProof{registered, true}, serving, cfg)
 	require.Len(t, got, 1)
 	require.Equal(t, float64(40), got[0].LoadOpsMin)
 	require.True(t, got[0].Committed)
 	require.True(t, got[0].ServedWholeWindow)
 	require.True(t, got[0].RegisteredBeforeWindow)
+	require.True(t, got[0].ReadCoverageComplete)
+	require.Empty(t, BuildLocalTargetEvidence(col, []distribution.RouteDescriptor{route}, registered, serving, cfg),
+		"registration and leadership without protocol read proof must fail closed")
+	require.Empty(t, BuildLocalTargetEvidence(col, []distribution.RouteDescriptor{route}, completeProof{registered, false}, serving, cfg),
+		"an explicit negative read proof must fail closed")
 
 	tests := []struct {
 		name string
@@ -85,7 +97,7 @@ func TestBuildLocalTargetEvidence(t *testing.T) {
 			copyRoute := route
 			tt.edit(&copyCol, &copyRoute)
 			got := BuildLocalTargetEvidence(copyCol, []distribution.RouteDescriptor{copyRoute},
-				registrationProofFunc(func(uint64, uint64, []byte, []byte, time.Time, time.Time) bool { return tt.reg }),
+				completeProof{registrationProofFunc(func(uint64, uint64, []byte, []byte, time.Time, time.Time) bool { return tt.reg }), true},
 				func(uint64, uint64, time.Time, time.Time) bool { return tt.lead }, cfg)
 			require.Empty(t, got)
 		})

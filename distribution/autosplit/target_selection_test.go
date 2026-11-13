@@ -21,6 +21,7 @@ func TestSelectTargetGroup(t *testing.T) {
 			RouteID: id, GroupID: group, WindowStart: start, WindowEnd: end,
 			LoadOpsMin: load, Committed: true, ServedWholeWindow: true,
 			RegisteredBeforeWindow: true,
+			ReadCoverageComplete:   true,
 		}
 	}
 	base := func() TargetSelectionInput {
@@ -57,6 +58,15 @@ func TestSelectTargetGroup(t *testing.T) {
 		{"ingress or follower row", func(in *TargetSelectionInput) { in.Evidence[0].ServedWholeWindow = false }, 3},
 		{"membership registered late", func(in *TargetSelectionInput) { in.Evidence[0].RegisteredBeforeWindow = false }, 3},
 		{"uncommitted row", func(in *TargetSelectionInput) { in.Evidence[0].Committed = false }, 3},
+		{"unobserved HGET with seeded write", func(in *TargetSelectionInput) {
+			in.CandidateGroupIDs = []uint64{2}
+			in.Evidence[0].ReadCoverageComplete = false
+		}, 0},
+		{"no coverage proof", func(in *TargetSelectionInput) {
+			for i := range in.Evidence {
+				in.Evidence[i].ReadCoverageComplete = false
+			}
+		}, 0},
 		{"source load unknown", func(in *TargetSelectionInput) { in.Evidence = in.Evidence[:2] }, 0},
 		{"source group route missing", func(in *TargetSelectionInput) {
 			in.Routes = append(in.Routes, route(11, 1, distribution.RouteStateActive))

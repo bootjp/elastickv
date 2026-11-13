@@ -20,6 +20,7 @@ type TargetRouteEvidence struct {
 	Committed              bool
 	ServedWholeWindow      bool
 	RegisteredBeforeWindow bool
+	ReadCoverageComplete   bool
 }
 
 // TargetSelectionInput contains only facts needed by the opt-in policy.
@@ -139,6 +140,7 @@ func validTargetWindow(in TargetSelectionInput) bool {
 
 func validTargetEvidence(in TargetSelectionInput, row TargetRouteEvidence) bool {
 	return row.Committed && row.ServedWholeWindow && row.RegisteredBeforeWindow &&
+		row.ReadCoverageComplete &&
 		row.WindowStart.Equal(in.WindowStart) && row.WindowEnd.Equal(in.WindowEnd) &&
 		finiteNonnegative(row.LoadOpsMin)
 }

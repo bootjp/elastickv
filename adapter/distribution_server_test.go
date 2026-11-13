@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -2212,6 +2213,66 @@ func TestDistributionServerGetSplitMigrationCapabilityRespectsReadinessGate(t *t
 	require.NoError(t, err)
 	require.False(t, resp.GetMigrationCapable())
 	require.NotContains(t, resp.GetCapabilities(), splitMigrationCapabilityV2)
+}
+
+func TestDistributionServerSplitJobRunnerReadinessFollowsRuntime(t *testing.T) {
+	t.Parallel()
+
+	baseStore := store.NewMVCCStore()
+	var gateOpen atomic.Bool
+	s := NewDistributionServer(distribution.NewEngine(), distribution.NewCatalogStore(baseStore),
+		WithDistributionCoordinator(newDistributionCoordinatorStub(baseStore, false)),
+		WithSplitPromotionClientFactory(func(context.Context, distribution.SplitJob) (SplitPromotionClient, error) {
+			return nil, nil
+		}),
+		WithSplitMigrationClientFactory(func(context.Context, distribution.SplitJob, uint64) (SplitMigrationClient, SplitMigrationClient, error) {
+			return nil, nil, nil
+		}),
+		WithSplitJobRunnerReadinessGate(func(context.Context) error {
+			if !gateOpen.Load() {
+				return status.Error(codes.FailedPrecondition, "local gate closed")
+			}
+			return nil
+		}),
+	)
+	probe := func() bool {
+		resp, err := s.GetSplitMigrationCapability(context.Background(), &pb.GetSplitMigrationCapabilityRequest{})
+		require.NoError(t, err)
+		return resp.GetMigrationCapable()
+	}
+	require.False(t, probe())
+
+	canceled, cancelBeforeStart := context.WithCancel(context.Background())
+	cancelBeforeStart()
+	require.NoError(t, s.RunSplitJobRunner(canceled))
+	require.False(t, probe())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- s.RunSplitJobRunner(ctx) }()
+	t.Cleanup(cancel)
+	require.Eventually(t, s.splitJobRunnerRunning, time.Second, time.Millisecond)
+	require.False(t, probe())
+	gateOpen.Store(true)
+	require.True(t, probe())
+	gateOpen.Store(false)
+	require.False(t, probe())
+	gateOpen.Store(true)
+	require.True(t, probe())
+	cancel()
+	require.False(t, probe())
+	require.NoError(t, <-done)
+	require.False(t, probe())
+}
+
+func TestDistributionServerUnconfiguredSplitJobRunnerNeverAdvertisesRuntimeReadiness(t *testing.T) {
+	t.Parallel()
+
+	s := NewDistributionServer(distribution.NewEngine(), distribution.NewCatalogStore(store.NewMVCCStore()))
+	require.NoError(t, s.RunSplitJobRunner(context.Background()))
+	resp, err := s.GetSplitMigrationCapability(context.Background(), &pb.GetSplitMigrationCapabilityRequest{})
+	require.NoError(t, err)
+	require.False(t, resp.GetMigrationCapable())
 }
 
 func TestDistributionServerStartSplitMigration_FailsClosedUntilCapabilityGate(t *testing.T) {

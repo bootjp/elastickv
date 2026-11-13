@@ -741,6 +741,12 @@ func (r *RedisServer) dispatchCommandUnowned(conn redcon.Conn, name string, hand
 }
 
 func (r *RedisServer) dispatchCommandDirect(conn redcon.Conn, name string, handler func(redcon.Conn, redcon.Command), cmd redcon.Command, start time.Time) {
+	defer func() {
+		if owned, ok := conn.(*redisOwnedConn); ok && !owned.workStarted {
+			return
+		}
+		r.observeRedisRead(r.handlerContext(conn), name, cmd.Args, true)
+	}()
 	switch {
 	case r.requestObserver != nil:
 		metricsConn, _ := redisMetricsConnPool.Get().(*redisMetricsConn)

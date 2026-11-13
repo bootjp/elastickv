@@ -13,6 +13,12 @@ type RouteWindowRegistration interface {
 	RouteRegistrationCoversWindow(routeID, groupID uint64, start, end []byte, windowStart, windowEnd time.Time) bool
 }
 
+// ReadWindowCoverage is an independent protocol-ingress proof. Leadership,
+// route registration, and an absence of uncovered-read marks are insufficient.
+type ReadWindowCoverage interface {
+	ReadCoverageCoversWindow(routeID uint64, windowStart, windowEnd time.Time) bool
+}
+
 // ServingWindowProof must prove this node served the group for the whole
 // window at term, not merely that it leads the group at the current instant.
 type ServingWindowProof func(groupID, term uint64, windowStart, windowEnd time.Time) bool
@@ -29,7 +35,8 @@ func BuildLocalTargetEvidence(
 	col keyviz.MatrixColumn, routes []distribution.RouteDescriptor,
 	registrations RouteWindowRegistration, serving ServingWindowProof, cfg Config,
 ) []TargetRouteEvidence {
-	if registrations == nil || serving == nil || !col.WindowStart.Before(col.At) {
+	coverage, ok := registrations.(ReadWindowCoverage)
+	if registrations == nil || !ok || serving == nil || !col.WindowStart.Before(col.At) {
 		return nil
 	}
 	byID := make(map[uint64]distribution.RouteDescriptor, len(routes))
@@ -43,7 +50,7 @@ func BuildLocalTargetEvidence(
 		if !exists {
 			continue
 		}
-		if evidence, ok := provenTargetSample(col, route, key, sample, registrations, serving, cfg); ok {
+		if evidence, ok := provenTargetSample(col, route, key, sample, registrations, coverage, serving, cfg); ok {
 			out = append(out, evidence)
 		}
 	}
@@ -77,12 +84,13 @@ func indexTargetSamples(rows []keyviz.MatrixRow) map[RouteKey]targetRouteSample 
 
 func provenTargetSample(
 	col keyviz.MatrixColumn, route distribution.RouteDescriptor, key RouteKey, sample targetRouteSample,
-	registrations RouteWindowRegistration, serving ServingWindowProof, cfg Config,
+	registrations RouteWindowRegistration, coverage ReadWindowCoverage, serving ServingWindowProof, cfg Config,
 ) (TargetRouteEvidence, bool) {
 	if route.GroupID != key.RaftGroupID || route.State != distribution.RouteStateActive || !sample.valid {
 		return TargetRouteEvidence{}, false
 	}
 	if !registrations.RouteRegistrationCoversWindow(route.RouteID, route.GroupID, route.Start, route.End, col.WindowStart, col.At) ||
+		!coverage.ReadCoverageCoversWindow(route.RouteID, col.WindowStart, col.At) ||
 		!serving(route.GroupID, sample.term, col.WindowStart, col.At) {
 		return TargetRouteEvidence{}, false
 	}
@@ -95,5 +103,6 @@ func provenTargetSample(
 		WindowStart: col.WindowStart, WindowEnd: col.At,
 		LoadOpsMin: load, Committed: true,
 		ServedWholeWindow: true, RegisteredBeforeWindow: true,
+		ReadCoverageComplete: true,
 	}, true
 }

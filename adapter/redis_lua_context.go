@@ -24,7 +24,8 @@ type luaScriptContext struct {
 	// ctx is the request-scoped context captured at newLuaScriptContext
 	// time. New cmd* handlers should propagate it into store operations
 	// so the Eval's deadline and cancellation reach storage.
-	ctx context.Context
+	ctx                context.Context
+	observeNestedReads bool
 
 	redisCallDuration time.Duration
 	redisCallCount    int
@@ -329,6 +330,9 @@ func (c *luaScriptContext) exec(command string, args []string) (luaReply, error)
 	var err error
 	if handler, ok := luaCommandHandlers[command]; ok {
 		reply, err = handler(c, args)
+		if c.observeNestedReads && err == nil {
+			c.server.observeLuaRead(c.ctx, command, args)
+		}
 	} else {
 		err = errors.WithStack(errors.Newf("ERR unsupported command '%s'", command))
 	}

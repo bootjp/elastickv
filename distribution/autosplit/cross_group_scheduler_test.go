@@ -26,10 +26,15 @@ func (s *crossGroupCatalogSource) ListSplitJobsAt(_ context.Context, ts uint64) 
 type crossGroupSampler struct {
 	*fakeSampler
 	registered bool
+	covered    bool
 }
 
 func (s *crossGroupSampler) RouteRegistrationCoversWindow(uint64, uint64, []byte, []byte, time.Time, time.Time) bool {
 	return s.registered
+}
+
+func (s *crossGroupSampler) ReadCoverageCoversWindow(uint64, time.Time, time.Time) bool {
+	return s.covered
 }
 
 func TestSchedulerCrossGroupTargetRequiresCompleteEvidence(t *testing.T) {
@@ -54,16 +59,18 @@ func TestSchedulerCrossGroupTargetRequiresCompleteEvidence(t *testing.T) {
 	tests := []struct {
 		name        string
 		registered  bool
+		covered     bool
 		term        uint64
 		jobs        []distribution.SplitJob
 		wantTarget  uint64
 		wantCalls   int
 		wantUnknown int
 	}{
-		{"complete evidence", true, 9, nil, 2, 1, 0},
-		{"registration unknown", false, 9, nil, 0, 1, 1},
-		{"leadership changed", true, 10, nil, 0, 0, 0},
-		{"migration already active", true, 9, []distribution.SplitJob{{SourceRouteID: 1, Phase: distribution.SplitJobPhaseBackfill}}, 0, 0, 0},
+		{"complete evidence", true, true, 9, nil, 2, 1, 0},
+		{"coverage absent", true, false, 9, nil, 0, 1, 1},
+		{"registration unknown", false, true, 9, nil, 0, 1, 1},
+		{"leadership changed", true, true, 10, nil, 0, 0, 0},
+		{"migration already active", true, true, 9, []distribution.SplitJob{{SourceRouteID: 1, Phase: distribution.SplitJobPhaseBackfill}}, 0, 0, 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -74,7 +81,7 @@ func TestSchedulerCrossGroupTargetRequiresCompleteEvidence(t *testing.T) {
 			splitter := &fakeSplitter{}
 			observer, ok := NewPrometheusObserver(prometheus.NewRegistry()).(*prometheusObserver)
 			require.True(t, ok)
-			sampler := &crossGroupSampler{fakeSampler: &fakeSampler{step: time.Minute, history: 16, cols: cols}, registered: tt.registered}
+			sampler := &crossGroupSampler{fakeSampler: &fakeSampler{step: time.Minute, history: 16, cols: cols}, registered: tt.registered, covered: tt.covered}
 			cfg := SchedulerConfig{
 				Enabled: true, CrossGroupEnabled: true, CandidateGroupIDs: []uint64{1, 2},
 				Detector:     Config{WriteWeight: 1, ThresholdOpsMin: 50, CandidateWindows: 2, MaxRoutes: 8, MaxSplitsPerCycle: 1},

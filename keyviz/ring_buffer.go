@@ -87,12 +87,21 @@ func cloneColumn(col MatrixColumn) MatrixColumn {
 	for i, snapshot := range col.HotKeys {
 		hotKeys[i] = cloneHotKeysSnapshot(snapshot)
 	}
+	var unattributableReads map[uint64]bool
+	if len(col.unattributableReads) > 0 {
+		unattributableReads = make(map[uint64]bool, len(col.unattributableReads))
+		for routeID, marked := range col.unattributableReads {
+			unattributableReads[routeID] = marked
+		}
+	}
 	return MatrixColumn{
-		WindowStart:  col.WindowStart,
-		At:           col.At,
-		Rows:         rows,
-		HotKeys:      hotKeys,
-		openRouteSeq: col.openRouteSeq,
+		WindowStart:          col.WindowStart,
+		At:                   col.At,
+		Rows:                 rows,
+		HotKeys:              hotKeys,
+		openRouteSeq:         col.openRouteSeq,
+		readCoverageComplete: col.readCoverageComplete,
+		unattributableReads:  unattributableReads,
 	}
 }
 

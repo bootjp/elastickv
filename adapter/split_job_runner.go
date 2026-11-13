@@ -2327,15 +2327,25 @@ func (s *DistributionServer) commitSplitJobCutover(
 	versionKey := distribution.CatalogVersionKey()
 	routeKey := distribution.CatalogRouteKey(right.RouteID)
 	jobKey := distribution.CatalogSplitJobKey(job.JobID)
+	deltaOps, err := s.catalogDeltaMutationOps(ctx, snapshot.ReadTS, distribution.CatalogDelta{
+		PreviousVersion: snapshot.Version,
+		Version:         nextVersion,
+		Mutations:       []distribution.CatalogRouteMutation{{Op: distribution.CatalogMutationUpsert, RouteID: right.RouteID, Route: right}},
+	})
+	if err != nil {
+		return err
+	}
+	ops := []*kv.Elem[kv.OP]{
+		{Op: kv.Put, Key: routeKey, Value: encodedRoute},
+		{Op: kv.Put, Key: versionKey, Value: distribution.EncodeCatalogVersion(nextVersion)},
+		{Op: kv.Put, Key: jobKey, Value: encodedJob},
+	}
+	ops = append(ops, deltaOps...)
 	if _, err := s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
-		Elems: []*kv.Elem[kv.OP]{
-			{Op: kv.Put, Key: routeKey, Value: encodedRoute},
-			{Op: kv.Put, Key: versionKey, Value: distribution.EncodeCatalogVersion(nextVersion)},
-			{Op: kv.Put, Key: jobKey, Value: encodedJob},
-		},
+		Elems:    ops,
 		IsTxn:    true,
 		StartTS:  snapshot.ReadTS,
-		ReadKeys: [][]byte{routeKey, versionKey, jobKey},
+		ReadKeys: [][]byte{routeKey, versionKey, jobKey, distribution.CatalogDeltaKey(nextVersion), distribution.CatalogDeltaFloorKey()},
 	}); err != nil {
 		if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
 			return grpcStatusError(codes.Unknown, kv.ErrTransactionOutcomeUnknown.Error())
