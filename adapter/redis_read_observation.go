@@ -91,6 +91,10 @@ func redisReadsKeysAtIngress(name string) bool {
 	return name == cmdXRead || name == cmdExists || name == cmdDel
 }
 
+func redisReadObservedAtProbe(name string) bool {
+	return name == cmdXRead || name == cmdBZPopMin || name == cmdPFCount
+}
+
 // These commands evaluate each key at ingress, even when the first key
 // belongs to another leader.
 func (r *RedisServer) observeLocalRedisKeys(ctx context.Context, keys [][]byte) {

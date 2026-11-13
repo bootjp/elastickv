@@ -226,6 +226,21 @@ func TestRedisReadObservationXReadStopsAtWrongType(t *testing.T) {
 	}
 }
 
+func TestRedisReadObservationPFCountStopsAtWrongType(t *testing.T) {
+	ctx := t.Context()
+	st := store.NewMVCCStore()
+	defer st.Close()
+	require.NoError(t, st.PutAt(ctx, redisStrKey([]byte("wrongtype")), encodeRedisStr([]byte("value"), nil), 1, 0))
+	coord := &redisReadObservationCoordinator{}
+	server := &RedisServer{coordinator: coord, store: st}
+	cmd := redcon.Command{Args: [][]byte{[]byte(cmdPFCount), []byte("wrongtype"), []byte("wrongtype"), []byte("untouched")}}
+	conn := &recordingConn{}
+	server.dispatchCommandDirect(conn, cmdPFCount, server.pfcountCommand, cmd, time.Now())
+	require.NotEmpty(t, conn.err)
+	require.Equal(t, [][]byte{redisUserRouteKey([]byte("wrongtype"))}, coord.keys)
+	require.Empty(t, coord.marks)
+}
+
 func TestRedisReadObservationMultiKeyIngressAttributesLocalAfterRemote(t *testing.T) {
 	remote := redisUserRouteKey([]byte("remote"))
 	local := redisUserRouteKey([]byte("local"))
