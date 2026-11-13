@@ -1408,6 +1408,9 @@ func (c *luaScriptContext) loadLuaSetContext(key []byte) (bool, *time.Time, erro
 	if err != nil {
 		return false, nil, err
 	}
+	if !exists {
+		return false, nil, nil
+	}
 
 	prevTTL, err := c.loadTTL(key)
 	if err != nil && !errors.Is(err, store.ErrKeyNotFound) {
