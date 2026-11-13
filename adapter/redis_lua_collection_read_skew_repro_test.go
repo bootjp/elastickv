@@ -5,6 +5,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bootjp/elastickv/store"
 	"github.com/redis/go-redis/v9"
@@ -204,6 +205,18 @@ func luaCollectionReadSkewCases(coll string) []luaCollectionReadSkewCase {
 			concurrent: luaReadSkewDelThen(coll, nil),
 			stale:      "-1",
 			fresh:      "-2",
+		},
+		{
+			name: "PTTL of a set vs PEXPIRE",
+			seed: func(ctx context.Context, c *redis.Client) error {
+				return c.SAdd(ctx, coll, "a").Err()
+			},
+			script: "local ttl=redis.call('PTTL',KEYS[1]); local v=ttl < 0 and 'no-ttl' or 'ttl'; redis.call('SET',KEYS[2],v); return v",
+			concurrent: func(ctx context.Context, c *redis.Client) error {
+				return c.PExpire(ctx, coll, time.Hour).Err()
+			},
+			stale: "no-ttl",
+			fresh: "ttl",
 		},
 		// WRONGTYPE under pcall (G7): the failed read recorded nothing (or, for
 		// GET, only the string anchors), so a script that caught the error and
@@ -515,6 +528,8 @@ func TestLua_ReadSetCoversCollectionReads(t *testing.T) {
 		{name: "SMEMBERS", seed: seedSet, read: `redis.call("SMEMBERS", KEYS[1])`, want: set},
 		{name: "SMEMBERS absent", read: `redis.call("SMEMBERS", KEYS[1])`, want: absent},
 		{name: "SCARD", seed: seedSet, read: `redis.call("SCARD", KEYS[1])`, want: set},
+		{name: "PTTL set", seed: seedSet, read: `redis.call("PTTL", KEYS[1])`, want: with(set, redisTTLKey(readKey))},
+		{name: "PTTL absent", read: `redis.call("PTTL", KEYS[1])`, want: absent},
 		{name: "SISMEMBER hit (fast path)", seed: seedSet, read: `redis.call("SISMEMBER", KEYS[1], "a")`, want: with(set, member("a"))},
 		{name: "SISMEMBER miss (slow path)", seed: seedSet, read: `redis.call("SISMEMBER", KEYS[1], "b")`, want: with(set, member("b"))},
 		{name: "SISMEMBER absent", read: `redis.call("SISMEMBER", KEYS[1], "a")`, want: absent},

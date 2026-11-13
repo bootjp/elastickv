@@ -1734,6 +1734,7 @@ func (c *luaScriptContext) cmdPTTL(args []string) (luaReply, error) {
 	if typ == redisTypeNone {
 		return luaIntReply(-2), nil
 	}
+	c.trackReadKey(redisTTLKey(key))
 	ttl, err := c.loadTTL(key)
 	if err != nil {
 		return luaReply{}, err
