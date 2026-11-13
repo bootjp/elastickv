@@ -153,21 +153,17 @@ func (s *S3BlobFetchServer) storeChunkBlob(
 		if err := s.ensurePushAllowed(); err != nil {
 			return err
 		}
-		startTS, err := s.chunkBlobWriteStartTS(ctx, key, digest, payload, commitTS)
+		startTS, writeTS, err := s.chunkBlobWriteStartTS(ctx, key, digest, payload, commitTS)
 		if err != nil {
 			return err
 		}
-		if startTS == commitTS {
-			s.observeCommitTS(commitTS)
-			return nil
-		}
-		if err := s.applyChunkBlobUntilRegistered(ctx, key, payload, startTS, commitTS); err != nil {
-			done, retry, retryErr := s.retryAfterChunkBlobWriteConflict(ctx, err, key, digest, payload, commitTS)
+		if err := s.applyChunkBlobUntilRegistered(ctx, key, payload, startTS, writeTS); err != nil {
+			done, retry, retryErr := s.retryAfterChunkBlobWriteConflict(ctx, err, key, digest, payload, writeTS)
 			if retryErr != nil {
 				return retryErr
 			}
 			if done {
-				s.observeCommitTS(commitTS)
+				s.observeCommitTS(writeTS)
 				return nil
 			}
 			if retry {
@@ -178,7 +174,7 @@ func (s *S3BlobFetchServer) storeChunkBlob(
 			}
 			return s3BlobFetchStatusf(codes.Internal, "write s3 chunkblob: %v", err)
 		}
-		s.observeCommitTS(commitTS)
+		s.observeCommitTS(writeTS)
 		return nil
 	}
 }
@@ -336,30 +332,33 @@ func (s *S3BlobFetchServer) chunkBlobWriteStartTS(
 	digest [s3ChunkBlobSHA256Bytes]byte,
 	payload []byte,
 	commitTS uint64,
-) (uint64, error) {
+) (uint64, uint64, error) {
 	if commitTS == 0 {
-		return 0, s3BlobFetchStatus(codes.InvalidArgument, "missing s3 chunkblob commit timestamp")
+		return 0, 0, s3BlobFetchStatus(codes.InvalidArgument, "missing s3 chunkblob commit timestamp")
 	}
 	latestTS, exists, err := s.latestChunkBlobTS(ctx, key)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	if exists && commitTS <= latestTS {
 		stored, storedErr := s.chunkBlobAlreadyStored(ctx, key, digest, payload)
 		if storedErr != nil {
-			return 0, storedErr
+			return 0, 0, storedErr
 		}
 		if stored {
-			return commitTS, nil
+			if latestTS == math.MaxUint64 {
+				return 0, 0, s3BlobFetchStatus(codes.FailedPrecondition, "s3 chunkblob timestamp is exhausted")
+			}
+			return latestTS, latestTS + 1, nil
 		}
-		return 0, s3BlobFetchStatusf(
+		return 0, 0, s3BlobFetchStatusf(
 			codes.FailedPrecondition,
 			"s3 chunkblob commit timestamp %d is not after latest version %d",
 			commitTS,
 			latestTS,
 		)
 	}
-	return latestTS, nil
+	return latestTS, commitTS, nil
 }
 
 func (s *S3BlobFetchServer) latestChunkBlobTS(ctx context.Context, key []byte) (uint64, bool, error) {

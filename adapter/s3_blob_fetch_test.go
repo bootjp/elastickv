@@ -208,6 +208,25 @@ func TestS3BlobFetchPushIsIdempotent(t *testing.T) {
 	require.Equal(t, uint64(43), latestTS)
 }
 
+func TestS3BlobFetchPushReanchorsExistingPayloadForGC(t *testing.T) {
+	t.Parallel()
+	st := store.NewMVCCStore()
+	server := NewS3BlobFetchServer(st, nil)
+	local, err := store.NewChunkBlobLocalStore(st)
+	require.NoError(t, err)
+	payload := []byte("reused payload")
+	digest := sha256.Sum256(payload)
+	require.NoError(t, server.PushChunkBlob(newS3BlobPushStreamAt(digest, payload, 42)))
+	require.NoError(t, server.PushChunkBlob(newS3BlobPushStreamAt(digest, payload, 42)))
+	writtenAt, found, err := local.ChunkBlobWrittenAt(t.Context(), digest)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Greater(t, writtenAt, uint64(42))
+	deleted, err := local.DeleteChunkBlobIfUnchanged(t.Context(), digest, 42)
+	require.NoError(t, err)
+	require.False(t, deleted)
+}
+
 func TestS3BlobFetchPushRestampsExistingPayloadAtLeaderCommitTS(t *testing.T) {
 	t.Parallel()
 
