@@ -254,11 +254,11 @@ func (r *RedisServer) rawKeyTypeAt(ctx context.Context, key []byte, readTS uint6
 // probeStringTypes runs the three cheap point lookups against the
 // string-family prefixes. Returns (String, true, nil) on first hit.
 func (r *RedisServer) probeStringTypes(ctx context.Context, key []byte, readTS uint64) (redisValueType, bool, error) {
-	candidates := [...][]byte{
+	candidates := [][]byte{
 		redisStrKey(key), // new-format prefixed string
 		redisHLLKey(key), // HyperLogLog (reported as string)
-		key,              // legacy bare key (pre-migration)
 	}
+	candidates = appendRedisLegacyBareKey(candidates, key)
 	for _, k := range candidates {
 		exists, err := r.store.ExistsAt(ctx, k, readTS)
 		if err != nil {
@@ -836,6 +836,12 @@ func (r *RedisServer) dispatchElems(ctx context.Context, isTxn bool, startTS uin
 }
 
 func (r *RedisServer) dispatchReadTimestampElems(ctx context.Context, readTimestamp kv.ReadTimestamp, elems []*kv.Elem[kv.OP]) error {
+	return r.dispatchReadTimestampElemsWithReadKeys(ctx, readTimestamp, elems, nil)
+}
+
+// dispatchReadTimestampElemsWithReadKeys is dispatchReadTimestampElems with a
+// read set the FSM validates against every commit newer than readTimestamp.
+func (r *RedisServer) dispatchReadTimestampElemsWithReadKeys(ctx context.Context, readTimestamp kv.ReadTimestamp, elems []*kv.Elem[kv.OP], readKeys [][]byte) error {
 	if len(elems) == 0 {
 		return nil
 	}
@@ -845,9 +851,10 @@ func (r *RedisServer) dispatchReadTimestampElems(ctx context.Context, readTimest
 	}
 	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
 	_, err := kv.DispatchWithReadTimestamp(dispatchCtx, r.coordinator, &kv.OperationGroup[kv.OP]{
-		IsTxn:   true,
-		StartTS: startTS,
-		Elems:   elems,
+		IsTxn:    true,
+		StartTS:  startTS,
+		ReadKeys: readKeys,
+		Elems:    elems,
 	})
 	return errors.WithStack(err)
 }
@@ -886,6 +893,9 @@ func (r *RedisServer) readRedisStringWith(key []byte, readTS uint64, get rawGetF
 	}
 	if !errors.Is(err, store.ErrKeyNotFound) {
 		return nil, nil, err
+	}
+	if !redisLegacyBareReadFenceAllowed(key) {
+		return nil, nil, errors.WithStack(store.ErrKeyNotFound)
 	}
 	return r.readBareLegacyStringWith(key, readTS, get)
 }
@@ -987,21 +997,6 @@ func (r *RedisServer) doGetAtContext(ctx context.Context, key []byte, readTS uin
 	return r.tryLeaderGetAtContext(ctx, key, readTS)
 }
 
-func (r *RedisServer) saveString(ctx context.Context, key []byte, value []byte, ttl *time.Time) error {
-	encoded := encodeRedisStr(value, ttl)
-	elems := []*kv.Elem[kv.OP]{
-		{Op: kv.Put, Key: redisStrKey(key), Value: encoded},
-	}
-	// Write !redis|ttl| as a secondary scan index for background expiration (if TTL set).
-	// Otherwise clear any pre-existing index so a persistent string is not later expired.
-	if ttl != nil {
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisTTLKey(key), Value: encodeRedisTTL(*ttl)})
-	} else {
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey(key)})
-	}
-	return r.dispatchElems(ctx, false, 0, elems)
-}
-
 // deleteListElems returns delete operations for all list keys: item keys, the base
 // meta key, all delta keys, and all claim keys.
 // It does not call resolveListMeta so that DEL succeeds even when a list has
@@ -1029,7 +1024,8 @@ func (r *RedisServer) deleteListElems(ctx context.Context, key []byte, readTS ui
 	if err != nil {
 		return nil, err
 	}
-	return append(elems, claimElems...), nil
+	elems = append(elems, claimElems...)
+	return append(elems, redisTxnWideListFenceElem(key)), nil
 }
 
 // scanListItemDelElems returns Del elems for every item key that belongs to
@@ -1205,16 +1201,16 @@ func (r *RedisServer) deleteLogicalKeyElems(ctx context.Context, key []byte, rea
 
 	elems := []*kv.Elem[kv.OP]{}
 
-	for _, internalKey := range [][]byte{
-		redisStrKey(key),
-		key, // legacy bare string key
+	internalKeys := appendRedisLegacyBareKey([][]byte{redisStrKey(key)}, key)
+	internalKeys = append(internalKeys,
 		redisHashKey(key),
 		redisSetKey(key),
 		redisHLLKey(key),
 		redisZSetKey(key),
 		redisStreamKey(key),
 		redisTTLKey(key),
-	} {
+	)
+	for _, internalKey := range internalKeys {
 		ok, err := r.store.ExistsAt(ctx, internalKey, readTS)
 		if err != nil {
 			return nil, false, errors.WithStack(err)
@@ -1237,6 +1233,7 @@ func (r *RedisServer) deleteLogicalKeyElems(ctx context.Context, key []byte, rea
 		return nil, false, err
 	}
 	elems = append(elems, hashElems...)
+	elems = append(elems, redisTxnWideHashFenceElem(key))
 
 	// Wide-column set cleanup: delete all !st|mem| keys, meta, and delta keys.
 	setElems, err := r.deleteWideColumnElems(ctx, readTS,
@@ -1245,6 +1242,7 @@ func (r *RedisServer) deleteLogicalKeyElems(ctx context.Context, key []byte, rea
 		return nil, false, err
 	}
 	elems = append(elems, setElems...)
+	elems = append(elems, redisTxnWideSetFenceElem(key))
 
 	// Wide-column zset cleanup: delete all !zs|mem|, !zs|scr|, meta, and delta keys.
 	zsetElems, err := r.deleteZSetWideColumnElems(ctx, key, readTS)
@@ -1252,6 +1250,7 @@ func (r *RedisServer) deleteLogicalKeyElems(ctx context.Context, key []byte, rea
 		return nil, false, err
 	}
 	elems = append(elems, zsetElems...)
+	elems = append(elems, redisTxnWideZSetFenceElem(key))
 
 	// Wide-column stream cleanup: delete the meta key and every entry key.
 	streamElems, err := r.deleteStreamWideColumnElems(ctx, key, readTS)
@@ -1285,13 +1284,27 @@ func (r *RedisServer) deleteLogicalKeyElemsForType(ctx context.Context, key []by
 }
 
 func (r *RedisServer) deleteStringLikeElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
-	var elems []*kv.Elem[kv.OP]
-	for _, internalKey := range [][]byte{
+	keys := [][]byte{
 		redisStrKey(key),
-		key, // legacy bare string key
 		redisHLLKey(key),
 		redisTTLKey(key),
-	} {
+	}
+	keys = appendRedisLegacyBareKey(keys, key)
+	return r.existingKeyDelElems(ctx, readTS, keys...)
+}
+
+func appendRedisLegacyBareKey(keys [][]byte, key []byte) [][]byte {
+	if redisLegacyBareReadFenceAllowed(key) {
+		return append(keys, key)
+	}
+	return keys
+}
+
+// existingKeyDelElems returns a Del for each of internalKeys that exists at
+// readTS, in order.
+func (r *RedisServer) existingKeyDelElems(ctx context.Context, readTS uint64, internalKeys ...[]byte) ([]*kv.Elem[kv.OP], error) {
+	var elems []*kv.Elem[kv.OP]
+	for _, internalKey := range internalKeys {
 		ok, err := r.store.ExistsAt(ctx, internalKey, readTS)
 		if err != nil {
 			return nil, errors.WithStack(err)
@@ -1326,7 +1339,8 @@ func (r *RedisServer) deleteHashLogicalKeyElems(ctx context.Context, key []byte,
 	if err != nil {
 		return nil, false, err
 	}
-	return append(elems, hashElems...), true, nil
+	elems = append(elems, hashElems...)
+	return append(elems, redisTxnWideHashFenceElem(key)), true, nil
 }
 
 func (r *RedisServer) deleteSetLogicalKeyElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], bool, error) {
@@ -1340,7 +1354,8 @@ func (r *RedisServer) deleteSetLogicalKeyElems(ctx context.Context, key []byte, 
 	if err != nil {
 		return nil, false, err
 	}
-	return append(elems, setElems...), true, nil
+	elems = append(elems, setElems...)
+	return append(elems, redisTxnWideSetFenceElem(key)), true, nil
 }
 
 func (r *RedisServer) deleteZSetLogicalKeyElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], bool, error) {
@@ -1353,7 +1368,8 @@ func (r *RedisServer) deleteZSetLogicalKeyElems(ctx context.Context, key []byte,
 	if err != nil {
 		return nil, false, err
 	}
-	return append(elems, zsetElems...), true, nil
+	elems = append(elems, zsetElems...)
+	return append(elems, redisTxnWideZSetFenceElem(key)), true, nil
 }
 
 func (r *RedisServer) deleteStreamLogicalKeyElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], bool, error) {

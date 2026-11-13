@@ -15,7 +15,9 @@ import (
 	"github.com/tidwall/redcon"
 )
 
-// SETEX key seconds value — equivalent to SET key value EX seconds
+// SETEX key seconds value — equivalent to SET key value EX seconds, and
+// executed as one: it replaces whatever encoding the key holds and, like
+// every string write through executeSet, validates the type it observed.
 func (r *RedisServer) setex(conn redcon.Conn, cmd redcon.Command) {
 	if !r.requireRequestContext(conn) {
 		return
@@ -34,7 +36,7 @@ func (r *RedisServer) setex(conn redcon.Conn, cmd redcon.Command) {
 	ctx, cancel := context.WithTimeout(r.handlerContext(conn),
 		redisDispatchTimeout)
 	defer cancel()
-	if err := r.saveString(ctx, cmd.Args[1], cmd.Args[3], &ttl); err != nil {
+	if _, err := r.executeSet(ctx, cmd.Args[1], cmd.Args[3], redisSetOptions{ttl: &ttl}); err != nil {
 		writeRedisError(conn, err)
 		return
 	}

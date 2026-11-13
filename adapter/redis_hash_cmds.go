@@ -205,11 +205,12 @@ func (r *RedisServer) applyHashFieldPairs(key []byte, args [][]byte, requestCont
 		elems, newFields = r.buildHashFieldElems(key, args, existsMap, elems)
 		added = newFields
 
+		// Every field write advances the fence used by whole-hash readers.
+		elems = append(elems, redisTxnWideHashFenceElem(key))
 		// Emit a single delta key for all newly-added fields.
 		if newFields != 0 {
 			deltaVal := store.MarshalHashMetaDelta(store.HashMetaDelta{LenDelta: int64(newFields)})
 			elems = append(elems,
-				redisTxnWideHashFenceElem(key),
 				&kv.Elem[kv.OP]{
 					Op:    kv.Put,
 					Key:   store.HashMetaDeltaKey(key, commitTS, 0),
@@ -436,7 +437,11 @@ func (r *RedisServer) hdel(conn redcon.Conn, cmd redcon.Command) {
 	conn.WriteInt(removed)
 }
 
-// hdelWideColumn deletes the given fields from the wide-column hash and emits a negative delta.
+// hdelWideColumn deletes the given fields from the wide-column hash, emits a
+// negative delta, and Puts the hash fence. The delta key is unique per commit
+// and the deleted field keys are ones a reader of the whole hash (HLEN,
+// HGETALL) may not have recorded, so the fence is what makes every change of
+// the field set visible to such a reader; field additions Put it as well.
 func (r *RedisServer) hdelWideColumn(ctx context.Context, key []byte, fields [][]byte, readTimestamp kv.ReadTimestamp) (int, error) {
 	readTS := readTimestamp.Timestamp()
 	delElems, removed, err := r.resolveHashFieldDelElems(ctx, key, fields, readTS)
@@ -453,11 +458,14 @@ func (r *RedisServer) hdelWideColumn(ctx context.Context, key []byte, fields [][
 	}
 	elems := delElems
 	deltaVal := store.MarshalHashMetaDelta(store.HashMetaDelta{LenDelta: int64(-removed)})
-	elems = append(elems, &kv.Elem[kv.OP]{
-		Op:    kv.Put,
-		Key:   store.HashMetaDeltaKey(key, commitTS, 0),
-		Value: deltaVal,
-	})
+	elems = append(elems,
+		&kv.Elem[kv.OP]{
+			Op:    kv.Put,
+			Key:   store.HashMetaDeltaKey(key, commitTS, 0),
+			Value: deltaVal,
+		},
+		redisTxnWideHashFenceElem(key),
+	)
 	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
 	_, dispatchErr := kv.DispatchWithReadTimestamp(dispatchCtx, r.coordinator, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
@@ -553,6 +561,8 @@ func removeHashFields(value redisHashValue, fields [][]byte) int {
 	return removed
 }
 
+// persistHashReadTimestampTxn writes value as the full content of a legacy
+// blob hash after HDEL removed fields from it (its only caller).
 func (r *RedisServer) persistHashReadTimestampTxn(ctx context.Context, key []byte, readTimestamp kv.ReadTimestamp, value redisHashValue) error {
 	readTS := readTimestamp.Timestamp()
 	if len(value) == 0 {
@@ -583,6 +593,10 @@ func (r *RedisServer) persistHashReadTimestampTxn(ctx context.Context, key []byt
 		Value: store.MarshalHashMeta(store.HashMeta{Len: int64(len(value)), ExpireAt: ttlMs}),
 	})
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisHashKey(key)})
+	// HDEL of a legacy blob hash rewrites it wide-column without the removed
+	// fields; like the wide-column HDEL it changes the field set, so it Puts
+	// the hash fence.
+	elems = append(elems, redisTxnWideHashFenceElem(key))
 	return r.dispatchReadTimestampElems(ctx, readTimestamp, elems)
 }
 
@@ -790,10 +804,10 @@ func (r *RedisServer) hincrbyWithMigration(ctx context.Context, key, fieldKey []
 	elems = append(elems, cleanupElems...)
 	elems = append(elems, migrationElems...)
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: fieldKey, Value: []byte(newVal)})
+	elems = append(elems, redisTxnWideHashFenceElem(key))
 	if isNewField {
 		deltaVal := store.MarshalHashMetaDelta(store.HashMetaDelta{LenDelta: 1})
 		elems = append(elems,
-			redisTxnWideHashFenceElem(key),
 			&kv.Elem[kv.OP]{
 				Op:    kv.Put,
 				Key:   store.HashMetaDeltaKey(key, commitTS, 0),
@@ -850,10 +864,10 @@ func (r *RedisServer) hincrbyTxn(ctx context.Context, key, field []byte, increme
 	elems := make([]*kv.Elem[kv.OP], 0, len(cleanupElems)+setWideColOverhead)
 	elems = append(elems, cleanupElems...)
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: fieldKey, Value: []byte(newVal)})
+	elems = append(elems, redisTxnWideHashFenceElem(key))
 	if isNewField {
 		deltaVal := store.MarshalHashMetaDelta(store.HashMetaDelta{LenDelta: 1})
 		elems = append(elems,
-			redisTxnWideHashFenceElem(key),
 			&kv.Elem[kv.OP]{
 				Op:    kv.Put,
 				Key:   store.HashMetaDeltaKey(key, commitTS, 0),
@@ -940,7 +954,12 @@ func (r *RedisServer) incrLegacyCommand(conn redcon.Conn, cmd redcon.Command) {
 			// cannot later expire a now-persistent key.
 			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey(cmd.Args[1])})
 		}
-		return r.dispatchReadTimestampElems(ctx, readTimestamp, elems)
+		// Validate the type INCR observed: a create conflicts with a
+		// concurrent create of another encoding, an increment with a DEL or
+		// type change of the string it read.
+		fences, readKeys := redisStringWriteGuard(cmd.Args[1], typ)
+		elems = append(elems, fences...)
+		return r.dispatchReadTimestampElemsWithReadKeys(ctx, readTimestamp, elems, readKeys)
 	}); err != nil {
 		writeRedisError(conn, err)
 		return
