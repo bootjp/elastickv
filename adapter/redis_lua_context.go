@@ -843,7 +843,7 @@ func (c *luaScriptContext) trackStringTypeReadKeys(key []byte, typ redisValueTyp
 		return
 	}
 	// String and HLL values can occupy different anchors under the same type.
-	for _, readKey := range [][]byte{redisStrKey(key), redisHLLKey(key), key} {
+	for _, readKey := range redisStringTypeReadKeys(key) {
 		c.trackReadKey(readKey)
 	}
 }

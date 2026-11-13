@@ -799,12 +799,16 @@ func redisTxnWideCreateReadKeys(userKey []byte, typ redisValueType, fenceKey fun
 }
 
 // redisStringTypeReadKeys lists the anchors of the string family (TYPE reports
-// all three as "string"): the prefixed string key, the HyperLogLog key, and
-// the legacy bare key. A command that observed userKey as a string at its read
+// the prefixed string key, the HyperLogLog key, and, outside internal
+// namespaces, the legacy bare key. A command that observed userKey as a string at its read
 // timestamp validates them at commit: every DEL, overwrite, and type change of
 // a string rewrites or deletes whichever of them holds the value.
 func redisStringTypeReadKeys(userKey []byte) [][]byte {
-	return [][]byte{redisStrKey(userKey), redisHLLKey(userKey), userKey}
+	keys := [][]byte{redisStrKey(userKey), redisHLLKey(userKey)}
+	if redisLegacyBareReadFenceAllowed(userKey) {
+		keys = append(keys, userKey)
+	}
+	return keys
 }
 
 // redisStringWriteGuard returns what a standalone string write (SET and its

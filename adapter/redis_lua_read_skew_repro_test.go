@@ -647,6 +647,7 @@ func TestLua_ReadSetCoversStringReads(t *testing.T) {
 	t.Parallel()
 
 	readKey := []byte("lua:readset:read")
+	internalKey := redisStrKey(readKey)
 	writeKey := []byte("lua:readset:write")
 	stringValue := [][]byte{redisStrKey(readKey), redisHLLKey(readKey), readKey}
 	absent := redisTxnReadFencePointKeys(readKey)
@@ -654,25 +655,32 @@ func TestLua_ReadSetCoversStringReads(t *testing.T) {
 	cases := []struct {
 		name string
 		cmd  string
+		key  []byte
 		seed bool
 		want [][]byte
 	}{
 		{name: "GET absent", cmd: "GET", want: absent},
 		{name: "GET string", cmd: "GET", seed: true, want: stringValue},
+		{name: "GET internal-shaped string", cmd: "GET", key: internalKey, seed: true,
+			want: [][]byte{redisStrKey(internalKey), redisHLLKey(internalKey)}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
+			key := readKey
+			if tc.key != nil {
+				key = tc.key
+			}
 			st := store.NewMVCCStore()
 			if tc.seed {
-				require.NoError(t, st.PutAt(context.Background(), redisStrKey(readKey), encodeRedisStr([]byte("v"), nil), 1, 0))
+				require.NoError(t, st.PutAt(context.Background(), redisStrKey(key), encodeRedisStr([]byte("v"), nil), 1, 0))
 			}
 			coord := newReadKeyRecordingCoordinator(st)
 			server := NewRedisServer(nil, "", st, coord, nil, nil)
 
 			conn := &recordingConn{}
 			script := `redis.call("` + tc.cmd + `", KEYS[1]); return redis.call("SET", KEYS[2], "w")`
-			server.runLuaScript(conn, script, [][]byte{[]byte("2"), readKey, writeKey})
+			server.runLuaScript(conn, script, [][]byte{[]byte("2"), key, writeKey})
 			require.Empty(t, conn.err)
 			require.Equal(t, 1, coord.dispatches)
 
