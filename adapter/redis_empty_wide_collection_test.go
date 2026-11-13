@@ -63,6 +63,23 @@ func TestRedis_ZSetProbeIgnoresZeroLengthMetadata(t *testing.T) {
 	require.Equal(t, redisTypeNone, typ)
 }
 
+func TestRedis_LuaRecreateEmptyHashClearsDeltas(t *testing.T) {
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	ctx := context.Background()
+	client := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = client.Close() }()
+
+	key := "empty-wide:lua-recreate-hash"
+	script := `return redis.call('HSET', KEYS[1], 'field', 'value')`
+	require.NoError(t, client.Eval(ctx, script, []string{key}).Err())
+	require.NoError(t, client.HDel(ctx, key, "field").Err())
+	require.NoError(t, client.Eval(ctx, script, []string{key}).Err())
+	length, err := client.HLen(ctx, key).Result()
+	require.NoError(t, err)
+	require.Equal(t, int64(1), length)
+}
+
 func TestRedis_EmptyWideCollectionRecreateDropsOldTTL(t *testing.T) {
 	nodes, _, _ := createNode(t, 1)
 	defer shutdown(nodes)

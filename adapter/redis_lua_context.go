@@ -3804,9 +3804,12 @@ func (c *luaScriptContext) commitPlanForKey(ctx context.Context, key string, com
 	var deleteElems []*kv.Elem[kv.OP]
 	readKeys := luaWideFenceReadKeysForPlan(keyBytes, finalType, startType, valuePlan.preserveExisting)
 	if !valuePlan.preserveExisting {
-		if c.everDeleted[key] && rawStartType != redisTypeNone {
+		switch {
+		case rawStartType == redisTypeNone:
+			deleteElems, _, err = c.server.emptyWideCollectionCleanupForRecreate(ctx, keyBytes, c.startTS)
+		case c.everDeleted[key]:
 			deleteElems, _, err = c.server.deleteLogicalKeyElems(ctx, keyBytes, c.startTS)
-		} else {
+		default:
 			deleteElems, _, err = c.server.deleteLogicalKeyElemsForType(ctx, keyBytes, c.startTS, rawStartType)
 		}
 		if err != nil {
