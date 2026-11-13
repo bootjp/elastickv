@@ -1671,6 +1671,14 @@ func (t *txnContext) applyZIncrBy(cmd redcon.Command) (redisResult, error) {
 	if err != nil {
 		return redisResult{}, err
 	}
+	if typ == redisTypeNone {
+		ttlSt, err := t.loadTTLState(cmd.Args[1])
+		if err != nil {
+			return redisResult{}, err
+		}
+		ttlSt.value = nil
+		ttlSt.dirty = true
+	}
 	member := string(cmd.Args[3])
 	st.members[member] += inc
 	st.dirty = true
@@ -2440,13 +2448,16 @@ func (t *txnContext) buildZSetElems(commitTS uint64) ([]*kv.Elem[kv.OP], error) 
 	seqInTxn := uint32(0)
 	for _, k := range keys {
 		st := t.zsetStates[k]
-		if _, ok := t.replacers[k]; ok {
-			continue
-		}
-		if !st.dirty {
+		_, replaced := t.replacers[k]
+		if replaced || !st.dirty {
 			continue
 		}
 		key := []byte(k)
+		cleanup, err := t.zsetRecreateCleanupElems(key, st)
+		if err != nil {
+			return nil, err
+		}
+		elems = append(elems, cleanup...)
 		inline, ok := t.zsetInlineTTLCreateElems(k, key, st)
 		if ok {
 			elems = append(elems, inline...)
@@ -2466,21 +2477,35 @@ func (t *txnContext) buildZSetElems(commitTS uint64) ([]*kv.Elem[kv.OP], error) 
 			}
 			continue
 		}
-		// Legacy blob path.
-		if len(st.members) == 0 {
-			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisZSetKey(key)})
-			continue
-		}
-		payload, err := marshalZSetValue(redisZSetValue{Entries: zsetMapToEntries(st.members)})
+		legacy, err := buildZSetLegacyElems(key, st)
 		if err != nil {
 			return nil, err
 		}
-		elems = append(elems,
-			&kv.Elem[kv.OP]{Op: kv.Put, Key: redisZSetKey(key), Value: payload},
-			redisTxnWideZSetFenceElem(key),
-		)
+		elems = append(elems, legacy...)
 	}
 	return elems, nil
+}
+
+func buildZSetLegacyElems(key []byte, st *zsetTxnState) ([]*kv.Elem[kv.OP], error) {
+	if len(st.members) == 0 {
+		return []*kv.Elem[kv.OP]{{Op: kv.Del, Key: redisZSetKey(key)}}, nil
+	}
+	payload, err := marshalZSetValue(redisZSetValue{Entries: zsetMapToEntries(st.members)})
+	if err != nil {
+		return nil, err
+	}
+	return []*kv.Elem[kv.OP]{
+		{Op: kv.Put, Key: redisZSetKey(key), Value: payload},
+		redisTxnWideZSetFenceElem(key),
+	}, nil
+}
+
+func (t *txnContext) zsetRecreateCleanupElems(key []byte, st *zsetTxnState) ([]*kv.Elem[kv.OP], error) {
+	if st.exists {
+		return nil, nil
+	}
+	elems, _, err := t.server.expiredCollectionCleanupForRecreate(t.ctxOrBackground(), key, t.startTS, redisTypeNone, redisTypeZSet)
+	return elems, err
 }
 
 func (t *txnContext) zsetInlineTTLCreateElems(key string, userKey []byte, st *zsetTxnState) ([]*kv.Elem[kv.OP], bool) {
