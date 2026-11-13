@@ -367,21 +367,143 @@ func (c *luaScriptContext) trackStreamTypeReadKeys(key []byte, exists bool) {
 	if exists {
 		return
 	}
-	for _, readKey := range redisTxnWideCollectionFenceKeys(key) {
+	c.trackAbsentKeyReadKeys(key)
+}
+
+// trackAbsentKeyReadKeys fences a key the script observed as absent at
+// startTS: every physical type anchor plus the wide-type creation fences, so
+// a concurrent create of any type conflicts with the script's commit.
+func (c *luaScriptContext) trackAbsentKeyReadKeys(key []byte) {
+	for _, readKey := range redisTxnReadFencePointKeys(key) {
 		c.trackReadKey(readKey)
 	}
-	for _, readKey := range [][]byte{
-		redisStrKey(key),
-		redisHLLKey(key),
-		key,
-		store.ListMetaKey(key),
-		redisHashKey(key),
-		redisSetKey(key),
-		redisZSetKey(key),
-		redisStreamKey(key),
-	} {
-		c.trackReadKey(readKey)
+}
+
+// trackCollectionReadKeys records a read command's observation of key as a
+// collection of type typ at startTS, so that a concurrent write changing what
+// the read returned conflicts with the script's commit:
+//
+//   - absent (exists=false): the absent-key fences, so a create of any type
+//     conflicts.
+//   - list / set / zset: the type's txn-wide fence. Every write that changes
+//     their content Puts it (push, pop, trim, SADD / SREM that change the
+//     cardinality, every ZADD / ZINCRBY / ZREM, every Lua commit), and so does
+//     every emptying delete and type change (the logical-delete helpers).
+//   - hash: the hash fence, which every change of the field set Puts (a
+//     create, a new field, every HDEL, an emptying delete, a type change),
+//     plus the legacy blob anchor, which a legacy-blob migration rewrites
+//     without the fence. Every wide-column field value update also Puts the
+//     fence. All hash reads use the bounded fence and legacy anchor.
+//   - zset: also the legacy blob anchor, which the MULTI legacy path deletes
+//     without the fence when it empties the zset.
+//   - stream: the stream meta key, which every stream write rewrites.
+//
+// Set and zset writes advance their respective fences, so point reads stay bounded.
+func (c *luaScriptContext) trackCollectionReadKeys(key []byte, typ redisValueType, exists bool) {
+	if !exists {
+		c.trackAbsentKeyReadKeys(key)
+		return
 	}
+	switch typ {
+	case redisTypeHash:
+		c.trackReadKey(redisTxnWideHashFenceKey(key))
+		c.trackReadKey(redisHashKey(key))
+	case redisTypeList:
+		c.trackReadKey(redisTxnWideListFenceKey(key))
+	case redisTypeSet:
+		c.trackReadKey(redisTxnWideSetFenceKey(key))
+	case redisTypeZSet:
+		c.trackReadKey(redisTxnWideZSetFenceKey(key))
+		c.trackReadKey(redisZSetKey(key))
+	case redisTypeStream:
+		c.trackReadKey(store.StreamMetaKey(key))
+	case redisTypeNone, redisTypeString:
+		c.trackStringTypeReadKeys(key, typ)
+	}
+}
+
+// observeHashState is hashState for a read command: it also records the read
+// (trackCollectionReadKeys). A missing key reports ErrKeyNotFound unchanged.
+func (c *luaScriptContext) observeHashState(key []byte) (*luaHashState, error) {
+	st, err := c.hashState(key)
+	c.trackObservedState(key, redisTypeHash, st != nil && st.exists, err)
+	return st, err
+}
+
+// observeListState is listState for a read command; see observeHashState.
+func (c *luaScriptContext) observeListState(key []byte) (*luaListState, error) {
+	st, err := c.listState(key)
+	c.trackObservedState(key, redisTypeList, st != nil && st.exists, err)
+	return st, err
+}
+
+// observeSetState is setState for a read command; see observeHashState.
+func (c *luaScriptContext) observeSetState(key []byte) (*luaSetState, error) {
+	st, err := c.setState(key)
+	c.trackObservedState(key, redisTypeSet, st != nil && st.exists, err)
+	return st, err
+}
+
+// observeZSetState is zsetState for a read command; see observeHashState.
+func (c *luaScriptContext) observeZSetState(key []byte) (*luaZSetState, error) {
+	st, err := c.zsetState(key)
+	c.trackObservedState(key, redisTypeZSet, st != nil && st.exists, err)
+	return st, err
+}
+
+// trackObservedState records a state load's outcome: the collection's read
+// keys when it loaded, the absent-key fences when the key reported missing.
+// A WRONGTYPE was already recorded by the loader (wrongTypeFor); a storage
+// error fails the script.
+func (c *luaScriptContext) trackObservedState(key []byte, typ redisValueType, exists bool, err error) {
+	switch {
+	case err == nil:
+		c.trackCollectionReadKeys(key, typ, exists)
+	case errors.Is(err, store.ErrKeyNotFound):
+		c.trackAbsentKeyReadKeys(key)
+	}
+}
+
+// trackTypeProbeReadKeys records what an existence or type observation of key
+// at startTS depends on, so a concurrent DEL, emptying, overwrite, type change,
+// or create conflicts with the script's commit:
+//
+//   - absent: the point read-fence keys (every create writes one).
+//   - string: the string-family anchors (string, HLL, and legacy bare key).
+//   - list / hash / set / zset: what a read of the collection records
+//     (trackCollectionReadKeys): the type's fence, which every DEL, emptying
+//     path, and type change Puts, plus the legacy blob anchor for a hash or
+//     zset (2 keys) or the fence alone for a list or set (1 key).
+//   - stream: the stream meta key and the legacy stream blob; a DEL of a
+//     stream that only has the legacy blob deletes nothing else it records.
+//
+// It serves the probes whose reply is the type or the existence (EXISTS,
+// TYPE, PTTL), the conditional writes on the branch that does not write the
+// key (SET NX / XX, SETNX, DEL / PEXPIRE of an absent key, RENAME of an absent
+// source), and reads that fail with WRONGTYPE, which a script can catch with
+// pcall and branch on.
+func (c *luaScriptContext) trackTypeProbeReadKeys(key []byte, typ redisValueType) {
+	switch typ {
+	case redisTypeNone:
+		c.trackAbsentKeyReadKeys(key)
+	case redisTypeString:
+		for _, readKey := range redisStringTypeReadKeys(key) {
+			c.trackReadKey(readKey)
+		}
+	case redisTypeStream:
+		c.trackCollectionReadKeys(key, typ, true)
+		c.trackReadKey(redisStreamKey(key))
+	case redisTypeList, redisTypeHash, redisTypeSet, redisTypeZSet:
+		c.trackCollectionReadKeys(key, typ, true)
+	}
+}
+
+// wrongTypeFor records the observation behind a WRONGTYPE reply, the type key
+// actually holds (trackTypeProbeReadKeys), and returns the error. A script
+// that catches the error with pcall and then writes has read key's type.
+func (c *luaScriptContext) wrongTypeFor(key []byte, typ redisValueType) error {
+	c.trackTypeProbeReadKeys(key, typ)
+	return wrongTypeError()
 }
 
 func (c *luaScriptContext) ttlState(key []byte) *luaTTLState {
@@ -608,18 +730,54 @@ func (c *luaScriptContext) ensureKeyNotExpired(key []byte) error {
 	return nil
 }
 
-func (c *luaScriptContext) logicalExists(key []byte) (bool, error) {
+// logicalType is keyType with an expired key reported as redisTypeNone. It
+// records nothing: a caller whose reply depends on the answer without writing
+// the key records it with trackTypeProbeReadKeys.
+func (c *luaScriptContext) logicalType(key []byte) (redisValueType, error) {
 	typ, err := c.keyType(key)
 	if errors.Is(err, store.ErrKeyNotFound) {
-		return false, nil
+		return redisTypeNone, nil
 	}
 	if err != nil {
-		return false, err
+		return redisTypeNone, err
 	}
-	return typ != redisTypeNone, nil
+	return typ, nil
+}
+
+// probedKeyType resolves key's logical type for a command whose reply is the
+// type or existence itself (EXISTS, TYPE, PTTL) and records the probe in the
+// script's read set. An expired key reports redisTypeNone.
+func (c *luaScriptContext) probedKeyType(key []byte) (redisValueType, error) {
+	typ, err := c.logicalType(key)
+	if err != nil {
+		return redisTypeNone, err
+	}
+	c.trackTypeProbeReadKeys(key, typ)
+	return typ, nil
+}
+
+// dropFailedStateLoad undoes a failed first load of key's state. Every loader
+// caches a fresh, unloaded state before it probes the key's type; when the
+// load then fails (WRONGTYPE, a storage error) and the script catches the
+// error with pcall, a later command of the same type would find that state
+// and treat the key as an absent value of that type: a read replied nil or 0
+// instead of WRONGTYPE, and a write (HSET on a string, INCR on a hash)
+// succeeded and replaced the key's value at commit. A state that was already
+// cached before the call is kept, since it may hold the script's own writes.
+func dropFailedStateLoad[S any](states map[string]S, key []byte, wasCached bool, err error) {
+	if err != nil && !wasCached {
+		delete(states, string(key))
+	}
 }
 
 func (c *luaScriptContext) stringState(key []byte) (*luaStringState, error) {
+	_, cached := c.strings[string(key)]
+	st, err := c.loadStringState(key)
+	dropFailedStateLoad(c.strings, key, cached, err)
+	return st, err
+}
+
+func (c *luaScriptContext) loadStringState(key []byte) (*luaStringState, error) {
 	k := string(key)
 	if st, ok := c.strings[k]; ok {
 		return st, nil
@@ -629,18 +787,20 @@ func (c *luaScriptContext) stringState(key []byte) (*luaStringState, error) {
 
 	typ, err := c.keyType(key)
 	if errors.Is(err, store.ErrKeyNotFound) {
+		c.trackStringTypeReadKeys(key, redisTypeNone)
 		st.loaded = true
 		return st, nil
 	}
 	if err != nil {
 		return nil, err
 	}
+	c.trackStringTypeReadKeys(key, typ)
 	if typ == redisTypeNone {
 		st.loaded = true
 		return st, nil
 	}
 	if typ != redisTypeString {
-		return nil, wrongTypeError()
+		return nil, c.wrongTypeFor(key, typ)
 	}
 
 	value, _, err := c.server.readRedisStringAtSnapshot(key, c.startTS, c.scriptCtx())
@@ -657,7 +817,28 @@ func (c *luaScriptContext) stringState(key []byte) (*luaStringState, error) {
 	return st, nil
 }
 
+func (c *luaScriptContext) trackStringTypeReadKeys(key []byte, typ redisValueType) {
+	if typ != redisTypeString {
+		// An absent or wrong-type result depends on all possible type creators.
+		for _, readKey := range redisTxnReadFencePointKeys(key) {
+			c.trackReadKey(readKey)
+		}
+		return
+	}
+	// String and HLL values can occupy different anchors under the same type.
+	for _, readKey := range redisStringTypeReadKeys(key) {
+		c.trackReadKey(readKey)
+	}
+}
+
 func (c *luaScriptContext) listState(key []byte) (*luaListState, error) {
+	_, cached := c.lists[string(key)]
+	st, err := c.loadListState(key)
+	dropFailedStateLoad(c.lists, key, cached, err)
+	return st, err
+}
+
+func (c *luaScriptContext) loadListState(key []byte) (*luaListState, error) {
 	k := string(key)
 	if st, ok := c.lists[k]; ok {
 		return st, nil
@@ -678,7 +859,7 @@ func (c *luaScriptContext) listState(key []byte) (*luaListState, error) {
 		return st, nil
 	}
 	if typ != redisTypeList {
-		return nil, wrongTypeError()
+		return nil, c.wrongTypeFor(key, typ)
 	}
 
 	meta, exists, err := c.server.resolveListMeta(c.scriptCtx(),
@@ -732,7 +913,7 @@ func (c *luaScriptContext) materializeList(key []byte, st *luaListState) error {
 }
 
 func (c *luaScriptContext) materializedListForRead(key string) (*luaListState, bool, error) {
-	st, err := c.listState([]byte(key))
+	st, err := c.observeListState([]byte(key))
 	if err != nil {
 		return nil, false, err
 	}
@@ -746,6 +927,13 @@ func (c *luaScriptContext) materializedListForRead(key string) (*luaListState, b
 }
 
 func (c *luaScriptContext) hashState(key []byte) (*luaHashState, error) {
+	_, cached := c.hashes[string(key)]
+	st, err := c.loadHashState(key)
+	dropFailedStateLoad(c.hashes, key, cached, err)
+	return st, err
+}
+
+func (c *luaScriptContext) loadHashState(key []byte) (*luaHashState, error) {
 	k := string(key)
 	if st, ok := c.hashes[k]; ok {
 		return st, nil
@@ -768,7 +956,7 @@ func (c *luaScriptContext) hashState(key []byte) (*luaHashState, error) {
 		return st, nil
 	}
 	if typ != redisTypeHash {
-		return nil, wrongTypeError()
+		return nil, c.wrongTypeFor(key, typ)
 	}
 
 	value, err := c.server.loadHashAt(c.scriptCtx(),
@@ -783,6 +971,13 @@ func (c *luaScriptContext) hashState(key []byte) (*luaHashState, error) {
 }
 
 func (c *luaScriptContext) setState(key []byte) (*luaSetState, error) {
+	_, cached := c.sets[string(key)]
+	st, err := c.loadSetState(key)
+	dropFailedStateLoad(c.sets, key, cached, err)
+	return st, err
+}
+
+func (c *luaScriptContext) loadSetState(key []byte) (*luaSetState, error) {
 	k := string(key)
 	if st, ok := c.sets[k]; ok {
 		return st, nil
@@ -805,7 +1000,7 @@ func (c *luaScriptContext) setState(key []byte) (*luaSetState, error) {
 		return st, nil
 	}
 	if typ != redisTypeSet {
-		return nil, wrongTypeError()
+		return nil, c.wrongTypeFor(key, typ)
 	}
 
 	value, err := c.server.loadSetAt(c.scriptCtx(),
@@ -823,6 +1018,13 @@ func (c *luaScriptContext) setState(key []byte) (*luaSetState, error) {
 }
 
 func (c *luaScriptContext) zsetState(key []byte) (*luaZSetState, error) {
+	_, cached := c.zsets[string(key)]
+	st, err := c.loadZSetState(key)
+	dropFailedStateLoad(c.zsets, key, cached, err)
+	return st, err
+}
+
+func (c *luaScriptContext) loadZSetState(key []byte) (*luaZSetState, error) {
 	k := string(key)
 	if st, ok := c.zsets[k]; ok {
 		return st, nil
@@ -864,7 +1066,7 @@ func (c *luaScriptContext) zsetState(key []byte) (*luaZSetState, error) {
 		st.loaded = true
 		return st, nil
 	case h.logType != redisTypeZSet:
-		return nil, wrongTypeError()
+		return nil, c.wrongTypeFor(key, h.logType)
 	}
 
 	// Key is a live ZSet.
@@ -905,7 +1107,7 @@ func (c *luaScriptContext) zsetStateFromCachedType(key []byte, st *luaZSetState)
 		st.exists = true
 		return st, true, nil
 	}
-	return nil, true, wrongTypeError()
+	return nil, true, c.wrongTypeFor(key, typ)
 }
 
 // ensureZSetLoaded loads all ZSet members from storage if not already loaded,
@@ -1069,6 +1271,13 @@ func (c *luaScriptContext) streamType(key []byte) (redisValueType, error) {
 }
 
 func (c *luaScriptContext) streamState(key []byte) (*luaStreamState, error) {
+	_, cached := c.streams[string(key)]
+	st, err := c.loadStreamState(key)
+	dropFailedStateLoad(c.streams, key, cached, err)
+	return st, err
+}
+
+func (c *luaScriptContext) loadStreamState(key []byte) (*luaStreamState, error) {
 	k := string(key)
 	if st, ok := c.streams[k]; ok {
 		if st.loaded {
@@ -1102,7 +1311,7 @@ func (c *luaScriptContext) streamState(key []byte) (*luaStreamState, error) {
 		return st, nil
 	}
 	if typ != redisTypeStream {
-		return nil, wrongTypeError()
+		return nil, c.wrongTypeFor(key, typ)
 	}
 
 	meta, found, err := c.server.loadStreamMetaAt(c.scriptCtx(), key, c.startTS)
@@ -1266,14 +1475,19 @@ func (c *luaScriptContext) markStreamValue(key []byte, value redisStreamValue, m
 func (c *luaScriptContext) cmdDel(args []string) (luaReply, error) {
 	deleted := 0
 	for _, arg := range args {
-		exists, err := c.logicalExists([]byte(arg))
+		key := []byte(arg)
+		typ, err := c.logicalType(key)
 		if err != nil {
 			return luaReply{}, err
 		}
-		if exists {
-			deleted++
-			c.deleteLogical([]byte(arg))
+		if typ == redisTypeNone {
+			// Nothing is written for an absent key, so only the read set
+			// validates that it was absent.
+			c.trackTypeProbeReadKeys(key, typ)
+			continue
 		}
+		deleted++
+		c.deleteLogical(key)
 	}
 	return luaIntReply(int64(deleted)), nil
 }
@@ -1281,11 +1495,11 @@ func (c *luaScriptContext) cmdDel(args []string) (luaReply, error) {
 func (c *luaScriptContext) cmdExists(args []string) (luaReply, error) {
 	count := 0
 	for _, arg := range args {
-		exists, err := c.logicalExists([]byte(arg))
+		typ, err := c.probedKeyType([]byte(arg))
 		if err != nil {
 			return luaReply{}, err
 		}
-		if exists {
+		if typ != redisTypeNone {
 			count++
 		}
 	}
@@ -1317,7 +1531,7 @@ func (c *luaScriptContext) cmdSet(args []string) (luaReply, error) {
 	key := []byte(args[0])
 	value := []byte(args[1])
 
-	exists, prevTTL, err := c.loadLuaSetContext(key)
+	typ, prevTTL, err := c.loadLuaSetContext(key)
 	if err != nil {
 		return luaReply{}, err
 	}
@@ -1330,7 +1544,12 @@ func (c *luaScriptContext) cmdSet(args []string) (luaReply, error) {
 	if err := validateLuaSetOptions(options); err != nil {
 		return luaReply{}, err
 	}
-	if shouldSkipLuaSet(options, exists) {
+	if shouldSkipLuaSet(options, typ != redisTypeNone) {
+		// The nil reply reports the existence check and the key is not
+		// written, so only the read set validates what the check saw. A SET
+		// that proceeds needs nothing more: its commit reads and Puts the
+		// four fences and rewrites the anchors it replaces.
+		c.trackTypeProbeReadKeys(key, typ)
 		return luaNilReply(), nil
 	}
 
@@ -1379,11 +1598,13 @@ func (c *luaScriptContext) cmdSetNX(args []string) (luaReply, error) {
 	key := []byte(args[0])
 	value := []byte(args[1])
 
-	exists, _, err := c.loadLuaSetContext(key)
+	typ, _, err := c.loadLuaSetContext(key)
 	if err != nil {
 		return luaReply{}, err
 	}
-	if exists {
+	if typ != redisTypeNone {
+		// See cmdSet: the 0 reply writes nothing, so record the check.
+		c.trackTypeProbeReadKeys(key, typ)
 		return luaIntReply(0), nil
 	}
 	c.deleteLogical(key)
@@ -1392,17 +1613,20 @@ func (c *luaScriptContext) cmdSetNX(args []string) (luaReply, error) {
 	return luaIntReply(1), nil
 }
 
-func (c *luaScriptContext) loadLuaSetContext(key []byte) (bool, *time.Time, error) {
-	exists, err := c.logicalExists(key)
+// loadLuaSetContext returns key's logical type and its TTL at the script's
+// current state. It records nothing; the NX / XX callers record the type on
+// the branch that does not write the key.
+func (c *luaScriptContext) loadLuaSetContext(key []byte) (redisValueType, *time.Time, error) {
+	typ, err := c.logicalType(key)
 	if err != nil {
-		return false, nil, err
+		return redisTypeNone, nil, err
 	}
 
 	prevTTL, err := c.loadTTL(key)
 	if err != nil && !errors.Is(err, store.ErrKeyNotFound) {
-		return false, nil, err
+		return redisTypeNone, nil, err
 	}
-	return exists, prevTTL, nil
+	return typ, prevTTL, nil
 }
 
 func validateLuaSetOptions(options luaSetOptions) error {
@@ -1490,13 +1714,14 @@ func (c *luaScriptContext) cmdIncr(args []string) (luaReply, error) {
 
 func (c *luaScriptContext) cmdPTTL(args []string) (luaReply, error) {
 	key := []byte(args[0])
-	exists, err := c.logicalExists(key)
+	typ, err := c.probedKeyType(key)
 	if err != nil {
 		return luaReply{}, err
 	}
-	if !exists {
+	if typ == redisTypeNone {
 		return luaIntReply(-2), nil
 	}
+	c.trackReadKey(redisTTLKey(key))
 	ttl, err := c.loadTTL(key)
 	if err != nil {
 		return luaReply{}, err
@@ -1506,11 +1731,13 @@ func (c *luaScriptContext) cmdPTTL(args []string) (luaReply, error) {
 
 func (c *luaScriptContext) cmdPExpire(args []string) (luaReply, error) {
 	key := []byte(args[0])
-	exists, err := c.logicalExists(key)
+	typ, err := c.logicalType(key)
 	if err != nil {
 		return luaReply{}, err
 	}
-	if !exists {
+	if typ == redisTypeNone {
+		// The 0 reply writes nothing, so record that the key was absent.
+		c.trackTypeProbeReadKeys(key, typ)
 		return luaIntReply(0), nil
 	}
 	ms, err := strconv.ParseInt(args[1], 10, 64)
@@ -1528,10 +1755,7 @@ func (c *luaScriptContext) cmdPExpire(args []string) (luaReply, error) {
 }
 
 func (c *luaScriptContext) cmdType(args []string) (luaReply, error) {
-	typ, err := c.keyType([]byte(args[0]))
-	if errors.Is(err, store.ErrKeyNotFound) {
-		return luaStatusReply(string(redisTypeNone)), nil
-	}
+	typ, err := c.probedKeyType([]byte(args[0]))
 	if err != nil {
 		return luaReply{}, err
 	}
@@ -1541,12 +1765,15 @@ func (c *luaScriptContext) cmdType(args []string) (luaReply, error) {
 func (c *luaScriptContext) cmdRename(args []string) (luaReply, error) {
 	src := []byte(args[0])
 	dst := []byte(args[1])
-	typ, err := c.keyType(src)
-	if errors.Is(err, store.ErrKeyNotFound) || typ == redisTypeNone {
-		return luaReply{}, errors.New("ERR no such key")
-	}
+	typ, err := c.logicalType(src)
 	if err != nil {
 		return luaReply{}, err
+	}
+	if typ == redisTypeNone {
+		// A script can catch the error with pcall; nothing is written, so
+		// record that the source was absent.
+		c.trackTypeProbeReadKeys(src, typ)
+		return luaReply{}, errors.New("ERR no such key")
 	}
 	ttl, err := c.loadTTL(src)
 	if err != nil {
@@ -1659,6 +1886,7 @@ func (c *luaScriptContext) cmdHGet(args []string) (luaReply, error) {
 		// nil directly skips that work and keeps the BullMQ poll loop on
 		// the cheapest possible code path.
 		if typ == redisTypeNone {
+			c.trackAbsentKeyReadKeys(key)
 			return luaNilReply(), nil
 		}
 		return hgetFromSlowPath(c, key, field)
@@ -1674,6 +1902,7 @@ func (c *luaScriptContext) cmdHGet(args []string) (luaReply, error) {
 		return luaReply{}, err
 	}
 	if hit {
+		c.trackHashFieldRead(key, alive)
 		if !alive {
 			return luaNilReply(), nil
 		}
@@ -1709,14 +1938,21 @@ func luaZSetAlreadyLoaded(c *luaScriptContext, key []byte) bool {
 // hgetFromSlowPath runs the legacy hashState-based HGET, preserving
 // the script-local cache and WRONGTYPE / nil behaviour unchanged.
 func hgetFromSlowPath(c *luaScriptContext, key []byte, field string) (luaReply, error) {
-	st, err := c.hashState(key)
+	st, err := c.observeHashState(key)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return luaNilReply(), nil
 		}
 		return luaReply{}, err
 	}
+	c.trackCollectionReadKeys(key, redisTypeHash, st.exists)
 	return hgetFromHashState(st, field), nil
+}
+
+// Value-only hash writes advance the whole-hash fence, so point reads need
+// only the bounded collection read set.
+func (c *luaScriptContext) trackHashFieldRead(key []byte, exists bool) {
+	c.trackCollectionReadKeys(key, redisTypeHash, exists)
 }
 
 // hgetFromHashState reads field out of a loaded luaHashState in the
@@ -1759,7 +1995,10 @@ func (c *luaScriptContext) cmdHSet(args []string) (luaReply, error) {
 }
 
 func (c *luaScriptContext) cmdHMGet(args []string) (luaReply, error) {
-	st, err := c.hashState([]byte(args[0]))
+	st, err := c.observeHashState([]byte(args[0]))
+	if err == nil {
+		c.trackCollectionReadKeys([]byte(args[0]), redisTypeHash, st.exists)
+	}
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			out := make([]luaReply, 0, len(args)-1)
@@ -1797,7 +2036,7 @@ func (c *luaScriptContext) cmdHMSet(args []string) (luaReply, error) {
 }
 
 func (c *luaScriptContext) cmdHGetAll(args []string) (luaReply, error) {
-	st, err := c.hashState([]byte(args[0]))
+	st, err := c.observeHashState([]byte(args[0]))
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return luaArrayReply(), nil
@@ -1812,6 +2051,8 @@ func (c *luaScriptContext) cmdHGetAll(args []string) (luaReply, error) {
 		fields = append(fields, field)
 	}
 	sort.Strings(fields)
+	// The hash fence covers both the field set and value-only updates.
+	// observeHashState already tracked it and the legacy blob anchor.
 	out := make([]luaReply, 0, len(fields)*redisPairWidth)
 	for _, field := range fields {
 		out = append(out, luaStringReply(field), luaStringReply(st.value[field]))
@@ -1896,6 +2137,7 @@ func (c *luaScriptContext) cmdHExists(args []string) (luaReply, error) {
 		// hash is defined to return 0, matching the slow-path result
 		// without allocating an empty luaHashState.
 		if typ == redisTypeNone {
+			c.trackAbsentKeyReadKeys(key)
 			return luaIntReply(0), nil
 		}
 		return hexistsFromSlowPath(c, key, field)
@@ -1906,6 +2148,7 @@ func (c *luaScriptContext) cmdHExists(args []string) (luaReply, error) {
 		return luaReply{}, err
 	}
 	if hit {
+		c.trackHashFieldRead(key, alive)
 		if alive {
 			return luaIntReply(1), nil
 		}
@@ -1915,13 +2158,14 @@ func (c *luaScriptContext) cmdHExists(args []string) (luaReply, error) {
 }
 
 func hexistsFromSlowPath(c *luaScriptContext, key []byte, field string) (luaReply, error) {
-	st, err := c.hashState(key)
+	st, err := c.observeHashState(key)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return luaIntReply(0), nil
 		}
 		return luaReply{}, err
 	}
+	c.trackCollectionReadKeys(key, redisTypeHash, st.exists)
 	return hexistsFromHashState(st, field), nil
 }
 
@@ -1938,7 +2182,7 @@ func hexistsFromHashState(st *luaHashState, field string) luaReply {
 }
 
 func (c *luaScriptContext) cmdHLen(args []string) (luaReply, error) {
-	st, err := c.hashState([]byte(args[0]))
+	st, err := c.observeHashState([]byte(args[0]))
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return luaIntReply(0), nil
@@ -2001,7 +2245,7 @@ func (c *luaScriptContext) pushList(args []string, left bool) (luaReply, error) 
 }
 
 func (c *luaScriptContext) cmdLLen(args []string) (luaReply, error) {
-	st, err := c.listState([]byte(args[0]))
+	st, err := c.observeListState([]byte(args[0]))
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return luaIntReply(0), nil
@@ -2507,7 +2751,7 @@ func (c *luaScriptContext) cmdRPopLPush(args []string) (luaReply, error) {
 }
 
 func (c *luaScriptContext) cmdLPos(args []string) (luaReply, error) {
-	st, err := c.listState([]byte(args[0]))
+	st, err := c.observeListState([]byte(args[0]))
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return luaNilReply(), nil
@@ -2582,7 +2826,7 @@ func (c *luaScriptContext) cmdSAdd(args []string) (luaReply, error) {
 }
 
 func (c *luaScriptContext) cmdSCard(args []string) (luaReply, error) {
-	st, err := c.setState([]byte(args[0]))
+	st, err := c.observeSetState([]byte(args[0]))
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return luaIntReply(0), nil
@@ -2596,7 +2840,7 @@ func (c *luaScriptContext) cmdSCard(args []string) (luaReply, error) {
 }
 
 func (c *luaScriptContext) cmdSMembers(args []string) (luaReply, error) {
-	st, err := c.setState([]byte(args[0]))
+	st, err := c.observeSetState([]byte(args[0]))
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return luaArrayReply(), nil
@@ -2672,6 +2916,7 @@ func (c *luaScriptContext) cmdSIsMember(args []string) (luaReply, error) {
 		// SISMEMBER on a missing set returns 0; skip the slow path to
 		// avoid an empty luaSetState allocation on repeated misses.
 		if typ == redisTypeNone {
+			c.trackAbsentKeyReadKeys(key)
 			return luaIntReply(0), nil
 		}
 		return sismemberFromSlowPath(c, key, member)
@@ -2682,6 +2927,7 @@ func (c *luaScriptContext) cmdSIsMember(args []string) (luaReply, error) {
 		return luaReply{}, err
 	}
 	if hit {
+		c.trackCollectionReadKeys(key, redisTypeSet, alive)
 		if alive {
 			return luaIntReply(1), nil
 		}
@@ -2691,7 +2937,7 @@ func (c *luaScriptContext) cmdSIsMember(args []string) (luaReply, error) {
 }
 
 func sismemberFromSlowPath(c *luaScriptContext, key []byte, member string) (luaReply, error) {
-	st, err := c.setState(key)
+	st, err := c.observeSetState(key)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return luaIntReply(0), nil
@@ -2802,7 +3048,7 @@ func (c *luaScriptContext) applyZAddMember(st *luaZSetState, key []byte, flags z
 
 func (c *luaScriptContext) cmdZCard(args []string) (luaReply, error) {
 	key := []byte(args[0])
-	st, err := c.zsetState(key)
+	st, err := c.observeZSetState(key)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return luaIntReply(0), nil
@@ -2821,7 +3067,7 @@ func (c *luaScriptContext) cmdZCard(args []string) (luaReply, error) {
 
 func (c *luaScriptContext) cmdZCount(args []string) (luaReply, error) {
 	key := []byte(args[0])
-	st, err := c.zsetState(key)
+	st, err := c.observeZSetState(key)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return luaIntReply(0), nil
@@ -2869,7 +3115,7 @@ func (c *luaScriptContext) cmdZRevRangeByScore(args []string) (luaReply, error) 
 
 func (c *luaScriptContext) rangeByRank(args []string, reverse bool) (luaReply, error) {
 	key := []byte(args[0])
-	st, err := c.zsetState(key)
+	st, err := c.observeZSetState(key)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return luaArrayReply(), nil
@@ -2940,6 +3186,7 @@ func (c *luaScriptContext) cmdZRangeByScore(args []string, reverse bool) (luaRep
 		// array directly matches the slow-path result without a second
 		// rawKeyTypeAt probe inside zsetState.
 		if typ == redisTypeNone {
+			c.trackAbsentKeyReadKeys(key)
 			return luaArrayReply(), nil
 		}
 		return c.cmdZRangeByScoreSlow(key, options, reverse)
@@ -2953,6 +3200,10 @@ func (c *luaScriptContext) cmdZRangeByScore(args []string, reverse bool) (luaRep
 		return c.cmdZRangeByScoreSlow(key, options, reverse)
 	}
 	zrangeMetrics.ObserveHit()
+	// A non-empty hit proves a live zset. An empty hit is either an absent
+	// key or a zset with nothing in range; the absent-key fences include the
+	// zset fence and legacy anchor, so they cover both without another probe.
+	c.trackCollectionReadKeys(key, redisTypeZSet, len(entries) > 0)
 	if len(entries) == 0 {
 		return luaArrayReply(), nil
 	}
@@ -2994,7 +3245,7 @@ func (c *luaScriptContext) scriptCtx() context.Context {
 // fall-through cases (in-script mutations, legacy-blob encoding,
 // ambiguous empty results).
 func (c *luaScriptContext) cmdZRangeByScoreSlow(key []byte, options luaZRangeByScoreOptions, reverse bool) (luaReply, error) {
-	st, err := c.zsetState(key)
+	st, err := c.observeZSetState(key)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return luaArrayReply(), nil
@@ -3206,6 +3457,7 @@ func (c *luaScriptContext) cmdZScore(args []string) (luaReply, error) {
 		// "missing zset" branch of zscoreFromSlowPath without paying for
 		// an empty luaZSetState allocation.
 		if typ == redisTypeNone {
+			c.trackAbsentKeyReadKeys(key)
 			return luaNilReply(), nil
 		}
 		return zscoreFromSlowPath(c, key, member)
@@ -3216,6 +3468,7 @@ func (c *luaScriptContext) cmdZScore(args []string) (luaReply, error) {
 		return luaReply{}, err
 	}
 	if hit {
+		c.trackCollectionReadKeys(key, redisTypeZSet, alive)
 		if !alive {
 			return luaNilReply(), nil
 		}
@@ -3229,7 +3482,7 @@ func (c *luaScriptContext) cmdZScore(args []string) (luaReply, error) {
 // unchanged. Handles legacy-blob zsets via ensureZSetLoaded inside
 // memberScore.
 func zscoreFromSlowPath(c *luaScriptContext, key []byte, member string) (luaReply, error) {
-	st, err := c.zsetState(key)
+	st, err := c.observeZSetState(key)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return luaNilReply(), nil
@@ -3815,9 +4068,11 @@ func (c *luaScriptContext) commitPlanForKey(ctx context.Context, key string, com
 		deleteElems = append(deleteElems, redisTxnWideCollectionFenceElems(keyBytes)...)
 	}
 
-	dataElems := make([]*kv.Elem[kv.OP], 0, len(deleteElems)+len(valuePlan.elems))
+	createFences := luaStreamCreateFenceElems(keyBytes, finalType, startType, valuePlan)
+	dataElems := make([]*kv.Elem[kv.OP], 0, len(deleteElems)+len(valuePlan.elems)+len(createFences))
 	dataElems = append(dataElems, deleteElems...)
 	dataElems = append(dataElems, valuePlan.elems...)
+	dataElems = append(dataElems, createFences...)
 	return luaKeyPlan{
 		elems:               dataElems,
 		readKeys:            readKeys,
@@ -3848,6 +4103,20 @@ func (c *luaScriptContext) rememberRawTypeAtStart(key string, typ redisValueType
 		return
 	}
 	c.rawTypeAtStart[key] = typ
+}
+
+// luaStreamCreateFenceElems returns the txn-wide fence Puts for a stream the
+// script creates on a key that was absent at startTS through the delta
+// (preserving) path. A non-preserving plan already Puts the four fences, and a
+// list or zset delta create Puts its own type fence; a stream has no fence of
+// its own, so without these a concurrent list / hash / set / zset create,
+// which reads the fences for an absent key, would not conflict with it.
+func luaStreamCreateFenceElems(key []byte, finalType, startType redisValueType, plan luaCommitPlan) []*kv.Elem[kv.OP] {
+	if finalType != redisTypeStream || !plan.preserveExisting || len(plan.elems) == 0 {
+		return nil
+	}
+	fences, _ := redisAbsentKeyCreateGuard(key, startType)
+	return fences
 }
 
 func luaWideFenceReadKeysForPlan(key []byte, finalType, startType redisValueType, preserveExisting bool) [][]byte {

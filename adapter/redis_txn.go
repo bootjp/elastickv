@@ -104,10 +104,7 @@ func redisTxnReadFencePointKeys(userKey []byte) [][]byte {
 }
 
 func redisLegacyBareReadFenceAllowed(userKey []byte) bool {
-	if isKnownInternalKey(userKey) {
-		return false
-	}
-	return !bytes.HasPrefix(userKey, []byte("!sqs|"))
+	return !isKnownInternalKey(userKey)
 }
 
 // redisTxnReadFenceTargetsForRanges builds the fence set for a user key. Point
@@ -798,6 +795,60 @@ func redisTxnWideCreateReadKeys(userKey []byte, typ redisValueType, fenceKey fun
 	return [][]byte{fenceKey(userKey)}
 }
 
+// redisStringTypeReadKeys lists the anchors of the string family (TYPE reports
+// the prefixed string key, the HyperLogLog key, and, outside internal
+// namespaces, the legacy bare key. A command that observed userKey as a string at its read
+// timestamp validates them at commit: every DEL, overwrite, and type change of
+// a string rewrites or deletes whichever of them holds the value.
+func redisStringTypeReadKeys(userKey []byte) [][]byte {
+	keys := [][]byte{redisStrKey(userKey), redisHLLKey(userKey)}
+	if redisLegacyBareReadFenceAllowed(userKey) {
+		keys = append(keys, userKey)
+	}
+	return keys
+}
+
+// redisStringWriteGuard returns what a standalone string write (SET and its
+// NX / XX / GET forms, SETNX, SETEX, the legacy INCR) adds to its transaction
+// once it has decided on userKey's logical type typ at its read timestamp:
+//
+//   - absent: redisAbsentKeyCreateGuard (the absent-key read keys and
+//     Puts of the four txn-wide fences), so the create conflicts with a
+//     concurrent create of any other encoding, in either commit order.
+//   - string: the string-family anchors (redisStringTypeReadKeys). The write
+//     Puts only the prefixed string key, so without them a DEL or type change
+//     of a value held under the HLL or the legacy bare key would go unseen.
+//   - list / hash / set / zset / stream: nothing. The write replaces the
+//     collection through deleteLogicalKeyElems, which Puts the four fences
+//     that every DEL, emptying path, and type change of a collection also
+//     writes, so the write-write check already covers them.
+func redisStringWriteGuard(userKey []byte, typ redisValueType) ([]*kv.Elem[kv.OP], [][]byte) {
+	switch typ {
+	case redisTypeNone:
+		return redisAbsentKeyCreateGuard(userKey, typ)
+	case redisTypeString:
+		return nil, redisStringTypeReadKeys(userKey)
+	case redisTypeList, redisTypeHash, redisTypeSet, redisTypeZSet, redisTypeStream:
+	}
+	return nil, nil
+}
+
+// redisAbsentKeyCreateGuard returns what a creator of a single-anchor
+// encoding (an HLL, a stream) adds to its transaction when it observed userKey
+// absent at its read timestamp (startType == redisTypeNone): the absent-key
+// read keys, so a concurrent create of any other type makes it conflict, and
+// Puts of the four txn-wide fences, so a concurrent list / hash / set / zset
+// create, which reads those fences for an absent key, conflicts with it too.
+// Without both, the two creates have disjoint read and write sets and commit
+// two encodings under one key. A creator that found the key already of its
+// own type gets nothing: its own anchor, which every write to the key
+// rewrites or deletes, is in its write set.
+func redisAbsentKeyCreateGuard(userKey []byte, startType redisValueType) ([]*kv.Elem[kv.OP], [][]byte) {
+	if startType != redisTypeNone {
+		return nil, nil
+	}
+	return redisTxnWideCollectionFenceElems(userKey), redisTxnReadFencePointKeys(userKey)
+}
 func redisTxnWideFenceElem(key []byte) *kv.Elem[kv.OP] {
 	return &kv.Elem[kv.OP]{Op: kv.Put, Key: key, Value: []byte{}}
 }
@@ -833,26 +884,23 @@ func (t *txnContext) ctxOrBackground() context.Context {
 	return t.server.redisContext(t.ctx)
 }
 
-func (t *txnContext) load(key []byte) (*txnValue, error) {
-	// If the key is already an internal key (e.g., !redis|hash|...,
-	// !lst|..., !txn|..., !ddb|..., !s3|..., !dist|...), use it as-is.
-	// Otherwise, it's a bare user key for a string value — prefix it.
-	storageKey := key
-	if !isKnownInternalKey(key) {
-		storageKey = redisStrKey(key)
+func (t *txnContext) load(key []byte, internal bool) (*txnValue, error) {
+	storageKey := redisStrKey(key)
+	if internal {
+		storageKey = key
 	}
 	k := string(storageKey)
 	if tv, ok := t.working[k]; ok {
 		return tv, nil
 	}
 	t.trackReadKey(storageKey)
-	if !isKnownInternalKey(key) {
+	if !internal {
 		// Track the bare key too for conflict detection on legacy fallback reads.
 		t.trackReadKey(key)
 	}
 	tv := &txnValue{}
 	var val []byte
-	if !isKnownInternalKey(key) {
+	if !internal {
 		// For bare user string keys, use the fallback-aware reader.
 		var (
 			err error
@@ -1164,7 +1212,17 @@ func (t *txnContext) stagedKeyType(key []byte) (redisValueType, error) {
 		return redisTypeNone, nil
 	}
 	t.trackTypeReadKeys(key)
-	return t.server.keyTypeAt(t.ctxOrBackground(), key, t.startTS)
+	typ, err := t.server.keyTypeAt(t.ctxOrBackground(), key, t.startTS)
+	if err != nil {
+		return typ, err
+	}
+	if typ == redisTypeNone {
+		// The nine type anchors miss a wide-column list / hash / set / zset
+		// create, which writes only its own rows and its fence; with the
+		// four fences the read set is the thirteen-key absent set.
+		t.trackWideCollectionFenceReads(key)
+	}
+	return typ, nil
 }
 
 func (t *txnContext) stagedPositiveKeyType(key string) (redisValueType, bool) {
@@ -1339,7 +1397,7 @@ func (t *txnContext) currentStringValue(key []byte) ([]byte, *time.Time, bool, e
 	if repl, ok := t.replacers[string(key)]; ok {
 		return bytes.Clone(repl.value), cloneTimePtr(repl.ttl), true, nil
 	}
-	tv, err := t.load(key)
+	tv, err := t.load(key, false)
 	if err != nil {
 		return nil, nil, false, err
 	}
@@ -1355,7 +1413,7 @@ func (t *txnContext) stageStringValue(key, value []byte, ttl *time.Time) error {
 		repl.ttl = cloneTimePtr(ttl)
 		return nil
 	}
-	tv, err := t.load(key)
+	tv, err := t.load(key, false)
 	if err != nil {
 		return err
 	}
@@ -1778,7 +1836,7 @@ func (t *txnContext) markHashCreate(key []byte) {
 // markStringDirty loads the string value into the working set so that
 // buildKeyElems will re-encode it with the updated embedded TTL.
 func (t *txnContext) markStringDirty(key []byte) (redisResult, error) {
-	tv, err := t.load(key)
+	tv, err := t.load(key, false)
 	if err != nil {
 		return redisResult{}, err
 	}
@@ -1787,7 +1845,7 @@ func (t *txnContext) markStringDirty(key []byte) (redisResult, error) {
 }
 
 func (t *txnContext) markHLLDirty(key []byte, ttl *time.Time) error {
-	hllValue, err := t.load(redisHLLKey(key))
+	hllValue, err := t.load(redisHLLKey(key), true)
 	if err != nil {
 		return err
 	}
@@ -1854,7 +1912,7 @@ func (t *txnContext) stageCollectionStateDeletion(key []byte) error {
 	}
 	stageListDelete(st)
 	// Mark the string/main value for deletion.
-	tv, err := t.load(key)
+	tv, err := t.load(key, false)
 	if err != nil {
 		return err
 	}
@@ -1888,7 +1946,7 @@ func (t *txnContext) stageLegacyInternalDeletion(key []byte) error {
 		redisStreamKey(key),
 		redisHLLKey(key),
 	} {
-		iv, err := t.load(internalKey)
+		iv, err := t.load(internalKey, true)
 		if err != nil {
 			return err
 		}
@@ -2583,6 +2641,9 @@ func (t *txnContext) appendHashStateElems(elems []*kv.Elem[kv.OP], key []byte, s
 		return append(elems, inline...), false
 	}
 	next, newFields := appendHashChangedFieldElems(elems, key, st)
+	if len(st.dirtyFields) != 0 {
+		next = append(next, redisTxnWideHashFenceElem(key))
+	}
 	if newFields == 0 {
 		return next, false
 	}
@@ -2609,7 +2670,6 @@ func appendHashChangedFieldElems(elems []*kv.Elem[kv.OP], key []byte, st *hashTx
 func appendHashDeltaElem(elems []*kv.Elem[kv.OP], key []byte, newFields int64, commitTS uint64, seqInTxn uint32) []*kv.Elem[kv.OP] {
 	deltaVal := store.MarshalHashMetaDelta(store.HashMetaDelta{LenDelta: newFields})
 	return append(elems,
-		redisTxnWideHashFenceElem(key),
 		&kv.Elem[kv.OP]{
 			Op:    kv.Put,
 			Key:   store.HashMetaDeltaKey(key, commitTS, seqInTxn),
