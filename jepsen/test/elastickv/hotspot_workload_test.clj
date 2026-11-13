@@ -1,6 +1,7 @@
 (ns elastickv.hotspot-workload-test
   (:require [clojure.java.shell :as shell]
             [clojure.test :refer :all]
+            [elastickv.cli :as cli]
             [elastickv.db :as ekdb]
             [elastickv.hotspot-workload :as hotspot]
             [jepsen.checker :as checker]
@@ -33,9 +34,23 @@
   (let [test (hotspot/elastickv-hotspot-test {})
         fs (nemesis/fs (:nemesis test))]
     (is (= hotspot/auto-split-args (get-in test [:db :opts :auto-split-args])))
-    (is (some? (:final-generator test)))
+    (is (nil? (:final-generator test)))
+    (is (= 6 (:concurrency test)))
     (is (every? fs #{:capture-hotspot-baseline :observe-hotspot-split
                      :start-partition :stop-partition :kill :start}))))
+
+(deftest managed-test-forwards-encryption-and-validates-concurrency
+  (is (true? (get-in (hotspot/elastickv-hotspot-test {:encryption true})
+                     [:db :opts :encryption])))
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                        #"even concurrency of at least six"
+                        (hotspot/elastickv-hotspot-test {:concurrency 5})))
+  (with-redefs [cli/run-workload!
+                (fn [_ options _ _]
+                  (is (= 6 (:default (apply hash-map
+                                            (drop 3 (first (filter #(= "--concurrency N"
+                                                                       (second %)) options))))))))]
+    (hotspot/-main)))
 
 (deftest observation-rejects-controller-failures
   (is (some? (hotspot/split-observation before after)))
@@ -53,6 +68,7 @@
         check #(checker/check (hotspot/controller-checker) {}
                               (history/history %) {})]
     (is (true? (:valid? (check [capture observe]))))
+    (is (true? (:valid? (check [(assoc capture :value nil) capture observe]))))
     (is (false? (:valid? (check []))))
     (is (false? (:valid? (check [capture]))))
     (is (false? (:valid? (check [observe capture]))))
@@ -74,6 +90,32 @@
           test {:nodes ["n1"]}]
       (is (= :info (:type (nemesis/invoke! n test
                                           {:type :info :f :capture-hotspot-baseline}))))
+      (is (= :fail (:type (nemesis/invoke! n test
+                                          {:type :info :f :observe-hotspot-split})))))))
+
+(deftest transient-route-observation-is-pending-until-deadline
+  (let [calls (atom 0)
+        n (hotspot/controller-nemesis {:observe-timeout-ms 1000})
+        test {:nodes ["n1"]}]
+    (with-redefs [hotspot/route-snapshot!
+                  (fn [& _]
+                    (case (swap! calls inc)
+                      1 before
+                      2 (throw (ex-info "node unavailable" {}))
+                      after))]
+      (nemesis/invoke! n test {:type :info :f :capture-hotspot-baseline})
+      (is (= :info (:type (nemesis/invoke! n test
+                                          {:type :info :f :observe-hotspot-split}))))
+      (is (map? (:value (nemesis/invoke! n test
+                                          {:type :info :f :observe-hotspot-split}))))))
+  (let [calls (atom 0)
+        n (hotspot/controller-nemesis {:observe-timeout-ms 0})
+        test {:nodes ["n1"]}]
+    (with-redefs [hotspot/route-snapshot!
+                  (fn [& _]
+                    (if (= 1 (swap! calls inc)) before
+                        (throw (ex-info "node unavailable" {}))))]
+      (nemesis/invoke! n test {:type :info :f :capture-hotspot-baseline})
       (is (= :fail (:type (nemesis/invoke! n test
                                           {:type :info :f :observe-hotspot-split})))))))
 

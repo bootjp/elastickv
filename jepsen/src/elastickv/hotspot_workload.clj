@@ -91,11 +91,19 @@
                 (throw (ex-info "missing hotspot baseline" {})))
               (if @observed
                 (assoc op :type :info :value @observed)
-                (let [after (route-snapshot! opts test)
-                      observation (split-observation @baseline after)]
+                (let [after (try
+                              (route-snapshot! opts test)
+                              (catch Throwable t
+                                (warn t "M4 route observation temporarily unavailable")
+                                nil))
+                      observation (when after (split-observation @baseline after))]
                   (cond
                     observation (do (reset! observed observation)
                                     (assoc op :type :info :value observation))
+                    (nil? after)
+                    (if (>= (System/currentTimeMillis) @deadline)
+                      (throw (ex-info "automatic hotspot split not observed before deadline" {}))
+                      (assoc op :type :info))
                     (not= 1 (count (active-routes after)))
                     (throw (ex-info "automatic hotspot split has invalid route geometry"
                                     {:before @baseline :after after}))
@@ -128,7 +136,8 @@
       (let [ops (filter #(and (= :nemesis (:process %))
                               (contains? #{:capture-hotspot-baseline :observe-hotspot-split} (:f %))
                               (contains? #{:info :ok :fail} (:type %))) history)
-            captures (vec (filter #(= :capture-hotspot-baseline (:f %)) ops))
+            captures (vec (filter #(and (= :capture-hotspot-baseline (:f %))
+                                        (map? (:value %))) ops))
             observations (filter #(and (= :observe-hotspot-split (:f %))
                                        (map? (:value %))) ops)
             capture (first captures)
@@ -179,6 +188,7 @@
          db (if local? jdb/noop
               (ekdb/db {:grpc-port (or (:grpc-port opts) 50051)
                         :redis-port node->port
+                        :encryption (:encryption opts)
                         :auto-split-args auto-split-args}))
          faults (when-not local?
                   (combined/nemesis-package
@@ -186,9 +196,14 @@
                      :interval (or (:fault-interval opts) 15)}))
          package (combined/compose-packages
                    (cond-> [(controller-package opts)] faults (conj faults)))
+         concurrency (or (:concurrency opts) 6)
+         _ (when (or (< concurrency (* 2 (count register-keys)))
+                     (odd? concurrency))
+             (throw (ex-info "hotspot workload requires even concurrency of at least six"
+                             {:concurrency concurrency})))
          workload (split/split-register-workload
                     (assoc opts :node->port node->port :register-keys register-keys
-                           :independent-concurrency (count register-keys)
+                           :independent-concurrency 2
                            :max-writes-per-key (or (:max-writes-per-key opts) 10000)))]
      (merge workload
             {:name (or (:name opts) "elastickv-m4-automatic-hotspot")
@@ -202,12 +217,15 @@
              :checker (checker/compose {:register (:checker workload)
                                         :controller (controller-checker)
                                         :final-reads (final-read-checker)})
-             :concurrency (or (:concurrency opts) 6)
-             :generator (->> (:generator workload)
-                             (gen/nemesis (:generator package))
-                             (gen/stagger (/ (double (or (:rate opts) 20))))
-                             (gen/time-limit (or (:time-limit opts) 120)))
-             :final-generator (final-reads (count nodes))}))))
+             :concurrency concurrency
+             :generator (gen/phases
+                          (->> (:generator workload)
+                               (gen/nemesis (:generator package))
+                               (gen/stagger (/ (double (or (:rate opts) 20))))
+                               (gen/time-limit (or (:time-limit opts) 120)))
+                          (gen/nemesis (:final-generator package))
+                          (gen/clients (final-reads (count nodes))))
+             :final-generator nil}))))
 
 (def hotspot-cli-opts
   [[nil "--redis-port PORT" "Redis port." :default 6379 :parse-fn #(Integer/parseInt %)]
@@ -223,6 +241,7 @@
                      (into (mapv (fn [option]
                                    (case (second option)
                                      "--time-limit SECONDS" (assoc option 4 120)
+                                     "--concurrency N" (assoc option 4 6)
                                      "--faults LIST" (assoc option 4 "partition,kill")
                                      "--fault-interval SECONDS" (assoc option 4 10)
                                      option)) cli/common-cli-opts)
