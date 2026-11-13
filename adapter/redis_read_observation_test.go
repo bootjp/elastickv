@@ -126,6 +126,44 @@ func TestRedisReadObservationXReadAttributesLocalStreamAfterRemote(t *testing.T)
 	require.Equal(t, []uint64{0}, coord.marks)
 }
 
+func TestRedisReadObservationBlockingXReadRecordsPolls(t *testing.T) {
+	st := store.NewMVCCStore()
+	defer st.Close()
+	coord := &redisReadObservationCoordinator{}
+	server := &RedisServer{
+		coordinator:       coord,
+		store:             st,
+		blockWaitFallback: 10 * time.Millisecond,
+	}
+	req := xreadRequest{
+		keys:     [][]byte{[]byte("missing")},
+		afterIDs: []string{"0-0"},
+	}
+	server.xreadBusyPoll(&recordingConn{}, req, time.Now().Add(100*time.Millisecond))
+	require.GreaterOrEqual(t, len(coord.keys), 2)
+	for _, key := range coord.keys {
+		require.Equal(t, redisUserRouteKey([]byte("missing")), key)
+	}
+	require.Empty(t, coord.marks)
+}
+
+func TestRedisReadObservationBlockingBZPopMinRecordsPolls(t *testing.T) {
+	st := store.NewMVCCStore()
+	defer st.Close()
+	coord := &redisReadObservationCoordinator{}
+	server := &RedisServer{
+		coordinator:       coord,
+		store:             st,
+		blockWaitFallback: 10 * time.Millisecond,
+	}
+	server.bzpopminWaitLoop(&recordingConn{}, [][]byte{[]byte("missing")}, time.Now().Add(100*time.Millisecond))
+	require.GreaterOrEqual(t, len(coord.keys), 2)
+	for _, key := range coord.keys {
+		require.Equal(t, redisUserRouteKey([]byte("missing")), key)
+	}
+	require.Empty(t, coord.marks)
+}
+
 func TestRedisReadObservationMultiKeyIngressAttributesLocalAfterRemote(t *testing.T) {
 	remote := redisUserRouteKey([]byte("remote"))
 	local := redisUserRouteKey([]byte("local"))

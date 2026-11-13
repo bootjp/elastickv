@@ -146,6 +146,7 @@ func (s *Service) planCreateOperation(ctx context.Context, snapshot operationPla
 	plan := operationAttemptPlan{Intent: intent, ReadTS: ts, RouteVersion: snapshot.RouteVersion,
 		ReadKeys: [][]byte{fskeys.InodeKey(parent), entryKey}}
 	parentMeta, err := s.inodeAt(ctx, parent, ts)
+	s.observeReadResult(ctx, fskeys.InodeKey(parent), err)
 	if errors.Is(err, ErrNotFound) {
 		return plan, ErrNotFound, nil
 	}
@@ -155,7 +156,9 @@ func (s *Service) planCreateOperation(ctx context.Context, snapshot operationPla
 	if parentMeta.Type != TypeDirectory {
 		return plan, ErrNotDir, nil
 	}
-	if _, err = s.dirEntryAt(ctx, parent, name, ts); err == nil {
+	_, err = s.dirEntryAt(ctx, parent, name, ts)
+	s.observeReadResult(ctx, entryKey, err)
+	if err == nil {
 		return plan, ErrExists, nil
 	} else if !errors.Is(err, ErrNotFound) {
 		return operationAttemptPlan{}, nil, err

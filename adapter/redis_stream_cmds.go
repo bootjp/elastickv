@@ -1371,6 +1371,7 @@ func (r *RedisServer) xread(conn redcon.Conn, cmd redcon.Command) {
 		writeRedisError(conn, err)
 		return
 	}
+	r.observeBlockingRedisKeys(r.handlerContext(conn), req.keys)
 
 	blockDuration := req.block
 	// block=0 means infinite wait in Redis; cap at redisDispatchTimeout to prevent goroutine leak.
@@ -1485,6 +1486,7 @@ func (r *RedisServer) xreadBusyPoll(conn redcon.Conn, req xreadRequest, deadline
 		iterCtx, iterCancel := context.WithTimeout(handlerCtx, iterTimeout)
 		var results []xreadResult
 		var err error
+		r.observeBlockingRedisKeys(iterCtx, req.keys)
 		if ok := r.runWithHeavyCommandSlot(func() {
 			results, err = r.xreadOnce(iterCtx, req)
 		}); !ok {

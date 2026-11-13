@@ -330,7 +330,7 @@ func WithOperationalObserver(observer OperationalObserver) Option {
 }
 
 // WithReadObserver enables bounded, leader-local KeyViz observations for
-// public FUSE reads. It does not observe internal mutation planning reads.
+// public FUSE reads and mutation probes before transaction dispatch.
 func WithReadObserver(observer kv.Coordinator) Option {
 	return func(s *Service) {
 		s.readObserver = observer
@@ -538,11 +538,14 @@ func (s *Service) SetAttr(ctx context.Context, inode uint64, mask SetAttrMask, a
 		return Stat{}, err
 	}
 	meta, err := s.inodeAt(ctx, inode, ts)
+	s.observeReadResult(ctx, fskeys.InodeKey(inode), err)
 	if err != nil {
 		return Stat{}, err
 	}
 	if mask.Size {
-		if err := s.ensureActiveHomeAt(ctx, meta, ts); err != nil {
+		err := s.ensureActiveHomeAt(ctx, meta, ts)
+		s.observeHomeRead(ctx, inode, err)
+		if err != nil {
 			return Stat{}, err
 		}
 	}
@@ -699,10 +702,12 @@ func (s *Service) openWithHandle(ctx context.Context, inode uint64, clientID []b
 	}
 	refKey := fskeys.RefKey(inode, clientID, fh)
 	if _, err := s.store.GetAt(ctx, refKey, ts); err == nil {
+		s.observeReadKey(ctx, refKey)
 		return ErrExists
 	} else if !errors.Is(err, store.ErrKeyNotFound) {
 		return errors.Wrap(err, "filesystem read open handle lease")
 	}
+	s.observeReadKey(ctx, refKey)
 	refElem, err := s.refPutElem(inode, clientID, fh)
 	if err != nil {
 		return err
@@ -871,13 +876,16 @@ func (s *Service) writeOnce(ctx context.Context, inode uint64, offset uint64, da
 		return 0, err
 	}
 	meta, err := s.inodeAt(ctx, inode, ts)
+	s.observeReadResult(ctx, fskeys.InodeKey(inode), err)
 	if err != nil {
 		return 0, err
 	}
 	if meta.Type == TypeDirectory {
 		return 0, ErrIsDir
 	}
-	if err := s.ensureActiveHomeAt(ctx, meta, ts); err != nil {
+	err = s.ensureActiveHomeAt(ctx, meta, ts)
+	s.observeHomeRead(ctx, inode, err)
+	if err != nil {
 		return 0, err
 	}
 	if end > meta.Size {
@@ -982,6 +990,7 @@ func (s *Service) writeChunkValue(
 	if getErr != nil && !errors.Is(getErr, store.ErrKeyNotFound) {
 		return 0, nil, false, errors.Wrap(getErr, "filesystem read chunk for write")
 	}
+	s.observeReadKey(ctx, chunkKey)
 	oldLen := uint64(len(raw))
 	if fullChunkWrite {
 		return oldLen, trimChunk(data[srcStart:srcEnd]), false, nil
@@ -1003,13 +1012,16 @@ func (s *Service) Truncate(ctx context.Context, inode uint64, size uint64) error
 		return err
 	}
 	meta, err := s.inodeAt(ctx, inode, ts)
+	s.observeReadResult(ctx, fskeys.InodeKey(inode), err)
 	if err != nil {
 		return err
 	}
 	if meta.Type == TypeDirectory {
 		return ErrIsDir
 	}
-	if err := s.ensureActiveHomeAt(ctx, meta, ts); err != nil {
+	err = s.ensureActiveHomeAt(ctx, meta, ts)
+	s.observeHomeRead(ctx, inode, err)
+	if err != nil {
 		return err
 	}
 	ts, meta, _, err = s.cleanupStaleChunksBeforeSizeChange(ctx, inode, meta)
@@ -1102,6 +1114,7 @@ func (s *Service) renameOnce(ctx context.Context, oldParent uint64, oldName []by
 		return err
 	}
 	parentMeta, err := s.inodeAt(ctx, oldParent, ts)
+	s.observeReadResult(ctx, fskeys.InodeKey(oldParent), err)
 	if err != nil {
 		return err
 	}
@@ -1109,6 +1122,7 @@ func (s *Service) renameOnce(ctx context.Context, oldParent uint64, oldName []by
 		return ErrNotDir
 	}
 	oldEntry, err := s.dirEntryAt(ctx, oldParent, oldName, ts)
+	s.observeReadResult(ctx, fskeys.DirEntryKey(oldParent, oldName), err)
 	if err != nil {
 		return err
 	}
@@ -1181,7 +1195,9 @@ func (s *Service) renameTargetTxnParts(
 		elems, reads, delta, err := s.rmdirTargetTxnParts(ctx, ts, parentMeta, replacedMeta)
 		return elems, reads, delta, nil, err
 	}
-	if err := s.ensureActiveHomeAt(ctx, replacedMeta, ts); err != nil {
+	err := s.ensureActiveHomeAt(ctx, replacedMeta, ts)
+	s.observeHomeRead(ctx, replacedMeta.Inode, err)
+	if err != nil {
 		return nil, nil, usageDelta{}, nil, err
 	}
 	return s.unlinkFileTxnParts(ctx, ts, replacedMeta, now)
@@ -1219,6 +1235,7 @@ func (s *Service) renameReplacedFileMeta(
 	ts uint64,
 ) (*InodeMeta, error) {
 	replacedEntry, err := s.dirEntryAt(ctx, parent, name, ts)
+	s.observeReadResult(ctx, fskeys.DirEntryKey(parent, name), err)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			return nil, nil
@@ -1232,6 +1249,7 @@ func (s *Service) renameReplacedFileMeta(
 		return nil, nil
 	}
 	meta, err := s.inodeAt(ctx, replacedEntry.Inode, ts)
+	s.observeReadResult(ctx, fskeys.InodeKey(replacedEntry.Inode), err)
 	if err != nil {
 		return nil, err
 	}
@@ -1377,6 +1395,7 @@ func (s *Service) releaseRefTxnParts(
 	elems := []*kv.Elem[kv.OP]{{Op: kv.Del, Key: refKey}}
 	readKeys := [][]byte{refKey, fskeys.InodeKey(inode)}
 	meta, err := s.inodeAt(ctx, inode, ts)
+	s.observeReadResult(ctx, fskeys.InodeKey(inode), err)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			return elems, readKeys, usageDelta{}, nil, false, nil
@@ -1757,11 +1776,17 @@ func (s *Service) refreshOpenHandleLeaseOnce(ctx context.Context, inode uint64, 
 	if err != nil {
 		return err
 	}
-	if _, err := s.inodeAt(ctx, inode, ts); err != nil {
+	_, err = s.inodeAt(ctx, inode, ts)
+	s.observeReadResult(ctx, fskeys.InodeKey(inode), err)
+	if err != nil {
 		return err
 	}
 	refKey := fskeys.RefKey(inode, clientID, fh)
-	if _, err := s.store.GetAt(ctx, refKey, ts); err != nil {
+	_, err = s.store.GetAt(ctx, refKey, ts)
+	if err == nil || errors.Is(err, store.ErrKeyNotFound) {
+		s.observeReadKey(ctx, refKey)
+	}
+	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return ErrNotFound
 		}
@@ -2016,13 +2041,16 @@ func (s *Service) createNode(
 		return CreateResult{}, err
 	}
 	parentMeta, err := s.inodeAt(ctx, parent, ts)
+	s.observeReadResult(ctx, fskeys.InodeKey(parent), err)
 	if err != nil {
 		return CreateResult{}, err
 	}
 	if parentMeta.Type != TypeDirectory {
 		return CreateResult{}, ErrNotDir
 	}
-	if _, err := s.dirEntryAt(ctx, parent, name, ts); err == nil {
+	_, err = s.dirEntryAt(ctx, parent, name, ts)
+	s.observeReadResult(ctx, fskeys.DirEntryKey(parent, name), err)
+	if err == nil {
 		return CreateResult{}, ErrExists
 	} else if !errors.Is(err, ErrNotFound) {
 		return CreateResult{}, err
@@ -2110,6 +2138,7 @@ func (s *Service) unlink(ctx context.Context, parent uint64, name []byte, direct
 		return err
 	}
 	parentMeta, err := s.inodeAt(ctx, parent, ts)
+	s.observeReadResult(ctx, fskeys.InodeKey(parent), err)
 	if err != nil {
 		return err
 	}
@@ -2117,24 +2146,31 @@ func (s *Service) unlink(ctx context.Context, parent uint64, name []byte, direct
 		return ErrNotDir
 	}
 	entry, err := s.dirEntryAt(ctx, parent, name, ts)
+	s.observeReadResult(ctx, fskeys.DirEntryKey(parent, name), err)
 	if err != nil {
 		return err
 	}
 	meta, err := s.inodeAt(ctx, entry.Inode, ts)
+	s.observeReadResult(ctx, fskeys.InodeKey(entry.Inode), err)
 	if err != nil {
 		return err
 	}
-	if directory {
+	switch {
+	case directory:
 		if meta.Type != TypeDirectory {
 			return ErrNotDir
 		}
 		if err := s.ensureDirectoryEmpty(ctx, entry.Inode, ts); err != nil {
 			return err
 		}
-	} else if meta.Type == TypeDirectory {
+	case meta.Type == TypeDirectory:
 		return ErrIsDir
-	} else if err := s.ensureActiveHomeAt(ctx, meta, ts); err != nil {
-		return err
+	default:
+		err := s.ensureActiveHomeAt(ctx, meta, ts)
+		s.observeHomeRead(ctx, meta.Inode, err)
+		if err != nil {
+			return err
+		}
 	}
 	now := s.now().UnixNano()
 	parentMeta.MtimeNsec = now
@@ -2209,11 +2245,15 @@ func (s *Service) unlinkFileTxnParts(
 		elems, err := s.putUnlinkedFileMeta(meta, now)
 		return elems, [][]byte{homeKey}, usageDelta{}, nil, err
 	}
+	refPrefix := fskeys.RefPrefix(meta.Inode)
+	s.markUnattributableReadForRange(refPrefix, prefixEnd(refPrefix))
 	hasRefs, refReads, err := s.openRefReadKeys(ctx, meta.Inode, ts)
 	if err != nil {
 		return nil, nil, usageDelta{}, nil, err
 	}
 	if !hasRefs {
+		chunkPrefix := fskeys.ChunkPrefix(meta.HomeSlot, meta.Inode)
+		s.markUnattributableReadForRange(chunkPrefix, prefixEnd(chunkPrefix))
 		gcElems, gcReads, delta, plan, err := s.gcFileElems(ctx, meta, ts)
 		if err != nil {
 			return nil, nil, usageDelta{}, nil, err
@@ -2293,6 +2333,9 @@ func (s *Service) truncateTailChunkElems(
 	}
 	tailKey := fskeys.ChunkKey(meta.HomeSlot, meta.Inode, tailIndex)
 	raw, err := s.store.GetAt(ctx, tailKey, ts)
+	if err == nil || errors.Is(err, store.ErrKeyNotFound) {
+		s.observeReadKey(ctx, tailKey)
+	}
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return nil, [][]byte{tailKey}, usageDelta{}, nil
@@ -2320,6 +2363,7 @@ func (s *Service) truncateDeletedChunkElems(
 	if err != nil {
 		return nil, nil, usageDelta{}, nil, errors.Wrap(err, "filesystem scan truncate deleted chunks")
 	}
+	s.markUnattributableReadForRange(start, prefixEnd(fskeys.ChunkPrefix(meta.HomeSlot, meta.Inode)))
 	page, plan := splitChunkDeletePage(page, chunkDeletePlan{
 		homeSlot:        meta.HomeSlot,
 		inode:           meta.Inode,
@@ -2577,13 +2621,16 @@ func (s *Service) cleanupStaleChunksBeforeSizeChange(
 		return 0, nil, false, err
 	}
 	refreshedMeta, err := s.inodeAt(ctx, inode, refreshedTS)
+	s.observeReadResult(ctx, fskeys.InodeKey(inode), err)
 	if err != nil {
 		return 0, nil, false, err
 	}
 	if refreshedMeta.Type == TypeDirectory {
 		return 0, nil, false, ErrIsDir
 	}
-	if err := s.ensureActiveHomeAt(ctx, refreshedMeta, refreshedTS); err != nil {
+	err = s.ensureActiveHomeAt(ctx, refreshedMeta, refreshedTS)
+	s.observeHomeRead(ctx, inode, err)
+	if err != nil {
 		return 0, nil, false, err
 	}
 	return refreshedTS, refreshedMeta, true, nil
@@ -2761,6 +2808,7 @@ func (s *Service) ensureDirectoryEmpty(ctx context.Context, inode uint64, ts uin
 	if err != nil {
 		return errors.Wrap(err, "filesystem scan directory emptiness")
 	}
+	s.markUnattributableReadForRange(fskeys.DirEntryPrefix(inode), prefixEnd(fskeys.DirEntryPrefix(inode)))
 	if len(pairs) > 0 {
 		return ErrNotEmpty
 	}
@@ -2786,6 +2834,7 @@ func (s *Service) hasOtherOpenRefs(ctx context.Context, inode uint64, ts uint64,
 	if err != nil {
 		return false, nil, errors.Wrap(err, "filesystem scan open handle refs")
 	}
+	s.markUnattributableReadForRange(prefix, prefixEnd(prefix))
 	readKeys := make([][]byte, 0, len(pairs))
 	for _, pair := range pairs {
 		readKeys = append(readKeys, pair.Key)

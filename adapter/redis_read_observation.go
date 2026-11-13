@@ -108,6 +108,13 @@ func (r *RedisServer) observeLocalRedisKeys(ctx context.Context, keys [][]byte) 
 	}
 }
 
+func (r *RedisServer) observeBlockingRedisKeys(ctx context.Context, keys [][]byte) {
+	if r == nil || r.coordinator == nil {
+		return
+	}
+	r.observeLocalRedisKeys(ctx, keys)
+}
+
 func (r *RedisServer) redisReadForwarded(direct bool, keys [][]byte) bool {
 	return direct && len(keys) != 0 &&
 		!r.coordinator.IsLeaderForKey(redisUserRouteKey(keys[0]))
