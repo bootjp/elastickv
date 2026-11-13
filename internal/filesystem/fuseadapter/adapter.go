@@ -330,14 +330,23 @@ func (a *Adapter) mutationErrno(err error) syscall.Errno {
 func (a *Adapter) Lookup(ctx context.Context, parent uint64, name []byte) (filesystem.Stat, syscall.Errno) {
 	inode, err := a.core.Resolve(ctx, parent, name)
 	if errno := Errno(err); errno != 0 {
+		if errno == syscall.EIO {
+			slog.WarnContext(ctx, "filesystem FUSE lookup resolve failed", "parent", parent, "name", string(name), "error", err.Error())
+		}
 		return filesystem.Stat{}, errno
 	}
 	stat, err := a.core.GetAttr(ctx, inode)
+	if err != nil && Errno(err) == syscall.EIO {
+		slog.WarnContext(ctx, "filesystem FUSE lookup getattr failed", "parent", parent, "name", string(name), "inode", inode, "error", err.Error())
+	}
 	return stat, Errno(err)
 }
 
 func (a *Adapter) GetAttr(ctx context.Context, inode uint64) (filesystem.Stat, syscall.Errno) {
 	stat, err := a.core.GetAttr(ctx, inode)
+	if err != nil && Errno(err) == syscall.EIO {
+		slog.WarnContext(ctx, "filesystem FUSE getattr failed", "inode", inode, "error", err.Error())
+	}
 	return stat, Errno(err)
 }
 
@@ -432,6 +441,9 @@ func (a *Adapter) openWithOperation(ctx context.Context, inode uint64) (uint64, 
 	}
 	ticket, errno := a.mutations.begin(ctx, inode)
 	if errno != 0 {
+		if errno == syscall.EIO {
+			slog.WarnContext(ctx, "filesystem FUSE open blocked by prior unknown mutation", "inode", inode)
+		}
 		return 0, errno
 	}
 	var err error
@@ -443,7 +455,7 @@ func (a *Adapter) openWithOperation(ctx context.Context, inode uint64) (uint64, 
 	}
 	a.noteUnknownOperation(id, err, inode)
 	if err != nil && Errno(err) == syscall.EIO {
-		slog.WarnContext(ctx, "filesystem FUSE open failed", "inode", inode, "error", err.Error())
+		slog.WarnContext(ctx, "filesystem FUSE open failed", "inode", inode, "sequence", id.Sequence, "error", err.Error())
 	}
 	return fh, a.mutationErrno(err)
 }
@@ -453,6 +465,9 @@ func (a *Adapter) Read(ctx context.Context, inode uint64, fh uint64, offset uint
 		return nil, errno
 	}
 	data, err := a.core.Read(ctx, inode, fh, offset, size)
+	if err != nil && Errno(err) == syscall.EIO {
+		slog.WarnContext(ctx, "filesystem FUSE read failed", "inode", inode, "fh", fh, "offset", offset, "size", size, "error", err.Error())
+	}
 	return data, Errno(err)
 }
 
