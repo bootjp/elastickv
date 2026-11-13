@@ -362,8 +362,21 @@ func (d *DynamoDBServer) proxyToLeader(w http.ResponseWriter, r *http.Request) b
 	return proxyHTTPRequestToLeader(d.coordinator, d.leaderDynamo, dynamoLeaderProxyErrorWriter, w, r)
 }
 
-func dynamoLeaderProxyErrorWriter(w http.ResponseWriter, status int, message string) {
-	writeDynamoError(w, status, dynamoErrInternal, message)
+func dynamoLeaderProxyErrorWriter(w http.ResponseWriter, r *http.Request, failure httpLeaderProxyFailure) {
+	if failure == httpLeaderProxyForwardAttemptFailed && !isReadOnlyDynamoRequest(r) {
+		writeDynamoErrorFromErr(w, kv.ErrTransactionOutcomeUnknown)
+		return
+	}
+	writeDynamoError(w, http.StatusServiceUnavailable, dynamoErrServiceUnavailable, "Service unavailable")
+}
+
+func isReadOnlyDynamoRequest(r *http.Request) bool {
+	switch r.Header.Get("X-Amz-Target") {
+	case describeTableTarget, getItemTarget, listTablesTarget, queryTarget, scanTarget, transactGetItemsTarget:
+		return true
+	default:
+		return false
+	}
 }
 
 func (d *DynamoDBServer) handle(w http.ResponseWriter, r *http.Request) {
