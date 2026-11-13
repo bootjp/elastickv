@@ -59,6 +59,9 @@ func absentKeyCreatorRaces(key string) []absentKeyCreatorRace {
 	sadd := func(ctx context.Context, c *redis.Client) (any, error) {
 		return c.SAdd(ctx, key, "m").Result()
 	}
+	setnx := func(ctx context.Context, c *redis.Client) (any, error) {
+		return c.Do(ctx, "SETNX", key, "s").Result()
+	}
 	evalXAdd := func(ctx context.Context, c *redis.Client) (any, error) {
 		return c.Eval(ctx, "return redis.call('XADD', KEYS[1], '1-1', 'f', 'v')", []string{key}).Result()
 	}
@@ -83,15 +86,38 @@ func absentKeyCreatorRaces(key string) []absentKeyCreatorRace {
 		{name: "EVAL XADD held, RPUSH commits", parked: evalXAdd, winner: commit(rpush)},
 		{name: "PFADD held, SADD commits", parked: pfadd, winner: commit(sadd)},
 		{name: "SADD held, PFADD commits", parked: sadd, winner: commit(pfadd)},
+		// The creators read the string anchor, so a SETNX committing first is
+		// already caught; the reverse order is in
+		// TestRedis_StringCreateDoesNotFenceConcurrentCreate.
+		{name: "XADD held, SETNX commits", parked: xadd, winner: commit(setnx)},
+		{name: "PFADD held, SETNX commits", parked: pfadd, winner: commit(setnx)},
 	}
 }
 
-// physicalEncodings lists every encoding that has rows for key at ts. An HLL
-// or a legacy bare value reports as "string", matching TYPE.
+// physicalEncodings lists every encoding that has rows for key at ts. The
+// string family is split, since TYPE reports all of it as "string": "string"
+// for the string anchor (prefixed or legacy bare) and "hll" for the
+// HyperLogLog anchor, so a string and an HLL under one key count as two.
 func (h *readSetReproHarness) physicalEncodings(t *testing.T, key []byte, ts uint64) []string {
 	t.Helper()
 	var out []string
-	for _, typ := range []redisValueType{redisTypeString, redisTypeList, redisTypeHash, redisTypeSet, redisTypeZSet, redisTypeStream} {
+	for _, anchor := range []struct {
+		name string
+		keys [][]byte
+	}{
+		{name: "string", keys: [][]byte{redisStrKey(key), key}},
+		{name: "hll", keys: [][]byte{redisHLLKey(key)}},
+	} {
+		for _, anchorKey := range anchor.keys {
+			found, err := h.st.ExistsAt(h.ctx, anchorKey, ts)
+			require.NoError(t, err)
+			if found {
+				out = append(out, anchor.name)
+				break
+			}
+		}
+	}
+	for _, typ := range []redisValueType{redisTypeList, redisTypeHash, redisTypeSet, redisTypeZSet, redisTypeStream} {
 		found, err := h.server.probeExpectedType(h.ctx, key, ts, typ)
 		require.NoError(t, err)
 		if found {

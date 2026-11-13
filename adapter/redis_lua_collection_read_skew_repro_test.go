@@ -150,6 +150,169 @@ func luaCollectionReadSkewCases(coll string) []luaCollectionReadSkewCase {
 			stale: "1",
 			fresh: "2",
 		},
+		// Type probes that resolve to a collection (G7): EXISTS / TYPE / PTTL
+		// recorded nothing for a hash, list, set, zset, or stream, so a DEL or
+		// type change committing under the script went unseen.
+		{
+			name: "TYPE of a hash vs DEL and SET",
+			seed: func(ctx context.Context, c *redis.Client) error {
+				return c.HSet(ctx, coll, "f", "v1").Err()
+			},
+			script: "local v=redis.call('TYPE',KEYS[1])['ok']; redis.call('SET',KEYS[2], v); return v",
+			concurrent: luaReadSkewDelThen(coll, func(ctx context.Context, c *redis.Client) error {
+				return c.Set(ctx, coll, "s", 0).Err()
+			}),
+			stale: "hash",
+			fresh: "string",
+		},
+		{
+			name: "TYPE of a zset vs DEL",
+			seed: func(ctx context.Context, c *redis.Client) error {
+				return c.ZAdd(ctx, coll, redis.Z{Score: 1, Member: "m"}).Err()
+			},
+			script:     "local v=redis.call('TYPE',KEYS[1])['ok']; redis.call('SET',KEYS[2], v); return v",
+			concurrent: luaReadSkewDelThen(coll, nil),
+			stale:      "zset",
+			fresh:      "none",
+		},
+		{
+			name: "TYPE of a stream vs DEL",
+			seed: func(ctx context.Context, c *redis.Client) error {
+				return c.XAdd(ctx, &redis.XAddArgs{Stream: coll, ID: "1-1", Values: []any{"f", "v1"}}).Err()
+			},
+			script:     "local v=redis.call('TYPE',KEYS[1])['ok']; redis.call('SET',KEYS[2], v); return v",
+			concurrent: luaReadSkewDelThen(coll, nil),
+			stale:      "stream",
+			fresh:      "none",
+		},
+		{
+			name: "EXISTS of a list vs DEL",
+			seed: func(ctx context.Context, c *redis.Client) error {
+				return c.RPush(ctx, coll, "a").Err()
+			},
+			script:     "local v=redis.call('EXISTS',KEYS[1]); redis.call('SET',KEYS[2], tostring(v)); return v",
+			concurrent: luaReadSkewDelThen(coll, nil),
+			stale:      "1",
+			fresh:      "0",
+		},
+		{
+			name: "PTTL of a set vs DEL",
+			seed: func(ctx context.Context, c *redis.Client) error {
+				return c.SAdd(ctx, coll, "a").Err()
+			},
+			script:     "local v=redis.call('PTTL',KEYS[1]); redis.call('SET',KEYS[2], tostring(v)); return v",
+			concurrent: luaReadSkewDelThen(coll, nil),
+			stale:      "-1",
+			fresh:      "-2",
+		},
+		// WRONGTYPE under pcall (G7): the failed read recorded nothing (or, for
+		// GET, only the string anchors), so a script that caught the error and
+		// wrote committed against a DEL or type change of the key.
+		{
+			name: "pcall GET of a hash vs DEL",
+			seed: func(ctx context.Context, c *redis.Client) error {
+				return c.HSet(ctx, coll, "f", "v1").Err()
+			},
+			script:     luaReadSkewPcallGet,
+			concurrent: luaReadSkewDelThen(coll, nil),
+			stale:      "err",
+			fresh:      "nil",
+		},
+		{
+			// GET records the string key, which the SET rewrites, so this one
+			// is already caught; kept to pin it.
+			name: "pcall GET of a hash vs DEL and SET",
+			seed: func(ctx context.Context, c *redis.Client) error {
+				return c.HSet(ctx, coll, "f", "v1").Err()
+			},
+			script: luaReadSkewPcallGet,
+			concurrent: luaReadSkewDelThen(coll, func(ctx context.Context, c *redis.Client) error {
+				return c.Set(ctx, coll, "s", 0).Err()
+			}),
+			stale: "err",
+			fresh: "s",
+		},
+		{
+			name: "redis.pcall HGET of a string vs DEL and HSET",
+			seed: func(ctx context.Context, c *redis.Client) error {
+				return c.Set(ctx, coll, "s", 0).Err()
+			},
+			script: "local r=redis.pcall('HGET',KEYS[1],'f'); local v; if type(r)=='table' then v='err' else v=r or 'nil' end; " +
+				"redis.call('SET',KEYS[2], v); return v",
+			concurrent: luaReadSkewDelThen(coll, func(ctx context.Context, c *redis.Client) error {
+				return c.HSet(ctx, coll, "f", "v2").Err()
+			}),
+			stale: "err",
+			fresh: "v2",
+		},
+		{
+			name: "pcall LLEN of a set vs DEL",
+			seed: func(ctx context.Context, c *redis.Client) error {
+				return c.SAdd(ctx, coll, "a").Err()
+			},
+			script: "local ok, r = pcall(redis.call, 'LLEN', KEYS[1]); local v = ok and tostring(r) or 'err'; " +
+				"redis.call('SET',KEYS[2], v); return v",
+			concurrent: luaReadSkewDelThen(coll, nil),
+			stale:      "err",
+			fresh:      "0",
+		},
+		// Existence checks that skip the write (G7): SET NX / XX, SETNX, DEL,
+		// PEXPIRE, and RENAME decide on existence through a probe that
+		// recorded nothing, and on the branch that does not write the key the
+		// script's commit validated nothing about it.
+		{
+			name: "SET NX of a string vs DEL",
+			seed: func(ctx context.Context, c *redis.Client) error {
+				return c.Set(ctx, coll, "s", 0).Err()
+			},
+			script:     "local r=redis.call('SET',KEYS[1],'a','NX'); local v = r and 'set' or 'skipped'; redis.call('SET',KEYS[2], v); return v",
+			concurrent: luaReadSkewDelThen(coll, nil),
+			stale:      "skipped",
+			fresh:      "set",
+		},
+		{
+			name: "SETNX of a hash vs DEL",
+			seed: func(ctx context.Context, c *redis.Client) error {
+				return c.HSet(ctx, coll, "f", "v1").Err()
+			},
+			script:     "local r=redis.call('SETNX',KEYS[1],'a'); redis.call('SET',KEYS[2], tostring(r)); return r",
+			concurrent: luaReadSkewDelThen(coll, nil),
+			stale:      "0",
+			fresh:      "1",
+		},
+		{
+			name:       "SET XX of an absent key vs SET",
+			seed:       luaReadSkewWarm,
+			script:     "local r=redis.call('SET',KEYS[1],'a','XX'); local v = r and 'set' or 'skipped'; redis.call('SET',KEYS[2], v); return v",
+			concurrent: luaReadSkewSetColl(coll),
+			stale:      "skipped",
+			fresh:      "set",
+		},
+		{
+			name:       "DEL of an absent key vs SET",
+			seed:       luaReadSkewWarm,
+			script:     "local n=redis.call('DEL',KEYS[1]); redis.call('SET',KEYS[2], tostring(n)); return n",
+			concurrent: luaReadSkewSetColl(coll),
+			stale:      "0",
+			fresh:      "1",
+		},
+		{
+			name:       "PEXPIRE of an absent key vs SET",
+			seed:       luaReadSkewWarm,
+			script:     "local n=redis.call('PEXPIRE',KEYS[1],100000); redis.call('SET',KEYS[2], tostring(n)); return n",
+			concurrent: luaReadSkewSetColl(coll),
+			stale:      "0",
+			fresh:      "1",
+		},
+		{
+			name: "pcall RENAME of an absent key vs SET",
+			seed: luaReadSkewWarm,
+			script: "local ok = pcall(redis.call, 'RENAME', KEYS[1], KEYS[1] .. '-dst'); local v = ok and 'renamed' or 'err'; " +
+				"redis.call('SET',KEYS[2], v); return v",
+			concurrent: luaReadSkewSetColl(coll),
+			stale:      "err",
+			fresh:      "renamed",
+		},
 		{
 			name: "XLEN vs XADD",
 			seed: func(ctx context.Context, c *redis.Client) error {
@@ -162,6 +325,38 @@ func luaCollectionReadSkewCases(coll string) []luaCollectionReadSkewCase {
 			stale: "1",
 			fresh: "2",
 		},
+	}
+}
+
+// luaReadSkewPcallGet GETs KEYS[1] under pcall and SETs KEYS[2] to the value,
+// "nil", or "err" (WRONGTYPE).
+const luaReadSkewPcallGet = "local ok, r = pcall(redis.call, 'GET', KEYS[1]); local v = ok and (r or 'nil') or 'err'; " +
+	"redis.call('SET',KEYS[2], v); return v"
+
+// luaReadSkewDelThen DELs coll and then runs next, if any, as separate
+// commands that all commit while the script is held.
+func luaReadSkewDelThen(coll string, next func(ctx context.Context, c *redis.Client) error) func(ctx context.Context, c *redis.Client) error {
+	return func(ctx context.Context, c *redis.Client) error {
+		if err := c.Del(ctx, coll).Err(); err != nil {
+			return err
+		}
+		if next == nil {
+			return nil
+		}
+		return next(ctx, c)
+	}
+}
+
+// luaReadSkewWarm commits an unrelated key so the script's startTS is a real
+// HLC timestamp when the case has no collection to seed.
+func luaReadSkewWarm(ctx context.Context, c *redis.Client) error {
+	return c.Set(ctx, "g3c-warm", "0", 0).Err()
+}
+
+// luaReadSkewSetColl creates coll as a string.
+func luaReadSkewSetColl(coll string) func(ctx context.Context, c *redis.Client) error {
+	return func(ctx context.Context, c *redis.Client) error {
+		return c.Set(ctx, coll, "s", 0).Err()
 	}
 }
 

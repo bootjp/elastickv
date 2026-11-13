@@ -402,7 +402,9 @@ func newReadSetReproClient(addr string) *redis.Client {
 	})
 }
 
-func newReadSetReproHarness(t *testing.T, raftID string) *readSetReproHarness {
+// newReadSetReproHarness builds the harness; opts are passed to the
+// RedisServer (e.g. WithOnePhaseTxnDedup(false) to exercise the legacy paths).
+func newReadSetReproHarness(t *testing.T, raftID string, opts ...RedisServerOption) *readSetReproHarness {
 	t.Helper()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -426,7 +428,7 @@ func newReadSetReproHarness(t *testing.T, raftID string) *readSetReproHarness {
 	reads := &readSetReproStore{MVCCStore: st, log: log}
 	lis, err := (&net.ListenConfig{}).Listen(ctx, "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
-	server := NewRedisServer(lis, lis.Addr().String(), kv.NewLeaderRoutedStore(reads, coord), coord, nil, nil)
+	server := NewRedisServer(lis, lis.Addr().String(), kv.NewLeaderRoutedStore(reads, coord), coord, nil, nil, opts...)
 	served := make(chan struct{})
 	go func() {
 		defer close(served)
