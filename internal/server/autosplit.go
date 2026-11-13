@@ -22,6 +22,7 @@ var _ serverwiring.Leader = (*kv.ShardedCoordinator)(nil)
 func setupDistributionWatcherAndAutoSplit(
 	ctx context.Context,
 	eg *errgroup.Group,
+	migrationReady adapter.MigrationReadinessGate,
 	catalog *distribution.CatalogStore,
 	engine *distribution.Engine,
 	distServer *adapter.DistributionServer,
@@ -39,6 +40,11 @@ func setupDistributionWatcherAndAutoSplit(
 	cfg.CandidateGroupIDs = groupIDs
 	if cfg.CrossGroupEnabled && len(groupIDs) < 2 {
 		return nil, errors.New("--autoSplitCrossGroup requires at least two configured Raft groups")
+	}
+	if cfg.CrossGroupEnabled {
+		if err := migrationReady.Check(ctx); err != nil {
+			return nil, errors.Wrap(err, "--autoSplitCrossGroup requires local split migration readiness")
+		}
 	}
 	cfg.Observer = observer
 	var runtime adapter.AutoSplitRuntime

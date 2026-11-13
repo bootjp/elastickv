@@ -513,6 +513,9 @@ func (s *S3Server) handle(w http.ResponseWriter, r *http.Request) {
 	if s.maybeProxyToLeader(w, r) {
 		return
 	}
+	if r.Method == http.MethodGet || r.Method == http.MethodHead {
+		kv.MarkUnattributableClientReadThrough(s.coordinator, 0)
+	}
 
 	if authErr := s.resolveAuth(r, bucket); authErr != nil {
 		writeS3Error(w, authErr.Status, authErr.Code, authErr.Message, bucket, objectKey)
@@ -522,9 +525,6 @@ func (s *S3Server) handle(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *S3Server) handleAuthorizedRequest(w http.ResponseWriter, r *http.Request, bucket, objectKey string, hasObject bool) {
-	if r.Method == http.MethodGet || r.Method == http.MethodHead {
-		kv.MarkUnattributableClientReadThrough(s.coordinator, 0)
-	}
 	switch {
 	case bucket == "":
 		s.handleRoot(w, r)
@@ -570,6 +570,7 @@ func (s *S3Server) isAnonymousReadAllowed(r *http.Request, bucket string) bool {
 	readPin := s.pinReadTS(readTS)
 	defer readPin.Release()
 
+	kv.ObserveReadForKeyThrough(s.coordinator, r.Context(), s3keys.BucketMetaKey(bucket))
 	meta, _, err := s.loadBucketMetaAt(r.Context(), bucket, readTS)
 	return err == nil && isPublicReadBucket(meta)
 }
@@ -1989,6 +1990,7 @@ func (s *S3Server) proxyRouteKey(r *http.Request) ([]byte, error) {
 		return s3keys.BucketMetaKey(bucket), nil
 	}
 
+	kv.ObserveReadForKeyThrough(s.coordinator, r.Context(), s3keys.BucketMetaKey(bucket))
 	meta, exists, err := s.loadBucketMetaAt(r.Context(), bucket, s.readTS())
 	if err != nil {
 		return nil, errors.WithStack(err)

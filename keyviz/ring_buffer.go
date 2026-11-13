@@ -116,3 +116,16 @@ func (r *ringBuffer) snapshotOrdered() []MatrixColumn {
 	out = append(out, r.buf[:r.pos]...)
 	return out
 }
+
+// forEach visits retained columns without allocating an ordered copy.
+func (r *ringBuffer) forEach(visit func(MatrixColumn)) {
+	if !r.wrapped {
+		for _, col := range r.buf {
+			visit(col)
+		}
+		return
+	}
+	for i := 0; i < len(r.buf); i++ {
+		visit(r.buf[(r.pos+i)%len(r.buf)])
+	}
+}

@@ -65,6 +65,14 @@ func (r *RedisServer) observeRedisRead(ctx context.Context, name string, args []
 		return
 	}
 	keys := redisReadKeys(name, args)
+	if direct && name == cmdXRead {
+		r.observeLocalXReadKeys(ctx, keys)
+		return
+	}
+	r.observeRedisKeys(ctx, keys, direct)
+}
+
+func (r *RedisServer) observeRedisKeys(ctx context.Context, keys [][]byte, direct bool) {
 	// A direct command may have been forwarded. Its first key determines
 	// the routing target, so do not invoke telemetry on the ingress node.
 	if r.redisReadForwarded(direct, keys) {
@@ -76,6 +84,17 @@ func (r *RedisServer) observeRedisRead(ctx context.Context, name string, args []
 	}
 	for _, key := range keys {
 		kv.ObserveReadForKeyThrough(r.coordinator, ctx, redisUserRouteKey(key))
+	}
+}
+
+// XREAD evaluates each stream at ingress, even when the first stream belongs
+// to another leader. Attribute every locally led stream independently.
+func (r *RedisServer) observeLocalXReadKeys(ctx context.Context, keys [][]byte) {
+	for _, key := range keys {
+		routed := redisUserRouteKey(key)
+		if r.coordinator.IsLeaderForKey(routed) {
+			kv.ObserveReadForKeyThrough(r.coordinator, ctx, routed)
+		}
 	}
 }
 

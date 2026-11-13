@@ -157,6 +157,7 @@ func startDistributionStartup(in distributionStartupInput) (distributionStartup,
 	autoSplitRuntime, err := setupDistributionWatcherAndAutoSplit(
 		in.ctx,
 		in.eg,
+		in.nodeAuth.SplitMigrationLocalReadinessGate,
 		distCatalog,
 		in.cfg.Engine,
 		distServer,

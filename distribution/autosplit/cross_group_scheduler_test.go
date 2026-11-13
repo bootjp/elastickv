@@ -27,14 +27,34 @@ type crossGroupSampler struct {
 	*fakeSampler
 	registered bool
 	covered    bool
+	proofCalls int
 }
 
 func (s *crossGroupSampler) RouteRegistrationCoversWindow(uint64, uint64, []byte, []byte, time.Time, time.Time) bool {
+	s.proofCalls++
 	return s.registered
 }
 
 func (s *crossGroupSampler) ReadCoverageCoversWindow(uint64, time.Time, time.Time) bool {
+	s.proofCalls++
 	return s.covered
+}
+
+func TestSelectCrossGroupTargetsSkipsEvidenceWithoutDecisions(t *testing.T) {
+	start := time.Unix(1_700_000_000, 0)
+	sampler := &crossGroupSampler{fakeSampler: &fakeSampler{step: time.Minute}, registered: true, covered: true}
+	scheduler := &Scheduler{sampler: sampler, cfg: SchedulerConfig{
+		CandidateGroupIDs: []uint64{1, 2},
+	}}
+	prep := tickPreparation{
+		snapshot: distribution.CatalogSnapshot{Routes: []distribution.RouteDescriptor{testRoute(1, 1, "a", "z")}},
+		windows: []ColumnWindow{{Column: keyviz.MatrixColumn{
+			WindowStart: start, At: start.Add(time.Minute),
+			Rows: []keyviz.MatrixRow{{RouteID: 1, RaftGroupID: 1, LeaderTerm: 9, Writes: 1}},
+		}}},
+	}
+	require.Empty(t, scheduler.selectCrossGroupTargets(nil, prep, start.Add(time.Minute)))
+	require.Zero(t, sampler.proofCalls)
 }
 
 func TestSchedulerCrossGroupTargetRequiresCompleteEvidence(t *testing.T) {

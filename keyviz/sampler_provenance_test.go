@@ -86,3 +86,27 @@ func TestCoarsenedRouteHasNoRegistrationProof(t *testing.T) {
 	require.True(t, s.RouteRegistrationCoversWindow(1, 7, []byte("a"), []byte("m"), col.WindowStart, col.At))
 	require.False(t, s.RouteRegistrationCoversWindow(2, 7, []byte("m"), []byte("z"), col.WindowStart, col.At))
 }
+
+func TestCommittedWindowProofAfterHistoryWrap(t *testing.T) {
+	s, clk := newTestSampler(t, MemSamplerOptions{Step: time.Second, HistoryColumns: 2})
+	require.True(t, s.RegisterRoute(1, []byte("a"), []byte("m"), 7))
+	require.True(t, s.RegisterRoute(2, []byte("m"), []byte("z"), 7))
+	s.EnrollReadCoverage(ReadCoverageEnrollment{
+		LocalKeyedReadsObserved: true, ForwardedReadsObserved: true, UnkeyedReadsMarked: true,
+	})
+	for range 3 {
+		clk.Advance(time.Second)
+		s.Flush()
+	}
+	col := lastSnapshotColumn(t, s)
+	proof, ok := s.ProofForCommittedWindow(col.WindowStart, col.At)
+	require.True(t, ok)
+	require.True(t, proof.RouteRegistrationCovers(1, 7, []byte("a"), []byte("m")))
+	require.True(t, proof.RouteRegistrationCovers(2, 7, []byte("m"), []byte("z")))
+	require.True(t, proof.ReadCoverageCovers(1))
+	s.RemoveRoute(2)
+	require.False(t, proof.RouteRegistrationCovers(2, 7, []byte("m"), []byte("z")))
+	s.Flush() // duplicate bounds are ambiguous
+	_, ok = s.ProofForCommittedWindow(col.WindowStart, col.At)
+	require.False(t, ok)
+}

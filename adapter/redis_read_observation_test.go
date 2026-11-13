@@ -114,6 +114,18 @@ func TestRedisReadObservationUsesRoutedKeysAndSkipsIngress(t *testing.T) {
 	require.Empty(t, coord.keys)
 }
 
+func TestRedisReadObservationXReadAttributesLocalStreamAfterRemote(t *testing.T) {
+	remote := redisUserRouteKey([]byte("remote"))
+	local := redisUserRouteKey([]byte("local"))
+	coord := &redisReadObservationCoordinator{notLeader: map[string]bool{string(remote): true}}
+	server := &RedisServer{coordinator: coord}
+	server.observeRedisRead(context.Background(), cmdXRead, [][]byte{
+		[]byte(cmdXRead), []byte("STREAMS"), []byte("remote"), []byte("local"), []byte("0"), []byte("0"),
+	}, true)
+	require.Equal(t, [][]byte{local}, coord.keys)
+	require.Empty(t, coord.marks)
+}
+
 func TestRedisReadObservationAfterDirectHandler(t *testing.T) {
 	coord := &redisReadObservationCoordinator{}
 	server := &RedisServer{coordinator: coord}

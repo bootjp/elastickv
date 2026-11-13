@@ -331,17 +331,61 @@ func (s *MemSampler) readCoverageColumn(start, end time.Time) (MatrixColumn, boo
 	}
 	s.historyMu.Lock()
 	defer s.historyMu.Unlock()
+	return s.committedColumnLocked(start, end)
+}
+
+// CommittedWindowProof holds the immutable metadata of one retained window.
+// Route registration is checked against current registrations on each use.
+type CommittedWindowProof struct {
+	sampler              *MemSampler
+	windowStart          time.Time
+	openRouteSeq         uint64
+	readCoverageComplete bool
+	unattributableReads  map[uint64]bool
+}
+
+// ProofForCommittedWindow resolves an exact window once for route admission.
+func (s *MemSampler) ProofForCommittedWindow(start, end time.Time) (CommittedWindowProof, bool) {
+	col, ok := s.readCoverageColumn(start, end)
+	if !ok {
+		return CommittedWindowProof{}, false
+	}
+	return CommittedWindowProof{
+		sampler: s, windowStart: start, openRouteSeq: col.openRouteSeq,
+		readCoverageComplete: col.readCoverageComplete,
+		unattributableReads:  col.unattributableReads,
+	}, true
+}
+
+func (p CommittedWindowProof) RouteRegistrationCovers(routeID, groupID uint64, start, end []byte) bool {
+	if p.sampler == nil {
+		return false
+	}
+	p.sampler.routesMu.Lock()
+	defer p.sampler.routesMu.Unlock()
+	reg, ok := p.sampler.routeRegistrations[routeID]
+	return ok && reg.matchesWindowStart(groupID, start, end, p.windowStart) && reg.sequence <= p.openRouteSeq
+}
+
+func (p CommittedWindowProof) ReadCoverageCovers(routeID uint64) bool {
+	return p.sampler != nil && p.readCoverageComplete &&
+		!p.unattributableReads[0] && !p.unattributableReads[routeID]
+}
+
+// committedColumnLocked must be called with historyMu held.
+func (s *MemSampler) committedColumnLocked(start, end time.Time) (MatrixColumn, bool) {
 	var found MatrixColumn
 	matched := false
-	for _, col := range s.history.snapshotOrdered() {
+	duplicate := false
+	s.history.forEach(func(col MatrixColumn) {
 		if col.WindowStart.Equal(start) && col.At.Equal(end) {
 			if matched {
-				return MatrixColumn{}, false
+				duplicate = true
 			}
 			found, matched = col, true
 		}
-	}
-	return found, matched
+	})
+	return found, matched && !duplicate
 }
 
 // retiredSlot tracks a removed slot through its post-removal grace
@@ -1418,18 +1462,8 @@ func (s *MemSampler) RouteRegistrationCoversWindow(routeID, groupID uint64, star
 	}
 	s.historyMu.Lock()
 	defer s.historyMu.Unlock()
-	matched := false
-	covered := false
-	for _, col := range s.history.snapshotOrdered() {
-		if col.WindowStart.Equal(windowStart) && col.At.Equal(windowEnd) {
-			if matched {
-				return false
-			}
-			matched = true
-			covered = reg.sequence <= col.openRouteSeq
-		}
-	}
-	return matched && covered
+	col, ok := s.committedColumnLocked(windowStart, windowEnd)
+	return ok && reg.sequence <= col.openRouteSeq
 }
 
 func (r routeRegistration) matches(groupID uint64, start, end []byte) bool {

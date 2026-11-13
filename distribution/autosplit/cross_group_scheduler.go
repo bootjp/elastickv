@@ -14,6 +14,9 @@ func (s *Scheduler) prepareCrossGroupTick(prep *tickPreparation, now time.Time, 
 }
 
 func (s *Scheduler) selectCrossGroupTargets(decisions []Decision, prep tickPreparation, now time.Time) []Decision {
+	if len(decisions) == 0 {
+		return decisions
+	}
 	registrations, ok := s.sampler.(RouteWindowRegistration)
 	if !ok || len(prep.windows) == 0 || len(s.cfg.CandidateGroupIDs) == 0 {
 		return decisions
