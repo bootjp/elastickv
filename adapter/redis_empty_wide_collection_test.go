@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/store"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 )
@@ -46,6 +47,20 @@ func TestRedis_EmptyWideCollectionIsAbsentBeforeCompaction(t *testing.T) {
 			require.True(t, created)
 		})
 	}
+}
+
+func TestRedis_ZSetProbeIgnoresZeroLengthMetadata(t *testing.T) {
+	ctx := context.Background()
+	server, st := newRedisStorageMigrationTestServer(t)
+	key := []byte("empty-wide:metadata-only-zset")
+	require.NoError(t, st.PutAt(ctx, store.ZSetMetaKey(key), store.MarshalZSetMeta(store.ZSetMeta{}), 1, 0))
+
+	memberless, err := server.zsetMetaOrDeltaExistsAt(ctx, key, 2)
+	require.NoError(t, err)
+	require.False(t, memberless)
+	typ, _, err := server.rawZSetPhysTypeAt(ctx, key, 2)
+	require.NoError(t, err)
+	require.Equal(t, redisTypeNone, typ)
 }
 
 func TestRedis_EmptyWideCollectionRecreateDropsOldTTL(t *testing.T) {
