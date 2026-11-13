@@ -2857,7 +2857,9 @@ func (s *Service) allocateInode(ctx context.Context, ts uint64) (uint64, error) 
 			}
 			continue
 		}
-		if _, err := s.inodeAt(ctx, inode, ts); errors.Is(err, ErrNotFound) {
+		_, err = s.inodeAt(ctx, inode, ts)
+		s.observeReadResult(ctx, fskeys.InodeKey(inode), err)
+		if errors.Is(err, ErrNotFound) {
 			return inode, nil
 		} else if err != nil {
 			return 0, err

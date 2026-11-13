@@ -114,6 +114,19 @@ func TestServiceReadObservationFailedMkdir(t *testing.T) {
 	}, observer.keys)
 }
 
+func TestServiceReadObservationCreateChecksAllocatedInode(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	observer := &recordingReadObserver{leader: true}
+	svc := newTestServiceWithOptions(t, []uint64{2}, WithReadObserver(observer))
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	observer.reset()
+
+	file, err := svc.Create(ctx, RootInode, []byte("file"), CreateOptions{Mode: testFileMode})
+	require.NoError(t, err)
+	require.Contains(t, observer.keys, fskeys.InodeKey(file.Inode))
+}
+
 func TestServiceReadObservationScansAndBound(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
