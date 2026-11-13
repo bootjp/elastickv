@@ -1214,7 +1214,17 @@ func (t *txnContext) stagedKeyType(key []byte) (redisValueType, error) {
 		return redisTypeNone, nil
 	}
 	t.trackTypeReadKeys(key)
-	return t.server.keyTypeAt(t.ctxOrBackground(), key, t.startTS)
+	typ, err := t.server.keyTypeAt(t.ctxOrBackground(), key, t.startTS)
+	if err != nil {
+		return typ, err
+	}
+	if typ == redisTypeNone {
+		// The nine type anchors miss a wide-column list / hash / set / zset
+		// create, which writes only its own rows and its fence; with the
+		// four fences the read set is the thirteen-key absent set.
+		t.trackWideCollectionFenceReads(key)
+	}
+	return typ, nil
 }
 
 func (t *txnContext) stagedPositiveKeyType(key string) (redisValueType, bool) {

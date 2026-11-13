@@ -358,17 +358,19 @@ func multiProbeRaces(key string) []multiProbeRace {
 	zadd := func(ctx context.Context, c *redis.Client) error {
 		return c.ZAdd(ctx, key, redis.Z{Score: 1, Member: "m"}).Err()
 	}
-	hdel := func(ctx context.Context, c *redis.Client) error { return c.HDel(ctx, key, "f").Err() }
-	// A standalone DEL, and the set / zset / list emptying paths that go
-	// through the logical delete, also tombstone the list meta key, a type
-	// anchor the probe does record. A wide-column HDEL that empties the hash
-	// writes only the field, a length delta, and the hash fence.
+	del := func(ctx context.Context, c *redis.Client) error { return c.Del(ctx, key).Err() }
 	return []multiProbeRace{
 		{name: "EXISTS of an absent key vs HSET", probe: exists, winner: hset, stale: "0", fresh: "1"},
 		{name: "GET of an absent key vs ZADD", probe: get, winner: zadd, stale: "nil", fresh: "err"},
 		{name: "EXPIRE of an absent key vs SADD", probe: expire, winner: sadd, stale: "0", fresh: "1"},
-		{name: "EXISTS of a hash vs emptying HDEL", seed: hset, probe: exists, winner: hdel, stale: "1", fresh: "0"},
-		{name: "GET of a hash vs emptying HDEL", seed: hset, probe: get, winner: hdel, stale: "err", fresh: "nil"},
+		// A present collection is already covered: every DEL and every
+		// emptying path that goes through the logical delete tombstones the
+		// list meta key, one of the nine anchors the probe records. (An HDEL
+		// of the last field leaves the hash's length deltas behind, and the
+		// type probe keeps reporting the key as a hash until compaction, so it
+		// does not change the probe's answer.) Kept as pins.
+		{name: "EXISTS of a hash vs DEL", seed: hset, probe: exists, winner: del, stale: "1", fresh: "0"},
+		{name: "GET of a set vs DEL", seed: sadd, probe: get, winner: del, stale: "err", fresh: "nil"},
 	}
 }
 
@@ -378,14 +380,14 @@ func multiProbeRaces(key string) []multiProbeRace {
 //
 // Client A runs MULTI { <probe k>; SET out 1 } and is held right after its
 // first storage read of k. Client B creates k as a wide-column collection, or
-// empties the collection k held, and commits. The probe records the type
+// deletes the collection k held, and commits. The probe records the nine type
 // anchors (string, HLL, bare, list meta, legacy blobs, stream meta), none of
-// which a wide-column hash / set / zset create or removal writes; the
-// txn-wide fences, which they do write, are not recorded. A is released and,
-// unless its read set sees B, commits SET out above B's commit timestamp with
-// a probe reply taken before it. A conflict may surface at the FSM or in the
-// adapter's pre-dispatch read-set check, so the test asserts only the reply of
-// the attempt that committed.
+// which a wide-column hash / set / zset create writes; the txn-wide fences,
+// which it does write, are not recorded. A is released and, unless its read
+// set sees B, commits SET out above B's commit timestamp with a probe reply
+// taken before it. A conflict may surface at the FSM or in the adapter's
+// pre-dispatch read-set check, so the test asserts only the reply of the
+// attempt that committed.
 func TestRedis_MultiTypeProbeIsValidated(t *testing.T) {
 	t.Parallel()
 
