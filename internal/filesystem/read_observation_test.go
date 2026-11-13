@@ -69,6 +69,10 @@ func TestServiceReadObservationPointReads(t *testing.T) {
 	require.Empty(t, observer.marks)
 
 	observer.reset()
+	_, err = svc.Read(ctx, RootInode, 0, 0, 1)
+	require.ErrorIs(t, err, ErrIsDir)
+	require.Equal(t, [][]byte{fskeys.InodeKey(RootInode)}, observer.keys)
+	observer.reset()
 	observer.leader = false
 	_, err = svc.GetAttr(ctx, file.Inode)
 	require.NoError(t, err)
@@ -119,7 +123,7 @@ func TestServiceReadObservationScansAndBound(t *testing.T) {
 	observer.reset()
 	_, err = svc.Read(ctx, file.Inode, file.FH, 0, maxObservedReadKeys)
 	require.NoError(t, err)
-	require.Empty(t, observer.keys)
+	require.Equal(t, [][]byte{fskeys.InodeKey(file.Inode)}, observer.keys)
 	require.Equal(t, []uint64{0}, observer.marks)
 
 	observer.reset()

@@ -123,7 +123,44 @@ func TestRedisReadObservationXReadAttributesLocalStreamAfterRemote(t *testing.T)
 		[]byte(cmdXRead), []byte("STREAMS"), []byte("remote"), []byte("local"), []byte("0"), []byte("0"),
 	}, true)
 	require.Equal(t, [][]byte{local}, coord.keys)
-	require.Empty(t, coord.marks)
+	require.Equal(t, []uint64{0}, coord.marks)
+}
+
+func TestRedisReadObservationMultiKeyIngressAttributesLocalAfterRemote(t *testing.T) {
+	remote := redisUserRouteKey([]byte("remote"))
+	local := redisUserRouteKey([]byte("local"))
+	for _, name := range []string{cmdExists, cmdDel} {
+		t.Run(name, func(t *testing.T) {
+			coord := &redisReadObservationCoordinator{notLeader: map[string]bool{string(remote): true}}
+			server := &RedisServer{coordinator: coord}
+			server.dispatchCommandDirect(&recordingConn{}, name, func(redcon.Conn, redcon.Command) {}, redcon.Command{
+				Args: [][]byte{[]byte(name), []byte("remote"), []byte("local")},
+			}, time.Now())
+			require.Equal(t, [][]byte{local}, coord.keys)
+			require.Equal(t, []uint64{0}, coord.marks)
+		})
+	}
+}
+
+func TestRedisReadObservationExistsHandlerRemoteFirst(t *testing.T) {
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	defer st.Close()
+	for _, key := range []string{"remote", "local"} {
+		require.NoError(t, st.PutAt(ctx, redisStrKey([]byte(key)), encodeRedisStr([]byte("value"), nil), 1, 0))
+	}
+	remote := redisUserRouteKey([]byte("remote"))
+	local := redisUserRouteKey([]byte("local"))
+	coord := &redisReadObservationCoordinator{notLeader: map[string]bool{string(remote): true}}
+	server := &RedisServer{coordinator: coord, store: st}
+	conn := &recordingConn{}
+	server.dispatchCommandDirect(conn, cmdExists, server.exists, redcon.Command{
+		Args: [][]byte{[]byte(cmdExists), []byte("remote"), []byte("local")},
+	}, time.Now())
+	require.Empty(t, conn.err)
+	require.Equal(t, int64(2), conn.int)
+	require.Equal(t, [][]byte{local}, coord.keys)
+	require.Equal(t, []uint64{0}, coord.marks)
 }
 
 func TestRedisReadObservationAfterDirectHandler(t *testing.T) {
@@ -166,12 +203,14 @@ func TestRedisReadObservationCrossLeaderMultiKeyMarksGlobal(t *testing.T) {
 		Args: [][]byte{[]byte(cmdExists), []byte("a"), []byte("b")},
 	}, time.Now())
 	require.Equal(t, []uint64{0}, coord.marks)
-	require.Empty(t, coord.keys)
+	require.Equal(t, [][]byte{redisUserRouteKey([]byte("a"))}, coord.keys)
 
 	coord.notLeader[string(redisUserRouteKey([]byte("a")))] = true
 	coord.marks = nil
+	coord.keys = nil
 	server.observeRedisRead(context.Background(), cmdExists, [][]byte{[]byte(cmdExists), []byte("a"), []byte("b")}, true)
-	require.Empty(t, coord.marks, "forwarded ingress must not mark")
+	require.Equal(t, []uint64{0}, coord.marks, "EXISTS probes both keys at ingress")
+	require.Empty(t, coord.keys)
 }
 
 func TestRedisReadObservationInsideLua(t *testing.T) {

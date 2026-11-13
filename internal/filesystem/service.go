@@ -735,17 +735,14 @@ func (s *Service) Read(ctx context.Context, inode uint64, _ uint64, offset uint6
 		return nil, err
 	}
 	meta, err := s.inodeAt(ctx, inode, ts)
+	s.observeReadKey(ctx, fskeys.InodeKey(inode))
 	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			s.observeReadKey(ctx, fskeys.InodeKey(inode))
-		}
 		return nil, err
 	}
 	if meta.Type == TypeDirectory {
 		return nil, ErrIsDir
 	}
 	if offset >= meta.Size || size == 0 {
-		s.observeReadKey(ctx, fskeys.InodeKey(inode))
 		return []byte{}, nil
 	}
 	end := boundedEnd(offset, size, meta.Size)
@@ -763,9 +760,7 @@ func (s *Service) Read(ctx context.Context, inode uint64, _ uint64, offset uint6
 	last := (end - 1) / chunkSize
 	// A large read cannot be represented by a bounded set of point keys.
 	observeKeys := last-first < maxObservedReadKeys-1
-	if observeKeys {
-		s.observeReadKey(ctx, fskeys.InodeKey(inode))
-	} else {
+	if !observeKeys {
 		s.markUnattributableReadForRange(
 			fskeys.ChunkKey(home, inode, first), scanCursorAfter(fskeys.ChunkKey(home, inode, last)),
 			fskeys.InodeKey(inode),

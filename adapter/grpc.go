@@ -246,8 +246,8 @@ func (r *GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.Raw
 	} else {
 		v, err = r.store.GetAt(ctx, req.Key, readTS)
 	}
+	r.observeGRPCPointRead(ctx, req.GetKey(), req.GetGroupId())
 	if errors.Is(err, store.ErrKeyNotFound) {
-		r.observeGRPCPointRead(ctx, req.GetKey(), req.GetGroupId())
 		return &pb.RawGetResponse{Value: nil, Exists: false}, nil
 	}
 	if errors.Is(err, store.ErrReadTSCompacted) {
@@ -256,8 +256,6 @@ func (r *GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.Raw
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	r.observeGRPCPointRead(ctx, req.GetKey(), req.GetGroupId())
-
 	r.log.InfoContext(ctx, "Get",
 		slog.String("key", string(req.Key)),
 		slog.String("value", string(v)))
@@ -475,6 +473,7 @@ func (r *GRPCServer) RawScanAt(ctx context.Context, req *pb.RawScanAtRequest) (*
 	if req.GetKeysOnly() {
 		keys, err := r.rawScanKeysAt(ctx, req, limit, readTS)
 		if err != nil {
+			r.markGRPCScanRead(req.GetGroupId(), req.GetStartKey(), req.GetEndKey(), nil)
 			return rawScanErrorResponse(err)
 		}
 		r.markGRPCScanRead(req.GetGroupId(), req.GetStartKey(), req.GetEndKey(), keys)
@@ -483,6 +482,7 @@ func (r *GRPCServer) RawScanAt(ctx context.Context, req *pb.RawScanAtRequest) (*
 
 	res, err := r.rawScanAt(ctx, req, limit, readTS)
 	if err != nil {
+		r.markGRPCScanRead(req.GetGroupId(), req.GetStartKey(), req.GetEndKey(), nil)
 		return rawScanErrorResponse(err)
 	}
 	r.markGRPCScanRead(req.GetGroupId(), req.GetStartKey(), req.GetEndKey(), storeKeysFromKVPairs(res))
@@ -818,17 +818,15 @@ func (r *GRPCServer) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetRespon
 
 	readTS := globalSnapshotTS(ctx, r.clock(), r.store)
 	v, err := r.store.GetAt(ctx, req.Key, readTS)
+	r.observeGRPCPointRead(ctx, req.GetKey(), 0)
 	if err != nil {
 		switch {
 		case errors.Is(err, store.ErrKeyNotFound):
-			r.observeGRPCPointRead(ctx, req.GetKey(), 0)
 			return &pb.GetResponse{Value: nil}, nil
 		default:
 			return nil, errors.WithStack(err)
 		}
 	}
-	r.observeGRPCPointRead(ctx, req.GetKey(), 0)
-
 	r.log.InfoContext(ctx, "Get",
 		slog.String("key", string(req.Key)),
 		slog.String("value", string(v)))
@@ -881,6 +879,7 @@ func (r *GRPCServer) Scan(ctx context.Context, req *pb.ScanRequest) (*pb.ScanRes
 	readTS := globalSnapshotTS(ctx, r.clock(), r.store)
 	res, err := r.store.ScanAt(ctx, req.StartKey, req.EndKey, limit, readTS)
 	if err != nil {
+		r.markGRPCScanRead(0, req.GetStartKey(), req.GetEndKey(), nil)
 		return &pb.ScanResponse{
 			Kv: nil,
 		}, errors.WithStack(err)

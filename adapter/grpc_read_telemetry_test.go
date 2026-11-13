@@ -3,6 +3,7 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/bootjp/elastickv/kv"
@@ -118,6 +119,41 @@ func TestGRPCReadTelemetryScans(t *testing.T) {
 type grpcReadRangeStore struct {
 	store.MVCCStore
 	targets []kv.ReadFenceTarget
+}
+
+type grpcReadErrorStore struct{ store.MVCCStore }
+
+func (grpcReadErrorStore) GetAt(context.Context, []byte, uint64) ([]byte, error) {
+	return nil, store.ErrReadTSCompacted
+}
+
+func (grpcReadErrorStore) ScanAt(context.Context, []byte, []byte, int, uint64) ([]*store.KVPair, error) {
+	return nil, errors.New("scan failed")
+}
+
+func (grpcReadErrorStore) ScanKeysAt(context.Context, []byte, []byte, int, uint64) ([][]byte, error) {
+	return nil, errors.New("scan keys failed")
+}
+
+func TestGRPCReadTelemetryStoreErrors(t *testing.T) {
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	defer st.Close()
+	coord := &grpcReadTelemetryCoordinator{}
+	srv := NewGRPCServer(grpcReadErrorStore{MVCCStore: st}, coord)
+
+	_, err := srv.RawGet(ctx, &pb.RawGetRequest{Key: []byte("key"), Ts: 1})
+	require.Error(t, err)
+	_, err = srv.Get(ctx, &pb.GetRequest{Key: []byte("key")})
+	require.Error(t, err)
+	for _, keysOnly := range []bool{false, true} {
+		_, err = srv.RawScanAt(ctx, &pb.RawScanAtRequest{StartKey: []byte("a"), EndKey: []byte("z"), Limit: 2, Ts: 1, KeysOnly: keysOnly})
+		require.Error(t, err)
+	}
+	_, err = srv.Scan(ctx, &pb.ScanRequest{StartKey: []byte("a"), EndKey: []byte("z"), Limit: 2})
+	require.Error(t, err)
+	require.Equal(t, [][]byte{[]byte("key"), []byte("key")}, coord.keys)
+	require.Equal(t, []uint64{0, 0, 0}, coord.marks)
 }
 
 func (s grpcReadRangeStore) ReadFenceTargetsForRange([]byte, []byte) []kv.ReadFenceTarget {
