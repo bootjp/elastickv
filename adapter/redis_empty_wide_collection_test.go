@@ -152,6 +152,67 @@ func TestRedis_MultiRecreateEmptyHashDropsOldTTL(t *testing.T) {
 	require.Equal(t, int64(1), client.ZCard(ctx, key).Val())
 }
 
+func TestRedis_MultiListRecreateEmptyHashDropsOldTTL(t *testing.T) {
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	ctx := context.Background()
+	client := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = client.Close() }()
+
+	key := "empty-wide:multi-list-from-hash"
+	require.NoError(t, client.HSet(ctx, key, "field", "value").Err())
+	require.NoError(t, client.Expire(ctx, key, time.Minute).Err())
+	require.NoError(t, client.HDel(ctx, key, "field").Err())
+	pipe := client.TxPipeline()
+	pipe.RPush(ctx, key, "item")
+	_, err := pipe.Exec(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []string{"item"}, client.LRange(ctx, key, 0, -1).Val())
+	require.Equal(t, time.Duration(-1), client.TTL(ctx, key).Val())
+}
+
+func TestRedis_MultiListRecreateEmptyHashWithoutTTL(t *testing.T) {
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	ctx := context.Background()
+	client := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = client.Close() }()
+
+	key := "empty-wide:multi-list-from-hash-no-ttl"
+	require.NoError(t, client.HSet(ctx, key, "field", "value").Err())
+	require.NoError(t, client.HDel(ctx, key, "field").Err())
+	pipe := client.TxPipeline()
+	pipe.RPush(ctx, key, "item")
+	_, err := pipe.Exec(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []string{"item"}, client.LRange(ctx, key, 0, -1).Val())
+	exists, err := nodes[0].redisServer.store.ExistsAt(ctx, store.HashMetaKey([]byte(key)), math.MaxUint64)
+	require.NoError(t, err)
+	require.False(t, exists)
+	delta, err := nodes[0].redisServer.prefixExistsAt(ctx, store.HashMetaDeltaScanPrefix([]byte(key)), math.MaxUint64)
+	require.NoError(t, err)
+	require.False(t, delta)
+}
+
+func TestRedis_MultiListRecreateExpiredZSet(t *testing.T) {
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	ctx := context.Background()
+	client := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = client.Close() }()
+
+	key := "empty-wide:multi-list-from-expired-zset"
+	require.NoError(t, client.ZAdd(ctx, key, redis.Z{Score: 1, Member: "member"}).Err())
+	require.NoError(t, client.PExpire(ctx, key, time.Millisecond).Err())
+	time.Sleep(10 * time.Millisecond)
+	pipe := client.TxPipeline()
+	pipe.RPush(ctx, key, "item")
+	_, err := pipe.Exec(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []string{"item"}, client.LRange(ctx, key, 0, -1).Val())
+	require.Equal(t, "list", client.Type(ctx, key).Val())
+}
+
 func TestRedis_EmptyWideCollectionRecreateDropsOldTTL(t *testing.T) {
 	nodes, _, _ := createNode(t, 1)
 	defer shutdown(nodes)

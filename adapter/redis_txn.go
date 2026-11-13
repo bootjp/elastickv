@@ -1617,6 +1617,12 @@ func (t *txnContext) prepareListWrite(key []byte) (redisResult, bool, error) {
 	if expired {
 		t.listStates[string(key)] = &listTxnState{appends: [][]byte{}}
 	}
+	// An empty collection may still have a live TTL index. A newly created
+	// list must not inherit it; the old wide rows are removed at dispatch.
+	if ttlSt, ok := t.ttlStates[string(key)]; ok && ttlSt.value != nil {
+		ttlSt.value = nil
+		ttlSt.dirty = true
+	}
 	return redisResult{}, false, nil
 }
 
@@ -2049,8 +2055,7 @@ func (t *txnContext) prepareDispatch() (preparedTxnDispatch, error) {
 		cancel()
 		return preparedTxnDispatch{cancel: func() {}}, errors.WithStack(err)
 	}
-	listElems := t.buildListElems(commitTS)
-	zsetElems, err := t.buildZSetElems(commitTS)
+	collectionWriteElems, err := t.buildCollectionWriteElems(ctx, commitTS)
 	if err != nil {
 		cancel()
 		return preparedTxnDispatch{cancel: func() {}}, err
@@ -2074,8 +2079,7 @@ func (t *txnContext) prepareDispatch() (preparedTxnDispatch, error) {
 		return preparedTxnDispatch{cancel: func() {}}, err
 	}
 
-	elems = append(elems, listElems...)
-	elems = append(elems, zsetElems...)
+	elems = append(elems, collectionWriteElems...)
 	elems = append(elems, hashElems...)
 	elems = append(elems, collectionTTLElems...)
 	elems = append(elems, ttlElems...)
@@ -2092,6 +2096,19 @@ func (t *txnContext) prepareDispatch() (preparedTxnDispatch, error) {
 		ctx:      ctx,
 		cancel:   cancel,
 	}, nil
+}
+
+func (t *txnContext) buildCollectionWriteElems(ctx context.Context, commitTS uint64) ([]*kv.Elem[kv.OP], error) {
+	zsetElems, err := t.buildZSetElems(commitTS)
+	if err != nil {
+		return nil, err
+	}
+	listCleanupElems, err := t.buildListRecreateCleanupElems(ctx)
+	if err != nil {
+		return nil, err
+	}
+	zsetElems = append(zsetElems, listCleanupElems...)
+	return append(zsetElems, t.buildListElems(commitTS)...), nil
 }
 
 func (t *txnContext) dispatchContext() (context.Context, context.CancelFunc) {
@@ -2359,6 +2376,21 @@ func (t *txnContext) buildListElems(commitTS uint64) []*kv.Elem[kv.OP] {
 		}
 	}
 	return elems
+}
+
+func (t *txnContext) buildListRecreateCleanupElems(ctx context.Context) ([]*kv.Elem[kv.OP], error) {
+	var elems []*kv.Elem[kv.OP]
+	for key, st := range t.listStates {
+		if st.deleted || st.metaExists || len(st.appends) == 0 || t.hasReplacement([]byte(key)) {
+			continue
+		}
+		cleanup, _, err := t.server.expiredCollectionCleanupForRecreate(ctx, []byte(key), t.startTS, redisTypeNone, redisTypeList)
+		if err != nil {
+			return nil, err
+		}
+		elems = append(elems, cleanup...)
+	}
+	return elems, nil
 }
 
 func (t *txnContext) appendListStateElems(elems []*kv.Elem[kv.OP], userKey []byte, st *listTxnState, commitTS uint64, seqInTxn uint32) ([]*kv.Elem[kv.OP], bool) {
