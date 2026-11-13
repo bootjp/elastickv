@@ -48,6 +48,7 @@ var upperLayers = []string{
 	"internal/leaderbalance",
 	"internal/nodeauth",
 	"internal/noderuntime",
+	"internal/server",
 	"internal/serverwiring",
 	"internal/snapshotoffload",
 	"internal/snapshotoffloadwiring",
@@ -120,7 +121,7 @@ var layerRules = []layerRule{
 	},
 	{
 		Dir:  "adapter",
-		Deny: []string{"proxy", "internal/adminbridge", "internal/serverwiring", "internal/snapshotoffload", "internal/noderuntime", "internal/nodeauth", "internal/encryptionwiring", "internal/clusterbootstrap"},
+		Deny: []string{"proxy", "internal/adminbridge", "internal/serverwiring", "internal/snapshotoffload", "internal/noderuntime", "internal/nodeauth", "internal/encryptionwiring", "internal/clusterbootstrap", "internal/server"},
 		Why:  "protocol adapters must not depend on binary wiring",
 	},
 }
@@ -129,20 +130,26 @@ var layerRules = []layerRule{
 var restrictedPackages = []restrictedPackage{
 	{
 		Pkg:         "internal/raftengine/etcd",
-		AllowedFrom: []string{".", "cmd", "internal/raftengine", "internal/snapshotoffload", "internal/encryptionwiring", "internal/clusterbootstrap"},
+		AllowedFrom: []string{"internal/server", "cmd", "internal/raftengine", "internal/snapshotoffload", "internal/encryptionwiring", "internal/clusterbootstrap"},
 		Why:         "the concrete Raft backend is chosen at the wiring edge; everything else uses internal/raftengine",
 	},
-	{Pkg: "internal/serverwiring", AllowedFrom: []string{".", "cmd"}, Why: "server wiring is for binaries only"},
-	{Pkg: "internal/adminbridge", AllowedFrom: []string{".", "cmd"}, Why: "admin bridges are wired by binaries only"},
-	{Pkg: "internal/noderuntime", AllowedFrom: []string{".", "cmd", "internal/encryptionwiring", "internal/clusterbootstrap"}, Why: "node runtime configuration is resolved by binaries and the wiring layers above it"},
-	{Pkg: "internal/leaderbalance", AllowedFrom: []string{".", "cmd"}, Why: "the leader-balance scheduler is started by binaries only"},
-	{Pkg: "internal/fsmount", AllowedFrom: []string{".", "cmd"}, Why: "the FUSE mount is started by binaries only"},
-	{Pkg: "internal/encryptionwiring", AllowedFrom: []string{".", "cmd", "internal/clusterbootstrap"}, Why: "encryption wiring is assembled by binaries and protected bootstrap"},
-	{Pkg: "internal/clusterbootstrap", AllowedFrom: []string{".", "cmd"}, Why: "protected bootstrap is assembled by binaries only"},
-	{Pkg: "internal/snapshotoffloadwiring", AllowedFrom: []string{".", "cmd"}, Why: "snapshot offload start-up is wired by binaries only"},
-	{Pkg: "internal/tsowiring", AllowedFrom: []string{".", "cmd"}, Why: "TSO wiring is configured by binaries only"},
-	{Pkg: "internal/nodeauth", AllowedFrom: []string{".", "cmd", "internal/clusterbootstrap"}, Why: "node and admin gRPC authentication is configured by binaries only"},
+	{Pkg: "internal/serverwiring", AllowedFrom: []string{"internal/server", "cmd"}, Why: "server wiring is for binaries only"},
+	{Pkg: "internal/adminbridge", AllowedFrom: []string{"internal/server", "cmd"}, Why: "admin bridges are wired by binaries only"},
+	{Pkg: "internal/noderuntime", AllowedFrom: []string{"internal/server", "cmd", "internal/encryptionwiring", "internal/clusterbootstrap"}, Why: "node runtime configuration is resolved by binaries and the wiring layers above it"},
+	{Pkg: "internal/leaderbalance", AllowedFrom: []string{"internal/server", "cmd"}, Why: "the leader-balance scheduler is started by binaries only"},
+	{Pkg: "internal/fsmount", AllowedFrom: []string{"internal/server", "cmd"}, Why: "the FUSE mount is started by binaries only"},
+	{Pkg: "internal/encryptionwiring", AllowedFrom: []string{"internal/server", "cmd", "internal/clusterbootstrap"}, Why: "encryption wiring is assembled by binaries and protected bootstrap"},
+	{Pkg: "internal/clusterbootstrap", AllowedFrom: []string{"internal/server", "cmd"}, Why: "protected bootstrap is assembled by binaries only"},
+	{Pkg: "internal/snapshotoffloadwiring", AllowedFrom: []string{"internal/server", "cmd"}, Why: "snapshot offload start-up is wired by binaries only"},
+	{Pkg: "internal/tsowiring", AllowedFrom: []string{"internal/server", "cmd"}, Why: "TSO wiring is configured by binaries only"},
+	{Pkg: "internal/nodeauth", AllowedFrom: []string{"internal/server", "cmd", "internal/clusterbootstrap"}, Why: "node and admin gRPC authentication is configured by binaries only"},
+	{Pkg: "internal/server", AllowedFrom: []string{"."}, Why: "the server assembly is started by the root binary only"},
 }
+
+// rootImports are the only module packages the repository-root main
+// package may import: main.go parses the command line and hands it to the
+// server assembly, which owns everything else.
+var rootImports = []string{"internal/server"}
 
 // checkLayering reports a layer violation when a production file in the
 // module-relative directory dir imports importPath.
@@ -150,6 +157,9 @@ func checkLayering(dir, importPath string) error {
 	pkg, ok := modulePackage(importPath)
 	if !ok {
 		return nil
+	}
+	if err := checkRootImports(dir, pkg); err != nil {
+		return err
 	}
 	if err := checkLayerRules(dir, pkg); err != nil {
 		return err
@@ -165,6 +175,19 @@ func modulePackage(importPath string) (string, bool) {
 	}
 	pkg, ok := strings.CutPrefix(importPath, modulePath+"/")
 	return pkg, ok
+}
+
+func checkRootImports(dir, pkg string) error {
+	if dir != "." {
+		return nil
+	}
+	for _, allowed := range rootImports {
+		if pkg == allowed {
+			return nil
+		}
+	}
+	return fmt.Errorf("layer violation: the root main package may import only %s, not %s (add the wiring to internal/server)",
+		strings.Join(rootImports, ", "), pkg)
 }
 
 func checkLayerRules(dir, pkg string) error {
