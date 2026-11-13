@@ -213,6 +213,29 @@ func TestRedis_MultiListRecreateExpiredZSet(t *testing.T) {
 	require.Equal(t, "list", client.Type(ctx, key).Val())
 }
 
+func TestRedis_MultiExpiredZSetDeleteThenListWithTTL(t *testing.T) {
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	ctx := context.Background()
+	client := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = client.Close() }()
+
+	key := "empty-wide:multi-expired-zset-to-list"
+	require.NoError(t, client.ZAdd(ctx, key, redis.Z{Score: 1, Member: "member"}).Err())
+	require.NoError(t, client.PExpire(ctx, key, time.Millisecond).Err())
+	time.Sleep(10 * time.Millisecond)
+	pipe := client.TxPipeline()
+	pipe.ZIncrBy(ctx, key, 1, "new")
+	pipe.Del(ctx, key)
+	pipe.RPush(ctx, key, "item")
+	pipe.PExpire(ctx, key, 30*time.Second)
+	_, err := pipe.Exec(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []string{"item"}, client.LRange(ctx, key, 0, -1).Val())
+	require.Equal(t, "list", client.Type(ctx, key).Val())
+	require.Positive(t, client.PTTL(ctx, key).Val())
+}
+
 func TestRedis_EmptyWideCollectionRecreateDropsOldTTL(t *testing.T) {
 	nodes, _, _ := createNode(t, 1)
 	defer shutdown(nodes)
