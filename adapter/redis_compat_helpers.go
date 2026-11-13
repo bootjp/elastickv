@@ -1015,7 +1015,8 @@ func (r *RedisServer) deleteListElems(ctx context.Context, key []byte, readTS ui
 	if err != nil {
 		return nil, err
 	}
-	return append(elems, claimElems...), nil
+	elems = append(elems, claimElems...)
+	return append(elems, redisTxnWideListFenceElem(key)), nil
 }
 
 // scanListItemDelElems returns Del elems for every item key that belongs to
@@ -1223,6 +1224,7 @@ func (r *RedisServer) deleteLogicalKeyElems(ctx context.Context, key []byte, rea
 		return nil, false, err
 	}
 	elems = append(elems, hashElems...)
+	elems = append(elems, redisTxnWideHashFenceElem(key))
 
 	// Wide-column set cleanup: delete all !st|mem| keys, meta, and delta keys.
 	setElems, err := r.deleteWideColumnElems(ctx, readTS,
@@ -1231,6 +1233,7 @@ func (r *RedisServer) deleteLogicalKeyElems(ctx context.Context, key []byte, rea
 		return nil, false, err
 	}
 	elems = append(elems, setElems...)
+	elems = append(elems, redisTxnWideSetFenceElem(key))
 
 	// Wide-column zset cleanup: delete all !zs|mem|, !zs|scr|, meta, and delta keys.
 	zsetElems, err := r.deleteZSetWideColumnElems(ctx, key, readTS)
@@ -1238,6 +1241,7 @@ func (r *RedisServer) deleteLogicalKeyElems(ctx context.Context, key []byte, rea
 		return nil, false, err
 	}
 	elems = append(elems, zsetElems...)
+	elems = append(elems, redisTxnWideZSetFenceElem(key))
 
 	// Wide-column stream cleanup: delete the meta key and every entry key.
 	streamElems, err := r.deleteStreamWideColumnElems(ctx, key, readTS)
@@ -1312,7 +1316,8 @@ func (r *RedisServer) deleteHashLogicalKeyElems(ctx context.Context, key []byte,
 	if err != nil {
 		return nil, false, err
 	}
-	return append(elems, hashElems...), true, nil
+	elems = append(elems, hashElems...)
+	return append(elems, redisTxnWideHashFenceElem(key)), true, nil
 }
 
 func (r *RedisServer) deleteSetLogicalKeyElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], bool, error) {
@@ -1326,7 +1331,8 @@ func (r *RedisServer) deleteSetLogicalKeyElems(ctx context.Context, key []byte, 
 	if err != nil {
 		return nil, false, err
 	}
-	return append(elems, setElems...), true, nil
+	elems = append(elems, setElems...)
+	return append(elems, redisTxnWideSetFenceElem(key)), true, nil
 }
 
 func (r *RedisServer) deleteZSetLogicalKeyElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], bool, error) {
@@ -1339,7 +1345,8 @@ func (r *RedisServer) deleteZSetLogicalKeyElems(ctx context.Context, key []byte,
 	if err != nil {
 		return nil, false, err
 	}
-	return append(elems, zsetElems...), true, nil
+	elems = append(elems, zsetElems...)
+	return append(elems, redisTxnWideZSetFenceElem(key)), true, nil
 }
 
 func (r *RedisServer) deleteStreamLogicalKeyElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], bool, error) {

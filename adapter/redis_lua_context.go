@@ -625,12 +625,14 @@ func (c *luaScriptContext) stringState(key []byte) (*luaStringState, error) {
 
 	typ, err := c.keyType(key)
 	if errors.Is(err, store.ErrKeyNotFound) {
+		c.trackStringTypeReadKeys(key, redisTypeNone)
 		st.loaded = true
 		return st, nil
 	}
 	if err != nil {
 		return nil, err
 	}
+	c.trackStringTypeReadKeys(key, typ)
 	if typ == redisTypeNone {
 		st.loaded = true
 		return st, nil
@@ -651,6 +653,20 @@ func (c *luaScriptContext) stringState(key []byte) (*luaStringState, error) {
 	st.exists = true
 	st.value = append([]byte(nil), value...)
 	return st, nil
+}
+
+func (c *luaScriptContext) trackStringTypeReadKeys(key []byte, typ redisValueType) {
+	if typ != redisTypeString {
+		// An absent or wrong-type result depends on all possible type creators.
+		for _, readKey := range redisTxnReadFencePointKeys(key) {
+			c.trackReadKey(readKey)
+		}
+		return
+	}
+	// String and HLL values can occupy different anchors under the same type.
+	for _, readKey := range [][]byte{redisStrKey(key), redisHLLKey(key), key} {
+		c.trackReadKey(readKey)
+	}
 }
 
 func (c *luaScriptContext) listState(key []byte) (*luaListState, error) {
