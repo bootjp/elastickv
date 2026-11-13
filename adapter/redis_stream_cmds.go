@@ -1130,6 +1130,7 @@ func (r *RedisServer) dollarIDFromState(ctx context.Context, key []byte, readTS 
 func (r *RedisServer) xreadOnce(ctx context.Context, req xreadRequest) ([]xreadResult, error) {
 	results := make([]xreadResult, 0, len(req.keys))
 	for i, key := range req.keys {
+		r.observeBlockingRedisKeys(ctx, [][]byte{key})
 		readTS := r.readTS()
 		typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeStream)
 		if err != nil {
@@ -1422,7 +1423,6 @@ func (r *RedisServer) xreadWithoutBlock(conn redcon.Conn, req xreadRequest) {
 	var results []xreadResult
 	var err error
 	if ok := r.runWithHeavyCommandSlot(func() {
-		r.observeBlockingRedisKeys(ctx, req.keys)
 		results, err = r.xreadOnce(ctx, req)
 	}); !ok {
 		conn.WriteError(errRedisHeavyCommandPoolFull.Error())
@@ -1489,7 +1489,6 @@ func (r *RedisServer) xreadBusyPoll(conn redcon.Conn, req xreadRequest, deadline
 		var results []xreadResult
 		var err error
 		if ok := r.runWithHeavyCommandSlot(func() {
-			r.observeBlockingRedisKeys(iterCtx, req.keys)
 			results, err = r.xreadOnce(iterCtx, req)
 		}); !ok {
 			iterCancel()
