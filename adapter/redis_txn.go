@@ -1385,6 +1385,16 @@ func (t *txnContext) stageExpiredKeyCleanupForRecreate(key []byte) (bool, error)
 	return true, nil
 }
 
+func (t *txnContext) clearMissingCollectionTTL(key []byte, typ redisValueType) {
+	if typ != redisTypeNone {
+		return
+	}
+	if ttlSt, ok := t.ttlStates[string(key)]; ok && ttlSt.value != nil {
+		ttlSt.value = nil
+		ttlSt.dirty = true
+	}
+}
+
 func (t *txnContext) trackMissingKeyCreatorFenceReads(key []byte, typ redisValueType) {
 	if typ == redisTypeNone {
 		t.trackWideCollectionFenceReads(key)
@@ -1494,6 +1504,7 @@ func (t *txnContext) applyHSet(cmd redcon.Command) (redisResult, error) {
 	if err != nil {
 		return redisResult{}, err
 	}
+	t.clearMissingCollectionTTL(cmd.Args[1], typ)
 	added := int64(0)
 	for i := 2; i < len(cmd.Args); i += redisPairWidth {
 		field := string(cmd.Args[i])
@@ -1617,12 +1628,7 @@ func (t *txnContext) prepareListWrite(key []byte) (redisResult, bool, error) {
 	if expired {
 		t.listStates[string(key)] = &listTxnState{appends: [][]byte{}}
 	}
-	// An empty collection may still have a live TTL index. A newly created
-	// list must not inherit it; the old wide rows are removed at dispatch.
-	if ttlSt, ok := t.ttlStates[string(key)]; ok && ttlSt.value != nil {
-		ttlSt.value = nil
-		ttlSt.dirty = true
-	}
+	t.clearMissingCollectionTTL(key, typ)
 	return redisResult{}, false, nil
 }
 
@@ -2060,7 +2066,6 @@ func (t *txnContext) prepareDispatch() (preparedTxnDispatch, error) {
 		cancel()
 		return preparedTxnDispatch{cancel: func() {}}, err
 	}
-	hashElems := t.buildHashElems(commitTS)
 	collectionTTLElems, skipTTLIndex, err := t.buildCollectionTTLElems(ctx)
 	if err != nil {
 		cancel()
@@ -2080,7 +2085,6 @@ func (t *txnContext) prepareDispatch() (preparedTxnDispatch, error) {
 	}
 
 	elems = append(elems, collectionWriteElems...)
-	elems = append(elems, hashElems...)
 	elems = append(elems, collectionTTLElems...)
 	elems = append(elems, ttlElems...)
 	elems = append(elems, streamElems...)
@@ -2107,8 +2111,14 @@ func (t *txnContext) buildCollectionWriteElems(ctx context.Context, commitTS uin
 	if err != nil {
 		return nil, err
 	}
+	hashCleanupElems, err := t.buildHashRecreateCleanupElems(ctx)
+	if err != nil {
+		return nil, err
+	}
 	zsetElems = append(zsetElems, listCleanupElems...)
-	return append(zsetElems, t.buildListElems(commitTS)...), nil
+	zsetElems = append(zsetElems, hashCleanupElems...)
+	zsetElems = append(zsetElems, t.buildListElems(commitTS)...)
+	return append(zsetElems, t.buildHashElems(commitTS)...), nil
 }
 
 func (t *txnContext) dispatchContext() (context.Context, context.CancelFunc) {
@@ -2385,6 +2395,22 @@ func (t *txnContext) buildListRecreateCleanupElems(ctx context.Context) ([]*kv.E
 			continue
 		}
 		cleanup, _, err := t.server.expiredCollectionCleanupForRecreate(ctx, []byte(key), t.startTS, redisTypeNone, redisTypeList)
+		if err != nil {
+			return nil, err
+		}
+		elems = append(elems, cleanup...)
+	}
+	return elems, nil
+}
+
+func (t *txnContext) buildHashRecreateCleanupElems(ctx context.Context) ([]*kv.Elem[kv.OP], error) {
+	var elems []*kv.Elem[kv.OP]
+	for key := range t.hashCreates {
+		st := t.hashStates[key]
+		if st == nil || st.deleted || !st.dirty || len(st.fields) == 0 || t.hasReplacement([]byte(key)) {
+			continue
+		}
+		cleanup, _, err := t.server.expiredCollectionCleanupForRecreate(ctx, []byte(key), t.startTS, redisTypeNone, redisTypeHash)
 		if err != nil {
 			return nil, err
 		}
