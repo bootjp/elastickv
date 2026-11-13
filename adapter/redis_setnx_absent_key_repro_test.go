@@ -216,6 +216,35 @@ func TestRedis_SetOfExistingStringValidatesTypeChange(t *testing.T) {
 	require.Equal(t, []string{"string"}, h.physicalEncodings(t, key, h.st.LastCommitTS()))
 }
 
+func TestRedis_SetExInternalShapedUserKeyPreservesOtherString(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		opts []RedisServerOption
+	}{
+		{name: "default"},
+		{name: "legacy", opts: []RedisServerOption{WithOnePhaseTxnDedup(false)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			h := newReadSetReproHarness(t, "internal-shaped-setex", tc.opts...)
+			ctx := h.ctx
+			require.NoError(t, h.clientB.Set(ctx, "victim", "value", 0).Err())
+			key := string(redisStrKey([]byte("victim")))
+			_, err := h.clientB.Get(ctx, key).Result()
+			require.ErrorIs(t, err, redis.Nil)
+			require.NoError(t, h.clientB.Do(ctx, "SETEX", key, 60, "other").Err())
+			got, err := h.clientB.Get(ctx, "victim").Result()
+			require.NoError(t, err)
+			require.Equal(t, "value", got)
+			require.NoError(t, h.clientB.Del(ctx, key).Err())
+			got, err = h.clientB.Get(ctx, "victim").Result()
+			require.NoError(t, err)
+			require.Equal(t, "value", got)
+		})
+	}
+}
+
 // setCondRace is one "SET NX / XX decided on the key's existence, then another
 // command changed it" interleaving on a single string key.
 type setCondRace struct {

@@ -170,7 +170,10 @@ func (r *RedisServer) stringReplaceCleanupElems(ctx context.Context, key []byte,
 		elems, _, err := r.deleteLogicalKeyElems(ctx, key, readTS)
 		return elems, err
 	case rawTyp == redisTypeString:
-		return r.existingKeyDelElems(ctx, readTS, redisHLLKey(key), key)
+		if redisLegacyBareReadFenceAllowed(key) {
+			return r.existingKeyDelElems(ctx, readTS, redisHLLKey(key), key)
+		}
+		return r.existingKeyDelElems(ctx, readTS, redisHLLKey(key))
 	}
 	return nil, nil
 }

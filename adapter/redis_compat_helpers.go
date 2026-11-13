@@ -240,11 +240,11 @@ func (r *RedisServer) rawKeyTypeAt(ctx context.Context, key []byte, readTS uint6
 // probeStringTypes runs the three cheap point lookups against the
 // string-family prefixes. Returns (String, true, nil) on first hit.
 func (r *RedisServer) probeStringTypes(ctx context.Context, key []byte, readTS uint64) (redisValueType, bool, error) {
-	candidates := [...][]byte{
+	candidates := [][]byte{
 		redisStrKey(key), // new-format prefixed string
 		redisHLLKey(key), // HyperLogLog (reported as string)
-		key,              // legacy bare key (pre-migration)
 	}
+	candidates = appendRedisLegacyBareKey(candidates, key)
 	for _, k := range candidates {
 		exists, err := r.store.ExistsAt(ctx, k, readTS)
 		if err != nil {
@@ -880,6 +880,9 @@ func (r *RedisServer) readRedisStringWith(key []byte, readTS uint64, get rawGetF
 	if !errors.Is(err, store.ErrKeyNotFound) {
 		return nil, nil, err
 	}
+	if !redisLegacyBareReadFenceAllowed(key) {
+		return nil, nil, errors.WithStack(store.ErrKeyNotFound)
+	}
 	return r.readBareLegacyStringWith(key, readTS, get)
 }
 
@@ -1184,16 +1187,16 @@ func (r *RedisServer) deleteLogicalKeyElems(ctx context.Context, key []byte, rea
 
 	elems := []*kv.Elem[kv.OP]{}
 
-	for _, internalKey := range [][]byte{
-		redisStrKey(key),
-		key, // legacy bare string key
+	internalKeys := appendRedisLegacyBareKey([][]byte{redisStrKey(key)}, key)
+	internalKeys = append(internalKeys,
 		redisHashKey(key),
 		redisSetKey(key),
 		redisHLLKey(key),
 		redisZSetKey(key),
 		redisStreamKey(key),
 		redisTTLKey(key),
-	} {
+	)
+	for _, internalKey := range internalKeys {
 		ok, err := r.store.ExistsAt(ctx, internalKey, readTS)
 		if err != nil {
 			return nil, false, errors.WithStack(err)
@@ -1267,12 +1270,20 @@ func (r *RedisServer) deleteLogicalKeyElemsForType(ctx context.Context, key []by
 }
 
 func (r *RedisServer) deleteStringLikeElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
-	return r.existingKeyDelElems(ctx, readTS,
+	keys := [][]byte{
 		redisStrKey(key),
-		key, // legacy bare string key
 		redisHLLKey(key),
 		redisTTLKey(key),
-	)
+	}
+	keys = appendRedisLegacyBareKey(keys, key)
+	return r.existingKeyDelElems(ctx, readTS, keys...)
+}
+
+func appendRedisLegacyBareKey(keys [][]byte, key []byte) [][]byte {
+	if redisLegacyBareReadFenceAllowed(key) {
+		return append(keys, key)
+	}
+	return keys
 }
 
 // existingKeyDelElems returns a Del for each of internalKeys that exists at
