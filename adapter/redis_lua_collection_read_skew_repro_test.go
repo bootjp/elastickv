@@ -471,8 +471,8 @@ func TestLua_CollectionReadOfUnwrittenKeyIsNotValidated(t *testing.T) {
 // read adds to the script's commit, on the fast and the slow paths: an absent
 // key records the absent-key set; a list / set records its type fence; a hash
 // or zset also records its legacy blob anchor; a stream records its meta key;
-// point reads of an existing collection add the element key (hash field, set
-// member, zset member). HGETALL uses only the hash fence and blob anchor.
+// point reads of sets and zsets add the element key; hash reads use the
+// whole-hash fence and blob anchor.
 // Each script also SETs an unrelated key so it dispatches; that key
 // contributes only its own creation fences.
 func TestLua_ReadSetCoversCollectionReads(t *testing.T) {
@@ -489,7 +489,6 @@ func TestLua_ReadSetCoversCollectionReads(t *testing.T) {
 	set := [][]byte{redisTxnWideSetFenceKey(readKey)}
 	zset := [][]byte{redisTxnWideZSetFenceKey(readKey), redisZSetKey(readKey)}
 	stream := [][]byte{store.StreamMetaKey(readKey)}
-	field := func(name string) []byte { return store.HashFieldKey(readKey, []byte(name)) }
 	member := func(name string) []byte { return store.SetMemberKey(readKey, []byte(name)) }
 	zmember := func(name string) []byte { return store.ZSetMemberKey(readKey, []byte(name)) }
 
@@ -507,13 +506,13 @@ func TestLua_ReadSetCoversCollectionReads(t *testing.T) {
 		read string
 		want [][]byte
 	}{
-		{name: "HGET hit (fast path)", seed: seedHash, read: `redis.call("HGET", KEYS[1], "f")`, want: with(hash, field("f"))},
-		{name: "HGET missing field (slow path)", seed: seedHash, read: `redis.call("HGET", KEYS[1], "g")`, want: with(hash, field("g"))},
+		{name: "HGET hit (fast path)", seed: seedHash, read: `redis.call("HGET", KEYS[1], "f")`, want: hash},
+		{name: "HGET missing field (slow path)", seed: seedHash, read: `redis.call("HGET", KEYS[1], "g")`, want: hash},
 		{name: "HGET absent", read: `redis.call("HGET", KEYS[1], "f")`, want: absent},
 		{name: "HGET after cached absent", read: `redis.call("GET", KEYS[1]); redis.call("HGET", KEYS[1], "f")`, want: absent},
-		{name: "HEXISTS hit (fast path)", seed: seedHash, read: `redis.call("HEXISTS", KEYS[1], "f")`, want: with(hash, field("f"))},
+		{name: "HEXISTS hit (fast path)", seed: seedHash, read: `redis.call("HEXISTS", KEYS[1], "f")`, want: hash},
 		{name: "HEXISTS absent", read: `redis.call("HEXISTS", KEYS[1], "f")`, want: absent},
-		{name: "HMGET", seed: seedHash, read: `redis.call("HMGET", KEYS[1], "f", "g")`, want: with(hash, field("f"), field("g"))},
+		{name: "HMGET", seed: seedHash, read: `redis.call("HMGET", KEYS[1], "f", "g")`, want: hash},
 		{name: "HMGET absent", read: `redis.call("HMGET", KEYS[1], "f", "g")`, want: absent},
 		{name: "HGETALL", seed: seedHash, read: `redis.call("HGETALL", KEYS[1])`, want: hash},
 		{name: "HGETALL two fields", seed: seedHash2, read: `redis.call("HGETALL", KEYS[1])`, want: hash},
@@ -593,6 +592,25 @@ func TestLuaHGetAllReadSetBoundedAboveMaxReadKeys(t *testing.T) {
 	require.Len(t, reply.array, 2*len(values))
 	readKeys, _ := c.sortedTrackedReadKeys(0)
 	require.Less(t, len(readKeys), kv.MaxReadKeys)
+	requireReadKeysMatch(t, readKeys, [][]byte{
+		redisTxnWideHashFenceKey([]byte(key)), redisHashKey([]byte(key)),
+	})
+}
+
+func TestLuaHMGetReadSetBoundedAboveMaxReadKeys(t *testing.T) {
+	key := "lua:many-missing-fields"
+	args := make([]string, kv.MaxReadKeys+2)
+	args[0] = key
+	for i := 1; i < len(args); i++ {
+		args[i] = fmt.Sprintf("f%05d", i)
+	}
+	c := &luaScriptContext{hashes: map[string]*luaHashState{
+		key: {loaded: true, exists: true, value: redisHashValue{"seed": "value"}},
+	}}
+	reply, err := c.cmdHMGet(args)
+	require.NoError(t, err)
+	require.Len(t, reply.array, kv.MaxReadKeys+1)
+	readKeys, _ := c.sortedTrackedReadKeys(0)
 	requireReadKeysMatch(t, readKeys, [][]byte{
 		redisTxnWideHashFenceKey([]byte(key)), redisHashKey([]byte(key)),
 	})

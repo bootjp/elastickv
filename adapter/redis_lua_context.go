@@ -393,14 +393,12 @@ func (c *luaScriptContext) trackAbsentKeyReadKeys(key []byte) {
 //     create, a new field, every HDEL, an emptying delete, a type change),
 //     plus the legacy blob anchor, which a legacy-blob migration rewrites
 //     without the fence. Every wide-column field value update also Puts the
-//     fence. Point reads additionally record their field keys; HGETALL uses
-//     only the fence so its read set stays bounded for large hashes.
+//     fence. All hash reads use the bounded fence and legacy anchor.
 //   - zset: also the legacy blob anchor, which the MULTI legacy path deletes
 //     without the fence when it empties the zset.
 //   - stream: the stream meta key, which every stream write rewrites.
 //
-// Element keys (a hash field, a set member, a zset member) are recorded by
-// the point-read commands on top of this.
+// Set and zset point reads also record their member keys.
 func (c *luaScriptContext) trackCollectionReadKeys(key []byte, typ redisValueType, exists bool) {
 	if !exists {
 		c.trackAbsentKeyReadKeys(key)
@@ -426,8 +424,7 @@ func (c *luaScriptContext) trackCollectionReadKeys(key []byte, typ redisValueTyp
 
 // trackCollectionElementReadKeys records a point read of elements of a
 // collection that exists at startTS: elementKey maps each requested element
-// to the key a write of that element Puts or deletes (a hash field value
-// update does not touch the hash fence). Absent collections need no element
+// to the key a write of that element Puts or deletes. Absent collections need no element
 // keys: the absent-key fences already cover every create.
 func (c *luaScriptContext) trackCollectionElementReadKeys(key []byte, exists bool, elementKey func(key, element []byte) []byte, elements ...string) {
 	if !exists {
@@ -1918,7 +1915,7 @@ func (c *luaScriptContext) cmdHGet(args []string) (luaReply, error) {
 		return luaReply{}, err
 	}
 	if hit {
-		c.trackHashFieldRead(key, alive, field)
+		c.trackHashFieldRead(key, alive)
 		if !alive {
 			return luaNilReply(), nil
 		}
@@ -1961,16 +1958,14 @@ func hgetFromSlowPath(c *luaScriptContext, key []byte, field string) (luaReply, 
 		}
 		return luaReply{}, err
 	}
-	c.trackCollectionElementReadKeys(key, st.exists, store.HashFieldKey, field)
+	c.trackCollectionReadKeys(key, redisTypeHash, st.exists)
 	return hgetFromHashState(st, field), nil
 }
 
-// trackHashFieldRead records a point read of hash fields: the hash's read
-// keys plus each field key, since updating an existing field's value writes
-// only that field key.
-func (c *luaScriptContext) trackHashFieldRead(key []byte, exists bool, fields ...string) {
+// Value-only hash writes advance the whole-hash fence, so point reads need
+// only the bounded collection read set.
+func (c *luaScriptContext) trackHashFieldRead(key []byte, exists bool) {
 	c.trackCollectionReadKeys(key, redisTypeHash, exists)
-	c.trackCollectionElementReadKeys(key, exists, store.HashFieldKey, fields...)
 }
 
 // hgetFromHashState reads field out of a loaded luaHashState in the
@@ -2015,7 +2010,7 @@ func (c *luaScriptContext) cmdHSet(args []string) (luaReply, error) {
 func (c *luaScriptContext) cmdHMGet(args []string) (luaReply, error) {
 	st, err := c.observeHashState([]byte(args[0]))
 	if err == nil {
-		c.trackCollectionElementReadKeys([]byte(args[0]), st.exists, store.HashFieldKey, args[1:]...)
+		c.trackCollectionReadKeys([]byte(args[0]), redisTypeHash, st.exists)
 	}
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
@@ -2166,7 +2161,7 @@ func (c *luaScriptContext) cmdHExists(args []string) (luaReply, error) {
 		return luaReply{}, err
 	}
 	if hit {
-		c.trackHashFieldRead(key, alive, field)
+		c.trackHashFieldRead(key, alive)
 		if alive {
 			return luaIntReply(1), nil
 		}
@@ -2183,7 +2178,7 @@ func hexistsFromSlowPath(c *luaScriptContext, key []byte, field string) (luaRepl
 		}
 		return luaReply{}, err
 	}
-	c.trackCollectionElementReadKeys(key, st.exists, store.HashFieldKey, field)
+	c.trackCollectionReadKeys(key, redisTypeHash, st.exists)
 	return hexistsFromHashState(st, field), nil
 }
 

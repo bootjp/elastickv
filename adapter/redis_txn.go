@@ -104,10 +104,7 @@ func redisTxnReadFencePointKeys(userKey []byte) [][]byte {
 }
 
 func redisLegacyBareReadFenceAllowed(userKey []byte) bool {
-	if isKnownInternalKey(userKey) {
-		return false
-	}
-	return !bytes.HasPrefix(userKey, []byte("!sqs|"))
+	return !isKnownInternalKey(userKey)
 }
 
 // redisTxnReadFenceTargetsForRanges builds the fence set for a user key. Point
@@ -887,26 +884,23 @@ func (t *txnContext) ctxOrBackground() context.Context {
 	return t.server.redisContext(t.ctx)
 }
 
-func (t *txnContext) load(key []byte) (*txnValue, error) {
-	// If the key is already an internal key (e.g., !redis|hash|...,
-	// !lst|..., !txn|..., !ddb|..., !s3|..., !dist|...), use it as-is.
-	// Otherwise, it's a bare user key for a string value — prefix it.
-	storageKey := key
-	if !isKnownInternalKey(key) {
-		storageKey = redisStrKey(key)
+func (t *txnContext) load(key []byte, internal bool) (*txnValue, error) {
+	storageKey := redisStrKey(key)
+	if internal {
+		storageKey = key
 	}
 	k := string(storageKey)
 	if tv, ok := t.working[k]; ok {
 		return tv, nil
 	}
 	t.trackReadKey(storageKey)
-	if !isKnownInternalKey(key) {
+	if !internal {
 		// Track the bare key too for conflict detection on legacy fallback reads.
 		t.trackReadKey(key)
 	}
 	tv := &txnValue{}
 	var val []byte
-	if !isKnownInternalKey(key) {
+	if !internal {
 		// For bare user string keys, use the fallback-aware reader.
 		var (
 			err error
@@ -1403,7 +1397,7 @@ func (t *txnContext) currentStringValue(key []byte) ([]byte, *time.Time, bool, e
 	if repl, ok := t.replacers[string(key)]; ok {
 		return bytes.Clone(repl.value), cloneTimePtr(repl.ttl), true, nil
 	}
-	tv, err := t.load(key)
+	tv, err := t.load(key, false)
 	if err != nil {
 		return nil, nil, false, err
 	}
@@ -1419,7 +1413,7 @@ func (t *txnContext) stageStringValue(key, value []byte, ttl *time.Time) error {
 		repl.ttl = cloneTimePtr(ttl)
 		return nil
 	}
-	tv, err := t.load(key)
+	tv, err := t.load(key, false)
 	if err != nil {
 		return err
 	}
@@ -1842,7 +1836,7 @@ func (t *txnContext) markHashCreate(key []byte) {
 // markStringDirty loads the string value into the working set so that
 // buildKeyElems will re-encode it with the updated embedded TTL.
 func (t *txnContext) markStringDirty(key []byte) (redisResult, error) {
-	tv, err := t.load(key)
+	tv, err := t.load(key, false)
 	if err != nil {
 		return redisResult{}, err
 	}
@@ -1851,7 +1845,7 @@ func (t *txnContext) markStringDirty(key []byte) (redisResult, error) {
 }
 
 func (t *txnContext) markHLLDirty(key []byte, ttl *time.Time) error {
-	hllValue, err := t.load(redisHLLKey(key))
+	hllValue, err := t.load(redisHLLKey(key), true)
 	if err != nil {
 		return err
 	}
@@ -1918,7 +1912,7 @@ func (t *txnContext) stageCollectionStateDeletion(key []byte) error {
 	}
 	stageListDelete(st)
 	// Mark the string/main value for deletion.
-	tv, err := t.load(key)
+	tv, err := t.load(key, false)
 	if err != nil {
 		return err
 	}
@@ -1952,7 +1946,7 @@ func (t *txnContext) stageLegacyInternalDeletion(key []byte) error {
 		redisStreamKey(key),
 		redisHLLKey(key),
 	} {
-		iv, err := t.load(internalKey)
+		iv, err := t.load(internalKey, true)
 		if err != nil {
 			return err
 		}

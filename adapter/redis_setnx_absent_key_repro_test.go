@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 )
@@ -32,6 +33,22 @@ func setNXReproCommit(run func(context.Context, *redis.Client) (any, error)) fun
 		_, err := run(ctx, c)
 		return err
 	}
+}
+
+func TestRedisLegacyBareCleanupPreservesFilesystemInode(t *testing.T) {
+	ctx := context.Background()
+	server, st := newRedisStorageMigrationTestServer(t)
+	inodeKey := fskeys.InodeKey(1)
+	require.NoError(t, st.PutAt(ctx, inodeKey, []byte("inode"), 1, 0))
+	require.False(t, redisLegacyBareReadFenceAllowed(inodeKey))
+	elems, err := server.deleteStringLikeElems(ctx, inodeKey, 2)
+	require.NoError(t, err)
+	require.False(t, opElemsDeleteKey(elems, inodeKey))
+	txn := newRedisTxnTestContext(server)
+	txn.startTS = 2
+	value, err := txn.load(inodeKey, false)
+	require.NoError(t, err)
+	require.Nil(t, value.raw)
 }
 
 // setNXReproCreators are the commands that create setNXReproKey under a
