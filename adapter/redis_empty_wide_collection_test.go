@@ -276,6 +276,27 @@ func TestRedis_EmptyWideCollectionRecreateDropsOldTTL(t *testing.T) {
 	require.Equal(t, int64(1), client.SCard(ctx, key).Val())
 }
 
+func TestRedis_MultiHSetRecreatesEmptySetWithoutOldTTL(t *testing.T) {
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	ctx := context.Background()
+	client := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = client.Close() }()
+
+	key := "empty-wide:multi-hset"
+	require.NoError(t, client.SAdd(ctx, key, "member").Err())
+	require.NoError(t, client.Expire(ctx, key, time.Minute).Err())
+	require.NoError(t, client.SRem(ctx, key, "member").Err())
+
+	pipe := client.TxPipeline()
+	pipe.HSet(ctx, key, "field", "value")
+	_, err := pipe.Exec(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "hash", client.Type(ctx, key).Val())
+	require.Equal(t, "value", client.HGet(ctx, key, "field").Val())
+	require.Equal(t, time.Duration(-1), client.TTL(ctx, key).Val())
+}
+
 func TestRedis_LuaZSetProbeIgnoresEmptyWideZSet(t *testing.T) {
 	nodes, _, _ := createNode(t, 1)
 	defer shutdown(nodes)
