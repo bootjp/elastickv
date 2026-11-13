@@ -93,3 +93,49 @@ func TestActiveSplitJobRouteIDsWorkingRoute(t *testing.T) {
 	require.Contains(t, got, uint64(11))
 	require.NotContains(t, got, uint64(12))
 }
+
+func TestActiveSplitJobRoutesAndReservedDelta(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		routes []uint64
+		jobs   []distribution.SplitJob
+		want   int
+	}{
+		{"unpublished", []uint64{1, 2}, []distribution.SplitJob{{SourceRouteID: 1, Phase: distribution.SplitJobPhasePlanned}}, 1},
+		{"two unpublished", []uint64{1, 2}, []distribution.SplitJob{{SourceRouteID: 1, Phase: distribution.SplitJobPhaseBackfill}, {SourceRouteID: 2, Phase: distribution.SplitJobPhaseFailed}}, 2},
+		{"working route visible", []uint64{1, 2, 3}, []distribution.SplitJob{{SourceRouteID: 1, WorkingSourceRouteID: 3, Phase: distribution.SplitJobPhaseBackfill}}, 0},
+		{"working route unpublished", []uint64{1, 2}, []distribution.SplitJob{{SourceRouteID: 1, WorkingSourceRouteID: 3, Phase: distribution.SplitJobPhaseBackfill}}, 1},
+		{"source absent", []uint64{2}, []distribution.SplitJob{{SourceRouteID: 1, Phase: distribution.SplitJobPhaseBackfill}}, 0},
+		{"terminal jobs", []uint64{1, 2}, []distribution.SplitJob{{SourceRouteID: 1, Phase: distribution.SplitJobPhaseDone}, {SourceRouteID: 2, Phase: distribution.SplitJobPhaseAbandoned}}, 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			snapshot := distribution.CatalogSnapshot{ReadTS: 123}
+			for _, id := range tc.routes {
+				snapshot.Routes = append(snapshot.Routes, distribution.RouteDescriptor{RouteID: id})
+			}
+			source := &splitJobGateSource{jobs: tc.jobs}
+			_, got, err := activeSplitJobRoutesAndReservedDelta(context.Background(), source, snapshot)
+			require.NoError(t, err)
+			require.Equal(t, tc.want, got)
+			require.Equal(t, snapshot.ReadTS, source.ts)
+		})
+	}
+}
+
+func TestActiveSplitJobRoutesAndReservedDeltaFailsClosed(t *testing.T) {
+	t.Parallel()
+	snapshot := distribution.CatalogSnapshot{ReadTS: 456}
+	busy, reserved, err := activeSplitJobRoutesAndReservedDelta(context.Background(), snapshotOnlyGateSource{}, snapshot)
+	require.ErrorContains(t, err, "does not support ListSplitJobsAt")
+	require.Nil(t, busy)
+	require.Zero(t, reserved)
+
+	readErr := errors.New("catalog unavailable")
+	busy, reserved, err = activeSplitJobRoutesAndReservedDelta(context.Background(), &splitJobGateSource{err: readErr}, snapshot)
+	require.ErrorIs(t, err, readErr)
+	require.Nil(t, busy)
+	require.Zero(t, reserved)
+}

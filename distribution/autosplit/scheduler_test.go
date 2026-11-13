@@ -77,6 +77,100 @@ func TestSchedulerTickSchedulesSplitRange(t *testing.T) {
 	require.Equal(t, uint64(0), splitter.requests[0].TargetGroupID)
 }
 
+func TestSchedulerReservesUnpublishedSplitJobRoute(t *testing.T) {
+	t.Parallel()
+	now := time.Unix(1_700_000_000, 0)
+	tests := []struct {
+		name           string
+		phase          distribution.SplitJobPhase
+		workingRouteID uint64
+		workingVisible bool
+		maxRoutes      int
+		wantScheduled  int
+	}{
+		{"unpublished at cap", distribution.SplitJobPhaseBackfill, 0, false, 3, 0},
+		{"unpublished below cap", distribution.SplitJobPhaseBackfill, 0, false, 4, 1},
+		{"working route published", distribution.SplitJobPhaseBackfill, 3, true, 4, 1},
+		{"working route unpublished", distribution.SplitJobPhaseBackfill, 3, false, 3, 0},
+		{"terminal job", distribution.SplitJobPhaseDone, 0, false, 3, 1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			routes := []distribution.RouteDescriptor{testRoute(1, 1, "a", "m"), testRoute(2, 1, "m", "z")}
+			if tc.workingVisible {
+				routes = append(routes, testRoute(3, 1, "a", "g"))
+			}
+			source := &crossGroupCatalogSource{
+				fakeCatalogSnapshotSource: &fakeCatalogSnapshotSource{snapshot: distribution.CatalogSnapshot{Version: 7, ReadTS: 123, Routes: routes}},
+				jobs:                      []distribution.SplitJob{{SourceRouteID: 1, WorkingSourceRouteID: tc.workingRouteID, Phase: tc.phase}},
+			}
+			splitter := &fakeSplitter{}
+			cfg := SchedulerConfig{
+				Enabled: true, CrossGroupEnabled: true,
+				Detector:     Config{WriteWeight: 1, ThresholdOpsMin: 50, CandidateWindows: 2, MaxRoutes: tc.maxRoutes, MaxSplitsPerCycle: 1},
+				EvalInterval: time.Minute, SplitCooldown: 10 * time.Minute,
+			}
+			scheduler := NewScheduler(cfg, source, splitter, &fakeSampler{step: time.Minute, history: 16, cols: dualRouteHotColumns(now, 2)}, nil)
+			scheduler.wasLeader = true
+			result, err := scheduler.Tick(context.Background(), now.Add(2*time.Minute))
+			require.NoError(t, err)
+			require.Equal(t, uint64(123), source.ts)
+			require.Equal(t, tc.wantScheduled, result.Scheduled)
+			require.Len(t, splitter.requests, tc.wantScheduled)
+			if tc.wantScheduled != 0 && tc.phase != distribution.SplitJobPhaseDone {
+				require.Equal(t, uint64(2), splitter.requests[0].RouteID)
+			}
+		})
+	}
+}
+
+func TestSchedulerPendingCompoundRespectsUnpublishedSplitJobRoute(t *testing.T) {
+	t.Parallel()
+	now := time.Unix(1_700_000_000, 0)
+	tests := []struct {
+		name           string
+		workingRouteID uint64
+		workingVisible bool
+		maxRoutes      int
+		wantScheduled  int
+	}{
+		{"unpublished at cap", 0, false, 3, 0},
+		{"working route published", 3, true, 4, 1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			routes := []distribution.RouteDescriptor{testRoute(1, 1, "a", "m"), testRoute(10, 1, "m", "z")}
+			if tc.workingVisible {
+				routes = append(routes, testRoute(3, 1, "a", "g"))
+			}
+			source := &crossGroupCatalogSource{
+				fakeCatalogSnapshotSource: &fakeCatalogSnapshotSource{snapshot: distribution.CatalogSnapshot{Version: 7, ReadTS: 123, Routes: routes}},
+				jobs:                      []distribution.SplitJob{{SourceRouteID: 1, WorkingSourceRouteID: tc.workingRouteID, Phase: distribution.SplitJobPhaseBackfill}},
+			}
+			splitter := &fakeSplitter{}
+			cfg := SchedulerConfig{
+				Enabled: true, CrossGroupEnabled: true,
+				Detector:     Config{MaxRoutes: tc.maxRoutes, MaxSplitsPerCycle: 1},
+				EvalInterval: time.Minute,
+			}
+			scheduler := NewScheduler(cfg, source, splitter, nil, nil)
+			scheduler.wasLeader = true
+			scheduler.pendingCompounds[1] = pendingCompound{parentRouteID: 1, intermediate: testRoute(10, 1, "m", "z"), splitKey: []byte{'m', 0}}
+			result, err := scheduler.Tick(context.Background(), now)
+			require.NoError(t, err)
+			require.Equal(t, tc.wantScheduled, result.Scheduled)
+			require.Len(t, splitter.requests, tc.wantScheduled)
+			if tc.wantScheduled == 0 {
+				require.Contains(t, scheduler.pendingCompounds, uint64(1))
+			} else {
+				require.Empty(t, scheduler.pendingCompounds)
+			}
+		})
+	}
+}
+
 func TestSchedulerUsesCommittedCatalogVersionBetweenSplits(t *testing.T) {
 	t.Parallel()
 	now := time.Unix(1_700_000_000, 0)

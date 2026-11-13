@@ -1,10 +1,7 @@
 package autosplit
 
 import (
-	"context"
 	"time"
-
-	"github.com/bootjp/elastickv/distribution"
 )
 
 const targetEvidenceMaxAgeSteps = 2
@@ -14,23 +11,6 @@ func (s *Scheduler) prepareCrossGroupTick(prep *tickPreparation, now time.Time, 
 		return
 	}
 	prep.result.Detector.Decisions = s.selectCrossGroupTargets(prep.result.Detector.Decisions, *prep, now)
-}
-
-func (s *Scheduler) excludeBusySplitJobs(ctx context.Context, prep *tickPreparation) error {
-	if !s.cfg.CrossGroupEnabled || prep.stopAfterPrepare {
-		return nil
-	}
-	busy, err := activeSplitJobRouteIDs(ctx, s.source, prep.snapshot)
-	if err != nil {
-		return err
-	}
-	for i := range prep.routes {
-		if _, exists := busy[prep.routes[i].RouteID]; exists {
-			prep.routes[i].State = distribution.RouteStateMigratingSource
-			s.state.ResetConfidence(prep.routes[i].RouteID)
-		}
-	}
-	return nil
 }
 
 func (s *Scheduler) selectCrossGroupTargets(decisions []Decision, prep tickPreparation, now time.Time) []Decision {
@@ -58,13 +38,17 @@ func (s *Scheduler) selectCrossGroupTargets(decisions []Decision, prep tickPrepa
 			MaxEvidenceAge:    maxAge,
 		}
 		decisions[i].TargetGroupID = SelectTargetGroup(input)
-		if decisions[i].TargetGroupID == 0 && rightChildEligible(input) && hasOtherCandidateGroup(input) {
+		if decisions[i].TargetGroupID == 0 && missingTargetLoadEvidence(input) {
 			if observer, ok := s.cfg.Observer.(targetSkipObserver); ok {
 				observer.ObserveTargetSkipped("load_unknown")
 			}
 		}
 	}
 	return decisions
+}
+
+func missingTargetLoadEvidence(in TargetSelectionInput) bool {
+	return rightChildEligible(in) && migratableRightChild(in.Decision) && hasOtherCandidateGroup(in)
 }
 
 func hasOtherCandidateGroup(in TargetSelectionInput) bool {

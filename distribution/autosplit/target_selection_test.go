@@ -27,6 +27,7 @@ func TestSelectTargetGroup(t *testing.T) {
 		return TargetSelectionInput{
 			Enabled: true, Decision: Decision{
 				RouteGroupID: 1, SplitOrigin: SplitOriginP50Mid,
+				SplitKey: []byte("n"), RouteEnd: []byte("z"),
 				LeftLoad: 40, RightLoad: 60,
 			},
 			P50LoadKnown: true, CandidateGroupIDs: []uint64{1, 2, 3},
@@ -93,6 +94,14 @@ func TestSelectTargetGroup(t *testing.T) {
 		{"left hot p50", func(in *TargetSelectionInput) { in.Decision.LeftLoad = 61 }, 0},
 		{"unknown p50", func(in *TargetSelectionInput) { in.P50LoadKnown = false }, 0},
 		{"invalid p50 estimate", func(in *TargetSelectionInput) { in.Decision.RightLoad = math.Inf(1) }, 0},
+		{"reserved migration namespace", func(in *TargetSelectionInput) {
+			in.Decision.SplitKey = []byte("!a")
+			in.Decision.RouteEnd = []byte("!z")
+		}, 0},
+		{"resolver owned SQS route", func(in *TargetSelectionInput) {
+			in.Decision.SplitKey = []byte("!sqs|route|g")
+			in.Decision.RouteEnd = []byte("!sqs|route|h")
+		}, 0},
 		{"last bucket right hot", func(in *TargetSelectionInput) { in.Decision.SplitOrigin = SplitOriginP50LastBucketLo }, 2},
 		{"upper edge singleton complete", func(in *TargetSelectionInput) { in.Decision.SplitOrigin = SplitOriginIsolationSingleUpperEdge }, 2},
 		{"upper edge singleton incomplete", func(in *TargetSelectionInput) {

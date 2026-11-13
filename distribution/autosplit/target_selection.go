@@ -42,7 +42,7 @@ type TargetSelectionInput struct {
 // SelectTargetGroup returns zero for a same-group split. It never collects
 // evidence or changes scheduler state. Equal-load targets use the smaller ID.
 func SelectTargetGroup(in TargetSelectionInput) uint64 {
-	if !in.Enabled || in.Decision.RouteGroupID == 0 || !rightChildEligible(in) {
+	if !in.Enabled || in.Decision.RouteGroupID == 0 || !rightChildEligible(in) || !migratableRightChild(in.Decision) {
 		return 0
 	}
 
@@ -54,6 +54,10 @@ func SelectTargetGroup(in TargetSelectionInput) uint64 {
 		return 0
 	}
 	return lowestLoadTarget(in, sourceLoad, active, transitional, evidence, duplicates)
+}
+
+func migratableRightChild(decision Decision) bool {
+	return distribution.ValidateSplitMigrationRouteRange(decision.SplitKey, decision.RouteEnd) == nil
 }
 
 func lowestLoadTarget(

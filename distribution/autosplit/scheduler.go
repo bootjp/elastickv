@@ -289,7 +289,7 @@ func (s *Scheduler) Tick(ctx context.Context, now time.Time) (SchedulerResult, e
 	if err != nil {
 		return out, err
 	}
-	if err := s.excludeBusySplitJobs(ctx, &prep); err != nil {
+	if err := s.excludeBusySplitJobsAndReserve(ctx, &prep); err != nil {
 		return out, err
 	}
 	prep.result.Detector = s.evaluateTick(now, &prep)
@@ -303,9 +303,28 @@ type tickPreparation struct {
 	windows          []ColumnWindow
 	fences           map[uint64]EvidenceFence
 	usedBudget       int
+	reservedRoutes   int
 	catalogGap       bool
 	stopAfterPrepare bool
 	result           SchedulerResult
+}
+
+func (s *Scheduler) excludeBusySplitJobsAndReserve(ctx context.Context, prep *tickPreparation) error {
+	if !s.cfg.CrossGroupEnabled || prep.stopAfterPrepare {
+		return nil
+	}
+	busy, reserved, err := activeSplitJobRoutesAndReservedDelta(ctx, s.source, prep.snapshot)
+	if err != nil {
+		return err
+	}
+	prep.reservedRoutes = reserved
+	for i := range prep.routes {
+		if _, exists := busy[prep.routes[i].RouteID]; exists {
+			prep.routes[i].State = distribution.RouteStateMigratingSource
+			s.state.ResetConfidence(prep.routes[i].RouteID)
+		}
+	}
+	return nil
 }
 
 func (s *Scheduler) ensureLeadership(now time.Time) bool {
@@ -346,7 +365,10 @@ func (s *Scheduler) prepareTick(
 	}
 	if runtimeEnabled {
 		var pendingScheduled, pendingFailed int
-		prep.snapshot, pendingScheduled, pendingFailed, prep.usedBudget, prep.stopAfterPrepare = s.finalizePendingCompounds(ctx, snapshot)
+		prep.snapshot, pendingScheduled, pendingFailed, prep.usedBudget, prep.stopAfterPrepare, err = s.finalizePendingCompounds(ctx, snapshot)
+		if err != nil {
+			return tickPreparation{}, err
+		}
 		prep.result.CatalogVersion = prep.snapshot.Version
 		prep.result.Scheduled += pendingScheduled
 		prep.result.Failed += pendingFailed
@@ -387,7 +409,7 @@ func (s *Scheduler) evaluateTick(now time.Time, prep *tickPreparation) Result {
 		Windows:        windows,
 		EvidenceFences: prep.fences,
 		Now:            now,
-		LiveRouteCount: len(prep.snapshot.Routes),
+		LiveRouteCount: len(prep.snapshot.Routes) + prep.reservedRoutes,
 	})
 	s.observeDetectorResult(result)
 	return result
@@ -653,9 +675,9 @@ func (s *Scheduler) executePendingCompound(
 func (s *Scheduler) finalizePendingCompounds(
 	ctx context.Context,
 	snapshot distribution.CatalogSnapshot,
-) (distribution.CatalogSnapshot, int, int, int, bool) {
+) (distribution.CatalogSnapshot, int, int, int, bool, error) {
 	if len(s.pendingCompounds) == 0 {
-		return snapshot, 0, 0, 0, false
+		return snapshot, 0, 0, 0, false, nil
 	}
 	parentIDs := make([]uint64, 0, len(s.pendingCompounds))
 	for parentID := range s.pendingCompounds {
@@ -671,7 +693,10 @@ func (s *Scheduler) finalizePendingCompounds(
 			break
 		}
 		pending := s.pendingCompounds[parentID]
-		intermediate, ok := s.resolvePendingCompound(ctx, parentID, pending, snapshot)
+		intermediate, ok, err := s.resolvePendingCompound(ctx, parentID, pending, snapshot)
+		if err != nil {
+			return snapshot, scheduled, failed, attempted, true, err
+		}
 		if !ok {
 			continue
 		}
@@ -694,11 +719,11 @@ func (s *Scheduler) finalizePendingCompounds(
 		if refreshErr != nil {
 			s.cfg.Logger.WarnContext(ctx, "autosplit: refresh after compound finalization failed",
 				slog.Any("err", refreshErr))
-			return snapshot, scheduled, failed, attempted, true
+			return snapshot, scheduled, failed, attempted, true, nil
 		}
 		snapshot = refreshed
 	}
-	return snapshot, scheduled, failed, attempted, false
+	return snapshot, scheduled, failed, attempted, false, nil
 }
 
 // resolvePendingCompound validates one pending entry immediately before it is
@@ -709,14 +734,14 @@ func (s *Scheduler) resolvePendingCompound(
 	parentID uint64,
 	pending pendingCompound,
 	snapshot distribution.CatalogSnapshot,
-) (distribution.RouteDescriptor, bool) {
+) (distribution.RouteDescriptor, bool, error) {
 	if !s.leadsPendingCompoundGroup(pending) {
 		delete(s.pendingCompounds, parentID)
 		s.cfg.Logger.WarnContext(ctx, "autosplit: dropping compound finalization without shard leadership",
 			slog.Uint64("parent_route_id", parentID),
 			slog.Uint64("intermediate_route_id", pending.intermediate.RouteID),
 			slog.Uint64("group_id", pending.intermediate.GroupID))
-		return distribution.RouteDescriptor{}, false
+		return distribution.RouteDescriptor{}, false, nil
 	}
 	intermediate, ok := findActiveRoute(snapshot.Routes, pending.intermediate.RouteID)
 	if !ok || !samePendingIntermediate(intermediate, pending) ||
@@ -725,9 +750,18 @@ func (s *Scheduler) resolvePendingCompound(
 		s.cfg.Logger.WarnContext(ctx, "autosplit: dropping invalid compound finalization",
 			slog.Uint64("parent_route_id", parentID),
 			slog.Uint64("intermediate_route_id", pending.intermediate.RouteID))
-		return distribution.RouteDescriptor{}, false
+		return distribution.RouteDescriptor{}, false, nil
 	}
-	return intermediate, true
+	if s.cfg.CrossGroupEnabled {
+		_, reserved, err := activeSplitJobRoutesAndReservedDelta(ctx, s.source, snapshot)
+		if err != nil {
+			return distribution.RouteDescriptor{}, false, err
+		}
+		if len(snapshot.Routes)+reserved+1 > s.cfg.Detector.MaxRoutes {
+			return distribution.RouteDescriptor{}, false, nil
+		}
+	}
+	return intermediate, true, nil
 }
 
 // leadsPendingCompoundGroup rechecks shard leadership immediately before a
