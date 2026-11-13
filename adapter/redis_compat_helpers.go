@@ -65,7 +65,7 @@ func (r *RedisServer) detectWideColumnType(ctx context.Context, key []byte, read
 	if typ, err := r.detectWideColumnTypeSkipZSet(ctx, key, readTS); err != nil || typ != redisTypeNone {
 		return typ, err
 	}
-	if found, err := r.wideColumnTypeExists(ctx, key, readTS, store.ZSetMemberScanPrefix, store.ZSetMetaKey, store.ZSetMetaDeltaScanPrefix); err != nil {
+	if found, err := r.wideColumnTypeExists(ctx, key, readTS, store.ZSetMemberScanPrefix, store.ZSetMetaKey, store.ZSetMetaDeltaScanPrefix, r.resolveZSetMeta); err != nil {
 		return redisTypeNone, err
 	} else if found {
 		return redisTypeZSet, nil
@@ -79,12 +79,12 @@ func (r *RedisServer) detectWideColumnType(ctx context.Context, key []byte, read
 // scans came back empty) use this to avoid re-issuing the three
 // ZSet-side probes detectWideColumnType would otherwise repeat.
 func (r *RedisServer) detectWideColumnTypeSkipZSet(ctx context.Context, key []byte, readTS uint64) (redisValueType, error) {
-	if found, err := r.wideColumnTypeExists(ctx, key, readTS, store.HashFieldScanPrefix, store.HashMetaKey, store.HashMetaDeltaScanPrefix); err != nil {
+	if found, err := r.wideColumnTypeExists(ctx, key, readTS, store.HashFieldScanPrefix, store.HashMetaKey, store.HashMetaDeltaScanPrefix, r.resolveHashMeta); err != nil {
 		return redisTypeNone, err
 	} else if found {
 		return redisTypeHash, nil
 	}
-	if found, err := r.wideColumnTypeExists(ctx, key, readTS, store.SetMemberScanPrefix, store.SetMetaKey, store.SetMetaDeltaScanPrefix); err != nil {
+	if found, err := r.wideColumnTypeExists(ctx, key, readTS, store.SetMemberScanPrefix, store.SetMetaKey, store.SetMetaDeltaScanPrefix, r.resolveSetMeta); err != nil {
 		return redisTypeNone, err
 	} else if found {
 		return redisTypeSet, nil
@@ -92,8 +92,8 @@ func (r *RedisServer) detectWideColumnTypeSkipZSet(ctx context.Context, key []by
 	return redisTypeNone, nil
 }
 
-// wideColumnTypeExists checks whether a wide-column collection of the given type exists,
-// trying: member/field prefix → metadata key → delta key prefix (in order).
+// wideColumnTypeExists checks members first. If only metadata or deltas remain,
+// the aggregated length decides whether the collection still exists.
 func (r *RedisServer) wideColumnTypeExists(
 	ctx context.Context,
 	key []byte,
@@ -101,16 +101,26 @@ func (r *RedisServer) wideColumnTypeExists(
 	memberPrefix func([]byte) []byte,
 	metaKeyFn func([]byte) []byte,
 	deltaPrefix func([]byte) []byte,
+	resolveLen func(context.Context, []byte, uint64) (int64, bool, error),
 ) (bool, error) {
 	if found, err := r.prefixExistsAt(ctx, memberPrefix(key), readTS); err != nil || found {
 		return found, err
 	}
-	if exists, err := r.store.ExistsAt(ctx, metaKeyFn(key), readTS); err != nil {
+	metaExists, err := r.store.ExistsAt(ctx, metaKeyFn(key), readTS)
+	if err != nil {
 		return false, errors.WithStack(err)
-	} else if exists {
-		return true, nil
 	}
-	return r.prefixExistsAt(ctx, deltaPrefix(key), readTS)
+	if !metaExists {
+		deltaExists, err := r.prefixExistsAt(ctx, deltaPrefix(key), readTS)
+		if err != nil || !deltaExists {
+			return false, err
+		}
+	}
+	length, _, err := resolveLen(ctx, key, readTS)
+	if err != nil {
+		return false, err
+	}
+	return length > 0, nil
 }
 
 // prefixExistsAt reports whether any key under prefix exists at readTS.
@@ -470,11 +480,11 @@ func (r *RedisServer) probeExpectedType(ctx context.Context, key []byte, readTS 
 		_, found, err := r.probeListType(ctx, key, readTS)
 		return found, err
 	case redisTypeHash:
-		return r.wideColumnTypeExists(ctx, key, readTS, store.HashFieldScanPrefix, store.HashMetaKey, store.HashMetaDeltaScanPrefix)
+		return r.wideColumnTypeExists(ctx, key, readTS, store.HashFieldScanPrefix, store.HashMetaKey, store.HashMetaDeltaScanPrefix, r.resolveHashMeta)
 	case redisTypeSet:
-		return r.wideColumnTypeExists(ctx, key, readTS, store.SetMemberScanPrefix, store.SetMetaKey, store.SetMetaDeltaScanPrefix)
+		return r.wideColumnTypeExists(ctx, key, readTS, store.SetMemberScanPrefix, store.SetMetaKey, store.SetMetaDeltaScanPrefix, r.resolveSetMeta)
 	case redisTypeZSet:
-		return r.wideColumnTypeExists(ctx, key, readTS, store.ZSetMemberScanPrefix, store.ZSetMetaKey, store.ZSetMetaDeltaScanPrefix)
+		return r.wideColumnTypeExists(ctx, key, readTS, store.ZSetMemberScanPrefix, store.ZSetMetaKey, store.ZSetMetaDeltaScanPrefix, r.resolveZSetMeta)
 	case redisTypeStream:
 		return r.probeStreamExists(ctx, key, readTS)
 	case redisTypeNone:
