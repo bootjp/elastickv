@@ -96,6 +96,13 @@ func TestRedis_LuaRecreateEmptyHashDropsOldTTL(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, time.Duration(-1), ttl)
 	require.Equal(t, int64(1), client.SCard(ctx, key).Val())
+	pttlKey := key + ":pttl"
+	require.NoError(t, client.HSet(ctx, pttlKey, "field", "value").Err())
+	require.NoError(t, client.Expire(ctx, pttlKey, time.Minute).Err())
+	require.NoError(t, client.HDel(ctx, pttlKey, "field").Err())
+	remaining, err := client.Eval(ctx, `redis.call('SADD', KEYS[1], 'member'); return redis.call('PTTL', KEYS[1])`, []string{pttlKey}).Int64()
+	require.NoError(t, err)
+	require.Equal(t, int64(-1), remaining)
 
 	withTTL := key + ":explicit"
 	require.NoError(t, client.HSet(ctx, withTTL, "field", "value").Err())

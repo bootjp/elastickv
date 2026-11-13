@@ -396,6 +396,17 @@ func (c *luaScriptContext) ttlState(key []byte) *luaTTLState {
 
 func (c *luaScriptContext) loadTTL(key []byte) (*time.Time, error) {
 	st := c.ttlState(key)
+	if _, touched := c.touched[string(key)]; touched && !st.dirty {
+		rawStartType, err := c.rawStartTypeForCommitPlan(c.scriptCtx(), key)
+		if err != nil {
+			return nil, err
+		}
+		if rawStartType == redisTypeNone {
+			st.loaded = true
+			st.value = nil
+			return nil, nil
+		}
+	}
 	if st.loaded {
 		return st.value, nil
 	}
