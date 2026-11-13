@@ -429,7 +429,11 @@ func (s *S3Server) AdminDeleteBucket(ctx context.Context, principal AdminPrincip
 	if err != nil {
 		return err //nolint:wrapcheck // sentinel errors propagate as-is.
 	}
-	return s.runBucketDeleteSafetyNet(ctx, name, deletedGeneration)
+	if err := s.runBucketDeleteSafetyNet(ctx, name, deletedGeneration); err != nil {
+		slog.WarnContext(ctx, "s3 admin bucket cleanup deferred to recovery",
+			"bucket", name, "generation", deletedGeneration, "err", err)
+	}
+	return nil
 }
 
 // adminDeleteBucketTxnBody is the per-attempt body retryS3Mutation
@@ -499,9 +503,8 @@ func bucketDeleteSafetyNetElems(bucket string, generation uint64) []*kv.Elem[kv.
 	}
 }
 
-// runBucketDeleteSafetyNet runs the Phase-2 DEL_PREFIX dispatch. Phase 1 has
-// already deleted the bucket meta, so this helper retries transient fencing in
-// place instead of re-entering the full delete transaction.
+// runBucketDeleteSafetyNet finishes the durable cleanup marker left by Phase 1.
+// A failed step leaves the marker for startup recovery to retry.
 func (s *S3Server) runBucketDeleteSafetyNet(ctx context.Context, bucket string, generation uint64) error {
 	prefix := s3keys.ChunkRefPrefixForBucket(bucket, generation)
 	if err := s.deleteByPrefix(ctx, prefix, bucket, generation, "", ""); err != nil {
@@ -515,14 +518,19 @@ func (s *S3Server) runBucketDeleteSafetyNet(ctx context.Context, bucket string, 
 	})
 	if err != nil {
 		slog.WarnContext(ctx,
-			"bucket delete safety-net DEL_PREFIX failed; bucket meta is gone but orphan sweep incomplete",
+			"bucket delete safety-net DEL_PREFIX failed; recovery marker retained",
 			slog.String("bucket", bucket),
 			slog.Uint64("generation", generation),
 			slog.String("error", err.Error()),
 		)
-		return nil
+		return errors.WithStack(err)
 	}
-	return nil
+	return s.retryS3Mutation(ctx, func() error {
+		_, err := s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+			Elems: []*kv.Elem[kv.OP]{{Op: kv.Del, Key: s3keys.BucketCleanupKey(bucket, generation)}},
+		})
+		return errors.WithStack(err)
+	})
 }
 
 // adminCanonicalACL normalises an empty input to the canned

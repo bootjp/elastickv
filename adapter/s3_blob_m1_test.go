@@ -526,6 +526,7 @@ func TestGRPCS3BlobClusterRequiresAndForwardsBearerToken(t *testing.T) {
 
 	withoutToken := requireGRPCS3BlobCluster(t, "")
 	require.False(t, withoutToken.AllPeersSupportS3BlobOffload(context.Background()))
+	require.False(t, withoutToken.AllPeersSupportS3BlobGC(context.Background()))
 
 	cluster := requireGRPCS3BlobCluster(t, "peer-secret")
 	adminCtx := cluster.authorizedAdminContext(context.Background())
@@ -569,6 +570,16 @@ func TestGRPCS3BlobClusterAuthenticatedCapabilityPushAndFetch(t *testing.T) {
 	cluster := NewGRPCS3BlobCluster("n1", members, "read-only-admin", "peer-secret")
 	t.Cleanup(func() { require.NoError(t, cluster.Close()) })
 	require.True(t, cluster.AllPeersSupportS3BlobOffload(context.Background()))
+	gcChecker, ok := cluster.(S3BlobGCCapabilityChecker)
+	require.True(t, ok)
+	require.False(t, gcChecker.AllPeersSupportS3BlobGC(context.Background()),
+		"an M1-only peer must not satisfy the M3 GC guard")
+	admin.SetCapability(S3BlobGCCapabilityName, true)
+	gcCluster := NewGRPCS3BlobCluster("n1", members, "read-only-admin", "peer-secret")
+	t.Cleanup(func() { require.NoError(t, gcCluster.Close()) })
+	gcChecker, ok = gcCluster.(S3BlobGCCapabilityChecker)
+	require.True(t, ok)
+	require.True(t, gcChecker.AllPeersSupportS3BlobGC(context.Background()))
 
 	mixedGroups := staticS3BlobMembership{
 		members: members.members,
@@ -580,6 +591,10 @@ func TestGRPCS3BlobClusterAuthenticatedCapabilityPushAndFetch(t *testing.T) {
 	t.Cleanup(func() { require.NoError(t, mixedCluster.Close()) })
 	require.False(t, mixedCluster.AllPeersSupportS3BlobOffload(context.Background()),
 		"a peer outside the chunk's sample group must keep rollout fail-closed")
+	gcChecker, ok = mixedCluster.(S3BlobGCCapabilityChecker)
+	require.True(t, ok)
+	require.False(t, gcChecker.AllPeersSupportS3BlobGC(context.Background()),
+		"GC capability must cover the whole cluster, not only a chunk's replicas")
 
 	payload := []byte("authenticated-peer-transfer")
 	digest := sha256.Sum256(payload)
@@ -591,6 +606,9 @@ func TestGRPCS3BlobClusterAuthenticatedCapabilityPushAndFetch(t *testing.T) {
 
 	unauthenticated := NewGRPCS3BlobCluster("n1", members, "read-only-admin", "")
 	t.Cleanup(func() { require.NoError(t, unauthenticated.Close()) })
+	gcChecker, ok = unauthenticated.(S3BlobGCCapabilityChecker)
+	require.True(t, ok)
+	require.False(t, gcChecker.AllPeersSupportS3BlobGC(context.Background()))
 	err = unauthenticated.PushChunkBlob(context.Background(), replica, digest, payload, 11)
 	require.Equal(t, codes.Unauthenticated, status.Code(err))
 }
@@ -799,6 +817,7 @@ func newFakeS3BlobCluster() *fakeS3BlobCluster {
 }
 
 func (c *fakeS3BlobCluster) AllPeersSupportS3BlobOffload(context.Context) bool { return true }
+func (c *fakeS3BlobCluster) AllPeersSupportS3BlobGC(context.Context) bool      { return true }
 func (c *fakeS3BlobCluster) SelfNodeID() string                                { return c.self }
 func (c *fakeS3BlobCluster) Close() error                                      { return nil }
 

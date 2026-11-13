@@ -1445,7 +1445,8 @@ func (i *Internal) migrationExportRouteFilter(req *pb.ExportRangeVersionsRequest
 
 func migrationFamilyRequiresDecodedS3(family uint32) bool {
 	return family == distribution.MigrationFamilyS3BucketMeta ||
-		family == distribution.MigrationFamilyS3BucketGeneration
+		family == distribution.MigrationFamilyS3BucketGeneration ||
+		family == distribution.MigrationFamilyS3BucketCleanup
 }
 
 func decodedS3BucketRouteFilter(family uint32, routeStart, routeEnd []byte) func([]byte) bool {
@@ -1491,6 +1492,9 @@ func decodedS3BucketName(family uint32, rawKey []byte) (string, bool) {
 		return s3keys.ParseBucketMetaKey(rawKey)
 	case distribution.MigrationFamilyS3BucketGeneration:
 		return s3keys.ParseBucketGenerationKey(rawKey)
+	case distribution.MigrationFamilyS3BucketCleanup:
+		bucket, _, ok := s3keys.ParseBucketCleanupKey(rawKey)
+		return bucket, ok
 	default:
 		return "", false
 	}

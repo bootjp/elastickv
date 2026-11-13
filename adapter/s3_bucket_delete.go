@@ -40,5 +40,6 @@ func (s *S3Server) bucketDeleteTxnElems(ctx context.Context, bucket string, gene
 	return []*kv.Elem[kv.OP]{
 		{Op: kv.Del, Key: s3keys.BucketMetaKey(bucket)},
 		{Op: kv.Put, Key: key, Value: encodeS3Generation(generation)},
+		{Op: kv.Put, Key: s3keys.BucketCleanupKey(bucket, generation)},
 	}, nil
 }

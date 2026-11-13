@@ -182,8 +182,12 @@ func (s *S3Server) s3BlobOffloadDecision(ctx context.Context) s3BlobOffloadDecis
 	// be enabled operationally until M3 installs reference counting, the grace
 	// queue, and the orphan scanner. M3 sets this readiness only after those
 	// workers are wired into the server lifecycle.
-	if !s.blobOffloadGCReady {
+	if !s.blobOffloadGCReady.Load() {
 		return s3BlobOffloadDecision{mode: s3BlobOffloadModeLegacy, reason: s3BlobOffloadReasonGCNotReady}
+	}
+	gcChecker, ok := s.blobOffloadChecker.(S3BlobGCCapabilityChecker)
+	if !ok || !gcChecker.AllPeersSupportS3BlobGC(ctx) {
+		return s3BlobOffloadDecision{mode: s3BlobOffloadModeLegacy, reason: s3BlobOffloadReasonCapabilityMissing}
 	}
 	return s3BlobOffloadDecision{mode: s3BlobOffloadModeOffload, reason: s3BlobOffloadReasonEnabled}
 }

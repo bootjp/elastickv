@@ -73,6 +73,9 @@ func s3BucketAuxiliaryRouteRange(rawKey []byte) ([]byte, []byte, bool) {
 		bucket, ok = s3keys.ParseBucketGenerationKey(rawKey)
 	}
 	if !ok {
+		bucket, _, ok = s3keys.ParseBucketCleanupKey(rawKey)
+	}
+	if !ok {
 		return nil, nil, false
 	}
 	bucketRouteStart := s3keys.RoutePrefixForBucketAnyGeneration(bucket)

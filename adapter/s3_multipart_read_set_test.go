@@ -253,7 +253,7 @@ func TestS3DeleteBucketWritesUploadPartGenerationFence(t *testing.T) {
 				}
 				h.waitCleanups()
 				req := h.coord.lastTxnWriting(t, metaKey)
-				assert.Len(t, req.Elems, 2)
+				assert.Len(t, req.Elems, 3)
 				foundGenerationFence := false
 				for _, elem := range req.Elems {
 					if bytes.Equal(elem.Key, metaKey) {

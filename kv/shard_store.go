@@ -1768,7 +1768,8 @@ func (s *ShardStore) routesForS3BucketAuxiliaryScan(start []byte, end []byte) ([
 
 func s3BucketAuxiliaryScanBounds(start []byte, end []byte) bool {
 	if !bytes.HasPrefix(start, []byte(s3keys.BucketMetaPrefix)) &&
-		!bytes.HasPrefix(start, []byte(s3keys.BucketGenerationPrefix)) {
+		!bytes.HasPrefix(start, []byte(s3keys.BucketGenerationPrefix)) &&
+		!bytes.HasPrefix(start, []byte(s3keys.BucketCleanupPrefix)) {
 		return false
 	}
 	if end == nil {

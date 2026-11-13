@@ -14,14 +14,14 @@
 > from the *Raft log itself* so that snapshots and follower catch-up
 > stay bounded as the data set grows.
 
-Implementation status (updated 2026-07-23): the chunkref/chunkblob
+Implementation status: the chunkref/chunkblob
 keyspace, local offload decision, PUT/GET helpers, peer blob
 replication/fetch RPCs, follower fetch/backfill helpers, metrics, and
 tests are present in `adapter/s3_blob_*.go`, `internal/s3keys/`, and
-`monitoring/s3.go`. The runtime still fails closed because the M3
-reference-count, grace-queue, orphan-scanner, and GC-readiness wiring
-are not implemented; the M4 legacy `BlobKey` migrator is also still
-open.
+`monitoring/s3.go`. M3 reference counting, the grace queue, local GC
+workers, startup cleanup recovery, and peer capability checks are
+wired. Offload remains opt-in pending production acceptance measurements;
+the M4 legacy `BlobKey` migrator is still open.
 
 ---
 
@@ -633,7 +633,7 @@ capability-advertising peers exists.
 | M0 | Spike: prove the chunkref + chunkblob keyspaces under a feature flag with 1 % traffic. Measure local Pebble write amp & blob fetch latency. | Implemented. |
 | M1 | PUT path emits chunkrefs through Raft; chunkblob writes go directly to local Pebble. **`FetchChunkBlob` and `PushChunkBlob` RPCs ship in this milestone** because both M1 PUT (semi-synchronous push) and M1 GET (proxy-on-miss) depend on them — without them M1 GET could only serve local-hit or 503. | Implemented behind the GC-readiness gate. |
 | M2 | Async fetch worker pool for follower apply (catch-up after a long absence). Independent of M1's synchronous `FetchChunkBlob` use on the GET path. SHA verification + retry from alternate peer on mismatch. | Partially implemented: fetch/backfill helpers exist; production enablement remains gated by M3. |
-| M3 | Reference-count + grace-period GC (the queue-based scheme in §3.5). | In progress: the §3.5 keyspaces (`!s3\|chunkref-rc\|`, `!s3\|chunkblob-gc-queue\|`) and their codecs are implemented in `internal/s3keys/chunkblob_gc.go`. Queue timestamps are HLC commit timestamps, and `ChunkBlobGCGraceBoundary` converts a wall-clock grace period into that domain so a sweeper never mixes it with Unix nanoseconds. The reference-count mutation planner (`PlanChunkRefRCMutations`) is implemented: it encodes the atomic-pair semantics — increment, decrement-to-zero-and-queue, re-reference-and-dequeue, underflow-fails-closed — as a pure function the chunkref txn will call. The sweeper's decision layer (`ClassifyChunkBlobSweep`) is also implemented: it maps one queue entry plus the reference-count record to reclaim / drop-entry-only / skip, which is the classification the conditional Raft delete in 3(b)(i) is built from. The sweeper loop itself (`ChunkBlobSweeper`) is implemented over narrow injected interfaces, enforcing the 3(b) phase ordering — Raft conditional delete first, local unlink second — and treating a lost conditional delete as a skip rather than a failure. The orphan scan (`ChunkBlobOrphanScanner`) is also implemented, covering both documented sources — a sweeper that crashed between phases, and a PUT that aborted before dispatching its chunkref — gated on the blob's own age so an in-flight upload is never mistaken for an abort. The planner and store adapters are implemented; production lifecycle and recovery remain. |
+| M3 | Reference-count + grace-period GC (the queue-based scheme in §3.5). | Implemented behind opt-in: atomic RC/queue mutations, Raft-conditional reclaim, local sweep/orphan workers per physical store, persisted bucket-cleanup retry, startup readiness gate, and all-peer M3 capability check. Production acceptance measurements and default flip remain open. |
 | M4 | Migrator: rewrite legacy `BlobKey` data in the background. Off by default until M0-M3 burn in for 30 days in production. | Open. |
 
 The M3 accounting slice wires `PlanChunkRefRCMutations` into explicit
@@ -641,23 +641,22 @@ chunkref PUT and DEL transactions, including staged upload batches,
 manifest cleanup, upload-abort cleanup, and bucket deletion regardless
 of the local GC-readiness gate. Each transaction validates the observed
 chunkref and RC keys; a missing or malformed RC fails closed rather
-than decrementing an unproven count. The next slice supplies the Raft
+than decrementing an unproven count. The Raft
 queue/RC store adapter and atomic node-local conditional unlink for both
 Pebble and in-memory stores. Reusing an existing payload now records a
 new local version so a concurrent sweep cannot unlink an acknowledged
-PUT. The remaining M3 work is server lifecycle wiring for every local
-store, recovery of incomplete bucket sweeps, and production acceptance
-measurements. The readiness gate remains false until those pieces are
-complete.
+PUT. The server starts local sweep/orphan workers and recovers persisted
+bucket-cleanup markers before opening its local readiness gate. The
+remaining M3 work is production acceptance measurement; offload remains
+disabled by default.
 
 Acceptance criteria for M3 (the milestone that flips `ELASTICKV_S3_BLOB_OFFLOAD=true` by default):
 
-Until M3 wires reference counting, the grace queue, and the orphan
-scanner into the server lifecycle, the runtime GC-readiness gate
-remains false. Setting `ELASTICKV_S3_BLOB_OFFLOAD=true` before that
-point still selects the legacy path. This fail-closed gate prevents
-M1 chunkblobs from becoming an unbounded production keyspace while
-preserving explicit test coverage of the M1 data path.
+The runtime GC-readiness gate opens only after the local workers are
+installed and the first bucket-cleanup recovery pass succeeds. Offload
+also requires all peers to advertise the M3 capability; mixed-version
+clusters use the legacy path. The flag is opt-in until the acceptance
+criteria below are measured in production.
 
 - WAL growth per GiB of S3 PUT < 1 MiB on a one-week soak test.
 - Snapshot transfer for a 100 GiB-cluster follower restart completes

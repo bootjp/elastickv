@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/bootjp/elastickv/internal/s3keys"
@@ -114,7 +115,8 @@ type S3Server struct {
 	putAdmission         *s3PutAdmission
 	putAdmissionObserver S3PutAdmissionObserver
 	blobOffloadEnabled   bool
-	blobOffloadGCReady   bool
+	blobOffloadGCReady   atomic.Bool
+	blobGC               s3BlobGCService
 	blobOffloadChecker   S3BlobOffloadCapabilityChecker
 	blobOffloadObserver  S3BlobOffloadObserver
 	blobCluster          S3BlobCluster
@@ -465,6 +467,7 @@ func (s *S3Server) Stop() {
 	if s == nil {
 		return
 	}
+	s.stopBlobGC()
 	if s.blobBackfiller != nil {
 		s.blobBackfiller.Stop()
 	}
@@ -861,8 +864,8 @@ func (s *S3Server) deleteBucket(w http.ResponseWriter, r *http.Request, bucket s
 	// Phase 2: DEL_PREFIX safety net. See AdminDeleteBucket /
 	// runBucketDeleteSafetyNet for the contract.
 	if err := s.runBucketDeleteSafetyNet(r.Context(), bucket, deletedGeneration); err != nil {
-		writeS3MutationError(w, err, bucket, "")
-		return
+		slog.WarnContext(r.Context(), "s3 bucket cleanup deferred to recovery",
+			"bucket", bucket, "generation", deletedGeneration, "err", err)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }

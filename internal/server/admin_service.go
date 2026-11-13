@@ -212,6 +212,10 @@ func configureAdminService(
 			adapter.S3BlobOffloadCapabilityName,
 			s3BlobOffloadAdminCapability(auth.AdminToken, auth.PeerToken, s3BlobOffloadEnabled),
 		)
+		srv.SetCapability(
+			adapter.S3BlobGCCapabilityName,
+			adapter.S3BlobGCLocalCapability() && s3BlobOffloadAdminCapability(auth.AdminToken, auth.PeerToken, s3BlobOffloadEnabled),
+		)
 	}
 	// token is what setupAdminService hands to SetLeaderReadToken and the
 	// per-group backup proposer, so it has to survive the interceptor build.

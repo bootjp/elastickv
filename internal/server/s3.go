@@ -105,6 +105,11 @@ func runS3Server(ctx context.Context, eg *errgroup.Group, s3Server *adapter.S3Se
 			runDoneCancel()
 			return errors.WithStack(err)
 		}
+		if err := s3Server.StartBlobGC(ctx); err != nil {
+			s3Server.Stop()
+			runDoneCancel()
+			return s3StartupResult(ctx, err)
+		}
 		err := s3Server.Run()
 		runDoneCancel()
 		if err == nil || errors.Is(err, net.ErrClosed) {
@@ -123,10 +128,21 @@ func runS3BlobBackfillOnly(ctx context.Context, eg *errgroup.Group, s3Server *ad
 			s3Server.Stop()
 			return errors.WithStack(err)
 		}
+		if err := s3Server.StartBlobGC(ctx); err != nil {
+			s3Server.Stop()
+			return s3StartupResult(ctx, err)
+		}
 		<-ctx.Done()
 		s3Server.Stop()
 		return nil
 	})
+}
+
+func s3StartupResult(ctx context.Context, err error) error {
+	if ctx.Err() != nil {
+		return nil //nolint:nilerr // canceled startup is a normal shutdown.
+	}
+	return errors.WithStack(err)
 }
 
 func s3BlobNodeEnabled(s3Address, peerTokenFile string) bool {

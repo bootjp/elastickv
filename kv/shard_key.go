@@ -161,6 +161,9 @@ func routeOwnershipKey(key []byte) []byte {
 	if bucket, ok := s3keys.ParseBucketGenerationKey(key); ok {
 		return s3keys.RoutePrefixForBucketAnyGeneration(bucket)
 	}
+	if bucket, _, ok := s3keys.ParseBucketCleanupKey(key); ok {
+		return s3keys.RoutePrefixForBucketAnyGeneration(bucket)
+	}
 	return routeKey(key)
 }
 

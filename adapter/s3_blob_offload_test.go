@@ -28,7 +28,7 @@ func TestS3BlobOffloadEnvCanEnableGate(t *testing.T) {
 	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
 
 	require.True(t, server.blobOffloadEnabled)
-	require.False(t, server.blobOffloadGCReady)
+	require.False(t, server.blobOffloadGCReady.Load())
 }
 
 func TestS3BlobOffloadDecisionFailsClosed(t *testing.T) {
@@ -88,6 +88,23 @@ func TestS3BlobOffloadDecisionFailsClosedWithoutGC(t *testing.T) {
 	require.Equal(t, s3BlobOffloadReasonGCNotReady, decision.reason)
 }
 
+func TestS3BlobOffloadDecisionRejectsM1OnlyCluster(t *testing.T) {
+	t.Parallel()
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil,
+		WithS3BlobOffloadEnabled(true),
+		WithS3BlobOffloadCapabilityChecker(m1OnlyS3BlobCapability{}),
+		withS3BlobOffloadGCReadyForTest(),
+	)
+	decision := server.s3BlobOffloadDecision(context.Background())
+	require.Equal(t, s3BlobOffloadModeLegacy, decision.mode)
+	require.Equal(t, s3BlobOffloadReasonCapabilityMissing, decision.reason)
+}
+
+type m1OnlyS3BlobCapability struct{}
+
+func (m1OnlyS3BlobCapability) AllPeersSupportS3BlobOffload(context.Context) bool { return true }
+
 func TestS3Server_PutObjectBlobOffloadFlagFallsBackToLegacyWithoutCapability(t *testing.T) {
 	t.Parallel()
 
@@ -132,10 +149,14 @@ func (alwaysS3BlobOffloadCapable) AllPeersSupportS3BlobOffload(context.Context) 
 	return true
 }
 
+func (alwaysS3BlobOffloadCapable) AllPeersSupportS3BlobGC(context.Context) bool {
+	return true
+}
+
 func withS3BlobOffloadGCReadyForTest() S3ServerOption {
 	return func(server *S3Server) {
 		if server != nil {
-			server.blobOffloadGCReady = true
+			server.blobOffloadGCReady.Store(true)
 		}
 	}
 }
