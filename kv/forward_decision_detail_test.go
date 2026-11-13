@@ -153,6 +153,6 @@ func TestForwardDecisionStatusCannotLookDefinitiveToLegacyDecoder(t *testing.T) 
 		require.False(t, IsForwardNotLeader(err))
 		require.False(t, IsForwardComposed1Violation(err))
 		require.False(t, IsForwardComposed1VersionGCd(err))
-		require.False(t, hasTransientLeaderPhrase(err))
+		require.False(t, isTransientLeaderError(err))
 	}
 }
