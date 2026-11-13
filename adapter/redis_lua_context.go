@@ -330,7 +330,7 @@ func (c *luaScriptContext) exec(command string, args []string) (luaReply, error)
 	var err error
 	if handler, ok := luaCommandHandlers[command]; ok {
 		reply, err = handler(c, args)
-		if c.observeNestedReads && err == nil {
+		if c.observeNestedReads {
 			c.server.observeLuaRead(c.ctx, command, args)
 		}
 	} else {

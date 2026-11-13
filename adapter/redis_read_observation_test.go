@@ -185,6 +185,20 @@ func TestRedisReadObservationInsideLua(t *testing.T) {
 	require.Equal(t, [][]byte{redisUserRouteKey([]byte("lua-key"))}, coord.keys)
 }
 
+func TestRedisReadObservationInsideLuaPCallError(t *testing.T) {
+	coord := &redisReadObservationCoordinator{}
+	server := &RedisServer{coordinator: coord, store: store.NewMVCCStore(), scriptCache: map[string]string{}}
+	conn := &recordingConn{}
+	server.eval(conn, redcon.Command{Args: [][]byte{
+		[]byte(cmdEval), []byte("redis.call('SET', KEYS[1], 'value'); local result = redis.pcall('HGET', KEYS[1], 'field'); return result.err"), []byte("1"), []byte("wrong-type"),
+	}})
+	require.Empty(t, conn.err)
+	require.Contains(t, string(conn.bulk), "WRONGTYPE")
+	require.Equal(t, [][]byte{
+		redisUserRouteKey([]byte("wrong-type")), redisUserRouteKey([]byte("wrong-type")),
+	}, coord.keys)
+}
+
 func TestRedisReadObservationInsideExec(t *testing.T) {
 	coord := &redisReadObservationCoordinator{}
 	server := &RedisServer{coordinator: coord, store: store.NewMVCCStore()}
