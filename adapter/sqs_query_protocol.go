@@ -143,9 +143,7 @@ func (s *SQSServer) handleQuery(w http.ResponseWriter, r *http.Request) {
 	}
 	s.fillQueryQueueURLFromPath(r, form)
 	if h := sqsQueryHandlers[action]; h != nil {
-		if isSQSReadObservationAction(action) {
-			kv.MarkUnattributableClientReadThrough(s.coordinator, 0)
-		}
+		kv.MarkUnattributableClientReadThrough(s.coordinator, 0)
 		h(s, w, r, form)
 		return
 	}
