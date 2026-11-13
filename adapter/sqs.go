@@ -613,7 +613,19 @@ func (s *SQSServer) handle(w http.ResponseWriter, r *http.Request) {
 		writeSQSError(w, http.StatusBadRequest, sqsErrInvalidAction, "unsupported SQS target: "+target)
 		return
 	}
+	if isSQSReadObservationAction(strings.TrimPrefix(target, sqsTargetPrefix)) {
+		kv.MarkUnattributableClientReadThrough(s.coordinator, 0)
+	}
 	handler(w, r)
+}
+
+func isSQSReadObservationAction(action string) bool {
+	switch sqsTargetPrefix + action {
+	case sqsListQueuesTarget, sqsGetQueueUrlTarget, sqsGetQueueAttributesTarget, sqsListQueueTagsTarget, sqsReceiveMessageTarget:
+		return true
+	default:
+		return false
+	}
 }
 
 // handleQueryProtocol owns the query-protocol leg of handle(): method

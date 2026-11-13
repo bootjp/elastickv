@@ -152,6 +152,48 @@ func (r *GRPCServer) clock() *kv.HLC {
 	return r.coordinator.Clock()
 }
 
+func (r *GRPCServer) observeGRPCPointRead(ctx context.Context, key []byte, groupID uint64) {
+	if r.coordinator == nil || !r.grpcServesGroupRead(key, groupID) {
+		return
+	}
+	kv.ObserveReadForKeyThrough(r.coordinator, ctx, key)
+}
+
+func (r *GRPCServer) grpcServesGroupRead(key []byte, groupID uint64) bool {
+	if groupID == 0 {
+		return r.coordinator.IsLeaderForKey(key)
+	}
+	if groups, ok := r.coordinator.(kv.GroupLeaderRoutableCoordinator); ok {
+		return groups.IsLeaderForGroup(groupID)
+	}
+	return r.coordinator.IsLeaderForKey(key)
+}
+
+func (r *GRPCServer) markGRPCScanRead(groupID uint64, start []byte, keys [][]byte) {
+	if r.coordinator == nil || !r.grpcServesScan(groupID, start, keys) {
+		return
+	}
+	kv.MarkUnattributableClientReadThrough(r.coordinator, 0)
+}
+
+func (r *GRPCServer) grpcServesScan(groupID uint64, start []byte, keys [][]byte) bool {
+	if groupID != 0 {
+		if groups, ok := r.coordinator.(kv.GroupLeaderRoutableCoordinator); ok {
+			return groups.IsLeaderForGroup(groupID)
+		}
+		return r.coordinator.IsLeader()
+	}
+	for _, key := range keys {
+		if r.coordinator.IsLeaderForKey(key) {
+			return true
+		}
+	}
+	if len(keys) != 0 {
+		return false
+	}
+	return r.coordinator.IsLeaderForKey(start)
+}
+
 func (r *GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.RawGetResponse, error) {
 	if err := r.requireReadReady(); err != nil {
 		return nil, err
@@ -177,6 +219,7 @@ func (r *GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.Raw
 		v, err = r.store.GetAt(ctx, req.Key, readTS)
 	}
 	if errors.Is(err, store.ErrKeyNotFound) {
+		r.observeGRPCPointRead(ctx, req.GetKey(), req.GetGroupId())
 		return &pb.RawGetResponse{Value: nil, Exists: false}, nil
 	}
 	if errors.Is(err, store.ErrReadTSCompacted) {
@@ -185,6 +228,7 @@ func (r *GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.Raw
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
+	r.observeGRPCPointRead(ctx, req.GetKey(), req.GetGroupId())
 
 	r.log.InfoContext(ctx, "Get",
 		slog.String("key", string(req.Key)),
@@ -397,6 +441,7 @@ func (r *GRPCServer) RawScanAt(ctx context.Context, req *pb.RawScanAtRequest) (*
 		if err != nil {
 			return rawScanErrorResponse(err)
 		}
+		r.markGRPCScanRead(req.GetGroupId(), req.GetStartKey(), keys)
 		return &pb.RawScanAtResponse{Kv: rawKeyPairs(keys)}, nil
 	}
 
@@ -404,6 +449,7 @@ func (r *GRPCServer) RawScanAt(ctx context.Context, req *pb.RawScanAtRequest) (*
 	if err != nil {
 		return rawScanErrorResponse(err)
 	}
+	r.markGRPCScanRead(req.GetGroupId(), req.GetStartKey(), storeKeysFromKVPairs(res))
 	return &pb.RawScanAtResponse{Kv: rawKvPairs(res)}, nil
 }
 
@@ -739,11 +785,13 @@ func (r *GRPCServer) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetRespon
 	if err != nil {
 		switch {
 		case errors.Is(err, store.ErrKeyNotFound):
+			r.observeGRPCPointRead(ctx, req.GetKey(), 0)
 			return &pb.GetResponse{Value: nil}, nil
 		default:
 			return nil, errors.WithStack(err)
 		}
 	}
+	r.observeGRPCPointRead(ctx, req.GetKey(), 0)
 
 	r.log.InfoContext(ctx, "Get",
 		slog.String("key", string(req.Key)),
@@ -801,6 +849,7 @@ func (r *GRPCServer) Scan(ctx context.Context, req *pb.ScanRequest) (*pb.ScanRes
 			Kv: nil,
 		}, errors.WithStack(err)
 	}
+	r.markGRPCScanRead(0, req.GetStartKey(), storeKeysFromKVPairs(res))
 
 	r.log.InfoContext(ctx, "Scan",
 		slog.String("startKey", string(req.StartKey)),

@@ -518,7 +518,13 @@ func (s *S3Server) handle(w http.ResponseWriter, r *http.Request) {
 		writeS3Error(w, authErr.Status, authErr.Code, authErr.Message, bucket, objectKey)
 		return
 	}
+	s.handleAuthorizedRequest(w, r, bucket, objectKey, hasObject)
+}
 
+func (s *S3Server) handleAuthorizedRequest(w http.ResponseWriter, r *http.Request, bucket, objectKey string, hasObject bool) {
+	if r.Method == http.MethodGet || r.Method == http.MethodHead {
+		kv.MarkUnattributableClientReadThrough(s.coordinator, 0)
+	}
 	switch {
 	case bucket == "":
 		s.handleRoot(w, r)
