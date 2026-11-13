@@ -235,7 +235,7 @@ func TestAppendPartBlobKeys_FlushFiresEveryS3MetaBatchOps(t *testing.T) {
 	pending := make([]*kv.Elem[kv.OP], 0, s3MetaBatchOps)
 	flushCalls := 0
 	flushBatchSizes := make([]int, 0, 4)
-	flush := func() {
+	flush := func() bool {
 		// Mirror cleanupManifestBlobs's flush: record the batch size
 		// and then truncate. If the helper's pointer plumbing is
 		// broken, len(pending) here would always be 0 and the
@@ -243,6 +243,7 @@ func TestAppendPartBlobKeys_FlushFiresEveryS3MetaBatchOps(t *testing.T) {
 		flushCalls++
 		flushBatchSizes = append(flushBatchSizes, len(pending))
 		pending = pending[:0]
+		return true
 	}
 
 	srv := (*S3Server)(nil) // method body does not touch s
@@ -273,7 +274,7 @@ func TestAppendPartBlobKeys_UsesVersionedChunkRefsForOffloadedPart(t *testing.T)
 	}
 
 	ok := (*S3Server)(nil).appendPartBlobKeys(
-		&pending, "bucket", 3, "object", "upload", part, func() {},
+		&pending, "bucket", 3, "object", "upload", part, func() bool { return true },
 	)
 	require.True(t, ok)
 	require.Len(t, pending, 1)

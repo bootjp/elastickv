@@ -98,11 +98,26 @@ func (u *s3ChunkUploader) run() (s3ChunkUploadResult, *s3PutBodyError, error) {
 	if bodyErr := u.verifyChecksums(); bodyErr != nil {
 		return u.result, bodyErr, nil
 	}
-	if u.cfg.offloaded {
-		u.result.ChunkRefElems = append([]*kv.Elem[kv.OP](nil), u.pendingBatch...)
+	if err := u.finishOffloadedChunks(); err != nil {
+		return u.result, nil, err
 	}
 	u.result.ETag = hex.EncodeToString(u.etagHasher.Sum(nil))
 	return u.result, nil, nil
+}
+
+func (u *s3ChunkUploader) finishOffloadedChunks() error {
+	if !u.cfg.offloaded {
+		return nil
+	}
+	// Once a staged batch has updated an RC, the final transaction's
+	// original start timestamp cannot validate another update to it.
+	if u.result.ChunkCount > uint64(len(u.pendingBatch)) {
+		if err := u.flushBatch(); err != nil {
+			return err
+		}
+	}
+	u.result.ChunkRefElems = append([]*kv.Elem[kv.OP](nil), u.pendingBatch...)
+	return nil
 }
 
 func (u *s3ChunkUploader) uploadNextChunk() (bool, *s3PutBodyError, error) {
@@ -233,7 +248,12 @@ func (u *s3ChunkUploader) flushBatch() error {
 	// Full offloaded batches are immutable staged refs. Object readers cannot
 	// discover them until the final manifest or part descriptor transaction;
 	// that final metadata commit remains the public linearization point.
-	_, err := u.server.coordinator.Dispatch(u.ctx, &kv.OperationGroup[kv.OP]{Elems: u.pendingBatch})
+	var err error
+	if u.cfg.offloaded {
+		err = u.flushOffloadedBatch()
+	} else {
+		_, err = u.server.coordinator.Dispatch(u.ctx, &kv.OperationGroup[kv.OP]{Elems: u.pendingBatch})
+	}
 	u.releasePendingAdmission()
 	if err != nil {
 		return errors.WithStack(err)
@@ -244,6 +264,23 @@ func (u *s3ChunkUploader) flushBatch() error {
 	u.pendingBatch = u.pendingBatch[:0]
 	u.pendingChunkSizes = u.pendingChunkSizes[:0]
 	return nil
+}
+
+func (u *s3ChunkUploader) flushOffloadedBatch() error {
+	readTimestamp, err := u.server.beginTxnReadTimestamp(u.ctx, u.server.readTS(), "s3 staged chunkrefs: begin read timestamp")
+	if err != nil {
+		return err
+	}
+	readPin := u.server.pinReadTS(readTimestamp.Timestamp())
+	defer readPin.Release()
+	commitTS, err := u.server.nextTxnCommitTS(u.ctx, readTimestamp.Timestamp())
+	if err != nil {
+		return err
+	}
+	return u.server.dispatchS3MetadataMutation(readTimestamp.WithDispatchVoucher(u.ctx), &kv.OperationGroup[kv.OP]{
+		IsTxn: true, StartTS: readTimestamp.Timestamp(), CommitTS: commitTS,
+		Elems: u.pendingBatch,
+	})
 }
 
 func (u *s3ChunkUploader) releasePendingAdmission() {

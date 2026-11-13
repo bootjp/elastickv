@@ -482,7 +482,7 @@ func (s *S3Server) adminDeleteBucketTxnBody(ctx context.Context, name string, de
 // BucketGenerationKey is intentionally not in the list — see the
 // AdminDeleteBucket doc comment for the orphan-isolation rationale.
 //
-// The 6 DEL_PREFIX ops broadcast across every shard
+// The DEL_PREFIX ops broadcast across every shard
 // (kv/sharded_coordinator.go: DEL_PREFIX cannot be routed to a
 // single shard). Acceptable because (a) the empty-probe already
 // confirmed the manifest prefix is empty in the common case, so
@@ -494,7 +494,6 @@ func bucketDeleteSafetyNetElems(bucket string, generation uint64) []*kv.Elem[kv.
 		{Op: kv.DelPrefix, Key: s3keys.UploadMetaPrefixForBucket(bucket, generation)},
 		{Op: kv.DelPrefix, Key: s3keys.UploadPartPrefixForBucket(bucket, generation)},
 		{Op: kv.DelPrefix, Key: s3keys.BlobPrefixForBucket(bucket, generation)},
-		{Op: kv.DelPrefix, Key: s3keys.ChunkRefPrefixForBucket(bucket, generation)},
 		{Op: kv.DelPrefix, Key: s3keys.GCUploadPrefixForBucket(bucket, generation)},
 		{Op: kv.DelPrefix, Key: s3keys.RoutePrefixForBucket(bucket, generation)},
 	}
@@ -504,6 +503,10 @@ func bucketDeleteSafetyNetElems(bucket string, generation uint64) []*kv.Elem[kv.
 // already deleted the bucket meta, so this helper retries transient fencing in
 // place instead of re-entering the full delete transaction.
 func (s *S3Server) runBucketDeleteSafetyNet(ctx context.Context, bucket string, generation uint64) error {
+	prefix := s3keys.ChunkRefPrefixForBucket(bucket, generation)
+	if err := s.deleteByPrefix(ctx, prefix, bucket, generation, "", ""); err != nil {
+		return errors.Wrap(err, "s3: bucket chunkref sweep incomplete")
+	}
 	err := s.retryS3Mutation(ctx, func() error {
 		_, err := s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 			Elems: bucketDeleteSafetyNetElems(bucket, generation),
