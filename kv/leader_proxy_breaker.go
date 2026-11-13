@@ -16,11 +16,15 @@ const (
 	leaderProxyBreakerMaxBackoff       = 2 * time.Second
 )
 
+type leaderProxyCircuitSentinel string
+
+func (e leaderProxyCircuitSentinel) Error() string { return string(e) }
+
 // ErrLeaderProxyCircuitOpen indicates that recent attempts against the same
 // leader identity failed and the shared forwarding breaker is suppressing a
 // retry storm. It is transient: callers may retry after leader publication or
 // the breaker backoff, but a single request must not busy-loop on it.
-var ErrLeaderProxyCircuitOpen = errors.New("leader proxy circuit open")
+var ErrLeaderProxyCircuitOpen = leaderProxyCircuitSentinel("leader proxy circuit open")
 
 type leaderProxyIdentity struct {
 	id      string

@@ -11,6 +11,8 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/redis/go-redis/v9"
 	"github.com/tidwall/redcon"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // captureConn is the minimal redcon.Conn surface these tests inspect.
@@ -27,6 +29,35 @@ func (c *captureConn) WriteArray(count int) {
 	c.wroteArray = true
 }
 
+// go-redis returns a redis.Error when it decodes an error frame from RESP.
+type decodedRedisReply string
+
+func (e decodedRedisReply) Error() string { return string(e) }
+func (decodedRedisReply) RedisError()     {}
+
+func TestIsRedisNotLeaderReply(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"decoded NOTLEADER", decodedRedisReply("NOTLEADER leader not found"), true},
+		{"wrapped decoded NOTLEADER", errors.WithStack(decodedRedisReply("NOTLEADER leader not found")), true},
+		{"plain text lookalike", errors.New("NOTLEADER leader not found"), false},
+		{"suffix lookalike", decodedRedisReply("ERR key: NOTLEADER leader not found"), false},
+		{"different code", decodedRedisReply("ERR not leader"), false},
+		{"code extension", decodedRedisReply("NOTLEADER_EXTRA leader not found"), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := isRedisNotLeaderReply(tc.err); got != tc.want {
+				t.Fatalf("isRedisNotLeaderReply(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestIsTransientLeaderRedisError(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
@@ -38,10 +69,14 @@ func TestIsTransientLeaderRedisError(t *testing.T) {
 		{"adapter.ErrNotLeader", ErrNotLeader, true},
 		{"kv.ErrLeaderNotFound", kv.ErrLeaderNotFound, true},
 		{"kv.ErrLeaderProxyCircuitOpen", kv.ErrLeaderProxyCircuitOpen, true},
+		{"wrapped kv.ErrLeaderProxyCircuitOpen", errors.WithStack(kv.ErrLeaderProxyCircuitOpen), true},
+		{"lookalike circuit error", errors.New("leader proxy circuit open"), false},
 		{"raftengine.ErrNotLeader", raftengine.ErrNotLeader, true},
-		{"raftengine.ErrLeadershipLost", raftengine.ErrLeadershipLost, true},
+		{"raftengine.ErrLeadershipLost", raftengine.ErrLeadershipLost, false},
 		{"unknown outcome after leadership lost",
 			fmt.Errorf("%w: %w", kv.ErrTransactionOutcomeUnknown, raftengine.ErrLeadershipLost), false},
+		{"transport loss alongside leader signal",
+			fmt.Errorf("%w: %w", io.EOF, ErrLeaderNotFound), false},
 		{"raftengine.ErrLeadershipTransferInProgress",
 			raftengine.ErrLeadershipTransferInProgress, true},
 		{"wrapped with errors.WithStack",
@@ -49,34 +84,28 @@ func TestIsTransientLeaderRedisError(t *testing.T) {
 		{"wrapped with errors.Wrapf",
 			errors.Wrapf(kv.ErrLeaderNotFound, "verify leader"), true},
 		{"wrapped with fmt.Errorf %w",
-			fmt.Errorf("dispatch: %w", raftengine.ErrLeadershipLost), true},
+			fmt.Errorf("dispatch: %w", raftengine.ErrLeadershipLost), false},
 		{"unrelated error", io.EOF, false},
 		{"nil", nil, false},
 		{"wrong-type-looking error", errors.New("WRONGTYPE op"), false},
-		// Suffix-fallback regression cases. These cover the gRPC-
-		// boundary path: when the coordinator forwards to a remote
-		// leader and the remote returns ErrLeaderNotFound, gRPC
-		// flattens it to "rpc error: code = X desc = leader not
-		// found"; the typed sentinel chain is gone. The Jepsen
-		// Redis workload (scheduled run 26035515694) saw workers
-		// crash with `:prefix :rpc` because this case was not
-		// classified as transient and the raw "rpc error: …"
-		// reached Carmine.
+		// A status message or a lookalike error is not a typed leader
+		// rejection, even when its final words match a sentinel.
 		{"grpc-wrapped leader not found",
-			errors.New("rpc error: code = Unknown desc = leader not found"), true},
+			status.Error(codes.Unknown, "leader not found"), false},
 		{"grpc-wrapped not leader",
-			errors.New("rpc error: code = FailedPrecondition desc = raft engine: not leader"), true},
+			status.Error(codes.FailedPrecondition, "raft engine: not leader"), false},
 		{"grpc-wrapped leadership lost",
-			errors.New("rpc error: code = Aborted desc = raft engine: leadership lost"), true},
+			status.Error(codes.Aborted, "raft engine: leadership lost"), false},
 		{"grpc-wrapped leadership transfer",
-			errors.New("rpc error: code = Aborted desc = raft engine: leadership transfer in progress"), true},
+			status.Error(codes.Aborted, "raft engine: leadership transfer in progress"), false},
 		{"grpc-wrapped leader proxy circuit open",
-			errors.New("rpc error: code = Unavailable desc = leader proxy circuit open"), true},
-		// Suffix discipline: a user-controlled key in the middle
-		// of the message must NOT trigger a false positive. The kv
-		// suffix matcher pins this exact scenario; mirror it here.
+			status.Error(codes.Unavailable, "leader proxy circuit open"), false},
+		{"lookalike text-only error",
+			errors.New("rpc error: code = Unknown desc = leader not found"), false},
 		{"user key embedding 'not leader' in the middle",
 			errors.New("key: not leader: write conflict"), false},
+		{"user key ending with leader phrase",
+			errors.New("key: private: leader not found"), false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -110,19 +139,27 @@ func TestWriteRedisError(t *testing.T) {
 		{"unknown outcome does not expose its cause",
 			fmt.Errorf("%w: %s", kv.ErrTransactionOutcomeUnknown, "private-key"),
 			"ERR operation outcome unknown"},
+		{"leadership loss after proposal is outcome unknown",
+			fmt.Errorf("private-key: %w", raftengine.ErrLeadershipLost),
+			redisOutcomeUnknownReply},
+		{"transport loss wins over leader signal",
+			fmt.Errorf("%w: %w", io.EOF, ErrLeaderNotFound),
+			redisOutcomeUnknownReply},
 		{"unrelated error untouched",
 			errors.New("WRONGTYPE op"), "WRONGTYPE op"},
-		{"generic io.EOF untouched",
-			io.EOF, io.EOF.Error()},
-		// Suffix-fallback wire reply regression: the gRPC-wrapped
-		// "rpc error: code = Unknown desc = leader not found" string
-		// (the failure mode behind scheduled run 26035515694) must
-		// gain a NOTLEADER prefix on the Redis wire so Carmine maps
-		// it to `:prefix :notleader` and the upstream
-		// jepsen-io/redis with-exceptions catch fires.
-		{"grpc-wrapped leader-not-found gains NOTLEADER prefix",
-			errors.New("rpc error: code = Unknown desc = leader not found"),
-			"NOTLEADER rpc error: code = Unknown desc = leader not found"},
+		{"lost response is outcome unknown",
+			io.EOF, redisOutcomeUnknownReply},
+		{"deadline after submission is outcome unknown",
+			context.DeadlineExceeded, redisOutcomeUnknownReply},
+		{"grpc status does not expose leader prose or claim safe retry",
+			status.Error(codes.Unknown, "private-key: leader not found"),
+			redisOutcomeUnknownReply},
+		{"wrapped grpc status stays outcome unknown",
+			errors.WithStack(status.Error(codes.Unavailable, "private-key: not leader")),
+			redisOutcomeUnknownReply},
+		{"decoded NOTLEADER is fixed and top level",
+			decodedRedisReply("NOTLEADER private-key: leader not found"),
+			redisNotLeaderReply},
 		{"already NOTLEADER-prefixed error is not double-prefixed",
 			errors.New("NOTLEADER leader not found"),
 			"NOTLEADER leader not found"},
@@ -154,21 +191,44 @@ func TestWriteRedisError(t *testing.T) {
 
 func TestHandleProxyTxnError(t *testing.T) {
 	t.Parallel()
-	t.Run("transient leader error is top-level NOTLEADER", func(t *testing.T) {
+	t.Run("grpc status is top-level outcome unknown", func(t *testing.T) {
 		t.Parallel()
 		c := &captureConn{}
-		handled := handleProxyTxnError(c, errors.New("rpc error: code = Unknown desc = leader not found"))
+		handled := handleProxyTxnError(c, status.Error(codes.Unknown, "private-key: leader not found"))
 		if !handled {
 			t.Fatal("handleProxyTxnError returned false")
 		}
-		if c.lastErr != "NOTLEADER rpc error: code = Unknown desc = leader not found" {
+		if c.lastErr != redisOutcomeUnknownReply {
 			t.Fatalf("last error = %q", c.lastErr)
 		}
 		if c.wroteArray {
 			t.Fatalf("unexpected array reply %d", c.lastArray)
 		}
 	})
+	t.Run("leadership loss after proposal is top-level outcome unknown", func(t *testing.T) {
+		t.Parallel()
+		c := &captureConn{}
+		if !handleProxyTxnError(c, errors.WithStack(raftengine.ErrLeadershipLost)) {
+			t.Fatal("handleProxyTxnError returned false")
+		}
+		if c.lastErr != redisOutcomeUnknownReply || c.wroteArray {
+			t.Fatalf("reply = (%q, array=%v)", c.lastErr, c.wroteArray)
+		}
+	})
+	t.Run("lost EXEC response is top-level outcome unknown", func(t *testing.T) {
+		t.Parallel()
+		c := &captureConn{}
+		if !handleProxyTxnError(c, io.EOF) {
+			t.Fatal("handleProxyTxnError returned false")
+		}
+		if c.lastErr != redisOutcomeUnknownReply || c.wroteArray {
+			t.Fatalf("reply = (%q, array=%v)", c.lastErr, c.wroteArray)
+		}
+	})
+}
 
+func TestHandleProxyTxnAbort(t *testing.T) {
+	t.Parallel()
 	t.Run("redis transaction abort remains null array", func(t *testing.T) {
 		t.Parallel()
 		c := &captureConn{}
@@ -183,7 +243,28 @@ func TestHandleProxyTxnError(t *testing.T) {
 			t.Fatalf("unexpected error reply %q", c.lastErr)
 		}
 	})
+}
 
+func TestHandleProxyTxnDecodedNotLeader(t *testing.T) {
+	t.Parallel()
+	c := &captureConn{}
+	if !handleProxyTxnError(c, decodedRedisReply("NOTLEADER private-key: leader not found")) {
+		t.Fatal("handleProxyTxnError returned false")
+	}
+	if c.lastErr != redisNotLeaderReply || c.wroteArray {
+		t.Fatalf("reply = (%q, array=%v)", c.lastErr, c.wroteArray)
+	}
+}
+
+func TestHandleProxyTxnDecodedOutcomeUnknown(t *testing.T) {
+	t.Parallel()
+	c := &captureConn{}
+	if !handleProxyTxnError(c, decodedRedisReply(redisOutcomeUnknownReply)) {
+		t.Fatal("handleProxyTxnError returned false")
+	}
+	if c.lastErr != redisOutcomeUnknownReply || c.wroteArray {
+		t.Fatalf("reply = (%q, array=%v)", c.lastErr, c.wroteArray)
+	}
 }
 
 func TestHandleProxyTxnTerminalExecError(t *testing.T) {
@@ -249,20 +330,47 @@ func TestHandleProxyTxnHeavyCommandBusyError(t *testing.T) {
 
 func TestHandleProxyTxnCommandError(t *testing.T) {
 	t.Parallel()
-	t.Run("transient command error is promoted to top-level NOTLEADER", func(t *testing.T) {
+	t.Run("grpc command status is promoted to top-level outcome unknown", func(t *testing.T) {
 		t.Parallel()
 		cmd := redis.NewCmd(context.Background(), "LRANGE", "k", 0, -1)
-		cmd.SetErr(errors.New("rpc error: code = FailedPrecondition desc = raft engine: not leader"))
+		cmd.SetErr(status.Error(codes.FailedPrecondition, "private-key: raft engine: not leader"))
 		c := &captureConn{}
 		handled := handleProxyTxnCommandError(c, []*redis.Cmd{cmd})
 		if !handled {
 			t.Fatal("handleProxyTxnCommandError returned false")
 		}
-		if c.lastErr != "NOTLEADER rpc error: code = FailedPrecondition desc = raft engine: not leader" {
+		if c.lastErr != redisOutcomeUnknownReply {
 			t.Fatalf("last error = %q", c.lastErr)
 		}
 	})
+	t.Run("leadership loss command is promoted to top-level outcome unknown", func(t *testing.T) {
+		t.Parallel()
+		cmd := redis.NewCmd(context.Background(), "SET", "k", "v")
+		cmd.SetErr(errors.WithStack(raftengine.ErrLeadershipLost))
+		c := &captureConn{}
+		if !handleProxyTxnCommandError(c, []*redis.Cmd{cmd}) {
+			t.Fatal("handleProxyTxnCommandError returned false")
+		}
+		if c.lastErr != redisOutcomeUnknownReply {
+			t.Fatalf("last error = %q", c.lastErr)
+		}
+	})
+	t.Run("lost command response is promoted to top-level outcome unknown", func(t *testing.T) {
+		t.Parallel()
+		cmd := redis.NewCmd(context.Background(), "SET", "k", "v")
+		cmd.SetErr(io.EOF)
+		c := &captureConn{}
+		if !handleProxyTxnCommandError(c, []*redis.Cmd{cmd}) {
+			t.Fatal("handleProxyTxnCommandError returned false")
+		}
+		if c.lastErr != redisOutcomeUnknownReply {
+			t.Fatalf("last error = %q", c.lastErr)
+		}
+	})
+}
 
+func TestHandleProxyTxnCommandOtherError(t *testing.T) {
+	t.Parallel()
 	t.Run("ordinary command error stays in EXEC result array", func(t *testing.T) {
 		t.Parallel()
 		cmd := redis.NewCmd(context.Background(), "LRANGE", "k", 0, -1)
@@ -323,6 +431,32 @@ func TestHandleProxyTxnCommandError(t *testing.T) {
 
 }
 
+func TestHandleProxyTxnCommandDecodedNotLeader(t *testing.T) {
+	t.Parallel()
+	cmd := redis.NewCmd(context.Background(), "SET", "k", "v")
+	cmd.SetErr(decodedRedisReply("NOTLEADER private-key: leader not found"))
+	c := &captureConn{}
+	if !handleProxyTxnCommandError(c, []*redis.Cmd{cmd}) {
+		t.Fatal("handleProxyTxnCommandError returned false")
+	}
+	if c.lastErr != redisNotLeaderReply || c.wroteArray {
+		t.Fatalf("reply = (%q, array=%v)", c.lastErr, c.wroteArray)
+	}
+}
+
+func TestHandleProxyTxnCommandDecodedOutcomeUnknown(t *testing.T) {
+	t.Parallel()
+	cmd := redis.NewCmd(context.Background(), "SET", "k", "v")
+	cmd.SetErr(decodedRedisReply(redisOutcomeUnknownReply))
+	c := &captureConn{}
+	if !handleProxyTxnCommandError(c, []*redis.Cmd{cmd}) {
+		t.Fatal("handleProxyTxnCommandError returned false")
+	}
+	if c.lastErr != redisOutcomeUnknownReply || c.wroteArray {
+		t.Fatalf("reply = (%q, array=%v)", c.lastErr, c.wroteArray)
+	}
+}
+
 func TestHandleProxyTxnCommandHeavyCommandBusyError(t *testing.T) {
 	t.Parallel()
 	cmd := redis.NewCmd(context.Background(), "LRANGE", "k", 0, -1)
@@ -334,47 +468,5 @@ func TestHandleProxyTxnCommandHeavyCommandBusyError(t *testing.T) {
 	}
 	if c.lastErr != errRedisHeavyCommandPoolFull.Error() {
 		t.Fatalf("last error = %q", c.lastErr)
-	}
-}
-
-// TestHasTransientLeaderSuffix_PinsSentinels closes the gap noted
-// at kv/coordinator.go:529 ("A symmetric pin lives in the adapter
-// test package"): the adapter's redisLeaderErrorPhrases set must
-// stay in sync with the actual .Error() text of every transient-
-// leader sentinel the suffix fallback is meant to catch. If a
-// sentinel ever gets renamed (e.g. raftengine.ErrLeadershipLost
-// becomes "raft engine: leadership lost (xyz)") the kv-side pin
-// fails first, but without this adapter-side pin the adapter's
-// phrase list could drift silently and the NOTLEADER classification
-// would regress to the pre-PR-789 worker-crash failure mode.
-//
-// Each case calls hasTransientLeaderSuffix(sentinel.Error()) and
-// asserts true. Wrapping (errors.Wrap / fmt.Errorf %w) is covered
-// by TestIsTransientLeaderRedisError; this test pins the raw
-// .Error() strings only.
-func TestHasTransientLeaderSuffix_PinsSentinels(t *testing.T) {
-	t.Parallel()
-	cases := []struct {
-		name string
-		msg  string
-	}{
-		{"adapter.ErrLeaderNotFound", ErrLeaderNotFound.Error()},
-		{"adapter.ErrNotLeader", ErrNotLeader.Error()},
-		{"kv.ErrLeaderNotFound", kv.ErrLeaderNotFound.Error()},
-		{"raftengine.ErrNotLeader", raftengine.ErrNotLeader.Error()},
-		{"raftengine.ErrLeadershipLost", raftengine.ErrLeadershipLost.Error()},
-		{"raftengine.ErrLeadershipTransferInProgress",
-			raftengine.ErrLeadershipTransferInProgress.Error()},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			if !hasTransientLeaderSuffix(tc.msg) {
-				t.Fatalf("hasTransientLeaderSuffix(%q) = false; "+
-					"redisLeaderErrorPhrases is out of sync with %s — "+
-					"a sentinel rename slipped through. Update the "+
-					"phrase list in adapter/redis.go to match.", tc.msg, tc.name)
-			}
-		})
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -248,6 +249,10 @@ func handleProxyTxnError(conn redcon.Conn, err error) bool {
 		conn.WriteArray(-1)
 		return true
 	}
+	if isProxyTransactionOutcomeUnknown(err) {
+		conn.WriteError(redisOutcomeUnknownReply)
+		return true
+	}
 	// Fatal transport / context error: per-command results are unreliable.
 	if err != nil {
 		if isRedisHeavyCommandPoolFullError(err) {
@@ -272,15 +277,15 @@ func handleProxyTxnCommandError(conn redcon.Conn, cmds []*redis.Cmd) bool {
 		if err == nil || errors.Is(err, redis.Nil) {
 			continue
 		}
+		if isProxyTransactionOutcomeUnknown(err) {
+			conn.WriteError(redisOutcomeUnknownReply)
+			return true
+		}
 		if isRedisHeavyCommandPoolFullError(err) {
 			conn.WriteError(errRedisHeavyCommandPoolFull.Error())
 			return true
 		}
-		if isRedisExecTerminalProxyError(err) {
-			writeRedisError(conn, err)
-			return true
-		}
-		if isTransientLeaderRedisError(err) {
+		if isTerminalProxyTxnError(err) {
 			writeRedisError(conn, err)
 			return true
 		}
@@ -289,14 +294,12 @@ func handleProxyTxnCommandError(conn redcon.Conn, cmds []*redis.Cmd) bool {
 }
 
 func isTerminalProxyTxnError(err error) bool {
-	var netErr net.Error
-	return isRedisExecTerminalProxyError(err) ||
+	return isProxyTransactionOutcomeUnknown(err) ||
+		isRedisExecTerminalProxyError(err) ||
 		isTransientLeaderRedisError(err) ||
-		errors.Is(err, context.DeadlineExceeded) ||
-		errors.Is(err, context.Canceled) ||
-		errors.Is(err, io.EOF) ||
-		errors.Is(err, io.ErrUnexpectedEOF) ||
-		errors.As(err, &netErr)
+		isRedisNotLeaderReply(err) ||
+		errors.Is(err, raftengine.ErrLeadershipLost) ||
+		isRedisTransportUncertain(err)
 }
 
 func isRedisExecTerminalProxyError(err error) bool {
