@@ -103,6 +103,22 @@ type s3LostMetadataReplyCoordinator struct {
 	lost      atomic.Bool
 }
 
+type s3RejectedMetadataCoordinator struct {
+	*s3OCCReproCoordinator
+	targetKey []byte
+}
+
+func (c *s3RejectedMetadataCoordinator) Dispatch(ctx context.Context, req *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
+	if req != nil && req.IsTxn {
+		for _, elem := range req.Elems {
+			if elem.Op == kv.Put && string(elem.Key) == string(c.targetKey) {
+				return nil, kv.ErrLeaderProxyCircuitOpen
+			}
+		}
+	}
+	return c.s3OCCReproCoordinator.Dispatch(ctx, req)
+}
+
 func (c *s3LostMetadataReplyCoordinator) Dispatch(ctx context.Context, req *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
 	response, err := c.s3OCCReproCoordinator.Dispatch(ctx, req)
 	if err != nil || req == nil || !req.IsTxn {
@@ -219,6 +235,44 @@ func TestS3PutObjectLostCommitReplyPreservesReferencedChunks(t *testing.T) {
 					require.Equal(t, "replacement", got.Body.String(), "uncertain commit cannot authorize deleting live chunks")
 				})
 			}
+		})
+	}
+}
+
+func TestS3PutObjectDefinitiveDispatchRejectionCleansChunks(t *testing.T) {
+	t.Parallel()
+	for _, offloaded := range []bool{false, true} {
+		name := "inline"
+		if offloaded {
+			name = "offloaded"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			h := newS3OCCReproModeHarness(t, false, offloaded)
+			const bucket = "rejected-put"
+			const object = "obj"
+			require.Equal(t, http.StatusOK, h.do(http.MethodPut, "/"+bucket, "").Code)
+			meta, exists, err := h.server.loadBucketMetaAt(t.Context(), bucket, ^uint64(0))
+			require.NoError(t, err)
+			require.True(t, exists)
+			headKey := s3keys.ObjectManifestKey(bucket, meta.Generation, object)
+			h.server.coordinator = &s3RejectedMetadataCoordinator{
+				s3OCCReproCoordinator: h.coord, targetKey: headKey,
+			}
+
+			response := h.do(http.MethodPut, "/"+bucket+"/"+object, "rejected payload")
+			require.Equal(t, http.StatusServiceUnavailable, response.Code)
+			h.waitCleanups()
+			_, found, err := h.server.loadObjectManifestAt(t.Context(), headKey, ^uint64(0))
+			require.NoError(t, err)
+			require.False(t, found)
+			prefix := s3keys.BlobPrefixForBucket(bucket, meta.Generation)
+			if offloaded {
+				prefix = s3keys.ChunkRefPrefixForBucket(bucket, meta.Generation)
+			}
+			chunks, err := h.st.ScanAt(t.Context(), prefix, prefixScanEnd(prefix), 10, ^uint64(0))
+			require.NoError(t, err)
+			require.Empty(t, chunks, "a definitive rejection cannot leave staged references")
 		})
 	}
 }
