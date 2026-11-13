@@ -129,13 +129,49 @@ var layerRules = []layerRule{
 	},
 }
 
-// importAllowlists name every module package a mid-level package may
-// import. They cover the packages between the data plane and the binaries
-// that the deny rules above do not reach, and encode the server wiring
-// order noderuntime / nodeauth -> encryptionwiring -> clusterbootstrap ->
-// server. Widening an allowlist is a layering decision: prefer inverting
-// the dependency.
+// importAllowlists name every module package a package may import. The
+// data-plane entries pin the layers the deny rules above describe, so an
+// import that no deny rule anticipated still fails; the rest cover the
+// packages between the data plane and the binaries and encode the server
+// wiring order noderuntime / nodeauth -> encryptionwiring ->
+// clusterbootstrap -> server. Widening an allowlist is a layering
+// decision: prefer inverting the dependency.
 var importAllowlists = []layerRule{
+	// Data plane, bottom up.
+	{Dir: "internal/encryption", Only: []string{}, Why: "encryption is a library over its own KEK and wire subpackages"},
+	{Dir: "store", Only: []string{"internal/encryption", "internal/raftbootstrap", "internal/s3keys"}, Why: "MVCC storage is the bottom of the data plane"},
+	{Dir: "distribution", Exact: true, Only: []string{"internal/fskeys", "internal/s3keys", "proto", "store"}, Why: "the route catalog sits on storage, below the coordinator"},
+	{Dir: "internal/raftengine", Exact: true, Only: []string{"internal/monoclock"}, Why: "the engine-neutral interface knows nothing of a backend or the state machine"},
+	{
+		Dir: "internal/raftengine/etcd",
+		Only: []string{
+			"internal", "internal/encryption", "internal/monoclock", "internal/pathsafety", "internal/peersession",
+			"internal/raftbootstrap", "internal/raftengine", "proto",
+		},
+		Why: "the etcd backend replicates opaque entries over authenticated peer sessions",
+	},
+	{
+		Dir: "kv",
+		Only: []string{
+			"distribution", "internal", "internal/encryption", "internal/fskeys", "internal/monoclock",
+			"internal/raftbootstrap", "internal/raftengine", "internal/s3keys", "keyviz", "proto", "store",
+		},
+		Why: "the coordinator drives storage, routing and replication, and nothing above them",
+	},
+	{Dir: "internal/filesystem", Only: []string{"internal/fskeys", "kv", "store"}, Why: "the filesystem service is a data-plane client"},
+	{Dir: "monitoring", Only: []string{"internal/encryption", "internal/filesystem", "internal/raftengine"}, Why: "observability exposes observer interfaces and reads engine state"},
+	{Dir: "internal/admin", Only: []string{"keyviz", "proto"}, Why: "the admin HTTP layer depends on its own source interfaces"},
+	{
+		Dir: "adapter",
+		Only: []string{
+			"distribution", "internal", "internal/admin", "internal/backup", "internal/encryption", "internal/fskeys",
+			"internal/peersession", "internal/raftadmin", "internal/raftbootstrap", "internal/raftengine",
+			"internal/s3keys", "keyviz", "kv", "monitoring", "proto", "store",
+		},
+		Why: "protocol adapters sit on the coordinator and never reach into wiring",
+	},
+
+	// Between the data plane and the binaries.
 	{Dir: "internal", Exact: true, Only: []string{"proto"}, Why: "shared helpers (token files, gRPC options) are imported by every layer, so they stay a leaf over proto"},
 	{Dir: "internal/backup", Only: []string{"internal/pathsafety", "internal/s3keys", "proto"}, Why: "the backup format is a codec that adapters and offline tools share"},
 	{Dir: "internal/peersession", Only: []string{"internal", "internal/raftbootstrap", "proto"}, Why: "peer-session authentication sits below the Raft transport that uses it"},
