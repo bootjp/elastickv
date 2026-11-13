@@ -31,6 +31,7 @@ const (
 	randomUint64Bytes                      = 8
 	keyValuePairArity                      = 2
 	maxReadSize                            = 64 * bytesPerMiB
+	maxObservedReadKeys                    = 16
 	maxScanPageSize                        = 1024
 	defaultOpenHandleLeaseTTL              = 5 * time.Minute
 	defaultLeaseReaperLimit                = 256
@@ -265,6 +266,7 @@ type Service struct {
 	allocID             func() (uint64, error)
 	homeSlot            func(uint64) uint64
 	observer            OperationalObserver
+	readObserver        kv.Coordinator
 }
 
 type Option func(*Service)
@@ -325,6 +327,66 @@ func WithOperationalObserver(observer OperationalObserver) Option {
 	return func(s *Service) {
 		s.observer = observer
 	}
+}
+
+// WithReadObserver enables bounded, leader-local KeyViz observations for
+// public FUSE reads. It does not observe internal mutation planning reads.
+func WithReadObserver(observer kv.Coordinator) Option {
+	return func(s *Service) {
+		s.readObserver = observer
+	}
+}
+
+func (s *Service) observeReadKey(ctx context.Context, key []byte) {
+	if s.readObserver != nil && s.readObserver.IsLeaderForKey(key) {
+		kv.ObserveReadForKeyThrough(s.readObserver, ctx, key)
+	}
+}
+
+func (s *Service) observeReadResult(ctx context.Context, key []byte, err error) {
+	if err == nil || errors.Is(err, ErrNotFound) {
+		s.observeReadKey(ctx, key)
+	}
+}
+
+func (s *Service) markUnattributableReadForRange(start, end []byte, extraKeys ...[]byte) {
+	if s.readObserver == nil {
+		return
+	}
+	for _, key := range extraKeys {
+		if s.readObserver.IsLeaderForKey(key) {
+			kv.MarkUnattributableClientReadThrough(s.readObserver, 0)
+			return
+		}
+	}
+	if s.hasLocalReadRangeLeader(start, end) {
+		kv.MarkUnattributableClientReadThrough(s.readObserver, 0)
+	}
+}
+
+func (s *Service) hasLocalReadRangeLeader(start, end []byte) bool {
+	if routes, ok := s.store.(interface {
+		ReadFenceTargetsForRange([]byte, []byte) []kv.ReadFenceTarget
+	}); ok {
+		if leaders, ok := s.readObserver.(interface{ IsLeaderForGroup(uint64) bool }); ok {
+			for _, target := range routes.ReadFenceTargetsForRange(start, end) {
+				if target.GroupID != 0 && leaders.IsLeaderForGroup(target.GroupID) ||
+					target.GroupID == 0 && s.readObserver.IsLeaderForKey(target.Key) {
+					return true
+				}
+			}
+			return false
+		}
+	}
+	return s.readObserver.IsLeaderForKey(start)
+}
+
+func (s *Service) readChunkAt(ctx context.Context, key []byte, ts uint64, observe bool) ([]byte, error) {
+	raw, err := s.store.GetAt(ctx, key, ts)
+	if observe && (err == nil || errors.Is(err, store.ErrKeyNotFound)) {
+		s.observeReadKey(ctx, key)
+	}
+	return raw, errors.WithStack(err)
 }
 
 func NewService(st store.MVCCStore, dispatch Dispatcher, opts ...Option) (*Service, error) {
@@ -437,6 +499,9 @@ func (s *Service) Resolve(ctx context.Context, parent uint64, name []byte) (uint
 		return 0, err
 	}
 	parentMeta, err := s.inodeAt(ctx, parent, ts)
+	if err == nil || errors.Is(err, ErrNotFound) {
+		s.observeReadKey(ctx, fskeys.InodeKey(parent))
+	}
 	if err != nil {
 		return 0, err
 	}
@@ -444,6 +509,9 @@ func (s *Service) Resolve(ctx context.Context, parent uint64, name []byte) (uint
 		return 0, ErrNotDir
 	}
 	entry, err := s.dirEntryAt(ctx, parent, name, ts)
+	if err == nil || errors.Is(err, ErrNotFound) {
+		s.observeReadKey(ctx, fskeys.DirEntryKey(parent, name))
+	}
 	if err != nil {
 		return 0, err
 	}
@@ -456,6 +524,7 @@ func (s *Service) GetAttr(ctx context.Context, inode uint64) (Stat, error) {
 		return Stat{}, err
 	}
 	meta, err := s.inodeAt(ctx, inode, ts)
+	s.observeReadResult(ctx, fskeys.InodeKey(inode), err)
 	if err != nil {
 		return Stat{}, err
 	}
@@ -621,6 +690,7 @@ func (s *Service) openWithHandle(ctx context.Context, inode uint64, clientID []b
 		return err
 	}
 	meta, err := s.inodeAt(ctx, inode, ts)
+	s.observeReadResult(ctx, fskeys.InodeKey(inode), err)
 	if err != nil {
 		return err
 	}
@@ -666,12 +736,16 @@ func (s *Service) Read(ctx context.Context, inode uint64, _ uint64, offset uint6
 	}
 	meta, err := s.inodeAt(ctx, inode, ts)
 	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			s.observeReadKey(ctx, fskeys.InodeKey(inode))
+		}
 		return nil, err
 	}
 	if meta.Type == TypeDirectory {
 		return nil, ErrIsDir
 	}
 	if offset >= meta.Size || size == 0 {
+		s.observeReadKey(ctx, fskeys.InodeKey(inode))
 		return []byte{}, nil
 	}
 	end := boundedEnd(offset, size, meta.Size)
@@ -687,12 +761,23 @@ func (s *Service) Read(ctx context.Context, inode uint64, _ uint64, offset uint6
 	home := meta.HomeSlot
 	first := offset / chunkSize
 	last := (end - 1) / chunkSize
+	// A large read cannot be represented by a bounded set of point keys.
+	observeKeys := last-first < maxObservedReadKeys-1
+	if observeKeys {
+		s.observeReadKey(ctx, fskeys.InodeKey(inode))
+	} else {
+		s.markUnattributableReadForRange(
+			fskeys.ChunkKey(home, inode, first), scanCursorAfter(fskeys.ChunkKey(home, inode, last)),
+			fskeys.InodeKey(inode),
+		)
+	}
 	for idx := first; idx <= last; idx++ {
 		chunkStart := idx * chunkSize
 		chunkEnd := saturatingAddUint64(chunkStart, chunkSize)
 		readStart := max(offset, chunkStart)
 		readEnd := min(end, chunkEnd)
-		raw, getErr := s.store.GetAt(ctx, fskeys.ChunkKey(home, inode, idx), ts)
+		chunkKey := fskeys.ChunkKey(home, inode, idx)
+		raw, getErr := s.readChunkAt(ctx, chunkKey, ts, observeKeys)
 		if getErr != nil {
 			if errors.Is(getErr, store.ErrKeyNotFound) {
 				continue
@@ -1215,6 +1300,9 @@ func (s *Service) readdirWithRefresh(
 
 func (s *Service) readdirAt(ctx context.Context, inode uint64, state readdirCookie, limit int) (ReaddirResult, error) {
 	meta, err := s.inodeAt(ctx, inode, state.ReadTS)
+	if err == nil || errors.Is(err, ErrNotFound) {
+		s.observeReadKey(ctx, fskeys.InodeKey(inode))
+	}
 	if err != nil {
 		return ReaddirResult{}, err
 	}
@@ -1589,6 +1677,7 @@ func (s *Service) scanVisiblePrefix(
 	start := append([]byte(nil), prefix...)
 	end := prefixEnd(prefix)
 	for {
+		s.markUnattributableReadForRange(start, end)
 		page, err := s.store.ScanAt(ctx, start, end, statFSScanPageSize, ts)
 		if err != nil {
 			return errors.Wrap(err, "filesystem scan prefix")
@@ -2584,6 +2673,7 @@ func (s *Service) appendDirectoryEntries(
 		start = append(fskeys.DirEntryKey(inode, state.LastName), 0)
 	}
 	end := prefixEnd(prefix)
+	s.markUnattributableReadForRange(start, end, fskeys.InodeKey(inode))
 	pairs, err := s.store.ScanAt(ctx, start, end, limit, state.ReadTS)
 	if err != nil {
 		return errors.Wrap(err, "filesystem scan directory entries")

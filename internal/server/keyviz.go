@@ -21,6 +21,19 @@ func keyVizSamplerForCoordinator(s *keyviz.MemSampler) keyviz.Sampler {
 	return s
 }
 
+// Enrollment starts only after every public ingress, including FUSE, is ready.
+// The sampler excludes the transition window from target-load evidence.
+func enrollKeyVizReadCoverage(s *keyviz.MemSampler, crossGroup bool) {
+	if s == nil || !crossGroup {
+		return
+	}
+	s.EnrollReadCoverage(keyviz.ReadCoverageEnrollment{
+		LocalKeyedReadsObserved: true,
+		ForwardedReadsObserved:  true,
+		UnkeyedReadsMarked:      true,
+	})
+}
+
 // startKeyVizLeaderTermPublisher polls each Raft group's current term
 // at the sampler's flush cadence and publishes it via
 // MemSampler.SetLeaderTerm so subsequent column flushes stamp

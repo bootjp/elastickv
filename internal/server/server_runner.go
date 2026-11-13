@@ -62,7 +62,8 @@ type serversInput struct {
 	// so AdminServer.GetKeyVizMatrix can serve snapshots; the
 	// coordinator already has its own copy from
 	// `WithSampler(...)` higher up in run().
-	keyvizSampler *keyviz.MemSampler
+	keyvizSampler       *keyviz.MemSampler
+	autoSplitCrossGroup bool
 	// autoSplitRuntime is registered on the authenticated Admin gRPC service
 	// when automatic splitting was configured at process startup.
 	autoSplitRuntime adapter.AutoSplitRuntime
@@ -236,7 +237,11 @@ func startPublicServicesAfterCommitTSFence(in serversInput, runner *runtimeServe
 		return err
 	}
 	runner.startAdminHTTP()
-	return startFilesystemAfterServing(in)
+	if err := startFilesystemAfterServing(in); err != nil {
+		return err
+	}
+	enrollKeyVizReadCoverage(in.keyvizSampler, in.autoSplitCrossGroup)
+	return nil
 }
 
 type runtimeServerRunner struct {

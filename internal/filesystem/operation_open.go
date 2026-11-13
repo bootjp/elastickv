@@ -116,6 +116,7 @@ func (s *Service) planOpenOperation(ctx context.Context, snapshot operationPlann
 	plan := operationAttemptPlan{Intent: intent, ReadTS: ts, RouteVersion: snapshot.RouteVersion,
 		ReadKeys: [][]byte{fskeys.InodeKey(inode)}}
 	meta, err := s.inodeAt(ctx, inode, ts)
+	s.observeReadResult(ctx, fskeys.InodeKey(inode), err)
 	if errors.Is(err, ErrNotFound) {
 		return plan, ErrNotFound, nil
 	}

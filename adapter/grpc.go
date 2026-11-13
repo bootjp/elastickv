@@ -156,6 +156,13 @@ func (r *GRPCServer) observeGRPCPointRead(ctx context.Context, key []byte, group
 	if r.coordinator == nil || !r.grpcServesGroupRead(key, groupID) {
 		return
 	}
+	if groupID != 0 {
+		router, ok := r.coordinator.(kv.GroupRoutableCoordinator)
+		if !ok || router.EngineGroupIDForKey(key) != groupID {
+			kv.MarkUnattributableClientReadThrough(r.coordinator, 0)
+			return
+		}
+	}
 	kv.ObserveReadForKeyThrough(r.coordinator, ctx, key)
 }
 
@@ -169,19 +176,26 @@ func (r *GRPCServer) grpcServesGroupRead(key []byte, groupID uint64) bool {
 	return r.coordinator.IsLeaderForKey(key)
 }
 
-func (r *GRPCServer) markGRPCScanRead(groupID uint64, start []byte, keys [][]byte) {
-	if r.coordinator == nil || !r.grpcServesScan(groupID, start, keys) {
+func (r *GRPCServer) markGRPCScanRead(groupID uint64, start, end []byte, keys [][]byte) {
+	if r.coordinator == nil || !r.grpcServesScan(groupID, start, end, keys) {
 		return
 	}
 	kv.MarkUnattributableClientReadThrough(r.coordinator, 0)
 }
 
-func (r *GRPCServer) grpcServesScan(groupID uint64, start []byte, keys [][]byte) bool {
+func (r *GRPCServer) grpcServesScan(groupID uint64, start, end []byte, keys [][]byte) bool {
 	if groupID != 0 {
 		if groups, ok := r.coordinator.(kv.GroupLeaderRoutableCoordinator); ok {
 			return groups.IsLeaderForGroup(groupID)
 		}
 		return r.coordinator.IsLeader()
+	}
+	if routes, ok := r.store.(interface {
+		ReadFenceTargetsForRange([]byte, []byte) []kv.ReadFenceTarget
+	}); ok {
+		if targets := routes.ReadFenceTargetsForRange(start, end); len(targets) != 0 {
+			return r.grpcServesScanTargets(targets)
+		}
 	}
 	for _, key := range keys {
 		if r.coordinator.IsLeaderForKey(key) {
@@ -192,6 +206,20 @@ func (r *GRPCServer) grpcServesScan(groupID uint64, start []byte, keys [][]byte)
 		return false
 	}
 	return r.coordinator.IsLeaderForKey(start)
+}
+
+func (r *GRPCServer) grpcServesScanTargets(targets []kv.ReadFenceTarget) bool {
+	groups, groupAware := r.coordinator.(kv.GroupLeaderRoutableCoordinator)
+	if !groupAware {
+		return true
+	}
+	for _, target := range targets {
+		if target.GroupID != 0 && groups.IsLeaderForGroup(target.GroupID) ||
+			target.GroupID == 0 && r.coordinator.IsLeaderForKey(target.Key) {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.RawGetResponse, error) {
@@ -441,7 +469,7 @@ func (r *GRPCServer) RawScanAt(ctx context.Context, req *pb.RawScanAtRequest) (*
 		if err != nil {
 			return rawScanErrorResponse(err)
 		}
-		r.markGRPCScanRead(req.GetGroupId(), req.GetStartKey(), keys)
+		r.markGRPCScanRead(req.GetGroupId(), req.GetStartKey(), req.GetEndKey(), keys)
 		return &pb.RawScanAtResponse{Kv: rawKeyPairs(keys)}, nil
 	}
 
@@ -449,7 +477,7 @@ func (r *GRPCServer) RawScanAt(ctx context.Context, req *pb.RawScanAtRequest) (*
 	if err != nil {
 		return rawScanErrorResponse(err)
 	}
-	r.markGRPCScanRead(req.GetGroupId(), req.GetStartKey(), storeKeysFromKVPairs(res))
+	r.markGRPCScanRead(req.GetGroupId(), req.GetStartKey(), req.GetEndKey(), storeKeysFromKVPairs(res))
 	return &pb.RawScanAtResponse{Kv: rawKvPairs(res)}, nil
 }
 
@@ -849,7 +877,7 @@ func (r *GRPCServer) Scan(ctx context.Context, req *pb.ScanRequest) (*pb.ScanRes
 			Kv: nil,
 		}, errors.WithStack(err)
 	}
-	r.markGRPCScanRead(0, req.GetStartKey(), storeKeysFromKVPairs(res))
+	r.markGRPCScanRead(0, req.GetStartKey(), req.GetEndKey(), storeKeysFromKVPairs(res))
 
 	r.log.InfoContext(ctx, "Scan",
 		slog.String("startKey", string(req.StartKey)),
