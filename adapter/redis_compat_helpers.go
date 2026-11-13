@@ -180,7 +180,7 @@ func (r *RedisServer) rawZSetPhysTypeAt(ctx context.Context, key []byte, readTS 
 	if memberFound {
 		return redisTypeZSet, true, nil
 	}
-	// No member rows — check meta/delta for a memberless wide-column ZSet.
+	// No member rows: only positive aggregate length denotes a ZSet.
 	zsetOnly, err := r.zsetMetaOrDeltaExistsAt(ctx, key, readTS)
 	if err != nil {
 		return redisTypeNone, false, err
@@ -195,9 +195,7 @@ func (r *RedisServer) rawZSetPhysTypeAt(ctx context.Context, key []byte, readTS 
 }
 
 // rawKeyTypeAtSkipZSet is rawKeyTypeAt minus the ZSet wide-column
-// probes. Used by rawZSetPhysTypeAt when the caller has already
-// confirmed no ZSet member / meta / delta rows exist, so the three
-// ZSet probes inside detectWideColumnType would be pure redundant I/O.
+// probes. Used when the caller has already ruled out a live ZSet.
 func (r *RedisServer) rawKeyTypeAtSkipZSet(ctx context.Context, key []byte, readTS uint64) (redisValueType, error) {
 	if typ, found, err := r.probeStringTypes(ctx, key, readTS); err != nil || found {
 		return typ, err
@@ -211,14 +209,20 @@ func (r *RedisServer) rawKeyTypeAtSkipZSet(ctx context.Context, key []byte, read
 	return r.probeLegacyCollectionTypes(ctx, key, readTS)
 }
 
-// zsetMetaOrDeltaExistsAt reports whether a ZSet meta key or delta prefix exists.
+// zsetMetaOrDeltaExistsAt reports whether ZSet metadata describes live members.
 func (r *RedisServer) zsetMetaOrDeltaExistsAt(ctx context.Context, key []byte, readTS uint64) (bool, error) {
-	if exists, err := r.store.ExistsAt(ctx, store.ZSetMetaKey(key), readTS); err != nil {
+	metaExists, err := r.store.ExistsAt(ctx, store.ZSetMetaKey(key), readTS)
+	if err != nil {
 		return false, errors.WithStack(err)
-	} else if exists {
-		return true, nil
 	}
-	return r.prefixExistsAt(ctx, store.ZSetMetaDeltaScanPrefix(key), readTS)
+	if !metaExists {
+		deltaExists, err := r.prefixExistsAt(ctx, store.ZSetMetaDeltaScanPrefix(key), readTS)
+		if err != nil || !deltaExists {
+			return false, err
+		}
+	}
+	length, _, err := r.resolveZSetMeta(ctx, key, readTS)
+	return length > 0, err
 }
 
 // rawKeyTypeAt classifies the Redis encoding under which key is
