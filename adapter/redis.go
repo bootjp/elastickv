@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"log/slog"
 	"net"
@@ -25,6 +26,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/redis/go-redis/v9"
 	"github.com/tidwall/redcon"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -396,6 +398,7 @@ func (c *redisMetricsConn) WriteError(msg string) {
 }
 
 const redisOutcomeUnknownReply = "ERR operation outcome unknown"
+const redisNotLeaderReply = "NOTLEADER leader unavailable"
 
 // writeRedisError writes a RESP error reply for err, prepending the
 // Redis-protocol semantic code NOTLEADER when err is a transient
@@ -406,18 +409,18 @@ const redisOutcomeUnknownReply = "ERR operation outcome unknown"
 // upstream `with-exceptions` macro does not catch, so a Jepsen worker
 // crashes instead of recording a clean `:fail` op.
 //
-// Classification is purely typed: cockroachdb/errors.Is traverses both
-// the standard %w chain and Mark-based equivalence, so wrappers
-// (errors.WithStack, errors.Wrapf, raftengine's marked sentinels) do
-// not defeat the check. Sentinels mirror kv.isTransientLeaderError +
-// kv.isLeadershipLossError so any sentinel those classifiers already
-// recognize as transient also flips a Redis reply to NOTLEADER.
+// Only local typed leadership errors qualify for NOTLEADER. An unclassified
+// gRPC status cannot prove a remote operation was rejected before submission.
 func writeRedisError(conn redcon.Conn, err error) {
 	if recorder, ok := conn.(interface{ recordRequestError(error) }); ok {
 		recorder.recordRequestError(err)
 	}
-	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+	if isRedisIndeterminate(err) {
 		conn.WriteError(redisOutcomeUnknownReply)
+		return
+	}
+	if isRedisNotLeaderReply(err) {
+		conn.WriteError(redisNotLeaderReply)
 		return
 	}
 	msg := err.Error()
@@ -432,6 +435,32 @@ func writeRedisError(conn redcon.Conn, err error) {
 	conn.WriteError(msg)
 }
 
+func isRedisTransportUncertain(err error) bool {
+	if err == nil {
+		return false
+	}
+	if _, ok := status.FromError(err); ok {
+		return true
+	}
+	var netErr net.Error
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) ||
+		errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.As(err, &netErr)
+}
+
+func isRedisIndeterminate(err error) bool {
+	return errors.Is(err, kv.ErrTransactionOutcomeUnknown) ||
+		errors.Is(err, raftengine.ErrLeadershipLost) || isRedisTransportUncertain(err)
+}
+
+func isRedisNotLeaderReply(err error) bool {
+	var reply redis.Error
+	if !errors.As(err, &reply) {
+		return false
+	}
+	code, _, ok := strings.Cut(reply.Error(), " ")
+	return ok && code == "NOTLEADER"
+}
+
 // isTransientLeaderRedisError reports whether err is a transient
 // leader-unavailable signal that the Redis adapter should rewrite to a
 // NOTLEADER reply. Uses cockroachdb/errors.Is so Mark-based equivalence
@@ -443,7 +472,7 @@ func isTransientLeaderRedisError(err error) bool {
 	}
 	// A proposal may have committed before leadership was lost. An unknown
 	// transaction outcome must not become a NOTLEADER retry instruction.
-	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+	if isRedisIndeterminate(err) {
 		return false
 	}
 	if errors.Is(err, ErrLeaderNotFound) ||
@@ -451,57 +480,8 @@ func isTransientLeaderRedisError(err error) bool {
 		errors.Is(err, kv.ErrLeaderNotFound) ||
 		errors.Is(err, kv.ErrLeaderProxyCircuitOpen) ||
 		errors.Is(err, raftengine.ErrNotLeader) ||
-		errors.Is(err, raftengine.ErrLeadershipLost) ||
 		errors.Is(err, raftengine.ErrLeadershipTransferInProgress) {
 		return true
-	}
-	// Suffix fallback for gRPC-wrapped sentinels. When the coordinator
-	// forwards a request to a remote leader via the operational gRPC
-	// service and that leader returns ErrLeaderNotFound, the status
-	// interceptor flattens the error to "rpc error: code = Unknown
-	// desc = leader not found"; the typed sentinel chain is stripped
-	// at the wire boundary, so errors.Is misses it. The Jepsen Redis
-	// workload (scheduled run 26035515694) saw workers crash with
-	// `:prefix :rpc` because the un-prefixed `"rpc error: …"` string
-	// reached Carmine. Match the same closed phrase set
-	// kv.hasTransientLeaderPhrase uses, with the same HasSuffix
-	// guard: free-form Contains would misclassify a user-controlled
-	// key like "key: not leader: write conflict" as transient.
-	return hasTransientLeaderSuffix(err.Error())
-}
-
-// redisLeaderErrorPhrases mirrors kv.leaderErrorPhrases (the kv
-// package keeps it unexported) and adds adapter-visible availability
-// sentinels such as the leader-proxy circuit. The circuit is deliberately
-// not coordinator-retryable, but Redis clients still need NOTLEADER so they
-// can retry without treating it as a command failure.
-var redisLeaderErrorPhrases = []string{
-	"not leader",
-	"leader not found",
-	"leadership lost",
-	"leadership transfer in progress",
-	"leader proxy circuit open",
-}
-
-// hasTransientLeaderSuffix is the suffix-match fallback for
-// isTransientLeaderRedisError. Suffix — not free-form Contains —
-// because cockroachdb/errors %w-prefix and gRPC status.Errorf's
-// "rpc error: code = X desc = <orig>" both leave the original
-// sentinel text at the END of the composed string; a Contains
-// match would tag a user-controlled key like "key: not leader:
-// conflict" as transient.
-//
-// strings.EqualFold on the trailing slice — rather than
-// strings.ToLower + HasSuffix — avoids allocating a copy of the
-// full message. cockroachdb/errors messages can be multi-KB when
-// they carry a serialized stack trace; this matters on the error
-// path under leader-loss storms.
-func hasTransientLeaderSuffix(msg string) bool {
-	for _, phrase := range redisLeaderErrorPhrases {
-		if len(msg) >= len(phrase) &&
-			strings.EqualFold(msg[len(msg)-len(phrase):], phrase) {
-			return true
-		}
 	}
 	return false
 }
