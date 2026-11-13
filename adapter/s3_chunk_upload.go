@@ -98,11 +98,26 @@ func (u *s3ChunkUploader) run() (s3ChunkUploadResult, *s3PutBodyError, error) {
 	if bodyErr := u.verifyChecksums(); bodyErr != nil {
 		return u.result, bodyErr, nil
 	}
-	if u.cfg.offloaded {
-		u.result.ChunkRefElems = append([]*kv.Elem[kv.OP](nil), u.pendingBatch...)
+	if err := u.finishOffloadedChunks(); err != nil {
+		return u.result, nil, err
 	}
 	u.result.ETag = hex.EncodeToString(u.etagHasher.Sum(nil))
 	return u.result, nil, nil
+}
+
+func (u *s3ChunkUploader) finishOffloadedChunks() error {
+	if !u.cfg.offloaded {
+		return nil
+	}
+	// Once a staged batch has updated an RC, the final transaction's
+	// original start timestamp cannot validate another update to it.
+	if u.result.ChunkCount > uint64(len(u.pendingBatch)) {
+		if err := u.flushBatch(); err != nil {
+			return err
+		}
+	}
+	u.result.ChunkRefElems = append([]*kv.Elem[kv.OP](nil), u.pendingBatch...)
+	return nil
 }
 
 func (u *s3ChunkUploader) uploadNextChunk() (bool, *s3PutBodyError, error) {

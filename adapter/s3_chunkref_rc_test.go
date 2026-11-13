@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/s3keys"
@@ -128,6 +129,21 @@ func TestS3OffloadedObjectUpdatesReferenceCountThroughHTTP(t *testing.T) {
 	require.ErrorIs(t, err, store.ErrKeyNotFound)
 	_, err = h.st.GetAt(t.Context(), s3keys.ChunkBlobGCQueueKey(rc.QueuedAtTS, sha), ^uint64(0))
 	require.NoError(t, err)
+}
+
+func TestS3OffloadedObjectRepeatedChunkAcrossStagedAndFinalBatches(t *testing.T) {
+	h := newS3OCCReproModeHarness(t, false, true)
+	const bucket = "repeated-chunk-bucket"
+	const object = "object"
+	body := strings.Repeat("z", (s3MetaBatchOps+1)*s3ChunkSize)
+	require.Equal(t, http.StatusOK, h.do(http.MethodPut, "/"+bucket, "").Code)
+	response := h.do(http.MethodPut, "/"+bucket+"/"+object, body)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	sha := sha256.Sum256([]byte(strings.Repeat("z", s3ChunkSize)))
+	require.Equal(t, uint64(s3MetaBatchOps+1), readS3ChunkRefRCTest(t, h, sha).Count)
+	response = h.do(http.MethodGet, "/"+bucket+"/"+object, "")
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	require.Equal(t, body, response.Body.String())
 }
 
 func TestS3BucketDeleteAccountsOrphanChunkRefs(t *testing.T) {
