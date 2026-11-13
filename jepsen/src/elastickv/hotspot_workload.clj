@@ -18,7 +18,7 @@
             [jepsen.os :as os]
             [jepsen.os.debian :as debian]))
 
-(def register-keys ["m4-a" "m4-m" "m4-z"])
+(def register-keys ["a-hot" "m-hot" "z-hot"])
 
 (def auto-split-args
   ["--autoSplit" "--keyvizStep=5s" "--autoSplitEvalInterval=1s"
@@ -62,7 +62,9 @@
                    (neg? (compare (:start (second ordered)) (:end (second ordered)))))
                (= (:end parent) (:end (second ordered)))
                (every? #(= 1 (count (filter (fn [r] (routes/route-covers? r %)) new)))
-                       register-keys))
+                       register-keys)
+               (every? #(some (fn [key] (routes/route-covers? % key)) register-keys)
+                       ordered))
       {:before before :after after :split-key (:end (first ordered))})))
 
 (defn controller-nemesis [opts]
@@ -197,10 +199,10 @@
          package (combined/compose-packages
                    (cond-> [(controller-package opts)] faults (conj faults)))
          concurrency (or (:concurrency opts) 6)
-         _ (when (or (< concurrency (* 2 (count register-keys)))
+         _ (when (or (< concurrency (max (* 2 (count register-keys)) (count nodes)))
                      (odd? concurrency))
-             (throw (ex-info "hotspot workload requires even concurrency of at least six"
-                             {:concurrency concurrency})))
+             (throw (ex-info "hotspot workload requires even concurrency covering all nodes and registers"
+                             {:concurrency concurrency :nodes (count nodes)})))
          workload (split/split-register-workload
                     (assoc opts :node->port node->port :register-keys register-keys
                            :independent-concurrency 2

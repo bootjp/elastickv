@@ -15,9 +15,9 @@
 
 (def after
   {:catalog-version 2
-   :routes [{:route-id 1 :raft-group-id 1 :start "" :end "m4-m"
+   :routes [{:route-id 1 :raft-group-id 1 :start "" :end "p"
              :state "ROUTE_STATE_ACTIVE"}
-            {:route-id 2 :raft-group-id 1 :start "m4-m" :end nil
+            {:route-id 2 :raft-group-id 1 :start "p" :end nil
              :state "ROUTE_STATE_ACTIVE"}]})
 
 (deftest server-flags-enable-automatic-split
@@ -43,8 +43,13 @@
   (is (true? (get-in (hotspot/elastickv-hotspot-test {:encryption true})
                      [:db :opts :encryption])))
   (is (thrown-with-msg? clojure.lang.ExceptionInfo
-                        #"even concurrency of at least six"
+                        #"even concurrency covering all nodes and registers"
                         (hotspot/elastickv-hotspot-test {:concurrency 5})))
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                        #"even concurrency covering all nodes and registers"
+                        (hotspot/elastickv-hotspot-test
+                          {:nodes ["n1" "n2" "n3" "n4" "n5" "n6" "n7"]
+                           :concurrency 6})))
   (with-redefs [cli/run-workload!
                 (fn [_ options _ _]
                   (is (= 6 (:default (apply hash-map
@@ -59,7 +64,11 @@
   (is (nil? (hotspot/split-observation before
             (assoc-in after [:routes 1 :start] "m4-n"))))
   (is (nil? (hotspot/split-observation before
-            (assoc-in after [:routes 1 :raft-group-id] 2)))))
+            (assoc-in after [:routes 1 :raft-group-id] 2))))
+  (is (nil? (hotspot/split-observation before
+            (-> after
+                (assoc-in [:routes 0 :end] "zz")
+                (assoc-in [:routes 1 :start] "zz"))))))
 
 (deftest controller-checker-requires-a-matched-success
   (let [capture {:process :nemesis :type :info :f :capture-hotspot-baseline :value before}
