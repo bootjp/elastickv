@@ -769,7 +769,28 @@ func (c *luaScriptContext) probedKeyType(key []byte) (redisValueType, error) {
 	return typ, nil
 }
 
+// dropFailedStateLoad undoes a failed first load of key's state. Every loader
+// caches a fresh, unloaded state before it probes the key's type; when the
+// load then fails (WRONGTYPE, a storage error) and the script catches the
+// error with pcall, a later command of the same type would find that state
+// and treat the key as an absent value of that type: a read replied nil or 0
+// instead of WRONGTYPE, and a write (HSET on a string, INCR on a hash)
+// succeeded and replaced the key's value at commit. A state that was already
+// cached before the call is kept, since it may hold the script's own writes.
+func dropFailedStateLoad[S any](states map[string]S, key []byte, wasCached bool, err error) {
+	if err != nil && !wasCached {
+		delete(states, string(key))
+	}
+}
+
 func (c *luaScriptContext) stringState(key []byte) (*luaStringState, error) {
+	_, cached := c.strings[string(key)]
+	st, err := c.loadStringState(key)
+	dropFailedStateLoad(c.strings, key, cached, err)
+	return st, err
+}
+
+func (c *luaScriptContext) loadStringState(key []byte) (*luaStringState, error) {
 	k := string(key)
 	if st, ok := c.strings[k]; ok {
 		return st, nil
@@ -824,6 +845,13 @@ func (c *luaScriptContext) trackStringTypeReadKeys(key []byte, typ redisValueTyp
 }
 
 func (c *luaScriptContext) listState(key []byte) (*luaListState, error) {
+	_, cached := c.lists[string(key)]
+	st, err := c.loadListState(key)
+	dropFailedStateLoad(c.lists, key, cached, err)
+	return st, err
+}
+
+func (c *luaScriptContext) loadListState(key []byte) (*luaListState, error) {
 	k := string(key)
 	if st, ok := c.lists[k]; ok {
 		return st, nil
@@ -912,6 +940,13 @@ func (c *luaScriptContext) materializedListForRead(key string) (*luaListState, b
 }
 
 func (c *luaScriptContext) hashState(key []byte) (*luaHashState, error) {
+	_, cached := c.hashes[string(key)]
+	st, err := c.loadHashState(key)
+	dropFailedStateLoad(c.hashes, key, cached, err)
+	return st, err
+}
+
+func (c *luaScriptContext) loadHashState(key []byte) (*luaHashState, error) {
 	k := string(key)
 	if st, ok := c.hashes[k]; ok {
 		return st, nil
@@ -949,6 +984,13 @@ func (c *luaScriptContext) hashState(key []byte) (*luaHashState, error) {
 }
 
 func (c *luaScriptContext) setState(key []byte) (*luaSetState, error) {
+	_, cached := c.sets[string(key)]
+	st, err := c.loadSetState(key)
+	dropFailedStateLoad(c.sets, key, cached, err)
+	return st, err
+}
+
+func (c *luaScriptContext) loadSetState(key []byte) (*luaSetState, error) {
 	k := string(key)
 	if st, ok := c.sets[k]; ok {
 		return st, nil
@@ -989,6 +1031,13 @@ func (c *luaScriptContext) setState(key []byte) (*luaSetState, error) {
 }
 
 func (c *luaScriptContext) zsetState(key []byte) (*luaZSetState, error) {
+	_, cached := c.zsets[string(key)]
+	st, err := c.loadZSetState(key)
+	dropFailedStateLoad(c.zsets, key, cached, err)
+	return st, err
+}
+
+func (c *luaScriptContext) loadZSetState(key []byte) (*luaZSetState, error) {
 	k := string(key)
 	if st, ok := c.zsets[k]; ok {
 		return st, nil
@@ -1235,6 +1284,13 @@ func (c *luaScriptContext) streamType(key []byte) (redisValueType, error) {
 }
 
 func (c *luaScriptContext) streamState(key []byte) (*luaStreamState, error) {
+	_, cached := c.streams[string(key)]
+	st, err := c.loadStreamState(key)
+	dropFailedStateLoad(c.streams, key, cached, err)
+	return st, err
+}
+
+func (c *luaScriptContext) loadStreamState(key []byte) (*luaStreamState, error) {
 	k := string(key)
 	if st, ok := c.streams[k]; ok {
 		if st.loaded {
