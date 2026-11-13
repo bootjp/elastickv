@@ -252,7 +252,7 @@ func (s *SQSServer) sendFifoMessage(
 	}
 	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
 	appendFifoOrderPut(req, meta, queueName, partition, rec)
-	if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, req); err != nil {
+	if err := s.dispatchSQSMutation(dispatchCtx, req); err != nil {
 		if isRetryableTransactWriteError(err) {
 			return nil, true, nil
 		}

@@ -162,7 +162,7 @@ func (s *SQSServer) tryPurgeQueueOnce(ctx context.Context, queueName string) (bo
 		},
 	}
 	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
-	if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, req); err != nil {
+	if err := s.dispatchSQSMutation(dispatchCtx, req); err != nil {
 		return false, 0, 0, errors.WithStack(err)
 	}
 	return true, lastGen, meta.Generation, nil

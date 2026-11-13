@@ -552,7 +552,7 @@ func (s *SQSServer) sendMessage(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 	dispatchCtx := readTimestamp.WithDispatchVoucher(r.Context())
-	if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, req); err != nil {
+	if err := s.dispatchSQSMutation(dispatchCtx, req); err != nil {
 		writeSQSErrorFromErr(w, err)
 		return
 	}
@@ -607,7 +607,7 @@ func (s *SQSServer) sendMessageCore(ctx context.Context, queueName string, in sq
 		},
 	}
 	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
-	if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, req); err != nil {
+	if err := s.dispatchSQSMutation(dispatchCtx, req); err != nil {
 		return nil, errors.WithStack(err)
 	}
 	return map[string]string{
@@ -1323,7 +1323,7 @@ func (s *SQSServer) expireMessage(ctx context.Context, queueName string, meta *s
 		ReadKeys: readKeys,
 		Elems:    elems,
 	}
-	if _, err := kv.DispatchWithReadTimestamp(ctx, s.coordinator, req); err != nil {
+	if err := s.dispatchSQSMutation(ctx, req); err != nil {
 		if isIgnorableSQSReceiveRace(err) {
 			return nil
 		}
@@ -1488,7 +1488,7 @@ func (s *SQSServer) commitReceiveRotation(ctx context.Context, queueName string,
 	if err != nil {
 		return nil, false, err
 	}
-	if _, err := kv.DispatchWithReadTimestamp(ctx, s.coordinator, req); err != nil {
+	if err := s.dispatchSQSMutation(ctx, req); err != nil {
 		if isIgnorableSQSReceiveRace(err) {
 			return nil, true, nil
 		}
@@ -1674,7 +1674,7 @@ func (s *SQSServer) deleteMessageWithRetry(ctx context.Context, queueName string
 			return err
 		}
 		dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
-		if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, req); err == nil {
+		if err := s.dispatchSQSMutation(dispatchCtx, req); err == nil {
 			// Hot-partition observability (§11 PR 7): record the
 			// successful delete on the partitioned commit branch
 			// only. Legacy queues stay off the metric.
@@ -1871,7 +1871,7 @@ func (s *SQSServer) changeVisibilityWithRetry(ctx context.Context, queueName str
 			},
 		}
 		dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
-		if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, req); err == nil {
+		if err := s.dispatchSQSMutation(dispatchCtx, req); err == nil {
 			return nil
 		} else if !isRetryableTransactWriteError(err) {
 			return errors.WithStack(err)

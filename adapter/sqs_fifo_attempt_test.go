@@ -213,11 +213,12 @@ func runFIFOAttemptRace(t *testing.T, partitions uint32, race error) {
 func TestSQSFIFOAttemptDispatchErrorsPropagate(t *testing.T) {
 	t.Parallel()
 	for _, fault := range []struct {
-		name string
-		err  error
+		name    string
+		err     error
+		wantErr error
 	}{
 		{name: "operational", err: errors.New("delivery coordinator unavailable")},
-		{name: "deadline", err: context.DeadlineExceeded},
+		{name: "deadline", err: context.DeadlineExceeded, wantErr: kv.ErrTransactionOutcomeUnknown},
 		{name: "route_fence", err: kv.ErrRouteWriteFenced},
 		{name: "unknown_outcome", err: kv.ErrTransactionOutcomeUnknown},
 		{name: "fence_with_race", err: errors.Join(kv.ErrRouteWriteFenced, kv.ErrTxnLocked)},
@@ -228,7 +229,11 @@ func TestSQSFIFOAttemptDispatchErrorsPropagate(t *testing.T) {
 			f.coord.firstErr = fault.err
 			readTS := f.st.LastCommitTS()
 			messages, err := f.scan(t, 60)
-			require.ErrorIs(t, err, fault.err, "must not convert a delivery failure into an empty success")
+			wantErr := fault.err
+			if fault.wantErr != nil {
+				wantErr = fault.wantErr
+			}
+			require.ErrorIs(t, err, wantErr, "must not convert a delivery failure into an empty success")
 			require.Empty(t, messages)
 			require.Len(t, f.coord.requests, 1)
 			f.requireHeadAttempt(t, f.coord.requests[0], readTS)

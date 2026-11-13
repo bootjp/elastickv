@@ -194,7 +194,7 @@ func (s *SQSServer) advanceFifoDelayReindex(ctx context.Context, queueName strin
 		return false, err
 	}
 	req.Elems = append(req.Elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: sqsQueueMetaKey(queueName), Value: encoded})
-	if _, err := kv.DispatchWithReadTimestamp(ctx, s.coordinator, req); err != nil {
+	if err := s.dispatchSQSMutation(ctx, req); err != nil {
 		return false, errors.WithStack(err)
 	}
 	return meta.DelayReindex == nil, nil
