@@ -164,6 +164,19 @@ func TestRedisReadObservationBlockingBZPopMinRecordsPolls(t *testing.T) {
 	require.Empty(t, coord.marks)
 }
 
+func TestRedisReadObservationBZPopMinSingleAttempt(t *testing.T) {
+	st := store.NewMVCCStore()
+	defer st.Close()
+	coord := &redisReadObservationCoordinator{}
+	server := &RedisServer{coordinator: coord, store: st}
+	cmd := redcon.Command{Args: [][]byte{[]byte(cmdBZPopMin), []byte("missing"), []byte("1")}}
+	server.dispatchCommandDirect(&recordingConn{}, cmdBZPopMin, func(conn redcon.Conn, _ redcon.Command) {
+		server.bzpopminWaitLoop(conn, [][]byte{[]byte("missing")}, time.Now().Add(-time.Second))
+	}, cmd, time.Now())
+	require.Equal(t, [][]byte{redisUserRouteKey([]byte("missing"))}, coord.keys)
+	require.Empty(t, coord.marks)
+}
+
 func TestRedisReadObservationNonblockingXReadCountsActualReads(t *testing.T) {
 	for _, tt := range []struct {
 		name string

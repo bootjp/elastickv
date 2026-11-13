@@ -1611,7 +1611,6 @@ func (r *RedisServer) bzpopminWaitLoop(conn redcon.Conn, keys [][]byte, deadline
 			conn.WriteArray(-1)
 			return
 		}
-		r.observeBlockingRedisKeys(handlerCtx, keys)
 		var done bool
 		if ok := r.runWithHeavyCommandSlot(func() {
 			done = r.bzpopminTryAllKeys(conn, keys, fast)
@@ -1642,6 +1641,7 @@ func (r *RedisServer) bzpopminWaitLoop(conn redcon.Conn, keys [][]byte, deadline
 // the full check.
 func (r *RedisServer) bzpopminTryAllKeys(conn redcon.Conn, keys [][]byte, fast bool) bool {
 	for _, key := range keys {
+		r.observeBlockingRedisKeys(r.handlerContext(conn), [][]byte{key})
 		result, err := r.tryBZPopMinWithMode(key, fast, r.handlerContext(conn))
 		if err != nil {
 			writeRedisError(conn, err)
