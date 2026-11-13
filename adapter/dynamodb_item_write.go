@@ -447,6 +447,7 @@ func (d *DynamoDBServer) reuseWriteSetMatches(ctx context.Context, elems []*kv.E
 }
 
 func (d *DynamoDBServer) reuseMutationMatches(ctx context.Context, elem *kv.Elem[kv.OP], commitTS uint64) (bool, error) {
+	kv.ObserveReadForKeyThrough(d.coordinator, ctx, elem.Key)
 	landed, err := d.store.CommittedVersionAt(ctx, elem.Key, commitTS)
 	if err != nil || !landed {
 		return false, errors.Wrap(err, "probe reuse version")
