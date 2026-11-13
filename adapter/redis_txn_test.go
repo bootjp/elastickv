@@ -1686,14 +1686,13 @@ func TestRedisTxnBuildZSetLegacyElemsWritesFence(t *testing.T) {
 	t.Parallel()
 
 	key := []byte("zset:legacy-fence")
-	txn := &txnContext{
-		zsetStates: map[string]*zsetTxnState{
-			string(key): {
-				members: map[string]float64{"member": 1},
-				dirty:   true,
-			},
+	server, _ := newRedisStorageMigrationTestServer(t)
+	txn := newRedisTxnTestContext(server)
+	txn.zsetStates = map[string]*zsetTxnState{
+		string(key): {
+			members: map[string]float64{"member": 1},
+			dirty:   true,
 		},
-		replacers: map[string]*stringReplacement{},
 	}
 
 	elems, err := txn.buildZSetElems(20)
