@@ -14,6 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/aws/smithy-go"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
@@ -111,4 +112,35 @@ func TestS3UnknownOutcomeGoSDKDoesNotReplay(t *testing.T) {
 	require.ErrorAs(t, err, &apiErr)
 	require.Equal(t, "OperationOutcomeUnknown", apiErr.ErrorCode())
 	require.Equal(t, int32(1), calls.Load())
+}
+
+func TestSQSUnknownOutcomeGoSDKDoesNotReplay(t *testing.T) {
+	t.Parallel()
+	var calls atomic.Int32
+	var jsonProtocol atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		jsonProtocol.Store(r.Header.Get("X-Amz-Target") == sqsSendMessageTarget)
+		writeSQSErrorFromErr(w, kv.ErrTransactionOutcomeUnknown)
+	}))
+	t.Cleanup(server.Close)
+
+	cfg, err := config.LoadDefaultConfig(t.Context(),
+		config.WithRegion("us-west-2"),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("dummy", "dummy", "")),
+	)
+	require.NoError(t, err)
+	client := sqs.NewFromConfig(cfg, func(o *sqs.Options) {
+		o.BaseEndpoint = aws.String(server.URL)
+	})
+	_, err = client.SendMessage(t.Context(), &sqs.SendMessageInput{
+		QueueUrl:    aws.String(server.URL + "/queue"),
+		MessageBody: aws.String("payload"),
+	})
+	require.Error(t, err)
+	var apiErr smithy.APIError
+	require.ErrorAs(t, err, &apiErr)
+	require.Equal(t, sqsErrOperationOutcomeUnknown, apiErr.ErrorCode())
+	require.Equal(t, int32(1), calls.Load())
+	require.True(t, jsonProtocol.Load())
 }
