@@ -2647,6 +2647,9 @@ func (t *txnContext) appendHashStateElems(elems []*kv.Elem[kv.OP], key []byte, s
 		return append(elems, inline...), false
 	}
 	next, newFields := appendHashChangedFieldElems(elems, key, st)
+	if len(st.dirtyFields) != 0 {
+		next = append(next, redisTxnWideHashFenceElem(key))
+	}
 	if newFields == 0 {
 		return next, false
 	}
@@ -2673,7 +2676,6 @@ func appendHashChangedFieldElems(elems []*kv.Elem[kv.OP], key []byte, st *hashTx
 func appendHashDeltaElem(elems []*kv.Elem[kv.OP], key []byte, newFields int64, commitTS uint64, seqInTxn uint32) []*kv.Elem[kv.OP] {
 	deltaVal := store.MarshalHashMetaDelta(store.HashMetaDelta{LenDelta: newFields})
 	return append(elems,
-		redisTxnWideHashFenceElem(key),
 		&kv.Elem[kv.OP]{
 			Op:    kv.Put,
 			Key:   store.HashMetaDeltaKey(key, commitTS, seqInTxn),

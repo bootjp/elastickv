@@ -205,11 +205,12 @@ func (r *RedisServer) applyHashFieldPairs(key []byte, args [][]byte, requestCont
 		elems, newFields = r.buildHashFieldElems(key, args, existsMap, elems)
 		added = newFields
 
+		// Every field write advances the fence used by whole-hash readers.
+		elems = append(elems, redisTxnWideHashFenceElem(key))
 		// Emit a single delta key for all newly-added fields.
 		if newFields != 0 {
 			deltaVal := store.MarshalHashMetaDelta(store.HashMetaDelta{LenDelta: int64(newFields)})
 			elems = append(elems,
-				redisTxnWideHashFenceElem(key),
 				&kv.Elem[kv.OP]{
 					Op:    kv.Put,
 					Key:   store.HashMetaDeltaKey(key, commitTS, 0),
@@ -803,10 +804,10 @@ func (r *RedisServer) hincrbyWithMigration(ctx context.Context, key, fieldKey []
 	elems = append(elems, cleanupElems...)
 	elems = append(elems, migrationElems...)
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: fieldKey, Value: []byte(newVal)})
+	elems = append(elems, redisTxnWideHashFenceElem(key))
 	if isNewField {
 		deltaVal := store.MarshalHashMetaDelta(store.HashMetaDelta{LenDelta: 1})
 		elems = append(elems,
-			redisTxnWideHashFenceElem(key),
 			&kv.Elem[kv.OP]{
 				Op:    kv.Put,
 				Key:   store.HashMetaDeltaKey(key, commitTS, 0),
@@ -863,10 +864,10 @@ func (r *RedisServer) hincrbyTxn(ctx context.Context, key, field []byte, increme
 	elems := make([]*kv.Elem[kv.OP], 0, len(cleanupElems)+setWideColOverhead)
 	elems = append(elems, cleanupElems...)
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: fieldKey, Value: []byte(newVal)})
+	elems = append(elems, redisTxnWideHashFenceElem(key))
 	if isNewField {
 		deltaVal := store.MarshalHashMetaDelta(store.HashMetaDelta{LenDelta: 1})
 		elems = append(elems,
-			redisTxnWideHashFenceElem(key),
 			&kv.Elem[kv.OP]{
 				Op:    kv.Put,
 				Key:   store.HashMetaDeltaKey(key, commitTS, 0),

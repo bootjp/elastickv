@@ -392,10 +392,9 @@ func (c *luaScriptContext) trackAbsentKeyReadKeys(key []byte) {
 //   - hash: the hash fence, which every change of the field set Puts (a
 //     create, a new field, every HDEL, an emptying delete, a type change),
 //     plus the legacy blob anchor, which a legacy-blob migration rewrites
-//     without the fence. An update of an existing field's value writes only
-//     the field key, so the commands that return values (HGET, HEXISTS,
-//     HMGET, HGETALL) also record the field keys they read; HLEN depends only
-//     on the field set.
+//     without the fence. Every wide-column field value update also Puts the
+//     fence. Point reads additionally record their field keys; HGETALL uses
+//     only the fence so its read set stays bounded for large hashes.
 //   - zset: also the legacy blob anchor, which the MULTI legacy path deletes
 //     without the fence when it empties the zset.
 //   - stream: the stream meta key, which every stream write rewrites.
@@ -2070,10 +2069,8 @@ func (c *luaScriptContext) cmdHGetAll(args []string) (luaReply, error) {
 		fields = append(fields, field)
 	}
 	sort.Strings(fields)
-	// Updating an existing field writes only its field key, so the values
-	// HGETALL returned are validated through those keys; the hash fence
-	// covers the field set (every added field and every HDEL Puts it).
-	c.trackCollectionElementReadKeys([]byte(args[0]), st.exists, store.HashFieldKey, fields...)
+	// The hash fence covers both the field set and value-only updates.
+	// observeHashState already tracked it and the legacy blob anchor.
 	out := make([]luaReply, 0, len(fields)*redisPairWidth)
 	for _, field := range fields {
 		out = append(out, luaStringReply(field), luaStringReply(st.value[field]))

@@ -3,10 +3,12 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
@@ -38,8 +40,8 @@ type luaCollectionReadSkewCase struct {
 func luaCollectionReadSkewCases(coll string) []luaCollectionReadSkewCase {
 	return []luaCollectionReadSkewCase{
 		{
-			// HSET of an existing field writes only the field key (no hash
-			// fence), so only the field key in the read set can see it.
+			// Point reads still record the field key even though HSET now
+			// advances the whole-hash fence as well.
 			name: "HGET vs update-only HSET",
 			seed: func(ctx context.Context, c *redis.Client) error {
 				return c.HSet(ctx, coll, "f", "v1").Err()
@@ -64,8 +66,7 @@ func luaCollectionReadSkewCases(coll string) []luaCollectionReadSkewCase {
 			fresh: "f,v1,g,v2",
 		},
 		{
-			// Update-only HSET writes only the field key; HGETALL sees it
-			// only if it records the field keys it returned.
+			// Update-only HSET advances the whole-hash fence.
 			name: "HGETALL vs update-only HSET",
 			seed: func(ctx context.Context, c *redis.Client) error {
 				return c.HSet(ctx, coll, "f", "v1").Err()
@@ -471,7 +472,7 @@ func TestLua_CollectionReadOfUnwrittenKeyIsNotValidated(t *testing.T) {
 // key records the absent-key set; a list / set records its type fence; a hash
 // or zset also records its legacy blob anchor; a stream records its meta key;
 // point reads of an existing collection add the element key (hash field, set
-// member, zset member), and HGETALL adds the key of every field it returned.
+// member, zset member). HGETALL uses only the hash fence and blob anchor.
 // Each script also SETs an unrelated key so it dispatches; that key
 // contributes only its own creation fences.
 func TestLua_ReadSetCoversCollectionReads(t *testing.T) {
@@ -514,8 +515,8 @@ func TestLua_ReadSetCoversCollectionReads(t *testing.T) {
 		{name: "HEXISTS absent", read: `redis.call("HEXISTS", KEYS[1], "f")`, want: absent},
 		{name: "HMGET", seed: seedHash, read: `redis.call("HMGET", KEYS[1], "f", "g")`, want: with(hash, field("f"), field("g"))},
 		{name: "HMGET absent", read: `redis.call("HMGET", KEYS[1], "f", "g")`, want: absent},
-		{name: "HGETALL", seed: seedHash, read: `redis.call("HGETALL", KEYS[1])`, want: with(hash, field("f"))},
-		{name: "HGETALL two fields", seed: seedHash2, read: `redis.call("HGETALL", KEYS[1])`, want: with(hash, field("f"), field("g"))},
+		{name: "HGETALL", seed: seedHash, read: `redis.call("HGETALL", KEYS[1])`, want: hash},
+		{name: "HGETALL two fields", seed: seedHash2, read: `redis.call("HGETALL", KEYS[1])`, want: hash},
 		{name: "HLEN two fields", seed: seedHash2, read: `redis.call("HLEN", KEYS[1])`, want: hash},
 		{name: "HGETALL absent", read: `redis.call("HGETALL", KEYS[1])`, want: absent},
 		{name: "HLEN", seed: seedHash, read: `redis.call("HLEN", KEYS[1])`, want: hash},
@@ -576,6 +577,62 @@ func TestLua_ReadSetCoversCollectionReads(t *testing.T) {
 			requireReadKeysMatch(t, coord.lastReadKeys, want)
 		})
 	}
+}
+
+func TestLuaHGetAllReadSetBoundedAboveMaxReadKeys(t *testing.T) {
+	key := "lua:large-hash"
+	values := make(redisHashValue, kv.MaxReadKeys+1)
+	for i := 0; i <= kv.MaxReadKeys; i++ {
+		values[fmt.Sprintf("f%05d", i)] = "v"
+	}
+	c := &luaScriptContext{hashes: map[string]*luaHashState{
+		key: {loaded: true, exists: true, value: values},
+	}}
+	reply, err := c.cmdHGetAll([]string{key})
+	require.NoError(t, err)
+	require.Len(t, reply.array, 2*len(values))
+	readKeys, _ := c.sortedTrackedReadKeys(0)
+	require.Less(t, len(readKeys), kv.MaxReadKeys)
+	requireReadKeysMatch(t, readKeys, [][]byte{
+		redisTxnWideHashFenceKey([]byte(key)), redisHashKey([]byte(key)),
+	})
+}
+
+func TestHashValueOnlyWritesAdvanceWholeHashFence(t *testing.T) {
+	ctx := context.Background()
+	key := []byte("hash:value-fence")
+	st := store.NewMVCCStore()
+	coord := &putRecordingCoordinator{readKeyRecordingCoordinator: newReadKeyRecordingCoordinator(st)}
+	server := NewRedisServer(nil, "", st, coord, nil, nil)
+	_, err := server.applyHashFieldPairs(key, [][]byte{[]byte("f"), []byte("1")})
+	require.NoError(t, err)
+
+	for _, tc := range []struct {
+		name  string
+		write func() error
+	}{
+		{name: "HSET", write: func() error {
+			_, err := server.applyHashFieldPairs(key, [][]byte{[]byte("f"), []byte("2")})
+			return err
+		}},
+		{name: "HINCRBY", write: func() error {
+			_, err := server.hincrbyTxn(ctx, key, []byte("f"), 1)
+			return err
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			coord.lastPuts = nil
+			require.NoError(t, tc.write())
+			require.Contains(t, coord.lastPuts, redisTxnWideHashFenceKey(key))
+		})
+	}
+
+	state := &hashTxnState{dirty: true, fields: map[string][]byte{"f": []byte("4")},
+		origFields: map[string][]byte{"f": []byte("3")}, dirtyFields: map[string]struct{}{"f": {}}}
+	txn := &txnContext{}
+	elems, emitted := txn.appendHashStateElems(nil, key, state, 1, 0)
+	require.False(t, emitted)
+	require.True(t, elemKeysContain(elems, redisTxnWideHashFenceKey(key)))
 }
 
 // TestHDel_PutsHashFence pins that every HDEL that removes a field Puts the
