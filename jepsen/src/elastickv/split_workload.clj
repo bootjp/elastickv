@@ -66,7 +66,8 @@
           (assoc op :type :info :error (or (.getMessage t) (str t))))))))
 
 (defn split-register-workload [opts]
-  (let [keys (if (:repeat-splits opts) repeated-register-keys register-keys)
+  (let [keys (or (:register-keys opts)
+                 (if (:repeat-splits opts) repeated-register-keys register-keys))
         client (assoc (->SplitRegisterClient
                         (or (:node->port opts) (zipmap default-nodes (repeat 6379)))
                         nil)
@@ -74,7 +75,7 @@
         max-writes (or (:max-writes-per-key opts) 100)]
     {:client client
      :generator (independent/concurrent-generator
-                  2
+                  (or (:independent-concurrency opts) 2)
                   (range (count keys))
                   (fn [_]
                     (gen/mix [(map (fn [v] {:f :write :value v}) (range max-writes))

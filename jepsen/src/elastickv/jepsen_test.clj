@@ -9,6 +9,7 @@
             [elastickv.filesystem-workload :as filesystem-workload]
             [elastickv.sqs-htfifo-workload :as sqs-htfifo-workload]
             [elastickv.split-workload :as split-workload]
+            [elastickv.hotspot-workload :as hotspot-workload]
             [jepsen.cli :as cli]))
 
 (defn elastickv-test
@@ -43,6 +44,10 @@
   ([] (elastickv-split-test {}))
   ([opts] (split-workload/elastickv-split-test opts)))
 
+(defn elastickv-hotspot-test
+  ([] (elastickv-hotspot-test {}))
+  ([opts] (hotspot-workload/elastickv-hotspot-test opts)))
+
 (def ^:private test-fns
   "Map of user-facing test names to their constructor fns. The first
   positional CLI arg selects which workload runs; if absent or unknown,
@@ -54,6 +59,7 @@
    "elastickv-s3-test"          elastickv-s3-test
    "elastickv-filesystem-test"  elastickv-filesystem-test
    "elastickv-split-test"       elastickv-split-test
+   "elastickv-hotspot-test"     elastickv-hotspot-test
    "elastickv-learner-test"     elastickv-learner-test})
 
 (defn elastickv-sqs-htfifo-test
