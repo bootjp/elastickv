@@ -798,6 +798,40 @@ func redisTxnWideCreateReadKeys(userKey []byte, typ redisValueType, fenceKey fun
 	return [][]byte{fenceKey(userKey)}
 }
 
+// redisStringTypeReadKeys lists the anchors of the string family (TYPE reports
+// all three as "string"): the prefixed string key, the HyperLogLog key, and
+// the legacy bare key. A command that observed userKey as a string at its read
+// timestamp validates them at commit: every DEL, overwrite, and type change of
+// a string rewrites or deletes whichever of them holds the value.
+func redisStringTypeReadKeys(userKey []byte) [][]byte {
+	return [][]byte{redisStrKey(userKey), redisHLLKey(userKey), userKey}
+}
+
+// redisStringWriteGuard returns what a standalone string write (SET and its
+// NX / XX / GET forms, SETNX, SETEX, the legacy INCR) adds to its transaction
+// once it has decided on userKey's logical type typ at its read timestamp:
+//
+//   - absent: redisAbsentKeyCreateGuard (the absent-key read keys and
+//     Puts of the four txn-wide fences), so the create conflicts with a
+//     concurrent create of any other encoding, in either commit order.
+//   - string: the string-family anchors (redisStringTypeReadKeys). The write
+//     Puts only the prefixed string key, so without them a DEL or type change
+//     of a value held under the HLL or the legacy bare key would go unseen.
+//   - list / hash / set / zset / stream: nothing. The write replaces the
+//     collection through deleteLogicalKeyElems, which Puts the four fences
+//     that every DEL, emptying path, and type change of a collection also
+//     writes, so the write-write check already covers them.
+func redisStringWriteGuard(userKey []byte, typ redisValueType) ([]*kv.Elem[kv.OP], [][]byte) {
+	switch typ {
+	case redisTypeNone:
+		return redisAbsentKeyCreateGuard(userKey, typ)
+	case redisTypeString:
+		return nil, redisStringTypeReadKeys(userKey)
+	case redisTypeList, redisTypeHash, redisTypeSet, redisTypeZSet, redisTypeStream:
+	}
+	return nil, nil
+}
+
 // redisAbsentKeyCreateGuard returns what a creator of a single-anchor
 // encoding (an HLL, a stream) adds to its transaction when it observed userKey
 // absent at its read timestamp (startType == redisTypeNone): the absent-key

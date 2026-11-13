@@ -130,10 +130,18 @@ func (r *RedisServer) loadRedisSetState(ctx context.Context, key []byte, readTS 
 	return state, nil
 }
 
-func (r *RedisServer) replaceWithStringReadTimestampTxn(ctx context.Context, key, value []byte, ttl *time.Time, typ redisValueType, readTimestamp kv.ReadTimestamp) error {
+// replaceWithStringReadTimestampTxn writes key as a string at readTimestamp,
+// replacing what state (loaded at the same read timestamp) found there, and
+// validates that observation at commit through redisStringWriteGuard: a create
+// reads the absent-key set and Puts the four fences, an overwrite of a string
+// reads the string-family anchors.
+func (r *RedisServer) replaceWithStringReadTimestampTxn(ctx context.Context, key, value []byte, ttl *time.Time, state redisSetState, readTimestamp kv.ReadTimestamp) error {
 	readTS := readTimestamp.Timestamp()
 	var elems []*kv.Elem[kv.OP]
-	if isNonStringCollectionType(typ) {
+	// Use rawTyp for cleanup so expired-but-lingering internal keys are
+	// deleted. deleteLogicalKeyElems also Puts the four txn-wide fences.
+	collectionReplaced := isNonStringCollectionType(state.rawTyp)
+	if collectionReplaced {
 		delElems, _, err := r.deleteLogicalKeyElems(ctx, key, readTS)
 		if err != nil {
 			return err
@@ -147,7 +155,12 @@ func (r *RedisServer) replaceWithStringReadTimestampTxn(ctx context.Context, key
 	} else {
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey(key)})
 	}
-	return r.dispatchReadTimestampElems(ctx, readTimestamp, elems)
+	// The existence and type the command decided on are TTL-aware (state.typ).
+	fences, readKeys := redisStringWriteGuard(key, state.typ)
+	if !collectionReplaced {
+		elems = append(elems, fences...)
+	}
+	return r.dispatchReadTimestampElemsWithReadKeys(ctx, readTimestamp, elems, readKeys)
 }
 
 func (r *RedisServer) executeSet(ctx context.Context, key, value []byte, opts redisSetOptions) (redisSetExecution, error) {
@@ -171,8 +184,7 @@ func (r *RedisServer) executeSet(ctx context.Context, key, value []byte, opts re
 		if opts.returnOld && exists && state.typ != redisTypeString {
 			return wrongTypeError()
 		}
-		// Use rawTyp for cleanup so expired-but-lingering internal keys are deleted.
-		if err := r.replaceWithStringReadTimestampTxn(ctx, key, value, opts.ttl, state.rawTyp, readTimestamp); err != nil {
+		if err := r.replaceWithStringReadTimestampTxn(ctx, key, value, opts.ttl, state, readTimestamp); err != nil {
 			return err
 		}
 		result = redisSetExecution{state: state, wroteOldBulk: opts.returnOld}
@@ -182,9 +194,12 @@ func (r *RedisServer) executeSet(ctx context.Context, key, value []byte, opts re
 }
 
 // trySetFastPath attempts the fast-path for SET (no NX/XX/GET flags) when the
-// key is a string or absent. Returns true if the fast-path handled the command.
-// When the key holds a non-string type, returns false so the caller can fall
-// through to executeSet which cleans up internal keys before overwriting.
+// key is a string. Returns true if the fast-path handled the command. When the
+// key holds a non-string type, returns false so the caller can fall through to
+// executeSet which cleans up internal keys before overwriting. When it is
+// absent, returns false too: a create must read the absent-key set and Put the
+// fences (redisStringWriteGuard), which the fast path's blind write cannot
+// carry.
 func (r *RedisServer) trySetFastPath(conn redcon.Conn, ctx context.Context, key, value []byte, ttl *time.Time) bool {
 	// Only use the fast path when we are the leader for this key so the local
 	// type check is authoritative. On followers, stale MVCC state could miss a
@@ -201,7 +216,7 @@ func (r *RedisServer) trySetFastPath(conn redcon.Conn, ctx context.Context, key,
 		writeRedisError(conn, err)
 		return true
 	}
-	if isNonStringCollectionType(typ) {
+	if typ == redisTypeNone || isNonStringCollectionType(typ) {
 		return false
 	}
 	if err := r.saveString(ctx, key, value, ttl); err != nil {

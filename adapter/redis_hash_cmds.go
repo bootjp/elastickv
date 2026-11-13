@@ -953,7 +953,12 @@ func (r *RedisServer) incrLegacyCommand(conn redcon.Conn, cmd redcon.Command) {
 			// cannot later expire a now-persistent key.
 			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey(cmd.Args[1])})
 		}
-		return r.dispatchReadTimestampElems(ctx, readTimestamp, elems)
+		// Validate the type INCR observed: a create conflicts with a
+		// concurrent create of another encoding, an increment with a DEL or
+		// type change of the string it read.
+		fences, readKeys := redisStringWriteGuard(cmd.Args[1], typ)
+		elems = append(elems, fences...)
+		return r.dispatchReadTimestampElemsWithReadKeys(ctx, readTimestamp, elems, readKeys)
 	}); err != nil {
 		writeRedisError(conn, err)
 		return
