@@ -206,3 +206,14 @@ func TestRedisReadObservationInsideExec(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, [][]byte{redisUserRouteKey([]byte("exec-key"))}, coord.keys)
 }
+
+func TestRedisReadObservationInsideFailedExec(t *testing.T) {
+	coord := &redisReadObservationCoordinator{}
+	server := &RedisServer{coordinator: coord, store: store.NewMVCCStore()}
+	_, err := server.runTransaction([]redcon.Command{
+		{Args: [][]byte{[]byte(cmdGet), []byte("exec-key")}},
+		{Args: [][]byte{[]byte(cmdHGet), []byte("exec-key"), []byte("field")}},
+	})
+	require.ErrorContains(t, err, "unsupported")
+	require.Contains(t, coord.keys, redisUserRouteKey([]byte("exec-key")))
+}

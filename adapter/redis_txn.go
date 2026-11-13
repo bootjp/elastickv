@@ -2907,11 +2907,9 @@ func (r *RedisServer) runTransaction(queue []redcon.Command, requestContexts ...
 	} else {
 		results, err = r.runTransactionDirect(queue, ctx)
 	}
-	if err == nil {
-		for _, cmd := range queue {
-			if len(cmd.Args) != 0 {
-				r.observeRedisRead(ctx, strings.ToUpper(string(cmd.Args[0])), cmd.Args, false)
-			}
+	for _, cmd := range queue {
+		if len(cmd.Args) != 0 {
+			r.observeRedisRead(ctx, strings.ToUpper(string(cmd.Args[0])), cmd.Args, false)
 		}
 	}
 	return results, err

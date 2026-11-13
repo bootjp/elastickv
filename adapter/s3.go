@@ -1937,6 +1937,9 @@ func (s *S3Server) maybeProxyToLeader(w http.ResponseWriter, r *http.Request) bo
 	if err != nil {
 		return false
 	}
+	if len(key) > 0 && r.Method != http.MethodGet && r.Method != http.MethodHead {
+		kv.ObserveReadForKeyThrough(s.coordinator, r.Context(), key)
+	}
 	var leader string
 	if len(key) > 0 {
 		if s.coordinator.IsLeaderForKey(key) && s.coordinator.VerifyLeaderForKey(r.Context(), key) == nil {

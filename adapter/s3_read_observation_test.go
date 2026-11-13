@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"bytes"
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -39,5 +40,27 @@ func TestS3ReadObservationMarksDeniedAnonymousACLProbe(t *testing.T) {
 	require.NotEmpty(t, coord.keys)
 	for _, key := range coord.keys {
 		require.True(t, bytes.Equal(s3keys.BucketMetaKey("private"), key))
+	}
+}
+
+func TestS3ReadObservationAttributesConditionalMutationRoute(t *testing.T) {
+	coord := &redisReadObservationCoordinator{}
+	coord.leaderSet = true
+	coord.leader = true
+	st := store.NewMVCCStore()
+	meta, err := encodeS3BucketMeta(&s3BucketMeta{BucketName: "bucket", Generation: 3})
+	require.NoError(t, err)
+	require.NoError(t, st.PutAt(context.Background(), s3keys.BucketMetaKey("bucket"), meta, 1, 0))
+	server := NewS3Server(nil, "", st, coord, nil)
+	t.Cleanup(server.cancelCleanups)
+
+	for _, method := range []string{http.MethodPut, http.MethodDelete} {
+		t.Run(method, func(t *testing.T) {
+			coord.keys = nil
+			req := httptest.NewRequest(method, "/bucket/object", nil)
+			req.Header.Set("If-Match", "stale")
+			require.False(t, server.maybeProxyToLeader(httptest.NewRecorder(), req))
+			require.Contains(t, coord.keys, s3keys.RouteKey("bucket", 3, "object"))
+		})
 	}
 }
