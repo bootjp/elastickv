@@ -462,6 +462,9 @@ func (a *Adapter) openWithOperation(ctx context.Context, inode uint64) (uint64, 
 
 func (a *Adapter) Read(ctx context.Context, inode uint64, fh uint64, offset uint64, size uint64) ([]byte, syscall.Errno) {
 	if errno := a.refreshOpenHandleLease(ctx, inode, fh, false); errno != 0 {
+		if errno == syscall.EIO {
+			slog.WarnContext(ctx, "filesystem FUSE read lease refresh failed", "inode", inode, "fh", fh, "offset", offset, "size", size)
+		}
 		return nil, errno
 	}
 	data, err := a.core.Read(ctx, inode, fh, offset, size)
