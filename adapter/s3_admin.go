@@ -495,6 +495,7 @@ func (s *S3Server) adminDeleteBucketTxnBody(ctx context.Context, name string, de
 func bucketDeleteSafetyNetElems(bucket string, generation uint64) []*kv.Elem[kv.OP] {
 	return []*kv.Elem[kv.OP]{
 		{Op: kv.DelPrefix, Key: s3keys.ObjectManifestPrefixForBucket(bucket, generation)},
+		{Op: kv.DelPrefix, Key: s3keys.MigrationIntentPrefixForBucket(bucket, generation)},
 		{Op: kv.DelPrefix, Key: s3keys.UploadMetaPrefixForBucket(bucket, generation)},
 		{Op: kv.DelPrefix, Key: s3keys.UploadPartPrefixForBucket(bucket, generation)},
 		{Op: kv.DelPrefix, Key: s3keys.BlobPrefixForBucket(bucket, generation)},

@@ -9,6 +9,7 @@ const (
 	BucketMetaPrefix       = "!s3|bucket|meta|"
 	BucketGenerationPrefix = "!s3|bucket|gen|"
 	ObjectManifestPrefix   = "!s3|obj|head|"
+	MigrationIntentPrefix  = "!s3|obj|migration|"
 	UploadMetaPrefix       = "!s3|upload|meta|"
 	UploadPartPrefix       = "!s3|upload|part|"
 	BlobPrefix             = "!s3|blob|"
@@ -32,6 +33,7 @@ var (
 	bucketMetaPrefixBytes       = []byte(BucketMetaPrefix)
 	bucketGenerationPrefixBytes = []byte(BucketGenerationPrefix)
 	objectManifestPrefixBytes   = []byte(ObjectManifestPrefix)
+	migrationIntentPrefixBytes  = []byte(MigrationIntentPrefix)
 	uploadMetaPrefixBytes       = []byte(UploadMetaPrefix)
 	uploadPartPrefixBytes       = []byte(UploadPartPrefix)
 	blobPrefixBytes             = []byte(BlobPrefix)
@@ -97,6 +99,25 @@ func ParseBucketGenerationKey(key []byte) (string, bool) {
 
 func ObjectManifestKey(bucket string, generation uint64, object string) []byte {
 	return buildObjectKey(objectManifestPrefixBytes, bucket, generation, object, "", 0, 0)
+}
+
+// MigrationIntentKey shares the manifest's object route. A future migrator
+// must commit its manifest flip and cleanup intent in one Raft transaction.
+func MigrationIntentKey(bucket string, generation uint64, object string) []byte {
+	manifest := ObjectManifestKey(bucket, generation, object)
+	key := make([]byte, 0, len(MigrationIntentPrefix)+len(manifest)-len(ObjectManifestPrefix))
+	key = append(key, migrationIntentPrefixBytes...)
+	return append(key, manifest[len(ObjectManifestPrefix):]...)
+}
+
+func ParseMigrationIntentKey(key []byte) (bucket string, generation uint64, object string, ok bool) {
+	if !bytes.HasPrefix(key, migrationIntentPrefixBytes) {
+		return "", 0, "", false
+	}
+	manifest := make([]byte, 0, len(ObjectManifestPrefix)+len(key)-len(MigrationIntentPrefix))
+	manifest = append(manifest, objectManifestPrefixBytes...)
+	manifest = append(manifest, key[len(MigrationIntentPrefix):]...)
+	return ParseObjectManifestKey(manifest)
 }
 
 func UploadMetaKey(bucket string, generation uint64, object string, uploadID string) []byte {
@@ -243,6 +264,10 @@ func ObjectManifestPrefixForBucket(bucket string, generation uint64) []byte {
 	return bucketScopedPrefix(objectManifestPrefixBytes, bucket, generation)
 }
 
+func MigrationIntentPrefixForBucket(bucket string, generation uint64) []byte {
+	return bucketScopedPrefix(migrationIntentPrefixBytes, bucket, generation)
+}
+
 // UploadMetaPrefixForBucket / UploadPartPrefixForBucket /
 // BlobPrefixForBucket / ChunkRefPrefixForBucket / GCUploadPrefixForBucket /
 // RoutePrefixForBucket each isolate to a single bucket+generation tuple. Used by
@@ -308,6 +333,8 @@ func bucketGenerationFamilyPrefix(key []byte) []byte {
 	switch {
 	case bytes.HasPrefix(key, objectManifestPrefixBytes):
 		return objectManifestPrefixBytes
+	case bytes.HasPrefix(key, migrationIntentPrefixBytes):
+		return migrationIntentPrefixBytes
 	case bytes.HasPrefix(key, uploadMetaPrefixBytes):
 		return uploadMetaPrefixBytes
 	case bytes.HasPrefix(key, uploadPartPrefixBytes):
@@ -497,26 +524,47 @@ func BucketScopedRoutePrefix(prefix []byte) ([]byte, bool) {
 }
 
 func ManifestScanRouteBounds(start []byte, end []byte) ([]byte, []byte, bool) {
-	routeStart, ok := manifestScanBound(start)
+	return objectFamilyScanRouteBounds(start, end, objectManifestPrefixBytes)
+}
+
+func MigrationIntentScanRouteBounds(start []byte, end []byte) ([]byte, []byte, bool) {
+	return objectFamilyScanRouteBounds(start, end, migrationIntentPrefixBytes)
+}
+
+func objectFamilyScanRouteBounds(start, end, family []byte) ([]byte, []byte, bool) {
+	if bytes.Equal(end, objectFamilyAllScanEnd(family)) {
+		if bytes.Equal(start, family) {
+			return nil, nil, true
+		}
+		routeStart, ok := objectFamilyScanBound(start, family)
+		return routeStart, nil, ok
+	}
+	routeStart, ok := objectFamilyScanBound(start, family)
 	if !ok {
 		return nil, nil, false
 	}
 	if end == nil {
 		return routeStart, nil, true
 	}
-	routeEnd, ok := manifestScanBound(end)
+	routeEnd, ok := objectFamilyScanBound(end, family)
 	if !ok {
 		return nil, nil, false
 	}
 	return routeStart, routeEnd, true
 }
 
-func manifestScanBound(key []byte) ([]byte, bool) {
-	if !bytes.HasPrefix(key, objectManifestPrefixBytes) {
+func objectFamilyAllScanEnd(family []byte) []byte {
+	end := bytes.Clone(family)
+	end[len(end)-1]++ // The family prefix ends in '|', so its successor is one byte away.
+	return end
+}
+
+func objectFamilyScanBound(key, family []byte) ([]byte, bool) {
+	if !bytes.HasPrefix(key, family) {
 		return nil, false
 	}
 
-	offset := len(objectManifestPrefixBytes)
+	offset := len(family)
 	bucketEnd, ok := segmentEnd(key, offset)
 	if !ok {
 		return nil, false
@@ -526,9 +574,9 @@ func manifestScanBound(key []byte) ([]byte, bool) {
 		return nil, false
 	}
 
-	out := make([]byte, 0, len(RoutePrefix)+len(key)-len(objectManifestPrefixBytes))
+	out := make([]byte, 0, len(RoutePrefix)+len(key)-len(family))
 	out = append(out, routePrefixBytes...)
-	out = append(out, key[len(objectManifestPrefixBytes):]...)
+	out = append(out, key[len(family):]...)
 	return out, true
 }
 
@@ -557,6 +605,8 @@ func objectScopedPrefix(key []byte) []byte {
 	switch {
 	case bytes.HasPrefix(key, objectManifestPrefixBytes):
 		return objectManifestPrefixBytes
+	case bytes.HasPrefix(key, migrationIntentPrefixBytes):
+		return migrationIntentPrefixBytes
 	case bytes.HasPrefix(key, uploadMetaPrefixBytes):
 		return uploadMetaPrefixBytes
 	case bytes.HasPrefix(key, uploadPartPrefixBytes):

@@ -55,7 +55,7 @@ func ScopeForKey(key []byte) (Scope, bool, error) {
 	case bytes.HasPrefix(key, []byte(S3ChunkBlobPrefix)):
 		return Scope{}, false, errors.WithStack(ErrScopeOffloadedChunkBlob)
 	case hasAnyBackupPrefix(key,
-		S3BucketMetaPrefix, S3ObjectManifestPrefix,
+		S3BucketMetaPrefix, S3ObjectManifestPrefix, S3MigrationIntentPrefix,
 		S3UploadMetaPrefix, S3UploadPartPrefix, S3BlobPrefix, S3ChunkRefPrefix,
 		S3GCUploadPrefix, S3RoutePrefix,
 	):
@@ -80,7 +80,7 @@ func AdapterForKey(key []byte) (string, bool) {
 	case hasAnyBackupPrefix(key, DDBTableMetaPrefix, DDBTableGenPrefix, DDBItemPrefix, DDBSealPrefix, DDBGSIPrefix):
 		return adapterDynamoDB, true
 	case hasAnyBackupPrefix(key,
-		S3BucketMetaPrefix, S3BucketGenPrefix, S3ObjectManifestPrefix,
+		S3BucketMetaPrefix, S3BucketGenPrefix, S3ObjectManifestPrefix, S3MigrationIntentPrefix,
 		S3UploadMetaPrefix, S3UploadPartPrefix, S3BlobPrefix, S3GCUploadPrefix, S3RoutePrefix,
 	):
 		return adapterS3, true
@@ -152,7 +152,7 @@ func scopeForS3Key(key []byte) (Scope, bool, error) {
 		// bucket, so it scopes like every other object-level row.
 		bucket, _, _, _, _, _, ok := s3keys.ParseChunkRefKey(key)
 		return parsedS3Scope(bucket, ok, key)
-	case bytes.HasPrefix(key, []byte(S3GCUploadPrefix)), bytes.HasPrefix(key, []byte(S3RoutePrefix)):
+	case bytes.HasPrefix(key, []byte(S3MigrationIntentPrefix)), bytes.HasPrefix(key, []byte(S3GCUploadPrefix)), bytes.HasPrefix(key, []byte(S3RoutePrefix)):
 		return Scope{}, false, nil
 	default:
 		return Scope{}, false, nil

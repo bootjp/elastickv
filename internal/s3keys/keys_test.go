@@ -62,6 +62,7 @@ func TestExtractRouteKey_ObjectScopedKeys(t *testing.T) {
 
 	keys := [][]byte{
 		ObjectManifestKey(bucket, generation, object),
+		MigrationIntentKey(bucket, generation, object),
 		UploadMetaKey(bucket, generation, object, "upload-1"),
 		UploadPartKey(bucket, generation, object, "upload-1", 9),
 		BlobKey(bucket, generation, object, "upload-1", 9, 2),
@@ -70,6 +71,23 @@ func TestExtractRouteKey_ObjectScopedKeys(t *testing.T) {
 	for _, key := range keys {
 		require.Equal(t, want, ExtractRouteKey(key))
 	}
+}
+
+func TestMigrationIntentKeySharesManifestRouteAndBucketScope(t *testing.T) {
+	t.Parallel()
+	bucket := string([]byte{'b', 0, 'k'})
+	object := string([]byte{'o', 0, 'x'})
+	key := MigrationIntentKey(bucket, 8, object)
+	gotBucket, generation, gotObject, ok := ParseMigrationIntentKey(key)
+	require.True(t, ok)
+	require.Equal(t, bucket, gotBucket)
+	require.Equal(t, uint64(8), generation)
+	require.Equal(t, object, gotObject)
+	require.Equal(t, ExtractRouteKey(ObjectManifestKey(bucket, 8, object)), ExtractRouteKey(key))
+	require.True(t, bytes.HasPrefix(key, MigrationIntentPrefixForBucket(bucket, 8)))
+	require.False(t, bytes.HasPrefix(key, MigrationIntentPrefixForBucket(bucket, 9)))
+	_, _, _, ok = ParseMigrationIntentKey(append(key, 0))
+	require.False(t, ok)
 }
 
 func TestRoutePrefixForBucketAnyGeneration(t *testing.T) {
@@ -93,6 +111,36 @@ func TestManifestScanRouteBounds(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, append([]byte(RoutePrefix), start[len(ObjectManifestPrefix):]...), routeStart)
 	require.Equal(t, append([]byte(RoutePrefix), end[len(ObjectManifestPrefix):]...), routeEnd)
+}
+
+func TestManifestScanRouteBoundsAllObjectsAndCursor(t *testing.T) {
+	t.Parallel()
+	end := objectFamilyAllScanEnd(objectManifestPrefixBytes)
+	routeStart, routeEnd, ok := ManifestScanRouteBounds([]byte(ObjectManifestPrefix), end)
+	require.True(t, ok)
+	require.Nil(t, routeStart)
+	require.Nil(t, routeEnd)
+
+	cursor := append(ObjectManifestKey("bucket-a", 5, "object"), 0)
+	routeStart, routeEnd, ok = ManifestScanRouteBounds(cursor, end)
+	require.True(t, ok)
+	require.Equal(t, append([]byte(RoutePrefix), cursor[len(ObjectManifestPrefix):]...), routeStart)
+	require.Nil(t, routeEnd)
+}
+
+func TestMigrationIntentScanRouteBoundsAllObjectsAndCursor(t *testing.T) {
+	t.Parallel()
+	end := objectFamilyAllScanEnd(migrationIntentPrefixBytes)
+	routeStart, routeEnd, ok := MigrationIntentScanRouteBounds([]byte(MigrationIntentPrefix), end)
+	require.True(t, ok)
+	require.Nil(t, routeStart)
+	require.Nil(t, routeEnd)
+
+	cursor := append(MigrationIntentKey("bucket-a", 5, "object"), 0)
+	routeStart, routeEnd, ok = MigrationIntentScanRouteBounds(cursor, end)
+	require.True(t, ok)
+	require.Equal(t, append([]byte(RoutePrefix), cursor[len(MigrationIntentPrefix):]...), routeStart)
+	require.Nil(t, routeEnd)
 }
 
 func TestManifestScanRouteBoundsRejectsNonManifestKeys(t *testing.T) {
