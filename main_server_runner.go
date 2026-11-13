@@ -11,6 +11,9 @@ import (
 	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/bootjp/elastickv/internal/admin"
 	"github.com/bootjp/elastickv/internal/adminbridge"
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
+	"github.com/bootjp/elastickv/internal/encryptionwiring"
+	"github.com/bootjp/elastickv/internal/nodeauth"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	internalraftadmin "github.com/bootjp/elastickv/internal/raftadmin"
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -38,7 +41,7 @@ type serversInput struct {
 	eg                 *errgroup.Group
 	cancel             context.CancelFunc
 	lc                 *net.ListenConfig
-	runtimes           []*raftGroupRuntime
+	runtimes           []*clusterbootstrap.GroupRuntime
 	shardGroups        map[uint64]*kv.ShardGroup
 	bootstrapServers   []raftengine.Server
 	shardStore         *kv.ShardStore
@@ -48,8 +51,8 @@ type serversInput struct {
 	readTracker        *kv.ActiveTimestampTracker
 	metricsRegistry    *monitoring.Registry
 	cfg                noderuntime.RuntimeConfig
-	encWiring          encryptionWriteWiring
-	encryption         encryptionFlags
+	encWiring          encryptionwiring.WriteWiring
+	encryption         encryptionwiring.Flags
 	kekConfigured      bool
 	redisApplyObserver *adapter.RedisApplyObserver
 	cleanup            *internalutil.CleanupStack
@@ -77,7 +80,7 @@ type serversInput struct {
 	leaderBalance leaderBalanceFlags
 	adminHTTP     adminHTTPFlags
 	backup        backupFlags
-	nodeAuth      nodeAuthFlags
+	nodeAuth      nodeauth.Flags
 	listeners     listenerFlags
 	// nodeAddress is this node's --address.
 	nodeAddress string
@@ -91,8 +94,8 @@ type serversInput struct {
 // per-group Raft listeners needed for quorum traffic, waits for a fresh join
 // to catch up, prepares the public listeners, waits for any requested startup
 // rotation, then starts serving public traffic.
-func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter, in serversInput) error {
-	adminGRPCEnabled := in.nodeAuth.adminTokenFile != "" || in.nodeAuth.adminInsecureNoAuth
+func startServersAfterStartupRotation(waitRotateOnStartup encryptionwiring.StartupRotationWaiter, in serversInput) error {
+	adminGRPCEnabled := in.nodeAuth.AdminTokenFile != "" || in.nodeAuth.AdminInsecureNoAuth
 	// roleStore is gated on *adminEnabled. With admin HTTP disabled, building
 	// it is wasted work AND a security regression risk: a non-empty
 	// -adminFullAccessKeys flag would otherwise still flip
@@ -112,14 +115,14 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 		return err
 	}
 	roleStore := startupRoleStoreFromFlags(in.adminHTTP)
-	publicKVGate := &startupPublicKVGate{blockRuntime: func() bool { return protectedRuntimesBlocked(in.runtimes) }}
-	publicKVGate.domain = bootstrapDomainForRuntimes(in.runtimes)
-	startBootstrapReadinessReconciler(in.ctx, in.eg, in.runtimes, in.distCatalog, in.cfg.Engine)
+	publicKVGate := &clusterbootstrap.StartupPublicKVGate{BlockRuntime: func() bool { return clusterbootstrap.ProtectedRuntimesBlocked(in.runtimes) }}
+	publicKVGate.Domain = clusterbootstrap.BootstrapDomainForRuntimes(in.runtimes)
+	clusterbootstrap.StartBootstrapReadinessReconciler(in.ctx, in.eg, in.runtimes, in.distCatalog, in.cfg.Engine)
 	if in.distServer != nil {
-		in.distServer.SetReadGate(publicKVGate.blocked)
+		in.distServer.SetReadGate(publicKVGate.Blocked)
 	}
 	tsowiring.InstallHLCLeaseRenewalBlocker(in.coordinate, waitRotateOnStartup.BlockMutators)
-	adapterCoordinate := newStartupGatedCoordinator(in.coordinate, publicKVGate)
+	adapterCoordinate := clusterbootstrap.NewStartupGatedCoordinator(in.coordinate, publicKVGate)
 	runner := runtimeServerRunner{
 		ctx:                in.ctx,
 		lc:                 in.lc,
@@ -184,7 +187,7 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 	if err := runner.startRaftTransport(); err != nil {
 		return err
 	}
-	startBootstrapActivationWorkers(in.ctx, in.eg, in.runtimes, in.shardGroups)
+	clusterbootstrap.StartBootstrapActivationWorkers(in.ctx, in.eg, in.runtimes, in.shardGroups)
 	if err := preparePublicServicesAfterRaftJoinReady(
 		in.ctx,
 		in.runtimes,
@@ -215,20 +218,20 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 		return runner.startupFailure(err)
 	}
 	runner.adminHTTP = adminHTTP
-	publicKVGate.blockMutator = waitRotateOnStartup.BlockMutators
+	publicKVGate.BlockMutator = waitRotateOnStartup.BlockMutators
 	if err := waitRotateOnStartup.Wait(in.ctx); err != nil {
 		return runner.startupFailure(errors.Wrap(err, "encryption rotate-on-startup: wait before serving"))
 	}
 	return startPublicServicesAfterCommitTSFence(in, &runner, publicKVGate, in.consistency.commitTSFence)
 }
 
-func startPublicServicesAfterCommitTSFence(in serversInput, runner *runtimeServerRunner, gate *startupPublicKVGate, fenceEnabled bool) error {
+func startPublicServicesAfterCommitTSFence(in serversInput, runner *runtimeServerRunner, gate *clusterbootstrap.StartupPublicKVGate, fenceEnabled bool) error {
 	tsowiring.StartHLCLeaseRenewal(in.ctx, in.eg, in.coordinate)
 	if err := markPublicGateReadyAfterCommitTSFence(in.ctx, gate, in.runtimes, fenceEnabled); err != nil {
 		return runner.startupFailure(errors.Wrap(err, "wait for commit-ts fence activation before public service"))
 	}
-	startDistributionSplitJobRunner(in.ctx, in.eg, in.distServer, in.nodeAuth.splitMigrationLocalReadinessGate)
-	adapter.StartMigrationOwnershipRefresh(in.ctx, in.eg, in.distServer, in.nodeAuth.splitMigrationLocalReadinessGate)
+	startDistributionSplitJobRunner(in.ctx, in.eg, in.distServer, in.nodeAuth.SplitMigrationLocalReadinessGate)
+	adapter.StartMigrationOwnershipRefresh(in.ctx, in.eg, in.distServer, in.nodeAuth.SplitMigrationLocalReadinessGate)
 	if err := runner.startPublicServices(); err != nil {
 		return err
 	}
@@ -241,14 +244,14 @@ type runtimeServerRunner struct {
 	lc                              *net.ListenConfig
 	eg                              *errgroup.Group
 	cancel                          context.CancelFunc
-	runtimes                        []*raftGroupRuntime
+	runtimes                        []*clusterbootstrap.GroupRuntime
 	shardGroups                     map[uint64]*kv.ShardGroup
 	shardStore                      *kv.ShardStore
 	coordinate                      kv.Coordinator
 	distServer                      *adapter.DistributionServer
 	routeEngine                     *distribution.Engine
 	adminServer                     *adapter.AdminServer
-	adminGRPCOpts                   adminGRPCInterceptors
+	adminGRPCOpts                   nodeauth.AdminGRPCInterceptors
 	redisAddress                    string
 	redisLuaMaxIdle                 int
 	leaderRedis                     map[string]string
@@ -256,8 +259,8 @@ type runtimeServerRunner struct {
 	readTracker                     *kv.ActiveTimestampTracker
 	redisApplyObserver              *adapter.RedisApplyObserver
 	s3BlobBackfiller                *adapter.S3BlobBackfiller
-	encWiring                       encryptionWriteWiring
-	encryption                      encryptionFlags
+	encWiring                       encryptionwiring.WriteWiring
+	encryption                      encryptionwiring.Flags
 	kekConfigured                   bool
 	defaultGroupID                  uint64
 	dynamoAddress                   string
@@ -341,9 +344,9 @@ type runtimeServerRunner struct {
 	// Nil when no admin access keys are configured.
 	roleStore admin.RoleStore
 
-	publicKVGate *startupPublicKVGate
+	publicKVGate *clusterbootstrap.StartupPublicKVGate
 	// nodeAuth supplies the token files the S3 blob cluster dials peers with.
-	nodeAuth nodeAuthFlags
+	nodeAuth nodeauth.Flags
 	raftID   string
 	// readWatermarkAdvance enables the Internal watermark-advance RPC.
 	readWatermarkAdvance bool
@@ -353,22 +356,22 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 	if err := r.prepareAdminForwardServers(); err != nil {
 		return r.startupFailure(err)
 	}
-	domain := bootstrapDomainForRuntimes(r.runtimes)
-	adminGRPCOpts := bootstrapServiceAuthOptions(r.adminGRPCOpts, domain)
+	domain := clusterbootstrap.BootstrapDomainForRuntimes(r.runtimes)
+	adminGRPCOpts := clusterbootstrap.BootstrapServiceAuthOptions(r.adminGRPCOpts, domain)
 	if domain != nil {
-		adminGRPCOpts.unary = append([]grpc.UnaryServerInterceptor{bootstrapRegistrationReceiverInterceptor(r.defaultGroupID)}, adminGRPCOpts.unary...)
+		adminGRPCOpts.Unary = append([]grpc.UnaryServerInterceptor{clusterbootstrap.BootstrapRegistrationReceiverInterceptor(r.defaultGroupID)}, adminGRPCOpts.Unary...)
 	}
-	adminGRPCOpts, err := bootstrapRotationRPCOptions(adminGRPCOpts, domain, etcdraftengine.DeriveNodeID(r.raftID), domain.rotationRPCHandler())
+	adminGRPCOpts, err := clusterbootstrap.BootstrapRotationRPCOptions(adminGRPCOpts, domain, etcdraftengine.DeriveNodeID(r.raftID), domain.RotationRPCHandler())
 	if err != nil {
 		return r.startupFailure(err)
 	}
 	if r.publicKVGate != nil {
-		adminGRPCOpts.unary = append(adminGRPCOpts.unary, r.publicKVGate.unaryInterceptor)
-		adminGRPCOpts.stream = append(adminGRPCOpts.stream, r.publicKVGate.streamInterceptor)
+		adminGRPCOpts.Unary = append(adminGRPCOpts.Unary, r.publicKVGate.UnaryInterceptor)
+		adminGRPCOpts.Stream = append(adminGRPCOpts.Stream, r.publicKVGate.StreamInterceptor)
 	}
 	var s3BlobPushBlocked func() bool
 	if r.publicKVGate != nil {
-		s3BlobPushBlocked = r.publicKVGate.blocked
+		s3BlobPushBlocked = r.publicKVGate.Blocked
 	}
 	forwardDeps := adminForwardServerDeps{
 		tables:  adminbridge.NewDynamoTablesSource(r.dynamoServer),
@@ -413,11 +416,11 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 	return nil
 }
 
-func prepareAdminConnCache(ctx context.Context, eg *errgroup.Group, enabled bool, runtimes ...*raftGroupRuntime) *kv.GRPCConnCache {
+func prepareAdminConnCache(ctx context.Context, eg *errgroup.Group, enabled bool, runtimes ...*clusterbootstrap.GroupRuntime) *kv.GRPCConnCache {
 	if !enabled {
 		return nil
 	}
-	connCache := newBootstrapRuntimeConnCache(runtimes)
+	connCache := clusterbootstrap.NewBootstrapRuntimeConnCache(runtimes)
 	eg.Go(func() error {
 		<-ctx.Done()
 		if err := connCache.Close(); err != nil {
@@ -440,7 +443,7 @@ func (r *runtimeServerRunner) prepareAdminForwardServers() error {
 		r.metricsRegistry.S3PutAdmissionObserver(),
 		r.metricsRegistry.S3BlobOffloadObserver(),
 		blobCluster,
-		r.publicKVGate.blocked,
+		r.publicKVGate.Blocked,
 		r.s3BlobBackfiller,
 	)
 	if err != nil {
@@ -454,7 +457,7 @@ func (r *runtimeServerRunner) prepareAdminForwardServers() error {
 }
 
 func (r *runtimeServerRunner) newS3BlobCluster() (adapter.S3BlobCluster, error) {
-	if r == nil || !s3BlobNodeEnabled(r.s3Address, r.nodeAuth.s3BlobPeerTokenFile) {
+	if r == nil || !s3BlobNodeEnabled(r.s3Address, r.nodeAuth.S3BlobPeerTokenFile) {
 		return nil, nil
 	}
 	members, ok := r.coordinate.(kv.RaftMembershipCoordinator)
@@ -462,22 +465,22 @@ func (r *runtimeServerRunner) newS3BlobCluster() (adapter.S3BlobCluster, error) 
 		return nil, errors.New("S3 blob offload requires raft membership discovery")
 	}
 	adminToken := ""
-	if strings.TrimSpace(r.nodeAuth.adminTokenFile) != "" {
-		loaded, err := loadAdminTokenFile(r.nodeAuth.adminTokenFile)
+	if strings.TrimSpace(r.nodeAuth.AdminTokenFile) != "" {
+		loaded, err := nodeauth.LoadAdminTokenFile(r.nodeAuth.AdminTokenFile)
 		if err != nil {
-			return nil, err
+			return nil, errors.WithStack(err)
 		}
 		adminToken = loaded
 	}
 	peerToken := ""
-	if strings.TrimSpace(r.nodeAuth.s3BlobPeerTokenFile) != "" {
-		loaded, err := loadS3BlobPeerTokenFile(r.nodeAuth.s3BlobPeerTokenFile)
+	if strings.TrimSpace(r.nodeAuth.S3BlobPeerTokenFile) != "" {
+		loaded, err := nodeauth.LoadS3BlobPeerTokenFile(r.nodeAuth.S3BlobPeerTokenFile)
 		if err != nil {
-			return nil, err
+			return nil, errors.WithStack(err)
 		}
 		peerToken = loaded
 	}
-	return adapter.NewGRPCS3BlobCluster(r.raftID, members, adminToken, peerToken, bootstrapRuntimeDialOptions(r.runtimes)), nil
+	return adapter.NewGRPCS3BlobCluster(r.raftID, members, adminToken, peerToken, clusterbootstrap.BootstrapRuntimeDialOptions(r.runtimes)), nil
 }
 
 func (r *runtimeServerRunner) preparePublicServices() error {

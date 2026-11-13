@@ -5,11 +5,12 @@ import (
 	"strconv"
 
 	"github.com/bootjp/elastickv/adapter"
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/monitoring"
 )
 
-func raftMonitorRuntimes(runtimes []*raftGroupRuntime) []monitoring.RaftRuntime {
+func raftMonitorRuntimes(runtimes []*clusterbootstrap.GroupRuntime) []monitoring.RaftRuntime {
 	out := make([]monitoring.RaftRuntime, 0, len(runtimes))
 	for _, runtime := range runtimes {
 		if runtime == nil || runtime.Engine == nil {
@@ -39,7 +40,7 @@ type fsmApplySyncModeLabeler interface {
 // returning the first one suffices. Returns "" when no runtime
 // exposes the accessor, in which case the caller skips emitting the
 // gauge to avoid publishing a misleading default.
-func fsmApplySyncModeLabelFromRuntimes(runtimes []*raftGroupRuntime) string {
+func fsmApplySyncModeLabelFromRuntimes(runtimes []*clusterbootstrap.GroupRuntime) string {
 	for _, runtime := range runtimes {
 		if runtime == nil || runtime.Store == nil {
 			continue
@@ -53,7 +54,7 @@ func fsmApplySyncModeLabelFromRuntimes(runtimes []*raftGroupRuntime) string {
 	return ""
 }
 
-func recordFSMApplySyncMode(reg *monitoring.Registry, runtimes []*raftGroupRuntime) {
+func recordFSMApplySyncMode(reg *monitoring.Registry, runtimes []*clusterbootstrap.GroupRuntime) {
 	if label := fsmApplySyncModeLabelFromRuntimes(runtimes); label != "" {
 		reg.SetFSMApplySyncMode(label)
 	}
@@ -65,7 +66,7 @@ func recordFSMApplySyncMode(reg *monitoring.Registry, runtimes []*raftGroupRunti
 // elastickv_pebble_* metrics family. Stores that do not satisfy the
 // interface (non-Pebble backends, if any are added later) are skipped
 // silently.
-func pebbleMonitorSources(runtimes []*raftGroupRuntime) []monitoring.PebbleSource {
+func pebbleMonitorSources(runtimes []*clusterbootstrap.GroupRuntime) []monitoring.PebbleSource {
 	out := make([]monitoring.PebbleSource, 0, len(runtimes))
 	for _, runtime := range runtimes {
 		if runtime == nil || runtime.Store == nil {
@@ -89,7 +90,7 @@ func pebbleMonitorSources(runtimes []*raftGroupRuntime) []monitoring.PebbleSourc
 // dashboard. Engines that do not satisfy the interface are skipped
 // silently; their groups simply won't contribute to
 // elastickv_raft_dispatch_* metrics.
-func dispatchMonitorSources(runtimes []*raftGroupRuntime) []monitoring.DispatchSource {
+func dispatchMonitorSources(runtimes []*clusterbootstrap.GroupRuntime) []monitoring.DispatchSource {
 	out := make([]monitoring.DispatchSource, 0, len(runtimes))
 	for _, runtime := range runtimes {
 		if runtime == nil || runtime.Engine == nil {
@@ -115,7 +116,7 @@ func dispatchMonitorSources(runtimes []*raftGroupRuntime) []monitoring.DispatchS
 func startMonitoringCollectors(
 	ctx context.Context,
 	reg *monitoring.Registry,
-	runtimes []*raftGroupRuntime,
+	runtimes []*clusterbootstrap.GroupRuntime,
 	clock *kv.HLC,
 	encryptionState monitoring.EncryptionStateSource,
 ) {
@@ -202,7 +203,7 @@ func (a sqsDepthSourceAdapter) SnapshotQueueDepths(ctx context.Context) ([]monit
 // store.MVCCStore implements WriteConflictCountsByPrefix(); stores
 // that do not track conflicts return an empty map and simply do not
 // contribute series.
-func writeConflictMonitorSources(runtimes []*raftGroupRuntime) []monitoring.WriteConflictSource {
+func writeConflictMonitorSources(runtimes []*clusterbootstrap.GroupRuntime) []monitoring.WriteConflictSource {
 	out := make([]monitoring.WriteConflictSource, 0, len(runtimes))
 	for _, runtime := range runtimes {
 		if runtime == nil || runtime.Store == nil {

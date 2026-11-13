@@ -24,6 +24,7 @@ import (
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
 	internalutil "github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/peersession"
 	"github.com/bootjp/elastickv/internal/raftadmission"
@@ -45,20 +46,20 @@ const multiEnablementMembers = 3
 
 type multiEnablementIdentity struct {
 	id, address, dir, configDir string
-	raw                         bootstrapPeerJSON
-	config                      *bootstrapPeerConfig
+	raw                         clusterbootstrap.BootstrapPeerJSON
+	config                      *clusterbootstrap.BootstrapPeerConfig
 	listener                    net.Listener
 }
 
 type multiEnablementProcess struct {
-	runtime     *raftGroupRuntime
+	runtime     *clusterbootstrap.GroupRuntime
 	shard       *kv.ShardGroup
-	domain      *bootstrapDomain
+	domain      *clusterbootstrap.BootstrapDomain
 	coordinate  *kv.ShardedCoordinator
 	shards      *kv.ShardStore
 	transaction *kv.TransactionManager
 	cleanup     internalutil.CleanupStack
-	gate        *startupPublicKVGate
+	gate        *clusterbootstrap.StartupPublicKVGate
 	server      *grpc.Server
 	cancel      context.CancelFunc
 	ctx         context.Context
@@ -80,7 +81,7 @@ func multiEnablementIdentities(t *testing.T, base string) []*multiEnablementIden
 	multiEnablementPEM(t, caPath, "CERTIFICATE", pki.ca.Raw)
 	tokenPath := filepath.Join(artifacts, "startup-token")
 	require.NoError(t, os.WriteFile(tokenPath, []byte(bootstrapGateTestToken), 0o600))
-	members := make([]bootstrapPeerMemberJSON, 0, multiEnablementMembers)
+	members := make([]clusterbootstrap.BootstrapPeerMemberJSON, 0, multiEnablementMembers)
 	identities := make([]*multiEnablementIdentity, 0, multiEnablementMembers)
 	for i := range multiEnablementMembers {
 		listener, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
@@ -103,10 +104,10 @@ func multiEnablementIdentities(t *testing.T, base string) []*multiEnablementIden
 		multiEnablementPEM(t, keyPath, "PRIVATE KEY", keyDER)
 		pin := sha256.Sum256(parsed.RawSubjectPublicKeyInfo)
 		memberID := etcd.DeriveNodeID(id)
-		members = append(members, bootstrapPeerMemberJSON{ID: memberID, Address: listener.Addr().String(), Key: hex.EncodeToString(pin[:]), Groups: []uint64{1}})
+		members = append(members, clusterbootstrap.BootstrapPeerMemberJSON{ID: memberID, Address: listener.Addr().String(), Key: hex.EncodeToString(pin[:]), Groups: []uint64{1}})
 		identities = append(identities, &multiEnablementIdentity{id: id, address: listener.Addr().String(),
 			dir: noderuntime.GroupDataDir(base, id, 1, false), configDir: t.TempDir(), listener: listener,
-			raw: bootstrapPeerJSON{Cluster: "12345678-1234-1234-1234-123456789abc", Local: memberID,
+			raw: clusterbootstrap.BootstrapPeerJSON{Cluster: "12345678-1234-1234-1234-123456789abc", Local: memberID,
 				CA: caPath, Cert: certPath, Key: keyPath, StartupTokenFile: tokenPath}})
 	}
 	for _, identity := range identities {
@@ -122,7 +123,7 @@ func multiEnablementWriteConfig(t *testing.T, identity *multiEnablementIdentity)
 	require.NoError(t, err)
 	path := filepath.Join(identity.configDir, "group-1.json")
 	require.NoError(t, os.WriteFile(path, encoded, 0o600))
-	identity.config, err = loadBootstrapPeerConfig(path)
+	identity.config, err = clusterbootstrap.LoadBootstrapPeerConfig(path)
 	require.NoError(t, err)
 }
 
@@ -135,7 +136,7 @@ func multiEnablementStart(t *testing.T, base string, identities []*multiEnableme
 	t.Cleanup(closeAll)
 	servers := make([]raftengine.Server, 0, len(identities))
 	for _, identity := range identities {
-		servers = append(servers, raftengine.Server{ID: identity.id, Address: identity.address, Suffrage: raftMemberSuffrageVoter})
+		servers = append(servers, raftengine.Server{ID: identity.id, Address: identity.address, Suffrage: noderuntime.VoterSuffrage})
 	}
 	for i, identity := range identities {
 		if protected && delayLastMember && i == multiEnablementMembers-1 {
@@ -153,7 +154,7 @@ func multiEnablementQuorumSnapshot(t *testing.T, processes []*multiEnablementPro
 	leader := multiEnablementLeader(t, processes)
 	metadata, ok := leader.runtime.Store.(store.RaftControlMetadataStore)
 	require.True(t, ok)
-	identity := raftbootstrap.Identity{Cluster: leader.runtime.bootstrapPeerConfig.local.Cluster, Group: 1}
+	identity := raftbootstrap.Identity{Cluster: leader.runtime.BootstrapPeerConfig.Local.Cluster, Group: 1}
 	prepared, err := kv.ReadPreparedBootstrapActivation(t.Context(), metadata, identity)
 	require.NoError(t, err)
 	require.Eventually(t, func() bool {
@@ -174,17 +175,17 @@ func multiEnablementStartMember(t *testing.T, base string, identity *multiEnable
 	if !protected {
 		builder.bootstrapCfg = noderuntime.BootstrapConfig{LegacyServers: servers}
 	}
-	var domain *bootstrapDomain
+	var domain *clusterbootstrap.BootstrapDomain
 	listener := identity.listener
 	if protected {
 		builder.bootstrapCfg = noderuntime.BootstrapConfig{PeerConfigDir: identity.configDir}
 		var err error
-		builder.bootstrapSpecs, domain, err = loadProtectedBootstrapDomain(identity.id, base, []noderuntime.GroupSpec{group}, false, builder.bootstrapCfg)
+		builder.bootstrapSpecs, domain, err = clusterbootstrap.LoadProtectedBootstrapDomain(identity.id, base, []noderuntime.GroupSpec{group}, false, builder.bootstrapCfg)
 		require.NoError(t, err)
-		t.Cleanup(domain.admission.Close)
-		loaded := builder.bootstrapSpecs[group.ID].config
-		require.Equal(t, identity.config.local, loaded.local)
-		require.Equal(t, identity.config.provisions, loaded.provisions, "restart retains all original CA/SPKI provisions")
+		t.Cleanup(domain.Admission.Close)
+		loaded := builder.bootstrapSpecs[group.ID].Config
+		require.Equal(t, identity.config.Local, loaded.Local)
+		require.Equal(t, identity.config.Provisions, loaded.Provisions, "restart retains all original CA/SPKI provisions")
 		listener, err = (&net.ListenConfig{}).Listen(t.Context(), "tcp", identity.address)
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = listener.Close() })
@@ -200,7 +201,7 @@ func multiEnablementStartMember(t *testing.T, base string, identity *multiEnable
 		options = append(options, multiEnablementNetwork(t, process, routes, clock)...)
 	}
 	process.server = grpc.NewServer(options...)
-	runtime.registerGRPC(process.server)
+	clusterbootstrap.RuntimeCore(runtime).RegisterGRPC(process.server)
 	if protected {
 		multiEnablementServices(process, clock)
 	}
@@ -213,25 +214,25 @@ func multiEnablementNetwork(t *testing.T, process *multiEnablementProcess, route
 	id := process.runtime.Spec.ID
 	groups := map[uint64]*kv.ShardGroup{id: process.shard}
 	process.shards = kv.NewShardStore(routes, groups)
-	process.shards.SetOperationAdmission(process.domain.operationAdmission)
-	network, err := configureBootstrapNetwork(process.ctx, []*raftGroupRuntime{process.runtime}, process.shards, groups, &process.cleanup)
+	process.shards.SetOperationAdmission(process.domain.OperationAdmission)
+	network, err := clusterbootstrap.ConfigureBootstrapNetwork(process.ctx, []*clusterbootstrap.GroupRuntime{process.runtime}, process.shards, groups, &process.cleanup)
 	require.NoError(t, err)
 	require.NotNil(t, network, "ordinary forwarding must use the actual runtime-scoped pinned TLS factory")
-	process.coordinate = kv.NewShardedCoordinator(routes, groups, id, clock, process.shards).WithOperationAdmission(process.domain.operationAdmission)
-	catalog := distributionCatalogStoreForGroup([]*raftGroupRuntime{process.runtime}, id)
-	startBootstrapReadinessReconciler(process.ctx, process.eg, []*raftGroupRuntime{process.runtime}, catalog, routes)
+	process.coordinate = kv.NewShardedCoordinator(routes, groups, id, clock, process.shards).WithOperationAdmission(process.domain.OperationAdmission)
+	catalog := distributionCatalogStoreForGroup([]*clusterbootstrap.GroupRuntime{process.runtime}, id)
+	clusterbootstrap.StartBootstrapReadinessReconciler(process.ctx, process.eg, []*clusterbootstrap.GroupRuntime{process.runtime}, catalog, routes)
 	process.gate = multiEnablementGate(process)
-	return []grpc.ServerOption{grpc.ChainUnaryInterceptor(process.gate.unaryInterceptor), grpc.ChainStreamInterceptor(process.gate.streamInterceptor)}
+	return []grpc.ServerOption{grpc.ChainUnaryInterceptor(process.gate.UnaryInterceptor), grpc.ChainStreamInterceptor(process.gate.StreamInterceptor)}
 }
 
-func multiEnablementGate(process *multiEnablementProcess) *startupPublicKVGate {
-	gate := &startupPublicKVGate{domain: process.domain, blockRuntime: func() bool { return !process.runtime.PublicReady() }}
-	gate.markReady()
+func multiEnablementGate(process *multiEnablementProcess) *clusterbootstrap.StartupPublicKVGate {
+	gate := &clusterbootstrap.StartupPublicKVGate{Domain: process.domain, BlockRuntime: func() bool { return !process.runtime.PublicReady() }}
+	gate.MarkReady()
 	return gate
 }
 
 func multiEnablementServices(process *multiEnablementProcess, clock *kv.HLC) {
-	coordinate := newStartupGatedCoordinator(process.coordinate, process.gate)
+	coordinate := clusterbootstrap.NewStartupGatedCoordinator(process.coordinate, process.gate)
 	service := adapter.NewGRPCServer(process.shards, coordinate)
 	pb.RegisterRawKVServer(process.server, service)
 	pb.RegisterTransactionalKVServer(process.server, service)
@@ -263,7 +264,7 @@ func multiEnablementStop(t *testing.T, processes []*multiEnablementProcess) {
 	var wg sync.WaitGroup
 	engineErrors := make([]error, len(active))
 	for i, process := range active {
-		engine := process.runtime.snapshotEngine()
+		engine := clusterbootstrap.RuntimeCore(process.runtime).SnapshotEngine()
 		if engine != nil {
 			wg.Add(1)
 			go func() { defer wg.Done(); engineErrors[i] = engine.Close() }()
@@ -273,7 +274,7 @@ func multiEnablementStop(t *testing.T, processes []*multiEnablementProcess) {
 	for _, process := range active {
 		process.runtime.Close()
 		if process.domain != nil {
-			process.domain.admission.Close()
+			process.domain.Admission.Close()
 		}
 	}
 	require.NoError(t, errors.Join(append(failures, engineErrors...)...))
@@ -338,7 +339,7 @@ func multiEnablementPopulate(t *testing.T, processes []*multiEnablementProcess) 
 			status := process.runtime.Engine.Status()
 			return status.AppliedIndex == result.CommitIndex && status.CommitIndex == result.CommitIndex && status.LastSnapshotIndex >= result.CommitIndex
 		}, bootstrapE2EWaitTimeout, 10*time.Millisecond)
-		catalog := distributionCatalogStoreForGroup([]*raftGroupRuntime{process.runtime}, 1)
+		catalog := distributionCatalogStoreForGroup([]*clusterbootstrap.GroupRuntime{process.runtime}, 1)
 		snapshot, err := catalog.Snapshot(t.Context())
 		require.NoError(t, err)
 		require.Equal(t, uint64(1), snapshot.Version, "the original cut contains a replicated catalog")
@@ -371,18 +372,18 @@ func multiEnablementBaselineProbe(t *testing.T, identity *multiEnablementIdentit
 	source, err := etcd.ReadOfflineBaselineWALSource(t.Context(), identity.dir, ownership)
 	require.NoError(t, err)
 	defer func() { require.NoError(t, source.Snapshot.Close()) }()
-	proof, err := bootstrapOfflineDataStoreProbe(t.Context(), identity.dir)
+	proof, err := clusterbootstrap.BootstrapOfflineDataStoreProbe(t.Context(), identity.dir)
 	require.NoError(t, err)
 	state := raftbootstrap.ConfState{Voters: source.Configuration.GetVoters(), VotersOutgoing: source.Configuration.GetVotersOutgoing(),
 		Learners: source.Configuration.GetLearners(), LearnersNext: source.Configuration.GetLearnersNext(), AutoLeave: source.Configuration.GetAutoLeave()}
 	if cut.Version == 0 {
-		cut = raftbootstrap.BaselineContext{Version: raftbootstrap.BaselineVersion, Identity: raftbootstrap.Identity{Cluster: identity.config.local.Cluster, Group: 1},
+		cut = raftbootstrap.BaselineContext{Version: raftbootstrap.BaselineVersion, Identity: raftbootstrap.Identity{Cluster: identity.config.Local.Cluster, Group: 1},
 			OperationID: raftbootstrap.OperationID{72}, Minimum: raftbootstrap.Versions{Entry: 1, Snapshot: 1, Session: 1},
 			CommitIndex: source.CommitIndex, CommitTerm: source.CommitTerm, Watermark: proof.Watermark, DataDigest: proof.DataDigest,
 			Configuration: raftbootstrap.Configuration{Index: source.ConfigurationIndex, State: state}}
 		for _, member := range identities {
-			cut.Configuration.Members = append(cut.Configuration.Members, raftbootstrap.Member{ID: member.config.local.Member,
-				Address: member.address, PublicKeyDigest: member.config.local.Key})
+			cut.Configuration.Members = append(cut.Configuration.Members, raftbootstrap.Member{ID: member.config.Local.Member,
+				Address: member.address, PublicKeyDigest: member.config.Local.Key})
 		}
 	}
 	require.Equal(t, cut.CommitIndex, source.CommitIndex)
@@ -394,11 +395,11 @@ func multiEnablementBaselineProbe(t *testing.T, identity *multiEnablementIdentit
 	require.Equal(t, cut.Watermark, proof.Watermark)
 	require.Equal(t, cut.DataDigest, proof.DataDigest)
 	inspection, err := etcd.InspectOfflineBaseline(t.Context(), etcd.OfflineBaselineOptions{Ownership: ownership, DataDir: identity.dir,
-		MemberID: identity.config.local.Member, Expected: cut, ProbeStore: func(ctx context.Context) (etcd.BaselineStoreProof, error) {
-			return bootstrapOfflineDataStoreProbe(ctx, identity.dir)
+		MemberID: identity.config.Local.Member, Expected: cut, ProbeStore: func(ctx context.Context) (etcd.BaselineStoreProof, error) {
+			return clusterbootstrap.BootstrapOfflineDataStoreProbe(ctx, identity.dir)
 		}})
 	require.NoError(t, err)
-	signer, ok := identity.config.clientTLS.Certificates[0].PrivateKey.(crypto.Signer)
+	signer, ok := identity.config.ClientTLS.Certificates[0].PrivateKey.(crypto.Signer)
 	require.True(t, ok)
 	probe, err := raftbootstrap.SignBaselineProbe(raftbootstrap.BaselineProbe{BaselineContext: cut, Evidence: inspection.Evidence}, signer)
 	require.NoError(t, err)
@@ -408,28 +409,28 @@ func multiEnablementBaselineProbe(t *testing.T, identity *multiEnablementIdentit
 func multiEnablementPrepareAck(t *testing.T, identity *multiEnablementIdentity, manifest raftbootstrap.BaselineManifest) []byte {
 	t.Helper()
 	original := offlineDataFiles(t, identity.dir)
-	request := bootstrapBaselineCLIRequest{Command: "prepare", RaftDataDir: identity.dir, MemberID: identity.config.local.Member, OperationID: manifest.OperationID}
-	prepared, err := executeBootstrapMigration(t.Context(), request, manifest.BaselineContext, manifest)
+	request := clusterbootstrap.BootstrapBaselineCLIRequest{Command: "prepare", RaftDataDir: identity.dir, MemberID: identity.config.Local.Member, OperationID: manifest.OperationID}
+	prepared, err := clusterbootstrap.ExecuteBootstrapMigration(t.Context(), request, manifest.BaselineContext, manifest)
 	require.NoError(t, err)
 	require.Equal(t, original, offlineDataFiles(t, prepared.BackupDir))
 	request.Command = "resume"
-	bound, err := executeBootstrapMigration(t.Context(), request, manifest.BaselineContext, manifest)
+	bound, err := clusterbootstrap.ExecuteBootstrapMigration(t.Context(), request, manifest.BaselineContext, manifest)
 	require.NoError(t, err)
 	require.Equal(t, "bound", bound.Phase)
 	require.Equal(t, original, offlineDataFiles(t, bound.BackupDir))
 	ownership, err := etcd.AcquireOfflineBaselineOwnership(identity.dir)
 	require.NoError(t, err)
 	defer func() { require.NoError(t, ownership.Close()) }()
-	options, err := bootstrapOfflineOptions(request, manifest.BaselineContext, manifest, ownership)
+	options, err := clusterbootstrap.BootstrapOfflineOptions(request, manifest.BaselineContext, manifest, ownership)
 	require.NoError(t, err)
 	evidence, err := etcd.VerifyOfflineBaselinePrepared(t.Context(), options, manifest)
 	require.NoError(t, err)
 	digest, err := raftbootstrap.BaselineManifestDigest(manifest)
 	require.NoError(t, err)
 	require.Equal(t, digest, evidence.Identity.PreparationDigest)
-	ack, err := signBootstrapPreparedAck(identity.config, manifest, identity.config.local.Member, evidence.DurableProofDigest)
+	ack, err := clusterbootstrap.SignBootstrapPreparedAck(identity.config, manifest, identity.config.Local.Member, evidence.DurableProofDigest)
 	require.NoError(t, err)
-	encoded, err := marshalBootstrapPreparedAck(ack, manifest)
+	encoded, err := clusterbootstrap.MarshalBootstrapPreparedAck(ack, manifest)
 	require.NoError(t, err)
 	return encoded
 }
@@ -438,10 +439,10 @@ func multiEnablementNoPolicy(t *testing.T, identity *multiEnablementIdentity, gr
 	t.Helper()
 	key, err := kv.BootstrapPolicyMetadataKey(group)
 	require.NoError(t, err)
-	err = bootstrapOfflineWithData(t.Context(), identity.dir, true, func(db *pebble.DB) error {
+	err = clusterbootstrap.BootstrapOfflineWithData(t.Context(), identity.dir, true, func(db *pebble.DB) error {
 		snapshot := db.NewSnapshot()
 		defer snapshot.Close()
-		_, present, err := bootstrapOfflineGet(snapshot, append([]byte(store.RaftControlMetadataPrefix), key...))
+		_, present, err := clusterbootstrap.BootstrapOfflineGet(snapshot, append([]byte(store.RaftControlMetadataPrefix), key...))
 		if present {
 			return errors.New("P appeared before complete readiness certificate activation")
 		}
@@ -453,13 +454,13 @@ func multiEnablementNoPolicy(t *testing.T, identity *multiEnablementIdentity, gr
 func multiEnablementReplicatedRead(t *testing.T, process *multiEnablementProcess, key, value string) {
 	t.Helper()
 	require.Eventually(t, func() bool {
-		ctx, op, err := process.domain.admission.Begin(t.Context(), raftadmission.Data)
+		ctx, op, err := process.domain.Admission.Begin(t.Context(), raftadmission.Data)
 		if err != nil {
 			return false
 		}
 		defer op.CancelAndJoin()
 		got, err := process.runtime.Store.GetAt(ctx, []byte(key), ^uint64(0))
-		return finishBootstrapIngress(op, err) == nil && bytes.Equal(got, []byte(value))
+		return clusterbootstrap.FinishBootstrapIngress(op, err) == nil && bytes.Equal(got, []byte(value))
 	}, bootstrapE2EWaitTimeout, 10*time.Millisecond, "read each member's own Pebble, not a forwarded leader result")
 }
 
@@ -484,9 +485,9 @@ func multiEnablementRun(t *testing.T, lagging bool) {
 	for _, identity := range identities {
 		acks = append(acks, multiEnablementPrepareAck(t, identity, manifest))
 	}
-	_, err := assembleBootstrapActivation(manifest, manifest.BaselineContext, acks[:2])
+	_, err := clusterbootstrap.AssembleBootstrapActivation(manifest, manifest.BaselineContext, acks[:2])
 	require.Error(t, err, "a prepared quorum cannot replace the third member's final ACK")
-	payload, err := assembleBootstrapActivation(manifest, manifest.BaselineContext, acks)
+	payload, err := clusterbootstrap.AssembleBootstrapActivation(manifest, manifest.BaselineContext, acks)
 	require.NoError(t, err)
 	command, matched, err := raftbootstrap.ParseActivationCommand(payload)
 	require.NoError(t, err)
@@ -515,7 +516,7 @@ func multiEnablementRun(t *testing.T, lagging bool) {
 		_, err := kv.LoadAppliedBootstrapPolicy(t.Context(), process.runtime.Store, manifest.Identity, process.runtime.Engine.Status().AppliedIndex)
 		require.ErrorIs(t, err, store.ErrKeyNotFound, "no activation worker has started")
 	}
-	startBootstrapActivationWorkers(leader.ctx, leader.eg, []*raftGroupRuntime{leader.runtime}, map[uint64]*kv.ShardGroup{1: leader.shard})
+	clusterbootstrap.StartBootstrapActivationWorkers(leader.ctx, leader.eg, []*clusterbootstrap.GroupRuntime{leader.runtime}, map[uint64]*kv.ShardGroup{1: leader.shard})
 	activation := multiEnablementAssertActivePolicy(t, protected, manifest)
 	ctx, cancel := context.WithTimeout(t.Context(), bootstrapE2EWaitTimeout)
 	defer cancel()
@@ -538,7 +539,7 @@ func multiEnablementAssertActivePolicy(t *testing.T, protected []*multiEnablemen
 			multiEnablementReadinessDiagnostics(t, protected, manifest)
 			t.FailNow()
 		}
-		require.Equal(t, peersession.DataReady, process.domain.admission.Stage(1))
+		require.Equal(t, peersession.DataReady, process.domain.Admission.Stage(1))
 		policy, err := kv.LoadAppliedBootstrapPolicy(t.Context(), process.runtime.Store, manifest.Identity, process.runtime.Engine.Status().AppliedIndex)
 		require.NoError(t, err)
 		if activation == 0 {
@@ -583,7 +584,7 @@ func multiEnablementSnapshotPreparation(t *testing.T, process *multiEnablementPr
 	require.Eventually(t, func() bool {
 		var err error
 		prepared, err = kv.ReadPreparedBootstrapActivation(t.Context(), metadata, manifest.Identity)
-		return err == nil && prepared.Probe.Evidence.MemberID != process.runtime.bootstrapPeerConfig.local.Member &&
+		return err == nil && prepared.Probe.Evidence.MemberID != process.runtime.BootstrapPeerConfig.Local.Member &&
 			process.runtime.Engine.Status().LastSnapshotIndex > manifest.CommitIndex
 	}, bootstrapE2EWaitTimeout, 10*time.Millisecond, "receiver must actually import another member's signed J via native snapshot")
 	digest, err := raftbootstrap.BaselineManifestDigest(manifest)
@@ -598,15 +599,15 @@ func multiEnablementReadinessDiagnostics(t *testing.T, processes []*multiEnablem
 	for _, process := range processes {
 		metadata, ok := process.runtime.Store.(store.RaftControlMetadataStore)
 		if !ok {
-			t.Logf("member=%d lacks metadata reader", process.runtime.bootstrapPeerConfig.local.Member)
+			t.Logf("member=%d lacks metadata reader", process.runtime.BootstrapPeerConfig.Local.Member)
 			continue
 		}
 		prepared, prepErr := kv.ReadPreparedBootstrapActivation(t.Context(), metadata, manifest.Identity)
 		configuration, confErr := raftbootstrap.ConfigurationDigest(prepared.Probe.Configuration)
 		policy, policyErr := kv.LoadAppliedBootstrapPolicy(t.Context(), process.runtime.Store, manifest.Identity, process.runtime.Engine.Status().AppliedIndex)
 		t.Logf("member=%d stored_prepared_member=%d prepared_identity=%+v stage=%v native=%+v prep_error=%v configuration=%x expected_configuration=%x conf_error=%v digest_error=%v P_activation=%d P_error=%v",
-			process.runtime.bootstrapPeerConfig.local.Member, prepared.Probe.Evidence.MemberID, prepared.Probe.Identity,
-			process.domain.admission.Stage(1), process.runtime.Engine.Status(), prepErr, configuration, expected, confErr, digestErr, policy.ActivationIndex, policyErr)
+			process.runtime.BootstrapPeerConfig.Local.Member, prepared.Probe.Evidence.MemberID, prepared.Probe.Identity,
+			process.domain.Admission.Stage(1), process.runtime.Engine.Status(), prepErr, configuration, expected, confErr, digestErr, policy.ActivationIndex, policyErr)
 	}
 }
 
@@ -633,11 +634,11 @@ func multiEnablementFollowerForward(t *testing.T, processes []*multiEnablementPr
 	}
 	readCtx, cancelRead := context.WithTimeout(t.Context(), bootstrapE2EWaitTimeout)
 	defer cancelRead()
-	owned, op, err := follower.domain.admission.Begin(readCtx, raftadmission.Data)
+	owned, op, err := follower.domain.Admission.Begin(readCtx, raftadmission.Data)
 	require.NoError(t, err)
 	defer op.CancelAndJoin()
 	value, err := follower.shards.GetAt(owned, []byte("forwarded-key"), ^uint64(0))
-	err = finishBootstrapIngress(op, err)
+	err = clusterbootstrap.FinishBootstrapIngress(op, err)
 	require.NoError(t, err, "follower read forwarding uses the same runtime-local ordinary TLS capability")
 	require.Equal(t, "tls-follower-forwarded", string(value))
 }

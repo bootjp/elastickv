@@ -7,6 +7,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
@@ -214,9 +215,9 @@ type startupWrapperSurface struct {
 }
 
 func startupGateOver(inner kv.Coordinator) kv.Coordinator {
-	gate := &startupPublicKVGate{}
-	gate.markReady()
-	return newStartupGatedCoordinator(inner, gate)
+	gate := &clusterbootstrap.StartupPublicKVGate{}
+	gate.MarkReady()
+	return clusterbootstrap.NewStartupGatedCoordinator(inner, gate)
 }
 
 // startupWrapperSurfaces are the values capability consumers type-assert in

@@ -4,6 +4,8 @@ import (
 	"context"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/cockroachdb/errors"
 )
@@ -12,7 +14,7 @@ const raftJoinReadyPollInterval = 100 * time.Millisecond
 
 func preparePublicServicesAfterRaftJoinReady(
 	ctx context.Context,
-	runtimes []*raftGroupRuntime,
+	runtimes []*clusterbootstrap.GroupRuntime,
 	localID string,
 	enabled bool,
 	prepare func() error,
@@ -23,7 +25,7 @@ func preparePublicServicesAfterRaftJoinReady(
 	return prepare()
 }
 
-func waitForRaftJoinReady(ctx context.Context, runtimes []*raftGroupRuntime, localID string, enabled bool) error {
+func waitForRaftJoinReady(ctx context.Context, runtimes []*clusterbootstrap.GroupRuntime, localID string, enabled bool) error {
 	if !enabled {
 		return nil
 	}
@@ -45,7 +47,7 @@ func waitForRaftJoinReady(ctx context.Context, runtimes []*raftGroupRuntime, loc
 	}
 }
 
-func raftJoinRuntimesReady(ctx context.Context, runtimes []*raftGroupRuntime, localID string) (bool, error) {
+func raftJoinRuntimesReady(ctx context.Context, runtimes []*clusterbootstrap.GroupRuntime, localID string) (bool, error) {
 	if len(runtimes) == 0 {
 		return false, nil
 	}
@@ -70,7 +72,7 @@ func raftJoinRuntimesReady(ctx context.Context, runtimes []*raftGroupRuntime, lo
 
 func configurationContainsMember(configuration raftengine.Configuration, localID string) bool {
 	for _, server := range configuration.Servers {
-		if server.ID == localID && (server.Suffrage == "learner" || server.Suffrage == raftMemberSuffrageVoter) {
+		if server.ID == localID && (server.Suffrage == "learner" || server.Suffrage == noderuntime.VoterSuffrage) {
 			return true
 		}
 	}

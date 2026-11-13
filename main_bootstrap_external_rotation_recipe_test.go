@@ -6,6 +6,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
@@ -44,8 +45,8 @@ func TestBootstrapExternalRotationRecipeRejectsInvalidRequests(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newRotationRecipeFixture(t)
-			_, err := newBootstrapExternalRotationRecipe(t.Context(), f.cfg, tc.mutate(externalRotationTestRequest(f)))
-			require.ErrorIs(t, err, errBootstrapExternalRotationRequest)
+			_, err := clusterbootstrap.NewBootstrapExternalRotationRecipe(t.Context(), f.cfg, tc.mutate(externalRotationTestRequest(f)))
+			require.ErrorIs(t, err, clusterbootstrap.ErrBootstrapExternalRotationRequest)
 			require.Zero(t, f.barriers, "malformed requests must not start IO")
 			require.Empty(t, f.calls)
 		})
@@ -56,8 +57,8 @@ func TestBootstrapExternalRotationRecipeExactImmutableRequest(t *testing.T) {
 	t.Parallel()
 	f := newRotationRecipeFixture(t)
 	req := externalRotationTestRequest(f)
-	expected := cloneBootstrapRotationRequest(req)
-	r, err := newBootstrapExternalRotationRecipe(t.Context(), f.cfg, req)
+	expected := clusterbootstrap.CloneBootstrapRotationRequest(req)
+	r, err := clusterbootstrap.NewBootstrapExternalRotationRecipe(t.Context(), f.cfg, req)
 	require.NoError(t, err)
 	require.Positive(t, f.barriers)
 	require.True(t, proto.Equal(expected, req), "unwrap must not mutate the caller's crypto bytes")
@@ -71,7 +72,7 @@ func TestBootstrapExternalRotationRecipeExactImmutableRequest(t *testing.T) {
 	require.True(t, receipt.Complete)
 	require.Len(t, f.calls, 1)
 	require.True(t, proto.Equal(expected, f.calls[0]))
-	retry, err := newBootstrapExternalRotationRecipe(t.Context(), f.cfg, expected)
+	retry, err := clusterbootstrap.NewBootstrapExternalRotationRecipe(t.Context(), f.cfg, expected)
 	require.NoError(t, err)
 	receipt, err = retry.Run(t.Context())
 	require.NoError(t, err)
@@ -91,20 +92,20 @@ func TestBootstrapExternalRotationRecipeCollisionAndSuperseded(t *testing.T) {
 			r.ProposerLocalEpoch = uint32(f.cfg.RaftEpoch)
 		},
 	} {
-		collision := cloneBootstrapRotationRequest(req)
+		collision := clusterbootstrap.CloneBootstrapRotationRequest(req)
 		mutate(collision)
-		_, err := newBootstrapExternalRotationRecipe(t.Context(), f.cfg, collision)
-		require.ErrorIs(t, err, errBootstrapExternalRotationRequest)
+		_, err := clusterbootstrap.NewBootstrapExternalRotationRecipe(t.Context(), f.cfg, collision)
+		require.ErrorIs(t, err, clusterbootstrap.ErrBootstrapExternalRotationRequest)
 	}
-	foreign := cloneBootstrapRotationRequest(req)
+	foreign := clusterbootstrap.CloneBootstrapRotationRequest(req)
 	foreign.NewDekId++
 	foreign.WrappedNewDek[0]++
 	f.apply(foreign)
-	r, err := newBootstrapExternalRotationRecipe(t.Context(), f.cfg, req)
+	r, err := clusterbootstrap.NewBootstrapExternalRotationRecipe(t.Context(), f.cfg, req)
 	require.NoError(t, err)
 	receipt, err := r.Run(t.Context())
 	require.NoError(t, err)
-	require.Equal(t, bootstrapRotationSuperseded, receipt.Outcome)
+	require.Equal(t, clusterbootstrap.BootstrapRotationSuperseded, receipt.Outcome)
 	require.False(t, receipt.Complete)
 	require.Empty(t, f.calls, "historical exact key must not replace a newer leader plan")
 }
@@ -113,7 +114,7 @@ func TestBootstrapExternalRotationRecipeLostResultFollowerReconcile(t *testing.T
 	t.Parallel()
 	f := newRotationRecipeFixture(t)
 	req := externalRotationTestRequest(f)
-	r, err := newBootstrapExternalRotationRecipe(t.Context(), f.cfg, req)
+	r, err := clusterbootstrap.NewBootstrapExternalRotationRecipe(t.Context(), f.cfg, req)
 	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(t.Context())
 	f.admin = func(_ context.Context, request *pb.RotateDEKRequest) (*pb.RotateDEKResponse, error) {
@@ -135,7 +136,7 @@ func TestBootstrapExternalRotationRecipeLostResultFollowerReconcile(t *testing.T
 func TestBootstrapExternalRotationRecipeCancelledAbsentAndTermChange(t *testing.T) {
 	t.Parallel()
 	f := newRotationRecipeFixture(t)
-	r, err := newBootstrapExternalRotationRecipe(t.Context(), f.cfg, externalRotationTestRequest(f))
+	r, err := clusterbootstrap.NewBootstrapExternalRotationRecipe(t.Context(), f.cfg, externalRotationTestRequest(f))
 	require.NoError(t, err)
 	f.admin = func(context.Context, *pb.RotateDEKRequest) (*pb.RotateDEKResponse, error) {
 		return nil, context.Canceled
@@ -147,7 +148,7 @@ func TestBootstrapExternalRotationRecipeCancelledAbsentAndTermChange(t *testing.
 	require.NoError(t, err)
 	require.False(t, receipt.Complete)
 	require.Len(t, f.calls, 1)
-	_, err = newBootstrapExternalRotationRecipe(t.Context(), f.cfg, externalRotationTestRequest(f))
+	_, err = clusterbootstrap.NewBootstrapExternalRotationRecipe(t.Context(), f.cfg, externalRotationTestRequest(f))
 	require.ErrorIs(t, err, raftengine.ErrNotLeader)
 }
 
@@ -155,7 +156,7 @@ func TestBootstrapExternalRotationRecipeFreshBarrierRequired(t *testing.T) {
 	t.Parallel()
 	f := newRotationRecipeFixture(t)
 	f.barrierErr = errors.New("read index unavailable")
-	_, err := newBootstrapExternalRotationRecipe(t.Context(), f.cfg, externalRotationTestRequest(f))
+	_, err := clusterbootstrap.NewBootstrapExternalRotationRecipe(t.Context(), f.cfg, externalRotationTestRequest(f))
 	require.ErrorIs(t, err, f.barrierErr)
 	require.Empty(t, f.calls)
 }
@@ -176,7 +177,7 @@ func TestBootstrapExternalRotationRecipePurposeEpochAndWrappedLimit(t *testing.T
 	req := externalRotationTestRequest(f)
 	req.Purpose, req.ProposerLocalEpoch = pb.RotateDEKRequest_PURPOSE_RAFT, uint32(f.cfg.RaftEpoch)
 	req.WrappedNewDek = bytes.Repeat([]byte{8}, 4096)
-	r, err := newBootstrapExternalRotationRecipe(t.Context(), f.cfg, req)
+	r, err := clusterbootstrap.NewBootstrapExternalRotationRecipe(t.Context(), f.cfg, req)
 	require.NoError(t, err, "the maximum bounded wrapped material is valid")
 	receipt, err := r.Run(t.Context())
 	require.NoError(t, err)
@@ -189,14 +190,14 @@ func TestBootstrapExternalRotationRecipeForeignPlanAfterConstruction(t *testing.
 	t.Parallel()
 	f := newRotationRecipeFixture(t)
 	req := externalRotationTestRequest(f)
-	r, err := newBootstrapExternalRotationRecipe(t.Context(), f.cfg, req)
+	r, err := clusterbootstrap.NewBootstrapExternalRotationRecipe(t.Context(), f.cfg, req)
 	require.NoError(t, err)
-	foreign := cloneBootstrapRotationRequest(req)
+	foreign := clusterbootstrap.CloneBootstrapRotationRequest(req)
 	foreign.NewDekId++
 	f.apply(foreign)
 	receipt, err := r.Run(t.Context())
 	require.NoError(t, err)
-	require.Equal(t, bootstrapRotationSuperseded, receipt.Outcome)
+	require.Equal(t, clusterbootstrap.BootstrapRotationSuperseded, receipt.Outcome)
 	require.False(t, receipt.Complete)
 	require.Empty(t, f.calls)
 }

@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/cockroachdb/errors"
@@ -44,7 +45,7 @@ func (h *shutdownHandoff) requestShutdown() {
 	request()
 }
 
-func (h *shutdownHandoff) arm(ctx context.Context, eg *errgroup.Group, runtimes []*raftGroupRuntime, quiesce func(context.Context) error) {
+func (h *shutdownHandoff) arm(ctx context.Context, eg *errgroup.Group, runtimes []*clusterbootstrap.GroupRuntime, quiesce func(context.Context) error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if ctx.Err() != nil {
@@ -58,7 +59,7 @@ func (h *shutdownHandoff) arm(ctx context.Context, eg *errgroup.Group, runtimes 
 	})
 }
 
-func shutdownAfterRequest(ctx context.Context, cancel context.CancelFunc, runtimes []*raftGroupRuntime, requests <-chan struct{}, timeout time.Duration, quiesce func(context.Context) error) {
+func shutdownAfterRequest(ctx context.Context, cancel context.CancelFunc, runtimes []*clusterbootstrap.GroupRuntime, requests <-chan struct{}, timeout time.Duration, quiesce func(context.Context) error) {
 	select {
 	case <-ctx.Done():
 		return
@@ -98,7 +99,7 @@ func stopLeaderBalanceForShutdown(ctx context.Context, cancel context.CancelFunc
 	}
 }
 
-func transferLeadershipOnShutdown(ctx context.Context, runtimes []*raftGroupRuntime) {
+func transferLeadershipOnShutdown(ctx context.Context, runtimes []*clusterbootstrap.GroupRuntime) {
 	ticker := time.NewTicker(shutdownTransferRetryDelay)
 	defer ticker.Stop()
 	for ctx.Err() == nil && transferShutdownLeaderRound(ctx, runtimes) {
@@ -112,11 +113,11 @@ func transferLeadershipOnShutdown(ctx context.Context, runtimes []*raftGroupRunt
 	}
 }
 
-func transferShutdownLeaderRound(ctx context.Context, runtimes []*raftGroupRuntime) bool {
+func transferShutdownLeaderRound(ctx context.Context, runtimes []*clusterbootstrap.GroupRuntime) bool {
 	var transfers sync.WaitGroup
 	foundLeader := false
 	for _, rt := range runtimes {
-		engine := rt.snapshotEngine()
+		engine := clusterbootstrap.RuntimeCore(rt).SnapshotEngine()
 		admin, ok := engine.(shutdownLeadershipController)
 		if !ok || admin.State() != raftengine.StateLeader {
 			continue

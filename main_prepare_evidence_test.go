@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/adapter"
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
@@ -30,7 +31,7 @@ func TestPrepareEvidenceCapabilityRequiresCoordinatorRuntime(t *testing.T) {
 			wiring, err := configureCoordinatorTSO(cfg, coord, groups, mainTSOFloorProvider{})
 			require.NoError(t, err)
 			t.Cleanup(func() { require.NoError(t, wiring.Close()) })
-			options := append(internalTimestampOptions(newStartupGatedCoordinator(coord, nil)), dedicatedTimestampCutoverOptions(groups)...)
+			options := append(internalTimestampOptions(clusterbootstrap.NewStartupGatedCoordinator(coord, nil)), dedicatedTimestampCutoverOptions(groups)...)
 			options = append(options, adapter.WithInternalPrepareEvidenceToken("runtime-token"))
 			server := adapter.NewInternalWithEngine(nil, nil, nil, nil, options...)
 			ctx := metadata.NewIncomingContext(t.Context(), metadata.Pairs("authorization", "Bearer runtime-token"))

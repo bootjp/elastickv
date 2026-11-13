@@ -10,7 +10,9 @@ import (
 
 	"github.com/bootjp/elastickv/adapter"
 	internalutil "github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/encryption"
+	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/bootjp/elastickv/internal/runtimehealth"
@@ -29,7 +31,7 @@ import (
 const exitCodeMemoryPressure = 2
 
 func main() {
-	if handled, err := dispatchBootstrapOperator(os.Args[1:], os.Stdout); handled {
+	if handled, err := clusterbootstrap.DispatchBootstrapOperator(os.Args[1:], os.Stdout); handled {
 		if err != nil {
 			log.Fatalf("%v", err)
 		}
@@ -98,7 +100,7 @@ func run(flags *serverFlags) error {
 	if err != nil {
 		return err
 	}
-	bootstrapCfg.Encryption = flags.encryption.bootstrapRequest()
+	bootstrapCfg.Encryption = flags.encryption.BootstrapRequest()
 
 	var lc net.ListenConfig
 
@@ -140,9 +142,9 @@ func run(flags *serverFlags) error {
 	// The KEK source is decorated for §9.2
 	// elastickv_encryption_kek_unwrap_seconds inside this call, before
 	// the startup guards run their own unwraps.
-	kekUnwrapper, err := loadKEKAfterPreNonceStartupGuards(cfg, flags.raft, flags.encryption, metricsRegistry.KEKUnwrapObserver())
+	kekUnwrapper, err := encryptionwiring.LoadKEKAfterPreNonceStartupGuards(cfg, flags.raft.id, flags.raft.dataDir, flags.encryption, metricsRegistry.KEKUnwrapObserver())
 	if err != nil {
-		return err
+		return errors.WithStack(err)
 	}
 	keystore := encryption.NewKeystore()
 	redisApplyObserver := adapter.NewRedisApplyObserver()
@@ -191,22 +193,22 @@ func run(flags *serverFlags) error {
 		clock,
 		kekUnwrapper,
 		keystore,
-		flags.encryption.sidecarPath,
-		flags.encryption.enabled,
+		flags.encryption.SidecarPath,
+		flags.encryption.Enabled,
 		readTracker,
 		cfg.Engine,
 		metricsRegistry.EncryptionObserver(),
 		redisApplyObserver,
 		s3BlobBackfiller,
 	)
-	if err = chainEncryptionStartupGuard(
+	if err = encryptionwiring.ChainStartupGuard(
 		err,
-		runtimes,
+		clusterbootstrap.RuntimeCores(runtimes),
 		cfg.DefaultGroup,
-		flags.encryption.sidecarPath,
-		flags.encryption.enabled,
+		flags.encryption.SidecarPath,
+		flags.encryption.Enabled,
 	); err != nil {
-		return err
+		return errors.WithStack(err)
 	}
 	// Startup has hydrated every keystore, so the KEK unwrap cache has
 	// served its purpose. Seal it: the same wrapper is retained by
@@ -231,10 +233,10 @@ func run(flags *serverFlags) error {
 			rt.Close()
 		}
 	})
-	bootstrapDomain, resolverOptions := configureBootstrapOperations(ctx, runtimes, shardStore, &cleanup)
-	bootstrapNetwork, err := configureBootstrapNetwork(ctx, runtimes, shardStore, shardGroups, &cleanup)
+	bootstrapDomain, resolverOptions := clusterbootstrap.ConfigureBootstrapOperations(ctx, runtimes, shardStore, &cleanup)
+	bootstrapNetwork, err := clusterbootstrap.ConfigureBootstrapNetwork(ctx, runtimes, shardStore, shardGroups, &cleanup)
 	if err != nil {
-		return err
+		return errors.WithStack(err)
 	}
 	cleanup.Add(cancel)
 	startLockResolverIfEnabled(shardStore, shardGroups, &cleanup, resolverOptions...)
@@ -248,7 +250,7 @@ func run(flags *serverFlags) error {
 		WithAllShardGroups(noderuntime.DataGroupIDs(cfg.Groups)...).
 		WithPartitionResolver(sqsPartitionResolver)
 	configureCommitTSFenceActivation(coordinate, flags.consistency.commitTSFence, runtimes)
-	installBootstrapCoordinator(bootstrapDomain, coordinate, &cleanup)
+	clusterbootstrap.InstallBootstrapCoordinator(bootstrapDomain, coordinate, &cleanup)
 	tsoWiring, err := configureCoordinatorTSOWithObserver(
 		flags.tso,
 		coordinate,
@@ -286,8 +288,8 @@ func run(flags *serverFlags) error {
 	// run with no registration gate installed.
 	encryptionStartup := bootstrapEncryptionStartupConfig{
 		runtimes: runtimes, groups: shardGroups, defaultGroup: cfg.DefaultGroup,
-		network: bootstrapNetwork, wiring: encWiring, sidecarPath: flags.encryption.sidecarPath,
-		wrapper: kekUnwrapper, nodeID: etcdraftengine.DeriveNodeID(flags.raft.id), requested: flags.encryption.rotateOnStartup,
+		network: bootstrapNetwork, wiring: encWiring, sidecarPath: flags.encryption.SidecarPath,
+		wrapper: kekUnwrapper, nodeID: etcdraftengine.DeriveNodeID(flags.raft.id), requested: flags.encryption.RotateOnStartup,
 		eg: eg, cleanup: &cleanup,
 	}
 	distStartup, err := startDistributionWithBootstrapEncryption(distributionStartupInput{
@@ -303,7 +305,7 @@ func run(flags *serverFlags) error {
 		encWiring:       encWiring,
 		raftID:          flags.raft.id,
 		raftDir:         flags.raft.dataDir,
-		sidecarPath:     flags.encryption.sidecarPath,
+		sidecarPath:     flags.encryption.SidecarPath,
 		sampler:         sampler,
 		readTracker:     readTracker,
 		metricsRegistry: metricsRegistry,
@@ -332,9 +334,9 @@ func run(flags *serverFlags) error {
 	// *kv.ShardedCoordinator and *kv.ShardGroup are available. Returns
 	// nil when encryption is not wired (no StateCache or no default
 	// group), in which case raftadmin.Server skips the pre-step.
-	encryptionConfChangeInterceptor := newEncryptionConfChangeInterceptor(
-		encWiring.encryptionConfigured(),
-		coordinate, shardGroups[cfg.DefaultGroup], encWiring.cache, flags.encryption.sidecarPath, etcdraftengine.DeriveNodeID)
+	encryptionConfChangeInterceptor := encryptionwiring.NewConfChangeInterceptor(
+		encWiring.EncryptionConfigured(),
+		coordinate, shardGroups[cfg.DefaultGroup], encWiring.Cache, flags.encryption.SidecarPath, etcdraftengine.DeriveNodeID)
 	rotateOnStartupDeregister, waitRotateOnStartup := installBootstrapStartupRotation(distStartup.rotationSupervisor, runCtx, encryptionStartup)
 	cleanup.Add(rotateOnStartupDeregister)
 	return serveStartedRuntime(waitRotateOnStartup, serversInput{
@@ -365,7 +367,7 @@ func run(flags *serverFlags) error {
 	}, health, handoff)
 }
 
-func serveStartedRuntime(waitRotateOnStartup startupRotationWaiter, in serversInput, health *runtimehealth.Probe, handoff *shutdownHandoff) error {
+func serveStartedRuntime(waitRotateOnStartup encryptionwiring.StartupRotationWaiter, in serversInput, health *runtimehealth.Probe, handoff *shutdownHandoff) error {
 	if err := startServersAfterStartupRotation(waitRotateOnStartup, in); err != nil {
 		return err
 	}

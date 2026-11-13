@@ -16,6 +16,8 @@ import (
 
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
+	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	internalraftadmin "github.com/bootjp/elastickv/internal/raftadmin"
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -62,7 +64,7 @@ type bootstrapE2EMultiGroupListeners struct {
 
 type bootstrapE2ENode struct {
 	id       string
-	runtimes []*raftGroupRuntime
+	runtimes []*clusterbootstrap.GroupRuntime
 
 	shardStore  *kv.ShardStore
 	coordinate  *kv.ShardedCoordinator
@@ -562,7 +564,7 @@ func startBootstrapE2ENode(
 	clock := kv.NewHLC()
 	runtimes, shardGroups, err := buildShardGroups(ep.id, baseDir, cfg.Groups, cfg.Multi, bootstrap,
 		noderuntime.BootstrapConfig{LegacyServers: bootstrapServers}, factory, nil, clock, kv.NewActiveTimestampTracker(),
-		nil, nil, "", encryptionWriteWiring{}, cfg.Engine)
+		nil, nil, "", encryptionwiring.WriteWiring{}, cfg.Engine)
 	if err != nil {
 		return nil, err
 	}
@@ -651,7 +653,7 @@ func startBootstrapE2EMultiGroupNode(
 	clock := kv.NewHLC()
 	runtimes, shardGroups, err := buildShardGroups(ep.id, baseDir, cfg.Groups, cfg.Multi, bootstrap,
 		bootstrapCfg, factory, nil, clock, kv.NewActiveTimestampTracker(), nil, nil, "",
-		encryptionWriteWiring{}, cfg.Engine)
+		encryptionwiring.WriteWiring{}, cfg.Engine)
 	if err != nil {
 		return nil, err
 	}
@@ -716,7 +718,7 @@ func startRuntimeServersWithBoundListeners(
 	ctx context.Context,
 	eg *errgroup.Group,
 	cancel context.CancelFunc,
-	runtimes []*raftGroupRuntime,
+	runtimes []*clusterbootstrap.GroupRuntime,
 	shardStore *kv.ShardStore,
 	coordinate kv.Coordinator,
 	distServer *adapter.DistributionServer,
@@ -746,7 +748,7 @@ func startRuntimeServersWithBoundMultiGroupListeners(
 	ctx context.Context,
 	eg *errgroup.Group,
 	cancel context.CancelFunc,
-	runtimes []*raftGroupRuntime,
+	runtimes []*clusterbootstrap.GroupRuntime,
 	shardStore *kv.ShardStore,
 	coordinate kv.Coordinator,
 	distServer *adapter.DistributionServer,
@@ -775,7 +777,7 @@ func startRuntimeServersWithBoundMultiGroupListeners(
 func startBoundGRPCServer(
 	ctx context.Context,
 	eg *errgroup.Group,
-	rt *raftGroupRuntime,
+	rt *clusterbootstrap.GroupRuntime,
 	shardStore *kv.ShardStore,
 	coordinate kv.Coordinator,
 	distServer *adapter.DistributionServer,
@@ -805,7 +807,7 @@ func startBoundGRPCServer(
 		adapter.WithInternalMigrationExportRouting(rt.Spec.ID, sqsPartitionResolver),
 	))
 	pb.RegisterDistributionServer(gs, distServer)
-	rt.registerGRPC(gs)
+	clusterbootstrap.RuntimeCore(rt).RegisterGRPC(gs)
 	internalraftadmin.RegisterOperationalServices(ctx, gs, rt.Engine, []string{"RawKV"})
 	reflection.Register(gs)
 

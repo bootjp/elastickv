@@ -10,6 +10,9 @@ import (
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
 	internalutil "github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
+	"github.com/bootjp/elastickv/internal/encryptionwiring"
+	"github.com/bootjp/elastickv/internal/nodeauth"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	internalraftadmin "github.com/bootjp/elastickv/internal/raftadmin"
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -43,7 +46,7 @@ func registerS3BlobFetchServer(
 	return []string{"S3BlobFetch"}
 }
 
-func raftGRPCServerOptions(adminGRPCOpts adminGRPCInterceptors) []grpc.ServerOption {
+func raftGRPCServerOptions(adminGRPCOpts nodeauth.AdminGRPCInterceptors) []grpc.ServerOption {
 	baseOpts := internalutil.GRPCServerOptions()
 	// extraOptsCap reserves slots for the unary + stream admin
 	// interceptor options appended below. Sized as a constant so the
@@ -56,11 +59,11 @@ func raftGRPCServerOptions(adminGRPCOpts adminGRPCInterceptors) []grpc.ServerOpt
 	// (single-interceptor) option added anywhere in this chain cannot
 	// silently overwrite the admin auth gate — gRPC-Go keeps only the
 	// last option of the same type.
-	unary := append([]grpc.UnaryServerInterceptor{}, adminGRPCOpts.unary...)
-	unary = append(unary, adapter.NewMigrationCoverageUnaryGate(adminGRPCOpts.migrationReady))
+	unary := append([]grpc.UnaryServerInterceptor{}, adminGRPCOpts.Unary...)
+	unary = append(unary, adapter.NewMigrationCoverageUnaryGate(adminGRPCOpts.MigrationReady))
 	opts = append(opts, grpc.ChainUnaryInterceptor(unary...))
-	if len(adminGRPCOpts.stream) > 0 {
-		opts = append(opts, grpc.ChainStreamInterceptor(adminGRPCOpts.stream...))
+	if len(adminGRPCOpts.Stream) > 0 {
+		opts = append(opts, grpc.ChainStreamInterceptor(adminGRPCOpts.Stream...))
 	}
 	return opts
 }
@@ -74,7 +77,7 @@ func startRaftServers(
 	ctx context.Context,
 	lc *net.ListenConfig,
 	eg *errgroup.Group,
-	runtimes []*raftGroupRuntime,
+	runtimes []*clusterbootstrap.GroupRuntime,
 	shardGroups map[uint64]*kv.ShardGroup,
 	shardStore *kv.ShardStore,
 	coordinate kv.Coordinator,
@@ -82,14 +85,14 @@ func startRaftServers(
 	relay *adapter.RedisPubSubRelay,
 	proposalObserverForGroup func(uint64) kv.ProposalObserver,
 	adminServer *adapter.AdminServer,
-	adminGRPCOpts adminGRPCInterceptors,
+	adminGRPCOpts nodeauth.AdminGRPCInterceptors,
 	forwardDeps adminForwardServerDeps,
 	confChangeInterceptor internalraftadmin.MembershipChangeInterceptor,
-	encWiring encryptionWriteWiring,
+	encWiring encryptionwiring.WriteWiring,
 	sqsPartitionResolver kv.PartitionResolver,
 	routeEngine *distribution.Engine,
 	readTracker *kv.ActiveTimestampTracker,
-	encryptionCfg encryptionFlags,
+	encryptionCfg encryptionwiring.Flags,
 	kekConfigured bool,
 	defaultGroupID uint64,
 	raftID string,
@@ -98,28 +101,28 @@ func startRaftServers(
 	s3BlobPushBlocked func() bool,
 ) error {
 	forwardLogger := slog.Default().With(slog.String("component", "admin"))
-	enableMutators := encryptionMutatorsEnabled(encryptionCfg, kekConfigured)
-	encryptionCapabilityFanout := buildEncryptionCapabilityFanout(ctx, eg, runtimes, enableMutators)
-	monitorFanout, releaseMonitorConns := buildStorageEnvelopeV2MonitorFanout(runtimes, enableMutators)
-	startStorageEnvelopeV2CapabilityMonitor(ctx, eg, monitorFanout, releaseMonitorConns, encWiring)
-	writerRegistry, err := encryptionAdminDefaultWriterRegistry(encryptionCfg.sidecarPath, shardGroups, defaultGroupID)
+	enableMutators := encryptionwiring.MutatorsEnabled(encryptionCfg, kekConfigured)
+	encryptionCapabilityFanout := encryptionwiring.BuildCapabilityFanout(ctx, eg, clusterbootstrap.RuntimeCores(runtimes), clusterbootstrap.BootstrapRuntimeDialOptions(runtimes), enableMutators)
+	monitorFanout, releaseMonitorConns := encryptionwiring.BuildStorageEnvelopeV2MonitorFanout(clusterbootstrap.RuntimeCores(runtimes), clusterbootstrap.BootstrapRuntimeDialOptions(runtimes), enableMutators)
+	encryptionwiring.StartStorageEnvelopeV2CapabilityMonitor(ctx, eg, monitorFanout, releaseMonitorConns, encWiring)
+	writerRegistry, err := encryptionwiring.AdminDefaultWriterRegistry(encryptionCfg.SidecarPath, shardGroups, defaultGroupID)
 	if err != nil {
-		return err
+		return errors.WithStack(err)
 	}
-	defaultAdmin, err := encryptionAdminDefaultRuntimeOptions(runtimes, shardGroups, defaultGroupID, enableMutators || writerRegistry != nil)
+	defaultAdmin, err := encryptionwiring.AdminDefaultRuntimeOptions(clusterbootstrap.RuntimeCores(runtimes), shardGroups, defaultGroupID, enableMutators || writerRegistry != nil)
 	if err != nil {
-		return err
+		return errors.WithStack(err)
 	}
-	encryptionAdminServer := newEncryptionAdminServer(
+	encryptionAdminServer := encryptionwiring.NewAdminServer(
 		etcdraftengine.DeriveNodeID(raftID),
-		encryptionCfg.sidecarPath,
+		encryptionCfg.SidecarPath,
 		enableMutators,
-		defaultAdmin.engine,
+		defaultAdmin.Engine,
 		encryptionCapabilityFanout,
 		writerRegistry,
-		defaultAdmin.latestAppliedIndex,
-		adapter.WithEncryptionAdminPostCutoverProposer(defaultAdmin.postCutoverProposer),
-		adapter.WithEncryptionAdminCutoverBarrier(encWiring.raftEnvelope.barrier()),
+		defaultAdmin.LatestAppliedIndex,
+		adapter.WithEncryptionAdminPostCutoverProposer(defaultAdmin.PostCutoverProposer),
+		adapter.WithEncryptionAdminCutoverBarrier(encWiring.RaftEnvelope.Barrier()),
 	)
 	for _, rt := range runtimes {
 		serverOptions := append(slices.Clone(rt.TransportServerOptions), raftGRPCServerOptions(adminGRPCOpts)...)
@@ -129,16 +132,16 @@ func startRaftServers(
 		pb.RegisterRawKVServer(gs, grpcSvc)
 		pb.RegisterTransactionalKVServer(gs, grpcSvc)
 		internalOpts := internalServerOptions(coordinate, adminServer, proposerForGroup(rt, shardGroups), shardGroups[rt.Spec.ID], rt.Spec.ID)
-		internalOpts = append(internalOpts, bootstrapInternalPolicyOptions(rt, proposerForGroup(rt, shardGroups))...)
+		internalOpts = append(internalOpts, clusterbootstrap.BootstrapInternalPolicyOptions(rt, proposerForGroup(rt, shardGroups))...)
 		internalOpts = append(internalOpts, dedicatedTimestampCutoverOptions(shardGroups)...)
 		internalOpts = append(internalOpts, adapter.WithInternalMigrationOwnershipReady(func() bool {
-			return adapter.MigrationOwnershipRuntimeReady(trx, shardStore, distServer, rt.Spec.ID, rt.snapshotEngine(), adminGRPCOpts.migrationReady)
+			return adapter.MigrationOwnershipRuntimeReady(trx, shardStore, distServer, rt.Spec.ID, clusterbootstrap.RuntimeCore(rt).SnapshotEngine(), adminGRPCOpts.MigrationReady)
 		}))
 		internalOpts = append(internalOpts, migrationInternalProtocolOptions(trx, shardStore, distServer, rt)...)
 		internalOpts = append(internalOpts, internalReadWatermarkOptions(readWatermarkAdvance, rt, shardGroups)...)
 		staticServingServices := registerS3BlobFetchServer(
 			gs,
-			adminGRPCOpts.s3BlobFetchEnabled,
+			adminGRPCOpts.S3BlobFetchEnabled,
 			rt.Store,
 			s3BlobObserver,
 			coordinate.Clock(),
@@ -150,7 +153,7 @@ func startRaftServers(
 			coordinate.Clock(),
 			relay,
 			append(internalOpts,
-				adapter.WithInternalPrepareEvidenceToken(adminGRPCOpts.token),
+				adapter.WithInternalPrepareEvidenceToken(adminGRPCOpts.Token),
 				adapter.WithInternalStore(rt.Store),
 				adapter.WithInternalPrimaryCommitEvidence(shardStore),
 				adapter.WithInternalMigrationProposer(proposerForGroup(rt, shardGroups)),
@@ -178,9 +181,9 @@ func startRaftServers(
 		// ResyncSidecar's freshness gate must verify that group's
 		// leader, and all mutating admin RPCs must commit into the
 		// same FSM whose registry GetSidecarState/ResyncSidecar read.
-		registerEncryptionAdminServer(gs, encryptionAdminServer)
+		encryptionwiring.RegisterAdminServer(gs, encryptionAdminServer)
 		registerAdminForwardServer(gs, forwardDeps, forwardLogger)
-		rt.registerGRPC(gs)
+		clusterbootstrap.RuntimeCore(rt).RegisterGRPC(gs)
 		// Stage 7c §3.1: pass the encryption-aware pre-register hook
 		// (nil when encryption is not wired); raftadmin.Server invokes
 		// it before AddVoter/AddLearner propose the conf-change.
@@ -190,7 +193,7 @@ func startRaftServers(
 			rt.Engine,
 			[]string{"RawKV"},
 			staticServingServices,
-			migrationMembershipInterceptor(rt, shardStore, proposerForGroup(rt, shardGroups), adminGRPCOpts.migrationToken, confChangeInterceptor),
+			migrationMembershipInterceptor(rt, shardStore, proposerForGroup(rt, shardGroups), adminGRPCOpts.MigrationToken, confChangeInterceptor),
 		)
 		reflection.Register(gs)
 
@@ -228,7 +231,7 @@ func startRaftServers(
 	return nil
 }
 
-func internalReadWatermarkOptions(enabled bool, rt *raftGroupRuntime, groups map[uint64]*kv.ShardGroup) []adapter.InternalOption {
+func internalReadWatermarkOptions(enabled bool, rt *clusterbootstrap.GroupRuntime, groups map[uint64]*kv.ShardGroup) []adapter.InternalOption {
 	if !enabled {
 		return nil
 	}

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/tsowiring"
 	"github.com/bootjp/elastickv/kv"
@@ -26,10 +27,10 @@ func configureCoordinatorTSOWithObserver(
 	shardGroups map[uint64]*kv.ShardGroup,
 	floorProvider kv.TSOCutoverFloorProvider,
 	observer kv.TSOObserver,
-	networks ...*bootstrapNetwork,
+	networks ...*clusterbootstrap.BootstrapNetwork,
 ) (tsowiring.Wiring, error) {
 	tsoGroup, dedicated := shardGroups[noderuntime.DedicatedTSORaftGroupID]
 	wiring, err := tsowiring.Configure(f, coordinate, noderuntime.DedicatedTSORaftGroupID, tsoGroup, dedicated,
-		floorProvider, observer, bootstrapTSORoutingOptions(networks)...)
+		floorProvider, observer, clusterbootstrap.BootstrapTSORoutingOptions(networks)...)
 	return wiring, errors.WithStack(err)
 }

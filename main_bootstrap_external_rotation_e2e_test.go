@@ -10,7 +10,9 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/adapter"
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/encryption"
+	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -34,7 +36,7 @@ func externalRotationE2EClient(t *testing.T, f *bootstrapRotationE2EFixture, nod
 	t.Helper()
 	controller, ok := any(node.supervisor).(externalRotationE2EController)
 	require.True(t, ok, "production rotation supervisor must implement the external controller API")
-	rpc, err := newBootstrapRotationRPC(externalRotationE2EAdmin, f.config.local.Member, func(ctx context.Context, req *pb.RotateDEKRequest) (*pb.RotateDEKResponse, error) {
+	rpc, err := clusterbootstrap.NewBootstrapRotationRPC(externalRotationE2EAdmin, f.config.Local.Member, func(ctx context.Context, req *pb.RotateDEKRequest) (*pb.RotateDEKResponse, error) {
 		reply, callErr := controller.RotateDEK(ctx, req)
 		if after != nil {
 			after(ctx, req)
@@ -42,13 +44,13 @@ func externalRotationE2EClient(t *testing.T, f *bootstrapRotationE2EFixture, nod
 		return reply, callErr
 	})
 	require.NoError(t, err)
-	options, err := node.domain.owners[1].ServerOptions(f.config.serverTLS)
+	options, err := node.domain.Owners[1].ServerOptions(f.config.ServerTLS)
 	require.NoError(t, err)
-	gate := &startupPublicKVGate{domain: node.domain}
-	gate.markReady()
-	server := grpc.NewServer(append(options, grpc.ChainUnaryInterceptor(rpc, gate.unaryInterceptor))...)
+	gate := &clusterbootstrap.StartupPublicKVGate{Domain: node.domain}
+	gate.MarkReady()
+	server := grpc.NewServer(append(options, grpc.ChainUnaryInterceptor(rpc, gate.UnaryInterceptor))...)
 	admin := adapter.NewEncryptionAdminServer(adapter.WithEncryptionAdminSidecarPath(f.sidecarPath),
-		adapter.WithEncryptionAdminFullNodeID(f.config.local.Member), adapter.WithEncryptionAdminProposer(node.runtime.Engine),
+		adapter.WithEncryptionAdminFullNodeID(f.config.Local.Member), adapter.WithEncryptionAdminProposer(node.runtime.Engine),
 		adapter.WithEncryptionAdminPostCutoverProposer(node.group.Proposer()), adapter.WithEncryptionAdminLeaderView(node.runtime.Engine))
 	require.NoError(t, admin.Validate())
 	pb.RegisterEncryptionAdminServer(server, admin)
@@ -57,7 +59,7 @@ func externalRotationE2EClient(t *testing.T, f *bootstrapRotationE2EFixture, nod
 	done := make(chan error, 1)
 	go func() { done <- server.Serve(listener) }()
 	t.Cleanup(func() { server.Stop(); require.NoError(t, <-done) })
-	tls := f.config.clientTLS.Clone()
+	tls := f.config.ClientTLS.Clone()
 	tls.ServerName = "localhost"
 	conn, err := grpc.NewClient(listener.Addr().String(), grpc.WithTransportCredentials(credentials.NewTLS(tls)))
 	require.NoError(t, err)
@@ -76,12 +78,12 @@ func externalRotationE2ERequest(t *testing.T, f *bootstrapRotationE2EFixture, no
 	t.Helper()
 	sc, err := encryption.ReadSidecar(f.sidecarPath)
 	require.NoError(t, err)
-	id, err := nextEncryptionRotateOnStartupKeyID(sc)
+	id, err := encryptionwiring.NextRotateOnStartupKeyID(sc)
 	require.NoError(t, err)
-	wrapped, err := wrapFreshStartupDEK(f.wrapper)
+	wrapped, err := encryptionwiring.WrapFreshStartupDEK(f.wrapper)
 	require.NoError(t, err)
 	return &pb.RotateDEKRequest{Purpose: pb.RotateDEKRequest_PURPOSE_STORAGE, NewDekId: id, WrappedNewDek: wrapped,
-		ProposerNodeId: f.config.local.Member, ProposerLocalEpoch: uint32(node.wiring.epoch)}
+		ProposerNodeId: f.config.Local.Member, ProposerLocalEpoch: uint32(node.wiring.Epoch)}
 }
 
 func externalRotationE2EApplied(t *testing.T, f *bootstrapRotationE2EFixture, node *bootstrapRotationE2ENode, req *pb.RotateDEKRequest) {
@@ -147,7 +149,7 @@ func TestBootstrapExternalRotationE2ERejectedRequestsDoNotMutate(t *testing.T) {
 		{"key_collision", func(r *pb.RotateDEKRequest) { r.NewDekId = before.Active.Storage }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			bad := cloneBootstrapRotationRequest(req)
+			bad := clusterbootstrap.CloneBootstrapRotationRequest(req)
 			tc.change(bad)
 			_, err := client.RotateDEK(externalRotationE2EContext(t), bad)
 			require.Error(t, err)
@@ -155,7 +157,7 @@ func TestBootstrapExternalRotationE2ERejectedRequestsDoNotMutate(t *testing.T) {
 	}
 	_, err = client.RotateDEK(t.Context(), req)
 	require.Equal(t, codes.Unauthenticated, status.Code(err))
-	ctx := metadata.AppendToOutgoingContext(t.Context(), "authorization", "Bearer "+externalRotationE2EAdmin, bootstrapControlHeader, f.config.startupToken)
+	ctx := metadata.AppendToOutgoingContext(t.Context(), "authorization", "Bearer "+externalRotationE2EAdmin, clusterbootstrap.BootstrapControlHeader, f.config.StartupToken)
 	_, err = client.RotateDEK(ctx, req)
 	require.Equal(t, codes.Unauthenticated, status.Code(err))
 	after, err := encryption.ReadSidecar(f.sidecarPath)
@@ -208,13 +210,13 @@ func TestBootstrapExternalRotationE2ERejectsReplayedSidecarMaterial(t *testing.T
 					req := externalRotationE2ERequest(t, f, node)
 					req.Purpose, req.WrappedNewDek = purpose, bytes.Clone(wrapped)
 					if purpose == pb.RotateDEKRequest_PURPOSE_RAFT {
-						req.ProposerLocalEpoch = uint32(node.wiring.raftEpoch)
+						req.ProposerLocalEpoch = uint32(node.wiring.RaftEpoch)
 					}
 					if rewrapped {
 						material, err := f.wrapper.Unwrap(wrapped)
 						require.NoError(t, err)
 						req.WrappedNewDek, err = f.wrapper.Wrap(material)
-						zeroBytes(material)
+						encryptionwiring.ZeroBytes(material)
 						require.NoError(t, err)
 						require.NotEqual(t, wrapped, req.WrappedNewDek)
 					}
@@ -229,7 +231,7 @@ func TestBootstrapExternalRotationE2ERejectsReplayedSidecarMaterial(t *testing.T
 	require.NoError(t, err)
 	require.Equal(t, before.Active, after.Active)
 	require.Equal(t, before.Keys, after.Keys)
-	state, err := node.domain.admission.RotationStatus()
+	state, err := node.domain.Admission.RotationStatus()
 	require.NoError(t, err)
 	require.False(t, state.Responsibility, "reused material must be rejected before private Rot authority is installed")
 	node.read(t, "legacy-key", "original-value")

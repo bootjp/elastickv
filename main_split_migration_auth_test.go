@@ -11,6 +11,8 @@ import (
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
 	internalutil "github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/internal/nodeauth"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
@@ -34,7 +36,7 @@ func TestSplitRangeProductionAuthRequiresDedicatedTokenDuringSendFirst(t *testin
 	for name, token := range map[string]string{"admin": "read-only-admin", "peer": "blob-peer", "migration": "migration-secret"} {
 		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte(token), 0o600))
 	}
-	adminServer, auth, err := configureAdminService(nodeAuthFlags{adminTokenFile: filepath.Join(dir, "admin"), s3BlobPeerTokenFile: filepath.Join(dir, "peer"), splitMigrationTokenFile: filepath.Join(dir, "migration")}, false, adapter.NodeIdentity{}, nil, nil)
+	adminServer, auth, err := configureAdminService(nodeauth.Flags{AdminTokenFile: filepath.Join(dir, "admin"), S3BlobPeerTokenFile: filepath.Join(dir, "peer"), SplitMigrationTokenFile: filepath.Join(dir, "migration")}, false, adapter.NodeIdentity{}, nil, nil)
 	require.NoError(t, err)
 	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -86,7 +88,7 @@ func TestSplitMigrationFactoriesPropagateCredentials(t *testing.T) {
 	migrationPath := filepath.Join(t.TempDir(), "migration-token")
 	require.NoError(t, os.WriteFile(adminPath, []byte("read-only-admin"), 0o600))
 	require.NoError(t, os.WriteFile(migrationPath, []byte("migration-secret"), 0o600))
-	adminServer, auth, err := configureAdminService(nodeAuthFlags{adminTokenFile: adminPath, splitMigrationTokenFile: migrationPath, splitMigrationPeerAuthEnforced: true}, false, adapter.NodeIdentity{}, nil, nil)
+	adminServer, auth, err := configureAdminService(nodeauth.Flags{AdminTokenFile: adminPath, SplitMigrationTokenFile: migrationPath, SplitMigrationPeerAuthEnforced: true}, false, adapter.NodeIdentity{}, nil, nil)
 	require.NoError(t, err)
 	serverOpts := append(raftGRPCServerOptions(auth), grpc.ChainUnaryInterceptor(
 		func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
@@ -120,7 +122,7 @@ func TestSplitMigrationFactoriesPropagateCredentials(t *testing.T) {
 	require.NoError(t, err)
 	voters, err := adapter.NewSplitMigrationGRPCVoterFactory(map[uint64]*kv.ShardGroup{
 		2: {Engine: capabilityConfigEngine{cfg: raftengine.Configuration{Servers: []raftengine.Server{
-			{ID: "voter", Address: lis.Addr().String(), Suffrage: raftMemberSuffrageVoter},
+			{ID: "voter", Address: lis.Addr().String(), Suffrage: noderuntime.VoterSuffrage},
 		}}}},
 	}, &cache, "migration-secret")(ctx, 2)
 	require.NoError(t, err)
@@ -183,31 +185,16 @@ func TestSplitMigrationFactoriesPropagateCredentials(t *testing.T) {
 	require.Equal(t, codes.Unauthenticated, status.Code(err), "migration credential must not gain unrelated Admin access")
 }
 
-func TestSplitMigrationOpcodesRequireExplicitAuthentication(t *testing.T) {
-	for _, env := range []string{adapter.MigrationImportOpcodeEnv, adapter.MigrationPromoteOpcodeEnv, adapter.MigrationCleanupOpcodeEnv} {
-		t.Setenv(env, "false")
-	}
-	for _, env := range []string{adapter.MigrationImportOpcodeEnv, adapter.MigrationPromoteOpcodeEnv, adapter.MigrationCleanupOpcodeEnv} {
-		t.Run(env, func(t *testing.T) {
-			t.Setenv(env, "true")
-			_, err := loadNodeGRPCAuth("", false, "", "")
-			require.ErrorContains(t, err, "migration opcodes require")
-			_, err = loadNodeGRPCAuth("", true, "", "")
-			require.NoError(t, err)
-		})
-	}
-}
-
 func TestSplitMigrationPeerAuthRolloutPausesRunnerAndCapability(t *testing.T) {
-	var nodeAuth nodeAuthFlags
+	var nodeAuth nodeauth.Flags
 	for _, env := range []string{adapter.MigrationImportOpcodeEnv, adapter.MigrationPromoteOpcodeEnv, adapter.MigrationCleanupOpcodeEnv} {
 		t.Setenv(env, "true")
 	}
-	require.ErrorContains(t, nodeAuth.splitMigrationLocalReadinessGate(context.Background()), "peer auth rollout")
+	require.ErrorContains(t, nodeAuth.SplitMigrationLocalReadinessGate(context.Background()), "peer auth rollout")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	group := new(errgroup.Group)
-	startDistributionSplitJobRunner(ctx, group, adapter.NewDistributionServer(nil, nil), nodeAuth.splitMigrationLocalReadinessGate)
+	startDistributionSplitJobRunner(ctx, group, adapter.NewDistributionServer(nil, nil), nodeAuth.SplitMigrationLocalReadinessGate)
 	done := make(chan error, 1)
 	go func() { done <- group.Wait() }()
 	select {
@@ -218,32 +205,8 @@ func TestSplitMigrationPeerAuthRolloutPausesRunnerAndCapability(t *testing.T) {
 		<-done
 		t.Fatal("send-only rollout stage must not start a privileged runner")
 	}
-	nodeAuth.splitMigrationPeerAuthEnforced = true
-	require.NoError(t, nodeAuth.splitMigrationLocalReadinessGate(context.Background()))
-	nodeAuth.splitMigrationPeerAuthEnforced, nodeAuth.adminInsecureNoAuth = false, true
-	require.NoError(t, nodeAuth.splitMigrationLocalReadinessGate(context.Background()), "explicit insecure mode retains its existing auth-rollout exception")
-}
-
-func TestSplitMigrationTokenMustBeDedicated(t *testing.T) {
-	t.Parallel()
-	dir := t.TempDir()
-	adminPath, peerPath := filepath.Join(dir, "admin"), filepath.Join(dir, "peer")
-	require.NoError(t, os.WriteFile(adminPath, []byte("read-only-admin"), 0o600))
-	require.NoError(t, os.WriteFile(peerPath, []byte("blob-peer"), 0o600))
-	for _, token := range []string{"read-only-admin", "blob-peer", "migration-secret"} {
-		path := filepath.Join(t.TempDir(), "migration")
-		require.NoError(t, os.WriteFile(path, []byte(token), 0o600))
-		cfg, err := loadNodeGRPCAuth(adminPath, false, peerPath, path)
-		if token != "migration-secret" {
-			require.ErrorContains(t, err, "migration token must differ")
-			continue
-		}
-		require.NoError(t, err)
-		require.Equal(t, "migration-secret", cfg.migrationToken)
-		_, err = loadNodeGRPCAuth("", true, "", path)
-		require.ErrorContains(t, err, "mutually exclusive")
-	}
-	cfg, err := loadNodeGRPCAuth(adminPath, false, peerPath, "")
-	require.NoError(t, err)
-	require.Empty(t, cfg.migrationToken, "an Admin token must never implicitly configure migration authority")
+	nodeAuth.SplitMigrationPeerAuthEnforced = true
+	require.NoError(t, nodeAuth.SplitMigrationLocalReadinessGate(context.Background()))
+	nodeAuth.SplitMigrationPeerAuthEnforced, nodeAuth.AdminInsecureNoAuth = false, true
+	require.NoError(t, nodeAuth.SplitMigrationLocalReadinessGate(context.Background()), "explicit insecure mode retains its existing auth-rollout exception")
 }

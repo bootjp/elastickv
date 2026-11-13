@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryption/fsmwire"
 	"github.com/bootjp/elastickv/internal/raftadmission"
@@ -53,7 +54,7 @@ func bootstrapPayloadGuarded(t testing.TB, kind raftbootstrap.ControlKind) []byt
 	inner := kv.EncodeWatermarkAdvance(42)
 	if kind == raftbootstrap.ControlGuardedCatalog {
 		key := distribution.CatalogVersionKey()
-		inner = bootstrapPayloadProto(t, bootstrapPayloadSingle, &pb.Request{
+		inner = bootstrapPayloadProto(t, clusterbootstrap.BootstrapPayloadSingle, &pb.Request{
 			IsTxn: true, Ts: 10, ReadKeys: [][]byte{key}, Mutations: []*pb.Mutation{
 				{Op: pb.Op_PUT, Key: []byte(kv.TxnMetaPrefix), Value: kv.EncodeTxnMeta(kv.TxnMeta{PrimaryKey: key, CommitTS: 20})},
 				{Op: pb.Op_PUT, Key: key, Value: distribution.EncodeCatalogVersion(1)},
@@ -82,8 +83,8 @@ func bootstrapPayloadFixtures(t testing.TB) []bootstrapPayloadCase {
 	require.NoError(t, err)
 	return []bootstrapPayloadCase{
 		{"initial activation", bootstrapPayloadActivation(t, 17), []raftadmission.Kind{raftadmission.Recovery}},
-		{"single", bootstrapPayloadProto(t, bootstrapPayloadSingle, bootstrapPayloadRequest()), data},
-		{"batch", bootstrapPayloadProto(t, bootstrapPayloadBatch, &pb.RaftCommand{Requests: []*pb.Request{bootstrapPayloadRequest(), bootstrapPayloadRequest()}}), data},
+		{"single", bootstrapPayloadProto(t, clusterbootstrap.BootstrapPayloadSingle, bootstrapPayloadRequest()), data},
+		{"batch", bootstrapPayloadProto(t, clusterbootstrap.BootstrapPayloadBatch, &pb.RaftCommand{Requests: []*pb.Request{bootstrapPayloadRequest(), bootstrapPayloadRequest()}}), data},
 		{"watermark", kv.EncodeWatermarkAdvance(42), data},
 		{"commit timestamp fence activation", kv.EncodeCommitTSFenceActivation(), data},
 		{"pin", kv.EncodeBackupPinEntry(pin), data},
@@ -92,12 +93,12 @@ func bootstrapPayloadFixtures(t testing.TB) []bootstrapPayloadCase {
 		{"release", kv.EncodeBackupReleaseEntry(kv.BackupReleaseEntry{PinID: pin.PinID}), data},
 		{"unreserve", kv.EncodeBackupUnreserveEntry(kv.BackupUnreserveEntry{PinID: pin.PinID}), data},
 		{"replicated backup", replicated, data},
-		{"import", bootstrapPayloadProto(t, bootstrapPayloadImport, &pb.ImportRangeVersionsRequest{JobId: 1}), data},
-		{"promote", bootstrapPayloadProto(t, bootstrapPayloadPromote, &pb.PromoteStagedVersionsRequest{JobId: 1}), data},
-		{"cleanup", bootstrapPayloadProto(t, bootstrapPayloadCleanup, &pb.CleanupMigrationRequest{JobId: 1, Mode: pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_METADATA}), data},
-		{"readiness", bootstrapPayloadProto(t, bootstrapPayloadReadiness, &pb.TargetStagedReadinessRequest{Armed: true}), data},
+		{"import", bootstrapPayloadProto(t, clusterbootstrap.BootstrapPayloadImport, &pb.ImportRangeVersionsRequest{JobId: 1}), data},
+		{"promote", bootstrapPayloadProto(t, clusterbootstrap.BootstrapPayloadPromote, &pb.PromoteStagedVersionsRequest{JobId: 1}), data},
+		{"cleanup", bootstrapPayloadProto(t, clusterbootstrap.BootstrapPayloadCleanup, &pb.CleanupMigrationRequest{JobId: 1, Mode: pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_METADATA}), data},
+		{"readiness", bootstrapPayloadProto(t, clusterbootstrap.BootstrapPayloadReadiness, &pb.TargetStagedReadinessRequest{Armed: true}), data},
 		{"retire", retire, data},
-		{"hlc", binary.BigEndian.AppendUint64([]byte{bootstrapPayloadHLC}, 1000), []raftadmission.Kind{raftadmission.HLC}},
+		{"hlc", binary.BigEndian.AppendUint64([]byte{clusterbootstrap.BootstrapPayloadHLC}, 1000), []raftadmission.Kind{raftadmission.HLC}},
 		{"tso allocation", binary.BigEndian.AppendUint64([]byte("\x07TSOF\x01"), 42), []raftadmission.Kind{raftadmission.Allocator}},
 		{"tso cutover", []byte("\x07TSOC\x01"), []raftadmission.Kind{raftadmission.Allocator}},
 		{"tso pending", binary.BigEndian.AppendUint64([]byte("\x07TSOP\x01"), 42), []raftadmission.Kind{raftadmission.Allocator}},
@@ -117,11 +118,11 @@ func TestBootstrapAdmissionPayloadLaneMatrix(t *testing.T) {
 	for _, tc := range bootstrapPayloadFixtures(t) {
 		t.Run(tc.name, func(t *testing.T) {
 			for _, kind := range bootstrapAdmissionKinds() {
-				err := validateBootstrapAdmissionPayload(kind, tc.payload)
+				err := clusterbootstrap.ValidateBootstrapAdmissionPayload(kind, tc.payload)
 				if slices.Contains(tc.kinds, kind) {
 					require.NoError(t, err, "kind %d", kind)
 				} else {
-					require.ErrorIs(t, err, errBootstrapAdmissionPayload, "kind %d", kind)
+					require.ErrorIs(t, err, clusterbootstrap.ErrBootstrapAdmissionPayload, "kind %d", kind)
 				}
 			}
 		})
@@ -133,12 +134,12 @@ func TestBootstrapAdmissionPayloadRejectsTrailingAndControlTruncation(t *testing
 	for _, tc := range bootstrapPayloadFixtures(t) {
 		t.Run(tc.name, func(t *testing.T) {
 			for _, kind := range tc.kinds {
-				require.ErrorIs(t, validateBootstrapAdmissionPayload(kind, append(bytes.Clone(tc.payload), 0)), errBootstrapAdmissionPayload)
+				require.ErrorIs(t, clusterbootstrap.ValidateBootstrapAdmissionPayload(kind, append(bytes.Clone(tc.payload), 0)), clusterbootstrap.ErrBootstrapAdmissionPayload)
 				if kind == raftadmission.Data || kind == raftadmission.Maintenance {
 					continue // Protobuf truncation at a field boundary can be a different complete data request.
 				}
 				for n := 0; n < len(tc.payload); n++ {
-					require.ErrorIs(t, validateBootstrapAdmissionPayload(kind, tc.payload[:n]), errBootstrapAdmissionPayload, "length %d", n)
+					require.ErrorIs(t, clusterbootstrap.ValidateBootstrapAdmissionPayload(kind, tc.payload[:n]), clusterbootstrap.ErrBootstrapAdmissionPayload, "length %d", n)
 				}
 			}
 		})
@@ -152,17 +153,17 @@ func TestBootstrapAdmissionPayloadRejectsUnknownAndUnsupportedControls(t *testin
 		candidate := bytes.Clone(guarded)
 		candidate[4] = byte(controlKind)
 		for _, lane := range bootstrapAdmissionKinds() {
-			require.ErrorIs(t, validateBootstrapAdmissionPayload(lane, candidate), errBootstrapAdmissionPayload)
+			require.ErrorIs(t, clusterbootstrap.ValidateBootstrapAdmissionPayload(lane, candidate), clusterbootstrap.ErrBootstrapAdmissionPayload)
 		}
 	}
 	for _, candidate := range [][]byte{nil, {}, {0xff}, {0x06}, {0x07}, {0x1f},
 		[]byte("\x07TSOF\x02"), []byte("\x07TSOX\x01"), {fsmwire.OpBootstrap, 1}, {fsmwire.OpRotation, 1},
-		bootstrapPayloadProto(t, bootstrapPayloadBatch, &pb.RaftCommand{}),
-		bootstrapPayloadProto(t, bootstrapPayloadSingle, &pb.Request{}),
-		bootstrapPayloadProto(t, bootstrapPayloadSingle, &pb.Request{Ts: 1}),
+		bootstrapPayloadProto(t, clusterbootstrap.BootstrapPayloadBatch, &pb.RaftCommand{}),
+		bootstrapPayloadProto(t, clusterbootstrap.BootstrapPayloadSingle, &pb.Request{}),
+		bootstrapPayloadProto(t, clusterbootstrap.BootstrapPayloadSingle, &pb.Request{Ts: 1}),
 	} {
 		for _, lane := range bootstrapAdmissionKinds() {
-			require.ErrorIs(t, validateBootstrapAdmissionPayload(lane, candidate), errBootstrapAdmissionPayload)
+			require.ErrorIs(t, clusterbootstrap.ValidateBootstrapAdmissionPayload(lane, candidate), clusterbootstrap.ErrBootstrapAdmissionPayload)
 		}
 	}
 }
@@ -179,17 +180,17 @@ func TestBootstrapAdmissionPayloadRejectsUnknownNestedFieldsAndEnums(t *testing.
 	rawPhase := bootstrapPayloadRequest()
 	rawPhase.Phase = pb.Phase_PREPARE
 	for name, payload := range map[string][]byte{
-		"nested unknown":       bootstrapPayloadProto(t, bootstrapPayloadSingle, request),
-		"batch nested unknown": bootstrapPayloadProto(t, bootstrapPayloadBatch, &pb.RaftCommand{Requests: []*pb.Request{bootstrapPayloadRequest(), request}}),
-		"phase":                bootstrapPayloadProto(t, bootstrapPayloadSingle, badPhase),
-		"operation":            bootstrapPayloadProto(t, bootstrapPayloadSingle, badOp),
-		"raw phase":            bootstrapPayloadProto(t, bootstrapPayloadSingle, rawPhase),
-		"mode":                 bootstrapPayloadProto(t, bootstrapPayloadCleanup, &pb.CleanupMigrationRequest{Mode: pb.MigrationCleanupMode(99)}),
-		"role":                 bootstrapPayloadProto(t, bootstrapPayloadCleanup, &pb.CleanupMigrationRequest{Ownership: &pb.MigrationOwnershipProof{Role: pb.MigrationOwnershipRole(99)}}),
+		"nested unknown":       bootstrapPayloadProto(t, clusterbootstrap.BootstrapPayloadSingle, request),
+		"batch nested unknown": bootstrapPayloadProto(t, clusterbootstrap.BootstrapPayloadBatch, &pb.RaftCommand{Requests: []*pb.Request{bootstrapPayloadRequest(), request}}),
+		"phase":                bootstrapPayloadProto(t, clusterbootstrap.BootstrapPayloadSingle, badPhase),
+		"operation":            bootstrapPayloadProto(t, clusterbootstrap.BootstrapPayloadSingle, badOp),
+		"raw phase":            bootstrapPayloadProto(t, clusterbootstrap.BootstrapPayloadSingle, rawPhase),
+		"mode":                 bootstrapPayloadProto(t, clusterbootstrap.BootstrapPayloadCleanup, &pb.CleanupMigrationRequest{Mode: pb.MigrationCleanupMode(99)}),
+		"role":                 bootstrapPayloadProto(t, clusterbootstrap.BootstrapPayloadCleanup, &pb.CleanupMigrationRequest{Ownership: &pb.MigrationOwnershipProof{Role: pb.MigrationOwnershipRole(99)}}),
 	} {
 		t.Run(name, func(t *testing.T) {
 			for _, lane := range bootstrapAdmissionKinds() {
-				require.ErrorIs(t, validateBootstrapAdmissionPayload(lane, payload), errBootstrapAdmissionPayload)
+				require.ErrorIs(t, clusterbootstrap.ValidateBootstrapAdmissionPayload(lane, payload), clusterbootstrap.ErrBootstrapAdmissionPayload)
 			}
 		})
 	}
@@ -197,39 +198,39 @@ func TestBootstrapAdmissionPayloadRejectsUnknownNestedFieldsAndEnums(t *testing.
 
 func TestBootstrapAdmissionPayloadRejectsAmbiguousProtobuf(t *testing.T) {
 	t.Parallel()
-	single := bootstrapPayloadProto(t, bootstrapPayloadSingle, bootstrapPayloadRequest())
-	batch := bootstrapPayloadProto(t, bootstrapPayloadBatch, &pb.RaftCommand{Requests: []*pb.Request{bootstrapPayloadRequest()}})
+	single := bootstrapPayloadProto(t, clusterbootstrap.BootstrapPayloadSingle, bootstrapPayloadRequest())
+	batch := bootstrapPayloadProto(t, clusterbootstrap.BootstrapPayloadBatch, &pb.RaftCommand{Requests: []*pb.Request{bootstrapPayloadRequest()}})
 	for _, payload := range [][]byte{
 		single[1:], batch[1:], // Legacy bare forms are not new-proposal codecs.
 		append(bytes.Clone(single), 0xf8, 0x07, 0x01), // Unknown top-level field.
 		append(bytes.Clone(single), 0x18, 0x0a),       // A trailing duplicate timestamp.
 		append(bytes.Clone(single), single[1:]...),    // Concatenated requests merge in lenient protobuf.
 	} {
-		require.ErrorIs(t, validateBootstrapAdmissionPayload(raftadmission.Data, payload), errBootstrapAdmissionPayload)
+		require.ErrorIs(t, clusterbootstrap.ValidateBootstrapAdmissionPayload(raftadmission.Data, payload), clusterbootstrap.ErrBootstrapAdmissionPayload)
 	}
 }
 
 func TestBootstrapAdmissionPayloadRejectsInvalidScalarsAndBackup(t *testing.T) {
 	t.Parallel()
 	for _, ceiling := range []uint64{0, uint64(1) << 48, ^uint64(0)} {
-		require.ErrorIs(t, validateBootstrapAdmissionPayload(raftadmission.HLC,
-			binary.BigEndian.AppendUint64([]byte{bootstrapPayloadHLC}, ceiling)), errBootstrapAdmissionPayload)
+		require.ErrorIs(t, clusterbootstrap.ValidateBootstrapAdmissionPayload(raftadmission.HLC,
+			binary.BigEndian.AppendUint64([]byte{clusterbootstrap.BootstrapPayloadHLC}, ceiling)), clusterbootstrap.ErrBootstrapAdmissionPayload)
 	}
 	for _, header := range []string{"\x07TSOF\x01", "\x07TSOD\x01", "\x07TSOP\x01"} {
 		for _, floor := range []uint64{0, ^uint64(0)} {
-			require.ErrorIs(t, validateBootstrapAdmissionPayload(raftadmission.Allocator,
-				binary.BigEndian.AppendUint64([]byte(header), floor)), errBootstrapAdmissionPayload)
+			require.ErrorIs(t, clusterbootstrap.ValidateBootstrapAdmissionPayload(raftadmission.Allocator,
+				binary.BigEndian.AppendUint64([]byte(header), floor)), clusterbootstrap.ErrBootstrapAdmissionPayload)
 		}
 	}
 	for _, subtype := range []byte{0, 9, 255} {
-		require.ErrorIs(t, validateBootstrapAdmissionPayload(raftadmission.Data, []byte{bootstrapPayloadBackup, subtype}), errBootstrapAdmissionPayload)
+		require.ErrorIs(t, clusterbootstrap.ValidateBootstrapAdmissionPayload(raftadmission.Data, []byte{clusterbootstrap.BootstrapPayloadBackup, subtype}), clusterbootstrap.ErrBootstrapAdmissionPayload)
 	}
 	command, err := kv.EncodeReplicatedBackupCommand(kv.ReplicatedBackupCommand{Operation: kv.ReplicatedBackupAllocate, Identity: kv.BackupIdentity{Epoch: 1}})
 	require.NoError(t, err)
 	for _, offset := range []int{1, 2} {
 		invalid := bytes.Clone(command)
 		invalid[offset] = 255
-		require.ErrorIs(t, validateBootstrapAdmissionPayload(raftadmission.Data, invalid), errBootstrapAdmissionPayload)
+		require.ErrorIs(t, clusterbootstrap.ValidateBootstrapAdmissionPayload(raftadmission.Data, invalid), clusterbootstrap.ErrBootstrapAdmissionPayload)
 	}
 }
 
@@ -241,7 +242,7 @@ func TestBootstrapAdmissionPayloadRejectsOpaqueEncryptedNativeFrame(t *testing.T
 	encoded, err := envelope.Encode()
 	require.NoError(t, err)
 	for _, lane := range bootstrapAdmissionKinds() {
-		require.ErrorIs(t, validateBootstrapAdmissionPayload(lane, encoded), errBootstrapAdmissionPayload)
+		require.ErrorIs(t, clusterbootstrap.ValidateBootstrapAdmissionPayload(lane, encoded), clusterbootstrap.ErrBootstrapAdmissionPayload)
 	}
 }
 
@@ -253,12 +254,12 @@ func FuzzBootstrapAdmissionPayload(f *testing.F) {
 	}
 	f.Fuzz(func(t *testing.T, kind byte, payload []byte) {
 		original := bytes.Clone(payload)
-		err := validateBootstrapAdmissionPayload(raftadmission.Kind(kind), payload)
+		err := clusterbootstrap.ValidateBootstrapAdmissionPayload(raftadmission.Kind(kind), payload)
 		require.Equal(t, original, payload)
 		if err == nil {
 			require.NotContains(t, []byte{0, 255}, kind, "unexpected open lane %d", kind)
 			if raftadmission.Kind(kind) == raftadmission.Rotation {
-				require.NoError(t, validateBootstrapRotationPayload(payload))
+				require.NoError(t, clusterbootstrap.ValidateBootstrapRotationPayload(payload))
 			}
 			if raftadmission.Kind(kind) == raftadmission.Recovery {
 				_, matched, parseErr := raftbootstrap.ParseActivationCommand(payload)

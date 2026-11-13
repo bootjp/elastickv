@@ -8,9 +8,11 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/adapter"
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryption/encryptiontest"
 	"github.com/bootjp/elastickv/internal/encryption/fsmwire"
+	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/internal/raftadmission"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -48,35 +50,35 @@ func TestBootstrapRotationPayloadExactGrantPlainAndEncrypted(t *testing.T) {
 
 func assertBootstrapRotationGrant(t *testing.T, plain []byte) {
 	t.Helper()
-	grant, err := newBootstrapRotationPayloadGrant(17, plain)
+	grant, err := clusterbootstrap.NewBootstrapRotationPayloadGrant(17, plain)
 	require.NoError(t, err)
 	encrypted, wrap := bootstrapEncryptedPayloadFixture(t, 17, grant)
-	unwrapped, err := newBootstrapPayloadProjection(17, 1, nil, 0, false, grant)
+	unwrapped, err := clusterbootstrap.NewBootstrapPayloadProjection(17, 1, nil, 0, false, grant)
 	require.NoError(t, err)
 	final, err := wrap(plain)
 	require.NoError(t, err)
 	for _, fixture := range []struct {
-		projection bootstrapPayloadProjection
+		projection clusterbootstrap.BootstrapPayloadProjection
 		payload    []byte
 	}{{encrypted, final}, {unwrapped, plain}} {
-		_, err := validateBootstrapFinalPayload(raftbootstrap.UUID{1}, raftadmission.Rotation, 17, fixture.payload, fixture.projection)
+		_, err := clusterbootstrap.ValidateBootstrapFinalPayload(raftbootstrap.UUID{1}, raftadmission.Rotation, 17, fixture.payload, fixture.projection)
 		require.NoError(t, err)
 		for _, lane := range []raftadmission.Kind{raftadmission.Data, raftadmission.Control, raftadmission.Registration, raftadmission.Recovery, raftadmission.Catalog, raftadmission.HLC, raftadmission.Allocator} {
-			_, err := validateBootstrapFinalPayload(raftbootstrap.UUID{1}, lane, 17, fixture.payload, fixture.projection)
-			require.ErrorIs(t, err, errBootstrapAdmissionPayload)
+			_, err := clusterbootstrap.ValidateBootstrapFinalPayload(raftbootstrap.UUID{1}, lane, 17, fixture.payload, fixture.projection)
+			require.ErrorIs(t, err, clusterbootstrap.ErrBootstrapAdmissionPayload)
 		}
-		fixture.projection.rotationRecipes = nil
-		_, err = validateBootstrapFinalPayload(raftbootstrap.UUID{1}, raftadmission.Rotation, 17, fixture.payload, fixture.projection)
-		require.ErrorIs(t, err, errBootstrapRotationRecipe)
+		fixture.projection.RotationRecipes = nil
+		_, err = clusterbootstrap.ValidateBootstrapFinalPayload(raftbootstrap.UUID{1}, raftadmission.Rotation, 17, fixture.payload, fixture.projection)
+		require.ErrorIs(t, err, clusterbootstrap.ErrBootstrapRotationRecipe)
 	}
-	require.ErrorIs(t, bootstrapPayloadValidator(raftbootstrap.UUID{1})(raftadmission.Rotation, 17, plain), errBootstrapRotationRecipe,
+	require.ErrorIs(t, clusterbootstrap.BootstrapPayloadValidator(raftbootstrap.UUID{1})(raftadmission.Rotation, 17, plain), clusterbootstrap.ErrBootstrapRotationRecipe,
 		"legacy validator must remain closed without an explicitly owned rotation recipe")
 }
 
 func TestBootstrapRotationPayloadGrantRejectsDifferentCompleteRecipe(t *testing.T) {
 	t.Parallel()
 	rotation := bootstrapTestRotation()
-	grant, err := newBootstrapRotationPayloadGrant(17, bootstrapTestRotationFrame(rotation))
+	grant, err := clusterbootstrap.NewBootstrapRotationPayloadGrant(17, bootstrapTestRotationFrame(rotation))
 	require.NoError(t, err)
 	projection, wrap := bootstrapEncryptedPayloadFixture(t, 17, grant)
 	for name, mutate := range map[string]func(*fsmwire.RotationPayload){
@@ -91,20 +93,20 @@ func TestBootstrapRotationPayloadGrantRejectsDifferentCompleteRecipe(t *testing.
 			candidate.Wrapped = bytes.Clone(rotation.Wrapped)
 			mutate(&candidate)
 			plain := bootstrapTestRotationFrame(candidate)
-			require.NoError(t, validateBootstrapRotationPayload(plain), "changed recipe is still a structurally valid rotation")
+			require.NoError(t, clusterbootstrap.ValidateBootstrapRotationPayload(plain), "changed recipe is still a structurally valid rotation")
 			final, err := wrap(plain)
 			require.NoError(t, err)
-			_, err = validateBootstrapFinalPayload(raftbootstrap.UUID{1}, raftadmission.Rotation, 17, final, projection)
-			require.ErrorIs(t, err, errBootstrapRotationRecipe)
+			_, err = clusterbootstrap.ValidateBootstrapFinalPayload(raftbootstrap.UUID{1}, raftadmission.Rotation, 17, final, projection)
+			require.ErrorIs(t, err, clusterbootstrap.ErrBootstrapRotationRecipe)
 		})
 	}
-	_, err = newBootstrapPayloadProjection(18, 1, nil, 0, false, grant)
-	require.ErrorIs(t, err, errBootstrapRotationRecipe)
-	grants := []bootstrapRotationPayloadGrant{grant}
-	plainProjection, err := newBootstrapPayloadProjection(17, 1, nil, 0, false, grants...)
+	_, err = clusterbootstrap.NewBootstrapPayloadProjection(18, 1, nil, 0, false, grant)
+	require.ErrorIs(t, err, clusterbootstrap.ErrBootstrapRotationRecipe)
+	grants := []clusterbootstrap.BootstrapRotationPayloadGrant{grant}
+	plainProjection, err := clusterbootstrap.NewBootstrapPayloadProjection(17, 1, nil, 0, false, grants...)
 	require.NoError(t, err)
-	grants[0] = bootstrapRotationPayloadGrant{}
-	_, err = validateBootstrapFinalPayload(raftbootstrap.UUID{1}, raftadmission.Rotation, 17, bootstrapTestRotationFrame(rotation), plainProjection)
+	grants[0] = clusterbootstrap.BootstrapRotationPayloadGrant{}
+	_, err = clusterbootstrap.ValidateBootstrapFinalPayload(raftbootstrap.UUID{1}, raftadmission.Rotation, 17, bootstrapTestRotationFrame(rotation), plainProjection)
 	require.NoError(t, err, "projection must not borrow a caller-mutable grant slice")
 }
 
@@ -124,19 +126,19 @@ func TestBootstrapRotationPayloadRejectsInvalidFrames(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			candidate := rotation
 			mutate(&candidate)
-			_, err := newBootstrapRotationPayloadGrant(17, bootstrapTestRotationFrame(candidate))
-			require.ErrorIs(t, err, errBootstrapAdmissionPayload)
+			_, err := clusterbootstrap.NewBootstrapRotationPayloadGrant(17, bootstrapTestRotationFrame(candidate))
+			require.ErrorIs(t, err, clusterbootstrap.ErrBootstrapAdmissionPayload)
 		})
 	}
 	valid := bootstrapTestRotationFrame(rotation)
 	for length := range len(valid) {
-		require.ErrorIs(t, validateBootstrapRotationPayload(valid[:length]), errBootstrapAdmissionPayload)
+		require.ErrorIs(t, clusterbootstrap.ValidateBootstrapRotationPayload(valid[:length]), clusterbootstrap.ErrBootstrapAdmissionPayload)
 	}
-	require.ErrorIs(t, validateBootstrapRotationPayload(append(bytes.Clone(valid), 0)), errBootstrapAdmissionPayload)
+	require.ErrorIs(t, clusterbootstrap.ValidateBootstrapRotationPayload(append(bytes.Clone(valid), 0)), clusterbootstrap.ErrBootstrapAdmissionPayload)
 	for _, opcode := range []byte{fsmwire.OpBootstrap, fsmwire.OpRegistration, 0x06, 0xff} {
 		candidate := bytes.Clone(valid)
 		candidate[0] = opcode
-		require.ErrorIs(t, validateBootstrapRotationPayload(candidate), errBootstrapAdmissionPayload)
+		require.ErrorIs(t, clusterbootstrap.ValidateBootstrapRotationPayload(candidate), clusterbootstrap.ErrBootstrapAdmissionPayload)
 	}
 }
 
@@ -153,38 +155,38 @@ func (e *bootstrapEncryptedCaptureEngine) ProposeAdmin(_ context.Context, payloa
 func TestBootstrapRotationRequestGrantMatchesActualAdminAndDynamicWrap(t *testing.T) {
 	t.Parallel()
 	request := &pb.RotateDEKRequest{NewDekId: 9, Purpose: pb.RotateDEKRequest_PURPOSE_RAFT, WrappedNewDek: []byte("fixed wrapped DEK"), ProposerNodeId: 42, ProposerLocalEpoch: 7}
-	grants, err := bootstrapRotationPayloadGrants(17, request)
+	grants, err := clusterbootstrap.BootstrapRotationPayloadGrants(17, request)
 	require.NoError(t, err)
 	cipher := encryptiontest.NewCipher(t, bootstrapEncryptedTestKey)
 	var cutover atomic.Uint64
-	runtime, err := newRaftEnvelopeRuntime(cipher, encryptiontest.NewNonceFactory(t), 1, bootstrapEncryptedTestKey, &cutover, 7, 42, nil)
+	runtime, err := encryptionwiring.NewRaftEnvelopeRuntime(cipher, encryptiontest.NewNonceFactory(t), 1, bootstrapEncryptedTestKey, &cutover, 7, 42, nil)
 	require.NoError(t, err)
 	engine := &bootstrapEncryptedCaptureEngine{}
 	shard := &kv.ShardGroup{Engine: engine}
 	shard.Txn = kv.NewLeaderProxyForShardGroup(shard)
-	runtime.attachGroup(17, shard)
+	runtime.AttachGroup(17, shard)
 	admin := adapter.NewEncryptionAdminServer(adapter.WithEncryptionAdminProposer(shard.Proposer()), adapter.WithEncryptionAdminLeaderView(rotateStartupLeader{}))
 	_, err = admin.RotateDEK(t.Context(), request)
 	require.NoError(t, err)
-	projection, err := newBootstrapPayloadProjection(17, 1, cipher, bootstrapEncryptedTestKey, true, grants...)
+	projection, err := clusterbootstrap.NewBootstrapPayloadProjection(17, 1, cipher, bootstrapEncryptedTestKey, true, grants...)
 	require.NoError(t, err)
-	_, err = validateBootstrapFinalPayload(raftbootstrap.UUID{1}, raftadmission.Rotation, 17, engine.final, projection)
+	_, err = clusterbootstrap.ValidateBootstrapFinalPayload(raftbootstrap.UUID{1}, raftadmission.Rotation, 17, engine.final, projection)
 	require.NoError(t, err)
 	actual, err := encryption.UnwrapRaftPayload(cipher, engine.final)
 	require.NoError(t, err)
-	expected, err := bootstrapRotationPayloadFromRequest(request)
+	expected, err := clusterbootstrap.BootstrapRotationPayloadFromRequest(request)
 	require.NoError(t, err)
 	require.Equal(t, expected, actual)
 	for _, bad := range []*pb.RotateDEKRequest{nil,
 		{Purpose: pb.RotateDEKRequest_PURPOSE_RAFT, NewDekId: 1, WrappedNewDek: []byte{1}, ProposerNodeId: 42, ProposerLocalEpoch: math.MaxUint16 + 1},
 		{Purpose: pb.RotateDEKRequest_Purpose(99)},
 	} {
-		_, err := bootstrapRotationPayloadFromRequest(bad)
+		_, err := clusterbootstrap.BootstrapRotationPayloadFromRequest(bad)
 		require.Error(t, err)
 	}
 	unknown, ok := proto.Clone(request).(*pb.RotateDEKRequest)
 	require.True(t, ok)
 	unknown.ProtoReflect().SetUnknown([]byte{0xf8, 0x07, 1})
-	_, err = bootstrapRotationPayloadFromRequest(unknown)
-	require.ErrorIs(t, err, errBootstrapRotationRecipe)
+	_, err = clusterbootstrap.BootstrapRotationPayloadFromRequest(unknown)
+	require.ErrorIs(t, err, clusterbootstrap.ErrBootstrapRotationRecipe)
 }

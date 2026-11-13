@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/peersession"
 	"github.com/bootjp/elastickv/internal/raftadmission"
@@ -30,7 +31,7 @@ func enablementFactory() *etcd.Factory {
 	return etcd.NewFactory(etcd.FactoryConfig{TickInterval: 20 * time.Millisecond, HeartbeatTick: 1, ElectionTick: 10})
 }
 
-func enablementPeerConfig(t *testing.T) (bootstrapPeerJSON, *bootstrapPeerConfig) {
+func enablementPeerConfig(t *testing.T) (clusterbootstrap.BootstrapPeerJSON, *clusterbootstrap.BootstrapPeerConfig) {
 	t.Helper()
 	raw := bootstrapConfigFixture(t)
 	raw.Local = etcd.DeriveNodeID("n1")
@@ -56,7 +57,7 @@ func enablementLegacyCut(t *testing.T, base string, group noderuntime.GroupSpec)
 	t.Cleanup(runtime.Close)
 	require.Eventually(t, func() bool { return runtime.Engine.State() == raftengine.StateLeader }, enablementE2EWait, 10*time.Millisecond)
 	enablementLegacyPut(t, runtime.Engine, clock.Next(), "legacy-key", "original-value")
-	catalog, err := setupDistributionCatalog(t.Context(), []*raftGroupRuntime{runtime}, routes)
+	catalog, err := setupDistributionCatalog(t.Context(), []*clusterbootstrap.GroupRuntime{runtime}, routes)
 	require.NoError(t, err)
 	snapshot, err := catalog.Snapshot(t.Context())
 	require.NoError(t, err)
@@ -81,7 +82,7 @@ func enablementLegacyPut(t *testing.T, engine raftengine.Engine, ts uint64, key,
 	require.NoError(t, err)
 }
 
-func enablementSignedBaseline(t *testing.T, dir string, cfg *bootstrapPeerConfig, group noderuntime.GroupSpec) raftbootstrap.BaselineManifest {
+func enablementSignedBaseline(t *testing.T, dir string, cfg *clusterbootstrap.BootstrapPeerConfig, group noderuntime.GroupSpec) raftbootstrap.BaselineManifest {
 	t.Helper()
 	ownership, err := etcd.AcquireOfflineBaselineOwnership(dir)
 	require.NoError(t, err)
@@ -89,51 +90,51 @@ func enablementSignedBaseline(t *testing.T, dir string, cfg *bootstrapPeerConfig
 	source, err := etcd.ReadOfflineBaselineWALSource(t.Context(), dir, ownership)
 	require.NoError(t, err)
 	defer func() { require.NoError(t, source.Snapshot.Close()) }()
-	proof, err := bootstrapOfflineDataStoreProbe(t.Context(), dir)
+	proof, err := clusterbootstrap.BootstrapOfflineDataStoreProbe(t.Context(), dir)
 	require.NoError(t, err)
 	require.Equal(t, source.CommitIndex, proof.AppliedIndex)
 	require.Equal(t, source.CommitIndex, source.LastLogIndex, "all members must remain quiesced")
 	configuration := raftbootstrap.Configuration{Index: source.ConfigurationIndex,
 		State: raftbootstrap.ConfState{Voters: source.Configuration.GetVoters(), VotersOutgoing: source.Configuration.GetVotersOutgoing(),
 			Learners: source.Configuration.GetLearners(), LearnersNext: source.Configuration.GetLearnersNext(), AutoLeave: source.Configuration.GetAutoLeave()},
-		Members: []raftbootstrap.Member{{ID: cfg.local.Member, Address: cfg.local.Address, PublicKeyDigest: cfg.local.Key}}}
+		Members: []raftbootstrap.Member{{ID: cfg.Local.Member, Address: cfg.Local.Address, PublicKeyDigest: cfg.Local.Key}}}
 	cut := raftbootstrap.BaselineContext{Version: raftbootstrap.BaselineVersion,
-		Identity: raftbootstrap.Identity{Cluster: cfg.local.Cluster, Group: group.ID}, OperationID: raftbootstrap.OperationID{71},
+		Identity: raftbootstrap.Identity{Cluster: cfg.Local.Cluster, Group: group.ID}, OperationID: raftbootstrap.OperationID{71},
 		Configuration: configuration, Minimum: raftbootstrap.Versions{Entry: 1, Snapshot: 1, Session: 1},
 		CommitIndex: source.CommitIndex, CommitTerm: source.CommitTerm, Watermark: proof.Watermark, DataDigest: proof.DataDigest}
 	inspection, err := etcd.InspectOfflineBaseline(t.Context(), etcd.OfflineBaselineOptions{Ownership: ownership, DataDir: dir,
-		MemberID: cfg.local.Member, Expected: cut, ProbeStore: func(ctx context.Context) (etcd.BaselineStoreProof, error) {
-			return bootstrapOfflineDataStoreProbe(ctx, dir)
+		MemberID: cfg.Local.Member, Expected: cut, ProbeStore: func(ctx context.Context) (etcd.BaselineStoreProof, error) {
+			return clusterbootstrap.BootstrapOfflineDataStoreProbe(ctx, dir)
 		}})
 	require.NoError(t, err)
-	signer, ok := cfg.clientTLS.Certificates[0].PrivateKey.(crypto.Signer)
+	signer, ok := cfg.ClientTLS.Certificates[0].PrivateKey.(crypto.Signer)
 	require.True(t, ok)
 	probe, err := raftbootstrap.SignBaselineProbe(raftbootstrap.BaselineProbe{BaselineContext: cut, Evidence: inspection.Evidence}, signer)
 	require.NoError(t, err)
 	return raftbootstrap.BaselineManifest{BaselineContext: cut, Members: []raftbootstrap.BaselineMemberEvidence{probe.Evidence}}
 }
 
-func enablementMigrateAndCertify(t *testing.T, dir string, cfg *bootstrapPeerConfig, manifest raftbootstrap.BaselineManifest) []byte {
+func enablementMigrateAndCertify(t *testing.T, dir string, cfg *clusterbootstrap.BootstrapPeerConfig, manifest raftbootstrap.BaselineManifest) []byte {
 	t.Helper()
 	before := offlineDataFiles(t, dir)
-	request := bootstrapBaselineCLIRequest{Command: "prepare", RaftDataDir: dir, MemberID: cfg.local.Member, OperationID: manifest.OperationID}
-	prepared, err := executeBootstrapMigration(t.Context(), request, manifest.BaselineContext, manifest)
+	request := clusterbootstrap.BootstrapBaselineCLIRequest{Command: "prepare", RaftDataDir: dir, MemberID: cfg.Local.Member, OperationID: manifest.OperationID}
+	prepared, err := clusterbootstrap.ExecuteBootstrapMigration(t.Context(), request, manifest.BaselineContext, manifest)
 	require.NoError(t, err)
 	require.Equal(t, "prepared", prepared.Phase)
 	require.Equal(t, before, offlineDataFiles(t, prepared.BackupDir), "backup must preserve every original file exactly")
 	backup := offlineDataFiles(t, prepared.BackupDir)
 	request.Command = "resume"
-	bound, err := executeBootstrapMigration(t.Context(), request, manifest.BaselineContext, manifest)
+	bound, err := clusterbootstrap.ExecuteBootstrapMigration(t.Context(), request, manifest.BaselineContext, manifest)
 	require.NoError(t, err)
 	require.Equal(t, "bound", bound.Phase)
-	again, err := executeBootstrapMigration(t.Context(), request, manifest.BaselineContext, manifest)
+	again, err := clusterbootstrap.ExecuteBootstrapMigration(t.Context(), request, manifest.BaselineContext, manifest)
 	require.NoError(t, err)
 	require.Equal(t, bound, again)
 	require.Equal(t, backup, offlineDataFiles(t, bound.BackupDir))
 	ownership, err := etcd.AcquireOfflineBaselineOwnership(dir)
 	require.NoError(t, err)
 	defer func() { require.NoError(t, ownership.Close()) }()
-	options, err := bootstrapOfflineOptions(request, manifest.BaselineContext, manifest, ownership)
+	options, err := clusterbootstrap.BootstrapOfflineOptions(request, manifest.BaselineContext, manifest, ownership)
 	require.NoError(t, err)
 	evidence, err := etcd.VerifyOfflineBaselinePrepared(t.Context(), options, manifest)
 	require.NoError(t, err, "ready ACK must follow final native/marker/store verification")
@@ -146,18 +147,18 @@ func enablementMigrateAndCertify(t *testing.T, dir string, cfg *bootstrapPeerCon
 	require.Equal(t, raftbootstrap.MarkerRequired, inspection.Marker)
 	require.NotNil(t, inspection.Intent)
 	require.Equal(t, raftbootstrap.Floor{}, inspection.Intent.Floor)
-	ack, err := signBootstrapPreparedAck(cfg, manifest, cfg.local.Member, evidence.DurableProofDigest)
+	ack, err := clusterbootstrap.SignBootstrapPreparedAck(cfg, manifest, cfg.Local.Member, evidence.DurableProofDigest)
 	require.NoError(t, err)
-	encoded, err := marshalBootstrapPreparedAck(ack, manifest)
+	encoded, err := clusterbootstrap.MarshalBootstrapPreparedAck(ack, manifest)
 	require.NoError(t, err)
-	payload, err := assembleBootstrapActivation(manifest, manifest.BaselineContext, [][]byte{encoded})
+	payload, err := clusterbootstrap.AssembleBootstrapActivation(manifest, manifest.BaselineContext, [][]byte{encoded})
 	require.NoError(t, err)
 	return payload
 }
 
 type enablementProtectedNode struct {
-	runtime    *raftGroupRuntime
-	domain     *bootstrapDomain
+	runtime    *clusterbootstrap.GroupRuntime
+	domain     *clusterbootstrap.BootstrapDomain
 	coordinate *kv.ShardedCoordinator
 	shards     *kv.ShardStore
 	close      func()
@@ -166,9 +167,9 @@ type enablementProtectedNode struct {
 func enablementStartProtected(t *testing.T, base, peerConfigDir string, group noderuntime.GroupSpec) *enablementProtectedNode {
 	t.Helper()
 	bootstrapCfg := noderuntime.BootstrapConfig{PeerConfigDir: peerConfigDir}
-	specs, domain, err := loadProtectedBootstrapDomain("n1", base, []noderuntime.GroupSpec{group}, false, bootstrapCfg)
+	specs, domain, err := clusterbootstrap.LoadProtectedBootstrapDomain("n1", base, []noderuntime.GroupSpec{group}, false, bootstrapCfg)
 	require.NoError(t, err)
-	t.Cleanup(domain.admission.Close)
+	t.Cleanup(domain.Admission.Close)
 	routes := distribution.NewEngine()
 	routes.UpdateRoute(nil, nil, group.ID)
 	clock := kv.NewHLC()
@@ -180,7 +181,7 @@ func enablementStartProtected(t *testing.T, base, peerConfigDir string, group no
 	// No data root may enter before the catalog-loaded publication. This also
 	// applies on restart with retained P; native identity alone is insufficient.
 	for _, kind := range []raftadmission.Kind{raftadmission.Data, raftadmission.Maintenance} {
-		_, op, err := domain.admission.Begin(t.Context(), kind)
+		_, op, err := domain.Admission.Begin(t.Context(), kind)
 		if op != nil {
 			op.CancelAndJoin()
 		}
@@ -188,13 +189,13 @@ func enablementStartProtected(t *testing.T, base, peerConfigDir string, group no
 	}
 	groups := map[uint64]*kv.ShardGroup{group.ID: shard}
 	shards := kv.NewShardStore(routes, groups)
-	shards.SetOperationAdmission(domain.operationAdmission)
-	coordinate := kv.NewShardedCoordinator(routes, groups, group.ID, clock, shards).WithOperationAdmission(domain.operationAdmission)
+	shards.SetOperationAdmission(domain.OperationAdmission)
+	coordinate := kv.NewShardedCoordinator(routes, groups, group.ID, clock, shards).WithOperationAdmission(domain.OperationAdmission)
 	ctx, cancel := context.WithCancel(t.Context())
 	eg, runCtx := errgroup.WithContext(ctx)
-	startBootstrapActivationWorkers(runCtx, eg, []*raftGroupRuntime{runtime}, groups)
-	catalog := distributionCatalogStoreForGroup([]*raftGroupRuntime{runtime}, group.ID)
-	startBootstrapReadinessReconciler(runCtx, eg, []*raftGroupRuntime{runtime}, catalog, routes)
+	clusterbootstrap.StartBootstrapActivationWorkers(runCtx, eg, []*clusterbootstrap.GroupRuntime{runtime}, groups)
+	catalog := distributionCatalogStoreForGroup([]*clusterbootstrap.GroupRuntime{runtime}, group.ID)
+	clusterbootstrap.StartBootstrapReadinessReconciler(runCtx, eg, []*clusterbootstrap.GroupRuntime{runtime}, catalog, routes)
 	var once sync.Once
 	node := &enablementProtectedNode{runtime: runtime, domain: domain, coordinate: coordinate, shards: shards}
 	node.close = func() {
@@ -202,14 +203,14 @@ func enablementStartProtected(t *testing.T, base, peerConfigDir string, group no
 			cancel()
 			require.NoError(t, eg.Wait())
 			require.NoError(t, coordinate.Close())
-			domain.admission.Close()
+			domain.Admission.Close()
 			runtime.Close()
 		})
 	}
 	t.Cleanup(node.close)
 	require.Eventually(t, func() bool { return runtime.PublicReady() }, enablementE2EWait, 10*time.Millisecond,
 		"activation/recovery/catalog must reach DataReady without synthetic publication")
-	require.Equal(t, peersession.DataReady, domain.admission.Stage(group.ID))
+	require.Equal(t, peersession.DataReady, domain.Admission.Stage(group.ID))
 	snapshot, err := catalog.Snapshot(t.Context())
 	require.NoError(t, err)
 	require.NotZero(t, snapshot.Version)
@@ -221,11 +222,11 @@ func enablementRead(t *testing.T, node *enablementProtectedNode, key, value stri
 	t.Helper()
 	// Match adapter direct reads: root ownership precedes target routing and
 	// depends on ALL local protected groups. Never refresh a stale owner here.
-	ctx, op, err := node.domain.admission.Begin(t.Context(), raftadmission.Data)
+	ctx, op, err := node.domain.Admission.Begin(t.Context(), raftadmission.Data)
 	require.NoError(t, err)
 	defer op.CancelAndJoin()
 	got, err := node.shards.GetAt(ctx, []byte(key), ^uint64(0))
-	err = finishBootstrapIngress(op, err)
+	err = clusterbootstrap.FinishBootstrapIngress(op, err)
 	require.NoError(t, err)
 	require.Equal(t, value, string(got))
 }
@@ -234,7 +235,7 @@ func TestBootstrapEnablementLegacyDataToProtectedDataReady(t *testing.T) {
 	t.Setenv("ELASTICKV_RAFT_SNAPSHOT_COUNT", "1")
 	base := t.TempDir()
 	raw, cfg := enablementPeerConfig(t)
-	group := noderuntime.GroupSpec{ID: 1, Address: cfg.local.Address}
+	group := noderuntime.GroupSpec{ID: 1, Address: cfg.Local.Address}
 	dir := enablementLegacyCut(t, base, group)
 	manifest := enablementSignedBaseline(t, dir, cfg, group)
 	payload := enablementMigrateAndCertify(t, dir, cfg, manifest)

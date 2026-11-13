@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
@@ -12,22 +13,22 @@ import (
 )
 
 func TestCommitTSFenceRuntimesReady(t *testing.T) {
-	domain := &bootstrapDomain{}
+	domain := &clusterbootstrap.BootstrapDomain{}
 	ready := func() bool { return true }
 	blocked := func() bool { return false }
 	cases := []struct {
 		name     string
-		runtimes []*raftGroupRuntime
+		runtimes []*clusterbootstrap.GroupRuntime
 		want     bool
 	}{
 		{name: "no runtimes"},
-		{name: "nil runtime", runtimes: []*raftGroupRuntime{nil}},
-		{name: "legacy runtime", runtimes: []*raftGroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{PublicReady: ready}}}},
-		{name: "missing callback", runtimes: []*raftGroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{}, bootstrapDomain: domain}}},
-		{name: "not ready", runtimes: []*raftGroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{PublicReady: blocked}, bootstrapDomain: domain}}},
-		{name: "mixed domains", runtimes: []*raftGroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{PublicReady: ready}, bootstrapDomain: domain}, {GroupRuntime: &noderuntime.GroupRuntime{PublicReady: ready}, bootstrapDomain: &bootstrapDomain{}}}},
-		{name: "missing group", runtimes: []*raftGroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{PublicReady: ready}, bootstrapDomain: domain}, nil}},
-		{name: "all protected groups ready", runtimes: []*raftGroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{PublicReady: ready}, bootstrapDomain: domain}, {GroupRuntime: &noderuntime.GroupRuntime{PublicReady: ready}, bootstrapDomain: domain}}, want: true},
+		{name: "nil runtime", runtimes: []*clusterbootstrap.GroupRuntime{nil}},
+		{name: "legacy runtime", runtimes: []*clusterbootstrap.GroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{PublicReady: ready}}}},
+		{name: "missing callback", runtimes: []*clusterbootstrap.GroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{}, BootstrapDomain: domain}}},
+		{name: "not ready", runtimes: []*clusterbootstrap.GroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{PublicReady: blocked}, BootstrapDomain: domain}}},
+		{name: "mixed domains", runtimes: []*clusterbootstrap.GroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{PublicReady: ready}, BootstrapDomain: domain}, {GroupRuntime: &noderuntime.GroupRuntime{PublicReady: ready}, BootstrapDomain: &clusterbootstrap.BootstrapDomain{}}}},
+		{name: "missing group", runtimes: []*clusterbootstrap.GroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{PublicReady: ready}, BootstrapDomain: domain}, nil}},
+		{name: "all protected groups ready", runtimes: []*clusterbootstrap.GroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{PublicReady: ready}, BootstrapDomain: domain}, {GroupRuntime: &noderuntime.GroupRuntime{PublicReady: ready}, BootstrapDomain: domain}}, want: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -37,16 +38,16 @@ func TestCommitTSFenceRuntimesReady(t *testing.T) {
 }
 
 func TestPublicGateWaitsForEveryCommitTSFenceActivation(t *testing.T) {
-	runtimes := make([]*raftGroupRuntime, 2)
+	runtimes := make([]*clusterbootstrap.GroupRuntime, 2)
 	fsms := make([]kv.FSM, 2)
 	for i := range runtimes {
 		st, err := store.NewPebbleStore(t.TempDir())
 		require.NoError(t, err)
 		t.Cleanup(func() { require.NoError(t, st.Close()) })
-		runtimes[i] = &raftGroupRuntime{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: uint64(i + 1)}, Store: st}}
+		runtimes[i] = &clusterbootstrap.GroupRuntime{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: uint64(i + 1)}, Store: st}}
 		fsms[i] = kv.NewKvFSMWithHLC(st, kv.NewHLC())
 	}
-	gate := &startupPublicKVGate{}
+	gate := &clusterbootstrap.StartupPublicKVGate{}
 	active, err := commitTSFenceRuntimesActive(t.Context(), runtimes)
 	require.NoError(t, err)
 	require.False(t, active)
@@ -62,24 +63,24 @@ func TestPublicGateWaitsForEveryCommitTSFenceActivation(t *testing.T) {
 	select {
 	case err := <-done:
 		t.Fatalf("gate opened before all groups activated: %v", err)
-	case <-time.After(2 * bootstrapReadinessRetryInterval):
+	case <-time.After(2 * clusterbootstrap.BootstrapReadinessRetryInterval):
 	}
-	require.True(t, gate.blocked())
+	require.True(t, gate.Blocked())
 	require.Nil(t, fsms[1].Apply(kv.EncodeCommitTSFenceActivation()))
 	require.NoError(t, <-done)
-	require.False(t, gate.blocked())
+	require.False(t, gate.Blocked())
 }
 
 func TestCommitTSFenceActivationWaitFailsClosed(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	require.ErrorIs(t, waitForCommitTSFenceActivation(ctx, nil), context.Canceled)
-	require.ErrorIs(t, waitForCommitTSFenceActivation(ctx, []*raftGroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{}}}), context.Canceled)
-	gate := &startupPublicKVGate{}
+	require.ErrorIs(t, waitForCommitTSFenceActivation(ctx, []*clusterbootstrap.GroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{}}}), context.Canceled)
+	gate := &clusterbootstrap.StartupPublicKVGate{}
 	require.ErrorIs(t, markPublicGateReadyAfterCommitTSFence(ctx, gate, nil, true), context.Canceled)
-	require.True(t, gate.blocked())
+	require.True(t, gate.Blocked())
 	require.NoError(t, markPublicGateReadyAfterCommitTSFence(ctx, gate, nil, false))
-	require.False(t, gate.blocked())
+	require.False(t, gate.Blocked())
 }
 
 // The dedicated TSO group never applies the KV activation entry: its runtime
@@ -87,20 +88,20 @@ func TestCommitTSFenceActivationWaitFailsClosed(t *testing.T) {
 // coordinator never proposes the marker there. Readiness must only wait for
 // the KV data groups, but it must still require at least one of them.
 func TestCommitTSFenceReadinessIgnoresDedicatedTSOGroup(t *testing.T) {
-	newRuntime := func(id uint64) (*raftGroupRuntime, kv.FSM) {
+	newRuntime := func(id uint64) (*clusterbootstrap.GroupRuntime, kv.FSM) {
 		st, err := store.NewPebbleStore(t.TempDir())
 		require.NoError(t, err)
 		t.Cleanup(func() { require.NoError(t, st.Close()) })
-		return &raftGroupRuntime{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: id}, Store: st}}, kv.NewKvFSMWithHLC(st, kv.NewHLC())
+		return &clusterbootstrap.GroupRuntime{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: id}, Store: st}}, kv.NewKvFSMWithHLC(st, kv.NewHLC())
 	}
 	tso, _ := newRuntime(noderuntime.DedicatedTSORaftGroupID)
 	data, dataFSM := newRuntime(1)
 
-	active, err := commitTSFenceRuntimesActive(t.Context(), []*raftGroupRuntime{tso})
+	active, err := commitTSFenceRuntimesActive(t.Context(), []*clusterbootstrap.GroupRuntime{tso})
 	require.NoError(t, err)
 	require.False(t, active, "a TSO-only node has no KV data group to fence")
 
-	runtimes := []*raftGroupRuntime{tso, data}
+	runtimes := []*clusterbootstrap.GroupRuntime{tso, data}
 	active, err = commitTSFenceRuntimesActive(t.Context(), runtimes)
 	require.NoError(t, err)
 	require.False(t, active)
@@ -112,7 +113,7 @@ func TestCommitTSFenceReadinessIgnoresDedicatedTSOGroup(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
-	gate := &startupPublicKVGate{}
+	gate := &clusterbootstrap.StartupPublicKVGate{}
 	require.NoError(t, markPublicGateReadyAfterCommitTSFence(ctx, gate, runtimes, true))
-	require.False(t, gate.blocked())
+	require.False(t, gate.Blocked())
 }

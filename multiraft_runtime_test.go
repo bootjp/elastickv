@@ -7,7 +7,9 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/encryption/fsmwire"
+	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
@@ -46,7 +48,7 @@ func TestBuildShardGroupsWithDedicatedTSOPreservesSingleDataGroupDir(t *testing.
 		nil,
 		nil,
 		"",
-		encryptionWriteWiring{},
+		encryptionwiring.WriteWiring{},
 		engine,
 	)
 	require.NoError(t, err)
@@ -93,7 +95,7 @@ func TestBuildShardGroupsWithDedicatedTSOPreservesLegacyGroupZeroStore(t *testin
 		nil,
 		nil,
 		"",
-		encryptionWriteWiring{},
+		encryptionwiring.WriteWiring{},
 		nil,
 	)
 	require.NoError(t, err)
@@ -136,7 +138,7 @@ func TestBuildShardGroupsClosesEarlierStoresWhenLaterGroupFails(t *testing.T) {
 		nil,
 		nil,
 		"",
-		encryptionWriteWiring{},
+		encryptionwiring.WriteWiring{},
 		nil,
 	)
 	require.ErrorIs(t, err, noderuntime.ErrUnsupportedRaftEngine)
@@ -173,7 +175,7 @@ func TestDedicatedTSOGroupContinuesAfterLegacyEncryptionEntry(t *testing.T) {
 		nil,
 		nil,
 		"",
-		encryptionWriteWiring{},
+		encryptionwiring.WriteWiring{},
 		nil,
 	)
 	require.NoError(t, err)
@@ -207,7 +209,7 @@ func TestBuildShardGroupsWithEtcdEngineRoutesAcrossGroups(t *testing.T) {
 	require.NoError(t, err)
 	clock := kv.NewHLC()
 	runtimes, shardGroups, err := buildShardGroups("n1", baseDir, groups, true, true, noderuntime.BootstrapConfig{},
-		factory, nil, clock, kv.NewActiveTimestampTracker(), nil, nil, "", encryptionWriteWiring{}, nil)
+		factory, nil, clock, kv.NewActiveTimestampTracker(), nil, nil, "", encryptionwiring.WriteWiring{}, nil)
 	require.NoError(t, err)
 
 	engine := distribution.NewEngine()
@@ -259,12 +261,12 @@ func TestBuildShardGroupsWithEtcdEngineRestartsAcrossGroups(t *testing.T) {
 	engine.UpdateRoute([]byte("m"), nil, 2)
 
 	sharedClock := kv.NewHLC()
-	openShardStore := func(bootstrap bool) ([]*raftGroupRuntime, map[uint64]*kv.ShardGroup, *kv.ShardStore) {
+	openShardStore := func(bootstrap bool) ([]*clusterbootstrap.GroupRuntime, map[uint64]*kv.ShardGroup, *kv.ShardStore) {
 		factory, err := newRaftFactory(noderuntime.RaftEngineEtcd, nil)
 		require.NoError(t, err)
 		runtimes, shardGroups, err := buildShardGroups("n1", baseDir, groups, true, bootstrap,
 			noderuntime.BootstrapConfig{}, factory, nil, sharedClock, kv.NewActiveTimestampTracker(), nil, nil, "",
-			encryptionWriteWiring{}, nil)
+			encryptionwiring.WriteWiring{}, nil)
 		require.NoError(t, err)
 		shardStore := kv.NewShardStore(engine, shardGroups)
 		return runtimes, shardGroups, shardStore

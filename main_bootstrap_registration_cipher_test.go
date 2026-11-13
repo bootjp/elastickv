@@ -6,6 +6,8 @@ import (
 	"crypto/sha256"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
+	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/internal/peersession"
 	"github.com/bootjp/elastickv/internal/raftadmission"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
@@ -37,7 +39,7 @@ func TestBootstrapRegistrationTLSCipherBoundDeclaration(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			projection, wrap := bootstrapEncryptedPayloadFixture(t, 17)
-			plain := registrationEntry(tc.dek, tc.member, tc.epoch)
+			plain := encryptionwiring.RegistrationEntry(tc.dek, tc.member, tc.epoch)
 			final, err := wrap(plain)
 			require.NoError(t, err)
 			second, err := wrap(plain)
@@ -73,7 +75,7 @@ func TestBootstrapRegistrationTLSCipherBoundDeclaration(t *testing.T) {
 			ctx, cancel := bootstrapGateContext(t, bootstrapGateTestToken)
 			defer cancel()
 			err = fixture.handle.Invoke(ctx, fixture.cc, pb.EncryptionAdmin_RegisterEncryptionWriter_FullMethodName,
-				registrationRequest(7, 2, 3), &pb.RegisterEncryptionWriterResponse{})
+				encryptionwiring.RegistrationRequest(7, 2, 3), &pb.RegisterEncryptionWriterResponse{})
 			if tc.accepted {
 				require.NoError(t, err)
 			} else {
@@ -85,7 +87,7 @@ func TestBootstrapRegistrationTLSCipherBoundDeclaration(t *testing.T) {
 	}
 }
 
-func bootstrapRegistrationCipherInspector(fixture **bootstrapAuthFixture, projection bootstrapPayloadProjection, stale, invalidate bool) func(raftadmission.Kind, uint64, []byte, raftbootstrap.Digest) (raftadmission.PayloadInspection, error) {
+func bootstrapRegistrationCipherInspector(fixture **bootstrapAuthFixture, projection clusterbootstrap.BootstrapPayloadProjection, stale, invalidate bool) func(raftadmission.Kind, uint64, []byte, raftbootstrap.Digest) (raftadmission.PayloadInspection, error) {
 	return func(kind raftadmission.Kind, group uint64, payload []byte, _ raftbootstrap.Digest) (raftadmission.PayloadInspection, error) {
 		generation, err := (*fixture).a.EncryptionFence()
 		if err != nil {
@@ -93,7 +95,7 @@ func bootstrapRegistrationCipherInspector(fixture **bootstrapAuthFixture, projec
 		}
 		current := projection
 		current.Generation = generation
-		validated, err := validateBootstrapFinalPayload(raftbootstrap.UUID{1}, kind, group, payload, current)
+		validated, err := clusterbootstrap.ValidateBootstrapFinalPayload(raftbootstrap.UUID{1}, kind, group, payload, current)
 		if err != nil {
 			return raftadmission.PayloadInspection{}, err
 		}

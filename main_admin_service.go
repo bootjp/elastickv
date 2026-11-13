@@ -8,17 +8,15 @@ import (
 
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
-	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/bootjp/elastickv/internal/admin"
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
+	"github.com/bootjp/elastickv/internal/nodeauth"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
-	"google.golang.org/grpc"
 )
-
-const adminTokenMaxBytes = 4 << 10
 
 func startupRoleStoreFromFlags(f adminHTTPFlags) admin.RoleStore {
 	if !f.enabled {
@@ -29,7 +27,7 @@ func startupRoleStoreFromFlags(f adminHTTPFlags) admin.RoleStore {
 
 func setupAdminService(
 	nodeID, grpcAddress string,
-	runtimes []*raftGroupRuntime,
+	runtimes []*clusterbootstrap.GroupRuntime,
 	shardGroups map[uint64]*kv.ShardGroup,
 	bootstrapServers []raftengine.Server,
 	shardStore *kv.ShardStore,
@@ -40,8 +38,8 @@ func setupAdminService(
 	connCache *kv.GRPCConnCache,
 	autoSplitRuntime adapter.AutoSplitRuntime,
 	backup backupFlags,
-	nodeAuth nodeAuthFlags,
-) (*adapter.AdminServer, adminGRPCInterceptors, error) {
+	nodeAuth nodeauth.Flags,
+) (*adapter.AdminServer, nodeauth.AdminGRPCInterceptors, error) {
 	members := adminMembersFromBootstrap(nodeID, bootstrapServers)
 	// In multi-group mode the process does not listen on --address — each group
 	// has its own rt.spec.address. Use the lowest-group-ID listener as the
@@ -62,7 +60,7 @@ func setupAdminService(
 		},
 	)
 	if err != nil {
-		return nil, adminGRPCInterceptors{}, err
+		return nil, nodeauth.AdminGRPCInterceptors{}, err
 	}
 	if srv == nil {
 		return nil, icept, nil
@@ -70,12 +68,12 @@ func setupAdminService(
 	for _, rt := range runtimes {
 		srv.RegisterGroup(rt.Spec.ID, rt.Engine)
 		if group := shardGroups[rt.Spec.ID]; group != nil {
-			group.SetLeaderReadToken(icept.token)
+			group.SetLeaderReadToken(icept.Token)
 			srv.RegisterBackupProposer(rt.Spec.ID, kv.NewLeaderAdminProposer(
 				rt.Engine,
 				group.Proposer(),
 				connCache,
-				kv.WithLeaderAdminToken(icept.token),
+				kv.WithLeaderAdminToken(icept.Token),
 			))
 		}
 	}
@@ -89,7 +87,7 @@ func setupAdminService(
 	if autoSplitRuntime != nil {
 		srv.RegisterAutoSplitRuntime(autoSplitRuntime)
 	}
-	if nodeAuth.adminInsecureNoAuth {
+	if nodeAuth.AdminInsecureNoAuth {
 		log.Printf("WARNING: --adminInsecureNoAuth is set; Admin gRPC service exposed without authentication")
 	}
 	return srv, icept, nil
@@ -101,7 +99,7 @@ func setupAdminService(
 // we pick the lowest group ID to make the choice deterministic across
 // restarts. Returns the supplied fallback when no runtimes exist (e.g., a
 // single-node dev invocation without --raftGroups).
-func canonicalSelfAddress(fallback string, runtimes []*raftGroupRuntime) string {
+func canonicalSelfAddress(fallback string, runtimes []*clusterbootstrap.GroupRuntime) string {
 	var (
 		bestID   uint64
 		bestAddr string
@@ -140,27 +138,6 @@ func adminMembersFromBootstrap(selfID string, servers []raftengine.Server) []ada
 		})
 	}
 	return out
-}
-
-// adminGRPCInterceptors bundles the unary+stream interceptors that enforce the
-// Admin bearer token. Returning the raw interceptor functions (rather than
-// pre-wrapped grpc.ServerOption values via grpc.ChainUnaryInterceptor) lets
-// the registration site combine them with any other interceptors in a single
-// ChainUnaryInterceptor call, so using grpc.UnaryInterceptor alongside risks
-// silent overwrites (gRPC-Go: last option of the same type wins).
-type adminGRPCInterceptors struct {
-	unary              []grpc.UnaryServerInterceptor
-	stream             []grpc.StreamServerInterceptor
-	token              string
-	migrationToken     string
-	s3BlobFetchEnabled bool
-	// migrationReady is the split-migration readiness gate the raft gRPC
-	// servers apply to migration RPCs and to ownership readiness.
-	migrationReady adapter.MigrationReadinessGate
-}
-
-func (a adminGRPCInterceptors) empty() bool {
-	return len(a.unary) == 0 && len(a.stream) == 0
 }
 
 // configureAdminService builds the node-side AdminServer plus the interceptor
@@ -212,40 +189,40 @@ func (s *adminBackupStore) CaptureBackupRouteSnapshotAt(ctx context.Context, ts 
 }
 
 func configureAdminService(
-	nodeAuth nodeAuthFlags,
+	nodeAuth nodeauth.Flags,
 	s3BlobOffloadEnabled bool,
 	self adapter.NodeIdentity,
 	members []adapter.NodeIdentity,
 	connCache *kv.GRPCConnCache,
 	backupDeps ...adminBackupDependencies,
-) (*adapter.AdminServer, adminGRPCInterceptors, error) {
-	auth, err := nodeAuth.loadGRPCAuth()
+) (*adapter.AdminServer, nodeauth.AdminGRPCInterceptors, error) {
+	auth, err := nodeAuth.LoadGRPCAuth()
 	if err != nil {
-		return nil, adminGRPCInterceptors{}, err
+		return nil, nodeauth.AdminGRPCInterceptors{}, errors.WithStack(err)
 	}
-	insecureNoAuth := nodeAuth.adminInsecureNoAuth
+	insecureNoAuth := nodeAuth.AdminInsecureNoAuth
 	var srv *adapter.AdminServer
-	if auth.adminEnabled {
+	if auth.AdminEnabled {
 		// adminServerOptions carries the live-backup dependencies and the
 		// admin token the backup proposer forwards with, so the options have
 		// to be built here rather than at NewAdminServer's bare call.
-		opts := adminServerOptions(auth.adminToken, insecureNoAuth, connCache, backupDeps)
+		opts := adminServerOptions(auth.AdminToken, insecureNoAuth, connCache, backupDeps)
 		srv = adapter.NewAdminServer(self, members, opts...)
 		srv.SetCapability(
 			adapter.S3BlobOffloadCapabilityName,
-			s3BlobOffloadAdminCapability(auth.adminToken, auth.peerToken, s3BlobOffloadEnabled),
+			s3BlobOffloadAdminCapability(auth.AdminToken, auth.PeerToken, s3BlobOffloadEnabled),
 		)
 	}
 	// token is what setupAdminService hands to SetLeaderReadToken and the
 	// per-group backup proposer, so it has to survive the interceptor build.
-	icept := adminGRPCInterceptors{token: auth.adminToken, migrationToken: auth.migrationToken, migrationReady: nodeAuth.splitMigrationLocalReadinessGate}
-	adminUnary, adminStream := adapter.AdminTokenAuth(auth.adminToken)
-	appendGRPCBearerInterceptors(&icept, adminUnary, adminStream)
-	migrationUnary, migrationStream := adapter.SplitMigrationTokenAuth(auth.migrationToken, insecureNoAuth, nodeAuth.splitMigrationPeerAuthEnforced)
-	appendGRPCBearerInterceptors(&icept, migrationUnary, migrationStream)
-	peerUnary, peerStream := adapter.S3BlobPeerTokenAuth(auth.peerToken)
-	appendGRPCBearerInterceptors(&icept, peerUnary, peerStream)
-	icept.s3BlobFetchEnabled = auth.peerToken != ""
+	icept := nodeauth.AdminGRPCInterceptors{Token: auth.AdminToken, MigrationToken: auth.MigrationToken, MigrationReady: nodeAuth.SplitMigrationLocalReadinessGate}
+	adminUnary, adminStream := adapter.AdminTokenAuth(auth.AdminToken)
+	nodeauth.AppendGRPCBearerInterceptors(&icept, adminUnary, adminStream)
+	migrationUnary, migrationStream := adapter.SplitMigrationTokenAuth(auth.MigrationToken, insecureNoAuth, nodeAuth.SplitMigrationPeerAuthEnforced)
+	nodeauth.AppendGRPCBearerInterceptors(&icept, migrationUnary, migrationStream)
+	peerUnary, peerStream := adapter.S3BlobPeerTokenAuth(auth.PeerToken)
+	nodeauth.AppendGRPCBearerInterceptors(&icept, peerUnary, peerStream)
+	icept.S3BlobFetchEnabled = auth.PeerToken != ""
 	return srv, icept, nil
 }
 
@@ -370,24 +347,4 @@ func adminLeaderVersionProbe(connCache *kv.GRPCConnCache) adapter.LeaderVersionP
 		}
 		return resp.GetNodeVersion(), nil
 	}
-}
-
-// loadAdminTokenFile materialises --adminTokenFile with a strict upper bound
-// so a misconfigured path (for example a log file) cannot force an arbitrary
-// allocation before the bearer-token check. Delegates to the shared helper in
-// internal/ so the admin binary and the node process read tokens identically.
-func loadAdminTokenFile(path string) (string, error) {
-	tok, err := internalutil.LoadBearerTokenFile(path, adminTokenMaxBytes, "admin token")
-	if err != nil {
-		return "", errors.Wrap(err, "load admin token")
-	}
-	return tok, nil
-}
-
-func loadS3BlobPeerTokenFile(path string) (string, error) {
-	tok, err := internalutil.LoadBearerTokenFile(path, adminTokenMaxBytes, "S3 blob peer token")
-	if err != nil {
-		return "", errors.Wrap(err, "load S3 blob peer token")
-	}
-	return tok, nil
 }

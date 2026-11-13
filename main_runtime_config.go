@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/adapter"
+	"github.com/bootjp/elastickv/internal/nodeauth"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/cockroachdb/errors"
 )
@@ -140,4 +141,13 @@ func resolveRuntimeInputs(raft raftFlags, topology topologyFlags, listeners list
 	bootstrapCfg.JoinAsLearner = bootstrap.joinAsLearner
 
 	return cfg, engineType, bootstrapCfg, bootstrap.bootstrap || bootstrapCfg.AnyBootstrapServers(), nil
+}
+
+func resolveNetworkRuntimeInputs(flags *serverFlags) (noderuntime.RuntimeConfig, noderuntime.RaftEngineType, noderuntime.BootstrapConfig, bool, error) {
+	if err := nodeauth.ConfigureGRPCTransport(flags.nodeAuth); err != nil {
+		return noderuntime.RuntimeConfig{}, "", noderuntime.BootstrapConfig{}, false, errors.WithStack(err)
+	}
+	cfg, engineType, bootstrapCfg, bootstrap, err := resolveValidatedRuntimeInputs(flags)
+	bootstrapCfg.ServiceTokenFiles = flags.nodeAuth.ServiceTokenFiles()
+	return cfg, engineType, bootstrapCfg, bootstrap, err
 }

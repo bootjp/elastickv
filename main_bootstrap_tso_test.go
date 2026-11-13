@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -18,20 +19,20 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func protectedTSOFixture(t *testing.T, dir string) (*groupBootstrapSpec, *bootstrapDomain, raftbootstrap.PolicyRecord) {
+func protectedTSOFixture(t *testing.T, dir string) (*clusterbootstrap.GroupBootstrapSpec, *clusterbootstrap.BootstrapDomain, raftbootstrap.PolicyRecord) {
 	t.Helper()
 	require.NoError(t, os.MkdirAll(dir, 0700))
 	raw := bootstrapConfigFixture(t)
 	raw.Local = etcd.DeriveNodeID("n1")
 	raw.Members[0].ID = raw.Local
 	raw.Members[0].Groups = []uint64{noderuntime.DedicatedTSORaftGroupID}
-	config, err := buildBootstrapPeerConfig(raw)
+	config, err := clusterbootstrap.BuildBootstrapPeerConfig(raw)
 	require.NoError(t, err)
-	intent := raftbootstrap.Intent{Identity: raftbootstrap.Identity{Cluster: config.local.Cluster, Group: noderuntime.DedicatedTSORaftGroupID},
+	intent := raftbootstrap.Intent{Identity: raftbootstrap.Identity{Cluster: config.Local.Cluster, Group: noderuntime.DedicatedTSORaftGroupID},
 		BaselineKind: raftbootstrap.Accepted, Minimum: raftbootstrap.Versions{Entry: 1, Snapshot: 1, Session: 1},
 		Floor: raftbootstrap.Floor{ActivationIndex: 2, Generation: 1},
-		Baseline: raftbootstrap.Configuration{Index: 1, State: raftbootstrap.ConfState{Voters: []uint64{config.local.Member}},
-			Members: []raftbootstrap.Member{{ID: config.local.Member, Address: config.local.Address, PublicKeyDigest: config.local.Key}}}}
+		Baseline: raftbootstrap.Configuration{Index: 1, State: raftbootstrap.ConfState{Voters: []uint64{config.Local.Member}},
+			Members: []raftbootstrap.Member{{ID: config.Local.Member, Address: config.Local.Address, PublicKeyDigest: config.Local.Key}}}}
 	digest, err := raftbootstrap.ConfigurationDigest(intent.Baseline)
 	require.NoError(t, err)
 	policy := raftbootstrap.PolicyRecord{Version: 1, Identity: intent.Identity, BaselineDigest: digest,
@@ -39,10 +40,10 @@ func protectedTSOFixture(t *testing.T, dir string) (*groupBootstrapSpec, *bootst
 	files := raftbootstrap.NewStore(dir)
 	projection := raftbootstrap.Policy{Identity: intent.Identity, BaselineDigest: digest, Minimum: intent.Minimum, Floor: intent.Floor}
 	require.NoError(t, files.Publish(intent, raftbootstrap.Evidence{Identity: &intent.Identity, BaselineDigest: &digest, RaftState: raftbootstrap.Intact, Policy: &projection}))
-	domain, err := newBootstrapDomain(intent.Identity.Cluster, []noderuntime.GroupSpec{{ID: noderuntime.DedicatedTSORaftGroupID}, {ID: 1}}, noderuntime.BootstrapEncryptionRequest{})
+	domain, err := clusterbootstrap.NewBootstrapDomain(intent.Identity.Cluster, []noderuntime.GroupSpec{{ID: noderuntime.DedicatedTSORaftGroupID}, {ID: 1}}, noderuntime.BootstrapEncryptionRequest{})
 	require.NoError(t, err)
-	t.Cleanup(domain.admission.Close)
-	return &groupBootstrapSpec{config: config, files: files, intent: intent, dir: dir, domain: domain}, domain, policy
+	t.Cleanup(domain.Admission.Close)
+	return &clusterbootstrap.GroupBootstrapSpec{Config: config, Files: files, Intent: intent, Dir: dir, Domain: domain}, domain, policy
 }
 
 func seedProtectedTSO(t *testing.T, st store.MVCCStore, policy raftbootstrap.PolicyRecord) *kv.TSOStateMachine {
@@ -76,28 +77,28 @@ func TestProtectedTSOPolicyRecoveryUsesDurableBacking(t *testing.T) {
 	spec, _, policy := protectedTSOFixture(t, t.TempDir())
 	st := protectedTSOStore(t)
 	seedProtectedTSO(t, st, policy)
-	sm, err := newProtectedTSOStateMachine(st, nil, policy.Identity)
+	sm, err := clusterbootstrap.NewProtectedTSOStateMachine(st, nil, policy.Identity)
 	require.NoError(t, err)
-	got, err := sm.policyLoader()(t.Context(), policy.Identity, 7)
+	got, err := sm.PolicyLoader()(t.Context(), policy.Identity, 7)
 	require.NoError(t, err)
 	wantBytes, err := raftbootstrap.MarshalPolicyRecord(policy)
 	require.NoError(t, err)
 	gotBytes, err := raftbootstrap.MarshalPolicyRecord(got)
 	require.NoError(t, err)
 	require.Equal(t, wantBytes, gotBytes)
-	require.NoError(t, sm.RecordAppliedNamespaceConfiguration(1, []uint64{spec.config.local.Member}))
-	require.NoError(t, sm.RecoverNamespaceConfiguration(7, []uint64{spec.config.local.Member}))
-	require.Error(t, sm.RecoverNamespaceConfiguration(7, []uint64{spec.config.local.Member + 1}))
-	require.Error(t, sm.RecordAppliedNamespaceConfiguration(8, []uint64{spec.config.local.Member}))
-	require.Error(t, sm.RecoverNamespaceConfiguration(0, []uint64{spec.config.local.Member}))
-	_, err = sm.policyLoader()(t.Context(), policy.Identity, 6)
+	require.NoError(t, sm.RecordAppliedNamespaceConfiguration(1, []uint64{spec.Config.Local.Member}))
+	require.NoError(t, sm.RecoverNamespaceConfiguration(7, []uint64{spec.Config.Local.Member}))
+	require.Error(t, sm.RecoverNamespaceConfiguration(7, []uint64{spec.Config.Local.Member + 1}))
+	require.Error(t, sm.RecordAppliedNamespaceConfiguration(8, []uint64{spec.Config.Local.Member}))
+	require.Error(t, sm.RecoverNamespaceConfiguration(0, []uint64{spec.Config.Local.Member}))
+	_, err = sm.PolicyLoader()(t.Context(), policy.Identity, 6)
 	require.Error(t, err, "native boundary must equal durable applied index")
 	wrong := policy.Identity
 	wrong.Cluster[0]++
-	_, err = sm.policyLoader()(t.Context(), wrong, 7)
+	_, err = sm.PolicyLoader()(t.Context(), wrong, 7)
 	require.Error(t, err)
-	expected := etcd.WALIdentity{Identity: policy.Identity, NodeID: spec.config.local.Member, BaselineDigest: policy.BaselineDigest}
-	require.ErrorIs(t, validateProtectedTSORecovery(sm, expected, etcd.RecoveredState{}), etcd.ErrWALIdentity)
+	expected := etcd.WALIdentity{Identity: policy.Identity, NodeID: spec.Config.Local.Member, BaselineDigest: policy.BaselineDigest}
+	require.ErrorIs(t, clusterbootstrap.ValidateProtectedTSORecovery(sm, expected, etcd.RecoveredState{}), etcd.ErrWALIdentity)
 }
 
 func TestProtectedTSORejectsMissingOrInconsistentState(t *testing.T) {
@@ -126,7 +127,7 @@ func TestProtectedTSORejectsMissingOrInconsistentState(t *testing.T) {
 				sm := seedProtectedTSO(t, st, policy)
 				require.NoError(t, sm.ApplyConfigurationWithControl(t.Context(), 8, nil))
 			}
-			_, err := newProtectedTSOStateMachine(st, nil, policy.Identity)
+			_, err := clusterbootstrap.NewProtectedTSOStateMachine(st, nil, policy.Identity)
 			require.Error(t, err)
 		})
 	}
@@ -137,25 +138,25 @@ func TestProtectedTSOFactoryNeverAutoMigrates(t *testing.T) {
 	base := t.TempDir()
 	dir := noderuntime.GroupDataDir(base, "n1", noderuntime.DedicatedTSORaftGroupID, true)
 	spec, domain, _ := protectedTSOFixture(t, dir)
-	group := noderuntime.GroupSpec{ID: noderuntime.DedicatedTSORaftGroupID, Address: spec.config.local.Address}
+	group := noderuntime.GroupSpec{ID: noderuntime.DedicatedTSORaftGroupID, Address: spec.Config.Local.Address}
 	factory := etcd.NewFactory(etcd.FactoryConfig{})
-	runtime, shard, err := buildProtectedDedicatedTSOGroup("n1", group, base, true, false, false,
+	runtime, shard, err := clusterbootstrap.BuildProtectedDedicatedTSOGroup("n1", group, base, true, false, false,
 		nil, nil, factory, nil, nil, spec, domain, nil)
 	require.ErrorContains(t, err, "explicitly migrated control store")
 	require.Nil(t, runtime)
 	require.Nil(t, shard)
-	require.NoDirExists(t, filepath.Join(dir, dedicatedTSOControlStoreName))
-	_, _, err = buildProtectedDedicatedTSOGroup("n1", group, base, true, false, false,
+	require.NoDirExists(t, filepath.Join(dir, clusterbootstrap.DedicatedTSOControlStoreName))
+	_, _, err = clusterbootstrap.BuildProtectedDedicatedTSOGroup("n1", group, base, true, false, false,
 		nil, nil, factory, nil, nil, nil, domain, nil)
 	require.Error(t, err)
-	_, _, err = buildProtectedDedicatedTSOGroup("n1", group, base, true, false, false,
+	_, _, err = clusterbootstrap.BuildProtectedDedicatedTSOGroup("n1", group, base, true, false, false,
 		nil, nil, factory, nil, nil, spec, nil, nil)
 	require.Error(t, err)
-	_, _, err = buildProtectedDedicatedTSOGroup("n1", group, base, true, false, false,
+	_, _, err = clusterbootstrap.BuildProtectedDedicatedTSOGroup("n1", group, base, true, false, false,
 		nil, nil, nil, nil, nil, spec, domain, nil)
 	require.Error(t, err)
 	servers := []raftengine.Server{{ID: "wrong-node", Address: group.Address}}
-	_, _, err = buildProtectedDedicatedTSOGroup("wrong-node", group, base, false, true, false,
+	_, _, err = clusterbootstrap.BuildProtectedDedicatedTSOGroup("wrong-node", group, base, false, true, false,
 		servers, servers, factory, kv.NewHLC(), protectedTSOTestObserver{}, spec, domain,
 		[]string{"/explicit/public/method"}, store.WithSSTIngestSnapshots(true))
 	require.Error(t, err)
@@ -170,13 +171,13 @@ func TestProtectedTSOFactoryRejectsEmptyControlDatabase(t *testing.T) {
 	base := t.TempDir()
 	dir := noderuntime.GroupDataDir(base, "n1", noderuntime.DedicatedTSORaftGroupID, true)
 	spec, domain, _ := protectedTSOFixture(t, dir)
-	path := filepath.Join(dir, dedicatedTSOControlStoreName)
+	path := filepath.Join(dir, clusterbootstrap.DedicatedTSOControlStoreName)
 	st, err := store.NewPebbleStore(path)
 	require.NoError(t, err)
 	require.NoError(t, st.Close())
 	factory := etcd.NewFactory(etcd.FactoryConfig{})
-	group := noderuntime.GroupSpec{ID: noderuntime.DedicatedTSORaftGroupID, Address: spec.config.local.Address}
-	_, _, err = buildProtectedDedicatedTSOGroup("n1", group, base, true, false, false,
+	group := noderuntime.GroupSpec{ID: noderuntime.DedicatedTSORaftGroupID, Address: spec.Config.Local.Address}
+	_, _, err = clusterbootstrap.BuildProtectedDedicatedTSOGroup("n1", group, base, true, false, false,
 		nil, nil, factory, nil, nil, spec, domain, nil)
 	require.Error(t, err)
 	// A failed constructor releases the DB lock and never imports scalar state.
@@ -194,22 +195,22 @@ func TestProtectedTSOStartupRegistersSharedDomain(t *testing.T) {
 	spec, domain, policy := protectedTSOFixture(t, t.TempDir())
 	st := protectedTSOStore(t)
 	seedProtectedTSO(t, st, policy)
-	sm, err := newProtectedTSOStateMachine(st, nil, policy.Identity)
+	sm, err := clusterbootstrap.NewProtectedTSOStateMachine(st, nil, policy.Identity)
 	require.NoError(t, err)
-	transport := etcd.NewGRPCTransport([]etcd.Peer{{ID: "n1", NodeID: spec.config.local.Member, Address: spec.config.local.Address}})
+	transport := etcd.NewGRPCTransport([]etcd.Peer{{ID: "n1", NodeID: spec.Config.Local.Member, Address: spec.Config.Local.Address}})
 	t.Cleanup(func() { require.NoError(t, transport.Close()) })
-	setup := newProtectedTSOStartup(spec, st, sm, domain, nil)
-	startup, err := setup(raftengine.FactoryConfig{GroupID: noderuntime.DedicatedTSORaftGroupID, LocalID: "n1", LocalAddress: spec.config.local.Address}, transport)
+	setup := clusterbootstrap.NewProtectedTSOStartup(spec, st, sm, domain, nil)
+	startup, err := setup(raftengine.FactoryConfig{GroupID: noderuntime.DedicatedTSORaftGroupID, LocalID: "n1", LocalAddress: spec.Config.Local.Address}, transport)
 	require.NoError(t, err)
 	t.Cleanup(startup.Close)
-	require.Same(t, domain.admission, startup.NativeAdmission)
-	require.NotNil(t, domain.owners[noderuntime.DedicatedTSORaftGroupID])
+	require.Same(t, domain.Admission, startup.NativeAdmission)
+	require.NotNil(t, domain.Owners[noderuntime.DedicatedTSORaftGroupID])
 	require.False(t, startup.PublicReady())
 	require.ErrorIs(t, startup.RecoveredAdmission(etcd.RecoveredState{}), etcd.ErrWALIdentity)
 	require.False(t, startup.PublicReady())
 }
 
-func preparedTSOFixture(t *testing.T, commit uint64) (*groupBootstrapSpec, *bootstrapDomain, store.MVCCStore, kv.PreparedBootstrapActivation) {
+func preparedTSOFixture(t *testing.T, commit uint64) (*clusterbootstrap.GroupBootstrapSpec, *clusterbootstrap.BootstrapDomain, store.MVCCStore, kv.PreparedBootstrapActivation) {
 	t.Helper()
 	spec, domain, _ := protectedTSOFixture(t, t.TempDir())
 	st := protectedTSOStore(t)
@@ -226,15 +227,15 @@ func preparedTSOFixture(t *testing.T, commit uint64) (*groupBootstrapSpec, *boot
 	state, err := kv.NewDurableTSOStateMachine(nil, backing)
 	require.NoError(t, err)
 	require.NoError(t, state.InitializeLegacyControl(t.Context(), commit, 1, &image, nil))
-	c := raftbootstrap.BaselineContext{Version: raftbootstrap.BaselineVersion, Identity: spec.intent.Identity,
-		OperationID: raftbootstrap.OperationID{9}, Configuration: spec.intent.Baseline, Minimum: spec.intent.Minimum,
+	c := raftbootstrap.BaselineContext{Version: raftbootstrap.BaselineVersion, Identity: spec.Intent.Identity,
+		OperationID: raftbootstrap.OperationID{9}, Configuration: spec.Intent.Baseline, Minimum: spec.Intent.Minimum,
 		CommitIndex: commit, CommitTerm: 1, Watermark: 42, DataDigest: raftbootstrap.Digest{8}}
 	configurationDigest, err := raftbootstrap.ConfigurationDigest(c.Configuration)
 	require.NoError(t, err)
-	signer, ok := spec.config.clientTLS.Certificates[0].PrivateKey.(crypto.Signer)
+	signer, ok := spec.Config.ClientTLS.Certificates[0].PrivateKey.(crypto.Signer)
 	require.True(t, ok)
 	probe, err := raftbootstrap.SignBaselineProbe(raftbootstrap.BaselineProbe{BaselineContext: c,
-		Evidence: raftbootstrap.BaselineMemberEvidence{MemberID: spec.config.local.Member,
+		Evidence: raftbootstrap.BaselineMemberEvidence{MemberID: spec.Config.Local.Member,
 			CommitIndex: commit, CommitTerm: 1, AppliedIndex: commit, LastLogIndex: commit, ConfigurationDigest: configurationDigest,
 			NativeStateDigest: raftbootstrap.Digest{7}, DataDigest: c.DataDigest, Watermark: c.Watermark}}, signer)
 	require.NoError(t, err)
@@ -255,21 +256,21 @@ func TestPreparedTSOExplicitFirstActivation(t *testing.T) {
 	proof := func(context.Context) (kv.BootstrapActivationNativeProof, error) {
 		return kv.BootstrapActivationNativeProof{Identity: c.Identity, Configuration: c.Configuration}, nil
 	}
-	unready, err := newProtectedTSOStateMachine(st, nil, c.Identity)
+	unready, err := clusterbootstrap.NewProtectedTSOStateMachine(st, nil, c.Identity)
 	require.NoError(t, err, "prepared state may proceed to native v2 verification")
-	_, err = unready.policyLoader()(t.Context(), c.Identity, 7)
+	_, err = unready.PolicyLoader()(t.Context(), c.Identity, 7)
 	require.ErrorIs(t, err, store.ErrKeyNotFound, "no synthetic policy is created")
-	require.NoError(t, unready.RecoverNamespaceConfiguration(7, []uint64{spec.config.local.Member}))
-	require.Error(t, unready.RecoverNamespaceConfiguration(7, []uint64{spec.config.local.Member + 1}))
-	sm, err := newPreparedTSOStateMachine(st, nil, c.Identity, nil)
+	require.NoError(t, unready.RecoverNamespaceConfiguration(7, []uint64{spec.Config.Local.Member}))
+	require.Error(t, unready.RecoverNamespaceConfiguration(7, []uint64{spec.Config.Local.Member + 1}))
+	sm, err := clusterbootstrap.NewPreparedTSOStateMachine(st, nil, c.Identity, nil)
 	require.NoError(t, err)
 	command := raftbootstrap.ActivationCommand{Manifest: manifest, Witness: raftbootstrap.Witness{
 		Cluster: c.Identity.Cluster, Group: c.Identity.Group, ConfigurationIndex: 1, ConfigurationDigest: configurationDigest}}
 	preparedImage, err := store.ProbeBootstrapBaseline(t.Context(), st)
 	require.NoError(t, err)
-	signer, ok := spec.config.clientTLS.Certificates[0].PrivateKey.(crypto.Signer)
+	signer, ok := spec.Config.ClientTLS.Certificates[0].PrivateKey.(crypto.Signer)
 	require.True(t, ok)
-	ack, err := raftbootstrap.SignPreparedMemberAck(raftbootstrap.PreparedMemberAck{MemberID: spec.config.local.Member,
+	ack, err := raftbootstrap.SignPreparedMemberAck(raftbootstrap.PreparedMemberAck{MemberID: spec.Config.Local.Member,
 		ManifestDigest: prepared.ManifestDigest, Minimum: c.Minimum, PreparedStateDigest: raftbootstrap.Digest(preparedImage.DataDigest)}, manifest, signer)
 	require.NoError(t, err)
 	command.Readiness = raftbootstrap.PreparedCertificate{ManifestDigest: prepared.ManifestDigest, Members: []raftbootstrap.PreparedMemberAck{ack}}
@@ -278,8 +279,8 @@ func TestPreparedTSOExplicitFirstActivation(t *testing.T) {
 	changes, err := sm.ApplyChangesAdmission(payload)
 	require.NoError(t, err)
 	require.True(t, changes)
-	sm.SetApplyNativeConfiguration(raftengine.NativeConfiguration{Index: 1, Voters: []uint64{spec.config.local.Member},
-		Members: []raftengine.NativeConfigurationMember{{ID: spec.config.local.Member, Address: spec.config.local.Address}}})
+	sm.SetApplyNativeConfiguration(raftengine.NativeConfiguration{Index: 1, Voters: []uint64{spec.Config.Local.Member},
+		Members: []raftengine.NativeConfigurationMember{{ID: spec.Config.Local.Member, Address: spec.Config.Local.Address}}})
 	sm.SetApplyEntryIdentity(raftengine.NewAppliedEntryIdentity(8, 2, 0, payload))
 	result := sm.Apply(payload)
 	sm.ClearApplyEntryIdentity()
@@ -293,9 +294,9 @@ func TestPreparedTSOExplicitFirstActivation(t *testing.T) {
 	changes, err = sm.ApplyChangesAdmission(payload)
 	require.NoError(t, err)
 	require.False(t, changes, "already-active rejection must not revoke healthy sessions")
-	_, err = newProtectedTSOStateMachine(st, nil, c.Identity)
+	_, err = clusterbootstrap.NewProtectedTSOStateMachine(st, nil, c.Identity)
 	require.NoError(t, err)
-	_, err = newPreparedTSOStateMachine(st, nil, c.Identity, proof)
+	_, err = clusterbootstrap.NewPreparedTSOStateMachine(st, nil, c.Identity, proof)
 	require.Error(t, err, "explicit preparation cannot replace active policy")
 }
 
@@ -304,9 +305,9 @@ func TestPreparedTSORecoveryRejectsFreshNativeSource(t *testing.T) {
 	for _, version := range []string{"v1", "v2", "wrong-v2"} {
 		t.Run(version, func(t *testing.T) {
 			spec, domain, st, prepared := preparedTSOFixture(t, 1)
-			sm, err := newProtectedTSOStateMachine(st, nil, spec.intent.Identity)
+			sm, err := clusterbootstrap.NewProtectedTSOStateMachine(st, nil, spec.Intent.Identity)
 			require.NoError(t, err)
-			expected := etcd.WALIdentity{Identity: spec.intent.Identity, NodeID: spec.config.local.Member,
+			expected := etcd.WALIdentity{Identity: spec.Intent.Identity, NodeID: spec.Config.Local.Member,
 				BaselineDigest: prepared.Probe.Evidence.ConfigurationDigest}
 			if version == "v2" {
 				expected.PreparationDigest = prepared.ManifestDigest
@@ -316,18 +317,18 @@ func TestPreparedTSORecoveryRejectsFreshNativeSource(t *testing.T) {
 			}
 			called := false
 			engine, err := etcd.Open(t.Context(), etcd.OpenConfig{GroupID: noderuntime.DedicatedTSORaftGroupID,
-				NodeID: spec.config.local.Member, LocalID: "n1", LocalAddress: spec.config.local.Address,
-				DataDir: t.TempDir(), Bootstrap: true, StateMachine: sm, NativeIdentity: &expected, NativeAdmission: domain.admission,
+				NodeID: spec.Config.Local.Member, LocalID: "n1", LocalAddress: spec.Config.Local.Address,
+				DataDir: t.TempDir(), Bootstrap: true, StateMachine: sm, NativeIdentity: &expected, NativeAdmission: domain.Admission,
 				RecoveredAdmission: func(state etcd.RecoveredState) error {
 					called = true
-					return validateProtectedTSORecovery(sm, expected, state)
+					return clusterbootstrap.ValidateProtectedTSORecovery(sm, expected, state)
 				}})
 			if engine != nil {
 				require.NoError(t, engine.Close())
 			}
 			require.Equal(t, version == "v1", called, "v2 must be migrated, never bootstrapped from an empty source")
 			require.ErrorIs(t, err, etcd.ErrWALIdentity)
-			key, keyErr := kv.BootstrapPolicyMetadataKey(spec.intent.Identity)
+			key, keyErr := kv.BootstrapPolicyMetadataKey(spec.Intent.Identity)
 			require.NoError(t, keyErr)
 			metadata, ok := st.(store.RaftControlMetadataStore)
 			require.True(t, ok)

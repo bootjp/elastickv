@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/peersession"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
@@ -18,7 +19,7 @@ const bootstrapMethodsTestGroup uint64 = 17
 
 func bootstrapMethodForTest(t *testing.T, group uint64, name string) peersession.Method {
 	t.Helper()
-	for _, method := range bootstrapSharedGRPCMethods(group) {
+	for _, method := range clusterbootstrap.BootstrapSharedGRPCMethods(group) {
 		if method.Name == name {
 			return method
 		}
@@ -33,7 +34,7 @@ func bootstrapBindingForTest(group uint64) peersession.RequestBinding {
 
 func TestBootstrapSharedGRPCMethodsExactInventory(t *testing.T) {
 	t.Parallel()
-	methods := bootstrapSharedGRPCMethods(bootstrapMethodsTestGroup)
+	methods := clusterbootstrap.BootstrapSharedGRPCMethods(bootstrapMethodsTestGroup)
 	names := make([]string, 0, len(methods))
 	for _, method := range methods {
 		names = append(names, method.Name)
@@ -160,15 +161,15 @@ func TestBootstrapPrepareProposalAcceptsOnlyCanonicalControls(t *testing.T) {
 func TestBootstrapPrepareMethodsRejectNilMessages(t *testing.T) {
 	t.Parallel()
 	binding := bootstrapBindingForTest(bootstrapMethodsTestGroup)
-	_, err := bootstrapPrepareStateRequest(binding, (*pb.PrepareEvidenceStateRequest)(nil))
+	_, err := clusterbootstrap.BootstrapPrepareStateRequest(binding, (*pb.PrepareEvidenceStateRequest)(nil))
 	require.Error(t, err)
-	_, err = bootstrapPrepareProposalRequest(binding, (*pb.ForwardAdminProposalRequest)(nil))
+	_, err = clusterbootstrap.BootstrapPrepareProposalRequest(binding, (*pb.ForwardAdminProposalRequest)(nil))
 	require.Error(t, err)
-	_, err = bootstrapTimestampReply(peersession.Message{}, (*pb.GetTimestampResponse)(nil))
+	_, err = clusterbootstrap.BootstrapTimestampReply(peersession.Message{}, (*pb.GetTimestampResponse)(nil))
 	require.Error(t, err)
-	_, err = bootstrapPrepareStateReply(peersession.Message{}, (*pb.PrepareEvidenceStateResponse)(nil))
+	_, err = clusterbootstrap.BootstrapPrepareStateReply(peersession.Message{}, (*pb.PrepareEvidenceStateResponse)(nil))
 	require.Error(t, err)
-	_, err = bootstrapPrepareProposalReply(peersession.Message{}, (*pb.ForwardAdminProposalResponse)(nil))
+	_, err = clusterbootstrap.BootstrapPrepareProposalReply(peersession.Message{}, (*pb.ForwardAdminProposalResponse)(nil))
 	require.Error(t, err)
 }
 

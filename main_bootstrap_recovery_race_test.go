@@ -9,7 +9,9 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/encryption"
+	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/peersession"
 	"github.com/bootjp/elastickv/internal/raftadmission"
@@ -56,21 +58,21 @@ func (s *bootstrapRecoveryCatalogRead) GetAt(ctx context.Context, key []byte, ts
 	return s.MVCCStore.GetAt(ctx, key, ts)
 }
 
-func bootstrapRecoveryCatalogView(node *bootstrapRotationE2ENode, reader store.MVCCStore) []*raftGroupRuntime {
-	return []*raftGroupRuntime{{
+func bootstrapRecoveryCatalogView(node *bootstrapRotationE2ENode, reader store.MVCCStore) []*clusterbootstrap.GroupRuntime {
+	return []*clusterbootstrap.GroupRuntime{{
 		GroupRuntime: &noderuntime.GroupRuntime{
 			Spec:        node.runtime.Spec,
 			Engine:      node.runtime.Engine,
 			Store:       reader,
 			PublicReady: node.runtime.PublicReady,
 		},
-		bootstrapDomain: node.domain,
+		BootstrapDomain: node.domain,
 	}}
 }
 
 type bootstrapRecoveryOverlap struct {
 	reader   *bootstrapRecoveryCatalogRead
-	runtimes []*raftGroupRuntime
+	runtimes []*clusterbootstrap.GroupRuntime
 	routes   *distribution.Engine
 	catalog  *distribution.CatalogStore
 }
@@ -80,26 +82,26 @@ func forceBootstrapRecoveryOverlap(t *testing.T, f *bootstrapRotationE2EFixture,
 	// Hold catalog publication under this test's control, not native apply or
 	// registration. The normal production reconciler is invoked once below.
 	node.stopReadiness()
-	old, err := node.domain.admission.Ticket(1)
+	old, err := node.domain.Admission.Ticket(1)
 	require.NoError(t, err)
 	var overlapped bool
 	routes := distribution.NewEngine()
 	routes.UpdateRoute(nil, nil, 1)
 	reader := &bootstrapRecoveryCatalogRead{MVCCStore: node.runtime.Store, onVersion: func() {
-		source := bootstrapRegistrationFromContext(node.registrationCtx)
+		source := clusterbootstrap.BootstrapRegistrationFromContext(node.registrationCtx)
 		require.NotNil(t, source)
 		sc, err := encryption.ReadSidecar(f.sidecarPath)
 		require.NoError(t, err)
 		before := node.runtime.Engine.Status().AppliedIndex
 		ctx, cancel := context.WithTimeout(node.registrationCtx, enablementE2EWait)
 		defer cancel()
-		entry := registrationEntry(sc.Active.Raft, f.config.local.Member, node.wiring.raftEpoch)
-		req := registrationRequest(sc.Active.Raft, f.config.local.Member, node.wiring.raftEpoch)
-		err = source.propose(ctx, node.group.Proposer(), entry, req)
+		entry := encryptionwiring.RegistrationEntry(sc.Active.Raft, f.config.Local.Member, node.wiring.RaftEpoch)
+		req := encryptionwiring.RegistrationRequest(sc.Active.Raft, f.config.Local.Member, node.wiring.RaftEpoch)
+		err = source.Propose(ctx, node.group.Proposer(), entry, req)
 		require.True(t, err == nil || errors.Is(err, raftadmission.ErrStale) || errors.Is(err, kv.ErrTransactionOutcomeUnknown) || errors.Is(err, context.Canceled) || errors.Is(err, raftengine.ErrLeadershipLost), "registration may lose its reply during native recovery: %v", err)
 		require.Eventually(t, func() bool { return node.runtime.Engine.Status().AppliedIndex > before }, enablementE2EWait, time.Millisecond)
-		require.Eventually(t, func() bool { return node.domain.admission.Stage(1) == peersession.ControlReady }, enablementE2EWait, time.Millisecond)
-		fresh, err := node.domain.admission.Ticket(1)
+		require.Eventually(t, func() bool { return node.domain.Admission.Stage(1) == peersession.ControlReady }, enablementE2EWait, time.Millisecond)
+		fresh, err := node.domain.Admission.Ticket(1)
 		require.NoError(t, err)
 		// An unknown reply does not prove this duplicate registration committed;
 		// the applied prefix and fresh ticket prove actual native recovery.
@@ -115,9 +117,9 @@ func forceBootstrapRecoveryOverlap(t *testing.T, f *bootstrapRotationE2EFixture,
 	require.NoError(t, err, "initial startup must defer stale publication to the production reconciler, not fail the process")
 	require.NotNil(t, catalog)
 	require.False(t, node.runtime.PublicReady(), "a discarded ticket cannot mark catalog loaded")
-	_, err = node.domain.admission.RotationStatus()
+	_, err = node.domain.Admission.RotationStatus()
 	require.NoError(t, err, "stale initial catalog publication must not latch fatal")
-	require.ErrorIs(t, node.domain.admission.MarkCatalogLoaded(old), raftadmission.ErrStale)
+	require.ErrorIs(t, node.domain.Admission.MarkCatalogLoaded(old), raftadmission.ErrStale)
 	return bootstrapRecoveryOverlap{reader: reader, runtimes: runtimes, routes: routes, catalog: catalog}
 }
 
@@ -126,7 +128,7 @@ func TestBootstrapRecoveryCatalogSnapshotRegistrationOverlap(t *testing.T) {
 	f := newBootstrapRotationE2EFixture(t, true)
 	node := f.protected(t)
 	overlap := forceBootstrapRecoveryOverlap(t, f, node, nil)
-	require.NoError(t, reconcileBootstrapReadiness(t.Context(), node.domain, overlap.runtimes, overlap.catalog, overlap.routes))
+	require.NoError(t, clusterbootstrap.ReconcileBootstrapReadiness(t.Context(), node.domain, overlap.runtimes, overlap.catalog, overlap.routes))
 	require.True(t, node.runtime.PublicReady())
 	ctx, cancel := context.WithTimeout(t.Context(), enablementE2EWait)
 	defer cancel()
@@ -150,7 +152,7 @@ func TestBootstrapRecoveryCatalogSameVersionMalformedReload(t *testing.T) {
 	require.NoError(t, err)
 	// Each record has valid canonical bytes and a distinct ID, but the new
 	// route overlaps the existing full-range route at the SAME version.
-	require.ErrorIs(t, reconcileBootstrapReadiness(t.Context(), node.domain, overlap.runtimes, overlap.catalog, overlap.routes), distribution.ErrEngineSnapshotRouteOrder)
+	require.ErrorIs(t, clusterbootstrap.ReconcileBootstrapReadiness(t.Context(), node.domain, overlap.runtimes, overlap.catalog, overlap.routes), distribution.ErrEngineSnapshotRouteOrder)
 	require.False(t, node.runtime.PublicReady())
 }
 
@@ -164,11 +166,11 @@ func TestBootstrapRecoveryCatalogNewerWatcherVersionDefersUntilLocalCommit(t *te
 		latest.Version++
 		require.NoError(t, routes.ApplySnapshot(latest), "model an independently validated watcher publication, not local durable catchup")
 	})
-	require.NoError(t, reconcileBootstrapReadiness(t.Context(), node.domain, overlap.runtimes, overlap.catalog, overlap.routes))
+	require.NoError(t, clusterbootstrap.ReconcileBootstrapReadiness(t.Context(), node.domain, overlap.runtimes, overlap.catalog, overlap.routes))
 	require.False(t, node.runtime.PublicReady(), "a deferred older local read cannot mint a loaded receipt")
 	target := overlap.routes.AppliedCatalogSnapshot().Version
 	commitBootstrapRecoveryCatalogVersion(t, f, node, target)
-	require.NoError(t, reconcileBootstrapReadiness(t.Context(), node.domain, overlap.runtimes, overlap.catalog, overlap.routes))
+	require.NoError(t, clusterbootstrap.ReconcileBootstrapReadiness(t.Context(), node.domain, overlap.runtimes, overlap.catalog, overlap.routes))
 	require.True(t, node.runtime.PublicReady(), "fresh read of ACTUALLY committed local catalog completes readiness")
 	version, err := distribution.NewCatalogStore(node.runtime.Store).Version(t.Context())
 	require.NoError(t, err)
@@ -179,7 +181,7 @@ func commitBootstrapRecoveryCatalogVersion(t *testing.T, f *bootstrapRotationE2E
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), enablementE2EWait)
 	defer cancel()
-	owned, op, err := node.domain.admission.Begin(ctx, raftadmission.Catalog)
+	owned, op, err := node.domain.Admission.Begin(ctx, raftadmission.Catalog)
 	require.NoError(t, err)
 	defer op.CancelAndJoin()
 	barrier, err := bootstrapEncryptionRecoveryBarrier(node.domain, node.runtime)
@@ -201,10 +203,10 @@ func commitBootstrapRecoveryCatalogVersion(t *testing.T, f *bootstrapRotationE2E
 	inner, err := proto.MarshalOptions{Deterministic: true}.Marshal(request)
 	require.NoError(t, err)
 	payload, err := kv.EncodeGuardedBootstrapCommand(raftbootstrap.GuardedCommand{Kind: raftbootstrap.ControlGuardedCatalog, Witness: witness,
-		OperationID: raftbootstrap.OperationID{98}, Inner: append([]byte{bootstrapPayloadSingle}, inner...)})
+		OperationID: raftbootstrap.OperationID{98}, Inner: append([]byte{clusterbootstrap.BootstrapPayloadSingle}, inner...)})
 	require.NoError(t, err)
 	result, err := node.group.Proposer().ProposeAdmin(owned, payload)
-	require.NoError(t, finishBootstrapIngress(op, err))
+	require.NoError(t, clusterbootstrap.FinishBootstrapIngress(op, err))
 	require.NotNil(t, result)
 	receipt, ok := result.Response.(raftbootstrap.GuardedReceipt)
 	require.True(t, ok)

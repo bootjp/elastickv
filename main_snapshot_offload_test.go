@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/snapshotoffload"
 	"github.com/cockroachdb/errors"
@@ -18,7 +19,7 @@ import (
 func TestSnapshotOffloadGroupsCarryPerGroupDataDirs(t *testing.T) {
 	t.Parallel()
 	raftDir := t.TempDir()
-	runtimes := []*raftGroupRuntime{
+	runtimes := []*clusterbootstrap.GroupRuntime{
 		{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 1}}},
 		{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 2}}},
 		nil, // a nil runtime must be skipped, not panic
@@ -44,7 +45,7 @@ func TestSnapshotOffloadGroupsCarryPerGroupDataDirs(t *testing.T) {
 // rather than panic or, worse, publish.
 func TestSnapshotOffloadLeadershipFailsClosedOnAClosedEngine(t *testing.T) {
 	t.Parallel()
-	rt := &raftGroupRuntime{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 7}}} // engine never set
+	rt := &clusterbootstrap.GroupRuntime{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 7}}} // engine never set
 
 	require.False(t, snapshotOffloadIsLeader(rt)(),
 		"a closed engine must never look like a leader")

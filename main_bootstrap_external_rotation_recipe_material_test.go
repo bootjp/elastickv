@@ -7,8 +7,10 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryption/kek"
+	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/stretchr/testify/require"
 )
@@ -27,7 +29,7 @@ func newExternalRotationMaterialFixture(t *testing.T) *rotationRecipeFixture {
 		key := sc.Keys[id]
 		material := bytes.Clone(key.Wrapped[:encryption.KeySize])
 		key.Wrapped, err = wrapper.Wrap(material)
-		zeroBytes(material)
+		encryptionwiring.ZeroBytes(material)
 		require.NoError(t, err)
 		sc.Keys[id] = key
 	}
@@ -72,14 +74,14 @@ func TestBootstrapExternalRotationRecipeMaterialPlaintextCleared(t *testing.T) {
 			req.NewDekId, req.WrappedNewDek = tc.id, bytes.Clone(sc.Keys["1"].Wrapped)
 			observed := &externalRotationObservedUnwrap{Wrapper: f.cfg.Wrapper, failAt: tc.failAt}
 			f.cfg.Wrapper = observed
-			r, err := newBootstrapExternalRotationRecipe(t.Context(), f.cfg, req)
+			r, err := clusterbootstrap.NewBootstrapExternalRotationRecipe(t.Context(), f.cfg, req)
 			if tc.valid {
 				require.NoError(t, err)
 				receipt, runErr := r.Run(t.Context())
 				require.NoError(t, runErr)
 				require.True(t, receipt.Complete)
 			} else {
-				require.ErrorIs(t, err, errBootstrapExternalRotationRequest)
+				require.ErrorIs(t, err, clusterbootstrap.ErrBootstrapExternalRotationRequest)
 			}
 			require.NotEmpty(t, observed.plaintext)
 			for _, material := range observed.plaintext {
@@ -96,8 +98,8 @@ func TestBootstrapExternalRotationRecipeRejectsSameIDRewrappedMaterial(t *testin
 	f := newExternalRotationMaterialFixture(t)
 	req := externalRotationMaterialReplay(t, f, true, false, true)
 	req.NewDekId = 1
-	_, err := newBootstrapExternalRotationRecipe(t.Context(), f.cfg, req)
-	require.ErrorIs(t, err, errBootstrapExternalRotationRequest, "same plaintext is not an exact original request retry")
+	_, err := clusterbootstrap.NewBootstrapExternalRotationRecipe(t.Context(), f.cfg, req)
+	require.ErrorIs(t, err, clusterbootstrap.ErrBootstrapExternalRotationRequest, "same plaintext is not an exact original request retry")
 	require.Empty(t, f.calls)
 }
 
@@ -110,7 +112,7 @@ func externalRotationMaterialReplay(t *testing.T, f *rotationRecipeFixture, same
 		material, err := f.cfg.Wrapper.Unwrap(wrapped)
 		require.NoError(t, err)
 		wrapped, err = f.cfg.Wrapper.Wrap(material)
-		zeroBytes(material)
+		encryptionwiring.ZeroBytes(material)
 		require.NoError(t, err)
 		require.NotEqual(t, sc.Keys["1"].Wrapped, wrapped, "randomized KEK envelopes must differ for the SAME AES key")
 	}
@@ -146,8 +148,8 @@ func TestBootstrapExternalRotationRecipeRejectsReusedMaterial(t *testing.T) {
 			req := externalRotationMaterialReplay(t, f, tc.samePurpose, tc.retired, tc.rewrapped)
 			before, err := encryption.ReadSidecar(f.path)
 			require.NoError(t, err)
-			_, err = newBootstrapExternalRotationRecipe(t.Context(), f.cfg, req)
-			require.ErrorIs(t, err, errBootstrapExternalRotationRequest)
+			_, err = clusterbootstrap.NewBootstrapExternalRotationRecipe(t.Context(), f.cfg, req)
+			require.ErrorIs(t, err, clusterbootstrap.ErrBootstrapExternalRotationRequest)
 			require.Empty(t, f.calls, "reused material must be refused before granting a proposal")
 			after, err := encryption.ReadSidecar(f.path)
 			require.NoError(t, err)

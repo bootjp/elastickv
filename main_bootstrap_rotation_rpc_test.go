@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/adapter"
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
+	"github.com/bootjp/elastickv/internal/nodeauth"
 	"github.com/bootjp/elastickv/internal/peersession"
 	"github.com/bootjp/elastickv/internal/raftadmission"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
@@ -37,7 +39,7 @@ type bootstrapRotationRPCFixture struct {
 
 // Keep the real owner TLS and service-auth order. No catalog is loaded: the
 // frontdoor must reach the controller without minting a generic Data handle.
-func newBootstrapRotationRPCFixture(t *testing.T, run bootstrapRotationRPCHandler, credentialOverride ...string) bootstrapRotationRPCFixture {
+func newBootstrapRotationRPCFixture(t *testing.T, run clusterbootstrap.BootstrapRotationRPCHandler, credentialOverride ...string) bootstrapRotationRPCFixture {
 	t.Helper()
 	pki := newBootstrapGatePKI(t)
 	serverCert, serverKey := pki.certificate(t, 2)
@@ -50,7 +52,7 @@ func newBootstrapRotationRPCFixture(t *testing.T, run bootstrapRotationRPCHandle
 	owner, err := peersession.NewOwner(peersession.Config{Local: local,
 		Provisioned: []peersession.Provision{{Node: local, Groups: []uint64{1}}, {Node: remote, Groups: []uint64{1}}},
 		Versions:    raftbootstrap.Versions{Entry: 1, Snapshot: 1, Session: 1},
-		Methods:     bootstrapSharedGRPCMethods(1), PublicMethods: bootstrapPublicGRPCMethods()})
+		Methods:     clusterbootstrap.BootstrapSharedGRPCMethods(1), PublicMethods: clusterbootstrap.BootstrapPublicGRPCMethods()})
 	require.NoError(t, err)
 	t.Cleanup(owner.Close)
 	options, err := owner.ServerOptions(&tls.Config{Certificates: []tls.Certificate{serverCert}, ClientCAs: pki.roots,
@@ -62,9 +64,9 @@ func newBootstrapRotationRPCFixture(t *testing.T, run bootstrapRotationRPCHandle
 	if len(credentialOverride) != 0 {
 		credential = credentialOverride[0]
 	}
-	rotation, err := bootstrapRotationRPCOptions(adminGRPCInterceptors{token: credential}, gate.domain, bootstrapRotationRPCNode, run)
+	rotation, err := clusterbootstrap.BootstrapRotationRPCOptions(nodeauth.AdminGRPCInterceptors{Token: credential}, gate.Domain, bootstrapRotationRPCNode, run)
 	require.NoError(t, err)
-	options = append(options, grpc.ChainUnaryInterceptor(bootstrapStartupAuthException(gate.domain, admin), rotation.unary[0], gate.unaryInterceptor))
+	options = append(options, grpc.ChainUnaryInterceptor(clusterbootstrap.BootstrapStartupAuthException(gate.Domain, admin), rotation.Unary[0], gate.UnaryInterceptor))
 	server := grpc.NewServer(options...)
 	owner.Register(server)
 	service := &bootstrapGateService{}
@@ -113,9 +115,9 @@ func TestBootstrapRotationRPCAdminOnlyTLS(t *testing.T) {
 		{"missing admin", metadata.MD{}},
 		{"wrong admin", metadata.Pairs("authorization", "Bearer wrong")},
 		{"startup bearer", metadata.Pairs("authorization", "Bearer "+bootstrapGateTestToken)},
-		{"startup only", metadata.Pairs(bootstrapControlHeader, bootstrapGateTestToken)},
-		{"startup plus admin", metadata.Pairs(bootstrapControlHeader, bootstrapGateTestToken, "authorization", "Bearer "+bootstrapRotationRPCAdmin)},
-		{"empty startup header", metadata.Pairs(bootstrapControlHeader, "", "authorization", "Bearer "+bootstrapRotationRPCAdmin)},
+		{"startup only", metadata.Pairs(clusterbootstrap.BootstrapControlHeader, bootstrapGateTestToken)},
+		{"startup plus admin", metadata.Pairs(clusterbootstrap.BootstrapControlHeader, bootstrapGateTestToken, "authorization", "Bearer "+bootstrapRotationRPCAdmin)},
+		{"empty startup header", metadata.Pairs(clusterbootstrap.BootstrapControlHeader, "", "authorization", "Bearer "+bootstrapRotationRPCAdmin)},
 		{"duplicate admin", metadata.Pairs("authorization", "Bearer "+bootstrapRotationRPCAdmin, "authorization", "Bearer wrong")},
 		{"forged peer", metadata.Pairs("x-elastickv-peer-session", "fake", "x-elastickv-peer-proof", "fake", "authorization", "Bearer "+bootstrapRotationRPCAdmin)},
 	} {
@@ -175,7 +177,9 @@ func TestBootstrapRotationRPCRequestBoundary(t *testing.T) {
 		{"unspecified purpose", func(r *pb.RotateDEKRequest) { r.Purpose = 0 }},
 		{"reserved key", func(r *pb.RotateDEKRequest) { r.NewDekId = 0 }},
 		{"missing wrapped key", func(r *pb.RotateDEKRequest) { r.WrappedNewDek = nil }},
-		{"oversized wrapped key", func(r *pb.RotateDEKRequest) { r.WrappedNewDek = make([]byte, bootstrapRotationWrappedKeyLimit+1) }},
+		{"oversized wrapped key", func(r *pb.RotateDEKRequest) {
+			r.WrappedNewDek = make([]byte, clusterbootstrap.BootstrapRotationWrappedKeyLimit+1)
+		}},
 		{"zero identity", func(r *pb.RotateDEKRequest) { r.ProposerNodeId = 0 }},
 		{"truncated identity", func(r *pb.RotateDEKRequest) { r.ProposerNodeId = 42 }},
 		{"other identity", func(r *pb.RotateDEKRequest) { r.ProposerNodeId++ }},
@@ -185,7 +189,7 @@ func TestBootstrapRotationRPCRequestBoundary(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			request := bootstrapRotationRPCRequest()
 			test.edit(request)
-			_, err := canonicalBootstrapRotationRPCRequest(request, bootstrapRotationRPCNode)
+			_, err := clusterbootstrap.CanonicalBootstrapRotationRPCRequest(request, bootstrapRotationRPCNode)
 			require.Error(t, err)
 			ctx, cancel := bootstrapRotationRPCContext(t)
 			defer cancel()
@@ -195,13 +199,13 @@ func TestBootstrapRotationRPCRequestBoundary(t *testing.T) {
 	}
 	require.Zero(t, calls.Load())
 	for _, bad := range []any{nil, (*pb.RotateDEKRequest)(nil), &pb.BootstrapEncryptionRequest{}} {
-		_, err := canonicalBootstrapRotationRPCRequest(bad, bootstrapRotationRPCNode)
+		_, err := clusterbootstrap.CanonicalBootstrapRotationRPCRequest(bad, bootstrapRotationRPCNode)
 		require.Error(t, err)
 	}
 	request := bootstrapRotationRPCRequest()
 	request.ProposerLocalEpoch = math.MaxUint16
-	request.WrappedNewDek = make([]byte, bootstrapRotationWrappedKeyLimit)
-	canonical, err := canonicalBootstrapRotationRPCRequest(request, bootstrapRotationRPCNode)
+	request.WrappedNewDek = make([]byte, clusterbootstrap.BootstrapRotationWrappedKeyLimit)
+	canonical, err := clusterbootstrap.CanonicalBootstrapRotationRPCRequest(request, bootstrapRotationRPCNode)
 	require.NoError(t, err)
 	request.WrappedNewDek[0] = 1
 	require.Zero(t, canonical.WrappedNewDek[0], "the controller owns an independent canonical byte copy")
@@ -214,7 +218,7 @@ func TestBootstrapRotationRPCRejectsCapturedStartupReceipt(t *testing.T) {
 	f.service.action = func(ctx context.Context) error {
 		require.NotNil(t, peersession.CapturedReceipt(ctx), "genuine receipt from the owner transport")
 		ctx = metadata.NewIncomingContext(ctx, metadata.Pairs("authorization", "Bearer "+bootstrapRotationRPCAdmin))
-		require.Equal(t, codes.Unauthenticated, status.Code(authenticateBootstrapRotationRPC(ctx, bootstrapRotationRPCAdmin)))
+		require.Equal(t, codes.Unauthenticated, status.Code(clusterbootstrap.AuthenticateBootstrapRotationRPC(ctx, bootstrapRotationRPCAdmin)))
 		checked.Store(true)
 		return nil
 	}
@@ -230,44 +234,44 @@ func TestBootstrapRotationRPCOptionsLegacyAndIsolation(t *testing.T) {
 	backing[0] = func(ctx context.Context, request any, _ *grpc.UnaryServerInfo, next grpc.UnaryHandler) (any, error) {
 		return next(ctx, request)
 	}
-	options := adminGRPCInterceptors{token: bootstrapRotationRPCAdmin, unary: backing[:1]}
-	legacy, err := bootstrapRotationRPCOptions(options, nil, 0, nil)
+	options := nodeauth.AdminGRPCInterceptors{Token: bootstrapRotationRPCAdmin, Unary: backing[:1]}
+	legacy, err := clusterbootstrap.BootstrapRotationRPCOptions(options, nil, 0, nil)
 	require.NoError(t, err, "nil legacy profile does not require a controller or identity")
-	require.Equal(t, &options.unary[0], &legacy.unary[0])
-	configured, err := bootstrapRotationRPCOptions(options, &bootstrapDomain{}, bootstrapRotationRPCNode,
+	require.Equal(t, &options.Unary[0], &legacy.Unary[0])
+	configured, err := clusterbootstrap.BootstrapRotationRPCOptions(options, &clusterbootstrap.BootstrapDomain{}, bootstrapRotationRPCNode,
 		func(context.Context, *pb.RotateDEKRequest) (*pb.RotateDEKResponse, error) {
 			return &pb.RotateDEKResponse{AppliedIndex: 1}, nil
 		})
 	require.NoError(t, err)
-	require.Len(t, configured.unary, 2)
-	require.Len(t, options.unary, 1)
+	require.Len(t, configured.Unary, 2)
+	require.Len(t, options.Unary, 1)
 	require.Nil(t, backing[1], "do not modify the original service-auth backing array")
-	var domain *bootstrapDomain
-	require.Nil(t, domain.rotationRPCHandler())
-	domain.setProtectedRotationHandler(nil)
-	domain = &bootstrapDomain{}
-	domain.setProtectedRotationHandler(func(context.Context, *pb.RotateDEKRequest) (*pb.RotateDEKResponse, error) {
+	var domain *clusterbootstrap.BootstrapDomain
+	require.Nil(t, domain.RotationRPCHandler())
+	domain.SetProtectedRotationHandler(nil)
+	domain = &clusterbootstrap.BootstrapDomain{}
+	domain.SetProtectedRotationHandler(func(context.Context, *pb.RotateDEKRequest) (*pb.RotateDEKResponse, error) {
 		return &pb.RotateDEKResponse{AppliedIndex: 1}, nil
 	})
-	require.NotNil(t, domain.rotationRPCHandler())
-	domain.setProtectedRotationHandler(nil)
-	require.Nil(t, domain.rotationRPCHandler())
+	require.NotNil(t, domain.RotationRPCHandler())
+	domain.SetProtectedRotationHandler(nil)
+	require.Nil(t, domain.RotationRPCHandler())
 }
 
 func TestBootstrapRotationRPCUnconfiguredDoesNotBreakStartup(t *testing.T) {
 	for _, credential := range []string{"", bootstrapRotationRPCAdmin} {
 		t.Run(map[bool]string{true: "missing ADMIN", false: "protected plaintext"}[credential == ""], func(t *testing.T) {
-			options, err := bootstrapRotationRPCOptions(adminGRPCInterceptors{token: credential}, &bootstrapDomain{}, bootstrapRotationRPCNode, nil)
+			options, err := clusterbootstrap.BootstrapRotationRPCOptions(nodeauth.AdminGRPCInterceptors{Token: credential}, &clusterbootstrap.BootstrapDomain{}, bootstrapRotationRPCNode, nil)
 			require.NoError(t, err)
-			require.Len(t, options.unary, 1)
+			require.Len(t, options.Unary, 1)
 			ordinaryCalled := false
 			next := func(context.Context, any) (any, error) { ordinaryCalled = true; return "ordinary", nil }
-			reply, err := options.unary[0](t.Context(), nil, &grpc.UnaryServerInfo{FullMethod: pb.RawKV_RawGet_FullMethodName}, next)
+			reply, err := options.Unary[0](t.Context(), nil, &grpc.UnaryServerInfo{FullMethod: pb.RawKV_RawGet_FullMethodName}, next)
 			require.NoError(t, err)
 			require.Equal(t, "ordinary", reply)
 			require.True(t, ordinaryCalled)
 			ordinaryCalled = false
-			_, err = options.unary[0](t.Context(), bootstrapRotationRPCRequest(), &grpc.UnaryServerInfo{FullMethod: pb.EncryptionAdmin_RotateDEK_FullMethodName}, next)
+			_, err = options.Unary[0](t.Context(), bootstrapRotationRPCRequest(), &grpc.UnaryServerInfo{FullMethod: pb.EncryptionAdmin_RotateDEK_FullMethodName}, next)
 			require.Equal(t, codes.Unauthenticated, status.Code(err))
 			require.False(t, ordinaryCalled, "disabled rotation cannot fall back to the adapter")
 			f := newBootstrapRotationRPCFixture(t, nil, credential)
@@ -337,7 +341,7 @@ func TestBootstrapRotationRPCControllerResult(t *testing.T) {
 		}()},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			reply, err := runBootstrapRotationRPC(t.Context(), bootstrapRotationRPCRequest(), func(context.Context, *pb.RotateDEKRequest) (*pb.RotateDEKResponse, error) {
+			reply, err := clusterbootstrap.RunBootstrapRotationRPC(t.Context(), bootstrapRotationRPCRequest(), func(context.Context, *pb.RotateDEKRequest) (*pb.RotateDEKResponse, error) {
 				return test.reply, nil
 			})
 			require.Nil(t, reply)
@@ -345,7 +349,7 @@ func TestBootstrapRotationRPCControllerResult(t *testing.T) {
 		})
 	}
 	ctx, cancel := context.WithCancel(t.Context())
-	reply, err := runBootstrapRotationRPC(ctx, bootstrapRotationRPCRequest(), func(context.Context, *pb.RotateDEKRequest) (*pb.RotateDEKResponse, error) {
+	reply, err := clusterbootstrap.RunBootstrapRotationRPC(ctx, bootstrapRotationRPCRequest(), func(context.Context, *pb.RotateDEKRequest) (*pb.RotateDEKResponse, error) {
 		cancel()
 		return &pb.RotateDEKResponse{AppliedIndex: 1}, nil
 	})
@@ -353,7 +357,7 @@ func TestBootstrapRotationRPCControllerResult(t *testing.T) {
 	require.ErrorIs(t, err, kv.ErrTransactionOutcomeUnknown)
 	require.ErrorIs(t, err, context.Canceled)
 	want := errors.Join(raftadmission.ErrStale, kv.ErrTransactionOutcomeUnknown)
-	reply, err = runBootstrapRotationRPC(t.Context(), bootstrapRotationRPCRequest(), func(context.Context, *pb.RotateDEKRequest) (*pb.RotateDEKResponse, error) {
+	reply, err = clusterbootstrap.RunBootstrapRotationRPC(t.Context(), bootstrapRotationRPCRequest(), func(context.Context, *pb.RotateDEKRequest) (*pb.RotateDEKResponse, error) {
 		return &pb.RotateDEKResponse{AppliedIndex: 1}, want
 	})
 	require.Nil(t, reply)
@@ -361,9 +365,9 @@ func TestBootstrapRotationRPCControllerResult(t *testing.T) {
 	for _, bad := range []struct {
 		credential string
 		node       uint64
-		run        bootstrapRotationRPCHandler
+		run        clusterbootstrap.BootstrapRotationRPCHandler
 	}{{}, {credential: bootstrapRotationRPCAdmin}, {credential: bootstrapRotationRPCAdmin, node: bootstrapRotationRPCNode}} {
-		_, err = newBootstrapRotationRPC(bad.credential, bad.node, bad.run)
+		_, err = clusterbootstrap.NewBootstrapRotationRPC(bad.credential, bad.node, bad.run)
 		require.Error(t, err)
 	}
 }

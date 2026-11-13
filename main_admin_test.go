@@ -16,7 +16,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -25,6 +24,8 @@ import (
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/admin"
 	"github.com/bootjp/elastickv/internal/adminbridge"
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
+	"github.com/bootjp/elastickv/internal/nodeauth"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
@@ -37,11 +38,11 @@ import (
 
 func TestConfigureAdminServiceDisabledByDefault(t *testing.T) {
 	t.Parallel()
-	srv, icept, err := configureAdminService(nodeAuthFlags{}, false, adapter.NodeIdentity{NodeID: "n1"}, nil, nil)
+	srv, icept, err := configureAdminService(nodeauth.Flags{}, false, adapter.NodeIdentity{NodeID: "n1"}, nil, nil)
 	if err != nil {
 		t.Fatalf("disabled-by-default should not error: %v", err)
 	}
-	if srv != nil || len(icept.unary) != 1 || len(icept.stream) != 1 {
+	if srv != nil || len(icept.Unary) != 1 || len(icept.Stream) != 1 {
 		t.Fatalf("disabled admin service should still deny migration mutations; got %v %+v", srv, icept)
 	}
 }
@@ -162,7 +163,7 @@ func TestConfigureAdminServiceRejectsMutualExclusion(t *testing.T) {
 	if err := os.WriteFile(tokPath, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := configureAdminService(nodeAuthFlags{adminTokenFile: tokPath, adminInsecureNoAuth: true}, false, adapter.NodeIdentity{}, nil, nil); err == nil {
+	if _, _, err := configureAdminService(nodeauth.Flags{AdminTokenFile: tokPath, AdminInsecureNoAuth: true}, false, adapter.NodeIdentity{}, nil, nil); err == nil {
 		t.Fatal("expected mutual-exclusion error")
 	}
 }
@@ -178,17 +179,17 @@ func TestConfigureAdminServiceTokenFile(t *testing.T) {
 	if err := os.WriteFile(peerPath, []byte("peer-secret\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	srv, icept, err := configureAdminService(nodeAuthFlags{adminTokenFile: tokPath, s3BlobPeerTokenFile: peerPath}, true, adapter.NodeIdentity{NodeID: "n1"}, nil, nil)
+	srv, icept, err := configureAdminService(nodeauth.Flags{AdminTokenFile: tokPath, S3BlobPeerTokenFile: peerPath}, true, adapter.NodeIdentity{NodeID: "n1"}, nil, nil)
 	if err != nil {
 		t.Fatalf("configureAdminService: %v", err)
 	}
 	if srv == nil {
 		t.Fatal("expected an AdminServer instance")
 	}
-	if len(icept.unary) != 3 || len(icept.stream) != 3 {
-		t.Fatalf("expected admin, migration and peer interceptors, got %d + %d", len(icept.unary), len(icept.stream))
+	if len(icept.Unary) != 3 || len(icept.Stream) != 3 {
+		t.Fatalf("expected admin, migration and peer interceptors, got %d + %d", len(icept.Unary), len(icept.Stream))
 	}
-	if !icept.s3BlobFetchEnabled {
+	if !icept.S3BlobFetchEnabled {
 		t.Fatal("token-authenticated configuration should enable S3BlobFetch")
 	}
 	overview, err := srv.GetClusterOverview(context.Background(), &pb.GetClusterOverviewRequest{})
@@ -210,7 +211,7 @@ func TestConfigureAdminServiceRejectsSharedAdminAndPeerToken(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, _, err := configureAdminService(nodeAuthFlags{adminTokenFile: adminPath, s3BlobPeerTokenFile: peerPath}, true, adapter.NodeIdentity{}, nil, nil); err == nil {
+	if _, _, err := configureAdminService(nodeauth.Flags{AdminTokenFile: adminPath, S3BlobPeerTokenFile: peerPath}, true, adapter.NodeIdentity{}, nil, nil); err == nil {
 		t.Fatal("expected shared admin and peer token to be rejected")
 	}
 }
@@ -226,11 +227,11 @@ func TestConfigureAdminServiceDoesNotAdvertiseDisabledS3BlobOffload(t *testing.T
 	if err := os.WriteFile(peerPath, []byte("peer-secret\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	srv, icept, err := configureAdminService(nodeAuthFlags{adminTokenFile: tokPath, s3BlobPeerTokenFile: peerPath}, false, adapter.NodeIdentity{NodeID: "n1"}, nil, nil)
+	srv, icept, err := configureAdminService(nodeauth.Flags{AdminTokenFile: tokPath, S3BlobPeerTokenFile: peerPath}, false, adapter.NodeIdentity{NodeID: "n1"}, nil, nil)
 	if err != nil {
 		t.Fatalf("configureAdminService: %v", err)
 	}
-	if !icept.s3BlobFetchEnabled {
+	if !icept.S3BlobFetchEnabled {
 		t.Fatal("rollback mode must retain authenticated blob reads")
 	}
 	overview, err := srv.GetClusterOverview(context.Background(), &pb.GetClusterOverviewRequest{})
@@ -244,17 +245,17 @@ func TestConfigureAdminServiceDoesNotAdvertiseDisabledS3BlobOffload(t *testing.T
 
 func TestConfigureAdminServiceInsecureNoAuth(t *testing.T) {
 	t.Parallel()
-	srv, icept, err := configureAdminService(nodeAuthFlags{adminInsecureNoAuth: true}, true, adapter.NodeIdentity{NodeID: "n1"}, nil, nil)
+	srv, icept, err := configureAdminService(nodeauth.Flags{AdminInsecureNoAuth: true}, true, adapter.NodeIdentity{NodeID: "n1"}, nil, nil)
 	if err != nil {
 		t.Fatalf("insecure mode should succeed: %v", err)
 	}
 	if srv == nil {
 		t.Fatal("expected AdminServer in insecure mode")
 	}
-	if !icept.empty() {
+	if !icept.Empty() {
 		t.Fatalf("insecure mode should not attach interceptors, got %+v", icept)
 	}
-	if icept.s3BlobFetchEnabled {
+	if icept.S3BlobFetchEnabled {
 		t.Fatal("insecure admin mode must not expose S3BlobFetch")
 	}
 	overview, err := srv.GetClusterOverview(context.Background(), &pb.GetClusterOverviewRequest{})
@@ -290,7 +291,7 @@ func TestConfigureAdminServiceWiresLeaderVersionProbe(t *testing.T) {
 
 	var cache kv.GRPCConnCache
 	t.Cleanup(func() { require.NoError(t, cache.Close()) })
-	srv, _, err := configureAdminService(nodeAuthFlags{adminInsecureNoAuth: true}, false, adapter.NodeIdentity{NodeID: "n1", GRPCAddress: "127.0.0.1:50051"}, nil, &cache)
+	srv, _, err := configureAdminService(nodeauth.Flags{AdminInsecureNoAuth: true}, false, adapter.NodeIdentity{NodeID: "n1", GRPCAddress: "127.0.0.1:50051"}, nil, &cache)
 	require.NoError(t, err)
 	require.NotNil(t, srv)
 	srv.RegisterGroup(1, adminVersionProbeGroup{leader: raftengine.LeaderInfo{
@@ -316,7 +317,7 @@ func TestConfigureAdminServiceUsesStampedBuildVersion(t *testing.T) {
 	if got := buildVersion(); got != "v-admin-test" {
 		t.Fatalf("buildVersion = %q, want v-admin-test", got)
 	}
-	srv, _, err := configureAdminService(nodeAuthFlags{adminInsecureNoAuth: true}, false, adapter.NodeIdentity{NodeID: "n1", GRPCAddress: "127.0.0.1:50051"}, nil, nil)
+	srv, _, err := configureAdminService(nodeauth.Flags{AdminInsecureNoAuth: true}, false, adapter.NodeIdentity{NodeID: "n1", GRPCAddress: "127.0.0.1:50051"}, nil, nil)
 	require.NoError(t, err)
 	require.NotNil(t, srv)
 	resp, err := srv.GetNodeVersion(context.Background(), &pb.GetNodeVersionRequest{})
@@ -374,7 +375,7 @@ func TestAdminMembersFromBootstrapEmpty(t *testing.T) {
 // unrelated) must not win over the real group listeners.
 func TestCanonicalSelfAddressPicksLowestGroup(t *testing.T) {
 	t.Parallel()
-	runtimes := []*raftGroupRuntime{
+	runtimes := []*clusterbootstrap.GroupRuntime{
 		{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 5, Address: "10.0.0.1:50055"}}},
 		{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 2, Address: "10.0.0.1:50052"}}},
 		{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 9, Address: "10.0.0.1:50059"}}},
@@ -390,18 +391,6 @@ func TestCanonicalSelfAddressFallsBackWithoutRuntimes(t *testing.T) {
 	got := canonicalSelfAddress("localhost:50051", nil)
 	if got != "localhost:50051" {
 		t.Fatalf("got %q, want fallback localhost:50051", got)
-	}
-}
-
-func TestLoadAdminTokenFileRejectsOversize(t *testing.T) {
-	t.Parallel()
-	dir := t.TempDir()
-	path := filepath.Join(dir, "huge")
-	if err := os.WriteFile(path, []byte(strings.Repeat("x", adminTokenMaxBytes+1)), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := loadAdminTokenFile(path); err == nil || !strings.Contains(err.Error(), "exceeds maximum") {
-		t.Fatalf("expected size-cap error, got %v", err)
 	}
 }
 

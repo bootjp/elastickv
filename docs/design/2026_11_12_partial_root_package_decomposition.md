@@ -269,6 +269,70 @@ Tests move with the code they cover.
   to binaries like the other extracted packages, and the guard's table
   test covers every extracted package.
 
+- M4, node auth: `internal/nodeauth` holds the node / admin gRPC
+  authentication: `Flags` (admin token, insecure mode, split-migration
+  token and enforcement, peer gRPC TLS, S3 blob peer token) with
+  `ServiceTokenFiles`, `LoadGRPCAuth` and the split-migration readiness
+  gates, the token-file loaders and validators, `ConfigureGRPCTransport`,
+  the bearer-token interceptor helper and `AdminGRPCInterceptors`. It
+  imports only `internal` and `adapter`. Its unit tests moved with it;
+  the wiring tests that build the admin service or call `run()` stay in
+  `main`.
+
+- M5a (seams before the encryption move, still in `package main`):
+  - The writer-registration source is an interface owned by encryption
+    (`writerRegistrationSource` with `Validate` / `Propose` / `Forward`,
+    installed with `withWriterRegistrationSource`); protected bootstrap
+    stores its `*bootstrapRegistrationSource` under it. Encryption no
+    longer calls into bootstrap for registration.
+  - The capability fan-out builders take a `kv.GRPCDialOptionsForAddress`
+    and build their own `kv.GRPCConnCache`; the raft-server wiring passes
+    the protected-bootstrap dial options.
+  - Encryption functions take `*noderuntime.GroupRuntime` cores instead of
+    the root wrapper (`runtimeCores` / `runtimeCore` adapt the callers), and
+    `noderuntime` gains `ProposerForGroup`, `PostCutoverProposer`,
+    `AppliedIndexForEngine` and `FindGroupRuntime`.
+  - Assembly code left encryption-named files
+    (`buildShardGroupsWithEncryptionWiring` → shard groups,
+    `setupDistributionAndRegistration` → distribution start-up), and the
+    bootstrap start-up that starts distribution is now
+    `main_distribution_bootstrap_encryption.go`. The raft-envelope
+    installed / projection code and the domain wiring validators, which
+    use only encryption types, are now encryption-named files.
+  - `distribution.CatalogGroupID` replaces the root helper, and
+    `noderuntime.VoterSuffrage` replaces the root voter constant.
+  - A trial compile of the encryption files as their own package leaves no
+    undefined identifier, so M5b is a pure move.
+
+- M5b: the encryption wiring moved to `internal/encryptionwiring` as a
+  move with exported identifiers (`Flags`, `WriteWiring`,
+  `RaftEnvelopeRuntime`, `BuildWriteWiring`, `LoadKEKAfterPreNonceStartupGuards`,
+  the start-up guards, registration, rotate-on-startup, the EncryptionAdmin
+  server and fan-out, `NewConfChangeInterceptor`, ...). Fields that the
+  root still reads or builds are exported as-is, including
+  `RaftEnvelopeRuntime.Mu`, per the exported-fields decision. Tests moved
+  with the code; the wiring tests that build `raftGroupRuntime` literals or
+  the startup gate stay in `main` with copies of the shared fixtures. The
+  package may import `noderuntime` and the concrete etcd backend; only
+  binaries may import it until M6 and M7 widen that to `clusterbootstrap`
+  and `server`, and `adapter` may not import it.
+
+- M6a / M6b: assembly code left bootstrap-named files
+  (`shardGroupBuilder.bootstrapSpecForGroup` → shard groups,
+  `resolveNetworkRuntimeInputs` → runtime config), after which the
+  bootstrap files, the startup gate and the root runtime wrapper compiled
+  as a package of their own. They moved to `internal/clusterbootstrap`;
+  `raftGroupRuntime` is now `clusterbootstrap.GroupRuntime` (with
+  `GroupID`, and `RuntimeCore` / `RuntimeCores` for the nil-safe core), and
+  the engine is read through `RuntimeCore(rt).SnapshotEngine()`. Test files
+  moved at file granularity: the three that compile against the package
+  alone moved, and the rest (e2e fixtures and tests that need the
+  shard-group builder, distribution start-up or the raft servers) stay in
+  `main` and use the exported API. `elastickv -help` and the
+  `elastickv bootstrap ...` usage and subcommand errors are identical to
+  the base. The package may import `noderuntime`, `nodeauth`,
+  `encryptionwiring` and the etcd backend; only binaries may import it.
+
 ## Decisions
 
 - **Internal packages, not exported library packages.** These packages

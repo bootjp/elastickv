@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/internal/raftengine/etcd"
@@ -19,12 +20,12 @@ func TestNamespaceReplayMustRejectHaltBeforeNoop(t *testing.T) {
 	t.Parallel()
 	baseline, prepared := preparedTSOMigrationFixture(t)
 	dir := t.TempDir()
-	_, err := initializePreparedTSOBaseline(t.Context(), dir, baseline, prepared)
+	_, err := clusterbootstrap.InitializePreparedTSOBaseline(t.Context(), dir, baseline, prepared)
 	require.NoError(t, err)
-	st, err := store.NewPebbleStore(filepath.Join(dir, dedicatedTSOControlStoreName))
+	st, err := store.NewPebbleStore(filepath.Join(dir, clusterbootstrap.DedicatedTSOControlStoreName))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, st.Close()) })
-	sm, err := newProtectedTSOStateMachine(st, nil, prepared.Probe.Identity)
+	sm, err := clusterbootstrap.NewProtectedTSOStateMachine(st, nil, prepared.Probe.Identity)
 	require.NoError(t, err)
 	entry := etcd.OfflineBaselineReplayEntry{Index: baseline.AppliedIndex + 1, Term: prepared.Probe.CommitTerm,
 		Type: kv.TSOBaselineNormalEntry, Payload: []byte{0xff}}
@@ -38,7 +39,7 @@ func TestNamespaceReplayMustRejectHaltBeforeNoop(t *testing.T) {
 	index := entry.Index + 1
 	require.NoError(t, sm.SetDurableAppliedIndex(index))
 	entries := []etcd.OfflineBaselineReplayEntry{entry, {Index: index, Term: entry.Term, Type: kv.TSOBaselineNormalEntry}}
-	err = compareReplayedTSOControl(t.Context(), sm, prepared, baseline, native, entries, index)
+	err = clusterbootstrap.CompareReplayedTSOControl(t.Context(), sm, prepared, baseline, native, entries, index)
 	require.Error(t, err, "a later no-op must not hide the earlier halting entry")
 }
 
@@ -47,7 +48,7 @@ func TestProtectedTSOLegacyRecoveryRejectsAdditionalControlState(t *testing.T) {
 	dir := noderuntime.GroupDataDir(base, "n1", 0, true)
 	ownership, err := etcd.AcquireOfflineBaselineOwnership(dir)
 	require.NoError(t, err)
-	st, err := store.NewPebbleStore(filepath.Join(dir, dedicatedTSOControlStoreName))
+	st, err := store.NewPebbleStore(filepath.Join(dir, clusterbootstrap.DedicatedTSOControlStoreName))
 	require.NoError(t, err)
 	metadata, ok := st.(store.RaftControlMetadataStore)
 	require.True(t, ok)
@@ -61,20 +62,20 @@ func TestProtectedTSOLegacyRecoveryRejectsAdditionalControlState(t *testing.T) {
 
 func assertTSOLegacyRecoveryRefused(t *testing.T, base, peerConfigDir string, profile []noderuntime.GroupSpec) {
 	t.Helper()
-	path := filepath.Join(noderuntime.GroupDataDir(base, "n1", 0, true), dedicatedTSOControlStoreName)
-	before, err := readOnlyTSOStoreDigest(t.Context(), path)
+	path := filepath.Join(noderuntime.GroupDataDir(base, "n1", 0, true), clusterbootstrap.DedicatedTSOControlStoreName)
+	before, err := clusterbootstrap.ReadOnlyTSOStoreDigest(t.Context(), path)
 	require.NoError(t, err)
 	bootstrapCfg := noderuntime.BootstrapConfig{PeerConfigDir: peerConfigDir}
-	specs, domain, err := loadProtectedBootstrapDomain("n1", base, profile, true, bootstrapCfg)
+	specs, domain, err := clusterbootstrap.LoadProtectedBootstrapDomain("n1", base, profile, true, bootstrapCfg)
 	require.NoError(t, err)
-	t.Cleanup(domain.admission.Close)
+	t.Cleanup(domain.Admission.Close)
 	builder := shardGroupBuilder{raftID: "n1", raftDir: base, multi: true, factory: enablementFactory(), clock: kv.NewHLC(), bootstrapSpecs: specs, bootstrapCfg: bootstrapCfg}
 	runtime, _, err := builder.build(profile[0])
 	if runtime != nil {
 		runtime.Close()
 	}
 	require.ErrorIs(t, err, kv.ErrTSODurableBacking, "a correct index and preparation cannot authorize unknown control rows")
-	after, err := readOnlyTSOStoreDigest(t.Context(), path)
+	after, err := clusterbootstrap.ReadOnlyTSOStoreDigest(t.Context(), path)
 	require.NoError(t, err)
 	require.Equal(t, before, after, "rejected startup must not import, erase or merge scalar/control state")
 }
@@ -82,7 +83,7 @@ func assertTSOLegacyRecoveryRefused(t *testing.T, base, peerConfigDir string, pr
 func assertTSOMissingReceiptRefusesRecovery(t *testing.T, base, configDir string, profile []noderuntime.GroupSpec) {
 	t.Helper()
 	dir := noderuntime.GroupDataDir(base, "n1", 0, true)
-	path := filepath.Join(dir, dedicatedTSOControlStoreName)
+	path := filepath.Join(dir, clusterbootstrap.DedicatedTSOControlStoreName)
 	ownership, err := etcd.AcquireOfflineBaselineOwnership(dir)
 	require.NoError(t, err)
 	db, err := pebble.Open(path, nil)

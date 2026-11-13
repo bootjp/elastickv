@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/keyviz"
 	"github.com/stretchr/testify/require"
@@ -53,7 +54,7 @@ func TestStartKeyVizLeaderTermPublisherSkipsWhenSamplerNil(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	eg, _ := errgroup.WithContext(ctx)
-	startKeyVizLeaderTermPublisher(ctx, eg, nil, []*raftGroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 1}}}})
+	startKeyVizLeaderTermPublisher(ctx, eg, nil, []*clusterbootstrap.GroupRuntime{{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 1}}}})
 	require.NoError(t, eg.Wait(),
 		"errgroup must close immediately because no goroutine should have launched")
 }

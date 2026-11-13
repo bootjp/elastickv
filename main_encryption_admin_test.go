@@ -1,122 +1,13 @@
 package main
 
 import (
-	"context"
-	"net"
-	"path/filepath"
 	"testing"
 
-	"github.com/bootjp/elastickv/internal/encryption"
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
+	"github.com/bootjp/elastickv/internal/encryptionwiring"
 	"github.com/bootjp/elastickv/internal/noderuntime"
-	"github.com/bootjp/elastickv/internal/raftengine"
-	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/bootjp/elastickv/kv"
-	pb "github.com/bootjp/elastickv/proto"
-	"github.com/bootjp/elastickv/store"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/status"
-	"google.golang.org/grpc/test/bufconn"
 )
-
-// stubEncryptionAdminEngine satisfies the encryptionAdminEngine
-// interface (Proposer + LeaderView) for tests that exercise the
-// Stage 6B-2 mutator-wiring gate. The methods are nil-deref-safe
-// stubs; the registration helper only stores them on the
-// EncryptionAdminServer options. Tests that exercise the gate via
-// a gRPC client never actually issue a Raft proposal because the
-// mutator path returns ErrFailedPrecondition before reaching
-// Propose() in the no-mutator case, and tests for the enabled
-// case stop at status.Code inspection.
-type stubEncryptionAdminEngine struct{}
-
-func (stubEncryptionAdminEngine) Propose(context.Context, []byte) (*raftengine.ProposalResult, error) {
-	return &raftengine.ProposalResult{}, nil
-}
-func (s stubEncryptionAdminEngine) ProposeAdmin(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
-	return s.Propose(ctx, data)
-}
-func (stubEncryptionAdminEngine) State() raftengine.State       { return raftengine.StateLeader }
-func (stubEncryptionAdminEngine) Leader() raftengine.LeaderInfo { return raftengine.LeaderInfo{} }
-func (stubEncryptionAdminEngine) VerifyLeader(context.Context) error {
-	return nil
-}
-func (stubEncryptionAdminEngine) LinearizableRead(context.Context) (uint64, error) {
-	return 0, nil
-}
-
-// TestEncryptionAdminFullNodeID_DistinctPerRaftId pins the
-// PR760 r1 Codex P1 regression: full_node_id must be derived from
-// --raftId (per-node-stable) and NOT from the Raft group id
-// (shared across replicas). An earlier wiring passed rt.spec.id,
-// which makes every replica return the same CapabilityReport
-// value and breaks BootstrapEncryption's
-// validateWriterBatchUniqueness check. The fix routes through
-// etcd.DeriveNodeID(raftId) at the call site; this test confirms
-// the canonical derivation is in fact distinct for the canonical
-// 3-node config (n1 / n2 / n3) the demo + Jepsen runners use.
-func TestEncryptionAdminFullNodeID_DistinctPerRaftId(t *testing.T) {
-	t.Parallel()
-	seen := make(map[uint64]string)
-	for _, id := range []string{"n1", "n2", "n3"} {
-		got := etcdraftengine.DeriveNodeID(id)
-		if got == 0 {
-			t.Fatalf("DeriveNodeID(%q) returned 0; the §6.1 not-capable sentinel must never be used as a real node id", id)
-		}
-		if dup, exists := seen[got]; exists {
-			t.Fatalf("DeriveNodeID(%q) = DeriveNodeID(%q) = %d; full_node_id must be distinct across raftIds — BootstrapEncryption uniqueness would reject", id, dup, got)
-		}
-		seen[got] = id
-	}
-}
-
-func TestEncryptionAdminDefaultWriterRegistryUsesDefaultGroupStore(t *testing.T) {
-	t.Parallel()
-
-	defaultStore := newEncryptionAdminRegistryTestStore(t, "default")
-	otherStore := newEncryptionAdminRegistryTestStore(t, "other")
-	groups := map[uint64]*kv.ShardGroup{
-		1: {Store: defaultStore},
-		2: {Store: otherStore},
-	}
-
-	reg, err := encryptionAdminDefaultWriterRegistry("keys.json", groups, 1)
-	if err != nil {
-		t.Fatalf("encryptionAdminDefaultWriterRegistry: %v", err)
-	}
-	key := encryption.RegistryKey(7, encryption.NodeID16(0xCAFE))
-	value := encryption.EncodeRegistryValue(encryption.RegistryValue{
-		FullNodeID:          0xCAFE,
-		FirstSeenLocalEpoch: 3,
-		LastSeenLocalEpoch:  3,
-	})
-	if err := reg.SetRegistryRow(key, value); err != nil {
-		t.Fatalf("SetRegistryRow: %v", err)
-	}
-
-	defaultReg, err := store.WriterRegistryFor(defaultStore)
-	if err != nil {
-		t.Fatalf("WriterRegistryFor(default): %v", err)
-	}
-	got, ok, err := defaultReg.GetRegistryRow(key)
-	if err != nil {
-		t.Fatalf("GetRegistryRow(default): %v", err)
-	}
-	if !ok || string(got) != string(value) {
-		t.Fatalf("default registry row ok=%v value=%x, want %x", ok, got, value)
-	}
-
-	otherReg, err := store.WriterRegistryFor(otherStore)
-	if err != nil {
-		t.Fatalf("WriterRegistryFor(other): %v", err)
-	}
-	if got, ok, err := otherReg.GetRegistryRow(key); err != nil {
-		t.Fatalf("GetRegistryRow(other): %v", err)
-	} else if ok {
-		t.Fatalf("non-default registry unexpectedly has row value=%x", got)
-	}
-}
 
 func TestEncryptionAdminDefaultRuntimeOptionsUsesDefaultGroupRuntime(t *testing.T) {
 	t.Parallel()
@@ -128,11 +19,11 @@ func TestEncryptionAdminDefaultRuntimeOptionsUsesDefaultGroupRuntime(t *testing.
 	_ = kv.NewLeaderProxyForShardGroup(defaultGroup)
 	_ = kv.NewLeaderProxyForShardGroup(otherGroup)
 
-	got, err := encryptionAdminDefaultRuntimeOptions(
-		[]*raftGroupRuntime{
+	got, err := encryptionwiring.AdminDefaultRuntimeOptions(
+		clusterbootstrap.RuntimeCores([]*clusterbootstrap.GroupRuntime{
 			{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 1}, Engine: defaultEngine}},
 			{GroupRuntime: &noderuntime.GroupRuntime{Spec: noderuntime.GroupSpec{ID: 2}, Engine: otherEngine}},
-		},
+		}),
 		map[uint64]*kv.ShardGroup{
 			1: defaultGroup,
 			2: otherGroup,
@@ -141,170 +32,15 @@ func TestEncryptionAdminDefaultRuntimeOptionsUsesDefaultGroupRuntime(t *testing.
 		true,
 	)
 	if err != nil {
-		t.Fatalf("encryptionAdminDefaultRuntimeOptions: %v", err)
+		t.Fatalf("encryptionwiring.AdminDefaultRuntimeOptions: %v", err)
 	}
-	if got.engine != encryptionAdminEngine(defaultEngine) {
-		t.Fatalf("engine=%T, want default group engine", got.engine)
+	if got.Engine != encryptionwiring.AdminEngine(defaultEngine) {
+		t.Fatalf("engine=%T, want default group engine", got.Engine)
 	}
-	if got.postCutoverProposer != defaultGroup.Proposer() {
+	if got.PostCutoverProposer != defaultGroup.Proposer() {
 		t.Error("postCutoverProposer did not use the default group's wrap-aware proposer")
 	}
-	if got.postCutoverProposer == otherGroup.Proposer() {
+	if got.PostCutoverProposer == otherGroup.Proposer() {
 		t.Error("postCutoverProposer unexpectedly used the non-default group's proposer")
-	}
-}
-
-func TestEncryptionAdminDefaultRuntimeOptionsRequiresDefaultRuntime(t *testing.T) {
-	t.Parallel()
-
-	if _, err := encryptionAdminDefaultRuntimeOptions(nil, nil, 7, true); err == nil {
-		t.Fatal("missing required default runtime returned nil error")
-	}
-	if _, err := encryptionAdminDefaultRuntimeOptions(nil, nil, 7, false); err != nil {
-		t.Fatalf("missing optional default runtime returned error: %v", err)
-	}
-}
-
-func newEncryptionAdminRegistryTestStore(t *testing.T, name string) store.MVCCStore {
-	t.Helper()
-	st, err := store.NewPebbleStore(filepath.Join(t.TempDir(), name+".db"))
-	if err != nil {
-		t.Fatalf("NewPebbleStore(%s): %v", name, err)
-	}
-	t.Cleanup(func() {
-		if closer, ok := st.(interface{ Close() error }); ok {
-			if err := closer.Close(); err != nil {
-				t.Fatalf("close %s store: %v", name, err)
-			}
-		}
-	})
-	return st
-}
-
-// TestEncryptionAdmin_MutatingRPCRefusedWhenGateOff pins the
-// Stage 6B-2 double-gate. With either condition of the gate false
-// (enableMutators=false OR engine=nil), Proposer + LeaderView
-// MUST stay unwired and EncryptionAdminServer.BootstrapEncryption
-// returns FailedPrecondition at the gRPC boundary — the proposal
-// never reaches Raft.
-//
-// The matrix below exercises all 4 corners of (enableMutators,
-// engine-supplied). Only the (true, non-nil) combination is the
-// production "gate ON" case, which is tested separately by
-// TestEncryptionAdmin_MutatingRPCEnabledWhenGateOn.
-func TestEncryptionAdmin_MutatingRPCRefusedWhenGateOff(t *testing.T) {
-	t.Parallel()
-	for _, tc := range []struct {
-		name           string
-		enableMutators bool
-		engine         encryptionAdminEngine
-	}{
-		{name: "flag_off_engine_nil", enableMutators: false, engine: nil},
-		{name: "flag_off_engine_set", enableMutators: false, engine: stubEncryptionAdminEngine{}},
-		{name: "flag_on_engine_nil", enableMutators: true, engine: nil},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			err := callBootstrapAgainstNewServer(t, tc.enableMutators, tc.engine)
-			if err == nil {
-				t.Fatal("BootstrapEncryption succeeded with gate off; mutating wiring must be refused at the RPC boundary")
-			}
-			if got := status.Code(err); got != codes.FailedPrecondition {
-				t.Errorf("BootstrapEncryption status=%v, want FailedPrecondition; err=%v", got, err)
-			}
-		})
-	}
-}
-
-// TestEncryptionAdmin_MutatingRPCEnabledWhenGateOn pins the
-// other side of the Stage 6B-2 gate: when enableMutators=true AND
-// engine is non-nil, the mutator wiring is installed and
-// BootstrapEncryption reaches the Raft propose path. The stub
-// engine's Propose() returns success, so the only-RPC-layer
-// portion of the path completes; deeper apply-layer behaviour is
-// covered by the applier tests in internal/encryption.
-//
-// The expected status is NOT FailedPrecondition — that is the
-// gate-off signature. The exact OK / OtherCode depends on the
-// EncryptionAdminServer's downstream validation of the empty
-// wrapped payload; the test asserts the FailedPrecondition gate
-// is no longer firing, which is the property that distinguishes
-// gate-on from gate-off.
-func TestEncryptionAdmin_MutatingRPCEnabledWhenGateOn(t *testing.T) {
-	t.Parallel()
-	err := callBootstrapAgainstNewServer(t, true, stubEncryptionAdminEngine{})
-	// Whatever the deeper error, it must not be the FailedPrecondition
-	// from the gate. The stub Propose() returns success on a malformed
-	// payload, so the actual return may be a deeper InvalidArgument
-	// or codes.OK — anything except FailedPrecondition / transport
-	// statuses is acceptable.
-	if err != nil {
-		got := status.Code(err)
-		if got == codes.FailedPrecondition {
-			t.Errorf("BootstrapEncryption returned FailedPrecondition with gate ON; want a deeper status (gate should not refuse): err=%v", err)
-		}
-		// Bufconn transport failures or context-derived statuses
-		// would defeat the test purpose — fail loud rather than
-		// silently passing on infra noise (coderabbit PR #776
-		// minor).
-		if got == codes.Unavailable || got == codes.DeadlineExceeded || got == codes.Canceled {
-			t.Fatalf("BootstrapEncryption failed on test transport/setup, not gate behavior: code=%v err=%v", got, err)
-		}
-	}
-}
-
-func callBootstrapAgainstNewServer(t *testing.T, enableMutators bool, engine encryptionAdminEngine) error {
-	t.Helper()
-	listener := bufconn.Listen(1024 * 1024)
-	gs := grpc.NewServer()
-	registerEncryptionAdminServer(gs, newEncryptionAdminServer(1, "", enableMutators, engine, nil, nil, nil))
-	go func() { _ = gs.Serve(listener) }()
-	t.Cleanup(gs.Stop)
-	conn, err := grpc.NewClient(
-		"passthrough:///bufnet",
-		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
-			return listener.Dial()
-		}),
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-	)
-	if err != nil {
-		t.Fatalf("grpc.NewClient: %v", err)
-	}
-	t.Cleanup(func() { _ = conn.Close() })
-	client := pb.NewEncryptionAdminClient(conn)
-	_, err = client.BootstrapEncryption(context.Background(), &pb.BootstrapEncryptionRequest{
-		StorageDekId:      1,
-		RaftDekId:         2,
-		WrappedStorageDek: []byte("w"),
-		WrappedRaftDek:    []byte("w"),
-	})
-	return err
-}
-
-func TestRegisterEncryptionAdminServer_Registers(t *testing.T) {
-	t.Parallel()
-	gs := grpc.NewServer()
-	registerEncryptionAdminServer(gs, newEncryptionAdminServer(1, "", false, nil, nil, nil, nil))
-	info := gs.GetServiceInfo()
-	if _, ok := info["EncryptionAdmin"]; !ok {
-		var registered []string
-		for name := range info {
-			registered = append(registered, name)
-		}
-		t.Fatalf("EncryptionAdmin not registered; got services=%v", registered)
-	}
-}
-
-func TestRegisterEncryptionAdminServer_CanReuseInstance(t *testing.T) {
-	t.Parallel()
-	srv := newEncryptionAdminServer(1, "", false, nil, nil, nil, nil)
-	first := grpc.NewServer()
-	second := grpc.NewServer()
-	registerEncryptionAdminServer(first, srv)
-	registerEncryptionAdminServer(second, srv)
-	if _, ok := first.GetServiceInfo()["EncryptionAdmin"]; !ok {
-		t.Fatal("EncryptionAdmin service not registered on first gRPC server")
-	}
-	if _, ok := second.GetServiceInfo()["EncryptionAdmin"]; !ok {
-		t.Fatal("EncryptionAdmin service not registered on second gRPC server")
 	}
 }

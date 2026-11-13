@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc"
@@ -281,4 +282,41 @@ func EnsureRaftEngineDataDirForFactory(dir string, engineType RaftEngineType, fa
 		return errors.WithStack(protected.PreflightRaftDataDir(dir, engineType))
 	}
 	return ensureRaftEngineDataDir(dir, engineType)
+}
+
+// ProposerForGroup returns the proposer of rt's shard group when it is wired,
+// so proposals observe raft-envelope cutovers, and the raw engine otherwise.
+func ProposerForGroup(rt *GroupRuntime, shardGroups map[uint64]*kv.ShardGroup) raftengine.Proposer {
+	if sg, ok := shardGroups[rt.Spec.ID]; ok && sg != nil {
+		return sg.Proposer()
+	}
+	return rt.Engine
+}
+
+// PostCutoverProposer is ProposerForGroup, nil-safe on rt.
+func PostCutoverProposer(rt *GroupRuntime, shardGroups map[uint64]*kv.ShardGroup) raftengine.Proposer {
+	if rt == nil {
+		return nil
+	}
+	return ProposerForGroup(rt, shardGroups)
+}
+
+// AppliedIndexForEngine returns the engine's applied-index reader, or nil when
+// the engine does not expose one.
+func AppliedIndexForEngine(engine raftengine.Engine) func() uint64 {
+	applied, ok := engine.(interface{ AppliedIndex() uint64 })
+	if !ok {
+		return nil
+	}
+	return applied.AppliedIndex
+}
+
+// FindGroupRuntime returns the runtime serving groupID, or nil.
+func FindGroupRuntime(runtimes []*GroupRuntime, groupID uint64) *GroupRuntime {
+	for _, rt := range runtimes {
+		if rt != nil && rt.Spec.ID == groupID {
+			return rt
+		}
+	}
+	return nil
 }

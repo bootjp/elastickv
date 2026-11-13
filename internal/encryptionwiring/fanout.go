@@ -1,0 +1,246 @@
+package encryptionwiring
+
+import (
+	"context"
+	"log/slog"
+	"time"
+
+	"github.com/bootjp/elastickv/adapter"
+	"github.com/bootjp/elastickv/internal/admin"
+	"github.com/bootjp/elastickv/internal/noderuntime"
+	"github.com/bootjp/elastickv/internal/raftengine"
+	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
+	"github.com/bootjp/elastickv/kv"
+	pb "github.com/bootjp/elastickv/proto"
+	"github.com/cockroachdb/errors"
+	"golang.org/x/sync/errgroup"
+)
+
+// CapabilityFanoutTimeout bounds the whole §4 GetCapability fan-out the
+// EnableStorageEnvelope cutover runs before proposing. The helper
+// caps the entire fan-out (not per-probe) by this value regardless of
+// member count, so a slow/unreachable peer cannot stall the operator's
+// cutover RPC indefinitely — it surfaces as a Reachable=false verdict
+// and the cutover fails closed. 5s is generous for a small-cluster
+// GetCapability round-trip.
+const CapabilityFanoutTimeout = 5 * time.Second
+
+const storageEnvelopeV2CapabilityRetryInterval = 5 * time.Second
+
+// BuildCapabilityFanout builds the §4 capability fan-out
+// closure shared across every shard's EncryptionAdmin server, or nil
+// when encryption mutators are disabled (the cutover RPC is then
+// unreachable, so the fan-out would never run). It owns a dedicated
+// kv.GRPCConnCache — NOT the --adminEnabled-gated admin-forward cache —
+// so the fan-out dials whenever encryption mutators are enabled,
+// independent of the admin HTTP surface; the cache is drained on
+// context cancellation via eg.
+func BuildCapabilityFanout(ctx context.Context, eg *errgroup.Group, runtimes []*noderuntime.GroupRuntime, dial kv.GRPCDialOptionsForAddress, enableMutators bool) adapter.CapabilityFanoutFn {
+	if !enableMutators {
+		return nil
+	}
+	fanoutConnCache := kv.NewGRPCConnCache(dial)
+	eg.Go(func() error {
+		<-ctx.Done()
+		if err := fanoutConnCache.Close(); err != nil {
+			return errors.Wrap(err, "close encryption capability fan-out gRPC connection cache")
+		}
+		return nil
+	})
+	return BuildCapabilityFanoutFn(runtimes, fanoutConnCache, CapabilityFanoutTimeout)
+}
+
+// BuildStorageEnvelopeV2MonitorFanout builds the fan-out the startup monitor
+// uses, on a connection cache of its own, and returns the closer for it.
+//
+// It deliberately does not share buildEncryptionCapabilityFanout's cache. That
+// one is the EnableStorageEnvelope cutover's, held for the process lifetime
+// because an operator can call the RPC at any time. The monitor is different:
+// it dials every voter and learner of every group on each attempt and then
+// finishes for good once V2 writes activate. Sharing the cutover's cache would
+// make ordinary startup on an encrypted cluster leave one idle connection per
+// peer on every node -- an all-to-all mesh, built unconditionally, for a probe
+// that is over. With its own cache the monitor drops those connections when it
+// exits, and the cutover dials again if it is ever used.
+func BuildStorageEnvelopeV2MonitorFanout(
+	runtimes []*noderuntime.GroupRuntime,
+	dial kv.GRPCDialOptionsForAddress,
+	enableMutators bool,
+) (adapter.CapabilityFanoutFn, func() error) {
+	if !enableMutators {
+		return nil, nil
+	}
+	connCache := kv.NewGRPCConnCache(dial)
+	return BuildCapabilityFanoutFn(runtimes, connCache, CapabilityFanoutTimeout), connCache.Close
+}
+
+// StartStorageEnvelopeV2CapabilityMonitor keeps encrypted writes on V1 until
+// a fresh live-membership fan-out confirms V2 reader support on every voter
+// and learner. Activation is sticky because existing V2 rows remain part of
+// snapshots after the first V2 write.
+//
+// release, when non-nil, is called once the monitor stops -- on activation or
+// on shutdown -- so the connections the probe opened do not outlive it.
+func StartStorageEnvelopeV2CapabilityMonitor(
+	ctx context.Context,
+	eg *errgroup.Group,
+	capabilityFanout adapter.CapabilityFanoutFn,
+	release func() error,
+	wiring WriteWiring,
+) {
+	if eg == nil || capabilityFanout == nil || wiring.Cache == nil || wiring.storageEnvelopeV2Active == nil {
+		return
+	}
+	eg.Go(func() error {
+		defer releaseCapabilityMonitorConns(release)
+		timer := time.NewTimer(0)
+		defer timer.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-timer.C:
+			}
+			if tryActivateStorageEnvelopeV2Writes(ctx, capabilityFanout, wiring) {
+				return nil
+			}
+			timer.Reset(storageEnvelopeV2CapabilityRetryInterval)
+		}
+	})
+}
+
+// releaseCapabilityMonitorConns closes the monitor's connections. A close
+// failure is logged rather than returned: the monitor's own outcome is what
+// the errgroup reports, and a stuck connection must not turn a successful
+// activation into a startup failure.
+func releaseCapabilityMonitorConns(release func() error) {
+	if release == nil {
+		return
+	}
+	if err := release(); err != nil {
+		slog.Warn("encryption: close storage envelope capability monitor connections",
+			slog.String("error", err.Error()))
+	}
+}
+
+func tryActivateStorageEnvelopeV2Writes(
+	ctx context.Context,
+	capabilityFanout adapter.CapabilityFanoutFn,
+	wiring WriteWiring,
+) bool {
+	keyID, bootstrapped := wiring.Cache.ActiveStorageKeyID()
+	if !bootstrapped {
+		return false
+	}
+	result, err := capabilityFanout(ctx)
+	if err != nil || !result.StorageEnvelopeV2Ready() {
+		return false
+	}
+	wiring.activateStorageEnvelopeV2Writes()
+	slog.Info("encryption: enabled V2 storage envelope writes after cluster capability confirmation",
+		slog.Uint64("key_id", uint64(keyID)))
+	return true
+}
+
+// BuildCapabilityFanoutFn assembles the adapter.CapabilityFanoutFn the
+// EnableStorageEnvelope server invokes for its §4 pre-flight check. The
+// returned closure snapshots the live membership of every Raft group
+// (the §4.1 "voter ∪ learner of every group" contract) and fans
+// GetCapability out to each unique node.
+//
+// dial reuses connCache so repeated cutover attempts share one
+// *grpc.ClientConn per peer; the cleanup closure is a no-op because the
+// cache owns the connection lifecycle (closed on shutdown by the
+// caller, not per-probe). A snapshot-build error fails the closure so
+// the cutover refuses rather than proposing against a membership view
+// it could not fully enumerate (fail-closed, §4.3 no-partial-success).
+func BuildCapabilityFanoutFn(runtimes []*noderuntime.GroupRuntime, connCache *kv.GRPCConnCache, timeout time.Duration) adapter.CapabilityFanoutFn {
+	dial := func(_ context.Context, address string) (pb.EncryptionAdminClient, func(), error) {
+		conn, err := connCache.ConnFor(address)
+		if err != nil {
+			return nil, nil, errors.Wrapf(err, "capability fan-out: dial %s", address)
+		}
+		return pb.NewEncryptionAdminClient(conn), func() {}, nil
+	}
+	return func(ctx context.Context) (admin.CapabilityFanoutResult, error) {
+		snapshot, err := capabilityRouteSnapshot(ctx, runtimes)
+		if err != nil {
+			return admin.CapabilityFanoutResult{}, err
+		}
+		return admin.CapabilityFanout(ctx, snapshot, dial, timeout)
+	}
+}
+
+// configReader is the narrow membership-view surface
+// capabilityRouteSnapshot needs from a Raft engine. raftengine.Engine
+// satisfies it structurally; defining it here lets the snapshot
+// builder be unit-tested with a stub that returns a Configuration
+// error (the fail-closed path) without standing up a full engine.
+type configReader interface {
+	Configuration(ctx context.Context) (raftengine.Configuration, error)
+}
+
+// groupConfigSource pairs a group id with its membership reader.
+type groupConfigSource struct {
+	groupID uint64
+	Engine  configReader
+}
+
+// capabilityRouteSnapshot builds the all-groups admin.RouteSnapshot
+// from each runtime's live Raft Configuration. It reads each engine
+// via snapshotEngine() (engineMu.RLock) because the fan-out closure
+// runs during live EnableStorageEnvelope RPCs, concurrently with a
+// possible Close() that clears the engine field — a direct field read
+// would be a data race. A nil runtime/engine is skipped.
+func capabilityRouteSnapshot(ctx context.Context, runtimes []*noderuntime.GroupRuntime) (admin.RouteSnapshot, error) {
+	sources := make([]groupConfigSource, 0, len(runtimes))
+	for _, rt := range runtimes {
+		if rt == nil {
+			continue
+		}
+		eng := rt.SnapshotEngine()
+		if eng == nil {
+			continue
+		}
+		sources = append(sources, groupConfigSource{groupID: rt.Spec.ID, Engine: eng})
+	}
+	return routeSnapshotFromSources(ctx, sources)
+}
+
+// routeSnapshotFromSources maps each group's Configuration into the
+// admin.RouteSnapshot. Any Configuration error aborts the whole
+// snapshot so the caller fails closed — the cutover must never
+// proceed against a membership view it could not fully enumerate.
+func routeSnapshotFromSources(ctx context.Context, sources []groupConfigSource) (admin.RouteSnapshot, error) {
+	groups := make([]admin.RouteGroup, 0, len(sources))
+	for _, s := range sources {
+		cfg, err := s.Engine.Configuration(ctx)
+		if err != nil {
+			return admin.RouteSnapshot{}, errors.Wrapf(err, "capability fan-out: configuration for group %d", s.groupID)
+		}
+		groups = append(groups, routeGroupFromConfiguration(s.groupID, cfg))
+	}
+	return admin.RouteSnapshot{Groups: groups}, nil
+}
+
+// routeGroupFromConfiguration maps one Raft group's live Configuration
+// to an admin.RouteGroup: each server becomes a RouteMember keyed by
+// etcd.DeriveNodeID(srv.ID) (the node identity the rest of the
+// encryption stack uses), split into Voters / Learners on Suffrage.
+// Empty suffrage counts as voter, matching raftengine's convention
+// that an unannotated peer (e.g. mid-WAL-replay) is a voter.
+func routeGroupFromConfiguration(groupID uint64, cfg raftengine.Configuration) admin.RouteGroup {
+	group := admin.RouteGroup{GroupID: groupID}
+	for _, srv := range cfg.Servers {
+		member := admin.RouteMember{
+			FullNodeID: etcdraftengine.DeriveNodeID(srv.ID),
+			Address:    srv.Address,
+		}
+		if srv.Suffrage == etcdraftengine.SuffrageLearner {
+			group.Learners = append(group.Learners, member)
+		} else {
+			group.Voters = append(group.Voters, member)
+		}
+	}
+	return group
+}

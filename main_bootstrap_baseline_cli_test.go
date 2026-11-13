@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/stretchr/testify/require"
 )
@@ -21,18 +22,18 @@ func baselineCLIArgs() []string {
 		"--raft-data-dir", "/offline/node-1", "--operation-id", "01000000000000000000000000000000", "--member-id", "1"}
 }
 
-func baselineCLIFixture(t testing.TB) (bootstrapBaselineCLIRequest, bootstrapBaselineExpectedJSON, []byte) {
+func baselineCLIFixture(t testing.TB) (clusterbootstrap.BootstrapBaselineCLIRequest, clusterbootstrap.BootstrapBaselineExpectedJSON, []byte) {
 	t.Helper()
 	request, expected, manifest, _ := baselineCLIFixtureWithSigners(t)
 	return request, expected, manifest
 }
 
-func baselineCLIFixtureWithSigners(t testing.TB) (bootstrapBaselineCLIRequest, bootstrapBaselineExpectedJSON, []byte, []crypto.Signer) {
+func baselineCLIFixtureWithSigners(t testing.TB) (clusterbootstrap.BootstrapBaselineCLIRequest, clusterbootstrap.BootstrapBaselineExpectedJSON, []byte, []crypto.Signer) {
 	t.Helper()
-	request, err := parseBootstrapBaselineCLI(baselineCLIArgs())
+	request, err := clusterbootstrap.ParseBootstrapBaselineCLI(baselineCLIArgs())
 	require.NoError(t, err)
-	raw := bootstrapBaselineExpectedJSON{Version: 1, Cluster: "01000000-0000-0000-0000-000000000000", Group: "0",
-		ConfigurationIndex: "8", Minimum: bootstrapBaselineMinimumJSON{1, 1, 1}, CommitIndex: "12", CommitTerm: "3", Watermark: "0",
+	raw := clusterbootstrap.BootstrapBaselineExpectedJSON{Version: 1, Cluster: "01000000-0000-0000-0000-000000000000", Group: "0",
+		ConfigurationIndex: "8", Minimum: clusterbootstrap.BootstrapBaselineMinimumJSON{Entry: 1, Snapshot: 1, Session: 1}, CommitIndex: "12", CommitTerm: "3", Watermark: "0",
 		DataDigest: strings.Repeat("01", 32)}
 	roles := [][]string{{"voter", "outgoing"}, {"voter"}, {"outgoing", "next"}, {"learner"}}
 	keys := make([]crypto.Signer, len(roles))
@@ -43,11 +44,11 @@ func baselineCLIFixtureWithSigners(t testing.TB) (bootstrapBaselineCLIRequest, b
 		der, err := x509.MarshalPKIXPublicKey(public)
 		require.NoError(t, err)
 		digest := sha256.Sum256(der)
-		raw.Members = append(raw.Members, bootstrapBaselineMemberJSON{ID: string(rune('1' + i)), Address: "localhost:1234", Key: hex.EncodeToString(digest[:]), Roles: roles[i]})
+		raw.Members = append(raw.Members, clusterbootstrap.BootstrapBaselineMemberJSON{ID: string(rune('1' + i)), Address: "localhost:1234", Key: hex.EncodeToString(digest[:]), Roles: roles[i]})
 	}
 	config, err := json.Marshal(raw)
 	require.NoError(t, err)
-	expected, err := parseBootstrapBaselineExpectedConfig(config, request.OperationID)
+	expected, err := clusterbootstrap.ParseBootstrapBaselineExpectedConfig(config, request.OperationID)
 	require.NoError(t, err)
 	digest, err := raftbootstrap.ConfigurationDigest(expected.Configuration)
 	require.NoError(t, err)
@@ -68,13 +69,13 @@ func baselineCLIFixtureWithSigners(t testing.TB) (bootstrapBaselineCLIRequest, b
 
 func TestBaselineCLIRequest(t *testing.T) {
 	t.Parallel()
-	r, err := parseBootstrapBaselineCLI(baselineCLIArgs())
+	r, err := clusterbootstrap.ParseBootstrapBaselineCLI(baselineCLIArgs())
 	require.NoError(t, err)
 	require.Equal(t, uint64(1), r.MemberID)
 	require.Equal(t, raftbootstrap.OperationID{1}, r.OperationID)
 	args := []string{"inspect", "-manifest=/offline/baseline.bin", "--expected-config=/offline/expected.json",
 		"--member-id=1", "--raft-data-dir=/offline/node-1", "--operation-id=01000000000000000000000000000000"}
-	other, err := parseBootstrapBaselineCLI(args)
+	other, err := clusterbootstrap.ParseBootstrapBaselineCLI(args)
 	require.NoError(t, err)
 	require.Equal(t, r, other)
 }
@@ -92,29 +93,29 @@ func TestBaselineCLIRejectsRequests(t *testing.T) {
 		"too large":           {"inspect", strings.Repeat("x", raftbootstrap.MaxFileSize)},
 	}
 	for name, args := range cases {
-		t.Run(name, func(t *testing.T) { _, err := parseBootstrapBaselineCLI(args); require.Error(t, err) })
+		t.Run(name, func(t *testing.T) { _, err := clusterbootstrap.ParseBootstrapBaselineCLI(args); require.Error(t, err) })
 	}
 	for _, text := range []string{"", "0", "00", "01", "+1", "-1", " 1", "1 ", "0x1", "18446744073709551616"} {
 		args := baselineCLIArgs()
 		args[len(args)-1] = text
-		_, err := parseBootstrapBaselineCLI(args)
+		_, err := clusterbootstrap.ParseBootstrapBaselineCLI(args)
 		require.Error(t, err)
 	}
 	for _, text := range []string{"", strings.Repeat("0", 32), strings.Repeat("A", 32), strings.Repeat("g", 32), strings.Repeat("1", 31)} {
 		args := baselineCLIArgs()
 		args[len(args)-3] = text
-		_, err := parseBootstrapBaselineCLI(args)
+		_, err := clusterbootstrap.ParseBootstrapBaselineCLI(args)
 		require.Error(t, err)
 	}
 	for _, path := range []string{"", "-", "/", "relative", "/offline/../expected.json", "/offline//file", "/offline/file/", "/bad\x00", "/bad\n", string([]byte{'/', 0xff})} {
 		args := baselineCLIArgs()
 		args[2] = path
-		_, err := parseBootstrapBaselineCLI(args)
+		_, err := clusterbootstrap.ParseBootstrapBaselineCLI(args)
 		require.Error(t, err)
 	}
 	args := baselineCLIArgs()
 	args[4] = args[2]
-	_, err := parseBootstrapBaselineCLI(args)
+	_, err := clusterbootstrap.ParseBootstrapBaselineCLI(args)
 	require.Error(t, err)
 }
 
@@ -123,14 +124,14 @@ func TestBaselineCLIConfigAndSummary(t *testing.T) {
 	request, raw, manifest := baselineCLIFixture(t)
 	config, err := json.Marshal(raw)
 	require.NoError(t, err)
-	c, err := parseBootstrapBaselineExpectedConfig(config, request.OperationID)
+	c, err := clusterbootstrap.ParseBootstrapBaselineExpectedConfig(config, request.OperationID)
 	require.NoError(t, err)
 	require.Zero(t, c.Identity.Group)
 	require.Equal(t, []uint64{1, 2}, c.Configuration.State.Voters)
 	require.Equal(t, []uint64{1, 3}, c.Configuration.State.VotersOutgoing)
 	require.Equal(t, []uint64{3}, c.Configuration.State.LearnersNext)
 	require.Equal(t, []uint64{4}, c.Configuration.State.Learners)
-	summary, err := bootstrapBaselineDryRun(request, config, manifest)
+	summary, err := clusterbootstrap.BootstrapBaselineDryRun(request, config, manifest)
 	require.NoError(t, err)
 	require.Equal(t, "signatures-verified-dry-run-only", summary.Status)
 	require.Equal(t, 4, summary.MemberCount)
@@ -154,7 +155,7 @@ func TestBaselineCLIConfigAndSummary(t *testing.T) {
 	raw.Members[3].Roles = []string{"outgoing", "voter"}
 	config, err = json.Marshal(raw)
 	require.NoError(t, err)
-	reordered, err := bootstrapBaselineDryRun(request, config, manifest)
+	reordered, err := clusterbootstrap.BootstrapBaselineDryRun(request, config, manifest)
 	require.NoError(t, err)
 	require.Equal(t, summary, reordered)
 }
@@ -179,7 +180,7 @@ func TestBaselineCLIConfigRejectsMalformedJSON(t *testing.T) {
 	}
 	for i, data := range cases {
 		t.Run(string(rune('A'+i)), func(t *testing.T) {
-			_, err := parseBootstrapBaselineExpectedConfig(data, request.OperationID)
+			_, err := clusterbootstrap.ParseBootstrapBaselineExpectedConfig(data, request.OperationID)
 			require.Error(t, err)
 		})
 	}
@@ -187,32 +188,40 @@ func TestBaselineCLIConfigRejectsMalformedJSON(t *testing.T) {
 
 func TestBaselineCLIExpectedContextRejectsInvalidValues(t *testing.T) {
 	t.Parallel()
-	cases := map[string]func(*bootstrapBaselineExpectedJSON){
-		"version":                   func(r *bootstrapBaselineExpectedJSON) { r.Version++ },
-		"cluster":                   func(r *bootstrapBaselineExpectedJSON) { r.Cluster = strings.ToUpper(r.Cluster[:8]) + "X" },
-		"missing member":            func(r *bootstrapBaselineExpectedJSON) { r.Members = nil },
-		"zero member":               func(r *bootstrapBaselineExpectedJSON) { r.Members[0].ID = "0" },
-		"duplicate member":          func(r *bootstrapBaselineExpectedJSON) { r.Members[1] = r.Members[0] },
-		"missing pin":               func(r *bootstrapBaselineExpectedJSON) { r.Members[0].Key = "" },
-		"zero pin":                  func(r *bootstrapBaselineExpectedJSON) { r.Members[0].Key = strings.Repeat("0", 64) },
-		"uppercase pin":             func(r *bootstrapBaselineExpectedJSON) { r.Members[0].Key = strings.Repeat("A", 64) },
-		"bad address":               func(r *bootstrapBaselineExpectedJSON) { r.Members[0].Address = "invalid" },
-		"unknown role":              func(r *bootstrapBaselineExpectedJSON) { r.Members[0].Roles = []string{"observer"} },
-		"duplicate role":            func(r *bootstrapBaselineExpectedJSON) { r.Members[0].Roles = []string{"voter", "voter"} },
-		"no role":                   func(r *bootstrapBaselineExpectedJSON) { r.Members[0].Roles = nil },
-		"role conflict":             func(r *bootstrapBaselineExpectedJSON) { r.Members[0].Roles = []string{"voter", "learner"} },
-		"no outgoing for next":      func(r *bootstrapBaselineExpectedJSON) { r.Members[2].Roles = []string{"next"} },
-		"uncommitted configuration": func(r *bootstrapBaselineExpectedJSON) { r.ConfigurationIndex = "13" },
-		"zero configuration":        func(r *bootstrapBaselineExpectedJSON) { r.ConfigurationIndex = "0" },
-		"zero commit":               func(r *bootstrapBaselineExpectedJSON) { r.CommitIndex = "0" },
-		"zero term":                 func(r *bootstrapBaselineExpectedJSON) { r.CommitTerm = "0" },
-		"watermark sentinel":        func(r *bootstrapBaselineExpectedJSON) { r.Watermark = "18446744073709551615" },
-		"unsupported minimum":       func(r *bootstrapBaselineExpectedJSON) { r.Minimum.Session = 2 },
-		"missing minimum":           func(r *bootstrapBaselineExpectedJSON) { r.Minimum = bootstrapBaselineMinimumJSON{} },
-		"missing data":              func(r *bootstrapBaselineExpectedJSON) { r.DataDigest = "" },
-		"leading zero":              func(r *bootstrapBaselineExpectedJSON) { r.Group = "00" },
-		"signed integer":            func(r *bootstrapBaselineExpectedJSON) { r.Watermark = "+0" },
-		"overflow":                  func(r *bootstrapBaselineExpectedJSON) { r.CommitIndex = "18446744073709551616" },
+	cases := map[string]func(*clusterbootstrap.BootstrapBaselineExpectedJSON){
+		"version": func(r *clusterbootstrap.BootstrapBaselineExpectedJSON) { r.Version++ },
+		"cluster": func(r *clusterbootstrap.BootstrapBaselineExpectedJSON) {
+			r.Cluster = strings.ToUpper(r.Cluster[:8]) + "X"
+		},
+		"missing member":   func(r *clusterbootstrap.BootstrapBaselineExpectedJSON) { r.Members = nil },
+		"zero member":      func(r *clusterbootstrap.BootstrapBaselineExpectedJSON) { r.Members[0].ID = "0" },
+		"duplicate member": func(r *clusterbootstrap.BootstrapBaselineExpectedJSON) { r.Members[1] = r.Members[0] },
+		"missing pin":      func(r *clusterbootstrap.BootstrapBaselineExpectedJSON) { r.Members[0].Key = "" },
+		"zero pin":         func(r *clusterbootstrap.BootstrapBaselineExpectedJSON) { r.Members[0].Key = strings.Repeat("0", 64) },
+		"uppercase pin":    func(r *clusterbootstrap.BootstrapBaselineExpectedJSON) { r.Members[0].Key = strings.Repeat("A", 64) },
+		"bad address":      func(r *clusterbootstrap.BootstrapBaselineExpectedJSON) { r.Members[0].Address = "invalid" },
+		"unknown role":     func(r *clusterbootstrap.BootstrapBaselineExpectedJSON) { r.Members[0].Roles = []string{"observer"} },
+		"duplicate role": func(r *clusterbootstrap.BootstrapBaselineExpectedJSON) {
+			r.Members[0].Roles = []string{"voter", "voter"}
+		},
+		"no role": func(r *clusterbootstrap.BootstrapBaselineExpectedJSON) { r.Members[0].Roles = nil },
+		"role conflict": func(r *clusterbootstrap.BootstrapBaselineExpectedJSON) {
+			r.Members[0].Roles = []string{"voter", "learner"}
+		},
+		"no outgoing for next":      func(r *clusterbootstrap.BootstrapBaselineExpectedJSON) { r.Members[2].Roles = []string{"next"} },
+		"uncommitted configuration": func(r *clusterbootstrap.BootstrapBaselineExpectedJSON) { r.ConfigurationIndex = "13" },
+		"zero configuration":        func(r *clusterbootstrap.BootstrapBaselineExpectedJSON) { r.ConfigurationIndex = "0" },
+		"zero commit":               func(r *clusterbootstrap.BootstrapBaselineExpectedJSON) { r.CommitIndex = "0" },
+		"zero term":                 func(r *clusterbootstrap.BootstrapBaselineExpectedJSON) { r.CommitTerm = "0" },
+		"watermark sentinel":        func(r *clusterbootstrap.BootstrapBaselineExpectedJSON) { r.Watermark = "18446744073709551615" },
+		"unsupported minimum":       func(r *clusterbootstrap.BootstrapBaselineExpectedJSON) { r.Minimum.Session = 2 },
+		"missing minimum": func(r *clusterbootstrap.BootstrapBaselineExpectedJSON) {
+			r.Minimum = clusterbootstrap.BootstrapBaselineMinimumJSON{}
+		},
+		"missing data":   func(r *clusterbootstrap.BootstrapBaselineExpectedJSON) { r.DataDigest = "" },
+		"leading zero":   func(r *clusterbootstrap.BootstrapBaselineExpectedJSON) { r.Group = "00" },
+		"signed integer": func(r *clusterbootstrap.BootstrapBaselineExpectedJSON) { r.Watermark = "+0" },
+		"overflow":       func(r *clusterbootstrap.BootstrapBaselineExpectedJSON) { r.CommitIndex = "18446744073709551616" },
 	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -220,7 +229,7 @@ func TestBaselineCLIExpectedContextRejectsInvalidValues(t *testing.T) {
 			mutate(&raw)
 			data, err := json.Marshal(raw)
 			require.NoError(t, err)
-			_, err = parseBootstrapBaselineExpectedConfig(data, request.OperationID)
+			_, err = clusterbootstrap.ParseBootstrapBaselineExpectedConfig(data, request.OperationID)
 			require.Error(t, err)
 		})
 	}
@@ -233,7 +242,7 @@ func FuzzBootstrapBaselineExpectedConfig(f *testing.F) {
 	f.Add(data)
 	f.Add([]byte(`{}`))
 	f.Fuzz(func(t *testing.T, data []byte) {
-		c, err := parseBootstrapBaselineExpectedConfig(data, request.OperationID)
+		c, err := clusterbootstrap.ParseBootstrapBaselineExpectedConfig(data, request.OperationID)
 		if err == nil {
 			require.Equal(t, request.OperationID, c.OperationID)
 			require.Equal(t, raftbootstrap.BaselineVersion, c.Version)
@@ -268,16 +277,16 @@ func TestBaselineCLIDryRunIndependentExpectation(t *testing.T) {
 			}
 			config, err := json.Marshal(raw)
 			require.NoError(t, err)
-			summary, err := bootstrapBaselineDryRun(request, config, manifest)
+			summary, err := clusterbootstrap.BootstrapBaselineDryRun(request, config, manifest)
 			require.Error(t, err)
-			require.Equal(t, bootstrapBaselineDryRunSummary{}, summary)
+			require.Equal(t, clusterbootstrap.BootstrapBaselineDryRunSummary{}, summary)
 		})
 	}
 	request, raw, manifest := baselineCLIFixture(t)
 	config, err := json.Marshal(raw)
 	require.NoError(t, err)
-	_, err = bootstrapBaselineDryRun(request, config, make([]byte, raftbootstrap.MaxFileSize))
+	_, err = clusterbootstrap.BootstrapBaselineDryRun(request, config, make([]byte, raftbootstrap.MaxFileSize))
 	require.Error(t, err)
-	_, err = bootstrapBaselineDryRun(request, make([]byte, raftbootstrap.MaxFileSize+1), manifest)
+	_, err = clusterbootstrap.BootstrapBaselineDryRun(request, make([]byte, raftbootstrap.MaxFileSize+1), manifest)
 	require.Error(t, err)
 }

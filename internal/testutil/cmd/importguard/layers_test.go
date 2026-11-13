@@ -49,6 +49,16 @@ func TestCheckLayering(t *testing.T) {
 		{"leaderbalance from root main", ".", m + "internal/leaderbalance", false},
 		{"fsmount only from binaries", "internal/filesystem", m + "internal/fsmount", true},
 		{"fsmount from a cmd", "cmd/server", m + "internal/fsmount", false},
+		{"encryptionwiring only from binaries", "kv", m + "internal/encryptionwiring", true},
+		{"encryptionwiring from root main", ".", m + "internal/encryptionwiring", false},
+		{"encryptionwiring may use noderuntime", "internal/encryptionwiring", m + "internal/noderuntime", false},
+		{"encryptionwiring may use the etcd backend", "internal/encryptionwiring", m + "internal/raftengine/etcd", false},
+		{"adapter may not use encryptionwiring", "adapter", m + "internal/encryptionwiring", true},
+		{"clusterbootstrap only from binaries", "kv", m + "internal/clusterbootstrap", true},
+		{"clusterbootstrap from root main", ".", m + "internal/clusterbootstrap", false},
+		{"clusterbootstrap may use encryptionwiring", "internal/clusterbootstrap", m + "internal/encryptionwiring", false},
+		{"clusterbootstrap may use nodeauth", "internal/clusterbootstrap", m + "internal/nodeauth", false},
+		{"encryptionwiring may not use clusterbootstrap", "internal/encryptionwiring", m + "internal/clusterbootstrap", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()

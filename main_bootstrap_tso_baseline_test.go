@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/bootjp/elastickv/internal/raftengine/etcd"
@@ -38,12 +39,12 @@ func TestOfflineTSOBaselineFromVerifiedBootstrapGenesis(t *testing.T) {
 	require.Eventually(t, func() bool { return runtime.Engine.Status().LastSnapshotIndex != 0 }, 5*time.Second, 10*time.Millisecond)
 	runtime.Close()
 	dir := noderuntime.GroupDataDir(base, "n1", noderuntime.DedicatedTSORaftGroupID, true)
-	path := filepath.Join(dir, dedicatedTSOControlStoreName)
+	path := filepath.Join(dir, clusterbootstrap.DedicatedTSOControlStoreName)
 	require.NoDirExists(t, path)
 	ownership, err := etcd.AcquireOfflineBaselineOwnership(dir)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, ownership.Close()) })
-	state, proof, err := probeOfflineTSOBaseline(t.Context(), dir, ownership)
+	state, proof, err := clusterbootstrap.ProbeOfflineTSOBaseline(t.Context(), dir, ownership)
 	require.NoError(t, err)
 	require.Equal(t, uint64(42), state.Watermark)
 	require.Equal(t, uint64(1), proof.ConfigurationIndex, "native proves the retained genesis epoch, not the data snapshot index")
@@ -54,7 +55,7 @@ func TestOfflineTSOBaselineFromVerifiedBootstrapGenesis(t *testing.T) {
 func TestOfflineTSOBaselineFromNativeWithoutControlDB(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	require.NoError(t, os.Mkdir(filepath.Join(dir, "snap"), tsoBaselineDirectoryPerm))
+	require.NoError(t, os.Mkdir(filepath.Join(dir, "snap"), clusterbootstrap.TsoBaselineDirectoryPerm))
 	change, err := proto.Marshal(&raftpb.ConfChange{Type: raftpb.ConfChangeAddNode.Enum(), NodeId: proto.Uint64(7)})
 	require.NoError(t, err)
 	w, err := wal.Create(zap.NewNop(), filepath.Join(dir, "wal"), []byte("legacy metadata"))
@@ -80,13 +81,13 @@ func TestOfflineTSOBaselineFromNativeWithoutControlDB(t *testing.T) {
 	ownership, err := etcd.AcquireOfflineBaselineOwnership(dir)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, ownership.Close()) })
-	baseline, proof, err := probeOfflineTSOBaseline(t.Context(), dir, ownership)
+	baseline, proof, err := clusterbootstrap.ProbeOfflineTSOBaseline(t.Context(), dir, ownership)
 	require.NoError(t, err)
 	require.Equal(t, uint64(42), baseline.Watermark)
 	require.Equal(t, uint64(3), proof.AppliedIndex)
 	require.Equal(t, uint64(1), proof.ConfigurationIndex, "C epoch comes from retained ConfChange, not snapshot index")
 	require.Equal(t, []uint64{7}, proof.ConfigurationMembers)
-	require.NoDirExists(t, filepath.Join(dir, dedicatedTSOControlStoreName))
+	require.NoDirExists(t, filepath.Join(dir, clusterbootstrap.DedicatedTSOControlStoreName))
 }
 
 func preparedTSOMigrationFixture(t *testing.T) (kv.TSOBaselineState, kv.PreparedBootstrapActivation) {
@@ -104,7 +105,7 @@ func preparedTSOMigrationFixture(t *testing.T) (kv.TSOBaselineState, kv.Prepared
 	evidence.DataDigest = state.DataDigest
 	evidence.PublicKeyDER = nil
 	evidence.Signature = nil
-	signer, ok := spec.config.clientTLS.Certificates[0].PrivateKey.(crypto.Signer)
+	signer, ok := spec.Config.ClientTLS.Certificates[0].PrivateKey.(crypto.Signer)
 	require.True(t, ok)
 	probe, err := raftbootstrap.SignBaselineProbe(raftbootstrap.BaselineProbe{BaselineContext: c, Evidence: evidence}, signer)
 	require.NoError(t, err)
@@ -118,24 +119,24 @@ func TestExplicitTSOBaselineMigrationAndExactRetry(t *testing.T) {
 	t.Parallel()
 	state, prepared := preparedTSOMigrationFixture(t)
 	dir := t.TempDir()
-	digest, err := initializePreparedTSOBaseline(t.Context(), dir, state, prepared)
+	digest, err := clusterbootstrap.InitializePreparedTSOBaseline(t.Context(), dir, state, prepared)
 	require.NoError(t, err)
 	require.NotEqual(t, state.DataDigest, digest, "scalar cut and complete prepared DB are distinct fingerprints")
-	again, err := initializePreparedTSOBaseline(t.Context(), dir, state, prepared)
+	again, err := clusterbootstrap.InitializePreparedTSOBaseline(t.Context(), dir, state, prepared)
 	require.NoError(t, err)
 	require.Equal(t, digest, again)
-	st, err := store.NewPebbleStore(filepath.Join(dir, dedicatedTSOControlStoreName))
+	st, err := store.NewPebbleStore(filepath.Join(dir, clusterbootstrap.DedicatedTSOControlStoreName))
 	require.NoError(t, err)
-	fsm, err := newProtectedTSOStateMachine(st, nil, prepared.Probe.Identity)
+	fsm, err := clusterbootstrap.NewProtectedTSOStateMachine(st, nil, prepared.Probe.Identity)
 	require.NoError(t, err)
 	require.Equal(t, state.Watermark, fsm.AllocationFloor())
-	_, err = fsm.policyLoader()(t.Context(), prepared.Probe.Identity, state.AppliedIndex)
+	_, err = fsm.PolicyLoader()(t.Context(), prepared.Probe.Identity, state.AppliedIndex)
 	require.ErrorIs(t, err, store.ErrKeyNotFound)
 	require.NoError(t, st.PutAt(t.Context(), []byte("unexpected"), []byte("preserve"), 99, 0))
 	require.NoError(t, st.Close())
-	_, err = initializePreparedTSOBaseline(t.Context(), dir, state, prepared)
+	_, err = clusterbootstrap.InitializePreparedTSOBaseline(t.Context(), dir, state, prepared)
 	require.Error(t, err, "arbitrary extra data is not an idempotent migration prefix")
-	st, err = store.NewPebbleStore(filepath.Join(dir, dedicatedTSOControlStoreName))
+	st, err = store.NewPebbleStore(filepath.Join(dir, clusterbootstrap.DedicatedTSOControlStoreName))
 	require.NoError(t, err)
 	value, err := st.GetAt(t.Context(), []byte("unexpected"), 99)
 	require.NoError(t, err)
@@ -148,31 +149,31 @@ func TestExplicitTSOBaselineMigrationRejectsChangedDigestBeforeCreatingDB(t *tes
 	state, prepared := preparedTSOMigrationFixture(t)
 	state.DataDigest[0]++
 	dir := t.TempDir()
-	_, err := initializePreparedTSOBaseline(t.Context(), dir, state, prepared)
+	_, err := clusterbootstrap.InitializePreparedTSOBaseline(t.Context(), dir, state, prepared)
 	require.Error(t, err)
-	require.NoDirExists(t, filepath.Join(dir, dedicatedTSOControlStoreName))
+	require.NoDirExists(t, filepath.Join(dir, clusterbootstrap.DedicatedTSOControlStoreName))
 }
 
 func TestExplicitTSOBaselineMigrationResumesEmptyDB(t *testing.T) {
 	t.Parallel()
 	state, prepared := preparedTSOMigrationFixture(t)
 	dir := t.TempDir()
-	st, err := store.NewPebbleStore(filepath.Join(dir, dedicatedTSOControlStoreName))
+	st, err := store.NewPebbleStore(filepath.Join(dir, clusterbootstrap.DedicatedTSOControlStoreName))
 	require.NoError(t, err)
 	require.NoError(t, st.Close())
-	digest, err := initializePreparedTSOBaseline(t.Context(), dir, state, prepared)
+	digest, err := clusterbootstrap.InitializePreparedTSOBaseline(t.Context(), dir, state, prepared)
 	require.NoError(t, err)
-	verified, err := verifyPreparedTSOBaseline(t.Context(), filepath.Join(dir, dedicatedTSOControlStoreName), state, prepared)
+	verified, err := clusterbootstrap.VerifyPreparedTSOBaseline(t.Context(), filepath.Join(dir, clusterbootstrap.DedicatedTSOControlStoreName), state, prepared)
 	require.NoError(t, err)
 	require.Equal(t, digest, verified)
 }
 
-func tsoPreparationCallbackFixture(t *testing.T) (*etcd.BaselinePreparationCallbacks, etcd.BaselinePreparationContext, etcd.BaselineStoreProof, *groupBootstrapSpec) {
+func tsoPreparationCallbackFixture(t *testing.T) (*etcd.BaselinePreparationCallbacks, etcd.BaselinePreparationContext, etcd.BaselineStoreProof, *clusterbootstrap.GroupBootstrapSpec) {
 	t.Helper()
 	t.Setenv("ELASTICKV_RAFT_SNAPSHOT_COUNT", "1")
 	spec, _, _ := protectedTSOFixture(t, t.TempDir())
 	base := t.TempDir()
-	group := noderuntime.GroupSpec{ID: noderuntime.DedicatedTSORaftGroupID, Address: spec.config.local.Address}
+	group := noderuntime.GroupSpec{ID: noderuntime.DedicatedTSORaftGroupID, Address: spec.Config.Local.Address}
 	runtime, _, err := buildDedicatedTSOGroup("n1", group, base, true, true, false, nil, nil, etcd.NewFactory(etcd.FactoryConfig{}), kv.NewHLC(), nil)
 	require.NoError(t, err)
 	t.Cleanup(runtime.Close)
@@ -186,26 +187,26 @@ func tsoPreparationCallbackFixture(t *testing.T) (*etcd.BaselinePreparationCallb
 	ownership, err := etcd.AcquireOfflineBaselineOwnership(backup)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, ownership.Close()) })
-	state, proof, err := probeOfflineTSOBaseline(ctx, backup, ownership)
+	state, proof, err := clusterbootstrap.ProbeOfflineTSOBaseline(ctx, backup, ownership)
 	require.NoError(t, err)
 	source, err := etcd.ReadOfflineBaselineWALSource(ctx, backup, ownership)
 	require.NoError(t, err)
 	term := source.CommitTerm
 	require.NoError(t, source.Snapshot.Close())
-	c := raftbootstrap.BaselineContext{Version: raftbootstrap.BaselineVersion, Identity: spec.intent.Identity,
-		OperationID: raftbootstrap.OperationID{9}, Configuration: spec.intent.Baseline, Minimum: spec.intent.Minimum,
+	c := raftbootstrap.BaselineContext{Version: raftbootstrap.BaselineVersion, Identity: spec.Intent.Identity,
+		OperationID: raftbootstrap.OperationID{9}, Configuration: spec.Intent.Baseline, Minimum: spec.Intent.Minimum,
 		CommitIndex: state.AppliedIndex, CommitTerm: term, Watermark: state.Watermark, DataDigest: state.DataDigest}
 	inspection, err := etcd.InspectOfflineBaseline(ctx, etcd.OfflineBaselineOptions{Ownership: ownership, DataDir: backup,
-		MemberID: spec.config.local.Member, Expected: c, ProbeStore: func(context.Context) (etcd.BaselineStoreProof, error) { return proof, nil }})
+		MemberID: spec.Config.Local.Member, Expected: c, ProbeStore: func(context.Context) (etcd.BaselineStoreProof, error) { return proof, nil }})
 	require.NoError(t, err)
-	signer, ok := spec.config.clientTLS.Certificates[0].PrivateKey.(crypto.Signer)
+	signer, ok := spec.Config.ClientTLS.Certificates[0].PrivateKey.(crypto.Signer)
 	require.True(t, ok)
 	probe, err := raftbootstrap.SignBaselineProbe(raftbootstrap.BaselineProbe{BaselineContext: c, Evidence: inspection.Evidence}, signer)
 	require.NoError(t, err)
 	manifest := raftbootstrap.BaselineManifest{BaselineContext: c, Members: []raftbootstrap.BaselineMemberEvidence{probe.Evidence}}
 	digest, err := raftbootstrap.BaselineManifestDigest(manifest)
 	require.NoError(t, err)
-	callbacks, err := bootstrapOfflineTSOPreparation(kv.PreparedBootstrapActivation{Probe: probe, ManifestDigest: digest})
+	callbacks, err := clusterbootstrap.BootstrapOfflineTSOPreparation(kv.PreparedBootstrapActivation{Probe: probe, ManifestDigest: digest})
 	require.NoError(t, err)
 	require.NoError(t, ownership.Close())
 	return callbacks, etcd.BaselinePreparationContext{DataDir: t.TempDir(), BackupDir: backup, Manifest: manifest}, proof, spec
@@ -213,7 +214,7 @@ func tsoPreparationCallbackFixture(t *testing.T) (*etcd.BaselinePreparationCallb
 
 func TestOfflineTSOPreparationCallbacksUseOriginalBackup(t *testing.T) {
 	callbacks, c, original, _ := tsoPreparationCallbackFixture(t)
-	require.Equal(t, []string{dedicatedTSOControlStoreName}, callbacks.MutablePaths)
+	require.Equal(t, []string{clusterbootstrap.DedicatedTSOControlStoreName}, callbacks.MutablePaths)
 	// No target WAL exists: reading target as a legacy source would fail.
 	require.NoFileExists(t, filepath.Join(c.DataDir, "wal"))
 	require.NoError(t, callbacks.StagePreparation(t.Context(), c))
@@ -234,12 +235,12 @@ func TestOfflineTSOPreparationRejectsChangedManifestAndSource(t *testing.T) {
 	changed := c
 	changed.Manifest.OperationID[0]++
 	require.Error(t, callbacks.StagePreparation(t.Context(), changed))
-	require.NoDirExists(t, filepath.Join(c.DataDir, dedicatedTSOControlStoreName))
+	require.NoDirExists(t, filepath.Join(c.DataDir, clusterbootstrap.DedicatedTSOControlStoreName))
 	require.NoError(t, callbacks.StagePreparation(t.Context(), c))
 	backup := c.BackupDir
 	// An existing control DB marks this as a transformed image, not a legacy
 	// source, regardless of whether its scalar values happen to agree.
-	require.NoError(t, os.Mkdir(filepath.Join(backup, dedicatedTSOControlStoreName), tsoBaselineDirectoryPerm))
+	require.NoError(t, os.Mkdir(filepath.Join(backup, clusterbootstrap.DedicatedTSOControlStoreName), clusterbootstrap.TsoBaselineDirectoryPerm))
 	_, err := callbacks.VerifyPreparedStore(t.Context(), c)
 	require.Error(t, err)
 }
@@ -250,10 +251,10 @@ func TestOfflineTSOPreparationNativeBound(t *testing.T) {
 	ownership, err := etcd.AcquireOfflineBaselineOwnership(dir)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, ownership.Close()) })
-	options := etcd.OfflineBaselineOptions{DataDir: dir, Ownership: ownership, MemberID: spec.config.local.Member,
-		Expected: c.Manifest.BaselineContext, Preparation: bootstrapOfflineFormatPreparation(callbacks),
+	options := etcd.OfflineBaselineOptions{DataDir: dir, Ownership: ownership, MemberID: spec.Config.Local.Member,
+		Expected: c.Manifest.BaselineContext, Preparation: clusterbootstrap.BootstrapOfflineFormatPreparation(callbacks),
 		ProbeStore: func(ctx context.Context) (etcd.BaselineStoreProof, error) {
-			_, proof, err := probeOfflineTSOBaseline(ctx, dir, ownership)
+			_, proof, err := clusterbootstrap.ProbeOfflineTSOBaseline(ctx, dir, ownership)
 			return proof, err
 		}}
 	migration, err := etcd.PrepareOfflineBaseline(t.Context(), options, c.Manifest)
@@ -273,21 +274,21 @@ func TestOfflineTSOPreparationNativeBound(t *testing.T) {
 	verifyBoundTSOControl(t, dir, spec, c.Manifest)
 }
 
-func verifyBoundTSOControl(t *testing.T, dir string, spec *groupBootstrapSpec, manifest raftbootstrap.BaselineManifest) {
+func verifyBoundTSOControl(t *testing.T, dir string, spec *clusterbootstrap.GroupBootstrapSpec, manifest raftbootstrap.BaselineManifest) {
 	t.Helper()
-	st, err := store.NewPebbleStore(filepath.Join(dir, dedicatedTSOControlStoreName))
+	st, err := store.NewPebbleStore(filepath.Join(dir, clusterbootstrap.DedicatedTSOControlStoreName))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, st.Close()) })
-	sm, err := newProtectedTSOStateMachine(st, nil, spec.intent.Identity)
+	sm, err := clusterbootstrap.NewProtectedTSOStateMachine(st, nil, spec.Intent.Identity)
 	require.NoError(t, err)
 	metadata, ok := st.(store.RaftControlMetadataStore)
 	require.True(t, ok)
-	prepared, err := kv.ReadPreparedBootstrapActivation(t.Context(), metadata, spec.intent.Identity)
+	prepared, err := kv.ReadPreparedBootstrapActivation(t.Context(), metadata, spec.Intent.Identity)
 	require.NoError(t, err)
 	digest, err := raftbootstrap.BaselineManifestDigest(manifest)
 	require.NoError(t, err)
 	require.Equal(t, digest, prepared.ManifestDigest)
 	require.Equal(t, manifest.Watermark, sm.AllocationFloor())
-	_, err = sm.policyLoader()(t.Context(), spec.intent.Identity, manifest.CommitIndex)
+	_, err = sm.PolicyLoader()(t.Context(), spec.Intent.Identity, manifest.CommitIndex)
 	require.ErrorIs(t, err, store.ErrKeyNotFound, "bound/prepared recovery does not activate P")
 }
