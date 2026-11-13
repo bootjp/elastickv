@@ -3,19 +3,33 @@ package autosplit
 import (
 	"context"
 	"time"
+
+	"github.com/bootjp/elastickv/distribution"
 )
 
 const targetEvidenceMaxAgeSteps = 2
 
-func (s *Scheduler) prepareCrossGroupTick(ctx context.Context, prep *tickPreparation, now time.Time, runtimeEnabled bool) error {
+func (s *Scheduler) prepareCrossGroupTick(prep *tickPreparation, now time.Time, runtimeEnabled bool) {
 	if !runtimeEnabled || !s.cfg.CrossGroupEnabled {
+		return
+	}
+	prep.result.Detector.Decisions = s.selectCrossGroupTargets(prep.result.Detector.Decisions, *prep, now)
+}
+
+func (s *Scheduler) excludeBusySplitJobs(ctx context.Context, prep *tickPreparation) error {
+	if !s.cfg.CrossGroupEnabled || prep.stopAfterPrepare {
 		return nil
 	}
-	decisions, err := FilterDecisionsWithActiveSplitJobs(ctx, s.source, prep.snapshot, prep.result.Detector.Decisions)
+	busy, err := activeSplitJobRouteIDs(ctx, s.source, prep.snapshot)
 	if err != nil {
 		return err
 	}
-	prep.result.Detector.Decisions = s.selectCrossGroupTargets(decisions, *prep, now)
+	for i := range prep.routes {
+		if _, exists := busy[prep.routes[i].RouteID]; exists {
+			prep.routes[i].State = distribution.RouteStateMigratingSource
+			s.state.ResetConfidence(prep.routes[i].RouteID)
+		}
+	}
 	return nil
 }
 

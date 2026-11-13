@@ -11,15 +11,11 @@ type splitJobSnapshotSource interface {
 	ListSplitJobsAt(ctx context.Context, ts uint64) ([]distribution.SplitJob, error)
 }
 
-// FilterDecisionsWithActiveSplitJobs excludes source routes with a nonterminal
-// split job at the supplied catalog snapshot's read timestamp. It is opt-in;
-// callers must explicitly use the filtered decisions.
-func FilterDecisionsWithActiveSplitJobs(
-	ctx context.Context,
-	source CatalogSnapshotSource,
-	snapshot distribution.CatalogSnapshot,
-	decisions []Decision,
-) ([]Decision, error) {
+// activeSplitJobRouteIDs reads the exact catalog snapshot used by a tick.
+// FAILED jobs remain active until they are retried or abandoned.
+func activeSplitJobRouteIDs(
+	ctx context.Context, source CatalogSnapshotSource, snapshot distribution.CatalogSnapshot,
+) (map[uint64]struct{}, error) {
 	jobSource, ok := source.(splitJobSnapshotSource)
 	if !ok {
 		return nil, fmt.Errorf("autosplit split-job gate: catalog source does not support ListSplitJobsAt")
@@ -38,11 +34,5 @@ func FilterDecisionsWithActiveSplitJobs(
 			}
 		}
 	}
-	filtered := make([]Decision, 0, len(decisions))
-	for _, decision := range decisions {
-		if _, busy := busyRoutes[decision.RouteID]; !busy {
-			filtered = append(filtered, decision)
-		}
-	}
-	return filtered, nil
+	return busyRoutes, nil
 }

@@ -289,10 +289,11 @@ func (s *Scheduler) Tick(ctx context.Context, now time.Time) (SchedulerResult, e
 	if err != nil {
 		return out, err
 	}
-	prep.result.Detector = s.evaluateTick(now, &prep)
-	if err := s.prepareCrossGroupTick(ctx, &prep, now, runtimeEnabled); err != nil {
+	if err := s.excludeBusySplitJobs(ctx, &prep); err != nil {
 		return out, err
 	}
+	prep.result.Detector = s.evaluateTick(now, &prep)
+	s.prepareCrossGroupTick(&prep, now, runtimeEnabled)
 	return s.finishTick(ctx, runtimeEnabled, prep), nil
 }
 

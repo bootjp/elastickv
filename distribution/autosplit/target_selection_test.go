@@ -35,7 +35,7 @@ func TestSelectTargetGroup(t *testing.T) {
 				route(20, 2, distribution.RouteStateActive),
 				route(30, 3, distribution.RouteStateActive),
 			},
-			Evidence:    []TargetRouteEvidence{row(20, 2, 5), row(30, 3, 8)},
+			Evidence:    []TargetRouteEvidence{row(20, 2, 5), row(30, 3, 8), row(10, 1, 100)},
 			WindowStart: start, WindowEnd: end, Now: end.Add(time.Second),
 			MaxEvidenceAge: time.Minute,
 		}
@@ -56,6 +56,14 @@ func TestSelectTargetGroup(t *testing.T) {
 		{"ingress or follower row", func(in *TargetSelectionInput) { in.Evidence[0].ServedWholeWindow = false }, 3},
 		{"membership registered late", func(in *TargetSelectionInput) { in.Evidence[0].RegisteredBeforeWindow = false }, 3},
 		{"uncommitted row", func(in *TargetSelectionInput) { in.Evidence[0].Committed = false }, 3},
+		{"source load unknown", func(in *TargetSelectionInput) { in.Evidence = in.Evidence[:2] }, 0},
+		{"source group route missing", func(in *TargetSelectionInput) {
+			in.Routes = append(in.Routes, route(11, 1, distribution.RouteStateActive))
+		}, 0},
+		{"target not lower than source", func(in *TargetSelectionInput) {
+			in.Evidence[0].LoadOpsMin = 100
+			in.Evidence[1].LoadOpsMin = 101
+		}, 0},
 		{"stale window", func(in *TargetSelectionInput) { in.Now = end.Add(2 * time.Minute) }, 0},
 		{"different committed window", func(in *TargetSelectionInput) { in.Evidence[0].WindowStart = start.Add(time.Second) }, 3},
 		{"duplicate route reports unknown", func(in *TargetSelectionInput) { in.Evidence = append(in.Evidence, row(20, 2, 0)) }, 3},

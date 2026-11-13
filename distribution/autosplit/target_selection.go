@@ -48,11 +48,16 @@ func SelectTargetGroup(in TargetSelectionInput) uint64 {
 
 	active, transitional := groupRoutes(in.Routes)
 	evidence, duplicates := indexTargetEvidence(in.Evidence)
-	return lowestLoadTarget(in, active, transitional, evidence, duplicates)
+	sourceLoad, sourceKnown := candidateLoad(in, in.Decision.RouteGroupID,
+		active[in.Decision.RouteGroupID], transitional[in.Decision.RouteGroupID], evidence, duplicates)
+	if !sourceKnown {
+		return 0
+	}
+	return lowestLoadTarget(in, sourceLoad, active, transitional, evidence, duplicates)
 }
 
 func lowestLoadTarget(
-	in TargetSelectionInput, active map[uint64]map[uint64]struct{}, transitional map[uint64]bool,
+	in TargetSelectionInput, sourceLoad float64, active map[uint64]map[uint64]struct{}, transitional map[uint64]bool,
 	evidence map[RouteKey]TargetRouteEvidence, duplicates map[RouteKey]bool,
 ) uint64 {
 	var bestID uint64
@@ -62,12 +67,16 @@ func lowestLoadTarget(
 			continue
 		}
 		load, known := candidateLoad(in, groupID, active[groupID], transitional[groupID], evidence, duplicates)
-		if known && finiteNonnegative(load) &&
+		if candidateBelowSource(known, load, sourceLoad) &&
 			(load < bestLoad || load == bestLoad && (bestID == 0 || groupID < bestID)) {
 			bestID, bestLoad = groupID, load
 		}
 	}
 	return bestID
+}
+
+func candidateBelowSource(known bool, load, sourceLoad float64) bool {
+	return known && finiteNonnegative(load) && load < sourceLoad
 }
 
 func groupRoutes(routes []distribution.RouteDescriptor) (map[uint64]map[uint64]struct{}, map[uint64]bool) {

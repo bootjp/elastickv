@@ -96,6 +96,9 @@ func TestSchedulerCrossGroupTargetRequiresCompleteEvidence(t *testing.T) {
 			}
 			require.Equal(t, tt.wantCalls, result.Scheduled)
 			require.Equal(t, float64(tt.wantUnknown), testutil.ToFloat64(observer.targetSkipped.WithLabelValues("load_unknown")))
+			if len(tt.jobs) > 0 {
+				require.Zero(t, scheduler.state.RouteStatus(1).ConsecutiveOver)
+			}
 		})
 	}
 }
