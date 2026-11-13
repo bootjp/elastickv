@@ -88,6 +88,38 @@ elastickv_s3_chunkblob_backfill_results_total{result="unknown"} 1
 	require.NoError(t, err)
 }
 
+func TestS3ObjectDurationMetricsObserve(t *testing.T) {
+	t.Parallel()
+	reg := prometheus.NewRegistry()
+	metrics := newS3Metrics(reg)
+	metrics.ObserveS3ObjectDuration("put", "legacy", "success", 12*time.Millisecond)
+	metrics.ObserveS3ObjectDuration("get", "mixed", "failure", -time.Second)
+	metrics.ObserveS3ObjectDuration("get", "unexpected", "unexpected", time.Second)
+	metrics.ObserveS3ObjectDuration("head", "legacy", "success", time.Second)
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	counts := make(map[string]uint64)
+	for _, family := range families {
+		if family.GetName() != "elastickv_s3_object_duration_seconds" {
+			continue
+		}
+		for _, metric := range family.Metric {
+			labels := make(map[string]string)
+			for _, label := range metric.Label {
+				labels[label.GetName()] = label.GetValue()
+			}
+			counts[labels["operation"]+"/"+labels["mode"]+"/"+labels["outcome"]] = metric.GetHistogram().GetSampleCount()
+		}
+	}
+	require.Equal(t, map[string]uint64{
+		"put/legacy/success":  1,
+		"get/mixed/failure":   1,
+		"get/unknown/failure": 1,
+	}, counts)
+	require.Equal(t, 3, testutil.CollectAndCount(metrics.objectDuration))
+}
+
 func TestRegistryReturnsS3PutAdmissionObserver(t *testing.T) {
 	t.Parallel()
 

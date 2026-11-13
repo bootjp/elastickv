@@ -650,6 +650,13 @@ bucket-cleanup markers before opening its local readiness gate. The
 remaining M3 work is production acceptance measurement; offload remains
 disabled by default.
 
+`elastickv_s3_object_duration_seconds` records single-object PUT and GET
+through completion, labeled by the selected write path or the manifest
+parts read (`legacy`, `offload`, or `mixed`) and by success/failure.
+Range GET labels reflect only the requested chunks. Compare successful
+`legacy` and `offload` p99 over the same workload window; this metric does
+not replace the WAL-growth, snapshot-transfer, or production soak checks.
+
 Acceptance criteria for M3 (the milestone that flips `ELASTICKV_S3_BLOB_OFFLOAD=true` by default):
 
 The runtime GC-readiness gate opens only after the local workers are
