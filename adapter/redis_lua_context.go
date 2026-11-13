@@ -4241,18 +4241,11 @@ func (c *luaScriptContext) zsetCommitPlan(ctx context.Context, key string, commi
 	if st == nil || !st.dirty {
 		return luaCommitPlan{preserveExisting: true}, nil
 	}
-	rewriteForTTL, err := c.dirtyPositiveTTLOnLogicallyAbsentStart(ctx, key)
+	rewrite, err := c.zsetRequiresFullCommit(ctx, key, st)
 	if err != nil {
 		return luaCommitPlan{}, err
 	}
-	// physicallyExistsAtStart is true when the key had physical ZSet data in
-	// storage at script start but was TTL-expired (logically absent). Force a
-	// full commit so deleteLogicalKeyElems removes stale wide-column rows
-	// (members, score-index, meta, TTL) that were left by the expired ZSet.
-	if st.physicallyExistsAtStart || c.everDeleted[key] || st.membersLoaded {
-		return c.zsetFullCommitWithMerge(ctx, key, st)
-	}
-	if rewriteForTTL {
+	if rewrite {
 		return c.zsetFullCommitWithMerge(ctx, key, st)
 	}
 	if st.legacyBlobBase {
@@ -4266,6 +4259,26 @@ func (c *luaScriptContext) zsetCommitPlan(ctx context.Context, key string, commi
 	// Delta path: write only changed members + score index + metadata delta.
 	elems, err := c.zsetDeltaCommitElems(ctx, key, st, commitTS)
 	return luaCommitPlan{preserveExisting: true, inlineMetaRewritten: luaZSetMetaRewritten(elems, []byte(key)), elems: elems}, err
+}
+
+func (c *luaScriptContext) zsetRequiresFullCommit(ctx context.Context, key string, st *luaZSetState) (bool, error) {
+	if st.physicallyExistsAtStart || c.everDeleted[key] || st.membersLoaded {
+		return true, nil
+	}
+	rewriteForTTL, err := c.dirtyPositiveTTLOnLogicallyAbsentStart(ctx, key)
+	if err != nil || rewriteForTTL {
+		return rewriteForTTL, err
+	}
+	return c.zsetRecreateHasStaleWideColumns(ctx, key)
+}
+
+func (c *luaScriptContext) zsetRecreateHasStaleWideColumns(ctx context.Context, key string) (bool, error) {
+	rawStartType, err := c.rawStartTypeForCommitPlan(ctx, []byte(key))
+	if err != nil || rawStartType != redisTypeNone {
+		return false, err
+	}
+	_, stale, err := c.server.emptyWideCollectionCleanupForRecreate(ctx, []byte(key), c.startTS)
+	return stale, err
 }
 
 func (c *luaScriptContext) dirtyPositiveTTLOnLogicallyAbsentStart(ctx context.Context, key string) (bool, error) {

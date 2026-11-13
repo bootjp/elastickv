@@ -120,6 +120,15 @@ func TestRedis_LuaRecreateEmptyHashDropsOldTTL(t *testing.T) {
 	ttl, err = client.TTL(ctx, keepTTL).Result()
 	require.NoError(t, err)
 	require.Equal(t, time.Duration(-1), ttl)
+	zsetKey := key + ":zset"
+	require.NoError(t, client.HSet(ctx, zsetKey, "field", "value").Err())
+	require.NoError(t, client.Expire(ctx, zsetKey, time.Minute).Err())
+	require.NoError(t, client.HDel(ctx, zsetKey, "field").Err())
+	require.NoError(t, client.Eval(ctx, `return redis.call('ZADD', KEYS[1], 1, 'member')`, []string{zsetKey}).Err())
+	ttl, err = client.TTL(ctx, zsetKey).Result()
+	require.NoError(t, err)
+	require.Equal(t, time.Duration(-1), ttl)
+	require.Equal(t, int64(1), client.ZCard(ctx, zsetKey).Val())
 }
 
 func TestRedis_EmptyWideCollectionRecreateDropsOldTTL(t *testing.T) {
