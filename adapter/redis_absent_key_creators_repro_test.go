@@ -43,6 +43,9 @@ func absentKeyCreatorRaces(key string) []absentKeyCreatorRace {
 	sadd := func(ctx context.Context, c *redis.Client) (any, error) {
 		return c.SAdd(ctx, key, "m").Result()
 	}
+	evalXAdd := func(ctx context.Context, c *redis.Client) (any, error) {
+		return c.Eval(ctx, "return redis.call('XADD', KEYS[1], '1-1', 'f', 'v')", []string{key}).Result()
+	}
 	commit := func(run func(context.Context, *redis.Client) (any, error)) func(context.Context, *redis.Client) error {
 		return func(ctx context.Context, c *redis.Client) error {
 			_, err := run(ctx, c)
@@ -60,6 +63,8 @@ func absentKeyCreatorRaces(key string) []absentKeyCreatorRace {
 		{name: "HSET held, XADD commits", parked: hset, winner: commit(xadd)},
 		{name: "XADD held, RPUSH commits", parked: xadd, winner: commit(rpush)},
 		{name: "RPUSH held, XADD commits", parked: rpush, parkOn: rpushTxnRead, winner: commit(xadd)},
+		{name: "RPUSH held, EVAL XADD commits", parked: rpush, parkOn: rpushTxnRead, winner: commit(evalXAdd)},
+		{name: "EVAL XADD held, RPUSH commits", parked: evalXAdd, winner: commit(rpush)},
 		{name: "PFADD held, SADD commits", parked: pfadd, winner: commit(sadd)},
 		{name: "SADD held, PFADD commits", parked: sadd, winner: commit(pfadd)},
 	}

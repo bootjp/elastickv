@@ -822,6 +822,12 @@ func (r *RedisServer) dispatchElems(ctx context.Context, isTxn bool, startTS uin
 }
 
 func (r *RedisServer) dispatchReadTimestampElems(ctx context.Context, readTimestamp kv.ReadTimestamp, elems []*kv.Elem[kv.OP]) error {
+	return r.dispatchReadTimestampElemsWithReadKeys(ctx, readTimestamp, elems, nil)
+}
+
+// dispatchReadTimestampElemsWithReadKeys is dispatchReadTimestampElems with a
+// read set the FSM validates against every commit newer than readTimestamp.
+func (r *RedisServer) dispatchReadTimestampElemsWithReadKeys(ctx context.Context, readTimestamp kv.ReadTimestamp, elems []*kv.Elem[kv.OP], readKeys [][]byte) error {
 	if len(elems) == 0 {
 		return nil
 	}
@@ -831,9 +837,10 @@ func (r *RedisServer) dispatchReadTimestampElems(ctx context.Context, readTimest
 	}
 	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
 	_, err := kv.DispatchWithReadTimestamp(dispatchCtx, r.coordinator, &kv.OperationGroup[kv.OP]{
-		IsTxn:   true,
-		StartTS: startTS,
-		Elems:   elems,
+		IsTxn:    true,
+		StartTS:  startTS,
+		ReadKeys: readKeys,
+		Elems:    elems,
 	})
 	return errors.WithStack(err)
 }

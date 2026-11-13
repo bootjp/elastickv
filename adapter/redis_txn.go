@@ -798,6 +798,22 @@ func redisTxnWideCreateReadKeys(userKey []byte, typ redisValueType, fenceKey fun
 	return [][]byte{fenceKey(userKey)}
 }
 
+// redisAbsentKeyCreateGuard returns what a creator of a single-anchor
+// encoding (an HLL, a stream) adds to its transaction when it observed userKey
+// absent at its read timestamp (startType == redisTypeNone): the absent-key
+// read keys, so a concurrent create of any other type makes it conflict, and
+// Puts of the four txn-wide fences, so a concurrent list / hash / set / zset
+// create, which reads those fences for an absent key, conflicts with it too.
+// Without both, the two creates have disjoint read and write sets and commit
+// two encodings under one key. A creator that found the key already of its
+// own type gets nothing: its own anchor, which every write to the key
+// rewrites or deletes, is in its write set.
+func redisAbsentKeyCreateGuard(userKey []byte, startType redisValueType) ([]*kv.Elem[kv.OP], [][]byte) {
+	if startType != redisTypeNone {
+		return nil, nil
+	}
+	return redisTxnWideCollectionFenceElems(userKey), redisTxnReadFencePointKeys(userKey)
+}
 func redisTxnWideFenceElem(key []byte) *kv.Elem[kv.OP] {
 	return &kv.Elem[kv.OP]{Op: kv.Put, Key: key, Value: []byte{}}
 }

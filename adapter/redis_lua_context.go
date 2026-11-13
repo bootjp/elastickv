@@ -3952,9 +3952,11 @@ func (c *luaScriptContext) commitPlanForKey(ctx context.Context, key string, com
 		deleteElems = append(deleteElems, redisTxnWideCollectionFenceElems(keyBytes)...)
 	}
 
-	dataElems := make([]*kv.Elem[kv.OP], 0, len(deleteElems)+len(valuePlan.elems))
+	createFences := luaStreamCreateFenceElems(keyBytes, finalType, startType, valuePlan)
+	dataElems := make([]*kv.Elem[kv.OP], 0, len(deleteElems)+len(valuePlan.elems)+len(createFences))
 	dataElems = append(dataElems, deleteElems...)
 	dataElems = append(dataElems, valuePlan.elems...)
+	dataElems = append(dataElems, createFences...)
 	return luaKeyPlan{
 		elems:               dataElems,
 		readKeys:            readKeys,
@@ -3985,6 +3987,20 @@ func (c *luaScriptContext) rememberRawTypeAtStart(key string, typ redisValueType
 		return
 	}
 	c.rawTypeAtStart[key] = typ
+}
+
+// luaStreamCreateFenceElems returns the txn-wide fence Puts for a stream the
+// script creates on a key that was absent at startTS through the delta
+// (preserving) path. A non-preserving plan already Puts the four fences, and a
+// list or zset delta create Puts its own type fence; a stream has no fence of
+// its own, so without these a concurrent list / hash / set / zset create,
+// which reads the fences for an absent key, would not conflict with it.
+func luaStreamCreateFenceElems(key []byte, finalType, startType redisValueType, plan luaCommitPlan) []*kv.Elem[kv.OP] {
+	if finalType != redisTypeStream || !plan.preserveExisting || len(plan.elems) == 0 {
+		return nil
+	}
+	fences, _ := redisAbsentKeyCreateGuard(key, startType)
+	return fences
 }
 
 func luaWideFenceReadKeysForPlan(key []byte, finalType, startType redisValueType, preserveExisting bool) [][]byte {
