@@ -188,8 +188,8 @@ func adapterToAdminAttributeMap(in map[string]adapter.AdminAttributeValue) map[s
 // for the item path but not the table path) lands in one place.
 func translateAdminItemsError(err error) error {
 	switch {
-	case err == nil:
-		return nil
+	case passThroughAdminError(err):
+		return err
 	case errors.Is(err, adapter.ErrAdminForbidden):
 		return admin.ErrItemsForbidden
 	case errors.Is(err, adapter.ErrAdminNotLeader):
@@ -260,8 +260,8 @@ func convertCreateTableInput(in admin.CreateTableRequest) adapter.AdminCreateTab
 // raw text to clients while we are still adding the translation.
 func translateAdminTablesError(err error) error {
 	switch {
-	case err == nil:
-		return nil
+	case passThroughAdminError(err):
+		return err
 	case errors.Is(err, adapter.ErrAdminForbidden):
 		return admin.ErrTablesForbidden
 	case errors.Is(err, adapter.ErrAdminNotLeader):

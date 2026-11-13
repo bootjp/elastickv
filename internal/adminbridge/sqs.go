@@ -209,8 +209,8 @@ func convertAdminQueueSummary(in *adapter.AdminQueueSummary) *admin.QueueSummary
 // + a sanitised body, matching the dynamo / s3 bridges' behaviour.
 func translateAdminQueuesError(err error) error {
 	switch {
-	case err == nil:
-		return nil
+	case passThroughAdminError(err):
+		return err
 	case errors.Is(err, adapter.ErrAdminForbidden):
 		return admin.ErrQueuesForbidden
 	case errors.Is(err, adapter.ErrAdminNotLeader):
@@ -236,8 +236,7 @@ func translateAdminQueuesError(err error) error {
 		// Leadership can be lost between AdminDeleteQueue's upfront
 		// isVerifiedSQSLeader check and the coordinator dispatch
 		// inside deleteQueueWithRetry. The kv coordinator surfaces
-		// that as ErrLeaderNotFound / ErrNotLeader (or a wrapped
-		// "not leader" / "leader not found" suffix), and the
+		// that as a typed ErrLeaderNotFound / ErrNotLeader, and the
 		// retry loop's isRetryableTransactWriteError does not catch
 		// them. Without this arm the error falls to default and the
 		// admin handler renders a generic 500. Mirrors the same arm

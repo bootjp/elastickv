@@ -163,6 +163,9 @@ func translateAdminObjectsError(err error) error {
 	if err == nil {
 		return nil
 	}
+	if isUnknownAdminOutcome(err) {
+		return err
+	}
 	for _, m := range adminObjectsSentinels {
 		if errors.Is(err, m.from) {
 			return m.to
@@ -220,8 +223,8 @@ func bucketSummaryFromAdapter(in adapter.AdminBucketSummary) admin.BucketSummary
 // is forwarded as-is and answered with 500 + a sanitised body.
 func translateAdminBucketsError(err error) error {
 	switch {
-	case err == nil:
-		return nil
+	case passThroughAdminError(err):
+		return err
 	case errors.Is(err, adapter.ErrAdminForbidden):
 		return admin.ErrBucketsForbidden
 	case errors.Is(err, adapter.ErrAdminNotLeader):
