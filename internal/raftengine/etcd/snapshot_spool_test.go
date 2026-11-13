@@ -152,7 +152,7 @@ func TestSnapshotSpoolRejectsWhenReserveWouldBeConsumed(t *testing.T) {
 
 // TestFinalizeAsFSMFile_PostFinalizeCloseIsNoop pins the gemini-medium
 // review on PR #747: after a successful FinalizeAsFSMFile, the deferred
-// caller-side spool.Close() must NOT attempt to remove the renamed file
+// caller-side spool.Close() must NOT attempt to remove the published file
 // (which would surface a misleading os.ErrNotExist that buries any real
 // error the caller is reporting). State clearing inside FinalizeAsFSMFile
 // at each successful step makes the post-success Close() a true no-op.
@@ -174,7 +174,7 @@ func TestFinalizeAsFSMFile_PostFinalizeCloseIsNoop(t *testing.T) {
 
 	require.NoError(t, spool.FinalizeAsFSMFile(fsmSnapDir, index, crc))
 
-	// Spool dir is empty (file moved, not deleted, not orphaned).
+	// Spool dir is empty after publication.
 	spoolEntries, err := os.ReadDir(spoolDir)
 	require.NoError(t, err)
 	require.Empty(t, spoolEntries)
@@ -194,22 +194,53 @@ func TestFinalizeAsFSMFile_PostFinalizeCloseIsNoop(t *testing.T) {
 	// must also be a no-op.
 	require.NoError(t, spool.Close())
 
-	// Renamed file is still on disk — Close did not nuke it.
+	// Published file is still on disk — Close did not nuke it.
 	_, err = os.Stat(finalPath)
 	require.NoError(t, err)
 }
 
-// TestFinalizeAsFSMFile_RenameFailureCleansUpSpool pins the partial-failure
-// path: if os.Rename fails (here simulated by removing the spool dir), the
+func TestFinalizeAsFSMFileDoesNotReplaceExistingSnapshot(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	const index uint64 = 9
+	path := fsmSnapPath(dir, index)
+	require.NoError(t, os.WriteFile(path, []byte("durable local snapshot"), 0o600))
+	spool, err := newSnapshotSpool(dir)
+	require.NoError(t, err)
+	_, err = spool.Write([]byte("ignored incoming snapshot"))
+	require.NoError(t, err)
+
+	require.ErrorIs(t, spool.FinalizeAsFSMFile(dir, index, 0), os.ErrExist)
+	require.NoError(t, spool.Close())
+	got, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, []byte("durable local snapshot"), got)
+}
+
+func TestPublishSnapshotSpoolFileRollsBackFailedUnlink(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	spoolPath := filepath.Join(dir, "incoming.tmp")
+	finalPath := filepath.Join(dir, "incoming.fsm")
+	require.NoError(t, os.WriteFile(spoolPath, []byte("incoming"), 0o600))
+	unlinkErr := errors.New("unlink failed")
+	err := publishSnapshotSpoolFile(spoolPath, finalPath, func(string) error { return unlinkErr })
+	require.ErrorIs(t, err, unlinkErr)
+	require.FileExists(t, spoolPath, "the caller retains ownership of the spool on failure")
+	require.NoFileExists(t, finalPath, "the failed receive must not leave a blocking canonical link")
+}
+
+// TestFinalizeAsFSMFile_LinkFailureCleansUpSpool pins the partial-failure
+// path: if publication fails (here simulated by removing the spool dir), the
 // already-closed spool file lives at its original path. The deferred
 // caller-side Close() should still remove that orphan so we don't leak
 // disk on the unhappy path.
-func TestFinalizeAsFSMFile_RenameFailureCleansUpSpool(t *testing.T) {
+func TestFinalizeAsFSMFile_LinkFailureCleansUpSpool(t *testing.T) {
 	t.Parallel()
 	spoolDir := t.TempDir()
 	// Point fsmSnapDir at a path under a directory we'll make unwritable
 	// AFTER the spool file is created. The file gets sync+close'd but the
-	// rename fails because the destination dir cannot be created.
+	// publication fails because the destination dir cannot be created.
 	parent := t.TempDir()
 	require.NoError(t, os.Chmod(parent, 0o500)) // r-x: MkdirAll under it fails
 	t.Cleanup(func() { _ = os.Chmod(parent, 0o700) })
@@ -222,11 +253,11 @@ func TestFinalizeAsFSMFile_RenameFailureCleansUpSpool(t *testing.T) {
 	spoolPath := spool.path
 
 	err = spool.FinalizeAsFSMFile(fsmSnapDir, 7, 0xdeadbeef)
-	require.Error(t, err, "Finalize must report the MkdirAll/Rename failure")
+	require.Error(t, err, "Finalize must report the MkdirAll/Link failure")
 
-	// Spool file is still at its original path (rename never happened).
+	// Spool file is still at its original path (link never happened).
 	_, statErr := os.Stat(spoolPath)
-	require.NoError(t, statErr, "spool file should still exist after a pre-rename failure")
+	require.NoError(t, statErr, "spool file should still exist after a pre-link failure")
 
 	// Caller's deferred Close() now removes the orphan.
 	require.NoError(t, spool.Close())
@@ -235,11 +266,11 @@ func TestFinalizeAsFSMFile_RenameFailureCleansUpSpool(t *testing.T) {
 }
 
 // TestFinalizeAsFSMFile_SyncDirFailureCloseIsNoop pins the partial-failure
-// path documented in FinalizeAsFSMFile's comment block: when os.Rename has
+// path documented in FinalizeAsFSMFile's comment block: when os.Link has
 // already succeeded but the subsequent dir-fsync fails, the spool's state
 // clearing must have advanced past s.path so a deferred caller-side
 // spool.Close() returns nil instead of surfacing os.ErrNotExist from
-// trying to delete the now-renamed file. Without the snapshotSyncDir
+// trying to delete the already-unlinked spool file. Without the snapshotSyncDir
 // injection seam there is no portable way to reproduce a syncDir failure
 // (the kernel happily fsyncs an empty tmp dir).
 func TestFinalizeAsFSMFile_SyncDirFailureCloseIsNoop(t *testing.T) {
@@ -266,15 +297,14 @@ func TestFinalizeAsFSMFile_SyncDirFailureCloseIsNoop(t *testing.T) {
 	require.Error(t, err)
 	require.ErrorIs(t, err, syncErr, "Finalize must surface the syncDir error")
 
-	// Crucial: rename already happened, so the .fsm file is at its
+	// Crucial: publication already happened, so the .fsm file is at its
 	// canonical path. A future read MUST find it; the syncDir failure
 	// is durability-only, not a logical-state regression.
 	finalPath := fsmSnapPath(fsmSnapDir, index)
 	_, statErr := os.Stat(finalPath)
 	require.NoError(t, statErr, ".fsm file should be at canonical path despite syncDir failure")
 
-	// Spool dir is empty (file was renamed out, not deleted, not
-	// orphaned at the spool location).
+	// Spool dir is empty; the spool name was removed after publication.
 	spoolEntries, err := os.ReadDir(spoolDir)
 	require.NoError(t, err)
 	require.Empty(t, spoolEntries)
