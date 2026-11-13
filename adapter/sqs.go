@@ -771,8 +771,38 @@ func (s *SQSServer) proxyToLeader(w http.ResponseWriter, r *http.Request) bool {
 	return proxyHTTPRequestToLeader(s.coordinator, s.leaderSQS, sqsLeaderProxyErrorWriter, w, r)
 }
 
-func sqsLeaderProxyErrorWriter(w http.ResponseWriter, status int, message string) {
-	writeSQSError(w, status, sqsErrServiceUnavailable, message)
+func sqsLeaderProxyErrorWriter(w http.ResponseWriter, r *http.Request, failure httpLeaderProxyFailure) {
+	err := error(kv.ErrLeaderProxyCircuitOpen)
+	if failure == httpLeaderProxyForwardAttemptFailed && !isReadOnlySQSRequest(r) {
+		err = kv.ErrTransactionOutcomeUnknown
+	}
+	if pickSqsProtocol(r) == sqsProtocolQuery {
+		writeSQSQueryError(w, err)
+		return
+	}
+	writeSQSErrorFromErr(w, err)
+}
+
+func isReadOnlySQSRequest(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	if pickSqsProtocol(r) == sqsProtocolQuery {
+		if r.Method != http.MethodGet || r.URL == nil {
+			return false
+		}
+		switch r.URL.Query().Get("Action") {
+		case "ListQueues", "GetQueueUrl", "GetQueueAttributes", "ListQueueTags":
+			return true
+		}
+		return false
+	}
+	switch r.Header.Get("X-Amz-Target") {
+	case sqsListQueuesTarget, sqsGetQueueUrlTarget, sqsGetQueueAttributesTarget, sqsListQueueTagsTarget:
+		return true
+	default:
+		return false
+	}
 }
 
 // writeSQSError emits an SQS JSON-protocol error envelope. AWS returns:

@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"log/slog"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -12,11 +13,14 @@ import (
 // httpSchemePlain is the URL scheme for plain-text HTTP adapter endpoints.
 const httpSchemePlain = "http"
 
-// httpLeaderErrorWriter writes an adapter-specific error envelope (JSON for
-// DynamoDB/SQS, XML for S3, RESP for Redis, ...) when the HTTP leader proxy
-// cannot forward a follower request. The adapter owns the shape of the body;
-// this helper only decides when to call it.
-type httpLeaderErrorWriter func(w http.ResponseWriter, status int, message string)
+type httpLeaderProxyFailure uint8
+
+const (
+	httpLeaderProxyNotForwarded httpLeaderProxyFailure = iota
+	httpLeaderProxyForwardAttemptFailed
+)
+
+type httpLeaderErrorWriter func(w http.ResponseWriter, r *http.Request, failure httpLeaderProxyFailure)
 
 // proxyHTTPRequestToLeader forwards r to the current Raft leader's HTTP
 // adapter endpoint when this node is a follower. It returns true when the
@@ -24,10 +28,8 @@ type httpLeaderErrorWriter func(w http.ResponseWriter, status int, message strin
 // false when the caller should serve it locally (no leader map configured,
 // no coordinator, or this node is the leader).
 //
-// Error paths:
-//  1. no known Raft leader            → 503 via errWriter("no raft leader currently available")
-//  2. leader id missing from leaderMap → 503 via errWriter("leader address not found")
-//  3. reverse-proxy dial/copy failure  → 503 via errWriter("leader proxy error: <reason>")
+// Before a forwarding attempt, the adapter can return a retryable routing
+// failure. Once forwarding starts, a failed reply cannot prove noncommit.
 //
 // leaderMap keys are Raft addresses; values are the matching adapter HTTP
 // addresses exported on that same node.
@@ -49,18 +51,19 @@ func proxyHTTPRequestToLeader(
 	// G2-item-realtime stale reads.
 	leader := coordinator.RaftLeader()
 	if leader == "" {
-		errWriter(w, http.StatusServiceUnavailable, "no raft leader currently available")
+		errWriter(w, r, httpLeaderProxyNotForwarded)
 		return true
 	}
 	targetAddr, ok := leaderMap[leader]
 	if !ok || strings.TrimSpace(targetAddr) == "" {
-		errWriter(w, http.StatusServiceUnavailable, "leader address not found")
+		errWriter(w, r, httpLeaderProxyNotForwarded)
 		return true
 	}
 	target := &url.URL{Scheme: httpSchemePlain, Host: targetAddr}
 	proxy := httputil.NewSingleHostReverseProxy(target)
-	proxy.ErrorHandler = func(rw http.ResponseWriter, _ *http.Request, err error) {
-		errWriter(rw, http.StatusServiceUnavailable, "leader proxy error: "+err.Error())
+	proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
+		slog.Warn("leader HTTP proxy failed", "err", err)
+		errWriter(rw, req, httpLeaderProxyForwardAttemptFailed)
 	}
 	proxy.ServeHTTP(w, r)
 	return true
