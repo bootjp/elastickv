@@ -4,23 +4,24 @@
 
 Elastickv already has shard boundaries, but it does not yet have the control-plane needed for safe automatic hotspot splitting.
 
-Current implementation status (updated August 22, 2026):
+Current implementation status:
 
-- M1 durable route catalog, watcher refresh, and same-group manual
-  `SplitRange` are implemented.
-- M2 has the SplitJob catalog substrate (`distribution/split_job_catalog.go`)
-  and codec/list/history tests, tracked in
-  [`2026_06_11_implemented_hotspot_split_milestone2_migration.md`](2026_06_11_implemented_hotspot_split_milestone2_migration.md);
-  the actual migration RPC, export/import, fence, cutover, promotion, and
-  cleanup workflow are still open.
+- M1 durable route catalog, `WatchCatalog` snapshot/delta stream,
+  `GetSplitJob`, watcher refresh, and same-group manual `SplitRange` are
+  implemented. `WatchCatalog` supersedes the proposed `WatchRoutes` RPC.
+- M2 cross-group migration, including export/import, fence, cutover,
+  promotion, and cleanup, is implemented in
+  [`2026_06_11_implemented_hotspot_split_milestone2_migration.md`](2026_06_11_implemented_hotspot_split_milestone2_migration.md).
 - Standalone M3 auto-split is implemented: keyviz supplies the sole load signal,
   and the detector/scheduler issues guarded same-group `SplitRange` operations.
   See
   [`2026_06_11_implemented_hotspot_split_milestone3_automation.md`](2026_06_11_implemented_hotspot_split_milestone3_automation.md).
-- There is no data movement workflow to relocate part of a split range to another Raft group.
+- Automatic cross-group target selection (M3-PR4) and the remaining M4
+  hardening are open. Manual cross-group relocation is implemented.
 
-Same-group hotspot splitting is connected end-to-end. Cross-group relocation
-still depends on the M2 movement workflow and the M3-PR4 target policy.
+Same-group hotspot splitting and manual cross-group relocation are connected
+end-to-end. Automatic cross-group relocation still needs the M3-PR4 target
+policy and its authoritative load evidence.
 
 For a current runtime/component snapshot, see `docs/architecture_overview.md`.
 
@@ -247,10 +248,10 @@ Add RPCs:
 
 Milestone 1 implementation status (current):
 
-1. Implemented: `GetRoute`, `GetTimestamp`, `ListRoutes`, `SplitRange`.
-2. `SplitRange` currently supports same-group split only (no cross-group migration).
+1. Implemented: `GetRoute`, `GetTimestamp`, `ListRoutes`, `SplitRange`, and `GetSplitJob`.
+2. `SplitRange` supports same-group splits and manual cross-group migration.
 3. `ReportAccess` is superseded by the keyviz sampler for M3 automation.
-4. Not implemented yet: `WatchRoutes`, `GetSplitJob`.
+4. `WatchCatalog` supersedes `WatchRoutes` with versioned snapshot resets and contiguous deltas.
 
 For operator examples, see the [Manual Route Split API section in the README](../../README.md#manual-route-split-api-milestone-1).
 
