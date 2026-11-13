@@ -17,11 +17,13 @@ Current implementation status:
   See
   [`2026_06_11_implemented_hotspot_split_milestone3_automation.md`](2026_06_11_implemented_hotspot_split_milestone3_automation.md).
 - Automatic cross-group target selection (M3-PR4) and the remaining M4
-  hardening are open. Manual cross-group relocation is implemented.
+  hardening are open. Manual cross-group relocation is implemented through
+  the separate `StartSplitMigration` RPC, not `SplitRange`.
 
 Same-group hotspot splitting and manual cross-group relocation are connected
 end-to-end. Automatic cross-group relocation still needs the M3-PR4 target
-policy and its authoritative load evidence.
+policy, authoritative load evidence, and scheduler integration with
+`StartSplitMigration`.
 
 For a current runtime/component snapshot, see `docs/architecture_overview.md`.
 
@@ -249,7 +251,7 @@ Add RPCs:
 Milestone 1 implementation status (current):
 
 1. Implemented: `GetRoute`, `GetTimestamp`, `ListRoutes`, `SplitRange`, and `GetSplitJob`.
-2. `SplitRange` supports same-group splits and manual cross-group migration.
+2. `SplitRange` supports same-group splits only; `StartSplitMigration` is the manual cross-group entrypoint.
 3. `ReportAccess` is superseded by the keyviz sampler for M3 automation.
 4. `WatchCatalog` supersedes `WatchRoutes` with versioned snapshot resets and contiguous deltas.
 
