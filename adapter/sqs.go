@@ -613,6 +613,9 @@ func (s *SQSServer) handle(w http.ResponseWriter, r *http.Request) {
 		writeSQSError(w, http.StatusBadRequest, sqsErrInvalidAction, "unsupported SQS target: "+target)
 		return
 	}
+	// Mutations can read queue/message state before returning without a write.
+	// Until those reads have route attribution, no SQS action proves coverage.
+	kv.MarkUnattributableClientReadThrough(s.coordinator, 0)
 	handler(w, r)
 }
 

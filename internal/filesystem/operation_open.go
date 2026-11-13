@@ -116,6 +116,7 @@ func (s *Service) planOpenOperation(ctx context.Context, snapshot operationPlann
 	plan := operationAttemptPlan{Intent: intent, ReadTS: ts, RouteVersion: snapshot.RouteVersion,
 		ReadKeys: [][]byte{fskeys.InodeKey(inode)}}
 	meta, err := s.inodeAt(ctx, inode, ts)
+	s.observeReadResult(ctx, fskeys.InodeKey(inode), err)
 	if errors.Is(err, ErrNotFound) {
 		return plan, ErrNotFound, nil
 	}
@@ -144,7 +145,11 @@ func (s *Service) planOpenLease(ctx context.Context, inode uint64, clientID []by
 		return nil, nil, nil, errors.WithStack(store.ErrWriteConflict)
 	}
 	refKey := fskeys.RefKey(inode, clientID, fh)
-	if _, err := s.store.GetAt(ctx, refKey, ts); err == nil {
+	_, err := s.store.GetAt(ctx, refKey, ts)
+	if err == nil || errors.Is(err, store.ErrKeyNotFound) {
+		s.observeReadKey(ctx, refKey)
+	}
+	if err == nil {
 		return nil, nil, nil, errors.WithStack(store.ErrWriteConflict)
 	} else if !errors.Is(err, store.ErrKeyNotFound) {
 		return nil, nil, nil, errors.Wrap(err, "read open handle lease")

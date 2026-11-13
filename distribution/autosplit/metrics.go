@@ -22,11 +22,16 @@ type Observer interface {
 	ObserveState(enabled bool, trackedRoutes, cooldownActive int, evalDuration time.Duration)
 }
 
+type targetSkipObserver interface {
+	ObserveTargetSkipped(reason string)
+}
+
 type prometheusObserver struct {
 	candidatesPromoted prometheus.Counter
 	splitsScheduled    prometheus.Counter
 	splitsFailed       *prometheus.CounterVec
 	skipped            *prometheus.CounterVec
+	targetSkipped      *prometheus.CounterVec
 	isolationDeclined  *prometheus.CounterVec
 	compoundPartial    prometheus.Counter
 	enabled            prometheus.Gauge
@@ -56,6 +61,10 @@ func NewPrometheusObserver(registerer prometheus.Registerer) Observer {
 		skipped: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "autosplit_skipped_total",
 			Help: "Automatic split decisions skipped before an RPC by bounded reason.",
+		}, []string{metricLabelReason}),
+		targetSkipped: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "autosplit_target_skipped_total",
+			Help: "Cross-group target selection declines by bounded reason.",
 		}, []string{metricLabelReason}),
 		isolationDeclined: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "autosplit_isolation_declined_total",
@@ -87,6 +96,7 @@ func NewPrometheusObserver(registerer prometheus.Registerer) Observer {
 		o.splitsScheduled,
 		o.splitsFailed,
 		o.skipped,
+		o.targetSkipped,
 		o.isolationDeclined,
 		o.compoundPartial,
 		o.enabled,
@@ -120,6 +130,12 @@ func (o *prometheusObserver) ObserveSkipped(reason SkipReason) {
 		return
 	}
 	o.skipped.WithLabelValues(string(reason)).Inc()
+}
+
+func (o *prometheusObserver) ObserveTargetSkipped(reason string) {
+	if o != nil && reason == "load_unknown" {
+		o.targetSkipped.WithLabelValues(reason).Inc()
+	}
 }
 
 func (o *prometheusObserver) ObserveIsolationDeclined(reason IsolationDeclineReason) {

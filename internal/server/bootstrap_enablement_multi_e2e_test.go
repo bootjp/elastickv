@@ -566,8 +566,12 @@ func multiEnablementActiveSnapshotRestart(t *testing.T, base string, identities 
 	require.Equal(t, source, multiEnablementSnapshotPreparation(t, protected[2], manifest))
 	for _, process := range protected {
 		require.Eventually(t, process.runtime.PublicReady, bootstrapE2EWaitTimeout, 10*time.Millisecond)
-		policy, err := kv.LoadAppliedBootstrapPolicy(t.Context(), process.runtime.Store, manifest.Identity, process.runtime.Engine.Status().AppliedIndex)
-		require.NoError(t, err)
+		var policy raftbootstrap.PolicyRecord
+		require.EventuallyWithT(t, func(c *assert.CollectT) {
+			var err error
+			policy, err = kv.LoadAppliedBootstrapPolicy(t.Context(), process.runtime.Store, manifest.Identity, process.runtime.Engine.Status().AppliedIndex)
+			assert.NoError(c, err)
+		}, bootstrapE2EWaitTimeout, 10*time.Millisecond)
 		require.Equal(t, activation, policy.ActivationIndex, "cold recovery cannot downgrade or reactivate P")
 		require.Equal(t, uint64(1), policy.Generation)
 		multiEnablementReplicatedRead(t, process, "legacy-key", "replicated-original")

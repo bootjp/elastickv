@@ -72,7 +72,7 @@ var errSnapshotPayloadTooLarge = errors.New("etcd raft snapshot payload exceeds 
 var errSnapshotSpoolDiskHeadroom = errors.New("etcd raft snapshot spool insufficient disk headroom")
 
 // snapshotSyncDir indirects fsync-on-directory through a package var so a
-// fault-injection test can simulate "rename succeeded but the fsync that
+// fault-injection test can simulate "publication succeeded but the fsync that
 // would persist the directory entry failed" — that's the partial-failure
 // path FinalizeAsFSMFile's stepwise state-clearing was added to handle,
 // and without an injection seam there's no portable way to reproduce it.
@@ -188,10 +188,9 @@ func (s *snapshotSpool) Reader() (io.Reader, error) {
 }
 
 // FinalizeAsFSMFile rewrites the spool file as a fully-formed .fsm snapshot
-// (payload + 4-byte big-endian CRC32C footer) and atomically renames it to
-// fsmSnapPath(fsmSnapDir, index). On success, ownership of the on-disk file
-// transfers to fsmSnapDir — subsequent Close() becomes a no-op so the
-// renamed file is NOT removed.
+// (payload + 4-byte big-endian CRC32C footer) and publishes it without
+// replacing an existing fsmSnapPath(fsmSnapDir, index). On success, ownership
+// transfers to fsmSnapDir and subsequent Close() becomes a no-op.
 //
 // The caller is responsible for having computed crc32c over the bytes
 // already written to the spool (see crc32CWriter). This is the streaming
@@ -201,11 +200,11 @@ func (s *snapshotSpool) Reader() (io.Reader, error) {
 //
 // Memory safety: this is the path that lets receiveSnapshotStream avoid
 // materializing a multi-GiB Snapshot.Data []byte. The spool file already
-// holds the payload; we only append 4 bytes and rename. Heap stays flat
+// holds the payload; we only append 4 bytes and link it. Heap stays flat
 // regardless of FSM size.
 //
 // Filesystem requirement: the spool file MUST be on the same filesystem as
-// fsmSnapDir, otherwise os.Rename returns syscall.EXDEV and the receive
+// fsmSnapDir, otherwise os.Link returns syscall.EXDEV and the receive
 // fails (the leader will retry indefinitely with no chance of success).
 // receiveSnapshotStream guarantees this by creating the spool inside
 // fsmSnapDir when the streaming-token path is wired; standard engine
@@ -221,10 +220,10 @@ func (s *snapshotSpool) FinalizeAsFSMFile(fsmSnapDir string, index uint64, crc32
 	// released. Two failure modes the original single-defer version would
 	// have produced misleading errors for, that this stepwise approach
 	// avoids:
-	//   1. file.Close() succeeds, os.Rename() fails → s.file=nil but s.path
+	//   1. file.Close() succeeds, os.Link() fails → s.file=nil but s.path
 	//      still valid, so Close() correctly removes the half-written
-	//      spool file at its original path (the rename never happened).
-	//   2. os.Rename() succeeds, syncDir() fails → s.file=nil AND s.path=""
+	//      spool file at its original path (the link never happened).
+	//   2. os.Link() succeeds, syncDir() fails → s.file=nil AND s.path=""
 	//      so Close() is a no-op. Without the per-step clear, Close()
 	//      would attempt os.Remove(s.path) and surface a misleading
 	//      ErrNotExist that buries the real syncDir error.
@@ -252,13 +251,25 @@ func (s *snapshotSpool) FinalizeAsFSMFile(fsmSnapDir string, index uint64, crc32
 	if mkErr := os.MkdirAll(fsmSnapDir, defaultDirPerm); mkErr != nil {
 		return errors.WithStack(mkErr)
 	}
-	if rnErr := os.Rename(s.path, finalPath); rnErr != nil {
-		return errors.WithStack(rnErr)
+	if err := publishSnapshotSpoolFile(s.path, finalPath, os.Remove); err != nil {
+		return err
 	}
 	s.path = "" // file no longer at this path; subsequent Close() must not try to remove it.
 
 	if syErr := snapshotSyncDir(fsmSnapDir); syErr != nil {
 		return errors.WithStack(syErr)
+	}
+	return nil
+}
+
+func publishSnapshotSpoolFile(spoolPath, finalPath string, removeSpool func(string) error) error {
+	// A local snapshot may publish this index after the receive was admitted.
+	// Linking fails if its canonical file already exists, unlike rename.
+	if err := os.Link(spoolPath, finalPath); err != nil {
+		return errors.WithStack(err)
+	}
+	if err := removeSpool(spoolPath); err != nil {
+		return errors.WithStack(errors.CombineErrors(err, os.Remove(finalPath)))
 	}
 	return nil
 }
@@ -290,8 +301,7 @@ func (s *snapshotSpool) Close() error {
 		err = errors.CombineErrors(err, errors.WithStack(s.file.Close()))
 	}
 	// Skip removal once FinalizeAsFSMFile has handed ownership of the file
-	// off to fsmSnapDir (it nils path so we don't try to delete a renamed
-	// .fsm file that's now serving as the durable snapshot).
+	// off to fsmSnapDir (it nils path after unlinking the spool name).
 	if s.path != "" {
 		err = errors.CombineErrors(err, errors.WithStack(os.Remove(s.path)))
 	}

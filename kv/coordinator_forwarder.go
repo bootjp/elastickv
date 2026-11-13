@@ -3,6 +3,7 @@ package kv
 import (
 	"context"
 
+	"github.com/bootjp/elastickv/keyviz"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
 )
@@ -26,25 +27,27 @@ type CoordinatorForwarder struct {
 var ErrOperationGroupResolverUnavailable = errors.New("operation group resolver unavailable")
 
 var (
-	_ Coordinator                          = CoordinatorForwarder{}
-	_ LeaseReadableCoordinator             = CoordinatorForwarder{}
-	_ AllGroupsLeaseReadableCoordinator    = CoordinatorForwarder{}
-	_ AllGroupsLeaseTimestampCoordinator   = CoordinatorForwarder{}
-	_ GroupRoutableCoordinator             = CoordinatorForwarder{}
-	_ GroupLeaderRoutableCoordinator       = CoordinatorForwarder{}
-	_ LocalLeaderGroupsCoordinator         = CoordinatorForwarder{}
-	_ RaftMembershipCoordinator            = CoordinatorForwarder{}
-	_ TimestampAllocatorProvider           = CoordinatorForwarder{}
-	_ ConfiguredTimestampAllocatorProvider = CoordinatorForwarder{}
-	_ TimestampAllocator                   = CoordinatorForwarder{}
-	_ TimestampAfterAllocator              = CoordinatorForwarder{}
-	_ TSOPhaseDState                       = CoordinatorForwarder{}
-	_ DurableTimestampValidator            = CoordinatorForwarder{}
-	_ AppliedReadTimestampVoucher          = CoordinatorForwarder{}
-	_ AppliedReadTimestampVoucherRevoker   = CoordinatorForwarder{}
-	_ AppliedReadTimestampVoucherSupport   = CoordinatorForwarder{}
-	_ MutationWriteGate                    = CoordinatorForwarder{}
-	_ hlcLeaseRecoverer                    = CoordinatorForwarder{}
+	_ Coordinator                           = CoordinatorForwarder{}
+	_ LeaseReadableCoordinator              = CoordinatorForwarder{}
+	_ ReadObserver                          = CoordinatorForwarder{}
+	_ keyviz.UnattributableClientReadMarker = CoordinatorForwarder{}
+	_ AllGroupsLeaseReadableCoordinator     = CoordinatorForwarder{}
+	_ AllGroupsLeaseTimestampCoordinator    = CoordinatorForwarder{}
+	_ GroupRoutableCoordinator              = CoordinatorForwarder{}
+	_ GroupLeaderRoutableCoordinator        = CoordinatorForwarder{}
+	_ LocalLeaderGroupsCoordinator          = CoordinatorForwarder{}
+	_ RaftMembershipCoordinator             = CoordinatorForwarder{}
+	_ TimestampAllocatorProvider            = CoordinatorForwarder{}
+	_ ConfiguredTimestampAllocatorProvider  = CoordinatorForwarder{}
+	_ TimestampAllocator                    = CoordinatorForwarder{}
+	_ TimestampAfterAllocator               = CoordinatorForwarder{}
+	_ TSOPhaseDState                        = CoordinatorForwarder{}
+	_ DurableTimestampValidator             = CoordinatorForwarder{}
+	_ AppliedReadTimestampVoucher           = CoordinatorForwarder{}
+	_ AppliedReadTimestampVoucherRevoker    = CoordinatorForwarder{}
+	_ AppliedReadTimestampVoucherSupport    = CoordinatorForwarder{}
+	_ MutationWriteGate                     = CoordinatorForwarder{}
+	_ hlcLeaseRecoverer                     = CoordinatorForwarder{}
 )
 
 func (f CoordinatorForwarder) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
@@ -71,6 +74,14 @@ func (f CoordinatorForwarder) LinearizableReadForKey(ctx context.Context, key []
 		return idx, errors.WithStack(err)
 	}
 	return f.LinearizableRead(ctx)
+}
+
+func (f CoordinatorForwarder) ObserveReadForKey(ctx context.Context, key []byte) {
+	ObserveReadForKeyThrough(f.Inner, ctx, key)
+}
+
+func (f CoordinatorForwarder) MarkUnattributableClientRead(routeID uint64) {
+	MarkUnattributableClientReadThrough(f.Inner, routeID)
 }
 
 func (f CoordinatorForwarder) RaftLeader() string { return f.Inner.RaftLeader() }

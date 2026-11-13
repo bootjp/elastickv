@@ -75,6 +75,7 @@ func Start(
 		filesystem.WithCapacity(config.Capacity),
 		filesystem.WithMaxFiles(config.MaxFiles),
 		filesystem.WithOperationalObserver(observer),
+		filesystem.WithReadObserver(coordinate),
 	)
 	if err != nil {
 		return errors.Wrap(err, "create filesystem service")

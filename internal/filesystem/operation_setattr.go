@@ -147,6 +147,7 @@ func (s *Service) prepareSetAttrCleanup(ctx context.Context, inode uint64, sizeC
 		return nil, err
 	}
 	meta, err := s.inodeAt(ctx, inode, ts)
+	s.observeReadResult(ctx, fskeys.InodeKey(inode), err)
 	if errors.Is(err, ErrNotFound) {
 		return nil, nil
 	}
@@ -154,8 +155,12 @@ func (s *Service) prepareSetAttrCleanup(ctx context.Context, inode uint64, sizeC
 		return meta, err
 	}
 	if err = s.ensureActiveHomeAt(ctx, meta, ts); err != nil {
+		s.observeHomeRead(ctx, inode, err)
 		return nil, err
 	}
+	s.observeHomeRead(ctx, inode, nil)
+	prefix := fskeys.ChunkPrefix(meta.HomeSlot, inode)
+	s.markUnattributableReadForRange(prefix, prefixEnd(prefix))
 	_, cleaned, _, err := s.cleanupStaleChunksBeforeSizeChange(ctx, inode, meta)
 	return cleaned, err
 }
@@ -164,6 +169,7 @@ func (s *Service) planSetAttrOperation(ctx context.Context, snapshot operationPl
 	plan := operationAttemptPlan{Intent: intent, ReadTS: snapshot.ReadTS, RouteVersion: snapshot.RouteVersion,
 		ReadKeys: [][]byte{fskeys.InodeKey(inode), fskeys.HomeKey(inode)}}
 	meta, err := s.inodeAt(ctx, inode, snapshot.ReadTS)
+	s.observeReadResult(ctx, fskeys.InodeKey(inode), err)
 	if errors.Is(err, ErrNotFound) {
 		return plan, nil, ErrNotFound, nil
 	}
@@ -198,27 +204,34 @@ func (s *Service) planSetAttrSize(ctx context.Context, plan *operationAttemptPla
 		return nil, ErrIsDir
 	}
 	if err := s.ensureActiveHomeAt(ctx, meta, plan.ReadTS); err != nil {
+		s.observeHomeRead(ctx, meta.Inode, err)
 		return nil, err
 	}
+	s.observeHomeRead(ctx, meta.Inode, nil)
 	if cleaned == nil || (size > meta.Size && (meta.Size != cleaned.Size || meta.HomeSlot != cleaned.HomeSlot)) {
 		return nil, errWriteCleanupChanged
 	}
 	if size < meta.Size {
-		elems, reads, delta, cleanup, err := s.truncateChunkElems(ctx, meta, plan.ReadTS, size, meta.effectiveChunkSize(s.chunkSize))
-		if err != nil {
-			return nil, err
-		}
-		plan.Effects = append(plan.Effects, elems...)
-		plan.ReadKeys = append(plan.ReadKeys, reads...)
-		plan.Effects, plan.ReadKeys, err = s.appendUsageUpdate(ctx, plan.ReadTS, plan.Effects, plan.ReadKeys, delta)
-		if err != nil {
-			return nil, err
-		}
-		meta.Size = size
-		return cleanup, nil
+		return s.planSetAttrShrink(ctx, plan, meta, size)
 	}
 	meta.Size = size
 	return nil, nil
+}
+
+func (s *Service) planSetAttrShrink(ctx context.Context, plan *operationAttemptPlan, meta *InodeMeta, size uint64) (*chunkDeletePlan, error) {
+	chunkSize := meta.effectiveChunkSize(s.chunkSize)
+	elems, reads, delta, cleanup, err := s.truncateChunkElems(ctx, meta, plan.ReadTS, size, chunkSize)
+	if err != nil {
+		return nil, err
+	}
+	plan.Effects = append(plan.Effects, elems...)
+	plan.ReadKeys = append(plan.ReadKeys, reads...)
+	plan.Effects, plan.ReadKeys, err = s.appendUsageUpdate(ctx, plan.ReadTS, plan.Effects, plan.ReadKeys, delta)
+	if err != nil {
+		return nil, err
+	}
+	meta.Size = size
+	return cleanup, nil
 }
 
 func applySetAttrFields(meta *InodeMeta, mask SetAttrMask, attrs SetAttr, oldSize uint64, now int64) {

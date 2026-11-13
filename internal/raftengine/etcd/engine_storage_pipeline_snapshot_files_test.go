@@ -44,6 +44,36 @@ func TestEnginePipelineSnapshotFilesKeepPinnedOlderPair(t *testing.T) {
 	require.FileExists(t, fsmSnapPath(env.fsmSnapDir, 500), "verified restorable floor survives prewrite")
 }
 
+func TestEnginePipelineSnapshotFilesPrepareSameIndexRetry(t *testing.T) {
+	root := t.TempDir()
+	env := pipelineConfigurationEnvironment{dataDir: root, fsmSnapDir: filepath.Join(root, fsmSnapDirName)}
+	require.NoError(t, os.MkdirAll(filepath.Join(root, snapDirName), defaultDirPerm))
+	require.NoError(t, os.MkdirAll(env.fsmSnapDir, defaultDirPerm))
+	files := &pipelineSnapshotFiles{mu: &sync.Mutex{}, protected: make(map[uint64]int)}
+	const index = uint64(10)
+	_, path := writeFSMFileForTest(t, env.fsmSnapDir, index, []byte("orphan"))
+
+	files.pin(index)
+	require.NoError(t, files.prepare(env, index))
+	require.FileExists(t, path)
+	files.unpin(index)
+	files.protected[index]++
+	require.NoError(t, files.prepare(env, index))
+	require.FileExists(t, path)
+	files.releaseReceived(index)
+	files.currentSnapshotIndex = func() (uint64, error) { return index, nil }
+	require.NoError(t, files.prepare(env, index))
+	require.FileExists(t, path)
+	files.currentSnapshotIndex = func() (uint64, error) { return index - 1, nil }
+	require.NoError(t, files.prepare(env, index))
+	require.NoFileExists(t, path)
+
+	crc, path := writeFSMFileForTest(t, env.fsmSnapDir, index, []byte("published"))
+	createTokenSnapFileWithTerm(t, filepath.Join(root, snapDirName), 1, index, crc)
+	require.NoError(t, files.prepare(env, index))
+	require.FileExists(t, path)
+}
+
 func TestEnginePipelineSnapshotFilesValidateFullChecksum(t *testing.T) {
 	files := &pipelineSnapshotFiles{mu: &sync.Mutex{}}
 	env := pipelineConfigurationEnvironment{fsmSnapDir: t.TempDir()}

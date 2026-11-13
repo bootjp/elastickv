@@ -71,3 +71,28 @@ func TestStartKeyVizLeaderTermPublisherSkipsWhenNoRuntimes(t *testing.T) {
 	startKeyVizLeaderTermPublisher(ctx, eg, s, nil)
 	require.NoError(t, eg.Wait())
 }
+
+func TestEnrollKeyVizReadCoverageAfterPublicStart(t *testing.T) {
+	now := time.Unix(100, 0)
+	s := keyviz.NewMemSampler(keyviz.MemSamplerOptions{
+		Step: time.Second, HistoryColumns: 4, Now: func() time.Time { return now },
+	})
+	require.True(t, s.RegisterRoute(1, []byte("a"), []byte("z"), 1))
+	flush := func() keyviz.MatrixColumn {
+		s.Observe(1, []byte("k"), keyviz.OpRead, 0, keyviz.LabelLegacy)
+		now = now.Add(time.Second)
+		s.Flush()
+		cols := s.Snapshot(time.Time{}, time.Time{})
+		return cols[len(cols)-1]
+	}
+
+	enrollKeyVizReadCoverage(s, false)
+	disabled := flush()
+	require.False(t, s.ReadCoverageCoversWindow(1, disabled.WindowStart, disabled.At))
+
+	enrollKeyVizReadCoverage(s, true)
+	transition := flush()
+	require.False(t, s.ReadCoverageCoversWindow(1, transition.WindowStart, transition.At))
+	covered := flush()
+	require.True(t, s.ReadCoverageCoversWindow(1, covered.WindowStart, covered.At))
+}

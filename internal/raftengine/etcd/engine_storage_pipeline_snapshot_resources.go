@@ -92,10 +92,11 @@ func (p *engineStoragePipeline) snapshotIngressLease(message *raftpb.Message) (*
 // File exclusion is shared only with transport/API I/O threads, never acquired
 // by the owner. Owner pins use a separate, I/O-free mutex.
 type pipelineSnapshotFiles struct {
-	mu        *sync.Mutex
-	protected map[uint64]int
-	pinsMu    sync.Mutex
-	pins      map[uint64]int
+	mu                   *sync.Mutex
+	protected            map[uint64]int
+	currentSnapshotIndex func() (uint64, error)
+	pinsMu               sync.Mutex
+	pins                 map[uint64]int
 }
 
 func (f *pipelineSnapshotFiles) pin(index uint64) {
@@ -137,7 +138,35 @@ func (f *pipelineSnapshotFiles) protectedIndexes() map[uint64]bool {
 func (f *pipelineSnapshotFiles) prepare(env pipelineConfigurationEnvironment, index uint64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return prepareFSMSnapshotWriteProtected(filepath.Join(env.dataDir, snapDirName), env.fsmSnapDir, index, f.protectedIndexes())
+	snapDir := filepath.Join(env.dataDir, snapDirName)
+	protected := f.protectedIndexes()
+	if index != 0 && env.fsmSnapDir != "" && !protected[index] {
+		if err := f.removeUnreferenced(env.fsmSnapDir, snapDir, index); err != nil {
+			return err
+		}
+	}
+	return prepareFSMSnapshotWriteProtected(snapDir, env.fsmSnapDir, index, protected)
+}
+
+func (f *pipelineSnapshotFiles) removeUnreferenced(fsmSnapDir, snapDir string, index uint64) error {
+	if f.currentSnapshotIndex != nil {
+		current, err := f.currentSnapshotIndex()
+		if err != nil {
+			return err
+		}
+		if index <= current {
+			return nil
+		}
+	}
+	live, err := collectLiveSnapIndexes(snapDir)
+	if err != nil || live[index] {
+		return err
+	}
+	err = os.Remove(fsmSnapPath(fsmSnapDir, index))
+	if err != nil && !os.IsNotExist(err) {
+		return errors.WithStack(err)
+	}
+	return nil
 }
 
 func (f *pipelineSnapshotFiles) purge(env pipelineConfigurationEnvironment) error {
@@ -155,7 +184,17 @@ func (e *Engine) initPipelineSnapshotFiles() {
 	if e.protectedReceivedFSMSnaps == nil {
 		e.protectedReceivedFSMSnaps = make(map[uint64]int)
 	}
-	p.snapshotFiles = &pipelineSnapshotFiles{mu: &e.snapshotMu, protected: e.protectedReceivedFSMSnaps}
+	p.snapshotFiles = &pipelineSnapshotFiles{
+		mu:        &e.snapshotMu,
+		protected: e.protectedReceivedFSMSnaps,
+		currentSnapshotIndex: func() (uint64, error) {
+			if e.storage == nil {
+				return 0, nil
+			}
+			snapshot, err := e.storage.Snapshot()
+			return snapshotIndex(snapshot), err
+		},
+	}
 }
 
 func (f *pipelineSnapshotFiles) releaseReceived(index uint64) {

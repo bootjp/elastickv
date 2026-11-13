@@ -14,11 +14,9 @@
 //
 // Hot-path properties (see design §5.1, §10):
 //
-//   - With hot-key tracking disabled, Observe is a single
-//     atomic.Pointer[routeTable].Load, a plain map lookup against an immutable
-//     snapshot, and at most two atomic.AddUint64 calls. Hot-key tracking adds a
-//     read lock to writes so sampled events stay aligned with their counter
-//     window.
+//   - Writes without hot-key tracking use a single route-table load, map
+//     lookup, and atomic counter updates. Reads take the flush read lock so
+//     their counter updates cannot cross a committed-window boundary.
 //   - Flush drains the per-route counters with atomic.SwapUint64; no
 //     pointer retirement, so a late writer cannot race past the snapshot
 //     and lose counts.
@@ -79,6 +77,12 @@ type Sampler interface {
 	// size is irrelevant. Implementations must no-op (not panic) when
 	// invoked on a typed-nil receiver.
 	Observe(routeID uint64, key []byte, op Op, valueLen int, label Label)
+}
+
+// UnattributableClientReadMarker is an optional interface for a kv-facing
+// caller. A zero route ID marks reads whose key or route cannot be resolved.
+type UnattributableClientReadMarker interface {
+	MarkUnattributableClientRead(routeID uint64)
 }
 
 // Defaults for MemSamplerOptions when fields are left zero.
@@ -205,8 +209,11 @@ type MemSampler struct {
 	// flushMu serializes explicit and background flushes, protects the
 	// committed window lower boundary, and aligns enabled hot-key events with
 	// the counter window drained by that flush.
-	flushMu     sync.RWMutex
-	lastFlushAt time.Time
+	flushMu                 sync.RWMutex
+	lastFlushAt             time.Time
+	readCoverageEnabled     bool
+	readCoverageWholeWindow bool
+	unattributableReads     map[uint64]bool
 
 	// table holds the immutable map of currently-tracked routes. The
 	// hot path Observe() does a single Load + map lookup; mutations
@@ -217,6 +224,10 @@ type MemSampler struct {
 	// routesMu serialises the routeTable copy-on-write update path.
 	// Held only by non-hot-path callers.
 	routesMu sync.Mutex
+	// Registration provenance is mutation-path only; Observe never reads it.
+	routeRegistrations map[uint64]routeRegistration
+	routeMutationSeq   uint64
+	windowOpenSeq      uint64
 
 	// historyMu guards the ring buffer. Reads (Snapshot) and writes
 	// (Flush) acquire it; Observe never touches it.
@@ -258,6 +269,123 @@ type MemSampler struct {
 	// happen at most a few times per second across the whole cluster.
 	groupTermsMu sync.RWMutex
 	groupTerms   map[uint64]uint64
+}
+
+// ReadCoverageEnrollment is an explicit assertion by the protocol ingress
+// owner. In particular, leader-local observations do not cover forwarded
+// reads. This must not be enabled until every client read path is instrumented.
+type ReadCoverageEnrollment struct {
+	LocalKeyedReadsObserved bool
+	ForwardedReadsObserved  bool
+	UnkeyedReadsMarked      bool
+}
+
+// EnrollReadCoverage changes the assertion for future complete windows only.
+// A transition in the current window leaves that window unproven.
+func (s *MemSampler) EnrollReadCoverage(enrollment ReadCoverageEnrollment) {
+	if s == nil {
+		return
+	}
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
+	enabled := enrollment.LocalKeyedReadsObserved && enrollment.ForwardedReadsObserved && enrollment.UnkeyedReadsMarked
+	if s.readCoverageEnabled != enabled {
+		s.readCoverageWholeWindow = false
+	}
+	s.readCoverageEnabled = enabled
+}
+
+// MarkUnattributableClientRead records a client read not represented by a
+// keyed Observe. routeID == 0 marks a global read (e.g. KEYS/SCAN/DBSIZE)
+// and invalidates coverage for every route in this committed window.
+func (s *MemSampler) MarkUnattributableClientRead(routeID uint64) {
+	if s == nil {
+		return
+	}
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
+	if s.unattributableReads == nil {
+		s.unattributableReads = make(map[uint64]bool)
+	}
+	s.unattributableReads[routeID] = true
+}
+
+// NoUnattributableClientReads proves only absence of marks in an exact,
+// retained committed window. It does not prove that all read paths were
+// instrumented; use ReadCoverageCoversWindow for target admission.
+func (s *MemSampler) NoUnattributableClientReads(routeID uint64, start, end time.Time) bool {
+	col, ok := s.readCoverageColumn(start, end)
+	return ok && !col.unattributableReads[0] && !col.unattributableReads[routeID]
+}
+
+// ReadCoverageCoversWindow requires explicit protocol enrollment throughout
+// the exact committed window and no route-local or global uncovered read.
+func (s *MemSampler) ReadCoverageCoversWindow(routeID uint64, start, end time.Time) bool {
+	col, ok := s.readCoverageColumn(start, end)
+	return ok && col.readCoverageComplete && !col.unattributableReads[0] && !col.unattributableReads[routeID]
+}
+
+func (s *MemSampler) readCoverageColumn(start, end time.Time) (MatrixColumn, bool) {
+	if s == nil || !start.Before(end) {
+		return MatrixColumn{}, false
+	}
+	s.historyMu.Lock()
+	defer s.historyMu.Unlock()
+	return s.committedColumnLocked(start, end)
+}
+
+// CommittedWindowProof holds the immutable metadata of one retained window.
+// Route registration is checked against current registrations on each use.
+type CommittedWindowProof struct {
+	sampler              *MemSampler
+	windowStart          time.Time
+	openRouteSeq         uint64
+	readCoverageComplete bool
+	unattributableReads  map[uint64]bool
+}
+
+// ProofForCommittedWindow resolves an exact window once for route admission.
+func (s *MemSampler) ProofForCommittedWindow(start, end time.Time) (CommittedWindowProof, bool) {
+	col, ok := s.readCoverageColumn(start, end)
+	if !ok {
+		return CommittedWindowProof{}, false
+	}
+	return CommittedWindowProof{
+		sampler: s, windowStart: start, openRouteSeq: col.openRouteSeq,
+		readCoverageComplete: col.readCoverageComplete,
+		unattributableReads:  col.unattributableReads,
+	}, true
+}
+
+func (p CommittedWindowProof) RouteRegistrationCovers(routeID, groupID uint64, start, end []byte) bool {
+	if p.sampler == nil {
+		return false
+	}
+	p.sampler.routesMu.Lock()
+	defer p.sampler.routesMu.Unlock()
+	reg, ok := p.sampler.routeRegistrations[routeID]
+	return ok && reg.matchesWindowStart(groupID, start, end, p.windowStart) && reg.sequence <= p.openRouteSeq
+}
+
+func (p CommittedWindowProof) ReadCoverageCovers(routeID uint64) bool {
+	return p.sampler != nil && p.readCoverageComplete &&
+		!p.unattributableReads[0] && !p.unattributableReads[routeID]
+}
+
+// committedColumnLocked must be called with historyMu held.
+func (s *MemSampler) committedColumnLocked(start, end time.Time) (MatrixColumn, bool) {
+	var found MatrixColumn
+	matched := false
+	duplicate := false
+	s.history.forEach(func(col MatrixColumn) {
+		if col.WindowStart.Equal(start) && col.At.Equal(end) {
+			if matched {
+				duplicate = true
+			}
+			found, matched = col, true
+		}
+	})
+	return found, matched && !duplicate
 }
 
 // retiredSlot tracks a removed slot through its post-removal grace
@@ -318,6 +446,14 @@ type routeTable struct {
 	// sortedSlots is the union of slots and virtualForRoute values
 	// sorted by Start, used by Snapshot for stable row ordering.
 	sortedSlots []*routeSlot
+}
+
+type routeRegistration struct {
+	sequence     uint64
+	registeredAt time.Time
+	groupID      uint64
+	start        []byte
+	end          []byte
 }
 
 // routeSlot owns the atomic counters for a tracked route or virtual
@@ -436,10 +572,13 @@ type MatrixColumn struct {
 	// WindowStart and At delimit the committed half-open sampler
 	// interval. Rows and HotKeys contain evidence drained for
 	// (WindowStart, At].
-	WindowStart time.Time
-	At          time.Time
-	Rows        []MatrixRow
-	HotKeys     []KeyvizHotKeysSnapshot
+	WindowStart          time.Time
+	At                   time.Time
+	Rows                 []MatrixRow
+	HotKeys              []KeyvizHotKeysSnapshot
+	openRouteSeq         uint64
+	readCoverageComplete bool
+	unattributableReads  map[uint64]bool
 }
 
 // MatrixRow is a single route or virtual bucket's counter snapshot
@@ -520,11 +659,12 @@ func NewMemSampler(opts MemSamplerOptions) *MemSampler {
 		now = time.Now
 	}
 	s := &MemSampler{
-		opts:        opts,
-		now:         now,
-		history:     newRingBuffer(opts.HistoryColumns),
-		groupTerms:  map[uint64]uint64{},
-		lastFlushAt: now(),
+		opts:               opts,
+		now:                now,
+		history:            newRingBuffer(opts.HistoryColumns),
+		groupTerms:         map[uint64]uint64{},
+		routeRegistrations: make(map[uint64]routeRegistration),
+		lastFlushAt:        now(),
 	}
 	s.table.Store(newEmptyRouteTable())
 	if opts.HotKeysEnabled {
@@ -663,7 +803,7 @@ func (s *MemSampler) Observe(routeID uint64, key []byte, op Op, valueLen int, la
 	if s == nil {
 		return
 	}
-	if s.hotKeys != nil && op == OpWrite {
+	if op == OpRead || s.hotKeys != nil && op == OpWrite {
 		s.flushMu.RLock()
 		defer s.flushMu.RUnlock()
 	}
@@ -1052,6 +1192,11 @@ func (s *MemSampler) RegisterRoute(routeID uint64, start, end []byte, groupID ui
 			next.sortedSlots = appendSorted(next.sortedSlots, slot)
 		}
 		s.table.Store(next)
+		s.routeMutationSeq++
+		s.routeRegistrations[routeID] = routeRegistration{
+			sequence: s.routeMutationSeq, registeredAt: s.now(), groupID: groupID,
+			start: cloneBytes(start), end: cloneBytes(end),
+		}
 		return true
 	}
 
@@ -1088,6 +1233,8 @@ func (s *MemSampler) RegisterRoute(routeID uint64, start, end []byte, groupID ui
 	s.cancelPendingPruneFor(bucket, routeID)
 	next.virtualForRoute[routeID] = bucket
 	s.table.Store(next)
+	s.routeMutationSeq++
+	delete(s.routeRegistrations, routeID)
 	return false
 }
 
@@ -1209,6 +1356,8 @@ func (s *MemSampler) RemoveRoute(routeID uint64) {
 
 	next.sortedSlots = rebuildSorted(next)
 	s.table.Store(next)
+	s.routeMutationSeq++
+	delete(s.routeRegistrations, routeID)
 }
 
 // Flush drains every slot's counters with atomic.SwapUint64 and
@@ -1250,12 +1399,21 @@ func (s *MemSampler) flushWindow(ctx context.Context, at time.Time) bool {
 }
 
 func (s *MemSampler) flushAtLocked(at time.Time, hotKeys []KeyvizHotKeysSnapshot) {
+	s.routesMu.Lock()
+	openSeq := s.windowOpenSeq
+	s.windowOpenSeq = s.routeMutationSeq
+	s.routesMu.Unlock()
 	col := MatrixColumn{
-		WindowStart: s.lastFlushAt,
-		At:          at,
-		HotKeys:     hotKeys,
+		WindowStart:          s.lastFlushAt,
+		At:                   at,
+		HotKeys:              hotKeys,
+		openRouteSeq:         openSeq,
+		readCoverageComplete: s.readCoverageWholeWindow && s.readCoverageEnabled,
+		unattributableReads:  s.unattributableReads,
 	}
 	s.lastFlushAt = at
+	s.readCoverageWholeWindow = s.readCoverageEnabled
+	s.unattributableReads = nil
 	// Snapshot the per-group leader-term map once at the top of
 	// Flush so every row in this column sees a consistent view, even
 	// if SetLeaderTerm fires concurrently. Later rows can never
@@ -1281,9 +1439,39 @@ func (s *MemSampler) flushAtLocked(at time.Time, hotKeys []KeyvizHotKeysSnapshot
 	s.historyMu.Lock()
 	if !col.WindowStart.Before(col.At) {
 		col.WindowStart = col.At.Add(-s.opts.Step)
+		col.readCoverageComplete = false
 	}
 	s.history.Push(col)
 	s.historyMu.Unlock()
+}
+
+// RouteRegistrationCoversWindow reports whether the current individual route
+// registration has continuously held the supplied descriptor since before the
+// exact retained committed window opened. It does not infer registration from
+// rows: idle routes have no rows, and aggregate rows cannot prove identity.
+// A route removed after the window also fails closed.
+func (s *MemSampler) RouteRegistrationCoversWindow(routeID, groupID uint64, start, end []byte, windowStart, windowEnd time.Time) bool {
+	if s == nil || !windowStart.Before(windowEnd) {
+		return false
+	}
+	s.routesMu.Lock()
+	defer s.routesMu.Unlock()
+	reg, ok := s.routeRegistrations[routeID]
+	if !ok || !reg.matchesWindowStart(groupID, start, end, windowStart) {
+		return false
+	}
+	s.historyMu.Lock()
+	defer s.historyMu.Unlock()
+	col, ok := s.committedColumnLocked(windowStart, windowEnd)
+	return ok && reg.sequence <= col.openRouteSeq
+}
+
+func (r routeRegistration) matches(groupID uint64, start, end []byte) bool {
+	return r.groupID == groupID && bytes.Equal(r.start, start) && bytes.Equal(r.end, end)
+}
+
+func (r routeRegistration) matchesWindowStart(groupID uint64, start, end []byte, windowStart time.Time) bool {
+	return r.matches(groupID, start, end) && r.registeredAt.Before(windowStart)
 }
 
 // drainRetiredSlots emits a row for each retired slot and returns the

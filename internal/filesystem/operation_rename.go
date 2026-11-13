@@ -123,6 +123,9 @@ func (s *Service) planRenameOperation(ctx context.Context, snapshot operationPla
 	plan := operationAttemptPlan{Intent: intent, ReadTS: ts, RouteVersion: snapshot.RouteVersion,
 		ReadKeys: [][]byte{fskeys.InodeKey(parent), oldKey, newKey}}
 	parentMeta, semanticErr, err := s.unlinkParentAt(ctx, parent, ts)
+	if err == nil {
+		s.observeReadKey(ctx, fskeys.InodeKey(parent))
+	}
 	if err != nil {
 		return operationAttemptPlan{}, nil, nil, err
 	}
@@ -130,6 +133,7 @@ func (s *Service) planRenameOperation(ctx context.Context, snapshot operationPla
 		return plan, nil, semanticErr, nil
 	}
 	oldEntry, err := s.dirEntryAt(ctx, parent, oldName, ts)
+	s.observeReadResult(ctx, oldKey, err)
 	if errors.Is(err, ErrNotFound) {
 		return plan, nil, ErrNotFound, nil
 	}

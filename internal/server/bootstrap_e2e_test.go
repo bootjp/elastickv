@@ -18,6 +18,7 @@ import (
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/encryptionwiring"
+	"github.com/bootjp/elastickv/internal/nodeauth"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	internalraftadmin "github.com/bootjp/elastickv/internal/raftadmin"
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -66,13 +67,22 @@ type bootstrapE2ENode struct {
 	id       string
 	runtimes []*clusterbootstrap.GroupRuntime
 
-	shardStore  *kv.ShardStore
-	coordinate  *kv.ShardedCoordinator
-	distEngine  *distribution.Engine
-	distCatalog *distribution.CatalogStore
-	distServer  *adapter.DistributionServer
-	cancel      context.CancelFunc
-	eg          *errgroup.Group
+	shardStore     *kv.ShardStore
+	coordinate     *kv.ShardedCoordinator
+	distEngine     *distribution.Engine
+	distCatalog    *distribution.CatalogStore
+	distServer     *adapter.DistributionServer
+	migrationConns *kv.GRPCConnCache
+	cancel         context.CancelFunc
+	eg             *errgroup.Group
+}
+
+type bootstrapE2EMigrationConfig struct {
+	flags  nodeauth.Flags
+	auth   nodeauth.AdminGRPCInterceptors
+	token  string
+	groups map[uint64]*kv.ShardGroup
+	routes *distribution.Engine
 }
 
 func (n *bootstrapE2ENode) engine() raftengine.Engine {
@@ -114,6 +124,9 @@ func (n *bootstrapE2ENode) close() error {
 	if n.coordinate != nil {
 		_ = n.coordinate.Close()
 		n.coordinate = nil
+	}
+	if n.migrationConns != nil {
+		_ = n.migrationConns.Close()
 	}
 	for _, rt := range n.runtimes {
 		if rt != nil {
@@ -633,6 +646,7 @@ func startBootstrapE2EMultiGroupNode(
 	groupIDs []uint64,
 	groupPeers string,
 	engineType noderuntime.RaftEngineType,
+	migration ...bootstrapE2EMigrationConfig,
 ) (*bootstrapE2ENode, error) {
 	cfg, err := noderuntime.ParseRuntimeConfig(ep.raftAddrs[groupIDs[0]], ep.redisAddr, "", ep.dynamoAddr, "",
 		raftGroupsArg(ep, groupIDs), "", "", "", "", "", "")
@@ -676,11 +690,10 @@ func startBootstrapE2EMultiGroupNode(
 		return runDistributionCatalogWatcher(runCtx, distCatalog, cfg.Engine)
 	})
 
-	distServer := adapter.NewDistributionServer(
-		cfg.Engine,
-		distCatalog,
-		adapter.WithDistributionCoordinator(coordinate),
-	)
+	migrationOptions, migrationConns := bootstrapE2EMigrationDistributionOptions(migration, runtimes, groupIDs, shardGroups, shardStore)
+	distOptions := append([]adapter.DistributionServerOption{adapter.WithDistributionCoordinator(coordinate)}, migrationOptions...)
+	distServer := adapter.NewDistributionServer(cfg.Engine, distCatalog, distOptions...)
+	startBootstrapE2ESplitRunner(runCtx, eg, distServer, migration, shardGroups, cfg.Engine)
 
 	err = startRuntimeServersWithBoundMultiGroupListeners(
 		runCtx,
@@ -692,6 +705,7 @@ func startBootstrapE2EMultiGroupNode(
 		distServer,
 		cfg.LeaderRedis,
 		listeners,
+		migration,
 	)
 	if err != nil {
 		_ = shardStore.Close()
@@ -702,16 +716,61 @@ func startBootstrapE2EMultiGroupNode(
 	}
 
 	return &bootstrapE2ENode{
-		id:          ep.id,
-		runtimes:    runtimes,
-		shardStore:  shardStore,
-		coordinate:  coordinate,
-		distEngine:  cfg.Engine,
-		distCatalog: distCatalog,
-		distServer:  distServer,
-		cancel:      cancel,
-		eg:          eg,
+		id:             ep.id,
+		runtimes:       runtimes,
+		shardStore:     shardStore,
+		coordinate:     coordinate,
+		distEngine:     cfg.Engine,
+		distCatalog:    distCatalog,
+		distServer:     distServer,
+		migrationConns: migrationConns,
+		cancel:         cancel,
+		eg:             eg,
 	}, nil
+}
+
+func bootstrapE2EMigrationDistributionOptions(
+	migration []bootstrapE2EMigrationConfig,
+	runtimes []*clusterbootstrap.GroupRuntime,
+	groupIDs []uint64,
+	shardGroups map[uint64]*kv.ShardGroup,
+	shardStore *kv.ShardStore,
+) ([]adapter.DistributionServerOption, *kv.GRPCConnCache) {
+	if len(migration) == 0 {
+		return nil, nil
+	}
+	migrationConns := clusterbootstrap.NewBootstrapRuntimeConnCache(runtimes)
+	m := migration[0]
+	return []adapter.DistributionServerOption{
+		adapter.WithDistributionKnownRaftGroups(groupIDs...),
+		adapter.WithSplitMigrationCapabilityGate(adapter.NewSplitMigrationCapabilityGate(
+			splitMigrationCapabilityPeerSourceForRuntimes(runtimes), splitMigrationCapabilityProbeTimeout,
+			clusterbootstrap.BootstrapSplitMigrationProbe(runtimes), m.flags.SplitMigrationLocalReadinessGate)),
+		adapter.WithSplitPromotionClientFactory(adapter.NewSplitPromotionGRPCClientFactory(adapter.SplitPromotionTargetLeaderResolver(shardGroups), migrationConns, m.token)),
+		adapter.WithSplitMigrationClientFactory(adapter.NewSplitMigrationGRPCClientFactory(adapter.SplitMigrationGroupLeaderResolver(shardGroups), migrationConns, m.token)),
+		adapter.WithSplitMigrationVoterFactory(adapter.NewSplitMigrationGRPCVoterFactory(shardGroups, migrationConns, m.token)),
+		adapter.WithSplitMigrationApplyMemberSnapshotFactory(adapter.NewSplitMigrationApplyMemberSnapshotGRPCFactory(shardGroups, migrationConns, m.token)),
+		adapter.WithSplitMigrationGroupClientFactory(adapter.NewSplitMigrationGroupGRPCClientFactory(adapter.SplitMigrationGroupLeaderResolver(shardGroups), migrationConns, m.token)),
+		adapter.WithSplitJobRunnerReadinessGate(m.flags.SplitMigrationLocalReadinessGate),
+		migrationOwnershipRefreshOption(shardGroups, runtimes[0], migrationConns, m.token, m.flags.SplitMigrationPeerAuthEnforced),
+		adapter.MigrationPartitionRuntimeOption(shardStore, shardGroups, migrationConns, m.token, m.flags.SplitMigrationPeerAuthEnforced),
+	}, migrationConns
+}
+
+func startBootstrapE2ESplitRunner(
+	ctx context.Context,
+	eg *errgroup.Group,
+	server *adapter.DistributionServer,
+	migration []bootstrapE2EMigrationConfig,
+	shardGroups map[uint64]*kv.ShardGroup,
+	routes *distribution.Engine,
+) {
+	if len(migration) == 0 {
+		return
+	}
+	migration[0].groups = shardGroups
+	migration[0].routes = routes
+	startDistributionSplitJobRunner(ctx, eg, server, migration[0].flags.SplitMigrationLocalReadinessGate)
 }
 
 func startRuntimeServersWithBoundListeners(
@@ -754,6 +813,7 @@ func startRuntimeServersWithBoundMultiGroupListeners(
 	distServer *adapter.DistributionServer,
 	leaderRedis map[string]string,
 	listeners bootstrapE2EMultiGroupListeners,
+	migration []bootstrapE2EMigrationConfig,
 ) error {
 	if len(runtimes) == 0 {
 		return waitErrgroupAfterStartupFailure(cancel, eg, fmt.Errorf("expected at least one runtime"))
@@ -764,7 +824,7 @@ func startRuntimeServersWithBoundMultiGroupListeners(
 		return waitErrgroupAfterStartupFailure(cancel, eg, err)
 	}
 	for _, rt := range runtimes {
-		if err := startBoundGRPCServer(ctx, eg, rt, shardStore, coordinate, distServer, relay, nil, listeners.grpc[rt.Spec.ID]); err != nil {
+		if err := startBoundGRPCServer(ctx, eg, rt, shardStore, coordinate, distServer, relay, nil, listeners.grpc[rt.Spec.ID], migration...); err != nil {
 			return waitErrgroupAfterStartupFailure(cancel, eg, err)
 		}
 	}
@@ -784,6 +844,7 @@ func startBoundGRPCServer(
 	relay *adapter.RedisPubSubRelay,
 	sqsPartitionResolver kv.PartitionResolver,
 	listener net.Listener,
+	migration ...bootstrapE2EMigrationConfig,
 ) error {
 	if rt == nil || rt.Engine == nil {
 		return fmt.Errorf("raft runtime is not ready")
@@ -792,19 +853,36 @@ func startBoundGRPCServer(
 		return fmt.Errorf("grpc listener is required")
 	}
 
-	gs := grpc.NewServer()
-	trx := kv.NewTransactionWithProposer(rt.Engine)
+	serverOpts := []grpc.ServerOption{}
+	var trx kv.Transactional = kv.NewTransactionWithProposer(rt.Engine)
+	if len(migration) != 0 {
+		serverOpts = raftGRPCServerOptions(migration[0].auth)
+		trx = adapter.NewInternalMigrationTransaction(rt.Engine, nil, rt.Store, rt.Spec.ID)
+	}
+	gs := grpc.NewServer(serverOpts...)
 	grpcSvc := adapter.NewGRPCServer(shardStore, coordinate)
 	pb.RegisterRawKVServer(gs, grpcSvc)
 	pb.RegisterTransactionalKVServer(gs, grpcSvc)
+	internalOpts := []adapter.InternalOption{
+		adapter.WithInternalStore(rt.Store),
+		adapter.WithInternalMigrationProposer(rt.Engine),
+		adapter.WithInternalMigrationExportRouting(rt.Spec.ID, sqsPartitionResolver),
+	}
+	if len(migration) != 0 {
+		groups := migration[0].groups
+		internalOpts = append(internalOpts, adapter.WithInternalRouteEngine(migration[0].routes))
+		internalOpts = append(internalOpts, internalServerOptions(coordinate, nil, rt.Engine, groups[rt.Spec.ID], rt.Spec.ID)...)
+		internalOpts = append(internalOpts, adapter.WithInternalMigrationOwnershipReady(func() bool {
+			return adapter.MigrationOwnershipRuntimeReady(trx, shardStore, distServer, rt.Spec.ID, rt.Engine, migration[0].flags.SplitMigrationLocalReadinessGate)
+		}))
+		internalOpts = append(internalOpts, migrationInternalProtocolOptions(trx, shardStore, distServer, rt)...)
+	}
 	pb.RegisterInternalServer(gs, adapter.NewInternalWithEngine(
 		trx,
 		rt.Engine,
 		coordinate.Clock(),
 		relay,
-		adapter.WithInternalStore(rt.Store),
-		adapter.WithInternalMigrationProposer(rt.Engine),
-		adapter.WithInternalMigrationExportRouting(rt.Spec.ID, sqsPartitionResolver),
+		internalOpts...,
 	))
 	pb.RegisterDistributionServer(gs, distServer)
 	clusterbootstrap.RuntimeCore(rt).RegisterGRPC(gs)

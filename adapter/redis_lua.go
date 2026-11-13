@@ -137,6 +137,7 @@ func (r *RedisServer) runLuaScript(conn redcon.Conn, script string, evalArgs [][
 		if err != nil {
 			return err
 		}
+		scriptCtx.observeNestedReads = true
 		defer scriptCtx.Close()
 
 		luaPool := r.getLuaPool()

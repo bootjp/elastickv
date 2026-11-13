@@ -1095,6 +1095,7 @@ func (r *RedisServer) resolveXReadAfterIDs(ctx context.Context, req *xreadReques
 		if afterID != "$" {
 			continue
 		}
+		r.observeBlockingRedisKeys(ctx, [][]byte{req.keys[i]})
 		resolved, err := r.resolveXReadDollarID(ctx, req.keys[i])
 		if err != nil {
 			return err
@@ -1151,6 +1152,7 @@ func (r *RedisServer) dollarIDFromState(ctx context.Context, key []byte, readTS 
 func (r *RedisServer) xreadOnce(ctx context.Context, req xreadRequest) ([]xreadResult, error) {
 	results := make([]xreadResult, 0, len(req.keys))
 	for i, key := range req.keys {
+		r.observeBlockingRedisKeys(ctx, [][]byte{key})
 		readTS := r.readTS()
 		typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeStream)
 		if err != nil {
@@ -1364,6 +1366,7 @@ func (r *RedisServer) xreadFinalTypeCheck(conn redcon.Conn, req xreadRequest) bo
 
 func (r *RedisServer) xreadCheckTypes(ctx context.Context, req xreadRequest) error {
 	for _, key := range req.keys {
+		r.observeBlockingRedisKeys(ctx, [][]byte{key})
 		readTS := r.readTS()
 		typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeStream)
 		if err != nil {

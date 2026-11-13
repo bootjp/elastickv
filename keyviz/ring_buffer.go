@@ -87,11 +87,21 @@ func cloneColumn(col MatrixColumn) MatrixColumn {
 	for i, snapshot := range col.HotKeys {
 		hotKeys[i] = cloneHotKeysSnapshot(snapshot)
 	}
+	var unattributableReads map[uint64]bool
+	if len(col.unattributableReads) > 0 {
+		unattributableReads = make(map[uint64]bool, len(col.unattributableReads))
+		for routeID, marked := range col.unattributableReads {
+			unattributableReads[routeID] = marked
+		}
+	}
 	return MatrixColumn{
-		WindowStart: col.WindowStart,
-		At:          col.At,
-		Rows:        rows,
-		HotKeys:     hotKeys,
+		WindowStart:          col.WindowStart,
+		At:                   col.At,
+		Rows:                 rows,
+		HotKeys:              hotKeys,
+		openRouteSeq:         col.openRouteSeq,
+		readCoverageComplete: col.readCoverageComplete,
+		unattributableReads:  unattributableReads,
 	}
 }
 
@@ -105,4 +115,17 @@ func (r *ringBuffer) snapshotOrdered() []MatrixColumn {
 	out = append(out, r.buf[r.pos:]...)
 	out = append(out, r.buf[:r.pos]...)
 	return out
+}
+
+// forEach visits retained columns without allocating an ordered copy.
+func (r *ringBuffer) forEach(visit func(MatrixColumn)) {
+	if !r.wrapped {
+		for _, col := range r.buf {
+			visit(col)
+		}
+		return
+	}
+	for i := 0; i < len(r.buf); i++ {
+		visit(r.buf[(r.pos+i)%len(r.buf)])
+	}
 }

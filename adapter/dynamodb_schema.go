@@ -926,7 +926,9 @@ func (d *DynamoDBServer) loadTableSchema(ctx context.Context, tableName string) 
 }
 
 func (d *DynamoDBServer) loadTableSchemaAt(ctx context.Context, tableName string, ts uint64) (*dynamoTableSchema, bool, error) {
-	b, err := d.store.GetAt(ctx, dynamoTableMetaKey(tableName), ts)
+	key := dynamoTableMetaKey(tableName)
+	kv.ObserveReadForKeyThrough(d.coordinator, ctx, key)
+	b, err := d.store.GetAt(ctx, key, ts)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return nil, false, nil
@@ -942,7 +944,9 @@ func (d *DynamoDBServer) loadTableSchemaAt(ctx context.Context, tableName string
 }
 
 func (d *DynamoDBServer) loadTableGenerationAt(ctx context.Context, tableName string, ts uint64) (uint64, error) {
-	b, err := d.store.GetAt(ctx, dynamoTableGenerationKey(tableName), ts)
+	key := dynamoTableGenerationKey(tableName)
+	kv.ObserveReadForKeyThrough(d.coordinator, ctx, key)
+	b, err := d.store.GetAt(ctx, key, ts)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return 0, nil

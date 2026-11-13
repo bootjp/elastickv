@@ -819,7 +819,6 @@ func (r *RedisServer) pfcount(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) pfcountCommand(conn redcon.Conn, cmd redcon.Command) {
-
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
@@ -829,6 +828,7 @@ func (r *RedisServer) pfcountCommand(conn redcon.Conn, cmd redcon.Command) {
 	readTS := r.readTS()
 	union := map[string]struct{}{}
 	for _, key := range cmd.Args[1:] {
+		r.observeBlockingRedisKeys(ctx, [][]byte{key})
 		typ, err := r.keyTypeAt(ctx, key, readTS)
 		if err != nil {
 			writeRedisError(conn, err)

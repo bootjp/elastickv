@@ -39,6 +39,7 @@ type DistributionServer struct {
 	readBlocked                 func() bool
 	migrationCapabilityGate     SplitMigrationCapabilityGate
 	splitJobRunnerReady         bool
+	splitJobRunnerContexts      map[*splitJobRunnerRun]struct{}
 	splitJobRunnerReadinessGate SplitMigrationCapabilityGate
 	splitPromotionClientFactory SplitPromotionClientFactory
 	splitMigrationClientFactory SplitMigrationClientFactory
@@ -58,6 +59,8 @@ type DistributionServer struct {
 
 // DistributionServerOption configures DistributionServer behavior.
 type DistributionServerOption func(*DistributionServer)
+
+type splitJobRunnerRun struct{ ctx context.Context }
 
 type DistributionFilesystemObserver interface {
 	ObserveFilePinnedHotspot(reason string)
@@ -170,8 +173,8 @@ func WithSplitMigrationCapabilityGate(gate SplitMigrationCapabilityGate) Distrib
 	}
 }
 
-// WithSplitJobRunnerReady opens the split migration capability probe once this
-// node can advance planned split jobs.
+// WithSplitJobRunnerReady explicitly overrides the runner lifecycle check.
+// It is retained for tests; production can use RunSplitJobRunner's lifecycle.
 func WithSplitJobRunnerReady() DistributionServerOption {
 	return func(s *DistributionServer) {
 		s.splitJobRunnerReady = true
@@ -342,6 +345,21 @@ func (s *DistributionServer) RunSplitJobRunner(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if !s.splitJobRunnerConfigured() || ctx.Err() != nil {
+		return nil
+	}
+	run := &splitJobRunnerRun{ctx: ctx}
+	s.mu.Lock()
+	if s.splitJobRunnerContexts == nil {
+		s.splitJobRunnerContexts = make(map[*splitJobRunnerRun]struct{})
+	}
+	s.splitJobRunnerContexts[run] = struct{}{}
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		delete(s.splitJobRunnerContexts, run)
+		s.mu.Unlock()
+	}()
 	ticker := time.NewTicker(defaultSplitJobRunnerInterval)
 	defer ticker.Stop()
 	for {
@@ -957,13 +975,27 @@ func (s *DistributionServer) GetSplitMigrationCapability(ctx context.Context, _ 
 }
 
 func (s *DistributionServer) splitMigrationCapabilityReady(ctx context.Context) bool {
-	if !s.splitJobRunnerReady {
+	if s == nil || (!s.splitJobRunnerReady && (!s.splitJobRunnerConfigured() || !s.splitJobRunnerRunning())) {
+		return false
+	}
+	if ctx != nil && ctx.Err() != nil {
 		return false
 	}
 	if s.splitJobRunnerReadinessGate == nil {
 		return true
 	}
 	return s.splitJobRunnerReadinessGate(ctx) == nil
+}
+
+func (s *DistributionServer) splitJobRunnerRunning() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for run := range s.splitJobRunnerContexts {
+		if run.ctx.Err() == nil {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *DistributionServer) verifyStartSplitMigrationPreflight(ctx context.Context, req *pb.StartSplitMigrationRequest) error {
@@ -1869,20 +1901,21 @@ func (s *DistributionServer) dispatchPromotionCompletion(
 	if completion.Job.PromotionCompletedTS == 0 {
 		completion.Job.PromotionCompletedTS = commitTS
 	}
-	ops, err := s.buildPromotionCompleteOps(expectedVersion, completion)
+	ops, err := s.buildPromotionCompleteOps(ctx, snapshot.ReadTS, expectedVersion, completion)
 	if err != nil {
 		return distribution.CatalogSnapshot{}, distribution.SplitJob{}, splitJobPromotionStatusError(err)
 	}
 	jobKey := distribution.CatalogSplitJobKey(jobID)
+	readKeys := [][]byte{distribution.CatalogVersionKey(), jobKey, distribution.CatalogDeltaKey(expectedVersion + 1), distribution.CatalogDeltaFloorKey()}
+	for _, routeID := range completion.ClearedRouteIDs {
+		readKeys = append(readKeys, distribution.CatalogRouteKey(routeID))
+	}
 	if _, err := s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 		Elems:    ops,
 		IsTxn:    true,
 		StartTS:  snapshot.ReadTS,
 		CommitTS: commitTS,
-		ReadKeys: [][]byte{
-			distribution.CatalogVersionKey(),
-			jobKey,
-		},
+		ReadKeys: readKeys,
 	}); err != nil {
 		return distribution.CatalogSnapshot{}, distribution.SplitJob{}, splitJobCoordinatorStatusError(err)
 	}
@@ -1908,6 +1941,8 @@ func (s *DistributionServer) nextPromotionCompleteCommitTS(ctx context.Context, 
 }
 
 func (s *DistributionServer) buildPromotionCompleteOps(
+	ctx context.Context,
+	readTS uint64,
 	expectedVersion uint64,
 	completion distribution.TargetPromotionCompletion,
 ) ([]*kv.Elem[kv.OP], error) {
@@ -1915,6 +1950,7 @@ func (s *DistributionServer) buildPromotionCompleteOps(
 		return nil, errors.WithStack(distribution.ErrCatalogVersionOverflow)
 	}
 	ops := make([]*kv.Elem[kv.OP], 0, len(completion.ClearedRouteIDs)+promotionCompleteBaseOpCount)
+	mutations := make([]distribution.CatalogRouteMutation, 0, len(completion.ClearedRouteIDs))
 	for _, routeID := range completion.ClearedRouteIDs {
 		route, ok := promotionCompleteRouteByID(completion.Routes, routeID)
 		if !ok {
@@ -1929,7 +1965,17 @@ func (s *DistributionServer) buildPromotionCompleteOps(
 			Key:   distribution.CatalogRouteKey(route.RouteID),
 			Value: encoded,
 		})
+		mutations = append(mutations, distribution.CatalogRouteMutation{Op: distribution.CatalogMutationUpsert, RouteID: routeID, Route: route})
 	}
+	deltaOps, err := s.catalogDeltaMutationOps(ctx, readTS, distribution.CatalogDelta{
+		PreviousVersion: expectedVersion,
+		Version:         expectedVersion + 1,
+		Mutations:       mutations,
+	})
+	if err != nil {
+		return nil, err
+	}
+	ops = append(ops, deltaOps...)
 	ops = append(ops, &kv.Elem[kv.OP]{
 		Op:    kv.Put,
 		Key:   distribution.CatalogVersionKey(),

@@ -21,6 +21,7 @@ import (
 // same-group hotspot splits on the catalog leader.
 type AutoSplitFlags struct {
 	Enabled             *bool
+	CrossGroup          *bool
 	EvalInterval        *time.Duration
 	SplitCooldown       *time.Duration
 	SplitTimeout        *time.Duration
@@ -41,6 +42,7 @@ func RegisterAutoSplitFlags(fs *flag.FlagSet) *AutoSplitFlags {
 	defaults := autosplit.DefaultConfig()
 	return &AutoSplitFlags{
 		Enabled:             fs.Bool("autoSplit", false, "Enable automatic same-group hotspot range splits on the catalog leader"),
+		CrossGroup:          fs.Bool("autoSplitCrossGroup", false, "Allow automatic migration of hot right-child ranges to a proven lower-load group"),
 		EvalInterval:        fs.Duration("autoSplitEvalInterval", autosplit.DefaultEvalInterval, "Interval between automatic hotspot split evaluations"),
 		SplitCooldown:       fs.Duration("autoSplitCooldown", autosplit.DefaultSplitCooldown, "Minimum cooldown before a route created by SplitRange can be auto-split again"),
 		SplitTimeout:        fs.Duration("autoSplitSplitTimeout", autosplit.DefaultSplitTimeout, "Timeout for each automatic SplitRange RPC"),
@@ -78,12 +80,13 @@ type termLeader interface {
 // KeyViz flags the sampler is built from.
 func (a *AutoSplitFlags) SchedulerConfig(leader Leader, k *KeyVizFlags) (autosplit.SchedulerConfig, error) {
 	cfg := autosplit.SchedulerConfig{
-		Enabled:        *a.Enabled,
-		EvalInterval:   *a.EvalInterval,
-		SplitCooldown:  *a.SplitCooldown,
-		SplitTimeout:   *a.SplitTimeout,
-		KillSwitchFile: strings.TrimSpace(*a.KillSwitchFile),
-		Logger:         slog.Default(),
+		Enabled:           *a.Enabled,
+		CrossGroupEnabled: *a.CrossGroup,
+		EvalInterval:      *a.EvalInterval,
+		SplitCooldown:     *a.SplitCooldown,
+		SplitTimeout:      *a.SplitTimeout,
+		KillSwitchFile:    strings.TrimSpace(*a.KillSwitchFile),
+		Logger:            slog.Default(),
 		Detector: autosplit.Config{
 			WriteWeight:         *a.WriteWeight,
 			ReadWeight:          *a.ReadWeight,
@@ -135,6 +138,9 @@ func leaderGate(leader Leader) func() bool {
 }
 
 func (a *AutoSplitFlags) validate(cfg autosplit.SchedulerConfig, k *KeyVizFlags) error {
+	if cfg.CrossGroupEnabled && !cfg.Enabled {
+		return errors.New("--autoSplitCrossGroup requires --autoSplit")
+	}
 	if !cfg.Enabled {
 		return nil
 	}
@@ -252,19 +258,22 @@ func StartScheduler(
 }
 
 // DistributionSplitter executes auto-split decisions through the local
-// distribution server's SplitRange.
+// distribution server.
 type DistributionSplitter struct {
 	Server *adapter.DistributionServer
 }
 
-// SplitRange implements autosplit.Splitter. Only same-group splits are
-// supported.
+// SplitRange implements autosplit.Splitter.
 func (s DistributionSplitter) SplitRange(ctx context.Context, req autosplit.SplitRequest) (autosplit.SplitResult, error) {
 	if s.Server == nil {
 		return autosplit.SplitResult{}, errors.New("autosplit: distribution server is not configured")
 	}
 	if req.TargetGroupID != 0 {
-		return autosplit.SplitResult{}, errors.New("autosplit: cross-group target selection is not enabled")
+		resp, err := s.Server.StartSplitMigration(ctx, splitMigrationRequest(req))
+		if err != nil {
+			return autosplit.SplitResult{}, errors.Wrap(err, "autosplit: start split migration")
+		}
+		return splitMigrationResultFromProto(resp)
 	}
 	resp, err := s.Server.SplitRange(ctx, &pb.SplitRangeRequest{
 		ExpectedCatalogVersion: req.ExpectedCatalogVersion,
@@ -275,6 +284,22 @@ func (s DistributionSplitter) SplitRange(ctx context.Context, req autosplit.Spli
 		return autosplit.SplitResult{}, errors.Wrap(err, "autosplit: split range")
 	}
 	return splitResultFromProto(resp)
+}
+
+func splitMigrationRequest(req autosplit.SplitRequest) *pb.StartSplitMigrationRequest {
+	return &pb.StartSplitMigrationRequest{
+		ExpectedCatalogVersion: req.ExpectedCatalogVersion,
+		RouteId:                req.RouteID,
+		SplitKey:               distribution.CloneBytes(req.SplitKey),
+		TargetGroupId:          req.TargetGroupID,
+	}
+}
+
+func splitMigrationResultFromProto(resp *pb.StartSplitMigrationResponse) (autosplit.SplitResult, error) {
+	if resp == nil || resp.GetJobId() == 0 {
+		return autosplit.SplitResult{}, errors.New("autosplit: split migration returned no job ID")
+	}
+	return autosplit.SplitResult{CatalogVersion: resp.GetCatalogVersion(), JobID: resp.GetJobId()}, nil
 }
 
 // splitResultFromProto converts the children with the catalog watcher's
