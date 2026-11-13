@@ -7,11 +7,11 @@ import (
 	"github.com/bootjp/elastickv/kv"
 )
 
-// redisReadKeys returns the user keys named by a readonly command. Commands
-// without attributable keys deliberately return nil.
+// redisReadKeys returns user keys whose command may inspect stored state.
+// Writes are included because a failed condition can return without a commit.
 func redisReadKeys(name string, args [][]byte) [][]byte {
 	meta, ok := redisCommandTable[name]
-	if !ok || !hasRedisCommandFlag(meta.Flags, redisCmdFlagReadonly) {
+	if !ok || (!hasRedisCommandFlag(meta.Flags, redisCmdFlagReadonly) && !hasRedisCommandFlag(meta.Flags, redisCmdFlagWrite)) {
 		return nil
 	}
 	if name == cmdXRead {
@@ -85,7 +85,8 @@ func (r *RedisServer) redisReadForwarded(direct bool, keys [][]byte) bool {
 }
 
 func redisReadUnattributable(name string, args [][]byte) bool {
-	if name == cmdDBSize || name == cmdKeys || name == cmdScan {
+	if name == cmdDBSize || name == cmdKeys || name == cmdScan ||
+		name == cmdFlushAll || name == cmdFlushDB || name == cmdFlushLegacy {
 		return true
 	}
 	if name != cmdXRead {

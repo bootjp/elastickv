@@ -31,18 +31,25 @@ func (c *redisReadObservationCoordinator) IsLeaderForKey(key []byte) bool {
 }
 
 func TestRedisReadObservationSpecCoverage(t *testing.T) {
-	// These readonly commands have no attributable user key. XREAD's key
-	// positions are dynamic but are parsed separately below. GET is covered
-	// by LeaseReadForKeyThrough on the standalone path.
-	keyless := map[string]bool{cmdDBSize: true, cmdKeys: true, cmdScan: true}
+	// Keyless state access marks the entire read window. EVAL and EVALSHA
+	// observe their nested commands, and XREAD parses dynamic key positions.
+	keyless := map[string]bool{
+		cmdDBSize: true, cmdKeys: true, cmdScan: true,
+		cmdFlushAll: true, cmdFlushDB: true, cmdFlushLegacy: true,
+		cmdEval: true, cmdEvalSHA: true,
+	}
 	var seenKeyless []string
 	for _, spec := range redisCommandSpecs {
-		if !hasRedisCommandFlag(spec.Flags, redisCmdFlagReadonly) {
+		if !hasRedisCommandFlag(spec.Flags, redisCmdFlagReadonly) &&
+			!hasRedisCommandFlag(spec.Flags, redisCmdFlagWrite) {
 			continue
 		}
 		if keyless[spec.Constant] {
 			require.Zero(t, spec.FirstKey, spec.Constant)
 			seenKeyless = append(seenKeyless, spec.Constant)
+			if spec.Constant != cmdEval && spec.Constant != cmdEvalSHA {
+				require.True(t, redisReadUnattributable(spec.Constant, nil), spec.Constant)
+			}
 			continue
 		}
 		if spec.Constant == cmdXRead {
@@ -53,15 +60,37 @@ func TestRedisReadObservationSpecCoverage(t *testing.T) {
 		require.Positive(t, spec.Step, spec.Constant)
 		require.NotEmpty(t, redisReadKeys(spec.Constant, [][]byte{[]byte(spec.Constant), []byte("k"), []byte("x"), []byte("y")}), spec.Constant)
 	}
-	require.ElementsMatch(t, []string{cmdDBSize, cmdKeys, cmdScan}, seenKeyless)
+	require.ElementsMatch(t, []string{cmdDBSize, cmdKeys, cmdScan, cmdFlushAll, cmdFlushDB, cmdFlushLegacy, cmdEval, cmdEvalSHA}, seenKeyless)
 }
 
 func TestRedisReadObservationExtractsMultipleAndDynamicKeys(t *testing.T) {
 	require.Equal(t, [][]byte{[]byte("a"), []byte("b")}, redisReadKeys(cmdExists, [][]byte{[]byte(cmdExists), []byte("a"), []byte("b")}))
+	require.Equal(t, [][]byte{[]byte("a"), []byte("b")}, redisReadKeys(cmdDel, [][]byte{[]byte(cmdDel), []byte("a"), []byte("b")}))
 	require.Equal(t, [][]byte{[]byte("a"), []byte("b")}, redisReadKeys(cmdXRead, [][]byte{[]byte(cmdXRead), []byte("COUNT"), []byte("2"), []byte("STREAMS"), []byte("a"), []byte("b"), []byte("0"), []byte("0")}))
 	require.Nil(t, redisReadKeys(cmdXRead, [][]byte{[]byte(cmdXRead), []byte("STREAMS"), []byte("a")}))
 	for _, name := range []string{cmdDBSize, cmdKeys, cmdScan, cmdEval, cmdExec} {
 		require.Nil(t, redisReadKeys(name, [][]byte{[]byte(name), []byte("k")}), name)
+	}
+}
+
+func TestRedisReadObservationCountsNoOpMutations(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		args [][]byte
+	}{
+		{cmdGetDel, [][]byte{[]byte(cmdGetDel), []byte("missing")}},
+		{cmdSet, [][]byte{[]byte(cmdSet), []byte("existing"), []byte("value"), []byte("NX")}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			coord := &redisReadObservationCoordinator{}
+			server := &RedisServer{coordinator: coord}
+			cmd := redcon.Command{Args: tt.args}
+			server.dispatchCommandDirect(&recordingConn{}, tt.name, func(redcon.Conn, redcon.Command) {
+				require.Empty(t, coord.keys)
+			}, cmd, time.Now())
+			require.Equal(t, [][]byte{redisUserRouteKey(tt.args[1])}, coord.keys)
+			require.Empty(t, coord.marks)
+		})
 	}
 }
 
