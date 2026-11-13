@@ -385,11 +385,13 @@ func (c *luaScriptContext) trackAbsentKeyReadKeys(key []byte) {
 //     their content Puts it (push, pop, trim, SADD / SREM that change the
 //     cardinality, every ZADD / ZINCRBY / ZREM, every Lua commit), and so does
 //     every emptying delete and type change (the logical-delete helpers).
-//   - hash: the hash fence, which creates, new fields, emptying deletes and
-//     type changes Put, plus the legacy blob anchor, which a legacy-blob HDEL
-//     or migration rewrites without the fence. An update of an existing field
-//     and a non-emptying HDEL write only the field key; point reads record
-//     that key themselves, range and cardinality reads cannot see them.
+//   - hash: the hash fence, which every change of the field set Puts (a
+//     create, a new field, every HDEL, an emptying delete, a type change),
+//     plus the legacy blob anchor, which a legacy-blob migration rewrites
+//     without the fence. An update of an existing field's value writes only
+//     the field key, so the commands that return values (HGET, HEXISTS,
+//     HMGET, HGETALL) also record the field keys they read; HLEN depends only
+//     on the field set.
 //   - zset: also the legacy blob anchor, which the MULTI legacy path deletes
 //     without the fence when it empties the zset.
 //   - stream: the stream meta key, which every stream write rewrites.
@@ -421,8 +423,8 @@ func (c *luaScriptContext) trackCollectionReadKeys(key []byte, typ redisValueTyp
 
 // trackCollectionElementReadKeys records a point read of elements of a
 // collection that exists at startTS: elementKey maps each requested element
-// to the key a write of that element Puts or deletes (a hash field update or
-// HDEL does not touch the hash fence). Absent collections need no element
+// to the key a write of that element Puts or deletes (a hash field value
+// update does not touch the hash fence). Absent collections need no element
 // keys: the absent-key fences already cover every create.
 func (c *luaScriptContext) trackCollectionElementReadKeys(key []byte, exists bool, elementKey func(key, element []byte) []byte, elements ...string) {
 	if !exists {
@@ -1830,8 +1832,8 @@ func hgetFromSlowPath(c *luaScriptContext, key []byte, field string) (luaReply, 
 }
 
 // trackHashFieldRead records a point read of hash fields: the hash's read
-// keys plus each field key, since updating an existing field or deleting a
-// field without emptying the hash writes only that field key.
+// keys plus each field key, since updating an existing field's value writes
+// only that field key.
 func (c *luaScriptContext) trackHashFieldRead(key []byte, exists bool, fields ...string) {
 	c.trackCollectionReadKeys(key, redisTypeHash, exists)
 	c.trackCollectionElementReadKeys(key, exists, store.HashFieldKey, fields...)
@@ -1933,6 +1935,10 @@ func (c *luaScriptContext) cmdHGetAll(args []string) (luaReply, error) {
 		fields = append(fields, field)
 	}
 	sort.Strings(fields)
+	// Updating an existing field writes only its field key, so the values
+	// HGETALL returned are validated through those keys; the hash fence
+	// covers the field set (every added field and every HDEL Puts it).
+	c.trackCollectionElementReadKeys([]byte(args[0]), st.exists, store.HashFieldKey, fields...)
 	out := make([]luaReply, 0, len(fields)*redisPairWidth)
 	for _, field := range fields {
 		out = append(out, luaStringReply(field), luaStringReply(st.value[field]))

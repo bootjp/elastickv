@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/bootjp/elastickv/store"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 )
@@ -60,6 +61,46 @@ func luaCollectionReadSkewCases(coll string) []luaCollectionReadSkewCase {
 			},
 			stale: "f,v1",
 			fresh: "f,v1,g,v2",
+		},
+		{
+			// Update-only HSET writes only the field key; HGETALL sees it
+			// only if it records the field keys it returned.
+			name: "HGETALL vs update-only HSET",
+			seed: func(ctx context.Context, c *redis.Client) error {
+				return c.HSet(ctx, coll, "f", "v1").Err()
+			},
+			script: "local v=redis.call('HGETALL',KEYS[1]); redis.call('SET',KEYS[2], table.concat(v, ',')); return #v",
+			concurrent: func(ctx context.Context, c *redis.Client) error {
+				return c.HSet(ctx, coll, "f", "v2").Err()
+			},
+			stale: "f,v1",
+			fresh: "f,v2",
+		},
+		{
+			// A non-emptying HDEL deletes the field key and writes a unique
+			// delta key; HLEN records neither, only the hash fence.
+			name: "HLEN vs non-emptying HDEL",
+			seed: func(ctx context.Context, c *redis.Client) error {
+				return c.HSet(ctx, coll, "f", "v1", "g", "v2").Err()
+			},
+			script: "local v=redis.call('HLEN',KEYS[1]); redis.call('SET',KEYS[2], tostring(v)); return v",
+			concurrent: func(ctx context.Context, c *redis.Client) error {
+				return c.HDel(ctx, coll, "g").Err()
+			},
+			stale: "2",
+			fresh: "1",
+		},
+		{
+			name: "HGETALL vs non-emptying HDEL",
+			seed: func(ctx context.Context, c *redis.Client) error {
+				return c.HSet(ctx, coll, "f", "v1", "g", "v2").Err()
+			},
+			script: "local v=redis.call('HGETALL',KEYS[1]); redis.call('SET',KEYS[2], table.concat(v, ',')); return #v",
+			concurrent: func(ctx context.Context, c *redis.Client) error {
+				return c.HDel(ctx, coll, "g").Err()
+			},
+			stale: "f,v1,g,v2",
+			fresh: "f,v1",
 		},
 		{
 			name: "LRANGE vs RPUSH",
@@ -213,6 +254,183 @@ func TestLua_CollectionReadOfUnwrittenKeyIsNotValidated(t *testing.T) {
 			require.Equal(t, tc.fresh, got, "the retried script must observe the concurrent write")
 			require.True(t, strings.Contains(attempts[0].outcome, "FSM error"),
 				"A's first attempt must fail validation, got %s", attempts[0].outcome)
+		})
+	}
+}
+
+// TestLua_ReadSetCoversCollectionReads pins the read keys each Lua collection
+// read adds to the script's commit, on the fast and the slow paths: an absent
+// key records the absent-key set; a list / set records its type fence; a hash
+// or zset also records its legacy blob anchor; a stream records its meta key;
+// point reads of an existing collection add the element key (hash field, set
+// member, zset member), and HGETALL adds the key of every field it returned.
+// Each script also SETs an unrelated key so it dispatches; that key
+// contributes only its own creation fences.
+func TestLua_ReadSetCoversCollectionReads(t *testing.T) {
+	t.Parallel()
+
+	readKey := []byte("lua:collread:read")
+	writeKey := []byte("lua:collread:write")
+	absent := redisTxnReadFencePointKeys(readKey)
+	with := func(base [][]byte, extra ...[]byte) [][]byte {
+		return append(append([][]byte{}, base...), extra...)
+	}
+	hash := [][]byte{redisTxnWideHashFenceKey(readKey), redisHashKey(readKey)}
+	list := [][]byte{redisTxnWideListFenceKey(readKey)}
+	set := [][]byte{redisTxnWideSetFenceKey(readKey)}
+	zset := [][]byte{redisTxnWideZSetFenceKey(readKey), redisZSetKey(readKey)}
+	stream := [][]byte{store.StreamMetaKey(readKey)}
+	field := func(name string) []byte { return store.HashFieldKey(readKey, []byte(name)) }
+	member := func(name string) []byte { return store.SetMemberKey(readKey, []byte(name)) }
+	zmember := func(name string) []byte { return store.ZSetMemberKey(readKey, []byte(name)) }
+
+	const (
+		seedHash   = `redis.call("HSET", KEYS[1], "f", "v")`
+		seedHash2  = `redis.call("HSET", KEYS[1], "f", "v", "g", "w")`
+		seedList   = `redis.call("RPUSH", KEYS[1], "a", "b")`
+		seedSet    = `redis.call("SADD", KEYS[1], "a")`
+		seedZSet   = `redis.call("ZADD", KEYS[1], 1, "m")`
+		seedStream = `redis.call("XADD", KEYS[1], "1-1", "f", "v")`
+	)
+	cases := []struct {
+		name string
+		seed string
+		read string
+		want [][]byte
+	}{
+		{name: "HGET hit (fast path)", seed: seedHash, read: `redis.call("HGET", KEYS[1], "f")`, want: with(hash, field("f"))},
+		{name: "HGET missing field (slow path)", seed: seedHash, read: `redis.call("HGET", KEYS[1], "g")`, want: with(hash, field("g"))},
+		{name: "HGET absent", read: `redis.call("HGET", KEYS[1], "f")`, want: absent},
+		{name: "HGET after cached absent", read: `redis.call("GET", KEYS[1]); redis.call("HGET", KEYS[1], "f")`, want: absent},
+		{name: "HEXISTS hit (fast path)", seed: seedHash, read: `redis.call("HEXISTS", KEYS[1], "f")`, want: with(hash, field("f"))},
+		{name: "HEXISTS absent", read: `redis.call("HEXISTS", KEYS[1], "f")`, want: absent},
+		{name: "HMGET", seed: seedHash, read: `redis.call("HMGET", KEYS[1], "f", "g")`, want: with(hash, field("f"), field("g"))},
+		{name: "HMGET absent", read: `redis.call("HMGET", KEYS[1], "f", "g")`, want: absent},
+		{name: "HGETALL", seed: seedHash, read: `redis.call("HGETALL", KEYS[1])`, want: with(hash, field("f"))},
+		{name: "HGETALL two fields", seed: seedHash2, read: `redis.call("HGETALL", KEYS[1])`, want: with(hash, field("f"), field("g"))},
+		{name: "HLEN two fields", seed: seedHash2, read: `redis.call("HLEN", KEYS[1])`, want: hash},
+		{name: "HGETALL absent", read: `redis.call("HGETALL", KEYS[1])`, want: absent},
+		{name: "HLEN", seed: seedHash, read: `redis.call("HLEN", KEYS[1])`, want: hash},
+		{name: "LRANGE", seed: seedList, read: `redis.call("LRANGE", KEYS[1], 0, -1)`, want: list},
+		{name: "LRANGE absent", read: `redis.call("LRANGE", KEYS[1], 0, -1)`, want: absent},
+		{name: "LINDEX", seed: seedList, read: `redis.call("LINDEX", KEYS[1], 0)`, want: list},
+		{name: "LLEN", seed: seedList, read: `redis.call("LLEN", KEYS[1])`, want: list},
+		{name: "LLEN absent", read: `redis.call("LLEN", KEYS[1])`, want: absent},
+		{name: "LPOS", seed: seedList, read: `redis.call("LPOS", KEYS[1], "b")`, want: list},
+		{name: "SMEMBERS", seed: seedSet, read: `redis.call("SMEMBERS", KEYS[1])`, want: set},
+		{name: "SMEMBERS absent", read: `redis.call("SMEMBERS", KEYS[1])`, want: absent},
+		{name: "SCARD", seed: seedSet, read: `redis.call("SCARD", KEYS[1])`, want: set},
+		{name: "SISMEMBER hit (fast path)", seed: seedSet, read: `redis.call("SISMEMBER", KEYS[1], "a")`, want: with(set, member("a"))},
+		{name: "SISMEMBER miss (slow path)", seed: seedSet, read: `redis.call("SISMEMBER", KEYS[1], "b")`, want: with(set, member("b"))},
+		{name: "SISMEMBER absent", read: `redis.call("SISMEMBER", KEYS[1], "a")`, want: absent},
+		{name: "ZSCORE hit (fast path)", seed: seedZSet, read: `redis.call("ZSCORE", KEYS[1], "m")`, want: with(zset, zmember("m"))},
+		{name: "ZSCORE miss (slow path)", seed: seedZSet, read: `redis.call("ZSCORE", KEYS[1], "x")`, want: with(zset, zmember("x"))},
+		{name: "ZSCORE absent", read: `redis.call("ZSCORE", KEYS[1], "m")`, want: absent},
+		{name: "ZRANGE", seed: seedZSet, read: `redis.call("ZRANGE", KEYS[1], 0, -1)`, want: zset},
+		{name: "ZREVRANGE", seed: seedZSet, read: `redis.call("ZREVRANGE", KEYS[1], 0, -1)`, want: zset},
+		{name: "ZCARD", seed: seedZSet, read: `redis.call("ZCARD", KEYS[1])`, want: zset},
+		{name: "ZCARD absent", read: `redis.call("ZCARD", KEYS[1])`, want: absent},
+		{name: "ZCOUNT", seed: seedZSet, read: `redis.call("ZCOUNT", KEYS[1], "-inf", "+inf")`, want: zset},
+		{name: "ZRANGEBYSCORE hit (fast path)", seed: seedZSet, read: `redis.call("ZRANGEBYSCORE", KEYS[1], "-inf", "+inf")`, want: zset},
+		// An empty fast-path hit cannot tell an empty range from an absent
+		// key, so it records the absent-key set, a superset of both.
+		{name: "ZRANGEBYSCORE empty range (fast path)", seed: seedZSet, read: `redis.call("ZRANGEBYSCORE", KEYS[1], 5, 10)`, want: absent},
+		{name: "ZRANGEBYSCORE absent", read: `redis.call("ZRANGEBYSCORE", KEYS[1], "-inf", "+inf")`, want: absent},
+		{name: "ZREVRANGEBYSCORE", seed: seedZSet, read: `redis.call("ZREVRANGEBYSCORE", KEYS[1], "+inf", "-inf")`, want: zset},
+		{name: "XLEN", seed: seedStream, read: `redis.call("XLEN", KEYS[1])`, want: stream},
+		{name: "XLEN absent", read: `redis.call("XLEN", KEYS[1])`, want: absent},
+		{name: "XRANGE", seed: seedStream, read: `redis.call("XRANGE", KEYS[1], "-", "+")`, want: stream},
+		{name: "XREVRANGE", seed: seedStream, read: `redis.call("XREVRANGE", KEYS[1], "+", "-")`, want: stream},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			st := store.NewMVCCStore()
+			coord := newReadKeyRecordingCoordinator(st)
+			server := NewRedisServer(nil, "", st, coord, nil, nil)
+			if tc.seed != "" {
+				conn := &recordingConn{}
+				server.runLuaScript(conn, tc.seed, [][]byte{[]byte("1"), readKey})
+				require.Empty(t, conn.err)
+				coord.dispatches = 0
+				coord.lastReadKeys = nil
+			}
+
+			conn := &recordingConn{}
+			script := tc.read + `; return redis.call("SET", KEYS[2], "w")`
+			server.runLuaScript(conn, script, [][]byte{[]byte("2"), readKey, writeKey})
+			require.Empty(t, conn.err)
+			require.Equal(t, 1, coord.dispatches)
+
+			want := append(append([][]byte{}, tc.want...), redisTxnWideCollectionFenceKeys(writeKey)...)
+			requireReadKeysMatch(t, coord.lastReadKeys, want)
+		})
+	}
+}
+
+// TestHDel_PutsHashFence pins that every HDEL that removes a field Puts the
+// hash fence, emptying or not, on the wide-column and the legacy blob paths,
+// so a reader of the whole field set (HLEN, HGETALL) that recorded the fence
+// sees the removal. An HDEL that removes nothing dispatches nothing.
+func TestHDel_PutsHashFence(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	key := []byte("hdel:fence")
+	seedWide := func(t *testing.T, server *RedisServer, _ store.MVCCStore) {
+		t.Helper()
+		_, err := server.applyHashFieldPairs(key, [][]byte{[]byte("f"), []byte("v"), []byte("g"), []byte("w")})
+		require.NoError(t, err)
+	}
+	seedLegacy := func(t *testing.T, _ *RedisServer, st store.MVCCStore) {
+		t.Helper()
+		raw, err := marshalHashValue(redisHashValue{"f": "v", "g": "w"})
+		require.NoError(t, err)
+		require.NoError(t, st.PutAt(ctx, redisHashKey(key), raw, 1, 0))
+	}
+
+	cases := []struct {
+		name      string
+		seed      func(*testing.T, *RedisServer, store.MVCCStore)
+		fields    []string
+		removed   int
+		wantFence bool
+	}{
+		{name: "wide, non-emptying", seed: seedWide, fields: []string{"g"}, removed: 1, wantFence: true},
+		{name: "wide, emptying", seed: seedWide, fields: []string{"f", "g"}, removed: 2, wantFence: true},
+		{name: "wide, missing field", seed: seedWide, fields: []string{"x"}, removed: 0},
+		{name: "legacy, non-emptying", seed: seedLegacy, fields: []string{"g"}, removed: 1, wantFence: true},
+		{name: "legacy, emptying", seed: seedLegacy, fields: []string{"f", "g"}, removed: 2, wantFence: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			st := store.NewMVCCStore()
+			coord := &putRecordingCoordinator{readKeyRecordingCoordinator: newReadKeyRecordingCoordinator(st)}
+			server := NewRedisServer(nil, "", st, coord, nil, nil)
+			tc.seed(t, server, st)
+			coord.dispatches = 0
+			coord.lastPuts = nil
+
+			fields := make([][]byte, 0, len(tc.fields))
+			for _, field := range tc.fields {
+				fields = append(fields, []byte(field))
+			}
+			removed, err := server.hdelTxn(ctx, key, fields)
+			require.NoError(t, err)
+			require.Equal(t, tc.removed, removed)
+			if !tc.wantFence {
+				require.Zero(t, coord.dispatches)
+				return
+			}
+			require.Equal(t, 1, coord.dispatches)
+			var fencePuts [][]byte
+			for _, putKey := range coord.lastPuts {
+				if redisTxnWideFenceUserKey(putKey) != nil {
+					fencePuts = append(fencePuts, putKey)
+				}
+			}
+			require.Contains(t, fencePuts, redisTxnWideHashFenceKey(key))
 		})
 	}
 }

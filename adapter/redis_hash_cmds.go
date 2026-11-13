@@ -436,7 +436,11 @@ func (r *RedisServer) hdel(conn redcon.Conn, cmd redcon.Command) {
 	conn.WriteInt(removed)
 }
 
-// hdelWideColumn deletes the given fields from the wide-column hash and emits a negative delta.
+// hdelWideColumn deletes the given fields from the wide-column hash, emits a
+// negative delta, and Puts the hash fence. The delta key is unique per commit
+// and the deleted field keys are ones a reader of the whole hash (HLEN,
+// HGETALL) may not have recorded, so the fence is what makes every change of
+// the field set visible to such a reader; field additions Put it as well.
 func (r *RedisServer) hdelWideColumn(ctx context.Context, key []byte, fields [][]byte, readTimestamp kv.ReadTimestamp) (int, error) {
 	readTS := readTimestamp.Timestamp()
 	delElems, removed, err := r.resolveHashFieldDelElems(ctx, key, fields, readTS)
@@ -453,11 +457,14 @@ func (r *RedisServer) hdelWideColumn(ctx context.Context, key []byte, fields [][
 	}
 	elems := delElems
 	deltaVal := store.MarshalHashMetaDelta(store.HashMetaDelta{LenDelta: int64(-removed)})
-	elems = append(elems, &kv.Elem[kv.OP]{
-		Op:    kv.Put,
-		Key:   store.HashMetaDeltaKey(key, commitTS, 0),
-		Value: deltaVal,
-	})
+	elems = append(elems,
+		&kv.Elem[kv.OP]{
+			Op:    kv.Put,
+			Key:   store.HashMetaDeltaKey(key, commitTS, 0),
+			Value: deltaVal,
+		},
+		redisTxnWideHashFenceElem(key),
+	)
 	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
 	_, dispatchErr := kv.DispatchWithReadTimestamp(dispatchCtx, r.coordinator, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
@@ -553,6 +560,8 @@ func removeHashFields(value redisHashValue, fields [][]byte) int {
 	return removed
 }
 
+// persistHashReadTimestampTxn writes value as the full content of a legacy
+// blob hash after HDEL removed fields from it (its only caller).
 func (r *RedisServer) persistHashReadTimestampTxn(ctx context.Context, key []byte, readTimestamp kv.ReadTimestamp, value redisHashValue) error {
 	readTS := readTimestamp.Timestamp()
 	if len(value) == 0 {
@@ -583,6 +592,10 @@ func (r *RedisServer) persistHashReadTimestampTxn(ctx context.Context, key []byt
 		Value: store.MarshalHashMeta(store.HashMeta{Len: int64(len(value)), ExpireAt: ttlMs}),
 	})
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisHashKey(key)})
+	// HDEL of a legacy blob hash rewrites it wide-column without the removed
+	// fields; like the wide-column HDEL it changes the field set, so it Puts
+	// the hash fence.
+	elems = append(elems, redisTxnWideHashFenceElem(key))
 	return r.dispatchReadTimestampElems(ctx, readTimestamp, elems)
 }
 

@@ -6,12 +6,28 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 )
 
 const absentCreatorReproKey = "g7-absent"
+
+type putRecordingCoordinator struct {
+	*readKeyRecordingCoordinator
+	lastPuts [][]byte
+}
+
+func (c *putRecordingCoordinator) Dispatch(ctx context.Context, req *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
+	c.lastPuts = nil
+	for _, elem := range req.Elems {
+		if elem != nil && elem.Op == kv.Put {
+			c.lastPuts = append(c.lastPuts, bytes.Clone(elem.Key))
+		}
+	}
+	return c.readKeyRecordingCoordinator.Dispatch(ctx, req)
+}
 
 // absentKeyCreatorRace is one pair of commands that each create an absent key
 // under a different encoding.
