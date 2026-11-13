@@ -26,29 +26,44 @@ func main() {
 // checkTree reports every violation in the tree, not only the first, so one
 // run lists all the imports that need fixing.
 func checkTree(root string) error {
-	var violations []error
-	walkErr := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return fmt.Errorf("read production source: %w", walkErr)
-		}
-		if entry.IsDir() {
-			if path != root && ignoredDirectory(entry.Name()) {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if !strings.HasSuffix(entry.Name(), ".go") || strings.HasSuffix(entry.Name(), "_test.go") {
-			return nil
-		}
-		if err := checkFile(root, path); err != nil {
-			violations = append(violations, err)
+	c := treeChecker{root: root, checked: map[string]bool{}}
+	if err := filepath.WalkDir(root, c.visit); err != nil {
+		return err
+	}
+	return errors.Join(c.violations...)
+}
+
+// treeChecker collects the violations of one walk: each production file's
+// imports, and once per package directory, whether a rule covers it.
+type treeChecker struct {
+	root       string
+	checked    map[string]bool
+	violations []error
+}
+
+func (c *treeChecker) visit(path string, entry fs.DirEntry, walkErr error) error {
+	if walkErr != nil {
+		return fmt.Errorf("read production source: %w", walkErr)
+	}
+	if entry.IsDir() {
+		if path != c.root && ignoredDirectory(entry.Name()) {
+			return filepath.SkipDir
 		}
 		return nil
-	})
-	if walkErr != nil {
-		return walkErr
 	}
-	return errors.Join(violations...)
+	if !strings.HasSuffix(entry.Name(), ".go") || strings.HasSuffix(entry.Name(), "_test.go") {
+		return nil
+	}
+	if err := checkFile(c.root, path); err != nil {
+		c.violations = append(c.violations, err)
+	}
+	if dir := moduleDir(c.root, path); !c.checked[dir] {
+		c.checked[dir] = true
+		if err := checkCoverage(dir); err != nil {
+			c.violations = append(c.violations, err)
+		}
+	}
+	return nil
 }
 
 func ignoredDirectory(name string) bool {

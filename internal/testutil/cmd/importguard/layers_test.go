@@ -1,9 +1,12 @@
 package main
 
 import (
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -67,6 +70,42 @@ func TestCheckLayering(t *testing.T) {
 		{"clusterbootstrap may use encryptionwiring", "internal/clusterbootstrap", m + "internal/encryptionwiring", false},
 		{"clusterbootstrap may use nodeauth", "internal/clusterbootstrap", m + "internal/nodeauth", false},
 		{"encryptionwiring may not use clusterbootstrap", "internal/encryptionwiring", m + "internal/clusterbootstrap", true},
+		{"internal leaf may use proto", "internal", m + "proto", false},
+		{"internal leaf rule is exact", "internal", m + "internal/encryption", true},
+		{"allowlist admits the package's own subpackage", "internal/peersession", m + "internal/peersession/wire", false},
+		{"allowlist entry internal is the helper package alone", "internal/peersession", m + "internal/encryption", true},
+		{"allowlist entry internal admits the helper package", "internal/peersession", m + "internal", false},
+		{"backup stays a codec", "internal/backup", m + "store", true},
+		{"raftadmin may use the neutral engine", "internal/raftadmin", m + "internal/raftengine", false},
+		{"raftadmin may not use the etcd backend", "internal/raftadmin", m + "internal/raftengine/etcd", true},
+		{"raftadmission may not use kv", "internal/raftadmission", m + "kv", true},
+		{"runtimehealth may not use kv", "internal/runtimehealth", m + "kv", true},
+		{"snapshot offload may use the etcd backend", "internal/snapshotoffload", m + "internal/raftengine/etcd", false},
+		{"snapshot offload may not use kv", "internal/snapshotoffload", m + "kv", true},
+		{"autosplit may use kv", "distribution/autosplit", m + "kv", false},
+		{"autosplit may not use adapter", "distribution/autosplit", m + "adapter", true},
+		{"leaderbalance may not use store", "internal/leaderbalance", m + "store", true},
+		{"tsowiring imports only kv", "internal/tsowiring", m + "store", true},
+		{"snapshotoffloadwiring may use its library", "internal/snapshotoffloadwiring", m + "internal/snapshotoffload", false},
+		{"adminbridge may not use the server assembly", "internal/adminbridge", m + "internal/server", true},
+		{"nodeauth may use adapter", "internal/nodeauth", m + "adapter", false},
+		{"nodeauth may not use noderuntime", "internal/nodeauth", m + "internal/noderuntime", true},
+		{"noderuntime may not use nodeauth", "internal/noderuntime", m + "internal/nodeauth", true},
+		{"noderuntime may not use encryptionwiring", "internal/noderuntime", m + "internal/encryptionwiring", true},
+		{"encryptionwiring may use noderuntime", "internal/encryptionwiring", m + "internal/noderuntime", false},
+		{"encryptionwiring may not use nodeauth", "internal/encryptionwiring", m + "internal/nodeauth", true},
+		{"encryptionwiring may not use adminbridge", "internal/encryptionwiring", m + "internal/adminbridge", true},
+		{"clusterbootstrap may use raftadmission", "internal/clusterbootstrap", m + "internal/raftadmission", false},
+		{"clusterbootstrap may not use the server assembly", "internal/clusterbootstrap", m + "internal/server", true},
+		{"server assembly may not use proxy", "internal/server", m + "proxy", true},
+		{"backup only from adapter and binaries", "internal/admin", m + "internal/backup", true},
+		{"adapter may use backup", "adapter", m + "internal/backup", false},
+		{"peersession from the etcd transport", "internal/raftengine/etcd", m + "internal/peersession", false},
+		{"peersession not from kv", "kv", m + "internal/peersession", true},
+		{"raftadmission only from the wiring layers", "adapter", m + "internal/raftadmission", true},
+		{"runtimehealth only from the server assembly", "internal/admin", m + "internal/runtimehealth", true},
+		{"autosplit only from binaries and server wiring", "adapter", m + "distribution/autosplit", true},
+		{"autosplit from server wiring", "internal/serverwiring", m + "distribution/autosplit", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -77,6 +116,69 @@ func TestCheckLayering(t *testing.T) {
 				require.NoError(t, err)
 			}
 		})
+	}
+}
+
+func TestCheckCoverage(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, dir string
+		covered   bool
+	}{
+		{"deny rule", "kv", true},
+		{"deny rule covers subpackages", "kv/sub", true},
+		{"allowlist", "internal/nodeauth", true},
+		{"exact rule does not cover subpackages", "distribution/newsub", false},
+		{"exact allowlist does not cover subpackages", "internal/newpkg", false},
+		{"root is checked by rootImports", ".", true},
+		{"binaries are exempt", "cmd/elastickv-admin", true},
+		{"nested module is exempt", "third_party/go-fuse/fuse", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := checkCoverage(tc.dir)
+			if tc.covered {
+				require.NoError(t, err)
+			} else {
+				require.ErrorContains(t, err, "has no layer rule or import allowlist")
+			}
+		})
+	}
+}
+
+// Every package a rule names must exist, so a rename or removal cannot leave
+// a rule that silently guards nothing.
+func TestRulesNameExistingPackages(t *testing.T) {
+	t.Parallel()
+	repoRoot := filepath.Join("..", "..", "..", "..")
+	var named []string
+	for _, rules := range [][]layerRule{layerRules, importAllowlists} {
+		for _, rule := range rules {
+			named = append(named, rule.Dir)
+			named = append(named, rule.Only...)
+			for _, denied := range rule.Deny {
+				if denied != anyModulePackage {
+					named = append(named, denied)
+				}
+			}
+		}
+	}
+	for _, restricted := range restrictedPackages {
+		named = append(named, restricted.Pkg)
+		for _, from := range restricted.AllowedFrom {
+			if from != "." {
+				named = append(named, from)
+			}
+		}
+	}
+	named = append(named, upperLayers...)
+	named = append(named, rootImports...)
+	for _, pkg := range named {
+		info, err := os.Stat(filepath.Join(repoRoot, filepath.FromSlash(pkg)))
+		if !assert.NoError(t, err, "rule names missing package %s", pkg) {
+			continue
+		}
+		assert.True(t, info.IsDir(), "rule names %s, which is not a directory", pkg)
 	}
 }
 
@@ -105,4 +207,16 @@ func TestCheckTreeReportsEveryLayerViolation(t *testing.T) {
 	require.NotContains(t, err.Error(), "main.go")
 	require.NotContains(t, err.Error(), filepath.Join("server", "backend.go"))
 	require.NotContains(t, err.Error(), "ok.go")
+}
+
+func TestCheckTreeReportsPackagesWithoutARule(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	writeSource(t, root, "kv/ok.go", "package kv\n")
+	writeSource(t, root, "internal/newpkg/a.go", "package newpkg\n")
+	writeSource(t, root, "internal/newpkg/b.go", "package newpkg\n")
+	err := checkTree(root)
+	require.ErrorContains(t, err, "internal/newpkg has no layer rule or import allowlist")
+	require.Equal(t, 1, strings.Count(err.Error(), "internal/newpkg has no layer rule"), "one report per package")
+	require.NotContains(t, err.Error(), "kv has no")
 }

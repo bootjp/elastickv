@@ -14,18 +14,21 @@ const modulePath = "github.com/bootjp/elastickv"
 const anyModulePackage = "*"
 
 // layerRule forbids production source under Dir from importing the
-// module packages in Deny. Dir and every Deny entry cover the package
-// and its subpackages; Exact limits Dir to the package itself.
+// module packages in Deny, or, when Only is set, any module package
+// outside Only. Dir and every Deny / Only entry cover the package and its
+// subpackages; Exact limits Dir to the package itself. A rule that is not
+// Exact also lets Dir import its own subpackages.
 type layerRule struct {
 	Dir   string
 	Exact bool
 	Deny  []string
+	Only  []string
 	Why   string
 }
 
 // restrictedPackage may be imported only from the listed directories
-// and their subdirectories. "." is the repository-root main package
-// alone.
+// and their subdirectories, and from inside its own subtree. "." is the
+// repository-root main package alone.
 type restrictedPackage struct {
 	Pkg         string
 	AllowedFrom []string
@@ -126,6 +129,63 @@ var layerRules = []layerRule{
 	},
 }
 
+// importAllowlists name every module package a mid-level package may
+// import. They cover the packages between the data plane and the binaries
+// that the deny rules above do not reach, and encode the server wiring
+// order noderuntime / nodeauth -> encryptionwiring -> clusterbootstrap ->
+// server. Widening an allowlist is a layering decision: prefer inverting
+// the dependency.
+var importAllowlists = []layerRule{
+	{Dir: "internal", Exact: true, Only: []string{"proto"}, Why: "shared helpers (token files, gRPC options) are imported by every layer, so they stay a leaf over proto"},
+	{Dir: "internal/backup", Only: []string{"internal/pathsafety", "internal/s3keys", "proto"}, Why: "the backup format is a codec that adapters and offline tools share"},
+	{Dir: "internal/peersession", Only: []string{"internal", "internal/raftbootstrap", "proto"}, Why: "peer-session authentication sits below the Raft transport that uses it"},
+	{Dir: "internal/raftadmin", Only: []string{"internal/raftengine", "proto"}, Why: "the Raft admin service works through the engine-neutral interface"},
+	{Dir: "internal/raftadmission", Only: []string{"internal", "internal/peersession", "internal/raftbootstrap", "internal/raftengine", "proto"}, Why: "Raft admission checks work through the engine-neutral interface"},
+	{Dir: "internal/runtimehealth", Only: []string{"internal/monoclock", "internal/raftengine"}, Why: "runtime health reads engine state only"},
+	{Dir: "internal/snapshotoffload", Only: []string{"internal/raftengine", "internal/pathsafety", "proto"}, Why: "snapshot offload reads the engine's snapshots and nothing above it"},
+	{Dir: "distribution/autosplit", Only: []string{"distribution", "keyviz", "kv", "proto"}, Why: "the auto-split scheduler drives the coordinator and the route catalog only"},
+	{Dir: "internal/leaderbalance", Only: []string{"internal/raftengine", "kv", "proto"}, Why: "the leader-balance scheduler sees groups through narrow interfaces"},
+	{Dir: "internal/fsmount", Only: []string{"internal", "internal/filesystem", "kv", "monitoring"}, Why: "the FUSE mount wires the filesystem service only"},
+	{Dir: "internal/tsowiring", Only: []string{"kv"}, Why: "a <lib>wiring package imports only its library"},
+	{Dir: "internal/snapshotoffloadwiring", Only: []string{"internal/snapshotoffload"}, Why: "a <lib>wiring package imports only its library"},
+	{Dir: "internal/adminbridge", Only: []string{"adapter", "internal/admin", "internal/raftengine", "keyviz", "kv", "proto"}, Why: "admin bridges adapt protocol adapters to the admin sources only"},
+	{Dir: "internal/serverwiring", Only: []string{"adapter", "distribution", "keyviz", "kv", "monitoring", "proto"}, Why: "server wiring helpers build adapters and observers, not the assembly"},
+	{Dir: "internal/nodeauth", Only: []string{"adapter", "internal"}, Why: "node and admin gRPC auth sits at the bottom of the server wiring"},
+	{
+		Dir:  "internal/noderuntime",
+		Only: []string{"adapter", "distribution", "internal", "internal/raftengine", "kv", "proto", "store"},
+		Why:  "node runtime configuration sits at the bottom of the server wiring",
+	},
+	{
+		Dir: "internal/encryptionwiring",
+		Only: []string{
+			"adapter", "internal", "internal/admin", "internal/encryption", "internal/noderuntime",
+			"internal/raftadmin", "internal/raftengine", "kv", "monitoring", "proto", "store",
+		},
+		Why: "encryption wiring builds on noderuntime, below protected bootstrap",
+	},
+	{
+		Dir: "internal/clusterbootstrap",
+		Only: []string{
+			"adapter", "distribution", "internal", "internal/encryption", "internal/encryptionwiring", "internal/nodeauth",
+			"internal/noderuntime", "internal/peersession", "internal/raftadmission", "internal/raftbootstrap",
+			"internal/raftengine", "kv", "proto", "store",
+		},
+		Why: "protected bootstrap builds on encryption wiring, below the server assembly",
+	},
+	{Dir: "internal/server", Deny: []string{"proxy"}, Why: "the Redis migration proxy is a binary of its own"},
+}
+
+// containerPackage is the shared helper package at internal/. Its
+// subdirectories are unrelated packages, so an Only entry naming it admits
+// the helper package alone, not the internal/ tree.
+const containerPackage = "internal"
+
+// coverageExempt directories hold binaries (the root is checked by
+// rootImports) or a nested module; every other production package must
+// have a layer rule or an import allowlist.
+var coverageExempt = []string{".", "cmd", "third_party"}
+
 // restrictedPackages may only be imported at the binary wiring edge.
 var restrictedPackages = []restrictedPackage{
 	{
@@ -144,6 +204,13 @@ var restrictedPackages = []restrictedPackage{
 	{Pkg: "internal/tsowiring", AllowedFrom: []string{"internal/server", "cmd"}, Why: "TSO wiring is configured by binaries only"},
 	{Pkg: "internal/nodeauth", AllowedFrom: []string{"internal/server", "cmd", "internal/clusterbootstrap"}, Why: "node and admin gRPC authentication is configured by binaries only"},
 	{Pkg: "internal/server", AllowedFrom: []string{"."}, Why: "the server assembly is started by the root binary only"},
+	{Pkg: "internal/backup", AllowedFrom: []string{"adapter", "cmd"}, Why: "the backup format is produced by the adapters and read by offline tools"},
+	{Pkg: "internal/peersession", AllowedFrom: []string{"adapter", "internal/raftengine", "internal/raftadmission", "internal/clusterbootstrap"}, Why: "peer sessions are opened by the Raft transport and checked by admission and bootstrap"},
+	{Pkg: "internal/raftadmin", AllowedFrom: []string{"adapter", "cmd", "internal/encryptionwiring", "internal/server"}, Why: "the Raft admin service is registered by the wiring layers"},
+	{Pkg: "internal/raftadmission", AllowedFrom: []string{"internal/clusterbootstrap", "internal/server"}, Why: "Raft admission is installed by the wiring layers"},
+	{Pkg: "internal/runtimehealth", AllowedFrom: []string{"internal/server"}, Why: "runtime health is served by the server assembly"},
+	{Pkg: "internal/snapshotoffload", AllowedFrom: []string{"cmd", "internal/server", "internal/snapshotoffloadwiring"}, Why: "snapshot offload is started by binaries and its wiring"},
+	{Pkg: "distribution/autosplit", AllowedFrom: []string{"cmd", "internal/server", "internal/serverwiring"}, Why: "the auto-split scheduler is started by binaries and server wiring"},
 }
 
 // rootImports are the only module packages the repository-root main
@@ -191,12 +258,33 @@ func checkRootImports(dir, pkg string) error {
 }
 
 func checkLayerRules(dir, pkg string) error {
-	for _, rule := range layerRules {
-		if rule.applies(dir) && rule.denies(pkg) {
-			return fmt.Errorf("layer violation: %s must not import %s (%s)", dir, pkg, rule.Why)
+	for _, rules := range [][]layerRule{layerRules, importAllowlists} {
+		for _, rule := range rules {
+			if rule.applies(dir) && rule.denies(pkg) {
+				return fmt.Errorf("layer violation: %s must not import %s (%s)", dir, pkg, rule.Why)
+			}
 		}
 	}
 	return nil
+}
+
+// checkCoverage reports a production package that no layer rule or import
+// allowlist applies to, so a new package has to declare its place in the
+// layering.
+func checkCoverage(dir string) error {
+	for _, exempt := range coverageExempt {
+		if dir == exempt || (exempt != "." && within(dir, exempt)) {
+			return nil
+		}
+	}
+	for _, rules := range [][]layerRule{layerRules, importAllowlists} {
+		for _, rule := range rules {
+			if rule.applies(dir) {
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("layer violation: %s has no layer rule or import allowlist; add one to layers.go", dir)
 }
 
 func checkRestrictedPackages(dir, pkg string) error {
@@ -217,6 +305,9 @@ func (r layerRule) applies(dir string) bool {
 }
 
 func (r layerRule) denies(pkg string) bool {
+	if r.Only != nil && !r.allowedByOnly(pkg) {
+		return true
+	}
 	for _, denied := range r.Deny {
 		if (denied == anyModulePackage && !within(pkg, r.Dir)) || within(pkg, denied) {
 			return true
@@ -225,7 +316,28 @@ func (r layerRule) denies(pkg string) bool {
 	return false
 }
 
+func (r layerRule) allowedByOnly(pkg string) bool {
+	if !r.Exact && within(pkg, r.Dir) {
+		return true
+	}
+	for _, allowed := range r.Only {
+		if allowed == containerPackage {
+			if pkg == containerPackage {
+				return true
+			}
+			continue
+		}
+		if within(pkg, allowed) {
+			return true
+		}
+	}
+	return false
+}
+
 func (r restrictedPackage) allows(dir string) bool {
+	if within(dir, r.Pkg) {
+		return true
+	}
 	for _, allowed := range r.AllowedFrom {
 		if dir == allowed || (allowed != "." && within(dir, allowed)) {
 			return true
