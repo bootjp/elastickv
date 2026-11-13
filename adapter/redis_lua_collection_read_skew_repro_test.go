@@ -489,8 +489,6 @@ func TestLua_ReadSetCoversCollectionReads(t *testing.T) {
 	set := [][]byte{redisTxnWideSetFenceKey(readKey)}
 	zset := [][]byte{redisTxnWideZSetFenceKey(readKey), redisZSetKey(readKey)}
 	stream := [][]byte{store.StreamMetaKey(readKey)}
-	member := func(name string) []byte { return store.SetMemberKey(readKey, []byte(name)) }
-	zmember := func(name string) []byte { return store.ZSetMemberKey(readKey, []byte(name)) }
 
 	const (
 		seedHash   = `redis.call("HSET", KEYS[1], "f", "v")`
@@ -530,11 +528,11 @@ func TestLua_ReadSetCoversCollectionReads(t *testing.T) {
 		{name: "SCARD", seed: seedSet, read: `redis.call("SCARD", KEYS[1])`, want: set},
 		{name: "PTTL set", seed: seedSet, read: `redis.call("PTTL", KEYS[1])`, want: with(set, redisTTLKey(readKey))},
 		{name: "PTTL absent", read: `redis.call("PTTL", KEYS[1])`, want: absent},
-		{name: "SISMEMBER hit (fast path)", seed: seedSet, read: `redis.call("SISMEMBER", KEYS[1], "a")`, want: with(set, member("a"))},
-		{name: "SISMEMBER miss (slow path)", seed: seedSet, read: `redis.call("SISMEMBER", KEYS[1], "b")`, want: with(set, member("b"))},
+		{name: "SISMEMBER hit (fast path)", seed: seedSet, read: `redis.call("SISMEMBER", KEYS[1], "a")`, want: set},
+		{name: "SISMEMBER miss (slow path)", seed: seedSet, read: `redis.call("SISMEMBER", KEYS[1], "b")`, want: set},
 		{name: "SISMEMBER absent", read: `redis.call("SISMEMBER", KEYS[1], "a")`, want: absent},
-		{name: "ZSCORE hit (fast path)", seed: seedZSet, read: `redis.call("ZSCORE", KEYS[1], "m")`, want: with(zset, zmember("m"))},
-		{name: "ZSCORE miss (slow path)", seed: seedZSet, read: `redis.call("ZSCORE", KEYS[1], "x")`, want: with(zset, zmember("x"))},
+		{name: "ZSCORE hit (fast path)", seed: seedZSet, read: `redis.call("ZSCORE", KEYS[1], "m")`, want: zset},
+		{name: "ZSCORE miss (slow path)", seed: seedZSet, read: `redis.call("ZSCORE", KEYS[1], "x")`, want: zset},
 		{name: "ZSCORE absent", read: `redis.call("ZSCORE", KEYS[1], "m")`, want: absent},
 		{name: "ZRANGE", seed: seedZSet, read: `redis.call("ZRANGE", KEYS[1], 0, -1)`, want: zset},
 		{name: "ZREVRANGE", seed: seedZSet, read: `redis.call("ZREVRANGE", KEYS[1], 0, -1)`, want: zset},
@@ -613,6 +611,26 @@ func TestLuaHMGetReadSetBoundedAboveMaxReadKeys(t *testing.T) {
 	readKeys, _ := c.sortedTrackedReadKeys(0)
 	requireReadKeysMatch(t, readKeys, [][]byte{
 		redisTxnWideHashFenceKey([]byte(key)), redisHashKey([]byte(key)),
+	})
+}
+
+func TestLuaSetAndZSetPointReadsStayBounded(t *testing.T) {
+	key := "lua:many-missing-members"
+	c := &luaScriptContext{
+		sets:  map[string]*luaSetState{key: {loaded: true, exists: true, members: map[string]struct{}{"seed": {}}}},
+		zsets: map[string]*luaZSetState{key: {loaded: true, exists: true, membersLoaded: true, members: map[string]float64{"seed": 1}}},
+	}
+	for i := 0; i <= kv.MaxReadKeys; i++ {
+		member := fmt.Sprintf("m%05d", i)
+		_, err := c.cmdSIsMember([]string{key, member})
+		require.NoError(t, err)
+		_, err = c.cmdZScore([]string{key, member})
+		require.NoError(t, err)
+	}
+	readKeys, _ := c.sortedTrackedReadKeys(0)
+	requireReadKeysMatch(t, readKeys, [][]byte{
+		redisTxnWideSetFenceKey([]byte(key)),
+		redisTxnWideZSetFenceKey([]byte(key)), redisZSetKey([]byte(key)),
 	})
 }
 

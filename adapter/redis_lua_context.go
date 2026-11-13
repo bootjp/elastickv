@@ -398,7 +398,7 @@ func (c *luaScriptContext) trackAbsentKeyReadKeys(key []byte) {
 //     without the fence when it empties the zset.
 //   - stream: the stream meta key, which every stream write rewrites.
 //
-// Set and zset point reads also record their member keys.
+// Set and zset writes advance their respective fences, so point reads stay bounded.
 func (c *luaScriptContext) trackCollectionReadKeys(key []byte, typ redisValueType, exists bool) {
 	if !exists {
 		c.trackAbsentKeyReadKeys(key)
@@ -419,19 +419,6 @@ func (c *luaScriptContext) trackCollectionReadKeys(key []byte, typ redisValueTyp
 		c.trackReadKey(store.StreamMetaKey(key))
 	case redisTypeNone, redisTypeString:
 		c.trackStringTypeReadKeys(key, typ)
-	}
-}
-
-// trackCollectionElementReadKeys records a point read of elements of a
-// collection that exists at startTS: elementKey maps each requested element
-// to the key a write of that element Puts or deletes. Absent collections need no element
-// keys: the absent-key fences already cover every create.
-func (c *luaScriptContext) trackCollectionElementReadKeys(key []byte, exists bool, elementKey func(key, element []byte) []byte, elements ...string) {
-	if !exists {
-		return
-	}
-	for _, element := range elements {
-		c.trackReadKey(elementKey(key, []byte(element)))
 	}
 }
 
@@ -2941,7 +2928,6 @@ func (c *luaScriptContext) cmdSIsMember(args []string) (luaReply, error) {
 	}
 	if hit {
 		c.trackCollectionReadKeys(key, redisTypeSet, alive)
-		c.trackCollectionElementReadKeys(key, alive, store.SetMemberKey, member)
 		if alive {
 			return luaIntReply(1), nil
 		}
@@ -2958,7 +2944,6 @@ func sismemberFromSlowPath(c *luaScriptContext, key []byte, member string) (luaR
 		}
 		return luaReply{}, err
 	}
-	c.trackCollectionElementReadKeys(key, st.exists, store.SetMemberKey, member)
 	return sismemberFromSetState(st, member), nil
 }
 
@@ -3484,7 +3469,6 @@ func (c *luaScriptContext) cmdZScore(args []string) (luaReply, error) {
 	}
 	if hit {
 		c.trackCollectionReadKeys(key, redisTypeZSet, alive)
-		c.trackCollectionElementReadKeys(key, alive, store.ZSetMemberKey, member)
 		if !alive {
 			return luaNilReply(), nil
 		}
@@ -3505,7 +3489,6 @@ func zscoreFromSlowPath(c *luaScriptContext, key []byte, member string) (luaRepl
 		}
 		return luaReply{}, err
 	}
-	c.trackCollectionElementReadKeys(key, st.exists, store.ZSetMemberKey, member)
 	return c.zscoreFromZSetState(st, key, member)
 }
 
