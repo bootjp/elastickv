@@ -1073,6 +1073,7 @@ func (r *RedisServer) resolveXReadAfterIDs(ctx context.Context, req *xreadReques
 		if afterID != "$" {
 			continue
 		}
+		r.observeBlockingRedisKeys(ctx, [][]byte{req.keys[i]})
 		resolved, err := r.resolveXReadDollarID(ctx, req.keys[i])
 		if err != nil {
 			return err
@@ -1342,6 +1343,7 @@ func (r *RedisServer) xreadFinalTypeCheck(conn redcon.Conn, req xreadRequest) bo
 
 func (r *RedisServer) xreadCheckTypes(ctx context.Context, req xreadRequest) error {
 	for _, key := range req.keys {
+		r.observeBlockingRedisKeys(ctx, [][]byte{key})
 		readTS := r.readTS()
 		typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeStream)
 		if err != nil {
@@ -1371,7 +1373,6 @@ func (r *RedisServer) xread(conn redcon.Conn, cmd redcon.Command) {
 		writeRedisError(conn, err)
 		return
 	}
-	r.observeBlockingRedisKeys(r.handlerContext(conn), req.keys)
 
 	blockDuration := req.block
 	// block=0 means infinite wait in Redis; cap at redisDispatchTimeout to prevent goroutine leak.
@@ -1421,6 +1422,7 @@ func (r *RedisServer) xreadWithoutBlock(conn redcon.Conn, req xreadRequest) {
 	var results []xreadResult
 	var err error
 	if ok := r.runWithHeavyCommandSlot(func() {
+		r.observeBlockingRedisKeys(ctx, req.keys)
 		results, err = r.xreadOnce(ctx, req)
 	}); !ok {
 		conn.WriteError(errRedisHeavyCommandPoolFull.Error())
@@ -1486,8 +1488,8 @@ func (r *RedisServer) xreadBusyPoll(conn redcon.Conn, req xreadRequest, deadline
 		iterCtx, iterCancel := context.WithTimeout(handlerCtx, iterTimeout)
 		var results []xreadResult
 		var err error
-		r.observeBlockingRedisKeys(iterCtx, req.keys)
 		if ok := r.runWithHeavyCommandSlot(func() {
+			r.observeBlockingRedisKeys(iterCtx, req.keys)
 			results, err = r.xreadOnce(iterCtx, req)
 		}); !ok {
 			iterCancel()

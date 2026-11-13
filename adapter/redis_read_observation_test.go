@@ -164,6 +164,31 @@ func TestRedisReadObservationBlockingBZPopMinRecordsPolls(t *testing.T) {
 	require.Empty(t, coord.marks)
 }
 
+func TestRedisReadObservationNonblockingXReadCountsActualReads(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		id   string
+		want int
+	}{
+		{name: "explicit-id", id: "0-0", want: 1},
+		{name: "dollar-id", id: "$", want: 2},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			st := store.NewMVCCStore()
+			defer st.Close()
+			coord := &redisReadObservationCoordinator{}
+			server := &RedisServer{coordinator: coord, store: st}
+			cmd := redcon.Command{Args: [][]byte{[]byte(cmdXRead), []byte("STREAMS"), []byte("missing"), []byte(tt.id)}}
+			server.dispatchCommandDirect(&recordingConn{}, cmdXRead, server.xread, cmd, time.Now())
+			require.Len(t, coord.keys, tt.want)
+			for _, key := range coord.keys {
+				require.Equal(t, redisUserRouteKey([]byte("missing")), key)
+			}
+			require.Empty(t, coord.marks)
+		})
+	}
+}
+
 func TestRedisReadObservationMultiKeyIngressAttributesLocalAfterRemote(t *testing.T) {
 	remote := redisUserRouteKey([]byte("remote"))
 	local := redisUserRouteKey([]byte("local"))
@@ -216,7 +241,6 @@ func TestRedisReadObservationMarksUnattributableOnServingNode(t *testing.T) {
 		{[]byte(cmdDBSize)},
 		{[]byte(cmdKeys), []byte("*")},
 		{[]byte(cmdScan), []byte("0")},
-		{[]byte(cmdXRead), []byte("STREAMS"), []byte("a")},
 	} {
 		t.Run(string(args[0]), func(t *testing.T) {
 			coord := &redisReadObservationCoordinator{}

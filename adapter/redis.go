@@ -745,6 +745,9 @@ func (r *RedisServer) dispatchCommandDirect(conn redcon.Conn, name string, handl
 		if owned, ok := conn.(*redisOwnedConn); ok && !owned.workStarted {
 			return
 		}
+		if name == cmdXRead {
+			return
+		}
 		r.observeRedisRead(r.handlerContext(conn), name, cmd.Args, true)
 	}()
 	switch {
