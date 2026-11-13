@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
@@ -95,20 +96,20 @@ func TestS3MutationRetryRebuildsDefinitiveConflict(t *testing.T) {
 	require.Equal(t, 2, attempts)
 }
 
-type s3LostPartReplyCoordinator struct {
+type s3LostMetadataReplyCoordinator struct {
 	*s3OCCReproCoordinator
-	partKey []byte
-	err     error
-	lost    atomic.Bool
+	targetKey []byte
+	err       error
+	lost      atomic.Bool
 }
 
-func (c *s3LostPartReplyCoordinator) Dispatch(ctx context.Context, req *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
+func (c *s3LostMetadataReplyCoordinator) Dispatch(ctx context.Context, req *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
 	response, err := c.s3OCCReproCoordinator.Dispatch(ctx, req)
 	if err != nil || req == nil || !req.IsTxn {
 		return response, errors.WithStack(err)
 	}
 	for _, elem := range req.Elems {
-		if elem.Op == kv.Put && string(elem.Key) == string(c.partKey) && c.lost.CompareAndSwap(false, true) {
+		if elem.Op == kv.Put && string(elem.Key) == string(c.targetKey) && c.lost.CompareAndSwap(false, true) {
 			return nil, errors.WithStack(c.err)
 		}
 	}
@@ -152,7 +153,7 @@ func testS3LostPartReplyOutcomes(t *testing.T, offloaded bool) {
 			h.waitCleanups()
 			previous, exists := h.part1Descriptor(u)
 			require.True(t, exists)
-			coord := &s3LostPartReplyCoordinator{s3OCCReproCoordinator: h.coord, partKey: u.partKey, err: tc.err}
+			coord := &s3LostMetadataReplyCoordinator{s3OCCReproCoordinator: h.coord, targetKey: u.partKey, err: tc.err}
 			h.server.coordinator = coord
 
 			response := h.uploadPart1(u, "replacement")
@@ -168,6 +169,56 @@ func testS3LostPartReplyOutcomes(t *testing.T, offloaded bool) {
 			require.NoError(t, err, "an uncertain response cannot authorize deleting committed chunks")
 			_, err = h.st.GetAt(t.Context(), u.chunkKey(0, s3ObjectPart(*previous)), ^uint64(0))
 			require.NoError(t, err, "superseded chunks are retired only after confirmed success")
+		})
+	}
+}
+
+func TestS3PutObjectLostCommitReplyPreservesReferencedChunks(t *testing.T) {
+	t.Parallel()
+	for _, offloaded := range []bool{false, true} {
+		name := "inline"
+		if offloaded {
+			name = "offloaded"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			for _, tc := range []struct {
+				name string
+				err  error
+			}{
+				{"unknown", kv.ErrTransactionOutcomeUnknown},
+				{"unknown joined conflict", errors.Join(kv.ErrTransactionOutcomeUnknown, store.ErrWriteConflict)},
+				{"deadline after commit", context.DeadlineExceeded},
+				{"lost transport reply after commit", io.EOF},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					t.Parallel()
+					h := newS3OCCReproModeHarness(t, false, offloaded)
+					const bucket = "lost-put-reply"
+					const object = "obj"
+					require.Equal(t, http.StatusOK, h.do(http.MethodPut, "/"+bucket, "").Code)
+					require.Equal(t, http.StatusOK, h.do(http.MethodPut, "/"+bucket+"/"+object, "original").Code)
+					meta, exists, err := h.server.loadBucketMetaAt(t.Context(), bucket, ^uint64(0))
+					require.NoError(t, err)
+					require.True(t, exists)
+					headKey := s3keys.ObjectManifestKey(bucket, meta.Generation, object)
+					coord := &s3LostMetadataReplyCoordinator{s3OCCReproCoordinator: h.coord, targetKey: headKey, err: tc.err}
+					h.server.coordinator = coord
+
+					response := h.do(http.MethodPut, "/"+bucket+"/"+object, "replacement")
+					require.Equal(t, http.StatusConflict, response.Code)
+					require.Contains(t, response.Body.String(), "<Code>OperationOutcomeUnknown</Code>")
+					require.True(t, coord.lost.Load(), "the failure must follow a real manifest commit")
+					h.waitCleanups()
+					manifest, found, err := h.server.loadObjectManifestAt(t.Context(), headKey, ^uint64(0))
+					require.NoError(t, err)
+					require.True(t, found)
+					require.Equal(t, int64(len("replacement")), manifest.SizeBytes)
+					got := h.do(http.MethodGet, "/"+bucket+"/"+object, "")
+					require.Equal(t, http.StatusOK, got.Code, got.Body.String())
+					require.Equal(t, "replacement", got.Body.String(), "uncertain commit cannot authorize deleting live chunks")
+				})
+			}
 		})
 	}
 }

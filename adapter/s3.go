@@ -1022,7 +1022,9 @@ func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket stri
 	}
 	mutationAttempted, err := s.commitS3PutObject(r.Context(), in, state, upload, bucket)
 	if err != nil {
-		s.cleanupS3PutObjectChunks(r.Context(), state, upload, bucket, objectKey)
+		if !mutationAttempted || isRetryableS3MutationErr(err) {
+			s.cleanupS3PutObjectChunks(r.Context(), state, upload, bucket, objectKey)
+		}
 		writeS3PutObjectCommitError(w, err, mutationAttempted, bucket, objectKey)
 		return
 	}
