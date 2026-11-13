@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"log/slog"
 	"reflect"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -829,10 +828,7 @@ func (c *Coordinate) dispatchAdmitted(ctx context.Context, reqs *OperationGroup[
 //     because it just lost leadership (ErrNotLeader / ErrLeadershipLost
 //     / ErrLeadershipTransferInProgress). Recoverable by re-routing
 //     through the new leader (redirect path).
-//   - Structured forwarding rejections before submission. The forwarding
-//     endpoint carries their reason across gRPC in ErrorInfo details.
-//     Older operational gRPC routes may still flatten sentinels into text;
-//     hasTransientLeaderPhrase retains their bounded compatibility fallback.
+//   - A locally typed leadership rejection before submission.
 //
 // Business-logic failures (write conflict, validation, etc.) are NOT
 // covered here — those must surface to the caller unchanged so client
@@ -848,68 +844,7 @@ func isTransientLeaderError(err error) bool {
 	if errors.Is(err, ErrLeaderNotFound) {
 		return true
 	}
-	if IsForwardNotLeader(err) {
-		return true
-	}
-	if isLeadershipLossError(err) {
-		return true
-	}
-	// Structured forwarding rejections are terminal regardless of their
-	// diagnostic message. The legacy phrase fallback must not override them.
-	if IsForwardWriteConflict(err) || IsForwardTxnLocked(err) ||
-		IsForwardComposed1Violation(err) || IsForwardComposed1VersionGCd(err) {
-		return false
-	}
-	return hasTransientLeaderPhrase(err)
-}
-
-// leaderErrorPhrases is the closed set of wire-level error strings the
-// coordinator is willing to treat as transient once the typed sentinel
-// has been dropped by a gRPC boundary. Keep this list tight — any
-// addition must correspond to an error the system actually emits for
-// leader churn, not a generic "failed" message that happens to mention
-// leaders.
-//
-// Every string here MUST be paired with a kv/raftengine/adapter
-// sentinel in isLeadershipLossError or isTransientLeaderError so the
-// typed-sentinel path catches the same condition when the error chain
-// is intact. TestIsTransientLeaderError_PinsRealSentinels locks the
-// sentinel .Error() texts to this list; a rename on the sentinel side
-// will fail that test and force a matching update here.
-var leaderErrorPhrases = []string{
-	"not leader",                      // adapter.ErrNotLeader, raftengine.ErrNotLeader ("raft engine: not leader")
-	"leader not found",                // kv.ErrLeaderNotFound, adapter.ErrLeaderNotFound
-	"leadership lost",                 // raftengine.ErrLeadershipLost ("raft engine: leadership lost")
-	"leadership transfer in progress", // raftengine.ErrLeadershipTransferInProgress
-}
-
-// hasTransientLeaderPhrase reports whether err.Error() ENDS WITH one of
-// the well-known transient-leader substrings. It is the last resort
-// used after errors.Is fails across a gRPC boundary that strips the
-// original sentinel chain.
-//
-// Suffix matching — not free-form Contains — is load-bearing here:
-// several non-leader errors embed user-controlled text in the middle
-// of their message. store.WriteConflictError, for example, formats as
-// "key: <user-key>: write conflict"; a conflicted key literally named
-// "not leader" would trip a Contains-based classifier and cause the
-// coordinator to spin retries (and reissue with fresh timestamps) on
-// what is actually a terminal business failure. Every wrapper we
-// observe in practice (cockroachdb Wrapf, fmt.Errorf %w-prefix, gRPC
-// status.Errorf's "rpc error: code = X desc = <orig>" form, plus any
-// stacking of those) places the original message at the END of the
-// composed string, so a suffix check is both tight and sufficient.
-func hasTransientLeaderPhrase(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := strings.ToLower(err.Error())
-	for _, phrase := range leaderErrorPhrases {
-		if strings.HasSuffix(msg, phrase) {
-			return true
-		}
-	}
-	return false
+	return isLeadershipLossError(err)
 }
 
 // refreshLeaseAfterDispatch extends the lease only when the dispatch
@@ -1583,7 +1518,11 @@ const (
 
 const maxReadKeys = MaxReadKeys
 
-var ErrLeaderNotFound = errors.New("leader not found")
+type leaderUnavailableSentinel string
+
+func (e leaderUnavailableSentinel) Error() string { return string(e) }
+
+var ErrLeaderNotFound = leaderUnavailableSentinel("leader not found")
 
 func (c *Coordinate) redirect(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
 	if len(reqs.Elems) == 0 {

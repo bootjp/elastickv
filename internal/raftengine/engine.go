@@ -11,18 +11,22 @@ import (
 
 // Shared sentinel errors that both engine implementations should wrap
 // so callers can test with errors.Is across engine backends.
+type leadershipSentinel string
+
+func (e leadershipSentinel) Error() string { return string(e) }
+
 var (
 	// ErrNotLeader indicates the operation was rejected because the
 	// local node is not the Raft leader for the target group.
 	// Callers that care about leadership (e.g. lease invalidation
 	// logic) should match via errors.Is.
-	ErrNotLeader = errors.New("raft engine: not leader")
+	ErrNotLeader = leadershipSentinel("raft engine: not leader")
 	// ErrLeadershipLost indicates the local node was leader when the
 	// operation began but lost leadership before it could complete.
-	ErrLeadershipLost = errors.New("raft engine: leadership lost")
+	ErrLeadershipLost = leadershipSentinel("raft engine: leadership lost")
 	// ErrLeadershipTransferInProgress indicates a leadership transfer
 	// is under way and proposals are being held back.
-	ErrLeadershipTransferInProgress = errors.New("raft engine: leadership transfer in progress")
+	ErrLeadershipTransferInProgress = leadershipSentinel("raft engine: leadership transfer in progress")
 	// ErrLeadershipTransferNoHealthyTarget indicates every supplied
 	// leadership-transfer target failed the leader-side eligibility
 	// checks.

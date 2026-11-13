@@ -59,14 +59,17 @@ func TestIsTransientLeaderError_Classification(t *testing.T) {
 		{"raftengine.ErrLeadershipLost", cerrors.WithStack(raftengine.ErrLeadershipLost), true},
 		{"raftengine.ErrLeadershipTransferInProgress",
 			cerrors.WithStack(raftengine.ErrLeadershipTransferInProgress), true},
-		{"wire not-leader string", errors.New("not leader"), true},
-		{"wire leader-not-found string", errors.New("leader not found"), true},
-		{"wire leadership-lost string", errors.New("raft engine: leadership lost"), true},
+		{"marked raftengine.ErrNotLeader",
+			cerrors.Mark(errors.New("engine rejected proposal"), raftengine.ErrNotLeader), true},
+		{"wire not-leader string", errors.New("not leader"), false},
+		{"wire exact raft not-leader string", errors.New(raftengine.ErrNotLeader.Error()), false},
+		{"wire leader-not-found string", errors.New("leader not found"), false},
+		{"wire leadership-lost string", errors.New("raft engine: leadership lost"), false},
 		{"wire leadership-transfer string",
-			errors.New("raft engine: leadership transfer in progress"), true},
-		{"gRPC status wrapping not leader", fmt.Errorf("rpc error: code = Unknown desc = not leader"), true},
+			errors.New("raft engine: leadership transfer in progress"), false},
+		{"gRPC status wrapping not leader", fmt.Errorf("rpc error: code = Unknown desc = not leader"), false},
 		{"gRPC status wrapping leadership lost",
-			fmt.Errorf("rpc error: code = Unknown desc = raft engine: leadership lost"), true},
+			fmt.Errorf("rpc error: code = Unknown desc = raft engine: leadership lost"), false},
 		{"unrelated error", errors.New("write conflict"), false},
 		{"validation error", errors.New("invalid request"), false},
 		{"leader proxy circuit open", cerrors.WithStack(ErrLeaderProxyCircuitOpen), false},
@@ -119,14 +122,11 @@ func newRetryCoordinate(tx Transactional) *Coordinate {
 func TestCoordinateDispatch_RetriesTransientLeaderError(t *testing.T) {
 	t.Parallel()
 
-	// First two Commit calls fail with transient leader signals (once via
-	// the typed raftengine sentinel, once via the wire-level string that
-	// gRPC would transport); the third succeeds. Dispatch must absorb
-	// both and return success without leaking the transient error.
+	// Both typed local leader failures are safe to retry before submission.
 	tx := &scriptedTransactional{
 		errs: map[uint64]error{
 			0: cerrors.WithStack(raftengine.ErrNotLeader),
-			1: errors.New("leader not found"),
+			1: cerrors.WithStack(ErrLeaderNotFound),
 		},
 	}
 	c := newRetryCoordinate(tx)
@@ -142,6 +142,19 @@ func TestCoordinateDispatch_RetriesTransientLeaderError(t *testing.T) {
 	// bound of ~50ms; anything shorter would mean the loop skipped its
 	// back-off.
 	require.GreaterOrEqual(t, time.Since(start), 2*dispatchLeaderRetryInterval)
+}
+
+func TestCoordinateDispatch_UnmarkedLeaderTextSurfacesImmediately(t *testing.T) {
+	t.Parallel()
+	wireErr := errors.New("rpc error: code = Unavailable desc = leader not found")
+	tx := &scriptedTransactional{errs: map[uint64]error{0: wireErr}}
+	c := newRetryCoordinate(tx)
+
+	_, err := c.Dispatch(context.Background(), &OperationGroup[OP]{
+		Elems: []*Elem[OP]{{Op: Put, Key: []byte("k"), Value: []byte("v")}},
+	})
+	require.Error(t, err)
+	require.EqualValues(t, 1, tx.commits.Load())
 }
 
 func TestCoordinateDispatch_NonTransientErrorSurfacesImmediately(t *testing.T) {
@@ -273,20 +286,7 @@ func TestCoordinateDispatch_SuccessBeatsConcurrentCancel(t *testing.T) {
 	require.Greater(t, resp.CommitIndex, uint64(0))
 }
 
-// TestIsTransientLeaderError_PinsRealSentinels asserts that the real
-// .Error() texts of the upstream sentinels we classify as transient
-// still pass through isTransientLeaderError. If a future rename of
-// these messages drifts them out of leaderErrorPhrases' closed list,
-// this test catches it at CI time rather than during a production
-// re-election window. Pinning kv.ErrLeaderNotFound covers the
-// wire-level phrase "leader not found"; raftengine.ErrNotLeader
-// covers the string-fallback path ("not leader" substring) after the
-// sentinel identity has been lost during transport.
-//
-// adapter.ErrNotLeader is not pinned here because adapter imports kv,
-// which would create a test-time import cycle. A symmetric pin lives
-// in the adapter test package alongside that sentinel.
-func TestIsTransientLeaderError_PinsRealSentinels(t *testing.T) {
+func TestIsTransientLeaderErrorRequiresTypedCause(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
@@ -302,13 +302,10 @@ func TestIsTransientLeaderError_PinsRealSentinels(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			// A bare errors.New with the same text still matches CockroachDB's
-			// network error identity. Include the transport's diagnostic prefix.
 			wireErr := errors.New("rpc error: code = Unavailable desc = " + tc.err.Error())
 			require.False(t, cerrors.Is(wireErr, tc.err), "fixture must bypass sentinel matching")
-			require.True(t, isTransientLeaderError(wireErr),
-				"sentinel %q (%q) no longer classified as transient — update leaderErrorPhrases or the classifier",
-				tc.name, tc.err.Error())
+			require.False(t, isTransientLeaderError(wireErr), "wire text is not pre-submission evidence")
+			require.True(t, isTransientLeaderError(cerrors.WithStack(tc.err)), tc.name)
 		})
 	}
 }
