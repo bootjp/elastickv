@@ -175,7 +175,7 @@ func (s *S3Server) commitS3PutObject(ctx context.Context, in *s3PutObjectInput, 
 		&kv.Elem[kv.OP]{Op: kv.Put, Key: state.headKey, Value: body},
 	)
 	dispatchCtx := state.readTimestamp.WithDispatchVoucher(ctx)
-	_, err = kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, &kv.OperationGroup[kv.OP]{
+	err = s.dispatchS3MetadataMutation(dispatchCtx, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
 		StartTS:  state.startTS,
 		CommitTS: commitTS,

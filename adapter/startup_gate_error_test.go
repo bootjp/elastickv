@@ -133,7 +133,7 @@ func (c *availabilityErrorCoordinator) Dispatch(context.Context, *kv.OperationGr
 	return nil, c.err
 }
 
-func TestS3CreateMultipartUploadMapsAvailabilityErrorsTo503(t *testing.T) {
+func TestS3CreateMultipartUploadMapsDispatchErrors(t *testing.T) {
 	t.Parallel()
 
 	st := store.NewMVCCStore()
@@ -147,11 +147,13 @@ func TestS3CreateMultipartUploadMapsAvailabilityErrorsTo503(t *testing.T) {
 	}
 
 	tests := []struct {
-		name string
-		err  error
+		name       string
+		err        error
+		wantStatus int
+		wantCode   string
 	}{
-		{name: "circuit open", err: kv.ErrLeaderProxyCircuitOpen},
-		{name: "grpc unavailable", err: crdberrors.Wrap(status.Error(codes.Unavailable, "startup gate closed"), "dispatch")},
+		{name: "circuit open", err: kv.ErrLeaderProxyCircuitOpen, wantStatus: http.StatusServiceUnavailable, wantCode: "ServiceUnavailable"},
+		{name: "grpc unavailable", err: crdberrors.Wrap(status.Error(codes.Unavailable, "startup gate closed"), "dispatch"), wantStatus: http.StatusConflict, wantCode: "OperationOutcomeUnknown"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -166,11 +168,11 @@ func TestS3CreateMultipartUploadMapsAvailabilityErrorsTo503(t *testing.T) {
 				"bucket-a",
 				"key",
 			)
-			if rec.Code != http.StatusServiceUnavailable {
-				t.Fatalf("status=%d, want 503: %s", rec.Code, rec.Body.String())
+			if rec.Code != tt.wantStatus {
+				t.Fatalf("status=%d, want %d: %s", rec.Code, tt.wantStatus, rec.Body.String())
 			}
-			if body := rec.Body.String(); !strings.Contains(body, "<Code>ServiceUnavailable</Code>") {
-				t.Fatalf("body %q does not contain ServiceUnavailable", body)
+			if body := rec.Body.String(); !strings.Contains(body, "<Code>"+tt.wantCode+"</Code>") {
+				t.Fatalf("body %q does not contain %s", body, tt.wantCode)
 			}
 		})
 	}

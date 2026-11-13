@@ -224,7 +224,7 @@ func (s *S3Server) commitS3MultipartCompletionAttempt(ctx context.Context, bucke
 		return completion, nil, errors.WithStack(err)
 	}
 	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
-	_, err = kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, &kv.OperationGroup[kv.OP]{
+	err = s.dispatchS3MetadataMutation(dispatchCtx, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
 		StartTS:  startTS,
 		CommitTS: commitTS,

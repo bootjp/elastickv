@@ -14,7 +14,7 @@ func (s *S3Server) dispatchBucketDeleteTxn(ctx context.Context, snapshot kv.Read
 	if err != nil {
 		return err
 	}
-	_, err = kv.DispatchWithReadTimestamp(snapshot.WithDispatchVoucher(ctx), s.coordinator, &kv.OperationGroup[kv.OP]{
+	err = s.dispatchS3MetadataMutation(snapshot.WithDispatchVoucher(ctx), &kv.OperationGroup[kv.OP]{
 		IsTxn: true, StartTS: snapshot.Timestamp(), Elems: elems,
 	})
 	return errors.WithStack(err)

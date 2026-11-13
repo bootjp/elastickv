@@ -754,7 +754,7 @@ func (s *S3Server) createBucket(w http.ResponseWriter, r *http.Request, bucket s
 			},
 		}
 		dispatchCtx := readTimestamp.WithDispatchVoucher(r.Context())
-		_, err = kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, req)
+		err = s.dispatchS3MetadataMutation(dispatchCtx, req)
 		return errors.WithStack(err)
 	})
 	if err != nil {
@@ -980,7 +980,7 @@ func (s *S3Server) putBucketAcl(w http.ResponseWriter, r *http.Request, bucket s
 			return errors.WithStack(err)
 		}
 		dispatchCtx := readTimestamp.WithDispatchVoucher(r.Context())
-		_, err = kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, &kv.OperationGroup[kv.OP]{
+		err = s.dispatchS3MetadataMutation(dispatchCtx, &kv.OperationGroup[kv.OP]{
 			IsTxn:   true,
 			StartTS: startTS,
 			Elems: []*kv.Elem[kv.OP]{
@@ -1348,7 +1348,7 @@ func (s *S3Server) createMultipartUpload(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	dispatchCtx := readTimestamp.WithDispatchVoucher(r.Context())
-	if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, &kv.OperationGroup[kv.OP]{
+	if err := s.dispatchS3MetadataMutation(dispatchCtx, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
 		StartTS:  startTS,
 		CommitTS: commitTS,
@@ -1475,7 +1475,7 @@ func (s *S3Server) abortMultipartUpload(w http.ResponseWriter, r *http.Request, 
 
 		// Transactional delete with startTS fencing — conflicts with concurrent Complete.
 		dispatchCtx := readTimestamp.WithDispatchVoucher(r.Context())
-		_, err = kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, &kv.OperationGroup[kv.OP]{
+		err = s.dispatchS3MetadataMutation(dispatchCtx, &kv.OperationGroup[kv.OP]{
 			IsTxn:   true,
 			StartTS: startTS,
 			Elems: []*kv.Elem[kv.OP]{
@@ -2754,7 +2754,7 @@ func (s *S3Server) dispatchConditionalObjectDelete(
 			err.Error(), bucket, objectKey)
 	}
 	dispatchCtx := readTimestamp.WithDispatchVoucher(r.Context())
-	if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, &kv.OperationGroup[kv.OP]{
+	if err := s.dispatchS3MetadataMutation(dispatchCtx, &kv.OperationGroup[kv.OP]{
 		IsTxn:   true,
 		StartTS: startTS,
 		Elems: []*kv.Elem[kv.OP]{
