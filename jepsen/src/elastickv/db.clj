@@ -210,7 +210,8 @@
   "Builds the production server argv for one managed Jepsen node."
   [{:keys [node grpc redis dynamo s3 sqs sqs-region data-dir raft-engine
            raft-redis-map raft-dynamo-map raft-s3-map raft-sqs-map raft-groups shard-ranges
-           filesystem-mount encryption migration-enabled bootstrap? join-as-learner join-members]}]
+           filesystem-mount encryption migration-enabled bootstrap? join-as-learner join-members
+           auto-split-args]}]
   (cond-> ["--address" grpc
            "--redisAddress" redis
            "--raftId" (name node)
@@ -225,6 +226,7 @@
     filesystem-mount (conj "--filesystemMount" filesystem-mount)
     (seq raft-groups) (conj "--raftGroups" (build-raft-groups-arg node raft-groups))
     (seq shard-ranges) (conj "--shardRanges" shard-ranges)
+    (seq auto-split-args) (into auto-split-args)
     ;; Isolated migration tests intentionally use unauthenticated helpers.
     migration-enabled (conj "--adminInsecureNoAuth")
     encryption (conj "--encryptionSidecarPath" sidecar-file
@@ -312,7 +314,7 @@
         (c/exec :bash "-c" (unmount-filesystem-cmd mount-dir))))))
 
 (defn- start-node!
-  [test node {:keys [bootstrap-node grpc-port redis-port dynamo-port s3-port sqs-port sqs-region data-dir raft-groups shard-ranges raft-engine server-env migration-enabled filesystem-mount encryption join-as-learner join-members]}]
+  [test node {:keys [bootstrap-node grpc-port redis-port dynamo-port s3-port sqs-port sqs-region data-dir raft-groups shard-ranges raft-engine server-env migration-enabled filesystem-mount encryption join-as-learner join-members auto-split-args]}]
   (when (and (seq raft-groups)
              (> (count raft-groups) 1)
              (nil? shard-ranges))
@@ -339,7 +341,7 @@
                 :raft-groups raft-groups :shard-ranges shard-ranges
                 :filesystem-mount mount-dir :encryption encryption :migration-enabled migration-enabled
                 :bootstrap? bootstrap? :join-as-learner join-as-learner
-                :join-members join-members})
+                :join-members join-members :auto-split-args auto-split-args})
         effective-server-env (cond-> (or server-env {})
                                migration-enabled
                                (merge {"ELASTICKV_ENABLE_MIGRATION_IMPORT_OPCODE" "true"
