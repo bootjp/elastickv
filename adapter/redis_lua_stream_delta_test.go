@@ -482,19 +482,7 @@ func TestLuaStreamDeltaCommitCarriesTypeAndMetaReadFences(t *testing.T) {
 		[]byte("1"), key,
 	})
 	require.Empty(t, conn.err)
-	want := append([][]byte{}, redisTxnWideCollectionFenceKeys(key)...)
-	want = append(want,
-		store.StreamMetaKey(key),
-		redisStrKey(key),
-		redisHLLKey(key),
-		key,
-		store.ListMetaKey(key),
-		redisHashKey(key),
-		redisSetKey(key),
-		redisZSetKey(key),
-		redisStreamKey(key),
-	)
-	requireReadKeysMatch(t, coord.lastReadKeys, want)
+	requireReadKeysMatch(t, coord.lastReadKeys, redisTxnReadFencePointKeys(key))
 }
 
 func TestLuaStreamAbsentCreateReadFenceRejectsConcurrentString(t *testing.T) {
