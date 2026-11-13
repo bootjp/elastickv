@@ -41,8 +41,7 @@ type Splitter interface {
 	SplitRange(ctx context.Context, req SplitRequest) (SplitResult, error)
 }
 
-// SplitRequest is the scheduler's stable request surface. TargetGroupID is
-// carried for the post-M2 hook; M3 standalone always sends zero.
+// SplitRequest is the scheduler's stable request surface.
 type SplitRequest struct {
 	ExpectedCatalogVersion uint64
 	RouteID                uint64
@@ -53,10 +52,11 @@ type SplitRequest struct {
 	ParentGroupID          uint64
 }
 
-// SplitResult contains the committed catalog version and children when
-// SplitRange succeeds.
+// SplitResult contains the catalog version and either same-group children or
+// the job ID of a started cross-group migration.
 type SplitResult struct {
 	CatalogVersion uint64
+	JobID          uint64
 	Left           distribution.RouteDescriptor
 	Right          distribution.RouteDescriptor
 }
@@ -91,19 +91,21 @@ type GroupLeadershipSnapshot func(groupID uint64) (bool, uint64)
 
 // SchedulerConfig controls background auto-split execution.
 type SchedulerConfig struct {
-	Enabled         bool
-	Detector        Config
-	EvalInterval    time.Duration
-	SplitCooldown   time.Duration
-	SplitTimeout    time.Duration
-	KillSwitchFile  string
-	KillSwitch      KillSwitch
-	IsLeader        func() bool
-	Leadership      LeadershipSnapshot
-	GroupLeadership GroupLeadershipSnapshot
-	Logger          *slog.Logger
-	Reconciler      *RouteReconciler
-	Observer        Observer
+	Enabled           bool
+	CrossGroupEnabled bool
+	CandidateGroupIDs []uint64
+	Detector          Config
+	EvalInterval      time.Duration
+	SplitCooldown     time.Duration
+	SplitTimeout      time.Duration
+	KillSwitchFile    string
+	KillSwitch        KillSwitch
+	IsLeader          func() bool
+	Leadership        LeadershipSnapshot
+	GroupLeadership   GroupLeadershipSnapshot
+	Logger            *slog.Logger
+	Reconciler        *RouteReconciler
+	Observer          Observer
 	// Now supplies the wall clock a cycle is stamped with. Defaults to
 	// time.Now. It exists so tests can prove Run stamps cycles at processing
 	// time rather than with the ticker payload.
@@ -287,13 +289,17 @@ func (s *Scheduler) Tick(ctx context.Context, now time.Time) (SchedulerResult, e
 	if err != nil {
 		return out, err
 	}
-	prep.result.Detector = s.evaluateTick(now, prep)
+	prep.result.Detector = s.evaluateTick(now, &prep)
+	if err := s.prepareCrossGroupTick(ctx, &prep, now, runtimeEnabled); err != nil {
+		return out, err
+	}
 	return s.finishTick(ctx, runtimeEnabled, prep), nil
 }
 
 type tickPreparation struct {
 	snapshot         distribution.CatalogSnapshot
 	routes           []distribution.RouteDescriptor
+	windows          []ColumnWindow
 	fences           map[uint64]EvidenceFence
 	usedBudget       int
 	catalogGap       bool
@@ -362,11 +368,12 @@ func (s *Scheduler) syncCatalogSnapshot(
 	return s.routesLedLocally(snapshot.Routes, now)
 }
 
-func (s *Scheduler) evaluateTick(now time.Time, prep tickPreparation) Result {
+func (s *Scheduler) evaluateTick(now time.Time, prep *tickPreparation) Result {
 	if prep.stopAfterPrepare {
 		return Result{}
 	}
 	windows := s.committedWindows(prep.routes, now)
+	prep.windows = windows
 	s.resetConfidenceForHistoryGaps(prep.routes, windows)
 	if prep.catalogGap {
 		if prep.fences == nil {
@@ -520,9 +527,14 @@ func (s *Scheduler) executeSplit(
 		}
 		return SplitResult{}, errors.Wrap(err, "autosplit: split range")
 	}
-	s.cfg.Logger.InfoContext(ctx, "autosplit: split committed",
+	message := "autosplit: split committed"
+	if result.JobID != 0 {
+		message = "autosplit: migration job started"
+	}
+	s.cfg.Logger.InfoContext(ctx, message,
 		slog.Uint64("route_id", routeID),
 		slog.Uint64("catalog_version", result.CatalogVersion),
+		slog.Uint64("job_id", result.JobID),
 		slog.String("split_key", loggedSplitKey(splitKey)),
 		slog.String("split_origin", string(splitOrigin)))
 	return result, nil
@@ -554,12 +566,16 @@ func (s *Scheduler) executeDecisions(ctx context.Context, catalogVersion uint64,
 }
 
 func (s *Scheduler) executeDecision(ctx context.Context, catalogVersion uint64, decision Decision) (uint64, error) {
+	targetGroupID := decision.TargetGroupID
+	if decision.SplitOrigin == SplitOriginIsolationCompound {
+		targetGroupID = 0
+	}
 	first, err := s.executeSplit(
 		ctx,
 		catalogVersion,
 		decision.RouteID,
 		decision.SplitKey,
-		decision.TargetGroupID,
+		targetGroupID,
 		decision.RouteStart,
 		decision.RouteEnd,
 		decision.RouteGroupID,

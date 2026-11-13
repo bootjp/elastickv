@@ -165,6 +165,7 @@ func startDistributionStartup(in distributionStartupInput) (distributionStartup,
 		autosplit.NewPrometheusObserver(in.metricsRegistry.Registerer()),
 		in.keyViz,
 		in.autoSplit,
+		noderuntime.ShardGroupIDs(in.shardGroups),
 	)
 	if err != nil {
 		return distributionStartup{}, err

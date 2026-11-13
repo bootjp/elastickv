@@ -282,6 +282,9 @@ func setupDemoDistributionRuntime(
 	if err != nil {
 		return demoDistributionRuntime{}, errors.Wrap(err, "configure auto-split")
 	}
+	if runtime.autoSplitCfg.CrossGroupEnabled {
+		return demoDistributionRuntime{}, errors.New("--autoSplitCrossGroup requires the multi-group server")
+	}
 	runtime.autoSplitCfg.Observer = autosplit.NewPrometheusObserver(metricsRegistry.Registerer())
 	runtime.sampler = buildDemoKeyVizSampler()
 	serverwiring.SeedRoutes(runtime.sampler, runtime.engine)

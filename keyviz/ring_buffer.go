@@ -88,10 +88,11 @@ func cloneColumn(col MatrixColumn) MatrixColumn {
 		hotKeys[i] = cloneHotKeysSnapshot(snapshot)
 	}
 	return MatrixColumn{
-		WindowStart: col.WindowStart,
-		At:          col.At,
-		Rows:        rows,
-		HotKeys:     hotKeys,
+		WindowStart:  col.WindowStart,
+		At:           col.At,
+		Rows:         rows,
+		HotKeys:      hotKeys,
+		openRouteSeq: col.openRouteSeq,
 	}
 }
 

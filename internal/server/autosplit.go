@@ -30,10 +30,15 @@ func setupDistributionWatcherAndAutoSplit(
 	observer autosplit.Observer,
 	keyVizFlags *serverwiring.KeyVizFlags,
 	autoSplitFlags *serverwiring.AutoSplitFlags,
+	groupIDs []uint64,
 ) (adapter.AutoSplitRuntime, error) {
 	cfg, err := autoSplitFlags.SchedulerConfig(coordinate, keyVizFlags)
 	if err != nil {
 		return nil, errors.Wrap(err, "configure auto-split")
+	}
+	cfg.CandidateGroupIDs = groupIDs
+	if cfg.CrossGroupEnabled && len(groupIDs) < 2 {
+		return nil, errors.New("--autoSplitCrossGroup requires at least two configured Raft groups")
 	}
 	cfg.Observer = observer
 	var runtime adapter.AutoSplitRuntime

@@ -14,12 +14,21 @@ import (
 func TestAutoSplitCanonicalFlagsAreRegistered(t *testing.T) {
 	t.Parallel()
 
-	for _, name := range []string{"autoSplitCooldown", "autoSplitThreshold", "autoSplitMaxPerCycle"} {
+	for _, name := range []string{"autoSplitCooldown", "autoSplitThreshold", "autoSplitMaxPerCycle", "autoSplitCrossGroup"} {
 		require.NotNil(t, flag.CommandLine.Lookup(name), name)
 	}
 	for _, name := range []string{"autoSplitSplitCooldown", "autoSplitThresholdOpsMin", "autoSplitMaxSplitsPerCycle"} {
 		require.Nil(t, flag.CommandLine.Lookup(name), name)
 	}
+}
+
+func TestCrossGroupAutoSplitRequiresMultipleGroups(t *testing.T) {
+	flags := defaultServerFlags()
+	*flags.autoSplit.Enabled = true
+	*flags.autoSplit.CrossGroup = true
+	_, err := setupDistributionWatcherAndAutoSplit(context.Background(), nil, nil, nil, nil, nil,
+		nil, nil, flags.keyViz, flags.autoSplit, []uint64{1})
+	require.ErrorContains(t, err, "at least two configured Raft groups")
 }
 
 func TestSetupDistributionWatcherAndAutoSplitReturnsNilRuntimeWhenDisabled(t *testing.T) {
@@ -39,7 +48,7 @@ func TestSetupDistributionWatcherAndAutoSplitReturnsNilRuntimeWhenDisabled(t *te
 	require.NoError(t, err)
 
 	var eg errgroup.Group
-	runtime, err := setupDistributionWatcherAndAutoSplit(ctx, &eg, catalog, distribution.NewEngine(), nil, nil, nil, nil, flags.keyViz, flags.autoSplit)
+	runtime, err := setupDistributionWatcherAndAutoSplit(ctx, &eg, catalog, distribution.NewEngine(), nil, nil, nil, nil, flags.keyViz, flags.autoSplit, nil)
 	require.NoError(t, err)
 	require.Nil(t, runtime)
 

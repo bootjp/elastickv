@@ -388,6 +388,62 @@ func TestSchedulerExecutesCompoundIsolationBackToBack(t *testing.T) {
 	require.Len(t, source.snapshot.Routes, 3)
 }
 
+func TestSchedulerKeepsCompoundSameGroupWithTarget(t *testing.T) {
+	t.Parallel()
+	source := &fakeCatalogSnapshotSource{snapshot: distribution.CatalogSnapshot{
+		Version: 7,
+		Routes:  []distribution.RouteDescriptor{testRoute(1, 1, "a", "z")},
+	}}
+	splitter := &fakeSplitter{}
+	splitter.onSuccess = func(req SplitRequest, result SplitResult) { applyFakeSplit(source, req, result) }
+	scheduler := newTestScheduler(source, splitter, nil, nil)
+	decision := testCompoundDecision()
+	decision.TargetGroupID = 2
+
+	_, err := scheduler.executeDecision(context.Background(), 7, decision)
+
+	require.NoError(t, err)
+	require.Len(t, splitter.requests, 2)
+	require.Zero(t, splitter.requests[0].TargetGroupID)
+	require.Zero(t, splitter.requests[1].TargetGroupID)
+	var nonSingleton distribution.RouteDescriptor
+	for _, route := range source.snapshot.Routes {
+		if bytes.Equal(route.Start, []byte("a")) && bytes.Equal(route.End, []byte("m")) {
+			nonSingleton = route
+		}
+	}
+	require.NotZero(t, nonSingleton.RouteID)
+	_, err = scheduler.executeDecision(context.Background(), source.snapshot.Version, Decision{
+		RouteID: nonSingleton.RouteID, SplitKey: []byte("g"), SplitOrigin: SplitOriginP50Mid,
+		TargetGroupID: 2, RouteStart: nonSingleton.Start, RouteEnd: nonSingleton.End,
+		RouteGroupID: nonSingleton.GroupID,
+	})
+	require.NoError(t, err)
+	require.Len(t, splitter.requests, 3)
+	require.Equal(t, nonSingleton.RouteID, splitter.requests[2].RouteID)
+	require.Equal(t, uint64(2), splitter.requests[2].TargetGroupID)
+}
+
+func TestSchedulerForwardsSingleSplitTarget(t *testing.T) {
+	t.Parallel()
+	source := &fakeCatalogSnapshotSource{snapshot: distribution.CatalogSnapshot{
+		Version: 7,
+		Routes:  []distribution.RouteDescriptor{testRoute(1, 1, "a", "z")},
+	}}
+	splitter := &fakeSplitter{}
+	scheduler := newTestScheduler(source, splitter, nil, nil)
+	decision := Decision{
+		RouteID: 1, SplitKey: []byte("m"), SplitOrigin: SplitOriginP50Mid,
+		TargetGroupID: 2, RouteStart: []byte("a"), RouteEnd: []byte("z"), RouteGroupID: 1,
+	}
+
+	_, err := scheduler.executeDecision(context.Background(), 7, decision)
+
+	require.NoError(t, err)
+	require.Len(t, splitter.requests, 1)
+	require.Equal(t, uint64(2), splitter.requests[0].TargetGroupID)
+}
+
 func TestSchedulerCompoundUsesNormalizedCommittedBoundary(t *testing.T) {
 	t.Parallel()
 	source := &fakeCatalogSnapshotSource{snapshot: distribution.CatalogSnapshot{
