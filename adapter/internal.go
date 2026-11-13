@@ -212,9 +212,13 @@ type Internal struct {
 
 var _ pb.InternalServer = (*Internal)(nil)
 
-var ErrNotLeader = errors.New("not leader")
+type adapterLeaderSentinel string
+
+func (e adapterLeaderSentinel) Error() string { return string(e) }
+
+var ErrNotLeader = adapterLeaderSentinel("not leader")
 var ErrKVForwardNotSupported = errors.New("kv forward not supported on this raft group")
-var ErrLeaderNotFound = errors.New("leader not found")
+var ErrLeaderNotFound = adapterLeaderSentinel("leader not found")
 var ErrTxnTimestampOverflow = errors.New("txn timestamp overflow")
 
 const (

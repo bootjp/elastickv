@@ -110,7 +110,7 @@ type AdminPrincipal struct {
 // translates this to 503 + Retry-After: 1 today; the future
 // AdminForward RPC catches it as the trigger to forward to the
 // leader instead.
-var ErrAdminNotLeader = errors.New("dynamodb admin: this node is not the raft leader")
+var ErrAdminNotLeader = adapterLeaderSentinel("dynamodb admin: this node is not the raft leader")
 
 // ErrAdminForbidden is returned when the principal lacks the role
 // required for the operation. Admin handlers translate this to 403

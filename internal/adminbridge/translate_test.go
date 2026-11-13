@@ -7,6 +7,7 @@ import (
 
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/internal/admin"
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	crdberrors "github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
@@ -25,12 +26,11 @@ func TestTranslateAdminTablesError_LeaderChurn(t *testing.T) {
 	}{
 		{"kv.ErrLeaderNotFound", kv.ErrLeaderNotFound},
 		{"kv.ErrLeaderProxyCircuitOpen", kv.ErrLeaderProxyCircuitOpen},
+		{"wrapped circuit open", crdberrors.WithStack(kv.ErrLeaderProxyCircuitOpen)},
 		{"adapter.ErrNotLeader", adapter.ErrNotLeader},
 		{"adapter.ErrLeaderNotFound", adapter.ErrLeaderNotFound},
-		{"wrapped not leader", errors.New("dispatch failed: not leader")},
-		{"wrapped leader not found", errors.New("dispatch: leader not found")},
-		{"wrapped leadership lost", errors.New("commit aborted: leadership lost")},
-		{"wrapped leadership transfer", errors.New("retry exhausted: leadership transfer in progress")},
+		{"marked raft not leader", crdberrors.Mark(errors.New("rejected"), raftengine.ErrNotLeader)},
+		{"typed transfer in progress", crdberrors.WithStack(raftengine.ErrLeadershipTransferInProgress)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -41,16 +41,10 @@ func TestTranslateAdminTablesError_LeaderChurn(t *testing.T) {
 	}
 }
 
-// TestTranslateAdminTablesError_LeaderPhraseInMiddleOfMessage covers
-// the false-positive class P2 review flagged: a message that
-// happens to contain a leader phrase NOT at the suffix must NOT
-// be classified as leader-churn. Switching from strings.Contains
-// to strings.HasSuffix is what makes this test pass.
+// A leader phrase inside a validation error is not a typed rejection.
 func TestTranslateAdminTablesError_LeaderPhraseInMiddleOfMessage(t *testing.T) {
 	t.Parallel()
 	cases := []string{
-		// Phrase mid-message — kv-internal sentinels never look
-		// like this; they always end with the canonical phrase.
 		"not leader: actually a downstream error",
 		"leader not found, but recovered automatically",
 		"leadership lost mid-snapshot, retried successfully",
@@ -126,10 +120,8 @@ func TestTranslateAdminItemsError_LeaderChurn(t *testing.T) {
 		{"kv.ErrLeaderProxyCircuitOpen", kv.ErrLeaderProxyCircuitOpen},
 		{"adapter.ErrNotLeader", adapter.ErrNotLeader},
 		{"adapter.ErrLeaderNotFound", adapter.ErrLeaderNotFound},
-		{"wrapped not leader", errors.New("dispatch failed: not leader")},
-		{"wrapped leader not found", errors.New("dispatch: leader not found")},
-		{"wrapped leadership lost", errors.New("commit aborted: leadership lost")},
-		{"wrapped leadership transfer", errors.New("retry exhausted: leadership transfer in progress")},
+		{"marked raft not leader", crdberrors.Mark(errors.New("rejected"), raftengine.ErrNotLeader)},
+		{"typed transfer in progress", crdberrors.WithStack(raftengine.ErrLeadershipTransferInProgress)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -175,7 +167,7 @@ func TestTranslateAdminItemsError_ValidationPreservesAdapterMessage(t *testing.T
 // TestTranslateAdminTablesError_LeaderChurn. AdminDeleteQueue clears
 // the upfront isVerifiedSQSLeader check but the kv coordinator can
 // still drop leadership inside deleteQueueWithRetry's Dispatch; the
-// resulting ErrLeaderNotFound / ErrNotLeader / wrapped suffixes must
+// resulting typed ErrLeaderNotFound / ErrNotLeader must
 // classify as 503 leader_unavailable, not the generic 500 fallthrough.
 func TestTranslateAdminQueuesError_LeaderChurn(t *testing.T) {
 	t.Parallel()
@@ -187,10 +179,8 @@ func TestTranslateAdminQueuesError_LeaderChurn(t *testing.T) {
 		{"kv.ErrLeaderProxyCircuitOpen", kv.ErrLeaderProxyCircuitOpen},
 		{"adapter.ErrNotLeader", adapter.ErrNotLeader},
 		{"adapter.ErrLeaderNotFound", adapter.ErrLeaderNotFound},
-		{"wrapped not leader", errors.New("dispatch failed: not leader")},
-		{"wrapped leader not found", errors.New("dispatch: leader not found")},
-		{"wrapped leadership lost", errors.New("commit aborted: leadership lost")},
-		{"wrapped leadership transfer", errors.New("retry exhausted: leadership transfer in progress")},
+		{"marked raft not leader", crdberrors.Mark(errors.New("rejected"), raftengine.ErrNotLeader)},
+		{"typed transfer in progress", crdberrors.WithStack(raftengine.ErrLeadershipTransferInProgress)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -201,12 +191,7 @@ func TestTranslateAdminQueuesError_LeaderChurn(t *testing.T) {
 	}
 }
 
-// TestTranslateAdminQueuesError_LeaderPhraseInMiddleOfMessage is the
-// SQS counterpart of the same Tables test — pins that the HasSuffix
-// matcher in isLeaderChurnError does not false-positive on
-// user-supplied error messages that happen to mention a leader
-// phrase mid-string (e.g. a queue name or attribute value that
-// happens to contain "not leader").
+// A leader phrase inside a queue error is not a typed rejection.
 func TestTranslateAdminQueuesError_LeaderPhraseInMiddleOfMessage(t *testing.T) {
 	t.Parallel()
 	cases := []string{
@@ -219,6 +204,38 @@ func TestTranslateAdminQueuesError_LeaderPhraseInMiddleOfMessage(t *testing.T) {
 			out := translateAdminQueuesError(errors.New(msg))
 			require.NotErrorIs(t, out, admin.ErrQueuesNotLeader,
 				"mid-message leader phrase %q must not classify as leader-churn", msg)
+		})
+	}
+}
+
+func TestAdminBridgeRejectsUnprovenLeaderTextAndUnknownOutcome(t *testing.T) {
+	t.Parallel()
+	translators := []struct {
+		name string
+		fn   func(error) error
+	}{
+		{"tables", translateAdminTablesError},
+		{"items", translateAdminItemsError},
+		{"buckets", translateAdminBucketsError},
+		{"objects", translateAdminObjectsError},
+		{"queues", translateAdminQueuesError},
+	}
+	for _, translator := range translators {
+		t.Run(translator.name, func(t *testing.T) {
+			t.Parallel()
+			for _, message := range []string{
+				"not leader", "leader not found", "raft engine: leadership lost",
+				"rpc error: code = Unavailable desc = leader proxy circuit open",
+				adapter.ErrAdminNotLeader.Error(),
+			} {
+				unproven := errors.New(message)
+				require.Equal(t, unproven, translator.fn(unproven), message)
+			}
+			unknown := errors.Join(kv.ErrTransactionOutcomeUnknown, adapter.ErrAdminNotLeader)
+			require.Equal(t, unknown, translator.fn(unknown))
+			unknownLeader := errors.Join(kv.ErrTransactionOutcomeUnknown, raftengine.ErrNotLeader)
+			require.Equal(t, unknownLeader, translator.fn(unknownLeader))
+			require.Equal(t, raftengine.ErrLeadershipLost, translator.fn(raftengine.ErrLeadershipLost))
 		})
 	}
 }
