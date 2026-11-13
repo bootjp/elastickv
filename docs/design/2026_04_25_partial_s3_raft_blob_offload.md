@@ -636,6 +636,16 @@ capability-advertising peers exists.
 | M3 | Reference-count + grace-period GC (the queue-based scheme in §3.5). | In progress: the §3.5 keyspaces (`!s3\|chunkref-rc\|`, `!s3\|chunkblob-gc-queue\|`) and their codecs are implemented in `internal/s3keys/chunkblob_gc.go`. Queue timestamps are HLC commit timestamps, and `ChunkBlobGCGraceBoundary` converts a wall-clock grace period into that domain so a sweeper never mixes it with Unix nanoseconds. The reference-count mutation planner (`PlanChunkRefRCMutations`) is implemented: it encodes the atomic-pair semantics — increment, decrement-to-zero-and-queue, re-reference-and-dequeue, underflow-fails-closed — as a pure function the chunkref txn will call. The sweeper's decision layer (`ClassifyChunkBlobSweep`) is also implemented: it maps one queue entry plus the reference-count record to reclaim / drop-entry-only / skip, which is the classification the conditional Raft delete in 3(b)(i) is built from. The sweeper loop itself (`ChunkBlobSweeper`) is implemented over narrow injected interfaces, enforcing the 3(b) phase ordering — Raft conditional delete first, local unlink second — and treating a lost conditional delete as a skip rather than a failure. The orphan scan (`ChunkBlobOrphanScanner`) is also implemented, covering both documented sources — a sweeper that crashed between phases, and a PUT that aborted before dispatching its chunkref — gated on the blob's own age so an in-flight upload is never mistaken for an abort. What remains is wiring: the planner into the chunkref txn, and the real store behind the sweeper's and scanner's interfaces. |
 | M4 | Migrator: rewrite legacy `BlobKey` data in the background. Off by default until M0-M3 burn in for 30 days in production. | Open. |
 
+The M3 accounting slice wires `PlanChunkRefRCMutations` into explicit
+chunkref PUT and DEL transactions, including staged upload batches,
+manifest cleanup, upload-abort cleanup, and bucket deletion regardless
+of the local GC-readiness gate. Each transaction validates the observed
+chunkref and RC keys; a missing or malformed RC fails closed rather
+than decrementing an unproven count. The remaining M3 work is the real
+sweeper and orphan-scanner store adapters, lifecycle wiring, recovery
+of incomplete bucket sweeps, and production acceptance measurements.
+The readiness gate remains false until those pieces are complete.
+
 Acceptance criteria for M3 (the milestone that flips `ELASTICKV_S3_BLOB_OFFLOAD=true` by default):
 
 Until M3 wires reference counting, the grace queue, and the orphan

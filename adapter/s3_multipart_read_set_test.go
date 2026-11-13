@@ -83,7 +83,9 @@ func TestS3CommitUploadPartReadSet(t *testing.T) {
 			}
 			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 			req := h.coord.lastTxnWriting(t, u.partKey)
-			assert.ElementsMatch(t, [][]byte{u.uploadMetaKey, s3keys.BucketGenerationKey(u.bucket), u.partKey}, req.ReadKeys)
+			for _, key := range [][]byte{u.uploadMetaKey, s3keys.BucketGenerationKey(u.bucket), u.partKey} {
+				assert.Contains(t, req.ReadKeys, key)
+			}
 			assert.NotContains(t, req.ReadKeys, s3keys.BucketMetaKey(u.bucket), "unrelated bucket writers must not serialize part uploads")
 			reads := h.readsForTxn(req)
 			for _, key := range [][]byte{s3keys.BucketMetaKey(u.bucket), u.uploadMetaKey, u.partKey} {

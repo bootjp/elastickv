@@ -164,9 +164,6 @@ func (c *s3OCCReproCoordinator) Dispatch(ctx context.Context, req *kv.OperationG
 		if c.failDelPrefix.Load() && s3OCCReproHasOp(req, kv.DelPrefix) {
 			return nil, errors.New("s3 occ repro: injected DEL_PREFIX failure")
 		}
-		if !req.IsTxn {
-			c.recordDels(req.Elems)
-		}
 		for n := int64(len(req.ReadKeys)); ; {
 			seen := c.maxReadKeys.Load()
 			if n <= seen || c.maxReadKeys.CompareAndSwap(seen, n) {
@@ -175,6 +172,9 @@ func (c *s3OCCReproCoordinator) Dispatch(ctx context.Context, req *kv.OperationG
 		}
 	}
 	resp, err := c.ShardedCoordinator.Dispatch(ctx, req)
+	if err == nil && req != nil {
+		c.recordDels(req.Elems)
+	}
 	return resp, errors.WithStack(err)
 }
 

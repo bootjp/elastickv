@@ -1581,7 +1581,7 @@ func (s *S3Server) cleanupUploadPartsAsync(bucket string, generation uint64, obj
 
 func (s *S3Server) cleanupUploadParts(ctx context.Context, bucket string, generation uint64, objectKey string, uploadID string) {
 	partPrefix := s3keys.UploadPartPrefixForUpload(bucket, generation, objectKey, uploadID)
-	s.deleteByPrefix(ctx, partPrefix, bucket, generation, objectKey, uploadID)
+	_ = s.deleteByPrefix(ctx, partPrefix, bucket, generation, objectKey, uploadID)
 }
 
 // cleanupPartBlobsAsync asynchronously deletes the blob chunk keys for a single
@@ -1601,9 +1601,9 @@ func (s *S3Server) cleanupPartBlobsAsync(
 ) {
 	s.startCleanup(func(ctx context.Context) {
 		pending := make([]*kv.Elem[kv.OP], 0, s3MetaBatchOps)
-		flush := func() {
+		flush := func() bool {
 			if len(pending) == 0 {
-				return
+				return true
 			}
 			if err := s.dispatchS3CleanupBatch(ctx, pending); err != nil {
 				slog.ErrorContext(ctx, "cleanupPartBlobsAsync: coordinator dispatch failed",
@@ -1613,8 +1613,10 @@ func (s *S3Server) cleanupPartBlobsAsync(
 					"part_no", partNo,
 					"err", err,
 				)
+				return false
 			}
 			pending = pending[:0]
+			return true
 		}
 		for i := uint64(0); i < chunkCount; i++ {
 			key := s3keys.VersionedBlobKey(bucket, generation, objectKey, uploadID, partNo, i, partVersion)
@@ -1626,10 +1628,12 @@ func (s *S3Server) cleanupPartBlobsAsync(
 				Key: key,
 			})
 			if len(pending) >= s3MetaBatchOps {
-				flush()
+				if !flush() {
+					return
+				}
 			}
 		}
-		flush()
+		_ = flush()
 	})
 }
 
@@ -1640,13 +1644,13 @@ func (s *S3Server) cleanupUploadDataAsync(bucket string, generation uint64, obje
 		// Delete legacy blob chunks and offloaded chunk references. Content-
 		// addressed chunkblobs are reclaimed by the reference-counted GC.
 		blobPrefix := s3keys.BlobPrefixForUpload(bucket, generation, objectKey, uploadID)
-		s.deleteByPrefix(ctx, blobPrefix, bucket, generation, objectKey, uploadID)
+		_ = s.deleteByPrefix(ctx, blobPrefix, bucket, generation, objectKey, uploadID)
 		chunkRefPrefix := s3keys.ChunkRefPrefixForUpload(bucket, generation, objectKey, uploadID)
-		s.deleteByPrefix(ctx, chunkRefPrefix, bucket, generation, objectKey, uploadID)
+		_ = s.deleteByPrefix(ctx, chunkRefPrefix, bucket, generation, objectKey, uploadID)
 	})
 }
 
-func (s *S3Server) deleteByPrefix(ctx context.Context, prefix []byte, bucket string, generation uint64, objectKey string, uploadID string) {
+func (s *S3Server) deleteByPrefix(ctx context.Context, prefix []byte, bucket string, generation uint64, objectKey string, uploadID string) error {
 	end := prefixScanEnd(prefix)
 	cursor := prefix
 	for {
@@ -1658,10 +1662,10 @@ func (s *S3Server) deleteByPrefix(ctx context.Context, prefix []byte, bucket str
 			slog.ErrorContext(ctx, "deleteByPrefix: scan failed",
 				"bucket", bucket, "generation", generation,
 				"object_key", objectKey, "upload_id", uploadID, "err", err)
-			return
+			return errors.WithStack(err)
 		}
 		if len(kvs) == 0 {
-			return
+			return nil
 		}
 		pending := make([]*kv.Elem[kv.OP], 0, len(kvs))
 		for _, kvp := range kvs {
@@ -1671,16 +1675,39 @@ func (s *S3Server) deleteByPrefix(ctx context.Context, prefix []byte, bucket str
 			slog.ErrorContext(ctx, "deleteByPrefix: dispatch failed",
 				"bucket", bucket, "generation", generation,
 				"object_key", objectKey, "upload_id", uploadID, "err", err)
-			return
+			return err
 		}
 		cursor = nextScanCursor(kvs[len(kvs)-1].Key)
 	}
 }
 
 func (s *S3Server) dispatchS3CleanupBatch(ctx context.Context, elems []*kv.Elem[kv.OP]) error {
+	var hasChunkRef bool
+	for _, elem := range elems {
+		if elem != nil && bytes.HasPrefix(elem.Key, []byte(s3keys.ChunkRefPrefix)) {
+			hasChunkRef = true
+			break
+		}
+	}
 	return s.retryS3Mutation(ctx, func() error {
+		if hasChunkRef {
+			readTimestamp, err := s.beginTxnReadTimestamp(ctx, ^uint64(0), "s3 chunkref cleanup: begin read timestamp")
+			if err != nil {
+				return err
+			}
+			readPin := s.pinReadTS(readTimestamp.Timestamp())
+			defer readPin.Release()
+			commitTS, err := s.nextTxnCommitTS(ctx, readTimestamp.Timestamp())
+			if err != nil {
+				return err
+			}
+			req := &kv.OperationGroup[kv.OP]{
+				IsTxn: true, StartTS: readTimestamp.Timestamp(), CommitTS: commitTS, Elems: append([]*kv.Elem[kv.OP](nil), elems...),
+			}
+			return s.dispatchS3MetadataMutation(readTimestamp.WithDispatchVoucher(ctx), req)
+		}
 		_, err := s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{Elems: elems})
-		return errors.WithStack(err)
+		return normalizeS3MetadataDispatchError(err)
 	})
 }
 
@@ -1831,11 +1858,13 @@ func (s *S3Server) cleanupManifestBlobs(ctx context.Context, bucket string, gene
 		return
 	}
 	pending := make([]*kv.Elem[kv.OP], 0, s3MetaBatchOps)
-	flush := func() {
+	flush := func() bool {
 		if len(pending) == 0 {
-			return
+			return true
 		}
-		if _, err := s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{Elems: pending}); err != nil {
+		err := s.dispatchS3CleanupBatch(ctx, pending)
+		pending = pending[:0]
+		if err != nil {
 			slog.ErrorContext(ctx, "cleanupManifestBlobs: coordinator dispatch failed",
 				"bucket", bucket,
 				"generation", generation,
@@ -1843,15 +1872,16 @@ func (s *S3Server) cleanupManifestBlobs(ctx context.Context, bucket string, gene
 				"upload_id", manifest.UploadID,
 				"err", err,
 			)
+			return false
 		}
-		pending = pending[:0]
+		return true
 	}
 	for _, part := range manifest.Parts {
 		if !s.appendPartBlobKeys(&pending, bucket, generation, objectKey, manifest.UploadID, part, flush) {
 			return
 		}
 	}
-	flush()
+	_ = flush()
 }
 
 // appendPartBlobKeys queues every blob-chunk Del for one manifest part
@@ -1865,7 +1895,7 @@ func (s *S3Server) cleanupManifestBlobs(ctx context.Context, bucket string, gene
 // the s3MetaBatchOps cap and re-opening the OOM / oversized-MsgApp
 // risk the cap was meant to bound. See TestS3CleanupManifestBlobs
 // _RespectsMetaBatchOps for the regression guard.
-func (s *S3Server) appendPartBlobKeys(pending *[]*kv.Elem[kv.OP], bucket string, generation uint64, objectKey string, uploadID string, part s3ObjectPart, flush func()) bool {
+func (s *S3Server) appendPartBlobKeys(pending *[]*kv.Elem[kv.OP], bucket string, generation uint64, objectKey string, uploadID string, part s3ObjectPart, flush func() bool) bool {
 	for chunkNo := range part.ChunkSizes {
 		chunkIndex, err := uint64FromInt(chunkNo)
 		if err != nil {
@@ -1880,7 +1910,9 @@ func (s *S3Server) appendPartBlobKeys(pending *[]*kv.Elem[kv.OP], bucket string,
 			Key: key,
 		})
 		if len(*pending) >= s3MetaBatchOps {
-			flush()
+			if !flush() {
+				return false
+			}
 		}
 	}
 	return true

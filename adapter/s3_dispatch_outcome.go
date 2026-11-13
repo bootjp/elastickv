@@ -8,6 +8,9 @@ import (
 )
 
 func (s *S3Server) dispatchS3MetadataMutation(ctx context.Context, req *kv.OperationGroup[kv.OP]) error {
+	if err := s.addS3ChunkRefAccounting(ctx, req); err != nil {
+		return err
+	}
 	_, err := kv.DispatchWithReadTimestamp(ctx, s.coordinator, req)
 	return normalizeS3MetadataDispatchError(err)
 }

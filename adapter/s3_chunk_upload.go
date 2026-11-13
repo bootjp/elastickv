@@ -233,7 +233,12 @@ func (u *s3ChunkUploader) flushBatch() error {
 	// Full offloaded batches are immutable staged refs. Object readers cannot
 	// discover them until the final manifest or part descriptor transaction;
 	// that final metadata commit remains the public linearization point.
-	_, err := u.server.coordinator.Dispatch(u.ctx, &kv.OperationGroup[kv.OP]{Elems: u.pendingBatch})
+	var err error
+	if u.cfg.offloaded {
+		err = u.flushOffloadedBatch()
+	} else {
+		_, err = u.server.coordinator.Dispatch(u.ctx, &kv.OperationGroup[kv.OP]{Elems: u.pendingBatch})
+	}
 	u.releasePendingAdmission()
 	if err != nil {
 		return errors.WithStack(err)
@@ -244,6 +249,23 @@ func (u *s3ChunkUploader) flushBatch() error {
 	u.pendingBatch = u.pendingBatch[:0]
 	u.pendingChunkSizes = u.pendingChunkSizes[:0]
 	return nil
+}
+
+func (u *s3ChunkUploader) flushOffloadedBatch() error {
+	readTimestamp, err := u.server.beginTxnReadTimestamp(u.ctx, u.server.readTS(), "s3 staged chunkrefs: begin read timestamp")
+	if err != nil {
+		return err
+	}
+	readPin := u.server.pinReadTS(readTimestamp.Timestamp())
+	defer readPin.Release()
+	commitTS, err := u.server.nextTxnCommitTS(u.ctx, readTimestamp.Timestamp())
+	if err != nil {
+		return err
+	}
+	return u.server.dispatchS3MetadataMutation(readTimestamp.WithDispatchVoucher(u.ctx), &kv.OperationGroup[kv.OP]{
+		IsTxn: true, StartTS: readTimestamp.Timestamp(), CommitTS: commitTS,
+		Elems: u.pendingBatch,
+	})
 }
 
 func (u *s3ChunkUploader) releasePendingAdmission() {

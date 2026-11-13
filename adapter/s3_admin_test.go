@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -476,11 +477,15 @@ func TestS3Server_AdminDeleteBucket_SweepsOrphansAcrossAllPerBucketPrefixes(t *t
 		objectName = "race/object.bin"
 		uploadID   = "upload-race"
 	)
+	chunkSHA := sha256.Sum256([]byte("orphan-chunk"))
+	chunkRefValue, err := s3keys.EncodeChunkRefValue(s3keys.ChunkRefValue{ContentSHA256: chunkSHA, Size: 12})
+	require.NoError(t, err)
 	planted := []*kv.Elem[kv.OP]{
 		{Op: kv.Put, Key: s3keys.UploadMetaKey(bucket, gen, objectName, uploadID), Value: []byte("orphan-upload-meta")},
 		{Op: kv.Put, Key: s3keys.UploadPartKey(bucket, gen, objectName, uploadID, 1), Value: []byte("orphan-part")},
 		{Op: kv.Put, Key: s3keys.BlobKey(bucket, gen, objectName, uploadID, 1, 0), Value: []byte("orphan-chunk")},
-		{Op: kv.Put, Key: s3keys.ChunkRefKey(bucket, gen, objectName, uploadID, 1, 0), Value: []byte("orphan-chunk-ref")},
+		{Op: kv.Put, Key: s3keys.ChunkRefKey(bucket, gen, objectName, uploadID, 1, 0), Value: chunkRefValue},
+		{Op: kv.Put, Key: s3keys.ChunkRefRCKey(chunkSHA), Value: s3keys.EncodeChunkRefRC(s3keys.ChunkRefRC{Count: 1})},
 		{Op: kv.Put, Key: s3keys.GCUploadKey(bucket, gen, objectName, uploadID), Value: []byte("orphan-gc")},
 		{Op: kv.Put, Key: s3keys.RouteKey(bucket, gen, objectName), Value: []byte("orphan-route")},
 	}
@@ -524,6 +529,12 @@ func TestS3Server_AdminDeleteBucket_SweepsOrphansAcrossAllPerBucketPrefixes(t *t
 				"AdminDeleteBucket must sweep the %s prefix; orphans here mean the DEL_PREFIX safety net regressed", p.name)
 		})
 	}
+	rcValue, err := st.GetAt(ctx, s3keys.ChunkRefRCKey(chunkSHA), postDeleteTS)
+	require.NoError(t, err)
+	rc, ok := s3keys.DecodeChunkRefRC(rcValue)
+	require.True(t, ok)
+	require.Zero(t, rc.Count)
+	require.NotZero(t, rc.QueuedAtTS)
 
 	// BucketMetaKey is also gone (existing contract; pinned here
 	// alongside the new prefix assertions so a refactor that
