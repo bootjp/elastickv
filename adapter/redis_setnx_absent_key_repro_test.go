@@ -192,6 +192,30 @@ func TestRedis_StringCreateDoesNotFenceConcurrentCreate(t *testing.T) {
 	}
 }
 
+func TestRedis_SetOfExistingStringValidatesTypeChange(t *testing.T) {
+	t.Parallel()
+	h := newReadSetReproHarness(t, "g7-set-existing", WithOnePhaseTxnDedup(false))
+	ctx := h.ctx
+	key := []byte("g7-set-existing-key")
+	require.NoError(t, h.clientB.Set(ctx, string(key), "old", 0).Err())
+
+	park := h.reads.addPark("A: type probe of existing string", func(_ string, readKey []byte) bool {
+		return bytes.Contains(readKey, key)
+	})
+	aDone := h.goCommand(func() (any, error) {
+		return h.clientA.Set(ctx, string(key), "new", 0).Result()
+	})
+	waitReadSetReproParked(t, park, aDone, "A")
+
+	require.NoError(t, h.clientB.Del(ctx, string(key)).Err())
+	require.NoError(t, h.clientB.HSet(ctx, string(key), "f", "v").Err())
+	park.releaseNow()
+	aRes := waitReadSetReproDone(t, aDone, "A")
+	require.NoError(t, aRes.err)
+	require.Equal(t, "OK", aRes.val)
+	require.Equal(t, []string{"string"}, h.physicalEncodings(t, key, h.st.LastCommitTS()))
+}
+
 // setCondRace is one "SET NX / XX decided on the key's existence, then another
 // command changed it" interleaving on a single string key.
 type setCondRace struct {

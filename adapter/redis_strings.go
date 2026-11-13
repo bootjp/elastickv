@@ -207,11 +207,9 @@ func (r *RedisServer) executeSet(ctx context.Context, key, value []byte, opts re
 
 // trySetFastPath attempts the fast-path for SET (no NX/XX/GET flags) when the
 // key is a string. Returns true if the fast-path handled the command. When the
-// key holds a non-string type, returns false so the caller can fall through to
-// executeSet which cleans up internal keys before overwriting. When it is
-// absent, returns false too: a create must read the absent-key set and Put the
-// fences (redisStringWriteGuard), which the fast path's blind write cannot
-// carry.
+// key holds a non-string type or is absent, returns false so the caller can
+// fall through to executeSet. Existing strings are replaced in a transaction
+// that validates the type probe at the same read timestamp.
 func (r *RedisServer) trySetFastPath(conn redcon.Conn, ctx context.Context, key, value []byte, ttl *time.Time) bool {
 	// Only use the fast path when we are the leader for this key so the local
 	// type check is authoritative. On followers, stale MVCC state could miss a
@@ -219,19 +217,28 @@ func (r *RedisServer) trySetFastPath(conn redcon.Conn, ctx context.Context, key,
 	if !r.coordinator.IsLeaderForKey(redisUserRouteKey(key)) {
 		return false
 	}
-	readTS := r.readTS()
-	// Use rawKeyTypeAt (TTL-unaware) so that expired keys whose internal data
-	// still exists are detected and routed through the full cleanup path.
-	typ, err := r.rawKeyTypeAt(ctx,
-		key, readTS)
-	if err != nil {
-		writeRedisError(conn, err)
-		return true
-	}
-	if typ == redisTypeNone || isNonStringCollectionType(typ) {
+	handled := true
+	err := r.retryRedisWrite(ctx, func() error {
+		readTimestamp, err := r.beginTxnReadTimestamp(ctx, "redis set fast path: begin read timestamp")
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		// The type probe and the OCC read set must refer to the same snapshot.
+		typ, err := r.rawKeyTypeAt(ctx, key, readTimestamp.Timestamp())
+		if err != nil {
+			return err
+		}
+		if typ != redisTypeString {
+			handled = false
+			return nil
+		}
+		state := redisSetState{rawTyp: typ, typ: typ}
+		return r.replaceWithStringReadTimestampTxn(ctx, key, value, ttl, state, readTimestamp)
+	})
+	if !handled {
 		return false
 	}
-	if err := r.saveString(ctx, key, value, ttl); err != nil {
+	if err != nil {
 		writeRedisError(conn, err)
 		return true
 	}
