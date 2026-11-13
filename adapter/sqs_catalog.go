@@ -1079,7 +1079,7 @@ func (s *SQSServer) tryCreateQueueOnce(ctx context.Context, requested *sqsQueueM
 	// than the cleanup cutoff below.
 	throttleResetCutoff := s.beginThrottleReset(requested.Name)
 	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
-	if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, req); err != nil {
+	if err := s.dispatchSQSMutation(dispatchCtx, req); err != nil {
 		return false, errors.WithStack(err)
 	}
 	// Drop any throttle bucket that survived a delete-then-create
@@ -1212,7 +1212,7 @@ func (s *SQSServer) deleteQueueWithRetry(ctx context.Context, queueName string) 
 		// then publish token gauges newer than this stale delete cleanup.
 		throttleResetCutoff := s.beginThrottleReset(queueName)
 		dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
-		if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, req); err == nil {
+		if err := s.dispatchSQSMutation(dispatchCtx, req); err == nil {
 			return throttleResetCutoff, nil
 		} else if !isRetryableTransactWriteError(err) {
 			return 0, errors.WithStack(err)
@@ -1749,7 +1749,7 @@ func (s *SQSServer) trySetQueueAttributesOnce(ctx context.Context, queueName str
 		throttleResetCutoff = s.beginThrottleReset(queueName)
 	}
 	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
-	if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, req); err != nil {
+	if err := s.dispatchSQSMutation(dispatchCtx, req); err != nil {
 		return false, nil, nil, 0, false, errors.WithStack(err)
 	}
 	return throttleChanged, postThrottle, resetActions, throttleResetCutoff, true, nil

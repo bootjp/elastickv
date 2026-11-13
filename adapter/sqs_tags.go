@@ -200,7 +200,7 @@ func (s *SQSServer) tryMutateQueueTagsOnce(
 		},
 	}
 	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
-	if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, req); err != nil {
+	if err := s.dispatchSQSMutation(dispatchCtx, req); err != nil {
 		return false, errors.WithStack(err)
 	}
 	return true, nil

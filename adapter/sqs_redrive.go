@@ -236,7 +236,7 @@ func (s *SQSServer) redriveCandidateToDLQ(
 	if err != nil {
 		return false, err
 	}
-	if _, err := kv.DispatchWithReadTimestamp(ctx, s.coordinator, req); err != nil {
+	if err := s.dispatchSQSMutation(ctx, req); err != nil {
 		if isIgnorableSQSReceiveRace(err) {
 			return true, nil
 		}
