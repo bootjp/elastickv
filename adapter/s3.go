@@ -1007,6 +1007,8 @@ func (s *S3Server) putBucketAcl(w http.ResponseWriter, r *http.Request, bucket s
 }
 
 func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket string, objectKey string) {
+	started, mode, outcome := time.Now(), s3BlobOffloadModeUnknown, s3ObjectOutcomeFailure
+	defer func() { s.observeS3ObjectDuration("put", mode, outcome, started) }()
 	in := s3PutObjectInputFromHeaders(r.Header)
 	state, err := s.prepareS3PutObject(r.Context(), in, bucket, objectKey)
 	if err != nil {
@@ -1024,7 +1026,9 @@ func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket stri
 	if !s.admitS3PutRequest(w, r, bucket, objectKey, s3MaxObjectSizeBytes, in.tooLargeMessage) {
 		return
 	}
-	upload, uploadBodyErr, uploadErr := s.uploadS3ObjectData(r.Context(), in, state, bucket, objectKey, s.s3BlobOffloadSelected(r.Context()))
+	offload := s.s3BlobOffloadSelected(r.Context())
+	mode = s3SelectedBlobMode(offload)
+	upload, uploadBodyErr, uploadErr := s.uploadS3ObjectData(r.Context(), in, state, bucket, objectKey, offload)
 	if uploadErr != nil || uploadBodyErr != nil {
 		s.cleanupS3PutObjectChunks(r.Context(), state, upload, bucket, objectKey)
 		s.writeS3ChunkUploadError(w, uploadBodyErr, uploadErr, bucket, objectKey)
@@ -1044,10 +1048,15 @@ func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket stri
 	}
 	w.Header().Set("ETag", quoteS3ETag(upload.ETag))
 	w.WriteHeader(http.StatusOK)
+	outcome = s3ObjectOutcomeSuccess
 }
 
 //nolint:cyclop,gocognit // The read handler branches on bucket/object existence, range, and HEAD vs GET response flow.
 func (s *S3Server) getObject(w http.ResponseWriter, r *http.Request, bucket string, objectKey string, headOnly bool) {
+	started, mode, outcome := time.Now(), s3BlobOffloadModeUnknown, s3ObjectOutcomeFailure
+	if !headOnly {
+		defer func() { s.observeS3ObjectDuration("get", mode, outcome, started) }()
+	}
 	readTS := s.readTS()
 	readPin := s.pinReadTS(readTS)
 	defer readPin.Release()
@@ -1071,6 +1080,7 @@ func (s *S3Server) getObject(w http.ResponseWriter, r *http.Request, bucket stri
 		writeS3Error(w, http.StatusNotFound, "NoSuchKey", "object not found", bucket, objectKey)
 		return
 	}
+	mode = s3ManifestDataMode(manifest)
 
 	rangeHeader := strings.TrimSpace(r.Header.Get("Range"))
 
@@ -1106,7 +1116,9 @@ func (s *S3Server) getObject(w http.ResponseWriter, r *http.Request, bucket stri
 		}
 		writeS3ObjectHeaders(w.Header(), manifest)
 		w.WriteHeader(http.StatusOK)
-		s.streamObjectChunks(w, r, bucket, meta.Generation, objectKey, manifest, readTS, 0, manifest.SizeBytes)
+		if s.streamObjectChunks(w, r, bucket, meta.Generation, objectKey, manifest, readTS, 0, manifest.SizeBytes) {
+			outcome = s3ObjectOutcomeSuccess
+		}
 		return
 	}
 
@@ -1119,6 +1131,7 @@ func (s *S3Server) getObject(w http.ResponseWriter, r *http.Request, bucket stri
 	}
 
 	contentLength := rangeEnd - rangeStart + 1
+	mode = s3ManifestRangeDataMode(manifest, rangeStart, contentLength)
 	if s3ManifestHasOffloadedParts(manifest) {
 		if err := s.ensureS3ObjectRangeLocal(r.Context(), bucket, meta.Generation, objectKey, manifest, readTS, rangeStart, contentLength); err != nil {
 			writeS3InternalError(w, err)
@@ -1130,11 +1143,13 @@ func (s *S3Server) getObject(w http.ResponseWriter, r *http.Request, bucket stri
 	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", rangeStart, rangeEnd, manifest.SizeBytes))
 	w.Header().Set("Accept-Ranges", "bytes")
 	w.WriteHeader(http.StatusPartialContent)
-	s.streamObjectChunks(w, r, bucket, meta.Generation, objectKey, manifest, readTS, rangeStart, contentLength)
+	if s.streamObjectChunks(w, r, bucket, meta.Generation, objectKey, manifest, readTS, rangeStart, contentLength) {
+		outcome = s3ObjectOutcomeSuccess
+	}
 }
 
 //nolint:cyclop // streamObjectChunks iterates nested part/chunk loops with necessary error-handling branches.
-func (s *S3Server) streamObjectChunks(w http.ResponseWriter, r *http.Request, bucket string, generation uint64, objectKey string, manifest *s3ObjectManifest, readTS uint64, offset int64, length int64) {
+func (s *S3Server) streamObjectChunks(w http.ResponseWriter, r *http.Request, bucket string, generation uint64, objectKey string, manifest *s3ObjectManifest, readTS uint64, offset int64, length int64) bool {
 	remaining := length
 	pos := int64(0)
 	for _, part := range manifest.Parts {
@@ -1158,7 +1173,7 @@ func (s *S3Server) streamObjectChunks(w http.ResponseWriter, r *http.Request, bu
 					"object_key", objectKey,
 					"err", err,
 				)
-				return
+				return false
 			}
 			chunk, err := s.readS3ObjectChunk(r.Context(), bucket, generation, objectKey, manifest.UploadID, part, chunkIndex, chunkSize, readTS)
 			if err != nil {
@@ -1167,7 +1182,7 @@ func (s *S3Server) streamObjectChunks(w http.ResponseWriter, r *http.Request, bu
 					"object_key", objectKey,
 					"err", err,
 				)
-				return
+				return false
 			}
 			chunkLen := int64(len(chunk))
 			start := int64(0)
@@ -1186,11 +1201,12 @@ func (s *S3Server) streamObjectChunks(w http.ResponseWriter, r *http.Request, bu
 			n, err := w.Write(chunk[start:end])
 			remaining -= int64(n)
 			if err != nil {
-				return
+				return false
 			}
 			pos = chunkEnd
 		}
 	}
+	return remaining == 0
 }
 
 //nolint:cyclop // parseS3RangeHeader handles all RFC-compliant byte-range forms; each branch is a distinct syntax.
