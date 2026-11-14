@@ -69,6 +69,42 @@
         (is (= ["lost acknowledgement"] (:delete-errors op)))
         (is (= [:ReceiveMessage :DeleteMessage :DeleteMessage] (mapv first @calls)))))))
 
+(deftest client-retries-ambiguous-delete-with-same-receipt
+  (let [calls (atom [])
+        c (assoc (:client (workload/sqs-workload {})) :queue-url (atom "queue"))]
+    (with-redefs [sqs/invoke! (fn [_ operation request]
+                               (swap! calls conj [operation request])
+                               (case operation
+                                 :ReceiveMessage {:Messages [{:Body "a" :ReceiptHandle "receipt-a"}]}
+                                 :DeleteMessage (if (= 1 (count (filter #(= :DeleteMessage (first %)) @calls)))
+                                                  (throw (ex-info "timeout" {:category :cognitect.anomalies/unavailable}))
+                                                  {})))]
+      (let [op (client/invoke! c {} {:type :invoke :f :recv})]
+        (is (= :ok (:type op)))
+        (is (= ["a"] (:value op)))
+        (is (= ["a"] (:deleted op)))
+        (is (empty? (:delete-errors op)))
+        (is (= ["receipt-a" "receipt-a"]
+               (mapv (comp :ReceiptHandle second)
+                     (filter #(= :DeleteMessage (first %)) @calls))))))))
+
+(deftest client-keeps-delete-unacknowledged-after-retry-budget
+  (let [deletes (atom 0)
+        c (assoc (:client (workload/sqs-workload {})) :queue-url (atom "queue"))]
+    (with-redefs [sqs/invoke! (fn [_ operation _]
+                               (case operation
+                                 :ReceiveMessage {:Messages [{:Body "a" :ReceiptHandle "receipt-a"}]}
+                                 :DeleteMessage (do
+                                                  (swap! deletes inc)
+                                                  (throw (ex-info "unavailable"
+                                                                  {:category :cognitect.anomalies/unavailable})))))]
+      (let [op (client/invoke! c {} {:type :invoke :f :recv})]
+        (is (= :ok (:type op)))
+        (is (= ["a"] (:value op)))
+        (is (empty? (:deleted op)))
+        (is (= 1 (count (:delete-errors op))))
+        (is (= workload/delete-max-attempts @deletes))))))
+
 (deftest clients-share-unique-message-identities
   (let [c (:client (workload/sqs-workload {}))
         bodies (atom [])]

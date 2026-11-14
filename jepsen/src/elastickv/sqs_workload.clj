@@ -13,6 +13,29 @@
             [jepsen.client :as client]
             [jepsen.generator :as gen]))
 
+(def ^:const delete-max-attempts 3)
+(def ^:const delete-retry-backoff-ms 100)
+
+(defn- retryable-delete-error? [e]
+  (contains? #{:cognitect.anomalies/unavailable :cognitect.anomalies/busy}
+             (:category (ex-data e))))
+
+(defn- delete-message-with-retry! [conn queue-url receipt-handle]
+  ;; The server treats a stale receipt handle as a successful no-op. Repeating
+  ;; the same handle is safe when the response to an earlier delete was lost.
+  (loop [remaining delete-max-attempts]
+    (let [result (try
+                   {:response (sqs/invoke! conn :DeleteMessage
+                                           {:QueueUrl queue-url
+                                            :ReceiptHandle receipt-handle})}
+                   (catch clojure.lang.ExceptionInfo e {:exception e}))]
+      (if-let [e (:exception result)]
+        (if (and (> remaining 1) (retryable-delete-error? e))
+          (do (Thread/sleep delete-retry-backoff-ms)
+              (recur (dec remaining)))
+          (throw e))
+        (:response result)))))
+
 (defn- receive-and-delete! [conn queue-url]
   (let [messages (:Messages (sqs/invoke! conn :ReceiveMessage
                               {:QueueUrl queue-url
@@ -22,9 +45,7 @@
         acknowledgements
         (mapv (fn [message]
                 (try
-                  (sqs/invoke! conn :DeleteMessage
-                               {:QueueUrl queue-url
-                                :ReceiptHandle (:ReceiptHandle message)})
+                  (delete-message-with-retry! conn queue-url (:ReceiptHandle message))
                   {:deleted (:Body message)}
                   (catch Exception e
                     {:error (.getMessage e)
