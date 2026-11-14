@@ -150,6 +150,26 @@
       (finally
         (delete-tree! dir)))))
 
+(deftest final-read-retries-open-failures
+  (let [dir (scratch-dir)]
+    (try
+      (workload/local-setup! dir [0])
+      (let [attempts (atom 0)
+            op {:type :invoke :f :read :value (independent/tuple 0 nil) :final true}]
+        (with-redefs [workload/local-read
+                      (fn [_]
+                        (if (<= (swap! attempts inc) 3)
+                          (throw (java.io.FileNotFoundException. "reg-0 (Device or resource busy)"))
+                          7))]
+          (let [result (workload/invoke-read!
+                         {:local? true :mount-dir dir :max-retries 8 :require-fuse-mount false}
+                         {} "n1" op 0)]
+            (is (= :ok (:type result)))
+            (is (= (independent/tuple 0 7) (:value result)))
+            (is (= 4 @attempts)))))
+      (finally
+        (delete-tree! dir)))))
+
 (deftest with-retries-accepts-a-custom-predicate
   (let [calls (atom 0)]
     (is (thrown? java.nio.file.NoSuchFileException

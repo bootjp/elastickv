@@ -170,6 +170,14 @@
   (or (retryable-error? e)
       (some? (data-loss-kind e))))
 
+(defn final-read-retryable-error?
+  "A final local open may report transient FUSE errors as FileNotFoundException,
+   without exposing a typed errno. Final reads can retry every open failure
+   because they cannot replay a mutation; persistent failures remain unknown."
+  [^Throwable e]
+  (or (read-retryable-error? e)
+      (instance? FileNotFoundException e)))
+
 (defn with-retries
   "Calls (f) up to max-retries times while it throws an error accepted by
    retry? (retryable-error? by default), sleeping retry-backoff-ms between
@@ -522,7 +530,9 @@
     (let [attempts (if (:final op)
                      (max max-retries final-read-min-retries)
                      max-retries)
-          v (with-retries attempts read-retryable-error?
+          v (with-retries attempts (if (:final op)
+                                     final-read-retryable-error?
+                                     read-retryable-error?)
               (fn []
                 (if local?
                   (do (require-local-mount! mount-dir require-fuse-mount)
