@@ -25,6 +25,7 @@ func timestampBindingForCreationRequest(request *pb.Request) (TimestampBinding, 
 	manifest := proto.CloneOf(request)
 	manifest.TimestampBindingOperationId = nil
 	manifest.TimestampAdmissionFloor = 0
+	manifest.TimestampBindingAdmissionTerm = 0
 	raw, err := (proto.MarshalOptions{Deterministic: true}).Marshal(manifest)
 	if err != nil {
 		return binding, errors.Wrap(err, "encode timestamp binding manifest")

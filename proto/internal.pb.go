@@ -606,8 +606,11 @@ type Request struct {
 	// timestamp source before proposing this field; replicas recompute the
 	// manifest digest from the request rather than trusting a supplied hash.
 	TimestampBindingOperationId []byte `protobuf:"bytes,9,opt,name=timestamp_binding_operation_id,json=timestampBindingOperationId,proto3" json:"timestamp_binding_operation_id,omitempty"`
-	unknownFields               protoimpl.UnknownFields
-	sizeCache                   protoimpl.SizeCache
+	// The leader term that prepared this binding. The proposer checks it in
+	// the Raft event loop before submitting the entry.
+	TimestampBindingAdmissionTerm uint64 `protobuf:"varint,10,opt,name=timestamp_binding_admission_term,json=timestampBindingAdmissionTerm,proto3" json:"timestamp_binding_admission_term,omitempty"`
+	unknownFields                 protoimpl.UnknownFields
+	sizeCache                     protoimpl.SizeCache
 }
 
 func (x *Request) Reset() {
@@ -701,6 +704,13 @@ func (x *Request) GetTimestampBindingOperationId() []byte {
 		return x.TimestampBindingOperationId
 	}
 	return nil
+}
+
+func (x *Request) GetTimestampBindingAdmissionTerm() uint64 {
+	if x != nil {
+		return x.TimestampBindingAdmissionTerm
+	}
+	return 0
 }
 
 type RaftCommand struct {
@@ -3337,7 +3347,7 @@ const file_internal_proto_rawDesc = "" +
 	"\x03key\x18\x02 \x01(\fR\x03key\x12\x14\n" +
 	"\x05value\x18\x03 \x01(\fR\x05value\x123\n" +
 	"\x16commit_ts_value_offset\x18\x04 \x01(\x04R\x13commitTsValueOffset\x12%\n" +
-	"\x0erequire_absent\x18\x05 \x01(\bR\rrequireAbsent\"\x82\x03\n" +
+	"\x0erequire_absent\x18\x05 \x01(\bR\rrequireAbsent\"\xcb\x03\n" +
 	"\aRequest\x12\x15\n" +
 	"\x06is_txn\x18\x01 \x01(\bR\x05isTxn\x12\x1c\n" +
 	"\x05phase\x18\x02 \x01(\x0e2\x06.PhaseR\x05phase\x12\x0e\n" +
@@ -3347,7 +3357,9 @@ const file_internal_proto_rawDesc = "" +
 	"\x16observed_route_version\x18\x06 \x01(\x04R\x14observedRouteVersion\x125\n" +
 	"\x17write_fence_bypass_keys\x18\a \x03(\fR\x14writeFenceBypassKeys\x12:\n" +
 	"\x19timestamp_admission_floor\x18\b \x01(\x04R\x17timestampAdmissionFloor\x12C\n" +
-	"\x1etimestamp_binding_operation_id\x18\t \x01(\fR\x1btimestampBindingOperationId\"3\n" +
+	"\x1etimestamp_binding_operation_id\x18\t \x01(\fR\x1btimestampBindingOperationId\x12G\n" +
+	" timestamp_binding_admission_term\x18\n" +
+	" \x01(\x04R\x1dtimestampBindingAdmissionTerm\"3\n" +
 	"\vRaftCommand\x12$\n" +
 	"\brequests\x18\x01 \x03(\v2\b.RequestR\brequests\"M\n" +
 	"\x0eForwardRequest\x12\x15\n" +

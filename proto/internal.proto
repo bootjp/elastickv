@@ -91,6 +91,9 @@ message Request {
   // timestamp source before proposing this field; replicas recompute the
   // manifest digest from the request rather than trusting a supplied hash.
   bytes timestamp_binding_operation_id = 9;
+  // The leader term that prepared this binding. The proposer checks it in
+  // the Raft event loop before submitting the entry.
+  uint64 timestamp_binding_admission_term = 10;
 }
 
 message RaftCommand {

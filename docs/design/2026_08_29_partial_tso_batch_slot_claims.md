@@ -194,12 +194,14 @@ Implementation order:
    carries native group-0 issuance through home preparation, atomic binding
    and data apply, and exact-ID retry. An in-process pending-ID gate now
    prevents concurrent or ambiguous retries from reissuing before the applied
-   binding is observed. The home lookup now verifies a stable leader term
-   before and after its applied ReadIndex and lookup, but the process-local
-   pending gate remains fail-closed across term changes: an already returned
-   request may be submitted after the read barrier. Admission needs a durable
-   proposal capability fence before a missing binding can authorize reissue,
-   especially across restart.
+   binding is observed. The home lookup verifies a stable leader term before
+   and after its applied ReadIndex and lookup. Prepared requests now carry
+   that term, and the native Raft event loop rejects a stale term before
+   submitting the proposal. After a new-term applied barrier finds no binding,
+   the process-local pending gate can reissue; a delayed old-term request is
+   fenced even across process restart. This is not a production admission
+   capability: Forward still rejects bound requests, and all-member activation
+   and authenticated issuance remain required.
    The integration test
    uses a test issuer and method descriptor, not the production allocator and
    registered method. It is not the production Forward path. Memory and Pebble

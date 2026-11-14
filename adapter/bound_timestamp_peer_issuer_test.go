@@ -55,6 +55,7 @@ func TestAuthenticatedIssuerToHomeRawBindingAndRetry(t *testing.T) {
 	manifest := proto.CloneOf(prepared)
 	manifest.TimestampBindingOperationId = nil
 	manifest.TimestampAdmissionFloor = 0
+	manifest.TimestampBindingAdmissionTerm = 0
 	encoded, err := (proto.MarshalOptions{Deterministic: true}).Marshal(manifest)
 	require.NoError(t, err)
 	binding := kv.TimestampBinding{Timestamp: prepared.GetTs(), OperationID: [16]byte{1}, ManifestDigest: sha256.Sum256(encoded)}

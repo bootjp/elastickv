@@ -77,8 +77,16 @@ func TestPrepareHomeRawTimestampBindingReusesExactOperation(t *testing.T) {
 	retry, err := PrepareHomeRawTimestampBinding(t.Context(), leader, metadata, issue, request)
 	require.NoError(t, err)
 	require.Equal(t, first, retry)
+	leader.term = 2
+	retry, err = PrepareHomeRawTimestampBinding(t.Context(), leader, metadata, issue, request)
+	require.NoError(t, err)
+	require.Equal(t, first.Ts, retry.Ts)
+	require.Equal(t, uint64(2), retry.TimestampBindingAdmissionTerm)
+	retryBinding, err := timestampBindingForCreationRequest(retry)
+	require.NoError(t, err)
+	require.Equal(t, binding, retryBinding, "admission term must not change the durable manifest")
 	require.Equal(t, 1, issues, "exact retry must not ask group 0 for another timestamp")
-	require.Equal(t, 2, leader.reads)
+	require.Equal(t, 3, leader.reads)
 	changed := &pb.Request{TimestampBindingOperationId: request.TimestampBindingOperationId,
 		Mutations: []*pb.Mutation{{Key: []byte("key"), Value: []byte("different")}}}
 	_, err = PrepareHomeRawTimestampBinding(t.Context(), leader, metadata, issue, changed)
@@ -189,7 +197,7 @@ func TestPrepareHomeRawTimestampBindingAmbiguousProposalResolvesOnlyFromAppliedB
 	require.Equal(t, 1, issues)
 }
 
-func TestPrepareHomeRawTimestampBindingRemainsPendingAfterNewTermBarrier(t *testing.T) {
+func TestPrepareHomeRawTimestampBindingReissuesAfterNewTermBarrier(t *testing.T) {
 	st := store.NewMVCCStore()
 	metadata, ok := st.(store.RaftControlMetadataStore)
 	require.True(t, ok)
@@ -210,9 +218,15 @@ func TestPrepareHomeRawTimestampBindingRemainsPendingAfterNewTermBarrier(t *test
 	require.Equal(t, 1, issues)
 
 	leader.term = 2
+	second, err := PrepareHomeRawTimestampBinding(t.Context(), leader, metadata, issue, request)
+	require.NoError(t, err)
+	require.Equal(t, uint64(42), second.Ts)
+	require.Equal(t, uint64(1), first.TimestampBindingAdmissionTerm)
+	require.Equal(t, uint64(2), second.TimestampBindingAdmissionTerm)
+	require.Equal(t, 2, issues)
 	_, err = PrepareHomeRawTimestampBinding(t.Context(), leader, metadata, issue, request)
 	require.ErrorIs(t, err, ErrTimestampBindingPending)
-	require.Equal(t, 1, issues)
+	require.Equal(t, 2, issues)
 }
 
 func TestPrepareHomeRawTimestampBindingRejectsTermChangeDuringRead(t *testing.T) {
@@ -261,8 +275,10 @@ func TestPrepareHomeRawTimestampBindingRejectsIssueAcrossTermChange(t *testing.T
 		return 42, nil
 	}, request)
 	require.ErrorIs(t, err, ErrTimestampBindingInvalid)
-	_, err = PrepareHomeRawTimestampBinding(t.Context(), leader, metadata, func(context.Context) (uint64, error) {
+	second, err := PrepareHomeRawTimestampBinding(t.Context(), leader, metadata, func(context.Context) (uint64, error) {
 		return 43, nil
 	}, request)
-	require.ErrorIs(t, err, ErrTimestampBindingPending)
+	require.NoError(t, err)
+	require.Equal(t, uint64(43), second.Ts)
+	require.Equal(t, uint64(2), second.TimestampBindingAdmissionTerm)
 }

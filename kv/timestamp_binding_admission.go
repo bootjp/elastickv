@@ -24,6 +24,7 @@ var homeBindingAttempts sync.Map // [16]byte -> *homeBindingAttempt
 type homeBindingAttempt struct {
 	mu      sync.Mutex
 	pending bool
+	term    uint64
 }
 
 func homeBindingLeaderTerm(leader raftengine.LeaderView) uint64 {
@@ -67,17 +68,13 @@ func PrepareHomeRawTimestampBinding(
 	}
 	owned := proto.CloneOf(request)
 	if found {
-		return prepareExistingHomeRawBinding(owned, bound, operationID)
+		return prepareExistingHomeRawBinding(owned, bound, operationID, term)
 	}
-	if attempt.pending {
-		return nil, errors.WithStack(ErrTimestampBindingPending)
+	if err := attempt.reserve(term); err != nil {
+		return nil, err
 	}
-	// A returned request can still be submitted after a term change. The
-	// applied read only fences proposals already submitted to Raft, so it
-	// cannot authorize reissuance while that request remains outstanding.
 	// An issue error may mean the timestamp was already handed to a proposer.
 	// Never release this ID on an unknown outcome, even if the caller cancels.
-	attempt.pending = true
 	timestamp, err := issue(ctx)
 	if err != nil {
 		return nil, errors.Wrap(err, "issue home write timestamp")
@@ -86,14 +83,27 @@ func PrepareHomeRawTimestampBinding(
 		return nil, errors.WithStack(ErrTimestampBindingInvalid)
 	}
 	owned.Ts = timestamp
+	owned.TimestampBindingAdmissionTerm = term
 	if _, err := timestampBindingForCreationRequest(owned); err != nil {
 		return nil, err
 	}
 	return owned, nil
 }
 
-func prepareExistingHomeRawBinding(owned *pb.Request, bound TimestampBinding, operationID [16]byte) (*pb.Request, error) {
+func (a *homeBindingAttempt) reserve(term uint64) error {
+	if a.pending && term <= a.term {
+		return errors.WithStack(ErrTimestampBindingPending)
+	}
+	// The current-term applied read proves the prior-term entry did not
+	// commit. A delayed prior-term request is rejected by ProposeIfTerm.
+	a.pending = true
+	a.term = term
+	return nil
+}
+
+func prepareExistingHomeRawBinding(owned *pb.Request, bound TimestampBinding, operationID [16]byte, term uint64) (*pb.Request, error) {
 	owned.Ts = bound.Timestamp
+	owned.TimestampBindingAdmissionTerm = term
 	candidate, err := timestampBindingForCreationRequest(owned)
 	if err != nil {
 		return nil, err
@@ -126,7 +136,7 @@ func validateHomeRawBindingInputs(leader raftengine.LeaderView, metadata store.R
 
 func rawBindingRequestUnstamped(request *pb.Request) bool {
 	return request != nil && !request.IsTxn && request.Phase == pb.Phase_NONE &&
-		request.Ts == 0 && request.TimestampAdmissionFloor == 0
+		request.Ts == 0 && request.TimestampAdmissionFloor == 0 && request.TimestampBindingAdmissionTerm == 0
 }
 
 func readHomeBinding(ctx context.Context, leader raftengine.LeaderView, metadata store.RaftControlMetadataStore,
