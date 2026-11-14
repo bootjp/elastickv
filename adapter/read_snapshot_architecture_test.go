@@ -107,7 +107,7 @@ func checkSnapshotFactoryFile(t *testing.T, fs *token.FileSet, name string, file
 func snapshotSourceName(node ast.Node) string {
 	switch n := node.(type) {
 	case *ast.Ident:
-		return n.Name
+		return snapshotIdentifierName(n)
 	case *ast.SelectorExpr:
 		// Exported capabilities must not escape through method values either.
 		if ast.IsExported(n.Sel.Name) {
@@ -120,6 +120,46 @@ func snapshotSourceName(node ast.Node) string {
 		case *ast.SelectorExpr:
 			return fn.Sel.Name
 		}
+	}
+	return ""
+}
+
+func isReadHelperReference(name string) bool {
+	return name == "eventualSnapshotTS" || strings.HasPrefix(name, "request") || strings.HasPrefix(name, "historical") || name == "authorizeHistoricalRead"
+}
+
+func TestSnapshotGuardDistinguishesFunctionAliasesFromTimestampData(t *testing.T) {
+	policy := map[string]map[string]bool{"LastCommitTS": {}, "eventualSnapshotTS": {}, "readTS": {}}
+	for _, tc := range []struct {
+		source   string
+		rejected bool
+	}{
+		{"var sample = store.MVCCStore.LastCommitTS", true},
+		{"var sample = eventualSnapshotTS", true},
+		{"func handler(){sample:=eventualSnapshotTS;sample(nil,st)}", true},
+		{"var readTS uint64;func handler(){_=readTS}", false},
+		{"func handler(){readTS:=uint64(42);_=readTS}", false},
+		{"func handler(){_=manifest.readTS}", false},
+	} {
+		file, err := parser.ParseFile(token.NewFileSet(), "fresh.go", "package adapter;"+tc.source, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rejected := len(requestReadViolations("fresh.go", file, policy)) > 0
+		if rejected != tc.rejected {
+			t.Errorf("rejected=%v, want %v: %s", rejected, tc.rejected, tc.source)
+		}
+	}
+}
+
+func snapshotIdentifierName(n *ast.Ident) string {
+	if n.Obj != nil && n.Obj.Kind == ast.Fun {
+		return n.Name
+	}
+	// Cross-file helper references have no parser-local object. Ordinary
+	// variables and fields named readTS are data, not function escapes.
+	if n.Obj == nil && isReadHelperReference(n.Name) {
+		return n.Name
 	}
 	return ""
 }
