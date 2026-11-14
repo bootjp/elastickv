@@ -1227,6 +1227,11 @@ func (r *RedisServer) tryBZPopMinWithMode(key []byte, fast bool, requestContexts
 	ctx, cancel := context.WithTimeout(r.redisContext(requestContexts...),
 		redisDispatchTimeout)
 	defer cancel()
+	// Retire this attempt's snapshots before an empty result enters BLOCK wait.
+	readRequest := kv.NewReadRequest(ctx, r.coordinator, r.store, r.readTracker)
+	defer readRequest.Close()
+	ctx = readRequest.Context()
+
 	var result *bzpopminResult
 	err := r.retryRedisWrite(ctx, func() error {
 		readTimestamp, err := r.beginTxnReadTimestamp(ctx, "redis bzpopmin: begin read timestamp")

@@ -33,7 +33,8 @@ snapshot; it is not a single-use token. Cancellation suppresses late results.
 `Close` cancels and joins in-flight reads and child scopes before releasing the
 shared MVCC retention pins. S3 admin streaming transfers ownership to the reader,
 which must be closed by its caller. Blocking Redis XREAD uses a child scope for
-initial dollar-ID resolution and each polling read. Those children close before
+initial dollar-ID resolution and each polling read. BZPOPMIN likewise owns a child
+scope through each pop attempt, including its transaction commit. Those children close before
 waiting for updates, so an idle command retains cancellation ownership without
 retaining completed polling snapshots or their GC pins.
 

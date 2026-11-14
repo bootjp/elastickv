@@ -37,7 +37,7 @@ func TestRedisXReadRetiresDollarAndPollingSnapshots(t *testing.T) {
 	require.NoError(t, server.resolveXReadAfterIDs(parent.Context(), &req))
 	require.Equal(t, "1-0", req.afterIDs[0])
 	require.Zero(t, tracker.Oldest(), "completed dollar resolution must release its snapshot")
-	assertRetiredXReadScopes(t, parent, observed.observed)
+	assertRetiredBlockingReadScopes(t, parent, observed.observed)
 	observed.observed = nil
 	for i := range 16 {
 		watermark := server.store.LastCommitTS() + 1
@@ -45,7 +45,7 @@ func TestRedisXReadRetiresDollarAndPollingSnapshots(t *testing.T) {
 		results, err := server.xreadOnce(parent.Context(), req)
 		require.NoError(t, err)
 		require.Empty(t, results)
-		assertRetiredXReadScopes(t, parent, observed.observed)
+		assertRetiredBlockingReadScopes(t, parent, observed.observed)
 		observed.observed = nil
 		require.Zero(t, tracker.Oldest(), "completed poll %d must release its snapshot", i)
 		require.NoError(t, parent.Context().Err(), "poll retirement must preserve the command owner")
@@ -54,7 +54,7 @@ func TestRedisXReadRetiresDollarAndPollingSnapshots(t *testing.T) {
 	_, err := server.xreadOnce(parent.Context(), req)
 	require.Error(t, err)
 	require.Zero(t, tracker.Oldest(), "failed polling reads must release their snapshots")
-	assertRetiredXReadScopes(t, parent, observed.observed)
+	assertRetiredBlockingReadScopes(t, parent, observed.observed)
 	require.NoError(t, parent.Context().Err())
 
 }
@@ -63,7 +63,7 @@ type readScopeSingleGroupCoordinator struct{ kv.Coordinator }
 
 func (*readScopeSingleGroupCoordinator) EngineGroupIDForKey([]byte) uint64 { return 1 }
 
-func assertRetiredXReadScopes(t *testing.T, parent *kv.ReadRequest, scopes []*kv.ReadRequest) {
+func assertRetiredBlockingReadScopes(t *testing.T, parent *kv.ReadRequest, scopes []*kv.ReadRequest) {
 	t.Helper()
 	require.NotEmpty(t, scopes)
 	for _, scope := range scopes {
@@ -72,4 +72,47 @@ func assertRetiredXReadScopes(t *testing.T, parent *kv.ReadRequest, scopes []*kv
 		_, err := scope.Issued(scope.Context(), 1)
 		require.ErrorIs(t, err, kv.ErrReadRequestClosed)
 	}
+}
+
+func TestRedisBZPopMinRetiresAttemptSnapshots(t *testing.T) {
+	server, owner := redisPropagationServer(t)
+	redisPropagationCommand(t, server, cmdSet, "unrelated", "initial")
+	observed := &requestScopeStore{MVCCStore: server.store}
+	server.store = observed
+	tracker := kv.NewActiveTimestampTracker()
+	server.readTracker = tracker
+	parent := kv.NewReadRequest(context.WithValue(owner.Context(), redisOwnedRequestKey{}, true), server.coordinator, server.store, tracker)
+	defer parent.Close()
+	for _, fast := range []bool{false, true} {
+		for i := range 8 {
+			watermark := server.store.LastCommitTS() + 1
+			require.NoError(t, server.store.PutAt(parent.Context(), []byte("unrelated"), []byte{byte(i)}, watermark, 0))
+			result, err := server.tryBZPopMinWithMode([]byte("empty"), fast, parent.Context())
+			require.NoError(t, err)
+			require.Nil(t, result)
+			require.Zero(t, tracker.Oldest(), "completed BZPOPMIN attempts must release pins")
+			assertRetiredBlockingReadScopes(t, parent, observed.observed)
+			observed.observed = nil
+			require.NoError(t, parent.Context().Err())
+		}
+	}
+	redisPropagationCommand(t, server, cmdZAdd, "zset", "1", "member")
+	observed.observed = nil
+	result, err := server.tryBZPopMinWithMode([]byte("zset"), false, parent.Context())
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Equal(t, "member", result.entry.Member)
+	require.Zero(t, tracker.Oldest())
+	assertRetiredBlockingReadScopes(t, parent, observed.observed)
+	observed.observed = nil
+	result, err = server.tryBZPopMinWithMode([]byte("zset"), false, parent.Context())
+	require.NoError(t, err)
+	require.Nil(t, result)
+	require.Zero(t, tracker.Oldest())
+	observed.observed = nil
+	_, err = server.tryBZPopMinWithMode([]byte("unrelated"), false, parent.Context())
+	require.ErrorContains(t, err, "WRONGTYPE")
+	require.Zero(t, tracker.Oldest())
+	assertRetiredBlockingReadScopes(t, parent, observed.observed)
+	require.NoError(t, parent.Context().Err())
 }
