@@ -717,7 +717,7 @@ func (r *RedisServer) streamWriteBase(ctx context.Context, key []byte, readTS ui
 // that touches a stream also evicts any stale legacy data.
 func (r *RedisServer) legacyStreamCleanupElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
 	legacyKey := redisStreamKey(key)
-	exists, err := r.store.ExistsAt(ctx, legacyKey, readTS)
+	exists, err := requestExistsAt(ctx, r.store, legacyKey, readTS)
 	if err != nil {
 		return nil, cockerrors.WithStack(err)
 	}
@@ -776,7 +776,7 @@ func (r *RedisServer) buildXTrimHeadElems(
 	}
 	prefix := store.StreamEntryScanPrefix(key)
 	end := store.PrefixScanEnd(prefix)
-	kvs, err := r.store.ScanAt(ctx, store.StreamEntryScanStart(key, meta), end, count, readTS)
+	kvs, err := requestScanAt(ctx, r.store, store.StreamEntryScanStart(key, meta), end, count, readTS)
 	if err != nil {
 		return nil, streamTrimCursor{}, cockerrors.WithStack(err)
 	}
@@ -1115,6 +1115,12 @@ func (r *RedisServer) resolveXReadAfterIDs(ctx context.Context, req *xreadReques
 // the caller's cancellation/deadline so the resolve step doesn't survive
 // past a BLOCK-window cancel.
 func (r *RedisServer) resolveXReadDollarID(ctx context.Context, key []byte) (string, error) {
+	// Each bounded read owns its snapshots; an idle BLOCK command must not
+	// retain earlier polling timestamps or pin unrelated MVCC history.
+	readRequest := kv.NewReadRequest(ctx, r.coordinator, r.store, r.readTracker)
+	defer readRequest.Close()
+	ctx = readRequest.Context()
+
 	readTS, err := r.snapshotReadTS(ctx)
 	if err != nil {
 		return "", err
@@ -1153,6 +1159,12 @@ func (r *RedisServer) dollarIDFromState(ctx context.Context, key []byte, readTS 
 }
 
 func (r *RedisServer) xreadOnce(ctx context.Context, req xreadRequest) ([]xreadResult, error) {
+	// Each bounded read owns its snapshots; an idle BLOCK command must not
+	// retain earlier polling timestamps or pin unrelated MVCC history.
+	readRequest := kv.NewReadRequest(ctx, r.coordinator, r.store, r.readTracker)
+	defer readRequest.Close()
+	ctx = readRequest.Context()
+
 	results := make([]xreadResult, 0, len(req.keys))
 	for i, key := range req.keys {
 		r.observeBlockingRedisKeys(ctx, [][]byte{key})
@@ -1233,7 +1245,7 @@ func (r *RedisServer) scanStreamEntriesAfter(
 	if unbounded {
 		limit = maxWideScanLimit
 	}
-	kvs, err := r.store.ScanAt(ctx, start, end, limit, readTS)
+	kvs, err := requestScanAt(ctx, r.store, start, end, limit, readTS)
 	if err != nil {
 		return nil, cockerrors.WithStack(err)
 	}
@@ -1783,9 +1795,9 @@ func (r *RedisServer) scanStreamRangeKVs(
 	}
 	var kvs []*store.KVPair
 	if reverse {
-		kvs, err = r.store.ReverseScanAt(ctx, scanStart, scanEnd, limit, readTS)
+		kvs, err = requestReverseScanAt(ctx, r.store, scanStart, scanEnd, limit, readTS)
 	} else {
-		kvs, err = r.store.ScanAt(ctx, scanStart, scanEnd, limit, readTS)
+		kvs, err = requestScanAt(ctx, r.store, scanStart, scanEnd, limit, readTS)
 	}
 	if err != nil {
 		return nil, cockerrors.WithStack(err)

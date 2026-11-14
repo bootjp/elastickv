@@ -49,7 +49,7 @@ const (
 // legacy blob exists. The base meta key is also written with the migrated count
 // so that resolveZSetMeta works correctly after migration.
 func (r *RedisServer) buildZSetLegacyMigrationElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
-	raw, err := r.store.GetAt(ctx, redisZSetKey(key), readTS)
+	raw, err := requestGetAt(ctx, r.store, redisZSetKey(key), readTS)
 	if cockerrors.Is(err, store.ErrKeyNotFound) {
 		return nil, nil
 	}
@@ -106,7 +106,7 @@ func (r *RedisServer) buildZSetLegacyMigrationElems(ctx context.Context, key []b
 // first so the negative case (missing, legacy-blob, wrong-type) does
 // not pay the priority-guard seek.
 func (r *RedisServer) zsetMemberFastScore(ctx context.Context, key, member []byte, readTS uint64) (score float64, hit, alive bool, err error) {
-	raw, err := r.store.GetAt(ctx, store.ZSetMemberKey(key, member), readTS)
+	raw, err := requestGetAt(ctx, r.store, store.ZSetMemberKey(key, member), readTS)
 	if err != nil {
 		if cockerrors.Is(err, store.ErrKeyNotFound) {
 			return 0, false, false, nil
@@ -264,7 +264,7 @@ func zsetFastPathTruncated(scannedRows, scanLimit, matchingEntries, offset, limi
 // blob zset is present; the caller must take the slow path so
 // ensureZSetLoaded / blob decoding runs.
 func (r *RedisServer) zsetFastPathEligible(ctx context.Context, key []byte, readTS uint64) (bool, error) {
-	legacyExists, err := r.store.ExistsAt(ctx, redisZSetKey(key), readTS)
+	legacyExists, err := requestExistsAt(ctx, r.store, redisZSetKey(key), readTS)
 	if err != nil {
 		return false, cockerrors.WithStack(err)
 	}
@@ -314,10 +314,10 @@ func (r *RedisServer) zsetScoreScan(
 	ctx context.Context, startKey, endKey []byte, scanLimit int, reverse bool, readTS uint64,
 ) ([]*store.KVPair, error) {
 	if reverse {
-		kvs, err := r.store.ReverseScanAt(ctx, startKey, endKey, scanLimit, readTS)
+		kvs, err := requestReverseScanAt(ctx, r.store, startKey, endKey, scanLimit, readTS)
 		return kvs, cockerrors.WithStack(err)
 	}
-	kvs, err := r.store.ScanAt(ctx, startKey, endKey, scanLimit, readTS)
+	kvs, err := requestScanAt(ctx, r.store, startKey, endKey, scanLimit, readTS)
 	return kvs, cockerrors.WithStack(err)
 }
 
@@ -574,7 +574,7 @@ func (r *RedisServer) resolveZSetMemberScore(ctx context.Context, memberKey []by
 	if ignoreExisting {
 		return 0, false, nil
 	}
-	raw, getErr := r.store.GetAt(ctx, memberKey, readTS)
+	raw, getErr := requestGetAt(ctx, r.store, memberKey, readTS)
 	if getErr == nil {
 		s, unmarshalErr := store.UnmarshalZSetScore(raw)
 		if unmarshalErr != nil {
@@ -891,7 +891,7 @@ func (r *RedisServer) persistZSetEntriesTxn(ctx context.Context, key []byte, rea
 
 	memberPrefix := store.ZSetMemberScanPrefix(key)
 	memberEnd := store.PrefixScanEnd(memberPrefix)
-	probeKVs, probeErr := r.store.ScanAt(ctx, memberPrefix, memberEnd, 1, readTS)
+	probeKVs, probeErr := requestScanAt(ctx, r.store, memberPrefix, memberEnd, 1, readTS)
 	if probeErr != nil {
 		return cockerrors.WithStack(probeErr)
 	}
@@ -953,7 +953,7 @@ func (r *RedisServer) persistZSetRemovalsTxn(ctx context.Context, key []byte, re
 	}
 	memberPrefix := store.ZSetMemberScanPrefix(key)
 	memberEnd := store.PrefixScanEnd(memberPrefix)
-	probeKVs, err := r.store.ScanAt(ctx, memberPrefix, memberEnd, 1, readTS)
+	probeKVs, err := requestScanAt(ctx, r.store, memberPrefix, memberEnd, 1, readTS)
 	if err != nil {
 		return cockerrors.WithStack(err)
 	}
@@ -1133,7 +1133,7 @@ func (r *RedisServer) zremTypeAt(ctx context.Context, key []byte, readTS uint64,
 }
 
 func (r *RedisServer) legacyZSetTypeAt(ctx context.Context, key []byte, readTS uint64) (redisValueType, error) {
-	exists, err := r.store.ExistsAt(ctx, redisZSetKey(key), readTS)
+	exists, err := requestExistsAt(ctx, r.store, redisZSetKey(key), readTS)
 	if err != nil {
 		return redisTypeNone, cockerrors.WithStack(err)
 	}
@@ -1227,6 +1227,11 @@ func (r *RedisServer) tryBZPopMinWithMode(key []byte, fast bool, requestContexts
 	ctx, cancel := context.WithTimeout(r.redisContext(requestContexts...),
 		redisDispatchTimeout)
 	defer cancel()
+	// Retire this attempt's snapshots before an empty result enters BLOCK wait.
+	readRequest := kv.NewReadRequest(ctx, r.coordinator, r.store, r.readTracker)
+	defer readRequest.Close()
+	ctx = readRequest.Context()
+
 	var result *bzpopminResult
 	err := r.retryRedisWrite(ctx, func() error {
 		readTimestamp, err := r.beginTxnReadTimestamp(ctx, "redis bzpopmin: begin read timestamp")
@@ -1323,7 +1328,7 @@ func (r *RedisServer) bzpopminWideScoreCandidateAt(ctx context.Context, key []by
 	}
 	scorePrefix := store.ZSetScoreScanPrefix(key)
 	scoreEnd := store.PrefixScanEnd(scorePrefix)
-	scoreKVs, err := r.store.ScanAt(ctx, scorePrefix, scoreEnd, bzpopminScoreScanLimit, readTS)
+	scoreKVs, err := requestScanAt(ctx, r.store, scorePrefix, scoreEnd, bzpopminScoreScanLimit, readTS)
 	if err != nil {
 		return nil, false, cockerrors.WithStack(err)
 	}
@@ -1376,8 +1381,9 @@ func (r *RedisServer) zsetScoreIndexCoverageAt(
 	readTS uint64,
 ) (zsetIndexCoverage, error) {
 	memberPrefix := store.ZSetMemberScanPrefix(key)
-	memberKeys, err := r.store.ScanKeysAt(
-		ctx, memberPrefix, store.PrefixScanEnd(memberPrefix), bzpopminIndexProofLimit+1, readTS)
+	memberKeys, err := requestScanKeysAt(
+		ctx, r.store,
+		memberPrefix, store.PrefixScanEnd(memberPrefix), bzpopminIndexProofLimit+1, readTS)
 	if err != nil {
 		return zsetIndexCoverage{}, cockerrors.WithStack(err)
 	}
@@ -1386,8 +1392,9 @@ func (r *RedisServer) zsetScoreIndexCoverageAt(
 		return cover, nil
 	}
 	scorePrefix := store.ZSetScoreScanPrefix(key)
-	scoreKeys, err := r.store.ScanKeysAt(
-		ctx, scorePrefix, store.PrefixScanEnd(scorePrefix), len(memberKeys), readTS)
+	scoreKeys, err := requestScanKeysAt(
+		ctx, r.store,
+		scorePrefix, store.PrefixScanEnd(scorePrefix), len(memberKeys), readTS)
 	if err != nil {
 		return zsetIndexCoverage{}, cockerrors.WithStack(err)
 	}
@@ -1418,7 +1425,7 @@ func (r *RedisServer) bzpopminMetaProbeAt(ctx context.Context, key []byte, readT
 }
 
 func (r *RedisServer) zsetBaseMetaExistsAt(ctx context.Context, key []byte, readTS uint64) (bool, error) {
-	_, err := r.store.GetAt(ctx, store.ZSetMetaKey(key), readTS)
+	_, err := requestGetAt(ctx, r.store, store.ZSetMetaKey(key), readTS)
 	if cockerrors.Is(err, store.ErrKeyNotFound) {
 		return false, nil
 	}
@@ -1451,7 +1458,7 @@ func bzpopminScoreCandidateFromKVs(key []byte, scoreKVs []*store.KVPair) (*bzpop
 func (r *RedisServer) bzpopminMemberOnlyCandidateAt(ctx context.Context, key []byte, readTS uint64) (*bzpopminCandidate, error) {
 	memberPrefix := store.ZSetMemberScanPrefix(key)
 	memberEnd := store.PrefixScanEnd(memberPrefix)
-	memberKVs, err := r.store.ScanAt(ctx, memberPrefix, memberEnd, 1, readTS)
+	memberKVs, err := requestScanAt(ctx, r.store, memberPrefix, memberEnd, 1, readTS)
 	if err != nil {
 		return nil, cockerrors.WithStack(err)
 	}
@@ -1474,7 +1481,7 @@ func (r *RedisServer) bzpopminMemberOnlyCandidateAt(ctx context.Context, key []b
 }
 
 func (r *RedisServer) bzpopminLegacyCandidateAt(ctx context.Context, key []byte, readTS uint64) (*bzpopminCandidate, error) {
-	raw, err := r.store.GetAt(ctx, redisZSetKey(key), readTS)
+	raw, err := requestGetAt(ctx, r.store, redisZSetKey(key), readTS)
 	if err != nil {
 		if cockerrors.Is(err, store.ErrKeyNotFound) {
 			return nil, nil

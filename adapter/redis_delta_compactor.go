@@ -493,7 +493,7 @@ func (c *DeltaCompactor) scanDeltaRaw(ctx context.Context, h collectionDeltaHand
 	c.cursorMu.Unlock()
 
 	end := store.PrefixScanEnd(h.prefix)
-	kvs, err := c.st.ScanAt(ctx, start, end, deltaCompactorTickScanLimit, readTS)
+	kvs, err := requestScanAt(ctx, c.st, start, end, deltaCompactorTickScanLimit, readTS)
 	if err != nil {
 		return nil, false, errors.WithStack(err)
 	}
@@ -778,7 +778,7 @@ func (c *DeltaCompactor) dispatchCompaction(ctx context.Context, readTS uint64, 
 // loadListBaseMeta reads the base list metadata key. Returns a zero ListMeta
 // if the key does not exist (all state may be in uncompacted delta keys).
 func (c *DeltaCompactor) loadListBaseMeta(ctx context.Context, userKey []byte, readTS uint64) (store.ListMeta, []byte, error) {
-	raw, err := c.st.GetAt(ctx, store.ListMetaKey(userKey), readTS)
+	raw, err := requestGetAt(ctx, c.st, store.ListMetaKey(userKey), readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return store.ListMeta{}, nil, nil
@@ -815,7 +815,7 @@ func compactedMetaExpireAt(
 
 func legacyTTLMillisWithCommitTSAt(ctx context.Context, st store.MVCCStore, userKey []byte, readTS uint64) (uint64, uint64, bool, error) {
 	ttlKey := redisTTLKey(userKey)
-	raw, err := st.GetAt(ctx, ttlKey, readTS)
+	raw, err := requestGetAt(ctx, st, ttlKey, readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return 0, 0, false, nil
@@ -975,7 +975,7 @@ func (c *DeltaCompactor) collectStaleClaimElems(ctx context.Context, userKey []b
 
 	// Stale LPOP claims: claim keys for seq < newMeta.Head.
 	lpopEnd := store.ListClaimKey(userKey, newMeta.Head)
-	lpopKVs, err := c.st.ScanAt(ctx, claimPrefix, lpopEnd, deltaCompactorTickScanLimit, readTS)
+	lpopKVs, err := requestScanAt(ctx, c.st, claimPrefix, lpopEnd, deltaCompactorTickScanLimit, readTS)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -985,7 +985,7 @@ func (c *DeltaCompactor) collectStaleClaimElems(ctx context.Context, userKey []b
 
 	// Stale RPOP claims: claim keys for seq >= newMeta.Tail.
 	rpopStart := store.ListClaimKey(userKey, newMeta.Tail)
-	rpopKVs, err := c.st.ScanAt(ctx, rpopStart, claimPrefixEnd, deltaCompactorTickScanLimit, readTS)
+	rpopKVs, err := requestScanAt(ctx, c.st, rpopStart, claimPrefixEnd, deltaCompactorTickScanLimit, readTS)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -1150,7 +1150,7 @@ func (c *DeltaCompactor) buildSimpleCompactElems(
 	unmarshalDelta func([]byte) (int64, error),
 	marshalBase func(int64, uint64) []byte,
 ) ([]*kv.Elem[kv.OP], error) {
-	raw, err := c.st.GetAt(ctx, metaKey, readTS)
+	raw, err := requestGetAt(ctx, c.st, metaKey, readTS)
 	var baseLen int64
 	var expireAt uint64
 	if err != nil && !errors.Is(err, store.ErrKeyNotFound) {
@@ -1186,7 +1186,7 @@ func (r *RedisServer) listInlineMetaCompactionElems(
 ) ([]*kv.Elem[kv.OP], bool, error) {
 	prefix := store.ListMetaDeltaScanPrefix(key)
 	end := store.PrefixScanEnd(prefix)
-	deltaKVs, err := r.store.ScanAt(ctx, prefix, end, listInlineMetaCompactionThreshold+1, readTS)
+	deltaKVs, err := requestScanAt(ctx, r.store, prefix, end, listInlineMetaCompactionThreshold+1, readTS)
 	if err != nil {
 		return nil, false, errors.WithStack(err)
 	}
@@ -1211,7 +1211,7 @@ func (r *RedisServer) listInlineMetaCompactionElems(
 }
 
 func (r *RedisServer) loadListBaseMetaForInlineCompaction(ctx context.Context, key []byte, readTS uint64) (store.ListMeta, []byte, error) {
-	raw, err := r.store.GetAt(ctx, store.ListMetaKey(key), readTS)
+	raw, err := requestGetAt(ctx, r.store, store.ListMetaKey(key), readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return store.ListMeta{}, nil, nil
@@ -1265,14 +1265,14 @@ func (r *RedisServer) zsetInlineMetaCompactionElems(
 	prefix := store.ZSetMetaDeltaScanPrefix(key)
 	end := store.PrefixScanEnd(prefix)
 	// Scan threshold+1 to distinguish "exactly threshold" from "below threshold".
-	deltaKVs, err := r.store.ScanAt(ctx, prefix, end, zsetInlineMetaCompactionThreshold+1, readTS)
+	deltaKVs, err := requestScanAt(ctx, r.store, prefix, end, zsetInlineMetaCompactionThreshold+1, readTS)
 	if err != nil {
 		return nil, false, errors.WithStack(err)
 	}
 	if len(deltaKVs) < zsetInlineMetaCompactionThreshold {
 		return nil, false, nil
 	}
-	raw, err := r.store.GetAt(ctx, store.ZSetMetaKey(key), readTS)
+	raw, err := requestGetAt(ctx, r.store, store.ZSetMetaKey(key), readTS)
 	var baseLen int64
 	var expireAt uint64
 	if err != nil && !errors.Is(err, store.ErrKeyNotFound) {

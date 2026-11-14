@@ -58,6 +58,10 @@ type AdminQueueCounters struct {
 // path; runs on follower or leader and uses the same scanQueueNames
 // helper the SigV4 ListQueues handler does.
 func (s *SQSServer) AdminListQueues(ctx context.Context) ([]string, error) {
+	readRequest := s.newReadRequest(ctx)
+	defer readRequest.Close()
+	ctx = readRequest.Context()
+
 	return s.scanQueueNames(ctx) //nolint:wrapcheck // pure pass-through; the adapter owns the error context.
 }
 
@@ -93,6 +97,10 @@ type AdminDescribeQueueOptions struct {
 // options retain the cheap path; Phase 4 wiring opts in when the SPA
 // needs the DLQ relationship.
 func (s *SQSServer) AdminDescribeQueue(ctx context.Context, name string, opts ...AdminDescribeQueueOptions) (*AdminQueueSummary, bool, error) {
+	readRequest := s.newReadRequest(ctx)
+	defer readRequest.Close()
+	ctx = readRequest.Context()
+
 	if strings.TrimSpace(name) == "" {
 		return nil, false, ErrAdminSQSValidation
 	}
@@ -172,7 +180,7 @@ func (s *SQSServer) findQueuesPointingAt(ctx context.Context, dlqName string, re
 	start := bytes.Clone(prefix)
 	var sources []string
 	for {
-		page, err := s.store.ScanAt(ctx, start, end, sqsQueueScanPageLimit, readTS)
+		page, err := requestScanAt(ctx, s.store, start, end, sqsQueueScanPageLimit, readTS)
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}
@@ -320,6 +328,10 @@ func (e *PurgeInProgressError) Is(target error) bool {
 //     ErrAdminSQSPurgeInProgress, RetryAfter carries the duration.
 //   - ErrAdminSQSValidation      — malformed queue name
 func (s *SQSServer) AdminPurgeQueue(ctx context.Context, principal AdminPrincipal, name string) (AdminPurgeResult, error) {
+	readRequest := s.newReadRequest(ctx)
+	defer readRequest.Close()
+	ctx = readRequest.Context()
+
 	if !principal.Role.canWrite() {
 		s.recordAdminPurge(ctx, principal, name, adminOutcomeForbidden)
 		return AdminPurgeResult{}, ErrAdminForbidden
@@ -461,6 +473,10 @@ func (s *SQSServer) observeAdminPeek(queue, outcome string) {
 // RedriveAllowPolicy through the same validator the public SQS API
 // uses.
 func (s *SQSServer) AdminSetQueueAttributes(ctx context.Context, principal AdminPrincipal, name string, attrs map[string]string) error {
+	readRequest := s.newReadRequest(ctx)
+	defer readRequest.Close()
+	ctx = readRequest.Context()
+
 	if !principal.Role.canWrite() {
 		return ErrAdminForbidden
 	}
@@ -490,6 +506,10 @@ func (s *SQSServer) AdminSetQueueAttributes(ctx context.Context, principal Admin
 // AdminCreateQueue creates a queue through the public SQS validator and
 // Raft write path, with admin role and leadership checks.
 func (s *SQSServer) AdminCreateQueue(ctx context.Context, principal AdminPrincipal, name string, attrs map[string]string) error {
+	readRequest := s.newReadRequest(ctx)
+	defer readRequest.Close()
+	ctx = readRequest.Context()
+
 	if !principal.Role.canWrite() {
 		return ErrAdminForbidden
 	}
@@ -519,6 +539,10 @@ func (s *SQSServer) AdminCreateQueue(ctx context.Context, principal AdminPrincip
 // side: ErrAdminForbidden on a read-only principal, ErrAdminNotLeader
 // on a follower, ErrAdminSQSNotFound when the queue is absent.
 func (s *SQSServer) AdminDeleteQueue(ctx context.Context, principal AdminPrincipal, name string) error {
+	readRequest := s.newReadRequest(ctx)
+	defer readRequest.Close()
+	ctx = readRequest.Context()
+
 	if !principal.Role.canWrite() {
 		return ErrAdminForbidden
 	}

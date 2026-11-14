@@ -13,35 +13,58 @@
             [jepsen.client :as client]
             [jepsen.generator :as gen]))
 
-(defn- receive-and-delete! [conn queue-url]
-  (let [messages (:Messages (sqs/invoke! conn :ReceiveMessage
-                              {:QueueUrl queue-url
-                               :MaxNumberOfMessages 10
-                               :VisibilityTimeout 30
-                               :WaitTimeSeconds 1}))
-        acknowledgements
-        (mapv (fn [message]
-                (try
-                  (sqs/invoke! conn :DeleteMessage
-                               {:QueueUrl queue-url
-                                :ReceiptHandle (:ReceiptHandle message)})
-                  {:deleted (:Body message)}
-                  (catch Exception e
-                    {:error (.getMessage e)
-                     :details {:body (:Body message)
-                               :type (:type (ex-data e))
-                               :category (:category (ex-data e))
-                               :response (select-keys (:resp (ex-data e))
-                                                      [:Error :ErrorResponse :__type
-                                                       :Message :message
-                                                       :cognitect.anomalies/message])}})))
-              messages)]
-    {:value (mapv :Body messages)
-     :deleted (mapv :deleted (filter #(contains? % :deleted) acknowledgements))
-     :delete-errors (mapv :error (filter :error acknowledgements))
-     :delete-error-details (mapv :details (filter :error acknowledgements))}))
+(deftype PendingDeletes [state]
+  Object
+  (toString [_] "pending delete receipts (redacted)"))
 
-(defrecord StandardClient [node->port region queue-name counter conn queue-url]
+(defn- delete-receipt! [conn queue-url pending body receipt]
+  (try
+    (sqs/invoke! conn :DeleteMessage {:QueueUrl queue-url :ReceiptHandle receipt})
+    {:deleted body :receipt receipt}
+    (catch Exception e
+      (swap! (.-state ^PendingDeletes pending) assoc receipt body)
+      {:receipt receipt
+       :error (.getMessage e)
+       :details {:body body
+                 :type (:type (ex-data e))
+                 :category (:category (ex-data e))
+                 :response (select-keys (:resp (ex-data e))
+                                        [:Error :ErrorResponse :__type
+                                         :Message :message
+                                         :cognitect.anomalies/message])}})))
+
+(defn- receive-and-delete! [conn queue-url pending]
+  ;; All copies of this queue's client share this lock and debt. No receive may
+  ;; rotate a receipt while its DeleteMessage outcome is unknown. In particular,
+  ;; a successful retry cannot be the stale-handle no-op permitted by SQS.
+  (locking pending
+    (let [debt (take 10 @(.-state ^PendingDeletes pending))
+          ;; A retry is its own observable Jepsen operation, including during
+          ;; faults. Record its evidence before attempting another receive.
+          messages (if (seq debt)
+                     []
+                     (:Messages (sqs/invoke! conn :ReceiveMessage
+                                  {:QueueUrl queue-url
+                                   :MaxNumberOfMessages 10
+                                   :VisibilityTimeout 30
+                                   :WaitTimeSeconds 1})))
+          receipts (if (seq debt)
+                     debt
+                     (map (juxt :ReceiptHandle :Body) messages))
+          acknowledgements (mapv (fn [[receipt body]]
+                                   (delete-receipt! conn queue-url pending body receipt))
+                                 receipts)
+          confirmed (filter #(contains? % :deleted) acknowledgements)]
+      (swap! (.-state ^PendingDeletes pending)
+             #(apply dissoc % (map :receipt confirmed)))
+      {:value (mapv :Body messages)
+       :receive-performed? (empty? debt)
+       :deleted (mapv :deleted confirmed)
+       :delete-retry-count (count debt)
+       :delete-errors (mapv :error (filter :error acknowledgements))
+       :delete-error-details (mapv :details (filter :error acknowledgements))})))
+
+(defrecord StandardClient [node->port region queue-name counter conn queue-url pending-deletes]
   client/Client
   (open! [this test node]
     (assoc this :conn (sqs/make-client (or (:sqs-host test) (name node))
@@ -64,7 +87,7 @@
           :send (do (sqs/invoke! conn :SendMessage
                                 {:QueueUrl @queue-url :MessageBody (:value op)})
                     (assoc op :type :ok))
-          :recv (merge op {:type :ok} (receive-and-delete! conn @queue-url)))
+          :recv (merge op {:type :ok} (receive-and-delete! conn @queue-url pending-deletes)))
         (catch Exception e
           ;; A transport error or server error may happen after commit.
           ;; Conservatively keep these sends in the possible-send set.
@@ -103,7 +126,7 @@
   {:client (->StandardClient (:node->port opts) (:sqs-region opts)
                              (or (:queue-name opts)
                                  (str "jepsen-standard-" (java.util.UUID/randomUUID)))
-                             (atom 0) nil (atom nil))
+                             (atom 0) nil (atom nil) (PendingDeletes. (atom {})))
    :generator (gen/mix [(gen/repeat {:f :send}) (gen/repeat {:f :recv})])
    :checker (standard-checker)})
 

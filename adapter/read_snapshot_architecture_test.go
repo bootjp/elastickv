@@ -40,9 +40,9 @@ func TestReadSnapshotConstructionIsCentralized(t *testing.T) {
 		},
 		"GlobalLastCommitTS": {}, // best-effort RPC fallback must never select a latest snapshot
 		"eventualSnapshotTS": {
-			"dynamodb_query_scan.go:resolveDynamoReadTS": true,
+			"dynamodb_query_scan.go:resolveDynamoReadSnapshot": true,
 			// Speculative schema validation only; actual strong reads fence separately.
-			"dynamodb_lease.go:multiShardReadLeasePlan":    true,
+			"dynamodb_lease.go:loadSpeculativeSchema":      true,
 			"dynamodb_lease.go:queryLeaseKey":              true,
 			"dynamodb_lease.go:resolveTransactGetItemKeys": true,
 		},
@@ -51,7 +51,7 @@ func TestReadSnapshotConstructionIsCentralized(t *testing.T) {
 			"redis_txn.go:beginTargetReadSnapshot":     true,
 			// These consume committed seals or explicit migration snapshots, rather
 			// than selecting latest reads from local watermarks.
-			"dynamodb_locks.go:tryTxnWriteTimestamp":                                   true,
+			"dynamodb_locks.go:sealedReadTimestamp":                                    true,
 			"migration_ownership_refresh_attestation.go:issueMigrationPartitionReadTS": true,
 			"read_snapshot.go:beginCatalogReadSnapshot":                                true,
 			"split_job_runner.go:ensureSplitJobCatalogFence":                           true,
@@ -81,12 +81,19 @@ func TestReadSnapshotConstructionIsCentralized(t *testing.T) {
 func checkSnapshotFactoryFile(t *testing.T, fs *token.FileSet, name string, file *ast.File, allowed map[string]map[string]bool) {
 	t.Helper()
 	for _, decl := range file.Decls {
-		fn, ok := decl.(*ast.FuncDecl)
-		if !ok || fn.Body == nil {
+		if general, ok := decl.(*ast.GenDecl); ok && general.Tok == token.TYPE {
 			continue
 		}
-		scope := filepath.Base(name) + ":" + fn.Name.Name
-		ast.Inspect(fn.Body, func(node ast.Node) bool {
+		scope := filepath.Base(name) + ":<package>"
+		var root ast.Node = decl
+		if fn, ok := decl.(*ast.FuncDecl); ok {
+			if fn.Body == nil {
+				continue
+			}
+			scope = filepath.Base(name) + ":" + fn.Name.Name
+			root = fn.Body
+		}
+		ast.Inspect(root, func(node ast.Node) bool {
 			callee := snapshotSourceName(node)
 			scopes, guarded := allowed[callee]
 			if guarded && !scopes[scope] {
@@ -99,6 +106,8 @@ func checkSnapshotFactoryFile(t *testing.T, fs *token.FileSet, name string, file
 
 func snapshotSourceName(node ast.Node) string {
 	switch n := node.(type) {
+	case *ast.Ident:
+		return snapshotIdentifierName(n)
 	case *ast.SelectorExpr:
 		// Exported capabilities must not escape through method values either.
 		if ast.IsExported(n.Sel.Name) {
@@ -111,6 +120,46 @@ func snapshotSourceName(node ast.Node) string {
 		case *ast.SelectorExpr:
 			return fn.Sel.Name
 		}
+	}
+	return ""
+}
+
+func isReadHelperReference(name string) bool {
+	return name == "eventualSnapshotTS" || strings.HasPrefix(name, "request") || strings.HasPrefix(name, "historical") || name == "authorizeHistoricalRead" || name == "manifestVersionGetAt"
+}
+
+func TestSnapshotGuardDistinguishesFunctionAliasesFromTimestampData(t *testing.T) {
+	policy := map[string]map[string]bool{"LastCommitTS": {}, "eventualSnapshotTS": {}, "readTS": {}}
+	for _, tc := range []struct {
+		source   string
+		rejected bool
+	}{
+		{"var sample = store.MVCCStore.LastCommitTS", true},
+		{"var sample = eventualSnapshotTS", true},
+		{"func handler(){sample:=eventualSnapshotTS;sample(nil,st)}", true},
+		{"var readTS uint64;func handler(){_=readTS}", false},
+		{"func handler(){readTS:=uint64(42);_=readTS}", false},
+		{"func handler(){_=manifest.readTS}", false},
+	} {
+		file, err := parser.ParseFile(token.NewFileSet(), "fresh.go", "package adapter;"+tc.source, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rejected := len(requestReadViolations("fresh.go", file, policy)) > 0
+		if rejected != tc.rejected {
+			t.Errorf("rejected=%v, want %v: %s", rejected, tc.rejected, tc.source)
+		}
+	}
+}
+
+func snapshotIdentifierName(n *ast.Ident) string {
+	if n.Obj != nil && n.Obj.Kind == ast.Fun {
+		return n.Name
+	}
+	// Cross-file helper references have no parser-local object. Ordinary
+	// variables and fields named readTS are data, not function escapes.
+	if n.Obj == nil && isReadHelperReference(n.Name) {
+		return n.Name
 	}
 	return ""
 }

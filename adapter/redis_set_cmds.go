@@ -73,7 +73,7 @@ func (r *RedisServer) hllExistsAt(key []byte, readTS uint64, requestContexts ...
 }
 
 func (r *RedisServer) hllAnchorExistsAt(ctx context.Context, key []byte, readTS uint64) (bool, error) {
-	exists, err := r.store.ExistsAt(ctx, redisHLLKey(key), readTS)
+	exists, err := requestExistsAt(ctx, r.store, redisHLLKey(key), readTS)
 	if err != nil {
 		return false, fmt.Errorf("exists hll: %w", err)
 	}
@@ -84,7 +84,7 @@ func (r *RedisServer) hllAnchorExistsAt(ctx context.Context, key []byte, readTS 
 // !redis|set| blob to wide-column !st|mem| keys. Returns nil if no legacy
 // blob exists.
 func (r *RedisServer) buildSetLegacyMigrationElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
-	raw, err := r.store.GetAt(ctx, redisSetKey(key), readTS)
+	raw, err := requestGetAt(ctx, r.store, redisSetKey(key), readTS)
 	if cockerrors.Is(err, store.ErrKeyNotFound) {
 		return nil, nil
 	}
@@ -507,7 +507,7 @@ func (r *RedisServer) scanZSetMemberScoreMap(ctx context.Context, key []byte, re
 	scores := make(map[string]float64)
 	cursor := scanPrefix
 	for {
-		scanKVs, err := r.store.ScanAt(ctx, cursor, scanEnd, store.MaxDeltaScanLimit, readTS)
+		scanKVs, err := requestScanAt(ctx, r.store, cursor, scanEnd, store.MaxDeltaScanLimit, readTS)
 		if err != nil {
 			return nil, cockerrors.WithStack(err)
 		}
@@ -540,7 +540,7 @@ func (r *RedisServer) scanKeyExistsMap(ctx context.Context, scanPrefix []byte, r
 	existsMap := make(map[string]struct{})
 	cursor := scanPrefix
 	for {
-		scanKVs, err := r.store.ScanAt(ctx, cursor, scanEnd, store.MaxDeltaScanLimit, readTS)
+		scanKVs, err := requestScanAt(ctx, r.store, cursor, scanEnd, store.MaxDeltaScanLimit, readTS)
 		if err != nil {
 			return nil, cockerrors.WithStack(err)
 		}
@@ -594,7 +594,7 @@ func (r *RedisServer) lookupSetMemberExists(ctx context.Context, memberStr strin
 	if !isSmallClean {
 		return false, nil
 	}
-	exists, err := r.store.ExistsAt(ctx, memberKey, readTS)
+	exists, err := requestExistsAt(ctx, r.store, memberKey, readTS)
 	if err != nil {
 		return false, cockerrors.WithStack(err)
 	}
@@ -689,7 +689,7 @@ func (r *RedisServer) sismember(conn redcon.Conn, cmd redcon.Command) {
 func (r *RedisServer) setMemberFastExists(ctx context.Context, key, member []byte, readTS uint64) (hit, alive bool, err error) {
 	// Probe FIRST; guard only on hit. See hashFieldFastLookup for the
 	// regression rationale.
-	exists, err := r.store.ExistsAt(ctx, store.SetMemberKey(key, member), readTS)
+	exists, err := requestExistsAt(ctx, r.store, store.SetMemberKey(key, member), readTS)
 	if err != nil {
 		return false, false, cockerrors.WithStack(err)
 	}

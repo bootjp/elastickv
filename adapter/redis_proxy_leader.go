@@ -676,7 +676,7 @@ func (r *RedisServer) readValueAt(ctx context.Context, key []byte, readTS uint64
 		if err := r.coordinator.VerifyLeaderForKey(ctx, key); err != nil {
 			return nil, errors.WithStack(err)
 		}
-		v, err := r.store.GetAt(ctx, key, readTS)
+		v, err := requestGetAt(ctx, r.store, key, readTS)
 		return v, errors.WithStack(err)
 	}
 	return r.tryLeaderGetAtContext(ctx, key, readTS)

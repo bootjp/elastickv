@@ -22,7 +22,7 @@ func (s *S3Server) ScanGCQueue(ctx context.Context, startKey, endKey []byte, lim
 	}
 	readPin := s.pinReadTS(readTimestamp.Timestamp())
 	defer readPin.Release()
-	rows, err := s.store.ScanAt(ctx, startKey, endKey, limit+1, readTimestamp.Timestamp())
+	rows, err := requestScanAt(ctx, s.store, startKey, endKey, limit+1, readTimestamp.Timestamp())
 	if err != nil {
 		return nil, nil, errors.WithStack(err)
 	}
@@ -49,7 +49,7 @@ func (s *S3Server) ReadChunkRefRC(ctx context.Context, sha [32]byte) ([]byte, bo
 	}
 	readPin := s.pinReadTS(readTimestamp.Timestamp())
 	defer readPin.Release()
-	raw, err := s.store.GetAt(ctx, s3keys.ChunkRefRCKey(sha), readTimestamp.Timestamp())
+	raw, err := requestGetAt(ctx, s.store, s3keys.ChunkRefRCKey(sha), readTimestamp.Timestamp())
 	if errors.Is(err, store.ErrKeyNotFound) {
 		return nil, false, nil
 	}
@@ -63,7 +63,7 @@ func (s *S3Server) GCQueueEntryExists(ctx context.Context, sha [32]byte) (bool, 
 	}
 	readPin := s.pinReadTS(readTimestamp.Timestamp())
 	defer readPin.Release()
-	raw, err := s.store.GetAt(ctx, s3keys.ChunkRefRCKey(sha), readTimestamp.Timestamp())
+	raw, err := requestGetAt(ctx, s.store, s3keys.ChunkRefRCKey(sha), readTimestamp.Timestamp())
 	if errors.Is(err, store.ErrKeyNotFound) {
 		return false, nil
 	}
@@ -77,7 +77,7 @@ func (s *S3Server) GCQueueEntryExists(ctx context.Context, sha [32]byte) (bool, 
 	if rc.QueuedAtTS == 0 {
 		return false, nil
 	}
-	_, err = s.store.GetAt(ctx, s3keys.ChunkBlobGCQueueKey(rc.QueuedAtTS, sha), readTimestamp.Timestamp())
+	_, err = requestGetAt(ctx, s.store, s3keys.ChunkBlobGCQueueKey(rc.QueuedAtTS, sha), readTimestamp.Timestamp())
 	if errors.Is(err, store.ErrKeyNotFound) {
 		return false, nil
 	}
@@ -137,7 +137,7 @@ func (s *S3Server) mutateGCQueueEntry(ctx context.Context, entry s3keys.ChunkBlo
 }
 
 func (s *S3Server) readGCQueueStateAt(ctx context.Context, queueKey, rcKey []byte, readTS uint64) (s3keys.ChunkRefRC, bool, error) {
-	value, err := s.store.GetAt(ctx, queueKey, readTS)
+	value, err := requestGetAt(ctx, s.store, queueKey, readTS)
 	if errors.Is(err, store.ErrKeyNotFound) {
 		return s3keys.ChunkRefRC{}, false, s3keys.ErrQueueEntryChanged
 	}
@@ -147,7 +147,7 @@ func (s *S3Server) readGCQueueStateAt(ctx context.Context, queueKey, rcKey []byt
 	if len(value) != 0 {
 		return s3keys.ChunkRefRC{}, false, errors.New("s3 gc: malformed queue entry")
 	}
-	raw, err := s.store.GetAt(ctx, rcKey, readTS)
+	raw, err := requestGetAt(ctx, s.store, rcKey, readTS)
 	if errors.Is(err, store.ErrKeyNotFound) {
 		return s3keys.ChunkRefRC{}, false, nil
 	}

@@ -1319,7 +1319,7 @@ func (s *SQSServer) scanQueueNamesAt(ctx context.Context, readTS uint64) ([]stri
 	start := bytes.Clone(prefix)
 	var names []string
 	for {
-		kvs, err := s.store.ScanAt(ctx, start, end, sqsQueueScanPageLimit, readTS)
+		kvs, err := requestScanAt(ctx, s.store, start, end, sqsQueueScanPageLimit, readTS)
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}
@@ -1782,7 +1782,7 @@ func (s *SQSServer) scanApproxCounters(ctx context.Context, queueName string, ge
 	var counters sqsApproxCounters
 	start := bytes.Clone(prefix)
 	for {
-		page, err := s.store.ScanAt(ctx, start, end, sqsQueueScanPageLimit, readTS)
+		page, err := requestScanAt(ctx, s.store, start, end, sqsQueueScanPageLimit, readTS)
 		if err != nil {
 			return counters, errors.WithStack(err)
 		}

@@ -93,7 +93,7 @@
                          (gen/nemesis nemesis-gen)
                          (gen/stagger (/ rate))
                          (gen/time-limit time-limit))
-         drain-gen  (->> (gen/repeat {:f :recv})
+         drain-gen  (->> (gen/repeat {:f :recv :final true})
                          (gen/stagger (/ rate))
                          (gen/time-limit drain-time)
                          (gen/clients))]

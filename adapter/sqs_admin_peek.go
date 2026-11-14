@@ -230,6 +230,10 @@ func (s *SQSServer) AdminPeekQueue(
 	name string,
 	opts AdminPeekMessageOptions,
 ) ([]AdminPeekedMessage, string, error) {
+	readRequest := s.newReadRequest(ctx)
+	defer readRequest.Close()
+	ctx = readRequest.Context()
+
 	if err := s.validateAdminPeekRequest(ctx, principal, name); err != nil {
 		return nil, "", err
 	}
@@ -459,7 +463,7 @@ func (s *SQSServer) walkPeekPartition(
 			return lastKey, true, nil
 		}
 	}
-	page, err := s.store.ScanAt(ctx, start, end, want, readTS)
+	page, err := requestScanAt(ctx, s.store, start, end, want, readTS)
 	if err != nil {
 		return nil, false, errors.WithStack(err)
 	}

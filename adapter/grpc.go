@@ -25,6 +25,7 @@ type GRPCServer struct {
 	grpcTranscoder *grpcTranscoder
 	coordinator    kv.Coordinator
 	store          store.MVCCStore
+	readTracker    *kv.ActiveTimestampTracker
 	readBlocked    func() bool
 
 	closeStore bool
@@ -216,17 +217,20 @@ func (r *GRPCServer) grpcServesScanTargets(targets []kv.ReadFenceTarget) bool {
 }
 
 func (r *GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.RawGetResponse, error) {
+	readRequest := kv.NewReadRequest(ctx, r.coordinator, r.store, r.readTracker)
+	defer readRequest.Close()
+	ctx = readRequest.Context()
 	if err := r.requireReadReady(); err != nil {
-		return nil, err
+		return nil, errors.WithStack(err)
 	}
 	readTS, err := r.resolveRawReadSnapshot(ctx, req.GetTs(), req.GetGroupId(), req.GetKey())
 	if err != nil {
-		return nil, err
+		return nil, errors.WithStack(err)
 	}
 
 	var v []byte
 	if fenceGetter, ok := r.store.(rawReadFenceGetter); ok {
-		v, err = fenceGetter.GetAtWithReadFence(ctx, req.Key, readTS, req.GetGroupId(), r.readRouteVersion(req.GetReadRouteVersion()))
+		v, err = requestGetAtWithReadFence(ctx, fenceGetter, req.Key, readTS, req.GetGroupId(), r.readRouteVersion(req.GetReadRouteVersion()))
 	} else if req.GetReadRouteVersion() != 0 {
 		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "raw get with read fence requires a read-fence-aware store"))
 	} else if groupID := req.GetGroupId(); groupID != 0 {
@@ -234,9 +238,9 @@ func (r *GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.Raw
 		if !ok {
 			return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "raw get with explicit group requires a group-aware store"))
 		}
-		v, err = groupGetter.GetGroupAt(ctx, groupID, req.Key, readTS)
+		v, err = requestGetGroupAt(ctx, groupGetter, groupID, req.Key, readTS)
 	} else {
-		v, err = r.store.GetAt(ctx, req.Key, readTS)
+		v, err = requestGetAt(ctx, r.store, req.Key, readTS)
 	}
 	r.observeGRPCPointRead(ctx, req.GetKey(), req.GetGroupId())
 	if errors.Is(err, store.ErrKeyNotFound) {
@@ -449,8 +453,11 @@ func (r *GRPCServer) rawVersionVisibleAt(ctx context.Context, req *pb.RawLatestC
 }
 
 func (r *GRPCServer) RawScanAt(ctx context.Context, req *pb.RawScanAtRequest) (*pb.RawScanAtResponse, error) {
+	readRequest := kv.NewReadRequest(ctx, r.coordinator, r.store, r.readTracker)
+	defer readRequest.Close()
+	ctx = readRequest.Context()
 	if err := r.requireReadReady(); err != nil {
-		return nil, err
+		return nil, errors.WithStack(err)
 	}
 	limit64 := req.GetLimit()
 	limit, err := rawScanLimit(limit64)
@@ -459,10 +466,15 @@ func (r *GRPCServer) RawScanAt(ctx context.Context, req *pb.RawScanAtRequest) (*
 	}
 
 	readTS := req.GetTs()
+	if readTS != 0 {
+		if _, err := readRequest.Historical(ctx, readTS); err != nil {
+			return nil, errors.WithStack(err)
+		}
+	}
 	if readTS == 0 {
 		stamp, err := r.beginLatestReadSnapshot(ctx, req.GetGroupId(), nil)
 		if err != nil {
-			return nil, err
+			return nil, errors.WithStack(err)
 		}
 		readTS = stamp
 	}
@@ -503,7 +515,7 @@ func (r *GRPCServer) rawScanKeysAt(ctx context.Context, req *pb.RawScanAtRequest
 	if req.GetReverse() {
 		return r.rawReverseScanKeysAt(ctx, req, limit, readTS)
 	}
-	keys, err := r.store.ScanKeysAt(ctx, req.StartKey, req.EndKey, limit, readTS)
+	keys, err := requestScanKeysAt(ctx, r.store, req.StartKey, req.EndKey, limit, readTS)
 	return keys, errors.WithStack(err)
 }
 
@@ -511,7 +523,7 @@ func (r *GRPCServer) rawScanKeysAtWithReadFence(ctx context.Context, req *pb.Raw
 	readRouteVersion := r.readRouteVersion(req.GetReadRouteVersion())
 	if !req.GetReverse() && !req.GetRouteBoundsPresent() {
 		if keyScanner, ok := r.store.(rawReadFenceKeyScanner); ok {
-			keys, err := keyScanner.ScanKeysAtWithReadFence(ctx, req.StartKey, req.EndKey, limit, readTS, req.GetGroupId(), readRouteVersion)
+			keys, err := requestScanKeysAtWithReadFence(ctx, keyScanner, req.StartKey, req.EndKey, limit, readTS, req.GetGroupId(), readRouteVersion)
 			return keys, errors.WithStack(err)
 		}
 	}
@@ -520,7 +532,7 @@ func (r *GRPCServer) rawScanKeysAtWithReadFence(ctx context.Context, req *pb.Raw
 		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "raw key scan with read fence requires a read-fence-aware store"))
 	}
 	routeStart, routeEnd := rawScanRouteBounds(req)
-	kvs, err := fenceScanner.ScanAtWithReadFence(ctx, req.StartKey, req.EndKey, limit, readTS, req.GetReverse(), req.GetGroupId(), readRouteVersion, routeStart, routeEnd)
+	kvs, err := requestScanAtWithReadFence(ctx, fenceScanner, req.StartKey, req.EndKey, limit, readTS, req.GetReverse(), req.GetGroupId(), readRouteVersion, routeStart, routeEnd)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -539,7 +551,7 @@ func (r *GRPCServer) rawScanExplicitGroupKeysAt(
 		if !ok {
 			return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "reverse raw key scan with explicit group requires a group-aware store"))
 		}
-		kvs, err := groupScanner.ReverseScanGroupAt(ctx, groupID, req.StartKey, req.EndKey, limit, readTS)
+		kvs, err := requestReverseScanGroupAt(ctx, groupScanner, groupID, req.StartKey, req.EndKey, limit, readTS)
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}
@@ -549,7 +561,7 @@ func (r *GRPCServer) rawScanExplicitGroupKeysAt(
 	if !ok {
 		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "raw key scan with explicit group requires a group-aware store"))
 	}
-	keys, err := groupScanner.ScanGroupKeysAt(ctx, groupID, req.StartKey, req.EndKey, limit, readTS)
+	keys, err := requestScanGroupKeysAt(ctx, groupScanner, groupID, req.StartKey, req.EndKey, limit, readTS)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -557,7 +569,7 @@ func (r *GRPCServer) rawScanExplicitGroupKeysAt(
 }
 
 func (r *GRPCServer) rawReverseScanKeysAt(ctx context.Context, req *pb.RawScanAtRequest, limit int, readTS uint64) ([][]byte, error) {
-	kvs, err := r.store.ReverseScanAt(ctx, req.StartKey, req.EndKey, limit, readTS)
+	kvs, err := requestReverseScanAt(ctx, r.store, req.StartKey, req.EndKey, limit, readTS)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -579,7 +591,7 @@ func (r *GRPCServer) rawScanAt(ctx context.Context, req *pb.RawScanAtRequest, li
 	// fence the value and key paths enforce.
 	if fenceScanner, ok := r.store.(rawReadFenceScanner); ok {
 		routeStart, routeEnd := rawScanRouteBounds(req)
-		res, err := fenceScanner.ScanAtWithReadFence(ctx, req.StartKey, req.EndKey, limit, readTS, req.GetReverse(), req.GetGroupId(), r.readRouteVersion(req.GetReadRouteVersion()), routeStart, routeEnd)
+		res, err := requestScanAtWithReadFence(ctx, fenceScanner, req.StartKey, req.EndKey, limit, readTS, req.GetReverse(), req.GetGroupId(), r.readRouteVersion(req.GetReadRouteVersion()), routeStart, routeEnd)
 		return res, errors.WithStack(err)
 	}
 	if rawScanCanUseExplicitGroupReverse(req) {
@@ -605,10 +617,10 @@ func (r *GRPCServer) rawScanAtWithoutReadFence(ctx context.Context, req *pb.RawS
 		return r.rawScanAtExplicitGroup(ctx, req, groupID, limit, readTS)
 	}
 	if req.GetReverse() {
-		res, err := r.store.ReverseScanAt(ctx, req.StartKey, req.EndKey, limit, readTS)
+		res, err := requestReverseScanAt(ctx, r.store, req.StartKey, req.EndKey, limit, readTS)
 		return res, errors.WithStack(err)
 	}
-	res, err := r.store.ScanAt(ctx, req.StartKey, req.EndKey, limit, readTS)
+	res, err := requestScanAt(ctx, r.store, req.StartKey, req.EndKey, limit, readTS)
 	return res, errors.WithStack(err)
 }
 
@@ -650,14 +662,14 @@ func (r *GRPCServer) rawScanAtExplicitGroup(
 		if !ok {
 			return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "reverse raw scan with explicit group requires a group-aware store"))
 		}
-		res, err := groupScanner.ReverseScanGroupAt(ctx, groupID, req.StartKey, req.EndKey, limit, readTS)
+		res, err := requestReverseScanGroupAt(ctx, groupScanner, groupID, req.StartKey, req.EndKey, limit, readTS)
 		return res, errors.WithStack(err)
 	}
 	groupScanner, ok := r.store.(rawGroupScanner)
 	if !ok {
 		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "raw scan with explicit group requires a group-aware store"))
 	}
-	res, err := groupScanner.ScanGroupAt(ctx, groupID, req.StartKey, req.EndKey, limit, readTS)
+	res, err := requestScanGroupAt(ctx, groupScanner, groupID, req.StartKey, req.EndKey, limit, readTS)
 	return res, errors.WithStack(err)
 }
 
@@ -804,19 +816,22 @@ func (r *GRPCServer) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutRespon
 }
 
 func (r *GRPCServer) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, error) {
+	readRequest := kv.NewReadRequest(ctx, r.coordinator, r.store, r.readTracker)
+	defer readRequest.Close()
+	ctx = readRequest.Context()
 	if err := r.requireReadReady(); err != nil {
-		return nil, err
+		return nil, errors.WithStack(err)
 	}
 	h := murmur3.New64()
 	if _, err := h.Write(req.Key); err != nil {
 		return nil, errors.WithStack(err)
 	}
 
-	readTS, err := r.beginLatestReadSnapshot(ctx, 0, req.GetKey())
+	snapshot, err := readRequest.Latest(ctx, "grpc get", req.GetKey())
 	if err != nil {
-		return nil, err
+		return nil, errors.WithStack(err)
 	}
-	v, err := r.store.GetAt(ctx, req.Key, readTS)
+	v, err := readRequest.Get(ctx, snapshot, req.Key)
 	r.observeGRPCPointRead(ctx, req.GetKey(), 0)
 	if err != nil {
 		switch {
@@ -860,8 +875,11 @@ func (r *GRPCServer) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.Del
 }
 
 func (r *GRPCServer) Scan(ctx context.Context, req *pb.ScanRequest) (*pb.ScanResponse, error) {
+	readRequest := kv.NewReadRequest(ctx, r.coordinator, r.store, r.readTracker)
+	defer readRequest.Close()
+	ctx = readRequest.Context()
 	if err := r.requireReadReady(); err != nil {
-		return nil, err
+		return nil, errors.WithStack(err)
 	}
 	limit, err := internal.Uint64ToInt(req.Limit)
 	if err != nil {
@@ -875,11 +893,11 @@ func (r *GRPCServer) Scan(ctx context.Context, req *pb.ScanRequest) (*pb.ScanRes
 			Kv: nil,
 		}, err
 	}
-	readTS, err := r.beginLatestReadSnapshot(ctx, 0, nil)
+	snapshot, err := readRequest.Latest(ctx, "grpc scan")
 	if err != nil {
-		return nil, err
+		return nil, errors.WithStack(err)
 	}
-	res, err := r.store.ScanAt(ctx, req.StartKey, req.EndKey, limit, readTS)
+	res, err := readRequest.Scan(ctx, snapshot, req.StartKey, req.EndKey, limit)
 	if err != nil {
 		r.markGRPCScanRead(0, req.GetStartKey(), req.GetEndKey(), nil)
 		return &pb.ScanResponse{
@@ -911,6 +929,12 @@ func (r *GRPCServer) Scan(ctx context.Context, req *pb.ScanRequest) (*pb.ScanRes
 // acquire a fresh snapshot, and explicit physical groups must fence that group.
 func (r *GRPCServer) beginLatestReadSnapshot(ctx context.Context, groupID uint64, key []byte) (uint64, error) {
 	if groupID != 0 {
+		if request, ok := kv.ReadRequestFromContext(ctx); ok {
+			snapshot, err := request.LatestTargets(ctx, "grpc group read", []kv.ReadFenceTarget{{GroupID: groupID, Key: key}})
+			return snapshot.Timestamp(), err
+		}
+	}
+	if groupID != 0 {
 		reader, ok := r.store.(rawGroupCommitFloorReader)
 		if !ok {
 			return 0, errors.New("latest raw read requires a group-aware fence")
@@ -928,7 +952,15 @@ func (r *GRPCServer) beginLatestReadSnapshot(ctx context.Context, groupID uint64
 
 func (r *GRPCServer) resolveRawReadSnapshot(ctx context.Context, requested, groupID uint64, key []byte) (uint64, error) {
 	if requested != 0 {
+		if request, ok := kv.ReadRequestFromContext(ctx); ok {
+			snapshot, err := request.Historical(ctx, requested)
+			return snapshot.Timestamp(), err
+		}
 		return requested, nil
 	}
 	return r.beginLatestReadSnapshot(ctx, groupID, key)
+}
+
+func WithGRPCActiveTimestampTracker(tracker *kv.ActiveTimestampTracker) GRPCServerOption {
+	return func(server *GRPCServer) { server.readTracker = tracker }
 }

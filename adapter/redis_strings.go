@@ -664,7 +664,7 @@ func (r *RedisServer) exists(conn redcon.Conn, cmd redcon.Command) {
 // round-trip per key on every follower, regressing EXISTS latency on
 // workloads that were previously all-local.
 func (r *RedisServer) existsAtFast(ctx context.Context, key []byte, readTS uint64) (bool, error) {
-	raw, err := r.store.GetAt(ctx, redisStrKey(key), readTS)
+	raw, err := requestGetAt(ctx, r.store, redisStrKey(key), readTS)
 	if err == nil {
 		alive, decErr := r.stringPayloadIsLive(ctx, key, raw, readTS)
 		if decErr != nil {

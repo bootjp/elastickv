@@ -11,7 +11,7 @@ import (
 // the same owner as sends and visibility scans. Catalog keys remain global.
 func (s *SQSServer) getSQSAt(ctx context.Context, key []byte, readTS uint64) ([]byte, error) {
 	if s.partitionResolver == nil || !s.partitionResolver.RecognisesPartitionedKey(key) {
-		value, err := s.store.GetAt(ctx, key, readTS)
+		value, err := requestGetAt(ctx, s.store, key, readTS)
 		return value, errors.WithStack(err)
 	}
 	groupID, ok := s.partitionResolver.ResolveGroup(key)
@@ -22,6 +22,6 @@ func (s *SQSServer) getSQSAt(ctx context.Context, key []byte, readTS uint64) ([]
 	if !ok {
 		return nil, errors.New("SQS partition point read requires a group-aware store")
 	}
-	value, err := getter.GetGroupAt(ctx, groupID, key, readTS)
+	value, err := requestGetGroupAt(ctx, getter, groupID, key, readTS)
 	return value, errors.WithStack(err)
 }

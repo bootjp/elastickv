@@ -1078,7 +1078,7 @@ func (c *luaScriptContext) loadZSetState(key []byte) (*luaZSetState, error) {
 	}
 	// No !zs|mem| rows: either wide-column with all members deleted (meta/delta
 	// only) or legacy blob. Probe the legacy blob key to distinguish.
-	blobExists, err := c.server.store.ExistsAt(c.scriptCtx(),
+	blobExists, err := requestExistsAt(c.scriptCtx(), c.server.store,
 		redisZSetKey(key), c.startTS)
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -1184,7 +1184,7 @@ func (c *luaScriptContext) memberScoreFromPebble(st *luaZSetState, key []byte, m
 		score, ok := st.members[member]
 		return score, ok, nil
 	}
-	raw, err := c.server.store.GetAt(c.scriptCtx(),
+	raw, err := requestGetAt(c.scriptCtx(), c.server.store,
 		store.ZSetMemberKey(key, []byte(member)), c.startTS)
 	if errors.Is(err, store.ErrKeyNotFound) {
 		st.storageScores[member] = nil
@@ -2689,11 +2689,11 @@ func (c *luaScriptContext) scanExactListPage(startKey, endKey, routeStart, route
 		err error
 	)
 	if scanner, ok := c.server.store.(luaRoutePinnedScanStore); ok {
-		kvs, err = scanner.ScanAtWithReadFence(c.ctx, startKey, endKey, 1, c.startTS, !left, 0, 0, routeStart, routeEnd)
+		kvs, err = requestScanAtWithReadFence(c.ctx, scanner, startKey, endKey, 1, c.startTS, !left, 0, 0, routeStart, routeEnd)
 	} else if left {
-		kvs, err = c.server.store.ScanAt(c.ctx, startKey, endKey, 1, c.startTS)
+		kvs, err = requestScanAt(c.ctx, c.server.store, startKey, endKey, 1, c.startTS)
 	} else {
-		kvs, err = c.server.store.ReverseScanAt(c.ctx, startKey, endKey, 1, c.startTS)
+		kvs, err = requestReverseScanAt(c.ctx, c.server.store, startKey, endKey, 1, c.startTS)
 	}
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -2723,19 +2723,19 @@ func luaListBoundaryItemFromKVs(key []byte, meta store.ListMeta, kvs []*store.KV
 
 func (c *luaScriptContext) scanAtPhysicalLimit(startKey, endKey []byte, scanLimit int) ([]*store.KVPair, bool, error) {
 	if scanner, ok := c.server.store.(luaPhysicalLimitedScanStore); ok {
-		kvs, limitReached, err := scanner.ScanAtPhysicalLimit(c.ctx, startKey, endKey, scanLimit, scanLimit, c.startTS)
+		kvs, limitReached, err := requestScanPhysicalAt(c.ctx, scanner, startKey, endKey, scanLimit, scanLimit, c.startTS, false)
 		return kvs, limitReached, errors.WithStack(err)
 	}
-	kvs, err := c.server.store.ScanAt(c.ctx, startKey, endKey, scanLimit, c.startTS)
+	kvs, err := requestScanAt(c.ctx, c.server.store, startKey, endKey, scanLimit, c.startTS)
 	return kvs, false, errors.WithStack(err)
 }
 
 func (c *luaScriptContext) reverseScanAtPhysicalLimit(startKey, endKey []byte, scanLimit int) ([]*store.KVPair, bool, error) {
 	if scanner, ok := c.server.store.(luaPhysicalLimitedScanStore); ok {
-		kvs, limitReached, err := scanner.ReverseScanAtPhysicalLimit(c.ctx, startKey, endKey, scanLimit, scanLimit, c.startTS)
+		kvs, limitReached, err := requestScanPhysicalAt(c.ctx, scanner, startKey, endKey, scanLimit, scanLimit, c.startTS, true)
 		return kvs, limitReached, errors.WithStack(err)
 	}
-	kvs, err := c.server.store.ReverseScanAt(c.ctx, startKey, endKey, scanLimit, c.startTS)
+	kvs, err := requestReverseScanAt(c.ctx, c.server.store, startKey, endKey, scanLimit, c.startTS)
 	return kvs, false, errors.WithStack(err)
 }
 

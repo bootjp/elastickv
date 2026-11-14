@@ -826,12 +826,7 @@ func (s *SQSServer) receiveMessage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	throttleEpoch := s.throttle.queueEpoch(queueName)
-	readTS, err := s.snapshotReadTS(r.Context())
-	if err != nil {
-		writeSQSErrorFromErr(w, err)
-		return
-	}
-	meta, exists, err := s.loadQueueMetaAt(ctx, queueName, readTS)
+	meta, exists, err := s.loadReceiveQueueMeta(ctx, queueName)
 	if err != nil {
 		writeSQSErrorFromErr(w, err)
 		return
@@ -880,13 +875,22 @@ func (s *SQSServer) receiveMessage(w http.ResponseWriter, r *http.Request) {
 	writeSQSJSON(w, map[string]any{"Messages": delivered})
 }
 
+// Receive preflight copies queue settings; its MVCC snapshot is no longer
+// needed while the request waits for messages.
+func (s *SQSServer) loadReceiveQueueMeta(ctx context.Context, queueName string) (*sqsQueueMeta, bool, error) {
+	request := s.newReadRequest(ctx)
+	defer request.Close()
+	ctx = request.Context()
+	ts, err := s.snapshotReadTS(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	return s.loadQueueMetaAt(ctx, queueName, ts)
+}
+
 func (s *SQSServer) receiveMessageCore(ctx context.Context, queueName string, in sqsReceiveMessageInput) ([]map[string]any, error) {
 	throttleEpoch := s.throttle.queueEpoch(queueName)
-	readTS, err := s.snapshotReadTS(ctx)
-	if err != nil {
-		return nil, err
-	}
-	meta, exists, err := s.loadQueueMetaAt(ctx, queueName, readTS)
+	meta, exists, err := s.loadReceiveQueueMeta(ctx, queueName)
 	if err != nil {
 		return nil, err
 	}
@@ -1009,6 +1013,10 @@ func (s *SQSServer) longPollReceive(ctx context.Context, queueName string, opts 
 // elapses prevents false-empty returns under poison-message backlogs
 // or hot-FIFO-group fan-in.
 func (s *SQSServer) scanAndDeliverOnce(ctx context.Context, queueName string, opts sqsReceiveOptions) ([]map[string]any, error) {
+	readRequest := s.newReadRequest(ctx)
+	defer readRequest.Close()
+	ctx = readRequest.Context()
+
 	readTimestamp, err := s.beginTxnReadTimestamp(ctx, "sqs receive message: begin read timestamp")
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -1227,7 +1235,7 @@ func (s *SQSServer) scanOneVisibleMessagePage(ctx context.Context, start, end []
 
 func (s *SQSServer) scanVisibleIndexAt(ctx context.Context, start, end []byte, pageSize int, readTS uint64) ([]*store.KVPair, uint64, error) {
 	if s.partitionResolver == nil || !s.partitionResolver.RecognisesPartitionedKey(start) {
-		kvs, err := s.store.ScanAt(ctx, start, end, pageSize, readTS)
+		kvs, err := requestScanAt(ctx, s.store, start, end, pageSize, readTS)
 		return kvs, 0, errors.WithStack(err)
 	}
 	groupID, ok := s.partitionResolver.ResolveGroup(start)
@@ -1238,7 +1246,7 @@ func (s *SQSServer) scanVisibleIndexAt(ctx context.Context, start, end []byte, p
 	if !ok {
 		return nil, 0, errors.New("sqs receive partition scan requires a group-aware shard store")
 	}
-	kvs, err := groupScanner.ScanGroupAt(ctx, groupID, start, end, pageSize, readTS)
+	kvs, err := requestScanGroupAt(ctx, groupScanner, groupID, start, end, pageSize, readTS)
 	return kvs, groupID, errors.WithStack(err)
 }
 
@@ -1266,7 +1274,7 @@ func (s *SQSServer) loadCandidateRecord(ctx context.Context, queueName string, m
 		if !ok {
 			return nil, dataKey, false, errors.New("sqs receive candidate load requires a group-aware shard store")
 		}
-		raw, err = groupGetter.GetGroupAt(ctx, cand.groupID, dataKey, readTS)
+		raw, err = requestGetGroupAt(ctx, groupGetter, cand.groupID, dataKey, readTS)
 	} else {
 		raw, err = s.getSQSAt(ctx, dataKey, readTS)
 	}

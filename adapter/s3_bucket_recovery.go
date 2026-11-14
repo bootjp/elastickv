@@ -43,7 +43,7 @@ func (s *S3Server) recoverPendingBucketDeletes(ctx context.Context) error {
 			return err
 		}
 		readPin := s.pinReadTS(readTimestamp.Timestamp())
-		rows, err := s.store.ScanAt(ctx, start, end, s3MetaBatchOps, readTimestamp.Timestamp())
+		rows, err := requestScanAt(ctx, s.store, start, end, s3MetaBatchOps, readTimestamp.Timestamp())
 		readPin.Release()
 		if err != nil {
 			return errors.WithStack(err)

@@ -496,6 +496,9 @@ func (s *S3Server) StartBlobBackfill(ctx context.Context) error {
 }
 
 func (s *S3Server) handle(w http.ResponseWriter, r *http.Request) {
+	readRequest := kv.NewReadRequest(r.Context(), s.coordinator, s.store, s.readTracker)
+	defer readRequest.Close()
+	r = r.WithContext(readRequest.Context())
 	if serveS3Healthz(w, r) {
 		return
 	}
@@ -677,7 +680,7 @@ func (s *S3Server) listBuckets(w http.ResponseWriter, r *http.Request) {
 	}
 	readPin := s.pinReadTS(readTS)
 	defer readPin.Release()
-	kvs, err := s.store.ScanAt(r.Context(), []byte(s3keys.BucketMetaPrefix), prefixScanEnd([]byte(s3keys.BucketMetaPrefix)), s3MaxKeys, readTS)
+	kvs, err := requestScanAt(r.Context(), s.store, []byte(s3keys.BucketMetaPrefix), prefixScanEnd([]byte(s3keys.BucketMetaPrefix)), s3MaxKeys, readTS)
 	if err != nil {
 		writeS3InternalError(w, err)
 		return
@@ -850,7 +853,7 @@ func (s *S3Server) deleteBucket(w http.ResponseWriter, r *http.Request, bucket s
 		}
 
 		start := s3keys.ObjectManifestPrefixForBucket(bucket, meta.Generation)
-		kvs, err := s.store.ScanAt(r.Context(), start, prefixScanEnd(start), 1, readTS)
+		kvs, err := requestScanAt(r.Context(), s.store, start, prefixScanEnd(start), 1, readTS)
 		if err != nil {
 			return errors.WithStack(err)
 		}
@@ -1500,7 +1503,7 @@ func (s *S3Server) abortMultipartUpload(w http.ResponseWriter, r *http.Request, 
 		generation = meta.Generation
 
 		uploadMetaKey := s3keys.UploadMetaKey(bucket, meta.Generation, objectKey, uploadID)
-		if _, err := s.store.GetAt(r.Context(), uploadMetaKey, readTS); err != nil {
+		if _, err := requestGetAt(r.Context(), s.store, uploadMetaKey, readTS); err != nil {
 			if errors.Is(err, store.ErrKeyNotFound) {
 				return &s3ResponseError{
 					Status:  http.StatusNotFound,
@@ -1558,7 +1561,7 @@ func (s *S3Server) listParts(w http.ResponseWriter, r *http.Request, bucket stri
 
 	// Verify upload exists.
 	uploadMetaKey := s3keys.UploadMetaKey(bucket, meta.Generation, objectKey, uploadID)
-	if _, err := s.store.GetAt(r.Context(), uploadMetaKey, readTS); err != nil {
+	if _, err := requestGetAt(r.Context(), s.store, uploadMetaKey, readTS); err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			writeS3Error(w, http.StatusNotFound, "NoSuchUpload", "upload not found", bucket, objectKey)
 			return
@@ -1578,7 +1581,7 @@ func (s *S3Server) listParts(w http.ResponseWriter, r *http.Request, bucket stri
 	}
 	end := prefixScanEnd(partPrefix)
 
-	kvs, err := s.store.ScanAt(r.Context(), start, end, maxParts+1, readTS)
+	kvs, err := requestScanAt(r.Context(), s.store, start, end, maxParts+1, readTS)
 	if err != nil {
 		writeS3InternalError(w, err)
 		return
@@ -1701,7 +1704,7 @@ func (s *S3Server) deleteByPrefix(ctx context.Context, prefix []byte, bucket str
 			return err
 		}
 		readPin := s.pinReadTS(readTS)
-		kvs, err := s.store.ScanAt(ctx, cursor, end, s3MetaBatchOps, readTS)
+		kvs, err := requestScanAt(ctx, s.store, cursor, end, s3MetaBatchOps, readTS)
 		readPin.Release()
 		if err != nil {
 			slog.ErrorContext(ctx, "deleteByPrefix: scan failed",
@@ -1845,7 +1848,7 @@ func writeS3ListingError(w http.ResponseWriter, bucket string, err error) {
 }
 
 func (s *S3Server) loadBucketMetaAt(ctx context.Context, bucket string, readTS uint64) (*s3BucketMeta, bool, error) {
-	raw, err := s.store.GetAt(ctx, s3keys.BucketMetaKey(bucket), readTS)
+	raw, err := requestGetAt(ctx, s.store, s3keys.BucketMetaKey(bucket), readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return nil, false, nil
@@ -1860,7 +1863,7 @@ func (s *S3Server) loadBucketMetaAt(ctx context.Context, bucket string, readTS u
 }
 
 func (s *S3Server) nextBucketGenerationAt(ctx context.Context, bucket string, readTS uint64) (uint64, error) {
-	raw, err := s.store.GetAt(ctx, s3keys.BucketGenerationKey(bucket), readTS)
+	raw, err := requestGetAt(ctx, s.store, s3keys.BucketGenerationKey(bucket), readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return 1, nil
@@ -1875,7 +1878,7 @@ func (s *S3Server) nextBucketGenerationAt(ctx context.Context, bucket string, re
 }
 
 func (s *S3Server) loadObjectManifestAt(ctx context.Context, key []byte, readTS uint64) (*s3ObjectManifest, bool, error) {
-	raw, err := s.store.GetAt(ctx, key, readTS)
+	raw, err := requestGetAt(ctx, s.store, key, readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return nil, false, nil

@@ -204,3 +204,13 @@
                  (merge opts (cli/parse-common-opts
                                {:nodes "n1,n2,n3" :host "localhost" :faults "kill"}
                                [6379 6380 6381]))))))
+
+(deftest delete-only-retries-do-not-prove-final-queue-reads
+  (let [history (adapter-history :sqs-standard)
+        retry-only (mapv #(if (:final %)
+                            (assoc % :receive-performed? false)
+                            %) history)
+        verdict (checker/check (hosted/evidence-checker nodes :partition 2 1 :sqs-standard)
+                               {} retry-only {})]
+    (is (false? (:valid? verdict)))
+    (is (= (set nodes) (set (map first (:missing-final-reads verdict)))))))

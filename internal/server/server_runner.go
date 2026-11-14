@@ -516,7 +516,7 @@ func (r *runtimeServerRunner) preparePublicServices() error {
 	sqsServer, sqsListener, err := prepareSQSServer(
 		r.ctx, r.lc, r.sqsAddress, r.shardStore, r.coordinate,
 		r.leaderSQS, r.sqsRegion, r.sqsCredsFile, r.sqsPublicEndpoint,
-		r.sqsPartitionResolver, r.sqsPartitionObserver,
+		r.sqsPartitionResolver, r.sqsPartitionObserver, r.readTracker,
 	)
 	if err != nil {
 		return err

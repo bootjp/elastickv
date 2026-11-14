@@ -324,8 +324,18 @@ func (d *DynamoDBServer) tryTxnWriteTimestamp(ctx context.Context, label string,
 		}
 		sealTS = resp.CommitTS
 	}
+	return d.sealedReadTimestamp(ctx, sealTS, label)
+}
+
+func (d *DynamoDBServer) sealedReadTimestamp(ctx context.Context, sealTS uint64, label string) (kv.ReadTimestamp, error) {
 	readTimestamp, err := kv.BeginReadTimestampThrough(ctx, d.coordinator, sealTS, label+": sealed snapshot")
-	return readTimestamp, errors.WithStack(err)
+	if err != nil {
+		return kv.ReadTimestamp{}, errors.WithStack(err)
+	}
+	if err = authorizeHistoricalRead(ctx, d.store, sealTS); err != nil {
+		return kv.ReadTimestamp{}, err
+	}
+	return readTimestamp, nil
 }
 
 func (d *DynamoDBServer) pinReadTS(ts uint64) *kv.ActiveTimestampToken {

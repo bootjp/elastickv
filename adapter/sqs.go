@@ -170,6 +170,7 @@ const (
 type SQSServerOption func(*SQSServer)
 
 type SQSServer struct {
+	readTracker      *kv.ActiveTimestampTracker
 	requestAdmission RequestAdmission
 	listen           net.Listener
 	store            store.MVCCStore
@@ -575,6 +576,9 @@ func (s *SQSServer) Stop() {
 }
 
 func (s *SQSServer) handle(w http.ResponseWriter, r *http.Request) {
+	readRequest := kv.NewReadRequest(r.Context(), s.coordinator, s.store, s.readTracker)
+	defer readRequest.Close()
+	r = r.WithContext(readRequest.Context())
 	if s.serveHealthz(w, r) {
 		return
 	}
@@ -839,4 +843,8 @@ func writeSQSThrottlingError(w http.ResponseWriter, queue, action string, retryA
 	w.Header().Set("Retry-After", strconv.Itoa(secs))
 	writeSQSError(w, http.StatusBadRequest, sqsErrThrottling,
 		"Rate exceeded for queue '"+queue+"' action '"+action+"'")
+}
+
+func WithSQSActiveTimestampTracker(tracker *kv.ActiveTimestampTracker) SQSServerOption {
+	return func(server *SQSServer) { server.readTracker = tracker }
 }

@@ -367,7 +367,7 @@ func (r *RedisServer) dispatchExpireForReadTimestamp(
 // (stored under !redis|hll|<key>), both of which rawKeyTypeAt reports as
 // redisTypeString.
 func (r *RedisServer) isPlainRedisString(ctx context.Context, key []byte, readTS uint64) (bool, error) {
-	exists, err := r.store.ExistsAt(ctx, redisStrKey(key), readTS)
+	exists, err := requestExistsAt(ctx, r.store, redisStrKey(key), readTS)
 	if err != nil {
 		return false, cockerrors.WithStack(err)
 	}
@@ -375,7 +375,7 @@ func (r *RedisServer) isPlainRedisString(ctx context.Context, key []byte, readTS
 		return true, nil
 	}
 	// Fall back to the bare legacy layout.
-	legacy, err := r.store.ExistsAt(ctx, key, readTS)
+	legacy, err := requestExistsAt(ctx, r.store, key, readTS)
 	if err != nil {
 		return false, cockerrors.WithStack(err)
 	}
@@ -422,7 +422,7 @@ func (r *RedisServer) dispatchStringExpireReadTimestamp(ctx context.Context, key
 
 func (r *RedisServer) dispatchHLLExpireReadTimestamp(ctx context.Context, key []byte, readTimestamp kv.ReadTimestamp, expireAt time.Time) (bool, error) {
 	readTS := readTimestamp.Timestamp()
-	raw, err := r.store.GetAt(ctx, redisHLLKey(key), readTS)
+	raw, err := requestGetAt(ctx, r.store, redisHLLKey(key), readTS)
 	if err != nil {
 		if cockerrors.Is(err, store.ErrKeyNotFound) {
 			return false, nil

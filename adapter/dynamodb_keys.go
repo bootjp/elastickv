@@ -30,7 +30,7 @@ func (d *DynamoDBServer) scanAllByPrefixAt(ctx context.Context, prefix []byte, r
 
 	out := make([]*store.KVPair, 0, dynamoScanPageLimit)
 	for {
-		kvs, err := d.store.ScanAt(ctx, start, end, dynamoScanPageLimit, readTS)
+		kvs, err := requestScanAt(ctx, d.store, start, end, dynamoScanPageLimit, readTS)
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}

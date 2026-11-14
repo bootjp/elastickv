@@ -52,7 +52,7 @@ func (r *RedisServer) collectionTTLAt(ctx context.Context, userKey []byte, readT
 }
 
 func (r *RedisServer) listInlineTTLAt(ctx context.Context, userKey []byte, readTS uint64) (*time.Time, bool, error) {
-	raw, err := r.store.GetAt(ctx, store.ListMetaKey(userKey), readTS)
+	raw, err := requestGetAt(ctx, r.store, store.ListMetaKey(userKey), readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return nil, false, nil
@@ -80,7 +80,7 @@ func (r *RedisServer) simpleInlineTTLAt(
 	readTS uint64,
 	expireAtFromMeta func([]byte) (uint64, error),
 ) (*time.Time, bool, error) {
-	raw, err := r.store.GetAt(ctx, metaKey, readTS)
+	raw, err := requestGetAt(ctx, r.store, metaKey, readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return nil, false, nil
@@ -114,7 +114,7 @@ func zsetMetaExpireAt(raw []byte) (uint64, error) {
 }
 
 func (r *RedisServer) streamInlineTTLAt(ctx context.Context, userKey []byte, readTS uint64) (*time.Time, bool, error) {
-	raw, err := r.store.GetAt(ctx, store.StreamMetaKey(userKey), readTS)
+	raw, err := requestGetAt(ctx, r.store, store.StreamMetaKey(userKey), readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return nil, false, nil
@@ -198,7 +198,7 @@ func (r *RedisServer) expiredCollectionCleanupForRecreate(
 func (r *RedisServer) staleDeltaOnlyCollectionCleanupElems(ctx context.Context, key []byte, readTS uint64, expected redisValueType) ([]*kv.Elem[kv.OP], error) {
 	elems := []*kv.Elem[kv.OP]{{Op: kv.Del, Key: redisTTLKey(key)}}
 	if legacyKey, ok := legacyCollectionBlobKey(key, expected); ok {
-		exists, err := r.store.ExistsAt(ctx, legacyKey, readTS)
+		exists, err := requestExistsAt(ctx, r.store, legacyKey, readTS)
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}
@@ -317,7 +317,7 @@ func (r *RedisServer) legacyCollectionExpireFallback(ctx context.Context, key []
 	if !ok {
 		return nil, false, nil
 	}
-	exists, err := r.store.ExistsAt(ctx, legacyKey, readTS)
+	exists, err := requestExistsAt(ctx, r.store, legacyKey, readTS)
 	if err != nil {
 		return nil, false, errors.WithStack(err)
 	}
@@ -424,7 +424,7 @@ func (r *RedisServer) simpleMetaExpireElems(
 	unmarshalDelta func([]byte) (int64, error),
 ) ([]*kv.Elem[kv.OP], bool, error) {
 	var baseLen int64
-	raw, err := r.store.GetAt(ctx, metaKey, readTS)
+	raw, err := requestGetAt(ctx, r.store, metaKey, readTS)
 	exists := true
 	if err != nil {
 		if !errors.Is(err, store.ErrKeyNotFound) {
@@ -511,7 +511,7 @@ func (r *RedisServer) streamMetaExpireElems(ctx context.Context, key []byte, rea
 
 func (r *RedisServer) scanDeltaKVs(ctx context.Context, prefix []byte, readTS uint64) ([]*store.KVPair, error) {
 	end := store.PrefixScanEnd(prefix)
-	deltas, err := r.store.ScanAt(ctx, prefix, end, store.MaxDeltaScanLimit+1, readTS)
+	deltas, err := requestScanAt(ctx, r.store, prefix, end, store.MaxDeltaScanLimit+1, readTS)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}

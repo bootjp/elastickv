@@ -56,7 +56,7 @@ func (r *RedisServer) hmset(conn redcon.Conn, cmd redcon.Command) {
 // blob exists.  The base meta key is also written with the migrated count so
 // that resolveHashMeta works correctly after migration.
 func (r *RedisServer) buildHashLegacyMigrationElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
-	raw, err := r.store.GetAt(ctx, redisHashKey(key), readTS)
+	raw, err := requestGetAt(ctx, r.store, redisHashKey(key), readTS)
 	if cockerrors.Is(err, store.ErrKeyNotFound) {
 		return nil, nil
 	}
@@ -301,7 +301,7 @@ func (r *RedisServer) hashFieldFastLookup(ctx context.Context, key, field []byte
 	// common negative-lookup case and for any workload that still
 	// carries legacy-blob encodings. See the PR #565 independent
 	// review for the Medium-severity regression this addresses.
-	raw, err = r.store.GetAt(ctx, store.HashFieldKey(key, field), readTS)
+	raw, err = requestGetAt(ctx, r.store, store.HashFieldKey(key, field), readTS)
 	if err != nil {
 		if cockerrors.Is(err, store.ErrKeyNotFound) {
 			return nil, false, false, nil
@@ -337,7 +337,7 @@ func (r *RedisServer) hashFieldFastLookup(ctx context.Context, key, field []byte
 // already saved. Callers that require complete priority alignment
 // must take the keyTypeAt slow path explicitly.
 func (r *RedisServer) hasHigherPriorityStringEncoding(ctx context.Context, key []byte, readTS uint64) (bool, error) {
-	exists, err := r.store.ExistsAt(ctx, redisStrKey(key), readTS)
+	exists, err := requestExistsAt(ctx, r.store, redisStrKey(key), readTS)
 	if err != nil {
 		return false, cockerrors.WithStack(err)
 	}
@@ -509,7 +509,7 @@ func (r *RedisServer) resolveHashFieldDelElems(ctx context.Context, key []byte, 
 			_, exists = existsMap[string(field)]
 		} else {
 			var err error
-			exists, err = r.store.ExistsAt(ctx, fieldKey, readTS)
+			exists, err = requestExistsAt(ctx, r.store, fieldKey, readTS)
 			if err != nil {
 				return nil, 0, cockerrors.WithStack(err)
 			}
@@ -542,7 +542,7 @@ func (r *RedisServer) hdelTxn(ctx context.Context, key []byte, fields [][]byte) 
 	// Wide-column path: check if any !hs|fld| keys exist for this key.
 	hashFieldPrefix := store.HashFieldScanPrefix(key)
 	hashFieldEnd := store.PrefixScanEnd(hashFieldPrefix)
-	wideKVs, err := r.store.ScanAt(ctx, hashFieldPrefix, hashFieldEnd, 1, readTS)
+	wideKVs, err := requestScanAt(ctx, r.store, hashFieldPrefix, hashFieldEnd, 1, readTS)
 	if err != nil {
 		return 0, cockerrors.WithStack(err)
 	}
@@ -650,7 +650,7 @@ func (r *RedisServer) hexists(conn redcon.Conn, cmd redcon.Command) {
 func (r *RedisServer) hashFieldFastExists(ctx context.Context, key, field []byte, readTS uint64) (hit, alive bool, err error) {
 	// Probe FIRST; guard only on hit. See hashFieldFastLookup for the
 	// regression rationale.
-	exists, err := r.store.ExistsAt(ctx, store.HashFieldKey(key, field), readTS)
+	exists, err := requestExistsAt(ctx, r.store, store.HashFieldKey(key, field), readTS)
 	if err != nil {
 		return false, false, cockerrors.WithStack(err)
 	}
@@ -781,7 +781,7 @@ func (r *RedisServer) readHashFieldInt(ctx context.Context, key, field []byte, r
 		return 0, true, nil, nil
 	}
 	fieldKey := store.HashFieldKey(key, field)
-	raw, readErr := r.store.GetAt(ctx, fieldKey, readTS)
+	raw, readErr := requestGetAt(ctx, r.store, fieldKey, readTS)
 	if readErr != nil && !cockerrors.Is(readErr, store.ErrKeyNotFound) {
 		return 0, true, nil, cockerrors.WithStack(readErr)
 	}

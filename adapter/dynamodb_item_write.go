@@ -452,7 +452,7 @@ func (d *DynamoDBServer) reuseMutationMatches(ctx context.Context, elem *kv.Elem
 	if err != nil || !landed {
 		return false, errors.Wrap(err, "probe reuse version")
 	}
-	value, err := d.store.GetAt(ctx, elem.Key, commitTS)
+	value, err := historicalGetAt(ctx, d.store, elem.Key, commitTS)
 	switch elem.Op {
 	case kv.Put:
 		if err != nil {

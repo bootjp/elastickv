@@ -709,6 +709,16 @@ func (s *LeaderRoutedStore) CommittedTimestampFloorForKeys(ctx context.Context, 
 	return s.GlobalCommittedTimestampFloor(ctx)
 }
 
+// CommittedTimestampFloorForKeysWithTargets carries the single-group proof
+// alongside the applied timestamp, including follower-forwarded barriers.
+func (s *LeaderRoutedStore) CommittedTimestampFloorForKeysWithTargets(ctx context.Context, keys [][]byte) (uint64, []ReadFenceTarget, error) {
+	ts, err := s.CommittedTimestampFloorForKeys(ctx, keys)
+	if err != nil {
+		return 0, nil, err
+	}
+	return ts, []ReadFenceTarget{{GroupID: coordinateSingleGroupID}}, nil
+}
+
 // GroupCommittedTimestampFloor waits for Raft ReadIndex before sampling the
 // local applied watermark. A leader lease alone does not wait for a pending
 // committed entry whose timestamp is below LastCommitTS.
@@ -720,6 +730,16 @@ func (s *LeaderRoutedStore) GroupCommittedTimestampFloor(ctx context.Context, gr
 		return 0, errors.WithStack(err)
 	}
 	return s.local.LastCommitTS(), nil
+}
+
+// ReadFenceTargetsForRange resolves ordinary scans to this store's sole data
+// group. The identity comes from the store topology, independently of leadership
+// or whether the requested interval currently contains records.
+func (s *LeaderRoutedStore) ReadFenceTargetsForRange(start, _ []byte) []ReadFenceTarget {
+	if s == nil || s.local == nil {
+		return nil
+	}
+	return []ReadFenceTarget{{GroupID: coordinateSingleGroupID, Key: bytes.Clone(start)}}
 }
 
 // WriteConflictCountsByPrefix delegates to the local MVCC store. The

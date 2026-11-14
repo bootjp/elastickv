@@ -38,7 +38,9 @@
 
 (defn recovery-keys [adapter op]
   (case adapter
-    (:sqs-standard :sqs-htfifo) (when (= :recv (:f op)) [:queue])
+    (:sqs-standard :sqs-htfifo) (when (and (= :recv (:f op))
+                                        (not (false? (:receive-performed? op))))
+                                [:queue])
     :s3 (when (= :read (:f op)) [(first (:value op))])
     (when (= :txn (:f op)) (map second (filter #(= :r (first %)) (:value op))))))
 
