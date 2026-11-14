@@ -26,6 +26,18 @@ func TestReadSnapshotConstructionIsCentralized(t *testing.T) {
 			"internal.go:forwardReadWatermarkAdvance": true,
 			"internal.go:ApplyTargetStagedReadiness":  true,
 		},
+		"LatestCommitTS": {
+			"read_snapshot.go:beginCatalogReadSnapshot":                                true,
+			"migration_ownership_refresh_attestation.go:issueMigrationPartitionReadTS": true,
+			// Per-key version inspection for OCC, blob identity, or raw RPC metadata;
+			// these are not node-local snapshot selection.
+			"grpc.go:rawKeyCommitTS":                                 true,
+			"redis_txn.go:validateReadSet":                           true,
+			"s3_blob_backfill.go:loadS3BlobBackfillRef":              true,
+			"s3_blob_read.go:loadS3ChunkRef":                         true,
+			"s3_blob_fetch.go:latestChunkBlobTS":                     true,
+			"redis_delta_compactor.go:legacyTTLMillisWithCommitTSAt": true,
+		},
 		"GlobalLastCommitTS": {}, // best-effort RPC fallback must never select a latest snapshot
 		"eventualSnapshotTS": {
 			"dynamodb_query_scan.go:resolveDynamoReadTS": true,
@@ -41,7 +53,7 @@ func TestReadSnapshotConstructionIsCentralized(t *testing.T) {
 			// than selecting latest reads from local watermarks.
 			"dynamodb_locks.go:tryTxnWriteTimestamp":                                   true,
 			"migration_ownership_refresh_attestation.go:issueMigrationPartitionReadTS": true,
-			"distribution_server.go:SplitRange":                                        true,
+			"read_snapshot.go:beginCatalogReadSnapshot":                                true,
 			"split_job_runner.go:ensureSplitJobCatalogFence":                           true,
 			"split_job_working_source.go:ensureSplitWorkingSource":                     true,
 			"split_job_working_source.go:commitWorkingSourceFence":                     true,

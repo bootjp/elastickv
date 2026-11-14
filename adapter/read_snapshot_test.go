@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -109,4 +110,56 @@ func TestGRPCLatestReadsFenceButExplicitHistoricalReadsKeepTheirTimestamp(t *tes
 	historical, err = server.RawGet(t.Context(), &pb.RawGetRequest{Key: []byte("key"), Ts: 2})
 	require.NoError(t, err)
 	require.Equal(t, []byte("0"), historical.Value)
+}
+
+func TestCatalogSnapshotWaitsForAppliedBarrierBeforeSampling(t *testing.T) {
+	base := store.NewMVCCStore()
+	t.Cleanup(func() { _ = base.Close() })
+	require.NoError(t, base.PutAt(t.Context(), distribution.CatalogVersionKey(), []byte("old"), 2, 0))
+	coord := &catalogSnapshotFenceCoordinator{Coordinator: newLocalAdapterCoordinator(base)}
+	coord.apply = func() error { return base.PutAt(t.Context(), distribution.CatalogVersionKey(), []byte("new"), 42, 0) }
+	sampled := 0
+	observed := &observingLastCommitStore{MVCCStore: base, onLastCommitTS: func() { sampled++; require.Equal(t, distribution.CatalogVersionKey(), coord.key) }}
+	server := &DistributionServer{catalog: distribution.NewCatalogStore(observed), coordinator: coord}
+	stamp, err := server.beginCatalogReadSnapshot(t.Context(), "test")
+	require.NoError(t, err)
+	require.Equal(t, uint64(42), stamp.Timestamp())
+	require.Positive(t, sampled)
+	coord.apply = func() error { return kv.ErrLeaderNotFound }
+	sampled = 0
+	_, err = server.beginCatalogReadSnapshot(t.Context(), "test")
+	require.ErrorIs(t, err, kv.ErrLeaderNotFound)
+	require.Zero(t, sampled)
+}
+
+type catalogSnapshotFenceCoordinator struct {
+	kv.Coordinator
+	key   []byte
+	apply func() error
+}
+
+func (c *catalogSnapshotFenceCoordinator) LinearizableReadForKey(_ context.Context, key []byte) (uint64, error) {
+	c.key = append([]byte(nil), key...)
+	return 0, c.apply()
+}
+func (c *catalogSnapshotFenceCoordinator) LinearizableRead(context.Context) (uint64, error) {
+	panic("catalog snapshot must fence its own group")
+}
+
+func TestCanceledSnapshotCannotIssueTokenOrSampleStore(t *testing.T) {
+	base := store.NewMVCCStore()
+	t.Cleanup(func() { _ = base.Close() })
+	st := &fencedSnapshotTestStore{MVCCStore: base, floor: 42}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	stamp, err := beginFencedReadSnapshot(ctx, newLocalAdapterCoordinator(base), st, "test")
+	require.ErrorIs(t, err, context.Canceled)
+	require.Zero(t, stamp.Timestamp())
+	require.Zero(t, st.samples)
+	live, stop := context.WithCancel(t.Context())
+	defer stop()
+	coord := &snapshotApplyCoordinator{Coordinator: newLocalAdapterCoordinator(base), apply: func() error { stop(); return nil }}
+	stamp, err = beginFencedReadSnapshot(live, coord, base, "test")
+	require.ErrorIs(t, err, context.Canceled)
+	require.Zero(t, stamp.Timestamp())
 }

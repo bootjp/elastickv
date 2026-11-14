@@ -1396,12 +1396,7 @@ func (s *DistributionServer) SplitRange(ctx context.Context, req *pb.SplitRangeR
 		return nil, err
 	}
 
-	readTimestamp, err := kv.BeginReadTimestampThrough(
-		ctx,
-		s.coordinator,
-		s.catalog.LatestCommitTS(),
-		"distribution split range: begin read timestamp",
-	)
+	readTimestamp, err := s.beginCatalogReadSnapshot(ctx, "distribution split range: begin read timestamp")
 	if err != nil {
 		return nil, grpcStatusErrorf(codes.Internal, "begin catalog split snapshot: %v", err)
 	}

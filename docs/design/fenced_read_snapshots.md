@@ -20,11 +20,16 @@ The factory:
 2. For local stores without those capabilities, waits for the coordinator's
    linearizable barrier and only then samples the local committed watermark.
    A missing coordinator fails closed.
-3. Returns errors from the fence; it never tries a best-effort RPC or local
+3. Checks cancellation before and after the barrier. A canceled request cannot
+   obtain a new read token. Returns errors from the fence; it never tries a best-effort RPC or local
    watermark after a distributed floor failure.
 4. Normalizes an empty watermark to 1, observes the floor in the HLC, then
    constructs the coordinator-validated read token. A fresh clock allocation
    must not replace the applied watermark.
+
+Catalog split snapshots use `beginCatalogReadSnapshot`, which waits for the
+catalog group's applied-log barrier before sampling the catalog watermark.
+A leadership-only verification does not establish that barrier.
 
 Redis MULTI/EXEC and list range reads preserve explicit physical group IDs,
 including legacy wide-column groups, through `beginTargetReadSnapshot`.
