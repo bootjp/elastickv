@@ -1115,6 +1115,12 @@ func (r *RedisServer) resolveXReadAfterIDs(ctx context.Context, req *xreadReques
 // the caller's cancellation/deadline so the resolve step doesn't survive
 // past a BLOCK-window cancel.
 func (r *RedisServer) resolveXReadDollarID(ctx context.Context, key []byte) (string, error) {
+	// Each bounded read owns its snapshots; an idle BLOCK command must not
+	// retain earlier polling timestamps or pin unrelated MVCC history.
+	readRequest := kv.NewReadRequest(ctx, r.coordinator, r.store, r.readTracker)
+	defer readRequest.Close()
+	ctx = readRequest.Context()
+
 	readTS, err := r.snapshotReadTS(ctx)
 	if err != nil {
 		return "", err
@@ -1153,6 +1159,12 @@ func (r *RedisServer) dollarIDFromState(ctx context.Context, key []byte, readTS 
 }
 
 func (r *RedisServer) xreadOnce(ctx context.Context, req xreadRequest) ([]xreadResult, error) {
+	// Each bounded read owns its snapshots; an idle BLOCK command must not
+	// retain earlier polling timestamps or pin unrelated MVCC history.
+	readRequest := kv.NewReadRequest(ctx, r.coordinator, r.store, r.readTracker)
+	defer readRequest.Close()
+	ctx = readRequest.Context()
+
 	results := make([]xreadResult, 0, len(req.keys))
 	for i, key := range req.keys {
 		r.observeBlockingRedisKeys(ctx, [][]byte{key})

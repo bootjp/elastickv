@@ -246,3 +246,30 @@ func TestReadRequestUnknownGroupKeepsKeyedFenceAndExactAuthority(t *testing.T) {
 		request.Close()
 	}
 }
+
+func TestReadRequestLeaderRoutedStoreRangeUsesAuthoritativeGroup(t *testing.T) {
+	base := store.NewMVCCStore()
+	t.Cleanup(func() { require.NoError(t, base.Close()) })
+	require.NoError(t, base.PutAt(t.Context(), []byte("key"), []byte("value"), 42, 0))
+	coord := &requestReadGroupCoordinator{stubLeaderCoordinator: &stubLeaderCoordinator{isLeader: true}}
+	routed := NewLeaderRoutedStore(base, coord)
+	request := NewReadRequest(t.Context(), coord, routed, nil)
+	defer request.Close()
+	snapshot, err := request.LatestTargets(request.Context(), "single group", []ReadFenceTarget{{GroupID: 1}})
+	require.NoError(t, err)
+	rows, err := request.Scan(request.Context(), snapshot, nil, nil, 10)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	require.Equal(t, "value", string(rows[0].Value))
+	rows, err = request.ReverseScan(request.Context(), snapshot, nil, nil, 10)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	keys, err := request.ScanKeys(request.Context(), snapshot, nil, nil, 10)
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{[]byte("key")}, keys)
+	_, err = request.LatestTargets(request.Context(), "foreign group", []ReadFenceTarget{{GroupID: 2}})
+	require.ErrorIs(t, err, ErrLeaderNotFound)
+	var absent *LeaderRoutedStore
+	require.Empty(t, absent.ReadFenceTargetsForRange(nil, nil))
+	require.Empty(t, (&LeaderRoutedStore{}).ReadFenceTargetsForRange(nil, nil))
+}

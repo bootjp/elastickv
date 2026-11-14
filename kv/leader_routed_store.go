@@ -722,6 +722,16 @@ func (s *LeaderRoutedStore) GroupCommittedTimestampFloor(ctx context.Context, gr
 	return s.local.LastCommitTS(), nil
 }
 
+// ReadFenceTargetsForRange resolves ordinary scans to this store's sole data
+// group. The identity comes from the store topology, independently of leadership
+// or whether the requested interval currently contains records.
+func (s *LeaderRoutedStore) ReadFenceTargetsForRange(start, _ []byte) []ReadFenceTarget {
+	if s == nil || s.local == nil {
+		return nil
+	}
+	return []ReadFenceTarget{{GroupID: coordinateSingleGroupID, Key: bytes.Clone(start)}}
+}
+
 // WriteConflictCountsByPrefix delegates to the local MVCC store. The
 // leader-routed wrapper does not add cross-group conflict detection of
 // its own, so the node-local view IS the authoritative view.
