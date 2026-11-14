@@ -3,6 +3,7 @@
   (:require [cognitect.aws.client.api :as aws]
             [cognitect.aws.credentials :as creds]
             [elastickv.cli :as cli]
+            [elastickv.fault-transport :as fault-transport]
             [elastickv.db :as ekdb]
             [jepsen [generator :as gen] [net :as net]]
             [jepsen.control :as control]
@@ -27,7 +28,8 @@
               :endpoint-override    {:protocol :http
                                      :hostname host
                                      :port port}}
-       disable-retries? (assoc :retriable? (constantly false))))))
+       disable-retries? (assoc :retriable? (constantly false)
+                              :http-client (fault-transport/bounded-http-client))))))
 
 (defn- anomaly? [resp]
   (contains? resp :cognitect.anomalies/category))
@@ -39,9 +41,12 @@
   [sqs op request]
   (let [resp (aws/invoke sqs {:op op :request request})]
     (if (anomaly? resp)
-      (let [err-type (:__type resp)
+      (let [err-type (or (:__type resp) (get-in resp [:Error :Code])
+                         (get-in resp [:ErrorResponse :Error :Code]))
             category (:cognitect.anomalies/category resp)
-            msg      (or (:message resp)
+            msg      (or (get-in resp [:Error :Message])
+                         (get-in resp [:ErrorResponse :Error :Message])
+                         (:message resp)
                          (:Message resp)
                          (:cognitect.anomalies/message resp)
                          "")]

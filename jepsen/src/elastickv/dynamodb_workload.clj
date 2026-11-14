@@ -14,6 +14,7 @@
             [cognitect.aws.client.api :as aws]
             [cognitect.aws.credentials :as creds]
             [elastickv.cli :as cli]
+            [elastickv.fault-transport :as fault-transport]
             [elastickv.db :as ekdb]
             [jepsen [client :as client]
                     [core :as jepsen]
@@ -51,7 +52,8 @@
               :endpoint-override    {:protocol :http
                                      :hostname host
                                      :port port}}
-       disable-retries? (assoc :retriable? (constantly false))))))
+       disable-retries? (assoc :retriable? (constantly false)
+                              :http-client (fault-transport/bounded-http-client))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Low-level DynamoDB helpers
