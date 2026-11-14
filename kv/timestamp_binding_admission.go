@@ -24,11 +24,6 @@ var homeBindingAttempts sync.Map // [16]byte -> *homeBindingAttempt
 type homeBindingAttempt struct {
 	mu      sync.Mutex
 	pending bool
-	term    uint64
-}
-
-func (a *homeBindingAttempt) canIssueAfter(term uint64) bool {
-	return !a.pending || term > a.term
 }
 
 func homeBindingLeaderTerm(leader raftengine.LeaderView) uint64 {
@@ -74,16 +69,15 @@ func PrepareHomeRawTimestampBinding(
 	if found {
 		return prepareExistingHomeRawBinding(owned, bound, operationID)
 	}
-	if !attempt.canIssueAfter(term) {
+	if attempt.pending {
 		return nil, errors.WithStack(ErrTimestampBindingPending)
 	}
-	// A current-term ReadIndex applied after a term change includes every
-	// surviving older-term proposal. Absence then proves that the prior
-	// attempt cannot later bind this operation ID.
+	// A returned request can still be submitted after a term change. The
+	// applied read only fences proposals already submitted to Raft, so it
+	// cannot authorize reissuance while that request remains outstanding.
 	// An issue error may mean the timestamp was already handed to a proposer.
 	// Never release this ID on an unknown outcome, even if the caller cancels.
 	attempt.pending = true
-	attempt.term = term
 	timestamp, err := issue(ctx)
 	if err != nil {
 		return nil, errors.Wrap(err, "issue home write timestamp")

@@ -194,12 +194,12 @@ Implementation order:
    carries native group-0 issuance through home preparation, atomic binding
    and data apply, and exact-ID retry. An in-process pending-ID gate now
    prevents concurrent or ambiguous retries from reissuing before the applied
-   binding is observed. A pending ID can now be reconsidered only after an
-   applied ReadIndex in a strictly newer leader term proves the old-term
-   proposal absent; the status term is checked before and after the barrier
-   and lookup. The process-local gate does not survive restart, so native
-   crash/leader-transfer tests must still prove that a restarted leader's
-   current-term barrier excludes every old proposal before production use.
+   binding is observed. The home lookup now verifies a stable leader term
+   before and after its applied ReadIndex and lookup, but the process-local
+   pending gate remains fail-closed across term changes: an already returned
+   request may be submitted after the read barrier. Admission needs a durable
+   proposal capability fence before a missing binding can authorize reissue,
+   especially across restart.
    The integration test
    uses a test issuer and method descriptor, not the production allocator and
    registered method. It is not the production Forward path. Memory and Pebble

@@ -189,7 +189,7 @@ func TestPrepareHomeRawTimestampBindingAmbiguousProposalResolvesOnlyFromAppliedB
 	require.Equal(t, 1, issues)
 }
 
-func TestPrepareHomeRawTimestampBindingReissuesOnlyAfterNewTermBarrier(t *testing.T) {
+func TestPrepareHomeRawTimestampBindingRemainsPendingAfterNewTermBarrier(t *testing.T) {
 	st := store.NewMVCCStore()
 	metadata, ok := st.(store.RaftControlMetadataStore)
 	require.True(t, ok)
@@ -210,12 +210,9 @@ func TestPrepareHomeRawTimestampBindingReissuesOnlyAfterNewTermBarrier(t *testin
 	require.Equal(t, 1, issues)
 
 	leader.term = 2
-	second, err := PrepareHomeRawTimestampBinding(t.Context(), leader, metadata, issue, request)
-	require.NoError(t, err)
-	require.Equal(t, uint64(42), second.Ts)
-	require.Equal(t, 2, issues)
 	_, err = PrepareHomeRawTimestampBinding(t.Context(), leader, metadata, issue, request)
 	require.ErrorIs(t, err, ErrTimestampBindingPending)
+	require.Equal(t, 1, issues)
 }
 
 func TestPrepareHomeRawTimestampBindingRejectsTermChangeDuringRead(t *testing.T) {
@@ -264,9 +261,8 @@ func TestPrepareHomeRawTimestampBindingRejectsIssueAcrossTermChange(t *testing.T
 		return 42, nil
 	}, request)
 	require.ErrorIs(t, err, ErrTimestampBindingInvalid)
-	second, err := PrepareHomeRawTimestampBinding(t.Context(), leader, metadata, func(context.Context) (uint64, error) {
+	_, err = PrepareHomeRawTimestampBinding(t.Context(), leader, metadata, func(context.Context) (uint64, error) {
 		return 43, nil
 	}, request)
-	require.NoError(t, err)
-	require.Equal(t, uint64(43), second.Ts)
+	require.ErrorIs(t, err, ErrTimestampBindingPending)
 }
