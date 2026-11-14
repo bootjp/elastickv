@@ -10,7 +10,7 @@ RUN java --list-modules | grep -q '^jdk.random@'
 
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       openssh-server sudo rsync curl netcat-openbsd iptables iproute2 \
-      chrony libfaketime fuse3 procps psmisc openjdk-17-jre-headless leiningen \
+      chrony libfaketime fuse3 procps psmisc openjdk-17-jre-headless leiningen graphviz gnuplot-nox \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /run/sshd /root/.ssh /home/vagrant/.cache/go-build /home/vagrant/go \
     && chmod 700 /root/.ssh \

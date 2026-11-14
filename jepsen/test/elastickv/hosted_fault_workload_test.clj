@@ -63,17 +63,27 @@
 (deftest final-reads-use-every-node-endpoint-and-every-key
   (let [test {:concurrency 6 :nodes nodes}
         ctx (gen/context test)
-        ops (loop [g (hosted/final-read-phase nodes 2) result []]
+        touched (atom #{0 1})
+        generator (hosted/final-read-phase nodes touched)
+        _ (swap! touched conj 12)
+        ops (loop [g generator result []]
               (let [[op next-gen] (gen/op g test ctx)]
                 (if (or (nil? op) (= :pending op))
                   result
                   (recur next-gen (conj result op)))))
         by-node (group-by #(mod (:process %) 3) ops)]
-    (is (= 6 (count ops)))
+    (is (= 3 (count ops)))
     (is (every? :final ops))
     (is (= #{0 1 2} (set (keys by-node))))
     (doseq [[_ reads] by-node]
-      (is (= [0 1] (sort (map #(second (first (:value %))) reads)))))))
+      (is (= [0 1 12] (mapv second (:value (first reads))))))))
+
+(deftest rotated-keys-also-require-recovery-reads
+  (let [history (into [{:type :invoke :f :txn :process 0 :value [[:append 12 1]]}]
+                      (good-history :kill))]
+    (is (false? (:valid? (check-history :kill history))))
+    (is (= #{["n1" 12] ["n2" 12] ["n3" 12]}
+           (set (:missing-final-reads (check-history :kill history)))))))
 
 (deftest managed-test-constructs-and-rejects-disabled-or-incomplete-faults
   (is (:generator (hosted/hosted-fault-test opts)))

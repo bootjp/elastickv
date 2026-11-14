@@ -13,6 +13,9 @@ is followed by healing/restart/resume. The last phase explicitly heals again,
 waits 10 seconds, then reads every key from every node. Redis may forward reads
 to the leader, so these are checks through each node's client endpoint, not
 direct inspections of each follower's local storage.
+The workload tracks emitted key IDs, including keys introduced when Elle
+rotates its active key window, and reads them all in a final transaction per
+node. Graphviz and gnuplot are included for checker diagnostics.
 
 The existing strict-serializability list-append checker analyzes the complete
 history, including recovery reads. An additional checker requires successful

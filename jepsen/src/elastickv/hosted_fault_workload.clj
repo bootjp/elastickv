@@ -43,15 +43,16 @@
                      (gen/sleep interval)])
                   nodes))))
 
-(defn final-read-phase [nodes key-count]
+(defn final-read-phase [nodes touched-keys]
   (apply gen/any
          (map-indexed
            (fn [i _node]
              (gen/on-threads
                #(and (integer? %) (= i (mod % (count nodes))))
-               (mapv (fn [k] {:type :invoke :f :txn :final true
-                             :value [[:r k nil]]})
-                     (range key-count))))
+               (gen/once
+                 (fn [_test _ctx]
+                   {:type :invoke :f :txn :final true
+                    :value (mapv (fn [k] [:r k nil]) (sort @touched-keys))}))))
            nodes)))
 
 (defn evidence-checker
@@ -81,7 +82,12 @@
                          indexed)
             observed (set (for [op finals [f k _v] (:value op) :when (= :r f)]
                             [(:node op) k]))
-            missing-reads (for [node nodes k (range key-count)
+            keys (into (set (range key-count))
+                       (for [op history
+                             :when (and (= :invoke (:type op)) (= :txn (:f op))
+                                        (not (:final op)))
+                             [_f k _v] (:value op)] k))
+            missing-reads (for [node nodes k (sort keys)
                                 :when (not (observed [node k]))] [node k])
             writes (filter #(and (= :ok (:type %))
                                  (some (fn [[f]] (= :append f)) (:value %)))
@@ -115,6 +121,7 @@
           base (redis/elastickv-redis-test (assoc opts :key-count key-count
                                                      :bootstrap-members members))
           workload (redis/elastickv-append-workload (assoc opts :key-count key-count))
+          touched-keys (atom (set (range key-count)))
           [_ stop] (fault-ops fault)]
       (assoc base
              :name (str "elastickv-hosted-" (name fault))
@@ -134,6 +141,12 @@
              :generator
              (gen/phases
                (->> (:generator workload)
+                    ;; Elle rotates its active key window; key-count does not
+                    ;; bound key IDs. Track emitted keys before dispatch so
+                    ;; even indeterminate operations receive final reads.
+                    (gen/map (fn [op]
+                               (swap! touched-keys into (map second (:value op)))
+                               op))
                     (gen/stagger (/ (double (:rate opts))))
                     (gen/nemesis (fault-cycle nodes fault interval))
                     (gen/time-limit (:time-limit opts)))
@@ -141,7 +154,7 @@
                ;; cannot be serialized as :final-generator in Jepsen 0.3.x.
                (gen/nemesis (gen/once {:type :info :f stop :value :all :recovery true}))
                (gen/sleep recovery-time)
-               (gen/clients (final-read-phase nodes key-count)))))))
+               (gen/clients (final-read-phase nodes touched-keys)))))))
 
 (def cli-opts
   (into (into cli/common-cli-opts redis/redis-cli-opts)
