@@ -714,11 +714,16 @@ func TestS3Server_UploadPartStreamingRejectsTruncatedChunk(t *testing.T) {
 	require.Contains(t, rec.Body.String(), "<Code>InvalidRequest</Code>")
 }
 
-func TestS3Server_ProxiesFollowerRequestsBeforeAuth(t *testing.T) {
+func TestS3Server_ProxiesAuthenticatedFollowerRequests(t *testing.T) {
 	t.Parallel()
 
+	validator := &S3Server{staticCreds: map[string]string{testS3AccessKey: testS3SecretKey}, region: testS3Region}
 	var proxied bool
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if authErr := validator.authorizeRequest(r); authErr != nil {
+			w.WriteHeader(authErr.Status)
+			return
+		}
 		proxied = true
 		_, _ = io.WriteString(w, "proxied")
 	}))
@@ -737,7 +742,9 @@ func TestS3Server_ProxiesFollowerRequestsBeforeAuth(t *testing.T) {
 	)
 
 	rec := httptest.NewRecorder()
-	req := newS3TestRequest(http.MethodGet, "/", nil)
+	req := newSignedS3Request(t, "/", "", currentS3SigningTime())
+	req.Method = http.MethodGet
+	req = resignS3Request(t, req, currentS3SigningTime())
 	server.handle(rec, req)
 
 	require.True(t, proxied)
