@@ -58,6 +58,7 @@
       (swap! (.-state ^PendingDeletes pending)
              #(apply dissoc % (map :receipt confirmed)))
       {:value (mapv :Body messages)
+       :receive-performed? (empty? debt)
        :deleted (mapv :deleted confirmed)
        :delete-retry-count (count debt)
        :delete-errors (mapv :error (filter :error acknowledgements))

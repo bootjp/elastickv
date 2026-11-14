@@ -141,6 +141,8 @@
         (is (= 1 (:delete-retry-count waiting-op)) "retry is observable before another receive")
         (is (false? (:valid? (result [(sent "a") first-op waiting-op]))))
         (is (= ["a"] (:deleted retry-op)))
+        (is (true? (:receive-performed? first-op)))
+        (is (false? (:receive-performed? retry-op)))
         (is (true? (:valid? (result [(sent "a") first-op waiting-op retry-op final-op]))))
         (is (= ["original" "original" "original"] @deletes))
         (is (= 2 @receives))))))
