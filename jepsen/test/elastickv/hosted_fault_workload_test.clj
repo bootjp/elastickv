@@ -12,9 +12,12 @@
   (let [[start stop] (hosted/fault-ops fault)]
     (vec (concat
            [{:type :ok :f :txn :process 0 :value [[:append 0 1]]}]
-           (for [node nodes f [start stop]]
-             {:type :info :process :nemesis :f f :target node})
-           [{:type :info :process :nemesis :f stop :recovery true}]
+           (mapcat (fn [[node f]]
+                     [{:type :info :process :nemesis :f f :target node :value [node]}
+                      {:type :info :process :nemesis :f f :target node :value :done}])
+                   (for [node nodes f [start stop]] [node f]))
+           [{:type :info :process :nemesis :f stop :recovery true :value :all}
+            {:type :info :process :nemesis :f stop :recovery true :value :done}]
            (for [node nodes k (range 2)]
              {:type :ok :process 0 :f :txn :final true :node node
               :value [[:r k (when (zero? k) [1])]]})))))
@@ -27,16 +30,16 @@
     (let [history (good-history fault)]
       (is (true? (:valid? (check-history fault history))))
       (testing "no missing, failed, or unexecuted fault/heal is accepted"
-        (doseq [i (range 1 8)]
+        (doseq [i (range 2 15 2)]
           (is (false? (:valid? (check-history fault
                                  (assoc-in history [i :error] :nemesis-error)))))))
       (testing "every node and key must be read successfully after recovery"
         (is (false? (:valid? (check-history fault (pop history)))))
         (is (false? (:valid? (check-history fault
-                               (assoc-in history [8 :type] :fail))))))
+                               (assoc-in history [15 :type] :fail))))))
       (testing "reads before recovery cannot satisfy the gate"
         (is (false? (:valid? (check-history fault
-                               (concat (subvec history 8) (subvec history 0 8)))))))
+                               (concat (subvec history 15) (subvec history 0 15)))))))
       (testing "an empty write history must fail"
         (is (false? (:valid? (check-history fault (subvec history 1)))))))))
 

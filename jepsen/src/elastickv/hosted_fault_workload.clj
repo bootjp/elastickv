@@ -62,16 +62,27 @@
     (check [_ _test history _opts]
       (let [[start stop] (fault-ops fault)
             indexed (map-indexed vector history)
+            ;; The serial nemesis worker records both invocation and response
+            ;; as :info. Only a matching, successful response proves completion.
+            completed (keep (fn [pair]
+                              (when (= 2 (count pair))
+                                (let [[[_ invoked] [i response]] pair]
+                                  (when (and (= (select-keys invoked [:f :target :recovery])
+                                                (select-keys response [:f :target :recovery]))
+                                             (= :info (:type response))
+                                             (not (:error response)))
+                                    [i response]))))
+                            (partition-all 2 (filter #(= :nemesis (:process (second %))) indexed)))
             healed-at (some (fn [[i op]]
                               (when (and (:recovery op) (= stop (:f op))
                                          (= :nemesis (:process op))
                                          (= :info (:type op)) (not (:error op))) i))
-                            indexed)
+                            completed)
             events (keep (fn [[i op]]
                            (when (and healed-at (< i healed-at)
                                       (= :nemesis (:process op))
                                       (= :info (:type op)) (not (:error op))) op))
-                         indexed)
+                         completed)
             missing-faults (for [node nodes f [start stop]
                                  :when (not-any? #(and (= f (:f %))
                                                        (= node (:target %))) events)]
