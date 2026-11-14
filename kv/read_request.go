@@ -146,7 +146,7 @@ func (r *ReadRequest) Latest(ctx context.Context, label string, keys ...[]byte) 
 	if err := r.validate(ctx); err != nil {
 		return ReadSnapshot{}, err
 	}
-	keys = requestFenceKeys(r.coord, r.st, keys)
+	keys = requestFenceKeys(r.st, keys)
 	ts, err := requestCommittedFloor(ctx, r.coord, r.st, keys)
 	if err != nil {
 		return ReadSnapshot{}, errors.Wrap(err, label+": read fence")
@@ -322,33 +322,12 @@ func (r *ReadRequest) validateKeyScope(s ReadSnapshot, key []byte) error {
 	return errors.WithStack(ErrReadSnapshotKeyScope)
 }
 
-// Without group identities, a global barrier is the only proof that may
-// authorize arbitrary object chunks or a range. Do not infer group coverage
-// from a key-only interface. A keyed-only authority retains exact-key scope.
-func requestFenceKeys(coord Coordinator, st store.MVCCStore, keys [][]byte) [][]byte {
-	if len(keys) == 0 {
-		return nil
-	}
+// A keyed barrier without complete group identities only authorizes its exact
+// keys. It must not silently expand into a global barrier or broader authority.
+func requestFenceKeys(st store.MVCCStore, keys [][]byte) [][]byte {
 	if _, keyed := st.(interface {
 		CommittedTimestampFloorForKeys(context.Context, [][]byte) (uint64, error)
 	}); !keyed {
-		return nil
-	}
-	if resolver, ok := coord.(interface{ EngineGroupIDForKey([]byte) uint64 }); ok {
-		complete := true
-		for _, key := range keys {
-			if resolver.EngineGroupIDForKey(key) == 0 {
-				complete = false
-				break
-			}
-		}
-		if complete {
-			return keys
-		}
-	}
-	if _, global := st.(interface {
-		GlobalCommittedTimestampFloor(context.Context) (uint64, error)
-	}); global {
 		return nil
 	}
 	return keys
@@ -445,7 +424,12 @@ func (r *ReadRequest) scopedSnapshot(stamp ReadTimestamp, keys [][]byte) ReadSna
 		if resolver, ok := r.coord.(interface{ EngineGroupIDForKey([]byte) uint64 }); ok {
 			snapshot.groups = make(map[uint64]struct{}, len(keys))
 			for _, key := range keys {
-				snapshot.groups[resolver.EngineGroupIDForKey(key)] = struct{}{}
+				groupID := resolver.EngineGroupIDForKey(key)
+				if groupID == 0 {
+					snapshot.groups = nil
+					break
+				}
+				snapshot.groups[groupID] = struct{}{}
 			}
 		}
 	}

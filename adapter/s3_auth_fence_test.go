@@ -73,7 +73,7 @@ func TestS3PublicObjectReadDoesNotFenceGlobally(t *testing.T) {
 		t.Run(method, func(t *testing.T) {
 			base := store.NewMVCCStore()
 			t.Cleanup(func() { require.NoError(t, base.Close()) })
-			srv := NewS3Server(nil, "", base, newLocalAdapterCoordinator(base), nil,
+			srv := NewS3Server(nil, "", base, &s3ReadSnapshotTestCoordinator{Coordinator: newLocalAdapterCoordinator(base)}, nil,
 				WithS3StaticCredentials(map[string]string{testS3AccessKey: testS3SecretKey}))
 			stamp := currentS3SigningTime()
 			req := newSignedS3Request(t, "/public", "", stamp)

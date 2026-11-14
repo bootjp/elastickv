@@ -13,17 +13,21 @@ import (
 
 type requestReadTestStore struct {
 	store.MVCCStore
-	floor    uint64
-	fenceErr error
-	reads    atomic.Int64
-	entered  chan struct{}
-	release  chan struct{}
+	floor        uint64
+	fenceErr     error
+	reads        atomic.Int64
+	globalFences atomic.Int64
+	keyedFences  atomic.Int64
+	entered      chan struct{}
+	release      chan struct{}
 }
 
 func (s *requestReadTestStore) GlobalCommittedTimestampFloor(context.Context) (uint64, error) {
+	s.globalFences.Add(1)
 	return s.floor, s.fenceErr
 }
 func (s *requestReadTestStore) CommittedTimestampFloorForKeys(context.Context, [][]byte) (uint64, error) {
+	s.keyedFences.Add(1)
 	return s.floor, s.fenceErr
 }
 func (s *requestReadTestStore) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte, error) {
@@ -218,4 +222,27 @@ func TestReadRequestReleasesPinsAndClosedChildren(t *testing.T) {
 	require.Zero(t, remaining)
 	request.Close()
 	require.Zero(t, tracker.Oldest())
+}
+
+type requestUnknownGroupCoordinator struct{ *stubLeaderCoordinator }
+
+func (*requestUnknownGroupCoordinator) EngineGroupIDForKey([]byte) uint64 { return 0 }
+
+func TestReadRequestUnknownGroupKeepsKeyedFenceAndExactAuthority(t *testing.T) {
+	for _, coord := range []Coordinator{nil, &requestUnknownGroupCoordinator{&stubLeaderCoordinator{isLeader: true}}} {
+		st, request := requestReadFixture(t)
+		request.coord = coord
+		snapshot, err := request.Latest(request.Context(), "bucket ACL", []byte("key"))
+		require.NoError(t, err)
+		require.Equal(t, int64(1), st.keyedFences.Load())
+		require.Zero(t, st.globalFences.Load())
+		_, err = request.Get(request.Context(), snapshot, []byte("other"))
+		require.ErrorIs(t, err, ErrReadSnapshotKeyScope)
+		_, err = request.Scan(request.Context(), snapshot, nil, nil, 10)
+		require.ErrorIs(t, err, ErrReadSnapshotKeyScope)
+		value, err := request.Get(request.Context(), snapshot, []byte("key"))
+		require.NoError(t, err)
+		require.Equal(t, "1", string(value))
+		request.Close()
+	}
 }
