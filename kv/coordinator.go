@@ -590,7 +590,7 @@ func (c *Coordinate) dispatchWithRetry(ctx context.Context, reqs *OperationGroup
 
 	// Validate the request before any use to avoid panics on malformed input.
 	// Validation errors are not retryable, so do this once outside the loop.
-	if err := validateOperationGroup(reqs); err != nil {
+	if err := validateOperationGroupForDispatch(reqs); err != nil {
 		return nil, err
 	}
 
@@ -833,7 +833,7 @@ func (c *Coordinate) dispatchAdmitted(ctx context.Context, reqs *OperationGroup[
 	if reqs.IsTxn {
 		resp, err = c.dispatchTxn(ctx, reqs.Elems, reqs.ReadKeys, reqs.StartTS, reqs.CommitTS, reqs.PrevCommitTS, reqs.ObservedRouteVersion, reqs.KeyVizLabel, reqs.PrimaryKey)
 	} else {
-		resp, err = c.dispatchRaw(ctx, reqs.Elems, reqs.KeyVizLabel)
+		resp, err = c.dispatchRaw(ctx, reqs.Elems, reqs.KeyVizLabel, reqs.OperationID)
 	}
 	c.refreshLeaseAfterDispatch(resp, err, dispatchStart, expectedGen)
 	return resp, err
@@ -1364,7 +1364,7 @@ func (c *Coordinate) dispatchTxn(ctx context.Context, reqs []*Elem[OP], readKeys
 	}, nil
 }
 
-func (c *Coordinate) dispatchRaw(ctx context.Context, req []*Elem[OP], label keyviz.Label) (*CoordinateResponse, error) {
+func (c *Coordinate) dispatchRaw(ctx context.Context, req []*Elem[OP], label keyviz.Label, operationID []byte) (*CoordinateResponse, error) {
 	muts := make([]*pb.Mutation, 0, len(req))
 	for _, elem := range req {
 		mut := elemToMutation(elem)
@@ -1377,10 +1377,11 @@ func (c *Coordinate) dispatchRaw(ctx context.Context, req []*Elem[OP], label key
 		return nil, err
 	}
 	logs := []*pb.Request{{
-		IsTxn:     false,
-		Phase:     pb.Phase_NONE,
-		Ts:        ts,
-		Mutations: muts,
+		IsTxn:                       false,
+		Phase:                       pb.Phase_NONE,
+		Ts:                          ts,
+		Mutations:                   muts,
+		TimestampBindingOperationId: append([]byte(nil), operationID...),
 	}}
 
 	r, err := c.transactionManager.Commit(ctx, logs)
@@ -1605,7 +1606,9 @@ func (c *Coordinate) buildRedirectRequests(reqs *OperationGroup[OP]) ([]*pb.Requ
 	if !reqs.IsTxn {
 		requests := make([]*pb.Request, 0, len(reqs.Elems))
 		for _, req := range reqs.Elems {
-			requests = append(requests, c.toRawRequest(req))
+			request := c.toRawRequest(req)
+			request.TimestampBindingOperationId = append([]byte(nil), reqs.OperationID...)
+			requests = append(requests, request)
 		}
 		return requests, nil
 	}

@@ -74,6 +74,9 @@ type Elem[T OP] struct {
 type OperationGroup[T OP] struct {
 	Elems []*Elem[T]
 	IsTxn bool
+	// OperationID identifies one raw write across client retries. It is
+	// unavailable until durable Phase-D admission is enabled.
+	OperationID []byte
 	// PrimaryKey optionally selects a written key as the transaction's
 	// primary. Empty preserves the lexicographically smallest-key default.
 	// Callers that use it must keep the same key across every attempt.

@@ -208,8 +208,11 @@ Implementation order:
    methods; TLS plus a bearer token alone is rejected. The authenticated
    client checks the versioned response and has no legacy fallback. The
    handler option and client route are not installed in production: no
-   replicated all-member activation gate or stable public raw operation ID
-   exists yet. The helper therefore cannot authorize production writes or
+   replicated all-member activation gate exists yet. The public RawPut and
+   RawDelete messages now carry an optional caller-stable operation ID through
+   the operation group and raw request builders, but production validation
+   rejects ID-bearing writes before timestamp issuance until durable admission
+   is installed. The helper therefore cannot authorize production writes or
    serve as a substitute for primary/secondary evidence.
 3. Physical-band group-0 reservation and versioned reservation response;
    prove no duplicate issuance across concurrent allocators, term changes,
