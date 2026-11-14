@@ -349,7 +349,10 @@ func (d *DynamoDBServer) prepareReadSchema(
 	if err := d.ensureLegacyTableMigration(ctx, tableName); err != nil {
 		return nil, 0, err
 	}
-	readTS := d.resolveDynamoReadTS(consistentRead)
+	readTS, err := d.resolveDynamoReadSnapshot(ctx, consistentRead)
+	if err != nil {
+		return nil, 0, err
+	}
 	schema, exists, err := d.loadTableSchemaAt(ctx, tableName, readTS)
 	if err != nil {
 		return nil, 0, errors.WithStack(err)
@@ -413,29 +416,15 @@ func (d *DynamoDBServer) mergeReadItemsFromSourceSchema(
 	return mergeMigratingReadItems(schema.PrimaryKey, orderKey, items, sourceItems)
 }
 
-// consistentReadLatestTS is a read timestamp used for ConsistentRead=true reads.
-// The value is far above any realistic HLC timestamp (~Unix-nanosecond range,
-// ≪ 10^19), so reading at this TS from the leader's Pebble store returns the
-// most recently committed version of any key.  It avoids the noStartTS
-// sentinel (^uint64(0)) used by the coordinator.
-//
-// This sentinel is used on BOTH the leader and followers:
-//   - On a follower, the read is proxied to the leader via proxyRawGet with
-//     ts=consistentReadLatestTS, so the leader reads the absolute latest version.
-//   - On the leader, the LeaderRoutedStore performs a linearizable read fence
-//     (ensuring all committed Raft entries are applied) and then reads locally
-//     at consistentReadLatestTS, returning the latest committed version.
-//
-// Using store.LastCommitTS() instead would introduce a TOCTOU race: the
-// timestamp is captured before the linearizable fence, so a write committed
-// after LastCommitTS() but applied during the fence would be missed.
-const consistentReadLatestTS = ^uint64(0) - 1
-
-func (d *DynamoDBServer) resolveDynamoReadTS(consistentRead *bool) uint64 {
+// resolveDynamoReadSnapshot makes the eventual/strong protocol choice
+// explicit before any typed data read resolves its capability.
+func (d *DynamoDBServer) resolveDynamoReadSnapshot(ctx context.Context, consistentRead *bool, keys ...[]byte) (uint64, error) {
 	if consistentRead != nil && *consistentRead {
-		return consistentReadLatestTS
+		stamp, err := beginFencedReadSnapshot(ctx, d.coordinator, d.store, "dynamodb consistent read", keys...)
+		return stamp.Timestamp(), err
 	}
-	return eventualSnapshotTS(d.coordinator.Clock(), d.store)
+	ts := eventualSnapshotTS(d.coordinator.Clock(), d.store)
+	return ts, authorizeHistoricalRead(ctx, d.store, ts)
 }
 
 func validateGSIReadOptions(
@@ -1170,7 +1159,7 @@ func (it *keyRangeKVIterator) loadNextPage(ctx context.Context) error {
 }
 
 func (it *keyRangeKVIterator) loadNextPageForward(ctx context.Context) error {
-	kvs, err := it.server.store.ScanAt(ctx, it.cursor, it.upper, it.pageLimit, it.readTS)
+	kvs, err := requestScanAt(ctx, it.server.store, it.cursor, it.upper, it.pageLimit, it.readTS)
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -1191,7 +1180,7 @@ func (it *keyRangeKVIterator) loadNextPageForward(ctx context.Context) error {
 }
 
 func (it *keyRangeKVIterator) loadNextPageReverse(ctx context.Context) error {
-	kvs, err := it.server.store.ReverseScanAt(ctx, it.lower, it.cursor, it.pageLimit, it.readTS)
+	kvs, err := requestReverseScanAt(ctx, it.server.store, it.lower, it.cursor, it.pageLimit, it.readTS)
 	if err != nil {
 		return errors.WithStack(err)
 	}

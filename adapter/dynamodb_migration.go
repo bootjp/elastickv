@@ -209,7 +209,7 @@ func (d *DynamoDBServer) scanLegacyMigrationPage(
 	upper []byte,
 	readTS uint64,
 ) ([]*store.KVPair, error) {
-	kvs, err := d.store.ScanAt(ctx, cursor, upper, dynamoScanPageLimit, readTS)
+	kvs, err := requestScanAt(ctx, d.store, cursor, upper, dynamoScanPageLimit, readTS)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -303,7 +303,7 @@ func (d *DynamoDBServer) isTableGenerationEmpty(ctx context.Context, tableName s
 	if err != nil {
 		return false, err
 	}
-	kvs, err := d.store.ScanAt(ctx, prefix, prefixScanEnd(prefix), 1, stamp.Timestamp())
+	kvs, err := requestScanAt(ctx, d.store, prefix, prefixScanEnd(prefix), 1, stamp.Timestamp())
 	if err != nil {
 		return false, errors.WithStack(err)
 	}

@@ -377,7 +377,7 @@ func loadS3BlobBackfillRef(
 	metadataStore store.MVCCStore,
 	refKey []byte,
 ) (s3keys.ChunkRefValue, uint64, bool, error) {
-	value, err := metadataStore.GetAt(ctx, refKey, math.MaxUint64)
+	value, err := historicalGetAt(ctx, metadataStore, refKey, math.MaxUint64)
 	if errors.Is(err, store.ErrKeyNotFound) {
 		return s3keys.ChunkRefValue{}, 0, true, nil
 	}
@@ -495,7 +495,7 @@ func (b *S3BlobBackfiller) scanChunkRefsInStore(ctx context.Context, localStore 
 	start := []byte(s3keys.ChunkRefPrefix)
 	end := prefixScanEnd(start)
 	for {
-		rows, err := localStore.ScanAt(ctx, start, end, b.config.ScanPageSize, math.MaxUint64)
+		rows, err := historicalScanAt(ctx, localStore, start, end, b.config.ScanPageSize, math.MaxUint64)
 		if err != nil {
 			if ctx.Err() == nil {
 				slog.Warn("scan local s3 chunkrefs for backfill", "err", err)

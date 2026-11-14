@@ -14,6 +14,13 @@ import (
 // A failed distributed fence never falls back to a follower's local watermark.
 // Explicit historical reads and DynamoDB eventual reads have separate paths.
 func beginFencedReadSnapshot(ctx context.Context, coord kv.Coordinator, st store.MVCCStore, label string, keys ...[]byte) (kv.ReadTimestamp, error) {
+	if request, ok := kv.ReadRequestFromContext(ctx); ok {
+		if !request.MatchesStore(st) {
+			return kv.ReadTimestamp{}, kv.ErrReadSnapshotScope
+		}
+		snapshot, err := request.Latest(ctx, label, keys...)
+		return snapshot.TransactionTimestamp(), err
+	}
 	if err := ctx.Err(); err != nil {
 		return kv.ReadTimestamp{}, errors.WithStack(err)
 	}

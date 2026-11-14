@@ -86,7 +86,7 @@ func (s *S3Server) loadS3MultipartCompletion(ctx context.Context, readTS uint64,
 }
 
 func (s *S3Server) loadS3MultipartUploadMeta(ctx context.Context, readTS uint64, completion *s3MultipartCompletion) error {
-	raw, err := s.store.GetAt(ctx, completion.uploadMetaKey, readTS)
+	raw, err := requestGetAt(ctx, s.store, completion.uploadMetaKey, readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return newS3ResponseError(http.StatusNotFound, "NoSuchUpload", "upload not found", completion.bucket, completion.objectKey)
@@ -125,7 +125,7 @@ func (s *S3Server) loadS3MultipartParts(ctx context.Context, readTS uint64, requ
 }
 
 func (s *S3Server) loadS3MultipartPart(ctx context.Context, readTS uint64, partKey []byte, requested s3CompleteMultipartUploadPart, last bool, completion *s3MultipartCompletion) (s3ObjectPart, []byte, error) {
-	raw, err := s.store.GetAt(ctx, partKey, readTS)
+	raw, err := requestGetAt(ctx, s.store, partKey, readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			message := fmt.Sprintf("part %d not found", requested.PartNumber)

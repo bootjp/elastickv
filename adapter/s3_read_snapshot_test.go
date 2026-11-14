@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/s3keys"
+	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 )
@@ -31,7 +32,7 @@ func TestS3GetObjectFencesBeforeChoosingItsSnapshot(t *testing.T) {
 	for _, head := range []bool{false, true} {
 		t.Run(map[bool]string{false: "GET", true: "HEAD"}[head], func(t *testing.T) {
 			st := store.NewMVCCStore()
-			srv := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+			srv := NewS3Server(nil, "", st, &s3ReadSnapshotTestCoordinator{Coordinator: newLocalAdapterCoordinator(st)}, nil)
 			put := func(path, body string) {
 				rec := httptest.NewRecorder()
 				srv.handle(rec, newS3TestRequest(http.MethodPut, path, strings.NewReader(body)))
@@ -98,3 +99,7 @@ func TestS3MetadataReadsFenceLaggingLocalWatermarks(t *testing.T) {
 		})
 	}
 }
+
+type s3ReadSnapshotTestCoordinator struct{ kv.Coordinator }
+
+func (*s3ReadSnapshotTestCoordinator) EngineGroupIDForKey([]byte) uint64 { return 1 }

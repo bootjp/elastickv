@@ -40,9 +40,9 @@ func TestReadSnapshotConstructionIsCentralized(t *testing.T) {
 		},
 		"GlobalLastCommitTS": {}, // best-effort RPC fallback must never select a latest snapshot
 		"eventualSnapshotTS": {
-			"dynamodb_query_scan.go:resolveDynamoReadTS": true,
+			"dynamodb_query_scan.go:resolveDynamoReadSnapshot": true,
 			// Speculative schema validation only; actual strong reads fence separately.
-			"dynamodb_lease.go:multiShardReadLeasePlan":    true,
+			"dynamodb_lease.go:loadSpeculativeSchema":      true,
 			"dynamodb_lease.go:queryLeaseKey":              true,
 			"dynamodb_lease.go:resolveTransactGetItemKeys": true,
 		},
@@ -51,7 +51,7 @@ func TestReadSnapshotConstructionIsCentralized(t *testing.T) {
 			"redis_txn.go:beginTargetReadSnapshot":     true,
 			// These consume committed seals or explicit migration snapshots, rather
 			// than selecting latest reads from local watermarks.
-			"dynamodb_locks.go:tryTxnWriteTimestamp":                                   true,
+			"dynamodb_locks.go:sealedReadTimestamp":                                    true,
 			"migration_ownership_refresh_attestation.go:issueMigrationPartitionReadTS": true,
 			"read_snapshot.go:beginCatalogReadSnapshot":                                true,
 			"split_job_runner.go:ensureSplitJobCatalogFence":                           true,
@@ -81,12 +81,19 @@ func TestReadSnapshotConstructionIsCentralized(t *testing.T) {
 func checkSnapshotFactoryFile(t *testing.T, fs *token.FileSet, name string, file *ast.File, allowed map[string]map[string]bool) {
 	t.Helper()
 	for _, decl := range file.Decls {
-		fn, ok := decl.(*ast.FuncDecl)
-		if !ok || fn.Body == nil {
+		if general, ok := decl.(*ast.GenDecl); ok && general.Tok == token.TYPE {
 			continue
 		}
-		scope := filepath.Base(name) + ":" + fn.Name.Name
-		ast.Inspect(fn.Body, func(node ast.Node) bool {
+		scope := filepath.Base(name) + ":<package>"
+		var root ast.Node = decl
+		if fn, ok := decl.(*ast.FuncDecl); ok {
+			if fn.Body == nil {
+				continue
+			}
+			scope = filepath.Base(name) + ":" + fn.Name.Name
+			root = fn.Body
+		}
+		ast.Inspect(root, func(node ast.Node) bool {
 			callee := snapshotSourceName(node)
 			scopes, guarded := allowed[callee]
 			if guarded && !scopes[scope] {
@@ -99,6 +106,8 @@ func checkSnapshotFactoryFile(t *testing.T, fs *token.FileSet, name string, file
 
 func snapshotSourceName(node ast.Node) string {
 	switch n := node.(type) {
+	case *ast.Ident:
+		return n.Name
 	case *ast.SelectorExpr:
 		// Exported capabilities must not escape through method values either.
 		if ast.IsExported(n.Sel.Name) {

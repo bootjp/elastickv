@@ -1227,7 +1227,7 @@ func (s *SQSServer) scanOneVisibleMessagePage(ctx context.Context, start, end []
 
 func (s *SQSServer) scanVisibleIndexAt(ctx context.Context, start, end []byte, pageSize int, readTS uint64) ([]*store.KVPair, uint64, error) {
 	if s.partitionResolver == nil || !s.partitionResolver.RecognisesPartitionedKey(start) {
-		kvs, err := s.store.ScanAt(ctx, start, end, pageSize, readTS)
+		kvs, err := requestScanAt(ctx, s.store, start, end, pageSize, readTS)
 		return kvs, 0, errors.WithStack(err)
 	}
 	groupID, ok := s.partitionResolver.ResolveGroup(start)
@@ -1238,7 +1238,7 @@ func (s *SQSServer) scanVisibleIndexAt(ctx context.Context, start, end []byte, p
 	if !ok {
 		return nil, 0, errors.New("sqs receive partition scan requires a group-aware shard store")
 	}
-	kvs, err := groupScanner.ScanGroupAt(ctx, groupID, start, end, pageSize, readTS)
+	kvs, err := requestScanGroupAt(ctx, groupScanner, groupID, start, end, pageSize, readTS)
 	return kvs, groupID, errors.WithStack(err)
 }
 
@@ -1266,7 +1266,7 @@ func (s *SQSServer) loadCandidateRecord(ctx context.Context, queueName string, m
 		if !ok {
 			return nil, dataKey, false, errors.New("sqs receive candidate load requires a group-aware shard store")
 		}
-		raw, err = groupGetter.GetGroupAt(ctx, cand.groupID, dataKey, readTS)
+		raw, err = requestGetGroupAt(ctx, groupGetter, cand.groupID, dataKey, readTS)
 	} else {
 		raw, err = s.getSQSAt(ctx, dataKey, readTS)
 	}

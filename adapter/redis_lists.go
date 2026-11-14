@@ -41,7 +41,7 @@ func clampRange(start, end, length int) (int, int) {
 }
 
 func (r *RedisServer) loadListMetaAt(ctx context.Context, key []byte, readTS uint64) (store.ListMeta, bool, error) {
-	val, err := r.store.GetAt(ctx, store.ListMetaKey(key), readTS)
+	val, err := requestGetAt(ctx, r.store, store.ListMetaKey(key), readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return store.ListMeta{}, false, nil
@@ -566,9 +566,9 @@ func (r *RedisServer) buildListPopElems(ctx context.Context, key []byte, meta st
 	var kvps []*store.KVPair
 	var scanErr error
 	if left {
-		kvps, scanErr = r.store.ScanAt(ctx, startKey, endKey, int(n), readTS)
+		kvps, scanErr = requestScanAt(ctx, r.store, startKey, endKey, int(n), readTS)
 	} else {
-		kvps, scanErr = r.store.ReverseScanAt(ctx, startKey, endKey, int(n), readTS)
+		kvps, scanErr = requestReverseScanAt(ctx, r.store, startKey, endKey, int(n), readTS)
 	}
 	if scanErr != nil {
 		return nil, nil, errors.WithStack(scanErr)
@@ -737,7 +737,7 @@ func (r *RedisServer) fetchListRange(ctx context.Context, key []byte, meta store
 	startKey := listItemKey(key, startSeq)
 	endKey := listItemKey(key, endSeq+1) // exclusive
 
-	kvs, err := r.store.ScanAt(ctx, startKey, endKey, int(endIdx-startIdx+1), readTS)
+	kvs, err := requestScanAt(ctx, r.store, startKey, endKey, int(endIdx-startIdx+1), readTS)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}

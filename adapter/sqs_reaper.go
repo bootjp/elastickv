@@ -136,7 +136,7 @@ func (s *SQSServer) reapTombstonedQueues(ctx context.Context) error {
 		}
 		pageCtx := readTimestamp.WithDispatchVoucher(ctx)
 		readTS := readTimestamp.Timestamp()
-		page, err := s.store.ScanAt(pageCtx, start, upper, sqsReaperPageLimit, readTS)
+		page, err := requestScanAt(pageCtx, s.store, start, upper, sqsReaperPageLimit, readTS)
 		if err != nil {
 			return errors.WithStack(err)
 		}
@@ -265,7 +265,7 @@ func (s *SQSServer) reapDeadByAge(ctx context.Context, queueName string, gen uin
 	start := bytes.Clone(prefix)
 	processed := 0
 	for processed < sqsReaperPerQueueBudget {
-		page, err := s.store.ScanAt(ctx, start, upper, sqsReaperPageLimit, readTS)
+		page, err := requestScanAt(ctx, s.store, start, upper, sqsReaperPageLimit, readTS)
 		if err != nil {
 			return false, errors.WithStack(err)
 		}
@@ -329,7 +329,7 @@ func (s *SQSServer) reapDeadByAgePartition(ctx context.Context, queueName string
 	start := bytes.Clone(prefix)
 	processed := 0
 	for processed < sqsReaperPerQueueBudget {
-		page, err := s.store.ScanAt(ctx, start, upper, sqsReaperPageLimit, readTS)
+		page, err := requestScanAt(ctx, s.store, start, upper, sqsReaperPageLimit, readTS)
 		if err != nil {
 			return false, errors.WithStack(err)
 		}
@@ -385,7 +385,7 @@ func (s *SQSServer) deleteAllPrefix(ctx context.Context, prefix []byte, readTS u
 	start := bytes.Clone(prefix)
 	processed := 0
 	for processed < sqsReaperPerQueueBudget {
-		page, err := s.store.ScanAt(ctx, start, upper, sqsReaperPageLimit, readTS)
+		page, err := requestScanAt(ctx, s.store, start, upper, sqsReaperPageLimit, readTS)
 		if err != nil {
 			return false, errors.WithStack(err)
 		}
@@ -491,7 +491,7 @@ func (s *SQSServer) reapQueueLegacy(ctx context.Context, queueName string, curre
 
 	processed := 0
 	for processed < sqsReaperPerQueueBudget {
-		page, err := s.store.ScanAt(ctx, start, upper, sqsReaperPageLimit, readTS)
+		page, err := requestScanAt(ctx, s.store, start, upper, sqsReaperPageLimit, readTS)
 		if err != nil {
 			return errors.WithStack(err)
 		}
@@ -542,7 +542,7 @@ func (s *SQSServer) reapQueuePartition(ctx context.Context, queueName string, pa
 
 	processed := 0
 	for processed < sqsReaperPerQueueBudget {
-		page, err := s.store.ScanAt(ctx, start, upper, sqsReaperPageLimit, readTS)
+		page, err := requestScanAt(ctx, s.store, start, upper, sqsReaperPageLimit, readTS)
 		if err != nil {
 			return errors.WithStack(err)
 		}
@@ -788,7 +788,7 @@ func (s *SQSServer) reapExpiredDedupLegacy(ctx context.Context, queueName string
 
 	processed := 0
 	for processed < sqsReaperPerQueueBudget {
-		page, err := s.store.ScanAt(ctx, start, upper, sqsReaperPageLimit, readTS)
+		page, err := requestScanAt(ctx, s.store, start, upper, sqsReaperPageLimit, readTS)
 		if err != nil {
 			return errors.WithStack(err)
 		}
@@ -837,7 +837,7 @@ func (s *SQSServer) reapExpiredDedupPartitioned(ctx context.Context, queueName s
 
 		processed := 0
 		for processed < sqsReaperPerQueueBudget {
-			page, err := s.store.ScanAt(ctx, start, upper, sqsReaperPageLimit, readTS)
+			page, err := requestScanAt(ctx, s.store, start, upper, sqsReaperPageLimit, readTS)
 			if err != nil {
 				return errors.WithStack(err)
 			}

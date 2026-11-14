@@ -746,7 +746,7 @@ func (r *RedisServer) deleteLegacyKeys(ctx context.Context, readTS uint64) (int,
 	var totalDeleted int
 	cursor := make([]byte, 0, batchSize)
 	for {
-		kvs, err := r.store.ScanAt(ctx, cursor, nil, batchSize, readTS)
+		kvs, err := requestScanAt(ctx, r.store, cursor, nil, batchSize, readTS)
 		if err != nil {
 			return totalDeleted, fmt.Errorf("scan: %w", err)
 		}

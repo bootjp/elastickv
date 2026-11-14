@@ -31,6 +31,7 @@ func prepareSQSServer(
 	publicEndpoint string,
 	partitionResolver *adapter.SQSPartitionResolver,
 	partitionObserver adapter.SQSPartitionObserver,
+	readTrackers ...*kv.ActiveTimestampTracker,
 ) (*adapter.SQSServer, net.Listener, error) {
 	endpointOption, err := adapter.WithSQSPublicEndpoint(publicEndpoint)
 	if err != nil {
@@ -57,11 +58,16 @@ func prepareSQSServer(
 	if o, ok := partitionObserver.(adapter.SQSAdminObserver); ok {
 		adminObserver = o
 	}
+	var tracker *kv.ActiveTimestampTracker
+	if len(readTrackers) > 0 {
+		tracker = readTrackers[0]
+	}
 	sqsServer := adapter.NewSQSServer(
 		sqsL,
 		shardStore,
 		coordinate,
 		adapter.WithSQSLeaderMap(leaderSQS),
+		adapter.WithSQSActiveTimestampTracker(tracker),
 		adapter.WithSQSRequestAdmission(clusterbootstrap.BootstrapRequestAdmissionForCoordinator(coordinate)),
 		adapter.WithSQSRegion(region),
 		endpointOption,

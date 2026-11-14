@@ -166,6 +166,10 @@ var ErrAdminDynamoValidation = errors.New("dynamodb admin: invalid request")
 // refill the page; partial pages are documented behaviour and the
 // caller treats any non-nil LastEvaluatedKey as "more available".
 func (d *DynamoDBServer) AdminScanTable(ctx context.Context, principal AdminPrincipal, tableName string, opts AdminScanOptions) (AdminScanResult, error) {
+	readRequest := d.newReadRequest(ctx)
+	defer readRequest.Close()
+	ctx = readRequest.Context()
+
 	if !principal.Role.canRead() {
 		return AdminScanResult{}, ErrAdminForbidden
 	}
@@ -243,6 +247,10 @@ func (d *DynamoDBServer) adminScanTableAt(ctx context.Context, tableName string,
 //   - ErrAdminDynamoNotFound — table absent
 //   - ErrAdminDynamoValidation — empty / malformed input
 func (d *DynamoDBServer) AdminGetItem(ctx context.Context, principal AdminPrincipal, tableName string, key map[string]AdminAttributeValue) (*AdminItem, bool, error) {
+	readRequest := d.newReadRequest(ctx)
+	defer readRequest.Close()
+	ctx = readRequest.Context()
+
 	schema, readTS, readPin, err := d.adminLoadReadableSchema(ctx, principal, tableName, len(key))
 	if err != nil {
 		return nil, false, err
@@ -331,6 +339,10 @@ func (d *DynamoDBServer) AdminPutItem(
 	pathKey map[string]AdminAttributeValue,
 	item AdminItem,
 ) error {
+	readRequest := d.newReadRequest(ctx)
+	defer readRequest.Close()
+	ctx = readRequest.Context()
+
 	if !principal.Role.canWrite() {
 		return ErrAdminForbidden
 	}
@@ -408,6 +420,10 @@ func validateAdminPathKeyCoversPrimaryKey(
 //   - ErrAdminDynamoNotFound   — table absent
 //   - ErrAdminDynamoValidation — empty / malformed input
 func (d *DynamoDBServer) AdminDeleteItem(ctx context.Context, principal AdminPrincipal, tableName string, key map[string]AdminAttributeValue) error {
+	readRequest := d.newReadRequest(ctx)
+	defer readRequest.Close()
+	ctx = readRequest.Context()
+
 	if !principal.Role.canWrite() {
 		return ErrAdminForbidden
 	}

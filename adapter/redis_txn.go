@@ -921,7 +921,7 @@ func (t *txnContext) loadListState(key []byte) (*listTxnState, error) {
 	// and let the caller retry after the background compactor has caught up.
 	deltaPrefix := store.ListMetaDeltaScanPrefix(key)
 	deltaEnd := store.PrefixScanEnd(deltaPrefix)
-	deltaKVs, err := t.server.store.ScanAt(ctx, deltaPrefix, deltaEnd, store.MaxDeltaScanLimit+1, t.startTS)
+	deltaKVs, err := requestScanAt(ctx, t.server.store, deltaPrefix, deltaEnd, store.MaxDeltaScanLimit+1, t.startTS)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -1027,7 +1027,7 @@ func (t *txnContext) loadExistingHashState(key []byte, keyString string) (*hashT
 		fields[field] = raw
 		origFields[field] = bytes.Clone(raw)
 	}
-	legacy, err := t.server.store.ExistsAt(ctx, redisHashKey(key), t.startTS)
+	legacy, err := requestExistsAt(ctx, t.server.store, redisHashKey(key), t.startTS)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -1057,7 +1057,7 @@ func (t *txnContext) loadExistingHashFieldState(key []byte, keyString string, fi
 		return nil, err
 	}
 	if !wide {
-		legacy, err := t.server.store.ExistsAt(ctx, redisHashKey(key), t.startTS)
+		legacy, err := requestExistsAt(ctx, t.server.store, redisHashKey(key), t.startTS)
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}
@@ -1090,7 +1090,7 @@ func (t *txnContext) loadHashFieldsIntoState(key []byte, fields [][]byte, st *ha
 		if _, staged := st.fields[fieldName]; staged {
 			continue
 		}
-		raw, err := t.server.store.GetAt(ctx, store.HashFieldKey(key, field), t.startTS)
+		raw, err := requestGetAt(ctx, t.server.store, store.HashFieldKey(key, field), t.startTS)
 		if err != nil {
 			if errors.Is(err, store.ErrKeyNotFound) {
 				continue
@@ -1133,7 +1133,7 @@ func (t *txnContext) loadZSetState(key []byte) (*zsetTxnState, error) {
 	ctx := t.ctxOrBackground()
 	memberPrefix := store.ZSetMemberScanPrefix(key)
 	memberEnd := store.PrefixScanEnd(memberPrefix)
-	probeKVs, probeErr := t.server.store.ScanAt(ctx, memberPrefix, memberEnd, 1, t.startTS)
+	probeKVs, probeErr := requestScanAt(ctx, t.server.store, memberPrefix, memberEnd, 1, t.startTS)
 	if probeErr != nil {
 		return nil, errors.WithStack(probeErr)
 	}
@@ -3350,6 +3350,13 @@ func (r *RedisServer) snapshotReadTS(ctx context.Context) (uint64, error) {
 }
 
 func (r *RedisServer) beginTargetReadSnapshot(ctx context.Context, targets []kv.ReadFenceTarget, label string) (kv.ReadTimestamp, error) {
+	if request, ok := kv.ReadRequestFromContext(ctx); ok {
+		if !request.MatchesStore(r.store) {
+			return kv.ReadTimestamp{}, kv.ErrReadSnapshotScope
+		}
+		snapshot, err := request.LatestTargets(ctx, label, targets)
+		return snapshot.TransactionTimestamp(), err
+	}
 	// Physical read-fence targets (including legacy wide columns) cannot be
 	// replaced by their logical key's group. Fence exactly the carried groups.
 	if reader, ok := r.store.(rawGroupCommitFloorReader); ok && len(targets) > 0 {

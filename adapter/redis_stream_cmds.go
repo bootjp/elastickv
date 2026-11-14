@@ -717,7 +717,7 @@ func (r *RedisServer) streamWriteBase(ctx context.Context, key []byte, readTS ui
 // that touches a stream also evicts any stale legacy data.
 func (r *RedisServer) legacyStreamCleanupElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
 	legacyKey := redisStreamKey(key)
-	exists, err := r.store.ExistsAt(ctx, legacyKey, readTS)
+	exists, err := requestExistsAt(ctx, r.store, legacyKey, readTS)
 	if err != nil {
 		return nil, cockerrors.WithStack(err)
 	}
@@ -776,7 +776,7 @@ func (r *RedisServer) buildXTrimHeadElems(
 	}
 	prefix := store.StreamEntryScanPrefix(key)
 	end := store.PrefixScanEnd(prefix)
-	kvs, err := r.store.ScanAt(ctx, store.StreamEntryScanStart(key, meta), end, count, readTS)
+	kvs, err := requestScanAt(ctx, r.store, store.StreamEntryScanStart(key, meta), end, count, readTS)
 	if err != nil {
 		return nil, streamTrimCursor{}, cockerrors.WithStack(err)
 	}
@@ -1233,7 +1233,7 @@ func (r *RedisServer) scanStreamEntriesAfter(
 	if unbounded {
 		limit = maxWideScanLimit
 	}
-	kvs, err := r.store.ScanAt(ctx, start, end, limit, readTS)
+	kvs, err := requestScanAt(ctx, r.store, start, end, limit, readTS)
 	if err != nil {
 		return nil, cockerrors.WithStack(err)
 	}
@@ -1783,9 +1783,9 @@ func (r *RedisServer) scanStreamRangeKVs(
 	}
 	var kvs []*store.KVPair
 	if reverse {
-		kvs, err = r.store.ReverseScanAt(ctx, scanStart, scanEnd, limit, readTS)
+		kvs, err = requestReverseScanAt(ctx, r.store, scanStart, scanEnd, limit, readTS)
 	} else {
-		kvs, err = r.store.ScanAt(ctx, scanStart, scanEnd, limit, readTS)
+		kvs, err = requestScanAt(ctx, r.store, scanStart, scanEnd, limit, readTS)
 	}
 	if err != nil {
 		return nil, cockerrors.WithStack(err)

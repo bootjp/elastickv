@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bootjp/elastickv/kv"
 	"github.com/cockroachdb/errors"
 	"github.com/tidwall/redcon"
 )
@@ -23,25 +24,26 @@ var errRedisTxnQueueLimit = errors.New("ERR transaction queue limit exceeded")
 // Only the serving goroutine touches redcon's writer; idle cancellation closes
 // the raw socket instead, waking redcon's reader without racing its buffers.
 type redisWireTxn struct {
-	mu         sync.Mutex
-	server     *RedisServer
-	conn       redcon.Conn
-	state      *connState
-	owner      RequestOwnership
-	ctx        context.Context
-	cancel     context.CancelFunc
-	stopServer func() bool
-	stopWatch  func() bool
-	watchDone  chan struct{}
-	watchOnce  sync.Once
-	idle       *time.Timer
-	closed     bool
-	done       chan struct{}
-	queueBytes int
-	queueErr   error
-	reserved   int
-	poisoned   bool
-	reply      *redisReplyBuffer
+	readRequest *kv.ReadRequest
+	mu          sync.Mutex
+	server      *RedisServer
+	conn        redcon.Conn
+	state       *connState
+	owner       RequestOwnership
+	ctx         context.Context
+	cancel      context.CancelFunc
+	stopServer  func() bool
+	stopWatch   func() bool
+	watchDone   chan struct{}
+	watchOnce   sync.Once
+	idle        *time.Timer
+	closed      bool
+	done        chan struct{}
+	queueBytes  int
+	queueErr    error
+	reserved    int
+	poisoned    bool
+	reply       *redisReplyBuffer
 }
 
 func (r *RedisServer) dispatchProtectedTransaction(conn redcon.Conn, name string, cmd redcon.Command, start time.Time) bool {
@@ -117,7 +119,9 @@ func (r *RedisServer) newWireTransaction(conn redcon.Conn, state *connState) (*r
 		return nil, errRedisAdmission
 	}
 	ctx, cancel := context.WithCancel(context.WithValue(owner.Context(), redisOwnedRequestKey{}, true))
-	t := &redisWireTxn{server: r, conn: redisLifetimeConn(conn), state: state, owner: owner,
+	readRequest := kv.NewReadRequest(ctx, r.coordinator, r.store, r.readTracker)
+	ctx = readRequest.Context()
+	t := &redisWireTxn{readRequest: readRequest, server: r, conn: redisLifetimeConn(conn), state: state, owner: owner,
 		ctx: ctx, cancel: cancel, done: make(chan struct{}), watchDone: make(chan struct{}), reserved: redisWireTxnBaseBytes, reply: r.newReplyBuffer()}
 	t.mu.Lock()
 	t.stopServer = context.AfterFunc(r.baseRequestContext(), cancel)
@@ -126,6 +130,7 @@ func (r *RedisServer) newWireTransaction(conn redcon.Conn, state *connState) (*r
 		r.wireTxnMu.Unlock()
 		t.stopServer()
 		cancel()
+		readRequest.Close()
 		owner.CancelAndJoin()
 		_ = owner.Finish(errRedisAdmission)
 		t.mu.Unlock()
@@ -309,6 +314,9 @@ func (t *redisWireTxn) cleanupLocked(finished bool, err error) {
 	t.stopServer()
 	t.cancel()
 	t.owner.CancelAndJoin()
+	if t.readRequest != nil {
+		t.readRequest.Close()
+	}
 	if !finished {
 		_ = t.owner.Finish(err)
 	}

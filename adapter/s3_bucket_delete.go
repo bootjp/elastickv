@@ -25,7 +25,7 @@ func (s *S3Server) dispatchBucketDeleteTxn(ctx context.Context, snapshot kv.Read
 // unrelated object writes abort them; preserving its maximum prevents reuse.
 func (s *S3Server) bucketDeleteTxnElems(ctx context.Context, bucket string, generation, readTS uint64) ([]*kv.Elem[kv.OP], error) {
 	key := s3keys.BucketGenerationKey(bucket)
-	raw, err := s.store.GetAt(ctx, key, readTS)
+	raw, err := requestGetAt(ctx, s.store, key, readTS)
 	switch {
 	case errors.Is(err, store.ErrKeyNotFound):
 	case err != nil:

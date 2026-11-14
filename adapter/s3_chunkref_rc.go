@@ -105,7 +105,7 @@ func collectS3ChunkRefChanges(elems []*kv.Elem[kv.OP]) ([]*s3ChunkRefChange, err
 }
 
 func (s *S3Server) readS3ChunkRefAt(ctx context.Context, key []byte, readTS uint64) (*s3keys.ChunkRefValue, error) {
-	raw, err := s.store.GetAt(ctx, key, readTS)
+	raw, err := requestGetAt(ctx, s.store, key, readTS)
 	if errors.Is(err, store.ErrKeyNotFound) {
 		return nil, nil
 	}
@@ -149,7 +149,7 @@ func s3ChunkRefDeltas(changes []*s3ChunkRefChange) ([]s3keys.ChunkRefDelta, map[
 }
 
 func (s *S3Server) readS3ChunkRefRCAt(ctx context.Context, key []byte, readTS uint64) (s3keys.ChunkRefRC, error) {
-	raw, err := s.store.GetAt(ctx, key, readTS)
+	raw, err := requestGetAt(ctx, s.store, key, readTS)
 	if errors.Is(err, store.ErrKeyNotFound) {
 		return s3keys.ChunkRefRC{}, nil
 	}

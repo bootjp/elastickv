@@ -161,7 +161,7 @@ func (r *RedisServer) localKeysPattern(pattern []byte, requestContexts ...contex
 	}
 
 	mergeScannedKeys := func(scanStart, scanEnd []byte) error {
-		keys, err := r.store.ScanAt(r.redisContext(requestContexts...),
+		keys, err := requestScanAt(r.redisContext(requestContexts...), r.store,
 			scanStart, scanEnd, math.MaxInt, readTS)
 		if err != nil {
 			return errors.WithStack(err)

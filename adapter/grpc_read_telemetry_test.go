@@ -168,7 +168,7 @@ func TestGRPCReadTelemetryEmptyCrossGroupScanMarksLocalLeader(t *testing.T) {
 		groupLeaders: map[uint64]bool{1: false, 2: true},
 		notLeader:    map[string]bool{"a": true},
 	}
-	srv := NewGRPCServer(grpcReadRangeStore{MVCCStore: st, targets: []kv.ReadFenceTarget{
+	srv := NewGRPCServer(&grpcReadRangeStore{MVCCStore: st, targets: []kv.ReadFenceTarget{
 		{GroupID: 1, Key: []byte("a")},
 		{GroupID: 2, Key: []byte("m")},
 	}}, coord)

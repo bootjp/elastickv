@@ -146,3 +146,6 @@ func redisFencedSelectTS(selectTS func() uint64) uint64 {
 	}
 	return ts
 }
+
+// Existing version-inspection fixtures use an explicit historical horizon.
+const consistentReadLatestTS = ^uint64(0) - 1

@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bootjp/elastickv/internal/s3keys"
@@ -79,6 +80,10 @@ var ErrAdminInvalidContinuationToken = errors.New("s3 admin: invalid continuatio
 //   - ErrAdminInvalidObjectKey   — empty key
 //   - ErrAdminS3Stopping         — Stop has begun
 func (s *S3Server) AdminDeleteObject(ctx context.Context, principal AdminPrincipal, bucket, key string) error {
+	readRequest := s.newReadRequest(ctx)
+	defer readRequest.Close()
+	ctx = readRequest.Context()
+
 	if !principal.Role.canWrite() {
 		return ErrAdminForbidden
 	}
@@ -193,6 +198,10 @@ func (s *S3Server) adminDeleteObjectTxn(ctx context.Context, bucket, key string)
 //   - ErrAdminUploadTooLarge     — body exceeds adminS3UploadMaxBytes
 //   - ErrAdminUploadThrottled    — PUT admission budget exhausted
 func (s *S3Server) AdminPutObject(ctx context.Context, principal AdminPrincipal, bucket, key string, body io.Reader, contentType string) error {
+	readRequest := s.newReadRequest(ctx)
+	defer readRequest.Close()
+	ctx = readRequest.Context()
+
 	if !principal.Role.canWrite() {
 		return ErrAdminForbidden
 	}
@@ -305,6 +314,14 @@ type AdminObject struct {
 //   - ErrAdminInvalidObjectKey   — empty key
 //   - ErrAdminInvalidBucketName  — malformed bucket name
 func (s *S3Server) AdminGetObject(ctx context.Context, principal AdminPrincipal, bucket, key string) (io.ReadCloser, AdminObject, error) {
+	readRequest := s.newReadRequest(ctx)
+	keepOpen := false
+	defer func() {
+		if !keepOpen {
+			readRequest.Close()
+		}
+	}()
+	ctx = readRequest.Context()
 	if !principal.Role.canRead() {
 		return nil, AdminObject{}, ErrAdminForbidden
 	}
@@ -332,6 +349,7 @@ func (s *S3Server) AdminGetObject(ctx context.Context, principal AdminPrincipal,
 
 	body := newS3AdminObjectReader(ctx, s, bucket, generation, key, manifest, readTS, readPin)
 	body.release = s.exitAdminBlobUse
+	body.readRequest = readRequest
 
 	adminMeta := AdminObject{
 		Key:          key,
@@ -344,6 +362,7 @@ func (s *S3Server) AdminGetObject(ctx context.Context, principal AdminPrincipal,
 	if adminMeta.ContentType == "" {
 		adminMeta.ContentType = defaultS3ContentType
 	}
+	keepOpen = true
 	return body, adminMeta, nil
 }
 
@@ -399,14 +418,16 @@ func (s *S3Server) adminLoadObjectForRead(ctx context.Context, bucket, key strin
 // by Close. Calling Close more than once is safe (both are cleared on
 // the first call).
 type s3AdminObjectReader struct {
-	ctx        context.Context
-	server     *S3Server
-	bucket     string
-	generation uint64
-	key        string
-	manifest   *s3ObjectManifest
-	readTS     uint64
-	pin        *kv.ActiveTimestampToken
+	mu          sync.Mutex
+	readRequest *kv.ReadRequest
+	ctx         context.Context
+	server      *S3Server
+	bucket      string
+	generation  uint64
+	key         string
+	manifest    *s3ObjectManifest
+	readTS      uint64
+	pin         *kv.ActiveTimestampToken
 	// release ends the server's admin blob-use registration (see
 	// S3Server.enterAdminBlobUse); called once, by Close.
 	release func()
@@ -442,8 +463,13 @@ func newS3AdminObjectReader(
 }
 
 func (r *s3AdminObjectReader) Read(p []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.closed {
 		return 0, io.ErrClosedPipe
+	}
+	if r.readRequest != nil && r.readRequest.Context().Err() != nil {
+		return 0, errors.WithStack(r.readRequest.Context().Err())
 	}
 	if r.err != nil {
 		return 0, r.err
@@ -503,6 +529,11 @@ func (r *s3AdminObjectReader) ensureBuffered() error {
 }
 
 func (r *s3AdminObjectReader) Close() error {
+	if r.readRequest != nil {
+		r.readRequest.Close()
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.closed {
 		return nil
 	}
@@ -571,6 +602,10 @@ func clampAdminListMaxKeys(n int) int {
 //     than the current request, or its readTS has been MVCC-GC'd past
 //     (store.ErrReadTSCompacted on the metadata load or the scan)
 func (s *S3Server) AdminListObjects(ctx context.Context, principal AdminPrincipal, bucket string, opts AdminListObjectsOptions) (AdminObjectListing, error) {
+	readRequest := s.newReadRequest(ctx)
+	defer readRequest.Close()
+	ctx = readRequest.Context()
+
 	if !principal.Role.canRead() {
 		return AdminObjectListing{}, ErrAdminForbidden
 	}

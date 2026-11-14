@@ -117,8 +117,7 @@ func (d *DynamoDBServer) multiShardReadLeasePlan(
 	names map[string]string,
 	consistentRead *bool,
 ) (*dynamoTableSchema, queryLeasePlan, error) {
-	tentativeTS := eventualSnapshotTS(d.coordinator.Clock(), d.store)
-	schema, exists, err := d.loadTableSchemaAt(ctx, tableName, tentativeTS)
+	schema, exists, err := d.loadSpeculativeSchema(ctx, tableName)
 	if err != nil {
 		// loadTableSchemaAt maps ErrKeyNotFound to (_, false, nil); any error
 		// reaching here is a transient store/context/decode failure, so fail
@@ -270,8 +269,7 @@ func (d *DynamoDBServer) queryLeaseKey(ctx context.Context, in queryInput) ([]by
 		// deterministic validation the read path runs before touching data.
 		return nil, gsiQueryLeasePlan(in, schema), nil
 	}
-	tentativeTS := eventualSnapshotTS(d.coordinator.Clock(), d.store)
-	schema, exists, err := d.loadTableSchemaAt(ctx, in.TableName, tentativeTS)
+	schema, exists, err := d.loadSpeculativeSchema(ctx, in.TableName)
 	if err != nil {
 		// loadTableSchemaAt maps ErrKeyNotFound to (_, false, nil); any
 		// error reaching here is a transient store/context/decode failure,
@@ -403,6 +401,9 @@ func (d *DynamoDBServer) leaseCheckTransactGetItemsWithKeys(w http.ResponseWrite
 // silently-dropped item would let a stale snapshot through).
 func (d *DynamoDBServer) resolveTransactGetItemKeys(ctx context.Context, in transactGetItemsInput) ([][]byte, bool, error) {
 	tentativeTS := eventualSnapshotTS(d.coordinator.Clock(), d.store)
+	if err := authorizeHistoricalRead(ctx, d.store, tentativeTS); err != nil {
+		return nil, false, err
+	}
 	schemaCache := make(map[string]*dynamoTableSchema)
 	seenKeys := make(map[string]struct{}, len(in.TransactItems))
 	uniqueKeys := make([][]byte, 0, len(in.TransactItems))
@@ -519,4 +520,12 @@ func transactGetItemKeyFromSchema(schema *dynamoTableSchema, key map[string]attr
 		return nil, false
 	}
 	return itemKey, true
+}
+
+func (d *DynamoDBServer) loadSpeculativeSchema(ctx context.Context, tableName string) (*dynamoTableSchema, bool, error) {
+	ts := eventualSnapshotTS(d.coordinator.Clock(), d.store)
+	if err := authorizeHistoricalRead(ctx, d.store, ts); err != nil {
+		return nil, false, err
+	}
+	return d.loadTableSchemaAt(ctx, tableName, ts)
 }
