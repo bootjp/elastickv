@@ -56,7 +56,11 @@ func TestS3GetObjectFencesBeforeChoosingItsSnapshot(t *testing.T) {
 			}
 			require.NotEmpty(t, lagging.fencedKeys)
 			require.Contains(t, lagging.fencedKeys[0], s3keys.BucketMetaKey("bucket"))
-			require.Equal(t, [][]byte{s3keys.BucketMetaKey("bucket"), s3keys.ObjectManifestKey("bucket", 1, "key")}, lagging.fencedKeys[1])
+			require.Equal(t, [][][]byte{
+				{s3keys.BucketMetaKey("bucket")}, // Routing.
+				{s3keys.BucketMetaKey("bucket")}, // Resolve the bucket generation.
+				{s3keys.BucketMetaKey("bucket"), s3keys.ObjectManifestKey("bucket", 1, "key")},
+			}, lagging.fencedKeys)
 			lagging.floorError = errors.New("read fence unavailable")
 			rec = httptest.NewRecorder()
 			srv.handle(rec, newS3TestRequest(method, "/bucket/key", nil))

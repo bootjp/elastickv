@@ -510,15 +510,16 @@ func (s *S3Server) handle(w http.ResponseWriter, r *http.Request) {
 	if rejectOversizedS3ObjectKey(w, objectKey, hasObject) {
 		return
 	}
-	if s.maybeProxyToLeader(w, r) {
-		return
-	}
 	if r.Method == http.MethodGet || r.Method == http.MethodHead {
 		kv.MarkUnattributableClientReadThrough(s.coordinator, 0)
 	}
-
+	// Reject invalid signatures before routing can perform distributed reads.
+	// Anonymous reads only probe the bucket's metadata shard for public ACLs.
 	if authErr := s.resolveAuth(r, bucket); authErr != nil {
 		writeS3Error(w, authErr.Status, authErr.Code, authErr.Message, bucket, objectKey)
+		return
+	}
+	if s.maybeProxyToLeader(w, r) {
 		return
 	}
 	s.handleAuthorizedRequest(w, r, bucket, objectKey, hasObject)
@@ -558,15 +559,15 @@ func (s *S3Server) isAnonymousReadAllowed(r *http.Request, bucket string) bool {
 	if bucket == "" || r.URL.Query().Has("acl") {
 		return false
 	}
-	// Signed requests (Authorization header or X-Amz-Algorithm presign param) are
-	// already authenticated; skip the public-bucket metadata read on the hot path.
+	// Signed requests (Authorization header or X-Amz-Algorithm presign param) must be
+	// authenticated; skip the public-bucket metadata read on the hot path.
 	if r.Header.Get("Authorization") != "" || r.URL.Query().Get("X-Amz-Algorithm") != "" {
 		return false
 	}
 	if !isReadOnlyS3Request(r) {
 		return false
 	}
-	readTS, err := s.snapshotReadTS(r.Context())
+	readTS, err := s.fencedObjectReadTS(r.Context(), s3keys.BucketMetaKey(bucket))
 	if err != nil {
 		return false
 	}
@@ -2028,7 +2029,7 @@ func (s *S3Server) proxyRouteKey(r *http.Request) ([]byte, error) {
 	}
 
 	kv.ObserveReadForKeyThrough(s.coordinator, r.Context(), s3keys.BucketMetaKey(bucket))
-	readTS, err := s.snapshotReadTS(r.Context())
+	readTS, err := s.fencedObjectReadTS(r.Context(), s3keys.BucketMetaKey(bucket))
 	if err != nil {
 		return nil, err
 	}
