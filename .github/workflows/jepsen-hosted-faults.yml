@@ -1,0 +1,56 @@
+name: Jepsen Hosted Faults
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+  schedule:
+    - cron: '23 18 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jepsen-hosted-faults-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  faults:
+    name: Jepsen (${{ matrix.fault }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        fault: [partition, kill, pause]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: actions/cache@v6
+        with:
+          path: ~/.m2/repository
+          key: hosted-jepsen-maven-${{ runner.os }}-${{ hashFiles('jepsen/project.clj') }}
+          restore-keys: hosted-jepsen-maven-${{ runner.os }}-
+      - name: Run three-node fault and recovery test
+        timeout-minutes: 25
+        env:
+          FAULT: ${{ matrix.fault }}
+        run: bash jepsen/docker/hosted/run.sh "$FAULT"
+      - name: Make container-written artifacts and cache readable
+        if: always()
+        run: |
+          for path in artifacts "$HOME/.m2"; do
+            if [ -d "$path" ]; then
+              sudo chown -R "$(id -u):$(id -g)" "$path"
+            fi
+          done
+      - name: Upload fault history, checker results, and node logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: jepsen-hosted-${{ matrix.fault }}-${{ github.run_attempt }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14

@@ -29,6 +29,7 @@ jepsen/.lein-*
 jepsen/.nrepl-port
 .m2/
 jepsen/store/
+/artifacts/jepsen-*/
 
 # Jepsen local SSH keys (generated locally; never commit)
 jepsen/docker/id_rsa

@@ -1,0 +1,36 @@
+x-node: &node
+  image: ${JEPSEN_IMAGE:?set JEPSEN_IMAGE}
+  init: true
+  cap_add: [NET_ADMIN]
+  volumes:
+    - ${JEPSEN_SSH_DIR:?set JEPSEN_SSH_DIR}/id_ed25519.pub:/run/jepsen-ssh/id_ed25519.pub:ro
+  networks: [jepsen]
+  healthcheck:
+    test: [CMD-SHELL, "nc -z 127.0.0.1 22 && iptables -L INPUT -n >/dev/null"]
+    interval: 2s
+    timeout: 3s
+    retries: 30
+
+services:
+  n1:
+    <<: *node
+    hostname: n1
+  n2:
+    <<: *node
+    hostname: n2
+  n3:
+    <<: *node
+    hostname: n3
+  control:
+    image: ${JEPSEN_IMAGE:?set JEPSEN_IMAGE}
+    init: true
+    profiles: [control]
+    volumes:
+      - ${JEPSEN_SSH_DIR:?set JEPSEN_SSH_DIR}:/run/jepsen-ssh:ro
+      - ${JEPSEN_REPO:?set JEPSEN_REPO}:/workspace
+      - ${JEPSEN_M2_DIR:?set JEPSEN_M2_DIR}:/root/.m2
+    networks: [jepsen]
+
+networks:
+  jepsen:
+    driver: bridge
