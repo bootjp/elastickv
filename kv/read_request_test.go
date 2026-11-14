@@ -273,3 +273,67 @@ func TestReadRequestLeaderRoutedStoreRangeUsesAuthoritativeGroup(t *testing.T) {
 	require.Empty(t, absent.ReadFenceTargetsForRange(nil, nil))
 	require.Empty(t, (&LeaderRoutedStore{}).ReadFenceTargetsForRange(nil, nil))
 }
+
+type requestProofStore struct {
+	*requestReadTestStore
+	targets    []ReadFenceTarget
+	groupCalls []uint64
+}
+
+func (s *requestProofStore) CommittedTimestampFloorForKeysWithTargets(_ context.Context, _ [][]byte) (uint64, []ReadFenceTarget, error) {
+	s.keyedFences.Add(1)
+	return s.floor, s.targets, nil
+}
+func (s *requestProofStore) GlobalCommittedTimestampFloor(context.Context) (uint64, error) {
+	s.globalFences.Add(1)
+	return 0, errors.New("unrelated group unavailable")
+}
+func (s *requestProofStore) GroupCommittedTimestampFloor(_ context.Context, group uint64) (uint64, error) {
+	s.groupCalls = append(s.groupCalls, group)
+	return s.floor, nil
+}
+
+type requestMovedGroupCoordinator struct{ *stubLeaderCoordinator }
+
+func (*requestMovedGroupCoordinator) EngineGroupIDForKey([]byte) uint64 { return 2 }
+
+func TestReadRequestUsesFencedGroupProofRatherThanLaterRoute(t *testing.T) {
+	base, _ := requestReadFixture(t)
+	st := &requestProofStore{requestReadTestStore: base, targets: []ReadFenceTarget{{GroupID: 1}}}
+	coord := &requestMovedGroupCoordinator{&stubLeaderCoordinator{isLeader: true}}
+	request := NewReadRequest(t.Context(), coord, st, nil)
+	defer request.Close()
+	snapshot, err := request.Latest(request.Context(), "routed", []byte("key"))
+	require.NoError(t, err)
+	require.ErrorIs(t, request.CheckGet(request.Context(), snapshot, []byte("unfenced")), ErrReadSnapshotKeyScope)
+	require.NoError(t, request.CheckGet(request.Context(), snapshot, []byte("key")))
+}
+
+func TestReadRequestMixedTargetsPreserveKeyedAndPhysicalFences(t *testing.T) {
+	base, _ := requestReadFixture(t)
+	st := &requestProofStore{requestReadTestStore: base, targets: []ReadFenceTarget{{GroupID: 1}}}
+	coord := &requestReadGroupCoordinator{&stubLeaderCoordinator{isLeader: true}}
+	request := NewReadRequest(t.Context(), coord, st, nil)
+	defer request.Close()
+	snapshot, err := request.LatestTargets(request.Context(), "mixed", []ReadFenceTarget{{Key: []byte("key")}, {GroupID: 2, Key: []byte("other")}})
+	require.NoError(t, err)
+	require.Equal(t, []uint64{2}, st.groupCalls)
+	require.Equal(t, int64(1), st.keyedFences.Load())
+	require.Zero(t, st.globalFences.Load())
+	require.NoError(t, request.CheckGet(request.Context(), snapshot, []byte("key")))
+	require.NoError(t, request.CheckGet(request.Context(), snapshot, []byte("other")))
+}
+
+func TestReadRequestHistoricalKeysRemainExact(t *testing.T) {
+	st, request := requestReadFixture(t)
+	snapshot, err := request.Historical(request.Context(), 2, []byte("key"))
+	require.NoError(t, err)
+	value, err := request.Get(request.Context(), snapshot, []byte("key"))
+	require.NoError(t, err)
+	require.Equal(t, "0", string(value))
+	_, err = request.Get(request.Context(), snapshot, []byte("other"))
+	require.ErrorIs(t, err, ErrReadSnapshotKeyScope)
+	_, err = request.Scan(request.Context(), snapshot, nil, nil, 10)
+	require.ErrorIs(t, err, ErrReadSnapshotKeyScope)
+	require.Equal(t, int64(1), st.reads.Load())
+}

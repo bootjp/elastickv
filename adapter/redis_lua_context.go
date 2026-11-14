@@ -2723,7 +2723,7 @@ func luaListBoundaryItemFromKVs(key []byte, meta store.ListMeta, kvs []*store.KV
 
 func (c *luaScriptContext) scanAtPhysicalLimit(startKey, endKey []byte, scanLimit int) ([]*store.KVPair, bool, error) {
 	if scanner, ok := c.server.store.(luaPhysicalLimitedScanStore); ok {
-		kvs, limitReached, err := scanner.ScanAtPhysicalLimit(c.ctx, startKey, endKey, scanLimit, scanLimit, c.startTS)
+		kvs, limitReached, err := requestScanPhysicalAt(c.ctx, scanner, startKey, endKey, scanLimit, scanLimit, c.startTS, false)
 		return kvs, limitReached, errors.WithStack(err)
 	}
 	kvs, err := requestScanAt(c.ctx, c.server.store, startKey, endKey, scanLimit, c.startTS)
@@ -2732,7 +2732,7 @@ func (c *luaScriptContext) scanAtPhysicalLimit(startKey, endKey []byte, scanLimi
 
 func (c *luaScriptContext) reverseScanAtPhysicalLimit(startKey, endKey []byte, scanLimit int) ([]*store.KVPair, bool, error) {
 	if scanner, ok := c.server.store.(luaPhysicalLimitedScanStore); ok {
-		kvs, limitReached, err := scanner.ReverseScanAtPhysicalLimit(c.ctx, startKey, endKey, scanLimit, scanLimit, c.startTS)
+		kvs, limitReached, err := requestScanPhysicalAt(c.ctx, scanner, startKey, endKey, scanLimit, scanLimit, c.startTS, true)
 		return kvs, limitReached, errors.WithStack(err)
 	}
 	kvs, err := requestReverseScanAt(c.ctx, c.server.store, startKey, endKey, scanLimit, c.startTS)

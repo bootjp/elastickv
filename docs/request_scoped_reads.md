@@ -22,7 +22,11 @@ value, err := request.Get(ctx, snapshot, objectKey)
 `Latest` fences the relevant committed log before choosing the applied timestamp
 and obtaining the existing timestamp-authority stamp. A failed fence does not
 fall back to a follower-local watermark. `LatestTargets` retains explicit
-physical group identity for grouped reads. A keyed capability only permits its
+physical group identity for grouped reads and combines keyed targets with
+explicit physical targets without replacing a key fence with a global one.
+Stores that can prove group coverage return the committed floor and the actual
+fenced group identities together. The issuer never reconstructs group authority
+from a second, potentially changed route lookup. A keyed capability only permits its
 fenced keys or groups; a range needs proof that all its groups are covered.
 
 Snapshots are bound to one request and backend. Zero, foreign-context,
@@ -33,7 +37,8 @@ snapshot; it is not a single-use token. Cancellation suppresses late results.
 `Close` cancels and joins in-flight reads and child scopes before releasing the
 shared MVCC retention pins. S3 admin streaming transfers ownership to the reader,
 which must be closed by its caller. Blocking Redis XREAD uses a child scope for
-initial dollar-ID resolution and each polling read. BZPOPMIN likewise owns a child
+initial dollar-ID resolution and each polling read. SQS receive preflight and
+each scan/delivery attempt also use bounded child scopes. BZPOPMIN likewise owns a child
 scope through each pop attempt, including its transaction commit. Those children close before
 waiting for updates, so an idle command retains cancellation ownership without
 retaining completed polling snapshots or their GC pins.
@@ -54,6 +59,10 @@ removal of the historical storage engine API. Explicit historical issuance is
 limited in adapters to audited protocol choices: DynamoDB eventual reads,
 committed snapshot seals and idempotency versions, S3 continuation snapshots,
 and immutable blob versions. Cross-store blob reads create their own child scope.
+Manifest-selected S3 part/ref versions use exact-key historical child scopes
+after validating the parent metadata timestamp was issued. This does not expand
+the metadata token to other keys. Lua physical-limit scans use the same typed
+read ports, including their cancellation and lifetime checks.
 Internal raw RPCs accept explicit historical versions and issue a local capability;
 capabilities are process-local and are not network authentication credentials.
 

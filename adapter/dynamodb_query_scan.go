@@ -349,7 +349,7 @@ func (d *DynamoDBServer) prepareReadSchema(
 	if err := d.ensureLegacyTableMigration(ctx, tableName); err != nil {
 		return nil, 0, err
 	}
-	readTS, err := d.resolveDynamoReadSnapshot(ctx, consistentRead)
+	readTS, err := d.resolveDynamoReadSnapshot(ctx, consistentRead, dynamoTableMetaKey(tableName))
 	if err != nil {
 		return nil, 0, err
 	}

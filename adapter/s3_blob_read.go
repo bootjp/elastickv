@@ -99,7 +99,7 @@ func (s *S3Server) readLegacyS3ObjectChunk(
 	readTS uint64,
 ) ([]byte, error) {
 	key := s3keys.VersionedBlobKey(bucket, generation, objectKey, uploadID, part.PartNo, chunkIndex, part.PartVersion)
-	payload, err := requestGetAt(ctx, s.store, key, readTS)
+	payload, err := manifestVersionGetAt(ctx, s.store, key, readTS)
 	return payload, errors.WithStack(err)
 }
 
@@ -116,7 +116,7 @@ func (s *S3Server) loadS3ChunkRef(
 	readTS uint64,
 ) (s3keys.ChunkRefValue, uint64, error) {
 	refKey := s3keys.VersionedChunkRefKey(bucket, generation, objectKey, uploadID, partNo, chunkIndex, chunkRefVersion)
-	rawRef, err := requestGetAt(ctx, s.store, refKey, readTS)
+	rawRef, err := manifestVersionGetAt(ctx, s.store, refKey, readTS)
 	if err != nil {
 		return s3keys.ChunkRefValue{}, 0, errors.Wrap(err, "read s3 chunkref")
 	}

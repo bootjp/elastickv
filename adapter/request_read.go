@@ -63,7 +63,7 @@ func requestReadContext(ctx context.Context, request *kv.ReadRequest) context.Co
 func historicalGetAt(ctx context.Context, st store.MVCCStore, key []byte, ts uint64) ([]byte, error) {
 	request := kv.NewReadRequest(ctx, nil, st, nil)
 	defer request.Close()
-	snapshot, err := request.Historical(request.Context(), ts)
+	snapshot, err := request.Historical(request.Context(), ts, key)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -128,4 +128,16 @@ func (d *DynamoDBServer) newReadRequest(ctx context.Context) *kv.ReadRequest {
 		return kv.NewReadRequest(ctx, nil, nil, nil)
 	}
 	return kv.NewReadRequest(ctx, d.coordinator, d.store, d.readTracker)
+}
+
+// A committed manifest chooses immutable part/ref versions. Verify its numeric
+// snapshot belongs to the current metadata request, then grant only that exact
+// version key in a short-lived child; metadata authority is never widened.
+func manifestVersionGetAt(ctx context.Context, st store.MVCCStore, key []byte, ts uint64) ([]byte, error) {
+	_, _, closeRead, err := requestReadSnapshot(ctx, st, ts)
+	if err != nil {
+		return nil, err
+	}
+	defer closeRead()
+	return historicalGetAt(ctx, st, key, ts)
 }

@@ -125,7 +125,7 @@ func snapshotSourceName(node ast.Node) string {
 }
 
 func isReadHelperReference(name string) bool {
-	return name == "eventualSnapshotTS" || strings.HasPrefix(name, "request") || strings.HasPrefix(name, "historical") || name == "authorizeHistoricalRead"
+	return name == "eventualSnapshotTS" || strings.HasPrefix(name, "request") || strings.HasPrefix(name, "historical") || name == "authorizeHistoricalRead" || name == "manifestVersionGetAt"
 }
 
 func TestSnapshotGuardDistinguishesFunctionAliasesFromTimestampData(t *testing.T) {

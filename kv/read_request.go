@@ -147,7 +147,7 @@ func (r *ReadRequest) Latest(ctx context.Context, label string, keys ...[]byte) 
 		return ReadSnapshot{}, err
 	}
 	keys = requestFenceKeys(r.st, keys)
-	ts, err := requestCommittedFloor(ctx, r.coord, r.st, keys)
+	ts, groups, err := requestCommittedFloorProof(ctx, r.coord, r.st, keys)
 	if err != nil {
 		return ReadSnapshot{}, errors.Wrap(err, label+": read fence")
 	}
@@ -156,8 +156,33 @@ func (r *ReadRequest) Latest(ctx context.Context, label string, keys ...[]byte) 
 		return ReadSnapshot{}, err
 	}
 	snapshot := r.scopedSnapshot(stamp, keys)
+	snapshot.groups = groups
 	r.remember(snapshot)
 	return snapshot, nil
+}
+
+func requestCommittedFloorProof(ctx context.Context, coord Coordinator, st store.MVCCStore, keys [][]byte) (uint64, map[uint64]struct{}, error) {
+	if proof, ok := st.(interface {
+		CommittedTimestampFloorForKeysWithTargets(context.Context, [][]byte) (uint64, []ReadFenceTarget, error)
+	}); ok && len(keys) > 0 {
+		ts, targets, err := proof.CommittedTimestampFloorForKeysWithTargets(ctx, keys)
+		if err != nil {
+			return 0, nil, errors.WithStack(err)
+		}
+		groups := make(map[uint64]struct{}, len(targets))
+		for _, target := range targets {
+			if target.GroupID == 0 {
+				return 0, nil, errors.WithStack(ErrReadSnapshotUnissued)
+			}
+			groups[target.GroupID] = struct{}{}
+		}
+		if len(groups) == 0 {
+			return 0, nil, errors.WithStack(ErrReadSnapshotUnissued)
+		}
+		return max(ts, 1), groups, nil
+	}
+	ts, err := requestCommittedFloor(ctx, coord, st, keys)
+	return ts, nil, err
 }
 
 func requestCommittedFloor(ctx context.Context, coord Coordinator, st store.MVCCStore, keys [][]byte) (uint64, error) {
@@ -237,13 +262,13 @@ func (r *ReadRequest) remember(snapshot ReadSnapshot) {
 
 // Historical is explicitly separate from Latest. It is for an existing MVCC
 // version supplied by a historical RPC or transaction protocol, not freshness.
-func (r *ReadRequest) Historical(ctx context.Context, ts uint64) (ReadSnapshot, error) {
+func (r *ReadRequest) Historical(ctx context.Context, ts uint64, keys ...[]byte) (ReadSnapshot, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if err := r.validate(ctx); err != nil {
 		return ReadSnapshot{}, err
 	}
-	snapshot := r.register(ReadTimestamp{timestamp: ts})
+	snapshot := r.scopedSnapshot(ReadTimestamp{timestamp: ts}, keys)
 	r.remember(snapshot)
 	return snapshot, nil
 }
@@ -374,32 +399,68 @@ func (r *ReadRequest) validateRangeScope(s ReadSnapshot, start, end []byte, grou
 
 // LatestTargets preserves physical group identity for legacy wide columns.
 func (r *ReadRequest) LatestTargets(ctx context.Context, label string, targets []ReadFenceTarget) (ReadSnapshot, error) {
+	if len(targets) == 0 {
+		return r.Latest(ctx, label)
+	}
 	reader, ok := r.st.(interface {
 		GroupCommittedTimestampFloor(context.Context, uint64) (uint64, error)
 	})
-	if !ok || len(targets) == 0 {
-		return r.Latest(ctx, label)
-	}
-	for _, target := range targets {
-		if target.GroupID == 0 {
-			return r.Latest(ctx, label)
+	if !ok {
+		keys := make([][]byte, 0, len(targets))
+		for _, target := range targets {
+			keys = append(keys, target.Key)
 		}
+		return r.Latest(ctx, label, keys...)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if err := r.validate(ctx); err != nil {
 		return ReadSnapshot{}, err
 	}
-	ts, groups, err := requestTargetFloor(ctx, reader, targets)
+	return r.latestTargetsLocked(ctx, label, targets, reader)
+}
+
+func (r *ReadRequest) latestTargetsLocked(ctx context.Context, label string, targets []ReadFenceTarget, reader interface {
+	GroupCommittedTimestampFloor(context.Context, uint64) (uint64, error)
+}) (ReadSnapshot, error) {
+	var keys [][]byte
+	var physical []ReadFenceTarget
+	for _, target := range targets {
+		if target.GroupID != 0 {
+			physical = append(physical, target)
+			continue
+		}
+		if len(target.Key) == 0 {
+			return ReadSnapshot{}, errors.WithStack(ErrReadSnapshotUnissued)
+		}
+		keys = append(keys, target.Key)
+	}
+	ts, groups, err := requestTargetFloor(ctx, reader, physical)
 	if err != nil {
 		return ReadSnapshot{}, err
+	}
+	var scopeKeys [][]byte
+	global := false
+	if len(keys) > 0 {
+		scopeKeys = requestFenceKeys(r.st, keys)
+		keyTS, keyGroups, keyErr := requestCommittedFloorProof(ctx, r.coord, r.st, scopeKeys)
+		if keyErr != nil {
+			return ReadSnapshot{}, keyErr
+		}
+		ts = max(ts, keyTS)
+		for group := range keyGroups {
+			groups[group] = struct{}{}
+		}
+		global = len(scopeKeys) == 0
 	}
 	stamp, err := r.bindAppliedBoundary(ctx, label, max(ts, 1))
 	if err != nil {
 		return ReadSnapshot{}, err
 	}
-	snapshot := r.register(stamp)
-	snapshot.groups = groups
+	snapshot := r.scopedSnapshot(stamp, scopeKeys)
+	if !global {
+		snapshot.groups = groups
+	}
 	r.remember(snapshot)
 	return snapshot, nil
 }
@@ -420,17 +481,6 @@ func (r *ReadRequest) scopedSnapshot(stamp ReadTimestamp, keys [][]byte) ReadSna
 		snapshot.keys = make([][]byte, len(keys))
 		for i, key := range keys {
 			snapshot.keys[i] = bytes.Clone(key)
-		}
-		if resolver, ok := r.coord.(interface{ EngineGroupIDForKey([]byte) uint64 }); ok {
-			snapshot.groups = make(map[uint64]struct{}, len(keys))
-			for _, key := range keys {
-				groupID := resolver.EngineGroupIDForKey(key)
-				if groupID == 0 {
-					snapshot.groups = nil
-					break
-				}
-				snapshot.groups[groupID] = struct{}{}
-			}
 		}
 	}
 

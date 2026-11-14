@@ -140,3 +140,22 @@ func TestS3AdminStreamRetainsRequestUntilClose(t *testing.T) {
 	_, err = body.Read(make([]byte, 1))
 	require.ErrorIs(t, err, io.ErrClosedPipe)
 }
+
+func TestManifestVersionReadDoesNotExpandMetadataCapability(t *testing.T) {
+	base := store.NewMVCCStore()
+	t.Cleanup(func() { require.NoError(t, base.Close()) })
+	require.NoError(t, base.PutAt(t.Context(), []byte("metadata"), []byte("manifest"), 42, 0))
+	require.NoError(t, base.PutAt(t.Context(), []byte("body-version"), []byte("body"), 42, 0))
+	st := &keyedReadScopeStore{MVCCStore: base}
+	request := kv.NewReadRequest(t.Context(), nil, st, nil)
+	defer request.Close()
+	snapshot, err := request.Latest(request.Context(), "metadata", []byte("metadata"))
+	require.NoError(t, err)
+	body, err := manifestVersionGetAt(request.Context(), st, []byte("body-version"), snapshot.Timestamp())
+	require.NoError(t, err)
+	require.Equal(t, "body", string(body))
+	_, err = request.Get(request.Context(), snapshot, []byte("body-version"))
+	require.ErrorIs(t, err, kv.ErrReadSnapshotKeyScope)
+	_, err = manifestVersionGetAt(request.Context(), st, []byte("body-version"), 41)
+	require.ErrorIs(t, err, kv.ErrReadSnapshotUnissued)
+}

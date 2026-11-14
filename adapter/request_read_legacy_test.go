@@ -173,6 +173,7 @@ var legacyRequestReadScopes = map[string]bool{
 
 // Explicit pagination, eventual schema planning and committed-version protocols.
 var historicalRequestReadScopes = map[string]bool{
+	"request_read.go:manifestVersionGetAt":             true,
 	"dynamodb_item_write.go:reuseMutationMatches":      true,
 	"dynamodb_lease.go:loadSpeculativeSchema":          true,
 	"dynamodb_lease.go:resolveTransactGetItemKeys":     true,

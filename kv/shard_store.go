@@ -6348,25 +6348,50 @@ func (s *ShardStore) GlobalCommittedTimestampFloor(ctx context.Context) (uint64,
 // DynamoDB table metadata, items, and seals share a table route, so an outage
 // in an unrelated group must not prevent a write to a healthy table.
 func (s *ShardStore) CommittedTimestampFloorForKeys(ctx context.Context, keys [][]byte) (uint64, error) {
+	ts, _, err := s.CommittedTimestampFloorForKeysWithTargets(ctx, keys)
+	return ts, err
+}
+
+func (s *ShardStore) committedFloorKeyGroups(keys [][]byte) ([]uint64, error) {
 	if s == nil || len(keys) == 0 {
-		return 0, errors.WithStack(ErrTSOCommitFloorUnavailable)
+		return nil, errors.WithStack(ErrTSOCommitFloorUnavailable)
 	}
 	seen := make(map[uint64]struct{}, len(keys))
 	ids := make([]uint64, 0, len(keys))
 	for _, key := range keys {
 		route, group, ok := s.routeAndGroupForKey(key)
 		if !ok || route.GroupID == 0 || group == nil || group.Store == nil {
-			return 0, errors.Wrapf(ErrTSOCommitFloorUnavailable, "key %q has no data group", key)
+			return nil, errors.Wrapf(ErrTSOCommitFloorUnavailable, "key %q has no data group", key)
 		}
 		if _, exists := seen[route.GroupID]; !exists {
 			seen[route.GroupID] = struct{}{}
 			ids = append(ids, route.GroupID)
 		}
 	}
-	if len(ids) == 1 {
-		return s.singleGroupCommittedTimestampFloor(ctx, ids[0])
+	return ids, nil
+}
+
+// CommittedTimestampFloorForKeysWithTargets returns the very group identities
+// used for the barrier, so callers never reconstruct authority from a later route.
+func (s *ShardStore) CommittedTimestampFloorForKeysWithTargets(ctx context.Context, keys [][]byte) (uint64, []ReadFenceTarget, error) {
+	ids, err := s.committedFloorKeyGroups(keys)
+	if err != nil {
+		return 0, nil, err
 	}
-	return s.parallelCommittedTimestampFloor(ctx, ids)
+	var ts uint64
+	if len(ids) == 1 {
+		ts, err = s.singleGroupCommittedTimestampFloor(ctx, ids[0])
+	} else {
+		ts, err = s.parallelCommittedTimestampFloor(ctx, ids)
+	}
+	if err != nil {
+		return 0, nil, err
+	}
+	targets := make([]ReadFenceTarget, 0, len(ids))
+	for _, id := range ids {
+		targets = append(targets, ReadFenceTarget{GroupID: id})
+	}
+	return ts, targets, nil
 }
 
 func (s *ShardStore) tsoCommitFloorGroupIDs() ([]uint64, error) {

@@ -106,3 +106,13 @@ func requestScanGroupOwnedAt(ctx context.Context, backend any, groupID uint64, s
 	rows, resume, err := request.ScanGroupOwned(requestReadContext(ctx, request), snapshot, groupID, start, end, limit)
 	return rows, resume, errors.WithStack(err)
 }
+
+func requestScanPhysicalAt(ctx context.Context, backend any, start, end []byte, visibleLimit, physicalLimit int, ts uint64, reverse bool) ([]*store.KVPair, bool, error) {
+	request, snapshot, closeRead, err := requestReadSnapshot(ctx, backend, ts)
+	if err != nil {
+		return nil, false, err
+	}
+	defer closeRead()
+	rows, limited, err := request.ScanPhysical(requestReadContext(ctx, request), snapshot, start, end, visibleLimit, physicalLimit, reverse)
+	return rows, limited, errors.WithStack(err)
+}

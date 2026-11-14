@@ -163,3 +163,32 @@ func (r *ReadRequest) ScanGroupOwned(ctx context.Context, snapshot ReadSnapshot,
 	})
 	return page.rows, page.resume, err
 }
+
+type physicalReadPage struct {
+	rows    []*store.KVPair
+	limited bool
+}
+
+// ScanPhysical applies the same capability checks to a scan with a physical
+// visit budget. Direction and both budgets are preserved at the store seam.
+func (r *ReadRequest) ScanPhysical(ctx context.Context, snapshot ReadSnapshot, start, end []byte, visibleLimit, physicalLimit int, reverse bool) ([]*store.KVPair, bool, error) {
+	page, err := withReadSnapshot(r, ctx, snapshot, func() error { return r.validateRangeScope(snapshot, start, end, 0) }, func(ts uint64) (physicalReadPage, error) {
+		reader, ok := r.st.(interface {
+			ScanAtPhysicalLimit(context.Context, []byte, []byte, int, int, uint64) ([]*store.KVPair, bool, error)
+			ReverseScanAtPhysicalLimit(context.Context, []byte, []byte, int, int, uint64) ([]*store.KVPair, bool, error)
+		})
+		if !ok {
+			return physicalReadPage{}, errors.New("snapshot store does not support physical-limit scans")
+		}
+		var rows []*store.KVPair
+		var limited bool
+		var readErr error
+		if reverse {
+			rows, limited, readErr = reader.ReverseScanAtPhysicalLimit(ctx, start, end, visibleLimit, physicalLimit, ts)
+		} else {
+			rows, limited, readErr = reader.ScanAtPhysicalLimit(ctx, start, end, visibleLimit, physicalLimit, ts)
+		}
+		return physicalReadPage{rows: rows, limited: limited}, errors.WithStack(readErr)
+	})
+	return page.rows, page.limited, err
+}

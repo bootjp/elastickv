@@ -34,6 +34,10 @@ func TestShardStoreCommittedTimestampFloorForKeysSkipsUnrelatedUnavailableGroup(
 	floor, err := shards.CommittedTimestampFloorForKeys(context.Background(), [][]byte{[]byte("apple"), []byte("apricot")})
 	require.NoError(t, err)
 	require.Equal(t, uint64(42), floor)
+	proofFloor, targets, err := shards.CommittedTimestampFloorForKeysWithTargets(context.Background(), [][]byte{[]byte("apple"), []byte("apricot")})
+	require.NoError(t, err)
+	require.Equal(t, floor, proofFloor)
+	require.Equal(t, []ReadFenceTarget{{GroupID: 1}}, targets)
 	_, err = shards.CommittedTimestampFloorForKeys(context.Background(), [][]byte{[]byte("apple"), []byte("yak")})
 	require.ErrorIs(t, err, ErrTSOCommitFloorUnavailable)
 }

@@ -36,10 +36,14 @@ func TestAdaptersRequireCapabilityReadPorts(t *testing.T) {
 
 func requestReadPolicy() map[string]map[string]bool {
 	allowed := make(map[string]map[string]bool)
-	for _, name := range []string{"GetAt", "ScanAt", "ExistsAt", "ScanKeysAt", "ReverseScanAt", "GetGroupAt", "ScanGroupAt", "ReverseScanGroupAt", "ScanGroupKeysAt", "GetAtWithReadFence", "ScanAtWithReadFence", "ScanKeysAtWithReadFence", "ScanGroupOwnedAt"} {
+	allowed["requestReadSnapshot"] = map[string]bool{"request_read.go:requestGetAt": true, "request_read.go:requestScanAt": true, "request_read.go:manifestVersionGetAt": true, "request_read_ports.go:requestScanPhysicalAt": true}
+
+	for _, name := range []string{"GetAt", "ScanAt", "ExistsAt", "ScanKeysAt", "ReverseScanAt", "GetGroupAt", "ScanGroupAt", "ReverseScanGroupAt", "ScanGroupKeysAt", "GetAtWithReadFence", "ScanAtWithReadFence", "ScanKeysAtWithReadFence", "ScanGroupOwnedAt", "ScanAtPhysicalLimit", "ReverseScanAtPhysicalLimit"} {
 		allowed[name] = map[string]bool{}
 		allowed["request"+name] = legacyRequestReadScopes
+		allowed["requestReadSnapshot"]["request_read_ports.go:request"+name] = true
 	}
+	allowed["requestScanPhysicalAt"] = legacyRequestReadScopes
 	allowed["Historical"] = map[string]bool{
 		"request_read.go:requestReadSnapshot":     true,
 		"request_read.go:historicalGetAt":         true,
@@ -50,6 +54,7 @@ func requestReadPolicy() map[string]map[string]bool {
 	}
 	allowed["Issued"] = map[string]bool{"request_read.go:requestReadSnapshot": true, "request_read.go:checkIssuedGet": true}
 	allowed["historicalGetAt"] = historicalRequestReadScopes
+	allowed["manifestVersionGetAt"] = map[string]bool{"s3_blob_read.go:readLegacyS3ObjectChunk": true, "s3_blob_read.go:loadS3ChunkRef": true}
 	allowed["historicalScanAt"] = historicalRequestReadScopes
 	allowed["authorizeHistoricalRead"] = historicalRequestReadScopes
 	return allowed
@@ -89,6 +94,8 @@ func TestCapabilityReadPortGuardRejectsNewRawOrHistoricalEscapes(t *testing.T) {
 		"old := requestGetAt; old(ctx, store, key, oldTimestamp)",
 		"request.Historical(ctx,oldTimestamp)",
 		"request.Issued(ctx,oldTimestamp)",
+		"old := manifestVersionGetAt; old(ctx,store,key,oldTimestamp)",
+		"old := requestReadSnapshot; old(ctx,store,oldTimestamp)",
 	} {
 		file, err := parser.ParseFile(token.NewFileSet(), "fresh.go", "package adapter; func fresh(){"+body+"}", 0)
 		if err != nil {
