@@ -382,7 +382,11 @@ func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
 		writeRedisError(conn, err)
 		return
 	}
-	readTS := r.readTS()
+	readTS, err := r.snapshotReadTS(r.handlerContext(conn))
+	if err != nil {
+		writeRedisError(conn, err)
+		return
+	}
 
 	// Fast path: attempt the string read directly instead of probing
 	// every possible Redis encoding first. rawKeyTypeAt issues up to
@@ -610,7 +614,11 @@ func (r *RedisServer) exists(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 
-	readTS := r.readTS()
+	readTS, err := r.snapshotReadTS(r.handlerContext(conn))
+	if err != nil {
+		writeRedisError(conn, err)
+		return
+	}
 	// Derive ctx from the server's base context so work in this handler
 	// that honors context deadlines is bounded and cancels on shutdown.
 	// Local Pebble reads (store.GetAt / ExistsAt / ScanAt) currently

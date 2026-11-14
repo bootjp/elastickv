@@ -817,7 +817,6 @@ func TestRedisReadFencedTimestampLeasesBeforeAndAfterSelectingTimestamp(t *testi
 	readTimestamp, readPin, err := server.redisReadFencedTimestampForTargets(
 		context.Background(),
 		[]kv.ReadFenceTarget{{Key: redisStrKey([]byte("txn:fence-order"))}},
-		server.txnStartTS,
 		"test",
 	)
 	defer readPin.Release()

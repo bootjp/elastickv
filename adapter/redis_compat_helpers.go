@@ -528,7 +528,11 @@ func (r *RedisServer) applyTTLFilter(ctx context.Context, key []byte, readTS uin
 }
 
 func (r *RedisServer) keyType(ctx context.Context, key []byte) (redisValueType, error) {
-	return r.keyTypeAt(ctx, key, r.readTS())
+	readTS, err := r.snapshotReadTS(ctx)
+	if err != nil {
+		return redisTypeNone, err
+	}
+	return r.keyTypeAt(ctx, key, readTS)
 }
 
 func (r *RedisServer) logicalExistsAt(ctx context.Context, key []byte, readTS uint64) (bool, error) {
@@ -1472,7 +1476,10 @@ func (r *RedisServer) visibleKeys(pattern []byte, requestContexts ...context.Con
 		return nil, err
 	}
 	visible := make([][]byte, 0, len(keys))
-	readTS := r.readTS()
+	readTS, err := r.snapshotReadTS(r.redisContext(requestContexts...))
+	if err != nil {
+		return nil, err
+	}
 	for _, key := range keys {
 		ok, err := r.logicalExistsAt(r.redisContext(requestContexts...),
 			key, readTS)

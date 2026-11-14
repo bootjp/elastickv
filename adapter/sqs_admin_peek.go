@@ -240,7 +240,10 @@ func (s *SQSServer) AdminPeekQueue(
 		s.observeAdminPeek(name, adminPeekOutcomeForError(err))
 		return nil, "", err
 	}
-	readTS := s.nextTxnReadTS(ctx)
+	readTS, err := s.snapshotReadTS(ctx)
+	if err != nil {
+		return nil, "", err
+	}
 	meta, exists, err := s.loadQueueMetaAt(ctx, name, readTS)
 	if err != nil {
 		s.observeAdminPeek(name, adminPeekOutcomeForError(err))

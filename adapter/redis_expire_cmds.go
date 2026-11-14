@@ -161,7 +161,11 @@ func (r *RedisServer) pttl(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) writeTTL(conn redcon.Conn, key []byte, milliseconds bool) {
-	readTS := r.readTS()
+	readTS, err := r.snapshotReadTS(r.handlerContext(conn))
+	if err != nil {
+		writeRedisError(conn, err)
+		return
+	}
 	exists, err := r.logicalExistsAt(r.handlerContext(conn),
 		key, readTS)
 	if err != nil {

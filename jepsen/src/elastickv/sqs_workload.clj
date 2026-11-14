@@ -27,17 +27,26 @@
                                 :ReceiptHandle (:ReceiptHandle message)})
                   {:deleted (:Body message)}
                   (catch Exception e
-                    {:error (.getMessage e)})))
+                    {:error (.getMessage e)
+                     :details {:body (:Body message)
+                               :type (:type (ex-data e))
+                               :category (:category (ex-data e))
+                               :response (select-keys (:resp (ex-data e))
+                                                      [:Error :ErrorResponse :__type
+                                                       :Message :message
+                                                       :cognitect.anomalies/message])}})))
               messages)]
     {:value (mapv :Body messages)
      :deleted (mapv :deleted (filter #(contains? % :deleted) acknowledgements))
-     :delete-errors (mapv :error (filter :error acknowledgements))}))
+     :delete-errors (mapv :error (filter :error acknowledgements))
+     :delete-error-details (mapv :details (filter :error acknowledgements))}))
 
 (defrecord StandardClient [node->port region queue-name counter conn queue-url]
   client/Client
   (open! [this test node]
     (assoc this :conn (sqs/make-client (or (:sqs-host test) (name node))
-                                     (get node->port node 9324) region)))
+                                     (get node->port node 9324) region
+                                     (:disable-sdk-retries test))))
   (setup! [this _test]
     ;; CreateQueue is idempotent for identical attributes; conflicting
     ;; attributes must fail setup rather than silently reuse another queue.

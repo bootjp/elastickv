@@ -11,6 +11,30 @@
 
 (def ^:private awkward-dir "/mnt/elastickv test's dir")
 
+(deftest static-bootstrap-members-reach-every-node
+  (let [members "n1=n1:50051,n2=n2:50051,n3=n3:50051"]
+    (doseq [node ["n1" "n2" "n3"]]
+      (let [started (atom nil)]
+        (with-redefs [c/session (constantly :test-session)
+                      c/disconnect (constantly nil)
+                      c/exec (constantly nil)
+                      cu/start-daemon! (fn [_opts _bin & args] (reset! started args))]
+          (#'db/start-node! {:nodes ["n1" "n2" "n3"]} node
+                           {:bootstrap-node "n1" :grpc-port 50051 :redis-port 6379
+                            :data-dir "/tmp/test" :bootstrap-members members}))
+        (is (= members (second (drop-while #(not= "--raftBootstrapMembers" %) @started))))
+        (is (not (some #{"--raftBootstrap"} @started)))))))
+
+(deftest static-bootstrap-waits-for-peers-without-adding-existing-voters
+  (let [waited (atom [])]
+    (with-redefs [elastickv.db/wait-for-node-grpc! (fn [node _] (swap! waited conj node))
+                  elastickv.db/wait-for-mount! (fn [& _])
+                  elastickv.db/enable-peer-mount! (fn [& _])
+                  elastickv.db/join-peer! (fn [& _] (throw (Exception. "unexpected voter add")))]
+      (#'db/finish-bootstrap-setup! {:nodes ["n1" "n2" "n3"]} "n1"
+                                  {:bootstrap-members "n1=n1:50051,n2=n2:50051,n3=n3:50051"}))
+    (is (= ["n1" "n2" "n3"] @waited))))
+
 (deftest migration-nodes-explicitly-allow-unauthenticated-test-helpers
   (doseq [enabled? [false true]]
     (let [started (atom nil)]

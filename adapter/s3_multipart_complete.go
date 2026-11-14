@@ -184,12 +184,11 @@ func (s *S3Server) commitS3MultipartCompletion(ctx context.Context, bucket, obje
 // A retry rebuilds the manifest from one retained snapshot. Descriptor keys are
 // read-only dependencies: a concurrent part replacement must conflict at apply.
 func (s *S3Server) commitS3MultipartCompletionAttempt(ctx context.Context, bucket, objectKey, uploadID string, request s3CompleteMultipartUploadRequest) (s3MultipartCompletion, *s3ObjectManifest, error) {
-	readTS := s.readTS()
-	readTimestamp, err := s.beginTxnReadTimestamp(ctx, readTS, "s3 complete multipart upload: begin read timestamp")
+	readTimestamp, err := s.beginTxnReadTimestamp(ctx, "s3 complete multipart upload: begin read timestamp")
 	if err != nil {
 		return s3MultipartCompletion{}, nil, errors.Wrap(err, "s3: allocate startTS for completeMultipartUpload retry")
 	}
-	readTS = readTimestamp.Timestamp()
+	readTS := readTimestamp.Timestamp()
 	startTS := readTS
 	readPin := s.pinReadTS(readTS)
 	defer readPin.Release()

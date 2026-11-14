@@ -16,7 +16,7 @@ import (
 func dispatchS3ChunkRefAccountingTest(t *testing.T, h *s3OCCReproHarness, elems ...*kv.Elem[kv.OP]) uint64 {
 	t.Helper()
 	ctx := context.Background()
-	readTimestamp, err := h.server.beginTxnReadTimestamp(ctx, h.server.readTS(), "s3 chunkref accounting test")
+	readTimestamp, err := h.server.beginTxnReadTimestamp(ctx, "s3 chunkref accounting test")
 	require.NoError(t, err)
 	commitTS, err := h.server.nextTxnCommitTS(ctx, readTimestamp.Timestamp())
 	require.NoError(t, err)
@@ -80,7 +80,7 @@ func TestS3ChunkRefAccountingRejectsMissingReferenceCount(t *testing.T) {
 	key := s3keys.VersionedChunkRefKey("bucket", 1, "object", "upload", 1, 0, 1)
 	_, err = h.coord.Dispatch(t.Context(), &kv.OperationGroup[kv.OP]{Elems: []*kv.Elem[kv.OP]{{Op: kv.Put, Key: key, Value: ref}}})
 	require.NoError(t, err)
-	readTimestamp, err := h.server.beginTxnReadTimestamp(t.Context(), h.server.readTS(), "s3 chunkref underflow test")
+	readTimestamp, err := h.server.beginTxnReadTimestamp(t.Context(), "s3 chunkref underflow test")
 	require.NoError(t, err)
 	commitTS, err := h.server.nextTxnCommitTS(t.Context(), readTimestamp.Timestamp())
 	require.NoError(t, err)

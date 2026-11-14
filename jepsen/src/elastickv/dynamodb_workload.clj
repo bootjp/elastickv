@@ -14,6 +14,7 @@
             [cognitect.aws.client.api :as aws]
             [cognitect.aws.credentials :as creds]
             [elastickv.cli :as cli]
+            [elastickv.fault-transport :as fault-transport]
             [elastickv.db :as ekdb]
             [jepsen [client :as client]
                     [core :as jepsen]
@@ -40,16 +41,19 @@
    Dummy credentials and a fixed region are provided explicitly so the SDK
    never attempts credential or region resolution from the environment
    (which would fail in CI or local runs without AWS config)."
-  [host port]
-  (aws/client
-    {:api                  :dynamodb
-     :region               "us-east-1"
-     :credentials-provider (creds/basic-credentials-provider
-                             {:access-key-id     "dummy"
-                              :secret-access-key "dummy"})
-     :endpoint-override    {:protocol :http
-                            :hostname  host
-                            :port      port}}))
+  ([host port] (make-ddb-client host port false))
+  ([host port disable-retries?]
+   (aws/client
+     (cond-> {:api                  :dynamodb
+              :region               "us-east-1"
+              :credentials-provider (creds/basic-credentials-provider
+                                      {:access-key-id     "dummy"
+                                       :secret-access-key "dummy"})
+              :endpoint-override    {:protocol :http
+                                     :hostname host
+                                     :port port}}
+       disable-retries? (assoc :retriable? (constantly false)
+                              :http-client (fault-transport/bounded-http-client))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Low-level DynamoDB helpers
@@ -218,7 +222,7 @@
   (open! [this test node]
     (let [port (get node->port node 8000)
           host (or (:dynamo-host test) (name node))]
-      (assoc this :ddb (make-ddb-client host port))))
+      (assoc this :ddb (make-ddb-client host port (:disable-sdk-retries test)))))
 
   (setup! [this _test]
     (create-table! ddb))

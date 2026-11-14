@@ -277,7 +277,7 @@ func (c *DeltaCompactor) compactUrgentKey(ctx context.Context, req urgentCompact
 func (c *DeltaCompactor) compactUrgentKeyBatch(ctx context.Context, req urgentCompactionRequest, h *collectionDeltaHandler, prefix []byte) (int, bool) {
 	// Use a fresh readTS each iteration so we observe the committed state from
 	// the previous compaction pass and do not re-scan already-deleted delta keys.
-	readTimestamp, err := kv.BeginReadTimestampThrough(ctx, c.coord, snapshotTS(c.coord.Clock(), c.st),
+	readTimestamp, err := beginFencedReadSnapshot(ctx, c.coord, c.st,
 		"redis delta compactor urgent: begin read timestamp")
 	if err != nil {
 		c.logger.WarnContext(ctx, "delta compactor urgent: timestamp allocation failed",
@@ -368,7 +368,7 @@ func (c *DeltaCompactor) syncOnceOwned(ctx context.Context) error {
 	// snapshotAt precedes the read timestamp, so a TTL-inline pass that reads
 	// at readTS never reports a start later than its snapshot.
 	snapshotAt := time.Now()
-	readTimestamp, err := kv.BeginReadTimestampThrough(tickCtx, c.coord, snapshotTS(c.coord.Clock(), c.st),
+	readTimestamp, err := beginFencedReadSnapshot(tickCtx, c.coord, c.st,
 		"redis delta compactor: begin read timestamp")
 	if err != nil {
 		return errors.WithStack(err)

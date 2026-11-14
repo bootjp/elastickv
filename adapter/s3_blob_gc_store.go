@@ -16,7 +16,7 @@ func (s *S3Server) ScanGCQueue(ctx context.Context, startKey, endKey []byte, lim
 	if limit <= 0 {
 		return nil, nil, errors.New("s3 gc: queue scan limit must be positive")
 	}
-	readTimestamp, err := s.beginTxnReadTimestamp(ctx, ^uint64(0), "s3 gc: scan queue")
+	readTimestamp, err := s.beginTxnReadTimestamp(ctx, "s3 gc: scan queue")
 	if err != nil {
 		return nil, nil, err
 	}
@@ -43,7 +43,7 @@ func (s *S3Server) ScanGCQueue(ctx context.Context, startKey, endKey []byte, lim
 }
 
 func (s *S3Server) ReadChunkRefRC(ctx context.Context, sha [32]byte) ([]byte, bool, error) {
-	readTimestamp, err := s.beginTxnReadTimestamp(ctx, ^uint64(0), "s3 gc: read reference count")
+	readTimestamp, err := s.beginTxnReadTimestamp(ctx, "s3 gc: read reference count")
 	if err != nil {
 		return nil, false, err
 	}
@@ -57,7 +57,7 @@ func (s *S3Server) ReadChunkRefRC(ctx context.Context, sha [32]byte) ([]byte, bo
 }
 
 func (s *S3Server) GCQueueEntryExists(ctx context.Context, sha [32]byte) (bool, error) {
-	readTimestamp, err := s.beginTxnReadTimestamp(ctx, ^uint64(0), "s3 gc: check queue entry")
+	readTimestamp, err := s.beginTxnReadTimestamp(ctx, "s3 gc: check queue entry")
 	if err != nil {
 		return false, err
 	}
@@ -105,7 +105,7 @@ func (s *S3Server) ClearGCQueueMetadata(ctx context.Context, entry s3keys.ChunkB
 }
 
 func (s *S3Server) mutateGCQueueEntry(ctx context.Context, entry s3keys.ChunkBlobGCQueueEntry, mode s3GCQueueMutation) error {
-	readTimestamp, err := s.beginTxnReadTimestamp(ctx, ^uint64(0), "s3 gc: mutate queue")
+	readTimestamp, err := s.beginTxnReadTimestamp(ctx, "s3 gc: mutate queue")
 	if err != nil {
 		return err
 	}

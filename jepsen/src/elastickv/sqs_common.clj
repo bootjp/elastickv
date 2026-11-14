@@ -3,6 +3,7 @@
   (:require [cognitect.aws.client.api :as aws]
             [cognitect.aws.credentials :as creds]
             [elastickv.cli :as cli]
+            [elastickv.fault-transport :as fault-transport]
             [elastickv.db :as ekdb]
             [jepsen [generator :as gen] [net :as net]]
             [jepsen.control :as control]
@@ -16,16 +17,19 @@
   "Returns a cognitect/aws-api SQS client pointed at http://host:port.
    Dummy credentials match the elastickv server's open-endpoint mode (no
    --sqsCredentialsFile passed → adapter accepts any signed request)."
-  [host port region]
-  (aws/client
-    {:api                  :sqs
-     :region               (or region "us-east-1")
-     :credentials-provider (creds/basic-credentials-provider
-                             {:access-key-id     "dummy"
-                              :secret-access-key "dummy"})
-     :endpoint-override    {:protocol :http
-                            :hostname  host
-                            :port      port}}))
+  ([host port region] (make-client host port region false))
+  ([host port region disable-retries?]
+   (aws/client
+     (cond-> {:api                  :sqs
+              :region               (or region "us-east-1")
+              :credentials-provider (creds/basic-credentials-provider
+                                      {:access-key-id     "dummy"
+                                       :secret-access-key "dummy"})
+              :endpoint-override    {:protocol :http
+                                     :hostname host
+                                     :port port}}
+       disable-retries? (assoc :retriable? (constantly false)
+                              :http-client (fault-transport/bounded-http-client))))))
 
 (defn- anomaly? [resp]
   (contains? resp :cognitect.anomalies/category))
@@ -37,9 +41,12 @@
   [sqs op request]
   (let [resp (aws/invoke sqs {:op op :request request})]
     (if (anomaly? resp)
-      (let [err-type (:__type resp)
+      (let [err-type (or (:__type resp) (get-in resp [:Error :Code])
+                         (get-in resp [:ErrorResponse :Error :Code]))
             category (:cognitect.anomalies/category resp)
-            msg      (or (:message resp)
+            msg      (or (get-in resp [:Error :Message])
+                         (get-in resp [:ErrorResponse :Error :Message])
+                         (:message resp)
                          (:Message resp)
                          (:cognitect.anomalies/message resp)
                          "")]

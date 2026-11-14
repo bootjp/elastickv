@@ -247,87 +247,8 @@ func dynamoItemUpdateLockKey(tableName string, key map[string]attributeValue) (s
 // LeaderRoutedStore) that can proxy the leader's LastCommitTS.  Defined as a
 // local interface so DynamoDBServer avoids a hard dependency on the concrete
 // kv type.
-type globalLastCommitTSProvider interface {
-	GlobalLastCommitTS(ctx context.Context) uint64
-}
-
-type committedTimestampFloorProvider interface {
-	GlobalCommittedTimestampFloor(ctx context.Context) (uint64, error)
-}
-
-type keyedCommittedTimestampFloorProvider interface {
-	CommittedTimestampFloorForKeys(ctx context.Context, keys [][]byte) (uint64, error)
-}
-
-func (d *DynamoDBServer) nextTxnReadTS() uint64 {
-	// On a follower the local store.LastCommitTS() may lag behind the leader.
-	// Use GlobalLastCommitTS so ConsistentRead snapshots and transaction
-	// start timestamps are aligned with the leader's committed watermark,
-	// preventing stale pre-reads that cause false Jepsen anomalies and
-	// unnecessary WriteConflict retries on every follower request.
-	maxTS := uint64(0)
-	if p, ok := d.store.(globalLastCommitTSProvider); ok {
-		maxTS = p.GlobalLastCommitTS(context.Background())
-	} else if d.store != nil {
-		maxTS = d.store.LastCommitTS()
-	}
-
-	// Advance the HLC so subsequent commitTS calls produce values > maxTS,
-	// but return maxTS directly as the snapshot — NOT clock.Next().
-	//
-	// clock.Next() can be ahead of store.LastCommitTS() because concurrent
-	// dispatchTxn calls advance the HLC before their Raft entry is applied.
-	// If readTS = clock.Next() = T and a concurrent write obtained
-	// commitTS = T-1 (still in the Raft pipeline), the version at T-1 is
-	// not yet in Pebble.  Reads would see stale data and the FSM conflict
-	// check (latestTS > startTS: T-1 > T → false) would silently pass,
-	// allowing corrupted writes.  Returning maxTS closes this gap: every
-	// version at ≤ maxTS is guaranteed visible, and any concurrent write at
-	// > maxTS triggers a WriteConflict and a retry.
-	clock := d.coordinator.Clock()
-	if clock != nil && maxTS > 0 {
-		clock.Observe(maxTS)
-	}
-	if maxTS == 0 {
-		return 1
-	}
-	return maxTS
-}
-
 func (d *DynamoDBServer) beginTxnReadTimestamp(ctx context.Context, label string, keys ...[]byte) (kv.ReadTimestamp, error) {
-	// LastCommitTS is a maximum, not an applied-log barrier: a Raft entry
-	// allocated an older commit timestamp can still be pending after another
-	// entry has advanced the watermark. Fence each touched group before sampling it,
-	// or OCC may accept a write built without that pending entry and overwrite
-	// its successful update.
-	var (
-		fencedTS uint64
-		err      error
-	)
-	if floor, ok := d.store.(keyedCommittedTimestampFloorProvider); ok && len(keys) > 0 {
-		fencedTS, err = floor.CommittedTimestampFloorForKeys(ctx, keys)
-	} else if floor, ok := d.store.(committedTimestampFloorProvider); ok {
-		fencedTS, err = floor.GlobalCommittedTimestampFloor(ctx)
-	} else {
-		// Bare test stores have no Raft-aware floor. Keep their coordinator
-		// boundary strict too, rather than letting a lease fast path mask a
-		// pending committed entry.
-		_, err = d.coordinator.LinearizableRead(ctx)
-		if err == nil {
-			fencedTS = d.nextTxnReadTS()
-		}
-	}
-	if err != nil {
-		return kv.ReadTimestamp{}, errors.Wrap(err, label+": fence read snapshot")
-	}
-	if fencedTS == 0 {
-		fencedTS = 1
-	}
-	if clock := d.coordinator.Clock(); clock != nil {
-		clock.Observe(fencedTS)
-	}
-	readTimestamp, err := kv.BeginReadTimestampThrough(ctx, d.coordinator, fencedTS, label)
-	return readTimestamp, errors.WithStack(err)
+	return beginFencedReadSnapshot(ctx, d.coordinator, d.store, label, keys...)
 }
 
 // beginTxnWriteTimestamp places a seal for each affected item in its Raft

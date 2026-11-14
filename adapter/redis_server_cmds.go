@@ -803,7 +803,12 @@ func (r *RedisServer) flushlegacy(conn redcon.Conn, _ redcon.Command) {
 		redisFlushLegacyTimeout)
 	defer cancel()
 
-	totalDeleted, err := r.deleteLegacyKeys(ctx, r.readTS())
+	readTS, err := r.snapshotReadTS(r.handlerContext(conn))
+	if err != nil {
+		writeRedisError(conn, err)
+		return
+	}
+	totalDeleted, err := r.deleteLegacyKeys(ctx, readTS)
 	if err != nil {
 		writeRedisError(conn, err)
 		return

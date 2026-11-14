@@ -663,7 +663,11 @@ func (r *RedisServer) sismember(conn redcon.Conn, cmd redcon.Command) {
 	}
 	key := cmd.Args[1]
 	member := cmd.Args[2]
-	readTS := r.readTS()
+	readTS, err := r.snapshotReadTS(r.handlerContext(conn))
+	if err != nil {
+		writeRedisError(conn, err)
+		return
+	}
 	ctx := r.handlerContext(conn)
 
 	hit, alive, err := r.setMemberFastExists(ctx, key, member, readTS)
@@ -738,7 +742,11 @@ func (r *RedisServer) smembers(conn redcon.Conn, cmd redcon.Command) {
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
-	readTS := r.readTS()
+	readTS, err := r.snapshotReadTS(r.handlerContext(conn))
+	if err != nil {
+		writeRedisError(conn, err)
+		return
+	}
 	typ, err := r.keyTypeAt(r.handlerContext(conn),
 		cmd.Args[1], readTS)
 	if err != nil {
@@ -825,7 +833,15 @@ func (r *RedisServer) pfcountCommand(conn redcon.Conn, cmd redcon.Command) {
 	ctx, cancel := context.WithTimeout(r.handlerContext(conn),
 		redisDispatchTimeout)
 	defer cancel()
-	readTS := r.readTS()
+	readTS, err := r.snapshotReadTS(r.handlerContext(conn))
+	if err != nil {
+		writeRedisError(conn, err)
+		return
+	}
+	r.pfcountAt(ctx, conn, cmd, readTS)
+}
+
+func (r *RedisServer) pfcountAt(ctx context.Context, conn redcon.Conn, cmd redcon.Command, readTS uint64) {
 	union := map[string]struct{}{}
 	for _, key := range cmd.Args[1:] {
 		r.observeBlockingRedisKeys(ctx, [][]byte{key})

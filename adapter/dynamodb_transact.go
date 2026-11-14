@@ -407,30 +407,10 @@ func (d *DynamoDBServer) transactGetItems(w http.ResponseWriter, r *http.Request
 }
 
 func (d *DynamoDBServer) fencedTransactGetReadTS(ctx context.Context, groupKeys [][]byte) (uint64, error) {
-	if len(groupKeys) == 0 {
-		// Validation will fail before a store read for malformed requests.
-		return d.nextTxnReadTS(), nil
-	}
 	fenceCtx, cancel := context.WithTimeout(ctx, dynamoLeaseReadTimeout)
 	defer cancel()
-	var (
-		readTS uint64
-		err    error
-	)
-	if floor, ok := d.store.(keyedCommittedTimestampFloorProvider); ok {
-		readTS, err = floor.CommittedTimestampFloorForKeys(fenceCtx, groupKeys)
-	} else if floor, ok := d.store.(committedTimestampFloorProvider); ok {
-		readTS, err = floor.GlobalCommittedTimestampFloor(fenceCtx)
-	} else {
-		_, err = d.coordinator.LinearizableRead(fenceCtx)
-		if err == nil {
-			readTS = d.nextTxnReadTS()
-		}
-	}
-	if readTS == 0 {
-		readTS = 1
-	}
-	return readTS, errors.WithStack(err)
+	stamp, err := beginFencedReadSnapshot(fenceCtx, d.coordinator, d.store, "dynamodb transact get", groupKeys...)
+	return stamp.Timestamp(), err
 }
 
 func decodeTransactGetItemsInput(bodyReader io.Reader) (transactGetItemsInput, error) {

@@ -1,0 +1,98 @@
+name: Jepsen Hosted Faults
+
+on:
+  workflow_call:
+    inputs:
+      adapters-json:
+        type: string
+        default: '["redis"]'
+      time-limit:
+        type: string
+        default: '90'
+      repeat-faults:
+        type: boolean
+        default: false
+      min-fault-cycles:
+        type: number
+        default: 1
+      rate:
+        type: string
+        default: '5'
+      concurrency:
+        type: string
+        default: '6'
+      key-count:
+        type: string
+        default: '8'
+      max-writes-per-key:
+        type: string
+        default: '256'
+      max-txn-length:
+        type: string
+        default: '4'
+      artifact-prefix:
+        type: string
+        default: jepsen-hosted
+  pull_request:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+  schedule:
+    - cron: '23 18 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-hosted-faults
+  cancel-in-progress: true
+
+jobs:
+  faults:
+    name: Jepsen (${{ matrix.adapter }}, ${{ matrix.fault }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        adapter: ${{ fromJSON(inputs.adapters-json || '["redis"]') }}
+        fault: [partition, kill, pause]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: actions/cache@v6
+        with:
+          path: ~/.m2/repository
+          key: hosted-jepsen-maven-${{ runner.os }}-${{ hashFiles('jepsen/project.clj') }}
+          restore-keys: hosted-jepsen-maven-${{ runner.os }}-
+      - name: Run three-node fault and recovery test
+        timeout-minutes: 25
+        env:
+          FAULT: ${{ matrix.fault }}
+          ADAPTER: ${{ matrix.adapter }}
+          JEPSEN_TIME_LIMIT: ${{ inputs.time-limit || '90' }}
+          JEPSEN_REPEAT_FAULTS: ${{ inputs.repeat-faults && 'true' || 'false' }}
+          JEPSEN_MIN_FAULT_CYCLES: ${{ inputs.min-fault-cycles || 1 }}
+          JEPSEN_RATE: ${{ inputs.rate || '5' }}
+          JEPSEN_CONCURRENCY: ${{ inputs.concurrency || '6' }}
+          JEPSEN_KEY_COUNT: ${{ inputs.key-count || '8' }}
+          JEPSEN_MAX_WRITES_PER_KEY: ${{ inputs.max-writes-per-key || '256' }}
+          JEPSEN_MAX_TXN_LENGTH: ${{ inputs.max-txn-length || '4' }}
+        run: bash jepsen/docker/hosted/run.sh "$FAULT" "$ADAPTER"
+      - name: Make container-written artifacts and cache readable
+        if: always()
+        run: |
+          for path in artifacts "$HOME/.m2"; do
+            if [ -d "$path" ]; then
+              sudo chown -R "$(id -u):$(id -g)" "$path"
+            fi
+          done
+      - name: Upload fault history, checker results, and node logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs.artifact-prefix || 'jepsen-hosted' }}-${{ matrix.adapter }}-${{ matrix.fault }}-${{ github.run_attempt }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14

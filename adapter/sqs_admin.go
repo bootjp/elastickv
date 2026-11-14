@@ -96,7 +96,10 @@ func (s *SQSServer) AdminDescribeQueue(ctx context.Context, name string, opts ..
 	if strings.TrimSpace(name) == "" {
 		return nil, false, ErrAdminSQSValidation
 	}
-	readTS := s.nextTxnReadTS(ctx)
+	readTS, err := s.snapshotReadTS(ctx)
+	if err != nil {
+		return nil, false, err
+	}
 	meta, exists, err := s.loadQueueMetaAt(ctx, name, readTS)
 	if err != nil {
 		return nil, false, errors.WithStack(err)

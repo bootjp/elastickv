@@ -328,7 +328,11 @@ func (r *RedisServer) resolveReuseLength(ctx context.Context, key []byte, pendin
 // stale w.r.t. intervening non-conflicting writes, so the probe-hit
 // shortcut would silently understate the count.
 func (r *RedisServer) resolveLengthAfterFreshApply(ctx context.Context, key []byte, pending *reusableListPush) int64 {
-	currentMeta, _, mErr := r.resolveListMeta(ctx, key, r.readTS())
+	readTS, err := r.snapshotReadTS(ctx)
+	if err != nil {
+		return pending.length
+	}
+	currentMeta, _, mErr := r.resolveListMeta(ctx, key, readTS)
 	if mErr != nil {
 		return pending.length
 	}
@@ -695,7 +699,10 @@ func (r *RedisServer) commitListPop(ctx context.Context, key []byte, elems []*kv
 func (r *RedisServer) listPopClaim(ctx context.Context, key []byte, count int, left bool) ([]string, error) {
 	// count=0: Redis returns an empty array if the key exists as a list, nil otherwise.
 	if count <= 0 {
-		readTS := r.readTS()
+		readTS, err := r.snapshotReadTS(ctx)
+		if err != nil {
+			return nil, err
+		}
 		found, err := r.checkListKeyType(ctx, key, readTS)
 		if err != nil || !found {
 			return nil, err
@@ -815,7 +822,7 @@ func (r *RedisServer) fenceRangeListReadGroups(ctx context.Context, key []byte, 
 		return 0, nil, proxied, true, err
 	}
 	readTimestamp, readPin, err := r.redisReadFencedTimestampForTargets(
-		ctx, targets, r.readTS, "redis list range: begin read timestamp")
+		ctx, targets, "redis list range: begin read timestamp")
 	if err != nil {
 		return 0, nil, nil, false, err
 	}
@@ -844,7 +851,11 @@ func (r *RedisServer) listPushCmd(conn redcon.Conn, cmd redcon.Command, pushFn l
 	ctx, cancel := context.WithTimeout(r.handlerContext(conn),
 		redisDispatchTimeout)
 	defer cancel()
-	readTS := r.readTS()
+	readTS, err := r.snapshotReadTS(r.handlerContext(conn))
+	if err != nil {
+		writeRedisError(conn, err)
+		return
+	}
 	typ, err := r.keyTypeAt(ctx, key, readTS)
 	if err != nil {
 		writeRedisError(conn, err)
@@ -977,7 +988,11 @@ func (r *RedisServer) lindex(conn redcon.Conn, cmd redcon.Command) {
 	ctx, cancel := context.WithTimeout(r.handlerContext(conn),
 		redisDispatchTimeout)
 	defer cancel()
-	readTS := r.readTS()
+	readTS, err := r.snapshotReadTS(r.handlerContext(conn))
+	if err != nil {
+		writeRedisError(conn, err)
+		return
+	}
 	typ, err := r.keyTypeAt(ctx, cmd.Args[1], readTS)
 	if err != nil {
 		writeRedisError(conn, err)

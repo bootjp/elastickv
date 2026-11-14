@@ -267,7 +267,7 @@ func (u *s3ChunkUploader) flushBatch() error {
 }
 
 func (u *s3ChunkUploader) flushOffloadedBatch() error {
-	readTimestamp, err := u.server.beginTxnReadTimestamp(u.ctx, u.server.readTS(), "s3 staged chunkrefs: begin read timestamp")
+	readTimestamp, err := u.server.beginTxnReadTimestamp(u.ctx, "s3 staged chunkrefs: begin read timestamp")
 	if err != nil {
 		return err
 	}
