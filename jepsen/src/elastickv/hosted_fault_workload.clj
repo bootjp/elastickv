@@ -1,7 +1,8 @@
 (ns elastickv.hosted-fault-workload
   "Three managed Docker nodes, deterministic faults, and checked recovery reads."
   (:gen-class)
-  (:require [elastickv.cli :as cli]
+  (:require [clojure.string :as str]
+            [elastickv.cli :as cli]
             [elastickv.redis-workload :as redis]
             [jepsen.checker :as checker]
             [jepsen.client :as client]
@@ -101,6 +102,7 @@
     (when-not (and (= 3 (count (set nodes))) (= 3 (count nodes))
                    (= 1 (count (:faults opts))) (contains? fault-ops fault)
                    (not (:local opts)) (not (:host opts))
+                   (not (seq (:raft-groups opts))) (not (:shard-ranges opts))
                    (pos? interval) (pos? recovery-time) (pos? key-count)
                    (pos? (:rate opts))
                    (pos? (:concurrency opts))
@@ -108,7 +110,9 @@
                    (> (:time-limit opts) minimum-time))
       (throw (ex-info "Require 3 managed nodes, one of partition/kill/pause, positive intervals and keys, concurrency divisible by 3, and time-limit > 7 * fault-interval"
                       {:options opts})))
-    (let [base (redis/elastickv-redis-test (assoc opts :key-count key-count))
+    (let [members (str/join "," (map #(str % "=" % ":" (or (:grpc-port opts) 50051)) nodes))
+          base (redis/elastickv-redis-test (assoc opts :key-count key-count
+                                                     :bootstrap-members members))
           workload (redis/elastickv-append-workload (assoc opts :key-count key-count))
           [_ stop] (fault-ops fault)]
       (assoc base

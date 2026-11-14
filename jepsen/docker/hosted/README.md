@@ -4,6 +4,8 @@ The `Jepsen Hosted Faults` workflow runs on Ubuntu GitHub-hosted runners. Each
 matrix job creates three SSH-managed database containers and a separate Jepsen
 control container on a dedicated Docker bridge. No ports are published. Only DB
 containers receive `NET_ADMIN`; none receive `SYS_TIME` or privileged mode.
+All three voters start with the same explicit `--raftBootstrapMembers` list;
+this suite tests a fixed single-group cluster rather than membership changes.
 
 The jobs exercise `partition`, `kill` (SIGKILL), and `pause` (SIGSTOP) separately.
 Each node is targeted once while the other two retain a quorum. Each injection
