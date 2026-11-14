@@ -50,7 +50,7 @@ concurrency:
 jobs:
   faults:
     name: Jepsen (${{ matrix.adapter }}, ${{ matrix.fault }})
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
