@@ -3,7 +3,8 @@
             [elastickv.cli :as cli]
             [elastickv.hosted-fault-workload :as hosted]
             [jepsen.checker :as checker]
-            [jepsen.generator :as gen]))
+            [jepsen.generator :as gen]
+            [jepsen.nemesis :as nemesis]))
 
 (def nodes ["n1" "n2" "n3"])
 
@@ -50,6 +51,14 @@
 (def opts
   {:nodes nodes :faults [:kill] :fault-interval 1 :time-limit 10
    :rate 5 :concurrency 6 :key-count 2 :recovery-time 1})
+
+(deftest only-the-requested-fault-nemesis-is-initialized
+  (doseq [fault [:partition :kill :pause]]
+    (let [test (hosted/hosted-fault-test (assoc opts :faults [fault]))]
+      (is (= (if (= :partition fault)
+               #{:start-partition :stop-partition}
+               #{:kill :start :pause :resume})
+             (set (nemesis/fs (:nemesis test))))))))
 
 (deftest final-reads-use-every-node-endpoint-and-every-key
   (let [test {:concurrency 6 :nodes nodes}

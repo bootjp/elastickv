@@ -7,6 +7,7 @@
             [jepsen.checker :as checker]
             [jepsen.client :as client]
             [jepsen.generator :as gen]
+            [jepsen.nemesis.combined :as combined]
             [jepsen.os :as os]))
 
 (def fault-ops
@@ -120,6 +121,12 @@
              ;; Images contain all dependencies. Debian OS setup manages system
              ;; services and /etc/hosts, which Docker owns on these nodes.
              :os os/noop
+             ;; combined/nemesis-package initializes clock and file-corruption
+             ;; nemeses even when their generators are disabled. Containers
+             ;; must never initialize those host-level failure mechanisms.
+             :nemesis (if (= :partition fault)
+                        (combined/partition-nemesis (:db base))
+                        (combined/db-nemesis (:db base)))
              :client (->ObservedClient (:client base) nil)
              :checker (checker/compose
                         {:consistency (:checker base)
