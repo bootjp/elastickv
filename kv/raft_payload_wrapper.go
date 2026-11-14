@@ -161,6 +161,24 @@ func (p *dynamicWrappedProposer) Propose(ctx context.Context, data []byte) (*raf
 	return res, nil
 }
 
+func (p *dynamicWrappedProposer) ProposeIfTerm(ctx context.Context, term uint64, data []byte) (*raftengine.ProposalResult, error) {
+	if err := p.beginUserPropose(); err != nil {
+		return nil, err
+	}
+	defer p.endUserPropose()
+
+	inner, ok := p.inner.(raftengine.TermFencedProposer)
+	if !ok {
+		return nil, raftengine.ErrStaleAdmissionTerm
+	}
+	wrapped, err := applyRaftPayloadWrap(p.currentWrap(), data)
+	if err != nil {
+		return nil, err
+	}
+	result, err := inner.ProposeIfTerm(ctx, term, wrapped)
+	return result, errors.Wrap(err, "kv: dynamic wrapped term-fenced propose")
+}
+
 // beginUserPropose increments the in-flight counter under
 // barrierMu, returning ErrEnvelopeCutoverInProgress if the barrier
 // is open. Returning the error without incrementing is intentional:

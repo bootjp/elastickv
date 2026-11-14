@@ -12,6 +12,51 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+type termRecordingProposer struct {
+	fakeProposer
+	term  uint64
+	calls int
+}
+
+func (p *termRecordingProposer) ProposeIfTerm(_ context.Context, term uint64, _ []byte) (*raftengine.ProposalResult, error) {
+	p.term = term
+	p.calls++
+	return nil, raftengine.ErrStaleAdmissionTerm
+}
+
+func TestApplyRequestsUsesTermFenceForBoundCreation(t *testing.T) {
+	t.Parallel()
+	request := &pb.Request{TimestampBindingOperationId: append([]byte{1}, make([]byte, 15)...),
+		TimestampBindingAdmissionTerm: 7}
+	proposer := &termRecordingProposer{}
+	_, _, err := applyRequests(t.Context(), proposer, []*pb.Request{request}, nil)
+	require.ErrorIs(t, err, raftengine.ErrStaleAdmissionTerm)
+	require.NotErrorIs(t, err, ErrTransactionOutcomeUnknown)
+	require.Equal(t, uint64(7), proposer.term)
+	require.Equal(t, 1, proposer.calls)
+	require.Zero(t, proposer.fakeProposer.calls.Load())
+
+	request.TimestampBindingAdmissionTerm = 0
+	_, _, err = applyRequests(t.Context(), proposer, []*pb.Request{request}, nil)
+	require.ErrorIs(t, err, raftengine.ErrStaleAdmissionTerm)
+	require.Equal(t, 1, proposer.calls)
+}
+
+func TestRawBatchKeepsBoundCreationSeparate(t *testing.T) {
+	t.Parallel()
+	bound := &pb.Request{TimestampBindingOperationId: append([]byte{1}, make([]byte, 15)...),
+		TimestampBindingAdmissionTerm: 7}
+	plain := &pb.Request{Mutations: []*pb.Mutation{{Key: []byte("plain")}}}
+	for _, reqs := range [][]*pb.Request{{bound, plain}, {plain, bound}} {
+		manager := &TransactionManager{rawPending: []*rawCommitItem{
+			{reqs: []*pb.Request{reqs[0]}},
+			{reqs: []*pb.Request{reqs[1]}},
+		}}
+		require.Len(t, manager.takeRawBatch(), 1)
+		require.Len(t, manager.takeRawBatch(), 1)
+	}
+}
+
 func TestApplyRequestsDoesNotCertifyFailedProposalAsAbort(t *testing.T) {
 	t.Parallel()
 

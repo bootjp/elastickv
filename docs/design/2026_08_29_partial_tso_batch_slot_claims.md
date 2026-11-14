@@ -185,20 +185,49 @@ Implementation order:
    creation in one indexed Raft entry, recompute the manifest digest on every
    replica, and skip an exact replay. A local lookup checks both indexes for
    unknown-outcome reconciliation. This branch adds an opt-in applied-leader
-   read barrier and a remote lookup RPC, but no production reconciliation
-   route is wired. Production admission rejects the new
+   read barrier and a remote lookup RPC. The lookup rejects a changed leader
+   term or expired peer session before returning, but no production
+   reconciliation route is wired. Production admission rejects the new
    operation-ID field until authenticated issuance and activation are wired.
    Before replicated activation, FSM apply ignores that field for single and
    batched entries so mixed-version replicas retain legacy apply semantics;
-   ingress still rejects newly bound requests.
+   ingress still rejects newly bound requests. A focused integration test now
+   carries native group-0 issuance through home preparation, atomic binding
+   and data apply, and exact-ID retry. An in-process pending-ID gate now
+   prevents concurrent or ambiguous retries from reissuing before the applied
+   binding is observed. The home lookup verifies a stable leader term before
+   and after its applied ReadIndex and lookup. Prepared requests now carry
+   that term, and the native Raft event loop rejects a stale term before
+   submitting the proposal. After a new-term applied barrier finds no binding,
+   the process-local pending gate can reissue; a delayed old-term request is
+   fenced even across process restart. This is not a production admission
+   capability: Forward still rejects bound requests, and all-member activation
+   and authenticated issuance remain required. A successful atomic data-group
+   apply now clears the matching process-local pending attempt; failed apply or
+   a different timestamp retains it. Unknown outcomes still require durable
+   reconciliation before production activation. The applied read barrier runs
+   outside the attempt mutex so Raft apply can finish and release a binding
+   while a retry waits for ReadIndex; the mutex still serializes issuance after
+   the barrier.
+   The integration test
+   uses a test issuer and method descriptor, not the production allocator and
+   registered method. It is not the production Forward path. Memory and Pebble
+   snapshot/restore tests now verify both binding indexes survive restore and
+   still reject conflicting operation IDs; a retention policy is not defined.
 2. Authenticated issuance and primary/home admission path, including unknown
    outcome reconciliation and cross-group PREPARE/COMMIT/ABORT evidence. This
-   branch adds a TLS-and-bearer-guarded group-0 issuance RPC and an opt-in
-   single-home raw binding preparation helper. Neither RPC is installed in
-   production: TLS plus a bearer token does not establish peer-session
-   identity, and no replicated all-member activation gate or stable public raw
-   operation ID exists yet. The helper therefore cannot authorize production
-   writes or serve as a substitute for primary/secondary evidence.
+   branch adds a versioned, physical-band-backed group-0 issuance RPC and an
+   opt-in single-home raw binding preparation helper. Protected-bootstrap
+   runtimes register issuance and home lookup as typed private peer-session
+   methods; TLS plus a bearer token alone is rejected. The authenticated
+   client checks the versioned response and has no legacy fallback. The
+   handler option and client route are not installed in production: no
+   replicated all-member activation gate exists yet. The public RawPut and
+   RawDelete messages now carry an optional caller-stable operation ID through
+   the operation group and raw request builders, but production validation
+   rejects ID-bearing writes before timestamp issuance until durable admission
+   is installed. The helper therefore cannot authorize production writes or
+   serve as a substitute for primary/secondary evidence.
 3. Physical-band group-0 reservation and versioned reservation response;
    prove no duplicate issuance across concurrent allocators, term changes,
    ambiguous proposals, and ceiling renewal. An opt-in local allocator now

@@ -606,8 +606,11 @@ type Request struct {
 	// timestamp source before proposing this field; replicas recompute the
 	// manifest digest from the request rather than trusting a supplied hash.
 	TimestampBindingOperationId []byte `protobuf:"bytes,9,opt,name=timestamp_binding_operation_id,json=timestampBindingOperationId,proto3" json:"timestamp_binding_operation_id,omitempty"`
-	unknownFields               protoimpl.UnknownFields
-	sizeCache                   protoimpl.SizeCache
+	// The leader term that prepared this binding. The proposer checks it in
+	// the Raft event loop before submitting the entry.
+	TimestampBindingAdmissionTerm uint64 `protobuf:"varint,10,opt,name=timestamp_binding_admission_term,json=timestampBindingAdmissionTerm,proto3" json:"timestamp_binding_admission_term,omitempty"`
+	unknownFields                 protoimpl.UnknownFields
+	sizeCache                     protoimpl.SizeCache
 }
 
 func (x *Request) Reset() {
@@ -701,6 +704,13 @@ func (x *Request) GetTimestampBindingOperationId() []byte {
 		return x.TimestampBindingOperationId
 	}
 	return nil
+}
+
+func (x *Request) GetTimestampBindingAdmissionTerm() uint64 {
+	if x != nil {
+		return x.TimestampBindingAdmissionTerm
+	}
+	return 0
 }
 
 type RaftCommand struct {
@@ -3078,10 +3088,13 @@ func (x *IssueMigrationTimestampResponse) GetLastCommitTs() uint64 {
 }
 
 type IssueBoundTimestampRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	MinTimestamp  uint64                 `protobuf:"varint,1,opt,name=min_timestamp,json=minTimestamp,proto3" json:"min_timestamp,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	MinTimestamp uint64                 `protobuf:"varint,1,opt,name=min_timestamp,json=minTimestamp,proto3" json:"min_timestamp,omitempty"`
+	// Version 1 requires a committed physical-band issuance. An old server
+	// ignores this field and returns version zero, which callers must reject.
+	PhysicalBandProtocolVersion uint32 `protobuf:"varint,2,opt,name=physical_band_protocol_version,json=physicalBandProtocolVersion,proto3" json:"physical_band_protocol_version,omitempty"`
+	unknownFields               protoimpl.UnknownFields
+	sizeCache                   protoimpl.SizeCache
 }
 
 func (x *IssueBoundTimestampRequest) Reset() {
@@ -3121,11 +3134,21 @@ func (x *IssueBoundTimestampRequest) GetMinTimestamp() uint64 {
 	return 0
 }
 
+func (x *IssueBoundTimestampRequest) GetPhysicalBandProtocolVersion() uint32 {
+	if x != nil {
+		return x.PhysicalBandProtocolVersion
+	}
+	return 0
+}
+
 type IssueBoundTimestampResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Timestamp     uint64                 `protobuf:"varint,1,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state                       protoimpl.MessageState `protogen:"open.v1"`
+	Timestamp                   uint64                 `protobuf:"varint,1,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	PhysicalBandProtocolVersion uint32                 `protobuf:"varint,2,opt,name=physical_band_protocol_version,json=physicalBandProtocolVersion,proto3" json:"physical_band_protocol_version,omitempty"`
+	CommittedBandEnd            uint64                 `protobuf:"varint,3,opt,name=committed_band_end,json=committedBandEnd,proto3" json:"committed_band_end,omitempty"`
+	PreviousIssuedCursor        uint64                 `protobuf:"varint,4,opt,name=previous_issued_cursor,json=previousIssuedCursor,proto3" json:"previous_issued_cursor,omitempty"`
+	unknownFields               protoimpl.UnknownFields
+	sizeCache                   protoimpl.SizeCache
 }
 
 func (x *IssueBoundTimestampResponse) Reset() {
@@ -3161,6 +3184,27 @@ func (*IssueBoundTimestampResponse) Descriptor() ([]byte, []int) {
 func (x *IssueBoundTimestampResponse) GetTimestamp() uint64 {
 	if x != nil {
 		return x.Timestamp
+	}
+	return 0
+}
+
+func (x *IssueBoundTimestampResponse) GetPhysicalBandProtocolVersion() uint32 {
+	if x != nil {
+		return x.PhysicalBandProtocolVersion
+	}
+	return 0
+}
+
+func (x *IssueBoundTimestampResponse) GetCommittedBandEnd() uint64 {
+	if x != nil {
+		return x.CommittedBandEnd
+	}
+	return 0
+}
+
+func (x *IssueBoundTimestampResponse) GetPreviousIssuedCursor() uint64 {
+	if x != nil {
+		return x.PreviousIssuedCursor
 	}
 	return 0
 }
@@ -3303,7 +3347,7 @@ const file_internal_proto_rawDesc = "" +
 	"\x03key\x18\x02 \x01(\fR\x03key\x12\x14\n" +
 	"\x05value\x18\x03 \x01(\fR\x05value\x123\n" +
 	"\x16commit_ts_value_offset\x18\x04 \x01(\x04R\x13commitTsValueOffset\x12%\n" +
-	"\x0erequire_absent\x18\x05 \x01(\bR\rrequireAbsent\"\x82\x03\n" +
+	"\x0erequire_absent\x18\x05 \x01(\bR\rrequireAbsent\"\xcb\x03\n" +
 	"\aRequest\x12\x15\n" +
 	"\x06is_txn\x18\x01 \x01(\bR\x05isTxn\x12\x1c\n" +
 	"\x05phase\x18\x02 \x01(\x0e2\x06.PhaseR\x05phase\x12\x0e\n" +
@@ -3313,7 +3357,9 @@ const file_internal_proto_rawDesc = "" +
 	"\x16observed_route_version\x18\x06 \x01(\x04R\x14observedRouteVersion\x125\n" +
 	"\x17write_fence_bypass_keys\x18\a \x03(\fR\x14writeFenceBypassKeys\x12:\n" +
 	"\x19timestamp_admission_floor\x18\b \x01(\x04R\x17timestampAdmissionFloor\x12C\n" +
-	"\x1etimestamp_binding_operation_id\x18\t \x01(\fR\x1btimestampBindingOperationId\"3\n" +
+	"\x1etimestamp_binding_operation_id\x18\t \x01(\fR\x1btimestampBindingOperationId\x12G\n" +
+	" timestamp_binding_admission_term\x18\n" +
+	" \x01(\x04R\x1dtimestampBindingAdmissionTerm\"3\n" +
 	"\vRaftCommand\x12$\n" +
 	"\brequests\x18\x01 \x03(\v2\b.RequestR\brequests\"M\n" +
 	"\x0eForwardRequest\x12\x15\n" +
@@ -3527,11 +3573,15 @@ const file_internal_proto_rawDesc = "" +
 	"\x1eIssueMigrationTimestampRequest\"e\n" +
 	"\x1fIssueMigrationTimestampResponse\x12\x1c\n" +
 	"\ttimestamp\x18\x01 \x01(\x04R\ttimestamp\x12$\n" +
-	"\x0elast_commit_ts\x18\x02 \x01(\x04R\flastCommitTs\"A\n" +
+	"\x0elast_commit_ts\x18\x02 \x01(\x04R\flastCommitTs\"\x86\x01\n" +
 	"\x1aIssueBoundTimestampRequest\x12#\n" +
-	"\rmin_timestamp\x18\x01 \x01(\x04R\fminTimestamp\";\n" +
+	"\rmin_timestamp\x18\x01 \x01(\x04R\fminTimestamp\x12C\n" +
+	"\x1ephysical_band_protocol_version\x18\x02 \x01(\rR\x1bphysicalBandProtocolVersion\"\xe4\x01\n" +
 	"\x1bIssueBoundTimestampResponse\x12\x1c\n" +
-	"\ttimestamp\x18\x01 \x01(\x04R\ttimestamp\"B\n" +
+	"\ttimestamp\x18\x01 \x01(\x04R\ttimestamp\x12C\n" +
+	"\x1ephysical_band_protocol_version\x18\x02 \x01(\rR\x1bphysicalBandProtocolVersion\x12,\n" +
+	"\x12committed_band_end\x18\x03 \x01(\x04R\x10committedBandEnd\x124\n" +
+	"\x16previous_issued_cursor\x18\x04 \x01(\x04R\x14previousIssuedCursor\"B\n" +
 	"\x1dLookupTimestampBindingRequest\x12!\n" +
 	"\foperation_id\x18\x01 \x01(\fR\voperationId\"\xd7\x01\n" +
 	"\x1eLookupTimestampBindingResponse\x12\x14\n" +

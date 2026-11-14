@@ -34,7 +34,8 @@ func newBootstrapStartupForGroup(config *BootstrapPeerConfig, files *raftbootstr
 			Local: config.Local, Provisioned: config.Provisions, Versions: intent.Minimum,
 			PublicMethods: publicMethods,
 			MethodFactory: func(owner *peersession.Owner) ([]peersession.Method, error) {
-				return append(etcd.PeerSessionMethodsForOwner(cfg.GroupID, owner), BootstrapSharedGRPCMethods(cfg.GroupID)...), nil
+				methods := append(etcd.PeerSessionMethodsForOwner(cfg.GroupID, owner), BootstrapSharedGRPCMethods(cfg.GroupID)...)
+				return append(methods, TimestampAdmissionPeerMethods(cfg.GroupID)...), nil
 			},
 		})
 		if err != nil {

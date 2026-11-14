@@ -1076,7 +1076,7 @@ func (c *ShardedCoordinator) dispatchAdmitted(ctx context.Context, reqs *Operati
 		ctx = context.Background()
 	}
 
-	if err := validateOperationGroup(reqs); err != nil {
+	if err := validateOperationGroupForDispatch(reqs); err != nil {
 		return nil, err
 	}
 
@@ -3455,6 +3455,16 @@ func maxStagedVisibilityLatestCommitTS(liveTS uint64, liveExists bool, stagedTS 
 
 var _ Coordinator = (*ShardedCoordinator)(nil)
 
+func validateOperationGroupForDispatch(reqs *OperationGroup[OP]) error {
+	if err := validateOperationGroup(reqs); err != nil {
+		return err
+	}
+	if len(reqs.OperationID) != 0 {
+		return ErrTimestampBindingInvalid
+	}
+	return nil
+}
+
 func validateOperationGroup(reqs *OperationGroup[OP]) error {
 	if reqs == nil || len(reqs.Elems) == 0 {
 		return ErrInvalidRequest
@@ -3514,12 +3524,13 @@ func (c *ShardedCoordinator) rawLogsWithGroups(ctx context.Context, reqs *Operat
 			}
 		}
 		logs = append(logs, &pb.Request{
-			IsTxn:                false,
-			Phase:                pb.Phase_NONE,
-			Ts:                   ts,
-			Mutations:            muts,
-			ObservedRouteVersion: reqs.ObservedRouteVersion,
-			WriteFenceBypassKeys: bypassKeysByGroup[gid],
+			IsTxn:                       false,
+			Phase:                       pb.Phase_NONE,
+			Ts:                          ts,
+			Mutations:                   muts,
+			TimestampBindingOperationId: append([]byte(nil), reqs.OperationID...),
+			ObservedRouteVersion:        reqs.ObservedRouteVersion,
+			WriteFenceBypassKeys:        bypassKeysByGroup[gid],
 		})
 	}
 	return logs, gids, nil

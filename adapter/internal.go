@@ -176,7 +176,7 @@ type Internal struct {
 	transactionManager              kv.Transactional
 	clock                           *kv.HLC
 	tsAllocator                     kv.TimestampAllocator
-	timestampAdmissionIssuer        kv.TimestampAfterAllocator
+	timestampAdmissionIssuer        kv.TSOPhysicalBandAllocator
 	timestampAdmissionToken         string
 	adminProposer                   raftengine.Proposer
 	bootstrapPolicyProposer         raftengine.Proposer

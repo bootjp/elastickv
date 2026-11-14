@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/peersession"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
@@ -25,10 +26,9 @@ func rejectUnactivatedBoundForward(requests []*pb.Request) error {
 	return nil
 }
 
-// WithInternalTimestampAdmission supplies TLS-and-bearer RPC credentials for
-// tests and future rollout wiring. It does not authenticate a peer identity.
-// Production leaves this option unset until identity and replica gates exist.
-func WithInternalTimestampAdmission(token string, issuer kv.TimestampAfterAllocator) InternalOption {
+// WithInternalTimestampAdmission installs the opt-in issuer and lookup service.
+// Production leaves it unset until peer-method registration and replica gates exist.
+func WithInternalTimestampAdmission(token string, issuer kv.TSOPhysicalBandAllocator) InternalOption {
 	return func(i *Internal) {
 		i.timestampAdmissionToken = token
 		i.timestampAdmissionIssuer = issuer
@@ -55,21 +55,35 @@ func (i *Internal) IssueBoundTimestamp(ctx context.Context, req *pb.IssueBoundTi
 	if err := i.leader.VerifyLeader(ctx); err != nil {
 		return nil, errors.Wrap(err, "verify group-0 issuer")
 	}
-	ts, err := i.timestampAdmissionIssuer.NextAfter(ctx, req.GetMinTimestamp())
+	reservation, err := i.timestampAdmissionIssuer.ReservePhysicalBandAfter(ctx, 1, req.GetMinTimestamp())
 	if err != nil {
 		return nil, errors.Wrap(err, "issue bound timestamp")
 	}
-	if ts == 0 || ts <= req.GetMinTimestamp() || i.leader.State() != raftengine.StateLeader {
+	ts := reservation.Base
+	if !validBoundTimestampBand(ts, req.GetMinTimestamp(), reservation.CommittedBandEnd, reservation.PreviousIssuedCursor) ||
+		reservation.Count != 1 ||
+		i.leader.State() != raftengine.StateLeader {
 		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "TSO issuance lost its leader fence"))
 	}
-	return &pb.IssueBoundTimestampResponse{Timestamp: ts}, nil
+	if err := peersession.CapturedReceipt(ctx).Check(ctx); err != nil {
+		return nil, errors.WithStack(status.Error(codes.PermissionDenied, "timestamp issuance lost its peer session"))
+	}
+	return &pb.IssueBoundTimestampResponse{Timestamp: ts,
+		PhysicalBandProtocolVersion: kv.TSOPhysicalBandProtocolVersion,
+		CommittedBandEnd:            reservation.CommittedBandEnd,
+		PreviousIssuedCursor:        reservation.PreviousIssuedCursor}, nil
 }
 
 func (i *Internal) checkBoundTimestampIssuer(ctx context.Context, req *pb.IssueBoundTimestampRequest) error {
 	if err := i.authorizeTimestampAdmission(ctx); err != nil {
 		return err
 	}
-	if req == nil || !i.kvForwardRejected || i.timestampAdmissionIssuer == nil {
+	receipt := peersession.CapturedReceipt(ctx)
+	if !validTimestampAdmissionSession(ctx, receipt, true) {
+		return errors.WithStack(status.Error(codes.PermissionDenied, "timestamp issuance requires a group-0 peer session"))
+	}
+	if req == nil || req.GetPhysicalBandProtocolVersion() != kv.TSOPhysicalBandProtocolVersion ||
+		!i.kvForwardRejected || i.timestampAdmissionIssuer == nil {
 		return errors.WithStack(status.Error(codes.FailedPrecondition, "dedicated TSO issuance is unavailable"))
 	}
 	if i.leader == nil || i.leader.State() != raftengine.StateLeader {
@@ -83,11 +97,22 @@ func (i *Internal) LookupTimestampBinding(ctx context.Context, req *pb.LookupTim
 	if err != nil {
 		return nil, err
 	}
+	statusReader, ok := i.leader.(raftengine.StatusReader)
+	if !ok {
+		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "home-group term is unavailable"))
+	}
+	term := statusReader.Status().Term
+	if term == 0 {
+		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "home-group term is unavailable"))
+	}
 	ctx, cancel := context.WithTimeout(ctx, timestampBindingPeerBudget)
 	defer cancel()
 	index, err := i.leader.LinearizableRead(ctx)
 	if err != nil {
 		return nil, errors.Wrap(err, "read home-group binding barrier")
+	}
+	if err := checkHomeBindingLookupFence(ctx, statusReader, term); err != nil {
+		return nil, err
 	}
 	binding, found, err := kv.LookupTimestampBinding(ctx, metadata, operationID)
 	if err != nil {
@@ -96,8 +121,8 @@ func (i *Internal) LookupTimestampBinding(ctx context.Context, req *pb.LookupTim
 	if err := ctx.Err(); err != nil {
 		return nil, errors.WithStack(err)
 	}
-	if i.leader.State() != raftengine.StateLeader {
-		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "home-group leadership changed"))
+	if err := checkHomeBindingLookupFence(ctx, statusReader, term); err != nil {
+		return nil, err
 	}
 	response := &pb.LookupTimestampBindingResponse{Found: found, AppliedIndex: index}
 	if found {
@@ -109,10 +134,25 @@ func (i *Internal) LookupTimestampBinding(ctx context.Context, req *pb.LookupTim
 	return response, nil
 }
 
+func checkHomeBindingLookupFence(ctx context.Context, reader raftengine.StatusReader, term uint64) error {
+	current := reader.Status()
+	if current.State != raftengine.StateLeader || current.Term != term {
+		return errors.WithStack(status.Error(codes.FailedPrecondition, "home-group leadership changed"))
+	}
+	if err := peersession.CapturedReceipt(ctx).Check(ctx); err != nil {
+		return errors.WithStack(status.Error(codes.PermissionDenied, "home binding lookup lost its peer session"))
+	}
+	return nil
+}
+
 func (i *Internal) homeBindingLookupInputs(ctx context.Context, req *pb.LookupTimestampBindingRequest) (store.RaftControlMetadataStore, [16]byte, error) {
 	var operationID [16]byte
 	if err := i.authorizeTimestampAdmission(ctx); err != nil {
 		return nil, operationID, err
+	}
+	receipt := peersession.CapturedReceipt(ctx)
+	if !validTimestampAdmissionSession(ctx, receipt, false) {
+		return nil, operationID, errors.WithStack(status.Error(codes.PermissionDenied, "home binding lookup requires a data-group peer session"))
 	}
 	if req == nil || len(req.GetOperationId()) != len(operationID) || i.kvForwardRejected {
 		return nil, operationID, errors.WithStack(status.Error(codes.InvalidArgument, "data-group operation ID is required"))
@@ -123,4 +163,9 @@ func (i *Internal) homeBindingLookupInputs(ctx context.Context, req *pb.LookupTi
 	}
 	copy(operationID[:], req.GetOperationId())
 	return metadata, operationID, nil
+}
+
+func validTimestampAdmissionSession(ctx context.Context, receipt *peersession.Receipt, groupZero bool) bool {
+	return receipt != nil && receipt.Message().Traffic == peersession.Control &&
+		(receipt.Message().Group == 0) == groupZero && receipt.Check(ctx) == nil
 }

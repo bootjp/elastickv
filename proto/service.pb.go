@@ -77,9 +77,11 @@ func (RaftAdminState) EnumDescriptor() ([]byte, []int) {
 }
 
 type RawPutRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Key           []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
-	Value         []byte                 `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Key   []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	Value []byte                 `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
+	// Stable across retries of the same write; reserved for Phase-D admission.
+	OperationId   []byte `protobuf:"bytes,3,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -124,6 +126,13 @@ func (x *RawPutRequest) GetKey() []byte {
 func (x *RawPutRequest) GetValue() []byte {
 	if x != nil {
 		return x.Value
+	}
+	return nil
+}
+
+func (x *RawPutRequest) GetOperationId() []byte {
+	if x != nil {
+		return x.OperationId
 	}
 	return nil
 }
@@ -309,8 +318,10 @@ func (x *RawGetResponse) GetExists() bool {
 }
 
 type RawDeleteRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Key           []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Key   []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	// Stable across retries of the same write; reserved for Phase-D admission.
+	OperationId   []byte `protobuf:"bytes,2,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -348,6 +359,13 @@ func (*RawDeleteRequest) Descriptor() ([]byte, []int) {
 func (x *RawDeleteRequest) GetKey() []byte {
 	if x != nil {
 		return x.Key
+	}
+	return nil
+}
+
+func (x *RawDeleteRequest) GetOperationId() []byte {
+	if x != nil {
+		return x.OperationId
 	}
 	return nil
 }
@@ -2641,10 +2659,11 @@ var File_service_proto protoreflect.FileDescriptor
 
 const file_service_proto_rawDesc = "" +
 	"\n" +
-	"\rservice.proto\"7\n" +
+	"\rservice.proto\"Z\n" +
 	"\rRawPutRequest\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\fR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\fR\x05value\"M\n" +
+	"\x05value\x18\x02 \x01(\fR\x05value\x12!\n" +
+	"\foperation_id\x18\x03 \x01(\fR\voperationId\"M\n" +
 	"\x0eRawPutResponse\x12!\n" +
 	"\fcommit_index\x18\x01 \x01(\x04R\vcommitIndex\x12\x18\n" +
 	"\asuccess\x18\x02 \x01(\bR\asuccess\"z\n" +
@@ -2656,9 +2675,10 @@ const file_service_proto_rawDesc = "" +
 	"\x0eRawGetResponse\x12\"\n" +
 	"\rread_at_index\x18\x01 \x01(\x04R\vreadAtIndex\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\fR\x05value\x12\x16\n" +
-	"\x06exists\x18\x03 \x01(\bR\x06exists\"$\n" +
+	"\x06exists\x18\x03 \x01(\bR\x06exists\"G\n" +
 	"\x10RawDeleteRequest\x12\x10\n" +
-	"\x03key\x18\x01 \x01(\fR\x03key\"P\n" +
+	"\x03key\x18\x01 \x01(\fR\x03key\x12!\n" +
+	"\foperation_id\x18\x02 \x01(\fR\voperationId\"P\n" +
 	"\x11RawDeleteResponse\x12!\n" +
 	"\fcommit_index\x18\x01 \x01(\x04R\vcommitIndex\x12\x18\n" +
 	"\asuccess\x18\x02 \x01(\bR\asuccess\"\xf4\x01\n" +

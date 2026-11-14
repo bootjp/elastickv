@@ -91,6 +91,9 @@ message Request {
   // timestamp source before proposing this field; replicas recompute the
   // manifest digest from the request rather than trusting a supplied hash.
   bytes timestamp_binding_operation_id = 9;
+  // The leader term that prepared this binding. The proposer checks it in
+  // the Raft event loop before submitting the entry.
+  uint64 timestamp_binding_admission_term = 10;
 }
 
 message RaftCommand {
@@ -432,10 +435,16 @@ message IssueMigrationTimestampResponse {
 
 message IssueBoundTimestampRequest {
   uint64 min_timestamp = 1;
+  // Version 1 requires a committed physical-band issuance. An old server
+  // ignores this field and returns version zero, which callers must reject.
+  uint32 physical_band_protocol_version = 2;
 }
 
 message IssueBoundTimestampResponse {
   uint64 timestamp = 1;
+  uint32 physical_band_protocol_version = 2;
+  uint64 committed_band_end = 3;
+  uint64 previous_issued_cursor = 4;
 }
 
 message LookupTimestampBindingRequest {
