@@ -128,7 +128,9 @@
   (is (workload/read-retryable-error? (java.io.EOFException.)))
   (is (workload/read-retryable-error? (NumberFormatException. "x")))
   (is (not (workload/read-retryable-error? (ex-info "mount unavailable: /mnt/fs" {}))))
-  (is (not (workload/read-retryable-error? (java.io.FileNotFoundException. "reg-1 (Transport endpoint is not connected)")))))
+  (is (not (workload/read-retryable-error? (java.io.FileNotFoundException. "reg-1 (Transport endpoint is not connected)"))))
+  (is (workload/final-read-observation-retry? true (java.io.FileNotFoundException. "reg-1 (Device or resource busy)")))
+  (is (not (workload/final-read-observation-retry? false (java.io.FileNotFoundException. "reg-1 (Device or resource busy)")))))
 
 (deftest final-read-retries-after-32-transient-conflicts
   (let [dir (scratch-dir)]
@@ -147,6 +149,26 @@
             (is (= :ok (:type result)))
             (is (= (independent/tuple 0 7) (:value result)))
             (is (= 33 @attempts)))))
+      (finally
+        (delete-tree! dir)))))
+
+(deftest final-read-retries-open-failures
+  (let [dir (scratch-dir)]
+    (try
+      (workload/local-setup! dir [0])
+      (let [attempts (atom 0)
+            op {:type :invoke :f :read :value (independent/tuple 0 nil) :final true}]
+        (with-redefs [workload/local-read
+                      (fn [_]
+                        (if (<= (swap! attempts inc) 3)
+                          (throw (java.io.FileNotFoundException. "reg-0 (Device or resource busy)"))
+                          7))]
+          (let [result (workload/invoke-read!
+                         {:local? true :mount-dir dir :max-retries 8 :require-fuse-mount false}
+                         {} "n1" op 0)]
+            (is (= :ok (:type result)))
+            (is (= (independent/tuple 0 7) (:value result)))
+            (is (= 4 @attempts)))))
       (finally
         (delete-tree! dir)))))
 
@@ -639,9 +661,15 @@
             (let [r (read 1)]
               (is (= (independent/tuple 1 workload/initial-value) (:value r)))
               (is (= 2 @calls)))))
-        ;; A read that could not be performed stays a :fail.
-        (with-redefs [workload/local-read (fn [_] (throw (java.io.FileNotFoundException. (str path " (Transport endpoint is not connected)"))))]
-          (is (= :fail (:type (read 0)))))
+        ;; A persistent local open failure remains unobserved after the bounded
+        ;; final-read window, even though its initial error was re-observed.
+        (let [calls (atom 0)]
+          (with-redefs [workload/local-read (fn [_]
+                                              (swap! calls inc)
+                                              (throw (java.io.FileNotFoundException.
+                                                       (str path " (Transport endpoint is not connected)"))))]
+            (is (= :fail (:type (read 0))))
+            (is (= workload/final-read-min-retries @calls))))
         ;; Without the workload directory (bare directory after an unmount)
         ;; the ENOENT says nothing about the register.
         (delete-tree! (workload/workload-dir dir))

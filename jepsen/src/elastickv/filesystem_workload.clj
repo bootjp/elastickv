@@ -170,6 +170,14 @@
   (or (retryable-error? e)
       (some? (data-loss-kind e))))
 
+(defn final-read-observation-retry?
+  "Repeat a quiescent read after a local open failure. RandomAccessFile maps
+   several distinct FUSE errnos to FileNotFoundException, so this does not
+   classify the error as transient. A persistent failure stays unobserved."
+  [local? ^Throwable e]
+  (or (read-retryable-error? e)
+      (and local? (instance? FileNotFoundException e))))
+
 (defn with-retries
   "Calls (f) up to max-retries times while it throws an error accepted by
    retry? (retryable-error? by default), sleeping retry-backoff-ms between
@@ -522,7 +530,9 @@
     (let [attempts (if (:final op)
                      (max max-retries final-read-min-retries)
                      max-retries)
-          v (with-retries attempts read-retryable-error?
+          v (with-retries attempts (if (:final op)
+                                     #(final-read-observation-retry? local? %)
+                                     read-retryable-error?)
               (fn []
                 (if local?
                   (do (require-local-mount! mount-dir require-fuse-mount)
