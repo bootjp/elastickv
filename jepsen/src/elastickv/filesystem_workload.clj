@@ -170,13 +170,13 @@
   (or (retryable-error? e)
       (some? (data-loss-kind e))))
 
-(defn final-read-retryable-error?
-  "A final local open may report transient FUSE errors as FileNotFoundException,
-   without exposing a typed errno. Final reads can retry every open failure
-   because they cannot replay a mutation; persistent failures remain unknown."
-  [^Throwable e]
+(defn final-read-observation-retry?
+  "Repeat a quiescent read after a local open failure. RandomAccessFile maps
+   several distinct FUSE errnos to FileNotFoundException, so this does not
+   classify the error as transient. A persistent failure stays unobserved."
+  [local? ^Throwable e]
   (or (read-retryable-error? e)
-      (instance? FileNotFoundException e)))
+      (and local? (instance? FileNotFoundException e))))
 
 (defn with-retries
   "Calls (f) up to max-retries times while it throws an error accepted by
@@ -531,7 +531,7 @@
                      (max max-retries final-read-min-retries)
                      max-retries)
           v (with-retries attempts (if (:final op)
-                                     final-read-retryable-error?
+                                     #(final-read-observation-retry? local? %)
                                      read-retryable-error?)
               (fn []
                 (if local?

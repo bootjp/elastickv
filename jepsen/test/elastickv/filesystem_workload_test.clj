@@ -128,7 +128,9 @@
   (is (workload/read-retryable-error? (java.io.EOFException.)))
   (is (workload/read-retryable-error? (NumberFormatException. "x")))
   (is (not (workload/read-retryable-error? (ex-info "mount unavailable: /mnt/fs" {}))))
-  (is (not (workload/read-retryable-error? (java.io.FileNotFoundException. "reg-1 (Transport endpoint is not connected)")))))
+  (is (not (workload/read-retryable-error? (java.io.FileNotFoundException. "reg-1 (Transport endpoint is not connected)"))))
+  (is (workload/final-read-observation-retry? true (java.io.FileNotFoundException. "reg-1 (Device or resource busy)")))
+  (is (not (workload/final-read-observation-retry? false (java.io.FileNotFoundException. "reg-1 (Device or resource busy)")))))
 
 (deftest final-read-retries-after-32-transient-conflicts
   (let [dir (scratch-dir)]
@@ -659,9 +661,15 @@
             (let [r (read 1)]
               (is (= (independent/tuple 1 workload/initial-value) (:value r)))
               (is (= 2 @calls)))))
-        ;; A read that could not be performed stays a :fail.
-        (with-redefs [workload/local-read (fn [_] (throw (java.io.FileNotFoundException. (str path " (Transport endpoint is not connected)"))))]
-          (is (= :fail (:type (read 0)))))
+        ;; A persistent local open failure remains unobserved after the bounded
+        ;; final-read window, even though its initial error was re-observed.
+        (let [calls (atom 0)]
+          (with-redefs [workload/local-read (fn [_]
+                                              (swap! calls inc)
+                                              (throw (java.io.FileNotFoundException.
+                                                       (str path " (Transport endpoint is not connected)"))))]
+            (is (= :fail (:type (read 0))))
+            (is (= workload/final-read-min-retries @calls))))
         ;; Without the workload directory (bare directory after an unmount)
         ;; the ENOENT says nothing about the register.
         (delete-tree! (workload/workload-dir dir))
