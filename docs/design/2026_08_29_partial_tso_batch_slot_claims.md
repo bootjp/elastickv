@@ -205,7 +205,10 @@ Implementation order:
    and authenticated issuance remain required. A successful atomic data-group
    apply now clears the matching process-local pending attempt; failed apply or
    a different timestamp retains it. Unknown outcomes still require durable
-   reconciliation before production activation.
+   reconciliation before production activation. The applied read barrier runs
+   outside the attempt mutex so Raft apply can finish and release a binding
+   while a retry waits for ReadIndex; the mutex still serializes issuance after
+   the barrier.
    The integration test
    uses a test issuer and method descriptor, not the production allocator and
    registered method. It is not the production Forward path. Memory and Pebble

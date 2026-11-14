@@ -61,8 +61,6 @@ func PrepareHomeRawTimestampBinding(
 	if !ok {
 		return nil, errors.WithStack(ErrTimestampBindingInvalid)
 	}
-	attempt.mu.Lock()
-	defer attempt.mu.Unlock()
 	bound, found, term, err := readHomeBinding(ctx, leader, metadata, operationID)
 	if err != nil {
 		return nil, err
@@ -71,7 +69,9 @@ func PrepareHomeRawTimestampBinding(
 	if found {
 		return prepareExistingHomeRawBinding(owned, bound, operationID, term)
 	}
-	if err := attempt.reserve(term); err != nil {
+	attempt.mu.Lock()
+	defer attempt.mu.Unlock()
+	if err := attempt.reserve(term, leader); err != nil {
 		return nil, err
 	}
 	// An issue error may mean the timestamp was already handed to a proposer.
@@ -92,7 +92,10 @@ func PrepareHomeRawTimestampBinding(
 	return owned, nil
 }
 
-func (a *homeBindingAttempt) reserve(term uint64) error {
+func (a *homeBindingAttempt) reserve(term uint64, leader raftengine.LeaderView) error {
+	if homeBindingLeaderTerm(leader) != term {
+		return errors.WithStack(ErrLeaderNotFound)
+	}
 	if a.pending && term <= a.term {
 		return errors.WithStack(ErrTimestampBindingPending)
 	}

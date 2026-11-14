@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
 	pb "github.com/bootjp/elastickv/proto"
@@ -18,6 +19,8 @@ type homeBindingLeader struct {
 	lostRead          bool
 	term              uint64
 	advanceTermOnRead bool
+	readEntered       chan struct{}
+	readRelease       <-chan struct{}
 }
 
 func (l *homeBindingLeader) State() raftengine.State {
@@ -38,8 +41,16 @@ func (l *homeBindingLeader) Status() raftengine.Status {
 func (l *homeBindingLeader) VerifyLeader(context.Context) error {
 	return nil
 }
-func (l *homeBindingLeader) LinearizableRead(context.Context) (uint64, error) {
+func (l *homeBindingLeader) LinearizableRead(ctx context.Context) (uint64, error) {
 	l.reads++
+	if l.readEntered != nil {
+		close(l.readEntered)
+		select {
+		case <-l.readRelease:
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+	}
 	if l.advanceTermOnRead {
 		l.term++
 	}
@@ -234,6 +245,53 @@ func TestHomeBindingAttemptClearedOnlyAfterAtomicApply(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, prepared.Ts, retry.Ts)
 	require.Equal(t, 1, issues)
+}
+
+func TestHomeBindingApplyDoesNotWaitForAdmissionMutex(t *testing.T) {
+	st := store.NewMVCCStore()
+	metadata, ok := st.(store.RaftControlMetadataStore)
+	require.True(t, ok)
+	request := &pb.Request{TimestampBindingOperationId: append([]byte{12}, make([]byte, 15)...),
+		Mutations: []*pb.Mutation{{Key: []byte("key"), Value: []byte("value")}}}
+	clearHomeBindingAttemptAfterTest(t, request)
+	leader := &homeBindingLeader{}
+	prepared, err := PrepareHomeRawTimestampBinding(t.Context(), leader, metadata,
+		func(context.Context) (uint64, error) { return 42, nil }, request)
+	require.NoError(t, err)
+	binding, err := timestampBindingForCreationRequest(prepared)
+	require.NoError(t, err)
+	leader.readEntered = make(chan struct{})
+	release := make(chan struct{})
+	leader.readRelease = release
+	retryDone := make(chan error, 1)
+	go func() {
+		_, retryErr := PrepareHomeRawTimestampBinding(t.Context(), leader, metadata,
+			func(context.Context) (uint64, error) { return 43, nil }, request)
+		retryDone <- retryErr
+	}()
+	select {
+	case <-leader.readEntered:
+	case <-time.After(time.Second):
+		t.Fatal("retry did not enter its read barrier")
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, applyErr := ApplyTimestampBoundCreation(t.Context(), st, 1, binding, func(context.Context) error { return nil })
+		done <- applyErr
+	}()
+	var completed bool
+	select {
+	case err = <-done:
+		completed = true
+	case <-time.After(time.Second):
+	}
+	close(release)
+	if !completed {
+		err = <-done
+	}
+	require.NoError(t, err)
+	require.True(t, completed, "Raft apply must not wait for admission's read-barrier mutex")
+	require.NoError(t, <-retryDone)
 }
 
 func TestPrepareHomeRawTimestampBindingReissuesAfterNewTermBarrier(t *testing.T) {
