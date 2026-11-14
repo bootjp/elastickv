@@ -1020,7 +1020,11 @@ func (r *RedisServer) zrange(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) zrangeRead(conn redcon.Conn, key []byte, start, stop int, opts zrangeOptions) {
-	readTS := r.readTS()
+	readTS, err := r.snapshotReadTS(r.handlerContext(conn))
+	if err != nil {
+		writeRedisError(conn, err)
+		return
+	}
 	typ, err := r.keyTypeAtExpect(r.handlerContext(conn),
 		key, readTS, redisTypeZSet)
 	if err != nil {

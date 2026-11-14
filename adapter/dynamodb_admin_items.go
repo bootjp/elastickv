@@ -183,7 +183,15 @@ func (d *DynamoDBServer) AdminScanTable(ctx context.Context, principal AdminPrin
 	// generate write load on every dashboard poll until the migration
 	// finishes (Codex r1 P1 on PR #805). Operators migrate the table
 	// via the SigV4 surface before admin reads become available.
-	readTS := d.nextTxnReadTS()
+	stamp, err := d.beginTxnReadTimestamp(ctx, "dynamodb admin read", dynamoTableMetaKey(tableName))
+	if err != nil {
+		return AdminScanResult{}, err
+	}
+	readTS := stamp.Timestamp()
+	return d.adminScanTableAt(ctx, tableName, opts, readTS)
+}
+
+func (d *DynamoDBServer) adminScanTableAt(ctx context.Context, tableName string, opts AdminScanOptions, readTS uint64) (AdminScanResult, error) {
 	schema, exists, err := d.loadTableSchemaAt(ctx, tableName, readTS)
 	if err != nil {
 		return AdminScanResult{}, errors.WithStack(err)
@@ -286,7 +294,11 @@ func (d *DynamoDBServer) adminLoadReadableSchema(ctx context.Context, principal 
 	if strings.TrimSpace(tableName) == "" || keyAttrs == 0 {
 		return nil, 0, nil, ErrAdminDynamoValidation
 	}
-	readTS := d.nextTxnReadTS()
+	stamp, err := d.beginTxnReadTimestamp(ctx, "dynamodb admin read", dynamoTableMetaKey(tableName))
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	readTS := stamp.Timestamp()
 	readPin := d.pinReadTS(readTS)
 	schema, exists, err := d.loadTableSchemaAt(ctx, tableName, readTS)
 	if err != nil {

@@ -245,7 +245,11 @@ func (r *RedisServer) hget(conn redcon.Conn, cmd redcon.Command) {
 	}
 	key := cmd.Args[1]
 	field := cmd.Args[2]
-	readTS := r.readTS()
+	readTS, err := r.snapshotReadTS(r.handlerContext(conn))
+	if err != nil {
+		writeRedisError(conn, err)
+		return
+	}
 	ctx := r.handlerContext(conn)
 
 	// Fast path: look the wide-column field up directly. Live
@@ -377,7 +381,15 @@ func (r *RedisServer) hmget(conn redcon.Conn, cmd redcon.Command) {
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
-	readTS := r.readTS()
+	readTS, err := r.snapshotReadTS(r.handlerContext(conn))
+	if err != nil {
+		writeRedisError(conn, err)
+		return
+	}
+	r.hmgetAt(conn, cmd, readTS)
+}
+
+func (r *RedisServer) hmgetAt(conn redcon.Conn, cmd redcon.Command, readTS uint64) {
 	typ, err := r.keyTypeAtExpect(r.handlerContext(conn),
 		cmd.Args[1], readTS, redisTypeHash)
 	if err != nil {
@@ -610,7 +622,11 @@ func (r *RedisServer) hexists(conn redcon.Conn, cmd redcon.Command) {
 	}
 	key := cmd.Args[1]
 	field := cmd.Args[2]
-	readTS := r.readTS()
+	readTS, err := r.snapshotReadTS(r.handlerContext(conn))
+	if err != nil {
+		writeRedisError(conn, err)
+		return
+	}
 	ctx := r.handlerContext(conn)
 
 	// Fast path: direct wide-column field existence check. ExistsAt
@@ -687,7 +703,11 @@ func (r *RedisServer) hlen(conn redcon.Conn, cmd redcon.Command) {
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
-	readTS := r.readTS()
+	readTS, err := r.snapshotReadTS(r.handlerContext(conn))
+	if err != nil {
+		writeRedisError(conn, err)
+		return
+	}
 	typ, err := r.keyTypeAtExpect(r.handlerContext(conn),
 		cmd.Args[1], readTS, redisTypeHash)
 	if err != nil {
@@ -975,7 +995,11 @@ func (r *RedisServer) hgetall(conn redcon.Conn, cmd redcon.Command) {
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
-	readTS := r.readTS()
+	readTS, err := r.snapshotReadTS(r.handlerContext(conn))
+	if err != nil {
+		writeRedisError(conn, err)
+		return
+	}
 	ctx := r.handlerContext(conn)
 	typ, err := r.keyTypeAtExpect(ctx, cmd.Args[1], readTS, redisTypeHash)
 	if err != nil {

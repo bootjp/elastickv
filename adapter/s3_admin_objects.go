@@ -133,12 +133,11 @@ func (s *S3Server) AdminDeleteObject(ctx context.Context, principal AdminPrincip
 // idempotent no-op" return shape, matching the SigV4 deleteObject
 // silent-no-op semantics and AWS S3.
 func (s *S3Server) adminDeleteObjectTxn(ctx context.Context, bucket, key string) (*s3ObjectManifest, uint64, error) {
-	readTS := s.readTS()
-	readTimestamp, err := s.beginTxnReadTimestamp(ctx, readTS, "s3 admin delete object: begin read timestamp")
+	readTimestamp, err := s.beginTxnReadTimestamp(ctx, "s3 admin delete object: begin read timestamp")
 	if err != nil {
 		return nil, 0, errors.Wrap(err, "s3 admin: allocate startTS for adminDeleteObjectTxn")
 	}
-	readTS = readTimestamp.Timestamp()
+	readTS := readTimestamp.Timestamp()
 	startTS := readTS
 	readPin := s.pinReadTS(readTS)
 	defer readPin.Release()
@@ -355,7 +354,10 @@ func (s *S3Server) AdminGetObject(ctx context.Context, principal AdminPrincipal,
 // the error path. On success the caller takes ownership of the
 // pin (typically by handing it to the streaming reader's Close).
 func (s *S3Server) adminLoadObjectForRead(ctx context.Context, bucket, key string) (*s3ObjectManifest, uint64, uint64, *kv.ActiveTimestampToken, error) {
-	readTS := s.readTS()
+	readTS, err := s.snapshotReadTS(ctx)
+	if err != nil {
+		return nil, 0, 0, nil, err
+	}
 	readPin := s.pinReadTS(readTS)
 	releaseOnError := readPin
 	defer func() {

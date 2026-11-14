@@ -826,7 +826,11 @@ func (s *SQSServer) receiveMessage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	throttleEpoch := s.throttle.queueEpoch(queueName)
-	readTS := s.nextTxnReadTS(ctx)
+	readTS, err := s.snapshotReadTS(r.Context())
+	if err != nil {
+		writeSQSErrorFromErr(w, err)
+		return
+	}
 	meta, exists, err := s.loadQueueMetaAt(ctx, queueName, readTS)
 	if err != nil {
 		writeSQSErrorFromErr(w, err)
@@ -877,11 +881,11 @@ func (s *SQSServer) receiveMessage(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *SQSServer) receiveMessageCore(ctx context.Context, queueName string, in sqsReceiveMessageInput) ([]map[string]any, error) {
-	if _, err := kv.LeaseReadThrough(s.coordinator, ctx); err != nil {
-		return nil, errors.WithStack(err)
-	}
 	throttleEpoch := s.throttle.queueEpoch(queueName)
-	readTS := s.nextTxnReadTS(ctx)
+	readTS, err := s.snapshotReadTS(ctx)
+	if err != nil {
+		return nil, err
+	}
 	meta, exists, err := s.loadQueueMetaAt(ctx, queueName, readTS)
 	if err != nil {
 		return nil, err

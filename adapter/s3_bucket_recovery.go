@@ -38,7 +38,7 @@ func (s *S3Server) recoverPendingBucketDeletes(ctx context.Context) error {
 	start := []byte(s3keys.BucketCleanupPrefix)
 	end := prefixScanEnd(start)
 	for {
-		readTimestamp, err := s.beginTxnReadTimestamp(ctx, ^uint64(0), "s3 bucket cleanup recovery")
+		readTimestamp, err := s.beginTxnReadTimestamp(ctx, "s3 bucket cleanup recovery")
 		if err != nil {
 			return err
 		}

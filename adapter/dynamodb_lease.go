@@ -117,7 +117,7 @@ func (d *DynamoDBServer) multiShardReadLeasePlan(
 	names map[string]string,
 	consistentRead *bool,
 ) (*dynamoTableSchema, queryLeasePlan, error) {
-	tentativeTS := snapshotTS(d.coordinator.Clock(), d.store)
+	tentativeTS := eventualSnapshotTS(d.coordinator.Clock(), d.store)
 	schema, exists, err := d.loadTableSchemaAt(ctx, tableName, tentativeTS)
 	if err != nil {
 		// loadTableSchemaAt maps ErrKeyNotFound to (_, false, nil); any error
@@ -270,7 +270,7 @@ func (d *DynamoDBServer) queryLeaseKey(ctx context.Context, in queryInput) ([]by
 		// deterministic validation the read path runs before touching data.
 		return nil, gsiQueryLeasePlan(in, schema), nil
 	}
-	tentativeTS := snapshotTS(d.coordinator.Clock(), d.store)
+	tentativeTS := eventualSnapshotTS(d.coordinator.Clock(), d.store)
 	schema, exists, err := d.loadTableSchemaAt(ctx, in.TableName, tentativeTS)
 	if err != nil {
 		// loadTableSchemaAt maps ErrKeyNotFound to (_, false, nil); any
@@ -402,7 +402,7 @@ func (d *DynamoDBServer) leaseCheckTransactGetItemsWithKeys(w http.ResponseWrite
 // (CLAUDE.md: the slow conditions the fence targets are exactly when a
 // silently-dropped item would let a stale snapshot through).
 func (d *DynamoDBServer) resolveTransactGetItemKeys(ctx context.Context, in transactGetItemsInput) ([][]byte, bool, error) {
-	tentativeTS := snapshotTS(d.coordinator.Clock(), d.store)
+	tentativeTS := eventualSnapshotTS(d.coordinator.Clock(), d.store)
 	schemaCache := make(map[string]*dynamoTableSchema)
 	seenKeys := make(map[string]struct{}, len(in.TransactItems))
 	uniqueKeys := make([][]byte, 0, len(in.TransactItems))

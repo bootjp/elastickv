@@ -145,13 +145,6 @@ func (r *GRPCServer) Close() error {
 	return r.closeErr
 }
 
-func (r *GRPCServer) clock() *kv.HLC {
-	if r == nil || r.coordinator == nil {
-		return nil
-	}
-	return r.coordinator.Clock()
-}
-
 func (r *GRPCServer) observeGRPCPointRead(ctx context.Context, key []byte, groupID uint64) {
 	if r.coordinator == nil || !r.grpcServesGroupRead(key, groupID) {
 		return
@@ -226,13 +219,12 @@ func (r *GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.Raw
 	if err := r.requireReadReady(); err != nil {
 		return nil, err
 	}
-	readTS := req.GetTs()
-	if readTS == 0 {
-		readTS = globalSnapshotTS(ctx, r.clock(), r.store)
+	readTS, err := r.resolveRawReadSnapshot(ctx, req.GetTs(), req.GetGroupId(), req.GetKey())
+	if err != nil {
+		return nil, err
 	}
 
 	var v []byte
-	var err error
 	if fenceGetter, ok := r.store.(rawReadFenceGetter); ok {
 		v, err = fenceGetter.GetAtWithReadFence(ctx, req.Key, readTS, req.GetGroupId(), r.readRouteVersion(req.GetReadRouteVersion()))
 	} else if req.GetReadRouteVersion() != 0 {
@@ -468,7 +460,11 @@ func (r *GRPCServer) RawScanAt(ctx context.Context, req *pb.RawScanAtRequest) (*
 
 	readTS := req.GetTs()
 	if readTS == 0 {
-		readTS = globalSnapshotTS(ctx, r.clock(), r.store)
+		stamp, err := r.beginLatestReadSnapshot(ctx, req.GetGroupId(), nil)
+		if err != nil {
+			return nil, err
+		}
+		readTS = stamp
 	}
 	if req.GetKeysOnly() {
 		keys, err := r.rawScanKeysAt(ctx, req, limit, readTS)
@@ -816,7 +812,10 @@ func (r *GRPCServer) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetRespon
 		return nil, errors.WithStack(err)
 	}
 
-	readTS := globalSnapshotTS(ctx, r.clock(), r.store)
+	readTS, err := r.beginLatestReadSnapshot(ctx, 0, req.GetKey())
+	if err != nil {
+		return nil, err
+	}
 	v, err := r.store.GetAt(ctx, req.Key, readTS)
 	r.observeGRPCPointRead(ctx, req.GetKey(), 0)
 	if err != nil {
@@ -876,7 +875,10 @@ func (r *GRPCServer) Scan(ctx context.Context, req *pb.ScanRequest) (*pb.ScanRes
 			Kv: nil,
 		}, err
 	}
-	readTS := globalSnapshotTS(ctx, r.clock(), r.store)
+	readTS, err := r.beginLatestReadSnapshot(ctx, 0, nil)
+	if err != nil {
+		return nil, err
+	}
 	res, err := r.store.ScanAt(ctx, req.StartKey, req.EndKey, limit, readTS)
 	if err != nil {
 		r.markGRPCScanRead(0, req.GetStartKey(), req.GetEndKey(), nil)
@@ -903,4 +905,30 @@ func (r *GRPCServer) Scan(ctx context.Context, req *pb.ScanRequest) (*pb.ScanRes
 	return &pb.ScanResponse{
 		Kv: kvs,
 	}, nil
+}
+
+// Explicit timestamps remain historical reads. Only timestamp-free requests
+// acquire a fresh snapshot, and explicit physical groups must fence that group.
+func (r *GRPCServer) beginLatestReadSnapshot(ctx context.Context, groupID uint64, key []byte) (uint64, error) {
+	if groupID != 0 {
+		reader, ok := r.store.(rawGroupCommitFloorReader)
+		if !ok {
+			return 0, errors.New("latest raw read requires a group-aware fence")
+		}
+		ts, err := reader.GroupCommittedTimestampFloor(ctx, groupID)
+		return max(ts, 1), errors.WithStack(err)
+	}
+	var keys [][]byte
+	if key != nil {
+		keys = [][]byte{key}
+	}
+	stamp, err := beginFencedReadSnapshot(ctx, r.coordinator, r.store, "grpc latest read", keys...)
+	return stamp.Timestamp(), err
+}
+
+func (r *GRPCServer) resolveRawReadSnapshot(ctx context.Context, requested, groupID uint64, key []byte) (uint64, error) {
+	if requested != 0 {
+		return requested, nil
+	}
+	return r.beginLatestReadSnapshot(ctx, groupID, key)
 }

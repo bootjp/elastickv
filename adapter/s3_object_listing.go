@@ -66,7 +66,10 @@ func (s *S3Server) scanS3ObjectListing(ctx context.Context, req s3ObjectListingR
 		return s3ObjectListingPage{}, errors.WithStack(
 			errors.Mark(errors.Wrap(err, "decode continuation token"), errS3ListingMalformedToken))
 	}
-	readTS := s.readTS()
+	readTS, err := s.snapshotReadTS(ctx)
+	if err != nil {
+		return s3ObjectListingPage{}, err
+	}
 	if token != nil && token.ReadTS != 0 {
 		readTS = token.ReadTS
 	}

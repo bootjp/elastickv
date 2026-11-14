@@ -17,7 +17,7 @@ func seedS3CleanupChunkRef(t *testing.T, h *s3OCCReproHarness) ([]byte, [32]byte
 	value, err := s3keys.EncodeChunkRefValue(s3keys.ChunkRefValue{ContentSHA256: sha, Size: 13})
 	require.NoError(t, err)
 	key := s3keys.VersionedChunkRefKey("bucket", 1, "object", "upload", 1, 0, 1)
-	readTimestamp, err := h.server.beginTxnReadTimestamp(t.Context(), ^uint64(0), "seed cleanup chunkref")
+	readTimestamp, err := h.server.beginTxnReadTimestamp(t.Context(), "seed cleanup chunkref")
 	require.NoError(t, err)
 	commitTS, err := h.server.nextTxnCommitTS(t.Context(), readTimestamp.Timestamp())
 	require.NoError(t, err)

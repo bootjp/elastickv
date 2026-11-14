@@ -876,27 +876,8 @@ func normalisePartitionCount(n uint32) uint32 {
 
 // ------------------------ storage primitives ------------------------
 
-func (s *SQSServer) nextTxnReadTS(ctx context.Context) uint64 {
-	maxTS := uint64(0)
-	if p, ok := s.store.(globalLastCommitTSProvider); ok {
-		maxTS = p.GlobalLastCommitTS(ctx)
-	} else if s.store != nil {
-		maxTS = s.store.LastCommitTS()
-	}
-	if s.coordinator != nil {
-		if clock := s.coordinator.Clock(); clock != nil && maxTS > 0 {
-			clock.Observe(maxTS)
-		}
-	}
-	if maxTS == 0 {
-		return 1
-	}
-	return maxTS
-}
-
 func (s *SQSServer) beginTxnReadTimestamp(ctx context.Context, label string) (kv.ReadTimestamp, error) {
-	readTimestamp, err := kv.BeginReadTimestampThrough(ctx, s.coordinator, s.nextTxnReadTS(ctx), label)
-	return readTimestamp, errors.WithStack(err)
+	return beginFencedReadSnapshot(ctx, s.coordinator, s.store, label)
 }
 
 func (s *SQSServer) loadQueueMetaAt(ctx context.Context, queueName string, ts uint64) (*sqsQueueMeta, bool, error) {
@@ -1316,7 +1297,11 @@ func resolveListQueuesStart(names []string, token string) int {
 }
 
 func (s *SQSServer) scanQueueNames(ctx context.Context) ([]string, error) {
-	return s.scanQueueNamesAt(ctx, s.nextTxnReadTS(ctx))
+	readTS, err := s.snapshotReadTS(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return s.scanQueueNamesAt(ctx, readTS)
 }
 
 // scanQueueNamesAt is scanQueueNames with the read timestamp passed
@@ -1383,7 +1368,11 @@ func (s *SQSServer) getQueueUrlCore(ctx context.Context, in *sqsGetQueueUrlInput
 	if err := validateQueueName(in.QueueName); err != nil {
 		return "", err
 	}
-	_, exists, err := s.loadQueueMetaAt(ctx, in.QueueName, s.nextTxnReadTS(ctx))
+	readTS, err := s.snapshotReadTS(ctx)
+	if err != nil {
+		return "", err
+	}
+	_, exists, err := s.loadQueueMetaAt(ctx, in.QueueName, readTS)
 	if err != nil {
 		return "", err
 	}
@@ -1413,7 +1402,10 @@ func (s *SQSServer) getQueueAttributes(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *SQSServer) getQueueAttributesCore(ctx context.Context, name string, attributeNames []string) (map[string]string, error) {
-	readTS := s.nextTxnReadTS(ctx)
+	readTS, err := s.snapshotReadTS(ctx)
+	if err != nil {
+		return nil, err
+	}
 	meta, exists, err := s.loadQueueMetaAt(ctx, name, readTS)
 	if err != nil {
 		return nil, err
@@ -1843,4 +1835,9 @@ func exhausted(counters sqsApproxCounters, page []*store.KVPair, end []byte, sta
 		return true
 	}
 	return false
+}
+
+func (s *SQSServer) snapshotReadTS(ctx context.Context) (uint64, error) {
+	stamp, err := beginFencedReadSnapshot(ctx, s.coordinator, s.store, "SQSServer read")
+	return stamp.Timestamp(), err
 }

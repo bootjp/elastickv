@@ -746,7 +746,10 @@ func (s *SQSServer) queueThrottleConfigContext(ctx context.Context, queueName st
 	if s.store == nil {
 		return nil, 0, nil
 	}
-	readTS := s.nextTxnReadTS(ctx)
+	readTS, err := s.snapshotReadTS(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
 	meta, exists, err := s.loadQueueMetaAt(ctx, queueName, readTS)
 	if err != nil {
 		return nil, 0, errors.WithStack(err)

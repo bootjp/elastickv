@@ -922,7 +922,11 @@ func describeTableShape(t *dynamoTableSchema) map[string]any {
 }
 
 func (d *DynamoDBServer) loadTableSchema(ctx context.Context, tableName string) (*dynamoTableSchema, bool, error) {
-	return d.loadTableSchemaAt(ctx, tableName, snapshotTS(d.coordinator.Clock(), d.store))
+	stamp, err := d.beginTxnReadTimestamp(ctx, "dynamodb schema read", dynamoTableMetaKey(tableName))
+	if err != nil {
+		return nil, false, err
+	}
+	return d.loadTableSchemaAt(ctx, tableName, stamp.Timestamp())
 }
 
 func (d *DynamoDBServer) loadTableSchemaAt(ctx context.Context, tableName string, ts uint64) (*dynamoTableSchema, bool, error) {

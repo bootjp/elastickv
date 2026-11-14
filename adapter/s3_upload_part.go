@@ -40,7 +40,7 @@ func (s *S3Server) prepareS3UploadPart(ctx context.Context, bucket, objectKey, u
 	if err != nil {
 		return nil, err
 	}
-	readTimestamp, err := s.beginTxnReadTimestamp(ctx, s.readTS(), "s3 upload part preparation: begin read timestamp")
+	readTimestamp, err := s.beginTxnReadTimestamp(ctx, "s3 upload part preparation: begin read timestamp")
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -141,12 +141,11 @@ func (s *S3Server) finalizeS3UploadPartCommitTS(ctx context.Context, startTS uin
 }
 
 func (s *S3Server) allocateS3UploadPartVersion(ctx context.Context) (kv.ReadTimestamp, uint64, uint64, error) {
-	readTS := s.readTS()
-	readTimestamp, err := s.beginTxnReadTimestamp(ctx, readTS, "s3 upload part: begin read timestamp")
+	readTimestamp, err := s.beginTxnReadTimestamp(ctx, "s3 upload part: begin read timestamp")
 	if err != nil {
 		return kv.ReadTimestamp{}, 0, 0, errors.WithStack(err)
 	}
-	readTS = readTimestamp.Timestamp()
+	readTS := readTimestamp.Timestamp()
 	startTS := readTS
 	commitTS, err := s.nextTxnCommitTS(ctx, startTS)
 	if err != nil {

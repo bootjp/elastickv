@@ -117,7 +117,11 @@ func (s *SQSServer) listQueueTags(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *SQSServer) listQueueTagsCore(ctx context.Context, name string) (map[string]string, error) {
-	meta, exists, err := s.loadQueueMetaAt(ctx, name, s.nextTxnReadTS(ctx))
+	readTS, err := s.snapshotReadTS(ctx)
+	if err != nil {
+		return nil, err
+	}
+	meta, exists, err := s.loadQueueMetaAt(ctx, name, readTS)
 	if err != nil {
 		return nil, err
 	}

@@ -435,7 +435,7 @@ func (d *DynamoDBServer) resolveDynamoReadTS(consistentRead *bool) uint64 {
 	if consistentRead != nil && *consistentRead {
 		return consistentReadLatestTS
 	}
-	return snapshotTS(d.coordinator.Clock(), d.store)
+	return eventualSnapshotTS(d.coordinator.Clock(), d.store)
 }
 
 func validateGSIReadOptions(
