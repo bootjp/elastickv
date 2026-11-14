@@ -487,6 +487,7 @@ func TestS3Server_AdminDeleteBucket_SweepsOrphansAcrossAllPerBucketPrefixes(t *t
 	chunkRefValue, err := s3keys.EncodeChunkRefValue(s3keys.ChunkRefValue{ContentSHA256: chunkSHA, Size: 12})
 	require.NoError(t, err)
 	planted := []*kv.Elem[kv.OP]{
+		{Op: kv.Put, Key: s3keys.MigrationIntentKey(bucket, gen, objectName), Value: []byte("orphan-migration-intent")},
 		{Op: kv.Put, Key: s3keys.UploadMetaKey(bucket, gen, objectName, uploadID), Value: []byte("orphan-upload-meta")},
 		{Op: kv.Put, Key: s3keys.UploadPartKey(bucket, gen, objectName, uploadID, 1), Value: []byte("orphan-part")},
 		{Op: kv.Put, Key: s3keys.BlobKey(bucket, gen, objectName, uploadID, 1, 0), Value: []byte("orphan-chunk")},
@@ -520,6 +521,7 @@ func TestS3Server_AdminDeleteBucket_SweepsOrphansAcrossAllPerBucketPrefixes(t *t
 		prefix []byte
 	}{
 		{"object_manifest", s3keys.ObjectManifestPrefixForBucket(bucket, gen)},
+		{"migration_intent", s3keys.MigrationIntentPrefixForBucket(bucket, gen)},
 		{"upload_meta", s3keys.UploadMetaPrefixForBucket(bucket, gen)},
 		{"upload_part", s3keys.UploadPartPrefixForBucket(bucket, gen)},
 		{"blob", s3keys.BlobPrefixForBucket(bucket, gen)},

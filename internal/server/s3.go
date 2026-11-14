@@ -44,7 +44,7 @@ func newS3Server(
 	if err != nil {
 		return nil, err
 	}
-	minReplicas, err := adapter.S3BlobMinReplicasFromEnv()
+	minReplicas, migrationConfig, err := loadS3BlobRuntimeConfig()
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -58,6 +58,7 @@ func newS3Server(
 		adapter.WithS3BlobMinReplicas(minReplicas),
 		adapter.WithS3BlobPushBlocked(blobPushBlocked),
 		adapter.WithS3BlobBackfiller(blobBackfiller),
+		adapter.WithS3LegacyBlobMigrationConfig(migrationConfig),
 	}
 	if blobCluster != nil {
 		options = append(options, adapter.WithS3BlobCluster(blobCluster))
@@ -71,6 +72,15 @@ func newS3Server(
 		options...,
 	)
 	return s3Server, nil
+}
+
+func loadS3BlobRuntimeConfig() (int, adapter.S3LegacyBlobMigrationConfig, error) {
+	minReplicas, err := adapter.S3BlobMinReplicasFromEnv()
+	if err != nil {
+		return 0, adapter.S3LegacyBlobMigrationConfig{}, errors.WithStack(err)
+	}
+	migrationConfig, err := adapter.S3LegacyBlobMigrationConfigFromEnv()
+	return minReplicas, migrationConfig, errors.WithStack(err)
 }
 
 func bindS3Server(ctx context.Context, lc *net.ListenConfig, s3Addr string, s3Server *adapter.S3Server) (net.Listener, error) {
@@ -110,6 +120,11 @@ func runS3Server(ctx context.Context, eg *errgroup.Group, s3Server *adapter.S3Se
 			runDoneCancel()
 			return s3StartupResult(ctx, err)
 		}
+		if err := s3Server.StartLegacyBlobMigration(ctx); err != nil {
+			s3Server.Stop()
+			runDoneCancel()
+			return s3StartupResult(ctx, err)
+		}
 		err := s3Server.Run()
 		runDoneCancel()
 		if err == nil || errors.Is(err, net.ErrClosed) {
@@ -129,6 +144,10 @@ func runS3BlobBackfillOnly(ctx context.Context, eg *errgroup.Group, s3Server *ad
 			return errors.WithStack(err)
 		}
 		if err := s3Server.StartBlobGC(ctx); err != nil {
+			s3Server.Stop()
+			return s3StartupResult(ctx, err)
+		}
+		if err := s3Server.StartLegacyBlobMigration(ctx); err != nil {
 			s3Server.Stop()
 			return s3StartupResult(ctx, err)
 		}

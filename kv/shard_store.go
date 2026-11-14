@@ -1648,6 +1648,10 @@ func (s *ShardStore) routesForScanWithVersion(start []byte, end []byte) ([]distr
 		routes, version := s.engine.GetIntersectingRoutesWithVersion(routeStart, routeEnd)
 		return routes, false, version
 	}
+	if routeStart, routeEnd, ok := s3keys.MigrationIntentScanRouteBounds(start, end); ok {
+		routes, version := s.engine.GetIntersectingRoutesWithVersion(routeStart, routeEnd)
+		return routes, false, version
+	}
 	if routes, version, ok := s.routesForFilesystemUsageScanWithVersion(start, end); ok {
 		return routes, false, version
 	}

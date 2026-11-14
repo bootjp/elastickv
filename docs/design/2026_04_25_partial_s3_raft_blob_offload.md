@@ -634,7 +634,23 @@ capability-advertising peers exists.
 | M1 | PUT path emits chunkrefs through Raft; chunkblob writes go directly to local Pebble. **`FetchChunkBlob` and `PushChunkBlob` RPCs ship in this milestone** because both M1 PUT (semi-synchronous push) and M1 GET (proxy-on-miss) depend on them — without them M1 GET could only serve local-hit or 503. | Implemented behind the GC-readiness gate. |
 | M2 | Async fetch worker pool for follower apply (catch-up after a long absence). Independent of M1's synchronous `FetchChunkBlob` use on the GET path. SHA verification + retry from alternate peer on mismatch. | Partially implemented: fetch/backfill helpers exist; production enablement remains gated by M3. |
 | M3 | Reference-count + grace-period GC (the queue-based scheme in §3.5). | Implemented behind opt-in: atomic RC/queue mutations, Raft-conditional reclaim, local sweep/orphan workers per physical store, persisted bucket-cleanup retry, startup readiness gate, and all-peer M3 capability check. Production acceptance measurements and default flip remain open. |
-| M4 | Migrator: rewrite legacy `BlobKey` data in the background. Off by default until M0-M3 burn in for 30 days in production. | Open. |
+| M4 | Migrator: rewrite legacy `BlobKey` data in the background. Off by default until M0-M3 burn in for 30 days in production. | Partial. A default-off, bounded worker scans manifest routes, recovers intents, and migrates objects. Production acceptance remains open. |
+
+The internal M4 attempt writes an intent before staging versioned chunkrefs,
+replicates each chunkblob before its ref transaction, and flips the manifest
+with a durable old-BlobKey cleanup obligation in one OCC transaction. Startup
+recovery aborts unfinished stages with RC accounting or resumes bounded
+post-flip cleanup before the existing GC readiness gate opens. The worker
+scans the full manifest keyspace across shard routes in bounded pages,
+rechecks leadership and M3 offload readiness, and is disabled by default.
+Only the verified leader aborts a staging intent, and recovery on the
+active process skips objects still being migrated; a restarted process or
+new leader can recover an abandoned attempt.
+It requires an explicit operator burn-in start date at least 30 days old;
+that date is an assertion, not proof of a successful production soak. No
+30-day production burn-in evidence is recorded here. A production rollout
+still requires operational measurements and validation on a multi-node Raft
+cluster with real crash/restart and MVCC compaction.
 
 The M3 accounting slice wires `PlanChunkRefRCMutations` into explicit
 chunkref PUT and DEL transactions, including staged upload batches,
