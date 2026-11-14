@@ -185,8 +185,9 @@ Implementation order:
    creation in one indexed Raft entry, recompute the manifest digest on every
    replica, and skip an exact replay. A local lookup checks both indexes for
    unknown-outcome reconciliation. This branch adds an opt-in applied-leader
-   read barrier and a remote lookup RPC, but no production reconciliation
-   route is wired. Production admission rejects the new
+   read barrier and a remote lookup RPC. The lookup rejects a changed leader
+   term or expired peer session before returning, but no production
+   reconciliation route is wired. Production admission rejects the new
    operation-ID field until authenticated issuance and activation are wired.
    Before replicated activation, FSM apply ignores that field for single and
    batched entries so mixed-version replicas retain legacy apply semantics;

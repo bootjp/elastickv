@@ -97,11 +97,22 @@ func (i *Internal) LookupTimestampBinding(ctx context.Context, req *pb.LookupTim
 	if err != nil {
 		return nil, err
 	}
+	statusReader, ok := i.leader.(raftengine.StatusReader)
+	if !ok {
+		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "home-group term is unavailable"))
+	}
+	term := statusReader.Status().Term
+	if term == 0 {
+		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "home-group term is unavailable"))
+	}
 	ctx, cancel := context.WithTimeout(ctx, timestampBindingPeerBudget)
 	defer cancel()
 	index, err := i.leader.LinearizableRead(ctx)
 	if err != nil {
 		return nil, errors.Wrap(err, "read home-group binding barrier")
+	}
+	if err := checkHomeBindingLookupFence(ctx, statusReader, term); err != nil {
+		return nil, err
 	}
 	binding, found, err := kv.LookupTimestampBinding(ctx, metadata, operationID)
 	if err != nil {
@@ -110,8 +121,8 @@ func (i *Internal) LookupTimestampBinding(ctx context.Context, req *pb.LookupTim
 	if err := ctx.Err(); err != nil {
 		return nil, errors.WithStack(err)
 	}
-	if i.leader.State() != raftengine.StateLeader {
-		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "home-group leadership changed"))
+	if err := checkHomeBindingLookupFence(ctx, statusReader, term); err != nil {
+		return nil, err
 	}
 	response := &pb.LookupTimestampBindingResponse{Found: found, AppliedIndex: index}
 	if found {
@@ -121,6 +132,17 @@ func (i *Internal) LookupTimestampBinding(ctx context.Context, req *pb.LookupTim
 		response.Phase = binding.Phase
 	}
 	return response, nil
+}
+
+func checkHomeBindingLookupFence(ctx context.Context, reader raftengine.StatusReader, term uint64) error {
+	current := reader.Status()
+	if current.State != raftengine.StateLeader || current.Term != term {
+		return errors.WithStack(status.Error(codes.FailedPrecondition, "home-group leadership changed"))
+	}
+	if err := peersession.CapturedReceipt(ctx).Check(ctx); err != nil {
+		return errors.WithStack(status.Error(codes.PermissionDenied, "home binding lookup lost its peer session"))
+	}
+	return nil
 }
 
 func (i *Internal) homeBindingLookupInputs(ctx context.Context, req *pb.LookupTimestampBindingRequest) (store.RaftControlMetadataStore, [16]byte, error) {

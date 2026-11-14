@@ -26,9 +26,11 @@ import (
 
 type prepareSafetyRPCLeader struct {
 	forwardObserverLeader
-	follower atomic.Bool
-	reads    atomic.Int32
-	loseRead bool
+	follower          atomic.Bool
+	reads             atomic.Int32
+	loseRead          bool
+	term              atomic.Uint64
+	advanceTermOnRead bool
 }
 
 func (l *prepareSafetyRPCLeader) State() raftengine.State {
@@ -39,13 +41,20 @@ func (l *prepareSafetyRPCLeader) State() raftengine.State {
 }
 
 func (l *prepareSafetyRPCLeader) Status() raftengine.Status {
-	return raftengine.Status{State: l.State(), Term: 1}
+	term := l.term.Load()
+	if term == 0 {
+		term = 1
+	}
+	return raftengine.Status{State: l.State(), Term: term}
 }
 
 func (l *prepareSafetyRPCLeader) LinearizableRead(context.Context) (uint64, error) {
 	l.reads.Add(1)
 	if l.loseRead {
 		l.follower.Store(true)
+	}
+	if l.advanceTermOnRead {
+		l.term.Store(l.Status().Term + 1)
 	}
 	return 23, nil
 }

@@ -290,4 +290,9 @@ func TestLookupTimestampBindingRequiresAppliedLeaderBarrier(t *testing.T) {
 	leader.loseRead = true
 	_, err = lookup()
 	require.Error(t, err)
+	leader.follower.Store(false)
+	leader.loseRead = false
+	leader.advanceTermOnRead = true
+	_, err = lookup()
+	require.Equal(t, codes.FailedPrecondition, status.Code(err), "a new leader term cannot attest the previous term's read")
 }
