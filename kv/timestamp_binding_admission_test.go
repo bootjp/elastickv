@@ -99,6 +99,7 @@ func TestPrepareHomeRawTimestampBindingConcurrentRetryStaysPending(t *testing.T)
 	require.True(t, ok)
 	request := &pb.Request{TimestampBindingOperationId: append([]byte{7}, make([]byte, 15)...),
 		Mutations: []*pb.Mutation{{Key: []byte("key"), Value: []byte("value")}}}
+	clearHomeBindingAttemptAfterTest(t, request)
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	var issues atomic.Int32
@@ -131,6 +132,7 @@ func TestPrepareHomeRawTimestampBindingAmbiguousIssueFailsClosed(t *testing.T) {
 	require.True(t, ok)
 	request := &pb.Request{TimestampBindingOperationId: append([]byte{8}, make([]byte, 15)...),
 		Mutations: []*pb.Mutation{{Key: []byte("key"), Value: []byte("value")}}}
+	clearHomeBindingAttemptAfterTest(t, request)
 	var issues int
 	ambiguous := errors.New("unknown issue result")
 	issue := func(context.Context) (uint64, error) { issues++; return 0, ambiguous }
@@ -139,6 +141,13 @@ func TestPrepareHomeRawTimestampBindingAmbiguousIssueFailsClosed(t *testing.T) {
 	_, err = PrepareHomeRawTimestampBinding(t.Context(), &homeBindingLeader{}, metadata, issue, request)
 	require.ErrorIs(t, err, ErrTimestampBindingPending)
 	require.Equal(t, 1, issues)
+}
+
+func clearHomeBindingAttemptAfterTest(t *testing.T, request *pb.Request) {
+	t.Helper()
+	var operationID [16]byte
+	copy(operationID[:], request.TimestampBindingOperationId)
+	t.Cleanup(func() { homeBindingAttempts.Delete(operationID) })
 }
 
 func TestPrepareHomeRawTimestampBindingAmbiguousProposalResolvesOnlyFromAppliedBinding(t *testing.T) {
