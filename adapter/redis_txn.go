@@ -1421,6 +1421,16 @@ func (t *txnContext) stageExpiredKeyCleanupForRecreate(key []byte) (bool, error)
 	return true, nil
 }
 
+func (t *txnContext) clearMissingCollectionTTL(key []byte, typ redisValueType) {
+	if typ != redisTypeNone {
+		return
+	}
+	if ttlSt, ok := t.ttlStates[string(key)]; ok && ttlSt.value != nil {
+		ttlSt.value = nil
+		ttlSt.dirty = true
+	}
+}
+
 func (t *txnContext) trackMissingKeyCreatorFenceReads(key []byte, typ redisValueType) {
 	if typ == redisTypeNone {
 		t.trackWideCollectionFenceReads(key)
@@ -1530,6 +1540,7 @@ func (t *txnContext) applyHSet(cmd redcon.Command) (redisResult, error) {
 	if err != nil {
 		return redisResult{}, err
 	}
+	t.clearMissingCollectionTTL(cmd.Args[1], typ)
 	added := int64(0)
 	for i := 2; i < len(cmd.Args); i += redisPairWidth {
 		field := string(cmd.Args[i])
@@ -1653,6 +1664,7 @@ func (t *txnContext) prepareListWrite(key []byte) (redisResult, bool, error) {
 	if expired {
 		t.listStates[string(key)] = &listTxnState{appends: [][]byte{}}
 	}
+	t.clearMissingCollectionTTL(key, typ)
 	return redisResult{}, false, nil
 }
 
@@ -1706,6 +1718,14 @@ func (t *txnContext) applyZIncrBy(cmd redcon.Command) (redisResult, error) {
 	st, err := t.loadZSetState(cmd.Args[1])
 	if err != nil {
 		return redisResult{}, err
+	}
+	if typ == redisTypeNone {
+		ttlSt, err := t.loadTTLState(cmd.Args[1])
+		if err != nil {
+			return redisResult{}, err
+		}
+		ttlSt.value = nil
+		ttlSt.dirty = true
 	}
 	member := string(cmd.Args[3])
 	st.members[member] += inc
@@ -2077,13 +2097,11 @@ func (t *txnContext) prepareDispatch() (preparedTxnDispatch, error) {
 		cancel()
 		return preparedTxnDispatch{cancel: func() {}}, errors.WithStack(err)
 	}
-	listElems := t.buildListElems(commitTS)
-	zsetElems, err := t.buildZSetElems(commitTS)
+	collectionWriteElems, err := t.buildCollectionWriteElems(ctx, commitTS)
 	if err != nil {
 		cancel()
 		return preparedTxnDispatch{cancel: func() {}}, err
 	}
-	hashElems := t.buildHashElems(commitTS)
 	collectionTTLElems, skipTTLIndex, err := t.buildCollectionTTLElems(ctx)
 	if err != nil {
 		cancel()
@@ -2102,9 +2120,7 @@ func (t *txnContext) prepareDispatch() (preparedTxnDispatch, error) {
 		return preparedTxnDispatch{cancel: func() {}}, err
 	}
 
-	elems = append(elems, listElems...)
-	elems = append(elems, zsetElems...)
-	elems = append(elems, hashElems...)
+	elems = append(elems, collectionWriteElems...)
 	elems = append(elems, collectionTTLElems...)
 	elems = append(elems, ttlElems...)
 	elems = append(elems, streamElems...)
@@ -2120,6 +2136,25 @@ func (t *txnContext) prepareDispatch() (preparedTxnDispatch, error) {
 		ctx:      ctx,
 		cancel:   cancel,
 	}, nil
+}
+
+func (t *txnContext) buildCollectionWriteElems(ctx context.Context, commitTS uint64) ([]*kv.Elem[kv.OP], error) {
+	zsetElems, err := t.buildZSetElems(commitTS)
+	if err != nil {
+		return nil, err
+	}
+	listCleanupElems, err := t.buildListRecreateCleanupElems(ctx)
+	if err != nil {
+		return nil, err
+	}
+	hashCleanupElems, err := t.buildHashRecreateCleanupElems(ctx)
+	if err != nil {
+		return nil, err
+	}
+	zsetElems = append(zsetElems, listCleanupElems...)
+	zsetElems = append(zsetElems, hashCleanupElems...)
+	zsetElems = append(zsetElems, t.buildListElems(commitTS)...)
+	return append(zsetElems, t.buildHashElems(commitTS)...), nil
 }
 
 func (t *txnContext) dispatchContext() (context.Context, context.CancelFunc) {
@@ -2389,6 +2424,37 @@ func (t *txnContext) buildListElems(commitTS uint64) []*kv.Elem[kv.OP] {
 	return elems
 }
 
+func (t *txnContext) buildListRecreateCleanupElems(ctx context.Context) ([]*kv.Elem[kv.OP], error) {
+	var elems []*kv.Elem[kv.OP]
+	for key, st := range t.listStates {
+		if st.deleted || st.metaExists || len(st.appends) == 0 || t.hasReplacement([]byte(key)) {
+			continue
+		}
+		cleanup, _, err := t.server.expiredCollectionCleanupForRecreate(ctx, []byte(key), t.startTS, redisTypeNone, redisTypeList)
+		if err != nil {
+			return nil, err
+		}
+		elems = append(elems, cleanup...)
+	}
+	return elems, nil
+}
+
+func (t *txnContext) buildHashRecreateCleanupElems(ctx context.Context) ([]*kv.Elem[kv.OP], error) {
+	var elems []*kv.Elem[kv.OP]
+	for key := range t.hashCreates {
+		st := t.hashStates[key]
+		if st == nil || st.deleted || !st.dirty || len(st.fields) == 0 || t.hasReplacement([]byte(key)) {
+			continue
+		}
+		cleanup, _, err := t.server.expiredCollectionCleanupForRecreate(ctx, []byte(key), t.startTS, redisTypeNone, redisTypeHash)
+		if err != nil {
+			return nil, err
+		}
+		elems = append(elems, cleanup...)
+	}
+	return elems, nil
+}
+
 func (t *txnContext) appendListStateElems(elems []*kv.Elem[kv.OP], userKey []byte, st *listTxnState, commitTS uint64, seqInTxn uint32) ([]*kv.Elem[kv.OP], bool) {
 	if t.hasReplacement(userKey) {
 		return elems, false
@@ -2476,13 +2542,16 @@ func (t *txnContext) buildZSetElems(commitTS uint64) ([]*kv.Elem[kv.OP], error) 
 	seqInTxn := uint32(0)
 	for _, k := range keys {
 		st := t.zsetStates[k]
-		if _, ok := t.replacers[k]; ok {
-			continue
-		}
-		if !st.dirty {
+		_, replaced := t.replacers[k]
+		if replaced || !st.dirty {
 			continue
 		}
 		key := []byte(k)
+		cleanup, err := t.zsetRecreateCleanupElems(key, st)
+		if err != nil {
+			return nil, err
+		}
+		elems = append(elems, cleanup...)
 		inline, ok := t.zsetInlineTTLCreateElems(k, key, st)
 		if ok {
 			elems = append(elems, inline...)
@@ -2502,21 +2571,35 @@ func (t *txnContext) buildZSetElems(commitTS uint64) ([]*kv.Elem[kv.OP], error) 
 			}
 			continue
 		}
-		// Legacy blob path.
-		if len(st.members) == 0 {
-			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisZSetKey(key)})
-			continue
-		}
-		payload, err := marshalZSetValue(redisZSetValue{Entries: zsetMapToEntries(st.members)})
+		legacy, err := buildZSetLegacyElems(key, st)
 		if err != nil {
 			return nil, err
 		}
-		elems = append(elems,
-			&kv.Elem[kv.OP]{Op: kv.Put, Key: redisZSetKey(key), Value: payload},
-			redisTxnWideZSetFenceElem(key),
-		)
+		elems = append(elems, legacy...)
 	}
 	return elems, nil
+}
+
+func buildZSetLegacyElems(key []byte, st *zsetTxnState) ([]*kv.Elem[kv.OP], error) {
+	if len(st.members) == 0 {
+		return []*kv.Elem[kv.OP]{{Op: kv.Del, Key: redisZSetKey(key)}}, nil
+	}
+	payload, err := marshalZSetValue(redisZSetValue{Entries: zsetMapToEntries(st.members)})
+	if err != nil {
+		return nil, err
+	}
+	return []*kv.Elem[kv.OP]{
+		{Op: kv.Put, Key: redisZSetKey(key), Value: payload},
+		redisTxnWideZSetFenceElem(key),
+	}, nil
+}
+
+func (t *txnContext) zsetRecreateCleanupElems(key []byte, st *zsetTxnState) ([]*kv.Elem[kv.OP], error) {
+	if st.exists {
+		return nil, nil
+	}
+	elems, _, err := t.server.expiredCollectionCleanupForRecreate(t.ctxOrBackground(), key, t.startTS, redisTypeNone, redisTypeZSet)
+	return elems, err
 }
 
 func (t *txnContext) zsetInlineTTLCreateElems(key string, userKey []byte, st *zsetTxnState) ([]*kv.Elem[kv.OP], bool) {

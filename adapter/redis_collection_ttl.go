@@ -189,10 +189,56 @@ func (r *RedisServer) expiredCollectionCleanupForRecreate(
 		return r.deleteExpiredLogicalKeyForRecreate(ctx, key, readTS)
 	}
 	hllExpired, err := r.hllExpiredAt(ctx, key, readTS)
-	if err != nil || !hllExpired {
+	if err != nil {
 		return nil, false, err
 	}
+	if !hllExpired {
+		return r.emptyWideCollectionCleanupForRecreate(ctx, key, readTS)
+	}
 	return r.deleteExpiredLogicalKeyForRecreate(ctx, key, readTS)
+}
+
+func (r *RedisServer) emptyWideCollectionCleanupForRecreate(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], bool, error) {
+	for _, keys := range []struct {
+		meta  []byte
+		delta []byte
+	}{
+		{store.HashMetaKey(key), store.HashMetaDeltaScanPrefix(key)},
+		{store.SetMetaKey(key), store.SetMetaDeltaScanPrefix(key)},
+		{store.ZSetMetaKey(key), store.ZSetMetaDeltaScanPrefix(key)},
+	} {
+		meta, err := r.store.ExistsAt(ctx, keys.meta, readTS)
+		if err != nil {
+			return nil, false, errors.WithStack(err)
+		}
+		delta, err := r.prefixExistsAt(ctx, keys.delta, readTS)
+		if err != nil {
+			return nil, false, err
+		}
+		if meta || delta {
+			elems := []*kv.Elem[kv.OP]{{Op: kv.Del, Key: redisTTLKey(key)}}
+			for _, wide := range []struct {
+				member []byte
+				meta   []byte
+				delta  []byte
+			}{
+				{store.HashFieldScanPrefix(key), store.HashMetaKey(key), store.HashMetaDeltaScanPrefix(key)},
+				{store.SetMemberScanPrefix(key), store.SetMetaKey(key), store.SetMetaDeltaScanPrefix(key)},
+			} {
+				deleted, err := r.deleteWideColumnElems(ctx, readTS, wide.member, wide.meta, wide.delta)
+				if err != nil {
+					return nil, false, err
+				}
+				elems = append(elems, deleted...)
+			}
+			deleted, err := r.deleteZSetWideColumnElems(ctx, key, readTS)
+			if err != nil {
+				return nil, false, err
+			}
+			return append(append(elems, deleted...), redisTxnWideCollectionFenceElems(key)...), true, nil
+		}
+	}
+	return nil, false, nil
 }
 
 func (r *RedisServer) staleDeltaOnlyCollectionCleanupElems(ctx context.Context, key []byte, readTS uint64, expected redisValueType) ([]*kv.Elem[kv.OP], error) {

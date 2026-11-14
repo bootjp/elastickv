@@ -518,6 +518,17 @@ func (c *luaScriptContext) ttlState(key []byte) *luaTTLState {
 
 func (c *luaScriptContext) loadTTL(key []byte) (*time.Time, error) {
 	st := c.ttlState(key)
+	if _, touched := c.touched[string(key)]; touched && !st.dirty {
+		rawStartType, err := c.rawStartTypeForCommitPlan(c.scriptCtx(), key)
+		if err != nil {
+			return nil, err
+		}
+		if rawStartType == redisTypeNone {
+			st.loaded = true
+			st.value = nil
+			return nil, nil
+		}
+	}
 	if st.loaded {
 		return st.value, nil
 	}
@@ -1620,6 +1631,9 @@ func (c *luaScriptContext) loadLuaSetContext(key []byte) (redisValueType, *time.
 	typ, err := c.logicalType(key)
 	if err != nil {
 		return redisTypeNone, nil, err
+	}
+	if typ == redisTypeNone {
+		return redisTypeNone, nil, nil
 	}
 
 	prevTTL, err := c.loadTTL(key)
@@ -4035,21 +4049,22 @@ func (c *luaScriptContext) nonStringTTLElems(ctx context.Context, key string, ty
 
 // commitPlanForKey builds the data Raft elements for a single key.
 func (c *luaScriptContext) commitPlanForKey(ctx context.Context, key string, commitTS uint64) (luaKeyPlan, error) {
-	finalType, err := c.finalType(ctx, []byte(key))
+	keyBytes := []byte(key)
+	finalType, err := c.finalType(ctx, keyBytes)
 	if err != nil {
 		return luaKeyPlan{}, err
 	}
+	rawStartType, err := c.rawStartTypeForCommitPlan(ctx, keyBytes)
+	if err != nil {
+		return luaKeyPlan{}, err
+	}
+	c.resetInheritedTTLForAbsentStart(keyBytes, rawStartType)
 
 	valuePlan, err := c.valueCommitPlan(ctx, key, finalType, commitTS)
 	if err != nil {
 		return luaKeyPlan{}, err
 	}
 
-	keyBytes := []byte(key)
-	rawStartType, err := c.rawStartTypeForCommitPlan(ctx, keyBytes)
-	if err != nil {
-		return luaKeyPlan{}, err
-	}
 	startType, err := c.server.applyTTLFilter(ctx, keyBytes, c.startTS, rawStartType)
 	if err != nil {
 		return luaKeyPlan{}, err
@@ -4057,15 +4072,10 @@ func (c *luaScriptContext) commitPlanForKey(ctx context.Context, key string, com
 	var deleteElems []*kv.Elem[kv.OP]
 	readKeys := luaWideFenceReadKeysForPlan(keyBytes, finalType, startType, valuePlan.preserveExisting)
 	if !valuePlan.preserveExisting {
-		if c.everDeleted[key] && rawStartType != redisTypeNone {
-			deleteElems, _, err = c.server.deleteLogicalKeyElems(ctx, keyBytes, c.startTS)
-		} else {
-			deleteElems, _, err = c.server.deleteLogicalKeyElemsForType(ctx, keyBytes, c.startTS, rawStartType)
-		}
+		deleteElems, err = c.deleteElemsForCommitPlan(ctx, keyBytes, rawStartType)
 		if err != nil {
 			return luaKeyPlan{}, err
 		}
-		deleteElems = append(deleteElems, redisTxnWideCollectionFenceElems(keyBytes)...)
 	}
 
 	createFences := luaStreamCreateFenceElems(keyBytes, finalType, startType, valuePlan)
@@ -4080,6 +4090,32 @@ func (c *luaScriptContext) commitPlanForKey(ctx context.Context, key string, com
 		preserveExisting:    valuePlan.preserveExisting,
 		inlineMetaRewritten: valuePlan.inlineMetaRewritten,
 	}, nil
+}
+
+func (c *luaScriptContext) resetInheritedTTLForAbsentStart(key []byte, rawStartType redisValueType) {
+	if rawStartType != redisTypeNone {
+		return
+	}
+	if ttl := c.ttls[string(key)]; ttl == nil || !ttl.dirty {
+		c.clearTTL(key)
+	}
+}
+
+func (c *luaScriptContext) deleteElemsForCommitPlan(ctx context.Context, key []byte, rawStartType redisValueType) ([]*kv.Elem[kv.OP], error) {
+	var elems []*kv.Elem[kv.OP]
+	var err error
+	switch {
+	case rawStartType == redisTypeNone:
+		elems, _, err = c.server.emptyWideCollectionCleanupForRecreate(ctx, key, c.startTS)
+	case c.everDeleted[string(key)]:
+		elems, _, err = c.server.deleteLogicalKeyElems(ctx, key, c.startTS)
+	default:
+		elems, _, err = c.server.deleteLogicalKeyElemsForType(ctx, key, c.startTS, rawStartType)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return append(elems, redisTxnWideCollectionFenceElems(key)...), nil
 }
 
 func (c *luaScriptContext) rawStartTypeForCommitPlan(ctx context.Context, key []byte) (redisValueType, error) {
@@ -4474,18 +4510,11 @@ func (c *luaScriptContext) zsetCommitPlan(ctx context.Context, key string, commi
 	if st == nil || !st.dirty {
 		return luaCommitPlan{preserveExisting: true}, nil
 	}
-	rewriteForTTL, err := c.dirtyPositiveTTLOnLogicallyAbsentStart(ctx, key)
+	rewrite, err := c.zsetRequiresFullCommit(ctx, key, st)
 	if err != nil {
 		return luaCommitPlan{}, err
 	}
-	// physicallyExistsAtStart is true when the key had physical ZSet data in
-	// storage at script start but was TTL-expired (logically absent). Force a
-	// full commit so deleteLogicalKeyElems removes stale wide-column rows
-	// (members, score-index, meta, TTL) that were left by the expired ZSet.
-	if st.physicallyExistsAtStart || c.everDeleted[key] || st.membersLoaded {
-		return c.zsetFullCommitWithMerge(ctx, key, st)
-	}
-	if rewriteForTTL {
+	if rewrite {
 		return c.zsetFullCommitWithMerge(ctx, key, st)
 	}
 	if st.legacyBlobBase {
@@ -4499,6 +4528,26 @@ func (c *luaScriptContext) zsetCommitPlan(ctx context.Context, key string, commi
 	// Delta path: write only changed members + score index + metadata delta.
 	elems, err := c.zsetDeltaCommitElems(ctx, key, st, commitTS)
 	return luaCommitPlan{preserveExisting: true, inlineMetaRewritten: luaZSetMetaRewritten(elems, []byte(key)), elems: elems}, err
+}
+
+func (c *luaScriptContext) zsetRequiresFullCommit(ctx context.Context, key string, st *luaZSetState) (bool, error) {
+	if st.physicallyExistsAtStart || c.everDeleted[key] || st.membersLoaded {
+		return true, nil
+	}
+	rewriteForTTL, err := c.dirtyPositiveTTLOnLogicallyAbsentStart(ctx, key)
+	if err != nil || rewriteForTTL {
+		return rewriteForTTL, err
+	}
+	return c.zsetRecreateHasStaleWideColumns(ctx, key)
+}
+
+func (c *luaScriptContext) zsetRecreateHasStaleWideColumns(ctx context.Context, key string) (bool, error) {
+	rawStartType, err := c.rawStartTypeForCommitPlan(ctx, []byte(key))
+	if err != nil || rawStartType != redisTypeNone {
+		return false, err
+	}
+	_, stale, err := c.server.emptyWideCollectionCleanupForRecreate(ctx, []byte(key), c.startTS)
+	return stale, err
 }
 
 func (c *luaScriptContext) dirtyPositiveTTLOnLogicallyAbsentStart(ctx context.Context, key string) (bool, error) {
