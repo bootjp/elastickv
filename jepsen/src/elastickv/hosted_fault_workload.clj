@@ -42,11 +42,28 @@
     :s3 (when (= :read (:f op)) [(first (:value op))])
     (when (= :txn (:f op)) (map second (filter #(= :r (first %)) (:value op))))))
 
+(defn setup-client!
+  "Retry only idempotent table/bucket/queue initialization during leader startup."
+  [delegate test]
+  (loop [delays [100 250 500 1000 2000 3000 5000 5000 5000]]
+    (let [[ok result] (try [true (client/setup! delegate test)]
+                          (catch Exception e [false e]))
+          {:keys [status category type]} (when-not ok (ex-data result))
+          transient? (or (instance? java.io.IOException result)
+                         (#{429 500 502 503 504} status)
+                         (#{:cognitect.anomalies/busy :cognitect.anomalies/unavailable
+                            :cognitect.anomalies/fault} category)
+                         (#{"ServiceUnavailable" "OperationOutcomeUnknown" "InternalServerError"} type))]
+      (cond
+        ok result
+        (and transient? (seq delays)) (do (Thread/sleep (first delays)) (recur (rest delays)))
+        :else (throw result)))))
+
 (defrecord ObservedClient [delegate node]
   client/Client
   (open! [this test node]
     (assoc this :node node :delegate (client/open! delegate test node)))
-  (setup! [_ test] (client/setup! delegate test))
+  (setup! [_ test] (setup-client! delegate test))
   (invoke! [_ test op]
     (assoc (client/invoke! delegate test op) :node node))
   (teardown! [_ test] (client/teardown! delegate test))

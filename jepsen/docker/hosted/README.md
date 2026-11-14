@@ -80,6 +80,8 @@ S3 reuses `s3_budget.sh` to cap per-object histories at 32 operations while
 preserving the aggregate requested budget. Effective settings are saved in
 `parameters.txt`. SDK retries are disabled for DynamoDB/SQS so uncertain
 outcomes remain visible rather than replaying workload operations.
+Only idempotent table/bucket/queue setup is retried with bounded backoff while
+the fresh cluster elects its leader and opens its API listeners.
 
 For a local stress run:
 

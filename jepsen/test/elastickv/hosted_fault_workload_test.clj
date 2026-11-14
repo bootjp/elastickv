@@ -3,11 +3,29 @@
             [elastickv.cli :as cli]
             [elastickv.hosted-fault-workload :as hosted]
             [jepsen.checker :as checker]
+            [jepsen.client :as client]
             [jepsen.generator :as gen]
             [jepsen.independent :as independent]
             [jepsen.nemesis :as nemesis]))
 
 (def nodes ["n1" "n2" "n3"])
+
+(deftest resource-setup-retries-transient-startup-errors-only
+  (doseq [error [{:status 503} {:type "ServiceUnavailable"}
+                {:category :cognitect.anomalies/busy} {:type "OperationOutcomeUnknown"}]]
+    (let [calls (atom 0)
+          delegate (reify client/Client
+                     (setup! [_ _]
+                       (if (= 1 (swap! calls inc))
+                         (throw (ex-info "leader not ready" error)) :ready)))]
+      (is (= :ready (hosted/setup-client! delegate {})))
+      (is (= 2 @calls))))
+  (let [calls (atom 0)
+        delegate (reify client/Client
+                   (setup! [_ _] (swap! calls inc)
+                     (throw (ex-info "invalid request" {:status 400}))))]
+    (is (thrown? clojure.lang.ExceptionInfo (hosted/setup-client! delegate {})))
+    (is (= 1 @calls))))
 
 (defn good-history [fault]
   (let [[start stop] (hosted/fault-ops fault)]
