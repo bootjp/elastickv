@@ -43,6 +43,8 @@
   [host port]
   (aws/client
     {:api                  :dynamodb
+     ;; Jepsen must observe ambiguous outcomes rather than replay UpdateItem.
+     :retriable?           (constantly false)
      :region               "us-east-1"
      :credentials-provider (creds/basic-credentials-provider
                              {:access-key-id     "dummy"

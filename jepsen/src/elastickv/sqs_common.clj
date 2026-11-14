@@ -19,6 +19,8 @@
   [host port region]
   (aws/client
     {:api                  :sqs
+     ;; Keep one observed send/receive per Jepsen operation under faults.
+     :retriable?           (constantly false)
      :region               (or region "us-east-1")
      :credentials-provider (creds/basic-credentials-provider
                              {:access-key-id     "dummy"

@@ -4,6 +4,7 @@
             [elastickv.hosted-fault-workload :as hosted]
             [jepsen.checker :as checker]
             [jepsen.generator :as gen]
+            [jepsen.independent :as independent]
             [jepsen.nemesis :as nemesis]))
 
 (def nodes ["n1" "n2" "n3"])
@@ -55,6 +56,74 @@
   {:nodes nodes :faults [:kill] :fault-interval 1 :time-limit 10
    :rate 5 :concurrency 6 :key-count 2 :recovery-time 1})
 
+(deftest every-adapter-uses-its-production-endpoint-and-explicit-voters
+  (doseq [[adapter port-key port] [[:redis :redis-port 6379]
+                                  [:dynamodb :dynamo-port 8000]
+                                  [:s3 :s3-port 9000]
+                                  [:sqs-standard :sqs-port 9324]
+                                  [:sqs-htfifo :sqs-port 9324]]]
+    (doseq [fault [:partition :kill :pause]]
+      (let [test (hosted/hosted-fault-test (assoc opts :adapter adapter :faults [fault]))]
+        (is (= port (get-in test [:db :opts port-key])))
+        (is (= "n1=n1:50051,n2=n2:50051,n3=n3:50051"
+               (get-in test [:db :opts :bootstrap-members])))
+        (is (= (zipmap nodes (repeat port)) (get-in test [:client :delegate :node->port])))
+        (is (nil? (:final-generator test)))
+        (when (= :sqs-htfifo adapter)
+          (is (string? (:sqs-observation-clock-id test))))))))
+
+(defn adapter-history [adapter]
+  (mapv (fn [op]
+          (if (= :nemesis (:process op))
+            op
+            (case adapter
+              :s3 (assoc op :f (if (:final op) :read :write)
+                            :value (independent/tuple (if (:final op)
+                                                      (second (first (:value op))) 0) 1))
+              (:sqs-standard :sqs-htfifo)
+              (assoc op :f (if (:final op) :recv :send)
+                        :value (if (:final op) [] "message"))
+              op)))
+        (good-history :partition)))
+
+(deftest every-adapter-requires-successful-recovery-through-every-node
+  (doseq [adapter (keys hosted/adapters)]
+    (let [history (adapter-history adapter)
+          check #(checker/check (hosted/evidence-checker nodes :partition 2 1 adapter) {} % {})]
+      (is (true? (:valid? (check history))))
+      (is (false? (:valid? (check (filterv #(not= "n3" (:node %)) history)))))
+      (is (false? (:valid? (check (mapv #(if (:final %) (assoc % :type :info) %) history))))))))
+
+(deftest dynamodb-recovery-reads-do-not-exceed-the-transaction-key-limit
+  (let [test {:concurrency 6 :nodes nodes}
+        ctx (gen/context test)
+        ops (loop [g (hosted/final-read-phase nodes (atom (set (range 103))) :dynamodb)
+                   result []]
+              (let [[op next-gen] (gen/op g test ctx)]
+                (if (or (nil? op) (= :pending op)) result
+                    (recur next-gen (conj result op)))))]
+    (is (= 309 (count ops)))
+    (is (every? #(= 1 (count (:value %))) ops))
+    (doseq [[_ reads] (group-by #(mod (:process %) 3) ops)]
+      (is (= (set (range 103)) (set (map #(second (first (:value %))) reads)))))))
+
+(deftest stress-schedule-repeats-every-node
+  (doseq [fault [:partition :kill :pause]]
+    (let [ops (->> (hosted/fault-schedule nodes fault 1 true)
+                   (filter :f) (take 12))]
+      (is (= (concat nodes nodes) (map :target (take-nth 2 ops))))
+      (is (= 6 (count (filter :f (hosted/fault-schedule nodes fault 1 false))))))))
+
+(deftest stress-requires-multiple-completed-cycles-on-every-node
+  (doseq [fault [:partition :kill :pause]]
+    (let [history (good-history fault)
+          repeated (into (subvec history 0 13) (subvec history 1))
+          check #(checker/check (hosted/evidence-checker nodes fault 2 2) {} % {})]
+      (is (false? (:valid? (check history))))
+      (is (true? (:valid? (check repeated))))
+      (is (= (zipmap nodes (repeat 2)) (:completed-fault-cycles (check repeated))))
+      (is (false? (:valid? (check (assoc-in repeated [14 :error] :nemesis-error))))))))
+
 (deftest only-the-requested-fault-nemesis-is-initialized
   (doseq [fault [:partition :kill :pause]]
     (let [test (hosted/hosted-fault-test (assoc opts :faults [fault]))]
@@ -90,9 +159,14 @@
 
 (deftest managed-test-constructs-and-rejects-disabled-or-incomplete-faults
   (is (:generator (hosted/hosted-fault-test opts)))
+  (is (:generator (hosted/hosted-fault-test
+                    (assoc opts :repeat-faults true :min-fault-cycles 2 :time-limit 20))))
   (is (nil? (:final-generator (hosted/hosted-fault-test opts))))
   (doseq [bad [{:local true} {:host "localhost"} {:nodes ["n1" "n2"]}
                {:nodes ["n1" "n1" "n3"]} {:concurrency 5} {:rate 0}
+               {:min-fault-cycles 0} {:min-fault-cycles 2}
+               {:adapter :unknown} {:adapter :s3 :concurrency 3}
+               {:adapter :sqs-standard :drain-time 1}
                {:faults [:clock]} {:faults [:kill :pause]} {:time-limit 7}]]
     (is (thrown? clojure.lang.ExceptionInfo
                  (hosted/hosted-fault-test (merge opts bad)))))

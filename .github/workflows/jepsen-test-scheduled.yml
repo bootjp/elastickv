@@ -7,6 +7,11 @@ on:
         description: "Workload runtime seconds"
         required: false
         default: "300"
+      faults-only:
+        description: "Run only Docker fault stress jobs (five adapters x three faults)"
+        type: boolean
+        required: false
+        default: false
       long-fuse-run:
         description: "Run FUSE Jepsen workloads for 30 minutes"
         type: boolean
@@ -49,7 +54,24 @@ name: Jepsen Scheduled Stress Test
 permissions:
   contents: read
 jobs:
+  faults:
+    if: ${{ inputs.faults-only || !inputs.workloads-json }}
+    uses: ./.github/workflows/jepsen-hosted-faults.yml
+    with:
+      adapters-json: '["redis","dynamodb","s3","sqs-standard","sqs-htfifo"]'
+      time-limit: ${{ inputs.time-limit || '300' }}
+      repeat-faults: true
+      min-fault-cycles: 2
+      rate: ${{ inputs.rate || '5' }}
+      # Fault workers must cover all three nodes; the local S3 workload has
+      # a separate four-worker divisibility requirement.
+      concurrency: '6'
+      key-count: ${{ inputs.key-count || '8' }}
+      max-writes-per-key: ${{ inputs.max-writes-per-key || '150' }}
+      max-txn-length: ${{ inputs.max-txn-length || '4' }}
+      artifact-prefix: jepsen-stress
   test:
+    if: ${{ !inputs.faults-only }}
     name: test (${{ matrix.workload }})
     runs-on: ubuntu-latest
     strategy:
