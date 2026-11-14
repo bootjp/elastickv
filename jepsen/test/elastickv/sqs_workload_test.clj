@@ -138,14 +138,14 @@
         (is (= ["a"] (:value first-op)))
         (is (not (.contains (pr-str c) "original")) "pending receipt bytes must not be printed into test artifacts")
         (is (empty? (:deleted first-op)))
-        (is (zero? (:delete-retry-count waiting-op)) "fault-phase operations must not retry old deletes")
-        (is (false? (:valid? (result [(sent "a") first-op waiting-op retry-op]))))
-        (is (= ["a"] (:deleted final-op)))
+        (is (= 1 (:delete-retry-count waiting-op)) "retry is observable before another receive")
+        (is (false? (:valid? (result [(sent "a") first-op waiting-op]))))
+        (is (= ["a"] (:deleted retry-op)))
         (is (true? (:valid? (result [(sent "a") first-op waiting-op retry-op final-op]))))
         (is (= ["original" "original" "original"] @deletes))
-        (is (= 4 @receives))))))
+        (is (= 2 @receives))))))
 
-(deftest confirmed-retry-is-retained-until-its-receive-operation-completes
+(deftest confirmed-retry-is-recorded-before-next-receive
   (let [receives (atom 0) deletes (atom 0)
         c (assoc (:client (workload/sqs-workload {})) :queue-url (atom "queue"))]
     (with-redefs [sqs/invoke! (fn [_ operation _]
@@ -160,7 +160,65 @@
       (let [first-op (client/invoke! c {} {:f :recv})
             failed-final (client/invoke! c {} {:f :recv :final true})
             final-op (client/invoke! c {} {:f :recv :final true})]
-        (is (= :info (:type failed-final)))
-        (is (= ["a"] (:deleted final-op)))
-        (is (= 3 @deletes))
+        (is (= :ok (:type failed-final)))
+        (is (= ["a"] (:deleted failed-final)))
+        (is (= :info (:type final-op)))
+        (is (= 2 @deletes))
         (is (true? (:valid? (result [(sent "a") first-op failed-final final-op]))))))))
+
+(deftest pending-delete-prevents-receipt-rotation-and-stale-success
+  (let [live? (atom true) token (atom nil) receives (atom 0) deletes (atom 0)
+        c (assoc (:client (workload/sqs-workload {})) :queue-url (atom "queue"))]
+    (with-redefs [sqs/invoke! (fn [_ operation request]
+                              (case operation
+                                :ReceiveMessage (if @live?
+                                                  (let [n (swap! receives inc)]
+                                                    (reset! token (str "r" n))
+                                                    (if (= n 1)
+                                                      {:Messages [{:Body "a" :ReceiptHandle @token}]}
+                                                      (if (= n 2)
+                                                        (throw (ex-info "rotated receipt response lost" {}))
+                                                        {})))
+                                                  {})
+                                :DeleteMessage (if (= 1 (swap! deletes inc))
+                                                 (throw (ex-info "ambiguous delete" {}))
+                                                 (do (when (= @token (:ReceiptHandle request))
+                                                       (reset! live? false))
+                                                     {}))))]
+      (let [ops [(client/invoke! c {} {:f :recv})
+                 (client/invoke! (assoc c :conn :other-node) {} {:f :recv})
+                 (client/invoke! c {} {:f :recv :final true})]
+            verdict (result (cons (sent "a") ops))]
+        (is (not (and (:valid? verdict) @live?))
+            "a stale receipt's successful no-op must never certify a live message deleted")
+        (is (false? @live?))
+        (is (= 1 @receives) "pending deletes must settle before any receive can rotate receipts")
+        (is (:valid? verdict))))))
+
+(deftest concurrent-client-cannot-receive-while-delete-is-unsettled
+  (let [delete-entered (promise) release-delete (promise) other-entered (promise)
+        receives (atom 0) deletes (atom 0)
+        c (assoc (:client (workload/sqs-workload {})) :queue-url (atom "queue"))]
+    (with-redefs [sqs/invoke! (fn [_ operation _]
+                              (case operation
+                                :ReceiveMessage (if (= 1 (swap! receives inc))
+                                                  {:Messages [{:Body "a" :ReceiptHandle "receipt"}]}
+                                                  {})
+                                :DeleteMessage (if (= 1 (swap! deletes inc))
+                                                 (do (deliver delete-entered true)
+                                                     @release-delete
+                                                     (throw (ex-info "ambiguous" {})))
+                                                 {})))]
+      (let [first-op (future (client/invoke! c {} {:f :recv}))]
+        (try
+          (is (= true (deref delete-entered 5000 :timeout)))
+          (let [other-op (future (deliver other-entered true)
+                                 (client/invoke! (assoc c :conn :other-node) {} {:f :recv}))]
+            (is (= true (deref other-entered 5000 :timeout)))
+            (is (= :waiting (deref other-op 100 :waiting)))
+            (is (= 1 @receives))
+            (deliver release-delete true)
+            (is (empty? (:deleted (deref first-op 5000 {}))))
+            (is (= ["a"] (:deleted (deref other-op 5000 {}))))
+            (is (= 1 @receives)))
+          (finally (deliver release-delete true)))))))

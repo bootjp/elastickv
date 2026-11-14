@@ -33,35 +33,35 @@
                                          :Message :message
                                          :cognitect.anomalies/message])}})))
 
-(defn- receive-and-delete! [conn queue-url pending final?]
-  (let [;; Only recovery operations retry old receipts. Fault-phase sends and
-        ;; receives retain their original one-attempt transport behavior.
-        retried (if final?
-                  (mapv (fn [[receipt body]]
-                          (delete-receipt! conn queue-url pending body receipt))
-                        (take 10 @(.-state ^PendingDeletes pending)))
-                  [])
-        messages (:Messages (sqs/invoke! conn :ReceiveMessage
-                              {:QueueUrl queue-url
-                               :MaxNumberOfMessages 10
-                               :VisibilityTimeout 30
-                               :WaitTimeSeconds 1}))
-        acknowledgements (into retried
-                               (map (fn [message]
-                                      (delete-receipt! conn queue-url pending
-                                                       (:Body message) (:ReceiptHandle message))))
-                               messages)
-        confirmed (filter #(contains? % :deleted) acknowledgements)]
-    ;; Remove debt only once the entire recv operation can be recorded. If the
-    ;; ReceiveMessage above fails after a confirmed retry, keep that receipt for
-    ;; another idempotent confirmation rather than dropping the history evidence.
-    (swap! (.-state ^PendingDeletes pending)
-           #(apply dissoc % (map :receipt confirmed)))
-    {:value (mapv :Body messages)
-     :deleted (mapv :deleted confirmed)
-     :delete-retry-count (count retried)
-     :delete-errors (mapv :error (filter :error acknowledgements))
-     :delete-error-details (mapv :details (filter :error acknowledgements))}))
+(defn- receive-and-delete! [conn queue-url pending]
+  ;; All copies of this queue's client share this lock and debt. No receive may
+  ;; rotate a receipt while its DeleteMessage outcome is unknown. In particular,
+  ;; a successful retry cannot be the stale-handle no-op permitted by SQS.
+  (locking pending
+    (let [debt (take 10 @(.-state ^PendingDeletes pending))
+          ;; A retry is its own observable Jepsen operation, including during
+          ;; faults. Record its evidence before attempting another receive.
+          messages (if (seq debt)
+                     []
+                     (:Messages (sqs/invoke! conn :ReceiveMessage
+                                  {:QueueUrl queue-url
+                                   :MaxNumberOfMessages 10
+                                   :VisibilityTimeout 30
+                                   :WaitTimeSeconds 1})))
+          receipts (if (seq debt)
+                     debt
+                     (map (juxt :ReceiptHandle :Body) messages))
+          acknowledgements (mapv (fn [[receipt body]]
+                                   (delete-receipt! conn queue-url pending body receipt))
+                                 receipts)
+          confirmed (filter #(contains? % :deleted) acknowledgements)]
+      (swap! (.-state ^PendingDeletes pending)
+             #(apply dissoc % (map :receipt confirmed)))
+      {:value (mapv :Body messages)
+       :deleted (mapv :deleted confirmed)
+       :delete-retry-count (count debt)
+       :delete-errors (mapv :error (filter :error acknowledgements))
+       :delete-error-details (mapv :details (filter :error acknowledgements))})))
 
 (defrecord StandardClient [node->port region queue-name counter conn queue-url pending-deletes]
   client/Client
@@ -86,7 +86,7 @@
           :send (do (sqs/invoke! conn :SendMessage
                                 {:QueueUrl @queue-url :MessageBody (:value op)})
                     (assoc op :type :ok))
-          :recv (merge op {:type :ok} (receive-and-delete! conn @queue-url pending-deletes (:final op))))
+          :recv (merge op {:type :ok} (receive-and-delete! conn @queue-url pending-deletes)))
         (catch Exception e
           ;; A transport error or server error may happen after commit.
           ;; Conservatively keep these sends in the possible-send set.

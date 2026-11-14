@@ -1680,6 +1680,13 @@ type internalScanRouteSelection struct {
 }
 
 func (s *ShardStore) routesForInternalScanWithVersion(start []byte, end []byte) (internalScanRouteSelection, bool) {
+	if routeKey := dynamoScanRouteKey(start, end); routeKey != nil {
+		route, version, ok := s.engine.GetRouteWithVersion(routeKey)
+		if !ok {
+			return internalScanRouteSelection{routes: []distribution.Route{}, version: version}, true
+		}
+		return internalScanRouteSelection{routes: []distribution.Route{route}, version: version}, true
+	}
 	if isBroadLegacyListDeltaScan(start) {
 		routes, version := s.engine.GetIntersectingRoutesWithVersion(nil, nil)
 		return internalScanRouteSelection{routes: routes, version: version}, true

@@ -285,3 +285,45 @@ func TestShardStoreGlobalCommittedTimestampFloorFailsWithoutRaftEngine(t *testin
 	require.ErrorIs(t, err, ErrTSOCommitFloorUnavailable)
 	require.ErrorContains(t, err, "no raft engine")
 }
+
+func TestDynamoTableScanFenceUsesPointRoute(t *testing.T) {
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{Version: 1, Routes: []distribution.RouteDescriptor{
+		{RouteID: 1, End: []byte("!ddb|route|"), GroupID: 1, State: distribution.RouteStateActive},
+		{RouteID: 2, Start: []byte("!ddb|route|"), GroupID: 2, State: distribution.RouteStateActive},
+	}}))
+	local := store.NewMVCCStore()
+	shards := NewShardStore(engine, map[uint64]*ShardGroup{
+		1: {Engine: &recordingTSOEngine{state: raftengine.StateFollower}, Store: store.NewMVCCStore()},
+		2: {Engine: &recordingTSOEngine{state: raftengine.StateLeader}, Store: local},
+	})
+	t.Cleanup(func() { require.NoError(t, shards.Close()) })
+	for _, family := range []string{DynamoItemPrefix, DynamoSealPrefix, DynamoGSIPrefix} {
+		start := []byte(family + "orders|generation|partition|")
+		targets := shards.ReadFenceTargetsForRange(start, prefixScanEnd(start))
+		require.Len(t, targets, 1)
+		require.Equal(t, uint64(2), targets[0].GroupID, family)
+		// Broad scans spanning tables retain their actual route coverage.
+		broad := shards.ReadFenceTargetsForRange([]byte(family), prefixScanEnd([]byte(family)))
+		require.Len(t, broad, 1)
+		rawRoutes := engine.GetIntersectingRoutes([]byte(family), prefixScanEnd([]byte(family)))
+		require.Equal(t, rawRoutes[0].GroupID, broad[0].GroupID)
+		require.Nil(t, dynamoScanRouteKey([]byte(family), prefixScanEnd([]byte(family))))
+		require.Nil(t, dynamoScanRouteKey(start, nil))
+		require.Nil(t, dynamoScanRouteKey(start, []byte(family+"other|")))
+		key := append(append([]byte{}, start...), 'a')
+		require.NoError(t, local.PutAt(t.Context(), key, []byte("value"), 42, 0))
+		request := NewReadRequest(t.Context(), nil, shards, nil)
+		snapshot, err := request.Latest(request.Context(), "table scan", []byte(DynamoTableMetaPrefix+"orders"))
+		require.NoError(t, err)
+		rows, err := request.Scan(request.Context(), snapshot, start, prefixScanEnd(start), 10)
+		require.NoError(t, err)
+		require.Len(t, rows, 1)
+		require.Equal(t, key, rows[0].Key)
+		reverse, err := request.ReverseScan(request.Context(), snapshot, start, prefixScanEnd(start), 10)
+		require.NoError(t, err)
+		require.Len(t, reverse, 1)
+		require.Equal(t, key, reverse[0].Key)
+		request.Close()
+	}
+}
