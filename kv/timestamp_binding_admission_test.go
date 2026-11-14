@@ -2,6 +2,8 @@ package kv
 
 import (
 	"context"
+	"errors"
+	"sync/atomic"
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -89,4 +91,79 @@ func TestPrepareHomeRawTimestampBindingRejectsUnprovenCreation(t *testing.T) {
 	_, err = PrepareHomeRawTimestampBinding(t.Context(), leader, metadata, issue, request)
 	require.Error(t, err)
 	require.Zero(t, issues, "a lost home leader cannot mint from stale absence")
+}
+
+func TestPrepareHomeRawTimestampBindingConcurrentRetryStaysPending(t *testing.T) {
+	st := store.NewMVCCStore()
+	metadata, ok := st.(store.RaftControlMetadataStore)
+	require.True(t, ok)
+	request := &pb.Request{TimestampBindingOperationId: append([]byte{7}, make([]byte, 15)...),
+		Mutations: []*pb.Mutation{{Key: []byte("key"), Value: []byte("value")}}}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var issues atomic.Int32
+	issue := func(context.Context) (uint64, error) {
+		issues.Add(1)
+		close(entered)
+		<-release
+		return 42, nil
+	}
+	firstResult := make(chan error, 1)
+	go func() {
+		_, err := PrepareHomeRawTimestampBinding(t.Context(), &homeBindingLeader{}, metadata, issue, request)
+		firstResult <- err
+	}()
+	<-entered
+	secondResult := make(chan error, 1)
+	go func() {
+		_, err := PrepareHomeRawTimestampBinding(t.Context(), &homeBindingLeader{}, metadata, issue, request)
+		secondResult <- err
+	}()
+	close(release)
+	require.NoError(t, <-firstResult)
+	require.ErrorIs(t, <-secondResult, ErrTimestampBindingPending)
+	require.EqualValues(t, 1, issues.Load())
+}
+
+func TestPrepareHomeRawTimestampBindingAmbiguousIssueFailsClosed(t *testing.T) {
+	st := store.NewMVCCStore()
+	metadata, ok := st.(store.RaftControlMetadataStore)
+	require.True(t, ok)
+	request := &pb.Request{TimestampBindingOperationId: append([]byte{8}, make([]byte, 15)...),
+		Mutations: []*pb.Mutation{{Key: []byte("key"), Value: []byte("value")}}}
+	var issues int
+	ambiguous := errors.New("unknown issue result")
+	issue := func(context.Context) (uint64, error) { issues++; return 0, ambiguous }
+	_, err := PrepareHomeRawTimestampBinding(t.Context(), &homeBindingLeader{}, metadata, issue, request)
+	require.ErrorIs(t, err, ambiguous)
+	_, err = PrepareHomeRawTimestampBinding(t.Context(), &homeBindingLeader{}, metadata, issue, request)
+	require.ErrorIs(t, err, ErrTimestampBindingPending)
+	require.Equal(t, 1, issues)
+}
+
+func TestPrepareHomeRawTimestampBindingAmbiguousProposalResolvesOnlyFromAppliedBinding(t *testing.T) {
+	st := store.NewMVCCStore()
+	metadata, ok := st.(store.RaftControlMetadataStore)
+	require.True(t, ok)
+	applier, ok := st.(store.RaftEntryApplier)
+	require.True(t, ok)
+	request := &pb.Request{TimestampBindingOperationId: append([]byte{9}, make([]byte, 15)...),
+		Mutations: []*pb.Mutation{{Key: []byte("key"), Value: []byte("value")}}}
+	issues := 0
+	issue := func(context.Context) (uint64, error) { issues++; return 42, nil }
+	first, err := PrepareHomeRawTimestampBinding(t.Context(), &homeBindingLeader{}, metadata, issue, request)
+	require.NoError(t, err)
+	_, err = PrepareHomeRawTimestampBinding(t.Context(), &homeBindingLeader{}, metadata, issue, request)
+	require.ErrorIs(t, err, ErrTimestampBindingPending)
+	require.Equal(t, 1, issues)
+	binding, err := timestampBindingForCreationRequest(first)
+	require.NoError(t, err)
+	require.NoError(t, applier.ApplyRaftEntry(t.Context(), 1, func(ctx context.Context) error {
+		_, err := StageTimestampBinding(ctx, metadata, binding)
+		return err
+	}))
+	retry, err := PrepareHomeRawTimestampBinding(t.Context(), &homeBindingLeader{}, metadata, issue, request)
+	require.NoError(t, err)
+	require.Equal(t, first, retry)
+	require.Equal(t, 1, issues)
 }

@@ -190,15 +190,25 @@ Implementation order:
    operation-ID field until authenticated issuance and activation are wired.
    Before replicated activation, FSM apply ignores that field for single and
    batched entries so mixed-version replicas retain legacy apply semantics;
-   ingress still rejects newly bound requests.
+   ingress still rejects newly bound requests. A focused integration test now
+   carries native group-0 issuance through home preparation, atomic binding
+   and data apply, and exact-ID retry. An in-process pending-ID gate now
+   prevents concurrent or ambiguous retries from reissuing before the applied
+   binding is observed. The gate does not survive restart; durable intent or
+   a proven reconciliation protocol is still required. The integration test
+   uses a test issuer and method descriptor, not the production allocator and
+   registered method. It is not the production Forward path.
 2. Authenticated issuance and primary/home admission path, including unknown
    outcome reconciliation and cross-group PREPARE/COMMIT/ABORT evidence. This
-   branch adds a TLS-and-bearer-guarded group-0 issuance RPC and an opt-in
-   single-home raw binding preparation helper. Neither RPC is installed in
-   production: TLS plus a bearer token does not establish peer-session
-   identity, and no replicated all-member activation gate or stable public raw
-   operation ID exists yet. The helper therefore cannot authorize production
-   writes or serve as a substitute for primary/secondary evidence.
+   branch adds a versioned, physical-band-backed group-0 issuance RPC and an
+   opt-in single-home raw binding preparation helper. Protected-bootstrap
+   runtimes register issuance and home lookup as typed private peer-session
+   methods; TLS plus a bearer token alone is rejected. The authenticated
+   client checks the versioned response and has no legacy fallback. The
+   handler option and client route are not installed in production: no
+   replicated all-member activation gate or stable public raw operation ID
+   exists yet. The helper therefore cannot authorize production writes or
+   serve as a substitute for primary/secondary evidence.
 3. Physical-band group-0 reservation and versioned reservation response;
    prove no duplicate issuance across concurrent allocators, term changes,
    ambiguous proposals, and ceiling renewal. An opt-in local allocator now

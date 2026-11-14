@@ -14,6 +14,10 @@ func BootstrapPublicGRPCMethods() []string {
 	for _, method := range BootstrapSharedGRPCMethods(0) {
 		mixed[method.Name] = true
 	}
+	private := map[string]bool{
+		pb.Internal_IssueBoundTimestamp_FullMethodName:    true,
+		pb.Internal_LookupTimestampBinding_FullMethodName: true,
+	}
 	var methods []string
 	for _, service := range []*grpc.ServiceDesc{
 		&pb.RawKV_ServiceDesc, &pb.TransactionalKV_ServiceDesc, &pb.Internal_ServiceDesc,
@@ -22,7 +26,7 @@ func BootstrapPublicGRPCMethods() []string {
 	} {
 		for _, method := range service.Methods {
 			name := "/" + service.ServiceName + "/" + method.MethodName
-			if !mixed[name] {
+			if !mixed[name] && !private[name] {
 				methods = append(methods, name)
 			}
 		}

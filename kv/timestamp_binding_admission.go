@@ -2,6 +2,7 @@ package kv
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -12,6 +13,18 @@ import (
 )
 
 const timestampBindingAdmissionBudget = 5 * time.Second
+
+var ErrTimestampBindingPending = errors.New("timestamp binding admission outcome unresolved")
+
+// This gate is intentionally process-local. It prevents a live admission
+// process from reissuing an ID whose first attempt may have reached Raft.
+// Durable reconciliation is required before enabling this path in production.
+var homeBindingAttempts sync.Map // [16]byte -> *homeBindingAttempt
+
+type homeBindingAttempt struct {
+	mu      sync.Mutex
+	pending bool
+}
 
 // PrepareHomeRawTimestampBinding prepares one raw write for the opt-in atomic
 // data-group apply path. The issuer must be a leader-owned authenticated TSO
@@ -29,22 +42,27 @@ func PrepareHomeRawTimestampBinding(
 	}
 	ctx, cancel := context.WithTimeout(ctx, timestampBindingAdmissionBudget)
 	defer cancel()
+	attemptValue, _ := homeBindingAttempts.LoadOrStore(operationID, &homeBindingAttempt{})
+	attempt, ok := attemptValue.(*homeBindingAttempt)
+	if !ok {
+		return nil, errors.WithStack(ErrTimestampBindingInvalid)
+	}
+	attempt.mu.Lock()
+	defer attempt.mu.Unlock()
 	bound, found, err := readHomeBinding(ctx, leader, metadata, operationID)
 	if err != nil {
 		return nil, err
 	}
 	owned := proto.CloneOf(request)
 	if found {
-		owned.Ts = bound.Timestamp
-		candidate, err := timestampBindingForCreationRequest(owned)
-		if err != nil {
-			return nil, err
-		}
-		if candidate != bound {
-			return nil, errors.WithStack(ErrTimestampBindingConflict)
-		}
-		return owned, nil
+		return prepareExistingHomeRawBinding(owned, bound, operationID)
 	}
+	if attempt.pending {
+		return nil, errors.WithStack(ErrTimestampBindingPending)
+	}
+	// An issue error may mean the timestamp was already handed to a proposer.
+	// Never release this ID on an unknown outcome, even if the caller cancels.
+	attempt.pending = true
 	timestamp, err := issue(ctx)
 	if err != nil {
 		return nil, errors.Wrap(err, "issue home write timestamp")
@@ -56,6 +74,19 @@ func PrepareHomeRawTimestampBinding(
 	if _, err := timestampBindingForCreationRequest(owned); err != nil {
 		return nil, err
 	}
+	return owned, nil
+}
+
+func prepareExistingHomeRawBinding(owned *pb.Request, bound TimestampBinding, operationID [16]byte) (*pb.Request, error) {
+	owned.Ts = bound.Timestamp
+	candidate, err := timestampBindingForCreationRequest(owned)
+	if err != nil {
+		return nil, err
+	}
+	if candidate != bound {
+		return nil, errors.WithStack(ErrTimestampBindingConflict)
+	}
+	homeBindingAttempts.Delete(operationID)
 	return owned, nil
 }
 

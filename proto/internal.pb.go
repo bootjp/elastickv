@@ -3078,10 +3078,13 @@ func (x *IssueMigrationTimestampResponse) GetLastCommitTs() uint64 {
 }
 
 type IssueBoundTimestampRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	MinTimestamp  uint64                 `protobuf:"varint,1,opt,name=min_timestamp,json=minTimestamp,proto3" json:"min_timestamp,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	MinTimestamp uint64                 `protobuf:"varint,1,opt,name=min_timestamp,json=minTimestamp,proto3" json:"min_timestamp,omitempty"`
+	// Version 1 requires a committed physical-band issuance. An old server
+	// ignores this field and returns version zero, which callers must reject.
+	PhysicalBandProtocolVersion uint32 `protobuf:"varint,2,opt,name=physical_band_protocol_version,json=physicalBandProtocolVersion,proto3" json:"physical_band_protocol_version,omitempty"`
+	unknownFields               protoimpl.UnknownFields
+	sizeCache                   protoimpl.SizeCache
 }
 
 func (x *IssueBoundTimestampRequest) Reset() {
@@ -3121,11 +3124,21 @@ func (x *IssueBoundTimestampRequest) GetMinTimestamp() uint64 {
 	return 0
 }
 
+func (x *IssueBoundTimestampRequest) GetPhysicalBandProtocolVersion() uint32 {
+	if x != nil {
+		return x.PhysicalBandProtocolVersion
+	}
+	return 0
+}
+
 type IssueBoundTimestampResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Timestamp     uint64                 `protobuf:"varint,1,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state                       protoimpl.MessageState `protogen:"open.v1"`
+	Timestamp                   uint64                 `protobuf:"varint,1,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	PhysicalBandProtocolVersion uint32                 `protobuf:"varint,2,opt,name=physical_band_protocol_version,json=physicalBandProtocolVersion,proto3" json:"physical_band_protocol_version,omitempty"`
+	CommittedBandEnd            uint64                 `protobuf:"varint,3,opt,name=committed_band_end,json=committedBandEnd,proto3" json:"committed_band_end,omitempty"`
+	PreviousIssuedCursor        uint64                 `protobuf:"varint,4,opt,name=previous_issued_cursor,json=previousIssuedCursor,proto3" json:"previous_issued_cursor,omitempty"`
+	unknownFields               protoimpl.UnknownFields
+	sizeCache                   protoimpl.SizeCache
 }
 
 func (x *IssueBoundTimestampResponse) Reset() {
@@ -3161,6 +3174,27 @@ func (*IssueBoundTimestampResponse) Descriptor() ([]byte, []int) {
 func (x *IssueBoundTimestampResponse) GetTimestamp() uint64 {
 	if x != nil {
 		return x.Timestamp
+	}
+	return 0
+}
+
+func (x *IssueBoundTimestampResponse) GetPhysicalBandProtocolVersion() uint32 {
+	if x != nil {
+		return x.PhysicalBandProtocolVersion
+	}
+	return 0
+}
+
+func (x *IssueBoundTimestampResponse) GetCommittedBandEnd() uint64 {
+	if x != nil {
+		return x.CommittedBandEnd
+	}
+	return 0
+}
+
+func (x *IssueBoundTimestampResponse) GetPreviousIssuedCursor() uint64 {
+	if x != nil {
+		return x.PreviousIssuedCursor
 	}
 	return 0
 }
@@ -3527,11 +3561,15 @@ const file_internal_proto_rawDesc = "" +
 	"\x1eIssueMigrationTimestampRequest\"e\n" +
 	"\x1fIssueMigrationTimestampResponse\x12\x1c\n" +
 	"\ttimestamp\x18\x01 \x01(\x04R\ttimestamp\x12$\n" +
-	"\x0elast_commit_ts\x18\x02 \x01(\x04R\flastCommitTs\"A\n" +
+	"\x0elast_commit_ts\x18\x02 \x01(\x04R\flastCommitTs\"\x86\x01\n" +
 	"\x1aIssueBoundTimestampRequest\x12#\n" +
-	"\rmin_timestamp\x18\x01 \x01(\x04R\fminTimestamp\";\n" +
+	"\rmin_timestamp\x18\x01 \x01(\x04R\fminTimestamp\x12C\n" +
+	"\x1ephysical_band_protocol_version\x18\x02 \x01(\rR\x1bphysicalBandProtocolVersion\"\xe4\x01\n" +
 	"\x1bIssueBoundTimestampResponse\x12\x1c\n" +
-	"\ttimestamp\x18\x01 \x01(\x04R\ttimestamp\"B\n" +
+	"\ttimestamp\x18\x01 \x01(\x04R\ttimestamp\x12C\n" +
+	"\x1ephysical_band_protocol_version\x18\x02 \x01(\rR\x1bphysicalBandProtocolVersion\x12,\n" +
+	"\x12committed_band_end\x18\x03 \x01(\x04R\x10committedBandEnd\x124\n" +
+	"\x16previous_issued_cursor\x18\x04 \x01(\x04R\x14previousIssuedCursor\"B\n" +
 	"\x1dLookupTimestampBindingRequest\x12!\n" +
 	"\foperation_id\x18\x01 \x01(\fR\voperationId\"\xd7\x01\n" +
 	"\x1eLookupTimestampBindingResponse\x12\x14\n" +

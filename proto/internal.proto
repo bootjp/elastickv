@@ -432,10 +432,16 @@ message IssueMigrationTimestampResponse {
 
 message IssueBoundTimestampRequest {
   uint64 min_timestamp = 1;
+  // Version 1 requires a committed physical-band issuance. An old server
+  // ignores this field and returns version zero, which callers must reject.
+  uint32 physical_band_protocol_version = 2;
 }
 
 message IssueBoundTimestampResponse {
   uint64 timestamp = 1;
+  uint32 physical_band_protocol_version = 2;
+  uint64 committed_band_end = 3;
+  uint64 previous_issued_cursor = 4;
 }
 
 message LookupTimestampBindingRequest {
