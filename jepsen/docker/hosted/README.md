@@ -39,6 +39,7 @@ rejects a run that ends before all three cycles complete. Builds, cluster
 startup, recovery, and analysis add to the total job duration.
 
 Results are written to `artifacts/jepsen-<fault>/`: the complete Jepsen `store/`
+(packed as `store.tar.gz` to preserve timestamp paths containing colons),
 (history, checker results and collected node logs), control/container logs,
 commit, parameters, resolved Compose configuration, and exit code. GitHub
 uploads these even after failure and retains them for 14 days. Per-run SSH

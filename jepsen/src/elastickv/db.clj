@@ -58,7 +58,7 @@
     (doseq [[out-cmd args] binary-builds]
       (let [{:keys [exit err]} (apply sh/sh (concat args [:env env :dir root]))]
         (when-not (zero? exit)
-          (throw (ex-info (str "failed to build " out-cmd) {:err err})))))))
+          (throw (ex-info (str "failed to build " out-cmd ": " err) {:err err})))))))
 
 (defonce ^:private built? (delay (build-binaries!)))
 

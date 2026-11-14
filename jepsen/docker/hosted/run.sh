@@ -30,7 +30,8 @@ finish() {
     fi
   done
   if [[ -d jepsen/store ]]; then
-    cp -a jepsen/store "$artifact_dir/" || status=1
+    # Timestamp directories contain colons, which upload-artifact rejects.
+    tar -czf "$artifact_dir/store.tar.gz" -C jepsen store || status=1
   elif [[ "$status" == 0 ]]; then
     echo 'Successful run has no Jepsen store' >> "$artifact_dir/collection.log"
     status=1
