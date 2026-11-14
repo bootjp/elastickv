@@ -22,9 +22,10 @@ var ErrTimestampBindingPending = errors.New("timestamp binding admission outcome
 var homeBindingAttempts sync.Map // [16]byte -> *homeBindingAttempt
 
 type homeBindingAttempt struct {
-	mu      sync.Mutex
-	pending bool
-	term    uint64
+	mu        sync.Mutex
+	pending   bool
+	term      uint64
+	timestamp uint64
 }
 
 func homeBindingLeaderTerm(leader raftengine.LeaderView) uint64 {
@@ -87,6 +88,7 @@ func PrepareHomeRawTimestampBinding(
 	if _, err := timestampBindingForCreationRequest(owned); err != nil {
 		return nil, err
 	}
+	attempt.timestamp = timestamp
 	return owned, nil
 }
 
@@ -98,7 +100,24 @@ func (a *homeBindingAttempt) reserve(term uint64) error {
 	// commit. A delayed prior-term request is rejected by ProposeIfTerm.
 	a.pending = true
 	a.term = term
+	a.timestamp = 0
 	return nil
+}
+
+func clearAppliedHomeBindingAttempt(binding TimestampBinding) {
+	value, ok := homeBindingAttempts.Load(binding.OperationID)
+	if !ok {
+		return
+	}
+	attempt, ok := value.(*homeBindingAttempt)
+	if !ok {
+		return
+	}
+	attempt.mu.Lock()
+	defer attempt.mu.Unlock()
+	if attempt.pending && attempt.timestamp == binding.Timestamp {
+		homeBindingAttempts.CompareAndDelete(binding.OperationID, attempt)
+	}
 }
 
 func prepareExistingHomeRawBinding(owned *pb.Request, bound TimestampBinding, operationID [16]byte, term uint64) (*pb.Request, error) {

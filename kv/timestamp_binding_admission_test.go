@@ -197,6 +197,45 @@ func TestPrepareHomeRawTimestampBindingAmbiguousProposalResolvesOnlyFromAppliedB
 	require.Equal(t, 1, issues)
 }
 
+func TestHomeBindingAttemptClearedOnlyAfterAtomicApply(t *testing.T) {
+	st := store.NewMVCCStore()
+	metadata, ok := st.(store.RaftControlMetadataStore)
+	require.True(t, ok)
+	request := &pb.Request{TimestampBindingOperationId: append([]byte{11}, make([]byte, 15)...),
+		Mutations: []*pb.Mutation{{Key: []byte("key"), Value: []byte("value")}}}
+	clearHomeBindingAttemptAfterTest(t, request)
+	issues := 0
+	issue := func(context.Context) (uint64, error) { issues++; return 42, nil }
+	prepared, err := PrepareHomeRawTimestampBinding(t.Context(), &homeBindingLeader{}, metadata, issue, request)
+	require.NoError(t, err)
+	var operationID [16]byte
+	copy(operationID[:], request.TimestampBindingOperationId)
+	_, pending := homeBindingAttempts.Load(operationID)
+	require.True(t, pending)
+
+	binding, err := timestampBindingForCreationRequest(prepared)
+	require.NoError(t, err)
+	other := binding
+	other.Timestamp++
+	clearAppliedHomeBindingAttempt(other)
+	_, pending = homeBindingAttempts.Load(operationID)
+	require.True(t, pending, "an unrelated applied timestamp cannot release this attempt")
+	boom := errors.New("apply rejected")
+	_, err = ApplyTimestampBoundCreation(t.Context(), st, 1, binding, func(context.Context) error { return boom })
+	require.ErrorIs(t, err, boom)
+	_, pending = homeBindingAttempts.Load(operationID)
+	require.True(t, pending, "failed apply does not prove the binding committed")
+
+	_, err = ApplyTimestampBoundCreation(t.Context(), st, 2, binding, func(context.Context) error { return nil })
+	require.NoError(t, err)
+	_, pending = homeBindingAttempts.Load(operationID)
+	require.False(t, pending, "committed binding no longer needs a process-local pending gate")
+	retry, err := PrepareHomeRawTimestampBinding(t.Context(), &homeBindingLeader{}, metadata, issue, request)
+	require.NoError(t, err)
+	require.Equal(t, prepared.Ts, retry.Ts)
+	require.Equal(t, 1, issues)
+}
+
 func TestPrepareHomeRawTimestampBindingReissuesAfterNewTermBarrier(t *testing.T) {
 	st := store.NewMVCCStore()
 	metadata, ok := st.(store.RaftControlMetadataStore)

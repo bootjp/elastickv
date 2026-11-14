@@ -202,7 +202,10 @@ Implementation order:
    the process-local pending gate can reissue; a delayed old-term request is
    fenced even across process restart. This is not a production admission
    capability: Forward still rejects bound requests, and all-member activation
-   and authenticated issuance remain required.
+   and authenticated issuance remain required. A successful atomic data-group
+   apply now clears the matching process-local pending attempt; failed apply or
+   a different timestamp retains it. Unknown outcomes still require durable
+   reconciliation before production activation.
    The integration test
    uses a test issuer and method descriptor, not the production allocator and
    registered method. It is not the production Forward path. Memory and Pebble
