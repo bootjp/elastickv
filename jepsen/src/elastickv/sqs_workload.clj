@@ -13,35 +13,57 @@
             [jepsen.client :as client]
             [jepsen.generator :as gen]))
 
-(defn- receive-and-delete! [conn queue-url]
-  (let [messages (:Messages (sqs/invoke! conn :ReceiveMessage
+(deftype PendingDeletes [state]
+  Object
+  (toString [_] "pending delete receipts (redacted)"))
+
+(defn- delete-receipt! [conn queue-url pending body receipt]
+  (try
+    (sqs/invoke! conn :DeleteMessage {:QueueUrl queue-url :ReceiptHandle receipt})
+    {:deleted body :receipt receipt}
+    (catch Exception e
+      (swap! (.-state ^PendingDeletes pending) assoc receipt body)
+      {:receipt receipt
+       :error (.getMessage e)
+       :details {:body body
+                 :type (:type (ex-data e))
+                 :category (:category (ex-data e))
+                 :response (select-keys (:resp (ex-data e))
+                                        [:Error :ErrorResponse :__type
+                                         :Message :message
+                                         :cognitect.anomalies/message])}})))
+
+(defn- receive-and-delete! [conn queue-url pending final?]
+  (let [;; Only recovery operations retry old receipts. Fault-phase sends and
+        ;; receives retain their original one-attempt transport behavior.
+        retried (if final?
+                  (mapv (fn [[receipt body]]
+                          (delete-receipt! conn queue-url pending body receipt))
+                        (take 10 @(.-state ^PendingDeletes pending)))
+                  [])
+        messages (:Messages (sqs/invoke! conn :ReceiveMessage
                               {:QueueUrl queue-url
                                :MaxNumberOfMessages 10
                                :VisibilityTimeout 30
                                :WaitTimeSeconds 1}))
-        acknowledgements
-        (mapv (fn [message]
-                (try
-                  (sqs/invoke! conn :DeleteMessage
-                               {:QueueUrl queue-url
-                                :ReceiptHandle (:ReceiptHandle message)})
-                  {:deleted (:Body message)}
-                  (catch Exception e
-                    {:error (.getMessage e)
-                     :details {:body (:Body message)
-                               :type (:type (ex-data e))
-                               :category (:category (ex-data e))
-                               :response (select-keys (:resp (ex-data e))
-                                                      [:Error :ErrorResponse :__type
-                                                       :Message :message
-                                                       :cognitect.anomalies/message])}})))
-              messages)]
+        acknowledgements (into retried
+                               (map (fn [message]
+                                      (delete-receipt! conn queue-url pending
+                                                       (:Body message) (:ReceiptHandle message))))
+                               messages)
+        confirmed (filter #(contains? % :deleted) acknowledgements)]
+    ;; Remove debt only once the entire recv operation can be recorded. If the
+    ;; ReceiveMessage above fails after a confirmed retry, keep that receipt for
+    ;; another idempotent confirmation rather than dropping the history evidence.
+    (swap! (.-state ^PendingDeletes pending)
+           #(apply dissoc % (map :receipt confirmed)))
     {:value (mapv :Body messages)
-     :deleted (mapv :deleted (filter #(contains? % :deleted) acknowledgements))
+     :deleted (mapv :deleted confirmed)
+     :delete-retry-count (count retried)
      :delete-errors (mapv :error (filter :error acknowledgements))
      :delete-error-details (mapv :details (filter :error acknowledgements))}))
 
-(defrecord StandardClient [node->port region queue-name counter conn queue-url]
+(defrecord StandardClient [node->port region queue-name counter conn queue-url pending-deletes]
   client/Client
   (open! [this test node]
     (assoc this :conn (sqs/make-client (or (:sqs-host test) (name node))
@@ -64,7 +86,7 @@
           :send (do (sqs/invoke! conn :SendMessage
                                 {:QueueUrl @queue-url :MessageBody (:value op)})
                     (assoc op :type :ok))
-          :recv (merge op {:type :ok} (receive-and-delete! conn @queue-url)))
+          :recv (merge op {:type :ok} (receive-and-delete! conn @queue-url pending-deletes (:final op))))
         (catch Exception e
           ;; A transport error or server error may happen after commit.
           ;; Conservatively keep these sends in the possible-send set.
@@ -103,7 +125,7 @@
   {:client (->StandardClient (:node->port opts) (:sqs-region opts)
                              (or (:queue-name opts)
                                  (str "jepsen-standard-" (java.util.UUID/randomUUID)))
-                             (atom 0) nil (atom nil))
+                             (atom 0) nil (atom nil) (PendingDeletes. (atom {})))
    :generator (gen/mix [(gen/repeat {:f :send}) (gen/repeat {:f :recv})])
    :checker (standard-checker)})
 

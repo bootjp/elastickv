@@ -117,3 +117,50 @@
               op (client/invoke! execution-client test-map {:f :send})]
           (is (= :ok (:type op)))
           (is (= "http://n1/queue" (:QueueUrl @sent-request))))))))
+
+(deftest recovery-confirms-ambiguous-delete-with-original-receipt
+  (let [receives (atom 0) deletes (atom [])
+        c (assoc (:client (workload/sqs-workload {})) :queue-url (atom "queue"))]
+    (with-redefs [sqs/invoke! (fn [_ operation request]
+                              (case operation
+                                :ReceiveMessage (if (= 1 (swap! receives inc))
+                                                  {:Messages [{:Body "a" :ReceiptHandle "original"}]}
+                                                  {})
+                                :DeleteMessage (do
+                                                 (swap! deletes conj (:ReceiptHandle request))
+                                                 (if (< (count @deletes) 3)
+                                                   (throw (ex-info "ambiguous delete" {:type "OperationOutcomeUnknown"}))
+                                                   {}))))]
+      (let [first-op (client/invoke! c {} {:type :invoke :f :recv})
+            waiting-op (client/invoke! c {} {:type :invoke :f :recv})
+            retry-op (client/invoke! (assoc c :conn :recovered-node) {} {:type :invoke :f :recv :final true})
+            final-op (client/invoke! c {} {:type :invoke :f :recv :final true})]
+        (is (= ["a"] (:value first-op)))
+        (is (not (.contains (pr-str c) "original")) "pending receipt bytes must not be printed into test artifacts")
+        (is (empty? (:deleted first-op)))
+        (is (zero? (:delete-retry-count waiting-op)) "fault-phase operations must not retry old deletes")
+        (is (false? (:valid? (result [(sent "a") first-op waiting-op retry-op]))))
+        (is (= ["a"] (:deleted final-op)))
+        (is (true? (:valid? (result [(sent "a") first-op waiting-op retry-op final-op]))))
+        (is (= ["original" "original" "original"] @deletes))
+        (is (= 4 @receives))))))
+
+(deftest confirmed-retry-is-retained-until-its-receive-operation-completes
+  (let [receives (atom 0) deletes (atom 0)
+        c (assoc (:client (workload/sqs-workload {})) :queue-url (atom "queue"))]
+    (with-redefs [sqs/invoke! (fn [_ operation _]
+                              (case operation
+                                :ReceiveMessage (case (swap! receives inc)
+                                                  1 {:Messages [{:Body "a" :ReceiptHandle "receipt"}]}
+                                                  2 (throw (ex-info "receive connection lost" {}))
+                                                  {})
+                                :DeleteMessage (if (= 1 (swap! deletes inc))
+                                                 (throw (ex-info "ambiguous delete" {:type "OperationOutcomeUnknown"}))
+                                                 {})))]
+      (let [first-op (client/invoke! c {} {:f :recv})
+            failed-final (client/invoke! c {} {:f :recv :final true})
+            final-op (client/invoke! c {} {:f :recv :final true})]
+        (is (= :info (:type failed-final)))
+        (is (= ["a"] (:deleted final-op)))
+        (is (= 3 @deletes))
+        (is (true? (:valid? (result [(sent "a") first-op failed-final final-op]))))))))
