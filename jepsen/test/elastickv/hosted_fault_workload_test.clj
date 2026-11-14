@@ -1,5 +1,6 @@
 (ns elastickv.hosted-fault-workload-test
   (:require [clojure.test :refer :all]
+            [cognitect.aws.client.api :as aws]
             [elastickv.cli :as cli]
             [elastickv.hosted-fault-workload :as hosted]
             [jepsen.checker :as checker]
@@ -73,6 +74,16 @@
 (def opts
   {:nodes nodes :faults [:kill] :fault-interval 1 :time-limit 10
    :rate 5 :concurrency 6 :key-count 2 :recovery-time 1})
+
+(deftest normal-sdk-retry-policy-is-preserved-outside-fault-tests
+  (doseq [[adapter field] [[:dynamodb :ddb] [:sqs-standard :conn] [:sqs-htfifo :sqs]]]
+    (let [test (hosted/hosted-fault-test (assoc opts :adapter adapter))
+          delegate (get-in test [:client :delegate])]
+      (with-redefs [aws/client identity]
+        (let [normal (get (client/open! delegate {} "n1") field)
+              fault (get (client/open! delegate test "n1") field)]
+          (is (not (contains? normal :retriable?)))
+          (is (false? ((:retriable? fault) {:cognitect.anomalies/category :cognitect.anomalies/busy}))))))))
 
 (deftest every-adapter-uses-its-production-endpoint-and-explicit-voters
   (doseq [[adapter port-key port] [[:redis :redis-port 6379]

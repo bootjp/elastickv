@@ -78,8 +78,9 @@ Stress `time-limit`, `rate`, `key-count`, `max-writes-per-key`, and
 three nodes; it is independent of the local S3 workload's concurrency setting.
 S3 reuses `s3_budget.sh` to cap per-object histories at 32 operations while
 preserving the aggregate requested budget. Effective settings are saved in
-`parameters.txt`. SDK retries are disabled for DynamoDB/SQS so uncertain
-outcomes remain visible rather than replaying workload operations.
+`parameters.txt`. SDK retries are disabled for DynamoDB/SQS only in this fault
+harness so uncertain outcomes remain visible rather than replaying workload
+operations. Existing local workloads retain their default SDK retry policy.
 Only idempotent table/bucket/queue setup is retried with bounded backoff while
 the fresh cluster elects its leader and opens its API listeners.
 

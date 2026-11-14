@@ -223,6 +223,7 @@
              :name (str "elastickv-hosted-" (name adapter) "-" (name fault))
              :final-generator nil
              :concurrency (:concurrency opts)
+             :disable-sdk-retries true
              :db managed-db
              ;; Images contain all dependencies. Debian OS setup manages system
              ;; services and /etc/hosts, which Docker owns on these nodes.

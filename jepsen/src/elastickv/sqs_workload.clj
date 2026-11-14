@@ -37,7 +37,8 @@
   client/Client
   (open! [this test node]
     (assoc this :conn (sqs/make-client (or (:sqs-host test) (name node))
-                                     (get node->port node 9324) region)))
+                                     (get node->port node 9324) region
+                                     (:disable-sdk-retries test))))
   (setup! [this _test]
     ;; CreateQueue is idempotent for identical attributes; conflicting
     ;; attributes must fail setup rather than silently reuse another queue.

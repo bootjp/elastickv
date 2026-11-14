@@ -16,18 +16,18 @@
   "Returns a cognitect/aws-api SQS client pointed at http://host:port.
    Dummy credentials match the elastickv server's open-endpoint mode (no
    --sqsCredentialsFile passed → adapter accepts any signed request)."
-  [host port region]
-  (aws/client
-    {:api                  :sqs
-     ;; Keep one observed send/receive per Jepsen operation under faults.
-     :retriable?           (constantly false)
-     :region               (or region "us-east-1")
-     :credentials-provider (creds/basic-credentials-provider
-                             {:access-key-id     "dummy"
-                              :secret-access-key "dummy"})
-     :endpoint-override    {:protocol :http
-                            :hostname  host
-                            :port      port}}))
+  ([host port region] (make-client host port region false))
+  ([host port region disable-retries?]
+   (aws/client
+     (cond-> {:api                  :sqs
+              :region               (or region "us-east-1")
+              :credentials-provider (creds/basic-credentials-provider
+                                      {:access-key-id     "dummy"
+                                       :secret-access-key "dummy"})
+              :endpoint-override    {:protocol :http
+                                     :hostname host
+                                     :port port}}
+       disable-retries? (assoc :retriable? (constantly false))))))
 
 (defn- anomaly? [resp]
   (contains? resp :cognitect.anomalies/category))

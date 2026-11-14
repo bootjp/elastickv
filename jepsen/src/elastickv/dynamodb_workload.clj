@@ -40,18 +40,18 @@
    Dummy credentials and a fixed region are provided explicitly so the SDK
    never attempts credential or region resolution from the environment
    (which would fail in CI or local runs without AWS config)."
-  [host port]
-  (aws/client
-    {:api                  :dynamodb
-     ;; Jepsen must observe ambiguous outcomes rather than replay UpdateItem.
-     :retriable?           (constantly false)
-     :region               "us-east-1"
-     :credentials-provider (creds/basic-credentials-provider
-                             {:access-key-id     "dummy"
-                              :secret-access-key "dummy"})
-     :endpoint-override    {:protocol :http
-                            :hostname  host
-                            :port      port}}))
+  ([host port] (make-ddb-client host port false))
+  ([host port disable-retries?]
+   (aws/client
+     (cond-> {:api                  :dynamodb
+              :region               "us-east-1"
+              :credentials-provider (creds/basic-credentials-provider
+                                      {:access-key-id     "dummy"
+                                       :secret-access-key "dummy"})
+              :endpoint-override    {:protocol :http
+                                     :hostname host
+                                     :port port}}
+       disable-retries? (assoc :retriable? (constantly false))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Low-level DynamoDB helpers
@@ -220,7 +220,7 @@
   (open! [this test node]
     (let [port (get node->port node 8000)
           host (or (:dynamo-host test) (name node))]
-      (assoc this :ddb (make-ddb-client host port))))
+      (assoc this :ddb (make-ddb-client host port (:disable-sdk-retries test)))))
 
   (setup! [this _test]
     (create-table! ddb))
