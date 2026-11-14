@@ -36,12 +36,17 @@ func scopedDynamoFixture(t *testing.T) (*DynamoDBServer, *keyedReadScopeStore) {
 }
 func TestAdminGetItemFencesSchemaAndDerivedItemKey(t *testing.T) {
 	server, st := scopedDynamoFixture(t)
+	schema, exists, err := server.loadTableSchemaAt(t.Context(), "items", st.LastCommitTS())
+	require.NoError(t, err)
+	require.True(t, exists)
+	expectedItemKey, err := schema.itemKeyFromAttributes(map[string]attributeValue{"id": newStringAttributeValue("one")})
+	require.NoError(t, err)
 	item, found, err := server.AdminGetItem(t.Context(), fullAdminPrincipal, "items", map[string]AdminAttributeValue{"id": stringAttr("one")})
 	require.NoError(t, err)
 	require.True(t, found)
 	require.Equal(t, "present", *item.Attributes["value"].S)
 	require.GreaterOrEqual(t, len(st.keys), 2)
-	require.Len(t, st.keys[len(st.keys)-1], 2)
+	require.ElementsMatch(t, [][]byte{dynamoTableMetaKey("items"), expectedItemKey}, st.keys[len(st.keys)-1])
 }
 func TestDynamoStrongSchemaReadUsesTableKeyedFence(t *testing.T) {
 	server, st := scopedDynamoFixture(t)
