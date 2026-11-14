@@ -643,6 +643,9 @@ recovery aborts unfinished stages with RC accounting or resumes bounded
 post-flip cleanup before the existing GC readiness gate opens. The worker
 scans the full manifest keyspace across shard routes in bounded pages,
 rechecks leadership and M3 offload readiness, and is disabled by default.
+Only the verified leader aborts a staging intent, and recovery on the
+active process skips objects still being migrated; a restarted process or
+new leader can recover an abandoned attempt.
 It requires an explicit operator burn-in start date at least 30 days old;
 that date is an assertion, not proof of a successful production soak. No
 30-day production burn-in evidence is recorded here. A production rollout

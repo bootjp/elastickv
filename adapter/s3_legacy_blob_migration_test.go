@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -234,6 +235,55 @@ func TestS3LegacyMigrationRecoveryAcrossShards(t *testing.T) {
 		require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 		require.Equal(t, object, rec.Body.String())
 	}
+}
+
+func TestS3LegacyMigrationRecoveryPreservesActiveAttempt(t *testing.T) {
+	st := store.NewMVCCStore()
+	cluster := newFakeS3BlobCluster()
+	cluster.pushStarted = make(chan struct{}, 2)
+	release := make(chan struct{})
+	closeRelease := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(closeRelease)
+	cluster.pushRelease = release
+	s := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil,
+		WithS3BlobOffloadEnabled(false),
+		WithS3BlobCluster(cluster),
+		WithS3BlobLocalStoreResolver(&mutableS3BlobLocalStore{store: st}),
+		withS3BlobOffloadGCReadyForTest(),
+	)
+	putS3MigrationTestObject(t, s, []byte("active migration"))
+	s.blobOffloadEnabled = true
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.migrateS3LegacyObject(t.Context(), "bucket-a", "object")
+		done <- err
+	}()
+	select {
+	case <-cluster.pushStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("migration did not reach chunkblob replication")
+	}
+	markerKey := s3keys.MigrationIntentKey("bucket-a", 1, "object")
+	require.NoError(t, s.recoverPendingS3Migrations(t.Context()))
+	follower := NewS3Server(nil, "", st, s3MigrationFollowerCoordinator{newLocalAdapterCoordinator(st)}, nil,
+		WithS3BlobCluster(cluster),
+		WithS3BlobLocalStoreResolver(&mutableS3BlobLocalStore{store: st}),
+	)
+	require.NoError(t, follower.recoverPendingS3Migrations(t.Context()))
+	raw, err := st.GetAt(t.Context(), markerKey, ^uint64(0))
+	require.NoError(t, err)
+	intent, err := decodeS3MigrationIntent(raw)
+	require.NoError(t, err)
+	require.Equal(t, s3MigrationStaging, intent.Phase)
+	closeRelease()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("migration did not finish after replication resumed")
+	}
+	_, err = st.GetAt(t.Context(), markerKey, ^uint64(0))
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
 }
 
 func TestS3LegacyMigrationConcurrentOverwriteFencesFlip(t *testing.T) {

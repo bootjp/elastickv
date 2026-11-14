@@ -43,6 +43,11 @@ type s3MigrationCandidate struct {
 	parts      []s3MigrationPart
 }
 
+type s3MigrationActiveKey struct {
+	bucket string
+	object string
+}
+
 func decodeS3MigrationIntent(raw []byte) (s3MigrationIntent, error) {
 	var intent s3MigrationIntent
 	if err := json.Unmarshal(raw, &intent); err != nil {
@@ -85,13 +90,13 @@ func encodeS3MigrationIntent(intent s3MigrationIntent) ([]byte, error) {
 	return raw, errors.WithStack(err)
 }
 
-// migrateS3LegacyObject is deliberately not wired to a production scanner or
-// option. M4 remains off until the 30-day M0-M3 burn-in is established. Tests
-// and a future gated worker use this complete per-object attempt.
+// migrateS3LegacyObject is called by the default-off migration worker.
 func (s *S3Server) migrateS3LegacyObject(ctx context.Context, bucket, object string) (bool, error) {
-	if err := s.ensureS3MigrationReady(ctx); err != nil {
+	finish, err := s.beginActiveS3Migration(ctx, bucket, object)
+	if err != nil {
 		return false, err
 	}
+	defer finish()
 	intent, manifest, generation, readTS, pin, err := s.beginS3LegacyMigration(ctx, bucket, object)
 	if err != nil || intent == nil {
 		return false, err
@@ -117,6 +122,17 @@ func (s *S3Server) migrateS3LegacyObject(ctx context.Context, bucket, object str
 		return true, err
 	}
 	return true, nil
+}
+
+func (s *S3Server) beginActiveS3Migration(ctx context.Context, bucket, object string) (func(), error) {
+	if err := s.ensureS3MigrationReady(ctx); err != nil {
+		return nil, err
+	}
+	activeKey := s3MigrationActiveKey{bucket: bucket, object: object}
+	if _, loaded := s.activeMigrations.LoadOrStore(activeKey, struct{}{}); loaded {
+		return nil, errors.New("s3 migration is already active for this object")
+	}
+	return func() { s.activeMigrations.Delete(activeKey) }, nil
 }
 
 func (s *S3Server) beginS3LegacyMigration(ctx context.Context, bucket, object string) (*s3MigrationIntent, *s3ObjectManifest, uint64, uint64, *kv.ActiveTimestampToken, error) {
@@ -415,6 +431,12 @@ func (s *S3Server) recoverS3MigrationIntent(ctx context.Context, key []byte) err
 		return err
 	}
 	if intent.Phase == s3MigrationStaging {
+		if !s.isVerifiedS3Leader(ctx) {
+			return nil
+		}
+		if _, active := s.activeMigrations.Load(s3MigrationActiveKey{bucket: bucket, object: object}); active {
+			return nil
+		}
 		if err := s.abortS3MigrationIntent(ctx, key, *intent); err != nil {
 			return err
 		}

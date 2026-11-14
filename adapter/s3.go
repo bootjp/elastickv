@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -125,6 +126,7 @@ type S3Server struct {
 	blobPushBlocked      func() bool
 	blobBackfiller       *S3BlobBackfiller
 	legacyMigration      *s3LegacyBlobMigrationWorker
+	activeMigrations     sync.Map
 	// adminBlobUsers counts the admin object operations that may use
 	// blobCluster from outside the HTTP listener (see enterAdminBlobUse),
 	// so Stop can wait for them before closing the cluster.
