@@ -38,6 +38,10 @@ func (l *prepareSafetyRPCLeader) State() raftengine.State {
 	return raftengine.StateLeader
 }
 
+func (l *prepareSafetyRPCLeader) Status() raftengine.Status {
+	return raftengine.Status{State: l.State(), Term: 1}
+}
+
 func (l *prepareSafetyRPCLeader) LinearizableRead(context.Context) (uint64, error) {
 	l.reads.Add(1)
 	if l.loseRead {

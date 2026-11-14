@@ -194,8 +194,13 @@ Implementation order:
    carries native group-0 issuance through home preparation, atomic binding
    and data apply, and exact-ID retry. An in-process pending-ID gate now
    prevents concurrent or ambiguous retries from reissuing before the applied
-   binding is observed. The gate does not survive restart; durable intent or
-   a proven reconciliation protocol is still required. The integration test
+   binding is observed. A pending ID can now be reconsidered only after an
+   applied ReadIndex in a strictly newer leader term proves the old-term
+   proposal absent; the status term is checked before and after the barrier
+   and lookup. The process-local gate does not survive restart, so native
+   crash/leader-transfer tests must still prove that a restarted leader's
+   current-term barrier excludes every old proposal before production use.
+   The integration test
    uses a test issuer and method descriptor, not the production allocator and
    registered method. It is not the production Forward path. Memory and Pebble
    snapshot/restore tests now verify both binding indexes survive restore and

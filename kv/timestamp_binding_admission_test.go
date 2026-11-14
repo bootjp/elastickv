@@ -13,9 +13,11 @@ import (
 )
 
 type homeBindingLeader struct {
-	reads    int
-	follower bool
-	lostRead bool
+	reads             int
+	follower          bool
+	lostRead          bool
+	term              uint64
+	advanceTermOnRead bool
 }
 
 func (l *homeBindingLeader) State() raftengine.State {
@@ -26,11 +28,21 @@ func (l *homeBindingLeader) State() raftengine.State {
 }
 
 func (l *homeBindingLeader) Leader() raftengine.LeaderInfo { return raftengine.LeaderInfo{ID: "self"} }
+func (l *homeBindingLeader) Status() raftengine.Status {
+	term := l.term
+	if term == 0 {
+		term = 1
+	}
+	return raftengine.Status{State: l.State(), Term: term}
+}
 func (l *homeBindingLeader) VerifyLeader(context.Context) error {
 	return nil
 }
 func (l *homeBindingLeader) LinearizableRead(context.Context) (uint64, error) {
 	l.reads++
+	if l.advanceTermOnRead {
+		l.term++
+	}
 	if l.lostRead {
 		l.follower = true
 	}
@@ -175,4 +187,86 @@ func TestPrepareHomeRawTimestampBindingAmbiguousProposalResolvesOnlyFromAppliedB
 	require.NoError(t, err)
 	require.Equal(t, first, retry)
 	require.Equal(t, 1, issues)
+}
+
+func TestPrepareHomeRawTimestampBindingReissuesOnlyAfterNewTermBarrier(t *testing.T) {
+	st := store.NewMVCCStore()
+	metadata, ok := st.(store.RaftControlMetadataStore)
+	require.True(t, ok)
+	request := &pb.Request{TimestampBindingOperationId: append([]byte{10}, make([]byte, 15)...),
+		Mutations: []*pb.Mutation{{Key: []byte("key"), Value: []byte("value")}}}
+	clearHomeBindingAttemptAfterTest(t, request)
+	leader := &homeBindingLeader{term: 1}
+	issues := 0
+	issue := func(context.Context) (uint64, error) {
+		issues++
+		return uint64(40 + issues), nil
+	}
+	first, err := PrepareHomeRawTimestampBinding(t.Context(), leader, metadata, issue, request)
+	require.NoError(t, err)
+	require.Equal(t, uint64(41), first.Ts)
+	_, err = PrepareHomeRawTimestampBinding(t.Context(), leader, metadata, issue, request)
+	require.ErrorIs(t, err, ErrTimestampBindingPending)
+	require.Equal(t, 1, issues)
+
+	leader.term = 2
+	second, err := PrepareHomeRawTimestampBinding(t.Context(), leader, metadata, issue, request)
+	require.NoError(t, err)
+	require.Equal(t, uint64(42), second.Ts)
+	require.Equal(t, 2, issues)
+	_, err = PrepareHomeRawTimestampBinding(t.Context(), leader, metadata, issue, request)
+	require.ErrorIs(t, err, ErrTimestampBindingPending)
+}
+
+func TestPrepareHomeRawTimestampBindingRejectsTermChangeDuringRead(t *testing.T) {
+	st := store.NewMVCCStore()
+	metadata, ok := st.(store.RaftControlMetadataStore)
+	require.True(t, ok)
+	leader := &homeBindingLeader{term: 1, advanceTermOnRead: true}
+	request := &pb.Request{TimestampBindingOperationId: append([]byte{11}, make([]byte, 15)...),
+		Mutations: []*pb.Mutation{{Key: []byte("key"), Value: []byte("value")}}}
+	clearHomeBindingAttemptAfterTest(t, request)
+	issues := 0
+	_, err := PrepareHomeRawTimestampBinding(t.Context(), leader, metadata, func(context.Context) (uint64, error) {
+		issues++
+		return 42, nil
+	}, request)
+	require.ErrorIs(t, err, ErrLeaderNotFound)
+	require.Zero(t, issues)
+}
+
+func TestPrepareHomeRawTimestampBindingRequiresTermStatus(t *testing.T) {
+	st := store.NewMVCCStore()
+	metadata, ok := st.(store.RaftControlMetadataStore)
+	require.True(t, ok)
+	request := &pb.Request{TimestampBindingOperationId: append([]byte{12}, make([]byte, 15)...),
+		Mutations: []*pb.Mutation{{Key: []byte("key"), Value: []byte("value")}}}
+	leader := struct{ raftengine.LeaderView }{LeaderView: &homeBindingLeader{term: 1}}
+	issues := 0
+	_, err := PrepareHomeRawTimestampBinding(t.Context(), leader, metadata, func(context.Context) (uint64, error) {
+		issues++
+		return 42, nil
+	}, request)
+	require.ErrorIs(t, err, ErrTimestampBindingInvalid)
+	require.Zero(t, issues)
+}
+
+func TestPrepareHomeRawTimestampBindingRejectsIssueAcrossTermChange(t *testing.T) {
+	st := store.NewMVCCStore()
+	metadata, ok := st.(store.RaftControlMetadataStore)
+	require.True(t, ok)
+	request := &pb.Request{TimestampBindingOperationId: append([]byte{13}, make([]byte, 15)...),
+		Mutations: []*pb.Mutation{{Key: []byte("key"), Value: []byte("value")}}}
+	clearHomeBindingAttemptAfterTest(t, request)
+	leader := &homeBindingLeader{term: 1}
+	_, err := PrepareHomeRawTimestampBinding(t.Context(), leader, metadata, func(context.Context) (uint64, error) {
+		leader.term = 2
+		return 42, nil
+	}, request)
+	require.ErrorIs(t, err, ErrTimestampBindingInvalid)
+	second, err := PrepareHomeRawTimestampBinding(t.Context(), leader, metadata, func(context.Context) (uint64, error) {
+		return 43, nil
+	}, request)
+	require.NoError(t, err)
+	require.Equal(t, uint64(43), second.Ts)
 }

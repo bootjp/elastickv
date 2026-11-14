@@ -24,6 +24,23 @@ var homeBindingAttempts sync.Map // [16]byte -> *homeBindingAttempt
 type homeBindingAttempt struct {
 	mu      sync.Mutex
 	pending bool
+	term    uint64
+}
+
+func (a *homeBindingAttempt) canIssueAfter(term uint64) bool {
+	return !a.pending || term > a.term
+}
+
+func homeBindingLeaderTerm(leader raftengine.LeaderView) uint64 {
+	status, ok := leader.(raftengine.StatusReader)
+	if !ok {
+		return 0
+	}
+	current := status.Status()
+	if current.State != raftengine.StateLeader {
+		return 0
+	}
+	return current.Term
 }
 
 // PrepareHomeRawTimestampBinding prepares one raw write for the opt-in atomic
@@ -49,7 +66,7 @@ func PrepareHomeRawTimestampBinding(
 	}
 	attempt.mu.Lock()
 	defer attempt.mu.Unlock()
-	bound, found, err := readHomeBinding(ctx, leader, metadata, operationID)
+	bound, found, term, err := readHomeBinding(ctx, leader, metadata, operationID)
 	if err != nil {
 		return nil, err
 	}
@@ -57,17 +74,21 @@ func PrepareHomeRawTimestampBinding(
 	if found {
 		return prepareExistingHomeRawBinding(owned, bound, operationID)
 	}
-	if attempt.pending {
+	if !attempt.canIssueAfter(term) {
 		return nil, errors.WithStack(ErrTimestampBindingPending)
 	}
+	// A current-term ReadIndex applied after a term change includes every
+	// surviving older-term proposal. Absence then proves that the prior
+	// attempt cannot later bind this operation ID.
 	// An issue error may mean the timestamp was already handed to a proposer.
 	// Never release this ID on an unknown outcome, even if the caller cancels.
 	attempt.pending = true
+	attempt.term = term
 	timestamp, err := issue(ctx)
 	if err != nil {
 		return nil, errors.Wrap(err, "issue home write timestamp")
 	}
-	if timestamp == 0 || leader.State() != raftengine.StateLeader {
+	if timestamp == 0 || homeBindingLeaderTerm(leader) != term {
 		return nil, errors.WithStack(ErrTimestampBindingInvalid)
 	}
 	owned.Ts = timestamp
@@ -96,6 +117,9 @@ func validateHomeRawBindingInputs(leader raftengine.LeaderView, metadata store.R
 	if leader == nil || metadata == nil || issue == nil || !rawBindingRequestUnstamped(request) {
 		return operationID, errors.WithStack(ErrTimestampBindingInvalid)
 	}
+	if _, ok := leader.(raftengine.StatusReader); !ok {
+		return operationID, errors.WithStack(ErrTimestampBindingInvalid)
+	}
 	if len(request.TimestampBindingOperationId) != len(operationID) {
 		return operationID, errors.WithStack(ErrTimestampBindingInvalid)
 	}
@@ -112,19 +136,26 @@ func rawBindingRequestUnstamped(request *pb.Request) bool {
 }
 
 func readHomeBinding(ctx context.Context, leader raftengine.LeaderView, metadata store.RaftControlMetadataStore,
-	operationID [16]byte) (TimestampBinding, bool, error) {
+	operationID [16]byte) (TimestampBinding, bool, uint64, error) {
+	term := homeBindingLeaderTerm(leader)
+	if term == 0 {
+		return TimestampBinding{}, false, 0, errors.WithStack(ErrLeaderNotFound)
+	}
 	if _, err := leader.LinearizableRead(ctx); err != nil {
-		return TimestampBinding{}, false, errors.Wrap(err, "read home binding barrier")
+		return TimestampBinding{}, false, 0, errors.Wrap(err, "read home binding barrier")
+	}
+	if homeBindingLeaderTerm(leader) != term {
+		return TimestampBinding{}, false, 0, errors.WithStack(ErrLeaderNotFound)
 	}
 	bound, found, err := LookupTimestampBinding(ctx, metadata, operationID)
 	if err != nil {
-		return TimestampBinding{}, false, errors.Wrap(err, "lookup home binding")
+		return TimestampBinding{}, false, 0, errors.Wrap(err, "lookup home binding")
 	}
 	if err := ctx.Err(); err != nil {
-		return TimestampBinding{}, false, errors.WithStack(err)
+		return TimestampBinding{}, false, 0, errors.WithStack(err)
 	}
-	if leader.State() != raftengine.StateLeader {
-		return TimestampBinding{}, false, errors.WithStack(ErrLeaderNotFound)
+	if homeBindingLeaderTerm(leader) != term {
+		return TimestampBinding{}, false, 0, errors.WithStack(ErrLeaderNotFound)
 	}
-	return bound, found, nil
+	return bound, found, term, nil
 }
