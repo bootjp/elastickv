@@ -197,7 +197,9 @@ Implementation order:
    binding is observed. The gate does not survive restart; durable intent or
    a proven reconciliation protocol is still required. The integration test
    uses a test issuer and method descriptor, not the production allocator and
-   registered method. It is not the production Forward path.
+   registered method. It is not the production Forward path. Memory and Pebble
+   snapshot/restore tests now verify both binding indexes survive restore and
+   still reject conflicting operation IDs; a retention policy is not defined.
 2. Authenticated issuance and primary/home admission path, including unknown
    outcome reconciliation and cross-group PREPARE/COMMIT/ABORT evidence. This
    branch adds a versioned, physical-band-backed group-0 issuance RPC and an
