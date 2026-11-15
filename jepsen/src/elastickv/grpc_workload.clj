@@ -73,7 +73,7 @@
 (defn elastickv-grpc-test [opts]
   (when-not (:local opts)
     (throw (ex-info "Use hosted-fault-workload for managed gRPC fault tests" {})))
-  (let [ports (or (:node->port opts) (zipmap (:nodes opts) (repeat 50051)))
+  (let [ports (or (:node->port opts) (zipmap (:nodes opts) (repeat (or (:grpc-port opts) 50051))))
         concurrency (or (:concurrency opts) 6)
         workload (grpc-register-workload (assoc opts :node->port ports))]
     (when-not (and (pos? concurrency) (even? concurrency))

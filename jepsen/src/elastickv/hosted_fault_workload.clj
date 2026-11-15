@@ -221,18 +221,20 @@
       (throw (ex-info "Require 3 managed nodes, one of partition/kill/pause, positive intervals and keys, concurrency divisible by 3, repeat-faults for multiple cycles, and time-limit > (1 + 6 * min-fault-cycles) * fault-interval"
                       {:options opts})))
     (let [{:keys [workload port db-port grpc-api write-mode]} (adapters adapter)
+          grpc-port (or (:grpc-port opts) 50051)
+          client-port (if grpc-api grpc-port port)
           mount-dir (when write-mode "/mnt/elastickv")
-          members (str/join "," (map #(str % "=" % ":" (or (:grpc-port opts) 50051)) nodes))
+          members (str/join "," (map #(str % "=" % ":" grpc-port) nodes))
           base (redis/elastickv-redis-test (assoc opts :key-count key-count
                                                      :bootstrap-members members))
-          managed-db (db/db (cond-> {:grpc-port (or (:grpc-port opts) 50051)
+          managed-db (db/db (cond-> {:grpc-port grpc-port
                                     :redis-port 6379 :bootstrap-members members
                                     :encryption (:encryption opts)
                                     :sqs-region "us-east-1"}
                              db-port (assoc db-port port)
                              mount-dir (assoc :filesystem-mount mount-dir)))
           workload (workload (assoc opts :key-count key-count :sqs-region "us-east-1"
-                                         :node->port (zipmap nodes (repeat port))
+                                         :node->port (zipmap nodes (repeat client-port))
                                          :grpc-api grpc-api :grpc-client-bin (db/grpc-client-binary)
                                          :write-mode write-mode
                                          :node->mount-dir (zipmap nodes (repeat mount-dir))))

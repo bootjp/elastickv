@@ -44,3 +44,7 @@
         opts (grpc/prepare-opts (:options options))]
     (is (= {"n1" 50051 "n2" 50052 "n3" 50053} (:node->port opts)))
     (is (= "127.0.0.1" (:grpc-host opts)))))
+
+(deftest local-gRPC-builder-honors-the-configured-port
+  (let [test (grpc/elastickv-grpc-test {:local true :nodes ["n1"] :grpc-port 51515})]
+    (is (= {"n1" 51515} (get-in test [:client :node->port])))))

@@ -227,3 +227,11 @@
       (is (= mode (:write-mode test)))
       (is (nil? (:local test)))
       (is (some? (get-in test [:checker :checkers :consistency :checkers :elle]))))))
+
+(deftest managed-grpc-clients-follow-the-configured-listener-port
+  (doseq [adapter [:grpc-raw :grpc-transactional]]
+    (let [test (hosted/hosted-fault-test (assoc opts :adapter adapter :grpc-port 51515))]
+      (is (= 51515 (get-in test [:db :opts :grpc-port])))
+      (is (= (zipmap nodes (repeat 51515)) (get-in test [:client :delegate :node->port])))
+      (is (= "n1=n1:51515,n2=n2:51515,n3=n3:51515"
+             (get-in test [:db :opts :bootstrap-members]))))))
