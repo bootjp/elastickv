@@ -1,6 +1,7 @@
 package etcd
 
 import (
+	"context"
 	"path/filepath"
 	"testing"
 	"time"
@@ -62,12 +63,17 @@ func newOwnedPipelineApplyWitness(t *testing.T, fsm StateMachine) *Engine {
 
 func awaitOwnedPipelineCompletion(t *testing.T, worker *storageWorker) storageWorkCompletion {
 	t.Helper()
+	// This is a deadlock guard, not a storage latency assertion. Native
+	// snapshot tasks checksum, write and sync a maximum-size value; a fixed
+	// one-second deadline spuriously fails under race instrumentation/CI load.
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
 	select {
 	case completion, ok := <-worker.completions:
 		require.True(t, ok, "actor exited without its actual completion")
 		return completion
-	case <-time.After(time.Second):
-		t.Fatal("actual pipeline actor did not complete")
+	case <-ctx.Done():
+		t.Fatalf("actual pipeline actor did not complete: %v", ctx.Err())
 		return storageWorkCompletion{}
 	}
 }

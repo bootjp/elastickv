@@ -3,7 +3,9 @@ package etcd
 import (
 	"bytes"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	etcdraft "go.etcd.io/raft/v3"
@@ -13,6 +15,15 @@ import (
 // Public legacy inline snapshot + real volatile Raft protocol witness. No
 // durable WAL/quorum, TLS, or whole-Go-heap claim is made by this reproduction.
 func TestPipelineDebtInlineSnapshotFanoutNormalization(t *testing.T) {
+	runPipelineDebtInlineSnapshotFanoutNormalization(t, false)
+}
+
+func TestPipelineDebtInlineSnapshotFanoutNormalizationSlowDisk(t *testing.T) {
+	runPipelineDebtInlineSnapshotFanoutNormalization(t, true)
+}
+
+func runPipelineDebtInlineSnapshotFanoutNormalization(t *testing.T, slowDisk bool) {
+	t.Helper()
 	e := newPipelineAdmissionFixture(t)
 	e.dataDir = t.TempDir()
 	e.fsmSnapDir = filepath.Join(e.dataDir, fsmSnapDirName)
@@ -43,7 +54,27 @@ func TestPipelineDebtInlineSnapshotFanoutNormalization(t *testing.T) {
 	require.NoError(t, err)
 	normalization.install = true
 	require.NoError(t, e.queuePipelineNormalization(normalization))
+	// Hold the real normalization task beyond the former fixture's one-second
+	// deadline. A slow disk must still return its actual completion and pass
+	// the full descriptor, restore and nine-peer fanout checks below.
+	entered, release := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	if slowDisk {
+		t.Cleanup(unblock)
+		task := p.diskDeferred[0]
+		run := task.work.run
+		task.work.run = func() (any, error) {
+			close(entered)
+			<-release
+			return run()
+		}
+	}
 	require.NoError(t, p.flush())
+	if slowDisk {
+		awaitStorageSignal(t, entered)
+		time.AfterFunc(1100*time.Millisecond, unblock)
+	}
 	require.NoError(t, e.completePipelineDisk(awaitOwnedPipelineCompletion(t, p.disk)))
 	current, err := e.storage.Snapshot()
 	require.NoError(t, err)
