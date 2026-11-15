@@ -39,6 +39,9 @@ unmarked response as unknown rather than parsing its message.
 The DynamoDB item and transaction planners also preserve storage-read failures
 as internal errors instead of converting them into client validation failures;
 public responses redact the underlying physical key.
+Migration RPC leader rejections are also projected as key-free `Unavailable`
+statuses so a remote split runner retries ordinary leadership churn without
+classifying status text.
 
 This is not whole-cluster activation. Durable logical-operation reconciliation
 across separate invocations, mandatory peer authentication for definitive

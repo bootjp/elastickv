@@ -1198,26 +1198,35 @@ func envFlagEnabled(name string) bool {
 
 func (i *Internal) verifyInternalLeader(ctx context.Context) error {
 	if i.leader == nil {
-		return errors.WithStack(ErrNotLeader)
+		return migrationLeaderUnavailable()
 	}
 	if i.leader.State() != raftengine.StateLeader {
-		return errors.WithStack(ErrNotLeader)
+		return migrationLeaderUnavailable()
 	}
 	if err := i.leader.VerifyLeader(ctx); err != nil {
-		return errors.WithStack(ErrNotLeader)
+		return migrationLeaderUnavailable()
 	}
 	return nil
 }
 
 func (i *Internal) verifyInternalLeaderApplied(ctx context.Context) error {
 	if i.leader == nil {
-		return errors.WithStack(ErrNotLeader)
+		return migrationLeaderUnavailable()
 	}
 	if i.leader.State() != raftengine.StateLeader {
-		return errors.WithStack(ErrNotLeader)
+		return migrationLeaderUnavailable()
 	}
 	_, err := i.leader.LinearizableRead(ctx)
+	if errors.Is(err, ErrNotLeader) || errors.Is(err, raftengine.ErrNotLeader) ||
+		errors.Is(err, raftengine.ErrLeadershipLost) ||
+		errors.Is(err, raftengine.ErrLeadershipTransferInProgress) {
+		return migrationLeaderUnavailable()
+	}
 	return errors.WithStack(err)
+}
+
+func migrationLeaderUnavailable() error {
+	return errors.WithStack(status.Error(codes.Unavailable, "migration leader unavailable"))
 }
 
 func (i *Internal) proposeMigrationImport(ctx context.Context, req *pb.ImportRangeVersionsRequest) (store.ImportVersionsResult, error) {
