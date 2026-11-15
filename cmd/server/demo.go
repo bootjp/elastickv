@@ -334,9 +334,9 @@ func setupFSMStore(raftDataDir string, cleanup *internalutil.CleanupStack) (stor
 	return st, nil
 }
 
-func setupGRPC(ctx context.Context, engine raftengine.Engine, registerTransport func(grpc.ServiceRegistrar), st store.MVCCStore, coordinator *kv.Coordinate, distServer *adapter.DistributionServer, relay *adapter.RedisPubSubRelay, proposalObserver kv.ProposalObserver) (*grpc.Server, *adapter.GRPCServer) {
+func setupGRPC(ctx context.Context, engine raftengine.Engine, registerTransport func(grpc.ServiceRegistrar), st store.MVCCStore, coordinator *kv.Coordinate, distServer *adapter.DistributionServer, relay *adapter.RedisPubSubRelay, proposalObserver kv.ProposalObserver, capability kv.TTLInlineCapabilityReader) (*grpc.Server, *adapter.GRPCServer) {
 	s := grpc.NewServer(internalutil.GRPCServerOptions()...)
-	trx := kv.NewTransactionWithProposer(engine, kv.WithProposalObserver(proposalObserver))
+	trx := kv.NewTransactionWithProposer(engine, kv.WithProposalObserver(proposalObserver), kv.WithTTLInlineCapabilityAdmission(capability))
 	routedStore := kv.NewLeaderRoutedStore(st, coordinator)
 	gs := adapter.NewGRPCServer(routedStore, coordinator, adapter.WithCloseStore())
 	if registerTransport != nil {
@@ -546,7 +546,8 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	metricsRegistry := monitoring.NewRegistry(cfg.raftID, cfg.address)
 	proposalObserver := metricsRegistry.RaftProposalObserver(1)
 	engine := result.Engine
-	trx := kv.NewTransactionWithProposer(engine, kv.WithProposalObserver(proposalObserver))
+	capability, _ := fsm.(kv.TTLInlineCapabilityReader)
+	trx := kv.NewTransactionWithProposer(engine, kv.WithProposalObserver(proposalObserver), kv.WithTTLInlineCapabilityAdmission(capability))
 	coordinator := kv.NewCoordinatorWithEngine(trx, engine, kv.WithHLC(hlc))
 	defer func() {
 		// Release the leader-loss callback slot on the engine before
@@ -580,7 +581,7 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	)
 	relay := adapter.NewRedisPubSubRelay()
 
-	s, grpcSvc := setupGRPC(ctx, engine, result.RegisterTransport, st, coordinator, distServer, relay, proposalObserver)
+	s, grpcSvc := setupGRPC(ctx, engine, result.RegisterTransport, st, coordinator, distServer, relay, proposalObserver, capability)
 
 	grpcSock, err := lc.Listen(ctx, "tcp", cfg.address)
 	if err != nil {

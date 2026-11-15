@@ -251,7 +251,11 @@ func (b shardGroupBuilder) buildDataGroup(
 		runtime.BootstrapDomain = bootstrapSpec.Domain
 		runtime.BootstrapPeerConfig = bootstrapSpec.Config
 	}
-	sg.Txn = kv.NewLeaderProxyForShardGroup(sg, kv.WithProposalObserver(proposalObserver))
+	capability, _ := sm.(kv.TTLInlineCapabilityReader)
+	sg.Txn = kv.NewLeaderProxyForShardGroup(sg,
+		kv.WithProposalObserver(proposalObserver),
+		kv.WithTTLInlineCapabilityAdmission(capability),
+	)
 	return runtime, sg, nil
 }
 
