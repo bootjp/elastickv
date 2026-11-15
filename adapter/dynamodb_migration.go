@@ -108,7 +108,11 @@ func (d *DynamoDBServer) migrateLegacyTableGeneration(ctx context.Context, schem
 	if sourceSchema == nil {
 		return nil
 	}
-	sourceReadTS := snapshotTS(d.coordinator.Clock(), d.store)
+	stamp, err := d.beginTxnReadTimestamp(ctx, "dynamodb migration source")
+	if err != nil {
+		return err
+	}
+	sourceReadTS := stamp.Timestamp()
 	if err := d.migrateLegacySourceItems(ctx, schema, sourceSchema, sourceReadTS); err != nil {
 		return err
 	}
@@ -205,7 +209,7 @@ func (d *DynamoDBServer) scanLegacyMigrationPage(
 	upper []byte,
 	readTS uint64,
 ) ([]*store.KVPair, error) {
-	kvs, err := d.store.ScanAt(ctx, cursor, upper, dynamoScanPageLimit, readTS)
+	kvs, err := requestScanAt(ctx, d.store, cursor, upper, dynamoScanPageLimit, readTS)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -295,7 +299,11 @@ func (d *DynamoDBServer) buildLegacyMigrationRequest(
 
 func (d *DynamoDBServer) isTableGenerationEmpty(ctx context.Context, tableName string, generation uint64) (bool, error) {
 	prefix := dynamoItemPrefixForTable(tableName, generation)
-	kvs, err := d.store.ScanAt(ctx, prefix, prefixScanEnd(prefix), 1, snapshotTS(d.coordinator.Clock(), d.store))
+	stamp, err := d.beginTxnReadTimestamp(ctx, "dynamodb migration emptiness check")
+	if err != nil {
+		return false, err
+	}
+	kvs, err := requestScanAt(ctx, d.store, prefix, prefixScanEnd(prefix), 1, stamp.Timestamp())
 	if err != nil {
 		return false, errors.WithStack(err)
 	}

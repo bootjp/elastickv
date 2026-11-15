@@ -49,7 +49,7 @@ func TestRedisFencedReadTimestampAcceptsAnEmptyStoreUnderPhaseD(t *testing.T) {
 	t.Cleanup(server.Stop)
 
 	readTimestamp, readPin, err := server.redisReadFencedTimestampForTargets(
-		context.Background(), nil, server.readTS, "test: begin read timestamp")
+		context.Background(), nil, "test: begin read timestamp")
 	require.NoError(t, err)
 	if readPin != nil {
 		readPin.Release()

@@ -99,7 +99,7 @@ func (s *S3Server) readLegacyS3ObjectChunk(
 	readTS uint64,
 ) ([]byte, error) {
 	key := s3keys.VersionedBlobKey(bucket, generation, objectKey, uploadID, part.PartNo, chunkIndex, part.PartVersion)
-	payload, err := s.store.GetAt(ctx, key, readTS)
+	payload, err := manifestVersionGetAt(ctx, s.store, key, readTS)
 	return payload, errors.WithStack(err)
 }
 
@@ -116,7 +116,7 @@ func (s *S3Server) loadS3ChunkRef(
 	readTS uint64,
 ) (s3keys.ChunkRefValue, uint64, error) {
 	refKey := s3keys.VersionedChunkRefKey(bucket, generation, objectKey, uploadID, partNo, chunkIndex, chunkRefVersion)
-	rawRef, err := s.store.GetAt(ctx, refKey, readTS)
+	rawRef, err := manifestVersionGetAt(ctx, s.store, refKey, readTS)
 	if err != nil {
 		return s3keys.ChunkRefValue{}, 0, errors.Wrap(err, "read s3 chunkref")
 	}
@@ -171,7 +171,7 @@ func (s *S3Server) localS3ChunkBlob(ctx context.Context, routeKey []byte, digest
 	if !ok || localStore == nil {
 		return nil, false, s3BlobUnavailable("s3 chunkblob local store is unavailable")
 	}
-	payload, err := localStore.GetAt(ctx, key, math.MaxUint64)
+	payload, err := historicalGetAt(ctx, localStore, key, math.MaxUint64)
 	if errors.Is(err, store.ErrKeyNotFound) {
 		return nil, false, nil
 	}
@@ -341,4 +341,61 @@ func s3ManifestHasOffloadedParts(manifest *s3ObjectManifest) bool {
 		}
 	}
 	return false
+}
+
+func s3ManifestDataMode(manifest *s3ObjectManifest) string {
+	if manifest == nil {
+		return s3BlobOffloadModeUnknown
+	}
+	var modes uint8
+	for _, part := range manifest.Parts {
+		modes |= s3PartModeFlag(part)
+	}
+	return s3BlobModeLabel(modes, s3BlobOffloadModeLegacy)
+}
+
+func s3ManifestRangeDataMode(manifest *s3ObjectManifest, offset, length int64) string {
+	if manifest == nil || length < 0 {
+		return s3BlobOffloadModeUnknown
+	}
+	if length == 0 {
+		return s3ManifestDataMode(manifest)
+	}
+	var modes uint8
+	position := int64(0)
+	for _, part := range manifest.Parts {
+		for _, size := range part.ChunkSizes {
+			end := position + int64(size) //nolint:gosec // Chunk size is bounded by s3ChunkSize.
+			if end > offset && position < offset+length {
+				modes |= s3PartModeFlag(part)
+			}
+			position = end
+		}
+	}
+	return s3BlobModeLabel(modes, s3BlobOffloadModeUnknown)
+}
+
+const (
+	s3LegacyModeFlag uint8 = 1 << iota
+	s3OffloadModeFlag
+)
+
+func s3PartModeFlag(part s3ObjectPart) uint8 {
+	if part.Offloaded {
+		return s3OffloadModeFlag
+	}
+	return s3LegacyModeFlag
+}
+
+func s3BlobModeLabel(modes uint8, empty string) string {
+	switch modes {
+	case s3LegacyModeFlag:
+		return s3BlobOffloadModeLegacy
+	case s3OffloadModeFlag:
+		return s3BlobOffloadModeOffload
+	case s3LegacyModeFlag | s3OffloadModeFlag:
+		return s3BlobOffloadModeMixed
+	default:
+		return empty
+	}
 }

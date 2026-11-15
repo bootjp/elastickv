@@ -775,7 +775,11 @@ func batchEntryIDs(entries []sqsSendMessageBatchEntryInput) []string {
 // the documented top-level error, not per-entry failures inside a
 // 200-envelope that retry logic can misclassify.
 func (s *SQSServer) requireQueueExists(ctx context.Context, queueName string) error {
-	_, exists, err := s.loadQueueMetaAt(ctx, queueName, s.nextTxnReadTS(ctx))
+	readTS, err := s.snapshotReadTS(ctx)
+	if err != nil {
+		return err
+	}
+	_, exists, err := s.loadQueueMetaAt(ctx, queueName, readTS)
 	if err != nil {
 		return errors.WithStack(err)
 	}

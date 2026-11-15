@@ -420,8 +420,11 @@ type GetTimestampRequest struct {
 	// ActivatePhaseD closes the legacy compatibility window after every member
 	// understands the M7 FSM entry. It requires ActivateCutover and is one-way.
 	ActivatePhaseD bool `protobuf:"varint,4,opt,name=activate_phase_d,json=activatePhaseD,proto3" json:"activate_phase_d,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// Version 1 requests the opt-in physical-band contract. Zero retains the
+	// legacy window contract; unsupported versions must be rejected.
+	ReservationProtocolVersion uint32 `protobuf:"varint,5,opt,name=reservation_protocol_version,json=reservationProtocolVersion,proto3" json:"reservation_protocol_version,omitempty"`
+	unknownFields              protoimpl.UnknownFields
+	sizeCache                  protoimpl.SizeCache
 }
 
 func (x *GetTimestampRequest) Reset() {
@@ -482,6 +485,13 @@ func (x *GetTimestampRequest) GetActivatePhaseD() bool {
 	return false
 }
 
+func (x *GetTimestampRequest) GetReservationProtocolVersion() uint32 {
+	if x != nil {
+		return x.ReservationProtocolVersion
+	}
+	return 0
+}
+
 type GetTimestampResponse struct {
 	state     protoimpl.MessageState `protogen:"open.v1"`
 	Timestamp uint64                 `protobuf:"varint,1,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
@@ -500,9 +510,15 @@ type GetTimestampResponse struct {
 	// PhaseDActive reports that legacy per-shard issuance has been retired.
 	PhaseDActive bool `protobuf:"varint,6,opt,name=phase_d_active,json=phaseDActive,proto3" json:"phase_d_active,omitempty"`
 	// PhaseDFloor is the allocation floor captured by the Phase-D marker.
-	PhaseDFloor   uint64 `protobuf:"varint,7,opt,name=phase_d_floor,json=phaseDFloor,proto3" json:"phase_d_floor,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	PhaseDFloor uint64 `protobuf:"varint,7,opt,name=phase_d_floor,json=phaseDFloor,proto3" json:"phase_d_floor,omitempty"`
+	// Set only for the version-1 physical-band contract.
+	ReservationProtocolVersion uint32 `protobuf:"varint,8,opt,name=reservation_protocol_version,json=reservationProtocolVersion,proto3" json:"reservation_protocol_version,omitempty"`
+	CommittedBandEnd           uint64 `protobuf:"varint,9,opt,name=committed_band_end,json=committedBandEnd,proto3" json:"committed_band_end,omitempty"`
+	// Last offset issued by this leader in the current band before this reply;
+	// zero for its first reservation. This is not previous_allocation_floor.
+	PreviousIssuedCursor uint64 `protobuf:"varint,10,opt,name=previous_issued_cursor,json=previousIssuedCursor,proto3" json:"previous_issued_cursor,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *GetTimestampResponse) Reset() {
@@ -580,6 +596,27 @@ func (x *GetTimestampResponse) GetPhaseDActive() bool {
 func (x *GetTimestampResponse) GetPhaseDFloor() uint64 {
 	if x != nil {
 		return x.PhaseDFloor
+	}
+	return 0
+}
+
+func (x *GetTimestampResponse) GetReservationProtocolVersion() uint32 {
+	if x != nil {
+		return x.ReservationProtocolVersion
+	}
+	return 0
+}
+
+func (x *GetTimestampResponse) GetCommittedBandEnd() uint64 {
+	if x != nil {
+		return x.CommittedBandEnd
+	}
+	return 0
+}
+
+func (x *GetTimestampResponse) GetPreviousIssuedCursor() uint64 {
+	if x != nil {
+		return x.PreviousIssuedCursor
 	}
 	return 0
 }
@@ -2866,12 +2903,13 @@ const file_distribution_proto_rawDesc = "" +
 	"\x10GetRouteResponse\x12\x14\n" +
 	"\x05start\x18\x01 \x01(\fR\x05start\x12\x10\n" +
 	"\x03end\x18\x02 \x01(\fR\x03end\x12\"\n" +
-	"\rraft_group_id\x18\x03 \x01(\x04R\vraftGroupId\"\xa5\x01\n" +
+	"\rraft_group_id\x18\x03 \x01(\x04R\vraftGroupId\"\xe7\x01\n" +
 	"\x13GetTimestampRequest\x12\x14\n" +
 	"\x05count\x18\x01 \x01(\rR\x05count\x12#\n" +
 	"\rmin_timestamp\x18\x02 \x01(\x04R\fminTimestamp\x12)\n" +
 	"\x10activate_cutover\x18\x03 \x01(\bR\x0factivateCutover\x12(\n" +
-	"\x10activate_phase_d\x18\x04 \x01(\bR\x0eactivatePhaseD\"\xb4\x02\n" +
+	"\x10activate_phase_d\x18\x04 \x01(\bR\x0eactivatePhaseD\x12@\n" +
+	"\x1creservation_protocol_version\x18\x05 \x01(\rR\x1areservationProtocolVersion\"\xda\x03\n" +
 	"\x14GetTimestampResponse\x12\x1c\n" +
 	"\ttimestamp\x18\x01 \x01(\x04R\ttimestamp\x12;\n" +
 	"\x1acommitted_by_dedicated_tso\x18\x02 \x01(\bR\x17committedByDedicatedTso\x12\x14\n" +
@@ -2879,7 +2917,11 @@ const file_distribution_proto_rawDesc = "" +
 	"\x19previous_allocation_floor\x18\x04 \x01(\x04R\x17previousAllocationFloor\x12%\n" +
 	"\x0ecutover_active\x18\x05 \x01(\bR\rcutoverActive\x12$\n" +
 	"\x0ephase_d_active\x18\x06 \x01(\bR\fphaseDActive\x12\"\n" +
-	"\rphase_d_floor\x18\a \x01(\x04R\vphaseDFloor\"\x8e\x01\n" +
+	"\rphase_d_floor\x18\a \x01(\x04R\vphaseDFloor\x12@\n" +
+	"\x1creservation_protocol_version\x18\b \x01(\rR\x1areservationProtocolVersion\x12,\n" +
+	"\x12committed_band_end\x18\t \x01(\x04R\x10committedBandEnd\x124\n" +
+	"\x16previous_issued_cursor\x18\n" +
+	" \x01(\x04R\x14previousIssuedCursor\"\x8e\x01\n" +
 	"\x18ValidateTimestampRequest\x12\x1c\n" +
 	"\ttimestamp\x18\x01 \x01(\x04R\ttimestamp\x12+\n" +
 	"\x11legacy_resolution\x18\x02 \x01(\bR\x10legacyResolution\x12'\n" +

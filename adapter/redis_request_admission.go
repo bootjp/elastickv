@@ -60,8 +60,10 @@ func (r *RedisServer) dispatchOwnedCommand(conn redcon.Conn, name string, handle
 	}
 	ctx := context.WithValue(owner.Context(), redisOwnedRequestKey{}, true)
 	ctx, cancel := context.WithCancel(ctx)
+	readRequest := kv.NewReadRequest(ctx, r.coordinator, r.store, r.readTracker)
+	ctx = readRequest.Context()
 	stopServer := context.AfterFunc(r.baseRequestContext(), cancel)
-	carrier := &redisOwnedConn{Conn: conn, owner: owner, ctx: ctx, serverCtx: r.baseRequestContext(), writer: r.newReplyBuffer(), initialDone: make(chan struct{}), cancel: cancel, stopServer: stopServer, mayWrite: redisCommandMayWrite(name)}
+	carrier := &redisOwnedConn{readRequest: readRequest, Conn: conn, owner: owner, ctx: ctx, serverCtx: r.baseRequestContext(), writer: r.newReplyBuffer(), initialDone: make(chan struct{}), cancel: cancel, stopServer: stopServer, mayWrite: redisCommandMayWrite(name)}
 	completed := false
 	defer func() {
 		if carrier.detached && !completed {
@@ -100,6 +102,7 @@ func (c *redisOwnedConn) publishIfAttached() {
 // RESP stays buffered until its terminal result is checked; no partial success
 // is published if a context-insensitive local read returns after revocation.
 type redisOwnedConn struct {
+	readRequest *kv.ReadRequest
 	redcon.Conn
 	owner          RequestOwnership
 	ctx            context.Context
@@ -162,6 +165,9 @@ func (c *redisOwnedConn) release() {
 		c.stopServer()
 		c.cancel()
 		c.owner.CancelAndJoin()
+		if c.readRequest != nil {
+			c.readRequest.Close()
+		}
 		c.writer.release()
 	})
 }

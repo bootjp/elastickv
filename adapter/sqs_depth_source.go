@@ -57,7 +57,10 @@ func (s *SQSServer) SnapshotQueueDepths(ctx context.Context) ([]SQSQueueDepth, b
 	// previous" diff would then ForgetQueue it spuriously, dashboard-
 	// rendering as a phantom drop. One ts per tick is also lighter
 	// on the leader's HLC than two.
-	readTS := s.nextTxnReadTS(ctx)
+	readTS, err := s.snapshotReadTS(ctx)
+	if err != nil {
+		return nil, false
+	}
 	names, err := s.scanQueueNamesAt(ctx, readTS)
 	if err != nil {
 		slog.Warn("sqs depth snapshot: scanQueueNamesAt failed", "err", err)

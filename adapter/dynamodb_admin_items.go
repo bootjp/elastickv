@@ -166,6 +166,10 @@ var ErrAdminDynamoValidation = errors.New("dynamodb admin: invalid request")
 // refill the page; partial pages are documented behaviour and the
 // caller treats any non-nil LastEvaluatedKey as "more available".
 func (d *DynamoDBServer) AdminScanTable(ctx context.Context, principal AdminPrincipal, tableName string, opts AdminScanOptions) (AdminScanResult, error) {
+	readRequest := d.newReadRequest(ctx)
+	defer readRequest.Close()
+	ctx = readRequest.Context()
+
 	if !principal.Role.canRead() {
 		return AdminScanResult{}, ErrAdminForbidden
 	}
@@ -183,7 +187,15 @@ func (d *DynamoDBServer) AdminScanTable(ctx context.Context, principal AdminPrin
 	// generate write load on every dashboard poll until the migration
 	// finishes (Codex r1 P1 on PR #805). Operators migrate the table
 	// via the SigV4 surface before admin reads become available.
-	readTS := d.nextTxnReadTS()
+	stamp, err := d.beginTxnReadTimestamp(ctx, "dynamodb admin read", dynamoTableMetaKey(tableName))
+	if err != nil {
+		return AdminScanResult{}, err
+	}
+	readTS := stamp.Timestamp()
+	return d.adminScanTableAt(ctx, tableName, opts, readTS)
+}
+
+func (d *DynamoDBServer) adminScanTableAt(ctx context.Context, tableName string, opts AdminScanOptions, readTS uint64) (AdminScanResult, error) {
 	schema, exists, err := d.loadTableSchemaAt(ctx, tableName, readTS)
 	if err != nil {
 		return AdminScanResult{}, errors.WithStack(err)
@@ -235,7 +247,11 @@ func (d *DynamoDBServer) AdminScanTable(ctx context.Context, principal AdminPrin
 //   - ErrAdminDynamoNotFound — table absent
 //   - ErrAdminDynamoValidation — empty / malformed input
 func (d *DynamoDBServer) AdminGetItem(ctx context.Context, principal AdminPrincipal, tableName string, key map[string]AdminAttributeValue) (*AdminItem, bool, error) {
-	schema, readTS, readPin, err := d.adminLoadReadableSchema(ctx, principal, tableName, len(key))
+	readRequest := d.newReadRequest(ctx)
+	defer readRequest.Close()
+	ctx = readRequest.Context()
+
+	schema, _, readPin, err := d.adminLoadReadableSchema(ctx, principal, tableName, len(key))
 	if err != nil {
 		return nil, false, err
 	}
@@ -251,8 +267,23 @@ func (d *DynamoDBServer) AdminGetItem(ctx context.Context, principal AdminPrinci
 	// malformed input (missing hash key, wrong type) surfaces as
 	// ErrAdminDynamoValidation rather than the plain errors.New chain
 	// readLogicalItemAt would otherwise return (Codex r1 P2).
-	if _, err := schema.itemKeyFromAttributes(internalKey); err != nil {
+	itemKey, err := schema.itemKeyFromAttributes(internalKey)
+	if err != nil {
 		return nil, false, errors.Wrap(ErrAdminDynamoValidation, err.Error())
+	}
+	// The schema determines the item key. Fence both at a fresh common
+	// snapshot, then confirm that schema re-resolution preserves that key.
+	schema, readTS, finalPin, err := d.adminLoadReadableSchema(ctx, principal, tableName, len(key), itemKey)
+	if err != nil {
+		return nil, false, err
+	}
+	defer finalPin.Release()
+	finalKey, err := schema.itemKeyFromAttributes(internalKey)
+	if err != nil {
+		return nil, false, errors.Wrap(ErrAdminDynamoValidation, err.Error())
+	}
+	if !bytes.Equal(finalKey, itemKey) {
+		return nil, false, errors.New("dynamodb admin: table routing changed during read; retry")
 	}
 	current, found, err := d.readLogicalItemAt(ctx, schema, internalKey, readTS)
 	if err != nil {
@@ -276,7 +307,7 @@ func (d *DynamoDBServer) AdminGetItem(ctx context.Context, principal AdminPrinci
 // On success the caller MUST defer readPin.Release(). On error the
 // helper releases the pin internally (if one was acquired) so the
 // caller never has to handle release on the error path.
-func (d *DynamoDBServer) adminLoadReadableSchema(ctx context.Context, principal AdminPrincipal, tableName string, keyAttrs int) (*dynamoTableSchema, uint64, *kv.ActiveTimestampToken, error) {
+func (d *DynamoDBServer) adminLoadReadableSchema(ctx context.Context, principal AdminPrincipal, tableName string, keyAttrs int, extraKeys ...[]byte) (*dynamoTableSchema, uint64, *kv.ActiveTimestampToken, error) {
 	if !principal.Role.canRead() {
 		return nil, 0, nil, ErrAdminForbidden
 	}
@@ -286,7 +317,12 @@ func (d *DynamoDBServer) adminLoadReadableSchema(ctx context.Context, principal 
 	if strings.TrimSpace(tableName) == "" || keyAttrs == 0 {
 		return nil, 0, nil, ErrAdminDynamoValidation
 	}
-	readTS := d.nextTxnReadTS()
+	keys := append([][]byte{dynamoTableMetaKey(tableName)}, extraKeys...)
+	stamp, err := d.beginTxnReadTimestamp(ctx, "dynamodb admin read", keys...)
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	readTS := stamp.Timestamp()
 	readPin := d.pinReadTS(readTS)
 	schema, exists, err := d.loadTableSchemaAt(ctx, tableName, readTS)
 	if err != nil {
@@ -319,6 +355,10 @@ func (d *DynamoDBServer) AdminPutItem(
 	pathKey map[string]AdminAttributeValue,
 	item AdminItem,
 ) error {
+	readRequest := d.newReadRequest(ctx)
+	defer readRequest.Close()
+	ctx = readRequest.Context()
+
 	if !principal.Role.canWrite() {
 		return ErrAdminForbidden
 	}
@@ -396,6 +436,10 @@ func validateAdminPathKeyCoversPrimaryKey(
 //   - ErrAdminDynamoNotFound   — table absent
 //   - ErrAdminDynamoValidation — empty / malformed input
 func (d *DynamoDBServer) AdminDeleteItem(ctx context.Context, principal AdminPrincipal, tableName string, key map[string]AdminAttributeValue) error {
+	readRequest := d.newReadRequest(ctx)
+	defer readRequest.Close()
+	ctx = readRequest.Context()
+
 	if !principal.Role.canWrite() {
 		return ErrAdminForbidden
 	}

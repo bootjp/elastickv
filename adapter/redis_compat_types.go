@@ -395,7 +395,7 @@ func decodeRedisTTL(raw []byte) (time.Time, error) {
 func (r *RedisServer) ttlAt(ctx context.Context, userKey []byte, readTS uint64) (*time.Time, error) {
 	// For string keys with new encoding: TTL is embedded in the string value.
 	// Trust only the embedded TTL; do not fall back to !redis|ttl| for new-format strings.
-	raw, err := r.store.GetAt(ctx, redisStrKey(userKey), readTS)
+	raw, err := requestGetAt(ctx, r.store, redisStrKey(userKey), readTS)
 	if err == nil {
 		if isNewRedisStrFormat(raw) {
 			_, expireAt, decErr := decodeRedisStr(raw)
@@ -419,7 +419,7 @@ func (r *RedisServer) ttlAt(ctx context.Context, userKey []byte, readTS uint64) 
 }
 
 func (r *RedisServer) hllTTLAt(ctx context.Context, userKey []byte, readTS uint64) (*time.Time, bool, error) {
-	raw, err := r.store.GetAt(ctx, redisHLLKey(userKey), readTS)
+	raw, err := requestGetAt(ctx, r.store, redisHLLKey(userKey), readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return nil, false, nil
@@ -444,7 +444,7 @@ func (r *RedisServer) hllTTLAt(ctx context.Context, userKey []byte, readTS uint6
 // legacyIndexTTLAt reads the TTL from the !redis|ttl| secondary index only.
 // Use this on non-string paths where the embedded-TTL probe would always miss.
 func (r *RedisServer) legacyIndexTTLAt(ctx context.Context, userKey []byte, readTS uint64) (*time.Time, error) {
-	raw, err := r.store.GetAt(ctx, redisTTLKey(userKey), readTS)
+	raw, err := requestGetAt(ctx, r.store, redisTTLKey(userKey), readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return nil, nil

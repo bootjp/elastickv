@@ -40,7 +40,7 @@ func (s *S3Server) prepareS3UploadPart(ctx context.Context, bucket, objectKey, u
 	if err != nil {
 		return nil, err
 	}
-	readTimestamp, err := s.beginTxnReadTimestamp(ctx, s.readTS(), "s3 upload part preparation: begin read timestamp")
+	readTimestamp, err := s.beginTxnReadTimestamp(ctx, "s3 upload part preparation: begin read timestamp")
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -62,7 +62,7 @@ func (s *S3Server) prepareS3UploadPart(ctx context.Context, bucket, objectKey, u
 	}
 	state.meta = meta
 	state.uploadMetaKey = s3keys.UploadMetaKey(bucket, meta.Generation, objectKey, uploadID)
-	if _, err := s.store.GetAt(ctx, state.uploadMetaKey, state.readTS); err != nil {
+	if _, err := requestGetAt(ctx, s.store, state.uploadMetaKey, state.readTS); err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return nil, newS3ResponseError(http.StatusNotFound, "NoSuchUpload", "upload not found", bucket, objectKey)
 		}
@@ -141,12 +141,11 @@ func (s *S3Server) finalizeS3UploadPartCommitTS(ctx context.Context, startTS uin
 }
 
 func (s *S3Server) allocateS3UploadPartVersion(ctx context.Context) (kv.ReadTimestamp, uint64, uint64, error) {
-	readTS := s.readTS()
-	readTimestamp, err := s.beginTxnReadTimestamp(ctx, readTS, "s3 upload part: begin read timestamp")
+	readTimestamp, err := s.beginTxnReadTimestamp(ctx, "s3 upload part: begin read timestamp")
 	if err != nil {
 		return kv.ReadTimestamp{}, 0, 0, errors.WithStack(err)
 	}
-	readTS = readTimestamp.Timestamp()
+	readTS := readTimestamp.Timestamp()
 	startTS := readTS
 	commitTS, err := s.nextTxnCommitTS(ctx, startTS)
 	if err != nil {
@@ -219,7 +218,7 @@ func (s *S3Server) readS3UploadPartCommitState(ctx context.Context, state *s3Upl
 }
 
 func (s *S3Server) loadPreviousS3PartDescriptor(ctx context.Context, partKey []byte, readTS uint64) (*s3PartDescriptor, error) {
-	raw, err := s.store.GetAt(ctx, partKey, readTS)
+	raw, err := requestGetAt(ctx, s.store, partKey, readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return nil, nil
@@ -240,7 +239,7 @@ func decodeS3PartDescriptorOrNil(raw []byte) *s3PartDescriptor {
 }
 
 func (s *S3Server) verifyS3UploadStillExists(ctx context.Context, uploadMetaKey []byte, bucket, objectKey string, readTS uint64) error {
-	if _, err := s.store.GetAt(ctx, uploadMetaKey, readTS); err != nil {
+	if _, err := requestGetAt(ctx, s.store, uploadMetaKey, readTS); err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return newS3ResponseError(http.StatusNotFound, "NoSuchUpload", "upload not found", bucket, objectKey)
 		}

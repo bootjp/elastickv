@@ -41,7 +41,7 @@ func clampRange(start, end, length int) (int, int) {
 }
 
 func (r *RedisServer) loadListMetaAt(ctx context.Context, key []byte, readTS uint64) (store.ListMeta, bool, error) {
-	val, err := r.store.GetAt(ctx, store.ListMetaKey(key), readTS)
+	val, err := requestGetAt(ctx, r.store, store.ListMetaKey(key), readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return store.ListMeta{}, false, nil
@@ -328,7 +328,11 @@ func (r *RedisServer) resolveReuseLength(ctx context.Context, key []byte, pendin
 // stale w.r.t. intervening non-conflicting writes, so the probe-hit
 // shortcut would silently understate the count.
 func (r *RedisServer) resolveLengthAfterFreshApply(ctx context.Context, key []byte, pending *reusableListPush) int64 {
-	currentMeta, _, mErr := r.resolveListMeta(ctx, key, r.readTS())
+	readTS, err := r.snapshotReadTS(ctx)
+	if err != nil {
+		return pending.length
+	}
+	currentMeta, _, mErr := r.resolveListMeta(ctx, key, readTS)
 	if mErr != nil {
 		return pending.length
 	}
@@ -562,9 +566,9 @@ func (r *RedisServer) buildListPopElems(ctx context.Context, key []byte, meta st
 	var kvps []*store.KVPair
 	var scanErr error
 	if left {
-		kvps, scanErr = r.store.ScanAt(ctx, startKey, endKey, int(n), readTS)
+		kvps, scanErr = requestScanAt(ctx, r.store, startKey, endKey, int(n), readTS)
 	} else {
-		kvps, scanErr = r.store.ReverseScanAt(ctx, startKey, endKey, int(n), readTS)
+		kvps, scanErr = requestReverseScanAt(ctx, r.store, startKey, endKey, int(n), readTS)
 	}
 	if scanErr != nil {
 		return nil, nil, errors.WithStack(scanErr)
@@ -695,7 +699,10 @@ func (r *RedisServer) commitListPop(ctx context.Context, key []byte, elems []*kv
 func (r *RedisServer) listPopClaim(ctx context.Context, key []byte, count int, left bool) ([]string, error) {
 	// count=0: Redis returns an empty array if the key exists as a list, nil otherwise.
 	if count <= 0 {
-		readTS := r.readTS()
+		readTS, err := r.snapshotReadTS(ctx)
+		if err != nil {
+			return nil, err
+		}
 		found, err := r.checkListKeyType(ctx, key, readTS)
 		if err != nil || !found {
 			return nil, err
@@ -730,7 +737,7 @@ func (r *RedisServer) fetchListRange(ctx context.Context, key []byte, meta store
 	startKey := listItemKey(key, startSeq)
 	endKey := listItemKey(key, endSeq+1) // exclusive
 
-	kvs, err := r.store.ScanAt(ctx, startKey, endKey, int(endIdx-startIdx+1), readTS)
+	kvs, err := requestScanAt(ctx, r.store, startKey, endKey, int(endIdx-startIdx+1), readTS)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -815,7 +822,7 @@ func (r *RedisServer) fenceRangeListReadGroups(ctx context.Context, key []byte, 
 		return 0, nil, proxied, true, err
 	}
 	readTimestamp, readPin, err := r.redisReadFencedTimestampForTargets(
-		ctx, targets, r.readTS, "redis list range: begin read timestamp")
+		ctx, targets, "redis list range: begin read timestamp")
 	if err != nil {
 		return 0, nil, nil, false, err
 	}
@@ -844,7 +851,11 @@ func (r *RedisServer) listPushCmd(conn redcon.Conn, cmd redcon.Command, pushFn l
 	ctx, cancel := context.WithTimeout(r.handlerContext(conn),
 		redisDispatchTimeout)
 	defer cancel()
-	readTS := r.readTS()
+	readTS, err := r.snapshotReadTS(r.handlerContext(conn))
+	if err != nil {
+		writeRedisError(conn, err)
+		return
+	}
 	typ, err := r.keyTypeAt(ctx, key, readTS)
 	if err != nil {
 		writeRedisError(conn, err)
@@ -977,7 +988,11 @@ func (r *RedisServer) lindex(conn redcon.Conn, cmd redcon.Command) {
 	ctx, cancel := context.WithTimeout(r.handlerContext(conn),
 		redisDispatchTimeout)
 	defer cancel()
-	readTS := r.readTS()
+	readTS, err := r.snapshotReadTS(r.handlerContext(conn))
+	if err != nil {
+		writeRedisError(conn, err)
+		return
+	}
 	typ, err := r.keyTypeAt(ctx, cmd.Args[1], readTS)
 	if err != nil {
 		writeRedisError(conn, err)

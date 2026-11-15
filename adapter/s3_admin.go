@@ -57,7 +57,14 @@ type AdminBucketSummary struct {
 // Returns an empty slice (not nil) when no buckets exist so JSON
 // callers see `[]` instead of `null`.
 func (s *S3Server) AdminListBuckets(ctx context.Context) ([]AdminBucketSummary, error) {
-	readTS := s.readTS()
+	readRequest := s.newReadRequest(ctx)
+	defer readRequest.Close()
+	ctx = readRequest.Context()
+
+	readTS, err := s.snapshotReadTS(ctx)
+	if err != nil {
+		return nil, err
+	}
 	readPin := s.pinReadTS(readTS)
 	defer readPin.Release()
 	prefix := []byte(s3keys.BucketMetaPrefix)
@@ -65,7 +72,7 @@ func (s *S3Server) AdminListBuckets(ctx context.Context) ([]AdminBucketSummary, 
 	start := bytes.Clone(prefix)
 	out := make([]AdminBucketSummary, 0, adminBucketScanPage)
 	for {
-		kvs, err := s.store.ScanAt(ctx, start, end, adminBucketScanPage, readTS)
+		kvs, err := requestScanAt(ctx, s.store, start, end, adminBucketScanPage, readTS)
 		if err != nil {
 			return nil, errors.Wrap(err, "admin list buckets: scan metadata")
 		}
@@ -150,7 +157,14 @@ func finaliseAdminBucketList(out []AdminBucketSummary) []AdminBucketSummary {
 // the boundary; the adapter trusts the caller for authentication
 // (Section 3.2's exception for read-only paths).
 func (s *S3Server) AdminDescribeBucket(ctx context.Context, name string) (*AdminBucketSummary, bool, error) {
-	readTS := s.readTS()
+	readRequest := s.newReadRequest(ctx)
+	defer readRequest.Close()
+	ctx = readRequest.Context()
+
+	readTS, err := s.snapshotReadTS(ctx)
+	if err != nil {
+		return nil, false, err
+	}
 	readPin := s.pinReadTS(readTS)
 	defer readPin.Release()
 	meta, exists, err := s.loadBucketMetaAt(ctx, name, readTS)
@@ -223,6 +237,10 @@ var (
 // ErrAdminBucketAlreadyExists; on a non-leader / non-full-role / bad
 // input returns the corresponding sentinel.
 func (s *S3Server) AdminCreateBucket(ctx context.Context, principal AdminPrincipal, name, acl string) (*AdminBucketSummary, error) {
+	readRequest := s.newReadRequest(ctx)
+	defer readRequest.Close()
+	ctx = readRequest.Context()
+
 	if !principal.Role.canWrite() {
 		return nil, ErrAdminForbidden
 	}
@@ -258,12 +276,11 @@ func (s *S3Server) AdminCreateBucket(ctx context.Context, principal AdminPrincip
 // generation / commit-ts dance — every step has a meaningful
 // error path that the wrapping retry harness needs to see.
 func (s *S3Server) adminCreateBucketTxn(ctx context.Context, principal AdminPrincipal, name, acl string) (*AdminBucketSummary, error) {
-	readTS := s.readTS()
-	readTimestamp, err := s.beginTxnReadTimestamp(ctx, readTS, "s3 admin create bucket: begin read timestamp")
+	readTimestamp, err := s.beginTxnReadTimestamp(ctx, "s3 admin create bucket: begin read timestamp")
 	if err != nil {
 		return nil, errors.Wrap(err, "s3 admin: allocate startTS for adminCreateBucketTxn")
 	}
-	readTS = readTimestamp.Timestamp()
+	readTS := readTimestamp.Timestamp()
 	startTS := readTS
 	readPin := s.pinReadTS(readTS)
 	defer readPin.Release()
@@ -317,6 +334,10 @@ func (s *S3Server) adminCreateBucketTxn(ctx context.Context, principal AdminPrin
 // the meta.Acl field; generation is preserved so existing object
 // references stay valid.
 func (s *S3Server) AdminPutBucketAcl(ctx context.Context, principal AdminPrincipal, name, acl string) error {
+	readRequest := s.newReadRequest(ctx)
+	defer readRequest.Close()
+	ctx = readRequest.Context()
+
 	if !principal.Role.canWrite() {
 		return ErrAdminForbidden
 	}
@@ -329,12 +350,11 @@ func (s *S3Server) AdminPutBucketAcl(ctx context.Context, principal AdminPrincip
 	}
 
 	err := s.retryS3Mutation(ctx, func() error {
-		readTS := s.readTS()
-		readTimestamp, err := s.beginTxnReadTimestamp(ctx, readTS, "s3 admin put bucket acl: begin read timestamp")
+		readTimestamp, err := s.beginTxnReadTimestamp(ctx, "s3 admin put bucket acl: begin read timestamp")
 		if err != nil {
 			return errors.Wrap(err, "s3 admin: allocate startTS for mutation")
 		}
-		readTS = readTimestamp.Timestamp()
+		readTS := readTimestamp.Timestamp()
 		startTS := readTS
 		readPin := s.pinReadTS(readTS)
 		defer readPin.Release()
@@ -415,6 +435,10 @@ func (s *S3Server) AdminPutBucketAcl(ctx context.Context, principal AdminPrincip
 // (adapter/s3.go:deleteBucket) so both delete entrypoints share
 // the same race-window guarantees.
 func (s *S3Server) AdminDeleteBucket(ctx context.Context, principal AdminPrincipal, name string) error {
+	readRequest := s.newReadRequest(ctx)
+	defer readRequest.Close()
+	ctx = readRequest.Context()
+
 	if !principal.Role.canWrite() {
 		return ErrAdminForbidden
 	}
@@ -442,12 +466,11 @@ func (s *S3Server) AdminDeleteBucket(ctx context.Context, principal AdminPrincip
 // HLC-4 (iii) fence added an extra error-branch on startTS
 // allocation (PR #867 Phase 2a).
 func (s *S3Server) adminDeleteBucketTxnBody(ctx context.Context, name string, deletedGeneration *uint64) error {
-	readTS := s.readTS()
-	readTimestamp, err := s.beginTxnReadTimestamp(ctx, readTS, "s3 admin delete bucket: begin read timestamp")
+	readTimestamp, err := s.beginTxnReadTimestamp(ctx, "s3 admin delete bucket: begin read timestamp")
 	if err != nil {
 		return errors.Wrap(err, "s3 admin: allocate startTS for adminDeleteBucket")
 	}
-	readTS = readTimestamp.Timestamp()
+	readTS := readTimestamp.Timestamp()
 	readPin := s.pinReadTS(readTS)
 	defer readPin.Release()
 
@@ -459,7 +482,7 @@ func (s *S3Server) adminDeleteBucketTxnBody(ctx context.Context, name string, de
 		return ErrAdminBucketNotFound
 	}
 	start := s3keys.ObjectManifestPrefixForBucket(name, meta.Generation)
-	kvs, err := s.store.ScanAt(ctx, start, prefixScanEnd(start), 1, readTS)
+	kvs, err := requestScanAt(ctx, s.store, start, prefixScanEnd(start), 1, readTS)
 	if err != nil {
 		return errors.WithStack(err)
 	}

@@ -18,6 +18,13 @@ const (
 	s3BlobOffloadModeLegacy  = "legacy"
 	s3BlobOffloadModeOffload = "offload"
 	s3BlobOffloadModeUnknown = "unknown"
+	s3BlobOffloadModeMixed   = "mixed"
+
+	s3ObjectOutcomeSuccess       = "success"
+	s3ObjectOutcomeFailure       = "failure"
+	s3ObjectDurationBucketStart  = 0.001
+	s3ObjectDurationBucketFactor = 2
+	s3ObjectDurationBucketCount  = 18
 
 	s3BlobOffloadReasonFlagDisabled      = "flag_disabled"
 	s3BlobOffloadReasonCapabilityMissing = "capability_missing"
@@ -44,6 +51,7 @@ type S3Metrics struct {
 	putAdmissionRejections       *prometheus.CounterVec
 	putAdmissionWait             *prometheus.HistogramVec
 	blobOffloadWriteDecisions    *prometheus.CounterVec
+	objectDuration               *prometheus.HistogramVec
 	chunkBlobReplicationDegraded prometheus.Counter
 	chunkBlobSHAMismatches       prometheus.Counter
 	chunkBlobUnrecoverableReads  prometheus.Counter
@@ -80,6 +88,14 @@ func newS3Metrics(registerer prometheus.Registerer) *S3Metrics {
 				Help: "Total S3 write-path blob offload decisions by selected mode and fallback reason.",
 			},
 			[]string{labelMode, labelReason},
+		),
+		objectDuration: prometheus.NewHistogramVec(
+			prometheus.HistogramOpts{
+				Name:    "elastickv_s3_object_duration_seconds",
+				Help:    "End-to-end S3 object PUT and GET duration by stored data path and outcome.",
+				Buckets: prometheus.ExponentialBuckets(s3ObjectDurationBucketStart, s3ObjectDurationBucketFactor, s3ObjectDurationBucketCount),
+			},
+			[]string{"operation", labelMode, "outcome"},
 		),
 		chunkBlobReplicationDegraded: prometheus.NewCounter(
 			prometheus.CounterOpts{
@@ -118,6 +134,7 @@ func newS3Metrics(registerer prometheus.Registerer) *S3Metrics {
 		m.putAdmissionRejections,
 		m.putAdmissionWait,
 		m.blobOffloadWriteDecisions,
+		m.objectDuration,
 		m.chunkBlobReplicationDegraded,
 		m.chunkBlobSHAMismatches,
 		m.chunkBlobUnrecoverableReads,
@@ -165,6 +182,29 @@ func (m *S3Metrics) ObserveS3BlobOffloadDecision(mode, reason string) {
 		normalizeS3BlobOffloadMode(mode),
 		normalizeS3BlobOffloadReason(reason),
 	).Inc()
+}
+
+func (m *S3Metrics) ObserveS3ObjectDuration(operation, mode, outcome string, duration time.Duration) {
+	if m == nil {
+		return
+	}
+	if operation != "put" && operation != "get" {
+		return
+	}
+	if outcome != s3ObjectOutcomeSuccess {
+		outcome = s3ObjectOutcomeFailure
+	}
+	if duration < 0 {
+		duration = 0
+	}
+	m.objectDuration.WithLabelValues(operation, normalizeS3ObjectMode(mode), outcome).Observe(duration.Seconds())
+}
+
+func normalizeS3ObjectMode(mode string) string {
+	if mode == s3BlobOffloadModeMixed {
+		return mode
+	}
+	return normalizeS3BlobOffloadMode(mode)
 }
 
 func (m *S3Metrics) ObserveS3ChunkBlobReplicationDegraded() {

@@ -1025,7 +1025,11 @@ func (r *RedisServer) collectionCardinal(
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
-	readTS := r.readTS()
+	readTS, err := r.snapshotReadTS(r.handlerContext(conn))
+	if err != nil {
+		writeRedisError(conn, err)
+		return
+	}
 	typ, err := r.keyTypeAt(r.handlerContext(conn),
 		cmd.Args[1], readTS)
 	if err != nil {

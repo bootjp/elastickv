@@ -6,6 +6,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/cockroachdb/errors"
 )
@@ -20,6 +21,11 @@ const (
 
 	s3BlobOffloadModeLegacy  = "legacy"
 	s3BlobOffloadModeOffload = "offload"
+	s3BlobOffloadModeMixed   = "mixed"
+	s3BlobOffloadModeUnknown = "unknown"
+
+	s3ObjectOutcomeSuccess = "success"
+	s3ObjectOutcomeFailure = "failure"
 
 	s3BlobMinimumDurableCopies = 2
 
@@ -45,6 +51,12 @@ type S3BlobOffloadObserver interface {
 	ObserveS3ChunkBlobReplicationDegraded()
 	ObserveS3ChunkBlobSHAMismatch()
 	ObserveS3ChunkBlobUnrecoverable()
+}
+
+// S3ObjectLatencyObserver is optional so existing offload observers need not
+// implement request timing.
+type S3ObjectLatencyObserver interface {
+	ObserveS3ObjectDuration(operation, mode, outcome string, duration time.Duration)
 }
 
 type s3BlobOffloadDecision struct {
@@ -204,4 +216,21 @@ func (s *S3Server) observeS3BlobOffloadDecision(ctx context.Context) s3BlobOfflo
 // reports whether its chunks go to replicated chunkblobs.
 func (s *S3Server) s3BlobOffloadSelected(ctx context.Context) bool {
 	return s.observeS3BlobOffloadDecision(ctx).mode == s3BlobOffloadModeOffload
+}
+
+func s3SelectedBlobMode(offload bool) string {
+	if offload {
+		return s3BlobOffloadModeOffload
+	}
+	return s3BlobOffloadModeLegacy
+}
+
+func (s *S3Server) observeS3ObjectDuration(operation, mode, outcome string, started time.Time) {
+	if s == nil {
+		return
+	}
+	observer, ok := s.blobOffloadObserver.(S3ObjectLatencyObserver)
+	if ok {
+		observer.ObserveS3ObjectDuration(operation, mode, outcome, time.Since(started))
+	}
 }

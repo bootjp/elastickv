@@ -382,7 +382,11 @@ func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
 		writeRedisError(conn, err)
 		return
 	}
-	readTS := r.readTS()
+	readTS, err := r.snapshotReadTS(r.handlerContext(conn))
+	if err != nil {
+		writeRedisError(conn, err)
+		return
+	}
 
 	// Fast path: attempt the string read directly instead of probing
 	// every possible Redis encoding first. rawKeyTypeAt issues up to
@@ -610,7 +614,11 @@ func (r *RedisServer) exists(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 
-	readTS := r.readTS()
+	readTS, err := r.snapshotReadTS(r.handlerContext(conn))
+	if err != nil {
+		writeRedisError(conn, err)
+		return
+	}
 	// Derive ctx from the server's base context so work in this handler
 	// that honors context deadlines is bounded and cancels on shutdown.
 	// Local Pebble reads (store.GetAt / ExistsAt / ScanAt) currently
@@ -656,7 +664,7 @@ func (r *RedisServer) exists(conn redcon.Conn, cmd redcon.Command) {
 // round-trip per key on every follower, regressing EXISTS latency on
 // workloads that were previously all-local.
 func (r *RedisServer) existsAtFast(ctx context.Context, key []byte, readTS uint64) (bool, error) {
-	raw, err := r.store.GetAt(ctx, redisStrKey(key), readTS)
+	raw, err := requestGetAt(ctx, r.store, redisStrKey(key), readTS)
 	if err == nil {
 		alive, decErr := r.stringPayloadIsLive(ctx, key, raw, readTS)
 		if decErr != nil {

@@ -687,10 +687,6 @@ func (r *RedisServer) ensureConnID(st *connState) uint64 {
 	return st.connID
 }
 
-func (r *RedisServer) readTS() uint64 {
-	return snapshotTS(r.coordinator.Clock(), r.store)
-}
-
 func (r *RedisServer) nextCommitTSAfter(ctx context.Context, startTS uint64, label string) (uint64, error) {
 	if r == nil || r.coordinator == nil {
 		return 0, errors.Wrap(kv.ErrTSOCoordinatorNil, label)
@@ -741,6 +737,11 @@ func (r *RedisServer) dispatchCommandUnowned(conn redcon.Conn, name string, hand
 }
 
 func (r *RedisServer) dispatchCommandDirect(conn redcon.Conn, name string, handler func(redcon.Conn, redcon.Command), cmd redcon.Command, start time.Time) {
+	if _, ok := kv.ReadRequestFromContext(r.handlerContext(conn)); !ok {
+		readRequest := kv.NewReadRequest(r.handlerContext(conn), r.coordinator, r.store, r.readTracker)
+		defer readRequest.Close()
+		conn = &redisReadRequestConn{Conn: conn, ctx: readRequest.Context()}
+	}
 	defer func() {
 		if owned, ok := conn.(*redisOwnedConn); ok && !owned.workStarted {
 			return
@@ -1204,3 +1205,10 @@ func (r *RedisServer) ping(conn redcon.Conn, cmd redcon.Command) {
 		conn.WriteError("ERR wrong number of arguments for 'ping' command")
 	}
 }
+
+type redisReadRequestConn struct {
+	redcon.Conn
+	ctx context.Context
+}
+
+func (c *redisReadRequestConn) requestContext() context.Context { return c.ctx }
