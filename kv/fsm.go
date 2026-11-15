@@ -615,14 +615,10 @@ func (f *kvFSM) applyReservedOpcode(ctx context.Context, data []byte) (any, bool
 		return nil, false
 	}
 	switch {
-	case data[0] == raftEncodeHLCLease:
-		return f.applyHLCLease(data[1:]), true
-	case data[0] == raftEncodeCommitTSFenceActivation:
-		return f.applyCommitTSFenceActivation(ctx, data[1:]), true
-	case data[0] == raftEncodeTwoGroupPrepare:
-		return f.applyTwoGroupPrepareEntry(ctx, data[1:]), true
-	case data[0] == raftEncodeWatermarkAdvance:
-		return f.applyWatermarkAdvance(ctx, data[1:]), true
+	case isSimpleControlOpcode(data[0]):
+		return f.applySimpleControlOpcode(ctx, data), true
+	case isTwoGroupOpcode(data[0]):
+		return f.applyTwoGroupOpcode(ctx, data), true
 	case data[0] >= fsmwire.OpEncryptionMin && data[0] <= fsmwire.OpEncryptionMax:
 		return f.applyEncryption(f.pendingApplyIdx, data[0], data[1:]), true
 	default:
@@ -631,6 +627,32 @@ func (f *kvFSM) applyReservedOpcode(ctx context.Context, data []byte) (any, bool
 		}
 		return f.applyBackupOpcode(ctx, data[0], data[1:])
 	}
+}
+
+func isSimpleControlOpcode(op byte) bool {
+	return op == raftEncodeHLCLease || op == raftEncodeCommitTSFenceActivation || op == raftEncodeWatermarkAdvance
+}
+
+func isTwoGroupOpcode(op byte) bool {
+	return op == raftEncodeTwoGroupPrepare || op == raftEncodeTwoGroupTerminal
+}
+
+func (f *kvFSM) applySimpleControlOpcode(ctx context.Context, data []byte) any {
+	switch data[0] {
+	case raftEncodeHLCLease:
+		return f.applyHLCLease(data[1:])
+	case raftEncodeCommitTSFenceActivation:
+		return f.applyCommitTSFenceActivation(ctx, data[1:])
+	default:
+		return f.applyWatermarkAdvance(ctx, data[1:])
+	}
+}
+
+func (f *kvFSM) applyTwoGroupOpcode(ctx context.Context, data []byte) any {
+	if data[0] == raftEncodeTwoGroupPrepare {
+		return f.applyTwoGroupPrepareEntry(ctx, data[1:])
+	}
+	return f.applyTwoGroupTerminalEntry(ctx, data[1:])
 }
 
 // applyMigrationOpcode handles the range-migration half of the reserved opcode
@@ -897,6 +919,9 @@ func verifyTwoGroupApplyRequestIngress(ctx context.Context, r *pb.Request) error
 			return nil
 		}
 	case pb.Phase_COMMIT, pb.Phase_ABORT:
+		if ctx.Value(twoGroupTerminalApplyContextKey{}) == true {
+			return nil
+		}
 	default:
 	}
 	return errors.WithStack(ErrTwoGroupAdmission)

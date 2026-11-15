@@ -16,6 +16,11 @@ import (
 // is replicated. Public Forward never accepts a lookup or observation.
 func (c *ShardedCoordinator) WithTwoGroupPrepareAdmission(lookup func(uint64) (TwoGroupHomeLookup, error)) *ShardedCoordinator {
 	c.twoGroupHomeLookup = lookup
+	for _, group := range c.groups {
+		if group != nil {
+			group.twoGroupTerminalResolver = c.DecideTwoGroup
+		}
+	}
 	return c
 }
 

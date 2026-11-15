@@ -118,20 +118,34 @@ func (i *Internal) LookupTimestampBinding(ctx context.Context, req *pb.LookupTim
 	if err != nil {
 		return nil, err
 	}
+	terminalRecord, err := lookupOptionalTwoGroupHomeDecision(ctx, metadata, operationID, req.GetHomeAdmissionVersion(), found)
+	if err != nil {
+		return nil, err
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, errors.WithStack(err)
 	}
 	if err := checkHomeBindingLookupFence(ctx, statusReader, term); err != nil {
 		return nil, err
 	}
-	return homeBindingLookupResponse(req.GetHomeAdmissionVersion(), found, binding, homeRecord, index, term), nil
+	return homeBindingLookupResponse(req.GetHomeAdmissionVersion(), found, binding, homeRecord, terminalRecord, index, term), nil
 }
 
-func homeBindingLookupResponse(version uint32, found bool, binding kv.TimestampBinding, homeRecord []byte, index, term uint64) *pb.LookupTimestampBindingResponse {
+func lookupOptionalTwoGroupHomeDecision(ctx context.Context, metadata store.RaftControlMetadataStore,
+	id [16]byte, version uint32, found bool) ([]byte, error) {
+	if version != kv.TwoGroupHomeDecisionLookupVersion || !found {
+		return nil, nil
+	}
+	record, _, err := kv.LookupTwoGroupHomeDecision(ctx, metadata, id)
+	return record, errors.Wrap(err, "lookup home decision")
+}
+
+func homeBindingLookupResponse(version uint32, found bool, binding kv.TimestampBinding, homeRecord, terminalRecord []byte, index, term uint64) *pb.LookupTimestampBindingResponse {
 	response := &pb.LookupTimestampBindingResponse{Found: found, AppliedIndex: index}
-	if version == kv.TwoGroupHomeAdmissionVersion {
-		response.HomeAdmissionVersion = kv.TwoGroupHomeAdmissionVersion
+	if version == kv.TwoGroupHomeAdmissionVersion || version == kv.TwoGroupHomeDecisionLookupVersion {
+		response.HomeAdmissionVersion = version
 		response.HomeAdmissionRecord = homeRecord
+		response.HomeTerminalRecord = terminalRecord
 		response.LeaderTerm = term
 	}
 	if found {
@@ -156,7 +170,7 @@ func (i *Internal) homeLookupTerm() (raftengine.StatusReader, uint64, error) {
 }
 
 func lookupOptionalTwoGroupHomeRecord(ctx context.Context, metadata store.RaftControlMetadataStore, id [16]byte, version uint32, found bool) ([]byte, error) {
-	if version != kv.TwoGroupHomeAdmissionVersion || !found {
+	if version != kv.TwoGroupHomeAdmissionVersion && version != kv.TwoGroupHomeDecisionLookupVersion || !found {
 		return nil, nil
 	}
 	record, recordFound, err := kv.LookupTwoGroupHomeRecord(ctx, metadata, id)
@@ -187,7 +201,7 @@ func (i *Internal) homeBindingLookupInputs(ctx context.Context, req *pb.LookupTi
 		return nil, operationID, errors.WithStack(status.Error(codes.PermissionDenied, "home binding lookup requires a data-group peer session"))
 	}
 	if req == nil || len(req.GetOperationId()) != len(operationID) || i.kvForwardRejected ||
-		req.GetHomeAdmissionVersion() > kv.TwoGroupHomeAdmissionVersion {
+		req.GetHomeAdmissionVersion() > kv.TwoGroupHomeDecisionLookupVersion {
 		return nil, operationID, errors.WithStack(status.Error(codes.InvalidArgument, "data-group operation ID is required"))
 	}
 	metadata, ok := i.store.(store.RaftControlMetadataStore)

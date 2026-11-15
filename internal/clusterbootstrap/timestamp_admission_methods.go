@@ -88,7 +88,7 @@ func lookupTimestampBindingMethod(group uint64) peersession.Method {
 		BoundRequest: func(binding peersession.RequestBinding, value any) (peersession.Message, error) {
 			request, ok := value.(*pb.LookupTimestampBindingRequest)
 			if !ok || !bootstrapExactProto(request) || binding.Group != group || len(request.GetOperationId()) != 16 ||
-				request.GetHomeAdmissionVersion() > kv.TwoGroupHomeAdmissionVersion {
+				request.GetHomeAdmissionVersion() > kv.TwoGroupHomeDecisionLookupVersion {
 				return peersession.Message{}, peersession.ErrFormat
 			}
 			return bootstrapControlMessage(binding), nil
@@ -119,11 +119,17 @@ func validLookupTimestampBindingResponse(response *pb.LookupTimestampBindingResp
 func validLookupTimestampBindingVersion(response *pb.LookupTimestampBindingResponse) bool {
 	switch response.GetHomeAdmissionVersion() {
 	case 0:
-		return len(response.GetHomeAdmissionRecord()) == 0 && response.GetLeaderTerm() == 0
+		return len(response.GetHomeAdmissionRecord()) == 0 && len(response.GetHomeTerminalRecord()) == 0 && response.GetLeaderTerm() == 0
 	case kv.TwoGroupHomeAdmissionVersion:
-		return response.GetLeaderTerm() != 0 && response.GetAppliedIndex() != 0 &&
-			response.GetFound() == (len(response.GetHomeAdmissionRecord()) != 0)
+		return len(response.GetHomeTerminalRecord()) == 0 && validTwoGroupLookupResponse(response)
+	case kv.TwoGroupHomeDecisionLookupVersion:
+		return validTwoGroupLookupResponse(response)
 	default:
 		return false
 	}
+}
+
+func validTwoGroupLookupResponse(response *pb.LookupTimestampBindingResponse) bool {
+	return response.GetLeaderTerm() != 0 && response.GetAppliedIndex() != 0 &&
+		response.GetFound() == (len(response.GetHomeAdmissionRecord()) != 0)
 }

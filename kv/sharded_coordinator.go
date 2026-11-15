@@ -26,6 +26,8 @@ type ShardGroup struct {
 	Engine raftengine.Engine
 	Store  store.MVCCStore
 	Txn    Transactional
+	// Installed only with the opt-in two-group coordinator. Never public Forward.
+	twoGroupTerminalResolver func(context.Context, *pb.TwoGroupPrepareManifest, pb.Phase) error
 	// TSOState is set only for reserved group 0. Keeping the applied floor and
 	// cutover marker next to the group's engine lets the leader allocator read
 	// consensus-owned state without treating the shared HLC mirror as durable.
@@ -2315,7 +2317,7 @@ func (c *ShardedCoordinator) commitPrimaryTxn(ctx context.Context, startTS uint6
 		return 0, 0, err
 	}
 
-	meta := txnMetaMutation(primaryKey, 0, commitTS)
+	meta := txnMetaMutation(primaryKey, commitTS)
 	keys := keyMutations(grouped[primaryGid])
 	req := &pb.Request{
 		IsTxn:                true,
@@ -2369,7 +2371,7 @@ func (c *ShardedCoordinator) commitSecondaryTxns(ctx context.Context, startTS ui
 	// recovery.  This sentinel is distinct from ErrComposed1Violation
 	// so the M4 retry path does not loop here (the primary is durable
 	// and re-prewriting would conflict with the existing locks).
-	meta := txnMetaMutation(primaryKey, 0, commitTS)
+	meta := txnMetaMutation(primaryKey, commitTS)
 	strict := requireAllParticipantsFlag(requireAllParticipants)
 	for _, gid := range gids {
 		if gid == primaryGid {
@@ -2474,7 +2476,7 @@ func (c *ShardedCoordinator) abortPreparedTxn(ctx context.Context, startTS uint6
 	}
 
 	cleaned := true
-	meta := txnMetaMutation(primaryKey, 0, abortTS)
+	meta := txnMetaMutation(primaryKey, abortTS)
 	for _, pg := range prepared {
 		if !c.abortPreparedGroup(ctx, startTS, primaryKey, abortTS, meta, pg) {
 			cleaned = false
@@ -2645,11 +2647,11 @@ func abortTSFrom(startTS, commitTS uint64) uint64 {
 	return 0
 }
 
-func txnMetaMutation(primaryKey []byte, lockTTLms uint64, commitTS uint64) *pb.Mutation {
+func txnMetaMutation(primaryKey []byte, commitTS uint64) *pb.Mutation {
 	return &pb.Mutation{
 		Op:    pb.Op_PUT,
 		Key:   []byte(txnMetaPrefix),
-		Value: EncodeTxnMeta(TxnMeta{PrimaryKey: primaryKey, LockTTLms: lockTTLms, CommitTS: commitTS}),
+		Value: EncodeTxnMeta(TxnMeta{PrimaryKey: primaryKey, CommitTS: commitTS}),
 	}
 }
 

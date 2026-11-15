@@ -5637,6 +5637,16 @@ func applyTxnResolution(ctx context.Context, g *ShardGroup, phase pb.Phase, star
 	if g == nil || g.Txn == nil {
 		return errors.WithStack(store.ErrNotSupported)
 	}
+	manifest, found, err := localTwoGroupManifestForLock(ctx, g, primaryKey, startTS)
+	if err != nil {
+		return err
+	}
+	if found {
+		if g.twoGroupTerminalResolver == nil {
+			return errors.WithStack(ErrTwoGroupAdmission)
+		}
+		return g.twoGroupTerminalResolver(ctx, manifest, phase)
+	}
 	meta := &pb.Mutation{
 		Op:    pb.Op_PUT,
 		Key:   []byte(txnMetaPrefix),
@@ -5647,7 +5657,7 @@ func applyTxnResolution(ctx context.Context, g *ShardGroup, phase pb.Phase, star
 	for _, k := range keys {
 		muts = append(muts, &pb.Mutation{Op: pb.Op_PUT, Key: k})
 	}
-	_, err := g.Txn.Commit(ctx, []*pb.Request{{IsTxn: true, Phase: phase, Ts: startTS, Mutations: muts}})
+	_, err = g.Txn.Commit(ctx, []*pb.Request{{IsTxn: true, Phase: phase, Ts: startTS, Mutations: muts}})
 	return errors.WithStack(err)
 }
 

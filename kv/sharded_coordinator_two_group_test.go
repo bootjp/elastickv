@@ -3,8 +3,11 @@ package kv
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"testing"
+	"time"
 
+	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -44,6 +47,9 @@ func (p *twoGroupRemoteTestPeer) PrepareTwoGroupOnLeader(ctx context.Context, gr
 
 func (e *twoGroupNativeEngine) State() raftengine.State            { return raftengine.StateLeader }
 func (e *twoGroupNativeEngine) VerifyLeader(context.Context) error { return nil }
+func (e *twoGroupNativeEngine) LinearizableRead(context.Context) (uint64, error) {
+	return e.index, nil
+}
 func (e *twoGroupNativeEngine) Status() raftengine.Status {
 	return raftengine.Status{State: raftengine.StateLeader, Term: e.term, AppliedIndex: e.index}
 }
@@ -128,6 +134,207 @@ func (l twoGroupNativeLookup) LookupTwoGroupHome(ctx context.Context, id [16]byt
 		return nil, 0, 0, errors.Join(ErrTwoGroupAdmission, err)
 	}
 	return raw, l.engine.index, l.engine.term, nil
+}
+
+func (l twoGroupNativeLookup) LookupTwoGroupDecision(ctx context.Context, id [16]byte) ([]byte, uint64, uint64, error) {
+	raw, found, err := LookupTwoGroupHomeDecision(ctx, l.metadata, id)
+	if err != nil || !found {
+		return nil, 0, 0, errors.Join(ErrTransactionOutcomeUnknown, err)
+	}
+	return raw, l.engine.index, l.engine.term, nil
+}
+
+func TestTwoGroupCoordinatorReconcilesLostPrimaryDecisionReply(t *testing.T) {
+	home, homeMetadata := twoGroupEntryFSM(t, 1)
+	secondary, secondaryMetadata := twoGroupEntryFSM(t, 2)
+	homeEngine := &twoGroupNativeEngine{f: home, index: 1, term: 2}
+	secondaryEngine := &twoGroupNativeEngine{f: secondary, index: 1, term: 3}
+	coord := &ShardedCoordinator{groups: map[uint64]*ShardGroup{
+		1: {Engine: homeEngine, Store: home.store, Txn: nilDecisionTransactional{}},
+		2: {Engine: secondaryEngine, Store: secondary.store, Txn: nilDecisionTransactional{}},
+	}, tsAllocator: twoGroupTestAllocator{}}
+	coord.WithTwoGroupPrepareAdmission(func(uint64) (TwoGroupHomeLookup, error) {
+		return twoGroupNativeLookup{metadata: homeMetadata, engine: homeEngine}, nil
+	})
+	grouped := map[uint64][]*pb.Mutation{
+		1: {{Op: pb.Op_PUT, Key: []byte("home-key"), Value: []byte("home")}},
+		2: {{Op: pb.Op_PUT, Key: []byte("secondary-key"), Value: []byte("secondary")}},
+	}
+	unresolved, err := coord.prepareTwoGroup(t.Context(), 10, 42, []byte("home-key"), grouped, nil, 0, nil)
+	require.NoError(t, err)
+	require.False(t, unresolved)
+	manifest, _, err := coord.buildTwoGroupManifest(t.Context(), 10, 42, []byte("home-key"), grouped, []uint64{1, 2}, nil, 0, nil)
+	require.NoError(t, err)
+	homeEngine.lostReply = true
+	require.NoError(t, coord.DecideTwoGroup(t.Context(), manifest, pb.Phase_COMMIT))
+	for _, metadata := range []store.RaftControlMetadataStore{homeMetadata, secondaryMetadata} {
+		_, err := metadata.ReadRaftControlMetadata(t.Context(), twoGroupTerminalKey(twoGroupOperationID([]byte("home-key"), 10)))
+		require.NoError(t, err)
+	}
+	require.NoError(t, coord.DecideTwoGroup(t.Context(), manifest, pb.Phase_COMMIT))
+}
+
+func TestTwoGroupResolverRoutesThroughTerminalDecision(t *testing.T) {
+	home, homeMetadata := twoGroupEntryFSM(t, 1)
+	secondary, secondaryMetadata := twoGroupEntryFSM(t, 2)
+	homeEngine := &twoGroupNativeEngine{f: home, index: 1, term: 2}
+	secondaryEngine := &twoGroupNativeEngine{f: secondary, index: 1, term: 3}
+	groups := map[uint64]*ShardGroup{
+		1: {Engine: homeEngine, Store: home.store, Txn: nilDecisionTransactional{}},
+		2: {Engine: secondaryEngine, Store: secondary.store, Txn: nilDecisionTransactional{}},
+	}
+	coord := &ShardedCoordinator{groups: groups, tsAllocator: twoGroupTestAllocator{}}
+	coord.WithTwoGroupPrepareAdmission(func(uint64) (TwoGroupHomeLookup, error) {
+		return twoGroupNativeLookup{metadata: homeMetadata, engine: homeEngine}, nil
+	})
+	grouped := map[uint64][]*pb.Mutation{
+		1: {{Op: pb.Op_PUT, Key: []byte("home-key"), Value: []byte("home")}},
+		2: {{Op: pb.Op_PUT, Key: []byte("secondary-key"), Value: []byte("secondary")}},
+	}
+	_, err := coord.prepareTwoGroup(t.Context(), 10, 42, []byte("home-key"), grouped, nil, 0, nil)
+	require.NoError(t, err)
+	manifest, _, err := coord.buildTwoGroupManifest(t.Context(), 10, 42, []byte("home-key"), grouped, []uint64{1, 2}, nil, 0, nil)
+	require.NoError(t, err)
+	routes := distribution.NewEngine()
+	routes.UpdateRoute([]byte("a"), []byte("m"), 1)
+	routes.UpdateRoute([]byte("m"), nil, 2)
+	ss := NewShardStore(routes, groups)
+	lr := &LockResolver{store: ss, groups: groups}
+	require.NoError(t, lr.resolveExpiredLock(t.Context(), groups[2], []byte("secondary-key"),
+		txnLock{StartTS: 10, PrimaryKey: []byte("home-key")}))
+	id := twoGroupOperationID([]byte("home-key"), 10)
+	_, err = secondaryMetadata.ReadRaftControlMetadata(t.Context(), twoGroupTerminalKey(id))
+	require.ErrorIs(t, err, store.ErrKeyNotFound, "unknown home outcome must retain the secondary PREPARE")
+	require.NoError(t, coord.proposeTwoGroupTerminal(t.Context(), 1, manifest, pb.Phase_COMMIT, TwoGroupDecisionObservation{}))
+	type ownedKey struct{}
+	hook := func(ctx context.Context, group uint64, purpose AdmissionPurpose) (context.Context, func(error) error, error) {
+		if group != 2 || purpose != AdmissionMaintenance {
+			return nil, nil, ErrTwoGroupAdmission
+		}
+		if ctx.Value(ownedKey{}) == nil {
+			ctx = context.WithValue(ctx, ownedKey{}, true)
+		}
+		return ctx, func(err error) error { return err }, nil
+	}
+	lr.operationAdmission = hook
+	lr.log = slog.Default()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	resultCh := make(chan error, 1)
+	go func() {
+		_, err := admittedOperation(ctx, hook, 2, AdmissionMaintenance, func(owned context.Context) (struct{}, error) {
+			_, resolveErr := lr.resolveScannedLock(owned, 2, groups[2], &store.KVPair{
+				Key: txnLockKey([]byte("secondary-key")), Value: encodeTxnLock(txnLock{
+					StartTS: 10, PrimaryKey: []byte("home-key"), TTLExpireAt: 1,
+				}),
+			})
+			return struct{}{}, resolveErr
+		})
+		resultCh <- err
+	}()
+	select {
+	case err := <-resultCh:
+		require.NoError(t, err)
+	case <-ctx.Done():
+		t.Fatal("nested lock resolver admission and terminal apply did not complete")
+	}
+	_, err = secondaryMetadata.ReadRaftControlMetadata(t.Context(), twoGroupTerminalKey(id))
+	require.NoError(t, err)
+	require.NoError(t, ss.resolveTxnLockForKey(t.Context(), groups[2], []byte("secondary-key"),
+		txnLock{StartTS: 10, PrimaryKey: []byte("home-key")}))
+	status, commitTS, done, err := ss.primaryTxnRecordedStatus(t.Context(), []byte("home-key"), 10)
+	require.NoError(t, err)
+	require.True(t, done)
+	require.Equal(t, txnStatusCommitted, status)
+	require.Equal(t, uint64(42), commitTS)
+}
+
+func TestTwoGroupRemoteSecondaryLeaderKeepsPreparedLockPending(t *testing.T) {
+	home, homeMetadata := twoGroupEntryFSM(t, 1)
+	secondary, secondaryMetadata := twoGroupEntryFSM(t, 2)
+	homeEngine := &twoGroupNativeEngine{f: home, index: 1, term: 2}
+	secondaryEngine := &twoGroupNativeEngine{f: secondary, index: 1, term: 3}
+	groups := map[uint64]*ShardGroup{
+		1: {Engine: homeEngine, Store: home.store, Txn: nilDecisionTransactional{}},
+		2: {Engine: secondaryEngine, Store: secondary.store, Txn: nilDecisionTransactional{}},
+	}
+	coord := &ShardedCoordinator{groups: groups, tsAllocator: twoGroupTestAllocator{}}
+	coord.WithTwoGroupPrepareAdmission(func(uint64) (TwoGroupHomeLookup, error) {
+		return twoGroupNativeLookup{metadata: homeMetadata, engine: homeEngine}, nil
+	})
+	grouped := map[uint64][]*pb.Mutation{
+		1: {{Op: pb.Op_PUT, Key: []byte("home-key"), Value: []byte("home")}},
+		2: {{Op: pb.Op_PUT, Key: []byte("secondary-key"), Value: []byte("secondary")}},
+	}
+	_, err := coord.prepareTwoGroup(t.Context(), 10, 42, []byte("home-key"), grouped, nil, 0, nil)
+	require.NoError(t, err)
+	manifest, _, err := coord.buildTwoGroupManifest(t.Context(), 10, 42, []byte("home-key"), grouped, []uint64{1, 2}, nil, 0, nil)
+	require.NoError(t, err)
+	groups[2].Engine = twoGroupFollowerEngine{secondaryEngine}
+	err = coord.DecideTwoGroup(t.Context(), manifest, pb.Phase_COMMIT)
+	require.ErrorIs(t, err, raftengine.ErrNotLeader)
+	id := twoGroupOperationID([]byte("home-key"), 10)
+	_, err = homeMetadata.ReadRaftControlMetadata(t.Context(), twoGroupTerminalKey(id))
+	require.ErrorIs(t, err, store.ErrKeyNotFound, "remote secondary PREPARE must not allow primary COMMIT")
+	require.NoError(t, coord.proposeTwoGroupTerminal(t.Context(), 1, manifest, pb.Phase_COMMIT, TwoGroupDecisionObservation{}))
+	routes := distribution.NewEngine()
+	routes.UpdateRoute([]byte("a"), []byte("m"), 1)
+	routes.UpdateRoute([]byte("m"), nil, 2)
+	lr := &LockResolver{store: NewShardStore(routes, groups), groups: groups, log: slog.Default()}
+	err = lr.resolveExpiredLock(t.Context(), groups[2], []byte("secondary-key"),
+		txnLock{StartTS: 10, PrimaryKey: []byte("home-key")})
+	require.ErrorIs(t, err, raftengine.ErrNotLeader)
+	outcome, err := lr.resolveScannedLock(t.Context(), 2, groups[2], &store.KVPair{
+		Key: txnLockKey([]byte("secondary-key")), Value: encodeTxnLock(txnLock{
+			StartTS: 10, PrimaryKey: []byte("home-key"), TTLExpireAt: 1,
+		}),
+	})
+	require.NoError(t, err)
+	require.Equal(t, lockResolveIgnored, outcome, "remote-only resolution must not count as resolved")
+	_, err = secondaryMetadata.ReadRaftControlMetadata(t.Context(), twoGroupTerminalKey(id))
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+	_, err = secondary.store.GetAt(t.Context(), txnLockKey([]byte("secondary-key")), ^uint64(0))
+	require.NoError(t, err, "remote-only terminal path must not report success or clean the lock")
+}
+
+func TestTwoGroupExpiredPrimaryAbortWritesBothTerminalRecords(t *testing.T) {
+	home, homeMetadata := twoGroupEntryFSM(t, 1)
+	secondary, secondaryMetadata := twoGroupEntryFSM(t, 2)
+	homeEngine := &twoGroupNativeEngine{f: home, index: 1, term: 2}
+	secondaryEngine := &twoGroupNativeEngine{f: secondary, index: 1, term: 3}
+	groups := map[uint64]*ShardGroup{
+		1: {Engine: homeEngine, Store: home.store, Txn: nilDecisionTransactional{}},
+		2: {Engine: secondaryEngine, Store: secondary.store, Txn: nilDecisionTransactional{}},
+	}
+	coord := &ShardedCoordinator{groups: groups, tsAllocator: twoGroupTestAllocator{}}
+	coord.WithTwoGroupPrepareAdmission(func(uint64) (TwoGroupHomeLookup, error) {
+		return twoGroupNativeLookup{metadata: homeMetadata, engine: homeEngine}, nil
+	})
+	grouped := map[uint64][]*pb.Mutation{
+		1: {{Op: pb.Op_PUT, Key: []byte("home-key"), Value: []byte("home")}},
+		2: {{Op: pb.Op_PUT, Key: []byte("secondary-key"), Value: []byte("secondary")}},
+	}
+	_, err := coord.prepareTwoGroup(t.Context(), 10, 42, []byte("home-key"), grouped, nil, 0, nil)
+	require.NoError(t, err)
+	routes := distribution.NewEngine()
+	routes.UpdateRoute([]byte("a"), []byte("m"), 1)
+	routes.UpdateRoute([]byte("m"), nil, 2)
+	ss := NewShardStore(routes, groups)
+	aborted, err := ss.tryAbortExpiredPrimary(t.Context(), []byte("home-key"), 10)
+	require.NoError(t, err)
+	require.True(t, aborted)
+	id := twoGroupOperationID([]byte("home-key"), 10)
+	for _, metadata := range []store.RaftControlMetadataStore{homeMetadata, secondaryMetadata} {
+		raw, err := metadata.ReadRaftControlMetadata(t.Context(), twoGroupTerminalKey(id))
+		require.NoError(t, err)
+		record, err := parseTwoGroupTerminalRecord(raw)
+		require.NoError(t, err)
+		require.Equal(t, pb.Phase_ABORT, record.GetDecision())
+	}
+	status, _, done, err := ss.primaryTxnRecordedStatus(t.Context(), []byte("home-key"), 10)
+	require.NoError(t, err)
+	require.True(t, done)
+	require.Equal(t, txnStatusRolledBack, status)
 }
 
 type twoGroupTestAllocator struct{}

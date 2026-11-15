@@ -464,6 +464,7 @@ message LookupTimestampBindingResponse {
   uint32 home_admission_version = 7;
   bytes home_admission_record = 8;
   uint64 leader_term = 9;
+  bytes home_terminal_record = 10;
 }
 
 message TwoGroupPrepareParticipant {
@@ -507,4 +508,24 @@ message TwoGroupPrepareEntry {
   bytes home_observation = 4;
   uint64 home_barrier_index = 5;
   uint64 home_leader_term = 6;
+}
+
+message TwoGroupTerminalRecord {
+  uint32 version = 1;
+  TwoGroupPrepareManifest manifest = 2;
+  Phase decision = 3;
+  uint64 resolution_timestamp = 4;
+  uint64 applied_index = 5;
+  uint64 applied_term = 6;
+}
+
+message TwoGroupTerminalEntry {
+  uint32 version = 1;
+  uint64 local_group_id = 2;
+  TwoGroupPrepareManifest manifest = 3;
+  Phase decision = 4;
+  uint64 resolution_timestamp = 5;
+  bytes home_terminal_record = 6;
+  uint64 home_barrier_index = 7;
+  uint64 home_leader_term = 8;
 }

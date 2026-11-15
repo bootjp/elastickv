@@ -40,3 +40,32 @@ func validTwoGroupHomeReply(response *pb.LookupTimestampBindingResponse) bool {
 		response.GetAppliedIndex() != 0 && response.GetLeaderTerm() != 0 &&
 		len(response.GetHomeAdmissionRecord()) != 0 && len(response.ProtoReflect().GetUnknown()) == 0
 }
+
+func (l TwoGroupHomePeerLookup) LookupTwoGroupDecision(ctx context.Context, id [16]byte) ([]byte, uint64, uint64, error) {
+	if !validTwoGroupPeerLookup(l, id) {
+		return nil, 0, 0, errors.WithStack(kv.ErrTwoGroupAdmission)
+	}
+	request := &pb.LookupTimestampBindingRequest{OperationId: id[:], HomeAdmissionVersion: kv.TwoGroupHomeDecisionLookupVersion}
+	response := new(pb.LookupTimestampBindingResponse)
+	ctx = metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+l.Token)
+	if err := l.Handle.Invoke(ctx, l.Conn, pb.Internal_LookupTimestampBinding_FullMethodName, request, response); err != nil {
+		return nil, 0, 0, errors.Wrap(err, "read authenticated home decision")
+	}
+	if !validTwoGroupDecisionReply(response) {
+		return nil, 0, 0, errors.WithStack(kv.ErrTwoGroupAdmission)
+	}
+	if len(response.GetHomeTerminalRecord()) == 0 {
+		return nil, 0, 0, errors.WithStack(kv.ErrTransactionOutcomeUnknown)
+	}
+	return response.GetHomeTerminalRecord(), response.GetAppliedIndex(), response.GetLeaderTerm(), nil
+}
+
+func validTwoGroupPeerLookup(l TwoGroupHomePeerLookup, id [16]byte) bool {
+	return l.Handle != nil && l.Conn != nil && l.Token != "" && id != ([16]byte{})
+}
+
+func validTwoGroupDecisionReply(response *pb.LookupTimestampBindingResponse) bool {
+	return response.GetFound() && response.GetHomeAdmissionVersion() == kv.TwoGroupHomeDecisionLookupVersion &&
+		response.GetAppliedIndex() != 0 && response.GetLeaderTerm() != 0 &&
+		len(response.GetHomeAdmissionRecord()) != 0 && len(response.ProtoReflect().GetUnknown()) == 0
+}
