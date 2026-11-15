@@ -89,6 +89,8 @@
   (doseq [[adapter port-key port] [[:redis :redis-port 6379]
                                   [:dynamodb :dynamo-port 8000]
                                   [:s3 :s3-port 9000]
+                                  [:grpc-raw :grpc-port 50051]
+                                  [:grpc-transactional :grpc-port 50051]
                                   [:sqs-standard :sqs-port 9324]
                                   [:sqs-htfifo :sqs-port 9324]]]
     (doseq [fault [:partition :kill :pause]]
@@ -106,7 +108,8 @@
           (if (= :nemesis (:process op))
             op
             (case adapter
-              :s3 (assoc op :f (if (:final op) :read :write)
+              (:s3 :grpc-raw :grpc-transactional :filesystem-overwrite :filesystem-rename)
+              (assoc op :f (if (:final op) :read :write)
                             :value (independent/tuple (if (:final op)
                                                       (second (first (:value op))) 0) 1))
               (:sqs-standard :sqs-htfifo)
@@ -214,3 +217,31 @@
                                {} retry-only {})]
     (is (false? (:valid? verdict)))
     (is (= (set nodes) (set (map first (:missing-final-reads verdict)))))))
+
+(deftest filesystem-faults-use-real-managed-mounts
+  (doseq [[adapter mode] [[:filesystem-overwrite :overwrite] [:filesystem-rename :rename]]
+          fault [:partition :kill :pause]]
+    (let [test (hosted/hosted-fault-test (assoc opts :adapter adapter :faults [fault]))]
+      (is (= "/mnt/elastickv" (get-in test [:db :opts :filesystem-mount])))
+      (is (= (zipmap nodes (repeat "/mnt/elastickv")) (get-in test [:client :delegate :node->mount-dir])))
+      (is (= mode (:write-mode test)))
+      (is (nil? (:local test)))
+      (is (some? (get-in test [:checker :checkers :consistency :checkers :elle]))))))
+
+(deftest managed-grpc-clients-follow-the-configured-listener-port
+  (doseq [adapter [:grpc-raw :grpc-transactional]]
+    (let [test (hosted/hosted-fault-test (assoc opts :adapter adapter :grpc-port 51515))]
+      (is (= 51515 (get-in test [:db :opts :grpc-port])))
+      (is (= (zipmap nodes (repeat 51515)) (get-in test [:client :delegate :node->port])))
+      (is (= "n1=n1:51515,n2=n2:51515,n3=n3:51515"
+             (get-in test [:db :opts :bootstrap-members]))))))
+
+(deftest managed-filesystem-recovery-requires-journaled-mutations
+  (doseq [adapter [:filesystem-overwrite :filesystem-rename]
+          fault [:partition :kill :pause]]
+    (let [test (hosted/hosted-fault-test (assoc opts :adapter adapter :faults [fault]))]
+      (is (true? (get-in test [:db :opts :filesystem-strict])))
+      (is (true? (:filesystem-strict test)))))
+  (doseq [adapter [:redis :dynamodb :s3 :grpc-raw :grpc-transactional :sqs-standard :sqs-htfifo]]
+    (is (nil? (get-in (hosted/hosted-fault-test (assoc opts :adapter adapter))
+                     [:db :opts :filesystem-strict])))))

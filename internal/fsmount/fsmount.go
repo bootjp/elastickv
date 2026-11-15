@@ -97,7 +97,7 @@ func Start(
 		startFilesystemJournalCollector(ctx, eg, service, observer, config.PlacementScanInterval)
 	}
 	startFilesystemLeaseReaper(ctx, eg, service, config.LeaseReapInterval)
-	slog.Info("filesystem FUSE mounted", "mount_point", config.MountPoint, "client_id", config.ClientID)
+	slog.Info("filesystem FUSE mounted", "mount_point", config.MountPoint, "client_id", config.ClientID, "strict", config.Strict, "strict_recover", config.StrictRecover)
 	return nil
 }
 

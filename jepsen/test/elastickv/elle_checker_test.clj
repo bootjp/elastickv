@@ -116,3 +116,18 @@
           (is (true? (:valid? result)))
           (is (.isFile (io/file out "elle-results.edn")))
           (is (= :txn (:f (first (elle/read-history (io/file out "elle-history.edn")))))))))))
+
+(deftest filesystem-initial-state-is-not-an-unobserved-write
+  (with-directory
+    (fn [dir]
+      (let [events (mapv #(if (= :write (:f %))
+                            (assoc % :value (independent/tuple :x 0)) %)
+                         (s3-history -1 :ok))
+            normalized (elle/transaction-history :filesystem events)]
+        (is (false? (:valid? (elle/check-history :filesystem events dir))))
+        (is (= [[:r :x nil]] (:value (last normalized))))
+        (is (= [[:w :x 0]] (:value (first normalized))))
+        (is (thrown? Exception (elle/transaction-history :filesystem
+                                 [{:type :invoke :process 0 :f :write :value [:x -1]}]))))
+      (doseq [kind [:grpc :filesystem :independent-register]]
+        (is (true? (:valid? (elle/check-history kind (s3-history 1 :ok) dir))))))))

@@ -912,6 +912,11 @@ func splitKeyForMedian(
 	if rightLoad <= 0 || splitKey == nil || (route.End != nil && bytes.Compare(splitKey, route.End) >= 0) {
 		splitKey = median.Start
 		origin = SplitOriginP50LastBucketLo
+	}
+	// The upper boundary of the last loaded bucket would leave all observed
+	// load on the left. Use its lower boundary when earlier buckets carry load.
+	if (rightLoad == 0 && loadBeforeMedian > 0) || origin == SplitOriginP50LastBucketLo {
+		splitKey = median.Start
 		leftLoad = loadBeforeMedian
 		rightLoad = total - leftLoad
 	}

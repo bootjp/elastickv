@@ -41,7 +41,10 @@
    ["elastickv-split" ["go" "build" "-o" (str build-dir "/elastickv-split") "./cmd/elastickv-split"]]
    ["elastickv-list-routes" ["go" "build" "-o" (str build-dir "/elastickv-list-routes") "./cmd/elastickv-list-routes"]]
    ["elastickv-admin" ["go" "build" "-o" (str build-dir "/elastickv-admin") "./cmd/elastickv-admin"]]
-   ["jepsen-encryption-setup" ["go" "build" "-o" (str build-dir "/jepsen-encryption-setup") "./cmd/jepsen-encryption-setup"]]])
+   ["jepsen-encryption-setup" ["go" "build" "-o" (str build-dir "/jepsen-encryption-setup") "./cmd/jepsen-encryption-setup"]]
+   ["jepsen-grpc-client" ["go" "build" "-o" (str build-dir "/jepsen-grpc-client") "./cmd/jepsen-grpc-client"]]])
+
+(defn grpc-client-binary [] (str build-dir "/jepsen-grpc-client"))
 
 (defn- build-binaries!
   "Build the production server and Jepsen administration helpers."
@@ -210,7 +213,7 @@
   "Builds the production server argv for one managed Jepsen node."
   [{:keys [node grpc redis dynamo s3 sqs sqs-region data-dir raft-engine
            raft-redis-map raft-dynamo-map raft-s3-map raft-sqs-map raft-groups shard-ranges
-           filesystem-mount encryption migration-enabled bootstrap? bootstrap-members
+           filesystem-mount filesystem-strict encryption migration-enabled bootstrap? bootstrap-members
            join-as-learner join-members auto-split-args]}]
   (cond-> ["--address" grpc
            "--redisAddress" redis
@@ -224,6 +227,9 @@
     sqs (conj "--sqsAddress" sqs "--raftSqsMap" raft-sqs-map)
     (and sqs sqs-region) (conj "--sqsRegion" sqs-region)
     filesystem-mount (conj "--filesystemMount" filesystem-mount)
+    ;; start-node! checks that this mount's old server is stopped before it
+    ;; launches a replacement. Recover only this node's stable owner session.
+    (and filesystem-mount filesystem-strict) (conj "--filesystemStrict" "--filesystemStrictRecover")
     (seq raft-groups) (conj "--raftGroups" (build-raft-groups-arg node raft-groups))
     (seq shard-ranges) (conj "--shardRanges" shard-ranges)
     (seq auto-split-args) (into auto-split-args)
@@ -315,7 +321,7 @@
         (c/exec :bash "-c" (unmount-filesystem-cmd mount-dir))))))
 
 (defn- start-node!
-  [test node {:keys [bootstrap-node bootstrap-members grpc-port redis-port dynamo-port s3-port sqs-port sqs-region data-dir raft-groups shard-ranges raft-engine server-env migration-enabled filesystem-mount encryption join-as-learner join-members auto-split-args]}]
+  [test node {:keys [bootstrap-node bootstrap-members grpc-port redis-port dynamo-port s3-port sqs-port sqs-region data-dir raft-groups shard-ranges raft-engine server-env migration-enabled filesystem-mount filesystem-strict encryption join-as-learner join-members auto-split-args]}]
   (when (and (seq raft-groups)
              (> (count raft-groups) 1)
              (nil? shard-ranges))
@@ -340,7 +346,7 @@
                 :raft-redis-map raft-redis-map :raft-dynamo-map raft-dynamo-map
                 :raft-s3-map raft-s3-map :raft-sqs-map raft-sqs-map
                 :raft-groups raft-groups :shard-ranges shard-ranges
-                :filesystem-mount mount-dir :encryption encryption :migration-enabled migration-enabled
+                :filesystem-mount mount-dir :filesystem-strict filesystem-strict :encryption encryption :migration-enabled migration-enabled
                 :bootstrap? bootstrap? :bootstrap-members bootstrap-members
                 :join-as-learner join-as-learner
                 :join-members join-members :auto-split-args auto-split-args})
@@ -357,9 +363,15 @@
     (c/on node
       (c/su
         (c/exec :mkdir :-p data-dir)
-        (when mount-dir
-          (prepare-filesystem-mount! mount-dir))
-        (apply cu/start-daemon! daemon-opts server-bin args)))))
+        ;; The nemesis starts :all after killing one node. Preparing a mount
+        ;; before start-daemon! returns :already-running would detach healthy
+        ;; peers. Only clean up the mount when its server is actually stopped.
+        (if (and mount-dir (cu/daemon-running? pid-file))
+          :already-running
+          (do
+            (when mount-dir
+              (prepare-filesystem-mount! mount-dir))
+            (apply cu/start-daemon! daemon-opts server-bin args)))))))
 
 (defn- stop-node!
   [node]

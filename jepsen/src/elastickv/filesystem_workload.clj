@@ -44,6 +44,7 @@
   (:require [clojure.string :as str]
             [elastickv.cli :as cli]
             [elastickv.db :as ekdb]
+            [elastickv.elle-checker :as elle]
             [jepsen [checker :as checker]
                     [client :as client]
                     [generator :as gen]
@@ -560,14 +561,15 @@
     (let [keys (range key-count)]
       (when (and local? require-fuse-mount)
         (require-local-fuse-mount! mount-dir))
-      (if local?
-        ;; Every local client sees the same mounted filesystem. Serialize
-        ;; setup writes to avoid self-conflicts, while still resetting the
-        ;; registers each time setup is called for a new test.
-        (locking setup-lock
-          (with-retries max-retries #(local-setup! mount-dir keys)))
+      ;; Local and remote mounts share the same replicated files. Serialize
+      ;; initialization across all client copies, including different nodes,
+      ;; rather than racing their create/truncate/write operations. This lock
+      ;; is only used before the measured workload begins.
+      (locking setup-lock
         (with-retries max-retries
-          #(remote-exec! test node (remote-setup-cmd mount-dir keys))))))
+          #(if local?
+             (local-setup! mount-dir keys)
+             (remote-exec! test node (remote-setup-cmd mount-dir keys)))))))
 
   (teardown! [_this test]
     ;; Jepsen runs teardown! before setup! and again after the test, so the
@@ -686,8 +688,9 @@
                   threads-per-key
                   (range key-count)
                   (fn [_k] (register-key-generator max-writes)))
-     :checker   (independent/checker
-                  (filesystem-register-checker))}))
+     :checker   (checker/compose
+                  {:register (independent/checker (filesystem-register-checker))
+                   :elle (elle/register-checker :filesystem)})}))
 
 (defn elastickv-filesystem-test
   "Builds a Jepsen test map that drives the Elastickv FUSE filesystem with the

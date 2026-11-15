@@ -506,3 +506,15 @@
           (is (not (re-find #"secret-marker|plaintext|payload|ReceiptHandle|message-id" (pr-str r))))
           (when (= :info (:type r))
             (is (= :unexpected-client-error (:error r)))))))))
+
+(deftest checker-observed-delivery-is-not-loss-when-delete-unconfirmed
+  (doseq [outcome [:info :fail]]
+    (let [received (-> (recv-op 200 [["g0" 0]])
+                       (assoc :value [])
+                       (assoc-in [:sqs-observation :deliveries 0 :delete :type] outcome))
+          result (check-history [(send-op 100 "g0" 0) received])]
+      (is (true? (:valid? result)) (pr-str result))
+      (is (empty? (:lost result)))
+      (is (= 1 (:observed result)))
+      (is (zero? (:received result)))
+      (is (empty? (:duplicates result))))))
