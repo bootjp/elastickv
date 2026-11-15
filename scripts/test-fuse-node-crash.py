@@ -66,6 +66,18 @@ def await_mutation_state(mount, contents):
     raise AssertionError(f"{mount}: mutation state did not recover")
 
 
+def restart_arguments(argv):
+    """The binary is strict by default; recovery is explicit after SIGKILL."""
+    if not argv:
+        raise AssertionError("missing node command line")
+    for arg in argv:
+        if arg in {"--filesystemStrict", "-filesystemStrict"} or arg.startswith(("--filesystemStrict=", "-filesystemStrict=")):
+            raise AssertionError("filesystemStrict argument has been removed")
+    # A final true overrides a previous explicit false recovery flag. The
+    # caller must stop the old process before launching these arguments.
+    return argv + ["--filesystemStrictRecover"]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mounts", nargs=3, type=pathlib.Path)
@@ -110,14 +122,12 @@ def main():
     # /proc cmdline ends in NUL; interior empty arguments (for example an
     # intentionally disabled metrics address) must remain in their positions.
     argv = [os.fsdecode(arg) for arg in pathlib.Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")[:-1]]
-    if not argv or "--filesystemStrict" not in argv:
-        raise AssertionError("node was not started in strict mode")
+    restart_argv = restart_arguments(argv)
     os.kill(pid, signal.SIGKILL)
     # The surviving quorum must still serve the acknowledged file.
     for mount in args.mounts[1:]:
         await_mutation_state(mount, contents)
 
-    restart_argv = argv if "--filesystemStrictRecover" in argv else argv + ["--filesystemStrictRecover"]
     with args.restart_log.open("wb") as log:
         restarted = subprocess.Popen(restart_argv, stdout=log, stderr=subprocess.STDOUT)
     with args.pid_file.open("a") as pid_file:

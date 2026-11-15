@@ -87,7 +87,6 @@ func TestMountFilesystemServiceAbortsOnCancelledContext(t *testing.T) {
 
 	server, serveDone, err := MountService(ctx, svc, config)
 	require.ErrorIs(t, err, context.Canceled)
-	require.ErrorContains(t, err, "mount filesystem frontend")
 	require.Nil(t, server)
 	require.Nil(t, serveDone)
 }
@@ -454,4 +453,18 @@ func TestRunFilesystemLeaseReaperLogsErrorsAndContinues(t *testing.T) {
 // lets the kernel-mount tests run in containers without fusermount3.
 func testFUSEMountOptions() *fuse.MountOptions {
 	return &fuse.MountOptions{DirectMount: os.Geteuid() == 0}
+}
+
+func TestFilesystemMountAlwaysRegistersJournalSession(t *testing.T) {
+	t.Parallel()
+	service := newFilesystemTestService(t)
+	opts, err := strictFilesystemOptions(t.Context(), service, Config{ClientID: "strict-default"})
+	require.NoError(t, err)
+	require.Len(t, opts, 1)
+	journal, err := filesystem.NewOperationJournal(service)
+	require.NoError(t, err)
+	id, err := journal.EnsureFilesystem(t.Context())
+	require.NoError(t, err)
+	_, err = journal.RegisterSession(t.Context(), id, "strict-default")
+	require.ErrorIs(t, err, filesystem.ErrOperationPending, "mount preparation must already own the registered session")
 }

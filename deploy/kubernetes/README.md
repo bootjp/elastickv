@@ -13,3 +13,14 @@ The FUSE example requires a dedicated image and privileged mount propagation; ne
 The opt-in [runtime readiness example](examples/readiness/) separates process
 liveness from Raft membership, startup recovery, and log-application progress.
 It requires a newer image than the base pin; replace its placeholder digest first.
+
+### Filesystem owner recovery
+
+FUSE mounts always use the operation journal; no legacy-mode flag is available.
+Remove the retired `--filesystemStrict` argument from launch commands; all of
+its values are rejected as undefined arguments. Give each live mount a unique stable
+client ID (the default is its Raft ID). After an unclean Pod stop, confirm the
+old process is no longer running before using `--filesystemStrictRecover` for
+that owner. Do not enable automatic fencing of a possibly live owner during a
+force-deletion or split-brain incident. Keep the existing persistent volume and
+keys. See [filesystem cutover and recovery](../../docs/filesystem.md#upgrading-from-legacy-mounts).

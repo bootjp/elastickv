@@ -236,12 +236,18 @@
       (is (= "n1=n1:51515,n2=n2:51515,n3=n3:51515"
              (get-in test [:db :opts :bootstrap-members]))))))
 
-(deftest managed-filesystem-recovery-requires-journaled-mutations
+(deftest managed-filesystem-has-no-mode-option
   (doseq [adapter [:filesystem-overwrite :filesystem-rename]
           fault [:partition :kill :pause]]
     (let [test (hosted/hosted-fault-test (assoc opts :adapter adapter :faults [fault]))]
-      (is (true? (get-in test [:db :opts :filesystem-strict])))
-      (is (true? (:filesystem-strict test)))))
+      (is (= "/mnt/elastickv" (get-in test [:db :opts :filesystem-mount])))
+      (is (not (contains? (get-in test [:db :opts]) :filesystem-strict)))
+      (is (not (contains? test :filesystem-strict)))))
   (doseq [adapter [:redis :dynamodb :s3 :grpc-raw :grpc-transactional :sqs-standard :sqs-htfifo]]
-    (is (nil? (get-in (hosted/hosted-fault-test (assoc opts :adapter adapter))
-                     [:db :opts :filesystem-strict])))))
+    (is (not (contains? (get-in (hosted/hosted-fault-test (assoc opts :adapter adapter)) [:db :opts])
+                        :filesystem-strict)))))
+
+(deftest hosted-filesystem-rejects-the-removed-mode-option
+  (doseq [value [true false]]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"filesystem-strict option has been removed"
+                         (hosted/hosted-fault-test (assoc opts :adapter :filesystem-overwrite :filesystem-strict value))))))

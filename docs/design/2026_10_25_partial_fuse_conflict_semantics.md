@@ -1,5 +1,11 @@
 # FUSE conflict resolution and operation outcomes
 
+Current mount policy: [strict-only](2026_11_15_implemented_filesystem_strict_only.md)
+replaces the legacy/default rollout instructions below. This document retains
+its implementation milestones and historical acceptance limits; mode retirement
+does not establish unsupported SQLite WAL or untested crash-boundary guarantees.
+
+
 Status: Partial
 Author: bootjp
 Date: 2026-10-25

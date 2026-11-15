@@ -117,6 +117,7 @@ if ! $NO_CLUSTER; then
       ENC_ARGS=(--encryption-enabled --kekFile "$KEK_FILE" \
                 --encryptionSidecarPath "${DATA_DIR}/n${node}/keys.json")
     fi
+    # Fresh clusters use mandatory journal mode; owner recovery is for stopped mounts.
     FS_ARGS=()
     if $FUSE_ENABLED; then
       mkdir -p "${DATA_DIR}/fs-n${node}"

@@ -31,6 +31,21 @@ if [[ $phase == initial && $mode == on ]]; then
   chmod 600 /tmp/elastickv-ci/kek.bin
 fi
 
+recovery=()
+if [[ $phase == restart ]]; then
+  # Recover only after every previous owner has stopped; never fence a live mount.
+  if [[ -f /tmp/elastickv-demo.pid ]]; then
+    while read -r pid; do
+      state=$(ps -o stat= -p "$pid" | tr -d ' ' || true)
+      if [[ -n $state && $state != Z* ]]; then
+        echo "refusing filesystem session recovery while node $pid is still running" >&2
+        exit 1
+      fi
+    done < /tmp/elastickv-demo.pid
+  fi
+  recovery=(--filesystemStrictRecover)
+fi
+
 : > /tmp/elastickv-demo.pid
 for node in 1 2 3; do
   if [[ $phase == restart && ! -d /tmp/elastickv-ci/n${node} ]]; then
@@ -51,6 +66,7 @@ for node in 1 2 3; do
     --s3Address "127.0.0.1:6390${node}" \
     --sqsAddress "127.0.0.1:6350${node}" \
     --filesystemMount "/tmp/elastickv-ci/fs-n${node}" \
+    "${recovery[@]}" \
     --filesystemRootUID "$(id -u)" \
     --filesystemRootGID "$(id -g)" \
     --metricsAddress "" \

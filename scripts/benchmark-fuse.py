@@ -136,7 +136,7 @@ def main():
     parser.add_argument("--writes", type=int, default=40)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--repetitions", type=int, default=3)
-    parser.add_argument("--mode", choices=("strict", "legacy"), required=True)
+    parser.add_argument("--mode", choices=("strict",), default="strict")
     parser.add_argument("--layout", choices=("single-group", "two-group"), required=True)
     parser.add_argument("--output", type=pathlib.Path, required=True)
     args = parser.parse_args()

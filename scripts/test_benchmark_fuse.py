@@ -5,6 +5,10 @@ import importlib.util
 import multiprocessing
 import pathlib
 import unittest
+import tempfile
+import json
+import sys
+import io
 from unittest import mock
 
 
@@ -19,6 +23,28 @@ def send_large_result(queue):
 
 
 class BenchmarkWorkerResultsTest(unittest.TestCase):
+    def run_with_mode(self, mode):
+        with tempfile.TemporaryDirectory() as directory:
+            output = pathlib.Path(directory) / "results.json"
+            argv = [str(SCRIPT), directory, "--layout", "single-group", "--output", str(output)]
+            if mode is not None:
+                argv += ["--mode", mode]
+            with mock.patch.object(sys, "argv", argv), \
+                 mock.patch.object(benchmark, "run_serial", return_value={}), \
+                 mock.patch.object(benchmark, "run_hot", return_value={}), \
+                 mock.patch("builtins.print"), \
+                 mock.patch.object(sys, "stderr", io.StringIO()):
+                benchmark.main()
+            return json.loads(output.read_text())
+
+    def test_default_mode_is_strict(self):
+        self.assertEqual("strict", self.run_with_mode(None)["mode"])
+
+    def test_legacy_mode_is_rejected(self):
+        with self.assertRaises(SystemExit) as result:
+            self.run_with_mode("legacy")
+        self.assertEqual(2, result.exception.code)
+
     def test_write_failure_identifies_syscall_and_offset(self):
         with mock.patch.object(benchmark.os, "pwrite", side_effect=OSError(5, "Input/output error")):
             with self.assertRaisesRegex(OSError, "pwrite offset=4096 length=4"):

@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"flag"
+	"io"
 	"math"
 	"testing"
 
@@ -20,7 +22,6 @@ func TestFilesystemStartConfigFromFlags(t *testing.T) {
 		gid           uint
 		want          fsmount.Config
 		wantErr       string
-		strict        bool
 		strictRecover bool
 	}{
 		{
@@ -47,20 +48,19 @@ func TestFilesystemStartConfigFromFlags(t *testing.T) {
 			want:     fsmount.Config{MountPoint: "/mnt/fs", ClientID: "mount-a", RootMode: 0o755},
 		},
 		{
-			name:   "strict mount is explicit",
+			name:   "journal mode is unconditional",
 			mount:  "/mnt/fs",
 			raftID: "n1",
 			mode:   0o755,
-			strict: true,
-			want:   fsmount.Config{MountPoint: "/mnt/fs", ClientID: "n1", Strict: true, RootMode: 0o755},
+			want:   fsmount.Config{MountPoint: "/mnt/fs", ClientID: "n1", RootMode: 0o755},
 		},
 		{
-			name:          "strict recovery needs strict mount",
+			name:          "recovery works without a mode flag",
 			mount:         "/mnt/fs",
 			raftID:        "n1",
 			mode:          0o755,
 			strictRecover: true,
-			wantErr:       "requires filesystemStrict",
+			want:          fsmount.Config{MountPoint: "/mnt/fs", ClientID: "n1", StrictRecover: true, RootMode: 0o755},
 		},
 		{
 			name:    "client id required",
@@ -97,7 +97,7 @@ func TestFilesystemStartConfigFromFlags(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			f := defaultFlags[filesystemFlags]()
 			f.mount, f.clientID = tt.mount, tt.clientID
-			f.strict, f.strictRecover = tt.strict, tt.strictRecover
+			f.strictRecover = tt.strictRecover
 			f.rootMode, f.rootUID, f.rootGID = tt.mode, tt.uid, tt.gid
 
 			got, err := filesystemStartConfig(f, tt.raftID)
@@ -125,4 +125,31 @@ func TestStartFilesystemIfEnabledRequiresLifecycle(t *testing.T) {
 
 	err := startFilesystemIfEnabled(context.Background(), nil, nil, nil, nil, nil, f, "n1")
 	require.ErrorContains(t, err, "filesystem lifecycle is required")
+}
+
+func TestFilesystemModeFlagIsRemoved(t *testing.T) {
+	fs := flag.NewFlagSet("defaults", flag.ContinueOnError)
+	f := RegisterFlags(fs)
+	require.Nil(t, fs.Lookup("filesystemStrict"))
+	require.NoError(t, fs.Parse(nil))
+	f.filesystem.mount = "/mnt/fs"
+	_, err := filesystemStartConfig(f.filesystem, "n1")
+	require.NoError(t, err)
+
+	for _, arg := range []string{"--filesystemStrict", "--filesystemStrict=true", "--filesystemStrict=1", "--filesystemStrict=false", "-filesystemStrict=true"} {
+		t.Run(arg, func(t *testing.T) {
+			fs := flag.NewFlagSet("test", flag.ContinueOnError)
+			fs.SetOutput(io.Discard)
+			RegisterFlags(fs)
+			require.ErrorContains(t, fs.Parse([]string{arg}), "flag provided but not defined: -filesystemStrict")
+		})
+	}
+}
+
+func TestFilesystemRecoveryFlagRemainsExplicit(t *testing.T) {
+	fs := flag.NewFlagSet("recovery", flag.ContinueOnError)
+	f := RegisterFlags(fs)
+	require.False(t, f.filesystem.strictRecover)
+	require.NoError(t, fs.Parse([]string{"--filesystemStrictRecover"}))
+	require.True(t, f.filesystem.strictRecover)
 }

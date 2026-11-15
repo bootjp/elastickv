@@ -29,11 +29,10 @@ const (
 )
 
 // Config is the resolved mount configuration. An empty MountPoint
-// disables the filesystem.
+// disables the filesystem. Every enabled mount uses the operation journal.
 type Config struct {
 	MountPoint    string
 	ClientID      string
-	Strict        bool
 	StrictRecover bool
 	RootMode      uint32
 	RootUID       uint32
@@ -93,11 +92,9 @@ func Start(
 	}
 	InstallLifecycle(ctx, eg, cleanup, server, serveDone, config.MountPoint)
 	startFilesystemPlacementCollector(ctx, eg, service, config.PlacementScanInterval)
-	if config.Strict {
-		startFilesystemJournalCollector(ctx, eg, service, observer, config.PlacementScanInterval)
-	}
+	startFilesystemJournalCollector(ctx, eg, service, observer, config.PlacementScanInterval)
 	startFilesystemLeaseReaper(ctx, eg, service, config.LeaseReapInterval)
-	slog.Info("filesystem FUSE mounted", "mount_point", config.MountPoint, "client_id", config.ClientID, "strict", config.Strict, "strict_recover", config.StrictRecover)
+	slog.Info("filesystem FUSE mounted", "mount_point", config.MountPoint, "client_id", config.ClientID, "strict", true, "strict_recover", config.StrictRecover)
 	return nil
 }
 
@@ -153,9 +150,6 @@ func MountService(
 }
 
 func strictFilesystemOptions(ctx context.Context, service *filesystem.Service, config Config) ([]fuseadapter.Option, error) {
-	if !config.Strict {
-		return nil, nil
-	}
 	journal, err := filesystem.NewOperationJournal(service)
 	if err != nil {
 		return nil, errors.Wrap(err, "create strict filesystem journal")

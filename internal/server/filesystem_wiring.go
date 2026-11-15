@@ -19,7 +19,6 @@ import (
 type filesystemFlags struct {
 	mount                 string
 	clientID              string
-	strict                bool
 	strictRecover         bool
 	capacity              uint64
 	maxFiles              uint64
@@ -33,7 +32,6 @@ type filesystemFlags struct {
 func (f *filesystemFlags) register(fs *flag.FlagSet) {
 	fs.StringVar(&f.mount, "filesystemMount", "", "FUSE mount point for the Elastickv filesystem; empty to disable")
 	fs.StringVar(&f.clientID, "filesystemClientID", "", "Stable open-handle lease client ID for the FUSE mount; empty uses raftId")
-	fs.BoolVar(&f.strict, "filesystemStrict", false, "Use the operation journal for supported FUSE mutations")
 	fs.BoolVar(&f.strictRecover, "filesystemStrictRecover", false, "Fence and recover a previous strict FUSE session for the same client ID; use only after the previous mount has stopped")
 	fs.Uint64Var(&f.capacity, "filesystemCapacity", 0, "Filesystem byte capacity reported by statfs; zero reports unlimited")
 	fs.Uint64Var(&f.maxFiles, "filesystemMaxFiles", 0, "Filesystem inode capacity reported by statfs; zero reports unlimited")
@@ -55,11 +53,7 @@ func filesystemStartConfig(f filesystemFlags, raftID string) (fsmount.Config, er
 		return fsmount.Config{}, errors.New("filesystem root mode, uid, or gid is out of range")
 	}
 	config.ClientID = strings.TrimSpace(f.clientID)
-	config.Strict = f.strict
 	config.StrictRecover = f.strictRecover
-	if config.StrictRecover && !config.Strict {
-		return fsmount.Config{}, errors.New("filesystemStrictRecover requires filesystemStrict")
-	}
 	if config.ClientID == "" {
 		config.ClientID = strings.TrimSpace(raftID)
 	}
