@@ -2,12 +2,14 @@
   "Bounded M4 automatic hotspot split test over linearizable Redis registers."
   (:gen-class)
   (:require [clojure.java.shell :as shell]
+            [clojure.string :as str]
             [clojure.tools.logging :refer [warn]]
             [elastickv.cli :as cli]
             [elastickv.composed1-nemesis :as routes]
             [elastickv.db :as ekdb]
             [elastickv.split-workload :as split]
             [jepsen [checker :as checker]
+                    [client :as client]
                     [generator :as gen]
                     [independent :as independent]
                     [net :as net]]
@@ -19,6 +21,10 @@
             [jepsen.os.debian :as debian]))
 
 (def register-keys ["a-hot" "m-hot" "z-hot"])
+
+(def fault-ops
+  {:partition [:start-partition :stop-partition]
+   :kill [:kill :start]})
 
 (def auto-split-args
   ["--autoSplit" "--keyvizStep=5s" "--autoSplitEvalInterval=1s"
@@ -153,6 +159,75 @@
                                                 (get-in observe [:value :after]))))
          :completions (vec ops)}))))
 
+(defn fault-cycle [nodes fault interval]
+  (let [[start stop] (fault-ops fault)]
+    (cons (gen/sleep interval)
+          (mapcat (fn [node]
+                    [{:type :info :f start :target node
+                      :value (if (= :partition fault)
+                               (into {} (for [peer nodes]
+                                          [peer (if (= peer node)
+                                                  (vec (remove #{node} nodes))
+                                                  [node])]))
+                               [node])}
+                     (gen/sleep interval)
+                     {:type :info :f stop :target node :value :all}
+                     (gen/sleep interval)])
+                  nodes))))
+
+(defn deterministic-fault-package [db nodes fault interval]
+  (let [[_ stop] (fault-ops fault)]
+    {:generator (fault-cycle nodes fault interval)
+     :final-generator (gen/once {:type :info :f stop :value :all :recovery true})
+     :nemesis (if (= :partition fault)
+                (combined/partition-nemesis db)
+                (combined/db-nemesis db))
+     :perf #{}}))
+
+(defn fault-cycle-checker [nodes fault]
+  (let [[start stop] (fault-ops fault)]
+    (reify checker/Checker
+      (check [_ _ history _]
+        (let [ops (filter #(and (= :nemesis (:process %))
+                                (#{start stop} (:f %))) history)
+              pairs (partition-all 2 ops)
+              completed (keep (fn [pair]
+                                (when (= 2 (count pair))
+                                  (let [[invoke response] pair]
+                                    (when (and (= :info (:type invoke))
+                                               (not (:error invoke))
+                                               (= :info (:type response))
+                                               (not (:error response))
+                                               (= (select-keys invoke [:f :target :recovery])
+                                                  (select-keys response [:f :target :recovery])))
+                                      response)))) pairs)
+              recovery (last (filter :recovery completed))
+              cycles (remove :recovery completed)
+              state (reduce (fn [{:keys [active counts valid?] :as acc} op]
+                              (let [node (:target op)]
+                                (cond
+                                  (or (not valid?) (not (some #{node} nodes)))
+                                  (assoc acc :valid? false)
+
+                                  (= start (:f op))
+                                  (if active (assoc acc :valid? false)
+                                      (assoc acc :active node))
+
+                                  (= node active)
+                                  (assoc acc :active nil :counts (update counts node (fnil inc 0)))
+
+                                  :else (assoc acc :valid? false))))
+                            {:active nil :counts {} :valid? true} cycles)
+              valid? (and (= (count ops) (* 2 (count completed)))
+                          (= 1 (count (filter :recovery completed)))
+                          (= stop (:f recovery))
+                          (every? #(< (:index %) (:index recovery)) cycles)
+                          (:valid? state) (nil? (:active state))
+                          (every? #(pos? (get (:counts state) % 0)) nodes))]
+          {:valid? (boolean valid?)
+           :completed-fault-cycles (:counts state)
+           :recovery-completed? (some? recovery)})))))
+
 (defn final-reads [node-count]
   (apply gen/any
          (for [node-index (range node-count)]
@@ -161,7 +236,9 @@
                                   {:f :read :value (independent/tuple key-index nil) :final true})
                                 (range (count register-keys)))))))
 
-(defn final-read-checker []
+(defn final-read-checker
+  ([] (final-read-checker nil))
+  ([recovery-f]
   (reify checker/Checker
     (check [_ test history _]
       (let [writes (set (keep #(when (and (= :ok (:type %)) (= :write (:f %)))
@@ -171,13 +248,37 @@
             expected (set (for [node (:nodes test), key-index (range (count register-keys))]
                             [node key-index]))
             observed-split (last (filter #(and (= :observe-hotspot-split (:f %))
-                                              (map? (:value %))) history))]
-        {:valid? (and (= (set (range (count register-keys))) writes)
-                      (= expected observed)
-                      (some? observed-split)
-                      (every? #(< (:index observed-split) (:index %)) reads))
+                                              (map? (:value %))) history))
+            recovery (when recovery-f
+                       (last (filter #(and (= :nemesis (:process %))
+                                           (= recovery-f (:f %)) (:recovery %)
+                                           (= :info (:type %)) (not (:error %))) history)))]
+        {:valid? (boolean (and (= (set (range (count register-keys))) writes)
+                              (= expected observed)
+                              (some? observed-split)
+                              (every? #(< (:index observed-split) (:index %)) reads)
+                              (or (nil? recovery-f)
+                                  (and recovery
+                                       (every? #(< (:index recovery) (:index %)) reads)))))
          :missing-final-reads (vec (sort (remove observed expected)))
-         :written-keys writes}))))
+         :written-keys writes})))))
+
+(defrecord StartupRetryClient [delegate]
+  client/Client
+  (open! [this test node]
+    (assoc this :delegate (client/open! delegate test node)))
+  (setup! [this test]
+    (loop [delays [100 250 500 1000 2000 3000 5000 5000 5000]]
+      (let [[ok result] (try [true (client/setup! delegate test)]
+                             (catch Exception e [false e]))]
+        (cond
+          ok this
+          (seq delays) (do (Thread/sleep (first delays)) (recur (rest delays)))
+          :else (throw result)))))
+  (invoke! [_ test op] (client/invoke! delegate test op))
+  (teardown! [this test] (client/teardown! delegate test) this)
+  (close! [this test]
+    (assoc this :delegate (client/close! delegate test))))
 
 (defn elastickv-hotspot-test
   ([] (elastickv-hotspot-test {}))
@@ -187,15 +288,32 @@
          node->port (or (:node->port opts)
                         (cli/ports->node-map
                           (or (:redis-ports opts) (repeat (count nodes) (or (:redis-port opts) 6379))) nodes))
+         requested-faults (cli/normalize-faults (or (:faults opts) [:partition :kill]))
+         deterministic-fault (when (and (not local?) (= 1 (count requested-faults))
+                                        (#{:partition :kill} (first requested-faults)))
+                               (first requested-faults))
+         bootstrap-members (when deterministic-fault
+                             (str/join "," (map #(str % "=" % ":" (or (:grpc-port opts) 50051)) nodes)))
          db (if local? jdb/noop
-              (ekdb/db {:grpc-port (or (:grpc-port opts) 50051)
-                        :redis-port node->port
-                        :encryption (:encryption opts)
-                        :auto-split-args auto-split-args}))
+              (ekdb/db (cond-> {:grpc-port (or (:grpc-port opts) 50051)
+                                :redis-port node->port
+                                :encryption (:encryption opts)
+                                :auto-split-args auto-split-args}
+                         deterministic-fault (assoc :bootstrap-members bootstrap-members))))
+         interval (or (:fault-interval opts) 15)
+         _ (when (and deterministic-fault
+                      (or (not= #{"n1" "n2" "n3"} (set nodes))
+                          (not= 3 (count nodes))
+                          (not (pos? interval))
+                          (not (pos? (or (:recovery-time opts) 10)))
+                          (not (> (or (:time-limit opts) 120) (* 7 interval)))))
+             (throw (ex-info "single-fault hotspot requires n1,n2,n3 and time-limit > 7 * fault-interval"
+                             {:nodes nodes :fault deterministic-fault :interval interval})))
          faults (when-not local?
-                  (combined/nemesis-package
-                    {:db db :faults (cli/normalize-faults (or (:faults opts) [:partition :kill]))
-                     :interval (or (:fault-interval opts) 15)}))
+                  (if deterministic-fault
+                    (deterministic-fault-package db nodes deterministic-fault interval)
+                    (combined/nemesis-package
+                      {:db db :faults requested-faults :interval interval})))
          package (combined/compose-packages
                    (cond-> [(controller-package opts)] faults (conj faults)))
          concurrency (or (:concurrency opts) 6)
@@ -210,23 +328,32 @@
      (merge workload
             {:name (or (:name opts) "elastickv-m4-automatic-hotspot")
              :nodes nodes :db db :redis-host (:redis-host opts)
-             :os (if local? os/noop debian/os)
+             :os (if (or local? deterministic-fault) os/noop debian/os)
              :net (if local? net/noop net/iptables)
              :ssh (merge {:username "vagrant" :private-key-path "/home/vagrant/.ssh/id_rsa"
                           :strict-host-key-checking false}
                          (when local? {:dummy true}) (:ssh opts))
              :remote control/ssh :nemesis (:nemesis package)
-             :checker (checker/compose {:register (:checker workload)
-                                        :controller (controller-checker)
-                                        :final-reads (final-read-checker)})
+             :client (if deterministic-fault
+                       (->StartupRetryClient (:client workload))
+                       (:client workload))
+             :checker (checker/compose (cond-> {:register (:checker workload)
+                                                :controller (controller-checker)
+                                                :final-reads (final-read-checker
+                                                               (when deterministic-fault
+                                                                 (second (fault-ops deterministic-fault))))}
+                                         deterministic-fault
+                                         (assoc :fault-cycles (fault-cycle-checker nodes deterministic-fault))))
              :concurrency concurrency
-             :generator (gen/phases
-                          (->> (:generator workload)
-                               (gen/nemesis (:generator package))
-                               (gen/stagger (/ (double (or (:rate opts) 20))))
-                               (gen/time-limit (or (:time-limit opts) 120)))
-                          (gen/nemesis (:final-generator package))
-                          (gen/clients (final-reads (count nodes))))
+             :generator (apply gen/phases
+                               (cond-> [(->> (:generator workload)
+                                            (gen/nemesis (:generator package))
+                                            (gen/stagger (/ (double (or (:rate opts) 20))))
+                                            (gen/time-limit (or (:time-limit opts) 120)))
+                                        (gen/nemesis (:final-generator package))]
+                                 deterministic-fault
+                                 (conj (gen/sleep (or (:recovery-time opts) 10)))
+                                 true (conj (gen/clients (final-reads (count nodes))))))
              :final-generator nil}))))
 
 (def hotspot-cli-opts
@@ -236,7 +363,9 @@
    [nil "--observe-after-seconds SECONDS" "Delay before route observation."
     :default 15 :parse-fn #(Integer/parseInt %)]
    [nil "--observe-timeout-ms MS" "Maximum route observation duration."
-    :default 90000 :parse-fn #(Long/parseLong %)]])
+    :default 90000 :parse-fn #(Long/parseLong %)]
+   [nil "--recovery-time SECONDS" "Wait after the final heal before final reads."
+    :default 10 :parse-fn #(Double/parseDouble %)]])
 
 (defn -main [& args]
   (cli/run-workload! args

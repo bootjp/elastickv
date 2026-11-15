@@ -1,0 +1,72 @@
+name: Jepsen Hotspot Split
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/jepsen-hotspot.yml'
+      - 'jepsen/docker/hosted/**'
+      - 'jepsen/src/elastickv/hotspot_workload.clj'
+      - 'jepsen/src/elastickv/db.clj'
+      - 'jepsen/src/elastickv/split_workload.clj'
+      - 'jepsen/test/elastickv/hotspot_workload_test.clj'
+  push:
+    branches: [main, master]
+    paths:
+      - '.github/workflows/jepsen-hotspot.yml'
+      - 'jepsen/docker/hosted/**'
+      - 'jepsen/src/elastickv/hotspot_workload.clj'
+      - 'jepsen/src/elastickv/db.clj'
+      - 'jepsen/src/elastickv/split_workload.clj'
+      - 'jepsen/test/elastickv/hotspot_workload_test.clj'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hotspot:
+    name: Hotspot split (${{ matrix.fault }})
+    runs-on: ubuntu-26.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        fault: [partition, kill]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: actions/cache@v6
+        with:
+          path: ~/.m2/repository
+          key: hosted-jepsen-maven-${{ runner.os }}-${{ hashFiles('jepsen/project.clj') }}
+          restore-keys: hosted-jepsen-maven-${{ runner.os }}-
+      - name: Run managed hotspot split and recovery test
+        timeout-minutes: 30
+        env:
+          FAULT: ${{ matrix.fault }}
+          JEPSEN_TIME_LIMIT: '90'
+          JEPSEN_RATE: '5'
+          JEPSEN_CONCURRENCY: '6'
+          JEPSEN_MAX_WRITES_PER_KEY: '256'
+        run: bash jepsen/docker/hosted/run.sh "$FAULT" hotspot
+      - name: Make artifacts and cache readable
+        if: always()
+        run: |
+          for path in artifacts "$HOME/.m2"; do
+            if [ -d "$path" ]; then
+              sudo chown -R "$(id -u):$(id -g)" "$path"
+            fi
+          done
+      - name: Upload hotspot history, checker results, and node logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: jepsen-hotspot-${{ matrix.fault }}-${{ github.run_attempt }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14

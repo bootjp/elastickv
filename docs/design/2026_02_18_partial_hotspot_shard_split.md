@@ -332,6 +332,14 @@ PR #1475 added complete-local-evidence target admission and guarded
 2. Cleanup GC
 3. Jepsen hotspot workloads
 
+PR #1487 adds the managed hotspot Jepsen workload and a dedicated hosted CI
+matrix for partition and kill faults. Bounded local three-node runs at 90
+seconds and 5 ops/s passed the linearizability, automatic split geometry,
+per-node fault/recovery, and post-recovery read checkers for both fault modes.
+The workflow must pass on the final PR HEAD before this Jepsen slice is
+accepted. These runs cover same-group automatic splitting; they do not close
+the stale-route reject path, cleanup GC, or cross-group hardening.
+
 ## 13. Test Strategy
 
 ### 13.1 Unit tests

@@ -5,8 +5,11 @@
             [elastickv.db :as ekdb]
             [elastickv.hotspot-workload :as hotspot]
             [jepsen.checker :as checker]
+            [jepsen.client :as client]
+            [jepsen.generator :as gen]
             [jepsen.history :as history]
-            [jepsen.nemesis :as nemesis]))
+            [jepsen.nemesis :as nemesis]
+            [jepsen.os :as os]))
 
 (def before
   {:catalog-version 1
@@ -56,6 +59,104 @@
                                             (drop 3 (first (filter #(= "--concurrency N"
                                                                        (second %)) options))))))))]
     (hotspot/-main)))
+
+(def fault-nodes ["n1" "n2" "n3"])
+
+(deftest managed-client-setup-retries-until-leader-is-ready
+  (let [attempts (atom 0)
+        delegate (reify client/Client
+                   (open! [this _ _] this)
+                   (setup! [this _]
+                     (when (= 1 (swap! attempts inc))
+                       (throw (ex-info "leader not elected" {})))
+                     this)
+                   (invoke! [_ _ op] (assoc op :type :ok))
+                   (teardown! [this _] this)
+                   (close! [this _] this))
+        wrapped (client/open! (hotspot/->StartupRetryClient delegate) {} "n1")]
+    (is (some? (client/setup! wrapped {})))
+    (is (= 2 @attempts))))
+
+(defn fault-history [fault]
+  (let [[start stop] (hotspot/fault-ops fault)]
+    (vec (concat
+           (mapcat (fn [node]
+                     (for [f [start stop]
+                           type [:info :info]]
+                       {:process :nemesis :type type :f f :target node
+                        :value (if (= f start) [node] :all)})) fault-nodes)
+           [{:process :nemesis :type :info :f stop :recovery true :value :all}
+            {:process :nemesis :type :info :f stop :recovery true :value :all}]))))
+
+(deftest single-managed-fault-covers-every-node
+  (doseq [fault [:partition :kill]]
+    (let [test (hotspot/elastickv-hotspot-test
+                 {:nodes fault-nodes :faults [fault] :fault-interval 1 :time-limit 20})
+          package (hotspot/deterministic-fault-package (:db test) fault-nodes fault 1)
+          [heal _] (gen/op (:final-generator package) test (gen/context test))
+          ops (filter map? (hotspot/fault-cycle fault-nodes fault 1))
+          [start stop] (hotspot/fault-ops fault)
+          starts (filter #(= start (:f %)) ops)]
+      (is (= fault-nodes (mapv :target starts)))
+      (is (= fault-nodes (mapv :target (filter #(= stop (:f %)) ops))))
+      (is (= stop (:f heal)))
+      (is (= "n1=n1:50051,n2=n2:50051,n3=n3:50051"
+             (get-in test [:db :opts :bootstrap-members])))
+      (is (= os/noop (:os test)))
+      (is (= :all (:value heal)))
+      (is (true? (:recovery heal)))
+      (is (every? (set (nemesis/fs (:nemesis test)))
+                  #{:capture-hotspot-baseline :observe-hotspot-split start stop}))
+      (is (nil? (:final-generator test)))
+      (when (= :partition fault)
+        (doseq [{:keys [target value]} starts]
+          (is (= (set (remove #{target} fault-nodes)) (set (value target))))))))
+  (doseq [bad [{:nodes ["n1" "n2"]} {:nodes ["n1" "n2" "n4"]}
+               {:fault-interval 0} {:recovery-time 0} {:time-limit 7}]]
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (hotspot/elastickv-hotspot-test
+                   (merge {:nodes fault-nodes :faults [:kill]
+                           :fault-interval 1 :time-limit 20} bad))))))
+
+(deftest fault-checker-rejects-missing-or-failed-cycles
+  (doseq [fault [:partition :kill]]
+    (let [good (fault-history fault)
+          check #(checker/check (hotspot/fault-cycle-checker fault-nodes fault)
+                                {} (history/history %) {})]
+      (is (true? (:valid? (check good))))
+      (is (= (zipmap fault-nodes (repeat 1))
+             (:completed-fault-cycles (check good))))
+      (is (false? (:valid? (check (subvec good 0 12)))))
+      (is (false? (:valid? (check (vec (concat (subvec good 0 8)
+                                               (subvec good 12)))))))
+      (is (false? (:valid? (check (assoc-in good [3 :type] :fail)))))
+      (is (false? (:valid? (check (assoc-in good [3 :error] :unavailable)))))
+      (is (false? (:valid? (check (assoc-in good [2 :error] :unavailable)))))
+      (is (false? (:valid? (check (assoc good 3 (assoc (good 3) :target "n2"))))))
+      (is (false? (:valid? (check (subvec good 0 13)))))
+      (is (false? (:valid? (check (vec (concat (subvec good 0 10)
+                                               (subvec good 12 14)
+                                               (subvec good 10 12))))))))))
+
+(deftest final-reads-follow-the-explicit-heal
+  (let [writes (mapv (fn [key-index]
+                       {:type :ok :f :write :value [key-index key-index]})
+                     (range (count hotspot/register-keys)))
+        observed-split {:process :nemesis :type :info :f :observe-hotspot-split
+                        :value {:before before :after after}}
+        heal {:process :nemesis :type :info :f :start :recovery true :value :all}
+        reads (vec (for [node fault-nodes
+                         key-index (range (count hotspot/register-keys))]
+                     {:type :ok :f :read :node node :final true
+                      :value [key-index key-index]}))
+        check #(checker/check (hotspot/final-read-checker :start)
+                              {:nodes fault-nodes} (history/history %) {})]
+    (is (true? (:valid? (check (concat writes [observed-split heal] reads)))))
+    (is (false? (:valid? (check (concat writes [observed-split] reads)))))
+    (is (false? (:valid? (check (concat writes [observed-split]
+                                       (take 1 reads) [heal] (rest reads))))))
+    (is (false? (:valid? (check (concat writes [observed-split]
+                                       [(assoc heal :type :fail)] reads)))))))
 
 (deftest observation-rejects-controller-failures
   (is (some? (hotspot/split-observation before after)))
