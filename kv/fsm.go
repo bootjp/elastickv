@@ -48,6 +48,7 @@ type kvFSM struct {
 	ttlInlineCapabilityDisabled bool
 	// Recovery needs independent local directory-fence and native ConfState proof.
 	ttlInlineRecoveryProof func() (fenced bool, native raftengine.NativeConfiguration)
+	ttlInlineFenceReady    atomic.Bool
 	// Disabled until every data-group member and ingress has adopted the
 	// timestamp-binding protocol. Tests may enable it directly.
 	timestampBindingEnabled atomic.Bool

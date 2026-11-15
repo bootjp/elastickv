@@ -109,8 +109,10 @@ func TestTTLInlineCapabilityRecovery(t *testing.T) {
 	require.False(t, replayed.TTLInlineCapabilityActive(), "an unfenced directory cannot reopen activation")
 	require.NoError(t, replayed.InstallTTLInlineRecoveryProof(t.Context(), true, native))
 	require.True(t, replayed.TTLInlineCapabilityActive(), "matching independent evidence reopens activation")
+	require.True(t, replayed.TTLInlineFenceReady())
 	replayed.InvalidateTTLInlineRecoveryProof()
 	require.False(t, replayed.TTLInlineCapabilityActive())
+	require.False(t, replayed.TTLInlineFenceReady())
 	target, err := store.NewPebbleStore(t.TempDir())
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, target.Close()) })
@@ -122,6 +124,7 @@ func TestTTLInlineCapabilityRecovery(t *testing.T) {
 	require.True(t, restored.TTLInlineCapabilityActive())
 	require.NoError(t, restored.Restore(bytes.NewReader(image.Bytes())))
 	require.False(t, restored.TTLInlineCapabilityActive(), "a new snapshot invalidates the previous native proof")
+	require.False(t, restored.TTLInlineFenceReady())
 }
 
 func TestTTLInlineCapabilityUnknownRecordFailsClosed(t *testing.T) {

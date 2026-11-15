@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -328,16 +329,18 @@ type Engine struct {
 	nativeAdmission          raftengine.NativeAdmission
 	groupID                  uint64
 	nativeConfigurationIndex uint64 // actual native configuration, owned by the loop
-	admissionDirty           bool   // owned by the native loop, like RawNode
-	admissionPublished       bool
-	recoveredIdentity        *WALIdentity
-	nodeID                   uint64
-	localID                  string
-	localAddress             string
-	dataDir                  string
-	fsmSnapDir               string
-	tickInterval             time.Duration
-	electionTick             int
+	// Published with status under mu; never read RawNode from an RPC goroutine.
+	nativeConfigurationView *raftengine.NativeConfiguration
+	admissionDirty          bool // owned by the native loop, like RawNode
+	admissionPublished      bool
+	recoveredIdentity       *WALIdentity
+	nodeID                  uint64
+	localID                 string
+	localAddress            string
+	dataDir                 string
+	fsmSnapDir              string
+	tickInterval            time.Duration
+	electionTick            int
 	// joinAsLearner is captured from OpenConfig; consulted by
 	// alarmIfJoinedAsVoter on every post-apply ConfState. See §4.5 of
 	// the learner design doc.
@@ -4139,6 +4142,7 @@ func (e *Engine) refreshStatus() {
 	lastLogIndex, _ := e.storage.LastIndex()
 	lastSnapshotIndex, _ := e.storedSnapshotIndex()
 	config := e.currentConfiguration()
+	nativeConfiguration := e.captureApplyNativeConfiguration()
 
 	state := translateState(basic.RaftState)
 	leader := e.leaderInfo(basic.Lead)
@@ -4167,6 +4171,7 @@ func (e *Engine) refreshStatus() {
 		status.PerPeer = nil
 	}
 	e.status = status
+	e.nativeConfigurationView = nativeConfiguration
 	e.statusObservedMonoNs.Store(monoclock.Now().Nanos())
 	// Use the voter count, NOT len(e.peers), so a 1-voter + N-learner
 	// cluster correctly hits the leader-of-1 fast path: a learner does
@@ -4218,6 +4223,33 @@ func (e *Engine) refreshStatus() {
 		// successor leader is already accepting writes.
 		e.fireLeaderLossCallbacks()
 	}
+}
+
+// NativeConfigurationSnapshot returns a copied, same-publication native image
+// and term. A pending or unpublished configuration change has no usable proof.
+func (e *Engine) NativeConfigurationSnapshot() (raftengine.NativeConfiguration, uint64, bool) {
+	if e == nil {
+		return raftengine.NativeConfiguration{}, 0, false
+	}
+	e.mu.RLock()
+	view := e.nativeConfigurationView
+	status := e.status
+	closed := e.closed
+	if view == nil || closed || status.State == raftengine.StateShutdown || view.Index != status.ConfigurationIndex {
+		e.mu.RUnlock()
+		return raftengine.NativeConfiguration{}, 0, false
+	}
+	copy := *view
+	copy.Voters = slices.Clone(view.Voters)
+	copy.VotersOutgoing = slices.Clone(view.VotersOutgoing)
+	copy.Learners = slices.Clone(view.Learners)
+	copy.LearnersNext = slices.Clone(view.LearnersNext)
+	copy.Members = slices.Clone(view.Members)
+	e.mu.RUnlock()
+	if e.currentConfigIndex() != copy.Index {
+		return raftengine.NativeConfiguration{}, 0, false
+	}
+	return copy, status.Term, true
 }
 
 func (e *Engine) markStarted() {

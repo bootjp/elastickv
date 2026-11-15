@@ -133,6 +133,7 @@ func startRaftServers(
 		pb.RegisterTransactionalKVServer(gs, grpcSvc)
 		internalOpts := internalServerOptions(coordinate, adminServer, proposerForGroup(rt, shardGroups), shardGroups[rt.Spec.ID], rt.Spec.ID)
 		internalOpts = append(internalOpts, clusterbootstrap.BootstrapInternalPolicyOptions(rt, proposerForGroup(rt, shardGroups))...)
+		internalOpts = append(internalOpts, ttlInlineInternalOptions(rt)...)
 		internalOpts = append(internalOpts, dedicatedTimestampCutoverOptions(shardGroups)...)
 		internalOpts = append(internalOpts, adapter.WithInternalMigrationOwnershipReady(func() bool {
 			return adapter.MigrationOwnershipRuntimeReady(trx, shardStore, distServer, rt.Spec.ID, clusterbootstrap.RuntimeCore(rt).SnapshotEngine(), adminGRPCOpts.MigrationReady)

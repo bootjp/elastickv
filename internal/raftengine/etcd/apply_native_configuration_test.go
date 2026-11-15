@@ -54,6 +54,36 @@ func TestApplyNativeConfigurationUsesActualRawNodeRoster(t *testing.T) {
 	require.Zero(t, fsm.configuration)
 }
 
+func TestNativeConfigurationSnapshotRejectsUnpublishedChanges(t *testing.T) {
+	t.Parallel()
+	storage := etcdraft.NewMemoryStorage()
+	raw, err := etcdraft.NewRawNode(&etcdraft.Config{ID: 1, Storage: storage, ElectionTick: 10, HeartbeatTick: 1, MaxInflightMsgs: 1})
+	require.NoError(t, err)
+	require.NoError(t, raw.Bootstrap([]etcdraft.Peer{{ID: 1}, {ID: 2}}))
+	e := &Engine{rawNode: raw, storage: storage, recoveredIdentity: &WALIdentity{},
+		nativeConfigurationIndex: 2, peers: map[uint64]Peer{
+			1: {NodeID: 1, Address: "node1:50051"},
+			2: {NodeID: 2, Address: "node2:50051"},
+		}}
+	e.configIndex.Store(2)
+	e.refreshStatus()
+	native, term, ok := e.NativeConfigurationSnapshot()
+	require.True(t, ok)
+	require.Equal(t, e.Status().Term, term)
+	require.Equal(t, []uint64{1, 2}, native.Voters)
+	require.Equal(t, uint64(2), native.Index)
+	native.Voters[0] = 99
+	native.Members[0].Address = "changed:50051"
+	again, _, ok := e.NativeConfigurationSnapshot()
+	require.True(t, ok)
+	require.Equal(t, []uint64{1, 2}, again.Voters)
+	require.Equal(t, "node1:50051", again.Members[0].Address)
+
+	e.configIndex.Store(3)
+	_, _, ok = e.NativeConfigurationSnapshot()
+	require.False(t, ok, "a new native configuration needs a fresh status publication")
+}
+
 func TestApplyNativeConfigurationCannotReuseAnUnverifiedImage(t *testing.T) {
 	t.Parallel()
 	fsm := &nativeConfigurationFSM{configuration: raftengine.NativeConfiguration{Index: 99}}

@@ -181,6 +181,7 @@ type Internal struct {
 	adminProposer                   raftengine.Proposer
 	bootstrapPolicyProposer         raftengine.Proposer
 	prepareStartupAuthorization     func(context.Context, *pb.PrepareEvidenceStateRequest) bool
+	ttlInlineCapabilityProbe        func(context.Context, *pb.GetTTLInlineCapabilityRequest) (*pb.GetTTLInlineCapabilityResponse, error)
 	readWatermarkProposer           raftengine.Proposer
 	lastCommitTimestamp             func() uint64
 	relay                           *RedisPubSubRelay

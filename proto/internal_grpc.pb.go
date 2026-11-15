@@ -23,6 +23,7 @@ const (
 	Internal_ForwardAdminProposal_FullMethodName       = "/Internal/ForwardAdminProposal"
 	Internal_ForwardLeaseRead_FullMethodName           = "/Internal/ForwardLeaseRead"
 	Internal_GetPrepareEvidenceState_FullMethodName    = "/Internal/GetPrepareEvidenceState"
+	Internal_GetTTLInlineCapability_FullMethodName     = "/Internal/GetTTLInlineCapability"
 	Internal_RelayPublish_FullMethodName               = "/Internal/RelayPublish"
 	Internal_ExportRangeVersions_FullMethodName        = "/Internal/ExportRangeVersions"
 	Internal_ImportRangeVersions_FullMethodName        = "/Internal/ImportRangeVersions"
@@ -45,6 +46,9 @@ type InternalClient interface {
 	ForwardAdminProposal(ctx context.Context, in *ForwardAdminProposalRequest, opts ...grpc.CallOption) (*ForwardAdminProposalResponse, error)
 	ForwardLeaseRead(ctx context.Context, in *ForwardLeaseReadRequest, opts ...grpc.CallOption) (*ForwardLeaseReadResponse, error)
 	GetPrepareEvidenceState(ctx context.Context, in *PrepareEvidenceStateRequest, opts ...grpc.CallOption) (*PrepareEvidenceStateResponse, error)
+	// Peer-only: the server must enforce protected peer-session authentication,
+	// nonempty nonce validation and echo, and exact configuration-index and term checks.
+	GetTTLInlineCapability(ctx context.Context, in *GetTTLInlineCapabilityRequest, opts ...grpc.CallOption) (*GetTTLInlineCapabilityResponse, error)
 	RelayPublish(ctx context.Context, in *RelayPublishRequest, opts ...grpc.CallOption) (*RelayPublishResponse, error)
 	ExportRangeVersions(ctx context.Context, in *ExportRangeVersionsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ExportRangeVersionsResponse], error)
 	ImportRangeVersions(ctx context.Context, in *ImportRangeVersionsRequest, opts ...grpc.CallOption) (*ImportRangeVersionsResponse, error)
@@ -100,6 +104,16 @@ func (c *internalClient) GetPrepareEvidenceState(ctx context.Context, in *Prepar
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(PrepareEvidenceStateResponse)
 	err := c.cc.Invoke(ctx, Internal_GetPrepareEvidenceState_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *internalClient) GetTTLInlineCapability(ctx context.Context, in *GetTTLInlineCapabilityRequest, opts ...grpc.CallOption) (*GetTTLInlineCapabilityResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetTTLInlineCapabilityResponse)
+	err := c.cc.Invoke(ctx, Internal_GetTTLInlineCapability_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -234,6 +248,9 @@ type InternalServer interface {
 	ForwardAdminProposal(context.Context, *ForwardAdminProposalRequest) (*ForwardAdminProposalResponse, error)
 	ForwardLeaseRead(context.Context, *ForwardLeaseReadRequest) (*ForwardLeaseReadResponse, error)
 	GetPrepareEvidenceState(context.Context, *PrepareEvidenceStateRequest) (*PrepareEvidenceStateResponse, error)
+	// Peer-only: the server must enforce protected peer-session authentication,
+	// nonempty nonce validation and echo, and exact configuration-index and term checks.
+	GetTTLInlineCapability(context.Context, *GetTTLInlineCapabilityRequest) (*GetTTLInlineCapabilityResponse, error)
 	RelayPublish(context.Context, *RelayPublishRequest) (*RelayPublishResponse, error)
 	ExportRangeVersions(*ExportRangeVersionsRequest, grpc.ServerStreamingServer[ExportRangeVersionsResponse]) error
 	ImportRangeVersions(context.Context, *ImportRangeVersionsRequest) (*ImportRangeVersionsResponse, error)
@@ -266,6 +283,9 @@ func (UnimplementedInternalServer) ForwardLeaseRead(context.Context, *ForwardLea
 }
 func (UnimplementedInternalServer) GetPrepareEvidenceState(context.Context, *PrepareEvidenceStateRequest) (*PrepareEvidenceStateResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetPrepareEvidenceState not implemented")
+}
+func (UnimplementedInternalServer) GetTTLInlineCapability(context.Context, *GetTTLInlineCapabilityRequest) (*GetTTLInlineCapabilityResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetTTLInlineCapability not implemented")
 }
 func (UnimplementedInternalServer) RelayPublish(context.Context, *RelayPublishRequest) (*RelayPublishResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method RelayPublish not implemented")
@@ -389,6 +409,24 @@ func _Internal_GetPrepareEvidenceState_Handler(srv interface{}, ctx context.Cont
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(InternalServer).GetPrepareEvidenceState(ctx, req.(*PrepareEvidenceStateRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Internal_GetTTLInlineCapability_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetTTLInlineCapabilityRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(InternalServer).GetTTLInlineCapability(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Internal_GetTTLInlineCapability_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(InternalServer).GetTTLInlineCapability(ctx, req.(*GetTTLInlineCapabilityRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -606,6 +644,10 @@ var Internal_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetPrepareEvidenceState",
 			Handler:    _Internal_GetPrepareEvidenceState_Handler,
+		},
+		{
+			MethodName: "GetTTLInlineCapability",
+			Handler:    _Internal_GetTTLInlineCapability_Handler,
 		},
 		{
 			MethodName: "RelayPublish",

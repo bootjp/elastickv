@@ -107,18 +107,31 @@ func (f *kvFSM) IsTTLInlineCapabilityMarkerPayload(payload []byte) bool {
 // verified directory fence and recovered native configuration. It must run
 // before serving begins; a later snapshot restore discards this proof.
 func (f *kvFSM) InstallTTLInlineRecoveryProof(ctx context.Context, fenced bool, native raftengine.NativeConfiguration) error {
+	f.ttlInlineFenceReady.Store(false)
 	native.Voters = slices.Clone(native.Voters)
 	native.VotersOutgoing = slices.Clone(native.VotersOutgoing)
 	native.Learners = slices.Clone(native.Learners)
 	native.LearnersNext = slices.Clone(native.LearnersNext)
 	native.Members = slices.Clone(native.Members)
 	f.ttlInlineRecoveryProof = func() (bool, raftengine.NativeConfiguration) { return fenced, native }
-	return f.reloadTTLInlineCapability(ctx)
+	if err := f.reloadTTLInlineCapability(ctx); err != nil {
+		f.InvalidateTTLInlineRecoveryProof()
+		return err
+	}
+	f.ttlInlineFenceReady.Store(fenced && !f.ttlInlineCapabilityDisabled)
+	return nil
+}
+
+// TTLInlineFenceReady reports whether the startup owner's local proof is still
+// valid. It is not a certificate for other members or marker activation.
+func (f *kvFSM) TTLInlineFenceReady() bool {
+	return !f.ttlInlineCapabilityDisabled && f.ttlInlineFenceReady.Load()
 }
 
 // InvalidateTTLInlineRecoveryProof closes capability admission when the
 // recovered cut no longer describes the live native state.
 func (f *kvFSM) InvalidateTTLInlineRecoveryProof() {
+	f.ttlInlineFenceReady.Store(false)
 	f.ttlInlineRecoveryProof = nil
 	f.ttlInlineCapability.Store(false)
 }
