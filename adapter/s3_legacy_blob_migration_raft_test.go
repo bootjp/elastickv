@@ -15,6 +15,7 @@ import (
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/kv"
+	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
@@ -32,7 +33,7 @@ type s3MigrationRaftNode struct {
 	closeFactory func() error
 }
 
-func openS3MigrationRaftNode(t *testing.T, node *s3MigrationRaftNode, id int, peers []raftengine.Server, blobs *fakeS3BlobCluster) {
+func openS3MigrationRaftNode(t *testing.T, node *s3MigrationRaftNode, id int, peers []raftengine.Server, blobs S3BlobCluster) {
 	t.Helper()
 	st, err := store.NewPebbleStore(node.storeDir)
 	require.NoError(t, err)
@@ -45,8 +46,19 @@ func openS3MigrationRaftNode(t *testing.T, node *s3MigrationRaftNode, id int, pe
 	})
 	require.NoError(t, err)
 	node.engine, node.closeFactory = result.Engine, result.Close
-	node.grpcServer = grpc.NewServer(result.ServerOptions...)
+	adminUnary, adminStream := AdminTokenAuth("read-only-admin")
+	peerUnary, peerStream := S3BlobPeerTokenAuth("peer-secret")
+	options := append([]grpc.ServerOption{
+		grpc.ChainUnaryInterceptor(adminUnary, peerUnary),
+		grpc.ChainStreamInterceptor(adminStream, peerStream),
+	}, result.ServerOptions...)
+	node.grpcServer = grpc.NewServer(options...)
 	result.RegisterTransport(node.grpcServer)
+	admin := NewAdminServer(NodeIdentity{NodeID: strconv.Itoa(id), GRPCAddress: node.address}, nil)
+	admin.SetCapability(S3BlobOffloadCapabilityName, true)
+	admin.SetCapability(S3BlobGCCapabilityName, true)
+	pb.RegisterAdminServer(node.grpcServer, admin)
+	pb.RegisterS3BlobFetchServer(node.grpcServer, NewS3BlobFetchServer(st, nil))
 	node.listener, err = net.Listen("tcp", node.address)
 	require.NoError(t, err)
 	go func() { _ = node.grpcServer.Serve(node.listener) }()
