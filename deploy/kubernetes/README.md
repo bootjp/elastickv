@@ -17,7 +17,8 @@ It requires a newer image than the base pin; replace its placeholder digest firs
 ### Filesystem owner recovery
 
 FUSE mounts always use the operation journal; no legacy-mode flag is available.
-`--filesystemStrict=false` is rejected. Give each live mount a unique stable
+Remove the retired `--filesystemStrict` argument from launch commands; all of
+its values are rejected as undefined arguments. Give each live mount a unique stable
 client ID (the default is its Raft ID). After an unclean Pod stop, confirm the
 old process is no longer running before using `--filesystemStrictRecover` for
 that owner. Do not enable automatic fencing of a possibly live owner during a

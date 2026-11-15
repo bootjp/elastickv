@@ -161,13 +161,18 @@ jobs:
             /tmp/dynamodb-seal-source.txt
           retention-days: 7
           if-no-files-found: ignore
-      - name: Reject retired filesystem mode
+      - name: Reject removed filesystem mode argument
         run: |
-          if /tmp/elastickv-bin --filesystemStrict=false > /tmp/filesystem-legacy-rejection.log 2>&1; then
-            echo 'legacy filesystem mode was accepted' >&2
-            exit 1
-          fi
-          grep -q 'legacy filesystem mode is no longer supported' /tmp/filesystem-legacy-rejection.log
+          : > /tmp/filesystem-legacy-rejection.log
+          for argument in --filesystemStrict --filesystemStrict=true --filesystemStrict=false; do
+            if /tmp/elastickv-bin "$argument" > /tmp/filesystem-rejected-argument.log 2>&1; then
+              echo "removed argument was accepted: $argument" >&2
+              exit 1
+            fi
+            grep -Fq 'flag provided but not defined: -filesystemStrict' /tmp/filesystem-rejected-argument.log
+            printf 'argument=%s\n' "$argument" >> /tmp/filesystem-legacy-rejection.log
+            cat /tmp/filesystem-rejected-argument.log >> /tmp/filesystem-legacy-rejection.log
+          done
       - name: Capture DynamoDB seal data and compacted snapshots
         timeout-minutes: 4
         run: bash scripts/ci-dynamodb-seal-restart-check.sh capture "${{ matrix.encryption }}"

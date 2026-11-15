@@ -72,10 +72,12 @@ it. Running the binary directly on the host is the simpler option.
 
 ## Upgrading from legacy mounts
 
-All enabled mounts now use the operation journal. `--filesystemStrict` may be
-omitted; `--filesystemStrict=true` remains accepted for existing launch scripts.
-`--filesystemStrict=false` (including `0` or `f`) is rejected even if FUSE is
-otherwise disabled. There is no mode switch in the mount configuration API.
+All enabled mounts use the operation journal. Remove `--filesystemStrict`
+from existing launch scripts: the argument has been removed, and both bare and
+true/false spellings are rejected as undefined arguments before startup. This
+also applies when FUSE is otherwise disabled. There is no mode switch in the
+mount configuration API. `--filesystemStrictRecover` remains a separate,
+explicit recovery operation for stopped owners.
 
 1. Stop applications using the old mounts and stop every old mount process
    cleanly. Keep the existing Raft data directories and encryption keys. Take
@@ -107,7 +109,6 @@ flags:
 |---|---|---|
 | `--filesystemMount` | empty (disabled) | Directory to mount the filesystem on. |
 | `--filesystemClientID` | value of `--raftId` | Stable owner of the journal session and open-handle leases. Must be unique among active mounts; defaults to the node Raft ID. Reuse after an unclean stop requires explicit recovery. |
-| `--filesystemStrict` | `true` (mandatory) | Compatibility flag. All mounts use registered operation sessions and the reply-aware bridge. Explicit false values are rejected during argument parsing. |
 | `--filesystemStrictRecover` | `false` | Fence and recover a prior strict session for the same client ID before registering a new one. Set this only after confirming the prior mount process has stopped. Journaling is always enabled. |
 | `--filesystemRootUID` | `0` | Owner UID of the root directory. Applied only when the root is first created. |
 | `--filesystemRootGID` | `0` | Owner GID of the root directory. Applied only when the root is first created. |

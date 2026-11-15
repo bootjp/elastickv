@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 	"flag"
-	"fmt"
 	"io"
 	"math"
 	"testing"
@@ -128,25 +127,29 @@ func TestStartFilesystemIfEnabledRequiresLifecycle(t *testing.T) {
 	require.ErrorContains(t, err, "filesystem lifecycle is required")
 }
 
-func TestFilesystemStrictOnlyFlag(t *testing.T) {
-	for _, args := range [][]string{nil, {"--filesystemStrict"}, {"--filesystemStrict=true"}, {"--filesystemStrict=1"}} {
-		t.Run(fmt.Sprint(args), func(t *testing.T) {
-			fs := flag.NewFlagSet("test", flag.ContinueOnError)
-			fs.SetOutput(io.Discard)
-			f := RegisterFlags(fs)
-			require.NoError(t, fs.Parse(args))
-			require.Equal(t, "true", fs.Lookup("filesystemStrict").Value.String())
-			f.filesystem.mount = "/mnt/fs"
-			_, err := filesystemStartConfig(f.filesystem, "n1")
-			require.NoError(t, err)
-		})
-	}
-	for _, value := range []string{"false", "0", "FALSE"} {
-		t.Run(value, func(t *testing.T) {
+func TestFilesystemModeFlagIsRemoved(t *testing.T) {
+	fs := flag.NewFlagSet("defaults", flag.ContinueOnError)
+	f := RegisterFlags(fs)
+	require.Nil(t, fs.Lookup("filesystemStrict"))
+	require.NoError(t, fs.Parse(nil))
+	f.filesystem.mount = "/mnt/fs"
+	_, err := filesystemStartConfig(f.filesystem, "n1")
+	require.NoError(t, err)
+
+	for _, arg := range []string{"--filesystemStrict", "--filesystemStrict=true", "--filesystemStrict=1", "--filesystemStrict=false", "-filesystemStrict=true"} {
+		t.Run(arg, func(t *testing.T) {
 			fs := flag.NewFlagSet("test", flag.ContinueOnError)
 			fs.SetOutput(io.Discard)
 			RegisterFlags(fs)
-			require.ErrorContains(t, fs.Parse([]string{"--filesystemStrict=" + value}), "legacy filesystem mode is no longer supported")
+			require.ErrorContains(t, fs.Parse([]string{arg}), "flag provided but not defined: -filesystemStrict")
 		})
 	}
+}
+
+func TestFilesystemRecoveryFlagRemainsExplicit(t *testing.T) {
+	fs := flag.NewFlagSet("recovery", flag.ContinueOnError)
+	f := RegisterFlags(fs)
+	require.False(t, f.filesystem.strictRecover)
+	require.NoError(t, fs.Parse([]string{"--filesystemStrictRecover"}))
+	require.True(t, f.filesystem.strictRecover)
 }

@@ -215,8 +215,8 @@
            raft-redis-map raft-dynamo-map raft-s3-map raft-sqs-map raft-groups shard-ranges
            filesystem-mount encryption migration-enabled bootstrap? bootstrap-members
            join-as-learner join-members auto-split-args] :as opts}]
-  (when (false? (:filesystem-strict opts))
-    (throw (ex-info "legacy filesystem mode is no longer supported" {})))
+  (when (contains? opts :filesystem-strict)
+    (throw (ex-info "filesystem-strict option has been removed" {})))
   (cond-> ["--address" grpc
            "--redisAddress" redis
            "--raftId" (name node)
@@ -323,7 +323,7 @@
         (c/exec :bash "-c" (unmount-filesystem-cmd mount-dir))))))
 
 (defn- start-node!
-  [test node {:keys [bootstrap-node bootstrap-members grpc-port redis-port dynamo-port s3-port sqs-port sqs-region data-dir raft-groups shard-ranges raft-engine server-env migration-enabled filesystem-mount filesystem-strict encryption join-as-learner join-members auto-split-args]}]
+  [test node {:keys [bootstrap-node bootstrap-members grpc-port redis-port dynamo-port s3-port sqs-port sqs-region data-dir raft-groups shard-ranges raft-engine server-env migration-enabled filesystem-mount encryption join-as-learner join-members auto-split-args]}]
   (when (and (seq raft-groups)
              (> (count raft-groups) 1)
              (nil? shard-ranges))
@@ -348,7 +348,7 @@
                 :raft-redis-map raft-redis-map :raft-dynamo-map raft-dynamo-map
                 :raft-s3-map raft-s3-map :raft-sqs-map raft-sqs-map
                 :raft-groups raft-groups :shard-ranges shard-ranges
-                :filesystem-mount mount-dir :filesystem-strict filesystem-strict :encryption encryption :migration-enabled migration-enabled
+                :filesystem-mount mount-dir :encryption encryption :migration-enabled migration-enabled
                 :bootstrap? bootstrap? :bootstrap-members bootstrap-members
                 :join-as-learner join-as-learner
                 :join-members join-members :auto-split-args auto-split-args})
@@ -716,8 +716,8 @@
           :server-env {\"ELASTICKV_RAFT_SEND_STREAM\" \"true\"}}"
   ([] (->ElastickvDB {}))
   ([opts]
-   (when (false? (:filesystem-strict opts))
-     (throw (ex-info "legacy filesystem mode is no longer supported" {})))
+   (when (contains? opts :filesystem-strict)
+     (throw (ex-info "filesystem-strict option has been removed" {})))
    (when (and (:encryption opts)
               (> (count (:raft-groups opts)) 1))
      (throw (ex-info "--encryption currently requires exactly one Raft group"

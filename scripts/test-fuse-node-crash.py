@@ -71,8 +71,8 @@ def restart_arguments(argv):
     if not argv:
         raise AssertionError("missing node command line")
     for arg in argv:
-        if arg.startswith("--filesystemStrict=") and arg.partition("=")[2].lower() not in {"1", "t", "true"}:
-            raise AssertionError("legacy filesystem mode is no longer supported")
+        if arg in {"--filesystemStrict", "-filesystemStrict"} or arg.startswith(("--filesystemStrict=", "-filesystemStrict=")):
+            raise AssertionError("filesystemStrict argument has been removed")
     # A final true overrides a previous explicit false recovery flag. The
     # caller must stop the old process before launching these arguments.
     return argv + ["--filesystemStrictRecover"]

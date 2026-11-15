@@ -4,9 +4,10 @@
 
 Retire the supported legacy mount configuration. Every production mount created
 by `fsmount.MountService` registers an operation journal session and uses
-`WithStrictMode`. `Config` has no mode switch. The server keeps the positive
-`--filesystemStrict` flag as a compatibility spelling; explicit false values
-fail argument parsing before any service starts. The filesystem remains
+`WithStrictMode`. `Config` has no mode switch. The server's
+`--filesystemStrict` argument is removed, including the positive spelling.
+All old spellings fail argument parsing before any service starts. Remove the
+argument from existing launch commands. The filesystem remains
 optional: an empty mount path still disables it.
 
 Low-level adapter unit fixtures may exercise unjournaled Core methods to pin
@@ -34,7 +35,7 @@ SQLite and single/two-group benchmarks use the same mandatory mode. Remove the
 workload names and `benchmark-fuse.py --mode legacy`. The node-crash helper
 accepts omitted mode flags and enables recovery only after stopping the node.
 
-Regression tests cover CLI defaults/false spellings, journal registration with
+Regression tests cover the removed CLI argument (bare/true/false), journal registration with
 zero-valued mode-free config, stopped-owner argument construction, benchmark
 labels and legacy rejection, and default-mode crash restart arguments.
 

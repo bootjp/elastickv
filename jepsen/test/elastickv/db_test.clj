@@ -181,7 +181,7 @@
         (is (= :already-running
                (#'db/start-node! {:nodes ["n1"]} "n1"
                                 {:grpc-port 50051 :redis-port 6379 :data-dir "/data"
-                                 :filesystem-mount "/mount" :filesystem-strict true})))
+                                 :filesystem-mount "/mount"})))
         (is (empty? @events))))))
 
 (deftest restarting-a-stopped-filesystem-node-prepares-before-start
@@ -197,7 +197,7 @@
         (is (= :started
                (#'db/start-node! {:nodes ["n1"]} "n1"
                                 {:grpc-port 50051 :redis-port 6379 :data-dir "/data"
-                                 :filesystem-mount "/mount" :filesystem-strict true})))
+                                 :filesystem-mount "/mount"})))
         (is (= [:unmount :start] @events))))))
 
 (deftest filesystem-starts-always-recover-the-stopped-owner
@@ -217,8 +217,9 @@
       (is (= (boolean mount-dir) (contains? @started "--filesystemStrictRecover")))
       (is (not (contains? @started "--filesystemStrict"))))))
 
-(deftest legacy-filesystem-options-are-rejected
-  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"legacy filesystem mode"
-                       (db/db {:filesystem-strict false})))
-  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"legacy filesystem mode"
-                       (db/server-args {:filesystem-mount "/mount" :filesystem-strict false}))))
+(deftest removed-filesystem-mode-options-are-rejected
+  (doseq [value [true false]]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"filesystem-strict option has been removed"
+                         (db/db {:filesystem-strict value})))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"filesystem-strict option has been removed"
+                         (db/server-args {:filesystem-mount "/mount" :filesystem-strict value})))))

@@ -4,7 +4,6 @@ import (
 	"context"
 	"flag"
 	"math"
-	"strconv"
 	"strings"
 	"time"
 
@@ -30,27 +29,9 @@ type filesystemFlags struct {
 	leaseReapInterval     time.Duration
 }
 
-// filesystemStrictOnlyFlag preserves existing true-valued invocations without
-// retaining a configuration switch that can disable the operation journal.
-type filesystemStrictOnlyFlag struct{}
-
-func (filesystemStrictOnlyFlag) String() string   { return "true" }
-func (filesystemStrictOnlyFlag) IsBoolFlag() bool { return true }
-func (filesystemStrictOnlyFlag) Set(value string) error {
-	enabled, err := strconv.ParseBool(value)
-	if err != nil {
-		return errors.Wrap(err, "parse filesystemStrict")
-	}
-	if !enabled {
-		return errors.New("legacy filesystem mode is no longer supported; filesystemStrict must be true")
-	}
-	return nil
-}
-
 func (f *filesystemFlags) register(fs *flag.FlagSet) {
 	fs.StringVar(&f.mount, "filesystemMount", "", "FUSE mount point for the Elastickv filesystem; empty to disable")
 	fs.StringVar(&f.clientID, "filesystemClientID", "", "Stable open-handle lease client ID for the FUSE mount; empty uses raftId")
-	fs.Var(filesystemStrictOnlyFlag{}, "filesystemStrict", "Compatibility flag: operation journaling is always enabled; false is rejected")
 	fs.BoolVar(&f.strictRecover, "filesystemStrictRecover", false, "Fence and recover a previous strict FUSE session for the same client ID; use only after the previous mount has stopped")
 	fs.Uint64Var(&f.capacity, "filesystemCapacity", 0, "Filesystem byte capacity reported by statfs; zero reports unlimited")
 	fs.Uint64Var(&f.maxFiles, "filesystemMaxFiles", 0, "Filesystem inode capacity reported by statfs; zero reports unlimited")

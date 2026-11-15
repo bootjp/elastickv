@@ -15,14 +15,11 @@ class RestartArgumentsTest(unittest.TestCase):
         self.assertEqual(original + ["--filesystemStrictRecover"], crash.restart_arguments(original))
         self.assertEqual("/mnt/fs", original[-1])
 
-    def test_true_compatibility_flags_are_supported(self):
-        for arg in ("--filesystemStrict", "--filesystemStrict=true", "--filesystemStrict=1"):
-            self.assertEqual(["server", arg, "--filesystemStrictRecover"], crash.restart_arguments(["server", arg]))
-
-    def test_false_mode_is_rejected(self):
-        for value in ("false", "FALSE", "0", "f"):
-            with self.assertRaisesRegex(AssertionError, "legacy filesystem mode"):
-                crash.restart_arguments(["server", "--filesystemStrict=" + value])
+    def test_removed_mode_flags_are_rejected(self):
+        for arg in ("--filesystemStrict", "--filesystemStrict=true", "--filesystemStrict=1",
+                    "--filesystemStrict=false", "--filesystemStrict=0", "-filesystemStrict=true"):
+            with self.assertRaisesRegex(AssertionError, "filesystemStrict argument has been removed"):
+                crash.restart_arguments(["server", arg])
 
     def test_recovery_is_enabled_after_an_explicit_false(self):
         self.assertEqual(["server", "--filesystemStrictRecover=false", "--filesystemStrictRecover"],

@@ -184,7 +184,8 @@ including overwrite and rename modes. Every mount uses the mandatory strict
 journal by default, so supported mutations have durable operation identities. An indeterminate
 write keeps its inode barrier closed until journal verification and reply-bound
 acknowledgement establish a terminal decision; recovery never assigns the write a new operation identity.
-Legacy mode has been retired. Explicit false mode flags are rejected. Normal
+Legacy mode and its mode argument have been retired. Bare, true and false
+`--filesystemStrict` arguments are rejected. Normal
 and scheduled workloads now exercise the same strict-only mount path.
 
 Stopped nodes also use `--filesystemStrictRecover` to fence and recover their
