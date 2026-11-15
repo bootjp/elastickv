@@ -139,7 +139,11 @@ func newRedisDeltaCompactorIfEnabled(shardStore *kv.ShardStore, coordinate kv.Co
 		if obs := metricsRegistry.RedisTTLInlineMigrationObserver(); obs != nil {
 			opts = append(opts, adapter.WithDeltaCompactorTTLInlineMigrationObserver(obs))
 		}
-		return adapter.NewDeltaCompactor(shardStore, coordinate, opts...)
+		compactor := adapter.NewDeltaCompactor(shardStore, coordinate, opts...)
+		if registerer := metricsRegistry.Registerer(); registerer != nil {
+			registerer.MustRegister(adapter.NewLegacyMetadataPassCollector(compactor))
+		}
+		return compactor
 	}
 	slog.Info("redis delta compactor disabled", "env", redisDeltaCompactorEnabledEnvVar)
 	return nil

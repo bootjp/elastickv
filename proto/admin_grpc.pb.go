@@ -19,19 +19,20 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	Admin_GetClusterOverview_FullMethodName    = "/Admin/GetClusterOverview"
-	Admin_GetRaftGroups_FullMethodName         = "/Admin/GetRaftGroups"
-	Admin_GetAdapterSummary_FullMethodName     = "/Admin/GetAdapterSummary"
-	Admin_GetKeyVizMatrix_FullMethodName       = "/Admin/GetKeyVizMatrix"
-	Admin_GetRouteDetail_FullMethodName        = "/Admin/GetRouteDetail"
-	Admin_SetAutoSplitEnabled_FullMethodName   = "/Admin/SetAutoSplitEnabled"
-	Admin_BeginBackup_FullMethodName           = "/Admin/BeginBackup"
-	Admin_RenewBackup_FullMethodName           = "/Admin/RenewBackup"
-	Admin_EndBackup_FullMethodName             = "/Admin/EndBackup"
-	Admin_ListAdaptersAndScopes_FullMethodName = "/Admin/ListAdaptersAndScopes"
-	Admin_StreamBackup_FullMethodName          = "/Admin/StreamBackup"
-	Admin_GetNodeVersion_FullMethodName        = "/Admin/GetNodeVersion"
-	Admin_StreamEvents_FullMethodName          = "/Admin/StreamEvents"
+	Admin_GetClusterOverview_FullMethodName           = "/Admin/GetClusterOverview"
+	Admin_GetRaftGroups_FullMethodName                = "/Admin/GetRaftGroups"
+	Admin_GetRedisLegacyMetadataPasses_FullMethodName = "/Admin/GetRedisLegacyMetadataPasses"
+	Admin_GetAdapterSummary_FullMethodName            = "/Admin/GetAdapterSummary"
+	Admin_GetKeyVizMatrix_FullMethodName              = "/Admin/GetKeyVizMatrix"
+	Admin_GetRouteDetail_FullMethodName               = "/Admin/GetRouteDetail"
+	Admin_SetAutoSplitEnabled_FullMethodName          = "/Admin/SetAutoSplitEnabled"
+	Admin_BeginBackup_FullMethodName                  = "/Admin/BeginBackup"
+	Admin_RenewBackup_FullMethodName                  = "/Admin/RenewBackup"
+	Admin_EndBackup_FullMethodName                    = "/Admin/EndBackup"
+	Admin_ListAdaptersAndScopes_FullMethodName        = "/Admin/ListAdaptersAndScopes"
+	Admin_StreamBackup_FullMethodName                 = "/Admin/StreamBackup"
+	Admin_GetNodeVersion_FullMethodName               = "/Admin/GetNodeVersion"
+	Admin_StreamEvents_FullMethodName                 = "/Admin/StreamEvents"
 )
 
 // AdminClient is the client API for Admin service.
@@ -45,6 +46,7 @@ const (
 type AdminClient interface {
 	GetClusterOverview(ctx context.Context, in *GetClusterOverviewRequest, opts ...grpc.CallOption) (*GetClusterOverviewResponse, error)
 	GetRaftGroups(ctx context.Context, in *GetRaftGroupsRequest, opts ...grpc.CallOption) (*GetRaftGroupsResponse, error)
+	GetRedisLegacyMetadataPasses(ctx context.Context, in *GetRedisLegacyMetadataPassesRequest, opts ...grpc.CallOption) (*GetRedisLegacyMetadataPassesResponse, error)
 	GetAdapterSummary(ctx context.Context, in *GetAdapterSummaryRequest, opts ...grpc.CallOption) (*GetAdapterSummaryResponse, error)
 	GetKeyVizMatrix(ctx context.Context, in *GetKeyVizMatrixRequest, opts ...grpc.CallOption) (*GetKeyVizMatrixResponse, error)
 	GetRouteDetail(ctx context.Context, in *GetRouteDetailRequest, opts ...grpc.CallOption) (*GetRouteDetailResponse, error)
@@ -80,6 +82,16 @@ func (c *adminClient) GetRaftGroups(ctx context.Context, in *GetRaftGroupsReques
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetRaftGroupsResponse)
 	err := c.cc.Invoke(ctx, Admin_GetRaftGroups_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *adminClient) GetRedisLegacyMetadataPasses(ctx context.Context, in *GetRedisLegacyMetadataPassesRequest, opts ...grpc.CallOption) (*GetRedisLegacyMetadataPassesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetRedisLegacyMetadataPassesResponse)
+	err := c.cc.Invoke(ctx, Admin_GetRedisLegacyMetadataPasses_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -225,6 +237,7 @@ type Admin_StreamEventsClient = grpc.ServerStreamingClient[StreamEventsEvent]
 type AdminServer interface {
 	GetClusterOverview(context.Context, *GetClusterOverviewRequest) (*GetClusterOverviewResponse, error)
 	GetRaftGroups(context.Context, *GetRaftGroupsRequest) (*GetRaftGroupsResponse, error)
+	GetRedisLegacyMetadataPasses(context.Context, *GetRedisLegacyMetadataPassesRequest) (*GetRedisLegacyMetadataPassesResponse, error)
 	GetAdapterSummary(context.Context, *GetAdapterSummaryRequest) (*GetAdapterSummaryResponse, error)
 	GetKeyVizMatrix(context.Context, *GetKeyVizMatrixRequest) (*GetKeyVizMatrixResponse, error)
 	GetRouteDetail(context.Context, *GetRouteDetailRequest) (*GetRouteDetailResponse, error)
@@ -251,6 +264,9 @@ func (UnimplementedAdminServer) GetClusterOverview(context.Context, *GetClusterO
 }
 func (UnimplementedAdminServer) GetRaftGroups(context.Context, *GetRaftGroupsRequest) (*GetRaftGroupsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetRaftGroups not implemented")
+}
+func (UnimplementedAdminServer) GetRedisLegacyMetadataPasses(context.Context, *GetRedisLegacyMetadataPassesRequest) (*GetRedisLegacyMetadataPassesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetRedisLegacyMetadataPasses not implemented")
 }
 func (UnimplementedAdminServer) GetAdapterSummary(context.Context, *GetAdapterSummaryRequest) (*GetAdapterSummaryResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetAdapterSummary not implemented")
@@ -338,6 +354,24 @@ func _Admin_GetRaftGroups_Handler(srv interface{}, ctx context.Context, dec func
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(AdminServer).GetRaftGroups(ctx, req.(*GetRaftGroupsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Admin_GetRedisLegacyMetadataPasses_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetRedisLegacyMetadataPassesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AdminServer).GetRedisLegacyMetadataPasses(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Admin_GetRedisLegacyMetadataPasses_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AdminServer).GetRedisLegacyMetadataPasses(ctx, req.(*GetRedisLegacyMetadataPassesRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -540,6 +574,10 @@ var Admin_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetRaftGroups",
 			Handler:    _Admin_GetRaftGroups_Handler,
+		},
+		{
+			MethodName: "GetRedisLegacyMetadataPasses",
+			Handler:    _Admin_GetRedisLegacyMetadataPasses_Handler,
 		},
 		{
 			MethodName: "GetAdapterSummary",

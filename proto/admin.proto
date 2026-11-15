@@ -9,6 +9,7 @@ option go_package = "github.com/bootjp/elastickv/proto";
 service Admin {
   rpc GetClusterOverview (GetClusterOverviewRequest) returns (GetClusterOverviewResponse) {}
   rpc GetRaftGroups (GetRaftGroupsRequest) returns (GetRaftGroupsResponse) {}
+  rpc GetRedisLegacyMetadataPasses (GetRedisLegacyMetadataPassesRequest) returns (GetRedisLegacyMetadataPassesResponse) {}
   rpc GetAdapterSummary (GetAdapterSummaryRequest) returns (GetAdapterSummaryResponse) {}
   rpc GetKeyVizMatrix (GetKeyVizMatrixRequest) returns (GetKeyVizMatrixResponse) {}
   rpc GetRouteDetail (GetRouteDetailRequest) returns (GetRouteDetailResponse) {}
@@ -71,6 +72,39 @@ message GetRaftGroupsRequest {}
 
 message GetRaftGroupsResponse {
   repeated RaftGroupState groups = 1;
+}
+
+// Diagnostic M1 snapshots only. A successful response requires one completed,
+// current pass for each hash, set, zset and stream plan of the requested group.
+// It is not an M4/Phase-3 gate verdict. Missing or stale passes return an RPC
+// error, never an empty response that can be mistaken for zero backlog.
+message GetRedisLegacyMetadataPassesRequest {
+  uint64 group_id = 1;
+}
+
+message RedisLegacyMetadataReasonCounts {
+  uint64 owner_group_id = 1;
+  uint64 served = 2;
+  uint64 owner_has_version = 3;
+  uint64 owner_led_elsewhere = 4;
+  uint64 staged_visibility = 5;
+}
+
+message RedisLegacyMetadataPass {
+  uint64 group_id = 1;
+  string plan = 2;
+  uint64 catalog_version = 3;
+  uint64 leader_term = 4;
+  int64 started_at_unix_nanos = 5;
+  int64 completion_epoch_unix_nanos = 6;
+  repeated RedisLegacyMetadataReasonCounts counts = 7;
+}
+
+message GetRedisLegacyMetadataPassesResponse {
+  uint64 group_id = 1;
+  uint64 catalog_version = 2;
+  uint64 leader_term = 3;
+  repeated RedisLegacyMetadataPass passes = 4;
 }
 
 message AdapterSummary {

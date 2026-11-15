@@ -39,7 +39,7 @@ type legacyMetadataPublishedPass struct {
 
 func isLegacyMetadataMigrationHandler(name string) bool {
 	switch name {
-	case "ttl-inline-hash", "ttl-inline-set", "ttl-inline-zset", "ttl-inline-stream":
+	case ttlInlineHashPlan, ttlInlineSetPlan, ttlInlineZSetPlan, ttlInlineStreamPlan:
 		return true
 	default:
 		return false
@@ -208,4 +208,89 @@ func (c *DeltaCompactor) legacyMetadataPassStillValid(ctx context.Context, name 
 		delete(c.legacyMetadataPasses, name)
 	}
 	return valid
+}
+
+var ErrLegacyMetadataPassIncomplete = errors.New("complete current legacy metadata pass set unavailable")
+
+const (
+	ttlInlineHashPlan   = "ttl-inline-hash"
+	ttlInlineSetPlan    = "ttl-inline-set"
+	ttlInlineZSetPlan   = "ttl-inline-zset"
+	ttlInlineStreamPlan = "ttl-inline-stream"
+)
+
+var legacyMetadataPlanNames = [...]string{
+	ttlInlineHashPlan, ttlInlineSetPlan, ttlInlineZSetPlan, ttlInlineStreamPlan,
+}
+
+func validLegacyMetadataPassHeader(pass LegacyMetadataPassSnapshot, groupID uint64) bool {
+	return pass.GroupID == groupID && isLegacyMetadataMigrationHandler(pass.Plan) &&
+		pass.CatalogVersion != 0 && pass.LeaderTerm != 0 && !pass.StartedAt.IsZero() &&
+		!pass.CompletionEpoch.IsZero() && !pass.CompletionEpoch.Before(pass.StartedAt)
+}
+
+// CompleteLegacyMetadataGroupPasses is diagnostic, not M4 admission. A
+// successful result has one completed pass for every base-metadata family,
+// all under the same still-current catalog version and local leader term.
+func (c *DeltaCompactor) CompleteLegacyMetadataGroupPasses(ctx context.Context, groupID uint64) ([]LegacyMetadataPassSnapshot, error) {
+	if c == nil || groupID == 0 {
+		return nil, errors.WithStack(ErrLegacyMetadataPassIncomplete)
+	}
+	all := c.LegacyMetadataPassSnapshots(ctx)
+	selected, err := selectCompleteLegacyMetadataPasses(all, groupID)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.recheckCompleteLegacyMetadataPasses(ctx, groupID, selected); err != nil {
+		return nil, err
+	}
+	return selected, nil
+}
+
+func selectCompleteLegacyMetadataPasses(all []LegacyMetadataPassSnapshot, groupID uint64) ([]LegacyMetadataPassSnapshot, error) {
+	byPlan := make(map[string]LegacyMetadataPassSnapshot, len(legacyMetadataPlanNames))
+	for _, snapshot := range all {
+		if snapshot.GroupID == groupID {
+			byPlan[snapshot.Plan] = snapshot
+		}
+	}
+	selected := make([]LegacyMetadataPassSnapshot, 0, len(legacyMetadataPlanNames))
+	for _, name := range legacyMetadataPlanNames {
+		snapshot, ok := byPlan[name]
+		if !ok || !validLegacyMetadataPassHeader(snapshot, groupID) {
+			return nil, errors.WithStack(ErrLegacyMetadataPassIncomplete)
+		}
+		if len(selected) != 0 && (snapshot.CatalogVersion != selected[0].CatalogVersion || snapshot.LeaderTerm != selected[0].LeaderTerm) {
+			return nil, errors.WithStack(ErrLegacyMetadataPassIncomplete)
+		}
+		selected = append(selected, snapshot)
+	}
+	return selected, nil
+}
+
+func (c *DeltaCompactor) recheckCompleteLegacyMetadataPasses(ctx context.Context, groupID uint64, selected []LegacyMetadataPassSnapshot) error {
+	c.cursorMu.Lock()
+	entries := make([]legacyMetadataPublishedPass, 0, len(selected))
+	for _, snapshot := range selected {
+		entry, ok := c.legacyMetadataPasses[ttlInlineMigrationGroupCursorName(snapshot.Plan, groupID)]
+		if !ok || !entry.snapshot.CompletionEpoch.Equal(snapshot.CompletionEpoch) {
+			c.cursorMu.Unlock()
+			return errors.WithStack(ErrLegacyMetadataPassIncomplete)
+		}
+		entries = append(entries, entry)
+	}
+	c.cursorMu.Unlock()
+	version, term, err := entries[0].scanner.GroupOwnedScanIdentity(ctx, groupID)
+	if err != nil || version != selected[0].CatalogVersion || term != selected[0].LeaderTerm {
+		return errors.Join(ErrLegacyMetadataPassIncomplete, err)
+	}
+	c.cursorMu.Lock()
+	defer c.cursorMu.Unlock()
+	for n, snapshot := range selected {
+		current, ok := c.legacyMetadataPasses[ttlInlineMigrationGroupCursorName(snapshot.Plan, groupID)]
+		if !ok || !current.snapshot.CompletionEpoch.Equal(entries[n].snapshot.CompletionEpoch) {
+			return errors.WithStack(ErrLegacyMetadataPassIncomplete)
+		}
+	}
+	return nil
 }

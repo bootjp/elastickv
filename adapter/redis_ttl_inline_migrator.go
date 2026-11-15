@@ -121,7 +121,7 @@ func (c *DeltaCompactor) ttlInlineMigrationHandlers() []ttlInlineMigrationHandle
 			buildElems:     c.migrateListTTLInlineElems,
 		},
 		c.simpleTTLInlineMigrationHandler(
-			"ttl-inline-hash",
+			ttlInlineHashPlan,
 			[]byte(store.HashMetaPrefix),
 			extractHashMetaMigrationUserKey,
 			func(raw []byte) (int64, uint64, error) {
@@ -131,7 +131,7 @@ func (c *DeltaCompactor) ttlInlineMigrationHandlers() []ttlInlineMigrationHandle
 			func(n int64, ttl uint64) []byte { return store.MarshalHashMeta(store.HashMeta{Len: n, ExpireAt: ttl}) },
 		),
 		c.simpleTTLInlineMigrationHandler(
-			"ttl-inline-set",
+			ttlInlineSetPlan,
 			[]byte(store.SetMetaPrefix),
 			extractSetMetaMigrationUserKey,
 			func(raw []byte) (int64, uint64, error) {
@@ -141,7 +141,7 @@ func (c *DeltaCompactor) ttlInlineMigrationHandlers() []ttlInlineMigrationHandle
 			func(n int64, ttl uint64) []byte { return store.MarshalSetMeta(store.SetMeta{Len: n, ExpireAt: ttl}) },
 		),
 		c.simpleTTLInlineMigrationHandler(
-			"ttl-inline-zset",
+			ttlInlineZSetPlan,
 			[]byte(store.ZSetMetaPrefix),
 			extractZSetMetaMigrationUserKey,
 			func(raw []byte) (int64, uint64, error) {
@@ -151,7 +151,7 @@ func (c *DeltaCompactor) ttlInlineMigrationHandlers() []ttlInlineMigrationHandle
 			func(n int64, ttl uint64) []byte { return store.MarshalZSetMeta(store.ZSetMeta{Len: n, ExpireAt: ttl}) },
 		),
 		{
-			typeName:       "ttl-inline-stream",
+			typeName:       ttlInlineStreamPlan,
 			prefix:         []byte(store.StreamMetaPrefix),
 			extractUserKey: store.ExtractStreamUserKeyFromMeta,
 			buildElems:     c.migrateStreamTTLInlineElems,

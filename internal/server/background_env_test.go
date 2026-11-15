@@ -1,6 +1,13 @@
 package server
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/bootjp/elastickv/adapter"
+	"github.com/bootjp/elastickv/monitoring"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/stretchr/testify/require"
+)
 
 func TestEnabledEnv(t *testing.T) {
 	t.Run("unset returns default", func(t *testing.T) {
@@ -39,4 +46,14 @@ func TestRedisDeltaCompactorEnv(t *testing.T) {
 			t.Fatal("newRedisDeltaCompactorIfEnabled() returned compactor, want nil")
 		}
 	})
+}
+
+func TestRedisDeltaCompactorRegistersLegacyMetadataMetrics(t *testing.T) {
+	t.Setenv(redisDeltaCompactorEnabledEnvVar, "true")
+	registry := monitoring.NewRegistry("node-1", "localhost")
+	compactor := newRedisDeltaCompactorIfEnabled(nil, nil, registry)
+	require.NotNil(t, compactor)
+	err := registry.Registerer().Register(adapter.NewLegacyMetadataPassCollector(compactor))
+	var already prometheus.AlreadyRegisteredError
+	require.ErrorAs(t, err, &already)
 }
