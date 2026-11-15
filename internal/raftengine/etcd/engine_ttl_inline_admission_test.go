@@ -51,12 +51,6 @@ func TestTTLInlineMembershipPreflightFindsEncryptedLogMarker(t *testing.T) {
 	blocked, err = e.ttlInlineMembershipBlocked()
 	require.NoError(t, err)
 	require.True(t, blocked, "an unapplied cutover must not hide a wrapped marker")
-	_, wrapped, ok := decodeProposalEnvelope(entry.GetData())
-	require.True(t, ok)
-	require.True(t, e.isTTLInlineCapabilityProposal(wrapped))
-	blocked, err = (&Engine{fsm: &ttlInlineMarkerTestFSM{}, pendingTTLInlineMarker: true}).ttlInlineMembershipBlocked()
-	require.NoError(t, err)
-	require.True(t, blocked, "an accepted local proposal is fenced before Ready persistence")
 }
 
 func TestTTLInlineMembershipPreflightRejectsUnreadableEncryptedLog(t *testing.T) {

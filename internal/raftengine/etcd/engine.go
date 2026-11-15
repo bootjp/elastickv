@@ -462,9 +462,6 @@ type Engine struct {
 	// but not yet applied. It is maintained by the raft event loop and read
 	// lock-free by status publication.
 	pendingConfChangeIndex atomic.Uint64
-	// A locally accepted marker proposal can precede Ready persistence. Keep
-	// membership closed across that interval and until this Engine is closed.
-	pendingTTLInlineMarker bool
 
 	lastLeaderContactAt   time.Time
 	lastLeaderContactFrom uint64
@@ -2231,10 +2228,6 @@ func (e *Engine) handleProposal(req proposalRequest) {
 	}); err != nil {
 		e.cancelPendingProposal(req.id)
 		req.done <- proposalResult{err: errors.WithStack(err)}
-		return
-	}
-	if e.isTTLInlineCapabilityProposal(req.payload) {
-		e.pendingTTLInlineMarker = true
 	}
 }
 
