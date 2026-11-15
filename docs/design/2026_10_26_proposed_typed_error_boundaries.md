@@ -42,6 +42,9 @@ public responses redact the underlying physical key.
 Migration RPC leader rejections are also projected as key-free `Unavailable`
 statuses so a remote split runner retries ordinary leadership churn without
 classifying status text.
+The public RawKV group-watermark response projects leader/floor unavailability
+and internal read failures to fixed, key-free gRPC statuses rather than
+serializing the storage error or mislabeling it as a client precondition.
 
 This is not whole-cluster activation. Durable logical-operation reconciliation
 across separate invocations, mandatory peer authentication for definitive
