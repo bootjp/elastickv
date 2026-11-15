@@ -240,7 +240,11 @@ Implementation order:
    activation, and data-group admission remain open.
 4. Whole-cluster activation gate, migration and rolling-upgrade tests, native
    fault campaigns, Jepsen, and throughput/latency comparison with the old
-   per-window allocator. No production activation before all gates pass.
+   per-window allocator. A read-only rolling-upgrade preflight now checks that
+   every current voter and learner of one locally led group advertises the
+   timestamp-binding protocol version under a stable term and configuration.
+   This is not a replicated activation decision and does not enable admission.
+   No production activation before all gates pass.
 
 ### 4c. Two-group PREPARE admission record (design contract, not activated)
 
