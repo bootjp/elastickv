@@ -44,6 +44,7 @@
   (:require [clojure.string :as str]
             [elastickv.cli :as cli]
             [elastickv.db :as ekdb]
+            [elastickv.elle-checker :as elle]
             [jepsen [checker :as checker]
                     [client :as client]
                     [generator :as gen]
@@ -686,8 +687,9 @@
                   threads-per-key
                   (range key-count)
                   (fn [_k] (register-key-generator max-writes)))
-     :checker   (independent/checker
-                  (filesystem-register-checker))}))
+     :checker   (checker/compose
+                  {:register (independent/checker (filesystem-register-checker))
+                   :elle (elle/register-checker :filesystem)})}))
 
 (defn elastickv-filesystem-test
   "Builds a Jepsen test map that drives the Elastickv FUSE filesystem with the

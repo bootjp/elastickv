@@ -6,6 +6,7 @@
   :dependencies [[org.clojure/clojure "1.11.1"]
                  [jepsen "0.3.15"]
                  [elle "0.2.8"]
+                 [org.clojure/data.json "2.5.1"]
                  [com.taoensso/carmine "3.5.0"]
                  [slingshot "0.12.2"]
                  [redis.clients/jedis "5.1.0" :exclusions [org.slf4j/slf4j-api]]

@@ -12,29 +12,37 @@
 
 (def models [:strict-serializable])
 
-(defn s3-operation
-  "One S3 request is one transaction. Preserve uncertainty and event ordering;
-   never combine separate HTTP requests into an invented atomic transaction."
-  [op]
+(def register-kinds #{:s3 :grpc :filesystem :independent-register})
+
+(defn register-operation
+  "One observed API operation is one transaction. Only the filesystem's
+   pre-created -1 sentinel maps to Elle's initial nil version."
+  [kind op]
   (if (= :nemesis (:process op))
     op
     (let [value (:value op)
           f (case (:f op) :read :r :write :w
-                  (throw (ex-info "Unsupported S3 operation" {:f (:f op)})))]
+                  (throw (ex-info "Unsupported register operation" {:f (:f op)})))]
       (when-not (and (sequential? value) (= 2 (count value)))
-        (throw (ex-info "Expected an S3 independent key/value pair" {})))
-      (assoc op :f :txn :value [[f (first value) (second value)]]))))
+        (throw (ex-info "Expected an independent key/value pair" {})))
+      (let [[k v] value]
+        (when (and (= kind :filesystem) (= :w f) (= -1 v))
+          (throw (ex-info "Filesystem writes must not reuse the initial sentinel" {})))
+        (assoc op :f :txn :value [[f k (if (and (= kind :filesystem) (= -1 v)) nil v)]])))))
+
+(defn s3-operation [op] (register-operation :s3 op))
 
 (defn transaction-history [kind events]
   (case kind
-    :s3 (history/history (mapv s3-operation events))
+    (:s3 :grpc :filesystem :independent-register)
+    (history/history (mapv #(register-operation kind %) events))
     (:list-append :rw-register) (history/history events)
-    (throw (ex-info "Expected list-append, rw-register, or s3" {:kind kind}))))
+    (throw (ex-info "Unsupported Elle history kind" {:kind kind}))))
 
 (defn check-history [kind events directory]
   (let [h (transaction-history kind events)
         opts {:consistency-models models :directory (str directory)}]
-    (when (#{:rw-register :s3} kind)
+    (when (or (= :rw-register kind) (register-kinds kind))
       ;; Elle infers versions from values. Reusing a written value for one key
       ;; violates its assumptions, even when the underlying API allows it.
       (let [writes (for [op h
@@ -47,7 +55,7 @@
           (throw (ex-info "Elle register writes must use unique non-nil values per key" {})))))
     (case kind
       :list-append (append/check opts h)
-      (:rw-register :s3) (register/check opts h))))
+      (:rw-register :s3 :grpc :filesystem :independent-register) (register/check opts h))))
 
 (defn read-history [file]
   ;; Jepsen history.edn contains one EDN operation per form, not a vector.
@@ -71,25 +79,27 @@
     (with-open [writer (io/writer (io/file dir "elle-history.edn"))]
       (doseq [op h]
         (.write writer (str (pr-str (into {} op)) "\n"))))
-    ;; S3 has already been normalized; do not transform a second time.
-    (let [result (check-history (if (= kind :s3) :rw-register kind) h dir)]
+    ;; API histories have already been normalized; do not transform twice.
+    (let [result (check-history (if (register-kinds kind) :rw-register kind) h dir)]
       (spit (io/file dir "elle-results.edn") (pr-str result))
       result)))
 
 (defn analyze-file! [kind input directory]
   (analyze-history! kind (read-history input) directory))
 
-(defn s3-checker []
+(defn register-checker [kind]
   (reify checker/Checker
     (check [_ test h opts]
-      (analyze-history! :s3 h
+      (analyze-history! kind h
                         (.getCanonicalPath
                           (store/path! test (:subdirectory opts) "elle"))))))
+
+(defn s3-checker [] (register-checker :s3))
 
 (defn -main [& args]
   (try
     (when-not (= 3 (count args))
-      (throw (ex-info "Usage: KIND HISTORY.edn OUTPUT-DIRECTORY; KIND=list-append|rw-register|s3" {})))
+      (throw (ex-info "Usage: KIND HISTORY.edn OUTPUT-DIRECTORY; KIND=list-append|rw-register|s3|grpc|filesystem|independent-register" {})))
     (let [[kind input directory] args
           result (analyze-file! (keyword kind) input directory)]
       (prn result)

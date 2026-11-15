@@ -80,6 +80,7 @@ jobs:
           go build -o /tmp/elastickv-bin .
           go build -o /tmp/elastickv-admin-bin ./cmd/elastickv-admin
           go build -o /tmp/elastickv-raftadmin-bin ./cmd/raftadmin
+          go build -o /tmp/jepsen-grpc-client ./cmd/jepsen-grpc-client
       - name: Warm Leiningen Maven cache
         working-directory: jepsen
         run: |
@@ -113,6 +114,15 @@ jobs:
         run: |
           scripts/jepsen-enable-encryption.sh /tmp/elastickv-admin-bin /tmp/elastickv-ci/kek.bin \
             127.0.0.1:50051 127.0.0.1:50052 127.0.0.1:50053
+      - name: Run public gRPC Elle workloads
+        working-directory: jepsen
+        timeout-minutes: 5
+        run: |
+          for api in raw transactional; do
+            timeout 120 ~/lein run -m elastickv.grpc-workload --local --host 127.0.0.1 \
+              --grpc-ports 50051,50052,50053 --grpc-api "$api" \
+              --time-limit 10 --rate 10 --concurrency 6 --key-count 8 --max-writes-per-key 16
+          done
       - name: Run Redis Jepsen workload against elastickv
         working-directory: jepsen
         timeout-minutes: 3
@@ -375,6 +385,21 @@ jobs:
             --time-limit 30 --rate 5 --concurrency 6 \
             --key-count 12 --max-writes-per-key 16 \
             --mount-dirs /tmp/elastickv-ci/fs-n1,/tmp/elastickv-ci/fs-n2,/tmp/elastickv-ci/fs-n3
+      - name: Archive all adapter Elle evidence
+        if: always()
+        run: |
+          printf 'run_sha=%s\nencryption=%s\n' "$GITHUB_SHA" "${{ matrix.encryption }}" > /tmp/elle-source.txt
+          bash scripts/archive-jepsen-store.sh jepsen/store /tmp/elle-adapter-histories.tar.gz
+      - name: Upload all adapter Elle evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: elle-adapter-histories-encryption-${{ matrix.encryption }}
+          path: |
+            /tmp/elle-adapter-histories.tar.gz
+            /tmp/elle-source.txt
+          retention-days: 14
+          if-no-files-found: error
       - name: Archive Jepsen store on filesystem failure
         if: failure()
         run: bash scripts/archive-jepsen-store.sh jepsen/store /tmp/jepsen-store-filesystem.tar.gz

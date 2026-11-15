@@ -4,7 +4,7 @@ set -euo pipefail
 fault=${1:?Usage: run.sh partition|kill|pause}
 case "$fault" in partition|kill|pause) ;; *) echo 'Unsupported fault' >&2; exit 2 ;; esac
 adapter=${2:-redis}
-case "$adapter" in redis|dynamodb|s3|sqs-standard|sqs-htfifo) ;; *) echo 'Unsupported adapter' >&2; exit 2 ;; esac
+case "$adapter" in redis|dynamodb|s3|grpc-raw|grpc-transactional|filesystem-overwrite|filesystem-rename|sqs-standard|sqs-htfifo) ;; *) echo 'Unsupported adapter' >&2; exit 2 ;; esac
 time_limit=${JEPSEN_TIME_LIMIT:-90}
 rate=${JEPSEN_RATE:-5}
 concurrency=${JEPSEN_CONCURRENCY:-6}
@@ -28,12 +28,18 @@ for value in "$time_limit" "$concurrency" "$key_count" "$max_writes" "$max_txn_l
     exit 2
   fi
 done
-if [[ "$adapter" == s3 ]]; then
+if [[ "$adapter" == s3 || "$adapter" == grpc-* ]]; then
   # Preserve the aggregate budget while bounding each Knossos search.
   source jepsen/s3_budget.sh
   s3_budget "$key_count" "$max_writes"
   key_count=$S3_KEY_COUNT
   max_writes=$S3_MAX_OPS_PER_KEY
+fi
+if [[ "$adapter" == filesystem-* ]]; then
+  source jepsen/filesystem_budget.sh
+  filesystem_budget "${adapter#filesystem-}" "$key_count" "$max_writes"
+  key_count=$FS_KEY_COUNT
+  max_writes=$FS_MAX_WRITES
 fi
 export JEPSEN_IMAGE="elastickv-jepsen-hosted:local"
 export JEPSEN_SSH_DIR
@@ -44,6 +50,9 @@ artifact_dir="$JEPSEN_REPO/artifacts/jepsen-$adapter-$fault"
 mkdir -p "$artifact_dir"
 project="jepsen-${GITHUB_RUN_ID:-$$}-${GITHUB_RUN_ATTEMPT:-1}-$adapter-$fault"
 compose=(docker compose -p "$project" -f jepsen/docker/hosted/compose.yml)
+if [[ "$adapter" == filesystem-* ]]; then
+  compose+=(-f jepsen/docker/hosted/compose.fuse.yml)
+fi
 
 finish() {
   status=$?
@@ -73,6 +82,11 @@ finish() {
 trap finish EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+if [[ "$adapter" == filesystem-* && ! -c /dev/fuse ]]; then
+  echo 'Filesystem fault tests require /dev/fuse on the Hosted runner' >&2
+  exit 1
+fi
 
 ssh-keygen -q -t ed25519 -N '' -f "$JEPSEN_SSH_DIR/id_ed25519"
 go_version=$(awk '$1 == "toolchain" {sub(/^go/, "", $2); print $2}' go.mod)

@@ -1,0 +1,12 @@
+x-fuse-node: &fuse-node
+  cap_add: [SYS_ADMIN]
+  devices: [/dev/fuse:/dev/fuse]
+  security_opt: [apparmor:unconfined]
+
+services:
+  n1:
+    <<: *fuse-node
+  n2:
+    <<: *fuse-node
+  n3:
+    <<: *fuse-node

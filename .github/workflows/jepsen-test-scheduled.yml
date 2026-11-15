@@ -8,7 +8,7 @@ on:
         required: false
         default: "300"
       faults-only:
-        description: "Run only Docker fault stress jobs (five adapters x three faults)"
+        description: "Run only Docker fault stress jobs (all data adapters x three faults)"
         type: boolean
         required: false
         default: false
@@ -58,7 +58,7 @@ jobs:
     if: ${{ inputs.faults-only || !inputs.workloads-json }}
     uses: ./.github/workflows/jepsen-hosted-faults.yml
     with:
-      adapters-json: '["redis","dynamodb","s3","sqs-standard","sqs-htfifo"]'
+      adapters-json: '["redis","dynamodb","s3","grpc-raw","grpc-transactional","filesystem-overwrite","filesystem-rename","sqs-standard","sqs-htfifo"]'
       time-limit: ${{ inputs.time-limit || '300' }}
       repeat-faults: true
       min-fault-cycles: 2
@@ -77,7 +77,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        workload: ${{ fromJSON(inputs.workloads-json || '["unit","redis","redis-zset","dynamodb","dynamodb-type-string","dynamodb-type-number","dynamodb-type-binary","dynamodb-type-bool","dynamodb-type-null","dynamodb-type-string-set","dynamodb-type-number-set","dynamodb-type-binary-set","dynamodb-type-list","dynamodb-type-map","s3","sqs-standard","sqs-htfifo","filesystem-cross-mount","filesystem-sqlite-check","filesystem-node-crash","filesystem-benchmark","filesystem-benchmark-legacy","filesystem-benchmark-multigroup","filesystem-benchmark-multigroup-legacy","filesystem-overwrite","filesystem-rename","sqlite"]') }}
+        workload: ${{ fromJSON(inputs.workloads-json || '["unit","grpc-raw","grpc-transactional","redis","redis-zset","dynamodb","dynamodb-type-string","dynamodb-type-number","dynamodb-type-binary","dynamodb-type-bool","dynamodb-type-null","dynamodb-type-string-set","dynamodb-type-number-set","dynamodb-type-binary-set","dynamodb-type-list","dynamodb-type-map","s3","sqs-standard","sqs-htfifo","filesystem-cross-mount","filesystem-sqlite-check","filesystem-node-crash","filesystem-benchmark","filesystem-benchmark-legacy","filesystem-benchmark-multigroup","filesystem-benchmark-multigroup-legacy","filesystem-overwrite","filesystem-rename","sqlite"]') }}
     env:
       GOCACHE: /tmp/go-build
       WORKLOAD: ${{ matrix.workload }}
@@ -139,6 +139,9 @@ jobs:
             filesystem-*|sqlite|sqs-*) go build -o /tmp/elastickv-bin . ;;
             *) go build -o /tmp/elastickv-demo ./cmd/server ;;
           esac
+          if [[ "$WORKLOAD" == grpc-* ]]; then
+            go build -o /tmp/jepsen-grpc-client ./cmd/jepsen-grpc-client
+          fi
       # Warm the Maven cache up front so unit tests / workloads start
       # against a populated ~/.m2. `lein deps` is wrapped with a retry
       # loop because Maven Central transiently returns 429 during peak
@@ -329,6 +332,16 @@ jobs:
             --drain-time 40 \
             --sqs-ports 63501,63502,63503 --host 127.0.0.1 \
             "${EXTRA_ARGS[@]}"
+      - name: Run public gRPC Elle workload
+        if: startsWith(matrix.workload, 'grpc-')
+        working-directory: jepsen
+        run: |
+          source ./s3_budget.sh
+          s3_budget "${{ inputs.key-count || '8' }}" "${{ inputs.max-writes-per-key || '150' }}"
+          timeout 600 ~/lein run -m elastickv.grpc-workload --local --host 127.0.0.1 \
+            --grpc-ports 50051,50052,50053 --grpc-api "${WORKLOAD#grpc-}" \
+            --time-limit "${{ inputs.time-limit || '300' }}" --rate "${{ inputs.rate || '5' }}" \
+            --concurrency 6 --key-count "$S3_KEY_COUNT" --max-writes-per-key "$S3_MAX_OPS_PER_KEY"
       - name: Launch filesystem cluster
         if: startsWith(matrix.workload, 'filesystem-') || matrix.workload == 'sqlite'
         # Mirrors the cluster in jepsen-test.yml: every node mounts the shared

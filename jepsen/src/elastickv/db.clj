@@ -41,7 +41,10 @@
    ["elastickv-split" ["go" "build" "-o" (str build-dir "/elastickv-split") "./cmd/elastickv-split"]]
    ["elastickv-list-routes" ["go" "build" "-o" (str build-dir "/elastickv-list-routes") "./cmd/elastickv-list-routes"]]
    ["elastickv-admin" ["go" "build" "-o" (str build-dir "/elastickv-admin") "./cmd/elastickv-admin"]]
-   ["jepsen-encryption-setup" ["go" "build" "-o" (str build-dir "/jepsen-encryption-setup") "./cmd/jepsen-encryption-setup"]]])
+   ["jepsen-encryption-setup" ["go" "build" "-o" (str build-dir "/jepsen-encryption-setup") "./cmd/jepsen-encryption-setup"]]
+   ["jepsen-grpc-client" ["go" "build" "-o" (str build-dir "/jepsen-grpc-client") "./cmd/jepsen-grpc-client"]]])
+
+(defn grpc-client-binary [] (str build-dir "/jepsen-grpc-client"))
 
 (defn- build-binaries!
   "Build the production server and Jepsen administration helpers."
