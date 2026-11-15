@@ -23,12 +23,19 @@ func TestOfflineProtectedPreparationPreservesM1bFence(t *testing.T) {
 			Minimum: raftbootstrap.Versions{Entry: 1, Snapshot: 1, Session: 1},
 		}}}
 	markerPath := filepath.Join(dir, raftbootstrap.MarkerFile)
+	require.NoError(t, os.MkdirAll(c.BackupDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(c.BackupDir, raftbootstrap.MarkerFile),
+		[]byte(raftbootstrap.MarkerLegacyFenced), 0o600))
 	require.NoError(t, os.WriteFile(markerPath, []byte(raftbootstrap.MarkerLegacyFenced), 0o600))
 	require.NoError(t, stageBootstrapRequiredFormat(c))
 	require.NoError(t, verifyBootstrapRequiredFormat(c))
 	marker, err := os.ReadFile(markerPath)
 	require.NoError(t, err)
 	require.Equal(t, raftbootstrap.MarkerV2, string(marker))
+	require.NoError(t, os.WriteFile(markerPath, []byte(raftbootstrap.MarkerV1), 0o600))
+	require.ErrorIs(t, verifyBootstrapRequiredFormat(c), raftbootstrap.ErrInconsistent,
+		"verification must reject losing the source downgrade fence")
+	require.NoError(t, os.WriteFile(markerPath, []byte(raftbootstrap.MarkerV2), 0o600))
 	require.NoError(t, stageBootstrapRequiredFormat(c), "retry must retain the fenced marker")
 	marker, err = os.ReadFile(markerPath)
 	require.NoError(t, err)
