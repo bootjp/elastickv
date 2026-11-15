@@ -34,6 +34,18 @@ func (s *legacyMetadataTestSource) LegacyMetadataPassSnapshots(context.Context) 
 	return s.passes
 }
 
+func (s *legacyMetadataTestSource) LegacyMetadataPassGroupIDs() []uint64 {
+	groups := make(map[uint64]struct{})
+	for _, pass := range s.passes {
+		groups[pass.GroupID] = struct{}{}
+	}
+	ids := make([]uint64, 0, len(groups))
+	for id := range groups {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
 func completeLegacyMetadataFixture() []LegacyMetadataPassSnapshot {
 	start := time.Unix(100, 0)
 	passes := make([]LegacyMetadataPassSnapshot, 0, len(legacyMetadataPlanNames))
@@ -156,6 +168,37 @@ func TestLegacyMetadataMetricsOmitIncompleteGroup(t *testing.T) {
 	metrics, err = registry.Gather()
 	require.NoError(t, err)
 	require.Empty(t, metrics, "stale published gauges must disappear at scrape time")
+}
+
+func TestLegacyMetadataMetricsChecksOnlyEachGroup(t *testing.T) {
+	bad := &diagnosticTTLInlineStore{MVCCStore: store.NewMVCCStore(), version: 12, term: 3}
+	good := &diagnosticTTLInlineStore{MVCCStore: store.NewMVCCStore(), version: 11, term: 3}
+	c := NewDeltaCompactor(good, newLocalAdapterCoordinator(good))
+	for _, pass := range completeLegacyMetadataFixture() {
+		badPass := pass
+		badPass.GroupID = 6
+		c.legacyMetadataPasses[ttlInlineMigrationGroupCursorName(pass.Plan, 6)] = legacyMetadataPublishedPass{snapshot: badPass, scanner: bad}
+		c.legacyMetadataPasses[ttlInlineMigrationGroupCursorName(pass.Plan, 7)] = legacyMetadataPublishedPass{snapshot: pass, scanner: good}
+	}
+	passes, err := c.CompleteLegacyMetadataGroupPasses(t.Context(), 7)
+	require.NoError(t, err)
+	require.Len(t, passes, 4)
+	require.Zero(t, bad.identityCalls, "a group lookup must not probe unrelated leaders")
+	require.LessOrEqual(t, good.identityCalls, 5)
+
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(NewLegacyMetadataPassCollector(c))
+	metrics, err := registry.Gather()
+	require.NoError(t, err)
+	foundComplete := false
+	for _, family := range metrics {
+		if family.GetName() == "elastickv_redis_legacy_metadata_pass_complete" {
+			foundComplete = true
+			require.Len(t, family.GetMetric(), 4, "an invalid group must not hide a healthy group")
+		}
+	}
+	require.True(t, foundComplete)
+	require.LessOrEqual(t, good.identityCalls, 10, "a scrape should validate each plan once per group")
 }
 
 func TestLegacyMetadataCompactorRequiresFourCurrentPlans(t *testing.T) {

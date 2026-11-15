@@ -11,7 +11,7 @@ import (
 const legacyMetadataMetricsScrapeTimeout = 2 * time.Second
 
 type legacyMetadataMetricsSource interface {
-	LegacyMetadataPassSnapshots(context.Context) []LegacyMetadataPassSnapshot
+	LegacyMetadataPassGroupIDs() []uint64
 	LegacyMetadataPassSource
 }
 
@@ -62,11 +62,7 @@ func (m *LegacyMetadataPassCollector) Collect(ch chan<- prometheus.Metric) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), legacyMetadataMetricsScrapeTimeout)
 	defer cancel()
-	groups := make(map[uint64]struct{})
-	for _, pass := range m.source.LegacyMetadataPassSnapshots(ctx) {
-		groups[pass.GroupID] = struct{}{}
-	}
-	for groupID := range groups {
+	for _, groupID := range m.source.LegacyMetadataPassGroupIDs() {
 		passes, err := m.source.CompleteLegacyMetadataGroupPasses(ctx, groupID)
 		if err != nil || validateLegacyMetadataRPCPasses(groupID, passes) != nil {
 			continue

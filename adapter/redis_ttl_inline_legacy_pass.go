@@ -189,6 +189,23 @@ func (c *DeltaCompactor) LegacyMetadataPassSnapshots(ctx context.Context) []Lega
 	return result
 }
 
+// LegacyMetadataPassGroupIDs lists candidates without probing every group's
+// leader. Each group's complete set is validated separately by the caller.
+func (c *DeltaCompactor) LegacyMetadataPassGroupIDs() []uint64 {
+	c.cursorMu.Lock()
+	groups := make(map[uint64]struct{}, len(c.legacyMetadataPasses))
+	for _, entry := range c.legacyMetadataPasses {
+		groups[entry.snapshot.GroupID] = struct{}{}
+	}
+	c.cursorMu.Unlock()
+	ids := make([]uint64, 0, len(groups))
+	for id := range groups {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	return ids
+}
+
 func (c *DeltaCompactor) legacyMetadataPassStillValid(ctx context.Context, name string, entry legacyMetadataPublishedPass) bool {
 	if ctx.Err() != nil {
 		return false
@@ -236,7 +253,7 @@ func (c *DeltaCompactor) CompleteLegacyMetadataGroupPasses(ctx context.Context, 
 	if c == nil || groupID == 0 {
 		return nil, errors.WithStack(ErrLegacyMetadataPassIncomplete)
 	}
-	all := c.LegacyMetadataPassSnapshots(ctx)
+	all := c.legacyMetadataGroupSnapshots(ctx, groupID)
 	selected, err := selectCompleteLegacyMetadataPasses(all, groupID)
 	if err != nil {
 		return nil, err
@@ -245,6 +262,28 @@ func (c *DeltaCompactor) CompleteLegacyMetadataGroupPasses(ctx context.Context, 
 		return nil, err
 	}
 	return selected, nil
+}
+
+func (c *DeltaCompactor) legacyMetadataGroupSnapshots(ctx context.Context, groupID uint64) []LegacyMetadataPassSnapshot {
+	c.cursorMu.Lock()
+	entries := make(map[string]legacyMetadataPublishedPass, len(legacyMetadataPlanNames))
+	for _, plan := range legacyMetadataPlanNames {
+		name := ttlInlineMigrationGroupCursorName(plan, groupID)
+		if entry, ok := c.legacyMetadataPasses[name]; ok {
+			entries[name] = entry
+		}
+	}
+	c.cursorMu.Unlock()
+	result := make([]LegacyMetadataPassSnapshot, 0, len(entries))
+	for name, entry := range entries {
+		if !c.legacyMetadataPassStillValid(ctx, name, entry) {
+			continue
+		}
+		copy := entry.snapshot
+		copy.Counts = cloneLegacyMetadataCounts(copy.Counts)
+		result = append(result, copy)
+	}
+	return result
 }
 
 func selectCompleteLegacyMetadataPasses(all []LegacyMetadataPassSnapshot, groupID uint64) ([]LegacyMetadataPassSnapshot, error) {

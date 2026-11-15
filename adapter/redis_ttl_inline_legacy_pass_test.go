@@ -12,12 +12,13 @@ import (
 
 type diagnosticTTLInlineStore struct {
 	store.MVCCStore
-	pages    []kv.GroupOwnedScanPage
-	version  uint64
-	term     uint64
-	pageCall int
-	oldCalls int
-	onPage   func(*diagnosticTTLInlineStore)
+	pages         []kv.GroupOwnedScanPage
+	version       uint64
+	term          uint64
+	pageCall      int
+	oldCalls      int
+	identityCalls int
+	onPage        func(*diagnosticTTLInlineStore)
 }
 
 func (s *diagnosticTTLInlineStore) ScanGroupOwnedAt(context.Context, uint64, []byte, []byte, int, uint64) ([]*store.KVPair, []byte, error) {
@@ -35,6 +36,7 @@ func (s *diagnosticTTLInlineStore) ScanGroupOwnedPageAt(_ context.Context, _ uin
 }
 
 func (s *diagnosticTTLInlineStore) GroupOwnedScanIdentity(context.Context, uint64) (uint64, uint64, error) {
+	s.identityCalls++
 	return s.version, s.term, nil
 }
 
