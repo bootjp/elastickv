@@ -360,9 +360,15 @@
     (c/on node
       (c/su
         (c/exec :mkdir :-p data-dir)
-        (when mount-dir
-          (prepare-filesystem-mount! mount-dir))
-        (apply cu/start-daemon! daemon-opts server-bin args)))))
+        ;; The nemesis starts :all after killing one node. Preparing a mount
+        ;; before start-daemon! returns :already-running would detach healthy
+        ;; peers. Only clean up the mount when its server is actually stopped.
+        (if (and mount-dir (cu/daemon-running? pid-file))
+          :already-running
+          (do
+            (when mount-dir
+              (prepare-filesystem-mount! mount-dir))
+            (apply cu/start-daemon! daemon-opts server-bin args)))))))
 
 (defn- stop-node!
   [node]

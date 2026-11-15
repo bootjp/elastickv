@@ -167,3 +167,35 @@
   (is (= "/mnt/fs" (#'db/filesystem-mount-dir "/mnt/fs" "n1")))
   (is (= "/b" (#'db/filesystem-mount-dir {"n1" "/a" "n2" "/b"} "n2")))
   (is (nil? (#'db/filesystem-mount-dir {"n1" "/a"} "n9"))))
+
+(deftest starting-a-live-filesystem-node-preserves-its-mount
+  (let [events (atom [])]
+    (with-redefs-fn
+      {#'c/session (constantly :test-session)
+       #'c/disconnect (constantly nil)
+       #'c/exec (constantly nil)
+       #'cu/daemon-running? (constantly true)
+       #'db/prepare-filesystem-mount! (fn [_] (swap! events conj :unmount))
+       #'cu/start-daemon! (fn [& _] (swap! events conj :start) :started)}
+      (fn []
+        (is (= :already-running
+               (#'db/start-node! {:nodes ["n1"]} "n1"
+                                {:grpc-port 50051 :redis-port 6379 :data-dir "/data"
+                                 :filesystem-mount "/mount"})))
+        (is (empty? @events))))))
+
+(deftest restarting-a-stopped-filesystem-node-prepares-before-start
+  (let [events (atom [])]
+    (with-redefs-fn
+      {#'c/session (constantly :test-session)
+       #'c/disconnect (constantly nil)
+       #'c/exec (constantly nil)
+       #'cu/daemon-running? (constantly false)
+       #'db/prepare-filesystem-mount! (fn [_] (swap! events conj :unmount))
+       #'cu/start-daemon! (fn [& _] (swap! events conj :start) :started)}
+      (fn []
+        (is (= :started
+               (#'db/start-node! {:nodes ["n1"]} "n1"
+                                {:grpc-port 50051 :redis-port 6379 :data-dir "/data"
+                                 :filesystem-mount "/mount"})))
+        (is (= [:unmount :start] @events))))))
