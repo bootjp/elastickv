@@ -1661,6 +1661,7 @@ func (f *kvFSM) Restore(r io.Reader) error {
 }
 
 func (f *kvFSM) restoreSnapshot(r io.Reader, restoreStore func(io.Reader) error) error {
+	f.InvalidateTTLInlineRecoveryProof()
 	// Stage 8a §3.2: the bufio.Reader is owned by the caller (us) and
 	// MUST be passed unchanged to the inner-store path on every branch
 	// — buffered bytes can sit between the header consumption and the

@@ -10,8 +10,32 @@ import (
 
 type ttlInlineMarkerTestFSM struct{ StateMachine }
 
+type ttlInlineRecoveryInvalidationFSM struct {
+	StateMachine
+	invalidations int
+}
+
+func (f *ttlInlineRecoveryInvalidationFSM) InvalidateTTLInlineRecoveryProof() {
+	f.invalidations++
+}
+
 func (*ttlInlineMarkerTestFSM) IsTTLInlineCapabilityMarkerPayload(payload []byte) bool {
 	return len(payload) != 0 && payload[0] == 0x2e
+}
+
+func TestTTLInlineRecoveryProofInvalidatedByNativeConfiguration(t *testing.T) {
+	t.Parallel()
+	for _, v2 := range []bool{false, true} {
+		fsm := &ttlInlineRecoveryInvalidationFSM{}
+		e := &Engine{nodeID: 1, fsm: fsm}
+		conf := raftpb.ConfState{Voters: []uint64{1}}
+		if v2 {
+			e.publishConfigChangeV2(raftpb.ConfChangeV2{}, 5, conf)
+		} else {
+			e.publishConfigChange(raftpb.ConfChangeRemoveNode, 2, nil, 5, conf)
+		}
+		require.Equal(t, 1, fsm.invalidations)
+	}
 }
 
 func TestTTLInlineMembershipPreflightFindsPendingLogMarker(t *testing.T) {

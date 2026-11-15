@@ -3375,6 +3375,7 @@ func (e *Engine) publishConfigChange(changeType raftpb.ConfChangeType, nodeID ui
 	e.applyConfigPeerChange(changeType, nodeID, context)
 	e.refreshConfigServers(confState)
 	e.setConfigIndex(index)
+	e.invalidateTTLInlineRecoveryProof()
 }
 
 func (e *Engine) applyConfigChangeV2(cc raftpb.ConfChangeV2, index uint64, confState raftpb.ConfState) {
@@ -3390,6 +3391,13 @@ func (e *Engine) publishConfigChangeV2(cc raftpb.ConfChangeV2, index uint64, con
 	}
 	e.refreshConfigServers(confState)
 	e.setConfigIndex(index)
+	e.invalidateTTLInlineRecoveryProof()
+}
+
+func (e *Engine) invalidateTTLInlineRecoveryProof() {
+	if aware, ok := e.fsm.(interface{ InvalidateTTLInlineRecoveryProof() }); ok {
+		aware.InvalidateTTLInlineRecoveryProof()
+	}
 }
 
 // alarmIfJoinedAsVoter implements the operator-alarm semantics from

@@ -103,6 +103,26 @@ func (f *kvFSM) IsTTLInlineCapabilityMarkerPayload(payload []byte) bool {
 	return len(payload) != 0 && payload[0] == raftEncodeTTLInlineCapability
 }
 
+// InstallTTLInlineRecoveryProof accepts only the startup owner's independently
+// verified directory fence and recovered native configuration. It must run
+// before serving begins; a later snapshot restore discards this proof.
+func (f *kvFSM) InstallTTLInlineRecoveryProof(ctx context.Context, fenced bool, native raftengine.NativeConfiguration) error {
+	native.Voters = slices.Clone(native.Voters)
+	native.VotersOutgoing = slices.Clone(native.VotersOutgoing)
+	native.Learners = slices.Clone(native.Learners)
+	native.LearnersNext = slices.Clone(native.LearnersNext)
+	native.Members = slices.Clone(native.Members)
+	f.ttlInlineRecoveryProof = func() (bool, raftengine.NativeConfiguration) { return fenced, native }
+	return f.reloadTTLInlineCapability(ctx)
+}
+
+// InvalidateTTLInlineRecoveryProof closes capability admission when the
+// recovered cut no longer describes the live native state.
+func (f *kvFSM) InvalidateTTLInlineRecoveryProof() {
+	f.ttlInlineRecoveryProof = nil
+	f.ttlInlineCapability.Store(false)
+}
+
 func (f *kvFSM) reloadTTLInlineCapability(ctx context.Context) error {
 	f.ttlInlineCapability.Store(false)
 	if f.store == nil {

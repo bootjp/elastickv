@@ -101,18 +101,16 @@ func TestTTLInlineCapabilityRecovery(t *testing.T) {
 	replayed := newTTLInlineFSM(t, reopened)
 	require.False(t, replayed.TTLInlineCapabilityActive(), "persisted marker is not local-fence or recovered-ConfState proof")
 	require.True(t, replayed.TTLInlineCapabilityRecorded())
-	replayed.ttlInlineRecoveryProof = func() (bool, raftengine.NativeConfiguration) {
-		return true, raftengine.NativeConfiguration{Index: 3, Voters: []uint64{1}, Learners: []uint64{2}}
-	}
-	require.NoError(t, replayed.reloadTTLInlineCapability(t.Context()))
+	require.NoError(t, replayed.InstallTTLInlineRecoveryProof(t.Context(), true,
+		raftengine.NativeConfiguration{Index: 3, Voters: []uint64{1}, Learners: []uint64{2}}))
 	require.False(t, replayed.TTLInlineCapabilityActive(), "a different recovered ConfChange index cannot reopen activation")
 	require.True(t, replayed.TTLInlineCapabilityRecorded(), "configuration mismatch does not erase durable marker evidence")
-	replayed.ttlInlineRecoveryProof = func() (bool, raftengine.NativeConfiguration) { return false, native }
-	require.NoError(t, replayed.reloadTTLInlineCapability(t.Context()))
+	require.NoError(t, replayed.InstallTTLInlineRecoveryProof(t.Context(), false, native))
 	require.False(t, replayed.TTLInlineCapabilityActive(), "an unfenced directory cannot reopen activation")
-	replayed.ttlInlineRecoveryProof = func() (bool, raftengine.NativeConfiguration) { return true, native }
-	require.NoError(t, replayed.reloadTTLInlineCapability(t.Context()))
+	require.NoError(t, replayed.InstallTTLInlineRecoveryProof(t.Context(), true, native))
 	require.True(t, replayed.TTLInlineCapabilityActive(), "matching independent evidence reopens activation")
+	replayed.InvalidateTTLInlineRecoveryProof()
+	require.False(t, replayed.TTLInlineCapabilityActive())
 	target, err := store.NewPebbleStore(t.TempDir())
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, target.Close()) })
@@ -120,6 +118,10 @@ func TestTTLInlineCapabilityRecovery(t *testing.T) {
 	require.NoError(t, restored.Restore(bytes.NewReader(image.Bytes())))
 	require.False(t, restored.TTLInlineCapabilityActive(), "snapshot marker cannot reopen activation")
 	require.True(t, restored.TTLInlineCapabilityRecorded(), "restored marker remains recorded without activation")
+	require.NoError(t, restored.InstallTTLInlineRecoveryProof(t.Context(), true, native))
+	require.True(t, restored.TTLInlineCapabilityActive())
+	require.NoError(t, restored.Restore(bytes.NewReader(image.Bytes())))
+	require.False(t, restored.TTLInlineCapabilityActive(), "a new snapshot invalidates the previous native proof")
 }
 
 func TestTTLInlineCapabilityUnknownRecordFailsClosed(t *testing.T) {
