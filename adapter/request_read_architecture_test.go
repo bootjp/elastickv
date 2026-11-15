@@ -43,6 +43,7 @@ func requestReadPolicy() map[string]map[string]bool {
 		allowed["request"+name] = legacyRequestReadScopes
 		allowed["requestReadSnapshot"]["request_read_ports.go:request"+name] = true
 	}
+	allowed["requestReadSnapshot"]["request_read_ports.go:requestScanGroupOwnedPageAt"] = true
 	allowed["requestScanPhysicalAt"] = legacyRequestReadScopes
 	allowed["Historical"] = map[string]bool{
 		"request_read.go:requestReadSnapshot":     true,
