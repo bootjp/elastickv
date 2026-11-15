@@ -62,7 +62,7 @@ func (a *LegacyMetadataAuditor) AuditLegacyMetadata(ctx context.Context, groupID
 	}
 	request := kv.NewReadRequest(ctx, a.coord, a.store, a.tracker)
 	defer request.Close()
-	snapshot, err := request.Latest(request.Context(), "legacy metadata audit")
+	snapshot, err := request.LatestTargets(request.Context(), "legacy metadata audit", []kv.ReadFenceTarget{{GroupID: groupID}})
 	if err != nil {
 		return LegacyMetadataAuditResult{}, errors.WithStack(err)
 	}

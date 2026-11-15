@@ -48,6 +48,8 @@ func (*legacyAuditFollowerEngine) Status() raftengine.Status {
 	return raftengine.Status{State: raftengine.StateFollower, Term: 1}
 }
 
+func (*legacyAuditFollowerEngine) Leader() raftengine.LeaderInfo { return raftengine.LeaderInfo{} }
+
 func TestLegacyMetadataAuditMatchesBackgroundPassOnSplitShardStore(t *testing.T) {
 	ctx := t.Context()
 	routes := distribution.NewEngine()
@@ -75,15 +77,14 @@ func TestLegacyMetadataAuditMatchesBackgroundPassOnSplitShardStore(t *testing.T)
 	}
 	// Nested metadata rows share the scan prefixes but are not base backlog.
 	require.NoError(t, legacy.PutAt(ctx, store.HashMetaDeltaKey([]byte("m-served"), 5, 0), []byte("delta"), 5, 0))
+	require.NoError(t, legacy.PutAt(ctx, []byte("audit-floor"), []byte("x"), 10, 0))
 	coord := newLocalAdapterCoordinator(shards)
-	const readTS = 10
-	audit, err := runLegacyMetadataAudit(ctx, shards, 1, readTS, 8,
-		func(ctx context.Context, start, end []byte) (kv.GroupOwnedScanPage, error) {
-			return shards.ScanGroupOwnedPageAt(ctx, 1, start, end, legacyMetadataAuditPageSize, readTS)
-		})
+	tracker := kv.NewActiveTimestampTracker()
+	audit, err := NewLegacyMetadataAuditor(shards, coord, tracker).AuditLegacyMetadata(ctx, 1, 8)
 	require.NoError(t, err)
 	require.Equal(t, LegacyMetadataAuditComplete, audit.Status)
 	require.Len(t, audit.Passes, 4)
+	require.Zero(t, tracker.Oldest())
 
 	compactor := NewDeltaCompactor(shards, &legacyAuditNoWriteCoordinator{Coordinator: coord})
 	for _, handler := range compactor.ttlInlineMigrationHandlers() {
