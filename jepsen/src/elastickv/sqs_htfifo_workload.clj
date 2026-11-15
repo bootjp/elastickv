@@ -459,7 +459,7 @@
 
 (defn ht-fifo-checker
   "Custom Jepsen checker for the HT-FIFO contract. Returns
-   {:valid? bool :sent N :received N :lost #{...} :duplicates #{...}
+   {:valid? bool :sent N :received N :observed N :lost #{...} :duplicates #{...}
     :ordering-violations {...}}."
   []
   (reify checker/Checker
@@ -472,13 +472,17 @@
             ;; the trace predates raw observations. Never retrofit a pass.
             acknowledged (mapcat #(when (vector? (:value %)) (:value %)) recvs)
             received-tuples (set acknowledged)
-            lost (cset/difference committed received-tuples)
             dups (set (keep (fn [[tuple n]] (when (> n 1) tuple)) (frequencies acknowledged)))
             op-errors (keep (fn [op]
                               (when-let [reason (observation-error test op)]
                                 {:process (:process op) :index (:index op) :reason reason})) ops)
             {:keys [pending intervals errors]} (send-intervals history)
             deliveries (when (empty? op-errors) (vec (raw-deliveries ops)))
+            ;; A successful raw delivery proves receipt even if DeleteMessage
+            ;; fails or its reply is lost. Only successful deletes count toward
+            ;; duplicate acknowledged consumption; keep that diagnostic separate.
+            observed-tuples (into received-tuples (map :tuple deliveries))
+            lost (cset/difference committed observed-tuples)
             response-times (keep #(get-in % [:sqs-observation :received-at]) recvs)
             trace-errors (concat op-errors errors
                                  (when (seq pending) [:incomplete-send-invocation])
@@ -494,6 +498,7 @@
          :committed-sends     (count committed)
          :in-flight-sends     (count in-flight)
          :received            (count received-tuples)
+         :observed            (count observed-tuples)
          :lost                lost
          :duplicates          dups
          :raw-deliveries      (reduce + 0 (map #(let [v (get-in % [:sqs-observation :deliveries])]
