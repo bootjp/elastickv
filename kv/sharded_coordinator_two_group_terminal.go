@@ -9,10 +9,10 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-// DecideTwoGroup is a trusted, opt-in local-leader terminal path. Both data
+// decideTwoGroup is a trusted, opt-in local-leader terminal path. Both data
 // group leaders must be local; a remote leader leaves the transaction pending.
 // It does not install a public Forward route or relax the legacy terminal fence.
-func (c *ShardedCoordinator) DecideTwoGroup(ctx context.Context, manifest *pb.TwoGroupPrepareManifest, decision pb.Phase) error {
+func (c *ShardedCoordinator) decideTwoGroup(ctx context.Context, manifest *pb.TwoGroupPrepareManifest, decision pb.Phase) error {
 	primary, secondary, lookup, err := c.twoGroupDecisionInputs(manifest, decision)
 	if err != nil {
 		return err

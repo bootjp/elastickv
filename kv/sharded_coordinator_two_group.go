@@ -18,7 +18,7 @@ func (c *ShardedCoordinator) WithTwoGroupPrepareAdmission(lookup func(uint64) (T
 	c.twoGroupHomeLookup = lookup
 	for _, group := range c.groups {
 		if group != nil {
-			group.twoGroupTerminalResolver = c.DecideTwoGroup
+			group.twoGroupTerminalResolver = c.decideTwoGroup
 		}
 	}
 	return c

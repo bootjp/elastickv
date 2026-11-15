@@ -315,8 +315,8 @@ canonical manifest and the secondary leader's lookup observation. An enabled
 FSM checks its local group, protected entry identity, full manifest, local
 projection and observation, and atomically applies the exact embedded PREPARE
 with the binding and record. Its reserved command prefix cannot alias a bare
-legacy protobuf request. It rejects legacy PREPARE and, until terminal evidence
-exists, legacy COMMIT/ABORT at FSM apply. The opt-in coordinator
+legacy protobuf request. It rejects legacy PREPARE and COMMIT/ABORT at FSM
+apply. The opt-in coordinator
 derives the operation ID internally, proposes home first, reconciles an unknown
 home reply through the authenticated applied lookup, and term-fences the
 secondary proposal through a trusted PREPARE-only call. The path has a private
@@ -325,13 +325,19 @@ only the canonical manifest, and the destination leader constructs its own
 applied home observation before term-fenced proposal. The peer method is not
 publicly admitted, and the handler remains default-off in production. The
 trusted PREPARE entry is package-private rather than a capability exposed by
-startup coordinator wrappers. Normal
-Dispatch is fenced while this opt-in is configured, because legacy terminal
-COMMIT/ABORT cannot consume the new identity. Public Forward cannot supply an
-observation. The production all-member activation gate, terminal COMMIT/ABORT
-evidence, retention horizon, and mixed-version rollout tests
-remain open. Production must not install the opt-in coordinator lookup or
-enable the FSM command until those gates are satisfied.
+startup coordinator wrappers. A separate versioned terminal entry now records
+an immutable local COMMIT/ABORT decision with the binding, and a secondary
+COMMIT requires an applied primary decision observation. The local-leader
+coordinator reconciles a lost primary reply, and the lock resolver retains a
+prepared lock when the required decision or local leadership is unavailable.
+Remote-leader terminal proposals and their private peer route remain missing;
+the local terminal path is not production-ready. Normal Dispatch is fenced
+while this opt-in is configured, because legacy terminal COMMIT/ABORT cannot
+consume the new identity. Public Forward cannot supply an observation. The
+production all-member activation gate, remote terminal path, retention
+horizon, and mixed-version rollout tests remain open. Production must not
+install the opt-in coordinator lookup or enable the FSM command until those
+gates are satisfied.
 
 ## 5. Open questions
 

@@ -166,12 +166,12 @@ func TestTwoGroupCoordinatorReconcilesLostPrimaryDecisionReply(t *testing.T) {
 	manifest, _, err := coord.buildTwoGroupManifest(t.Context(), 10, 42, []byte("home-key"), grouped, []uint64{1, 2}, nil, 0, nil)
 	require.NoError(t, err)
 	homeEngine.lostReply = true
-	require.NoError(t, coord.DecideTwoGroup(t.Context(), manifest, pb.Phase_COMMIT))
+	require.NoError(t, coord.decideTwoGroup(t.Context(), manifest, pb.Phase_COMMIT))
 	for _, metadata := range []store.RaftControlMetadataStore{homeMetadata, secondaryMetadata} {
 		_, err := metadata.ReadRaftControlMetadata(t.Context(), twoGroupTerminalKey(twoGroupOperationID([]byte("home-key"), 10)))
 		require.NoError(t, err)
 	}
-	require.NoError(t, coord.DecideTwoGroup(t.Context(), manifest, pb.Phase_COMMIT))
+	require.NoError(t, coord.decideTwoGroup(t.Context(), manifest, pb.Phase_COMMIT))
 }
 
 func TestTwoGroupResolverRoutesThroughTerminalDecision(t *testing.T) {
@@ -271,7 +271,7 @@ func TestTwoGroupRemoteSecondaryLeaderKeepsPreparedLockPending(t *testing.T) {
 	manifest, _, err := coord.buildTwoGroupManifest(t.Context(), 10, 42, []byte("home-key"), grouped, []uint64{1, 2}, nil, 0, nil)
 	require.NoError(t, err)
 	groups[2].Engine = twoGroupFollowerEngine{secondaryEngine}
-	err = coord.DecideTwoGroup(t.Context(), manifest, pb.Phase_COMMIT)
+	err = coord.decideTwoGroup(t.Context(), manifest, pb.Phase_COMMIT)
 	require.ErrorIs(t, err, raftengine.ErrNotLeader)
 	id := twoGroupOperationID([]byte("home-key"), 10)
 	_, err = homeMetadata.ReadRaftControlMetadata(t.Context(), twoGroupTerminalKey(id))
