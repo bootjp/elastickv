@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -33,6 +34,82 @@ type auditPinObservingStore struct {
 	reads   int
 	readTS  uint64
 	failAt  int
+}
+
+type legacyAuditNoWriteCoordinator struct{ kv.Coordinator }
+
+func (*legacyAuditNoWriteCoordinator) IsLeaderForKey([]byte) bool { return false }
+
+type legacyAuditFollowerEngine struct{ raftengine.Engine }
+
+func (*legacyAuditFollowerEngine) State() raftengine.State { return raftengine.StateFollower }
+
+func (*legacyAuditFollowerEngine) Status() raftengine.Status {
+	return raftengine.Status{State: raftengine.StateFollower, Term: 1}
+}
+
+func TestLegacyMetadataAuditMatchesBackgroundPassOnSplitShardStore(t *testing.T) {
+	ctx := t.Context()
+	routes := distribution.NewEngine()
+	require.NoError(t, routes.ApplySnapshot(distribution.CatalogSnapshot{Version: 10, Routes: []distribution.RouteDescriptor{
+		{RouteID: 1, End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
+		{RouteID: 2, Start: []byte("m"), End: []byte("t"), GroupID: 2, State: distribution.RouteStateActive},
+		{RouteID: 3, Start: []byte("t"), End: []byte("x"), GroupID: 3, State: distribution.RouteStateActive},
+		{RouteID: 4, Start: []byte("x"), GroupID: 4, State: distribution.RouteStateActive,
+			StagedVisibilityActive: true, MigrationJobID: 9},
+	}}))
+	legacy := store.NewMVCCStore()
+	owner := store.NewMVCCStore()
+	shards := kv.NewShardStore(routes, map[uint64]*kv.ShardGroup{
+		1: {Store: legacy, Engine: &localCompactionReadEngine{}},
+		2: {Store: owner, Engine: &localCompactionReadEngine{}},
+		3: {Store: store.NewMVCCStore(), Engine: &legacyAuditFollowerEngine{}},
+		4: {Store: store.NewMVCCStore(), Engine: &localCompactionReadEngine{}},
+	})
+	families := []func([]byte) []byte{store.HashMetaKey, store.SetMetaKey, store.ZSetMetaKey, store.StreamMetaKey}
+	for _, keyFor := range families {
+		for _, userKey := range []string{"m-served", "n-shadowed", "u-remote", "z-staged"} {
+			require.NoError(t, legacy.PutAt(ctx, keyFor([]byte(userKey)), []byte("legacy"), 5, 0))
+		}
+		require.NoError(t, owner.PutAt(ctx, keyFor([]byte("n-shadowed")), []byte("new"), 6, 0))
+	}
+	// Nested metadata rows share the scan prefixes but are not base backlog.
+	require.NoError(t, legacy.PutAt(ctx, store.HashMetaDeltaKey([]byte("m-served"), 5, 0), []byte("delta"), 5, 0))
+	coord := newLocalAdapterCoordinator(shards)
+	const readTS = 10
+	audit, err := runLegacyMetadataAudit(ctx, shards, 1, readTS, 8,
+		func(ctx context.Context, start, end []byte) (kv.GroupOwnedScanPage, error) {
+			return shards.ScanGroupOwnedPageAt(ctx, 1, start, end, legacyMetadataAuditPageSize, readTS)
+		})
+	require.NoError(t, err)
+	require.Equal(t, LegacyMetadataAuditComplete, audit.Status)
+	require.Len(t, audit.Passes, 4)
+
+	compactor := NewDeltaCompactor(shards, &legacyAuditNoWriteCoordinator{Coordinator: coord})
+	for _, handler := range compactor.ttlInlineMigrationHandlers() {
+		if !isLegacyMetadataMigrationHandler(handler.typeName) {
+			continue
+		}
+		plan := ttlInlineMigrationScanPlan{
+			cursorName: ttlInlineMigrationGroupCursorName(handler.typeName, 1), groupID: 1, scanner: shards,
+		}
+		require.NoError(t, compactor.migrateTTLInlineScanPlan(ctx, handler, plan, audit.ReadTS, audit.Passes[0].StartedAt))
+	}
+	background, err := compactor.CompleteLegacyMetadataGroupPasses(ctx, 1)
+	require.NoError(t, err)
+	require.Len(t, background, 4)
+	for i, pass := range audit.Passes {
+		require.Equal(t, pass.Plan, background[i].Plan)
+		require.Equal(t, pass.CatalogVersion, background[i].CatalogVersion)
+		require.Equal(t, pass.LeaderTerm, background[i].LeaderTerm)
+		require.Equal(t, pass.Counts, background[i].Counts)
+		require.Equal(t, LegacyMetadataReasonCounts{Served: 1, OwnerHasVersion: 1}, pass.Counts[2])
+		require.Equal(t, LegacyMetadataReasonCounts{OwnerLedElsewhere: 1}, pass.Counts[3])
+		require.Equal(t, LegacyMetadataReasonCounts{StagedVisibility: 1}, pass.Counts[4])
+	}
+	value, err := legacy.GetAt(ctx, store.HashMetaKey([]byte("m-served")), audit.ReadTS)
+	require.NoError(t, err)
+	require.Equal(t, []byte("legacy"), value, "diagnostic scans must not rewrite physical legacy rows")
 }
 
 func (s *auditPinObservingStore) ScanAt(ctx context.Context, start, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
