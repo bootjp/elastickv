@@ -57,12 +57,19 @@ func (forwardConflictTxn) Abort(context.Context, []*pb.Request) (*kv.Transaction
 	return &kv.TransactionResponse{}, nil
 }
 
-type forwardAppliedConflictProposer struct{ index uint64 }
+type forwardAppliedConflictProposer struct {
+	index   uint64
+	failure error
+}
 
 func (p forwardAppliedConflictProposer) Propose(context.Context, []byte) (*raftengine.ProposalResult, error) {
+	failure := p.failure
+	if failure == nil {
+		failure = store.NewWriteConflictError([]byte("private-key"))
+	}
 	return &raftengine.ProposalResult{
 		CommitIndex: p.index,
-		Response:    store.NewWriteConflictError([]byte("private-key")),
+		Response:    failure,
 	}, nil
 }
 
@@ -102,6 +109,63 @@ func TestInternalForwardCertifiesOnlyIndexedOnePhaseApplyConflict(t *testing.T) 
 	}
 }
 
+func TestInternalForwardCertifiesOnlyIndexedOnePhaseApplyFence(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		phase    pb.Phase
+		index    uint64
+		decision pb.ForwardDecisionClass
+	}{
+		{name: "one phase applied", phase: pb.Phase_NONE, index: 7, decision: pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_DEFINITIVELY_ABORTED},
+		{name: "missing apply index", phase: pb.Phase_NONE, decision: pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN},
+		{name: "prepare participant", phase: pb.Phase_PREPARE, index: 7, decision: pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			txn := kv.NewTransactionWithProposer(forwardAppliedConflictProposer{
+				index: tc.index, failure: errors.Wrap(kv.ErrRouteWriteFenced, "private-key"),
+			})
+			t.Cleanup(txn.Close)
+			internal := NewInternalWithEngine(txn, forwardObserverLeader{}, nil, nil)
+			req := &pb.Request{IsTxn: true, Phase: tc.phase, Mutations: []*pb.Mutation{
+				{Op: pb.Op_PUT, Key: []byte(kv.TxnMetaPrefix), Value: kv.EncodeTxnMeta(kv.TxnMeta{PrimaryKey: []byte("k")})},
+				{Op: pb.Op_PUT, Key: []byte("k"), Value: []byte("v")},
+			}}
+			_, err := internal.Forward(t.Context(), &pb.ForwardRequest{IsTxn: true, Requests: []*pb.Request{req}})
+			require.Error(t, err)
+			phase, ok := kv.ForwardFailurePhaseForRequests([]*pb.Request{req})
+			require.True(t, ok)
+			reason, decision, ok := kv.DecodeForwardDecisionStatus(err, phase)
+			require.True(t, ok)
+			require.Equal(t, pb.ForwardFailureReason_FORWARD_FAILURE_REASON_FENCE, reason)
+			require.Equal(t, tc.decision, decision)
+			require.NotContains(t, err.Error(), "private-key")
+		})
+	}
+}
+
+func TestInternalForwardMixedFenceEvidenceStaysUnknown(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		cause  error
+		reason pb.ForwardFailureReason
+	}{
+		{cause: errors.Join(kv.ErrRouteWriteFenced, store.ErrWriteConflict), reason: pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CONFLICT},
+		{cause: errors.Join(kv.ErrRouteWriteFenced, kv.ErrTransactionOutcomeUnknown), reason: pb.ForwardFailureReason_FORWARD_FAILURE_REASON_FENCE},
+	} {
+		txn := kv.NewTransactionWithProposer(forwardAppliedConflictProposer{index: 7, failure: tc.cause})
+		t.Cleanup(txn.Close)
+		internal := NewInternalWithEngine(txn, forwardObserverLeader{}, nil, nil)
+		_, err := internal.Forward(t.Context(), &pb.ForwardRequest{Requests: []*pb.Request{{
+			Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("k"), Value: []byte("v")}},
+		}}})
+		require.Error(t, err)
+		reason, decision, ok := kv.DecodeForwardDecisionStatus(err, pb.ForwardFailurePhase_FORWARD_FAILURE_PHASE_ONE_PHASE_APPLY)
+		require.True(t, ok)
+		require.Equal(t, tc.reason, reason)
+		require.Equal(t, pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN, decision)
+	}
+}
+
 func TestInternalForwardAppliedConflictStatusSurvivesGRPC(t *testing.T) {
 	txn := kv.NewTransactionWithProposer(forwardAppliedConflictProposer{index: 7})
 	t.Cleanup(txn.Close)
@@ -128,6 +192,38 @@ func TestInternalForwardAppliedConflictStatusSurvivesGRPC(t *testing.T) {
 	reason, decision, ok := kv.DecodeForwardDecisionStatus(err, pb.ForwardFailurePhase_FORWARD_FAILURE_PHASE_ONE_PHASE_APPLY)
 	require.True(t, ok)
 	require.Equal(t, pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CONFLICT, reason)
+	require.Equal(t, pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_DEFINITIVELY_ABORTED, decision)
+	require.NotContains(t, err.Error(), "private-key")
+}
+
+func TestInternalForwardAppliedFenceStatusSurvivesGRPC(t *testing.T) {
+	txn := kv.NewTransactionWithProposer(forwardAppliedConflictProposer{
+		index: 7, failure: errors.Wrap(kv.ErrRouteWriteFenced, "private-key"),
+	})
+	t.Cleanup(txn.Close)
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	server := grpc.NewServer()
+	pb.RegisterInternalServer(server, NewInternalWithEngine(txn, forwardObserverLeader{}, nil, nil))
+	go func() { _ = server.Serve(lis) }()
+	t.Cleanup(func() {
+		server.Stop()
+		_ = lis.Close()
+	})
+	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	_, err = pb.NewInternalClient(conn).Forward(t.Context(), &pb.ForwardRequest{IsTxn: true, Requests: []*pb.Request{{
+		IsTxn: true, Phase: pb.Phase_NONE, Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(kv.TxnMetaPrefix), Value: kv.EncodeTxnMeta(kv.TxnMeta{PrimaryKey: []byte("k")})},
+			{Op: pb.Op_PUT, Key: []byte("k"), Value: []byte("v")},
+		},
+	}}})
+	require.Error(t, err)
+	require.Equal(t, codes.Aborted, status.Code(err))
+	reason, decision, ok := kv.DecodeForwardDecisionStatus(err, pb.ForwardFailurePhase_FORWARD_FAILURE_PHASE_ONE_PHASE_APPLY)
+	require.True(t, ok)
+	require.Equal(t, pb.ForwardFailureReason_FORWARD_FAILURE_REASON_FENCE, reason)
 	require.Equal(t, pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_DEFINITIVELY_ABORTED, decision)
 	require.NotContains(t, err.Error(), "private-key")
 }

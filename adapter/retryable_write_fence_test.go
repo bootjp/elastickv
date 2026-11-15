@@ -1,15 +1,48 @@
 package adapter
 
 import (
+	"context"
 	"testing"
 
 	"github.com/bootjp/elastickv/kv"
+	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
+
+func TestRedisRetriesOnlyTypedOnePhaseFence(t *testing.T) {
+	t.Parallel()
+	attempts := 0
+	err := (&RedisServer{}).retryRedisWrite(context.Background(), func() error {
+		attempts++
+		if attempts == 1 {
+			return errors.WithStack(kv.ErrRouteWriteFenced)
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	require.Equal(t, 2, attempts)
+
+	for _, unproven := range []error{
+		&kv.ForwardFailure{Decision: pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN,
+			Reason: pb.ForwardFailureReason_FORWARD_FAILURE_REASON_FENCE},
+		kv.ForwardDecisionStatus(pb.ForwardFailurePhase_FORWARD_FAILURE_PHASE_ONE_PHASE_APPLY,
+			pb.ForwardFailureReason_FORWARD_FAILURE_REASON_FENCE,
+			pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_DEFINITIVELY_ABORTED),
+	} {
+		attempts = 0
+		err := (&RedisServer{}).retryRedisWrite(context.Background(), func() error {
+			attempts++
+			return unproven
+		})
+		require.Equal(t, 1, attempts)
+		require.ErrorIs(t, err, kv.ErrTransactionOutcomeUnknown)
+		require.False(t, isRouteWriteFencedError(unproven))
+	}
+}
 
 func TestWriteFenceErrorsAreAdapterRetryable(t *testing.T) {
 	t.Parallel()

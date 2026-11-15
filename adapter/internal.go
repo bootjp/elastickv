@@ -295,11 +295,17 @@ func forwardCommitStatus(reqs []*pb.Request, err error) error {
 	var rejected *kv.AppliedRequestRejection
 	// Only an indexed, terminal one-phase apply verdict proves this attempt
 	// had no effect. The receiver must separately rule out earlier attempts.
+	conflict := errors.Is(err, store.ErrWriteConflict)
+	fence := errors.Is(err, kv.ErrRouteWriteFenced)
 	if ok && phase == pb.ForwardFailurePhase_FORWARD_FAILURE_PHASE_ONE_PHASE_APPLY &&
 		!errors.Is(err, kv.ErrTransactionOutcomeUnknown) && errors.As(err, &rejected) &&
-		rejected.CommitIndex() != 0 && errors.Is(err, store.ErrWriteConflict) {
+		rejected.CommitIndex() != 0 && conflict != fence {
+		reason := pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CONFLICT
+		if fence {
+			reason = pb.ForwardFailureReason_FORWARD_FAILURE_REASON_FENCE
+		}
 		return &forwardWireFailure{
-			wire: kv.ForwardDecisionStatus(phase, pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CONFLICT,
+			wire: kv.ForwardDecisionStatus(phase, reason,
 				pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_DEFINITIVELY_ABORTED),
 			cause: err,
 		}

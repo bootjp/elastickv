@@ -425,6 +425,24 @@ func TestLeaderProxy_LostResponseCannotBeReclassifiedByLaterConflict(t *testing.
 	require.Equal(t, 1, svc.callCount(), "an uncertain earlier submission cannot be cleared by a later rejection")
 }
 
+func TestLeaderProxy_LostResponseCannotBeReclassifiedByLaterFence(t *testing.T) {
+	t.Parallel()
+	svc := &fakeInternal{
+		err: status.Error(codes.Unavailable, "response lost after submission"), failFor: 1,
+		nextErr: ForwardDecisionStatus(pb.ForwardFailurePhase_FORWARD_FAILURE_PHASE_ONE_PHASE_APPLY,
+			pb.ForwardFailureReason_FORWARD_FAILURE_REASON_FENCE,
+			pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_DEFINITIVELY_ABORTED),
+	}
+	addr := grpctest.Serve(t, func(srv *grpc.Server) { pb.RegisterInternalServer(srv, svc) })
+	p := NewLeaderProxyWithEngine(newStubFollowerEngine(addr))
+	t.Cleanup(func() { _ = p.connCache.Close() })
+
+	_, err := p.Commit(context.Background(), []*pb.Request{{IsTxn: true, Phase: pb.Phase_NONE}})
+	require.ErrorIs(t, err, ErrTransactionOutcomeUnknown)
+	require.NotErrorIs(t, err, ErrRouteWriteFenced)
+	require.Equal(t, 1, svc.callCount())
+}
+
 func TestForwardDecisionEvidence(t *testing.T) {
 	t.Parallel()
 	for _, wire := range []error{
@@ -569,6 +587,31 @@ func TestClassifyForwardIndexedOnePhaseConflict(t *testing.T) {
 	}
 }
 
+func TestClassifyForwardIndexedOnePhaseFence(t *testing.T) {
+	t.Parallel()
+	proof := ForwardDecisionStatus(pb.ForwardFailurePhase_FORWARD_FAILURE_PHASE_ONE_PHASE_APPLY,
+		pb.ForwardFailureReason_FORWARD_FAILURE_REASON_FENCE,
+		pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_DEFINITIVELY_ABORTED)
+	err := classifyForwardRPCError(proof, []*pb.Request{{IsTxn: true, Phase: pb.Phase_NONE}})
+	require.ErrorIs(t, err, ErrRouteWriteFenced)
+	require.NotErrorIs(t, err, ErrTransactionOutcomeUnknown)
+	require.True(t, isTerminalForwardError(err))
+
+	for _, phase := range []pb.Phase{pb.Phase_PREPARE, pb.Phase_COMMIT, pb.Phase_ABORT} {
+		err := classifyForwardRPCError(proof, []*pb.Request{{IsTxn: true, Phase: phase}})
+		require.ErrorIs(t, err, ErrTransactionOutcomeUnknown)
+		require.NotErrorIs(t, err, ErrRouteWriteFenced)
+	}
+	for _, wire := range []error{
+		status.Error(codes.Aborted, "private-key: "+ErrRouteWriteFenced.Error()),
+		ForwardWriteConflictStatus(),
+	} {
+		err := classifyForwardRPCError(wire, []*pb.Request{{IsTxn: true, Phase: pb.Phase_NONE}})
+		require.ErrorIs(t, err, ErrTransactionOutcomeUnknown)
+		require.NotErrorIs(t, err, ErrRouteWriteFenced)
+	}
+}
+
 func TestLeaderProxy_AppliedOnePhaseConflictUsesDecisionDetail(t *testing.T) {
 	t.Parallel()
 	svc := &fakeInternal{err: ForwardDecisionStatus(
@@ -582,6 +625,23 @@ func TestLeaderProxy_AppliedOnePhaseConflictUsesDecisionDetail(t *testing.T) {
 
 	_, err := p.Commit(context.Background(), []*pb.Request{{IsTxn: true, Phase: pb.Phase_NONE}})
 	require.ErrorIs(t, err, store.ErrWriteConflict)
+	require.NotErrorIs(t, err, ErrTransactionOutcomeUnknown)
+	require.Equal(t, 1, svc.callCount())
+}
+
+func TestLeaderProxy_AppliedOnePhaseFenceUsesDecisionDetail(t *testing.T) {
+	t.Parallel()
+	svc := &fakeInternal{err: ForwardDecisionStatus(
+		pb.ForwardFailurePhase_FORWARD_FAILURE_PHASE_ONE_PHASE_APPLY,
+		pb.ForwardFailureReason_FORWARD_FAILURE_REASON_FENCE,
+		pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_DEFINITIVELY_ABORTED,
+	)}
+	addr := grpctest.Serve(t, func(srv *grpc.Server) { pb.RegisterInternalServer(srv, svc) })
+	p := NewLeaderProxyWithEngine(newStubFollowerEngine(addr))
+	t.Cleanup(func() { _ = p.connCache.Close() })
+
+	_, err := p.Commit(context.Background(), []*pb.Request{{IsTxn: true, Phase: pb.Phase_NONE}})
+	require.ErrorIs(t, err, ErrRouteWriteFenced)
 	require.NotErrorIs(t, err, ErrTransactionOutcomeUnknown)
 	require.Equal(t, 1, svc.callCount())
 }

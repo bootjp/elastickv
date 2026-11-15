@@ -112,8 +112,8 @@ func (r *RedisServer) retryRedisWrite(ctx context.Context, fn func() error) erro
 		if err == nil {
 			return nil
 		}
-		// Only local typed rejections are retryable. An ErrorInfo status does
-		// not carry phase or decision proof, even when it names a conflict.
+		// Only typed local or authenticated Forward rejections are retryable.
+		// A raw wire status does not prove that the operation did not commit.
 		retryable := isRetryableRedisTxnErr(err)
 		err = normalizeRetryableRedisTxnErr(err)
 		if !retryable {
