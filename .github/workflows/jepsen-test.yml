@@ -41,6 +41,7 @@ jobs:
         run: |
           packages=()
           command -v nc >/dev/null || packages+=(netcat-openbsd)
+          command -v jq >/dev/null || packages+=(jq)
           command -v fusermount3 >/dev/null || packages+=(fuse3)
           command -v sqlite3 >/dev/null || packages+=(sqlite3)
           command -v strace >/dev/null || packages+=(strace)
@@ -100,80 +101,7 @@ jobs:
       - name: Test Jepsen evidence archiving
         run: bash scripts/test-archive-jepsen-store.sh
       - name: Launch etcd-backed cluster
-        run: |
-          set -euo pipefail
-          mkdir -p /tmp/elastickv-ci
-          BOOTSTRAP_MEMBERS="n1=127.0.0.1:50051,n2=127.0.0.1:50052,n3=127.0.0.1:50053"
-          RAFT_REDIS_MAP="127.0.0.1:50051=127.0.0.1:63791,127.0.0.1:50052=127.0.0.1:63792,127.0.0.1:50053=127.0.0.1:63793"
-          RAFT_S3_MAP="127.0.0.1:50051=127.0.0.1:63901,127.0.0.1:50052=127.0.0.1:63902,127.0.0.1:50053=127.0.0.1:63903"
-          # No raftDynamoMap: DynamoDB workloads must exercise follower gRPC
-          # forwarding and leader-issued seals instead of HTTP leader proxying.
-          RAFT_SQS_MAP="127.0.0.1:50051=127.0.0.1:63501,127.0.0.1:50052=127.0.0.1:63502,127.0.0.1:50053=127.0.0.1:63503"
-
-          # Encrypted leg: one random owner-only file KEK shared by the
-          # three nodes; the cutover runs in the next step once the
-          # cluster is up. Node data dirs must exist before start-up so
-          # the sidecar path's directory is writable.
-          ENC_ARGS=()
-          if [ "${{ matrix.encryption }}" = "on" ]; then
-            head -c 32 /dev/urandom > /tmp/elastickv-ci/kek.bin
-            chmod 600 /tmp/elastickv-ci/kek.bin
-          fi
-
-          : > /tmp/elastickv-demo.pid
-          for node in 1 2 3; do
-            if [ "${{ matrix.encryption }}" = "on" ]; then
-              mkdir -p "/tmp/elastickv-ci/n${node}"
-              ENC_ARGS=(--encryption-enabled --kekFile /tmp/elastickv-ci/kek.bin \
-                        --encryptionSidecarPath "/tmp/elastickv-ci/n${node}/keys.json")
-            fi
-            # Every node mounts the shared filesystem so the filesystem
-            # workload can drive leader and follower mounts alike. The root
-            # directory is owned by the runner user: the mount enforces
-            # default_permissions, so a root-owned root would reject the
-            # workload's mkdir.
-            mkdir -p "/tmp/elastickv-ci/fs-n${node}"
-            nohup /tmp/elastickv-bin \
-              --address "127.0.0.1:5005${node}" \
-              --redisAddress "127.0.0.1:6379${node}" \
-              --dynamoAddress "127.0.0.1:6380${node}" \
-              --s3Address "127.0.0.1:6390${node}" \
-              --sqsAddress "127.0.0.1:6350${node}" \
-              --filesystemMount "/tmp/elastickv-ci/fs-n${node}" \
-              --filesystemRootUID "$(id -u)" \
-              --filesystemRootGID "$(id -g)" \
-              --metricsAddress "" \
-              --pprofAddress "" \
-              --raftId "n${node}" \
-              --raftDataDir "/tmp/elastickv-ci/n${node}" \
-              --raftBootstrapMembers "$BOOTSTRAP_MEMBERS" \
-              --raftRedisMap "$RAFT_REDIS_MAP" \
-              --raftS3Map "$RAFT_S3_MAP" \
-              --raftSqsMap "$RAFT_SQS_MAP" \
-              "${ENC_ARGS[@]}" \
-              > "/tmp/elastickv-demo-n${node}.log" 2>&1 &
-            echo $! >> /tmp/elastickv-demo.pid
-          done
-
-          echo "Waiting for redis (63791-63793), dynamo (63801-63803), s3 (63901-63903), sqs (63501-63503) listeners and FUSE mounts..."
-          for _ in {1..90}; do
-            if nc -z 127.0.0.1 63791 && nc -z 127.0.0.1 63792 && nc -z 127.0.0.1 63793 \
-              && nc -z 127.0.0.1 63801 && nc -z 127.0.0.1 63802 && nc -z 127.0.0.1 63803 \
-              && nc -z 127.0.0.1 63901 && nc -z 127.0.0.1 63902 && nc -z 127.0.0.1 63903 \
-              && nc -z 127.0.0.1 63501 && nc -z 127.0.0.1 63502 && nc -z 127.0.0.1 63503 \
-              && mountpoint -q /tmp/elastickv-ci/fs-n1 && mountpoint -q /tmp/elastickv-ci/fs-n2 \
-              && mountpoint -q /tmp/elastickv-ci/fs-n3; then
-              echo "Cluster is up"
-              exit 0
-            fi
-            sleep 1
-          done
-
-          echo "Demo cluster failed to start; dumping log:"
-          tail -n 200 /tmp/elastickv-demo-n1.log || true
-          tail -n 200 /tmp/elastickv-demo-n2.log || true
-          tail -n 200 /tmp/elastickv-demo-n3.log || true
-          exit 1
+        run: bash scripts/ci-jepsen-start-cluster.sh "${{ matrix.encryption }}"
       - name: Enable data-at-rest encryption on the cluster
         if: matrix.encryption == 'on'
         # Bootstrap the DEK pair, then flip the storage and raft envelope
@@ -222,6 +150,53 @@ jobs:
             /tmp/dynamodb-seal-source.txt
           retention-days: 7
           if-no-files-found: ignore
+      - name: Capture DynamoDB seal data and compacted snapshots
+        timeout-minutes: 4
+        run: bash scripts/ci-dynamodb-seal-restart-check.sh capture "${{ matrix.encryption }}"
+      - name: Restart all nodes from their compacted data directories
+        timeout-minutes: 4
+        env:
+          ENCRYPTION_MODE: ${{ matrix.encryption }}
+        run: |
+          set -euo pipefail
+          while read -r pid; do
+            kill -TERM "$pid"
+          done < /tmp/elastickv-demo.pid
+          for _ in {1..90}; do
+            alive=false
+            while read -r pid; do
+              state=$(ps -o stat= -p "$pid" | tr -d ' ' || true)
+              if [[ -n $state && $state != Z* ]]; then alive=true; fi
+            done < /tmp/elastickv-demo.pid
+            if [[ $alive == false ]]; then break; fi
+            sleep 1
+          done
+          if [[ $alive == true ]]; then
+            echo 'A node did not stop before snapshot restart' >&2
+            exit 1
+          fi
+          for node in 1 2 3; do
+            if mountpoint -q "/tmp/elastickv-ci/fs-n${node}"; then
+              echo "node $node left a FUSE mount after shutdown" >&2
+              exit 1
+            fi
+          done
+          bash scripts/ci-jepsen-start-cluster.sh "$ENCRYPTION_MODE" restart
+      - name: Verify DynamoDB seal data after snapshot restart
+        timeout-minutes: 5
+        run: bash scripts/ci-dynamodb-seal-restart-check.sh verify
+      - name: Upload DynamoDB seal snapshot restart evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: dynamodb-seal-restart-encryption-${{ matrix.encryption }}
+          path: |
+            /tmp/elastickv-ci/dynamodb-seal-snapshot-indexes.txt
+            /tmp/elastickv-ci/dynamodb-seal-before.jsonl
+            /tmp/elastickv-ci/dynamodb-seal-after-n*.jsonl
+            /tmp/dynamodb-seal-source.txt
+          retention-days: 14
+          if-no-files-found: warn
       - name: Run DynamoDB per-type Jepsen workloads against elastickv
         working-directory: jepsen
         timeout-minutes: 10
