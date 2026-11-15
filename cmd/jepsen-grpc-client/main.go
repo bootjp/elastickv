@@ -49,7 +49,7 @@ type rpcClient struct {
 
 func (c rpcClient) read(ctx context.Context, key []byte) ([]byte, error) {
 	if c.api == apiRaw {
-		result, err := c.raw.RawGet(ctx, &pb.RawGetRequest{Key: key})
+		result, err := c.raw.RawGet(ctx, &pb.RawGetRequest{Key: key}, grpc.WaitForReady(true))
 		if err != nil {
 			return nil, fmt.Errorf("read register: %w", err)
 		}
@@ -61,7 +61,7 @@ func (c rpcClient) read(ctx context.Context, key []byte) ([]byte, error) {
 		}
 		return result.GetValue(), nil
 	}
-	result, err := c.txn.Get(ctx, &pb.GetRequest{Key: key})
+	result, err := c.txn.Get(ctx, &pb.GetRequest{Key: key}, grpc.WaitForReady(true))
 	if err != nil {
 		return nil, fmt.Errorf("read register: %w", err)
 	}

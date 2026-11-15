@@ -349,7 +349,8 @@ jobs:
           done
           source ./s3_budget.sh
           s3_budget "$GRPC_KEYS" "$GRPC_WRITES"
-          timeout 600 ~/lein run -m elastickv.grpc-workload --local --host 127.0.0.1 \
+          GRPC_TIMEOUT=$((GRPC_TIME_LIMIT + 900))
+          timeout "$GRPC_TIMEOUT" ~/lein run -m elastickv.grpc-workload --local --host 127.0.0.1 \
             --grpc-ports 50051,50052,50053 --grpc-api "${WORKLOAD#grpc-}" \
             --time-limit "$GRPC_TIME_LIMIT" --rate "$GRPC_RATE" \
             --concurrency 6 --key-count "$S3_KEY_COUNT" --max-writes-per-key "$S3_MAX_OPS_PER_KEY"

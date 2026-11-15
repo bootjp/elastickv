@@ -218,7 +218,7 @@
                    (or (not (register-adapter? adapter)) (even? (:concurrency opts)))
                    (or (not (queue-adapter? adapter)) (>= (or (:drain-time opts) 40) 40))
                    (> (:time-limit opts) minimum-time))
-      (throw (ex-info "Require 3 managed nodes, one of partition/kill/pause, positive intervals and keys, concurrency divisible by 3, repeat-faults for multiple cycles, and time-limit > (1 + 6 * min-fault-cycles) * fault-interval"
+      (throw (ex-info "Require 3 managed nodes, one of partition/kill/pause, positive intervals and keys, concurrency divisible by 3 (and even for register adapters), repeat-faults for multiple cycles, and time-limit > (1 + 6 * min-fault-cycles) * fault-interval"
                       {:options opts})))
     (let [{:keys [workload port db-port grpc-api write-mode]} (adapters adapter)
           grpc-port (or (:grpc-port opts) 50051)
