@@ -41,6 +41,12 @@ func (s *AdminServer) AuditRedisLegacyMetadata(ctx context.Context,
 	}
 	result, err := source.AuditLegacyMetadata(ctx, req.GetGroupId(), req.GetMaxPages())
 	if err != nil {
+		if errors.Is(err, ErrLegacyMetadataAuditBusy) {
+			return nil, errors.WithStack(status.Error(codes.ResourceExhausted, "legacy metadata audit already running"))
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			return nil, errors.WithStack(status.Error(codes.DeadlineExceeded, "legacy metadata audit timed out"))
+		}
 		return nil, errors.WithStack(status.Errorf(codes.FailedPrecondition, "legacy metadata audit failed: %v", err))
 	}
 	if !validLegacyAuditHeader(req.GetGroupId(), result) {

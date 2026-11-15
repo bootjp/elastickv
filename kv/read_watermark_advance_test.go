@@ -106,6 +106,30 @@ func TestShardStoreSnapshotReadAdvancesLaggingGroupWatermark(t *testing.T) {
 	require.NoError(t, f.onePhase(t, 2, s, 40, "b-k", "old+1", "b-k"))
 }
 
+func TestLegacyMetadataDiagnosticPageAdvancesLaggingGroupWatermark(t *testing.T) {
+	t.Parallel()
+	f := newTwoGroupReadFixture(t)
+	require.NoError(t, f.shards.engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 2,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: []byte("m"), GroupID: 2, State: distribution.RouteStateActive},
+		},
+	}))
+	key := store.HashMetaKey([]byte("zebra"))
+	require.NoError(t, f.stores[1].PutAt(t.Context(), key, []byte("legacy"), 5, 0))
+	require.NoError(t, f.onePhase(t, 2, 10, 30, "m-watermark", "x"))
+	require.Less(t, f.stores[1].LastCommitTS(), uint64(30))
+
+	page, err := f.shards.ScanGroupOwnedPageAt(t.Context(), 1, []byte(store.HashMetaPrefix),
+		store.PrefixScanEnd([]byte(store.HashMetaPrefix)), 10, 30)
+	require.NoError(t, err)
+	require.Len(t, page.LegacyRows, 1)
+	require.GreaterOrEqual(t, f.stores[1].LastCommitTS(), uint64(30),
+		"diagnostic scans must fence late writes before reading the page")
+	require.ErrorIs(t, f.onePhase(t, 1, 10, 20, "a-late", "new"), store.ErrWriteConflict)
+}
+
 func TestAdvanceReadWatermarkForGroupReturnsLocalApplyReceipt(t *testing.T) {
 	t.Parallel()
 	f := newTwoGroupReadFixture(t)

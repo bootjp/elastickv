@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"net"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -34,6 +36,73 @@ type auditPinObservingStore struct {
 	reads   int
 	readTS  uint64
 	failAt  int
+}
+
+type auditBlockingStore struct {
+	store.MVCCStore
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (s *auditBlockingStore) ScanAt(ctx context.Context, start, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
+	s.once.Do(func() { close(s.entered) })
+	select {
+	case <-s.release:
+		return s.MVCCStore.ScanAt(ctx, start, end, limit, ts)
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func newBlockingLegacyMetadataAuditor(t *testing.T) (*LegacyMetadataAuditor, *auditBlockingStore, *kv.ActiveTimestampTracker) {
+	t.Helper()
+	st := &auditBlockingStore{MVCCStore: store.NewMVCCStore(), entered: make(chan struct{}), release: make(chan struct{})}
+	require.NoError(t, st.PutAt(t.Context(), store.HashMetaKey([]byte("apple")), []byte("legacy"), 5, 0))
+	routes := distribution.NewEngine()
+	routes.UpdateRoute(nil, nil, 1)
+	shards := kv.NewShardStore(routes, map[uint64]*kv.ShardGroup{
+		1: {Store: st, Engine: &localCompactionReadEngine{}},
+	})
+	tracker := kv.NewActiveTimestampTracker()
+	return NewLegacyMetadataAuditor(shards, newLocalAdapterCoordinator(shards), tracker), st, tracker
+}
+
+func TestLegacyMetadataAuditorBoundsConcurrentRuns(t *testing.T) {
+	auditor, st, tracker := newBlockingLegacyMetadataAuditor(t)
+	first := make(chan error, 1)
+	go func() {
+		_, err := auditor.AuditLegacyMetadata(t.Context(), 1, 8)
+		first <- err
+	}()
+	select {
+	case <-st.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first audit did not reach the physical scan")
+	}
+	_, err := auditor.AuditLegacyMetadata(t.Context(), 1, 8)
+	require.ErrorIs(t, err, ErrLegacyMetadataAuditBusy)
+	require.NotZero(t, tracker.Oldest())
+	close(st.release)
+	require.NoError(t, <-first)
+	require.Zero(t, tracker.Oldest())
+	_, err = auditor.AuditLegacyMetadata(t.Context(), 1, legacyMetadataAuditMaxPages+1)
+	require.Error(t, err, "direct callers must obey the same page budget as the RPC")
+}
+
+func TestLegacyMetadataAuditorReleasesPinAtServerDeadline(t *testing.T) {
+	auditor, st, tracker := newBlockingLegacyMetadataAuditor(t)
+	auditor.timeout = 250 * time.Millisecond
+	result, err := auditor.AuditLegacyMetadata(t.Context(), 1, 8)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	select {
+	case <-st.entered:
+	default:
+		t.Fatal("audit deadline fired before the physical scan")
+	}
+	require.Empty(t, result.Passes)
+	require.Zero(t, tracker.Oldest())
+	close(st.release)
 }
 
 type legacyAuditNoWriteCoordinator struct{ kv.Coordinator }
@@ -251,10 +320,28 @@ func TestLegacyMetadataAuditReadFailureDoesNotReturnZero(t *testing.T) {
 	require.Empty(t, result.Passes)
 }
 
-type auditSourceStub struct{ result LegacyMetadataAuditResult }
+type auditSourceStub struct {
+	result LegacyMetadataAuditResult
+	err    error
+}
 
 func (s auditSourceStub) AuditLegacyMetadata(context.Context, uint64, uint32) (LegacyMetadataAuditResult, error) {
-	return s.result, nil
+	return s.result, s.err
+}
+
+func TestLegacyMetadataAuditAdminMapsResourceLimits(t *testing.T) {
+	srv := NewAdminServer(NodeIdentity{}, nil)
+	for _, tc := range []struct {
+		err  error
+		want codes.Code
+	}{
+		{ErrLegacyMetadataAuditBusy, codes.ResourceExhausted},
+		{context.DeadlineExceeded, codes.DeadlineExceeded},
+	} {
+		srv.RegisterLegacyMetadataAuditSource(auditSourceStub{err: tc.err})
+		_, err := srv.AuditRedisLegacyMetadata(t.Context(), &pb.AuditRedisLegacyMetadataRequest{GroupId: 1})
+		require.Equal(t, tc.want, status.Code(err))
+	}
 }
 
 func TestLegacyMetadataAuditAdminBearerAndIncompleteProtocol(t *testing.T) {

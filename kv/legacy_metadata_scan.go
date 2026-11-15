@@ -123,6 +123,9 @@ func (s *ShardStore) groupOwnedPageSource(ctx context.Context, groupID uint64, l
 }
 
 func (s *ShardStore) scanGroupOwnedLocalPage(ctx context.Context, groupID uint64, g *ShardGroup, start, end []byte, limit int, ts uint64) (scanRoutePage, error) {
+	if err := s.ensureReadWatermark(ctx, g, ts); err != nil {
+		return scanRoutePage{}, err
+	}
 	route := distribution.Route{GroupID: groupID}
 	if engineForGroup(g) == nil {
 		return s.scanRouteAtForwardLocalPage(ctx, g, route, start, end, limit, ts)

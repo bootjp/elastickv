@@ -13,8 +13,11 @@ import (
 const (
 	legacyMetadataAuditPageSize     = 512
 	legacyMetadataAuditDefaultPages = 1024
-	legacyMetadataAuditMaxPages     = 65536
+	legacyMetadataAuditMaxPages     = 4096
+	legacyMetadataAuditTimeout      = 2 * time.Minute
 )
+
+var ErrLegacyMetadataAuditBusy = errors.New("legacy metadata audit already running")
 
 type LegacyMetadataAuditStatus uint8
 
@@ -47,19 +50,36 @@ type legacyMetadataAuditScanner interface {
 // LegacyMetadataAuditor reads only the local group's physical metadata ranges.
 // Latest creates one admitted snapshot and keeps its read pin until Close.
 type LegacyMetadataAuditor struct {
-	store   *kv.ShardStore
-	coord   kv.Coordinator
-	tracker *kv.ActiveTimestampTracker
+	store    *kv.ShardStore
+	coord    kv.Coordinator
+	tracker  *kv.ActiveTimestampTracker
+	inflight chan struct{}
+	timeout  time.Duration
 }
 
 func NewLegacyMetadataAuditor(st *kv.ShardStore, coord kv.Coordinator, tracker *kv.ActiveTimestampTracker) *LegacyMetadataAuditor {
-	return &LegacyMetadataAuditor{store: st, coord: coord, tracker: tracker}
+	return &LegacyMetadataAuditor{store: st, coord: coord, tracker: tracker,
+		inflight: make(chan struct{}, 1), timeout: legacyMetadataAuditTimeout}
 }
 
 func (a *LegacyMetadataAuditor) AuditLegacyMetadata(ctx context.Context, groupID uint64, maxPages uint32) (LegacyMetadataAuditResult, error) {
 	if a == nil || a.store == nil || a.coord == nil || a.tracker == nil {
 		return LegacyMetadataAuditResult{}, errors.New("legacy metadata audit is unavailable")
 	}
+	if maxPages > legacyMetadataAuditMaxPages {
+		return LegacyMetadataAuditResult{}, errors.New("legacy metadata audit page budget exceeded")
+	}
+	if err := ctx.Err(); err != nil {
+		return LegacyMetadataAuditResult{}, errors.WithStack(err)
+	}
+	select {
+	case a.inflight <- struct{}{}:
+		defer func() { <-a.inflight }()
+	default:
+		return LegacyMetadataAuditResult{}, errors.WithStack(ErrLegacyMetadataAuditBusy)
+	}
+	ctx, cancel := context.WithTimeout(ctx, a.timeout)
+	defer cancel()
 	request := kv.NewReadRequest(ctx, a.coord, a.store, a.tracker)
 	defer request.Close()
 	snapshot, err := request.LatestTargets(request.Context(), "legacy metadata audit", []kv.ReadFenceTarget{{GroupID: groupID}})
