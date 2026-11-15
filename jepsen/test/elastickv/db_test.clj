@@ -200,9 +200,8 @@
                                  :filesystem-mount "/mount" :filesystem-strict true})))
         (is (= [:unmount :start] @events))))))
 
-(deftest strict-filesystem-starts-enable-journal-and-stopped-owner-recovery
-  (doseq [strict? [false true]
-          mount-dir [nil "/mount"]]
+(deftest filesystem-starts-always-recover-the-stopped-owner
+  (doseq [mount-dir [nil "/mount"]]
     (let [started (atom nil)]
       (with-redefs-fn
         {#'c/session (constantly :test-session)
@@ -214,6 +213,12 @@
         (fn []
           (#'db/start-node! {:nodes ["n1"]} "n1"
                            {:grpc-port 50051 :redis-port 6379 :data-dir "/data"
-                            :filesystem-mount mount-dir :filesystem-strict strict?})))
-      (doseq [flag ["--filesystemStrict" "--filesystemStrictRecover"]]
-        (is (= (boolean (and strict? mount-dir)) (contains? @started flag)))))))
+                            :filesystem-mount mount-dir})))
+      (is (= (boolean mount-dir) (contains? @started "--filesystemStrictRecover")))
+      (is (not (contains? @started "--filesystemStrict"))))))
+
+(deftest legacy-filesystem-options-are-rejected
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"legacy filesystem mode"
+                       (db/db {:filesystem-strict false})))
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"legacy filesystem mode"
+                       (db/server-args {:filesystem-mount "/mount" :filesystem-strict false}))))

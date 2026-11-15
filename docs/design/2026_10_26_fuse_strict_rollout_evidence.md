@@ -1,6 +1,9 @@
 # Strict FUSE durability and rollout evidence
 
-Status: validation in progress. Strict mode remains opt-in.
+Status: historical validation evidence. The current strict-only mount policy is
+recorded in [Filesystem strict-only](2026_11_15_implemented_filesystem_strict_only.md).
+The outcomes and limits below are retained as historical evidence, not current
+instructions to select a legacy mount.
 
 ## Scope of the current evidence
 

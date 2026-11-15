@@ -2,6 +2,9 @@ package server
 
 import (
 	"context"
+	"flag"
+	"fmt"
+	"io"
 	"math"
 	"testing"
 
@@ -20,7 +23,6 @@ func TestFilesystemStartConfigFromFlags(t *testing.T) {
 		gid           uint
 		want          fsmount.Config
 		wantErr       string
-		strict        bool
 		strictRecover bool
 	}{
 		{
@@ -47,20 +49,19 @@ func TestFilesystemStartConfigFromFlags(t *testing.T) {
 			want:     fsmount.Config{MountPoint: "/mnt/fs", ClientID: "mount-a", RootMode: 0o755},
 		},
 		{
-			name:   "strict mount is explicit",
+			name:   "journal mode is unconditional",
 			mount:  "/mnt/fs",
 			raftID: "n1",
 			mode:   0o755,
-			strict: true,
-			want:   fsmount.Config{MountPoint: "/mnt/fs", ClientID: "n1", Strict: true, RootMode: 0o755},
+			want:   fsmount.Config{MountPoint: "/mnt/fs", ClientID: "n1", RootMode: 0o755},
 		},
 		{
-			name:          "strict recovery needs strict mount",
+			name:          "recovery works without a mode flag",
 			mount:         "/mnt/fs",
 			raftID:        "n1",
 			mode:          0o755,
 			strictRecover: true,
-			wantErr:       "requires filesystemStrict",
+			want:          fsmount.Config{MountPoint: "/mnt/fs", ClientID: "n1", StrictRecover: true, RootMode: 0o755},
 		},
 		{
 			name:    "client id required",
@@ -97,7 +98,7 @@ func TestFilesystemStartConfigFromFlags(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			f := defaultFlags[filesystemFlags]()
 			f.mount, f.clientID = tt.mount, tt.clientID
-			f.strict, f.strictRecover = tt.strict, tt.strictRecover
+			f.strictRecover = tt.strictRecover
 			f.rootMode, f.rootUID, f.rootGID = tt.mode, tt.uid, tt.gid
 
 			got, err := filesystemStartConfig(f, tt.raftID)
@@ -125,4 +126,27 @@ func TestStartFilesystemIfEnabledRequiresLifecycle(t *testing.T) {
 
 	err := startFilesystemIfEnabled(context.Background(), nil, nil, nil, nil, nil, f, "n1")
 	require.ErrorContains(t, err, "filesystem lifecycle is required")
+}
+
+func TestFilesystemStrictOnlyFlag(t *testing.T) {
+	for _, args := range [][]string{nil, {"--filesystemStrict"}, {"--filesystemStrict=true"}, {"--filesystemStrict=1"}} {
+		t.Run(fmt.Sprint(args), func(t *testing.T) {
+			fs := flag.NewFlagSet("test", flag.ContinueOnError)
+			fs.SetOutput(io.Discard)
+			f := RegisterFlags(fs)
+			require.NoError(t, fs.Parse(args))
+			require.Equal(t, "true", fs.Lookup("filesystemStrict").Value.String())
+			f.filesystem.mount = "/mnt/fs"
+			_, err := filesystemStartConfig(f.filesystem, "n1")
+			require.NoError(t, err)
+		})
+	}
+	for _, value := range []string{"false", "0", "FALSE"} {
+		t.Run(value, func(t *testing.T) {
+			fs := flag.NewFlagSet("test", flag.ContinueOnError)
+			fs.SetOutput(io.Discard)
+			RegisterFlags(fs)
+			require.ErrorContains(t, fs.Parse([]string{"--filesystemStrict=" + value}), "legacy filesystem mode is no longer supported")
+		})
+	}
 }

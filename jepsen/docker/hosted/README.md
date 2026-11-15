@@ -180,13 +180,12 @@ transactions: PreWrite/Commit/Rollback are unimplemented, so this suite checks
 its supported Get/Put calls individually.
 
 Filesystem fault jobs use actual node-local FUSE mounts and SSH file operations,
-including overwrite and rename modes. These fault jobs use `--filesystemStrict`
-so every supported mutation has a durable operation identity. An indeterminate
+including overwrite and rename modes. Every mount uses the mandatory strict
+journal by default, so supported mutations have durable operation identities. An indeterminate
 write keeps its inode barrier closed until journal verification and reply-bound
 acknowledgement establish a terminal decision; recovery never assigns the write a new operation identity.
-Legacy mode deliberately requires a remount after an unjournaled unknown outcome
-and therefore cannot satisfy this suite's live recovery requirement. Existing
-normal legacy workloads remain enabled.
+Legacy mode has been retired. Explicit false mode flags are rejected. Normal
+and scheduled workloads now exercise the same strict-only mount path.
 
 Stopped nodes also use `--filesystemStrictRecover` to fence and recover their
 previous mount session before registering a replacement. The stable owner is the
@@ -204,8 +203,10 @@ checker. SQLite uses one worker per database because locks are local to a mount.
 Normal CI preserves encryption off/on and all existing workloads, adds both
 gRPC APIs, and always uploads `elle-adapter-histories-encryption-*`. The scheduled
 normal matrix adds `grpc-raw` and `grpc-transactional`; Filesystem overwrite,
-rename and SQLite entries retain their existing strict/legacy controls and now
-also run Elle. Its fault matrix adds both gRPC APIs and both Filesystem modes.
+rename and SQLite entries use mandatory strict mode and also run Elle. The
+`strict-mode` dispatch input and legacy benchmark entries are removed. Old legacy
+benchmark names are explicitly rejected; single-group and two-group strict
+benchmarks remain. Its fault matrix adds both gRPC APIs and both Filesystem modes.
 SQS retains its dedicated delivery/acknowledgement checkers. Distribution,
 RaftAdmin, backup, monitoring and internal replication/control RPCs do not expose
 application register transactions and are not presented as Elle-tested data

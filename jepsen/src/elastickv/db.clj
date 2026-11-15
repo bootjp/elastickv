@@ -213,8 +213,10 @@
   "Builds the production server argv for one managed Jepsen node."
   [{:keys [node grpc redis dynamo s3 sqs sqs-region data-dir raft-engine
            raft-redis-map raft-dynamo-map raft-s3-map raft-sqs-map raft-groups shard-ranges
-           filesystem-mount filesystem-strict encryption migration-enabled bootstrap? bootstrap-members
-           join-as-learner join-members auto-split-args]}]
+           filesystem-mount encryption migration-enabled bootstrap? bootstrap-members
+           join-as-learner join-members auto-split-args] :as opts}]
+  (when (false? (:filesystem-strict opts))
+    (throw (ex-info "legacy filesystem mode is no longer supported" {})))
   (cond-> ["--address" grpc
            "--redisAddress" redis
            "--raftId" (name node)
@@ -229,7 +231,7 @@
     filesystem-mount (conj "--filesystemMount" filesystem-mount)
     ;; start-node! checks that this mount's old server is stopped before it
     ;; launches a replacement. Recover only this node's stable owner session.
-    (and filesystem-mount filesystem-strict) (conj "--filesystemStrict" "--filesystemStrictRecover")
+    filesystem-mount (conj "--filesystemStrictRecover")
     (seq raft-groups) (conj "--raftGroups" (build-raft-groups-arg node raft-groups))
     (seq shard-ranges) (conj "--shardRanges" shard-ranges)
     (seq auto-split-args) (into auto-split-args)
@@ -714,6 +716,8 @@
           :server-env {\"ELASTICKV_RAFT_SEND_STREAM\" \"true\"}}"
   ([] (->ElastickvDB {}))
   ([opts]
+   (when (false? (:filesystem-strict opts))
+     (throw (ex-info "legacy filesystem mode is no longer supported" {})))
    (when (and (:encryption opts)
               (> (count (:raft-groups opts)) 1))
      (throw (ex-info "--encryption currently requires exactly one Raft group"

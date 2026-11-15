@@ -196,6 +196,8 @@
          :successful-writes (count writes)})))))
 
 (defn hosted-fault-test [opts]
+  (when (false? (:filesystem-strict opts))
+    (throw (ex-info "legacy filesystem mode is no longer supported" {})))
   (let [nodes (:nodes opts)
         adapter (or (:adapter opts) :redis)
         fault (first (:faults opts))

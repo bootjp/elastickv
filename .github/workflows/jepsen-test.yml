@@ -161,6 +161,13 @@ jobs:
             /tmp/dynamodb-seal-source.txt
           retention-days: 7
           if-no-files-found: ignore
+      - name: Reject retired filesystem mode
+        run: |
+          if /tmp/elastickv-bin --filesystemStrict=false > /tmp/filesystem-legacy-rejection.log 2>&1; then
+            echo 'legacy filesystem mode was accepted' >&2
+            exit 1
+          fi
+          grep -q 'legacy filesystem mode is no longer supported' /tmp/filesystem-legacy-rejection.log
       - name: Capture DynamoDB seal data and compacted snapshots
         timeout-minutes: 4
         run: bash scripts/ci-dynamodb-seal-restart-check.sh capture "${{ matrix.encryption }}"
@@ -193,6 +200,19 @@ jobs:
             fi
           done
           bash scripts/ci-jepsen-start-cluster.sh "$ENCRYPTION_MODE" restart
+      - name: Verify mandatory journal mode on initial and restarted mounts
+        run: |
+          : > /tmp/filesystem-mount-modes.txt
+          for node in 1 2 3; do
+            log="/tmp/elastickv-demo-n${node}.log"
+            lines=$(grep 'filesystem FUSE mounted' "$log")
+            test "$(printf '%s\n' "$lines" | wc -l)" -ge 2
+            if printf '%s\n' "$lines" | grep -qv 'strict=true'; then
+              echo "node $node used a non-journaled mount" >&2
+              exit 1
+            fi
+            printf '%s\n' "$lines" >> /tmp/filesystem-mount-modes.txt
+          done
       - name: Verify DynamoDB seal data after snapshot restart
         timeout-minutes: 5
         run: bash scripts/ci-dynamodb-seal-restart-check.sh verify
@@ -398,6 +418,8 @@ jobs:
           path: |
             /tmp/elle-adapter-histories.tar.gz
             /tmp/elle-source.txt
+            /tmp/filesystem-mount-modes.txt
+            /tmp/filesystem-legacy-rejection.log
           retention-days: 14
           if-no-files-found: error
       - name: Archive Jepsen store on filesystem failure

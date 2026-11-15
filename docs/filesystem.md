@@ -70,6 +70,34 @@ container, build an image that installs `fuse3`, give the container
 runtime), and bind-mount the mount point with `:rshared` so the host can see
 it. Running the binary directly on the host is the simpler option.
 
+## Upgrading from legacy mounts
+
+All enabled mounts now use the operation journal. `--filesystemStrict` may be
+omitted; `--filesystemStrict=true` remains accepted for existing launch scripts.
+`--filesystemStrict=false` (including `0` or `f`) is rejected even if FUSE is
+otherwise disabled. There is no mode switch in the mount configuration API.
+
+1. Stop applications using the old mounts and stop every old mount process
+   cleanly. Keep the existing Raft data directories and encryption keys. Take
+   the usual backup before upgrading; the upgrade does not rewrite file data.
+2. Reconcile any unjournaled outcome that an old mount reported as unknown
+   before cutover. Reading a later value does not establish that outcome.
+3. Start the new binary with the existing mount path, data directory and a
+   stable, unique `--filesystemClientID` (or its default Raft ID). An existing
+   legacy filesystem gets its journal identity and first owner session during
+   mount startup; file and directory data remain in place.
+4. After an **unclean strict mount stop**, first confirm the old process is
+   stopped, then restart that owner with `--filesystemStrictRecover`. This
+   fences/reconciles its prior session before registering the replacement.
+   Never apply recovery to a live owner or share a client ID across live mounts.
+   A clean shutdown drains acknowledgements and closes its session normally.
+
+The normal CI cluster uses the mandatory default on encrypted and cleartext
+nodes. Its restart helper checks old processes have stopped before adding
+`--filesystemStrictRecover`. The scheduled `strict-mode` input and legacy
+benchmark matrix entries are retired. `benchmark-fuse.py` defaults to strict;
+`--mode legacy` is rejected. Single-group and two-group benchmarks remain.
+
 ## Enabling the filesystem
 
 The filesystem is off unless `--filesystemMount` is set. The relevant server
@@ -78,9 +106,9 @@ flags:
 | Flag | Default | Meaning |
 |---|---|---|
 | `--filesystemMount` | empty (disabled) | Directory to mount the filesystem on. |
-| `--filesystemClientID` | value of `--raftId` | Identity recorded in open-handle lease keys and in the mount log line, for attribution. Does not have to be unique: lease keys also carry a per-open handle ID. |
-| `--filesystemStrict` | `false` | Use a registered operation session for supported FUSE mutations. This validation mode requires the reply-aware go-fuse bridge. |
-| `--filesystemStrictRecover` | `false` | Fence and recover a prior strict session for the same client ID before registering a new one. Set this only after confirming the prior mount process has stopped. Requires `--filesystemStrict`. |
+| `--filesystemClientID` | value of `--raftId` | Stable owner of the journal session and open-handle leases. Must be unique among active mounts; defaults to the node Raft ID. Reuse after an unclean stop requires explicit recovery. |
+| `--filesystemStrict` | `true` (mandatory) | Compatibility flag. All mounts use registered operation sessions and the reply-aware bridge. Explicit false values are rejected during argument parsing. |
+| `--filesystemStrictRecover` | `false` | Fence and recover a prior strict session for the same client ID before registering a new one. Set this only after confirming the prior mount process has stopped. Journaling is always enabled. |
 | `--filesystemRootUID` | `0` | Owner UID of the root directory. Applied only when the root is first created. |
 | `--filesystemRootGID` | `0` | Owner GID of the root directory. Applied only when the root is first created. |
 | `--filesystemRootMode` | `0755` | Permission bits of the root directory. Applied only when the root is first created. |
@@ -191,7 +219,10 @@ When `--filesystemMount` is set, the server:
    group, on a multi-group cluster it can span several groups. Concurrent
    root creation from several nodes is resolved by write-conflict retries;
    the losers find the root the first node created.
-3. Checks the mount point for a FUSE mount left behind by a previous server
+3. Ensures the durable filesystem identity and registers a journal session for
+   the mount owner. With explicit recovery, it first fences and reconciles the
+   stopped owner's previous session.
+4. Checks the mount point for a FUSE mount left behind by a previous server
    that died without unmounting (the mounts table lists a `fuse.elastickv`
    entry, the type the server mounts with, for the path and `stat` fails
    with `ENOTCONN`). Such a dead mount is detached with `fusermount3 -u -z`
@@ -201,15 +232,15 @@ When `--filesystemMount` is set, the server:
    FUSE or not, is never touched. When `/proc/self/mounts` cannot be read
    (no `/proc` in a minimal container), the check is skipped with a warning
    and the mount proceeds as before.
-4. Replays filesystem recovery state: safely aborted create/delete intents are
+5. Replays filesystem recovery state: safely aborted create/delete intents are
    cleared and unfinished file moves are resumed, in batches of 256, until
    nothing is left. The whole replay must finish within 5 minutes; if it does
    not, the mount fails and the server exits. Recovery is resumable, so
    restarting the server continues where the previous attempt stopped.
-5. Mounts the directory with `fusermount3`, waits for the kernel to confirm
+6. Mounts the directory with `fusermount3`, waits for the kernel to confirm
    the mount, and logs `filesystem FUSE mounted` with the mount point and
    client ID.
-6. Starts the placement-metrics collector and the lease reaper.
+7. Starts the placement/journal metrics collectors and the lease reaper.
 
 Because the listeners come up before the mount, a readiness check on the gRPC
 or Redis port is not enough for clients that use the mount. Check the
@@ -316,9 +347,10 @@ listing already in progress keeps paging through its original snapshot; see
 applied as one transaction over the chunks it touches before it returns.
 The mount waits for earlier local mutations of the same inode before answering
 `flush` or `fsync`, and for earlier local namespace mutations before answering
-directory `fsync`. The backend has no write-back buffer, but `fsync` currently
-uses a read fence rather than a separate durable receipt check. Full crash
-durability guarantees for `fsync` remain under validation. Two caveats:
+directory `fsync`. The backend has no write-back buffer. `flush` and `fsync`
+verify retained operation receipts; `fsync` also fences the backend before
+clearing those receipts. Crash-boundary coverage remains described in the
+[strict rollout evidence](design/2026_10_26_fuse_strict_rollout_evidence.md). Two caveats:
 
 - *A large `write(2)` is not atomic.* The kernel splits a write into FUSE
   requests of at most 128 KiB (the go-fuse default; the mount does not raise
@@ -347,7 +379,9 @@ returns `EIO`. An unresolved tracked mutation also leaves a sticky barrier
 error for the affected inode or directory. For a journaled mutation that
 returned `EIO`, the barrier clears once the attempted reply is acknowledged
 and the journal has established a terminal, verified decision. Other unresolved
-mutations continue to block; unjournaled unknown outcomes require a remount.
+mutations continue to block until their own decisions are verified. There is no
+unjournaled runtime mode. Historical legacy mounts required remounting after
+an unjournaled unknown outcome; see the cutover procedure below.
 Do not replay a non-idempotent
 operation after that error: it may already have committed.
 An exhausted retry budget or full local mutation queue returns `EBUSY`;

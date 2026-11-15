@@ -17,11 +17,6 @@ on:
         type: boolean
         required: false
         default: false
-      strict-mode:
-        description: "Use strict FUSE mode for filesystem workloads"
-        type: boolean
-        required: false
-        default: true
       workloads-json:
         description: "Optional JSON array of workload names to run"
         required: false
@@ -77,11 +72,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        workload: ${{ fromJSON(inputs.workloads-json || '["unit","grpc-raw","grpc-transactional","redis","redis-zset","dynamodb","dynamodb-type-string","dynamodb-type-number","dynamodb-type-binary","dynamodb-type-bool","dynamodb-type-null","dynamodb-type-string-set","dynamodb-type-number-set","dynamodb-type-binary-set","dynamodb-type-list","dynamodb-type-map","s3","sqs-standard","sqs-htfifo","filesystem-cross-mount","filesystem-sqlite-check","filesystem-node-crash","filesystem-benchmark","filesystem-benchmark-legacy","filesystem-benchmark-multigroup","filesystem-benchmark-multigroup-legacy","filesystem-overwrite","filesystem-rename","sqlite"]') }}
+        workload: ${{ fromJSON(inputs.workloads-json || '["unit","grpc-raw","grpc-transactional","redis","redis-zset","dynamodb","dynamodb-type-string","dynamodb-type-number","dynamodb-type-binary","dynamodb-type-bool","dynamodb-type-null","dynamodb-type-string-set","dynamodb-type-number-set","dynamodb-type-binary-set","dynamodb-type-list","dynamodb-type-map","s3","sqs-standard","sqs-htfifo","filesystem-cross-mount","filesystem-sqlite-check","filesystem-node-crash","filesystem-benchmark","filesystem-benchmark-multigroup","filesystem-overwrite","filesystem-rename","sqlite"]') }}
     env:
       GOCACHE: /tmp/go-build
       WORKLOAD: ${{ matrix.workload }}
     steps:
+      - name: Reject retired legacy filesystem workloads
+        if: matrix.workload == 'filesystem-benchmark-legacy' || matrix.workload == 'filesystem-benchmark-multigroup-legacy'
+        run: |
+          echo 'Legacy filesystem workloads are no longer supported; use filesystem-benchmark or filesystem-benchmark-multigroup.' >&2
+          exit 2
       - uses: actions/checkout@v7
         with:
           submodules: recursive
@@ -368,19 +368,14 @@ jobs:
           RAFT_REDIS_MAP="127.0.0.1:50051=127.0.0.1:63791,127.0.0.1:50052=127.0.0.1:63792,127.0.0.1:50053=127.0.0.1:63793"
           RAFT_S3_MAP="127.0.0.1:50051=127.0.0.1:63901,127.0.0.1:50052=127.0.0.1:63902,127.0.0.1:50053=127.0.0.1:63903"
           RAFT_DYNAMO_MAP="127.0.0.1:50051=127.0.0.1:63801,127.0.0.1:50052=127.0.0.1:63802,127.0.0.1:50053=127.0.0.1:63803"
-          STRICT_FLAGS=(--filesystemStrict)
-          if [[ "${{ github.event_name }}" == 'workflow_dispatch' && "${{ inputs.strict-mode }}" == 'false' ]] ||
-             [[ "$WORKLOAD" == 'filesystem-benchmark-legacy' || "$WORKLOAD" == 'filesystem-benchmark-multigroup-legacy' ]]; then
-            STRICT_FLAGS=()
-          fi
 
-          if [[ "$WORKLOAD" == 'filesystem-benchmark-multigroup' || "$WORKLOAD" == 'filesystem-benchmark-multigroup-legacy' ]]; then
+
+          if [[ "$WORKLOAD" == 'filesystem-benchmark-multigroup' ]]; then
             mkdir -p /tmp/elastickv-fs/fs-n1
             nohup /tmp/elastickv-bin \
               --address "127.0.0.1:50051" \
               --redisAddress "" --dynamoAddress "" --s3Address "" --sqsAddress "" \
               --filesystemMount /tmp/elastickv-fs/fs-n1 \
-              "${STRICT_FLAGS[@]}" \
               --filesystemRootUID "$(id -u)" \
               --filesystemRootGID "$(id -g)" \
               --metricsAddress "" --pprofAddress "" \
@@ -416,7 +411,6 @@ jobs:
               --dynamoAddress "127.0.0.1:6380${node}" \
               --s3Address "127.0.0.1:6390${node}" \
               --filesystemMount "/tmp/elastickv-fs/fs-n${node}" \
-              "${STRICT_FLAGS[@]}" \
               --filesystemRootUID "$(id -u)" \
               --filesystemRootGID "$(id -g)" \
               --metricsAddress "" \
@@ -447,6 +441,28 @@ jobs:
             tail -n 200 "/tmp/elastickv-fs-n${node}.log" || true
           done
           exit 1
+      - name: Verify mandatory filesystem journal mode
+        if: startsWith(matrix.workload, 'filesystem-') || matrix.workload == 'sqlite'
+        run: |
+          : > /tmp/filesystem-mount-modes.txt
+          nodes=(1 2 3)
+          if [[ "$WORKLOAD" == 'filesystem-benchmark-multigroup' ]]; then nodes=(1); fi
+          for node in "${nodes[@]}"; do
+            lines=$(grep 'filesystem FUSE mounted' "/tmp/elastickv-fs-n${node}.log")
+            if printf '%s\n' "$lines" | grep -qv 'strict=true'; then
+              echo "node $node used a non-journaled mount" >&2
+              exit 1
+            fi
+            printf '%s\n' "$lines" >> /tmp/filesystem-mount-modes.txt
+          done
+      - name: Upload filesystem journal mode evidence
+        if: always() && (startsWith(matrix.workload, 'filesystem-') || matrix.workload == 'sqlite')
+        uses: actions/upload-artifact@v7
+        with:
+          name: filesystem-mount-mode-${{ matrix.workload }}
+          path: /tmp/filesystem-mount-modes.txt
+          if-no-files-found: error
+          retention-days: 14
       - name: Verify FUSE cross-mount disjoint writes without client retries
         if: matrix.workload == 'filesystem-cross-mount'
         run: |
@@ -462,6 +478,7 @@ jobs:
         if: matrix.workload == 'filesystem-node-crash'
         timeout-minutes: 5
         run: |
+          python3 scripts/test_fuse_node_crash.py
           python3 scripts/test-fuse-node-crash.py \
             /tmp/elastickv-fs/fs-n1 \
             /tmp/elastickv-fs/fs-n2 \
@@ -469,19 +486,17 @@ jobs:
             --pid-file /tmp/elastickv-fs.pid \
             --restart-log /tmp/elastickv-fs-n1-restarted.log
       - name: Measure FUSE write and fsync latency
-        if: matrix.workload == 'filesystem-benchmark' || matrix.workload == 'filesystem-benchmark-legacy' || matrix.workload == 'filesystem-benchmark-multigroup' || matrix.workload == 'filesystem-benchmark-multigroup-legacy'
+        if: matrix.workload == 'filesystem-benchmark' || matrix.workload == 'filesystem-benchmark-multigroup'
         timeout-minutes: 10
         run: |
           python3 scripts/test_benchmark_fuse.py
-          MODE=strict
-          if [[ "$WORKLOAD" == 'filesystem-benchmark-legacy' || "$WORKLOAD" == 'filesystem-benchmark-multigroup-legacy' ]]; then MODE=legacy; fi
           LAYOUT=single-group
-          if [[ "$WORKLOAD" == 'filesystem-benchmark-multigroup' || "$WORKLOAD" == 'filesystem-benchmark-multigroup-legacy' ]]; then LAYOUT=two-group; fi
+          if [[ "$WORKLOAD" == 'filesystem-benchmark-multigroup' ]]; then LAYOUT=two-group; fi
           python3 scripts/benchmark-fuse.py /tmp/elastickv-fs/fs-n1 \
-            --mode "$MODE" --layout "$LAYOUT" --writes 40 --workers 4 --repetitions 3 \
+            --layout "$LAYOUT" --writes 40 --workers 4 --repetitions 3 \
             --output /tmp/elastickv-fuse-benchmark.json
       - name: Upload FUSE benchmark results
-        if: matrix.workload == 'filesystem-benchmark' || matrix.workload == 'filesystem-benchmark-legacy' || matrix.workload == 'filesystem-benchmark-multigroup' || matrix.workload == 'filesystem-benchmark-multigroup-legacy'
+        if: matrix.workload == 'filesystem-benchmark' || matrix.workload == 'filesystem-benchmark-multigroup'
         uses: actions/upload-artifact@v7
         with:
           name: elastickv-fuse-benchmark-${{ matrix.workload }}

@@ -245,3 +245,7 @@
   (doseq [adapter [:redis :dynamodb :s3 :grpc-raw :grpc-transactional :sqs-standard :sqs-htfifo]]
     (is (nil? (get-in (hosted/hosted-fault-test (assoc opts :adapter adapter))
                      [:db :opts :filesystem-strict])))))
+
+(deftest hosted-filesystem-cannot-select-legacy-mode
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"legacy filesystem mode"
+                       (hosted/hosted-fault-test (assoc opts :adapter :filesystem-overwrite :filesystem-strict false)))))
