@@ -20,7 +20,7 @@ func (f *kvFSM) validateAbsenceRequest(request *pb.Request) error {
 		if mutation == nil || !mutation.RequireAbsent {
 			continue
 		}
-		if !f.ttlInlineCapability.Load() {
+		if !f.TTLInlineCapabilityActive() {
 			return errors.WithStack(ErrTTLInlineCapabilityRequired)
 		}
 		if !request.IsTxn || request.Phase != pb.Phase_NONE || mutation.Op != pb.Op_PUT || isTxnInternalKey(mutation.Key) {

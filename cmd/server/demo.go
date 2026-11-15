@@ -539,7 +539,7 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	cleanup.Add(func() { st.Close() })
 	hlc := kv.NewHLC()
 	redisApplyObserver := adapter.NewRedisApplyObserver()
-	fsm := kv.NewKvFSMWithHLC(st, hlc, kv.WithApplyObserver(redisApplyObserver))
+	fsm := newDemoFSM(st, hlc, redisApplyObserver)
 	readTracker := kv.NewActiveTimestampTracker()
 
 	result, err := openRaftEngine(cfg, fsm, &cleanup)
@@ -640,6 +640,12 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 
 	cleanup.Release()
 	return nil
+}
+
+func newDemoFSM(st store.MVCCStore, hlc *kv.HLC, observer kv.ApplyObserver) kv.FSM {
+	// The direct single-group factory has no downgrade fence. Older binaries
+	// may ignore its Raft-engine marker, so it must never activate M1b.
+	return kv.NewKvFSMWithHLC(st, hlc, kv.WithApplyObserver(observer), kv.WithTTLInlineCapabilityDisabled())
 }
 
 func prepareDemoRaftDataDir(dir string) error {

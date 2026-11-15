@@ -68,6 +68,7 @@ func TestTTLInlineCapabilityRecovery(t *testing.T) {
 	payload := capabilityPayload(t, ttlInlineCapabilityMarker{Version: 1, Index: 2, Voters: []uint64{1}, Learners: []uint64{2}})
 	require.Nil(t, applyCapability(t, f, 3, native, payload))
 	require.True(t, f.TTLInlineCapabilityActive())
+	require.True(t, f.TTLInlineCapabilityRecorded())
 	snap, err := f.Snapshot()
 	require.NoError(t, err)
 	var image bytes.Buffer
@@ -80,11 +81,13 @@ func TestTTLInlineCapabilityRecovery(t *testing.T) {
 	t.Cleanup(func() { require.NoError(t, reopened.Close()) })
 	replayed := newTTLInlineFSM(t, reopened)
 	require.False(t, replayed.TTLInlineCapabilityActive(), "persisted marker is not local-fence or recovered-ConfState proof")
+	require.True(t, replayed.TTLInlineCapabilityRecorded())
 	replayed.ttlInlineRecoveryProof = func() (bool, raftengine.NativeConfiguration) {
 		return true, raftengine.NativeConfiguration{Index: 3, Voters: []uint64{1}, Learners: []uint64{2}}
 	}
 	require.NoError(t, replayed.reloadTTLInlineCapability(t.Context()))
 	require.False(t, replayed.TTLInlineCapabilityActive(), "a different recovered ConfChange index cannot reopen activation")
+	require.True(t, replayed.TTLInlineCapabilityRecorded(), "configuration mismatch does not erase durable marker evidence")
 	replayed.ttlInlineRecoveryProof = func() (bool, raftengine.NativeConfiguration) { return false, native }
 	require.NoError(t, replayed.reloadTTLInlineCapability(t.Context()))
 	require.False(t, replayed.TTLInlineCapabilityActive(), "an unfenced directory cannot reopen activation")
@@ -97,6 +100,7 @@ func TestTTLInlineCapabilityRecovery(t *testing.T) {
 	restored := newTTLInlineFSM(t, target)
 	require.NoError(t, restored.Restore(bytes.NewReader(image.Bytes())))
 	require.False(t, restored.TTLInlineCapabilityActive(), "snapshot marker cannot reopen activation")
+	require.True(t, restored.TTLInlineCapabilityRecorded(), "restored marker remains recorded without activation")
 }
 
 func TestTTLInlineCapabilityUnknownRecordFailsClosed(t *testing.T) {
@@ -110,6 +114,73 @@ func TestTTLInlineCapabilityUnknownRecordFailsClosed(t *testing.T) {
 	require.NoError(t, err)
 	f := newTTLInlineFSM(t, st)
 	require.False(t, f.TTLInlineCapabilityActive())
+	require.False(t, f.TTLInlineCapabilityRecorded())
 	require.ErrorIs(t, f.ttlInlineCapabilityLoadErr, ErrTTLInlineCapabilityMarker)
 	require.ErrorIs(t, haltApplyOf(f.Apply([]byte{0xff})), ErrTTLInlineCapabilityMarker)
+}
+
+func TestTTLInlineCapabilityRecordedSurvivesMissingMarkerReload(t *testing.T) {
+	t.Parallel()
+	withMarker := store.NewMVCCStore()
+	t.Cleanup(func() { require.NoError(t, withMarker.Close()) })
+	writer, ok := withMarker.(store.ReplicatedControlStore)
+	require.True(t, ok)
+	_, err := writer.ApplyReplicatedControlState(t.Context(), ttlInlineCapabilityKey,
+		[]byte(`{"version":1,"index":2,"voters":[1]}`), 3)
+	require.NoError(t, err)
+	f := newTTLInlineFSM(t, withMarker)
+	require.True(t, f.TTLInlineCapabilityRecorded())
+	require.False(t, f.TTLInlineCapabilityActive())
+
+	withoutMarker := store.NewMVCCStore()
+	t.Cleanup(func() { require.NoError(t, withoutMarker.Close()) })
+	f.store = withoutMarker
+	require.NoError(t, f.reloadTTLInlineCapability(t.Context()))
+	require.True(t, f.TTLInlineCapabilityRecorded(), "reload must not reopen membership admission after a marker was observed")
+	require.False(t, f.TTLInlineCapabilityActive())
+}
+
+func TestTTLInlineCapabilityDisabledHaltsOnRecoveryMarker(t *testing.T) {
+	t.Parallel()
+	for _, raw := range [][]byte{
+		[]byte(`{"version":1,"index":2,"voters":[1]}`),
+		[]byte(`not-json`),
+	} {
+		st := store.NewMVCCStore()
+		writer, ok := st.(store.ReplicatedControlStore)
+		require.True(t, ok)
+		_, err := writer.ApplyReplicatedControlState(t.Context(), ttlInlineCapabilityKey, raw, 3)
+		require.NoError(t, err)
+		f, ok := NewKvFSMWithHLC(st, nil, WithTTLInlineCapabilityDisabled()).(*kvFSM)
+		require.True(t, ok)
+		require.False(t, f.TTLInlineCapabilityActive())
+		require.False(t, f.TTLInlineCapabilityRecorded())
+		require.ErrorIs(t, f.ttlInlineCapabilityLoadErr, ErrTTLInlineCapabilityDisabled)
+		require.ErrorIs(t, haltApplyOf(f.Apply([]byte{0xff})), ErrTTLInlineCapabilityDisabled)
+		require.NoError(t, st.Close())
+	}
+}
+
+func TestTTLInlineCapabilityDisabledHaltsOnAppliedMarker(t *testing.T) {
+	t.Parallel()
+	st := store.NewMVCCStore()
+	t.Cleanup(func() { require.NoError(t, st.Close()) })
+	f, ok := NewKvFSMWithHLC(st, nil, WithTTLInlineCapabilityDisabled()).(*kvFSM)
+	require.True(t, ok)
+	require.NoError(t, f.ttlInlineCapabilityLoadErr)
+	native := raftengine.NativeConfiguration{Index: 2, Voters: []uint64{1}}
+	f.ttlInlineMemberProof = func(raftengine.NativeConfiguration) bool { return true }
+	for _, payload := range [][]byte{
+		capabilityPayload(t, ttlInlineCapabilityMarker{Version: 1, Index: 2, Voters: []uint64{1}}),
+		{raftEncodeTTLInlineCapability, 0xff},
+	} {
+		require.ErrorIs(t, haltApplyOf(applyCapability(t, f, 4, native, payload)), ErrTTLInlineCapabilityDisabled)
+		require.False(t, f.TTLInlineCapabilityActive())
+	}
+	_, err := st.GetAt(t.Context(), ttlInlineCapabilityKey, ^uint64(0))
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+	require.False(t, f.TTLInlineCapabilityRecorded())
+	f.ttlInlineCapability.Store(true)
+	require.False(t, f.TTLInlineCapabilityActive(), "disabled admission must ignore a stale activation bit")
+	require.ErrorIs(t, f.validateAbsenceRequest(absenceRequest([]byte("key"), true)), ErrTTLInlineCapabilityRequired)
 }

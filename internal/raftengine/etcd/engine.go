@@ -161,6 +161,7 @@ var (
 	errLeadershipTransferTargetNotCaughtUp = errors.Mark(errors.New("etcd raft leadership transfer target is not caught up"), raftengine.ErrLeadershipTransferTargetNotCaughtUp)
 	errLeadershipTransferConfChangePending = errors.Mark(errors.New("etcd raft leadership transfer blocked by pending config change"), raftengine.ErrLeadershipTransferConfChangePending)
 	errMembershipConfChangePending         = errors.Mark(errors.New("etcd raft membership change blocked by pending config change"), raftengine.ErrMembershipChangePending)
+	errTTLInlineMembershipProofRequired    = errors.New("etcd raft membership change requires TTL-inline member capability proof")
 	errTooManyPendingConfigs               = errors.New("etcd raft engine has too many pending config changes")
 	errPromoteLearnerNotLearner            = errors.New("etcd raft promote-learner target is not a learner")
 	errPromoteLearnerNoProgress            = errors.New("etcd raft promote-learner target has no leader-side progress entry")
@@ -2366,6 +2367,12 @@ func (e *Engine) proposeMembershipChange(req adminRequest, changeType raftpb.Con
 	if e.hasPendingConfChange() {
 		req.done <- adminResult{err: errors.WithStack(errMembershipConfChangePending)}
 		return
+	}
+	if changeType != raftpb.ConfChangeRemoveNode {
+		if capability, ok := e.fsm.(interface{ TTLInlineCapabilityRecorded() bool }); ok && capability.TTLInlineCapabilityRecorded() {
+			req.done <- adminResult{err: errors.WithStack(errTTLInlineMembershipProofRequired)}
+			return
+		}
 	}
 	contextBytes, err := encodeConfChangeContext(req.id, peer)
 	if err != nil {

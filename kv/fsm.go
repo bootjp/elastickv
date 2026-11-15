@@ -42,8 +42,10 @@ type kvFSM struct {
 	store store.MVCCStore
 	log   *slog.Logger
 	// Set only by the replicated protocol activation, never by a process flag.
-	ttlInlineCapability        atomic.Bool
-	ttlInlineCapabilityLoadErr error
+	ttlInlineCapability         atomic.Bool
+	ttlInlineCapabilityRecorded atomic.Bool
+	ttlInlineCapabilityLoadErr  error
+	ttlInlineCapabilityDisabled bool
 	// No production producer is wired yet. A command cannot attest its own members.
 	ttlInlineMemberProof func(raftengine.NativeConfiguration) bool
 	// Recovery needs independent local directory-fence and native ConfState proof.

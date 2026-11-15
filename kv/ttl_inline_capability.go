@@ -18,6 +18,13 @@ const raftEncodeTTLInlineCapability byte = 0x2e
 var ttlInlineCapabilityKey = []byte(store.ReplicatedControlPrefix + "absence-capability")
 
 var ErrTTLInlineCapabilityMarker = errors.New("TTL-inline capability marker invalid")
+var ErrTTLInlineCapabilityDisabled = errors.New("TTL-inline capability marker unsupported by direct Raft factory")
+
+// WithTTLInlineCapabilityDisabled excludes a legacy direct Raft factory from
+// activation and halts it if a capability marker is recovered or applied.
+func WithTTLInlineCapabilityDisabled() FSMOption {
+	return func(f *kvFSM) { f.ttlInlineCapabilityDisabled = true }
+}
 
 // The configuration is the exact native pre-entry image, including joint roles.
 // Index is the last applied ConfChange index, not this marker's Raft index.
@@ -79,7 +86,16 @@ func (m ttlInlineCapabilityMarker) matches(native raftengine.NativeConfiguration
 }
 
 // TTLInlineCapabilityActive is safe for coordinator reads on other goroutines.
-func (f *kvFSM) TTLInlineCapabilityActive() bool { return f.ttlInlineCapability.Load() }
+func (f *kvFSM) TTLInlineCapabilityActive() bool {
+	return !f.ttlInlineCapabilityDisabled && f.ttlInlineCapability.Load()
+}
+
+// TTLInlineCapabilityRecorded reports whether a valid marker is durable,
+// regardless of whether current configuration proof permits activation.
+// It is safe to read from another goroutine.
+func (f *kvFSM) TTLInlineCapabilityRecorded() bool {
+	return !f.ttlInlineCapabilityDisabled && f.ttlInlineCapabilityRecorded.Load()
+}
 
 func (f *kvFSM) reloadTTLInlineCapability(ctx context.Context) error {
 	f.ttlInlineCapability.Store(false)
@@ -93,10 +109,14 @@ func (f *kvFSM) reloadTTLInlineCapability(ctx context.Context) error {
 	if err != nil {
 		return errors.Wrap(err, "read TTL-inline capability")
 	}
+	if f.ttlInlineCapabilityDisabled {
+		return errors.WithStack(ErrTTLInlineCapabilityDisabled)
+	}
 	marker, err := decodeTTLInlineCapabilityMarker(raw)
 	if err != nil {
 		return err
 	}
+	f.ttlInlineCapabilityRecorded.Store(true)
 	// A durable FSM record cannot prove the local directory is downgrade-fenced
 	// or that native recovery selected this same ConfState. No production verifier
 	// exists yet, so restart and snapshot restore stay closed.
@@ -110,6 +130,9 @@ func (f *kvFSM) reloadTTLInlineCapability(ctx context.Context) error {
 }
 
 func (f *kvFSM) applyTTLInlineCapability(ctx context.Context, raw []byte) any {
+	if f.ttlInlineCapabilityDisabled {
+		return haltErr(errors.WithStack(ErrTTLInlineCapabilityDisabled))
+	}
 	marker, err := decodeTTLInlineCapabilityMarker(raw)
 	if err != nil {
 		return haltErr(err)
@@ -146,6 +169,7 @@ func (f *kvFSM) persistTTLInlineCapability(ctx context.Context, raw []byte) any 
 		}
 		return nil
 	}
+	f.ttlInlineCapabilityRecorded.Store(true)
 	f.ttlInlineCapability.Store(true)
 	return nil
 }
