@@ -34,6 +34,7 @@ const (
 	Internal_IssueMigrationTimestamp_FullMethodName    = "/Internal/IssueMigrationTimestamp"
 	Internal_IssueBoundTimestamp_FullMethodName        = "/Internal/IssueBoundTimestamp"
 	Internal_LookupTimestampBinding_FullMethodName     = "/Internal/LookupTimestampBinding"
+	Internal_ProposeTwoGroupPrepare_FullMethodName     = "/Internal/ProposeTwoGroupPrepare"
 )
 
 // InternalClient is the client API for Internal service.
@@ -56,6 +57,7 @@ type InternalClient interface {
 	IssueMigrationTimestamp(ctx context.Context, in *IssueMigrationTimestampRequest, opts ...grpc.CallOption) (*IssueMigrationTimestampResponse, error)
 	IssueBoundTimestamp(ctx context.Context, in *IssueBoundTimestampRequest, opts ...grpc.CallOption) (*IssueBoundTimestampResponse, error)
 	LookupTimestampBinding(ctx context.Context, in *LookupTimestampBindingRequest, opts ...grpc.CallOption) (*LookupTimestampBindingResponse, error)
+	ProposeTwoGroupPrepare(ctx context.Context, in *ProposeTwoGroupPrepareRequest, opts ...grpc.CallOption) (*ProposeTwoGroupPrepareResponse, error)
 }
 
 type internalClient struct {
@@ -225,6 +227,16 @@ func (c *internalClient) LookupTimestampBinding(ctx context.Context, in *LookupT
 	return out, nil
 }
 
+func (c *internalClient) ProposeTwoGroupPrepare(ctx context.Context, in *ProposeTwoGroupPrepareRequest, opts ...grpc.CallOption) (*ProposeTwoGroupPrepareResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ProposeTwoGroupPrepareResponse)
+	err := c.cc.Invoke(ctx, Internal_ProposeTwoGroupPrepare_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // InternalServer is the server API for Internal service.
 // All implementations must embed UnimplementedInternalServer
 // for forward compatibility.
@@ -245,6 +257,7 @@ type InternalServer interface {
 	IssueMigrationTimestamp(context.Context, *IssueMigrationTimestampRequest) (*IssueMigrationTimestampResponse, error)
 	IssueBoundTimestamp(context.Context, *IssueBoundTimestampRequest) (*IssueBoundTimestampResponse, error)
 	LookupTimestampBinding(context.Context, *LookupTimestampBindingRequest) (*LookupTimestampBindingResponse, error)
+	ProposeTwoGroupPrepare(context.Context, *ProposeTwoGroupPrepareRequest) (*ProposeTwoGroupPrepareResponse, error)
 	mustEmbedUnimplementedInternalServer()
 }
 
@@ -299,6 +312,9 @@ func (UnimplementedInternalServer) IssueBoundTimestamp(context.Context, *IssueBo
 }
 func (UnimplementedInternalServer) LookupTimestampBinding(context.Context, *LookupTimestampBindingRequest) (*LookupTimestampBindingResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method LookupTimestampBinding not implemented")
+}
+func (UnimplementedInternalServer) ProposeTwoGroupPrepare(context.Context, *ProposeTwoGroupPrepareRequest) (*ProposeTwoGroupPrepareResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ProposeTwoGroupPrepare not implemented")
 }
 func (UnimplementedInternalServer) mustEmbedUnimplementedInternalServer() {}
 func (UnimplementedInternalServer) testEmbeddedByValue()                  {}
@@ -584,6 +600,24 @@ func _Internal_LookupTimestampBinding_Handler(srv interface{}, ctx context.Conte
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Internal_ProposeTwoGroupPrepare_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ProposeTwoGroupPrepareRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(InternalServer).ProposeTwoGroupPrepare(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Internal_ProposeTwoGroupPrepare_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(InternalServer).ProposeTwoGroupPrepare(ctx, req.(*ProposeTwoGroupPrepareRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Internal_ServiceDesc is the grpc.ServiceDesc for Internal service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -646,6 +680,10 @@ var Internal_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "LookupTimestampBinding",
 			Handler:    _Internal_LookupTimestampBinding_Handler,
+		},
+		{
+			MethodName: "ProposeTwoGroupPrepare",
+			Handler:    _Internal_ProposeTwoGroupPrepare_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

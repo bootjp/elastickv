@@ -19,10 +19,21 @@ func (c *ShardedCoordinator) WithTwoGroupPrepareAdmission(lookup func(uint64) (T
 	return c
 }
 
-// PrepareTwoGroup is the trusted in-process PREPARE-only entry. It never
+// TwoGroupRemotePreparer is a trusted private peer route. It accepts only a
+// manifest; the destination leader constructs any home observation locally.
+type TwoGroupRemotePreparer interface {
+	PrepareTwoGroupOnLeader(context.Context, uint64, *pb.TwoGroupPrepareManifest) error
+}
+
+func (c *ShardedCoordinator) WithTwoGroupRemotePrepare(resolve func(uint64) (TwoGroupRemotePreparer, error)) *ShardedCoordinator {
+	c.twoGroupRemotePrepare = resolve
+	return c
+}
+
+// prepareTwoGroup is the trusted in-process PREPARE-only entry. It never
 // accepts an observation from its caller and cannot commit or abort the txn.
 // The normal Dispatch route remains fenced until terminal evidence is wired.
-func (c *ShardedCoordinator) PrepareTwoGroup(ctx context.Context, startTS, commitTS uint64,
+func (c *ShardedCoordinator) prepareTwoGroup(ctx context.Context, startTS, commitTS uint64,
 	primaryKey []byte, grouped map[uint64][]*pb.Mutation, groupedReadKeys map[uint64][][]byte,
 	routeVersion uint64, bypassKeys map[uint64][][]byte) (bool, error) {
 	if c == nil || c.twoGroupHomeLookup == nil || len(grouped) != 2 {
@@ -151,26 +162,94 @@ func (c *ShardedCoordinator) proposeTwoGroupPrepare(ctx context.Context, gid uin
 	manifest *pb.TwoGroupPrepareManifest, observed TwoGroupAdmissionObservation) error {
 	proposer, term, err := c.localTwoGroupProposer(ctx, gid)
 	if err != nil {
-		return err
+		if !errors.Is(err, raftengine.ErrNotLeader) || c.twoGroupRemotePrepare == nil {
+			return err
+		}
+		remote, resolveErr := c.twoGroupRemotePrepare(gid)
+		if resolveErr != nil || remote == nil {
+			return errors.Join(ErrTwoGroupAdmission, resolveErr)
+		}
+		return errors.Wrap(remote.PrepareTwoGroupOnLeader(ctx, gid, manifest), "remote two-group PREPARE")
 	}
+	_, err = proposeTwoGroupPreparedEntry(ctx, proposer, term, gid, manifest, observed)
+	return err
+}
+
+// ProposeTwoGroupPrepareOnLeader is called only after private peer-session
+// authentication. The secondary performs its own authenticated home lookup;
+// the RPC caller never supplies an observation or a Raft command.
+func ProposeTwoGroupPrepareOnLeader(ctx context.Context, gid uint64, manifest *pb.TwoGroupPrepareManifest,
+	leader raftengine.LeaderView, proposer raftengine.TermFencedProposer, lookup TwoGroupHomeLookup,
+	checkSession func(context.Context) error) (uint64, uint64, error) {
+	reader, term, err := twoGroupLeaderTerm(ctx, gid, manifest, leader, proposer, checkSession)
+	if err != nil {
+		return 0, 0, err
+	}
+	observed, err := twoGroupLeaderObservation(ctx, gid, manifest, lookup)
+	if err != nil {
+		return 0, 0, err
+	}
+	if err := checkSession(ctx); err != nil {
+		return 0, 0, err
+	}
+	if current := reader.Status(); current.State != raftengine.StateLeader || current.Term != term {
+		return 0, 0, errors.WithStack(raftengine.ErrStaleAdmissionTerm)
+	}
+	index, err := proposeTwoGroupPreparedEntry(ctx, proposer, term, gid, manifest, observed)
+	return index, term, err
+}
+
+func twoGroupLeaderTerm(ctx context.Context, gid uint64, manifest *pb.TwoGroupPrepareManifest,
+	leader raftengine.LeaderView, proposer raftengine.TermFencedProposer,
+	checkSession func(context.Context) error) (raftengine.StatusReader, uint64, error) {
+	if _, _, _, err := canonicalTwoGroupManifest(manifest); err != nil || gid == 0 || leader == nil || proposer == nil || checkSession == nil {
+		return nil, 0, errors.Join(ErrTwoGroupAdmission, err)
+	}
+	reader, ok := leader.(raftengine.StatusReader)
+	if !ok || leader.State() != raftengine.StateLeader {
+		return nil, 0, errors.WithStack(raftengine.ErrNotLeader)
+	}
+	term := reader.Status().Term
+	if term == 0 {
+		return nil, 0, errors.WithStack(raftengine.ErrStaleAdmissionTerm)
+	}
+	if err := leader.VerifyLeader(ctx); err != nil {
+		return nil, 0, errors.Wrap(err, "verify two-group leader")
+	}
+	return reader, term, nil
+}
+
+func twoGroupLeaderObservation(ctx context.Context, gid uint64, manifest *pb.TwoGroupPrepareManifest,
+	lookup TwoGroupHomeLookup) (TwoGroupAdmissionObservation, error) {
+	if gid == manifest.GetPrimaryGroupId() {
+		return TwoGroupAdmissionObservation{}, nil
+	}
+	if lookup == nil {
+		return TwoGroupAdmissionObservation{}, errors.WithStack(ErrTwoGroupAdmission)
+	}
+	return ObserveTwoGroupHome(ctx, lookup, manifest)
+}
+
+func proposeTwoGroupPreparedEntry(ctx context.Context, proposer raftengine.TermFencedProposer, term, gid uint64,
+	manifest *pb.TwoGroupPrepareManifest, observed TwoGroupAdmissionObservation) (uint64, error) {
 	data, err := marshalTwoGroupPrepareEntry(gid, manifest, observed)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	result, err := proposer.ProposeIfTerm(ctx, term, data)
 	if err != nil || result == nil {
-		return errors.Join(ErrTransactionOutcomeUnknown, err)
+		return 0, errors.Join(ErrTransactionOutcomeUnknown, err)
 	}
 	if result.CommitIndex == 0 {
-		return errors.WithStack(ErrTransactionOutcomeUnknown)
+		return 0, errors.WithStack(ErrTransactionOutcomeUnknown)
 	}
 	if result.Response != nil {
 		if applyErr, ok := result.Response.(error); ok {
-			return errors.WithStack(applyErr)
+			return 0, errors.WithStack(applyErr)
 		}
-		return errors.WithStack(ErrRaftEntryApply)
+		return 0, errors.WithStack(ErrRaftEntryApply)
 	}
-	return nil
+	return result.CommitIndex, nil
 }
 
 func (c *ShardedCoordinator) localTwoGroupProposer(ctx context.Context, gid uint64) (raftengine.TermFencedProposer, uint64, error) {

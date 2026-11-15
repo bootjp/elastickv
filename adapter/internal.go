@@ -178,6 +178,10 @@ type Internal struct {
 	tsAllocator                     kv.TimestampAllocator
 	timestampAdmissionIssuer        kv.TSOPhysicalBandAllocator
 	timestampAdmissionToken         string
+	twoGroupPrepareGroupID          uint64
+	twoGroupPrepareToken            string
+	twoGroupPrepareProposer         raftengine.TermFencedProposer
+	twoGroupPrepareHomeLookup       func(uint64) (*TwoGroupHomePeerLookup, error)
 	adminProposer                   raftengine.Proposer
 	bootstrapPolicyProposer         raftengine.Proposer
 	prepareStartupAuthorization     func(context.Context, *pb.PrepareEvidenceStateRequest) bool

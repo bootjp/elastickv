@@ -20,6 +20,7 @@ service Internal {
   rpc IssueMigrationTimestamp(IssueMigrationTimestampRequest) returns (IssueMigrationTimestampResponse) {}
   rpc IssueBoundTimestamp(IssueBoundTimestampRequest) returns (IssueBoundTimestampResponse) {}
   rpc LookupTimestampBinding(LookupTimestampBindingRequest) returns (LookupTimestampBindingResponse) {}
+  rpc ProposeTwoGroupPrepare(ProposeTwoGroupPrepareRequest) returns (ProposeTwoGroupPrepareResponse) {}
 }
 
 // internal.proto is node to node communication message in raft replication.
@@ -476,6 +477,17 @@ message TwoGroupPrepareManifest {
   uint64 primary_group_id = 3;
   repeated TwoGroupPrepareParticipant participants = 4;
   uint32 version = 5;
+}
+
+// Only the manifest crosses the peer RPC. The destination constructs the
+// home observation itself; callers cannot submit replicated entry bytes.
+message ProposeTwoGroupPrepareRequest {
+  TwoGroupPrepareManifest manifest = 1;
+}
+
+message ProposeTwoGroupPrepareResponse {
+  uint64 commit_index = 1;
+  uint64 leader_term = 2;
 }
 
 message TwoGroupHomeAdmissionRecord {

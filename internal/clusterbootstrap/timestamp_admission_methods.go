@@ -13,7 +13,38 @@ func TimestampAdmissionPeerMethods(group uint64) []peersession.Method {
 	if group == noderuntime.DedicatedTSORaftGroupID {
 		return []peersession.Method{issueBoundTimestampMethod(group)}
 	}
-	return []peersession.Method{lookupTimestampBindingMethod(group)}
+	return []peersession.Method{lookupTimestampBindingMethod(group), proposeTwoGroupPrepareMethod(group)}
+}
+
+func proposeTwoGroupPrepareMethod(group uint64) peersession.Method {
+	return peersession.Method{
+		Name: pb.Internal_ProposeTwoGroupPrepare_FullMethodName,
+		BoundRequest: func(binding peersession.RequestBinding, value any) (peersession.Message, error) {
+			request, ok := value.(*pb.ProposeTwoGroupPrepareRequest)
+			if !ok || !bootstrapExactProto(request) || binding.Group != group ||
+				!kv.ValidTwoGroupPrepareManifest(request.GetManifest()) ||
+				!twoGroupManifestContainsGroup(request.GetManifest(), group) {
+				return peersession.Message{}, peersession.ErrFormat
+			}
+			return bootstrapControlMessage(binding), nil
+		},
+		Reply: func(request peersession.Message, value any) (peersession.Message, error) {
+			response, ok := value.(*pb.ProposeTwoGroupPrepareResponse)
+			if !ok || !bootstrapExactProto(response) || response.GetCommitIndex() == 0 || response.GetLeaderTerm() == 0 {
+				return peersession.Message{}, peersession.ErrFormat
+			}
+			return bootstrapControlReply(request), nil
+		},
+	}
+}
+
+func twoGroupManifestContainsGroup(manifest *pb.TwoGroupPrepareManifest, group uint64) bool {
+	for _, participant := range manifest.GetParticipants() {
+		if participant.GetGroupId() == group {
+			return true
+		}
+	}
+	return false
 }
 
 func issueBoundTimestampMethod(group uint64) peersession.Method {

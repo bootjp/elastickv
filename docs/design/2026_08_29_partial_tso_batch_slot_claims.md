@@ -319,13 +319,17 @@ legacy protobuf request. It rejects legacy PREPARE and, until terminal evidence
 exists, legacy COMMIT/ABORT at FSM apply. The opt-in coordinator
 derives the operation ID internally, proposes home first, reconciles an unknown
 home reply through the authenticated applied lookup, and term-fences the
-secondary proposal through a trusted PREPARE-only call. This first path
-requires both group leaders to be local; it fails closed otherwise. Normal
+secondary proposal through a trusted PREPARE-only call. The path has a private
+peer-session route for a remote group leader: the RPC carries
+only the canonical manifest, and the destination leader constructs its own
+applied home observation before term-fenced proposal. The peer method is not
+publicly admitted, and the handler remains default-off in production. The
+trusted PREPARE entry is package-private rather than a capability exposed by
+startup coordinator wrappers. Normal
 Dispatch is fenced while this opt-in is configured, because legacy terminal
 COMMIT/ABORT cannot consume the new identity. Public Forward cannot supply an
-observation. The
-production all-member activation gate, remote-leader proposal route, terminal
-COMMIT/ABORT evidence, retention horizon, and mixed-version rollout tests
+observation. The production all-member activation gate, terminal COMMIT/ABORT
+evidence, retention horizon, and mixed-version rollout tests
 remain open. Production must not install the opt-in coordinator lookup or
 enable the FSM command until those gates are satisfied.
 

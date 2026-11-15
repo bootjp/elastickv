@@ -34,6 +34,11 @@ type TwoGroupAdmissionObservation struct {
 	leaderTerm   uint64
 }
 
+func ValidTwoGroupPrepareManifest(manifest *pb.TwoGroupPrepareManifest) bool {
+	_, _, _, err := canonicalTwoGroupManifest(manifest)
+	return err == nil
+}
+
 func twoGroupHomeKey(id [16]byte) []byte {
 	return append([]byte("timestamp-binding/two-group-home/"), id[:]...)
 }

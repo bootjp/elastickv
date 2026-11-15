@@ -495,12 +495,13 @@ const (
 type ShardedCoordinator struct {
 	operationAdmission OperationAdmission
 	// Nil in production until the all-member two-group activation gate exists.
-	twoGroupHomeLookup func(uint64) (TwoGroupHomeLookup, error)
-	engine             *distribution.Engine
-	router             *ShardRouter
-	groups             map[uint64]*ShardGroup
-	defaultGroup       uint64
-	clock              *HLC
+	twoGroupHomeLookup    func(uint64) (TwoGroupHomeLookup, error)
+	twoGroupRemotePrepare func(uint64) (TwoGroupRemotePreparer, error)
+	engine                *distribution.Engine
+	router                *ShardRouter
+	groups                map[uint64]*ShardGroup
+	defaultGroup          uint64
+	clock                 *HLC
 	// tsAllocator is an optional TSO-backed timestamp source used for every
 	// coordinator-owned persistence timestamp. Nil preserves the legacy shared
 	// HLC path.
