@@ -974,7 +974,7 @@ func (d *DynamoDBServer) buildTransactPutPlan(
 	}
 	currentLocation, found, err := d.readLogicalItemAt(ctx, schema, keyAttrs, readTS)
 	if err != nil {
-		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+		return nil, err
 	}
 	var current map[string]attributeValue
 	if found {
@@ -1012,7 +1012,7 @@ func (d *DynamoDBServer) buildTransactUpdatePlan(
 	}
 	currentLocation, found, err := d.readLogicalItemAt(ctx, schema, in.Key, readTS)
 	if err != nil {
-		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+		return nil, err
 	}
 	var current map[string]attributeValue
 	if !found {
@@ -1056,7 +1056,7 @@ func (d *DynamoDBServer) buildTransactDeletePlan(
 	}
 	currentLocation, found, err := d.readLogicalItemAt(ctx, schema, in.Key, readTS)
 	if err != nil {
-		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+		return nil, err
 	}
 	current := map[string]attributeValue(nil)
 	if found {
@@ -1103,7 +1103,7 @@ func (d *DynamoDBServer) buildTransactConditionCheckPlan(
 	}
 	currentLocation, found, err := d.readLogicalItemAt(ctx, schema, in.Key, readTS)
 	if err != nil {
-		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+		return nil, err
 	}
 	current := map[string]attributeValue(nil)
 	if found {

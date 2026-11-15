@@ -514,7 +514,7 @@ func (d *DynamoDBServer) preparePutItemWrite(ctx context.Context, in putItemInpu
 	}
 	currentLocation, found, err := d.readLogicalItemAt(ctx, schema, keyAttrs, readTS)
 	if err != nil {
-		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+		return nil, err
 	}
 	var current map[string]attributeValue
 	if found {
@@ -663,7 +663,7 @@ func (d *DynamoDBServer) prepareDeleteItemWrite(ctx context.Context, in deleteIt
 	}
 	currentLocation, found, err := d.readLogicalItemAt(ctx, schema, in.Key, readTS)
 	if err != nil {
-		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+		return nil, err
 	}
 	current := map[string]attributeValue(nil)
 	if found {
@@ -779,7 +779,7 @@ func (d *DynamoDBServer) prepareUpdateItemWrite(ctx context.Context, in updateIt
 	}
 	currentLocation, found, err := d.readLogicalItemAt(ctx, schema, in.Key, readTS)
 	if err != nil {
-		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+		return nil, err
 	}
 	var current map[string]attributeValue
 	if !found {

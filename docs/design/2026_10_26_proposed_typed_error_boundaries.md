@@ -36,6 +36,9 @@ advertises the detail schema version in each request. A peer sends the detail
 only for the supported version; an old or unknown receiver version gets a
 fixed, detail-free unknown outcome. An upgraded receiver treats an old peer's
 unmarked response as unknown rather than parsing its message.
+The DynamoDB item and transaction planners also preserve storage-read failures
+as internal errors instead of converting them into client validation failures;
+public responses redact the underlying physical key.
 
 This is not whole-cluster activation. Durable logical-operation reconciliation
 across separate invocations, mandatory peer authentication for definitive

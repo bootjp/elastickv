@@ -174,7 +174,7 @@ func (d *DynamoDBServer) readLogicalItemAt(
 ) (*dynamoItemLocation, bool, error) {
 	itemKey, err := schema.itemKeyFromAttributes(key)
 	if err != nil {
-		return nil, false, err
+		return nil, false, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
 	}
 	item, found, err := d.readItemAtKeyAt(ctx, itemKey, ts)
 	if err != nil {
@@ -189,7 +189,7 @@ func (d *DynamoDBServer) readLogicalItemAt(
 	}
 	sourceKey, err := sourceSchema.itemKeyFromAttributes(key)
 	if err != nil {
-		return nil, false, err
+		return nil, false, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
 	}
 	item, found, err = d.readItemAtKeyAt(ctx, sourceKey, ts)
 	if err != nil {
