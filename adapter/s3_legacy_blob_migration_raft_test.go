@@ -3,6 +3,7 @@ package adapter
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -146,7 +147,7 @@ func TestS3LegacyMigrationRaftPebbleRestartAfterFlipAndCompact(t *testing.T) {
 	for i := range fixtures {
 		require.Eventually(t, func() bool {
 			_, err := fixtures[i].store.GetAt(ctx, markerKey, ^uint64(0))
-			return err == store.ErrKeyNotFound
+			return errors.Is(err, store.ErrKeyNotFound)
 		}, 5*time.Second, 10*time.Millisecond)
 		require.NoError(t, fixtures[i].store.Compact(ctx, fixtures[i].store.LastCommitTS()))
 		require.ErrorIs(t, func() error { _, err := fixtures[i].store.GetAt(ctx, legacyKey, ^uint64(0)); return err }(), store.ErrKeyNotFound)
