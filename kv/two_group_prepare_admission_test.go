@@ -30,6 +30,8 @@ func (l localTwoGroupHomeLookup) LookupTwoGroupHome(ctx context.Context, id [16]
 	return raw, l.barrier, l.term, nil
 }
 
+var twoGroupFixtureID = twoGroupOperationID([]byte("home-key"), 10)
+
 func twoGroupPrepareFixture() *pb.TwoGroupPrepareManifest {
 	const commitTS = 42
 	makePrepare := func(key string) *pb.Request {
@@ -40,12 +42,30 @@ func twoGroupPrepareFixture() *pb.TwoGroupPrepareManifest {
 			{Op: pb.Op_PUT, Key: []byte(key), Value: []byte("value")},
 		}}
 	}
-	return &pb.TwoGroupPrepareManifest{Version: twoGroupManifestVersion, OperationId: append([]byte{1}, make([]byte, 15)...),
+	return &pb.TwoGroupPrepareManifest{Version: twoGroupManifestVersion, OperationId: append([]byte(nil), twoGroupFixtureID[:]...),
 		PersistenceTimestamp: commitTS, PrimaryGroupId: 1,
 		Participants: []*pb.TwoGroupPrepareParticipant{
 			{GroupId: 1, Prepare: makePrepare("home-key")},
 			{GroupId: 2, Prepare: makePrepare("secondary-key")},
 		}}
+}
+
+func TestTwoGroupManifestRejectsUnrelatedOperationID(t *testing.T) {
+	manifest := twoGroupPrepareFixture()
+	require.True(t, ValidTwoGroupPrepareManifest(manifest))
+	manifest.OperationId[0] ^= 0xff
+	require.False(t, ValidTwoGroupPrepareManifest(manifest))
+	st, metadata := controlStore(t)
+	called := false
+	_, err := ApplyTwoGroupHomePrepare(t.Context(), st, 1, 1, manifest, func(context.Context) error {
+		called = true
+		return nil
+	})
+	require.ErrorIs(t, err, ErrTwoGroupAdmission)
+	require.False(t, called)
+	_, found, err := LookupTimestampBinding(t.Context(), metadata, twoGroupFixtureID)
+	require.NoError(t, err)
+	require.False(t, found)
 }
 
 func controlStore(t *testing.T) (store.MVCCStore, store.RaftControlMetadataStore) {
@@ -70,7 +90,7 @@ func TestTwoGroupPrepareAdmissionRequiresAppliedHome(t *testing.T) {
 	lookup := localTwoGroupHomeLookup{store: homeMetadata, barrier: 1, term: 1}
 	_, err := ObserveTwoGroupHome(t.Context(), lookup, manifest)
 	require.ErrorIs(t, err, ErrTwoGroupAdmission)
-	_, err = secondaryMetadata.ReadRaftControlMetadata(t.Context(), twoGroupSecondaryKey([16]byte{1}))
+	_, err = secondaryMetadata.ReadRaftControlMetadata(t.Context(), twoGroupSecondaryKey(twoGroupFixtureID))
 	require.ErrorIs(t, err, store.ErrKeyNotFound)
 
 	already, err := ApplyTwoGroupHomePrepare(t.Context(), home, 1, 1, manifest,
@@ -85,7 +105,7 @@ func TestTwoGroupPrepareAdmissionRequiresAppliedHome(t *testing.T) {
 	require.False(t, already)
 	_, err = secondaryMetadata.ReadRaftControlMetadata(t.Context(), []byte("test/secondary-prepared"))
 	require.NoError(t, err)
-	proof, err := secondaryMetadata.ReadRaftControlMetadata(t.Context(), twoGroupSecondaryKey([16]byte{1}))
+	proof, err := secondaryMetadata.ReadRaftControlMetadata(t.Context(), twoGroupSecondaryKey(twoGroupFixtureID))
 	require.NoError(t, err)
 	_, err = validateTwoGroupObservationProof(proof, 2)
 	require.NoError(t, err)
@@ -150,7 +170,7 @@ func TestTwoGroupPrepareAdmissionFailsClosedOnLookupOrApply(t *testing.T) {
 	_, err := ApplyTwoGroupHomePrepare(t.Context(), home, 1, 1, manifest,
 		func(context.Context) error { return errors.New("apply failed") })
 	require.Error(t, err)
-	_, found, err := LookupTwoGroupHomeRecord(t.Context(), metadata, [16]byte{1})
+	_, found, err := LookupTwoGroupHomeRecord(t.Context(), metadata, twoGroupFixtureID)
 	require.NoError(t, err)
 	require.False(t, found)
 	_, err = ObserveTwoGroupHome(t.Context(), localTwoGroupHomeLookup{err: errors.New("leader transferred")}, manifest)
@@ -176,9 +196,9 @@ func TestTwoGroupSecondaryRejectsChangedProjectionAndRollsBackFailedPrepare(t *t
 	_, err = ApplyTwoGroupSecondaryPrepare(t.Context(), secondary, 1, 2, manifest, observed,
 		func(context.Context) error { return errors.New("prepare failed") })
 	require.ErrorContains(t, err, "prepare failed")
-	_, err = secondaryMetadata.ReadRaftControlMetadata(t.Context(), twoGroupSecondaryKey([16]byte{1}))
+	_, err = secondaryMetadata.ReadRaftControlMetadata(t.Context(), twoGroupSecondaryKey(twoGroupFixtureID))
 	require.ErrorIs(t, err, store.ErrKeyNotFound)
-	_, found, err := LookupTimestampBinding(t.Context(), secondaryMetadata, [16]byte{1})
+	_, found, err := LookupTimestampBinding(t.Context(), secondaryMetadata, twoGroupFixtureID)
 	require.NoError(t, err)
 	require.False(t, found)
 }
@@ -191,8 +211,8 @@ func TestTwoGroupPrepareAdmissionRejectsRecordWithoutBindingOnReplay(t *testing.
 		name string
 		key  []byte
 	}{
-		{name: "home", key: twoGroupHomeKey([16]byte{1})},
-		{name: "secondary", key: twoGroupSecondaryKey([16]byte{1})},
+		{name: "home", key: twoGroupHomeKey(twoGroupFixtureID)},
+		{name: "secondary", key: twoGroupSecondaryKey(twoGroupFixtureID)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			st, metadata := controlStore(t)
@@ -216,7 +236,7 @@ func TestTwoGroupPrepareAdmissionRejectsRecordWithoutBindingOnReplay(t *testing.
 				_, err = ApplyTwoGroupSecondaryPrepare(t.Context(), st, 2, 2, manifest, observed, apply)
 			}
 			require.ErrorIs(t, err, ErrTimestampBindingConflict)
-			_, found, lookupErr := LookupTimestampBinding(t.Context(), metadata, [16]byte{1})
+			_, found, lookupErr := LookupTimestampBinding(t.Context(), metadata, twoGroupFixtureID)
 			require.NoError(t, lookupErr)
 			require.False(t, found)
 		})

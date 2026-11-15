@@ -319,7 +319,10 @@ legacy protobuf request. It rejects legacy PREPARE and COMMIT/ABORT at FSM
 apply. The opt-in coordinator
 derives the operation ID internally, proposes home first, reconciles an unknown
 home reply through the authenticated applied lookup, and term-fences the
-secondary proposal through a trusted PREPARE-only call. The path has a private
+secondary proposal through a trusted PREPARE-only call. The manifest validator
+requires that ID to equal the versioned derivation from
+the primary key and transaction start timestamp, which is also the lock
+resolver's durable-record lookup key. The path has a private
 peer-session route for a remote group leader: the RPC carries
 only the canonical manifest, and the destination leader constructs its own
 applied home observation before term-fenced proposal. The peer method is not

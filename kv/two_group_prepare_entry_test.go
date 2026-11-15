@@ -52,7 +52,7 @@ func TestTwoGroupNativePrepareRequiresAppliedHome(t *testing.T) {
 		t.Fatalf("secondary apply halted: %+v", halted.HaltApply())
 	}
 	require.Nil(t, secondaryResult)
-	_, found, err := LookupTimestampBinding(t.Context(), secondaryMetadata, [16]byte{1})
+	_, found, err := LookupTimestampBinding(t.Context(), secondaryMetadata, twoGroupFixtureID)
 	require.NoError(t, err)
 	require.True(t, found)
 }
@@ -66,7 +66,7 @@ func TestTwoGroupNativePrepareRejectsLegacyAndDisabledEntry(t *testing.T) {
 	legacyErr, ok := f.Apply(legacy).(error)
 	require.True(t, ok)
 	require.ErrorIs(t, legacyErr, ErrTwoGroupAdmission)
-	_, found, err := LookupTimestampBinding(t.Context(), metadata, [16]byte{1})
+	_, found, err := LookupTimestampBinding(t.Context(), metadata, twoGroupFixtureID)
 	require.NoError(t, err)
 	require.False(t, found)
 	entry, err := marshalTwoGroupPrepareEntry(1, manifest, TwoGroupAdmissionObservation{})
@@ -136,7 +136,7 @@ func TestTwoGroupNativeSecondaryRejectsTamperedEntry(t *testing.T) {
 		require.True(t, ok)
 		require.ErrorIs(t, applyErr, ErrTwoGroupAdmission)
 	}
-	_, found, err := LookupTimestampBinding(t.Context(), secondaryMetadata, [16]byte{1})
+	_, found, err := LookupTimestampBinding(t.Context(), secondaryMetadata, twoGroupFixtureID)
 	require.NoError(t, err)
 	require.False(t, found)
 }
@@ -164,7 +164,7 @@ func TestTwoGroupNativeHomeRecordSurvivesPebbleRestart(t *testing.T) {
 	t.Cleanup(func() { require.NoError(t, reopened.Close()) })
 	metadata, ok := reopened.(store.RaftControlMetadataStore)
 	require.True(t, ok)
-	_, found, err := LookupTwoGroupHomeRecord(t.Context(), metadata, [16]byte{1})
+	_, found, err := LookupTwoGroupHomeRecord(t.Context(), metadata, twoGroupFixtureID)
 	require.NoError(t, err)
 	require.True(t, found)
 }

@@ -36,7 +36,10 @@ func twoGroupRPCManifest() *pb.TwoGroupPrepareManifest {
 			{Op: pb.Op_PUT, Key: []byte(key), Value: []byte("value")},
 		}}
 	}
-	return &pb.TwoGroupPrepareManifest{Version: 1, OperationId: append([]byte{1}, make([]byte, 15)...),
+	return &pb.TwoGroupPrepareManifest{Version: 1, OperationId: []byte{
+		0x08, 0xc0, 0xcb, 0xe1, 0xb7, 0x61, 0x8d, 0x49,
+		0x2d, 0x8f, 0x93, 0xff, 0x9c, 0x0b, 0x59, 0x12,
+	},
 		PersistenceTimestamp: 42, PrimaryGroupId: 1, Participants: []*pb.TwoGroupPrepareParticipant{
 			{GroupId: 1, Prepare: prepare("home-key")}, {GroupId: 2, Prepare: prepare("secondary-key")},
 		}}

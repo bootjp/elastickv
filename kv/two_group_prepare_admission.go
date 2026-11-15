@@ -91,7 +91,8 @@ func twoGroupManifestProjections(manifest *pb.TwoGroupPrepareManifest) ([2][32]b
 		}
 		projections[n] = projection
 	}
-	if !primaryKeyWritten {
+	expectedID := twoGroupOperationID(primaryKey, startTS)
+	if !primaryKeyWritten || !bytes.Equal(manifest.GetOperationId(), expectedID[:]) {
 		return projections, errors.WithStack(ErrTwoGroupAdmission)
 	}
 	return projections, nil
