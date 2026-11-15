@@ -5,6 +5,8 @@
             [elastickv.cli :as cli]
             [elastickv.db :as db]
             [elastickv.dynamodb-workload :as dynamodb]
+            [elastickv.filesystem-workload :as filesystem]
+            [elastickv.grpc-workload :as grpc]
             [elastickv.redis-workload :as redis]
             [elastickv.s3-workload :as s3]
             [elastickv.sqs-workload :as sqs]
@@ -25,15 +27,23 @@
   {:redis {:workload redis/elastickv-append-workload :port 6379}
    :dynamodb {:workload dynamodb/dynamodb-append-workload :port 8000 :db-port :dynamo-port}
    :s3 {:workload s3/s3-register-workload :port 9000 :db-port :s3-port}
+   :grpc-raw {:workload grpc/grpc-register-workload :port 50051 :grpc-api :raw}
+   :grpc-transactional {:workload grpc/grpc-register-workload :port 50051 :grpc-api :transactional}
+   :filesystem-overwrite {:workload filesystem/filesystem-register-workload :write-mode :overwrite}
+   :filesystem-rename {:workload filesystem/filesystem-register-workload :write-mode :rename}
    :sqs-standard {:workload sqs/sqs-workload :port 9324 :db-port :sqs-port}
    :sqs-htfifo {:workload fifo/sqs-htfifo-workload :port 9324 :db-port :sqs-port}})
 
 (defn queue-adapter? [adapter] (contains? #{:sqs-standard :sqs-htfifo} adapter))
 
+(defn register-adapter? [adapter]
+  (contains? #{:s3 :grpc-raw :grpc-transactional :filesystem-overwrite :filesystem-rename} adapter))
+
 (defn operation-keys [adapter op]
   (case adapter
     (:redis :dynamodb) (when (= :txn (:f op)) (map second (:value op)))
-    :s3 (when (#{:read :write} (:f op)) [(first (:value op))])
+    (:s3 :grpc-raw :grpc-transactional :filesystem-overwrite :filesystem-rename)
+    (when (#{:read :write} (:f op)) [(first (:value op))])
     []))
 
 (defn recovery-keys [adapter op]
@@ -41,7 +51,8 @@
     (:sqs-standard :sqs-htfifo) (when (and (= :recv (:f op))
                                         (not (false? (:receive-performed? op))))
                                 [:queue])
-    :s3 (when (= :read (:f op)) [(first (:value op))])
+    (:s3 :grpc-raw :grpc-transactional :filesystem-overwrite :filesystem-rename)
+    (when (= :read (:f op)) [(first (:value op))])
     (when (= :txn (:f op)) (map second (filter #(= :r (first %)) (:value op))))))
 
 (defn setup-client!
@@ -104,7 +115,7 @@
                    ;; One-key DynamoDB reads avoid TransactGetItems' 100-key
                    ;; limit after Elle has rotated through many key IDs.
                    (mapv (fn [k]
-                           (if (= :s3 adapter)
+                           (if (register-adapter? adapter)
                              {:f :read :final true :value (independent/tuple k nil)}
                              {:f :txn :final true :value [[:r k nil]]}))
                          (sort @touched-keys))))))
@@ -169,7 +180,8 @@
             writes (filter #(and (= :ok (:type %))
                                  (case adapter
                                    (:sqs-standard :sqs-htfifo) (= :send (:f %))
-                                   :s3 (= :write (:f %))
+                                   (:s3 :grpc-raw :grpc-transactional :filesystem-overwrite :filesystem-rename)
+                                   (= :write (:f %))
                                    (and (= :txn (:f %))
                                         (some (fn [[f]] (= :append f)) (:value %)))))
                            (remove #(= :nemesis (:process %)) history))]
@@ -203,22 +215,30 @@
                    (or (:repeat-faults opts) (= 1 min-cycles))
                    (pos? (:concurrency opts))
                    (zero? (mod (:concurrency opts) 3))
-                   (or (not= :s3 adapter) (even? (:concurrency opts)))
+                   (or (not (register-adapter? adapter)) (even? (:concurrency opts)))
                    (or (not (queue-adapter? adapter)) (>= (or (:drain-time opts) 40) 40))
                    (> (:time-limit opts) minimum-time))
-      (throw (ex-info "Require 3 managed nodes, one of partition/kill/pause, positive intervals and keys, concurrency divisible by 3, repeat-faults for multiple cycles, and time-limit > (1 + 6 * min-fault-cycles) * fault-interval"
+      (throw (ex-info "Require 3 managed nodes, one of partition/kill/pause, positive intervals and keys, concurrency divisible by 3 (and even for register adapters), repeat-faults for multiple cycles, and time-limit > (1 + 6 * min-fault-cycles) * fault-interval"
                       {:options opts})))
-    (let [{:keys [workload port db-port]} (adapters adapter)
-          members (str/join "," (map #(str % "=" % ":" (or (:grpc-port opts) 50051)) nodes))
+    (let [{:keys [workload port db-port grpc-api write-mode]} (adapters adapter)
+          grpc-port (or (:grpc-port opts) 50051)
+          client-port (if grpc-api grpc-port port)
+          mount-dir (when write-mode "/mnt/elastickv")
+          members (str/join "," (map #(str % "=" % ":" grpc-port) nodes))
           base (redis/elastickv-redis-test (assoc opts :key-count key-count
                                                      :bootstrap-members members))
-          managed-db (db/db (cond-> {:grpc-port (or (:grpc-port opts) 50051)
+          managed-db (db/db (cond-> {:grpc-port grpc-port
                                     :redis-port 6379 :bootstrap-members members
                                     :encryption (:encryption opts)
                                     :sqs-region "us-east-1"}
-                             db-port (assoc db-port port)))
+                             db-port (assoc db-port port)
+                             mount-dir (assoc :filesystem-mount mount-dir :filesystem-strict true)))
           workload (workload (assoc opts :key-count key-count :sqs-region "us-east-1"
-                                         :node->port (zipmap nodes (repeat port))))
+                                         :node->port (zipmap nodes (repeat client-port))
+                                         :grpc-api grpc-api :grpc-client-bin (db/grpc-client-binary)
+                                         :write-mode write-mode
+                                         :filesystem-strict (boolean mount-dir)
+                                         :node->mount-dir (zipmap nodes (repeat mount-dir))))
           touched-keys (atom (set (range key-count)))
           [_ stop] (fault-ops fault)]
       (assoc (merge base workload)
@@ -227,6 +247,8 @@
              :concurrency (:concurrency opts)
              :disable-sdk-retries true
              :db managed-db
+             :write-mode write-mode
+             :filesystem-strict (boolean mount-dir)
              ;; Images contain all dependencies. Debian OS setup manages system
              ;; services and /etc/hosts, which Docker owns on these nodes.
              :os os/noop
@@ -265,7 +287,7 @@
 
 (def cli-opts
   (into (into cli/common-cli-opts redis/redis-cli-opts)
-        [[nil "--adapter NAME" "redis, dynamodb, s3, sqs-standard, or sqs-htfifo."
+        [[nil "--adapter NAME" "Data adapter: redis, dynamodb, s3, grpc-raw, grpc-transactional, filesystem-overwrite, filesystem-rename, sqs-standard, sqs-htfifo."
           :default :redis :parse-fn keyword]
          [nil "--drain-time SECONDS" "SQS receive/delete-only recovery phase."
           :default 40 :parse-fn #(Integer/parseInt %)]

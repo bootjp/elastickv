@@ -25,6 +25,8 @@ The existing adapter checkers analyze the complete history, including recovery:
 | Redis | 6379 | Strict-serializable list append; read all emitted keys through every node |
 | DynamoDB | 8000 | Strict-serializable list append; one-key final reads avoid the 100-key transaction limit |
 | S3 | 9000 | Knossos linearizable object registers plus Elle read/write registers; final GET for every object through every node |
+| gRPC RawKV / TransactionalKV | 50051 | Elle read/write registers plus Knossos; each Get/Put is one operation |
+| Filesystem overwrite / rename | FUSE via SSH | Elle read/write registers plus Knossos and required final reads |
 | SQS Standard | 9324 | Acknowledged sends must be received and deleted; 40s receive/delete-only drain |
 | SQS HT-FIFO | 9324 | Delivery identities, no lost acknowledged sends, duplicates, or ordering violations; 40s drain |
 
@@ -55,7 +57,10 @@ S3 runs both checkers in each existing job, including multipart workloads.
 
 The complete `store.tar.gz` includes `history.edn`, `results.edn`, and any Elle
 cycle explanations and Graphviz diagrams below checker `elle/` directories.
-S3 also saves its normalized `elle-history.edn` and `elle-results.edn` there.
+S3, gRPC and Filesystem save normalized `elle-history.edn` and `elle-results.edn` there.
+Filesystem/SQLite replay uses `filesystem` to map its pre-created -1 initial
+value to Elle's nil initial version. gRPC replay uses `grpc`; neither mode
+combines separate API calls into an invented transaction.
 Anomaly diagnostics are generated when anomalies are found; successful runs
 need not contain a cycle graph. To recheck an extracted history from `jepsen/`:
 
@@ -112,13 +117,13 @@ startup, recovery, and analysis add to the total job duration.
 ## Scheduled stress suite
 
 `Jepsen Scheduled Stress Test` calls this reusable workflow every six hours.
-It runs all five adapters against all three faults (15 jobs), using a 300s
+It runs nine adapter/workload entries against all three faults (27 jobs), using a 300s
 main phase by default. Fault rounds repeat throughout the main phase and the
 checker requires at least two completed injection/healing cycles per node.
 The final healing phase also recovers an in-progress last round before reads
 or queue draining begin.
 
-Use manual dispatch with `faults-only=true` to run just these 15 jobs. A nonempty
+Use manual dispatch with `faults-only=true` to run just these 27 jobs. A nonempty
 `workloads-json` selects the existing local workloads and omits fault jobs,
 unless `faults-only` is true. The normal PR workflow continues to run only
 Redis for 90s with one round. Scheduled and PR jobs have separate concurrency
@@ -161,3 +166,55 @@ a hard runner termination relies on the hosted VM's disposal.
 The workflow runs on pull requests, main/master pushes, nightly schedules, and
 manual dispatch. It uses read-only repository permissions and no repository
 secrets. Container clock skew and OS/power failures require a separate VM suite.
+
+
+## Additional data adapters
+
+Public gRPC is exercised through a persistent Go JSON-line bridge built from
+`cmd/jepsen-grpc-client`, using the generated RawKV and TransactionalKV clients.
+Each worker has its own connection and helper process. RPCs have deadlines;
+write errors are indeterminate and are never automatically replayed. Missing
+registers remain nil; unexpected read payloads remain observations so the
+checkers can reject them. The TransactionalKV name does not imply multi-request
+transactions: PreWrite/Commit/Rollback are unimplemented, so this suite checks
+its supported Get/Put calls individually.
+
+Filesystem fault jobs use actual node-local FUSE mounts and SSH file operations,
+including overwrite and rename modes. These fault jobs use `--filesystemStrict`
+so every supported mutation has a durable operation identity. An indeterminate
+write keeps its inode barrier closed until journal verification and reply-bound
+acknowledgement establish a terminal decision; recovery never assigns the write a new operation identity.
+Legacy mode deliberately requires a remount after an unjournaled unknown outcome
+and therefore cannot satisfy this suite's live recovery requirement. Existing
+normal legacy workloads remain enabled.
+
+Stopped nodes also use `--filesystemStrictRecover` to fence and recover their
+previous mount session before registering a replacement. The stable owner is the
+node's Raft ID; healthy peers are not restarted or recovered by a heal-all call.
+The managed startup checks the old daemon is stopped and unmounts its stale FUSE
+mount before launching a replacement. Node mount logs record strict/recovery mode.
+
+Only those jobs apply `compose.fuse.yml`,
+which exposes `/dev/fuse`, adds SYS_ADMIN and disables the container AppArmor
+profile for mount operations. Other adapter containers retain their existing
+capabilities. A missing FUSE device fails rather than testing a plain directory.
+Normal CI also checks SQLite through FUSE; it inherits the Filesystem Elle
+checker. SQLite uses one worker per database because locks are local to a mount.
+
+Normal CI preserves encryption off/on and all existing workloads, adds both
+gRPC APIs, and always uploads `elle-adapter-histories-encryption-*`. The scheduled
+normal matrix adds `grpc-raw` and `grpc-transactional`; Filesystem overwrite,
+rename and SQLite entries retain their existing strict/legacy controls and now
+also run Elle. Its fault matrix adds both gRPC APIs and both Filesystem modes.
+SQS retains its dedicated delivery/acknowledgement checkers. Distribution,
+RaftAdmin, backup, monitoring and internal replication/control RPCs do not expose
+application register transactions and are not presented as Elle-tested data
+adapters. Protocol coverage does not imply coverage of every command or API.
+
+```bash
+# Local cluster, from jepsen/ after building the helper at the repository root:
+# go build -o /tmp/jepsen-grpc-client ./cmd/jepsen-grpc-client
+lein run -m elastickv.grpc-workload --local --host 127.0.0.1 \
+  --grpc-ports 50051,50052,50053 --grpc-api raw --concurrency 6
+lein run -m elastickv.elle-checker filesystem /path/to/history.edn /tmp/elle-filesystem
+```
