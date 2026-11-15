@@ -181,7 +181,7 @@ func (*legacyAuditFollowerEngine) Status() raftengine.Status {
 
 func (*legacyAuditFollowerEngine) Leader() raftengine.LeaderInfo { return raftengine.LeaderInfo{} }
 
-func TestLegacyMetadataAuditMatchesBackgroundPassOnSplitShardStore(t *testing.T) {
+func TestLegacyMetadataAuditMatchesBackgroundPassOnSplitRaftGroups(t *testing.T) {
 	ctx := t.Context()
 	routes := distribution.NewEngine()
 	require.NoError(t, routes.ApplySnapshot(distribution.CatalogSnapshot{Version: 10, Routes: []distribution.RouteDescriptor{
@@ -193,9 +193,14 @@ func TestLegacyMetadataAuditMatchesBackgroundPassOnSplitShardStore(t *testing.T)
 	}}))
 	legacy := store.NewMVCCStore()
 	owner := store.NewMVCCStore()
+	hlc := kv.NewHLC()
+	legacyEngine, stopLegacy := newSingleRaftForDistributionE2E(t, "legacy-audit-group", kv.NewKvFSMWithHLC(legacy, hlc))
+	defer stopLegacy()
+	ownerEngine, stopOwner := newSingleRaftForDistributionE2E(t, "owner-audit-group", kv.NewKvFSMWithHLC(owner, hlc))
+	defer stopOwner()
 	shards := kv.NewShardStore(routes, map[uint64]*kv.ShardGroup{
-		1: {Store: legacy, Engine: &localCompactionReadEngine{}},
-		2: {Store: owner, Engine: &localCompactionReadEngine{}},
+		1: {Store: legacy, Engine: legacyEngine},
+		2: {Store: owner, Engine: ownerEngine},
 		3: {Store: store.NewMVCCStore(), Engine: &legacyAuditFollowerEngine{}},
 		4: {Store: store.NewMVCCStore(), Engine: &localCompactionReadEngine{}},
 	})
