@@ -2430,9 +2430,12 @@ func (t *txnContext) buildListRecreateCleanupElems(ctx context.Context) ([]*kv.E
 		if st.deleted || st.metaExists || len(st.appends) == 0 || t.hasReplacement([]byte(key)) {
 			continue
 		}
-		cleanup, _, err := t.server.expiredCollectionCleanupForRecreate(ctx, []byte(key), t.startTS, redisTypeNone, redisTypeList)
+		cleanup, cleaned, err := t.server.expiredCollectionCleanupForRecreate(ctx, []byte(key), t.startTS, redisTypeNone, redisTypeList)
 		if err != nil {
 			return nil, err
+		}
+		if cleaned {
+			t.deletedKeys[key] = struct{}{}
 		}
 		elems = append(elems, cleanup...)
 	}
@@ -2446,9 +2449,12 @@ func (t *txnContext) buildHashRecreateCleanupElems(ctx context.Context) ([]*kv.E
 		if st == nil || st.deleted || !st.dirty || len(st.fields) == 0 || t.hasReplacement([]byte(key)) {
 			continue
 		}
-		cleanup, _, err := t.server.expiredCollectionCleanupForRecreate(ctx, []byte(key), t.startTS, redisTypeNone, redisTypeHash)
+		cleanup, cleaned, err := t.server.expiredCollectionCleanupForRecreate(ctx, []byte(key), t.startTS, redisTypeNone, redisTypeHash)
 		if err != nil {
 			return nil, err
+		}
+		if cleaned {
+			t.deletedKeys[key] = struct{}{}
 		}
 		elems = append(elems, cleanup...)
 	}
@@ -2598,7 +2604,10 @@ func (t *txnContext) zsetRecreateCleanupElems(key []byte, st *zsetTxnState) ([]*
 	if st.exists {
 		return nil, nil
 	}
-	elems, _, err := t.server.expiredCollectionCleanupForRecreate(t.ctxOrBackground(), key, t.startTS, redisTypeNone, redisTypeZSet)
+	elems, cleaned, err := t.server.expiredCollectionCleanupForRecreate(t.ctxOrBackground(), key, t.startTS, redisTypeNone, redisTypeZSet)
+	if cleaned {
+		t.deletedKeys[string(key)] = struct{}{}
+	}
 	return elems, err
 }
 

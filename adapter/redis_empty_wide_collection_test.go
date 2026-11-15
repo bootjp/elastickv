@@ -152,6 +152,24 @@ func TestRedis_MultiRecreateEmptyHashDropsOldTTL(t *testing.T) {
 	require.Equal(t, int64(1), client.ZCard(ctx, key).Val())
 }
 
+func TestRedis_MultiRecreateEmptyZSetWithTTLRetainsCardinality(t *testing.T) {
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	ctx := context.Background()
+	client := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = client.Close() }()
+
+	key := "empty-wide:multi-zset-with-ttl"
+	require.NoError(t, nodes[0].redisServer.store.PutAt(ctx, store.ZSetMetaKey([]byte(key)), store.MarshalZSetMeta(store.ZSetMeta{}), 1, 0))
+	pipe := client.TxPipeline()
+	pipe.ZIncrBy(ctx, key, 1, "member")
+	pipe.PExpire(ctx, key, 30*time.Second)
+	_, err := pipe.Exec(ctx)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), client.ZCard(ctx, key).Val())
+	require.Positive(t, client.PTTL(ctx, key).Val())
+}
+
 func TestRedis_MultiListRecreateEmptyHashDropsOldTTL(t *testing.T) {
 	nodes, _, _ := createNode(t, 1)
 	defer shutdown(nodes)
