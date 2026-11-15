@@ -193,8 +193,8 @@ func (s *ShardStore) classifyLegacyMetadataRowAt(ctx context.Context, groupID ui
 }
 
 func (s *ShardStore) legacyMetadataOwnerReasonAt(ctx context.Context, owner distribution.Route, key []byte, ts uint64) (LegacyMetadataRowReason, error) {
-	g, ok := s.groupForID(owner.GroupID)
-	if !ok || g == nil || g.Store == nil {
+	g, localLeader := s.localLegacyMetadataOwner(ctx, owner.GroupID)
+	if !localLeader {
 		return LegacyMetadataOwnerLedElsewhere, nil
 	}
 	exists, answered, err := s.routeHasVersionAtOrBefore(ctx, owner, key, ts)
@@ -211,6 +211,17 @@ func (s *ShardStore) legacyMetadataOwnerReasonAt(ctx context.Context, owner dist
 		return LegacyMetadataServed, nil
 	}
 	return LegacyMetadataOwnerHasVersion, nil
+}
+
+func (s *ShardStore) localLegacyMetadataOwner(ctx context.Context, groupID uint64) (*ShardGroup, bool) {
+	g, ok := s.groupForID(groupID)
+	if !ok || g == nil || g.Store == nil {
+		return nil, false
+	}
+	if engine := engineForGroup(g); engine != nil && !isLinearizableRaftLeader(ctx, engine) {
+		return nil, false
+	}
+	return g, true
 }
 
 func isLegacyMigrationMetadataKey(key []byte) bool {
