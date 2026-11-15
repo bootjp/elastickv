@@ -332,12 +332,14 @@ startup coordinator wrappers. A separate versioned terminal entry now records
 an immutable local COMMIT/ABORT decision with the binding, and a secondary
 COMMIT requires an applied primary decision observation. The local-leader
 coordinator reconciles a lost primary reply, and the lock resolver retains a
-prepared lock when the required decision or local leadership is unavailable.
-Remote-leader terminal proposals and their private peer route remain missing;
-the local terminal path is not production-ready. Normal Dispatch is fenced
+prepared lock when the required decision or leadership is unavailable. A
+private peer-session route now verifies a remote secondary PREPARE before the
+primary COMMIT and proposes remote COMMIT/ABORT with term and session checks;
+the destination constructs its own applied home-decision observation. This
+route is still default-off and is not production-ready. Normal Dispatch is fenced
 while this opt-in is configured, because legacy terminal COMMIT/ABORT cannot
 consume the new identity. Public Forward cannot supply an observation. The
-production all-member activation gate, remote terminal path, retention
+production all-member activation gate, cross-node Raft fault tests, retention
 horizon, and mixed-version rollout tests remain open. Production must not
 install the opt-in coordinator lookup or enable the FSM command until those
 gates are satisfied.
