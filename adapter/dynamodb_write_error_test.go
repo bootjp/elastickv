@@ -59,7 +59,7 @@ func TestNormalizeDynamoWriteDispatchError(t *testing.T) {
 				require.False(t, isRetryableTransactWriteError(normalized))
 			case tc.want != nil:
 				require.True(t, errors.Is(normalized, tc.want), "missing normalized sentinel %v: %v", tc.want, normalized)
-				require.True(t, shouldPreserveTransactWriteAttempt(normalized))
+				require.Equal(t, !errors.Is(tc.want, store.ErrWriteConflict), shouldPreserveTransactWriteAttempt(normalized))
 			case tc.err != nil:
 				require.False(t, isRetryableTransactWriteError(normalized))
 				require.Equal(t, tc.err, normalized)
