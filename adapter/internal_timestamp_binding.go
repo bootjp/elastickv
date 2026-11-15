@@ -97,13 +97,9 @@ func (i *Internal) LookupTimestampBinding(ctx context.Context, req *pb.LookupTim
 	if err != nil {
 		return nil, err
 	}
-	statusReader, ok := i.leader.(raftengine.StatusReader)
-	if !ok {
-		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "home-group term is unavailable"))
-	}
-	term := statusReader.Status().Term
-	if term == 0 {
-		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "home-group term is unavailable"))
+	statusReader, term, err := i.homeLookupTerm()
+	if err != nil {
+		return nil, err
 	}
 	ctx, cancel := context.WithTimeout(ctx, timestampBindingPeerBudget)
 	defer cancel()
@@ -118,20 +114,56 @@ func (i *Internal) LookupTimestampBinding(ctx context.Context, req *pb.LookupTim
 	if err != nil {
 		return nil, errors.Wrap(err, "lookup home-group binding")
 	}
+	homeRecord, err := lookupOptionalTwoGroupHomeRecord(ctx, metadata, operationID, req.GetHomeAdmissionVersion(), found)
+	if err != nil {
+		return nil, err
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, errors.WithStack(err)
 	}
 	if err := checkHomeBindingLookupFence(ctx, statusReader, term); err != nil {
 		return nil, err
 	}
+	return homeBindingLookupResponse(req.GetHomeAdmissionVersion(), found, binding, homeRecord, index, term), nil
+}
+
+func homeBindingLookupResponse(version uint32, found bool, binding kv.TimestampBinding, homeRecord []byte, index, term uint64) *pb.LookupTimestampBindingResponse {
 	response := &pb.LookupTimestampBindingResponse{Found: found, AppliedIndex: index}
+	if version == kv.TwoGroupHomeAdmissionVersion {
+		response.HomeAdmissionVersion = kv.TwoGroupHomeAdmissionVersion
+		response.HomeAdmissionRecord = homeRecord
+		response.LeaderTerm = term
+	}
 	if found {
 		response.Timestamp = binding.Timestamp
 		response.ManifestDigest = binding.ManifestDigest[:]
 		response.IsTxn = binding.IsTxn
 		response.Phase = binding.Phase
 	}
-	return response, nil
+	return response
+}
+
+func (i *Internal) homeLookupTerm() (raftengine.StatusReader, uint64, error) {
+	reader, ok := i.leader.(raftengine.StatusReader)
+	if !ok {
+		return nil, 0, errors.WithStack(status.Error(codes.FailedPrecondition, "home-group term is unavailable"))
+	}
+	term := reader.Status().Term
+	if term == 0 {
+		return nil, 0, errors.WithStack(status.Error(codes.FailedPrecondition, "home-group term is unavailable"))
+	}
+	return reader, term, nil
+}
+
+func lookupOptionalTwoGroupHomeRecord(ctx context.Context, metadata store.RaftControlMetadataStore, id [16]byte, version uint32, found bool) ([]byte, error) {
+	if version != kv.TwoGroupHomeAdmissionVersion || !found {
+		return nil, nil
+	}
+	record, recordFound, err := kv.LookupTwoGroupHomeRecord(ctx, metadata, id)
+	if err != nil || !recordFound {
+		return nil, errors.Join(kv.ErrTwoGroupAdmission, err)
+	}
+	return record, nil
 }
 
 func checkHomeBindingLookupFence(ctx context.Context, reader raftengine.StatusReader, term uint64) error {
@@ -154,7 +186,8 @@ func (i *Internal) homeBindingLookupInputs(ctx context.Context, req *pb.LookupTi
 	if !validTimestampAdmissionSession(ctx, receipt, false) {
 		return nil, operationID, errors.WithStack(status.Error(codes.PermissionDenied, "home binding lookup requires a data-group peer session"))
 	}
-	if req == nil || len(req.GetOperationId()) != len(operationID) || i.kvForwardRejected {
+	if req == nil || len(req.GetOperationId()) != len(operationID) || i.kvForwardRejected ||
+		req.GetHomeAdmissionVersion() > kv.TwoGroupHomeAdmissionVersion {
 		return nil, operationID, errors.WithStack(status.Error(codes.InvalidArgument, "data-group operation ID is required"))
 	}
 	metadata, ok := i.store.(store.RaftControlMetadataStore)

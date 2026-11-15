@@ -56,7 +56,8 @@ func lookupTimestampBindingMethod(group uint64) peersession.Method {
 		Name: pb.Internal_LookupTimestampBinding_FullMethodName,
 		BoundRequest: func(binding peersession.RequestBinding, value any) (peersession.Message, error) {
 			request, ok := value.(*pb.LookupTimestampBindingRequest)
-			if !ok || !bootstrapExactProto(request) || binding.Group != group || len(request.GetOperationId()) != 16 {
+			if !ok || !bootstrapExactProto(request) || binding.Group != group || len(request.GetOperationId()) != 16 ||
+				request.GetHomeAdmissionVersion() > kv.TwoGroupHomeAdmissionVersion {
 				return peersession.Message{}, peersession.ErrFormat
 			}
 			return bootstrapControlMessage(binding), nil
@@ -74,7 +75,7 @@ func lookupTimestampBindingReply(request peersession.Message, value any) (peerse
 }
 
 func validLookupTimestampBindingResponse(response *pb.LookupTimestampBindingResponse) bool {
-	if !bootstrapExactProto(response) {
+	if !bootstrapExactProto(response) || !validLookupTimestampBindingVersion(response) {
 		return false
 	}
 	if response.GetFound() {
@@ -82,4 +83,16 @@ func validLookupTimestampBindingResponse(response *pb.LookupTimestampBindingResp
 	}
 	return response.GetTimestamp() == 0 && len(response.GetManifestDigest()) == 0 &&
 		!response.GetIsTxn() && response.GetPhase() == pb.Phase_NONE
+}
+
+func validLookupTimestampBindingVersion(response *pb.LookupTimestampBindingResponse) bool {
+	switch response.GetHomeAdmissionVersion() {
+	case 0:
+		return len(response.GetHomeAdmissionRecord()) == 0 && response.GetLeaderTerm() == 0
+	case kv.TwoGroupHomeAdmissionVersion:
+		return response.GetLeaderTerm() != 0 && response.GetAppliedIndex() != 0 &&
+			response.GetFound() == (len(response.GetHomeAdmissionRecord()) != 0)
+	default:
+		return false
+	}
 }

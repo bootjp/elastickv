@@ -449,6 +449,8 @@ message IssueBoundTimestampResponse {
 
 message LookupTimestampBindingRequest {
   bytes operation_id = 1;
+  // Opt-in two-group PREPARE admission. Old servers reject the unknown field.
+  uint32 home_admission_version = 2;
 }
 
 message LookupTimestampBindingResponse {
@@ -458,4 +460,39 @@ message LookupTimestampBindingResponse {
   bool is_txn = 4;
   Phase phase = 5;
   uint64 applied_index = 6;
+  uint32 home_admission_version = 7;
+  bytes home_admission_record = 8;
+  uint64 leader_term = 9;
+}
+
+message TwoGroupPrepareParticipant {
+  uint64 group_id = 1;
+  Request prepare = 2;
+}
+
+message TwoGroupPrepareManifest {
+  bytes operation_id = 1;
+  uint64 persistence_timestamp = 2;
+  uint64 primary_group_id = 3;
+  repeated TwoGroupPrepareParticipant participants = 4;
+  uint32 version = 5;
+}
+
+message TwoGroupHomeAdmissionRecord {
+  uint32 version = 1;
+  TwoGroupPrepareManifest manifest = 2;
+  bytes full_digest = 3;
+  repeated bytes projection_digests = 4;
+  uint64 applied_index = 5;
+  uint64 applied_term = 6;
+}
+
+// Replicated only through the trusted two-group proposer, never Forward.
+message TwoGroupPrepareEntry {
+  uint32 version = 1;
+  uint64 local_group_id = 2;
+  TwoGroupPrepareManifest manifest = 3;
+  bytes home_observation = 4;
+  uint64 home_barrier_index = 5;
+  uint64 home_leader_term = 6;
 }

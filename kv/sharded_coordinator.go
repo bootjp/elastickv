@@ -494,6 +494,8 @@ const (
 // It issues timestamps via a shared HLC and uses ShardRouter to dispatch.
 type ShardedCoordinator struct {
 	operationAdmission OperationAdmission
+	// Nil in production until the all-member two-group activation gate exists.
+	twoGroupHomeLookup func(uint64) (TwoGroupHomeLookup, error)
 	engine             *distribution.Engine
 	router             *ShardRouter
 	groups             map[uint64]*ShardGroup
@@ -2023,6 +2025,9 @@ func (c *ShardedCoordinator) validateCrossShardReadTimestamp(
 // error checks (groupReadKeys, prewrite, commitPrimary, abortCleanup,
 // commitSecondaries) that pushed the parent over the 10-edge limit.
 func (c *ShardedCoordinator) dispatchMultiShardTxn(ctx context.Context, startTS, commitTS, prevCommitTS uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, gids []uint64, readKeys [][]byte, observedRouteVersion uint64, bypassKeysByGroup map[uint64][][]byte, requireAllParticipants ...bool) (*CoordinateResponse, error) {
+	if err := c.preflightMultiShardTxn(prevCommitTS, gids); err != nil {
+		return nil, err
+	}
 	// Fail-closed when a retry carries the option-2 dedup probe key but its
 	// write set / read set spans shards (codex P2 round-10 "reject retries
 	// that leave the one-phase path"). The 2PC log builders only encode
@@ -2032,9 +2037,6 @@ func (c *ShardedCoordinator) dispatchMultiShardTxn(ctx context.Context, startTS,
 	// meant to prevent would reappear. Surface the constraint explicitly so
 	// the caller (or a future multi-shard dedup design) knows the request
 	// shape is unsupported.
-	if prevCommitTS != 0 {
-		return nil, errors.WithStack(ErrTxnDedupRequiresSingleShard)
-	}
 	releaseIdentity, err := c.acquireTxnIdentity(primaryKey, startTS)
 	if err != nil {
 		return nil, err
@@ -2115,6 +2117,16 @@ func (c *ShardedCoordinator) dispatchMultiShardTxn(ctx context.Context, startTS,
 		return nil, errors.WithStack(err)
 	}
 	return &CoordinateResponse{CommitIndex: maxIndex, CommitTS: commitTS}, nil
+}
+
+func (c *ShardedCoordinator) preflightMultiShardTxn(prevCommitTS uint64, gids []uint64) error {
+	if c.twoGroupHomeLookup != nil && len(gids) == 2 {
+		return errors.WithStack(ErrTwoGroupAdmission)
+	}
+	if prevCommitTS != 0 {
+		return errors.WithStack(ErrTxnDedupRequiresSingleShard)
+	}
+	return nil
 }
 
 func primaryCommitDefinitelyRejected(err error) bool {

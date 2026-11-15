@@ -242,6 +242,93 @@ Implementation order:
    fault campaigns, Jepsen, and throughput/latency comparison with the old
    per-window allocator. No production activation before all gates pass.
 
+### 4c. Two-group PREPARE admission record (design contract, not activated)
+
+The first cross-group implementation is limited to exactly two data groups and
+an explicit 16-byte nonzero operation ID. It does not change legacy PREPARE,
+public Forward, or Phase D. A version-1 two-group home-admission record is distinct from
+the existing per-group `TimestampBinding`: the latter hashes one
+group's Raft request and cannot represent a full participant manifest.
+
+- Canonical manifest v1 contains the operation ID, persistence timestamp,
+  primary group ID, and exactly two participants with an identical transaction
+  start timestamp in their PREPARE requests,
+  sorted by distinct group ID. Each participant contains its complete PREPARE
+  projection: ordered mutations (including transaction metadata), read keys,
+  route version, and bypass keys. Transient admission term, peer receipt, and
+  attestation fields are excluded. Reject unknown fields, duplicate groups,
+  noncanonical encoding, or a local PREPARE whose projection differs. Hash the
+  versioned canonical bytes with a domain-separated SHA-256; persist both the
+  full digest and each participant's domain-separated projection digest.
+- The primary data group's indexed Raft entry atomically applies its PREPARE
+  and stages two immutable indexes: operation ID to (timestamp, full digest,
+  both projection digests, primary group, phase) and timestamp to the same
+  identity. An exact replay is idempotent. Any changed timestamp, participant,
+  projection, phase, or primary group is a conflict. The primary's applied
+  record must precede the secondary's PREPARE; a sent or acknowledged proposal
+  without an applied record is not evidence.
+- The secondary leader obtains the primary record only through a private,
+  authenticated peer session to the current home leader. The home handler
+  performs an applied ReadIndex and checks its leader term and session before
+  and after lookup. The response identifies the home group, operation ID,
+  timestamp, full and projection digests, phase, applied index, leader term,
+  and record version. The secondary compares every field to
+  its locally constructed canonical manifest before proposing. Missing,
+  stale-term, ambiguous, malformed, or mismatched evidence fails closed.
+- The secondary leader constructs an admission observation from that verified
+  response; public Forward cannot supply or amend it. The secondary Raft entry
+  carries the observation and canonical manifest. Every secondary replica
+  checks its version, home identity, operation/timestamp, full and local
+  projection digests, and the exact local PREPARE at apply. It atomically
+  stages both secondary binding indexes, the observation, and PREPARE. An
+  absent or incompatible observation rejects the entire entry. Replay after
+  rotation or leader transfer uses the persisted observation, not the old
+  peer session or a fresh RPC. New lookups require a current authenticated
+  session and current home leader; an old TLS key never regains live access.
+  This is durable leader-observed evidence under the trusted-member,
+  crash-fault Raft model, not an independently verifiable Byzantine proof or
+  a cryptographic quorum certificate.
+- COMMIT/ABORT may only consume the matching durable PREPARE identity and
+  record an immutable terminal decision. A secondary COMMIT additionally
+  verifies the matching durable primary COMMIT decision; an unknown primary
+  outcome retains the secondary PREPARE for resolution. A terminal record
+  never releases its timestamp for another operation. No binding or
+  attestation is garbage collected until an explicit retry/outcome-resolution
+  horizon, snapshot retention rule, and all-participant terminal proof are
+  specified and tested;
+  in the interim retain them indefinitely across compaction and restore.
+
+Failure cases to test before activation: secondary-before-home; wrong ID,
+timestamp, primary group, participant set, or projection; forged/expired peer
+credential or caller observation; home leader transfer between ReadIndex and reply;
+secondary transfer between lookup and proposal; lost home PREPARE reply with
+same-ID retry; crash after home apply but before secondary PREPARE; and restore
+of either group before COMMIT/ABORT. A failed apply must leave neither local
+binding nor data. Admission must be built from the authenticated applied
+lookup by the trusted secondary leader; a caller-provided digest cannot replace it.
+Mixed-version activation remains disabled until every voter and learner can
+decode, validate, snapshot, and restore the existing binding and the new
+home/secondary admission records.
+
+Current implementation status: an opt-in, versioned Raft entry carries the
+canonical manifest and the secondary leader's lookup observation. An enabled
+FSM checks its local group, protected entry identity, full manifest, local
+projection and observation, and atomically applies the exact embedded PREPARE
+with the binding and record. Its reserved command prefix cannot alias a bare
+legacy protobuf request. It rejects legacy PREPARE and, until terminal evidence
+exists, legacy COMMIT/ABORT at FSM apply. The opt-in coordinator
+derives the operation ID internally, proposes home first, reconciles an unknown
+home reply through the authenticated applied lookup, and term-fences the
+secondary proposal through a trusted PREPARE-only call. This first path
+requires both group leaders to be local; it fails closed otherwise. Normal
+Dispatch is fenced while this opt-in is configured, because legacy terminal
+COMMIT/ABORT cannot consume the new identity. Public Forward cannot supply an
+observation. The
+production all-member activation gate, remote-leader proposal route, terminal
+COMMIT/ABORT evidence, retention horizon, and mixed-version rollout tests
+remain open. Production must not install the opt-in coordinator lookup or
+enable the FSM command until those gates are satisfied.
+
 ## 5. Open questions
 
 1. ~~Is a per-timestamp group-0 round trip acceptable on the Phase-D path as an

@@ -26,6 +26,7 @@ func TestKVFSMReservedOpcodesAreDistinct(t *testing.T) {
 		"target readiness":  raftEncodeTargetReadiness,
 		"replicated backup": raftEncodeReplicatedBackup,
 		"commit-ts fence":   raftEncodeCommitTSFenceActivation,
+		"two-group prepare": raftEncodeTwoGroupPrepare,
 	}
 	owner := make(map[byte]string, len(opcodes))
 	for name, op := range opcodes {
