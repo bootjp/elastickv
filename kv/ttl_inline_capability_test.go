@@ -32,7 +32,7 @@ func newTTLInlineFSM(t *testing.T, st store.MVCCStore) *kvFSM {
 	return f
 }
 
-func TestTTLInlineCapabilityStaleConfigurationAndMissingProof(t *testing.T) {
+func TestTTLInlineCapabilityStaleConfiguration(t *testing.T) {
 	t.Parallel()
 	st := store.NewMVCCStore()
 	t.Cleanup(func() { require.NoError(t, st.Close()) })
@@ -40,21 +40,36 @@ func TestTTLInlineCapabilityStaleConfigurationAndMissingProof(t *testing.T) {
 	marker := ttlInlineCapabilityMarker{Version: 1, Index: 5, Voters: []uint64{1, 2}, Learners: []uint64{3}}
 	payload := capabilityPayload(t, marker)
 	native := raftengine.NativeConfiguration{Index: 5, Voters: []uint64{2, 1}, Learners: []uint64{3}}
-	require.Nil(t, applyCapability(t, f, 6, native, payload))
-	require.False(t, f.TTLInlineCapabilityActive(), "command alone is not member proof")
-	f.ttlInlineMemberProof = func(raftengine.NativeConfiguration) bool { return true }
 	stale := native
 	stale.Learners = []uint64{3, 4}
-	require.Nil(t, applyCapability(t, f, 7, stale, payload))
+	require.Nil(t, applyCapability(t, f, 6, stale, payload))
 	require.False(t, f.TTLInlineCapabilityActive())
 	stale = native
 	stale.Index = 6
-	require.Nil(t, applyCapability(t, f, 8, stale, payload))
+	require.Nil(t, applyCapability(t, f, 7, stale, payload))
 	require.False(t, f.TTLInlineCapabilityActive())
 	_, err := st.GetAt(t.Context(), ttlInlineCapabilityKey, ^uint64(0))
 	require.ErrorIs(t, err, store.ErrKeyNotFound)
-	require.Nil(t, applyCapability(t, f, 9, native, payload))
-	require.True(t, f.TTLInlineCapabilityActive())
+	require.Nil(t, applyCapability(t, f, 8, native, payload))
+	require.False(t, f.TTLInlineCapabilityActive(), "matching marker is not independent all-member proof")
+	_, err = st.GetAt(t.Context(), ttlInlineCapabilityKey, ^uint64(0))
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+}
+
+func TestTTLInlineCapabilityApplyIsReplicaDeterministic(t *testing.T) {
+	t.Parallel()
+	native := raftengine.NativeConfiguration{Index: 5, Voters: []uint64{1, 2}, Learners: []uint64{3}}
+	payload := capabilityPayload(t, ttlInlineCapabilityMarker{Version: 1, Index: 5, Voters: []uint64{2, 1}, Learners: []uint64{3}})
+	for replica := 0; replica < 2; replica++ {
+		st := store.NewMVCCStore()
+		t.Cleanup(func() { require.NoError(t, st.Close()) })
+		f := newTTLInlineFSM(t, st)
+		require.Nil(t, applyCapability(t, f, 6, native, payload))
+		require.False(t, f.TTLInlineCapabilityActive())
+		require.False(t, f.TTLInlineCapabilityRecorded())
+		_, err := st.GetAt(t.Context(), ttlInlineCapabilityKey, ^uint64(0))
+		require.ErrorIs(t, err, store.ErrKeyNotFound)
+	}
 }
 
 func TestTTLInlineCapabilityRecovery(t *testing.T) {
@@ -63,11 +78,15 @@ func TestTTLInlineCapabilityRecovery(t *testing.T) {
 	st, err := store.NewPebbleStore(dir)
 	require.NoError(t, err)
 	f := newTTLInlineFSM(t, st)
-	f.ttlInlineMemberProof = func(raftengine.NativeConfiguration) bool { return true }
 	native := raftengine.NativeConfiguration{Index: 2, Voters: []uint64{1}, Learners: []uint64{2}}
 	payload := capabilityPayload(t, ttlInlineCapabilityMarker{Version: 1, Index: 2, Voters: []uint64{1}, Learners: []uint64{2}})
 	require.Nil(t, applyCapability(t, f, 3, native, payload))
-	require.True(t, f.TTLInlineCapabilityActive())
+	require.False(t, f.TTLInlineCapabilityActive())
+	writer, ok := st.(store.ReplicatedControlStore)
+	require.True(t, ok)
+	_, err = writer.ApplyReplicatedControlState(t.Context(), ttlInlineCapabilityKey, payload[1:], 3)
+	require.NoError(t, err)
+	require.NoError(t, f.reloadTTLInlineCapability(t.Context()))
 	require.True(t, f.TTLInlineCapabilityRecorded())
 	snap, err := f.Snapshot()
 	require.NoError(t, err)
@@ -169,7 +188,6 @@ func TestTTLInlineCapabilityDisabledHaltsOnAppliedMarker(t *testing.T) {
 	require.True(t, ok)
 	require.NoError(t, f.ttlInlineCapabilityLoadErr)
 	native := raftengine.NativeConfiguration{Index: 2, Voters: []uint64{1}}
-	f.ttlInlineMemberProof = func(raftengine.NativeConfiguration) bool { return true }
 	for _, payload := range [][]byte{
 		capabilityPayload(t, ttlInlineCapabilityMarker{Version: 1, Index: 2, Voters: []uint64{1}}),
 		{raftEncodeTTLInlineCapability, 0xff},

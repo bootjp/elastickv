@@ -46,8 +46,6 @@ type kvFSM struct {
 	ttlInlineCapabilityRecorded atomic.Bool
 	ttlInlineCapabilityLoadErr  error
 	ttlInlineCapabilityDisabled bool
-	// No production producer is wired yet. A command cannot attest its own members.
-	ttlInlineMemberProof func(raftengine.NativeConfiguration) bool
 	// Recovery needs independent local directory-fence and native ConfState proof.
 	ttlInlineRecoveryProof func() (fenced bool, native raftengine.NativeConfiguration)
 	// Disabled until every data-group member and ingress has adopted the
@@ -631,7 +629,7 @@ func (f *kvFSM) applyReservedOpcode(ctx context.Context, data []byte) (any, bool
 	case data[0] == raftEncodeWatermarkAdvance:
 		return f.applyWatermarkAdvance(ctx, data[1:]), true
 	case data[0] == raftEncodeTTLInlineCapability:
-		return f.applyTTLInlineCapability(ctx, data[1:]), true
+		return f.applyTTLInlineCapability(data[1:]), true
 	case data[0] >= fsmwire.OpEncryptionMin && data[0] <= fsmwire.OpEncryptionMax:
 		return f.applyEncryption(f.pendingApplyIdx, data[0], data[1:]), true
 	default:
