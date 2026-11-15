@@ -341,9 +341,11 @@ while this opt-in is configured, because legacy terminal COMMIT/ABORT cannot
 consume the new identity. Public Forward cannot supply an observation. The
 coordinator can construct a canonical manifest for a remote-only participant
 after an authenticated, group-scoped leader probe confirms its applied
-PREPARE-evidence marker. The probe is default-off. Remote-only end-to-end
-PREPARE is still blocked because the later proposer lookup requires a local
-group entry; terminal resolution has the same placement constraint. The
+PREPARE-evidence marker. The probe is default-off. When that probe and the
+existing private PREPARE/terminal peer routes are explicitly configured, the
+coordinator can also propose and resolve a participant with no local group
+entry. This is covered with real FSM apply and in-process peer-route tests;
+cross-node Raft/gRPC fault tests are still needed before activation. The
 production all-member activation gate, cross-node Raft fault tests, retention
 horizon, and mixed-version rollout tests remain open. Production must not
 install the opt-in coordinator lookup or enable the FSM command until those

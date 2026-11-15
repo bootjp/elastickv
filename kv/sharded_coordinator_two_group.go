@@ -124,6 +124,9 @@ func (c *ShardedCoordinator) twoGroupPrimaryAndIDs(primaryKey []byte, grouped ma
 
 func (c *ShardedCoordinator) prepareTwoGroupOrdered(ctx context.Context, manifest *pb.TwoGroupPrepareManifest,
 	ids []uint64, groupedReadKeys map[uint64][][]byte, startTS uint64) (bool, error) {
+	if err := c.requireLocalTwoGroupReadOnlyShards(groupedReadKeys, ids); err != nil {
+		return false, err
+	}
 	primary := manifest.GetPrimaryGroupId()
 	lookup, err := c.twoGroupHomeLookup(primary)
 	if err != nil || lookup == nil {
@@ -147,6 +150,19 @@ func (c *ShardedCoordinator) prepareTwoGroupOrdered(ctx context.Context, manifes
 		return true, err
 	}
 	return false, nil
+}
+
+func (c *ShardedCoordinator) requireLocalTwoGroupReadOnlyShards(groupedReadKeys map[uint64][][]byte, writeIDs []uint64) error {
+	for group, keys := range groupedReadKeys {
+		if len(keys) == 0 || slices.Contains(writeIDs, group) {
+			continue
+		}
+		local := c.groups[group]
+		if local == nil || local.Store == nil || local.Engine == nil {
+			return errors.WithStack(ErrTwoGroupAdmission)
+		}
+	}
+	return nil
 }
 
 func (c *ShardedCoordinator) proposeOrReconcileHome(ctx context.Context, primary uint64,
@@ -258,7 +274,7 @@ func proposeTwoGroupPreparedEntry(ctx context.Context, proposer raftengine.TermF
 }
 
 func (c *ShardedCoordinator) localTwoGroupProposer(ctx context.Context, gid uint64) (raftengine.TermFencedProposer, uint64, error) {
-	g, err := c.txnGroupForID(gid)
+	g, err := c.twoGroupLocalReplica(gid)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -281,4 +297,14 @@ func (c *ShardedCoordinator) localTwoGroupProposer(ctx context.Context, gid uint
 		return nil, 0, errors.WithStack(raftengine.ErrStaleAdmissionTerm)
 	}
 	return proposer, term, nil
+}
+
+func (c *ShardedCoordinator) twoGroupLocalReplica(gid uint64) (*ShardGroup, error) {
+	if c == nil || gid == 0 {
+		return nil, errors.WithStack(ErrTwoGroupAdmission)
+	}
+	if c.groups[gid] == nil {
+		return nil, errors.WithStack(raftengine.ErrNotLeader)
+	}
+	return c.txnGroupForID(gid)
 }

@@ -96,7 +96,7 @@ func (c *ShardedCoordinator) requireLocalTwoGroupPrepare(ctx context.Context, gr
 }
 
 func (c *ShardedCoordinator) localTwoGroupMetadataAfterBarrier(ctx context.Context, group uint64) (store.RaftControlMetadataStore, error) {
-	g, err := c.txnGroupForID(group)
+	g, err := c.twoGroupLocalReplica(group)
 	if err != nil || g.Store == nil || g.Engine == nil {
 		return nil, errors.Join(ErrTwoGroupAdmission, err)
 	}
