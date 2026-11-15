@@ -2,7 +2,6 @@ package adapter
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"math"
 	"net"
@@ -10,6 +9,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/kv"
+	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
@@ -246,12 +246,11 @@ func TestRedisEvalRetriesWriteConflict(t *testing.T) {
 	require.Equal(t, []byte("v1"), value)
 }
 
-func TestRedisXAddRetriesWireWriteConflict(t *testing.T) {
+func TestRedisXAddRetriesTypedWriteConflict(t *testing.T) {
 	t.Parallel()
 
 	st := store.NewMVCCStore()
 	coord := newDedupTestCoordinator(st, 1, false)
-	coord.wireWriteConflicts = true
 	srv := &RedisServer{
 		store:            st,
 		coordinator:      coord,
@@ -273,7 +272,7 @@ func TestRedisXAddRetriesWireWriteConflict(t *testing.T) {
 	require.Equal(t, int64(1), meta.Length)
 }
 
-func TestRedisXAddDedupsLandedWireWriteConflict(t *testing.T) {
+func TestRedisXAddDoesNotReplayLandedLegacyConflict(t *testing.T) {
 	t.Parallel()
 
 	st := store.NewMVCCStore()
@@ -291,10 +290,9 @@ func TestRedisXAddDedupsLandedWireWriteConflict(t *testing.T) {
 		[]byte(cmdXAdd), []byte("retry:stream"), []byte("*"), []byte("field"), []byte("value"),
 	}})
 
-	require.Empty(t, conn.err)
-	require.NotEmpty(t, conn.bulk)
-	require.Equal(t, 2, coord.dispatches, "ambiguous apply plus exact-ts reuse probe")
-	require.Equal(t, 1, coord.probeNoOps, "reuse must observe the landed first attempt")
+	require.Equal(t, redisOutcomeUnknownReply, conn.err)
+	require.Equal(t, 1, coord.dispatches, "unknown result must not replay the landed attempt")
+	require.Equal(t, 0, coord.probeNoOps)
 	meta, found, err := srv.loadStreamMetaAt(context.Background(), []byte("retry:stream"), snapshotTS(coord.Clock(), st))
 	require.NoError(t, err)
 	require.True(t, found)
@@ -370,7 +368,7 @@ func TestRedisXAddDedupDisabledDoesNotReplayLandedWireConflict(t *testing.T) {
 	}})
 
 	require.NotEmpty(t, conn.err)
-	require.Contains(t, conn.err, store.ErrWriteConflict.Error())
+	require.Equal(t, redisOutcomeUnknownReply, conn.err)
 	require.NotContains(t, conn.err, "retry:stream")
 	require.NotContains(t, conn.err, store.StreamEntryPrefix)
 	require.Equal(t, 1, coord.dispatches, "unsafe legacy path must fail closed instead of replaying XADD")
@@ -380,10 +378,10 @@ func TestRedisXAddDedupDisabledDoesNotReplayLandedWireConflict(t *testing.T) {
 	require.Equal(t, int64(1), meta.Length)
 }
 
-func TestRetryRedisWriteRetriesWireTxnLocked(t *testing.T) {
+func TestRetryRedisWriteDoesNotRetryLegacyTxnLocked(t *testing.T) {
 	t.Parallel()
 
-	wireErr := fmt.Errorf("%w: %w", kv.ErrTxnLocked, kv.ForwardTxnLockedStatus())
+	wireErr := kv.ForwardTxnLockedStatus()
 	attempts := 0
 	srv := &RedisServer{}
 	err := srv.retryRedisWrite(context.Background(), func() error {
@@ -394,12 +392,37 @@ func TestRetryRedisWriteRetriesWireTxnLocked(t *testing.T) {
 		return nil
 	})
 
-	require.NoError(t, err)
-	require.Equal(t, 2, attempts)
-	require.Equal(t, redisTxnLockedRetryPolicy, retryPolicyForRedisTxnErr(wireErr))
+	require.ErrorIs(t, err, kv.ErrTransactionOutcomeUnknown)
+	require.Equal(t, 1, attempts)
 }
 
-func TestRetryRedisWriteRetriesWireComposedRouteErrors(t *testing.T) {
+func TestRedisDoesNotRetryUntrustedForwardDetails(t *testing.T) {
+	t.Parallel()
+	for _, wire := range []error{
+		kv.ForwardWriteConflictStatus(),
+		kv.ForwardTxnLockedStatus(),
+		errors.Join(kv.ErrTxnLocked, kv.ForwardTxnLockedStatus()),
+		kv.ForwardNotLeaderStatus(),
+		kv.ForwardDecisionStatus(pb.ForwardFailurePhase_FORWARD_FAILURE_PHASE_ONE_PHASE_APPLY,
+			pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CONFLICT,
+			pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_DEFINITIVELY_ABORTED),
+		kv.ForwardDecisionStatus(pb.ForwardFailurePhase_FORWARD_FAILURE_PHASE_PREPARE,
+			pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CONFLICT,
+			pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN),
+	} {
+		attempts := 0
+		err := (&RedisServer{}).retryRedisWrite(context.Background(), func() error {
+			attempts++
+			return wire
+		})
+		require.Equal(t, 1, attempts)
+		require.ErrorIs(t, err, kv.ErrTransactionOutcomeUnknown)
+		require.NotErrorIs(t, err, store.ErrWriteConflict)
+		require.NotErrorIs(t, err, kv.ErrTxnLocked)
+	}
+}
+
+func TestRetryRedisWriteDoesNotRetryLegacyComposedRouteErrors(t *testing.T) {
 	t.Parallel()
 
 	wireErr := errors.WithStack(kv.ForwardComposed1Status(kv.ErrComposed1Violation))
@@ -413,19 +436,20 @@ func TestRetryRedisWriteRetriesWireComposedRouteErrors(t *testing.T) {
 		return nil
 	})
 
-	require.NoError(t, err)
-	require.Equal(t, 2, attempts)
+	require.ErrorIs(t, err, kv.ErrTransactionOutcomeUnknown)
+	require.Equal(t, 1, attempts)
 }
 
 func TestComposedRouteErrorsAreRetryableButDoNotPreserveAttempts(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name string
-		err  error
+		name      string
+		err       error
+		retryable bool
 	}{
-		{name: "typed violation", err: kv.ErrComposed1Violation},
-		{name: "typed gc", err: kv.ErrComposed1VersionGCd},
+		{name: "typed violation", err: kv.ErrComposed1Violation, retryable: true},
+		{name: "typed gc", err: kv.ErrComposed1VersionGCd, retryable: true},
 		{
 			name: "wire violation",
 			err:  errors.WithStack(kv.ForwardComposed1Status(kv.ErrComposed1Violation)),
@@ -440,7 +464,7 @@ func TestComposedRouteErrorsAreRetryableButDoNotPreserveAttempts(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			require.True(t, isRetryableRedisTxnErr(tt.err))
+			require.Equal(t, tt.retryable, isRetryableRedisTxnErr(tt.err))
 			require.False(t, shouldPreserveRedisTxnAttempt(tt.err))
 		})
 	}
@@ -466,7 +490,7 @@ func TestRetryRedisWriteDoesNotRetryUnclassifiedWireErrors(t *testing.T) {
 				return tt.wireErr
 			})
 
-			require.ErrorIs(t, err, tt.wireErr)
+			require.ErrorIs(t, err, kv.ErrTransactionOutcomeUnknown)
 			require.Equal(t, 1, attempts)
 		})
 	}
@@ -483,8 +507,8 @@ func TestRetryRedisWriteDoesNotReplayOrLeakWireWriteConflict(t *testing.T) {
 		return wireErr
 	})
 
-	require.ErrorIs(t, err, store.ErrWriteConflict)
-	require.Equal(t, store.ErrWriteConflict.Error(), err.Error())
+	require.ErrorIs(t, err, kv.ErrTransactionOutcomeUnknown)
+	require.Equal(t, kv.ErrTransactionOutcomeUnknown.Error(), err.Error())
 	require.NotContains(t, err.Error(), "redis txn retry limit exceeded")
 	require.NotContains(t, err.Error(), store.StreamEntryPrefix)
 	require.Equal(t, 1, attempts)
@@ -498,8 +522,8 @@ func TestNormalizeRetryableRedisTxnErrDropsStorageContext(t *testing.T) {
 		want   error
 		hidden string
 	}{
-		{"wire conflict", kv.ForwardWriteConflictStatus(), store.ErrWriteConflict, "key:"},
-		{"wire lock", kv.ForwardTxnLockedStatus(), kv.ErrTxnLocked, "key:"},
+		{"legacy conflict", kv.ForwardWriteConflictStatus(), kv.ErrTransactionOutcomeUnknown, "key:"},
+		{"legacy lock", kv.ForwardTxnLockedStatus(), kv.ErrTransactionOutcomeUnknown, "key:"},
 		{"local list lock", kv.NewTxnLockedErrorWithDetail(store.ListItemKey([]byte("retry:list"), 2), "timestamp overflow"), kv.ErrTxnLocked, "timestamp overflow"},
 		{"local txn TTL conflict", store.NewWriteConflictError(append([]byte("!txn|cmt|"), redisTTLKey([]byte("retry:ttl"))...)), store.ErrWriteConflict, "retry:ttl"},
 		{"local wide fence conflict", store.NewWriteConflictError(redisTxnWideHashFenceKey([]byte("retry:hash"))), store.ErrWriteConflict, "retry:hash"},

@@ -6,7 +6,7 @@ import (
 )
 
 func isRouteWriteFencedError(err error) bool {
-	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) || isIndeterminateMutationDispatchFailure(err) {
 		return false
 	}
 	return errors.Is(err, kv.ErrRouteWriteFenced)

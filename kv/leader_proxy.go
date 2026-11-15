@@ -32,11 +32,6 @@ const leaderProxyRetryInterval = 25 * time.Millisecond
 // again without a durable operation identity and an authoritative resolution.
 var ErrTransactionOutcomeUnknown = errors.New("transaction outcome unknown")
 
-// Only the leader's structured rejection certifies a definitive OCC conflict.
-func isDefinitiveForwardConflict(err error) bool {
-	return IsForwardWriteConflict(err)
-}
-
 // LeaderProxy forwards transactional requests to the current raft leader when
 // the local node is not the leader.
 type LeaderProxy struct {
@@ -331,10 +326,6 @@ func classifyForwardRPCError(err error, reqs []*pb.Request) error {
 	// Legacy ErrorInfo, malformed details, and unrecognized decisions do
 	// not prove the logical operation was absent or aborted.
 	return &ForwardFailure{Decision: pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN}
-}
-
-func isDefinitiveForwardNotLeader(err error) bool {
-	return IsForwardNotLeader(err)
 }
 
 func (p *LeaderProxy) forwardLeaseRead(callerCtx context.Context) (leaseReadResult, error) {

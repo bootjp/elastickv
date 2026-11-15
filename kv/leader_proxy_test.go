@@ -427,25 +427,16 @@ func TestLeaderProxy_LostResponseCannotBeReclassifiedByLaterConflict(t *testing.
 
 func TestForwardDecisionEvidence(t *testing.T) {
 	t.Parallel()
-
-	rejected := ForwardWriteConflictStatus()
-	require.True(t, isDefinitiveForwardConflict(rejected))
-	require.True(t, isDefinitiveForwardConflict(errors.WithStack(ForwardWriteConflictStatus())))
-	require.False(t, isDefinitiveForwardConflict(status.Error(codes.Aborted, store.ErrWriteConflict.Error())))
-	require.False(t, isDefinitiveForwardNotLeader(rejected))
-	require.False(t, isDefinitiveForwardConflict(status.Error(codes.Unknown, store.NewWriteConflictError([]byte("key")).Error())))
-
-	beforeSubmit := ForwardNotLeaderStatus()
-	require.True(t, isDefinitiveForwardNotLeader(beforeSubmit))
-	require.False(t, isDefinitiveForwardNotLeader(status.Error(codes.Unknown, "not leader")))
-
-	for _, err := range []error{
+	for _, wire := range []error{
+		ForwardWriteConflictStatus(),
+		ForwardNotLeaderStatus(),
 		status.Error(codes.Unknown, "raft engine: leadership lost"),
 		status.Error(codes.Unavailable, "not leader"),
 		status.Error(codes.DeadlineExceeded, "context deadline exceeded"),
 	} {
-		require.False(t, isDefinitiveForwardNotLeader(err))
-		require.False(t, isDefinitiveForwardConflict(err))
+		err := classifyForwardRPCError(wire, []*pb.Request{{IsTxn: true, Phase: pb.Phase_NONE}})
+		require.ErrorIs(t, err, ErrTransactionOutcomeUnknown)
+		require.NotErrorIs(t, err, store.ErrWriteConflict)
 	}
 }
 
@@ -489,7 +480,7 @@ func TestLeaderProxy_SinglePhaseLockUsesStructuredStatus(t *testing.T) {
 	_, err := p.Commit(context.Background(), []*pb.Request{{IsTxn: false, Phase: pb.Phase_NONE}})
 	require.ErrorIs(t, err, ErrTransactionOutcomeUnknown)
 	require.NotErrorIs(t, err, ErrTxnLocked)
-	require.False(t, IsForwardTxnLocked(err))
+	require.NotErrorIs(t, err, ErrTxnLocked)
 	require.Equal(t, 1, svc.callCount())
 }
 

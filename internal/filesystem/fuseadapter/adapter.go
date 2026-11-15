@@ -12,6 +12,7 @@ import (
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -306,6 +307,9 @@ func (a *Adapter) Close() {
 func Errno(err error) syscall.Errno {
 	if err == nil {
 		return 0
+	}
+	if _, ok := status.FromError(err); ok {
+		return syscall.EIO
 	}
 	for _, mapping := range errnoMappings {
 		if errors.Is(err, mapping.err) {

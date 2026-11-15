@@ -3,6 +3,7 @@ package kv
 import (
 	"testing"
 
+	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
@@ -11,47 +12,21 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-func TestForwardStatusClassificationIgnoresDisplayMessage(t *testing.T) {
+func TestLegacyForwardStatusNeverProvesRejection(t *testing.T) {
 	t.Parallel()
-
-	conflict := ForwardWriteConflictStatus()
-	st, ok := status.FromError(conflict)
-	require.True(t, ok)
-	proto := st.Proto()
-	proto.Message = "diagnostic changed to not leader"
-	changed := errors.WithStack(status.FromProto(proto).Err())
-	require.True(t, IsForwardWriteConflict(changed))
-	require.False(t, isTransientLeaderError(changed))
-	require.False(t, IsForwardWriteConflict(status.Error(codes.Aborted, conflict.Error())))
-
-	locked := ForwardTxnLockedStatus()
-	lockedStatus, ok := status.FromError(locked)
-	require.True(t, ok)
-	lockedProto := lockedStatus.Proto()
-	lockedProto.Message = "another message"
-	changedLocked := status.FromProto(lockedProto).Err()
-	require.True(t, IsForwardTxnLocked(changedLocked))
-
-	beforeSubmit := ForwardNotLeaderStatus()
-	leaderStatus, ok := status.FromError(beforeSubmit)
-	require.True(t, ok)
-	leaderProto := leaderStatus.Proto()
-	leaderProto.Message = "renamed pre-submit rejection"
-	require.True(t, IsForwardNotLeader(status.FromProto(leaderProto).Err()))
-	require.False(t, IsForwardNotLeader(status.Error(codes.Unavailable, "not leader")))
-}
-
-func TestForwardStatusDoesNotAcceptUnmarkedErrors(t *testing.T) {
-	t.Parallel()
-
 	for _, err := range []error{
+		ForwardWriteConflictStatus(),
+		ForwardTxnLockedStatus(),
+		ForwardNotLeaderStatus(),
+		ForwardComposed1Status(ErrComposed1Violation),
 		status.Error(codes.Aborted, store.ErrWriteConflict.Error()),
 		status.Error(codes.Unknown, store.NewWriteConflictError([]byte("key")).Error()),
 		status.Error(codes.Unavailable, "not leader"),
 	} {
-		require.False(t, IsForwardWriteConflict(err))
-		require.False(t, IsForwardTxnLocked(err))
-		require.False(t, IsForwardNotLeader(err))
+		got := classifyForwardRPCError(errors.WithStack(err), []*pb.Request{{Phase: pb.Phase_NONE}})
+		require.ErrorIs(t, got, ErrTransactionOutcomeUnknown)
+		require.NotErrorIs(t, got, store.ErrWriteConflict)
+		require.NotErrorIs(t, got, ErrTxnLocked)
 	}
 }
 

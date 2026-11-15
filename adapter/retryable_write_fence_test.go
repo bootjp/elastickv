@@ -39,6 +39,19 @@ func TestUnprovenWireWriteFenceErrorsAreNotAdapterRetryable(t *testing.T) {
 	}
 }
 
+func TestUntrustedStatusCannotBorrowLocalConflictForRetry(t *testing.T) {
+	t.Parallel()
+	for _, cause := range []error{store.ErrWriteConflict, kv.ErrTxnLocked, kv.ErrRouteWriteFenced} {
+		err := errors.Join(cause, kv.ForwardWriteConflictStatus())
+		require.False(t, isRetryableTransactWriteError(err))
+		require.False(t, isIgnorableTransactRaceError(err))
+		require.False(t, isRetryableRedisTxnErr(err))
+		require.False(t, isRetryableS3MutationErr(err))
+		require.False(t, isRouteWriteFencedError(err))
+		require.False(t, isAmbiguousRedisExecDispatchErr(err))
+	}
+}
+
 func TestWireWriteFenceMatcherRequiresSentinelSuffix(t *testing.T) {
 	t.Parallel()
 

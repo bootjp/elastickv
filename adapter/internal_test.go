@@ -164,7 +164,7 @@ func TestForwardUnknownStatusKeepsLockCauseWithoutCertifyingOutcome(t *testing.T
 		require.True(t, ok)
 		require.Equal(t, pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CONFLICT, reason)
 		require.Equal(t, pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN, decision)
-		require.False(t, kv.IsForwardTxnLocked(err))
+		require.Equal(t, codes.Unknown, status.Code(err))
 	}
 }
 

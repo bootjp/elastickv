@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/kv"
+	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	cerrors "github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
@@ -50,8 +51,7 @@ func (c *forwardedRootRaceCoordinator) Dispatch(
 }
 
 func forwardedWriteConflict() error {
-	wire := kv.ForwardWriteConflictStatus()
-	return cerrors.Wrapf(wire, "leader forward failed after %d retries", 3)
+	return cerrors.Wrap(kv.ErrTransactionOutcomeUnknown, "legacy Forward conflict has no decision proof")
 }
 
 func TestServiceInitializeRootRetriesForwardedWriteConflict(t *testing.T) {
@@ -104,7 +104,11 @@ func TestIsWriteConflict(t *testing.T) {
 		{name: "typed conflict", err: store.NewWriteConflictError(conflictKey), want: true, wantRoot: true},
 		{name: "wrapped typed conflict", err: cerrors.Wrap(store.ErrWriteConflict, "txn"), want: true, wantRoot: true},
 		{name: "unknown attempt with conflict detail", err: errors.Join(kv.ErrTransactionOutcomeUnknown, store.ErrWriteConflict), want: false},
-		{name: "forwarded typed status", err: forwardedWriteConflict(), wantRoot: true},
+		{name: "legacy forwarded status", err: forwardedWriteConflict()},
+		{name: "forged legacy detail", err: kv.ForwardWriteConflictStatus()},
+		{name: "legacy detail joined with local cause", err: errors.Join(store.ErrWriteConflict, kv.ForwardWriteConflictStatus())},
+		{name: "forged current detail", err: kv.ForwardDecisionStatus(pb.ForwardFailurePhase_FORWARD_FAILURE_PHASE_ONE_PHASE_APPLY, pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CONFLICT, pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_DEFINITIVELY_ABORTED)},
+		{name: "wrong phase detail", err: kv.ForwardDecisionStatus(pb.ForwardFailurePhase_FORWARD_FAILURE_PHASE_PREPARE, pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CONFLICT, pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN)},
 		{name: "forwarded aborted status without typed marker", err: status.Error(codes.Aborted, store.NewWriteConflictError(conflictKey).Error())},
 		{name: "forwarded other code", err: status.Error(codes.Unavailable, store.NewWriteConflictError(conflictKey).Error()), want: false},
 		{name: "status without key envelope", err: status.Error(codes.Unknown, "write conflict"), want: false},

@@ -1190,14 +1190,14 @@ func (d *DynamoDBServer) resolveTransactTableSchema(ctx context.Context, cache m
 }
 
 func isRetryableTransactWriteError(err error) bool {
-	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) || isIndeterminateMutationDispatchFailure(err) {
 		return false
 	}
 	return errors.Is(err, store.ErrWriteConflict) || errors.Is(err, kv.ErrTxnLocked) || isRouteWriteFencedError(err)
 }
 
 func isIgnorableTransactRaceError(err error) bool {
-	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) || isIndeterminateMutationDispatchFailure(err) {
 		return false
 	}
 	// Route fences reject before applying the write. They must be retried or

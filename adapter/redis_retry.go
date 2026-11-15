@@ -40,19 +40,18 @@ var (
 )
 
 func isRetryableRedisTxnErr(err error) bool {
-	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) || isRedisTransportUncertain(err) {
 		return false
 	}
 	return isReusableRedisTxnErr(err) || isRedisComposedRouteErr(err)
 }
 
 func isReusableRedisTxnErr(err error) bool {
-	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) || isRedisTransportUncertain(err) {
 		return false
 	}
 	return errors.Is(err, store.ErrWriteConflict) ||
 		errors.Is(err, kv.ErrTxnLocked) ||
-		wireRedisTxnErrKind(err) == redisTxnWireErrLocked ||
 		isRouteWriteFencedError(err)
 }
 
@@ -63,70 +62,21 @@ func shouldPreserveRedisTxnAttempt(err error) bool {
 }
 
 func isRedisComposedRouteErr(err error) bool {
-	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) || isRedisTransportUncertain(err) {
 		return false
 	}
 	if errors.Is(err, kv.ErrComposed1Violation) ||
 		errors.Is(err, kv.ErrComposed1VersionGCd) {
 		return true
 	}
-	parsed := parseWireRedisTxnErr(err)
-	return errors.Is(parsed, kv.ErrComposed1Violation) ||
-		errors.Is(parsed, kv.ErrComposed1VersionGCd)
+	return false
 }
 
 func retryPolicyForRedisTxnErr(err error) redisTxnRetryPolicy {
-	if errors.Is(err, kv.ErrTxnLocked) || wireRedisTxnErrKind(err) == redisTxnWireErrLocked {
+	if errors.Is(err, kv.ErrTxnLocked) {
 		return redisTxnLockedRetryPolicy
 	}
 	return redisWriteConflictRetryPolicy
-}
-
-type redisTxnWireErrKind uint8
-
-const (
-	redisTxnWireErrNone redisTxnWireErrKind = iota
-	redisTxnWireErrWriteConflict
-	redisTxnWireErrLocked
-)
-
-// parseWireRedisTxnErr restores transaction error typing after an internal
-// leader redirect crosses gRPC. Structured status details preserve the
-// rejection kind without interpreting diagnostic messages or transporting keys.
-// Wire write conflicts are not generally retryable: a lost forwarding response
-// can turn an already-applied write into a later self-conflict. Reuse-aware
-// callers explicitly normalize them before retrying; all other callers return
-// the normalized error without replaying the operation or exposing the internal
-// key layout.
-func parseWireRedisTxnErr(err error) error {
-	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
-		return nil
-	}
-	if kv.IsForwardWriteConflict(err) {
-		return errors.WithStack(store.ErrWriteConflict)
-	}
-	if kv.IsForwardTxnLocked(err) {
-		return errors.WithStack(kv.ErrTxnLocked)
-	}
-	if kv.IsForwardComposed1Violation(err) {
-		return errors.WithStack(kv.ErrComposed1Violation)
-	}
-	if kv.IsForwardComposed1VersionGCd(err) {
-		return errors.WithStack(kv.ErrComposed1VersionGCd)
-	}
-	return nil
-}
-
-func wireRedisTxnErrKind(err error) redisTxnWireErrKind {
-	parsed := parseWireRedisTxnErr(err)
-	switch {
-	case errors.Is(parsed, store.ErrWriteConflict):
-		return redisTxnWireErrWriteConflict
-	case errors.Is(parsed, kv.ErrTxnLocked):
-		return redisTxnWireErrLocked
-	default:
-		return redisTxnWireErrNone
-	}
 }
 
 func waitRedisRetryBackoff(ctx context.Context, delay time.Duration) bool {
@@ -162,12 +112,8 @@ func (r *RedisServer) retryRedisWrite(ctx context.Context, fn func() error) erro
 		if err == nil {
 			return nil
 		}
-		// Classify the original transport shape before normalization. A wire
-		// write conflict is ambiguous — the forwarded apply may already have
-		// landed — so the generic loop must return it without replaying. Wire
-		// TxnLocked remains retryable because the lock rejection did not apply
-		// the transaction. Reuse-aware callers convert wire conflicts to typed
-		// errors before returning them here.
+		// Only local typed rejections are retryable. An ErrorInfo status does
+		// not carry phase or decision proof, even when it names a conflict.
 		retryable := isRetryableRedisTxnErr(err)
 		err = normalizeRetryableRedisTxnErr(err)
 		if !retryable {
@@ -194,8 +140,8 @@ func normalizeRetryableRedisTxnErr(err error) error {
 	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
 		return err
 	}
-	if parsed := parseWireRedisTxnErr(err); parsed != nil {
-		return parsed
+	if isRedisTransportUncertain(err) {
+		return errors.WithStack(kv.ErrTransactionOutcomeUnknown)
 	}
 	if errors.Is(err, kv.ErrTxnLocked) {
 		return errors.WithStack(kv.ErrTxnLocked)
