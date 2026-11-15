@@ -44,6 +44,7 @@ jobs:
           command -v jq >/dev/null || packages+=(jq)
           command -v fusermount3 >/dev/null || packages+=(fuse3)
           command -v sqlite3 >/dev/null || packages+=(sqlite3)
+          command -v dot >/dev/null || packages+=(graphviz)
           command -v strace >/dev/null || packages+=(strace)
           if ((${#packages[@]})); then
             sudo apt-get update

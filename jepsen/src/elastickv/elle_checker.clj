@@ -1,0 +1,102 @@
+(ns elastickv.elle-checker
+  "Elle checks and offline replay of client-observed transaction histories."
+  (:gen-class)
+  (:require [clojure.edn :as edn]
+            [clojure.java.io :as io]
+            [elle.list-append :as append]
+            [elle.rw-register :as register]
+            [jepsen.checker :as checker]
+            [jepsen.history :as history]
+            [jepsen.store :as store])
+  (:import [java.io PushbackReader]))
+
+(def models [:strict-serializable])
+
+(defn s3-operation
+  "One S3 request is one transaction. Preserve uncertainty and event ordering;
+   never combine separate HTTP requests into an invented atomic transaction."
+  [op]
+  (if (= :nemesis (:process op))
+    op
+    (let [value (:value op)
+          f (case (:f op) :read :r :write :w
+                  (throw (ex-info "Unsupported S3 operation" {:f (:f op)})))]
+      (when-not (and (sequential? value) (= 2 (count value)))
+        (throw (ex-info "Expected an S3 independent key/value pair" {})))
+      (assoc op :f :txn :value [[f (first value) (second value)]]))))
+
+(defn transaction-history [kind events]
+  (case kind
+    :s3 (history/history (mapv s3-operation events))
+    (:list-append :rw-register) (history/history events)
+    (throw (ex-info "Expected list-append, rw-register, or s3" {:kind kind}))))
+
+(defn check-history [kind events directory]
+  (let [h (transaction-history kind events)
+        opts {:consistency-models models :directory (str directory)}]
+    (when (#{:rw-register :s3} kind)
+      ;; Elle infers versions from values. Reusing a written value for one key
+      ;; violates its assumptions, even when the underlying API allows it.
+      (let [writes (for [op h
+                         :when (and (= :invoke (:type op)) (not= :nemesis (:process op)))
+                         [f k v] (:value op)
+                         :when (= :w f)]
+                     [k v])]
+        (when (or (some #(nil? (second %)) writes)
+                  (not= (count writes) (count (set writes))))
+          (throw (ex-info "Elle register writes must use unique non-nil values per key" {})))))
+    (case kind
+      :list-append (append/check opts h)
+      (:rw-register :s3) (register/check opts h))))
+
+(defn read-history [file]
+  ;; Jepsen history.edn contains one EDN operation per form, not a vector.
+  ;; EDN reading does not evaluate code from an artifact.
+  (with-open [reader (PushbackReader. (io/reader file))]
+    (loop [events []]
+      (let [op (edn/read {:eof ::eof :default tagged-literal} reader)]
+        (if (= ::eof op)
+          events
+          (do
+            (when-not (map? op)
+              (throw (ex-info "Expected one operation map per EDN form" {})))
+            (recur (conj events op))))))))
+
+(defn analyze-history!
+  "Retain the normalized input and Elle verdict alongside anomaly diagnostics."
+  [kind events directory]
+  (let [h (transaction-history kind events)
+        dir (io/file directory)]
+    (.mkdirs dir)
+    (with-open [writer (io/writer (io/file dir "elle-history.edn"))]
+      (doseq [op h]
+        (.write writer (str (pr-str (into {} op)) "\n"))))
+    ;; S3 has already been normalized; do not transform a second time.
+    (let [result (check-history (if (= kind :s3) :rw-register kind) h dir)]
+      (spit (io/file dir "elle-results.edn") (pr-str result))
+      result)))
+
+(defn analyze-file! [kind input directory]
+  (analyze-history! kind (read-history input) directory))
+
+(defn s3-checker []
+  (reify checker/Checker
+    (check [_ test h opts]
+      (analyze-history! :s3 h
+                        (.getCanonicalPath
+                          (store/path! test (:subdirectory opts) "elle"))))))
+
+(defn -main [& args]
+  (try
+    (when-not (= 3 (count args))
+      (throw (ex-info "Usage: KIND HISTORY.edn OUTPUT-DIRECTORY; KIND=list-append|rw-register|s3" {})))
+    (let [[kind input directory] args
+          result (analyze-file! (keyword kind) input directory)]
+      (prn result)
+      (shutdown-agents)
+      (when-not (true? (:valid? result))
+        (System/exit 1)))
+    (catch Exception e
+      (binding [*out* *err*] (println (.getMessage e)))
+      (shutdown-agents)
+      (System/exit 2))))

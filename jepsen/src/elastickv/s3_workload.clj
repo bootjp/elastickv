@@ -10,6 +10,7 @@
             [clj-http.conn-mgr :as conn]
             [elastickv.cli :as cli]
             [elastickv.db :as ekdb]
+            [elastickv.elle-checker :as elle]
             [jepsen [checker :as checker]
                     [client :as client]
                     [generator :as gen]
@@ -344,7 +345,9 @@
                     (->> (gen/mix [(map (fn [v] {:f :write :value v}) (range))
                                   (gen/repeat {:f :read})])
                          (gen/limit max-writes))))
-     :checker   (let [register (independent/checker (s3-register-checker))]
+     :checker   (let [register (checker/compose
+                                {:register (independent/checker (s3-register-checker))
+                                 :elle (elle/s3-checker)})]
                   (if (:multipart opts)
                     (checker/compose {:register register
                                       :complete-final-reads (multipart-final-reads-checker key-count)})
