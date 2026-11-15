@@ -40,9 +40,18 @@ type auditPinObservingStore struct {
 
 type auditBlockingStore struct {
 	store.MVCCStore
-	entered chan struct{}
-	release chan struct{}
-	once    sync.Once
+	retention store.RetentionController
+	entered   chan struct{}
+	release   chan struct{}
+	once      sync.Once
+}
+
+func (s *auditBlockingStore) MinRetainedTS() uint64 {
+	return s.retention.MinRetainedTS()
+}
+
+func (s *auditBlockingStore) SetMinRetainedTS(ts uint64) {
+	s.retention.SetMinRetainedTS(ts)
 }
 
 func (s *auditBlockingStore) ScanAt(ctx context.Context, start, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
@@ -57,7 +66,10 @@ func (s *auditBlockingStore) ScanAt(ctx context.Context, start, end []byte, limi
 
 func newBlockingLegacyMetadataAuditor(t *testing.T) (*LegacyMetadataAuditor, *auditBlockingStore, *kv.ActiveTimestampTracker) {
 	t.Helper()
-	st := &auditBlockingStore{MVCCStore: store.NewMVCCStore(), entered: make(chan struct{}), release: make(chan struct{})}
+	base := store.NewMVCCStore()
+	retention, ok := base.(store.RetentionController)
+	require.True(t, ok)
+	st := &auditBlockingStore{MVCCStore: base, retention: retention, entered: make(chan struct{}), release: make(chan struct{})}
 	require.NoError(t, st.PutAt(t.Context(), store.HashMetaKey([]byte("apple")), []byte("legacy"), 5, 0))
 	routes := distribution.NewEngine()
 	routes.UpdateRoute(nil, nil, 1)
@@ -103,6 +115,56 @@ func TestLegacyMetadataAuditorReleasesPinAtServerDeadline(t *testing.T) {
 	require.Empty(t, result.Passes)
 	require.Zero(t, tracker.Oldest())
 	close(st.release)
+}
+
+type auditCompactionStatus struct{}
+
+func (auditCompactionStatus) Status() raftengine.Status {
+	return raftengine.Status{State: raftengine.StateFollower, AppliedIndex: 1, CommitIndex: 1}
+}
+
+func TestLegacyMetadataAuditReadSurvivesConcurrentFSMCompaction(t *testing.T) {
+	auditor, st, tracker := newBlockingLegacyMetadataAuditor(t)
+	key := store.HashMetaKey([]byte("apple"))
+	require.NoError(t, st.PutAt(t.Context(), key, []byte("before"), 8, 0))
+	completed := make(chan struct {
+		result LegacyMetadataAuditResult
+		err    error
+	}, 1)
+	go func() {
+		result, err := auditor.AuditLegacyMetadata(t.Context(), 1, 8)
+		completed <- struct {
+			result LegacyMetadataAuditResult
+			err    error
+		}{result, err}
+	}()
+	select {
+	case <-st.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("audit did not reach the physical scan")
+	}
+	readTS := tracker.Oldest()
+	require.Equal(t, uint64(8), readTS)
+	require.NoError(t, st.PutAt(t.Context(), key, []byte("after"), 10, 0))
+	compactor := kv.NewFSMCompactor(
+		[]kv.FSMCompactRuntime{{GroupID: 1, StatusReader: auditCompactionStatus{}, Store: st}},
+		kv.WithFSMCompactorActiveTimestampTracker(tracker),
+		kv.WithFSMCompactorInterval(time.Hour),
+		kv.WithFSMCompactorRetentionWindow(time.Millisecond),
+	)
+	require.NoError(t, compactor.SyncOnce(t.Context()))
+	value, err := st.GetAt(t.Context(), key, readTS)
+	require.NoError(t, err)
+	require.Equal(t, []byte("before"), value)
+	close(st.release)
+	finished := <-completed
+	require.NoError(t, finished.err)
+	require.Equal(t, LegacyMetadataAuditComplete, finished.result.Status)
+	require.Equal(t, readTS, finished.result.ReadTS)
+	require.Zero(t, tracker.Oldest())
+	require.NoError(t, compactor.SyncOnce(t.Context()))
+	_, err = st.GetAt(t.Context(), key, readTS)
+	require.ErrorIs(t, err, store.ErrReadTSCompacted)
 }
 
 type legacyAuditNoWriteCoordinator struct{ kv.Coordinator }
