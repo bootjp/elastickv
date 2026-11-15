@@ -332,9 +332,9 @@ func classifyValidatedForwardFailure(phase pb.ForwardFailurePhase, reason pb.For
 		decision == pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_DEFINITIVELY_ABORTED {
 		switch reason {
 		case pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CONFLICT:
-			return errors.WithStack(store.ErrWriteConflict)
+			return errors.WithStack(&ForwardApplyRejection{cause: store.ErrWriteConflict})
 		case pb.ForwardFailureReason_FORWARD_FAILURE_REASON_FENCE:
-			return errors.WithStack(ErrRouteWriteFenced)
+			return errors.WithStack(&ForwardApplyRejection{cause: ErrRouteWriteFenced})
 		case pb.ForwardFailureReason_FORWARD_FAILURE_REASON_UNSPECIFIED,
 			pb.ForwardFailureReason_FORWARD_FAILURE_REASON_NO_LEADER,
 			pb.ForwardFailureReason_FORWARD_FAILURE_REASON_INTERRUPTED,

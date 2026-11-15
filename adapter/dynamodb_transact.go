@@ -1206,12 +1206,12 @@ func isIgnorableTransactRaceError(err error) bool {
 }
 
 func shouldPreserveTransactWriteAttempt(err error) bool {
-	// A classified write conflict proves this dispatch did not apply. Retrying
-	// its old write set with PrevCommitTS would need a prior-attempt receipt;
-	// instead, start a new attempt from a fresh read. Keep lock failures on the
-	// dedup path because their prior outcome is not certified here.
+	// Only an indexed apply rejection or a validated Forward verdict proves
+	// this conflict did not apply. A raw conflict can follow a landed write;
+	// keep its write set for the prior-attempt dedup probe.
 	return isRetryableTransactWriteError(err) &&
-		!isRouteWriteFencedError(err) && !errors.Is(err, store.ErrWriteConflict)
+		!isRouteWriteFencedError(err) &&
+		(!errors.Is(err, store.ErrWriteConflict) || !kv.IsCertifiedOnePhaseConflict(err))
 }
 
 func waitTransactRetryBackoff(ctx context.Context, delay time.Duration) error {

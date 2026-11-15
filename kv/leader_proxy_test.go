@@ -550,6 +550,7 @@ func TestCoordinateRedirectAcceptsIndexedOnePhaseConflict(t *testing.T) {
 	_, err := c.redirect(context.Background(), &OperationGroup[OP]{Elems: []*Elem[OP]{{Op: Put, Key: []byte("k"), Value: []byte("v")}}})
 	require.ErrorIs(t, err, store.ErrWriteConflict)
 	require.NotErrorIs(t, err, ErrTransactionOutcomeUnknown)
+	require.True(t, IsCertifiedOnePhaseConflict(err))
 	require.Equal(t, 1, svc.callCount())
 }
 
