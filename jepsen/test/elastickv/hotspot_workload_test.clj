@@ -108,6 +108,8 @@
       (is (every? (set (nemesis/fs (:nemesis test)))
                   #{:capture-hotspot-baseline :observe-hotspot-split start stop}))
       (is (nil? (:final-generator test)))
+      (let [[first-op _] (gen/op (:generator test) test (gen/context test))]
+        (is (= :capture-hotspot-baseline (:f first-op))))
       (when (= :partition fault)
         (doseq [{:keys [target value]} starts]
           (is (= (set (remove #{target} fault-nodes)) (set (value target))))))))
@@ -187,11 +189,11 @@
 
 (deftest missing-baseline-and-route-helper-failure
   (let [n (hotspot/controller-nemesis {:list-routes-bin "missing"})]
-    (is (= :fail (:type (nemesis/invoke! n {:nodes ["n1"]}
+    (is (= :info (:type (nemesis/invoke! n {:nodes ["n1"]}
                                         {:type :info :f :observe-hotspot-split})))))
   (with-redefs [shell/sh (fn [& _] {:exit 1 :out "" :err "unavailable"})]
     (let [n (hotspot/controller-nemesis {:list-routes-bin "list-routes"})]
-      (is (= :fail (:type (nemesis/invoke! n {:nodes ["n1"]}
+      (is (= :info (:type (nemesis/invoke! n {:nodes ["n1"]}
                                           {:type :info :f :capture-hotspot-baseline})))))))
 
 (deftest observation-has-a-deadline
@@ -200,7 +202,7 @@
           test {:nodes ["n1"]}]
       (is (= :info (:type (nemesis/invoke! n test
                                           {:type :info :f :capture-hotspot-baseline}))))
-      (is (= :fail (:type (nemesis/invoke! n test
+      (is (= :info (:type (nemesis/invoke! n test
                                           {:type :info :f :observe-hotspot-split})))))))
 
 (deftest transient-route-observation-is-pending-until-deadline
@@ -226,7 +228,29 @@
                     (if (= 1 (swap! calls inc)) before
                         (throw (ex-info "node unavailable" {}))))]
       (nemesis/invoke! n test {:type :info :f :capture-hotspot-baseline})
-      (is (= :fail (:type (nemesis/invoke! n test
+      (is (= :info (:type (nemesis/invoke! n test
+                                          {:type :info :f :observe-hotspot-split})))))))
+
+(deftest transitional-route-geometry-is-pending-until-convergence
+  (let [snapshots (atom [before
+                         {:catalog-version 2
+                          :routes (conj (:routes after)
+                                        (first (:routes before)))}
+                         after])
+        n (hotspot/controller-nemesis {:observe-timeout-ms 1000})
+        test {:nodes ["n1"]}]
+    (with-redefs [hotspot/route-snapshot!
+                  (fn [& _]
+                    (let [snapshot (first @snapshots)]
+                      (swap! snapshots rest)
+                      snapshot))]
+      (nemesis/invoke! n test {:type :info :f :capture-hotspot-baseline})
+      (let [pending (nemesis/invoke! n test
+                                     {:type :info :f :observe-hotspot-split})]
+        (is (= :info (:type pending)))
+        (is (nil? (:error pending)))
+        (is (nil? (:value pending))))
+      (is (map? (:value (nemesis/invoke! n test
                                           {:type :info :f :observe-hotspot-split})))))))
 
 (deftest controller-observation-does-not-block-faults

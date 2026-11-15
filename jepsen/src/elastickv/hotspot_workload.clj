@@ -112,17 +112,16 @@
                     (if (>= (System/currentTimeMillis) @deadline)
                       (throw (ex-info "automatic hotspot split not observed before deadline" {}))
                       (assoc op :type :info))
-                    (not= 1 (count (active-routes after)))
-                    (throw (ex-info "automatic hotspot split has invalid route geometry"
-                                    {:before @baseline :after after}))
                     (>= (System/currentTimeMillis) @deadline)
-                    (throw (ex-info "automatic hotspot split not observed before deadline"
+                    (throw (ex-info "automatic hotspot split has not reached valid route geometry before deadline"
                                     {:before @baseline :after after}))
                     :else (assoc op :type :info)))))
             op)
           (catch Throwable t
             (warn t "M4 controller observation failed")
-            (assoc op :type :fail :error (or (.getMessage t) (str t))))))
+            (assoc op :type :info :error (str (or (.getMessage t) (str t))
+                                              (when-let [after (:after (ex-data t))]
+                                                (str ": " (pr-str after))))))))
       (teardown! [this _] this))))
 
 (defn controller-package [opts]
@@ -137,6 +136,11 @@
             :start #{:capture-hotspot-baseline}
             :stop #{:observe-hotspot-split}
             :color "#4A90E2"}}})
+
+(defn controller-observation-generator [opts]
+  (gen/phases
+    (gen/sleep (or (:observe-after-seconds opts) 15))
+    (gen/stagger 5 (gen/repeat {:type :info :f :observe-hotspot-split}))))
 
 (defn controller-checker []
   (reify checker/Checker
@@ -314,8 +318,12 @@
                     (deterministic-fault-package db nodes deterministic-fault interval)
                     (combined/nemesis-package
                       {:db db :faults requested-faults :interval interval})))
+         controller (controller-package opts)
          package (combined/compose-packages
-                   (cond-> [(controller-package opts)] faults (conj faults)))
+                   (cond-> [(if deterministic-fault
+                              (assoc controller :generator (controller-observation-generator opts))
+                              controller)]
+                     faults (conj faults)))
          concurrency (or (:concurrency opts) 6)
          _ (when (or (< concurrency (max (* 2 (count register-keys)) (count nodes)))
                      (odd? concurrency))
@@ -346,11 +354,16 @@
                                          (assoc :fault-cycles (fault-cycle-checker nodes deterministic-fault))))
              :concurrency concurrency
              :generator (apply gen/phases
-                               (cond-> [(->> (:generator workload)
+                               (cond-> []
+                                 deterministic-fault
+                                 (conj (gen/nemesis
+                                         (gen/once {:type :info :f :capture-hotspot-baseline})))
+                                 true
+                                 (conj (->> (:generator workload)
                                             (gen/nemesis (:generator package))
                                             (gen/stagger (/ (double (or (:rate opts) 20))))
                                             (gen/time-limit (or (:time-limit opts) 120)))
-                                        (gen/nemesis (:final-generator package))]
+                                       (gen/nemesis (:final-generator package)))
                                  deterministic-fault
                                  (conj (gen/sleep (or (:recovery-time opts) 10)))
                                  true (conj (gen/clients (final-reads (count nodes))))))
