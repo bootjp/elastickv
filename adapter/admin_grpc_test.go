@@ -428,12 +428,14 @@ func TestGetRaftGroupsSnapshotsEachGroupOnce(t *testing.T) {
 
 func TestGetRaftGroupsLeaderVersionBoundsEachCandidateProbe(t *testing.T) {
 	t.Parallel()
+	// The race shard runs parallel tests; allow scheduling slack while proving
+	// that a timed-out candidate does not prevent probing the next address.
 	var callsMu sync.Mutex
 	callsByAddr := map[string]int{}
 	srv := NewAdminServer(
 		NodeIdentity{NodeID: "n1", GRPCAddress: "10.0.0.11:50051"},
 		nil,
-		WithAdminLeaderVersionProbeTimeout(200*time.Millisecond),
+		WithAdminLeaderVersionProbeTimeout(2*time.Second),
 		WithAdminLeaderVersionCacheTTL(time.Second),
 		WithAdminLeaderVersionProbe(func(ctx context.Context, addr string) (string, error) {
 			callsMu.Lock()
@@ -459,7 +461,7 @@ func TestGetRaftGroupsLeaderVersionBoundsEachCandidateProbe(t *testing.T) {
 			return false
 		}
 		return resp.Groups[0].LeaderNodeVersion == "v-good" && resp.Groups[1].LeaderNodeVersion == "v-good"
-	}, time.Second, 10*time.Millisecond)
+	}, 8*time.Second, 10*time.Millisecond)
 	callsMu.Lock()
 	defer callsMu.Unlock()
 	if callsByAddr["10.0.0.12:50051"] == 0 || callsByAddr["10.0.0.22:50051"] == 0 {
