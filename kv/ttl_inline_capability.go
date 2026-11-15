@@ -97,6 +97,12 @@ func (f *kvFSM) TTLInlineCapabilityRecorded() bool {
 	return !f.ttlInlineCapabilityDisabled && f.ttlInlineCapabilityRecorded.Load()
 }
 
+// IsTTLInlineCapabilityMarkerPayload classifies the cleartext FSM command for
+// native Raft admission, including a marker not yet applied by the FSM.
+func (f *kvFSM) IsTTLInlineCapabilityMarkerPayload(payload []byte) bool {
+	return len(payload) != 0 && payload[0] == raftEncodeTTLInlineCapability
+}
+
 func (f *kvFSM) reloadTTLInlineCapability(ctx context.Context) error {
 	f.ttlInlineCapability.Store(false)
 	if f.store == nil {
