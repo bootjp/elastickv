@@ -95,6 +95,19 @@ bash jepsen/docker/hosted/run.sh pause sqs-standard
 bash jepsen/docker/hosted/run.sh partition sqs-htfifo
 ```
 
+The `Jepsen Hotspot Split` workflow runs the automatic split workload under
+managed partition and kill faults. To reproduce one leg locally, use the same
+bounded settings as CI:
+
+```bash
+JEPSEN_TIME_LIMIT=90 JEPSEN_RATE=5 JEPSEN_CONCURRENCY=6 \
+  JEPSEN_MAX_WRITES_PER_KEY=256 \
+  bash jepsen/docker/hosted/run.sh partition hotspot
+```
+
+The run keeps node logs, the Jepsen history, checker results, and its exit code
+under `artifacts/jepsen-hotspot-<fault>/`.
+
 The default main phase is 90s, with a 5s warmup and 5s fault/recovery intervals.
 Set `JEPSEN_TIME_LIMIT` to extend the main phase; it must exceed 35s. Fault
 operations take time in addition to their intervals: the evidence checker

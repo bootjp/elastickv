@@ -4,7 +4,11 @@ set -euo pipefail
 fault=${1:?Usage: run.sh partition|kill|pause}
 case "$fault" in partition|kill|pause) ;; *) echo 'Unsupported fault' >&2; exit 2 ;; esac
 adapter=${2:-redis}
-case "$adapter" in redis|dynamodb|s3|grpc-raw|grpc-transactional|filesystem-overwrite|filesystem-rename|sqs-standard|sqs-htfifo) ;; *) echo 'Unsupported adapter' >&2; exit 2 ;; esac
+case "$adapter" in redis|dynamodb|s3|grpc-raw|grpc-transactional|filesystem-overwrite|filesystem-rename|sqs-standard|sqs-htfifo|hotspot) ;; *) echo 'Unsupported adapter' >&2; exit 2 ;; esac
+if [[ $adapter == hotspot && $fault == pause ]]; then
+  echo 'Hotspot acceptance supports partition and kill only' >&2
+  exit 2
+fi
 time_limit=${JEPSEN_TIME_LIMIT:-90}
 rate=${JEPSEN_RATE:-5}
 concurrency=${JEPSEN_CONCURRENCY:-6}
@@ -99,11 +103,17 @@ printf 'adapter=%s\nfault=%s\ntime-limit=%s\nfault-interval=5\nrecovery-time=10\
   "$max_txn_length" "$repeat_faults" "$min_cycles" > "$artifact_dir/parameters.txt"
 "${compose[@]}" config > "$artifact_dir/compose.yml"
 # These are SSH-managed nodes: --local and --host would disable the nemesis.
-"${compose[@]}" run --rm control \
-  lein run -m elastickv.hosted-fault-workload \
-    --adapter "$adapter" --nodes n1,n2,n3 --ssh-user root --ssh-key /run/jepsen-ssh/id_ed25519 \
-    --faults "$fault" --fault-interval 5 --time-limit "$time_limit" \
-    --recovery-time 10 --rate "$rate" --concurrency "$concurrency" --key-count "$key_count" \
-    --max-writes-per-key "$max_writes" --max-txn-length "$max_txn_length" \
-    --min-fault-cycles "$min_cycles" "${extra_args[@]}" \
-  2>&1 | tee "$artifact_dir/control.log"
+if [[ $adapter == hotspot ]]; then
+  workload=(lein run -m elastickv.hotspot-workload
+    --nodes 'n1,n2,n3' --ssh-user root --ssh-key /run/jepsen-ssh/id_ed25519
+    --faults "$fault" --fault-interval 5 --time-limit "$time_limit"
+    --rate "$rate" --concurrency "$concurrency" --max-writes-per-key "$max_writes")
+else
+  workload=(lein run -m elastickv.hosted-fault-workload
+    --adapter "$adapter" --nodes 'n1,n2,n3' --ssh-user root --ssh-key /run/jepsen-ssh/id_ed25519
+    --faults "$fault" --fault-interval 5 --time-limit "$time_limit"
+    --recovery-time 10 --rate "$rate" --concurrency "$concurrency" --key-count "$key_count"
+    --max-writes-per-key "$max_writes" --max-txn-length "$max_txn_length"
+    --min-fault-cycles "$min_cycles" "${extra_args[@]}")
+fi
+"${compose[@]}" run --rm control "${workload[@]}" 2>&1 | tee "$artifact_dir/control.log"
