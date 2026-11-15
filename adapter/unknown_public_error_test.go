@@ -17,9 +17,70 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/aws/smithy-go"
 	"github.com/bootjp/elastickv/kv"
+	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
+
+func TestTypedForwardFailureProjectsIndeterminateAcrossPublicProtocols(t *testing.T) {
+	t.Parallel()
+	err := &kv.ForwardFailure{
+		Reason:   pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CONFLICT,
+		Decision: pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN,
+	}
+	require.ErrorIs(t, err, kv.ErrTransactionOutcomeUnknown)
+
+	redisConn := &captureConn{}
+	writeRedisError(redisConn, err)
+	require.Equal(t, redisOutcomeUnknownReply, redisConn.lastErr)
+	require.False(t, isRetryableRedisTxnErr(err))
+
+	dynamo := httptest.NewRecorder()
+	writeDynamoErrorFromErr(dynamo, err)
+	require.Equal(t, http.StatusConflict, dynamo.Code)
+	require.Equal(t, dynamoErrOperationOutcomeUnknown, dynamo.Header().Get("x-amzn-ErrorType"))
+	require.JSONEq(t, `{"__type":"OperationOutcomeUnknown","message":"Operation outcome unknown"}`, dynamo.Body.String())
+
+	s3Response := httptest.NewRecorder()
+	writeS3MutationError(s3Response, err, "bucket", "physical-key")
+	require.Equal(t, http.StatusConflict, s3Response.Code)
+	require.Contains(t, s3Response.Body.String(), "<Code>OperationOutcomeUnknown</Code>")
+	require.NotContains(t, s3Response.Body.String(), "physical-key")
+
+	sqsJSON := httptest.NewRecorder()
+	writeSQSErrorFromErr(sqsJSON, err)
+	require.Equal(t, http.StatusConflict, sqsJSON.Code)
+	require.Equal(t, sqsErrOperationOutcomeUnknown, sqsJSON.Header().Get("x-amzn-ErrorType"))
+	sqsQuery := httptest.NewRecorder()
+	writeSQSQueryError(sqsQuery, err)
+	require.Equal(t, http.StatusConflict, sqsQuery.Code)
+	require.Contains(t, sqsQuery.Body.String(), "<Code>OperationOutcomeUnknown</Code>")
+
+	publicGRPC := status.Convert(projectPublicGRPCMutationError(err))
+	require.Equal(t, codes.Unknown, publicGRPC.Code())
+	require.Equal(t, "Operation outcome unknown", publicGRPC.Message())
+}
+
+func TestDynamoUnclassifiedErrorDoesNotExposeInternalKey(t *testing.T) {
+	t.Parallel()
+	for _, write := range []func(http.ResponseWriter){
+		func(w http.ResponseWriter) {
+			writeDynamoErrorFromErr(w, fmt.Errorf("physical-key: invalid byte: %d", 7))
+		},
+		func(w http.ResponseWriter) {
+			writeDynamoError(w, http.StatusInternalServerError, dynamoErrInternal, "physical-key: invalid byte")
+		},
+	} {
+		rec := httptest.NewRecorder()
+		write(rec)
+		require.Equal(t, http.StatusInternalServerError, rec.Code)
+		require.Equal(t, dynamoErrInternal, rec.Header().Get("x-amzn-ErrorType"))
+		require.JSONEq(t, `{"__type":"InternalServerError","message":"internal error"}`, rec.Body.String())
+		require.NotContains(t, rec.Body.String(), "physical-key")
+	}
+}
 
 func TestS3UnknownOutcomeResponse(t *testing.T) {
 	t.Parallel()

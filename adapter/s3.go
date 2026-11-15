@@ -2655,7 +2655,7 @@ func (s *S3Server) retryS3Mutation(ctx context.Context, fn func() error) error {
 }
 
 func writeS3MutationError(w http.ResponseWriter, err error, bucket string, key string) {
-	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) || isIndeterminateMutationDispatchFailure(err) {
 		writeS3Error(w, http.StatusConflict, "OperationOutcomeUnknown", "Operation outcome unknown", "", "")
 		return
 	}

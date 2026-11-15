@@ -20,12 +20,12 @@ func TestSplitJobPhaseErrorClassification(t *testing.T) {
 	t.Parallel()
 	for _, err := range []error{nil, context.Canceled, context.DeadlineExceeded, store.ErrWriteConflict, errSplitMigrationVoterBarrierIncomplete,
 		kv.ErrLeaderNotFound, ErrNotLeader, raftengine.ErrNotLeader, raftengine.ErrLeadershipLost, raftengine.ErrLeadershipTransferInProgress,
-		status.Error(codes.Unknown, "not leader"), status.Error(codes.Unknown, "leader not found"),
 		status.Error(codes.Unavailable, "leader"), status.Error(codes.Aborted, "conflict"), status.Error(codes.ResourceExhausted, "busy")} {
 		require.True(t, splitJobPhaseErrorRetryable(errors.WithStack(err)))
 	}
 	for _, err := range []error{errors.New("invalid durable cursor"), status.Error(codes.Unauthenticated, "token"),
-		status.Error(codes.PermissionDenied, "denied"), status.Error(codes.FailedPrecondition, "witness"), status.Error(codes.DataLoss, "corrupt")} {
+		status.Error(codes.PermissionDenied, "denied"), status.Error(codes.FailedPrecondition, "witness"), status.Error(codes.DataLoss, "corrupt"),
+		status.Error(codes.Unknown, "not leader"), status.Error(codes.Unknown, "leader not found")} {
 		require.False(t, splitJobPhaseErrorRetryable(errors.WithStack(err)))
 	}
 }
@@ -33,7 +33,7 @@ func TestSplitJobPhaseErrorClassification(t *testing.T) {
 func TestSplitJobLeaderChurnNeverConsumesFailureBudget(t *testing.T) {
 	t.Parallel()
 	ctx, server, catalog, job := failedCleanupFixture(t)
-	for _, leaderErr := range []error{kv.ErrLeaderNotFound, ErrNotLeader, status.Error(codes.Unknown, "not leader"), status.Error(codes.Unknown, "leader not found")} {
+	for _, leaderErr := range []error{kv.ErrLeaderNotFound, ErrNotLeader, raftengine.ErrNotLeader} {
 		server.splitMigrationClientFactory = func(context.Context, distribution.SplitJob, uint64) (SplitMigrationClient, SplitMigrationClient, error) {
 			return nil, nil, leaderErr
 		}

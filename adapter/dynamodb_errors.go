@@ -16,7 +16,10 @@ type dynamoAPIError struct {
 	message   string
 }
 
-const dynamoErrOperationOutcomeUnknown = "OperationOutcomeUnknown"
+const (
+	dynamoErrOperationOutcomeUnknown = "OperationOutcomeUnknown"
+	dynamoInternalErrorMessage       = "internal error"
+)
 
 func (e *dynamoAPIError) Error() string {
 	if e == nil {
@@ -50,7 +53,7 @@ func writeDynamoErrorFromErr(w http.ResponseWriter, err error) {
 		writeDynamoError(w, http.StatusServiceUnavailable, dynamoErrServiceUnavailable, "service unavailable")
 		return
 	}
-	writeDynamoError(w, http.StatusInternalServerError, dynamoErrInternal, err.Error())
+	writeDynamoError(w, http.StatusInternalServerError, dynamoErrInternal, dynamoInternalErrorMessage)
 }
 
 // dynamoErrIsTransient reports whether err is a transient/internal failure
@@ -70,6 +73,9 @@ func dynamoErrIsTransient(err error) bool {
 }
 
 func writeDynamoError(w http.ResponseWriter, status int, errorType string, message string) {
+	if status == http.StatusInternalServerError && errorType == dynamoErrInternal {
+		message = dynamoInternalErrorMessage
+	}
 	if message == "" {
 		message = http.StatusText(status)
 	}

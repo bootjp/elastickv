@@ -61,6 +61,23 @@ func TestS3UnmarkedMetadataDispatchProjectsUnknownOutcome(t *testing.T) {
 	require.NotContains(t, rec.Body.String(), "bucket")
 }
 
+func TestS3MutationErrorRejectsUnmarkedStatusAsRetryHint(t *testing.T) {
+	t.Parallel()
+	for _, err := range []error{
+		status.Error(codes.Unavailable, "physical-key: not leader"),
+		errors.Join(status.Error(codes.Aborted, "physical-key: conflict"), store.ErrWriteConflict),
+	} {
+		rec := httptest.NewRecorder()
+		writeS3MutationError(rec, err, "bucket", "object")
+		require.Equal(t, http.StatusConflict, rec.Code)
+		require.Contains(t, rec.Body.String(), "<Code>OperationOutcomeUnknown</Code>")
+		require.Contains(t, rec.Body.String(), "<Message>Operation outcome unknown</Message>")
+		require.NotContains(t, rec.Body.String(), "physical-key")
+		require.NotContains(t, rec.Body.String(), "bucket")
+		require.NotContains(t, rec.Body.String(), "object")
+	}
+}
+
 func TestS3MutationRetryPreservesUnknownOutcome(t *testing.T) {
 	t.Parallel()
 	for _, cause := range []error{store.ErrWriteConflict, kv.ErrTxnLocked, kv.ErrRouteWriteFenced} {

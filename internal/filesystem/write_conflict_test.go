@@ -104,6 +104,10 @@ func TestIsWriteConflict(t *testing.T) {
 		{name: "typed conflict", err: store.NewWriteConflictError(conflictKey), want: true, wantRoot: true},
 		{name: "wrapped typed conflict", err: cerrors.Wrap(store.ErrWriteConflict, "txn"), want: true, wantRoot: true},
 		{name: "unknown attempt with conflict detail", err: errors.Join(kv.ErrTransactionOutcomeUnknown, store.ErrWriteConflict), want: false},
+		{name: "typed forward outcome unknown", err: &kv.ForwardFailure{
+			Reason:   pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CONFLICT,
+			Decision: pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN,
+		}, want: false},
 		{name: "legacy forwarded status", err: forwardedWriteConflict()},
 		{name: "forged legacy detail", err: kv.ForwardWriteConflictStatus()},
 		{name: "legacy detail joined with local cause", err: errors.Join(store.ErrWriteConflict, kv.ForwardWriteConflictStatus())},

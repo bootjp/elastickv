@@ -2478,26 +2478,11 @@ func splitJobCoordinatorLeadershipError(err error) bool {
 		return false
 	}
 	if errors.Is(err, kv.ErrLeaderNotFound) ||
+		errors.Is(err, ErrNotLeader) ||
 		errors.Is(err, raftengine.ErrNotLeader) ||
 		errors.Is(err, raftengine.ErrLeadershipLost) ||
 		errors.Is(err, raftengine.ErrLeadershipTransferInProgress) {
 		return true
-	}
-	return hasSplitJobLeaderErrorSuffix(err.Error())
-}
-
-var splitJobLeaderErrorPhrases = []string{
-	ErrNotLeader.Error(),
-	"leader not found",
-	"leadership lost",
-	"leadership transfer in progress",
-}
-
-func hasSplitJobLeaderErrorSuffix(msg string) bool {
-	for _, phrase := range splitJobLeaderErrorPhrases {
-		if len(msg) >= len(phrase) && strings.EqualFold(msg[len(msg)-len(phrase):], phrase) {
-			return true
-		}
 	}
 	return false
 }

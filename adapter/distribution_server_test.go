@@ -2873,7 +2873,6 @@ func TestDistributionServerRetrySplitJob_MapsDispatchLeadershipLoss(t *testing.T
 		{name: "raft not leader", err: raftengine.ErrNotLeader},
 		{name: "leadership lost", err: raftengine.ErrLeadershipLost},
 		{name: "transfer in progress", err: raftengine.ErrLeadershipTransferInProgress},
-		{name: "wrapped grpc detail", err: errors.New("rpc error: code = Unknown desc = raft engine: leadership lost")},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -2897,6 +2896,19 @@ func TestDistributionServerRetrySplitJob_MapsDispatchLeadershipLoss(t *testing.T
 			require.Equal(t, 1, coordinator.dispatchCalls)
 		})
 	}
+}
+
+func TestSplitJobLeadershipClassificationIgnoresStatusText(t *testing.T) {
+	t.Parallel()
+	for _, err := range []error{
+		errors.New("user key: raft engine: leadership lost"),
+		status.Error(codes.Unknown, "not leader"),
+		status.Error(codes.Unknown, "leader not found"),
+	} {
+		require.False(t, splitJobCoordinatorLeadershipError(err))
+		require.Equal(t, codes.Internal, status.Code(splitJobCoordinatorStatusError(err)))
+	}
+	require.True(t, splitJobCoordinatorLeadershipError(errors.WithStack(raftengine.ErrLeadershipLost)))
 }
 
 func TestDistributionServerAbandonSplitJob_RecordsAbandoningViaCoordinator(t *testing.T) {
