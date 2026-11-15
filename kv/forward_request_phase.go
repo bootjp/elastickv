@@ -25,3 +25,34 @@ func ForwardFailurePhaseForRequests(reqs []*pb.Request) (pb.ForwardFailurePhase,
 		return 0, false
 	}
 }
+
+// ForwardOnePhaseDecisionEligible rejects known prior attempts before an
+// indexed apply rejection is promoted to a logical noncommit decision. It
+// does not reconcile a separate caller invocation without a durable identity.
+func ForwardOnePhaseDecisionEligible(reqs []*pb.Request) bool {
+	phase, ok := ForwardFailurePhaseForRequests(reqs)
+	if !ok || phase != pb.ForwardFailurePhase_FORWARD_FAILURE_PHASE_ONE_PHASE_APPLY {
+		return false
+	}
+	req := reqs[0]
+	if !req.IsTxn {
+		return true
+	}
+	return forwardTxnHasNoPriorAttempt(req)
+}
+
+func forwardTxnHasNoPriorAttempt(req *pb.Request) bool {
+	if len(req.Mutations) == 0 || req.Mutations[0] == nil || req.Mutations[0].Op != pb.Op_PUT {
+		return false
+	}
+	meta, mutations, err := extractTxnMeta(req.Mutations)
+	if err != nil || len(meta.PrimaryKey) == 0 || meta.PrevCommitTS != 0 {
+		return false
+	}
+	for _, mut := range mutations {
+		if mut == nil || isTxnMetaKey(mut.Key) {
+			return false
+		}
+	}
+	return true
+}

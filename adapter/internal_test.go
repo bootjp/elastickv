@@ -143,6 +143,37 @@ func TestInternalForwardCertifiesOnlyIndexedOnePhaseApplyFence(t *testing.T) {
 	}
 }
 
+func TestInternalForwardPriorAttemptCannotCertifyOnePhaseRejection(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name   string
+		cause  error
+		reason pb.ForwardFailureReason
+	}{
+		{name: "conflict", cause: store.NewWriteConflictError([]byte("private-key")), reason: pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CONFLICT},
+		{name: "fence", cause: errors.Wrap(kv.ErrRouteWriteFenced, "private-key"), reason: pb.ForwardFailureReason_FORWARD_FAILURE_REASON_FENCE},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			txn := kv.NewTransactionWithProposer(forwardAppliedConflictProposer{index: 7, failure: tc.cause})
+			t.Cleanup(txn.Close)
+			internal := NewInternalWithEngine(txn, forwardObserverLeader{}, nil, nil)
+			req := &pb.Request{IsTxn: true, Phase: pb.Phase_NONE, Mutations: []*pb.Mutation{
+				{Op: pb.Op_PUT, Key: []byte(kv.TxnMetaPrefix), Value: kv.EncodeTxnMeta(kv.TxnMeta{
+					PrimaryKey: []byte("k"), PrevCommitTS: 17,
+				})},
+				{Op: pb.Op_PUT, Key: []byte("k"), Value: []byte("v")},
+			}}
+			_, err := internal.Forward(t.Context(), &pb.ForwardRequest{IsTxn: true, Requests: []*pb.Request{req}})
+			require.Error(t, err)
+			reason, decision, ok := kv.DecodeForwardDecisionStatus(err, pb.ForwardFailurePhase_FORWARD_FAILURE_PHASE_ONE_PHASE_APPLY)
+			require.True(t, ok)
+			require.Equal(t, tc.reason, reason)
+			require.Equal(t, pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN, decision)
+			require.NotContains(t, err.Error(), "private-key")
+		})
+	}
+}
+
 func TestInternalForwardMixedFenceEvidenceStaysUnknown(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {

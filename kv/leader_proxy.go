@@ -314,7 +314,7 @@ func classifyForwardRPCError(err error, reqs []*pb.Request) error {
 	if phase, ok := ForwardFailurePhaseForRequests(reqs); ok {
 		reason, decision, valid := DecodeForwardDecisionStatus(err, phase)
 		if valid {
-			return classifyValidatedForwardFailure(phase, reason, decision)
+			return classifyValidatedForwardFailure(phase, reason, decision, ForwardOnePhaseDecisionEligible(reqs))
 		}
 	}
 	// Legacy ErrorInfo, malformed details, and unrecognized decisions do
@@ -322,13 +322,13 @@ func classifyForwardRPCError(err error, reqs []*pb.Request) error {
 	return &ForwardFailure{Decision: pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN}
 }
 
-func classifyValidatedForwardFailure(phase pb.ForwardFailurePhase, reason pb.ForwardFailureReason, decision pb.ForwardDecisionClass) error {
+func classifyValidatedForwardFailure(phase pb.ForwardFailurePhase, reason pb.ForwardFailureReason, decision pb.ForwardDecisionClass, onePhaseEligible bool) error {
 	if decision == pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN {
 		return &ForwardFailure{Reason: reason, Decision: decision}
 	}
 	// A possibly submitted earlier Forward attempt is terminal in
 	// runForwardCycle; it can never reach a later definitive verdict.
-	if phase == pb.ForwardFailurePhase_FORWARD_FAILURE_PHASE_ONE_PHASE_APPLY &&
+	if onePhaseEligible && phase == pb.ForwardFailurePhase_FORWARD_FAILURE_PHASE_ONE_PHASE_APPLY &&
 		decision == pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_DEFINITIVELY_ABORTED {
 		switch reason {
 		case pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CONFLICT:

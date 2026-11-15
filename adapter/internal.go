@@ -298,6 +298,7 @@ func forwardCommitStatus(reqs []*pb.Request, err error) error {
 	conflict := errors.Is(err, store.ErrWriteConflict)
 	fence := errors.Is(err, kv.ErrRouteWriteFenced)
 	if ok && phase == pb.ForwardFailurePhase_FORWARD_FAILURE_PHASE_ONE_PHASE_APPLY &&
+		kv.ForwardOnePhaseDecisionEligible(reqs) &&
 		!errors.Is(err, kv.ErrTransactionOutcomeUnknown) && errors.As(err, &rejected) &&
 		rejected.CommitIndex() != 0 && conflict != fence {
 		reason := pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CONFLICT
