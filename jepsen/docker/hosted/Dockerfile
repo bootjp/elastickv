@@ -20,5 +20,6 @@ COPY entrypoint.sh /usr/local/bin/jepsen-entrypoint
 RUN chmod +x /usr/local/bin/jepsen-entrypoint
 WORKDIR /workspace/jepsen
 ENV LEIN_ROOT=true
+ENV GOFLAGS=-buildvcs=false
 ENTRYPOINT ["/usr/local/bin/jepsen-entrypoint"]
 CMD ["/usr/sbin/sshd", "-D", "-e"]
