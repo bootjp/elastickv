@@ -649,8 +649,12 @@ new leader can recover an abandoned attempt.
 It requires an explicit operator burn-in start date at least 30 days old;
 that date is an assertion, not proof of a successful production soak. No
 30-day production burn-in evidence is recorded here. A production rollout
-still requires operational measurements and validation on a multi-node Raft
-cluster with real crash/restart and MVCC compaction.
+still requires operational measurements. Three-node Raft/Pebble regressions
+now cover graceful restart, whole-cluster process SIGKILL after manifest
+flip, and single-node SIGKILL while two peers retain a live quorum. They
+verify durable cleanup obligations, real gRPC peer blob transfer, recovery,
+GET, reference count, and MVCC compaction. These bounded tests do not replace
+the 30-day production M0-M3 burn-in or production rollout measurements.
 
 The M3 accounting slice wires `PlanChunkRefRCMutations` into explicit
 chunkref PUT and DEL transactions, including staged upload batches,
