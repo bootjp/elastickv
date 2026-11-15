@@ -16,6 +16,7 @@ import (
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/distribution/autosplit"
 	internalutil "github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	internalraftadmin "github.com/bootjp/elastickv/internal/raftadmin"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
@@ -528,6 +529,9 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	cleanup := internalutil.CleanupStack{}
 	defer cleanup.Run()
 
+	if err := prepareDemoRaftDataDir(cfg.raftDataDir); err != nil {
+		return err
+	}
 	st, err := setupFSMStore(cfg.raftDataDir, &cleanup)
 	if err != nil {
 		return err
@@ -636,6 +640,13 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 
 	cleanup.Release()
 	return nil
+}
+
+func prepareDemoRaftDataDir(dir string) error {
+	if dir == "" {
+		return nil
+	}
+	return errors.Wrap(noderuntime.PrepareFreshRaftEngineMarkerFence(dir), "prepare fresh raft directory")
 }
 
 func setupObservabilityServers(ctx context.Context, lc net.ListenConfig, cleanup *internalutil.CleanupStack, cfg config, metricsHandler http.Handler) (metricsL net.Listener, ms *http.Server, pprofL net.Listener, ps *http.Server, err error) {

@@ -213,6 +213,9 @@ func (b shardGroupBuilder) buildDataGroup(
 	if err := os.MkdirAll(dir, dirPerm); err != nil {
 		return nil, nil, errors.Wrapf(err, "failed to create fsm store dir for group %d", group.ID)
 	}
+	if err := noderuntime.PrepareFreshRaftEngineMarkerFence(dir); err != nil {
+		return nil, nil, errors.Wrapf(err, "failed to fence fresh raft dir for group %d", group.ID)
+	}
 	st, err := store.NewPebbleStore(filepath.Join(dir, "fsm.db"), b.encWiring.PebbleOptions()...)
 	if err != nil {
 		return nil, nil, errors.Wrapf(err, "failed to open pebble fsm store for group %d", group.ID)
