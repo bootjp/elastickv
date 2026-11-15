@@ -59,7 +59,7 @@ func prepareRedisServer(ctx context.Context, lc *net.ListenConfig, redisAddr str
 	if err != nil {
 		return nil, nil, nil, errors.Wrapf(err, "failed to listen on %s", redisAddr)
 	}
-	deltaCompactor := newRedisDeltaCompactorIfEnabled(shardStore, coordinate, metricsRegistry)
+	deltaCompactor := newRedisDeltaCompactorIfEnabled(ctx, shardStore, coordinate, metricsRegistry)
 	redisOpts := []adapter.RedisServerOption{
 		adapter.WithRedisRequestAdmission(clusterbootstrap.BootstrapRequestAdmissionForCoordinator(coordinate)),
 		adapter.WithRedisActiveTimestampTracker(readTracker),

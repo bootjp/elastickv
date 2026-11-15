@@ -18,6 +18,7 @@ type legacyMetadataMetricsSource interface {
 // LegacyMetadataPassCollector exposes only complete, currently valid
 // four-plan group sets. Missing series are unknown, never a zero-backlog proof.
 type LegacyMetadataPassCollector struct {
+	ctx        context.Context
 	source     legacyMetadataMetricsSource
 	complete   *prometheus.Desc
 	rows       *prometheus.Desc
@@ -27,9 +28,10 @@ type LegacyMetadataPassCollector struct {
 	completion *prometheus.Desc
 }
 
-func NewLegacyMetadataPassCollector(source legacyMetadataMetricsSource) *LegacyMetadataPassCollector {
+func NewLegacyMetadataPassCollector(ctx context.Context, source legacyMetadataMetricsSource) *LegacyMetadataPassCollector {
 	labels := []string{"group_id", "plan"}
 	return &LegacyMetadataPassCollector{
+		ctx:    ctx,
 		source: source,
 		complete: prometheus.NewDesc("elastickv_redis_legacy_metadata_pass_complete",
 			"One means this plan belongs to a complete current four-plan diagnostic set, not an M4 gate verdict.", labels, nil),
@@ -60,7 +62,7 @@ func (m *LegacyMetadataPassCollector) Collect(ch chan<- prometheus.Metric) {
 	if m == nil || m.source == nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), legacyMetadataMetricsScrapeTimeout)
+	ctx, cancel := context.WithTimeout(m.ctx, legacyMetadataMetricsScrapeTimeout)
 	defer cancel()
 	for _, groupID := range m.source.LegacyMetadataPassGroupIDs() {
 		passes, err := m.source.CompleteLegacyMetadataGroupPasses(ctx, groupID)

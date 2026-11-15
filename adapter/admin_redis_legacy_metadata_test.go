@@ -148,7 +148,7 @@ func TestLegacyMetadataAdminRPCBearerProtocol(t *testing.T) {
 func TestLegacyMetadataMetricsOmitIncompleteGroup(t *testing.T) {
 	source := &legacyMetadataTestSource{passes: completeLegacyMetadataFixture()[:3]}
 	registry := prometheus.NewRegistry()
-	registry.MustRegister(NewLegacyMetadataPassCollector(source))
+	registry.MustRegister(NewLegacyMetadataPassCollector(t.Context(), source))
 	metrics, err := registry.Gather()
 	require.NoError(t, err)
 	require.Empty(t, metrics, "a partial group must not expose a zero-looking metric")
@@ -187,7 +187,7 @@ func TestLegacyMetadataMetricsChecksOnlyEachGroup(t *testing.T) {
 	require.LessOrEqual(t, good.identityCalls, 5)
 
 	registry := prometheus.NewRegistry()
-	registry.MustRegister(NewLegacyMetadataPassCollector(c))
+	registry.MustRegister(NewLegacyMetadataPassCollector(t.Context(), c))
 	metrics, err := registry.Gather()
 	require.NoError(t, err)
 	foundComplete := false

@@ -133,7 +133,7 @@ func startFSMCompactorIfEnabled(ctx context.Context, eg *errgroup.Group, runtime
 	slog.Info("fsm compactor disabled", "env", fsmCompactorEnabledEnvVar)
 }
 
-func newRedisDeltaCompactorIfEnabled(shardStore *kv.ShardStore, coordinate kv.Coordinator, metricsRegistry *monitoring.Registry) *adapter.DeltaCompactor {
+func newRedisDeltaCompactorIfEnabled(ctx context.Context, shardStore *kv.ShardStore, coordinate kv.Coordinator, metricsRegistry *monitoring.Registry) *adapter.DeltaCompactor {
 	if enabledEnv(redisDeltaCompactorEnabledEnvVar) {
 		var opts []adapter.DeltaCompactorOption
 		if obs := metricsRegistry.RedisTTLInlineMigrationObserver(); obs != nil {
@@ -141,7 +141,7 @@ func newRedisDeltaCompactorIfEnabled(shardStore *kv.ShardStore, coordinate kv.Co
 		}
 		compactor := adapter.NewDeltaCompactor(shardStore, coordinate, opts...)
 		if registerer := metricsRegistry.Registerer(); registerer != nil {
-			registerer.MustRegister(adapter.NewLegacyMetadataPassCollector(compactor))
+			registerer.MustRegister(adapter.NewLegacyMetadataPassCollector(ctx, compactor))
 		}
 		return compactor
 	}
