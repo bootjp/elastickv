@@ -181,6 +181,8 @@ message PrepareEvidenceStateResponse {
   uint64 applied_index = 5;
   bool cutover_applied = 6;
   bool dedicated_tso_configured = 7;
+  // Binary support only; this does not authorize timestamp-bound proposals.
+  uint32 timestamp_binding_protocol_version = 8;
 }
 
 message RelayPublishRequest {

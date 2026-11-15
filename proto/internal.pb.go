@@ -1187,8 +1187,10 @@ type PrepareEvidenceStateResponse struct {
 	AppliedIndex           uint64                 `protobuf:"varint,5,opt,name=applied_index,json=appliedIndex,proto3" json:"applied_index,omitempty"`
 	CutoverApplied         bool                   `protobuf:"varint,6,opt,name=cutover_applied,json=cutoverApplied,proto3" json:"cutover_applied,omitempty"`
 	DedicatedTsoConfigured bool                   `protobuf:"varint,7,opt,name=dedicated_tso_configured,json=dedicatedTsoConfigured,proto3" json:"dedicated_tso_configured,omitempty"`
-	unknownFields          protoimpl.UnknownFields
-	sizeCache              protoimpl.SizeCache
+	// Binary support only; this does not authorize timestamp-bound proposals.
+	TimestampBindingProtocolVersion uint32 `protobuf:"varint,8,opt,name=timestamp_binding_protocol_version,json=timestampBindingProtocolVersion,proto3" json:"timestamp_binding_protocol_version,omitempty"`
+	unknownFields                   protoimpl.UnknownFields
+	sizeCache                       protoimpl.SizeCache
 }
 
 func (x *PrepareEvidenceStateResponse) Reset() {
@@ -1268,6 +1270,13 @@ func (x *PrepareEvidenceStateResponse) GetDedicatedTsoConfigured() bool {
 		return x.DedicatedTsoConfigured
 	}
 	return false
+}
+
+func (x *PrepareEvidenceStateResponse) GetTimestampBindingProtocolVersion() uint32 {
+	if x != nil {
+		return x.TimestampBindingProtocolVersion
+	}
+	return 0
 }
 
 type RelayPublishRequest struct {
@@ -4326,7 +4335,7 @@ const file_internal_proto_rawDesc = "" +
 	"\x0elast_commit_ts\x18\x02 \x01(\x04R\flastCommitTs\"\\\n" +
 	"\x1bPrepareEvidenceStateRequest\x12\x14\n" +
 	"\x05floor\x18\x01 \x01(\x04R\x05floor\x12'\n" +
-	"\x0fcapability_only\x18\x02 \x01(\bR\x0ecapabilityOnly\"\xb1\x02\n" +
+	"\x0fcapability_only\x18\x02 \x01(\bR\x0ecapabilityOnly\"\xfe\x02\n" +
 	"\x1cPrepareEvidenceStateResponse\x12\x1c\n" +
 	"\tsupported\x18\x01 \x01(\bR\tsupported\x12#\n" +
 	"\rproof_enabled\x18\x02 \x01(\bR\fproofEnabled\x12%\n" +
@@ -4335,7 +4344,8 @@ const file_internal_proto_rawDesc = "" +
 	"fenceFloor\x12#\n" +
 	"\rapplied_index\x18\x05 \x01(\x04R\fappliedIndex\x12'\n" +
 	"\x0fcutover_applied\x18\x06 \x01(\bR\x0ecutoverApplied\x128\n" +
-	"\x18dedicated_tso_configured\x18\a \x01(\bR\x16dedicatedTsoConfigured\"I\n" +
+	"\x18dedicated_tso_configured\x18\a \x01(\bR\x16dedicatedTsoConfigured\x12K\n" +
+	"\"timestamp_binding_protocol_version\x18\b \x01(\rR\x1ftimestampBindingProtocolVersion\"I\n" +
 	"\x13RelayPublishRequest\x12\x18\n" +
 	"\achannel\x18\x01 \x01(\fR\achannel\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\fR\amessage\"8\n" +
