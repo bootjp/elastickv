@@ -79,6 +79,54 @@ type Store struct {
 
 func NewStore(dir string) *Store { return &Store{dir: dir, ops: realFileOps()} }
 
+// UpgradeRequiredMarkerFence is an explicit offline-only V1 to V2 transition.
+// The caller must hold exclusive native Raft directory and WAL ownership.
+// It never changes intent, policy, or an unprotected marker.
+func (s *Store) UpgradeRequiredMarkerFence(expected Identity) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fenced, err := s.inspectRequiredMarkerFence(expected)
+	if err != nil || fenced {
+		return false, err
+	}
+	if err := s.replace(MarkerFile, []byte(MarkerV2)); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// InspectRequiredMarkerFence reports the marker format without changing disk.
+func (s *Store) InspectRequiredMarkerFence(expected Identity) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.inspectRequiredMarkerFence(expected)
+}
+
+func (s *Store) inspectRequiredMarkerFence(expected Identity) (bool, error) {
+	marker, present, err := readBounded(s.dir, MarkerFile)
+	if err != nil {
+		return false, err
+	}
+	if !present || (string(marker) != MarkerV1 && string(marker) != MarkerV2) {
+		return false, errors.WithStack(ErrInconsistent)
+	}
+	data, present, err := readBounded(s.dir, IntentFile)
+	if err != nil {
+		return false, err
+	}
+	if !present {
+		return false, errors.WithStack(ErrInconsistent)
+	}
+	intent, err := ParseIntent(data)
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+	if intent.Identity != expected {
+		return false, errors.WithStack(ErrInconsistent)
+	}
+	return string(marker) == MarkerV2, nil
+}
+
 // LoadIntent returns the strict durable intent when present. It does not
 // classify Raft state or grant admission; callers must still reconcile the
 // marker, WAL/snapshot identity and replicated policy before voting or data

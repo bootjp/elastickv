@@ -83,6 +83,64 @@ func TestPublishPreservesM1bDowngradeFence(t *testing.T) {
 	require.Equal(t, MarkerV2, string(diskBytes(t, dir, MarkerFile)), "retry must not downgrade the marker")
 }
 
+func TestUpgradeRequiredMarkerFence(t *testing.T) {
+	t.Parallel()
+	in, _ := fixture(t)
+	encoded, err := MarshalIntent(in)
+	require.NoError(t, err)
+	dir := t.TempDir()
+	put(t, dir, IntentFile, encoded)
+	put(t, dir, MarkerFile, []byte(MarkerV1))
+	files := NewStore(dir)
+	changed, err := files.UpgradeRequiredMarkerFence(Identity{Cluster: UUID{2}, Group: in.Identity.Group})
+	require.ErrorIs(t, err, ErrInconsistent)
+	require.False(t, changed)
+	require.Equal(t, MarkerV1, string(diskBytes(t, dir, MarkerFile)))
+
+	changed, err = files.UpgradeRequiredMarkerFence(in.Identity)
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.Equal(t, MarkerV2, string(diskBytes(t, dir, MarkerFile)))
+	require.Equal(t, encoded, diskBytes(t, dir, IntentFile))
+	changed, err = files.UpgradeRequiredMarkerFence(in.Identity)
+	require.NoError(t, err)
+	require.False(t, changed, "retry reports an already-fenced marker")
+}
+
+func TestUpgradeRequiredMarkerFenceRejectsIncompletePair(t *testing.T) {
+	t.Parallel()
+	in, _ := fixture(t)
+	encoded, err := MarshalIntent(in)
+	require.NoError(t, err)
+	for _, tc := range []struct {
+		name   string
+		marker string
+		intent []byte
+	}{
+		{name: "missing marker", intent: encoded},
+		{name: "unprotected marker", marker: "etcd\n", intent: encoded},
+		{name: "unknown marker", marker: "etcd-bootstrap-v3\n", intent: encoded},
+		{name: "missing intent", marker: MarkerV1},
+		{name: "invalid intent", marker: MarkerV1, intent: []byte("invalid")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if tc.marker != "" {
+				put(t, dir, MarkerFile, []byte(tc.marker))
+			}
+			if tc.intent != nil {
+				put(t, dir, IntentFile, tc.intent)
+			}
+			changed, err := NewStore(dir).UpgradeRequiredMarkerFence(in.Identity)
+			require.Error(t, err)
+			require.False(t, changed)
+			if tc.marker != "" {
+				require.Equal(t, tc.marker, string(diskBytes(t, dir, MarkerFile)))
+			}
+		})
+	}
+}
+
 func TestLoadIntentIsStrictAndDoesNotClassify(t *testing.T) {
 	t.Parallel()
 	in, _ := fixture(t)

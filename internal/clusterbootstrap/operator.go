@@ -16,7 +16,7 @@ func DispatchBootstrapOperator(args []string, output io.Writer) (bool, error) {
 	if len(args) == 0 || args[0] != "bootstrap" {
 		return false, nil
 	}
-	if handled, err := dispatchBootstrapObservationOrArtifact(args[1:], output); handled {
+	if handled, err := dispatchBootstrapNonBaseline(args[1:], output); handled {
 		return true, err
 	}
 	request, err := ParseBootstrapBaselineCLI(args[1:])
@@ -43,6 +43,13 @@ func DispatchBootstrapOperator(args []string, output io.Writer) (bool, error) {
 	}
 	summary.NativeStateVerified = true
 	return true, errors.WithStack(json.NewEncoder(output).Encode(summary))
+}
+
+func dispatchBootstrapNonBaseline(args []string, output io.Writer) (bool, error) {
+	if len(args) > 0 && args[0] == bootstrapMarkerUpgradeCommand {
+		return true, dispatchBootstrapMarkerUpgrade(args, output)
+	}
+	return dispatchBootstrapObservationOrArtifact(args, output)
 }
 
 func verifyBootstrapInspectionInputs(request BootstrapBaselineCLIRequest, expectedRaw, manifestRaw []byte) error {
