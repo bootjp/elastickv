@@ -24,7 +24,7 @@ The existing adapter checkers analyze the complete history, including recovery:
 | --- | --- | --- |
 | Redis | 6379 | Strict-serializable list append; read all emitted keys through every node |
 | DynamoDB | 8000 | Strict-serializable list append; one-key final reads avoid the 100-key transaction limit |
-| S3 | 9000 | Linearizable object registers; final GET for every object through every node |
+| S3 | 9000 | Knossos linearizable object registers plus Elle read/write registers; final GET for every object through every node |
 | SQS Standard | 9324 | Acknowledged sends must be received and deleted; 40s receive/delete-only drain |
 | SQS HT-FIFO | 9324 | Delivery identities, no lost acknowledged sends, duplicates, or ordering violations; 40s drain |
 
@@ -33,6 +33,44 @@ writes, completed injection and healing operations for every target, and a
 successful recovery read for every node/key pair. Missing operations, failed
 reads, and unknown/invalid Jepsen results fail the job. Required recovery reads
 must succeed; queue delivery correctness is checked across the bounded drain.
+
+## Elle analysis and replay
+
+Elle 0.2.8 is an explicit dependency. Redis and DynamoDB already use
+`elle.list-append` through Jepsen's cycle-append checker with
+`[:strict-serializable]`. S3 additionally uses `elle.rw-register` with that model,
+alongside the existing per-object Knossos checker. Each S3 PUT/GET becomes one
+single-operation transaction; separate HTTP operations are never combined into
+an atomic multi-object transaction. Invocation/completion ordering and failed or
+indeterminate outcomes are preserved. The generator writes unique values per
+object, as required by Elle. Elle cannot infer every register anomaly, so its
+verdict supplements Knossos. Neither checker is disabled.
+Register replay rejects repeated or nil write values for a key rather than
+analyzing a history that violates those inference assumptions.
+
+SQS Standard and HT-FIFO retain their queue-specific checkers: receive/delete
+histories are not list-append or read/write register transactions. They are not
+reported as Elle passes. The normal and fault/stress matrices remain in place;
+S3 runs both checkers in each existing job, including multipart workloads.
+
+The complete `store.tar.gz` includes `history.edn`, `results.edn`, and any Elle
+cycle explanations and Graphviz diagrams below checker `elle/` directories.
+S3 also saves its normalized `elle-history.edn` and `elle-results.edn` there.
+Anomaly diagnostics are generated when anomalies are found; successful runs
+need not contain a cycle graph. To recheck an extracted history from `jepsen/`:
+
+```bash
+lein run -m elastickv.elle-checker list-append /path/to/history.edn /tmp/elle-append
+lein run -m elastickv.elle-checker s3 /path/to/history.edn /tmp/elle-s3
+# For histories already containing [:r key value] / [:w key value] transactions:
+lein run -m elastickv.elle-checker rw-register /path/to/history.edn /tmp/elle-register
+```
+
+Replay saves the normalized `elle-history.edn`, `elle-results.edn`, and any
+anomaly diagnostics in the output directory. It exits successfully only for
+`:valid? true`; invalid or unknown verdicts and malformed input fail. Use a
+fresh output directory for each analysis. Graphviz is already installed in the
+Hosted image and is required locally to render anomaly diagrams.
 
 ## Run locally on Linux
 

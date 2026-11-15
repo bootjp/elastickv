@@ -357,7 +357,8 @@
     (is (= "elastickv-s3-multipart-register" (:name multipart)))
     (is (nil? (:final-generator multipart)))
     (is (= #{:register :complete-final-reads} (set (keys (:checkers (:checker multipart))))))
-    (is (nil? (:checkers (:checker normal))))))
+    (is (some? (get-in normal [:checker :checkers :elle])))
+    (is (nil? (get-in normal [:checker :checkers :complete-final-reads])))))
 
 (deftest multipart-test-generator-ends-with-all-final-reads
   (let [test (workload/elastickv-s3-test {:local true :multipart true :time-limit 0 :key-count 3})
