@@ -58,7 +58,8 @@ func isReusableRedisTxnErr(err error) bool {
 func shouldPreserveRedisTxnAttempt(err error) bool {
 	return isRetryableRedisTxnErr(err) &&
 		!isRouteWriteFencedError(err) &&
-		!isRedisComposedRouteErr(err)
+		!isRedisComposedRouteErr(err) &&
+		(!errors.Is(err, store.ErrWriteConflict) || !kv.IsCertifiedOnePhaseConflict(err))
 }
 
 func isRedisComposedRouteErr(err error) bool {
@@ -147,7 +148,18 @@ func normalizeRetryableRedisTxnErr(err error) error {
 		return errors.WithStack(kv.ErrTxnLocked)
 	}
 	if errors.Is(err, store.ErrWriteConflict) {
+		if kv.IsCertifiedOnePhaseConflict(err) {
+			return &redisCertifiedConflict{cause: err}
+		}
 		return errors.WithStack(store.ErrWriteConflict)
 	}
 	return err
 }
+
+// Keep the apply proof for retry policy without exposing the underlying key
+// or storage diagnostic as a Redis protocol error.
+type redisCertifiedConflict struct{ cause error }
+
+func (e *redisCertifiedConflict) Error() string { return store.ErrWriteConflict.Error() }
+
+func (e *redisCertifiedConflict) Unwrap() error { return e.cause }
