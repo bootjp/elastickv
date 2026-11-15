@@ -164,6 +164,19 @@ func (r *ReadRequest) ScanGroupOwned(ctx context.Context, snapshot ReadSnapshot,
 	return page.rows, page.resume, err
 }
 
+func (r *ReadRequest) ScanGroupOwnedPage(ctx context.Context, snapshot ReadSnapshot, groupID uint64, start, end []byte, limit int) (GroupOwnedScanPage, error) {
+	return withReadSnapshot(r, ctx, snapshot, func() error { return r.validateRangeScope(snapshot, start, end, groupID) }, func(timestamp uint64) (GroupOwnedScanPage, error) {
+		reader, ok := r.st.(interface {
+			ScanGroupOwnedPageAt(context.Context, uint64, []byte, []byte, int, uint64) (GroupOwnedScanPage, error)
+		})
+		if !ok {
+			return GroupOwnedScanPage{}, errors.New("snapshot store does not support owned-group diagnostic scans")
+		}
+		page, err := reader.ScanGroupOwnedPageAt(ctx, groupID, start, end, limit, timestamp)
+		return page, errors.WithStack(err)
+	})
+}
+
 type physicalReadPage struct {
 	rows    []*store.KVPair
 	limited bool

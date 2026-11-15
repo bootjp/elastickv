@@ -3,6 +3,7 @@ package adapter
 import (
 	"context"
 
+	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 )
@@ -105,6 +106,15 @@ func requestScanGroupOwnedAt(ctx context.Context, backend any, groupID uint64, s
 	defer closeRead()
 	rows, resume, err := request.ScanGroupOwned(requestReadContext(ctx, request), snapshot, groupID, start, end, limit)
 	return rows, resume, errors.WithStack(err)
+}
+
+func requestScanGroupOwnedPageAt(ctx context.Context, backend any, groupID uint64, start, end []byte, limit int, ts uint64) (kv.GroupOwnedScanPage, error) {
+	request, snapshot, closeRead, err := requestReadSnapshot(ctx, backend, ts)
+	if err != nil {
+		return kv.GroupOwnedScanPage{}, err
+	}
+	defer closeRead()
+	return wrappedReadResult(request.ScanGroupOwnedPage(requestReadContext(ctx, request), snapshot, groupID, start, end, limit))
 }
 
 func requestScanPhysicalAt(ctx context.Context, backend any, start, end []byte, visibleLimit, physicalLimit int, ts uint64, reverse bool) ([]*store.KVPair, bool, error) {

@@ -32,6 +32,14 @@ type ttlInlineGroupScanner interface {
 	ScanGroupOwnedAt(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, []byte, error)
 }
 
+type ttlInlineDiagnosticScanner interface {
+	ttlInlineGroupScanner
+	ScanGroupOwnedPageAt(context.Context, uint64, []byte, []byte, int, uint64) (kv.GroupOwnedScanPage, error)
+	GroupOwnedScanIdentity(context.Context, uint64) (uint64, uint64, error)
+}
+
+var _ ttlInlineDiagnosticScanner = (*kv.ShardStore)(nil)
+
 type ttlInlineMigrationScanPlan struct {
 	cursorName string
 	groupID    uint64
@@ -224,7 +232,11 @@ func (c *DeltaCompactor) migrateTTLInlineScanPlan(
 ) error {
 	page, err := c.scanTTLInlineMigrationRaw(ctx, h, plan, readTS, snapshotAt)
 	if err != nil {
+		c.discardLegacyMetadataPass(plan)
 		return err
+	}
+	if !c.acceptLegacyMetadataPage(plan, page) {
+		return nil
 	}
 	tally, err := c.migrateTTLInlinePage(ctx, h, page.kvs, readTS)
 	if err != nil {
@@ -233,8 +245,13 @@ func (c *DeltaCompactor) migrateTTLInlineScanPlan(
 		c.noteTTLInlineMigrationPageFailed(plan.cursorName, page, tally.keysMigrated)
 		return err
 	}
+	if err := c.checkLegacyMetadataPageIdentity(ctx, plan, page); err != nil {
+		c.discardLegacyMetadataPass(plan)
+		return err
+	}
 	if pass, prevClean, done := c.finishTTLInlineMigrationPage(plan.cursorName, page, tally); done {
 		c.reportTTLInlineMigrationPass(ctx, h, plan, pass, prevClean)
+		c.publishLegacyMetadataPass(ctx, h, plan, pass)
 	}
 	return nil
 }
@@ -341,7 +358,11 @@ func ttlInlineMigrationGroupCursorName(typeName string, groupID uint64) string {
 
 // ttlInlineMigrationPage is one page a scan plan read in a tick.
 type ttlInlineMigrationPage struct {
-	kvs []*store.KVPair
+	kvs            []*store.KVPair
+	legacyRows     []kv.LegacyMetadataRow
+	catalogVersion uint64
+	leaderTerm     uint64
+	diagnostic     bool
 	// cursorKey is the key the plan's cursor moves to.
 	cursorKey []byte
 	// truncated reports that the scan stopped before the end of the prefix.
@@ -372,6 +393,15 @@ func (c *DeltaCompactor) scanTTLInlineMigrationRaw(
 	page := ttlInlineMigrationPage{fromStart: len(cur) == 0, snapshotAt: snapshotAt}
 	end := store.PrefixScanEnd(h.prefix)
 	if plan.scanner != nil {
+		if scanner, ok := plan.scanner.(ttlInlineDiagnosticScanner); ok && isLegacyMetadataMigrationHandler(h.typeName) {
+			diagnostic, err := requestScanGroupOwnedPageAt(ctx, scanner, plan.groupID, start, end, ttlInlineMigrationTickScanLimit, readTS)
+			if err != nil {
+				return ttlInlineMigrationPage{}, errors.WithStack(err)
+			}
+			page.kvs, page.cursorKey, page.truncated = diagnostic.Rows, diagnostic.Resume, diagnostic.Resume != nil
+			page.legacyRows, page.catalogVersion, page.leaderTerm, page.diagnostic = diagnostic.LegacyRows, diagnostic.CatalogVersion, diagnostic.LeaderTerm, true
+			return page, nil
+		}
 		kvs, resume, err := requestScanGroupOwnedAt(ctx, plan.scanner, plan.groupID, start, end, ttlInlineMigrationTickScanLimit, readTS)
 		if err != nil {
 			return ttlInlineMigrationPage{}, errors.WithStack(err)
