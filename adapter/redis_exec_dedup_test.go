@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/redcon"
@@ -118,7 +119,6 @@ func TestExecDedup_GenuineConflictRebuildsAndApplies(t *testing.T) {
 	ctx := context.Background()
 	st := store.NewMVCCStore()
 	coord := newDedupTestCoordinator(st, 1, false) // attempt 1 errors without landing
-	coord.wireWriteConflicts = true                // forwarded conflict loses its typed chain
 	key := []byte("k")
 
 	// Before dispatch 2 (the reuse), inject a concurrent SET so the reuse
@@ -155,6 +155,22 @@ func TestExecDedup_GenuineConflictRebuildsAndApplies(t *testing.T) {
 	val, _, err := decodeRedisStr(rawVal)
 	require.NoError(t, err)
 	require.Equal(t, []byte("v1"), val)
+}
+
+func TestExecDedup_LegacyWireConflictRemainsUnknown(t *testing.T) {
+	t.Parallel()
+	st := store.NewMVCCStore()
+	coord := newDedupTestCoordinator(st, 1, false)
+	coord.wireWriteConflicts = true
+	srv := &RedisServer{store: st, coordinator: coord, scriptCache: map[string]string{}, onePhaseTxnDedup: true}
+	queue := []redcon.Command{{Args: [][]byte{[]byte(cmdSet), []byte("k"), []byte("v1")}}}
+
+	results, err := srv.runTransaction(queue)
+	require.ErrorIs(t, err, kv.ErrTransactionOutcomeUnknown)
+	require.Empty(t, results)
+	require.Equal(t, 1, coord.dispatches, "a legacy detail cannot justify replay")
+	_, err = st.GetAt(t.Context(), redisStrKey([]byte("k")), snapshotTS(coord.Clock(), st))
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
 }
 
 // TestExecDedup_SelfInflictedReuseConflict_ReturnsSuccess mirrors the
