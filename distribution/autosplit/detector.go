@@ -825,7 +825,7 @@ func selectP50SplitKey(cfg Config, route distribution.RouteDescriptor, rows []ke
 		return nil, "", 0, 0, false
 	}
 	splitKey, origin, leftLoad, rightLoad := splitKeyForMedian(route, median, total, leftLoad, loadBeforeMedian)
-	if !splitKeyInsideRoute(route, splitKey) {
+	if leftLoad <= 0 || rightLoad <= 0 || !splitKeyInsideRoute(route, splitKey) {
 		return nil, "", 0, 0, false
 	}
 	return distribution.CloneBytes(splitKey), origin, leftLoad, rightLoad, true
@@ -907,7 +907,9 @@ func splitKeyForMedian(
 	if median.SubBucket == 0 && bytes.Equal(median.Start, route.Start) {
 		origin = SplitOriginP50FirstBucketHi
 	}
-	if splitKey == nil || (route.End != nil && bytes.Compare(splitKey, route.End) >= 0) {
+	// The last loaded bucket need not be the route's last bucket. Its hi
+	// would create an unobserved right child even when hi is interior.
+	if rightLoad <= 0 || splitKey == nil || (route.End != nil && bytes.Compare(splitKey, route.End) >= 0) {
 		splitKey = median.Start
 		origin = SplitOriginP50LastBucketLo
 	}

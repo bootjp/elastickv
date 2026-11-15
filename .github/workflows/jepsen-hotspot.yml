@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - '.github/workflows/jepsen-hotspot.yml'
+      - 'distribution/autosplit/**'
       - 'jepsen/docker/hosted/**'
       - 'jepsen/src/elastickv/hotspot_workload.clj'
       - 'jepsen/src/elastickv/db.clj'
@@ -13,6 +14,7 @@ on:
     branches: [main, master]
     paths:
       - '.github/workflows/jepsen-hotspot.yml'
+      - 'distribution/autosplit/**'
       - 'jepsen/docker/hosted/**'
       - 'jepsen/src/elastickv/hotspot_workload.clj'
       - 'jepsen/src/elastickv/db.clj'

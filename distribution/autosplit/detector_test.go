@@ -589,16 +589,20 @@ func TestP50BoundarySelection(t *testing.T) {
 		rows       []keyviz.MatrixRow
 		wantKey    []byte
 		wantOrigin SplitOrigin
+		wantLeft   float64
+		wantRight  float64
 	}{
 		{
-			name:  "interior median without upper load uses lo",
+			name:  "last loaded interior bucket uses lo",
 			route: testRoute(1, 1, "a", "e"),
 			rows: []keyviz.MatrixRow{
 				testRow(1, 1, 0, 4, "a", "b", 10, 0),
 				testRow(1, 1, 1, 4, "b", "c", 90, 0),
 			},
 			wantKey:    []byte("b"),
-			wantOrigin: SplitOriginP50Mid,
+			wantOrigin: SplitOriginP50LastBucketLo,
+			wantLeft:   10,
+			wantRight:  90,
 		},
 		{
 			name:  "first bucket uses interior hi",
@@ -609,6 +613,8 @@ func TestP50BoundarySelection(t *testing.T) {
 			},
 			wantKey:    []byte("b"),
 			wantOrigin: SplitOriginP50FirstBucketHi,
+			wantLeft:   90,
+			wantRight:  10,
 		},
 		{
 			name:  "last finite bucket falls back to lo",
@@ -619,6 +625,8 @@ func TestP50BoundarySelection(t *testing.T) {
 			},
 			wantKey:    []byte("d"),
 			wantOrigin: SplitOriginP50LastBucketLo,
+			wantLeft:   10,
+			wantRight:  90,
 		},
 		{
 			name:  "rightmost interior bucket keeps finite hi",
@@ -630,6 +638,20 @@ func TestP50BoundarySelection(t *testing.T) {
 			},
 			wantKey:    []byte("c"),
 			wantOrigin: SplitOriginP50Mid,
+			wantLeft:   80,
+			wantRight:  20,
+		},
+		{
+			name:  "hotspot workload median in last loaded bucket",
+			route: testRouteNilEnd(1, 1, ""),
+			rows: []keyviz.MatrixRow{
+				testRow(1, 1, 6, 16, "\x60", "\x70", 110, 0),
+				testRow(1, 1, 7, 16, "\x70", "\x80", 160, 0),
+			},
+			wantKey:    []byte("\x70"),
+			wantOrigin: SplitOriginP50LastBucketLo,
+			wantLeft:   110,
+			wantRight:  160,
 		},
 	}
 
@@ -645,6 +667,51 @@ func TestP50BoundarySelection(t *testing.T) {
 			require.Len(t, result.Decisions, 1)
 			require.Equal(t, tc.wantKey, result.Decisions[0].SplitKey)
 			require.Equal(t, tc.wantOrigin, result.Decisions[0].SplitOrigin)
+			require.InDelta(t, tc.wantLeft, result.Decisions[0].LeftLoad, 0.0001)
+			require.InDelta(t, tc.wantRight, result.Decisions[0].RightLoad, 0.0001)
+		})
+	}
+}
+
+func TestP50DeclinesWithoutLoadOnBothSides(t *testing.T) {
+	t.Parallel()
+	at := time.Unix(825, 0)
+	for _, tc := range []struct {
+		name  string
+		route distribution.RouteDescriptor
+		rows  []keyviz.MatrixRow
+	}{
+		{
+			name:  "only interior bucket has load",
+			route: testRouteNilEnd(1, 1, ""),
+			rows: []keyviz.MatrixRow{
+				testRow(1, 1, 7, 16, "\x70", "\x80", 100, 0),
+			},
+		},
+		{
+			name:  "only first bucket has load",
+			route: testRoute(1, 1, "a", "e"),
+			rows: []keyviz.MatrixRow{
+				testRow(1, 1, 0, 4, "a", "b", 100, 0),
+			},
+		},
+		{
+			name:  "only final bucket has load",
+			route: testRoute(1, 1, "a", "e"),
+			rows: []keyviz.MatrixRow{
+				testRow(1, 1, 3, 4, "d", "e", 100, 0),
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			result := Evaluate(testConfig(), NewDetectorState(), Input{
+				Routes:  []distribution.RouteDescriptor{tc.route},
+				Windows: []ColumnWindow{testWindow(at, time.Minute, tc.rows...)},
+				Now:     at,
+			})
+			require.Empty(t, result.Decisions)
+			requireEvent(t, result.Events, 1, SkipReasonNoSplitKey)
 		})
 	}
 }
@@ -676,7 +743,7 @@ func TestP50KeepsObservedLoadOnBothSides(t *testing.T) {
 			require.Equal(t, []byte("\x70"), decision.SplitKey)
 			require.InDelta(t, 10, decision.LeftLoad, 0.0001)
 			require.InDelta(t, 90, decision.RightLoad, 0.0001)
-			require.Equal(t, SplitOriginP50Mid, decision.SplitOrigin)
+			require.Equal(t, SplitOriginP50LastBucketLo, decision.SplitOrigin)
 		})
 	}
 }
