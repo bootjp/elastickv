@@ -561,14 +561,15 @@
     (let [keys (range key-count)]
       (when (and local? require-fuse-mount)
         (require-local-fuse-mount! mount-dir))
-      (if local?
-        ;; Every local client sees the same mounted filesystem. Serialize
-        ;; setup writes to avoid self-conflicts, while still resetting the
-        ;; registers each time setup is called for a new test.
-        (locking setup-lock
-          (with-retries max-retries #(local-setup! mount-dir keys)))
+      ;; Local and remote mounts share the same replicated files. Serialize
+      ;; initialization across all client copies, including different nodes,
+      ;; rather than racing their create/truncate/write operations. This lock
+      ;; is only used before the measured workload begins.
+      (locking setup-lock
         (with-retries max-retries
-          #(remote-exec! test node (remote-setup-cmd mount-dir keys))))))
+          #(if local?
+             (local-setup! mount-dir keys)
+             (remote-exec! test node (remote-setup-cmd mount-dir keys)))))))
 
   (teardown! [_this test]
     ;; Jepsen runs teardown! before setup! and again after the test, so the

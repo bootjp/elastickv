@@ -742,3 +742,31 @@
   (let [test-map (workload/elastickv-filesystem-test {:nodes ["n1"] :mount-dirs ["/tmp/a"] :local true})]
     (is (thrown? clojure.lang.ExceptionInfo
                  (client/open! (:client test-map) test-map "n9")))))
+
+(deftest remote-setup-is-serialized-across-replicated-mounts
+  (let [entered (promise) release (promise) attempted (promise)
+        seen (atom [])
+        base (:client (workload/filesystem-register-workload
+                        {:key-count 1 :node->mount-dir {"n1" "/mount" "n2" "/mount"}}))
+        first-client (client/open! base {} "n1")
+        other-client (client/open! base {} "n2")]
+    (with-redefs-fn
+      {#'workload/remote-exec!
+       (fn [_ node _]
+         (swap! seen conj node)
+         (when (= node "n1") (deliver entered true) @release)
+         "")}
+      (fn []
+        (let [first-call (future (client/setup! first-client {}) :ok)]
+          (try
+            (is (= true (deref entered 5000 :timeout)))
+            (let [other-call (future (deliver attempted true)
+                                     (client/setup! other-client {}) :ok)]
+              (is (= true (deref attempted 5000 :timeout)))
+              (is (= :waiting (deref other-call 100 :waiting)))
+              (is (= ["n1"] @seen))
+              (deliver release true)
+              (is (= :ok (deref first-call 5000 :timeout)))
+              (is (= :ok (deref other-call 5000 :timeout)))
+              (is (= ["n1" "n2"] @seen)))
+            (finally (deliver release true))))))))

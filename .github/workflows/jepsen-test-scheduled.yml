@@ -335,12 +335,23 @@ jobs:
       - name: Run public gRPC Elle workload
         if: startsWith(matrix.workload, 'grpc-')
         working-directory: jepsen
+        env:
+          GRPC_TIME_LIMIT: ${{ inputs.time-limit || '300' }}
+          GRPC_RATE: ${{ inputs.rate || '5' }}
+          GRPC_KEYS: ${{ inputs.key-count || '8' }}
+          GRPC_WRITES: ${{ inputs.max-writes-per-key || '150' }}
         run: |
+          for budget_value in "$GRPC_TIME_LIMIT" "$GRPC_KEYS" "$GRPC_WRITES"; do
+            if [[ ! "$budget_value" =~ ^[1-9][0-9]*$ || ${#budget_value} -gt 9 ]]; then
+              echo 'gRPC workload budgets must be positive integers of at most nine digits' >&2
+              exit 2
+            fi
+          done
           source ./s3_budget.sh
-          s3_budget "${{ inputs.key-count || '8' }}" "${{ inputs.max-writes-per-key || '150' }}"
+          s3_budget "$GRPC_KEYS" "$GRPC_WRITES"
           timeout 600 ~/lein run -m elastickv.grpc-workload --local --host 127.0.0.1 \
             --grpc-ports 50051,50052,50053 --grpc-api "${WORKLOAD#grpc-}" \
-            --time-limit "${{ inputs.time-limit || '300' }}" --rate "${{ inputs.rate || '5' }}" \
+            --time-limit "$GRPC_TIME_LIMIT" --rate "$GRPC_RATE" \
             --concurrency 6 --key-count "$S3_KEY_COUNT" --max-writes-per-key "$S3_MAX_OPS_PER_KEY"
       - name: Launch filesystem cluster
         if: startsWith(matrix.workload, 'filesystem-') || matrix.workload == 'sqlite'
