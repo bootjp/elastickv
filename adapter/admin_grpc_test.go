@@ -436,7 +436,7 @@ func TestGetRaftGroupsLeaderVersionBoundsEachCandidateProbe(t *testing.T) {
 		NodeIdentity{NodeID: "n1", GRPCAddress: "10.0.0.11:50051"},
 		nil,
 		WithAdminLeaderVersionProbeTimeout(2*time.Second),
-		WithAdminLeaderVersionCacheTTL(time.Second),
+		WithAdminLeaderVersionCacheTTL(10*time.Second),
 		WithAdminLeaderVersionProbe(func(ctx context.Context, addr string) (string, error) {
 			callsMu.Lock()
 			callsByAddr[addr]++
@@ -467,6 +467,8 @@ func TestGetRaftGroupsLeaderVersionBoundsEachCandidateProbe(t *testing.T) {
 	if callsByAddr["10.0.0.12:50051"] == 0 || callsByAddr["10.0.0.22:50051"] == 0 {
 		t.Fatalf("probe calls by address = %v, want timeout candidate and alternate address", callsByAddr)
 	}
+	require.Equal(t, 2, callsByAddr["10.0.0.12:50051"]+callsByAddr["10.0.0.22:50051"],
+		"one probe should try each candidate once")
 }
 
 func TestLeaderVersionProbeAttemptTimeoutHasSaneMinimum(t *testing.T) {
