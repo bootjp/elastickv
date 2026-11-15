@@ -168,4 +168,16 @@ The design remains Partial despite the short successful CI and review results:
 - Existing [PR #1286](https://github.com/bootjp/elastickv/pull/1286) addresses an overlapping Raft apply/timestamp problem. A diagnostic build combining its `78cab1ba` with `8db0155d` passed one identical encrypted workload with six verified transfers. This suggests overlap, not a causal proof or a completed stress campaign. The comparison was made in a separate worktree; this acceptance PR does not duplicate that implementation.
 - The combined run's subsequent encrypted restart failed: the startup guard attempted to scan Raft entries `(6, 877]` after compaction and MemoryStorage returned `requested index is unavailable due to compaction`. The unmodified `8db0155d` binary also refuses startup on that retained diagnostic state, without the #1286 patch. Logs are under `/private/tmp/elastickv-seal-jepsen-dscUKN/`. The earlier plaintext restart success is not evidence that encrypted restart is safe.
 
+On current `main`, #1286 is merged and the encryption startup guard has a
+snapshot-checkpoint witness (`76409d940`) plus bounded retry when compaction
+overtakes the retained-suffix scan (`32704e4d4`, `8b9961464`). Those changes
+address the recorded refusal path in code, but their unit tests are not a rerun
+of the failed three-process history. The Jepsen workflow in this follow-up
+starts all three members with a 20-entry snapshot interval, requires each
+member to report a post-bootstrap snapshot after the seal workload, restarts
+the same data directories and encryption sidecars, and compares paginated,
+consistent full-table scans from every member against the pre-restart values. This acceptance
+remains unproven until the workflow passes on the follow-up HEAD; repeated
+encrypted stress and the broader production performance gate also remain open.
+
 Before declaring this design complete, coordinate the existing Raft fix without duplication, cover and resolve the encrypted compacted-snapshot startup failure, and rerun the acceptance matrix. Adding tests, receiving a clean review, or changing status alone does not complete acceptance.

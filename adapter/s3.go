@@ -496,6 +496,9 @@ func (s *S3Server) StartBlobBackfill(ctx context.Context) error {
 }
 
 func (s *S3Server) handle(w http.ResponseWriter, r *http.Request) {
+	readRequest := kv.NewReadRequest(r.Context(), s.coordinator, s.store, s.readTracker)
+	defer readRequest.Close()
+	r = r.WithContext(readRequest.Context())
 	if serveS3Healthz(w, r) {
 		return
 	}
@@ -510,15 +513,16 @@ func (s *S3Server) handle(w http.ResponseWriter, r *http.Request) {
 	if rejectOversizedS3ObjectKey(w, objectKey, hasObject) {
 		return
 	}
-	if s.maybeProxyToLeader(w, r) {
-		return
-	}
 	if r.Method == http.MethodGet || r.Method == http.MethodHead {
 		kv.MarkUnattributableClientReadThrough(s.coordinator, 0)
 	}
-
+	// Reject invalid signatures before routing can perform distributed reads.
+	// Anonymous reads only probe the bucket's metadata shard for public ACLs.
 	if authErr := s.resolveAuth(r, bucket); authErr != nil {
 		writeS3Error(w, authErr.Status, authErr.Code, authErr.Message, bucket, objectKey)
+		return
+	}
+	if s.maybeProxyToLeader(w, r) {
 		return
 	}
 	s.handleAuthorizedRequest(w, r, bucket, objectKey, hasObject)
@@ -558,15 +562,18 @@ func (s *S3Server) isAnonymousReadAllowed(r *http.Request, bucket string) bool {
 	if bucket == "" || r.URL.Query().Has("acl") {
 		return false
 	}
-	// Signed requests (Authorization header or X-Amz-Algorithm presign param) are
-	// already authenticated; skip the public-bucket metadata read on the hot path.
+	// Signed requests (Authorization header or X-Amz-Algorithm presign param) must be
+	// authenticated; skip the public-bucket metadata read on the hot path.
 	if r.Header.Get("Authorization") != "" || r.URL.Query().Get("X-Amz-Algorithm") != "" {
 		return false
 	}
 	if !isReadOnlyS3Request(r) {
 		return false
 	}
-	readTS := s.readTS()
+	readTS, err := s.fencedObjectReadTS(r.Context(), s3keys.BucketMetaKey(bucket))
+	if err != nil {
+		return false
+	}
 	readPin := s.pinReadTS(readTS)
 	defer readPin.Release()
 
@@ -666,10 +673,14 @@ func (s *S3Server) handleObject(w http.ResponseWriter, r *http.Request, bucket s
 }
 
 func (s *S3Server) listBuckets(w http.ResponseWriter, r *http.Request) {
-	readTS := s.readTS()
+	readTS, err := s.snapshotReadTS(r.Context())
+	if err != nil {
+		writeS3InternalError(w, err)
+		return
+	}
 	readPin := s.pinReadTS(readTS)
 	defer readPin.Release()
-	kvs, err := s.store.ScanAt(r.Context(), []byte(s3keys.BucketMetaPrefix), prefixScanEnd([]byte(s3keys.BucketMetaPrefix)), s3MaxKeys, readTS)
+	kvs, err := requestScanAt(r.Context(), s.store, []byte(s3keys.BucketMetaPrefix), prefixScanEnd([]byte(s3keys.BucketMetaPrefix)), s3MaxKeys, readTS)
 	if err != nil {
 		writeS3InternalError(w, err)
 		return
@@ -712,12 +723,11 @@ func (s *S3Server) createBucket(w http.ResponseWriter, r *http.Request, bucket s
 		return
 	}
 	err := s.retryS3Mutation(r.Context(), func() error {
-		readTS := s.readTS()
-		readTimestamp, err := s.beginTxnReadTimestamp(r.Context(), readTS, "s3 create bucket: begin read timestamp")
+		readTimestamp, err := s.beginTxnReadTimestamp(r.Context(), "s3 create bucket: begin read timestamp")
 		if err != nil {
 			return errors.Wrap(err, "s3: allocate startTS for mutation")
 		}
-		readTS = readTimestamp.Timestamp()
+		readTS := readTimestamp.Timestamp()
 		startTS := readTS
 		readPin := s.pinReadTS(readTS)
 		defer readPin.Release()
@@ -775,7 +785,11 @@ func (s *S3Server) createBucket(w http.ResponseWriter, r *http.Request, bucket s
 }
 
 func (s *S3Server) headBucket(w http.ResponseWriter, r *http.Request, bucket string) {
-	readTS := s.readTS()
+	readTS, err := s.snapshotReadTS(r.Context())
+	if err != nil {
+		writeS3InternalError(w, err)
+		return
+	}
 	readPin := s.pinReadTS(readTS)
 	defer readPin.Release()
 
@@ -792,7 +806,11 @@ func (s *S3Server) headBucket(w http.ResponseWriter, r *http.Request, bucket str
 }
 
 func (s *S3Server) getBucketVersioning(w http.ResponseWriter, r *http.Request, bucket string) {
-	readTS := s.readTS()
+	readTS, err := s.snapshotReadTS(r.Context())
+	if err != nil {
+		writeS3InternalError(w, err)
+		return
+	}
 	readPin := s.pinReadTS(readTS)
 	defer readPin.Release()
 
@@ -813,12 +831,11 @@ func (s *S3Server) getBucketVersioning(w http.ResponseWriter, r *http.Request, b
 func (s *S3Server) deleteBucket(w http.ResponseWriter, r *http.Request, bucket string) {
 	var deletedGeneration uint64
 	err := s.retryS3Mutation(r.Context(), func() error {
-		readTS := s.readTS()
-		readTimestamp, err := s.beginTxnReadTimestamp(r.Context(), readTS, "s3 delete bucket: begin read timestamp")
+		readTimestamp, err := s.beginTxnReadTimestamp(r.Context(), "s3 delete bucket: begin read timestamp")
 		if err != nil {
 			return errors.Wrap(err, "s3: allocate startTS for mutation")
 		}
-		readTS = readTimestamp.Timestamp()
+		readTS := readTimestamp.Timestamp()
 		readPin := s.pinReadTS(readTS)
 		defer readPin.Release()
 
@@ -836,7 +853,7 @@ func (s *S3Server) deleteBucket(w http.ResponseWriter, r *http.Request, bucket s
 		}
 
 		start := s3keys.ObjectManifestPrefixForBucket(bucket, meta.Generation)
-		kvs, err := s.store.ScanAt(r.Context(), start, prefixScanEnd(start), 1, readTS)
+		kvs, err := requestScanAt(r.Context(), s.store, start, prefixScanEnd(start), 1, readTS)
 		if err != nil {
 			return errors.WithStack(err)
 		}
@@ -878,7 +895,11 @@ func (s *S3Server) deleteBucket(w http.ResponseWriter, r *http.Request, bucket s
 }
 
 func (s *S3Server) getBucketAcl(w http.ResponseWriter, r *http.Request, bucket string) {
-	readTS := s.readTS()
+	readTS, err := s.snapshotReadTS(r.Context())
+	if err != nil {
+		writeS3InternalError(w, err)
+		return
+	}
 	readPin := s.pinReadTS(readTS)
 	defer readPin.Release()
 
@@ -961,12 +982,11 @@ func (s *S3Server) putBucketAcl(w http.ResponseWriter, r *http.Request, bucket s
 	}
 
 	err := s.retryS3Mutation(r.Context(), func() error {
-		readTS := s.readTS()
-		readTimestamp, err := s.beginTxnReadTimestamp(r.Context(), readTS, "s3 put bucket acl: begin read timestamp")
+		readTimestamp, err := s.beginTxnReadTimestamp(r.Context(), "s3 put bucket acl: begin read timestamp")
 		if err != nil {
 			return errors.Wrap(err, "s3: allocate startTS for mutation")
 		}
-		readTS = readTimestamp.Timestamp()
+		readTS := readTimestamp.Timestamp()
 		startTS := readTS
 		readPin := s.pinReadTS(readTS)
 		defer readPin.Release()
@@ -1007,6 +1027,8 @@ func (s *S3Server) putBucketAcl(w http.ResponseWriter, r *http.Request, bucket s
 }
 
 func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket string, objectKey string) {
+	started, mode, outcome := time.Now(), s3BlobOffloadModeUnknown, s3ObjectOutcomeFailure
+	defer func() { s.observeS3ObjectDuration("put", mode, outcome, started) }()
 	in := s3PutObjectInputFromHeaders(r.Header)
 	state, err := s.prepareS3PutObject(r.Context(), in, bucket, objectKey)
 	if err != nil {
@@ -1024,7 +1046,9 @@ func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket stri
 	if !s.admitS3PutRequest(w, r, bucket, objectKey, s3MaxObjectSizeBytes, in.tooLargeMessage) {
 		return
 	}
-	upload, uploadBodyErr, uploadErr := s.uploadS3ObjectData(r.Context(), in, state, bucket, objectKey, s.s3BlobOffloadSelected(r.Context()))
+	offload := s.s3BlobOffloadSelected(r.Context())
+	mode = s3SelectedBlobMode(offload)
+	upload, uploadBodyErr, uploadErr := s.uploadS3ObjectData(r.Context(), in, state, bucket, objectKey, offload)
 	if uploadErr != nil || uploadBodyErr != nil {
 		s.cleanupS3PutObjectChunks(r.Context(), state, upload, bucket, objectKey)
 		s.writeS3ChunkUploadError(w, uploadBodyErr, uploadErr, bucket, objectKey)
@@ -1044,19 +1068,22 @@ func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket stri
 	}
 	w.Header().Set("ETag", quoteS3ETag(upload.ETag))
 	w.WriteHeader(http.StatusOK)
+	outcome = s3ObjectOutcomeSuccess
 }
 
 //nolint:cyclop,gocognit // The read handler branches on bucket/object existence, range, and HEAD vs GET response flow.
 func (s *S3Server) getObject(w http.ResponseWriter, r *http.Request, bucket string, objectKey string, headOnly bool) {
-	readTS := s.readTS()
-	readPin := s.pinReadTS(readTS)
-	defer readPin.Release()
-	meta, exists, err := s.loadBucketMetaAt(r.Context(), bucket, readTS)
+	started, mode, outcome := time.Now(), s3BlobOffloadModeUnknown, s3ObjectOutcomeFailure
+	if !headOnly {
+		defer func() { s.observeS3ObjectDuration("get", mode, outcome, started) }()
+	}
+	meta, readTS, readPin, err := s.objectReadSnapshot(r.Context(), bucket, objectKey)
 	if err != nil {
 		writeS3InternalError(w, err)
 		return
 	}
-	if !exists || meta == nil {
+	defer readPin.Release()
+	if meta == nil {
 		writeS3Error(w, http.StatusNotFound, s3ErrNoSuchBucket, s3ErrNoSuchBucketMsg, bucket, objectKey)
 		return
 	}
@@ -1071,6 +1098,7 @@ func (s *S3Server) getObject(w http.ResponseWriter, r *http.Request, bucket stri
 		writeS3Error(w, http.StatusNotFound, "NoSuchKey", "object not found", bucket, objectKey)
 		return
 	}
+	mode = s3ManifestDataMode(manifest)
 
 	rangeHeader := strings.TrimSpace(r.Header.Get("Range"))
 
@@ -1106,7 +1134,9 @@ func (s *S3Server) getObject(w http.ResponseWriter, r *http.Request, bucket stri
 		}
 		writeS3ObjectHeaders(w.Header(), manifest)
 		w.WriteHeader(http.StatusOK)
-		s.streamObjectChunks(w, r, bucket, meta.Generation, objectKey, manifest, readTS, 0, manifest.SizeBytes)
+		if s.streamObjectChunks(w, r, bucket, meta.Generation, objectKey, manifest, readTS, 0, manifest.SizeBytes) {
+			outcome = s3ObjectOutcomeSuccess
+		}
 		return
 	}
 
@@ -1119,6 +1149,7 @@ func (s *S3Server) getObject(w http.ResponseWriter, r *http.Request, bucket stri
 	}
 
 	contentLength := rangeEnd - rangeStart + 1
+	mode = s3ManifestRangeDataMode(manifest, rangeStart, contentLength)
 	if s3ManifestHasOffloadedParts(manifest) {
 		if err := s.ensureS3ObjectRangeLocal(r.Context(), bucket, meta.Generation, objectKey, manifest, readTS, rangeStart, contentLength); err != nil {
 			writeS3InternalError(w, err)
@@ -1130,11 +1161,13 @@ func (s *S3Server) getObject(w http.ResponseWriter, r *http.Request, bucket stri
 	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", rangeStart, rangeEnd, manifest.SizeBytes))
 	w.Header().Set("Accept-Ranges", "bytes")
 	w.WriteHeader(http.StatusPartialContent)
-	s.streamObjectChunks(w, r, bucket, meta.Generation, objectKey, manifest, readTS, rangeStart, contentLength)
+	if s.streamObjectChunks(w, r, bucket, meta.Generation, objectKey, manifest, readTS, rangeStart, contentLength) {
+		outcome = s3ObjectOutcomeSuccess
+	}
 }
 
 //nolint:cyclop // streamObjectChunks iterates nested part/chunk loops with necessary error-handling branches.
-func (s *S3Server) streamObjectChunks(w http.ResponseWriter, r *http.Request, bucket string, generation uint64, objectKey string, manifest *s3ObjectManifest, readTS uint64, offset int64, length int64) {
+func (s *S3Server) streamObjectChunks(w http.ResponseWriter, r *http.Request, bucket string, generation uint64, objectKey string, manifest *s3ObjectManifest, readTS uint64, offset int64, length int64) bool {
 	remaining := length
 	pos := int64(0)
 	for _, part := range manifest.Parts {
@@ -1158,7 +1191,7 @@ func (s *S3Server) streamObjectChunks(w http.ResponseWriter, r *http.Request, bu
 					"object_key", objectKey,
 					"err", err,
 				)
-				return
+				return false
 			}
 			chunk, err := s.readS3ObjectChunk(r.Context(), bucket, generation, objectKey, manifest.UploadID, part, chunkIndex, chunkSize, readTS)
 			if err != nil {
@@ -1167,7 +1200,7 @@ func (s *S3Server) streamObjectChunks(w http.ResponseWriter, r *http.Request, bu
 					"object_key", objectKey,
 					"err", err,
 				)
-				return
+				return false
 			}
 			chunkLen := int64(len(chunk))
 			start := int64(0)
@@ -1186,11 +1219,12 @@ func (s *S3Server) streamObjectChunks(w http.ResponseWriter, r *http.Request, bu
 			n, err := w.Write(chunk[start:end])
 			remaining -= int64(n)
 			if err != nil {
-				return
+				return false
 			}
 			pos = chunkEnd
 		}
 	}
+	return remaining == 0
 }
 
 //nolint:cyclop // parseS3RangeHeader handles all RFC-compliant byte-range forms; each branch is a distinct syntax.
@@ -1267,12 +1301,11 @@ func (s *S3Server) deleteObject(w http.ResponseWriter, r *http.Request, bucket s
 func (s *S3Server) deleteObjectAttempt(
 	r *http.Request, bucket string, objectKey string,
 ) (*s3ObjectManifest, uint64, error) {
-	readTS := s.readTS()
-	readTimestamp, err := s.beginTxnReadTimestamp(r.Context(), readTS, "s3 delete object: begin read timestamp")
+	readTimestamp, err := s.beginTxnReadTimestamp(r.Context(), "s3 delete object: begin read timestamp")
 	if err != nil {
 		return nil, 0, errors.Wrap(err, "s3: allocate startTS for mutation")
 	}
-	readTS = readTimestamp.Timestamp()
+	readTS := readTimestamp.Timestamp()
 	readPin := s.pinReadTS(readTS)
 	defer readPin.Release()
 
@@ -1313,13 +1346,12 @@ func validateS3AbsentObjectDelete(r *http.Request, bucket, objectKey string) err
 }
 
 func (s *S3Server) createMultipartUpload(w http.ResponseWriter, r *http.Request, bucket string, objectKey string) {
-	readTS := s.readTS()
-	readTimestamp, err := s.beginTxnReadTimestamp(r.Context(), readTS, "s3 create multipart upload: begin read timestamp")
+	readTimestamp, err := s.beginTxnReadTimestamp(r.Context(), "s3 create multipart upload: begin read timestamp")
 	if err != nil {
 		writeS3InternalError(w, err)
 		return
 	}
-	readTS = readTimestamp.Timestamp()
+	readTS := readTimestamp.Timestamp()
 	readPin := s.pinReadTS(readTS)
 	defer readPin.Release()
 
@@ -1446,12 +1478,11 @@ func (s *S3Server) completeMultipartUpload(w http.ResponseWriter, r *http.Reques
 func (s *S3Server) abortMultipartUpload(w http.ResponseWriter, r *http.Request, bucket string, objectKey string, uploadID string) {
 	var generation uint64
 	err := s.retryS3Mutation(r.Context(), func() error {
-		readTS := s.readTS()
-		readTimestamp, err := s.beginTxnReadTimestamp(r.Context(), readTS, "s3 abort multipart upload: begin read timestamp")
+		readTimestamp, err := s.beginTxnReadTimestamp(r.Context(), "s3 abort multipart upload: begin read timestamp")
 		if err != nil {
 			return errors.Wrap(err, "s3: allocate startTS for mutation")
 		}
-		readTS = readTimestamp.Timestamp()
+		readTS := readTimestamp.Timestamp()
 		startTS := readTS
 		readPin := s.pinReadTS(readTS)
 		defer readPin.Release()
@@ -1472,7 +1503,7 @@ func (s *S3Server) abortMultipartUpload(w http.ResponseWriter, r *http.Request, 
 		generation = meta.Generation
 
 		uploadMetaKey := s3keys.UploadMetaKey(bucket, meta.Generation, objectKey, uploadID)
-		if _, err := s.store.GetAt(r.Context(), uploadMetaKey, readTS); err != nil {
+		if _, err := requestGetAt(r.Context(), s.store, uploadMetaKey, readTS); err != nil {
 			if errors.Is(err, store.ErrKeyNotFound) {
 				return &s3ResponseError{
 					Status:  http.StatusNotFound,
@@ -1510,7 +1541,11 @@ func (s *S3Server) abortMultipartUpload(w http.ResponseWriter, r *http.Request, 
 
 //nolint:cyclop // listParts validates upload, parses pagination params, and iterates parts; branches are inherent.
 func (s *S3Server) listParts(w http.ResponseWriter, r *http.Request, bucket string, objectKey string, uploadID string) {
-	readTS := s.readTS()
+	readTS, err := s.snapshotReadTS(r.Context())
+	if err != nil {
+		writeS3InternalError(w, err)
+		return
+	}
 	readPin := s.pinReadTS(readTS)
 	defer readPin.Release()
 
@@ -1526,7 +1561,7 @@ func (s *S3Server) listParts(w http.ResponseWriter, r *http.Request, bucket stri
 
 	// Verify upload exists.
 	uploadMetaKey := s3keys.UploadMetaKey(bucket, meta.Generation, objectKey, uploadID)
-	if _, err := s.store.GetAt(r.Context(), uploadMetaKey, readTS); err != nil {
+	if _, err := requestGetAt(r.Context(), s.store, uploadMetaKey, readTS); err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			writeS3Error(w, http.StatusNotFound, "NoSuchUpload", "upload not found", bucket, objectKey)
 			return
@@ -1546,7 +1581,7 @@ func (s *S3Server) listParts(w http.ResponseWriter, r *http.Request, bucket stri
 	}
 	end := prefixScanEnd(partPrefix)
 
-	kvs, err := s.store.ScanAt(r.Context(), start, end, maxParts+1, readTS)
+	kvs, err := requestScanAt(r.Context(), s.store, start, end, maxParts+1, readTS)
 	if err != nil {
 		writeS3InternalError(w, err)
 		return
@@ -1664,9 +1699,12 @@ func (s *S3Server) deleteByPrefix(ctx context.Context, prefix []byte, bucket str
 	end := prefixScanEnd(prefix)
 	cursor := prefix
 	for {
-		readTS := s.readTS()
+		readTS, err := s.snapshotReadTS(ctx)
+		if err != nil {
+			return err
+		}
 		readPin := s.pinReadTS(readTS)
-		kvs, err := s.store.ScanAt(ctx, cursor, end, s3MetaBatchOps, readTS)
+		kvs, err := requestScanAt(ctx, s.store, cursor, end, s3MetaBatchOps, readTS)
 		readPin.Release()
 		if err != nil {
 			slog.ErrorContext(ctx, "deleteByPrefix: scan failed",
@@ -1701,7 +1739,7 @@ func (s *S3Server) dispatchS3CleanupBatch(ctx context.Context, elems []*kv.Elem[
 	}
 	return s.retryS3Mutation(ctx, func() error {
 		if hasChunkRef {
-			readTimestamp, err := s.beginTxnReadTimestamp(ctx, ^uint64(0), "s3 chunkref cleanup: begin read timestamp")
+			readTimestamp, err := s.beginTxnReadTimestamp(ctx, "s3 chunkref cleanup: begin read timestamp")
 			if err != nil {
 				return err
 			}
@@ -1810,7 +1848,7 @@ func writeS3ListingError(w http.ResponseWriter, bucket string, err error) {
 }
 
 func (s *S3Server) loadBucketMetaAt(ctx context.Context, bucket string, readTS uint64) (*s3BucketMeta, bool, error) {
-	raw, err := s.store.GetAt(ctx, s3keys.BucketMetaKey(bucket), readTS)
+	raw, err := requestGetAt(ctx, s.store, s3keys.BucketMetaKey(bucket), readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return nil, false, nil
@@ -1825,7 +1863,7 @@ func (s *S3Server) loadBucketMetaAt(ctx context.Context, bucket string, readTS u
 }
 
 func (s *S3Server) nextBucketGenerationAt(ctx context.Context, bucket string, readTS uint64) (uint64, error) {
-	raw, err := s.store.GetAt(ctx, s3keys.BucketGenerationKey(bucket), readTS)
+	raw, err := requestGetAt(ctx, s.store, s3keys.BucketGenerationKey(bucket), readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return 1, nil
@@ -1840,7 +1878,7 @@ func (s *S3Server) nextBucketGenerationAt(ctx context.Context, bucket string, re
 }
 
 func (s *S3Server) loadObjectManifestAt(ctx context.Context, key []byte, readTS uint64) (*s3ObjectManifest, bool, error) {
-	raw, err := s.store.GetAt(ctx, key, readTS)
+	raw, err := requestGetAt(ctx, s.store, key, readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return nil, false, nil
@@ -1994,7 +2032,11 @@ func (s *S3Server) proxyRouteKey(r *http.Request) ([]byte, error) {
 	}
 
 	kv.ObserveReadForKeyThrough(s.coordinator, r.Context(), s3keys.BucketMetaKey(bucket))
-	meta, exists, err := s.loadBucketMetaAt(r.Context(), bucket, s.readTS())
+	readTS, err := s.fencedObjectReadTS(r.Context(), s3keys.BucketMetaKey(bucket))
+	if err != nil {
+		return nil, err
+	}
+	meta, exists, err := s.loadBucketMetaAt(r.Context(), bucket, readTS)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -2519,10 +2561,6 @@ func hlcToTime(ts uint64) time.Time {
 	return time.UnixMilli(int64(millis)).UTC() //nolint:gosec // G115: millis is clamped to MaxInt64 above.
 }
 
-func (s *S3Server) readTS() uint64 {
-	return snapshotTS(s.clock(), s.store)
-}
-
 func (s *S3Server) pinReadTS(ts uint64) *kv.ActiveTimestampToken {
 	if s == nil || s.readTracker == nil {
 		return &kv.ActiveTimestampToken{}
@@ -2530,41 +2568,8 @@ func (s *S3Server) pinReadTS(ts uint64) *kv.ActiveTimestampToken {
 	return s.readTracker.Pin(ts)
 }
 
-// txnStartTS returns the read/start timestamp for an S3 transaction.
-// When the caller passes the sentinel ^uint64(0) ("server, please
-// allocate"), the timestamp is drawn through the coordinator timestamp source.
-// TSO-enabled deployments use the allocator path; the legacy fallback still
-// applies the HLC-4 (iii) physical-ceiling fence because the returned value is
-// persistence-grade (it pins MVCC reads and is the startTS half of a 2PC
-// commit). Returning ErrCeilingExpired here lets the SigV4 handler surface the
-// failure as an S3 5xx instead of silently issuing a stale-leader timestamp.
-func (s *S3Server) txnStartTS(ctx context.Context, readTS uint64) (uint64, error) {
-	if readTS != ^uint64(0) {
-		return readTS, nil
-	}
-	ts, err := kv.NextTimestampThrough(ctx, s.coordinator, "s3: allocate txn startTS")
-	if err != nil {
-		return 0, errors.WithStack(err)
-	}
-	return ts, nil
-}
-
-func (s *S3Server) beginTxnReadTimestamp(ctx context.Context, readTS uint64, label string) (kv.ReadTimestamp, error) {
-	if readTS == ^uint64(0) {
-		if alloc, ok := kv.TimestampAllocatorThrough(s.coordinator); ok {
-			if phaseD, phaseDOK := alloc.(kv.TSOPhaseDState); phaseDOK && (phaseD.PhaseDRequired() || phaseD.PhaseDActive()) {
-				readTS = 1
-				readTimestamp, err := kv.BeginReadTimestampThrough(ctx, s.coordinator, readTS, label)
-				return readTimestamp, errors.WithStack(err)
-			}
-		}
-	}
-	startTS, err := s.txnStartTS(ctx, readTS)
-	if err != nil {
-		return kv.ReadTimestamp{}, err
-	}
-	readTimestamp, err := kv.BeginReadTimestampThrough(ctx, s.coordinator, startTS, label)
-	return readTimestamp, errors.WithStack(err)
+func (s *S3Server) beginTxnReadTimestamp(ctx context.Context, label string) (kv.ReadTimestamp, error) {
+	return beginFencedReadSnapshot(ctx, s.coordinator, s.store, label)
 }
 
 // newS3UploadID generates an upload identifier for multipart uploads.

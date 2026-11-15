@@ -104,10 +104,7 @@ func redisTxnReadFencePointKeys(userKey []byte) [][]byte {
 }
 
 func redisLegacyBareReadFenceAllowed(userKey []byte) bool {
-	if isKnownInternalKey(userKey) {
-		return false
-	}
-	return !bytes.HasPrefix(userKey, []byte("!sqs|"))
+	return !isKnownInternalKey(userKey)
 }
 
 // redisTxnReadFenceTargetsForRanges builds the fence set for a user key. Point
@@ -513,20 +510,17 @@ func (r *RedisServer) leaseRedisReadFenceTargets(ctx context.Context, targets []
 // timestamp through the coordinator, pins it, and leases again -- the second
 // lease is what catches a leadership change between the fence and the pin.
 //
-// The timestamp comes from BeginReadTimestampThrough rather than selectTS
-// alone: under the dedicated TSO the coordinator is the only thing allowed to
-// hand out a read timestamp, and selectTS is the caller's preference, not the
-// decision.
+// Timestamp selection is owned by beginTargetReadSnapshot. Callers cannot
+// supply an old watermark, including through a deferred callback.
 func (r *RedisServer) redisReadFencedTimestampForTargets(
 	ctx context.Context,
 	targets []kv.ReadFenceTarget,
-	selectTS func() uint64,
 	label string,
 ) (kv.ReadTimestamp, *kv.ActiveTimestampToken, error) {
 	if err := r.leaseRedisReadFenceTargets(ctx, targets); err != nil {
 		return kv.ReadTimestamp{}, nil, err
 	}
-	readTimestamp, err := kv.BeginReadTimestampThrough(ctx, r.coordinator, redisFencedSelectTS(selectTS), label)
+	readTimestamp, err := r.beginTargetReadSnapshot(ctx, targets, label)
 	if err != nil {
 		return kv.ReadTimestamp{}, nil, errors.WithStack(err)
 	}
@@ -536,25 +530,6 @@ func (r *RedisServer) redisReadFencedTimestampForTargets(
 		return kv.ReadTimestamp{}, nil, err
 	}
 	return readTimestamp, readPin, nil
-}
-
-// redisFencedSelectTS normalizes the empty-store watermark before it reaches
-// the Phase-D boundary. snapshotTS answers ^uint64(0) for a store with no
-// committed record -- "the latest of everything" for a direct MVCC read -- but
-// BeginReadTimestampThrough rejects both 0 and ^uint64(0) as invalid read
-// timestamps once Phase D is required, so reading a nonexistent key on a fresh
-// cluster would return an error instead of an empty result, and Phase D could
-// never activate from that path. 1 is the floor txnStartTS already uses for
-// the same case: below every real commit, so the read still sees nothing.
-func redisFencedSelectTS(selectTS func() uint64) uint64 {
-	if selectTS == nil {
-		return 1
-	}
-	ts := selectTS()
-	if ts == 0 || ts == ^uint64(0) {
-		return 1
-	}
-	return ts
 }
 
 // MULTI/EXEC/DISCARD handling
@@ -798,6 +773,60 @@ func redisTxnWideCreateReadKeys(userKey []byte, typ redisValueType, fenceKey fun
 	return [][]byte{fenceKey(userKey)}
 }
 
+// redisStringTypeReadKeys lists the anchors of the string family (TYPE reports
+// the prefixed string key, the HyperLogLog key, and, outside internal
+// namespaces, the legacy bare key. A command that observed userKey as a string at its read
+// timestamp validates them at commit: every DEL, overwrite, and type change of
+// a string rewrites or deletes whichever of them holds the value.
+func redisStringTypeReadKeys(userKey []byte) [][]byte {
+	keys := [][]byte{redisStrKey(userKey), redisHLLKey(userKey)}
+	if redisLegacyBareReadFenceAllowed(userKey) {
+		keys = append(keys, userKey)
+	}
+	return keys
+}
+
+// redisStringWriteGuard returns what a standalone string write (SET and its
+// NX / XX / GET forms, SETNX, SETEX, the legacy INCR) adds to its transaction
+// once it has decided on userKey's logical type typ at its read timestamp:
+//
+//   - absent: redisAbsentKeyCreateGuard (the absent-key read keys and
+//     Puts of the four txn-wide fences), so the create conflicts with a
+//     concurrent create of any other encoding, in either commit order.
+//   - string: the string-family anchors (redisStringTypeReadKeys). The write
+//     Puts only the prefixed string key, so without them a DEL or type change
+//     of a value held under the HLL or the legacy bare key would go unseen.
+//   - list / hash / set / zset / stream: nothing. The write replaces the
+//     collection through deleteLogicalKeyElems, which Puts the four fences
+//     that every DEL, emptying path, and type change of a collection also
+//     writes, so the write-write check already covers them.
+func redisStringWriteGuard(userKey []byte, typ redisValueType) ([]*kv.Elem[kv.OP], [][]byte) {
+	switch typ {
+	case redisTypeNone:
+		return redisAbsentKeyCreateGuard(userKey, typ)
+	case redisTypeString:
+		return nil, redisStringTypeReadKeys(userKey)
+	case redisTypeList, redisTypeHash, redisTypeSet, redisTypeZSet, redisTypeStream:
+	}
+	return nil, nil
+}
+
+// redisAbsentKeyCreateGuard returns what a creator of a single-anchor
+// encoding (an HLL, a stream) adds to its transaction when it observed userKey
+// absent at its read timestamp (startType == redisTypeNone): the absent-key
+// read keys, so a concurrent create of any other type makes it conflict, and
+// Puts of the four txn-wide fences, so a concurrent list / hash / set / zset
+// create, which reads those fences for an absent key, conflicts with it too.
+// Without both, the two creates have disjoint read and write sets and commit
+// two encodings under one key. A creator that found the key already of its
+// own type gets nothing: its own anchor, which every write to the key
+// rewrites or deletes, is in its write set.
+func redisAbsentKeyCreateGuard(userKey []byte, startType redisValueType) ([]*kv.Elem[kv.OP], [][]byte) {
+	if startType != redisTypeNone {
+		return nil, nil
+	}
+	return redisTxnWideCollectionFenceElems(userKey), redisTxnReadFencePointKeys(userKey)
+}
 func redisTxnWideFenceElem(key []byte) *kv.Elem[kv.OP] {
 	return &kv.Elem[kv.OP]{Op: kv.Put, Key: key, Value: []byte{}}
 }
@@ -833,26 +862,23 @@ func (t *txnContext) ctxOrBackground() context.Context {
 	return t.server.redisContext(t.ctx)
 }
 
-func (t *txnContext) load(key []byte) (*txnValue, error) {
-	// If the key is already an internal key (e.g., !redis|hash|...,
-	// !lst|..., !txn|..., !ddb|..., !s3|..., !dist|...), use it as-is.
-	// Otherwise, it's a bare user key for a string value — prefix it.
-	storageKey := key
-	if !isKnownInternalKey(key) {
-		storageKey = redisStrKey(key)
+func (t *txnContext) load(key []byte, internal bool) (*txnValue, error) {
+	storageKey := redisStrKey(key)
+	if internal {
+		storageKey = key
 	}
 	k := string(storageKey)
 	if tv, ok := t.working[k]; ok {
 		return tv, nil
 	}
 	t.trackReadKey(storageKey)
-	if !isKnownInternalKey(key) {
+	if !internal {
 		// Track the bare key too for conflict detection on legacy fallback reads.
 		t.trackReadKey(key)
 	}
 	tv := &txnValue{}
 	var val []byte
-	if !isKnownInternalKey(key) {
+	if !internal {
 		// For bare user string keys, use the fallback-aware reader.
 		var (
 			err error
@@ -895,7 +921,7 @@ func (t *txnContext) loadListState(key []byte) (*listTxnState, error) {
 	// and let the caller retry after the background compactor has caught up.
 	deltaPrefix := store.ListMetaDeltaScanPrefix(key)
 	deltaEnd := store.PrefixScanEnd(deltaPrefix)
-	deltaKVs, err := t.server.store.ScanAt(ctx, deltaPrefix, deltaEnd, store.MaxDeltaScanLimit+1, t.startTS)
+	deltaKVs, err := requestScanAt(ctx, t.server.store, deltaPrefix, deltaEnd, store.MaxDeltaScanLimit+1, t.startTS)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -1001,7 +1027,7 @@ func (t *txnContext) loadExistingHashState(key []byte, keyString string) (*hashT
 		fields[field] = raw
 		origFields[field] = bytes.Clone(raw)
 	}
-	legacy, err := t.server.store.ExistsAt(ctx, redisHashKey(key), t.startTS)
+	legacy, err := requestExistsAt(ctx, t.server.store, redisHashKey(key), t.startTS)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -1031,7 +1057,7 @@ func (t *txnContext) loadExistingHashFieldState(key []byte, keyString string, fi
 		return nil, err
 	}
 	if !wide {
-		legacy, err := t.server.store.ExistsAt(ctx, redisHashKey(key), t.startTS)
+		legacy, err := requestExistsAt(ctx, t.server.store, redisHashKey(key), t.startTS)
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}
@@ -1064,7 +1090,7 @@ func (t *txnContext) loadHashFieldsIntoState(key []byte, fields [][]byte, st *ha
 		if _, staged := st.fields[fieldName]; staged {
 			continue
 		}
-		raw, err := t.server.store.GetAt(ctx, store.HashFieldKey(key, field), t.startTS)
+		raw, err := requestGetAt(ctx, t.server.store, store.HashFieldKey(key, field), t.startTS)
 		if err != nil {
 			if errors.Is(err, store.ErrKeyNotFound) {
 				continue
@@ -1107,7 +1133,7 @@ func (t *txnContext) loadZSetState(key []byte) (*zsetTxnState, error) {
 	ctx := t.ctxOrBackground()
 	memberPrefix := store.ZSetMemberScanPrefix(key)
 	memberEnd := store.PrefixScanEnd(memberPrefix)
-	probeKVs, probeErr := t.server.store.ScanAt(ctx, memberPrefix, memberEnd, 1, t.startTS)
+	probeKVs, probeErr := requestScanAt(ctx, t.server.store, memberPrefix, memberEnd, 1, t.startTS)
 	if probeErr != nil {
 		return nil, errors.WithStack(probeErr)
 	}
@@ -1164,7 +1190,17 @@ func (t *txnContext) stagedKeyType(key []byte) (redisValueType, error) {
 		return redisTypeNone, nil
 	}
 	t.trackTypeReadKeys(key)
-	return t.server.keyTypeAt(t.ctxOrBackground(), key, t.startTS)
+	typ, err := t.server.keyTypeAt(t.ctxOrBackground(), key, t.startTS)
+	if err != nil {
+		return typ, err
+	}
+	if typ == redisTypeNone {
+		// The nine type anchors miss a wide-column list / hash / set / zset
+		// create, which writes only its own rows and its fence; with the
+		// four fences the read set is the thirteen-key absent set.
+		t.trackWideCollectionFenceReads(key)
+	}
+	return typ, nil
 }
 
 func (t *txnContext) stagedPositiveKeyType(key string) (redisValueType, bool) {
@@ -1339,7 +1375,7 @@ func (t *txnContext) currentStringValue(key []byte) ([]byte, *time.Time, bool, e
 	if repl, ok := t.replacers[string(key)]; ok {
 		return bytes.Clone(repl.value), cloneTimePtr(repl.ttl), true, nil
 	}
-	tv, err := t.load(key)
+	tv, err := t.load(key, false)
 	if err != nil {
 		return nil, nil, false, err
 	}
@@ -1355,7 +1391,7 @@ func (t *txnContext) stageStringValue(key, value []byte, ttl *time.Time) error {
 		repl.ttl = cloneTimePtr(ttl)
 		return nil
 	}
-	tv, err := t.load(key)
+	tv, err := t.load(key, false)
 	if err != nil {
 		return err
 	}
@@ -1778,7 +1814,7 @@ func (t *txnContext) markHashCreate(key []byte) {
 // markStringDirty loads the string value into the working set so that
 // buildKeyElems will re-encode it with the updated embedded TTL.
 func (t *txnContext) markStringDirty(key []byte) (redisResult, error) {
-	tv, err := t.load(key)
+	tv, err := t.load(key, false)
 	if err != nil {
 		return redisResult{}, err
 	}
@@ -1787,7 +1823,7 @@ func (t *txnContext) markStringDirty(key []byte) (redisResult, error) {
 }
 
 func (t *txnContext) markHLLDirty(key []byte, ttl *time.Time) error {
-	hllValue, err := t.load(redisHLLKey(key))
+	hllValue, err := t.load(redisHLLKey(key), true)
 	if err != nil {
 		return err
 	}
@@ -1854,7 +1890,7 @@ func (t *txnContext) stageCollectionStateDeletion(key []byte) error {
 	}
 	stageListDelete(st)
 	// Mark the string/main value for deletion.
-	tv, err := t.load(key)
+	tv, err := t.load(key, false)
 	if err != nil {
 		return err
 	}
@@ -1888,7 +1924,7 @@ func (t *txnContext) stageLegacyInternalDeletion(key []byte) error {
 		redisStreamKey(key),
 		redisHLLKey(key),
 	} {
-		iv, err := t.load(internalKey)
+		iv, err := t.load(internalKey, true)
 		if err != nil {
 			return err
 		}
@@ -2583,6 +2619,9 @@ func (t *txnContext) appendHashStateElems(elems []*kv.Elem[kv.OP], key []byte, s
 		return append(elems, inline...), false
 	}
 	next, newFields := appendHashChangedFieldElems(elems, key, st)
+	if len(st.dirtyFields) != 0 {
+		next = append(next, redisTxnWideHashFenceElem(key))
+	}
 	if newFields == 0 {
 		return next, false
 	}
@@ -2609,7 +2648,6 @@ func appendHashChangedFieldElems(elems []*kv.Elem[kv.OP], key []byte, st *hashTx
 func appendHashDeltaElem(elems []*kv.Elem[kv.OP], key []byte, newFields int64, commitTS uint64, seqInTxn uint32) []*kv.Elem[kv.OP] {
 	deltaVal := store.MarshalHashMetaDelta(store.HashMetaDelta{LenDelta: newFields})
 	return append(elems,
-		redisTxnWideHashFenceElem(key),
 		&kv.Elem[kv.OP]{
 			Op:    kv.Put,
 			Key:   store.HashMetaDeltaKey(key, commitTS, seqInTxn),
@@ -2965,7 +3003,7 @@ func (r *RedisServer) runTransactionDirect(queue []redcon.Command, requestContex
 		routeVersion := r.redisReadFenceRouteVersion()
 		fenceTargets := r.queuedCommandReadFenceGroupTargets(queue)
 		readTimestamp, readPin, err := r.redisReadFencedTimestampForTargets(
-			dispatchCtx, fenceTargets, r.txnStartTS, "redis exec: begin read timestamp")
+			dispatchCtx, fenceTargets, "redis exec: begin read timestamp")
 		if err != nil {
 			return err
 		}
@@ -3207,7 +3245,7 @@ func (r *RedisServer) firstExecAttempt(dispatchCtx context.Context, queue []redc
 	routeVersion := r.redisReadFenceRouteVersion()
 	fenceTargets := r.queuedCommandReadFenceGroupTargets(queue)
 	readTimestamp, readPin, err := r.redisReadFencedTimestampForTargets(
-		dispatchCtx, fenceTargets, r.txnStartTS, "redis exec: begin read timestamp")
+		dispatchCtx, fenceTargets, "redis exec: begin read timestamp")
 	if err != nil {
 		return nil, nil, err
 	}
@@ -3276,46 +3314,8 @@ func isAmbiguousRedisExecDispatchErr(err error) bool {
 	return !errors.Is(err, kv.ErrTransactionOutcomeUnknown) && errors.Is(err, store.ErrWriteConflict)
 }
 
-func (r *RedisServer) txnStartTS() uint64 {
-	// store.LastCommitTS() is the authoritative safe-snapshot watermark: it is
-	// updated atomically only AFTER the corresponding Pebble batch commit, so
-	// every version with commitTS ≤ store.LastCommitTS() is guaranteed visible
-	// in the store when we read.
-	//
-	// We must NOT return clock.Next() here.  clock.Next() can be AHEAD of
-	// store.LastCommitTS() because concurrent dispatchTxn calls advance the HLC
-	// before their Raft entry is applied.  If startTS = clock.Next() = T, a
-	// concurrent transaction that already called clock.Next() to obtain
-	// commitTS = T-1 and is still in the Raft pipeline will satisfy
-	//   latestTS(key) = T-1  ≤  T = startTS
-	// causing the FSM conflict check (latestTS > startTS) to silently pass even
-	// though we read stale data.  This allows two concurrent RPUSHes to pick the
-	// same sequence number, with the second overwriting the first — a lost write.
-	//
-	// Using store.LastCommitTS() directly closes this gap: any concurrent commit
-	// at > maxTS triggers a WriteConflict and a retry via retryRedisWrite.
-	//
-	// The Observe call still advances the HLC so that dispatchTxn's clock.Next()
-	// produces a commitTS strictly greater than maxTS (leader-election safety).
-	//
-	// When maxTS is 0 (empty store) we return 1 so the coordinator treats this
-	// as a valid startTS and does not override it with clock.Next() — which
-	// could be ahead of unapplied Raft entries and reintroduce the anomaly.
-	var maxTS uint64
-	if r.store != nil {
-		maxTS = r.store.LastCommitTS()
-	}
-	if r.coordinator != nil && r.coordinator.Clock() != nil && maxTS > 0 {
-		r.coordinator.Clock().Observe(maxTS)
-	}
-	if maxTS == 0 {
-		return 1
-	}
-	return maxTS
-}
-
 func (r *RedisServer) beginTxnReadTimestamp(ctx context.Context, label string) (kv.ReadTimestamp, error) {
-	readTimestamp, err := kv.BeginReadTimestampThrough(ctx, r.coordinator, r.txnStartTS(), label)
+	readTimestamp, err := beginFencedReadSnapshot(ctx, r.coordinator, r.store, label)
 	return readTimestamp, errors.WithStack(err)
 }
 
@@ -3342,4 +3342,44 @@ func (r *RedisServer) writeResults(conn redcon.Conn, results []redisResult) {
 			conn.WriteNull()
 		}
 	}
+}
+
+func (r *RedisServer) snapshotReadTS(ctx context.Context) (uint64, error) {
+	stamp, err := beginFencedReadSnapshot(ctx, r.coordinator, r.store, "redis read")
+	return stamp.Timestamp(), err
+}
+
+func (r *RedisServer) beginTargetReadSnapshot(ctx context.Context, targets []kv.ReadFenceTarget, label string) (kv.ReadTimestamp, error) {
+	if request, ok := kv.ReadRequestFromContext(ctx); ok {
+		if !request.MatchesStore(r.store) {
+			return kv.ReadTimestamp{}, kv.ErrReadSnapshotScope
+		}
+		snapshot, err := request.LatestTargets(ctx, label, targets)
+		return snapshot.TransactionTimestamp(), err
+	}
+	// Physical read-fence targets (including legacy wide columns) cannot be
+	// replaced by their logical key's group. Fence exactly the carried groups.
+	if reader, ok := r.store.(rawGroupCommitFloorReader); ok && len(targets) > 0 {
+		var ts uint64
+		for _, target := range targets {
+			var floor uint64
+			var err error
+			if target.GroupID != 0 {
+				floor, err = reader.GroupCommittedTimestampFloor(ctx, target.GroupID)
+			} else {
+				floor, err = fencedCommittedReadTS(ctx, r.coordinator, r.store, target.Key)
+			}
+			if err != nil {
+				return kv.ReadTimestamp{}, errors.WithStack(err)
+			}
+			ts = max(ts, floor)
+		}
+		stamp, err := kv.BeginReadTimestampThrough(ctx, r.coordinator, max(ts, 1), label)
+		return stamp, errors.WithStack(err)
+	}
+	keys := make([][]byte, 0, len(targets))
+	for _, target := range targets {
+		keys = append(keys, target.Key)
+	}
+	return beginFencedReadSnapshot(ctx, r.coordinator, r.store, label, keys...)
 }

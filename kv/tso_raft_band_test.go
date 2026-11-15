@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
+	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
@@ -37,6 +38,7 @@ func TestTSOPhysicalBandCommitsFullEndAndServesDistinctSlots(t *testing.T) {
 	require.Equal(t, uint64(0), first.Base&hlcLogicalMask)
 	require.Equal(t, (first.Base&^hlcLogicalMask)|hlcLogicalMask, first.CommittedBandEnd)
 	require.Equal(t, first.CommittedBandEnd, alloc.AllocationFloor())
+	require.Zero(t, first.PreviousIssuedCursor)
 	payloads := engine.proposedPayloads()
 	require.Len(t, payloads, 1)
 	require.Equal(t, first.CommittedBandEnd,
@@ -67,6 +69,7 @@ func TestTSOPhysicalBandCommitsFullEndAndServesDistinctSlots(t *testing.T) {
 	}
 	for reservation := range results {
 		require.Equal(t, first.CommittedBandEnd, reservation.CommittedBandEnd)
+		require.Less(t, reservation.PreviousIssuedCursor, reservation.Base)
 		for slot := reservation.Base; slot < reservation.Base+2; slot++ {
 			require.False(t, seen[slot])
 			seen[slot] = true
@@ -74,6 +77,46 @@ func TestTSOPhysicalBandCommitsFullEndAndServesDistinctSlots(t *testing.T) {
 	}
 	require.Len(t, seen, 3+workers*2)
 	require.Len(t, engine.proposedPayloads(), 1)
+}
+
+func TestTSOPhysicalBandWireCursorExcludesSkippedOffsets(t *testing.T) {
+	alloc, engine, _ := newBandTSOFixture(t)
+	first, err := alloc.ReservePhysicalBandAfter(t.Context(), 2, 0)
+	require.NoError(t, err)
+	minimum := first.Base + 10
+	second, err := alloc.ReservePhysicalBandAfter(t.Context(), 2, minimum)
+	require.NoError(t, err)
+	require.Equal(t, first.Base+1, second.PreviousIssuedCursor)
+	require.Equal(t, minimum+1, second.Base)
+	require.Equal(t, first.CommittedBandEnd, second.CommittedBandEnd)
+	require.Len(t, engine.proposedPayloads(), 1)
+
+	resp := &pb.GetTimestampResponse{Timestamp: second.Base, Count: 2, CommittedByDedicatedTso: true,
+		ReservationProtocolVersion: TSOPhysicalBandProtocolVersion, CommittedBandEnd: second.CommittedBandEnd,
+		PreviousIssuedCursor: second.PreviousIssuedCursor}
+	got, err := physicalBandReservationFromResponse(resp, 2, minimum)
+	require.NoError(t, err)
+	require.Equal(t, second, got)
+	resp.ReservationProtocolVersion = 0 // Old peer ignored the new request.
+	_, err = physicalBandReservationFromResponse(resp, 2, minimum)
+	require.ErrorIs(t, err, ErrTSOProtocolUnsupported)
+}
+
+func TestTSOPhysicalBandWireRejectsOldPeer(t *testing.T) {
+	client := &LeaderRoutedTSOAllocator{startupControlRPC: func(_ context.Context, _ uint64, _ string, _ string, request, reply any) (bool, error) {
+		timestampRequest, ok := request.(*pb.GetTimestampRequest)
+		require.True(t, ok)
+		require.Equal(t, TSOPhysicalBandProtocolVersion, timestampRequest.GetReservationProtocolVersion())
+		response, ok := reply.(*pb.GetTimestampResponse)
+		require.True(t, ok)
+		*response = pb.GetTimestampResponse{
+			Timestamp: 100, Count: 1, CommittedByDedicatedTso: true,
+			PreviousAllocationFloor: 99, // Legacy response to a request it ignored.
+		}
+		return true, nil
+	}}
+	_, err := client.requestRemotePhysicalBand(t.Context(), "old-peer", 1, 0)
+	require.ErrorIs(t, err, ErrTSOProtocolUnsupported)
 }
 
 func TestTSOPhysicalBandRollsOverBeforeCeilingRenewal(t *testing.T) {

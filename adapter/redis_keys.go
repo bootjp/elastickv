@@ -69,8 +69,11 @@ func (r *RedisServer) localKeys(pattern []byte, requestContexts ...context.Conte
 }
 
 func (r *RedisServer) localKeysExact(pattern []byte, requestContexts ...context.Context) ([][]byte, error) {
-	typ, err := r.keyTypeAt(r.redisContext(requestContexts...),
-		pattern, r.readTS())
+	readTS, err := r.snapshotReadTS(r.redisContext(requestContexts...))
+	if err != nil {
+		return nil, err
+	}
+	typ, err := r.keyTypeAt(r.redisContext(requestContexts...), pattern, readTS)
 	if err != nil {
 		return nil, err
 	}
@@ -152,10 +155,13 @@ func streamMetaScanStart(userPrefix []byte) []byte {
 func (r *RedisServer) localKeysPattern(pattern []byte, requestContexts ...context.Context) ([][]byte, error) {
 	start, end := patternScanBounds(pattern)
 	keyset := map[string][]byte{}
-	readTS := r.readTS()
+	readTS, err := r.snapshotReadTS(r.redisContext(requestContexts...))
+	if err != nil {
+		return nil, err
+	}
 
 	mergeScannedKeys := func(scanStart, scanEnd []byte) error {
-		keys, err := r.store.ScanAt(r.redisContext(requestContexts...),
+		keys, err := requestScanAt(r.redisContext(requestContexts...), r.store,
 			scanStart, scanEnd, math.MaxInt, readTS)
 		if err != nil {
 			return errors.WithStack(err)

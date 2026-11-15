@@ -58,7 +58,7 @@
     (doseq [[out-cmd args] binary-builds]
       (let [{:keys [exit err]} (apply sh/sh (concat args [:env env :dir root]))]
         (when-not (zero? exit)
-          (throw (ex-info (str "failed to build " out-cmd) {:err err})))))))
+          (throw (ex-info (str "failed to build " out-cmd ": " err) {:err err})))))))
 
 (defonce ^:private built? (delay (build-binaries!)))
 
@@ -210,8 +210,8 @@
   "Builds the production server argv for one managed Jepsen node."
   [{:keys [node grpc redis dynamo s3 sqs sqs-region data-dir raft-engine
            raft-redis-map raft-dynamo-map raft-s3-map raft-sqs-map raft-groups shard-ranges
-           filesystem-mount encryption migration-enabled bootstrap? join-as-learner join-members
-           auto-split-args]}]
+           filesystem-mount encryption migration-enabled bootstrap? bootstrap-members
+           join-as-learner join-members auto-split-args]}]
   (cond-> ["--address" grpc
            "--redisAddress" redis
            "--raftId" (name node)
@@ -232,7 +232,8 @@
     encryption (conj "--encryptionSidecarPath" sidecar-file
                      "--encryption-enabled"
                      "--kekFile" kek-file)
-    bootstrap? (conj "--raftBootstrap")
+    (and bootstrap? (not bootstrap-members)) (conj "--raftBootstrap")
+    bootstrap-members (conj "--raftBootstrapMembers" bootstrap-members)
     join-as-learner (conj "--raftJoinAsLearner")
     (and join-as-learner join-members) (conj "--raftJoinMembers" join-members)))
 
@@ -314,7 +315,7 @@
         (c/exec :bash "-c" (unmount-filesystem-cmd mount-dir))))))
 
 (defn- start-node!
-  [test node {:keys [bootstrap-node grpc-port redis-port dynamo-port s3-port sqs-port sqs-region data-dir raft-groups shard-ranges raft-engine server-env migration-enabled filesystem-mount encryption join-as-learner join-members auto-split-args]}]
+  [test node {:keys [bootstrap-node bootstrap-members grpc-port redis-port dynamo-port s3-port sqs-port sqs-region data-dir raft-groups shard-ranges raft-engine server-env migration-enabled filesystem-mount encryption join-as-learner join-members auto-split-args]}]
   (when (and (seq raft-groups)
              (> (count raft-groups) 1)
              (nil? shard-ranges))
@@ -340,7 +341,8 @@
                 :raft-s3-map raft-s3-map :raft-sqs-map raft-sqs-map
                 :raft-groups raft-groups :shard-ranges shard-ranges
                 :filesystem-mount mount-dir :encryption encryption :migration-enabled migration-enabled
-                :bootstrap? bootstrap? :join-as-learner join-as-learner
+                :bootstrap? bootstrap? :bootstrap-members bootstrap-members
+                :join-as-learner join-as-learner
                 :join-members join-members :auto-split-args auto-split-args})
         effective-server-env (cond-> (or server-env {})
                                migration-enabled
@@ -601,7 +603,9 @@
   (wait-for-node-grpc! node opts)
   (wait-for-mount! node (filesystem-mount-dir (:filesystem-mount opts) node))
   (doseq [peer (voter-peers (:nodes test) (:reserve-learner opts))]
-    (join-peer! node peer opts)
+    (if (:bootstrap-members opts)
+      (wait-for-node-grpc! peer opts)
+      (join-peer! node peer opts))
     (enable-peer-mount! test peer opts))
   (when-let [candidate (:reserve-learner opts)]
     (wait-for-node-grpc! candidate opts))

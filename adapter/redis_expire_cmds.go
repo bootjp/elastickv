@@ -15,7 +15,9 @@ import (
 	"github.com/tidwall/redcon"
 )
 
-// SETEX key seconds value — equivalent to SET key value EX seconds
+// SETEX key seconds value — equivalent to SET key value EX seconds, and
+// executed as one: it replaces whatever encoding the key holds and, like
+// every string write through executeSet, validates the type it observed.
 func (r *RedisServer) setex(conn redcon.Conn, cmd redcon.Command) {
 	if !r.requireRequestContext(conn) {
 		return
@@ -34,7 +36,7 @@ func (r *RedisServer) setex(conn redcon.Conn, cmd redcon.Command) {
 	ctx, cancel := context.WithTimeout(r.handlerContext(conn),
 		redisDispatchTimeout)
 	defer cancel()
-	if err := r.saveString(ctx, cmd.Args[1], cmd.Args[3], &ttl); err != nil {
+	if _, err := r.executeSet(ctx, cmd.Args[1], cmd.Args[3], redisSetOptions{ttl: &ttl}); err != nil {
 		writeRedisError(conn, err)
 		return
 	}
@@ -159,7 +161,11 @@ func (r *RedisServer) pttl(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) writeTTL(conn redcon.Conn, key []byte, milliseconds bool) {
-	readTS := r.readTS()
+	readTS, err := r.snapshotReadTS(r.handlerContext(conn))
+	if err != nil {
+		writeRedisError(conn, err)
+		return
+	}
 	exists, err := r.logicalExistsAt(r.handlerContext(conn),
 		key, readTS)
 	if err != nil {
@@ -361,7 +367,7 @@ func (r *RedisServer) dispatchExpireForReadTimestamp(
 // (stored under !redis|hll|<key>), both of which rawKeyTypeAt reports as
 // redisTypeString.
 func (r *RedisServer) isPlainRedisString(ctx context.Context, key []byte, readTS uint64) (bool, error) {
-	exists, err := r.store.ExistsAt(ctx, redisStrKey(key), readTS)
+	exists, err := requestExistsAt(ctx, r.store, redisStrKey(key), readTS)
 	if err != nil {
 		return false, cockerrors.WithStack(err)
 	}
@@ -369,7 +375,7 @@ func (r *RedisServer) isPlainRedisString(ctx context.Context, key []byte, readTS
 		return true, nil
 	}
 	// Fall back to the bare legacy layout.
-	legacy, err := r.store.ExistsAt(ctx, key, readTS)
+	legacy, err := requestExistsAt(ctx, r.store, key, readTS)
 	if err != nil {
 		return false, cockerrors.WithStack(err)
 	}
@@ -416,7 +422,7 @@ func (r *RedisServer) dispatchStringExpireReadTimestamp(ctx context.Context, key
 
 func (r *RedisServer) dispatchHLLExpireReadTimestamp(ctx context.Context, key []byte, readTimestamp kv.ReadTimestamp, expireAt time.Time) (bool, error) {
 	readTS := readTimestamp.Timestamp()
-	raw, err := r.store.GetAt(ctx, redisHLLKey(key), readTS)
+	raw, err := requestGetAt(ctx, r.store, redisHLLKey(key), readTS)
 	if err != nil {
 		if cockerrors.Is(err, store.ErrKeyNotFound) {
 			return false, nil

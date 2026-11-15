@@ -66,9 +66,15 @@ func (s *S3Server) scanS3ObjectListing(ctx context.Context, req s3ObjectListingR
 		return s3ObjectListingPage{}, errors.WithStack(
 			errors.Mark(errors.Wrap(err, "decode continuation token"), errS3ListingMalformedToken))
 	}
-	readTS := s.readTS()
+	readTS, err := s.snapshotReadTS(ctx)
+	if err != nil {
+		return s3ObjectListingPage{}, err
+	}
 	if token != nil && token.ReadTS != 0 {
 		readTS = token.ReadTS
+		if err := authorizeHistoricalRead(ctx, s.store, readTS); err != nil {
+			return s3ObjectListingPage{}, err
+		}
 	}
 	generation, err := s.s3ListingGeneration(ctx, req, token, readTS)
 	if err != nil {
@@ -134,7 +140,7 @@ func (s *S3Server) runS3ObjectListingScan(ctx context.Context, scan *s3ObjectLis
 	cursor := start
 	for scan.emitted < scan.req.MaxKeys {
 		pageLimit := min(s3ListPageSize, scan.req.MaxKeys-scan.emitted)
-		kvs, err := s.store.ScanAt(ctx, cursor, end, pageLimit, scan.readTS)
+		kvs, err := requestScanAt(ctx, s.store, cursor, end, pageLimit, scan.readTS)
 		if err != nil {
 			if scan.resumed && errors.Is(err, store.ErrReadTSCompacted) {
 				return errors.WithStack(errS3ListingTokenExpired)

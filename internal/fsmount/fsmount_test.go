@@ -103,7 +103,6 @@ func skipOrFailWithoutFuse(t *testing.T, format string, args ...any) {
 }
 
 func TestMountFilesystemServiceServesKernelMount(t *testing.T) {
-	t.Parallel()
 	if _, err := os.Stat("/dev/fuse"); err != nil {
 		skipOrFailWithoutFuse(t, "no /dev/fuse: %v", err)
 	}
@@ -405,7 +404,7 @@ func TestStartFilesystemPlacementCollectorStopsOnCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	eg, egCtx := errgroup.WithContext(ctx)
 
-	startFilesystemPlacementCollector(egCtx, eg, svc, time.Millisecond)
+	startFilesystemPlacementCollector(egCtx, eg, svc, time.Hour)
 	time.Sleep(10 * time.Millisecond)
 	cancel()
 

@@ -448,6 +448,26 @@ func redisRouteKey(key []byte) []byte {
 	return rest[sep+1:]
 }
 
+// dynamoScanRouteKey recognizes only ranges contained in one table's persisted
+// family. Broader scans must retain their full route coverage.
+func dynamoScanRouteKey(start, end []byte) []byte {
+	for _, family := range [][]byte{dynamoItemPrefixBytes, dynamoSealPrefixBytes, dynamoGSIPrefixBytes} {
+		if !bytes.HasPrefix(start, family) {
+			continue
+		}
+		sep := bytes.IndexByte(start[len(family):], '|')
+		if sep <= 0 || len(end) == 0 || bytes.Compare(end, start) <= 0 {
+			return nil
+		}
+		tablePrefix := start[:len(family)+sep+1]
+		if bytes.Compare(end, prefixScanEnd(tablePrefix)) > 0 {
+			return nil
+		}
+		return dynamoRouteKey(start)
+	}
+	return nil
+}
+
 func dynamoRouteKey(key []byte) []byte {
 	switch {
 	case bytes.HasPrefix(key, dynamoTableMetaPrefixBytes):

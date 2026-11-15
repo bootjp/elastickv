@@ -267,7 +267,7 @@
   (open! [this test node]
     (let [port (get node->port node default-sqs-port)
           host (or (:sqs-host test) (name node))]
-      (assoc this :sqs (sqs/make-client host port region))))
+      (assoc this :sqs (sqs/make-client host port region (:disable-sdk-retries test)))))
 
   (setup! [this _test]
     (let [url (create-htfifo-queue! sqs queue-name partition-count)]

@@ -417,7 +417,11 @@ func (r *RedisServer) getOrCreateLeaderClient(addr string) *redis.Client {
 	if cli, ok = r.leaderClients[addr]; ok {
 		return cli
 	}
-	cli = redis.NewClient(&redis.Options{Addr: addr, PoolSize: r.leaderClientPoolSize(), ContextTimeoutEnabled: r.requestAdmission != nil})
+	// A leader may apply a non-idempotent command before its reply is lost.
+	// Replaying at the transport layer creates a new request and bypasses
+	// request-scoped deduplication, so leave that outcome indeterminate.
+	cli = redis.NewClient(&redis.Options{Addr: addr, PoolSize: r.leaderClientPoolSize(),
+		MaxRetries: -1, ContextTimeoutEnabled: r.requestAdmission != nil})
 	r.leaderClients[addr] = cli
 	return cli
 }
@@ -441,6 +445,7 @@ func (r *RedisServer) getOrCreateBlockingLeaderClient(addr string) *redis.Client
 	cli = redis.NewClient(&redis.Options{
 		Addr:                  addr,
 		PoolSize:              r.blockingLeaderClientPoolSize(),
+		MaxRetries:            -1,
 		ContextTimeoutEnabled: r.requestAdmission != nil,
 	})
 	r.blockingLeaderClients[addr] = cli
@@ -671,7 +676,7 @@ func (r *RedisServer) readValueAt(ctx context.Context, key []byte, readTS uint64
 		if err := r.coordinator.VerifyLeaderForKey(ctx, key); err != nil {
 			return nil, errors.WithStack(err)
 		}
-		v, err := r.store.GetAt(ctx, key, readTS)
+		v, err := requestGetAt(ctx, r.store, key, readTS)
 		return v, errors.WithStack(err)
 	}
 	return r.tryLeaderGetAtContext(ctx, key, readTS)

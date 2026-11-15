@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/monitoring"
@@ -682,6 +683,16 @@ func TestDeltaCompactor_TTLInlineRotatesPlansAcrossTicksThatRunOutOfBudget(t *te
 	require.Equal(t, want, st.scanned, "each tick must reach the plan after the one the previous tick reached")
 }
 
+// These compaction fixtures apply writes synchronously. Give each shard an
+// explicit leader/read barrier so the real ShardStore strict-floor path is
+// exercised; an engine-less shard correctly cannot supply an authoritative floor.
+type localCompactionReadEngine struct{ raftengine.Engine }
+
+func (*localCompactionReadEngine) State() raftengine.State { return raftengine.StateLeader }
+func (*localCompactionReadEngine) LinearizableRead(ctx context.Context) (uint64, error) {
+	return 0, ctx.Err()
+}
+
 // newSplitRedisShardStore returns a ShardStore whose catalog sends user keys
 // below "m" to group 1 and the rest to group 2, the way a multi-shard
 // deployment splits the Redis keyspace.
@@ -690,8 +701,8 @@ func newSplitRedisShardStore() *kv.ShardStore {
 	engine.UpdateRoute([]byte(""), []byte("m"), 1)
 	engine.UpdateRoute([]byte("m"), nil, 2)
 	return kv.NewShardStore(engine, map[uint64]*kv.ShardGroup{
-		1: {Store: store.NewMVCCStore()},
-		2: {Store: store.NewMVCCStore()},
+		1: {Store: store.NewMVCCStore(), Engine: &localCompactionReadEngine{}},
+		2: {Store: store.NewMVCCStore(), Engine: &localCompactionReadEngine{}},
 	})
 }
 
@@ -769,8 +780,8 @@ func TestDeltaCompactor_TTLInlineAdvancesPastAFullPageOfStaleRows(t *testing.T) 
 	engine.UpdateRoute([]byte("m"), nil, 1)
 	group1 := store.NewMVCCStore()
 	st := kv.NewShardStore(engine, map[uint64]*kv.ShardGroup{
-		1: {Store: group1},
-		2: {Store: store.NewMVCCStore()},
+		1: {Store: group1, Engine: &localCompactionReadEngine{}},
+		2: {Store: store.NewMVCCStore(), Engine: &localCompactionReadEngine{}},
 	})
 	coord := &localLeaderGroupCompactionCoordinator{
 		shardOnlyLeaderCompactionCoordinator: &shardOnlyLeaderCompactionCoordinator{
@@ -815,8 +826,8 @@ func TestDeltaCompactor_TTLInlineMigratesWideColumnRowsAtTheirLegacyRoute(t *tes
 	engine.UpdateRoute([]byte("m"), nil, 2)
 	group1 := store.NewMVCCStore()
 	st := kv.NewShardStore(engine, map[uint64]*kv.ShardGroup{
-		1: {Store: group1},
-		2: {Store: store.NewMVCCStore()},
+		1: {Store: group1, Engine: &localCompactionReadEngine{}},
+		2: {Store: store.NewMVCCStore(), Engine: &localCompactionReadEngine{}},
 	})
 	coord := &localLeaderGroupCompactionCoordinator{
 		shardOnlyLeaderCompactionCoordinator: &shardOnlyLeaderCompactionCoordinator{
@@ -858,8 +869,8 @@ func TestDeltaCompactor_TTLInlineMigratesStreamMetaAtItsLegacyRoute(t *testing.T
 	engine.UpdateRoute([]byte("m"), nil, 2)
 	group1 := store.NewMVCCStore()
 	st := kv.NewShardStore(engine, map[uint64]*kv.ShardGroup{
-		1: {Store: group1},
-		2: {Store: store.NewMVCCStore()},
+		1: {Store: group1, Engine: &localCompactionReadEngine{}},
+		2: {Store: store.NewMVCCStore(), Engine: &localCompactionReadEngine{}},
 	})
 	coord := &localLeaderGroupCompactionCoordinator{
 		shardOnlyLeaderCompactionCoordinator: &shardOnlyLeaderCompactionCoordinator{
@@ -2786,4 +2797,19 @@ func TestDeltaCompactor_TTLInlinePassStartsNoLaterThanItsReadTimestamp(t *testin
 	require.Len(t, passes, 1)
 	require.False(t, coord.snapshotAt.IsZero(), "SyncOnce must read the coordinator's clock")
 	require.LessOrEqual(t, passes[0].startedAt, coord.snapshotAt)
+}
+
+func TestDeltaCompactorRejectsMissingAuthoritativeShardFence(t *testing.T) {
+	t.Parallel()
+	base := store.NewMVCCStore()
+	t.Cleanup(func() { _ = base.Close() })
+	router := distribution.NewEngine()
+	router.UpdateRoute(nil, nil, 1)
+	shards := kv.NewShardStore(router, map[uint64]*kv.ShardGroup{1: {Store: base}})
+	coord := newLocalAdapterCoordinator(shards)
+	compactor := NewDeltaCompactor(shards, coord)
+	// Even a coordinator claiming local leadership cannot make an engine-less
+	// distributed store's local watermark authoritative. Do not bypass its error.
+	err := compactor.SyncOnce(t.Context())
+	require.ErrorIs(t, err, kv.ErrTSOCommitFloorUnavailable)
 }

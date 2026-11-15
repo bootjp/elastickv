@@ -56,7 +56,7 @@ func (r *RedisServer) hmset(conn redcon.Conn, cmd redcon.Command) {
 // blob exists.  The base meta key is also written with the migrated count so
 // that resolveHashMeta works correctly after migration.
 func (r *RedisServer) buildHashLegacyMigrationElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
-	raw, err := r.store.GetAt(ctx, redisHashKey(key), readTS)
+	raw, err := requestGetAt(ctx, r.store, redisHashKey(key), readTS)
 	if cockerrors.Is(err, store.ErrKeyNotFound) {
 		return nil, nil
 	}
@@ -205,11 +205,12 @@ func (r *RedisServer) applyHashFieldPairs(key []byte, args [][]byte, requestCont
 		elems, newFields = r.buildHashFieldElems(key, args, existsMap, elems)
 		added = newFields
 
+		// Every field write advances the fence used by whole-hash readers.
+		elems = append(elems, redisTxnWideHashFenceElem(key))
 		// Emit a single delta key for all newly-added fields.
 		if newFields != 0 {
 			deltaVal := store.MarshalHashMetaDelta(store.HashMetaDelta{LenDelta: int64(newFields)})
 			elems = append(elems,
-				redisTxnWideHashFenceElem(key),
 				&kv.Elem[kv.OP]{
 					Op:    kv.Put,
 					Key:   store.HashMetaDeltaKey(key, commitTS, 0),
@@ -244,7 +245,11 @@ func (r *RedisServer) hget(conn redcon.Conn, cmd redcon.Command) {
 	}
 	key := cmd.Args[1]
 	field := cmd.Args[2]
-	readTS := r.readTS()
+	readTS, err := r.snapshotReadTS(r.handlerContext(conn))
+	if err != nil {
+		writeRedisError(conn, err)
+		return
+	}
 	ctx := r.handlerContext(conn)
 
 	// Fast path: look the wide-column field up directly. Live
@@ -296,7 +301,7 @@ func (r *RedisServer) hashFieldFastLookup(ctx context.Context, key, field []byte
 	// common negative-lookup case and for any workload that still
 	// carries legacy-blob encodings. See the PR #565 independent
 	// review for the Medium-severity regression this addresses.
-	raw, err = r.store.GetAt(ctx, store.HashFieldKey(key, field), readTS)
+	raw, err = requestGetAt(ctx, r.store, store.HashFieldKey(key, field), readTS)
 	if err != nil {
 		if cockerrors.Is(err, store.ErrKeyNotFound) {
 			return nil, false, false, nil
@@ -332,7 +337,7 @@ func (r *RedisServer) hashFieldFastLookup(ctx context.Context, key, field []byte
 // already saved. Callers that require complete priority alignment
 // must take the keyTypeAt slow path explicitly.
 func (r *RedisServer) hasHigherPriorityStringEncoding(ctx context.Context, key []byte, readTS uint64) (bool, error) {
-	exists, err := r.store.ExistsAt(ctx, redisStrKey(key), readTS)
+	exists, err := requestExistsAt(ctx, r.store, redisStrKey(key), readTS)
 	if err != nil {
 		return false, cockerrors.WithStack(err)
 	}
@@ -376,7 +381,15 @@ func (r *RedisServer) hmget(conn redcon.Conn, cmd redcon.Command) {
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
-	readTS := r.readTS()
+	readTS, err := r.snapshotReadTS(r.handlerContext(conn))
+	if err != nil {
+		writeRedisError(conn, err)
+		return
+	}
+	r.hmgetAt(conn, cmd, readTS)
+}
+
+func (r *RedisServer) hmgetAt(conn redcon.Conn, cmd redcon.Command, readTS uint64) {
 	typ, err := r.keyTypeAtExpect(r.handlerContext(conn),
 		cmd.Args[1], readTS, redisTypeHash)
 	if err != nil {
@@ -436,7 +449,11 @@ func (r *RedisServer) hdel(conn redcon.Conn, cmd redcon.Command) {
 	conn.WriteInt(removed)
 }
 
-// hdelWideColumn deletes the given fields from the wide-column hash and emits a negative delta.
+// hdelWideColumn deletes the given fields from the wide-column hash, emits a
+// negative delta, and Puts the hash fence. The delta key is unique per commit
+// and the deleted field keys are ones a reader of the whole hash (HLEN,
+// HGETALL) may not have recorded, so the fence is what makes every change of
+// the field set visible to such a reader; field additions Put it as well.
 func (r *RedisServer) hdelWideColumn(ctx context.Context, key []byte, fields [][]byte, readTimestamp kv.ReadTimestamp) (int, error) {
 	readTS := readTimestamp.Timestamp()
 	delElems, removed, err := r.resolveHashFieldDelElems(ctx, key, fields, readTS)
@@ -453,11 +470,14 @@ func (r *RedisServer) hdelWideColumn(ctx context.Context, key []byte, fields [][
 	}
 	elems := delElems
 	deltaVal := store.MarshalHashMetaDelta(store.HashMetaDelta{LenDelta: int64(-removed)})
-	elems = append(elems, &kv.Elem[kv.OP]{
-		Op:    kv.Put,
-		Key:   store.HashMetaDeltaKey(key, commitTS, 0),
-		Value: deltaVal,
-	})
+	elems = append(elems,
+		&kv.Elem[kv.OP]{
+			Op:    kv.Put,
+			Key:   store.HashMetaDeltaKey(key, commitTS, 0),
+			Value: deltaVal,
+		},
+		redisTxnWideHashFenceElem(key),
+	)
 	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
 	_, dispatchErr := kv.DispatchWithReadTimestamp(dispatchCtx, r.coordinator, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
@@ -489,7 +509,7 @@ func (r *RedisServer) resolveHashFieldDelElems(ctx context.Context, key []byte, 
 			_, exists = existsMap[string(field)]
 		} else {
 			var err error
-			exists, err = r.store.ExistsAt(ctx, fieldKey, readTS)
+			exists, err = requestExistsAt(ctx, r.store, fieldKey, readTS)
 			if err != nil {
 				return nil, 0, cockerrors.WithStack(err)
 			}
@@ -522,7 +542,7 @@ func (r *RedisServer) hdelTxn(ctx context.Context, key []byte, fields [][]byte) 
 	// Wide-column path: check if any !hs|fld| keys exist for this key.
 	hashFieldPrefix := store.HashFieldScanPrefix(key)
 	hashFieldEnd := store.PrefixScanEnd(hashFieldPrefix)
-	wideKVs, err := r.store.ScanAt(ctx, hashFieldPrefix, hashFieldEnd, 1, readTS)
+	wideKVs, err := requestScanAt(ctx, r.store, hashFieldPrefix, hashFieldEnd, 1, readTS)
 	if err != nil {
 		return 0, cockerrors.WithStack(err)
 	}
@@ -553,6 +573,8 @@ func removeHashFields(value redisHashValue, fields [][]byte) int {
 	return removed
 }
 
+// persistHashReadTimestampTxn writes value as the full content of a legacy
+// blob hash after HDEL removed fields from it (its only caller).
 func (r *RedisServer) persistHashReadTimestampTxn(ctx context.Context, key []byte, readTimestamp kv.ReadTimestamp, value redisHashValue) error {
 	readTS := readTimestamp.Timestamp()
 	if len(value) == 0 {
@@ -583,6 +605,10 @@ func (r *RedisServer) persistHashReadTimestampTxn(ctx context.Context, key []byt
 		Value: store.MarshalHashMeta(store.HashMeta{Len: int64(len(value)), ExpireAt: ttlMs}),
 	})
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisHashKey(key)})
+	// HDEL of a legacy blob hash rewrites it wide-column without the removed
+	// fields; like the wide-column HDEL it changes the field set, so it Puts
+	// the hash fence.
+	elems = append(elems, redisTxnWideHashFenceElem(key))
 	return r.dispatchReadTimestampElems(ctx, readTimestamp, elems)
 }
 
@@ -596,7 +622,11 @@ func (r *RedisServer) hexists(conn redcon.Conn, cmd redcon.Command) {
 	}
 	key := cmd.Args[1]
 	field := cmd.Args[2]
-	readTS := r.readTS()
+	readTS, err := r.snapshotReadTS(r.handlerContext(conn))
+	if err != nil {
+		writeRedisError(conn, err)
+		return
+	}
 	ctx := r.handlerContext(conn)
 
 	// Fast path: direct wide-column field existence check. ExistsAt
@@ -620,7 +650,7 @@ func (r *RedisServer) hexists(conn redcon.Conn, cmd redcon.Command) {
 func (r *RedisServer) hashFieldFastExists(ctx context.Context, key, field []byte, readTS uint64) (hit, alive bool, err error) {
 	// Probe FIRST; guard only on hit. See hashFieldFastLookup for the
 	// regression rationale.
-	exists, err := r.store.ExistsAt(ctx, store.HashFieldKey(key, field), readTS)
+	exists, err := requestExistsAt(ctx, r.store, store.HashFieldKey(key, field), readTS)
 	if err != nil {
 		return false, false, cockerrors.WithStack(err)
 	}
@@ -673,7 +703,11 @@ func (r *RedisServer) hlen(conn redcon.Conn, cmd redcon.Command) {
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
-	readTS := r.readTS()
+	readTS, err := r.snapshotReadTS(r.handlerContext(conn))
+	if err != nil {
+		writeRedisError(conn, err)
+		return
+	}
 	typ, err := r.keyTypeAtExpect(r.handlerContext(conn),
 		cmd.Args[1], readTS, redisTypeHash)
 	if err != nil {
@@ -747,7 +781,7 @@ func (r *RedisServer) readHashFieldInt(ctx context.Context, key, field []byte, r
 		return 0, true, nil, nil
 	}
 	fieldKey := store.HashFieldKey(key, field)
-	raw, readErr := r.store.GetAt(ctx, fieldKey, readTS)
+	raw, readErr := requestGetAt(ctx, r.store, fieldKey, readTS)
 	if readErr != nil && !cockerrors.Is(readErr, store.ErrKeyNotFound) {
 		return 0, true, nil, cockerrors.WithStack(readErr)
 	}
@@ -790,10 +824,10 @@ func (r *RedisServer) hincrbyWithMigration(ctx context.Context, key, fieldKey []
 	elems = append(elems, cleanupElems...)
 	elems = append(elems, migrationElems...)
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: fieldKey, Value: []byte(newVal)})
+	elems = append(elems, redisTxnWideHashFenceElem(key))
 	if isNewField {
 		deltaVal := store.MarshalHashMetaDelta(store.HashMetaDelta{LenDelta: 1})
 		elems = append(elems,
-			redisTxnWideHashFenceElem(key),
 			&kv.Elem[kv.OP]{
 				Op:    kv.Put,
 				Key:   store.HashMetaDeltaKey(key, commitTS, 0),
@@ -850,10 +884,10 @@ func (r *RedisServer) hincrbyTxn(ctx context.Context, key, field []byte, increme
 	elems := make([]*kv.Elem[kv.OP], 0, len(cleanupElems)+setWideColOverhead)
 	elems = append(elems, cleanupElems...)
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: fieldKey, Value: []byte(newVal)})
+	elems = append(elems, redisTxnWideHashFenceElem(key))
 	if isNewField {
 		deltaVal := store.MarshalHashMetaDelta(store.HashMetaDelta{LenDelta: 1})
 		elems = append(elems,
-			redisTxnWideHashFenceElem(key),
 			&kv.Elem[kv.OP]{
 				Op:    kv.Put,
 				Key:   store.HashMetaDeltaKey(key, commitTS, 0),
@@ -940,7 +974,12 @@ func (r *RedisServer) incrLegacyCommand(conn redcon.Conn, cmd redcon.Command) {
 			// cannot later expire a now-persistent key.
 			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey(cmd.Args[1])})
 		}
-		return r.dispatchReadTimestampElems(ctx, readTimestamp, elems)
+		// Validate the type INCR observed: a create conflicts with a
+		// concurrent create of another encoding, an increment with a DEL or
+		// type change of the string it read.
+		fences, readKeys := redisStringWriteGuard(cmd.Args[1], typ)
+		elems = append(elems, fences...)
+		return r.dispatchReadTimestampElemsWithReadKeys(ctx, readTimestamp, elems, readKeys)
 	}); err != nil {
 		writeRedisError(conn, err)
 		return
@@ -956,7 +995,11 @@ func (r *RedisServer) hgetall(conn redcon.Conn, cmd redcon.Command) {
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
-	readTS := r.readTS()
+	readTS, err := r.snapshotReadTS(r.handlerContext(conn))
+	if err != nil {
+		writeRedisError(conn, err)
+		return
+	}
 	ctx := r.handlerContext(conn)
 	typ, err := r.keyTypeAtExpect(ctx, cmd.Args[1], readTS, redisTypeHash)
 	if err != nil {

@@ -132,6 +132,7 @@
          db         (if local?
                       jdb/noop
                       (ekdb/db {:grpc-port (or (:grpc-port opts) 50051)
+                                :bootstrap-members (:bootstrap-members opts)
                                 :redis-port node->port
                                 :raft-groups (:raft-groups opts)
                                 :shard-ranges (:shard-ranges opts)

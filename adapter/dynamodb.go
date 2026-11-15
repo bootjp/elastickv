@@ -380,6 +380,9 @@ func isReadOnlyDynamoRequest(r *http.Request) bool {
 }
 
 func (d *DynamoDBServer) handle(w http.ResponseWriter, r *http.Request) {
+	readRequest := kv.NewReadRequest(r.Context(), d.coordinator, d.store, d.readTracker)
+	defer readRequest.Close()
+	r = r.WithContext(readRequest.Context())
 	if d.serveHealthz(w, r) {
 		return
 	}

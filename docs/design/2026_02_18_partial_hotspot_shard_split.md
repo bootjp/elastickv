@@ -16,14 +16,16 @@ Current implementation status:
   and the detector/scheduler issues guarded same-group `SplitRange` operations.
   See
   [`2026_06_11_implemented_hotspot_split_milestone3_automation.md`](2026_06_11_implemented_hotspot_split_milestone3_automation.md).
-- Automatic cross-group target selection (M3-PR4) and the remaining M4
-  hardening are open. Manual cross-group relocation is implemented through
-  the separate `StartSplitMigration` RPC, not `SplitRange`.
+- Opt-in automatic cross-group target selection (M3-PR4) is implemented in
+  PR #1475. It uses complete, fresh local load evidence and only targets an
+  eligible hot right child through `StartSplitMigration`. The remaining M4
+  hardening is open. Manual cross-group relocation uses the same separate RPC,
+  not `SplitRange`.
 
-Same-group hotspot splitting and manual cross-group relocation are connected
-end-to-end. Automatic cross-group relocation still needs the M3-PR4 target
-policy, authoritative load evidence, and scheduler integration with
-`StartSplitMigration`.
+Same-group hotspot splitting, manual cross-group relocation, and opt-in
+automatic cross-group target selection are connected end-to-end. Missing or
+ingress-only load evidence still fails closed for target selection; cluster-wide
+fan-out beyond complete local evidence remains open.
 
 For a current runtime/component snapshot, see `docs/architecture_overview.md`.
 
@@ -316,11 +318,13 @@ and its final runner/lifecycle slice landed in PR #1096.
 2. Hotspot detector
 3. Auto-split scheduler (cooldown/hysteresis)
 
-Status: implemented for standalone same-group automation. Detector, scheduler,
+Status: implemented for standalone same-group automation and opt-in M3-PR4
+cross-group target selection. Detector, scheduler,
 compound isolation, cooldown/hysteresis, leadership fencing, runtime control,
 metrics, and three-node end-to-end coverage are complete in
 [`2026_06_11_implemented_hotspot_split_milestone3_automation.md`](2026_06_11_implemented_hotspot_split_milestone3_automation.md).
-Cross-group target selection remains the post-M2 M3-PR4 follow-on.
+PR #1475 added complete-local-evidence target admission and guarded
+`StartSplitMigration` integration. M4 hardening remains separate.
 
 ### Milestone 4: Hardening
 
