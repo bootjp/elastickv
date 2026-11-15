@@ -9,7 +9,8 @@ import (
 	"google.golang.org/protobuf/types/known/anypb"
 )
 
-const forwardDecisionSchemaVersion = 1
+// ForwardDecisionSchemaVersion is the Forward failure detail version accepted by this receiver.
+const ForwardDecisionSchemaVersion uint32 = 1
 
 // ForwardDecisionStatus encodes a verified Internal.Forward result. Callers must
 // establish the decision from admission and durable state before calling it.
@@ -18,7 +19,7 @@ func ForwardDecisionStatus(phase pb.ForwardFailurePhase, reason pb.ForwardFailur
 		return errors.WithStack(status.Error(codes.Internal, "invalid forward decision"))
 	}
 	st, err := status.New(forwardDecisionCode(decision), forwardDecisionMessage(reason)).WithDetails(&pb.ForwardFailureDetail{
-		SchemaVersion: forwardDecisionSchemaVersion,
+		SchemaVersion: ForwardDecisionSchemaVersion,
 		Phase:         phase,
 		Reason:        reason,
 		Decision:      decision,
@@ -37,7 +38,7 @@ func DecodeForwardDecisionStatus(err error, expectedPhase pb.ForwardFailurePhase
 		return 0, 0, false
 	}
 	found, ok := uniqueForwardDecisionDetail(st)
-	if !ok || found.GetSchemaVersion() != forwardDecisionSchemaVersion || found.GetPhase() != expectedPhase ||
+	if !ok || found.GetSchemaVersion() != ForwardDecisionSchemaVersion || found.GetPhase() != expectedPhase ||
 		!validForwardDecision(found.GetPhase(), found.GetReason(), found.GetDecision()) ||
 		st.Code() != forwardDecisionCode(found.GetDecision()) {
 		return 0, 0, false

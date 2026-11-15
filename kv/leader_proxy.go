@@ -294,8 +294,9 @@ func (p *LeaderProxy) forward(callerCtx context.Context, parentCtx context.Conte
 	defer cancel()
 
 	resp, err := cli.Forward(ctx, &pb.ForwardRequest{
-		IsTxn:    reqs[0].IsTxn,
-		Requests: reqs,
+		IsTxn:                 reqs[0].IsTxn,
+		Requests:              reqs,
+		DecisionDetailVersion: ForwardDecisionSchemaVersion,
 	})
 	if err != nil {
 		// Preserve the breaker accounting, but caller cancellation is not

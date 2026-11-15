@@ -16,6 +16,11 @@ import (
 	"google.golang.org/protobuf/types/known/anypb"
 )
 
+func TestCoordinateForwardAdvertisesDecisionDetailVersion(t *testing.T) {
+	req := (&Coordinate{}).toForwardRequest([]*pb.Request{{Phase: pb.Phase_NONE}})
+	require.Equal(t, ForwardDecisionSchemaVersion, req.GetDecisionDetailVersion())
+}
+
 func TestForwardDecisionStatusAllowedPairs(t *testing.T) {
 	const (
 		one      = pb.ForwardFailurePhase_FORWARD_FAILURE_PHASE_ONE_PHASE_APPLY

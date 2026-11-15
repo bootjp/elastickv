@@ -249,16 +249,16 @@ func (i *Internal) Forward(ctx context.Context, req *pb.ForwardRequest) (*pb.For
 	// Before the leader check, so a non-leader gets the accurate reason and a
 	// leader can never reach stampTimestamps and propose.
 	if i.kvForwardRejected {
-		return nil, forwardUnknownStatus(req.GetRequests(), ErrKVForwardNotSupported)
+		return nil, forwardStatusForReceiver(req, ErrKVForwardNotSupported, false)
 	}
 	if i.leader == nil || i.leader.State() != raftengine.StateLeader {
-		return nil, forwardUnknownStatus(req.GetRequests(), kv.ErrLeaderNotFound)
+		return nil, forwardStatusForReceiver(req, kv.ErrLeaderNotFound, false)
 	}
 	if err := i.leader.VerifyLeader(ctx); err != nil {
-		return nil, forwardUnknownStatus(req.GetRequests(), err)
+		return nil, forwardStatusForReceiver(req, err, false)
 	}
 	if err := rejectUnactivatedBoundForward(req.GetRequests()); err != nil {
-		return nil, forwardUnknownStatus(req.GetRequests(), err)
+		return nil, forwardStatusForReceiver(req, err, false)
 	}
 
 	commitTS, err := i.stampTimestamps(ctx, req)
@@ -266,10 +266,10 @@ func (i *Internal) Forward(ctx context.Context, req *pb.ForwardRequest) (*pb.For
 		return &pb.ForwardResponse{
 			Success:     false,
 			CommitIndex: 0,
-		}, forwardUnknownStatus(req.GetRequests(), err)
+		}, forwardStatusForReceiver(req, err, false)
 	}
 	if err := kv.StampTimestampAdmission(ctx, i.tsAllocator, i.store, req.GetRequests()); err != nil {
-		return nil, forwardUnknownStatus(req.GetRequests(), err)
+		return nil, forwardStatusForReceiver(req, err, false)
 	}
 
 	r, err := i.transactionManager.Commit(ctx, req.Requests)
@@ -277,7 +277,7 @@ func (i *Internal) Forward(ctx context.Context, req *pb.ForwardRequest) (*pb.For
 		return &pb.ForwardResponse{
 			Success:     false,
 			CommitIndex: 0,
-		}, forwardCommitStatus(req.GetRequests(), err)
+		}, forwardStatusForReceiver(req, err, true)
 	}
 	if i.forwardWriteObserver != nil {
 		i.forwardWriteObserver(req.GetRequests())
@@ -288,6 +288,16 @@ func (i *Internal) Forward(ctx context.Context, req *pb.ForwardRequest) (*pb.For
 		CommitIndex: r.CommitIndex,
 		CommitTs:    commitTS,
 	}, nil
+}
+
+func forwardStatusForReceiver(req *pb.ForwardRequest, err error, commitAttempt bool) error {
+	if req.GetDecisionDetailVersion() != kv.ForwardDecisionSchemaVersion {
+		return &forwardWireFailure{wire: status.Error(codes.Unknown, "forward outcome unknown"), cause: err}
+	}
+	if commitAttempt {
+		return forwardCommitStatus(req.GetRequests(), err)
+	}
+	return forwardUnknownStatus(req.GetRequests(), err)
 }
 
 func forwardCommitStatus(reqs []*pb.Request, err error) error {

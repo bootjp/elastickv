@@ -172,6 +172,7 @@ func TestLeaderProxy_ForwardsWhenFollower(t *testing.T) {
 	defer svc.mu.Unlock()
 	require.Equal(t, 1, svc.calls)
 	require.NotNil(t, svc.lastReq)
+	require.Equal(t, ForwardDecisionSchemaVersion, svc.lastReq.GetDecisionDetailVersion())
 	require.Len(t, svc.lastReq.Requests, 1)
 }
 
