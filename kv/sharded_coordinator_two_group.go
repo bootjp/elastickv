@@ -85,7 +85,7 @@ func (c *ShardedCoordinator) buildTwoGroupManifest(ctx context.Context, startTS,
 	if err != nil {
 		return nil, nil, err
 	}
-	metas, err := c.prepareEvidenceMetas(ctx, primaryKey, commitTS, ids)
+	metas, err := c.twoGroupPrepareEvidenceMetas(ctx, primaryKey, commitTS, ids)
 	if err != nil {
 		return nil, nil, err
 	}

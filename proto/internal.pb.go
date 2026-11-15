@@ -3804,6 +3804,126 @@ func (x *ProposeTwoGroupTerminalResponse) GetLeaderTerm() uint64 {
 	return 0
 }
 
+type ProbeTwoGroupPrepareEvidenceRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Version       uint32                 `protobuf:"varint,1,opt,name=version,proto3" json:"version,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ProbeTwoGroupPrepareEvidenceRequest) Reset() {
+	*x = ProbeTwoGroupPrepareEvidenceRequest{}
+	mi := &file_internal_proto_msgTypes[44]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ProbeTwoGroupPrepareEvidenceRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ProbeTwoGroupPrepareEvidenceRequest) ProtoMessage() {}
+
+func (x *ProbeTwoGroupPrepareEvidenceRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[44]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ProbeTwoGroupPrepareEvidenceRequest.ProtoReflect.Descriptor instead.
+func (*ProbeTwoGroupPrepareEvidenceRequest) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{44}
+}
+
+func (x *ProbeTwoGroupPrepareEvidenceRequest) GetVersion() uint32 {
+	if x != nil {
+		return x.Version
+	}
+	return 0
+}
+
+type ProbeTwoGroupPrepareEvidenceResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Version       uint32                 `protobuf:"varint,1,opt,name=version,proto3" json:"version,omitempty"`
+	GroupId       uint64                 `protobuf:"varint,2,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`
+	ProofEnabled  bool                   `protobuf:"varint,3,opt,name=proof_enabled,json=proofEnabled,proto3" json:"proof_enabled,omitempty"`
+	AppliedIndex  uint64                 `protobuf:"varint,4,opt,name=applied_index,json=appliedIndex,proto3" json:"applied_index,omitempty"`
+	LeaderTerm    uint64                 `protobuf:"varint,5,opt,name=leader_term,json=leaderTerm,proto3" json:"leader_term,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ProbeTwoGroupPrepareEvidenceResponse) Reset() {
+	*x = ProbeTwoGroupPrepareEvidenceResponse{}
+	mi := &file_internal_proto_msgTypes[45]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ProbeTwoGroupPrepareEvidenceResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ProbeTwoGroupPrepareEvidenceResponse) ProtoMessage() {}
+
+func (x *ProbeTwoGroupPrepareEvidenceResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[45]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ProbeTwoGroupPrepareEvidenceResponse.ProtoReflect.Descriptor instead.
+func (*ProbeTwoGroupPrepareEvidenceResponse) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{45}
+}
+
+func (x *ProbeTwoGroupPrepareEvidenceResponse) GetVersion() uint32 {
+	if x != nil {
+		return x.Version
+	}
+	return 0
+}
+
+func (x *ProbeTwoGroupPrepareEvidenceResponse) GetGroupId() uint64 {
+	if x != nil {
+		return x.GroupId
+	}
+	return 0
+}
+
+func (x *ProbeTwoGroupPrepareEvidenceResponse) GetProofEnabled() bool {
+	if x != nil {
+		return x.ProofEnabled
+	}
+	return false
+}
+
+func (x *ProbeTwoGroupPrepareEvidenceResponse) GetAppliedIndex() uint64 {
+	if x != nil {
+		return x.AppliedIndex
+	}
+	return 0
+}
+
+func (x *ProbeTwoGroupPrepareEvidenceResponse) GetLeaderTerm() uint64 {
+	if x != nil {
+		return x.LeaderTerm
+	}
+	return 0
+}
+
 type TwoGroupHomeAdmissionRecord struct {
 	state             protoimpl.MessageState   `protogen:"open.v1"`
 	Version           uint32                   `protobuf:"varint,1,opt,name=version,proto3" json:"version,omitempty"`
@@ -3818,7 +3938,7 @@ type TwoGroupHomeAdmissionRecord struct {
 
 func (x *TwoGroupHomeAdmissionRecord) Reset() {
 	*x = TwoGroupHomeAdmissionRecord{}
-	mi := &file_internal_proto_msgTypes[44]
+	mi := &file_internal_proto_msgTypes[46]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3830,7 +3950,7 @@ func (x *TwoGroupHomeAdmissionRecord) String() string {
 func (*TwoGroupHomeAdmissionRecord) ProtoMessage() {}
 
 func (x *TwoGroupHomeAdmissionRecord) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_proto_msgTypes[44]
+	mi := &file_internal_proto_msgTypes[46]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3843,7 +3963,7 @@ func (x *TwoGroupHomeAdmissionRecord) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TwoGroupHomeAdmissionRecord.ProtoReflect.Descriptor instead.
 func (*TwoGroupHomeAdmissionRecord) Descriptor() ([]byte, []int) {
-	return file_internal_proto_rawDescGZIP(), []int{44}
+	return file_internal_proto_rawDescGZIP(), []int{46}
 }
 
 func (x *TwoGroupHomeAdmissionRecord) GetVersion() uint32 {
@@ -3903,7 +4023,7 @@ type TwoGroupPrepareEntry struct {
 
 func (x *TwoGroupPrepareEntry) Reset() {
 	*x = TwoGroupPrepareEntry{}
-	mi := &file_internal_proto_msgTypes[45]
+	mi := &file_internal_proto_msgTypes[47]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3915,7 +4035,7 @@ func (x *TwoGroupPrepareEntry) String() string {
 func (*TwoGroupPrepareEntry) ProtoMessage() {}
 
 func (x *TwoGroupPrepareEntry) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_proto_msgTypes[45]
+	mi := &file_internal_proto_msgTypes[47]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3928,7 +4048,7 @@ func (x *TwoGroupPrepareEntry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TwoGroupPrepareEntry.ProtoReflect.Descriptor instead.
 func (*TwoGroupPrepareEntry) Descriptor() ([]byte, []int) {
-	return file_internal_proto_rawDescGZIP(), []int{45}
+	return file_internal_proto_rawDescGZIP(), []int{47}
 }
 
 func (x *TwoGroupPrepareEntry) GetVersion() uint32 {
@@ -3987,7 +4107,7 @@ type TwoGroupTerminalRecord struct {
 
 func (x *TwoGroupTerminalRecord) Reset() {
 	*x = TwoGroupTerminalRecord{}
-	mi := &file_internal_proto_msgTypes[46]
+	mi := &file_internal_proto_msgTypes[48]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3999,7 +4119,7 @@ func (x *TwoGroupTerminalRecord) String() string {
 func (*TwoGroupTerminalRecord) ProtoMessage() {}
 
 func (x *TwoGroupTerminalRecord) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_proto_msgTypes[46]
+	mi := &file_internal_proto_msgTypes[48]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4012,7 +4132,7 @@ func (x *TwoGroupTerminalRecord) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TwoGroupTerminalRecord.ProtoReflect.Descriptor instead.
 func (*TwoGroupTerminalRecord) Descriptor() ([]byte, []int) {
-	return file_internal_proto_rawDescGZIP(), []int{46}
+	return file_internal_proto_rawDescGZIP(), []int{48}
 }
 
 func (x *TwoGroupTerminalRecord) GetVersion() uint32 {
@@ -4073,7 +4193,7 @@ type TwoGroupTerminalEntry struct {
 
 func (x *TwoGroupTerminalEntry) Reset() {
 	*x = TwoGroupTerminalEntry{}
-	mi := &file_internal_proto_msgTypes[47]
+	mi := &file_internal_proto_msgTypes[49]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4085,7 +4205,7 @@ func (x *TwoGroupTerminalEntry) String() string {
 func (*TwoGroupTerminalEntry) ProtoMessage() {}
 
 func (x *TwoGroupTerminalEntry) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_proto_msgTypes[47]
+	mi := &file_internal_proto_msgTypes[49]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4098,7 +4218,7 @@ func (x *TwoGroupTerminalEntry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TwoGroupTerminalEntry.ProtoReflect.Descriptor instead.
 func (*TwoGroupTerminalEntry) Descriptor() ([]byte, []int) {
-	return file_internal_proto_rawDescGZIP(), []int{47}
+	return file_internal_proto_rawDescGZIP(), []int{49}
 }
 
 func (x *TwoGroupTerminalEntry) GetVersion() uint32 {
@@ -4445,6 +4565,15 @@ const file_internal_proto_rawDesc = "" +
 	"\x1fProposeTwoGroupTerminalResponse\x12!\n" +
 	"\fcommit_index\x18\x01 \x01(\x04R\vcommitIndex\x12\x1f\n" +
 	"\vleader_term\x18\x02 \x01(\x04R\n" +
+	"leaderTerm\"?\n" +
+	"#ProbeTwoGroupPrepareEvidenceRequest\x12\x18\n" +
+	"\aversion\x18\x01 \x01(\rR\aversion\"\xc6\x01\n" +
+	"$ProbeTwoGroupPrepareEvidenceResponse\x12\x18\n" +
+	"\aversion\x18\x01 \x01(\rR\aversion\x12\x19\n" +
+	"\bgroup_id\x18\x02 \x01(\x04R\agroupId\x12#\n" +
+	"\rproof_enabled\x18\x03 \x01(\bR\fproofEnabled\x12#\n" +
+	"\rapplied_index\x18\x04 \x01(\x04R\fappliedIndex\x12\x1f\n" +
+	"\vleader_term\x18\x05 \x01(\x04R\n" +
 	"leaderTerm\"\x85\x02\n" +
 	"\x1bTwoGroupHomeAdmissionRecord\x12\x18\n" +
 	"\aversion\x18\x01 \x01(\rR\aversion\x124\n" +
@@ -4532,7 +4661,7 @@ const file_internal_proto_rawDesc = "" +
 	",MIGRATION_STATE_PROBE_KIND_OWNERSHIP_APPLIED\x10\b\x120\n" +
 	",MIGRATION_STATE_PROBE_KIND_PARTITION_APPLIED\x10\t\x122\n" +
 	".MIGRATION_STATE_PROBE_KIND_NAMESPACE_ADMISSION\x10\n" +
-	"2\xf3\v\n" +
+	"2\xe2\f\n" +
 	"\bInternal\x12.\n" +
 	"\aForward\x12\x0f.ForwardRequest\x1a\x10.ForwardResponse\"\x00\x12U\n" +
 	"\x14ForwardAdminProposal\x12\x1c.ForwardAdminProposalRequest\x1a\x1d.ForwardAdminProposalResponse\"\x00\x12I\n" +
@@ -4551,7 +4680,8 @@ const file_internal_proto_rawDesc = "" +
 	"\x16LookupTimestampBinding\x12\x1e.LookupTimestampBindingRequest\x1a\x1f.LookupTimestampBindingResponse\"\x00\x12[\n" +
 	"\x16ProposeTwoGroupPrepare\x12\x1e.ProposeTwoGroupPrepareRequest\x1a\x1f.ProposeTwoGroupPrepareResponse\"\x00\x12X\n" +
 	"\x15VerifyTwoGroupPrepare\x12\x1d.VerifyTwoGroupPrepareRequest\x1a\x1e.VerifyTwoGroupPrepareResponse\"\x00\x12^\n" +
-	"\x17ProposeTwoGroupTerminal\x12\x1f.ProposeTwoGroupTerminalRequest\x1a .ProposeTwoGroupTerminalResponse\"\x00B#Z!github.com/bootjp/elastickv/protob\x06proto3"
+	"\x17ProposeTwoGroupTerminal\x12\x1f.ProposeTwoGroupTerminalRequest\x1a .ProposeTwoGroupTerminalResponse\"\x00\x12m\n" +
+	"\x1cProbeTwoGroupPrepareEvidence\x12$.ProbeTwoGroupPrepareEvidenceRequest\x1a%.ProbeTwoGroupPrepareEvidenceResponse\"\x00B#Z!github.com/bootjp/elastickv/protob\x06proto3"
 
 var (
 	file_internal_proto_rawDescOnce sync.Once
@@ -4566,64 +4696,66 @@ func file_internal_proto_rawDescGZIP() []byte {
 }
 
 var file_internal_proto_enumTypes = make([]protoimpl.EnumInfo, 8)
-var file_internal_proto_msgTypes = make([]protoimpl.MessageInfo, 48)
+var file_internal_proto_msgTypes = make([]protoimpl.MessageInfo, 50)
 var file_internal_proto_goTypes = []any{
-	(Op)(0),                                 // 0: Op
-	(Phase)(0),                              // 1: Phase
-	(ForwardFailurePhase)(0),                // 2: ForwardFailurePhase
-	(ForwardFailureReason)(0),               // 3: ForwardFailureReason
-	(ForwardDecisionClass)(0),               // 4: ForwardDecisionClass
-	(MigrationCleanupMode)(0),               // 5: MigrationCleanupMode
-	(MigrationOwnershipRole)(0),             // 6: MigrationOwnershipRole
-	(MigrationStateProbeKind)(0),            // 7: MigrationStateProbeKind
-	(*Mutation)(nil),                        // 8: Mutation
-	(*Request)(nil),                         // 9: Request
-	(*RaftCommand)(nil),                     // 10: RaftCommand
-	(*ForwardRequest)(nil),                  // 11: ForwardRequest
-	(*ForwardResponse)(nil),                 // 12: ForwardResponse
-	(*ForwardFailureDetail)(nil),            // 13: ForwardFailureDetail
-	(*ForwardAdminProposalRequest)(nil),     // 14: ForwardAdminProposalRequest
-	(*ForwardAdminProposalResponse)(nil),    // 15: ForwardAdminProposalResponse
-	(*ForwardLeaseReadRequest)(nil),         // 16: ForwardLeaseReadRequest
-	(*ForwardLeaseReadResponse)(nil),        // 17: ForwardLeaseReadResponse
-	(*PrepareEvidenceStateRequest)(nil),     // 18: PrepareEvidenceStateRequest
-	(*PrepareEvidenceStateResponse)(nil),    // 19: PrepareEvidenceStateResponse
-	(*RelayPublishRequest)(nil),             // 20: RelayPublishRequest
-	(*RelayPublishResponse)(nil),            // 21: RelayPublishResponse
-	(*ExportRangeVersionsRequest)(nil),      // 22: ExportRangeVersionsRequest
-	(*ExportRangeVersionsResponse)(nil),     // 23: ExportRangeVersionsResponse
-	(*MVCCVersion)(nil),                     // 24: MVCCVersion
-	(*ImportRangeVersionsRequest)(nil),      // 25: ImportRangeVersionsRequest
-	(*ImportRangeVersionsResponse)(nil),     // 26: ImportRangeVersionsResponse
-	(*PromoteStagedVersionsRequest)(nil),    // 27: PromoteStagedVersionsRequest
-	(*PromoteStagedVersionsResponse)(nil),   // 28: PromoteStagedVersionsResponse
-	(*TargetStagedReadinessRequest)(nil),    // 29: TargetStagedReadinessRequest
-	(*TargetStagedReadinessResponse)(nil),   // 30: TargetStagedReadinessResponse
-	(*ProbeMigrationLocksRequest)(nil),      // 31: ProbeMigrationLocksRequest
-	(*ProbeMigrationLocksResponse)(nil),     // 32: ProbeMigrationLocksResponse
-	(*MigrationOwnershipProof)(nil),         // 33: MigrationOwnershipProof
-	(*CleanupMigrationRequest)(nil),         // 34: CleanupMigrationRequest
-	(*CleanupMigrationResponse)(nil),        // 35: CleanupMigrationResponse
-	(*ProbeMigrationStateRequest)(nil),      // 36: ProbeMigrationStateRequest
-	(*ProbeMigrationStateResponse)(nil),     // 37: ProbeMigrationStateResponse
-	(*IssueMigrationTimestampRequest)(nil),  // 38: IssueMigrationTimestampRequest
-	(*IssueMigrationTimestampResponse)(nil), // 39: IssueMigrationTimestampResponse
-	(*IssueBoundTimestampRequest)(nil),      // 40: IssueBoundTimestampRequest
-	(*IssueBoundTimestampResponse)(nil),     // 41: IssueBoundTimestampResponse
-	(*LookupTimestampBindingRequest)(nil),   // 42: LookupTimestampBindingRequest
-	(*LookupTimestampBindingResponse)(nil),  // 43: LookupTimestampBindingResponse
-	(*TwoGroupPrepareParticipant)(nil),      // 44: TwoGroupPrepareParticipant
-	(*TwoGroupPrepareManifest)(nil),         // 45: TwoGroupPrepareManifest
-	(*ProposeTwoGroupPrepareRequest)(nil),   // 46: ProposeTwoGroupPrepareRequest
-	(*ProposeTwoGroupPrepareResponse)(nil),  // 47: ProposeTwoGroupPrepareResponse
-	(*VerifyTwoGroupPrepareRequest)(nil),    // 48: VerifyTwoGroupPrepareRequest
-	(*VerifyTwoGroupPrepareResponse)(nil),   // 49: VerifyTwoGroupPrepareResponse
-	(*ProposeTwoGroupTerminalRequest)(nil),  // 50: ProposeTwoGroupTerminalRequest
-	(*ProposeTwoGroupTerminalResponse)(nil), // 51: ProposeTwoGroupTerminalResponse
-	(*TwoGroupHomeAdmissionRecord)(nil),     // 52: TwoGroupHomeAdmissionRecord
-	(*TwoGroupPrepareEntry)(nil),            // 53: TwoGroupPrepareEntry
-	(*TwoGroupTerminalRecord)(nil),          // 54: TwoGroupTerminalRecord
-	(*TwoGroupTerminalEntry)(nil),           // 55: TwoGroupTerminalEntry
+	(Op)(0),                                      // 0: Op
+	(Phase)(0),                                   // 1: Phase
+	(ForwardFailurePhase)(0),                     // 2: ForwardFailurePhase
+	(ForwardFailureReason)(0),                    // 3: ForwardFailureReason
+	(ForwardDecisionClass)(0),                    // 4: ForwardDecisionClass
+	(MigrationCleanupMode)(0),                    // 5: MigrationCleanupMode
+	(MigrationOwnershipRole)(0),                  // 6: MigrationOwnershipRole
+	(MigrationStateProbeKind)(0),                 // 7: MigrationStateProbeKind
+	(*Mutation)(nil),                             // 8: Mutation
+	(*Request)(nil),                              // 9: Request
+	(*RaftCommand)(nil),                          // 10: RaftCommand
+	(*ForwardRequest)(nil),                       // 11: ForwardRequest
+	(*ForwardResponse)(nil),                      // 12: ForwardResponse
+	(*ForwardFailureDetail)(nil),                 // 13: ForwardFailureDetail
+	(*ForwardAdminProposalRequest)(nil),          // 14: ForwardAdminProposalRequest
+	(*ForwardAdminProposalResponse)(nil),         // 15: ForwardAdminProposalResponse
+	(*ForwardLeaseReadRequest)(nil),              // 16: ForwardLeaseReadRequest
+	(*ForwardLeaseReadResponse)(nil),             // 17: ForwardLeaseReadResponse
+	(*PrepareEvidenceStateRequest)(nil),          // 18: PrepareEvidenceStateRequest
+	(*PrepareEvidenceStateResponse)(nil),         // 19: PrepareEvidenceStateResponse
+	(*RelayPublishRequest)(nil),                  // 20: RelayPublishRequest
+	(*RelayPublishResponse)(nil),                 // 21: RelayPublishResponse
+	(*ExportRangeVersionsRequest)(nil),           // 22: ExportRangeVersionsRequest
+	(*ExportRangeVersionsResponse)(nil),          // 23: ExportRangeVersionsResponse
+	(*MVCCVersion)(nil),                          // 24: MVCCVersion
+	(*ImportRangeVersionsRequest)(nil),           // 25: ImportRangeVersionsRequest
+	(*ImportRangeVersionsResponse)(nil),          // 26: ImportRangeVersionsResponse
+	(*PromoteStagedVersionsRequest)(nil),         // 27: PromoteStagedVersionsRequest
+	(*PromoteStagedVersionsResponse)(nil),        // 28: PromoteStagedVersionsResponse
+	(*TargetStagedReadinessRequest)(nil),         // 29: TargetStagedReadinessRequest
+	(*TargetStagedReadinessResponse)(nil),        // 30: TargetStagedReadinessResponse
+	(*ProbeMigrationLocksRequest)(nil),           // 31: ProbeMigrationLocksRequest
+	(*ProbeMigrationLocksResponse)(nil),          // 32: ProbeMigrationLocksResponse
+	(*MigrationOwnershipProof)(nil),              // 33: MigrationOwnershipProof
+	(*CleanupMigrationRequest)(nil),              // 34: CleanupMigrationRequest
+	(*CleanupMigrationResponse)(nil),             // 35: CleanupMigrationResponse
+	(*ProbeMigrationStateRequest)(nil),           // 36: ProbeMigrationStateRequest
+	(*ProbeMigrationStateResponse)(nil),          // 37: ProbeMigrationStateResponse
+	(*IssueMigrationTimestampRequest)(nil),       // 38: IssueMigrationTimestampRequest
+	(*IssueMigrationTimestampResponse)(nil),      // 39: IssueMigrationTimestampResponse
+	(*IssueBoundTimestampRequest)(nil),           // 40: IssueBoundTimestampRequest
+	(*IssueBoundTimestampResponse)(nil),          // 41: IssueBoundTimestampResponse
+	(*LookupTimestampBindingRequest)(nil),        // 42: LookupTimestampBindingRequest
+	(*LookupTimestampBindingResponse)(nil),       // 43: LookupTimestampBindingResponse
+	(*TwoGroupPrepareParticipant)(nil),           // 44: TwoGroupPrepareParticipant
+	(*TwoGroupPrepareManifest)(nil),              // 45: TwoGroupPrepareManifest
+	(*ProposeTwoGroupPrepareRequest)(nil),        // 46: ProposeTwoGroupPrepareRequest
+	(*ProposeTwoGroupPrepareResponse)(nil),       // 47: ProposeTwoGroupPrepareResponse
+	(*VerifyTwoGroupPrepareRequest)(nil),         // 48: VerifyTwoGroupPrepareRequest
+	(*VerifyTwoGroupPrepareResponse)(nil),        // 49: VerifyTwoGroupPrepareResponse
+	(*ProposeTwoGroupTerminalRequest)(nil),       // 50: ProposeTwoGroupTerminalRequest
+	(*ProposeTwoGroupTerminalResponse)(nil),      // 51: ProposeTwoGroupTerminalResponse
+	(*ProbeTwoGroupPrepareEvidenceRequest)(nil),  // 52: ProbeTwoGroupPrepareEvidenceRequest
+	(*ProbeTwoGroupPrepareEvidenceResponse)(nil), // 53: ProbeTwoGroupPrepareEvidenceResponse
+	(*TwoGroupHomeAdmissionRecord)(nil),          // 54: TwoGroupHomeAdmissionRecord
+	(*TwoGroupPrepareEntry)(nil),                 // 55: TwoGroupPrepareEntry
+	(*TwoGroupTerminalRecord)(nil),               // 56: TwoGroupTerminalRecord
+	(*TwoGroupTerminalEntry)(nil),                // 57: TwoGroupTerminalEntry
 }
 var file_internal_proto_depIdxs = []int32{
 	0,  // 0: Mutation.op:type_name -> Op
@@ -4673,26 +4805,28 @@ var file_internal_proto_depIdxs = []int32{
 	46, // 44: Internal.ProposeTwoGroupPrepare:input_type -> ProposeTwoGroupPrepareRequest
 	48, // 45: Internal.VerifyTwoGroupPrepare:input_type -> VerifyTwoGroupPrepareRequest
 	50, // 46: Internal.ProposeTwoGroupTerminal:input_type -> ProposeTwoGroupTerminalRequest
-	12, // 47: Internal.Forward:output_type -> ForwardResponse
-	15, // 48: Internal.ForwardAdminProposal:output_type -> ForwardAdminProposalResponse
-	17, // 49: Internal.ForwardLeaseRead:output_type -> ForwardLeaseReadResponse
-	19, // 50: Internal.GetPrepareEvidenceState:output_type -> PrepareEvidenceStateResponse
-	21, // 51: Internal.RelayPublish:output_type -> RelayPublishResponse
-	23, // 52: Internal.ExportRangeVersions:output_type -> ExportRangeVersionsResponse
-	26, // 53: Internal.ImportRangeVersions:output_type -> ImportRangeVersionsResponse
-	28, // 54: Internal.PromoteStagedVersions:output_type -> PromoteStagedVersionsResponse
-	30, // 55: Internal.ApplyTargetStagedReadiness:output_type -> TargetStagedReadinessResponse
-	32, // 56: Internal.ProbeMigrationLocks:output_type -> ProbeMigrationLocksResponse
-	35, // 57: Internal.CleanupMigration:output_type -> CleanupMigrationResponse
-	37, // 58: Internal.ProbeMigrationState:output_type -> ProbeMigrationStateResponse
-	39, // 59: Internal.IssueMigrationTimestamp:output_type -> IssueMigrationTimestampResponse
-	41, // 60: Internal.IssueBoundTimestamp:output_type -> IssueBoundTimestampResponse
-	43, // 61: Internal.LookupTimestampBinding:output_type -> LookupTimestampBindingResponse
-	47, // 62: Internal.ProposeTwoGroupPrepare:output_type -> ProposeTwoGroupPrepareResponse
-	49, // 63: Internal.VerifyTwoGroupPrepare:output_type -> VerifyTwoGroupPrepareResponse
-	51, // 64: Internal.ProposeTwoGroupTerminal:output_type -> ProposeTwoGroupTerminalResponse
-	47, // [47:65] is the sub-list for method output_type
-	29, // [29:47] is the sub-list for method input_type
+	52, // 47: Internal.ProbeTwoGroupPrepareEvidence:input_type -> ProbeTwoGroupPrepareEvidenceRequest
+	12, // 48: Internal.Forward:output_type -> ForwardResponse
+	15, // 49: Internal.ForwardAdminProposal:output_type -> ForwardAdminProposalResponse
+	17, // 50: Internal.ForwardLeaseRead:output_type -> ForwardLeaseReadResponse
+	19, // 51: Internal.GetPrepareEvidenceState:output_type -> PrepareEvidenceStateResponse
+	21, // 52: Internal.RelayPublish:output_type -> RelayPublishResponse
+	23, // 53: Internal.ExportRangeVersions:output_type -> ExportRangeVersionsResponse
+	26, // 54: Internal.ImportRangeVersions:output_type -> ImportRangeVersionsResponse
+	28, // 55: Internal.PromoteStagedVersions:output_type -> PromoteStagedVersionsResponse
+	30, // 56: Internal.ApplyTargetStagedReadiness:output_type -> TargetStagedReadinessResponse
+	32, // 57: Internal.ProbeMigrationLocks:output_type -> ProbeMigrationLocksResponse
+	35, // 58: Internal.CleanupMigration:output_type -> CleanupMigrationResponse
+	37, // 59: Internal.ProbeMigrationState:output_type -> ProbeMigrationStateResponse
+	39, // 60: Internal.IssueMigrationTimestamp:output_type -> IssueMigrationTimestampResponse
+	41, // 61: Internal.IssueBoundTimestamp:output_type -> IssueBoundTimestampResponse
+	43, // 62: Internal.LookupTimestampBinding:output_type -> LookupTimestampBindingResponse
+	47, // 63: Internal.ProposeTwoGroupPrepare:output_type -> ProposeTwoGroupPrepareResponse
+	49, // 64: Internal.VerifyTwoGroupPrepare:output_type -> VerifyTwoGroupPrepareResponse
+	51, // 65: Internal.ProposeTwoGroupTerminal:output_type -> ProposeTwoGroupTerminalResponse
+	53, // 66: Internal.ProbeTwoGroupPrepareEvidence:output_type -> ProbeTwoGroupPrepareEvidenceResponse
+	48, // [48:67] is the sub-list for method output_type
+	29, // [29:48] is the sub-list for method input_type
 	29, // [29:29] is the sub-list for extension type_name
 	29, // [29:29] is the sub-list for extension extendee
 	0,  // [0:29] is the sub-list for field type_name
@@ -4709,7 +4843,7 @@ func file_internal_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_internal_proto_rawDesc), len(file_internal_proto_rawDesc)),
 			NumEnums:      8,
-			NumMessages:   48,
+			NumMessages:   50,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

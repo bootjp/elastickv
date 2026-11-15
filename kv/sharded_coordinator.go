@@ -500,6 +500,7 @@ type ShardedCoordinator struct {
 	twoGroupHomeLookup     func(uint64) (TwoGroupHomeLookup, error)
 	twoGroupRemotePrepare  func(uint64) (TwoGroupRemotePreparer, error)
 	twoGroupRemoteTerminal func(uint64) (TwoGroupRemoteTerminal, error)
+	twoGroupRemoteEvidence func(uint64) (TwoGroupPrepareEvidenceProbe, error)
 	engine                 *distribution.Engine
 	router                 *ShardRouter
 	groups                 map[uint64]*ShardGroup

@@ -339,8 +339,11 @@ the destination constructs its own applied home-decision observation. This
 route is still default-off and is not production-ready. Normal Dispatch is fenced
 while this opt-in is configured, because legacy terminal COMMIT/ABORT cannot
 consume the new identity. Public Forward cannot supply an observation. The
-coordinator still requires a local replica of each group to construct the
-manifest; a group hosted only on remote nodes is not yet supported. The
+coordinator can construct a canonical manifest for a remote-only participant
+after an authenticated, group-scoped leader probe confirms its applied
+PREPARE-evidence marker. The probe is default-off. Remote-only end-to-end
+PREPARE is still blocked because the later proposer lookup requires a local
+group entry; terminal resolution has the same placement constraint. The
 production all-member activation gate, cross-node Raft fault tests, retention
 horizon, and mixed-version rollout tests remain open. Production must not
 install the opt-in coordinator lookup or enable the FSM command until those

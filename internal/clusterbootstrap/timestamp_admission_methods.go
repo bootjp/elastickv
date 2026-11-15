@@ -14,7 +14,34 @@ func TimestampAdmissionPeerMethods(group uint64) []peersession.Method {
 		return []peersession.Method{issueBoundTimestampMethod(group)}
 	}
 	return []peersession.Method{lookupTimestampBindingMethod(group), proposeTwoGroupPrepareMethod(group),
-		verifyTwoGroupPrepareMethod(group), proposeTwoGroupTerminalMethod(group)}
+		verifyTwoGroupPrepareMethod(group), proposeTwoGroupTerminalMethod(group), probeTwoGroupPrepareEvidenceMethod(group)}
+}
+
+func probeTwoGroupPrepareEvidenceMethod(group uint64) peersession.Method {
+	return peersession.Method{
+		Name: pb.Internal_ProbeTwoGroupPrepareEvidence_FullMethodName,
+		BoundRequest: func(binding peersession.RequestBinding, value any) (peersession.Message, error) {
+			return boundTwoGroupEvidenceProbe(binding, value, group)
+		},
+		Reply: twoGroupEvidenceProbeReply,
+	}
+}
+
+func boundTwoGroupEvidenceProbe(binding peersession.RequestBinding, value any, group uint64) (peersession.Message, error) {
+	request, ok := value.(*pb.ProbeTwoGroupPrepareEvidenceRequest)
+	if !ok || !bootstrapExactProto(request) || binding.Group != group || request.GetVersion() != kv.TwoGroupPrepareEvidenceProbeVersion {
+		return peersession.Message{}, peersession.ErrFormat
+	}
+	return bootstrapControlMessage(binding), nil
+}
+
+func twoGroupEvidenceProbeReply(request peersession.Message, value any) (peersession.Message, error) {
+	response, ok := value.(*pb.ProbeTwoGroupPrepareEvidenceResponse)
+	if !ok || !bootstrapExactProto(response) || response.GetVersion() != kv.TwoGroupPrepareEvidenceProbeVersion ||
+		response.GetGroupId() != request.Group || response.GetAppliedIndex() == 0 || response.GetLeaderTerm() == 0 {
+		return peersession.Message{}, peersession.ErrFormat
+	}
+	return bootstrapControlReply(request), nil
 }
 
 func verifyTwoGroupPrepareMethod(group uint64) peersession.Method {

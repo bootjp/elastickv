@@ -13,7 +13,7 @@ func TestTimestampAdmissionMethodsArePrivateAndGroupScoped(t *testing.T) {
 	public := BootstrapPublicGRPCMethods()
 	for _, name := range []string{pb.Internal_IssueBoundTimestamp_FullMethodName, pb.Internal_LookupTimestampBinding_FullMethodName,
 		pb.Internal_ProposeTwoGroupPrepare_FullMethodName, pb.Internal_VerifyTwoGroupPrepare_FullMethodName,
-		pb.Internal_ProposeTwoGroupTerminal_FullMethodName} {
+		pb.Internal_ProposeTwoGroupTerminal_FullMethodName, pb.Internal_ProbeTwoGroupPrepareEvidence_FullMethodName} {
 		require.False(t, slices.Contains(public, name), "timestamp admission cannot bypass peer sessions")
 	}
 	for _, tc := range []struct {
@@ -31,7 +31,7 @@ func TestTimestampAdmissionMethodsArePrivateAndGroupScoped(t *testing.T) {
 		if tc.group == 0 {
 			require.Len(t, methods, 1)
 		} else {
-			require.Len(t, methods, 4)
+			require.Len(t, methods, 5)
 			require.Equal(t, pb.Internal_ProposeTwoGroupPrepare_FullMethodName, methods[1].Name)
 			require.False(t, methods[1].AllowPublic)
 			_, err := methods[1].BoundRequest(peersession.RequestBinding{Group: tc.group}, &pb.ProposeTwoGroupPrepareRequest{})
@@ -42,6 +42,18 @@ func TestTimestampAdmissionMethodsArePrivateAndGroupScoped(t *testing.T) {
 			_, err = methods[2].BoundRequest(peersession.RequestBinding{Group: tc.group}, &pb.VerifyTwoGroupPrepareRequest{})
 			require.Error(t, err)
 			_, err = methods[3].BoundRequest(peersession.RequestBinding{Group: tc.group}, &pb.ProposeTwoGroupTerminalRequest{})
+			require.Error(t, err)
+			probe := methods[4]
+			binding := peersession.RequestBinding{Group: tc.group, From: peersession.Node{Member: 2}, To: peersession.Node{Member: 1}}
+			message, err := probe.BoundRequest(binding, &pb.ProbeTwoGroupPrepareEvidenceRequest{Version: 1})
+			require.NoError(t, err)
+			_, err = probe.Reply(message, &pb.ProbeTwoGroupPrepareEvidenceResponse{Version: 1, GroupId: tc.group, AppliedIndex: 3, LeaderTerm: 2})
+			require.NoError(t, err)
+			_, err = probe.BoundRequest(binding, &pb.ProbeTwoGroupPrepareEvidenceRequest{})
+			require.Error(t, err)
+			_, err = probe.BoundRequest(peersession.RequestBinding{Group: tc.group + 1}, &pb.ProbeTwoGroupPrepareEvidenceRequest{Version: 1})
+			require.Error(t, err)
+			_, err = probe.Reply(message, &pb.ProbeTwoGroupPrepareEvidenceResponse{Version: 1, GroupId: tc.group + 1, AppliedIndex: 3, LeaderTerm: 2})
 			require.Error(t, err)
 		}
 		method := methods[0]

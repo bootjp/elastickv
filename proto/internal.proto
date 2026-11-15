@@ -23,6 +23,7 @@ service Internal {
   rpc ProposeTwoGroupPrepare(ProposeTwoGroupPrepareRequest) returns (ProposeTwoGroupPrepareResponse) {}
   rpc VerifyTwoGroupPrepare(VerifyTwoGroupPrepareRequest) returns (VerifyTwoGroupPrepareResponse) {}
   rpc ProposeTwoGroupTerminal(ProposeTwoGroupTerminalRequest) returns (ProposeTwoGroupTerminalResponse) {}
+  rpc ProbeTwoGroupPrepareEvidence(ProbeTwoGroupPrepareEvidenceRequest) returns (ProbeTwoGroupPrepareEvidenceResponse) {}
 }
 
 // internal.proto is node to node communication message in raft replication.
@@ -510,6 +511,18 @@ message ProposeTwoGroupTerminalRequest {
 message ProposeTwoGroupTerminalResponse {
   uint64 commit_index = 1;
   uint64 leader_term = 2;
+}
+
+message ProbeTwoGroupPrepareEvidenceRequest {
+  uint32 version = 1;
+}
+
+message ProbeTwoGroupPrepareEvidenceResponse {
+  uint32 version = 1;
+  uint64 group_id = 2;
+  bool proof_enabled = 3;
+  uint64 applied_index = 4;
+  uint64 leader_term = 5;
 }
 
 message TwoGroupHomeAdmissionRecord {
