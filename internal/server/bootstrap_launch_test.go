@@ -44,6 +44,9 @@ func TestProtectedBootstrapLaunchRequiresExactDurableFormat(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, noderuntime.EnsureRaftEngineDataDirForFactory(dir, noderuntime.RaftEngineEtcd, factory))
 	marker := filepath.Join(dir, raftbootstrap.MarkerFile)
+	require.NoError(t, os.WriteFile(marker, []byte(raftbootstrap.MarkerV2), 0600))
+	require.NoError(t, noderuntime.EnsureRaftEngineDataDirForFactory(dir, noderuntime.RaftEngineEtcd, factory),
+		"protected startup must accept the fenced required marker")
 	require.NoError(t, os.WriteFile(marker, []byte("etcd\n"), 0600))
 	require.Error(t, noderuntime.EnsureRaftEngineDataDirForFactory(dir, noderuntime.RaftEngineEtcd, factory))
 	got, err := os.ReadFile(marker)

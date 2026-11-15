@@ -20,6 +20,8 @@ const (
 	PolicyFile                 = "bootstrap-policy"
 	MarkerFile                 = "raft-engine"
 	MarkerV1                   = "etcd-bootstrap-v1\n"
+	MarkerV2                   = "etcd-bootstrap-v2-m1b\n"
+	MarkerLegacyFenced         = "etcd+m1b\n"
 	MaxFileSize                = 16 << 20
 	intentMagic                = "EKVBI001"
 	formatVersion       uint32 = 1

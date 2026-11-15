@@ -62,6 +62,27 @@ func TestPublishAndInspect(t *testing.T) {
 	require.NoError(t, s.Publish(in, e), "idempotent retry still syncs both files")
 }
 
+func TestPublishPreservesM1bDowngradeFence(t *testing.T) {
+	t.Parallel()
+	in, evidence := fixture(t)
+	dir := t.TempDir()
+	files := NewStore(dir)
+	put(t, dir, MarkerFile, []byte(MarkerLegacyFenced))
+	before, err := files.Inspect(evidence)
+	require.NoError(t, err)
+	require.Equal(t, Legacy, before.Class)
+	require.True(t, before.Fenced)
+
+	require.NoError(t, files.Publish(in, evidence))
+	require.Equal(t, MarkerV2, string(diskBytes(t, dir, MarkerFile)))
+	after, err := files.Inspect(evidence)
+	require.NoError(t, err)
+	require.Equal(t, Required, after.Class)
+	require.True(t, after.Fenced)
+	require.NoError(t, files.Publish(in, evidence))
+	require.Equal(t, MarkerV2, string(diskBytes(t, dir, MarkerFile)), "retry must not downgrade the marker")
+}
+
 func TestLoadIntentIsStrictAndDoesNotClassify(t *testing.T) {
 	t.Parallel()
 	in, _ := fixture(t)

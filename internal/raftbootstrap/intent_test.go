@@ -160,7 +160,8 @@ func TestMarkerStrict(t *testing.T) {
 		state MarkerState
 		err   error
 	}{
-		{MarkerV1, MarkerRequired, nil}, {"etcd", MarkerLegacy, nil}, {"etcd\n", MarkerLegacy, nil},
+		{MarkerV1, MarkerRequired, nil}, {MarkerV2, MarkerRequired, nil},
+		{"etcd", MarkerLegacy, nil}, {"etcd\n", MarkerLegacy, nil}, {MarkerLegacyFenced, MarkerLegacy, nil},
 		{"", MarkerCorrupt, ErrInvalid}, {"etcd-bootstrap-v1", MarkerUnknown, ErrUnsupported},
 		{"etcd-bootstrap-v1\n\n", MarkerUnknown, ErrUnsupported}, {"ETCD", MarkerUnknown, ErrUnsupported},
 		{" etcd\n", MarkerUnknown, ErrUnsupported}, {"etcd-bootstrap-v2\n", MarkerUnknown, ErrUnsupported},

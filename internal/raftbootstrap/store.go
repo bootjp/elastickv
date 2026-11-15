@@ -63,6 +63,7 @@ const (
 type Inspection struct {
 	Class  Classification
 	Marker MarkerState
+	Fenced bool
 	Intent *Intent
 }
 
@@ -163,9 +164,9 @@ func (s *Store) AdvancePolicy(expected Witness, next PolicyRecord) error {
 
 func ParseMarker(data []byte) (MarkerState, error) {
 	switch string(data) {
-	case MarkerV1:
+	case MarkerV1, MarkerV2:
 		return MarkerRequired, nil
-	case "etcd", "etcd\n":
+	case "etcd", "etcd\n", MarkerLegacyFenced:
 		return MarkerLegacy, nil
 	case "":
 		return MarkerCorrupt, ErrInvalid
@@ -193,6 +194,7 @@ func (s *Store) inspect(e Evidence) (Inspection, error) {
 		if err != nil {
 			return classifiedError(r, err)
 		}
+		r.Fenced = string(b) == MarkerLegacyFenced || string(b) == MarkerV2
 	}
 	b, present, err = readBounded(s.dir, IntentFile)
 	if err != nil {
@@ -354,7 +356,11 @@ func (s *Store) publish(in Intent, e Evidence, validate func(Intent, Evidence) e
 	if err := s.replace(IntentFile, data); err != nil {
 		return err
 	}
-	return s.replace(MarkerFile, []byte(MarkerV1))
+	marker := MarkerV1
+	if old.Fenced {
+		marker = MarkerV2
+	}
+	return s.replace(MarkerFile, []byte(marker))
 }
 
 func validateExisting(old Inspection, in Intent, e Evidence) error {
