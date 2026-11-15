@@ -175,8 +175,8 @@ address the recorded refusal path in code, but their unit tests are not a rerun
 of the failed three-process history. The Jepsen workflow in this follow-up
 starts all three members with a 20-entry snapshot interval, requires each
 member to report a post-bootstrap snapshot after the seal workload, restarts
-the same data directories and encryption sidecars, and compares consistent
-item reads from every member against the pre-restart values. This acceptance
+the same data directories and encryption sidecars, and compares paginated,
+consistent full-table scans from every member against the pre-restart values. This acceptance
 remains unproven until the workflow passes on the follow-up HEAD; repeated
 encrypted stress and the broader production performance gate also remain open.
 

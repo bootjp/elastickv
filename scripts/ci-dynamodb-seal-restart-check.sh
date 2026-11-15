@@ -6,15 +6,34 @@ mode=${2:-off}
 before=/tmp/elastickv-ci/dynamodb-seal-before.jsonl
 
 read_items() {
-  local node=$1 key response
-  for key in {0..11}; do
+  local node=$1 response request cursor=null next page
+  for page in {1..1000}; do
+    request=$(jq -nc --argjson cursor "$cursor" \
+      '{TableName:"jepsen_append",ConsistentRead:true,Limit:100} +
+       (if $cursor == null then {} else {ExclusiveStartKey:$cursor} end)')
     response=$(curl -fsS --retry 10 --retry-all-errors --retry-delay 1 --max-time 10 \
-      -H 'X-Amz-Target: DynamoDB_20120810.GetItem' \
+      -H 'X-Amz-Target: DynamoDB_20120810.Scan' \
       -H 'Content-Type: application/x-amz-json-1.0' \
-      --data "{\"TableName\":\"jepsen_append\",\"Key\":{\"pk\":{\"S\":\"${key}\"}},\"ConsistentRead\":true}" \
+      --data "$request" \
       "http://127.0.0.1:6380${node}/")
-    jq -cS '.Item // {}' <<< "$response"
-  done
+    jq -e '(.Items | type == "array") and
+      ((.LastEvaluatedKey == null) or (.LastEvaluatedKey | type == "object"))' \
+      <<< "$response" >/dev/null
+    jq -cS '.Items[]' <<< "$response"
+    next=$(jq -c '.LastEvaluatedKey // null' <<< "$response")
+    if [[ $next == null ]]; then
+      break
+    fi
+    if [[ $next == "$cursor" ]]; then
+      echo "DynamoDB Scan cursor did not advance on node $node" >&2
+      return 1
+    fi
+    cursor=$next
+    if (( page == 1000 )); then
+      echo "DynamoDB Scan exceeded 1000 pages on node $node" >&2
+      return 1
+    fi
+  done | LC_ALL=C sort
 }
 
 case $phase in
