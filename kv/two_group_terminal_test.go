@@ -1,6 +1,7 @@
 package kv
 
 import (
+	"bytes"
 	"context"
 	"testing"
 
@@ -134,4 +135,129 @@ func TestTwoGroupTerminalDecisionSurvivesPebbleReopenAndCompaction(t *testing.T)
 	require.Equal(t, pb.Phase_ABORT, record.GetDecision())
 	_, err = reopened.GetAt(t.Context(), txnRollbackKey([]byte("home-key"), 10), ^uint64(0))
 	require.NoError(t, err)
+}
+
+func restoreTwoGroupTestFSM(t *testing.T, source *kvFSM, group uint64) (*kvFSM, store.RaftControlMetadataStore) {
+	t.Helper()
+	snapshot, err := source.Snapshot()
+	require.NoError(t, err)
+	var image bytes.Buffer
+	_, err = snapshot.WriteTo(&image)
+	require.NoError(t, err)
+	require.NoError(t, snapshot.Close())
+
+	st := store.NewMVCCStore()
+	t.Cleanup(func() { require.NoError(t, st.Close()) })
+	restored, ok := NewKvFSMWithHLC(st, NewHLC(), WithRouteHistory(nil, group)).(*kvFSM)
+	require.True(t, ok)
+	restored.twoGroupPrepareEnabled.Store(true)
+	require.NoError(t, restored.Restore(bytes.NewReader(image.Bytes())))
+	metadata, ok := st.(store.RaftControlMetadataStore)
+	require.True(t, ok)
+	return restored, metadata
+}
+
+func TestTwoGroupPrepareAndTerminalSurviveBothGroupSnapshotRestores(t *testing.T) {
+	home, secondary, _, _, manifest := prepareTwoGroupTerminalFSMs(t)
+
+	home, homeMetadata := restoreTwoGroupTestFSM(t, home, 1)
+	secondary, secondaryMetadata := restoreTwoGroupTestFSM(t, secondary, 2)
+	for _, tc := range []struct {
+		name     string
+		fsm      *kvFSM
+		metadata store.RaftControlMetadataStore
+		group    uint64
+	}{
+		{name: "home", fsm: home, metadata: homeMetadata, group: 1},
+		{name: "secondary", fsm: secondary, metadata: secondaryMetadata, group: 2},
+	} {
+		t.Run(tc.name+" prepare", func(t *testing.T) {
+			key := []byte("home-key")
+			if tc.group == 2 {
+				key = []byte("secondary-key")
+			}
+			binding, found, err := LookupTimestampBinding(t.Context(), tc.metadata, twoGroupFixtureID)
+			require.NoError(t, err)
+			require.True(t, found)
+			require.Equal(t, manifest.GetPersistenceTimestamp(), binding.Timestamp)
+			require.Equal(t, pb.Phase_PREPARE, binding.Phase)
+			if tc.group == 1 {
+				_, found, err = LookupTwoGroupHomeRecord(t.Context(), tc.metadata, twoGroupFixtureID)
+				require.NoError(t, err)
+				require.True(t, found)
+			} else {
+				proof, err := tc.metadata.ReadRaftControlMetadata(t.Context(), twoGroupSecondaryKey(twoGroupFixtureID))
+				require.NoError(t, err)
+				observedBinding, err := validateTwoGroupObservationProof(proof, tc.group)
+				require.NoError(t, err)
+				require.Equal(t, binding, observedBinding)
+			}
+			_, err = tc.fsm.store.GetAt(t.Context(), txnLockKey(key), ^uint64(0))
+			require.NoError(t, err)
+		})
+	}
+
+	homeCommit, err := marshalTwoGroupTerminalEntry(1, manifest, pb.Phase_COMMIT, TwoGroupDecisionObservation{})
+	require.NoError(t, err)
+	require.Nil(t, applyTwoGroupTestEntry(t, home, 3, 1, homeCommit))
+	decision, err := ObserveTwoGroupDecision(t.Context(), localTwoGroupDecisionLookup{store: homeMetadata, barrier: 3, term: 1}, manifest, pb.Phase_COMMIT)
+	require.NoError(t, err)
+	secondaryCommit, err := marshalTwoGroupTerminalEntry(2, manifest, pb.Phase_COMMIT, decision)
+	require.NoError(t, err)
+	require.Nil(t, applyTwoGroupTestEntry(t, secondary, 3, 1, secondaryCommit))
+
+	home, homeMetadata = restoreTwoGroupTestFSM(t, home, 1)
+	secondary, secondaryMetadata = restoreTwoGroupTestFSM(t, secondary, 2)
+	for _, tc := range []struct {
+		name     string
+		fsm      *kvFSM
+		metadata store.RaftControlMetadataStore
+		group    uint64
+	}{
+		{name: "home", fsm: home, metadata: homeMetadata, group: 1},
+		{name: "secondary", fsm: secondary, metadata: secondaryMetadata, group: 2},
+	} {
+		t.Run(tc.name+" terminal", func(t *testing.T) {
+			key := []byte("home-key")
+			if tc.group == 2 {
+				key = []byte("secondary-key")
+			}
+			binding, found, err := LookupTimestampBinding(t.Context(), tc.metadata, twoGroupFixtureID)
+			require.NoError(t, err)
+			require.True(t, found)
+			require.Equal(t, pb.Phase_PREPARE, binding.Phase)
+			raw, err := tc.metadata.ReadRaftControlMetadata(t.Context(), twoGroupTerminalKey(twoGroupFixtureID))
+			require.NoError(t, err)
+			record, err := parseTwoGroupTerminalRecord(raw)
+			require.NoError(t, err)
+			require.Equal(t, pb.Phase_COMMIT, record.GetDecision())
+			if tc.group == 2 {
+				proof, err := tc.metadata.ReadRaftControlMetadata(t.Context(), twoGroupSecondaryKey(twoGroupFixtureID))
+				require.NoError(t, err)
+				observedBinding, err := validateTwoGroupObservationProof(proof, tc.group)
+				require.NoError(t, err)
+				require.Equal(t, binding, observedBinding)
+			}
+			if tc.group == 1 {
+				_, err = tc.fsm.store.GetAt(t.Context(), txnCommitKey(key, 10), ^uint64(0))
+				require.NoError(t, err)
+			} else {
+				value, err := tc.fsm.store.GetAt(t.Context(), key, manifest.GetPersistenceTimestamp())
+				require.NoError(t, err)
+				require.Equal(t, []byte("value"), value)
+			}
+
+			_, applier := testTimestampBindingStores(t, tc.fsm.store)
+			for _, changed := range []TimestampBinding{
+				func() TimestampBinding { b := binding; b.Timestamp++; return b }(),
+				func() TimestampBinding { b := binding; b.OperationID[0]++; return b }(),
+			} {
+				err := applier.ApplyRaftEntry(t.Context(), 4, func(ctx context.Context) error {
+					_, err := StageTimestampBinding(ctx, tc.metadata, changed)
+					return err
+				})
+				require.ErrorIs(t, err, ErrTimestampBindingConflict)
+			}
+		})
+	}
 }
