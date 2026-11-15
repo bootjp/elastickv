@@ -10,6 +10,7 @@ service Admin {
   rpc GetClusterOverview (GetClusterOverviewRequest) returns (GetClusterOverviewResponse) {}
   rpc GetRaftGroups (GetRaftGroupsRequest) returns (GetRaftGroupsResponse) {}
   rpc GetRedisLegacyMetadataPasses (GetRedisLegacyMetadataPassesRequest) returns (GetRedisLegacyMetadataPassesResponse) {}
+  rpc AuditRedisLegacyMetadata (AuditRedisLegacyMetadataRequest) returns (AuditRedisLegacyMetadataResponse) {}
   rpc GetAdapterSummary (GetAdapterSummaryRequest) returns (GetAdapterSummaryResponse) {}
   rpc GetKeyVizMatrix (GetKeyVizMatrixRequest) returns (GetKeyVizMatrixResponse) {}
   rpc GetRouteDetail (GetRouteDetailRequest) returns (GetRouteDetailResponse) {}
@@ -316,4 +317,30 @@ message KeyVizColumn {
   int64 column_unix_ms = 1;
   KeyVizSeries series = 2;
   repeated KeyVizRow rows = 3;
+}
+
+// A one-shot, read-only diagnostic. Counts are present only on COMPLETE.
+// INCOMPLETE and RESTARTED are never zero-backlog evidence or M4 gate input.
+message AuditRedisLegacyMetadataRequest {
+  uint64 group_id = 1;
+  // Maximum physical pages across all four plans. Zero uses the server default.
+  uint32 max_pages = 2;
+}
+
+enum RedisLegacyMetadataAuditStatus {
+  REDIS_LEGACY_METADATA_AUDIT_STATUS_UNSPECIFIED = 0;
+  REDIS_LEGACY_METADATA_AUDIT_COMPLETE = 1;
+  REDIS_LEGACY_METADATA_AUDIT_INCOMPLETE = 2;
+  REDIS_LEGACY_METADATA_AUDIT_RESTARTED = 3;
+}
+
+message AuditRedisLegacyMetadataResponse {
+  RedisLegacyMetadataAuditStatus status = 1;
+  uint64 group_id = 2;
+  uint64 read_ts = 3;
+  uint64 catalog_version = 4;
+  uint64 leader_term = 5;
+  uint32 pages_scanned = 6;
+  // Exactly four entries on COMPLETE; absent for every other status.
+  repeated RedisLegacyMetadataPass passes = 7;
 }

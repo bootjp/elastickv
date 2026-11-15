@@ -65,6 +65,7 @@ func setupAdminService(
 	if srv == nil {
 		return nil, icept, nil
 	}
+	registerLegacyMetadataAudit(srv, shardStore, coordinate, readTracker)
 	for _, rt := range runtimes {
 		srv.RegisterGroup(rt.Spec.ID, rt.Engine)
 		if group := shardGroups[rt.Spec.ID]; group != nil {
@@ -91,6 +92,13 @@ func setupAdminService(
 		log.Printf("WARNING: --adminInsecureNoAuth is set; Admin gRPC service exposed without authentication")
 	}
 	return srv, icept, nil
+}
+
+func registerLegacyMetadataAudit(srv *adapter.AdminServer, shardStore *kv.ShardStore, coordinate kv.Coordinator,
+	readTracker *kv.ActiveTimestampTracker) {
+	if shardStore != nil && coordinate != nil && readTracker != nil {
+		srv.RegisterLegacyMetadataAuditSource(adapter.NewLegacyMetadataAuditor(shardStore, coordinate, readTracker))
+	}
 }
 
 // canonicalSelfAddress picks the listener address AdminServer should advertise

@@ -22,6 +22,61 @@ func (s *AdminServer) RegisterLegacyMetadataPassSource(source LegacyMetadataPass
 	s.groupsMu.Unlock()
 }
 
+func (s *AdminServer) RegisterLegacyMetadataAuditSource(source LegacyMetadataAuditSource) {
+	s.groupsMu.Lock()
+	s.legacyMetadataAuditSource = source
+	s.groupsMu.Unlock()
+}
+
+func (s *AdminServer) AuditRedisLegacyMetadata(ctx context.Context,
+	req *pb.AuditRedisLegacyMetadataRequest) (*pb.AuditRedisLegacyMetadataResponse, error) {
+	if req == nil || req.GetGroupId() == 0 || req.GetMaxPages() > legacyMetadataAuditMaxPages || len(req.ProtoReflect().GetUnknown()) != 0 {
+		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "a data-group ID and bounded max_pages are required"))
+	}
+	s.groupsMu.RLock()
+	source := s.legacyMetadataAuditSource
+	s.groupsMu.RUnlock()
+	if source == nil {
+		return nil, errors.WithStack(status.Error(codes.Unavailable, "legacy metadata audit is unavailable"))
+	}
+	result, err := source.AuditLegacyMetadata(ctx, req.GetGroupId(), req.GetMaxPages())
+	if err != nil {
+		return nil, errors.WithStack(status.Errorf(codes.FailedPrecondition, "legacy metadata audit failed: %v", err))
+	}
+	if !validLegacyAuditHeader(req.GetGroupId(), result) {
+		return nil, errors.WithStack(status.Error(codes.Internal, "invalid legacy metadata audit result"))
+	}
+	return legacyMetadataAuditRPCResponse(result)
+}
+
+func validLegacyAuditHeader(groupID uint64, result LegacyMetadataAuditResult) bool {
+	return result.GroupID == groupID && result.ReadTS != 0 && result.CatalogVersion != 0 && result.LeaderTerm != 0 &&
+		(result.Status == LegacyMetadataAuditComplete || len(result.Passes) == 0)
+}
+
+func legacyMetadataAuditRPCResponse(result LegacyMetadataAuditResult) (*pb.AuditRedisLegacyMetadataResponse, error) {
+	response := &pb.AuditRedisLegacyMetadataResponse{GroupId: result.GroupID, ReadTs: result.ReadTS,
+		CatalogVersion: result.CatalogVersion, LeaderTerm: result.LeaderTerm, PagesScanned: result.PagesScanned}
+	switch result.Status {
+	case LegacyMetadataAuditComplete:
+		if err := validateLegacyMetadataRPCPasses(result.GroupID, result.Passes); err != nil {
+			return nil, errors.WithStack(status.Error(codes.Internal, "invalid completed legacy metadata audit"))
+		}
+		if result.Passes[0].CatalogVersion != result.CatalogVersion || result.Passes[0].LeaderTerm != result.LeaderTerm {
+			return nil, errors.WithStack(status.Error(codes.Internal, "completed legacy metadata audit identity mismatch"))
+		}
+		response.Status = pb.RedisLegacyMetadataAuditStatus_REDIS_LEGACY_METADATA_AUDIT_COMPLETE
+		response.Passes = legacyMetadataRPCResponse(result.GroupID, result.Passes).Passes
+	case LegacyMetadataAuditIncomplete:
+		response.Status = pb.RedisLegacyMetadataAuditStatus_REDIS_LEGACY_METADATA_AUDIT_INCOMPLETE
+	case LegacyMetadataAuditRestarted:
+		response.Status = pb.RedisLegacyMetadataAuditStatus_REDIS_LEGACY_METADATA_AUDIT_RESTARTED
+	default:
+		return nil, errors.WithStack(status.Error(codes.Internal, "invalid legacy metadata audit status"))
+	}
+	return response, nil
+}
+
 func (s *AdminServer) GetRedisLegacyMetadataPasses(ctx context.Context,
 	req *pb.GetRedisLegacyMetadataPassesRequest) (*pb.GetRedisLegacyMetadataPassesResponse, error) {
 	if req == nil || req.GetGroupId() == 0 || len(req.ProtoReflect().GetUnknown()) != 0 {

@@ -1,0 +1,232 @@
+package adapter
+
+import (
+	"bytes"
+	"context"
+	"net"
+	"testing"
+
+	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/kv"
+	pb "github.com/bootjp/elastickv/proto"
+	"github.com/bootjp/elastickv/store"
+	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
+	"google.golang.org/grpc/test/bufconn"
+)
+
+type auditScannerStub struct {
+	version uint64
+	term    uint64
+	checks  int
+	change  func(*auditScannerStub)
+}
+
+type auditPinObservingStore struct {
+	store.MVCCStore
+	tracker *kv.ActiveTimestampTracker
+	reads   int
+	readTS  uint64
+	failAt  int
+}
+
+func (s *auditPinObservingStore) ScanAt(ctx context.Context, start, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
+	if s.tracker.Oldest() != ts {
+		return nil, errors.New("audit read timestamp is not pinned")
+	}
+	if s.readTS != 0 && s.readTS != ts {
+		return nil, errors.New("audit changed read timestamp between pages")
+	}
+	s.readTS = ts
+	s.reads++
+	if s.reads == s.failAt {
+		return nil, errors.New("injected scan failure")
+	}
+	return s.MVCCStore.ScanAt(ctx, start, end, limit, ts)
+}
+
+func TestLegacyMetadataAuditorPinsOneReadAcrossFourRanges(t *testing.T) {
+	tracker := kv.NewActiveTimestampTracker()
+	base := store.NewMVCCStore()
+	key := store.HashMetaKey([]byte("apple"))
+	require.NoError(t, base.PutAt(t.Context(), key, []byte("meta"), 5, 0))
+	observed := &auditPinObservingStore{MVCCStore: base, tracker: tracker}
+	routes := distribution.NewEngine()
+	routes.UpdateRoute(nil, nil, 1)
+	shards := kv.NewShardStore(routes, map[uint64]*kv.ShardGroup{
+		1: {Store: observed, Engine: &localCompactionReadEngine{}},
+	})
+	auditor := NewLegacyMetadataAuditor(shards, newLocalAdapterCoordinator(shards), tracker)
+	result, err := auditor.AuditLegacyMetadata(t.Context(), 1, 8)
+	require.NoError(t, err)
+	require.Equal(t, LegacyMetadataAuditComplete, result.Status)
+	require.Len(t, result.Passes, 4)
+	require.GreaterOrEqual(t, observed.reads, 4)
+	require.Equal(t, result.ReadTS, observed.readTS)
+	require.Zero(t, tracker.Oldest(), "request close must release the audit pin")
+	observed.reads = 0
+	observed.readTS = 0
+	observed.failAt = 2
+	failed, err := auditor.AuditLegacyMetadata(t.Context(), 1, 8)
+	require.ErrorContains(t, err, "injected scan failure")
+	require.Empty(t, failed.Passes)
+	require.Zero(t, tracker.Oldest(), "failed audit must release the pin")
+}
+
+func (s *auditScannerStub) GroupOwnedScanIdentity(context.Context, uint64) (uint64, uint64, error) {
+	s.checks++
+	if s.change != nil {
+		s.change(s)
+	}
+	return s.version, s.term, nil
+}
+
+func TestLegacyMetadataAuditCountsFourPlansAtOneTimestamp(t *testing.T) {
+	scanner := &auditScannerStub{version: 11, term: 3}
+	var starts [][]byte
+	page := 0
+	result, err := runLegacyMetadataAudit(t.Context(), scanner, 7, 123, 8,
+		func(_ context.Context, start, end []byte) (kv.GroupOwnedScanPage, error) {
+			require.Equal(t, uint64(11), scanner.version)
+			require.Less(t, bytes.Compare(start, end), 0)
+			starts = append(starts, bytes.Clone(start))
+			page++
+			out := kv.GroupOwnedScanPage{CatalogVersion: 11, LeaderTerm: 3}
+			switch page {
+			case 1:
+				out.Resume = append([]byte(store.HashMetaPrefix), []byte("cursor")...)
+				out.LegacyRows = []kv.LegacyMetadataRow{legacyTestRow(9, kv.LegacyMetadataServed)}
+			case 2:
+				out.LegacyRows = []kv.LegacyMetadataRow{legacyTestRow(9, kv.LegacyMetadataOwnerLedElsewhere)}
+			case 3:
+				out.LegacyRows = []kv.LegacyMetadataRow{legacyTestRow(8, kv.LegacyMetadataOwnerHasVersion)}
+			case 4:
+				out.LegacyRows = []kv.LegacyMetadataRow{legacyTestRow(8, kv.LegacyMetadataStaged)}
+			}
+			return out, nil
+		})
+	require.NoError(t, err)
+	require.Equal(t, LegacyMetadataAuditComplete, result.Status)
+	require.Equal(t, uint64(123), result.ReadTS)
+	require.Equal(t, uint32(5), result.PagesScanned)
+	require.Len(t, result.Passes, 4)
+	require.Equal(t, uint64(1), result.Passes[0].Counts[9].Served)
+	require.Equal(t, uint64(1), result.Passes[0].Counts[9].OwnerLedElsewhere)
+	require.Equal(t, uint64(1), result.Passes[1].Counts[8].OwnerHasVersion)
+	require.Equal(t, uint64(1), result.Passes[2].Counts[8].StagedVisibility)
+	require.Empty(t, result.Passes[3].Counts)
+	require.True(t, bytes.HasSuffix(starts[1], []byte{0}), "physical-page resume must advance")
+}
+
+func TestLegacyMetadataAuditIncompleteNeverReturnsPartialCounts(t *testing.T) {
+	scanner := &auditScannerStub{version: 11, term: 3}
+	reads := 0
+	result, err := runLegacyMetadataAudit(t.Context(), scanner, 7, 123, 1,
+		func(context.Context, []byte, []byte) (kv.GroupOwnedScanPage, error) {
+			reads++
+			return kv.GroupOwnedScanPage{CatalogVersion: 11, LeaderTerm: 3,
+				LegacyRows: []kv.LegacyMetadataRow{legacyTestRow(9, kv.LegacyMetadataServed)}}, nil
+		})
+	require.NoError(t, err)
+	require.Equal(t, LegacyMetadataAuditIncomplete, result.Status)
+	require.Equal(t, 1, reads)
+	require.Empty(t, result.Passes)
+}
+
+func TestLegacyMetadataAuditRestartsOnCatalogOrTermChange(t *testing.T) {
+	for _, field := range []string{"catalog", "term"} {
+		t.Run(field, func(t *testing.T) {
+			scanner := &auditScannerStub{version: 11, term: 3}
+			scanner.change = func(s *auditScannerStub) {
+				if s.checks == 3 {
+					if field == "catalog" {
+						s.version++
+					} else {
+						s.term++
+					}
+				}
+			}
+			result, err := runLegacyMetadataAudit(t.Context(), scanner, 7, 123, 8,
+				func(context.Context, []byte, []byte) (kv.GroupOwnedScanPage, error) {
+					return kv.GroupOwnedScanPage{CatalogVersion: 11, LeaderTerm: 3,
+						LegacyRows: []kv.LegacyMetadataRow{legacyTestRow(9, kv.LegacyMetadataServed)}}, nil
+				})
+			require.NoError(t, err)
+			require.Equal(t, LegacyMetadataAuditRestarted, result.Status)
+			require.Empty(t, result.Passes)
+		})
+	}
+}
+
+func TestLegacyMetadataAuditReadFailureDoesNotReturnZero(t *testing.T) {
+	scanner := &auditScannerStub{version: 11, term: 3}
+	result, err := runLegacyMetadataAudit(t.Context(), scanner, 7, 123, 8,
+		func(context.Context, []byte, []byte) (kv.GroupOwnedScanPage, error) {
+			return kv.GroupOwnedScanPage{}, errors.New("read failed")
+		})
+	require.ErrorContains(t, err, "read failed")
+	require.Empty(t, result.Passes)
+}
+
+type auditSourceStub struct{ result LegacyMetadataAuditResult }
+
+func (s auditSourceStub) AuditLegacyMetadata(context.Context, uint64, uint32) (LegacyMetadataAuditResult, error) {
+	return s.result, nil
+}
+
+func TestLegacyMetadataAuditAdminBearerAndIncompleteProtocol(t *testing.T) {
+	srv := NewAdminServer(NodeIdentity{}, nil)
+	srv.RegisterLegacyMetadataAuditSource(auditSourceStub{result: LegacyMetadataAuditResult{
+		Status: LegacyMetadataAuditIncomplete, GroupID: 7, ReadTS: 123, CatalogVersion: 11, LeaderTerm: 3, PagesScanned: 1,
+	}})
+	unary, _ := AdminTokenAuth("admin-token")
+	listener := bufconn.Listen(1 << 20)
+	server := grpc.NewServer(grpc.UnaryInterceptor(unary))
+	pb.RegisterAdminServer(server, srv)
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(func() { server.Stop(); _ = listener.Close() })
+	conn, err := grpc.NewClient("passthrough:///bufnet", grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+		return listener.Dial()
+	}), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	client := pb.NewAdminClient(conn)
+	req := &pb.AuditRedisLegacyMetadataRequest{GroupId: 7, MaxPages: 1}
+	_, err = client.AuditRedisLegacyMetadata(t.Context(), req)
+	require.Equal(t, codes.Unauthenticated, status.Code(err))
+	ctx := metadata.AppendToOutgoingContext(t.Context(), "authorization", "Bearer admin-token")
+	response, err := client.AuditRedisLegacyMetadata(ctx, req)
+	require.NoError(t, err)
+	require.Equal(t, pb.RedisLegacyMetadataAuditStatus_REDIS_LEGACY_METADATA_AUDIT_INCOMPLETE, response.GetStatus())
+	require.Empty(t, response.GetPasses())
+	_, err = client.AuditRedisLegacyMetadata(ctx, &pb.AuditRedisLegacyMetadataRequest{GroupId: 7, MaxPages: legacyMetadataAuditMaxPages + 1})
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+}
+
+func TestLegacyMetadataAuditAdminRejectsInvalidSourceEvidence(t *testing.T) {
+	srv := NewAdminServer(NodeIdentity{}, nil)
+	req := &pb.AuditRedisLegacyMetadataRequest{GroupId: 7}
+	_, err := srv.AuditRedisLegacyMetadata(t.Context(), req)
+	require.Equal(t, codes.Unavailable, status.Code(err))
+	base := LegacyMetadataAuditResult{Status: LegacyMetadataAuditIncomplete, GroupID: 7, ReadTS: 123,
+		CatalogVersion: 11, LeaderTerm: 3, Passes: completeLegacyMetadataFixture()[:1]}
+	srv.RegisterLegacyMetadataAuditSource(auditSourceStub{result: base})
+	_, err = srv.AuditRedisLegacyMetadata(t.Context(), req)
+	require.Equal(t, codes.Internal, status.Code(err))
+	base.Status = LegacyMetadataAuditComplete
+	base.Passes = completeLegacyMetadataFixture()[:3]
+	srv.RegisterLegacyMetadataAuditSource(auditSourceStub{result: base})
+	_, err = srv.AuditRedisLegacyMetadata(t.Context(), req)
+	require.Equal(t, codes.Internal, status.Code(err))
+	base.Passes = completeLegacyMetadataFixture()
+	srv.RegisterLegacyMetadataAuditSource(auditSourceStub{result: base})
+	response, err := srv.AuditRedisLegacyMetadata(t.Context(), req)
+	require.NoError(t, err)
+	require.Equal(t, pb.RedisLegacyMetadataAuditStatus_REDIS_LEGACY_METADATA_AUDIT_COMPLETE, response.GetStatus())
+	require.Len(t, response.GetPasses(), 4)
+}
