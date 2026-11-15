@@ -591,13 +591,13 @@ func TestP50BoundarySelection(t *testing.T) {
 		wantOrigin SplitOrigin
 	}{
 		{
-			name:  "interior median uses hi",
+			name:  "interior median without upper load uses lo",
 			route: testRoute(1, 1, "a", "e"),
 			rows: []keyviz.MatrixRow{
 				testRow(1, 1, 0, 4, "a", "b", 10, 0),
 				testRow(1, 1, 1, 4, "b", "c", 90, 0),
 			},
-			wantKey:    []byte("c"),
+			wantKey:    []byte("b"),
 			wantOrigin: SplitOriginP50Mid,
 		},
 		{
@@ -645,6 +645,38 @@ func TestP50BoundarySelection(t *testing.T) {
 			require.Len(t, result.Decisions, 1)
 			require.Equal(t, tc.wantKey, result.Decisions[0].SplitKey)
 			require.Equal(t, tc.wantOrigin, result.Decisions[0].SplitOrigin)
+		})
+	}
+}
+
+func TestP50KeepsObservedLoadOnBothSides(t *testing.T) {
+	t.Parallel()
+	for _, readsOnly := range []bool{false, true} {
+		t.Run(map[bool]string{false: "writes", true: "reads"}[readsOnly], func(t *testing.T) {
+			t.Parallel()
+			at := time.Unix(825, 0)
+			rows := []keyviz.MatrixRow{
+				testRow(1, 1, 6, 16, "\x60", "\x70", 10, 0),
+				testRow(1, 1, 7, 16, "\x70", "\x80", 90, 0),
+				testRow(1, 1, 8, 16, "\x80", "\x90", 0, 0),
+			}
+			cfg := testConfig()
+			if readsOnly {
+				cfg.WriteWeight, cfg.ReadWeight = 0, 1
+				for i := range rows {
+					rows[i].Reads, rows[i].Writes = rows[i].Writes, 0
+				}
+			}
+			result := Evaluate(cfg, NewDetectorState(), Input{
+				Routes:  []distribution.RouteDescriptor{testRouteNilEnd(1, 1, "")},
+				Windows: []ColumnWindow{testWindow(at, time.Minute, rows...)}, Now: at,
+			})
+			require.Len(t, result.Decisions, 1)
+			decision := result.Decisions[0]
+			require.Equal(t, []byte("\x70"), decision.SplitKey)
+			require.InDelta(t, 10, decision.LeftLoad, 0.0001)
+			require.InDelta(t, 90, decision.RightLoad, 0.0001)
+			require.Equal(t, SplitOriginP50Mid, decision.SplitOrigin)
 		})
 	}
 }
