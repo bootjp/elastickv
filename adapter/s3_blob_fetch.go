@@ -297,7 +297,7 @@ func sendChunkBlobPushAck(stream pb.S3BlobFetch_PushChunkBlobServer) error {
 }
 
 func (s *S3BlobFetchServer) currentChunkBlobPayload(ctx context.Context, key []byte) ([]byte, bool, error) {
-	payload, err := s.store.GetAt(ctx, key, math.MaxUint64)
+	payload, err := historicalGetAt(ctx, s.store, key, math.MaxUint64)
 	if errors.Is(err, store.ErrKeyNotFound) {
 		return nil, false, nil
 	}

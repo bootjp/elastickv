@@ -128,7 +128,7 @@ func startRaftServers(
 		serverOptions := append(slices.Clone(rt.TransportServerOptions), raftGRPCServerOptions(adminGRPCOpts)...)
 		gs := grpc.NewServer(serverOptions...)
 		trx := adapter.NewInternalMigrationTransaction(proposerForGroup(rt, shardGroups), observerForGroup(proposalObserverForGroup, rt.Spec.ID), rt.Store, rt.Spec.ID)
-		grpcSvc := adapter.NewGRPCServer(shardStore, coordinate)
+		grpcSvc := adapter.NewGRPCServer(shardStore, coordinate, adapter.WithGRPCActiveTimestampTracker(readTracker))
 		pb.RegisterRawKVServer(gs, grpcSvc)
 		pb.RegisterTransactionalKVServer(gs, grpcSvc)
 		internalOpts := internalServerOptions(coordinate, adminServer, proposerForGroup(rt, shardGroups), shardGroups[rt.Spec.ID], rt.Spec.ID)

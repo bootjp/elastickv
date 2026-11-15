@@ -14,7 +14,11 @@ import (
 )
 
 func (d *DynamoDBServer) scanAllByPrefix(ctx context.Context, prefix []byte) ([]*store.KVPair, error) {
-	return d.scanAllByPrefixAt(ctx, prefix, snapshotTS(d.coordinator.Clock(), d.store))
+	stamp, err := d.beginTxnReadTimestamp(ctx, "dynamodb prefix scan")
+	if err != nil {
+		return nil, err
+	}
+	return d.scanAllByPrefixAt(ctx, prefix, stamp.Timestamp())
 }
 
 func (d *DynamoDBServer) scanAllByPrefixAt(ctx context.Context, prefix []byte, readTS uint64) ([]*store.KVPair, error) {
@@ -26,7 +30,7 @@ func (d *DynamoDBServer) scanAllByPrefixAt(ctx context.Context, prefix []byte, r
 
 	out := make([]*store.KVPair, 0, dynamoScanPageLimit)
 	for {
-		kvs, err := d.store.ScanAt(ctx, start, end, dynamoScanPageLimit, readTS)
+		kvs, err := requestScanAt(ctx, d.store, start, end, dynamoScanPageLimit, readTS)
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}

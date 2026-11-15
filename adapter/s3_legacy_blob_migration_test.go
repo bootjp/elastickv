@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
@@ -27,6 +28,13 @@ type s3MigrationLostReplyCoordinator struct {
 type s3MigrationFollowerCoordinator struct{ kv.Coordinator }
 
 func (s3MigrationFollowerCoordinator) IsLeader() bool { return false }
+
+type s3MigrationLocalReadEngine struct{ raftengine.Engine }
+
+func (*s3MigrationLocalReadEngine) State() raftengine.State { return raftengine.StateLeader }
+func (*s3MigrationLocalReadEngine) LinearizableRead(ctx context.Context) (uint64, error) {
+	return 0, ctx.Err()
+}
 
 func (c *s3MigrationLostReplyCoordinator) Dispatch(ctx context.Context, req *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
 	resp, err := c.Coordinator.Dispatch(ctx, req)
@@ -189,8 +197,8 @@ func TestS3LegacyMigrationRecoveryAcrossShards(t *testing.T) {
 	engine.UpdateRoute(nil, boundary, 1)
 	engine.UpdateRoute(boundary, nil, 2)
 	st := kv.NewShardStore(engine, map[uint64]*kv.ShardGroup{
-		1: {Store: store.NewMVCCStore()},
-		2: {Store: store.NewMVCCStore()},
+		1: {Store: store.NewMVCCStore(), Engine: &s3MigrationLocalReadEngine{}},
+		2: {Store: store.NewMVCCStore(), Engine: &s3MigrationLocalReadEngine{}},
 	})
 	blobs := store.NewMVCCStore()
 	cluster := newFakeS3BlobCluster()

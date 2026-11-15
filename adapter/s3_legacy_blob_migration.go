@@ -48,6 +48,24 @@ type s3MigrationActiveKey struct {
 	object string
 }
 
+func (s *S3Server) beginS3MigrationRead(ctx context.Context, label string) (*kv.ReadRequest, kv.ReadSnapshot, error) {
+	request := s.newReadRequest(ctx)
+	snapshot, err := request.Latest(request.Context(), label)
+	if err != nil {
+		request.Close()
+		return nil, kv.ReadSnapshot{}, errors.WithStack(err)
+	}
+	return request, snapshot, nil
+}
+
+func (s *S3Server) s3MigrationGet(ctx context.Context, snapshot kv.ReadSnapshot, key []byte) ([]byte, error) {
+	request, ok := kv.ReadRequestFromContext(ctx)
+	if !ok || !request.MatchesStore(s.store) {
+		return nil, kv.ErrReadSnapshotScope
+	}
+	return wrappedReadResult(request.Get(ctx, snapshot, key))
+}
+
 func decodeS3MigrationIntent(raw []byte) (s3MigrationIntent, error) {
 	var intent s3MigrationIntent
 	if err := json.Unmarshal(raw, &intent); err != nil {
@@ -136,17 +154,20 @@ func (s *S3Server) beginActiveS3Migration(ctx context.Context, bucket, object st
 }
 
 func (s *S3Server) beginS3LegacyMigration(ctx context.Context, bucket, object string) (*s3MigrationIntent, *s3ObjectManifest, uint64, uint64, *kv.ActiveTimestampToken, error) {
-	read, err := s.beginTxnReadTimestamp(ctx, s.readTS(), "s3 migration: begin")
+	request, snapshot, err := s.beginS3MigrationRead(ctx, "s3 migration: begin")
 	if err != nil {
 		return nil, nil, 0, 0, nil, err
 	}
+	defer request.Close()
+	ctx = request.Context()
+	read := snapshot.TransactionTimestamp()
 	ts := read.Timestamp()
 	pin := s.pinReadTS(ts)
 	fail := func(err error) (*s3MigrationIntent, *s3ObjectManifest, uint64, uint64, *kv.ActiveTimestampToken, error) {
 		pin.Release()
 		return nil, nil, 0, 0, nil, err
 	}
-	candidate, err := s.loadS3MigrationCandidateAt(ctx, bucket, object, ts)
+	candidate, err := s.loadS3MigrationCandidateAt(ctx, bucket, object, snapshot)
 	if err != nil {
 		return fail(err)
 	}
@@ -179,16 +200,17 @@ func (s *S3Server) beginS3LegacyMigration(ctx context.Context, bucket, object st
 	return &intent, candidate.manifest, candidate.generation, ts, pin, nil
 }
 
-func (s *S3Server) loadS3MigrationCandidateAt(ctx context.Context, bucket, object string, ts uint64) (*s3MigrationCandidate, error) {
+func (s *S3Server) loadS3MigrationCandidateAt(ctx context.Context, bucket, object string, snapshot kv.ReadSnapshot) (*s3MigrationCandidate, error) {
+	ts := snapshot.Timestamp()
 	meta, exists, err := s.loadBucketMetaAt(ctx, bucket, ts)
 	if err != nil || !exists || meta == nil {
 		return nil, err
 	}
 	markerKey := s3keys.MigrationIntentKey(bucket, meta.Generation, object)
-	if err := s.ensureS3MigrationIntentAbsentAt(ctx, markerKey, ts); err != nil {
+	if err := s.ensureS3MigrationIntentAbsentAt(ctx, markerKey, snapshot); err != nil {
 		return nil, err
 	}
-	manifest, raw, err := s.loadS3MigrationManifestAt(ctx, bucket, meta.Generation, object, ts)
+	manifest, raw, err := s.loadS3MigrationManifestAt(ctx, bucket, meta.Generation, object, snapshot)
 	if err != nil || manifest == nil {
 		return nil, err
 	}
@@ -202,8 +224,8 @@ func (s *S3Server) loadS3MigrationCandidateAt(ctx context.Context, bucket, objec
 	return &s3MigrationCandidate{manifest: manifest, raw: raw, generation: meta.Generation, parts: parts}, nil
 }
 
-func (s *S3Server) ensureS3MigrationIntentAbsentAt(ctx context.Context, markerKey []byte, ts uint64) error {
-	existing, err := s.loadS3MigrationIntentAt(ctx, markerKey, ts)
+func (s *S3Server) ensureS3MigrationIntentAbsentAt(ctx context.Context, markerKey []byte, snapshot kv.ReadSnapshot) error {
+	existing, err := s.loadS3MigrationIntentAt(ctx, markerKey, snapshot)
 	if err != nil {
 		return err
 	}
@@ -220,8 +242,8 @@ func validateS3MigrationCandidate(manifest *s3ObjectManifest, parts []s3Migratio
 	return validateS3MigrationParts(parts)
 }
 
-func (s *S3Server) loadS3MigrationManifestAt(ctx context.Context, bucket string, generation uint64, object string, ts uint64) (*s3ObjectManifest, []byte, error) {
-	raw, err := s.store.GetAt(ctx, s3keys.ObjectManifestKey(bucket, generation, object), ts)
+func (s *S3Server) loadS3MigrationManifestAt(ctx context.Context, bucket string, generation uint64, object string, snapshot kv.ReadSnapshot) (*s3ObjectManifest, []byte, error) {
+	raw, err := s.s3MigrationGet(ctx, snapshot, s3keys.ObjectManifestKey(bucket, generation, object))
 	if errors.Is(err, store.ErrKeyNotFound) {
 		return nil, nil, nil
 	}
@@ -256,20 +278,22 @@ func s3LegacyMigrationParts(manifest *s3ObjectManifest) ([]s3MigrationPart, erro
 
 func (s *S3Server) stageS3LegacyChunk(ctx context.Context, bucket string, generation uint64, object, uploadID string, part s3ObjectPart, chunkNo, size, sourceTS uint64, intent s3MigrationIntent) error {
 	refKey := s3keys.VersionedChunkRefKey(bucket, generation, object, uploadID, part.PartNo, chunkNo, intent.AttemptVersion)
-	legacyKey := s3keys.VersionedBlobKey(bucket, generation, object, uploadID, part.PartNo, chunkNo, part.PartVersion)
-	value, err := s.prepareS3MigrationChunkRef(ctx, legacyKey, refKey, size, sourceTS)
+	value, err := s.prepareS3MigrationChunkRef(ctx, bucket, generation, object, uploadID, part, chunkNo, refKey, size, sourceTS)
 	if err != nil {
 		return err
 	}
-	read, err := s.beginTxnReadTimestamp(ctx, s.readTS(), "s3 migration: stage ref")
+	request, snapshot, err := s.beginS3MigrationRead(ctx, "s3 migration: stage ref")
 	if err != nil {
 		return err
 	}
+	defer request.Close()
+	ctx = request.Context()
+	read := snapshot.TransactionTimestamp()
 	ts := read.Timestamp()
 	pin := s.pinReadTS(ts)
 	defer pin.Release()
 	markerKey := s3keys.MigrationIntentKey(bucket, generation, object)
-	current, err := s.loadS3MigrationIntentAt(ctx, markerKey, ts)
+	current, err := s.loadS3MigrationIntentAt(ctx, markerKey, snapshot)
 	if err != nil || current == nil || current.Phase != s3MigrationStaging || current.AttemptVersion != intent.AttemptVersion {
 		return errors.New("s3 migration stage lost its intent fence")
 	}
@@ -284,8 +308,8 @@ func (s *S3Server) stageS3LegacyChunk(ctx context.Context, bucket string, genera
 	})
 }
 
-func (s *S3Server) prepareS3MigrationChunkRef(ctx context.Context, legacyKey, refKey []byte, size, sourceTS uint64) ([]byte, error) {
-	payload, err := s.store.GetAt(ctx, legacyKey, sourceTS)
+func (s *S3Server) prepareS3MigrationChunkRef(ctx context.Context, bucket string, generation uint64, object, uploadID string, part s3ObjectPart, chunkNo uint64, refKey []byte, size, sourceTS uint64) ([]byte, error) {
+	payload, err := s.readLegacyS3ObjectChunk(ctx, bucket, generation, object, uploadID, part, chunkNo, sourceTS)
 	if err != nil {
 		return nil, errors.Wrap(err, "read legacy blob for migration")
 	}
@@ -309,19 +333,22 @@ func (s *S3Server) flipS3LegacyManifest(ctx context.Context, bucket string, gene
 	if err := s.ensureS3MigrationReady(ctx); err != nil {
 		return err
 	}
-	read, err := s.beginTxnReadTimestamp(ctx, s.readTS(), "s3 migration: flip")
+	request, snapshot, err := s.beginS3MigrationRead(ctx, "s3 migration: flip")
 	if err != nil {
 		return err
 	}
+	defer request.Close()
+	ctx = request.Context()
+	read := snapshot.TransactionTimestamp()
 	ts := read.Timestamp()
 	pin := s.pinReadTS(ts)
 	defer pin.Release()
 	markerKey := s3keys.MigrationIntentKey(bucket, generation, object)
-	current, err := s.loadS3MigrationIntentAt(ctx, markerKey, ts)
+	current, err := s.loadS3MigrationIntentAt(ctx, markerKey, snapshot)
 	if err != nil || current == nil || current.Phase != s3MigrationStaging || current.AttemptVersion != intent.AttemptVersion {
 		return errors.New("s3 migration flip lost its intent fence")
 	}
-	encodedManifest, err := s.buildS3MigrationManifestAt(ctx, bucket, generation, object, intent, ts)
+	encodedManifest, err := s.buildS3MigrationManifestAt(ctx, bucket, generation, object, intent, snapshot)
 	if err != nil {
 		return err
 	}
@@ -355,13 +382,14 @@ func (s *S3Server) ensureS3MigrationReady(ctx context.Context) error {
 	return nil
 }
 
-func (s *S3Server) buildS3MigrationManifestAt(ctx context.Context, bucket string, generation uint64, object string, intent s3MigrationIntent, ts uint64) ([]byte, error) {
+func (s *S3Server) buildS3MigrationManifestAt(ctx context.Context, bucket string, generation uint64, object string, intent s3MigrationIntent, snapshot kv.ReadSnapshot) ([]byte, error) {
+	ts := snapshot.Timestamp()
 	meta, exists, err := s.loadBucketMetaAt(ctx, bucket, ts)
 	if err != nil || !exists || meta == nil || meta.Generation != generation {
 		return nil, errors.New("s3 migration bucket generation changed")
 	}
 	headKey := s3keys.ObjectManifestKey(bucket, generation, object)
-	raw, err := s.store.GetAt(ctx, headKey, ts)
+	raw, err := s.s3MigrationGet(ctx, snapshot, headKey)
 	if err != nil || sha256.Sum256(raw) != intent.ManifestSHA256 {
 		return nil, errors.New("s3 migration manifest changed before flip")
 	}
@@ -378,8 +406,8 @@ func (s *S3Server) buildS3MigrationManifestAt(ctx context.Context, bucket string
 	return encodeS3ObjectManifest(manifest)
 }
 
-func (s *S3Server) loadS3MigrationIntentAt(ctx context.Context, key []byte, ts uint64) (*s3MigrationIntent, error) {
-	raw, err := s.store.GetAt(ctx, key, ts)
+func (s *S3Server) loadS3MigrationIntentAt(ctx context.Context, key []byte, snapshot kv.ReadSnapshot) (*s3MigrationIntent, error) {
+	raw, err := s.s3MigrationGet(ctx, snapshot, key)
 	if errors.Is(err, store.ErrKeyNotFound) {
 		return nil, nil
 	}
@@ -391,14 +419,17 @@ func (s *S3Server) loadS3MigrationIntentAt(ctx context.Context, key []byte, ts u
 }
 
 func (s *S3Server) abortS3MigrationIntent(ctx context.Context, key []byte, intent s3MigrationIntent) error {
-	read, err := s.beginTxnReadTimestamp(ctx, s.readTS(), "s3 migration: abort")
+	request, snapshot, err := s.beginS3MigrationRead(ctx, "s3 migration: abort")
 	if err != nil {
 		return err
 	}
+	defer request.Close()
+	ctx = request.Context()
+	read := snapshot.TransactionTimestamp()
 	ts := read.Timestamp()
 	pin := s.pinReadTS(ts)
 	defer pin.Release()
-	current, err := s.loadS3MigrationIntentAt(ctx, key, ts)
+	current, err := s.loadS3MigrationIntentAt(ctx, key, snapshot)
 	if err != nil || current == nil || current.Phase != s3MigrationStaging || current.AttemptVersion != intent.AttemptVersion {
 		return errors.New("s3 migration abort lost its intent fence")
 	}
@@ -422,11 +453,12 @@ func (s *S3Server) recoverS3MigrationIntent(ctx context.Context, key []byte) err
 	if !ok {
 		return errors.New("s3 migration marker key is malformed")
 	}
-	read, err := s.beginTxnReadTimestamp(ctx, s.readTS(), "s3 migration: recover")
+	request, snapshot, err := s.beginS3MigrationRead(ctx, "s3 migration: recover")
 	if err != nil {
 		return err
 	}
-	intent, err := s.loadS3MigrationIntentAt(ctx, key, read.Timestamp())
+	defer request.Close()
+	intent, err := s.loadS3MigrationIntentAt(request.Context(), key, snapshot)
 	if err != nil || intent == nil {
 		return err
 	}
@@ -481,14 +513,17 @@ func s3MigrationCleanupKey(bucket string, generation uint64, object string, inte
 
 func (s *S3Server) dispatchS3MigrationCleanupBatch(ctx context.Context, markerKey []byte, phase string, version uint64, elems []*kv.Elem[kv.OP]) error {
 	return s.retryS3Mutation(ctx, func() error {
-		read, err := s.beginTxnReadTimestamp(ctx, s.readTS(), "s3 migration: cleanup batch")
+		request, snapshot, err := s.beginS3MigrationRead(ctx, "s3 migration: cleanup batch")
 		if err != nil {
 			return errors.WithStack(err)
 		}
+		defer request.Close()
+		readCtx := request.Context()
+		read := snapshot.TransactionTimestamp()
 		ts := read.Timestamp()
 		pin := s.pinReadTS(ts)
 		defer pin.Release()
-		intent, err := s.loadS3MigrationIntentAt(ctx, markerKey, ts)
+		intent, err := s.loadS3MigrationIntentAt(readCtx, markerKey, snapshot)
 		if err != nil || intent == nil || intent.Phase != phase || intent.AttemptVersion != version {
 			return errors.New("s3 migration cleanup lost its intent fence")
 		}
@@ -496,7 +531,7 @@ func (s *S3Server) dispatchS3MigrationCleanupBatch(ctx context.Context, markerKe
 		if err != nil {
 			return err
 		}
-		return s.dispatchS3MetadataMutation(read.WithDispatchVoucher(ctx), &kv.OperationGroup[kv.OP]{
+		return s.dispatchS3MetadataMutation(read.WithDispatchVoucher(readCtx), &kv.OperationGroup[kv.OP]{
 			IsTxn: true, StartTS: ts, CommitTS: commitTS, ReadKeys: [][]byte{markerKey},
 			Elems: append([]*kv.Elem[kv.OP](nil), elems...),
 		})
@@ -504,14 +539,17 @@ func (s *S3Server) dispatchS3MigrationCleanupBatch(ctx context.Context, markerKe
 }
 
 func (s *S3Server) deleteS3MigrationIntent(ctx context.Context, key []byte, phase string, version uint64) error {
-	read, err := s.beginTxnReadTimestamp(ctx, s.readTS(), "s3 migration: finish")
+	request, snapshot, err := s.beginS3MigrationRead(ctx, "s3 migration: finish")
 	if err != nil {
 		return err
 	}
+	defer request.Close()
+	ctx = request.Context()
+	read := snapshot.TransactionTimestamp()
 	ts := read.Timestamp()
 	pin := s.pinReadTS(ts)
 	defer pin.Release()
-	current, err := s.loadS3MigrationIntentAt(ctx, key, ts)
+	current, err := s.loadS3MigrationIntentAt(ctx, key, snapshot)
 	if err != nil || current == nil || current.Phase != phase || current.AttemptVersion != version {
 		return errors.New("s3 migration cleanup lost its intent fence")
 	}
@@ -531,13 +569,12 @@ func (s *S3Server) recoverPendingS3Migrations(ctx context.Context) error {
 	start := []byte(s3keys.MigrationIntentPrefix)
 	end := prefixScanEnd(start)
 	for {
-		read, err := s.beginTxnReadTimestamp(ctx, s.readTS(), "s3 migration: scan")
+		request, snapshot, err := s.beginS3MigrationRead(ctx, "s3 migration: scan")
 		if err != nil {
 			return err
 		}
-		pin := s.pinReadTS(read.Timestamp())
-		rows, err := s.store.ScanKeysAt(ctx, start, end, s3MetaBatchOps, read.Timestamp())
-		pin.Release()
+		rows, err := request.ScanKeys(request.Context(), snapshot, start, end, s3MetaBatchOps)
+		request.Close()
 		if err != nil {
 			return errors.WithStack(err)
 		}

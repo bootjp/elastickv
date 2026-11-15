@@ -407,30 +407,10 @@ func (d *DynamoDBServer) transactGetItems(w http.ResponseWriter, r *http.Request
 }
 
 func (d *DynamoDBServer) fencedTransactGetReadTS(ctx context.Context, groupKeys [][]byte) (uint64, error) {
-	if len(groupKeys) == 0 {
-		// Validation will fail before a store read for malformed requests.
-		return d.nextTxnReadTS(), nil
-	}
 	fenceCtx, cancel := context.WithTimeout(ctx, dynamoLeaseReadTimeout)
 	defer cancel()
-	var (
-		readTS uint64
-		err    error
-	)
-	if floor, ok := d.store.(keyedCommittedTimestampFloorProvider); ok {
-		readTS, err = floor.CommittedTimestampFloorForKeys(fenceCtx, groupKeys)
-	} else if floor, ok := d.store.(committedTimestampFloorProvider); ok {
-		readTS, err = floor.GlobalCommittedTimestampFloor(fenceCtx)
-	} else {
-		_, err = d.coordinator.LinearizableRead(fenceCtx)
-		if err == nil {
-			readTS = d.nextTxnReadTS()
-		}
-	}
-	if readTS == 0 {
-		readTS = 1
-	}
-	return readTS, errors.WithStack(err)
+	stamp, err := beginFencedReadSnapshot(fenceCtx, d.coordinator, d.store, "dynamodb transact get", groupKeys...)
+	return stamp.Timestamp(), err
 }
 
 func decodeTransactGetItemsInput(bodyReader io.Reader) (transactGetItemsInput, error) {
@@ -1261,11 +1241,9 @@ func nextTransactRetryBackoff(current time.Duration) time.Duration {
 var errTableGenerationChanged = errors.New("table generation changed")
 
 func (d *DynamoDBServer) verifyTableGeneration(ctx context.Context, tableName string, expectedGeneration uint64) error {
-	// Use consistentReadLatestTS to always read the latest committed schema.
-	// Using a stale snapshotTS can cause false "table not found" results when
-	// this node's LastCommitTS is behind the table creation timestamp, which
-	// would erroneously trigger cleanupCommittedKeys and delete live item data.
-	schema, exists, err := d.loadTableSchemaAt(ctx, tableName, consistentReadLatestTS)
+	// A post-commit generation check needs a new fenced boundary, not an
+	// unissued numeric "latest" sentinel carried through this request.
+	schema, exists, err := d.loadTableSchema(ctx, tableName)
 	if err != nil {
 		return errors.WithStack(err)
 	}

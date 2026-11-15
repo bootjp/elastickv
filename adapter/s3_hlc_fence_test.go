@@ -66,9 +66,12 @@ func TestS3BeginTxnReadTimestampPhaseDPreservesAppliedWatermark(t *testing.T) {
 	allocator := &distributionTSOAllocator{base: 100, phaseD: true, phaseDFloor: 10}
 	coord := newDistributionCoordinatorStub(nil, true)
 	coord.allocator = allocator
-	srv := &S3Server{coordinator: coord}
+	st := store.NewMVCCStore()
+	t.Cleanup(func() { _ = st.Close() })
+	require.NoError(t, st.PutAt(t.Context(), []byte("key"), []byte("v"), 42, 0))
+	srv := &S3Server{coordinator: coord, store: st}
 
-	readTimestamp, err := srv.beginTxnReadTimestamp(context.Background(), 42, "test")
+	readTimestamp, err := srv.beginTxnReadTimestamp(context.Background(), "test")
 	require.NoError(t, err)
 	require.Equal(t, uint64(42), readTimestamp.Timestamp())
 	require.Zero(t, allocator.count, "an applied Phase-D read watermark must not allocate ahead of Raft apply")
@@ -82,7 +85,7 @@ func TestS3BeginTxnReadTimestampPhaseDNormalizesEmptySnapshotSentinel(t *testing
 	coord.allocator = allocator
 	srv := &S3Server{coordinator: coord}
 
-	readTimestamp, err := srv.beginTxnReadTimestamp(context.Background(), ^uint64(0), "test")
+	readTimestamp, err := srv.beginTxnReadTimestamp(context.Background(), "test")
 	require.NoError(t, err)
 	require.Equal(t, uint64(1), readTimestamp.Timestamp())
 	require.Zero(t, allocator.count, "an empty S3 snapshot must not allocate ahead of Raft apply")

@@ -305,10 +305,14 @@ func (w *s3LegacyBlobMigrationWorker) processCandidatePage(ctx context.Context, 
 }
 
 func (w *s3LegacyBlobMigrationWorker) scanCandidatePage(ctx context.Context, s *S3Server, end []byte, limit int) ([][]byte, error) {
-	readTS := s.readTS()
-	pin := s.pinReadTS(readTS)
-	defer pin.Release()
-	keys, err := s.store.ScanKeysAt(ctx, w.cursor, end, limit, readTS)
+	readRequest := s.newReadRequest(ctx)
+	defer readRequest.Close()
+	readCtx := readRequest.Context()
+	snapshot, err := readRequest.Latest(readCtx, "s3 legacy migration candidate scan")
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	keys, err := readRequest.ScanKeys(readCtx, snapshot, w.cursor, end, limit)
 	return keys, errors.WithStack(err)
 }
 
@@ -321,7 +325,12 @@ func (w *s3LegacyBlobMigrationWorker) migrateCandidate(ctx context.Context, s *S
 	if !ok {
 		return errors.New("s3 legacy migration found malformed manifest key")
 	}
-	meta, exists, err := s.loadBucketMetaAt(ctx, bucket, s.readTS())
+	request, snapshot, err := s.beginS3MigrationRead(ctx, "s3 migration: candidate bucket")
+	if err != nil {
+		return err
+	}
+	meta, exists, err := s.loadBucketMetaAt(request.Context(), bucket, snapshot.Timestamp())
+	request.Close()
 	if err != nil {
 		return err
 	}

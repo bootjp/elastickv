@@ -35,6 +35,10 @@ type AdminGSISummary struct {
 // counterpart to the listTables HTTP handler; both share the same
 // underlying lookup so the two views cannot drift.
 func (d *DynamoDBServer) AdminListTables(ctx context.Context) ([]string, error) {
+	readRequest := d.newReadRequest(ctx)
+	defer readRequest.Close()
+	ctx = readRequest.Context()
+
 	return d.listTableNames(ctx)
 }
 
@@ -54,6 +58,10 @@ func (d *DynamoDBServer) AdminListTables(ctx context.Context) ([]string, error) 
 // snapshot for display, not a guarantee that the table is
 // up-to-date for serving.
 func (d *DynamoDBServer) AdminDescribeTable(ctx context.Context, name string) (*AdminTableSummary, bool, error) {
+	readRequest := d.newReadRequest(ctx)
+	defer readRequest.Close()
+	ctx = readRequest.Context()
+
 	schema, exists, err := d.loadTableSchema(ctx, name)
 	if err != nil {
 		return nil, false, err
@@ -209,6 +217,10 @@ type AdminCreateTableInput struct {
 //     map the inner code (ValidationException, ResourceInUseException,
 //     etc.) to the appropriate status without re-classifying.
 func (d *DynamoDBServer) AdminCreateTable(ctx context.Context, principal AdminPrincipal, in AdminCreateTableInput) (*AdminTableSummary, error) {
+	readRequest := d.newReadRequest(ctx)
+	defer readRequest.Close()
+	ctx = readRequest.Context()
+
 	if !principal.Role.canWrite() {
 		return nil, ErrAdminForbidden
 	}
@@ -256,6 +268,10 @@ func (d *DynamoDBServer) AdminCreateTable(ctx context.Context, principal AdminPr
 // adapter's standard dynamoErrResourceNotFound when the table is
 // absent — admin handlers should map that to 404 rather than 500.
 func (d *DynamoDBServer) AdminDeleteTable(ctx context.Context, principal AdminPrincipal, name string) error {
+	readRequest := d.newReadRequest(ctx)
+	defer readRequest.Close()
+	ctx = readRequest.Context()
+
 	if !principal.Role.canWrite() {
 		return ErrAdminForbidden
 	}

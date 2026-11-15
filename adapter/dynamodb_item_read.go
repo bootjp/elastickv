@@ -51,7 +51,11 @@ func (d *DynamoDBServer) getItem(w http.ResponseWriter, r *http.Request) {
 	// Tentative TS for schema resolution only; schemas change rarely
 	// so a slight pre-lease stale is acceptable. The item read below
 	// is sampled AFTER the lease check.
-	tentativeTS := d.resolveDynamoReadTS(in.ConsistentRead)
+	tentativeTS, err := d.resolveDynamoReadSnapshot(r.Context(), in.ConsistentRead, dynamoTableMetaKey(in.TableName))
+	if err != nil {
+		writeDynamoErrorFromErr(w, err)
+		return
+	}
 	_, itemKey, ok := d.resolveGetItemTarget(w, r, in, tentativeTS)
 	if !ok {
 		return
@@ -74,7 +78,11 @@ func (d *DynamoDBServer) getItem(w http.ResponseWriter, r *http.Request) {
 	// visible. Sampling earlier would violate linearizability for
 	// ConsistentRead=false reads by returning a snapshot from before
 	// the most recent confirmed commit.
-	readTS := d.resolveDynamoReadTS(in.ConsistentRead)
+	readTS, err := d.resolveDynamoReadSnapshot(r.Context(), in.ConsistentRead, dynamoTableMetaKey(in.TableName), itemKey)
+	if err != nil {
+		writeDynamoErrorFromErr(w, err)
+		return
+	}
 	// Pin readTS so concurrent MVCC GC cannot reclaim versions
 	// between the schema revalidation and the item read below;
 	// matches the pattern already used by queryItems / scanItems /
@@ -82,6 +90,10 @@ func (d *DynamoDBServer) getItem(w http.ResponseWriter, r *http.Request) {
 	readPin := d.pinReadTS(readTS)
 	defer readPin.Release()
 
+	d.finishGetItem(w, r, in, itemKey, readTS)
+}
+
+func (d *DynamoDBServer) finishGetItem(w http.ResponseWriter, r *http.Request, in getItemInput, itemKey []byte, readTS uint64) {
 	// Re-resolve schema + itemKey at readTS and verify that the key
 	// we lease-checked is STILL the key that will be read. A table
 	// migration that commits between the tentative schema load and
@@ -140,7 +152,7 @@ func (d *DynamoDBServer) resolveGetItemTarget(w http.ResponseWriter, r *http.Req
 
 func (d *DynamoDBServer) readItemAtKeyAt(ctx context.Context, key []byte, ts uint64) (map[string]attributeValue, bool, error) {
 	kv.ObserveReadForKeyThrough(d.coordinator, ctx, key)
-	b, err := d.store.GetAt(ctx, key, ts)
+	b, err := requestGetAt(ctx, d.store, key, ts)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return nil, false, nil

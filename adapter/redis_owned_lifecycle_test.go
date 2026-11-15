@@ -113,6 +113,23 @@ func TestRedisOwnedBlockingCancellationReleasesWaiters(t *testing.T) {
 			s, owner := redisPropagationServer(t)
 			ctx, cancel := context.WithCancel(owner.ctx)
 			owner.ctx = ctx
+			// Cancel during an actual registered blocking read. Canceling
+			// immediately after spawning raced the active-context assertions
+			// in the propagation fixture and could skip waiter registration.
+			entered := make(chan struct{})
+			var once sync.Once
+			reads, ok := s.store.(*redisOwnershipReadStore)
+			require.True(t, ok)
+			reads.onRead = func(readCtx context.Context) {
+				require.Equal(t, "propagated", readCtx.Value(redisOwnershipTestKey{}))
+				once.Do(func() { close(entered) })
+				<-readCtx.Done()
+			}
+			registry := s.zsetWaiters
+			if name == cmdXRead {
+				registry = s.streamWaiters
+			}
+
 			args := []string{cmdBZPopMin, "missing", "10"}
 			if name == cmdXRead {
 				args = []string{cmdXRead, "BLOCK", "10000", "STREAMS", "missing", "0-0"}
@@ -124,6 +141,16 @@ func TestRedisOwnedBlockingCancellationReleasesWaiters(t *testing.T) {
 			c := &redisOwnedTestConn{}
 			done := make(chan struct{})
 			go func() { defer close(done); s.dispatchCommand(c, name, s.route[name], cmd, time.Now()) }()
+			select {
+			case <-entered:
+			case <-time.After(time.Second):
+				cancel()
+				t.Fatal("blocking request did not reach storage")
+			}
+			registry.mu.Lock()
+			registered := len(registry.waiters["missing"])
+			registry.mu.Unlock()
+			require.Equal(t, 1, registered)
 			cancel()
 			select {
 			case <-done:
@@ -134,6 +161,10 @@ func TestRedisOwnedBlockingCancellationReleasesWaiters(t *testing.T) {
 			require.Len(t, c.writes, 1)
 			require.Equal(t, 1, owner.finishes)
 			require.Equal(t, 1, owner.joins)
+			registry.mu.Lock()
+			remaining := len(registry.waiters["missing"])
+			registry.mu.Unlock()
+			require.Zero(t, remaining)
 		})
 	}
 }

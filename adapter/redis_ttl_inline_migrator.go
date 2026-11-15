@@ -372,14 +372,14 @@ func (c *DeltaCompactor) scanTTLInlineMigrationRaw(
 	page := ttlInlineMigrationPage{fromStart: len(cur) == 0, snapshotAt: snapshotAt}
 	end := store.PrefixScanEnd(h.prefix)
 	if plan.scanner != nil {
-		kvs, resume, err := plan.scanner.ScanGroupOwnedAt(ctx, plan.groupID, start, end, ttlInlineMigrationTickScanLimit, readTS)
+		kvs, resume, err := requestScanGroupOwnedAt(ctx, plan.scanner, plan.groupID, start, end, ttlInlineMigrationTickScanLimit, readTS)
 		if err != nil {
 			return ttlInlineMigrationPage{}, errors.WithStack(err)
 		}
 		page.kvs, page.cursorKey, page.truncated = kvs, resume, resume != nil
 		return page, nil
 	}
-	kvs, err := c.st.ScanAt(ctx, start, end, ttlInlineMigrationTickScanLimit, readTS)
+	kvs, err := requestScanAt(ctx, c.st, start, end, ttlInlineMigrationTickScanLimit, readTS)
 	if err != nil {
 		return ttlInlineMigrationPage{}, errors.WithStack(err)
 	}
@@ -612,7 +612,7 @@ func collectionBaseMetaExistsAt(ctx context.Context, st store.MVCCStore, userKey
 	case redisTypeStream:
 		metaKey = store.StreamMetaKey(userKey)
 	}
-	exists, err := st.ExistsAt(ctx, metaKey, readTS)
+	exists, err := requestExistsAt(ctx, st, metaKey, readTS)
 	return exists, errors.WithStack(err)
 }
 
@@ -639,7 +639,7 @@ func (c *DeltaCompactor) legacyCollectionTTLInlineElems(
 }
 
 func (c *DeltaCompactor) legacyHashTTLInlineElems(ctx context.Context, userKey []byte, ttlMs uint64, readTS uint64) ([]*kv.Elem[kv.OP], error) {
-	raw, err := c.st.GetAt(ctx, redisHashKey(userKey), readTS)
+	raw, err := requestGetAt(ctx, c.st, redisHashKey(userKey), readTS)
 	if errors.Is(err, store.ErrKeyNotFound) {
 		return nil, nil
 	}
@@ -670,7 +670,7 @@ func (c *DeltaCompactor) legacyHashTTLInlineElems(ctx context.Context, userKey [
 }
 
 func (c *DeltaCompactor) legacySetTTLInlineElems(ctx context.Context, userKey []byte, ttlMs uint64, readTS uint64) ([]*kv.Elem[kv.OP], error) {
-	raw, err := c.st.GetAt(ctx, redisSetKey(userKey), readTS)
+	raw, err := requestGetAt(ctx, c.st, redisSetKey(userKey), readTS)
 	if errors.Is(err, store.ErrKeyNotFound) {
 		return nil, nil
 	}
@@ -701,7 +701,7 @@ func (c *DeltaCompactor) legacySetTTLInlineElems(ctx context.Context, userKey []
 }
 
 func (c *DeltaCompactor) legacyZSetTTLInlineElems(ctx context.Context, userKey []byte, ttlMs uint64, readTS uint64) ([]*kv.Elem[kv.OP], error) {
-	raw, err := c.st.GetAt(ctx, redisZSetKey(userKey), readTS)
+	raw, err := requestGetAt(ctx, c.st, redisZSetKey(userKey), readTS)
 	if errors.Is(err, store.ErrKeyNotFound) {
 		return nil, nil
 	}
@@ -739,7 +739,7 @@ func (c *DeltaCompactor) legacyZSetTTLInlineElems(ctx context.Context, userKey [
 }
 
 func (c *DeltaCompactor) legacyStreamTTLInlineElems(ctx context.Context, userKey []byte, ttlMs uint64, readTS uint64) ([]*kv.Elem[kv.OP], error) {
-	_, err := c.st.GetAt(ctx, redisStreamKey(userKey), readTS)
+	_, err := requestGetAt(ctx, c.st, redisStreamKey(userKey), readTS)
 	if errors.Is(err, store.ErrKeyNotFound) {
 		return nil, nil
 	}
@@ -825,7 +825,7 @@ func isLegacyWideMeta(raw []byte) bool {
 }
 
 func legacyTTLMillisAt(ctx context.Context, st store.MVCCStore, userKey []byte, readTS uint64) (uint64, error) {
-	raw, err := st.GetAt(ctx, redisTTLKey(userKey), readTS)
+	raw, err := requestGetAt(ctx, st, redisTTLKey(userKey), readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return 0, nil
@@ -870,7 +870,7 @@ func appendTTLIndexSyncElem(
 }
 
 func ttlIndexSyncElem(ctx context.Context, st store.MVCCStore, userKey []byte, ttlMs uint64, readTS uint64) (*kv.Elem[kv.OP], error) {
-	raw, err := st.GetAt(ctx, redisTTLKey(userKey), readTS)
+	raw, err := requestGetAt(ctx, st, redisTTLKey(userKey), readTS)
 	if ttlMs == 0 {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return nil, nil
