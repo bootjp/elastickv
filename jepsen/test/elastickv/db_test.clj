@@ -181,7 +181,7 @@
         (is (= :already-running
                (#'db/start-node! {:nodes ["n1"]} "n1"
                                 {:grpc-port 50051 :redis-port 6379 :data-dir "/data"
-                                 :filesystem-mount "/mount"})))
+                                 :filesystem-mount "/mount" :filesystem-strict true})))
         (is (empty? @events))))))
 
 (deftest restarting-a-stopped-filesystem-node-prepares-before-start
@@ -197,5 +197,23 @@
         (is (= :started
                (#'db/start-node! {:nodes ["n1"]} "n1"
                                 {:grpc-port 50051 :redis-port 6379 :data-dir "/data"
-                                 :filesystem-mount "/mount"})))
+                                 :filesystem-mount "/mount" :filesystem-strict true})))
         (is (= [:unmount :start] @events))))))
+
+(deftest strict-filesystem-starts-enable-journal-and-stopped-owner-recovery
+  (doseq [strict? [false true]
+          mount-dir [nil "/mount"]]
+    (let [started (atom nil)]
+      (with-redefs-fn
+        {#'c/session (constantly :test-session)
+         #'c/disconnect (constantly nil)
+         #'c/exec (constantly nil)
+         #'cu/daemon-running? (constantly false)
+         #'db/prepare-filesystem-mount! (constantly nil)
+         #'cu/start-daemon! (fn [_ _ & args] (reset! started (set args)))}
+        (fn []
+          (#'db/start-node! {:nodes ["n1"]} "n1"
+                           {:grpc-port 50051 :redis-port 6379 :data-dir "/data"
+                            :filesystem-mount mount-dir :filesystem-strict strict?})))
+      (doseq [flag ["--filesystemStrict" "--filesystemStrictRecover"]]
+        (is (= (boolean (and strict? mount-dir)) (contains? @started flag)))))))

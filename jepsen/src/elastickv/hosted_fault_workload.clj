@@ -232,11 +232,12 @@
                                     :encryption (:encryption opts)
                                     :sqs-region "us-east-1"}
                              db-port (assoc db-port port)
-                             mount-dir (assoc :filesystem-mount mount-dir)))
+                             mount-dir (assoc :filesystem-mount mount-dir :filesystem-strict true)))
           workload (workload (assoc opts :key-count key-count :sqs-region "us-east-1"
                                          :node->port (zipmap nodes (repeat client-port))
                                          :grpc-api grpc-api :grpc-client-bin (db/grpc-client-binary)
                                          :write-mode write-mode
+                                         :filesystem-strict (boolean mount-dir)
                                          :node->mount-dir (zipmap nodes (repeat mount-dir))))
           touched-keys (atom (set (range key-count)))
           [_ stop] (fault-ops fault)]
@@ -247,6 +248,7 @@
              :disable-sdk-retries true
              :db managed-db
              :write-mode write-mode
+             :filesystem-strict (boolean mount-dir)
              ;; Images contain all dependencies. Debian OS setup manages system
              ;; services and /etc/hosts, which Docker owns on these nodes.
              :os os/noop

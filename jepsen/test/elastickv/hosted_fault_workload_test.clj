@@ -235,3 +235,13 @@
       (is (= (zipmap nodes (repeat 51515)) (get-in test [:client :delegate :node->port])))
       (is (= "n1=n1:51515,n2=n2:51515,n3=n3:51515"
              (get-in test [:db :opts :bootstrap-members]))))))
+
+(deftest managed-filesystem-recovery-requires-journaled-mutations
+  (doseq [adapter [:filesystem-overwrite :filesystem-rename]
+          fault [:partition :kill :pause]]
+    (let [test (hosted/hosted-fault-test (assoc opts :adapter adapter :faults [fault]))]
+      (is (true? (get-in test [:db :opts :filesystem-strict])))
+      (is (true? (:filesystem-strict test)))))
+  (doseq [adapter [:redis :dynamodb :s3 :grpc-raw :grpc-transactional :sqs-standard :sqs-htfifo]]
+    (is (nil? (get-in (hosted/hosted-fault-test (assoc opts :adapter adapter))
+                     [:db :opts :filesystem-strict])))))

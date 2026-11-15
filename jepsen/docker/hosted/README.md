@@ -180,7 +180,21 @@ transactions: PreWrite/Commit/Rollback are unimplemented, so this suite checks
 its supported Get/Put calls individually.
 
 Filesystem fault jobs use actual node-local FUSE mounts and SSH file operations,
-including overwrite and rename modes. Only those jobs apply `compose.fuse.yml`,
+including overwrite and rename modes. These fault jobs use `--filesystemStrict`
+so every supported mutation has a durable operation identity. An indeterminate
+write keeps its inode barrier closed until journal verification and reply-bound
+acknowledgement establish a terminal decision; recovery never assigns the write a new operation identity.
+Legacy mode deliberately requires a remount after an unjournaled unknown outcome
+and therefore cannot satisfy this suite's live recovery requirement. Existing
+normal legacy workloads remain enabled.
+
+Stopped nodes also use `--filesystemStrictRecover` to fence and recover their
+previous mount session before registering a replacement. The stable owner is the
+node's Raft ID; healthy peers are not restarted or recovered by a heal-all call.
+The managed startup checks the old daemon is stopped and unmounts its stale FUSE
+mount before launching a replacement. Node mount logs record strict/recovery mode.
+
+Only those jobs apply `compose.fuse.yml`,
 which exposes `/dev/fuse`, adds SYS_ADMIN and disables the container AppArmor
 profile for mount operations. Other adapter containers retain their existing
 capabilities. A missing FUSE device fails rather than testing a plain directory.
