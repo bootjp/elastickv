@@ -207,7 +207,7 @@ func (r *RedisServer) emptyWideCollectionCleanupForRecreate(ctx context.Context,
 		{store.SetMetaKey(key), store.SetMetaDeltaScanPrefix(key)},
 		{store.ZSetMetaKey(key), store.ZSetMetaDeltaScanPrefix(key)},
 	} {
-		meta, err := r.store.ExistsAt(ctx, keys.meta, readTS)
+		meta, err := r.prefixExistsAt(ctx, keys.meta, readTS)
 		if err != nil {
 			return nil, false, errors.WithStack(err)
 		}
