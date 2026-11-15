@@ -21,6 +21,8 @@ service Internal {
   rpc IssueBoundTimestamp(IssueBoundTimestampRequest) returns (IssueBoundTimestampResponse) {}
   rpc LookupTimestampBinding(LookupTimestampBindingRequest) returns (LookupTimestampBindingResponse) {}
   rpc ProposeTwoGroupPrepare(ProposeTwoGroupPrepareRequest) returns (ProposeTwoGroupPrepareResponse) {}
+  rpc VerifyTwoGroupPrepare(VerifyTwoGroupPrepareRequest) returns (VerifyTwoGroupPrepareResponse) {}
+  rpc ProposeTwoGroupTerminal(ProposeTwoGroupTerminalRequest) returns (ProposeTwoGroupTerminalResponse) {}
 }
 
 // internal.proto is node to node communication message in raft replication.
@@ -487,6 +489,25 @@ message ProposeTwoGroupPrepareRequest {
 }
 
 message ProposeTwoGroupPrepareResponse {
+  uint64 commit_index = 1;
+  uint64 leader_term = 2;
+}
+
+message VerifyTwoGroupPrepareRequest {
+  TwoGroupPrepareManifest manifest = 1;
+}
+
+message VerifyTwoGroupPrepareResponse {
+  uint64 applied_index = 1;
+  uint64 leader_term = 2;
+}
+
+message ProposeTwoGroupTerminalRequest {
+  TwoGroupPrepareManifest manifest = 1;
+  Phase decision = 2;
+}
+
+message ProposeTwoGroupTerminalResponse {
   uint64 commit_index = 1;
   uint64 leader_term = 2;
 }

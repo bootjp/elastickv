@@ -182,6 +182,8 @@ type Internal struct {
 	twoGroupPrepareToken            string
 	twoGroupPrepareProposer         raftengine.TermFencedProposer
 	twoGroupPrepareHomeLookup       func(uint64) (*TwoGroupHomePeerLookup, error)
+	twoGroupTerminalMetadata        store.RaftControlMetadataStore
+	twoGroupTerminalSecondary       func(uint64) (*TwoGroupTerminalPeer, error)
 	adminProposer                   raftengine.Proposer
 	bootstrapPolicyProposer         raftengine.Proposer
 	prepareStartupAuthorization     func(context.Context, *pb.PrepareEvidenceStateRequest) bool

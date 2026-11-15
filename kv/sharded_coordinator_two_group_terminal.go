@@ -9,20 +9,19 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-// decideTwoGroup is a trusted, opt-in local-leader terminal path. Both data
-// group leaders must be local; a remote leader leaves the transaction pending.
-// It does not install a public Forward route or relax the legacy terminal fence.
+// decideTwoGroup is a trusted, opt-in terminal path. It does not install a
+// public Forward route or relax the legacy terminal fence.
 func (c *ShardedCoordinator) decideTwoGroup(ctx context.Context, manifest *pb.TwoGroupPrepareManifest, decision pb.Phase) error {
 	primary, secondary, lookup, err := c.twoGroupDecisionInputs(manifest, decision)
 	if err != nil {
 		return err
 	}
-	if err := c.requireLocalTwoGroupPrepare(ctx, primary, manifest); err != nil {
+	if err := c.requireTwoGroupPrepare(ctx, primary, manifest); err != nil {
 		return err
 	}
 	// No primary COMMIT may become durable before the secondary PREPARE.
 	if decision == pb.Phase_COMMIT {
-		if err := c.requireLocalTwoGroupPrepare(ctx, secondary, manifest); err != nil {
+		if err := c.requireTwoGroupPrepare(ctx, secondary, manifest); err != nil {
 			return err
 		}
 	}
@@ -34,10 +33,34 @@ func (c *ShardedCoordinator) decideTwoGroup(ctx context.Context, manifest *pb.Tw
 	if err != nil {
 		return errors.Join(ErrTransactionOutcomeUnknown, err)
 	}
-	if err := c.requireLocalTwoGroupPrepare(ctx, secondary, manifest); err != nil {
+	if err := c.requireTwoGroupPrepare(ctx, secondary, manifest); err != nil {
 		return errors.Join(ErrTransactionOutcomeUnknown, err)
 	}
 	return c.proposeOrReconcileTwoGroupDecision(ctx, secondary, manifest, decision, observed, lookup)
+}
+
+// TwoGroupRemoteTerminal is a private peer-session route, not a public
+// transaction API. A remote leader verifies its own PREPARE and home decision.
+type TwoGroupRemoteTerminal interface {
+	VerifyTwoGroupPrepareOnLeader(context.Context, uint64, *pb.TwoGroupPrepareManifest) error
+	DecideTwoGroupOnLeader(context.Context, uint64, *pb.TwoGroupPrepareManifest, pb.Phase) error
+}
+
+func (c *ShardedCoordinator) WithTwoGroupRemoteTerminal(resolve func(uint64) (TwoGroupRemoteTerminal, error)) *ShardedCoordinator {
+	c.twoGroupRemoteTerminal = resolve
+	return c
+}
+
+func (c *ShardedCoordinator) requireTwoGroupPrepare(ctx context.Context, group uint64, manifest *pb.TwoGroupPrepareManifest) error {
+	err := c.requireLocalTwoGroupPrepare(ctx, group, manifest)
+	if !errors.Is(err, raftengine.ErrNotLeader) || c.twoGroupRemoteTerminal == nil {
+		return err
+	}
+	remote, resolveErr := c.twoGroupRemoteTerminal(group)
+	if resolveErr != nil || remote == nil {
+		return errors.Join(ErrTwoGroupAdmission, resolveErr)
+	}
+	return errors.Wrap(remote.VerifyTwoGroupPrepareOnLeader(ctx, group, manifest), "verify remote two-group PREPARE")
 }
 
 func (c *ShardedCoordinator) twoGroupDecisionInputs(manifest *pb.TwoGroupPrepareManifest,
@@ -155,7 +178,7 @@ func (c *ShardedCoordinator) proposeTwoGroupTerminal(ctx context.Context, group 
 	manifest *pb.TwoGroupPrepareManifest, decision pb.Phase, observed TwoGroupDecisionObservation) error {
 	proposer, term, err := c.localTwoGroupProposer(ctx, group)
 	if err != nil {
-		return err
+		return c.proposeRemoteTwoGroupTerminal(ctx, group, manifest, decision, err)
 	}
 	data, err := marshalTwoGroupTerminalEntry(group, manifest, decision, observed)
 	if err != nil {
@@ -172,4 +195,16 @@ func (c *ShardedCoordinator) proposeTwoGroupTerminal(ctx context.Context, group 
 		return errors.WithStack(ErrRaftEntryApply)
 	}
 	return nil
+}
+
+func (c *ShardedCoordinator) proposeRemoteTwoGroupTerminal(ctx context.Context, group uint64,
+	manifest *pb.TwoGroupPrepareManifest, decision pb.Phase, localErr error) error {
+	if !errors.Is(localErr, raftengine.ErrNotLeader) || c.twoGroupRemoteTerminal == nil {
+		return localErr
+	}
+	remote, err := c.twoGroupRemoteTerminal(group)
+	if err != nil || remote == nil {
+		return errors.Join(ErrTransactionOutcomeUnknown, err)
+	}
+	return errors.Wrap(remote.DecideTwoGroupOnLeader(ctx, group, manifest, decision), "propose remote two-group terminal")
 }

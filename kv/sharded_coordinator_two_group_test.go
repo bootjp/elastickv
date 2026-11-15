@@ -35,6 +35,36 @@ type twoGroupRemoteTestPeer struct {
 	calls  int
 }
 
+type twoGroupRemoteTerminalTestPeer struct {
+	group        uint64
+	engine       *twoGroupNativeEngine
+	metadata     store.RaftControlMetadataStore
+	home         TwoGroupDecisionLookup
+	secondary    func(context.Context, uint64, *pb.TwoGroupPrepareManifest) error
+	failDecision error
+}
+
+func (p *twoGroupRemoteTerminalTestPeer) VerifyTwoGroupPrepareOnLeader(ctx context.Context, group uint64, manifest *pb.TwoGroupPrepareManifest) error {
+	if group != p.group {
+		return ErrTwoGroupAdmission
+	}
+	_, _, err := VerifyTwoGroupPrepareOnLeader(ctx, group, manifest, p.engine, p.metadata,
+		func(context.Context) error { return nil })
+	return err
+}
+
+func (p *twoGroupRemoteTerminalTestPeer) DecideTwoGroupOnLeader(ctx context.Context, group uint64, manifest *pb.TwoGroupPrepareManifest, decision pb.Phase) error {
+	if group != p.group {
+		return ErrTwoGroupAdmission
+	}
+	if p.failDecision != nil {
+		return p.failDecision
+	}
+	_, _, err := ProposeTwoGroupTerminalOnLeader(ctx, group, manifest, decision, p.engine, p.engine,
+		p.metadata, p.home, p.secondary, func(context.Context) error { return nil })
+	return err
+}
+
 func (p *twoGroupRemoteTestPeer) PrepareTwoGroupOnLeader(ctx context.Context, group uint64, manifest *pb.TwoGroupPrepareManifest) error {
 	p.calls++
 	if group != p.group {
@@ -142,6 +172,122 @@ func (l twoGroupNativeLookup) LookupTwoGroupDecision(ctx context.Context, id [16
 		return nil, 0, 0, errors.Join(ErrTransactionOutcomeUnknown, err)
 	}
 	return raw, l.engine.index, l.engine.term, nil
+}
+
+func prepareDerivedTwoGroupTerminalFSMs(t *testing.T) (*kvFSM, *kvFSM, store.RaftControlMetadataStore, store.RaftControlMetadataStore, *pb.TwoGroupPrepareManifest) {
+	t.Helper()
+	home, homeMetadata := twoGroupEntryFSM(t, 1)
+	secondary, secondaryMetadata := twoGroupEntryFSM(t, 2)
+	manifest := twoGroupPrepareFixture()
+	id := twoGroupOperationID([]byte("home-key"), manifest.GetParticipants()[0].GetPrepare().GetTs())
+	manifest.OperationId = id[:]
+	homeEntry, err := marshalTwoGroupPrepareEntry(1, manifest, TwoGroupAdmissionObservation{})
+	require.NoError(t, err)
+	require.Nil(t, applyTwoGroupTestEntry(t, home, 2, 1, homeEntry))
+	observed, err := ObserveTwoGroupHome(t.Context(), localTwoGroupHomeLookup{store: homeMetadata, barrier: 2, term: 1}, manifest)
+	require.NoError(t, err)
+	secondaryEntry, err := marshalTwoGroupPrepareEntry(2, manifest, observed)
+	require.NoError(t, err)
+	require.Nil(t, applyTwoGroupTestEntry(t, secondary, 2, 1, secondaryEntry))
+	return home, secondary, homeMetadata, secondaryMetadata, manifest
+}
+
+func manifestOperationID(manifest *pb.TwoGroupPrepareManifest) [16]byte {
+	var id [16]byte
+	copy(id[:], manifest.GetOperationId())
+	return id
+}
+
+func TestTwoGroupRemotePrimaryTerminalReconcilesLostReply(t *testing.T) {
+	home, secondary, homeMetadata, secondaryMetadata, manifest := prepareDerivedTwoGroupTerminalFSMs(t)
+	homeEngine := &twoGroupNativeEngine{f: home, index: 2, term: 2, lostReply: true}
+	secondaryEngine := &twoGroupNativeEngine{f: secondary, index: 2, term: 3}
+	lookup := twoGroupNativeLookup{metadata: homeMetadata, engine: homeEngine}
+	remote := &twoGroupRemoteTerminalTestPeer{group: 1, engine: homeEngine, metadata: homeMetadata,
+		secondary: func(ctx context.Context, group uint64, m *pb.TwoGroupPrepareManifest) error {
+			_, _, err := VerifyTwoGroupPrepareOnLeader(ctx, group, m, secondaryEngine, secondaryMetadata,
+				func(context.Context) error { return nil })
+			return err
+		}}
+	coord := &ShardedCoordinator{groups: map[uint64]*ShardGroup{
+		1: {Engine: twoGroupFollowerEngine{}, Store: home.store, Txn: nilDecisionTransactional{}},
+		2: {Engine: secondaryEngine, Store: secondary.store, Txn: nilDecisionTransactional{}},
+	}}
+	coord.WithTwoGroupPrepareAdmission(func(uint64) (TwoGroupHomeLookup, error) { return lookup, nil })
+	coord.WithTwoGroupRemoteTerminal(func(uint64) (TwoGroupRemoteTerminal, error) { return remote, nil })
+	require.NoError(t, coord.decideTwoGroup(t.Context(), manifest, pb.Phase_COMMIT))
+	for _, metadata := range []store.RaftControlMetadataStore{homeMetadata, secondaryMetadata} {
+		raw, err := metadata.ReadRaftControlMetadata(t.Context(), twoGroupTerminalKey(manifestOperationID(manifest)))
+		require.NoError(t, err)
+		record, err := parseTwoGroupTerminalRecord(raw)
+		require.NoError(t, err)
+		require.Equal(t, pb.Phase_COMMIT, record.GetDecision())
+	}
+}
+
+func TestTwoGroupRemoteSecondaryTerminalRequiresPrimaryDecision(t *testing.T) {
+	home, secondary, homeMetadata, secondaryMetadata, manifest := prepareDerivedTwoGroupTerminalFSMs(t)
+	homeEngine := &twoGroupNativeEngine{f: home, index: 2, term: 2}
+	secondaryEngine := &twoGroupNativeEngine{f: secondary, index: 2, term: 3}
+	lookup := twoGroupNativeLookup{metadata: homeMetadata, engine: homeEngine}
+	remote := &twoGroupRemoteTerminalTestPeer{group: 2, engine: secondaryEngine,
+		metadata: secondaryMetadata, home: lookup}
+	require.ErrorIs(t, remote.DecideTwoGroupOnLeader(t.Context(), 2, manifest, pb.Phase_COMMIT), ErrTransactionOutcomeUnknown)
+	_, err := secondaryMetadata.ReadRaftControlMetadata(t.Context(), twoGroupTerminalKey(manifestOperationID(manifest)))
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+	coord := &ShardedCoordinator{groups: map[uint64]*ShardGroup{
+		1: {Engine: homeEngine, Store: home.store, Txn: nilDecisionTransactional{}},
+		2: {Engine: twoGroupFollowerEngine{}, Store: secondary.store, Txn: nilDecisionTransactional{}},
+	}}
+	coord.WithTwoGroupPrepareAdmission(func(uint64) (TwoGroupHomeLookup, error) { return lookup, nil })
+	coord.WithTwoGroupRemoteTerminal(func(uint64) (TwoGroupRemoteTerminal, error) { return remote, nil })
+	require.NoError(t, coord.decideTwoGroup(t.Context(), manifest, pb.Phase_COMMIT))
+}
+
+func TestTwoGroupRemoteSecondaryFailureKeepsOutcomeUnknown(t *testing.T) {
+	home, secondary, homeMetadata, secondaryMetadata, manifest := prepareDerivedTwoGroupTerminalFSMs(t)
+	homeEngine := &twoGroupNativeEngine{f: home, index: 2, term: 2}
+	secondaryEngine := &twoGroupNativeEngine{f: secondary, index: 2, term: 3}
+	lookup := twoGroupNativeLookup{metadata: homeMetadata, engine: homeEngine}
+	remote := &twoGroupRemoteTerminalTestPeer{group: 2, engine: secondaryEngine,
+		metadata: secondaryMetadata, home: lookup, failDecision: errors.New("secondary unavailable")}
+	coord := &ShardedCoordinator{groups: map[uint64]*ShardGroup{
+		1: {Engine: homeEngine, Store: home.store, Txn: nilDecisionTransactional{}},
+		2: {Engine: twoGroupFollowerEngine{}, Store: secondary.store, Txn: nilDecisionTransactional{}},
+	}}
+	coord.WithTwoGroupPrepareAdmission(func(uint64) (TwoGroupHomeLookup, error) { return lookup, nil })
+	coord.WithTwoGroupRemoteTerminal(func(uint64) (TwoGroupRemoteTerminal, error) { return remote, nil })
+	require.ErrorIs(t, coord.decideTwoGroup(t.Context(), manifest, pb.Phase_COMMIT), ErrTransactionOutcomeUnknown)
+	_, found, err := LookupTwoGroupHomeDecision(t.Context(), homeMetadata, manifestOperationID(manifest))
+	require.NoError(t, err)
+	require.True(t, found)
+	_, err = secondaryMetadata.ReadRaftControlMetadata(t.Context(), twoGroupTerminalKey(manifestOperationID(manifest)))
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+}
+
+func TestTwoGroupRemotePrimaryTransferLeavesLocksPending(t *testing.T) {
+	home, secondary, homeMetadata, secondaryMetadata, manifest := prepareDerivedTwoGroupTerminalFSMs(t)
+	homeEngine := &twoGroupNativeEngine{f: home, index: 2, term: 2, transferBeforePropose: true}
+	secondaryEngine := &twoGroupNativeEngine{f: secondary, index: 2, term: 3}
+	lookup := twoGroupNativeLookup{metadata: homeMetadata, engine: homeEngine}
+	remote := &twoGroupRemoteTerminalTestPeer{group: 1, engine: homeEngine, metadata: homeMetadata,
+		secondary: func(ctx context.Context, group uint64, m *pb.TwoGroupPrepareManifest) error {
+			_, _, err := VerifyTwoGroupPrepareOnLeader(ctx, group, m, secondaryEngine, secondaryMetadata,
+				func(context.Context) error { return nil })
+			return err
+		}}
+	coord := &ShardedCoordinator{groups: map[uint64]*ShardGroup{
+		1: {Engine: twoGroupFollowerEngine{}, Store: home.store, Txn: nilDecisionTransactional{}},
+		2: {Engine: secondaryEngine, Store: secondary.store, Txn: nilDecisionTransactional{}},
+	}}
+	coord.WithTwoGroupPrepareAdmission(func(uint64) (TwoGroupHomeLookup, error) { return lookup, nil })
+	coord.WithTwoGroupRemoteTerminal(func(uint64) (TwoGroupRemoteTerminal, error) { return remote, nil })
+	require.ErrorIs(t, coord.decideTwoGroup(t.Context(), manifest, pb.Phase_COMMIT), ErrTransactionOutcomeUnknown)
+	_, found, err := LookupTwoGroupHomeDecision(t.Context(), homeMetadata, manifestOperationID(manifest))
+	require.NoError(t, err)
+	require.False(t, found)
+	_, err = secondaryMetadata.ReadRaftControlMetadata(t.Context(), twoGroupTerminalKey(manifestOperationID(manifest)))
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
 }
 
 func TestTwoGroupCoordinatorReconcilesLostPrimaryDecisionReply(t *testing.T) {

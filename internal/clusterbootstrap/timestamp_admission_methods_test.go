@@ -12,7 +12,8 @@ import (
 func TestTimestampAdmissionMethodsArePrivateAndGroupScoped(t *testing.T) {
 	public := BootstrapPublicGRPCMethods()
 	for _, name := range []string{pb.Internal_IssueBoundTimestamp_FullMethodName, pb.Internal_LookupTimestampBinding_FullMethodName,
-		pb.Internal_ProposeTwoGroupPrepare_FullMethodName} {
+		pb.Internal_ProposeTwoGroupPrepare_FullMethodName, pb.Internal_VerifyTwoGroupPrepare_FullMethodName,
+		pb.Internal_ProposeTwoGroupTerminal_FullMethodName} {
 		require.False(t, slices.Contains(public, name), "timestamp admission cannot bypass peer sessions")
 	}
 	for _, tc := range []struct {
@@ -30,10 +31,17 @@ func TestTimestampAdmissionMethodsArePrivateAndGroupScoped(t *testing.T) {
 		if tc.group == 0 {
 			require.Len(t, methods, 1)
 		} else {
-			require.Len(t, methods, 2)
+			require.Len(t, methods, 4)
 			require.Equal(t, pb.Internal_ProposeTwoGroupPrepare_FullMethodName, methods[1].Name)
 			require.False(t, methods[1].AllowPublic)
 			_, err := methods[1].BoundRequest(peersession.RequestBinding{Group: tc.group}, &pb.ProposeTwoGroupPrepareRequest{})
+			require.Error(t, err)
+			for _, method := range methods[2:] {
+				require.False(t, method.AllowPublic)
+			}
+			_, err = methods[2].BoundRequest(peersession.RequestBinding{Group: tc.group}, &pb.VerifyTwoGroupPrepareRequest{})
+			require.Error(t, err)
+			_, err = methods[3].BoundRequest(peersession.RequestBinding{Group: tc.group}, &pb.ProposeTwoGroupTerminalRequest{})
 			require.Error(t, err)
 		}
 		method := methods[0]

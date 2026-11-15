@@ -15,9 +15,11 @@ func BootstrapPublicGRPCMethods() []string {
 		mixed[method.Name] = true
 	}
 	private := map[string]bool{
-		pb.Internal_IssueBoundTimestamp_FullMethodName:    true,
-		pb.Internal_LookupTimestampBinding_FullMethodName: true,
-		pb.Internal_ProposeTwoGroupPrepare_FullMethodName: true,
+		pb.Internal_IssueBoundTimestamp_FullMethodName:     true,
+		pb.Internal_LookupTimestampBinding_FullMethodName:  true,
+		pb.Internal_ProposeTwoGroupPrepare_FullMethodName:  true,
+		pb.Internal_VerifyTwoGroupPrepare_FullMethodName:   true,
+		pb.Internal_ProposeTwoGroupTerminal_FullMethodName: true,
 	}
 	var methods []string
 	for _, service := range []*grpc.ServiceDesc{

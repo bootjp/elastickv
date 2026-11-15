@@ -13,24 +13,58 @@ func TimestampAdmissionPeerMethods(group uint64) []peersession.Method {
 	if group == noderuntime.DedicatedTSORaftGroupID {
 		return []peersession.Method{issueBoundTimestampMethod(group)}
 	}
-	return []peersession.Method{lookupTimestampBindingMethod(group), proposeTwoGroupPrepareMethod(group)}
+	return []peersession.Method{lookupTimestampBindingMethod(group), proposeTwoGroupPrepareMethod(group),
+		verifyTwoGroupPrepareMethod(group), proposeTwoGroupTerminalMethod(group)}
+}
+
+func verifyTwoGroupPrepareMethod(group uint64) peersession.Method {
+	return twoGroupControlMethod(group, pb.Internal_VerifyTwoGroupPrepare_FullMethodName,
+		func(value any) (*pb.TwoGroupPrepareManifest, bool) {
+			request, ok := value.(*pb.VerifyTwoGroupPrepareRequest)
+			return request.GetManifest(), ok && bootstrapExactProto(request)
+		}, func(value any) bool {
+			response, ok := value.(*pb.VerifyTwoGroupPrepareResponse)
+			return ok && bootstrapExactProto(response) && response.GetAppliedIndex() != 0 && response.GetLeaderTerm() != 0
+		})
+}
+
+func proposeTwoGroupTerminalMethod(group uint64) peersession.Method {
+	return twoGroupControlMethod(group, pb.Internal_ProposeTwoGroupTerminal_FullMethodName,
+		func(value any) (*pb.TwoGroupPrepareManifest, bool) {
+			request, ok := value.(*pb.ProposeTwoGroupTerminalRequest)
+			return request.GetManifest(), ok && bootstrapExactProto(request) &&
+				(request.GetDecision() == pb.Phase_COMMIT || request.GetDecision() == pb.Phase_ABORT)
+		}, func(value any) bool {
+			response, ok := value.(*pb.ProposeTwoGroupTerminalResponse)
+			return ok && bootstrapExactProto(response) && response.GetCommitIndex() != 0 && response.GetLeaderTerm() != 0
+		})
 }
 
 func proposeTwoGroupPrepareMethod(group uint64) peersession.Method {
-	return peersession.Method{
-		Name: pb.Internal_ProposeTwoGroupPrepare_FullMethodName,
-		BoundRequest: func(binding peersession.RequestBinding, value any) (peersession.Message, error) {
+	return twoGroupControlMethod(group, pb.Internal_ProposeTwoGroupPrepare_FullMethodName,
+		func(value any) (*pb.TwoGroupPrepareManifest, bool) {
 			request, ok := value.(*pb.ProposeTwoGroupPrepareRequest)
-			if !ok || !bootstrapExactProto(request) || binding.Group != group ||
-				!kv.ValidTwoGroupPrepareManifest(request.GetManifest()) ||
-				!twoGroupManifestContainsGroup(request.GetManifest(), group) {
+			return request.GetManifest(), ok && bootstrapExactProto(request)
+		}, func(value any) bool {
+			response, ok := value.(*pb.ProposeTwoGroupPrepareResponse)
+			return ok && bootstrapExactProto(response) && response.GetCommitIndex() != 0 && response.GetLeaderTerm() != 0
+		})
+}
+
+func twoGroupControlMethod(group uint64, name string,
+	requestManifest func(any) (*pb.TwoGroupPrepareManifest, bool), validReply func(any) bool) peersession.Method {
+	return peersession.Method{
+		Name: name,
+		BoundRequest: func(binding peersession.RequestBinding, value any) (peersession.Message, error) {
+			manifest, ok := requestManifest(value)
+			if !ok || binding.Group != group || !kv.ValidTwoGroupPrepareManifest(manifest) ||
+				!twoGroupManifestContainsGroup(manifest, group) {
 				return peersession.Message{}, peersession.ErrFormat
 			}
 			return bootstrapControlMessage(binding), nil
 		},
 		Reply: func(request peersession.Message, value any) (peersession.Message, error) {
-			response, ok := value.(*pb.ProposeTwoGroupPrepareResponse)
-			if !ok || !bootstrapExactProto(response) || response.GetCommitIndex() == 0 || response.GetLeaderTerm() == 0 {
+			if !validReply(value) {
 				return peersession.Message{}, peersession.ErrFormat
 			}
 			return bootstrapControlReply(request), nil
