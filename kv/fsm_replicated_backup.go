@@ -62,9 +62,9 @@ func (f *kvFSM) applyReplicatedBackup(ctx context.Context, payload []byte) any {
 	if f.replicatedPins == nil || f.pendingApplyIdx == 0 {
 		return replicatedBackupHalt(errors.New("missing journal or Raft applied index"), "apply command")
 	}
-	if !f.TTLInlineCapabilityActive() || f.replicatedPins.snapshot().Pins.Epoch == 0 {
-		// Binary support is not activation. Only a future configuration-bound
-		// capability marker and complete durable drain may create the epoch.
+	if !f.TTLInlineCapabilityRecorded() || f.replicatedPins.snapshot().Pins.Epoch == 0 {
+		// Replay uses the durable marker, not a local startup proof that may
+		// be installed only after committed entries have been drained.
 		return errors.WithStack(ErrTTLInlineCapabilityRequired)
 	}
 	if command.Operation == ReplicatedBackupAllocate {

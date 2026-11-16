@@ -27,6 +27,7 @@ func activatedPinFSM(t *testing.T, st store.MVCCStore) *kvFSM {
 	// Test fixture only: production activation still requires its capability
 	// certificate and the durable legacy drain, neither supplied by this flag.
 	f.ttlInlineCapability.Store(true)
+	f.ttlInlineCapabilityRecorded.Store(true)
 	return f
 }
 
@@ -40,10 +41,33 @@ func TestFSMReplicatedBackupRequiresCapabilityAndActivatedEpoch(t *testing.T) {
 	require.True(t, ok)
 	require.ErrorIs(t, err, ErrTTLInlineCapabilityRequired)
 	f.ttlInlineCapability.Store(true)
+	f.ttlInlineCapabilityRecorded.Store(true)
 	response = applyReplicatedBackupCommand(t, f, 3, command)
 	err, ok = response.(error)
 	require.True(t, ok)
 	require.ErrorIs(t, err, ErrTTLInlineCapabilityRequired, "binary support cannot manufacture an epoch")
+}
+
+func TestFSMReplicatedBackupReplaysBeforeLocalRecoveryProof(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	st, err := store.NewPebbleStore(dir)
+	require.NoError(t, err)
+	seedActivatedPinJournal(t, st)
+	writer, ok := st.(store.ReplicatedControlStore)
+	require.True(t, ok)
+	_, err = writer.ApplyReplicatedControlState(t.Context(), ttlInlineCapabilityKey,
+		[]byte(`{"version":1,"index":2,"voters":[1]}`), 2)
+	require.NoError(t, err)
+	require.NoError(t, st.Close())
+	reopened, err := store.NewPebbleStore(dir)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, reopened.Close()) })
+	f := newTTLInlineFSM(t, reopened)
+	require.True(t, f.TTLInlineCapabilityRecorded())
+	require.False(t, f.TTLInlineCapabilityActive())
+	require.Nil(t, applyReplicatedBackupCommand(t, f, 3, replicatedBackupWireFixtures()[0]))
+	require.Len(t, f.replicatedPins.snapshot().Pins.Active, 1)
 }
 
 func TestFSMReplicatedBackupCoexistsWithPrepareEvidence(t *testing.T) {
