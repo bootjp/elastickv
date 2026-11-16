@@ -3,9 +3,11 @@ package clusterbootstrap
 import (
 	"context"
 	"sync"
+	"time"
 
 	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/bootjp/elastickv/internal/peersession"
+	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -30,6 +32,8 @@ type bootstrapControlPeer struct {
 	conn   *grpc.ClientConn
 	handle *peersession.Handle
 }
+
+const ttlInlinePeerProbeTimeout = 5 * time.Second
 
 // Connections/sessions are per group and peer, never borrowed from the public
 // GRPCConnCache. No received hint publishes policy or readiness. A failed call
@@ -133,6 +137,38 @@ func (c *bootstrapControlClient) Invoke(ctx context.Context, group uint64, addre
 	return nil
 }
 
+// ProbeTTLInlineCapability uses only the protected peer session. In particular,
+// it never sends the startup-control credential or falls back to a public call.
+func (c *bootstrapControlClient) ProbeTTLInlineCapability(ctx context.Context, group uint64, address string, req *pb.GetTTLInlineCapabilityRequest) (*pb.GetTTLInlineCapabilityResponse, error) {
+	call, stop, err := c.begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer stop()
+	call, cancel := context.WithTimeout(call, ttlInlinePeerProbeTimeout)
+	defer cancel()
+	if bootstrapControlOutgoingMetadataPresent(call) || !bootstrapExactProto(req) {
+		return nil, errors.WithStack(peersession.ErrDenied)
+	}
+	local, peer, err := c.target(group, address)
+	if err != nil {
+		return nil, err
+	}
+	input := proto.CloneOf(req)
+	method := TTLInlinePeerMethod(group)
+	message, err := method.BoundRequest(peersession.RequestBinding{Group: group, From: local.Local, To: peer}, input)
+	if err != nil || message.Traffic != peersession.Probe {
+		return nil, errors.WithStack(peersession.ErrDenied)
+	}
+	pending := new(pb.GetTTLInlineCapabilityResponse)
+	if err := c.invokePeerSession(call, group, address, method.Name, input, pending, local, peer, false); err != nil {
+		return nil, err
+	}
+	// Handle.Invoke has already checked the bound reply; copy it so no
+	// transport-owned message can be exposed to the caller.
+	return proto.CloneOf(pending), nil
+}
+
 func bootstrapOutgoingControlTraffic(traffic peersession.Traffic) bool {
 	return traffic == peersession.Control || traffic == peersession.Registration
 }
@@ -197,6 +233,10 @@ func (c *bootstrapControlClient) begin(parent context.Context) (context.Context,
 }
 
 func (c *bootstrapControlClient) invokePeer(ctx context.Context, group uint64, address, method string, request, reply any, local bootstrapControlClientGroup, remote peersession.Node) error {
+	return c.invokePeerSession(ctx, group, address, method, request, reply, local, remote, true)
+}
+
+func (c *bootstrapControlClient) invokePeerSession(ctx context.Context, group uint64, address, method string, request, reply any, local bootstrapControlClientGroup, remote peersession.Node, startupControl bool) error {
 	c.mu.Lock()
 	key := bootstrapControlPeerKey{Group: group, address: address}
 	peer := c.peers[key]
@@ -215,12 +255,17 @@ func (c *bootstrapControlClient) invokePeer(ctx context.Context, group uint64, a
 		peer.close()
 		return err
 	}
-	if err := c.Domain.Admission.ValidateResult(ctx); err != nil {
-		peer.close()
-		return errors.WithStack(err)
+	if startupControl {
+		if err := c.Domain.Admission.ValidateResult(ctx); err != nil {
+			peer.close()
+			return errors.WithStack(err)
+		}
 	}
-	err := peer.handle.Invoke(ctx, peer.conn, method, request, reply,
-		grpc.PerRPCCredentials(bootstrapControlCredential{method: method, value: c.Domain.StartupToken}))
+	var options []grpc.CallOption
+	if startupControl {
+		options = append(options, grpc.PerRPCCredentials(bootstrapControlCredential{method: method, value: c.Domain.StartupToken}))
+	}
+	err := peer.handle.Invoke(ctx, peer.conn, method, request, reply, options...)
 	if err != nil {
 		peer.close()
 	}
