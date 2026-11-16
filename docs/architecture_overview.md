@@ -1,6 +1,24 @@
 # Elastickv Architecture Overview
 
-This document summarizes the current architecture and runtime topology.
+Elastickv exposes multiple protocol APIs over one sharded, replicated KV engine.
+Start with the [high-level diagram in the README](../README.md#architecture) for the request flow, or the [Getting started guide](getting_started.md) to run a node.
+The diagrams below expand that view into runtime components and cluster topology.
+
+## Architectural layers
+
+| Layer | Responsibility |
+| --- | --- |
+| Protocol adapters | Translate Redis, DynamoDB, S3, SQS, gRPC, and filesystem requests into KV operations. Each API has its own compatibility scope. |
+| Routing and transactions | Resolve key ranges to Raft groups and coordinate transactional operations over those groups. |
+| Raft replication | Order and replicate each group's changes through its leader and voting replicas. A group needs a majority of voters to commit. |
+| MVCC storage | Apply committed changes to versioned local data, persisted in Pebble by the normal server. Each replica owns its local storage. |
+| Route catalog | Persist range ownership in the default Raft group and refresh each node's routing cache. |
+
+A **shard range** maps a portion of the keyspace to a **Raft group**.
+A **node** is a server process that can host replicas for several groups; those groups can have different leaders.
+Replicas of the same group contain replicated data, while different data groups serve their assigned ranges.
+The single-node quick start runs one voting replica per configured group. To tolerate a host failure, place a three-voter group across independent hosts; the in-process demo does not provide those failure domains.
+The shared engine does not imply cross-API record interoperability or a transaction spanning different protocol requests.
 
 ## 1. Component Diagram
 
@@ -36,7 +54,7 @@ flowchart TB
 
     subgraph ControlPlane["Control Plane"]
       DE["Route Engine Cache (distribution/engine.go)"]
-      CW["Catalog Watcher (distribution/watcher.go)"]
+      CW["Catalog Watchers (distribution/grpc_watcher.go, watcher.go)"]
       CS["Catalog Store (distribution/catalog.go)"]
     end
 
@@ -61,10 +79,13 @@ flowchart TB
   RP --> RS
 
   RS --> SCC
+  RS --> SS
   DBS --> SCC
+  DBS --> SS
   GS --> SCC
   GS --> SS
   S3S --> SCC
+  S3S --> SS
   SQSS --> SCC
   SQSS --> SS
   FS --> SCC
@@ -82,14 +103,18 @@ flowchart TB
   RG --> FSM
   FSM --> MV
 
-  CS --> MV
-  CW --> CS
+  CS -->|"Read catalog snapshot"| MV
+  CW -->|"Local polling"| CS
+  CW -->|"WatchCatalog from catalog leader"| DS
   CW --> DE
 
-  SCC -- "Next() timestamps" --> HLC
+  SCC -- "Fenced timestamp allocation (legacy mode)" --> HLC
   FSM -- "apply HLC lease: SetPhysicalCeiling" --> HLC
   SCC -- "propose HLC lease (leader)" --> RG
 ```
+
+Catalog mutations follow the coordinator → Raft → FSM path; the catalog store reads the applied snapshot.
+The HLC arrows show the legacy timestamp mode. The optional dedicated group-0 timestamp oracle is described in the [TSO operations guide](centralized_tso_operations.md).
 
 ## 2. Overall Runtime Architecture
 
@@ -144,7 +169,9 @@ flowchart LR
   CCW --> CDE
 ```
 
-## 3. Control Plane Split Path (Milestone 1)
+The topology illustrates separate catalog and user-group roles. Depending on configuration, the default group can also own user ranges; the quick start does not require a separate catalog-only group.
+
+## 3. Same-group Control Plane Split Path
 
 ```mermaid
 sequenceDiagram
@@ -159,23 +186,25 @@ sequenceDiagram
   DS->>SC: "Dispatch catalog mutations as txn"
   SC->>DG: "Replicate catalog key updates"
   DG-->>DS: "Commit new catalog version"
-  CW->>DG: "Poll catalog version/snapshot"
-  CW->>DE: "ApplySnapshot(newVersion)"
   DS-->>Op: "SplitRangeResponse(left,right,catalogVersion)"
+  Note over CW,DE: Routing caches refresh asynchronously
+  CW->>DS: "WatchCatalog / polling fallback"
+  DS-->>CW: "Catalog deltas or snapshot"
+  CW->>DE: "ApplyDelta / ApplySnapshot"
 ```
 
 ## 4. Hybrid Logical Clock (HLC)
 
-Transactional reads and writes are ordered by a Hybrid Logical Clock (`kv/hlc.go`).
+In legacy timestamp mode, the coordinator uses a Hybrid Logical Clock (`kv/hlc.go`).
 A 64-bit timestamp packs a 48-bit physical component (Unix milliseconds) and a
-16-bit in-memory logical counter. The physical component is bounded by a
-Raft-agreed ceiling so that a newly elected leader never issues timestamps that
-overlap the previous leader's window.
+16-bit in-memory logical counter. Raft commits the physical-time ceiling.
+Fenced allocation rejects an expired ceiling or an exhausted logical window;
+callers must handle that error. The unfenced `Next()` helper is not a persistence safety check.
 
 ```mermaid
 sequenceDiagram
   participant L as "Leader Coordinator"
-  participant RG as "Default Raft Group"
+  participant RG as "Locally led Raft Group"
   participant F as "KV FSM (all nodes)"
   participant H as "HLC (all nodes)"
   participant Tx as "Txn / MVCC read-write path"
@@ -186,15 +215,21 @@ sequenceDiagram
     F->>H: SetPhysicalCeiling(ms)
   end
 
-  Tx->>H: Next()
-  H-->>Tx: ts = max(wall, ceiling)<<16 | logical_counter
+  Tx->>H: NextFenced() / NextBatchFenced(n)
+  alt Ceiling expired or logical window exhausted
+    H-->>Tx: ErrCeilingExpired
+  else Allocation permitted
+    H-->>Tx: Monotonic timestamp / reserved batch
+  end
 ```
 
 ## 5. Notes
 
 1. Route catalog is persisted in reserved internal keys in the default Raft group.
-2. `distribution.Engine` is an in-memory read path cache and is refreshed by watcher.
-3. Milestone 1 split is same-group only. Cross-group migration is out of scope.
-4. HLC physical ceiling is replicated via the default Raft group; the logical
-   counter advances in memory with no Raft round-trip. Coordinator and FSM share
-   the same `*HLC` instance (wired via `WithHLC` / `NewKvFSMWithHLC`).
+2. `distribution.Engine` is an in-memory routing cache. The normal server consumes the catalog leader's `WatchCatalog` stream (with a polling fallback) and also polls its local applied catalog. Watchers apply deltas or replacement snapshots; the split response does not wait for every node's cache to refresh.
+3. `SplitRange` is same-group only. Cross-group split migration uses a separate job path (`StartSplitMigration`), omitted from this diagram. The opt-in `--autoSplitCrossGroup` scheduler uses that path for eligible right-child moves; see the [automation design](design/2026_06_11_implemented_hotspot_split_milestone3_automation.md).
+4. In legacy mode, the sharded coordinator renews HLC ceilings through each
+   locally led group. The logical counter advances in memory with no Raft
+   round-trip. The normal server shares a `*HLC` instance between its
+   coordinator and KV FSMs; see `internal/server/run.go` and
+   `internal/server/shard_groups.go` for wiring.
