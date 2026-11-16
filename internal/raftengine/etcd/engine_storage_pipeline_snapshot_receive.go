@@ -68,7 +68,6 @@ func (e *Engine) frontPipelineReceivedSnapshot(request *pipelineSnapshotRequest)
 		p.normalizingReceived = nil
 	}
 	e.snapshotTransition.Store(true)
-	e.invalidateTTLInlineRecoveryProof()
 	e.ackTracker.reset()
 	e.singleNodeLeaderAckMonoNs.Store(0)
 	e.fireLeaderLossCallbacks()
@@ -98,6 +97,10 @@ func (e *Engine) queuePipelineReceivedSave(message *raftpb.Message) error {
 	plan.message = message
 	plan.snapshot = message.Snapshot
 	plan.accepted = true
+	e.invalidateTTLInlineRecoveryProof()
+	if e.recoveredAdmission != nil {
+		e.invalidateAdmission()
+	}
 	detachPipelineMessage(message)
 	// RawNode restore has physically replaced its unstable entry slice. Earlier
 	// actor borrows keep their independent reservations until real completion.
@@ -208,14 +211,47 @@ func (e *Engine) publishPipelineReceivedSnapshot(plan *pipelineSnapshotPlan) err
 	e.refreshVoterCache(state)
 	e.setConfigurationFromConfState(state, configurationIndex)
 	p.configurationEpoch.Add(1)
-	e.snapshotTransition.Store(false)
 	p.publishedSnapshotFloor = e.applied
 	p.receiving = nil
+	return e.finishPipelinePublishedSnapshot(plan, state)
+}
+
+func (e *Engine) finishPipelinePublishedSnapshot(plan *pipelineSnapshotPlan, state raftpb.ConfState) error {
+	if e.recoveredAdmission != nil {
+		e.pipelineSnapshotRecoveryPending = true
+	} else {
+		e.snapshotTransition.Store(false)
+	}
+	if err := e.flushPublishedSnapshotDisk(); err != nil {
+		return err
+	}
+	if err := e.completePipelineSnapshotRecovery(); err != nil {
+		return err
+	}
 	if err := e.routePipelineResponses(plan.message.Responses); err != nil {
 		return err
 	}
 	e.alarmIfJoinedAsVoter(state)
-	return e.flushPublishedSnapshotDisk()
+	return nil
+}
+
+func (e *Engine) completePipelineSnapshotRecovery() error {
+	if !e.pipelineSnapshotRecoveryPending {
+		return nil
+	}
+	// The snapshot and its native tail may be durable before the apply actor
+	// publishes the same committed prefix. Keep admission closed until then.
+	if e.rawNode.BasicStatus().GetCommit() > e.applied {
+		return nil
+	}
+	if err := e.publishRecoveredAdmission(); err != nil {
+		return err
+	}
+	e.pipelineSnapshotRecoveryPending = false
+	e.admissionPublished = true
+	e.admissionDirty = false
+	e.snapshotTransition.Store(false)
+	return nil
 }
 
 func (e *Engine) flushHeldSnapshotDisk() error {

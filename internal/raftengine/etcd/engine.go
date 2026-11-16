@@ -330,17 +330,18 @@ type Engine struct {
 	groupID                  uint64
 	nativeConfigurationIndex uint64 // actual native configuration, owned by the loop
 	// Published with status under mu; never read RawNode from an RPC goroutine.
-	nativeConfigurationView *raftengine.NativeConfiguration
-	admissionDirty          bool // owned by the native loop, like RawNode
-	admissionPublished      bool
-	recoveredIdentity       *WALIdentity
-	nodeID                  uint64
-	localID                 string
-	localAddress            string
-	dataDir                 string
-	fsmSnapDir              string
-	tickInterval            time.Duration
-	electionTick            int
+	nativeConfigurationView         *raftengine.NativeConfiguration
+	admissionDirty                  bool // owned by the native loop, like RawNode
+	admissionPublished              bool
+	recoveredIdentity               *WALIdentity
+	pipelineSnapshotRecoveryPending bool
+	nodeID                          uint64
+	localID                         string
+	localAddress                    string
+	dataDir                         string
+	fsmSnapDir                      string
+	tickInterval                    time.Duration
+	electionTick                    int
 	// joinAsLearner is captured from OpenConfig; consulted by
 	// alarmIfJoinedAsVoter on every post-apply ConfState. See §4.5 of
 	// the learner design doc.

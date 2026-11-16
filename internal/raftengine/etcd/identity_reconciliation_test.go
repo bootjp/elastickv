@@ -36,6 +36,46 @@ func identityElectionEngine(t *testing.T, id uint64) *Engine {
 	return e
 }
 
+func TestPipelineSnapshotRecoveryWaitsForAppliedNativeCommit(t *testing.T) {
+	t.Parallel()
+	e := identityElectionEngine(t, 1)
+	e.peers[4] = Peer{NodeID: 4, ID: "4", Address: "127.0.0.1:7004"}
+	var states []RecoveredState
+	e.recoveredAdmission = func(state RecoveredState) error {
+		states = append(states, state)
+		return nil
+	}
+	e.pipelineSnapshotRecoveryPending = true
+	e.snapshotTransition.Store(true)
+	e.applied = 0
+	require.NoError(t, e.completePipelineSnapshotRecovery())
+	require.Empty(t, states)
+	require.True(t, e.pipelineSnapshotRecoveryPending)
+	require.True(t, e.snapshotTransition.Load())
+
+	e.applied = e.rawNode.BasicStatus().GetCommit()
+	require.NoError(t, e.completePipelineSnapshotRecovery())
+	require.Len(t, states, 1)
+	require.Equal(t, e.applied, states[0].AppliedIndex())
+	require.Len(t, states[0].Peers(), 3)
+	require.False(t, e.pipelineSnapshotRecoveryPending)
+	require.False(t, e.snapshotTransition.Load())
+	require.NoError(t, e.completePipelineSnapshotRecovery())
+	require.Len(t, states, 1)
+}
+
+func TestPipelineSnapshotRecoveryFailureRemainsClosed(t *testing.T) {
+	t.Parallel()
+	e := identityElectionEngine(t, 1)
+	e.recoveredIdentity = nil
+	e.recoveredAdmission = func(RecoveredState) error { return nil }
+	e.pipelineSnapshotRecoveryPending = true
+	e.snapshotTransition.Store(true)
+	require.ErrorIs(t, e.completePipelineSnapshotRecovery(), ErrWALIdentity)
+	require.True(t, e.pipelineSnapshotRecoveryPending)
+	require.True(t, e.snapshotTransition.Load())
+}
+
 func TestIdentityReconciliationAllowsProtectedElection(t *testing.T) {
 	t.Parallel()
 	nodes := map[uint64]*Engine{}
