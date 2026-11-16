@@ -1,0 +1,21 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: elastickv
+resources:
+  - ../../../base
+patches:
+  - target:
+      group: apps
+      version: v1
+      kind: StatefulSet
+      name: elastickv
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/image
+        value: ghcr.io/bootjp/elastickv@sha256:cafdb36081e89a4bc33f5951a95c2c8acc41bf8d20aa47cf72a90a65cfcf3605
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: --healthAddress=0.0.0.0:8081
+      - op: add
+        path: /spec/template/spec/containers/0/ports/-
+        value: {name: health, containerPort: 8081}
