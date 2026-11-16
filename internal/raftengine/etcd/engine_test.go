@@ -886,6 +886,8 @@ func TestElectionDispatchDoesNotWaitForBlockedHeartbeat(t *testing.T) {
 				}
 			case raftpb.MsgPreVoteResp:
 				close(electionSent)
+			default:
+				t.Errorf("unexpected dispatch type %s", req.msg.GetType())
 			}
 			return nil
 		},
