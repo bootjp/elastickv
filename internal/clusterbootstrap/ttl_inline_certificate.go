@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"fmt"
 	"slices"
-	"sync"
 	"time"
 
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
@@ -103,31 +102,16 @@ func ttlInlineProbeAllMembers(ctx context.Context, group, local uint64, native r
 	bounded, cancel := context.WithTimeout(ctx, ttlInlineCertificateTimeout)
 	defer cancel()
 	workers, workerCtx := errgroup.WithContext(bounded)
-	var mu sync.Mutex
-	proved := make(map[uint64]bool, len(members))
 	for _, member := range members {
 		if member == local {
-			proved[member] = true
 			continue
 		}
 		address := addresses[member]
 		workers.Go(func() error {
-			if err := ttlInlineProbeMember(workerCtx, group, member, address, native, term, probe); err != nil {
-				return err
-			}
-			mu.Lock()
-			proved[member] = true
-			mu.Unlock()
-			return nil
+			return ttlInlineProbeMember(workerCtx, group, member, address, native, term, probe)
 		})
 	}
-	if err := workers.Wait(); err != nil {
-		return errors.WithStack(err)
-	}
-	if len(proved) != len(members) {
-		return errors.New("TTL-inline member proof is incomplete")
-	}
-	return nil
+	return errors.WithStack(workers.Wait())
 }
 
 func ttlInlineProbeMember(ctx context.Context, group, member uint64, address string,
