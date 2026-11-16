@@ -251,6 +251,7 @@ Three nodes in one process do not provide independent failure domains or a persi
 | Fresh directory fails to start | Bootstrap a new cluster once with `--raftBootstrap`. Restart existing data without it. |
 | Key missing after restart | Check the absolute data path and current working directory, or the Docker volume name. The three-node demo uses temporary storage. |
 | Unknown flag in a container | The selected image may predate the documentation. Build this checkout or choose a compatible image digest. |
+| FUSE restart cannot register its journal session | After an unclean stop, confirm the previous mount process is stopped, keep its client ID, and restart with `--filesystemStrictRecover`; see the [filesystem recovery procedure](filesystem.md#upgrading-from-legacy-mounts). |
 | Admin page says the bundle is missing | Build the SPA with `cd web/admin && npm ci && npm run build`, then rebuild the Go binary. The root Dockerfile builds the SPA automatically. |
 
 ## Continue to deployment

@@ -198,8 +198,9 @@ sequenceDiagram
 In legacy timestamp mode, the coordinator uses a Hybrid Logical Clock (`kv/hlc.go`).
 A 64-bit timestamp packs a 48-bit physical component (Unix milliseconds) and a
 16-bit in-memory logical counter. Raft commits the physical-time ceiling.
-Fenced allocation rejects an expired ceiling or an exhausted logical window;
-callers must handle that error. The unfenced `Next()` helper is not a persistence safety check.
+Once a nonzero ceiling is established, fenced allocation rejects an expired ceiling or an exhausted logical window;
+callers must handle that error. Before bootstrap establishes a ceiling, this fence is inactive. The unfenced `Next()` helper is not a persistence safety check.
+This diagram covers timestamp allocation; read-snapshot selection follows the relevant API path, including applied-watermark reads.
 
 ```mermaid
 sequenceDiagram
@@ -207,7 +208,7 @@ sequenceDiagram
   participant RG as "Locally led Raft Group"
   participant F as "KV FSM (all nodes)"
   participant H as "HLC (all nodes)"
-  participant Tx as "Txn / MVCC read-write path"
+  participant Tx as "Persistence timestamp request"
 
   loop every hlcRenewalInterval (=1s, <20s)
     L->>RG: Propose HLC lease (now + hlcPhysicalWindowMs)
