@@ -222,17 +222,14 @@ func (e *Engine) finishPipelinePublishedSnapshot(plan *pipelineSnapshotPlan, sta
 	} else {
 		e.snapshotTransition.Store(false)
 	}
-	if err := e.flushPublishedSnapshotDisk(); err != nil {
-		return err
-	}
-	if err := e.completePipelineSnapshotRecovery(); err != nil {
-		return err
-	}
 	if err := e.routePipelineResponses(plan.message.Responses); err != nil {
 		return err
 	}
 	e.alarmIfJoinedAsVoter(state)
-	return nil
+	if err := e.flushPublishedSnapshotDisk(); err != nil {
+		return err
+	}
+	return e.completePipelineSnapshotRecovery()
 }
 
 func (e *Engine) completePipelineSnapshotRecovery() error {
