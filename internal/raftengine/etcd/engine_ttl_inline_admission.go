@@ -58,13 +58,17 @@ func (e *Engine) ttlInlinePromotionCertified(req adminRequest, changeType raftpb
 	if !learner {
 		return false, nil
 	}
+	native := e.captureApplyNativeConfiguration()
+	if native == nil {
+		return false, nil
+	}
 	reader, ok := e.fsm.(interface {
-		TTLInlineCertifiedLearner(context.Context, uint64) (bool, error)
+		TTLInlineCertifiedLearner(context.Context, uint64, raftengine.NativeConfiguration) (bool, error)
 	})
 	if !ok {
 		return false, nil
 	}
-	certified, err := reader.TTLInlineCertifiedLearner(req.ctx, member)
+	certified, err := reader.TTLInlineCertifiedLearner(req.ctx, member, *native)
 	return certified, errors.Wrap(err, "verify TTL-inline learner certificate")
 }
 

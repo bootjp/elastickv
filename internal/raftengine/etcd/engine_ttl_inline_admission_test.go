@@ -49,15 +49,22 @@ type ttlInlineProposalTestFSM struct {
 type ttlInlineCertifiedLearnerTestFSM struct {
 	ttlInlineMarkerTestFSM
 	member uint64
+	index  uint64
 }
 
-func (f *ttlInlineCertifiedLearnerTestFSM) TTLInlineCertifiedLearner(_ context.Context, member uint64) (bool, error) {
-	return member == f.member, nil
+func (f *ttlInlineCertifiedLearnerTestFSM) TTLInlineCertifiedLearner(_ context.Context, member uint64, native raftengine.NativeConfiguration) (bool, error) {
+	return member == f.member && native.Index == f.index, nil
 }
 
 func TestTTLInlinePromotionRequiresCertifiedExistingLearner(t *testing.T) {
 	t.Parallel()
-	e := &Engine{fsm: &ttlInlineCertifiedLearnerTestFSM{member: 3}, isLearnerNode: map[uint64]bool{3: true}}
+	storage := etcdraft.NewMemoryStorage()
+	require.NoError(t, storage.ApplySnapshot(&raftpb.Snapshot{Metadata: &raftpb.SnapshotMetadata{
+		Index: uint64Ptr(5), Term: uint64Ptr(1), ConfState: &raftpb.ConfState{Voters: []uint64{1, 2}, Learners: []uint64{3}},
+	}}))
+	storage.SetHardState(&raftpb.HardState{Term: uint64Ptr(1), Commit: uint64Ptr(5)})
+	e := &Engine{fsm: &ttlInlineCertifiedLearnerTestFSM{member: 3, index: 5}, rawNode: mustRawNode(t, storage, 1),
+		recoveredIdentity: &WALIdentity{}, nativeConfigurationIndex: 5, isLearnerNode: map[uint64]bool{3: true}}
 	request := adminRequest{ctx: context.Background(), action: adminActionPromoteLearner}
 	certified, err := e.ttlInlinePromotionCertified(request, raftpb.ConfChangeAddNode, 3)
 	require.NoError(t, err)
@@ -79,6 +86,11 @@ func TestTTLInlinePromotionRequiresCertifiedExistingLearner(t *testing.T) {
 	certified, err = e.ttlInlinePromotionCertified(request, raftpb.ConfChangeAddNode, 3)
 	require.NoError(t, err)
 	require.False(t, certified)
+	e.isLearnerNode[3] = true
+	e.nativeConfigurationIndex = 6
+	certified, err = e.ttlInlinePromotionCertified(request, raftpb.ConfChangeAddNode, 3)
+	require.NoError(t, err)
+	require.False(t, certified, "a stale native configuration cannot reuse the learner certificate")
 }
 
 func (f *ttlInlineProposalTestFSM) TTLInlineFenceReady() bool { return f.fenced }

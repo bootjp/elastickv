@@ -127,10 +127,10 @@ func (f *kvFSM) TTLInlineCapabilityRecorded() bool {
 	return !f.ttlInlineCapabilityDisabled && f.ttlInlineCapabilityRecorded.Load()
 }
 
-// TTLInlineCertifiedLearner checks the durable marker, not a local proof bit.
-// A learner present when the marker was committed was part of its all-member
-// certificate and may be promoted without admitting a new replica.
-func (f *kvFSM) TTLInlineCertifiedLearner(ctx context.Context, member uint64) (bool, error) {
+// TTLInlineCertifiedLearner checks the durable marker against the current
+// native cut, not a local proof bit. An unchanged certified learner may be
+// promoted without admitting a new replica.
+func (f *kvFSM) TTLInlineCertifiedLearner(ctx context.Context, member uint64, native raftengine.NativeConfiguration) (bool, error) {
 	if ctx == nil {
 		return false, errors.WithStack(ErrTTLInlineCapabilityMarker)
 	}
@@ -147,6 +147,9 @@ func (f *kvFSM) TTLInlineCertifiedLearner(ctx context.Context, member uint64) (b
 	marker, err := decodeTTLInlineCapabilityMarker(raw)
 	if err != nil {
 		return false, err
+	}
+	if !marker.matches(native) {
+		return false, nil
 	}
 	return slices.Contains(marker.Learners, member) || slices.Contains(marker.LearnersNext, member), nil
 }

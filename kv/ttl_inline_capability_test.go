@@ -131,18 +131,28 @@ func TestTTLInlineCertifiedLearnerReadsDurableMarker(t *testing.T) {
 	payload := capabilityPayload(t, ttlInlineCapabilityMarker{Version: 1, Index: 5, Voters: native.Voters, Learners: native.Learners})
 	require.Nil(t, applyCapability(t, f, 6, native, payload))
 	require.False(t, f.TTLInlineCapabilityActive())
-	certified, err := f.TTLInlineCertifiedLearner(t.Context(), 3)
+	certified, err := f.TTLInlineCertifiedLearner(t.Context(), 3, native)
 	require.NoError(t, err)
 	require.True(t, certified)
 	for _, member := range []uint64{0, 1, 4} {
-		certified, err = f.TTLInlineCertifiedLearner(t.Context(), member)
+		certified, err = f.TTLInlineCertifiedLearner(t.Context(), member, native)
 		require.NoError(t, err)
 		require.False(t, certified)
 	}
+	stale := native
+	stale.Index++
+	certified, err = f.TTLInlineCertifiedLearner(t.Context(), 3, stale)
+	require.NoError(t, err)
+	require.False(t, certified)
+	stale = native
+	stale.Voters = []uint64{1}
+	certified, err = f.TTLInlineCertifiedLearner(t.Context(), 3, stale)
+	require.NoError(t, err)
+	require.False(t, certified)
 	withoutMarker := store.NewMVCCStore()
 	t.Cleanup(func() { require.NoError(t, withoutMarker.Close()) })
 	f.store = withoutMarker
-	certified, err = f.TTLInlineCertifiedLearner(t.Context(), 3)
+	certified, err = f.TTLInlineCertifiedLearner(t.Context(), 3, native)
 	require.NoError(t, err)
 	require.False(t, certified, "a monotonic recorded bit cannot replace the durable marker")
 }
