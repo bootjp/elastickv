@@ -1,8 +1,12 @@
 # Stateful runtime readiness
 
-Use an image containing the runtime readiness listener. Replace the placeholder
-image in `kustomization.yaml` with the published digest before applying this
-example. The base remains pinned to an older image and does not enable this flag.
+The base remains pinned to an older image without the runtime readiness listener.
+The `image-first` overlay pins the image built from main commit
+`b9043cbb23860d69525b7db405b711e7756dc483` and enables its private health
+listener while retaining the base TCP probes. The parent overlay changes only
+the probes after every member has been upgraded. Use a newer published digest
+only after its startup, restore, and replication checks pass.
+The pinned digest is recorded by the [successful main image build](https://github.com/bootjp/elastickv/actions/runs/43813746736).
 
 `--healthAddress=0.0.0.0:8081` enables a separate private HTTP listener:
 
@@ -37,7 +41,23 @@ cluster-wide membership/quorum checks and signed API canaries. Readiness does no
 prove end-to-end protocol compatibility, synchronous durability, or every byte of
 an on-disk snapshot. Restore success is reported from the actual engine path.
 
-For an existing installation, first roll out the new image with the old probes,
-verify its private listener, and only then switch the readiness configuration.
-An older image without this endpoint must also recover its old probe settings on
-rollback; image-only rollback is safe only when those settings are compatible.
+For an existing installation:
+
+1. Render `kubectl kustomize deploy/kubernetes/examples/readiness/image-first`
+   and apply `kubectl apply -k deploy/kubernetes/examples/readiness/image-first`.
+   The StatefulSet uses `OnDelete`: replace
+   one Pod at a time, preserving its PVC. After each replacement, verify its
+   `/livez` and `/readyz` on the private port, its applied membership and
+   catch-up, and cluster quorum before replacing another member. The TCP
+   probes remain in force during this stage.
+2. Once every member serves the new listener and the cluster-wide checks and
+   signed API canaries pass, render and apply
+   `deploy/kubernetes/examples/readiness`. Replace one
+   Pod at a time again so the new HTTP probes take effect. Confirm that
+   `/livez` remains independent of slow recovery and `/readyz` stays 503 until
+   the local groups are ready.
+3. To roll back to the old image, first restore the base TCP probe settings
+   with a compatible image configuration, then replace Pods one at a time.
+   Never leave an old image running behind the HTTP probes. Keep the PVCs.
+
+The health port is not in a public Service or NetworkPolicy ingress grant.

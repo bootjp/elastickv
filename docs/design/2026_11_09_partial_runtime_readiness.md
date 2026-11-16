@@ -91,5 +91,10 @@ Five review passes:
    HTTP method/privacy behavior, and a listener alive before readiness.
 
 Focused race tests and new-diff lint passed. The readiness overlay renders with
-Kustomize and deliberately requires a new image digest. Full CI/Jepsen and live
-bootstrap validation remain required before enabling this listener in production.
+Kustomize. A staged overlay now pins the image built from main commit
+`b9043cbb23860d69525b7db405b711e7756dc483`: the first stage upgrades the
+image and enables the listener while preserving TCP probes, and the second
+stage switches the probes. The base is unchanged. The pinned image has passed
+its main-branch CI, but a real cluster rollout, quorum/catch-up checks, and
+signed API canaries have not been performed. These operational gates remain
+required before making the HTTP readiness probe the production default.
