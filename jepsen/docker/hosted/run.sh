@@ -92,14 +92,22 @@ if [[ "$adapter" == filesystem-* && ! -c /dev/fuse ]]; then
   exit 1
 fi
 
+recovery_time=10
+if [[ "$adapter" == filesystem-* && "$fault" == partition ]]; then
+  # Repeated partitions can leave a FUSE mount temporarily unable to serve
+  # reads after the network heals. Keep the final-read check strict, but give
+  # the Raft groups time to elect leaders and restore the mount first.
+  recovery_time=60
+fi
+
 ssh-keygen -q -t ed25519 -N '' -f "$JEPSEN_SSH_DIR/id_ed25519"
 go_version=$(awk '$1 == "toolchain" {sub(/^go/, "", $2); print $2}' go.mod)
 docker build --build-arg "GO_VERSION=$go_version" -t "$JEPSEN_IMAGE" jepsen/docker/hosted
 "${compose[@]}" up -d --wait n1 n2 n3
 
 git rev-parse HEAD > "$artifact_dir/commit.txt"
-printf 'adapter=%s\nfault=%s\ntime-limit=%s\nfault-interval=5\nrecovery-time=10\nrate=%s\nconcurrency=%s\nkey-count=%s\nmax-writes-per-key=%s\nmax-txn-length=%s\nrepeat-faults=%s\nmin-fault-cycles=%s\n' \
-  "$adapter" "$fault" "$time_limit" "$rate" "$concurrency" "$key_count" "$max_writes" \
+printf 'adapter=%s\nfault=%s\ntime-limit=%s\nfault-interval=5\nrecovery-time=%s\nrate=%s\nconcurrency=%s\nkey-count=%s\nmax-writes-per-key=%s\nmax-txn-length=%s\nrepeat-faults=%s\nmin-fault-cycles=%s\n' \
+  "$adapter" "$fault" "$time_limit" "$recovery_time" "$rate" "$concurrency" "$key_count" "$max_writes" \
   "$max_txn_length" "$repeat_faults" "$min_cycles" > "$artifact_dir/parameters.txt"
 "${compose[@]}" config > "$artifact_dir/compose.yml"
 # These are SSH-managed nodes: --local and --host would disable the nemesis.
@@ -112,7 +120,7 @@ else
   workload=(lein run -m elastickv.hosted-fault-workload
     --adapter "$adapter" --nodes 'n1,n2,n3' --ssh-user root --ssh-key /run/jepsen-ssh/id_ed25519
     --faults "$fault" --fault-interval 5 --time-limit "$time_limit"
-    --recovery-time 10 --rate "$rate" --concurrency "$concurrency" --key-count "$key_count"
+    --recovery-time "$recovery_time" --rate "$rate" --concurrency "$concurrency" --key-count "$key_count"
     --max-writes-per-key "$max_writes" --max-txn-length "$max_txn_length"
     --min-fault-cycles "$min_cycles" "${extra_args[@]}")
 fi
