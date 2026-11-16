@@ -168,7 +168,7 @@ func (f *kvFSM) reloadTTLInlineCapability(ctx context.Context) error {
 	return nil
 }
 
-func (f *kvFSM) applyTTLInlineCapability(raw []byte) any {
+func (f *kvFSM) applyTTLInlineCapability(ctx context.Context, raw []byte) any {
 	if f.ttlInlineCapabilityDisabled {
 		return haltErr(errors.WithStack(ErrTTLInlineCapabilityDisabled))
 	}
@@ -182,8 +182,15 @@ func (f *kvFSM) applyTTLInlineCapability(raw []byte) any {
 	if !marker.matches(*f.pendingNativeConfiguration) {
 		return nil // An intervening ConfChange makes this proposal stale.
 	}
-	// No production all-member proof producer exists yet. The verdict is the
-	// same on every replica; a local proof callback would make replay diverge.
-	// Keep activation closed until a verified leader proposal path is wired.
+	writer, ok := f.store.(store.ReplicatedControlStore)
+	if !ok {
+		return haltErr(errors.Wrap(ErrTTLInlineCapabilityMarker, "store lacks replicated control state"))
+	}
+	if _, err := writer.ApplyReplicatedControlState(ctx, ttlInlineCapabilityKey, raw, f.pendingApplyIdx); err != nil {
+		return haltErr(errors.Wrap(err, "persist TTL-inline capability"))
+	}
+	if err := f.reloadTTLInlineCapability(ctx); err != nil {
+		return haltErr(err)
+	}
 	return nil
 }

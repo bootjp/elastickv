@@ -8,6 +8,7 @@ import (
 
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/store"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -52,8 +53,10 @@ func TestTTLInlineCapabilityStaleConfiguration(t *testing.T) {
 	require.ErrorIs(t, err, store.ErrKeyNotFound)
 	require.Nil(t, applyCapability(t, f, 8, native, payload))
 	require.False(t, f.TTLInlineCapabilityActive(), "matching marker is not independent all-member proof")
-	_, err = st.GetAt(t.Context(), ttlInlineCapabilityKey, ^uint64(0))
-	require.ErrorIs(t, err, store.ErrKeyNotFound)
+	recorded, err := st.GetAt(t.Context(), ttlInlineCapabilityKey, ^uint64(0))
+	require.NoError(t, err)
+	require.Equal(t, payload[1:], recorded)
+	require.True(t, f.TTLInlineCapabilityRecorded())
 }
 
 func TestTTLInlineCapabilityApplyIsReplicaDeterministic(t *testing.T) {
@@ -66,10 +69,41 @@ func TestTTLInlineCapabilityApplyIsReplicaDeterministic(t *testing.T) {
 		f := newTTLInlineFSM(t, st)
 		require.Nil(t, applyCapability(t, f, 6, native, payload))
 		require.False(t, f.TTLInlineCapabilityActive())
-		require.False(t, f.TTLInlineCapabilityRecorded())
-		_, err := st.GetAt(t.Context(), ttlInlineCapabilityKey, ^uint64(0))
-		require.ErrorIs(t, err, store.ErrKeyNotFound)
+		require.True(t, f.TTLInlineCapabilityRecorded())
+		recorded, err := st.GetAt(t.Context(), ttlInlineCapabilityKey, ^uint64(0))
+		require.NoError(t, err)
+		require.Equal(t, payload[1:], recorded)
 	}
+}
+
+func TestTTLInlineCapabilityApplyRequiresDurableWrite(t *testing.T) {
+	t.Parallel()
+	st := store.NewMVCCStore()
+	t.Cleanup(func() { require.NoError(t, st.Close()) })
+	failure := errors.New("disk unavailable")
+	f := newTTLInlineFSM(t, &failingPinControlStore{MVCCStore: st, err: failure})
+	native := raftengine.NativeConfiguration{Index: 5, Voters: []uint64{1}}
+	require.NoError(t, f.InstallTTLInlineRecoveryProof(t.Context(), true, native))
+	payload := capabilityPayload(t, ttlInlineCapabilityMarker{Version: 1, Index: 5, Voters: []uint64{1}})
+	require.ErrorIs(t, haltApplyOf(applyCapability(t, f, 6, native, payload)), failure)
+	require.False(t, f.TTLInlineCapabilityRecorded())
+	require.False(t, f.TTLInlineCapabilityActive())
+	_, err := st.GetAt(t.Context(), ttlInlineCapabilityKey, ^uint64(0))
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+}
+
+func TestTTLInlineCapabilityApplyWithLocalRecoveryProof(t *testing.T) {
+	t.Parallel()
+	st := store.NewMVCCStore()
+	t.Cleanup(func() { require.NoError(t, st.Close()) })
+	f := newTTLInlineFSM(t, st)
+	native := raftengine.NativeConfiguration{Index: 5, Voters: []uint64{1}}
+	require.NoError(t, f.InstallTTLInlineRecoveryProof(t.Context(), true, native))
+	require.False(t, f.TTLInlineCapabilityActive())
+	payload := capabilityPayload(t, ttlInlineCapabilityMarker{Version: 1, Index: 5, Voters: []uint64{1}})
+	require.Nil(t, applyCapability(t, f, 6, native, payload))
+	require.True(t, f.TTLInlineCapabilityRecorded())
+	require.True(t, f.TTLInlineCapabilityActive())
 }
 
 func TestTTLInlineCapabilityRecovery(t *testing.T) {
@@ -82,11 +116,6 @@ func TestTTLInlineCapabilityRecovery(t *testing.T) {
 	payload := capabilityPayload(t, ttlInlineCapabilityMarker{Version: 1, Index: 2, Voters: []uint64{1}, Learners: []uint64{2}})
 	require.Nil(t, applyCapability(t, f, 3, native, payload))
 	require.False(t, f.TTLInlineCapabilityActive())
-	writer, ok := st.(store.ReplicatedControlStore)
-	require.True(t, ok)
-	_, err = writer.ApplyReplicatedControlState(t.Context(), ttlInlineCapabilityKey, payload[1:], 3)
-	require.NoError(t, err)
-	require.NoError(t, f.reloadTTLInlineCapability(t.Context()))
 	require.True(t, f.TTLInlineCapabilityRecorded())
 	snap, err := f.Snapshot()
 	require.NoError(t, err)
