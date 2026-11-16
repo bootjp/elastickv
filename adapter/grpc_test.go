@@ -1,10 +1,12 @@
 package adapter
 
 import (
+	"bytes"
 	"context"
 	"strconv"
 	"sync"
 	"testing"
+	"time"
 
 	_ "github.com/Jille/grpc-multi-resolver"
 	"github.com/bootjp/elastickv/distribution"
@@ -13,6 +15,7 @@ import (
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -45,6 +48,107 @@ func grpcSequenceIterations(t testing.TB) int {
 		return grpcSequenceShortIterations
 	}
 	return grpcSequenceFullIterations
+}
+
+func isIndeterminateGRPCMutation(err error) bool {
+	st, ok := status.FromError(err)
+	if !ok || st.Code() != codes.Unknown {
+		return false
+	}
+	for _, detail := range st.Details() {
+		info, ok := detail.(*errdetails.ErrorInfo)
+		if ok && info.GetDomain() == publicGRPCFailureDomain && info.GetReason() == publicGRPCUnknownReason {
+			return true
+		}
+	}
+	return false
+}
+
+func putSequenceValue(ctx context.Context, c pb.RawKVClient, key, want []byte) error {
+	deadline := time.Now().Add(leaderChurnRetryTimeout)
+	for {
+		putErr := retryNotLeader(ctx, func() error {
+			_, err := c.RawPut(ctx, &pb.RawPutRequest{Key: key, Value: want})
+			return err
+		})
+		if putErr == nil || !isIndeterminateGRPCMutation(putErr) {
+			return putErr
+		}
+
+		var resp *pb.RawGetResponse
+		getErr := retryNotLeader(ctx, func() error {
+			var err error
+			resp, err = c.RawGet(ctx, &pb.RawGetRequest{Key: key})
+			return err
+		})
+		if getErr != nil {
+			return getErr
+		}
+		if bytes.Equal(resp.Value, want) {
+			return nil
+		}
+		if !time.Now().Before(deadline) {
+			return putErr
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(leaderChurnRetryInterval):
+		}
+	}
+}
+
+type sequenceRawKVClient struct {
+	pb.RawKVClient
+	put func() error
+	get func() []byte
+}
+
+func (c sequenceRawKVClient) RawPut(context.Context, *pb.RawPutRequest, ...grpc.CallOption) (*pb.RawPutResponse, error) {
+	return nil, c.put()
+}
+
+func (c sequenceRawKVClient) RawGet(context.Context, *pb.RawGetRequest, ...grpc.CallOption) (*pb.RawGetResponse, error) {
+	return &pb.RawGetResponse{Value: c.get()}, nil
+}
+
+func TestPutSequenceValueResolvesIndeterminateOutcome(t *testing.T) {
+	t.Parallel()
+	unknown, err := status.New(codes.Unknown, "Operation outcome unknown").WithDetails(&errdetails.ErrorInfo{
+		Domain: publicGRPCFailureDomain,
+		Reason: publicGRPCUnknownReason,
+	})
+	require.NoError(t, err)
+
+	for _, tc := range []struct {
+		name      string
+		readValue []byte
+		wantPuts  int
+		wantReads int
+	}{
+		{name: "committed", readValue: []byte("new"), wantPuts: 1, wantReads: 1},
+		{name: "not committed", readValue: []byte("old"), wantPuts: 2, wantReads: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			puts, reads := 0, 0
+			c := sequenceRawKVClient{
+				put: func() error {
+					puts++
+					if puts == 1 {
+						return unknown.Err()
+					}
+					return nil
+				},
+				get: func() []byte {
+					reads++
+					return tc.readValue
+				},
+			}
+			require.NoError(t, putSequenceValue(t.Context(), c, []byte("key"), []byte("new")))
+			require.Equal(t, tc.wantPuts, puts)
+			require.Equal(t, tc.wantReads, reads)
+		})
+	}
 }
 
 func Test_value_can_be_deleted(t *testing.T) {
@@ -1140,19 +1244,12 @@ func Test_consistency_satisfy_write_after_read_sequence(t *testing.T) {
 	ctx := t.Context()
 	key := []byte("test-key-sequence")
 
-	// Each RPC is wrapped in retryNotLeader so an in-flight Raft
-	// re-election (which can fire mid-loop on a busy CI runner — emit
-	// "leader not found" / "etcd raft engine is not leader" — and is
-	// purely an availability hiccup, not a consistency violation) does
-	// not abort the test. The post-RPC assert.Equal still pins the
-	// consistency invariant: once Put eventually succeeds, the
-	// subsequent Get must return the same value, otherwise we fail.
+	// A re-election can make a Put outcome indeterminate. Resolve that
+	// only for this idempotent value write by reading the key before
+	// retrying; the final Get still checks the consistency invariant.
 	for i := range grpcSequenceIterations(t) {
 		want := []byte("sequence" + strconv.Itoa(i))
-		err := retryNotLeader(ctx, func() error {
-			_, perr := c.RawPut(ctx, &pb.RawPutRequest{Key: key, Value: want})
-			return perr
-		})
+		err := putSequenceValue(ctx, c, key, want)
 		// Stop at the first non-leader-churn RPC failure instead of
 		// continuing: a genuine regression would otherwise cascade
 		// into 9998 more iterations, each reporting the same broken
@@ -1161,10 +1258,7 @@ func Test_consistency_satisfy_write_after_read_sequence(t *testing.T) {
 			break
 		}
 
-		err = retryNotLeader(ctx, func() error {
-			_, perr := c.RawPut(ctx, &pb.RawPutRequest{Key: key, Value: want})
-			return perr
-		})
+		err = putSequenceValue(ctx, c, key, want)
 		if !assert.NoError(t, err, "Put RPC failed") {
 			break
 		}
