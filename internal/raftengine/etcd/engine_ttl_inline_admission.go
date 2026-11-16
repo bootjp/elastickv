@@ -15,6 +15,25 @@ const ttlInlineMarkerScanBatch = 128
 
 var errTTLInlineAdmissionStoragePending = errors.New("etcd raft membership change waits for pending Raft storage append")
 var errTTLInlineAdmissionSnapshotPending = errors.New("etcd raft membership change waits for snapshot recovery")
+var errTTLInlineMarkerProposalUnauthorized = errors.New("etcd raft TTL-inline capability marker requires verified admission")
+
+func (e *Engine) rejectUnverifiedTTLInlineMarker(payload []byte) error {
+	classifier, ok := e.fsm.(ttlInlineMarkerClassifier)
+	if !ok {
+		return nil
+	}
+	if classifier.IsTTLInlineCapabilityMarkerPayload(payload) {
+		return errors.WithStack(errTTLInlineMarkerProposalUnauthorized)
+	}
+	if e.raftCipher == nil {
+		return nil
+	}
+	plain, err := unwrapRaftPayload(e.raftCipher, payload)
+	if err == nil && classifier.IsTTLInlineCapabilityMarkerPayload(plain) {
+		return errors.WithStack(errTTLInlineMarkerProposalUnauthorized)
+	}
+	return nil
+}
 
 func (e *Engine) ttlInlineMembershipBlocked() (bool, error) {
 	if recorded, ok := e.fsm.(interface{ TTLInlineCapabilityRecorded() bool }); ok && recorded.TTLInlineCapabilityRecorded() {

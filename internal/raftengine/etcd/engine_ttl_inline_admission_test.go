@@ -1,12 +1,33 @@
 package etcd
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 	etcdraft "go.etcd.io/raft/v3"
 	raftpb "go.etcd.io/raft/v3/raftpb"
 )
+
+func TestTTLInlineMarkerRequiresVerifiedProposalPath(t *testing.T) {
+	t.Parallel()
+	cipher, kid := raftCipherFixture(t)
+	e := &Engine{fsm: &ttlInlineMarkerTestFSM{}, raftCipher: cipher}
+	for _, payload := range [][]byte{
+		{0x2e},
+		func() []byte {
+			entry := envelopeEntry(t, cipher, kid, 2, []byte{0x2e})
+			_, wrapped, ok := decodeProposalEnvelope(entry.GetData())
+			require.True(t, ok)
+			return wrapped
+		}(),
+	} {
+		done := make(chan proposalResult, 1)
+		e.handleProposal(proposalRequest{ctx: context.Background(), payload: payload, done: done})
+		require.ErrorIs(t, (<-done).err, errTTLInlineMarkerProposalUnauthorized)
+	}
+	require.NoError(t, e.rejectUnverifiedTTLInlineMarker([]byte{0x01}))
+}
 
 type ttlInlineMarkerTestFSM struct{ StateMachine }
 

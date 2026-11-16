@@ -2210,6 +2210,10 @@ func (e *Engine) handleProposal(req proposalRequest) {
 		req.done <- proposalResult{err: err}
 		return
 	}
+	if err := e.rejectUnverifiedTTLInlineMarker(req.payload); err != nil {
+		req.done <- proposalResult{err: err}
+		return
+	}
 	if e.State() != raftengine.StateLeader {
 		req.done <- proposalResult{err: errors.WithStack(errNotLeader)}
 		return
