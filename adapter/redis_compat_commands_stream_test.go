@@ -503,29 +503,45 @@ func TestRedis_StreamXTrimReturnAndMetaTrackLenTrim(t *testing.T) {
 
 	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
 	defer func() { _ = rdb.Close() }()
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Seed a small populated stream.
 	for i := range 5 {
-		_, err := rdb.XAdd(ctx, &redis.XAddArgs{
+		args := &redis.XAddArgs{
 			Stream: "stream-trim-actual",
 			ID:     fmt.Sprintf("%d-0", 1_000_000+i),
 			Values: []string{"i", fmt.Sprint(i)},
-		}).Result()
+		}
+		err := retryNotLeader(ctx, func() error { return rdb.XAdd(ctx, args).Err() })
 		require.NoError(t, err)
 	}
 
 	// Trim to 3: 2 entries should be removed; XTRIM returns 2; XLEN is 3.
-	removed, err := rdb.Do(ctx, "XTRIM", "stream-trim-actual", "MAXLEN", "3").Int64()
+	var removed int64
+	err := retryNotLeader(ctx, func() error {
+		var trimErr error
+		removed, trimErr = rdb.Do(ctx, "XTRIM", "stream-trim-actual", "MAXLEN", "3").Int64()
+		return trimErr
+	})
 	require.NoError(t, err)
 	require.Equal(t, int64(2), removed,
 		"XTRIM must report the actual number of entries removed (len(trim)), not the requested diff")
 
-	xlen, err := rdb.XLen(ctx, "stream-trim-actual").Result()
+	var xlen int64
+	err = retryNotLeader(ctx, func() error {
+		var lenErr error
+		xlen, lenErr = rdb.XLen(ctx, "stream-trim-actual").Result()
+		return lenErr
+	})
 	require.NoError(t, err)
 	require.Equal(t, int64(3), xlen, "meta.Length must equal len(remaining), not the planned post-trim count")
 
-	entries, err := rdb.XRange(ctx, "stream-trim-actual", "-", "+").Result()
+	var entries []redis.XMessage
+	err = retryNotLeader(ctx, func() error {
+		var rangeErr error
+		entries, rangeErr = rdb.XRange(ctx, "stream-trim-actual", "-", "+").Result()
+		return rangeErr
+	})
 	require.NoError(t, err)
 	require.Len(t, entries, 3,
 		"XRANGE must return as many entries as XLEN claims; meta.Length and physical rows must agree")
@@ -533,10 +549,18 @@ func TestRedis_StreamXTrimReturnAndMetaTrackLenTrim(t *testing.T) {
 	// Trim to a value greater than the current length: zero deletions, zero
 	// reported, meta.Length unchanged. Guards against returning a negative
 	// or absurd count when diff <= 0.
-	removed, err = rdb.Do(ctx, "XTRIM", "stream-trim-actual", "MAXLEN", "100").Int64()
+	err = retryNotLeader(ctx, func() error {
+		var trimErr error
+		removed, trimErr = rdb.Do(ctx, "XTRIM", "stream-trim-actual", "MAXLEN", "100").Int64()
+		return trimErr
+	})
 	require.NoError(t, err)
 	require.Equal(t, int64(0), removed)
-	xlen, err = rdb.XLen(ctx, "stream-trim-actual").Result()
+	err = retryNotLeader(ctx, func() error {
+		var lenErr error
+		xlen, lenErr = rdb.XLen(ctx, "stream-trim-actual").Result()
+		return lenErr
+	})
 	require.NoError(t, err)
 	require.Equal(t, int64(3), xlen)
 }
