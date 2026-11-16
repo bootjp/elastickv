@@ -9,6 +9,7 @@ import (
 
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
 	"golang.org/x/sync/errgroup"
@@ -32,6 +33,28 @@ type ttlInlineCertificateEngine interface {
 }
 
 type ttlInlineCapabilityProbe func(context.Context, uint64, string, *pb.GetTTLInlineCapabilityRequest) (*pb.GetTTLInlineCapabilityResponse, error)
+
+// ProposeRuntimeTTLInlineCapability collects fresh proof and submits its
+// configuration-bound marker through the wrap-aware, native-gated proposer.
+func ProposeRuntimeTTLInlineCapability(ctx context.Context, rt *GroupRuntime, group *kv.ShardGroup) (*raftengine.ProposalResult, error) {
+	if rt == nil || rt.GroupRuntime == nil || group == nil || group.Engine == nil || group.Engine != rt.SnapshotEngine() {
+		return nil, errors.New("TTL-inline capability proposal requires the matching runtime group")
+	}
+	certificate, err := CollectRuntimeTTLInlineCapabilityCertificate(ctx, rt)
+	if err != nil {
+		return nil, err
+	}
+	payload, err := kv.EncodeTTLInlineCapabilityMarker(certificate.Native)
+	if err != nil {
+		return nil, errors.Wrap(err, "encode TTL-inline capability marker")
+	}
+	proposer, ok := group.Proposer().(raftengine.TTLInlineCapabilityProposer)
+	if !ok {
+		return nil, errors.New("TTL-inline capability proposal is unsupported")
+	}
+	result, err := proposer.ProposeTTLInlineCapability(ctx, certificate.Native, certificate.Term, payload)
+	return result, errors.Wrap(err, "propose TTL-inline capability marker")
+}
 
 // CollectRuntimeTTLInlineCapabilityCertificate uses the process's protected
 // transport and current Raft/FSM instances. It cannot activate a capability.

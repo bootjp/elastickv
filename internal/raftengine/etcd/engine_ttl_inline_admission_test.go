@@ -1,9 +1,11 @@
 package etcd
 
 import (
+	"bytes"
 	"context"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/stretchr/testify/require"
 	etcdraft "go.etcd.io/raft/v3"
 	raftpb "go.etcd.io/raft/v3/raftpb"
@@ -27,9 +29,64 @@ func TestTTLInlineMarkerRequiresVerifiedProposalPath(t *testing.T) {
 		require.ErrorIs(t, (<-done).err, errTTLInlineMarkerProposalUnauthorized)
 	}
 	require.NoError(t, e.rejectUnverifiedTTLInlineMarker([]byte{0x01}))
+	normal := envelopeEntry(t, cipher, kid, 3, []byte{0x01})
+	_, encrypted, ok := decodeProposalEnvelope(normal.GetData())
+	require.True(t, ok)
+	require.NoError(t, e.rejectUnverifiedTTLInlineMarker(encrypted))
 }
 
 type ttlInlineMarkerTestFSM struct{ StateMachine }
+
+type ttlInlineProposalTestFSM struct {
+	ttlInlineMarkerTestFSM
+	fenced bool
+}
+
+func (f *ttlInlineProposalTestFSM) TTLInlineFenceReady() bool { return f.fenced }
+
+func (f *ttlInlineProposalTestFSM) ValidateTTLInlineCapabilityMarkerPayload(payload []byte, native raftengine.NativeConfiguration) error {
+	if bytes.Equal(payload, []byte{0x2e, 0x01}) && native.Index == 1 {
+		return nil
+	}
+	return errTTLInlineMarkerProposalUnauthorized
+}
+
+func TestTTLInlineMarkerNativeProposalRequiresCurrentCut(t *testing.T) {
+	t.Parallel()
+	storage := etcdraft.NewMemoryStorage()
+	raw, err := etcdraft.NewRawNode(&etcdraft.Config{ID: 1, Storage: storage, ElectionTick: 10, HeartbeatTick: 1, MaxInflightMsgs: 1})
+	require.NoError(t, err)
+	require.NoError(t, raw.Bootstrap([]etcdraft.Peer{{ID: 1}}))
+	fsm := &ttlInlineProposalTestFSM{fenced: true}
+	e := &Engine{rawNode: raw, recoveredIdentity: &WALIdentity{}, fsm: fsm,
+		nativeConfigurationIndex: 1, peers: map[uint64]Peer{1: {NodeID: 1, Address: "n1:50051"}}}
+	native := *e.captureApplyNativeConfiguration()
+	req := proposalRequest{payload: []byte{0x2e, 0x01}, ttlInlineCut: &ttlInlineProposalCut{native: native, term: raw.BasicStatus().GetTerm()}}
+	require.NoError(t, e.authorizeTTLInlineMarkerProposal(req))
+	e.raftCutoverIndex = func() uint64 { return 1 }
+	e.appliedIndex.Store(1)
+	require.ErrorIs(t, e.authorizeTTLInlineMarkerProposal(req), errTTLInlineMarkerProposalUnauthorized,
+		"post-cutover marker must use the raft envelope")
+	e.raftCutoverIndex = nil
+	req.ttlInlineCut.term++
+	require.ErrorIs(t, e.authorizeTTLInlineMarkerProposal(req), errTTLInlineMarkerProposalUnauthorized)
+	req.ttlInlineCut.term--
+	req.ttlInlineCut.native.Members[0].Address = "changed:50051"
+	require.ErrorIs(t, e.authorizeTTLInlineMarkerProposal(req), errTTLInlineMarkerProposalUnauthorized)
+	req.ttlInlineCut.native.Members[0].Address = "n1:50051"
+	fsm.fenced = false
+	require.ErrorIs(t, e.authorizeTTLInlineMarkerProposal(req), errTTLInlineMarkerProposalUnauthorized)
+	fsm.fenced = true
+	req.payload = []byte{0x2e, 0xff}
+	require.ErrorIs(t, e.authorizeTTLInlineMarkerProposal(req), errTTLInlineMarkerProposalUnauthorized)
+
+	cipher, kid := raftCipherFixture(t)
+	e.raftCipher = cipher
+	entry := envelopeEntry(t, cipher, kid, 2, []byte{0x2e, 0x01})
+	_, req.payload, _ = decodeProposalEnvelope(entry.GetData())
+	e.raftCutoverIndex = func() uint64 { return 1 }
+	require.NoError(t, e.authorizeTTLInlineMarkerProposal(req))
+}
 
 type ttlInlineRecoveryInvalidationFSM struct {
 	StateMachine

@@ -599,6 +599,7 @@ type proposalRequest struct {
 	id            uint64
 	payload       []byte
 	payloadDigest [32]byte
+	ttlInlineCut  *ttlInlineProposalCut
 	done          chan proposalResult
 }
 
@@ -1222,6 +1223,10 @@ func (e *Engine) ProposeAdmin(ctx context.Context, data []byte) (*raftengine.Pro
 }
 
 func (e *Engine) propose(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
+	return e.proposeWithTTLInlineCut(ctx, data, nil)
+}
+
+func (e *Engine) proposeWithTTLInlineCut(ctx context.Context, data []byte, cut *ttlInlineProposalCut) (*raftengine.ProposalResult, error) {
 	if err := contextErr(ctx); err != nil {
 		return nil, err
 	}
@@ -1238,6 +1243,7 @@ func (e *Engine) propose(ctx context.Context, data []byte) (*raftengine.Proposal
 	if err != nil {
 		return nil, err
 	}
+	req.ttlInlineCut = cut
 
 	select {
 	case <-ctx.Done():
@@ -2210,7 +2216,7 @@ func (e *Engine) handleProposal(req proposalRequest) {
 		req.done <- proposalResult{err: err}
 		return
 	}
-	if err := e.rejectUnverifiedTTLInlineMarker(req.payload); err != nil {
+	if err := e.authorizeTTLInlineMarkerProposal(req); err != nil {
 		req.done <- proposalResult{err: err}
 		return
 	}

@@ -1,8 +1,11 @@
 package etcd
 
 import (
+	"context"
 	"math"
+	"slices"
 
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/cockroachdb/errors"
 	raftpb "go.etcd.io/raft/v3/raftpb"
 )
@@ -11,25 +14,95 @@ type ttlInlineMarkerClassifier interface {
 	IsTTLInlineCapabilityMarkerPayload([]byte) bool
 }
 
+type ttlInlineMarkerValidator interface {
+	TTLInlineFenceReady() bool
+	ValidateTTLInlineCapabilityMarkerPayload([]byte, raftengine.NativeConfiguration) error
+}
+
+type ttlInlineProposalCut struct {
+	native raftengine.NativeConfiguration
+	term   uint64
+}
+
 const ttlInlineMarkerScanBatch = 128
 
 var errTTLInlineAdmissionStoragePending = errors.New("etcd raft membership change waits for pending Raft storage append")
 var errTTLInlineAdmissionSnapshotPending = errors.New("etcd raft membership change waits for snapshot recovery")
 var errTTLInlineMarkerProposalUnauthorized = errors.New("etcd raft TTL-inline capability marker requires verified admission")
 
-func (e *Engine) rejectUnverifiedTTLInlineMarker(payload []byte) error {
-	classifier, ok := e.fsm.(ttlInlineMarkerClassifier)
-	if !ok {
-		return nil
+func (e *Engine) ProposeTTLInlineCapability(ctx context.Context, native raftengine.NativeConfiguration, term uint64, payload []byte) (*raftengine.ProposalResult, error) {
+	copy := native
+	copy.Voters = slices.Clone(native.Voters)
+	copy.VotersOutgoing = slices.Clone(native.VotersOutgoing)
+	copy.Learners = slices.Clone(native.Learners)
+	copy.LearnersNext = slices.Clone(native.LearnersNext)
+	copy.Members = slices.Clone(native.Members)
+	return e.proposeWithTTLInlineCut(ctx, payload, &ttlInlineProposalCut{native: copy, term: term})
+}
+
+func (e *Engine) authorizeTTLInlineMarkerProposal(req proposalRequest) error {
+	if req.ttlInlineCut == nil {
+		return e.rejectUnverifiedTTLInlineMarker(req.payload)
 	}
-	if classifier.IsTTLInlineCapabilityMarkerPayload(payload) {
+	marker, wrapped := e.ttlInlineCleartextMarker(req.payload)
+	validator, ok := e.fsm.(ttlInlineMarkerValidator)
+	if marker == nil || !ok || !validator.TTLInlineFenceReady() {
 		return errors.WithStack(errTTLInlineMarkerProposalUnauthorized)
 	}
-	if e.raftCipher == nil {
-		return nil
+	current, ok := e.currentTTLInlineProposalCut(req.ttlInlineCut, wrapped)
+	if !ok {
+		return errors.WithStack(errTTLInlineMarkerProposalUnauthorized)
 	}
-	plain, err := unwrapRaftPayload(e.raftCipher, payload)
-	if err == nil && classifier.IsTTLInlineCapabilityMarkerPayload(plain) {
+	if err := validator.ValidateTTLInlineCapabilityMarkerPayload(marker, current); err != nil {
+		return errors.Join(errTTLInlineMarkerProposalUnauthorized, err)
+	}
+	return nil
+}
+
+func (e *Engine) currentTTLInlineProposalCut(cut *ttlInlineProposalCut, wrapped bool) (raftengine.NativeConfiguration, bool) {
+	if e.rawNode == nil || e.recoveredIdentity == nil || cut.term == 0 {
+		return raftengine.NativeConfiguration{}, false
+	}
+	current := e.captureApplyNativeConfiguration()
+	if current == nil || e.rawNode.BasicStatus().GetTerm() != cut.term || !sameTTLInlineProposalCut(*current, cut.native) {
+		return raftengine.NativeConfiguration{}, false
+	}
+	cutover := orInertCutover(e.raftCutoverIndex)()
+	if cutover != math.MaxUint64 && e.appliedIndex.Load() >= cutover && !wrapped {
+		return raftengine.NativeConfiguration{}, false
+	}
+	return *current, true
+}
+
+func sameTTLInlineProposalCut(left, right raftengine.NativeConfiguration) bool {
+	return left.Index == right.Index && left.AutoLeave == right.AutoLeave &&
+		slices.Equal(left.Voters, right.Voters) && slices.Equal(left.VotersOutgoing, right.VotersOutgoing) &&
+		slices.Equal(left.Learners, right.Learners) && slices.Equal(left.LearnersNext, right.LearnersNext) &&
+		slices.Equal(left.Members, right.Members)
+}
+
+func (e *Engine) ttlInlineCleartextMarker(payload []byte) ([]byte, bool) {
+	classifier, ok := e.fsm.(ttlInlineMarkerClassifier)
+	if !ok {
+		return nil, false
+	}
+	if e.raftCipher != nil {
+		plain, err := unwrapRaftPayload(e.raftCipher, payload)
+		if err == nil {
+			if classifier.IsTTLInlineCapabilityMarkerPayload(plain) {
+				return plain, true
+			}
+			return nil, true
+		}
+	}
+	if classifier.IsTTLInlineCapabilityMarkerPayload(payload) {
+		return payload, false
+	}
+	return nil, false
+}
+
+func (e *Engine) rejectUnverifiedTTLInlineMarker(payload []byte) error {
+	if marker, _ := e.ttlInlineCleartextMarker(payload); marker != nil {
 		return errors.WithStack(errTTLInlineMarkerProposalUnauthorized)
 	}
 	return nil

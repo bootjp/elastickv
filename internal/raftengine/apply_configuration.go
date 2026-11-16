@@ -1,5 +1,7 @@
 package raftengine
 
+import "context"
+
 type NativeConfigurationMember struct {
 	ID      uint64
 	Address string
@@ -13,6 +15,13 @@ type NativeConfiguration struct {
 	Voters, VotersOutgoing, Learners, LearnersNext []uint64
 	AutoLeave                                      bool
 	Members                                        []NativeConfigurationMember
+}
+
+// TTLInlineCapabilityProposer admits a configuration-bound capability marker
+// only through the native owner loop. The caller must first verify every
+// member of the supplied cut; ordinary Propose and ProposeAdmin reject it.
+type TTLInlineCapabilityProposer interface {
+	ProposeTTLInlineCapability(context.Context, NativeConfiguration, uint64, []byte) (*ProposalResult, error)
 }
 
 type ApplyNativeConfigurationAware interface {

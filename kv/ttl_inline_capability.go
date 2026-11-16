@@ -85,6 +85,36 @@ func (m ttlInlineCapabilityMarker) matches(native raftengine.NativeConfiguration
 		sameCapabilityIDs(m.LearnersNext, native.LearnersNext)
 }
 
+// EncodeTTLInlineCapabilityMarker binds a marker to the exact native roles
+// checked by the all-member certificate collector.
+func EncodeTTLInlineCapabilityMarker(native raftengine.NativeConfiguration) ([]byte, error) {
+	marker := ttlInlineCapabilityMarker{Version: 1, Index: native.Index,
+		Voters: native.Voters, VotersOutgoing: native.VotersOutgoing,
+		Learners: native.Learners, LearnersNext: native.LearnersNext, AutoLeave: native.AutoLeave}
+	raw, err := json.Marshal(marker)
+	if err != nil {
+		return nil, errors.Join(ErrTTLInlineCapabilityMarker, err)
+	}
+	if _, err := decodeTTLInlineCapabilityMarker(raw); err != nil {
+		return nil, err
+	}
+	return append([]byte{raftEncodeTTLInlineCapability}, raw...), nil
+}
+
+func (f *kvFSM) ValidateTTLInlineCapabilityMarkerPayload(payload []byte, native raftengine.NativeConfiguration) error {
+	if !f.IsTTLInlineCapabilityMarkerPayload(payload) {
+		return errors.WithStack(ErrTTLInlineCapabilityMarker)
+	}
+	marker, err := decodeTTLInlineCapabilityMarker(payload[1:])
+	if err != nil {
+		return err
+	}
+	if !marker.matches(native) {
+		return errors.WithStack(ErrTTLInlineCapabilityMarker)
+	}
+	return nil
+}
+
 // TTLInlineCapabilityActive is safe for coordinator reads on other goroutines.
 func (f *kvFSM) TTLInlineCapabilityActive() bool {
 	return !f.ttlInlineCapabilityDisabled && f.ttlInlineCapability.Load()

@@ -106,6 +106,22 @@ func TestTTLInlineCapabilityApplyWithLocalRecoveryProof(t *testing.T) {
 	require.True(t, f.TTLInlineCapabilityActive())
 }
 
+func TestEncodeTTLInlineCapabilityMarker(t *testing.T) {
+	t.Parallel()
+	native := raftengine.NativeConfiguration{Index: 5, Voters: []uint64{1, 2}, Learners: []uint64{3}}
+	payload, err := EncodeTTLInlineCapabilityMarker(native)
+	require.NoError(t, err)
+	f := newTTLInlineFSM(t, nil)
+	require.NoError(t, f.ValidateTTLInlineCapabilityMarkerPayload(payload, native))
+	changed := native
+	changed.Index++
+	require.ErrorIs(t, f.ValidateTTLInlineCapabilityMarkerPayload(payload, changed), ErrTTLInlineCapabilityMarker)
+	require.ErrorIs(t, f.ValidateTTLInlineCapabilityMarkerPayload([]byte{0x2e, 0xff}, native), ErrTTLInlineCapabilityMarker)
+	require.ErrorIs(t, f.ValidateTTLInlineCapabilityMarkerPayload([]byte{0x01}, native), ErrTTLInlineCapabilityMarker)
+	_, err = EncodeTTLInlineCapabilityMarker(raftengine.NativeConfiguration{Index: 5, Voters: []uint64{0}})
+	require.ErrorIs(t, err, ErrTTLInlineCapabilityMarker)
+}
+
 func TestTTLInlineCapabilityRecovery(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()

@@ -11,6 +11,8 @@ import (
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/peersession"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/internal/raftengine/raftenginetest"
+	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/stretchr/testify/require"
 )
@@ -21,6 +23,62 @@ type ttlInlineCertificateEngineStub struct {
 	state       raftengine.State
 	changeTerm  bool
 	snapshotNum atomic.Int64
+}
+
+type ttlInlineRuntimeProposalEngine struct {
+	raftenginetest.StubEngine
+	native raftengine.NativeConfiguration
+	term   uint64
+	called bool
+}
+
+func (e *ttlInlineRuntimeProposalEngine) NativeConfigurationSnapshot() (raftengine.NativeConfiguration, uint64, bool) {
+	return e.native, e.term, true
+}
+
+func (e *ttlInlineRuntimeProposalEngine) ProposeTTLInlineCapability(_ context.Context, native raftengine.NativeConfiguration, term uint64, payload []byte) (*raftengine.ProposalResult, error) {
+	e.called = true
+	if term != e.term || !sameTTLInlineNativeCut(native, e.native) {
+		return nil, errors.New("incorrect certificate cut")
+	}
+	return &raftengine.ProposalResult{CommitIndex: 6}, (&ttlInlineMarkerPayloadProbe{native: native}).validate(payload)
+}
+
+type ttlInlineMarkerPayloadProbe struct {
+	native raftengine.NativeConfiguration
+}
+
+func (p *ttlInlineMarkerPayloadProbe) validate(payload []byte) error {
+	want, err := kv.EncodeTTLInlineCapabilityMarker(p.native)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(payload, want) {
+		return errors.New("incorrect marker payload")
+	}
+	return nil
+}
+
+type ttlInlineRuntimeFenceFSM struct{ raftengine.StateMachine }
+
+func (*ttlInlineRuntimeFenceFSM) TTLInlineFenceReady() bool { return true }
+
+func TestProposeRuntimeTTLInlineCapabilityUsesCollectedCut(t *testing.T) {
+	t.Parallel()
+	native := raftengine.NativeConfiguration{Index: 5, Voters: []uint64{1},
+		Members: []raftengine.NativeConfigurationMember{{ID: 1, Address: "n1:50051"}}}
+	engine := &ttlInlineRuntimeProposalEngine{native: native, term: 9}
+	engine.StaticLeaderView.StateValue = raftengine.StateLeader
+	runtime := &GroupRuntime{GroupRuntime: &noderuntime.GroupRuntime{
+		Spec: noderuntime.GroupSpec{ID: 7}, Engine: engine, StateMachine: &ttlInlineRuntimeFenceFSM{},
+	}, BootstrapPeerConfig: &BootstrapPeerConfig{
+		Local:      peersession.Node{Member: 1, Address: "n1:50051"},
+		Provisions: []peersession.Provision{{Node: peersession.Node{Member: 1, Address: "n1:50051"}, Groups: []uint64{7}}},
+	}, BootstrapNetwork: &BootstrapNetwork{Control: &bootstrapControlClient{}}}
+	result, err := ProposeRuntimeTTLInlineCapability(t.Context(), runtime, &kv.ShardGroup{Engine: engine})
+	require.NoError(t, err)
+	require.Equal(t, uint64(6), result.CommitIndex)
+	require.True(t, engine.called)
 }
 
 func (e *ttlInlineCertificateEngineStub) State() raftengine.State { return e.state }

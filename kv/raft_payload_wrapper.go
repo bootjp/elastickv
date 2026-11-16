@@ -331,3 +331,16 @@ func (p *dynamicWrappedProposer) ProposeAdmin(ctx context.Context, data []byte) 
 	}
 	return res, nil
 }
+
+func (p *dynamicWrappedProposer) ProposeTTLInlineCapability(ctx context.Context, native raftengine.NativeConfiguration, term uint64, data []byte) (*raftengine.ProposalResult, error) {
+	inner, ok := p.inner.(raftengine.TTLInlineCapabilityProposer)
+	if !ok {
+		return nil, errors.New("kv: TTL-inline capability proposal is unsupported")
+	}
+	wrapped, err := applyRaftPayloadWrap(p.currentWrap(), data)
+	if err != nil {
+		return nil, err
+	}
+	result, err := inner.ProposeTTLInlineCapability(ctx, native, term, wrapped)
+	return result, errors.Wrap(err, "kv: wrapped TTL-inline capability proposal")
+}

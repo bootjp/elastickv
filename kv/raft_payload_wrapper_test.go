@@ -29,6 +29,44 @@ type fakeProposer struct {
 	err        error
 }
 
+type ttlInlineWrappedProposalRecorder struct {
+	fakeProposer
+	native  raftengine.NativeConfiguration
+	term    uint64
+	payload []byte
+}
+
+func (p *ttlInlineWrappedProposalRecorder) ProposeTTLInlineCapability(_ context.Context, native raftengine.NativeConfiguration, term uint64, payload []byte) (*raftengine.ProposalResult, error) {
+	p.native, p.term, p.payload = native, term, bytes.Clone(payload)
+	return &raftengine.ProposalResult{CommitIndex: 7}, nil
+}
+
+func TestDynamicWrappedProposerTTLInlineCapability(t *testing.T) {
+	t.Parallel()
+	inner := &ttlInlineWrappedProposalRecorder{}
+	var wrapPtr atomic.Pointer[RaftPayloadWrapper]
+	var wrap RaftPayloadWrapper = func(payload []byte) ([]byte, error) {
+		return append([]byte("wrapped:"), payload...), nil
+	}
+	wrapPtr.Store(&wrap)
+	proposer := newDynamicWrappedProposer(inner, &wrapPtr)
+	typed, ok := proposer.(raftengine.TTLInlineCapabilityProposer)
+	if !ok {
+		t.Fatal("TTL-inline proposal path missing")
+	}
+	native := raftengine.NativeConfiguration{Index: 5, Voters: []uint64{1}}
+	result, err := typed.ProposeTTLInlineCapability(t.Context(), native, 9, []byte{0x2e})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.CommitIndex != 7 || inner.term != 9 || inner.native.Index != 5 || !bytes.Equal(inner.payload, []byte("wrapped:\x2e")) {
+		t.Fatalf("incorrect wrapped TTL-inline proposal: result=%+v term=%d native=%+v payload=%x", result, inner.term, inner.native, inner.payload)
+	}
+	if inner.calls.Load() != 0 || inner.adminCalls.Load() != 0 {
+		t.Fatal("TTL-inline proposal used a generic proposal method")
+	}
+}
+
 func (p *fakeProposer) Propose(_ context.Context, data []byte) (*raftengine.ProposalResult, error) {
 	p.calls.Add(1)
 	cp := make([]byte, len(data))
