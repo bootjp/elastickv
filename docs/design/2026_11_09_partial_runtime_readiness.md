@@ -94,8 +94,8 @@ Focused race tests and new-diff lint passed. The readiness overlay renders with
 Kustomize. A staged overlay now pins the image built from main commit
 `b9043cbb23860d69525b7db405b711e7756dc483`: the first stage upgrades the
 image and enables the listener while preserving TCP probes, and the second
-stage switches the probes. The base is unchanged. The image build and Hotspot
-checks passed on the pinned main commit; the aggregate main Go test check was
-still queued when this overlay was prepared. Complete CI, a real cluster
-rollout, quorum/catch-up checks, and signed API canaries remain required before
-making the HTTP readiness probe the production default.
+stage switches the probes. The base is unchanged. The pinned main commit passed
+its image build, Hotspot checks, [Go tests](https://github.com/bootjp/elastickv/actions/runs/43813746883),
+and [Jepsen checks](https://github.com/bootjp/elastickv/actions/runs/43813746839).
+A real cluster rollout, quorum/catch-up checks, and signed API canaries remain
+required before making the HTTP readiness probe the production default.
