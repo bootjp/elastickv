@@ -1685,14 +1685,13 @@ func TestRedisTxnBuildZSetLegacyElemsWritesFence(t *testing.T) {
 	t.Parallel()
 
 	key := []byte("zset:legacy-fence")
-	txn := &txnContext{
-		zsetStates: map[string]*zsetTxnState{
-			string(key): {
-				members: map[string]float64{"member": 1},
-				dirty:   true,
-			},
+	server, _ := newRedisStorageMigrationTestServer(t)
+	txn := newRedisTxnTestContext(server)
+	txn.zsetStates = map[string]*zsetTxnState{
+		string(key): {
+			members: map[string]float64{"member": 1},
+			dirty:   true,
 		},
-		replacers: map[string]*stringReplacement{},
 	}
 
 	elems, err := txn.buildZSetElems(20)
@@ -2223,13 +2222,8 @@ func TestRedisTxnCollectionExpireDeltaOnlyTruncatedReturnsError(t *testing.T) {
 			txn := newRedisTxnTestContext(server)
 			txn.startTS = store.MaxDeltaScanLimit + 2
 			expireRes, err := txn.applyExpire(redcon.Command{Args: [][]byte{[]byte(cmdPExpire), key, []byte("50000")}}, time.Millisecond)
-			require.NoError(t, err)
-			require.Equal(t, int64(1), expireRes.integer)
-
-			elems, skipTTLIndex, err := txn.buildCollectionTTLElems(ctx)
 			require.ErrorIs(t, err, ErrDeltaScanTruncated)
-			require.Empty(t, elems)
-			require.Empty(t, skipTTLIndex)
+			require.Zero(t, expireRes)
 		})
 	}
 }

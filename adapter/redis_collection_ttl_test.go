@@ -1511,7 +1511,7 @@ func TestRedisSAddClearsExpiredHLLAnchorBehindStaleTTLIndex(t *testing.T) {
 	requireExistsAt(t, st, store.SetMemberKey(key, []byte("new")), readTS)
 }
 
-func TestRedisExpiredCollectionCleanupTreatsTruncatedDeltaScanAsExpiredRecreate(t *testing.T) {
+func TestRedisExpiredCollectionCleanupRejectsTruncatedDeltaScan(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -1524,12 +1524,8 @@ func TestRedisExpiredCollectionCleanupTreatsTruncatedDeltaScanAsExpiredRecreate(
 	}
 
 	typ, err := server.keyTypeOrEmptyAt(ctx, key, st.LastCommitTS(), redisTypeHash)
-	require.NoError(t, err)
+	require.ErrorIs(t, err, ErrDeltaScanTruncated)
 	require.Equal(t, redisTypeNone, typ)
-	cleanup, expiredRecreate, err := server.expiredCollectionCleanupForRecreate(ctx, key, st.LastCommitTS(), typ, redisTypeHash)
-	require.NoError(t, err)
-	require.True(t, expiredRecreate)
-	require.NotEmpty(t, cleanup)
 }
 
 func TestRedisLegacyStreamRecreateClearsExpiredLegacyTTL(t *testing.T) {
