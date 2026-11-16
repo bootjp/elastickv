@@ -877,14 +877,14 @@ func TestElectionDispatchDoesNotWaitForBlockedHeartbeat(t *testing.T) {
 		peerDispatchers: make(map[uint64]*peerQueues),
 		dispatchStopCh:  make(chan struct{}),
 		dispatchFn: func(ctx context.Context, req dispatchRequest) error {
-			switch req.msg.GetType() {
-			case raftpb.MsgHeartbeat:
+			switch {
+			case req.msg.GetType() == raftpb.MsgHeartbeat:
 				close(heartbeatStarted)
 				select {
 				case <-releaseHeartbeat:
 				case <-ctx.Done():
 				}
-			case raftpb.MsgPreVoteResp:
+			case req.msg.GetType() == raftpb.MsgPreVoteResp:
 				close(electionSent)
 			default:
 				t.Errorf("unexpected dispatch type %s", req.msg.GetType())
