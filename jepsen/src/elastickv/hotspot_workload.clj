@@ -20,7 +20,10 @@
             [jepsen.os :as os]
             [jepsen.os.debian :as debian]))
 
-(def register-keys ["a-hot" "m-hot" "z-hot"])
+(def register-keys
+  ["a-hot-0" "a-hot-1" "a-hot-2" "a-hot-3"
+   "m-hot-0" "m-hot-1" "m-hot-2" "m-hot-3"
+   "z-hot-0" "z-hot-1" "z-hot-2" "z-hot-3"])
 
 (def fault-ops
   {:partition [:start-partition :stop-partition]
@@ -324,7 +327,7 @@
                               (assoc controller :generator (controller-observation-generator opts))
                               controller)]
                      faults (conj faults)))
-         concurrency (or (:concurrency opts) 6)
+         concurrency (or (:concurrency opts) 24)
          _ (when (or (< concurrency (max (* 2 (count register-keys)) (count nodes)))
                      (odd? concurrency))
              (throw (ex-info "hotspot workload requires even concurrency covering all nodes and registers"
@@ -332,7 +335,7 @@
          workload (split/split-register-workload
                     (assoc opts :node->port node->port :register-keys register-keys
                            :independent-concurrency 2
-                           :max-writes-per-key (or (:max-writes-per-key opts) 10000)))]
+                           :max-writes-per-key (or (:max-writes-per-key opts) 32)))]
      (merge workload
             {:name (or (:name opts) "elastickv-m4-automatic-hotspot")
              :nodes nodes :db db :redis-host (:redis-host opts)
@@ -385,7 +388,7 @@
                      (into (mapv (fn [option]
                                    (case (second option)
                                      "--time-limit SECONDS" (assoc option 4 120)
-                                     "--concurrency N" (assoc option 4 6)
+                                     "--concurrency N" (assoc option 4 24)
                                      "--faults LIST" (assoc option 4 "partition,kill")
                                      "--fault-interval SECONDS" (assoc option 4 10)
                                      option)) cli/common-cli-opts)

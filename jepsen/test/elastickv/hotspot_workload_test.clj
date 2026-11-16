@@ -38,7 +38,9 @@
         fs (nemesis/fs (:nemesis test))]
     (is (= hotspot/auto-split-args (get-in test [:db :opts :auto-split-args])))
     (is (nil? (:final-generator test)))
-    (is (= 6 (:concurrency test)))
+    (is (= 24 (:concurrency test)))
+    (is (= 12 (count hotspot/register-keys)))
+    (is (every? (set hotspot/register-keys) ["a-hot-0" "m-hot-0" "z-hot-0"]))
     (is (every? fs #{:capture-hotspot-baseline :observe-hotspot-split
                      :start-partition :stop-partition :kill :start}))))
 
@@ -55,7 +57,7 @@
                            :concurrency 6})))
   (with-redefs [cli/run-workload!
                 (fn [_ options _ _]
-                  (is (= 6 (:default (apply hash-map
+                  (is (= 24 (:default (apply hash-map
                                             (drop 3 (first (filter #(= "--concurrency N"
                                                                        (second %)) options))))))))]
     (hotspot/-main)))
