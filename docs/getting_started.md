@@ -72,7 +72,9 @@ The image uses `/app` as its command, so supply `/app` explicitly before the fla
 
 ```bash
 docker volume create elastickv-quickstart-data
+docker network create elastickv-quickstart-net
 docker run --name elastickv-quickstart \
+  --network elastickv-quickstart-net \
   -p 127.0.0.1:6379:6379 \
   -p 127.0.0.1:8081:8081 \
   -v elastickv-quickstart-data:/var/lib/elastickv \
@@ -88,7 +90,9 @@ docker run --name elastickv-quickstart \
   --raftBootstrap
 ```
 
-Only Redis and health are published to the host; gRPC, DynamoDB, and metrics stay inside the container.
+Only Redis and health are published to the host; gRPC, DynamoDB, and metrics have no published host ports.
+The Redis listener is unauthenticated. Publishing it on `127.0.0.1` restricts the host-side address, but does not restrict communication between containers.
+The dedicated network isolates this example from containers on other Docker bridge networks under Docker's default isolation rules. Attach only trusted clients to `elastickv-quickstart-net`: containers on that network can still connect directly to the Redis, gRPC, and health listeners. An existing trusted client can join with `docker network connect elastickv-quickstart-net <client-container>` and reach Redis at `elastickv-quickstart:6379`.
 The wildcard gRPC bind is for this isolated single-node example only; multi-node Raft addresses must be reachable, concrete node addresses.
 `latest` tracks main and is convenient for evaluation. For repeatable deployments, select and validate an immutable image digest.
 The image must include `--healthAddress` support; build this checkout with `docker build -t elastickv-local .` and substitute `elastickv-local` if the image you selected predates that flag.
@@ -146,7 +150,7 @@ redis-cli -h 127.0.0.1 -p 6379 --raw GET greeting
 ```
 
 For Docker, run `docker stop --time 30 elastickv-quickstart` in another terminal.
-After it stops, remove the container with `docker rm elastickv-quickstart`, then repeat the Docker startup command without `--raftBootstrap`.
+After it stops, remove the container with `docker rm elastickv-quickstart`, then repeat only the `docker run` command without `--raftBootstrap`, retaining `--network elastickv-quickstart-net`. The volume and network already exist; do not repeat their creation commands.
 Keep the named volume `elastickv-quickstart-data`; removing the container does not remove that volume.
 
 Keep the node ID and data directory together on restart.
