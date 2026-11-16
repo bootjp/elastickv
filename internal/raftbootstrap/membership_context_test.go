@@ -4,13 +4,12 @@ import (
 	"encoding/binary"
 	"testing"
 
-	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/stretchr/testify/require"
 )
 
 func membershipContextFixture(t *testing.T) MembershipChangeContext {
 	t.Helper()
-	candidate := Member{ID: raftengine.DeriveNodeID("n8"), Address: "127.0.0.1:50051", PublicKeyDigest: Digest{9}}
+	candidate := Member{ID: 8, Address: "127.0.0.1:50051", PublicKeyDigest: Digest{9}}
 	target, err := ConfigurationDigest(Configuration{Index: 7,
 		State:   ConfState{Voters: []uint64{1}, Learners: []uint64{candidate.ID}},
 		Members: []Member{{ID: 1, Address: "127.0.0.1:50050", PublicKeyDigest: Digest{1}}, candidate}})
@@ -37,13 +36,14 @@ func TestMembershipChangeContextRoundTrip(t *testing.T) {
 		Transition: context.Transition, Candidate: context.Candidate,
 		Target: Configuration{Index: 7, State: ConfState{Voters: []uint64{1}, Learners: []uint64{context.Candidate.ID}},
 			Members: []Member{{ID: 1, Address: "127.0.0.1:50050", PublicKeyDigest: Digest{1}}, context.Candidate}}}
-	require.True(t, decoded.MatchesReservation(reservation, "n8"))
+	require.True(t, decoded.MatchesReservation(reservation, "n8", 8))
 	reservation.ID.ReserveIndex++
-	require.False(t, decoded.MatchesReservation(reservation, "n8"))
+	require.False(t, decoded.MatchesReservation(reservation, "n8", 8))
 	reservation.ID.ReserveIndex--
-	require.False(t, decoded.MatchesReservation(reservation, "n9"))
+	require.False(t, decoded.MatchesReservation(reservation, "n9", 8))
+	require.False(t, decoded.MatchesReservation(reservation, "n8", 9))
 	reservation.Target.Index++
-	require.False(t, decoded.MatchesReservation(reservation, "n8"))
+	require.False(t, decoded.MatchesReservation(reservation, "n8", 8))
 }
 
 func TestMembershipChangeContextRejectsMalformedFrames(t *testing.T) {
@@ -64,10 +64,6 @@ func TestMembershipChangeContextRejectsMalformedFrames(t *testing.T) {
 			return b
 		}},
 		{"unknown transition", func(b []byte) []byte { binary.BigEndian.PutUint32(b[41+WitnessSize:], 99); return b }},
-		{"peer node id mismatch", func(b []byte) []byte {
-			b[membershipContextPrefixSize+WitnessSize+4+checksumSize+checksumSize+7]++
-			return b
-		}},
 		{"zero target digest", func(b []byte) []byte {
 			clear(b[membershipContextPrefixSize+WitnessSize+4 : membershipContextPrefixSize+WitnessSize+4+checksumSize])
 			return b

@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"unicode/utf8"
 
-	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/cockroachdb/errors"
 )
 
@@ -94,7 +93,7 @@ func ParseMembershipChangeContext(data []byte) (MembershipChangeContext, error) 
 	return context, nil
 }
 
-func (context MembershipChangeContext) MatchesReservation(reservation MembershipReservation, peerID string) bool {
+func (context MembershipChangeContext) MatchesReservation(reservation MembershipReservation, peerID string, peerNodeID uint64) bool {
 	targetDigest, err := ConfigurationDigest(reservation.Target)
 	if err != nil {
 		return false
@@ -102,7 +101,7 @@ func (context MembershipChangeContext) MatchesReservation(reservation Membership
 	return context.ID == reservation.ID && context.Expected == reservation.Expected &&
 		context.Transition == reservation.Transition && context.TargetDigest == targetDigest &&
 		context.Candidate == reservation.Candidate &&
-		context.PeerID == peerID
+		context.PeerID == peerID && context.Candidate.ID == peerNodeID
 }
 
 func validateMembershipChangeContext(context MembershipChangeContext) error {
@@ -111,8 +110,7 @@ func validateMembershipChangeContext(context MembershipChangeContext) error {
 		context.Candidate.PublicKeyDigest == (Digest{}) || !validAddress(context.Candidate.Address) {
 		return errors.WithStack(ErrInvalid)
 	}
-	if !validMembershipContextPeer(context.PeerID, context.Candidate.Address) ||
-		raftengine.DeriveNodeID(context.PeerID) != context.Candidate.ID {
+	if !validMembershipContextPeer(context.PeerID, context.Candidate.Address) {
 		return errors.WithStack(ErrInvalid)
 	}
 	return nil
