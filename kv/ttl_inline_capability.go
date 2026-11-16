@@ -127,6 +127,30 @@ func (f *kvFSM) TTLInlineCapabilityRecorded() bool {
 	return !f.ttlInlineCapabilityDisabled && f.ttlInlineCapabilityRecorded.Load()
 }
 
+// TTLInlineCertifiedLearner checks the durable marker, not a local proof bit.
+// A learner present when the marker was committed was part of its all-member
+// certificate and may be promoted without admitting a new replica.
+func (f *kvFSM) TTLInlineCertifiedLearner(ctx context.Context, member uint64) (bool, error) {
+	if ctx == nil {
+		return false, errors.WithStack(ErrTTLInlineCapabilityMarker)
+	}
+	if member == 0 || !f.TTLInlineCapabilityRecorded() || f.store == nil {
+		return false, nil
+	}
+	raw, err := f.store.GetAt(ctx, ttlInlineCapabilityKey, math.MaxUint64)
+	if errors.Is(err, store.ErrKeyNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, errors.Wrap(err, "read TTL-inline certified learner")
+	}
+	marker, err := decodeTTLInlineCapabilityMarker(raw)
+	if err != nil {
+		return false, err
+	}
+	return slices.Contains(marker.Learners, member) || slices.Contains(marker.LearnersNext, member), nil
+}
+
 // IsTTLInlineCapabilityMarkerPayload classifies the cleartext FSM command for
 // native Raft admission, including a marker not yet applied by the FSM.
 func (f *kvFSM) IsTTLInlineCapabilityMarkerPayload(payload []byte) bool {

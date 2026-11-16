@@ -2381,16 +2381,9 @@ func (e *Engine) proposeMembershipChange(req adminRequest, changeType raftpb.Con
 		req.done <- adminResult{err: errors.WithStack(errMembershipConfChangePending)}
 		return
 	}
-	if changeType != raftpb.ConfChangeRemoveNode {
-		blocked, err := e.ttlInlineMembershipBlocked()
-		if err != nil {
-			req.done <- adminResult{err: err}
-			return
-		}
-		if blocked {
-			req.done <- adminResult{err: errors.WithStack(errTTLInlineMembershipProofRequired)}
-			return
-		}
+	if err := e.ttlInlineMembershipAdmission(req, changeType, peer.NodeID); err != nil {
+		req.done <- adminResult{err: err}
+		return
 	}
 	contextBytes, err := encodeConfChangeContext(req.id, peer)
 	if err != nil {

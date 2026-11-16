@@ -37,9 +37,48 @@ func TestTTLInlineMarkerRequiresVerifiedProposalPath(t *testing.T) {
 
 type ttlInlineMarkerTestFSM struct{ StateMachine }
 
+type ttlInlineRecordedMarkerTestFSM struct{ ttlInlineMarkerTestFSM }
+
+func (*ttlInlineRecordedMarkerTestFSM) TTLInlineCapabilityRecorded() bool { return true }
+
 type ttlInlineProposalTestFSM struct {
 	ttlInlineMarkerTestFSM
 	fenced bool
+}
+
+type ttlInlineCertifiedLearnerTestFSM struct {
+	ttlInlineMarkerTestFSM
+	member uint64
+}
+
+func (f *ttlInlineCertifiedLearnerTestFSM) TTLInlineCertifiedLearner(_ context.Context, member uint64) (bool, error) {
+	return member == f.member, nil
+}
+
+func TestTTLInlinePromotionRequiresCertifiedExistingLearner(t *testing.T) {
+	t.Parallel()
+	e := &Engine{fsm: &ttlInlineCertifiedLearnerTestFSM{member: 3}, isLearnerNode: map[uint64]bool{3: true}}
+	request := adminRequest{ctx: context.Background(), action: adminActionPromoteLearner}
+	certified, err := e.ttlInlinePromotionCertified(request, raftpb.ConfChangeAddNode, 3)
+	require.NoError(t, err)
+	require.True(t, certified)
+	for _, tc := range []struct {
+		request adminRequest
+		change  raftpb.ConfChangeType
+		member  uint64
+	}{
+		{request, raftpb.ConfChangeAddNode, 4},
+		{adminRequest{ctx: context.Background(), action: adminActionAddVoter}, raftpb.ConfChangeAddNode, 3},
+		{request, raftpb.ConfChangeAddLearnerNode, 3},
+	} {
+		certified, err = e.ttlInlinePromotionCertified(tc.request, tc.change, tc.member)
+		require.NoError(t, err)
+		require.False(t, certified)
+	}
+	e.isLearnerNode[3] = false
+	certified, err = e.ttlInlinePromotionCertified(request, raftpb.ConfChangeAddNode, 3)
+	require.NoError(t, err)
+	require.False(t, certified)
 }
 
 func (f *ttlInlineProposalTestFSM) TTLInlineFenceReady() bool { return f.fenced }
@@ -211,6 +250,23 @@ func TestTTLInlineMembershipPreflightWaitsForAsyncAppend(t *testing.T) {
 	blocked, err := e.ttlInlineMembershipBlocked()
 	require.False(t, blocked)
 	require.ErrorIs(t, err, errTTLInlineAdmissionStoragePending)
+}
+
+func TestTTLInlineRecordedMarkerStillWaitsForNativeRecovery(t *testing.T) {
+	t.Parallel()
+	e := &Engine{fsm: &ttlInlineRecordedMarkerTestFSM{}, storagePipeline: &engineStoragePipeline{diskOutstanding: 1}}
+	blocked, err := e.ttlInlineMembershipBlocked()
+	require.False(t, blocked)
+	require.ErrorIs(t, err, errTTLInlineAdmissionStoragePending)
+	e.storagePipeline.diskOutstanding = 0
+	e.snapshotRestoring.Store(true)
+	blocked, err = e.ttlInlineMembershipBlocked()
+	require.False(t, blocked)
+	require.ErrorIs(t, err, errTTLInlineAdmissionSnapshotPending)
+	e.snapshotRestoring.Store(false)
+	blocked, err = e.ttlInlineMembershipBlocked()
+	require.NoError(t, err)
+	require.True(t, blocked)
 }
 
 func TestTTLInlineMembershipPreflightWaitsForSnapshotRecovery(t *testing.T) {

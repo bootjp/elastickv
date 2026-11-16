@@ -30,6 +30,44 @@ var errTTLInlineAdmissionStoragePending = errors.New("etcd raft membership chang
 var errTTLInlineAdmissionSnapshotPending = errors.New("etcd raft membership change waits for snapshot recovery")
 var errTTLInlineMarkerProposalUnauthorized = errors.New("etcd raft TTL-inline capability marker requires verified admission")
 
+func (e *Engine) ttlInlineMembershipAdmission(req adminRequest, changeType raftpb.ConfChangeType, member uint64) error {
+	if changeType == raftpb.ConfChangeRemoveNode {
+		return nil
+	}
+	blocked, err := e.ttlInlineMembershipBlocked()
+	if err != nil || !blocked {
+		return err
+	}
+	certified, err := e.ttlInlinePromotionCertified(req, changeType, member)
+	if err != nil {
+		return err
+	}
+	if !certified {
+		return errors.WithStack(errTTLInlineMembershipProofRequired)
+	}
+	return nil
+}
+
+func (e *Engine) ttlInlinePromotionCertified(req adminRequest, changeType raftpb.ConfChangeType, member uint64) (bool, error) {
+	if req.action != adminActionPromoteLearner || changeType != raftpb.ConfChangeAddNode || member == 0 {
+		return false, nil
+	}
+	e.mu.RLock()
+	learner := e.isLearnerNode[member]
+	e.mu.RUnlock()
+	if !learner {
+		return false, nil
+	}
+	reader, ok := e.fsm.(interface {
+		TTLInlineCertifiedLearner(context.Context, uint64) (bool, error)
+	})
+	if !ok {
+		return false, nil
+	}
+	certified, err := reader.TTLInlineCertifiedLearner(req.ctx, member)
+	return certified, errors.Wrap(err, "verify TTL-inline learner certificate")
+}
+
 func (e *Engine) ProposeTTLInlineCapability(ctx context.Context, native raftengine.NativeConfiguration, term uint64, payload []byte) (*raftengine.ProposalResult, error) {
 	copy := native
 	copy.Voters = slices.Clone(native.Voters)
@@ -109,11 +147,11 @@ func (e *Engine) rejectUnverifiedTTLInlineMarker(payload []byte) error {
 }
 
 func (e *Engine) ttlInlineMembershipBlocked() (bool, error) {
-	if recorded, ok := e.fsm.(interface{ TTLInlineCapabilityRecorded() bool }); ok && recorded.TTLInlineCapabilityRecorded() {
-		return true, nil
-	}
 	classifier, ok := e.fsm.(ttlInlineMarkerClassifier)
 	if !ok {
+		if recorded, ok := e.fsm.(interface{ TTLInlineCapabilityRecorded() bool }); ok && recorded.TTLInlineCapabilityRecorded() {
+			return true, nil
+		}
 		return false, nil
 	}
 	if e.ttlInlineSnapshotPending() {
@@ -123,6 +161,9 @@ func (e *Engine) ttlInlineMembershipBlocked() (bool, error) {
 	// actor completes, the storage scan below cannot see every accepted entry.
 	if e.storagePipeline != nil && e.storagePipeline.diskOutstanding != 0 {
 		return false, errors.WithStack(errTTLInlineAdmissionStoragePending)
+	}
+	if recorded, ok := e.fsm.(interface{ TTLInlineCapabilityRecorded() bool }); ok && recorded.TTLInlineCapabilityRecorded() {
+		return true, nil
 	}
 	return e.unappliedTTLInlineMarker(classifier)
 }

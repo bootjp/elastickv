@@ -122,6 +122,31 @@ func TestEncodeTTLInlineCapabilityMarker(t *testing.T) {
 	require.ErrorIs(t, err, ErrTTLInlineCapabilityMarker)
 }
 
+func TestTTLInlineCertifiedLearnerReadsDurableMarker(t *testing.T) {
+	t.Parallel()
+	st := store.NewMVCCStore()
+	t.Cleanup(func() { require.NoError(t, st.Close()) })
+	f := newTTLInlineFSM(t, st)
+	native := raftengine.NativeConfiguration{Index: 5, Voters: []uint64{1, 2}, Learners: []uint64{3}}
+	payload := capabilityPayload(t, ttlInlineCapabilityMarker{Version: 1, Index: 5, Voters: native.Voters, Learners: native.Learners})
+	require.Nil(t, applyCapability(t, f, 6, native, payload))
+	require.False(t, f.TTLInlineCapabilityActive())
+	certified, err := f.TTLInlineCertifiedLearner(t.Context(), 3)
+	require.NoError(t, err)
+	require.True(t, certified)
+	for _, member := range []uint64{0, 1, 4} {
+		certified, err = f.TTLInlineCertifiedLearner(t.Context(), member)
+		require.NoError(t, err)
+		require.False(t, certified)
+	}
+	withoutMarker := store.NewMVCCStore()
+	t.Cleanup(func() { require.NoError(t, withoutMarker.Close()) })
+	f.store = withoutMarker
+	certified, err = f.TTLInlineCertifiedLearner(t.Context(), 3)
+	require.NoError(t, err)
+	require.False(t, certified, "a monotonic recorded bit cannot replace the durable marker")
+}
+
 func TestTTLInlineCapabilityRecovery(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
