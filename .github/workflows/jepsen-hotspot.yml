@@ -53,8 +53,8 @@ jobs:
           FAULT: ${{ matrix.fault }}
           JEPSEN_TIME_LIMIT: '90'
           JEPSEN_RATE: '5'
-          JEPSEN_CONCURRENCY: '6'
-          JEPSEN_MAX_WRITES_PER_KEY: '256'
+          JEPSEN_CONCURRENCY: '24'
+          JEPSEN_MAX_WRITES_PER_KEY: '32'
         run: bash jepsen/docker/hosted/run.sh "$FAULT" hotspot
       - name: Make artifacts and cache readable
         if: always()

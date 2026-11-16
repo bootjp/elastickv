@@ -14,6 +14,10 @@ rate=${JEPSEN_RATE:-5}
 concurrency=${JEPSEN_CONCURRENCY:-6}
 key_count=${JEPSEN_KEY_COUNT:-8}
 max_writes=${JEPSEN_MAX_WRITES_PER_KEY:-256}
+if [[ $adapter == hotspot ]]; then
+  concurrency=${JEPSEN_CONCURRENCY:-24}
+  max_writes=${JEPSEN_MAX_WRITES_PER_KEY:-32}
+fi
 max_txn_length=${JEPSEN_MAX_TXN_LENGTH:-4}
 min_cycles=${JEPSEN_MIN_FAULT_CYCLES:-1}
 repeat_faults=${JEPSEN_REPEAT_FAULTS:-false}
