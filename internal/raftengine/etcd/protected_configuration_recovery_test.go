@@ -70,6 +70,54 @@ func TestProtectedReceivedSnapshotRetainsConfigurationProof(t *testing.T) {
 	}
 }
 
+func TestProtectedReceivedSnapshotReinstallsTTLInlineProof(t *testing.T) {
+	t.Parallel()
+	sourceStore := store.NewMVCCStore()
+	t.Cleanup(func() { require.NoError(t, sourceStore.Close()) })
+	source := kv.NewKvFSMWithHLC(sourceStore, nil)
+	configuration, ok := source.(raftengine.NamespaceConfigurationAware)
+	require.True(t, ok)
+	require.NoError(t, configuration.RecordAppliedNamespaceConfiguration(4, []uint64{1, 2, 3}))
+	writer, ok := sourceStore.(store.ReplicatedControlStore)
+	require.True(t, ok)
+	_, err := writer.ApplyReplicatedControlState(t.Context(),
+		[]byte(store.ReplicatedControlPrefix+"absence-capability"),
+		[]byte(`{"version":1,"index":4,"voters":[1,2,3]}`), 5)
+	require.NoError(t, err)
+	snapshotData, err := source.Snapshot()
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, snapshotData.Close()) })
+
+	e := identityElectionEngine(t, 1)
+	e.dataDir = t.TempDir()
+	e.fsmSnapDir = t.TempDir()
+	crc, err := writeFSMSnapshotFile(snapshotData, e.fsmSnapDir, 10)
+	require.NoError(t, err)
+	targetStore := store.NewMVCCStore()
+	t.Cleanup(func() { require.NoError(t, targetStore.Close()) })
+	target := kv.NewKvFSMWithHLC(targetStore, nil)
+	proof, ok := target.(interface {
+		TTLInlineCapabilityActive() bool
+		TTLInlineCapabilityRecorded() bool
+		InstallTTLInlineRecoveryProof(context.Context, bool, raftengine.NativeConfiguration) error
+	})
+	require.True(t, ok)
+	e.fsm = target
+	e.admissionChanged = func() { require.False(t, proof.TTLInlineCapabilityActive()) }
+	e.recoveredAdmission = func(state RecoveredState) error {
+		require.Equal(t, uint64(10), state.AppliedIndex())
+		require.Equal(t, uint64(4), state.ConfigurationIndex())
+		require.True(t, proof.TTLInlineCapabilityRecorded())
+		return proof.InstallTTLInlineRecoveryProof(t.Context(), true,
+			raftengine.NativeConfiguration{Index: state.ConfigurationIndex(), Voters: state.ConfState().GetVoters()})
+	}
+	snapshot := raftTestSnapshot(10, 3, []uint64{1, 2, 3}, encodeSnapshotToken(10, crc))
+	require.NoError(t, e.rawNode.Step(&raftpb.Message{Type: raftpb.MsgSnap.Enum(),
+		From: proto.Uint64(2), To: proto.Uint64(1), Term: proto.Uint64(3), Snapshot: &snapshot}))
+	require.NoError(t, e.drainReady())
+	require.True(t, proof.TTLInlineCapabilityActive())
+}
+
 func TestProtectedDataSnapshotRetainsConfigurationIndex(t *testing.T) {
 	t.Setenv(snapshotEveryEnvVar, "1")
 	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
