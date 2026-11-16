@@ -68,7 +68,7 @@ func TestProposeRuntimeTTLInlineCapabilityUsesCollectedCut(t *testing.T) {
 	native := raftengine.NativeConfiguration{Index: 5, Voters: []uint64{1},
 		Members: []raftengine.NativeConfigurationMember{{ID: 1, Address: "n1:50051"}}}
 	engine := &ttlInlineRuntimeProposalEngine{native: native, term: 9}
-	engine.StaticLeaderView.StateValue = raftengine.StateLeader
+	engine.StateValue = raftengine.StateLeader
 	runtime := &GroupRuntime{GroupRuntime: &noderuntime.GroupRuntime{
 		Spec: noderuntime.GroupSpec{ID: 7}, Engine: engine, StateMachine: &ttlInlineRuntimeFenceFSM{},
 	}, BootstrapPeerConfig: &BootstrapPeerConfig{
