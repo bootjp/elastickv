@@ -20,7 +20,9 @@ func (f *kvFSM) validateAbsenceRequest(request *pb.Request) error {
 		if mutation == nil || !mutation.RequireAbsent {
 			continue
 		}
-		if !f.TTLInlineCapabilityActive() {
+		// Apply must be a function of replicated state. Startup can replay a
+		// committed guarded write before local recovery proof is installed.
+		if !f.TTLInlineCapabilityRecorded() {
 			return errors.WithStack(ErrTTLInlineCapabilityRequired)
 		}
 		if !request.IsTxn || request.Phase != pb.Phase_NONE || mutation.Op != pb.Op_PUT || isTxnInternalKey(mutation.Key) {
