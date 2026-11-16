@@ -844,6 +844,77 @@ func TestSendMessagesDoesNotBlockWhenDispatchQueueIsFull(t *testing.T) {
 	}
 }
 
+func TestElectionMessagesBypassFullHeartbeatQueue(t *testing.T) {
+	t.Parallel()
+	pd := &peerQueues{
+		heartbeat: make(chan dispatchRequest, 1),
+		election:  make(chan dispatchRequest, 2),
+	}
+	pd.heartbeat <- prepareDispatchRequest(raftpb.Message{
+		Type: messageTypePtr(raftpb.MsgHeartbeat), To: uint64Ptr(2),
+	})
+	engine := &Engine{nodeID: 1, peerDispatchers: map[uint64]*peerQueues{2: pd}}
+	for _, kind := range []raftpb.MessageType{raftpb.MsgPreVote, raftpb.MsgPreVoteResp} {
+		require.NoError(t, engine.enqueueDispatchMessage(raftpb.Message{
+			Type: messageTypePtr(kind), To: uint64Ptr(2),
+		}))
+	}
+	require.Zero(t, engine.DispatchDropCount())
+	require.Len(t, pd.heartbeat, 1)
+	require.Len(t, pd.election, 2)
+	first, second := <-pd.election, <-pd.election
+	require.Equal(t, raftpb.MsgPreVote, first.msg.GetType())
+	require.Equal(t, raftpb.MsgPreVoteResp, second.msg.GetType())
+}
+
+func TestElectionDispatchDoesNotWaitForBlockedHeartbeat(t *testing.T) {
+	t.Parallel()
+	heartbeatStarted := make(chan struct{})
+	releaseHeartbeat := make(chan struct{})
+	electionSent := make(chan struct{})
+	engine := &Engine{
+		nodeID:          1,
+		peerDispatchers: make(map[uint64]*peerQueues),
+		dispatchStopCh:  make(chan struct{}),
+		dispatchFn: func(ctx context.Context, req dispatchRequest) error {
+			switch {
+			case req.msg.GetType() == raftpb.MsgHeartbeat:
+				close(heartbeatStarted)
+				select {
+				case <-releaseHeartbeat:
+				case <-ctx.Done():
+				}
+			case req.msg.GetType() == raftpb.MsgPreVoteResp:
+				close(electionSent)
+			default:
+				t.Errorf("unexpected dispatch type %s", req.msg.GetType())
+			}
+			return nil
+		},
+	}
+	engine.startPeerDispatcher(2)
+	t.Cleanup(func() {
+		close(releaseHeartbeat)
+		engine.stopDispatchWorkers()
+	})
+	require.NoError(t, engine.enqueueDispatchMessage(raftpb.Message{
+		Type: messageTypePtr(raftpb.MsgHeartbeat), To: uint64Ptr(2),
+	}))
+	select {
+	case <-heartbeatStarted:
+	case <-time.After(time.Second):
+		t.Fatal("heartbeat dispatch did not start")
+	}
+	require.NoError(t, engine.enqueueDispatchMessage(raftpb.Message{
+		Type: messageTypePtr(raftpb.MsgPreVoteResp), To: uint64Ptr(2),
+	}))
+	select {
+	case <-electionSent:
+	case <-time.After(time.Second):
+		t.Fatal("election dispatch waited for blocked heartbeat")
+	}
+}
+
 func TestReportFailedDispatchReliablyQueuesMsgSnapFailure(t *testing.T) {
 	t.Parallel()
 	engine := &Engine{
@@ -2473,16 +2544,17 @@ func TestLeaderLossLeavesPendingProposalOutcomeUnknown(t *testing.T) {
 	require.Empty(t, engine.pendingProposals)
 }
 
-// TestSelectDispatchLane_LegacyThreeLane verifies that, when the opt-in
-// multi-lane dispatcher is disabled (default), priority control traffic uses
-// the heartbeat lane, heartbeat responses use their coalescing response lane,
-// and everything else uses the normal lane.
-func TestSelectDispatchLane_LegacyThreeLane(t *testing.T) {
+// TestSelectDispatchLane_Default verifies that, when the opt-in
+// multi-lane dispatcher is disabled (default), election traffic has its own
+// lane, heartbeats and read-index traffic share a lane, heartbeat responses
+// use their coalescing response lane, and replication uses the normal lane.
+func TestSelectDispatchLane_Default(t *testing.T) {
 	t.Parallel()
 	engine := &Engine{dispatcherLanesEnabled: false}
 	pd := &peerQueues{
 		normal:        make(chan dispatchRequest, 1),
 		heartbeat:     make(chan dispatchRequest, 1),
+		election:      make(chan dispatchRequest, 1),
 		heartbeatResp: make(chan dispatchRequest, 1),
 		readIndexResp: make(chan dispatchRequest, 1),
 	}
@@ -2492,11 +2564,11 @@ func TestSelectDispatchLane_LegacyThreeLane(t *testing.T) {
 		raftpb.MsgHeartbeatResp: pd.heartbeatResp,
 		raftpb.MsgReadIndex:     pd.heartbeat,
 		raftpb.MsgReadIndexResp: pd.heartbeat,
-		raftpb.MsgVote:          pd.heartbeat,
-		raftpb.MsgVoteResp:      pd.heartbeat,
-		raftpb.MsgPreVote:       pd.heartbeat,
-		raftpb.MsgPreVoteResp:   pd.heartbeat,
-		raftpb.MsgTimeoutNow:    pd.heartbeat,
+		raftpb.MsgVote:          pd.election,
+		raftpb.MsgVoteResp:      pd.election,
+		raftpb.MsgPreVote:       pd.election,
+		raftpb.MsgPreVoteResp:   pd.election,
+		raftpb.MsgTimeoutNow:    pd.election,
 		raftpb.MsgApp:           pd.normal,
 		raftpb.MsgAppResp:       pd.normal,
 		raftpb.MsgSnap:          pd.normal,
@@ -2512,15 +2584,16 @@ func TestSelectDispatchLane_LegacyThreeLane(t *testing.T) {
 	require.Equal(t, pd.readIndexResp, got)
 }
 
-// TestSelectDispatchLane_FiveLane verifies that, when ELASTICKV_RAFT_DISPATCHER_LANES
+// TestSelectDispatchLane_MultiLane verifies that, when ELASTICKV_RAFT_DISPATCHER_LANES
 // is enabled, MsgApp/MsgAppResp goes to the replication lane, MsgSnap goes to
-// the snapshot lane, heartbeat responses get their own lane, and
-// heartbeats/votes/read-index share the priority lane.
-func TestSelectDispatchLane_FiveLane(t *testing.T) {
+// the snapshot lane, election traffic has its own lane, and heartbeats and
+// read-index traffic share the heartbeat lane.
+func TestSelectDispatchLane_MultiLane(t *testing.T) {
 	t.Parallel()
 	engine := &Engine{dispatcherLanesEnabled: true}
 	pd := &peerQueues{
 		heartbeat:     make(chan dispatchRequest, 1),
+		election:      make(chan dispatchRequest, 1),
 		heartbeatResp: make(chan dispatchRequest, 1),
 		readIndexResp: make(chan dispatchRequest, 1),
 		replication:   make(chan dispatchRequest, 1),
@@ -2531,13 +2604,13 @@ func TestSelectDispatchLane_FiveLane(t *testing.T) {
 	cases := map[raftpb.MessageType]chan dispatchRequest{
 		raftpb.MsgHeartbeat:     pd.heartbeat,
 		raftpb.MsgHeartbeatResp: pd.heartbeatResp,
-		raftpb.MsgVote:          pd.heartbeat,
-		raftpb.MsgVoteResp:      pd.heartbeat,
-		raftpb.MsgPreVote:       pd.heartbeat,
-		raftpb.MsgPreVoteResp:   pd.heartbeat,
+		raftpb.MsgVote:          pd.election,
+		raftpb.MsgVoteResp:      pd.election,
+		raftpb.MsgPreVote:       pd.election,
+		raftpb.MsgPreVoteResp:   pd.election,
 		raftpb.MsgReadIndex:     pd.heartbeat,
 		raftpb.MsgReadIndexResp: pd.heartbeat,
-		raftpb.MsgTimeoutNow:    pd.heartbeat,
+		raftpb.MsgTimeoutNow:    pd.election,
 		raftpb.MsgApp:           pd.replication,
 		raftpb.MsgAppResp:       pd.replication,
 		raftpb.MsgSnap:          pd.snapshot,

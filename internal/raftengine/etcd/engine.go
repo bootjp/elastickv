@@ -73,10 +73,9 @@ const (
 	// admin work. The next event goes through the blocking select, where Tick
 	// competes fairly with priority and bulk steps.
 	priorityStepBurstLimit = 64
-	// defaultHeartbeatBufPerPeer is the capacity of the priority dispatch channel.
-	// It carries low-frequency control traffic: heartbeats, votes, read-index,
-	// leader-transfer, and their corresponding response messages except for
-	// MsgHeartbeatResp, which uses its own coalescing response lane.
+	// defaultHeartbeatBufPerPeer is the capacity of the heartbeat dispatch
+	// channel. It carries heartbeats and read-index traffic. Election messages
+	// have their own lane, and MsgHeartbeatResp uses its coalescing response lane.
 	// MsgAppResp is intentionally kept in the normal channel: followers — the
 	// only senders of MsgAppResp — do not send MsgApp, so there is no
 	// head-of-line blocking risk there.
@@ -88,6 +87,10 @@ const (
 	// upside is that a ~5 s transient pause (election-timeout scale)
 	// no longer drops heartbeats and forces the peers' lease to expire.
 	defaultHeartbeatBufPerPeer = 512
+	// Keep election traffic off the heartbeat lane. Under a partition a
+	// sustained stream of heartbeats can fill that lane and discard votes,
+	// delaying recovery even after the network has healed.
+	defaultElectionBufPerPeer = 64
 	// defaultReadIndexRespBufPerPeer sizes the dedicated follower-to-leader
 	// ReadIndex heartbeat response lane. etcd/raft encodes ReadIndex
 	// completions as MsgHeartbeatResp messages with Context set; unlike plain
@@ -111,8 +114,8 @@ const (
 	// locally-addressed control types). Small buffer: traffic volume is tiny.
 	defaultOtherLaneBufPerPeer = 16
 	// dispatcherLanesEnvVar toggles the multi-lane dispatcher (heartbeat /
-	// heartbeatResp / replication / snapshot / other). When unset or "0", the
-	// legacy 3-lane layout (heartbeat + heartbeatResp + normal) is used.
+	// election / heartbeatResp / readIndexResp / replication / snapshot /
+	// other). When unset or "0", replication and snapshots share normal.
 	// Opt-in by design: the raft hot path is high blast radius and a regression
 	// here can cause cluster-wide elections.
 	dispatcherLanesEnvVar = "ELASTICKV_RAFT_DISPATCHER_LANES"
@@ -638,10 +641,9 @@ type dispatchRequest struct {
 // peerQueues holds separate dispatch channels per peer so that heartbeats
 // are never blocked behind large log-entry RPCs.
 //
-// Legacy 4-lane layout (default): heartbeat + heartbeatResp +
-// readIndexResp + normal.
+// Default layout: heartbeat + election + heartbeatResp + readIndexResp + normal.
 //
-// 6-lane layout (opt-in via ELASTICKV_RAFT_DISPATCHER_LANES=1): heartbeat +
+// Opt-in layout (ELASTICKV_RAFT_DISPATCHER_LANES=1): heartbeat + election +
 // heartbeatResp + readIndexResp + replication (MsgApp/MsgAppResp) + snapshot
 // (MsgSnap) + other. Each lane gets its own goroutine so a bulky MsgSnap
 // transfer cannot stall MsgApp replication and vice versa. Per-peer ordering
@@ -650,11 +652,12 @@ type dispatchRequest struct {
 type peerQueues struct {
 	normal        chan dispatchRequest
 	heartbeat     chan dispatchRequest
+	election      chan dispatchRequest
 	heartbeatResp chan dispatchRequest
 	readIndexResp chan dispatchRequest
-	replication   chan dispatchRequest // 6-lane mode only; nil otherwise
-	snapshot      chan dispatchRequest // 6-lane mode only; nil otherwise
-	other         chan dispatchRequest // 6-lane mode only; nil otherwise
+	replication   chan dispatchRequest // opt-in mode only; nil otherwise
+	snapshot      chan dispatchRequest // opt-in mode only; nil otherwise
+	other         chan dispatchRequest // opt-in mode only; nil otherwise
 	ctx           context.Context
 	cancel        context.CancelFunc
 }
@@ -2825,8 +2828,9 @@ func isBlockingInboundStepMsg(t raftpb.MessageType) bool {
 }
 
 // selectDispatchLane picks the per-peer channel for msgType. In the legacy
-// layout it returns pd.heartbeatResp for MsgHeartbeatResp, pd.heartbeat for
-// other priority control traffic, and pd.normal for everything else. In the
+// layout it returns pd.heartbeatResp for MsgHeartbeatResp, pd.election for
+// votes and leader transfer, pd.heartbeat for other priority traffic, and
+// pd.normal for everything else. In the
 // opt-in multi-lane layout it additionally partitions the non-heartbeat traffic
 // so that MsgApp/MsgAppResp and MsgSnap do not share a goroutine and cannot
 // block each other.
@@ -2842,9 +2846,11 @@ func (e *Engine) selectDispatchLane(pd *peerQueues, msgType raftpb.MessageType) 
 	if msgType == raftpb.MsgHeartbeatResp && pd.heartbeatResp != nil {
 		return pd.heartbeatResp
 	}
-	// Priority control traffic (heartbeats, votes, read-index, timeout-now)
-	// always rides the heartbeat lane in both layouts so it keeps its
-	// low-latency treatment and is never stuck behind MsgApp payloads.
+	if isElectionMsg(msgType) && pd.election != nil {
+		return pd.election
+	}
+	// Remaining priority control traffic (heartbeats and read-index) rides the
+	// heartbeat lane so it is never stuck behind MsgApp payloads.
 	if isPriorityMsg(msgType) {
 		return pd.heartbeat
 	}
@@ -2873,6 +2879,12 @@ func (e *Engine) selectDispatchLane(pd *peerQueues, msgType raftpb.MessageType) 
 	// traffic onto pd.other keeps runtime behaviour compatible with the
 	// pre-lanes default branch.
 	return pd.other
+}
+
+func isElectionMsg(t raftpb.MessageType) bool {
+	return t == raftpb.MsgVote || t == raftpb.MsgVoteResp ||
+		t == raftpb.MsgPreVote || t == raftpb.MsgPreVoteResp ||
+		t == raftpb.MsgTimeoutNow
 }
 
 func (e *Engine) applyReadySnapshot(snapshot *raftpb.Snapshot) error {
@@ -4973,6 +4985,7 @@ func (e *Engine) startPeerDispatcher(nodeID uint64) {
 	ctx, cancel := context.WithCancel(baseCtx)
 	pd := &peerQueues{
 		heartbeat:     make(chan dispatchRequest, defaultHeartbeatBufPerPeer),
+		election:      make(chan dispatchRequest, defaultElectionBufPerPeer),
 		heartbeatResp: make(chan dispatchRequest, defaultHeartbeatRespBufPerPeer),
 		readIndexResp: make(chan dispatchRequest, defaultReadIndexRespBufPerPeer),
 		ctx:           ctx,
@@ -4980,7 +4993,7 @@ func (e *Engine) startPeerDispatcher(nodeID uint64) {
 	}
 	var workers []chan dispatchRequest
 	if e.dispatcherLanesEnabled {
-		// 6-lane layout: split MsgHeartbeatResp, ReadIndex heartbeat
+		// Split MsgHeartbeatResp, election traffic, ReadIndex heartbeat
 		// responses, MsgApp/MsgAppResp (replication), MsgSnap (snapshot), and
 		// misc (other) onto independent goroutines so a bulky snapshot transfer
 		// cannot stall replication or follower heartbeat responses. Each channel
@@ -4989,10 +5002,10 @@ func (e *Engine) startPeerDispatcher(nodeID uint64) {
 		pd.replication = make(chan dispatchRequest, size)
 		pd.snapshot = make(chan dispatchRequest, defaultSnapshotLaneBufPerPeer)
 		pd.other = make(chan dispatchRequest, defaultOtherLaneBufPerPeer)
-		workers = []chan dispatchRequest{pd.heartbeat, pd.heartbeatResp, pd.readIndexResp, pd.replication, pd.snapshot, pd.other}
+		workers = []chan dispatchRequest{pd.heartbeat, pd.election, pd.heartbeatResp, pd.readIndexResp, pd.replication, pd.snapshot, pd.other}
 	} else {
 		pd.normal = make(chan dispatchRequest, size)
-		workers = []chan dispatchRequest{pd.normal, pd.heartbeat, pd.heartbeatResp, pd.readIndexResp}
+		workers = []chan dispatchRequest{pd.normal, pd.heartbeat, pd.election, pd.heartbeatResp, pd.readIndexResp}
 	}
 	e.peerDispatchers[nodeID] = pd
 	e.dispatchWG.Add(len(workers))
@@ -5087,7 +5100,7 @@ func preVoteEnabledFromEnv() bool {
 // drain loops in runDispatchWorker exit. It is safe to call with any dispatch
 // layout because unused lanes are nil.
 func closePeerLanes(pd *peerQueues) {
-	for _, ch := range []chan dispatchRequest{pd.heartbeat, pd.heartbeatResp, pd.readIndexResp, pd.normal, pd.replication, pd.snapshot, pd.other} {
+	for _, ch := range []chan dispatchRequest{pd.heartbeat, pd.election, pd.heartbeatResp, pd.readIndexResp, pd.normal, pd.replication, pd.snapshot, pd.other} {
 		if ch != nil {
 			close(ch)
 		}
