@@ -1263,6 +1263,10 @@ The data-group FSM can atomically apply a witnessed `ControlReserve` policy
 transition with its receipt and revokes admission before that apply. Production
 ingress still rejects this opcode: native ConfChange binding, terminal completion
 or abort, and ambiguous-outcome reconciliation are not implemented yet.
+The strict v4 ConfChange context codec binds the operation/reservation IDs,
+expected witness, transition, target-configuration digest, candidate identity
+and peer address. It is not yet connected to native proposal or committed
+apply; protected configuration changes remain rejected at that boundary.
 The legacy startup regression remains separately retained and red. No usable
 production rollout, complete bootstrap, or completion of the parent isolation
 audit is claimed by this integration checkpoint.
