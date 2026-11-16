@@ -30,11 +30,17 @@ func ParseGuardedBootstrapCommand(payload []byte) (raftbootstrap.GuardedCommand,
 // accepted existing Raft command shape.
 func ValidateGuardedBootstrapInner(kind raftbootstrap.ControlKind, inner []byte) error {
 	switch kind {
+	case raftbootstrap.ControlReserve:
+		policy, err := raftbootstrap.ParsePolicyRecord(inner)
+		if err != nil || policy.Reservation == nil {
+			return errors.Join(ErrInvalidGuardedBootstrapInner, err)
+		}
+		return nil
 	case raftbootstrap.ControlGuardedWatermark:
 		return validateGuardedWatermarkInner(inner)
 	case raftbootstrap.ControlGuardedCatalog:
 		return validateGuardedCatalogInner(inner)
-	case raftbootstrap.ControlActivate, raftbootstrap.ControlReserve, raftbootstrap.ControlAbort:
+	case raftbootstrap.ControlActivate, raftbootstrap.ControlAbort:
 		return errors.WithStack(ErrInvalidGuardedBootstrapInner)
 	}
 	return errors.WithStack(ErrInvalidGuardedBootstrapInner)

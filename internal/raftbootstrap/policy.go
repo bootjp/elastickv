@@ -188,6 +188,39 @@ func validateTerminalOperation(policy PolicyRecord, index int, operation Termina
 	return nil
 }
 
+// ValidateReservationTransition checks the durable policy change that creates
+// a reservation. The caller must validate the reservation's ReserveIndex
+// against the replicated entry index.
+func ValidateReservationTransition(previous, next PolicyRecord) error {
+	old, err := canonicalPolicy(previous)
+	if err != nil {
+		return err
+	}
+	updated, err := canonicalPolicy(next)
+	if err != nil {
+		return err
+	}
+	if !samePolicyLineage(old, updated) || !sameReservationBase(old, updated) {
+		return errors.WithStack(ErrInvalid)
+	}
+	witness, err := old.Witness()
+	if err != nil {
+		return err
+	}
+	if updated.Reservation.Expected != witness {
+		return errors.WithStack(ErrInvalid)
+	}
+	return nil
+}
+
+func sameReservationBase(old, updated PolicyRecord) bool {
+	return old.Reservation == nil && updated.Reservation != nil &&
+		old.LastConfigurationIndex == updated.LastConfigurationIndex &&
+		sameConfiguration(old.Configuration, updated.Configuration) &&
+		slices.Equal(old.RetiredMemberIDs, updated.RetiredMemberIDs) &&
+		slices.Equal(old.TerminalOperations, updated.TerminalOperations)
+}
+
 // ValidatePolicyTransition binds terminal receipts to the reservation they
 // consume. A standalone policy frame cannot prove how it was reached; callers
 // applying replicated policy entries must validate the previous and next

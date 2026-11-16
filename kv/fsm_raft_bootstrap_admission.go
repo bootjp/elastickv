@@ -21,35 +21,45 @@ func BootstrapApplyChangesAdmission(ctx context.Context, st store.MVCCStore, ide
 	if changed, err := EncryptionApplyChangesAdmission(payload); changed || err != nil {
 		return changed, err
 	}
-	return bootstrapActivationChangesAdmission(ctx, st, identity, payload)
-}
-
-func bootstrapActivationChangesAdmission(ctx context.Context, st store.MVCCStore, identity raftbootstrap.Identity, payload []byte) (bool, error) {
-	_, matched, err := raftbootstrap.ParseActivationCommand(payload)
-	if err != nil || !matched {
-		return false, errors.WithStack(err)
+	if changed, matched, err := bootstrapActivationChangesAdmission(ctx, st, identity, payload); matched || err != nil {
+		return changed, err
 	}
-	metadata, ok := st.(store.RaftControlMetadataStore)
-	if !ok {
-		return false, errors.WithStack(ErrGuardedBootstrapApply)
+	if !raftbootstrap.IsReservedControlPayload(payload) {
+		return false, nil
 	}
-	key, err := BootstrapPolicyMetadataKey(identity)
+	command, matched, err := ParseGuardedBootstrapCommand(payload)
 	if err != nil {
 		return false, err
 	}
+	return matched && command.Kind == raftbootstrap.ControlReserve, nil
+}
+
+func bootstrapActivationChangesAdmission(ctx context.Context, st store.MVCCStore, identity raftbootstrap.Identity, payload []byte) (bool, bool, error) {
+	_, matched, err := raftbootstrap.ParseActivationCommand(payload)
+	if err != nil || !matched {
+		return false, matched, errors.WithStack(err)
+	}
+	metadata, ok := st.(store.RaftControlMetadataStore)
+	if !ok {
+		return false, true, errors.WithStack(ErrGuardedBootstrapApply)
+	}
+	key, err := BootstrapPolicyMetadataKey(identity)
+	if err != nil {
+		return false, true, err
+	}
 	raw, err := metadata.ReadRaftControlMetadata(ctx, key)
 	if errors.Is(err, store.ErrKeyNotFound) {
-		return true, nil
+		return true, true, nil
 	}
 	if err != nil {
-		return false, errors.WithStack(err)
+		return false, true, errors.WithStack(err)
 	}
 	policy, err := raftbootstrap.ParsePolicyRecord(raw)
 	if err != nil {
-		return false, errors.WithStack(err)
+		return false, true, errors.WithStack(err)
 	}
 	if policy.Identity != identity {
-		return false, errors.WithStack(raftbootstrap.ErrInconsistent)
+		return false, true, errors.WithStack(raftbootstrap.ErrInconsistent)
 	}
-	return false, nil
+	return false, true, nil
 }

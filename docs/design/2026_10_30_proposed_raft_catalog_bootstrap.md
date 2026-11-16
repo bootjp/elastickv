@@ -1258,7 +1258,11 @@ boundary. Catch-up grant-owner admission remains closed at this scope.
 This does not complete runtime admission. TSO policy recovery is still rejected
 instead of starting a partially protected domain. DataReady/control admission,
 cross-group rotation dependencies, background-writer admission, protected
-membership reservations and enqueue/install receipt rechecks remain required.
+membership orchestration and enqueue/install receipt rechecks remain required.
+The data-group FSM can atomically apply a witnessed `ControlReserve` policy
+transition with its receipt and revokes admission before that apply. Production
+ingress still rejects this opcode: native ConfChange binding, terminal completion
+or abort, and ambiguous-outcome reconciliation are not implemented yet.
 The legacy startup regression remains separately retained and red. No usable
 production rollout, complete bootstrap, or completion of the parent isolation
 audit is claimed by this integration checkpoint.
