@@ -68,6 +68,7 @@ func (e *Engine) frontPipelineReceivedSnapshot(request *pipelineSnapshotRequest)
 		p.normalizingReceived = nil
 	}
 	e.snapshotTransition.Store(true)
+	e.invalidateTTLInlineRecoveryProof()
 	e.ackTracker.reset()
 	e.singleNodeLeaderAckMonoNs.Store(0)
 	e.fireLeaderLossCallbacks()

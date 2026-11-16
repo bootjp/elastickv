@@ -48,9 +48,10 @@ func (g *nativeSnapshotGate) unblock() { g.once.Do(func() { close(g.release) }) 
 
 type nativeSnapshotFSM struct {
 	asyncStorageFSM
-	gate         *nativeSnapshotGate
-	restores     atomic.Uint64
-	deferCapture atomic.Bool
+	gate          *nativeSnapshotGate
+	restores      atomic.Uint64
+	invalidations atomic.Uint64
+	deferCapture  atomic.Bool
 }
 
 func (f *nativeSnapshotFSM) Apply(data []byte) any {
@@ -102,6 +103,10 @@ func (f *nativeSnapshotFSM) Restore(reader io.Reader) error {
 	}
 	f.restores.Add(1)
 	return f.asyncStorageFSM.Restore(reader)
+}
+
+func (f *nativeSnapshotFSM) InvalidateTTLInlineRecoveryProof() {
+	f.invalidations.Add(1)
 }
 
 func (f *nativeSnapshotFSM) SetDurableAppliedIndex(index uint64) error {
@@ -461,6 +466,22 @@ func TestEnginePipelineThreeVoterStreamedSnapshotCatchup(t *testing.T) {
 	for _, stage := range []string{"save", "restore", "release"} {
 		t.Run(stage, func(t *testing.T) { testPipelineStreamedSnapshotCatchup(t, stage) })
 	}
+}
+
+func TestEnginePipelineReceivedSnapshotInvalidatesTTLProofBeforeRestore(t *testing.T) {
+	c := newNativeSnapshotCluster(t, "", "save")
+	c.dropThird = true
+	index := c.propose(t, []byte("proof-invalidation-target"))
+	c.pumpUntil(t, func() bool { first, _ := c.nodes[0].engine.storage.FirstIndex(); return first > index }, "checkpoint")
+	before := c.fsms[2].invalidations.Load()
+	c.gates[2].minimum.Store(index)
+	c.dropThird = false
+	c.pumpUntil(t, func() bool { return c.gates[2].used.Load() }, "held snapshot save")
+	require.Greater(t, c.fsms[2].invalidations.Load(), before)
+	require.Zero(t, c.fsms[2].restores.Load())
+	require.True(t, c.nodes[2].engine.snapshotTransition.Load())
+	c.gates[2].unblock()
+	c.pumpUntil(t, func() bool { return c.nodes[2].engine.AppliedIndex() >= index }, "published snapshot")
 }
 
 func testPipelineStreamedSnapshotCatchup(t *testing.T, stage string) {
