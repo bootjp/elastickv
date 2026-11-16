@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"unicode/utf8"
 
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/cockroachdb/errors"
 )
 
@@ -110,7 +111,8 @@ func validateMembershipChangeContext(context MembershipChangeContext) error {
 		context.Candidate.PublicKeyDigest == (Digest{}) || !validAddress(context.Candidate.Address) {
 		return errors.WithStack(ErrInvalid)
 	}
-	if !validMembershipContextPeer(context.PeerID, context.Candidate.Address) {
+	if !validMembershipContextPeer(context.PeerID, context.Candidate.Address) ||
+		raftengine.DeriveNodeID(context.PeerID) != context.Candidate.ID {
 		return errors.WithStack(ErrInvalid)
 	}
 	return nil
