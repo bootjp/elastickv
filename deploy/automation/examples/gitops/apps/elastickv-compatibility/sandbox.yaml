@@ -258,7 +258,7 @@ metadata:
   name: data-elastickv-0
   namespace: elastickv-validation
   labels:
-    elastickv-validation: rollback-20261111213000
+    elastickv-validation: compatibility
 spec:
   accessModes:
   - ReadWriteOnce
@@ -273,7 +273,7 @@ metadata:
   name: data-elastickv-1
   namespace: elastickv-validation
   labels:
-    elastickv-validation: rollback-20261111213000
+    elastickv-validation: compatibility
 spec:
   accessModes:
   - ReadWriteOnce
@@ -288,7 +288,7 @@ metadata:
   name: data-elastickv-2
   namespace: elastickv-validation
   labels:
-    elastickv-validation: rollback-20261111213000
+    elastickv-validation: compatibility
 spec:
   accessModes:
   - ReadWriteOnce

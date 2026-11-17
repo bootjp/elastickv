@@ -339,6 +339,10 @@ class PublicationTests(unittest.TestCase):
                 continue
             text = path.read_text()
             self.assertIsNone(
+                re.search(r"\b(?:rollback|migration|rehearsal)-\d{8,14}\b", text),
+                str(path),
+            )
+            self.assertIsNone(
                 re.search(
                     r"\b(?:192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+|172\.(?:1[6-9]|2[0-9]|3[01])\.\d+\.\d+)\b",
                     text,
