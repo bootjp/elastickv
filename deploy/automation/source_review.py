@@ -112,38 +112,85 @@ def code_lines(text):
     ]
 
 
+def marker_expression(lines, start, first):
+    """Read a complete Go initializer without evaluating candidate code."""
+    stack, parts = [], []
+    quote, escaped = None, False
+    last = None
+    pairs = {")": "(", "]": "[", "}": "{"}
+    for index in range(start, len(lines)):
+        line = first if index == start else lines[index]
+        for char in line:
+            if not char.isspace():
+                last = char
+            if quote is not None:
+                parts.append(char)
+                if escaped:
+                    escaped = False
+                elif char == "\\" and quote != "`":
+                    escaped = True
+                elif char == quote:
+                    quote = None
+                continue
+            if char in ('"', "'", "`"):
+                quote = char
+            elif char in "([{":
+                stack.append(char)
+            elif char in ")]}":
+                if not stack or stack.pop() != pairs[char]:
+                    return None, index
+            elif char == ";" and not stack:
+                return "".join(parts).strip() or None, index
+            parts.append(char)
+        if quote is not None and quote != "`":
+            return None, index
+        if (
+            not stack
+            and quote is None
+            and last is not None
+            and last not in "+-*/%&|^<>=!,:."
+        ):
+            return "".join(parts).strip(), index
+    return None, len(lines) - 1
+
+
 def version_literals(text):
-    # Compare declarations as source expressions, never evaluate candidate Go.
-    # Keep quoted literals intact while excluding comments from marker identity.
+    # Quoted literals survive comment removal, including raw multiline strings.
     text = re.sub(
         r"(\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|`[^`]*`)|//[^\n]*|/\*[\s\S]*?\*/",
         lambda m: m[1] if m[1] is not None else "\n" * m[0].count("\n"),
         text,
     )
-    pattern = re.compile(
-        r"(?m)^[ \t]*(?:const[ \t]+|var[ \t]+)?([A-Za-z_]\w*)[ \t]*(?:[\w.]+[ \t]+)?=[ \t]*(\[[^\]\n]*\]byte\s*\{[^}]*\}|[\w.]+\s*\([^)]*\)|[^\n;]+)"
+    declaration = re.compile(
+        r"^[ \t]*(?:const[ \t]+|var[ \t]+)?([A-Za-z_]\w*)(?:[ \t]+[\w.\[\]]+)?[ \t]*=[ \t]*(.*)$"
     )
-    result = {}
-    for match in pattern.finditer(text):
-        name = match[1].lower()
-        if "magic" in name or (
-            "version" in name
-            and any(
-                k in name
-                for k in (
-                    "format",
-                    "schema",
-                    "snapshot",
-                    "codec",
-                    "wire",
-                    "disk",
-                    "hlc",
-                    "mvcc",
-                    "pebble",
+    result, index = {}, 0
+    lines = text.splitlines(keepends=True)
+    while index < len(lines):
+        match = declaration.match(lines[index].rstrip("\r\n"))
+        if match:
+            name = match[1].lower()
+            if "magic" in name or (
+                "version" in name
+                and any(
+                    k in name
+                    for k in (
+                        "format",
+                        "schema",
+                        "snapshot",
+                        "codec",
+                        "wire",
+                        "disk",
+                        "hlc",
+                        "mvcc",
+                        "pebble",
+                    )
                 )
-            )
-        ):
-            result[match[1]] = match[2].strip()
+            ):
+                result[match[1]], index = marker_expression(
+                    lines, index, match[2] + "\n"
+                )
+        index += 1
     return result
 
 
@@ -279,7 +326,18 @@ def analyze(
                 )
         if path.startswith(PERSISTENT) or prior.startswith(PERSISTENT):
             new_versions = version_literals(after)
-            for name, value in version_literals(before).items():
+            old_versions = version_literals(before)
+            if any(
+                value is None
+                for value in [*old_versions.values(), *new_versions.values()]
+            ):
+                finding(
+                    "blocker",
+                    "persistent-marker-incomplete",
+                    path,
+                    "A complete persisted marker initializer could not be established",
+                )
+            for name, value in old_versions.items():
                 if new_versions.get(name) != value:
                     finding(
                         "blocker",

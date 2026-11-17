@@ -188,6 +188,29 @@ class SourceAuditTests(unittest.TestCase):
                     )
                 )
 
+    def test_complete_compound_persisted_marker_expression_is_compared(self):
+        expressions = [
+            "uint32(8) + 1",
+            "uint32(8) +\n 1",
+            "(uint32(8) +\n 1)",
+            "[2]byte{1, 2}[1]",
+        ]
+        for value in expressions:
+            old = "const snapshotFormatVersion = " + value
+            new = old.rsplit("1", 1)[0] + "2" + old.rsplit("1", 1)[1]
+            with self.subTest(expression=value):
+                self.assertEqual(
+                    "blocked", self.assess("store/snapshot.go", old, new)["decision"]
+                )
+
+    def test_incomplete_marker_expression_cannot_be_eligible(self):
+        report = self.assess(
+            "store/snapshot.go",
+            "const snapshotFormatVersion = uint32(8)",
+            "const snapshotFormatVersion = uint32(8) + (",
+        )
+        self.assertEqual("blocked", report["decision"])
+
     def test_reader_removal_is_blocked(self):
         self.assertEqual(
             "blocked",
