@@ -189,6 +189,7 @@ class RenderTests(unittest.TestCase):
                 "import compatibility_pr;print(compatibility_pr.ROOT)",
             ],
             env=env,
+            cwd=self.output,
             text=True,
         )
         self.assertEqual(str(self.output.resolve()), result.strip())
@@ -270,6 +271,7 @@ assert not agent.ci_ready([{**run,'head_branch':'main'}],'a'*40,['Test'])
             [sys.executable, "-c", script],
             check=True,
             env=environment,
+            cwd=self.output,
             capture_output=True,
         )
 

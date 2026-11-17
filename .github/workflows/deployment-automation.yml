@@ -25,3 +25,26 @@ jobs:
           ruff format --check deploy/automation/*.py
       - name: Test controllers and render isolated examples
         run: python3 -m unittest discover -s deploy/automation -v
+
+  controller-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v4
+      - name: Build the portable controller without publishing or deploying
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: deploy/automation/Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: elastickv-release-controller:ci
+          cache-from: type=gha,scope=release-controller
+          cache-to: type=gha,mode=max,scope=release-controller
+      - name: Check CLI and runtime imports without credentials
+        run: |
+          docker run --rm elastickv-release-controller:ci --help
+          docker run --rm --entrypoint python3 elastickv-release-controller:ci -c 'import agent, compatibility, source_review, human_approval, boto3, yaml'
