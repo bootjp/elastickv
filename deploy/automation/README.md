@@ -91,7 +91,9 @@ validation storage. The examples require three eligible nodes for anti-affinity.
 
 This default profile does not enable encryption, commit-ts fence, timestamp
 binding, Phase D, custom server flags, production init containers or lifecycle
-hooks. Unsupported settings stop qualification. Writable data sidecars and
+hooks. Admission inspects every running voter as well as the StatefulSet template;
+stale OnDelete Pod hooks, init/debug containers and unexpected claim bindings
+stop qualification. Writable data sidecars and
 unexpected/overlapping volumes are refused. FUSE workloads and custom application
 hooks need a separate qualification profile.
 
@@ -326,10 +328,28 @@ Production retains its longer startup/healthy-window checks. Raft membership,
 commit/application progress, snapshot progress, leader ReadIndex, follower-first
 replacement, leader transfer and Redis/DynamoDB/S3/SQS canaries are checked during
 rollout. The persisted transaction and Lease serialize recovery. Health failure
-rolls back the compatible image and quarantines that digest. Configuration drift
+rolls back the compatible image and quarantines that digest. If the live Raft leader
+fails readiness, rollback may use a normal leadership transfer only after two Ready
+voters prove the expected membership, recent leader contact and fully applied
+committed entries. The leader must answer RaftAdmin, and all three must agree on a
+positive term and configuration index. Both Ready voters must cover its commit
+index. Git ownership, the Lease, Pod identities/specs and PVC identities are checked
+before transfer. Normal quorum and leader ReadIndex must pass on the new Ready
+leader before any Pod deletion. This recovery path is restricted to a persisted
+rollback transaction; forward rollout keeps the strict Ready-leader requirement.
+Configuration drift
 or lost ownership stops writes. PVC data is not rolled back; incompatible format
 changes need a separately designed migration and cannot use this image rollback.
 Existing backups remain protected; the controller does not create or refresh them.
+
+If RaftAdmin is unreachable, membership/term/progress disagrees, a transfer cannot
+be confirmed, or fewer than two Ready voters remain, stop without deleting another
+Pod. Suspend scheduling in Git, wait for any active Job/Lease holder to finish,
+and retain the transaction, evidence and failed Job logs. Restore connectivity and
+the proven Ready majority before resuming the recorded rollback. Do not clear its
+transaction, rebind/delete claims, remove voters, or force an election to bypass the
+gate. A cluster without a provable majority requires a separate operator-reviewed
+recovery using retained backups.
 
 If the server merge succeeds but recording consent fails, the proposal is inert:
 there is no new deployment permission. Preserve the qualification branch. Rerun the

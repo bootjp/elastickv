@@ -33,6 +33,7 @@ class RunningProductionTests(unittest.TestCase):
             "command": ["/app"],
             "args": [],
             "env": [],
+            "volumeMounts": [{"name": "data", "mountPath": "/var/lib/elastickv"}],
         }
         sts = {
             "spec": {
@@ -44,7 +45,17 @@ class RunningProductionTests(unittest.TestCase):
         pods = {
             f"elastickv-{n}": {
                 "metadata": {"name": f"elastickv-{n}", "uid": str(n)},
-                "spec": {"containers": [copy.deepcopy(expected)]},
+                "spec": {
+                    "containers": [copy.deepcopy(expected)],
+                    "volumes": [
+                        {
+                            "name": "data",
+                            "persistentVolumeClaim": {
+                                "claimName": f"data-elastickv-{n}"
+                            },
+                        }
+                    ],
+                },
                 "status": {
                     "conditions": [{"type": "Ready", "status": "True"}],
                     "containerStatuses": [{"name": "elastickv", "restartCount": 0}],

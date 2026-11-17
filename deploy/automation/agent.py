@@ -653,10 +653,15 @@ class Runtime:
     def check_qualified_storage(self):
         if not self.policy.get("require_qualification"):
             return
-        from compatibility_profile import verify_live_data_layout
+        from compatibility_profile import (
+            verify_live_data_layout,
+            verify_running_pod_layout,
+        )
 
         try:
             verify_live_data_layout(self.kube.request(self.sts_path))
+            for name, pod in self.pods().items():
+                verify_running_pod_layout(pod, "data-" + name)
         except ValueError as error:
             raise UnsafeState(str(error)) from None
         actual = self.production_bindings()
@@ -687,39 +692,47 @@ class Runtime:
             raise ReleaseError("Raft RPC failed: " + command + " on " + name)
         return result.stdout
 
-    def quorum(self, pods):
+    def _voter_status(self, name, *, require_applied=True):
+        raw = self.rpc(name, "status")
+        status = dict(line.split(": ", 1) for line in raw.splitlines() if ": " in line)
+        config = self.rpc(name, "configuration")
+        ids = set(re.findall(r'^  id: "([^"]+)"$', config, re.M))
+        if (
+            ids != set(self.policy["members"])
+            or len(re.findall('suffrage: "voter"', config)) != 3
+        ):
+            raise ReleaseError("Unexpected Raft membership")
+        if status["pending_conf_change"] != "false":
+            raise ReleaseError("Pending membership change")
+        applied, committed, snapshot = (
+            int(status[k])
+            for k in ("applied_index", "commit_index", "last_snapshot_index")
+        )
+        if (
+            min(applied, committed, snapshot, int(status["fsm_pending"])) < 0
+            or not snapshot <= applied <= committed
+        ):
+            raise ReleaseError("Invalid Raft progress")
+        if require_applied and (int(status["fsm_pending"]) or applied != committed):
+            raise ReleaseError("Voter has not applied committed entries")
+        if (
+            status["state"].strip(chr(34)).upper() == "FOLLOWER"
+            and not 0 <= int(status["last_contact_nanos"]) <= 10_000_000_000
+        ):
+            raise ReleaseError("Voter leader contact is unknown or stale")
+        return status
+
+    def _healthy_statuses(self, pods):
         healthy = [name for name, pod in pods.items() if pod_ready(pod)]
         if len(healthy) < 2:
             raise ReleaseError(
                 "Fewer than two healthy voters; automatic disruption forbidden"
             )
-        statuses = {}
-        for name in healthy:
-            raw = self.rpc(name, "status")
-            status = dict(
-                line.split(": ", 1) for line in raw.splitlines() if ": " in line
-            )
-            config = self.rpc(name, "configuration")
-            ids = set(re.findall(r'^  id: "([^"]+)"$', config, re.M))
-            if (
-                ids != set(self.policy["members"])
-                or len(re.findall('suffrage: "voter"', config)) != 3
-            ):
-                raise ReleaseError("Unexpected Raft membership")
-            if status["pending_conf_change"] != "false":
-                raise ReleaseError("Pending membership change")
-            if int(status["fsm_pending"]) or int(status["applied_index"]) != int(
-                status["commit_index"]
-            ):
-                raise ReleaseError("Voter has not applied committed entries")
-            if int(status["applied_index"]) < int(status["last_snapshot_index"]):
-                raise ReleaseError("Voter has not applied its snapshot")
-            if (
-                status["state"] == "FOLLOWER"
-                and not 0 <= int(status["last_contact_nanos"]) <= 10_000_000_000
-            ):
-                raise ReleaseError("Voter leader contact is unknown or stale")
-            statuses[name] = status
+        return {name: self._voter_status(name) for name in healthy}
+
+    def quorum(self, pods):
+        statuses = self._healthy_statuses(pods)
+        healthy = list(statuses)
         leaders = {json.loads(s["leader_id"]) for s in statuses.values()}
         if len(leaders) != 1 or next(iter(leaders)) not in healthy:
             raise ReleaseError("No common healthy leader")
@@ -739,6 +752,85 @@ class Runtime:
             if response.status != 200:
                 raise ReleaseError("Leader ReadIndex verification failed")
         return leader
+
+    def rollback_quorum(self, pods, pvcs):
+        transaction = self.git.state.get("transaction", {})
+        if transaction.get("phase") != "rollback":
+            raise UnsafeState("Leadership recovery is restricted to recorded rollback")
+        if set(pods) != set(self.policy["members"]):
+            raise UnsafeState("Unexpected member inventory")
+        statuses = self._healthy_statuses(pods)
+        leaders = {json.loads(s["leader_id"]) for s in statuses.values()}
+        if len(leaders) != 1:
+            raise ReleaseError("No common leader for rollback recovery")
+        leader = next(iter(leaders))
+        if leader in statuses:
+            return self.quorum(pods)
+        if leader not in pods or len(statuses) != 2:
+            raise ReleaseError("Unknown or unproven rollback leader")
+        unhealthy = self._voter_status(leader, require_applied=False)
+        if (
+            unhealthy["state"].strip(chr(34)).upper() != "LEADER"
+            or json.loads(unhealthy["leader_id"]) != leader
+        ):
+            raise ReleaseError("Unready member is not the reported Raft leader")
+        # Refresh followers after reading the leader's commit barrier, rather
+        # than requiring earlier follower samples to cover later concurrent writes.
+        statuses = self._healthy_statuses(pods)
+        if any(json.loads(s["leader_id"]) != leader for s in statuses.values()):
+            raise ReleaseError("Leader changed during rollback recovery")
+        views = [*statuses.values(), unhealthy]
+        for key in ("term", "configuration_index"):
+            values = {int(s[key]) for s in views}
+            if len(values) != 1 or next(iter(values)) <= 0:
+                raise ReleaseError("Raft term or configuration changed during recovery")
+        if any(
+            s["state"].strip(chr(34)).upper() != "FOLLOWER"
+            or int(s["applied_index"]) < int(unhealthy["commit_index"])
+            for s in statuses.values()
+        ):
+            raise ReleaseError("Ready rollback voters do not cover the leader commit")
+        allowed = {transaction["from"]["image"], transaction["to"]["image"]}
+        if any(
+            next(
+                c["image"] for c in p["spec"]["containers"] if c["name"] == "elastickv"
+            )
+            not in allowed
+            for p in pods.values()
+        ):
+            raise UnsafeState("Unexpected image during rollback recovery")
+        target = next(iter(statuses))
+        self.lease.guard()
+        self.git.guard()
+        if self.pvcs() != pvcs:
+            raise UnsafeState("PVC identity changed before leadership recovery")
+        current = self.pods()
+        if set(current) != set(pods) or any(
+            current[n]["metadata"].get("deletionTimestamp")
+            or current[n]["metadata"]["uid"] != pods[n]["metadata"]["uid"]
+            or current[n]["spec"] != pods[n]["spec"]
+            or pod_ready(current[n]) != pod_ready(pods[n])
+            or [
+                (c["name"], c.get("restartCount", 0))
+                for c in current[n].get("status", {}).get("containerStatuses", [])
+            ]
+            != [
+                (c["name"], c.get("restartCount", 0))
+                for c in pods[n].get("status", {}).get("containerStatuses", [])
+            ]
+            for n in pods
+        ):
+            raise ReleaseError("Pod inventory changed during leadership recovery")
+        self.lease.guard()
+        self.rpc(
+            leader,
+            "leadership_transfer_to_server",
+            target,
+            target + ".elastickv-peer." + self.policy["namespace"] + ".svc:50051",
+        )
+        # No Pod is deleted until normal quorum and leader ReadIndex pass again.
+        self.wait(lambda: self.quorum(self.pods()) == target, 90)
+        return target
 
     def verify(self, release, canary=True):
         self.lease.tick()
@@ -853,7 +945,12 @@ class Runtime:
                     self.policy["startup_timeout"],
                 )
                 return
-            leader = self.wait(lambda: self.quorum(self.pods()), 120)
+            leader = self.wait(
+                lambda: self.rollback_quorum(self.pods(), pvcs)
+                if transaction.get("phase") == "rollback"
+                else self.quorum(self.pods()),
+                120,
+            )
             unhealthy = [name for name, p in pods.items() if not pod_ready(p)]
             if unhealthy and unhealthy[0] not in remaining:
                 self.wait(

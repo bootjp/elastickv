@@ -18,6 +18,7 @@ from compatibility_profile import (
     qualification_identity,
     verify_dedicated_volume,
     verify_live_data_layout,
+    verify_running_pod_layout,
 )
 from settings import CONFIG as SITE
 from settings import require_configured
@@ -94,6 +95,10 @@ def production(kube, baseline):
     pods = {}
     for n in range(3):
         pod = kube.request(prefix + "/pods/elastickv-" + str(n))
+        try:
+            verify_running_pod_layout(pod, "data-elastickv-" + str(n))
+        except ValueError as error:
+            raise agent.UnsafeState(str(error)) from None
         actual = next(c for c in pod["spec"]["containers"] if c["name"] == "elastickv")
         image = actual["image"]
         if actual.get("envFrom") or any(

@@ -131,12 +131,41 @@ def verify_live_data_layout(sts):
         or templates[0]["spec"].get("selector")
     ):
         raise ValueError("Unexpected production data claim template")
-    pod = spec["template"]["spec"]
+    verify_pod_data_layout(spec["template"]["spec"])
+
+
+def verify_running_pod_layout(pod, claim):
+    verify_pod_data_layout(pod["spec"], claim=claim)
+
+
+def verify_pod_data_layout(pod, *, claim=None):
+    if pod.get("ephemeralContainers"):
+        raise ValueError(
+            "Production debug containers require a separate qualification profile"
+        )
+    data_volumes = [v for v in pod.get("volumes", []) if v["name"] == "data"]
+    if claim is not None:
+        if len(data_volumes) != 1 or data_volumes[0] != {
+            "name": "data",
+            "persistentVolumeClaim": {"claimName": claim},
+        }:
+            # Kubernetes may explicitly default readOnly to false.
+            if len(data_volumes) != 1 or data_volumes[0] != {
+                "name": "data",
+                "persistentVolumeClaim": {"claimName": claim, "readOnly": False},
+            }:
+                raise ValueError(
+                    "Running Pod data volume does not identify its owned claim"
+                )
+    elif data_volumes:
+        raise ValueError("Production data must come from the claim template")
     if pod.get("initContainers"):
         raise ValueError(
             "Production init containers require a separate qualification profile"
         )
     for volume in pod.get("volumes", []):
+        if claim is not None and volume["name"] == "data":
+            continue
         if set(volume) - {
             "name",
             "secret",

@@ -55,3 +55,8 @@ jobs:
           docker run --rm --read-only --tmpfs /tmp:rw,nosuid,nodev,size=64m \
             -e GH_TOKEN -e GH_CONFIG_DIR=/tmp/gh-provenance -e XDG_CACHE_HOME=/tmp/gh-cache \
             --entrypoint gh elastickv-release-controller:ci attestation trusted-root --verify-only
+      - name: Test the built runtime with its installed dependencies
+        run: |
+          docker run --rm --read-only --tmpfs /tmp:rw,nosuid,nodev,size=128m \
+            -v "$PWD:/repo:ro" -w /repo/deploy/automation -e ELASTICKV_DEPLOYMENT_CONFIG= \
+            --entrypoint python3 elastickv-release-controller:ci -m unittest discover -v
