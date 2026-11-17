@@ -274,6 +274,13 @@ def analyze(
                 path,
                 "A persistence/wire implementation or reader was removed or moved",
             )
+        if change.get("unresolved_persistent_move"):
+            finding(
+                "blocker",
+                "persistent-move-unresolved",
+                path,
+                "Unreported implementation deletion/addition may move code into persistence",
+            )
         try:
             before, after = old.decode("utf-8"), new.decode("utf-8")
         except UnicodeDecodeError:
@@ -480,6 +487,15 @@ def collect(
                 {"filename": path, "previous_filename": prior, "status": "renamed"}
             )
             covered.update((prior, path))
+        # The API may omit a move entirely. A Go/protobuf implementation deletion
+        # plus a new persistence path cannot safely be treated as unrelated edits.
+        remaining = actual - covered
+        unresolved_removal = any(
+            path not in new_tree
+            and path.endswith((".go", ".proto"))
+            and not path.endswith("_test.go")
+            for path in remaining
+        )
         # Paths beyond the API cap still come from the complete immutable trees.
         changes = renames + [
             {
@@ -490,8 +506,16 @@ def collect(
                 if path not in new_tree
                 else "modified",
             }
-            for path in sorted(actual - covered)
+            for path in sorted(remaining)
         ]
+        if unresolved_removal:
+            for change in changes:
+                if (
+                    change["status"] == "added"
+                    and change["filename"].startswith(PERSISTENT)
+                    and not change["filename"].endswith("_test.go")
+                ):
+                    change["unresolved_persistent_move"] = True
         described = actual
     elif actual != described:
         raise ValueError("Comparison omitted source changes")

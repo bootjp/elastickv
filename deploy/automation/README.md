@@ -65,6 +65,10 @@ against both trees and retained, including moves into persistence paths. Remaini
 paths use conservative removal/addition analysis. Truncated trees, missing blobs and all byte/publication budgets
 still stop qualification. Large reports may omit display excerpts while retaining
 every file identity and finding; this never omits source analysis or blockers.
+If a Go/protobuf implementation deletion is not covered by a verified rename,
+an accompanying new persistence path blocks qualification: an omitted move cannot
+be established safely. This can conservatively block independent deletion/addition
+changes; they require a separate reviewed profile rather than an approval bypass.
 
 The sandbox copies supported literal transport, FSM sync, snapshot-size and Redis
 connection tuning, rejecting Secret references and invalid values. It preserves

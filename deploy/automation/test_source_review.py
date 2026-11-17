@@ -371,6 +371,38 @@ class InventoryTests(unittest.TestCase):
             with self.subTest(previous=previous), self.assertRaises(ValueError):
                 self.collect(limits={"max_files": 1000})
 
+    def test_omitted_implementation_moves_into_persistence_are_blocked(self):
+        for changed in (False, True):
+            self.large_inventory()
+            self.old["adapter/legacy.go"] = b"func legacyReader() {}"
+            self.new["store/legacy.go"] = (
+                b"func legacyReader() { /* moved */ }"
+                if changed
+                else self.old["adapter/legacy.go"]
+            )
+            self.trees = {OLD: inventory(self.old), NEW: inventory(self.new)}
+            with self.subTest(changed=changed):
+                report = self.collect(limits={"max_files": 1000})
+                self.assertEqual(342, len(report["files"]))
+                self.assertEqual("blocked", report["decision"])
+                self.assertFalse(sr.eligible(report, OLD, NEW, IMAGE))
+                self.assertTrue(
+                    any(
+                        f["code"] == "persistent-move-unresolved"
+                        for f in report["findings"]
+                    )
+                )
+
+    def test_document_or_test_deletion_does_not_imply_an_implementation_move(self):
+        for removed in ("docs/legacy.md", "adapter/legacy_test.go"):
+            self.large_inventory()
+            self.old[removed] = b"old"
+            self.new["store/new.go"] = b"func newReader() {}"
+            self.trees = {OLD: inventory(self.old), NEW: inventory(self.new)}
+            with self.subTest(removed=removed):
+                report = self.collect(limits={"max_files": 1000})
+                self.assertTrue(sr.eligible(report, OLD, NEW, IMAGE))
+
     def test_incomplete_small_comparison_and_foreign_prefix_fail_closed(self):
         self.large_inventory()
         self.comparison["files"].pop()
