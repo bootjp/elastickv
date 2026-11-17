@@ -460,9 +460,28 @@ def collect(
         if not described <= actual:
             raise ValueError("Comparison names files outside the changed inventory")
         # GitHub returns at most 300 files, even with comparison pagination.
-        # Full immutable tree inventories are authoritative. Treat renames as
-        # removal/addition so persistence-reader moves remain conservative blockers.
-        changes = [
+        # Keep API rename relationships after validating them against both trees:
+        # a move into persistence must retain the same blocker as a smaller diff.
+        renames, covered = [], set()
+        for change in changes:
+            if change["status"] != "renamed":
+                continue
+            prior, path = change.get("previous_filename"), change["filename"]
+            if (
+                prior == path
+                or prior not in old_tree
+                or prior in new_tree
+                or path not in new_tree
+                or path in old_tree
+                or covered.intersection((prior, path))
+            ):
+                raise ValueError("Rename hint does not match disjoint tree paths")
+            renames.append(
+                {"filename": path, "previous_filename": prior, "status": "renamed"}
+            )
+            covered.update((prior, path))
+        # Paths beyond the API cap still come from the complete immutable trees.
+        changes = renames + [
             {
                 "filename": path,
                 "status": "added"
@@ -471,7 +490,7 @@ def collect(
                 if path not in new_tree
                 else "modified",
             }
-            for path in sorted(actual)
+            for path in sorted(actual - covered)
         ]
         described = actual
     elif actual != described:

@@ -325,6 +325,52 @@ class InventoryTests(unittest.TestCase):
                     any(f["severity"] == "blocker" for f in report["findings"])
                 )
 
+    def test_renames_into_persistence_keep_their_blocker_at_the_api_cap(self):
+        for count in (1, 299, 340):
+            for changed in (False, True):
+                with self.subTest(count=count, changed=changed):
+                    self.old = {f"adapter/file_{n:04}.go": b"old" for n in range(count)}
+                    self.new = {p: b"new" for p in self.old}
+                    regular = [
+                        {"filename": p, "status": "modified"} for p in sorted(self.old)
+                    ]
+                    self.old["adapter/legacy.go"] = b"func legacyReader() {}"
+                    self.new["store/legacy.go"] = (
+                        b"func legacyReader() { /* moved */ }"
+                        if changed
+                        else self.old["adapter/legacy.go"]
+                    )
+                    self.trees = {OLD: inventory(self.old), NEW: inventory(self.new)}
+                    self.comparison["files"] = regular[:299] + [
+                        {
+                            "filename": "store/legacy.go",
+                            "previous_filename": "adapter/legacy.go",
+                            "status": "renamed",
+                        }
+                    ]
+                    report = self.collect(limits={"max_files": 1000})
+                    self.assertEqual("blocked", report["decision"])
+                    self.assertFalse(sr.eligible(report, OLD, NEW, IMAGE))
+                    moved = next(
+                        r for r in report["files"] if r["path"] == "store/legacy.go"
+                    )
+                    self.assertEqual("renamed", moved["status"])
+                    self.assertEqual("adapter/legacy.go", moved["previous_path"])
+                    self.assertEqual(count + 1, len(report["files"]))
+
+    def test_capped_rename_hints_must_match_disjoint_removed_and_added_paths(self):
+        for previous in ("missing.go", "store/legacy.go", "adapter/file_0000.go"):
+            self.large_inventory()
+            self.new["store/legacy.go"] = b"reader"
+            self.trees = {OLD: inventory(self.old), NEW: inventory(self.new)}
+            self.comparison["files"][-1] = {
+                "filename": "store/legacy.go",
+                "previous_filename": previous,
+                "status": "renamed",
+            }
+            with self.subTest(previous=previous), self.assertRaises(ValueError):
+                self.collect(limits={"max_files": 1000})
+
     def test_incomplete_small_comparison_and_foreign_prefix_fail_closed(self):
         self.large_inventory()
         self.comparison["files"].pop()
