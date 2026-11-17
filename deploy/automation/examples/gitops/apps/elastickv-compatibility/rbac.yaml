@@ -1,0 +1,187 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: elastickv-compatibility
+  namespace: elastickv-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: elastickv-compatibility
+  namespace: elastickv-system
+rules:
+- apiGroups:
+  - coordination.k8s.io
+  resources:
+  - leases
+  verbs:
+  - get
+  - patch
+  resourceNames:
+  - elastickv-compatibility
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: elastickv-compatibility
+  namespace: elastickv-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: elastickv-compatibility
+subjects:
+- kind: ServiceAccount
+  name: elastickv-compatibility
+  namespace: elastickv-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: elastickv-compatibility
+  namespace: elastickv
+rules:
+- apiGroups:
+  - apps
+  resources:
+  - statefulsets
+  verbs:
+  - get
+  resourceNames:
+  - elastickv
+- apiGroups:
+  - ''
+  resources:
+  - pods
+  verbs:
+  - get
+  resourceNames:
+  - elastickv-0
+  - elastickv-1
+  - elastickv-2
+- apiGroups:
+  - ''
+  resources:
+  - persistentvolumeclaims
+  verbs:
+  - get
+  resourceNames:
+  - data-elastickv-0
+  - data-elastickv-1
+  - data-elastickv-2
+  - elastickv-backup
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: elastickv-compatibility
+  namespace: elastickv
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: elastickv-compatibility
+subjects:
+- kind: ServiceAccount
+  name: elastickv-compatibility
+  namespace: elastickv-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: elastickv-compatibility
+  namespace: elastickv-validation
+rules:
+- apiGroups:
+  - apps
+  resources:
+  - statefulsets
+  verbs:
+  - create
+- apiGroups:
+  - apps
+  resources:
+  - statefulsets
+  verbs:
+  - get
+  - patch
+  - delete
+  resourceNames:
+  - elastickv
+- apiGroups:
+  - batch
+  resources:
+  - jobs
+  verbs:
+  - create
+- apiGroups:
+  - batch
+  resources:
+  - jobs
+  verbs:
+  - get
+  - delete
+  resourceNames:
+  - compatibility-validation
+  - compatibility-clean-synthetic
+- apiGroups:
+  - ''
+  resources:
+  - pods
+  verbs:
+  - list
+- apiGroups:
+  - ''
+  resources:
+  - persistentvolumeclaims
+  verbs:
+  - get
+  resourceNames:
+  - data-elastickv-0
+  - data-elastickv-1
+  - data-elastickv-2
+- apiGroups:
+  - ''
+  resources:
+  - configmaps
+  verbs:
+  - create
+- apiGroups:
+  - ''
+  resources:
+  - configmaps
+  verbs:
+  - get
+  - patch
+  resourceNames:
+  - compatibility-run
+  - validation-evidence
+- apiGroups:
+  - ''
+  resources:
+  - configmaps
+  verbs:
+  - get
+  resourceNames:
+  - compatibility-volume-identities
+- apiGroups:
+  - coordination.k8s.io
+  resources:
+  - leases
+  verbs:
+  - get
+  - patch
+  resourceNames:
+  - elastickv-release
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: elastickv-compatibility
+  namespace: elastickv-validation
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: elastickv-compatibility
+subjects:
+- kind: ServiceAccount
+  name: elastickv-compatibility
+  namespace: elastickv-system

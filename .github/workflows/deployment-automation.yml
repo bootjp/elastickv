@@ -1,0 +1,62 @@
+name: Deployment automation
+on:
+  pull_request:
+    paths:
+      - 'deploy/automation/**'
+      - '.github/workflows/deployment-automation.yml'
+  push:
+    paths:
+      - 'deploy/automation/**'
+      - '.github/workflows/deployment-automation.yml'
+permissions:
+  contents: read
+jobs:
+  offline-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install YAML parser
+        run: python3 -m pip install PyYAML==6.0.2 ruff==0.9.10
+      - name: Check Python source
+        run: |
+          ruff check --select E4,E7,E9,F,I deploy/automation/*.py
+          ruff format --check deploy/automation/*.py
+      - name: Test controllers and render isolated examples
+        run: python3 -m unittest discover -s deploy/automation -v
+
+  controller-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v4
+      - name: Build the portable controller without publishing or deploying
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: deploy/automation/Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: elastickv-release-controller:ci
+          cache-from: type=gha,scope=release-controller
+          cache-to: type=gha,mode=max,scope=release-controller
+      - name: Check CLI and runtime imports without credentials
+        run: |
+          docker run --rm elastickv-release-controller:ci --help
+          docker run --rm --entrypoint python3 elastickv-release-controller:ci -c 'import agent, compatibility, source_review, human_approval, boto3, yaml'
+      - name: Verify trust-root cache on a read-only filesystem
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          docker run --rm --read-only --tmpfs /tmp:rw,nosuid,nodev,size=64m \
+            -e GH_TOKEN -e GH_CONFIG_DIR=/tmp/gh-provenance -e XDG_CACHE_HOME=/tmp/gh-cache \
+            --entrypoint gh elastickv-release-controller:ci attestation trusted-root --verify-only
+      - name: Test the built runtime with its installed dependencies
+        run: |
+          docker run --rm --read-only --tmpfs /tmp:rw,nosuid,nodev,size=128m \
+            -v "$PWD:/repo:ro" -w /repo/deploy/automation -e ELASTICKV_DEPLOYMENT_CONFIG= \
+            --entrypoint python3 elastickv-release-controller:ci -m unittest discover -v

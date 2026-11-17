@@ -1,0 +1,15 @@
+{
+  "version": 2,
+  "namespace": "elastickv-validation",
+  "controller_image": "ghcr.io/example/elastickv-release-agent@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "agent_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "qualification_source_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "source_reviewer_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "source_review_limits": {
+    "max_files": 200,
+    "max_file_bytes": 2097152,
+    "max_total_file_bytes": 67108864,
+    "max_archive_bytes": 67108864,
+    "max_expanded_bytes": 536870912
+  }
+}

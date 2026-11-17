@@ -2,6 +2,8 @@ name: Docker Image CI
 permissions:
   contents: read
   packages: write
+  id-token: write
+  attestations: write
 
 on:
   push:
@@ -36,6 +38,7 @@ jobs:
         id: image
         run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -48,3 +51,11 @@ jobs:
             ${{ steps.image.outputs.name }}:${{ github.sha }}
 #          cache-from: type=gha
 #          cache-to: type=gha,mode=max
+
+      - name: Attest published application image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/attest@v4
+        with:
+          subject-name: ${{ steps.image.outputs.name }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true

@@ -1,0 +1,27 @@
+name: Promote human-approved Elastickv proposal
+on:
+  pull_request_review:
+    types: [submitted]
+permissions:
+  contents: read
+  pull-requests: read
+  actions: write
+jobs:
+  dispatch-approved:
+    if: >-
+      github.event.review.state == 'approved' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.base.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - run: python3 -m pip install PyYAML==6.0.2
+      - name: Dispatch trusted-main verification for exact human-reviewed head
+        env:
+          ELASTICKV_DEPLOYMENT_CONFIG: automation/deployment.json
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: python3 automation/compatibility_pr.py dispatch-approved --pr "$PR_NUMBER"
