@@ -304,6 +304,7 @@ class PromotionFlowTests(unittest.TestCase):
                 patch.object(agent, "registry_image", return_value=IMAGE),
                 patch.object(source_review, "collect", side_effect=collect),
             ):
+                frontend.record_check(1, HEAD)
                 frontend.merge_pr(1, HEAD)
             self.assertIsNotNone(self.merged)
             entry = self.merged["approved_transitions"][-1]
@@ -380,6 +381,10 @@ class PromotionFlowTests(unittest.TestCase):
                     }
                 ]
             }
+        if path == "check-runs":
+            return {"id": 99}
+        if path == "check-runs/99":
+            return {}
         if path == "git/blobs":
             raw = base64.b64decode(data["content"])
             sha = source_review.git_blob(raw)

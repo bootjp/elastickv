@@ -405,6 +405,18 @@ def request_pr(branch, head):
     )
 
 
+def verified_server_merge(pr, head):
+    if not pr.get("merged"):
+        return None
+    merged = pr.get("merge_commit_sha", "")
+    if pr.get("state") != "closed" or not re.fullmatch("[0-9a-f]{40}", merged):
+        raise ValueError("Unexpected standard merge identity")
+    commit = api("git/commits/" + merged)
+    if len(commit["parents"]) != 2 or commit["parents"][1]["sha"] != head:
+        raise ValueError("Unexpected standard merge provenance")
+    return commit
+
+
 def merge_pr(number, head):
     pr = api("pulls/" + str(number))
     if (
@@ -419,14 +431,8 @@ def merge_pr(number, head):
         or pr["base"]["repo"]["full_name"] != REPO
     ):
         raise ValueError("Not an eligible machine approval PR")
-    merged = pr.get("merge_commit_sha") if pr.get("merged") else None
-    merge_commit = api("git/commits/" + merged) if merged else None
-    if merged and (
-        not re.fullmatch("[0-9a-f]{40}", merged)
-        or len(merge_commit["parents"]) != 2
-        or merge_commit["parents"][1]["sha"] != head
-    ):
-        raise ValueError("Unexpected standard merge provenance")
+    merge_commit = verified_server_merge(pr, head)
+    merged = pr["merge_commit_sha"] if merge_commit else None
     result = (
         review(pr["head"]["ref"], head, merged_base=merge_commit["parents"][0]["sha"])
         if merged
@@ -614,13 +620,20 @@ def record_check(number, head):
         or not re.fullmatch(BRANCH, pr["head"]["ref"])
     ):
         raise ValueError("Check target is not the immutable machine head")
+    merge_commit = verified_server_merge(pr, head)
     check_run = api(
         "check-runs",
         "POST",
         {"name": "compatibility-review", "head_sha": head, "status": "in_progress"},
     )["id"]
     try:
-        result = review(pr["head"]["ref"], head)
+        result = (
+            review(
+                pr["head"]["ref"], head, merged_base=merge_commit["parents"][0]["sha"]
+            )
+            if merge_commit
+            else review(pr["head"]["ref"], head)
+        )
         if not result["eligible"]:
             raise ValueError("Automated source review blocked promotion")
     except Exception:
