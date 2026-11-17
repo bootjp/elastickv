@@ -234,6 +234,17 @@ class ScopeTests(unittest.TestCase):
             with self.assertRaises(agent.UnsafeState):
                 compatibility.test_container(base, {**actual, "args": [flag]}, OLD)
 
+    def test_imported_environment_is_rejected_before_sandbox_execution(self):
+        for source in (
+            {"configMapRef": {"name": "runtime"}},
+            {"secretRef": {"name": "runtime"}},
+        ):
+            with (
+                self.subTest(source=source),
+                self.assertRaisesRegex(agent.UnsafeState, "envFrom"),
+            ):
+                compatibility.test_container({}, {"envFrom": [source]}, OLD)
+
     def test_production_roles_are_read_only_and_sandbox_never_deletes_claims(self):
         import yaml
 

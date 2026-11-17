@@ -118,6 +118,10 @@ def production(kube, baseline):
 
 
 def test_container(base, actual, old):
+    if actual.get("envFrom"):
+        raise agent.UnsafeState(
+            "Unresolved envFrom settings need compatibility profile review"
+        )
     container = copy.deepcopy(base)
     if actual.get("command") != ["/app"]:
         raise agent.UnsafeState("Unknown production entrypoint")
