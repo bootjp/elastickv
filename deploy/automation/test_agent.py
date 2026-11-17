@@ -1,5 +1,7 @@
 import copy
+import http.server
 import io
+import threading
 import unittest
 from unittest.mock import Mock
 
@@ -137,6 +139,132 @@ class ReadinessContractTests(unittest.TestCase):
             agent.compatible(policy, {**OLD, "readiness": True}, NEW["source"], {})
         )
         self.assertIsNone(agent.compatible(policy, OLD, NEW["source"], {}))
+
+
+class AcceptanceWindowTests(unittest.TestCase):
+    def runtime(self):
+        runtime = agent.Runtime(
+            {
+                "namespace": "test",
+                "statefulset": "elastickv",
+                "healthy_window": 6,
+                "startup_timeout": 18,
+            },
+            Mock(),
+            Mock(),
+            Mock(),
+        )
+        runtime.canary = Mock()
+        return runtime
+
+    def test_snapshot_restoration_resets_the_entire_continuous_window(self):
+        r = self.runtime()
+        clock = [0]
+        observed = []
+
+        def verify(*args, **kwargs):
+            observed.append(clock[0])
+            if clock[0] == 6:
+                raise agent.HttpReleaseError(
+                    503, "GET", "/readyz", "snapshot_restoring"
+                )
+
+        r.verify = Mock(side_effect=verify)
+        with (
+            unittest.mock.patch.object(
+                agent.time, "monotonic", side_effect=lambda: clock[0]
+            ),
+            unittest.mock.patch.object(
+                agent.time,
+                "sleep",
+                side_effect=lambda n: clock.__setitem__(0, clock[0] + n),
+            ),
+        ):
+            r.accept(NEW)
+        self.assertEqual([0, 3, 6, 9, 12, 15], observed)
+        r.canary.assert_called_once()
+
+    def test_actual_http_503_restore_response_restarts_the_window(self):
+        r = self.runtime()
+        clock = [0]
+        requests = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                requests.append(clock[0])
+                restoring = clock[0] == 6
+                self.send_response(503 if restoring else 200)
+                self.end_headers()
+                self.wfile.write(
+                    b'{"ready":false,"reason":"snapshot_restoring"}'
+                    if restoring
+                    else b'{"ready":true,"reason":"ready"}'
+                )
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(thread.join)
+        self.addCleanup(server.shutdown)
+        r.verify = lambda *args, **kwargs: agent.http_json(
+            "http://127.0.0.1:" + str(server.server_port) + "/readyz"
+        )
+        with (
+            unittest.mock.patch.object(
+                agent.time, "monotonic", side_effect=lambda: clock[0]
+            ),
+            unittest.mock.patch.object(
+                agent.time,
+                "sleep",
+                side_effect=lambda n: clock.__setitem__(0, clock[0] + n),
+            ),
+        ):
+            r.accept(NEW)
+        self.assertEqual([0, 3, 6, 9, 12, 15], requests)
+        r.canary.assert_called_once()
+
+    def test_unknown_http_errors_and_ownership_loss_are_never_retried(self):
+        for error in [
+            agent.HttpReleaseError(503, "GET", "/readyz", "engine_failed"),
+            agent.HttpReleaseError(503, "GET", "/readyz"),
+            agent.HttpReleaseError(403, "GET", "/readyz", "snapshot_restoring"),
+            agent.HttpReleaseError(503, "PATCH", "/readyz", "snapshot_restoring"),
+            agent.LostLease("lost"),
+            agent.UnsafeState("drift"),
+        ]:
+            r = self.runtime()
+            r.verify = Mock(side_effect=error)
+            with self.subTest(error=str(error)), self.assertRaises(type(error)):
+                r.accept(NEW)
+            self.assertEqual(1, r.verify.call_count)
+            r.canary.assert_not_called()
+
+    def test_restoration_that_never_stabilizes_fails_at_the_existing_deadline(self):
+        r = self.runtime()
+        clock = [0]
+        r.verify = Mock(
+            side_effect=agent.HttpReleaseError(
+                503, "GET", "/readyz", "snapshot_restoring"
+            )
+        )
+        with (
+            unittest.mock.patch.object(
+                agent.time, "monotonic", side_effect=lambda: clock[0]
+            ),
+            unittest.mock.patch.object(
+                agent.time,
+                "sleep",
+                side_effect=lambda n: clock.__setitem__(0, clock[0] + n),
+            ),
+        ):
+            with self.assertRaisesRegex(agent.ReleaseError, "stabilize"):
+                r.accept(NEW)
+        self.assertEqual(18, clock[0])
+        r.canary.assert_not_called()
 
 
 class FakeStore:
@@ -388,6 +516,7 @@ class RuntimeTests(unittest.TestCase):
             "statefulset": "elastickv",
             "members": ["n1", "n2", "n3"],
             "healthy_window": 0,
+            "startup_timeout": 120,
         }
         self.runtime = agent.Runtime(self.policy, Mock(), Mock(), Mock())
 
@@ -419,6 +548,45 @@ class RuntimeTests(unittest.TestCase):
         self.runtime.accept(NEW)
         self.runtime.verify.assert_called_with(NEW, canary=False)
         self.runtime.canary.assert_called_once()
+
+    def test_unready_pods_only_settle_for_restore_or_confirmed_probe_lag(self):
+        p = {
+            "metadata": {"uid": "one"},
+            "spec": {"containers": [{"name": "elastickv", "image": NEW["image"]}]},
+            "status": {
+                "podIP": "127.0.0.1",
+                "conditions": [{"type": "Ready", "status": "False"}],
+            },
+        }
+        for result in [
+            agent.HttpReleaseError(503, "GET", "/readyz", "snapshot_restoring"),
+            {"ready": True},
+        ]:
+            with (
+                self.subTest(result=str(result)),
+                unittest.mock.patch.object(
+                    agent,
+                    "http_json",
+                    side_effect=result if isinstance(result, Exception) else None,
+                    return_value=result,
+                ),
+            ):
+                self.runtime.pods = Mock(return_value={"n1": p})
+                self.runtime.check_qualified_storage = Mock()
+                self.runtime.quorum = Mock()
+                with self.assertRaises(agent.ReadinessSettling):
+                    self.runtime.verify(NEW, canary=False)
+                self.runtime.quorum.assert_not_called()
+        for error in [
+            agent.HttpReleaseError(503, "GET", "/readyz", "engine_failed"),
+            agent.HttpReleaseError(403, "GET", "/readyz"),
+        ]:
+            with (
+                self.subTest(error=str(error)),
+                unittest.mock.patch.object(agent, "http_json", side_effect=error),
+                self.assertRaises(agent.HttpReleaseError),
+            ):
+                self.runtime.verify(NEW, canary=False)
 
     def test_lost_lease_and_manual_drift_do_not_retry(self):
         predicate = Mock(side_effect=agent.LostLease("lost"))

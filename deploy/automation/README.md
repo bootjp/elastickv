@@ -95,6 +95,15 @@ method and query-free path. Readiness reasons are drawn from a fixed allowlist;
 headers, credentials and arbitrary response bodies are never logged. These
 diagnostics do not change health thresholds, retry failures or weaken rollback.
 
+Acceptance starts a fresh continuous healthy window after a reported snapshot
+restore or a confirmed healthy endpoint awaiting its Kubernetes probe condition.
+This settling is bounded by the existing startup timeout. Every sample in the
+final window must still pass the original readiness, Raft and ownership checks;
+unknown HTTP failures, failed engines, lost ownership and invalid state remain
+fatal. An unfinished restore cannot pass acceptance, and expiry triggers the
+recorded rollback. No error body outside the allowlisted readiness reason is used
+to authorize waiting.
+
 The sandbox copies supported literal transport, FSM sync, snapshot-size and Redis
 connection tuning, rejecting Secret references and invalid values. It preserves
 the configured `sync`/`nosync` choice; synthetic round trips and snapshot restart

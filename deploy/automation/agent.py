@@ -78,6 +78,10 @@ class UnsafeState(ReleaseError):
     pass
 
 
+class ReadinessSettling(ReleaseError):
+    pass
+
+
 def log(event, **fields):
     print(json.dumps({"event": event, **fields}), flush=True)
 
@@ -875,11 +879,53 @@ class Runtime:
         self.wait(lambda: self.quorum(self.pods()) == target, 90)
         return target
 
+    def _readiness_settling(self, pods, release):
+        for pod in pods.values():
+            if pod_ready(pod):
+                continue
+            image = next(
+                (
+                    c["image"]
+                    for c in pod["spec"]["containers"]
+                    if c["name"] == "elastickv"
+                ),
+                None,
+            )
+            address = pod.get("status", {}).get("podIP")
+            if (
+                pod["metadata"].get("deletionTimestamp")
+                or image != release["image"]
+                or not address
+            ):
+                return False
+            try:
+                result = http_json("http://" + address + ":8081/readyz")
+            except HttpReleaseError as error:
+                if not self._expected_snapshot_restore(error):
+                    raise
+            else:
+                if result.get("ready") is not True:
+                    return False
+        return True
+
+    @staticmethod
+    def _expected_snapshot_restore(error):
+        return (
+            error.status == 503
+            and error.method == "GET"
+            and error.path == "/readyz"
+            and error.readiness_reason == "snapshot_restoring"
+        )
+
     def verify(self, release, canary=True):
         self.lease.tick()
         self.check_qualified_storage()
         pods = self.pods()
         if not all(pod_ready(p) for p in pods.values()):
+            if self._readiness_settling(pods, release):
+                raise ReadinessSettling(
+                    "Snapshot restoration or probe update is pending"
+                )
             raise ReleaseError("Not all three voters are Ready")
         self.quorum(pods)
         if release.get("readiness"):
@@ -899,11 +945,38 @@ class Runtime:
             self.canary()
 
     def accept(self, release):
-        end = time.monotonic() + self.policy["healthy_window"]
+        deadline = time.monotonic() + self.policy["startup_timeout"]
+        healthy_since = None
+        waiting = False
         while True:
-            self.verify(release, canary=False)
-            if time.monotonic() >= end:
-                break
+            try:
+                self.verify(release, canary=False)
+            except ReadinessSettling:
+                healthy_since = None
+            except HttpReleaseError as error:
+                if not self._expected_snapshot_restore(error):
+                    raise
+                healthy_since = None
+            else:
+                now = time.monotonic()
+                if healthy_since is None:
+                    healthy_since = now
+                if (
+                    now <= deadline
+                    and now - healthy_since >= self.policy["healthy_window"]
+                ):
+                    break
+                waiting = False
+            if healthy_since is None and not waiting:
+                log(
+                    "release-awaiting-readiness",
+                    reason="snapshot_restore_or_probe_settling",
+                )
+                waiting = True
+            if time.monotonic() >= deadline:
+                raise ReleaseError(
+                    "Readiness did not stabilize before the acceptance deadline"
+                )
             time.sleep(3)
         self.canary()
 
