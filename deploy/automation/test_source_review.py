@@ -448,6 +448,115 @@ class InventoryTests(unittest.TestCase):
             self.collect()
 
 
+class RelocationProfileTests(unittest.TestCase):
+    def fixture(self):
+        f = InventoryTests()
+        f.setUp()
+        f.large_inventory()
+        f.old["assembly.go"] = b"func oldReader() {}"
+        f.new["internal/server/assembly.go"] = b"func newReader() {}"
+        f.new["store/add.go"] = b"func added() {}"
+        f.trees = {OLD: inventory(f.old), NEW: inventory(f.new)}
+        profile = {
+            "version": 1,
+            "repository": "example/database",
+            "from_source": OLD,
+            "to_source": NEW,
+            "image": IMAGE,
+            "relocations": [
+                {
+                    "old_path": "assembly.go",
+                    "old_blob": sr.git_blob(f.old["assembly.go"]),
+                    "targets": [
+                        {
+                            "path": "internal/server/assembly.go",
+                            "blob": sr.git_blob(f.new["internal/server/assembly.go"]),
+                        }
+                    ],
+                    "review": "Reviewed assembly relocation; persistence formats are still assessed separately.",
+                }
+            ],
+        }
+        return f, profile
+
+    def test_exact_trusted_profile_resolves_only_its_nonpersistent_removals(self):
+        f, profile = self.fixture()
+        self.assertEqual("blocked", f.collect(limits={"max_files": 1000})["decision"])
+        report = f.collect(limits={"max_files": 1000}, relocation_profile=profile)
+        self.assertTrue(sr.eligible(report, OLD, NEW, IMAGE))
+        self.assertEqual(sr.digest(profile), report["relocation_profile_sha256"])
+        self.assertEqual(["assembly.go"], report["resolved_nonpersistent_removals"])
+
+    def test_pair_image_repository_and_blob_changes_are_rejected(self):
+        f, profile = self.fixture()
+        for field, value in [
+            ("from_source", "c" * 40),
+            ("to_source", "d" * 40),
+            ("repository", "other/database"),
+            ("image", IMAGE[:-1] + "d"),
+        ]:
+            bad = copy.deepcopy(profile)
+            bad[field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                f.collect(limits={"max_files": 1000}, relocation_profile=bad)
+        for field in ("old_blob", "target_blob"):
+            bad = copy.deepcopy(profile)
+            if field == "old_blob":
+                bad["relocations"][0]["old_blob"] = "f" * 40
+            else:
+                bad["relocations"][0]["targets"][0]["blob"] = "f" * 40
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                f.collect(limits={"max_files": 1000}, relocation_profile=bad)
+
+    def test_missing_duplicate_or_unreviewed_targets_fail_closed(self):
+        for failure in ("missing", "duplicate", "review", "target", "test_target"):
+            f, profile = self.fixture()
+            row = profile["relocations"][0]
+            if failure == "missing":
+                row["targets"][0]["path"] = "missing.go"
+            if failure == "duplicate":
+                profile["relocations"].append(copy.deepcopy(row))
+            if failure == "review":
+                row["review"] = ""
+            if failure == "target":
+                row["targets"] = []
+            if failure == "test_target":
+                row["targets"][0]["path"] = "internal/server/assembly_test.go"
+            with self.subTest(failure=failure), self.assertRaises(ValueError):
+                f.collect(limits={"max_files": 1000}, relocation_profile=profile)
+
+    def test_additional_deletions_and_format_changes_are_not_overridden(self):
+        for kind in ("unregistered", "format"):
+            f, profile = self.fixture()
+            if kind == "unregistered":
+                f.old["another.go"] = b"func another() {}"
+            else:
+                f.old["store/format.go"] = b"const snapshotVersion = 1"
+                f.new["store/format.go"] = b"const snapshotVersion = 2"
+            f.trees = {OLD: inventory(f.old), NEW: inventory(f.new)}
+            with self.subTest(kind=kind):
+                report = f.collect(
+                    limits={"max_files": 1000}, relocation_profile=profile
+                )
+                self.assertEqual("blocked", report["decision"])
+
+    def test_persistent_reader_removal_cannot_be_classified_by_profile(self):
+        f, profile = self.fixture()
+        f.old["store/reader.go"] = f.old.pop("assembly.go")
+        f.trees[OLD] = inventory(f.old)
+        profile["relocations"][0]["old_path"] = "store/reader.go"
+        with self.assertRaises(ValueError):
+            f.collect(limits={"max_files": 1000}, relocation_profile=profile)
+
+    def test_bootstrap_target_is_exact_and_retires_after_baseline_advances(self):
+        _, profile = self.fixture()
+        config = {"relocation_profile": profile}
+        head = "c" * 40
+        self.assertEqual(NEW, sr.candidate_source(config, OLD, head))
+        self.assertEqual(head, sr.candidate_source(config, NEW, head))
+        self.assertIsNone(sr.active_profile(config, NEW))
+
+
 class ArchiveTests(unittest.TestCase):
     def archive(self, path="root/store/read.go", data=b"hello", symlink=False):
         stream = io.BytesIO()

@@ -201,6 +201,9 @@ def review(branch, head, *, merged_base=None):
             "https://api.github.com/repos/" + before["repository"] + "/" + path
         ),
         limits=config.get("source_review_limits"),
+        relocation_profile=source_review.active_profile(
+            config, state["last_good"]["source"]
+        ),
     )
     if (
         source != expected_source

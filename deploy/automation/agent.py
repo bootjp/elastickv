@@ -34,10 +34,40 @@ class ReleaseError(Exception):
     pass
 
 
+READINESS_REASONS = frozenset(
+    {
+        "starting",
+        "engine_failed",
+        "engine_stopped",
+        "snapshot_restoring",
+        "observation_failed",
+        "observation_unavailable",
+        "observation_stale",
+        "configuration_unavailable",
+        "not_a_voter",
+        "leader_unknown",
+        "membership_changing",
+        "leader_contact_stale",
+        "not_participating",
+        "apply_regressed",
+        "catching_up",
+        "apply_stalled",
+    }
+)
+
+
 class HttpReleaseError(ReleaseError):
-    def __init__(self, status, method, path):
+    def __init__(self, status, method, path, readiness_reason=None):
         self.status = status
-        super().__init__(f"HTTP {status}: {method} {path}")
+        self.method = method
+        self.path = urllib.parse.urlsplit(path).path
+        self.readiness_reason = (
+            readiness_reason
+            if isinstance(readiness_reason, str)
+            and readiness_reason in READINESS_REASONS
+            else None
+        )
+        super().__init__(f"HTTP {status}: {method} {self.path}")
 
 
 class LostLease(ReleaseError):
@@ -71,10 +101,23 @@ def http_json(url, method="GET", data=None, headers=None, context=None):
     except urllib.error.HTTPError as exc:
         # Never copy request headers, response contents, or credentials into logs.
         status = exc.code
+        path = urllib.parse.urlsplit(url).path
+        reason = None
+        if path == "/readyz":
+            try:
+                raw = exc.read(4097)
+                if len(raw) <= 4096:
+                    payload = json.loads(raw)
+                    if (
+                        isinstance(payload, dict)
+                        and isinstance(payload.get("reason"), str)
+                        and payload["reason"] in READINESS_REASONS
+                    ):
+                        reason = payload["reason"]
+            except (ValueError, OSError):
+                pass
         exc.close()
-        raise HttpReleaseError(
-            status, method, urllib.parse.urlsplit(url).path
-        ) from None
+        raise HttpReleaseError(status, method, path, reason) from None
 
 
 def ci_ready(runs, sha, required, codeql_workflow_id=None):
@@ -1188,7 +1231,16 @@ class Manager:
             except (LostLease, UnsafeState):
                 raise
             except Exception as exc:
-                log("release-failed", error=type(exc).__name__)
+                fields = {"error": type(exc).__name__}
+                if isinstance(exc, HttpReleaseError):
+                    fields.update(
+                        http_status=exc.status,
+                        http_method=exc.method,
+                        http_path=exc.path,
+                    )
+                    if exc.readiness_reason is not None:
+                        fields["readiness_reason"] = exc.readiness_reason
+                log("release-failed", **fields)
                 transaction["phase"] = "rollback"
                 state.setdefault("quarantined", []).append(transaction["to"]["image"])
                 self.store.commit(

@@ -1,4 +1,5 @@
 import copy
+import io
 import unittest
 from unittest.mock import Mock
 
@@ -172,6 +173,49 @@ class ManagerTests(unittest.TestCase):
         self.assertIsNone(self.store.state["transaction"])
         self.runtime.verify.assert_any_call(OLD)
         self.runtime.accept.assert_called_with(NEW)
+
+    def test_http_acceptance_failure_records_sanitized_context_then_rolls_back(self):
+        self.runtime.accept.side_effect = [
+            agent.HttpReleaseError(
+                503, "GET", "http://user:secret@private/readyz?token=secret"
+            ),
+            None,
+        ]
+        with unittest.mock.patch.object(agent, "log") as log:
+            self.manager.execute(NEW)
+        log.assert_any_call(
+            "release-failed",
+            error="HttpReleaseError",
+            http_status=503,
+            http_method="GET",
+            http_path="/readyz",
+        )
+        self.assertNotIn("secret", str(log.call_args_list))
+        self.assertEqual(OLD, self.store.state["last_good"])
+        self.assertIsNone(self.store.state["transaction"])
+        self.assertIn(NEW["image"], self.store.state["quarantined"])
+
+    def test_http_readiness_reason_is_allowlisted_and_body_is_never_logged(self):
+        for body, expected in [
+            (b'{"reason":"snapshot_restoring","other":"secret"}', "snapshot_restoring"),
+            (b'{"reason":"secret"}', None),
+            (b'{"reason":[]}', None),
+            (b"secret" * 1000, None),
+        ]:
+            error = agent.urllib.error.HTTPError(
+                "http://private/readyz?token=secret", 503, "error", {}, io.BytesIO(body)
+            )
+            with (
+                self.subTest(body=body[:30]),
+                unittest.mock.patch.object(
+                    agent.urllib.request, "urlopen", side_effect=error
+                ),
+            ):
+                with self.assertRaises(agent.HttpReleaseError) as caught:
+                    agent.http_json("http://private/readyz?token=secret")
+            self.assertEqual(expected, caught.exception.readiness_reason)
+            self.assertEqual("/readyz", caught.exception.path)
+            self.assertNotIn("secret", str(caught.exception))
 
     def test_failed_update_commits_old_probe_and_image_before_rollback(self):
         def rolling(release, pvcs):
