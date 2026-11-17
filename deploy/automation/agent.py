@@ -416,21 +416,22 @@ class GitState:
         if count != 1:
             raise ReleaseError("Expected exactly one application image pin")
         kustom = yaml.safe_load(texts[KUSTOM])
-        patches = [
-            p for p in kustom.get("patches", []) if p.get("path") != READINESS_PATCH
-        ]
+        patches = list(kustom.get("patches", []))
         if release.get("readiness"):
-            patches.append(
-                {
-                    "target": {
-                        "group": "apps",
-                        "version": "v1",
-                        "kind": "StatefulSet",
-                        "name": "elastickv",
-                    },
-                    "path": READINESS_PATCH,
-                }
-            )
+            if not any(p.get("path") == READINESS_PATCH for p in patches):
+                patches.append(
+                    {
+                        "target": {
+                            "group": "apps",
+                            "version": "v1",
+                            "kind": "StatefulSet",
+                            "name": "elastickv",
+                        },
+                        "path": READINESS_PATCH,
+                    }
+                )
+        else:
+            patches = [p for p in patches if p.get("path") != READINESS_PATCH]
         kustom["patches"] = patches
         texts[KUSTOM] = yaml.safe_dump(kustom, sort_keys=False)
         texts[STATE] = json.dumps(self.state, indent=2) + "\n"

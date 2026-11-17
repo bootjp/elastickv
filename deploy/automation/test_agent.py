@@ -279,6 +279,52 @@ class GitGuardTests(unittest.TestCase):
         self.assertEqual(2, len(patches))
         self.assertTrue(all(c.args[2]["force"] is False for c in patches))
 
+    def test_qualified_readiness_patch_keeps_order_and_profile_on_restart(self):
+        import yaml
+        from compatibility_profile import configuration_hash
+
+        self.git.files = {
+            agent.SPEC: "spec:\n  template:\n    spec:\n      containers:\n      - name: elastickv\n        image: ghcr.io/example/elastickv@sha256:old\n",
+            agent.KUSTOM: yaml.safe_dump(
+                {
+                    "resources": ["upstream"],
+                    "patches": [
+                        {
+                            "path": agent.READINESS_PATCH,
+                            "target": {"kind": "StatefulSet"},
+                        },
+                        {"path": "pdb.json"},
+                    ],
+                }
+            ),
+            agent.STATE: "{}",
+        }
+        self.git.state = {
+            "last_good": {**OLD, "readiness": True},
+            "transaction": {"phase": "forward"},
+        }
+        self.git.guard = Mock(return_value="head")
+        self.github.request.side_effect = lambda path, method="GET", data=None: (
+            {"tree": {"sha": "base"}}
+            if path.startswith("git/commits/") and method == "GET"
+            else {"sha": "new-commit"}
+        )
+        before = configuration_hash(self.git.files)
+        for digest in ("new", "old"):
+            self.git.commit(
+                {**NEW, "image": "ghcr.io/example/elastickv@sha256:" + digest},
+                "update",
+                Mock(),
+            )
+            self.assertEqual(before, configuration_hash(self.git.files))
+            self.assertEqual(
+                [agent.READINESS_PATCH, "pdb.json"],
+                [
+                    p["path"]
+                    for p in yaml.safe_load(self.git.files[agent.KUSTOM])["patches"]
+                ],
+            )
+
 
 class RuntimeTests(unittest.TestCase):
     def setUp(self):

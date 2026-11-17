@@ -113,16 +113,37 @@ def code_lines(text):
 
 
 def version_literals(text):
-    result = {}
-    pattern = re.compile(
-        r'(?mi)^\s*(?:const\s+|var\s+)?([A-Za-z_]\w*)\s*(?:[\w.]+)?\s*=\s*("[^"\n]*"|0x[0-9a-f]+|\d+)\s*(?://.*)?$'
+    # Compare declarations as source expressions, never evaluate candidate Go.
+    # Keep quoted literals intact while excluding comments from marker identity.
+    text = re.sub(
+        r"(\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|`[^`]*`)|//[^\n]*|/\*[\s\S]*?\*/",
+        lambda m: m[1] if m[1] is not None else "\n" * m[0].count("\n"),
+        text,
     )
+    pattern = re.compile(
+        r"(?m)^[ \t]*(?:const[ \t]+|var[ \t]+)?([A-Za-z_]\w*)[ \t]*(?:[\w.]+[ \t]+)?=[ \t]*(\[[^\]\n]*\]byte\s*\{[^}]*\}|[\w.]+\s*\([^)]*\)|[^\n;]+)"
+    )
+    result = {}
     for match in pattern.finditer(text):
         name = match[1].lower()
-        if ("version" in name or "magic" in name) and any(
-            k in name for k in ("format", "schema", "snapshot", "codec", "wire", "disk")
+        if "magic" in name or (
+            "version" in name
+            and any(
+                k in name
+                for k in (
+                    "format",
+                    "schema",
+                    "snapshot",
+                    "codec",
+                    "wire",
+                    "disk",
+                    "hlc",
+                    "mvcc",
+                    "pebble",
+                )
+            )
         ):
-            result[match[1]] = match[2]
+            result[match[1]] = match[2].strip()
     return result
 
 

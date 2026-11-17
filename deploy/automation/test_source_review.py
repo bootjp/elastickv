@@ -134,6 +134,60 @@ class SourceAuditTests(unittest.TestCase):
                     self.assess(path, registration, registration)["decision"],
                 )
 
+    def test_actual_persisted_marker_expressions_are_blocked(self):
+        declarations = [
+            (
+                "store/mvcc_store.go",
+                "mvccSnapshotVersionV8 = uint32(8)",
+                "uint32(8)",
+                "uint32(9)",
+            ),
+            (
+                "store/snapshot_pebble.go",
+                "var pebbleSnapshotMagic = [8]byte{'E', 'K', 'V', 'P', 'B', 'B', 'L', '1'}",
+                "'1'",
+                "'2'",
+            ),
+            (
+                "kv/snapshot.go",
+                "var hlcSnapshotMagicPrefix = [4]byte{\n'E', 'K', 'V', 'H',\n}",
+                "'H'",
+                "'X'",
+            ),
+            ("kv/snapshot.go", "const hlcSnapshotVersion = uint32(\n 8\n)", "8", "9"),
+        ]
+        declarations += [
+            (
+                "kv/snapshot.go",
+                "var hlcSnapshotMagic = [8]byte{'E', 'K', 'V', 'T', 'H', 'L', 'C', '1'}",
+                "'1'",
+                "'2'",
+            ),
+            (
+                "kv/snapshot.go",
+                'var hlcSnapshotMagicPrefix = []byte("EKVTHLC")',
+                "EKVTHLC",
+                "EKVTHLX",
+            ),
+        ]
+        for path, declaration, old, new in declarations:
+            with self.subTest(path=path, declaration=declaration):
+                self.assertEqual(
+                    "blocked",
+                    self.assess(path, declaration, declaration.replace(old, new))[
+                        "decision"
+                    ],
+                )
+                report = self.assess(
+                    path, declaration, declaration + " // explanatory comment"
+                )
+                self.assertFalse(
+                    any(
+                        f["code"] == "persistent-version-change"
+                        for f in report["findings"]
+                    )
+                )
+
     def test_reader_removal_is_blocked(self):
         self.assertEqual(
             "blocked",
