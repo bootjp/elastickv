@@ -540,6 +540,22 @@ class RelocationProfileTests(unittest.TestCase):
                 )
                 self.assertEqual("blocked", report["decision"])
 
+    def test_reviewed_move_into_persistence_never_waives_another_reader_removal(self):
+        f, profile = self.fixture()
+        target = profile["relocations"][0]["targets"][0]
+        f.new["kv/client.go"] = f.new.pop(target["path"])
+        target["path"] = "kv/client.go"
+        f.trees[NEW] = inventory(f.new)
+        report = f.collect(limits={"max_files": 1000}, relocation_profile=profile)
+        self.assertTrue(sr.eligible(report, OLD, NEW, IMAGE))
+        f.old["store/reader.go"] = b"func readExistingRecord() {}"
+        f.trees[OLD] = inventory(f.old)
+        report = f.collect(limits={"max_files": 1000}, relocation_profile=profile)
+        self.assertEqual("blocked", report["decision"])
+        self.assertTrue(
+            any(r["code"] == "persistent-contract-removal" for r in report["findings"])
+        )
+
     def test_persistent_reader_removal_cannot_be_classified_by_profile(self):
         f, profile = self.fixture()
         f.old["store/reader.go"] = f.old.pop("assembly.go")
