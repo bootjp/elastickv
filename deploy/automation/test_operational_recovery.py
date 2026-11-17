@@ -340,6 +340,18 @@ class RollbackRecoveryTests(unittest.TestCase):
     def test_forward_rollout_does_not_use_rollback_recovery(self):
         runtime, pods, actions, overrides = self.fixture()
         runtime.git.state["transaction"]["phase"] = "forward"
-        with self.assertRaises(agent.ReleaseError):
-            runtime.quorum(pods)
+        # Every Pod is still at the old revision: avoid the resume guard and
+        # reach the actual forward/rollback branch inside roll().
+        for pod in pods.values():
+            pod["metadata"]["labels"]["controller-revision-hash"] = "old"
+        template = runtime.kube.request(runtime.sts_path)
+        template["spec"]["template"]["spec"]["containers"][0]["image"] = NEW["image"]
+        template["status"]["updateRevision"] = "new"
+        runtime.kube.request.side_effect = lambda path: copy.deepcopy(template)
+        runtime.rollback_quorum = Mock(
+            side_effect=AssertionError("Rollback in forward")
+        )
+        with self.assertRaisesRegex(agent.ReleaseError, "No common healthy leader"):
+            runtime.roll(NEW, {"data": "retained"})
+        runtime.rollback_quorum.assert_not_called()
         self.assertEqual([], actions)

@@ -34,6 +34,7 @@ class PromotionFlowTests(unittest.TestCase):
         self.blobs = {}
         self.merged = None
         self.current = OLD
+        self.fail_consent_record = True
         self.state = {
             "last_good": {
                 "source": OLD,
@@ -289,7 +290,11 @@ class PromotionFlowTests(unittest.TestCase):
                         "user": {"login": "reviewer", "type": "User"},
                     }
                 ]
-                frontend.merge_pr(1, HEAD)
+                with self.assertRaisesRegex(RuntimeError, "Consent record unavailable"):
+                    frontend.merge_pr(1, HEAD)
+                self.assertEqual("d" * 40, self.current)
+                self.assertTrue(self.pull["merged"])
+                self.fail_consent_record = False
             # Recovery must use immutable commits even after GitHub auto-deletes the branch.
             original_api = self.api
 
@@ -306,6 +311,7 @@ class PromotionFlowTests(unittest.TestCase):
             ):
                 frontend.record_check(1, HEAD)
                 frontend.merge_pr(1, HEAD)
+            self.assertEqual("f" * 40, self.current)
             self.assertIsNotNone(self.merged)
             entry = self.merged["approved_transitions"][-1]
             self.assertEqual(HEAD, entry["human_approval"]["commit"])
@@ -401,6 +407,9 @@ class PromotionFlowTests(unittest.TestCase):
             return {"sha": "f" * 40}
         if path == "git/refs/heads/main":
             self.assertIs(data["force"], False)
+            if self.fail_consent_record:
+                raise RuntimeError("Consent record unavailable")
+            self.current = data["sha"]
             return {}
         self.fail("Unexpected API operation " + path)
 

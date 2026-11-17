@@ -121,9 +121,20 @@ class ReadinessContractTests(unittest.TestCase):
         policy = {
             "require_qualification": True,
             "approved_transitions": [
-                {"from": OLD["source"], "to": NEW["source"], "readiness": True}
+                {
+                    "from": OLD["source"],
+                    "to": NEW["source"],
+                    "readiness": True,
+                    "image": NEW["image"],
+                    "profile_sha256": "profile",
+                    "production_bindings": {},
+                    "evidence": "summary.json",
+                }
             ],
         }
+        self.assertTrue(
+            agent.compatible(policy, {**OLD, "readiness": True}, NEW["source"], {})
+        )
         self.assertIsNone(agent.compatible(policy, OLD, NEW["source"], {}))
 
 
