@@ -1,0 +1,89 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: elastickv-compatibility
+  namespace: elastickv-system
+spec:
+  schedule: '*/15 * * * *'
+  suspend: true
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 120
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 3600
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: elastickv-compatibility
+        spec:
+          serviceAccountName: elastickv-compatibility
+          restartPolicy: Never
+          imagePullSecrets:
+          - name: registry-pull
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            fsGroup: 65532
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+          - name: compatibility
+            image: ghcr.io/example/elastickv-release-agent@sha256:0000000000000000000000000000000000000000000000000000000000000000
+            env:
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            securityContext:
+              allowPrivilegeEscalation: false
+              readOnlyRootFilesystem: true
+              capabilities:
+                drop:
+                - ALL
+            resources:
+              requests:
+                cpu: 20m
+                memory: 96Mi
+              limits:
+                cpu: 500m
+                memory: 512Mi
+            volumeMounts:
+            - name: policy
+              mountPath: /etc/release
+              readOnly: true
+            - name: github-app
+              mountPath: /var/run/github-app
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            - name: compatibility
+              mountPath: /etc/compatibility
+              readOnly: true
+            command:
+            - python3
+            - /app/compatibility.py
+          volumes:
+          - name: policy
+            configMap:
+              name: elastickv-release-policy
+          - name: github-app
+            secret:
+              secretName: elastickv-github-app
+              defaultMode: 288
+              items:
+              - key: githubAppID
+                path: githubAppID
+              - key: githubAppInstallationID
+                path: githubAppInstallationID
+              - key: githubAppPrivateKey
+                path: githubAppPrivateKey
+          - name: tmp
+            emptyDir:
+              sizeLimit: 32Mi
+          - name: compatibility
+            configMap:
+              name: elastickv-compatibility-policy

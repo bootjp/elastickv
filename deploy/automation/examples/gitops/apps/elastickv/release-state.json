@@ -1,0 +1,9 @@
+{
+  "last_good": {
+    "source": "0000000000000000000000000000000000000000",
+    "image": "ghcr.io/example/elastickv@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "readiness": true
+  },
+  "transaction": null,
+  "quarantined": []
+}

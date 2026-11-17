@@ -1,0 +1,26 @@
+{
+  "gitops_repository": "example/elastickv-gitops",
+  "gitops_branch": "main",
+  "source_repository": "example/elastickv",
+  "source_branch": "main",
+  "application_image": "ghcr.io/example/elastickv",
+  "control_namespace": "elastickv-system",
+  "production_namespace": "elastickv",
+  "validation_namespace": "elastickv-validation",
+  "backup_claims": [
+    "elastickv-backup"
+  ],
+  "application_path": "apps/elastickv",
+  "release_path": "apps/elastickv-release",
+  "qualification_path": "apps/elastickv-compatibility",
+  "evidence_path": "docs/operations/elastickv-compatibility",
+  "code_path": "automation",
+  "storage_class": "validation-storage",
+  "nfs_root": "/srv/validation",
+  "commit_identity": {
+    "name": "Release Operator",
+    "email": "operator@example.com"
+  },
+  "bot_login": "github-actions[bot]",
+  "promotion_reviewers": []
+}

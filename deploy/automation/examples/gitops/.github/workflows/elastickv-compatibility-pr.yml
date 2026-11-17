@@ -1,0 +1,30 @@
+name: Open qualified Elastickv proposal
+on:
+  repository_dispatch:
+    types: [elastickv-compatibility-qualified]
+env:
+  ELASTICKV_DEPLOYMENT_CONFIG: automation/deployment.json
+permissions:
+  contents: read
+  pull-requests: write
+  actions: write
+  checks: read
+concurrency:
+  group: elastickv-qualification-${{ github.event.client_payload.branch }}
+  cancel-in-progress: false
+jobs:
+  proposal:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Install runtime parser
+        run: python3 -m pip install PyYAML==6.0.2
+      - name: Revalidate machine branch and create its bounded PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          QUAL_BRANCH: ${{ github.event.client_payload.branch }}
+          QUAL_HEAD: ${{ github.event.client_payload.head }}
+        run: python3 automation/compatibility_pr.py request --branch "$QUAL_BRANCH" --head "$QUAL_HEAD"

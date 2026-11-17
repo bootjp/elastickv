@@ -1,0 +1,39 @@
+{
+  "repository": "example/elastickv",
+  "gitops_repository": "example/elastickv-gitops",
+  "required_workflows": [
+    "Test",
+    "Jepsen Test",
+    "CodeQL",
+    "Docker Image CI"
+  ],
+  "image": "ghcr.io/example/elastickv",
+  "baseline_source": "0000000000000000000000000000000000000000",
+  "safe_paths": [
+    "docs/*",
+    "README.md",
+    "monitoring/grafana/*",
+    "monitoring/prometheus/*",
+    "monitoring/tests/*",
+    "monitoring/README.md"
+  ],
+  "approved_transitions": [],
+  "namespace": "elastickv",
+  "statefulset": "elastickv",
+  "members": [
+    "elastickv-0",
+    "elastickv-1",
+    "elastickv-2"
+  ],
+  "startup_timeout": 900,
+  "healthy_window": 30,
+  "endpoints": {
+    "dynamodb": "http://elastickv.elastickv.svc:8000",
+    "s3": "http://elastickv.elastickv.svc:9000",
+    "sqs": "http://elastickv.elastickv.svc:9324"
+  },
+  "require_qualification": true,
+  "controller_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "require_human_approval": true,
+  "promotion_reviewers": []
+}

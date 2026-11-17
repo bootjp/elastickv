@@ -1,0 +1,263 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: elastickv-release
+  namespace: elastickv-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: elastickv-release
+  namespace: elastickv-system
+rules:
+- apiGroups:
+  - coordination.k8s.io
+  resources:
+  - leases
+  resourceNames:
+  - elastickv-release
+  verbs:
+  - get
+  - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: elastickv-release
+  namespace: elastickv-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: elastickv-release
+subjects:
+- kind: ServiceAccount
+  name: elastickv-release
+  namespace: elastickv-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: elastickv-release
+  namespace: elastickv
+rules:
+- apiGroups:
+  - apps
+  resources:
+  - statefulsets
+  resourceNames:
+  - elastickv
+  verbs:
+  - get
+- apiGroups:
+  - ''
+  resources:
+  - pods
+  verbs:
+  - list
+- apiGroups:
+  - ''
+  resources:
+  - pods
+  resourceNames:
+  - elastickv-0
+  - elastickv-1
+  - elastickv-2
+  verbs:
+  - get
+  - delete
+- apiGroups:
+  - ''
+  resources:
+  - persistentvolumeclaims
+  resourceNames:
+  - data-elastickv-0
+  - data-elastickv-1
+  - data-elastickv-2
+  - elastickv-backup
+  verbs:
+  - get
+- apiGroups:
+  - ''
+  resources:
+  - secrets
+  resourceNames:
+  - elastickv-api-credentials
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: elastickv-release
+  namespace: elastickv
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: elastickv-release
+subjects:
+- kind: ServiceAccount
+  name: elastickv-release
+  namespace: elastickv-system
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: elastickv-release
+  namespace: elastickv
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: elastickv
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: elastickv-system
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: elastickv-release
+    ports:
+    - protocol: TCP
+      port: 50051
+    - protocol: TCP
+      port: 6379
+    - protocol: TCP
+      port: 8000
+    - protocol: TCP
+      port: 8081
+    - protocol: TCP
+      port: 9000
+    - protocol: TCP
+      port: 9324
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: elastickv-release
+  namespace: elastickv-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: elastickv-release
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress: []
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: elastickv
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: elastickv
+    ports:
+    - protocol: TCP
+      port: 50051
+    - protocol: TCP
+      port: 6379
+    - protocol: TCP
+      port: 8000
+    - protocol: TCP
+      port: 8081
+    - protocol: TCP
+      port: 9000
+    - protocol: TCP
+      port: 9324
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+  - ports:
+    - protocol: TCP
+      port: 443
+    - protocol: TCP
+      port: 6443
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: elastickv-release
+  namespace: elastickv-system
+spec:
+  schedule: '*/5 * * * *'
+  suspend: true
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 120
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 7200
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: elastickv-release
+        spec:
+          serviceAccountName: elastickv-release
+          restartPolicy: Never
+          imagePullSecrets:
+          - name: registry-pull
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            fsGroup: 65532
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+          - name: release
+            image: ghcr.io/example/elastickv-release-agent@sha256:0000000000000000000000000000000000000000000000000000000000000000
+            env:
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            securityContext:
+              allowPrivilegeEscalation: false
+              readOnlyRootFilesystem: true
+              capabilities:
+                drop:
+                - ALL
+            resources:
+              requests:
+                cpu: 20m
+                memory: 96Mi
+              limits:
+                cpu: 500m
+                memory: 256Mi
+            volumeMounts:
+            - name: policy
+              mountPath: /etc/release
+              readOnly: true
+            - name: github-app
+              mountPath: /var/run/github-app
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          volumes:
+          - name: policy
+            configMap:
+              name: elastickv-release-policy
+          - name: github-app
+            secret:
+              secretName: elastickv-github-app
+              defaultMode: 288
+              items:
+              - key: githubAppID
+                path: githubAppID
+              - key: githubAppInstallationID
+                path: githubAppInstallationID
+              - key: githubAppPrivateKey
+                path: githubAppPrivateKey
+          - name: tmp
+            emptyDir:
+              sizeLimit: 32Mi

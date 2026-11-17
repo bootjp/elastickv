@@ -1,0 +1,28 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: elastickv-compatibility
+  namespace: elastickv-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: elastickv-compatibility
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress: []
+  egress:
+  - ports:
+    - protocol: TCP
+      port: 443
+    - protocol: TCP
+      port: 6443
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53

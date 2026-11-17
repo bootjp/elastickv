@@ -312,6 +312,14 @@ Configure it according to [admin.md](admin.md), including signing keys, access k
 Metrics bind to loopback by default; external scraping requires `--metricsAddress`, `--metricsToken`, a Secret, and appropriate NetworkPolicy rules.
 If gRPC TLS or authorization is enabled, apply matching settings to peers and operational CLIs.
 
+## Optional GitOps release automation
+
+The [compatibility-qualified GitOps package](../deploy/automation/README.md) provides
+configurable controllers, suspended deployment examples and trusted bot-PR workflows.
+It validates images in a separate synthetic cluster before serialized rollout and
+compatible-image rollback. It is not installed by the Kubernetes base; read its
+supported-profile, storage registration and activation instructions before use.
+
 ## References
 
 - [Kubernetes StatefulSets](https://kubernetes.io/docs/concepts/workloads/controllers/statefulset/)

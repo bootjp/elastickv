@@ -14,6 +14,10 @@ The opt-in [runtime readiness example](examples/readiness/) separates process
 liveness from Raft membership, startup recovery, and log-application progress.
 It requires a newer image than the base pin; replace its placeholder digest first.
 
+The separate [GitOps automation package](../automation/README.md) adds optional
+compatibility qualification, bot approval PRs and serialized image rollout/rollback.
+Its examples are suspended and are not included in this Kustomization.
+
 ### Filesystem owner recovery
 
 FUSE mounts always use the operation journal; no legacy-mode flag is available.

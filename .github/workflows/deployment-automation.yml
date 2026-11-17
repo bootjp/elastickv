@@ -1,0 +1,27 @@
+name: Deployment automation
+on:
+  pull_request:
+    paths:
+      - 'deploy/automation/**'
+      - '.github/workflows/deployment-automation.yml'
+  push:
+    paths:
+      - 'deploy/automation/**'
+      - '.github/workflows/deployment-automation.yml'
+permissions:
+  contents: read
+jobs:
+  offline-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install YAML parser
+        run: python3 -m pip install PyYAML==6.0.2 ruff==0.9.10
+      - name: Check Python source
+        run: |
+          ruff check --select E4,E7,E9,F,I deploy/automation/*.py
+          ruff format --check deploy/automation/*.py
+      - name: Test controllers and render isolated examples
+        run: python3 -m unittest discover -s deploy/automation -v

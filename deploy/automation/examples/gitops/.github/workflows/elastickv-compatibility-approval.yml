@@ -1,0 +1,79 @@
+name: Review Elastickv compatibility approval
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        required: true
+        type: string
+      head_sha:
+        required: true
+        type: string
+      promote:
+        type: boolean
+        default: false
+  pull_request:
+    paths:
+      - 'apps/elastickv-release/policy.json'
+      - 'docs/operations/elastickv-compatibility/**'
+      - 'automation/**'
+      - '.github/workflows/elastickv-compatibility-approval.yml'
+env:
+  ELASTICKV_DEPLOYMENT_CONFIG: automation/deployment.json
+permissions:
+  contents: read
+concurrency:
+  group: elastickv-review-${{ inputs.pr_number || github.event.pull_request.number }}-${{ inputs.promote || false }}
+  cancel-in-progress: false
+jobs:
+  offline-proposal-checks:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - run: |
+          python3 -m pip install PyYAML==6.0.2
+          ELASTICKV_DEPLOYMENT_CONFIG= python3 -m unittest discover -s automation -v
+  compatibility-review:
+    if: github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Test trusted controller and review gates
+        run: |
+          python3 -m pip install PyYAML==6.0.2
+          ELASTICKV_DEPLOYMENT_CONFIG= python3 -m unittest discover -s automation -v
+      - name: Revalidate immutable proposal and record exact-head check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+        run: python3 automation/compatibility_pr.py check --pr "$PR_NUMBER" --head "$HEAD_SHA"
+  merge-qualified:
+    if: github.event_name == 'workflow_dispatch' && inputs.promote
+    needs: compatibility-review
+    permissions:
+      contents: write
+      pull-requests: read
+      checks: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          persist-credentials: false
+      - run: python3 -m pip install PyYAML==6.0.2
+      - name: Recheck human consent and merge only the reviewed head
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+        run: python3 automation/compatibility_pr.py merge --pr "$PR_NUMBER" --head "$HEAD_SHA"
