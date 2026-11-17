@@ -195,6 +195,10 @@ def test_container(base, actual, old):
         "ELASTICKV_FSM_COMPACTOR_ENABLED",
         "ELASTICKV_REDIS_DELTA_COMPACTOR_ENABLED",
         "ELASTICKV_RAFT_PRE_VOTE",
+        "ELASTICKV_RAFT_DISPATCHER_LANES",
+        "ELASTICKV_FSM_SYNC_MODE",
+        "ELASTICKV_RAFT_MAX_SNAPSHOT_PAYLOAD_BYTES",
+        "ELASTICKV_REDIS_PER_PEER_CONNECTIONS",
     }
     safe = []
     for entry in actual.get("env", []):
@@ -204,6 +208,23 @@ def test_container(base, actual, old):
                 raise agent.UnsafeState(
                     "Unknown or secret-based runtime tuning needs profile review"
                 )
+            value = entry.get("value", "")
+            if (
+                name == "ELASTICKV_FSM_SYNC_MODE"
+                and value not in ("sync", "nosync")
+                or name == "ELASTICKV_RAFT_DISPATCHER_LANES"
+                and value not in ("0", "1")
+                or name
+                in (
+                    "ELASTICKV_RAFT_MAX_SNAPSHOT_PAYLOAD_BYTES",
+                    "ELASTICKV_REDIS_PER_PEER_CONNECTIONS",
+                )
+                and (
+                    not re.fullmatch(r"[1-9][0-9]{0,18}", value)
+                    or int(value) > 2**63 - 1
+                )
+            ):
+                raise agent.UnsafeState("Unsupported runtime tuning value")
             safe.append(copy.deepcopy(entry))
     safe = [
         e

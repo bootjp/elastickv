@@ -57,6 +57,26 @@ and human approval are independent requirements. A blocker or incomplete/truncat
 analysis cannot be overridden by simply approving or marking a Draft ready; it
 needs a separately designed, reviewed compatibility/migration profile.
 
+Source review defaults to 200 changed tree paths. An explicitly reviewed profile
+may set `source_review_limits.max_files` up to 1000. At GitHub's 300-file comparison
+cap, complete old/new Git inventories supply every changed path; archive contents
+must match their immutable blob hashes. Reported rename relationships are checked
+against both trees and retained, including moves into persistence paths. Remaining
+paths use conservative removal/addition analysis. Truncated trees, missing blobs and all byte/publication budgets
+still stop qualification. Large reports may omit display excerpts while retaining
+every file identity and finding; this never omits source analysis or blockers.
+If a Go/protobuf implementation deletion is not covered by a verified rename,
+an accompanying new persistence path blocks qualification: an omitted move cannot
+be established safely. This can conservatively block independent deletion/addition
+changes; they require a separate reviewed profile rather than an approval bypass.
+
+The sandbox copies supported literal transport, FSM sync, snapshot-size and Redis
+connection tuning, rejecting Secret references and invalid values. It preserves
+the configured `sync`/`nosync` choice; synthetic round trips and snapshot restart
+do not establish power-loss durability. Production settings are never changed by
+qualification. Cache and snapshot-frequency overrides retain the documented
+synthetic resource budget.
+
 ## Components and supported profile
 
 | Component | Responsibility |

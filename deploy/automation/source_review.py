@@ -24,6 +24,7 @@ DEFAULT_LIMITS = {
     "max_archive_bytes": 64 * 1024 * 1024,
     "max_expanded_bytes": 512 * 1024 * 1024,
 }
+LIMIT_CEILINGS = {**DEFAULT_LIMITS, "max_files": 1000}
 PERSISTENT = ("store/", "kv/", "proto/", "internal/raftengine/", "distribution/")
 
 
@@ -273,6 +274,13 @@ def analyze(
                 path,
                 "A persistence/wire implementation or reader was removed or moved",
             )
+        if change.get("unresolved_persistent_move"):
+            finding(
+                "blocker",
+                "persistent-move-unresolved",
+                path,
+                "Unreported implementation deletion/addition may move code into persistence",
+            )
         try:
             before, after = old.decode("utf-8"), new.decode("utf-8")
         except UnicodeDecodeError:
@@ -401,6 +409,12 @@ def analyze(
     }
 
     if len(canonical(report)) > 900 * 1024:
+        # Excerpts are display hints, never audit inputs. Keep every immutable
+        # file identity and finding even when a large report needs less display text.
+        for record in files:
+            record.pop("review_excerpt", None)
+        report["review_excerpts_omitted_for_budget"] = True
+    if len(canonical(report)) > 900 * 1024:
         raise ValueError("Source review report exceeds its publication budget")
     return report
 
@@ -419,7 +433,7 @@ def collect(
 ):
     overrides = limits or {}
     if set(overrides) - set(DEFAULT_LIMITS) or any(
-        type(v) is not int or v <= 0 or v > DEFAULT_LIMITS[k]
+        type(v) is not int or v <= 0 or v > LIMIT_CEILINGS[k]
         for k, v in overrides.items()
     ):
         raise ValueError("Invalid source review limits")
@@ -429,12 +443,7 @@ def collect(
     ):
         raise ValueError("Invalid immutable source identity")
     changes = comparison.get("files", [])
-    if (
-        comparison.get("status") != "ahead"
-        or not changes
-        or len(changes) >= 300
-        or len(changes) > limits["max_files"]
-    ):
+    if comparison.get("status") != "ahead" or not changes or len(changes) > 300:
         raise ValueError("Incomplete or unbounded source comparison")
     inventories = []
     for sha in (previous, candidate):
@@ -450,7 +459,65 @@ def collect(
     described = {c["filename"] for c in changes} | {
         c["previous_filename"] for c in changes if c.get("previous_filename")
     }
-    if actual != described:
+    if len({c["filename"] for c in changes}) != len(changes):
+        raise ValueError("Duplicate source comparison entries")
+    if len(actual) > limits["max_files"]:
+        raise ValueError("Complete source inventory exceeds the file budget")
+    if len(changes) == 300:
+        if not described <= actual:
+            raise ValueError("Comparison names files outside the changed inventory")
+        # GitHub returns at most 300 files, even with comparison pagination.
+        # Keep API rename relationships after validating them against both trees:
+        # a move into persistence must retain the same blocker as a smaller diff.
+        renames, covered = [], set()
+        for change in changes:
+            if change["status"] != "renamed":
+                continue
+            prior, path = change.get("previous_filename"), change["filename"]
+            if (
+                prior == path
+                or prior not in old_tree
+                or prior in new_tree
+                or path not in new_tree
+                or path in old_tree
+                or covered.intersection((prior, path))
+            ):
+                raise ValueError("Rename hint does not match disjoint tree paths")
+            renames.append(
+                {"filename": path, "previous_filename": prior, "status": "renamed"}
+            )
+            covered.update((prior, path))
+        # The API may omit a move entirely. A Go/protobuf implementation deletion
+        # plus a new persistence path cannot safely be treated as unrelated edits.
+        remaining = actual - covered
+        unresolved_removal = any(
+            path not in new_tree
+            and path.endswith((".go", ".proto"))
+            and not path.endswith("_test.go")
+            for path in remaining
+        )
+        # Paths beyond the API cap still come from the complete immutable trees.
+        changes = renames + [
+            {
+                "filename": path,
+                "status": "added"
+                if path not in old_tree
+                else "removed"
+                if path not in new_tree
+                else "modified",
+            }
+            for path in sorted(remaining)
+        ]
+        if unresolved_removal:
+            for change in changes:
+                if (
+                    change["status"] == "added"
+                    and change["filename"].startswith(PERSISTENT)
+                    and not change["filename"].endswith("_test.go")
+                ):
+                    change["unresolved_persistent_move"] = True
+        described = actual
+    elif actual != described:
         raise ValueError("Comparison omitted source changes")
     contents = []
     total_source_bytes = 0
@@ -471,7 +538,12 @@ def collect(
         if total_source_bytes > limits["max_total_file_bytes"]:
             raise ValueError("Changed source exceeds the aggregate memory budget")
         tick()
-        contents.append(archive(repository, sha, needed, limits, tick))
+        data = archive(repository, sha, needed, limits, tick)
+        if set(data) != set(needed) or any(
+            git_blob(data[p]) != row["sha"] for p, row in needed.items()
+        ):
+            raise ValueError("Changed source archive does not match immutable blobs")
+        contents.append(data)
     return analyze(
         repository, previous, candidate, image, changes, inventories, contents, limits
     )
