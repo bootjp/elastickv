@@ -312,6 +312,47 @@ class ScopeTests(unittest.TestCase):
             ):
                 compatibility.test_container({}, {"envFrom": [source]}, OLD)
 
+    def test_sandbox_preserves_known_transport_storage_and_connection_tuning(self):
+        tuning = {
+            "ELASTICKV_RAFT_DISPATCHER_LANES": "1",
+            "ELASTICKV_FSM_SYNC_MODE": "nosync",
+            "ELASTICKV_RAFT_MAX_SNAPSHOT_PAYLOAD_BYTES": "17179869184",
+            "ELASTICKV_REDIS_PER_PEER_CONNECTIONS": "128",
+        }
+        actual = {
+            "command": ["/app"],
+            "args": [],
+            "env": [{"name": k, "value": v} for k, v in tuning.items()],
+        }
+        result = compatibility.test_container({"env": []}, actual, OLD)
+        copied = {e["name"]: e["value"] for e in result["env"]}
+        self.assertEqual(tuning, {k: copied[k] for k in tuning})
+        for name in tuning:
+            bad = copy.deepcopy(actual)
+            bad["env"] = [
+                {
+                    "name": name,
+                    "valueFrom": {"secretKeyRef": {"name": "runtime", "key": "value"}},
+                }
+            ]
+            with self.subTest(name=name), self.assertRaises(agent.UnsafeState):
+                compatibility.test_container({"env": []}, bad, OLD)
+        for name, value in (
+            ("ELASTICKV_FSM_SYNC_MODE", "unrecognized"),
+            ("ELASTICKV_RAFT_MAX_SNAPSHOT_PAYLOAD_BYTES", "-1"),
+            ("ELASTICKV_REDIS_PER_PEER_CONNECTIONS", "0"),
+            ("ELASTICKV_RAFT_DISPATCHER_LANES", "unknown"),
+        ):
+            with (
+                self.subTest(name=name, value=value),
+                self.assertRaises(agent.UnsafeState),
+            ):
+                compatibility.test_container(
+                    {"env": []},
+                    {**actual, "env": [{"name": name, "value": value}]},
+                    OLD,
+                )
+
     def test_production_roles_are_read_only_and_sandbox_never_deletes_claims(self):
         import yaml
 

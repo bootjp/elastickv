@@ -237,6 +237,29 @@ class SourceAuditTests(unittest.TestCase):
         changed["findings"].append({"severity": "blocker"})
         self.assertNotEqual(sr.digest(report), sr.digest(changed))
 
+    def test_large_report_keeps_every_file_and_blocker_when_excerpts_are_omitted(self):
+        old = {
+            f"adapter/{n:04}_{'x' * 100}.go": ("old" * 40 + "\n").encode() * 14
+            for n in range(999)
+        }
+        new = {p: value.replace(b"old", b"new") for p, value in old.items()}
+        old["store/snapshot.go"] = b"const snapshotVersion = 1"
+        new["store/snapshot.go"] = b"const snapshotVersion = 2"
+        report = sr.analyze(
+            "example/database",
+            OLD,
+            NEW,
+            IMAGE,
+            [{"filename": p, "status": "modified"} for p in old],
+            (inventory(old), inventory(new)),
+            (old, new),
+            sr.DEFAULT_LIMITS,
+        )
+        self.assertEqual(1000, len(report["files"]))
+        self.assertTrue(report["review_excerpts_omitted_for_budget"])
+        self.assertLessEqual(len(sr.canonical(report)), 900 * 1024)
+        self.assertEqual("blocked", report["decision"])
+
 
 class InventoryTests(unittest.TestCase):
     def setUp(self):
@@ -270,6 +293,59 @@ class InventoryTests(unittest.TestCase):
 
     def test_full_source_inventory_is_covered(self):
         self.assertTrue(self.collect()["complete"])
+
+    def large_inventory(self):
+        self.old = {f"adapter/file_{n:04}.go": b"old" for n in range(340)}
+        self.new = {p: b"new" for p in self.old}
+        self.trees = {OLD: inventory(self.old), NEW: inventory(self.new)}
+        self.comparison["files"] = [
+            {"filename": p, "status": "modified"} for p in sorted(self.old)[:300]
+        ]
+
+    def test_full_trees_cover_changes_beyond_the_comparison_api_cap(self):
+        self.large_inventory()
+        with self.assertRaises(ValueError):
+            self.collect()  # The default 200-file profile remains bounded.
+        report = self.collect(limits={"max_files": 1000})
+        self.assertEqual(340, len(report["files"]))
+        self.assertTrue(sr.eligible(report, OLD, NEW, IMAGE))
+
+    def test_hidden_format_edit_and_reader_removal_remain_blockers(self):
+        for removed in (False, True):
+            with self.subTest(removed=removed):
+                self.large_inventory()
+                self.old["store/snapshot.go"] = b"const snapshotVersion = 1"
+                if not removed:
+                    self.new["store/snapshot.go"] = b"const snapshotVersion = 2"
+                self.trees = {OLD: inventory(self.old), NEW: inventory(self.new)}
+                report = self.collect(limits={"max_files": 1000})
+                self.assertEqual(341, len(report["files"]))
+                self.assertEqual("blocked", report["decision"])
+                self.assertTrue(
+                    any(f["severity"] == "blocker" for f in report["findings"])
+                )
+
+    def test_incomplete_small_comparison_and_foreign_prefix_fail_closed(self):
+        self.large_inventory()
+        self.comparison["files"].pop()
+        with self.assertRaises(ValueError):
+            self.collect(limits={"max_files": 1000})
+        self.large_inventory()
+        self.comparison["files"][0]["filename"] = "not-in-either-tree.go"
+        with self.assertRaises(ValueError):
+            self.collect(limits={"max_files": 1000})
+
+    def test_large_inventory_still_honors_file_byte_and_blob_budgets(self):
+        self.large_inventory()
+        for limits in (
+            {"max_files": 320},
+            {"max_files": 1000, "max_total_file_bytes": 1},
+        ):
+            with self.subTest(limits=limits), self.assertRaises(ValueError):
+                self.collect(limits=limits)
+        with patch.object(self, "archive", return_value={}):
+            with self.assertRaises(ValueError):
+                self.collect(limits={"max_files": 1000})
 
     def test_omitted_changed_files_cannot_produce_approval(self):
         self.new["README.md"] = b"changed"
