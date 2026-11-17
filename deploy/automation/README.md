@@ -24,7 +24,7 @@ flowchart TD
   E -->|Yes| G[Ready PR: source findings and proposed exact permission]
   G --> H[Human approves the current PR commit]
   H --> I[Trusted-main CI revalidates source, evidence, digest and consent]
-  I --> J[Non-force merge with human approval attestation]
+  I --> J[Standard PR merge then guarded approval record]
   J --> K[GitOps reconciliation and release controller]
   K --> L[One voter at a time, quorum and protocol checks]
   L -->|Healthy| M[Record last_good; clear transaction]
@@ -68,7 +68,7 @@ needs a separately designed, reviewed compatibility/migration profile.
 | `compatibility_profile.py` | Runtime/qualification hashes, sealed storage and supported-layout checks |
 | `source_review.py` | Complete source inventory, verified blobs, bounded contract audit and findings |
 | `human_approval.py` | Human allowlist, current commit, dismissal/change-request and release-attestation checks |
-| `compatibility_pr.py` / `check_elastickv_compatibility.py` | Trusted PR validation and compare-and-swap merge |
+| `compatibility_pr.py` / `check_elastickv_compatibility.py` | Trusted PR validation, exact-head server merge and guarded consent record |
 | `prepare.py` | Render an offline GitOps scaffold without overwriting an existing repository |
 | `register_elastickv_compatibility_volumes.py` | One-time operator registration of dedicated validation volumes |
 
@@ -211,9 +211,20 @@ merge job receives contents write; it reads PR consent and check results again
 immediately before advancing the branch. GitHub's repository setting for Actions PR
 creation is a combined create-and-approve setting. Enabling it permits PR creation;
 these workflows do **not** call the PR review approval API. Repository protections
-still apply. The reference merge uses a non-force Git ref update; it cannot bypass
-branch protections. PR authors may be the configured bot while commit author and
-committer both use `commit_identity`.
+still apply. The PR is merged with GitHub's standard merge API using the exact
+reviewed head SHA. Closed PRs, moved heads and branch-rule rejections have no
+fallback to a direct Git merge. Only this automatic merge commit uses the GitHub
+App identity. Proposal and consent-record commits use `commit_identity` for both
+author and committer.
+
+After the server merge, a separate non-force commit records consent in the policy.
+The controller rejects the unstamped proposal during this gap. This record and
+the existing rollout ledger/image updates require operational Git writes by the
+configured writer. A branch policy that forbids those writes is unsupported unless
+the operator has explicitly configured that writer's operational permissions.
+Do not weaken protections automatically or grant general bypass as part of this
+installation. Confirm both standard PR merges and the existing operational writes
+are permitted before enabling scheduling; rejection stops promotion.
 
 The initial bootstrap sequence is:
 
@@ -268,10 +279,13 @@ Before merging, the tool requires a same-repository bot PR, a ready/open state,
 successful exact-head validation and an effective approval from an allowed human.
 Comment-only reviews do not erase a prior approval; dismissed approvals, wrong
 commits, bots, stale heads and outstanding changes requested by an authorized
-collaborator block promotion. Consent is read again before the non-force ref update.
-Only policy and fresh evidence files may be merged. The merge inserts the review
-ID, human login, PR number and approved head in the exact permission. The release
-engine refuses an unstamped permission when the human gate is enabled.
+collaborator block promotion. Consent is read again before the standard PR merge
+and before the subsequent approval record. Only policy and fresh evidence files
+may be merged. GitHub checks PR state, exact head and branch rules on the merge
+request. The following guarded commit inserts the review ID, human login, PR
+number and approved head in the exact permission. It verifies the server merge's
+parents and reviewed policy and refuses concurrent main changes. The release
+engine rejects the unstamped intermediate proposal.
 
 Changing a commit after approval requires a new review. Manually dispatching the
 workflow or removing Draft status does not bypass consent or source/test blockers.
@@ -317,7 +331,15 @@ or lost ownership stops writes. PVC data is not rolled back; incompatible format
 changes need a separately designed migration and cannot use this image rollback.
 Existing backups remain protected; the controller does not create or refresh them.
 
-For a retry, retain failed Job logs/evidence, fix the cause and let the next schedule
+If the server merge succeeds but recording consent fails, the proposal is inert:
+there is no new deployment permission. Preserve the qualification branch. Rerun the
+same trusted workflow with the original PR number and head SHA while main still
+points at the exact server merge. Recovery revalidates the original evidence,
+source CI, consent and verified merge parents; it does not merge the PR again.
+If main or controlled inputs advanced, stop for a fresh qualification and approval.
+Never hand-stamp an approval or force-update main to recover.
+
+For a qualification/release retry, retain failed Job logs/evidence, fix the cause and let the next schedule
 run. To pause, suspend the relevant CronJob **in Git**. Suspension does not stop an
 already-running Job. Wait for it to finish before changing controller code or
 runtime configuration. For an operator-triggered run, first suspend its schedule

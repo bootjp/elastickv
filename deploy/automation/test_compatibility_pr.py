@@ -1,3 +1,4 @@
+import copy
 import unittest
 from unittest.mock import patch
 
@@ -5,6 +6,7 @@ import compatibility_pr as pr
 
 HEAD = "b" * 40
 MAIN = "a" * 40
+MERGED = "d" * 40
 
 
 class MergeTests(unittest.TestCase):
@@ -55,10 +57,21 @@ class MergeTests(unittest.TestCase):
         self.calls.append((path, method, data))
         if path.startswith("pulls/1/reviews?"):
             return self.consent
+        if path == "pulls/1/merge":
+            if self.pull["state"] != "open" or self.pull["head"]["sha"] != data["sha"]:
+                raise ValueError("GitHub rejected closed/changed PR")
+            self.pull.update(state="closed", merged=True, merge_commit_sha=MERGED)
+            self.current = MERGED
+            return {"merged": True, "sha": MERGED}
+        if path == "git/commits/" + MERGED:
+            return {
+                "parents": [{"sha": MAIN}, {"sha": HEAD}],
+                "tree": {"sha": "server-tree"},
+            }
         if path == "git/blobs":
             return {"sha": "human-policy-blob"}
         if path == "pulls/1":
-            return self.pull
+            return copy.deepcopy(self.pull)
         if "/check-runs?" in path:
             return {
                 "check_runs": [
@@ -87,6 +100,7 @@ class MergeTests(unittest.TestCase):
         with (
             patch.object(pr, "api", side_effect=self.api),
             patch.object(pr, "review", return_value=self.result),
+            patch.object(pr, "read", return_value=self.result["proposed_policy"]),
         ):
             pr.merge_pr(1, HEAD)
 
@@ -99,7 +113,15 @@ class MergeTests(unittest.TestCase):
             for path, method, data in self.calls
             if path == "git/commits" and method == "POST"
         ][0]
-        self.assertEqual([MAIN, HEAD], commit["parents"])
+        self.assertEqual([MERGED], commit["parents"])
+        server_merge = next(
+            data for path, method, data in self.calls if path == "pulls/1/merge"
+        )
+        self.assertEqual(HEAD, server_merge["sha"])
+        self.assertEqual("merge", server_merge["merge_method"])
+        tree = next(data for path, method, data in self.calls if path == "git/trees")
+        self.assertEqual("server-tree", tree["base_tree"])
+        self.assertEqual([pr.POLICY], [e["path"] for e in tree["tree"]])
         self.assertEqual(
             {"name": "Release Operator", "email": "operator@example.com"},
             commit["author"],
@@ -152,12 +174,111 @@ class MergeTests(unittest.TestCase):
         with (
             patch.object(pr, "api", side_effect=mutate),
             patch.object(pr, "review", return_value=self.result),
+            patch.object(pr, "read", return_value=self.result["proposed_policy"]),
         ):
             with self.assertRaises(ValueError):
                 pr.merge_pr(1, HEAD)
         self.assertFalse(
             any(path == "git/refs/heads/main" for path, method, data in self.calls)
         )
+
+    def test_close_or_head_change_during_review_fetch_is_rejected_by_server(self):
+        for mutation in ("close", "head"):
+            self.setUp()
+            reads = 0
+            original = self.api
+
+            def race(path, method="GET", data=None):
+                nonlocal reads
+                if path.startswith("pulls/1/reviews?"):
+                    reads += 1
+                    if reads == 2:
+                        if mutation == "close":
+                            self.pull["state"] = "closed"
+                        else:
+                            self.pull["head"]["sha"] = "e" * 40
+                return original(path, method, data)
+
+            with (
+                self.subTest(mutation=mutation),
+                patch.object(pr, "api", side_effect=race),
+                patch.object(pr, "review", return_value=self.result),
+            ):
+                with self.assertRaises(ValueError):
+                    pr.merge_pr(1, HEAD)
+            self.assertFalse(
+                any(path == "git/refs/heads/main" for path, _, _ in self.calls)
+            )
+
+    def test_branch_protection_rejection_never_falls_back_to_ref_merge(self):
+        original = self.api
+
+        def protected(path, method="GET", data=None):
+            if path == "pulls/1/merge":
+                raise ValueError("Protected branch rejected merge")
+            return original(path, method, data)
+
+        with (
+            patch.object(pr, "api", side_effect=protected),
+            patch.object(pr, "review", return_value=self.result),
+        ):
+            with self.assertRaises(ValueError):
+                pr.merge_pr(1, HEAD)
+        self.assertFalse(any(method != "GET" for _, method, _ in self.calls))
+
+    def test_failed_attestation_can_resume_from_verified_server_merge(self):
+        self.pull.update(state="closed", merged=True, merge_commit_sha=MERGED)
+        self.current = MERGED
+        self.run_merge()
+        self.assertFalse(any(path == "pulls/1/merge" for path, _, _ in self.calls))
+        self.assertTrue(any(path == "git/refs/heads/main" for path, _, _ in self.calls))
+
+    def test_base_change_during_server_merge_never_records_permission(self):
+        original = self.api
+
+        def changed_base(path, method="GET", data=None):
+            result = original(path, method, data)
+            if path == "git/commits/" + MERGED:
+                result["parents"][0]["sha"] = "e" * 40
+            return result
+
+        with (
+            patch.object(pr, "api", side_effect=changed_base),
+            patch.object(pr, "review", return_value=self.result),
+        ):
+            with self.assertRaises(ValueError):
+                pr.merge_pr(1, HEAD)
+        self.assertFalse(
+            any(path == "git/refs/heads/main" for path, _, _ in self.calls)
+        )
+
+    def test_record_write_failure_leaves_server_merge_unstamped(self):
+        original = self.api
+
+        def reject_record(path, method="GET", data=None):
+            if path == "git/refs/heads/main":
+                raise ValueError("Operational policy write forbidden")
+            return original(path, method, data)
+
+        with (
+            patch.object(pr, "api", side_effect=reject_record),
+            patch.object(pr, "review", return_value=self.result),
+            patch.object(pr, "read", return_value=self.result["proposed_policy"]),
+        ):
+            with self.assertRaises(ValueError):
+                pr.merge_pr(1, HEAD)
+        self.assertTrue(self.pull["merged"])
+        self.assertNotIn(
+            "human_approval", self.result["proposed_policy"]["approved_transitions"][-1]
+        )
+        self.assertEqual(MERGED, self.current)
+
+    def test_merged_state_without_consent_does_not_grant_permission(self):
+        self.pull.update(state="closed", merged=True, merge_commit_sha=MERGED)
+        self.current = MERGED
+        self.consent = []
+        self.run_merge()
+        self.assertFalse(any(method != "GET" for _, method, _ in self.calls))
 
     def test_unrelated_dispatch_branch_is_rejected_before_api(self):
         with patch.object(pr, "api") as api:

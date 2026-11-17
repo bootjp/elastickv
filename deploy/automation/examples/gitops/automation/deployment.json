@@ -22,5 +22,6 @@
     "email": "operator@example.com"
   },
   "bot_login": "github-actions[bot]",
-  "promotion_reviewers": []
+  "promotion_reviewers": [],
+  "provenance_workflow": ".github/workflows/docker-image.yml"
 }

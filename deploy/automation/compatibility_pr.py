@@ -74,7 +74,7 @@ def read(path, sha):
     return json.loads(content(path, sha))
 
 
-def review(branch, head):
+def review(branch, head, *, merged_base=None):
     if not re.fullmatch(BRANCH, branch) or not re.fullmatch("[0-9a-f]{40}", head):
         raise ValueError("Invalid machine qualification identity")
     if api("git/ref/heads/" + branch)["object"]["sha"] != head:
@@ -87,6 +87,8 @@ def review(branch, head):
         raise ValueError("Unexpected qualification commit provenance")
     base = commit["parents"][0]["sha"]
     main = api("git/ref/heads/" + SITE["gitops_branch"])["object"]["sha"]
+    if merged_base is not None:
+        main = merged_base  # Only merge_pr supplies the verified merge parent for recovery.
     for trusted in [
         SITE["code_path"] + "/" + name
         for name in [
@@ -408,14 +410,28 @@ def merge_pr(number, head):
     if (
         pr["head"]["sha"] != head
         or pr["base"]["ref"] != SITE["gitops_branch"]
-        or pr["state"] != "open"
+        or (
+            pr["state"] != "open" and not (pr["state"] == "closed" and pr.get("merged"))
+        )
         or pr["draft"]
         or pr["user"]["login"] != SITE["bot_login"]
         or pr["head"]["repo"]["full_name"] != REPO
         or pr["base"]["repo"]["full_name"] != REPO
     ):
         raise ValueError("Not an eligible machine approval PR")
-    result = review(pr["head"]["ref"], head)
+    merged = pr.get("merge_commit_sha") if pr.get("merged") else None
+    merge_commit = api("git/commits/" + merged) if merged else None
+    if merged and (
+        not re.fullmatch("[0-9a-f]{40}", merged)
+        or len(merge_commit["parents"]) != 2
+        or merge_commit["parents"][1]["sha"] != head
+    ):
+        raise ValueError("Unexpected standard merge provenance")
+    result = (
+        review(pr["head"]["ref"], head, merged_base=merge_commit["parents"][0]["sha"])
+        if merged
+        else review(pr["head"]["ref"], head)
+    )
     if not result["eligible"]:
         raise ValueError("Source review is required")
     checks = api("commits/" + head + "/check-runs?per_page=100")["check_runs"]
@@ -430,7 +446,7 @@ def merge_pr(number, head):
         or max(matched, key=lambda c: c["id"])["status"] != "completed"
     ):
         raise ValueError("Latest compatibility CI/review not successful")
-    consent = current_approval(pr, head, result["policy"])
+    consent = current_approval(pr, head, result["policy"], merged_sha=merged)
     if consent is None:
         print(
             json.dumps(
@@ -443,11 +459,36 @@ def merge_pr(number, head):
         )
         return
     main = result["base"]
-    tree_base = api("git/commits/" + main)["tree"]["sha"]
-    entries = [
-        {"path": f["filename"], "mode": "100644", "type": "blob", "sha": f["sha"]}
-        for f in result["changes"]
-    ]
+    if merged is None:
+        if api("git/ref/heads/" + SITE["gitops_branch"])["object"]["sha"] != main:
+            raise ValueError("Main changed before merge; re-review required")
+        final_pr = api("pulls/" + str(number))
+        if current_approval(final_pr, head, result["policy"]) != consent:
+            raise ValueError("Exact-head human approval changed or was revoked")
+        # GitHub atomically checks the current PR state, exact head and branch rules.
+        outcome = api(
+            "pulls/" + str(number) + "/merge",
+            "PUT",
+            {
+                "sha": head,
+                "merge_method": "merge",
+                "commit_title": "Merge qualified Elastickv "
+                + result["report"]["to_source"][:12],
+            },
+        )
+        if outcome.get("merged") is not True or not re.fullmatch(
+            "[0-9a-f]{40}", outcome.get("sha", "")
+        ):
+            raise ValueError("GitHub did not merge the approved PR")
+        merged = outcome["sha"]
+        merge_commit = api("git/commits/" + merged)
+    if [p["sha"] for p in merge_commit["parents"]] != [main, head]:
+        raise ValueError("Main advanced during merge; no promotion permission recorded")
+    # The standard merge contains no executable grant: only this second, guarded
+    # commit records consent. Failure leaves an inert proposal and can be retried.
+    if read(POLICY, merged) != result["proposed_policy"]:
+        raise ValueError("Merged policy differs from reviewed proposal")
+    tree_base = merge_commit["tree"]["sha"]
     proposed = json.loads(json.dumps(result["proposed_policy"]))
     proposed["approved_transitions"][-1]["human_approval"] = consent
     policy_blob = api(
@@ -460,12 +501,10 @@ def merge_pr(number, head):
             "encoding": "base64",
         },
     )["sha"]
-    for entry in entries:
-        if entry["path"] == POLICY:
-            entry["sha"] = policy_blob
+    entries = [{"path": POLICY, "mode": "100644", "type": "blob", "sha": policy_blob}]
     tree = api("git/trees", "POST", {"base_tree": tree_base, "tree": entries})["sha"]
     message = (
-        "Merge qualified Elastickv "
+        "Record approved Elastickv "
         + result["report"]["to_source"][:12]
         + " (#"
         + str(number)
@@ -480,19 +519,20 @@ def merge_pr(number, head):
         "POST",
         {
             "tree": tree,
-            "parents": [main, head],
+            "parents": [merged],
             "message": message,
             "author": check.agent.AUTHOR,
             "committer": check.agent.AUTHOR,
         },
     )["sha"]
-    if api("git/ref/heads/" + SITE["gitops_branch"])["object"]["sha"] != main:
-        raise ValueError("Main changed before merge; re-review required")
+    if api("git/ref/heads/" + SITE["gitops_branch"])["object"]["sha"] != merged:
+        raise ValueError(
+            "Main advanced after merge; retry only from the unchanged merge commit"
+        )
     final_pr = api("pulls/" + str(number))
-    if current_approval(final_pr, head, result["policy"]) != consent:
+    if current_approval(final_pr, head, result["policy"], merged_sha=merged) != consent:
         raise ValueError("Exact-head human approval changed or was revoked")
-    # Non-force update rejects a concurrent main commit. The head parent makes
-    # this an ordinary Git merge that GitHub associates with the open PR.
+    # No PR is merged by this ref write; it only records consent after the server merge.
     api(
         "git/refs/heads/" + SITE["gitops_branch"],
         "PATCH",
@@ -515,7 +555,18 @@ def review_records(number):
     raise ValueError("Review history exceeds its bounded inventory")
 
 
-def current_approval(pr, head, policy):
+def current_approval(pr, head, policy, *, merged_sha=None):
+    if merged_sha is not None:
+        if (
+            pr.get("state") != "closed"
+            or not pr.get("merged")
+            or pr.get("merge_commit_sha") != merged_sha
+        ):
+            return None
+        pr = {
+            **pr,
+            "state": "open",
+        }  # Assess reviews only on this verified server merge.
     return human_approval.approval(pr, head, review_records(pr["number"]), policy)
 
 

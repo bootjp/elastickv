@@ -33,6 +33,7 @@ class PromotionFlowTests(unittest.TestCase):
         self.writes = []
         self.blobs = {}
         self.merged = None
+        self.current = OLD
         self.state = {
             "last_good": {
                 "source": OLD,
@@ -315,12 +316,23 @@ class PromotionFlowTests(unittest.TestCase):
         if path == "git/ref/heads/" + self.branch:
             return {"object": {"sha": HEAD}}
         if path == "git/ref/heads/main":
-            return {"object": {"sha": OLD}}
+            return {"object": {"sha": self.current}}
         if path == "git/commits/" + HEAD:
             return {
                 "parents": [{"sha": OLD}],
                 "author": agent.AUTHOR,
                 "committer": agent.AUTHOR,
+            }
+        if path == "pulls/1/merge":
+            self.assertEqual(HEAD, data["sha"])
+            self.assertEqual("merge", data["merge_method"])
+            self.pull.update(state="closed", merged=True, merge_commit_sha="d" * 40)
+            self.current = "d" * 40
+            return {"merged": True, "sha": self.current}
+        if path == "git/commits/" + "d" * 40:
+            return {
+                "parents": [{"sha": OLD}, {"sha": HEAD}],
+                "tree": {"sha": "server-tree"},
             }
         if path == "git/commits/" + OLD:
             return {"tree": {"sha": "base-tree"}}

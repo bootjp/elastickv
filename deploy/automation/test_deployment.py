@@ -15,6 +15,14 @@ import yaml
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_documented_example_configuration_matches_current_schema(self):
+        example = json.loads(
+            (
+                settings.PACKAGE / "examples/gitops/automation/deployment.json"
+            ).read_text()
+        )
+        self.assertEqual(settings.DEFAULTS, settings.validate(example))
+
     def test_distinct_namespaces_paths_and_dedicated_storage_are_required(self):
         for update in [
             {"validation_namespace": "elastickv"},
