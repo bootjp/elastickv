@@ -200,6 +200,56 @@ func TestAcknowledgementBatchRotatesPastFailures(t *testing.T) {
 	require.EqualValues(t, 70, second[5].Sequence)
 }
 
+func TestAcknowledgementBatchPrioritizesUnknownMutation(t *testing.T) {
+	t.Parallel()
+	adapter := New(&fakeCore{}, []byte("client"), WithHandleKeepaliveInterval(0))
+	adapter.ackPending = make(map[filesystem.OperationID]struct{})
+	for sequence := uint64(1); sequence <= 70; sequence++ {
+		id := filesystem.OperationID{Filesystem: [16]byte{1}, Session: [16]byte{2}, Sequence: sequence}
+		adapter.ackPending[id] = struct{}{}
+		if sequence == 70 {
+			adapter.unknownOperations = map[filesystem.OperationID][]uint64{id: {235}}
+		}
+	}
+	first := adapter.pendingAcknowledgements()
+	require.Len(t, first, ackBatchSize)
+	require.EqualValues(t, 70, first[0].Sequence)
+	require.EqualValues(t, 1, first[1].Sequence)
+	second := adapter.pendingAcknowledgements()
+	require.EqualValues(t, 70, second[0].Sequence)
+	require.Contains(t, second, filesystem.OperationID{Filesystem: [16]byte{1}, Session: [16]byte{2}, Sequence: 64})
+}
+
+func TestAcknowledgementBatchRetainsOrdinaryProgressWithManyUnknowns(t *testing.T) {
+	t.Parallel()
+	adapter := New(&fakeCore{}, []byte("client"), WithHandleKeepaliveInterval(0))
+	adapter.ackPending = make(map[filesystem.OperationID]struct{})
+	adapter.unknownOperations = make(map[filesystem.OperationID][]uint64)
+	for sequence := uint64(1); sequence <= 140; sequence++ {
+		id := filesystem.OperationID{Filesystem: [16]byte{1}, Session: [16]byte{2}, Sequence: sequence}
+		adapter.ackPending[id] = struct{}{}
+		if sequence <= 70 {
+			adapter.unknownOperations[id] = []uint64{sequence}
+		}
+	}
+	selected := adapter.pendingAcknowledgements()
+	require.Len(t, selected, ackBatchSize)
+	for _, id := range selected[:ackBatchSize/2] {
+		require.LessOrEqual(t, id.Sequence, uint64(70))
+	}
+	for _, id := range selected[ackBatchSize/2:] {
+		require.Greater(t, id.Sequence, uint64(70))
+	}
+	// Even when the first unknown ACKs keep failing, later unknown ACKs must
+	// receive attempts in the next batch.
+	next := adapter.pendingAcknowledgements()
+	require.Len(t, next, ackBatchSize)
+	require.EqualValues(t, 33, next[0].Sequence)
+	require.Contains(t, next[:ackBatchSize/2], filesystem.OperationID{
+		Filesystem: [16]byte{1}, Session: [16]byte{2}, Sequence: 64,
+	})
+}
+
 func TestSuppressedReplyQueuesOperationIdentity(t *testing.T) {
 	t.Parallel()
 	adapter := New(&fakeCore{}, []byte("client"), WithHandleKeepaliveInterval(0))

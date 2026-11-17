@@ -80,6 +80,7 @@ type Adapter struct {
 	ackPending        map[filesystem.OperationID]struct{}
 	unknownOperations map[filesystem.OperationID][]uint64
 	ackCursor         uint64
+	unknownAckCursor  uint64
 	ackWake           chan struct{}
 	ackCancel         context.CancelFunc
 }

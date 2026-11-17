@@ -51,6 +51,74 @@ func TestOperationJournalConcurrentAcknowledgementChurn(t *testing.T) {
 	})
 }
 
+func TestOperationJournalOutOfOrderAcknowledgements(t *testing.T) {
+	t.Parallel()
+	for _, backend := range []string{"memory", "pebble"} {
+		t.Run(backend, func(t *testing.T) {
+			var journal *OperationJournal
+			if backend == "memory" {
+				journal, _, _ = testOperationJournal(t)
+			} else {
+				st, err := store.NewPebbleStore(t.TempDir())
+				require.NoError(t, err)
+				t.Cleanup(func() { require.NoError(t, st.Close()) })
+				service, err := NewService(st, &testCoordinator{st: st})
+				require.NoError(t, err)
+				journal, err = NewOperationJournal(service)
+				require.NoError(t, err)
+			}
+			assertOutOfOrderAcknowledgements(t, journal)
+		})
+	}
+}
+
+func assertOutOfOrderAcknowledgements(t *testing.T, journal *OperationJournal) {
+	t.Helper()
+	ctx := context.Background()
+	first := testOperationID(t, journal, 1)
+	sessionID := OperationSessionID{Filesystem: first.Filesystem, Session: first.Session}
+	ids := []OperationID{first,
+		{Filesystem: first.Filesystem, Session: first.Session, Sequence: 2},
+		{Filesystem: first.Filesystem, Session: first.Session, Sequence: 3}}
+	for _, id := range ids {
+		_, err := journal.Admit(ctx, id, []byte("write"), 128, 1024)
+		require.NoError(t, err)
+		attempt, err := journal.BeginAttempt(ctx, id)
+		require.NoError(t, err)
+		_, err = journal.Publish(ctx, id, attempt.AttemptID, operationAttemptPlan{
+			Intent: []byte("write"), Result: []byte("done"),
+		})
+		require.NoError(t, err)
+	}
+	readSession := func() operationSession {
+		ts, err := journal.backend.Snapshot(ctx)
+		require.NoError(t, err)
+		session, found, err := journal.loadSessionAt(ctx, sessionID, ts)
+		require.NoError(t, err)
+		require.True(t, found)
+		return session
+	}
+
+	require.NoError(t, journal.Acknowledge(ctx, ids[2]))
+	session := readSession()
+	require.Zero(t, session.RejectBefore)
+	require.Equal(t, []uint64{3}, session.AckGaps)
+	require.Equal(t, uint32(2), session.RetainedCount)
+
+	require.NoError(t, journal.Acknowledge(ctx, ids[0]))
+	session = readSession()
+	require.Equal(t, uint64(1), session.RejectBefore)
+	require.Equal(t, []uint64{3}, session.AckGaps)
+	require.Equal(t, uint32(1), session.RetainedCount)
+
+	require.NoError(t, journal.Acknowledge(ctx, ids[1]))
+	session = readSession()
+	require.Equal(t, uint64(3), session.RejectBefore)
+	require.Empty(t, session.AckGaps)
+	require.Zero(t, session.RetainedCount)
+	require.Zero(t, session.RetainedBytes)
+}
+
 func TestOperationJournalGenerationFenceRacesAcknowledgement(t *testing.T) {
 	t.Parallel()
 	t.Run("memory", func(t *testing.T) {
