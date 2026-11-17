@@ -240,6 +240,14 @@ func TestAcknowledgementBatchRetainsOrdinaryProgressWithManyUnknowns(t *testing.
 	for _, id := range selected[ackBatchSize/2:] {
 		require.Greater(t, id.Sequence, uint64(70))
 	}
+	// Even when the first unknown ACKs keep failing, later unknown ACKs must
+	// receive attempts in the next batch.
+	next := adapter.pendingAcknowledgements()
+	require.Len(t, next, ackBatchSize)
+	require.EqualValues(t, 33, next[0].Sequence)
+	require.Contains(t, next[:ackBatchSize/2], filesystem.OperationID{
+		Filesystem: [16]byte{1}, Session: [16]byte{2}, Sequence: 64,
+	})
 }
 
 func TestSuppressedReplyQueuesOperationIdentity(t *testing.T) {

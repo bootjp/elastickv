@@ -152,15 +152,16 @@ func (a *Adapter) pendingAcknowledgements() []filesystem.OperationID {
 	if len(ids) == 0 {
 		return ids
 	}
-	start := sort.Search(len(ids), func(i int) bool { return ids[i].Sequence > a.ackCursor })
 	selected := make([]filesystem.OperationID, 0, min(len(ids), ackBatchSize))
 	seen := make(map[filesystem.OperationID]struct{}, ackBatchSize)
 	// An unknown mutation blocks subsequent operations on its inode until its
 	// acknowledgement resolves. Visit those receipts before ordinary ACKs so
 	// a full batch of slow or contended retirements cannot delay recovery.
 	// Reserve half of a full batch for ordinary ACKs when both classes have
-	// work, and keep the cursor rotation within each class.
-	appendMatching := func(wantUnknown bool, limit int) {
+	// work. Rotate each class independently so an ordinary ACK cannot pin the
+	// unknown cursor ahead of unknown mutations that still need a retry.
+	appendMatching := func(wantUnknown bool, limit int, cursor *uint64) {
+		start := sort.Search(len(ids), func(i int) bool { return ids[i].Sequence > *cursor })
 		for i := 0; i < len(ids) && len(selected) < limit; i++ {
 			id := ids[(start+i)%len(ids)]
 			_, unknown := a.unknownOperations[id]
@@ -170,13 +171,13 @@ func (a *Adapter) pendingAcknowledgements() []filesystem.OperationID {
 				}
 				selected = append(selected, id)
 				seen[id] = struct{}{}
+				*cursor = id.Sequence
 			}
 		}
 	}
-	appendMatching(true, ackBatchSize/ackClassCount)
-	appendMatching(false, ackBatchSize)
-	appendMatching(true, ackBatchSize)
-	a.ackCursor = selected[len(selected)-1].Sequence
+	appendMatching(true, ackBatchSize/ackClassCount, &a.unknownAckCursor)
+	appendMatching(false, ackBatchSize, &a.ackCursor)
+	appendMatching(true, ackBatchSize, &a.unknownAckCursor)
 	return selected
 }
 
