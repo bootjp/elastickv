@@ -352,7 +352,9 @@ class ManagerTests(unittest.TestCase):
         error = agent.urllib.error.HTTPError(
             "http://private/readyz?token=secret", 503, "error", {}, body
         )
-        with unittest.mock.patch.object(agent.urllib.request, "urlopen", side_effect=error):
+        with unittest.mock.patch.object(
+            agent.urllib.request, "urlopen", side_effect=error
+        ):
             with self.assertRaises(agent.HttpReleaseError) as caught:
                 agent.http_json("http://private/readyz?token=secret")
         self.assertEqual(503, caught.exception.status)
