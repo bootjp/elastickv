@@ -923,6 +923,7 @@ class Runtime:
         pods = self.pods()
         if not all(pod_ready(p) for p in pods.values()):
             if self._readiness_settling(pods, release):
+                self.quorum(pods)
                 raise ReadinessSettling(
                     "Snapshot restoration or probe update is pending"
                 )

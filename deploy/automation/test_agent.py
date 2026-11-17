@@ -576,7 +576,7 @@ class RuntimeTests(unittest.TestCase):
                 self.runtime.quorum = Mock()
                 with self.assertRaises(agent.ReadinessSettling):
                     self.runtime.verify(NEW, canary=False)
-                self.runtime.quorum.assert_not_called()
+                self.runtime.quorum.assert_called_once_with({"n1": p})
         for error in [
             agent.HttpReleaseError(503, "GET", "/readyz", "engine_failed"),
             agent.HttpReleaseError(403, "GET", "/readyz"),
@@ -587,6 +587,19 @@ class RuntimeTests(unittest.TestCase):
                 self.assertRaises(agent.HttpReleaseError),
             ):
                 self.runtime.verify(NEW, canary=False)
+
+    def test_readiness_settling_never_defers_quorum_failure(self):
+        self.runtime.pods = Mock(return_value={"n1": {"metadata": {}, "status": {}}})
+        self.runtime.check_qualified_storage = Mock()
+        self.runtime._readiness_settling = Mock(return_value=True)
+        self.runtime.canary = Mock()
+        with (
+            unittest.mock.patch.object(agent.time, "sleep") as sleep,
+            self.assertRaisesRegex(agent.ReleaseError, "Fewer than two healthy voters"),
+        ):
+            self.runtime.accept(NEW)
+        sleep.assert_not_called()
+        self.runtime.canary.assert_not_called()
 
     def test_lost_lease_and_manual_drift_do_not_retry(self):
         predicate = Mock(side_effect=agent.LostLease("lost"))
