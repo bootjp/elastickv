@@ -261,3 +261,6 @@ spec:
           - name: tmp
             emptyDir:
               sizeLimit: 32Mi
+          nodeSelector:
+            kubernetes.io/os: linux
+            kubernetes.io/arch: amd64

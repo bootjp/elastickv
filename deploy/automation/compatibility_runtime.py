@@ -153,17 +153,24 @@ def verify_seed(runtime):
     ):
         raise agent.ReleaseError("Persistent validation object data changed")
     queue = c["sqs"].get_queue_url(QueueName=SEED)["QueueUrl"]
-    messages = (
-        c["sqs"]
-        .receive_message(
-            QueueUrl=queue,
-            MaxNumberOfMessages=10,
-            VisibilityTimeout=0,
-            WaitTimeSeconds=1,
+    observed = set()
+    for _ in range(10):
+        messages = (
+            c["sqs"]
+            .receive_message(
+                QueueUrl=queue,
+                MaxNumberOfMessages=10,
+                VisibilityTimeout=0,
+                WaitTimeSeconds=1,
+            )
+            .get("Messages", [])
         )
-        .get("Messages", [])
-    )
-    if {m["Body"] for m in messages} != MESSAGES:
+        observed.update(m["Body"] for m in messages)
+        if observed - MESSAGES:
+            raise agent.ReleaseError("Persistent validation SQS messages changed")
+        if observed == MESSAGES:
+            break
+    if observed != MESSAGES:
         raise agent.ReleaseError("Persistent validation SQS messages changed")
     return {
         "redis_keys_verified_on_each_of_three_members": len(VALUES),
@@ -261,4 +268,8 @@ class Observer:
 
     def __exit__(self, *_):
         self.done.set()
-        self.thread.join(timeout=10)
+        self.thread.join(timeout=30)
+        if self.thread.is_alive():
+            raise agent.ReleaseError(
+                "Observation did not finish before evidence deadline"
+            )

@@ -116,6 +116,17 @@ class PolicyTests(unittest.TestCase):
         self.assertTrue(agent.compatible(policy, OLD, NEW["source"], {}))
 
 
+class ReadinessContractTests(unittest.TestCase):
+    def test_qualified_update_rejects_legacy_readiness_baseline(self):
+        policy = {
+            "require_qualification": True,
+            "approved_transitions": [
+                {"from": OLD["source"], "to": NEW["source"], "readiness": True}
+            ],
+        }
+        self.assertIsNone(agent.compatible(policy, OLD, NEW["source"], {}))
+
+
 class FakeStore:
     def __init__(self):
         self.state = {
@@ -320,6 +331,11 @@ class RuntimeTests(unittest.TestCase):
 
 
 class RegistryTests(unittest.TestCase):
+    def setUp(self):
+        patcher = unittest.mock.patch.object(agent, "verify_image_provenance")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_single_manifest_rejects_wrong_platform_and_accepts_digest_pin(self):
         import hashlib
         import io
@@ -453,6 +469,25 @@ class RolloutTests(unittest.TestCase):
             )
         )
 
+    def test_sidecar_before_application_does_not_block_template_wait(self):
+        runtime, pods, template, actions = self.runtime()
+        template["spec"]["template"]["spec"]["containers"].insert(
+            0, {"name": "observer", "image": "other"}
+        )
+        runtime.roll(NEW, {"data": "retained"})
+        self.assertEqual(3, sum(a[0] == "delete" for a in actions))
+
+    def test_resumed_forward_checks_existing_candidate_before_any_deletion(self):
+        runtime, pods, template, actions = self.runtime()
+        runtime.git.state["transaction"]["phase"] = "forward"
+        pods["n2"]["metadata"]["labels"]["controller-revision-hash"] = "new"
+        pods["n2"]["spec"]["containers"][0]["image"] = NEW["image"]
+        runtime.verify = Mock(side_effect=agent.ReleaseError("candidate canary failed"))
+        with self.assertRaises(agent.ReleaseError):
+            runtime.roll(NEW, {"data": "retained"})
+        runtime.verify.assert_called_once_with(NEW)
+        self.assertEqual([], actions)
+
     def test_pvc_or_unexpected_image_drift_stops_without_deletion(self):
         runtime, pods, template, actions = self.runtime()
         runtime.pvcs.return_value = {"data": "changed"}
@@ -471,6 +506,45 @@ class RolloutTests(unittest.TestCase):
         with self.assertRaises(agent.ReleaseError):
             runtime.roll(NEW, {"data": "retained"})
         self.assertEqual([("delete", "n2")], actions)
+
+
+class ProvenanceTests(unittest.TestCase):
+    def test_signed_verifier_is_bound_to_digest_source_ref_and_workflow(self):
+        image = "ghcr.io/example/elastickv@sha256:" + "c" * 64
+        with (
+            unittest.mock.patch.dict(agent.os.environ, {"GH_TOKEN": "test-only"}),
+            unittest.mock.patch.object(
+                agent.subprocess,
+                "run",
+                return_value=Mock(returncode=0, stdout='[{"verified":true}]'),
+            ) as run,
+        ):
+            agent.verify_image_provenance(image, NEW["source"])
+        args = run.call_args.args[0]
+        self.assertIn("oci://" + image, args)
+        self.assertIn(NEW["source"], args)
+        self.assertIn("refs/heads/main", args)
+        self.assertIn("example/elastickv/.github/workflows/docker-image.yml", args)
+        self.assertIn("--deny-self-hosted-runners", args)
+        self.assertNotIn("test-only", args)
+
+    def test_untrusted_unsigned_mismatched_or_unavailable_provenance_fails_closed(self):
+        for result in (
+            Mock(returncode=1, stdout=""),
+            Mock(returncode=0, stdout="[]"),
+            Mock(returncode=0, stdout="invalid"),
+        ):
+            with (
+                self.subTest(result=result),
+                unittest.mock.patch.dict(agent.os.environ, {"GH_TOKEN": "test-only"}),
+                unittest.mock.patch.object(
+                    agent.subprocess, "run", return_value=result
+                ),
+            ):
+                with self.assertRaises(agent.ReleaseError):
+                    agent.verify_image_provenance(
+                        "ghcr.io/example/elastickv@sha256:" + "c" * 64, NEW["source"]
+                    )
 
 
 class GithubReadRetryTests(unittest.TestCase):

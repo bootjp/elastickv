@@ -87,3 +87,6 @@ spec:
           - name: compatibility
             configMap:
               name: elastickv-compatibility-policy
+          nodeSelector:
+            kubernetes.io/os: linux
+            kubernetes.io/arch: amd64

@@ -16,6 +16,7 @@ DEFAULTS = {
     "gitops_branch": "main",
     "source_repository": "example/elastickv",
     "source_branch": "main",
+    "provenance_workflow": ".github/workflows/docker-image.yml",
     "application_image": "ghcr.io/example/elastickv",
     "control_namespace": "elastickv-system",
     "production_namespace": "elastickv",
@@ -69,6 +70,7 @@ def validate(config, live=False):
             or ".." in path.parts
             or str(path) != config[key]
             or config[key] in ("", ".")
+            or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_./-]*", config[key])
         ):
             raise ValueError("Require a normalized repository-relative path: " + key)
     paths = [
@@ -90,6 +92,10 @@ def validate(config, live=False):
     for key in ("gitops_repository", "source_repository"):
         if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", config[key]):
             raise ValueError("Invalid repository: " + key)
+    if not re.fullmatch(
+        r"\.github/workflows/[A-Za-z0-9_-]+\.ya?ml", config["provenance_workflow"]
+    ):
+        raise ValueError("Invalid trusted provenance workflow")
     for key in ("gitops_branch", "source_branch"):
         if not re.fullmatch(r"[A-Za-z0-9_-]+", config[key]):
             raise ValueError("Branch must be a simple branch name: " + key)

@@ -197,8 +197,12 @@ class ScopeTests(unittest.TestCase):
     def test_branch_guard_precedes_all_github_writes(self):
         github = Mock()
         store = Mock()
-        with self.assertRaises(agent.UnsafeState):
-            compatibility.publish(github, store, {}, "main", NEW, {}, b"", True, "test")
+        guard = Mock()
+        with self.assertRaisesRegex(agent.UnsafeState, "Invalid qualification branch"):
+            compatibility.publish(
+                github, store, {}, "main", NEW, {}, b"", True, "test", guard=guard
+            )
+        guard.assert_not_called()
         github.request.assert_not_called()
         store.guard.assert_not_called()
 

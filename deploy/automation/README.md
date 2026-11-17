@@ -77,7 +77,10 @@ The current profile supports exactly three Linux/amd64 voters named
 `elastickv-peer` service, a `data` claim mounted at `/var/lib/elastickv`, and the
 standard Redis/DynamoDB/S3/SQS ports. HTTP `/readyz` must be available on port 8081.
 The existing [runtime readiness configuration](../kubernetes/examples/readiness/)
-is mandatory. Use a compatible image for the initial baseline too.
+is mandatory. Use a compatible image for the initial baseline too. Qualification
+requires readiness already enabled on the live baseline. Enabling or removing
+readiness changes the runtime contract and requires a separately reviewed rollout;
+it cannot be combined with an automatic qualified image update.
 
 Production storage can use the provisioner selected for the existing application.
 The supplied **validation storage adapter** deliberately requires NFS CSI
@@ -340,3 +343,22 @@ it has no publish, cluster or production deployment step.
 The parameterized package requires its own staging run at the target site before
 enabling automatic production promotion. Offline checks do not establish live
 cluster, storage, registry credential or CNI compatibility.
+
+### Signed application provenance
+
+Every candidate digest must have a valid GitHub/Sigstore build attestation from
+`provenance_workflow` in the configured source repository, at the exact candidate
+commit and source branch, on a GitHub-hosted runner. The publisher uses
+`actions/attest` after pushing the image. Qualification, trusted PR review and
+release discovery each run `gh attestation verify` with the digest, repository,
+workflow, source SHA and ref pinned. Missing or invalid attestations stop promotion;
+a SHA-named registry tag alone never authorizes deployment. GitHub CLI is included
+in the controller image with a pinned download checksum. Review workflows also
+need a current GitHub CLI; controllers use their existing installation token for
+public attestation lookup. No new application credentials are required.
+
+The source publisher must be merged and publish a newly attested image before
+this controller can qualify a candidate. Historical unsigned images may remain
+as the already-installed baseline and rollback target, but cannot become a new
+candidate. See [GitHub CLI verification](https://cli.github.com/manual/gh_attestation_verify)
+and [artifact attestations](https://docs.github.com/en/actions/how-tos/secure-your-work/use-artifact-attestations/use-artifact-attestations).

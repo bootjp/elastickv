@@ -54,15 +54,13 @@ def render(
             "storage_class",
         )
     }
+    replacements[".elastickv.svc"] = "." + config["production_namespace"] + ".svc"
     expression = re.compile(
         "|".join(re.escape(v) for v in sorted(replacements, key=len, reverse=True))
     )
 
     def text(value):
-        value = expression.sub(lambda match: replacements[match.group()], value)
-        return value.replace(
-            ".elastickv.svc", "." + config["production_namespace"] + ".svc"
-        )
+        return expression.sub(lambda match: replacements[match.group()], value)
 
     def transform(value, key=None):
         if isinstance(value, dict):

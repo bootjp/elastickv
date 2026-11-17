@@ -538,6 +538,10 @@ def run():
     github = agent.GithubApp(REPO)
     store = agent.GitState(github, policy)
     baseline = store.state["last_good"]
+    if baseline.get("readiness") is not True:
+        raise agent.UnsafeState(
+            "Enable and verify baseline readiness before qualification"
+        )
     if store.state.get("transaction"):
         agent.log("compatibility-waiting-for-release")
         return

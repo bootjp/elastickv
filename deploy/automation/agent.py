@@ -110,6 +110,8 @@ def ci_ready(runs, sha, required, codeql_workflow_id=None):
 
 
 def compatible(policy, previous, candidate, comparison):
+    if policy.get("require_qualification") and previous.get("readiness") is not True:
+        return None
     if previous["source"] == candidate:
         return previous.get("readiness", False)
     for transition in reversed(policy.get("approved_transitions", [])):
@@ -197,7 +199,59 @@ def registry_image(name, sha):
     )
     if config.get("os") != "linux" or config.get("architecture") != "amd64":
         raise ReleaseError("Image configuration is not linux/amd64")
-    return name + "@" + digest
+    image = name + "@" + digest
+    verify_image_provenance(image, sha)
+    return image
+
+
+def verify_image_provenance(image, source):
+    """Verify Sigstore signatures and certificate-bound workflow/source identity."""
+    if not re.fullmatch(r"[0-9a-f]{40}", source) or not re.fullmatch(
+        r"[a-z0-9./_-]+@sha256:[0-9a-f]{64}", image
+    ):
+        raise ReleaseError("Invalid provenance subject")
+    token = os.environ.get("GH_TOKEN")
+    if not token:
+        token = (
+            GithubApp(SITE["gitops_repository"])
+            .headers()["Authorization"]
+            .removeprefix("Bearer ")
+        )
+    try:
+        result = subprocess.run(
+            [
+                "gh",
+                "attestation",
+                "verify",
+                "oci://" + image,
+                "--repo",
+                SITE["source_repository"],
+                "--signer-workflow",
+                SITE["source_repository"] + "/" + SITE["provenance_workflow"],
+                "--source-digest",
+                source,
+                "--source-ref",
+                "refs/heads/" + SITE["source_branch"],
+                "--deny-self-hosted-runners",
+                "--format",
+                "json",
+            ],
+            env={
+                **os.environ,
+                "GH_TOKEN": token,
+                "GH_CONFIG_DIR": "/tmp/gh-provenance",
+                "GH_PROMPT_DISABLED": "1",
+                "GH_NO_UPDATE_NOTIFIER": "1",
+            },
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        verified = json.loads(result.stdout) if result.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        raise ReleaseError("Signed image provenance could not be verified") from None
+    if not isinstance(verified, list) or not verified:
+        raise ReleaseError("Signed image provenance could not be verified")
 
 
 class GithubApp:
@@ -734,9 +788,13 @@ class Runtime:
 
     def roll(self, release, pvcs):
         self.wait(
-            lambda: self.kube.request(self.sts_path)["spec"]["template"]["spec"][
-                "containers"
-            ][0]["image"]
+            lambda: next(
+                c["image"]
+                for c in self.kube.request(self.sts_path)["spec"]["template"]["spec"][
+                    "containers"
+                ]
+                if c["name"] == "elastickv"
+            )
             == release["image"],
             300,
         )
@@ -754,6 +812,7 @@ class Runtime:
             120,
         )
         revision = self.kube.request(self.sts_path)["status"]["updateRevision"]
+        resuming = True
         while True:
             self.check_qualified_storage()
             if self.pvcs() != pvcs:
@@ -779,6 +838,13 @@ class Runtime:
                 if p["metadata"].get("labels", {}).get("controller-revision-hash")
                 != revision
             ]
+            if (
+                resuming
+                and transaction.get("phase") == "forward"
+                and len(remaining) < len(pods)
+            ):
+                self.verify(release)
+            resuming = False
             if not remaining:
                 self.wait(
                     lambda: all(pod_ready(p) for p in self.pods().values()),

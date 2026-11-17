@@ -21,6 +21,9 @@ class ConfigurationTests(unittest.TestCase):
             {"control_namespace": "elastickv"},
             {"application_path": "../escape"},
             {"code_path": "/absolute"},
+            {"code_path": "release tools"},
+            {"code_path": "tools;false"},
+            {"code_path": "tools/${VALUE}"},
             {"evidence_path": "apps/elastickv/proof"},
             {"nfs_root": "/"},
             {"backup_claims": ["data-elastickv-0"]},
@@ -120,6 +123,10 @@ class RenderTests(unittest.TestCase):
             self.assertEqual("release-system", cron["metadata"]["namespace"])
             pod = cron["spec"]["jobTemplate"]["spec"]["template"]["spec"]
             self.assertEqual(self.controller, pod["containers"][0]["image"])
+            self.assertEqual(
+                {"kubernetes.io/os": "linux", "kubernetes.io/arch": "amd64"},
+                pod["nodeSelector"],
+            )
             self.assertTrue(
                 any(
                     e["name"] == "ELASTICKV_DEPLOYMENT_CONFIG"
@@ -171,6 +178,18 @@ class RenderTests(unittest.TestCase):
             ),
             set(claims),
         )
+
+    def test_namespace_replacement_does_not_reprocess_validation_dns(self):
+        self.config.update(
+            production_namespace="production", validation_namespace="elastickv"
+        )
+        self.render()
+        assets = json.loads(
+            (self.output / "releases/qualification/assets.json").read_text()
+        )
+        endpoints = json.dumps(assets["validation_policy"]["endpoints"])
+        self.assertIn(".elastickv.svc", endpoints)
+        self.assertNotIn(".production.svc", endpoints)
 
     def test_nested_vendored_code_path_has_correct_repository_root(self):
         self.config["code_path"] = "infrastructure/release-tools"
