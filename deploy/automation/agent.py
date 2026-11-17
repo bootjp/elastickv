@@ -5,6 +5,7 @@ import base64
 import datetime as dt
 import fnmatch
 import hashlib
+import http.client
 import json
 import os
 import pathlib
@@ -118,7 +119,7 @@ def http_json(url, method="GET", data=None, headers=None, context=None):
                         and payload["reason"] in READINESS_REASONS
                     ):
                         reason = payload["reason"]
-            except (ValueError, OSError):
+            except (ValueError, OSError, RecursionError, http.client.HTTPException):
                 pass
         exc.close()
         raise HttpReleaseError(status, method, path, reason) from None

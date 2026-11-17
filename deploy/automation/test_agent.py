@@ -328,6 +328,7 @@ class ManagerTests(unittest.TestCase):
             (b'{"reason":"snapshot_restoring","other":"secret"}', "snapshot_restoring"),
             (b'{"reason":"secret"}', None),
             (b'{"reason":[]}', None),
+            (b"[" * 2000 + b"]" * 2000, None),
             (b"secret" * 1000, None),
         ]:
             error = agent.urllib.error.HTTPError(
@@ -344,6 +345,20 @@ class ManagerTests(unittest.TestCase):
             self.assertEqual(expected, caught.exception.readiness_reason)
             self.assertEqual("/readyz", caught.exception.path)
             self.assertNotIn("secret", str(caught.exception))
+
+    def test_truncated_readiness_body_retains_http_context_and_closes_response(self):
+        body = Mock()
+        body.read.side_effect = agent.http.client.IncompleteRead(b"partial")
+        error = agent.urllib.error.HTTPError(
+            "http://private/readyz?token=secret", 503, "error", {}, body
+        )
+        with unittest.mock.patch.object(agent.urllib.request, "urlopen", side_effect=error):
+            with self.assertRaises(agent.HttpReleaseError) as caught:
+                agent.http_json("http://private/readyz?token=secret")
+        self.assertEqual(503, caught.exception.status)
+        self.assertEqual("/readyz", caught.exception.path)
+        self.assertIsNone(caught.exception.readiness_reason)
+        body.close.assert_called_once()
 
     def test_failed_update_commits_old_probe_and_image_before_rollback(self):
         def rolling(release, pvcs):
