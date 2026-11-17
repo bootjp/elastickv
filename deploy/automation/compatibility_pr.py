@@ -77,7 +77,7 @@ def read(path, sha):
 def review(branch, head, *, merged_base=None):
     if not re.fullmatch(BRANCH, branch) or not re.fullmatch("[0-9a-f]{40}", head):
         raise ValueError("Invalid machine qualification identity")
-    if api("git/ref/heads/" + branch)["object"]["sha"] != head:
+    if merged_base is None and api("git/ref/heads/" + branch)["object"]["sha"] != head:
         raise ValueError("Machine branch changed")
     commit = api("git/commits/" + head)
     if len(commit["parents"]) != 1 or any(

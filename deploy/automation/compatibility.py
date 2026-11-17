@@ -82,12 +82,27 @@ def production(kube, baseline):
         or sts["spec"]["updateStrategy"]["type"] != "OnDelete"
     ):
         raise agent.UnsafeState("Production is not the supported three-voter profile")
+    container = next(
+        c
+        for c in sts["spec"]["template"]["spec"]["containers"]
+        if c["name"] == "elastickv"
+    )
+    if container.get("envFrom"):
+        raise agent.UnsafeState(
+            "Unresolved template envFrom settings need profile review"
+        )
     pods = {}
     for n in range(3):
         pod = kube.request(prefix + "/pods/elastickv-" + str(n))
-        image = next(
-            c["image"] for c in pod["spec"]["containers"] if c["name"] == "elastickv"
-        )
+        actual = next(c for c in pod["spec"]["containers"] if c["name"] == "elastickv")
+        image = actual["image"]
+        if actual.get("envFrom") or any(
+            actual.get(k, []) != container.get(k, [])
+            for k in ("command", "args", "env", "envFrom", "workingDir")
+        ):
+            raise agent.UnsafeState(
+                "Running production Pod runtime differs from qualified template"
+            )
         if not agent.pod_ready(pod) or image != baseline["image"]:
             raise agent.UnsafeState("Production baseline is not stable")
         pods[pod["metadata"]["name"]] = {
@@ -104,11 +119,6 @@ def production(kube, baseline):
         ):
             raise agent.UnsafeState("Production/backup claim is not stable and Bound")
         claims[name] = claim["metadata"]["uid"]
-    container = next(
-        c
-        for c in sts["spec"]["template"]["spec"]["containers"]
-        if c["name"] == "elastickv"
-    )
     return {
         "claims": claims,
         "container": container,

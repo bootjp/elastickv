@@ -48,3 +48,10 @@ jobs:
         run: |
           docker run --rm elastickv-release-controller:ci --help
           docker run --rm --entrypoint python3 elastickv-release-controller:ci -c 'import agent, compatibility, source_review, human_approval, boto3, yaml'
+      - name: Verify trust-root cache on a read-only filesystem
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          docker run --rm --read-only --tmpfs /tmp:rw,nosuid,nodev,size=64m \
+            -e GH_TOKEN -e GH_CONFIG_DIR=/tmp/gh-provenance -e XDG_CACHE_HOME=/tmp/gh-cache \
+            --entrypoint gh elastickv-release-controller:ci attestation trusted-root --verify-only

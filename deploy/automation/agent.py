@@ -240,6 +240,7 @@ def verify_image_provenance(image, source):
                 **os.environ,
                 "GH_TOKEN": token,
                 "GH_CONFIG_DIR": "/tmp/gh-provenance",
+                "XDG_CACHE_HOME": "/tmp/gh-cache",
                 "GH_PROMPT_DISABLED": "1",
                 "GH_NO_UPDATE_NOTIFIER": "1",
             },

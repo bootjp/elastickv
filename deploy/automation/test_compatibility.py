@@ -25,6 +25,62 @@ NEW = {
 }
 
 
+class RunningProductionTests(unittest.TestCase):
+    def test_ondelete_pods_must_match_the_inspected_runtime(self):
+        expected = {
+            "name": "elastickv",
+            "image": OLD["image"],
+            "command": ["/app"],
+            "args": [],
+            "env": [],
+        }
+        sts = {
+            "spec": {
+                "replicas": 3,
+                "updateStrategy": {"type": "OnDelete"},
+                "template": {"spec": {"containers": [expected]}},
+            }
+        }
+        pods = {
+            f"elastickv-{n}": {
+                "metadata": {"name": f"elastickv-{n}", "uid": str(n)},
+                "spec": {"containers": [copy.deepcopy(expected)]},
+                "status": {
+                    "conditions": [{"type": "Ready", "status": "True"}],
+                    "containerStatuses": [{"name": "elastickv", "restartCount": 0}],
+                },
+            }
+            for n in range(3)
+        }
+
+        def request(path):
+            if "/statefulsets/" in path:
+                return sts
+            if "/pods/" in path:
+                return pods[path.rsplit("/", 1)[-1]]
+            return {
+                "metadata": {"uid": path.rsplit("/", 1)[-1]},
+                "status": {"phase": "Bound"},
+            }
+
+        kube = Mock()
+        kube.request.side_effect = request
+        with patch.object(compatibility, "verify_live_data_layout"):
+            self.assertEqual(3, len(compatibility.production(kube, OLD)["pods"]))
+            for update in (
+                {"envFrom": [{"configMapRef": {"name": "old-config"}}]},
+                {"envFrom": [{"secretRef": {"name": "old-secret"}}]},
+                {"args": ["--old-setting"]},
+                {"env": [{"name": "ELASTICKV_FSM_SYNC_MODE", "value": "nosync"}]},
+            ):
+                pods["elastickv-1"]["spec"]["containers"][0] = {**expected, **update}
+                with (
+                    self.subTest(update=update),
+                    self.assertRaisesRegex(agent.UnsafeState, "runtime differs"),
+                ):
+                    compatibility.production(kube, OLD)
+
+
 class OptionalCodeQLTests(unittest.TestCase):
     def test_qualification_without_codeql_id_waits_for_required_ci(self):
         fingerprint = hashlib.sha256(b"controller").hexdigest()

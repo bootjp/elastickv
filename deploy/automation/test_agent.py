@@ -573,6 +573,7 @@ class ProvenanceTests(unittest.TestCase):
         self.assertIn("example/elastickv/.github/workflows/docker-image.yml", args)
         self.assertIn("--deny-self-hosted-runners", args)
         self.assertNotIn("test-only", args)
+        self.assertEqual("/tmp/gh-cache", run.call_args.kwargs["env"]["XDG_CACHE_HOME"])
 
     def test_untrusted_unsigned_mismatched_or_unavailable_provenance_fails_closed(self):
         for result in (

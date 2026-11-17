@@ -290,6 +290,21 @@ class PromotionFlowTests(unittest.TestCase):
                     }
                 ]
                 frontend.merge_pr(1, HEAD)
+            # Recovery must use immutable commits even after GitHub auto-deletes the branch.
+            original_api = self.api
+
+            def no_branch(path, method="GET", data=None):
+                if path == "git/ref/heads/" + self.branch:
+                    self.fail("Merged recovery must not require a live branch ref")
+                return original_api(path, method, data)
+
+            with (
+                patch.object(frontend, "api", side_effect=no_branch),
+                patch.object(agent, "http_json", side_effect=public),
+                patch.object(agent, "registry_image", return_value=IMAGE),
+                patch.object(source_review, "collect", side_effect=collect),
+            ):
+                frontend.merge_pr(1, HEAD)
             self.assertIsNotNone(self.merged)
             entry = self.merged["approved_transitions"][-1]
             self.assertEqual(HEAD, entry["human_approval"]["commit"])
