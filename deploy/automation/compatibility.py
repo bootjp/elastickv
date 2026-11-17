@@ -559,7 +559,7 @@ def run():
             )["workflow_runs"]
         )
     if not agent.ci_ready(
-        runs, sha, policy["required_workflows"], policy["codeql_workflow_id"]
+        runs, sha, policy["required_workflows"], policy.get("codeql_workflow_id")
     ):
         agent.log("compatibility-waiting-for-ci", source=sha)
         return

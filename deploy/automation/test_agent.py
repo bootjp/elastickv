@@ -552,7 +552,6 @@ class ApprovedDigestTests(unittest.TestCase):
         policy = {
             "repository": "example/elastickv",
             "required_workflows": [],
-            "codeql_workflow_id": 1,
             "image": "ghcr.io/example/elastickv",
             "approved_transitions": [
                 {

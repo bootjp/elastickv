@@ -1107,7 +1107,7 @@ def discover(policy, previous, profile=None, quarantined=()):
             )
             runs.extend(http_json(public + "/actions/runs?" + query)["workflow_runs"])
         if not ci_ready(
-            runs, sha, policy["required_workflows"], policy["codeql_workflow_id"]
+            runs, sha, policy["required_workflows"], policy.get("codeql_workflow_id")
         ):
             log("waiting-for-ci", source=sha)
             continue

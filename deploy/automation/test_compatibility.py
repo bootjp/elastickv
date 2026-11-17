@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import json
 import pathlib
 import unittest
@@ -22,6 +23,45 @@ NEW = {
     "image": "ghcr.io/example/elastickv@sha256:" + "b" * 64,
     "readiness": True,
 }
+
+
+class OptionalCodeQLTests(unittest.TestCase):
+    def test_qualification_without_codeql_id_waits_for_required_ci(self):
+        fingerprint = hashlib.sha256(b"controller").hexdigest()
+        config = {
+            "qualification_source_sha256": fingerprint,
+            "agent_sha256": fingerprint,
+            "source_reviewer_sha256": "reviewer",
+        }
+        policy = {"repository": "example/elastickv", "required_workflows": ["Test"]}
+        store = Mock(state={"last_good": OLD})
+        with (
+            patch.object(compatibility, "require_configured"),
+            patch.object(pathlib.Path, "read_bytes", return_value=b"controller"),
+            patch.object(
+                pathlib.Path,
+                "read_text",
+                side_effect=[json.dumps(config), json.dumps(policy)],
+            ),
+            patch.object(
+                compatibility.source_review, "fingerprint", return_value="reviewer"
+            ),
+            patch.object(agent, "validate_site_policy"),
+            patch.object(agent, "GithubApp"),
+            patch.object(agent, "GitState", return_value=store),
+            patch.object(
+                agent,
+                "http_json",
+                side_effect=[
+                    {"sha": NEW["source"]},
+                    {"workflow_runs": []},
+                    {"workflow_runs": []},
+                ],
+            ),
+            patch.object(agent, "registry_image") as image,
+        ):
+            compatibility.run()
+        image.assert_not_called()
 
 
 class ProfileTests(unittest.TestCase):

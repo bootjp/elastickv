@@ -80,6 +80,60 @@ class SourceAuditTests(unittest.TestCase):
                 self.assertFalse(sr.eligible(report, OLD, NEW, IMAGE))
                 self.assertEqual("blocked", report["decision"])
 
+    def test_actual_server_flag_registration_defaults_are_blocked(self):
+        registrations = [
+            (
+                "internal/encryptionwiring/kek.go",
+                'fs.BoolVar(&f.Enabled, "encryption-enabled", false, "enable")',
+                "false",
+                "true",
+            ),
+            (
+                "internal/server/commit_ts_fence.go",
+                'fs.BoolVar(&f.commitTSFence, "commitTSFence", false, "fence")',
+                "false",
+                "true",
+            ),
+            (
+                "internal/tsowiring/tso.go",
+                'fs.BoolVar(&f.PhaseDEnabled, "tsoPhaseDEnabled", false, "phase")',
+                "false",
+                "true",
+            ),
+            (
+                "internal/tsowiring/tso.go",
+                'fs.BoolVar(&f.Enabled, "tsoEnabled", false, "enable")',
+                "false",
+                "true",
+            ),
+            (
+                "internal/tsowiring/tso.go",
+                'fs.StringVar(\n &f.ModeFile,\n "tsoModeFile", "", "mode")',
+                '""',
+                '"cutover"',
+            ),
+            (
+                "main.go",
+                'fs.String("tsoMode", "legacy", "mode")',
+                '"legacy"',
+                '"phase-d"',
+            ),
+        ]
+        for path, registration, old, new in registrations:
+            with self.subTest(registration=registration):
+                report = self.assess(path, registration, registration.replace(old, new))
+                self.assertEqual("blocked", report["decision"])
+                self.assertTrue(
+                    any(
+                        f["code"] == "feature-default-activation"
+                        for f in report["findings"]
+                    )
+                )
+                self.assertEqual(
+                    "approval-required",
+                    self.assess(path, registration, registration)["decision"],
+                )
+
     def test_reader_removal_is_blocked(self):
         self.assertEqual(
             "blocked",

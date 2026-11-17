@@ -128,21 +128,24 @@ def version_literals(text):
 
 def feature_defaults(text):
     result = {}
-    for match in re.finditer(
-        r'flag\.(Bool|String)\(\s*"([^"]+)"\s*,\s*(true|false|"[^"]*")', text
-    ):
-        name = re.sub(r"[^a-z]", "", match[2].lower())
-        if any(
-            k in name
-            for k in (
-                "encryption",
-                "committsfence",
-                "timestampbinding",
-                "phased",
-                "tsomode",
-            )
-        ):
-            result[match[2]] = match[3]
+    patterns = (
+        r'\b[A-Za-z_]\w*\.(?:Bool|String)\(\s*"([^"]+)"\s*,\s*(true|false|"[^"]*")',
+        r'\b[A-Za-z_]\w*\.(?:BoolVar|StringVar)\(\s*[^,]+,\s*"([^"]+)"\s*,\s*(true|false|"[^"]*")',
+    )
+    for pattern in patterns:
+        for match in re.finditer(pattern, text):
+            name = re.sub(r"[^a-z]", "", match[1].lower())
+            if any(
+                k in name
+                for k in (
+                    "encryption",
+                    "committsfence",
+                    "timestampbinding",
+                    "phased",
+                    "tso",
+                )
+            ):
+                result[match[1]] = match[2]
     return result
 
 
