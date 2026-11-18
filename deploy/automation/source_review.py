@@ -419,6 +419,110 @@ def analyze(
     return report
 
 
+def active_profile(config, previous):
+    """A trusted, separately reviewed bootstrap profile expires with its baseline."""
+    profile = config.get("relocation_profile")
+    if profile is None:
+        return None
+    validate_profile_identity(profile)
+    return profile if profile["from_source"] == previous else None
+
+
+def candidate_source(config, previous, head):
+    profile = active_profile(config, previous)
+    return profile["to_source"] if profile else head
+
+
+def validate_profile_identity(profile):
+    if (
+        not isinstance(profile, dict)
+        or set(profile)
+        != {"version", "repository", "from_source", "to_source", "image", "relocations"}
+        or type(profile["version"]) is not int
+        or profile["version"] != 1
+        or not all(
+            isinstance(profile[k], str)
+            for k in ("repository", "from_source", "to_source", "image")
+        )
+        or not re.fullmatch(r"[\w.-]+/[\w.-]+", profile["repository"])
+        or not all(
+            re.fullmatch("[0-9a-f]{40}", profile[k])
+            for k in ("from_source", "to_source")
+        )
+        or profile["from_source"] == profile["to_source"]
+        or not re.fullmatch(r"[a-z0-9./_-]+@sha256:[0-9a-f]{64}", profile["image"])
+        or not isinstance(profile["relocations"], list)
+        or not 0 < len(profile["relocations"]) <= 1000
+        or len(canonical(profile)) > 256 * 1024
+    ):
+        raise ValueError("Invalid exact-pair relocation profile")
+
+
+def verified_relocations(profile, identity, inventories):
+    if profile is None:
+        return set(), set()
+    validate_profile_identity(profile)
+    if (
+        tuple(profile[k] for k in ("repository", "from_source", "to_source", "image"))
+        != identity
+    ):
+        raise ValueError("Relocation profile is not for this exact source/image pair")
+    old_tree, new_tree = inventories
+    resolved, targets = set(), set()
+    edges = 0
+    for row in profile["relocations"]:
+        if not isinstance(row, dict) or set(row) != {
+            "old_path",
+            "old_blob",
+            "targets",
+            "review",
+        }:
+            raise ValueError("Invalid relocation entry")
+        prior = row["old_path"]
+        if (
+            not isinstance(prior, str)
+            or prior in resolved
+            or prior.startswith(PERSISTENT)
+            or not prior.endswith((".go", ".proto"))
+            or prior.endswith("_test.go")
+            or prior not in old_tree
+            or prior in new_tree
+            or old_tree[prior]["sha"] != row["old_blob"]
+            or old_tree[prior]["mode"] not in ("100644", "100755")
+            or not isinstance(row["review"], str)
+            or not 0 < len(row["review"].strip()) <= 2000
+            or not isinstance(row["targets"], list)
+            or not row["targets"]
+        ):
+            raise ValueError("Unbound or unsupported nonpersistent relocation")
+        seen = set()
+        for target in row["targets"]:
+            edges += 1
+            if (
+                not isinstance(target, dict)
+                or set(target) != {"path", "blob"}
+                or edges > 1000
+            ):
+                raise ValueError("Invalid or unbounded relocation targets")
+            path = target["path"]
+            if (
+                not isinstance(path, str)
+                or path in seen
+                or path not in new_tree
+                or not path.endswith((".go", ".proto"))
+                or path.endswith("_test.go")
+                or new_tree[path]["mode"] not in ("100644", "100755")
+                or new_tree[path]["sha"] != target["blob"]
+            ):
+                raise ValueError(
+                    "Relocation target does not match immutable implementation"
+                )
+            seen.add(path)
+            targets.add(path)
+        resolved.add(prior)
+    return resolved, targets
+
+
 def collect(
     repository,
     previous,
@@ -428,6 +532,7 @@ def collect(
     fetch_json,
     *,
     limits=None,
+    relocation_profile=None,
     archive=download_archive,
     tick=lambda: None,
 ):
@@ -450,6 +555,9 @@ def collect(
         tick()
         inventories.append(tree_files(fetch_json("git/trees/" + sha + "?recursive=1")))
     old_tree, new_tree = inventories
+    resolved, profile_targets = verified_relocations(
+        relocation_profile, (repository, previous, candidate, image), inventories
+    )
     actual = {
         p
         for p in set(old_tree) | set(new_tree)
@@ -492,6 +600,7 @@ def collect(
         remaining = actual - covered
         unresolved_removal = any(
             path not in new_tree
+            and path not in resolved
             and path.endswith((".go", ".proto"))
             and not path.endswith("_test.go")
             for path in remaining
@@ -519,6 +628,9 @@ def collect(
         described = actual
     elif actual != described:
         raise ValueError("Comparison omitted source changes")
+    described |= profile_targets
+    if len(described) > limits["max_files"]:
+        raise ValueError("Relocation evidence exceeds the complete source file budget")
     contents = []
     total_source_bytes = 0
     for sha, tree in zip((previous, candidate), inventories):
@@ -544,9 +656,24 @@ def collect(
         ):
             raise ValueError("Changed source archive does not match immutable blobs")
         contents.append(data)
-    return analyze(
+    report = analyze(
         repository, previous, candidate, image, changes, inventories, contents, limits
     )
+    if relocation_profile is not None:
+        report["relocation_profile_sha256"] = digest(relocation_profile)
+        report["resolved_nonpersistent_removals"] = sorted(resolved)
+        report["findings"].extend(
+            {
+                "severity": "attention",
+                "code": "reviewed-relocation",
+                "path": path,
+                "detail": "Exact blob-bound assembly disposition from the trusted bootstrap profile",
+            }
+            for path in sorted(resolved)
+        )
+    if len(canonical(report)) > 900 * 1024:
+        raise ValueError("Relocation report exceeds its publication budget")
+    return report
 
 
 def eligible(report, previous, candidate, image):

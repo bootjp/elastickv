@@ -5,6 +5,7 @@ import base64
 import datetime as dt
 import fnmatch
 import hashlib
+import http.client
 import json
 import os
 import pathlib
@@ -34,10 +35,40 @@ class ReleaseError(Exception):
     pass
 
 
+READINESS_REASONS = frozenset(
+    {
+        "starting",
+        "engine_failed",
+        "engine_stopped",
+        "snapshot_restoring",
+        "observation_failed",
+        "observation_unavailable",
+        "observation_stale",
+        "configuration_unavailable",
+        "not_a_voter",
+        "leader_unknown",
+        "membership_changing",
+        "leader_contact_stale",
+        "not_participating",
+        "apply_regressed",
+        "catching_up",
+        "apply_stalled",
+    }
+)
+
+
 class HttpReleaseError(ReleaseError):
-    def __init__(self, status, method, path):
+    def __init__(self, status, method, path, readiness_reason=None):
         self.status = status
-        super().__init__(f"HTTP {status}: {method} {path}")
+        self.method = method
+        self.path = urllib.parse.urlsplit(path).path
+        self.readiness_reason = (
+            readiness_reason
+            if isinstance(readiness_reason, str)
+            and readiness_reason in READINESS_REASONS
+            else None
+        )
+        super().__init__(f"HTTP {status}: {method} {self.path}")
 
 
 class LostLease(ReleaseError):
@@ -45,6 +76,10 @@ class LostLease(ReleaseError):
 
 
 class UnsafeState(ReleaseError):
+    pass
+
+
+class ReadinessSettling(ReleaseError):
     pass
 
 
@@ -71,10 +106,23 @@ def http_json(url, method="GET", data=None, headers=None, context=None):
     except urllib.error.HTTPError as exc:
         # Never copy request headers, response contents, or credentials into logs.
         status = exc.code
+        path = urllib.parse.urlsplit(url).path
+        reason = None
+        if path == "/readyz":
+            try:
+                raw = exc.read(4097)
+                if len(raw) <= 4096:
+                    payload = json.loads(raw)
+                    if (
+                        isinstance(payload, dict)
+                        and isinstance(payload.get("reason"), str)
+                        and payload["reason"] in READINESS_REASONS
+                    ):
+                        reason = payload["reason"]
+            except (ValueError, OSError, RecursionError, http.client.HTTPException):
+                pass
         exc.close()
-        raise HttpReleaseError(
-            status, method, urllib.parse.urlsplit(url).path
-        ) from None
+        raise HttpReleaseError(status, method, path, reason) from None
 
 
 def ci_ready(runs, sha, required, codeql_workflow_id=None):
@@ -832,11 +880,54 @@ class Runtime:
         self.wait(lambda: self.quorum(self.pods()) == target, 90)
         return target
 
+    def _readiness_settling(self, pods, release):
+        for pod in pods.values():
+            if pod_ready(pod):
+                continue
+            image = next(
+                (
+                    c["image"]
+                    for c in pod["spec"]["containers"]
+                    if c["name"] == "elastickv"
+                ),
+                None,
+            )
+            address = pod.get("status", {}).get("podIP")
+            if (
+                pod["metadata"].get("deletionTimestamp")
+                or image != release["image"]
+                or not address
+            ):
+                return False
+            try:
+                result = http_json("http://" + address + ":8081/readyz")
+            except HttpReleaseError as error:
+                if not self._expected_snapshot_restore(error):
+                    raise
+            else:
+                if result.get("ready") is not True:
+                    return False
+        return True
+
+    @staticmethod
+    def _expected_snapshot_restore(error):
+        return (
+            error.status == 503
+            and error.method == "GET"
+            and error.path == "/readyz"
+            and error.readiness_reason == "snapshot_restoring"
+        )
+
     def verify(self, release, canary=True):
         self.lease.tick()
         self.check_qualified_storage()
         pods = self.pods()
         if not all(pod_ready(p) for p in pods.values()):
+            if self._readiness_settling(pods, release):
+                self.quorum(pods)
+                raise ReadinessSettling(
+                    "Snapshot restoration or probe update is pending"
+                )
             raise ReleaseError("Not all three voters are Ready")
         self.quorum(pods)
         if release.get("readiness"):
@@ -856,11 +947,38 @@ class Runtime:
             self.canary()
 
     def accept(self, release):
-        end = time.monotonic() + self.policy["healthy_window"]
+        deadline = time.monotonic() + self.policy["startup_timeout"]
+        healthy_since = None
+        waiting = False
         while True:
-            self.verify(release, canary=False)
-            if time.monotonic() >= end:
-                break
+            try:
+                self.verify(release, canary=False)
+            except ReadinessSettling:
+                healthy_since = None
+            except HttpReleaseError as error:
+                if not self._expected_snapshot_restore(error):
+                    raise
+                healthy_since = None
+            else:
+                now = time.monotonic()
+                if healthy_since is None:
+                    healthy_since = now
+                if (
+                    now <= deadline
+                    and now - healthy_since >= self.policy["healthy_window"]
+                ):
+                    break
+                waiting = False
+            if healthy_since is None and not waiting:
+                log(
+                    "release-awaiting-readiness",
+                    reason="snapshot_restore_or_probe_settling",
+                )
+                waiting = True
+            if time.monotonic() >= deadline:
+                raise ReleaseError(
+                    "Readiness did not stabilize before the acceptance deadline"
+                )
             time.sleep(3)
         self.canary()
 
@@ -1188,7 +1306,16 @@ class Manager:
             except (LostLease, UnsafeState):
                 raise
             except Exception as exc:
-                log("release-failed", error=type(exc).__name__)
+                fields = {"error": type(exc).__name__}
+                if isinstance(exc, HttpReleaseError):
+                    fields.update(
+                        http_status=exc.status,
+                        http_method=exc.method,
+                        http_path=exc.path,
+                    )
+                    if exc.readiness_reason is not None:
+                        fields["readiness_reason"] = exc.readiness_reason
+                log("release-failed", **fields)
                 transaction["phase"] = "rollback"
                 state.setdefault("quarantined", []).append(transaction["to"]["image"])
                 self.store.commit(

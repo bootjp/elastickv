@@ -587,7 +587,13 @@ def run():
         return
     public = "https://api.github.com/repos/" + policy["repository"]
     main_sha = agent.http_json(public + "/commits/" + SITE["source_branch"])["sha"]
-    sha = main_sha
+    sha = source_review.candidate_source(config, baseline["source"], main_sha)
+    if sha != main_sha and agent.http_json(
+        public + "/compare/" + sha + "..." + main_sha
+    ).get("status") not in ("ahead", "identical"):
+        raise agent.UnsafeState(
+            "Bootstrap candidate is not on the configured source branch"
+        )
     if sha == baseline["source"]:
         agent.log("compatibility-current", source=sha)
         return
@@ -638,6 +644,7 @@ def run():
             comparison,
             lambda path: agent.http_json(public + "/" + path),
             limits=config.get("source_review_limits"),
+            relocation_profile=source_review.active_profile(config, baseline["source"]),
             tick=lease.tick,
         )
         eligible = source_review.eligible(source, baseline["source"], sha, image)

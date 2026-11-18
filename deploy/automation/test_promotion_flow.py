@@ -26,6 +26,14 @@ class PromotionFlowTests(unittest.TestCase):
     def test_audited_proposal_waits_for_exact_consent_then_merges_and_permits_release(
         self,
     ):
+        self.exercise()
+
+    def test_exact_relocation_profile_still_requires_consent_and_trusted_revalidation(
+        self,
+    ):
+        self.exercise(with_relocations=True)
+
+    def exercise(self, with_relocations=False):
         fixture = fixtures.ApprovalTests()
         fixture.setUp()
         self.addCleanup(fixture.doCleanups)
@@ -73,6 +81,33 @@ class PromotionFlowTests(unittest.TestCase):
             "old": {"store/read.go": b"func read() int { return 1 }"},
             "new": {"store/read.go": b"func read() int { return 2 }"},
         }
+        if with_relocations:
+            source["old"]["assembly.go"] = b"func oldAssembly() {}"
+            source["new"]["internal/server/assembly.go"] = b"func newAssembly() {}"
+            config["relocation_profile"] = {
+                "version": 1,
+                "repository": policy["repository"],
+                "from_source": OLD,
+                "to_source": NEW,
+                "image": IMAGE,
+                "relocations": [
+                    {
+                        "old_path": "assembly.go",
+                        "old_blob": source_review.git_blob(
+                            source["old"]["assembly.go"]
+                        ),
+                        "targets": [
+                            {
+                                "path": "internal/server/assembly.go",
+                                "blob": source_review.git_blob(
+                                    source["new"]["internal/server/assembly.go"]
+                                ),
+                            }
+                        ],
+                        "review": "Reviewed exact assembly split; no contract blocker is overridden.",
+                    }
+                ],
+            }
         inventories = {
             sha: {
                 p: {
@@ -88,7 +123,17 @@ class PromotionFlowTests(unittest.TestCase):
         }
         comparison = {
             "status": "ahead",
-            "files": [{"filename": "store/read.go", "status": "modified"}],
+            "files": [
+                {
+                    "filename": p,
+                    "status": "added"
+                    if p not in source["old"]
+                    else "removed"
+                    if p not in source["new"]
+                    else "modified",
+                }
+                for p in sorted(source["old"].keys() | source["new"].keys())
+            ],
         }
 
         def source_fetch(path):
@@ -106,6 +151,7 @@ class PromotionFlowTests(unittest.TestCase):
             comparison,
             source_fetch,
             archive=archive,
+            relocation_profile=config.get("relocation_profile"),
         )
         spec = (
             "spec:\n  template:\n    spec:\n      containers:\n      - name: elastickv\n        image: "
