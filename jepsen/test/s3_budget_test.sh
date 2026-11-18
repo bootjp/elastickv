@@ -5,7 +5,7 @@ set -euo pipefail
 source "$(dirname "$0")/../s3_budget.sh"
 
 s3_budget 16 250
-[[ "$S3_KEY_COUNT" == 125 && "$S3_MAX_OPS_PER_KEY" == 32 ]]
+[[ "$S3_KEY_COUNT" == 250 && "$S3_MAX_OPS_PER_KEY" == 16 ]]
 
 s3_budget 3 7
 [[ "$S3_KEY_COUNT" == 3 && "$S3_MAX_OPS_PER_KEY" == 7 ]]
