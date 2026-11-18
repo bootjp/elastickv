@@ -974,7 +974,7 @@ func (d *DynamoDBServer) buildTransactPutPlan(
 	}
 	currentLocation, found, err := d.readLogicalItemAt(ctx, schema, keyAttrs, readTS)
 	if err != nil {
-		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+		return nil, err
 	}
 	var current map[string]attributeValue
 	if found {
@@ -1012,7 +1012,7 @@ func (d *DynamoDBServer) buildTransactUpdatePlan(
 	}
 	currentLocation, found, err := d.readLogicalItemAt(ctx, schema, in.Key, readTS)
 	if err != nil {
-		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+		return nil, err
 	}
 	var current map[string]attributeValue
 	if !found {
@@ -1056,7 +1056,7 @@ func (d *DynamoDBServer) buildTransactDeletePlan(
 	}
 	currentLocation, found, err := d.readLogicalItemAt(ctx, schema, in.Key, readTS)
 	if err != nil {
-		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+		return nil, err
 	}
 	current := map[string]attributeValue(nil)
 	if found {
@@ -1103,7 +1103,7 @@ func (d *DynamoDBServer) buildTransactConditionCheckPlan(
 	}
 	currentLocation, found, err := d.readLogicalItemAt(ctx, schema, in.Key, readTS)
 	if err != nil {
-		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+		return nil, err
 	}
 	current := map[string]attributeValue(nil)
 	if found {
@@ -1190,14 +1190,14 @@ func (d *DynamoDBServer) resolveTransactTableSchema(ctx context.Context, cache m
 }
 
 func isRetryableTransactWriteError(err error) bool {
-	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) || isIndeterminateMutationDispatchFailure(err) {
 		return false
 	}
 	return errors.Is(err, store.ErrWriteConflict) || errors.Is(err, kv.ErrTxnLocked) || isRouteWriteFencedError(err)
 }
 
 func isIgnorableTransactRaceError(err error) bool {
-	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) || isIndeterminateMutationDispatchFailure(err) {
 		return false
 	}
 	// Route fences reject before applying the write. They must be retried or
@@ -1206,7 +1206,12 @@ func isIgnorableTransactRaceError(err error) bool {
 }
 
 func shouldPreserveTransactWriteAttempt(err error) bool {
-	return isRetryableTransactWriteError(err) && !isRouteWriteFencedError(err)
+	// Only an indexed apply rejection or a validated Forward verdict proves
+	// this conflict did not apply. A raw conflict can follow a landed write;
+	// keep its write set for the prior-attempt dedup probe.
+	return isRetryableTransactWriteError(err) &&
+		!isRouteWriteFencedError(err) &&
+		(!errors.Is(err, store.ErrWriteConflict) || !kv.IsCertifiedOnePhaseConflict(err))
 }
 
 func waitTransactRetryBackoff(ctx context.Context, delay time.Duration) error {

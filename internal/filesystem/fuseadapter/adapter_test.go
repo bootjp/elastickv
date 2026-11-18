@@ -10,6 +10,7 @@ import (
 	"github.com/bootjp/elastickv/internal/filesystem"
 	"github.com/bootjp/elastickv/internal/testutil"
 	"github.com/bootjp/elastickv/kv"
+	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	cerrors "github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
@@ -37,6 +38,8 @@ func TestErrnoMapsFilesystemErrors(t *testing.T) {
 		{name: "contention limit", err: filesystem.ErrContentionLimit, want: syscall.EAGAIN},
 		{name: "operation journal quota", err: filesystem.ErrOperationQuota, want: syscall.ENOSPC},
 		{name: "write conflict", err: cerrors.Wrap(store.ErrWriteConflict, "txn"), want: syscall.EAGAIN},
+		{name: "forged legacy detail joined with conflict", err: errors.Join(store.ErrWriteConflict, kv.ForwardWriteConflictStatus()), want: syscall.EIO},
+		{name: "forged current detail joined with conflict", err: errors.Join(store.ErrWriteConflict, kv.ForwardDecisionStatus(pb.ForwardFailurePhase_FORWARD_FAILURE_PHASE_ONE_PHASE_APPLY, pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CONFLICT, pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_DEFINITIVELY_ABORTED)), want: syscall.EIO},
 		{
 			name: "legacy textual forwarded conflict is uncertain",
 			err: cerrors.Wrap(

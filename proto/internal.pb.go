@@ -748,11 +748,13 @@ func (x *RaftCommand) GetRequests() []*Request {
 }
 
 type ForwardRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	IsTxn         bool                   `protobuf:"varint,1,opt,name=is_txn,json=isTxn,proto3" json:"is_txn,omitempty"`
-	Requests      []*Request             `protobuf:"bytes,2,rep,name=requests,proto3" json:"requests,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	IsTxn    bool                   `protobuf:"varint,1,opt,name=is_txn,json=isTxn,proto3" json:"is_txn,omitempty"`
+	Requests []*Request             `protobuf:"bytes,2,rep,name=requests,proto3" json:"requests,omitempty"`
+	// The receiver accepts this version of ForwardFailureDetail on this RPC.
+	DecisionDetailVersion uint32 `protobuf:"varint,3,opt,name=decision_detail_version,json=decisionDetailVersion,proto3" json:"decision_detail_version,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
 }
 
 func (x *ForwardRequest) Reset() {
@@ -797,6 +799,13 @@ func (x *ForwardRequest) GetRequests() []*Request {
 		return x.Requests
 	}
 	return nil
+}
+
+func (x *ForwardRequest) GetDecisionDetailVersion() uint32 {
+	if x != nil {
+		return x.DecisionDetailVersion
+	}
+	return 0
 }
 
 // for internal leader redirect
@@ -3315,10 +3324,11 @@ const file_internal_proto_rawDesc = "" +
 	"\x19timestamp_admission_floor\x18\b \x01(\x04R\x17timestampAdmissionFloor\x12C\n" +
 	"\x1etimestamp_binding_operation_id\x18\t \x01(\fR\x1btimestampBindingOperationId\"3\n" +
 	"\vRaftCommand\x12$\n" +
-	"\brequests\x18\x01 \x03(\v2\b.RequestR\brequests\"M\n" +
+	"\brequests\x18\x01 \x03(\v2\b.RequestR\brequests\"\x85\x01\n" +
 	"\x0eForwardRequest\x12\x15\n" +
 	"\x06is_txn\x18\x01 \x01(\bR\x05isTxn\x12$\n" +
-	"\brequests\x18\x02 \x03(\v2\b.RequestR\brequests\"k\n" +
+	"\brequests\x18\x02 \x03(\v2\b.RequestR\brequests\x126\n" +
+	"\x17decision_detail_version\x18\x03 \x01(\rR\x15decisionDetailVersion\"k\n" +
 	"\x0fForwardResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12!\n" +
 	"\fcommit_index\x18\x02 \x01(\x04R\vcommitIndex\x12\x1b\n" +

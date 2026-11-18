@@ -40,10 +40,8 @@ type dedupTestCoordinator struct {
 	// WITHOUT applying — an ambiguous retryable error distinct from
 	// WriteConflict, exercising the "advance pending.commitTS and retry" branch.
 	txnLockedAtDispatch int
-	// wireWriteConflicts converts every typed write conflict this test
-	// coordinator returns into the keyed gRPC status produced by leader
-	// forwarding. It exercises adapter-side type restoration without changing
-	// the underlying landed-vs-not-landed scenario.
+	// wireWriteConflicts converts conflicts into an old peer's unproven
+	// ErrorInfo status. The adapter must not restore its type or retry.
 	wireWriteConflicts bool
 	// routeFenceAtDispatch makes the named dispatch return ErrRouteWriteFenced
 	// before the FSM dedup probe or apply. It is retryable but cannot be
@@ -551,7 +549,7 @@ func TestListPushDedup_GenuineConflictRecomputes(t *testing.T) {
 	ctx := context.Background()
 	st := store.NewMVCCStore()
 	coord := newDedupTestCoordinator(st, 1, false) // attempt 1 errors without landing
-	coord.wireWriteConflicts = true                // forwarded conflict loses its typed chain
+	// The trusted Forward classifier has already returned a typed conflict.
 	key := []byte("mylist")
 	// Before the reuse (dispatch 2), simulate another client's RPUSH landing
 	// at seq 0 so the reuse conflicts and must recompute.

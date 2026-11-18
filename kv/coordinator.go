@@ -1642,8 +1642,9 @@ func (c *Coordinate) toForwardRequest(reqs []*pb.Request) *pb.ForwardRequest {
 	}
 
 	out := &pb.ForwardRequest{
-		IsTxn:    reqs[0].IsTxn,
-		Requests: make([]*pb.Request, 0, len(reqs)),
+		IsTxn:                 reqs[0].IsTxn,
+		Requests:              make([]*pb.Request, 0, len(reqs)),
+		DecisionDetailVersion: ForwardDecisionSchemaVersion,
 	}
 	out.Requests = reqs
 

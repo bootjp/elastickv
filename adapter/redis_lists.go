@@ -230,10 +230,8 @@ func (r *RedisServer) dispatchListPushReuse(ctx context.Context, key []byte, pen
 	if dispErr == nil {
 		return r.resolveReuseLength(ctx, key, pending), false, nil
 	}
-	// This path owns an exact reusable write set plus PrevCommitTS, so it can
-	// safely opt in to retrying an otherwise-ambiguous forwarded conflict.
-	// Normalize before the typed conflict branch; generic Redis writes keep
-	// raw wire write conflicts fail-closed.
+	// Exact write-set reuse is allowed for a typed, proven conflict. An
+	// unclassified Forward status remains unknown even with PrevCommitTS.
 	dispErr = normalizeRetryableRedisTxnErr(dispErr)
 	if errors.Is(dispErr, kv.ErrTransactionOutcomeUnknown) {
 		return 0, false, dispErr
@@ -442,8 +440,8 @@ func (r *RedisServer) listPushCoreWithDedup(ctx context.Context, key []byte, val
 			newLen = updatedMeta.Len
 			return nil
 		}
-		// Preserve the exact attempt for a forwarded conflict only after
-		// restoring its typed form. The next iteration can then reuse these
+		// Preserve the exact attempt only for a typed, proven conflict. The next
+		// iteration can then reuse these
 		// operations instead of recomputing a second list append.
 		dispErr = normalizeRetryableRedisTxnErr(dispErr)
 		// Only remember the attempt for reuse if retryRedisWrite will actually

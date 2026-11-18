@@ -4,6 +4,7 @@ import (
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
+	"google.golang.org/grpc/status"
 )
 
 // IsWriteConflict reports a definitive OCC rejection. The leader proxy
@@ -13,17 +14,20 @@ func IsWriteConflict(err error) bool {
 	if err == nil {
 		return false
 	}
+	if _, ok := status.FromError(err); ok {
+		return false
+	}
 	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
 		return false
 	}
 	return errors.Is(err, store.ErrWriteConflict)
 }
 
-// Root initialization may retry only a definitive conflict. An unknown reply
-// is handled by a separate read-only check of the root inode.
+// Root initialization may retry only a local, typed definitive conflict. An
+// unknown Forward reply is handled by a separate read-only check of the root.
 func isRootInitializationConflict(err error) bool {
 	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
 		return false
 	}
-	return IsWriteConflict(err) || kv.IsForwardWriteConflict(err)
+	return IsWriteConflict(err)
 }

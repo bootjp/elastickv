@@ -18,13 +18,14 @@ const (
 	forwardComposed1GCdReason  = "COMPOSED1_VERSION_GCD"
 )
 
-// ForwardWriteConflictStatus marks a conflict rejected before commit. Storage
-// keys remain in store errors and never cross the forwarding seam.
+// ForwardWriteConflictStatus is the legacy wire encoding, retained to model
+// old peers. Its ErrorInfo lacks phase and decision proof and cannot certify
+// a retry, even when received by Internal.Forward.
 func ForwardWriteConflictStatus() error {
 	return forwardStatus(codes.Aborted, store.ErrWriteConflict.Error(), forwardWriteConflictReason)
 }
 
-// ForwardTxnLockedStatus marks a transaction rejected by an existing lock.
+// ForwardTxnLockedStatus is the legacy wire encoding for a lock cause.
 func ForwardTxnLockedStatus() error {
 	return forwardStatus(codes.Aborted, ErrTxnLocked.Error(), forwardTxnLockedReason)
 }
@@ -42,8 +43,7 @@ func ForwardComposed1Status(err error) error {
 	}
 }
 
-// ForwardNotLeaderStatus marks a request rejected before timestamp admission
-// or transaction submission on the receiving node.
+// ForwardNotLeaderStatus is the legacy wire encoding for a leader cause.
 func ForwardNotLeaderStatus() error {
 	return forwardStatus(codes.Unavailable, "not leader", forwardNotLeaderReason)
 }
@@ -57,49 +57,4 @@ func forwardStatus(code codes.Code, message, reason string) error {
 		return errors.WithStack(status.Error(codes.Internal, "forward status detail unavailable"))
 	}
 	return errors.WithStack(st.Err())
-}
-
-// IsForwardWriteConflict accepts only the status produced by the forwarding
-// endpoint, not an arbitrary Aborted status with similar display text.
-func IsForwardWriteConflict(err error) bool {
-	return hasForwardStatusDetail(err, codes.Aborted, forwardWriteConflictReason)
-}
-
-// IsForwardTxnLocked identifies a definitive lock rejection.
-func IsForwardTxnLocked(err error) bool {
-	return hasForwardStatusDetail(err, codes.Aborted, forwardTxnLockedReason)
-}
-
-// IsForwardComposed1Violation identifies a route rejection by its detail.
-func IsForwardComposed1Violation(err error) bool {
-	return hasForwardStatusDetail(err, codes.FailedPrecondition, forwardComposed1Reason)
-}
-
-// IsForwardComposed1VersionGCd identifies an expired-route rejection.
-func IsForwardComposed1VersionGCd(err error) bool {
-	return hasForwardStatusDetail(err, codes.FailedPrecondition, forwardComposed1GCdReason)
-}
-
-// IsForwardNotLeader identifies the pre-submission leader rejection.
-func IsForwardNotLeader(err error) bool {
-	return hasForwardStatusDetail(err, codes.Unavailable, forwardNotLeaderReason)
-}
-
-func hasForwardStatusDetail(err error, code codes.Code, reason string) bool {
-	_, ok := forwardStatusInfo(err, code, reason)
-	return ok
-}
-
-func forwardStatusInfo(err error, code codes.Code, reason string) (*errdetails.ErrorInfo, bool) {
-	st, ok := status.FromError(err)
-	if !ok || st.Code() != code {
-		return nil, false
-	}
-	for _, detail := range st.Details() {
-		if info, ok := detail.(*errdetails.ErrorInfo); ok &&
-			info.GetDomain() == forwardErrorDomain && info.GetReason() == reason {
-			return info, true
-		}
-	}
-	return nil, false
 }

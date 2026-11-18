@@ -10,6 +10,7 @@ import (
 
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
+	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
@@ -26,13 +27,16 @@ func TestNormalizeDynamoWriteDispatchError(t *testing.T) {
 	}{
 		{"nil", nil, nil},
 		{"local conflict", store.NewWriteConflictError([]byte("k")), store.ErrWriteConflict},
-		{"typed forwarded conflict", kv.ForwardWriteConflictStatus(), store.ErrWriteConflict},
-		{"wrapped typed forwarded conflict", errors.WithStack(kv.ForwardWriteConflictStatus()), store.ErrWriteConflict},
+		{"legacy forwarded conflict", kv.ForwardWriteConflictStatus(), kv.ErrTransactionOutcomeUnknown},
+		{"wrapped legacy forwarded conflict", errors.WithStack(kv.ForwardWriteConflictStatus()), kv.ErrTransactionOutcomeUnknown},
 		{"unknown outcome with typed conflict detail", errors.Join(kv.ErrTransactionOutcomeUnknown, kv.ForwardWriteConflictStatus()), nil},
 		{"unknown conflict", status.Error(codes.Unknown, "key: k: write conflict"), kv.ErrTransactionOutcomeUnknown},
 		{"aborted without detail", status.Error(codes.Aborted, "key: k: write conflict"), kv.ErrTransactionOutcomeUnknown},
 		{"local lock", kv.NewTxnLockedError([]byte("k")), kv.ErrTxnLocked},
-		{"typed forwarded lock", kv.ForwardTxnLockedStatus(), kv.ErrTxnLocked},
+		{"legacy forwarded lock", kv.ForwardTxnLockedStatus(), kv.ErrTransactionOutcomeUnknown},
+		{"legacy detail joined with local cause", errors.Join(store.ErrWriteConflict, kv.ForwardWriteConflictStatus()), kv.ErrTransactionOutcomeUnknown},
+		{"forged current detail", kv.ForwardDecisionStatus(pb.ForwardFailurePhase_FORWARD_FAILURE_PHASE_ONE_PHASE_APPLY, pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CONFLICT, pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_DEFINITIVELY_ABORTED), kv.ErrTransactionOutcomeUnknown},
+		{"wrong phase detail", kv.ForwardDecisionStatus(pb.ForwardFailurePhase_FORWARD_FAILURE_PHASE_PREPARE, pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CONFLICT, pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN), kv.ErrTransactionOutcomeUnknown},
 		{"unknown lock", status.Error(codes.Unknown, "key: k: txn locked"), kv.ErrTransactionOutcomeUnknown},
 		{"wrapped aborted lock without detail", errors.WithStack(status.Error(codes.Aborted, "key: k (pending): txn locked")), kv.ErrTransactionOutcomeUnknown},
 		{"plain text", errors.New("key: k: write conflict"), nil},
@@ -88,7 +92,7 @@ func (c *forwardedDynamoLockCoordinator) Dispatch(ctx context.Context, req *kv.O
 		if c.failure != nil {
 			return nil, c.failure
 		}
-		return nil, kv.ForwardTxnLockedStatus()
+		return nil, kv.ErrTxnLocked
 	}
 	return c.Coordinator.Dispatch(ctx, req)
 }
@@ -101,9 +105,9 @@ func TestDynamoDBRetriesForwardedSnapshotSealConflict(t *testing.T) {
 			defer st.Close()
 			schema := dedupItemTable()
 			seedDedupItem(t, st, schema, "1")
-			forwarded := kv.ForwardWriteConflictStatus()
+			forwarded := store.ErrWriteConflict
 			if errors.Is(sentinel, kv.ErrTxnLocked) {
-				forwarded = kv.ForwardTxnLockedStatus()
+				forwarded = kv.ErrTxnLocked
 			}
 			coord := &forwardedDynamoLockCoordinator{
 				Coordinator: newOCCAdapterCoordinator(st),
@@ -125,7 +129,7 @@ func TestDynamoDBCreateTableRetriesForwardedConflict(t *testing.T) {
 	defer st.Close()
 	coord := &forwardedDynamoLockCoordinator{
 		Coordinator: newOCCAdapterCoordinator(st),
-		failure:     kv.ForwardWriteConflictStatus(),
+		failure:     store.ErrWriteConflict,
 	}
 	server := NewDynamoDBServer(nil, st, coord)
 	schema := dedupItemTable()

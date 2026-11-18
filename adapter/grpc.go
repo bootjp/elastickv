@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
@@ -270,7 +271,7 @@ func (r *GRPCServer) rawGroupWatermark(ctx context.Context, groupID uint64) (*pb
 	}
 	ts, err := reader.GroupCommittedTimestampFloor(ctx, groupID)
 	if err != nil {
-		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, err.Error()))
+		return nil, rawGroupWatermarkError(err)
 	}
 	return &pb.RawLatestCommitTSResponse{
 		Ts:           ts,
@@ -278,6 +279,23 @@ func (r *GRPCServer) rawGroupWatermark(ctx context.Context, groupID uint64) (*pb
 		GroupId:      groupID,
 		LeaderFenced: true,
 	}, nil
+}
+
+func rawGroupWatermarkError(err error) error {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return errors.WithStack(status.Error(codes.Canceled, "group watermark canceled"))
+	case errors.Is(err, context.DeadlineExceeded):
+		return errors.WithStack(status.Error(codes.DeadlineExceeded, "group watermark deadline exceeded"))
+	case errors.Is(err, kv.ErrLeaderNotFound),
+		errors.Is(err, kv.ErrTSOCommitFloorUnavailable),
+		errors.Is(err, raftengine.ErrNotLeader),
+		errors.Is(err, raftengine.ErrLeadershipLost),
+		errors.Is(err, raftengine.ErrLeadershipTransferInProgress):
+		return errors.WithStack(status.Error(codes.Unavailable, "group watermark unavailable"))
+	default:
+		return errors.WithStack(status.Error(codes.Internal, "group watermark failed"))
+	}
 }
 
 func (r *GRPCServer) RawLatestCommitTS(ctx context.Context, req *pb.RawLatestCommitTSRequest) (*pb.RawLatestCommitTSResponse, error) {

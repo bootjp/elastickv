@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	pb "github.com/bootjp/elastickv/proto"
+	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/genproto/googleapis/rpc/errdetails"
@@ -14,6 +15,11 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 )
+
+func TestCoordinateForwardAdvertisesDecisionDetailVersion(t *testing.T) {
+	req := (&Coordinate{}).toForwardRequest([]*pb.Request{{Phase: pb.Phase_NONE}})
+	require.Equal(t, ForwardDecisionSchemaVersion, req.GetDecisionDetailVersion())
+}
 
 func TestForwardDecisionStatusAllowedPairs(t *testing.T) {
 	const (
@@ -136,7 +142,7 @@ func TestForwardDecisionStatusContainsNoKeyBytes(t *testing.T) {
 	require.NotContains(t, err.Error(), "write conflict")
 }
 
-func TestForwardDecisionStatusCannotLookDefinitiveToLegacyDecoder(t *testing.T) {
+func TestForwardDecisionUnknownNeverBecomesDefinitive(t *testing.T) {
 	t.Parallel()
 	for _, reason := range []pb.ForwardFailureReason{
 		pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CONFLICT,
@@ -148,11 +154,9 @@ func TestForwardDecisionStatusCannotLookDefinitiveToLegacyDecoder(t *testing.T) 
 			reason,
 			pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN,
 		)
-		require.False(t, IsForwardWriteConflict(err))
-		require.False(t, IsForwardTxnLocked(err))
-		require.False(t, IsForwardNotLeader(err))
-		require.False(t, IsForwardComposed1Violation(err))
-		require.False(t, IsForwardComposed1VersionGCd(err))
+		classified := classifyForwardRPCError(err, []*pb.Request{{Phase: pb.Phase_NONE}})
+		require.ErrorIs(t, classified, ErrTransactionOutcomeUnknown)
+		require.NotErrorIs(t, classified, store.ErrWriteConflict)
 		require.False(t, isTransientLeaderError(err))
 	}
 }

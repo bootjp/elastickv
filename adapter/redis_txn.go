@@ -3198,10 +3198,8 @@ func (r *RedisServer) dispatchExecReuse(ctx context.Context, pending *reusableEx
 	if dispErr == nil {
 		return pending.results, false, nil
 	}
-	// This path owns an exact reusable write set plus PrevCommitTS, so it can
-	// safely opt in to retrying an otherwise-ambiguous forwarded conflict.
-	// Normalize before the typed conflict branch; the generic retry loop keeps
-	// raw wire write conflicts fail-closed for callers without this protection.
+	// Exact write-set reuse permits a typed, proven conflict retry. An
+	// unclassified Forward status stays unknown even with PrevCommitTS.
 	dispErr = normalizeRetryableRedisTxnErr(dispErr)
 	if errors.Is(dispErr, kv.ErrTransactionOutcomeUnknown) {
 		return nil, false, dispErr
@@ -3379,8 +3377,8 @@ func (r *RedisServer) firstExecAttempt(dispatchCtx context.Context, queue []redc
 		ObservedRouteVersion: routeVersion.observedRouteVersion(),
 	}
 	if _, dispErr := kv.DispatchWithReadTimestamp(prepared.ctx, r.coordinator, group); dispErr != nil {
-		// Preserve the exact attempt for a forwarded conflict only after
-		// restoring its typed form. runTransactionWithDedup can then reuse this
+		// Preserve the exact attempt only for a typed, proven conflict.
+		// runTransactionWithDedup can then reuse this
 		// write set instead of replaying the EXEC body from a new snapshot.
 		dispErr = normalizeRetryableRedisTxnErr(dispErr)
 		// Only remember the attempt when the dispatch outcome is ambiguous.
@@ -3403,7 +3401,8 @@ func (r *RedisServer) firstExecAttempt(dispatchCtx context.Context, queue []redc
 }
 
 func isAmbiguousRedisExecDispatchErr(err error) bool {
-	return !errors.Is(err, kv.ErrTransactionOutcomeUnknown) && errors.Is(err, store.ErrWriteConflict)
+	return !errors.Is(err, kv.ErrTransactionOutcomeUnknown) && !isRedisTransportUncertain(err) &&
+		errors.Is(err, store.ErrWriteConflict)
 }
 
 func (r *RedisServer) beginTxnReadTimestamp(ctx context.Context, label string) (kv.ReadTimestamp, error) {

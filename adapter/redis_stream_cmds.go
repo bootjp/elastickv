@@ -365,8 +365,8 @@ type reusableXAdd struct {
 
 // xaddTxnWithDedup retries XADD only through exact write-set reuse. This is the
 // opt-in counterpart to retryRedisWrite's fail-closed treatment of raw wire
-// write conflicts: the retained write set and PrevCommitTS make a retry safe
-// even when the forwarded response was lost after the leader applied it.
+// errors: the retained write set and PrevCommitTS permit a proven conflict
+// retry, but a lost Forward response remains unknown.
 func (r *RedisServer) xaddTxnWithDedup(ctx context.Context, key []byte, req xaddRequest) (string, error) {
 	var id string
 	var pending *reusableXAdd
@@ -424,8 +424,8 @@ func (r *RedisServer) firstXAddAttempt(
 		return prepared.id, nil, nil
 	}
 
-	// This path owns the exact ID and write set, so it can safely restore a
-	// forwarded conflict to its typed form before entering retryRedisWrite.
+	// The exact ID and write set permit retry only after the KV boundary has
+	// returned a typed, proven conflict.
 	dispErr = normalizeRetryableRedisTxnErr(dispErr)
 	if !shouldPreserveRedisTxnAttempt(dispErr) {
 		return "", nil, cockerrors.WithStack(dispErr)

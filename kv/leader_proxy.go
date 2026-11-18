@@ -32,11 +32,6 @@ const leaderProxyRetryInterval = 25 * time.Millisecond
 // again without a durable operation identity and an authoritative resolution.
 var ErrTransactionOutcomeUnknown = errors.New("transaction outcome unknown")
 
-// Only the leader's structured rejection certifies a definitive OCC conflict.
-func isDefinitiveForwardConflict(err error) bool {
-	return IsForwardWriteConflict(err)
-}
-
 // LeaderProxy forwards transactional requests to the current raft leader when
 // the local node is not the leader.
 type LeaderProxy struct {
@@ -249,6 +244,7 @@ func (p *LeaderProxy) runForwardCycle(callerCtx context.Context, parentCtx conte
 func isTerminalForwardError(err error) bool {
 	return errors.Is(err, ErrTransactionOutcomeUnknown) ||
 		errors.Is(err, store.ErrWriteConflict) ||
+		errors.Is(err, ErrRouteWriteFenced) ||
 		errors.Is(err, ErrTxnLocked) ||
 		errors.Is(err, ErrComposed1Violation) ||
 		errors.Is(err, ErrComposed1VersionGCd)
@@ -298,8 +294,9 @@ func (p *LeaderProxy) forward(callerCtx context.Context, parentCtx context.Conte
 	defer cancel()
 
 	resp, err := cli.Forward(ctx, &pb.ForwardRequest{
-		IsTxn:    reqs[0].IsTxn,
-		Requests: reqs,
+		IsTxn:                 reqs[0].IsTxn,
+		Requests:              reqs,
+		DecisionDetailVersion: ForwardDecisionSchemaVersion,
 	})
 	if err != nil {
 		// Preserve the breaker accounting, but caller cancellation is not
@@ -317,15 +314,8 @@ func (p *LeaderProxy) forward(callerCtx context.Context, parentCtx context.Conte
 func classifyForwardRPCError(err error, reqs []*pb.Request) error {
 	if phase, ok := ForwardFailurePhaseForRequests(reqs); ok {
 		reason, decision, valid := DecodeForwardDecisionStatus(err, phase)
-		if valid && decision == pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN {
-			return &ForwardFailure{Reason: reason, Decision: decision}
-		}
-		if valid && phase == pb.ForwardFailurePhase_FORWARD_FAILURE_PHASE_ONE_PHASE_APPLY &&
-			decision == pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_DEFINITIVELY_ABORTED &&
-			reason == pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CONFLICT {
-			// A possibly submitted earlier Forward attempt is terminal in
-			// runForwardCycle; it can never reach this later classification.
-			return errors.WithStack(store.ErrWriteConflict)
+		if valid {
+			return classifyValidatedForwardFailure(phase, reason, decision, ForwardOnePhaseDecisionEligible(reqs))
 		}
 	}
 	// Legacy ErrorInfo, malformed details, and unrecognized decisions do
@@ -333,8 +323,29 @@ func classifyForwardRPCError(err error, reqs []*pb.Request) error {
 	return &ForwardFailure{Decision: pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN}
 }
 
-func isDefinitiveForwardNotLeader(err error) bool {
-	return IsForwardNotLeader(err)
+func classifyValidatedForwardFailure(phase pb.ForwardFailurePhase, reason pb.ForwardFailureReason, decision pb.ForwardDecisionClass, onePhaseEligible bool) error {
+	if decision == pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN {
+		return &ForwardFailure{Reason: reason, Decision: decision}
+	}
+	// A possibly submitted earlier Forward attempt is terminal in
+	// runForwardCycle; it can never reach a later definitive verdict.
+	if onePhaseEligible && phase == pb.ForwardFailurePhase_FORWARD_FAILURE_PHASE_ONE_PHASE_APPLY &&
+		decision == pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_DEFINITIVELY_ABORTED {
+		switch reason {
+		case pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CONFLICT:
+			return errors.WithStack(&ForwardApplyRejection{cause: store.ErrWriteConflict})
+		case pb.ForwardFailureReason_FORWARD_FAILURE_REASON_FENCE:
+			return errors.WithStack(&ForwardApplyRejection{cause: ErrRouteWriteFenced})
+		case pb.ForwardFailureReason_FORWARD_FAILURE_REASON_UNSPECIFIED,
+			pb.ForwardFailureReason_FORWARD_FAILURE_REASON_NO_LEADER,
+			pb.ForwardFailureReason_FORWARD_FAILURE_REASON_INTERRUPTED,
+			pb.ForwardFailureReason_FORWARD_FAILURE_REASON_ABORTED:
+			return &ForwardFailure{Decision: pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN}
+		default:
+			return &ForwardFailure{Decision: pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN}
+		}
+	}
+	return &ForwardFailure{Decision: pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN}
 }
 
 func (p *LeaderProxy) forwardLeaseRead(callerCtx context.Context) (leaseReadResult, error) {

@@ -27,6 +27,31 @@ It also defines how errors cross those seams.
 It does not change the behavior of any running server in this documentation PR.
 PR #1337 contains a narrower conflict and lock correction; its code is not the completed implementation of this proposal.
 
+## Implementation status
+
+Draft PR #1509 adds key-free typed causes, a versioned Forward failure detail,
+phase/decision validation at the two internal forwarding callers, and
+fail-closed projections for several public adapters. The Forward receiver now
+advertises the detail schema version in each request. A peer sends the detail
+only for the supported version; an old or unknown receiver version gets a
+fixed, detail-free unknown outcome. An upgraded receiver treats an old peer's
+unmarked response as unknown rather than parsing its message.
+The DynamoDB item and transaction planners also preserve storage-read failures
+as internal errors instead of converting them into client validation failures;
+public responses redact the underlying physical key.
+Migration RPC leader rejections are also projected as key-free `Unavailable`
+statuses so a remote split runner retries ordinary leadership churn without
+classifying status text.
+The public RawKV group-watermark response projects leader/floor unavailability
+and internal read failures to fixed, key-free gRPC statuses rather than
+serializing the storage error or mislabeling it as a client precondition.
+
+This is not whole-cluster activation. Durable logical-operation reconciliation
+across separate invocations, mandatory peer authentication for definitive
+decisions, the remaining public-protocol and SDK acceptance tests, and the
+successful RawKV reserved-key audit remain open. The proposal stays partial
+until those gates are implemented, verified, and merged.
+
 ## Decisions
 
 1. A physical storage key belongs to the storage and coordination modules.

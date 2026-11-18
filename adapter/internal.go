@@ -249,16 +249,16 @@ func (i *Internal) Forward(ctx context.Context, req *pb.ForwardRequest) (*pb.For
 	// Before the leader check, so a non-leader gets the accurate reason and a
 	// leader can never reach stampTimestamps and propose.
 	if i.kvForwardRejected {
-		return nil, forwardUnknownStatus(req.GetRequests(), ErrKVForwardNotSupported)
+		return nil, forwardStatusForReceiver(req, ErrKVForwardNotSupported, false)
 	}
 	if i.leader == nil || i.leader.State() != raftengine.StateLeader {
-		return nil, forwardUnknownStatus(req.GetRequests(), kv.ErrLeaderNotFound)
+		return nil, forwardStatusForReceiver(req, kv.ErrLeaderNotFound, false)
 	}
 	if err := i.leader.VerifyLeader(ctx); err != nil {
-		return nil, forwardUnknownStatus(req.GetRequests(), err)
+		return nil, forwardStatusForReceiver(req, err, false)
 	}
 	if err := rejectUnactivatedBoundForward(req.GetRequests()); err != nil {
-		return nil, forwardUnknownStatus(req.GetRequests(), err)
+		return nil, forwardStatusForReceiver(req, err, false)
 	}
 
 	commitTS, err := i.stampTimestamps(ctx, req)
@@ -266,10 +266,10 @@ func (i *Internal) Forward(ctx context.Context, req *pb.ForwardRequest) (*pb.For
 		return &pb.ForwardResponse{
 			Success:     false,
 			CommitIndex: 0,
-		}, forwardUnknownStatus(req.GetRequests(), err)
+		}, forwardStatusForReceiver(req, err, false)
 	}
 	if err := kv.StampTimestampAdmission(ctx, i.tsAllocator, i.store, req.GetRequests()); err != nil {
-		return nil, forwardUnknownStatus(req.GetRequests(), err)
+		return nil, forwardStatusForReceiver(req, err, false)
 	}
 
 	r, err := i.transactionManager.Commit(ctx, req.Requests)
@@ -277,7 +277,7 @@ func (i *Internal) Forward(ctx context.Context, req *pb.ForwardRequest) (*pb.For
 		return &pb.ForwardResponse{
 			Success:     false,
 			CommitIndex: 0,
-		}, forwardCommitStatus(req.GetRequests(), err)
+		}, forwardStatusForReceiver(req, err, true)
 	}
 	if i.forwardWriteObserver != nil {
 		i.forwardWriteObserver(req.GetRequests())
@@ -290,16 +290,33 @@ func (i *Internal) Forward(ctx context.Context, req *pb.ForwardRequest) (*pb.For
 	}, nil
 }
 
+func forwardStatusForReceiver(req *pb.ForwardRequest, err error, commitAttempt bool) error {
+	if req.GetDecisionDetailVersion() != kv.ForwardDecisionSchemaVersion {
+		return &forwardWireFailure{wire: status.Error(codes.Unknown, "forward outcome unknown"), cause: err}
+	}
+	if commitAttempt {
+		return forwardCommitStatus(req.GetRequests(), err)
+	}
+	return forwardUnknownStatus(req.GetRequests(), err)
+}
+
 func forwardCommitStatus(reqs []*pb.Request, err error) error {
 	phase, ok := kv.ForwardFailurePhaseForRequests(reqs)
 	var rejected *kv.AppliedRequestRejection
 	// Only an indexed, terminal one-phase apply verdict proves this attempt
 	// had no effect. The receiver must separately rule out earlier attempts.
+	conflict := errors.Is(err, store.ErrWriteConflict)
+	fence := errors.Is(err, kv.ErrRouteWriteFenced)
 	if ok && phase == pb.ForwardFailurePhase_FORWARD_FAILURE_PHASE_ONE_PHASE_APPLY &&
+		kv.ForwardOnePhaseDecisionEligible(reqs) &&
 		!errors.Is(err, kv.ErrTransactionOutcomeUnknown) && errors.As(err, &rejected) &&
-		rejected.CommitIndex() != 0 && errors.Is(err, store.ErrWriteConflict) {
+		rejected.CommitIndex() != 0 && conflict != fence {
+		reason := pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CONFLICT
+		if fence {
+			reason = pb.ForwardFailureReason_FORWARD_FAILURE_REASON_FENCE
+		}
 		return &forwardWireFailure{
-			wire: kv.ForwardDecisionStatus(phase, pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CONFLICT,
+			wire: kv.ForwardDecisionStatus(phase, reason,
 				pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_DEFINITIVELY_ABORTED),
 			cause: err,
 		}
@@ -1181,26 +1198,35 @@ func envFlagEnabled(name string) bool {
 
 func (i *Internal) verifyInternalLeader(ctx context.Context) error {
 	if i.leader == nil {
-		return errors.WithStack(ErrNotLeader)
+		return migrationLeaderUnavailable()
 	}
 	if i.leader.State() != raftengine.StateLeader {
-		return errors.WithStack(ErrNotLeader)
+		return migrationLeaderUnavailable()
 	}
 	if err := i.leader.VerifyLeader(ctx); err != nil {
-		return errors.WithStack(ErrNotLeader)
+		return migrationLeaderUnavailable()
 	}
 	return nil
 }
 
 func (i *Internal) verifyInternalLeaderApplied(ctx context.Context) error {
 	if i.leader == nil {
-		return errors.WithStack(ErrNotLeader)
+		return migrationLeaderUnavailable()
 	}
 	if i.leader.State() != raftengine.StateLeader {
-		return errors.WithStack(ErrNotLeader)
+		return migrationLeaderUnavailable()
 	}
 	_, err := i.leader.LinearizableRead(ctx)
+	if errors.Is(err, ErrNotLeader) || errors.Is(err, raftengine.ErrNotLeader) ||
+		errors.Is(err, raftengine.ErrLeadershipLost) ||
+		errors.Is(err, raftengine.ErrLeadershipTransferInProgress) {
+		return migrationLeaderUnavailable()
+	}
 	return errors.WithStack(err)
+}
+
+func migrationLeaderUnavailable() error {
+	return errors.WithStack(status.Error(codes.Unavailable, "migration leader unavailable"))
 }
 
 func (i *Internal) proposeMigrationImport(ctx context.Context, req *pb.ImportRangeVersionsRequest) (store.ImportVersionsResult, error) {

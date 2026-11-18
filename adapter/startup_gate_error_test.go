@@ -14,7 +14,7 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-func TestHTTPAdaptersMapStartupGateUnavailableTo503(t *testing.T) {
+func TestHTTPAdaptersMapUnmarkedStartupStatus(t *testing.T) {
 	t.Parallel()
 	err := crdberrors.Wrap(status.Error(codes.Unavailable, "startup rotation has not completed"), "dispatch")
 
@@ -62,11 +62,11 @@ func TestHTTPAdaptersMapStartupGateUnavailableTo503(t *testing.T) {
 		rec := httptest.NewRecorder()
 		writeS3MutationError(rec, err, "bucket-a", "key-a")
 
-		if rec.Code != http.StatusServiceUnavailable {
-			t.Fatalf("status=%d, want 503", rec.Code)
+		if rec.Code != http.StatusConflict {
+			t.Fatalf("status=%d, want 409", rec.Code)
 		}
-		if body := rec.Body.String(); !strings.Contains(body, "<Code>ServiceUnavailable</Code>") {
-			t.Fatalf("body %q does not contain ServiceUnavailable", body)
+		if body := rec.Body.String(); !strings.Contains(body, "<Code>OperationOutcomeUnknown</Code>") {
+			t.Fatalf("body %q does not contain OperationOutcomeUnknown", body)
 		}
 	})
 }

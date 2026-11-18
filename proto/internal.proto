@@ -100,6 +100,8 @@ message RaftCommand {
 message ForwardRequest {
   bool is_txn = 1;
   repeated Request requests = 2;
+  // The receiver accepts this version of ForwardFailureDetail on this RPC.
+  uint32 decision_detail_version = 3;
 }
 
 // for internal leader redirect

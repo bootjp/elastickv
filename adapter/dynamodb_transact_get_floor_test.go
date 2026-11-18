@@ -49,7 +49,8 @@ func TestDynamoDB_TransactGetItems_FailsClosedWhenSnapshotFenceUnavailable(t *te
 	rec := httptest.NewRecorder()
 	server.transactGetItems(rec, req)
 	require.Equal(t, http.StatusInternalServerError, rec.Code)
-	require.Contains(t, rec.Body.String(), "leader changed")
+	require.JSONEq(t, `{"__type":"InternalServerError","message":"internal error"}`, rec.Body.String())
+	require.NotContains(t, rec.Body.String(), "leader changed")
 }
 
 func TestDynamoDB_TransactGetItems_FencesSnapshotAfterLeaderChange(t *testing.T) {
