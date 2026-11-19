@@ -88,6 +88,25 @@ func (s *ShardStore) JournalSingleGroupAtVersion(observed uint64) bool {
 	return len(route.Start) == 0 && len(route.End) == 0 && route.GroupID != 0 && route.State == distribution.RouteStateActive
 }
 
+// CanReadSealedItemAt checks the premises for omitting a DynamoDB condition
+// writeback. The seal and item must share an active owner, the owner must
+// have applied the seal at ts, and no earlier PREPARE may remain unresolved.
+func (s *ShardStore) CanReadSealedItemAt(ctx context.Context, key, seal []byte, ts uint64) bool {
+	if !bytes.Equal(routeKey(key), routeKey(seal)) {
+		return false
+	}
+	route, group, version, ok := s.routeAndGroupForKeyWithVersion(key)
+	if !ok || group == nil || group.Store == nil || route.State != distribution.RouteStateActive || route.StagedVisibilityActive {
+		return false
+	}
+	applied, err := s.CommittedVersionAtGroupAuthoritative(ctx, seal, route.GroupID, ts)
+	if err != nil || !applied {
+		return false
+	}
+	_, err = s.getGroupAtWithReadFence(ctx, route.GroupID, txnLockKey(key), ts, version)
+	return errors.Is(err, store.ErrKeyNotFound) && s.ReadRouteVersion() == version
+}
+
 // SetOperationAdmission must be called before starting receiver operations.
 func (s *ShardStore) SetOperationAdmission(hook OperationAdmission) {
 	s.operationAdmission = hook

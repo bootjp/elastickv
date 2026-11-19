@@ -1696,20 +1696,25 @@ func elemToMutation(req *Elem[OP]) *pb.Mutation {
 // docs/design/2026_05_29_implemented_composed1_cross_group_commit_guard.md).
 // Zero is the legacy "unpinned" sentinel.
 func onePhaseTxnRequestWithPrevCommit(startTS, commitTS, prevCommitTS uint64, primaryKey []byte, reqs []*Elem[OP], readKeys [][]byte, observedRouteVersion uint64, writeFenceBypassKeys [][]byte) *pb.Request {
-	muts := make([]*pb.Mutation, 0, len(reqs)+1)
-	muts = append(muts, &pb.Mutation{
+	request := newOnePhaseTxnRequest(startTS, commitTS, prevCommitTS, primaryKey, len(reqs), readKeys, observedRouteVersion, writeFenceBypassKeys)
+	for _, elem := range reqs {
+		request.Mutations = append(request.Mutations, elemToMutation(elem))
+	}
+	if commitTS != 0 {
+		// Dispatch and Internal.Forward validate offsets before committing.
+		_ = StampMutationCommitTS(request.Mutations, commitTS)
+	}
+	return request
+}
+
+// newOnePhaseTxnRequest reserves room for the ordered mutations after the
+// transaction metadata. The sharded coordinator already encoded them during routing.
+func newOnePhaseTxnRequest(startTS, commitTS, prevCommitTS uint64, primaryKey []byte, mutationCount int, readKeys [][]byte, observedRouteVersion uint64, writeFenceBypassKeys [][]byte) *pb.Request {
+	muts := make([]*pb.Mutation, 1, mutationCount+1)
+	muts[0] = &pb.Mutation{
 		Op:    pb.Op_PUT,
 		Key:   []byte(txnMetaPrefix),
 		Value: EncodeTxnMeta(TxnMeta{PrimaryKey: primaryKey, CommitTS: commitTS, PrevCommitTS: prevCommitTS}),
-	})
-	for _, req := range reqs {
-		muts = append(muts, elemToMutation(req))
-	}
-	if commitTS != 0 {
-		// stamp errors are validated before commit by dispatchTxn and
-		// Internal.Forward; this best-effort call keeps the helper nil-error
-		// compatible for existing tests that construct raw requests directly.
-		_ = StampMutationCommitTS(muts, commitTS)
 	}
 	return &pb.Request{
 		IsTxn:                true,

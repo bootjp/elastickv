@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"io"
@@ -762,17 +763,19 @@ func (d *DynamoDBServer) runTransactWriteAttempt(
 	cleanupKeys [][]byte,
 	lastErr *error,
 ) (bool, error) {
-	if len(reqs.group.Elems) == 0 {
+	if len(reqs.group.Elems) == 0 && !reqs.elidedWriteback {
 		return true, nil
 	}
-	dispatchCtx := reqs.readTimestamp.WithDispatchVoucher(ctx)
-	if _, err := d.dispatchWriteWithReadTimestamp(dispatchCtx, reqs.group); err != nil {
-		wrapped := errors.WithStack(err)
-		if !isRetryableTransactWriteError(err) {
-			return false, wrapped
+	if len(reqs.group.Elems) > 0 {
+		dispatchCtx := reqs.readTimestamp.WithDispatchVoucher(ctx)
+		if _, err := d.dispatchWriteWithReadTimestamp(dispatchCtx, reqs.group); err != nil {
+			wrapped := errors.WithStack(err)
+			if !isRetryableTransactWriteError(err) {
+				return false, wrapped
+			}
+			*lastErr = wrapped
+			return false, nil
 		}
-		*lastErr = wrapped
-		return false, nil
 	}
 	retry, verifyErr := d.handleGenerationFenceResult(
 		ctx,
@@ -789,24 +792,45 @@ func (d *DynamoDBServer) runTransactWriteAttempt(
 }
 
 type preparedTransactWriteItemsRequest struct {
-	readTimestamp kv.ReadTimestamp
-	group         *kv.OperationGroup[kv.OP]
+	readTimestamp   kv.ReadTimestamp
+	group           *kv.OperationGroup[kv.OP]
+	elidedWriteback bool
 }
 
 func (d *DynamoDBServer) buildTransactWriteItemsRequest(ctx context.Context, in transactWriteItemsInput, sealKeys [][]byte, sealedGenerations map[string]uint64) (*preparedTransactWriteItemsRequest, map[string]uint64, [][]byte, error) {
 	// transactWriteItemsWithRetry completes legacy migration before acquiring
 	// item locks. Re-entering table locks here would deadlock BatchWriteItem,
 	// which holds a table lock while waiting for an item lock.
+	shards, routed := d.store.(*kv.ShardStore)
+	elide := routed && conditionOnlyCandidate(in, sealKeys)
+	var routeVersion uint64
+	if elide {
+		routeVersion = shards.ReadRouteVersion()
+	}
 	readTimestamp, err := d.beginTxnWriteTimestamp(ctx, "dynamodb transact-write: begin read timestamp", sealKeys)
 	if err != nil {
 		return nil, nil, nil, errors.WithStack(err)
 	}
 	readTS := readTimestamp.Timestamp()
+	pin := d.pinReadTS(readTS)
+	defer pin.Release()
 	for name, generation := range sealedGenerations {
 		if err := d.verifySealedTableGeneration(ctx, name, generation, readTS); err != nil {
 			return nil, nil, nil, err
 		}
 	}
+	prepared, generations, cleanup, err := d.planSealedTransactWrite(ctx, in, sealKeys, readTimestamp, elide)
+	if errors.Is(err, errConditionGuardRequired) || (elide && shards.ReadRouteVersion() != routeVersion) {
+		// Discard the partial plan and retain every existing guard at the same cut.
+		return d.planSealedTransactWrite(ctx, in, sealKeys, readTimestamp, false)
+	}
+	return prepared, generations, cleanup, err
+}
+
+var errConditionGuardRequired = errors.New("condition requires transaction writeback")
+
+func (d *DynamoDBServer) planSealedTransactWrite(ctx context.Context, in transactWriteItemsInput, sealKeys [][]byte, readTimestamp kv.ReadTimestamp, elideGuards bool) (*preparedTransactWriteItemsRequest, map[string]uint64, [][]byte, error) {
+	readTS := readTimestamp.Timestamp()
 	reqs := &kv.OperationGroup[kv.OP]{
 		IsTxn: true,
 		// Keep transaction start aligned with the snapshot used to evaluate
@@ -815,21 +839,54 @@ func (d *DynamoDBServer) buildTransactWriteItemsRequest(ctx context.Context, in 
 		StartTS: readTS,
 	}
 	reqs.ReadKeys = append(reqs.ReadKeys, sealKeys...)
+	prepared := &preparedTransactWriteItemsRequest{readTimestamp: readTimestamp, group: reqs}
 	schemaCache := make(map[string]*dynamoTableSchema)
 	tableGenerations := make(map[string]uint64)
 	cleanup := make([][]byte, 0, len(in.TransactItems))
 	// seenItemKeys tracks (tableName, primaryKey) pairs to detect duplicates.
 	// Real DynamoDB rejects requests with multiple operations on the same item.
 	seenItemKeys := make(map[string]struct{}, len(in.TransactItems))
-	for _, item := range in.TransactItems {
-		if err := d.processTransactWriteItem(ctx, item, readTS, reqs, schemaCache, seenItemKeys, tableGenerations, &cleanup); err != nil {
+	for i, item := range in.TransactItems {
+		var conditionSeal []byte
+		if elideGuards {
+			conditionSeal = sealKeys[i]
+		}
+		if err := d.processTransactWriteItem(ctx, item, prepared, conditionSeal, schemaCache, seenItemKeys, tableGenerations, &cleanup); err != nil {
 			return nil, nil, nil, err
 		}
 	}
-	return &preparedTransactWriteItemsRequest{
-		readTimestamp: readTimestamp,
-		group:         reqs,
-	}, tableGenerations, cleanup, nil
+	return prepared, tableGenerations, cleanup, nil
+}
+
+func conditionOnlyCandidate(in transactWriteItemsInput, sealKeys [][]byte) bool {
+	// Preserve coordinator read-set limits even with staged visibility aliases
+	// for both reads (item and seal) and the synthetic mutation.
+	const maxReadKeysPerCheck = 5
+	if len(sealKeys) != len(in.TransactItems) || len(in.TransactItems) > kv.MaxReadKeys/maxReadKeysPerCheck {
+		return false
+	}
+	for i, item := range in.TransactItems {
+		if len(sealKeys[i]) == 0 || item.ConditionCheck == nil || item.Put != nil || item.Update != nil || item.Delete != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// A PREPARE ordered before the seal can still install a version at C <= R.
+// Probe its lock at R BEFORE reading the item. Resolution removes that lock
+// atomically with its effect. A later PREPARE must validate the item's seal.
+func (d *DynamoDBServer) conditionCutCoversItem(ctx context.Context, schema *dynamoTableSchema, check *transactConditionInput, sealKey []byte, readTS uint64) bool {
+	if schema.needsLegacyKeyMigration() {
+		// A writer of the source generation uses a different seal.
+		return false
+	}
+	key, err := schema.itemKeyFromAttributes(check.Key)
+	if err != nil || !bytes.Equal(dynamoItemSnapshotSealKey(schema.TableName, schema.Generation, key), sealKey) {
+		return false
+	}
+	shards, ok := d.store.(*kv.ShardStore)
+	return ok && shards.CanReadSealedItemAt(ctx, key, sealKey, readTS)
 }
 
 // processTransactWriteItem validates and plans a single item within a
@@ -837,8 +894,8 @@ func (d *DynamoDBServer) buildTransactWriteItemsRequest(ctx context.Context, in 
 func (d *DynamoDBServer) processTransactWriteItem(
 	ctx context.Context,
 	item transactWriteItem,
-	readTS uint64,
-	reqs *kv.OperationGroup[kv.OP],
+	prepared *preparedTransactWriteItemsRequest,
+	conditionSeal []byte,
 	schemaCache map[string]*dynamoTableSchema,
 	seenItemKeys map[string]struct{},
 	tableGenerations map[string]uint64,
@@ -848,6 +905,7 @@ func (d *DynamoDBServer) processTransactWriteItem(
 	if err != nil {
 		return err
 	}
+	readTS := prepared.readTimestamp.Timestamp()
 	schema, err := d.resolveTransactTableSchema(ctx, schemaCache, tableName, readTS)
 	if err != nil {
 		return err
@@ -863,6 +921,26 @@ func (d *DynamoDBServer) processTransactWriteItem(
 			"Transaction request cannot include multiple operations on one item")
 	}
 	seenItemKeys[compositeKey] = struct{}{}
+	plan, err := d.planItemWithConditionGuard(ctx, schema, item, prepared, conditionSeal)
+	if err != nil {
+		return err
+	}
+	reqs := prepared.group
+	reqs.Elems = append(reqs.Elems, plan.elems...)
+	reqs.ReadKeys = append(reqs.ReadKeys, plan.readKeys...)
+	if !plan.verifyGeneration {
+		return nil
+	}
+	tableGenerations[tableName] = schema.Generation
+	*cleanup = append(*cleanup, plan.cleanup...)
+	return nil
+}
+
+func (d *DynamoDBServer) planItemWithConditionGuard(ctx context.Context, schema *dynamoTableSchema, item transactWriteItem, prepared *preparedTransactWriteItemsRequest, conditionSeal []byte) (*transactWriteItemPlan, error) {
+	readTS := prepared.readTimestamp.Timestamp()
+	if conditionSeal != nil && !d.conditionCutCoversItem(ctx, schema, item.ConditionCheck, conditionSeal, readTS) {
+		return nil, errConditionGuardRequired
+	}
 	plan, err := d.buildTransactWriteItemPlan(ctx, schema, item, readTS)
 	if err != nil {
 		// Real DynamoDB wraps per-item condition failures in
@@ -870,18 +948,23 @@ func (d *DynamoDBServer) processTransactWriteItem(
 		// ConditionalCheckFailedException to the caller.
 		var apiErr *dynamoAPIError
 		if errors.As(err, &apiErr) && apiErr.errorType == dynamoErrConditionalFailed {
-			return newDynamoAPIError(http.StatusBadRequest, dynamoErrTransactionCanceled, apiErr.message)
+			return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrTransactionCanceled, apiErr.message)
 		}
-		return err
+		return nil, err
 	}
-	reqs.Elems = append(reqs.Elems, plan.elems...)
-	reqs.ReadKeys = append(reqs.ReadKeys, plan.readKeys...)
-	if !plan.writes {
-		return nil
+	if checked := plan.checkedItem; checked != nil {
+		if conditionSeal != nil {
+			prepared.elidedWriteback = true
+		} else {
+			payload, err := encodeStoredDynamoItem(checked.item)
+			if err != nil {
+				return nil, errors.WithStack(err)
+			}
+			plan.elems = []*kv.Elem[kv.OP]{{Op: kv.Put, Key: checked.key, Value: payload}}
+			plan.cleanup = [][]byte{checked.key}
+		}
 	}
-	tableGenerations[tableName] = schema.Generation
-	*cleanup = append(*cleanup, plan.cleanup...)
-	return nil
+	return plan, nil
 }
 
 // transactWriteItemPrimaryKeyStr returns a canonical string of the item's
@@ -927,9 +1010,10 @@ func transactWriteItemPrimaryKeyAttributes(schema *dynamoTableSchema, item trans
 }
 
 type transactWriteItemPlan struct {
-	elems   []*kv.Elem[kv.OP]
-	cleanup [][]byte
-	writes  bool
+	checkedItem      *dynamoItemLocation
+	elems            []*kv.Elem[kv.OP]
+	cleanup          [][]byte
+	verifyGeneration bool
 	// readKeys contains the raw storage keys that were read during plan
 	// construction.  They are propagated into OperationGroup.ReadKeys so the
 	// FSM can validate read-write conflicts atomically at commit time,
@@ -993,10 +1077,10 @@ func (d *DynamoDBServer) buildTransactPutPlan(
 		return nil, err
 	}
 	return &transactWriteItemPlan{
-		elems:    req.Elems,
-		cleanup:  cleanup,
-		writes:   true,
-		readKeys: [][]byte{itemKey},
+		elems:            req.Elems,
+		cleanup:          cleanup,
+		verifyGeneration: true,
+		readKeys:         [][]byte{itemKey},
 	}, nil
 }
 
@@ -1037,10 +1121,10 @@ func (d *DynamoDBServer) buildTransactUpdatePlan(
 		return nil, err
 	}
 	return &transactWriteItemPlan{
-		elems:    req.Elems,
-		cleanup:  cleanup,
-		writes:   true,
-		readKeys: [][]byte{itemKey},
+		elems:            req.Elems,
+		cleanup:          cleanup,
+		verifyGeneration: true,
+		readKeys:         [][]byte{itemKey},
 	}, nil
 }
 
@@ -1082,9 +1166,9 @@ func (d *DynamoDBServer) buildTransactDeletePlan(
 		return nil, err
 	}
 	return &transactWriteItemPlan{
-		elems:    req.Elems,
-		writes:   true,
-		readKeys: [][]byte{itemKey},
+		elems:            req.Elems,
+		verifyGeneration: true,
+		readKeys:         [][]byte{itemKey},
 	}, nil
 }
 
@@ -1117,19 +1201,12 @@ func (d *DynamoDBServer) buildTransactConditionCheckPlan(
 	); err != nil {
 		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrConditionalFailed, err.Error())
 	}
-	lockKey := itemKey
-	if currentLocation != nil {
-		lockKey = currentLocation.key
-	}
-	lockReq, lockCleanup, err := buildConditionCheckLockRequest(lockKey, current, found)
-	if err != nil {
-		return nil, err
-	}
+	// A missing item contributes the read key only. An existing item also
+	// supplies the same-value guard Put when the transaction needs writeback.
 	return &transactWriteItemPlan{
-		elems:    lockReq.Elems,
-		cleanup:  lockCleanup,
-		writes:   true,
-		readKeys: [][]byte{itemKey},
+		checkedItem:      currentLocation,
+		verifyGeneration: true,
+		readKeys:         [][]byte{itemKey},
 	}, nil
 }
 
@@ -1138,40 +1215,6 @@ func valueOrEmptyMap(item map[string]attributeValue, found bool) map[string]attr
 		return item
 	}
 	return map[string]attributeValue{}
-}
-
-func buildConditionCheckLockRequest(
-	itemKey []byte,
-	current map[string]attributeValue,
-	found bool,
-) (*kv.OperationGroup[kv.OP], [][]byte, error) {
-	if !found {
-		// Item does not exist: no write is needed.
-		// Include itemKey in ReadKeys only so OCC conflict detection fires
-		// if a concurrent writer commits to this key between our startTS and commitTS.
-		// Writing a Del tombstone here would shadow any concurrently committed Put
-		// at a higher timestamp, causing G-single-item-realtime anomalies.
-		// Return nil cleanup since nothing was written by this condition check.
-		return &kv.OperationGroup[kv.OP]{
-				IsTxn:   true,
-				StartTS: 0,
-				Elems:   nil,
-			},
-			nil,
-			nil
-	}
-	payload, err := encodeStoredDynamoItem(current)
-	if err != nil {
-		return nil, nil, errors.WithStack(err)
-	}
-	elems := []*kv.Elem[kv.OP]{{Op: kv.Put, Key: itemKey, Value: payload}}
-	return &kv.OperationGroup[kv.OP]{
-			IsTxn:   true,
-			StartTS: 0,
-			Elems:   elems,
-		},
-		[][]byte{itemKey},
-		nil
 }
 
 func (d *DynamoDBServer) resolveTransactTableSchema(ctx context.Context, cache map[string]*dynamoTableSchema, tableName string, readTS uint64) (*dynamoTableSchema, error) {

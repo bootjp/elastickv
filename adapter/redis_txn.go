@@ -2055,9 +2055,7 @@ type preparedTxnDispatch struct {
 // readKeys, ctx) without actually calling Dispatch. Callers must always
 // invoke `cancel()` on the returned prepared value once the dispatch
 // attempt finishes (commit() does this via defer; the dedup path does it
-// per retry iteration). When the transaction has no writes this returns
-// a prepared value with empty `elems` and a no-op cancel — callers can
-// check len(prepared.elems)==0 and skip the dispatch.
+// per retry iteration). Callers skip dispatch when prepared.elems is empty.
 func (t *txnContext) prepareDispatch() (preparedTxnDispatch, error) {
 	ctx, cancel := t.dispatchContext()
 
@@ -2089,10 +2087,7 @@ func (t *txnContext) prepareDispatch() (preparedTxnDispatch, error) {
 	elems = append(elems, setDeleteElems...)
 	elems = append(elems, keyElems...)
 
-	// Pre-allocate commitTS so Delta keys can embed it in their bytes before
-	// the coordinator assigns it during Dispatch. The allocation is bounded by
-	// ctx and must floor above the transaction's read snapshot.
-	commitTS, err := t.server.nextCommitTSAfter(ctx, t.startTS, "redis txn commit: allocate commitTS")
+	commitTS, err := t.prepareCommitTS(ctx, elems)
 	if err != nil {
 		cancel()
 		return preparedTxnDispatch{cancel: func() {}}, errors.WithStack(err)
@@ -2136,6 +2131,18 @@ func (t *txnContext) prepareDispatch() (preparedTxnDispatch, error) {
 		ctx:      ctx,
 		cancel:   cancel,
 	}, nil
+}
+
+func (t *txnContext) prepareCommitTS(ctx context.Context, elems []*kv.Elem[kv.OP]) (uint64, error) {
+	// The remaining builders consume collection state (including recreate
+	// cleanup), TTL state and stream deletions. With no inputs they cannot
+	// emit a mutation. A GET may still have populated working and readKeys.
+	if len(elems) == 0 && len(t.listStates) == 0 && len(t.hashStates) == 0 && len(t.zsetStates) == 0 &&
+		len(t.hashCreates) == 0 && len(t.collectionExpireTypes) == 0 && len(t.ttlStates) == 0 && len(t.streamDeletions) == 0 {
+		return 0, errors.WithStack(ctx.Err())
+	}
+	// Delta keys embed this timestamp, and Dispatch uses it for every write.
+	return t.server.nextCommitTSAfter(ctx, t.startTS, "redis txn commit: allocate commitTS")
 }
 
 func (t *txnContext) buildCollectionWriteElems(ctx context.Context, commitTS uint64) ([]*kv.Elem[kv.OP], error) {
