@@ -1,10 +1,13 @@
-.PHONY: build test
+.PHONY: build test lean-check
 
 build:
 	go build ./...
 
 test:
 	go test -v -race ./...
+
+lean-check:
+	cd lean && lean -DwarningAsError=true MVCCHistory.lean
 
 run:
 	go run cmd/server/demo.go
