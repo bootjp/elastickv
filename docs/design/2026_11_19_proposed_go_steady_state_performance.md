@@ -1,112 +1,89 @@
-# 現行 Go 実装の平常時の読み書き性能改善
+# Improving steady-state read and write performance in Go
 
 Status: In progress
 Author: bootjp
 Date: 2026-11-19
 
-## 目的と測定基準
+## Goals and baseline
 
-Raft group の構成とキーの所有範囲を固定し、通常の読み書きに必要な CPU と、クライアントが成功応答を受けるまでの p99 を下げる。
-最初の変更候補は point read の割り当て削減と、同一 group に同時到着した write の永続化効率である。
-どちらも gRPC の応答、読み取りの一貫性、既定の同期耐久性をそろえて比較する。
+Reduce server CPU time per successful request and the p99 latency clients experience on successful reads and writes. Keep Raft group membership and key ownership fixed. The first two candidates are allocations on point reads and the cost of persisting concurrent writes to the same group. Both must preserve gRPC response semantics, read consistency, and the default synchronous durability guarantees.
 
-既存の Linux 診断の初期区間では、1 KiB、8 workers の RawKV で次の結果が得られた。
-Go 1.27.3、固定 SHA `5ccfbc74a`、単一 VM 内で 3 ノードを同一プロセスに配置した短時間測定である。[測定ログと実行条件](../evidence/2026_11_19_steady_state_linux_baseline.md)
+The initial phase of a short Linux diagnostic run measured RawKV with 1 KiB values and eight workers. All three nodes ran in one process on one VM, using Go 1.27.3 at commit `5ccfbc74a`. [Measurement log and configuration](../evidence/2026_11_19_steady_state_linux_baseline.md)
 
-| 負荷 | 成功 ops/s | 成功要求の p99 | 成功 / エラー |
+| Workload | Successful ops/s | p99 for successful requests | Successes / errors |
 | --- | ---: | ---: | ---: |
-| read-only | 28,968 | 0.599 ms | 57,939 / 0 |
-| write-only | 308.9 | 37.012 ms | 625 / 0 |
+| Read-only | 28,968 | 0.599 ms | 57,939 / 0 |
+| Write-only | 308.9 | 37.012 ms | 625 / 0 |
 
-同じ Linux 環境での Pebble に対する 64 B の単発 apply は、同期ありで中央値 2.755 ms/op、同期なしで 3.538 µs/op だった。
-単発 apply の中央値と RPC 全体の p99 は測定箇所も分位点も異なるため、この値から書き込み遅延の内訳は算出できない。
-設計確認時の `origin/main`（`afe0a9f9d`）では読み取り要求の寿命管理も更新されている。実装を始める際は、その時点の SHA で定常負荷専用の基準を取り直す。[store 測定ログ](../evidence/2026_11_19_steady_state_linux_baseline.md)・[読み取り要求の実装](https://github.com/bootjp/elastickv/blob/afe0a9f9dc1542b4a039a6a0392776a41370e1ef/kv/read_request.go)
+On the same Linux VM, applying a single 64 B update to Pebble took a median of 2.755 ms/op with synchronous writes and 3.538 µs/op with sync disabled. These store-level medians and the end-to-end RPC p99 measure different stages and percentiles. They cannot establish how much of the RPC latency came from storage. Read request lifetime management had also changed by the time of the design review at `origin/main` commit `afe0a9f9d`. Establish a fresh steady-state baseline against the commit used for each implementation comparison. [Store measurements](../evidence/2026_11_19_steady_state_linux_baseline.md) and [read request implementation](https://github.com/bootjp/elastickv/blob/afe0a9f9dc1542b4a039a6a0392776a41370e1ef/kv/read_request.go)
 
-## 読み取りで値長に比例する割り当てを調べる
+## Point-read allocations
 
-`RawGet` は、既定の出力レベルが Warn の場合にも、成功経路で key と value を文字列に変換して `InfoContext` に渡す。
-Pebble も読み出した値をデコードしてコピーするため、ログ引数の費用は実装間の差から求める。
-64 B、1 KiB、16 KiB の各値長で、同じキー列、スナップショット時刻、Warn 設定の成功 hit を基準版と候補版に与える。
-候補版の変更は `logger.Enabled(ctx, slog.LevelInfo)` の内側でログ引数を作ることに限る。
-各値長で bytes/op と CPU 時間/op の差を求め、割り当てプロファイルは別実行で採ってハンドラと Pebble の割り当て元を照合する。
-Info 有効時のログ、空値と欠損の区別、KeyViz の観測回数を回帰試験で確認する。[gRPC ハンドラ](../../adapter/grpc.go)
+On a successful hit, the baseline `RawGet` converts the key and value to strings before calling `InfoContext`, even at the default Warn level. Pebble also copies the value during decoding. To isolate the cost of preparing log arguments, compare the baseline with a build that constructs those arguments inside `logger.Enabled(ctx, slog.LevelInfo)`. At each value size (64 B, 1 KiB, and 16 KiB), use the same sequence of successful hits, snapshot timestamp, and Warn setting. Measure the difference in bytes allocated and CPU time per operation. Collect allocation profiles in separate runs to identify allocations in the handler and in Pebble. Regression tests check the log fields at Info level, the distinction between an empty value and a missing key, and the number of KeyViz observations. [gRPC handler](../../adapter/grpc.go)
 
-最新読み、時刻指定の履歴読み、順方向と逆方向の scan を別々に計測する。
-leader 直結と follower 経由に分け、lease の成立、ReadIndex への切り替え、snapshot pin の保持時間を記録する。
-複数 group にまたがる読み取りでは、read watermark を更新した回数と quorum 待ちを含める。
-同じ snapshot で遅延書き込みを挟んだ再読、compaction 中の読み取り、キャンセル後の pin 解放を採用条件とする。[read watermark の既存試験](../../kv/read_watermark_advance_test.go)
+Measure latest reads, historical reads at a specified timestamp, forward scans, and reverse scans separately. For requests sent directly to the leader and those forwarded by a follower, record whether a lease was established, when reads fell back to ReadIndex, and how long each snapshot stayed pinned. For reads spanning multiple groups, also count read watermark updates and measure time spent waiting for a quorum. Before adopting a read optimization, verify repeat reads at the same snapshot with an intervening delayed write, reads during compaction, and pin release after cancellation. [Read watermark tests](../../kv/read_watermark_advance_test.go)
 
-## 書き込みの同期回数と待ち時間を減らす
+## Write batching and durability
 
-要求受付、Raft 提案、WAL 保存、quorum commit、FSM apply、Pebble batch 完了、応答を同じ操作に対応づけ、キュー待ちと I/O の重なりを確認する。
-Raft は一度の Ready で複数 entry を保存できる。group ごとの entries/保存、同期回数/成功 write、batch の bytes、最古要求の待ち時間を測る。
-Raft WAL と Pebble のどちらに同期が集中しているかを確認してから、一方ずつ変更する。[Raft の保存処理](../../internal/raftengine/etcd/wal_store.go)・[Pebble の apply](../../store/lsm_store.go)
+Trace each write from admission through Raft proposal, write-ahead log (WAL) persistence, quorum commit, state machine (FSM) application, Pebble batch completion, and the client response. Correlating these events shows where queueing overlaps with I/O. Raft can persist multiple entries in one `Ready`. For each group, measure entries per save, syncs per successful write, batch size in bytes, and the age of the oldest queued request. Use those measurements to locate the sync cost in the Raft WAL or Pebble, then change one stage at a time. [Raft persistence](../../internal/raftengine/etcd/wal_store.go) and [Pebble apply path](../../store/lsm_store.go)
 
-最初の書き込み候補は、同一 group の `commitRaw` が提案前にまとめる Raw 要求の件数と bytes、先頭要求の待ち時間である。
-現行経路はキューの最初の flush で 500 µs 待ち、原則として最大 64 要求を取り出す。
-計測では提案経路別に呼び出し数を記録する。
-要求ごとの提案コンテキストを保持する `commitRawOwned` が対象負荷を処理する場合、このキューの調整をその負荷の改善候補から外す。[集約と提案](../../kv/transaction.go)
+The first write candidate is the batch that `commitRaw` forms within a group before proposing an entry. Vary the request and byte limits and the wait for the first request. The current queue waits 500 µs before its first flush and normally takes at most 64 requests. Count calls by proposal path. If the target workload uses `commitRawOwned`, which retains a separate proposal context for each request, tuning the `commitRaw` queue cannot benefit that workload. [Raw write batching and proposal paths](../../kv/transaction.go)
 
-FSM は一つの Raft entry の Raw 要求を順に検証し、対応する store では成功した更新と applied index を同じ batch に書く。
-同一キーに「成功、直前の書き込みとの OCC 競合、成功」を並べ、各結果とその順序、各時刻の値、commit 後の適用通知を逐次実行と照合する。
-store の読み出しや batch commit が失敗した場合は entry 全体の更新と通知を破棄し、その index を越える前に適用を停止する。
-提案前の集約では、commit 済みの entry 間の適用境界を維持する。
-連続する三つの entry の中央に障害を注入し、先頭の応答と永続値、中央と末尾の成功応答および通知の件数がゼロであること、再起動時の durable applied index と再適用後の値を検査する。[FSM の試験](../../kv/fsm_batch_entry_test.go)、[完了済みの先頭を検証する試験](../../internal/raftengine/etcd/engine_storage_pipeline_failure_test.go)
+### Apply boundaries and failure recovery
 
-WAL 保存を変更する候補では、適用対象のユーザー write がなくても投票などの `HardState` 更新だけで保存を開始する。
-同期経路では snapshot があれば先に保存し、次に entries と `HardState` を保存する。
-必要な同期が完了してから、それに依存する peer 応答、適用、`Advance` に進む。
-試験では投票だけの `Ready` を入力して WAL 再オープン後の term と vote を検査する。
-保存処理と同期処理それぞれについて停止中と失敗時を検査し、保存完了に依存する応答と進行を観測する。
-WAL の `Save` が内部で同期する経路ではその完了を、明示的に `Sync` を発行する経路ではその完了を待つ。[WAL の試験](../../internal/raftengine/etcd/wal_store_test.go)、[明示的な非同期経路の故障試験](../../internal/raftengine/etcd/engine_storage_pipeline_failure_test.go)
-同期前後のプロセス停止、leader 交代、snapshot 復旧後に、成功応答を返した更新が回収できることを確認する。[既存 store benchmark](../../store/lsm_store_sync_mode_benchmark_test.go)
+The FSM validates the raw requests in a Raft entry in order. On stores that support entry-level batching, it persists the successful updates and the applied index in the same batch. Exercise three requests to the same key in order. The first is a successful write, the second conflicts with it under optimistic concurrency control (OCC), and the third succeeds. Compare the ordered results, the value visible at each timestamp, and the post-commit apply notifications against sequential execution.
 
-複数 group にまたがる filesystem 操作は実際の操作ジャーナルから計測する。
-`RequireAllParticipants=true` の要求では全参加 group の commit 応答を確認した時点までを計時する。
-primary 確定後に secondary の応答を失ったケースは結果不明として記録し、復旧後の効果を操作 ID で照合する。[2PC の結果分類](../../kv/sharded_coordinator.go)・[複数 group の journal 試験](../../internal/filesystem/operation_journal_multigroup_test.go)
+If a store read or batch commit fails, discard the updates and notifications for the entire entry and stop applying before advancing past its index. Pre-proposal batching must preserve the apply boundary between committed entries. Inject a failure in the middle of three consecutive entries. Verify the first entry's response and durable value, zero success responses and apply notifications for the failed and trailing entries, the durable applied index at restart, and the values after replay. [FSM tests](../../kv/fsm_batch_entry_test.go) and [completed-prefix recovery test](../../internal/raftengine/etcd/engine_storage_pipeline_failure_test.go)
 
-## 実装順序と採用条件
+### WAL persistence and peer responses
 
-1. **基準測定。** Linux サーバー 3 台と別ホストの負荷生成器で、TLS、Sync、データセット、leader 配置を固定する。read-only、write-only、95:5 の混合負荷と scan を、均一なアクセスと hot key、同時実行 1/8/32/128 で比較する。
-2. **point read。** ログ引数生成だけを変更し、割り当て削減が成功 1 件あたりの CPU または RPC の p99 に現れるか確認する。
-3. **write。** 同期回数とキュー待ちから選んだ 1 箇所で集約上限を比較する。低負荷の p99、高負荷の成功 ops/s、故障後の履歴を確認する。
+A `HardState` update such as a vote must trigger persistence even when there are no user writes to apply. On the synchronous path, save the snapshot first if present, then save the entries and `HardState`. Any peer response, apply operation, or `Advance` that depends on a sync must wait for it. On paths where WAL `Save` performs the sync internally, wait for `Save` to finish. On paths that issue an explicit `Sync`, wait for that call to finish.
 
-各負荷の到着率は、基準版だけで測った飽和成功 ops/s の 50% と 80%（整数に切り下げ、最低 1 ops/s）とする。
-候補を測る前に実際の ops/s、同時実行上限、キー列の seed、期限、データセット、主指標と対象セルを記録して固定する。
-各回は 30 秒のウォームアップ後に 120 秒間送信を予定し、最後に送信済み要求の期限まで応答を回収する。
-同時実行上限で発行できない予定要求はキューに入れ、期限までに発行できなければ未送信として数える。
-予定要求数を分母として、未送信、成功、確定失敗、結果不明を記録し、deadline 超過は別の属性として残す。
-成功要求の遅延は予定送信時刻から応答までを測り、送信遅れも記録する。
-混合負荷では read と write の成功率と p50/p95/p99 を別々に算出し、飽和時の成功 ops/s は別実行で測る。
-同じ時間窓の全サーバーの CPU 時間と割り当て量を成功数で割る。成功数がゼロの窓は停止時間と件数を報告する。
-同一条件で基準版と候補版を対にして 10 組測定し、各組の実行順を交互に反転する。
-成功数がゼロ、または操作別の p99 を計算する成功が各回 1,000 件未満なら判定を保留し、両版で同じ測定時間を延長して取り直す。
+Submit a vote-only `Ready` and verify the term and vote after reopening the WAL. Block and fail the save and sync operations separately, checking which dependent responses and state transitions can proceed. Verify that acknowledged updates survive process termination on either side of a sync, a leader change, and recovery from a snapshot. [WAL tests](../../internal/raftengine/etcd/wal_store_test.go), [asynchronous storage failure tests](../../internal/raftengine/etcd/engine_storage_pipeline_failure_test.go), and [store sync benchmark](../../store/lsm_store_sync_mode_benchmark_test.go)
 
-point read の主指標は均一 read-only、1 KiB、同時実行上限 8、到着率 80% での成功 1 件あたりのサーバー CPU 時間とする。
-書き込み候補の主指標は同条件の write-only における RPC p99 とする。
-各組で候補／基準の比を算出し、10 個の比の中央値と、小さい方から 2 番目および 9 番目を端点とする区間を報告する（独立な組を仮定した中央値の分布によらない約 97.9% 信頼区間）。
-採用には主指標の区間上限が 0.90 以下、対象負荷を含む全セルの操作別 p99 の区間上限が 1.05 以下、飽和時の成功 ops/s の区間下限が 0.95 以上であることを求める。
-固定到着率の平常時の比較では両版の各回で成功率 100%、結果不明と未送信が各 0 件を求める。
-履歴と耐久性の検査に失敗した場合、または区間が閾値をまたいだ場合は採用を保留する。
-これらの暫定条件を基準版の測定時に運用 SLO と照合し、変更があれば候補の測定前に記録する。[独立レビュー](../evidence/2026_11_19_go_steady_state_performance_review.md)
-各候補を独立した変更として段階導入し、履歴検査の違反、結果不明率の増加、低負荷時の遅延悪化を監視する。
-書き込み経路を切り戻す際は受理済み batch の適用と結果通知を完了させてから従来の集約量に戻す。
+For filesystem operations spanning multiple groups, take measurements from the operation journal. For a request with `RequireAllParticipants=true`, measure through the commit acknowledgment from the last participating group. If a secondary's response is lost after the primary commits, record the outcome as unknown. After recovery, use the operation ID to reconcile the recorded outcome with the effects in storage. [Two-phase commit outcomes](../../kv/sharded_coordinator.go) and [multi-group journal tests](../../internal/filesystem/operation_journal_multigroup_test.go)
 
-## 最初の実装とローカル測定
+## Experiment sequence and acceptance criteria
 
-2026-11-19 に、`RawGet` の成功時に Info が有効な場合だけ key と value を文字列化する候補版を実装した。
-Go 1.27.3、darwin/arm64、`GOMAXPROCS=1` で、コミット `5ccfbc74a` と、同コミットにガードだけを加えた候補版を比較した。
-両版とも同じベンチマークを組み込み、既定の Warn 設定でローカルのハンドラから Pebble の 64 キーを同じ順に読み、各値長で 10 万回すべての hit を確認した。
-各セルにつき実行順を交互に入れ替えて 10 組測った。[ベンチマーク](../../adapter/grpc_raw_get_test.go)、[全試行の測定値](../evidence/2026_11_19_steady_state_raw_get.tsv)
+1. **Establish the baseline.** Run three Linux servers with the load generator on a separate host. Fix TLS, synchronous durability, the dataset, and leader placement. Test read-only, write-only, a 95:5 read/write mix, and scans. Cover uniform and hot-key access with concurrency limits of 1, 8, 32, and 128.
+2. **Test point reads.** Change only how the handler prepares log arguments. Check whether the allocation savings reduce server CPU time per successful request or RPC p99.
+3. **Test writes.** Use sync counts and queueing times to select one batching stage. Compare limits at that stage and check low-load p99, successful ops/s at high load, and operation histories after faults.
 
-| 値長 | 割り当て B/件（基準 → 候補、中央値） | 割り当て回数/件（基準 → 候補） | プロセス CPU 時間/件（候補／基準、組ごとの比の中央値） |
+### Load generation and reporting
+
+For each workload, set the scheduled arrival rates to 50% and 80% of the baseline's successful ops/s at saturation. Round down to whole ops/s with a minimum of 1. Before measuring the candidate, record the actual rates, concurrency limits, key-sequence seed, deadlines, dataset, primary metric, and target configuration.
+
+Warm up for 30 seconds, then schedule requests for 120 seconds. At the end of the window, collect responses to outstanding requests through their deadlines. Queue a scheduled request if the concurrency limit prevents dispatch. Count it as unsent if its deadline expires in the queue. Use all scheduled requests as the denominator when reporting unsent requests, successes, definitive failures, and unknown outcomes. Track deadline expiry separately.
+
+Measure successful-request latency from scheduled send time to response, and record dispatch delay separately. For mixed workloads, report success rates and p50, p95, and p99 separately for reads and writes. Measure successful throughput at saturation in a separate run. For each measurement window, sum CPU time and allocated bytes across all servers and divide each by the number of successes. If a window has no successes, report the duration of the stall and the request counts.
+
+Collect 10 matched baseline/candidate pairs per configuration, alternating which build runs first. If a run has no successes or fewer than 1,000 successes for an operation whose p99 is being evaluated, defer the decision and rerun both builds with the same longer measurement window.
+
+### Adoption and rollout
+
+For point reads, the primary metric is server CPU time per successful request under uniform read-only traffic with 1 KiB values, a concurrency limit of 8, and an arrival rate of 80% of baseline saturation throughput. For the write candidate, use RPC p99 under the corresponding write-only workload.
+
+For each metric, calculate the candidate-to-baseline ratio within each pair. Report the median of the 10 ratios and the interval from the second-smallest to the ninth-smallest ratio. Assuming independent pairs, this gives an approximately 97.9% distribution-free confidence interval for the median. A candidate must meet all of the following criteria.
+
+- The upper bound for the primary metric is at most 0.90.
+- The upper bound for each operation's p99 is at most 1.05 in every configuration, including the target workload.
+- The lower bound for successful throughput at saturation is at least 0.95.
+- In every fixed-arrival-rate steady-state run, both builds achieve 100% success with zero unsent requests and zero unknown outcomes.
+
+Defer adoption if a history or durability check fails or an interval crosses its threshold. During baseline measurement, check these provisional criteria against the operational SLOs and record any adjustment before measuring the candidate. [Independent design review](../evidence/2026_11_19_go_steady_state_performance_review.md)
+
+Roll out each candidate independently and in stages. Monitor history-check violations, increases in unknown outcomes, and latency regressions at low load. Before restoring the previous write batching limits, finish applying accepted batches and notifying callers of their results.
+
+## Initial implementation and local measurements
+
+On 2026-11-19, we implemented the Info-level guard on the successful `RawGet` path. We compared commit `5ccfbc74a` with the same commit plus the guard, using Go 1.27.3 on darwin/arm64 with `GOMAXPROCS=1`. Both builds ran the same local handler benchmark at the default Warn level. For each value size, the benchmark read the same 64 Pebble keys in the same order and verified all 100,000 hits per run. Each configuration had 10 paired runs with alternating execution order. [Benchmark](../../adapter/grpc_raw_get_test.go) and [measurements for all runs](../evidence/2026_11_19_steady_state_raw_get.tsv)
+
+| Value size | Allocated B/read, median (baseline → candidate) | Allocations/read (baseline → candidate) | Process CPU time/read (median paired candidate/baseline ratio) |
 | --- | ---: | ---: | ---: |
 | 64 B | 552 → 376 | 9 → 5 | 0.796 |
 | 1 KiB | 2,472 → 1,336 | 9 → 5 | 0.824 |
 | 16 KiB | 33,193 → 16,696 | 9 → 5 | 0.616 |
 
-割り当ては Go のベンチマーク区間の値である。
-CPU 時間は各値長を独立したプロセスで実行し、そのプロセスの user と system CPU 時間の和を読み取り件数で割った値で、起動、データ投入、終了処理を含む。
-同条件で別に採った 16 KiB の割り当てプロファイルでは、`RawGet` 自身に帰属する累積割り当て量（pprof の flat）は基準版で 1.53 GiB、候補版で 10 MiB だった。
-候補版では `store.decodeValue` が全割り当て量の約 97% を占めた。
-3 台構成の採否判定には、TLS 経由の RPC p99、サーバー CPU、飽和時の成功 ops/s の計測が残る。
+Allocation figures cover the timed Go benchmark loop. Each value size ran in its own process. The CPU metric divides total user and system CPU time by the read count, so it includes startup, data loading, and shutdown. In a separate 16 KiB allocation profile under the same conditions, pprof attributed 1.53 GiB of allocations directly to `RawGet` in the baseline and 10 MiB in the candidate (flat allocation space). In the candidate, `store.decodeValue` accounted for approximately 97% of allocated bytes.
+
+The three-server acceptance decision still requires measurements of RPC p99 over TLS, server CPU time, and successful throughput at saturation.
