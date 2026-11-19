@@ -167,11 +167,32 @@ func strictFilesystemOptions(ctx context.Context, service *filesystem.Service, c
 			return nil, errors.Wrap(err, "recover previous strict filesystem session")
 		}
 	}
-	session, err := journal.RegisterSession(ctx, filesystemID, config.ClientID)
+	session, err := registerStrictSession(ctx, journal, filesystemID, config.ClientID)
 	if err != nil {
 		return nil, errors.Wrap(err, "register strict filesystem session")
 	}
 	return []fuseadapter.Option{fuseadapter.WithStrictMode(session)}, nil
+}
+
+type strictSessionRegistrar interface {
+	RegisterSession(context.Context, [16]byte, string) (filesystem.OperationSessionID, error)
+	RegisterSessionWithID(context.Context, filesystem.OperationSessionID, string) error
+}
+
+// Retain the session ID across an uncertain registration result. A retry with
+// a new ID could leave two active sessions for the same mount owner.
+func registerStrictSession(ctx context.Context, journal strictSessionRegistrar, filesystemID [16]byte, owner string) (filesystem.OperationSessionID, error) {
+	startupCtx, cancel := context.WithTimeout(ctx, startupRetryBudget)
+	defer cancel()
+	session, err := journal.RegisterSession(startupCtx, filesystemID, owner)
+	if err == nil || session.Session == [16]byte{} ||
+		(!errors.Is(err, kv.ErrLeaderNotFound) && !errors.Is(err, kv.ErrCeilingExpired)) {
+		return session, err
+	}
+	err = retryFilesystemStartup(startupCtx, startupRetryInterval, func(ctx context.Context) error {
+		return journal.RegisterSessionWithID(ctx, session, owner)
+	})
+	return session, err
 }
 
 // MountServer is the part of *fuseadapter.Server the shutdown
