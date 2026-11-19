@@ -187,10 +187,10 @@ func registerStrictSession(ctx context.Context, journal strictSessionRegistrar, 
 	session, err := journal.RegisterSession(startupCtx, filesystemID, owner)
 	if err == nil || session.Session == [16]byte{} ||
 		(!errors.Is(err, kv.ErrLeaderNotFound) && !errors.Is(err, kv.ErrCeilingExpired)) {
-		return session, err
+		return session, errors.WithStack(err)
 	}
 	err = retryFilesystemStartup(startupCtx, startupRetryInterval, func(ctx context.Context) error {
-		return journal.RegisterSessionWithID(ctx, session, owner)
+		return errors.WithStack(journal.RegisterSessionWithID(ctx, session, owner))
 	})
 	return session, err
 }
