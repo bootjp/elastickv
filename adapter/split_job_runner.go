@@ -240,6 +240,16 @@ func (s *DistributionServer) runSplitJobPhase(ctx context.Context, job distribut
 			return err
 		}
 	}
+	return s.runAdmittedSplitJobPhase(ctx, job)
+}
+
+func (s *DistributionServer) runAdmittedSplitJobPhase(ctx context.Context, job distribution.SplitJob) error {
+	// Only the full runner repeats pages after namespace admission. Yield on
+	// completion so the next attempt independently admits the fence or delta.
+	if !job.TransferPreflightDone && (job.Phase == distribution.SplitJobPhaseFence || job.Phase == distribution.SplitJobPhaseDeltaCopy) {
+		_, err := s.preflightSplitTransferPages(ctx, job, preflightPagesPerTick)
+		return err
+	}
 	if job.Phase == distribution.SplitJobPhaseBackfill || job.Phase == distribution.SplitJobPhaseDeltaCopy {
 		return s.runSplitJobCopyPhase(ctx, job)
 	}
