@@ -27,6 +27,8 @@
   (let [h (history)
         valid? #(:valid? (checker/check (pf/recovery-checker) {} % {}))]
     (is (valid? h))
+    (is (valid? (assoc-in h [4 :type] :info)) "the moving range may fail closed")
+    (is (false? (valid? (assoc-in h [3 :type] :info))) "the retained range must serve a read")
     (doseq [[path bad] [[[2 :value :state] "S"]
                         [[2 :value :before :completed] #{}]
                         [[2 :value :during :done] true]

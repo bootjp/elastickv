@@ -13,6 +13,7 @@
             [jepsen.generator :as gen]
             [jepsen.independent :as independent]
             [jepsen.nemesis :as nemesis]
+            [jepsen.net :as net]
             [jepsen.tests :as tests]))
 
 (def nodes ["n1" "n2" "n3"])
@@ -44,7 +45,8 @@
     {:job (:job_id j) :phase (:phase j) :scan-ts (:transfer_preflight_ts j)
      :plan (ids progress) :completed (ids (filter :done progress))
      :done (:transfer_preflight_done j) :fence (:fence_ts j)
-     :source (:source_group_id j) :target (:target_group_id j) :error (:last_error j)}))
+     :source (:source_group_id j) :target (:target_group_id j)
+     :capability-regressed (:capability_regressed j) :error (:last_error j)}))
 
 (defn partial-scan? [s]
   (and (= "SPLIT_JOB_PHASE_FENCE" (:phase s)) (false? (:done s))
@@ -154,7 +156,8 @@
                         (= seeds written) (not= victim leader) (stopped? state)
                         (= victim (get-in resume [:value :victim]))
                         (valid-checkpoints? before during final) (correct-routes? routes)
-                        (= (set (keys seeds)) (set (map (comp first :value) during-reads)))
+                        ;; A capability regression may close the moving range.
+                        (some #(= 0 (first (:value %))) during-reads)
                         (= expected coverage) (every? #(< (:index finish) (:index %)) reads)
                         (every? (fn [{[k v] :value}] (= (seeds k) v))
                                 (filter #(= :read (:f %)) ok))))
@@ -176,7 +179,7 @@
   (let [client (grpc/->GRPCClient ports :raw (path "jepsen-grpc-client") nil nil nil)
         event #(gen/nemesis (gen/once {:type :info :f %}))]
     (merge tests/noop-test
-           {:name "elastickv-split-preflight-pause" :nodes nodes :concurrency 3
+           {:name "elastickv-split-preflight-pause" :nodes nodes :concurrency 3 :net net/noop
             :grpc-host "127.0.0.1" :grpc-tls-ca-file (path "cert.pem")
             :client (hosted/->ObservedClient client nil) :nemesis (preflight-nemesis)
             :checker (recovery-checker)
