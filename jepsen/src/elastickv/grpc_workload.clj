@@ -37,16 +37,24 @@
   (setup! [this _test] this)
   (invoke! [_this _test op]
     (let [[k v] (:value op)]
-      (try
-        (let [result (exchange! writer reader
-                                {:op (name (:f op))
-                                 :key (str "jepsen-grpc/" (name api) "/" k)
-                                 :value v})]
-          (cond-> (assoc op :type (keyword (:type result)))
-            (= :read (:f op)) (assoc :value (independent/tuple k (:value result)))
-            (:error result) (assoc :error (:error result))))
-        (catch Exception e
-          (assoc op :type :info :error (.getMessage e))))))
+      (loop [attempt 1]
+        (let [outcome (try
+                        (let [result (exchange! writer reader
+                                                {:op (name (:f op))
+                                                 :key (str "jepsen-grpc/" (name api) "/" k)
+                                                 :value v})]
+                          (cond-> (assoc op :type (keyword (:type result)))
+                            (= :read (:f op)) (assoc :value (independent/tuple k (:value result)))
+                            (:error result) (assoc :error (:error result))))
+                        (catch Exception e
+                          (assoc op :type :info :error (.getMessage e))))]
+          ;; Final reads are observations after healing. An indeterminate read
+          ;; can be repeated without changing state, unlike a write.
+          (if (and (:final op) (= :read (:f op)) (= :info (:type outcome))
+                   (< attempt 5))
+            (do (Thread/sleep 250)
+                (recur (inc attempt)))
+            outcome)))))
   (teardown! [_this _test] nil)
   (close! [this _test]
     (when process
