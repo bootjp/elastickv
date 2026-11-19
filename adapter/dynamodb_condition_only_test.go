@@ -331,14 +331,12 @@ func TestDynamoDBConditionOnlyPreparedBeforeSeal(t *testing.T) {
 }
 
 func TestDynamoDBConditionOnlyLegacyMigration(t *testing.T) {
-	schema, base, st := newLegacyMigrationTestServer(t, false, "N")
+	schema, server, st := newLegacyMigrationTestServer(t, false, "N")
 	seed := newDynamoFixtureWriter(t, st)
 	seed.writeSchema(schema)
 	check := tableCondition(schema.TableName, "tenant", "attribute_exists(pk)")
 	check.ConditionCheck.Key["sk"] = newNumberAttributeValue("2")
 	seed.writeItem(schema, check.ConditionCheck.Key)
-	trace := &conditionOnlyTrace{CoordinatorForwarder: kv.CoordinatorForwarder{Inner: base.coordinator}}
-	server := NewDynamoDBServer(nil, st, trace)
 	rec := runConditionTransaction(t, server, check)
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 	migrated, found, err := server.loadTableSchema(t.Context(), schema.TableName)
