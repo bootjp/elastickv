@@ -3,12 +3,14 @@ package store
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/binary"
 	"hash/crc32"
 	"io"
 	"log/slog"
 	"os"
+	"slices"
 	"sort"
 	"sync"
 
@@ -177,34 +179,40 @@ var _ RetentionController = (*mvccStore)(nil)
 
 // ---- helpers guarded by caller locks ----
 
-func latestVisible(vs []VersionedValue, ts uint64) (VersionedValue, bool) {
-	for i := len(vs) - 1; i >= 0; i-- {
-		if vs[i].TS <= ts {
-			if vs[i].ExpireAt != 0 && vs[i].ExpireAt <= ts {
-				// Treat expired value as a tombstone for visibility.
-				return VersionedValue{}, false
-			}
-			return vs[i], true
+// versionUpperBound counts the prefix with TS <= ts.
+func versionUpperBound(vs []VersionedValue, ts uint64) int {
+	return sort.Search(len(vs), func(i int) bool { return vs[i].TS > ts })
+}
+
+func visibleValue(vs []VersionedValue, ts uint64) ([]byte, bool) {
+	// Reads at or just behind the head can skip the binary search.
+	const tailChecks = 2
+	for range tailChecks {
+		if len(vs) == 0 {
+			return nil, false
 		}
+		last := len(vs) - 1
+		if vs[last].TS <= ts {
+			return vs[last].valueAt(ts)
+		}
+		vs = vs[:last]
 	}
-	return VersionedValue{}, false
+	n := versionUpperBound(vs, ts)
+	if n == 0 {
+		return nil, false
+	}
+	return vs[n-1].valueAt(ts)
+}
+
+func (v *VersionedValue) valueAt(ts uint64) ([]byte, bool) {
+	if v.Tombstone || (v.ExpireAt != 0 && v.ExpireAt <= ts) {
+		return nil, false
+	}
+	return v.Value, true
 }
 
 func versionExistsAtOrBefore(vs []VersionedValue, ts uint64) bool {
-	for i := len(vs) - 1; i >= 0; i-- {
-		if vs[i].TS <= ts {
-			return true
-		}
-	}
-	return false
-}
-
-func visibleValue(versions []VersionedValue, ts uint64) ([]byte, bool) {
-	ver, ok := latestVisible(versions, ts)
-	if !ok || ver.Tombstone {
-		return nil, false
-	}
-	return ver.Value, true
+	return len(vs) > 0 && vs[0].TS <= ts
 }
 
 func (s *mvccStore) putVersionLocked(key, value []byte, commitTS, expireAt uint64) {
@@ -346,11 +354,11 @@ func (s *mvccStore) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte, e
 		return nil, ErrKeyNotFound
 	}
 	versions, _ := v.([]VersionedValue)
-	ver, ok := latestVisible(versions, ts)
-	if !ok || ver.Tombstone {
+	value, ok := visibleValue(versions, ts)
+	if !ok {
 		return nil, ErrKeyNotFound
 	}
-	return bytes.Clone(ver.Value), nil
+	return bytes.Clone(value), nil
 }
 
 func (s *mvccStore) ExistsAt(ctx context.Context, key []byte, ts uint64) (bool, error) {
@@ -368,14 +376,8 @@ func (s *mvccStore) ExistsAt(ctx context.Context, key []byte, ts uint64) (bool, 
 		return false, nil
 	}
 	versions, _ := v.([]VersionedValue)
-	if len(versions) == 0 {
-		return false, nil
-	}
-	ver, ok := latestVisible(versions, ts)
-	if !ok || ver.Tombstone {
-		return false, nil
-	}
-	return true, nil
+	_, visible := visibleValue(versions, ts)
+	return visible, nil
 }
 
 func (s *mvccStore) VersionExistsAtOrBefore(ctx context.Context, key []byte, ts uint64) (bool, error) {
@@ -1604,6 +1606,10 @@ func readMVCCSnapshotTree(r io.Reader) (*treemap.Map, error) {
 		if eof {
 			return tree, nil
 		}
+		// The in-memory store searches these slices directly after restore.
+		if !slices.IsSortedFunc(versions, func(a, b VersionedValue) int { return cmp.Compare(a.TS, b.TS) }) {
+			return nil, errors.New("mvcc snapshot contains out-of-order versions")
+		}
 		tree.Put(key, versions)
 	}
 }
@@ -1686,16 +1692,7 @@ func readMVCCSnapshotVersion(r io.Reader) (VersionedValue, error) {
 // compactKeepIndex returns the index from which versions should be kept when
 // compacting with the given minTS. Returns -1 when no compaction is needed.
 func compactKeepIndex(versions []VersionedValue, minTS uint64) int {
-	if len(versions) == 0 {
-		return -1
-	}
-	// versions are sorted ascending by TS; use binary search for O(log n).
-	// Find the first index where TS > minTS; everything before it has TS <= minTS.
-	n := sort.Search(len(versions), func(i int) bool {
-		return versions[i].TS > minTS
-	})
-	// n-1 is the last index with TS <= minTS.
-	keepIdx := n - 1
+	keepIdx := versionUpperBound(versions, minTS) - 1
 	if keepIdx <= 0 {
 		return -1
 	}

@@ -84,6 +84,25 @@ func TestMVCCStore_RestoreRejectsInvalidChecksum(t *testing.T) {
 	})
 }
 
+func TestMemoryMVCCRestoreRejectsUnsortedHistory(t *testing.T) {
+	t.Parallel()
+	// Produce a snapshot with a valid checksum but a decreasing timestamp.
+	src := newTestMVCCStore(t)
+	src.tree.Put([]byte("bad"), []VersionedValue{{TS: 3}, {TS: 1}})
+	snap, err := src.Snapshot()
+	require.NoError(t, err)
+	defer snap.Close()
+
+	dst := newTestMVCCStore(t)
+	ctx := t.Context()
+	require.NoError(t, dst.PutAt(ctx, []byte("existing"), []byte("value"), 10, 0))
+	require.ErrorContains(t, dst.Restore(bytes.NewReader(snapshotBytes(t, snap))), "out-of-order versions")
+	value, err := dst.GetAt(ctx, []byte("existing"), 10)
+	require.NoError(t, err)
+	require.Equal(t, []byte("value"), value)
+	require.Equal(t, uint64(10), dst.LastCommitTS())
+}
+
 func TestMVCCStore_RestoreClearsMigrationMetadata(t *testing.T) {
 	t.Parallel()
 

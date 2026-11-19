@@ -38,17 +38,7 @@ func TestMVCCStore_Compact(t *testing.T) {
 		require.Equal(t, uint64(25), retention.MinRetainedTS())
 		require.Equal(t, 3, countConformanceVersions(t, s))
 
-		// v10 should be gone physically, but logically checking at TS 15
-		// depends on how GetAt is implemented.
-		// Current GetAt implementation:
-		// It iterates versions backwards. If we removed v10, and only have v20, v30, v40...
-		// querying at TS 15:
-		// v40 > 15 -> skip
-		// v30 > 15 -> skip
-		// v20 > 15 -> skip
-		// No version <= 15 found -> ErrReadTSCompacted
-		// This is the expected behavior of Compaction: you cannot query older than minTS.
-
+		// TS 15 is below the retention floor.
 		_, err = s.GetAt(ctx, key, 15)
 		assert.ErrorIs(t, err, ErrReadTSCompacted, "Should not find version older than compacted minTS")
 

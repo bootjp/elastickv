@@ -490,6 +490,12 @@ Elastickv ships an optional admin dashboard — a React SPA plus JSON API served
 
 Implementation rationale lives in the [design documents](docs/design/README.md), and the [TLA+ models](tla/README.md) describe the modeled safety properties and their scope. The workload tests below exercise specific API behavior; assess their results against the workload, configuration, and fault model used.
 
+Run `make lean-check` with Lean 4 to check the in-memory MVCC history
+lookup and compaction proofs. The toolchain version is pinned in
+[`lean/lean-toolchain`](lean/lean-toolchain). To benchmark historical and latest
+reads on a single key with 4,096 versions, run
+`go test ./store -run '^$' -bench BenchmarkMemoryMVCCHistory -benchmem`.
+
 ### Running Jepsen tests
 
 Jepsen workloads and their harness tests live in `jepsen/`. Install Leiningen and run the harness tests locally:
