@@ -1,0 +1,170 @@
+{
+  "benchmark": "BenchmarkSplitPreflight",
+  "date": "2026-11-19",
+  "commits": {
+    "baseline": "afe0a9f9dc1542b4a039a6a0392776a41370e1ef",
+    "candidate": "408d60e718a336f3ddb0fc61bc47245b0c2f0971"
+  },
+  "binary_sha256": {
+    "baseline": "7c74349f984f782df46c5637dfffe9fcc3d1077d26fb5e4b8d2e2fac78afffd2",
+    "candidate": "cc032794e7bb49af6b4cbe73aa61d2c14d7677a51264abf1c485dc832acc562a"
+  },
+  "environment": "Apple M1 Max, 10 cores, 64 GiB, macOS 27.2.1 arm64, Go 1.27.3, GOMAXPROCS=8, shared host",
+  "cluster": "Three loopback etcd/raft nodes in one process, two Raft groups, separate on-disk Pebble stores on the same disk, default FSM sync, TLS RawKV. Source leader node 0, target leader node 1.",
+  "workload": "128 moving 1 KiB values. Every 200 ms, write to one retained key, then read a separately seeded retained key and verify its value. Missed slots are counted. Each pass scans 46 families. Time starts on observing entry to Fence and ends on observing durable TransferPreflightDone.",
+  "method": "Same benchmark on both versions. The baseline build overlays the baseline versions of the two changed production files and omits the candidate-only batch tests. Each binary runs once per pair in a fresh process. Alternate baseline/candidate and candidate/baseline. Five pairs, no profiler.",
+  "command": "GOMAXPROCS=8 go test ./internal/server -run '^$' -bench '^BenchmarkSplitPreflight$' -benchtime=1x -count=1 -timeout=6m",
+  "metrics": "Time is ns per preflight. Latencies are successful RPC service-time p99 in ms per run. The medians summarize five per-run metrics for each variant. max-start-lag-ms is the largest delay from a pair's scheduled start to dispatch. The benchmark fails on an RPC error, an unsuccessful write, or a read mismatch.",
+  "runs_in_execution_order": [
+    {
+      "pair": 1,
+      "variant": "baseline",
+      "exit": 0,
+      "families": 46,
+      "ns/op": 47966953167.0,
+      "read-p99-ms": 12.14,
+      "write-p99-ms": 69.02,
+      "reads/op": 240.0,
+      "writes/op": 240.0,
+      "missed-slots/op": 0.0,
+      "max-start-lag-ms": 19.97
+    },
+    {
+      "pair": 1,
+      "variant": "candidate",
+      "exit": 0,
+      "families": 46,
+      "ns/op": 24104496791.0,
+      "read-p99-ms": 46.2,
+      "write-p99-ms": 78.61,
+      "reads/op": 121.0,
+      "writes/op": 121.0,
+      "missed-slots/op": 0.0,
+      "max-start-lag-ms": 32.53
+    },
+    {
+      "pair": 2,
+      "variant": "candidate",
+      "exit": 0,
+      "families": 46,
+      "ns/op": 23094176126.0,
+      "read-p99-ms": 30.11,
+      "write-p99-ms": 77.61,
+      "reads/op": 116.0,
+      "writes/op": 116.0,
+      "missed-slots/op": 0.0,
+      "max-start-lag-ms": 20.99
+    },
+    {
+      "pair": 2,
+      "variant": "baseline",
+      "exit": 0,
+      "families": 46,
+      "ns/op": 48009001834.0,
+      "read-p99-ms": 17.45,
+      "write-p99-ms": 80.83,
+      "reads/op": 240.0,
+      "writes/op": 240.0,
+      "missed-slots/op": 0.0,
+      "max-start-lag-ms": 16.18
+    },
+    {
+      "pair": 3,
+      "variant": "baseline",
+      "exit": 0,
+      "families": 46,
+      "ns/op": 48081849792.0,
+      "read-p99-ms": 19.24,
+      "write-p99-ms": 82.08,
+      "reads/op": 241.0,
+      "writes/op": 241.0,
+      "missed-slots/op": 0.0,
+      "max-start-lag-ms": 21.98
+    },
+    {
+      "pair": 3,
+      "variant": "candidate",
+      "exit": 0,
+      "families": 46,
+      "ns/op": 11033807126.0,
+      "read-p99-ms": 19.29,
+      "write-p99-ms": 43.18,
+      "reads/op": 56.0,
+      "writes/op": 56.0,
+      "missed-slots/op": 0.0,
+      "max-start-lag-ms": 7.042
+    },
+    {
+      "pair": 4,
+      "variant": "candidate",
+      "exit": 0,
+      "families": 46,
+      "ns/op": 13132247250.0,
+      "read-p99-ms": 13.53,
+      "write-p99-ms": 50.38,
+      "reads/op": 66.0,
+      "writes/op": 66.0,
+      "missed-slots/op": 0.0,
+      "max-start-lag-ms": 6.361
+    },
+    {
+      "pair": 4,
+      "variant": "baseline",
+      "exit": 0,
+      "families": 46,
+      "ns/op": 47995196417.0,
+      "read-p99-ms": 14.37,
+      "write-p99-ms": 45.0,
+      "reads/op": 240.0,
+      "writes/op": 240.0,
+      "missed-slots/op": 0.0,
+      "max-start-lag-ms": 8.734
+    },
+    {
+      "pair": 5,
+      "variant": "baseline",
+      "exit": 0,
+      "families": 46,
+      "ns/op": 47986668542.0,
+      "read-p99-ms": 18.94,
+      "write-p99-ms": 84.83,
+      "reads/op": 240.0,
+      "writes/op": 240.0,
+      "missed-slots/op": 0.0,
+      "max-start-lag-ms": 13.8
+    },
+    {
+      "pair": 5,
+      "variant": "candidate",
+      "exit": 0,
+      "families": 46,
+      "ns/op": 12034419501.0,
+      "read-p99-ms": 19.47,
+      "write-p99-ms": 66.25,
+      "reads/op": 61.0,
+      "writes/op": 61.0,
+      "missed-slots/op": 0.0,
+      "max-start-lag-ms": 6.971
+    }
+  ],
+  "medians": {
+    "baseline": {
+      "ns/op": 47995196417.0,
+      "read-p99-ms": 17.45,
+      "write-p99-ms": 80.83,
+      "reads/op": 240.0,
+      "writes/op": 240.0,
+      "missed-slots/op": 0.0,
+      "max-start-lag-ms": 16.18
+    },
+    "candidate": {
+      "ns/op": 13132247250.0,
+      "read-p99-ms": 19.47,
+      "write-p99-ms": 66.25,
+      "reads/op": 66.0,
+      "writes/op": 66.0,
+      "missed-slots/op": 0.0,
+      "max-start-lag-ms": 7.042
+    }
+  }
+}
