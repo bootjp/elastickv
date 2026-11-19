@@ -102,6 +102,22 @@ jobs:
         run: ~/lein test
       - name: Test Jepsen evidence archiving
         run: bash scripts/test-archive-jepsen-store.sh
+      - name: Pause a voter during split preflight
+        if: matrix.encryption == 'off'
+        timeout-minutes: 15
+        run: LEIN="$HOME/lein" PREFLIGHT_LOG_DIR="$RUNNER_TEMP/preflight-logs" bash scripts/jepsen-split-preflight.sh
+      - name: Archive split preflight fault history
+        if: always() && matrix.encryption == 'off'
+        run: bash scripts/archive-jepsen-store.sh jepsen/store/elastickv-split-preflight-pause "$RUNNER_TEMP/preflight-history.tar.gz"
+      - name: Upload split preflight evidence
+        if: always() && matrix.encryption == 'off'
+        uses: actions/upload-artifact@v7
+        with:
+          name: jepsen-split-preflight-pause
+          path: |
+            ${{ runner.temp }}/preflight-history.tar.gz
+            ${{ runner.temp }}/preflight-logs/
+          retention-days: 14
       - name: Launch etcd-backed cluster
         run: bash scripts/ci-jepsen-start-cluster.sh "${{ matrix.encryption }}"
       - name: Enable data-at-rest encryption on the cluster
