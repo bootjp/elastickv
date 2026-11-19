@@ -40,4 +40,10 @@
                         [[7 :value] [0 -1]]]]
       (is (false? (valid? (assoc-in h path bad))) (str path)))
     (is (false? (valid? (pop h))))
-    (is (false? (valid? (assoc-in h [2 :confirmed] false))))))
+    (is (false? (valid? (assoc-in h [2 :confirmed] false))))
+    (let [last-sample (assoc (get-in h [2 :value :during]) :capability-regressed true)
+          timeout (assoc h 6 {:f :finish-split :process :nemesis :error "timeout" :details last-sample})
+          result (checker/check (pf/recovery-checker) {} timeout {})]
+      (is (false? (:valid? result)))
+      (is (= {:phase "SPLIT_JOB_PHASE_FENCE" :completed 2 :total 3 :preflight-done false
+              :capability-regressed true} (:last-checkpoint result))))))
