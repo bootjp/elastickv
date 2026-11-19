@@ -253,11 +253,16 @@ func (r *GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.Raw
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	r.log.InfoContext(ctx, "Get",
-		slog.String("key", string(req.Key)),
-		slog.String("value", string(v)))
-
+	r.logRawGet(ctx, req.Key, v)
 	return &pb.RawGetResponse{Value: v, Exists: true}, nil
+}
+
+func (r *GRPCServer) logRawGet(ctx context.Context, key, value []byte) {
+	if r.log.Enabled(ctx, slog.LevelInfo) {
+		r.log.InfoContext(ctx, "Get",
+			slog.String("key", string(key)),
+			slog.String("value", string(value)))
+	}
 }
 
 // rawGroupWatermark answers the keyless leader-fenced watermark for one Raft
