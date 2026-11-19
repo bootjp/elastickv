@@ -5,6 +5,8 @@ import (
 
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // StartupControlRPC selects a per-node typed startup control transport before
@@ -60,7 +62,14 @@ func invokeStartupControlRPC(ctx context.Context, call StartupControlRPC, cache 
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	return errors.WithStack(conn.Invoke(ctx, method, request, reply))
+	err = conn.Invoke(ctx, method, request, reply)
+	// The first public floor read after a partition can hit a reset HTTP/2
+	// connection. Repeat this idempotent query once under the same deadline.
+	// The caller still checks the group echo and the leader's ReadIndex fence.
+	if method == pb.RawKV_RawLatestCommitTS_FullMethodName && status.Code(err) == codes.Unavailable && ctx.Err() == nil {
+		err = conn.Invoke(ctx, method, request, reply)
+	}
+	return errors.WithStack(err)
 }
 
 func (s *ShardStore) remoteStartupGroupFloor(ctx context.Context, group uint64, address string) (*pb.RawLatestCommitTSResponse, error) {
