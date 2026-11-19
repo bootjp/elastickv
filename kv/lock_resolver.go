@@ -230,10 +230,12 @@ func (lr *LockResolver) resolveScannedLock(ctx context.Context, gid uint64, g *S
 
 	lock, err := decodeTxnLock(kvp.Value)
 	if err != nil {
-		lr.log.Warn("lock resolver: decode lock failed",
-			slog.String("key", string(userKey)),
-			slog.Any("err", err),
-		)
+		if lr.log.Enabled(context.Background(), slog.LevelWarn) {
+			lr.log.Warn("lock resolver: decode lock failed",
+				slog.String("key", string(userKey)),
+				slog.Any("err", err),
+			)
+		}
 		return lockResolveIgnored, nil
 	}
 
@@ -257,12 +259,14 @@ func (lr *LockResolver) resolveScannedLock(ctx context.Context, gid uint64, g *S
 	if lr.operationAdmission != nil {
 		return lockResolveIgnored, err
 	}
-	lr.log.Warn("lock resolver: resolve failed",
-		slog.Uint64("gid", gid),
-		slog.String("key", string(userKey)),
-		slog.Uint64("start_ts", lock.StartTS),
-		slog.Any("err", err),
-	)
+	if lr.log.Enabled(context.Background(), slog.LevelWarn) {
+		lr.log.Warn("lock resolver: resolve failed",
+			slog.Uint64("gid", gid),
+			slog.String("key", string(userKey)),
+			slog.Uint64("start_ts", lock.StartTS),
+			slog.Any("err", err),
+		)
+	}
 	return lockResolveIgnored, nil
 }
 

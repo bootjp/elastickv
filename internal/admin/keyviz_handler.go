@@ -234,9 +234,7 @@ func (h *KeyVizHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
 	if err := json.NewEncoder(w).Encode(matrix); err != nil {
-		h.logger.LogAttrs(r.Context(), slog.LevelWarn, "admin keyviz response encode failed",
-			slog.String("error", err.Error()),
-		)
+		logRequestError(r.Context(), h.logger, slog.LevelWarn, "admin keyviz response encode failed", err)
 	}
 }
 

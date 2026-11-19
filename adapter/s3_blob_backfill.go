@@ -324,7 +324,9 @@ func (b *S3BlobBackfiller) backfillWithRetry(ctx context.Context, key []byte) {
 	}
 	if ctx.Err() == nil {
 		b.observeResult(s3BlobBackfillResultFailed)
-		slog.Warn("s3 chunkblob backfill failed", "key", string(key), "err", lastErr)
+		if logger := slog.Default(); logger.Enabled(context.Background(), slog.LevelWarn) {
+			logger.Warn("s3 chunkblob backfill failed", "key", string(key), "err", lastErr)
+		}
 	}
 }
 

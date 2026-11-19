@@ -87,3 +87,15 @@ On 2026-11-19, we implemented the Info-level guard on the successful `RawGet` pa
 Allocation figures cover the timed Go benchmark loop. Each value size ran in its own process. The CPU metric divides total user and system CPU time by the read count, so it includes startup, data loading, and shutdown. In a separate 16 KiB allocation profile under the same conditions, pprof attributed 1.53 GiB of allocations directly to `RawGet` in the baseline and 10 MiB in the candidate (flat allocation space). In the candidate, `store.decodeValue` accounted for approximately 97% of allocated bytes.
 
 The three-server acceptance decision still requires measurements of RPC p99 over TLS, server CPU time, and successful throughput at saturation.
+
+### Disabled logging on other Go paths
+
+The same check now covers transactional gRPC reads and scans, storage mutations, and diagnostics that encode keys, format errors, capture stacks, or assemble audit fields. Each call checks the destination logger at the level of the record before preparing its arguments. Metrics and Sentry reporting follow their own settings.
+
+We also measured in-memory `PutAt` at the default Warn level on darwin/arm64 (Apple M1 Max, Go 1.27.3, `GOMAXPROCS=1`). The benchmark overwrites one key at one timestamp, keeping the version history constant. We compared the implementation at `d295bb7f4` with the guarded write using the same harness. For each value size we ran five matched pairs of 100,000 writes, alternating build order. Every pair returned the allocation counts below. [Benchmark](../../store/mvcc_store_logging_test.go)
+
+| Value size | B/write before | B/write after | Allocations/write before | Allocations/write after |
+| --- | ---: | ---: | ---: | ---: |
+| 64 B | 392 | 160 | 10 | 5 |
+| 1 KiB | 2,312 | 1,120 | 10 | 5 |
+| 16 KiB | 33,032 | 16,480 | 10 | 5 |

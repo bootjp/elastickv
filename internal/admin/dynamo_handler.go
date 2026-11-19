@@ -432,9 +432,7 @@ func (h *DynamoHandler) handleList(w http.ResponseWriter, r *http.Request) {
 	// endpoint is not the limiting factor.
 	names, err := h.source.AdminListTables(r.Context())
 	if err != nil {
-		h.logger.LogAttrs(r.Context(), slog.LevelError, "admin dynamo list tables failed",
-			slog.String("error", err.Error()),
-		)
+		logRequestError(r.Context(), h.logger, slog.LevelError, "admin dynamo list tables failed", err)
 		writeJSONError(w, http.StatusInternalServerError, "dynamo_list_failed",
 			"failed to list tables; see server logs")
 		return
@@ -584,9 +582,7 @@ func writeForwardedResult(w http.ResponseWriter, r *http.Request, logger *slog.L
 	if len(res.Payload) > 0 {
 		encoded, err := stdjson.Marshal(stdjson.RawMessage(res.Payload))
 		if err != nil {
-			logger.LogAttrs(r.Context(), slog.LevelWarn, "admin forward response is not valid JSON",
-				slog.String("error", err.Error()),
-			)
+			logRequestError(r.Context(), logger, slog.LevelWarn, "admin forward response is not valid JSON", err)
 			writeMalformedForwardResult(w, res.StatusCode)
 			return
 		}
@@ -611,9 +607,7 @@ func writeForwardedResult(w http.ResponseWriter, r *http.Request, logger *slog.L
 		return
 	}
 	if _, err := w.Write(payload); err != nil {
-		logger.LogAttrs(r.Context(), slog.LevelWarn, writeFailedMsg,
-			slog.String("error", err.Error()),
-		)
+		logRequestError(r.Context(), logger, slog.LevelWarn, writeFailedMsg, err)
 	}
 }
 
@@ -644,9 +638,11 @@ func (h *DynamoHandler) writeForwardFailure(w http.ResponseWriter, r *http.Reque
 		// Not the "no leader known" case — log the raw error so
 		// operators can investigate. Client still sees the same
 		// 503 + Retry-After so they retry uniformly.
-		h.logger.LogAttrs(r.Context(), slog.LevelError, "admin dynamo "+op+" forward failed",
-			slog.String("error", err.Error()),
-		)
+		if h.logger.Enabled(r.Context(), slog.LevelError) {
+			h.logger.LogAttrs(r.Context(), slog.LevelError, "admin dynamo "+op+" forward failed",
+				slog.String("error", err.Error()),
+			)
+		}
 	}
 	w.Header().Set("Retry-After", "1")
 	writeJSONError(w, http.StatusServiceUnavailable, "leader_unavailable",
@@ -680,9 +676,11 @@ func (h *DynamoHandler) writeTablesError(w http.ResponseWriter, r *http.Request,
 			writeJSONError(w, http.StatusBadRequest, "invalid_request", verr.Error())
 			return
 		}
-		h.logger.LogAttrs(r.Context(), slog.LevelError, "admin dynamo "+op+" table failed",
-			slog.String("error", err.Error()),
-		)
+		if h.logger.Enabled(r.Context(), slog.LevelError) {
+			h.logger.LogAttrs(r.Context(), slog.LevelError, "admin dynamo "+op+" table failed",
+				slog.String("error", err.Error()),
+			)
+		}
 		writeJSONError(w, http.StatusInternalServerError, "dynamo_"+op+"_failed",
 			"failed to "+op+" table; see server logs")
 	}
@@ -844,10 +842,12 @@ func (h *DynamoHandler) handleDescribe(w http.ResponseWriter, r *http.Request, n
 	}
 	summary, exists, err := h.source.AdminDescribeTable(r.Context(), name)
 	if err != nil {
-		h.logger.LogAttrs(r.Context(), slog.LevelError, "admin dynamo describe table failed",
-			slog.String("table", name),
-			slog.String("error", err.Error()),
-		)
+		if h.logger.Enabled(r.Context(), slog.LevelError) {
+			h.logger.LogAttrs(r.Context(), slog.LevelError, "admin dynamo describe table failed",
+				slog.String("table", name),
+				slog.String("error", err.Error()),
+			)
+		}
 		writeJSONError(w, http.StatusInternalServerError, "dynamo_describe_failed",
 			"failed to describe table; see server logs")
 		return
@@ -917,9 +917,7 @@ func writeAdminJSONStatus(w http.ResponseWriter, ctx context.Context, logger *sl
 		if logger == nil {
 			logger = slog.Default()
 		}
-		logger.LogAttrs(ctx, slog.LevelError, "admin response marshal failed",
-			slog.String("error", err.Error()),
-		)
+		logRequestError(ctx, logger, slog.LevelError, "admin response marshal failed", err)
 		writeJSONError(w, http.StatusInternalServerError, "internal", "failed to encode response")
 		return
 	}
@@ -939,8 +937,6 @@ func writeAdminJSONStatus(w http.ResponseWriter, ctx context.Context, logger *sl
 		if logger == nil {
 			logger = slog.Default()
 		}
-		logger.LogAttrs(ctx, slog.LevelWarn, "admin response write failed",
-			slog.String("error", werr.Error()),
-		)
+		logRequestError(ctx, logger, slog.LevelWarn, "admin response write failed", werr)
 	}
 }

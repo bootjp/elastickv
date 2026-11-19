@@ -293,7 +293,7 @@ func (a *Adapter) Close() {
 				err = a.finishStrictSession(ctx)
 			}
 			if err != nil {
-				slog.Warn("filesystem strict session remains open after close", "error", err.Error())
+				warnFuseOperation(context.Background(), "filesystem strict session remains open after close", err)
 			}
 		}
 		if a.ackCancel != nil {
@@ -336,13 +336,17 @@ func (a *Adapter) Lookup(ctx context.Context, parent uint64, name []byte) (files
 	inode, err := a.core.Resolve(ctx, parent, name)
 	if errno := Errno(err); errno != 0 {
 		if errno == syscall.EIO {
-			slog.WarnContext(ctx, "filesystem FUSE lookup resolve failed", "parent", parent, "name", string(name), "error", err.Error())
+			if logger := slog.Default(); logger.Enabled(ctx, slog.LevelWarn) {
+				logger.WarnContext(ctx, "filesystem FUSE lookup resolve failed", "parent", parent, "name", string(name), "error", err.Error())
+			}
 		}
 		return filesystem.Stat{}, errno
 	}
 	stat, err := a.core.GetAttr(ctx, inode)
 	if err != nil && Errno(err) == syscall.EIO {
-		slog.WarnContext(ctx, "filesystem FUSE lookup getattr failed", "parent", parent, "name", string(name), "inode", inode, "error", err.Error())
+		if logger := slog.Default(); logger.Enabled(ctx, slog.LevelWarn) {
+			logger.WarnContext(ctx, "filesystem FUSE lookup getattr failed", "parent", parent, "name", string(name), "inode", inode, "error", err.Error())
+		}
 	}
 	return stat, Errno(err)
 }
@@ -350,7 +354,7 @@ func (a *Adapter) Lookup(ctx context.Context, parent uint64, name []byte) (files
 func (a *Adapter) GetAttr(ctx context.Context, inode uint64) (filesystem.Stat, syscall.Errno) {
 	stat, err := a.core.GetAttr(ctx, inode)
 	if err != nil && Errno(err) == syscall.EIO {
-		slog.WarnContext(ctx, "filesystem FUSE getattr failed", "inode", inode, "error", err.Error())
+		warnFuseOperation(ctx, "filesystem FUSE getattr failed", err, slog.Uint64("inode", inode))
 	}
 	return stat, Errno(err)
 }
@@ -420,6 +424,13 @@ func (a *Adapter) noteUnknownOperation(id filesystem.OperationID, err error, key
 	a.replyMu.Unlock()
 }
 
+func warnFuseOperation(ctx context.Context, message string, err error, attrs ...slog.Attr) {
+	logger := slog.Default()
+	if logger.Enabled(ctx, slog.LevelWarn) {
+		logger.LogAttrs(ctx, slog.LevelWarn, message, append(attrs, slog.String("error", err.Error()))...)
+	}
+}
+
 func (a *Adapter) Open(ctx context.Context, inode uint64) (uint64, syscall.Errno) {
 	if a.journaledOpen {
 		fh, errno := a.openWithOperation(ctx, inode)
@@ -432,7 +443,7 @@ func (a *Adapter) Open(ctx context.Context, inode uint64) (uint64, syscall.Errno
 	if err == nil {
 		a.trackOpenHandle(inode, fh)
 	} else if Errno(err) == syscall.EIO {
-		slog.WarnContext(ctx, "filesystem FUSE open failed", "inode", inode, "error", err.Error())
+		warnFuseOperation(ctx, "filesystem FUSE open failed", err, slog.Uint64("inode", inode))
 	}
 	return fh, Errno(err)
 }
@@ -460,7 +471,7 @@ func (a *Adapter) openWithOperation(ctx context.Context, inode uint64) (uint64, 
 	}
 	a.noteUnknownOperation(id, err, inode)
 	if err != nil && Errno(err) == syscall.EIO {
-		slog.WarnContext(ctx, "filesystem FUSE open failed", "inode", inode, "sequence", id.Sequence, "error", err.Error())
+		warnFuseOperation(ctx, "filesystem FUSE open failed", err, slog.Uint64("inode", inode), slog.Uint64("sequence", id.Sequence))
 	}
 	return fh, a.mutationErrno(err)
 }
@@ -474,7 +485,7 @@ func (a *Adapter) Read(ctx context.Context, inode uint64, fh uint64, offset uint
 	}
 	data, err := a.core.Read(ctx, inode, fh, offset, size)
 	if err != nil && Errno(err) == syscall.EIO {
-		slog.WarnContext(ctx, "filesystem FUSE read failed", "inode", inode, "fh", fh, "offset", offset, "size", size, "error", err.Error())
+		warnFuseOperation(ctx, "filesystem FUSE read failed", err, slog.Uint64("inode", inode), slog.Uint64("fh", fh), slog.Uint64("offset", offset), slog.Uint64("size", size))
 	}
 	return data, Errno(err)
 }
@@ -501,7 +512,7 @@ func (a *Adapter) Write(ctx context.Context, inode uint64, fh uint64, offset uin
 		n, writeErr = a.core.Write(ctx, inode, fh, offset, data)
 	}
 	if writeErr != nil && Errno(writeErr) == syscall.EIO {
-		slog.WarnContext(ctx, "filesystem FUSE write failed", "inode", inode, "offset", offset, "length", len(data), "error", writeErr.Error())
+		warnFuseOperation(ctx, "filesystem FUSE write failed", writeErr, slog.Uint64("inode", inode), slog.Uint64("offset", offset), slog.Int("length", len(data)))
 	}
 	return n, a.mutationErrno(writeErr)
 }
@@ -549,14 +560,14 @@ func (a *Adapter) Fsync(ctx context.Context, inode uint64, fh uint64, datasync b
 	if err != nil {
 		errno := Errno(err)
 		if errno == syscall.EIO {
-			slog.WarnContext(ctx, "filesystem FUSE fsync receipt verification failed", "inode", inode, "fh", fh, "error", err.Error())
+			warnFuseOperation(ctx, "filesystem FUSE fsync receipt verification failed", err, slog.Uint64("inode", inode), slog.Uint64("fh", fh))
 		}
 		return errno
 	}
 	if err := a.core.Fsync(ctx, inode, fh, datasync); err != nil {
 		errno := Errno(err)
 		if errno == syscall.EIO {
-			slog.WarnContext(ctx, "filesystem FUSE fsync failed", "inode", inode, "fh", fh, "error", err.Error())
+			warnFuseOperation(ctx, "filesystem FUSE fsync failed", err, slog.Uint64("inode", inode), slog.Uint64("fh", fh))
 		}
 		return errno
 	}
@@ -572,7 +583,7 @@ func (a *Adapter) FsyncDirectory(ctx context.Context, inode uint64) syscall.Errn
 	if err != nil {
 		errno := Errno(err)
 		if errno == syscall.EIO {
-			slog.WarnContext(ctx, "filesystem FUSE directory fsync receipt verification failed", "inode", inode, "error", err.Error())
+			warnFuseOperation(ctx, "filesystem FUSE directory fsync receipt verification failed", err, slog.Uint64("inode", inode))
 		}
 		return errno
 	}
@@ -608,7 +619,7 @@ func (a *Adapter) Release(ctx context.Context, inode uint64, fh uint64) syscall.
 		err = a.core.Release(ctx, inode, fh, a.clientID)
 	}
 	if err != nil && Errno(err) == syscall.EIO {
-		slog.WarnContext(ctx, "filesystem FUSE release uncertain", "inode", inode, "fh", fh, "error", err.Error())
+		warnFuseOperation(ctx, "filesystem FUSE release uncertain", err, slog.Uint64("inode", inode), slog.Uint64("fh", fh))
 	}
 	return a.mutationErrno(err)
 }
@@ -853,7 +864,7 @@ func (a *Adapter) refreshOpenHandleLease(ctx context.Context, inode uint64, fh u
 
 func logLeaseRefreshError(ctx context.Context, inode, fh uint64, err error) {
 	if err != nil && Errno(err) == syscall.EIO {
-		slog.WarnContext(ctx, "filesystem FUSE lease refresh failed", "inode", inode, "fh", fh, "error", err.Error())
+		warnFuseOperation(ctx, "filesystem FUSE lease refresh failed", err, slog.Uint64("inode", inode), slog.Uint64("fh", fh))
 	}
 }
 
@@ -926,7 +937,7 @@ func (a *Adapter) markLeaseRefreshed(inode, fh uint64) {
 func (a *Adapter) refreshLegacyLease(ctx context.Context, inode uint64, fh uint64) syscall.Errno {
 	err := a.core.RefreshOpenHandleLease(ctx, inode, fh, a.clientID)
 	if err != nil && Errno(err) == syscall.EIO {
-		slog.WarnContext(ctx, "filesystem FUSE lease refresh failed", "inode", inode, "fh", fh, "error", err.Error())
+		warnFuseOperation(ctx, "filesystem FUSE lease refresh failed", err, slog.Uint64("inode", inode), slog.Uint64("fh", fh))
 	}
 	return Errno(err)
 }

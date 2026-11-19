@@ -87,11 +87,13 @@ func (s *SQSServer) validateHTFIFOCapability(ctx context.Context, requested *sqs
 		// no raw poller error text) so the CreateQueue surface
 		// does not leak cluster topology to authenticated callers
 		// — CodeRabbit major review on PR #734.
-		slog.Warn("sqs: htfifo capability gate rejected partitioned CreateQueue",
-			"queueName", requested.Name,
-			"partitionCount", requested.PartitionCount,
-			"peerCount", len(peers),
-			"detail", formatHTFIFOCapabilityReportForLog(report))
+		if logger := slog.Default(); logger.Enabled(context.Background(), slog.LevelWarn) {
+			logger.Warn("sqs: htfifo capability gate rejected partitioned CreateQueue",
+				"queueName", requested.Name,
+				"partitionCount", requested.PartitionCount,
+				"peerCount", len(peers),
+				"detail", formatHTFIFOCapabilityReportForLog(report))
+		}
 		return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
 			htfifoCapabilityRejectionPublic)
 	}

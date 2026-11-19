@@ -697,7 +697,7 @@ func (j *OperationJournal) acknowledgeOnce(ctx context.Context, id OperationID) 
 	}
 	response, commitErr := j.backend.Commit(ctx, ts, elems, [][]byte{id.key(), session.ID.key()})
 	err = commitErr
-	if err == nil && operationAccountingTrace {
+	if err == nil && operationAccountingTrace && slog.Default().Enabled(context.Background(), slog.LevelInfo) {
 		var commitTS uint64
 		if response != nil {
 			commitTS = response.CommitTS

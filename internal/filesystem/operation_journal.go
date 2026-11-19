@@ -555,7 +555,7 @@ func (j *OperationJournal) storeRecordAndSessionAtRoute(ctx context.Context, ts 
 	} else {
 		response, err = j.backend.Commit(ctx, ts, elems, readKeys)
 	}
-	if err == nil && operationAccountingTrace {
+	if err == nil && operationAccountingTrace && slog.Default().Enabled(context.Background(), slog.LevelInfo) {
 		var commitTS uint64
 		if response != nil {
 			commitTS = response.CommitTS

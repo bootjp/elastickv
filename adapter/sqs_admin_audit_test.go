@@ -63,6 +63,18 @@ func TestAdminQueueInvalidNamesRecordValidation(t *testing.T) {
 	}
 }
 
+func TestDisabledPurgeAuditStillReportsOutcome(t *testing.T) {
+	var buf bytes.Buffer
+	observer := &adminQueueOutcomeRecorder{}
+	server := SQSServer{
+		adminAuditLogger: slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})),
+		adminObserver:    observer,
+	}
+	server.recordAdminPurge(t.Context(), fullAdminPrincipal, "orders", adminOutcomeNotLeader)
+	require.Equal(t, adminOutcomeNotLeader, observer.purge)
+	require.Zero(t, buf.Len())
+}
+
 // captureAdminAudit points the server's audit logger at a buffer and returns a
 // reader for the admin.sqs.purge_queue records it emits.
 func captureAdminAudit(t *testing.T, server *SQSServer) func() []map[string]any {

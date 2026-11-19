@@ -2057,7 +2057,9 @@ func (s *pebbleStore) PutAt(ctx context.Context, key []byte, value []byte, commi
 	if err := s.db.Set(k, v, pebble.NoSync); err != nil { //nolint:wrapcheck
 		return errors.WithStack(err)
 	}
-	s.log.InfoContext(ctx, "put_at", slog.String("key", string(key)), slog.Uint64("ts", commitTS))
+	if s.log.Enabled(ctx, slog.LevelInfo) {
+		s.log.InfoContext(ctx, "put_at", slog.String("key", string(key)), slog.Uint64("ts", commitTS))
+	}
 	return nil
 }
 
@@ -2077,7 +2079,9 @@ func (s *pebbleStore) DeleteAt(ctx context.Context, key []byte, commitTS uint64)
 	if err := s.db.Set(k, v, pebble.NoSync); err != nil {
 		return errors.WithStack(err)
 	}
-	s.log.InfoContext(ctx, "delete_at", slog.String("key", string(key)), slog.Uint64("ts", commitTS))
+	if s.log.Enabled(ctx, slog.LevelInfo) {
+		s.log.InfoContext(ctx, "delete_at", slog.String("key", string(key)), slog.Uint64("ts", commitTS))
+	}
 	return nil
 }
 

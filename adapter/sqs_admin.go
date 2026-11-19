@@ -384,9 +384,13 @@ func (s *SQSServer) recordAdminPurge(
 	extra ...slog.Attr,
 ) {
 	s.observeAdminPurge(name, outcome)
+	logger := s.adminLogger()
+	if !logger.Enabled(ctx, slog.LevelInfo) {
+		return
+	}
 	// access_key, role, queue, outcome.
 	const baseAuditAttrs = 4
-	attrs := make([]any, 0, len(extra)+baseAuditAttrs)
+	attrs := make([]slog.Attr, 0, len(extra)+baseAuditAttrs)
 	attrs = append(attrs,
 		// AdminPrincipal carries AccessKey, not the design's
 		// "subject": the access key ID is the identity the admin
@@ -396,10 +400,7 @@ func (s *SQSServer) recordAdminPurge(
 		slog.String("role", string(principal.Role)),
 		slog.String("queue", name),
 		slog.String("outcome", outcome))
-	for _, attr := range extra {
-		attrs = append(attrs, attr)
-	}
-	s.adminLogger().InfoContext(ctx, "admin.sqs.purge_queue", attrs...)
+	logger.LogAttrs(ctx, slog.LevelInfo, "admin.sqs.purge_queue", append(attrs, extra...)...)
 }
 
 // adminLogger returns the configured audit destination, falling back to the

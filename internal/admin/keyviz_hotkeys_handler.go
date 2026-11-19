@@ -185,9 +185,7 @@ func (h *KeyVizHotKeysHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
 	if err := json.NewEncoder(w).Encode(out); err != nil {
-		h.logger.LogAttrs(r.Context(), slog.LevelWarn, "admin keyviz hotkeys response encode failed",
-			slog.String("error", err.Error()),
-		)
+		logRequestError(r.Context(), h.logger, slog.LevelWarn, "admin keyviz hotkeys response encode failed", err)
 	}
 }
 
@@ -446,6 +444,9 @@ func positiveAsUint64(n int) uint64 {
 }
 
 func (h *KeyVizHotKeysHandler) audit(r *http.Request, p hotKeysParams, returned int, degraded bool) {
+	if !h.logger.Enabled(r.Context(), slog.LevelInfo) {
+		return
+	}
 	attrs := []slog.Attr{
 		slog.String("component", "admin.keyviz.hotkeys"),
 		slog.String("method", r.Method),

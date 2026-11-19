@@ -524,10 +524,12 @@ func (h *DynamoHandler) writeItemsError(w http.ResponseWriter, r *http.Request, 
 	case errors.Is(err, ErrItemsValidation):
 		writeJSONError(w, http.StatusBadRequest, "invalid_request", err.Error())
 	default:
-		h.logger.LogAttrs(r.Context(), slog.LevelError, "admin dynamo "+op+" item failed",
-			slog.String("table", table),
-			slog.String("error", err.Error()),
-		)
+		if h.logger.Enabled(r.Context(), slog.LevelError) {
+			h.logger.LogAttrs(r.Context(), slog.LevelError, "admin dynamo "+op+" item failed",
+				slog.String("table", table),
+				slog.String("error", err.Error()),
+			)
+		}
 		writeJSONError(w, http.StatusInternalServerError, "internal_error",
 			"failed to "+op+" item; see server logs")
 	}

@@ -336,10 +336,12 @@ func (rt *Router) serveStaticFile(w http.ResponseWriter, r *http.Request, name s
 		// silently disappear, matching the project rule that
 		// resource Close errors must be visible.
 		if cerr := f.Close(); cerr != nil {
-			slog.Warn("admin static file close failed",
-				slog.String("name", name),
-				slog.String("error", cerr.Error()),
-			)
+			if logger := slog.Default(); logger.Enabled(context.Background(), slog.LevelWarn) {
+				logger.Warn("admin static file close failed",
+					slog.String("name", name),
+					slog.String("error", cerr.Error()),
+				)
+			}
 		}
 	}()
 	info, err := f.Stat()

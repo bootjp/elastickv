@@ -94,12 +94,17 @@ func (s *ShadowReader) Compare(ctx context.Context, cmd string, args [][]byte, p
 	if kind == DivMigrationGap {
 		s.metrics.MigrationGaps.WithLabelValues(cmd).Inc()
 		count := s.gapCount.Add(1)
-		if count%s.gapLogSampleRate == 1 {
+		if count%s.gapLogSampleRate == 1 && s.logger.Enabled(context.Background(), slog.LevelDebug) {
 			s.logger.Debug("migration gap (sampled)", "cmd", cmd, "key", truncateValue(extractKey(args)))
 		}
 		return
 	}
 
+	s.metrics.Divergences.WithLabelValues(cmd, kind.String()).Inc()
+	warn := s.logger.Enabled(context.Background(), slog.LevelWarn)
+	if !warn && !s.sentry.enabled {
+		return
+	}
 	div := Divergence{
 		Command:    cmd,
 		Key:        extractKey(args),
@@ -109,12 +114,13 @@ func (s *ShadowReader) Compare(ctx context.Context, cmd string, args [][]byte, p
 		DetectedAt: time.Now(),
 	}
 
-	s.metrics.Divergences.WithLabelValues(cmd, kind.String()).Inc()
-	s.logger.Warn("response divergence detected",
-		"cmd", div.Command, "key", truncateValue(div.Key), "kind", div.Kind.String(),
-		"primary", truncateValue(div.Primary),
-		"secondary", truncateValue(div.Secondary),
-	)
+	if warn {
+		s.logger.Warn("response divergence detected",
+			"cmd", div.Command, "key", truncateValue(div.Key), "kind", div.Kind.String(),
+			"primary", truncateValue(div.Primary),
+			"secondary", truncateValue(div.Secondary),
+		)
+	}
 	s.sentry.CaptureDivergence(div)
 }
 
