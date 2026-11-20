@@ -743,7 +743,7 @@
     (is (thrown? clojure.lang.ExceptionInfo
                  (client/open! (:client test-map) test-map "n9")))))
 
-(deftest remote-setup-is-serialized-across-replicated-mounts
+(deftest remote-setup-is-shared-and-serialized-across-replicated-mounts
   (let [entered (promise) release (promise) attempted (promise)
         seen (atom [])
         base (:client (workload/filesystem-register-workload
@@ -768,7 +768,7 @@
               (deliver release true)
               (is (= :ok (deref first-call 5000 :timeout)))
               (is (= :ok (deref other-call 5000 :timeout)))
-              (is (= ["n1" "n2"] @seen)))
+              (is (= ["n1"] @seen) "other mounts await the same completed initialization"))
             (finally (deliver release true))))))))
 
 (deftest remote-setup-bounds-commands-without-dropping-registers
@@ -794,3 +794,46 @@
         (is (= workload/record-width (.length (io/file (workload/register-path dir k)))))
         (is (= workload/initial-value (workload/local-read (workload/register-path dir k)))))
       (finally (delete-tree! root)))))
+
+(deftest remote-setup-seeds-shared-files-once
+  (let [commands (atom [])
+        base (:client (workload/filesystem-register-workload
+                        {:key-count 2 :node->mount-dir {"n1" "/mount" "n2" "/mount" "n3" "/mount"}}))]
+    (with-redefs-fn
+      {#'workload/remote-exec! (fn [_ node command] (swap! commands conj [node command]) "")}
+      (fn []
+        (doseq [node ["n1" "n2" "n3" "n1" "n2" "n3"]]
+          (client/setup! (client/open! base {} node) {}))))
+    (is (= 1 (count @commands)) "all worker copies share the same replicated seed files")
+    (is (str/includes? (second (first @commands)) "reg-0"))
+    (is (str/includes? (second (first @commands)) "reg-1"))))
+
+
+(deftest failed-remote-setup-does-not-publish-completion
+  (let [calls (atom 0)
+        base (:client (workload/filesystem-register-workload
+                        {:key-count 2 :max-retries 1 :node->mount-dir {"n1" "/mount" "n2" "/mount"}}))
+        first-client (client/open! base {} "n1")
+        other-client (client/open! base {} "n2")]
+    (with-redefs-fn
+      {#'workload/remote-exec!
+       (fn [_ _ _]
+         (when (= 1 (swap! calls inc))
+           (throw (java.io.IOException. "seed interrupted")))
+         "")}
+      (fn []
+        (is (thrown? java.io.IOException (client/setup! first-client {})))
+        (client/setup! other-client {})
+        (client/setup! first-client {})
+        (is (= 2 @calls) "a failed seed must be retried; a successful seed must be shared")))))
+
+(deftest remote-setup-state-is-scoped-to-one-workload
+  (let [calls (atom 0)]
+    (with-redefs-fn
+      {#'workload/remote-exec! (fn [& _] (swap! calls inc) "")}
+      (fn []
+        (dotimes [_ 2]
+          (let [base (:client (workload/filesystem-register-workload
+                               {:key-count 2 :node->mount-dir {"n1" "/mount"}}))]
+            (client/setup! (client/open! base {} "n1") {})))
+        (is (= 2 @calls) "a new test must initialize its own seed files")))))

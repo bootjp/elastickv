@@ -547,7 +547,7 @@
         (assoc op :type :ok :value (independent/tuple k kind) :error (io-error-label e))
         (fail op (io-error-label e))))))
 
-(defrecord FilesystemClient [node->mount-dir write-mode key-count max-retries require-fuse-mount setup-lock node mount-dir local?]
+(defrecord FilesystemClient [node->mount-dir write-mode key-count max-retries require-fuse-mount setup-state node mount-dir local?]
   client/Client
   (open! [this test node]
     (let [dir (or (get node->mount-dir node)
@@ -561,18 +561,18 @@
     (let [keys (range key-count)]
       (when (and local? require-fuse-mount)
         (require-local-fuse-mount! mount-dir))
-      ;; Local and remote mounts share the same replicated files. Serialize
-      ;; initialization across all client copies, including different nodes,
-      ;; rather than racing their create/truncate/write operations. This lock
-      ;; is only used before the measured workload begins.
-      (locking setup-lock
-        (with-retries max-retries
-          #(if local?
-             (local-setup! mount-dir keys)
-             (doseq [batch (partition-all 128 keys)]
-               ;; Bound each SSH shell argument even when the checker budget
-               ;; redistributes thousands of registers. Keep all seed keys.
-               (remote-exec! test node (remote-setup-cmd mount-dir batch))))))))
+      ;; Worker copies on remote nodes see the same replicated files. Seed
+      ;; once before the measured workload, and publish completion only after
+      ;; every batch succeeds. Local scratch mounts still initialize separately.
+      (locking setup-state
+        (when (or local? (not @setup-state))
+          (with-retries max-retries
+            #(if local?
+               (local-setup! mount-dir keys)
+               (doseq [batch (partition-all 128 keys)]
+                 ;; Bound each SSH shell argument without dropping seed keys.
+                 (remote-exec! test node (remote-setup-cmd mount-dir batch)))))
+          (when-not local? (reset! setup-state true))))))
 
   (teardown! [_this test]
     ;; Jepsen runs teardown! before setup! and again after the test, so the
@@ -683,7 +683,7 @@
         require-fuse    (if (contains? opts :require-fuse-mount) (boolean (:require-fuse-mount opts)) true)
         node->dir       (or (:node->mount-dir opts)
                             (node->mount-dir default-nodes nil default-mount-dir))
-        client          (->FilesystemClient node->dir write-mode key-count max-retries require-fuse (Object.) nil nil false)]
+        client          (->FilesystemClient node->dir write-mode key-count max-retries require-fuse (atom false) nil nil false)]
     (when-not (contains? write-modes write-mode)
       (throw (ex-info "unknown write mode" {:write-mode write-mode})))
     {:client    client
