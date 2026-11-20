@@ -132,8 +132,9 @@ groups and do not cancel each other.
 Stress `time-limit`, `rate`, `key-count`, `max-writes-per-key`, and
 `max-txn-length` inputs are forwarded. Fault concurrency is six to cover the
 three nodes; it is independent of the local S3 workload's concurrency setting.
-S3 reuses `s3_budget.sh` to cap per-object histories at 16 operations while
-preserving the aggregate requested budget. Effective settings are saved in
+S3 and gRPC use `s3_budget.sh` to cap each register history at 16 operations:
+at most 13 generated operations and three final reads, one from each node.
+The aggregate requested generated-operation budget is preserved. Effective settings are saved in
 `parameters.txt`. SDK retries are disabled for DynamoDB/SQS only in this fault
 harness so uncertain outcomes remain visible rather than replaying workload
 operations. Fault-only DynamoDB/SQS HTTP requests have a 10-second total
