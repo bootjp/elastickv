@@ -25,7 +25,7 @@ import (
 
 // enableMigrationRuntimeFlags turns on the migration opcodes for the test
 // and returns node auth with peer-auth enforcement complete.
-func enableMigrationRuntimeFlags(t *testing.T) nodeauth.Flags {
+func enableMigrationRuntimeFlags(t testing.TB) nodeauth.Flags {
 	t.Helper()
 	for _, env := range []string{adapter.MigrationImportOpcodeEnv, adapter.MigrationPromoteOpcodeEnv, adapter.MigrationCleanupOpcodeEnv} {
 		t.Setenv(env, "true")

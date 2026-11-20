@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"time"
 
+	internalutil "github.com/bootjp/elastickv/internal"
 	pb "github.com/bootjp/elastickv/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -150,11 +151,20 @@ func run() error {
 	address := flag.String("address", "", "Public gRPC endpoint")
 	api := flag.String("api", apiRaw, "raw or transactional")
 	timeout := flag.Duration("timeout", defaultTimeout, "Deadline per operation")
+	ca := flag.String("tls-ca-file", "", "CA certificate for verified gRPC TLS")
 	flag.Parse()
 	if *address == "" || (*api != apiRaw && *api != apiTransactional) || *timeout <= 0 {
 		return errors.New("require address, api=raw|transactional, and positive timeout")
 	}
-	conn, err := grpc.NewClient(*address, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	creds := insecure.NewCredentials()
+	if *ca != "" {
+		verified, err := internalutil.GRPCClientTLSCredentials(*ca)
+		if err != nil {
+			return fmt.Errorf("load gRPC CA: %w", err)
+		}
+		creds = verified
+	}
+	conn, err := grpc.NewClient(*address, grpc.WithTransportCredentials(creds))
 	if err != nil {
 		return fmt.Errorf("connect gRPC: %w", err)
 	}

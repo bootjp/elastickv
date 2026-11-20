@@ -348,7 +348,7 @@ func allocateBootstrapE2EEndpoints(t *testing.T, nodeCount int) ([]bootstrapE2EE
 }
 
 func allocateBootstrapE2EMultiGroupEndpoints(
-	t *testing.T,
+	t testing.TB,
 	nodeCount int,
 	groupIDs []uint64,
 ) ([]bootstrapE2EMultiGroupEndpoint, []bootstrapE2EMultiGroupListeners) {
@@ -985,7 +985,7 @@ func startBoundDynamoDBServer(
 	return nil
 }
 
-func closeBootstrapE2ENodes(t *testing.T, nodes []*bootstrapE2ENode) {
+func closeBootstrapE2ENodes(t testing.TB, nodes []*bootstrapE2ENode) {
 	t.Helper()
 	for _, n := range nodes {
 		require.NoError(t, n.close())
@@ -1019,7 +1019,7 @@ func waitForBootstrapClusterConfig(t *testing.T, nodes []*bootstrapE2ENode, expe
 }
 
 func waitForMultiGroupBootstrapClusterConfig(
-	t *testing.T,
+	t testing.TB,
 	nodes []*bootstrapE2ENode,
 	endpoints []bootstrapE2EMultiGroupEndpoint,
 	groupIDs []uint64,
@@ -1085,7 +1085,7 @@ func waitForSingleLeader(t *testing.T, nodes []*bootstrapE2ENode) int {
 	return leaderIdx
 }
 
-func waitForGroupLeader(t *testing.T, nodes []*bootstrapE2ENode, groupID uint64, waitTimeout, waitInterval time.Duration) int {
+func waitForGroupLeader(t testing.TB, nodes []*bootstrapE2ENode, groupID uint64, waitTimeout, waitInterval time.Duration) int {
 	t.Helper()
 
 	leaderIdx := -1
@@ -1112,7 +1112,7 @@ func waitForGroupLeader(t *testing.T, nodes []*bootstrapE2ENode, groupID uint64,
 }
 
 func waitForGroupLeaderOnNode(
-	t *testing.T,
+	t testing.TB,
 	nodes []*bootstrapE2ENode,
 	groupID uint64,
 	wantIdx int,

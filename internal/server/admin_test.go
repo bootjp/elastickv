@@ -584,7 +584,7 @@ func TestStartAdminServer_ServesTLS(t *testing.T) {
 // writeSelfSignedCert writes a short-lived self-signed certificate to a
 // temp dir and returns the cert / key paths. The certificate is valid
 // for 127.0.0.1 only; tests that need TLS should run with it.
-func writeSelfSignedCert(t *testing.T) (string, string) {
+func writeSelfSignedCert(t testing.TB) (string, string) {
 	t.Helper()
 	dir := t.TempDir()
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
