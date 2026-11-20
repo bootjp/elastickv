@@ -4,18 +4,23 @@
 
 The public gRPC RawKV adapter projected migration fences as `Unknown` even when
 the single RawPut had been rejected before data proposal. In the instrumented
-baseline, 4,163 errors originated at the coordinator's pre-routing write fence,
-40 at preproposal cutover admission, 68 were Forward failures, and three were
-context cancellation: 4,274 failed writes in total (4,263 public Unknown and 11
-DeadlineExceeded). The diagnostic is not a performance comparison.
+baseline, error classes contained 4,163 fence errors, 40 cutover errors, 68
+Forward outcome-unknown errors, and three context cancellations: 4,274 failed
+writes in total (4,263 public Unknown and 11 DeadlineExceeded). Only the first
+stack per class was captured: the sampled fence stack shows the coordinator's
+pre-routing check and the cutover sample shows admission rejection. These
+samples do not establish the originating call site of every counted error.
+The diagnostic is not a performance comparison.
 
 A second race remained after correcting admission classification: migration
 metadata could change after the advisory preproposal check but before Raft
 apply. The FSM rejected the entry before any data mutation, but the RawKV
 transaction layer discarded its nonzero commit index. A diagnostic of that
-intermediate implementation found two remaining Unknown writes: one local
-apply rejection and one forwarded apply rejection. No ownership or
-durability guard was removed to fix this race.
+intermediate implementation found two remaining Unknown writes. The local
+cutover error's captured stack establishes a pre-data FSM rejection. The other
+was a Forward INTERRUPTED / OUTCOME_UNKNOWN verdict; its remote originating
+call site was not established by that diagnostic. No ownership or durability
+guard was removed to fix the observed local race.
 
 The correction retains scoped evidence through the coordinator, transaction
 layer, Forward protocol, and public gRPC projection:
@@ -74,8 +79,11 @@ not a significance estimate.
 The original diagnostic, exploratory-v3, and remaining-error diagnostic are
 excluded from formal timing. One diagnostic launch failed before test startup
 because transfer had not completed (exit 126, Text file busy); it was rerun
-only after verifying the complete binary hash. Formal runs verify hashes before
-launch. Large binaries and diagnostic overlays remain in the local artifact
+only after verifying the complete binary hash. Formal runners record hashes
+before launch; all four recorded hashes were checked against `source.json`
+during aggregation. The final candidate transfer was additionally checked
+against its expected hash before being released for execution. Large binaries
+and diagnostic overlays remain in the local artifact
 directory `/private/tmp/elastickv-outcome-20261121-artifacts` and the preserved
 guest directory `/home/bootjp/outcome-20261121`.
 
@@ -88,7 +96,7 @@ a summary from each `*-run.log`; it retains all errors and drops.
 | Metric | Baseline A1 / A2 | Fixed B1 / B2 |
 | --- | --- | --- |
 | Write Unknown | 4,246 / 4,284 | 0 / 0 |
-| Known write rejection | 0 / 0 | Unavailable 4,260 + Aborted 1 / Unavailable 4,265 + Aborted 2 |
+| Write Unavailable / Aborted | 0 / 0 | Unavailable 4,260 + Aborted 1 / Unavailable 4,265 + Aborted 2 |
 | Mean successful reads/s | 194.069 | 194.355 (+0.15%) |
 | Mean successful writes/s | 180.331 | 180.982 (+0.36%) |
 | Mean of per-trial read p99, ms | 83.001 | 82.771 |
@@ -112,12 +120,19 @@ post-Done paths (3,000 writes/readbacks per trial). Both fixed runs completed
 preflight within five seconds at this load; no bound is established for other
 workloads.
 
-Availability is **not clean**: fixed runs still reject 4,261 / 4,267 writes,
+The formal load driver records `status.Code(err)`, not `ErrorInfo.reason`.
+Thus the observed result is zero write Unknown and 4,261 / 4,267 write
+Unavailable-or-Aborted responses. The NOT_ADMITTED/PROVEN_NONCOMMIT mapping is
+an API contract verified by focused regression tests, not a per-error reason
+measurement in these four trials. Failed writes are not included in the ACK
+audit, so that audit does not independently prove their absence from storage.
+
+Availability is **not clean**: fixed runs still fail 4,261 / 4,267 writes,
 have 166 / 175 read Unknown errors during migration, and drop 32,207 / 33,429
 operations at the concurrency limit plus 108 / 92 scheduler drops. The baseline
 also has read errors and drops; see [the full table](comparison.md). Changing
-write outcomes from indeterminate to proven rejection does not eliminate these
-availability failures or justify replaying genuinely indeterminate operations.
+write outcome reporting does not eliminate these availability failures or
+justify replaying genuinely indeterminate operations.
 
 Regression evidence includes a real coordinator rejecting a point mutation
 without calling Commit, a real FSM guard racing the advisory check and refusing
