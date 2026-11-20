@@ -1,0 +1,93 @@
+diff --git a/kv/sharded_coordinator.go b/kv/sharded_coordinator.go
+index f8e7f8a09..b32b81ce4 100644
+--- a/kv/sharded_coordinator.go
++++ b/kv/sharded_coordinator.go
+@@ -3495,6 +3495,10 @@ func (c *ShardedCoordinator) rawLogs(ctx context.Context, reqs *OperationGroup[O
+ }
+ 
+ func (c *ShardedCoordinator) rawLogsWithGroups(ctx context.Context, reqs *OperationGroup[OP]) ([]*pb.Request, []uint64, error) {
++	var observed uint64
++	if c.engine != nil {
++		observed = EncodeObservedRouteVersion(c.engine.Version())
++	}
+ 	grouped, gids, err := c.groupMutations(reqs.Elems, reqs.KeyVizLabel)
+ 	if err != nil {
+ 		return nil, nil, err
+@@ -3513,14 +3517,18 @@ func (c *ShardedCoordinator) rawLogsWithGroups(ctx context.Context, reqs *Operat
+ 				return nil, nil, err
+ 			}
+ 		}
+-		logs = append(logs, &pb.Request{
++		request := &pb.Request{
+ 			IsTxn:                false,
+ 			Phase:                pb.Phase_NONE,
+ 			Ts:                   ts,
+ 			Mutations:            muts,
+ 			ObservedRouteVersion: reqs.ObservedRouteVersion,
+ 			WriteFenceBypassKeys: bypassKeysByGroup[gid],
+-		})
++		}
++		if err := c.pinRawMigrationVersion(ctx, gid, request, observed); err != nil {
++			return nil, nil, err
++		}
++		logs = append(logs, request)
+ 	}
+ 	return logs, gids, nil
+ }
+diff --git a/kv/sharded_coordinator_migration_version.go b/kv/sharded_coordinator_migration_version.go
+new file mode 100644
+index 000000000..c2d47d8f0
+--- /dev/null
++++ b/kv/sharded_coordinator_migration_version.go
+@@ -0,0 +1,51 @@
++package kv
++
++import (
++	"context"
++
++	pb "github.com/bootjp/elastickv/proto"
++	"github.com/bootjp/elastickv/store"
++	"github.com/cockroachdb/errors"
++)
++
++// Migration creation requires a tracked routing version even for raw writes.
++// Keep ordinary raw writes unpinned and preserve any caller-supplied version.
++// This only supplies the observation; proposal and apply still prove ownership.
++func (c *ShardedCoordinator) pinRawMigrationVersion(ctx context.Context, groupID uint64, request *pb.Request, observed uint64) error {
++	if request.ObservedRouteVersion != 0 {
++		return nil
++	}
++	group := c.groups[groupID]
++	if group == nil || group.Store == nil {
++		return nil
++	}
++	present, err := rawMigrationMetadataPresent(ctx, group.Store)
++	if err != nil || !present {
++		return err
++	}
++	view, err := readMigrationServingState(ctx, group.Store)
++	if err != nil {
++		return err
++	}
++	ranges, err := migrationServingFootprint(request)
++	if err != nil {
++		return err
++	}
++	if !migrationApplyIntersects(view, ranges) {
++		return nil
++	}
++	if observed == 0 {
++		return errors.WithStack(ErrRouteCutoverPending)
++	}
++	request.ObservedRouteVersion = observed
++	return nil
++}
++
++func rawMigrationMetadataPresent(ctx context.Context, st store.MVCCStore) (bool, error) {
++	reader, ok := st.(store.MigrationServingSummaryReader)
++	if !ok {
++		return true, nil
++	}
++	summary, err := reader.MigrationServingSummary(ctx)
++	return summary.Present, errors.WithStack(err)
++}

@@ -13,7 +13,7 @@ import (
 // caller's source ownership acquisition. Initial arm ACKs bind C explicitly;
 // resumed ticks collect a fresh exact all-member ownership ACK, never just
 // stamp a newly observed configuration onto a previously saved proof.
-func (s *DistributionServer) ensureSplitJobTransferControl(ctx context.Context, job distribution.SplitJob, groupID uint64, source SplitMigrationClient, control *pb.TargetStagedReadinessRequest, ownershipACK []byte) (*splitTransferAdmissionWitness, error) {
+func (s *DistributionServer) ensureSplitJobTransferControl(ctx context.Context, job distribution.SplitJob, groupID uint64, source SplitMigrationClient, control *pb.TargetStagedReadinessRequest, ownershipACK []byte, options ...splitTransferAdmissionOptions) (*splitTransferAdmissionWitness, error) {
 	if source == nil || control == nil {
 		return nil, errors.New("transfer phase source or control is missing")
 	}
@@ -36,16 +36,21 @@ func (s *DistributionServer) ensureSplitJobTransferControl(ctx context.Context, 
 	bound := proto.CloneOf(control)
 	// This temporary witness only collects the fresh ownership ACK. It is not
 	// returned or used as control evidence until ensure completes guard ACKs.
-	ack := &splitTransferAdmissionWitness{groupID: groupID, snapshot: snapshot, control: bound, ownershipProof: proof}
-	if err := probeSplitTransferOwnership(ctx, ack, snapshot.Members); err != nil {
-		return nil, err
+	// Preflight immediately repeats this exact ownership proof in ensure below,
+	// before any control ACK or proposal. Keep that authoritative all-member
+	// pass while avoiding an otherwise redundant round of read-only probes.
+	if !splitTransferReadsExistingControl(options) {
+		ack := &splitTransferAdmissionWitness{groupID: groupID, snapshot: snapshot, control: bound, ownershipProof: proof}
+		if err := probeSplitTransferOwnership(ctx, ack, snapshot.Members); err != nil {
+			return nil, err
+		}
 	}
 	bound.RequireConfigurationIndex, bound.ExpectedConfigurationIndex = true, configuration
 	if bound.ExpectedCutoverVersion == 0 {
 		bound.ExpectedCutoverVersion = proof.GetSourceTrackerVersion()
 	}
 	bound.MinWriteTsExclusive = max(bound.GetMinWriteTsExclusive(), proof.GetMinWriteTsExclusive())
-	return s.ensureSplitTransferAdmission(ctx, job, groupID, source, bound, proof)
+	return s.ensureSplitTransferAdmission(ctx, job, groupID, source, bound, proof, options...)
 }
 
 func splitTransferPhaseConfiguration(configuration uint64, control *pb.TargetStagedReadinessRequest, ownershipACK []byte) (uint64, error) {
@@ -70,7 +75,7 @@ func validSplitTransferPhaseOwnership(state *pb.ProbeMigrationStateResponse, gro
 		validSplitTransferOwner(groupID, state.GetOwnership())
 }
 
-func (s *DistributionServer) ensureSplitJobTransferPhase(ctx context.Context, job distribution.SplitJob, source SplitMigrationClient, ownershipACK []byte) (*splitTransferAdmissionWitness, error) {
+func (s *DistributionServer) ensureSplitJobTransferPhase(ctx context.Context, job distribution.SplitJob, source SplitMigrationClient, ownershipACK []byte, options ...splitTransferAdmissionOptions) (*splitTransferAdmissionWitness, error) {
 	snapshot, route, err := s.splitJobSourceRoute(ctx, job)
 	if err != nil {
 		return nil, err
@@ -85,7 +90,7 @@ func (s *DistributionServer) ensureSplitJobTransferPhase(ctx context.Context, jo
 	if err != nil {
 		return nil, err
 	}
-	return s.ensureSplitJobTransferControl(ctx, job, route.GroupID, source, control, ownershipACK)
+	return s.ensureSplitJobTransferControl(ctx, job, route.GroupID, source, control, ownershipACK, options...)
 }
 
 func splitTransferPhaseControl(job distribution.SplitJob, route distribution.RouteDescriptor, catalogVersion uint64) (*pb.TargetStagedReadinessRequest, error) {
@@ -114,4 +119,8 @@ func splitTransferPhaseControl(job distribution.SplitJob, route distribution.Rou
 	}
 	control.SourceWriteFence, control.MinWriteTsExclusive = true, job.SnapshotTS
 	return control, nil
+}
+
+func splitTransferReadsExistingControl(options []splitTransferAdmissionOptions) bool {
+	return len(options) > 0 && options[0].readExistingControl
 }

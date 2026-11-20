@@ -47,11 +47,19 @@ func MigrationNamespaceInstalledVersion(st store.MVCCStore, fsm raftengine.State
 // support. It is safe for public handlers to fail closed before proposal using
 // this API; FSM user admission consults only its ordered durable counterpart.
 func MigrationNamespaceAdmissionVersion(ctx context.Context, st store.MVCCStore) (uint32, error) {
+	version, _, err := MigrationNamespaceAdmissionState(ctx, st)
+	return version, err
+}
+
+// MigrationNamespaceAdmissionState reads activation version and configuration
+// index from one durable record, so concurrent configuration changes cannot
+// combine the version of one record with the index of another.
+func MigrationNamespaceAdmissionState(ctx context.Context, st store.MVCCStore) (uint32, uint64, error) {
 	if st == nil {
-		return 0, errors.WithStack(ErrMigrationNamespaceProtocol)
+		return 0, 0, errors.WithStack(ErrMigrationNamespaceProtocol)
 	}
 	state, err := readNamespaceConfiguration(ctx, st)
-	return state.Version, err
+	return state.Version, state.Index, err
 }
 
 // RequireMigrationNamespaceAdmission applies to every mutating migration RPC,

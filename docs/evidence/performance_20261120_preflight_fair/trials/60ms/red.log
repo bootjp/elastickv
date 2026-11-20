@@ -1,0 +1,10 @@
+2000/01/01 09:00:05 WARN split job runner tick failed err="rpc error: code = Internal desc = split job catalog: context deadline exceeded\n(1) attached stack trace\n  -- stack trace:\n  | github.com/bootjp/elastickv/adapter.grpcStatusErrorf\n  | \t/Users/bootjp/src/elastickv/adapter/distribution_server.go:2636\n  | github.com/bootjp/elastickv/adapter.splitJobCatalogStatusError\n  | \t/Users/bootjp/src/elastickv/adapter/distribution_server.go:2314\n  | github.com/bootjp/elastickv/adapter.(*DistributionServer).RunSplitJobRunnerOnce\n  | \t/Users/bootjp/src/elastickv/adapter/distribution_server.go:396\n  | github.com/bootjp/elastickv/adapter.(*DistributionServer).RunSplitJobRunner\n  | \t/Users/bootjp/src/elastickv/adapter/distribution_server.go:373\n  | github.com/bootjp/elastickv/adapter.TestPreflightRunnerReschedulesDurablePagesWithinFiveSeconds.func1.3\n  | \t/Users/bootjp/src/elastickv/adapter/split_job_preflight_schedule_test.go:32\n  | runtime.goexit\n  | \t/usr/local/go/src/runtime/asm_arm64.s:1039\nWraps: (2) rpc error: code = Internal desc = split job catalog: context deadline exceeded\nError types: (1) *withstack.withStack (2) *status.Error"
+--- FAIL: TestPreflightRunnerReschedulesDurablePagesWithinFiveSeconds (0.02s)
+    split_job_preflight_schedule_test.go:40: 
+        	Error Trace:	/Users/bootjp/src/elastickv/adapter/split_job_preflight_schedule_test.go:40
+        	Error:      	Should be true
+        	Test:       	TestPreflightRunnerReschedulesDurablePagesWithinFiveSeconds
+        	Messages:   	preflight exceeded five seconds with bounded page I/O
+FAIL
+FAIL	github.com/bootjp/elastickv/adapter	0.833s
+FAIL

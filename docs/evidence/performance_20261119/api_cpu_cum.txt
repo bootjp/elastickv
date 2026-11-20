@@ -1,0 +1,30 @@
+File: server.test
+Type: cpu
+Time: 2026-11-19 17:52:04 JST
+Duration: 265.64s, Total samples = 639.26s (240.65%)
+Showing nodes accounting for 286.85s, 44.87% of 639.26s total
+Dropped 2408 nodes (cum <= 3.20s)
+Showing top 22 nodes out of 139
+      flat  flat%   sum%        cum   cum%
+     0.01s 0.0016% 0.0016%    286.11s 44.76%  syscall.syscalln
+   285.78s 44.70% 44.71%    285.87s 44.72%  syscall.rawsyscalln
+     0.02s 0.0031% 44.71%    285.08s 44.60%  syscall.syscall
+     0.02s 0.0031% 44.71%    284.32s 44.48%  internal/poll.ignoringEINTRIO (inline)
+         0     0% 44.71%    252.31s 39.47%  runtime.mcall
+     0.12s 0.019% 44.73%    241.86s 37.83%  runtime.schedule
+     0.22s 0.034% 44.77%    229.86s 35.96%  runtime.findRunnable
+     0.03s 0.0047% 44.77%    178.91s 27.99%  runtime.park_m
+     0.06s 0.0094% 44.78%    177.12s 27.71%  google.golang.org/grpc/internal/transport.(*loopyWriter).run
+     0.02s 0.0031% 44.78%    171.53s 26.83%  internal/poll.(*FD).Write
+         0     0% 44.78%    171.43s 26.82%  syscall.Write (inline)
+     0.04s 0.0063% 44.79%    171.43s 26.82%  syscall.write
+         0     0% 44.79%    170.82s 26.72%  google.golang.org/grpc/internal/transport.(*bufWriter).Flush
+     0.05s 0.0078% 44.80%    170.78s 26.72%  google.golang.org/grpc/internal/transport.(*bufWriter).flushKeepBuffer
+     0.18s 0.028% 44.83%    170.73s 26.71%  crypto/tls.(*Conn).Write
+     0.09s 0.014% 44.84%    170.63s 26.69%  crypto/tls.(*Conn).writeRecordLocked
+     0.02s 0.0031% 44.84%    169.62s 26.53%  net.(*conn).Write
+         0     0% 44.84%    169.60s 26.53%  net.(*netFD).Write
+     0.01s 0.0016% 44.84%    169.52s 26.52%  crypto/tls.(*Conn).write
+     0.04s 0.0063% 44.85%    116.08s 18.16%  google.golang.org/grpc/internal/transport.(*framer).readFrame
+     0.11s 0.017% 44.87%    114.16s 17.86%  golang.org/x/net/http2.(*Framer).ReadFrameHeader
+     0.03s 0.0047% 44.87%    114.03s 17.84%  golang.org/x/net/http2.readFrameHeader

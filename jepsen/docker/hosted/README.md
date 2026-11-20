@@ -132,8 +132,9 @@ groups and do not cancel each other.
 Stress `time-limit`, `rate`, `key-count`, `max-writes-per-key`, and
 `max-txn-length` inputs are forwarded. Fault concurrency is six to cover the
 three nodes; it is independent of the local S3 workload's concurrency setting.
-S3 reuses `s3_budget.sh` to cap per-object histories at 32 operations while
-preserving the aggregate requested budget. Effective settings are saved in
+S3 and gRPC use `s3_budget.sh` to cap each register history at 16 operations:
+at most 13 generated operations and three final reads, one from each node.
+The aggregate requested generated-operation budget is preserved. Effective settings are saved in
 `parameters.txt`. SDK retries are disabled for DynamoDB/SQS only in this fault
 harness so uncertain outcomes remain visible rather than replaying workload
 operations. Fault-only DynamoDB/SQS HTTP requests have a 10-second total
@@ -151,8 +152,10 @@ JEPSEN_TIME_LIMIT=300 JEPSEN_REPEAT_FAULTS=true JEPSEN_MIN_FAULT_CYCLES=2 \
 ```
 
 With 5s intervals, two cycles require a main phase longer than 65s plus time
-for fault operations. The reusable workflow has a 25-minute step budget for
-image build, setup, workload, recovery, analysis, and cleanup.
+for fault operations. The reusable workflow allows 25 minutes for image build,
+setup, workload, recovery, analysis, and cleanup; Filesystem jobs allow 40
+minutes so all 6,000 final observations in the stress configuration can finish.
+The fault phase and generated workload are unchanged by this wall-clock limit.
 
 Results are written to `artifacts/jepsen-<adapter>-<fault>/`: the complete Jepsen `store/`
 (packed as `store.tar.gz` to preserve timestamp paths containing colons),
@@ -178,6 +181,29 @@ registers remain nil; unexpected read payloads remain observations so the
 checkers can reject them. The TransactionalKV name does not imply multi-request
 transactions: PreWrite/Commit/Rollback are unimplemented, so this suite checks
 its supported Get/Put calls individually.
+
+Filesystem bounds each key to 16 writes and at most 16 generated reads, plus
+one final read per node, while preserving the aggregate requested write budget.
+Its Knossos checker uses the linear analyzer alone: racing WGL exhausted the
+heap on captured indeterminate-write histories. All client outcomes and final
+reads remain in the checker input; unknown verdicts fail the run.
+
+A final read may re-observe mount or workload-directory availability until one
+30-second monotonic deadline from its invocation. Missing, truncated, or corrupt
+records retain the ordinary 128-attempt limit, and changing error types resets
+neither limit. If the deadline ends before enough attempts can confirm a missing
+or malformed record, the read remains unobserved rather than certifying data loss.
+A data-loss-shaped error first seen after availability retries exceeded the
+original limit also ends unobserved, without resetting the retry budget.
+Main-phase reads and writes retain their existing policy. A single
+SSH call can overrun the observation deadline; no further attempt is then started.
+Every final completion records its attempts, actual elapsed time, key, node, last
+error, and limit overruns in `:final-observation`. The per-key final-read result
+retains independent `:availability` diagnostics and all extended observations.
+A successful consistency verdict does not establish that the original attempt
+limit or the observation deadline was met; older uninstrumented histories report
+those bounds as unknown unless an overrun is already proven by another observation.
+Persistent unobserved final reads still fail the run.
 
 Filesystem fault jobs use actual node-local FUSE mounts and SSH file operations,
 including overwrite and rename modes. Every mount uses the mandatory strict
@@ -208,6 +234,10 @@ rename and SQLite entries use mandatory strict mode and also run Elle. The
 `strict-mode` dispatch input and legacy benchmark entries are removed. Old legacy
 benchmark names are explicitly rejected; single-group and two-group strict
 benchmarks remain. Its fault matrix adds both gRPC APIs and both Filesystem modes.
+SQS Standard begins its measured generator with one send, then runs the mixed
+send/receive phase. This prevents a short smoke run from sampling only serialized
+empty-queue polls. Validation still requires at least one acknowledged send;
+delivery and deletion checks are unchanged.
 SQS retains its dedicated delivery/acknowledgement checkers. Distribution,
 RaftAdmin, backup, monitoring and internal replication/control RPCs do not expose
 application register transactions and are not presented as Elle-tested data

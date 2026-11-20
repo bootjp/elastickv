@@ -1,0 +1,105 @@
+{
+  "scope": "exploratory, before final legacy corrections; not full migration",
+  "runs": [
+    {
+      "pair": 1,
+      "variant": "baseline",
+      "lower_ms": 12957.62,
+      "upper_ms": 12980.055,
+      "read_success": 125283,
+      "read_errors": 0,
+      "read_ops_s": 9677.3,
+      "read_p99_ms": 3.049,
+      "write_success": 4930,
+      "write_errors": 0,
+      "write_ops_s": 380.8,
+      "write_p99_ms": 20.539
+    },
+    {
+      "pair": 1,
+      "variant": "candidate",
+      "lower_ms": 3269.477,
+      "upper_ms": 3290.156,
+      "read_success": 32824,
+      "read_errors": 0,
+      "read_ops_s": 9919.0,
+      "read_p99_ms": 2.296,
+      "write_success": 1346,
+      "write_errors": 0,
+      "write_ops_s": 406.7,
+      "write_p99_ms": 16.048
+    },
+    {
+      "pair": 2,
+      "variant": "baseline",
+      "lower_ms": 12129.668,
+      "upper_ms": 12150.036,
+      "read_success": 124619,
+      "read_errors": 0,
+      "read_ops_s": 10276.6,
+      "read_p99_ms": 2.25,
+      "write_success": 5153,
+      "write_errors": 0,
+      "write_ops_s": 424.9,
+      "write_p99_ms": 16.746
+    },
+    {
+      "pair": 2,
+      "variant": "candidate",
+      "lower_ms": 3339.944,
+      "upper_ms": 3360.093,
+      "read_success": 28973,
+      "read_errors": 0,
+      "read_ops_s": 8741.8,
+      "read_p99_ms": 3.471,
+      "write_success": 1161,
+      "write_errors": 0,
+      "write_ops_s": 350.3,
+      "write_p99_ms": 19.955
+    },
+    {
+      "pair": 3,
+      "variant": "baseline",
+      "lower_ms": 12109.705,
+      "upper_ms": 12125.563,
+      "read_success": 122864,
+      "read_errors": 0,
+      "read_ops_s": 10203.5,
+      "read_p99_ms": 2.21,
+      "write_success": 4935,
+      "write_errors": 0,
+      "write_ops_s": 409.8,
+      "write_p99_ms": 17.218
+    },
+    {
+      "pair": 3,
+      "variant": "candidate",
+      "lower_ms": 3268.877,
+      "upper_ms": 3290.731,
+      "read_success": 31386,
+      "read_errors": 0,
+      "read_ops_s": 9482.6,
+      "read_p99_ms": 2.866,
+      "write_success": 1278,
+      "write_errors": 0,
+      "write_ops_s": 386.1,
+      "write_p99_ms": 19.511
+    }
+  ],
+  "medians": {
+    "baseline": {
+      "upper_ms": 12150.036,
+      "read_ops_s": 10203.5,
+      "write_ops_s": 409.8,
+      "read_p99_ms": 2.25,
+      "write_p99_ms": 17.218
+    },
+    "candidate": {
+      "upper_ms": 3290.731,
+      "read_ops_s": 9482.6,
+      "write_ops_s": 386.1,
+      "read_p99_ms": 2.866,
+      "write_p99_ms": 19.511
+    }
+  }
+}

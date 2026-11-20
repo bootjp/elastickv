@@ -1,0 +1,24 @@
+    performance_split_test.go:55: PERF topology nodes=3 groups=2 source_leader=0 target_leader=0 fsm_sync_mode=""
+    performance_split_test.go:75: PERF phase=before-read write=false elapsed_s=2.000 success=93393 errors=0 ops_s=46694.2 p50_ms=0.151 p99_ms=0.510 first_error=<nil>
+    performance_split_test.go:75: PERF phase=before-write write=true elapsed_s=2.213 success=109 errors=0 ops_s=49.3 p50_ms=156.542 p99_ms=203.169 first_error=<nil>
+    performance_split_test.go:75: PERF phase=before-mixed write=false elapsed_s=2.061 success=29834 errors=0 ops_s=14473.9 p50_ms=0.116 p99_ms=0.395 first_error=<nil>
+    performance_split_test.go:75: PERF phase=before-mixed write=true elapsed_s=2.061 success=63 errors=0 ops_s=30.6 p50_ms=127.486 p99_ms=215.562 first_error=<nil>
+    performance_split_test.go:89: PERF same-group catalog_commit_ms=75.281
+    performance_split_test.go:75: PERF phase=same-group-mixed write=false elapsed_s=2.107 success=29576 errors=0 ops_s=14039.7 p50_ms=0.117 p99_ms=0.420 first_error=<nil>
+    performance_split_test.go:75: PERF phase=same-group-mixed write=true elapsed_s=2.107 success=66 errors=0 ops_s=31.3 p50_ms=118.814 p99_ms=238.729 first_error=<nil>
+    performance_split_test.go:107: PERF migration elapsed_ms=213 phase=1 last_error=""
+    performance_split_test.go:107: PERF migration elapsed_ms=1735 phase=2 last_error=""
+    performance_split_test.go:107: PERF migration elapsed_ms=47669 phase=3 last_error=""
+    performance_split_test.go:107: PERF migration elapsed_ms=96859 phase=4 last_error=""
+    performance_split_test.go:107: PERF migration elapsed_ms=143537 phase=5 last_error=""
+    performance_split_test.go:107: PERF migration elapsed_ms=146486 phase=6 last_error=""
+    performance_split_test.go:107: PERF migration elapsed_ms=226439 phase=7 last_error=""
+    performance_split_test.go:98: PERF phase=cross-group-during write=false elapsed_s=226.498 success=3333490 errors=9348 ops_s=14717.5 p50_ms=0.133 p99_ms=0.739 first_error=rpc error: code = Unknown desc = route cutover pending
+    performance_split_test.go:98: PERF phase=cross-group-during write=true elapsed_s=226.498 success=7378 errors=922597 ops_s=32.6 p50_ms=47.763 p99_ms=198.427 first_error=rpc error: code = Unknown desc = Operation outcome unknown
+    performance_split_test.go:113: PERF cross-group done_ms=226753
+    performance_split_test.go:75: PERF phase=after-mixed write=false elapsed_s=2.048 success=31734 errors=0 ops_s=15494.6 p50_ms=0.144 p99_ms=0.444 first_error=<nil>
+    performance_split_test.go:75: PERF phase=after-mixed write=true elapsed_s=2.048 success=74 errors=4468 ops_s=36.1 p50_ms=52.317 p99_ms=96.701 first_error=rpc error: code = Unknown desc = Operation outcome unknown
+--- FAIL: TestPerformanceReadWriteSplit (265.58s)
+FAIL
+FAIL	github.com/bootjp/elastickv/internal/server	267.805s
+FAIL

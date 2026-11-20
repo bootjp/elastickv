@@ -102,8 +102,11 @@ jobs:
           command -v sqlite3 >/dev/null || packages+=(sqlite3)
           command -v dot >/dev/null || packages+=(graphviz)
           if ((${#packages[@]})); then
-            sudo apt-get update
-            sudo apt-get install -y "${packages[@]}"
+            # The runner needs package indexes, not translated descriptions.
+            # Translation-en intermittently returns 404; package downloads
+            # can also return 503 while the Ubuntu mirrors synchronize.
+            sudo apt-get -o Acquire::Languages=none -o Acquire::Retries=5 update
+            sudo apt-get -o Acquire::Languages=none -o Acquire::Retries=5 install -y "${packages[@]}"
           fi
       # Cache Maven artifacts across runs. Maven Central (repo1.maven.org)
       # serves intermittent 429s during dependency download, which

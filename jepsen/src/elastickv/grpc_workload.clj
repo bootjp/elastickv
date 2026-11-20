@@ -29,7 +29,9 @@
   client/Client
   (open! [this test node]
     (let [address (str (or (:grpc-host test) (name node)) ":" (get node->port node 50051))
-          builder (ProcessBuilder. ^java.util.List [binary "--address" address "--api" (name api)])
+          args (cond-> [binary "--address" address "--api" (name api)]
+                 (:grpc-tls-ca-file test) (conj "--tls-ca-file" (:grpc-tls-ca-file test)))
+          builder (ProcessBuilder. ^java.util.List args)
           _ (.redirectError builder ProcessBuilder$Redirect/INHERIT)
           process (.start builder)]
       (assoc this :process process :reader (io/reader (.getInputStream process))

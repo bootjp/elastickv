@@ -1,0 +1,22 @@
+--- FAIL: TestInternalPreflightExportSummarizesValidatedPage (0.00s)
+    migration_export_preflight_test.go:28: 
+        	Error Trace:	/Users/bootjp/src/elastickv/adapter/migration_export_preflight_test.go:28
+        	Error:      	Not equal: 
+        	            	expected: 0x1
+        	            	actual  : 0x0
+        	Test:       	TestInternalPreflightExportSummarizesValidatedPage
+--- FAIL: TestPreflightSummaryRetainsVersionAndByteAccounting (0.00s)
+    migration_export_preflight_test.go:41: 
+        	Error Trace:	/Users/bootjp/src/elastickv/adapter/migration_export_preflight_test.go:41
+        	            				/Users/bootjp/src/elastickv/adapter/split_job_transfer_preflight_test.go:46
+        	            				/Users/bootjp/src/elastickv/adapter/split_job_transfer_preflight.go:170
+        	            				/Users/bootjp/src/elastickv/adapter/split_job_transfer_preflight.go:71
+        	            				/Users/bootjp/src/elastickv/adapter/split_job_transfer_preflight.go:55
+        	            				/Users/bootjp/src/elastickv/adapter/split_job_runner.go:250
+        	            				/Users/bootjp/src/elastickv/adapter/split_job_runner.go:243
+        	            				/Users/bootjp/src/elastickv/adapter/migration_export_preflight_test.go:45
+        	Error:      	Should be true
+        	Test:       	TestPreflightSummaryRetainsVersionAndByteAccounting
+FAIL
+FAIL	github.com/bootjp/elastickv/adapter	1.057s
+FAIL

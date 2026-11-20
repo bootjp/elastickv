@@ -1,0 +1,26 @@
+File: server.test
+Type: cpu
+Time: 2026-11-19 17:52:04 JST
+Duration: 265.64s, Total samples = 639.26s (240.65%)
+Showing nodes accounting for 563.83s, 88.20% of 639.26s total
+Dropped 2408 nodes (cum <= 3.20s)
+Showing top 18 nodes out of 139
+      flat  flat%   sum%        cum   cum%
+   285.78s 44.70% 44.70%    285.87s 44.72%  syscall.rawsyscalln
+    95.93s 15.01% 59.71%     95.94s 15.01%  runtime.kevent
+    72.63s 11.36% 71.07%     72.63s 11.36%  runtime.usleep
+    64.60s 10.11% 81.18%     64.60s 10.11%  runtime.pthread_cond_wait
+    37.69s  5.90% 87.07%     37.69s  5.90%  runtime.pthread_cond_signal
+     2.20s  0.34% 87.42%      5.50s  0.86%  runtime.pcvalue
+     0.82s  0.13% 87.55%     41.29s  6.46%  runtime.stealWork
+     0.78s  0.12% 87.67%     35.69s  5.58%  runtime.lock2
+     0.75s  0.12% 87.79%      4.96s  0.78%  runtime.selectgo
+     0.45s  0.07% 87.86%     39.82s  6.23%  runtime.runqgrab
+     0.44s 0.069% 87.93%      7.07s  1.11%  runtime.mallocgc
+     0.39s 0.061% 87.99%      3.67s  0.57%  runtime.adjustframe
+     0.37s 0.058% 88.04%      4.33s  0.68%  google.golang.org/grpc/internal/transport.(*controlBuffer).executeAndPut
+     0.22s 0.034% 88.08%    229.86s 35.96%  runtime.findRunnable
+     0.21s 0.033% 88.11%    113.96s 17.83%  bufio.(*Reader).Read
+     0.20s 0.031% 88.14%     95.81s 14.99%  runtime.netpoll
+     0.19s  0.03% 88.17%     37.40s  5.85%  runtime.systemstack
+     0.18s 0.028% 88.20%    170.73s 26.71%  crypto/tls.(*Conn).Write

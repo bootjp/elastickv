@@ -1,0 +1,816 @@
+--- a/adapter/distribution_server.go
++++ b/adapter/distribution_server.go
+@@ -370,44 +370,55 @@
+ 	ticker := time.NewTicker(defaultSplitJobRunnerInterval)
+ 	defer ticker.Stop()
+ 	for {
+-		if err := s.RunSplitJobRunnerOnce(ctx); err != nil {
++		continueSoon, err := s.runSplitJobRunnerOnce(ctx)
++		if err != nil {
+ 			if !splitJobRunnerContextDone(err) {
+ 				slog.Warn("split job runner tick failed", "err", err)
+ 			}
+ 		}
+-		select {
+-		case <-ctx.Done():
++		if !waitSplitJobRunner(ctx, ticker.C, continueSoon && err == nil) {
+ 			return nil
+-		case <-ticker.C:
+ 		}
+ 	}
+ }
+ 
+ func (s *DistributionServer) RunSplitJobRunnerOnce(ctx context.Context) error {
++	_, err := s.runSplitJobRunnerOnce(ctx)
++	return err
++}
++
++func (s *DistributionServer) runSplitJobRunnerOnce(ctx context.Context) (bool, error) {
+ 	if !s.splitJobRunnerConfigured() {
+-		return nil
++		return false, nil
+ 	}
+ 	leader, err := s.verifySplitJobRunnerLeader(ctx)
+ 	if err != nil || !leader {
+-		return err
++		return false, err
+ 	}
+ 	jobs, err := s.catalog.ListSplitJobs(ctx)
+ 	if err != nil {
+-		return splitJobCatalogStatusError(err)
++		return false, splitJobCatalogStatusError(err)
+ 	}
+ 	if job, ok := nextRunnableSplitJob(jobs); ok {
+-		if err := s.verifySplitJobCleanupDispatch(ctx, job); err != nil {
+-			return err
+-		}
+-		if job.Phase != distribution.SplitJobPhaseAbandoning {
+-			ready, gateErr := s.splitJobCapabilityReady(ctx, job)
+-			if gateErr != nil || !ready {
+-				return gateErr
+-			}
+-		}
+-		return s.runSplitJobAttempt(ctx, job)
+-	}
+-	return s.gcSplitJobHistory(ctx, jobs, time.Now())
++		return s.runSplitJobRunnerJob(ctx, job)
++	}
++	return false, s.gcSplitJobHistory(ctx, jobs, time.Now())
++}
++
++func (s *DistributionServer) runSplitJobRunnerJob(ctx context.Context, job distribution.SplitJob) (bool, error) {
++	if err := s.verifySplitJobCleanupDispatch(ctx, job); err != nil {
++		return false, err
++	}
++	if job.Phase != distribution.SplitJobPhaseAbandoning {
++		ready, err := s.splitJobCapabilityReady(ctx, job)
++		if err != nil || !ready {
++			return false, err
++		}
++	}
++	if err := s.runSplitJobAttempt(ctx, job); err != nil {
++		return false, err
++	}
++	return s.splitJobPreflightContinuation(ctx, job)
+ }
+ 
+ func (s *DistributionServer) splitJobCapabilityReady(ctx context.Context, job distribution.SplitJob) (bool, error) {
+--- a/adapter/split_job_runner.go
++++ b/adapter/split_job_runner.go
+@@ -239,6 +239,16 @@
+ 		if err := s.ensureSplitJobNamespaceAdmission(ctx, job); err != nil {
+ 			return err
+ 		}
++	}
++	return s.runAdmittedSplitJobPhase(ctx, job)
++}
++
++func (s *DistributionServer) runAdmittedSplitJobPhase(ctx context.Context, job distribution.SplitJob) error {
++	// Only the full runner repeats pages after namespace admission. Yield on
++	// completion so the next attempt independently admits the fence or delta.
++	if !job.TransferPreflightDone && (job.Phase == distribution.SplitJobPhaseFence || job.Phase == distribution.SplitJobPhaseDeltaCopy) {
++		_, err := s.preflightSplitTransferPages(ctx, job, preflightPagesPerTick, true)
++		return err
+ 	}
+ 	if job.Phase == distribution.SplitJobPhaseBackfill || job.Phase == distribution.SplitJobPhaseDeltaCopy {
+ 		return s.runSplitJobCopyPhase(ctx, job)
+--- a/adapter/split_job_transfer_preflight.go
++++ b/adapter/split_job_transfer_preflight.go
+@@ -3,6 +3,7 @@
+ import (
+ 	"bytes"
+ 	"context"
++	"slices"
+ 	"time"
+ 
+ 	"github.com/bootjp/elastickv/distribution"
+@@ -10,12 +11,22 @@
+ 	"github.com/cockroachdb/errors"
+ )
+ 
+-const splitTransferPreflightVersion = uint32(1)
+-
+-// Each tick validates one bounded export page without importing it. Its cursor
+-// is independent of copy progress, so a legacy copy cursor is never proof.
++const (
++	splitTransferPreflightVersion = uint32(1)
++	preflightPagesPerTick         = 4
++	preflightBytesPerTick         = 4 * defaultSplitMigrationChunkBytes
++	preflightTimePerTick          = 100 * time.Millisecond
++)
++
++// A phase caller can check the witness or take one step without entering the
++// full runner. Only an already durable completion witness authorizes a fence.
+ func (s *DistributionServer) preflightSplitJobTransfer(ctx context.Context, job distribution.SplitJob) (bool, error) {
+-	_, route, err := s.splitJobSourceRoute(ctx, job)
++	return s.preflightSplitTransferPages(ctx, job, 1)
++}
++
++func (s *DistributionServer) preflightSplitTransferPages(ctx context.Context, job distribution.SplitJob, maxPages int, admitted ...bool) (bool, error) {
++	deadline := time.Now().Add(preflightTimePerTick)
++	snapshot, route, err := s.splitJobSourceRoute(ctx, job)
+ 	if err != nil {
+ 		return false, err
+ 	}
+@@ -27,12 +38,13 @@
+ 	if err != nil {
+ 		return false, err
+ 	}
+-	witness, err := s.ensureSplitJobTransferPhase(ctx, job, source, nil)
+-	if err != nil {
+-		return false, err
+-	}
++	witness, err := s.ensureSplitJobTransferPhase(ctx, job, source, nil, splitTransferAdmissionOptions{readExistingControl: true})
++	if err != nil {
++		return false, err
++	}
++	pass := splitPreflightPass{source: source, route: route, brackets: brackets, witness: witness, catalogVersion: snapshot.Version, namespaceAdmission: len(admitted) > 0 && admitted[0]}
+ 	if job.TransferPreflightVersion == 0 {
+-		return false, s.initializeSplitTransferPreflight(ctx, job, source, brackets, witness)
++		return false, s.initializeSplitTransferPreflight(ctx, job, pass)
+ 	}
+ 	if err := validateSplitTransferPreflight(job, brackets); err != nil {
+ 		return false, err
+@@ -40,18 +52,82 @@
+ 	if job.TransferPreflightDone {
+ 		return true, nil
+ 	}
+-	for index, progress := range job.TransferPreflightProgress {
+-		if !progress.Done {
+-			return false, s.preflightSplitTransferPage(ctx, job, source, route.End, brackets[index], index, witness)
+-		}
+-	}
++	return false, s.runSplitPreflightPages(ctx, job, pass, deadline, maxPages)
++}
++
++type splitPreflightPass struct {
++	source             SplitMigrationClient
++	route              distribution.RouteDescriptor
++	brackets           []distribution.MigrationBracket
++	witness            *splitTransferAdmissionWitness
++	catalogVersion     uint64
++	namespaceAdmission bool
++}
++
++func (s *DistributionServer) runSplitPreflightPages(ctx context.Context, job distribution.SplitJob, pass splitPreflightPass, deadline time.Time, maxPages int) error {
++	bytesLeft := preflightBytesPerTick
+ 	next := distribution.CloneSplitJob(job)
+-	next.TransferPreflightDone = true
+-	return false, s.persistSplitTransferPreflight(ctx, job, next, witness)
+-}
+-
+-func (s *DistributionServer) initializeSplitTransferPreflight(ctx context.Context, job distribution.SplitJob, source SplitMigrationClient, brackets []distribution.MigrationBracket, witness *splitTransferAdmissionWitness) error {
+-	issued, err := issueSplitMigrationTimestamp(ctx, source)
++	for page := 1; ; page++ {
++		size, err := pass.advance(ctx, &next, bytesLeft)
++		if err != nil {
++			return bindPreflightExportFailure(err, job, pass)
++		}
++		bytesLeft -= size
++		if next.TransferPreflightDone || page >= maxPages || bytesLeft <= 0 || !time.Now().Before(deadline) {
++			break
++		}
++		// These pages are read-only. Validate against the original durable
++		// checkpoint until the whole bounded batch can be committed atomically.
++		ready, err := s.canContinueSplitPreflight(ctx, job, pass)
++		if err != nil || !ready {
++			return err
++		}
++		if !time.Now().Before(deadline) {
++			break
++		}
++	}
++	return s.persistSplitTransferPreflight(ctx, job, &next, pass)
++}
++
++// Re-read the exact checkpoint we wrote. Another runner or administrator can
++// change the job between two pages even when its phase is unchanged.
++func (s *DistributionServer) canContinueSplitPreflight(ctx context.Context, expected distribution.SplitJob, pass splitPreflightPass) (bool, error) {
++	if err := ctx.Err(); err != nil {
++		return false, errors.WithStack(err)
++	}
++	leader, err := s.verifySplitJobRunnerLeader(ctx)
++	if err != nil || !leader {
++		return false, err
++	}
++	current, err := s.splitPreflightCheckpointCurrent(ctx, expected, pass)
++	if err != nil || !current {
++		return false, err
++	}
++	ready, err := s.splitJobCapabilityReady(ctx, expected)
++	if err != nil || !ready {
++		return false, err
++	}
++	if err := s.verifyPreflightNamespace(ctx, expected, pass); err != nil {
++		return false, err
++	}
++	err = s.revalidateSplitTransferAdmission(ctx, pass.witness)
++	return err == nil, err
++}
++
++func (s *DistributionServer) splitPreflightCheckpointCurrent(ctx context.Context, expected distribution.SplitJob, pass splitPreflightPass) (bool, error) {
++	snapshot, err := s.loadCatalogSnapshot(ctx)
++	if err != nil || !pass.matchesCatalog(snapshot) {
++		return false, err
++	}
++	current, found, err := s.catalog.SplitJobAt(ctx, expected.JobID, snapshot.ReadTS)
++	if err != nil {
++		return false, splitJobCatalogStatusError(err)
++	}
++	return found && distribution.SplitJobsEquivalent(current, expected), nil
++}
++
++func (s *DistributionServer) initializeSplitTransferPreflight(ctx context.Context, job distribution.SplitJob, pass splitPreflightPass) error {
++	issued, err := issueSplitMigrationTimestamp(ctx, pass.source)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -61,9 +137,9 @@
+ 	next := distribution.CloneSplitJob(job)
+ 	next.TransferPreflightVersion = splitTransferPreflightVersion
+ 	next.TransferPreflightTS = issued.GetTimestamp()
+-	next.TransferPreflightProgress = distribution.SplitJobBracketProgressForPlan(brackets, distribution.SplitJobExportPhaseBackfill)
++	next.TransferPreflightProgress = distribution.SplitJobBracketProgressForPlan(pass.brackets, distribution.SplitJobExportPhaseBackfill)
+ 	next.TransferPreflightDone = false
+-	return s.persistSplitTransferPreflight(ctx, job, next, witness)
++	return s.persistSplitTransferPreflight(ctx, job, &next, pass)
+ }
+ 
+ func validateSplitTransferPreflight(job distribution.SplitJob, brackets []distribution.MigrationBracket) error {
+@@ -80,53 +156,55 @@
+ 	return nil
+ }
+ 
+-func (s *DistributionServer) preflightSplitTransferPage(ctx context.Context, job distribution.SplitJob, source SplitMigrationClient, routeEnd []byte, bracket distribution.MigrationBracket, index int, witness *splitTransferAdmissionWitness) error {
++func (pass splitPreflightPass) advance(ctx context.Context, job *distribution.SplitJob, bytesLeft int) (int, error) {
++	index := slices.IndexFunc(job.TransferPreflightProgress, func(p distribution.SplitJobBracketProgress) bool { return !p.Done })
++	if index < 0 {
++		job.TransferPreflightDone = true
++		return 0, nil
++	}
++	bracket := pass.brackets[index]
+ 	progress := job.TransferPreflightProgress[index]
+ 	attemptCtx, cancel := context.WithTimeout(ctx, defaultSplitMigrationAttemptTimeout)
+ 	defer cancel()
+-	stream, err := source.ExportRangeVersions(attemptCtx, &pb.ExportRangeVersionsRequest{
++	chunkBytes := min(defaultSplitMigrationChunkBytes, max(1, bytesLeft))
++	stream, err := pass.source.ExportRangeVersions(attemptCtx, &pb.ExportRangeVersionsRequest{
+ 		RangeStart: bracket.Start, RangeEnd: bracket.End, MaxCommitTs: job.TransferPreflightTS,
+-		MinCommitTs: 0, Cursor: progress.Cursor, ChunkBytes: defaultSplitMigrationChunkBytes,
+-		RouteStart: job.SplitKey, RouteEnd: routeEnd, MaxScannedBytes: defaultSplitMigrationMaxScannedBytes,
++		MinCommitTs: 0, Cursor: progress.Cursor, ChunkBytes: uint32(chunkBytes),
++		RouteStart: job.SplitKey, RouteEnd: pass.route.End, MaxScannedBytes: defaultSplitMigrationMaxScannedBytes,
+ 		KeyFamily: bracket.Family, ExcludeKnownInternal: bracket.ExcludeKnownInternal, ExcludePrefixes: bracket.ExcludePrefixes,
+ 	})
+ 	if err != nil {
+-		return errors.WithStack(migrationSourceExportError(err))
++		return 0, errors.WithStack(migrationSourceExportError(err))
+ 	}
+ 	resp, err := stream.Recv()
+ 	if err != nil {
+-		return errors.WithStack(migrationSourceExportError(err))
++		return 0, errors.WithStack(migrationSourceExportError(err))
+ 	}
+ 	if !resp.GetDone() && (len(resp.GetNextCursor()) == 0 || bytes.Equal(progress.Cursor, resp.GetNextCursor())) {
+-		return errors.New("migration preflight cursor did not progress")
++		return 0, errors.New("migration preflight cursor did not progress")
+ 	}
+ 	if err := checkMigrationExportPageSize(resp); err != nil {
+ 		// A local validation error is not an explicit failure from the source.
+-		return err
+-	}
+-	next := distribution.CloneSplitJob(job)
+-	next.TransferPreflightProgress[index].Cursor = distribution.CloneBytes(resp.GetNextCursor())
+-	next.TransferPreflightProgress[index].Done = resp.GetDone()
++		return 0, err
++	}
++	progress.Cursor = distribution.CloneBytes(resp.GetNextCursor())
++	progress.Done = resp.GetDone()
+ 	if resp.GetDone() {
+ 		// Completed families need only their completion witness, not a retained
+ 		// full-key cursor for every family in the catalog job record.
+-		next.TransferPreflightProgress[index].Cursor = nil
+-	}
+-	next.TransferPreflightProgress[index].AcceptedRows += uint64(len(resp.GetVersions()))
+-	return s.persistSplitTransferPreflight(ctx, job, next, witness)
+-}
+-
+-func (s *DistributionServer) persistSplitTransferPreflight(ctx context.Context, expected, next distribution.SplitJob, witness *splitTransferAdmissionWitness) error {
+-	if err := s.revalidateSplitTransferAdmission(ctx, witness); err != nil {
++		progress.Cursor = nil
++	}
++	progress.AcceptedRows += uint64(len(resp.GetVersions()))
++	job.TransferPreflightProgress[index] = progress
++	return migrationExportPagePayloadBytes(resp), nil
++}
++
++func (s *DistributionServer) persistSplitTransferPreflight(ctx context.Context, expected distribution.SplitJob, next *distribution.SplitJob, pass splitPreflightPass) error {
++	ready, err := s.canContinueSplitPreflight(ctx, expected, pass)
++	if err != nil || !ready {
+ 		return err
+ 	}
+-	return s.updateSplitJobViaCoordinator(ctx, expected.JobID, func(current distribution.SplitJob) (distribution.SplitJob, error) {
+-		if !distribution.SplitJobsEquivalent(current, expected) {
+-			return current, nil
+-		}
+-		next.UpdatedAtMs = time.Now().UnixMilli()
+-		return next, nil
+-	})
++	return s.writeSplitPreflightJob(ctx, expected, *next, pass)
+ }
+ 
+ func (s *DistributionServer) abandonOversizedSplitTransfer(ctx context.Context, job distribution.SplitJob, cause error) error {
+@@ -136,24 +214,18 @@
+ 	if err := ctx.Err(); err != nil {
+ 		return errors.WithStack(err)
+ 	}
++	var failure *splitPreflightExportFailure
++	if errors.As(cause, &failure) {
++		return s.abandonSplitPreflightFailure(ctx, failure, cause)
++	}
+ 	return s.updateSplitJobViaCoordinator(ctx, job.JobID, func(current distribution.SplitJob) (distribution.SplitJob, error) {
++		if splitPreflightIncomplete(job) && !distribution.SplitJobsEquivalent(current, job) {
++			return current, nil
++		}
+ 		if !splitTransferCanAutoAbandon(current.Phase) || current.Phase != job.Phase || current.SnapshotTS != job.SnapshotTS || current.FenceTS != job.FenceTS {
+ 			return current, nil
+ 		}
+-		next, err := distribution.BeginSplitJobAbandon(current, time.Now().UnixMilli())
+-		if err != nil {
+-			return current, errors.WithStack(err)
+-		}
+-		next.LastError = errors.Wrapf(cause, "migration transfer failed before cutover in phase %d", current.Phase).Error()
+-		if current.LastError != "" {
+-			const maxPreviousDiagnosticBytes = 512
+-			previous := current.LastError
+-			if len(previous) > maxPreviousDiagnosticBytes {
+-				previous = previous[:maxPreviousDiagnosticBytes]
+-			}
+-			next.LastError += "; previous: " + previous
+-		}
+-		return next, nil
++		return oversizedSplitAbandonState(current, cause)
+ 	})
+ }
+ 
+@@ -161,3 +233,10 @@
+ 	return phase == distribution.SplitJobPhasePlanned || phase == distribution.SplitJobPhaseBackfill ||
+ 		phase == distribution.SplitJobPhaseFence || phase == distribution.SplitJobPhaseDeltaCopy
+ }
++
++func (s *DistributionServer) verifyPreflightNamespace(ctx context.Context, expected distribution.SplitJob, pass splitPreflightPass) error {
++	if !pass.namespaceAdmission || !s.MigrationPartitionRuntimeConfigured(expected.SourceGroupID) {
++		return nil
++	}
++	return s.ensureSplitJobNamespaceAdmission(ctx, expected)
++}
+--- /dev/null
++++ b/adapter/split_job_preflight_schedule.go
+@@ -0,0 +1,67 @@
++package adapter
++
++import (
++	"bytes"
++	"context"
++	"slices"
++	"time"
++
++	"github.com/bootjp/elastickv/distribution"
++)
++
++const splitPreflightContinuationDelay = 80 * time.Millisecond
++
++// A short wake is only a scheduling hint. Every attempt still enters through
++// the ordinary leader, capability and ownership checks. Do not accelerate a
++// completed preflight into its fence, or turn stalled work into a busy loop.
++func (s *DistributionServer) splitJobPreflightContinuation(ctx context.Context, previous distribution.SplitJob) (bool, error) {
++	if !splitPreflightIncomplete(previous) {
++		return false, nil
++	}
++	current, found, err := s.catalog.SplitJob(ctx, previous.JobID)
++	if err != nil {
++		return false, splitJobCatalogStatusError(err)
++	}
++	if !found || current.Phase != previous.Phase || !splitPreflightIncomplete(current) {
++		return false, nil
++	}
++	return preflightCheckpointChanged(previous, current), nil
++}
++
++func preflightCheckpointChanged(previous, current distribution.SplitJob) bool {
++	if current.TransferPreflightVersion != splitTransferPreflightVersion || current.TransferPreflightTS == 0 {
++		return false
++	}
++	if previous.TransferPreflightVersion == 0 {
++		return true
++	}
++	if previous.TransferPreflightVersion != current.TransferPreflightVersion || previous.TransferPreflightTS != current.TransferPreflightTS {
++		return false
++	}
++	return !slices.EqualFunc(previous.TransferPreflightProgress, current.TransferPreflightProgress, splitPreflightProgressEqual)
++}
++
++func splitPreflightIncomplete(job distribution.SplitJob) bool {
++	return !job.TransferPreflightDone && (job.Phase == distribution.SplitJobPhaseFence || job.Phase == distribution.SplitJobPhaseDeltaCopy)
++}
++
++func splitPreflightProgressEqual(a, b distribution.SplitJobBracketProgress) bool {
++	return a.BracketID == b.BracketID && a.Family == b.Family && a.ExportPhase == b.ExportPhase && a.Done == b.Done && a.AcceptedRows == b.AcceptedRows && a.ScannedBytes == b.ScannedBytes && a.LastAckedBatchSeq == b.LastAckedBatchSeq && bytes.Equal(a.Cursor, b.Cursor)
++}
++
++func waitSplitJobRunner(ctx context.Context, tick <-chan time.Time, continueSoon bool) bool {
++	var wake <-chan time.Time
++	if continueSoon {
++		timer := time.NewTimer(splitPreflightContinuationDelay)
++		defer timer.Stop()
++		wake = timer.C
++	}
++	select {
++	case <-ctx.Done():
++		return false
++	case <-tick:
++		return true
++	case <-wake:
++		return true
++	}
++}
+--- /dev/null
++++ b/adapter/split_job_preflight_checkpoint.go
+@@ -0,0 +1,92 @@
++package adapter
++
++import (
++	"context"
++	"time"
++
++	"github.com/bootjp/elastickv/distribution"
++	"github.com/bootjp/elastickv/kv"
++	"github.com/cockroachdb/errors"
++)
++
++func (pass splitPreflightPass) matchesCatalog(snapshot distribution.CatalogSnapshot) bool {
++	if snapshot.Version != pass.catalogVersion {
++		return false
++	}
++	route, found := findRouteByID(snapshot.Routes, pass.route.RouteID)
++	return found && pass.route.Equal(route)
++}
++
++// The catalog geometry and the live checkpoint are observed at one read TS.
++// OCC closes the gap after validation, including catalog-only route changes.
++func (s *DistributionServer) writeSplitPreflightJob(ctx context.Context, expected distribution.SplitJob, next distribution.SplitJob, pass splitPreflightPass) error {
++	current, readTS, err := s.catalog.LiveSplitJobForUpdate(ctx, expected.JobID)
++	if err != nil {
++		return splitJobCatalogStatusError(err)
++	}
++	snapshot, err := s.loadCatalogSnapshotAt(ctx, readTS)
++	if err != nil {
++		return err
++	}
++	if !pass.matchesCatalog(snapshot) || !distribution.SplitJobsEquivalent(current, expected) {
++		return nil
++	}
++	next.UpdatedAtMs = time.Now().UnixMilli()
++	encoded, err := distribution.EncodeSplitJob(next)
++	if err != nil {
++		return splitJobCatalogStatusError(err)
++	}
++	key := distribution.CatalogSplitJobKey(expected.JobID)
++	_, err = s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{Elems: []*kv.Elem[kv.OP]{{Op: kv.Put, Key: key, Value: encoded}}, IsTxn: true, StartTS: readTS, ReadKeys: [][]byte{key, distribution.CatalogVersionKey(), distribution.CatalogRouteKey(pass.route.RouteID)}})
++	if err != nil {
++		return splitJobCoordinatorStatusError(err)
++	}
++	return nil
++}
++
++// Only authenticated oversized preflight verdicts carry the original scan
++// authority into compensation. Tentative pages never authorize abandonment.
++type splitPreflightExportFailure struct {
++	cause    error
++	expected distribution.SplitJob
++	pass     splitPreflightPass
++}
++
++func (e *splitPreflightExportFailure) Error() string { return e.cause.Error() }
++func (e *splitPreflightExportFailure) Unwrap() error { return e.cause }
++
++func bindPreflightExportFailure(err error, expected distribution.SplitJob, pass splitPreflightPass) error {
++	if !errors.Is(err, errMigrationOversizedSourceVersion) {
++		return err
++	}
++	return &splitPreflightExportFailure{cause: err, expected: expected, pass: pass}
++}
++
++func (s *DistributionServer) abandonSplitPreflightFailure(ctx context.Context, failure *splitPreflightExportFailure, cause error) error {
++	ready, err := s.canContinueSplitPreflight(ctx, failure.expected, failure.pass)
++	if err != nil || !ready {
++		return err
++	}
++	next, err := oversizedSplitAbandonState(failure.expected, cause)
++	if err != nil {
++		return err
++	}
++	return s.writeSplitPreflightJob(ctx, failure.expected, next, failure.pass)
++}
++
++func oversizedSplitAbandonState(current distribution.SplitJob, cause error) (distribution.SplitJob, error) {
++	next, err := distribution.BeginSplitJobAbandon(current, time.Now().UnixMilli())
++	if err != nil {
++		return current, errors.WithStack(err)
++	}
++	next.LastError = errors.Wrapf(cause, "migration transfer failed before cutover in phase %d", current.Phase).Error()
++	if current.LastError != "" {
++		const maxPreviousDiagnosticBytes = 512
++		previous := current.LastError
++		if len(previous) > maxPreviousDiagnosticBytes {
++			previous = previous[:maxPreviousDiagnosticBytes]
++		}
++		next.LastError += "; previous: " + previous
++	}
++	return next, nil
++}
+--- a/adapter/split_job_transfer_admission.go
++++ b/adapter/split_job_transfer_admission.go
+@@ -22,10 +22,14 @@
+ 	ownershipProof *pb.MigrationOwnershipProof
+ }
+ 
++// Readback is opt-in for preflight. Exact all-member proof may replace a
++// redundant proposal of controls that are already durably installed.
++type splitTransferAdmissionOptions struct{ readExistingControl bool }
++
+ // The caller has already ACKed the full same-owner partition at the control's
+ // configuration. This must finish before preflight timestamps/catalog writes,
+ // history export, or source write fencing. No leader-only fallback is allowed.
+-func (s *DistributionServer) ensureSplitTransferAdmission(ctx context.Context, job distribution.SplitJob, groupID uint64, source SplitMigrationClient, control *pb.TargetStagedReadinessRequest, ownershipProof *pb.MigrationOwnershipProof) (*splitTransferAdmissionWitness, error) {
++func (s *DistributionServer) ensureSplitTransferAdmission(ctx context.Context, job distribution.SplitJob, groupID uint64, source SplitMigrationClient, control *pb.TargetStagedReadinessRequest, ownershipProof *pb.MigrationOwnershipProof, options ...splitTransferAdmissionOptions) (*splitTransferAdmissionWitness, error) {
+ 	if err := validateSplitTransferAdmission(job, groupID, source, control, ownershipProof); err != nil {
+ 		return nil, err
+ 	}
+@@ -44,6 +48,24 @@
+ 	}
+ 	if _, err := s.revalidateSplitTransferMembers(ctx, witness); err != nil {
+ 		return nil, err
++	}
++	return s.armOrReadSplitTransferAdmission(ctx, source, witness, options)
++}
++
++func (s *DistributionServer) armOrReadSplitTransferAdmission(ctx context.Context, source SplitMigrationClient, witness *splitTransferAdmissionWitness, options []splitTransferAdmissionOptions) (*splitTransferAdmissionWitness, error) {
++	if len(options) > 0 && options[0].readExistingControl {
++		ready, err := readSplitTransferControls(ctx, witness, witness.snapshot.Members)
++		if err != nil {
++			return nil, err
++		}
++		if ready {
++			// Ownership ACKs preceded the exact control ACKs above. Close the
++			// same configuration sandwich as revalidateSplitTransferAdmission.
++			if _, err := s.revalidateSplitTransferMembers(ctx, witness); err != nil {
++				return nil, err
++			}
++			return witness, nil
++		}
+ 	}
+ 	attempt, cancel := context.WithTimeout(ctx, defaultSplitMigrationAttemptTimeout)
+ 	defer cancel()
+@@ -196,3 +218,19 @@
+ 	_, err = s.revalidateSplitTransferMembers(ctx, witness)
+ 	return err
+ }
++
++func readSplitTransferControls(ctx context.Context, witness *splitTransferAdmissionWitness, members []SplitMigrationVoter) (bool, error) {
++	req := probeMigrationControlRequest(witness.control)
++	req.RequireConfigurationIndex = true
++	req.ExpectedConfigurationIndex = witness.snapshot.ConfigurationIndex
++	req.TransferSizeGuardVersion = store.MigrationTransferSizeGuardVersion
++	for _, member := range members {
++		if _, err := probeSplitTransferMember(ctx, member, req); err != nil {
++			if errors.Is(err, errSplitMigrationVoterBarrierIncomplete) {
++				return false, nil
++			}
++			return false, err
++		}
++	}
++	return true, nil
++}
+--- a/adapter/split_job_transfer_phase.go
++++ b/adapter/split_job_transfer_phase.go
+@@ -13,7 +13,7 @@
+ // caller's source ownership acquisition. Initial arm ACKs bind C explicitly;
+ // resumed ticks collect a fresh exact all-member ownership ACK, never just
+ // stamp a newly observed configuration onto a previously saved proof.
+-func (s *DistributionServer) ensureSplitJobTransferControl(ctx context.Context, job distribution.SplitJob, groupID uint64, source SplitMigrationClient, control *pb.TargetStagedReadinessRequest, ownershipACK []byte) (*splitTransferAdmissionWitness, error) {
++func (s *DistributionServer) ensureSplitJobTransferControl(ctx context.Context, job distribution.SplitJob, groupID uint64, source SplitMigrationClient, control *pb.TargetStagedReadinessRequest, ownershipACK []byte, options ...splitTransferAdmissionOptions) (*splitTransferAdmissionWitness, error) {
+ 	if source == nil || control == nil {
+ 		return nil, errors.New("transfer phase source or control is missing")
+ 	}
+@@ -45,7 +45,7 @@
+ 		bound.ExpectedCutoverVersion = proof.GetSourceTrackerVersion()
+ 	}
+ 	bound.MinWriteTsExclusive = max(bound.GetMinWriteTsExclusive(), proof.GetMinWriteTsExclusive())
+-	return s.ensureSplitTransferAdmission(ctx, job, groupID, source, bound, proof)
++	return s.ensureSplitTransferAdmission(ctx, job, groupID, source, bound, proof, options...)
+ }
+ 
+ func splitTransferPhaseConfiguration(configuration uint64, control *pb.TargetStagedReadinessRequest, ownershipACK []byte) (uint64, error) {
+@@ -70,7 +70,7 @@
+ 		validSplitTransferOwner(groupID, state.GetOwnership())
+ }
+ 
+-func (s *DistributionServer) ensureSplitJobTransferPhase(ctx context.Context, job distribution.SplitJob, source SplitMigrationClient, ownershipACK []byte) (*splitTransferAdmissionWitness, error) {
++func (s *DistributionServer) ensureSplitJobTransferPhase(ctx context.Context, job distribution.SplitJob, source SplitMigrationClient, ownershipACK []byte, options ...splitTransferAdmissionOptions) (*splitTransferAdmissionWitness, error) {
+ 	snapshot, route, err := s.splitJobSourceRoute(ctx, job)
+ 	if err != nil {
+ 		return nil, err
+@@ -85,7 +85,7 @@
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	return s.ensureSplitJobTransferControl(ctx, job, route.GroupID, source, control, ownershipACK)
++	return s.ensureSplitJobTransferControl(ctx, job, route.GroupID, source, control, ownershipACK, options...)
+ }
+ 
+ func splitTransferPhaseControl(job distribution.SplitJob, route distribution.RouteDescriptor, catalogVersion uint64) (*pb.TargetStagedReadinessRequest, error) {
+--- a/adapter/migration_namespace_activation.go
++++ b/adapter/migration_namespace_activation.go
+@@ -9,10 +9,14 @@
+ 	"github.com/bootjp/elastickv/kv"
+ 	pb "github.com/bootjp/elastickv/proto"
+ 	"github.com/cockroachdb/errors"
++	"golang.org/x/sync/errgroup"
+ 	"google.golang.org/grpc"
+ )
+ 
+-const namespaceProbeTimeout = 2 * time.Second
++const (
++	namespaceProbeTimeout     = 2 * time.Second
++	namespaceProbeConcurrency = 3
++)
+ 
+ type MigrationNamespaceProbeClient interface {
+ 	ProbeMigrationState(context.Context, *pb.ProbeMigrationStateRequest, ...grpc.CallOption) (*pb.ProbeMigrationStateResponse, error)
+@@ -43,16 +47,18 @@
+ 				return state, errors.WithStack(kv.ErrMigrationNamespaceProtocol)
+ 			}
+ 			peer := NamespaceAdmissionPeer{MemberID: raftengine.DeriveNodeID(member.ID), Address: member.Address, Client: member.Client}
+-			response, err := probeNamespacePeer(ctx, peer, 0, false)
+-			if err != nil {
+-				return state, err
+-			}
++			state.Members = append(state.Members, peer)
++		}
++		responses, err := probeNamespacePeers(ctx, state.Members, 0, false)
++		if err != nil {
++			return state, err
++		}
++		for _, response := range responses {
+ 			index := response.GetAppliedConfigurationIndex()
+ 			if index == 0 || (state.ConfigurationIndex != 0 && state.ConfigurationIndex != index) {
+ 				return state, errors.WithStack(kv.ErrMigrationNamespaceProtocol)
+ 			}
+ 			state.ConfigurationIndex = index
+-			state.Members = append(state.Members, peer)
+ 		}
+ 		return state, nil
+ 	}
+@@ -85,10 +91,8 @@
+ 	if err := activateNamespaceWithSnapshot(ctx, snapshot, before, activate, joining); err != nil {
+ 		return err
+ 	}
+-	for _, member := range before.Members {
+-		if _, err := probeNamespacePeer(ctx, member, before.ConfigurationIndex, true); err != nil {
+-			return err
+-		}
++	if _, err := probeNamespacePeers(ctx, before.Members, before.ConfigurationIndex, true); err != nil {
++		return err
+ 	}
+ 	return revalidateNamespaceSnapshot(ctx, snapshot, before)
+ }
+@@ -124,16 +128,18 @@
+ 		if ids[member.MemberID] || addresses[member.Address] {
+ 			return command, false, errors.WithStack(kv.ErrMigrationNamespaceProtocol)
+ 		}
+-		response, err := probeNamespacePeer(ctx, member, snapshot.ConfigurationIndex, false)
+-		if err != nil {
+-			return command, false, err
+-		}
++		ids[member.MemberID], addresses[member.Address] = true, true
++	}
++	responses, err := probeNamespacePeers(ctx, snapshot.Members, snapshot.ConfigurationIndex, false)
++	if err != nil {
++		return command, false, err
++	}
++	for i, member := range snapshot.Members {
++		response := responses[i]
+ 		alreadyActive = alreadyActive && response.GetReady()
+-		ids[member.MemberID], addresses[member.Address] = true, true
+ 		command.ApplyMembers = append(command.ApplyMembers, member.MemberID)
+ 		command.Members = append(command.Members, kv.NamespaceMemberCapability{MemberID: member.MemberID, Version: response.GetNamespaceAdmissionVersion(), ConfigurationIndex: snapshot.ConfigurationIndex})
+ 	}
+-	var err error
+ 	command.Joining, err = probeNamespaceJoining(ctx, snapshot.ConfigurationIndex, joining, ids, addresses)
+ 	if err != nil {
+ 		return command, false, err
+@@ -205,3 +211,24 @@
+ 	}
+ 	return nil
+ }
++
++// Only independent read probes overlap. Activation still waits for every
++// member, and the configuration sandwich and learner checks remain unchanged.
++func probeNamespacePeers(ctx context.Context, members []NamespaceAdmissionPeer, configuration uint64, activated bool) ([]*pb.ProbeMigrationStateResponse, error) {
++	responses := make([]*pb.ProbeMigrationStateResponse, len(members))
++	group, probeCtx := errgroup.WithContext(ctx)
++	group.SetLimit(namespaceProbeConcurrency)
++	for i, member := range members {
++		group.Go(func() error {
++			response, err := probeNamespacePeer(probeCtx, member, configuration, activated)
++			if err == nil {
++				responses[i] = response
++			}
++			return err
++		})
++	}
++	if err := group.Wait(); err != nil {
++		return nil, errors.WithStack(err)
++	}
++	return responses, nil
++}
+--- a/adapter/split_job_namespace.go
++++ b/adapter/split_job_namespace.go
+@@ -4,6 +4,7 @@
+ 	"context"
+ 
+ 	"github.com/bootjp/elastickv/distribution"
++	"github.com/bootjp/elastickv/internal/raftengine"
+ 	pb "github.com/bootjp/elastickv/proto"
+ 	"github.com/bootjp/elastickv/store"
+ 	"github.com/cockroachdb/errors"
+@@ -45,8 +46,14 @@
+ 		groups = append(groups, group)
+ 	}
+ 	for _, group := range groups {
+-		if err := EnsureMigrationNamespaceAdmission(ctx, group.client, group.members.Members); err != nil {
++		active, err := readActiveSplitNamespace(ctx, group)
++		if err != nil {
+ 			return err
++		}
++		if !active {
++			if err := EnsureMigrationNamespaceAdmission(ctx, group.client, group.members.Members); err != nil {
++				return err
++			}
+ 		}
+ 	}
+ 	for _, group := range groups {
+@@ -94,3 +101,18 @@
+ 	}
+ 	return nil
+ }
++
++// The apply-member inventory comes from an authoritative group snapshot.
++// Fresh activation ACKs at that exact configuration need no negotiation or
++// activation replay. The caller revalidates every captured inventory afterward.
++func readActiveSplitNamespace(ctx context.Context, group splitNamespaceGroup) (bool, error) {
++	peers := make([]NamespaceAdmissionPeer, 0, len(group.members.Members))
++	for _, member := range group.members.Members {
++		peers = append(peers, NamespaceAdmissionPeer{MemberID: raftengine.DeriveNodeID(member.ID), Address: member.Address, Client: member.Client})
++	}
++	_, err := probeNamespacePeers(ctx, peers, group.members.ConfigurationIndex, true)
++	if errors.Is(err, errSplitMigrationVoterBarrierIncomplete) {
++		return false, nil
++	}
++	return err == nil, err
++}
+--- a/distribution/catalog.go
++++ b/distribution/catalog.go
+@@ -843,6 +843,11 @@
+ 	return out, nil
+ }
+ 
++// Equal reports whether two descriptors have the same durable catalog fields.
++func (left RouteDescriptor) Equal(right RouteDescriptor) bool {
++	return routeDescriptorEqual(left, right)
++}
++
+ func routeDescriptorEqual(left, right RouteDescriptor) bool {
+ 	return left.RouteID == right.RouteID &&
+ 		bytes.Equal(left.Start, right.Start) &&

@@ -1,0 +1,14 @@
+--- FAIL: TestPreflightFinalExportCannotCommitAcrossCatalogChange (0.00s)
+    split_job_preflight_schedule_test.go:200: 
+        	Error Trace:	/Users/bootjp/src/elastickv/adapter/split_job_preflight_schedule_test.go:200
+        	Error:      	Should be true
+        	Test:       	TestPreflightFinalExportCannotCommitAcrossCatalogChange
+        	Messages:   	catalog-only update invalidates tentative pages
+--- FAIL: TestPreflightCheckpointReadsJobVersionAndRoute (0.00s)
+    split_job_preflight_schedule_test.go:209: 
+        	Error Trace:	/Users/bootjp/src/elastickv/adapter/split_job_preflight_schedule_test.go:209
+        	Error:      	[][]uint8{[]uint8{0x21, 0x64, 0x69, 0x73, 0x74, 0x7c, 0x6a, 0x6f, 0x62, 0x7c, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1}} does not contain []byte{0x21, 0x64, 0x69, 0x73, 0x74, 0x7c, 0x6d, 0x65, 0x74, 0x61, 0x7c, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e}
+        	Test:       	TestPreflightCheckpointReadsJobVersionAndRoute
+FAIL
+FAIL	github.com/bootjp/elastickv/adapter	0.785s
+FAIL

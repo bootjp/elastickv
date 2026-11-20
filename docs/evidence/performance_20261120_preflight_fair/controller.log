@@ -1,0 +1,76 @@
+START prefix-1-baseline 2026-11-19T18:44:33Z
+ 18:44:33 up  4:03,  1 user,  load average: 1.41, 1.58, 0.87
+END prefix-1-baseline exit=0 2026-11-19T18:45:49Z
+    performance_split_timing_test.go:30: PERF preflight-duration lower_ms=12957.620 upper_ms=12980.055
+    performance_split_timing_test.go:30: PERF preflight-work families=46 completed=46 versions=8599
+    performance_split_test.go:104: PERF phase=migration-preflight write=false elapsed_s=12.946 success=125283 errors=0 ops_s=9677.3 p50_ms=0.277 p99_ms=3.049 first_error=<nil>
+    performance_split_test.go:104: PERF phase=migration-preflight write=true elapsed_s=12.946 success=4930 errors=0 ops_s=380.8 p50_ms=9.578 p99_ms=20.539 first_error=<nil>
+--- PASS: TestPerformanceReadWriteSplit (75.43s)
+START prefix-1-candidate 2026-11-19T18:45:49Z
+ 18:45:49 up  4:05,  1 user,  load average: 4.86, 2.64, 1.29
+END prefix-1-candidate exit=0 2026-11-19T18:46:58Z
+    performance_split_timing_test.go:30: PERF preflight-duration lower_ms=3269.477 upper_ms=3290.156
+    performance_split_timing_test.go:30: PERF preflight-work families=46 completed=46 versions=9218
+    performance_split_test.go:104: PERF phase=migration-preflight write=false elapsed_s=3.309 success=32824 errors=0 ops_s=9919.0 p50_ms=0.287 p99_ms=2.296 first_error=<nil>
+    performance_split_test.go:104: PERF phase=migration-preflight write=true elapsed_s=3.309 success=1346 errors=0 ops_s=406.7 p50_ms=9.147 p99_ms=16.048 first_error=<nil>
+--- PASS: TestPerformanceReadWriteSplit (68.98s)
+START prefix-2-candidate 2026-11-19T18:46:58Z
+ 18:46:58 up  4:06,  1 user,  load average: 5.51, 3.30, 1.62
+END prefix-2-candidate exit=0 2026-11-19T18:48:05Z
+    performance_split_timing_test.go:30: PERF preflight-duration lower_ms=3339.944 upper_ms=3360.093
+    performance_split_timing_test.go:30: PERF preflight-work families=46 completed=46 versions=8734
+    performance_split_test.go:104: PERF phase=migration-preflight write=false elapsed_s=3.314 success=28973 errors=0 ops_s=8741.8 p50_ms=0.289 p99_ms=3.471 first_error=<nil>
+    performance_split_test.go:104: PERF phase=migration-preflight write=true elapsed_s=3.314 success=1161 errors=0 ops_s=350.3 p50_ms=11.255 p99_ms=19.955 first_error=<nil>
+--- PASS: TestPerformanceReadWriteSplit (66.76s)
+START prefix-2-baseline 2026-11-19T18:48:05Z
+ 18:48:05 up  4:07,  1 user,  load average: 5.81, 3.85, 1.93
+END prefix-2-baseline exit=0 2026-11-19T18:49:21Z
+    performance_split_timing_test.go:30: PERF preflight-duration lower_ms=12129.668 upper_ms=12150.036
+    performance_split_timing_test.go:30: PERF preflight-work families=46 completed=46 versions=9117
+    performance_split_test.go:104: PERF phase=migration-preflight write=false elapsed_s=12.127 success=124619 errors=0 ops_s=10276.6 p50_ms=0.272 p99_ms=2.250 first_error=<nil>
+    performance_split_test.go:104: PERF phase=migration-preflight write=true elapsed_s=12.127 success=5153 errors=0 ops_s=424.9 p50_ms=8.930 p99_ms=16.746 first_error=<nil>
+--- PASS: TestPerformanceReadWriteSplit (75.78s)
+START prefix-3-baseline 2026-11-19T18:49:21Z
+ 18:49:21 up  4:08,  1 user,  load average: 6.60, 4.52, 2.31
+END prefix-3-baseline exit=0 2026-11-19T18:50:38Z
+    performance_split_timing_test.go:30: PERF preflight-duration lower_ms=12109.705 upper_ms=12125.563
+    performance_split_timing_test.go:30: PERF preflight-work families=46 completed=46 versions=9156
+    performance_split_test.go:104: PERF phase=migration-preflight write=false elapsed_s=12.041 success=122864 errors=0 ops_s=10203.5 p50_ms=0.279 p99_ms=2.210 first_error=<nil>
+    performance_split_test.go:104: PERF phase=migration-preflight write=true elapsed_s=12.041 success=4935 errors=0 ops_s=409.8 p50_ms=9.286 p99_ms=17.218 first_error=<nil>
+--- PASS: TestPerformanceReadWriteSplit (77.53s)
+START prefix-3-candidate 2026-11-19T18:50:38Z
+ 18:50:38 up  4:09,  1 user,  load average: 6.41, 4.86, 2.61
+END prefix-3-candidate exit=0 2026-11-19T18:51:47Z
+    performance_split_timing_test.go:30: PERF preflight-duration lower_ms=3268.877 upper_ms=3290.731
+    performance_split_timing_test.go:30: PERF preflight-work families=46 completed=46 versions=8960
+    performance_split_test.go:104: PERF phase=migration-preflight write=false elapsed_s=3.310 success=31386 errors=0 ops_s=9482.6 p50_ms=0.290 p99_ms=2.866 first_error=<nil>
+    performance_split_test.go:104: PERF phase=migration-preflight write=true elapsed_s=3.310 success=1278 errors=0 ops_s=386.1 p50_ms=9.636 p99_ms=19.511 first_error=<nil>
+--- PASS: TestPerformanceReadWriteSplit (68.76s)
+START full-1-baseline 2026-11-19T18:51:47Z
+ 18:51:47 up  4:10,  1 user,  load average: 6.50, 5.18, 2.89
+END full-1-baseline exit=0 2026-11-19T18:56:32Z
+    performance_split_timing_test.go:30: PERF preflight-duration lower_ms=12999.984 upper_ms=13020.041
+    performance_split_timing_test.go:30: PERF preflight-work families=46 completed=46 versions=8584
+    performance_split_test.go:104: PERF phase=migration-preflight write=false elapsed_s=12.936 success=120318 errors=0 ops_s=9301.0 p50_ms=0.289 p99_ms=3.001 first_error=<nil>
+    performance_split_test.go:104: PERF phase=migration-preflight write=true elapsed_s=12.936 success=4932 errors=0 ops_s=381.3 p50_ms=9.545 p99_ms=20.016 first_error=<nil>
+    performance_split_test.go:127: PERF cross-group done_ms=204458
+    performance_split_test.go:137: PERF recovery path=retained-direct planned=600 sent=600 success=600 errors=0 first_success_ms=56 max_lag_ms=75 error_details=map[] first_error=<nil>
+    performance_split_test.go:137: PERF recovery path=moved-direct planned=600 sent=600 success=600 errors=0 first_success_ms=41 max_lag_ms=63 error_details=map[] first_error=<nil>
+    performance_split_test.go:137: PERF recovery path=moved-forwarded planned=600 sent=600 success=600 errors=0 first_success_ms=47 max_lag_ms=63 error_details=map[] first_error=<nil>
+    performance_split_test.go:137: PERF recovery path=retained-forwarded planned=600 sent=600 success=600 errors=0 first_success_ms=42 max_lag_ms=63 error_details=map[] first_error=<nil>
+    performance_split_test.go:137: PERF recovery path=outside-direct planned=600 sent=600 success=600 errors=0 first_success_ms=41 max_lag_ms=81 error_details=map[] first_error=<nil>
+--- PASS: TestPerformanceReadWriteSplit (284.41s)
+START full-1-candidate 2026-11-19T18:56:32Z
+ 18:56:32 up  4:15,  1 user,  load average: 3.55, 5.34, 3.63
+END full-1-candidate exit=0 2026-11-19T19:06:59Z
+    performance_split_timing_test.go:30: PERF preflight-duration lower_ms=3518.583 upper_ms=3540.968
+    performance_split_timing_test.go:30: PERF preflight-work families=46 completed=46 versions=8690
+    performance_split_test.go:104: PERF phase=migration-preflight write=false elapsed_s=3.509 success=29524 errors=0 ops_s=8414.1 p50_ms=0.301 p99_ms=3.343 first_error=<nil>
+    performance_split_test.go:104: PERF phase=migration-preflight write=true elapsed_s=3.509 success=1213 errors=0 ops_s=345.7 p50_ms=11.445 p99_ms=20.280 first_error=<nil>
+    performance_split_test.go:127: PERF cross-group done_ms=191911
+    performance_split_test.go:137: PERF recovery path=outside-direct planned=600 sent=600 success=600 errors=0 first_success_ms=38 max_lag_ms=624 error_details=map[] first_error=<nil>
+    performance_split_test.go:137: PERF recovery path=retained-direct planned=600 sent=600 success=600 errors=0 first_success_ms=80 max_lag_ms=578 error_details=map[] first_error=<nil>
+    performance_split_test.go:137: PERF recovery path=moved-forwarded planned=600 sent=600 success=600 errors=0 first_success_ms=39 max_lag_ms=524 error_details=map[] first_error=<nil>
+    performance_split_test.go:137: PERF recovery path=moved-direct planned=600 sent=600 success=600 errors=0 first_success_ms=38 max_lag_ms=524 error_details=map[] first_error=<nil>
+    performance_split_test.go:137: PERF recovery path=retained-forwarded planned=600 sent=600 success=600 errors=0 first_success_ms=81 max_lag_ms=625 error_details=map[] first_error=<nil>
+--- PASS: TestPerformanceReadWriteSplit (272.15s)

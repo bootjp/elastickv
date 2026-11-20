@@ -1,0 +1,14 @@
+--- FAIL: TestPreflightCheckpointCommitsOnlyValidatedBatch (0.00s)
+    --- FAIL: TestPreflightCheckpointCommitsOnlyValidatedBatch/commit (0.00s)
+        split_job_preflight_schedule_test.go:177: 
+            	Error Trace:	/Users/bootjp/src/elastickv/adapter/split_job_preflight_schedule_test.go:177
+            	Error:      	Should be true
+            	Test:       	TestPreflightCheckpointCommitsOnlyValidatedBatch/commit
+    --- FAIL: TestPreflightCheckpointCommitsOnlyValidatedBatch/read-error (0.00s)
+        split_job_preflight_schedule_test.go:172: 
+            	Error Trace:	/Users/bootjp/src/elastickv/adapter/split_job_preflight_schedule_test.go:172
+            	Error:      	Expected error with "context deadline exceeded" in chain but got nil.
+            	Test:       	TestPreflightCheckpointCommitsOnlyValidatedBatch/read-error
+FAIL
+FAIL	github.com/bootjp/elastickv/adapter	0.804s
+FAIL

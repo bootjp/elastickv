@@ -293,13 +293,14 @@
           "esac"))))
 
 (defn- wait-for-mount-cmd
-  "Shell snippet that waits up to ~60s for mount-dir to become a mountpoint.
-   The server mounts the filesystem after its public listeners are up, so a
+  "Shell snippet that waits up to ~120s for mount-dir to become a mountpoint.
+   Session registration may spend 90s waiting for Raft/HLC recovery; allow
+   another 30s for mounting. Public listeners start before the mount, so a
    gRPC readiness check alone would let clients hit the bare directory."
   [mount-dir]
   (let [q (sh-quote mount-dir)]
-    (str "for i in $(seq 1 60); do if mountpoint -q " q "; then exit 0; fi; sleep 1; done; "
-         "echo \"Timed out waiting for FUSE mount at \"" q "; exit 1")))
+    (str "for i in $(seq 1 120); do if mountpoint -q " q "; then exit 0; fi; sleep 1; done; "
+         "echo \"Timed out waiting for FUSE mount at \"" q "; tail -n 80 " log-file " >&2 || true; exit 1")))
 
 (defn- prepare-filesystem-mount!
   "Ensures mount-dir exists and holds no stale mount before the server starts."
@@ -401,7 +402,7 @@
     (doseq [p ports]
       (c/on node
         (c/exec :bash "-c"
-                "for i in $(seq 1 60); do if nc -z -w 1 $1 $2; then exit 0; fi; sleep 1; done; echo \\\"Timed out waiting for $1:$2\\\"; exit 1"
+                (str "for i in $(seq 1 60); do if nc -z -w 1 $1 $2; then exit 0; fi; sleep 1; done; echo \\\"Timed out waiting for $1:$2\\\"; tail -n 80 " log-file " >&2 || true; exit 1")
                 "--" (name node) (str p))))))
 
 (defn- join-node!

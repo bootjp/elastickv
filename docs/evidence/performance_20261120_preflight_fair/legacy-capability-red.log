@@ -1,0 +1,28 @@
+--- FAIL: TestLegacyNamespaceFinalCapabilitiesBeforeAnyActivation (0.00s)
+    --- FAIL: TestLegacyNamespaceFinalCapabilitiesBeforeAnyActivation/guard-missing (0.00s)
+        split_job_namespace_legacy_capability_test.go:36: 
+            	Error Trace:	/Users/bootjp/src/elastickv/adapter/split_job_namespace_legacy_capability_test.go:36
+            	Error:      	Should be zero, but was 1
+            	Test:       	TestLegacyNamespaceFinalCapabilitiesBeforeAnyActivation/guard-missing
+            	Messages:   	the inactive source must not activate before the final target capability check
+    --- FAIL: TestLegacyNamespaceFinalCapabilitiesBeforeAnyActivation/guard-unknown (0.00s)
+        split_job_namespace_legacy_capability_test.go:36: 
+            	Error Trace:	/Users/bootjp/src/elastickv/adapter/split_job_namespace_legacy_capability_test.go:36
+            	Error:      	Should be zero, but was 1
+            	Test:       	TestLegacyNamespaceFinalCapabilitiesBeforeAnyActivation/guard-unknown
+            	Messages:   	the inactive source must not activate before the final target capability check
+    --- FAIL: TestLegacyNamespaceFinalCapabilitiesBeforeAnyActivation/partition-missing (0.00s)
+        split_job_namespace_legacy_capability_test.go:36: 
+            	Error Trace:	/Users/bootjp/src/elastickv/adapter/split_job_namespace_legacy_capability_test.go:36
+            	Error:      	Should be zero, but was 1
+            	Test:       	TestLegacyNamespaceFinalCapabilitiesBeforeAnyActivation/partition-missing
+            	Messages:   	the inactive source must not activate before the final target capability check
+    --- FAIL: TestLegacyNamespaceFinalCapabilitiesBeforeAnyActivation/partition-unknown (0.00s)
+        split_job_namespace_legacy_capability_test.go:36: 
+            	Error Trace:	/Users/bootjp/src/elastickv/adapter/split_job_namespace_legacy_capability_test.go:36
+            	Error:      	Should be zero, but was 1
+            	Test:       	TestLegacyNamespaceFinalCapabilitiesBeforeAnyActivation/partition-unknown
+            	Messages:   	the inactive source must not activate before the final target capability check
+FAIL
+FAIL	github.com/bootjp/elastickv/adapter	0.811s
+FAIL

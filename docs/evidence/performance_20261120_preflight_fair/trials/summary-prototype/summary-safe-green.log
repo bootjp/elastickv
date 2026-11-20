@@ -1,0 +1,12 @@
+--- FAIL: TestPreflightSummaryCannotHideOversizedVersion (0.02s)
+    migration_export_preflight_test.go:65: 
+        	Error Trace:	/Users/bootjp/src/elastickv/adapter/migration_export_preflight_test.go:65
+        	Error:      	Target error should be in err chain:
+        	            	expected: "authenticated source version exceeds migration transfer budget"
+        	            	in chain: "rpc error: code = FailedPrecondition desc = rpc error: code = FailedPrecondition desc = migration version exceeds transfer budget; key \"too-large\" commit_ts=17 value_bytes=66060288 key_sha256=347b31929b97f682c017452674f9efd68a21a14b246ef33b17b702f3bc5c2574"
+        	            		"rpc error: code = FailedPrecondition desc = rpc error: code = FailedPrecondition desc = migration version exceeds transfer budget; key \"too-large\" commit_ts=17 value_bytes=66060288 key_sha256=347b31929b97f682c017452674f9efd68a21a14b246ef33b17b702f3bc5c2574"
+        	            		"rpc error: code = FailedPrecondition desc = rpc error: code = FailedPrecondition desc = migration version exceeds transfer budget; key \"too-large\" commit_ts=17 value_bytes=66060288 key_sha256=347b31929b97f682c017452674f9efd68a21a14b246ef33b17b702f3bc5c2574"
+        	Test:       	TestPreflightSummaryCannotHideOversizedVersion
+FAIL
+FAIL	github.com/bootjp/elastickv/adapter	1.319s
+FAIL

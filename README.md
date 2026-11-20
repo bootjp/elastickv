@@ -98,8 +98,9 @@ See the [architecture overview](docs/architecture_overview.md) for component det
 
 ## Implemented Features
 - **Raft-based Data Replication**: KV state replication is implemented on Raft, with leader-based commit and follower forwarding paths.
-- **Shard-aware Data Plane**: Static shard ranges across multiple Raft groups with shard routing/coordinator are implemented.
-- **Route Management and Load Distribution**: A durable route catalog, versioned route snapshots, watcher-based refresh, and manual `ListRoutes`/`SplitRange` are implemented. Opt-in `--autoSplit` detects hot ranges and splits them within the same Raft group. The additional `--autoSplitCrossGroup` flag can migrate an eligible hot right child to another configured group when migration readiness and target-load checks pass; see the [automation design and limits](docs/design/2026_06_11_implemented_hotspot_split_milestone3_automation.md). Opt-in `--leaderBalance` distributes Raft-group leadership among existing voters.
+- **Shard routing.** The coordinator routes requests across Raft groups using versioned snapshots of the durable route catalog. A watcher refreshes the routes after catalog changes.
+- **Hotspot splitting.** The catalog leader can split hot ranges within a group with `--autoSplit`. Adding `--autoSplitCrossGroup` allows it to migrate an eligible right child to a lower-load group. [Automatic hotspot splitting](#automatic-hotspot-splitting)
+- **Leader balancing.** Opt-in `--leaderBalance` distributes Raft-group leadership among existing voters.
 - **Protocol Adapters**: gRPC (`RawKV`/`TransactionalKV`), Redis-compatible server, DynamoDB-compatible HTTP API, S3-compatible HTTP API, and SQS-compatible HTTP API implementations are available (runtime exposure depends on the selected server entrypoint/configuration). The public gRPC `TransactionalKV` service supports single-key operations; its `PreWrite`, `Commit`, and `Rollback` RPCs are not implemented.
 - **Redis Compatibility Scope**: Strings, hashes, lists, sets, sorted sets, HyperLogLog, streams (`XADD`/`XREAD`/`XRANGE`/`XREVRANGE`/`XTRIM`/`XLEN`), Pub/Sub (`PUBLISH`/`SUBSCRIBE`), transactions (`MULTI`/`EXEC`/`DISCARD`), TTL/expiry (`EXPIRE`/`PEXPIRE`/`TTL`/`PTTL`), key scanning (`KEYS`/`SCAN`), and Lua scripting (`EVAL`/`EVALSHA`) are implemented. A Redis-protocol reverse proxy (`cmd/redis-proxy`) supports phased migration with dual writes and shadow-read comparison; validate command coverage and cutover behavior for your workload.
 - **DynamoDB Compatibility Scope**: `CreateTable`/`DeleteTable`/`DescribeTable`/`ListTables`/`PutItem`/`GetItem`/`DeleteItem`/`UpdateItem`/`Query`/`Scan`/`BatchWriteItem`/`TransactWriteItems`/`TransactGetItems` are implemented.
@@ -316,23 +317,23 @@ quit
 
 ### Manual Route Split API
 
-The manual control-plane APIs on `proto.Distribution` are:
+Use `proto.Distribution/ListRoutes` to get the route ID, bounds, and current catalog version. Send split requests to the catalog leader with that version and a split key strictly inside the route.
 
-1. `ListRoutes`
-2. `SplitRange` (same-group split only)
+- `SplitRange` returns both child routes. Both stay in the parent's Raft group.
+- `StartSplitMigration` also takes a `targetGroupId` naming a different, preconfigured data group. It returns a durable job ID. The job moves the right child `[splitKey, parent.end)` to the target and leaves the left child on the source. The moving range must exclude reserved migration and distribution keys and the SQS global routing key. Follow the job with `GetSplitJob` or `ListSplitJobs` through completion.
 
-Use `grpcurl` against a running node:
+For this same-group example, set `CATALOG_LEADER` to the leader's gRPC host and port, `CA_FILE` to its CA certificate file, and export `MIGRATION_TOKEN` with the dedicated split-migration bearer token.
 
 ```bash
 # 1) Read current durable route catalog
-grpcurl -plaintext -d '{}' localhost:50051 proto.Distribution/ListRoutes
+grpcurl -cacert "$CA_FILE" -d '{}' "$CATALOG_LEADER" proto.Distribution/ListRoutes
 
 # 2) Split route 1 at user key "g" (bytes are base64 in grpcurl JSON: "g" -> "Zw==")
-grpcurl -plaintext -d '{
+grpcurl -cacert "$CA_FILE" -expand-headers -rpc-header 'authorization: Bearer ${MIGRATION_TOKEN}' -d '{
   "expectedCatalogVersion": 1,
   "routeId": 1,
   "splitKey": "Zw=="
-}' localhost:50051 proto.Distribution/SplitRange
+}' "$CATALOG_LEADER" proto.Distribution/SplitRange
 ```
 
 Example `SplitRange` response:
@@ -359,12 +360,27 @@ Example `SplitRange` response:
 }
 ```
 
-Notes:
+#### Cross-group migration prerequisites
 
-1. `expectedCatalogVersion` must match the latest `ListRoutes.catalogVersion`.
-2. `splitKey` must be strictly inside the parent range (not equal to range start/end).
-3. Manual split keeps both children in the same Raft group as the parent.
+Configure gRPC TLS on every node with `--grpcTLSCertFile`, `--grpcTLSKeyFile`, and the appropriate CA trust. Distribute the same dedicated token through `--splitMigrationTokenFile`, distinct from the Admin and S3 peer tokens. Once every node sends the migration token, enable `--splitMigrationPeerAuthEnforced`. Enable all three migration operations in each server's environment.
 
+```sh
+export ELASTICKV_ENABLE_MIGRATION_IMPORT_OPCODE=true
+export ELASTICKV_ENABLE_MIGRATION_PROMOTE_OPCODE=true
+export ELASTICKV_ENABLE_MIGRATION_CLEANUP_OPCODE=true
+```
+
+Before accepting a migration job, the catalog leader checks local readiness and probes every configured Raft peer for migration capability. A failed probe prevents job creation.
+
+### Automatic hotspot splitting
+
+Both scheduler flags default to off. With `--autoSplit`, the catalog leader uses committed KeyViz windows to detect sustained hot ranges and calls `SplitRange`. Adding `--autoSplitCrossGroup` lets it call `StartSplitMigration` for an eligible right child. Enabling both flags requires at least two configured Raft data groups and local migration readiness at startup.
+
+The scheduler considers migration when the split isolates a hot key at the upper edge of the range. A median split must have observed load on both sides. The right child can migrate when its estimated load is at least as high as the left child's and the boundary is eligible. A split at the upper edge of the first histogram bucket stays within the source group.
+
+To compare groups, the catalog leader sums weighted operations per minute over the same recent, committed KeyViz window. Each group being compared must have only active routes. For every such route, the catalog leader must have led its group, tracked the route, and covered its reads for the entire window. A preconfigured group with no routes counts as zero load.
+
+Among eligible targets with strictly lower load than the source, the scheduler chooses the least loaded group, breaking ties by smaller group ID. If the right child or target does not qualify, an otherwise eligible split stays in the source group. Group provisioning and node placement remain operator responsibilities.
 
 ## Graceful shutdown
 
@@ -403,6 +419,7 @@ Design documents:
 - [docs/design/2026_03_22_implemented_s3_compatible_adapter.md](docs/design/2026_03_22_implemented_s3_compatible_adapter.md) (S3-compatible object storage adapter design, data model, routing, and rollout plan)
 - [docs/design/2026_04_24_implemented_sqs_compatible_adapter.md](docs/design/2026_04_24_implemented_sqs_compatible_adapter.md) (SQS-compatible queues)
 - [docs/design/2026_02_24_implemented_filesystem_on_elastickv.md](docs/design/2026_02_24_implemented_filesystem_on_elastickv.md) (filesystem operations, FUSE, placement, and limitations)
+- [Cross-group split migration](docs/design/2026_06_11_implemented_hotspot_split_milestone2_migration.md)
 - [docs/design/2026_06_11_implemented_hotspot_split_milestone3_automation.md](docs/design/2026_06_11_implemented_hotspot_split_milestone3_automation.md) (automatic range splitting and opt-in cross-group migration)
 
 ## Metrics and Grafana
@@ -489,6 +506,12 @@ Elastickv ships an optional admin dashboard — a React SPA plus JSON API served
 ## Development
 
 Implementation rationale lives in the [design documents](docs/design/README.md), and the [TLA+ models](tla/README.md) describe the modeled safety properties and their scope. The workload tests below exercise specific API behavior; assess their results against the workload, configuration, and fault model used.
+
+Run `make lean-check` with Lean 4 to check the in-memory MVCC history
+lookup and compaction proofs. The toolchain version is pinned in
+[`lean/lean-toolchain`](lean/lean-toolchain). To benchmark historical and latest
+reads on a single key with 4,096 versions, run
+`go test ./store -run '^$' -bench BenchmarkMemoryMVCCHistory -benchmem`.
 
 ### Running Jepsen tests
 

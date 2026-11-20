@@ -4,7 +4,8 @@
             [elastickv.sqs-htfifo-workload :as htfifo]
             [elastickv.sqs-workload :as workload]
             [jepsen.checker :as checker]
-            [jepsen.client :as client]))
+            [jepsen.client :as client]
+            [jepsen.generator :as gen]))
 
 (defn result [history]
   (checker/check (workload/standard-checker) {} history {}))
@@ -224,3 +225,12 @@
             (is (= ["a"] (:deleted (deref other-op 5000 {}))))
             (is (= 1 @receives)))
           (finally (deliver release-delete true)))))))
+
+(deftest standard-workload-sends-before-short-polling-phase
+  ;; Five one-second, serialized receives can consume the entire five-second
+  ;; smoke test. An initial send ensures this is not an empty-queue-only sample.
+  (dotimes [_ 32]
+    (let [test {:concurrency 5 :nodes ["n1" "n2" "n3"]}
+          context (gen/context test)
+          [op _] (gen/op (:generator (workload/sqs-workload {})) test context)]
+      (is (= :send (:f op))))))

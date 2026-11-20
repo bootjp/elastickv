@@ -51,7 +51,7 @@ jobs:
   faults:
     name: Jepsen (${{ matrix.adapter }}, ${{ matrix.fault }})
     runs-on: ubuntu-26.04
-    timeout-minutes: 30
+    timeout-minutes: ${{ startsWith(matrix.adapter, 'filesystem-') && 45 || 30 }}
     strategy:
       fail-fast: false
       matrix:
@@ -67,7 +67,8 @@ jobs:
           key: hosted-jepsen-maven-${{ runner.os }}-${{ hashFiles('jepsen/project.clj') }}
           restore-keys: hosted-jepsen-maven-${{ runner.os }}-
       - name: Run three-node fault and recovery test
-        timeout-minutes: 25
+        # Preserve the fault phase; allow all 6,000 FUSE final reads to finish.
+        timeout-minutes: ${{ startsWith(matrix.adapter, 'filesystem-') && 40 || 25 }}
         env:
           FAULT: ${{ matrix.fault }}
           ADAPTER: ${{ matrix.adapter }}

@@ -3450,6 +3450,10 @@ func (c *ShardedCoordinator) rawLogs(ctx context.Context, reqs *OperationGroup[O
 }
 
 func (c *ShardedCoordinator) rawLogsWithGroups(ctx context.Context, reqs *OperationGroup[OP]) ([]*pb.Request, []uint64, error) {
+	var observed uint64
+	if c.engine != nil {
+		observed = EncodeObservedRouteVersion(c.engine.Version())
+	}
 	grouped, gids, err := c.groupMutations(reqs.Elems, reqs.KeyVizLabel)
 	if err != nil {
 		return nil, nil, err
@@ -3468,14 +3472,18 @@ func (c *ShardedCoordinator) rawLogsWithGroups(ctx context.Context, reqs *Operat
 				return nil, nil, err
 			}
 		}
-		logs = append(logs, &pb.Request{
+		request := &pb.Request{
 			IsTxn:                false,
 			Phase:                pb.Phase_NONE,
 			Ts:                   ts,
 			Mutations:            muts,
 			ObservedRouteVersion: reqs.ObservedRouteVersion,
 			WriteFenceBypassKeys: bypassKeysByGroup[gid],
-		})
+		}
+		if err := c.pinRawMigrationVersion(ctx, gid, request, observed); err != nil {
+			return nil, nil, err
+		}
+		logs = append(logs, request)
 	}
 	return logs, gids, nil
 }

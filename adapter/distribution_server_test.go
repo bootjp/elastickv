@@ -3600,6 +3600,7 @@ func (s *splitMigrationClientStub) ExportRangeVersions(
 	_ ...grpc.CallOption,
 ) (grpc.ServerStreamingClient[pb.ExportRangeVersionsResponse], error) {
 	cloned := &pb.ExportRangeVersionsRequest{
+		MaxPages:             req.GetMaxPages(),
 		RangeStart:           distribution.CloneBytes(req.GetRangeStart()),
 		RangeEnd:             distribution.CloneBytes(req.GetRangeEnd()),
 		MaxCommitTs:          req.GetMaxCommitTs(),

@@ -22,10 +22,14 @@ type splitTransferAdmissionWitness struct {
 	ownershipProof *pb.MigrationOwnershipProof
 }
 
+// Readback is opt-in for preflight. Exact all-member proof may replace a
+// redundant proposal of controls that are already durably installed.
+type splitTransferAdmissionOptions struct{ readExistingControl bool }
+
 // The caller has already ACKed the full same-owner partition at the control's
 // configuration. This must finish before preflight timestamps/catalog writes,
 // history export, or source write fencing. No leader-only fallback is allowed.
-func (s *DistributionServer) ensureSplitTransferAdmission(ctx context.Context, job distribution.SplitJob, groupID uint64, source SplitMigrationClient, control *pb.TargetStagedReadinessRequest, ownershipProof *pb.MigrationOwnershipProof) (*splitTransferAdmissionWitness, error) {
+func (s *DistributionServer) ensureSplitTransferAdmission(ctx context.Context, job distribution.SplitJob, groupID uint64, source SplitMigrationClient, control *pb.TargetStagedReadinessRequest, ownershipProof *pb.MigrationOwnershipProof, options ...splitTransferAdmissionOptions) (*splitTransferAdmissionWitness, error) {
 	if err := validateSplitTransferAdmission(job, groupID, source, control, ownershipProof); err != nil {
 		return nil, err
 	}
@@ -44,6 +48,24 @@ func (s *DistributionServer) ensureSplitTransferAdmission(ctx context.Context, j
 	}
 	if _, err := s.revalidateSplitTransferMembers(ctx, witness); err != nil {
 		return nil, err
+	}
+	return s.armOrReadSplitTransferAdmission(ctx, source, witness, options)
+}
+
+func (s *DistributionServer) armOrReadSplitTransferAdmission(ctx context.Context, source SplitMigrationClient, witness *splitTransferAdmissionWitness, options []splitTransferAdmissionOptions) (*splitTransferAdmissionWitness, error) {
+	if len(options) > 0 && options[0].readExistingControl {
+		ready, err := readSplitTransferControls(ctx, witness, witness.snapshot.Members)
+		if err != nil {
+			return nil, err
+		}
+		if ready {
+			// Ownership ACKs preceded the exact control ACKs above. Close the
+			// same configuration sandwich as revalidateSplitTransferAdmission.
+			if _, err := s.revalidateSplitTransferMembers(ctx, witness); err != nil {
+				return nil, err
+			}
+			return witness, nil
+		}
 	}
 	attempt, cancel := context.WithTimeout(ctx, defaultSplitMigrationAttemptTimeout)
 	defer cancel()
@@ -195,4 +217,20 @@ func (s *DistributionServer) revalidateSplitTransferAdmission(ctx context.Contex
 	}
 	_, err = s.revalidateSplitTransferMembers(ctx, witness)
 	return err
+}
+
+func readSplitTransferControls(ctx context.Context, witness *splitTransferAdmissionWitness, members []SplitMigrationVoter) (bool, error) {
+	req := probeMigrationControlRequest(witness.control)
+	req.RequireConfigurationIndex = true
+	req.ExpectedConfigurationIndex = witness.snapshot.ConfigurationIndex
+	req.TransferSizeGuardVersion = store.MigrationTransferSizeGuardVersion
+	for _, member := range members {
+		if _, err := probeSplitTransferMember(ctx, member, req); err != nil {
+			if errors.Is(err, errSplitMigrationVoterBarrierIncomplete) {
+				return false, nil
+			}
+			return false, err
+		}
+	}
+	return true, nil
 }

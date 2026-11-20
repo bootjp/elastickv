@@ -4,6 +4,13 @@
             [clojure.test :refer :all]
             [clojure.tools.cli :as tools.cli]
             [jepsen.checker :as checker]
+            [knossos.linear :as linear]
+            [elastickv.elle-checker :as elle]
+            [jepsen.control.core :as control-core]
+            [jepsen.control.retry :as control-retry]
+            [jepsen.control.scp :as control-scp]
+            [jepsen.control.sshj :as control-sshj]
+            [jepsen.reconnect :as reconnect]
             [jepsen.client :as client]
             [jepsen.generator :as gen]
             [jepsen.history :as history]
@@ -366,10 +373,27 @@
     (is (nil? (:final-generator test-map)))
     (is (some? (:generator test-map)))))
 
-(deftest register-checker-races-knossos-analyzers
+(deftest register-checker-uses-linear-without-wgl
   (let [linear-checker (get-in (workload/filesystem-register-checker)
                                [:checkers :linear])]
-    (is (nil? (:algorithm linear-checker)))))
+    (is (= :linear (:algorithm linear-checker)))))
+
+(deftest register-checker-handles-indeterminate-fuse-history
+  ;; All 70 client events from run 44697497760, overwrite/kill, key 71.
+  ;; Competition and WGL exhaust 512 MiB on this input; no client outcomes
+  ;; are dropped to make the selected checker finish.
+  (let [events (elle/read-history (io/resource "fixtures/filesystem-overwrite-kill-key71.edn"))
+        selected (get-in (workload/filesystem-register-checker) [:checkers :linear])]
+    (is (= 70 (count events)))
+    (is (= 16 (count (filter #(and (= :write (:f %)) (= :info (:type %))) events))))
+    (is (= 3 (count (filter #(and (:final %) (= :ok (:type %))) events))))
+    (is (true? (:valid? (checker/check selected {} (history/history events {:dense-indices? false}) {}))))
+    ;; A successful write followed by an older final read must be rejected.
+    (is (false? (:valid? (linear/analysis (:model selected)
+                          [{:process 0 :type :invoke :f :write :value 4}
+                           {:process 0 :type :ok :f :write :value 4}
+                           {:process 1 :type :invoke :f :read :value nil :final true}
+                           {:process 1 :type :ok :f :read :value -1 :final true}]))))))
 
 (deftest remote-db-receives-mount-map
   (let [test-map (workload/elastickv-filesystem-test {:nodes ["n1" "n2"]
@@ -394,7 +418,8 @@
     (is (str/includes? read "[ \"$s\" -ge 16 ] || { echo 'short record' >&2; exit 1; }; "))
     (is (str/ends-with? read "exec head -c 16 '/mnt/fs/jepsen/reg-1'")))
   (let [setup (workload/remote-setup-cmd "/mnt/fs" [0 1])]
-    (is (str/starts-with? setup "mkdir -p '/mnt/fs/jepsen'"))
+    (is (str/starts-with? setup "mountpoint -q '/mnt/fs' || { echo 'mount unavailable: /mnt/fs' >&2; exit 1; }; "))
+    (is (str/includes? setup "mkdir -p '/mnt/fs/jepsen'"))
     (is (str/includes? setup "> '/mnt/fs/jepsen/reg-0'"))
     (is (str/includes? setup "> '/mnt/fs/jepsen/reg-1'"))))
 
@@ -754,7 +779,7 @@
     (is (thrown? clojure.lang.ExceptionInfo
                  (client/open! (:client test-map) test-map "n9")))))
 
-(deftest remote-setup-is-serialized-across-replicated-mounts
+(deftest remote-setup-is-shared-and-serialized-across-replicated-mounts
   (let [entered (promise) release (promise) attempted (promise)
         seen (atom [])
         base (:client (workload/filesystem-register-workload
@@ -779,5 +804,491 @@
               (deliver release true)
               (is (= :ok (deref first-call 5000 :timeout)))
               (is (= :ok (deref other-call 5000 :timeout)))
-              (is (= ["n1" "n2"] @seen)))
+              (is (= ["n1"] @seen) "other mounts await the same completed initialization"))
             (finally (deliver release true))))))))
+
+(deftest remote-setup-bounds-commands-without-dropping-registers
+  (let [root (scratch-dir)
+        dir (str root "/it's a mount")
+        commands (atom [])
+        base (:client (workload/filesystem-register-workload
+                        {:key-count 2000 :node->mount-dir {"n1" dir}}))
+        c (client/open! base {} "n1")]
+    (try
+      (with-redefs-fn
+        {#'workload/remote-exec!
+         (fn [_ _ command]
+           (swap! commands conj command)
+           (is (< (count (.getBytes ^String command "UTF-8")) 32768)
+               "setup must stay below the Linux single-argument limit")
+           (let [result (clojure.java.shell/sh "sh" "-c" (str "mountpoint() { return 0; }; " command))]
+             (is (zero? (:exit result)) (:err result))))}
+        #(client/setup! c {}))
+      (is (> (count @commands) 1))
+      (is (= 2000 (count (.listFiles (io/file (workload/workload-dir dir))))))
+      (doseq [k (range 2000)]
+        (is (= workload/record-width (.length (io/file (workload/register-path dir k)))))
+        (is (= workload/initial-value (workload/local-read (workload/register-path dir k)))))
+      (finally (delete-tree! root)))))
+
+(deftest remote-setup-seeds-shared-files-once
+  (let [commands (atom [])
+        base (:client (workload/filesystem-register-workload
+                        {:key-count 2 :node->mount-dir {"n1" "/mount" "n2" "/mount" "n3" "/mount"}}))]
+    (with-redefs-fn
+      {#'workload/remote-exec! (fn [_ node command] (swap! commands conj [node command]) "")}
+      (fn []
+        (doseq [node ["n1" "n2" "n3" "n1" "n2" "n3"]]
+          (client/setup! (client/open! base {} node) {}))))
+    (is (= 1 (count @commands)) "all worker copies share the same replicated seed files")
+    (is (str/includes? (second (first @commands)) "reg-0"))
+    (is (str/includes? (second (first @commands)) "reg-1"))))
+
+
+(deftest failed-remote-setup-does-not-publish-completion
+  (let [calls (atom 0)
+        base (:client (workload/filesystem-register-workload
+                        {:key-count 2 :max-retries 1 :node->mount-dir {"n1" "/mount" "n2" "/mount"}}))
+        first-client (client/open! base {} "n1")
+        other-client (client/open! base {} "n2")]
+    (with-redefs-fn
+      {#'workload/remote-exec!
+       (fn [_ _ _]
+         (when (= 1 (swap! calls inc))
+           (throw (java.io.IOException. "seed interrupted")))
+         "")}
+      (fn []
+        (is (thrown? clojure.lang.ExceptionInfo (client/setup! first-client {})))
+        (client/setup! other-client {})
+        (client/setup! first-client {})
+        (is (= 2 @calls) "a failed seed must be retried; a successful seed must be shared")))))
+
+(deftest remote-setup-state-is-scoped-to-one-workload
+  (let [calls (atom 0)]
+    (with-redefs-fn
+      {#'workload/remote-exec! (fn [& _] (swap! calls inc) "")}
+      (fn []
+        (dotimes [_ 2]
+          (let [base (:client (workload/filesystem-register-workload
+                               {:key-count 2 :node->mount-dir {"n1" "/mount"}}))]
+            (client/setup! (client/open! base {} "n1") {})))
+        (is (= 2 @calls) "a new test must initialize its own seed files")))))
+
+
+(deftest remote-setup-rejects-missing-mount-before-publishing-completion
+  (let [root (scratch-dir)
+        bad (str root "/missing-mount")
+        good (str root "/healthy-mount")
+        base (:client (workload/filesystem-register-workload
+                        {:key-count 2 :max-retries 1 :node->mount-dir {"n1" bad "n2" good}}))]
+    (try
+      (with-redefs-fn
+        {#'workload/remote-exec!
+         (fn [_ node command]
+           (let [mount-exit (if (= "n1" node) 1 0)
+                 result (clojure.java.shell/sh "sh" "-c"
+                          (str "mountpoint() { return " mount-exit "; }; " command))]
+             (when-not (zero? (:exit result))
+               (throw (ex-info (:err result) (assoc result :type :jepsen.control/nonzero-exit))))))}
+        (fn []
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"mount unavailable"
+                (client/setup! (client/open! base {} "n1") {})))
+          (is (false? @(:setup-state base)))
+          (is (not (.exists (io/file bad))) "an unmounted path must receive no seed writes")
+          (client/setup! (client/open! base {} "n2") {})
+          (is (true? @(:setup-state base)))
+          (doseq [k (range 2)]
+            (is (= workload/initial-value (workload/local-read (workload/register-path good k)))))))
+      (finally (delete-tree! root)))))
+
+(defn- with-final-read-clock [f]
+  (let [now (atom 0)]
+    (with-redefs-fn
+      {#'workload/final-read-now-ns #(long @now)
+       #'workload/final-read-backoff! #(swap! now + (* 1000000 %))}
+      f)))
+
+(deftest remote-final-read-reobserves-bounded-mount-availability
+  (let [calls (atom 0)
+        unavailable (nonzero-exit "read command" "mount unavailable: /mnt/fs")
+        read (fn [final?]
+               (with-final-read-clock
+                 #(workload/invoke-read! {:local? false :mount-dir "/mnt/fs" :max-retries 3}
+                    {} "n1" (cond-> {:type :invoke :f :read :value (independent/tuple 0 nil)}
+                               final? (assoc :final true)) 0)))]
+    (with-redefs-fn
+      {#'workload/remote-exec!
+       (fn [& _]
+         (if (= 1 (swap! calls inc))
+           (throw unavailable)
+           (String. ^bytes (workload/encode-value 15) "US-ASCII")))}
+      (fn []
+        (let [result (read true)]
+          (is (= :ok (:type result)))
+          (is (= (independent/tuple 0 15) (:value result)))
+          (is (= 2 @calls)))))
+    (reset! calls 0)
+    (with-redefs-fn
+      {#'workload/remote-exec! (fn [& _] (swap! calls inc) (throw unavailable))}
+      (fn []
+        (let [result (read true)]
+          (is (= :fail (:type result)))
+          (is (= 1500 @calls))
+          (is (= 30000 (get-in result [:final-observation :elapsed-ms])))
+          (is (true? (get-in result [:final-observation :extended?])))
+          (is (true? (get-in result [:final-observation :deadline-exceeded?])))
+          (is (= :unknown (:valid? (checker/check (workload/final-reads-checker)
+                                    {} (history/history [result]) {})))))
+        (reset! calls 0)
+        (is (= :fail (:type (read false))))
+        (is (= 1 @calls) "main-phase classification is unchanged")))))
+
+
+(deftest final-read-outlasts-leader-recovery-beyond-one-attempt-window
+  (let [calls (atom 0)
+        unavailable (nonzero-exit "read command" "mount unavailable: /mnt/fs")]
+    (with-redefs-fn
+      {#'workload/remote-exec!
+       (fn [& _]
+         (if (<= (swap! calls inc) workload/final-read-min-retries)
+           (throw unavailable)
+           (String. ^bytes (workload/encode-value 15) "US-ASCII")))}
+      (fn []
+        (let [result (workload/invoke-read!
+                       {:local? false :mount-dir "/mnt/fs" :max-retries 3}
+                       {} "n1" {:type :invoke :f :read :value (independent/tuple 0 nil) :final true} 0)]
+          (is (= :ok (:type result)))
+          (is (= (independent/tuple 0 15) (:value result)))
+          (is (= (inc workload/final-read-min-retries) @calls)))))))
+
+(deftest extended-final-observation-retains-availability-evidence
+  (with-final-read-clock
+    (fn []
+      (let [calls (atom 0)]
+        (with-redefs-fn
+          {#'workload/remote-exec!
+           (fn [& _]
+             (if (<= (swap! calls inc) 128)
+               (throw (nonzero-exit "read" "mount unavailable: /mnt/fs"))
+               (String. ^bytes (workload/encode-value 15) "US-ASCII")))}
+          (fn []
+            (let [op {:process 0 :node "n1" :type :invoke :f :read :value (independent/tuple 2 nil) :final true}
+                  result (workload/invoke-read! {:local? false :mount-dir "/mnt/fs" :max-retries 3} {} "n1" op 2)
+                  verdict (check-final-reads [(update result :value second)])]
+              (is (= :ok (:type result)))
+              (is (= [2 15] (:value result)))
+              (is (= 129 (get-in result [:final-observation :attempts])))
+              (is (str/includes? (get-in result [:final-observation :last-error]) "mount unavailable"))
+              (is (true? (:valid? verdict)))
+              (is (false? (get-in verdict [:availability :within-original-attempt-limit?])))
+              (is (= [(select-keys (update result :value second) [:process :node :f :value :final-observation])]
+                     (mapv #(dissoc % :index) (get-in verdict [:availability :extended-observations])))))))))))
+
+(deftest final-observation-does-not-reset-budget-when-error-changes
+  (doseq [data-error [(nonzero-exit "read" "No such file or directory")
+                     (java.io.EOFException. "short record")
+                     (NumberFormatException. "invalid record")]]
+    (with-final-read-clock
+      (fn []
+        (let [calls (atom 0)]
+          (with-redefs-fn
+            {#'workload/remote-exec!
+             (fn [& _]
+               (if (<= (swap! calls inc) 128)
+                 (throw (nonzero-exit "read" "mount unavailable: /mnt/fs"))
+                 (throw data-error)))}
+            (fn []
+              (let [result (workload/invoke-read! {:local? false :mount-dir "/mnt/fs" :max-retries 3}
+                             {} "n1" {:type :invoke :f :read :value (independent/tuple 0 nil) :final true} 0)]
+                (is (= 129 @calls))
+                (is (= :fail (:type result)))
+                (is (= [0 nil] (:value result)))
+                (is (true? (get-in result [:final-observation :extended?])))
+                (is (= :unknown (:valid? (check-final-reads [(update result :value second)]))))))))))))
+
+(deftest final-observation-does-not-start-a-retry-at-deadline
+  (let [now (atom 0), calls (atom 0)]
+    (with-redefs-fn
+      {#'workload/final-read-now-ns #(long @now)
+       #'workload/final-read-backoff! #(swap! now + (* 1000000 %))
+       #'workload/remote-exec! (fn [& _]
+                                (swap! calls inc)
+                                (reset! now 29990000000)
+                                (throw (nonzero-exit "read" "mount unavailable: /mnt/fs")))}
+      (fn []
+        (let [result (workload/invoke-read! {:local? false :mount-dir "/mnt/fs" :max-retries 3}
+                       {} "n1" {:type :invoke :f :read :value (independent/tuple 0 nil) :final true} 0)]
+          (is (= 1 @calls))
+          (is (= :fail (:type result)))
+          (is (= 30000 (get-in result [:final-observation :elapsed-ms])))
+          (is (true? (get-in result [:final-observation :deadline-exceeded?])))
+          (is (= :unknown (:valid? (check-final-reads [(update result :value second)])))))))))
+
+(deftest final-observation-records-a-single-ssh-call-overrunning-deadline
+  (let [now (atom 0)]
+    (with-redefs-fn
+      {#'workload/final-read-now-ns #(long @now)
+       #'workload/remote-exec! (fn [& _] (reset! now 31000000000)
+                                (String. ^bytes (workload/encode-value 15) "US-ASCII"))}
+      (fn []
+        (let [result (workload/invoke-read! {:local? false :mount-dir "/mnt/fs" :max-retries 3}
+                       {} "n1" {:type :invoke :f :read :value (independent/tuple 0 nil) :final true} 0)
+              verdict (check-final-reads [(update result :value second)])]
+          (is (= :ok (:type result)))
+          (is (= 1 (get-in result [:final-observation :attempts])))
+          (is (= 31000 (get-in result [:final-observation :elapsed-ms])))
+          (is (true? (:valid? verdict)))
+          (is (false? (get-in verdict [:availability :within-observation-deadline?]))))))))
+
+(deftest final-observation-does-not-retry-cancellation
+  (doseq [failure [(InterruptedException. "mount unavailable")
+                   (java.util.concurrent.CancellationException. "mount unavailable")
+                   (java.io.InterruptedIOException. "mount unavailable")]]
+    (with-final-read-clock
+      (fn []
+        (let [calls (atom 0)]
+          (with-redefs-fn
+            {#'workload/remote-exec! (fn [& _] (swap! calls inc) (throw failure))}
+            (fn []
+              (let [result (workload/invoke-read! {:local? false :mount-dir "/mnt/fs" :max-retries 3}
+                             {} "n1" {:type :invoke :f :read :value (independent/tuple 0 nil) :final true} 0)]
+                (is (= :fail (:type result)))
+                (is (= 1 @calls))
+                (is (= 1 (get-in result [:final-observation :attempts])))))))))))
+
+(deftest final-observation-deadline-does-not-certify-early-data-loss
+  (let [now (atom 0)]
+    (with-redefs-fn
+      {#'workload/final-read-now-ns #(long @now)
+       #'workload/remote-exec! (fn [& _] (reset! now 30005000000)
+                                (throw (nonzero-exit "read" "No such file or directory")))}
+      (fn []
+        (let [result (workload/invoke-read! {:local? false :mount-dir "/mnt/fs" :max-retries 3}
+                       {} "n1" {:type :invoke :f :read :value (independent/tuple 0 nil) :final true} 0)]
+          (is (= :fail (:type result)))
+          (is (= 1 (get-in result [:final-observation :attempts])))
+          (is (= :deadline (get-in result [:final-observation :stop-reason])))
+          (is (= :unknown (:valid? (check-final-reads [(update result :value second)])))))))))
+
+(deftest final-observation-retains-evidence-when-backoff-is-interrupted
+  (let [now (atom 0), calls (atom 0)]
+    (with-redefs-fn
+      {#'workload/final-read-now-ns #(long @now)
+       #'workload/final-read-backoff! (fn [_] (reset! now 7000000) (throw (InterruptedException. "cancelled")))
+       #'workload/remote-exec! (fn [& _] (swap! calls inc)
+                                (throw (nonzero-exit "read" "mount unavailable: /mnt/fs")))}
+      (fn []
+        (let [result (workload/invoke-read! {:local? false :mount-dir "/mnt/fs" :max-retries 3}
+                       {} "n1" {:type :invoke :f :read :value (independent/tuple 0 nil) :final true} 0)]
+          (is (= :fail (:type result)))
+          (is (= 1 @calls))
+          (is (= 7 (get-in result [:final-observation :elapsed-ms])))
+          (is (= :cancelled (get-in result [:final-observation :stop-reason])))
+          (is (str/includes? (get-in result [:final-observation :last-error]) "mount unavailable")))))))
+
+(deftest known-observation-overruns-outweigh-missing-legacy-metadata
+  (let [old {:process 0 :type :ok :f :read :value 1 :final true}
+        extended (assoc old :process 1 :final-observation
+                        {:attempts 129 :extended? true :deadline-exceeded? false})
+        late (assoc old :process 2 :final-observation
+                    {:attempts 1 :extended? false :deadline-exceeded? true})]
+    (is (false? (get-in (check-final-reads [old extended]) [:availability :within-original-attempt-limit?])))
+    (is (false? (get-in (check-final-reads [old late]) [:availability :within-observation-deadline?])))))
+
+(deftest legacy-final-history-does-not-claim-new-observation-bounds
+  (let [verdict (check-final-reads [{:process 0 :type :ok :f :read :value 1 :final true}])]
+    (is (true? (:valid? verdict)))
+    (is (= :unknown (get-in verdict [:availability :within-original-attempt-limit?])))
+    (is (= :unknown (get-in verdict [:availability :within-observation-deadline?])))))
+
+(deftest final-mount-retry-does-not-classify-command-text
+  (is (not (workload/final-read-observation-retry? false
+             (nonzero-exit "guard prints mount unavailable" "Permission denied")))))
+
+(deftest seed-retries-before-measured-writers-start
+  (doseq [message ["sh: 1: printf: printf: I/O error"
+                   "mount unavailable: /mnt/fs"
+                   "seed command interrupted"]]
+    (let [calls (atom 0)
+          base (:client (workload/filesystem-register-workload
+                          {:key-count 2 :max-retries 3 :node->mount-dir {"n1" "/mount"}}))]
+      (with-redefs-fn
+        {#'workload/remote-exec!
+         (fn [& _]
+           (is (false? @(:setup-state base)))
+           (when (= 1 (swap! calls inc))
+             (throw (nonzero-exit "seed" message)))
+           "")}
+        (fn []
+          (client/setup! (client/open! base {} "n1") {})
+          (is (= 2 @calls) message)
+          (is (true? @(:setup-state base))))))))
+
+(deftest persistent-seed-errors-exhaust-the-attempt-limit
+  (let [calls (atom 0)
+        base (:client (workload/filesystem-register-workload
+                        {:key-count 2 :max-retries 3 :node->mount-dir {"n1" "/mount"}}))]
+    (with-redefs-fn
+      {#'workload/remote-exec!
+       (fn [& _]
+         (swap! calls inc)
+         (throw (nonzero-exit "seed" "Permission denied")))}
+      (fn []
+        (is (thrown? clojure.lang.ExceptionInfo (client/setup! (client/open! base {} "n1") {})))
+        (is (= 3 @calls))
+        (is (false? @(:setup-state base)))))))
+
+(deftest seed-cancellation-is-not-retried
+  (doseq [cancel [(InterruptedException. "seed interrupted")
+                  (java.util.concurrent.CancellationException. "seed cancelled")]]
+    (let [calls (atom 0)
+          base (:client (workload/filesystem-register-workload
+                          {:key-count 2 :max-retries 3 :node->mount-dir {"n1" "/mount"}}))]
+      (with-redefs-fn
+        {#'workload/remote-exec! (fn [& _] (swap! calls inc) (throw cancel))}
+        (fn []
+          (is (identical? cancel (try
+                                  (client/setup! (client/open! base {} "n1") {})
+                                  nil
+                                  (catch Exception e e))))
+          (is (= 1 @calls))
+          (is (false? @(:setup-state base))))))))
+
+(deftest seed-with-unknown-remote-outcome-is-not-replayed
+  (doseq [failure [(java.io.IOException. "SSH command interrupted")
+                   (java.io.InterruptedIOException. "SSH read interrupted")
+                   (ex-info "exit status unavailable" {:exit nil})
+                   (ex-info "exit status unavailable" {:exit -1})]]
+    (let [calls (atom 0)
+          base (:client (workload/filesystem-register-workload
+                          {:key-count 2 :max-retries 3 :node->mount-dir {"n1" "/mount"}}))]
+      (with-redefs-fn
+        {#'workload/remote-exec! (fn [& _] (swap! calls inc) (throw failure))}
+        (fn []
+          (let [result (try (client/setup! (client/open! base {} "n1") {})
+                            (catch Exception e e))]
+            (is (= :elastickv.filesystem-workload/seed-outcome-unknown (:type (ex-data result))))
+            (is (identical? failure (ex-cause result))))
+          (is (= 1 @calls) "a remote seed shell may still be running when its exit status is unknown")
+          (is (false? @(:setup-state base))))))))
+
+
+(deftest local-seed-retries-synchronous-io-failure
+  (let [dir (scratch-dir)
+        calls (atom 0)
+        setup workload/local-setup!
+        test-map (workload/elastickv-filesystem-test
+                   {:nodes ["n1"] :mount-dirs [dir] :local true
+                    :require-fuse-mount false :key-count 2 :max-retries 3})]
+    (try
+      (with-redefs [workload/local-setup!
+                    (fn [mount keys]
+                      (when (= 1 (swap! calls inc)) (throw (java.io.IOException. "seed interrupted")))
+                      (setup mount keys))]
+        (client/setup! (client/open! (:client test-map) test-map "n1") test-map))
+      (is (= 2 @calls))
+      (doseq [k (range 2)]
+        (is (= workload/initial-value (workload/local-read (workload/register-path dir k)))))
+      (finally (delete-tree! dir)))))
+
+
+(defn- seed-ssh-fixture [execute]
+  (let [opens (atom 0)
+        ssh (proxy [net.schmizz.sshj.SSHClient] []
+              (startSession []
+                (reify net.schmizz.sshj.connection.channel.direct.Session
+                  (exec [_ command] (execute command))
+                  (close [_] nil))))
+        raw (control-scp/->Remote
+              (control-sshj/->SSHJRemote 6 {:host "n1"} ssh (java.util.concurrent.Semaphore. 6 true))
+              {:host "n1"})
+        pool (reconnect/open! (reconnect/wrapper {:open #(do (swap! opens inc) raw) :close (fn [_])}))]
+    {:session (control-retry/->Remote raw pool) :pool pool :opens opens :ssh ssh}))
+
+(defn- seed-ssh-result [exit err]
+  (reify net.schmizz.sshj.connection.channel.direct.Session$Command
+    (getInputStream [_] (java.io.ByteArrayInputStream. (byte-array 0)))
+    (getErrorStream [_] (java.io.ByteArrayInputStream. (.getBytes ^String err "UTF-8")))
+    (getExitStatus [_] (Integer/valueOf (int exit)))
+    (join [_] nil)
+    (close [_] nil)))
+
+(deftest seed-ssh-response-loss-is-not-automatically-replayed
+  (let [sends (atom 0)
+        {:keys [session pool ssh]} (seed-ssh-fixture
+                                (fn [_]
+                                  (if (= 1 (swap! sends inc))
+                                    (throw (net.schmizz.sshj.connection.ConnectionException. "response lost after send"))
+                                    (seed-ssh-result 0 ""))))
+        test-map {:sessions {"n1" session}}
+        base (:client (workload/filesystem-register-workload
+                        {:key-count 2 :max-retries 1 :node->mount-dir {"n1" "/mount"}}))]
+    (try
+      (let [delegate (client/open! base test-map "n1")
+            result (try
+                     ((requiring-resolve 'elastickv.hosted-fault-workload/setup-client!) delegate test-map)
+                     (catch Exception e e))]
+        (is (= :elastickv.filesystem-workload/seed-outcome-unknown (:type (ex-data result))))
+        (is (= 1 @sends))
+        (is (false? @(:setup-state base))))
+      (finally (reconnect/close! pool) (.close ssh)))))
+
+(deftest seed-ssh-confirmed-exit-can-be-retried-without-reconnecting
+  (let [sends (atom 0)
+        {:keys [session pool opens ssh]} (seed-ssh-fixture
+                                      (fn [_]
+                                        (if (= 1 (swap! sends inc))
+                                          (seed-ssh-result 1 "printf: I/O error")
+                                          (seed-ssh-result 0 ""))))
+        test-map {:sessions {"n1" session}}
+        base (:client (workload/filesystem-register-workload
+                        {:key-count 2 :max-retries 3 :node->mount-dir {"n1" "/mount"}}))]
+    (try
+      (client/setup! (client/open! base test-map "n1") test-map)
+      (is (= 2 @sends))
+      (is (= 1 @opens))
+      (is (true? @(:setup-state base)))
+      (finally (reconnect/close! pool) (.close ssh)))))
+
+
+(deftest seed-rejects-unknown-session-layout-before-sending
+  (doseq [layout [:outer :inner :missing]]
+    (let [sends (atom 0)
+          raw (reify control-core/Remote
+                (execute! [_ _ _] (swap! sends inc) {:exit 0 :out "" :err ""}))
+          pool (when (= :inner layout)
+                 (reconnect/open! (reconnect/wrapper {:open (fn [] raw) :close (fn [_])})))
+          session (case layout :outer raw :inner (control-retry/->Remote raw pool) :missing nil)
+          test-map {:sessions {"n1" session}}
+          base (:client (workload/filesystem-register-workload
+                          {:key-count 2 :max-retries 3 :node->mount-dir {"n1" "/mount"}}))]
+      (try
+        (let [result (try
+                       (client/setup! (client/open! base test-map "n1") test-map)
+                       (catch Exception e e))]
+          (is (= :elastickv.filesystem-workload/seed-outcome-unknown (:type (ex-data result))))
+          (is (= 0 @sends))
+          (is (false? @(:setup-state base))))
+        (finally (when pool (reconnect/close! pool)))))))
+
+(deftest local-seed-rechecks-fuse-before-retrying
+  (let [dir (scratch-dir)
+        mounted (atom true)
+        calls (atom 0)
+        setup workload/local-setup!
+        test-map (workload/elastickv-filesystem-test
+                   {:nodes ["n1"] :mount-dirs [dir] :local true
+                    :require-fuse-mount true :key-count 2 :max-retries 3})]
+    (try
+      (with-redefs [workload/local-fuse-mount? (fn [_] @mounted)
+                    workload/local-setup!
+                    (fn [mount keys]
+                      (when (= 1 (swap! calls inc))
+                        (reset! mounted false)
+                        (throw (java.io.IOException. "seed interrupted")))
+                      (setup mount keys))]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"not a FUSE mount"
+              (client/setup! (client/open! (:client test-map) test-map "n1") test-map))))
+      (is (= 1 @calls))
+      (is (not (.exists (io/file (workload/workload-dir dir)))))
+      (finally (delete-tree! dir)))))

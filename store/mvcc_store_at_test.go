@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"math"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -13,6 +14,38 @@ func newTestMVCCStore(t *testing.T) *mvccStore {
 	ms, ok := st.(*mvccStore)
 	require.True(t, ok)
 	return ms
+}
+
+func TestMemoryMVCCHistoryMatchesReverseScan(t *testing.T) {
+	t.Parallel()
+	history := []VersionedValue{
+		{TS: 1, Value: []byte("first")},
+		{TS: 3, Value: []byte("overwritten")},
+		{TS: 3, Value: []byte("expires"), ExpireAt: 5},
+		{TS: 7, Tombstone: true},
+		{TS: 9, Value: []byte("new")},
+		{TS: math.MaxUint64, Value: []byte("last")},
+	}
+	for n := 0; n <= len(history); n++ {
+		versions := history[:n]
+		for _, ts := range []uint64{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, math.MaxUint64 - 1, math.MaxUint64} {
+			var want []byte
+			var exists, visible bool
+			for i := n - 1; i >= 0; i-- {
+				if v := versions[i]; v.TS <= ts {
+					exists = true
+					if !v.Tombstone && (v.ExpireAt == 0 || v.ExpireAt > ts) {
+						want, visible = v.Value, true
+					}
+					break
+				}
+			}
+			got, ok := visibleValue(versions, ts)
+			require.Equal(t, want, got, "n=%d ts=%d", n, ts)
+			require.Equal(t, visible, ok, "n=%d ts=%d", n, ts)
+			require.Equal(t, exists, versionExistsAtOrBefore(versions, ts), "n=%d ts=%d", n, ts)
+		}
+	}
 }
 
 func TestMVCCStore_GetAtSnapshots(t *testing.T) {

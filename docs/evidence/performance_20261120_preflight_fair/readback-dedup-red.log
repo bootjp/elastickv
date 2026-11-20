@@ -1,0 +1,19 @@
+--- FAIL: TestTransferPreflightOwnershipReadbackOnceBeforeControl (0.00s)
+    --- FAIL: TestTransferPreflightOwnershipReadbackOnceBeforeControl/ready (0.00s)
+        split_job_transfer_phase_readback_test.go:30: 
+            	Error Trace:	/Users/bootjp/src/elastickv/adapter/split_job_transfer_phase_readback_test.go:30
+            	            				/Users/bootjp/src/elastickv/adapter/split_job_transfer_admission_test.go:21
+            	            				/Users/bootjp/src/elastickv/adapter/split_job_transfer_admission.go:162
+            	            				/Users/bootjp/src/elastickv/adapter/split_job_transfer_admission.go:228
+            	            				/Users/bootjp/src/elastickv/adapter/split_job_transfer_admission.go:57
+            	            				/Users/bootjp/src/elastickv/adapter/split_job_transfer_admission.go:52
+            	            				/Users/bootjp/src/elastickv/adapter/split_job_transfer_phase.go:48
+            	            				/Users/bootjp/src/elastickv/adapter/split_job_transfer_phase_readback_test.go:39
+            	Error:      	Not equal: 
+            	            	expected: 2
+            	            	actual  : 4
+            	Test:       	TestTransferPreflightOwnershipReadbackOnceBeforeControl/ready
+            	Messages:   	all ownership ACKs must precede control readback
+FAIL
+FAIL	github.com/bootjp/elastickv/adapter	0.819s
+FAIL

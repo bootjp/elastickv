@@ -49,11 +49,11 @@ func (s *mvccStore) partitionConfigurationLocked() (uint64, error) {
 		return 0, nil
 	}
 	versions, _ := v.([]VersionedValue)
-	latest, ok := latestVisible(versions, ^uint64(0))
-	if !ok || latest.Tombstone {
+	value, ok := visibleValue(versions, ^uint64(0))
+	if !ok {
 		return 0, nil
 	}
-	return partitionConfiguration(latest.Value, nil)
+	return partitionConfiguration(value, nil)
 }
 
 func (s *pebbleStore) partitionConfigurationLocked(ctx context.Context) (uint64, error) {

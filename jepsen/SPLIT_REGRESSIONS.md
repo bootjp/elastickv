@@ -1,5 +1,27 @@
 # Bounded Split Regressions
 
+## Process pause during cross-group preflight
+
+Run `bash scripts/jepsen-split-preflight.sh` from the repository root with
+Go, Java 21, Leiningen, OpenSSL and jq. The script starts three processes
+with independent Raft data directories, two groups and authenticated TLS
+on loopback. It uses ports 25101–25103, 25201–25203 and 25301–25303.
+Set `LEIN` to select the Leiningen executable and `PREFLIGHT_LOG_DIR` to
+retain node logs. Jepsen writes its history under
+`jepsen/store/elastickv-split-preflight-pause/`.
+
+The client writes two RawKV registers on opposite sides of the split.
+The nemesis waits for a durable checkpoint containing both completed and
+pending brackets, stops a catalog follower with SIGSTOP, checks its process
+state and samples the same job on the same catalog leader and term.
+The checker requires both samples inside preflight, matching scan timestamps
+and preserved completed brackets. After reads during the pause, SIGCONT
+restores the voter. The job must reach DONE with every bracket complete,
+the expected route owners, and both original values readable through all
+three nodes. The test fails if it misses the preflight window.
+
+## Repeated splits
+
 `elastickv.split-workload --repeat-splits` opts into exactly three splits:
 
 1. Same-owner split at `m2-split`.

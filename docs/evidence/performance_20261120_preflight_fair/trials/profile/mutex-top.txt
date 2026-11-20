@@ -1,0 +1,36 @@
+File: candidate-eight-work.test
+Build ID: 4d429bbd5946331604d3a3e290161ef1cf431c0c
+Type: delay
+Time: 2026-11-20 02:19:20 JST
+Showing nodes accounting for 74766.61ms, 98.90% of 75598.11ms total
+Dropped 1066 nodes (cum <= 755.98ms)
+      flat  flat%   sum%        cum   cum%
+73884.59ms 97.73% 97.73% 73892.19ms 97.74%  sync.(*RWMutex).Unlock
+  882.01ms  1.17% 98.90%   882.35ms  1.17%  sync.(*Mutex).Unlock
+         0     0% 98.90% 73434.14ms 97.14%  github.com/bootjp/elastickv/internal/raftengine/etcd.(*Engine).applyAndDispatchReady
+         0     0% 98.90% 73432.52ms 97.14%  github.com/bootjp/elastickv/internal/raftengine/etcd.(*Engine).applyCommitted
+         0     0% 98.90% 73432.52ms 97.14%  github.com/bootjp/elastickv/internal/raftengine/etcd.(*Engine).applyNormalCommitted
+         0     0% 98.90% 74373.50ms 98.38%  github.com/bootjp/elastickv/internal/raftengine/etcd.(*Engine).drainReady
+         0     0% 98.90%   937.11ms  1.24%  github.com/bootjp/elastickv/internal/raftengine/etcd.(*Engine).refreshStatus
+         0     0% 98.90% 74377.17ms 98.38%  github.com/bootjp/elastickv/internal/raftengine/etcd.(*Engine).run
+         0     0% 98.90% 74369.81ms 98.38%  github.com/bootjp/elastickv/internal/raftengine/etcd.Open.gowrap2
+         0     0% 98.90% 73432.52ms 97.14%  github.com/bootjp/elastickv/internal/raftengine/etcd.executeNormalApply
+         0     0% 98.90% 73432.52ms 97.14%  github.com/bootjp/elastickv/internal/raftengine/etcd.normalApplyInput.applyCleartext
+         0     0% 98.90% 73432.52ms 97.14%  github.com/bootjp/elastickv/internal/raftengine/etcd.normalApplyInput.applyNormalEntry
+         0     0% 98.90% 73432.52ms 97.14%  github.com/bootjp/elastickv/kv.(*kvFSM).Apply
+         0     0% 98.90% 43978.69ms 58.17%  github.com/bootjp/elastickv/kv.(*kvFSM).applyBatchedRequests
+         0     0% 98.90% 72761.84ms 96.25%  github.com/bootjp/elastickv/kv.(*kvFSM).applyDecodedRequests
+         0     0% 98.90% 28133.23ms 37.21%  github.com/bootjp/elastickv/kv.(*kvFSM).applyRawMutations
+         0     0% 98.90% 28783.15ms 38.07%  github.com/bootjp/elastickv/kv.(*kvFSM).applyRequest
+         0     0% 98.90% 28783.24ms 38.07%  github.com/bootjp/elastickv/kv.(*kvFSM).applyRequestData
+         0     0% 98.90% 28783.24ms 38.07%  github.com/bootjp/elastickv/kv.(*kvFSM).applyRequestErr
+         0     0% 98.90% 28139.07ms 37.22%  github.com/bootjp/elastickv/kv.(*kvFSM).handleRawRequest
+         0     0% 98.90% 28783.23ms 38.07%  github.com/bootjp/elastickv/kv.(*kvFSM).handleRequest
+         0     0% 98.90% 28154.86ms 37.24%  github.com/bootjp/elastickv/store.(*pebbleStore).ApplyMutationsRaftAt
+         0     0% 98.90% 43978.69ms 58.17%  github.com/bootjp/elastickv/store.(*pebbleStore).ApplyRaftEntry
+         0     0% 98.90% 28798.98ms 38.09%  github.com/bootjp/elastickv/store.(*pebbleStore).applyMutationsWithOpts
+         0     0% 98.90% 43978.69ms 58.17%  github.com/bootjp/elastickv/store.(*pebbleStore).applyRaftEntry
+         0     0% 98.90% 43654.05ms 57.74%  github.com/bootjp/elastickv/store.(*pebbleStore).commitRaftEntryScope
+         0     0% 98.90% 43653.81ms 57.74%  github.com/bootjp/elastickv/store.(*pebbleStore).commitRaftEntryScope.deferwrap2
+         0     0% 98.90% 29683.94ms 39.27%  runtime.deferreturn
+         0     0% 98.90% 28672.47ms 37.93%  sync.(*RWMutex).Unlock-fm
