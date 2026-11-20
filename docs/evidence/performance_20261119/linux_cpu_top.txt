@@ -1,0 +1,29 @@
+File: server-linux.test
+Build ID: 025ea163a0dce47d954f0b52a9d46bd844bd2617
+Type: cpu
+Time: 2026-11-19 18:11:12 JST
+Duration: 251.11s, Total samples = 1105.65s (440.30%)
+Showing nodes accounting for 466.44s, 42.19% of 1105.65s total
+Dropped 3276 nodes (cum <= 5.53s)
+Showing top 20 nodes out of 380
+      flat  flat%   sum%        cum   cum%
+   255.81s 23.14% 23.14%    255.81s 23.14%  internal/runtime/syscall/linux.Syscall6
+    26.17s  2.37% 25.50%     26.17s  2.37%  runtime.futex
+    18.93s  1.71% 27.22%     26.31s  2.38%  runtime.step
+    17.63s  1.59% 28.81%     51.82s  4.69%  runtime.pcvalue
+    15.94s  1.44% 30.25%     15.94s  1.44%  runtime.memmove
+    15.62s  1.41% 31.66%     15.62s  1.41%  sync/atomic.(*Int32).Add
+    12.18s  1.10% 32.77%     15.37s  1.39%  runtime.lock2
+    10.02s  0.91% 33.67%     55.01s  4.98%  runtime.selectgo
+     9.97s   0.9% 34.57%     10.77s  0.97%  internal/sync.(*Mutex).Unlock
+     9.50s  0.86% 35.43%      9.50s  0.86%  runtime.memclrNoHeapPointers
+     9.42s  0.85% 36.29%     11.20s  1.01%  runtime.unlock2
+     9.38s  0.85% 37.13%      9.38s  0.85%  runtime.nextFreeFast (inline)
+     7.80s  0.71% 37.84%      8.41s  0.76%  runtime.findfunc
+     7.54s  0.68% 38.52%     30.60s  2.77%  runtime.(*unwinder).resolveInternal
+     7.42s  0.67% 39.19%      7.42s  0.67%  runtime.usleep
+     7.38s  0.67% 39.86%      7.38s  0.67%  runtime.readvarint (inline)
+     7.16s  0.65% 40.51%      8.92s  0.81%  runtime.casgstatus
+     6.60s   0.6% 41.10%     30.15s  2.73%  runtime.(*stkframe).getStackMap
+     6.10s  0.55% 41.66%     66.25s  5.99%  runtime.mallocgc
+     5.87s  0.53% 42.19%      5.87s  0.53%  runtime.nanotime

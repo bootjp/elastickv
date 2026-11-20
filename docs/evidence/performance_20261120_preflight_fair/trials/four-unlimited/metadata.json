@@ -1,0 +1,67 @@
+{
+  "base_commit": "5ccfbc74a31f6b21aa4d631704ca922a0749c18e",
+  "baseline": "previous 16-page / 200ms preflight slice with normal one-second ticker and P0 route version fix",
+  "candidate": "4 read-only pages / 4MiB / 100ms continuation budget; one checkpoint CAS per batch; 80ms progress-only wake; fresh all-member guard/namespace readback; namespace probe concurrency 3",
+  "order": [
+    "baseline,candidate",
+    "candidate,baseline",
+    "baseline,candidate"
+  ],
+  "nodes": 3,
+  "groups": 2,
+  "source_leader": 0,
+  "target_leader": 1,
+  "keys": 256,
+  "value_bytes": 1024,
+  "GOMAXPROCS": 8,
+  "Sync": "default, environment override unset",
+  "TLS": true,
+  "Forward_auth": "production token configured",
+  "foreground": "4 readers / 4 writers, same closed-loop workload; before/after windows 2s",
+  "recovery": "5 paths x 600 unique write/readbacks/run, about 60s",
+  "timing": "same additional 10ms transition observer in both variants; existing 100ms traffic phase attribution unchanged",
+  "pilot_mode": "PREFLIGHT_ONLY explicitly unset for full comparison",
+  "candidate_sources": {
+    "adapter/distribution_server.go": "ac63a98bf30a5f03ed00e5496598bb52f9d5f9ad9a68c262c5b921783698aafa",
+    "adapter/split_job_runner.go": "dc64bcdcac11bac0c1350da6e1474dac51d8c01216b2a8f1ecf1fb4f26c6f14f",
+    "adapter/split_job_transfer_preflight.go": "f96548fca7edd27905f55510489733c11b74f3a0143f714620fb399b8917ca0c",
+    "adapter/split_job_preflight_schedule.go": "f267cc15166a7fa233c4637552eb6650f1321da6c2870be1658a2569722907c1",
+    "adapter/split_job_preflight_checkpoint.go": "574fb39e99aada0c5222cf016b8bfe65f8a7c1398e57cdbb8f3ccde5f93683f8",
+    "adapter/split_job_transfer_admission.go": "71c57dd22d73c9074e7c607e51f00c4724be07b6b5eca4d66f9b79b284a8b74d",
+    "adapter/split_job_transfer_phase.go": "e3e1bf75d3b9a30f927bcba08cf5fe048b963fba90e9b69b5ba425d82229e08c",
+    "adapter/migration_namespace_activation.go": "eee76d65124f5404b00e3766ae8da3496fe7e47747e328a0e56d1451cb9b0bbc",
+    "adapter/split_job_namespace.go": "1109ab4acaa6608ebbc1798122a888253c2e15cb70612f50386a61ca27035086",
+    "distribution/catalog.go": "df1f5b4269df202ac9d9dcd8e333e980dbe94927c1dd166797649f9bb0ae3a71"
+  },
+  "common_sources": {
+    "kv/sharded_coordinator.go": "e918b67c048d3340499503db1f9e0d2c1ec5c13a13d9bb4d9812c596b4e9efd7",
+    "kv/sharded_coordinator_migration_version.go": "74d52997788bd199f2637b1b8a706583a69c52e25c28a155416bd72c5a6436e7",
+    "internal/server/performance_split_timing_test.go": "aeb2d142d93f824a543b6bec116c907fc54063a6ee2f57f09fd562cc286a0628",
+    "internal/server/performance_split_test.go": "13ffff777c7935b946fccd090fa27a88076cb94d95b953db429432a2cd0af1a8",
+    "internal/server/performance_split_comparison_test.go": "f35241e6cc6ef18bede38c7c2b3e0e82b3e1a37f05d8b8c0ec2dddde32498ea7",
+    "internal/server/performance_split_recovery_test.go": "6bdc3811b9c8a369cc8bce446d26633d2781f384afbace09a68151f4bfcd44bc"
+  },
+  "baseline_sources": {
+    "adapter/split_job_runner.go": "70abcb0ab6667e89f305656505a61996495c2064209aa8c99cb19bb821ef8919",
+    "adapter/split_job_transfer_preflight.go": "1ae2ad210fe29df06b1a1a1e94e10722a3ac45fa911716b8681ce3c4a0b8179e"
+  },
+  "binaries": {
+    "baseline.test": "616b2c1bcbee6ace74088b4507f84b52716c990fb9fdecd62d33736d6a7d12c6",
+    "candidate.test": "317ba3b2b72859df9901ea61a1de448f801a8dc6b2816e1c89731127969c23b1"
+  },
+  "test_sources": {
+    "adapter/split_job_preflight_schedule_test.go": "e88d6ec5d8f850a59aa98c9a27b2e6e12fb943678de5c81c892cbe217dd43ca4",
+    "adapter/split_job_preflight_batch_test.go": "006d136d25b60c3ec1e9b2525bc9c2c0381ca0bfa47917f31b9c5eb55d7eed09",
+    "adapter/split_job_preflight_route_test.go": "dbbad4bca303638c385e3e797eaf57a95c824b88376283aaebd44212376aebfd",
+    "adapter/migration_namespace_parallel_test.go": "c106d98307c54a333626d8e425e17de4e7d28e3e0ad7128d24f8edde5ff2d5e2",
+    "adapter/split_job_namespace_readback_test.go": "8373a9128a2abc178b612519c03637d4f0eda18758bfd7861e6a6a6f94c0e2ae",
+    "adapter/split_migration_peer_namespace_membership_test.go": "252c3c066b827e7c2c8e4f94a9b7885a31a763e3f3fc5950b9e550842f8a088a"
+  },
+  "planned_pairs": 3,
+  "completed_runs": [
+    "final-1-baseline",
+    "final-1-candidate",
+    "final-2-candidate"
+  ],
+  "stopped_reason": "first paired foreground p99 worsened; controlled stop before next baseline; run 2 candidate already active was allowed to complete"
+}

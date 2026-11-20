@@ -1,0 +1,35 @@
+2026/11/19 09:11:02 Found 0 WALs
+goos: linux
+goarch: amd64
+pkg: github.com/bootjp/elastickv/store
+cpu: Intel(R) Xeon(R) Gold 6140 CPU @ 2.30GHz
+BenchmarkApplyMutationsRaft_SyncMode/sync-8         	2026/11/19 09:11:02 Found 0 WALs
+2026/11/19 09:11:02 Found 0 WALs
+     567	   2466414 ns/op	     370 B/op	       8 allocs/op
+BenchmarkApplyMutationsRaft_SyncMode/sync-8         	2026/11/19 09:11:03 Found 0 WALs
+2026/11/19 09:11:03 Found 0 WALs
+2026/11/19 09:11:04 Found 0 WALs
+     468	   2906573 ns/op	     384 B/op	       8 allocs/op
+BenchmarkApplyMutationsRaft_SyncMode/sync-8         	2026/11/19 09:11:05 Found 0 WALs
+2026/11/19 09:11:05 Found 0 WALs
+2026/11/19 09:11:05 Found 0 WALs
+     441	   2755029 ns/op	     388 B/op	       8 allocs/op
+2026/11/19 09:11:07 Found 0 WALs
+BenchmarkApplyMutationsRaft_SyncMode/nosync-8       	2026/11/19 09:11:07 Found 0 WALs
+2026/11/19 09:11:07 Found 0 WALs
+2026/11/19 09:11:07 Found 0 WALs
+2026/11/19 09:11:07 Found 0 WALs
+  301914	      3538 ns/op	     361 B/op	       9 allocs/op
+BenchmarkApplyMutationsRaft_SyncMode/nosync-8       	2026/11/19 09:11:08 Found 0 WALs
+2026/11/19 09:11:08 Found 0 WALs
+2026/11/19 09:11:08 Found 0 WALs
+2026/11/19 09:11:09 Found 0 WALs
+2026/11/19 09:11:09 Found 0 WALs
+  316376	      3392 ns/op	     359 B/op	       9 allocs/op
+BenchmarkApplyMutationsRaft_SyncMode/nosync-8       	2026/11/19 09:11:10 Found 0 WALs
+2026/11/19 09:11:10 Found 0 WALs
+2026/11/19 09:11:10 Found 0 WALs
+2026/11/19 09:11:11 Found 0 WALs
+2026/11/19 09:11:11 Found 0 WALs
+  299638	      3612 ns/op	     361 B/op	       9 allocs/op
+PASS

@@ -1,0 +1,22 @@
+--- FAIL: TestLegacyNamespaceReadbackDiscardsACKBeforeCapability (0.00s)
+    --- FAIL: TestLegacyNamespaceReadbackDiscardsACKBeforeCapability/pending (0.00s)
+        split_job_namespace_readback_test.go:207: 
+            	Error Trace:	/Users/bootjp/src/elastickv/adapter/split_job_namespace_readback_test.go:207
+            	Error:      	Should be false
+            	Test:       	TestLegacyNamespaceReadbackDiscardsACKBeforeCapability/pending
+            	Messages:   	the initial old-server ACK cannot survive the capability fallback
+    --- FAIL: TestLegacyNamespaceReadbackDiscardsACKBeforeCapability/configuration (0.00s)
+        split_job_namespace_readback_test.go:207: 
+            	Error Trace:	/Users/bootjp/src/elastickv/adapter/split_job_namespace_readback_test.go:207
+            	Error:      	Should be false
+            	Test:       	TestLegacyNamespaceReadbackDiscardsACKBeforeCapability/configuration
+            	Messages:   	the initial old-server ACK cannot survive the capability fallback
+    --- FAIL: TestLegacyNamespaceReadbackDiscardsACKBeforeCapability/transport (0.00s)
+        split_job_namespace_readback_test.go:207: 
+            	Error Trace:	/Users/bootjp/src/elastickv/adapter/split_job_namespace_readback_test.go:207
+            	Error:      	Should be false
+            	Test:       	TestLegacyNamespaceReadbackDiscardsACKBeforeCapability/transport
+            	Messages:   	the initial old-server ACK cannot survive the capability fallback
+FAIL
+FAIL	github.com/bootjp/elastickv/adapter	0.755s
+FAIL

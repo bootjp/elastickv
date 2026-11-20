@@ -1,0 +1,8 @@
+--- FAIL: TestCopyRejectsPreflightSummaryBeforeImport (0.00s)
+    migration_export_preflight_test.go:96: 
+        	Error Trace:	/Users/bootjp/src/elastickv/adapter/migration_export_preflight_test.go:96
+        	Error:      	An error is expected but got nil.
+        	Test:       	TestCopyRejectsPreflightSummaryBeforeImport
+FAIL
+FAIL	github.com/bootjp/elastickv/adapter	0.855s
+FAIL

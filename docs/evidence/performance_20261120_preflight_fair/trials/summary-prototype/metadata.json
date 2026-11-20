@@ -1,0 +1,14 @@
+{
+  "binary_sha256": "15e09b0eb1c50ab7256edac262027bd8e812a099e843f942796b48dece743bf1",
+  "mode": "preflight-only pilot",
+  "adopted": false,
+  "reason": "No foreground latency improvement in pilot; response protocol prototype withdrawn",
+  "preflight_bounds_ms": [
+    4457.973,
+    4479.572
+  ],
+  "p99_read_write_ms": [
+    4.596,
+    24.69
+  ]
+}

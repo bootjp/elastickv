@@ -1,0 +1,8 @@
+--- FAIL: TestNamespaceAdmissionProbesAllMembersWithBoundedConcurrency (0.00s)
+    migration_namespace_parallel_test.go:44: 
+        	Error Trace:	/Users/bootjp/src/elastickv/adapter/migration_namespace_parallel_test.go:44
+        	Error:      	"1" is not greater than "1"
+        	Test:       	TestNamespaceAdmissionProbesAllMembersWithBoundedConcurrency
+FAIL
+FAIL	github.com/bootjp/elastickv/adapter	0.820s
+FAIL

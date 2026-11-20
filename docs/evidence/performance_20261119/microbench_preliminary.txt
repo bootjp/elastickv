@@ -1,0 +1,122 @@
+2026/11/19 17:35:07 Found 0 WALs
+goos: darwin
+goarch: arm64
+pkg: github.com/bootjp/elastickv/store
+cpu: Apple M1 Max
+BenchmarkApplyMutationsRaft_SyncMode/sync-10         	2026/11/19 17:35:07 Found 0 WALs
+2026/11/19 17:35:07 Found 0 WALs
+     120	   5140665 ns/op	     314 B/op	       8 allocs/op
+BenchmarkApplyMutationsRaft_SyncMode/sync-10         	2026/11/19 17:35:08 Found 0 WALs
+2026/11/19 17:35:08 Found 0 WALs
+2026/11/19 17:35:09 Found 0 WALs
+     111	   5898297 ns/op	     303 B/op	       8 allocs/op
+BenchmarkApplyMutationsRaft_SyncMode/sync-10         	2026/11/19 17:35:09 Found 0 WALs
+2026/11/19 17:35:09 Found 0 WALs
+2026/11/19 17:35:10 Found 0 WALs
+     110	   5093746 ns/op	     317 B/op	       8 allocs/op
+2026/11/19 17:35:10 Found 0 WALs
+BenchmarkApplyMutationsRaft_SyncMode/nosync-10       	2026/11/19 17:35:10 Found 0 WALs
+2026/11/19 17:35:10 Found 0 WALs
+2026/11/19 17:35:11 Found 0 WALs
+2026/11/19 17:35:11 Found 0 WALs
+  254940	      2029 ns/op	     320 B/op	       9 allocs/op
+BenchmarkApplyMutationsRaft_SyncMode/nosync-10       	2026/11/19 17:35:11 Found 0 WALs
+2026/11/19 17:35:11 Found 0 WALs
+2026/11/19 17:35:12 Found 0 WALs
+2026/11/19 17:35:12 Found 0 WALs
+2026/11/19 17:35:12 Found 0 WALs
+2026/11/19 17:35:13 Found 0 WALs
+  281550	      2241 ns/op	     321 B/op	       9 allocs/op
+BenchmarkApplyMutationsRaft_SyncMode/nosync-10       	2026/11/19 17:35:13 Found 0 WALs
+2026/11/19 17:35:13 Found 0 WALs
+2026/11/19 17:35:13 Found 0 WALs
+2026/11/19 17:35:13 Found 0 WALs
+2026/11/19 17:35:14 Found 0 WALs
+2026/11/19 17:35:14 Found 0 WALs
+  290403	      2204 ns/op	     323 B/op	       9 allocs/op
+PASS
+ok  	github.com/bootjp/elastickv/store	8.364s
+goos: darwin
+goarch: arm64
+pkg: github.com/bootjp/elastickv/kv
+cpu: Apple M1 Max
+BenchmarkLeaseRead-10                      	13303252	        45.32 ns/op	       0 B/op	       0 allocs/op
+BenchmarkLeaseRead-10                      	13467799	        44.65 ns/op	       0 B/op	       0 allocs/op
+BenchmarkLeaseRead-10                      	12976701	        44.99 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGroupLeaseRead-10                 	12783976	        48.03 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGroupLeaseRead-10                 	12257080	        47.87 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGroupLeaseRead-10                 	12204112	        47.99 ns/op	       0 B/op	       0 allocs/op
+2026/11/19 17:35:19 Found 0 WALs
+BenchmarkMigrationFrontierAdmission/partitions=16/selected-point-10         	   98730	      5856 ns/op	   10009 B/op	      45 allocs/op
+BenchmarkMigrationFrontierAdmission/partitions=16/selected-point-10         	  103516	      5678 ns/op	   10009 B/op	      45 allocs/op
+BenchmarkMigrationFrontierAdmission/partitions=16/selected-point-10         	  106566	      5747 ns/op	   10009 B/op	      45 allocs/op
+BenchmarkMigrationFrontierAdmission/partitions=16/full-scan-10              	    8856	     70721 ns/op	   86601 B/op	     465 allocs/op
+BenchmarkMigrationFrontierAdmission/partitions=16/full-scan-10              	    8696	     70797 ns/op	   86602 B/op	     465 allocs/op
+BenchmarkMigrationFrontierAdmission/partitions=16/full-scan-10              	    8841	     71959 ns/op	   86600 B/op	     465 allocs/op
+2026/11/19 17:35:23 Found 0 WALs
+BenchmarkMigrationFrontierAdmission/partitions=128/selected-point-10        	   44146	     13733 ns/op	   44088 B/op	     157 allocs/op
+BenchmarkMigrationFrontierAdmission/partitions=128/selected-point-10        	   42734	     13794 ns/op	   44088 B/op	     157 allocs/op
+BenchmarkMigrationFrontierAdmission/partitions=128/selected-point-10        	   43520	     13861 ns/op	   44089 B/op	     157 allocs/op
+BenchmarkMigrationFrontierAdmission/partitions=128/full-scan-10             	    1057	    556908 ns/op	  696288 B/op	    3714 allocs/op
+BenchmarkMigrationFrontierAdmission/partitions=128/full-scan-10             	    1078	    566606 ns/op	  696326 B/op	    3714 allocs/op
+BenchmarkMigrationFrontierAdmission/partitions=128/full-scan-10             	    1076	    555926 ns/op	  696332 B/op	    3715 allocs/op
+2026/11/19 17:35:27 Found 0 WALs
+BenchmarkMigrationFrontierAdmission/partitions=512/selected-point-10        	   16690	     35748 ns/op	  152713 B/op	     541 allocs/op
+BenchmarkMigrationFrontierAdmission/partitions=512/selected-point-10        	   16605	     36233 ns/op	  152715 B/op	     541 allocs/op
+BenchmarkMigrationFrontierAdmission/partitions=512/selected-point-10        	   16804	     36022 ns/op	  152710 B/op	     541 allocs/op
+BenchmarkMigrationFrontierAdmission/partitions=512/full-scan-10             	     265	   2217560 ns/op	 2778002 B/op	   14854 allocs/op
+BenchmarkMigrationFrontierAdmission/partitions=512/full-scan-10             	     240	   5597360 ns/op	 2777565 B/op	   14852 allocs/op
+BenchmarkMigrationFrontierAdmission/partitions=512/full-scan-10             	      50	  11321674 ns/op	 2777312 B/op	   14851 allocs/op
+BenchmarkLatestCandidateVersionsAt/dense-10                                 	   10000	    154548 ns/op	   32656 B/op	     468 allocs/op
+BenchmarkLatestCandidateVersionsAt/dense-10                                 	   10000	    241897 ns/op	   32656 B/op	     468 allocs/op
+BenchmarkLatestCandidateVersionsAt/dense-10                                 	   10000	    152251 ns/op	   32656 B/op	     468 allocs/op
+BenchmarkLatestCandidateVersionsAt/sparse-10                                	      42	  28357476 ns/op	  530536 B/op	   41642 allocs/op
+BenchmarkLatestCandidateVersionsAt/sparse-10                                	     100	  21176510 ns/op	  530529 B/op	   41642 allocs/op
+BenchmarkLatestCandidateVersionsAt/sparse-10                                	      72	  23169896 ns/op	  530528 B/op	   41642 allocs/op
+BenchmarkTimestampAdmissionOwnership/32B/before_unguarded-10                	100000000	        22.85 ns/op	1400.34 MB/s	       0 B/op	       0 allocs/op
+BenchmarkTimestampAdmissionOwnership/32B/before_unguarded-10                	100000000	        17.44 ns/op	1835.01 MB/s	       0 B/op	       0 allocs/op
+BenchmarkTimestampAdmissionOwnership/32B/before_unguarded-10                	100000000	        11.17 ns/op	2864.37 MB/s	       0 B/op	       0 allocs/op
+BenchmarkTimestampAdmissionOwnership/32B/after_legacy-10                    	  640398	      2686 ns/op	  11.91 MB/s	     640 B/op	      11 allocs/op
+BenchmarkTimestampAdmissionOwnership/32B/after_legacy-10                    	  947287	      2599 ns/op	  12.31 MB/s	     640 B/op	      11 allocs/op
+BenchmarkTimestampAdmissionOwnership/32B/after_legacy-10                    	  354252	      2580 ns/op	  12.40 MB/s	     640 B/op	      11 allocs/op
+BenchmarkTimestampAdmissionOwnership/32B/after_released-10                  	  311062	      3075 ns/op	  10.40 MB/s	     656 B/op	      12 allocs/op
+BenchmarkTimestampAdmissionOwnership/32B/after_released-10                  	  437522	      4638 ns/op	   6.90 MB/s	     656 B/op	      12 allocs/op
+BenchmarkTimestampAdmissionOwnership/32B/after_released-10                  	  254151	      4981 ns/op	   6.42 MB/s	     656 B/op	      12 allocs/op
+BenchmarkTimestampAdmissionOwnership/1MiB/before_unguarded-10               	100000000	        10.82 ns/op	96881234.73 MB/s	       0 B/op	       0 allocs/op
+BenchmarkTimestampAdmissionOwnership/1MiB/before_unguarded-10               	75533055	         8.260 ns/op	126944719.60 MB/s	       0 B/op	       0 allocs/op
+BenchmarkTimestampAdmissionOwnership/1MiB/before_unguarded-10               	100000000	         6.256 ns/op	167599800.37 MB/s	       0 B/op	       0 allocs/op
+BenchmarkTimestampAdmissionOwnership/1MiB/after_legacy-10                   	    2476	    386296 ns/op	2714.43 MB/s	 1049189 B/op	      11 allocs/op
+BenchmarkTimestampAdmissionOwnership/1MiB/after_legacy-10                   	    4772	    139883 ns/op	7496.10 MB/s	 1049185 B/op	      11 allocs/op
+BenchmarkTimestampAdmissionOwnership/1MiB/after_legacy-10                   	    3280	    167090 ns/op	6275.52 MB/s	 1049185 B/op	      11 allocs/op
+BenchmarkTimestampAdmissionOwnership/1MiB/after_released-10                 	    3566	    170753 ns/op	6140.91 MB/s	 1049200 B/op	      12 allocs/op
+BenchmarkTimestampAdmissionOwnership/1MiB/after_released-10                 	    5721	    141087 ns/op	7432.10 MB/s	 1049200 B/op	      12 allocs/op
+BenchmarkTimestampAdmissionOwnership/1MiB/after_released-10                 	    6424	    196865 ns/op	5326.38 MB/s	 1049200 B/op	      12 allocs/op
+BenchmarkTSOWriteFanout/writers=16/fanout=1/batch=1/rtt=1ms-10              	     412	   1493972 ns/op	         1.275 p50-ms	       610.3 p99-ms	         1.000 refills/op	       669.4 writes/s	     406 B/op	       5 allocs/op
+BenchmarkTSOWriteFanout/writers=16/fanout=1/batch=1/rtt=1ms-10              	     386	   1354793 ns/op	         1.272 p50-ms	       519.1 p99-ms	         1.000 refills/op	       738.1 writes/s	     407 B/op	       5 allocs/op
+BenchmarkTSOWriteFanout/writers=16/fanout=1/batch=1/rtt=1ms-10              	     442	   1450092 ns/op	         1.276 p50-ms	       630.3 p99-ms	         1.000 refills/op	       689.6 writes/s	     412 B/op	       5 allocs/op
+BenchmarkTSOWriteFanout/writers=16/fanout=1/batch=64/rtt=1ms-10             	   28594	     20906 ns/op	         0.0000410 p50-ms	         1.275 p99-ms	         0.01563 refills/op	     47834 writes/s	       6 B/op	       0 allocs/op
+BenchmarkTSOWriteFanout/writers=16/fanout=1/batch=64/rtt=1ms-10             	   30013	     20948 ns/op	         0.0000410 p50-ms	         1.274 p99-ms	         0.01563 refills/op	     47738 writes/s	       6 B/op	       0 allocs/op
+BenchmarkTSOWriteFanout/writers=16/fanout=1/batch=64/rtt=1ms-10             	   22674	     22703 ns/op	         0.0000420 p50-ms	         1.289 p99-ms	         0.01566 refills/op	     44047 writes/s	       6 B/op	       0 allocs/op
+BenchmarkTSOWriteFanout/writers=16/fanout=1/batch=256/rtt=1ms-10            	  113563	      5372 ns/op	         0.0000420 p50-ms	         0.0005000 p99-ms	         0.003910 refills/op	    186143 writes/s	       1 B/op	       0 allocs/op
+BenchmarkTSOWriteFanout/writers=16/fanout=1/batch=256/rtt=1ms-10            	   89205	      5809 ns/op	         0.0000420 p50-ms	         0.0003750 p99-ms	         0.003912 refills/op	    172156 writes/s	       1 B/op	       0 allocs/op
+BenchmarkTSOWriteFanout/writers=16/fanout=1/batch=256/rtt=1ms-10            	  106130	      5517 ns/op	         0.0000420 p50-ms	         0.0003750 p99-ms	         0.003910 refills/op	    181254 writes/s	       1 B/op	       0 allocs/op
+BenchmarkTSOWriteFanout/writers=16/fanout=3/batch=1/rtt=1ms-10              	     138	   4224350 ns/op	         3.938 p50-ms	       579.1 p99-ms	         3.000 refills/op	       710.2 writes/s	    1202 B/op	      15 allocs/op
+BenchmarkTSOWriteFanout/writers=16/fanout=3/batch=1/rtt=1ms-10              	     151	   3969717 ns/op	         3.866 p50-ms	       595.5 p99-ms	         3.000 refills/op	       755.7 writes/s	    1219 B/op	      15 allocs/op
+BenchmarkTSOWriteFanout/writers=16/fanout=3/batch=1/rtt=1ms-10              	     148	   4031079 ns/op	         3.934 p50-ms	       592.8 p99-ms	         3.000 refills/op	       744.2 writes/s	    1221 B/op	      15 allocs/op
+BenchmarkTSOWriteFanout/writers=16/fanout=3/batch=64/rtt=1ms-10             	    9294	     59713 ns/op	         0.0000830 p50-ms	         1.277 p99-ms	         0.04691 refills/op	     50240 writes/s	      18 B/op	       0 allocs/op
+BenchmarkTSOWriteFanout/writers=16/fanout=3/batch=64/rtt=1ms-10             	    9903	     59284 ns/op	         0.0000830 p50-ms	         1.352 p99-ms	         0.04696 refills/op	     50604 writes/s	      18 B/op	       0 allocs/op
+BenchmarkTSOWriteFanout/writers=16/fanout=3/batch=64/rtt=1ms-10             	    9818	     60377 ns/op	         0.0000830 p50-ms	         1.350 p99-ms	         0.04695 refills/op	     49688 writes/s	      18 B/op	       0 allocs/op
+BenchmarkTSOWriteFanout/writers=16/fanout=3/batch=256/rtt=1ms-10            	   37538	     16102 ns/op	         0.0000830 p50-ms	         1.266 p99-ms	         0.01172 refills/op	    186308 writes/s	       4 B/op	       0 allocs/op
+BenchmarkTSOWriteFanout/writers=16/fanout=3/batch=256/rtt=1ms-10            	   39007	     16813 ns/op	         0.0000830 p50-ms	         1.272 p99-ms	         0.01174 refills/op	    178435 writes/s	       4 B/op	       0 allocs/op
+BenchmarkTSOWriteFanout/writers=16/fanout=3/batch=256/rtt=1ms-10            	   38056	     15744 ns/op	         0.0000830 p50-ms	         1.268 p99-ms	         0.01172 refills/op	    190549 writes/s	       4 B/op	       0 allocs/op
+BenchmarkTSOWriteFanout/writers=16/fanout=8/batch=1/rtt=1ms-10              	      60	  10842808 ns/op	        10.20 p50-ms	       650.6 p99-ms	         8.000 refills/op	       737.8 writes/s	    3163 B/op	      40 allocs/op
+BenchmarkTSOWriteFanout/writers=16/fanout=8/batch=1/rtt=1ms-10              	      56	  10098138 ns/op	        10.14 p50-ms	       565.5 p99-ms	         8.000 refills/op	       792.2 writes/s	    3324 B/op	      40 allocs/op
+BenchmarkTSOWriteFanout/writers=16/fanout=8/batch=1/rtt=1ms-10              	      52	  10793292 ns/op	        10.47 p50-ms	       561.2 p99-ms	         8.000 refills/op	       741.2 writes/s	    3165 B/op	      40 allocs/op
+BenchmarkTSOWriteFanout/writers=16/fanout=8/batch=64/rtt=1ms-10             	    3534	    161087 ns/op	         0.0001670 p50-ms	         1.731 p99-ms	         0.1251 refills/op	     49663 writes/s	      49 B/op	       0 allocs/op
+BenchmarkTSOWriteFanout/writers=16/fanout=8/batch=64/rtt=1ms-10             	    3728	    158855 ns/op	         0.0001670 p50-ms	         1.644 p99-ms	         0.1250 refills/op	     50361 writes/s	      49 B/op	       0 allocs/op
+BenchmarkTSOWriteFanout/writers=16/fanout=8/batch=64/rtt=1ms-10             	    3962	    166745 ns/op	         0.0001670 p50-ms	         2.734 p99-ms	         0.1252 refills/op	     47977 writes/s	      49 B/op	       0 allocs/op
+BenchmarkTSOWriteFanout/writers=16/fanout=8/batch=256/rtt=1ms-10            	   13826	     39560 ns/op	         0.0001670 p50-ms	        14.00 p99-ms	         0.03132 refills/op	    202227 writes/s	      12 B/op	       0 allocs/op
+BenchmarkTSOWriteFanout/writers=16/fanout=8/batch=256/rtt=1ms-10            	   15364	     38719 ns/op	         0.0001670 p50-ms	        19.58 p99-ms	         0.03131 refills/op	    206619 writes/s	      12 B/op	       0 allocs/op
+BenchmarkTSOWriteFanout/writers=16/fanout=8/batch=256/rtt=1ms-10            	   14938	     37942 ns/op	         0.0001670 p50-ms	        20.08 p99-ms	         0.03126 refills/op	    210849 writes/s	      12 B/op	       0 allocs/op
+PASS
+ok  	github.com/bootjp/elastickv/kv	82.928s

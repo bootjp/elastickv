@@ -1,0 +1,143 @@
+=== RUN   TestPerformanceReadWriteSplit
+2026/11/19 14:05:56 Found 0 WALs
+raft2026/11/19 14:05:56 INFO: 8b37b07b558d4c0 switched to configuration voters=(8b37b07b558d4c0 8b37d07b558d826 8b37e07b558d9d9)
+raft2026/11/19 14:05:56 INFO: 8b37b07b558d4c0 became follower at term 1
+raft2026/11/19 14:05:56 INFO: newRaft 8b37b07b558d4c0 [peers: [8b37b07b558d4c0,8b37d07b558d826,8b37e07b558d9d9], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+2026/11/19 14:05:56 Found 0 WALs
+raft2026/11/19 14:05:56 INFO: 8b37b07b558d4c0 switched to configuration voters=(8b37b07b558d4c0 8b37d07b558d826 8b37e07b558d9d9)
+raft2026/11/19 14:05:56 INFO: 8b37b07b558d4c0 became follower at term 1
+raft2026/11/19 14:05:56 INFO: newRaft 8b37b07b558d4c0 [peers: [8b37b07b558d4c0,8b37d07b558d826,8b37e07b558d9d9], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+2026/11/19 14:05:56 Found 0 WALs
+raft2026/11/19 14:05:56 INFO: 8b37e07b558d9d9 switched to configuration voters=(8b37b07b558d4c0 8b37d07b558d826 8b37e07b558d9d9)
+raft2026/11/19 14:05:56 INFO: 8b37e07b558d9d9 became follower at term 1
+raft2026/11/19 14:05:56 INFO: newRaft 8b37e07b558d9d9 [peers: [8b37b07b558d4c0,8b37d07b558d826,8b37e07b558d9d9], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+2026/11/19 14:05:56 Found 0 WALs
+raft2026/11/19 14:05:56 INFO: 8b37e07b558d9d9 switched to configuration voters=(8b37b07b558d4c0 8b37d07b558d826 8b37e07b558d9d9)
+raft2026/11/19 14:05:56 INFO: 8b37e07b558d9d9 became follower at term 1
+raft2026/11/19 14:05:56 INFO: newRaft 8b37e07b558d9d9 [peers: [8b37b07b558d4c0,8b37d07b558d826,8b37e07b558d9d9], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+2026/11/19 14:05:56 Found 0 WALs
+raft2026/11/19 14:05:56 INFO: 8b37d07b558d826 switched to configuration voters=(8b37b07b558d4c0 8b37d07b558d826 8b37e07b558d9d9)
+raft2026/11/19 14:05:56 INFO: 8b37d07b558d826 became follower at term 1
+raft2026/11/19 14:05:56 INFO: newRaft 8b37d07b558d826 [peers: [8b37b07b558d4c0,8b37d07b558d826,8b37e07b558d9d9], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+2026/11/19 14:05:56 Found 0 WALs
+raft2026/11/19 14:05:56 INFO: 8b37d07b558d826 switched to configuration voters=(8b37b07b558d4c0 8b37d07b558d826 8b37e07b558d9d9)
+raft2026/11/19 14:05:56 INFO: 8b37d07b558d826 became follower at term 1
+raft2026/11/19 14:05:56 INFO: newRaft 8b37d07b558d826 [peers: [8b37b07b558d4c0,8b37d07b558d826,8b37e07b558d9d9], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/11/19 14:05:58 INFO: 8b37d07b558d826 is starting a new election at term 1
+raft2026/11/19 14:05:58 INFO: 8b37d07b558d826 became pre-candidate at term 1
+raft2026/11/19 14:05:58 INFO: 8b37d07b558d826 [logterm: 1, index: 1] sent MsgPreVote request to 8b37b07b558d4c0 at term 1
+raft2026/11/19 14:05:58 INFO: 8b37d07b558d826 [logterm: 1, index: 1] sent MsgPreVote request to 8b37e07b558d9d9 at term 1
+raft2026/11/19 14:05:58 INFO: 8b37d07b558d826 received MsgPreVoteResp from 8b37d07b558d826 at term 1
+raft2026/11/19 14:05:58 INFO: 8b37d07b558d826 has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft2026/11/19 14:05:58 INFO: 8b37e07b558d9d9 [logterm: 1, index: 1, vote: 0] cast MsgPreVote for 8b37d07b558d826 [logterm: 1, index: 1] at term 1
+raft2026/11/19 14:05:58 INFO: 8b37b07b558d4c0 [logterm: 1, index: 1, vote: 0] cast MsgPreVote for 8b37d07b558d826 [logterm: 1, index: 1] at term 1
+raft2026/11/19 14:05:58 INFO: 8b37d07b558d826 received MsgPreVoteResp from 8b37b07b558d4c0 at term 1
+raft2026/11/19 14:05:58 INFO: 8b37d07b558d826 has received 2 MsgPreVoteResp votes and 0 vote rejections
+raft2026/11/19 14:05:58 INFO: 8b37d07b558d826 became candidate at term 2
+raft2026/11/19 14:05:58 INFO: 8b37d07b558d826 [logterm: 1, index: 1] sent MsgVote request to 8b37b07b558d4c0 at term 2
+raft2026/11/19 14:05:58 INFO: 8b37d07b558d826 [logterm: 1, index: 1] sent MsgVote request to 8b37e07b558d9d9 at term 2
+raft2026/11/19 14:05:58 INFO: 8b37d07b558d826 received MsgVoteResp from 8b37d07b558d826 at term 2
+raft2026/11/19 14:05:58 INFO: 8b37d07b558d826 has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/11/19 14:05:58 INFO: 8b37b07b558d4c0 [term: 1] received a MsgVote message with higher term from 8b37d07b558d826 [term: 2]
+raft2026/11/19 14:05:58 INFO: 8b37b07b558d4c0 became follower at term 2
+raft2026/11/19 14:05:58 INFO: 8b37b07b558d4c0 [logterm: 1, index: 1, vote: 0] cast MsgVote for 8b37d07b558d826 [logterm: 1, index: 1] at term 2
+raft2026/11/19 14:05:58 INFO: 8b37e07b558d9d9 [term: 1] received a MsgVote message with higher term from 8b37d07b558d826 [term: 2]
+raft2026/11/19 14:05:58 INFO: 8b37e07b558d9d9 became follower at term 2
+raft2026/11/19 14:05:58 INFO: 8b37e07b558d9d9 [logterm: 1, index: 1, vote: 0] cast MsgVote for 8b37d07b558d826 [logterm: 1, index: 1] at term 2
+raft2026/11/19 14:05:58 INFO: 8b37d07b558d826 received MsgVoteResp from 8b37e07b558d9d9 at term 2
+raft2026/11/19 14:05:58 INFO: 8b37d07b558d826 has received 2 MsgVoteResp votes and 0 vote rejections
+raft2026/11/19 14:05:58 INFO: 8b37d07b558d826 became leader at term 2
+raft2026/11/19 14:05:58 INFO: 8b37d07b558d826 [term 2] starts to transfer leadership to 8b37b07b558d4c0
+raft2026/11/19 14:05:58 INFO: 8b37d07b558d826 sends MsgTimeoutNow to 8b37b07b558d4c0 immediately as 8b37b07b558d4c0 already has up-to-date log
+raft2026/11/19 14:05:58 INFO: 8b37b07b558d4c0 [term 2] received MsgTimeoutNow from 8b37d07b558d826 and starts an election to get leadership.
+raft2026/11/19 14:05:58 INFO: 8b37b07b558d4c0 is starting a new election at term 2
+raft2026/11/19 14:05:58 INFO: 8b37b07b558d4c0 became candidate at term 3
+raft2026/11/19 14:05:58 INFO: 8b37b07b558d4c0 [logterm: 2, index: 2] sent MsgVote request to 8b37d07b558d826 at term 3
+raft2026/11/19 14:05:58 INFO: 8b37b07b558d4c0 [logterm: 2, index: 2] sent MsgVote request to 8b37e07b558d9d9 at term 3
+raft2026/11/19 14:05:58 INFO: 8b37b07b558d4c0 received MsgVoteResp from 8b37b07b558d4c0 at term 3
+raft2026/11/19 14:05:58 INFO: 8b37b07b558d4c0 has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/11/19 14:05:58 INFO: 8b37d07b558d826 [term: 2] received a MsgVote message with higher term from 8b37b07b558d4c0 [term: 3]
+raft2026/11/19 14:05:58 INFO: 8b37d07b558d826 became follower at term 3
+raft2026/11/19 14:05:58 INFO: 8b37d07b558d826 [logterm: 2, index: 2, vote: 0] cast MsgVote for 8b37b07b558d4c0 [logterm: 2, index: 2] at term 3
+raft2026/11/19 14:05:58 INFO: 8b37b07b558d4c0 received MsgVoteResp from 8b37d07b558d826 at term 3
+raft2026/11/19 14:05:58 INFO: 8b37b07b558d4c0 has received 2 MsgVoteResp votes and 0 vote rejections
+raft2026/11/19 14:05:58 INFO: 8b37b07b558d4c0 became leader at term 3
+raft2026/11/19 14:05:58 INFO: 8b37e07b558d9d9 [term: 2] received a MsgVote message with higher term from 8b37b07b558d4c0 [term: 3]
+raft2026/11/19 14:05:58 INFO: 8b37e07b558d9d9 became follower at term 3
+raft2026/11/19 14:05:58 INFO: 8b37e07b558d9d9 [logterm: 2, index: 2, vote: 0] cast MsgVote for 8b37b07b558d4c0 [logterm: 2, index: 2] at term 3
+raft2026/11/19 14:05:58 INFO: 8b37e07b558d9d9 is starting a new election at term 1
+raft2026/11/19 14:05:58 INFO: 8b37e07b558d9d9 became pre-candidate at term 1
+raft2026/11/19 14:05:58 INFO: 8b37e07b558d9d9 [logterm: 1, index: 1] sent MsgPreVote request to 8b37b07b558d4c0 at term 1
+raft2026/11/19 14:05:58 INFO: 8b37e07b558d9d9 [logterm: 1, index: 1] sent MsgPreVote request to 8b37d07b558d826 at term 1
+raft2026/11/19 14:05:58 INFO: 8b37e07b558d9d9 received MsgPreVoteResp from 8b37e07b558d9d9 at term 1
+raft2026/11/19 14:05:58 INFO: 8b37e07b558d9d9 has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft2026/11/19 14:05:58 INFO: 8b37d07b558d826 [logterm: 1, index: 1, vote: 0] cast MsgPreVote for 8b37e07b558d9d9 [logterm: 1, index: 1] at term 1
+raft2026/11/19 14:05:58 INFO: 8b37b07b558d4c0 [logterm: 1, index: 1, vote: 0] cast MsgPreVote for 8b37e07b558d9d9 [logterm: 1, index: 1] at term 1
+raft2026/11/19 14:05:58 INFO: 8b37e07b558d9d9 received MsgPreVoteResp from 8b37d07b558d826 at term 1
+raft2026/11/19 14:05:58 INFO: 8b37e07b558d9d9 has received 2 MsgPreVoteResp votes and 0 vote rejections
+raft2026/11/19 14:05:58 INFO: 8b37e07b558d9d9 became candidate at term 2
+raft2026/11/19 14:05:58 INFO: 8b37e07b558d9d9 [logterm: 1, index: 1] sent MsgVote request to 8b37b07b558d4c0 at term 2
+raft2026/11/19 14:05:58 INFO: 8b37e07b558d9d9 [logterm: 1, index: 1] sent MsgVote request to 8b37d07b558d826 at term 2
+raft2026/11/19 14:05:58 INFO: 8b37e07b558d9d9 received MsgVoteResp from 8b37e07b558d9d9 at term 2
+raft2026/11/19 14:05:58 INFO: 8b37e07b558d9d9 has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/11/19 14:05:58 INFO: 8b37d07b558d826 [term: 1] received a MsgVote message with higher term from 8b37e07b558d9d9 [term: 2]
+raft2026/11/19 14:05:58 INFO: 8b37d07b558d826 became follower at term 2
+raft2026/11/19 14:05:58 INFO: 8b37d07b558d826 [logterm: 1, index: 1, vote: 0] cast MsgVote for 8b37e07b558d9d9 [logterm: 1, index: 1] at term 2
+raft2026/11/19 14:05:58 INFO: 8b37b07b558d4c0 [term: 1] received a MsgVote message with higher term from 8b37e07b558d9d9 [term: 2]
+raft2026/11/19 14:05:58 INFO: 8b37b07b558d4c0 became follower at term 2
+raft2026/11/19 14:05:58 INFO: 8b37b07b558d4c0 [logterm: 1, index: 1, vote: 0] cast MsgVote for 8b37e07b558d9d9 [logterm: 1, index: 1] at term 2
+raft2026/11/19 14:05:58 INFO: 8b37e07b558d9d9 received MsgVoteResp from 8b37b07b558d4c0 at term 2
+raft2026/11/19 14:05:58 INFO: 8b37e07b558d9d9 has received 2 MsgVoteResp votes and 0 vote rejections
+raft2026/11/19 14:05:58 INFO: 8b37e07b558d9d9 became leader at term 2
+    performance_split_test.go:60: PERF topology nodes=3 groups=2 source_leader=0 target_leader=1 fsm_sync_mode=""
+    performance_split_test.go:80: PERF phase=before-read write=false elapsed_s=2.000 success=49758 errors=0 ops_s=24875.3 p50_ms=0.301 p99_ms=0.709 first_error=<nil>
+    performance_split_test.go:80: PERF phase=before-write write=true elapsed_s=2.022 success=672 errors=0 ops_s=332.4 p50_ms=24.505 p99_ms=35.513 first_error=<nil>
+    performance_split_test.go:80: PERF phase=before-mixed write=false elapsed_s=2.011 success=14968 errors=0 ops_s=7443.2 p50_ms=0.296 p99_ms=4.528 first_error=<nil>
+    performance_split_test.go:80: PERF phase=before-mixed write=true elapsed_s=2.011 success=569 errors=0 ops_s=282.9 p50_ms=13.312 p99_ms=23.404 first_error=<nil>
+    performance_split_test.go:94: PERF same-group catalog_commit_ms=22.636
+    performance_split_test.go:80: PERF phase=same-group-mixed write=false elapsed_s=2.017 success=16047 errors=0 ops_s=7957.2 p50_ms=0.280 p99_ms=4.387 first_error=<nil>
+    performance_split_test.go:80: PERF phase=same-group-mixed write=true elapsed_s=2.017 success=603 errors=0 ops_s=299.0 p50_ms=12.904 p99_ms=22.441 first_error=<nil>
+    performance_split_test.go:113: PERF migration elapsed_ms=38 phase=1 last_error=""
+    performance_split_test.go:113: PERF migration elapsed_ms=741 phase=2 last_error=""
+    performance_split_test.go:113: PERF migration elapsed_ms=47629 phase=3 last_error=""
+    performance_split_test.go:113: PERF migration elapsed_ms=62680 phase=4 last_error=""
+2026/11/19 14:07:42 WARN split job runner tick failed err="rpc error: code = Aborted desc = catalog split job conflict\n(1) attached stack trace\n  -- stack trace:\n  | github.com/bootjp/elastickv/adapter.grpcStatusError\n  | \t/private/tmp/elastickv-preflight-comparison-20261119/source/adapter/distribution_server.go:2632\n  | github.com/bootjp/elastickv/adapter.splitJobCoordinatorStatusError\n  | \t/private/tmp/elastickv-preflight-comparison-20261119/source/adapter/distribution_server.go:2346\n  | github.com/bootjp/elastickv/adapter.(*DistributionServer).updateSplitJobViaCoordinator\n  | \t/private/tmp/elastickv-preflight-comparison-20261119/source/adapter/distribution_server.go:1853\n  | github.com/bootjp/elastickv/adapter.(*DistributionServer).persistSplitJobCopyProgress\n  | \t/private/tmp/elastickv-preflight-comparison-20261119/source/adapter/split_job_runner.go:1602\n  | github.com/bootjp/elastickv/adapter.(*DistributionServer).copySplitJobStream\n  | \t/private/tmp/elastickv-preflight-comparison-20261119/source/adapter/split_job_runner.go:1506\n  | github.com/bootjp/elastickv/adapter.(*DistributionServer).copySplitJobPhase\n  | \t/private/tmp/elastickv-preflight-comparison-20261119/source/adapter/split_job_runner.go:1437\n  | github.com/bootjp/elastickv/adapter.(*DistributionServer).runSplitJobCopyPhase\n  | \t/private/tmp/elastickv-preflight-comparison-20261119/source/adapter/split_job_runner.go:473\n  | github.com/bootjp/elastickv/adapter.(*DistributionServer).runAdmittedSplitJobPhase\n  | \t/private/tmp/elastickv-preflight-comparison-20261119/source/adapter/split_job_runner.go:254\n  | github.com/bootjp/elastickv/adapter.(*DistributionServer).runSplitJobPhase\n  | \t/private/tmp/elastickv-preflight-comparison-20261119/source/adapter/split_job_runner.go:243\n  | github.com/bootjp/elastickv/adapter.(*DistributionServer).runSplitJobAttempt\n  | \t/private/tmp/elastickv-preflight-comparison-20261119/source/adapter/split_job_failure.go:28\n  | github.com/bootjp/elastickv/adapter.(*DistributionServer).RunSplitJobRunnerOnce\n  | \t/private/tmp/elastickv-preflight-comparison-20261119/source/adapter/distribution_server.go:408\n  | github.com/bootjp/elastickv/adapter.(*DistributionServer).RunSplitJobRunner\n  | \t/private/tmp/elastickv-preflight-comparison-20261119/source/adapter/distribution_server.go:373\n  | github.com/bootjp/elastickv/internal/server.startDistributionSplitJobRunner.func1\n  | \t/private/tmp/elastickv-preflight-comparison-20261119/source/internal/server/distribution.go:203\n  | golang.org/x/sync/errgroup.(*Group).Go.func1\n  | \t/Users/bootjp/go/pkg/mod/golang.org/x/sync@v0.24.0/errgroup/errgroup.go:93\n  | runtime.goexit\n  | \t/usr/local/go/src/runtime/asm_amd64.s:1264\nWraps: (2) rpc error: code = Aborted desc = catalog split job conflict\nError types: (1) *withstack.withStack (2) *status.Error"
+    performance_split_test.go:113: PERF migration elapsed_ms=111577 phase=5 last_error=""
+    performance_split_test.go:113: PERF migration elapsed_ms=115585 phase=6 last_error=""
+    performance_split_test.go:113: PERF migration elapsed_ms=205586 phase=7 last_error=""
+    performance_split_test.go:104: PERF phase=migration-0 write=false elapsed_s=0.039 success=187 errors=0 ops_s=4793.8 p50_ms=0.347 p99_ms=8.294 first_error=<nil>
+    performance_split_test.go:104: PERF phase=migration-0 write=true elapsed_s=0.039 success=10 errors=0 ops_s=256.4 p50_ms=17.885 p99_ms=29.387 first_error=<nil>
+    performance_split_test.go:104: PERF phase=migration-1 write=false elapsed_s=0.702 success=4933 errors=0 ops_s=7025.8 p50_ms=0.305 p99_ms=5.012 first_error=<nil>
+    performance_split_test.go:104: PERF phase=migration-1 write=true elapsed_s=0.702 success=190 errors=4 ops_s=270.6 p50_ms=13.515 p99_ms=23.176 first_error=rpc error: code = Unknown desc = Operation outcome unknown
+    performance_split_test.go:104: PERF phase=migration-2 write=false elapsed_s=46.888 success=362229 errors=0 ops_s=7725.4 p50_ms=0.296 p99_ms=4.194 first_error=<nil>
+    performance_split_test.go:104: PERF phase=migration-2 write=true elapsed_s=46.888 success=13901 errors=0 ops_s=296.5 p50_ms=12.849 p99_ms=24.006 first_error=<nil>
+    performance_split_test.go:104: PERF phase=migration-preflight write=false elapsed_s=13.147 success=117809 errors=0 ops_s=8960.8 p50_ms=0.289 p99_ms=3.362 first_error=<nil>
+    performance_split_test.go:104: PERF phase=migration-preflight write=true elapsed_s=13.147 success=4671 errors=0 ops_s=355.3 p50_ms=10.802 p99_ms=21.230 first_error=<nil>
+    performance_split_test.go:104: PERF phase=migration-3 write=false elapsed_s=1.904 success=19383 errors=0 ops_s=10180.0 p50_ms=0.300 p99_ms=1.655 first_error=<nil>
+    performance_split_test.go:104: PERF phase=migration-3 write=true elapsed_s=1.904 success=734 errors=7794 ops_s=385.5 p50_ms=6.720 p99_ms=14.260 first_error=rpc error: code = Unknown desc = Operation outcome unknown
+    performance_split_test.go:104: PERF phase=migration-4 write=false elapsed_s=48.898 success=525495 errors=0 ops_s=10746.8 p50_ms=0.301 p99_ms=1.437 first_error=<nil>
+    performance_split_test.go:104: PERF phase=migration-4 write=true elapsed_s=48.898 success=17307 errors=355384 ops_s=353.9 p50_ms=5.755 p99_ms=11.239 first_error=rpc error: code = Unknown desc = Operation outcome unknown
+    performance_split_test.go:104: PERF phase=migration-5 write=false elapsed_s=4.008 success=32058 errors=11457 ops_s=7999.0 p50_ms=0.306 p99_ms=1.414 first_error=rpc error: code = Unknown desc = route cutover pending
+    performance_split_test.go:104: PERF phase=migration-5 write=true elapsed_s=4.008 success=1450 errors=28349 ops_s=361.8 p50_ms=5.745 p99_ms=10.446 first_error=rpc error: code = Unknown desc = Operation outcome unknown
+    performance_split_test.go:104: PERF phase=migration-6 write=false elapsed_s=90.001 success=620571 errors=0 ops_s=6895.2 p50_ms=0.361 p99_ms=2.962 first_error=<nil>
+    performance_split_test.go:104: PERF phase=migration-6 write=true elapsed_s=90.001 success=45429 errors=2110 ops_s=504.8 p50_ms=7.716 p99_ms=15.759 first_error=rpc error: code = Unknown desc = Operation outcome unknown
+    performance_split_test.go:104: PERF phase=cross-group-during write=false elapsed_s=205.869 success=1682665 errors=11457 ops_s=8173.5 p50_ms=0.309 p99_ms=3.044 first_error=rpc error: code = Unknown desc = route cutover pending
+    performance_split_test.go:104: PERF phase=cross-group-during write=true elapsed_s=205.869 success=83692 errors=393641 ops_s=406.5 p50_ms=7.804 p99_ms=20.407 first_error=rpc error: code = Unknown desc = Operation outcome unknown
+    performance_split_test.go:119: PERF cross-group done_ms=206170
+    performance_split_test.go:80: PERF phase=after-mixed write=false elapsed_s=2.005 success=14355 errors=0 ops_s=7160.8 p50_ms=0.349 p99_ms=2.811 first_error=<nil>
+    performance_split_test.go:80: PERF phase=after-mixed write=true elapsed_s=2.005 success=1043 errors=0 ops_s=520.3 p50_ms=7.487 p99_ms=15.874 first_error=<nil>
+    performance_split_test.go:80: PERF phase=after-read write=false elapsed_s=2.000 success=43102 errors=0 ops_s=21546.3 p50_ms=0.328 p99_ms=0.800 first_error=<nil>
+    performance_split_test.go:80: PERF phase=after-write write=true elapsed_s=2.018 success=1032 errors=0 ops_s=511.4 p50_ms=13.518 p99_ms=61.471 first_error=<nil>
+    performance_split_test.go:129: PERF recovery routing_convergence_ms=0 catalog_version=6
+    performance_split_test.go:129: PERF recovery path=outside-direct group=1 ingress=0 leader=0 term=3
+    performance_split_test.go:129: PERF recovery path=retained-direct group=1 ingress=0 leader=0 term=3
+    performance_split_test.go:129: PERF recovery path=retained-forwarded group=1 ingress=1 leader=0 term=3
+    performance_split_test.go:129: PERF recovery path=moved-direct group=2 ingress=1 leader=1 term=2
+    performance_split_test.go:129: PERF recovery path=moved-forwarded group=2 ingress=0 leader=1 term=2
+    performance_split_test.go:129: PERF recovery path=retained-forwarded planned=600 sent=600 success=600 errors=0 first_success_ms=18 max_lag_ms=139 error_details=map[] first_error=<nil>
+    performance_split_test.go:129: PERF recovery path=retained-direct planned=600 sent=600 success=600 errors=0 first_success_ms=18 max_lag_ms=138 error_details=map[] first_error=<nil>
+    performance_split_test.go:129: PERF recovery path=moved-direct planned=600 sent=600 success=600 errors=0 first_success_ms=14 max_lag_ms=135 error_details=map[] first_error=<nil>
+    performance_split_test.go:129: PERF recovery path=outside-direct planned=600 sent=600 success=600 errors=0 first_success_ms=14 max_lag_ms=159 error_details=map[] first_error=<nil>
+    performance_split_test.go:129: PERF recovery path=moved-forwarded planned=600 sent=600 success=600 errors=0 first_success_ms=14 max_lag_ms=136 error_details=map[] first_error=<nil>
+--- PASS: TestPerformanceReadWriteSplit (285.99s)
+PASS

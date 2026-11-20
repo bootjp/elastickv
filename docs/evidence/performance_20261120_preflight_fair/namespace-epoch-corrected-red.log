@@ -1,0 +1,22 @@
+--- FAIL: TestNamespaceProbeDoesNotRelabelOldActivationACK (0.00s)
+    --- FAIL: TestNamespaceProbeDoesNotRelabelOldActivationACK/inventory-discovery (0.00s)
+        internal_namespace_configuration_race_test.go:35: 
+            	Error Trace:	/Users/bootjp/src/elastickv/adapter/internal_namespace_configuration_race_test.go:35
+            	Error:      	Should be false
+            	Test:       	TestNamespaceProbeDoesNotRelabelOldActivationACK/inventory-discovery
+            	Messages:   	an ACK proved at index 9 cannot be relabeled as index 10
+    --- FAIL: TestNamespaceProbeDoesNotRelabelOldActivationACK/expected-configuration (0.00s)
+        internal_namespace_configuration_race_test.go:35: 
+            	Error Trace:	/Users/bootjp/src/elastickv/adapter/internal_namespace_configuration_race_test.go:35
+            	Error:      	Should be false
+            	Test:       	TestNamespaceProbeDoesNotRelabelOldActivationACK/expected-configuration
+            	Messages:   	an ACK proved at index 9 cannot be relabeled as index 10
+--- FAIL: TestNamespaceProbeReadsVersionAndConfigurationAtomically (0.00s)
+    internal_namespace_configuration_race_test.go:69: 
+        	Error Trace:	/Users/bootjp/src/elastickv/adapter/internal_namespace_configuration_race_test.go:69
+        	Error:      	Should be false
+        	Test:       	TestNamespaceProbeReadsVersionAndConfigurationAtomically
+        	Messages:   	version from the old record must not combine with the new configuration index
+FAIL
+FAIL	github.com/bootjp/elastickv/adapter	0.773s
+FAIL

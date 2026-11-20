@@ -1,0 +1,18 @@
+{
+  "suite-final-guard.log": {
+    "exit": 0,
+    "scope": "focused regression or harness unit test"
+  },
+  "race-final-guard.log": {
+    "exit": 0,
+    "scope": "focused regression or harness unit test"
+  },
+  "lint-final-guard.log": {
+    "exit": 0,
+    "scope": "focused regression or harness unit test"
+  },
+  "jepsen-final-guard.log": {
+    "exit": 0,
+    "scope": "focused regression or harness unit test"
+  }
+}

@@ -1,0 +1,51 @@
+{
+  "base": "5ccfbc74a31f6b21aa4d631704ca922a0749c18e",
+  "go": "go version go1.27.3 darwin/arm64",
+  "target": "linux/amd64, CGO_ENABLED=0",
+  "variants": {
+    "one": {
+      "go_file_changes": {
+        "adapter/distribution_server.go": "ac63a98bf30a5f03ed00e5496598bb52f9d5f9ad9a68c262c5b921783698aafa",
+        "adapter/grpc_migration_write_test.go": "13a9f748c14f99c62b316ff257ae2f66e248509a4db04fe634c6eea7955b04af",
+        "adapter/migration_namespace_activation.go": "159884e6db3fa155635bc0091278a4bc49beff6def6fe595ba88c23ce4652b52",
+        "adapter/split_job_preflight_batch_test.go": "69c04113745ab741c426389e3e330c30c04876f68bce175505b23bf394e307ed",
+        "adapter/split_job_preflight_schedule.go": "f9f0ff0c49b2bd1081af1183f06115b21c1037c17d8a4a187d009b68311c2370",
+        "adapter/split_job_runner.go": "70abcb0ab6667e89f305656505a61996495c2064209aa8c99cb19bb821ef8919",
+        "adapter/split_job_transfer_admission.go": "71c57dd22d73c9074e7c607e51f00c4724be07b6b5eca4d66f9b79b284a8b74d",
+        "adapter/split_job_transfer_phase.go": "e3e1bf75d3b9a30f927bcba08cf5fe048b963fba90e9b69b5ba425d82229e08c",
+        "adapter/split_job_transfer_preflight.go": "d3f860ca253b0866c390769428b5f57d13c7468d704a2f2ab6930ed28162230e",
+        "internal/server/performance_split_comparison_test.go": "f35241e6cc6ef18bede38c7c2b3e0e82b3e1a37f05d8b8c0ec2dddde32498ea7",
+        "internal/server/performance_split_recovery_test.go": "6bdc3811b9c8a369cc8bce446d26633d2781f384afbace09a68151f4bfcd44bc",
+        "internal/server/performance_split_test.go": "13ffff777c7935b946fccd090fa27a88076cb94d95b953db429432a2cd0af1a8",
+        "internal/server/performance_split_timing_test.go": "ab90a11a3a845764bccdef6a97414bae51db32f81edecb5f10a70d72e3a18223",
+        "kv/sharded_coordinator.go": "e918b67c048d3340499503db1f9e0d2c1ec5c13a13d9bb4d9812c596b4e9efd7",
+        "kv/sharded_coordinator_migration_version.go": "74d52997788bd199f2637b1b8a706583a69c52e25c28a155416bd72c5a6436e7",
+        "kv/sharded_coordinator_migration_version_test.go": "5dbe96ff14ef252ff02446b0fa923b1d84d550e1645669df89766e63f1e80121"
+      },
+      "linux_binary_sha256": "198a87f8482090a8ec68537b9937a985bb6138ba6df0339d9e45350be464760a"
+    },
+    "two": {
+      "go_file_changes": {
+        "adapter/distribution_server.go": "ac63a98bf30a5f03ed00e5496598bb52f9d5f9ad9a68c262c5b921783698aafa",
+        "adapter/grpc_migration_write_test.go": "13a9f748c14f99c62b316ff257ae2f66e248509a4db04fe634c6eea7955b04af",
+        "adapter/migration_namespace_activation.go": "159884e6db3fa155635bc0091278a4bc49beff6def6fe595ba88c23ce4652b52",
+        "adapter/split_job_preflight_batch_test.go": "69c04113745ab741c426389e3e330c30c04876f68bce175505b23bf394e307ed",
+        "adapter/split_job_preflight_checkpoint.go": "574fb39e99aada0c5222cf016b8bfe65f8a7c1398e57cdbb8f3ccde5f93683f8",
+        "adapter/split_job_preflight_schedule.go": "f9f0ff0c49b2bd1081af1183f06115b21c1037c17d8a4a187d009b68311c2370",
+        "adapter/split_job_runner.go": "dc64bcdcac11bac0c1350da6e1474dac51d8c01216b2a8f1ecf1fb4f26c6f14f",
+        "adapter/split_job_transfer_admission.go": "71c57dd22d73c9074e7c607e51f00c4724be07b6b5eca4d66f9b79b284a8b74d",
+        "adapter/split_job_transfer_phase.go": "e3e1bf75d3b9a30f927bcba08cf5fe048b963fba90e9b69b5ba425d82229e08c",
+        "adapter/split_job_transfer_preflight.go": "a9ccb857d26dfa36623b12b7ef19f2f9c44ce4670ea7854e65f906bc9bcd73fa",
+        "distribution/catalog.go": "df1f5b4269df202ac9d9dcd8e333e980dbe94927c1dd166797649f9bb0ae3a71",
+        "internal/server/performance_split_comparison_test.go": "f35241e6cc6ef18bede38c7c2b3e0e82b3e1a37f05d8b8c0ec2dddde32498ea7",
+        "internal/server/performance_split_recovery_test.go": "6bdc3811b9c8a369cc8bce446d26633d2781f384afbace09a68151f4bfcd44bc",
+        "internal/server/performance_split_test.go": "13ffff777c7935b946fccd090fa27a88076cb94d95b953db429432a2cd0af1a8",
+        "internal/server/performance_split_timing_test.go": "ab90a11a3a845764bccdef6a97414bae51db32f81edecb5f10a70d72e3a18223",
+        "kv/sharded_coordinator.go": "e918b67c048d3340499503db1f9e0d2c1ec5c13a13d9bb4d9812c596b4e9efd7",
+        "kv/sharded_coordinator_migration_version.go": "74d52997788bd199f2637b1b8a706583a69c52e25c28a155416bd72c5a6436e7",
+        "kv/sharded_coordinator_migration_version_test.go": "5dbe96ff14ef252ff02446b0fa923b1d84d550e1645669df89766e63f1e80121"
+      },
+      "linux_binary_sha256": "dc057b70c85d5211a115ca15e99f21371e1f5c49933c21aa4805fc694dc65de1"
+    }
+  }
+}

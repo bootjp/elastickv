@@ -1,0 +1,32 @@
+{
+  "code_commit": "03cd340b7889bea6cb253931769857526235047d",
+  "full_suite": {
+    "command": "GOMAXPROCS=6 go test -p 2 -json -count=1 -timeout=18m ./...",
+    "exit": 0,
+    "package_results": {
+      "pass": 63,
+      "skip": 6
+    },
+    "tests_including_subtests": {
+      "pass": 15855,
+      "skip": 12
+    },
+    "no_test_files": [
+      "github.com/bootjp/elastickv/cmd",
+      "github.com/bootjp/elastickv/cmd/client",
+      "github.com/bootjp/elastickv/cmd/elastickv-raft-stream-soak",
+      "github.com/bootjp/elastickv/internal/pathsafety",
+      "github.com/bootjp/elastickv/internal/peersession/wire",
+      "github.com/bootjp/elastickv/proto"
+    ]
+  },
+  "focused_race": {
+    "command": "go test -race -count=1 ./adapter -run 'Test(Preflight|SplitPreflight|TransferPreflight)'",
+    "output": "ok  \tgithub.com/bootjp/elastickv/adapter\t3.177s",
+    "exit": 0
+  },
+  "lint": {
+    "command": "make lint",
+    "result": "0 issues."
+  }
+}
