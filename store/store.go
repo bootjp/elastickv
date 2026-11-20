@@ -142,6 +142,11 @@ type ImportVersionsOptions struct {
 	BatchSeq     uint64
 	Versions     []MVCCVersion
 	Cursor       []byte
+	// LogicalKey maps a staged key to the public key whose version it carries.
+	LogicalKey func([]byte) []byte
+	// AllowLegacyVersionOverwrite preserves replay of migration entries that
+	// preceded replicated version identity protection.
+	AllowLegacyVersionOverwrite bool
 }
 
 // ImportVersionsResult reports the cursor durably acknowledged by the target.
@@ -165,6 +170,9 @@ type PromoteVersionsOptions struct {
 	MaxBytes        uint64
 	MaxScannedBytes uint64
 	TargetKey       func(stagedKey []byte) ([]byte, bool)
+	// AllowLegacyVersionOverwrite preserves replay of migration entries that
+	// preceded replicated version identity protection.
+	AllowLegacyVersionOverwrite bool
 }
 
 // PromoteVersionsResult reports one resumable staged-version promotion chunk.
@@ -327,6 +335,23 @@ type Snapshot interface {
 // before a read timestamp, including tombstones and expired values.
 type VersionPresenceReader interface {
 	VersionExistsAtOrBefore(ctx context.Context, key []byte, ts uint64) (bool, error)
+}
+
+// VersionedValueReader reads a live record and its commit timestamp together.
+type VersionedValueReader interface {
+	GetVersionAt(ctx context.Context, key []byte, ts uint64) (VersionedValue, error)
+}
+
+// GetVersionAt returns the live record visible at ts. A local engine also
+// returns its absolute expiry. Missing, expired and deleted records return
+// ErrKeyNotFound.
+func GetVersionAt(ctx context.Context, st MVCCStore, key []byte, ts uint64) (VersionedValue, error) {
+	reader, ok := st.(VersionedValueReader)
+	if !ok {
+		return VersionedValue{}, ErrNotSupported
+	}
+	record, err := reader.GetVersionAt(ctx, key, ts)
+	return record, errors.WithStack(err)
 }
 
 // MVCCStore extends Store with multi-version concurrency control helpers.

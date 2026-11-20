@@ -185,23 +185,31 @@ func versionUpperBound(vs []VersionedValue, ts uint64) int {
 }
 
 func visibleValue(vs []VersionedValue, ts uint64) ([]byte, bool) {
+	version := versionAt(vs, ts)
+	if version == nil {
+		return nil, false
+	}
+	return version.valueAt(ts)
+}
+
+func versionAt(vs []VersionedValue, ts uint64) *VersionedValue {
 	// Reads at or just behind the head can skip the binary search.
 	const tailChecks = 2
 	for range tailChecks {
 		if len(vs) == 0 {
-			return nil, false
+			return nil
 		}
 		last := len(vs) - 1
 		if vs[last].TS <= ts {
-			return vs[last].valueAt(ts)
+			return &vs[last]
 		}
 		vs = vs[:last]
 	}
 	n := versionUpperBound(vs, ts)
 	if n == 0 {
-		return nil, false
+		return nil
 	}
-	return vs[n-1].valueAt(ts)
+	return &vs[n-1]
 }
 
 func (v *VersionedValue) valueAt(ts uint64) ([]byte, bool) {
@@ -340,25 +348,36 @@ func readTSCompacted(ts, minRetainedTS uint64) bool {
 // ---- MVCCStore methods ----
 
 func (s *mvccStore) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte, error) {
+	version, err := s.GetVersionAt(ctx, key, ts)
+	return version.Value, err
+}
+
+func (s *mvccStore) GetVersionAt(ctx context.Context, key []byte, ts uint64) (VersionedValue, error) {
 	if staged := s.memoryEntryStore(ctx); staged != nil {
-		return staged.GetAt(ctx, key, ts)
+		return staged.GetVersionAt(ctx, key, ts)
 	}
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
 	if readTSCompacted(ts, s.minRetainedTS) {
-		return nil, ErrReadTSCompacted
+		return VersionedValue{}, ErrReadTSCompacted
 	}
 
 	v, ok := s.entryTreeGet(key)
 	if !ok {
-		return nil, ErrKeyNotFound
+		return VersionedValue{}, ErrKeyNotFound
 	}
 	versions, _ := v.([]VersionedValue)
-	value, ok := visibleValue(versions, ts)
-	if !ok {
-		return nil, ErrKeyNotFound
+	version := versionAt(versions, ts)
+	if version == nil {
+		return VersionedValue{}, ErrKeyNotFound
 	}
-	return bytes.Clone(value), nil
+	value, visible := version.valueAt(ts)
+	if !visible {
+		return VersionedValue{}, ErrKeyNotFound
+	}
+	result := *version
+	result.Value = bytes.Clone(value)
+	return result, nil
 }
 
 func (s *mvccStore) ExistsAt(ctx context.Context, key []byte, ts uint64) (bool, error) {

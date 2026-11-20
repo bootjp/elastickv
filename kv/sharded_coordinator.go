@@ -23,9 +23,10 @@ import (
 )
 
 type ShardGroup struct {
-	Engine raftengine.Engine
-	Store  store.MVCCStore
-	Txn    Transactional
+	Engine               raftengine.Engine
+	Store                store.MVCCStore
+	Txn                  Transactional
+	versionReadAdmission func(context.Context) error
 	// TSOState is set only for reserved group 0. Keeping the applied floor and
 	// cutover marker next to the group's engine lets the leader allocator read
 	// consensus-owned state without treating the shared HLC mirror as durable.
@@ -369,6 +370,13 @@ func (t *leaseRefreshingTxn) stampLeaderIssuedTxnForVerifiedLocalCommit(ctx cont
 	if meta.CommitTS != 0 {
 		return 0, nil
 	}
+	if err := t.stampCASStartTimestamp(ctx, r); err != nil {
+		return 0, err
+	}
+	return t.stampLeaderIssuedCommitTimestamp(ctx, r, metaMutation, meta)
+}
+
+func (t *leaseRefreshingTxn) stampLeaderIssuedCommitTimestamp(ctx context.Context, r *pb.Request, metaMutation *pb.Mutation, meta TxnMeta) (uint64, error) {
 	commitTS, err := t.coord.resolveTxnCommitTS(ctx, r.Ts, 0)
 	if err != nil {
 		return 0, err
@@ -382,6 +390,18 @@ func (t *leaseRefreshingTxn) stampLeaderIssuedTxnForVerifiedLocalCommit(ctx cont
 	meta.CommitTS = commitTS
 	metaMutation.Value = EncodeTxnMeta(meta)
 	return commitTS, nil
+}
+
+func (t *leaseRefreshingTxn) stampCASStartTimestamp(ctx context.Context, req *pb.Request) error {
+	if req.Ts != 0 || !HasCASMutation([]*pb.Request{req}) {
+		return nil
+	}
+	ts, err := t.coord.allocateTimestamp(ctx, "allocate CAS startTS")
+	if err != nil {
+		return err
+	}
+	req.Ts = ts
+	return nil
 }
 
 func leaderIssuedOnePhaseRequest(reqs []*pb.Request) (*pb.Request, *pb.Mutation) {
@@ -1087,6 +1107,13 @@ func (c *ShardedCoordinator) dispatchAdmitted(ctx context.Context, reqs *Operati
 		return nil, err
 	}
 
+	if reqs.Elems[0].Op == CompareAndSwap {
+		return c.dispatchCAS(ctx, reqs)
+	}
+	return c.dispatchOrdinaryOperation(ctx, reqs)
+}
+
+func (c *ShardedCoordinator) dispatchOrdinaryOperation(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
 	// Capture whether the caller supplied a non-zero StartTS BEFORE
 	// the coordinator-allocates-on-zero branch below mutates the
 	// field.  A caller-supplied StartTS names a specific snapshot
@@ -2103,8 +2130,7 @@ func (c *ShardedCoordinator) dispatchSingleShardTxn(ctx context.Context, startTS
 	if err != nil {
 		return nil, err
 	}
-	readKeys = c.readKeysWithStagedVisibilityAliasesForGroup(gid, readKeys)
-	readKeys = c.readKeysWithStagedVisibilityMutationAliasesForGroup(gid, readKeys, muts)
+	readKeys = c.onePhaseReadKeys(gid, readKeys, muts)
 	if len(readKeys) > maxReadKeys {
 		return nil, errors.WithStack(ErrInvalidRequest)
 	}
@@ -2132,6 +2158,16 @@ func (c *ShardedCoordinator) dispatchSingleShardTxn(ctx context.Context, startTS
 		return nil, errors.WithStack(ErrTransactionOutcomeUnknown)
 	}
 	return &CoordinateResponse{CommitIndex: resp.CommitIndex, CommitTS: commitTS}, nil
+}
+
+func (c *ShardedCoordinator) onePhaseReadKeys(gid uint64, readKeys [][]byte, muts []*pb.Mutation) [][]byte {
+	// A standalone CAS uses an exact-version predicate and is admitted only on
+	// initial routes. Keep its wire shape free of auxiliary OCC read keys.
+	if len(muts) == 1 && muts[0].GetOp() == pb.Op_COMPARE_AND_SWAP {
+		return readKeys
+	}
+	readKeys = c.readKeysWithStagedVisibilityAliasesForGroup(gid, readKeys)
+	return c.readKeysWithStagedVisibilityMutationAliasesForGroup(gid, readKeys, muts)
 }
 
 func (c *ShardedCoordinator) readKeysWithStagedVisibilityAliasesForGroup(gid uint64, readKeys [][]byte) [][]byte {
@@ -3418,23 +3454,33 @@ func validateOperationGroup(reqs *OperationGroup[OP]) error {
 		if e == nil {
 			return ErrInvalidRequest
 		}
-	}
-	if len(reqs.PrimaryKey) != 0 {
-		if !reqs.IsTxn {
-			return ErrInvalidRequest
-		}
-		found := false
-		for _, e := range reqs.Elems {
-			if bytes.Equal(e.Key, reqs.PrimaryKey) {
-				found = true
-				break
+		if e.Op == CompareAndSwap {
+			if !validCASOperation(reqs, e) {
+				return ErrInvalidRequest
 			}
-		}
-		if !found {
+		} else if e.ExpectedCommitTS != 0 {
 			return ErrInvalidRequest
 		}
+	}
+	if !validOperationPrimaryKey(reqs) {
+		return ErrInvalidRequest
 	}
 	return nil
+}
+
+func validOperationPrimaryKey(reqs *OperationGroup[OP]) bool {
+	if len(reqs.PrimaryKey) == 0 {
+		return true
+	}
+	if !reqs.IsTxn {
+		return false
+	}
+	for _, e := range reqs.Elems {
+		if bytes.Equal(e.Key, reqs.PrimaryKey) {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *ShardedCoordinator) requestLogs(ctx context.Context, reqs *OperationGroup[OP]) ([]*pb.Request, error) {
@@ -3699,7 +3745,7 @@ func (c *ShardedCoordinator) ensureMutationWriteAllowed(mut *pb.Mutation, commit
 			}
 		}
 		return nil
-	case pb.Op_PUT, pb.Op_DEL:
+	case pb.Op_PUT, pb.Op_DEL, pb.Op_COMPARE_AND_SWAP:
 		return c.rejectWriteTimestampFloorPointKey(mut.Key, commitTS)
 	default:
 		return errors.WithStack(ErrInvalidRequest)

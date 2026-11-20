@@ -61,6 +61,14 @@ func writeExternalRestoreOrigin(dir string, opts ExternalSnapshotRestoreOptions,
 	return syncDir(dir)
 }
 
+// HasExternalRestoreOrigin reports whether this data directory descends from
+// an offline external snapshot rebase. The marker survives later restarts and
+// native snapshots.
+func HasExternalRestoreOrigin(dir string) (bool, error) {
+	marker, err := readExternalRestoreOrigin(dir)
+	return marker != nil, err
+}
+
 func readExternalRestoreOrigin(dir string) (*externalRestoreOrigin, error) {
 	f, err := openRegularExternalFSMInput(filepath.Join(dir, externalRestoreOriginFile))
 	if os.IsNotExist(errors.UnwrapAll(err)) {

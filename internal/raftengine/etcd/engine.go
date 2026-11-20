@@ -2226,6 +2226,9 @@ func (e *Engine) handleProposal(req proposalRequest) {
 	request := &raftengine.NativeRequest{Operation: raftengine.NativeProposal, Payload: req.payload, PayloadDigest: req.payloadDigest}
 	envelope := encodeProposalEnvelope(req.id, req.payload)
 	if err := e.withNative(req.ctx, request, func() error {
+		if err := e.checkVersionCASProposal(req); err != nil {
+			return err
+		}
 		return e.rawNode.Propose(envelope)
 	}); err != nil {
 		e.cancelPendingProposal(req.id)

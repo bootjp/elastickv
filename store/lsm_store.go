@@ -1154,9 +1154,9 @@ func (s *pebbleStore) alignCommitTS(commitTS uint64) uint64 {
 
 // MVCC Implementation
 
-// getAt is the internal implementation of GetAt.  It must be called while the
-// caller holds at least s.dbMu.RLock().
-func (s *pebbleStore) getAt(ctx context.Context, key []byte, ts uint64) ([]byte, error) {
+// getAt must be called while holding at least s.dbMu.RLock(). A non-nil
+// version requests metadata from the same visible record as the returned value.
+func (s *pebbleStore) getAt(ctx context.Context, key []byte, ts uint64, version *VersionedValue) ([]byte, error) {
 	if readTSCompacted(ts, s.effectiveMinRetainedTS()) {
 		return nil, ErrReadTSCompacted
 	}
@@ -1172,9 +1172,9 @@ func (s *pebbleStore) getAt(ctx context.Context, key []byte, ts uint64) ([]byte,
 	defer iter.Close()
 
 	if !iter.SeekGE(seekKey) {
-		return nil, ErrKeyNotFound
+		return missingIteratorValue(iter)
 	}
-	return s.readVisibleVersion(iter, key, ts)
+	return s.readVisibleVersion(iter, key, ts, version)
 }
 
 // readVisibleVersion examines the iterator's current entry and
@@ -1189,12 +1189,12 @@ func (s *pebbleStore) getAt(ctx context.Context, key []byte, ts uint64) ([]byte,
 // GCM (returns ErrEncryptedReadIntegrity) or matches the original
 // values, in which case the visibility checks below are operating
 // on authenticated bytes.
-func (s *pebbleStore) readVisibleVersion(iter *pebble.Iterator, key []byte, ts uint64) ([]byte, error) {
+func (s *pebbleStore) readVisibleVersion(iter *pebble.Iterator, key []byte, ts uint64, version *VersionedValue) ([]byte, error) {
 	if !skipPebbleMetadataForward(iter) {
-		return nil, ErrKeyNotFound
+		return missingIteratorValue(iter)
 	}
 	k := iter.Key()
-	userKey, _ := decodeKeyView(k)
+	userKey, commitTS := decodeKeyView(k)
 	if !bytes.Equal(userKey, key) {
 		return nil, ErrKeyNotFound
 	}
@@ -1212,13 +1212,36 @@ func (s *pebbleStore) readVisibleVersion(iter *pebble.Iterator, key []byte, ts u
 	if sv.ExpireAt != 0 && sv.ExpireAt <= ts {
 		return nil, ErrKeyNotFound
 	}
+	if version != nil {
+		version.TS = commitTS
+		version.ExpireAt = sv.ExpireAt
+	}
 	return finishAuthenticatedValue(plain, flag)
+}
+
+func missingIteratorValue(iter *pebble.Iterator) ([]byte, error) {
+	if err := iter.Error(); err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return nil, ErrKeyNotFound
 }
 
 func (s *pebbleStore) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte, error) {
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
-	return s.getAt(ctx, key, ts)
+	return s.getAt(ctx, key, ts, nil)
+}
+
+func (s *pebbleStore) GetVersionAt(ctx context.Context, key []byte, ts uint64) (VersionedValue, error) {
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+	var version VersionedValue
+	value, err := s.getAt(ctx, key, ts, &version)
+	if err != nil {
+		return VersionedValue{}, err
+	}
+	version.Value = value
+	return version, nil
 }
 
 func (s *pebbleStore) VersionExistsAtOrBefore(ctx context.Context, key []byte, ts uint64) (bool, error) {
@@ -1294,7 +1317,7 @@ func (s *pebbleStore) getAtBatchWithIter(ctx context.Context, iter *pebble.Itera
 			}
 			continue
 		}
-		value, err := s.readVisibleVersion(iter, key, ts)
+		value, err := s.readVisibleVersion(iter, key, ts, nil)
 		if err != nil {
 			if errors.Is(err, ErrKeyNotFound) {
 				continue
@@ -1331,7 +1354,7 @@ func (s *pebbleStore) ExistsAt(ctx context.Context, key []byte, ts uint64) (bool
 	defer s.dbMu.RUnlock()
 
 	// Use internal getAt to avoid a recursive dbMu.RLock() acquisition.
-	val, err := s.getAt(ctx, key, ts)
+	val, err := s.getAt(ctx, key, ts, nil)
 	if errors.Is(err, ErrKeyNotFound) {
 		return false, nil
 	}
@@ -2101,7 +2124,7 @@ func (s *pebbleStore) ExpireAt(ctx context.Context, key []byte, expireAt uint64,
 
 	// Must read latest value first to preserve it; use internal getAt to
 	// avoid a recursive dbMu.RLock() while we already hold it.
-	val, err := s.getAt(ctx, key, commitTS)
+	val, err := s.getAt(ctx, key, commitTS, nil)
 	if err != nil {
 		return err
 	}

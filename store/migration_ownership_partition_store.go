@@ -57,7 +57,7 @@ func (s *mvccStore) partitionConfigurationLocked() (uint64, error) {
 }
 
 func (s *pebbleStore) partitionConfigurationLocked(ctx context.Context) (uint64, error) {
-	return partitionConfiguration(s.getAt(ctx, MigrationConfigurationIndexKey(), ^uint64(0)))
+	return partitionConfiguration(s.getAt(ctx, MigrationConfigurationIndexKey(), ^uint64(0), nil))
 }
 
 func (s *mvccStore) syncPartitionJobLocked(updated []MigrationOwnershipState, requested MigrationOwnershipState, operation MigrationOwnershipOperation, index uint64) (MigrationOwnershipPartitionState, error) {

@@ -24,7 +24,8 @@ type Server struct {
 	// proposal through completion. This closes the window where a concurrent
 	// membership RPC could mutate encryption metadata before the engine exposes
 	// the first request's pending configuration change in Status.
-	membershipMu sync.Mutex
+	membershipMu      sync.Mutex
+	versionCASCapable bool
 
 	pb.UnimplementedRaftAdminServer
 }
@@ -38,12 +39,13 @@ func NewServer(engine raftengine.Engine) *Server {
 // conf-change. See [MembershipChangeInterceptor]. Passing nil is
 // equivalent to [NewServer] — the pre-step is skipped and the
 // conf-change runs exactly as the pre-7c posture.
-func NewServerWithInterceptor(engine raftengine.Engine, interceptor MembershipChangeInterceptor) *Server {
+func NewServerWithInterceptor(engine raftengine.Engine, interceptor MembershipChangeInterceptor, versionCASCapable ...bool) *Server {
 	admin, _ := any(engine).(raftengine.Admin)
 	return &Server{
-		engine:      engine,
-		admin:       admin,
-		interceptor: interceptor,
+		engine:            engine,
+		admin:             admin,
+		interceptor:       interceptor,
+		versionCASCapable: len(versionCASCapable) != 0 && versionCASCapable[0],
 	}
 }
 
@@ -66,6 +68,7 @@ func (s *Server) Status(context.Context, *pb.RaftAdminStatusRequest) (*pb.RaftAd
 		LastContactNanos:   current.LastContact.Nanoseconds(),
 		ConfigurationIndex: current.ConfigurationIndex,
 		PendingConfChange:  current.PendingConfChange,
+		SupportsVersionCas: s.versionCASCapable && current.State != raftengine.StateShutdown,
 	}, nil
 }
 

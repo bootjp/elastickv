@@ -27,6 +27,7 @@ import (
 	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/peersession"
+	"github.com/bootjp/elastickv/internal/raftadmin"
 	"github.com/bootjp/elastickv/internal/raftadmission"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -198,7 +199,7 @@ func multiEnablementStartMember(t *testing.T, base string, identity *multiEnable
 	process.eg, process.ctx = errgroup.WithContext(process.ctx)
 	options := append([]grpc.ServerOption{}, runtime.TransportServerOptions...)
 	if protected {
-		options = append(options, multiEnablementNetwork(t, process, routes, clock)...)
+		options = append(options, multiEnablementNetwork(t, process, routes, clock, base, identity.id)...)
 	}
 	process.server = grpc.NewServer(options...)
 	clusterbootstrap.RuntimeCore(runtime).RegisterGRPC(process.server)
@@ -209,7 +210,7 @@ func multiEnablementStartMember(t *testing.T, base string, identity *multiEnable
 	return process
 }
 
-func multiEnablementNetwork(t *testing.T, process *multiEnablementProcess, routes *distribution.Engine, clock *kv.HLC) []grpc.ServerOption {
+func multiEnablementNetwork(t *testing.T, process *multiEnablementProcess, routes *distribution.Engine, clock *kv.HLC, base, raftID string) []grpc.ServerOption {
 	t.Helper()
 	id := process.runtime.Spec.ID
 	groups := map[uint64]*kv.ShardGroup{id: process.shard}
@@ -218,6 +219,12 @@ func multiEnablementNetwork(t *testing.T, process *multiEnablementProcess, route
 	network, err := clusterbootstrap.ConfigureBootstrapNetwork(process.ctx, []*clusterbootstrap.GroupRuntime{process.runtime}, process.shards, groups, &process.cleanup)
 	require.NoError(t, err)
 	require.NotNil(t, network, "ordinary forwarding must use the actual runtime-scoped pinned TLS factory")
+	flags := defaultServerFlags()
+	flags.raft.id, flags.raft.dataDir = raftID, base
+	flags.consistency.versionCAS = true
+	flags.consistency.commitTSFence = true
+	require.NoError(t, configureVersionCAS(flags, noderuntime.RuntimeConfig{Groups: []noderuntime.GroupSpec{process.runtime.Spec}},
+		[]*clusterbootstrap.GroupRuntime{process.runtime}, groups, &process.cleanup))
 	process.coordinate = kv.NewShardedCoordinator(routes, groups, id, clock, process.shards).WithOperationAdmission(process.domain.OperationAdmission)
 	catalog := distributionCatalogStoreForGroup([]*clusterbootstrap.GroupRuntime{process.runtime}, id)
 	clusterbootstrap.StartBootstrapReadinessReconciler(process.ctx, process.eg, []*clusterbootstrap.GroupRuntime{process.runtime}, catalog, routes)
@@ -237,10 +244,11 @@ func multiEnablementServices(process *multiEnablementProcess, clock *kv.HLC) {
 	pb.RegisterRawKVServer(process.server, service)
 	pb.RegisterTransactionalKVServer(process.server, service)
 	proposer := process.shard.Proposer()
-	process.transaction = adapter.NewInternalMigrationTransaction(proposer, nil, process.runtime.Store, process.runtime.Spec.ID)
+	process.transaction = adapter.NewInternalMigrationTransaction(proposer, nil, process.runtime.Store, process.runtime.Spec.ID, kv.WithVersionCASAdmission(process.runtime.VersionCASAdmission))
 	options := internalServerOptions(coordinate, nil, proposer, process.shard, process.runtime.Spec.ID)
 	options = append(options, adapter.WithInternalStore(process.runtime.Store), adapter.WithInternalPrimaryCommitEvidence(process.shards))
 	pb.RegisterInternalServer(process.server, adapter.NewInternalWithEngine(process.transaction, process.runtime.Engine, clock, nil, options...))
+	pb.RegisterRaftAdminServer(process.server, raftadmin.NewServerWithInterceptor(process.runtime.Engine, nil, process.runtime.VersionCASCapable))
 }
 
 func multiEnablementStop(t *testing.T, processes []*multiEnablementProcess) {
@@ -513,8 +521,12 @@ func multiEnablementRun(t *testing.T, lagging bool) {
 	}
 	leader := multiEnablementLeader(t, protected)
 	for _, process := range protected {
-		_, err := kv.LoadAppliedBootstrapPolicy(t.Context(), process.runtime.Store, manifest.Identity, process.runtime.Engine.Status().AppliedIndex)
-		require.ErrorIs(t, err, store.ErrKeyNotFound, "no activation worker has started")
+		// Followers can still be publishing their applied index after election.
+		// Read the policy at a matching durable and published index.
+		require.EventuallyWithT(t, func(check *assert.CollectT) {
+			_, err := kv.LoadAppliedBootstrapPolicy(t.Context(), process.runtime.Store, manifest.Identity, process.runtime.Engine.Status().AppliedIndex)
+			require.ErrorIs(check, err, store.ErrKeyNotFound, "no activation worker has started")
+		}, bootstrapE2EWaitTimeout, 10*time.Millisecond)
 	}
 	clusterbootstrap.StartBootstrapActivationWorkers(leader.ctx, leader.eg, []*clusterbootstrap.GroupRuntime{leader.runtime}, map[uint64]*kv.ShardGroup{1: leader.shard})
 	activation := multiEnablementAssertActivePolicy(t, protected, manifest)
@@ -526,6 +538,9 @@ func multiEnablementRun(t *testing.T, lagging bool) {
 		multiEnablementReplicatedRead(t, process, "protected-key", "replicated-protected")
 	}
 	multiEnablementFollowerForward(t, protected, leader)
+	if !lagging {
+		multiEnablementVersionCAS(t, protected, leader)
+	}
 	if lagging {
 		multiEnablementActiveSnapshotRestart(t, base, identities, protected, manifest, activation)
 	}

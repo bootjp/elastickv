@@ -110,7 +110,7 @@ func (s *pebbleStore) chunkBlobWrittenAtLocked(ctx context.Context, key []byte) 
 		if !bytes.Equal(userKey, key) {
 			continue
 		}
-		_, err := s.readVisibleVersion(it, key, math.MaxUint64)
+		_, err := s.readVisibleVersion(it, key, math.MaxUint64, nil)
 		if errors.Is(err, ErrKeyNotFound) {
 			return 0, false, nil
 		}

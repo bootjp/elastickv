@@ -273,13 +273,14 @@ var RawKV_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	TransactionalKV_Put_FullMethodName      = "/TransactionalKV/Put"
-	TransactionalKV_Get_FullMethodName      = "/TransactionalKV/Get"
-	TransactionalKV_Delete_FullMethodName   = "/TransactionalKV/Delete"
-	TransactionalKV_Scan_FullMethodName     = "/TransactionalKV/Scan"
-	TransactionalKV_PreWrite_FullMethodName = "/TransactionalKV/PreWrite"
-	TransactionalKV_Commit_FullMethodName   = "/TransactionalKV/Commit"
-	TransactionalKV_Rollback_FullMethodName = "/TransactionalKV/Rollback"
+	TransactionalKV_Put_FullMethodName            = "/TransactionalKV/Put"
+	TransactionalKV_Get_FullMethodName            = "/TransactionalKV/Get"
+	TransactionalKV_CompareAndSwap_FullMethodName = "/TransactionalKV/CompareAndSwap"
+	TransactionalKV_Delete_FullMethodName         = "/TransactionalKV/Delete"
+	TransactionalKV_Scan_FullMethodName           = "/TransactionalKV/Scan"
+	TransactionalKV_PreWrite_FullMethodName       = "/TransactionalKV/PreWrite"
+	TransactionalKV_Commit_FullMethodName         = "/TransactionalKV/Commit"
+	TransactionalKV_Rollback_FullMethodName       = "/TransactionalKV/Rollback"
 )
 
 // TransactionalKVClient is the client API for TransactionalKV service.
@@ -288,6 +289,7 @@ const (
 type TransactionalKVClient interface {
 	Put(ctx context.Context, in *PutRequest, opts ...grpc.CallOption) (*PutResponse, error)
 	Get(ctx context.Context, in *GetRequest, opts ...grpc.CallOption) (*GetResponse, error)
+	CompareAndSwap(ctx context.Context, in *CompareAndSwapRequest, opts ...grpc.CallOption) (*CompareAndSwapResponse, error)
 	Delete(ctx context.Context, in *DeleteRequest, opts ...grpc.CallOption) (*DeleteResponse, error)
 	Scan(ctx context.Context, in *ScanRequest, opts ...grpc.CallOption) (*ScanResponse, error)
 	PreWrite(ctx context.Context, in *PreWriteRequest, opts ...grpc.CallOption) (*PreCommitResponse, error)
@@ -317,6 +319,16 @@ func (c *transactionalKVClient) Get(ctx context.Context, in *GetRequest, opts ..
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetResponse)
 	err := c.cc.Invoke(ctx, TransactionalKV_Get_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *transactionalKVClient) CompareAndSwap(ctx context.Context, in *CompareAndSwapRequest, opts ...grpc.CallOption) (*CompareAndSwapResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CompareAndSwapResponse)
+	err := c.cc.Invoke(ctx, TransactionalKV_CompareAndSwap_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -379,6 +391,7 @@ func (c *transactionalKVClient) Rollback(ctx context.Context, in *RollbackReques
 type TransactionalKVServer interface {
 	Put(context.Context, *PutRequest) (*PutResponse, error)
 	Get(context.Context, *GetRequest) (*GetResponse, error)
+	CompareAndSwap(context.Context, *CompareAndSwapRequest) (*CompareAndSwapResponse, error)
 	Delete(context.Context, *DeleteRequest) (*DeleteResponse, error)
 	Scan(context.Context, *ScanRequest) (*ScanResponse, error)
 	PreWrite(context.Context, *PreWriteRequest) (*PreCommitResponse, error)
@@ -399,6 +412,9 @@ func (UnimplementedTransactionalKVServer) Put(context.Context, *PutRequest) (*Pu
 }
 func (UnimplementedTransactionalKVServer) Get(context.Context, *GetRequest) (*GetResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Get not implemented")
+}
+func (UnimplementedTransactionalKVServer) CompareAndSwap(context.Context, *CompareAndSwapRequest) (*CompareAndSwapResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CompareAndSwap not implemented")
 }
 func (UnimplementedTransactionalKVServer) Delete(context.Context, *DeleteRequest) (*DeleteResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Delete not implemented")
@@ -468,6 +484,24 @@ func _TransactionalKV_Get_Handler(srv interface{}, ctx context.Context, dec func
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(TransactionalKVServer).Get(ctx, req.(*GetRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _TransactionalKV_CompareAndSwap_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CompareAndSwapRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TransactionalKVServer).CompareAndSwap(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: TransactionalKV_CompareAndSwap_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TransactionalKVServer).CompareAndSwap(ctx, req.(*CompareAndSwapRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -576,6 +610,10 @@ var TransactionalKV_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Get",
 			Handler:    _TransactionalKV_Get_Handler,
+		},
+		{
+			MethodName: "CompareAndSwap",
+			Handler:    _TransactionalKV_CompareAndSwap_Handler,
 		},
 		{
 			MethodName: "Delete",

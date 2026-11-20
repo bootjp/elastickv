@@ -70,15 +70,6 @@ func requestScanGroupKeysAt(ctx context.Context, backend any, groupID uint64, st
 	return wrappedReadResult(request.ScanGroupKeys(requestReadContext(ctx, request), snapshot, groupID, start, end, limit))
 }
 
-func requestGetAtWithReadFence(ctx context.Context, backend any, key []byte, ts uint64, groupID uint64, readRouteVersion uint64) ([]byte, error) {
-	request, snapshot, closeRead, err := requestReadSnapshot(ctx, backend, ts)
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-	defer closeRead()
-	return wrappedReadResult(request.GetWithFence(requestReadContext(ctx, request), snapshot, key, groupID, readRouteVersion))
-}
-
 func requestScanKeysAtWithReadFence(ctx context.Context, backend any, start []byte, end []byte, limit int, ts uint64, groupID uint64, readRouteVersion uint64) ([][]byte, error) {
 	request, snapshot, closeRead, err := requestReadSnapshot(ctx, backend, ts)
 	if err != nil {

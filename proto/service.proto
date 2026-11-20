@@ -13,6 +13,7 @@ service RawKV {
 service TransactionalKV {
   rpc Put(PutRequest) returns (PutResponse) {}
   rpc Get(GetRequest) returns (GetResponse) {}
+  rpc CompareAndSwap(CompareAndSwapRequest) returns (CompareAndSwapResponse) {}
   rpc Delete(DeleteRequest) returns (DeleteResponse) {}
   rpc Scan(ScanRequest) returns (ScanResponse) {}
 
@@ -51,12 +52,17 @@ message RawGetRequest {
   uint64 ts = 3; // optional read timestamp; if zero, server uses current HLC
   uint64 group_id = 4; // optional explicit Raft group for non-range-owned keyspaces
   uint64 read_route_version = 5; // stamped by server-side routing for migration read fences
+  bool need_commit_ts = 6;
 }
 
 message RawGetResponse {
   uint64 read_at_index = 1;
   bytes value = 2;
   bool exists = 3;
+  oneof version {
+    uint64 commit_ts = 4;
+    bool missing = 5;
+  }
 }
 
 message RawDeleteRequest {
@@ -151,11 +157,32 @@ message DeleteResponse {
 
 message GetRequest {
   bytes key = 1;
+  // Return the commit timestamp of the record that supplied the value.
+  bool need_commit_ts = 2;
 }
 
 message GetResponse {
   uint64 read_at_index = 1;
   bytes value = 2;
+  // Absent on a legacy response. A live value may have zero bytes.
+  oneof version {
+    uint64 commit_ts = 3;
+    bool missing = 4;
+  }
+}
+
+message CompareAndSwapRequest {
+  bytes key = 1;
+  // A positive commit timestamp previously observed for this live key.
+  uint64 expected_commit_ts = 2;
+  bytes value = 3;
+}
+
+message CompareAndSwapResponse {
+  oneof result {
+    uint64 new_commit_ts = 1;
+    bool mismatch = 2;
+  }
 }
 
 message KeyError {
@@ -237,6 +264,7 @@ message RaftAdminStatusResponse {
   int64 last_contact_nanos = 11;
   uint64 configuration_index = 12;
   bool pending_conf_change = 13;
+  bool supports_version_cas = 14;
 }
 
 message RaftAdminConfigurationRequest {}

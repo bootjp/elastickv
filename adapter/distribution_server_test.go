@@ -1847,7 +1847,7 @@ func coordinatorStubMutation(elem *kv.Elem[kv.OP], commitTS uint64) (*store.KVPa
 			Op:  store.OpTypeDelete,
 			Key: distribution.CloneBytes(elem.Key),
 		}, nil
-	case kv.DelPrefix:
+	case kv.DelPrefix, kv.CompareAndSwap:
 		return nil, kv.ErrInvalidRequest
 	default:
 		return nil, kv.ErrInvalidRequest

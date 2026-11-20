@@ -20,7 +20,15 @@ type NopCoordinator struct {
 	clock *kv.HLC
 }
 
-func (*NopCoordinator) Dispatch(context.Context, *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
+func (*NopCoordinator) Dispatch(_ context.Context, req *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
+	if req == nil {
+		return &kv.CoordinateResponse{}, nil
+	}
+	for _, elem := range req.Elems {
+		if elem != nil && (elem.Op == kv.CompareAndSwap || elem.ExpectedCommitTS != 0) {
+			return nil, errors.WithStack(kv.ErrVersionCASUnavailable)
+		}
+	}
 	return &kv.CoordinateResponse{}, nil
 }
 func (*NopCoordinator) IsLeader() bool                                   { return true }
@@ -160,11 +168,16 @@ func operationShape(elems []*kv.Elem[kv.OP]) (bool, bool, error) {
 		if elem == nil {
 			continue
 		}
+		if elem.ExpectedCommitTS != 0 {
+			return false, false, errors.WithStack(kv.ErrVersionCASUnavailable)
+		}
 		switch elem.Op {
 		case kv.Put, kv.Del:
 			points = true
 		case kv.DelPrefix:
 			prefixes = true
+		case kv.CompareAndSwap:
+			return false, false, errors.WithStack(kv.ErrVersionCASUnavailable)
 		default:
 			return false, false, errors.WithStack(store.ErrUnknownOp)
 		}
@@ -275,6 +288,8 @@ func (c *LocalCoordinator) applyOCC(ctx context.Context, req *kv.OperationGroup[
 			mutations = append(mutations, &store.KVPairMutation{Op: store.OpTypeDelete, Key: elem.Key})
 		case kv.DelPrefix:
 			// PrefixIgnore was validated before entering this path.
+		case kv.CompareAndSwap:
+			return errors.WithStack(kv.ErrVersionCASUnavailable)
 		}
 	}
 	var reads [][]byte
@@ -296,6 +311,8 @@ func (c *LocalCoordinator) applySequential(ctx context.Context, elems []*kv.Elem
 			if c.options.DelPrefix == PrefixApply {
 				err = c.st.DeletePrefixAt(ctx, elem.Key, nil, ts)
 			}
+		case kv.CompareAndSwap:
+			return errors.WithStack(kv.ErrVersionCASUnavailable)
 		}
 		if err != nil {
 			return errors.Wrap(err, "apply local operation")

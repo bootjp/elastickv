@@ -12,6 +12,7 @@ const (
 	// DelPrefix deletes all visible keys matching the prefix stored in Key.
 	// An empty Key means "all keys". Transaction-internal keys are excluded.
 	DelPrefix
+	CompareAndSwap
 )
 
 // ObservedRouteVersionZero encodes a transaction pinned to catalog version 0.
@@ -57,6 +58,8 @@ type Elem[T OP] struct {
 	// RequireAbsent is an apply-time precondition for a capability-gated,
 	// single-owner TTL-inline relocation. Tombstones also count as present.
 	RequireAbsent bool
+	// ExpectedCommitTS is the exact live version required by CompareAndSwap.
+	ExpectedCommitTS uint64
 	// CommitTSValueOffset, when non-zero, asks the coordinator or forwarded
 	// leader to stamp the resolved transaction commit timestamp into Value at
 	// this byte offset before committing the mutation.

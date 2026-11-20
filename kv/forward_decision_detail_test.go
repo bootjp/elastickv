@@ -32,18 +32,20 @@ func TestForwardDecisionStatusAllowedPairs(t *testing.T) {
 		leader   = pb.ForwardFailureReason_FORWARD_FAILURE_REASON_NO_LEADER
 		broken   = pb.ForwardFailureReason_FORWARD_FAILURE_REASON_INTERRUPTED
 		aborted  = pb.ForwardFailureReason_FORWARD_FAILURE_REASON_ABORTED
+		mismatch = pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CAS_MISMATCH
+		locked   = pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CAS_LOCKED
 		reject   = pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_REJECTED_BEFORE_SUBMISSION
 		settled  = pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_DEFINITIVELY_ABORTED
 		unknown  = pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN
 	)
 	allowed := map[pb.ForwardFailurePhase]map[pb.ForwardDecisionClass][]pb.ForwardFailureReason{
-		one:     {reject: {leader, fence}, settled: {conflict, fence}, unknown: {conflict, fence, leader, broken}},
+		one:     {reject: {leader, fence}, settled: {conflict, fence, mismatch, locked}, unknown: {conflict, fence, leader, broken}},
 		prepare: {settled: {aborted}, unknown: {conflict, fence, leader, broken}},
 		commit:  {settled: {aborted}, unknown: {conflict, fence, leader, broken}},
 		abort:   {settled: {aborted}, unknown: {conflict, fence, leader, broken}},
 	}
 	phases := []pb.ForwardFailurePhase{0, one, prepare, commit, abort, 99}
-	reasons := []pb.ForwardFailureReason{0, conflict, fence, leader, broken, aborted, 99}
+	reasons := []pb.ForwardFailureReason{0, conflict, fence, leader, broken, aborted, mismatch, locked, 99}
 	decisions := []pb.ForwardDecisionClass{0, reject, settled, unknown, 99}
 	for _, phase := range phases {
 		for _, reason := range reasons {

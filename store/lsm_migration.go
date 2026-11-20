@@ -418,9 +418,21 @@ func (s *pebbleStore) validatePebbleImportBatch(opts ImportVersionsOptions) (boo
 }
 
 func (s *pebbleStore) commitPebbleImportBatch(opts ImportVersionsOptions, batchMax uint64, writeOpts *pebble.WriteOptions, gateRegistration bool) error {
+	writes := opts.Versions
+	if !opts.AllowLegacyVersionOverwrite {
+		var err error
+		lookup := s.lookupMigrationHead
+		if gateRegistration {
+			lookup = s.lookupMigrationVersion
+		}
+		writes, err = immutableMigrationWrites(writes, opts.LogicalKey, lookup)
+		if err != nil {
+			return err
+		}
+	}
 	batch := s.db.NewBatch()
 	defer batch.Close()
-	if err := s.applyImportVersionsBatch(batch, opts.Versions, gateRegistration); err != nil {
+	if err := s.applyImportVersionsBatch(batch, writes, gateRegistration); err != nil {
 		return err
 	}
 	if err := s.stageMigrationImportAck(batch, opts.JobID, opts.BracketID, migrationImportAck{

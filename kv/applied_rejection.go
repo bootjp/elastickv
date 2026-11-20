@@ -30,6 +30,10 @@ func singleRequestApplyVerdict(req *pb.Request, requestCount int, commitIndex ui
 		(req.Phase != pb.Phase_NONE && req.Phase != pb.Phase_PREPARE) {
 		return false
 	}
+	if errors.Is(err, ErrCASMismatch) || errors.Is(err, ErrVersionCASUnavailable) {
+		reqs := []*pb.Request{req}
+		return HasCASMutation(reqs) && ValidateCASProposalShape(reqs) == nil
+	}
 	return recognizedApplyVerdict(err)
 }
 

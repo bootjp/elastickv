@@ -7,6 +7,7 @@ import (
 	"github.com/bootjp/elastickv/internal/encryption/fsmwire"
 	"github.com/bootjp/elastickv/internal/raftadmission"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
@@ -166,13 +167,15 @@ func validateBootstrapDataPayload(payload []byte) error {
 	if _, matched, err := kv.DecodeWatermarkAdvance(payload); matched {
 		return errors.Wrap(err, "decode data read watermark")
 	}
+	if bytes.Equal(payload, kv.EncodeMigrationVersionIdentityActivation()) {
+		return nil
+	}
+	if raftengine.IsVersionCASRaftPayload(payload) {
+		return validateBootstrapVersionCASPayload(payload[len(raftengine.VersionCASFrame):])
+	}
 	switch payload[0] {
 	case BootstrapPayloadSingle:
-		var request pb.Request
-		if err := decodeBootstrapAdmissionProto(payload[1:], &request); err != nil {
-			return err
-		}
-		return validateBootstrapKVRequest(&request)
+		return validateBootstrapKVSingle(payload[1:])
 	case BootstrapPayloadBatch:
 		return validateBootstrapKVBatch(payload[1:])
 	case BootstrapPayloadBackup:
@@ -184,12 +187,38 @@ func validateBootstrapDataPayload(payload []byte) error {
 	}
 }
 
+func validateBootstrapKVSingle(body []byte) error {
+	var request pb.Request
+	if err := decodeBootstrapAdmissionProto(body, &request); err != nil {
+		return err
+	}
+	if kv.HasCASMutation([]*pb.Request{&request}) {
+		return errors.WithStack(ErrBootstrapAdmissionPayload)
+	}
+	return validateBootstrapKVRequest(&request)
+}
+
+func validateBootstrapVersionCASPayload(body []byte) error {
+	var request pb.Request
+	if err := decodeBootstrapAdmissionProto(body, &request); err != nil {
+		return err
+	}
+	reqs := []*pb.Request{&request}
+	if !kv.HasCASMutation(reqs) {
+		return errors.WithStack(ErrBootstrapAdmissionPayload)
+	}
+	if err := kv.ValidateCASProposalShape(reqs); err != nil {
+		return errors.WithStack(err)
+	}
+	return validateBootstrapKVRequest(&request)
+}
+
 func validateBootstrapKVBatch(payload []byte) error {
 	var command pb.RaftCommand
 	if err := decodeBootstrapAdmissionProto(payload, &command); err != nil {
 		return err
 	}
-	if len(command.Requests) == 0 {
+	if len(command.Requests) == 0 || kv.HasCASMutation(command.Requests) {
 		return errors.WithStack(ErrBootstrapAdmissionPayload)
 	}
 	for _, request := range command.Requests {

@@ -13,8 +13,8 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-func NewInternalMigrationTransaction(proposer raftengine.Proposer, observer kv.ProposalObserver, st store.MVCCStore, groupID uint64) *kv.TransactionManager {
-	opts := []kv.TransactionOption{kv.WithProposalObserver(observer)}
+func NewInternalMigrationTransaction(proposer raftengine.Proposer, observer kv.ProposalObserver, st store.MVCCStore, groupID uint64, opts ...kv.TransactionOption) *kv.TransactionManager {
+	opts = append(opts, kv.WithProposalObserver(observer))
 	if groupID != 0 {
 		opts = append(opts, kv.WithMigrationRequestAdmission(st, groupID))
 	}

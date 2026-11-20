@@ -50,6 +50,7 @@ func RegisterOperationalServicesWithInterceptorAndStaticServing(
 	leaderServiceNames []string,
 	staticServingServiceNames []string,
 	interceptor MembershipChangeInterceptor,
+	versionCASCapable ...bool,
 ) {
 	if gs == nil {
 		return
@@ -58,7 +59,7 @@ func RegisterOperationalServicesWithInterceptorAndStaticServing(
 		panic("raftadmin: RegisterOperationalServices requires non-nil context")
 	}
 
-	pb.RegisterRaftAdminServer(gs, NewServerWithInterceptor(engine, interceptor))
+	pb.RegisterRaftAdminServer(gs, NewServerWithInterceptor(engine, interceptor, versionCASCapable...))
 
 	healthSrv := health.NewServer()
 	healthpb.RegisterHealthServer(gs, healthSrv)

@@ -186,6 +186,7 @@ type RawGetRequest struct {
 	Ts               uint64                 `protobuf:"varint,3,opt,name=ts,proto3" json:"ts,omitempty"`                                                       // optional read timestamp; if zero, server uses current HLC
 	GroupId          uint64                 `protobuf:"varint,4,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`                              // optional explicit Raft group for non-range-owned keyspaces
 	ReadRouteVersion uint64                 `protobuf:"varint,5,opt,name=read_route_version,json=readRouteVersion,proto3" json:"read_route_version,omitempty"` // stamped by server-side routing for migration read fences
+	NeedCommitTs     bool                   `protobuf:"varint,6,opt,name=need_commit_ts,json=needCommitTs,proto3" json:"need_commit_ts,omitempty"`
 	unknownFields    protoimpl.UnknownFields
 	sizeCache        protoimpl.SizeCache
 }
@@ -248,11 +249,23 @@ func (x *RawGetRequest) GetReadRouteVersion() uint64 {
 	return 0
 }
 
+func (x *RawGetRequest) GetNeedCommitTs() bool {
+	if x != nil {
+		return x.NeedCommitTs
+	}
+	return false
+}
+
 type RawGetResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	ReadAtIndex   uint64                 `protobuf:"varint,1,opt,name=read_at_index,json=readAtIndex,proto3" json:"read_at_index,omitempty"`
-	Value         []byte                 `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
-	Exists        bool                   `protobuf:"varint,3,opt,name=exists,proto3" json:"exists,omitempty"`
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	ReadAtIndex uint64                 `protobuf:"varint,1,opt,name=read_at_index,json=readAtIndex,proto3" json:"read_at_index,omitempty"`
+	Value       []byte                 `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
+	Exists      bool                   `protobuf:"varint,3,opt,name=exists,proto3" json:"exists,omitempty"`
+	// Types that are valid to be assigned to Version:
+	//
+	//	*RawGetResponse_CommitTs
+	//	*RawGetResponse_Missing
+	Version       isRawGetResponse_Version `protobuf_oneof:"version"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -307,6 +320,47 @@ func (x *RawGetResponse) GetExists() bool {
 	}
 	return false
 }
+
+func (x *RawGetResponse) GetVersion() isRawGetResponse_Version {
+	if x != nil {
+		return x.Version
+	}
+	return nil
+}
+
+func (x *RawGetResponse) GetCommitTs() uint64 {
+	if x != nil {
+		if x, ok := x.Version.(*RawGetResponse_CommitTs); ok {
+			return x.CommitTs
+		}
+	}
+	return 0
+}
+
+func (x *RawGetResponse) GetMissing() bool {
+	if x != nil {
+		if x, ok := x.Version.(*RawGetResponse_Missing); ok {
+			return x.Missing
+		}
+	}
+	return false
+}
+
+type isRawGetResponse_Version interface {
+	isRawGetResponse_Version()
+}
+
+type RawGetResponse_CommitTs struct {
+	CommitTs uint64 `protobuf:"varint,4,opt,name=commit_ts,json=commitTs,proto3,oneof"`
+}
+
+type RawGetResponse_Missing struct {
+	Missing bool `protobuf:"varint,5,opt,name=missing,proto3,oneof"`
+}
+
+func (*RawGetResponse_CommitTs) isRawGetResponse_Version() {}
+
+func (*RawGetResponse_Missing) isRawGetResponse_Version() {}
 
 type RawDeleteRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -1035,8 +1089,10 @@ func (x *DeleteResponse) GetSuccess() bool {
 }
 
 type GetRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Key           []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Key   []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	// Return the commit timestamp of the record that supplied the value.
+	NeedCommitTs  bool `protobuf:"varint,2,opt,name=need_commit_ts,json=needCommitTs,proto3" json:"need_commit_ts,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1078,10 +1134,24 @@ func (x *GetRequest) GetKey() []byte {
 	return nil
 }
 
+func (x *GetRequest) GetNeedCommitTs() bool {
+	if x != nil {
+		return x.NeedCommitTs
+	}
+	return false
+}
+
 type GetResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	ReadAtIndex   uint64                 `protobuf:"varint,1,opt,name=read_at_index,json=readAtIndex,proto3" json:"read_at_index,omitempty"`
-	Value         []byte                 `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	ReadAtIndex uint64                 `protobuf:"varint,1,opt,name=read_at_index,json=readAtIndex,proto3" json:"read_at_index,omitempty"`
+	Value       []byte                 `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
+	// Absent on a legacy response. A live value may have zero bytes.
+	//
+	// Types that are valid to be assigned to Version:
+	//
+	//	*GetResponse_CommitTs
+	//	*GetResponse_Missing
+	Version       isGetResponse_Version `protobuf_oneof:"version"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1130,6 +1200,190 @@ func (x *GetResponse) GetValue() []byte {
 	return nil
 }
 
+func (x *GetResponse) GetVersion() isGetResponse_Version {
+	if x != nil {
+		return x.Version
+	}
+	return nil
+}
+
+func (x *GetResponse) GetCommitTs() uint64 {
+	if x != nil {
+		if x, ok := x.Version.(*GetResponse_CommitTs); ok {
+			return x.CommitTs
+		}
+	}
+	return 0
+}
+
+func (x *GetResponse) GetMissing() bool {
+	if x != nil {
+		if x, ok := x.Version.(*GetResponse_Missing); ok {
+			return x.Missing
+		}
+	}
+	return false
+}
+
+type isGetResponse_Version interface {
+	isGetResponse_Version()
+}
+
+type GetResponse_CommitTs struct {
+	CommitTs uint64 `protobuf:"varint,3,opt,name=commit_ts,json=commitTs,proto3,oneof"`
+}
+
+type GetResponse_Missing struct {
+	Missing bool `protobuf:"varint,4,opt,name=missing,proto3,oneof"`
+}
+
+func (*GetResponse_CommitTs) isGetResponse_Version() {}
+
+func (*GetResponse_Missing) isGetResponse_Version() {}
+
+type CompareAndSwapRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Key   []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	// A positive commit timestamp previously observed for this live key.
+	ExpectedCommitTs uint64 `protobuf:"varint,2,opt,name=expected_commit_ts,json=expectedCommitTs,proto3" json:"expected_commit_ts,omitempty"`
+	Value            []byte `protobuf:"bytes,3,opt,name=value,proto3" json:"value,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
+}
+
+func (x *CompareAndSwapRequest) Reset() {
+	*x = CompareAndSwapRequest{}
+	mi := &file_service_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CompareAndSwapRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CompareAndSwapRequest) ProtoMessage() {}
+
+func (x *CompareAndSwapRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_service_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CompareAndSwapRequest.ProtoReflect.Descriptor instead.
+func (*CompareAndSwapRequest) Descriptor() ([]byte, []int) {
+	return file_service_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *CompareAndSwapRequest) GetKey() []byte {
+	if x != nil {
+		return x.Key
+	}
+	return nil
+}
+
+func (x *CompareAndSwapRequest) GetExpectedCommitTs() uint64 {
+	if x != nil {
+		return x.ExpectedCommitTs
+	}
+	return 0
+}
+
+func (x *CompareAndSwapRequest) GetValue() []byte {
+	if x != nil {
+		return x.Value
+	}
+	return nil
+}
+
+type CompareAndSwapResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Types that are valid to be assigned to Result:
+	//
+	//	*CompareAndSwapResponse_NewCommitTs
+	//	*CompareAndSwapResponse_Mismatch
+	Result        isCompareAndSwapResponse_Result `protobuf_oneof:"result"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CompareAndSwapResponse) Reset() {
+	*x = CompareAndSwapResponse{}
+	mi := &file_service_proto_msgTypes[18]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CompareAndSwapResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CompareAndSwapResponse) ProtoMessage() {}
+
+func (x *CompareAndSwapResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_service_proto_msgTypes[18]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CompareAndSwapResponse.ProtoReflect.Descriptor instead.
+func (*CompareAndSwapResponse) Descriptor() ([]byte, []int) {
+	return file_service_proto_rawDescGZIP(), []int{18}
+}
+
+func (x *CompareAndSwapResponse) GetResult() isCompareAndSwapResponse_Result {
+	if x != nil {
+		return x.Result
+	}
+	return nil
+}
+
+func (x *CompareAndSwapResponse) GetNewCommitTs() uint64 {
+	if x != nil {
+		if x, ok := x.Result.(*CompareAndSwapResponse_NewCommitTs); ok {
+			return x.NewCommitTs
+		}
+	}
+	return 0
+}
+
+func (x *CompareAndSwapResponse) GetMismatch() bool {
+	if x != nil {
+		if x, ok := x.Result.(*CompareAndSwapResponse_Mismatch); ok {
+			return x.Mismatch
+		}
+	}
+	return false
+}
+
+type isCompareAndSwapResponse_Result interface {
+	isCompareAndSwapResponse_Result()
+}
+
+type CompareAndSwapResponse_NewCommitTs struct {
+	NewCommitTs uint64 `protobuf:"varint,1,opt,name=new_commit_ts,json=newCommitTs,proto3,oneof"`
+}
+
+type CompareAndSwapResponse_Mismatch struct {
+	Mismatch bool `protobuf:"varint,2,opt,name=mismatch,proto3,oneof"`
+}
+
+func (*CompareAndSwapResponse_NewCommitTs) isCompareAndSwapResponse_Result() {}
+
+func (*CompareAndSwapResponse_Mismatch) isCompareAndSwapResponse_Result() {}
+
 type KeyError struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Message       string                 `protobuf:"bytes,1,opt,name=message,proto3" json:"message,omitempty"`
@@ -1140,7 +1394,7 @@ type KeyError struct {
 
 func (x *KeyError) Reset() {
 	*x = KeyError{}
-	mi := &file_service_proto_msgTypes[17]
+	mi := &file_service_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1152,7 +1406,7 @@ func (x *KeyError) String() string {
 func (*KeyError) ProtoMessage() {}
 
 func (x *KeyError) ProtoReflect() protoreflect.Message {
-	mi := &file_service_proto_msgTypes[17]
+	mi := &file_service_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1165,7 +1419,7 @@ func (x *KeyError) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use KeyError.ProtoReflect.Descriptor instead.
 func (*KeyError) Descriptor() ([]byte, []int) {
-	return file_service_proto_rawDescGZIP(), []int{17}
+	return file_service_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *KeyError) GetMessage() string {
@@ -1193,7 +1447,7 @@ type Kv struct {
 
 func (x *Kv) Reset() {
 	*x = Kv{}
-	mi := &file_service_proto_msgTypes[18]
+	mi := &file_service_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1205,7 +1459,7 @@ func (x *Kv) String() string {
 func (*Kv) ProtoMessage() {}
 
 func (x *Kv) ProtoReflect() protoreflect.Message {
-	mi := &file_service_proto_msgTypes[18]
+	mi := &file_service_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1218,7 +1472,7 @@ func (x *Kv) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Kv.ProtoReflect.Descriptor instead.
 func (*Kv) Descriptor() ([]byte, []int) {
-	return file_service_proto_rawDescGZIP(), []int{18}
+	return file_service_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *Kv) GetError() *KeyError {
@@ -1253,7 +1507,7 @@ type ScanRequest struct {
 
 func (x *ScanRequest) Reset() {
 	*x = ScanRequest{}
-	mi := &file_service_proto_msgTypes[19]
+	mi := &file_service_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1265,7 +1519,7 @@ func (x *ScanRequest) String() string {
 func (*ScanRequest) ProtoMessage() {}
 
 func (x *ScanRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_service_proto_msgTypes[19]
+	mi := &file_service_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1278,7 +1532,7 @@ func (x *ScanRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ScanRequest.ProtoReflect.Descriptor instead.
 func (*ScanRequest) Descriptor() ([]byte, []int) {
-	return file_service_proto_rawDescGZIP(), []int{19}
+	return file_service_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *ScanRequest) GetStartKey() []byte {
@@ -1311,7 +1565,7 @@ type ScanResponse struct {
 
 func (x *ScanResponse) Reset() {
 	*x = ScanResponse{}
-	mi := &file_service_proto_msgTypes[20]
+	mi := &file_service_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1323,7 +1577,7 @@ func (x *ScanResponse) String() string {
 func (*ScanResponse) ProtoMessage() {}
 
 func (x *ScanResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_service_proto_msgTypes[20]
+	mi := &file_service_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1336,7 +1590,7 @@ func (x *ScanResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ScanResponse.ProtoReflect.Descriptor instead.
 func (*ScanResponse) Descriptor() ([]byte, []int) {
-	return file_service_proto_rawDescGZIP(), []int{20}
+	return file_service_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *ScanResponse) GetKv() []*Kv {
@@ -1360,7 +1614,7 @@ type PreWriteRequest struct {
 
 func (x *PreWriteRequest) Reset() {
 	*x = PreWriteRequest{}
-	mi := &file_service_proto_msgTypes[21]
+	mi := &file_service_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1372,7 +1626,7 @@ func (x *PreWriteRequest) String() string {
 func (*PreWriteRequest) ProtoMessage() {}
 
 func (x *PreWriteRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_service_proto_msgTypes[21]
+	mi := &file_service_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1385,7 +1639,7 @@ func (x *PreWriteRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PreWriteRequest.ProtoReflect.Descriptor instead.
 func (*PreWriteRequest) Descriptor() ([]byte, []int) {
-	return file_service_proto_rawDescGZIP(), []int{21}
+	return file_service_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *PreWriteRequest) GetMutations() []*Kv {
@@ -1418,7 +1672,7 @@ type PreCommitResponse struct {
 
 func (x *PreCommitResponse) Reset() {
 	*x = PreCommitResponse{}
-	mi := &file_service_proto_msgTypes[22]
+	mi := &file_service_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1430,7 +1684,7 @@ func (x *PreCommitResponse) String() string {
 func (*PreCommitResponse) ProtoMessage() {}
 
 func (x *PreCommitResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_service_proto_msgTypes[22]
+	mi := &file_service_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1443,7 +1697,7 @@ func (x *PreCommitResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PreCommitResponse.ProtoReflect.Descriptor instead.
 func (*PreCommitResponse) Descriptor() ([]byte, []int) {
-	return file_service_proto_rawDescGZIP(), []int{22}
+	return file_service_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *PreCommitResponse) GetErrors() []*KeyError {
@@ -1464,7 +1718,7 @@ type CommitRequest struct {
 
 func (x *CommitRequest) Reset() {
 	*x = CommitRequest{}
-	mi := &file_service_proto_msgTypes[23]
+	mi := &file_service_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1476,7 +1730,7 @@ func (x *CommitRequest) String() string {
 func (*CommitRequest) ProtoMessage() {}
 
 func (x *CommitRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_service_proto_msgTypes[23]
+	mi := &file_service_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1489,7 +1743,7 @@ func (x *CommitRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CommitRequest.ProtoReflect.Descriptor instead.
 func (*CommitRequest) Descriptor() ([]byte, []int) {
-	return file_service_proto_rawDescGZIP(), []int{23}
+	return file_service_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *CommitRequest) GetStartTs() uint64 {
@@ -1517,7 +1771,7 @@ type CommitResponse struct {
 
 func (x *CommitResponse) Reset() {
 	*x = CommitResponse{}
-	mi := &file_service_proto_msgTypes[24]
+	mi := &file_service_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1529,7 +1783,7 @@ func (x *CommitResponse) String() string {
 func (*CommitResponse) ProtoMessage() {}
 
 func (x *CommitResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_service_proto_msgTypes[24]
+	mi := &file_service_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1542,7 +1796,7 @@ func (x *CommitResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CommitResponse.ProtoReflect.Descriptor instead.
 func (*CommitResponse) Descriptor() ([]byte, []int) {
-	return file_service_proto_rawDescGZIP(), []int{24}
+	return file_service_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *CommitResponse) GetCommitIndex() uint64 {
@@ -1575,7 +1829,7 @@ type RollbackRequest struct {
 
 func (x *RollbackRequest) Reset() {
 	*x = RollbackRequest{}
-	mi := &file_service_proto_msgTypes[25]
+	mi := &file_service_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1587,7 +1841,7 @@ func (x *RollbackRequest) String() string {
 func (*RollbackRequest) ProtoMessage() {}
 
 func (x *RollbackRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_service_proto_msgTypes[25]
+	mi := &file_service_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1600,7 +1854,7 @@ func (x *RollbackRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RollbackRequest.ProtoReflect.Descriptor instead.
 func (*RollbackRequest) Descriptor() ([]byte, []int) {
-	return file_service_proto_rawDescGZIP(), []int{25}
+	return file_service_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *RollbackRequest) GetStartTs() uint64 {
@@ -1619,7 +1873,7 @@ type RollbackResponse struct {
 
 func (x *RollbackResponse) Reset() {
 	*x = RollbackResponse{}
-	mi := &file_service_proto_msgTypes[26]
+	mi := &file_service_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1631,7 +1885,7 @@ func (x *RollbackResponse) String() string {
 func (*RollbackResponse) ProtoMessage() {}
 
 func (x *RollbackResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_service_proto_msgTypes[26]
+	mi := &file_service_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1644,7 +1898,7 @@ func (x *RollbackResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RollbackResponse.ProtoReflect.Descriptor instead.
 func (*RollbackResponse) Descriptor() ([]byte, []int) {
-	return file_service_proto_rawDescGZIP(), []int{26}
+	return file_service_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *RollbackResponse) GetSuccess() bool {
@@ -1662,7 +1916,7 @@ type RaftAdminStatusRequest struct {
 
 func (x *RaftAdminStatusRequest) Reset() {
 	*x = RaftAdminStatusRequest{}
-	mi := &file_service_proto_msgTypes[27]
+	mi := &file_service_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1674,7 +1928,7 @@ func (x *RaftAdminStatusRequest) String() string {
 func (*RaftAdminStatusRequest) ProtoMessage() {}
 
 func (x *RaftAdminStatusRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_service_proto_msgTypes[27]
+	mi := &file_service_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1687,7 +1941,7 @@ func (x *RaftAdminStatusRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RaftAdminStatusRequest.ProtoReflect.Descriptor instead.
 func (*RaftAdminStatusRequest) Descriptor() ([]byte, []int) {
-	return file_service_proto_rawDescGZIP(), []int{27}
+	return file_service_proto_rawDescGZIP(), []int{29}
 }
 
 type RaftAdminStatusResponse struct {
@@ -1705,13 +1959,14 @@ type RaftAdminStatusResponse struct {
 	LastContactNanos   int64                  `protobuf:"varint,11,opt,name=last_contact_nanos,json=lastContactNanos,proto3" json:"last_contact_nanos,omitempty"`
 	ConfigurationIndex uint64                 `protobuf:"varint,12,opt,name=configuration_index,json=configurationIndex,proto3" json:"configuration_index,omitempty"`
 	PendingConfChange  bool                   `protobuf:"varint,13,opt,name=pending_conf_change,json=pendingConfChange,proto3" json:"pending_conf_change,omitempty"`
+	SupportsVersionCas bool                   `protobuf:"varint,14,opt,name=supports_version_cas,json=supportsVersionCas,proto3" json:"supports_version_cas,omitempty"`
 	unknownFields      protoimpl.UnknownFields
 	sizeCache          protoimpl.SizeCache
 }
 
 func (x *RaftAdminStatusResponse) Reset() {
 	*x = RaftAdminStatusResponse{}
-	mi := &file_service_proto_msgTypes[28]
+	mi := &file_service_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1723,7 +1978,7 @@ func (x *RaftAdminStatusResponse) String() string {
 func (*RaftAdminStatusResponse) ProtoMessage() {}
 
 func (x *RaftAdminStatusResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_service_proto_msgTypes[28]
+	mi := &file_service_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1736,7 +1991,7 @@ func (x *RaftAdminStatusResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RaftAdminStatusResponse.ProtoReflect.Descriptor instead.
 func (*RaftAdminStatusResponse) Descriptor() ([]byte, []int) {
-	return file_service_proto_rawDescGZIP(), []int{28}
+	return file_service_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *RaftAdminStatusResponse) GetState() RaftAdminState {
@@ -1830,6 +2085,13 @@ func (x *RaftAdminStatusResponse) GetPendingConfChange() bool {
 	return false
 }
 
+func (x *RaftAdminStatusResponse) GetSupportsVersionCas() bool {
+	if x != nil {
+		return x.SupportsVersionCas
+	}
+	return false
+}
+
 type RaftAdminConfigurationRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	unknownFields protoimpl.UnknownFields
@@ -1838,7 +2100,7 @@ type RaftAdminConfigurationRequest struct {
 
 func (x *RaftAdminConfigurationRequest) Reset() {
 	*x = RaftAdminConfigurationRequest{}
-	mi := &file_service_proto_msgTypes[29]
+	mi := &file_service_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1850,7 +2112,7 @@ func (x *RaftAdminConfigurationRequest) String() string {
 func (*RaftAdminConfigurationRequest) ProtoMessage() {}
 
 func (x *RaftAdminConfigurationRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_service_proto_msgTypes[29]
+	mi := &file_service_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1863,7 +2125,7 @@ func (x *RaftAdminConfigurationRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RaftAdminConfigurationRequest.ProtoReflect.Descriptor instead.
 func (*RaftAdminConfigurationRequest) Descriptor() ([]byte, []int) {
-	return file_service_proto_rawDescGZIP(), []int{29}
+	return file_service_proto_rawDescGZIP(), []int{31}
 }
 
 type RaftAdminMember struct {
@@ -1877,7 +2139,7 @@ type RaftAdminMember struct {
 
 func (x *RaftAdminMember) Reset() {
 	*x = RaftAdminMember{}
-	mi := &file_service_proto_msgTypes[30]
+	mi := &file_service_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1889,7 +2151,7 @@ func (x *RaftAdminMember) String() string {
 func (*RaftAdminMember) ProtoMessage() {}
 
 func (x *RaftAdminMember) ProtoReflect() protoreflect.Message {
-	mi := &file_service_proto_msgTypes[30]
+	mi := &file_service_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1902,7 +2164,7 @@ func (x *RaftAdminMember) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RaftAdminMember.ProtoReflect.Descriptor instead.
 func (*RaftAdminMember) Descriptor() ([]byte, []int) {
-	return file_service_proto_rawDescGZIP(), []int{30}
+	return file_service_proto_rawDescGZIP(), []int{32}
 }
 
 func (x *RaftAdminMember) GetId() string {
@@ -1935,7 +2197,7 @@ type RaftAdminConfigurationResponse struct {
 
 func (x *RaftAdminConfigurationResponse) Reset() {
 	*x = RaftAdminConfigurationResponse{}
-	mi := &file_service_proto_msgTypes[31]
+	mi := &file_service_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1947,7 +2209,7 @@ func (x *RaftAdminConfigurationResponse) String() string {
 func (*RaftAdminConfigurationResponse) ProtoMessage() {}
 
 func (x *RaftAdminConfigurationResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_service_proto_msgTypes[31]
+	mi := &file_service_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1960,7 +2222,7 @@ func (x *RaftAdminConfigurationResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RaftAdminConfigurationResponse.ProtoReflect.Descriptor instead.
 func (*RaftAdminConfigurationResponse) Descriptor() ([]byte, []int) {
-	return file_service_proto_rawDescGZIP(), []int{31}
+	return file_service_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *RaftAdminConfigurationResponse) GetServers() []*RaftAdminMember {
@@ -1981,7 +2243,7 @@ type RaftAdminAddVoterRequest struct {
 
 func (x *RaftAdminAddVoterRequest) Reset() {
 	*x = RaftAdminAddVoterRequest{}
-	mi := &file_service_proto_msgTypes[32]
+	mi := &file_service_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1993,7 +2255,7 @@ func (x *RaftAdminAddVoterRequest) String() string {
 func (*RaftAdminAddVoterRequest) ProtoMessage() {}
 
 func (x *RaftAdminAddVoterRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_service_proto_msgTypes[32]
+	mi := &file_service_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2006,7 +2268,7 @@ func (x *RaftAdminAddVoterRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RaftAdminAddVoterRequest.ProtoReflect.Descriptor instead.
 func (*RaftAdminAddVoterRequest) Descriptor() ([]byte, []int) {
-	return file_service_proto_rawDescGZIP(), []int{32}
+	return file_service_proto_rawDescGZIP(), []int{34}
 }
 
 func (x *RaftAdminAddVoterRequest) GetId() string {
@@ -2041,7 +2303,7 @@ type RaftAdminAddLearnerRequest struct {
 
 func (x *RaftAdminAddLearnerRequest) Reset() {
 	*x = RaftAdminAddLearnerRequest{}
-	mi := &file_service_proto_msgTypes[33]
+	mi := &file_service_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2053,7 +2315,7 @@ func (x *RaftAdminAddLearnerRequest) String() string {
 func (*RaftAdminAddLearnerRequest) ProtoMessage() {}
 
 func (x *RaftAdminAddLearnerRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_service_proto_msgTypes[33]
+	mi := &file_service_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2066,7 +2328,7 @@ func (x *RaftAdminAddLearnerRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RaftAdminAddLearnerRequest.ProtoReflect.Descriptor instead.
 func (*RaftAdminAddLearnerRequest) Descriptor() ([]byte, []int) {
-	return file_service_proto_rawDescGZIP(), []int{33}
+	return file_service_proto_rawDescGZIP(), []int{35}
 }
 
 func (x *RaftAdminAddLearnerRequest) GetId() string {
@@ -2113,7 +2375,7 @@ type RaftAdminPromoteLearnerRequest struct {
 
 func (x *RaftAdminPromoteLearnerRequest) Reset() {
 	*x = RaftAdminPromoteLearnerRequest{}
-	mi := &file_service_proto_msgTypes[34]
+	mi := &file_service_proto_msgTypes[36]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2125,7 +2387,7 @@ func (x *RaftAdminPromoteLearnerRequest) String() string {
 func (*RaftAdminPromoteLearnerRequest) ProtoMessage() {}
 
 func (x *RaftAdminPromoteLearnerRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_service_proto_msgTypes[34]
+	mi := &file_service_proto_msgTypes[36]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2138,7 +2400,7 @@ func (x *RaftAdminPromoteLearnerRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RaftAdminPromoteLearnerRequest.ProtoReflect.Descriptor instead.
 func (*RaftAdminPromoteLearnerRequest) Descriptor() ([]byte, []int) {
-	return file_service_proto_rawDescGZIP(), []int{34}
+	return file_service_proto_rawDescGZIP(), []int{36}
 }
 
 func (x *RaftAdminPromoteLearnerRequest) GetId() string {
@@ -2179,7 +2441,7 @@ type RaftAdminRemoveServerRequest struct {
 
 func (x *RaftAdminRemoveServerRequest) Reset() {
 	*x = RaftAdminRemoveServerRequest{}
-	mi := &file_service_proto_msgTypes[35]
+	mi := &file_service_proto_msgTypes[37]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2191,7 +2453,7 @@ func (x *RaftAdminRemoveServerRequest) String() string {
 func (*RaftAdminRemoveServerRequest) ProtoMessage() {}
 
 func (x *RaftAdminRemoveServerRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_service_proto_msgTypes[35]
+	mi := &file_service_proto_msgTypes[37]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2204,7 +2466,7 @@ func (x *RaftAdminRemoveServerRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RaftAdminRemoveServerRequest.ProtoReflect.Descriptor instead.
 func (*RaftAdminRemoveServerRequest) Descriptor() ([]byte, []int) {
-	return file_service_proto_rawDescGZIP(), []int{35}
+	return file_service_proto_rawDescGZIP(), []int{37}
 }
 
 func (x *RaftAdminRemoveServerRequest) GetId() string {
@@ -2230,7 +2492,7 @@ type RaftAdminConfigurationChangeResponse struct {
 
 func (x *RaftAdminConfigurationChangeResponse) Reset() {
 	*x = RaftAdminConfigurationChangeResponse{}
-	mi := &file_service_proto_msgTypes[36]
+	mi := &file_service_proto_msgTypes[38]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2242,7 +2504,7 @@ func (x *RaftAdminConfigurationChangeResponse) String() string {
 func (*RaftAdminConfigurationChangeResponse) ProtoMessage() {}
 
 func (x *RaftAdminConfigurationChangeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_service_proto_msgTypes[36]
+	mi := &file_service_proto_msgTypes[38]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2255,7 +2517,7 @@ func (x *RaftAdminConfigurationChangeResponse) ProtoReflect() protoreflect.Messa
 
 // Deprecated: Use RaftAdminConfigurationChangeResponse.ProtoReflect.Descriptor instead.
 func (*RaftAdminConfigurationChangeResponse) Descriptor() ([]byte, []int) {
-	return file_service_proto_rawDescGZIP(), []int{36}
+	return file_service_proto_rawDescGZIP(), []int{38}
 }
 
 func (x *RaftAdminConfigurationChangeResponse) GetIndex() uint64 {
@@ -2278,7 +2540,7 @@ type RaftAdminTransferLeadershipRequest struct {
 
 func (x *RaftAdminTransferLeadershipRequest) Reset() {
 	*x = RaftAdminTransferLeadershipRequest{}
-	mi := &file_service_proto_msgTypes[37]
+	mi := &file_service_proto_msgTypes[39]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2290,7 +2552,7 @@ func (x *RaftAdminTransferLeadershipRequest) String() string {
 func (*RaftAdminTransferLeadershipRequest) ProtoMessage() {}
 
 func (x *RaftAdminTransferLeadershipRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_service_proto_msgTypes[37]
+	mi := &file_service_proto_msgTypes[39]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2303,7 +2565,7 @@ func (x *RaftAdminTransferLeadershipRequest) ProtoReflect() protoreflect.Message
 
 // Deprecated: Use RaftAdminTransferLeadershipRequest.ProtoReflect.Descriptor instead.
 func (*RaftAdminTransferLeadershipRequest) Descriptor() ([]byte, []int) {
-	return file_service_proto_rawDescGZIP(), []int{37}
+	return file_service_proto_rawDescGZIP(), []int{39}
 }
 
 func (x *RaftAdminTransferLeadershipRequest) GetTargetId() string {
@@ -2351,7 +2613,7 @@ type TransferTarget struct {
 
 func (x *TransferTarget) Reset() {
 	*x = TransferTarget{}
-	mi := &file_service_proto_msgTypes[38]
+	mi := &file_service_proto_msgTypes[40]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2363,7 +2625,7 @@ func (x *TransferTarget) String() string {
 func (*TransferTarget) ProtoMessage() {}
 
 func (x *TransferTarget) ProtoReflect() protoreflect.Message {
-	mi := &file_service_proto_msgTypes[38]
+	mi := &file_service_proto_msgTypes[40]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2376,7 +2638,7 @@ func (x *TransferTarget) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TransferTarget.ProtoReflect.Descriptor instead.
 func (*TransferTarget) Descriptor() ([]byte, []int) {
-	return file_service_proto_rawDescGZIP(), []int{38}
+	return file_service_proto_rawDescGZIP(), []int{40}
 }
 
 func (x *TransferTarget) GetTargetId() string {
@@ -2402,7 +2664,7 @@ type FetchChunkBlobRequest struct {
 
 func (x *FetchChunkBlobRequest) Reset() {
 	*x = FetchChunkBlobRequest{}
-	mi := &file_service_proto_msgTypes[39]
+	mi := &file_service_proto_msgTypes[41]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2414,7 +2676,7 @@ func (x *FetchChunkBlobRequest) String() string {
 func (*FetchChunkBlobRequest) ProtoMessage() {}
 
 func (x *FetchChunkBlobRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_service_proto_msgTypes[39]
+	mi := &file_service_proto_msgTypes[41]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2427,7 +2689,7 @@ func (x *FetchChunkBlobRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FetchChunkBlobRequest.ProtoReflect.Descriptor instead.
 func (*FetchChunkBlobRequest) Descriptor() ([]byte, []int) {
-	return file_service_proto_rawDescGZIP(), []int{39}
+	return file_service_proto_rawDescGZIP(), []int{41}
 }
 
 func (x *FetchChunkBlobRequest) GetContentSha256() []byte {
@@ -2447,7 +2709,7 @@ type FetchChunkBlobResponse struct {
 
 func (x *FetchChunkBlobResponse) Reset() {
 	*x = FetchChunkBlobResponse{}
-	mi := &file_service_proto_msgTypes[40]
+	mi := &file_service_proto_msgTypes[42]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2459,7 +2721,7 @@ func (x *FetchChunkBlobResponse) String() string {
 func (*FetchChunkBlobResponse) ProtoMessage() {}
 
 func (x *FetchChunkBlobResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_service_proto_msgTypes[40]
+	mi := &file_service_proto_msgTypes[42]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2472,7 +2734,7 @@ func (x *FetchChunkBlobResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FetchChunkBlobResponse.ProtoReflect.Descriptor instead.
 func (*FetchChunkBlobResponse) Descriptor() ([]byte, []int) {
-	return file_service_proto_rawDescGZIP(), []int{40}
+	return file_service_proto_rawDescGZIP(), []int{42}
 }
 
 func (x *FetchChunkBlobResponse) GetPayload() []byte {
@@ -2501,7 +2763,7 @@ type PushChunkBlobRequest struct {
 
 func (x *PushChunkBlobRequest) Reset() {
 	*x = PushChunkBlobRequest{}
-	mi := &file_service_proto_msgTypes[41]
+	mi := &file_service_proto_msgTypes[43]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2513,7 +2775,7 @@ func (x *PushChunkBlobRequest) String() string {
 func (*PushChunkBlobRequest) ProtoMessage() {}
 
 func (x *PushChunkBlobRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_service_proto_msgTypes[41]
+	mi := &file_service_proto_msgTypes[43]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2526,7 +2788,7 @@ func (x *PushChunkBlobRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PushChunkBlobRequest.ProtoReflect.Descriptor instead.
 func (*PushChunkBlobRequest) Descriptor() ([]byte, []int) {
-	return file_service_proto_rawDescGZIP(), []int{41}
+	return file_service_proto_rawDescGZIP(), []int{43}
 }
 
 func (x *PushChunkBlobRequest) GetContentSha256() []byte {
@@ -2566,7 +2828,7 @@ type PushChunkBlobResponse struct {
 
 func (x *PushChunkBlobResponse) Reset() {
 	*x = PushChunkBlobResponse{}
-	mi := &file_service_proto_msgTypes[42]
+	mi := &file_service_proto_msgTypes[44]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2578,7 +2840,7 @@ func (x *PushChunkBlobResponse) String() string {
 func (*PushChunkBlobResponse) ProtoMessage() {}
 
 func (x *PushChunkBlobResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_service_proto_msgTypes[42]
+	mi := &file_service_proto_msgTypes[44]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2591,7 +2853,7 @@ func (x *PushChunkBlobResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PushChunkBlobResponse.ProtoReflect.Descriptor instead.
 func (*PushChunkBlobResponse) Descriptor() ([]byte, []int) {
-	return file_service_proto_rawDescGZIP(), []int{42}
+	return file_service_proto_rawDescGZIP(), []int{44}
 }
 
 func (x *PushChunkBlobResponse) GetDurable() bool {
@@ -2609,7 +2871,7 @@ type RaftAdminTransferLeadershipResponse struct {
 
 func (x *RaftAdminTransferLeadershipResponse) Reset() {
 	*x = RaftAdminTransferLeadershipResponse{}
-	mi := &file_service_proto_msgTypes[43]
+	mi := &file_service_proto_msgTypes[45]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2621,7 +2883,7 @@ func (x *RaftAdminTransferLeadershipResponse) String() string {
 func (*RaftAdminTransferLeadershipResponse) ProtoMessage() {}
 
 func (x *RaftAdminTransferLeadershipResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_service_proto_msgTypes[43]
+	mi := &file_service_proto_msgTypes[45]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2634,7 +2896,7 @@ func (x *RaftAdminTransferLeadershipResponse) ProtoReflect() protoreflect.Messag
 
 // Deprecated: Use RaftAdminTransferLeadershipResponse.ProtoReflect.Descriptor instead.
 func (*RaftAdminTransferLeadershipResponse) Descriptor() ([]byte, []int) {
-	return file_service_proto_rawDescGZIP(), []int{43}
+	return file_service_proto_rawDescGZIP(), []int{45}
 }
 
 var File_service_proto protoreflect.FileDescriptor
@@ -2647,16 +2909,20 @@ const file_service_proto_rawDesc = "" +
 	"\x05value\x18\x02 \x01(\fR\x05value\"M\n" +
 	"\x0eRawPutResponse\x12!\n" +
 	"\fcommit_index\x18\x01 \x01(\x04R\vcommitIndex\x12\x18\n" +
-	"\asuccess\x18\x02 \x01(\bR\asuccess\"z\n" +
+	"\asuccess\x18\x02 \x01(\bR\asuccess\"\xa0\x01\n" +
 	"\rRawGetRequest\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\fR\x03key\x12\x0e\n" +
 	"\x02ts\x18\x03 \x01(\x04R\x02ts\x12\x19\n" +
 	"\bgroup_id\x18\x04 \x01(\x04R\agroupId\x12,\n" +
-	"\x12read_route_version\x18\x05 \x01(\x04R\x10readRouteVersion\"b\n" +
+	"\x12read_route_version\x18\x05 \x01(\x04R\x10readRouteVersion\x12$\n" +
+	"\x0eneed_commit_ts\x18\x06 \x01(\bR\fneedCommitTs\"\xa8\x01\n" +
 	"\x0eRawGetResponse\x12\"\n" +
 	"\rread_at_index\x18\x01 \x01(\x04R\vreadAtIndex\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\fR\x05value\x12\x16\n" +
-	"\x06exists\x18\x03 \x01(\bR\x06exists\"$\n" +
+	"\x06exists\x18\x03 \x01(\bR\x06exists\x12\x1d\n" +
+	"\tcommit_ts\x18\x04 \x01(\x04H\x00R\bcommitTs\x12\x1a\n" +
+	"\amissing\x18\x05 \x01(\bH\x00R\amissingB\t\n" +
+	"\aversion\"$\n" +
 	"\x10RawDeleteRequest\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\fR\x03key\"P\n" +
 	"\x11RawDeleteResponse\x12!\n" +
@@ -2710,13 +2976,25 @@ const file_service_proto_rawDesc = "" +
 	"\x03key\x18\x01 \x01(\fR\x03key\"M\n" +
 	"\x0eDeleteResponse\x12!\n" +
 	"\fcommit_index\x18\x01 \x01(\x04R\vcommitIndex\x12\x18\n" +
-	"\asuccess\x18\x02 \x01(\bR\asuccess\"\x1e\n" +
+	"\asuccess\x18\x02 \x01(\bR\asuccess\"D\n" +
 	"\n" +
 	"GetRequest\x12\x10\n" +
-	"\x03key\x18\x01 \x01(\fR\x03key\"G\n" +
+	"\x03key\x18\x01 \x01(\fR\x03key\x12$\n" +
+	"\x0eneed_commit_ts\x18\x02 \x01(\bR\fneedCommitTs\"\x8d\x01\n" +
 	"\vGetResponse\x12\"\n" +
 	"\rread_at_index\x18\x01 \x01(\x04R\vreadAtIndex\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\fR\x05value\"B\n" +
+	"\x05value\x18\x02 \x01(\fR\x05value\x12\x1d\n" +
+	"\tcommit_ts\x18\x03 \x01(\x04H\x00R\bcommitTs\x12\x1a\n" +
+	"\amissing\x18\x04 \x01(\bH\x00R\amissingB\t\n" +
+	"\aversion\"m\n" +
+	"\x15CompareAndSwapRequest\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\fR\x03key\x12,\n" +
+	"\x12expected_commit_ts\x18\x02 \x01(\x04R\x10expectedCommitTs\x12\x14\n" +
+	"\x05value\x18\x03 \x01(\fR\x05value\"f\n" +
+	"\x16CompareAndSwapResponse\x12$\n" +
+	"\rnew_commit_ts\x18\x01 \x01(\x04H\x00R\vnewCommitTs\x12\x1c\n" +
+	"\bmismatch\x18\x02 \x01(\bH\x00R\bmismatchB\b\n" +
+	"\x06result\"B\n" +
 	"\bKeyError\x12\x18\n" +
 	"\amessage\x18\x01 \x01(\tR\amessage\x12\x1c\n" +
 	"\tretryable\x18\x02 \x01(\bR\tretryable\"M\n" +
@@ -2747,7 +3025,7 @@ const file_service_proto_rawDesc = "" +
 	"\bstart_ts\x18\x01 \x01(\x04R\astartTs\",\n" +
 	"\x10RollbackResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\"\x18\n" +
-	"\x16RaftAdminStatusRequest\"\x83\x04\n" +
+	"\x16RaftAdminStatusRequest\"\xb5\x04\n" +
 	"\x17RaftAdminStatusResponse\x12%\n" +
 	"\x05state\x18\x01 \x01(\x0e2\x0f.RaftAdminStateR\x05state\x12\x1b\n" +
 	"\tleader_id\x18\x02 \x01(\tR\bleaderId\x12%\n" +
@@ -2763,7 +3041,8 @@ const file_service_proto_rawDesc = "" +
 	" \x01(\x04R\bnumPeers\x12,\n" +
 	"\x12last_contact_nanos\x18\v \x01(\x03R\x10lastContactNanos\x12/\n" +
 	"\x13configuration_index\x18\f \x01(\x04R\x12configurationIndex\x12.\n" +
-	"\x13pending_conf_change\x18\r \x01(\bR\x11pendingConfChange\"\x1f\n" +
+	"\x13pending_conf_change\x18\r \x01(\bR\x11pendingConfChange\x120\n" +
+	"\x14supports_version_cas\x18\x0e \x01(\bR\x12supportsVersionCas\"\x1f\n" +
 	"\x1dRaftAdminConfigurationRequest\"W\n" +
 	"\x0fRaftAdminMember\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x18\n" +
@@ -2822,10 +3101,11 @@ const file_service_proto_rawDesc = "" +
 	"\x06RawGet\x12\x0e.RawGetRequest\x1a\x0f.RawGetResponse\"\x00\x124\n" +
 	"\tRawDelete\x12\x11.RawDeleteRequest\x1a\x12.RawDeleteResponse\"\x00\x12L\n" +
 	"\x11RawLatestCommitTS\x12\x19.RawLatestCommitTSRequest\x1a\x1a.RawLatestCommitTSResponse\"\x00\x124\n" +
-	"\tRawScanAt\x12\x11.RawScanAtRequest\x1a\x12.RawScanAtResponse\"\x002\xc1\x02\n" +
+	"\tRawScanAt\x12\x11.RawScanAtRequest\x1a\x12.RawScanAtResponse\"\x002\x86\x03\n" +
 	"\x0fTransactionalKV\x12\"\n" +
 	"\x03Put\x12\v.PutRequest\x1a\f.PutResponse\"\x00\x12\"\n" +
-	"\x03Get\x12\v.GetRequest\x1a\f.GetResponse\"\x00\x12+\n" +
+	"\x03Get\x12\v.GetRequest\x1a\f.GetResponse\"\x00\x12C\n" +
+	"\x0eCompareAndSwap\x12\x16.CompareAndSwapRequest\x1a\x17.CompareAndSwapResponse\"\x00\x12+\n" +
 	"\x06Delete\x12\x0e.DeleteRequest\x1a\x0f.DeleteResponse\"\x00\x12%\n" +
 	"\x04Scan\x12\f.ScanRequest\x1a\r.ScanResponse\"\x00\x122\n" +
 	"\bPreWrite\x12\x10.PreWriteRequest\x1a\x12.PreCommitResponse\"\x00\x12+\n" +
@@ -2857,7 +3137,7 @@ func file_service_proto_rawDescGZIP() []byte {
 }
 
 var file_service_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_service_proto_msgTypes = make([]protoimpl.MessageInfo, 44)
+var file_service_proto_msgTypes = make([]protoimpl.MessageInfo, 46)
 var file_service_proto_goTypes = []any{
 	(RaftAdminState)(0),                          // 0: RaftAdminState
 	(*RawPutRequest)(nil),                        // 1: RawPutRequest
@@ -2877,44 +3157,46 @@ var file_service_proto_goTypes = []any{
 	(*DeleteResponse)(nil),                       // 15: DeleteResponse
 	(*GetRequest)(nil),                           // 16: GetRequest
 	(*GetResponse)(nil),                          // 17: GetResponse
-	(*KeyError)(nil),                             // 18: KeyError
-	(*Kv)(nil),                                   // 19: Kv
-	(*ScanRequest)(nil),                          // 20: ScanRequest
-	(*ScanResponse)(nil),                         // 21: ScanResponse
-	(*PreWriteRequest)(nil),                      // 22: PreWriteRequest
-	(*PreCommitResponse)(nil),                    // 23: PreCommitResponse
-	(*CommitRequest)(nil),                        // 24: CommitRequest
-	(*CommitResponse)(nil),                       // 25: CommitResponse
-	(*RollbackRequest)(nil),                      // 26: RollbackRequest
-	(*RollbackResponse)(nil),                     // 27: RollbackResponse
-	(*RaftAdminStatusRequest)(nil),               // 28: RaftAdminStatusRequest
-	(*RaftAdminStatusResponse)(nil),              // 29: RaftAdminStatusResponse
-	(*RaftAdminConfigurationRequest)(nil),        // 30: RaftAdminConfigurationRequest
-	(*RaftAdminMember)(nil),                      // 31: RaftAdminMember
-	(*RaftAdminConfigurationResponse)(nil),       // 32: RaftAdminConfigurationResponse
-	(*RaftAdminAddVoterRequest)(nil),             // 33: RaftAdminAddVoterRequest
-	(*RaftAdminAddLearnerRequest)(nil),           // 34: RaftAdminAddLearnerRequest
-	(*RaftAdminPromoteLearnerRequest)(nil),       // 35: RaftAdminPromoteLearnerRequest
-	(*RaftAdminRemoveServerRequest)(nil),         // 36: RaftAdminRemoveServerRequest
-	(*RaftAdminConfigurationChangeResponse)(nil), // 37: RaftAdminConfigurationChangeResponse
-	(*RaftAdminTransferLeadershipRequest)(nil),   // 38: RaftAdminTransferLeadershipRequest
-	(*TransferTarget)(nil),                       // 39: TransferTarget
-	(*FetchChunkBlobRequest)(nil),                // 40: FetchChunkBlobRequest
-	(*FetchChunkBlobResponse)(nil),               // 41: FetchChunkBlobResponse
-	(*PushChunkBlobRequest)(nil),                 // 42: PushChunkBlobRequest
-	(*PushChunkBlobResponse)(nil),                // 43: PushChunkBlobResponse
-	(*RaftAdminTransferLeadershipResponse)(nil),  // 44: RaftAdminTransferLeadershipResponse
+	(*CompareAndSwapRequest)(nil),                // 18: CompareAndSwapRequest
+	(*CompareAndSwapResponse)(nil),               // 19: CompareAndSwapResponse
+	(*KeyError)(nil),                             // 20: KeyError
+	(*Kv)(nil),                                   // 21: Kv
+	(*ScanRequest)(nil),                          // 22: ScanRequest
+	(*ScanResponse)(nil),                         // 23: ScanResponse
+	(*PreWriteRequest)(nil),                      // 24: PreWriteRequest
+	(*PreCommitResponse)(nil),                    // 25: PreCommitResponse
+	(*CommitRequest)(nil),                        // 26: CommitRequest
+	(*CommitResponse)(nil),                       // 27: CommitResponse
+	(*RollbackRequest)(nil),                      // 28: RollbackRequest
+	(*RollbackResponse)(nil),                     // 29: RollbackResponse
+	(*RaftAdminStatusRequest)(nil),               // 30: RaftAdminStatusRequest
+	(*RaftAdminStatusResponse)(nil),              // 31: RaftAdminStatusResponse
+	(*RaftAdminConfigurationRequest)(nil),        // 32: RaftAdminConfigurationRequest
+	(*RaftAdminMember)(nil),                      // 33: RaftAdminMember
+	(*RaftAdminConfigurationResponse)(nil),       // 34: RaftAdminConfigurationResponse
+	(*RaftAdminAddVoterRequest)(nil),             // 35: RaftAdminAddVoterRequest
+	(*RaftAdminAddLearnerRequest)(nil),           // 36: RaftAdminAddLearnerRequest
+	(*RaftAdminPromoteLearnerRequest)(nil),       // 37: RaftAdminPromoteLearnerRequest
+	(*RaftAdminRemoveServerRequest)(nil),         // 38: RaftAdminRemoveServerRequest
+	(*RaftAdminConfigurationChangeResponse)(nil), // 39: RaftAdminConfigurationChangeResponse
+	(*RaftAdminTransferLeadershipRequest)(nil),   // 40: RaftAdminTransferLeadershipRequest
+	(*TransferTarget)(nil),                       // 41: TransferTarget
+	(*FetchChunkBlobRequest)(nil),                // 42: FetchChunkBlobRequest
+	(*FetchChunkBlobResponse)(nil),               // 43: FetchChunkBlobResponse
+	(*PushChunkBlobRequest)(nil),                 // 44: PushChunkBlobRequest
+	(*PushChunkBlobResponse)(nil),                // 45: PushChunkBlobResponse
+	(*RaftAdminTransferLeadershipResponse)(nil),  // 46: RaftAdminTransferLeadershipResponse
 }
 var file_service_proto_depIdxs = []int32{
 	10, // 0: RawScanAtResponse.kv:type_name -> RawKVPair
-	18, // 1: Kv.error:type_name -> KeyError
-	19, // 2: ScanResponse.kv:type_name -> Kv
-	19, // 3: PreWriteRequest.mutations:type_name -> Kv
-	18, // 4: PreCommitResponse.errors:type_name -> KeyError
-	18, // 5: CommitResponse.errors:type_name -> KeyError
+	20, // 1: Kv.error:type_name -> KeyError
+	21, // 2: ScanResponse.kv:type_name -> Kv
+	21, // 3: PreWriteRequest.mutations:type_name -> Kv
+	20, // 4: PreCommitResponse.errors:type_name -> KeyError
+	20, // 5: CommitResponse.errors:type_name -> KeyError
 	0,  // 6: RaftAdminStatusResponse.state:type_name -> RaftAdminState
-	31, // 7: RaftAdminConfigurationResponse.servers:type_name -> RaftAdminMember
-	39, // 8: RaftAdminTransferLeadershipRequest.target_candidates:type_name -> TransferTarget
+	33, // 7: RaftAdminConfigurationResponse.servers:type_name -> RaftAdminMember
+	41, // 8: RaftAdminTransferLeadershipRequest.target_candidates:type_name -> TransferTarget
 	1,  // 9: RawKV.RawPut:input_type -> RawPutRequest
 	3,  // 10: RawKV.RawGet:input_type -> RawGetRequest
 	5,  // 11: RawKV.RawDelete:input_type -> RawDeleteRequest
@@ -2922,43 +3204,45 @@ var file_service_proto_depIdxs = []int32{
 	9,  // 13: RawKV.RawScanAt:input_type -> RawScanAtRequest
 	12, // 14: TransactionalKV.Put:input_type -> PutRequest
 	16, // 15: TransactionalKV.Get:input_type -> GetRequest
-	14, // 16: TransactionalKV.Delete:input_type -> DeleteRequest
-	20, // 17: TransactionalKV.Scan:input_type -> ScanRequest
-	22, // 18: TransactionalKV.PreWrite:input_type -> PreWriteRequest
-	24, // 19: TransactionalKV.Commit:input_type -> CommitRequest
-	26, // 20: TransactionalKV.Rollback:input_type -> RollbackRequest
-	28, // 21: RaftAdmin.Status:input_type -> RaftAdminStatusRequest
-	30, // 22: RaftAdmin.Configuration:input_type -> RaftAdminConfigurationRequest
-	33, // 23: RaftAdmin.AddVoter:input_type -> RaftAdminAddVoterRequest
-	34, // 24: RaftAdmin.AddLearner:input_type -> RaftAdminAddLearnerRequest
-	35, // 25: RaftAdmin.PromoteLearner:input_type -> RaftAdminPromoteLearnerRequest
-	36, // 26: RaftAdmin.RemoveServer:input_type -> RaftAdminRemoveServerRequest
-	38, // 27: RaftAdmin.TransferLeadership:input_type -> RaftAdminTransferLeadershipRequest
-	40, // 28: S3BlobFetch.FetchChunkBlob:input_type -> FetchChunkBlobRequest
-	42, // 29: S3BlobFetch.PushChunkBlob:input_type -> PushChunkBlobRequest
-	2,  // 30: RawKV.RawPut:output_type -> RawPutResponse
-	4,  // 31: RawKV.RawGet:output_type -> RawGetResponse
-	6,  // 32: RawKV.RawDelete:output_type -> RawDeleteResponse
-	8,  // 33: RawKV.RawLatestCommitTS:output_type -> RawLatestCommitTSResponse
-	11, // 34: RawKV.RawScanAt:output_type -> RawScanAtResponse
-	13, // 35: TransactionalKV.Put:output_type -> PutResponse
-	17, // 36: TransactionalKV.Get:output_type -> GetResponse
-	15, // 37: TransactionalKV.Delete:output_type -> DeleteResponse
-	21, // 38: TransactionalKV.Scan:output_type -> ScanResponse
-	23, // 39: TransactionalKV.PreWrite:output_type -> PreCommitResponse
-	25, // 40: TransactionalKV.Commit:output_type -> CommitResponse
-	27, // 41: TransactionalKV.Rollback:output_type -> RollbackResponse
-	29, // 42: RaftAdmin.Status:output_type -> RaftAdminStatusResponse
-	32, // 43: RaftAdmin.Configuration:output_type -> RaftAdminConfigurationResponse
-	37, // 44: RaftAdmin.AddVoter:output_type -> RaftAdminConfigurationChangeResponse
-	37, // 45: RaftAdmin.AddLearner:output_type -> RaftAdminConfigurationChangeResponse
-	37, // 46: RaftAdmin.PromoteLearner:output_type -> RaftAdminConfigurationChangeResponse
-	37, // 47: RaftAdmin.RemoveServer:output_type -> RaftAdminConfigurationChangeResponse
-	44, // 48: RaftAdmin.TransferLeadership:output_type -> RaftAdminTransferLeadershipResponse
-	41, // 49: S3BlobFetch.FetchChunkBlob:output_type -> FetchChunkBlobResponse
-	43, // 50: S3BlobFetch.PushChunkBlob:output_type -> PushChunkBlobResponse
-	30, // [30:51] is the sub-list for method output_type
-	9,  // [9:30] is the sub-list for method input_type
+	18, // 16: TransactionalKV.CompareAndSwap:input_type -> CompareAndSwapRequest
+	14, // 17: TransactionalKV.Delete:input_type -> DeleteRequest
+	22, // 18: TransactionalKV.Scan:input_type -> ScanRequest
+	24, // 19: TransactionalKV.PreWrite:input_type -> PreWriteRequest
+	26, // 20: TransactionalKV.Commit:input_type -> CommitRequest
+	28, // 21: TransactionalKV.Rollback:input_type -> RollbackRequest
+	30, // 22: RaftAdmin.Status:input_type -> RaftAdminStatusRequest
+	32, // 23: RaftAdmin.Configuration:input_type -> RaftAdminConfigurationRequest
+	35, // 24: RaftAdmin.AddVoter:input_type -> RaftAdminAddVoterRequest
+	36, // 25: RaftAdmin.AddLearner:input_type -> RaftAdminAddLearnerRequest
+	37, // 26: RaftAdmin.PromoteLearner:input_type -> RaftAdminPromoteLearnerRequest
+	38, // 27: RaftAdmin.RemoveServer:input_type -> RaftAdminRemoveServerRequest
+	40, // 28: RaftAdmin.TransferLeadership:input_type -> RaftAdminTransferLeadershipRequest
+	42, // 29: S3BlobFetch.FetchChunkBlob:input_type -> FetchChunkBlobRequest
+	44, // 30: S3BlobFetch.PushChunkBlob:input_type -> PushChunkBlobRequest
+	2,  // 31: RawKV.RawPut:output_type -> RawPutResponse
+	4,  // 32: RawKV.RawGet:output_type -> RawGetResponse
+	6,  // 33: RawKV.RawDelete:output_type -> RawDeleteResponse
+	8,  // 34: RawKV.RawLatestCommitTS:output_type -> RawLatestCommitTSResponse
+	11, // 35: RawKV.RawScanAt:output_type -> RawScanAtResponse
+	13, // 36: TransactionalKV.Put:output_type -> PutResponse
+	17, // 37: TransactionalKV.Get:output_type -> GetResponse
+	19, // 38: TransactionalKV.CompareAndSwap:output_type -> CompareAndSwapResponse
+	15, // 39: TransactionalKV.Delete:output_type -> DeleteResponse
+	23, // 40: TransactionalKV.Scan:output_type -> ScanResponse
+	25, // 41: TransactionalKV.PreWrite:output_type -> PreCommitResponse
+	27, // 42: TransactionalKV.Commit:output_type -> CommitResponse
+	29, // 43: TransactionalKV.Rollback:output_type -> RollbackResponse
+	31, // 44: RaftAdmin.Status:output_type -> RaftAdminStatusResponse
+	34, // 45: RaftAdmin.Configuration:output_type -> RaftAdminConfigurationResponse
+	39, // 46: RaftAdmin.AddVoter:output_type -> RaftAdminConfigurationChangeResponse
+	39, // 47: RaftAdmin.AddLearner:output_type -> RaftAdminConfigurationChangeResponse
+	39, // 48: RaftAdmin.PromoteLearner:output_type -> RaftAdminConfigurationChangeResponse
+	39, // 49: RaftAdmin.RemoveServer:output_type -> RaftAdminConfigurationChangeResponse
+	46, // 50: RaftAdmin.TransferLeadership:output_type -> RaftAdminTransferLeadershipResponse
+	43, // 51: S3BlobFetch.FetchChunkBlob:output_type -> FetchChunkBlobResponse
+	45, // 52: S3BlobFetch.PushChunkBlob:output_type -> PushChunkBlobResponse
+	31, // [31:53] is the sub-list for method output_type
+	9,  // [9:31] is the sub-list for method input_type
 	9,  // [9:9] is the sub-list for extension type_name
 	9,  // [9:9] is the sub-list for extension extendee
 	0,  // [0:9] is the sub-list for field type_name
@@ -2969,13 +3253,25 @@ func file_service_proto_init() {
 	if File_service_proto != nil {
 		return
 	}
+	file_service_proto_msgTypes[3].OneofWrappers = []any{
+		(*RawGetResponse_CommitTs)(nil),
+		(*RawGetResponse_Missing)(nil),
+	}
+	file_service_proto_msgTypes[16].OneofWrappers = []any{
+		(*GetResponse_CommitTs)(nil),
+		(*GetResponse_Missing)(nil),
+	}
+	file_service_proto_msgTypes[18].OneofWrappers = []any{
+		(*CompareAndSwapResponse_NewCommitTs)(nil),
+		(*CompareAndSwapResponse_Mismatch)(nil),
+	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_service_proto_rawDesc), len(file_service_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   44,
+			NumMessages:   46,
 			NumExtensions: 0,
 			NumServices:   4,
 		},

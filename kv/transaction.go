@@ -16,9 +16,10 @@ import (
 type TransactionManager struct {
 	proposer raftengine.Proposer
 
-	proposalObserver   ProposalObserver
-	timestampAdmission atomic.Pointer[transactionTimestampAdmission]
-	migrationAdmission atomic.Pointer[transactionMigrationAdmission]
+	versionCASAdmission VersionCASAdmission
+	proposalObserver    ProposalObserver
+	timestampAdmission  atomic.Pointer[transactionTimestampAdmission]
+	migrationAdmission  atomic.Pointer[transactionMigrationAdmission]
 
 	mu          sync.Mutex
 	rawPending  []*rawCommitItem
@@ -114,16 +115,47 @@ type TransactionResponse struct {
 	CommitTS    uint64
 }
 
+// proposalConditions classifies caller-supplied mutations in one pass. In
+// particular, require_absent must stay out of the log while a replica could
+// still decode it as an unknown field and apply an unconditional PUT.
+type proposalConditions struct {
+	cas    bool
+	absent bool
+}
+
+func classifyProposalConditions(reqs []*pb.Request) proposalConditions {
+	var conditions proposalConditions
+	for _, req := range reqs {
+		for _, mutation := range req.GetMutations() {
+			conditions.cas = conditions.cas || usesCAS(mutation)
+			conditions.absent = conditions.absent || mutation.GetRequireAbsent()
+		}
+	}
+	return conditions
+}
+
+func (c proposalConditions) validate(reqs []*pb.Request) error {
+	if c.cas {
+		// The standalone CAS shape also forbids require_absent.
+		return validateCASProposalShape(reqs)
+	}
+	if c.absent {
+		return errors.WithStack(ErrTTLInlineCapabilityRequired)
+	}
+	return nil
+}
+
 func marshalRaftCommand(reqs []*pb.Request) ([]byte, error) {
+	conditions := classifyProposalConditions(reqs)
+	if err := conditions.validate(reqs); err != nil {
+		return nil, err
+	}
+	return marshalClassifiedRaftCommand(reqs, conditions.cas)
+}
+
+func marshalClassifiedRaftCommand(reqs []*pb.Request, cas bool) ([]byte, error) {
 	if len(reqs) == 1 {
-		b, err := proto.Marshal(reqs[0])
-		if err != nil {
-			return nil, errors.WithStack(err)
-		}
-		if len(b) >= maxMarshaledCommandSize {
-			return nil, errors.New("marshaled request too large")
-		}
-		return prependByte(raftEncodeSingle, b), nil
+		return marshalSingleRaftRequest(reqs[0], cas)
 	}
 	b, err := proto.Marshal(&pb.RaftCommand{Requests: reqs})
 	if err != nil {
@@ -133,6 +165,23 @@ func marshalRaftCommand(reqs []*pb.Request) ([]byte, error) {
 		return nil, errors.New("marshaled request batch too large")
 	}
 	return prependByte(raftEncodeBatch, b), nil
+}
+
+func marshalSingleRaftRequest(req *pb.Request, cas bool) ([]byte, error) {
+	b, err := proto.Marshal(req)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if len(b) >= maxMarshaledCommandSize {
+		return nil, errors.New("marshaled request too large")
+	}
+	if !cas {
+		return prependByte(raftEncodeSingle, b), nil
+	}
+	if len(b) > maxMarshaledCommandSize-len(versionCASFrame) {
+		return nil, errors.New("marshaled version CAS request too large")
+	}
+	return append([]byte(versionCASFrame), b...), nil
 }
 
 // prependByte returns a new slice with prefix followed by data.
@@ -150,24 +199,43 @@ func prependByte(prefix byte, data []byte) []byte {
 // HashiCorp Raft delivers FSM responses via ApplyFuture.Response(), not Error(),
 // so we must inspect the response to avoid silently treating failed writes as
 // successes.
-func applyRequests(ctx context.Context, proposer raftengine.Proposer, reqs []*pb.Request, proposalObserver ProposalObserver, admission ...*transactionMigrationAdmission) (uint64, []error, error) {
-	if len(admission) > 0 && admission[0] != nil {
-		return admission[0].apply(ctx, proposer, reqs, proposalObserver)
+func applyRequests(ctx context.Context, proposer raftengine.Proposer, reqs []*pb.Request, observer ProposalObserver, admission ...*transactionMigrationAdmission) (uint64, []error, error) {
+	conditions := classifyProposalConditions(reqs)
+	if err := conditions.validate(reqs); err != nil {
+		return 0, nil, err
 	}
-	b, err := marshalRaftCommand(reqs)
+	var migration *transactionMigrationAdmission
+	if len(admission) > 0 {
+		migration = admission[0]
+	}
+	return applyClassifiedRequests(ctx, proposer, reqs, observer, migration, conditions.cas)
+}
+
+// applyClassifiedRequests is called after all mutations have been checked.
+// A CAS command is always standalone, including through migration admission.
+func applyClassifiedRequests(ctx context.Context, proposer raftengine.Proposer, reqs []*pb.Request, observer ProposalObserver, migration *transactionMigrationAdmission, cas bool) (uint64, []error, error) {
+	if migration != nil {
+		return migration.apply(ctx, proposer, reqs, observer, cas)
+	}
+	b, err := marshalClassifiedRaftCommand(reqs, cas)
 	if err != nil {
 		return 0, nil, errors.WithStack(err)
 	}
 
 	if proposer == nil {
-		recordProposalFailure(proposalObserver)
+		recordProposalFailure(observer)
 		return 0, nil, errors.WithStack(ErrLeaderNotFound)
 	}
 
+	if raftengine.IsVersionCASRaftPayload(b) {
+		if _, ok := raftengine.VersionCASProposalProof(ctx); !ok {
+			return 0, nil, errors.WithStack(ErrVersionCASUnavailable)
+		}
+	}
 	result, err := proposer.Propose(ctx, b)
 	if err != nil {
-		recordProposalFailure(proposalObserver)
-		if errors.Is(err, raftengine.ErrNotLeader) || errors.Is(err, raftengine.ErrLeadershipTransferInProgress) {
+		recordProposalFailure(observer)
+		if rejectedBeforeProposal(err) {
 			// The etcd engine returns these before appending the entry.
 			return 0, nil, errors.WithStack(err)
 		}
@@ -176,11 +244,16 @@ func applyRequests(ctx context.Context, proposer raftengine.Proposer, reqs []*pb
 		return 0, nil, &unknownTransactionFailure{cause: err}
 	}
 	if result == nil {
-		recordProposalFailure(proposalObserver)
+		recordProposalFailure(observer)
 		return 0, nil, &unknownTransactionFailure{cause: errors.New("raft proposal returned nil result")}
 	}
 
-	return interpretProposalResult(result, reqs, proposalObserver)
+	return interpretProposalResult(result, reqs, observer)
+}
+
+func rejectedBeforeProposal(err error) bool {
+	return errors.Is(err, raftengine.ErrNotLeader) || errors.Is(err, raftengine.ErrLeadershipTransferInProgress) ||
+		errors.Is(err, ErrVersionCASUnavailable)
 }
 
 func interpretProposalResult(result *raftengine.ProposalResult, reqs []*pb.Request, proposalObserver ProposalObserver) (uint64, []error, error) {
@@ -212,10 +285,17 @@ func recordProposalFailure(observer ProposalObserver) {
 }
 
 func (t *TransactionManager) Commit(ctx context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
+	return t.commitClassified(ctx, reqs, classifyProposalConditions(reqs))
+}
+
+func (t *TransactionManager) commitClassified(ctx context.Context, reqs []*pb.Request, conditions proposalConditions) (*TransactionResponse, error) {
 	if len(reqs) == 0 {
 		return &TransactionResponse{}, nil
 	}
-	if err := refuseAbsenceProposal(reqs); err != nil {
+	if conditions.cas && t.versionCASAdmission == nil {
+		return nil, errors.WithStack(ErrVersionCASUnavailable)
+	}
+	if err := conditions.validate(reqs); err != nil {
 		return nil, err
 	}
 	owned, err := t.timestampAdmission.Load().prepare(ctx, reqs)
@@ -223,8 +303,15 @@ func (t *TransactionManager) Commit(ctx context.Context, reqs []*pb.Request) (*T
 		return nil, err
 	}
 	reqs = owned
+	if conditions.cas {
+		ctx, err = t.versionCASAdmission(ctx)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		return t.commitSequential(ctx, reqs, true)
+	}
 	if hasTxnRequests(reqs) {
-		return t.commitSequential(ctx, reqs)
+		return t.commitSequential(ctx, reqs, false)
 	}
 	return t.commitRaw(ctx, reqs)
 }
@@ -238,8 +325,8 @@ func hasTxnRequests(reqs []*pb.Request) bool {
 	return false
 }
 
-func (t *TransactionManager) commitSequential(ctx context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
-	commitIndex, err := t.applySequentialRequests(ctx, reqs)
+func (t *TransactionManager) commitSequential(ctx context.Context, reqs []*pb.Request, cas bool) (*TransactionResponse, error) {
+	commitIndex, err := t.applySequentialRequests(ctx, reqs, cas)
 
 	if err != nil {
 		// Only the coordinator can decide whether earlier participants or an
@@ -252,10 +339,10 @@ func (t *TransactionManager) commitSequential(ctx context.Context, reqs []*pb.Re
 	}, nil
 }
 
-func (t *TransactionManager) applySequentialRequests(ctx context.Context, reqs []*pb.Request) (uint64, error) {
+func (t *TransactionManager) applySequentialRequests(ctx context.Context, reqs []*pb.Request, cas bool) (uint64, error) {
 	commitIndex := uint64(0)
 	for _, req := range reqs {
-		idx, results, err := applyRequests(ctx, t.proposer, []*pb.Request{req}, t.proposalObserver, t.migrationAdmission.Load())
+		idx, results, err := applyClassifiedRequests(ctx, t.proposer, []*pb.Request{req}, t.proposalObserver, t.migrationAdmission.Load(), cas)
 		if err != nil {
 			return 0, err
 		}
@@ -447,6 +534,9 @@ func combineApplyErrors(errs []error) error {
 }
 
 func (t *TransactionManager) Abort(ctx context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
+	if HasCASMutation(reqs) {
+		return nil, errors.WithStack(ErrInvalidRequest)
+	}
 	var abortReqs []*pb.Request
 	for _, req := range reqs {
 		if abortReq := abortRequestFor(req); abortReq != nil {

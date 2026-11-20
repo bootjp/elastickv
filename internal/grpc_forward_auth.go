@@ -23,7 +23,7 @@ func ConfigureGRPCForwardToken(token string) {
 }
 
 func forwardTokenClientInterceptor(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
-	if token := grpcForwardToken.Load(); token != nil && method == pb.Internal_Forward_FullMethodName {
+	if token := grpcForwardToken.Load(); token != nil && (method == pb.Internal_Forward_FullMethodName || method == pb.Internal_ForwardCompareAndSwap_FullMethodName) {
 		md, _ := metadata.FromOutgoingContext(ctx)
 		md = md.Copy()
 		md.Delete("authorization")

@@ -198,7 +198,7 @@ func Run(flags *Flags) error {
 		}
 	})
 	bootstrapDomain, resolverOptions := clusterbootstrap.ConfigureBootstrapOperations(ctx, runtimes, shardStore, &cleanup)
-	bootstrapNetwork, err := clusterbootstrap.ConfigureBootstrapNetwork(ctx, runtimes, shardStore, shardGroups, &cleanup)
+	bootstrapNetwork, err := configureProtectedShardNetwork(ctx, flags, cfg, runtimes, shardStore, shardGroups, &cleanup)
 	if err != nil {
 		return errors.WithStack(err)
 	}

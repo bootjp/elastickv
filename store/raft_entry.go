@@ -83,9 +83,9 @@ type raftEntryScope struct {
 	// lastCommitTS, mirroring the advanceLastCommitTS argument of the
 	// per-request path.
 	advance bool
-	// touched records that at least one request staged or observed
-	// something, so an entry whose every request failed validation commits
-	// nothing, as the per-request path does.
+	// touched records staged writes, observations, or explicit entry
+	// progress. A rejection-only entry commits its index when its caller
+	// stages progress explicitly.
 	touched     bool
 	dataTouched bool
 	forceSync   bool

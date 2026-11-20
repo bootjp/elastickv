@@ -43,6 +43,8 @@ func requestReadPolicy() map[string]map[string]bool {
 		allowed["request"+name] = legacyRequestReadScopes
 		allowed["requestReadSnapshot"]["request_read_ports.go:request"+name] = true
 	}
+	allowed["GetVersionAt"] = map[string]bool{}
+	allowed["GetVersionAtWithReadFence"] = map[string]bool{}
 	allowed["requestScanPhysicalAt"] = legacyRequestReadScopes
 	allowed["Historical"] = map[string]bool{
 		"request_read.go:requestReadSnapshot":     true,
@@ -90,6 +92,8 @@ func requestReadViolations(name string, file *ast.File, allowed map[string]map[s
 func TestCapabilityReadPortGuardRejectsNewRawOrHistoricalEscapes(t *testing.T) {
 	for _, body := range []string{
 		"store.GetAt(ctx,key,oldTimestamp)",
+		"store.GetVersionAt(ctx,backend,key,oldTimestamp)",
+		"store.GetVersionAtWithReadFence(ctx,key,oldTimestamp,groupID,routeVersion)",
 		"store.ScanAt(ctx,start,end,10,oldTimestamp)",
 		"old := requestGetAt; old(ctx, store, key, oldTimestamp)",
 		"request.Historical(ctx,oldTimestamp)",

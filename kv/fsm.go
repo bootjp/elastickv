@@ -430,6 +430,12 @@ func (f *kvFSM) Apply(data []byte) any {
 	if resp, handled := f.applyGuardedBootstrap(ctx, data); handled {
 		return resp
 	}
+	if raftengine.IsVersionCASRaftPayload(data) {
+		return f.applyVersionCASFrame(ctx, data)
+	}
+	if IsMigrationVersionIdentityActivation(data) {
+		return f.applyMigrationVersionIdentityActivation(ctx, data)
+	}
 	if resp, handled := f.applyReservedOpcode(ctx, data); handled {
 		return resp
 	}
@@ -437,6 +443,9 @@ func (f *kvFSM) Apply(data []byte) any {
 	reqs, err := decodeRaftRequests(data)
 	if err != nil {
 		return errors.WithStack(err)
+	}
+	if HasCASMutation(reqs) {
+		return haltErr(errors.Mark(errors.New("version CAS mutation outside its Raft frame"), ErrRaftEntryApply))
 	}
 	return f.applyDecodedRequests(ctx, reqs)
 }
@@ -842,31 +851,39 @@ func (f *kvFSM) applyRequestErr(ctx context.Context, r *pb.Request) error {
 }
 
 func (f *kvFSM) applyRequestData(ctx context.Context, r *pb.Request) (uint64, error) {
-	ctx = context.WithValue(ctx, applyReadinessContextKey{}, struct{}{})
-	if f.migrationNamespaceVersion.Load() != 0 {
-		if err := verifyRequestMigrationControlKeys(r); err != nil {
-			return 0, err
-		}
-	}
-	var err error
-	ctx, err = f.withMigrationOwnershipEvidence(ctx, r)
+	ctx, commitTS, err := f.prepareRequestForApply(ctx, r)
 	if err != nil {
-		return 0, err
-	}
-	if err := f.verifyPrepareCreationGate(r); err != nil {
-		return 0, err
-	}
-	commitTS, err := requestCommitTS(r)
-	if err != nil {
-		return 0, err
-	}
-	if err := f.verifyBackupTimestampFloor(r, commitTS); err != nil {
 		return 0, err
 	}
 	if err := f.handleRequest(ctx, r, commitTS); err != nil {
 		return 0, errors.WithStack(err)
 	}
 	return commitTS, nil
+}
+
+func (f *kvFSM) prepareRequestForApply(ctx context.Context, r *pb.Request) (context.Context, uint64, error) {
+	ctx = context.WithValue(ctx, applyReadinessContextKey{}, struct{}{})
+	if f.migrationNamespaceVersion.Load() != 0 {
+		if err := verifyRequestMigrationControlKeys(r); err != nil {
+			return ctx, 0, err
+		}
+	}
+	var err error
+	ctx, err = f.withMigrationOwnershipEvidence(ctx, r)
+	if err != nil {
+		return ctx, 0, err
+	}
+	if err := f.verifyPrepareCreationGate(r); err != nil {
+		return ctx, 0, err
+	}
+	commitTS, err := requestCommitTS(r)
+	if err != nil {
+		return ctx, 0, err
+	}
+	if err := f.verifyBackupTimestampFloor(r, commitTS); err != nil {
+		return ctx, 0, err
+	}
+	return ctx, commitTS, nil
 }
 
 func (f *kvFSM) handleRequest(ctx context.Context, r *pb.Request, commitTS uint64) error {
@@ -2961,7 +2978,7 @@ func txnIntentFromPBMutation(mut *pb.Mutation, startTS uint64) (txnIntent, error
 		return txnIntent{StartTS: startTS, Op: txnIntentOpPut, Value: mut.Value}, nil
 	case pb.Op_DEL:
 		return txnIntent{StartTS: startTS, Op: txnIntentOpDel, Value: nil}, nil
-	case pb.Op_DEL_PREFIX:
+	case pb.Op_DEL_PREFIX, pb.Op_COMPARE_AND_SWAP:
 		return txnIntent{}, errors.WithStack(ErrUnknownRequestType)
 	default:
 		return txnIntent{}, errors.WithStack(ErrUnknownRequestType)
@@ -3276,7 +3293,7 @@ func toStoreMutations(muts []*pb.Mutation) ([]*store.KVPairMutation, error) {
 				Key:           mut.Key,
 				RequireAbsent: mut.RequireAbsent,
 			})
-		case pb.Op_DEL_PREFIX:
+		case pb.Op_DEL_PREFIX, pb.Op_COMPARE_AND_SWAP:
 			return nil, ErrUnknownRequestType
 		default:
 			return nil, ErrUnknownRequestType

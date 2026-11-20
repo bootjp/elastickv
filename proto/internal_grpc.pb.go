@@ -20,6 +20,7 @@ const _ = grpc.SupportPackageIsVersion9
 
 const (
 	Internal_Forward_FullMethodName                    = "/Internal/Forward"
+	Internal_ForwardCompareAndSwap_FullMethodName      = "/Internal/ForwardCompareAndSwap"
 	Internal_ForwardAdminProposal_FullMethodName       = "/Internal/ForwardAdminProposal"
 	Internal_ForwardLeaseRead_FullMethodName           = "/Internal/ForwardLeaseRead"
 	Internal_GetPrepareEvidenceState_FullMethodName    = "/Internal/GetPrepareEvidenceState"
@@ -42,6 +43,8 @@ const (
 type InternalClient interface {
 	// for internal leader redirect only
 	Forward(ctx context.Context, in *ForwardRequest, opts ...grpc.CallOption) (*ForwardResponse, error)
+	// A legacy leader must reject a forwarded CAS before proposing it.
+	ForwardCompareAndSwap(ctx context.Context, in *ForwardRequest, opts ...grpc.CallOption) (*ForwardResponse, error)
 	ForwardAdminProposal(ctx context.Context, in *ForwardAdminProposalRequest, opts ...grpc.CallOption) (*ForwardAdminProposalResponse, error)
 	ForwardLeaseRead(ctx context.Context, in *ForwardLeaseReadRequest, opts ...grpc.CallOption) (*ForwardLeaseReadResponse, error)
 	GetPrepareEvidenceState(ctx context.Context, in *PrepareEvidenceStateRequest, opts ...grpc.CallOption) (*PrepareEvidenceStateResponse, error)
@@ -70,6 +73,16 @@ func (c *internalClient) Forward(ctx context.Context, in *ForwardRequest, opts .
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ForwardResponse)
 	err := c.cc.Invoke(ctx, Internal_Forward_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *internalClient) ForwardCompareAndSwap(ctx context.Context, in *ForwardRequest, opts ...grpc.CallOption) (*ForwardResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ForwardResponse)
+	err := c.cc.Invoke(ctx, Internal_ForwardCompareAndSwap_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -231,6 +244,8 @@ func (c *internalClient) LookupTimestampBinding(ctx context.Context, in *LookupT
 type InternalServer interface {
 	// for internal leader redirect only
 	Forward(context.Context, *ForwardRequest) (*ForwardResponse, error)
+	// A legacy leader must reject a forwarded CAS before proposing it.
+	ForwardCompareAndSwap(context.Context, *ForwardRequest) (*ForwardResponse, error)
 	ForwardAdminProposal(context.Context, *ForwardAdminProposalRequest) (*ForwardAdminProposalResponse, error)
 	ForwardLeaseRead(context.Context, *ForwardLeaseReadRequest) (*ForwardLeaseReadResponse, error)
 	GetPrepareEvidenceState(context.Context, *PrepareEvidenceStateRequest) (*PrepareEvidenceStateResponse, error)
@@ -257,6 +272,9 @@ type UnimplementedInternalServer struct{}
 
 func (UnimplementedInternalServer) Forward(context.Context, *ForwardRequest) (*ForwardResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Forward not implemented")
+}
+func (UnimplementedInternalServer) ForwardCompareAndSwap(context.Context, *ForwardRequest) (*ForwardResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ForwardCompareAndSwap not implemented")
 }
 func (UnimplementedInternalServer) ForwardAdminProposal(context.Context, *ForwardAdminProposalRequest) (*ForwardAdminProposalResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ForwardAdminProposal not implemented")
@@ -335,6 +353,24 @@ func _Internal_Forward_Handler(srv interface{}, ctx context.Context, dec func(in
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(InternalServer).Forward(ctx, req.(*ForwardRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Internal_ForwardCompareAndSwap_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ForwardRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(InternalServer).ForwardCompareAndSwap(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Internal_ForwardCompareAndSwap_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(InternalServer).ForwardCompareAndSwap(ctx, req.(*ForwardRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -594,6 +630,10 @@ var Internal_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Forward",
 			Handler:    _Internal_Forward_Handler,
+		},
+		{
+			MethodName: "ForwardCompareAndSwap",
+			Handler:    _Internal_ForwardCompareAndSwap_Handler,
 		},
 		{
 			MethodName: "ForwardAdminProposal",
