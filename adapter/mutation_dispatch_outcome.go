@@ -17,9 +17,6 @@ func isIndeterminateMutationDispatchFailure(err error) bool {
 	if err == nil {
 		return false
 	}
-	if mixedMutationDispatchFailure(err) {
-		return true
-	}
 	if _, ok := status.FromError(err); ok {
 		return true
 	}

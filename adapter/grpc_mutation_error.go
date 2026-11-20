@@ -54,5 +54,5 @@ func publicGRPCMutationFailure(err error) (codes.Code, string, string) {
 }
 
 func uncertainPublicMutationFailure(err error) bool {
-	return errors.Is(err, kv.ErrTransactionOutcomeUnknown) || errors.Is(err, kv.ErrRouteWriteFenced) || errors.Is(err, kv.ErrTxnLocked) || isIndeterminateMutationDispatchFailure(err)
+	return mixedMutationDispatchFailure(err) || errors.Is(err, kv.ErrTransactionOutcomeUnknown) || errors.Is(err, kv.ErrRouteWriteFenced) || errors.Is(err, kv.ErrTxnLocked) || isIndeterminateMutationDispatchFailure(err)
 }
