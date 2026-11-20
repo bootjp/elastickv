@@ -72,3 +72,40 @@ func TestSplitCleanupConfigurationBarrierRejectsMixedAndMissingEpochs(t *testing
 		})
 	}
 }
+
+type controlConfigurationReadHook struct {
+	store.MVCCStore
+	after func()
+}
+
+func (s *controlConfigurationReadHook) MigrationTargetReadinessStates(ctx context.Context) ([]store.TargetStagedReadinessState, error) {
+	reader, ok := s.MVCCStore.(store.MigrationTargetReadinessReader)
+	if !ok {
+		return nil, store.ErrNotSupported
+	}
+	states, err := reader.MigrationTargetReadinessStates(ctx)
+	if s.after != nil {
+		s.after()
+	}
+	return states, err
+}
+
+func TestMigrationControlProbeRejectsConfigurationChangedDuringRead(t *testing.T) {
+	st := store.NewMVCCStore()
+	t.Cleanup(func() { require.NoError(t, st.Close()) })
+	writer, ok := st.(store.MigrationTargetReadinessWriter)
+	require.True(t, ok)
+	state := store.TargetStagedReadinessState{JobID: 7, MigrationJobID: 7, Armed: true, TrackWrites: true, RouteStart: []byte("m"), RouteEnd: []byte("z"), ExpectedCutoverVersion: 3, RetentionPinTS: 1, MinWriteTSExclusive: 10}
+	require.NoError(t, writer.ApplyTargetStagedReadiness(t.Context(), state))
+	node := NewInternalWithEngine(nil, migrationConfigurationLeader{index: 8}, nil, nil, WithInternalStore(st))
+	reader := &controlConfigurationReadHook{MVCCStore: st, after: func() { node.leader = migrationConfigurationLeader{index: 9} }}
+	node.store = reader
+	req := &pb.ProbeMigrationStateRequest{Kind: pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_CONTROL_APPLIED, JobId: 7, MigrationJobId: 7, TrackWrites: true, RouteStart: state.RouteStart, RouteEnd: state.RouteEnd, ExpectedCatalogVersion: 3, RetentionPinTs: 1, MinWriteTsExclusive: 10, RequireConfigurationIndex: true, ExpectedConfigurationIndex: 9}
+	resp, err := node.ProbeMigrationState(t.Context(), req)
+	require.NoError(t, err)
+	require.False(t, resp.Ready, "an old configuration's read must not be relabeled as the new configuration")
+	reader.after = nil
+	resp, err = node.ProbeMigrationState(t.Context(), req)
+	require.NoError(t, err)
+	require.True(t, resp.Ready, "a fresh read in the expected configuration may ACK")
+}

@@ -569,7 +569,10 @@
         (with-retries max-retries
           #(if local?
              (local-setup! mount-dir keys)
-             (remote-exec! test node (remote-setup-cmd mount-dir keys)))))))
+             (doseq [batch (partition-all 128 keys)]
+               ;; Bound each SSH shell argument even when the checker budget
+               ;; redistributes thousands of registers. Keep all seed keys.
+               (remote-exec! test node (remote-setup-cmd mount-dir batch))))))))
 
   (teardown! [_this test]
     ;; Jepsen runs teardown! before setup! and again after the test, so the

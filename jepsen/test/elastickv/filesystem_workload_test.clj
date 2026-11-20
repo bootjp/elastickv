@@ -770,3 +770,27 @@
               (is (= :ok (deref other-call 5000 :timeout)))
               (is (= ["n1" "n2"] @seen)))
             (finally (deliver release true))))))))
+
+(deftest remote-setup-bounds-commands-without-dropping-registers
+  (let [root (scratch-dir)
+        dir (str root "/it's a mount")
+        commands (atom [])
+        base (:client (workload/filesystem-register-workload
+                        {:key-count 2000 :node->mount-dir {"n1" dir}}))
+        c (client/open! base {} "n1")]
+    (try
+      (with-redefs-fn
+        {#'workload/remote-exec!
+         (fn [_ _ command]
+           (swap! commands conj command)
+           (is (< (count (.getBytes ^String command "UTF-8")) 32768)
+               "setup must stay below the Linux single-argument limit")
+           (let [result (clojure.java.shell/sh "sh" "-c" command)]
+             (is (zero? (:exit result)) (:err result))))}
+        #(client/setup! c {}))
+      (is (> (count @commands) 1))
+      (is (= 2000 (count (.listFiles (io/file (workload/workload-dir dir))))))
+      (doseq [k (range 2000)]
+        (is (= workload/record-width (.length (io/file (workload/register-path dir k)))))
+        (is (= workload/initial-value (workload/local-read (workload/register-path dir k)))))
+      (finally (delete-tree! root)))))

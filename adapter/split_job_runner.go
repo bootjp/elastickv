@@ -2160,11 +2160,27 @@ func (s *DistributionServer) ensureSplitJobCapabilityRegressionFailClosed(ctx co
 	return sourceComplete && targetComplete, nil
 }
 
+func splitJobHasInterruptedPreflight(job distribution.SplitJob) bool {
+	return job.Phase == distribution.SplitJobPhaseFence && job.TransferPreflightTS != 0 && !job.TransferPreflightDone
+}
+
 func (s *DistributionServer) restoreSplitJobCapabilityRegressionGuards(ctx context.Context, job distribution.SplitJob) (bool, error) {
 	targets, err := s.splitJobCapabilityControlTargets(ctx, job)
 	if err != nil {
 		return false, err
 	}
+	// During an interrupted preflight, reacquire the existing configuration-bound
+	// source admission instead of proposing an unbound normal-phase refresh. This
+	// uses the same size-guard apply rules on rolling-upgrade peers.
+	if splitJobHasInterruptedPreflight(job) {
+		_, err := s.ensureSplitJobTransferPhase(ctx, job, targets.source, nil, splitTransferAdmissionOptions{readExistingControl: true})
+		return err == nil, err
+	}
+
+	return s.restoreSplitJobNormalGuards(ctx, job, targets)
+}
+
+func (s *DistributionServer) restoreSplitJobNormalGuards(ctx context.Context, job distribution.SplitJob, targets splitJobMigrationControlTargets) (bool, error) {
 	if splitJobCapabilityRegressionSourceGuardRequired(job) {
 		sourceReq, ok := splitJobNormalSourceControlRequest(job, targets.routeEnd, targets.snapshot.Version)
 		if ok {
