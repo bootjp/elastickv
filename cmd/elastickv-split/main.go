@@ -32,6 +32,7 @@ import (
 	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 const (
@@ -48,6 +49,7 @@ var (
 	abandonJobID    = flag.Uint64("abandon-job-id", 0, "Abandon a pre-cutover migration job; mutually exclusive with split flags")
 	retryJobID      = flag.Uint64("retry-job-id", 0, "Resume a FAILED migration at its recorded phase; mutually exclusive with other job/split flags")
 	getJobID        = flag.Uint64("get-job-id", 0, "Print one migration job; mutually exclusive with mutation flags")
+	jobJSON         = flag.Bool("job-json", false, "Print the persisted SplitJob as protobuf JSON with --get-job-id")
 	tokenFile       = flag.String("token-file", "", "File containing the dedicated migration controller bearer token; not the read-only Admin token")
 	tlsCAFile       = flag.String("tls-ca-file", "", "PEM CA certificates for verified gRPC TLS; token-file always requires TLS (system roots if omitted)")
 	tlsServerName   = flag.String("tls-server-name", "", "Expected TLS server name when different from the address; implies verified TLS")
@@ -144,6 +146,14 @@ func runGetSplitJob(ctx context.Context, client pb.DistributionClient) error {
 		return errors.Wrap(err, "GetSplitJob")
 	}
 	job := resp.GetJob()
+	if *jobJSON {
+		data, marshalErr := (protojson.MarshalOptions{UseProtoNames: true, EmitDefaultValues: true}).Marshal(job)
+		if marshalErr != nil {
+			return errors.Wrap(marshalErr, "encode split job")
+		}
+		fmt.Println(string(data))
+		return nil
+	}
 	fmt.Printf("job_id: %d\nphase: %s\n", job.GetJobId(), job.GetPhase())
 	return nil
 }
@@ -195,6 +205,9 @@ func validateFlags() error {
 }
 
 func validateJobModeFlags() (bool, error) {
+	if *jobJSON && *getJobID == 0 {
+		return false, errors.New("--job-json requires --get-job-id")
+	}
 	modes := 0
 	for _, id := range []uint64{*getJobID, *abandonJobID, *retryJobID} {
 		if id != 0 {

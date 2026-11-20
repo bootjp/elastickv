@@ -843,6 +843,11 @@ func appendUpsertRouteMutations(out []*store.KVPairMutation, existing []RouteDes
 	return out, nil
 }
 
+// Equal reports whether two descriptors have the same durable catalog fields.
+func (left RouteDescriptor) Equal(right RouteDescriptor) bool {
+	return routeDescriptorEqual(left, right)
+}
+
 func routeDescriptorEqual(left, right RouteDescriptor) bool {
 	return left.RouteID == right.RouteID &&
 		bytes.Equal(left.Start, right.Start) &&

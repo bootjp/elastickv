@@ -101,6 +101,15 @@ func TestValidateFlags_RejectsGetWithMutationFlags(t *testing.T) {
 	require.ErrorContains(t, err, "mutually exclusive")
 }
 
+func TestJobJSONRequiresGet(t *testing.T) {
+	resetFlags(t)
+	t.Cleanup(func() { resetFlags(t) })
+	*jobJSON = true
+	require.ErrorContains(t, validateFlags(), "--job-json requires --get-job-id")
+	*getJobID = 42
+	require.NoError(t, validateFlags())
+}
+
 // resetFlags reinitialises the package-level flag pointers around
 // each test so subtests don't leak state through them.  We rebind
 // the globals directly rather than re-parsing argv because the
@@ -121,6 +130,7 @@ func resetFlags(t *testing.T) {
 	*abandonJobID = 0
 	*retryJobID = 0
 	*getJobID = 0
+	*jobJSON = false
 	*address = "127.0.0.1:50051"
 	*tokenFile = ""
 	*tlsCAFile = ""

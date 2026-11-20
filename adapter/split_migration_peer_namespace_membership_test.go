@@ -3,6 +3,7 @@ package adapter
 import (
 	"context"
 	"slices"
+	"sync"
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -86,8 +87,11 @@ func newNamespaceGateFixture(t *testing.T, active bool) (*MigrationNamespaceMemb
 	gate := NewMigrationNamespaceMembershipGate(st, engine, engine, "secret", next, etcd.DeriveNodeID)
 	versions := map[string]uint32{"n1:7001": 1, "learner:7001": 1, "candidate:7001": 1}
 	probes := map[string]int{}
+	var probeMu sync.Mutex
 	gate.probe = func(ctx context.Context, address string, _ *pb.ProbeMigrationStateRequest) (*pb.ProbeMigrationStateResponse, error) {
+		probeMu.Lock()
 		probes[address]++
+		probeMu.Unlock()
 		version, err := kv.MigrationNamespaceAdmissionVersion(ctx, st)
 		if err != nil {
 			return nil, err

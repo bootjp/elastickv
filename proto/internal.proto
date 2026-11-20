@@ -206,6 +206,9 @@ message ExportRangeVersionsRequest {
   // Bracket-local raw-prefix exclusions, e.g. non-partitioned SQS brackets
   // excluding their partitioned subprefixes.
   repeated bytes exclude_prefixes = 12;
+  // Optional response-page limit. Zero preserves the full streaming export.
+  // A limited response keeps done=false and next_cursor when more data exists.
+  uint32 max_pages = 13;
 }
 
 message ExportRangeVersionsResponse {

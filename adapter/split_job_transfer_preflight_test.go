@@ -98,7 +98,9 @@ func TestTransferPreflightPersistsEveryFamilyBeforeFence(t *testing.T) {
 		require.Equal(t, plan[index].Family, req.GetKeyFamily())
 		require.Equal(t, uint64(0), req.GetMinCommitTs(), "include retained historical versions")
 		require.Equal(t, job.TransferPreflightTS, req.GetMaxCommitTs())
-		require.Equal(t, uint32(defaultSplitMigrationChunkBytes), req.GetChunkBytes())
+		require.Equal(t, uint32(preflightPageBytes), req.GetChunkBytes())
+		require.Equal(t, uint64(preflightPageBytes), req.GetMaxScannedBytes())
+		require.Equal(t, uint32(1), req.GetMaxPages(), "preflight consumes and checkpoints one page per RPC")
 	}
 	require.NotEmpty(t, source.controls)
 	for _, control := range source.controls {

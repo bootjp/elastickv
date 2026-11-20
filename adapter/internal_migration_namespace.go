@@ -74,11 +74,7 @@ func (i *Internal) probeMigrationNamespace(ctx context.Context, _ *pb.ProbeMigra
 	if !supported || index == 0 {
 		return response, nil
 	}
-	version, err := kv.MigrationNamespaceAdmissionVersion(ctx, i.store)
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-	configuration, err := kv.MigrationConfigurationIndex(ctx, i.store)
+	version, configuration, err := kv.MigrationNamespaceAdmissionState(ctx, i.store)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}

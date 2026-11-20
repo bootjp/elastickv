@@ -370,44 +370,55 @@ func (s *DistributionServer) RunSplitJobRunner(ctx context.Context) error {
 	ticker := time.NewTicker(defaultSplitJobRunnerInterval)
 	defer ticker.Stop()
 	for {
-		if err := s.RunSplitJobRunnerOnce(ctx); err != nil {
+		continueSoon, err := s.runSplitJobRunnerOnce(ctx)
+		if err != nil {
 			if !splitJobRunnerContextDone(err) {
 				slog.Warn("split job runner tick failed", "err", err)
 			}
 		}
-		select {
-		case <-ctx.Done():
+		if !waitSplitJobRunner(ctx, ticker.C, continueSoon && err == nil) {
 			return nil
-		case <-ticker.C:
 		}
 	}
 }
 
 func (s *DistributionServer) RunSplitJobRunnerOnce(ctx context.Context) error {
+	_, err := s.runSplitJobRunnerOnce(ctx)
+	return err
+}
+
+func (s *DistributionServer) runSplitJobRunnerOnce(ctx context.Context) (bool, error) {
 	if !s.splitJobRunnerConfigured() {
-		return nil
+		return false, nil
 	}
 	leader, err := s.verifySplitJobRunnerLeader(ctx)
 	if err != nil || !leader {
-		return err
+		return false, err
 	}
 	jobs, err := s.catalog.ListSplitJobs(ctx)
 	if err != nil {
-		return splitJobCatalogStatusError(err)
+		return false, splitJobCatalogStatusError(err)
 	}
 	if job, ok := nextRunnableSplitJob(jobs); ok {
-		if err := s.verifySplitJobCleanupDispatch(ctx, job); err != nil {
-			return err
-		}
-		if job.Phase != distribution.SplitJobPhaseAbandoning {
-			ready, gateErr := s.splitJobCapabilityReady(ctx, job)
-			if gateErr != nil || !ready {
-				return gateErr
-			}
-		}
-		return s.runSplitJobAttempt(ctx, job)
+		return s.runSplitJobRunnerJob(ctx, job)
 	}
-	return s.gcSplitJobHistory(ctx, jobs, time.Now())
+	return false, s.gcSplitJobHistory(ctx, jobs, time.Now())
+}
+
+func (s *DistributionServer) runSplitJobRunnerJob(ctx context.Context, job distribution.SplitJob) (bool, error) {
+	if err := s.verifySplitJobCleanupDispatch(ctx, job); err != nil {
+		return false, err
+	}
+	if job.Phase != distribution.SplitJobPhaseAbandoning {
+		ready, err := s.splitJobCapabilityReady(ctx, job)
+		if err != nil || !ready {
+			return false, err
+		}
+	}
+	if err := s.runSplitJobAttempt(ctx, job); err != nil {
+		return false, err
+	}
+	return s.splitJobPreflightContinuation(ctx, job)
 }
 
 func (s *DistributionServer) splitJobCapabilityReady(ctx context.Context, job distribution.SplitJob) (bool, error) {

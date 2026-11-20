@@ -377,6 +377,9 @@ func (i *Internal) ProbeMigrationState(ctx context.Context, req *pb.ProbeMigrati
 }
 
 func (i *Internal) decorateMigrationTransferCapability(req *pb.ProbeMigrationStateRequest, resp *pb.ProbeMigrationStateResponse) {
+	if req.GetKind() == pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_NAMESPACE_ADMISSION {
+		resp.OwnershipPartitionProtocol = i.implementedPartitionProtocol()
+	}
 	if i.MigrationTransferSizeGuardSupported() {
 		resp.TransferSizeGuardVersion = store.MigrationTransferSizeGuardVersion
 	}
@@ -387,7 +390,8 @@ func (i *Internal) decorateMigrationTransferCapability(req *pb.ProbeMigrationSta
 }
 
 func (i *Internal) bindMigrationProbeConfiguration(req *pb.ProbeMigrationStateRequest, resp *pb.ProbeMigrationStateResponse) {
-	if !req.GetRequireConfigurationIndex() {
+	namespace := req.GetKind() == pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_NAMESPACE_ADMISSION
+	if !req.GetRequireConfigurationIndex() && !namespace {
 		return
 	}
 	reader, supported := i.leader.(raftengine.AppliedConfigurationReader)
@@ -396,9 +400,22 @@ func (i *Internal) bindMigrationProbeConfiguration(req *pb.ProbeMigrationStateRe
 		return
 	}
 	index, supported := reader.AppliedConfigurationIndex()
+	if !supported {
+		index = 0
+	}
+	ready := resp.GetReady() && migrationProbeConfigurationMatches(req, resp, index)
 	resp.AppliedConfigurationIndex = index
-	resp.Ready = resp.GetReady() && supported && index != 0 &&
-		(req.GetExpectedConfigurationIndex() == 0 || req.GetExpectedConfigurationIndex() == index)
+	resp.Ready = ready
+}
+
+func migrationProbeConfigurationMatches(req *pb.ProbeMigrationStateRequest, resp *pb.ProbeMigrationStateResponse, index uint64) bool {
+	if index == 0 {
+		return false
+	}
+	if req.GetKind() == pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_NAMESPACE_ADMISSION && resp.GetAppliedConfigurationIndex() != index {
+		return false
+	}
+	return !req.GetRequireConfigurationIndex() || req.GetExpectedConfigurationIndex() == 0 || req.GetExpectedConfigurationIndex() == index
 }
 
 func (i *Internal) probeMigrationStateKind(ctx context.Context, req *pb.ProbeMigrationStateRequest) (*pb.ProbeMigrationStateResponse, error) {
@@ -815,7 +832,7 @@ func exportRangeVersionsRequestRouteUnbounded(req *pb.ExportRangeVersionsRequest
 
 func (i *Internal) streamExportRangeVersions(req *pb.ExportRangeVersionsRequest, stream pb.Internal_ExportRangeVersionsServer) error {
 	opts := i.exportRangeVersionsOptions(req)
-	for {
+	for pages := uint32(1); ; pages++ {
 		result, err := i.store.ExportVersions(stream.Context(), opts)
 		if err != nil {
 			return errors.WithStack(err)
@@ -834,7 +851,9 @@ func (i *Internal) streamExportRangeVersions(req *pb.ExportRangeVersionsRequest,
 		if err := stream.Send(resp); err != nil {
 			return errors.WithStack(err)
 		}
-		if result.Done {
+		// A caller that checkpoints one page must not trigger another scan
+		// while cancelling this stream. Preserve the resumable cursor/Done.
+		if result.Done || (req.GetMaxPages() != 0 && pages >= req.GetMaxPages()) {
 			return nil
 		}
 		opts.Cursor = result.NextCursor
