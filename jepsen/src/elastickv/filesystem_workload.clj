@@ -448,7 +448,9 @@
 
 (defn remote-setup-cmd
   [mount-dir keys]
-  (str "mkdir -p " (sh-quote (workload-dir mount-dir))
+  (str "mountpoint -q " (sh-quote mount-dir)
+       " || { echo " (sh-quote (str mount-unavailable-message ": " mount-dir)) " >&2; exit 1; }; "
+       "mkdir -p " (sh-quote (workload-dir mount-dir))
        (apply str
               (for [k keys]
                 (str " && printf '%s' "

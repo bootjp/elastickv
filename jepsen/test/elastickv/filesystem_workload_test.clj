@@ -383,7 +383,8 @@
     (is (str/includes? read "[ \"$s\" -ge 16 ] || { echo 'short record' >&2; exit 1; }; "))
     (is (str/ends-with? read "exec head -c 16 '/mnt/fs/jepsen/reg-1'")))
   (let [setup (workload/remote-setup-cmd "/mnt/fs" [0 1])]
-    (is (str/starts-with? setup "mkdir -p '/mnt/fs/jepsen'"))
+    (is (str/starts-with? setup "mountpoint -q '/mnt/fs' || { echo 'mount unavailable: /mnt/fs' >&2; exit 1; }; "))
+    (is (str/includes? setup "mkdir -p '/mnt/fs/jepsen'"))
     (is (str/includes? setup "> '/mnt/fs/jepsen/reg-0'"))
     (is (str/includes? setup "> '/mnt/fs/jepsen/reg-1'"))))
 
@@ -785,7 +786,7 @@
            (swap! commands conj command)
            (is (< (count (.getBytes ^String command "UTF-8")) 32768)
                "setup must stay below the Linux single-argument limit")
-           (let [result (clojure.java.shell/sh "sh" "-c" command)]
+           (let [result (clojure.java.shell/sh "sh" "-c" (str "mountpoint() { return 0; }; " command))]
              (is (zero? (:exit result)) (:err result))))}
         #(client/setup! c {}))
       (is (> (count @commands) 1))
@@ -837,3 +838,30 @@
                                {:key-count 2 :node->mount-dir {"n1" "/mount"}}))]
             (client/setup! (client/open! base {} "n1") {})))
         (is (= 2 @calls) "a new test must initialize its own seed files")))))
+
+
+(deftest remote-setup-rejects-missing-mount-before-publishing-completion
+  (let [root (scratch-dir)
+        bad (str root "/missing-mount")
+        good (str root "/healthy-mount")
+        base (:client (workload/filesystem-register-workload
+                        {:key-count 2 :max-retries 1 :node->mount-dir {"n1" bad "n2" good}}))]
+    (try
+      (with-redefs-fn
+        {#'workload/remote-exec!
+         (fn [_ node command]
+           (let [mount-exit (if (= "n1" node) 1 0)
+                 result (clojure.java.shell/sh "sh" "-c"
+                          (str "mountpoint() { return " mount-exit "; }; " command))]
+             (when-not (zero? (:exit result))
+               (throw (ex-info (:err result) result)))))}
+        (fn []
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"mount unavailable"
+                (client/setup! (client/open! base {} "n1") {})))
+          (is (false? @(:setup-state base)))
+          (is (not (.exists (io/file bad))) "an unmounted path must receive no seed writes")
+          (client/setup! (client/open! base {} "n2") {})
+          (is (true? @(:setup-state base)))
+          (doseq [k (range 2)]
+            (is (= workload/initial-value (workload/local-read (workload/register-path good k)))))))
+      (finally (delete-tree! root)))))
