@@ -8,6 +8,7 @@ import (
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 	"pgregory.net/rapid"
 )
 
@@ -54,6 +55,37 @@ func TestGrpcTranscoder_Property_RawDelete(t *testing.T) {
 		_, ok := mem[string(key)]
 		require.False(t, ok)
 	})
+}
+
+func TestGrpcTranscoderPreservesRawOperationID(t *testing.T) {
+	t.Parallel()
+	id := append([]byte{1}, make([]byte, 15)...)
+	tr := newGrpcGrpcTranscoder()
+	put, err := tr.RawPutToRequest(&pb.RawPutRequest{Key: []byte("k"), Value: []byte("v"), OperationId: id})
+	require.NoError(t, err)
+	require.Equal(t, id, put.OperationID)
+	del, err := tr.RawDeleteToRequest(&pb.RawDeleteRequest{Key: []byte("k"), OperationId: id})
+	require.NoError(t, err)
+	require.Equal(t, id, del.OperationID)
+	id[0] = 2
+	require.Equal(t, byte(1), put.OperationID[0])
+	require.Equal(t, byte(1), del.OperationID[0])
+}
+
+func TestGRPCRawOperationIDWireRoundTrip(t *testing.T) {
+	t.Parallel()
+	id := append([]byte{1}, make([]byte, 15)...)
+	for _, original := range []proto.Message{
+		&pb.RawPutRequest{Key: []byte("k"), Value: []byte("v"), OperationId: id},
+		&pb.RawDeleteRequest{Key: []byte("k"), OperationId: id},
+	} {
+		encoded, err := proto.Marshal(original)
+		require.NoError(t, err)
+		decoded := proto.Clone(original)
+		proto.Reset(decoded)
+		require.NoError(t, proto.Unmarshal(encoded, decoded))
+		require.True(t, proto.Equal(original, decoded))
+	}
 }
 
 func TestGrpcTranscoder_Property_TxnOps(t *testing.T) {

@@ -1,0 +1,79 @@
+package clusterbootstrap
+
+import (
+	"slices"
+	"testing"
+
+	"github.com/bootjp/elastickv/internal/peersession"
+	pb "github.com/bootjp/elastickv/proto"
+	"github.com/stretchr/testify/require"
+)
+
+func TestTimestampAdmissionMethodsArePrivateAndGroupScoped(t *testing.T) {
+	public := BootstrapPublicGRPCMethods()
+	for _, name := range []string{pb.Internal_IssueBoundTimestamp_FullMethodName, pb.Internal_LookupTimestampBinding_FullMethodName,
+		pb.Internal_ProposeTwoGroupPrepare_FullMethodName, pb.Internal_VerifyTwoGroupPrepare_FullMethodName,
+		pb.Internal_ProposeTwoGroupTerminal_FullMethodName, pb.Internal_ProbeTwoGroupPrepareEvidence_FullMethodName} {
+		require.False(t, slices.Contains(public, name), "timestamp admission cannot bypass peer sessions")
+	}
+	for _, tc := range []struct {
+		group uint64
+		name  string
+		req   any
+		reply any
+	}{
+		{0, pb.Internal_IssueBoundTimestamp_FullMethodName,
+			&pb.IssueBoundTimestampRequest{MinTimestamp: 10, PhysicalBandProtocolVersion: 1},
+			&pb.IssueBoundTimestampResponse{Timestamp: 11, PhysicalBandProtocolVersion: 1, CommittedBandEnd: 0xffff}},
+		{17, pb.Internal_LookupTimestampBinding_FullMethodName, &pb.LookupTimestampBindingRequest{OperationId: append([]byte{1}, make([]byte, 15)...)}, &pb.LookupTimestampBindingResponse{AppliedIndex: 1}},
+	} {
+		methods := TimestampAdmissionPeerMethods(tc.group)
+		if tc.group == 0 {
+			require.Len(t, methods, 1)
+		} else {
+			require.Len(t, methods, 5)
+			require.Equal(t, pb.Internal_ProposeTwoGroupPrepare_FullMethodName, methods[1].Name)
+			require.False(t, methods[1].AllowPublic)
+			_, err := methods[1].BoundRequest(peersession.RequestBinding{Group: tc.group}, &pb.ProposeTwoGroupPrepareRequest{})
+			require.Error(t, err)
+			for _, method := range methods[2:] {
+				require.False(t, method.AllowPublic)
+			}
+			_, err = methods[2].BoundRequest(peersession.RequestBinding{Group: tc.group}, &pb.VerifyTwoGroupPrepareRequest{})
+			require.Error(t, err)
+			_, err = methods[3].BoundRequest(peersession.RequestBinding{Group: tc.group}, &pb.ProposeTwoGroupTerminalRequest{})
+			require.Error(t, err)
+			probe := methods[4]
+			binding := peersession.RequestBinding{Group: tc.group, From: peersession.Node{Member: 2}, To: peersession.Node{Member: 1}}
+			message, err := probe.BoundRequest(binding, &pb.ProbeTwoGroupPrepareEvidenceRequest{Version: 1})
+			require.NoError(t, err)
+			_, err = probe.Reply(message, &pb.ProbeTwoGroupPrepareEvidenceResponse{Version: 1, GroupId: tc.group, AppliedIndex: 3, LeaderTerm: 2})
+			require.NoError(t, err)
+			_, err = probe.BoundRequest(binding, &pb.ProbeTwoGroupPrepareEvidenceRequest{})
+			require.Error(t, err)
+			_, err = probe.BoundRequest(peersession.RequestBinding{Group: tc.group + 1}, &pb.ProbeTwoGroupPrepareEvidenceRequest{Version: 1})
+			require.Error(t, err)
+			_, err = probe.Reply(message, &pb.ProbeTwoGroupPrepareEvidenceResponse{Version: 1, GroupId: tc.group + 1, AppliedIndex: 3, LeaderTerm: 2})
+			require.Error(t, err)
+		}
+		method := methods[0]
+		require.Equal(t, tc.name, method.Name)
+		require.False(t, method.AllowPublic)
+		binding := peersession.RequestBinding{Group: tc.group, From: peersession.Node{Member: 2}, To: peersession.Node{Member: 1}}
+		message, err := method.BoundRequest(binding, tc.req)
+		require.NoError(t, err)
+		require.Equal(t, peersession.Control, message.Traffic)
+		require.Equal(t, tc.group, message.Group)
+		_, err = method.Reply(message, tc.reply)
+		require.NoError(t, err)
+		if tc.group == 0 {
+			_, err = method.BoundRequest(binding, &pb.IssueBoundTimestampRequest{MinTimestamp: 10})
+			require.Error(t, err, "old request cannot select physical-band issuance")
+			_, err = method.Reply(message, &pb.IssueBoundTimestampResponse{Timestamp: 11})
+			require.Error(t, err, "old response cannot satisfy the versioned contract")
+		}
+		binding.Group++
+		_, err = method.BoundRequest(binding, tc.req)
+		require.Error(t, err)
+	}
+}

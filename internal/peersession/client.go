@@ -26,6 +26,15 @@ func (h *Handle) SessionID() raftbootstrap.Digest {
 	}
 	return h.s.id
 }
+
+// GroupID identifies the group authenticated by this handle. It does not
+// replace Invoke's live-session and transport checks.
+func (h *Handle) GroupID() uint64 {
+	if h == nil || h.s == nil {
+		return 0
+	}
+	return h.s.binding.Group
+}
 func (h *Handle) Done() <-chan struct{} {
 	if h == nil || h.s == nil {
 		ch := make(chan struct{})

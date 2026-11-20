@@ -185,20 +185,49 @@ Implementation order:
    creation in one indexed Raft entry, recompute the manifest digest on every
    replica, and skip an exact replay. A local lookup checks both indexes for
    unknown-outcome reconciliation. This branch adds an opt-in applied-leader
-   read barrier and a remote lookup RPC, but no production reconciliation
-   route is wired. Production admission rejects the new
+   read barrier and a remote lookup RPC. The lookup rejects a changed leader
+   term or expired peer session before returning, but no production
+   reconciliation route is wired. Production admission rejects the new
    operation-ID field until authenticated issuance and activation are wired.
    Before replicated activation, FSM apply ignores that field for single and
    batched entries so mixed-version replicas retain legacy apply semantics;
-   ingress still rejects newly bound requests.
+   ingress still rejects newly bound requests. A focused integration test now
+   carries native group-0 issuance through home preparation, atomic binding
+   and data apply, and exact-ID retry. An in-process pending-ID gate now
+   prevents concurrent or ambiguous retries from reissuing before the applied
+   binding is observed. The home lookup verifies a stable leader term before
+   and after its applied ReadIndex and lookup. Prepared requests now carry
+   that term, and the native Raft event loop rejects a stale term before
+   submitting the proposal. After a new-term applied barrier finds no binding,
+   the process-local pending gate can reissue; a delayed old-term request is
+   fenced even across process restart. This is not a production admission
+   capability: Forward still rejects bound requests, and all-member activation
+   and authenticated issuance remain required. A successful atomic data-group
+   apply now clears the matching process-local pending attempt; failed apply or
+   a different timestamp retains it. Unknown outcomes still require durable
+   reconciliation before production activation. The applied read barrier runs
+   outside the attempt mutex so Raft apply can finish and release a binding
+   while a retry waits for ReadIndex; the mutex still serializes issuance after
+   the barrier.
+   The integration test
+   uses a test issuer and method descriptor, not the production allocator and
+   registered method. It is not the production Forward path. Memory and Pebble
+   snapshot/restore tests now verify both binding indexes survive restore and
+   still reject conflicting operation IDs; a retention policy is not defined.
 2. Authenticated issuance and primary/home admission path, including unknown
    outcome reconciliation and cross-group PREPARE/COMMIT/ABORT evidence. This
-   branch adds a TLS-and-bearer-guarded group-0 issuance RPC and an opt-in
-   single-home raw binding preparation helper. Neither RPC is installed in
-   production: TLS plus a bearer token does not establish peer-session
-   identity, and no replicated all-member activation gate or stable public raw
-   operation ID exists yet. The helper therefore cannot authorize production
-   writes or serve as a substitute for primary/secondary evidence.
+   branch adds a versioned, physical-band-backed group-0 issuance RPC and an
+   opt-in single-home raw binding preparation helper. Protected-bootstrap
+   runtimes register issuance and home lookup as typed private peer-session
+   methods; TLS plus a bearer token alone is rejected. The authenticated
+   client checks the versioned response and has no legacy fallback. The
+   handler option and client route are not installed in production: no
+   replicated all-member activation gate exists yet. The public RawPut and
+   RawDelete messages now carry an optional caller-stable operation ID through
+   the operation group and raw request builders, but production validation
+   rejects ID-bearing writes before timestamp issuance until durable admission
+   is installed. The helper therefore cannot authorize production writes or
+   serve as a substitute for primary/secondary evidence.
 3. Physical-band group-0 reservation and versioned reservation response;
    prove no duplicate issuance across concurrent allocators, term changes,
    ambiguous proposals, and ceiling renewal. An opt-in local allocator now
@@ -211,7 +240,120 @@ Implementation order:
    activation, and data-group admission remain open.
 4. Whole-cluster activation gate, migration and rolling-upgrade tests, native
    fault campaigns, Jepsen, and throughput/latency comparison with the old
-   per-window allocator. No production activation before all gates pass.
+   per-window allocator. A read-only rolling-upgrade preflight now checks that
+   every current voter and learner of one locally led group advertises the
+   timestamp-binding protocol version under a stable term and configuration.
+   This is not a replicated activation decision and does not enable admission.
+   No production activation before all gates pass.
+
+### 4c. Two-group PREPARE admission record (design contract, not activated)
+
+The first cross-group implementation is limited to exactly two data groups and
+an explicit 16-byte nonzero operation ID. It does not change legacy PREPARE,
+public Forward, or Phase D. A version-1 two-group home-admission record is distinct from
+the existing per-group `TimestampBinding`: the latter hashes one
+group's Raft request and cannot represent a full participant manifest.
+
+- Canonical manifest v1 contains the operation ID, persistence timestamp,
+  primary group ID, and exactly two participants with an identical transaction
+  start timestamp in their PREPARE requests,
+  sorted by distinct group ID. Each participant contains its complete PREPARE
+  projection: ordered mutations (including transaction metadata), read keys,
+  route version, and bypass keys. Transient admission term, peer receipt, and
+  attestation fields are excluded. Reject unknown fields, duplicate groups,
+  noncanonical encoding, or a local PREPARE whose projection differs. Hash the
+  versioned canonical bytes with a domain-separated SHA-256; persist both the
+  full digest and each participant's domain-separated projection digest.
+- The primary data group's indexed Raft entry atomically applies its PREPARE
+  and stages two immutable indexes: operation ID to (timestamp, full digest,
+  both projection digests, primary group, phase) and timestamp to the same
+  identity. An exact replay is idempotent. Any changed timestamp, participant,
+  projection, phase, or primary group is a conflict. The primary's applied
+  record must precede the secondary's PREPARE; a sent or acknowledged proposal
+  without an applied record is not evidence.
+- The secondary leader obtains the primary record only through a private,
+  authenticated peer session to the current home leader. The home handler
+  performs an applied ReadIndex and checks its leader term and session before
+  and after lookup. The response identifies the home group, operation ID,
+  timestamp, full and projection digests, phase, applied index, leader term,
+  and record version. The secondary compares every field to
+  its locally constructed canonical manifest before proposing. Missing,
+  stale-term, ambiguous, malformed, or mismatched evidence fails closed.
+- The secondary leader constructs an admission observation from that verified
+  response; public Forward cannot supply or amend it. The secondary Raft entry
+  carries the observation and canonical manifest. Every secondary replica
+  checks its version, home identity, operation/timestamp, full and local
+  projection digests, and the exact local PREPARE at apply. It atomically
+  stages both secondary binding indexes, the observation, and PREPARE. An
+  absent or incompatible observation rejects the entire entry. Replay after
+  rotation or leader transfer uses the persisted observation, not the old
+  peer session or a fresh RPC. New lookups require a current authenticated
+  session and current home leader; an old TLS key never regains live access.
+  This is durable leader-observed evidence under the trusted-member,
+  crash-fault Raft model, not an independently verifiable Byzantine proof or
+  a cryptographic quorum certificate.
+- COMMIT/ABORT may only consume the matching durable PREPARE identity and
+  record an immutable terminal decision. A secondary COMMIT additionally
+  verifies the matching durable primary COMMIT decision; an unknown primary
+  outcome retains the secondary PREPARE for resolution. A terminal record
+  never releases its timestamp for another operation. No binding or
+  attestation is garbage collected until an explicit retry/outcome-resolution
+  horizon, snapshot retention rule, and all-participant terminal proof are
+  specified and tested;
+  in the interim retain them indefinitely across compaction and restore.
+
+Failure cases to test before activation: secondary-before-home; wrong ID,
+timestamp, primary group, participant set, or projection; forged/expired peer
+credential or caller observation; home leader transfer between ReadIndex and reply;
+secondary transfer between lookup and proposal; lost home PREPARE reply with
+same-ID retry; crash after home apply but before secondary PREPARE; and restore
+of either group before COMMIT/ABORT. A failed apply must leave neither local
+binding nor data. Admission must be built from the authenticated applied
+lookup by the trusted secondary leader; a caller-provided digest cannot replace it.
+Mixed-version activation remains disabled until every voter and learner can
+decode, validate, snapshot, and restore the existing binding and the new
+home/secondary admission records.
+
+Current implementation status: an opt-in, versioned Raft entry carries the
+canonical manifest and the secondary leader's lookup observation. An enabled
+FSM checks its local group, protected entry identity, full manifest, local
+projection and observation, and atomically applies the exact embedded PREPARE
+with the binding and record. Its reserved command prefix cannot alias a bare
+legacy protobuf request. It rejects legacy PREPARE and COMMIT/ABORT at FSM
+apply. The opt-in coordinator
+derives the operation ID internally, proposes home first, reconciles an unknown
+home reply through the authenticated applied lookup, and term-fences the
+secondary proposal through a trusted PREPARE-only call. The manifest validator
+requires that ID to equal the versioned derivation from
+the primary key and transaction start timestamp, which is also the lock
+resolver's durable-record lookup key. The path has a private
+peer-session route for a remote group leader: the RPC carries
+only the canonical manifest, and the destination leader constructs its own
+applied home observation before term-fenced proposal. The peer method is not
+publicly admitted, and the handler remains default-off in production. The
+trusted PREPARE entry is package-private rather than a capability exposed by
+startup coordinator wrappers. A separate versioned terminal entry now records
+an immutable local COMMIT/ABORT decision with the binding, and a secondary
+COMMIT requires an applied primary decision observation. The local-leader
+coordinator reconciles a lost primary reply, and the lock resolver retains a
+prepared lock when the required decision or leadership is unavailable. A
+private peer-session route now verifies a remote secondary PREPARE before the
+primary COMMIT and proposes remote COMMIT/ABORT with term and session checks;
+the destination constructs its own applied home-decision observation. This
+route is still default-off and is not production-ready. Normal Dispatch is fenced
+while this opt-in is configured, because legacy terminal COMMIT/ABORT cannot
+consume the new identity. Public Forward cannot supply an observation. The
+coordinator can construct a canonical manifest for a remote-only participant
+after an authenticated, group-scoped leader probe confirms its applied
+PREPARE-evidence marker. The probe is default-off. When that probe and the
+existing private PREPARE/terminal peer routes are explicitly configured, the
+coordinator can also propose and resolve a participant with no local group
+entry. This is covered with real FSM apply and in-process peer-route tests;
+cross-node Raft/gRPC fault tests are still needed before activation. The
+production all-member activation gate, cross-node Raft fault tests, retention
+horizon, and mixed-version rollout tests remain open. Production must not
+install the opt-in coordinator lookup or enable the FSM command until those
+gates are satisfied.
 
 ## 5. Open questions
 

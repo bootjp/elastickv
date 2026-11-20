@@ -606,8 +606,11 @@ type Request struct {
 	// timestamp source before proposing this field; replicas recompute the
 	// manifest digest from the request rather than trusting a supplied hash.
 	TimestampBindingOperationId []byte `protobuf:"bytes,9,opt,name=timestamp_binding_operation_id,json=timestampBindingOperationId,proto3" json:"timestamp_binding_operation_id,omitempty"`
-	unknownFields               protoimpl.UnknownFields
-	sizeCache                   protoimpl.SizeCache
+	// The leader term that prepared this binding. The proposer checks it in
+	// the Raft event loop before submitting the entry.
+	TimestampBindingAdmissionTerm uint64 `protobuf:"varint,10,opt,name=timestamp_binding_admission_term,json=timestampBindingAdmissionTerm,proto3" json:"timestamp_binding_admission_term,omitempty"`
+	unknownFields                 protoimpl.UnknownFields
+	sizeCache                     protoimpl.SizeCache
 }
 
 func (x *Request) Reset() {
@@ -701,6 +704,13 @@ func (x *Request) GetTimestampBindingOperationId() []byte {
 		return x.TimestampBindingOperationId
 	}
 	return nil
+}
+
+func (x *Request) GetTimestampBindingAdmissionTerm() uint64 {
+	if x != nil {
+		return x.TimestampBindingAdmissionTerm
+	}
+	return 0
 }
 
 type RaftCommand struct {
@@ -1186,8 +1196,10 @@ type PrepareEvidenceStateResponse struct {
 	AppliedIndex           uint64                 `protobuf:"varint,5,opt,name=applied_index,json=appliedIndex,proto3" json:"applied_index,omitempty"`
 	CutoverApplied         bool                   `protobuf:"varint,6,opt,name=cutover_applied,json=cutoverApplied,proto3" json:"cutover_applied,omitempty"`
 	DedicatedTsoConfigured bool                   `protobuf:"varint,7,opt,name=dedicated_tso_configured,json=dedicatedTsoConfigured,proto3" json:"dedicated_tso_configured,omitempty"`
-	unknownFields          protoimpl.UnknownFields
-	sizeCache              protoimpl.SizeCache
+	// Binary support only; this does not authorize timestamp-bound proposals.
+	TimestampBindingProtocolVersion uint32 `protobuf:"varint,8,opt,name=timestamp_binding_protocol_version,json=timestampBindingProtocolVersion,proto3" json:"timestamp_binding_protocol_version,omitempty"`
+	unknownFields                   protoimpl.UnknownFields
+	sizeCache                       protoimpl.SizeCache
 }
 
 func (x *PrepareEvidenceStateResponse) Reset() {
@@ -1267,6 +1279,13 @@ func (x *PrepareEvidenceStateResponse) GetDedicatedTsoConfigured() bool {
 		return x.DedicatedTsoConfigured
 	}
 	return false
+}
+
+func (x *PrepareEvidenceStateResponse) GetTimestampBindingProtocolVersion() uint32 {
+	if x != nil {
+		return x.TimestampBindingProtocolVersion
+	}
+	return 0
 }
 
 type RelayPublishRequest struct {
@@ -3087,10 +3106,13 @@ func (x *IssueMigrationTimestampResponse) GetLastCommitTs() uint64 {
 }
 
 type IssueBoundTimestampRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	MinTimestamp  uint64                 `protobuf:"varint,1,opt,name=min_timestamp,json=minTimestamp,proto3" json:"min_timestamp,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	MinTimestamp uint64                 `protobuf:"varint,1,opt,name=min_timestamp,json=minTimestamp,proto3" json:"min_timestamp,omitempty"`
+	// Version 1 requires a committed physical-band issuance. An old server
+	// ignores this field and returns version zero, which callers must reject.
+	PhysicalBandProtocolVersion uint32 `protobuf:"varint,2,opt,name=physical_band_protocol_version,json=physicalBandProtocolVersion,proto3" json:"physical_band_protocol_version,omitempty"`
+	unknownFields               protoimpl.UnknownFields
+	sizeCache                   protoimpl.SizeCache
 }
 
 func (x *IssueBoundTimestampRequest) Reset() {
@@ -3130,11 +3152,21 @@ func (x *IssueBoundTimestampRequest) GetMinTimestamp() uint64 {
 	return 0
 }
 
+func (x *IssueBoundTimestampRequest) GetPhysicalBandProtocolVersion() uint32 {
+	if x != nil {
+		return x.PhysicalBandProtocolVersion
+	}
+	return 0
+}
+
 type IssueBoundTimestampResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Timestamp     uint64                 `protobuf:"varint,1,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state                       protoimpl.MessageState `protogen:"open.v1"`
+	Timestamp                   uint64                 `protobuf:"varint,1,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	PhysicalBandProtocolVersion uint32                 `protobuf:"varint,2,opt,name=physical_band_protocol_version,json=physicalBandProtocolVersion,proto3" json:"physical_band_protocol_version,omitempty"`
+	CommittedBandEnd            uint64                 `protobuf:"varint,3,opt,name=committed_band_end,json=committedBandEnd,proto3" json:"committed_band_end,omitempty"`
+	PreviousIssuedCursor        uint64                 `protobuf:"varint,4,opt,name=previous_issued_cursor,json=previousIssuedCursor,proto3" json:"previous_issued_cursor,omitempty"`
+	unknownFields               protoimpl.UnknownFields
+	sizeCache                   protoimpl.SizeCache
 }
 
 func (x *IssueBoundTimestampResponse) Reset() {
@@ -3174,11 +3206,34 @@ func (x *IssueBoundTimestampResponse) GetTimestamp() uint64 {
 	return 0
 }
 
+func (x *IssueBoundTimestampResponse) GetPhysicalBandProtocolVersion() uint32 {
+	if x != nil {
+		return x.PhysicalBandProtocolVersion
+	}
+	return 0
+}
+
+func (x *IssueBoundTimestampResponse) GetCommittedBandEnd() uint64 {
+	if x != nil {
+		return x.CommittedBandEnd
+	}
+	return 0
+}
+
+func (x *IssueBoundTimestampResponse) GetPreviousIssuedCursor() uint64 {
+	if x != nil {
+		return x.PreviousIssuedCursor
+	}
+	return 0
+}
+
 type LookupTimestampBindingRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	OperationId   []byte                 `protobuf:"bytes,1,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	OperationId []byte                 `protobuf:"bytes,1,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
+	// Opt-in two-group PREPARE admission. Old servers reject the unknown field.
+	HomeAdmissionVersion uint32 `protobuf:"varint,2,opt,name=home_admission_version,json=homeAdmissionVersion,proto3" json:"home_admission_version,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *LookupTimestampBindingRequest) Reset() {
@@ -3218,16 +3273,27 @@ func (x *LookupTimestampBindingRequest) GetOperationId() []byte {
 	return nil
 }
 
+func (x *LookupTimestampBindingRequest) GetHomeAdmissionVersion() uint32 {
+	if x != nil {
+		return x.HomeAdmissionVersion
+	}
+	return 0
+}
+
 type LookupTimestampBindingResponse struct {
-	state          protoimpl.MessageState `protogen:"open.v1"`
-	Found          bool                   `protobuf:"varint,1,opt,name=found,proto3" json:"found,omitempty"`
-	Timestamp      uint64                 `protobuf:"varint,2,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
-	ManifestDigest []byte                 `protobuf:"bytes,3,opt,name=manifest_digest,json=manifestDigest,proto3" json:"manifest_digest,omitempty"`
-	IsTxn          bool                   `protobuf:"varint,4,opt,name=is_txn,json=isTxn,proto3" json:"is_txn,omitempty"`
-	Phase          Phase                  `protobuf:"varint,5,opt,name=phase,proto3,enum=Phase" json:"phase,omitempty"`
-	AppliedIndex   uint64                 `protobuf:"varint,6,opt,name=applied_index,json=appliedIndex,proto3" json:"applied_index,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	state                protoimpl.MessageState `protogen:"open.v1"`
+	Found                bool                   `protobuf:"varint,1,opt,name=found,proto3" json:"found,omitempty"`
+	Timestamp            uint64                 `protobuf:"varint,2,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	ManifestDigest       []byte                 `protobuf:"bytes,3,opt,name=manifest_digest,json=manifestDigest,proto3" json:"manifest_digest,omitempty"`
+	IsTxn                bool                   `protobuf:"varint,4,opt,name=is_txn,json=isTxn,proto3" json:"is_txn,omitempty"`
+	Phase                Phase                  `protobuf:"varint,5,opt,name=phase,proto3,enum=Phase" json:"phase,omitempty"`
+	AppliedIndex         uint64                 `protobuf:"varint,6,opt,name=applied_index,json=appliedIndex,proto3" json:"applied_index,omitempty"`
+	HomeAdmissionVersion uint32                 `protobuf:"varint,7,opt,name=home_admission_version,json=homeAdmissionVersion,proto3" json:"home_admission_version,omitempty"`
+	HomeAdmissionRecord  []byte                 `protobuf:"bytes,8,opt,name=home_admission_record,json=homeAdmissionRecord,proto3" json:"home_admission_record,omitempty"`
+	LeaderTerm           uint64                 `protobuf:"varint,9,opt,name=leader_term,json=leaderTerm,proto3" json:"leader_term,omitempty"`
+	HomeTerminalRecord   []byte                 `protobuf:"bytes,10,opt,name=home_terminal_record,json=homeTerminalRecord,proto3" json:"home_terminal_record,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *LookupTimestampBindingResponse) Reset() {
@@ -3302,6 +3368,933 @@ func (x *LookupTimestampBindingResponse) GetAppliedIndex() uint64 {
 	return 0
 }
 
+func (x *LookupTimestampBindingResponse) GetHomeAdmissionVersion() uint32 {
+	if x != nil {
+		return x.HomeAdmissionVersion
+	}
+	return 0
+}
+
+func (x *LookupTimestampBindingResponse) GetHomeAdmissionRecord() []byte {
+	if x != nil {
+		return x.HomeAdmissionRecord
+	}
+	return nil
+}
+
+func (x *LookupTimestampBindingResponse) GetLeaderTerm() uint64 {
+	if x != nil {
+		return x.LeaderTerm
+	}
+	return 0
+}
+
+func (x *LookupTimestampBindingResponse) GetHomeTerminalRecord() []byte {
+	if x != nil {
+		return x.HomeTerminalRecord
+	}
+	return nil
+}
+
+type TwoGroupPrepareParticipant struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	GroupId       uint64                 `protobuf:"varint,1,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`
+	Prepare       *Request               `protobuf:"bytes,2,opt,name=prepare,proto3" json:"prepare,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TwoGroupPrepareParticipant) Reset() {
+	*x = TwoGroupPrepareParticipant{}
+	mi := &file_internal_proto_msgTypes[36]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TwoGroupPrepareParticipant) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TwoGroupPrepareParticipant) ProtoMessage() {}
+
+func (x *TwoGroupPrepareParticipant) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[36]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TwoGroupPrepareParticipant.ProtoReflect.Descriptor instead.
+func (*TwoGroupPrepareParticipant) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{36}
+}
+
+func (x *TwoGroupPrepareParticipant) GetGroupId() uint64 {
+	if x != nil {
+		return x.GroupId
+	}
+	return 0
+}
+
+func (x *TwoGroupPrepareParticipant) GetPrepare() *Request {
+	if x != nil {
+		return x.Prepare
+	}
+	return nil
+}
+
+type TwoGroupPrepareManifest struct {
+	state                protoimpl.MessageState        `protogen:"open.v1"`
+	OperationId          []byte                        `protobuf:"bytes,1,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
+	PersistenceTimestamp uint64                        `protobuf:"varint,2,opt,name=persistence_timestamp,json=persistenceTimestamp,proto3" json:"persistence_timestamp,omitempty"`
+	PrimaryGroupId       uint64                        `protobuf:"varint,3,opt,name=primary_group_id,json=primaryGroupId,proto3" json:"primary_group_id,omitempty"`
+	Participants         []*TwoGroupPrepareParticipant `protobuf:"bytes,4,rep,name=participants,proto3" json:"participants,omitempty"`
+	Version              uint32                        `protobuf:"varint,5,opt,name=version,proto3" json:"version,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
+}
+
+func (x *TwoGroupPrepareManifest) Reset() {
+	*x = TwoGroupPrepareManifest{}
+	mi := &file_internal_proto_msgTypes[37]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TwoGroupPrepareManifest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TwoGroupPrepareManifest) ProtoMessage() {}
+
+func (x *TwoGroupPrepareManifest) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[37]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TwoGroupPrepareManifest.ProtoReflect.Descriptor instead.
+func (*TwoGroupPrepareManifest) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{37}
+}
+
+func (x *TwoGroupPrepareManifest) GetOperationId() []byte {
+	if x != nil {
+		return x.OperationId
+	}
+	return nil
+}
+
+func (x *TwoGroupPrepareManifest) GetPersistenceTimestamp() uint64 {
+	if x != nil {
+		return x.PersistenceTimestamp
+	}
+	return 0
+}
+
+func (x *TwoGroupPrepareManifest) GetPrimaryGroupId() uint64 {
+	if x != nil {
+		return x.PrimaryGroupId
+	}
+	return 0
+}
+
+func (x *TwoGroupPrepareManifest) GetParticipants() []*TwoGroupPrepareParticipant {
+	if x != nil {
+		return x.Participants
+	}
+	return nil
+}
+
+func (x *TwoGroupPrepareManifest) GetVersion() uint32 {
+	if x != nil {
+		return x.Version
+	}
+	return 0
+}
+
+// Only the manifest crosses the peer RPC. The destination constructs the
+// home observation itself; callers cannot submit replicated entry bytes.
+type ProposeTwoGroupPrepareRequest struct {
+	state         protoimpl.MessageState   `protogen:"open.v1"`
+	Manifest      *TwoGroupPrepareManifest `protobuf:"bytes,1,opt,name=manifest,proto3" json:"manifest,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ProposeTwoGroupPrepareRequest) Reset() {
+	*x = ProposeTwoGroupPrepareRequest{}
+	mi := &file_internal_proto_msgTypes[38]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ProposeTwoGroupPrepareRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ProposeTwoGroupPrepareRequest) ProtoMessage() {}
+
+func (x *ProposeTwoGroupPrepareRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[38]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ProposeTwoGroupPrepareRequest.ProtoReflect.Descriptor instead.
+func (*ProposeTwoGroupPrepareRequest) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{38}
+}
+
+func (x *ProposeTwoGroupPrepareRequest) GetManifest() *TwoGroupPrepareManifest {
+	if x != nil {
+		return x.Manifest
+	}
+	return nil
+}
+
+type ProposeTwoGroupPrepareResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	CommitIndex   uint64                 `protobuf:"varint,1,opt,name=commit_index,json=commitIndex,proto3" json:"commit_index,omitempty"`
+	LeaderTerm    uint64                 `protobuf:"varint,2,opt,name=leader_term,json=leaderTerm,proto3" json:"leader_term,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ProposeTwoGroupPrepareResponse) Reset() {
+	*x = ProposeTwoGroupPrepareResponse{}
+	mi := &file_internal_proto_msgTypes[39]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ProposeTwoGroupPrepareResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ProposeTwoGroupPrepareResponse) ProtoMessage() {}
+
+func (x *ProposeTwoGroupPrepareResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[39]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ProposeTwoGroupPrepareResponse.ProtoReflect.Descriptor instead.
+func (*ProposeTwoGroupPrepareResponse) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{39}
+}
+
+func (x *ProposeTwoGroupPrepareResponse) GetCommitIndex() uint64 {
+	if x != nil {
+		return x.CommitIndex
+	}
+	return 0
+}
+
+func (x *ProposeTwoGroupPrepareResponse) GetLeaderTerm() uint64 {
+	if x != nil {
+		return x.LeaderTerm
+	}
+	return 0
+}
+
+type VerifyTwoGroupPrepareRequest struct {
+	state         protoimpl.MessageState   `protogen:"open.v1"`
+	Manifest      *TwoGroupPrepareManifest `protobuf:"bytes,1,opt,name=manifest,proto3" json:"manifest,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *VerifyTwoGroupPrepareRequest) Reset() {
+	*x = VerifyTwoGroupPrepareRequest{}
+	mi := &file_internal_proto_msgTypes[40]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *VerifyTwoGroupPrepareRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*VerifyTwoGroupPrepareRequest) ProtoMessage() {}
+
+func (x *VerifyTwoGroupPrepareRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[40]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use VerifyTwoGroupPrepareRequest.ProtoReflect.Descriptor instead.
+func (*VerifyTwoGroupPrepareRequest) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{40}
+}
+
+func (x *VerifyTwoGroupPrepareRequest) GetManifest() *TwoGroupPrepareManifest {
+	if x != nil {
+		return x.Manifest
+	}
+	return nil
+}
+
+type VerifyTwoGroupPrepareResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	AppliedIndex  uint64                 `protobuf:"varint,1,opt,name=applied_index,json=appliedIndex,proto3" json:"applied_index,omitempty"`
+	LeaderTerm    uint64                 `protobuf:"varint,2,opt,name=leader_term,json=leaderTerm,proto3" json:"leader_term,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *VerifyTwoGroupPrepareResponse) Reset() {
+	*x = VerifyTwoGroupPrepareResponse{}
+	mi := &file_internal_proto_msgTypes[41]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *VerifyTwoGroupPrepareResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*VerifyTwoGroupPrepareResponse) ProtoMessage() {}
+
+func (x *VerifyTwoGroupPrepareResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[41]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use VerifyTwoGroupPrepareResponse.ProtoReflect.Descriptor instead.
+func (*VerifyTwoGroupPrepareResponse) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{41}
+}
+
+func (x *VerifyTwoGroupPrepareResponse) GetAppliedIndex() uint64 {
+	if x != nil {
+		return x.AppliedIndex
+	}
+	return 0
+}
+
+func (x *VerifyTwoGroupPrepareResponse) GetLeaderTerm() uint64 {
+	if x != nil {
+		return x.LeaderTerm
+	}
+	return 0
+}
+
+type ProposeTwoGroupTerminalRequest struct {
+	state         protoimpl.MessageState   `protogen:"open.v1"`
+	Manifest      *TwoGroupPrepareManifest `protobuf:"bytes,1,opt,name=manifest,proto3" json:"manifest,omitempty"`
+	Decision      Phase                    `protobuf:"varint,2,opt,name=decision,proto3,enum=Phase" json:"decision,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ProposeTwoGroupTerminalRequest) Reset() {
+	*x = ProposeTwoGroupTerminalRequest{}
+	mi := &file_internal_proto_msgTypes[42]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ProposeTwoGroupTerminalRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ProposeTwoGroupTerminalRequest) ProtoMessage() {}
+
+func (x *ProposeTwoGroupTerminalRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[42]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ProposeTwoGroupTerminalRequest.ProtoReflect.Descriptor instead.
+func (*ProposeTwoGroupTerminalRequest) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{42}
+}
+
+func (x *ProposeTwoGroupTerminalRequest) GetManifest() *TwoGroupPrepareManifest {
+	if x != nil {
+		return x.Manifest
+	}
+	return nil
+}
+
+func (x *ProposeTwoGroupTerminalRequest) GetDecision() Phase {
+	if x != nil {
+		return x.Decision
+	}
+	return Phase_NONE
+}
+
+type ProposeTwoGroupTerminalResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	CommitIndex   uint64                 `protobuf:"varint,1,opt,name=commit_index,json=commitIndex,proto3" json:"commit_index,omitempty"`
+	LeaderTerm    uint64                 `protobuf:"varint,2,opt,name=leader_term,json=leaderTerm,proto3" json:"leader_term,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ProposeTwoGroupTerminalResponse) Reset() {
+	*x = ProposeTwoGroupTerminalResponse{}
+	mi := &file_internal_proto_msgTypes[43]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ProposeTwoGroupTerminalResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ProposeTwoGroupTerminalResponse) ProtoMessage() {}
+
+func (x *ProposeTwoGroupTerminalResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[43]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ProposeTwoGroupTerminalResponse.ProtoReflect.Descriptor instead.
+func (*ProposeTwoGroupTerminalResponse) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{43}
+}
+
+func (x *ProposeTwoGroupTerminalResponse) GetCommitIndex() uint64 {
+	if x != nil {
+		return x.CommitIndex
+	}
+	return 0
+}
+
+func (x *ProposeTwoGroupTerminalResponse) GetLeaderTerm() uint64 {
+	if x != nil {
+		return x.LeaderTerm
+	}
+	return 0
+}
+
+type ProbeTwoGroupPrepareEvidenceRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Version       uint32                 `protobuf:"varint,1,opt,name=version,proto3" json:"version,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ProbeTwoGroupPrepareEvidenceRequest) Reset() {
+	*x = ProbeTwoGroupPrepareEvidenceRequest{}
+	mi := &file_internal_proto_msgTypes[44]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ProbeTwoGroupPrepareEvidenceRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ProbeTwoGroupPrepareEvidenceRequest) ProtoMessage() {}
+
+func (x *ProbeTwoGroupPrepareEvidenceRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[44]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ProbeTwoGroupPrepareEvidenceRequest.ProtoReflect.Descriptor instead.
+func (*ProbeTwoGroupPrepareEvidenceRequest) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{44}
+}
+
+func (x *ProbeTwoGroupPrepareEvidenceRequest) GetVersion() uint32 {
+	if x != nil {
+		return x.Version
+	}
+	return 0
+}
+
+type ProbeTwoGroupPrepareEvidenceResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Version       uint32                 `protobuf:"varint,1,opt,name=version,proto3" json:"version,omitempty"`
+	GroupId       uint64                 `protobuf:"varint,2,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`
+	ProofEnabled  bool                   `protobuf:"varint,3,opt,name=proof_enabled,json=proofEnabled,proto3" json:"proof_enabled,omitempty"`
+	AppliedIndex  uint64                 `protobuf:"varint,4,opt,name=applied_index,json=appliedIndex,proto3" json:"applied_index,omitempty"`
+	LeaderTerm    uint64                 `protobuf:"varint,5,opt,name=leader_term,json=leaderTerm,proto3" json:"leader_term,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ProbeTwoGroupPrepareEvidenceResponse) Reset() {
+	*x = ProbeTwoGroupPrepareEvidenceResponse{}
+	mi := &file_internal_proto_msgTypes[45]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ProbeTwoGroupPrepareEvidenceResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ProbeTwoGroupPrepareEvidenceResponse) ProtoMessage() {}
+
+func (x *ProbeTwoGroupPrepareEvidenceResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[45]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ProbeTwoGroupPrepareEvidenceResponse.ProtoReflect.Descriptor instead.
+func (*ProbeTwoGroupPrepareEvidenceResponse) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{45}
+}
+
+func (x *ProbeTwoGroupPrepareEvidenceResponse) GetVersion() uint32 {
+	if x != nil {
+		return x.Version
+	}
+	return 0
+}
+
+func (x *ProbeTwoGroupPrepareEvidenceResponse) GetGroupId() uint64 {
+	if x != nil {
+		return x.GroupId
+	}
+	return 0
+}
+
+func (x *ProbeTwoGroupPrepareEvidenceResponse) GetProofEnabled() bool {
+	if x != nil {
+		return x.ProofEnabled
+	}
+	return false
+}
+
+func (x *ProbeTwoGroupPrepareEvidenceResponse) GetAppliedIndex() uint64 {
+	if x != nil {
+		return x.AppliedIndex
+	}
+	return 0
+}
+
+func (x *ProbeTwoGroupPrepareEvidenceResponse) GetLeaderTerm() uint64 {
+	if x != nil {
+		return x.LeaderTerm
+	}
+	return 0
+}
+
+type TwoGroupHomeAdmissionRecord struct {
+	state             protoimpl.MessageState   `protogen:"open.v1"`
+	Version           uint32                   `protobuf:"varint,1,opt,name=version,proto3" json:"version,omitempty"`
+	Manifest          *TwoGroupPrepareManifest `protobuf:"bytes,2,opt,name=manifest,proto3" json:"manifest,omitempty"`
+	FullDigest        []byte                   `protobuf:"bytes,3,opt,name=full_digest,json=fullDigest,proto3" json:"full_digest,omitempty"`
+	ProjectionDigests [][]byte                 `protobuf:"bytes,4,rep,name=projection_digests,json=projectionDigests,proto3" json:"projection_digests,omitempty"`
+	AppliedIndex      uint64                   `protobuf:"varint,5,opt,name=applied_index,json=appliedIndex,proto3" json:"applied_index,omitempty"`
+	AppliedTerm       uint64                   `protobuf:"varint,6,opt,name=applied_term,json=appliedTerm,proto3" json:"applied_term,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
+}
+
+func (x *TwoGroupHomeAdmissionRecord) Reset() {
+	*x = TwoGroupHomeAdmissionRecord{}
+	mi := &file_internal_proto_msgTypes[46]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TwoGroupHomeAdmissionRecord) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TwoGroupHomeAdmissionRecord) ProtoMessage() {}
+
+func (x *TwoGroupHomeAdmissionRecord) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[46]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TwoGroupHomeAdmissionRecord.ProtoReflect.Descriptor instead.
+func (*TwoGroupHomeAdmissionRecord) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{46}
+}
+
+func (x *TwoGroupHomeAdmissionRecord) GetVersion() uint32 {
+	if x != nil {
+		return x.Version
+	}
+	return 0
+}
+
+func (x *TwoGroupHomeAdmissionRecord) GetManifest() *TwoGroupPrepareManifest {
+	if x != nil {
+		return x.Manifest
+	}
+	return nil
+}
+
+func (x *TwoGroupHomeAdmissionRecord) GetFullDigest() []byte {
+	if x != nil {
+		return x.FullDigest
+	}
+	return nil
+}
+
+func (x *TwoGroupHomeAdmissionRecord) GetProjectionDigests() [][]byte {
+	if x != nil {
+		return x.ProjectionDigests
+	}
+	return nil
+}
+
+func (x *TwoGroupHomeAdmissionRecord) GetAppliedIndex() uint64 {
+	if x != nil {
+		return x.AppliedIndex
+	}
+	return 0
+}
+
+func (x *TwoGroupHomeAdmissionRecord) GetAppliedTerm() uint64 {
+	if x != nil {
+		return x.AppliedTerm
+	}
+	return 0
+}
+
+// Replicated only through the trusted two-group proposer, never Forward.
+type TwoGroupPrepareEntry struct {
+	state            protoimpl.MessageState   `protogen:"open.v1"`
+	Version          uint32                   `protobuf:"varint,1,opt,name=version,proto3" json:"version,omitempty"`
+	LocalGroupId     uint64                   `protobuf:"varint,2,opt,name=local_group_id,json=localGroupId,proto3" json:"local_group_id,omitempty"`
+	Manifest         *TwoGroupPrepareManifest `protobuf:"bytes,3,opt,name=manifest,proto3" json:"manifest,omitempty"`
+	HomeObservation  []byte                   `protobuf:"bytes,4,opt,name=home_observation,json=homeObservation,proto3" json:"home_observation,omitempty"`
+	HomeBarrierIndex uint64                   `protobuf:"varint,5,opt,name=home_barrier_index,json=homeBarrierIndex,proto3" json:"home_barrier_index,omitempty"`
+	HomeLeaderTerm   uint64                   `protobuf:"varint,6,opt,name=home_leader_term,json=homeLeaderTerm,proto3" json:"home_leader_term,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
+}
+
+func (x *TwoGroupPrepareEntry) Reset() {
+	*x = TwoGroupPrepareEntry{}
+	mi := &file_internal_proto_msgTypes[47]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TwoGroupPrepareEntry) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TwoGroupPrepareEntry) ProtoMessage() {}
+
+func (x *TwoGroupPrepareEntry) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[47]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TwoGroupPrepareEntry.ProtoReflect.Descriptor instead.
+func (*TwoGroupPrepareEntry) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{47}
+}
+
+func (x *TwoGroupPrepareEntry) GetVersion() uint32 {
+	if x != nil {
+		return x.Version
+	}
+	return 0
+}
+
+func (x *TwoGroupPrepareEntry) GetLocalGroupId() uint64 {
+	if x != nil {
+		return x.LocalGroupId
+	}
+	return 0
+}
+
+func (x *TwoGroupPrepareEntry) GetManifest() *TwoGroupPrepareManifest {
+	if x != nil {
+		return x.Manifest
+	}
+	return nil
+}
+
+func (x *TwoGroupPrepareEntry) GetHomeObservation() []byte {
+	if x != nil {
+		return x.HomeObservation
+	}
+	return nil
+}
+
+func (x *TwoGroupPrepareEntry) GetHomeBarrierIndex() uint64 {
+	if x != nil {
+		return x.HomeBarrierIndex
+	}
+	return 0
+}
+
+func (x *TwoGroupPrepareEntry) GetHomeLeaderTerm() uint64 {
+	if x != nil {
+		return x.HomeLeaderTerm
+	}
+	return 0
+}
+
+type TwoGroupTerminalRecord struct {
+	state               protoimpl.MessageState   `protogen:"open.v1"`
+	Version             uint32                   `protobuf:"varint,1,opt,name=version,proto3" json:"version,omitempty"`
+	Manifest            *TwoGroupPrepareManifest `protobuf:"bytes,2,opt,name=manifest,proto3" json:"manifest,omitempty"`
+	Decision            Phase                    `protobuf:"varint,3,opt,name=decision,proto3,enum=Phase" json:"decision,omitempty"`
+	ResolutionTimestamp uint64                   `protobuf:"varint,4,opt,name=resolution_timestamp,json=resolutionTimestamp,proto3" json:"resolution_timestamp,omitempty"`
+	AppliedIndex        uint64                   `protobuf:"varint,5,opt,name=applied_index,json=appliedIndex,proto3" json:"applied_index,omitempty"`
+	AppliedTerm         uint64                   `protobuf:"varint,6,opt,name=applied_term,json=appliedTerm,proto3" json:"applied_term,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
+}
+
+func (x *TwoGroupTerminalRecord) Reset() {
+	*x = TwoGroupTerminalRecord{}
+	mi := &file_internal_proto_msgTypes[48]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TwoGroupTerminalRecord) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TwoGroupTerminalRecord) ProtoMessage() {}
+
+func (x *TwoGroupTerminalRecord) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[48]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TwoGroupTerminalRecord.ProtoReflect.Descriptor instead.
+func (*TwoGroupTerminalRecord) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{48}
+}
+
+func (x *TwoGroupTerminalRecord) GetVersion() uint32 {
+	if x != nil {
+		return x.Version
+	}
+	return 0
+}
+
+func (x *TwoGroupTerminalRecord) GetManifest() *TwoGroupPrepareManifest {
+	if x != nil {
+		return x.Manifest
+	}
+	return nil
+}
+
+func (x *TwoGroupTerminalRecord) GetDecision() Phase {
+	if x != nil {
+		return x.Decision
+	}
+	return Phase_NONE
+}
+
+func (x *TwoGroupTerminalRecord) GetResolutionTimestamp() uint64 {
+	if x != nil {
+		return x.ResolutionTimestamp
+	}
+	return 0
+}
+
+func (x *TwoGroupTerminalRecord) GetAppliedIndex() uint64 {
+	if x != nil {
+		return x.AppliedIndex
+	}
+	return 0
+}
+
+func (x *TwoGroupTerminalRecord) GetAppliedTerm() uint64 {
+	if x != nil {
+		return x.AppliedTerm
+	}
+	return 0
+}
+
+type TwoGroupTerminalEntry struct {
+	state               protoimpl.MessageState   `protogen:"open.v1"`
+	Version             uint32                   `protobuf:"varint,1,opt,name=version,proto3" json:"version,omitempty"`
+	LocalGroupId        uint64                   `protobuf:"varint,2,opt,name=local_group_id,json=localGroupId,proto3" json:"local_group_id,omitempty"`
+	Manifest            *TwoGroupPrepareManifest `protobuf:"bytes,3,opt,name=manifest,proto3" json:"manifest,omitempty"`
+	Decision            Phase                    `protobuf:"varint,4,opt,name=decision,proto3,enum=Phase" json:"decision,omitempty"`
+	ResolutionTimestamp uint64                   `protobuf:"varint,5,opt,name=resolution_timestamp,json=resolutionTimestamp,proto3" json:"resolution_timestamp,omitempty"`
+	HomeTerminalRecord  []byte                   `protobuf:"bytes,6,opt,name=home_terminal_record,json=homeTerminalRecord,proto3" json:"home_terminal_record,omitempty"`
+	HomeBarrierIndex    uint64                   `protobuf:"varint,7,opt,name=home_barrier_index,json=homeBarrierIndex,proto3" json:"home_barrier_index,omitempty"`
+	HomeLeaderTerm      uint64                   `protobuf:"varint,8,opt,name=home_leader_term,json=homeLeaderTerm,proto3" json:"home_leader_term,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
+}
+
+func (x *TwoGroupTerminalEntry) Reset() {
+	*x = TwoGroupTerminalEntry{}
+	mi := &file_internal_proto_msgTypes[49]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TwoGroupTerminalEntry) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TwoGroupTerminalEntry) ProtoMessage() {}
+
+func (x *TwoGroupTerminalEntry) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[49]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TwoGroupTerminalEntry.ProtoReflect.Descriptor instead.
+func (*TwoGroupTerminalEntry) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{49}
+}
+
+func (x *TwoGroupTerminalEntry) GetVersion() uint32 {
+	if x != nil {
+		return x.Version
+	}
+	return 0
+}
+
+func (x *TwoGroupTerminalEntry) GetLocalGroupId() uint64 {
+	if x != nil {
+		return x.LocalGroupId
+	}
+	return 0
+}
+
+func (x *TwoGroupTerminalEntry) GetManifest() *TwoGroupPrepareManifest {
+	if x != nil {
+		return x.Manifest
+	}
+	return nil
+}
+
+func (x *TwoGroupTerminalEntry) GetDecision() Phase {
+	if x != nil {
+		return x.Decision
+	}
+	return Phase_NONE
+}
+
+func (x *TwoGroupTerminalEntry) GetResolutionTimestamp() uint64 {
+	if x != nil {
+		return x.ResolutionTimestamp
+	}
+	return 0
+}
+
+func (x *TwoGroupTerminalEntry) GetHomeTerminalRecord() []byte {
+	if x != nil {
+		return x.HomeTerminalRecord
+	}
+	return nil
+}
+
+func (x *TwoGroupTerminalEntry) GetHomeBarrierIndex() uint64 {
+	if x != nil {
+		return x.HomeBarrierIndex
+	}
+	return 0
+}
+
+func (x *TwoGroupTerminalEntry) GetHomeLeaderTerm() uint64 {
+	if x != nil {
+		return x.HomeLeaderTerm
+	}
+	return 0
+}
+
 var File_internal_proto protoreflect.FileDescriptor
 
 const file_internal_proto_rawDesc = "" +
@@ -3312,7 +4305,7 @@ const file_internal_proto_rawDesc = "" +
 	"\x03key\x18\x02 \x01(\fR\x03key\x12\x14\n" +
 	"\x05value\x18\x03 \x01(\fR\x05value\x123\n" +
 	"\x16commit_ts_value_offset\x18\x04 \x01(\x04R\x13commitTsValueOffset\x12%\n" +
-	"\x0erequire_absent\x18\x05 \x01(\bR\rrequireAbsent\"\x82\x03\n" +
+	"\x0erequire_absent\x18\x05 \x01(\bR\rrequireAbsent\"\xcb\x03\n" +
 	"\aRequest\x12\x15\n" +
 	"\x06is_txn\x18\x01 \x01(\bR\x05isTxn\x12\x1c\n" +
 	"\x05phase\x18\x02 \x01(\x0e2\x06.PhaseR\x05phase\x12\x0e\n" +
@@ -3322,7 +4315,9 @@ const file_internal_proto_rawDesc = "" +
 	"\x16observed_route_version\x18\x06 \x01(\x04R\x14observedRouteVersion\x125\n" +
 	"\x17write_fence_bypass_keys\x18\a \x03(\fR\x14writeFenceBypassKeys\x12:\n" +
 	"\x19timestamp_admission_floor\x18\b \x01(\x04R\x17timestampAdmissionFloor\x12C\n" +
-	"\x1etimestamp_binding_operation_id\x18\t \x01(\fR\x1btimestampBindingOperationId\"3\n" +
+	"\x1etimestamp_binding_operation_id\x18\t \x01(\fR\x1btimestampBindingOperationId\x12G\n" +
+	" timestamp_binding_admission_term\x18\n" +
+	" \x01(\x04R\x1dtimestampBindingAdmissionTerm\"3\n" +
 	"\vRaftCommand\x12$\n" +
 	"\brequests\x18\x01 \x03(\v2\b.RequestR\brequests\"\x85\x01\n" +
 	"\x0eForwardRequest\x12\x15\n" +
@@ -3350,7 +4345,7 @@ const file_internal_proto_rawDesc = "" +
 	"\x0elast_commit_ts\x18\x02 \x01(\x04R\flastCommitTs\"\\\n" +
 	"\x1bPrepareEvidenceStateRequest\x12\x14\n" +
 	"\x05floor\x18\x01 \x01(\x04R\x05floor\x12'\n" +
-	"\x0fcapability_only\x18\x02 \x01(\bR\x0ecapabilityOnly\"\xb1\x02\n" +
+	"\x0fcapability_only\x18\x02 \x01(\bR\x0ecapabilityOnly\"\xfe\x02\n" +
 	"\x1cPrepareEvidenceStateResponse\x12\x1c\n" +
 	"\tsupported\x18\x01 \x01(\bR\tsupported\x12#\n" +
 	"\rproof_enabled\x18\x02 \x01(\bR\fproofEnabled\x12%\n" +
@@ -3359,7 +4354,8 @@ const file_internal_proto_rawDesc = "" +
 	"fenceFloor\x12#\n" +
 	"\rapplied_index\x18\x05 \x01(\x04R\fappliedIndex\x12'\n" +
 	"\x0fcutover_applied\x18\x06 \x01(\bR\x0ecutoverApplied\x128\n" +
-	"\x18dedicated_tso_configured\x18\a \x01(\bR\x16dedicatedTsoConfigured\"I\n" +
+	"\x18dedicated_tso_configured\x18\a \x01(\bR\x16dedicatedTsoConfigured\x12K\n" +
+	"\"timestamp_binding_protocol_version\x18\b \x01(\rR\x1ftimestampBindingProtocolVersion\"I\n" +
 	"\x13RelayPublishRequest\x12\x18\n" +
 	"\achannel\x18\x01 \x01(\fR\achannel\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\fR\amessage\"8\n" +
@@ -3537,20 +4533,99 @@ const file_internal_proto_rawDesc = "" +
 	"\x1eIssueMigrationTimestampRequest\"e\n" +
 	"\x1fIssueMigrationTimestampResponse\x12\x1c\n" +
 	"\ttimestamp\x18\x01 \x01(\x04R\ttimestamp\x12$\n" +
-	"\x0elast_commit_ts\x18\x02 \x01(\x04R\flastCommitTs\"A\n" +
+	"\x0elast_commit_ts\x18\x02 \x01(\x04R\flastCommitTs\"\x86\x01\n" +
 	"\x1aIssueBoundTimestampRequest\x12#\n" +
-	"\rmin_timestamp\x18\x01 \x01(\x04R\fminTimestamp\";\n" +
+	"\rmin_timestamp\x18\x01 \x01(\x04R\fminTimestamp\x12C\n" +
+	"\x1ephysical_band_protocol_version\x18\x02 \x01(\rR\x1bphysicalBandProtocolVersion\"\xe4\x01\n" +
 	"\x1bIssueBoundTimestampResponse\x12\x1c\n" +
-	"\ttimestamp\x18\x01 \x01(\x04R\ttimestamp\"B\n" +
+	"\ttimestamp\x18\x01 \x01(\x04R\ttimestamp\x12C\n" +
+	"\x1ephysical_band_protocol_version\x18\x02 \x01(\rR\x1bphysicalBandProtocolVersion\x12,\n" +
+	"\x12committed_band_end\x18\x03 \x01(\x04R\x10committedBandEnd\x124\n" +
+	"\x16previous_issued_cursor\x18\x04 \x01(\x04R\x14previousIssuedCursor\"x\n" +
 	"\x1dLookupTimestampBindingRequest\x12!\n" +
-	"\foperation_id\x18\x01 \x01(\fR\voperationId\"\xd7\x01\n" +
+	"\foperation_id\x18\x01 \x01(\fR\voperationId\x124\n" +
+	"\x16home_admission_version\x18\x02 \x01(\rR\x14homeAdmissionVersion\"\x94\x03\n" +
 	"\x1eLookupTimestampBindingResponse\x12\x14\n" +
 	"\x05found\x18\x01 \x01(\bR\x05found\x12\x1c\n" +
 	"\ttimestamp\x18\x02 \x01(\x04R\ttimestamp\x12'\n" +
 	"\x0fmanifest_digest\x18\x03 \x01(\fR\x0emanifestDigest\x12\x15\n" +
 	"\x06is_txn\x18\x04 \x01(\bR\x05isTxn\x12\x1c\n" +
 	"\x05phase\x18\x05 \x01(\x0e2\x06.PhaseR\x05phase\x12#\n" +
-	"\rapplied_index\x18\x06 \x01(\x04R\fappliedIndex*&\n" +
+	"\rapplied_index\x18\x06 \x01(\x04R\fappliedIndex\x124\n" +
+	"\x16home_admission_version\x18\a \x01(\rR\x14homeAdmissionVersion\x122\n" +
+	"\x15home_admission_record\x18\b \x01(\fR\x13homeAdmissionRecord\x12\x1f\n" +
+	"\vleader_term\x18\t \x01(\x04R\n" +
+	"leaderTerm\x120\n" +
+	"\x14home_terminal_record\x18\n" +
+	" \x01(\fR\x12homeTerminalRecord\"[\n" +
+	"\x1aTwoGroupPrepareParticipant\x12\x19\n" +
+	"\bgroup_id\x18\x01 \x01(\x04R\agroupId\x12\"\n" +
+	"\aprepare\x18\x02 \x01(\v2\b.RequestR\aprepare\"\xf6\x01\n" +
+	"\x17TwoGroupPrepareManifest\x12!\n" +
+	"\foperation_id\x18\x01 \x01(\fR\voperationId\x123\n" +
+	"\x15persistence_timestamp\x18\x02 \x01(\x04R\x14persistenceTimestamp\x12(\n" +
+	"\x10primary_group_id\x18\x03 \x01(\x04R\x0eprimaryGroupId\x12?\n" +
+	"\fparticipants\x18\x04 \x03(\v2\x1b.TwoGroupPrepareParticipantR\fparticipants\x12\x18\n" +
+	"\aversion\x18\x05 \x01(\rR\aversion\"U\n" +
+	"\x1dProposeTwoGroupPrepareRequest\x124\n" +
+	"\bmanifest\x18\x01 \x01(\v2\x18.TwoGroupPrepareManifestR\bmanifest\"d\n" +
+	"\x1eProposeTwoGroupPrepareResponse\x12!\n" +
+	"\fcommit_index\x18\x01 \x01(\x04R\vcommitIndex\x12\x1f\n" +
+	"\vleader_term\x18\x02 \x01(\x04R\n" +
+	"leaderTerm\"T\n" +
+	"\x1cVerifyTwoGroupPrepareRequest\x124\n" +
+	"\bmanifest\x18\x01 \x01(\v2\x18.TwoGroupPrepareManifestR\bmanifest\"e\n" +
+	"\x1dVerifyTwoGroupPrepareResponse\x12#\n" +
+	"\rapplied_index\x18\x01 \x01(\x04R\fappliedIndex\x12\x1f\n" +
+	"\vleader_term\x18\x02 \x01(\x04R\n" +
+	"leaderTerm\"z\n" +
+	"\x1eProposeTwoGroupTerminalRequest\x124\n" +
+	"\bmanifest\x18\x01 \x01(\v2\x18.TwoGroupPrepareManifestR\bmanifest\x12\"\n" +
+	"\bdecision\x18\x02 \x01(\x0e2\x06.PhaseR\bdecision\"e\n" +
+	"\x1fProposeTwoGroupTerminalResponse\x12!\n" +
+	"\fcommit_index\x18\x01 \x01(\x04R\vcommitIndex\x12\x1f\n" +
+	"\vleader_term\x18\x02 \x01(\x04R\n" +
+	"leaderTerm\"?\n" +
+	"#ProbeTwoGroupPrepareEvidenceRequest\x12\x18\n" +
+	"\aversion\x18\x01 \x01(\rR\aversion\"\xc6\x01\n" +
+	"$ProbeTwoGroupPrepareEvidenceResponse\x12\x18\n" +
+	"\aversion\x18\x01 \x01(\rR\aversion\x12\x19\n" +
+	"\bgroup_id\x18\x02 \x01(\x04R\agroupId\x12#\n" +
+	"\rproof_enabled\x18\x03 \x01(\bR\fproofEnabled\x12#\n" +
+	"\rapplied_index\x18\x04 \x01(\x04R\fappliedIndex\x12\x1f\n" +
+	"\vleader_term\x18\x05 \x01(\x04R\n" +
+	"leaderTerm\"\x85\x02\n" +
+	"\x1bTwoGroupHomeAdmissionRecord\x12\x18\n" +
+	"\aversion\x18\x01 \x01(\rR\aversion\x124\n" +
+	"\bmanifest\x18\x02 \x01(\v2\x18.TwoGroupPrepareManifestR\bmanifest\x12\x1f\n" +
+	"\vfull_digest\x18\x03 \x01(\fR\n" +
+	"fullDigest\x12-\n" +
+	"\x12projection_digests\x18\x04 \x03(\fR\x11projectionDigests\x12#\n" +
+	"\rapplied_index\x18\x05 \x01(\x04R\fappliedIndex\x12!\n" +
+	"\fapplied_term\x18\x06 \x01(\x04R\vappliedTerm\"\x8f\x02\n" +
+	"\x14TwoGroupPrepareEntry\x12\x18\n" +
+	"\aversion\x18\x01 \x01(\rR\aversion\x12$\n" +
+	"\x0elocal_group_id\x18\x02 \x01(\x04R\flocalGroupId\x124\n" +
+	"\bmanifest\x18\x03 \x01(\v2\x18.TwoGroupPrepareManifestR\bmanifest\x12)\n" +
+	"\x10home_observation\x18\x04 \x01(\fR\x0fhomeObservation\x12,\n" +
+	"\x12home_barrier_index\x18\x05 \x01(\x04R\x10homeBarrierIndex\x12(\n" +
+	"\x10home_leader_term\x18\x06 \x01(\x04R\x0ehomeLeaderTerm\"\x87\x02\n" +
+	"\x16TwoGroupTerminalRecord\x12\x18\n" +
+	"\aversion\x18\x01 \x01(\rR\aversion\x124\n" +
+	"\bmanifest\x18\x02 \x01(\v2\x18.TwoGroupPrepareManifestR\bmanifest\x12\"\n" +
+	"\bdecision\x18\x03 \x01(\x0e2\x06.PhaseR\bdecision\x121\n" +
+	"\x14resolution_timestamp\x18\x04 \x01(\x04R\x13resolutionTimestamp\x12#\n" +
+	"\rapplied_index\x18\x05 \x01(\x04R\fappliedIndex\x12!\n" +
+	"\fapplied_term\x18\x06 \x01(\x04R\vappliedTerm\"\xee\x02\n" +
+	"\x15TwoGroupTerminalEntry\x12\x18\n" +
+	"\aversion\x18\x01 \x01(\rR\aversion\x12$\n" +
+	"\x0elocal_group_id\x18\x02 \x01(\x04R\flocalGroupId\x124\n" +
+	"\bmanifest\x18\x03 \x01(\v2\x18.TwoGroupPrepareManifestR\bmanifest\x12\"\n" +
+	"\bdecision\x18\x04 \x01(\x0e2\x06.PhaseR\bdecision\x121\n" +
+	"\x14resolution_timestamp\x18\x05 \x01(\x04R\x13resolutionTimestamp\x120\n" +
+	"\x14home_terminal_record\x18\x06 \x01(\fR\x12homeTerminalRecord\x12,\n" +
+	"\x12home_barrier_index\x18\a \x01(\x04R\x10homeBarrierIndex\x12(\n" +
+	"\x10home_leader_term\x18\b \x01(\x04R\x0ehomeLeaderTerm*&\n" +
 	"\x02Op\x12\a\n" +
 	"\x03PUT\x10\x00\x12\a\n" +
 	"\x03DEL\x10\x01\x12\x0e\n" +
@@ -3606,7 +4681,7 @@ const file_internal_proto_rawDesc = "" +
 	",MIGRATION_STATE_PROBE_KIND_OWNERSHIP_APPLIED\x10\b\x120\n" +
 	",MIGRATION_STATE_PROBE_KIND_PARTITION_APPLIED\x10\t\x122\n" +
 	".MIGRATION_STATE_PROBE_KIND_NAMESPACE_ADMISSION\x10\n" +
-	"2\xdc\t\n" +
+	"2\xe2\f\n" +
 	"\bInternal\x12.\n" +
 	"\aForward\x12\x0f.ForwardRequest\x1a\x10.ForwardResponse\"\x00\x12U\n" +
 	"\x14ForwardAdminProposal\x12\x1c.ForwardAdminProposalRequest\x1a\x1d.ForwardAdminProposalResponse\"\x00\x12I\n" +
@@ -3622,7 +4697,11 @@ const file_internal_proto_rawDesc = "" +
 	"\x13ProbeMigrationState\x12\x1b.ProbeMigrationStateRequest\x1a\x1c.ProbeMigrationStateResponse\"\x00\x12^\n" +
 	"\x17IssueMigrationTimestamp\x12\x1f.IssueMigrationTimestampRequest\x1a .IssueMigrationTimestampResponse\"\x00\x12R\n" +
 	"\x13IssueBoundTimestamp\x12\x1b.IssueBoundTimestampRequest\x1a\x1c.IssueBoundTimestampResponse\"\x00\x12[\n" +
-	"\x16LookupTimestampBinding\x12\x1e.LookupTimestampBindingRequest\x1a\x1f.LookupTimestampBindingResponse\"\x00B#Z!github.com/bootjp/elastickv/protob\x06proto3"
+	"\x16LookupTimestampBinding\x12\x1e.LookupTimestampBindingRequest\x1a\x1f.LookupTimestampBindingResponse\"\x00\x12[\n" +
+	"\x16ProposeTwoGroupPrepare\x12\x1e.ProposeTwoGroupPrepareRequest\x1a\x1f.ProposeTwoGroupPrepareResponse\"\x00\x12X\n" +
+	"\x15VerifyTwoGroupPrepare\x12\x1d.VerifyTwoGroupPrepareRequest\x1a\x1e.VerifyTwoGroupPrepareResponse\"\x00\x12^\n" +
+	"\x17ProposeTwoGroupTerminal\x12\x1f.ProposeTwoGroupTerminalRequest\x1a .ProposeTwoGroupTerminalResponse\"\x00\x12m\n" +
+	"\x1cProbeTwoGroupPrepareEvidence\x12$.ProbeTwoGroupPrepareEvidenceRequest\x1a%.ProbeTwoGroupPrepareEvidenceResponse\"\x00B#Z!github.com/bootjp/elastickv/protob\x06proto3"
 
 var (
 	file_internal_proto_rawDescOnce sync.Once
@@ -3637,52 +4716,66 @@ func file_internal_proto_rawDescGZIP() []byte {
 }
 
 var file_internal_proto_enumTypes = make([]protoimpl.EnumInfo, 8)
-var file_internal_proto_msgTypes = make([]protoimpl.MessageInfo, 36)
+var file_internal_proto_msgTypes = make([]protoimpl.MessageInfo, 50)
 var file_internal_proto_goTypes = []any{
-	(Op)(0),                                 // 0: Op
-	(Phase)(0),                              // 1: Phase
-	(ForwardFailurePhase)(0),                // 2: ForwardFailurePhase
-	(ForwardFailureReason)(0),               // 3: ForwardFailureReason
-	(ForwardDecisionClass)(0),               // 4: ForwardDecisionClass
-	(MigrationCleanupMode)(0),               // 5: MigrationCleanupMode
-	(MigrationOwnershipRole)(0),             // 6: MigrationOwnershipRole
-	(MigrationStateProbeKind)(0),            // 7: MigrationStateProbeKind
-	(*Mutation)(nil),                        // 8: Mutation
-	(*Request)(nil),                         // 9: Request
-	(*RaftCommand)(nil),                     // 10: RaftCommand
-	(*ForwardRequest)(nil),                  // 11: ForwardRequest
-	(*ForwardResponse)(nil),                 // 12: ForwardResponse
-	(*ForwardFailureDetail)(nil),            // 13: ForwardFailureDetail
-	(*ForwardAdminProposalRequest)(nil),     // 14: ForwardAdminProposalRequest
-	(*ForwardAdminProposalResponse)(nil),    // 15: ForwardAdminProposalResponse
-	(*ForwardLeaseReadRequest)(nil),         // 16: ForwardLeaseReadRequest
-	(*ForwardLeaseReadResponse)(nil),        // 17: ForwardLeaseReadResponse
-	(*PrepareEvidenceStateRequest)(nil),     // 18: PrepareEvidenceStateRequest
-	(*PrepareEvidenceStateResponse)(nil),    // 19: PrepareEvidenceStateResponse
-	(*RelayPublishRequest)(nil),             // 20: RelayPublishRequest
-	(*RelayPublishResponse)(nil),            // 21: RelayPublishResponse
-	(*ExportRangeVersionsRequest)(nil),      // 22: ExportRangeVersionsRequest
-	(*ExportRangeVersionsResponse)(nil),     // 23: ExportRangeVersionsResponse
-	(*MVCCVersion)(nil),                     // 24: MVCCVersion
-	(*ImportRangeVersionsRequest)(nil),      // 25: ImportRangeVersionsRequest
-	(*ImportRangeVersionsResponse)(nil),     // 26: ImportRangeVersionsResponse
-	(*PromoteStagedVersionsRequest)(nil),    // 27: PromoteStagedVersionsRequest
-	(*PromoteStagedVersionsResponse)(nil),   // 28: PromoteStagedVersionsResponse
-	(*TargetStagedReadinessRequest)(nil),    // 29: TargetStagedReadinessRequest
-	(*TargetStagedReadinessResponse)(nil),   // 30: TargetStagedReadinessResponse
-	(*ProbeMigrationLocksRequest)(nil),      // 31: ProbeMigrationLocksRequest
-	(*ProbeMigrationLocksResponse)(nil),     // 32: ProbeMigrationLocksResponse
-	(*MigrationOwnershipProof)(nil),         // 33: MigrationOwnershipProof
-	(*CleanupMigrationRequest)(nil),         // 34: CleanupMigrationRequest
-	(*CleanupMigrationResponse)(nil),        // 35: CleanupMigrationResponse
-	(*ProbeMigrationStateRequest)(nil),      // 36: ProbeMigrationStateRequest
-	(*ProbeMigrationStateResponse)(nil),     // 37: ProbeMigrationStateResponse
-	(*IssueMigrationTimestampRequest)(nil),  // 38: IssueMigrationTimestampRequest
-	(*IssueMigrationTimestampResponse)(nil), // 39: IssueMigrationTimestampResponse
-	(*IssueBoundTimestampRequest)(nil),      // 40: IssueBoundTimestampRequest
-	(*IssueBoundTimestampResponse)(nil),     // 41: IssueBoundTimestampResponse
-	(*LookupTimestampBindingRequest)(nil),   // 42: LookupTimestampBindingRequest
-	(*LookupTimestampBindingResponse)(nil),  // 43: LookupTimestampBindingResponse
+	(Op)(0),                                      // 0: Op
+	(Phase)(0),                                   // 1: Phase
+	(ForwardFailurePhase)(0),                     // 2: ForwardFailurePhase
+	(ForwardFailureReason)(0),                    // 3: ForwardFailureReason
+	(ForwardDecisionClass)(0),                    // 4: ForwardDecisionClass
+	(MigrationCleanupMode)(0),                    // 5: MigrationCleanupMode
+	(MigrationOwnershipRole)(0),                  // 6: MigrationOwnershipRole
+	(MigrationStateProbeKind)(0),                 // 7: MigrationStateProbeKind
+	(*Mutation)(nil),                             // 8: Mutation
+	(*Request)(nil),                              // 9: Request
+	(*RaftCommand)(nil),                          // 10: RaftCommand
+	(*ForwardRequest)(nil),                       // 11: ForwardRequest
+	(*ForwardResponse)(nil),                      // 12: ForwardResponse
+	(*ForwardFailureDetail)(nil),                 // 13: ForwardFailureDetail
+	(*ForwardAdminProposalRequest)(nil),          // 14: ForwardAdminProposalRequest
+	(*ForwardAdminProposalResponse)(nil),         // 15: ForwardAdminProposalResponse
+	(*ForwardLeaseReadRequest)(nil),              // 16: ForwardLeaseReadRequest
+	(*ForwardLeaseReadResponse)(nil),             // 17: ForwardLeaseReadResponse
+	(*PrepareEvidenceStateRequest)(nil),          // 18: PrepareEvidenceStateRequest
+	(*PrepareEvidenceStateResponse)(nil),         // 19: PrepareEvidenceStateResponse
+	(*RelayPublishRequest)(nil),                  // 20: RelayPublishRequest
+	(*RelayPublishResponse)(nil),                 // 21: RelayPublishResponse
+	(*ExportRangeVersionsRequest)(nil),           // 22: ExportRangeVersionsRequest
+	(*ExportRangeVersionsResponse)(nil),          // 23: ExportRangeVersionsResponse
+	(*MVCCVersion)(nil),                          // 24: MVCCVersion
+	(*ImportRangeVersionsRequest)(nil),           // 25: ImportRangeVersionsRequest
+	(*ImportRangeVersionsResponse)(nil),          // 26: ImportRangeVersionsResponse
+	(*PromoteStagedVersionsRequest)(nil),         // 27: PromoteStagedVersionsRequest
+	(*PromoteStagedVersionsResponse)(nil),        // 28: PromoteStagedVersionsResponse
+	(*TargetStagedReadinessRequest)(nil),         // 29: TargetStagedReadinessRequest
+	(*TargetStagedReadinessResponse)(nil),        // 30: TargetStagedReadinessResponse
+	(*ProbeMigrationLocksRequest)(nil),           // 31: ProbeMigrationLocksRequest
+	(*ProbeMigrationLocksResponse)(nil),          // 32: ProbeMigrationLocksResponse
+	(*MigrationOwnershipProof)(nil),              // 33: MigrationOwnershipProof
+	(*CleanupMigrationRequest)(nil),              // 34: CleanupMigrationRequest
+	(*CleanupMigrationResponse)(nil),             // 35: CleanupMigrationResponse
+	(*ProbeMigrationStateRequest)(nil),           // 36: ProbeMigrationStateRequest
+	(*ProbeMigrationStateResponse)(nil),          // 37: ProbeMigrationStateResponse
+	(*IssueMigrationTimestampRequest)(nil),       // 38: IssueMigrationTimestampRequest
+	(*IssueMigrationTimestampResponse)(nil),      // 39: IssueMigrationTimestampResponse
+	(*IssueBoundTimestampRequest)(nil),           // 40: IssueBoundTimestampRequest
+	(*IssueBoundTimestampResponse)(nil),          // 41: IssueBoundTimestampResponse
+	(*LookupTimestampBindingRequest)(nil),        // 42: LookupTimestampBindingRequest
+	(*LookupTimestampBindingResponse)(nil),       // 43: LookupTimestampBindingResponse
+	(*TwoGroupPrepareParticipant)(nil),           // 44: TwoGroupPrepareParticipant
+	(*TwoGroupPrepareManifest)(nil),              // 45: TwoGroupPrepareManifest
+	(*ProposeTwoGroupPrepareRequest)(nil),        // 46: ProposeTwoGroupPrepareRequest
+	(*ProposeTwoGroupPrepareResponse)(nil),       // 47: ProposeTwoGroupPrepareResponse
+	(*VerifyTwoGroupPrepareRequest)(nil),         // 48: VerifyTwoGroupPrepareRequest
+	(*VerifyTwoGroupPrepareResponse)(nil),        // 49: VerifyTwoGroupPrepareResponse
+	(*ProposeTwoGroupTerminalRequest)(nil),       // 50: ProposeTwoGroupTerminalRequest
+	(*ProposeTwoGroupTerminalResponse)(nil),      // 51: ProposeTwoGroupTerminalResponse
+	(*ProbeTwoGroupPrepareEvidenceRequest)(nil),  // 52: ProbeTwoGroupPrepareEvidenceRequest
+	(*ProbeTwoGroupPrepareEvidenceResponse)(nil), // 53: ProbeTwoGroupPrepareEvidenceResponse
+	(*TwoGroupHomeAdmissionRecord)(nil),          // 54: TwoGroupHomeAdmissionRecord
+	(*TwoGroupPrepareEntry)(nil),                 // 55: TwoGroupPrepareEntry
+	(*TwoGroupTerminalRecord)(nil),               // 56: TwoGroupTerminalRecord
+	(*TwoGroupTerminalEntry)(nil),                // 57: TwoGroupTerminalEntry
 }
 var file_internal_proto_depIdxs = []int32{
 	0,  // 0: Mutation.op:type_name -> Op
@@ -3702,41 +4795,61 @@ var file_internal_proto_depIdxs = []int32{
 	33, // 14: ProbeMigrationStateRequest.ownership:type_name -> MigrationOwnershipProof
 	33, // 15: ProbeMigrationStateResponse.ownership:type_name -> MigrationOwnershipProof
 	1,  // 16: LookupTimestampBindingResponse.phase:type_name -> Phase
-	11, // 17: Internal.Forward:input_type -> ForwardRequest
-	14, // 18: Internal.ForwardAdminProposal:input_type -> ForwardAdminProposalRequest
-	16, // 19: Internal.ForwardLeaseRead:input_type -> ForwardLeaseReadRequest
-	18, // 20: Internal.GetPrepareEvidenceState:input_type -> PrepareEvidenceStateRequest
-	20, // 21: Internal.RelayPublish:input_type -> RelayPublishRequest
-	22, // 22: Internal.ExportRangeVersions:input_type -> ExportRangeVersionsRequest
-	25, // 23: Internal.ImportRangeVersions:input_type -> ImportRangeVersionsRequest
-	27, // 24: Internal.PromoteStagedVersions:input_type -> PromoteStagedVersionsRequest
-	29, // 25: Internal.ApplyTargetStagedReadiness:input_type -> TargetStagedReadinessRequest
-	31, // 26: Internal.ProbeMigrationLocks:input_type -> ProbeMigrationLocksRequest
-	34, // 27: Internal.CleanupMigration:input_type -> CleanupMigrationRequest
-	36, // 28: Internal.ProbeMigrationState:input_type -> ProbeMigrationStateRequest
-	38, // 29: Internal.IssueMigrationTimestamp:input_type -> IssueMigrationTimestampRequest
-	40, // 30: Internal.IssueBoundTimestamp:input_type -> IssueBoundTimestampRequest
-	42, // 31: Internal.LookupTimestampBinding:input_type -> LookupTimestampBindingRequest
-	12, // 32: Internal.Forward:output_type -> ForwardResponse
-	15, // 33: Internal.ForwardAdminProposal:output_type -> ForwardAdminProposalResponse
-	17, // 34: Internal.ForwardLeaseRead:output_type -> ForwardLeaseReadResponse
-	19, // 35: Internal.GetPrepareEvidenceState:output_type -> PrepareEvidenceStateResponse
-	21, // 36: Internal.RelayPublish:output_type -> RelayPublishResponse
-	23, // 37: Internal.ExportRangeVersions:output_type -> ExportRangeVersionsResponse
-	26, // 38: Internal.ImportRangeVersions:output_type -> ImportRangeVersionsResponse
-	28, // 39: Internal.PromoteStagedVersions:output_type -> PromoteStagedVersionsResponse
-	30, // 40: Internal.ApplyTargetStagedReadiness:output_type -> TargetStagedReadinessResponse
-	32, // 41: Internal.ProbeMigrationLocks:output_type -> ProbeMigrationLocksResponse
-	35, // 42: Internal.CleanupMigration:output_type -> CleanupMigrationResponse
-	37, // 43: Internal.ProbeMigrationState:output_type -> ProbeMigrationStateResponse
-	39, // 44: Internal.IssueMigrationTimestamp:output_type -> IssueMigrationTimestampResponse
-	41, // 45: Internal.IssueBoundTimestamp:output_type -> IssueBoundTimestampResponse
-	43, // 46: Internal.LookupTimestampBinding:output_type -> LookupTimestampBindingResponse
-	32, // [32:47] is the sub-list for method output_type
-	17, // [17:32] is the sub-list for method input_type
-	17, // [17:17] is the sub-list for extension type_name
-	17, // [17:17] is the sub-list for extension extendee
-	0,  // [0:17] is the sub-list for field type_name
+	9,  // 17: TwoGroupPrepareParticipant.prepare:type_name -> Request
+	44, // 18: TwoGroupPrepareManifest.participants:type_name -> TwoGroupPrepareParticipant
+	45, // 19: ProposeTwoGroupPrepareRequest.manifest:type_name -> TwoGroupPrepareManifest
+	45, // 20: VerifyTwoGroupPrepareRequest.manifest:type_name -> TwoGroupPrepareManifest
+	45, // 21: ProposeTwoGroupTerminalRequest.manifest:type_name -> TwoGroupPrepareManifest
+	1,  // 22: ProposeTwoGroupTerminalRequest.decision:type_name -> Phase
+	45, // 23: TwoGroupHomeAdmissionRecord.manifest:type_name -> TwoGroupPrepareManifest
+	45, // 24: TwoGroupPrepareEntry.manifest:type_name -> TwoGroupPrepareManifest
+	45, // 25: TwoGroupTerminalRecord.manifest:type_name -> TwoGroupPrepareManifest
+	1,  // 26: TwoGroupTerminalRecord.decision:type_name -> Phase
+	45, // 27: TwoGroupTerminalEntry.manifest:type_name -> TwoGroupPrepareManifest
+	1,  // 28: TwoGroupTerminalEntry.decision:type_name -> Phase
+	11, // 29: Internal.Forward:input_type -> ForwardRequest
+	14, // 30: Internal.ForwardAdminProposal:input_type -> ForwardAdminProposalRequest
+	16, // 31: Internal.ForwardLeaseRead:input_type -> ForwardLeaseReadRequest
+	18, // 32: Internal.GetPrepareEvidenceState:input_type -> PrepareEvidenceStateRequest
+	20, // 33: Internal.RelayPublish:input_type -> RelayPublishRequest
+	22, // 34: Internal.ExportRangeVersions:input_type -> ExportRangeVersionsRequest
+	25, // 35: Internal.ImportRangeVersions:input_type -> ImportRangeVersionsRequest
+	27, // 36: Internal.PromoteStagedVersions:input_type -> PromoteStagedVersionsRequest
+	29, // 37: Internal.ApplyTargetStagedReadiness:input_type -> TargetStagedReadinessRequest
+	31, // 38: Internal.ProbeMigrationLocks:input_type -> ProbeMigrationLocksRequest
+	34, // 39: Internal.CleanupMigration:input_type -> CleanupMigrationRequest
+	36, // 40: Internal.ProbeMigrationState:input_type -> ProbeMigrationStateRequest
+	38, // 41: Internal.IssueMigrationTimestamp:input_type -> IssueMigrationTimestampRequest
+	40, // 42: Internal.IssueBoundTimestamp:input_type -> IssueBoundTimestampRequest
+	42, // 43: Internal.LookupTimestampBinding:input_type -> LookupTimestampBindingRequest
+	46, // 44: Internal.ProposeTwoGroupPrepare:input_type -> ProposeTwoGroupPrepareRequest
+	48, // 45: Internal.VerifyTwoGroupPrepare:input_type -> VerifyTwoGroupPrepareRequest
+	50, // 46: Internal.ProposeTwoGroupTerminal:input_type -> ProposeTwoGroupTerminalRequest
+	52, // 47: Internal.ProbeTwoGroupPrepareEvidence:input_type -> ProbeTwoGroupPrepareEvidenceRequest
+	12, // 48: Internal.Forward:output_type -> ForwardResponse
+	15, // 49: Internal.ForwardAdminProposal:output_type -> ForwardAdminProposalResponse
+	17, // 50: Internal.ForwardLeaseRead:output_type -> ForwardLeaseReadResponse
+	19, // 51: Internal.GetPrepareEvidenceState:output_type -> PrepareEvidenceStateResponse
+	21, // 52: Internal.RelayPublish:output_type -> RelayPublishResponse
+	23, // 53: Internal.ExportRangeVersions:output_type -> ExportRangeVersionsResponse
+	26, // 54: Internal.ImportRangeVersions:output_type -> ImportRangeVersionsResponse
+	28, // 55: Internal.PromoteStagedVersions:output_type -> PromoteStagedVersionsResponse
+	30, // 56: Internal.ApplyTargetStagedReadiness:output_type -> TargetStagedReadinessResponse
+	32, // 57: Internal.ProbeMigrationLocks:output_type -> ProbeMigrationLocksResponse
+	35, // 58: Internal.CleanupMigration:output_type -> CleanupMigrationResponse
+	37, // 59: Internal.ProbeMigrationState:output_type -> ProbeMigrationStateResponse
+	39, // 60: Internal.IssueMigrationTimestamp:output_type -> IssueMigrationTimestampResponse
+	41, // 61: Internal.IssueBoundTimestamp:output_type -> IssueBoundTimestampResponse
+	43, // 62: Internal.LookupTimestampBinding:output_type -> LookupTimestampBindingResponse
+	47, // 63: Internal.ProposeTwoGroupPrepare:output_type -> ProposeTwoGroupPrepareResponse
+	49, // 64: Internal.VerifyTwoGroupPrepare:output_type -> VerifyTwoGroupPrepareResponse
+	51, // 65: Internal.ProposeTwoGroupTerminal:output_type -> ProposeTwoGroupTerminalResponse
+	53, // 66: Internal.ProbeTwoGroupPrepareEvidence:output_type -> ProbeTwoGroupPrepareEvidenceResponse
+	48, // [48:67] is the sub-list for method output_type
+	29, // [29:48] is the sub-list for method input_type
+	29, // [29:29] is the sub-list for extension type_name
+	29, // [29:29] is the sub-list for extension extendee
+	0,  // [0:29] is the sub-list for field type_name
 }
 
 func init() { file_internal_proto_init() }
@@ -3750,7 +4863,7 @@ func file_internal_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_internal_proto_rawDesc), len(file_internal_proto_rawDesc)),
 			NumEnums:      8,
-			NumMessages:   36,
+			NumMessages:   50,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

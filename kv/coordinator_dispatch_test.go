@@ -403,3 +403,33 @@ func TestBuildRedirectRequestsSurvivesStaleFollowerCeiling(t *testing.T) {
 	require.Equal(t, uint64(0), got[0].Ts,
 		"redirect-path raw requests must carry Ts==0 (leader stamps)")
 }
+
+func TestBuildRedirectRequestsPreservesRawOperationID(t *testing.T) {
+	t.Parallel()
+	id := append([]byte{1}, make([]byte, 15)...)
+	c := &Coordinate{}
+	requests, err := c.buildRedirectRequests(&OperationGroup[OP]{
+		OperationID: id,
+		Elems:       []*Elem[OP]{{Op: Put, Key: []byte("k"), Value: []byte("v")}},
+	})
+	require.NoError(t, err)
+	require.Len(t, requests, 1)
+	require.Equal(t, uint64(0), requests[0].Ts)
+	require.Equal(t, id, requests[0].TimestampBindingOperationId)
+	id[0] = 2
+	require.Equal(t, byte(1), requests[0].TimestampBindingOperationId[0])
+}
+
+func TestRawOperationIDFailsClosedBeforeActivation(t *testing.T) {
+	t.Parallel()
+	reqs := &OperationGroup[OP]{
+		OperationID: append([]byte{1}, make([]byte, 15)...),
+		Elems:       []*Elem[OP]{{Op: Put, Key: []byte("k"), Value: []byte("v")}},
+	}
+	_, err := (&Coordinate{}).Dispatch(t.Context(), reqs)
+	require.ErrorIs(t, err, ErrTimestampBindingInvalid)
+	_, err = (&ShardedCoordinator{}).Dispatch(t.Context(), reqs)
+	require.ErrorIs(t, err, ErrTimestampBindingInvalid)
+	reqs.OperationID = nil
+	require.NoError(t, validateOperationGroup(reqs))
+}

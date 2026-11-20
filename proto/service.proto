@@ -39,6 +39,8 @@ service S3BlobFetch {
 message RawPutRequest {
   bytes key = 1;
   bytes value = 2;
+  // Stable across retries of the same write; reserved for Phase-D admission.
+  bytes operation_id = 3;
 }
 
 message RawPutResponse {
@@ -61,6 +63,8 @@ message RawGetResponse {
 
 message RawDeleteRequest {
   bytes key = 1;
+  // Stable across retries of the same write; reserved for Phase-D admission.
+  bytes operation_id = 2;
 }
 
 message RawDeleteResponse {

@@ -164,10 +164,11 @@ func applyRequests(ctx context.Context, proposer raftengine.Proposer, reqs []*pb
 		return 0, nil, errors.WithStack(ErrLeaderNotFound)
 	}
 
-	result, err := proposer.Propose(ctx, b)
+	result, err := submitUserProposal(ctx, proposer, reqs, b)
 	if err != nil {
 		recordProposalFailure(proposalObserver)
-		if errors.Is(err, raftengine.ErrNotLeader) || errors.Is(err, raftengine.ErrLeadershipTransferInProgress) {
+		if errors.Is(err, raftengine.ErrNotLeader) || errors.Is(err, raftengine.ErrLeadershipTransferInProgress) ||
+			errors.Is(err, raftengine.ErrStaleAdmissionTerm) {
 			// The etcd engine returns these before appending the entry.
 			return 0, nil, errors.WithStack(err)
 		}
@@ -181,6 +182,46 @@ func applyRequests(ctx context.Context, proposer raftengine.Proposer, reqs []*pb
 	}
 
 	return interpretProposalResult(result, reqs, proposalObserver)
+}
+
+func submitUserProposal(ctx context.Context, proposer raftengine.Proposer, reqs []*pb.Request, data []byte) (*raftengine.ProposalResult, error) {
+	term, fenced, err := proposalAdmissionTerm(reqs)
+	if err != nil {
+		return nil, err
+	}
+	if !fenced {
+		result, err := proposer.Propose(ctx, data)
+		return result, errors.WithStack(err)
+	}
+	termProposer, ok := proposer.(raftengine.TermFencedProposer)
+	if !ok {
+		return nil, raftengine.ErrStaleAdmissionTerm
+	}
+	result, err := termProposer.ProposeIfTerm(ctx, term, data)
+	return result, errors.WithStack(err)
+}
+
+func proposalAdmissionTerm(reqs []*pb.Request) (uint64, bool, error) {
+	var term uint64
+	for _, req := range reqs {
+		if req == nil {
+			continue
+		}
+		if len(req.TimestampBindingOperationId) == 0 {
+			if req.TimestampBindingAdmissionTerm != 0 {
+				return 0, false, raftengine.ErrStaleAdmissionTerm
+			}
+			continue
+		}
+		if term != 0 || req.TimestampBindingAdmissionTerm == 0 {
+			return 0, false, raftengine.ErrStaleAdmissionTerm
+		}
+		term = req.TimestampBindingAdmissionTerm
+	}
+	if term != 0 && len(reqs) != 1 {
+		return 0, false, raftengine.ErrStaleAdmissionTerm
+	}
+	return term, term != 0, nil
 }
 
 func interpretProposalResult(result *raftengine.ProposalResult, reqs []*pb.Request, proposalObserver ProposalObserver) (uint64, []error, error) {
@@ -391,6 +432,9 @@ func (t *TransactionManager) takeRawBatch() []*rawCommitItem {
 	count := 0
 	n := 0
 	for n < len(t.rawPending) {
+		if n > 0 && (rawItemHasTimestampBinding(t.rawPending[0]) || rawItemHasTimestampBinding(t.rawPending[n])) {
+			break
+		}
 		next := count + len(t.rawPending[n].reqs)
 		if n > 0 && next > maxRawBatchRequests {
 			break
@@ -402,6 +446,15 @@ func (t *TransactionManager) takeRawBatch() []*rawCommitItem {
 	batch := append([]*rawCommitItem(nil), t.rawPending[:n]...)
 	t.rawPending = t.rawPending[n:]
 	return batch
+}
+
+func rawItemHasTimestampBinding(item *rawCommitItem) bool {
+	for _, req := range item.reqs {
+		if req != nil && len(req.TimestampBindingOperationId) != 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func (t *TransactionManager) applyRawBatch(batch []*rawCommitItem) {

@@ -46,6 +46,8 @@ type kvFSM struct {
 	// Disabled until every data-group member and ingress has adopted the
 	// timestamp-binding protocol. Tests may enable it directly.
 	timestampBindingEnabled atomic.Bool
+	// Default-off until a replicated all-member activation gate exists.
+	twoGroupPrepareEnabled atomic.Bool
 	// hlc is the shared HLC instance updated when a HLC lease entry is applied.
 	// May be nil for nodes that do not participate in physical ceiling tracking.
 	hlc *HLC
@@ -613,12 +615,10 @@ func (f *kvFSM) applyReservedOpcode(ctx context.Context, data []byte) (any, bool
 		return nil, false
 	}
 	switch {
-	case data[0] == raftEncodeHLCLease:
-		return f.applyHLCLease(data[1:]), true
-	case data[0] == raftEncodeCommitTSFenceActivation:
-		return f.applyCommitTSFenceActivation(ctx, data[1:]), true
-	case data[0] == raftEncodeWatermarkAdvance:
-		return f.applyWatermarkAdvance(ctx, data[1:]), true
+	case isSimpleControlOpcode(data[0]):
+		return f.applySimpleControlOpcode(ctx, data), true
+	case isTwoGroupOpcode(data[0]):
+		return f.applyTwoGroupOpcode(ctx, data), true
 	case data[0] >= fsmwire.OpEncryptionMin && data[0] <= fsmwire.OpEncryptionMax:
 		return f.applyEncryption(f.pendingApplyIdx, data[0], data[1:]), true
 	default:
@@ -627,6 +627,32 @@ func (f *kvFSM) applyReservedOpcode(ctx context.Context, data []byte) (any, bool
 		}
 		return f.applyBackupOpcode(ctx, data[0], data[1:])
 	}
+}
+
+func isSimpleControlOpcode(op byte) bool {
+	return op == raftEncodeHLCLease || op == raftEncodeCommitTSFenceActivation || op == raftEncodeWatermarkAdvance
+}
+
+func isTwoGroupOpcode(op byte) bool {
+	return op == raftEncodeTwoGroupPrepare || op == raftEncodeTwoGroupTerminal
+}
+
+func (f *kvFSM) applySimpleControlOpcode(ctx context.Context, data []byte) any {
+	switch data[0] {
+	case raftEncodeHLCLease:
+		return f.applyHLCLease(data[1:])
+	case raftEncodeCommitTSFenceActivation:
+		return f.applyCommitTSFenceActivation(ctx, data[1:])
+	default:
+		return f.applyWatermarkAdvance(ctx, data[1:])
+	}
+}
+
+func (f *kvFSM) applyTwoGroupOpcode(ctx context.Context, data []byte) any {
+	if data[0] == raftEncodeTwoGroupPrepare {
+		return f.applyTwoGroupPrepareEntry(ctx, data[1:])
+	}
+	return f.applyTwoGroupTerminalEntry(ctx, data[1:])
 }
 
 // applyMigrationOpcode handles the range-migration half of the reserved opcode
@@ -842,12 +868,10 @@ func (f *kvFSM) applyRequestErr(ctx context.Context, r *pb.Request) error {
 }
 
 func (f *kvFSM) applyRequestData(ctx context.Context, r *pb.Request) (uint64, error) {
-	ctx = context.WithValue(ctx, applyReadinessContextKey{}, struct{}{})
-	if f.migrationNamespaceVersion.Load() != 0 {
-		if err := verifyRequestMigrationControlKeys(r); err != nil {
-			return 0, err
-		}
+	if err := f.verifyApplyRequestIngress(ctx, r); err != nil {
+		return 0, err
 	}
+	ctx = context.WithValue(ctx, applyReadinessContextKey{}, struct{}{})
 	var err error
 	ctx, err = f.withMigrationOwnershipEvidence(ctx, r)
 	if err != nil {
@@ -867,6 +891,40 @@ func (f *kvFSM) applyRequestData(ctx context.Context, r *pb.Request) (uint64, er
 		return 0, errors.WithStack(err)
 	}
 	return commitTS, nil
+}
+
+func (f *kvFSM) verifyApplyRequestIngress(ctx context.Context, r *pb.Request) error {
+	if f.twoGroupPrepareEnabled.Load() {
+		if err := verifyTwoGroupApplyRequestIngress(ctx, r); err != nil {
+			return err
+		}
+	}
+	if f.migrationNamespaceVersion.Load() != 0 {
+		if err := verifyRequestMigrationControlKeys(r); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func verifyTwoGroupApplyRequestIngress(ctx context.Context, r *pb.Request) error {
+	if r == nil || !r.IsTxn {
+		return nil
+	}
+	switch r.Phase {
+	case pb.Phase_NONE:
+		return nil
+	case pb.Phase_PREPARE:
+		if ctx.Value(twoGroupPrepareApplyContextKey{}) == true {
+			return nil
+		}
+	case pb.Phase_COMMIT, pb.Phase_ABORT:
+		if ctx.Value(twoGroupTerminalApplyContextKey{}) == true {
+			return nil
+		}
+	default:
+	}
+	return errors.WithStack(ErrTwoGroupAdmission)
 }
 
 func (f *kvFSM) handleRequest(ctx context.Context, r *pb.Request, commitTS uint64) error {

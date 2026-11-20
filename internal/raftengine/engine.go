@@ -56,6 +56,9 @@ var (
 	// ConfChange-time RegisterEncryptionWriter) and never observes
 	// this error.
 	ErrEnvelopeCutoverInProgress = errors.New("raft engine: envelope cutover in progress")
+	// ErrStaleAdmissionTerm proves a term-fenced proposal was rejected before
+	// it entered the Raft log.
+	ErrStaleAdmissionTerm = errors.New("raft engine: stale admission term")
 	// ErrSnapshotDeferred indicates StateMachine.Snapshot declined to
 	// produce a snapshot right now and wants the caller to try again
 	// later. It is the only Snapshot error a caller may treat as
@@ -219,6 +222,12 @@ type ProposalResult struct {
 type Proposer interface {
 	Propose(ctx context.Context, data []byte) (*ProposalResult, error)
 	ProposeAdmin(ctx context.Context, data []byte) (*ProposalResult, error)
+}
+
+// TermFencedProposer rejects a prepared user proposal if leadership has
+// changed before its entry is submitted to Raft.
+type TermFencedProposer interface {
+	ProposeIfTerm(ctx context.Context, term uint64, data []byte) (*ProposalResult, error)
 }
 
 type LeaderView interface {

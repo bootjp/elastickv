@@ -19,21 +19,25 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	Internal_Forward_FullMethodName                    = "/Internal/Forward"
-	Internal_ForwardAdminProposal_FullMethodName       = "/Internal/ForwardAdminProposal"
-	Internal_ForwardLeaseRead_FullMethodName           = "/Internal/ForwardLeaseRead"
-	Internal_GetPrepareEvidenceState_FullMethodName    = "/Internal/GetPrepareEvidenceState"
-	Internal_RelayPublish_FullMethodName               = "/Internal/RelayPublish"
-	Internal_ExportRangeVersions_FullMethodName        = "/Internal/ExportRangeVersions"
-	Internal_ImportRangeVersions_FullMethodName        = "/Internal/ImportRangeVersions"
-	Internal_PromoteStagedVersions_FullMethodName      = "/Internal/PromoteStagedVersions"
-	Internal_ApplyTargetStagedReadiness_FullMethodName = "/Internal/ApplyTargetStagedReadiness"
-	Internal_ProbeMigrationLocks_FullMethodName        = "/Internal/ProbeMigrationLocks"
-	Internal_CleanupMigration_FullMethodName           = "/Internal/CleanupMigration"
-	Internal_ProbeMigrationState_FullMethodName        = "/Internal/ProbeMigrationState"
-	Internal_IssueMigrationTimestamp_FullMethodName    = "/Internal/IssueMigrationTimestamp"
-	Internal_IssueBoundTimestamp_FullMethodName        = "/Internal/IssueBoundTimestamp"
-	Internal_LookupTimestampBinding_FullMethodName     = "/Internal/LookupTimestampBinding"
+	Internal_Forward_FullMethodName                      = "/Internal/Forward"
+	Internal_ForwardAdminProposal_FullMethodName         = "/Internal/ForwardAdminProposal"
+	Internal_ForwardLeaseRead_FullMethodName             = "/Internal/ForwardLeaseRead"
+	Internal_GetPrepareEvidenceState_FullMethodName      = "/Internal/GetPrepareEvidenceState"
+	Internal_RelayPublish_FullMethodName                 = "/Internal/RelayPublish"
+	Internal_ExportRangeVersions_FullMethodName          = "/Internal/ExportRangeVersions"
+	Internal_ImportRangeVersions_FullMethodName          = "/Internal/ImportRangeVersions"
+	Internal_PromoteStagedVersions_FullMethodName        = "/Internal/PromoteStagedVersions"
+	Internal_ApplyTargetStagedReadiness_FullMethodName   = "/Internal/ApplyTargetStagedReadiness"
+	Internal_ProbeMigrationLocks_FullMethodName          = "/Internal/ProbeMigrationLocks"
+	Internal_CleanupMigration_FullMethodName             = "/Internal/CleanupMigration"
+	Internal_ProbeMigrationState_FullMethodName          = "/Internal/ProbeMigrationState"
+	Internal_IssueMigrationTimestamp_FullMethodName      = "/Internal/IssueMigrationTimestamp"
+	Internal_IssueBoundTimestamp_FullMethodName          = "/Internal/IssueBoundTimestamp"
+	Internal_LookupTimestampBinding_FullMethodName       = "/Internal/LookupTimestampBinding"
+	Internal_ProposeTwoGroupPrepare_FullMethodName       = "/Internal/ProposeTwoGroupPrepare"
+	Internal_VerifyTwoGroupPrepare_FullMethodName        = "/Internal/VerifyTwoGroupPrepare"
+	Internal_ProposeTwoGroupTerminal_FullMethodName      = "/Internal/ProposeTwoGroupTerminal"
+	Internal_ProbeTwoGroupPrepareEvidence_FullMethodName = "/Internal/ProbeTwoGroupPrepareEvidence"
 )
 
 // InternalClient is the client API for Internal service.
@@ -56,6 +60,10 @@ type InternalClient interface {
 	IssueMigrationTimestamp(ctx context.Context, in *IssueMigrationTimestampRequest, opts ...grpc.CallOption) (*IssueMigrationTimestampResponse, error)
 	IssueBoundTimestamp(ctx context.Context, in *IssueBoundTimestampRequest, opts ...grpc.CallOption) (*IssueBoundTimestampResponse, error)
 	LookupTimestampBinding(ctx context.Context, in *LookupTimestampBindingRequest, opts ...grpc.CallOption) (*LookupTimestampBindingResponse, error)
+	ProposeTwoGroupPrepare(ctx context.Context, in *ProposeTwoGroupPrepareRequest, opts ...grpc.CallOption) (*ProposeTwoGroupPrepareResponse, error)
+	VerifyTwoGroupPrepare(ctx context.Context, in *VerifyTwoGroupPrepareRequest, opts ...grpc.CallOption) (*VerifyTwoGroupPrepareResponse, error)
+	ProposeTwoGroupTerminal(ctx context.Context, in *ProposeTwoGroupTerminalRequest, opts ...grpc.CallOption) (*ProposeTwoGroupTerminalResponse, error)
+	ProbeTwoGroupPrepareEvidence(ctx context.Context, in *ProbeTwoGroupPrepareEvidenceRequest, opts ...grpc.CallOption) (*ProbeTwoGroupPrepareEvidenceResponse, error)
 }
 
 type internalClient struct {
@@ -225,6 +233,46 @@ func (c *internalClient) LookupTimestampBinding(ctx context.Context, in *LookupT
 	return out, nil
 }
 
+func (c *internalClient) ProposeTwoGroupPrepare(ctx context.Context, in *ProposeTwoGroupPrepareRequest, opts ...grpc.CallOption) (*ProposeTwoGroupPrepareResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ProposeTwoGroupPrepareResponse)
+	err := c.cc.Invoke(ctx, Internal_ProposeTwoGroupPrepare_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *internalClient) VerifyTwoGroupPrepare(ctx context.Context, in *VerifyTwoGroupPrepareRequest, opts ...grpc.CallOption) (*VerifyTwoGroupPrepareResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(VerifyTwoGroupPrepareResponse)
+	err := c.cc.Invoke(ctx, Internal_VerifyTwoGroupPrepare_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *internalClient) ProposeTwoGroupTerminal(ctx context.Context, in *ProposeTwoGroupTerminalRequest, opts ...grpc.CallOption) (*ProposeTwoGroupTerminalResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ProposeTwoGroupTerminalResponse)
+	err := c.cc.Invoke(ctx, Internal_ProposeTwoGroupTerminal_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *internalClient) ProbeTwoGroupPrepareEvidence(ctx context.Context, in *ProbeTwoGroupPrepareEvidenceRequest, opts ...grpc.CallOption) (*ProbeTwoGroupPrepareEvidenceResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ProbeTwoGroupPrepareEvidenceResponse)
+	err := c.cc.Invoke(ctx, Internal_ProbeTwoGroupPrepareEvidence_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // InternalServer is the server API for Internal service.
 // All implementations must embed UnimplementedInternalServer
 // for forward compatibility.
@@ -245,6 +293,10 @@ type InternalServer interface {
 	IssueMigrationTimestamp(context.Context, *IssueMigrationTimestampRequest) (*IssueMigrationTimestampResponse, error)
 	IssueBoundTimestamp(context.Context, *IssueBoundTimestampRequest) (*IssueBoundTimestampResponse, error)
 	LookupTimestampBinding(context.Context, *LookupTimestampBindingRequest) (*LookupTimestampBindingResponse, error)
+	ProposeTwoGroupPrepare(context.Context, *ProposeTwoGroupPrepareRequest) (*ProposeTwoGroupPrepareResponse, error)
+	VerifyTwoGroupPrepare(context.Context, *VerifyTwoGroupPrepareRequest) (*VerifyTwoGroupPrepareResponse, error)
+	ProposeTwoGroupTerminal(context.Context, *ProposeTwoGroupTerminalRequest) (*ProposeTwoGroupTerminalResponse, error)
+	ProbeTwoGroupPrepareEvidence(context.Context, *ProbeTwoGroupPrepareEvidenceRequest) (*ProbeTwoGroupPrepareEvidenceResponse, error)
 	mustEmbedUnimplementedInternalServer()
 }
 
@@ -299,6 +351,18 @@ func (UnimplementedInternalServer) IssueBoundTimestamp(context.Context, *IssueBo
 }
 func (UnimplementedInternalServer) LookupTimestampBinding(context.Context, *LookupTimestampBindingRequest) (*LookupTimestampBindingResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method LookupTimestampBinding not implemented")
+}
+func (UnimplementedInternalServer) ProposeTwoGroupPrepare(context.Context, *ProposeTwoGroupPrepareRequest) (*ProposeTwoGroupPrepareResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ProposeTwoGroupPrepare not implemented")
+}
+func (UnimplementedInternalServer) VerifyTwoGroupPrepare(context.Context, *VerifyTwoGroupPrepareRequest) (*VerifyTwoGroupPrepareResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method VerifyTwoGroupPrepare not implemented")
+}
+func (UnimplementedInternalServer) ProposeTwoGroupTerminal(context.Context, *ProposeTwoGroupTerminalRequest) (*ProposeTwoGroupTerminalResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ProposeTwoGroupTerminal not implemented")
+}
+func (UnimplementedInternalServer) ProbeTwoGroupPrepareEvidence(context.Context, *ProbeTwoGroupPrepareEvidenceRequest) (*ProbeTwoGroupPrepareEvidenceResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ProbeTwoGroupPrepareEvidence not implemented")
 }
 func (UnimplementedInternalServer) mustEmbedUnimplementedInternalServer() {}
 func (UnimplementedInternalServer) testEmbeddedByValue()                  {}
@@ -584,6 +648,78 @@ func _Internal_LookupTimestampBinding_Handler(srv interface{}, ctx context.Conte
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Internal_ProposeTwoGroupPrepare_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ProposeTwoGroupPrepareRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(InternalServer).ProposeTwoGroupPrepare(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Internal_ProposeTwoGroupPrepare_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(InternalServer).ProposeTwoGroupPrepare(ctx, req.(*ProposeTwoGroupPrepareRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Internal_VerifyTwoGroupPrepare_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(VerifyTwoGroupPrepareRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(InternalServer).VerifyTwoGroupPrepare(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Internal_VerifyTwoGroupPrepare_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(InternalServer).VerifyTwoGroupPrepare(ctx, req.(*VerifyTwoGroupPrepareRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Internal_ProposeTwoGroupTerminal_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ProposeTwoGroupTerminalRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(InternalServer).ProposeTwoGroupTerminal(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Internal_ProposeTwoGroupTerminal_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(InternalServer).ProposeTwoGroupTerminal(ctx, req.(*ProposeTwoGroupTerminalRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Internal_ProbeTwoGroupPrepareEvidence_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ProbeTwoGroupPrepareEvidenceRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(InternalServer).ProbeTwoGroupPrepareEvidence(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Internal_ProbeTwoGroupPrepareEvidence_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(InternalServer).ProbeTwoGroupPrepareEvidence(ctx, req.(*ProbeTwoGroupPrepareEvidenceRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Internal_ServiceDesc is the grpc.ServiceDesc for Internal service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -646,6 +782,22 @@ var Internal_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "LookupTimestampBinding",
 			Handler:    _Internal_LookupTimestampBinding_Handler,
+		},
+		{
+			MethodName: "ProposeTwoGroupPrepare",
+			Handler:    _Internal_ProposeTwoGroupPrepare_Handler,
+		},
+		{
+			MethodName: "VerifyTwoGroupPrepare",
+			Handler:    _Internal_VerifyTwoGroupPrepare_Handler,
+		},
+		{
+			MethodName: "ProposeTwoGroupTerminal",
+			Handler:    _Internal_ProposeTwoGroupTerminal_Handler,
+		},
+		{
+			MethodName: "ProbeTwoGroupPrepareEvidence",
+			Handler:    _Internal_ProbeTwoGroupPrepareEvidence_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

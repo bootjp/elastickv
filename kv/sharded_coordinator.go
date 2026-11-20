@@ -26,6 +26,8 @@ type ShardGroup struct {
 	Engine raftengine.Engine
 	Store  store.MVCCStore
 	Txn    Transactional
+	// Installed only with the opt-in two-group coordinator. Never public Forward.
+	twoGroupTerminalResolver func(context.Context, *pb.TwoGroupPrepareManifest, pb.Phase) error
 	// TSOState is set only for reserved group 0. Keeping the applied floor and
 	// cutover marker next to the group's engine lets the leader allocator read
 	// consensus-owned state without treating the shared HLC mirror as durable.
@@ -494,11 +496,16 @@ const (
 // It issues timestamps via a shared HLC and uses ShardRouter to dispatch.
 type ShardedCoordinator struct {
 	operationAdmission OperationAdmission
-	engine             *distribution.Engine
-	router             *ShardRouter
-	groups             map[uint64]*ShardGroup
-	defaultGroup       uint64
-	clock              *HLC
+	// Nil in production until the all-member two-group activation gate exists.
+	twoGroupHomeLookup     func(uint64) (TwoGroupHomeLookup, error)
+	twoGroupRemotePrepare  func(uint64) (TwoGroupRemotePreparer, error)
+	twoGroupRemoteTerminal func(uint64) (TwoGroupRemoteTerminal, error)
+	twoGroupRemoteEvidence func(uint64) (TwoGroupPrepareEvidenceProbe, error)
+	engine                 *distribution.Engine
+	router                 *ShardRouter
+	groups                 map[uint64]*ShardGroup
+	defaultGroup           uint64
+	clock                  *HLC
 	// tsAllocator is an optional TSO-backed timestamp source used for every
 	// coordinator-owned persistence timestamp. Nil preserves the legacy shared
 	// HLC path.
@@ -1076,7 +1083,7 @@ func (c *ShardedCoordinator) dispatchAdmitted(ctx context.Context, reqs *Operati
 		ctx = context.Background()
 	}
 
-	if err := validateOperationGroup(reqs); err != nil {
+	if err := validateOperationGroupForDispatch(reqs); err != nil {
 		return nil, err
 	}
 
@@ -2023,6 +2030,9 @@ func (c *ShardedCoordinator) validateCrossShardReadTimestamp(
 // error checks (groupReadKeys, prewrite, commitPrimary, abortCleanup,
 // commitSecondaries) that pushed the parent over the 10-edge limit.
 func (c *ShardedCoordinator) dispatchMultiShardTxn(ctx context.Context, startTS, commitTS, prevCommitTS uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, gids []uint64, readKeys [][]byte, observedRouteVersion uint64, bypassKeysByGroup map[uint64][][]byte, requireAllParticipants ...bool) (*CoordinateResponse, error) {
+	if err := c.preflightMultiShardTxn(prevCommitTS, gids); err != nil {
+		return nil, err
+	}
 	// Fail-closed when a retry carries the option-2 dedup probe key but its
 	// write set / read set spans shards (codex P2 round-10 "reject retries
 	// that leave the one-phase path"). The 2PC log builders only encode
@@ -2032,9 +2042,6 @@ func (c *ShardedCoordinator) dispatchMultiShardTxn(ctx context.Context, startTS,
 	// meant to prevent would reappear. Surface the constraint explicitly so
 	// the caller (or a future multi-shard dedup design) knows the request
 	// shape is unsupported.
-	if prevCommitTS != 0 {
-		return nil, errors.WithStack(ErrTxnDedupRequiresSingleShard)
-	}
 	releaseIdentity, err := c.acquireTxnIdentity(primaryKey, startTS)
 	if err != nil {
 		return nil, err
@@ -2115,6 +2122,16 @@ func (c *ShardedCoordinator) dispatchMultiShardTxn(ctx context.Context, startTS,
 		return nil, errors.WithStack(err)
 	}
 	return &CoordinateResponse{CommitIndex: maxIndex, CommitTS: commitTS}, nil
+}
+
+func (c *ShardedCoordinator) preflightMultiShardTxn(prevCommitTS uint64, gids []uint64) error {
+	if c.twoGroupHomeLookup != nil && len(gids) == 2 {
+		return errors.WithStack(ErrTwoGroupAdmission)
+	}
+	if prevCommitTS != 0 {
+		return errors.WithStack(ErrTxnDedupRequiresSingleShard)
+	}
+	return nil
 }
 
 func primaryCommitDefinitelyRejected(err error) bool {
@@ -2302,7 +2319,7 @@ func (c *ShardedCoordinator) commitPrimaryTxn(ctx context.Context, startTS uint6
 		return 0, 0, err
 	}
 
-	meta := txnMetaMutation(primaryKey, 0, commitTS)
+	meta := txnMetaMutation(primaryKey, commitTS)
 	keys := keyMutations(grouped[primaryGid])
 	req := &pb.Request{
 		IsTxn:                true,
@@ -2356,7 +2373,7 @@ func (c *ShardedCoordinator) commitSecondaryTxns(ctx context.Context, startTS ui
 	// recovery.  This sentinel is distinct from ErrComposed1Violation
 	// so the M4 retry path does not loop here (the primary is durable
 	// and re-prewriting would conflict with the existing locks).
-	meta := txnMetaMutation(primaryKey, 0, commitTS)
+	meta := txnMetaMutation(primaryKey, commitTS)
 	strict := requireAllParticipantsFlag(requireAllParticipants)
 	for _, gid := range gids {
 		if gid == primaryGid {
@@ -2461,7 +2478,7 @@ func (c *ShardedCoordinator) abortPreparedTxn(ctx context.Context, startTS uint6
 	}
 
 	cleaned := true
-	meta := txnMetaMutation(primaryKey, 0, abortTS)
+	meta := txnMetaMutation(primaryKey, abortTS)
 	for _, pg := range prepared {
 		if !c.abortPreparedGroup(ctx, startTS, primaryKey, abortTS, meta, pg) {
 			cleaned = false
@@ -2632,11 +2649,11 @@ func abortTSFrom(startTS, commitTS uint64) uint64 {
 	return 0
 }
 
-func txnMetaMutation(primaryKey []byte, lockTTLms uint64, commitTS uint64) *pb.Mutation {
+func txnMetaMutation(primaryKey []byte, commitTS uint64) *pb.Mutation {
 	return &pb.Mutation{
 		Op:    pb.Op_PUT,
 		Key:   []byte(txnMetaPrefix),
-		Value: EncodeTxnMeta(TxnMeta{PrimaryKey: primaryKey, LockTTLms: lockTTLms, CommitTS: commitTS}),
+		Value: EncodeTxnMeta(TxnMeta{PrimaryKey: primaryKey, CommitTS: commitTS}),
 	}
 }
 
@@ -3455,6 +3472,16 @@ func maxStagedVisibilityLatestCommitTS(liveTS uint64, liveExists bool, stagedTS 
 
 var _ Coordinator = (*ShardedCoordinator)(nil)
 
+func validateOperationGroupForDispatch(reqs *OperationGroup[OP]) error {
+	if err := validateOperationGroup(reqs); err != nil {
+		return err
+	}
+	if len(reqs.OperationID) != 0 {
+		return ErrTimestampBindingInvalid
+	}
+	return nil
+}
+
 func validateOperationGroup(reqs *OperationGroup[OP]) error {
 	if reqs == nil || len(reqs.Elems) == 0 {
 		return ErrInvalidRequest
@@ -3514,12 +3541,13 @@ func (c *ShardedCoordinator) rawLogsWithGroups(ctx context.Context, reqs *Operat
 			}
 		}
 		logs = append(logs, &pb.Request{
-			IsTxn:                false,
-			Phase:                pb.Phase_NONE,
-			Ts:                   ts,
-			Mutations:            muts,
-			ObservedRouteVersion: reqs.ObservedRouteVersion,
-			WriteFenceBypassKeys: bypassKeysByGroup[gid],
+			IsTxn:                       false,
+			Phase:                       pb.Phase_NONE,
+			Ts:                          ts,
+			Mutations:                   muts,
+			TimestampBindingOperationId: append([]byte(nil), reqs.OperationID...),
+			ObservedRouteVersion:        reqs.ObservedRouteVersion,
+			WriteFenceBypassKeys:        bypassKeysByGroup[gid],
 		})
 	}
 	return logs, gids, nil

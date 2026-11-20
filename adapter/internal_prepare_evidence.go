@@ -75,7 +75,8 @@ func (i *Internal) inspectPrepareEvidence(ctx context.Context, requestedFloor ui
 func (i *Internal) prepareEvidenceCapabilities() *pb.PrepareEvidenceStateResponse {
 	return &pb.PrepareEvidenceStateResponse{
 		Supported: true, DedicatedTsoConfigured: i.tsoCutoverState != nil && i.tsAllocator != nil,
-		CutoverApplied: i.tsoCutoverState != nil && i.tsoCutoverState.CutoverActive(),
+		CutoverApplied:                  i.tsoCutoverState != nil && i.tsoCutoverState.CutoverActive(),
+		TimestampBindingProtocolVersion: kv.TimestampBindingProtocolVersion,
 	}
 }
 

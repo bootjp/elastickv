@@ -29,6 +29,10 @@ func projectPublicGRPCMutationError(err error) error {
 		!errors.Is(err, kv.ErrTxnLocked) &&
 		!isIndeterminateMutationDispatchFailure(err) {
 		switch {
+		case errors.Is(err, kv.ErrTimestampBindingInvalid):
+			code = codes.FailedPrecondition
+			message = "Timestamp binding admission unavailable"
+			reason = publicGRPCNotAdmittedReason
 		case errors.Is(err, kv.ErrLeaderProxyCircuitOpen):
 			code = codes.Unavailable
 			message = "Route unavailable"

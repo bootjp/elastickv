@@ -14,18 +14,20 @@ func TestKVFSMReservedOpcodesAreDistinct(t *testing.T) {
 	t.Parallel()
 
 	opcodes := map[string]byte{
-		"single":            raftEncodeSingle,
-		"batch":             raftEncodeBatch,
-		"hlc lease":         raftEncodeHLCLease,
-		"migration import":  raftEncodeMigrationImport,
-		"migration promote": raftEncodeMigrationPromote,
-		"migration retire":  raftEncodeMigrationRetire,
-		"migration cleanup": raftEncodeMigrationCleanup,
-		"backup":            raftEncodeBackup,
-		"read watermark":    raftEncodeWatermarkAdvance,
-		"target readiness":  raftEncodeTargetReadiness,
-		"replicated backup": raftEncodeReplicatedBackup,
-		"commit-ts fence":   raftEncodeCommitTSFenceActivation,
+		"single":             raftEncodeSingle,
+		"batch":              raftEncodeBatch,
+		"hlc lease":          raftEncodeHLCLease,
+		"migration import":   raftEncodeMigrationImport,
+		"migration promote":  raftEncodeMigrationPromote,
+		"migration retire":   raftEncodeMigrationRetire,
+		"migration cleanup":  raftEncodeMigrationCleanup,
+		"backup":             raftEncodeBackup,
+		"read watermark":     raftEncodeWatermarkAdvance,
+		"target readiness":   raftEncodeTargetReadiness,
+		"replicated backup":  raftEncodeReplicatedBackup,
+		"commit-ts fence":    raftEncodeCommitTSFenceActivation,
+		"two-group prepare":  raftEncodeTwoGroupPrepare,
+		"two-group terminal": raftEncodeTwoGroupTerminal,
 	}
 	owner := make(map[byte]string, len(opcodes))
 	for name, op := range opcodes {
@@ -38,4 +40,6 @@ func TestKVFSMReservedOpcodesAreDistinct(t *testing.T) {
 	}
 	require.NotEqual(t, byte(0x1f), raftEncodeCommitTSFenceActivation,
 		"the guarded bootstrap control prefix must not dispatch as a legacy opcode")
+	require.Equal(t, byte(6), raftEncodeTwoGroupTerminal&7,
+		"the terminal prefix must be invalid as a bare protobuf Request")
 }

@@ -1,6 +1,7 @@
 package kv
 
 import (
+	"bytes"
 	"context"
 	"testing"
 
@@ -110,6 +111,51 @@ func TestTimestampBindingPebbleReopen(t *testing.T) {
 		require.True(t, already)
 		return err
 	}))
+}
+
+func TestTimestampBindingSurvivesSnapshotRestore(t *testing.T) {
+	for name, factory := range map[string]func(*testing.T) store.MVCCStore{
+		"memory": func(t *testing.T) store.MVCCStore { return store.NewMVCCStore() },
+		"pebble": func(t *testing.T) store.MVCCStore { return storetest.NewPebble(t) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			source := factory(t)
+			metadata, applier := testTimestampBindingStores(t, source)
+			binding := testTimestampBinding()
+			require.NoError(t, applier.ApplyRaftEntry(t.Context(), 1, func(ctx context.Context) error {
+				_, err := StageTimestampBinding(ctx, metadata, binding)
+				return err
+			}))
+
+			snapshot, err := source.Snapshot()
+			require.NoError(t, err)
+			var data bytes.Buffer
+			_, err = snapshot.WriteTo(&data)
+			require.NoError(t, err)
+			require.NoError(t, snapshot.Close())
+
+			target := factory(t)
+			require.NoError(t, target.Restore(&data))
+			metadata, applier = testTimestampBindingStores(t, target)
+			got, found, err := LookupTimestampBinding(t.Context(), metadata, binding.OperationID)
+			require.NoError(t, err)
+			require.True(t, found)
+			require.Equal(t, binding, got)
+
+			require.NoError(t, applier.ApplyRaftEntry(t.Context(), 2, func(ctx context.Context) error {
+				already, err := StageTimestampBinding(ctx, metadata, binding)
+				require.True(t, already)
+				return err
+			}))
+			conflicting := binding
+			conflicting.OperationID[0]++
+			err = applier.ApplyRaftEntry(t.Context(), 3, func(ctx context.Context) error {
+				_, err := StageTimestampBinding(ctx, metadata, conflicting)
+				return err
+			})
+			require.ErrorIs(t, err, ErrTimestampBindingConflict)
+		})
+	}
 }
 
 func TestTimestampBindingConflictAbortsWholeEntry(t *testing.T) {

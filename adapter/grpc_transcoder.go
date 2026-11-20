@@ -14,7 +14,8 @@ func newGrpcGrpcTranscoder() *grpcTranscoder {
 
 func (c *grpcTranscoder) RawPutToRequest(m *pb.RawPutRequest) (*kv.OperationGroup[kv.OP], error) {
 	return &kv.OperationGroup[kv.OP]{
-		IsTxn: false,
+		IsTxn:       false,
+		OperationID: append([]byte(nil), m.GetOperationId()...),
 		Elems: []*kv.Elem[kv.OP]{
 			{
 				Op:    kv.Put,
@@ -27,7 +28,8 @@ func (c *grpcTranscoder) RawPutToRequest(m *pb.RawPutRequest) (*kv.OperationGrou
 
 func (c *grpcTranscoder) RawDeleteToRequest(m *pb.RawDeleteRequest) (*kv.OperationGroup[kv.OP], error) {
 	return &kv.OperationGroup[kv.OP]{
-		IsTxn: false,
+		IsTxn:       false,
+		OperationID: append([]byte(nil), m.GetOperationId()...),
 		Elems: []*kv.Elem[kv.OP]{
 			{
 				Op:  kv.Del,

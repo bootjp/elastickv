@@ -596,6 +596,7 @@ type adminResult struct {
 type proposalRequest struct {
 	ctx           context.Context
 	id            uint64
+	expectedTerm  uint64
 	payload       []byte
 	payloadDigest [32]byte
 	done          chan proposalResult
@@ -1193,7 +1194,14 @@ func (e *Engine) Err() error {
 }
 
 func (e *Engine) Propose(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
-	return e.propose(ctx, data)
+	return e.propose(ctx, 0, data)
+}
+
+func (e *Engine) ProposeIfTerm(ctx context.Context, term uint64, data []byte) (*raftengine.ProposalResult, error) {
+	if term == 0 {
+		return nil, raftengine.ErrStaleAdmissionTerm
+	}
+	return e.propose(ctx, term, data)
 }
 
 // ProposeAdmin drives a control-plane proposal that must remain
@@ -1217,10 +1225,10 @@ func (e *Engine) Propose(ctx context.Context, data []byte) (*raftengine.Proposal
 // change (6E-2d) — calling Propose from an exempt site today is
 // silently wrong tomorrow.
 func (e *Engine) ProposeAdmin(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
-	return e.propose(ctx, data)
+	return e.propose(ctx, 0, data)
 }
 
-func (e *Engine) propose(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
+func (e *Engine) propose(ctx context.Context, term uint64, data []byte) (*raftengine.ProposalResult, error) {
 	if err := contextErr(ctx); err != nil {
 		return nil, err
 	}
@@ -1237,6 +1245,7 @@ func (e *Engine) propose(ctx context.Context, data []byte) (*raftengine.Proposal
 	if err != nil {
 		return nil, err
 	}
+	req.expectedTerm = term
 
 	select {
 	case <-ctx.Done():
@@ -2211,6 +2220,10 @@ func (e *Engine) handleProposal(req proposalRequest) {
 	}
 	if e.State() != raftengine.StateLeader {
 		req.done <- proposalResult{err: errors.WithStack(errNotLeader)}
+		return
+	}
+	if req.expectedTerm != 0 && e.rawNode.BasicStatus().GetTerm() != req.expectedTerm {
+		req.done <- proposalResult{err: raftengine.ErrStaleAdmissionTerm}
 		return
 	}
 	// etcd/raft drops proposals while a leadership transfer is in flight

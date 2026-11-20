@@ -207,6 +207,33 @@ func TestProposeAdmin_EquivalentToProposeToday(t *testing.T) {
 // method) or hard-fail the build (if it doesn't) — the latter is
 // the failure mode this guard exists to produce.
 var _ raftengine.Proposer = (*Engine)(nil)
+var _ raftengine.TermFencedProposer = (*Engine)(nil)
+
+func TestProposeIfTermRejectsBeforeRaftSubmission(t *testing.T) {
+	t.Parallel()
+	fsm := &testStateMachine{}
+	engine, err := Open(context.Background(), OpenConfig{
+		NodeID:       1,
+		LocalID:      "n1",
+		LocalAddress: "127.0.0.1:7021",
+		DataDir:      t.TempDir(),
+		Bootstrap:    true,
+		StateMachine: fsm,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, engine.Close()) })
+
+	term := engine.Status().Term
+	require.NotZero(t, term)
+	_, err = engine.ProposeIfTerm(t.Context(), term+1, []byte("stale"))
+	require.ErrorIs(t, err, raftengine.ErrStaleAdmissionTerm)
+	require.Empty(t, fsm.Applied())
+
+	result, err := engine.ProposeIfTerm(t.Context(), term, []byte("current"))
+	require.NoError(t, err)
+	require.NotZero(t, result.CommitIndex)
+	require.Equal(t, [][]byte{[]byte("current")}, fsm.Applied())
+}
 
 func TestInboundQueueCapacityScalesSmallInflight(t *testing.T) {
 	t.Parallel()

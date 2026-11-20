@@ -35,5 +35,6 @@ func ApplyTimestampBoundCreation(ctx context.Context, st store.MVCCStore, index 
 	if err != nil {
 		return false, errors.Wrap(err, "apply timestamp-bound creation")
 	}
+	clearAppliedHomeBindingAttempt(binding)
 	return already, nil
 }

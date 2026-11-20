@@ -176,8 +176,15 @@ type Internal struct {
 	transactionManager              kv.Transactional
 	clock                           *kv.HLC
 	tsAllocator                     kv.TimestampAllocator
-	timestampAdmissionIssuer        kv.TimestampAfterAllocator
+	timestampAdmissionIssuer        kv.TSOPhysicalBandAllocator
 	timestampAdmissionToken         string
+	twoGroupPrepareGroupID          uint64
+	twoGroupPrepareToken            string
+	twoGroupPrepareProposer         raftengine.TermFencedProposer
+	twoGroupPrepareHomeLookup       func(uint64) (*TwoGroupHomePeerLookup, error)
+	twoGroupEvidenceProbeEnabled    bool
+	twoGroupTerminalMetadata        store.RaftControlMetadataStore
+	twoGroupTerminalSecondary       func(uint64) (*TwoGroupTerminalPeer, error)
 	adminProposer                   raftengine.Proposer
 	bootstrapPolicyProposer         raftengine.Proposer
 	prepareStartupAuthorization     func(context.Context, *pb.PrepareEvidenceStateRequest) bool

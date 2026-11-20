@@ -65,6 +65,19 @@ func (p *leaderAdminProposer) Propose(
 	return result, errors.WithStack(err)
 }
 
+func (p *leaderAdminProposer) ProposeIfTerm(
+	ctx context.Context,
+	term uint64,
+	data []byte,
+) (*raftengine.ProposalResult, error) {
+	local, ok := p.local.(raftengine.TermFencedProposer)
+	if !ok {
+		return nil, raftengine.ErrStaleAdmissionTerm
+	}
+	result, err := local.ProposeIfTerm(ctx, term, data)
+	return result, errors.WithStack(err)
+}
+
 func (p *leaderAdminProposer) ProposeAdmin(
 	ctx context.Context,
 	data []byte,

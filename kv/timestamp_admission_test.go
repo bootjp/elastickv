@@ -223,7 +223,7 @@ func TestTimestampAdmissionSingleCoordinatorUsesCurrentAllocator(t *testing.T) {
 	allocator := &phaseDTestAllocator{next: 140}
 	coord := NewCoordinatorWithEngine(tm, engine, WithTimestampAdmissionStore(st), WithTSOAllocator(allocator))
 	t.Cleanup(func() { require.NoError(t, coord.Close()) })
-	_, err := coord.dispatchRaw(context.Background(), []*Elem[OP]{{Op: Put, Key: []byte("k"), Value: []byte("v")}}, keyviz.LabelLegacy)
+	_, err := coord.dispatchRaw(context.Background(), []*Elem[OP]{{Op: Put, Key: []byte("k"), Value: []byte("v")}}, keyviz.LabelLegacy, nil)
 	require.NoError(t, err)
 	requests, err := decodeRaftRequests(engine.proposedPayloads()[0])
 	require.NoError(t, err)

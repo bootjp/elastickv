@@ -29,6 +29,7 @@ func TestProjectPublicGRPCMutationError(t *testing.T) {
 		message string
 		reason  string
 	}{
+		{"timestamp binding unavailable", kv.ErrTimestampBindingInvalid, codes.FailedPrecondition, "Timestamp binding admission unavailable", publicGRPCNotAdmittedReason},
 		{"not admitted", kv.ErrLeaderProxyCircuitOpen, codes.Unavailable, "Route unavailable", publicGRPCNotAdmittedReason},
 		{"proven conflict", errors.Wrap(store.ErrWriteConflict, "physical-key"), codes.Aborted, "Operation aborted", publicGRPCAbortedReason},
 		{"unknown", kv.ErrTransactionOutcomeUnknown, codes.Unknown, "Operation outcome unknown", publicGRPCUnknownReason},
@@ -55,6 +56,35 @@ func TestProjectPublicGRPCMutationError(t *testing.T) {
 		})
 	}
 	require.NoError(t, projectPublicGRPCMutationError(nil))
+}
+
+func TestGRPCPublicRawOperationIDRejectedBeforeActivation(t *testing.T) {
+	t.Parallel()
+	st := store.NewMVCCStore()
+	service := NewGRPCServer(st, &kv.Coordinate{})
+	id := append([]byte{1}, make([]byte, 15)...)
+	key := []byte("raw-operation-id")
+	for _, call := range []func() error{
+		func() error {
+			_, err := service.RawPut(t.Context(), &pb.RawPutRequest{Key: key, Value: []byte("value"), OperationId: id})
+			return err
+		},
+		func() error {
+			_, err := service.RawDelete(t.Context(), &pb.RawDeleteRequest{Key: key, OperationId: id})
+			return err
+		},
+	} {
+		err := call()
+		require.Equal(t, codes.FailedPrecondition, status.Code(err))
+		st, ok := status.FromError(err)
+		require.True(t, ok)
+		require.Len(t, st.Details(), 1)
+		detail, ok := st.Details()[0].(*errdetails.ErrorInfo)
+		require.True(t, ok)
+		require.Equal(t, publicGRPCNotAdmittedReason, detail.GetReason())
+		_, err = service.store.GetAt(t.Context(), key, ^uint64(0))
+		require.ErrorIs(t, err, store.ErrKeyNotFound)
+	}
 }
 
 func TestGRPCPublicMutationsHideUnmarkedDispatchErrors(t *testing.T) {
