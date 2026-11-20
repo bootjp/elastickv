@@ -313,6 +313,11 @@ func (p *LeaderProxy) forward(callerCtx context.Context, parentCtx context.Conte
 }
 
 func classifyForwardRPCError(err error, reqs []*pb.Request) error {
+	// Decoding a status can select one branch and discard another failed
+	// attempt. Only an isolated reply can supply a definitive verdict.
+	if !isolatedMutationFailure(err) {
+		return &ForwardFailure{Decision: pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN}
+	}
 	if phase, ok := ForwardFailurePhaseForRequests(reqs); ok {
 		reason, decision, valid := DecodeForwardDecisionStatus(err, phase)
 		if valid {

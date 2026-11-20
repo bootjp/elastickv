@@ -80,6 +80,18 @@ func TestForwardRawPreSubmissionProofIsPhaseBound(t *testing.T) {
 	}
 }
 
+func TestMixedForwardDecisionCannotProveRejection(t *testing.T) {
+	for _, decision := range []pb.ForwardDecisionClass{pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_REJECTED_BEFORE_SUBMISSION, pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_DEFINITIVELY_ABORTED} {
+		wire := ForwardDecisionStatus(pb.ForwardFailurePhase_FORWARD_FAILURE_PHASE_ONE_PHASE_APPLY, pb.ForwardFailureReason_FORWARD_FAILURE_REASON_FENCE, decision)
+		for _, mixed := range []error{errors.Join(wire, io.EOF), errors.WithSecondaryError(wire, io.EOF), errors.WithStack(errors.Join(wire, io.EOF))} {
+			err := classifyForwardRPCError(mixed, []*pb.Request{{}})
+			require.ErrorIs(t, err, ErrTransactionOutcomeUnknown)
+			require.False(t, IsDataRequestNotSubmitted(err))
+			require.False(t, IsCertifiedOnePhaseConflict(err))
+		}
+	}
+}
+
 func TestLaterRawRejectionDoesNotEraseEarlierSubmission(t *testing.T) {
 	for _, first := range []error{store.ErrWriteConflict, ErrComposed1VersionGCd} {
 		engine := distribution.NewEngine()
