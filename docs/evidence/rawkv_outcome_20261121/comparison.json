@@ -1,0 +1,120 @@
+{
+  "trials": [
+    {
+      "trial": "A1",
+      "read_rps": 192.1185266122297,
+      "write_rps": 178.14802693159496,
+      "read_p99_ms": 85.306978,
+      "write_p99_ms": 188.091651,
+      "read_success_p99_ms": 85.33484,
+      "write_success_p99_ms": 189.815118,
+      "read_errors": {
+        "Unknown": 176
+      },
+      "write_errors": {
+        "Unknown": 4246
+      },
+      "capacity_drops": 34303,
+      "scheduler_drops": 146,
+      "preflight_upper_ms": 3462.292,
+      "preflight_versions": 4761,
+      "split_done_ms": 190265,
+      "acknowledged_writes": 53468,
+      "availability_clean": false
+    },
+    {
+      "trial": "B1",
+      "read_rps": 195.12996304194786,
+      "write_rps": 182.2354722801772,
+      "read_p99_ms": 80.494041,
+      "write_p99_ms": 178.427378,
+      "read_success_p99_ms": 80.547673,
+      "write_success_p99_ms": 179.545195,
+      "read_errors": {
+        "Unknown": 166
+      },
+      "write_errors": {
+        "Aborted": 1,
+        "Unavailable": 4260
+      },
+      "capacity_drops": 32207,
+      "scheduler_drops": 108,
+      "preflight_upper_ms": 3050.091,
+      "preflight_versions": 5658,
+      "split_done_ms": 204308,
+      "acknowledged_writes": 54694,
+      "availability_clean": false
+    },
+    {
+      "trial": "B2",
+      "read_rps": 193.5790577741801,
+      "write_rps": 179.72794423703934,
+      "read_p99_ms": 85.047449,
+      "write_p99_ms": 185.277667,
+      "read_success_p99_ms": 85.070242,
+      "write_success_p99_ms": 187.238993,
+      "read_errors": {
+        "Unknown": 175
+      },
+      "write_errors": {
+        "Aborted": 2,
+        "Unavailable": 4265
+      },
+      "capacity_drops": 33429,
+      "scheduler_drops": 92,
+      "preflight_upper_ms": 3460.136,
+      "preflight_versions": 4693,
+      "split_done_ms": 189690,
+      "acknowledged_writes": 53940,
+      "availability_clean": false
+    },
+    {
+      "trial": "A2",
+      "read_rps": 196.0186872438238,
+      "write_rps": 182.51474824125347,
+      "read_p99_ms": 80.69405,
+      "write_p99_ms": 176.550373,
+      "read_success_p99_ms": 80.745078,
+      "write_success_p99_ms": 177.989158,
+      "read_errors": {
+        "Unknown": 87
+      },
+      "write_errors": {
+        "Unknown": 4284
+      },
+      "capacity_drops": 31900,
+      "scheduler_drops": 118,
+      "preflight_upper_ms": 3481.465,
+      "preflight_versions": 4694,
+      "split_done_ms": 189666,
+      "acknowledged_writes": 54779,
+      "availability_clean": false
+    }
+  ],
+  "means": {
+    "baseline": {
+      "read_rps": 194.06860692802672,
+      "write_rps": 180.33138758642423,
+      "read_p99_ms": 83.00051400000001,
+      "write_p99_ms": 182.321012,
+      "preflight_upper_ms": 3471.8785,
+      "split_done_ms": 189965.5
+    },
+    "candidate": {
+      "read_rps": 194.35451040806396,
+      "write_rps": 180.98170825860825,
+      "read_p99_ms": 82.770745,
+      "write_p99_ms": 181.85252250000002,
+      "preflight_upper_ms": 3255.1135,
+      "split_done_ms": 196999
+    }
+  },
+  "candidate_change_percent": {
+    "read_rps": 0.147320828733144,
+    "write_rps": 0.3606253358819034,
+    "read_p99_ms": -0.27682840614698945,
+    "write_p99_ms": -0.25695858906267244,
+    "preflight_upper_ms": -6.2434500516075015,
+    "split_done_ms": 3.702514403931234
+  }
+}

@@ -1,0 +1,12 @@
+--- FAIL: TestMixedForwardDecisionCannotProveRejection (0.00s)
+    mutation_nonadmission_test.go:88: 
+        	Error Trace:	/private/tmp/elastickv-load-ramp-20261121/kv/mutation_nonadmission_test.go:88
+        	Error:      	Target error should be in err chain:
+        	            	expected: "transaction outcome unknown"
+        	            	in chain: "data request was not submitted"
+        	            		"route is write-fenced; retry after route migration"
+        	            		"route is write-fenced; retry after route migration"
+        	Test:       	TestMixedForwardDecisionCannotProveRejection
+FAIL
+FAIL	github.com/bootjp/elastickv/kv	0.612s
+FAIL

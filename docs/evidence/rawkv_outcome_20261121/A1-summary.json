@@ -1,0 +1,223 @@
+{
+  "stages": [
+    {
+      "index": 0,
+      "offered_rps": 500,
+      "started": "2026-11-20T19:19:07.349883367Z",
+      "elapsed_seconds": 300.13242875,
+      "planned": 150000,
+      "offered": 150000,
+      "dropped_capacity": 34303,
+      "dropped_scheduler": 146,
+      "cancelled": false,
+      "read": {
+        "attempts": 57837,
+        "success": 57661,
+        "errors": {
+          "Unknown": 176
+        },
+        "first_error": "rpc error: code = Unknown desc = route cutover pending",
+        "latency": {
+          "samples": 57837,
+          "p50_ms": 17.88195,
+          "p95_ms": 61.200032,
+          "p99_ms": 85.306978,
+          "max_ms": 516.641707
+        },
+        "successful_latency": {
+          "samples": 57661,
+          "p50_ms": 17.845361,
+          "p95_ms": 61.250816,
+          "p99_ms": 85.33484,
+          "max_ms": 516.641707
+        }
+      },
+      "write": {
+        "attempts": 57714,
+        "success": 53468,
+        "errors": {
+          "Unknown": 4246
+        },
+        "first_error": "rpc error: code = Unknown desc = Operation outcome unknown",
+        "latency": {
+          "samples": 57714,
+          "p50_ms": 71.561616,
+          "p95_ms": 151.785484,
+          "p99_ms": 188.091651,
+          "max_ms": 858.493796
+        },
+        "successful_latency": {
+          "samples": 53468,
+          "p50_ms": 78.914935,
+          "p95_ms": 153.830259,
+          "p99_ms": 189.815118,
+          "max_ms": 858.493796
+        }
+      },
+      "verification": {
+        "attempts": 53468,
+        "success": 53468,
+        "errors": {},
+        "latency": {
+          "samples": 53468,
+          "p50_ms": 21.255259,
+          "p95_ms": 65.204211,
+          "p99_ms": 88.546742,
+          "max_ms": 476.353129
+        },
+        "successful_latency": {
+          "samples": 53468,
+          "p50_ms": 21.255259,
+          "p95_ms": 65.204211,
+          "p99_ms": 88.546742,
+          "max_ms": 476.353129
+        }
+      },
+      "logical_scheduled_latency": {
+        "attempts": 115551,
+        "success": 111129,
+        "errors": {
+          "Unknown": 4422
+        },
+        "first_error": "rpc error: code = Unknown desc = Operation outcome unknown",
+        "latency": {
+          "samples": 115551,
+          "p50_ms": 30.217865,
+          "p95_ms": 181.939515,
+          "p99_ms": 232.872103,
+          "max_ms": 987.628461
+        },
+        "successful_latency": {
+          "samples": 111129,
+          "p50_ms": 31.630706,
+          "p95_ms": 183.431884,
+          "p99_ms": 234.153745,
+          "max_ms": 987.628461
+        }
+      },
+      "read_scheduled_latency": {
+        "attempts": 57837,
+        "success": 57661,
+        "errors": {
+          "Unknown": 176
+        },
+        "first_error": "rpc error: code = Unknown desc = route cutover pending",
+        "latency": {
+          "samples": 57837,
+          "p50_ms": 18.422105,
+          "p95_ms": 61.749546,
+          "p99_ms": 85.727029,
+          "max_ms": 517.554045
+        },
+        "successful_latency": {
+          "samples": 57661,
+          "p50_ms": 18.365003,
+          "p95_ms": 61.802837,
+          "p99_ms": 85.822948,
+          "max_ms": 517.554045
+        }
+      },
+      "write_scheduled_latency": {
+        "attempts": 57714,
+        "success": 53468,
+        "errors": {
+          "Unknown": 4246
+        },
+        "first_error": "rpc error: code = Unknown desc = Operation outcome unknown",
+        "latency": {
+          "samples": 57714,
+          "p50_ms": 99.008177,
+          "p95_ms": 203.316901,
+          "p99_ms": 252.671428,
+          "max_ms": 987.628461
+        },
+        "successful_latency": {
+          "samples": 53468,
+          "p50_ms": 109.290925,
+          "p95_ms": 205.903303,
+          "p99_ms": 255.070711,
+          "max_ms": 987.628461
+        }
+      },
+      "admitted": 115551,
+      "read_success_rps": 192.1185266122297,
+      "write_success_rps": 178.14802693159496,
+      "verification_success_rps": 178.14802693159496
+    }
+  ],
+  "availability_clean": false,
+  "acknowledged_writes": 53468,
+  "audit": {
+    "acknowledged_writes": 53468,
+    "audit": {
+      "attempts": 160404,
+      "success": 160404,
+      "errors": {},
+      "latency": {
+        "samples": 160404,
+        "p50_ms": 5.511267,
+        "p95_ms": 8.847916,
+        "p99_ms": 11.76346,
+        "max_ms": 29.519751
+      },
+      "successful_latency": {
+        "samples": 160404,
+        "p50_ms": 5.511267,
+        "p95_ms": 8.847916,
+        "p99_ms": 11.76346,
+        "max_ms": 29.519751
+      }
+    },
+    "complete": true,
+    "expected_observations": 160404,
+    "type": "audit",
+    "verified": true
+  },
+  "accounting_valid": true,
+  "ack_audit_valid": true,
+  "split_done_ms": [
+    190265
+  ],
+  "preflight_upper_ms": [
+    3462.292
+  ],
+  "post_done_paths": [
+    [
+      "moved-forwarded",
+      "600",
+      "600",
+      "600",
+      "0"
+    ],
+    [
+      "moved-direct",
+      "600",
+      "600",
+      "600",
+      "0"
+    ],
+    [
+      "outside-direct",
+      "600",
+      "600",
+      "600",
+      "0"
+    ],
+    [
+      "retained-direct",
+      "600",
+      "600",
+      "600",
+      "0"
+    ],
+    [
+      "retained-forwarded",
+      "600",
+      "600",
+      "600",
+      "0"
+    ]
+  ],
+  "profile_events": [],
+  "test_passed": true
+}
