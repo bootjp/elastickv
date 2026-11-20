@@ -18,7 +18,6 @@ func TestListenerFlagsDefaultsAndParsing(t *testing.T) {
 		s3PathStyleOnly:       true,
 		sqsRegion:             "us-east-1",
 		metricsAddress:        "localhost:9090",
-		pprofAddress:          "localhost:6060",
 	}, defaultFlags[listenerFlags]())
 
 	var f listenerFlags

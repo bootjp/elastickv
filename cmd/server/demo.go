@@ -40,7 +40,7 @@ var (
 	s3PathStyle    = flag.Bool("s3PathStyleOnly", true, "Only accept path-style S3 requests")
 	metricsAddress = flag.String("metricsAddress", "127.0.0.1:9090", "Prometheus metrics address")
 	metricsToken   = flag.String("metricsToken", "", "Bearer token for Prometheus metrics; required for non-loopback metricsAddress")
-	pprofAddress   = flag.String("pprofAddress", "localhost:6060", "TCP host+port for pprof debug endpoints; empty to disable")
+	pprofAddress   = flag.String("pprofAddress", "", "Opt-in TCP host+port for pprof debug endpoints; disabled by default")
 	pprofToken     = flag.String("pprofToken", "", "Bearer token for pprof; required for non-loopback pprofAddress")
 	raftID         = flag.String("raftId", "", "Raft ID")
 	raftDataDir    = flag.String("raftDataDir", "/var/lib/elastickv", "Raft data directory")

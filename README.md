@@ -513,6 +513,16 @@ lookup and compaction proofs. The toolchain version is pinned in
 reads on a single key with 4,096 versions, run
 `go test ./store -run '^$' -bench BenchmarkMemoryMVCCHistory -benchmem`.
 
+### Linux load ramp and Split checks
+
+The [RawKV load tool](cmd/loadtest/README.md) generates paced, bounded read/write
+load against the public gRPC adapter and reports latency, errors and dropped
+arrivals separately. The Linux fixture starts three nodes, increases offered
+load in stages, performs a same-group or cross-group Split, and audits every
+acknowledged write through every ingress after Done and routing convergence.
+It measures a single-host placement; adding nodes or groups remains an operator
+action. Debug profiles require explicit opt-in and are disabled by default.
+
 ### Running Jepsen tests
 
 Jepsen workloads and their harness tests live in `jepsen/`. Install Leiningen and run the harness tests locally:

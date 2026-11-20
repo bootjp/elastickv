@@ -50,7 +50,7 @@ func (f *listenerFlags) register(fs *flag.FlagSet) {
 	fs.StringVar(&f.sqsCredentialsFile, "sqsCredentialsFile", "", "Path to a JSON file containing static SQS credentials")
 	fs.StringVar(&f.metricsAddress, "metricsAddress", "localhost:9090", "TCP host+port for Prometheus metrics")
 	fs.StringVar(&f.metricsToken, "metricsToken", "", "Bearer token for Prometheus metrics; required for non-loopback metricsAddress")
-	fs.StringVar(&f.pprofAddress, "pprofAddress", "localhost:6060", "TCP host+port for pprof debug endpoints; empty to disable")
+	fs.StringVar(&f.pprofAddress, "pprofAddress", "", "Opt-in TCP host+port for pprof debug endpoints; disabled by default")
 	fs.StringVar(&f.pprofToken, "pprofToken", "", "Bearer token for pprof; required for non-loopback pprofAddress")
 }
 

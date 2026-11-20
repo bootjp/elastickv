@@ -2585,7 +2585,7 @@ func (e *Engine) handleStepWithAdmission(msg raftpb.Message, request *raftengine
 	if e.rawNode == nil {
 		return
 	}
-	commitBeforeStep := e.rawNode.Status().GetCommit()
+	commitBeforeStep := e.rawNode.BasicStatus().GetCommit()
 	err := e.mutateNative(context.Background(), request, msg.GetType() == raftpb.MsgSnap, func() error {
 		return admit(func() error {
 			e.recordLeaderContact(msg)
