@@ -4,6 +4,11 @@
             [clojure.test :refer :all]
             [clojure.tools.cli :as tools.cli]
             [jepsen.checker :as checker]
+            [jepsen.control.core :as control-core]
+            [jepsen.control.retry :as control-retry]
+            [jepsen.control.scp :as control-scp]
+            [jepsen.control.sshj :as control-sshj]
+            [jepsen.reconnect :as reconnect]
             [jepsen.client :as client]
             [jepsen.generator :as gen]
             [jepsen.history :as history]
@@ -823,7 +828,7 @@
            (throw (java.io.IOException. "seed interrupted")))
          "")}
       (fn []
-        (is (thrown? java.io.IOException (client/setup! first-client {})))
+        (is (thrown? clojure.lang.ExceptionInfo (client/setup! first-client {})))
         (client/setup! other-client {})
         (client/setup! first-client {})
         (is (= 2 @calls) "a failed seed must be retried; a successful seed must be shared")))))
@@ -854,7 +859,7 @@
                  result (clojure.java.shell/sh "sh" "-c"
                           (str "mountpoint() { return " mount-exit "; }; " command))]
              (when-not (zero? (:exit result))
-               (throw (ex-info (:err result) result)))))}
+               (throw (ex-info (:err result) (assoc result :type :jepsen.control/nonzero-exit))))))}
         (fn []
           (is (thrown-with-msg? clojure.lang.ExceptionInfo #"mount unavailable"
                 (client/setup! (client/open! base {} "n1") {})))
@@ -901,3 +906,191 @@
 (deftest final-mount-retry-does-not-classify-command-text
   (is (not (workload/final-read-observation-retry? false
              (nonzero-exit "guard prints mount unavailable" "Permission denied")))))
+
+(deftest seed-retries-before-measured-writers-start
+  (doseq [message ["sh: 1: printf: printf: I/O error"
+                   "mount unavailable: /mnt/fs"
+                   "seed command interrupted"]]
+    (let [calls (atom 0)
+          base (:client (workload/filesystem-register-workload
+                          {:key-count 2 :max-retries 3 :node->mount-dir {"n1" "/mount"}}))]
+      (with-redefs-fn
+        {#'workload/remote-exec!
+         (fn [& _]
+           (is (false? @(:setup-state base)))
+           (when (= 1 (swap! calls inc))
+             (throw (nonzero-exit "seed" message)))
+           "")}
+        (fn []
+          (client/setup! (client/open! base {} "n1") {})
+          (is (= 2 @calls) message)
+          (is (true? @(:setup-state base))))))))
+
+(deftest persistent-seed-errors-exhaust-the-attempt-limit
+  (let [calls (atom 0)
+        base (:client (workload/filesystem-register-workload
+                        {:key-count 2 :max-retries 3 :node->mount-dir {"n1" "/mount"}}))]
+    (with-redefs-fn
+      {#'workload/remote-exec!
+       (fn [& _]
+         (swap! calls inc)
+         (throw (nonzero-exit "seed" "Permission denied")))}
+      (fn []
+        (is (thrown? clojure.lang.ExceptionInfo (client/setup! (client/open! base {} "n1") {})))
+        (is (= 3 @calls))
+        (is (false? @(:setup-state base)))))))
+
+(deftest seed-cancellation-is-not-retried
+  (doseq [cancel [(InterruptedException. "seed interrupted")
+                  (java.util.concurrent.CancellationException. "seed cancelled")]]
+    (let [calls (atom 0)
+          base (:client (workload/filesystem-register-workload
+                          {:key-count 2 :max-retries 3 :node->mount-dir {"n1" "/mount"}}))]
+      (with-redefs-fn
+        {#'workload/remote-exec! (fn [& _] (swap! calls inc) (throw cancel))}
+        (fn []
+          (is (identical? cancel (try
+                                  (client/setup! (client/open! base {} "n1") {})
+                                  nil
+                                  (catch Exception e e))))
+          (is (= 1 @calls))
+          (is (false? @(:setup-state base))))))))
+
+(deftest seed-with-unknown-remote-outcome-is-not-replayed
+  (doseq [failure [(java.io.IOException. "SSH command interrupted")
+                   (java.io.InterruptedIOException. "SSH read interrupted")
+                   (ex-info "exit status unavailable" {:exit nil})
+                   (ex-info "exit status unavailable" {:exit -1})]]
+    (let [calls (atom 0)
+          base (:client (workload/filesystem-register-workload
+                          {:key-count 2 :max-retries 3 :node->mount-dir {"n1" "/mount"}}))]
+      (with-redefs-fn
+        {#'workload/remote-exec! (fn [& _] (swap! calls inc) (throw failure))}
+        (fn []
+          (let [result (try (client/setup! (client/open! base {} "n1") {})
+                            (catch Exception e e))]
+            (is (= :elastickv.filesystem-workload/seed-outcome-unknown (:type (ex-data result))))
+            (is (identical? failure (ex-cause result))))
+          (is (= 1 @calls) "a remote seed shell may still be running when its exit status is unknown")
+          (is (false? @(:setup-state base))))))))
+
+
+(deftest local-seed-retries-synchronous-io-failure
+  (let [dir (scratch-dir)
+        calls (atom 0)
+        setup workload/local-setup!
+        test-map (workload/elastickv-filesystem-test
+                   {:nodes ["n1"] :mount-dirs [dir] :local true
+                    :require-fuse-mount false :key-count 2 :max-retries 3})]
+    (try
+      (with-redefs [workload/local-setup!
+                    (fn [mount keys]
+                      (when (= 1 (swap! calls inc)) (throw (java.io.IOException. "seed interrupted")))
+                      (setup mount keys))]
+        (client/setup! (client/open! (:client test-map) test-map "n1") test-map))
+      (is (= 2 @calls))
+      (doseq [k (range 2)]
+        (is (= workload/initial-value (workload/local-read (workload/register-path dir k)))))
+      (finally (delete-tree! dir)))))
+
+
+(defn- seed-ssh-fixture [execute]
+  (let [opens (atom 0)
+        ssh (proxy [net.schmizz.sshj.SSHClient] []
+              (startSession []
+                (reify net.schmizz.sshj.connection.channel.direct.Session
+                  (exec [_ command] (execute command))
+                  (close [_] nil))))
+        raw (control-scp/->Remote
+              (control-sshj/->SSHJRemote 6 {:host "n1"} ssh (java.util.concurrent.Semaphore. 6 true))
+              {:host "n1"})
+        pool (reconnect/open! (reconnect/wrapper {:open #(do (swap! opens inc) raw) :close (fn [_])}))]
+    {:session (control-retry/->Remote raw pool) :pool pool :opens opens :ssh ssh}))
+
+(defn- seed-ssh-result [exit err]
+  (reify net.schmizz.sshj.connection.channel.direct.Session$Command
+    (getInputStream [_] (java.io.ByteArrayInputStream. (byte-array 0)))
+    (getErrorStream [_] (java.io.ByteArrayInputStream. (.getBytes ^String err "UTF-8")))
+    (getExitStatus [_] (Integer/valueOf (int exit)))
+    (join [_] nil)
+    (close [_] nil)))
+
+(deftest seed-ssh-response-loss-is-not-automatically-replayed
+  (let [sends (atom 0)
+        {:keys [session pool ssh]} (seed-ssh-fixture
+                                (fn [_]
+                                  (if (= 1 (swap! sends inc))
+                                    (throw (net.schmizz.sshj.connection.ConnectionException. "response lost after send"))
+                                    (seed-ssh-result 0 ""))))
+        test-map {:sessions {"n1" session}}
+        base (:client (workload/filesystem-register-workload
+                        {:key-count 2 :max-retries 1 :node->mount-dir {"n1" "/mount"}}))]
+    (try
+      (let [delegate (client/open! base test-map "n1")
+            result (try
+                     ((requiring-resolve 'elastickv.hosted-fault-workload/setup-client!) delegate test-map)
+                     (catch Exception e e))]
+        (is (= :elastickv.filesystem-workload/seed-outcome-unknown (:type (ex-data result))))
+        (is (= 1 @sends))
+        (is (false? @(:setup-state base))))
+      (finally (reconnect/close! pool) (.close ssh)))))
+
+(deftest seed-ssh-confirmed-exit-can-be-retried-without-reconnecting
+  (let [sends (atom 0)
+        {:keys [session pool opens ssh]} (seed-ssh-fixture
+                                      (fn [_]
+                                        (if (= 1 (swap! sends inc))
+                                          (seed-ssh-result 1 "printf: I/O error")
+                                          (seed-ssh-result 0 ""))))
+        test-map {:sessions {"n1" session}}
+        base (:client (workload/filesystem-register-workload
+                        {:key-count 2 :max-retries 3 :node->mount-dir {"n1" "/mount"}}))]
+    (try
+      (client/setup! (client/open! base test-map "n1") test-map)
+      (is (= 2 @sends))
+      (is (= 1 @opens))
+      (is (true? @(:setup-state base)))
+      (finally (reconnect/close! pool) (.close ssh)))))
+
+
+(deftest seed-rejects-unknown-session-layout-before-sending
+  (doseq [layout [:outer :inner :missing]]
+    (let [sends (atom 0)
+          raw (reify control-core/Remote
+                (execute! [_ _ _] (swap! sends inc) {:exit 0 :out "" :err ""}))
+          pool (when (= :inner layout)
+                 (reconnect/open! (reconnect/wrapper {:open (fn [] raw) :close (fn [_])})))
+          session (case layout :outer raw :inner (control-retry/->Remote raw pool) :missing nil)
+          test-map {:sessions {"n1" session}}
+          base (:client (workload/filesystem-register-workload
+                          {:key-count 2 :max-retries 3 :node->mount-dir {"n1" "/mount"}}))]
+      (try
+        (let [result (try
+                       (client/setup! (client/open! base test-map "n1") test-map)
+                       (catch Exception e e))]
+          (is (= :elastickv.filesystem-workload/seed-outcome-unknown (:type (ex-data result))))
+          (is (= 0 @sends))
+          (is (false? @(:setup-state base))))
+        (finally (when pool (reconnect/close! pool)))))))
+
+(deftest local-seed-rechecks-fuse-before-retrying
+  (let [dir (scratch-dir)
+        mounted (atom true)
+        calls (atom 0)
+        setup workload/local-setup!
+        test-map (workload/elastickv-filesystem-test
+                   {:nodes ["n1"] :mount-dirs [dir] :local true
+                    :require-fuse-mount true :key-count 2 :max-retries 3})]
+    (try
+      (with-redefs [workload/local-fuse-mount? (fn [_] @mounted)
+                    workload/local-setup!
+                    (fn [mount keys]
+                      (when (= 1 (swap! calls inc))
+                        (reset! mounted false)
+                        (throw (java.io.IOException. "seed interrupted")))
+                      (setup mount keys))]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"not a FUSE mount"
+              (client/setup! (client/open! (:client test-map) test-map "n1") test-map))))
+      (is (= 1 @calls))
+      (is (not (.exists (io/file (workload/workload-dir dir)))))
+      (finally (delete-tree! dir)))))

@@ -52,6 +52,11 @@
                     [net :as net]]
             [jepsen.checker.timeline :as timeline]
             [jepsen.control :as control]
+            [jepsen.control.core :as control-core]
+            [jepsen.control.retry]
+            [jepsen.control.scp]
+            [jepsen.control.sshj]
+            [jepsen.reconnect :as reconnect]
             [jepsen.db :as jdb]
             [jepsen.nemesis :as nemesis]
             [jepsen.nemesis.combined :as combined]
@@ -180,6 +185,20 @@
   (or (read-retryable-error? e)
       (str/includes? (error-text e) mount-unavailable-message)
       (and local? (instance? FileNotFoundException e))))
+
+(defn- confirmed-remote-setup-exit?
+  [^Throwable e]
+  (let [{:keys [type exit]} (ex-data e)]
+    (and (= :jepsen.control/nonzero-exit type)
+         (integer? exit) (<= 1 exit 255))))
+
+(defn- setup-retryable-error?
+  "Replay only synchronous local setup or a remotely confirmed command exit."
+  [local? ^Throwable e]
+  (and (not (or (instance? InterruptedException e)
+                (instance? java.util.concurrent.CancellationException e)
+                (instance? java.io.InterruptedIOException e)))
+       (or local? (confirmed-remote-setup-exit? e))))
 
 (defn with-retries
   "Calls (f) up to max-retries times while it throws an error accepted by
@@ -468,6 +487,33 @@
     (control/su
       (control/exec :sh :-c cmd))))
 
+(defn- single-attempt-session
+  "Borrow the pinned SSHJ transport without the control layer's auto-resend."
+  [session]
+  (reify control-core/Remote
+    (execute! [_ context action]
+      (when-not (and (instance? jepsen.control.retry.Remote session) (:conn session))
+        (throw (ex-info "Unsupported seed SSH session" {:type ::unsupported-seed-session})))
+      (reconnect/with-conn [raw (:conn session)]
+        (when-not (and (instance? jepsen.control.scp.Remote raw)
+                       (instance? jepsen.control.sshj.SSHJRemote (:cmd-remote raw)))
+          (throw (ex-info "Unsupported seed SSH transport" {:type ::unsupported-seed-session})))
+        (control-core/execute! raw context action)))))
+
+(defn- remote-setup-batch!
+  [test node command]
+  (try
+    (remote-exec! (update-in test [:sessions node] single-attempt-session) node command)
+    (catch Exception e
+      (if (or (confirmed-remote-setup-exit? e)
+              (instance? InterruptedException e)
+              (instance? java.util.concurrent.CancellationException e))
+        (throw e)
+        ;; The old shell could still be seeding. Prevent the hosted startup
+        ;; wrapper from replaying IOException or service-unavailable outcomes.
+        (throw (ex-info "Remote seed exit is unconfirmed; refusing replay"
+                        {:type ::seed-outcome-unknown} e))))))
+
 ;; ---------------------------------------------------------------------------
 ;; Jepsen client
 ;; ---------------------------------------------------------------------------
@@ -563,19 +609,20 @@
 
   (setup! [this test]
     (let [keys (range key-count)]
-      (when (and local? require-fuse-mount)
-        (require-local-fuse-mount! mount-dir))
       ;; Worker copies on remote nodes see the same replicated files. Seed
       ;; once before the measured workload, and publish completion only after
       ;; every batch succeeds. Local scratch mounts still initialize separately.
       (locking setup-state
         (when (or local? (not @setup-state))
-          (with-retries max-retries
+          ;; Repeating the fixed initial value is safe only during setup.
+          ;; Do not apply this policy to possibly applied workload writes.
+          (with-retries max-retries #(setup-retryable-error? local? %)
             #(if local?
-               (local-setup! mount-dir keys)
+               (do (when require-fuse-mount (require-local-fuse-mount! mount-dir))
+                   (local-setup! mount-dir keys))
                (doseq [batch (partition-all 128 keys)]
                  ;; Bound each SSH shell argument without dropping seed keys.
-                 (remote-exec! test node (remote-setup-cmd mount-dir batch)))))
+                 (remote-setup-batch! test node (remote-setup-cmd mount-dir batch)))))
           (when-not local? (reset! setup-state true))))))
 
   (teardown! [_this test]
