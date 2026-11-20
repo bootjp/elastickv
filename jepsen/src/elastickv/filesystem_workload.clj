@@ -117,6 +117,11 @@
   "Final reads run after writers stop and must outlast transient FUSE conflicts."
   128)
 
+(def ^:const final-read-observation-timeout-ms
+  "Stop starting read-only availability retries after thirty seconds. A single
+   SSH call may overrun this deadline; its actual duration remains in history."
+  30000)
+
 (def ^:const retry-backoff-ms 20)
 
 (def retryable-messages
@@ -180,7 +185,7 @@
   "Repeat a quiescent read after mount availability or local open failures.
    RandomAccessFile maps distinct FUSE errnos to FileNotFoundException; neither
    case proves data loss. Persistent failures remain unobserved after the
-   existing bounded final-read window."
+   bounded final-read observation window."
   [local? ^Throwable e]
   (or (read-retryable-error? e)
       (str/includes? (error-text e) mount-unavailable-message)
@@ -568,34 +573,87 @@
           (fail op (io-error-label e))
           (indeterminate op (io-error-label e)))))))
 
+(defn- final-read-now-ns [] (System/nanoTime))
+
+(defn- final-read-backoff! [millis] (Thread/sleep (long millis)))
+
+(defn- final-read-cancelled? [e]
+  (or (instance? InterruptedException e)
+      (instance? java.util.concurrent.CancellationException e)
+      (instance? java.io.InterruptedIOException e)))
+
+(defn- observe-final-read
+  "Keep one invocation and one deadline across error changes. Only mount or
+   workload-directory availability may exceed the ordinary attempt limit."
+  [max-retries local? read!]
+  (let [started (final-read-now-ns)
+        elapsed #(long (/ (- (final-read-now-ns) started) 1000000))
+        limit (max max-retries final-read-min-retries)
+        finish (fn [result attempt last-error reason]
+                 (let [millis (elapsed)]
+                   (assoc result :observation
+                     (cond-> {:attempts attempt :elapsed-ms millis
+                              :original-attempt-limit limit :extended? (> attempt limit)
+                              :deadline-exceeded? (>= millis final-read-observation-timeout-ms)
+                              :stop-reason reason}
+                       last-error (assoc :last-error (io-error-label last-error))))))]
+    (loop [attempt 1, previous-error nil]
+      (let [result (try {:value (read!)} (catch Exception e {:error e}))
+            e (:error result)
+            millis (elapsed)
+            reason (cond
+                     (nil? e) :success
+                     (final-read-cancelled? e) :cancelled
+                     (>= millis final-read-observation-timeout-ms) :deadline
+                     (not (final-read-observation-retry? local? e)) :not-retryable
+                     (and (>= attempt limit)
+                          (not (str/includes? (error-text e) mount-unavailable-message))) :attempt-limit
+                     :else :retry)]
+        (if (not= :retry reason)
+          (finish result attempt (or e previous-error) reason)
+          (let [pause-error (try
+                              (final-read-backoff! (min retry-backoff-ms
+                                                       (- final-read-observation-timeout-ms millis)))
+                              nil
+                              (catch Exception interrupted interrupted))]
+            (cond
+              pause-error (finish (assoc result :error pause-error) attempt e :cancelled)
+              (>= (elapsed) final-read-observation-timeout-ms) (finish result attempt e :deadline)
+              :else (recur (inc attempt) e))))))))
+
+(defn- read-failure
+  ([op k e] (read-failure op k e nil))
+  ([op k e observation]
+   (let [incomplete? (or (:extended? observation)
+                         (and (:deadline-exceeded? observation)
+                              (< (:attempts observation) (:original-attempt-limit observation))))]
+     (if-let [kind (and (:final op) (not incomplete?) (not (final-read-cancelled? e)) (data-loss-kind e))]
+       (assoc op :type :ok :value (independent/tuple k kind) :error (io-error-label e))
+       (fail op (io-error-label e))))))
+
 (defn invoke-read!
-  "Executes a read, retrying retryable and data-loss-shaped errors. Reads
-   never mutate state, so an exhausted error is a :fail, with one exception:
-   a final-phase read (:final, issued after every writer stopped) whose error
-   says the register is gone completes :ok with its data-loss sentinel so the
-   checker sees the loss. A main-phase read keeps :fail even then, because a
-   bounded retry window cannot distinguish a lost register from the
-   LOOKUP/OPEN race against a concurrent rename."
+  "Observe a register without replaying writes. Final availability retries
+   share one thirty-second deadline; data-loss-shaped errors retain the ordinary
+   128-attempt limit. Persistent failures remain unobserved, and extended or
+   late observations retain their availability evidence in history."
   [{:keys [local? mount-dir max-retries require-fuse-mount]} test node op k]
   (try
-    (let [attempts (if (:final op)
-                     (max max-retries final-read-min-retries)
-                     max-retries)
-          v (with-retries attempts (if (:final op)
-                                     #(final-read-observation-retry? local? %)
-                                     read-retryable-error?)
-              (fn []
-                (if local?
-                  (do (require-local-mount! mount-dir require-fuse-mount)
-                      (local-read (register-path mount-dir k)))
-                  (decode-value (.getBytes ^String (remote-exec! test node
-                                                                   (remote-read-cmd mount-dir (register-path mount-dir k)))
-                                           StandardCharsets/US_ASCII)))))]
-      (assoc op :type :ok :value (independent/tuple k v)))
-    (catch Exception e
-      (if-let [kind (and (:final op) (data-loss-kind e))]
-        (assoc op :type :ok :value (independent/tuple k kind) :error (io-error-label e))
-        (fail op (io-error-label e))))))
+    (let [read! (fn []
+                  (if local?
+                    (do (require-local-mount! mount-dir require-fuse-mount)
+                        (local-read (register-path mount-dir k)))
+                    (decode-value (.getBytes ^String (remote-exec! test node
+                                                       (remote-read-cmd mount-dir (register-path mount-dir k)))
+                                             StandardCharsets/US_ASCII))))
+          result (if (:final op)
+                   (observe-final-read max-retries local? read!)
+                   {:value (with-retries max-retries read-retryable-error? read!)})
+          completed (if-let [e (:error result)]
+                      (read-failure op k e (:observation result))
+                      (assoc op :type :ok :value (independent/tuple k (:value result))))]
+      (cond-> completed
+        (:final op) (assoc :final-observation (assoc (:observation result) :key k :node node))))
+    (catch Exception e (read-failure op k e))))
 
 (defrecord FilesystemClient [node->mount-dir write-mode key-count max-retries require-fuse-mount setup-state node mount-dir local?]
   client/Client
@@ -695,12 +753,27 @@
                             (filter #(and (:final %) (not= :invoke (:type %))))
                             (map #(into {} %)))
             lost       (filter #(and (= :ok (:type %)) (contains? data-loss-kinds (:value %))) finals)
-            unobserved (remove #(= :ok (:type %)) finals)]
-        (cond
-          (seq lost)       {:valid? false :lost (vec lost)}
-          (seq unobserved) {:valid? :unknown :unobserved (vec unobserved)}
-          (empty? finals)  {:valid? :unknown :error "no final read in history"}
-          :else            {:valid? true})))))
+            unobserved (remove #(= :ok (:type %)) finals)
+            extended (filter #(or (get-in % [:final-observation :extended?])
+                                  (get-in % [:final-observation :deadline-exceeded?])) finals)
+            verdict (cond
+                      (seq lost)       {:valid? false :lost (vec lost)}
+                      (seq unobserved) {:valid? :unknown :unobserved (vec unobserved)}
+                      (empty? finals)  {:valid? :unknown :error "no final read in history"}
+                      :else            {:valid? true})]
+        (assoc verdict :availability
+          {:within-original-attempt-limit? (cond
+                                                   (or (empty? finals) (seq unobserved)
+                                                       (some #(get-in % [:final-observation :extended?]) finals)) false
+                                                   (not-every? :final-observation finals) :unknown
+                                                   :else (not-any? #(get-in % [:final-observation :extended?]) finals))
+           :within-observation-deadline? (cond
+                                                (or (empty? finals) (seq unobserved)
+                                                    (some #(get-in % [:final-observation :deadline-exceeded?]) finals)) false
+                                                (not-every? :final-observation finals) :unknown
+                                                :else (not-any? #(get-in % [:final-observation :deadline-exceeded?]) finals))
+           :observation-metadata-complete? (boolean (and (seq finals) (every? :final-observation finals)))
+           :extended-observations (mapv #(select-keys % [:process :node :f :value :index :final-observation]) extended)})))))
 
 (defn filesystem-register-checker
   "Per-key register checker. Use linear alone: racing WGL exhausts the heap

@@ -188,6 +188,23 @@ Its Knossos checker uses the linear analyzer alone: racing WGL exhausted the
 heap on captured indeterminate-write histories. All client outcomes and final
 reads remain in the checker input; unknown verdicts fail the run.
 
+A final read may re-observe mount or workload-directory availability until one
+30-second monotonic deadline from its invocation. Missing, truncated, or corrupt
+records retain the ordinary 128-attempt limit, and changing error types resets
+neither limit. If the deadline ends before enough attempts can confirm a missing
+or malformed record, the read remains unobserved rather than certifying data loss.
+A data-loss-shaped error first seen after availability retries exceeded the
+original limit also ends unobserved, without resetting the retry budget.
+Main-phase reads and writes retain their existing policy. A single
+SSH call can overrun the observation deadline; no further attempt is then started.
+Every final completion records its attempts, actual elapsed time, key, node, last
+error, and limit overruns in `:final-observation`. The per-key final-read result
+retains independent `:availability` diagnostics and all extended observations.
+A successful consistency verdict does not establish that the original attempt
+limit or the observation deadline was met; older uninstrumented histories report
+those bounds as unknown unless an overrun is already proven by another observation.
+Persistent unobserved final reads still fail the run.
+
 Filesystem fault jobs use actual node-local FUSE mounts and SSH file operations,
 including overwrite and rename modes. Every mount uses the mandatory strict
 journal by default, so supported mutations have durable operation identities. An indeterminate

@@ -890,13 +890,21 @@
             (is (= workload/initial-value (workload/local-read (workload/register-path good k)))))))
       (finally (delete-tree! root)))))
 
+(defn- with-final-read-clock [f]
+  (let [now (atom 0)]
+    (with-redefs-fn
+      {#'workload/final-read-now-ns #(long @now)
+       #'workload/final-read-backoff! #(swap! now + (* 1000000 %))}
+      f)))
+
 (deftest remote-final-read-reobserves-bounded-mount-availability
   (let [calls (atom 0)
         unavailable (nonzero-exit "read command" "mount unavailable: /mnt/fs")
         read (fn [final?]
-               (workload/invoke-read! {:local? false :mount-dir "/mnt/fs" :max-retries 3}
-                 {} "n1" (cond-> {:type :invoke :f :read :value (independent/tuple 0 nil)}
-                            final? (assoc :final true)) 0))]
+               (with-final-read-clock
+                 #(workload/invoke-read! {:local? false :mount-dir "/mnt/fs" :max-retries 3}
+                    {} "n1" (cond-> {:type :invoke :f :read :value (independent/tuple 0 nil)}
+                               final? (assoc :final true)) 0)))]
     (with-redefs-fn
       {#'workload/remote-exec!
        (fn [& _]
@@ -914,13 +922,173 @@
       (fn []
         (let [result (read true)]
           (is (= :fail (:type result)))
-          (is (= workload/final-read-min-retries @calls))
+          (is (= 1500 @calls))
+          (is (= 30000 (get-in result [:final-observation :elapsed-ms])))
+          (is (true? (get-in result [:final-observation :extended?])))
+          (is (true? (get-in result [:final-observation :deadline-exceeded?])))
           (is (= :unknown (:valid? (checker/check (workload/final-reads-checker)
                                     {} (history/history [result]) {})))))
         (reset! calls 0)
         (is (= :fail (:type (read false))))
         (is (= 1 @calls) "main-phase classification is unchanged")))))
 
+
+(deftest final-read-outlasts-leader-recovery-beyond-one-attempt-window
+  (let [calls (atom 0)
+        unavailable (nonzero-exit "read command" "mount unavailable: /mnt/fs")]
+    (with-redefs-fn
+      {#'workload/remote-exec!
+       (fn [& _]
+         (if (<= (swap! calls inc) workload/final-read-min-retries)
+           (throw unavailable)
+           (String. ^bytes (workload/encode-value 15) "US-ASCII")))}
+      (fn []
+        (let [result (workload/invoke-read!
+                       {:local? false :mount-dir "/mnt/fs" :max-retries 3}
+                       {} "n1" {:type :invoke :f :read :value (independent/tuple 0 nil) :final true} 0)]
+          (is (= :ok (:type result)))
+          (is (= (independent/tuple 0 15) (:value result)))
+          (is (= (inc workload/final-read-min-retries) @calls)))))))
+
+(deftest extended-final-observation-retains-availability-evidence
+  (with-final-read-clock
+    (fn []
+      (let [calls (atom 0)]
+        (with-redefs-fn
+          {#'workload/remote-exec!
+           (fn [& _]
+             (if (<= (swap! calls inc) 128)
+               (throw (nonzero-exit "read" "mount unavailable: /mnt/fs"))
+               (String. ^bytes (workload/encode-value 15) "US-ASCII")))}
+          (fn []
+            (let [op {:process 0 :node "n1" :type :invoke :f :read :value (independent/tuple 2 nil) :final true}
+                  result (workload/invoke-read! {:local? false :mount-dir "/mnt/fs" :max-retries 3} {} "n1" op 2)
+                  verdict (check-final-reads [(update result :value second)])]
+              (is (= :ok (:type result)))
+              (is (= [2 15] (:value result)))
+              (is (= 129 (get-in result [:final-observation :attempts])))
+              (is (str/includes? (get-in result [:final-observation :last-error]) "mount unavailable"))
+              (is (true? (:valid? verdict)))
+              (is (false? (get-in verdict [:availability :within-original-attempt-limit?])))
+              (is (= [(select-keys (update result :value second) [:process :node :f :value :final-observation])]
+                     (mapv #(dissoc % :index) (get-in verdict [:availability :extended-observations])))))))))))
+
+(deftest final-observation-does-not-reset-budget-when-error-changes
+  (doseq [data-error [(nonzero-exit "read" "No such file or directory")
+                     (java.io.EOFException. "short record")
+                     (NumberFormatException. "invalid record")]]
+    (with-final-read-clock
+      (fn []
+        (let [calls (atom 0)]
+          (with-redefs-fn
+            {#'workload/remote-exec!
+             (fn [& _]
+               (if (<= (swap! calls inc) 128)
+                 (throw (nonzero-exit "read" "mount unavailable: /mnt/fs"))
+                 (throw data-error)))}
+            (fn []
+              (let [result (workload/invoke-read! {:local? false :mount-dir "/mnt/fs" :max-retries 3}
+                             {} "n1" {:type :invoke :f :read :value (independent/tuple 0 nil) :final true} 0)]
+                (is (= 129 @calls))
+                (is (= :fail (:type result)))
+                (is (= [0 nil] (:value result)))
+                (is (true? (get-in result [:final-observation :extended?])))
+                (is (= :unknown (:valid? (check-final-reads [(update result :value second)]))))))))))))
+
+(deftest final-observation-does-not-start-a-retry-at-deadline
+  (let [now (atom 0), calls (atom 0)]
+    (with-redefs-fn
+      {#'workload/final-read-now-ns #(long @now)
+       #'workload/final-read-backoff! #(swap! now + (* 1000000 %))
+       #'workload/remote-exec! (fn [& _]
+                                (swap! calls inc)
+                                (reset! now 29990000000)
+                                (throw (nonzero-exit "read" "mount unavailable: /mnt/fs")))}
+      (fn []
+        (let [result (workload/invoke-read! {:local? false :mount-dir "/mnt/fs" :max-retries 3}
+                       {} "n1" {:type :invoke :f :read :value (independent/tuple 0 nil) :final true} 0)]
+          (is (= 1 @calls))
+          (is (= :fail (:type result)))
+          (is (= 30000 (get-in result [:final-observation :elapsed-ms])))
+          (is (true? (get-in result [:final-observation :deadline-exceeded?])))
+          (is (= :unknown (:valid? (check-final-reads [(update result :value second)])))))))))
+
+(deftest final-observation-records-a-single-ssh-call-overrunning-deadline
+  (let [now (atom 0)]
+    (with-redefs-fn
+      {#'workload/final-read-now-ns #(long @now)
+       #'workload/remote-exec! (fn [& _] (reset! now 31000000000)
+                                (String. ^bytes (workload/encode-value 15) "US-ASCII"))}
+      (fn []
+        (let [result (workload/invoke-read! {:local? false :mount-dir "/mnt/fs" :max-retries 3}
+                       {} "n1" {:type :invoke :f :read :value (independent/tuple 0 nil) :final true} 0)
+              verdict (check-final-reads [(update result :value second)])]
+          (is (= :ok (:type result)))
+          (is (= 1 (get-in result [:final-observation :attempts])))
+          (is (= 31000 (get-in result [:final-observation :elapsed-ms])))
+          (is (true? (:valid? verdict)))
+          (is (false? (get-in verdict [:availability :within-observation-deadline?]))))))))
+
+(deftest final-observation-does-not-retry-cancellation
+  (doseq [failure [(InterruptedException. "mount unavailable")
+                   (java.util.concurrent.CancellationException. "mount unavailable")
+                   (java.io.InterruptedIOException. "mount unavailable")]]
+    (with-final-read-clock
+      (fn []
+        (let [calls (atom 0)]
+          (with-redefs-fn
+            {#'workload/remote-exec! (fn [& _] (swap! calls inc) (throw failure))}
+            (fn []
+              (let [result (workload/invoke-read! {:local? false :mount-dir "/mnt/fs" :max-retries 3}
+                             {} "n1" {:type :invoke :f :read :value (independent/tuple 0 nil) :final true} 0)]
+                (is (= :fail (:type result)))
+                (is (= 1 @calls))
+                (is (= 1 (get-in result [:final-observation :attempts])))))))))))
+
+(deftest final-observation-deadline-does-not-certify-early-data-loss
+  (let [now (atom 0)]
+    (with-redefs-fn
+      {#'workload/final-read-now-ns #(long @now)
+       #'workload/remote-exec! (fn [& _] (reset! now 30005000000)
+                                (throw (nonzero-exit "read" "No such file or directory")))}
+      (fn []
+        (let [result (workload/invoke-read! {:local? false :mount-dir "/mnt/fs" :max-retries 3}
+                       {} "n1" {:type :invoke :f :read :value (independent/tuple 0 nil) :final true} 0)]
+          (is (= :fail (:type result)))
+          (is (= 1 (get-in result [:final-observation :attempts])))
+          (is (= :deadline (get-in result [:final-observation :stop-reason])))
+          (is (= :unknown (:valid? (check-final-reads [(update result :value second)])))))))))
+
+(deftest final-observation-retains-evidence-when-backoff-is-interrupted
+  (let [now (atom 0), calls (atom 0)]
+    (with-redefs-fn
+      {#'workload/final-read-now-ns #(long @now)
+       #'workload/final-read-backoff! (fn [_] (reset! now 7000000) (throw (InterruptedException. "cancelled")))
+       #'workload/remote-exec! (fn [& _] (swap! calls inc)
+                                (throw (nonzero-exit "read" "mount unavailable: /mnt/fs")))}
+      (fn []
+        (let [result (workload/invoke-read! {:local? false :mount-dir "/mnt/fs" :max-retries 3}
+                       {} "n1" {:type :invoke :f :read :value (independent/tuple 0 nil) :final true} 0)]
+          (is (= :fail (:type result)))
+          (is (= 1 @calls))
+          (is (= 7 (get-in result [:final-observation :elapsed-ms])))
+          (is (= :cancelled (get-in result [:final-observation :stop-reason])))
+          (is (str/includes? (get-in result [:final-observation :last-error]) "mount unavailable")))))))
+
+(deftest known-observation-overruns-outweigh-missing-legacy-metadata
+  (let [old {:process 0 :type :ok :f :read :value 1 :final true}
+        extended (assoc old :process 1 :final-observation
+                        {:attempts 129 :extended? true :deadline-exceeded? false})
+        late (assoc old :process 2 :final-observation
+                    {:attempts 1 :extended? false :deadline-exceeded? true})]
+    (is (false? (get-in (check-final-reads [old extended]) [:availability :within-original-attempt-limit?])))
+    (is (false? (get-in (check-final-reads [old late]) [:availability :within-observation-deadline?])))))
+
+(deftest legacy-final-history-does-not-claim-new-observation-bounds
+  (let [verdict (check-final-reads [{:process 0 :type :ok :f :read :value 1 :final true}])]
+    (is (true? (:valid? verdict)))
+    (is (= :unknown (get-in verdict [:availability :within-original-attempt-limit?])))
+    (is (= :unknown (get-in verdict [:availability :within-observation-deadline?])))))
 
 (deftest final-mount-retry-does-not-classify-command-text
   (is (not (workload/final-read-observation-retry? false
