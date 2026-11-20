@@ -294,6 +294,9 @@ func forwardStatusForReceiver(req *pb.ForwardRequest, err error, commitAttempt b
 	if req.GetDecisionDetailVersion() != kv.ForwardDecisionSchemaVersion {
 		return &forwardWireFailure{wire: status.Error(codes.Unknown, "forward outcome unknown"), cause: err}
 	}
+	if forwardRawNotSubmitted(req.GetRequests(), err, commitAttempt) {
+		return &forwardWireFailure{wire: kv.ForwardDecisionStatus(pb.ForwardFailurePhase_FORWARD_FAILURE_PHASE_ONE_PHASE_APPLY, pb.ForwardFailureReason_FORWARD_FAILURE_REASON_FENCE, pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_REJECTED_BEFORE_SUBMISSION), cause: err}
+	}
 	if commitAttempt {
 		return forwardCommitStatus(req.GetRequests(), err)
 	}
@@ -302,26 +305,33 @@ func forwardStatusForReceiver(req *pb.ForwardRequest, err error, commitAttempt b
 
 func forwardCommitStatus(reqs []*pb.Request, err error) error {
 	phase, ok := kv.ForwardFailurePhaseForRequests(reqs)
-	var rejected *kv.AppliedRequestRejection
-	// Only an indexed, terminal one-phase apply verdict proves this attempt
-	// had no effect. The receiver must separately rule out earlier attempts.
-	conflict := errors.Is(err, store.ErrWriteConflict)
-	fence := errors.Is(err, kv.ErrRouteWriteFenced)
-	if ok && phase == pb.ForwardFailurePhase_FORWARD_FAILURE_PHASE_ONE_PHASE_APPLY &&
-		kv.ForwardOnePhaseDecisionEligible(reqs) &&
-		!errors.Is(err, kv.ErrTransactionOutcomeUnknown) && errors.As(err, &rejected) &&
-		rejected.CommitIndex() != 0 && conflict != fence {
-		reason := pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CONFLICT
-		if fence {
-			reason = pb.ForwardFailureReason_FORWARD_FAILURE_REASON_FENCE
-		}
-		return &forwardWireFailure{
-			wire: kv.ForwardDecisionStatus(phase, reason,
-				pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_DEFINITIVELY_ABORTED),
-			cause: err,
+	if ok {
+		if reason, definitive := indexedForwardRejection(reqs, phase, err); definitive {
+			return &forwardWireFailure{wire: kv.ForwardDecisionStatus(phase, reason, pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_DEFINITIVELY_ABORTED), cause: err}
 		}
 	}
 	return forwardUnknownStatus(reqs, err)
+}
+
+// Only a terminal, indexed result for this eligible invocation can establish
+// noncommit. Joined errors and missing receipts remain indeterminate.
+func indexedForwardRejection(reqs []*pb.Request, phase pb.ForwardFailurePhase, err error) (pb.ForwardFailureReason, bool) {
+	if phase != pb.ForwardFailurePhase_FORWARD_FAILURE_PHASE_ONE_PHASE_APPLY || !kv.ForwardOnePhaseDecisionEligible(reqs) || !kv.IsCertifiedOnePhaseConflict(err) {
+		return 0, false
+	}
+	var rejected *kv.AppliedRequestRejection
+	if !errors.As(err, &rejected) || rejected.CommitIndex() == 0 {
+		return 0, false
+	}
+	conflict := errors.Is(err, store.ErrWriteConflict)
+	fence := errors.Is(err, kv.ErrRouteWriteFenced) || errors.Is(err, kv.ErrRouteCutoverPending)
+	if conflict == fence {
+		return 0, false
+	}
+	if conflict {
+		return pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CONFLICT, true
+	}
+	return pb.ForwardFailureReason_FORWARD_FAILURE_REASON_FENCE, true
 }
 
 func forwardUnknownStatus(reqs []*pb.Request, err error) error {
@@ -2020,4 +2030,14 @@ func (i *Internal) forwardedTxnCommitTS(ctx context.Context, startTS uint64) (ui
 		return 0, errors.WithStack(ErrTxnTimestampOverflow)
 	}
 	return commitTS, nil
+}
+
+func forwardRawNotSubmitted(reqs []*pb.Request, err error, commitAttempt bool) bool {
+	if len(reqs) != 1 || reqs[0] == nil || reqs[0].IsTxn || reqs[0].Phase != pb.Phase_NONE {
+		return false
+	}
+	if commitAttempt {
+		return kv.IsDataRequestNotSubmitted(err)
+	}
+	return kv.IsMigrationAdmissionRejection(err)
 }

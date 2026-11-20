@@ -851,7 +851,7 @@ func (f *kvFSM) applyRequestData(ctx context.Context, r *pb.Request) (uint64, er
 	var err error
 	ctx, err = f.withMigrationOwnershipEvidence(ctx, r)
 	if err != nil {
-		return 0, err
+		return 0, markMigrationApplyRejection(r, err)
 	}
 	if err := f.verifyPrepareCreationGate(r); err != nil {
 		return 0, err
@@ -883,7 +883,7 @@ func (f *kvFSM) handleRequest(ctx context.Context, r *pb.Request, commitTS uint6
 
 func (f *kvFSM) handleRawRequest(ctx context.Context, r *pb.Request, commitTS uint64) error {
 	if err := f.verifyWriteFence(ctx, r); err != nil {
-		return err
+		return markMigrationApplyRejection(r, err)
 	}
 	floorSnap, err := f.routeFloorSnapshotForRequest(ctx, r)
 	if err != nil {

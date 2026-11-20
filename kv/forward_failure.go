@@ -35,6 +35,9 @@ func (r *ForwardApplyRejection) Unwrap() error { return r.cause }
 // IsCertifiedOnePhaseConflict distinguishes a proven apply rejection from a
 // raw conflict that could have followed a committed write.
 func IsCertifiedOnePhaseConflict(err error) bool {
+	if !isolatedMutationFailure(err) {
+		return false
+	}
 	var applied *AppliedRequestRejection
 	var forwarded *ForwardApplyRejection
 	return (errors.As(err, &applied) && applied.CommitIndex() != 0) || errors.As(err, &forwarded)

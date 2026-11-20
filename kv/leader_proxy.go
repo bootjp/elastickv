@@ -301,8 +301,9 @@ func (p *LeaderProxy) forward(callerCtx context.Context, parentCtx context.Conte
 	if err != nil {
 		// Preserve the breaker accounting, but caller cancellation is not
 		// evidence that the remote mutation did not commit.
-		_ = p.recordForwardFailure(callerCtx, identity, requestID, err)
-		return nil, classifyForwardRPCError(err, reqs)
+		classified := classifyForwardRPCError(err, reqs)
+		_ = p.recordForwardFailure(callerCtx, identity, requestID, forwardBreakerEvidence(err, classified))
+		return nil, classified
 	}
 	p.forwardBreaker.record(identity, requestID, nil, time.Now())
 	if !resp.Success {
@@ -315,6 +316,9 @@ func classifyForwardRPCError(err error, reqs []*pb.Request) error {
 	if phase, ok := ForwardFailurePhaseForRequests(reqs); ok {
 		reason, decision, valid := DecodeForwardDecisionStatus(err, phase)
 		if valid {
+			if rawPreSubmissionDecision(reqs, reason, decision) {
+				return &dataRequestNotSubmitted{cause: ErrRouteWriteFenced}
+			}
 			return classifyValidatedForwardFailure(phase, reason, decision, ForwardOnePhaseDecisionEligible(reqs))
 		}
 	}
@@ -409,4 +413,18 @@ func (p *LeaderProxy) Close() error {
 		return nil
 	}
 	return p.connCache.Close()
+}
+
+func rawPreSubmissionDecision(reqs []*pb.Request, reason pb.ForwardFailureReason, decision pb.ForwardDecisionClass) bool {
+	return len(reqs) == 1 && reqs[0] != nil && !reqs[0].IsTxn && reqs[0].Phase == pb.Phase_NONE &&
+		reason == pb.ForwardFailureReason_FORWARD_FAILURE_REASON_FENCE && decision == pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_REJECTED_BEFORE_SUBMISSION
+}
+
+// An authenticated, phase-bound pre-submission fence reply is a healthy peer
+// response. Do not open the leader-wide breaker for an unavailable key range.
+func forwardBreakerEvidence(wire, classified error) error {
+	if IsDataRequestNotSubmitted(classified) {
+		return nil
+	}
+	return wire
 }
