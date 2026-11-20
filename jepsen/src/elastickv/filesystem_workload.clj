@@ -172,11 +172,13 @@
       (some? (data-loss-kind e))))
 
 (defn final-read-observation-retry?
-  "Repeat a quiescent read after a local open failure. RandomAccessFile maps
-   several distinct FUSE errnos to FileNotFoundException, so this does not
-   classify the error as transient. A persistent failure stays unobserved."
+  "Repeat a quiescent read after mount availability or local open failures.
+   RandomAccessFile maps distinct FUSE errnos to FileNotFoundException; neither
+   case proves data loss. Persistent failures remain unobserved after the
+   existing bounded final-read window."
   [local? ^Throwable e]
   (or (read-retryable-error? e)
+      (str/includes? (error-text e) mount-unavailable-message)
       (and local? (instance? FileNotFoundException e))))
 
 (defn with-retries

@@ -865,3 +865,39 @@
           (doseq [k (range 2)]
             (is (= workload/initial-value (workload/local-read (workload/register-path good k)))))))
       (finally (delete-tree! root)))))
+
+(deftest remote-final-read-reobserves-bounded-mount-availability
+  (let [calls (atom 0)
+        unavailable (nonzero-exit "read command" "mount unavailable: /mnt/fs")
+        read (fn [final?]
+               (workload/invoke-read! {:local? false :mount-dir "/mnt/fs" :max-retries 3}
+                 {} "n1" (cond-> {:type :invoke :f :read :value (independent/tuple 0 nil)}
+                            final? (assoc :final true)) 0))]
+    (with-redefs-fn
+      {#'workload/remote-exec!
+       (fn [& _]
+         (if (= 1 (swap! calls inc))
+           (throw unavailable)
+           (String. ^bytes (workload/encode-value 15) "US-ASCII")))}
+      (fn []
+        (let [result (read true)]
+          (is (= :ok (:type result)))
+          (is (= (independent/tuple 0 15) (:value result)))
+          (is (= 2 @calls)))))
+    (reset! calls 0)
+    (with-redefs-fn
+      {#'workload/remote-exec! (fn [& _] (swap! calls inc) (throw unavailable))}
+      (fn []
+        (let [result (read true)]
+          (is (= :fail (:type result)))
+          (is (= workload/final-read-min-retries @calls))
+          (is (= :unknown (:valid? (checker/check (workload/final-reads-checker)
+                                    {} (history/history [result]) {})))))
+        (reset! calls 0)
+        (is (= :fail (:type (read false))))
+        (is (= 1 @calls) "main-phase classification is unchanged")))))
+
+
+(deftest final-mount-retry-does-not-classify-command-text
+  (is (not (workload/final-read-observation-retry? false
+             (nonzero-exit "guard prints mount unavailable" "Permission denied")))))
