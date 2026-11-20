@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -288,19 +289,33 @@ func readRampOutput(t *testing.T, reader io.Reader, result *rampProcess, profile
 // precondition; never replay an ambiguous control-plane mutation.
 func requestRampSplit(t *testing.T, splitter serverwiring.DistributionSplitter, catalog *distribution.CatalogStore, request autosplit.SplitRequest) autosplit.SplitResult {
 	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
 	for {
-		snapshot, err := catalog.Snapshot(t.Context())
+		require.NoError(t, ctx.Err())
+		snapshot, err := catalog.Snapshot(ctx)
 		require.NoError(t, err)
 		request.ExpectedCatalogVersion = snapshot.Version
-		result, err := splitter.SplitRange(t.Context(), request)
+		require.NoError(t, ctx.Err())
+		result, err := splitter.SplitRange(ctx, request)
 		if err == nil {
 			return result
 		}
-		require.Equal(t, codes.Aborted, status.Code(err), "Split outcome is not a definitive OCC rejection: %v", err)
-		require.Contains(t, err.Error(), "catalog version conflict")
-		require.True(t, time.Now().Before(deadline), "Split OCC retries exhausted: %v", err)
+		require.True(t, rampCatalogConflict(err), "Split outcome is not a definitive OCC rejection: %v", err)
 		t.Logf("LOAD split_occ_retry version=%d", snapshot.Version)
-		time.Sleep(10 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			require.NoError(t, ctx.Err())
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
+}
+
+func rampCatalogConflict(err error) bool {
+	var rpc interface{ GRPCStatus() *status.Status }
+	if !errors.As(err, &rpc) {
+		return false
+	}
+	detail := rpc.GRPCStatus()
+	return detail != nil && detail.Code() == codes.Aborted && detail.Message() == "catalog version conflict"
 }

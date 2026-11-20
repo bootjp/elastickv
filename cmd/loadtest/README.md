@@ -64,6 +64,20 @@ groups with TLS and Forward authentication, on one Linux process/disk. The load
 command is a separate process. This measures load scaling on that placement;
 it does not establish multi-host throughput scaling or failure isolation.
 `ELASTICKV_LOAD_SPLIT` selects `none`, `same`, or `cross`.
+The wrapper builds the child binary and sets `ELASTICKV_LOAD_BINARY` for you.
+Other fixture controls (the standalone CLI has the full set of flags above):
+
+| Environment variable | Default | Meaning |
+| --- | --- | --- |
+| `ELASTICKV_LOAD_RATES` | `100,500,1000,2000` | Offered logical operations/s in successive stages |
+| `ELASTICKV_LOAD_STAGE_DURATION` | `90s` | Request-offering time per stage |
+| `ELASTICKV_LOAD_CONCURRENCY` | `32` | Maximum active logical operations |
+| `ELASTICKV_LOAD_READ_PERCENT` | `50` | Planned reads; the fixture requires positive write ACKs |
+| `ELASTICKV_LOAD_MAX_REQUESTS` | `1000000` | Planned-request and sample tracking limit |
+| `ELASTICKV_LOAD_SPLIT` | `cross` | `none`, `same` or `cross` |
+
+The fixture fixes seed keys at 256, value size at 1 KiB and per-RPC timeout at 2 s.
+Use the standalone CLI for other key/value sizes and read-only runs.
 The requested `ELASTICKV_LOAD_SPLIT_STAGE` starts the Split at that stage's event
 (default: stage 1 for a ramp, stage 0 for a single fixed rate). A cross-group case
 first performs the same-group Split, then moves the right child's upper range.
