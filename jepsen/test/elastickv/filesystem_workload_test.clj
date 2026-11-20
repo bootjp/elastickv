@@ -4,6 +4,8 @@
             [clojure.test :refer :all]
             [clojure.tools.cli :as tools.cli]
             [jepsen.checker :as checker]
+            [knossos.linear :as linear]
+            [elastickv.elle-checker :as elle]
             [jepsen.control.core :as control-core]
             [jepsen.control.retry :as control-retry]
             [jepsen.control.scp :as control-scp]
@@ -359,10 +361,27 @@
     (is (nil? (:final-generator test-map)))
     (is (some? (:generator test-map)))))
 
-(deftest register-checker-races-knossos-analyzers
+(deftest register-checker-uses-linear-without-wgl
   (let [linear-checker (get-in (workload/filesystem-register-checker)
                                [:checkers :linear])]
-    (is (nil? (:algorithm linear-checker)))))
+    (is (= :linear (:algorithm linear-checker)))))
+
+(deftest register-checker-handles-indeterminate-fuse-history
+  ;; All 70 client events from run 44697497760, overwrite/kill, key 71.
+  ;; Competition and WGL exhaust 512 MiB on this input; no client outcomes
+  ;; are dropped to make the selected checker finish.
+  (let [events (elle/read-history (io/resource "fixtures/filesystem-overwrite-kill-key71.edn"))
+        selected (get-in (workload/filesystem-register-checker) [:checkers :linear])]
+    (is (= 70 (count events)))
+    (is (= 16 (count (filter #(and (= :write (:f %)) (= :info (:type %))) events))))
+    (is (= 3 (count (filter #(and (:final %) (= :ok (:type %))) events))))
+    (is (true? (:valid? (checker/check selected {} (history/history events {:dense-indices? false}) {}))))
+    ;; A successful write followed by an older final read must be rejected.
+    (is (false? (:valid? (linear/analysis (:model selected)
+                          [{:process 0 :type :invoke :f :write :value 4}
+                           {:process 0 :type :ok :f :write :value 4}
+                           {:process 1 :type :invoke :f :read :value nil :final true}
+                           {:process 1 :type :ok :f :read :value -1 :final true}]))))))
 
 (deftest remote-db-receives-mount-map
   (let [test-map (workload/elastickv-filesystem-test {:nodes ["n1" "n2"]

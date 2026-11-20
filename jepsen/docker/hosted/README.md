@@ -152,8 +152,10 @@ JEPSEN_TIME_LIMIT=300 JEPSEN_REPEAT_FAULTS=true JEPSEN_MIN_FAULT_CYCLES=2 \
 ```
 
 With 5s intervals, two cycles require a main phase longer than 65s plus time
-for fault operations. The reusable workflow has a 25-minute step budget for
-image build, setup, workload, recovery, analysis, and cleanup.
+for fault operations. The reusable workflow allows 25 minutes for image build,
+setup, workload, recovery, analysis, and cleanup; Filesystem jobs allow 40
+minutes so all 6,000 final observations in the stress configuration can finish.
+The fault phase and generated workload are unchanged by this wall-clock limit.
 
 Results are written to `artifacts/jepsen-<adapter>-<fault>/`: the complete Jepsen `store/`
 (packed as `store.tar.gz` to preserve timestamp paths containing colons),
@@ -179,6 +181,12 @@ registers remain nil; unexpected read payloads remain observations so the
 checkers can reject them. The TransactionalKV name does not imply multi-request
 transactions: PreWrite/Commit/Rollback are unimplemented, so this suite checks
 its supported Get/Put calls individually.
+
+Filesystem bounds each key to 16 writes and at most 16 generated reads, plus
+one final read per node, while preserving the aggregate requested write budget.
+Its Knossos checker uses the linear analyzer alone: racing WGL exhausted the
+heap on captured indeterminate-write histories. All client outcomes and final
+reads remain in the checker input; unknown verdicts fail the run.
 
 Filesystem fault jobs use actual node-local FUSE mounts and SSH file operations,
 including overwrite and rename modes. Every mount uses the mandatory strict

@@ -703,11 +703,13 @@
           :else            {:valid? true})))))
 
 (defn filesystem-register-checker
-  "Per-key register checker. Knossos races its linear and WGL analyzers; the
-   final-reads checker refuses to let a failed last read hide data loss."
+  "Per-key register checker. Use linear alone: racing WGL exhausts the heap
+   on indeterminate FUSE writes before linear can finish. Preserve the full
+   history and refuse to let a failed final read hide data loss."
   []
   (checker/compose
-    {:linear      (checker/linearizable {:model (model/register initial-value)})
+    {:linear      (checker/linearizable {:algorithm :linear
+                                        :model (model/register initial-value)})
      :final-reads (final-reads-checker)
      :timeline    (timeline/html)}))
 
