@@ -1,0 +1,57 @@
+raft2026/11/21 02:31:19 INFO: 1 switched to configuration voters=(1 2 3)
+raft2026/11/21 02:31:19 INFO: 1 became follower at term 0
+raft2026/11/21 02:31:19 INFO: newRaft 1 [peers: [1,2,3], term: 0, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+goos: darwin
+goarch: arm64
+pkg: github.com/bootjp/elastickv/internal/raftengine/etcd
+cpu: Apple M1 Max
+BenchmarkRejectedPeerStep/follower-10         	 3561129	       366.2 ns/op	     544 B/op	       8 allocs/op
+BenchmarkRejectedPeerStep/follower-10         	raft2026/11/21 02:31:21 INFO: 1 switched to configuration voters=(1 2 3)
+raft2026/11/21 02:31:21 INFO: 1 became follower at term 0
+raft2026/11/21 02:31:21 INFO: newRaft 1 [peers: [1,2,3], term: 0, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+ 3497067	       360.1 ns/op	     544 B/op	       8 allocs/op
+BenchmarkRejectedPeerStep/follower-10         	raft2026/11/21 02:31:22 INFO: 1 switched to configuration voters=(1 2 3)
+raft2026/11/21 02:31:22 INFO: 1 became follower at term 0
+raft2026/11/21 02:31:22 INFO: newRaft 1 [peers: [1,2,3], term: 0, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+ 2787045	       384.9 ns/op	     544 B/op	       8 allocs/op
+raft2026/11/21 02:31:23 INFO: 1 switched to configuration voters=(1 2 3)
+raft2026/11/21 02:31:23 INFO: 1 became follower at term 0
+raft2026/11/21 02:31:23 INFO: newRaft 1 [peers: [1,2,3], term: 0, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/11/21 02:31:23 INFO: 1 is starting a new election at term 0
+raft2026/11/21 02:31:23 INFO: 1 became candidate at term 1
+raft2026/11/21 02:31:23 INFO: 1 [logterm: 1, index: 1] sent MsgVote request to 2 at term 1
+raft2026/11/21 02:31:23 INFO: 1 [logterm: 1, index: 1] sent MsgVote request to 3 at term 1
+raft2026/11/21 02:31:23 INFO: 1 received MsgVoteResp from 2 at term 1
+raft2026/11/21 02:31:23 INFO: 1 has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/11/21 02:31:23 INFO: 1 received MsgVoteResp from 3 at term 1
+raft2026/11/21 02:31:23 INFO: 1 has received 2 MsgVoteResp votes and 0 vote rejections
+raft2026/11/21 02:31:23 INFO: 1 became leader at term 1
+BenchmarkRejectedPeerStep/leader-10           	 1560415	       791.2 ns/op	    1424 B/op	      13 allocs/op
+BenchmarkRejectedPeerStep/leader-10           	raft2026/11/21 02:31:24 INFO: 1 switched to configuration voters=(1 2 3)
+raft2026/11/21 02:31:24 INFO: 1 became follower at term 0
+raft2026/11/21 02:31:24 INFO: newRaft 1 [peers: [1,2,3], term: 0, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/11/21 02:31:24 INFO: 1 is starting a new election at term 0
+raft2026/11/21 02:31:24 INFO: 1 became candidate at term 1
+raft2026/11/21 02:31:24 INFO: 1 [logterm: 1, index: 1] sent MsgVote request to 2 at term 1
+raft2026/11/21 02:31:24 INFO: 1 [logterm: 1, index: 1] sent MsgVote request to 3 at term 1
+raft2026/11/21 02:31:24 INFO: 1 received MsgVoteResp from 2 at term 1
+raft2026/11/21 02:31:24 INFO: 1 has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/11/21 02:31:24 INFO: 1 received MsgVoteResp from 3 at term 1
+raft2026/11/21 02:31:24 INFO: 1 has received 2 MsgVoteResp votes and 0 vote rejections
+raft2026/11/21 02:31:24 INFO: 1 became leader at term 1
+ 1412926	       834.9 ns/op	    1424 B/op	      13 allocs/op
+BenchmarkRejectedPeerStep/leader-10           	raft2026/11/21 02:31:25 INFO: 1 switched to configuration voters=(1 2 3)
+raft2026/11/21 02:31:26 INFO: 1 became follower at term 0
+raft2026/11/21 02:31:26 INFO: newRaft 1 [peers: [1,2,3], term: 0, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/11/21 02:31:26 INFO: 1 is starting a new election at term 0
+raft2026/11/21 02:31:26 INFO: 1 became candidate at term 1
+raft2026/11/21 02:31:26 INFO: 1 [logterm: 1, index: 1] sent MsgVote request to 2 at term 1
+raft2026/11/21 02:31:26 INFO: 1 [logterm: 1, index: 1] sent MsgVote request to 3 at term 1
+raft2026/11/21 02:31:26 INFO: 1 received MsgVoteResp from 2 at term 1
+raft2026/11/21 02:31:26 INFO: 1 has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/11/21 02:31:26 INFO: 1 received MsgVoteResp from 3 at term 1
+raft2026/11/21 02:31:26 INFO: 1 has received 2 MsgVoteResp votes and 0 vote rejections
+raft2026/11/21 02:31:26 INFO: 1 became leader at term 1
+ 1515193	       759.4 ns/op	    1424 B/op	      13 allocs/op
+PASS
+ok  	github.com/bootjp/elastickv/internal/raftengine/etcd	7.817s

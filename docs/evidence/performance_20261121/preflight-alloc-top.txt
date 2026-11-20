@@ -1,0 +1,26 @@
+File: ramp.test
+Build ID: 5a5016fdfe3eaf77e0e1f6ff52fa67e165ebcf37
+Type: alloc_space
+Time: 2026-11-21 02:21:58 JST
+Showing nodes accounting for 4229.45MB, 49.81% of 8491.62MB total
+Dropped 988 nodes (cum <= 42.46MB)
+Showing top 18 nodes out of 308
+      flat  flat%   sum%        cum   cum%
+  696.57MB  8.20%  8.20%   696.57MB  8.20%  go.etcd.io/raft/v3/tracker.(*Inflights).Clone (inline)
+  612.07MB  7.21% 15.41%   612.07MB  7.21%  reflect.unsafe_New
+  404.13MB  4.76% 20.17%   719.15MB  8.47%  google.golang.org/grpc/internal/transport.(*http2Server).operateHeaders
+  282.55MB  3.33% 23.50%   282.55MB  3.33%  golang.org/x/net/http2.(*Framer).readMetaFrame.func1
+  219.09MB  2.58% 26.08%   219.09MB  2.58%  github.com/bootjp/elastickv/internal/raftengine/etcd.(*Engine).peerProgress.func1
+  209.47MB  2.47% 28.54%   209.47MB  2.47%  google.golang.org/protobuf/internal/impl.consumeBytesNoZero
+  187.06MB  2.20% 30.75%   303.58MB  3.57%  google.golang.org/grpc/internal/transport.(*http2Client).newStream
+  183.53MB  2.16% 32.91%   249.04MB  2.93%  context.(*cancelCtx).propagateCancel
+  168.10MB  1.98% 34.89%   864.67MB 10.18%  go.etcd.io/raft/v3.getProgressCopy.func1
+  161.23MB  1.90% 36.79%   161.73MB  1.90%  google.golang.org/protobuf/proto.MarshalOptions.marshal
+  151.01MB  1.78% 38.57%   436.56MB  5.14%  golang.org/x/net/http2.(*Framer).readMetaFrame
+  148.02MB  1.74% 40.31%   148.02MB  1.74%  github.com/bootjp/elastickv/internal/raftengine/etcd.(*Engine).currentConfiguration
+  137.52MB  1.62% 41.93%  1422.78MB 16.76%  github.com/bootjp/elastickv/internal/raftengine/etcd.(*GRPCTransport).dispatchRegular
+  137.01MB  1.61% 43.54%   137.01MB  1.61%  time.newTimer
+  136.01MB  1.60% 45.14%   136.01MB  1.60%  context.(*cancelCtx).Done
+  135.51MB  1.60% 46.74%   270.03MB  3.18%  context.WithDeadlineCause
+  131.53MB  1.55% 48.29%   194.04MB  2.29%  google.golang.org/grpc/internal/transport.(*http2Client).operateHeaders
+  129.02MB  1.52% 49.81%  1257.72MB 14.81%  github.com/bootjp/elastickv/internal/raftengine/etcd.(*Engine).handleStepWithAdmission

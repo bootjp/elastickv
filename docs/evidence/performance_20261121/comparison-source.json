@@ -1,0 +1,40 @@
+{
+  "base_commit": "a2455239c1772f5046b955232b551eda853fac33",
+  "measured_candidate_source_commit": "1eaf9a30941323eb7f9929a2d4c0272fb1872431",
+  "baseline_difference": "engine.handleStepWithAdmission reads rawNode.Status().GetCommit() instead of BasicStatus().GetCommit(); otherwise identical fixture and load process",
+  "verified_new_go_files": [
+    "cmd/loadtest/audit_barrier.go",
+    "cmd/loadtest/audit_barrier_test.go",
+    "cmd/loadtest/main.go",
+    "cmd/loadtest/main_test.go",
+    "cmd/loadtest/options.go",
+    "internal/loadtest/config.go",
+    "internal/loadtest/raw.go",
+    "internal/loadtest/runner.go",
+    "internal/loadtest/runner_test.go",
+    "internal/loadtest/stats.go",
+    "internal/raftengine/etcd/engine_step_bench_test.go",
+    "internal/server/performance_load_profile_test.go",
+    "internal/server/performance_load_ramp_test.go"
+  ],
+  "source_artifacts_sha256": {
+    "v2-tracked.patch": "c3acab94e19d645052601cf1326d6d65f54dca059ad9731f82a8aaac7ab0fdcd",
+    "v2-untracked-source.tar": "9531976fe545651016b0bd98c1a42f3e08ffd2e91742ee46badbf61900ef7007",
+    "baseline-engine.go": "ee0de62b87b74cf5d7742ded5e1ecd163bb528ddb2fb453d9b25f57886852ab1"
+  },
+  "subsequent_fixture_refinement_commit": "eb804ce63",
+  "profile_enabled": false,
+  "trial_order": [
+    "A1",
+    "B1",
+    "B2",
+    "A2"
+  ],
+  "offered_rps": 500,
+  "duration_seconds": 300,
+  "concurrency": 32,
+  "read_percent": 50,
+  "seed_keys": 256,
+  "value_bytes": 1024,
+  "sync_override": null
+}

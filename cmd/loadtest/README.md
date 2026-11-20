@@ -40,7 +40,7 @@ every ACK is audited through every supplied ingress. Stage write successes, ledg
 cardinality, unique IDs, expected observations, attempted observations and successful observations are
 cross-checked. An empty write audit is not a passing write test. Read-only runs
 report an empty write audit and validate their measured immutable reads instead.
-Tracking and latency memory are bounded by the explicit planned-request limit.
+Tracking and latency memory are bounded by the planned-request limit and the number of supplied ingresses; auditing stores one latency observation per ACK per ingress.
 
 An optional `--audit-ready-file=/fresh/run/done` delays the audit until an external
 controller has confirmed Split Done and routing convergence and creates that file.
@@ -100,7 +100,9 @@ a rate-dependent bottleneck. Metrics are stage-wide, not per-Split-phase p99.
 
 The normal server and demo have no pprof listener by default. Explicitly pass
 `--pprofAddress=127.0.0.1:6060` to enable `/debug/pprof/`; an external bind still
-requires the existing bearer-token configuration. CPU and heap examples:
+requires the existing bearer-token configuration. The three-node demo uses
+loopback ports 6061–6063 when profiling is explicitly enabled. CPU and heap
+examples for a single server listening on port 6060:
 
 ```sh
 curl -f 'http://127.0.0.1:6060/debug/pprof/profile?seconds=20' -o cpu.pprof
