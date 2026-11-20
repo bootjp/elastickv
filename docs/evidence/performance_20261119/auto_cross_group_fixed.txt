@@ -1,0 +1,5 @@
+2026/11/19 17:57:32 INFO autosplit: leadership acquired; detector state reset leader_started_at=2026-11-19T17:57:32.000+09:00 processed_watermark=0001-01-01T00:00:00.000Z
+2026/11/19 17:57:38 INFO autosplit: scheduling split route_id=1 catalog_version=1 split_key=f0 split_origin=p50_last_bucket_lo score=40 consecutive_over=2 target_group_id=2
+2026/11/19 17:57:38 INFO autosplit: migration job started route_id=1 catalog_version=1 job_id=1 split_key=f0 split_origin=p50_last_bucket_lo
+--- PASS: TestAutoSplitCrossGroupThreeNodeTwoGroupAcceptance (239.36s)
+PASS

@@ -1,0 +1,40 @@
+{
+  "base_commit": "5ccfbc74a31f6b21aa4d631704ca922a0749c18e",
+  "variants": "identical baseline + P0 + diagnostic; candidate replaces only two preflight production files",
+  "pairs": 3,
+  "order": [
+    "baseline,candidate",
+    "candidate,baseline",
+    "baseline,candidate"
+  ],
+  "value_bytes": 1024,
+  "keys": 256,
+  "nodes": 3,
+  "groups": 2,
+  "source_leader": 0,
+  "target_leader": 1,
+  "GOMAXPROCS": 8,
+  "fsm_sync": "default Sync, env unset",
+  "TLS": true,
+  "forward_auth": "production ConfigureGRPCForwardToken",
+  "foreground": "closed-loop 4 readers / 4 writers during entire migration; before/after 8 readers, 8 writers, mixed each 2s",
+  "recovery": "5 paths, 600 scheduled write+readbacks/path over about 60s",
+  "phase_attribution": "observed at RPC start, catalog polling 100ms; successful RPC latency only",
+  "baseline_sources": {
+    "kv/sharded_coordinator.go": "e918b67c048d3340499503db1f9e0d2c1ec5c13a13d9bb4d9812c596b4e9efd7",
+    "kv/sharded_coordinator_migration_version.go": "74d52997788bd199f2637b1b8a706583a69c52e25c28a155416bd72c5a6436e7",
+    "internal/server/performance_split_test.go": "ca5dd573a899c3823d2966a4df1dd553da88abaef32a39002d3d353b5f3ea08f",
+    "internal/server/performance_split_recovery_test.go": "6bdc3811b9c8a369cc8bce446d26633d2781f384afbace09a68151f4bfcd44bc",
+    "internal/server/performance_split_comparison_test.go": "3483c8b1e3cfdcd1b83f4f064f8f296e6db2fb95759524716839d63a46661102",
+    "adapter/split_job_runner.go": "eea57fea94eb80741eb7b6fc6ef75a69370aaf4f1a45faa8a73687ea221c0853",
+    "adapter/split_job_transfer_preflight.go": "b39a67d832aa4a347666ae75b7fb5b5c947b5a0b892dbf92fe2c509012e773a7"
+  },
+  "candidate_sources": {
+    "adapter/split_job_runner.go": "70abcb0ab6667e89f305656505a61996495c2064209aa8c99cb19bb821ef8919",
+    "adapter/split_job_transfer_preflight.go": "1ae2ad210fe29df06b1a1a1e94e10722a3ac45fa911716b8681ce3c4a0b8179e"
+  },
+  "binaries": {
+    "baseline-e2e.test": "5976bba8032170c78c075bc987ff3d1f9d0b87e039133fde797209c8c718a061",
+    "candidate-e2e.test": "49a09e910c2beb574f3bf9c58e5bf927615c93eba1323b390b2acdb71619f440"
+  }
+}

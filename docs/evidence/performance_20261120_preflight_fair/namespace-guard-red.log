@@ -1,0 +1,10 @@
+--- FAIL: TestLegacyNamespaceFinalCapabilitiesBeforeAnyActivation (0.00s)
+    --- FAIL: TestLegacyNamespaceFinalCapabilitiesBeforeAnyActivation/guard-from-start-missing (0.00s)
+        split_job_namespace_legacy_capability_test.go:36: 
+            	Error Trace:	/Users/bootjp/src/elastickv/adapter/split_job_namespace_legacy_capability_test.go:36
+            	Error:      	Should be zero, but was 1
+            	Test:       	TestLegacyNamespaceFinalCapabilitiesBeforeAnyActivation/guard-from-start-missing
+            	Messages:   	the inactive source must not activate before the final target capability check
+FAIL
+FAIL	github.com/bootjp/elastickv/adapter	0.775s
+FAIL

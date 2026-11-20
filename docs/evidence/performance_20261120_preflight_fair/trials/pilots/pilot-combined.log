@@ -1,0 +1,117 @@
+=== RUN   TestPerformanceReadWriteSplit
+2026/11/19 18:01:09 Found 0 WALs
+raft2026/11/19 18:01:09 INFO: 8b37b07b558d4c0 switched to configuration voters=(8b37b07b558d4c0 8b37d07b558d826 8b37e07b558d9d9)
+raft2026/11/19 18:01:09 INFO: 8b37b07b558d4c0 became follower at term 1
+raft2026/11/19 18:01:09 INFO: newRaft 8b37b07b558d4c0 [peers: [8b37b07b558d4c0,8b37d07b558d826,8b37e07b558d9d9], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+2026/11/19 18:01:09 Found 0 WALs
+raft2026/11/19 18:01:09 INFO: 8b37b07b558d4c0 switched to configuration voters=(8b37b07b558d4c0 8b37d07b558d826 8b37e07b558d9d9)
+raft2026/11/19 18:01:09 INFO: 8b37b07b558d4c0 became follower at term 1
+raft2026/11/19 18:01:09 INFO: newRaft 8b37b07b558d4c0 [peers: [8b37b07b558d4c0,8b37d07b558d826,8b37e07b558d9d9], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+2026/11/19 18:01:09 Found 0 WALs
+raft2026/11/19 18:01:09 INFO: 8b37e07b558d9d9 switched to configuration voters=(8b37b07b558d4c0 8b37d07b558d826 8b37e07b558d9d9)
+raft2026/11/19 18:01:09 INFO: 8b37e07b558d9d9 became follower at term 1
+raft2026/11/19 18:01:09 INFO: newRaft 8b37e07b558d9d9 [peers: [8b37b07b558d4c0,8b37d07b558d826,8b37e07b558d9d9], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+2026/11/19 18:01:09 Found 0 WALs
+raft2026/11/19 18:01:09 INFO: 8b37e07b558d9d9 switched to configuration voters=(8b37b07b558d4c0 8b37d07b558d826 8b37e07b558d9d9)
+raft2026/11/19 18:01:09 INFO: 8b37e07b558d9d9 became follower at term 1
+raft2026/11/19 18:01:09 INFO: newRaft 8b37e07b558d9d9 [peers: [8b37b07b558d4c0,8b37d07b558d826,8b37e07b558d9d9], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+2026/11/19 18:01:09 Found 0 WALs
+raft2026/11/19 18:01:09 INFO: 8b37d07b558d826 switched to configuration voters=(8b37b07b558d4c0 8b37d07b558d826 8b37e07b558d9d9)
+raft2026/11/19 18:01:09 INFO: 8b37d07b558d826 became follower at term 1
+raft2026/11/19 18:01:09 INFO: newRaft 8b37d07b558d826 [peers: [8b37b07b558d4c0,8b37d07b558d826,8b37e07b558d9d9], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+2026/11/19 18:01:09 Found 0 WALs
+raft2026/11/19 18:01:09 INFO: 8b37d07b558d826 switched to configuration voters=(8b37b07b558d4c0 8b37d07b558d826 8b37e07b558d9d9)
+raft2026/11/19 18:01:09 INFO: 8b37d07b558d826 became follower at term 1
+raft2026/11/19 18:01:09 INFO: newRaft 8b37d07b558d826 [peers: [8b37b07b558d4c0,8b37d07b558d826,8b37e07b558d9d9], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/11/19 18:01:12 INFO: 8b37b07b558d4c0 is starting a new election at term 1
+raft2026/11/19 18:01:12 INFO: 8b37b07b558d4c0 became pre-candidate at term 1
+raft2026/11/19 18:01:12 INFO: 8b37b07b558d4c0 [logterm: 1, index: 1] sent MsgPreVote request to 8b37d07b558d826 at term 1
+raft2026/11/19 18:01:12 INFO: 8b37b07b558d4c0 [logterm: 1, index: 1] sent MsgPreVote request to 8b37e07b558d9d9 at term 1
+raft2026/11/19 18:01:12 INFO: 8b37b07b558d4c0 received MsgPreVoteResp from 8b37b07b558d4c0 at term 1
+raft2026/11/19 18:01:12 INFO: 8b37b07b558d4c0 has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft2026/11/19 18:01:12 INFO: 8b37d07b558d826 [logterm: 1, index: 1, vote: 0] cast MsgPreVote for 8b37b07b558d4c0 [logterm: 1, index: 1] at term 1
+raft2026/11/19 18:01:12 INFO: 8b37e07b558d9d9 [logterm: 1, index: 1, vote: 0] cast MsgPreVote for 8b37b07b558d4c0 [logterm: 1, index: 1] at term 1
+raft2026/11/19 18:01:12 INFO: 8b37b07b558d4c0 received MsgPreVoteResp from 8b37e07b558d9d9 at term 1
+raft2026/11/19 18:01:12 INFO: 8b37b07b558d4c0 has received 2 MsgPreVoteResp votes and 0 vote rejections
+raft2026/11/19 18:01:12 INFO: 8b37b07b558d4c0 became candidate at term 2
+raft2026/11/19 18:01:12 INFO: 8b37b07b558d4c0 [logterm: 1, index: 1] sent MsgVote request to 8b37d07b558d826 at term 2
+raft2026/11/19 18:01:12 INFO: 8b37b07b558d4c0 [logterm: 1, index: 1] sent MsgVote request to 8b37e07b558d9d9 at term 2
+raft2026/11/19 18:01:12 INFO: 8b37b07b558d4c0 received MsgVoteResp from 8b37b07b558d4c0 at term 2
+raft2026/11/19 18:01:12 INFO: 8b37b07b558d4c0 has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/11/19 18:01:12 INFO: 8b37e07b558d9d9 [term: 1] received a MsgVote message with higher term from 8b37b07b558d4c0 [term: 2]
+raft2026/11/19 18:01:12 INFO: 8b37e07b558d9d9 became follower at term 2
+raft2026/11/19 18:01:12 INFO: 8b37d07b558d826 [term: 1] received a MsgVote message with higher term from 8b37b07b558d4c0 [term: 2]
+raft2026/11/19 18:01:12 INFO: 8b37d07b558d826 became follower at term 2
+raft2026/11/19 18:01:12 INFO: 8b37d07b558d826 [logterm: 1, index: 1, vote: 0] cast MsgVote for 8b37b07b558d4c0 [logterm: 1, index: 1] at term 2
+raft2026/11/19 18:01:12 INFO: 8b37e07b558d9d9 [logterm: 1, index: 1, vote: 0] cast MsgVote for 8b37b07b558d4c0 [logterm: 1, index: 1] at term 2
+raft2026/11/19 18:01:12 INFO: 8b37b07b558d4c0 received MsgVoteResp from 8b37e07b558d9d9 at term 2
+raft2026/11/19 18:01:12 INFO: 8b37b07b558d4c0 has received 2 MsgVoteResp votes and 0 vote rejections
+raft2026/11/19 18:01:12 INFO: 8b37b07b558d4c0 became leader at term 2
+raft2026/11/19 18:01:12 INFO: 8b37b07b558d4c0 is starting a new election at term 1
+raft2026/11/19 18:01:12 INFO: 8b37b07b558d4c0 became pre-candidate at term 1
+raft2026/11/19 18:01:12 INFO: 8b37b07b558d4c0 [logterm: 1, index: 1] sent MsgPreVote request to 8b37d07b558d826 at term 1
+raft2026/11/19 18:01:12 INFO: 8b37b07b558d4c0 [logterm: 1, index: 1] sent MsgPreVote request to 8b37e07b558d9d9 at term 1
+raft2026/11/19 18:01:12 INFO: 8b37b07b558d4c0 received MsgPreVoteResp from 8b37b07b558d4c0 at term 1
+raft2026/11/19 18:01:12 INFO: 8b37b07b558d4c0 has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft2026/11/19 18:01:12 INFO: 8b37e07b558d9d9 [logterm: 1, index: 1, vote: 0] cast MsgPreVote for 8b37b07b558d4c0 [logterm: 1, index: 1] at term 1
+raft2026/11/19 18:01:12 INFO: 8b37d07b558d826 [logterm: 1, index: 1, vote: 0] cast MsgPreVote for 8b37b07b558d4c0 [logterm: 1, index: 1] at term 1
+raft2026/11/19 18:01:12 INFO: 8b37b07b558d4c0 received MsgPreVoteResp from 8b37e07b558d9d9 at term 1
+raft2026/11/19 18:01:12 INFO: 8b37b07b558d4c0 has received 2 MsgPreVoteResp votes and 0 vote rejections
+raft2026/11/19 18:01:12 INFO: 8b37b07b558d4c0 became candidate at term 2
+raft2026/11/19 18:01:12 INFO: 8b37b07b558d4c0 [logterm: 1, index: 1] sent MsgVote request to 8b37d07b558d826 at term 2
+raft2026/11/19 18:01:12 INFO: 8b37b07b558d4c0 [logterm: 1, index: 1] sent MsgVote request to 8b37e07b558d9d9 at term 2
+raft2026/11/19 18:01:12 INFO: 8b37b07b558d4c0 received MsgVoteResp from 8b37b07b558d4c0 at term 2
+raft2026/11/19 18:01:12 INFO: 8b37b07b558d4c0 has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/11/19 18:01:12 INFO: 8b37d07b558d826 [term: 1] received a MsgVote message with higher term from 8b37b07b558d4c0 [term: 2]
+raft2026/11/19 18:01:12 INFO: 8b37d07b558d826 became follower at term 2
+raft2026/11/19 18:01:12 INFO: 8b37d07b558d826 [logterm: 1, index: 1, vote: 0] cast MsgVote for 8b37b07b558d4c0 [logterm: 1, index: 1] at term 2
+raft2026/11/19 18:01:12 INFO: 8b37e07b558d9d9 [term: 1] received a MsgVote message with higher term from 8b37b07b558d4c0 [term: 2]
+raft2026/11/19 18:01:12 INFO: 8b37e07b558d9d9 became follower at term 2
+raft2026/11/19 18:01:12 INFO: 8b37e07b558d9d9 [logterm: 1, index: 1, vote: 0] cast MsgVote for 8b37b07b558d4c0 [logterm: 1, index: 1] at term 2
+raft2026/11/19 18:01:12 INFO: 8b37b07b558d4c0 received MsgVoteResp from 8b37e07b558d9d9 at term 2
+raft2026/11/19 18:01:12 INFO: 8b37b07b558d4c0 has received 2 MsgVoteResp votes and 0 vote rejections
+raft2026/11/19 18:01:12 INFO: 8b37b07b558d4c0 became leader at term 2
+raft2026/11/19 18:01:12 INFO: 8b37b07b558d4c0 [term 2] starts to transfer leadership to 8b37e07b558d9d9
+raft2026/11/19 18:01:12 INFO: 8b37b07b558d4c0 sends MsgTimeoutNow to 8b37e07b558d9d9 immediately as 8b37e07b558d9d9 already has up-to-date log
+raft2026/11/19 18:01:12 INFO: 8b37e07b558d9d9 [term 2] received MsgTimeoutNow from 8b37b07b558d4c0 and starts an election to get leadership.
+raft2026/11/19 18:01:12 INFO: 8b37e07b558d9d9 is starting a new election at term 2
+raft2026/11/19 18:01:12 INFO: 8b37e07b558d9d9 became candidate at term 3
+raft2026/11/19 18:01:12 INFO: 8b37e07b558d9d9 [logterm: 2, index: 2] sent MsgVote request to 8b37b07b558d4c0 at term 3
+raft2026/11/19 18:01:12 INFO: 8b37e07b558d9d9 [logterm: 2, index: 2] sent MsgVote request to 8b37d07b558d826 at term 3
+raft2026/11/19 18:01:12 INFO: 8b37e07b558d9d9 received MsgVoteResp from 8b37e07b558d9d9 at term 3
+raft2026/11/19 18:01:12 INFO: 8b37e07b558d9d9 has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/11/19 18:01:12 INFO: 8b37b07b558d4c0 [term: 2] received a MsgVote message with higher term from 8b37e07b558d9d9 [term: 3]
+raft2026/11/19 18:01:12 INFO: 8b37b07b558d4c0 became follower at term 3
+raft2026/11/19 18:01:12 INFO: 8b37b07b558d4c0 [logterm: 2, index: 2, vote: 0] cast MsgVote for 8b37e07b558d9d9 [logterm: 2, index: 2] at term 3
+raft2026/11/19 18:01:12 INFO: 8b37e07b558d9d9 received MsgVoteResp from 8b37b07b558d4c0 at term 3
+raft2026/11/19 18:01:12 INFO: 8b37e07b558d9d9 has received 2 MsgVoteResp votes and 0 vote rejections
+raft2026/11/19 18:01:12 INFO: 8b37e07b558d9d9 became leader at term 3
+raft2026/11/19 18:01:12 INFO: 8b37d07b558d826 [term: 2] received a MsgVote message with higher term from 8b37e07b558d9d9 [term: 3]
+raft2026/11/19 18:01:12 INFO: 8b37d07b558d826 became follower at term 3
+raft2026/11/19 18:01:12 INFO: 8b37d07b558d826 [logterm: 2, index: 2, vote: 0] cast MsgVote for 8b37e07b558d9d9 [logterm: 2, index: 2] at term 3
+    performance_split_test.go:60: PERF topology nodes=3 groups=2 source_leader=0 target_leader=1 fsm_sync_mode=""
+    performance_split_test.go:80: PERF phase=before-read write=false elapsed_s=2.000 success=59840 errors=0 ops_s=29918.3 p50_ms=0.252 p99_ms=0.560 first_error=<nil>
+    performance_split_test.go:80: PERF phase=before-write write=true elapsed_s=2.025 success=645 errors=0 ops_s=318.5 p50_ms=25.133 p99_ms=36.796 first_error=<nil>
+    performance_split_test.go:80: PERF phase=before-mixed write=false elapsed_s=2.013 success=16987 errors=0 ops_s=8438.9 p50_ms=0.264 p99_ms=4.155 first_error=<nil>
+    performance_split_test.go:80: PERF phase=before-mixed write=true elapsed_s=2.013 success=644 errors=0 ops_s=319.9 p50_ms=12.059 p99_ms=21.827 first_error=<nil>
+    performance_split_test.go:94: PERF same-group catalog_commit_ms=13.541
+    performance_split_test.go:80: PERF phase=same-group-mixed write=false elapsed_s=2.010 success=16812 errors=0 ops_s=8362.7 p50_ms=0.272 p99_ms=4.087 first_error=<nil>
+    performance_split_test.go:80: PERF phase=same-group-mixed write=true elapsed_s=2.010 success=631 errors=0 ops_s=313.9 p50_ms=12.196 p99_ms=22.377 first_error=<nil>
+    performance_split_test.go:114: PERF migration elapsed_ms=27 phase=1 last_error=""
+    performance_split_test.go:114: PERF migration elapsed_ms=328 phase=2 last_error=""
+    performance_split_test.go:114: PERF migration elapsed_ms=47204 phase=3 last_error=""
+    performance_split_timing_test.go:30: PERF preflight-duration lower_ms=4439.824 upper_ms=4461.111
+    performance_split_timing_test.go:30: PERF preflight-work families=46 completed=46 versions=8210
+    performance_split_test.go:104: PERF phase=migration-0 write=false elapsed_s=0.028 success=186 errors=0 ops_s=6655.3 p50_ms=0.340 p99_ms=3.198 first_error=<nil>
+    performance_split_test.go:104: PERF phase=migration-0 write=true elapsed_s=0.028 success=10 errors=0 ops_s=357.8 p50_ms=12.006 p99_ms=23.222 first_error=<nil>
+    performance_split_test.go:104: PERF phase=migration-1 write=false elapsed_s=0.301 success=2521 errors=0 ops_s=8385.0 p50_ms=0.282 p99_ms=3.830 first_error=<nil>
+    performance_split_test.go:104: PERF phase=migration-1 write=true elapsed_s=0.301 success=94 errors=4 ops_s=312.7 p50_ms=11.811 p99_ms=19.978 first_error=rpc error: code = Unknown desc = Operation outcome unknown
+    performance_split_test.go:104: PERF phase=migration-2 write=false elapsed_s=46.875 success=365220 errors=0 ops_s=7791.3 p50_ms=0.291 p99_ms=4.207 first_error=<nil>
+    performance_split_test.go:104: PERF phase=migration-2 write=true elapsed_s=46.875 success=13895 errors=0 ops_s=296.4 p50_ms=12.920 p99_ms=24.251 first_error=<nil>
+    performance_split_test.go:104: PERF phase=migration-preflight write=false elapsed_s=4.513 success=33256 errors=0 ops_s=7369.5 p50_ms=0.308 p99_ms=4.426 first_error=<nil>
+    performance_split_test.go:104: PERF phase=migration-preflight write=true elapsed_s=4.513 success=1271 errors=0 ops_s=281.7 p50_ms=13.411 p99_ms=22.918 first_error=<nil>
+    performance_split_test.go:104: PERF phase=cross-group-during write=false elapsed_s=51.801 success=401183 errors=0 ops_s=7744.6 p50_ms=0.292 p99_ms=4.221 first_error=<nil>
+    performance_split_test.go:104: PERF phase=cross-group-during write=true elapsed_s=51.801 success=15270 errors=4 ops_s=294.8 p50_ms=12.956 p99_ms=24.068 first_error=rpc error: code = Unknown desc = Operation outcome unknown
+    performance_split_test.go:123: PERF preflight-pilot stopped_after_witness=true elapsed_ms=51865
+--- PASS: TestPerformanceReadWriteSplit (65.95s)
+PASS

@@ -1,0 +1,60 @@
+name: Jepsen Split Preflight
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/jepsen-split-preflight.yml'
+      - 'adapter/split_job*.go'
+      - 'adapter/distribution_server.go'
+      - 'cmd/elastickv-split/**'
+      - 'cmd/jepsen-grpc-client/**'
+      - 'scripts/jepsen-split-preflight.sh'
+      - 'jepsen/**'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  voter-pause:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          submodules: recursive
+          persist-credentials: false
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.lein
+          key: ${{ runner.os }}-maven-${{ hashFiles('jepsen/project.clj') }}
+      - name: Install Leiningen if absent
+        run: |
+          if ! command -v lein >/dev/null; then
+            curl -fL --retry 5 --retry-all-errors https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein -o "$RUNNER_TEMP/lein"
+            chmod +x "$RUNNER_TEMP/lein"
+            echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+          fi
+      - name: Check the preflight oracle
+        working-directory: jepsen
+        run: lein test elastickv.split-preflight-workload-test
+      - name: Pause a voter during split preflight
+        run: PREFLIGHT_LOG_DIR="$RUNNER_TEMP/preflight-logs" bash scripts/jepsen-split-preflight.sh
+      - name: Archive Jepsen history
+        if: always()
+        run: bash scripts/archive-jepsen-store.sh jepsen/store/elastickv-split-preflight-pause "$RUNNER_TEMP/preflight-history.tar.gz"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: jepsen-split-preflight-pause
+          path: |
+            ${{ runner.temp }}/preflight-history.tar.gz
+            ${{ runner.temp }}/preflight-logs/
+          retention-days: 14

@@ -1,0 +1,337 @@
+=== RUN   TestPerformanceReadWriteSplit
+2026/11/19 15:00:59 Found 0 WALs
+raft2026/11/19 15:00:59 INFO: 8b37b07b558d4c0 switched to configuration voters=(8b37b07b558d4c0 8b37d07b558d826 8b37e07b558d9d9)
+raft2026/11/19 15:00:59 INFO: 8b37b07b558d4c0 became follower at term 1
+raft2026/11/19 15:00:59 INFO: newRaft 8b37b07b558d4c0 [peers: [8b37b07b558d4c0,8b37d07b558d826,8b37e07b558d9d9], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+2026/11/19 15:00:59 Found 0 WALs
+raft2026/11/19 15:00:59 INFO: 8b37b07b558d4c0 switched to configuration voters=(8b37b07b558d4c0 8b37d07b558d826 8b37e07b558d9d9)
+raft2026/11/19 15:00:59 INFO: 8b37b07b558d4c0 became follower at term 1
+raft2026/11/19 15:00:59 INFO: newRaft 8b37b07b558d4c0 [peers: [8b37b07b558d4c0,8b37d07b558d826,8b37e07b558d9d9], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+2026/11/19 15:00:59 Found 0 WALs
+raft2026/11/19 15:00:59 INFO: 8b37e07b558d9d9 switched to configuration voters=(8b37b07b558d4c0 8b37d07b558d826 8b37e07b558d9d9)
+raft2026/11/19 15:00:59 INFO: 8b37e07b558d9d9 became follower at term 1
+raft2026/11/19 15:00:59 INFO: newRaft 8b37e07b558d9d9 [peers: [8b37b07b558d4c0,8b37d07b558d826,8b37e07b558d9d9], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+2026/11/19 15:00:59 Found 0 WALs
+raft2026/11/19 15:00:59 INFO: 8b37e07b558d9d9 switched to configuration voters=(8b37b07b558d4c0 8b37d07b558d826 8b37e07b558d9d9)
+raft2026/11/19 15:00:59 INFO: 8b37e07b558d9d9 became follower at term 1
+raft2026/11/19 15:00:59 INFO: newRaft 8b37e07b558d9d9 [peers: [8b37b07b558d4c0,8b37d07b558d826,8b37e07b558d9d9], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+2026/11/19 15:00:59 Found 0 WALs
+raft2026/11/19 15:00:59 INFO: 8b37d07b558d826 switched to configuration voters=(8b37b07b558d4c0 8b37d07b558d826 8b37e07b558d9d9)
+raft2026/11/19 15:00:59 INFO: 8b37d07b558d826 became follower at term 1
+raft2026/11/19 15:00:59 INFO: newRaft 8b37d07b558d826 [peers: [8b37b07b558d4c0,8b37d07b558d826,8b37e07b558d9d9], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+2026/11/19 15:00:59 Found 0 WALs
+raft2026/11/19 15:00:59 INFO: 8b37d07b558d826 switched to configuration voters=(8b37b07b558d4c0 8b37d07b558d826 8b37e07b558d9d9)
+raft2026/11/19 15:00:59 INFO: 8b37d07b558d826 became follower at term 1
+raft2026/11/19 15:00:59 INFO: newRaft 8b37d07b558d826 [peers: [8b37b07b558d4c0,8b37d07b558d826,8b37e07b558d9d9], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+raft2026/11/19 15:01:02 INFO: 8b37b07b558d4c0 is starting a new election at term 1
+raft2026/11/19 15:01:02 INFO: 8b37b07b558d4c0 became pre-candidate at term 1
+raft2026/11/19 15:01:02 INFO: 8b37b07b558d4c0 [logterm: 1, index: 1] sent MsgPreVote request to 8b37d07b558d826 at term 1
+raft2026/11/19 15:01:02 INFO: 8b37b07b558d4c0 [logterm: 1, index: 1] sent MsgPreVote request to 8b37e07b558d9d9 at term 1
+raft2026/11/19 15:01:02 INFO: 8b37b07b558d4c0 received MsgPreVoteResp from 8b37b07b558d4c0 at term 1
+raft2026/11/19 15:01:02 INFO: 8b37b07b558d4c0 has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft2026/11/19 15:01:02 INFO: 8b37e07b558d9d9 [logterm: 1, index: 1, vote: 0] cast MsgPreVote for 8b37b07b558d4c0 [logterm: 1, index: 1] at term 1
+raft2026/11/19 15:01:02 INFO: 8b37d07b558d826 [logterm: 1, index: 1, vote: 0] cast MsgPreVote for 8b37b07b558d4c0 [logterm: 1, index: 1] at term 1
+raft2026/11/19 15:01:02 INFO: 8b37b07b558d4c0 received MsgPreVoteResp from 8b37e07b558d9d9 at term 1
+raft2026/11/19 15:01:02 INFO: 8b37b07b558d4c0 has received 2 MsgPreVoteResp votes and 0 vote rejections
+raft2026/11/19 15:01:02 INFO: 8b37b07b558d4c0 became candidate at term 2
+raft2026/11/19 15:01:02 INFO: 8b37b07b558d4c0 [logterm: 1, index: 1] sent MsgVote request to 8b37d07b558d826 at term 2
+raft2026/11/19 15:01:02 INFO: 8b37b07b558d4c0 [logterm: 1, index: 1] sent MsgVote request to 8b37e07b558d9d9 at term 2
+raft2026/11/19 15:01:02 INFO: 8b37b07b558d4c0 received MsgVoteResp from 8b37b07b558d4c0 at term 2
+raft2026/11/19 15:01:02 INFO: 8b37b07b558d4c0 has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/11/19 15:01:02 INFO: 8b37d07b558d826 [term: 1] received a MsgVote message with higher term from 8b37b07b558d4c0 [term: 2]
+raft2026/11/19 15:01:02 INFO: 8b37e07b558d9d9 [term: 1] received a MsgVote message with higher term from 8b37b07b558d4c0 [term: 2]
+raft2026/11/19 15:01:02 INFO: 8b37d07b558d826 became follower at term 2
+raft2026/11/19 15:01:02 INFO: 8b37e07b558d9d9 became follower at term 2
+raft2026/11/19 15:01:02 INFO: 8b37e07b558d9d9 [logterm: 1, index: 1, vote: 0] cast MsgVote for 8b37b07b558d4c0 [logterm: 1, index: 1] at term 2
+raft2026/11/19 15:01:02 INFO: 8b37d07b558d826 [logterm: 1, index: 1, vote: 0] cast MsgVote for 8b37b07b558d4c0 [logterm: 1, index: 1] at term 2
+raft2026/11/19 15:01:02 INFO: 8b37b07b558d4c0 received MsgVoteResp from 8b37e07b558d9d9 at term 2
+raft2026/11/19 15:01:02 INFO: 8b37b07b558d4c0 has received 2 MsgVoteResp votes and 0 vote rejections
+raft2026/11/19 15:01:02 INFO: 8b37b07b558d4c0 became leader at term 2
+raft2026/11/19 15:01:02 INFO: 8b37b07b558d4c0 is starting a new election at term 1
+raft2026/11/19 15:01:02 INFO: 8b37b07b558d4c0 became pre-candidate at term 1
+raft2026/11/19 15:01:02 INFO: 8b37b07b558d4c0 [logterm: 1, index: 1] sent MsgPreVote request to 8b37d07b558d826 at term 1
+raft2026/11/19 15:01:02 INFO: 8b37b07b558d4c0 [logterm: 1, index: 1] sent MsgPreVote request to 8b37e07b558d9d9 at term 1
+raft2026/11/19 15:01:02 INFO: 8b37b07b558d4c0 received MsgPreVoteResp from 8b37b07b558d4c0 at term 1
+raft2026/11/19 15:01:02 INFO: 8b37b07b558d4c0 has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft2026/11/19 15:01:02 INFO: 8b37e07b558d9d9 [logterm: 1, index: 1, vote: 0] cast MsgPreVote for 8b37b07b558d4c0 [logterm: 1, index: 1] at term 1
+raft2026/11/19 15:01:02 INFO: 8b37d07b558d826 [logterm: 1, index: 1, vote: 0] cast MsgPreVote for 8b37b07b558d4c0 [logterm: 1, index: 1] at term 1
+raft2026/11/19 15:01:02 INFO: 8b37b07b558d4c0 received MsgPreVoteResp from 8b37e07b558d9d9 at term 1
+raft2026/11/19 15:01:02 INFO: 8b37b07b558d4c0 has received 2 MsgPreVoteResp votes and 0 vote rejections
+raft2026/11/19 15:01:02 INFO: 8b37b07b558d4c0 became candidate at term 2
+raft2026/11/19 15:01:02 INFO: 8b37b07b558d4c0 [logterm: 1, index: 1] sent MsgVote request to 8b37d07b558d826 at term 2
+raft2026/11/19 15:01:02 INFO: 8b37b07b558d4c0 [logterm: 1, index: 1] sent MsgVote request to 8b37e07b558d9d9 at term 2
+raft2026/11/19 15:01:02 INFO: 8b37b07b558d4c0 received MsgVoteResp from 8b37b07b558d4c0 at term 2
+raft2026/11/19 15:01:02 INFO: 8b37b07b558d4c0 has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/11/19 15:01:02 INFO: 8b37d07b558d826 [term: 1] received a MsgVote message with higher term from 8b37b07b558d4c0 [term: 2]
+raft2026/11/19 15:01:02 INFO: 8b37d07b558d826 became follower at term 2
+raft2026/11/19 15:01:02 INFO: 8b37d07b558d826 [logterm: 1, index: 1, vote: 0] cast MsgVote for 8b37b07b558d4c0 [logterm: 1, index: 1] at term 2
+raft2026/11/19 15:01:02 INFO: 8b37e07b558d9d9 [term: 1] received a MsgVote message with higher term from 8b37b07b558d4c0 [term: 2]
+raft2026/11/19 15:01:02 INFO: 8b37e07b558d9d9 became follower at term 2
+raft2026/11/19 15:01:02 INFO: 8b37e07b558d9d9 [logterm: 1, index: 1, vote: 0] cast MsgVote for 8b37b07b558d4c0 [logterm: 1, index: 1] at term 2
+raft2026/11/19 15:01:02 INFO: 8b37b07b558d4c0 received MsgVoteResp from 8b37d07b558d826 at term 2
+raft2026/11/19 15:01:02 INFO: 8b37b07b558d4c0 has received 2 MsgVoteResp votes and 0 vote rejections
+raft2026/11/19 15:01:02 INFO: 8b37b07b558d4c0 became leader at term 2
+raft2026/11/19 15:01:02 INFO: 8b37b07b558d4c0 [term 2] starts to transfer leadership to 8b37e07b558d9d9
+raft2026/11/19 15:01:02 INFO: 8b37b07b558d4c0 sends MsgTimeoutNow to 8b37e07b558d9d9 immediately as 8b37e07b558d9d9 already has up-to-date log
+raft2026/11/19 15:01:02 INFO: 8b37e07b558d9d9 [term 2] received MsgTimeoutNow from 8b37b07b558d4c0 and starts an election to get leadership.
+raft2026/11/19 15:01:02 INFO: 8b37e07b558d9d9 is starting a new election at term 2
+raft2026/11/19 15:01:02 INFO: 8b37e07b558d9d9 became candidate at term 3
+raft2026/11/19 15:01:02 INFO: 8b37e07b558d9d9 [logterm: 2, index: 2] sent MsgVote request to 8b37b07b558d4c0 at term 3
+raft2026/11/19 15:01:02 INFO: 8b37e07b558d9d9 [logterm: 2, index: 2] sent MsgVote request to 8b37d07b558d826 at term 3
+raft2026/11/19 15:01:02 INFO: 8b37e07b558d9d9 received MsgVoteResp from 8b37e07b558d9d9 at term 3
+raft2026/11/19 15:01:02 INFO: 8b37e07b558d9d9 has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/11/19 15:01:02 INFO: 8b37b07b558d4c0 [term: 2] received a MsgVote message with higher term from 8b37e07b558d9d9 [term: 3]
+raft2026/11/19 15:01:02 INFO: 8b37b07b558d4c0 became follower at term 3
+raft2026/11/19 15:01:02 INFO: 8b37b07b558d4c0 [logterm: 2, index: 2, vote: 0] cast MsgVote for 8b37e07b558d9d9 [logterm: 2, index: 2] at term 3
+raft2026/11/19 15:01:02 INFO: 8b37e07b558d9d9 received MsgVoteResp from 8b37b07b558d4c0 at term 3
+raft2026/11/19 15:01:02 INFO: 8b37e07b558d9d9 has received 2 MsgVoteResp votes and 0 vote rejections
+raft2026/11/19 15:01:02 INFO: 8b37e07b558d9d9 became leader at term 3
+raft2026/11/19 15:01:02 INFO: 8b37d07b558d826 [term: 2] received a MsgVote message with higher term from 8b37e07b558d9d9 [term: 3]
+raft2026/11/19 15:01:02 INFO: 8b37d07b558d826 became follower at term 3
+raft2026/11/19 15:01:02 INFO: 8b37d07b558d826 [logterm: 2, index: 2, vote: 0] cast MsgVote for 8b37e07b558d9d9 [logterm: 2, index: 2] at term 3
+    performance_split_test.go:60: PERF topology nodes=3 groups=2 source_leader=0 target_leader=1 fsm_sync_mode=""
+    performance_split_test.go:80: PERF phase=before-read write=false elapsed_s=2.000 success=50813 errors=0 ops_s=25402.0 p50_ms=0.298 p99_ms=0.671 first_error=<nil>
+    performance_split_test.go:80: PERF phase=before-write write=true elapsed_s=2.026 success=651 errors=0 ops_s=321.4 p50_ms=26.114 p99_ms=36.427 first_error=<nil>
+    performance_split_test.go:80: PERF phase=before-mixed write=false elapsed_s=2.016 success=14492 errors=0 ops_s=7187.8 p50_ms=0.306 p99_ms=4.535 first_error=<nil>
+    performance_split_test.go:80: PERF phase=before-mixed write=true elapsed_s=2.016 success=547 errors=0 ops_s=271.3 p50_ms=13.937 p99_ms=25.256 first_error=<nil>
+    performance_split_test.go:94: PERF same-group catalog_commit_ms=23.041
+    performance_split_test.go:80: PERF phase=same-group-mixed write=false elapsed_s=2.008 success=15567 errors=0 ops_s=7753.1 p50_ms=0.287 p99_ms=4.123 first_error=<nil>
+    performance_split_test.go:80: PERF phase=same-group-mixed write=true elapsed_s=2.008 success=569 errors=0 ops_s=283.4 p50_ms=13.228 p99_ms=23.397 first_error=<nil>
+    performance_split_test.go:113: PERF migration elapsed_ms=25 phase=1 last_error=""
+    performance_split_test.go:113: PERF migration elapsed_ms=1228 phase=2 last_error=""
+    performance_split_test.go:113: PERF migration elapsed_ms=48123 phase=3 last_error=""
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 8349 1795100522747604
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 7900 1795100522836477
+[DEBUG-preflight] export_us 19688
+[DEBUG-preflight] persist_us 19541
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 6282 1795100522943779
+[DEBUG-preflight] export_us 7722
+[DEBUG-preflight] persist_us 23725
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 11705 1795100523045110
+[DEBUG-preflight] export_us 12459
+[DEBUG-preflight] persist_us 11871
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 2436 1795100523127662
+[DEBUG-preflight] export_us 9660
+[DEBUG-preflight] persist_us 13252
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 7282 1795100523212727
+[DEBUG-preflight] export_us 11213
+[DEBUG-preflight] persist_us 18912
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 6987 1795100523299086
+[DEBUG-preflight] export_us 14257
+[DEBUG-preflight] persist_us 18247
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 7616 1795100523398440
+[DEBUG-preflight] export_us 10347
+[DEBUG-preflight] persist_us 20633
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 5512 1795100523490509
+[DEBUG-preflight] export_us 11871
+[DEBUG-preflight] persist_us 11745
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 2580 1795100523570196
+[DEBUG-preflight] export_us 5695
+[DEBUG-preflight] persist_us 13487
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 8407 1795100523656521
+[DEBUG-preflight] export_us 4943
+[DEBUG-preflight] persist_us 18552
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 2656 1795100523738892
+[DEBUG-preflight] export_us 2907
+[DEBUG-preflight] persist_us 8418
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 5385 1795100523807973
+[DEBUG-preflight] export_us 5525
+[DEBUG-preflight] persist_us 16109
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 3057 1795100523883665
+[DEBUG-preflight] export_us 3959
+[DEBUG-preflight] persist_us 17147
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 6092 1795100523968053
+[DEBUG-preflight] export_us 4381
+[DEBUG-preflight] persist_us 13452
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 6704 1795100524040507
+[DEBUG-preflight] export_us 5063
+[DEBUG-preflight] persist_us 14081
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 5342 1795100524122338
+[DEBUG-preflight] export_us 2207
+[DEBUG-preflight] persist_us 11218
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 3281 1795100524191034
+[DEBUG-preflight] export_us 4918
+[DEBUG-preflight] persist_us 12514
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 5855 1795100524267514
+[DEBUG-preflight] export_us 4928
+[DEBUG-preflight] persist_us 15402
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 3200 1795100524346024
+[DEBUG-preflight] export_us 4691
+[DEBUG-preflight] persist_us 16112
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 5743 1795100524423507
+[DEBUG-preflight] export_us 7168
+[DEBUG-preflight] persist_us 20024
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 2366 1795100524504692
+[DEBUG-preflight] export_us 7280
+[DEBUG-preflight] persist_us 24920
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 2377 1795100524592922
+[DEBUG-preflight] export_us 3181
+[DEBUG-preflight] persist_us 15245
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 9517 1795100524677476
+[DEBUG-preflight] export_us 6136
+[DEBUG-preflight] persist_us 24165
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 2476 1795100524744586
+[DEBUG-preflight] export_us 4492
+[DEBUG-preflight] persist_us 17870
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 2400 1795100524825349
+[DEBUG-preflight] export_us 2951
+[DEBUG-preflight] persist_us 14500
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 5313 1795100524903480
+[DEBUG-preflight] export_us 5602
+[DEBUG-preflight] persist_us 16078
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 5887 1795100524983177
+[DEBUG-preflight] export_us 5188
+[DEBUG-preflight] persist_us 13990
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 3011 1795100525062548
+[DEBUG-preflight] export_us 3871
+[DEBUG-preflight] persist_us 19100
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 5762 1795100525151429
+[DEBUG-preflight] export_us 7685
+[DEBUG-preflight] persist_us 17376
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 2605 1795100525232847
+[DEBUG-preflight] export_us 4005
+[DEBUG-preflight] persist_us 13896
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 7675 1795100525310301
+[DEBUG-preflight] export_us 5199
+[DEBUG-preflight] persist_us 12380
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 11485 1795100525386169
+[DEBUG-preflight] export_us 3484
+[DEBUG-preflight] persist_us 12933
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 5214 1795100525460839
+[DEBUG-preflight] export_us 4335
+[DEBUG-preflight] persist_us 13779
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 7236 1795100525535703
+[DEBUG-preflight] export_us 7264
+[DEBUG-preflight] persist_us 16382
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 5777 1795100525619608
+[DEBUG-preflight] export_us 2611
+[DEBUG-preflight] persist_us 15928
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 6421 1795100525705224
+[DEBUG-preflight] export_us 6933
+[DEBUG-preflight] persist_us 22611
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 6355 1795100525775062
+[DEBUG-preflight] export_us 5405
+[DEBUG-preflight] persist_us 16362
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 7735 1795100525856226
+[DEBUG-preflight] export_us 6398
+[DEBUG-preflight] persist_us 16696
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 7835 1795100525950920
+[DEBUG-preflight] export_us 6617
+[DEBUG-preflight] persist_us 19441
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 2431 1795100526048088
+[DEBUG-preflight] export_us 4434
+[DEBUG-preflight] persist_us 9939
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 6167 1795100526124245
+[DEBUG-preflight] export_us 7217
+[DEBUG-preflight] persist_us 16663
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 9019 1795100526211451
+[DEBUG-preflight] export_us 7240
+[DEBUG-preflight] persist_us 15363
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 12655 1795100526301803
+[DEBUG-preflight] export_us 6982
+[DEBUG-preflight] persist_us 18117
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 6430 1795100526395437
+[DEBUG-preflight] export_us 5977
+[DEBUG-preflight] persist_us 15738
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 2690 1795100526479866
+[DEBUG-preflight] export_us 3717
+[DEBUG-preflight] persist_us 20422
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 2830 1795100526553852
+[DEBUG-preflight] export_us 4087
+[DEBUG-preflight] persist_us 16010
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 6674 1795100526641628
+[DEBUG-preflight] export_us 3444
+[DEBUG-preflight] persist_us 12387
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 2452 1795100526713182
+[DEBUG-preflight] export_us 4230
+[DEBUG-preflight] persist_us 17067
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 2419 1795100526766430
+[DEBUG-preflight] export_us 4934
+[DEBUG-preflight] persist_us 21418
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 7762 1795100526856610
+[DEBUG-preflight] export_us 10165
+[DEBUG-preflight] persist_us 20325
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 7122 1795100526946101
+[DEBUG-preflight] export_us 4936
+[DEBUG-preflight] persist_us 14804
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 3021 1795100527022360
+[DEBUG-preflight] export_us 4529
+[DEBUG-preflight] persist_us 15364
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 3327 1795100527104565
+[DEBUG-preflight] export_us 4975
+[DEBUG-preflight] persist_us 16781
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 2355 1795100527181342
+[DEBUG-preflight] export_us 6500
+[DEBUG-preflight] persist_us 16993
+[DEBUG-preflight] readback true
+[DEBUG-preflight] admission_us 2828 1795100527266604
+[DEBUG-preflight] export_us 0
+[DEBUG-preflight] persist_us 15585
+    performance_split_test.go:104: PERF phase=migration-0 write=false elapsed_s=0.025 success=257 errors=0 ops_s=10264.8 p50_ms=0.269 p99_ms=2.631 first_error=<nil>
+    performance_split_test.go:104: PERF phase=migration-0 write=true elapsed_s=0.025 success=12 errors=0 ops_s=479.3 p50_ms=8.928 p99_ms=11.690 first_error=<nil>
+    performance_split_test.go:104: PERF phase=migration-1 write=false elapsed_s=1.203 success=10074 errors=0 ops_s=8372.6 p50_ms=0.278 p99_ms=3.694 first_error=<nil>
+    performance_split_test.go:104: PERF phase=migration-1 write=true elapsed_s=1.203 success=375 errors=2 ops_s=311.7 p50_ms=12.444 p99_ms=21.966 first_error=rpc error: code = Unknown desc = Operation outcome unknown
+    performance_split_test.go:104: PERF phase=migration-2 write=false elapsed_s=46.895 success=358037 errors=0 ops_s=7634.8 p50_ms=0.303 p99_ms=4.194 first_error=<nil>
+    performance_split_test.go:104: PERF phase=migration-2 write=true elapsed_s=46.895 success=13658 errors=0 ops_s=291.2 p50_ms=12.875 p99_ms=23.903 first_error=<nil>
+    performance_split_test.go:104: PERF phase=migration-preflight write=false elapsed_s=5.539 success=39898 errors=0 ops_s=7202.7 p50_ms=0.304 p99_ms=4.655 first_error=<nil>
+    performance_split_test.go:104: PERF phase=migration-preflight write=true elapsed_s=5.539 success=1510 errors=0 ops_s=272.6 p50_ms=13.687 p99_ms=24.620 first_error=<nil>
+    performance_split_test.go:104: PERF phase=cross-group-during write=false elapsed_s=53.751 success=408267 errors=0 ops_s=7595.5 p50_ms=0.303 p99_ms=4.216 first_error=<nil>
+    performance_split_test.go:104: PERF phase=cross-group-during write=true elapsed_s=53.751 success=15555 errors=2 ops_s=289.4 p50_ms=12.935 p99_ms=23.956 first_error=rpc error: code = Unknown desc = Operation outcome unknown
+    performance_split_test.go:121: PERF preflight-pilot stopped_after_witness=true elapsed_ms=53817
+--- PASS: TestPerformanceReadWriteSplit (68.02s)
+PASS

@@ -1,0 +1,512 @@
+{
+  "runs": [
+    {
+      "pair": 1,
+      "variant": "baseline",
+      "split_s": 263.605,
+      "exit": 0,
+      "recovery_success": 3000,
+      "recovery_max_lag_ms": 23
+    },
+    {
+      "pair": 1,
+      "variant": "candidate",
+      "split_s": 206.17,
+      "exit": 0,
+      "recovery_success": 3000,
+      "recovery_max_lag_ms": 159
+    },
+    {
+      "pair": 2,
+      "variant": "baseline",
+      "split_s": 260.438,
+      "exit": 0,
+      "recovery_success": 3000,
+      "recovery_max_lag_ms": 79
+    },
+    {
+      "pair": 2,
+      "variant": "candidate",
+      "split_s": 203.076,
+      "exit": 0,
+      "recovery_success": 3000,
+      "recovery_max_lag_ms": 28
+    },
+    {
+      "pair": 3,
+      "variant": "baseline",
+      "split_s": 254.593,
+      "exit": 0,
+      "recovery_success": 3000,
+      "recovery_max_lag_ms": 745
+    },
+    {
+      "pair": 3,
+      "variant": "candidate",
+      "split_s": 208.352,
+      "exit": 0,
+      "recovery_success": 3000,
+      "recovery_max_lag_ms": 28
+    }
+  ],
+  "medians": {
+    "baseline": {
+      "split_s": 260.438,
+      "metrics": {
+        "after-mixed/read": {
+          "elapsed_s": 2.038,
+          "success": 6214,
+          "errors": 0,
+          "ops_s": 3033.7,
+          "p50_ms": 0.474,
+          "p99_ms": 13.089
+        },
+        "after-mixed/write": {
+          "elapsed_s": 2.038,
+          "success": 121,
+          "errors": 0,
+          "ops_s": 59.1,
+          "p50_ms": 46.167,
+          "p99_ms": 389.808
+        },
+        "after-read/read": {
+          "elapsed_s": 2.001,
+          "success": 42090,
+          "errors": 0,
+          "ops_s": 21038.1,
+          "p50_ms": 0.336,
+          "p99_ms": 0.851
+        },
+        "after-write/write": {
+          "elapsed_s": 2.053,
+          "success": 270,
+          "errors": 0,
+          "ops_s": 131.4,
+          "p50_ms": 58.159,
+          "p99_ms": 95.493
+        },
+        "before-mixed/read": {
+          "elapsed_s": 2.011,
+          "success": 15311,
+          "errors": 0,
+          "ops_s": 7613.9,
+          "p50_ms": 0.289,
+          "p99_ms": 4.324
+        },
+        "before-mixed/write": {
+          "elapsed_s": 2.011,
+          "success": 564,
+          "errors": 0,
+          "ops_s": 280.5,
+          "p50_ms": 13.635,
+          "p99_ms": 23.533
+        },
+        "before-read/read": {
+          "elapsed_s": 2.0,
+          "success": 54125,
+          "errors": 0,
+          "ops_s": 27059.2,
+          "p50_ms": 0.278,
+          "p99_ms": 0.636
+        },
+        "before-write/write": {
+          "elapsed_s": 2.02,
+          "success": 672,
+          "errors": 0,
+          "ops_s": 332.8,
+          "p50_ms": 24.363,
+          "p99_ms": 34.759
+        },
+        "cross-group-during/read": {
+          "elapsed_s": 260.105,
+          "success": 1843055,
+          "errors": 5754,
+          "ops_s": 7085.8,
+          "p50_ms": 0.305,
+          "p99_ms": 6.043
+        },
+        "cross-group-during/write": {
+          "elapsed_s": 260.105,
+          "success": 70728,
+          "errors": 380697,
+          "ops_s": 271.9,
+          "p50_ms": 8.997,
+          "p99_ms": 64.287
+        },
+        "migration-0/read": {
+          "elapsed_s": 0.041,
+          "success": 255,
+          "errors": 0,
+          "ops_s": 6265.3,
+          "p50_ms": 0.318,
+          "p99_ms": 4.931
+        },
+        "migration-0/write": {
+          "elapsed_s": 0.041,
+          "success": 13,
+          "errors": 0,
+          "ops_s": 319.4,
+          "p50_ms": 12.796,
+          "p99_ms": 23.177
+        },
+        "migration-1/read": {
+          "elapsed_s": 0.905,
+          "success": 6944,
+          "errors": 0,
+          "ops_s": 7674.7,
+          "p50_ms": 0.287,
+          "p99_ms": 4.412
+        },
+        "migration-1/write": {
+          "elapsed_s": 0.905,
+          "success": 264,
+          "errors": 2,
+          "ops_s": 291.8,
+          "p50_ms": 12.756,
+          "p99_ms": 21.897
+        },
+        "migration-2/read": {
+          "elapsed_s": 48.816,
+          "success": 370938,
+          "errors": 0,
+          "ops_s": 7769.7,
+          "p50_ms": 0.296,
+          "p99_ms": 4.253
+        },
+        "migration-2/write": {
+          "elapsed_s": 48.816,
+          "success": 14110,
+          "errors": 0,
+          "ops_s": 296.6,
+          "p50_ms": 12.933,
+          "p99_ms": 23.841
+        },
+        "migration-3/read": {
+          "elapsed_s": 1.103,
+          "success": 11331,
+          "errors": 0,
+          "ops_s": 10272.5,
+          "p50_ms": 0.273,
+          "p99_ms": 1.787
+        },
+        "migration-3/write": {
+          "elapsed_s": 1.103,
+          "success": 472,
+          "errors": 796,
+          "ops_s": 427.9,
+          "p50_ms": 8.272,
+          "p99_ms": 15.588
+        },
+        "migration-4/read": {
+          "elapsed_s": 48.98,
+          "success": 522751,
+          "errors": 0,
+          "ops_s": 10426.2,
+          "p50_ms": 0.297,
+          "p99_ms": 1.507
+        },
+        "migration-4/write": {
+          "elapsed_s": 48.98,
+          "success": 15694,
+          "errors": 356868,
+          "ops_s": 296.3,
+          "p50_ms": 5.789,
+          "p99_ms": 12.009
+        },
+        "migration-5/read": {
+          "elapsed_s": 3.01,
+          "success": 25747,
+          "errors": 5754,
+          "ops_s": 8847.7,
+          "p50_ms": 0.299,
+          "p99_ms": 1.51
+        },
+        "migration-5/write": {
+          "elapsed_s": 3.01,
+          "success": 996,
+          "errors": 21670,
+          "ops_s": 342.3,
+          "p50_ms": 5.929,
+          "p99_ms": 11.702
+        },
+        "migration-6/read": {
+          "elapsed_s": 99.109,
+          "success": 344160,
+          "errors": 0,
+          "ops_s": 3399.6,
+          "p50_ms": 0.496,
+          "p99_ms": 14.128
+        },
+        "migration-6/write": {
+          "elapsed_s": 99.109,
+          "success": 14733,
+          "errors": 1841,
+          "ops_s": 145.5,
+          "p50_ms": 14.717,
+          "p99_ms": 80.699
+        },
+        "migration-preflight/read": {
+          "elapsed_s": 55.957,
+          "success": 560340,
+          "errors": 0,
+          "ops_s": 10013.8,
+          "p50_ms": 0.282,
+          "p99_ms": 2.488
+        },
+        "migration-preflight/write": {
+          "elapsed_s": 55.957,
+          "success": 22558,
+          "errors": 0,
+          "ops_s": 403.1,
+          "p50_ms": 9.188,
+          "p99_ms": 18.32
+        },
+        "same-group-mixed/read": {
+          "elapsed_s": 2.016,
+          "success": 15258,
+          "errors": 0,
+          "ops_s": 7559.2,
+          "p50_ms": 0.29,
+          "p99_ms": 4.463
+        },
+        "same-group-mixed/write": {
+          "elapsed_s": 2.016,
+          "success": 563,
+          "errors": 0,
+          "ops_s": 279.3,
+          "p50_ms": 13.296,
+          "p99_ms": 23.449
+        }
+      }
+    },
+    "candidate": {
+      "split_s": 206.17,
+      "metrics": {
+        "after-mixed/read": {
+          "elapsed_s": 2.009,
+          "success": 12710,
+          "errors": 0,
+          "ops_s": 6326.2,
+          "p50_ms": 0.384,
+          "p99_ms": 3.081
+        },
+        "after-mixed/write": {
+          "elapsed_s": 2.009,
+          "success": 955,
+          "errors": 0,
+          "ops_s": 475.3,
+          "p50_ms": 8.149,
+          "p99_ms": 16.404
+        },
+        "after-read/read": {
+          "elapsed_s": 2.0,
+          "success": 42253,
+          "errors": 0,
+          "ops_s": 21119.8,
+          "p50_ms": 0.335,
+          "p99_ms": 0.822
+        },
+        "after-write/write": {
+          "elapsed_s": 2.017,
+          "success": 1098,
+          "errors": 0,
+          "ops_s": 544.4,
+          "p50_ms": 13.518,
+          "p99_ms": 24.66
+        },
+        "before-mixed/read": {
+          "elapsed_s": 2.006,
+          "success": 15504,
+          "errors": 0,
+          "ops_s": 7729.7,
+          "p50_ms": 0.29,
+          "p99_ms": 4.439
+        },
+        "before-mixed/write": {
+          "elapsed_s": 2.006,
+          "success": 603,
+          "errors": 0,
+          "ops_s": 300.6,
+          "p50_ms": 12.465,
+          "p99_ms": 24.02
+        },
+        "before-read/read": {
+          "elapsed_s": 2.0,
+          "success": 53021,
+          "errors": 0,
+          "ops_s": 26505.3,
+          "p50_ms": 0.284,
+          "p99_ms": 0.668
+        },
+        "before-write/write": {
+          "elapsed_s": 2.022,
+          "success": 640,
+          "errors": 0,
+          "ops_s": 316.2,
+          "p50_ms": 25.287,
+          "p99_ms": 37.734
+        },
+        "cross-group-during/read": {
+          "elapsed_s": 205.869,
+          "success": 1682665,
+          "errors": 6035,
+          "ops_s": 8184.1,
+          "p50_ms": 0.309,
+          "p99_ms": 3.095
+        },
+        "cross-group-during/write": {
+          "elapsed_s": 205.869,
+          "success": 83692,
+          "errors": 379337,
+          "ops_s": 407.8,
+          "p50_ms": 7.73,
+          "p99_ms": 20.436
+        },
+        "migration-0/read": {
+          "elapsed_s": 0.039,
+          "success": 212,
+          "errors": 0,
+          "ops_s": 5881.0,
+          "p50_ms": 0.339,
+          "p99_ms": 5.782
+        },
+        "migration-0/write": {
+          "elapsed_s": 0.039,
+          "success": 12,
+          "errors": 0,
+          "ops_s": 332.9,
+          "p50_ms": 14.924,
+          "p99_ms": 19.233
+        },
+        "migration-1/read": {
+          "elapsed_s": 0.702,
+          "success": 4933,
+          "errors": 0,
+          "ops_s": 7372.5,
+          "p50_ms": 0.285,
+          "p99_ms": 4.741
+        },
+        "migration-1/write": {
+          "elapsed_s": 0.702,
+          "success": 190,
+          "errors": 4,
+          "ops_s": 271.2,
+          "p50_ms": 13.515,
+          "p99_ms": 25.197
+        },
+        "migration-2/read": {
+          "elapsed_s": 46.887,
+          "success": 357484,
+          "errors": 0,
+          "ops_s": 7624.4,
+          "p50_ms": 0.298,
+          "p99_ms": 4.381
+        },
+        "migration-2/write": {
+          "elapsed_s": 46.887,
+          "success": 13707,
+          "errors": 0,
+          "ops_s": 292.3,
+          "p50_ms": 13.057,
+          "p99_ms": 24.006
+        },
+        "migration-3/read": {
+          "elapsed_s": 1.903,
+          "success": 19383,
+          "errors": 0,
+          "ops_s": 10237.3,
+          "p50_ms": 0.281,
+          "p99_ms": 1.748
+        },
+        "migration-3/write": {
+          "elapsed_s": 1.903,
+          "success": 679,
+          "errors": 7794,
+          "ops_s": 385.5,
+          "p50_ms": 7.181,
+          "p99_ms": 16.02
+        },
+        "migration-4/read": {
+          "elapsed_s": 48.898,
+          "success": 525495,
+          "errors": 0,
+          "ops_s": 10751.1,
+          "p50_ms": 0.301,
+          "p99_ms": 1.437
+        },
+        "migration-4/write": {
+          "elapsed_s": 48.898,
+          "success": 17116,
+          "errors": 355226,
+          "ops_s": 349.7,
+          "p50_ms": 5.764,
+          "p99_ms": 11.239
+        },
+        "migration-5/read": {
+          "elapsed_s": 3.007,
+          "success": 27973,
+          "errors": 6035,
+          "ops_s": 8693.6,
+          "p50_ms": 0.304,
+          "p99_ms": 1.414
+        },
+        "migration-5/write": {
+          "elapsed_s": 3.007,
+          "success": 1110,
+          "errors": 21974,
+          "ops_s": 361.8,
+          "p50_ms": 5.745,
+          "p99_ms": 10.446
+        },
+        "migration-6/read": {
+          "elapsed_s": 90.001,
+          "success": 630251,
+          "errors": 0,
+          "ops_s": 7004.6,
+          "p50_ms": 0.355,
+          "p99_ms": 2.962
+        },
+        "migration-6/write": {
+          "elapsed_s": 90.001,
+          "success": 46112,
+          "errors": 2110,
+          "ops_s": 512.5,
+          "p50_ms": 7.577,
+          "p99_ms": 15.759
+        },
+        "migration-preflight/read": {
+          "elapsed_s": 13.147,
+          "success": 118396,
+          "errors": 0,
+          "ops_s": 8999.6,
+          "p50_ms": 0.284,
+          "p99_ms": 3.362
+        },
+        "migration-preflight/write": {
+          "elapsed_s": 13.147,
+          "success": 4671,
+          "errors": 0,
+          "ops_s": 355.3,
+          "p50_ms": 10.802,
+          "p99_ms": 21.23
+        },
+        "same-group-mixed/read": {
+          "elapsed_s": 2.016,
+          "success": 16047,
+          "errors": 0,
+          "ops_s": 7957.2,
+          "p50_ms": 0.28,
+          "p99_ms": 4.328
+        },
+        "same-group-mixed/write": {
+          "elapsed_s": 2.016,
+          "success": 603,
+          "errors": 0,
+          "ops_s": 299.0,
+          "p50_ms": 12.904,
+          "p99_ms": 22.441
+        }
+      }
+    }
+  }
+}

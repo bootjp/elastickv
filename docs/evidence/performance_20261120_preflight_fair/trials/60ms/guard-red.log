@@ -1,0 +1,11 @@
+--- FAIL: TestPreflightReadsBackAlreadyAppliedGuardWithoutReproposal (0.00s)
+    split_job_preflight_schedule_test.go:105: 
+        	Error Trace:	/Users/bootjp/src/elastickv/adapter/split_job_preflight_schedule_test.go:105
+        	Error:      	Not equal: 
+        	            	expected: 1
+        	            	actual  : 2
+        	Test:       	TestPreflightReadsBackAlreadyAppliedGuardWithoutReproposal
+        	Messages:   	matching all-member guard ACKs must avoid another Raft proposal
+FAIL
+FAIL	github.com/bootjp/elastickv/adapter	0.855s
+FAIL

@@ -1,0 +1,129 @@
+{
+  "date": "2026-11-19",
+  "commit": "5ccfbc74a31f6b21aa4d631704ca922a0749c18e",
+  "hardware": {
+    "cpu": "Apple M1 Max",
+    "cpus": 10,
+    "memory_gib": 64
+  },
+  "os": "Darwin arm64",
+  "go": "go1.27.3",
+  "adapter": "gRPC RawKV",
+  "topology": {
+    "nodes": 3,
+    "groups": [
+      1,
+      2
+    ],
+    "deployment": "same process and local disk",
+    "tls": true,
+    "ingress": "fixed source-group leader endpoint"
+  },
+  "workload": {
+    "keys": 256,
+    "value_bytes": 1024,
+    "steady_phase_seconds": 2,
+    "read_only_workers": 8,
+    "write_only_workers": 8,
+    "mixed_readers": 4,
+    "mixed_writers": 4,
+    "mixed_keys": "disjoint per worker",
+    "load": "closed loop, no retry backoff",
+    "latency": "successful requests only"
+  },
+  "durability": "default FSM Sync; mode environment empty in preliminary run",
+  "tso": "existing E2E helper HLC configuration; no dedicated group 0",
+  "limitations": [
+    "Shared host has concurrent builds/tests",
+    "Preliminary run source may include concurrent working-tree changes",
+    "No production capacity claim",
+    "Constant values do not prove update ordering or linearizability"
+  ],
+  "preliminary_api": {
+    "file": "api_split_preliminary.txt",
+    "outcome": "failed: cleanup not complete by 180 seconds",
+    "read_errors": 8053,
+    "write_errors": 675624
+  },
+  "microbenchmark": {
+    "file": "microbench_preliminary.txt",
+    "count": 3,
+    "benchtime": "500ms",
+    "outcome": "passed",
+    "command": "go test ./store ./kv -run '^$' -bench 'Benchmark(ApplyMutationsRaft_SyncMode|LeaseRead|GroupLeaseRead|TSOWriteFanout|MigrationFrontierAdmission|TimestampAdmissionOwnership|LatestCandidateVersionsAt)$' -benchmem -benchtime=500ms -count=3"
+  },
+  "fixed_api": {
+    "outcome": "failed: write errors after Done",
+    "command": "ELASTICKV_PERF_SPLIT=1 go test ./internal/server -run '^TestPerformanceReadWriteSplit$' -count=1 -timeout=7m -v -cpuprofile=<local path> -o <local path>",
+    "profiling": true,
+    "file": "api_split_fixed.txt",
+    "done_ms": 226439,
+    "source_leader": 0,
+    "target_leader": 0,
+    "during_read_errors": 9348,
+    "during_write_errors": 922597,
+    "after_mixed_read_success": 31734,
+    "after_mixed_read_errors": 0,
+    "after_mixed_write_success": 74,
+    "after_mixed_write_errors": 4468,
+    "remaining_phases": "not executed because original diagnostic stopped at post-Done write errors"
+  },
+  "lint": {
+    "command": "golangci-lint run ./internal/server --timeout=5m --new-from-rev=5ccfbc74a31f6b21aa4d631704ca922a0749c18e --allow-parallel-runners --concurrency=2",
+    "result": "0 issues. (final diagnostic)"
+  },
+  "automatic_acceptance": {
+    "command": "env -u ELASTICKV_PERF_SPLIT server.test -test.run '^TestAutoSplitCrossGroupThreeNodeTwoGroupAcceptance$' -test.v -test.timeout=6m",
+    "result": "PASS",
+    "elapsed_seconds": 239.36,
+    "file": "auto_cross_group_fixed.txt",
+    "limitation": "Existing test verifies read after migration, not post-Done writes"
+  },
+  "linux": {
+    "vmid": 150,
+    "name": "elastickv-perf-20261119",
+    "node": "pve16intel",
+    "ip": "192.168.0.172",
+    "vcpu": 8,
+    "memory_gib": 8,
+    "disk_gib": 48,
+    "storage": "local-lvm",
+    "os": "Ubuntu 24.04, Linux 6.8.0-124-generic amd64",
+    "cpu": "Intel Xeon Gold 6140 @ 2.30GHz",
+    "ntp_synchronized": true,
+    "topology": "3 Raft nodes and 2 groups in one VM; physical host shared with other VMs",
+    "source_leader": 2,
+    "target_leader": 1,
+    "go": "go1.27.3",
+    "cgo_enabled": false,
+    "cpu_profile": true,
+    "api_result": "FAIL: post-Done writes have outcome-unknown errors",
+    "api_exit": 1,
+    "api_duration_seconds": 251.11,
+    "done_ms": 230983,
+    "store_result": "PASS",
+    "store_exit": 0,
+    "store_sync_ns_op_median": 2755029,
+    "store_nosync_ns_op_median": 3538,
+    "automatic_acceptance": "PASS",
+    "final_vm_state": "stopped; disk retained for reruns",
+    "hashes_file": "linux_sha256.txt",
+    "metrics_file": "api_split_linux.json",
+    "build_commands": [
+      "GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test -c -p 2 ./internal/server -o server-linux.test",
+      "GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test -c -p 2 ./store -o store-linux.test"
+    ],
+    "runner": "run_linux_perf.sh",
+    "automatic_acceptance_exit": 0,
+    "automatic_acceptance_seconds": 230.37,
+    "automatic_acceptance_file": "auto_cross_group_linux.txt",
+    "cpu_profile_file": "api_cpu_linux.pprof",
+    "vm_state_evidence": "vm_final_state.txt",
+    "post_done_write_only": {
+      "success": 865,
+      "errors": 16222,
+      "error_rate": 0.9493767191432083
+    },
+    "constant_value_check": "No additional final-key assertion failures were recorded; update ordering and lost writes were not tested"
+  }
+}

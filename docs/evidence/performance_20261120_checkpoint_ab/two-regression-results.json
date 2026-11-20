@@ -1,0 +1,18 @@
+{
+  "test_filter": "Split|MigrationQuorum|MigrationNamespace|Preflight|Oversiz",
+  "packages": {
+    "github.com/bootjp/elastickv/adapter": {
+      "top_level": 219,
+      "including_subtests": 403,
+      "status": "pass"
+    },
+    "github.com/bootjp/elastickv/distribution": {
+      "top_level": 45,
+      "including_subtests": 66,
+      "status": "pass"
+    }
+  },
+  "failures": [],
+  "race_filter": "Test(Preflight|SplitPreflight|TransferPreflight)",
+  "race_output": "ok  \tgithub.com/bootjp/elastickv/adapter\t2.772s"
+}

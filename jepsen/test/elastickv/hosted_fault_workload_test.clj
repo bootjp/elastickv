@@ -2,6 +2,7 @@
   (:require [clojure.test :refer :all]
             [cognitect.aws.client.api :as aws]
             [elastickv.cli :as cli]
+            [elastickv.filesystem-workload :as filesystem]
             [elastickv.hosted-fault-workload :as hosted]
             [jepsen.checker :as checker]
             [jepsen.client :as client]
@@ -251,3 +252,25 @@
   (doseq [value [true false]]
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"filesystem-strict option has been removed"
                          (hosted/hosted-fault-test (assoc opts :adapter :filesystem-overwrite :filesystem-strict value))))))
+
+
+(deftest filesystem-setup-with-unconfirmed-exit-is-not-retried-by-hosted-client
+  (doseq [failure [(java.io.IOException. "SSH response lost")
+                   (java.io.InterruptedIOException. "SSH interrupted")
+                   (ex-info "remote command outcome unknown" {:type "OperationOutcomeUnknown"})]]
+    (let [calls (atom 0)
+          base (:client (filesystem/filesystem-register-workload
+                          {:key-count 2 :max-retries 3 :node->mount-dir {"n1" "/mount"}}))
+          delegate (client/open! base {} "n1")]
+      (with-redefs-fn
+        {#'filesystem/remote-exec!
+         (fn [& _]
+           (if (= 1 (swap! calls inc)) (throw failure) ""))}
+        (fn []
+          (let [result (try (hosted/setup-client! delegate {})
+                            (catch Exception e e))]
+            (is (instance? clojure.lang.ExceptionInfo result))
+            (is (= :elastickv.filesystem-workload/seed-outcome-unknown (:type (ex-data result))))
+            (is (identical? failure (ex-cause result))))
+          (is (= 1 @calls))
+          (is (false? @(:setup-state base))))))))

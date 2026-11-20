@@ -1,0 +1,14 @@
+--- FAIL: TestInternalExportPageLimitDoesNotScanAheadAndResumes (0.00s)
+    --- FAIL: TestInternalExportPageLimitDoesNotScanAheadAndResumes/one-page (0.00s)
+        internal_migration_page_limit_test.go:50: 
+            	Error Trace:	/Users/bootjp/src/elastickv/adapter/internal_migration_page_limit_test.go:50
+            	Error:      	"4" is not less than or equal to "1"
+            	Test:       	TestInternalExportPageLimitDoesNotScanAheadAndResumes/one-page
+    --- FAIL: TestInternalExportPageLimitDoesNotScanAheadAndResumes/two-pages (0.00s)
+        internal_migration_page_limit_test.go:50: 
+            	Error Trace:	/Users/bootjp/src/elastickv/adapter/internal_migration_page_limit_test.go:50
+            	Error:      	"4" is not less than or equal to "2"
+            	Test:       	TestInternalExportPageLimitDoesNotScanAheadAndResumes/two-pages
+FAIL
+FAIL	github.com/bootjp/elastickv/adapter	0.834s
+FAIL

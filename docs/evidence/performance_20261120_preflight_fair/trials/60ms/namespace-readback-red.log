@@ -1,0 +1,11 @@
+--- FAIL: TestActiveNamespaceUsesFreshAllMemberReadback (0.00s)
+    split_job_namespace_readback_test.go:28: 
+        	Error Trace:	/Users/bootjp/src/elastickv/adapter/split_job_namespace_readback_test.go:28
+        	Error:      	Not equal: 
+        	            	expected: 2
+        	            	actual  : 10
+        	Test:       	TestActiveNamespaceUsesFreshAllMemberReadback
+        	Messages:   	one current activation ACK per apply member must suffice without replaying negotiation
+FAIL
+FAIL	github.com/bootjp/elastickv/adapter	0.799s
+FAIL

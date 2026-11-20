@@ -9,10 +9,14 @@ import (
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 )
 
-const namespaceProbeTimeout = 2 * time.Second
+const (
+	namespaceProbeTimeout     = 2 * time.Second
+	namespaceProbeConcurrency = 3
+)
 
 type MigrationNamespaceProbeClient interface {
 	ProbeMigrationState(context.Context, *pb.ProbeMigrationStateRequest, ...grpc.CallOption) (*pb.ProbeMigrationStateResponse, error)
@@ -43,16 +47,18 @@ func EnsureMigrationNamespaceAdmission(ctx context.Context, client SplitMigratio
 				return state, errors.WithStack(kv.ErrMigrationNamespaceProtocol)
 			}
 			peer := NamespaceAdmissionPeer{MemberID: raftengine.DeriveNodeID(member.ID), Address: member.Address, Client: member.Client}
-			response, err := probeNamespacePeer(ctx, peer, 0, false)
-			if err != nil {
-				return state, err
-			}
+			state.Members = append(state.Members, peer)
+		}
+		responses, err := probeNamespacePeers(ctx, state.Members, 0, false)
+		if err != nil {
+			return state, err
+		}
+		for _, response := range responses {
 			index := response.GetAppliedConfigurationIndex()
 			if index == 0 || (state.ConfigurationIndex != 0 && state.ConfigurationIndex != index) {
 				return state, errors.WithStack(kv.ErrMigrationNamespaceProtocol)
 			}
 			state.ConfigurationIndex = index
-			state.Members = append(state.Members, peer)
 		}
 		return state, nil
 	}
@@ -85,10 +91,8 @@ func EnsureMigrationNamespaceAdmissionWithSnapshot(ctx context.Context,
 	if err := activateNamespaceWithSnapshot(ctx, snapshot, before, activate, joining); err != nil {
 		return err
 	}
-	for _, member := range before.Members {
-		if _, err := probeNamespacePeer(ctx, member, before.ConfigurationIndex, true); err != nil {
-			return err
-		}
+	if _, err := probeNamespacePeers(ctx, before.Members, before.ConfigurationIndex, true); err != nil {
+		return err
 	}
 	return revalidateNamespaceSnapshot(ctx, snapshot, before)
 }
@@ -124,16 +128,18 @@ func namespaceNegotiation(ctx context.Context, snapshot NamespaceAdmissionSnapsh
 		if ids[member.MemberID] || addresses[member.Address] {
 			return command, false, errors.WithStack(kv.ErrMigrationNamespaceProtocol)
 		}
-		response, err := probeNamespacePeer(ctx, member, snapshot.ConfigurationIndex, false)
-		if err != nil {
-			return command, false, err
-		}
-		alreadyActive = alreadyActive && response.GetReady()
 		ids[member.MemberID], addresses[member.Address] = true, true
+	}
+	responses, err := probeNamespacePeers(ctx, snapshot.Members, snapshot.ConfigurationIndex, false)
+	if err != nil {
+		return command, false, err
+	}
+	for i, member := range snapshot.Members {
+		response := responses[i]
+		alreadyActive = alreadyActive && response.GetReady()
 		command.ApplyMembers = append(command.ApplyMembers, member.MemberID)
 		command.Members = append(command.Members, kv.NamespaceMemberCapability{MemberID: member.MemberID, Version: response.GetNamespaceAdmissionVersion(), ConfigurationIndex: snapshot.ConfigurationIndex})
 	}
-	var err error
 	command.Joining, err = probeNamespaceJoining(ctx, snapshot.ConfigurationIndex, joining, ids, addresses)
 	if err != nil {
 		return command, false, err
@@ -204,4 +210,25 @@ func revalidateNamespaceSnapshot(ctx context.Context, snapshot func(context.Cont
 		return errors.WithStack(kv.ErrMigrationNamespaceProtocol)
 	}
 	return nil
+}
+
+// Only independent read probes overlap. Activation still waits for every
+// member, and the configuration sandwich and learner checks remain unchanged.
+func probeNamespacePeers(ctx context.Context, members []NamespaceAdmissionPeer, configuration uint64, activated bool) ([]*pb.ProbeMigrationStateResponse, error) {
+	responses := make([]*pb.ProbeMigrationStateResponse, len(members))
+	group, probeCtx := errgroup.WithContext(ctx)
+	group.SetLimit(namespaceProbeConcurrency)
+	for i, member := range members {
+		group.Go(func() error {
+			response, err := probeNamespacePeer(probeCtx, member, configuration, activated)
+			if err == nil {
+				responses[i] = response
+			}
+			return err
+		})
+	}
+	if err := group.Wait(); err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return responses, nil
 }

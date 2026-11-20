@@ -1,0 +1,8 @@
+--- FAIL: TestSplitPreflightBatchThroughRunner (0.00s)
+    split_job_preflight_batch_test.go:42: 
+        	Error Trace:	/private/tmp/elastickv-preflight-comparison-20261119/source/adapter/split_job_preflight_batch_test.go:42
+        	Error:      	"6s" is not less than or equal to "5s"
+        	Test:       	TestSplitPreflightBatchThroughRunner
+FAIL
+FAIL	github.com/bootjp/elastickv/adapter	0.753s
+FAIL

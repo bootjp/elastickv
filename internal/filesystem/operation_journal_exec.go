@@ -906,6 +906,29 @@ func (j *OperationJournal) recoverOperationPair(ctx context.Context, id Operatio
 	if record.State != OperationPending {
 		return false, nil
 	}
-	_, err = j.Cancel(ctx, opID)
-	return err == nil, errors.Wrap(err, "recover pending operation")
+	return j.cancelRecoveredOperation(ctx, opID)
+}
+
+func (j *OperationJournal) cancelRecoveredOperation(ctx context.Context, opID OperationID) (bool, error) {
+	// A definitive OCC rejection did not cancel this operation. Re-read the
+	// same fenced session and operation at a fresh snapshot; never reselect an
+	// owner session or replay an unknown cancellation outcome.
+	for retry := range operationCASRetries {
+		_, err := j.Cancel(ctx, opID)
+		// Resolve confirmed this exact ID was acknowledged and retired by
+		// another recoverer. A missing row alone is not retirement evidence.
+		if errors.Is(err, ErrOperationRetired) && !errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+			return false, nil
+		}
+		if !IsWriteConflict(err) {
+			return err == nil, errors.Wrap(err, "recover pending operation")
+		}
+		if retry == operationCASRetries-1 {
+			break
+		}
+		if err = waitOperationCASRetry(ctx, retry); err != nil {
+			return false, errors.Wrap(err, "recover pending operation")
+		}
+	}
+	return false, errors.Wrap(ErrContentionLimit, "recover pending operation")
 }

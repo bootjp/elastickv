@@ -1,0 +1,550 @@
+{
+  "runs": [
+    {
+      "mode": "full",
+      "pair": 1,
+      "variant": "baseline",
+      "split_s": 204.458,
+      "exit": 0,
+      "recovery_success": 3000,
+      "preflight_versions": 8584,
+      "preflight_families": 46,
+      "preflight_lower_ms": 12999.984,
+      "preflight_upper_ms": 13020.041,
+      "recovery_max_lag_ms": 81
+    },
+    {
+      "mode": "full",
+      "pair": 1,
+      "variant": "candidate",
+      "split_s": 191.911,
+      "exit": 0,
+      "recovery_success": 3000,
+      "preflight_versions": 8690,
+      "preflight_families": 46,
+      "preflight_lower_ms": 3518.583,
+      "preflight_upper_ms": 3540.968,
+      "recovery_max_lag_ms": 625
+    },
+    {
+      "mode": "full",
+      "pair": 2,
+      "variant": "baseline",
+      "split_s": 203.809,
+      "exit": 0,
+      "recovery_success": 3000,
+      "preflight_versions": 8272,
+      "preflight_families": 46,
+      "preflight_lower_ms": 13067.798,
+      "preflight_upper_ms": 13090.031,
+      "recovery_max_lag_ms": 680
+    },
+    {
+      "mode": "full",
+      "pair": 2,
+      "variant": "candidate",
+      "split_s": 191.268,
+      "exit": 0,
+      "recovery_success": 3000,
+      "preflight_versions": 8139,
+      "preflight_families": 46,
+      "preflight_lower_ms": 3630.247,
+      "preflight_upper_ms": 3649.202,
+      "recovery_max_lag_ms": 681
+    },
+    {
+      "mode": "full",
+      "pair": 3,
+      "variant": "baseline",
+      "split_s": 205.146,
+      "exit": 0,
+      "recovery_success": 3000,
+      "preflight_versions": 8309,
+      "preflight_families": 46,
+      "preflight_lower_ms": 13007.115,
+      "preflight_upper_ms": 13030.257,
+      "recovery_max_lag_ms": 27
+    },
+    {
+      "mode": "full",
+      "pair": 3,
+      "variant": "candidate",
+      "split_s": 194.879,
+      "exit": 0,
+      "recovery_success": 3000,
+      "preflight_versions": 8904,
+      "preflight_families": 46,
+      "preflight_lower_ms": 3277.588,
+      "preflight_upper_ms": 3300.104,
+      "recovery_max_lag_ms": 25
+    }
+  ],
+  "studies": {
+    "full": {
+      "baseline": {
+        "n": 3,
+        "preflight_upper_ms": 13030.257,
+        "all_preflight_under_5s": false,
+        "metrics": {
+          "after-mixed/read": {
+            "elapsed_s": 2.019,
+            "success": 8607,
+            "errors": 0,
+            "ops_s": 4262.4,
+            "p50_ms": 0.434,
+            "p99_ms": 11.909
+          },
+          "after-mixed/write": {
+            "elapsed_s": 2.019,
+            "success": 129,
+            "errors": 0,
+            "ops_s": 63.9,
+            "p50_ms": 38.95,
+            "p99_ms": 418.775
+          },
+          "after-read/read": {
+            "elapsed_s": 2.0,
+            "success": 42628,
+            "errors": 0,
+            "ops_s": 21309.4,
+            "p50_ms": 0.333,
+            "p99_ms": 0.81
+          },
+          "after-write/write": {
+            "elapsed_s": 2.019,
+            "success": 1086,
+            "errors": 0,
+            "ops_s": 538.0,
+            "p50_ms": 13.86,
+            "p99_ms": 52.864
+          },
+          "before-mixed/read": {
+            "elapsed_s": 2.011,
+            "success": 16014,
+            "errors": 0,
+            "ops_s": 7951.3,
+            "p50_ms": 0.287,
+            "p99_ms": 4.108
+          },
+          "before-mixed/write": {
+            "elapsed_s": 2.011,
+            "success": 592,
+            "errors": 0,
+            "ops_s": 293.9,
+            "p50_ms": 13.063,
+            "p99_ms": 22.327
+          },
+          "before-read/read": {
+            "elapsed_s": 2.0,
+            "success": 52779,
+            "errors": 0,
+            "ops_s": 26384.7,
+            "p50_ms": 0.284,
+            "p99_ms": 0.661
+          },
+          "before-write/write": {
+            "elapsed_s": 2.023,
+            "success": 662,
+            "errors": 0,
+            "ops_s": 326.5,
+            "p50_ms": 24.094,
+            "p99_ms": 36.111
+          },
+          "cross-group-during/read": {
+            "elapsed_s": 204.177,
+            "success": 1596659,
+            "errors": 5877,
+            "ops_s": 7820.0,
+            "p50_ms": 0.308,
+            "p99_ms": 3.516
+          },
+          "cross-group-during/write": {
+            "elapsed_s": 204.177,
+            "success": 73822,
+            "errors": 365367,
+            "ops_s": 360.4,
+            "p50_ms": 7.893,
+            "p99_ms": 49.253
+          },
+          "migration-0/read": {
+            "elapsed_s": 0.035,
+            "success": 231,
+            "errors": 0,
+            "ops_s": 7485.8,
+            "p50_ms": 0.288,
+            "p99_ms": 4.278
+          },
+          "migration-0/write": {
+            "elapsed_s": 0.035,
+            "success": 12,
+            "errors": 0,
+            "ops_s": 363.1,
+            "p50_ms": 12.527,
+            "p99_ms": 16.796
+          },
+          "migration-1/read": {
+            "elapsed_s": 0.608,
+            "success": 4385,
+            "errors": 0,
+            "ops_s": 7712.7,
+            "p50_ms": 0.286,
+            "p99_ms": 4.296
+          },
+          "migration-1/write": {
+            "elapsed_s": 0.608,
+            "success": 165,
+            "errors": 3,
+            "ops_s": 271.4,
+            "p50_ms": 13.463,
+            "p99_ms": 24.274
+          },
+          "migration-2/read": {
+            "elapsed_s": 46.934,
+            "success": 356165,
+            "errors": 0,
+            "ops_s": 7603.1,
+            "p50_ms": 0.304,
+            "p99_ms": 3.887
+          },
+          "migration-2/write": {
+            "elapsed_s": 46.934,
+            "success": 14118,
+            "errors": 0,
+            "ops_s": 301.4,
+            "p50_ms": 12.628,
+            "p99_ms": 23.044
+          },
+          "migration-3/read": {
+            "elapsed_s": 1.002,
+            "success": 9879,
+            "errors": 0,
+            "ops_s": 9861.8,
+            "p50_ms": 0.293,
+            "p99_ms": 2.098
+          },
+          "migration-3/write": {
+            "elapsed_s": 1.002,
+            "success": 403,
+            "errors": 927,
+            "ops_s": 395.5,
+            "p50_ms": 8.971,
+            "p99_ms": 16.714
+          },
+          "migration-4/read": {
+            "elapsed_s": 46.909,
+            "success": 500043,
+            "errors": 0,
+            "ops_s": 10663.4,
+            "p50_ms": 0.302,
+            "p99_ms": 1.481
+          },
+          "migration-4/write": {
+            "elapsed_s": 46.909,
+            "success": 16535,
+            "errors": 339048,
+            "ops_s": 351.8,
+            "p50_ms": 5.812,
+            "p99_ms": 10.993
+          },
+          "migration-5/read": {
+            "elapsed_s": 3.008,
+            "success": 27612,
+            "errors": 5877,
+            "ops_s": 9186.6,
+            "p50_ms": 0.293,
+            "p99_ms": 1.39
+          },
+          "migration-5/write": {
+            "elapsed_s": 3.008,
+            "success": 1084,
+            "errors": 21915,
+            "ops_s": 360.7,
+            "p50_ms": 5.731,
+            "p99_ms": 10.74
+          },
+          "migration-6/read": {
+            "elapsed_s": 91.988,
+            "success": 549213,
+            "errors": 0,
+            "ops_s": 5964.2,
+            "p50_ms": 0.37,
+            "p99_ms": 6.098
+          },
+          "migration-6/write": {
+            "elapsed_s": 91.988,
+            "success": 36174,
+            "errors": 2147,
+            "ops_s": 392.8,
+            "p50_ms": 7.685,
+            "p99_ms": 55.185
+          },
+          "migration-preflight/read": {
+            "elapsed_s": 13.044,
+            "success": 120318,
+            "errors": 0,
+            "ops_s": 9236.6,
+            "p50_ms": 0.287,
+            "p99_ms": 3.092
+          },
+          "migration-preflight/write": {
+            "elapsed_s": 13.044,
+            "success": 4776,
+            "errors": 0,
+            "ops_s": 365.6,
+            "p50_ms": 10.472,
+            "p99_ms": 20.306
+          },
+          "same-group-mixed/read": {
+            "elapsed_s": 2.011,
+            "success": 16261,
+            "errors": 0,
+            "ops_s": 8085.9,
+            "p50_ms": 0.283,
+            "p99_ms": 3.952
+          },
+          "same-group-mixed/write": {
+            "elapsed_s": 2.011,
+            "success": 587,
+            "errors": 0,
+            "ops_s": 291.9,
+            "p50_ms": 12.86,
+            "p99_ms": 21.809
+          }
+        },
+        "split_s": 204.458
+      },
+      "candidate": {
+        "n": 3,
+        "preflight_upper_ms": 3540.968,
+        "all_preflight_under_5s": true,
+        "metrics": {
+          "after-mixed/read": {
+            "elapsed_s": 2.031,
+            "success": 6165,
+            "errors": 0,
+            "ops_s": 3035.3,
+            "p50_ms": 0.46,
+            "p99_ms": 14.773
+          },
+          "after-mixed/write": {
+            "elapsed_s": 2.031,
+            "success": 105,
+            "errors": 0,
+            "ops_s": 51.8,
+            "p50_ms": 48.55,
+            "p99_ms": 408.231
+          },
+          "after-read/read": {
+            "elapsed_s": 2.0,
+            "success": 42700,
+            "errors": 0,
+            "ops_s": 21346.8,
+            "p50_ms": 0.329,
+            "p99_ms": 0.82
+          },
+          "after-write/write": {
+            "elapsed_s": 2.052,
+            "success": 274,
+            "errors": 0,
+            "ops_s": 133.2,
+            "p50_ms": 58.359,
+            "p99_ms": 94.918
+          },
+          "before-mixed/read": {
+            "elapsed_s": 2.013,
+            "success": 14281,
+            "errors": 0,
+            "ops_s": 7093.5,
+            "p50_ms": 0.307,
+            "p99_ms": 4.105
+          },
+          "before-mixed/write": {
+            "elapsed_s": 2.013,
+            "success": 545,
+            "errors": 0,
+            "ops_s": 270.7,
+            "p50_ms": 13.781,
+            "p99_ms": 23.873
+          },
+          "before-read/read": {
+            "elapsed_s": 2.0,
+            "success": 51854,
+            "errors": 0,
+            "ops_s": 25923.1,
+            "p50_ms": 0.29,
+            "p99_ms": 0.692
+          },
+          "before-write/write": {
+            "elapsed_s": 2.022,
+            "success": 726,
+            "errors": 0,
+            "ops_s": 359.1,
+            "p50_ms": 22.466,
+            "p99_ms": 33.1
+          },
+          "cross-group-during/read": {
+            "elapsed_s": 191.666,
+            "success": 1381835,
+            "errors": 5907,
+            "ops_s": 7099.8,
+            "p50_ms": 0.312,
+            "p99_ms": 5.472
+          },
+          "cross-group-during/write": {
+            "elapsed_s": 191.666,
+            "success": 58177,
+            "errors": 370494,
+            "ops_s": 298.9,
+            "p50_ms": 8.008,
+            "p99_ms": 60.461
+          },
+          "migration-0/read": {
+            "elapsed_s": 0.044,
+            "success": 271,
+            "errors": 0,
+            "ops_s": 8508.3,
+            "p50_ms": 0.288,
+            "p99_ms": 3.548
+          },
+          "migration-0/write": {
+            "elapsed_s": 0.044,
+            "success": 14,
+            "errors": 0,
+            "ops_s": 320.9,
+            "p50_ms": 14.048,
+            "p99_ms": 19.004
+          },
+          "migration-1/read": {
+            "elapsed_s": 1.711,
+            "success": 11827,
+            "errors": 0,
+            "ops_s": 7367.0,
+            "p50_ms": 0.29,
+            "p99_ms": 4.656
+          },
+          "migration-1/write": {
+            "elapsed_s": 1.711,
+            "success": 457,
+            "errors": 4,
+            "ops_s": 267.1,
+            "p50_ms": 13.988,
+            "p99_ms": 23.586
+          },
+          "migration-2/read": {
+            "elapsed_s": 46.869,
+            "success": 361605,
+            "errors": 0,
+            "ops_s": 7715.2,
+            "p50_ms": 0.299,
+            "p99_ms": 3.885
+          },
+          "migration-2/write": {
+            "elapsed_s": 46.869,
+            "success": 14441,
+            "errors": 0,
+            "ops_s": 308.1,
+            "p50_ms": 12.371,
+            "p99_ms": 22.889
+          },
+          "migration-3/read": {
+            "elapsed_s": 0.5,
+            "success": 4739,
+            "errors": 0,
+            "ops_s": 9471.3,
+            "p50_ms": 0.294,
+            "p99_ms": 2.437
+          },
+          "migration-3/write": {
+            "elapsed_s": 0.5,
+            "success": 204,
+            "errors": 766,
+            "ops_s": 362.9,
+            "p50_ms": 8.682,
+            "p99_ms": 15.425
+          },
+          "migration-4/read": {
+            "elapsed_s": 46.909,
+            "success": 506744,
+            "errors": 0,
+            "ops_s": 10805.1,
+            "p50_ms": 0.297,
+            "p99_ms": 1.487
+          },
+          "migration-4/write": {
+            "elapsed_s": 46.909,
+            "success": 16774,
+            "errors": 344735,
+            "ops_s": 356.9,
+            "p50_ms": 5.743,
+            "p99_ms": 10.835
+          },
+          "migration-5/read": {
+            "elapsed_s": 3.006,
+            "success": 26800,
+            "errors": 5907,
+            "ops_s": 8914.0,
+            "p50_ms": 0.305,
+            "p99_ms": 1.379
+          },
+          "migration-5/write": {
+            "elapsed_s": 3.006,
+            "success": 1082,
+            "errors": 21708,
+            "ops_s": 359.9,
+            "p50_ms": 5.675,
+            "p99_ms": 10.805
+          },
+          "migration-6/read": {
+            "elapsed_s": 89.19,
+            "success": 401690,
+            "errors": 0,
+            "ops_s": 4503.7,
+            "p50_ms": 0.424,
+            "p99_ms": 11.368
+          },
+          "migration-6/write": {
+            "elapsed_s": 89.19,
+            "success": 22903,
+            "errors": 2249,
+            "ops_s": 256.8,
+            "p50_ms": 8.185,
+            "p99_ms": 67.505
+          },
+          "migration-preflight/read": {
+            "elapsed_s": 3.509,
+            "success": 28928,
+            "errors": 0,
+            "ops_s": 8414.1,
+            "p50_ms": 0.297,
+            "p99_ms": 3.343
+          },
+          "migration-preflight/write": {
+            "elapsed_s": 3.509,
+            "success": 1213,
+            "errors": 0,
+            "ops_s": 345.7,
+            "p50_ms": 11.445,
+            "p99_ms": 20.28
+          },
+          "same-group-mixed/read": {
+            "elapsed_s": 2.013,
+            "success": 14707,
+            "errors": 0,
+            "ops_s": 7316.7,
+            "p50_ms": 0.301,
+            "p99_ms": 4.205
+          },
+          "same-group-mixed/write": {
+            "elapsed_s": 2.013,
+            "success": 562,
+            "errors": 0,
+            "ops_s": 279.2,
+            "p50_ms": 13.65,
+            "p99_ms": 24.449
+          }
+        },
+        "split_s": 191.911
+      }
+    }
+  }
+}

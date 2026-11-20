@@ -21,6 +21,12 @@ fi
 max_txn_length=${JEPSEN_MAX_TXN_LENGTH:-4}
 min_cycles=${JEPSEN_MIN_FAULT_CYCLES:-1}
 repeat_faults=${JEPSEN_REPEAT_FAULTS:-false}
+recovery_time=10
+if [[ $adapter == filesystem-* ]]; then
+  # A restarted strict mount may use the full startup retry budget while its
+  # Raft leader and HLC lease recover after a kill or partition.
+  recovery_time=90
+fi
 extra_args=()
 case "$repeat_faults" in
   true) extra_args+=(--repeat-faults) ;;
@@ -102,8 +108,8 @@ docker build --build-arg "GO_VERSION=$go_version" -t "$JEPSEN_IMAGE" jepsen/dock
 "${compose[@]}" up -d --wait n1 n2 n3
 
 git rev-parse HEAD > "$artifact_dir/commit.txt"
-printf 'adapter=%s\nfault=%s\ntime-limit=%s\nfault-interval=5\nrecovery-time=10\nrate=%s\nconcurrency=%s\nkey-count=%s\nmax-writes-per-key=%s\nmax-txn-length=%s\nrepeat-faults=%s\nmin-fault-cycles=%s\n' \
-  "$adapter" "$fault" "$time_limit" "$rate" "$concurrency" "$key_count" "$max_writes" \
+printf 'adapter=%s\nfault=%s\ntime-limit=%s\nfault-interval=5\nrecovery-time=%s\nrate=%s\nconcurrency=%s\nkey-count=%s\nmax-writes-per-key=%s\nmax-txn-length=%s\nrepeat-faults=%s\nmin-fault-cycles=%s\n' \
+  "$adapter" "$fault" "$time_limit" "$recovery_time" "$rate" "$concurrency" "$key_count" "$max_writes" \
   "$max_txn_length" "$repeat_faults" "$min_cycles" > "$artifact_dir/parameters.txt"
 "${compose[@]}" config > "$artifact_dir/compose.yml"
 # These are SSH-managed nodes: --local and --host would disable the nemesis.
@@ -116,7 +122,7 @@ else
   workload=(lein run -m elastickv.hosted-fault-workload
     --adapter "$adapter" --nodes 'n1,n2,n3' --ssh-user root --ssh-key /run/jepsen-ssh/id_ed25519
     --faults "$fault" --fault-interval 5 --time-limit "$time_limit"
-    --recovery-time 10 --rate "$rate" --concurrency "$concurrency" --key-count "$key_count"
+    --recovery-time "$recovery_time" --rate "$rate" --concurrency "$concurrency" --key-count "$key_count"
     --max-writes-per-key "$max_writes" --max-txn-length "$max_txn_length"
     --min-fault-cycles "$min_cycles" "${extra_args[@]}")
 fi

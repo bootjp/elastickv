@@ -1,0 +1,75 @@
+{
+  "base_commit": "5ccfbc74a31f6b21aa4d631704ca922a0749c18e",
+  "baseline": "previous 16-page / 200ms preflight slice with normal one-second ticker and P0 route version fix",
+  "candidate": "bounded atomic checkpoint with fresh all-member guards, progress-only pacing, and preflight max_pages=1; exact constants preserved in measured sources",
+  "order": [
+    "baseline,candidate",
+    "candidate,baseline",
+    "baseline,candidate"
+  ],
+  "nodes": 3,
+  "groups": 2,
+  "source_leader": 0,
+  "target_leader": 1,
+  "keys": 256,
+  "value_bytes": 1024,
+  "GOMAXPROCS": 8,
+  "Sync": "default, environment override unset",
+  "TLS": true,
+  "Forward_auth": "production token configured",
+  "foreground": "4 readers / 4 writers, same closed-loop workload; before/after windows 2s",
+  "recovery": "5 paths x 600 unique write/readbacks/run, about 60s",
+  "timing": "same additional 10ms transition observer in both variants; existing 100ms traffic phase attribution unchanged",
+  "pilot_mode": "PREFLIGHT_ONLY explicitly unset for full comparison",
+  "candidate_sources": {
+    "adapter/distribution_server.go": "ac63a98bf30a5f03ed00e5496598bb52f9d5f9ad9a68c262c5b921783698aafa",
+    "adapter/split_job_runner.go": "dc64bcdcac11bac0c1350da6e1474dac51d8c01216b2a8f1ecf1fb4f26c6f14f",
+    "adapter/split_job_transfer_preflight.go": "b9b024aa2d342a540beba45d25a65ead2e2daefd131de1fc26938dbf44a98bde",
+    "adapter/split_job_preflight_schedule.go": "69cd81a33699b9323c4062a11aeb8c9c0819c794f2efb21b225b12bb8fbd8a17",
+    "adapter/split_job_preflight_checkpoint.go": "574fb39e99aada0c5222cf016b8bfe65f8a7c1398e57cdbb8f3ccde5f93683f8",
+    "adapter/split_job_transfer_admission.go": "71c57dd22d73c9074e7c607e51f00c4724be07b6b5eca4d66f9b79b284a8b74d",
+    "adapter/split_job_transfer_phase.go": "22306b8595d1faf86f2c48a3bb376a8903e8002a4a9f3742fae4d93a6d756fae",
+    "adapter/migration_namespace_activation.go": "eee76d65124f5404b00e3766ae8da3496fe7e47747e328a0e56d1451cb9b0bbc",
+    "adapter/split_job_namespace.go": "0418467e9590538458368f98ad6108e56440a9fc326f91547306d45d9a121277",
+    "distribution/catalog.go": "df1f5b4269df202ac9d9dcd8e333e980dbe94927c1dd166797649f9bb0ae3a71",
+    "adapter/internal.go": "5a349bb8bed6fec22f02866446dfb269edfac8195433846e878453b6c09f5e8d",
+    "proto/internal.pb.go": "6015e5ced0e89d54eba57cc801d870836cf2f9ed158e3641cec3dfbb2ea932f3",
+    "kv/migration_namespace_activation.go": "16b332138dbf37093a79420383b803360a95a3fb667a508da84dbca716a4cdd0",
+    "adapter/internal_migration_namespace.go": "25bdb503d929d8c3a66b30c77d492757a8602b0abd27250bea08728b2b598278",
+    "proto/internal.proto": "9eac9635be01158ee98b22e10218ead5d5308da87121ad58a1ff260948ccd9c2"
+  },
+  "common_sources": {
+    "kv/sharded_coordinator.go": "e918b67c048d3340499503db1f9e0d2c1ec5c13a13d9bb4d9812c596b4e9efd7",
+    "kv/sharded_coordinator_migration_version.go": "74d52997788bd199f2637b1b8a706583a69c52e25c28a155416bd72c5a6436e7",
+    "internal/server/performance_split_timing_test.go": "ad6dbfb96a9fc2f432e5e68467d0a7e9563b2644cdc36917df98f93091766d2a",
+    "internal/server/performance_split_test.go": "398b86c69a82f64eccb625e0d4de9025b95c04192e583856567fe5a871b31e94",
+    "internal/server/performance_split_comparison_test.go": "f35241e6cc6ef18bede38c7c2b3e0e82b3e1a37f05d8b8c0ec2dddde32498ea7",
+    "internal/server/performance_split_recovery_test.go": "6bdc3811b9c8a369cc8bce446d26633d2781f384afbace09a68151f4bfcd44bc",
+    "go.mod": "f159f0e9aa2b346925bd573cf8eb8fde7e4ce30a5316391d557b77a932250773",
+    "go.sum": "7e35b578dfe401515df57200a4bc064506dd74d1a5a8f17066b16ddd56025341"
+  },
+  "baseline_sources": {
+    "adapter/split_job_runner.go": "70abcb0ab6667e89f305656505a61996495c2064209aa8c99cb19bb821ef8919",
+    "adapter/split_job_transfer_preflight.go": "1ae2ad210fe29df06b1a1a1e94e10722a3ac45fa911716b8681ce3c4a0b8179e"
+  },
+  "binaries": {
+    "baseline.test": "50b5ffcb0ddfb03591102cbf57ca3e3a40e8da483f1c6e148fea8a53f698b438",
+    "candidate.test": "44980ff79533ab474ed49752774d2d9735b277895f03bd964b145b7b0f574999"
+  },
+  "test_sources": {},
+  "studies": {
+    "prefix": {
+      "pairs": 3,
+      "order": "AB/BA/AB",
+      "stops": "durable preflight completion"
+    },
+    "full": {
+      "pairs": 1,
+      "order": "AB",
+      "stops": "Done plus 5 x 600 recovery writes and canonical-owner readback"
+    }
+  },
+  "go": "go1.27.3 darwin/arm64 cross-compiling linux/amd64 CGO_ENABLED=0",
+  "stopped_reason": "replaced by equivalent helper extraction required by cyclop lint before final comparison",
+  "completed_runs": 2
+}

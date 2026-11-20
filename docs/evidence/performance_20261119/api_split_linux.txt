@@ -1,0 +1,26 @@
+    performance_split_test.go:55: PERF topology nodes=3 groups=2 source_leader=2 target_leader=1 fsm_sync_mode=""
+    performance_split_test.go:75: PERF phase=before-read write=false elapsed_s=2.000 success=57939 errors=0 ops_s=28967.8 p50_ms=0.260 p99_ms=0.599 first_error=<nil>
+    performance_split_test.go:75: PERF phase=before-write write=true elapsed_s=2.023 success=625 errors=0 ops_s=308.9 p50_ms=25.762 p99_ms=37.012 first_error=<nil>
+    performance_split_test.go:75: PERF phase=before-mixed write=false elapsed_s=2.018 success=16149 errors=0 ops_s=8001.2 p50_ms=0.270 p99_ms=4.297 first_error=<nil>
+    performance_split_test.go:75: PERF phase=before-mixed write=true elapsed_s=2.018 success=560 errors=0 ops_s=277.5 p50_ms=13.787 p99_ms=24.143 first_error=<nil>
+    performance_split_test.go:89: PERF same-group catalog_commit_ms=17.074
+    performance_split_test.go:75: PERF phase=same-group-mixed write=false elapsed_s=2.021 success=15251 errors=0 ops_s=7547.3 p50_ms=0.274 p99_ms=4.863 first_error=<nil>
+    performance_split_test.go:75: PERF phase=same-group-mixed write=true elapsed_s=2.021 success=524 errors=0 ops_s=259.3 p50_ms=14.425 p99_ms=27.605 first_error=<nil>
+    performance_split_test.go:107: PERF migration elapsed_ms=29 phase=1 last_error=""
+    performance_split_test.go:107: PERF migration elapsed_ms=2037 phase=2 last_error=""
+    performance_split_test.go:107: PERF migration elapsed_ms=49014 phase=3 last_error=""
+    performance_split_test.go:107: PERF migration elapsed_ms=99008 phase=4 last_error=""
+    performance_split_test.go:107: PERF migration elapsed_ms=145999 phase=5 last_error=""
+    performance_split_test.go:107: PERF migration elapsed_ms=149908 phase=6 last_error=""
+    performance_split_test.go:107: PERF migration elapsed_ms=230983 phase=7 last_error=""
+    performance_split_test.go:98: PERF phase=cross-group-during write=false elapsed_s=230.993 success=2192320 errors=12143 ops_s=9490.9 p50_ms=0.296 p99_ms=2.491 first_error=rpc error: code = Unknown desc = route cutover pending
+    performance_split_test.go:98: PERF phase=cross-group-during write=true elapsed_s=230.993 success=69273 errors=731824 ops_s=299.9 p50_ms=6.188 p99_ms=15.498 first_error=rpc error: code = Unknown desc = Operation outcome unknown
+    performance_split_test.go:113: PERF cross-group done_ms=231373
+    performance_split_test.go:75: PERF phase=after-mixed write=false elapsed_s=2.004 success=18475 errors=0 ops_s=9218.8 p50_ms=0.348 p99_ms=1.538 first_error=<nil>
+    performance_split_test.go:75: PERF phase=after-mixed write=true elapsed_s=2.004 success=682 errors=7810 ops_s=340.3 p50_ms=6.170 p99_ms=10.967 first_error=rpc error: code = Unknown desc = Operation outcome unknown
+    performance_split_test.go:75: after-mixed write=true errors=7810: rpc error: code = Unknown desc = Operation outcome unknown
+    performance_split_test.go:75: PERF phase=after-read write=false elapsed_s=2.000 success=41879 errors=0 ops_s=20934.7 p50_ms=0.341 p99_ms=0.815 first_error=<nil>
+    performance_split_test.go:75: PERF phase=after-write write=true elapsed_s=2.009 success=865 errors=16222 ops_s=430.5 p50_ms=8.828 p99_ms=15.428 first_error=rpc error: code = Unknown desc = Operation outcome unknown
+    performance_split_test.go:75: after-write write=true errors=16222: rpc error: code = Unknown desc = Operation outcome unknown
+--- FAIL: TestPerformanceReadWriteSplit (251.11s)
+FAIL

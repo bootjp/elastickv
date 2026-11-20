@@ -1,0 +1,28 @@
+{
+  "source_and_binary_provenance": "verified",
+  "workspace_matches_measured_sources": false,
+  "workspace_source_mismatches": [
+    "adapter/distribution_server.go",
+    "adapter/internal.go",
+    "proto/internal.pb.go",
+    "proto/internal.proto"
+  ],
+  "prefix_runs": 0,
+  "full_runs": 6,
+  "recovery_success": 18000,
+  "candidate_all_preflight_upper_under_5s": true,
+  "foreground_delta_pct": {
+    "full": {
+      "read": {
+        "p99_ms": 8.117723156532985,
+        "ops_s": -8.904791806508882
+      },
+      "write": {
+        "p99_ms": -0.1280409731113985,
+        "ops_s": -5.443107221006571
+      }
+    }
+  },
+  "formal_adoption_gate_evaluated": false,
+  "limitation": "three closed-loop full pairs; no planned-arrival latency or failure-injection campaign"
+}

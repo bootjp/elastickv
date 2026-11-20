@@ -223,3 +223,17 @@
                          (db/db {:filesystem-strict value})))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"filesystem-strict option has been removed"
                          (db/server-args {:filesystem-mount "/mount" :filesystem-strict value})))))
+
+(deftest fuse-mount-readiness-outlasts-session-registration
+  (let [prefix (str "mount_ticks=0; "
+                    "seq() { n=$1; while [ \"$n\" -le \"$2\" ]; do echo \"$n\"; n=$((n+1)); done; }; "
+                    "sleep() { mount_ticks=$((mount_ticks+1)); }; "
+                    "tail() { echo 'fixture startup diagnostics' >&2; }; ")
+        command (#'db/wait-for-mount-cmd awkward-dir)
+        recovered (sh/sh "sh" "-c" (str prefix
+                      "mountpoint() { [ \"$mount_ticks\" -ge 75 ]; }; " command))
+        unavailable (sh/sh "sh" "-c" (str prefix "mountpoint() { return 1; }; " command))]
+    (is (zero? (:exit recovered)) "session registration may recover after the old 60-second wait")
+    (is (empty? (:err recovered)))
+    (is (= 1 (:exit unavailable)))
+    (is (str/includes? (:err unavailable) "fixture startup diagnostics"))))

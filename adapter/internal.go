@@ -366,6 +366,13 @@ func (i *Internal) ProbeMigrationState(ctx context.Context, req *pb.ProbeMigrati
 	if req == nil || req.GetJobId() == 0 {
 		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "migration probe job_id is required"))
 	}
+	// A control read from an old configuration must never be stamped with a
+	// newer configuration after the store read completes.
+	configurationBoundControl := req.GetRequireConfigurationIndex() && req.GetKind() == pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_CONTROL_APPLIED
+	var controlConfiguration uint64
+	if configurationBoundControl {
+		controlConfiguration = i.migrationAppliedConfigurationIndex()
+	}
 	resp, err := i.probeMigrationStateKind(ctx, req)
 	if err != nil {
 		return nil, err
@@ -373,10 +380,16 @@ func (i *Internal) ProbeMigrationState(ctx context.Context, req *pb.ProbeMigrati
 	resp.NamespaceAdmissionVersion = i.migrationNamespaceProtocolVersion()
 	i.decorateMigrationTransferCapability(req, resp)
 	i.bindMigrationProbeConfiguration(req, resp)
+	if configurationBoundControl && (controlConfiguration == 0 || controlConfiguration != resp.GetAppliedConfigurationIndex()) {
+		resp.Ready = false
+	}
 	return resp, nil
 }
 
 func (i *Internal) decorateMigrationTransferCapability(req *pb.ProbeMigrationStateRequest, resp *pb.ProbeMigrationStateResponse) {
+	if req.GetKind() == pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_NAMESPACE_ADMISSION {
+		resp.OwnershipPartitionProtocol = i.implementedPartitionProtocol()
+	}
 	if i.MigrationTransferSizeGuardSupported() {
 		resp.TransferSizeGuardVersion = store.MigrationTransferSizeGuardVersion
 	}
@@ -387,18 +400,36 @@ func (i *Internal) decorateMigrationTransferCapability(req *pb.ProbeMigrationSta
 }
 
 func (i *Internal) bindMigrationProbeConfiguration(req *pb.ProbeMigrationStateRequest, resp *pb.ProbeMigrationStateResponse) {
-	if !req.GetRequireConfigurationIndex() {
+	namespace := req.GetKind() == pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_NAMESPACE_ADMISSION
+	if !req.GetRequireConfigurationIndex() && !namespace {
 		return
 	}
+	index := i.migrationAppliedConfigurationIndex()
+	ready := resp.GetReady() && migrationProbeConfigurationMatches(req, resp, index)
+	resp.AppliedConfigurationIndex = index
+	resp.Ready = ready
+}
+
+func (i *Internal) migrationAppliedConfigurationIndex() uint64 {
 	reader, supported := i.leader.(raftengine.AppliedConfigurationReader)
 	if !supported {
-		resp.Ready = false
-		return
+		return 0
 	}
 	index, supported := reader.AppliedConfigurationIndex()
-	resp.AppliedConfigurationIndex = index
-	resp.Ready = resp.GetReady() && supported && index != 0 &&
-		(req.GetExpectedConfigurationIndex() == 0 || req.GetExpectedConfigurationIndex() == index)
+	if !supported {
+		return 0
+	}
+	return index
+}
+
+func migrationProbeConfigurationMatches(req *pb.ProbeMigrationStateRequest, resp *pb.ProbeMigrationStateResponse, index uint64) bool {
+	if index == 0 {
+		return false
+	}
+	if req.GetKind() == pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_NAMESPACE_ADMISSION && resp.GetAppliedConfigurationIndex() != index {
+		return false
+	}
+	return !req.GetRequireConfigurationIndex() || req.GetExpectedConfigurationIndex() == 0 || req.GetExpectedConfigurationIndex() == index
 }
 
 func (i *Internal) probeMigrationStateKind(ctx context.Context, req *pb.ProbeMigrationStateRequest) (*pb.ProbeMigrationStateResponse, error) {
@@ -538,15 +569,39 @@ func (i *Internal) probeMigrationControl(ctx context.Context, req *pb.ProbeMigra
 }
 
 func migrationControlMatches(state store.TargetStagedReadinessState, req *pb.ProbeMigrationStateRequest) bool {
-	return state.Armed &&
+	return state.Armed && state.JobID == req.GetJobId() &&
 		bytes.Equal(state.RouteStart, req.GetRouteStart()) &&
 		bytes.Equal(state.RouteEnd, normalizeOptionalEnd(req.GetRouteEnd())) &&
 		state.ExpectedCutoverVersion == req.GetExpectedCatalogVersion() &&
 		state.MigrationJobID == req.GetMigrationJobId() &&
-		state.MinWriteTSExclusive == req.GetMinWriteTsExclusive() &&
-		migrationControlModesMatch(state, req) &&
-		(req.GetTransferSizeGuardVersion() == 0 || state.TransferSizeGuardVersion == req.GetTransferSizeGuardVersion()) &&
-		state.RetentionPinTS == req.GetRetentionPinTs()
+		migrationControlProtectionMatches(state, req) &&
+		(req.GetTransferSizeGuardVersion() == 0 || state.TransferSizeGuardVersion == req.GetTransferSizeGuardVersion())
+}
+
+// Source controls merge monotonically in the FSM. A resumed runner must
+// acknowledge at least its requested protection, without trying to remove a
+// fail-closed fence. Target/disarm and pin-release probes remain exact.
+func migrationControlProtectionMatches(state store.TargetStagedReadinessState, req *pb.ProbeMigrationStateRequest) bool {
+	if state.MinWriteTSExclusive == req.GetMinWriteTsExclusive() && state.RetentionPinTS == req.GetRetentionPinTs() && migrationControlModesMatch(state, req) {
+		return true
+	}
+	if !migrationSourceProtectionRequested(req) {
+		return false
+	}
+	return state.MinWriteTSExclusive >= req.GetMinWriteTsExclusive() &&
+		state.RetentionPinTS != 0 && state.RetentionPinTS <= req.GetRetentionPinTs() &&
+		migrationControlModesDominate(state, req)
+}
+
+func migrationSourceProtectionRequested(req *pb.ProbeMigrationStateRequest) bool {
+	return req.GetMigrationJobId() != 0 && req.GetRetentionPinTs() != 0 && req.GetRetentionPinTs() != ^uint64(0) &&
+		(req.GetTrackWrites() || req.GetSourceWriteFence() || req.GetSourceReadFence())
+}
+
+func migrationControlModesDominate(state store.TargetStagedReadinessState, req *pb.ProbeMigrationStateRequest) bool {
+	return (!req.GetSourceWriteFence() || state.SourceWriteFence) &&
+		(!req.GetSourceReadFence() || state.SourceReadFence) &&
+		(!req.GetTrackWrites() || state.TrackWrites)
 }
 
 func migrationControlModesMatch(state store.TargetStagedReadinessState, req *pb.ProbeMigrationStateRequest) bool {
@@ -815,7 +870,7 @@ func exportRangeVersionsRequestRouteUnbounded(req *pb.ExportRangeVersionsRequest
 
 func (i *Internal) streamExportRangeVersions(req *pb.ExportRangeVersionsRequest, stream pb.Internal_ExportRangeVersionsServer) error {
 	opts := i.exportRangeVersionsOptions(req)
-	for {
+	for pages := uint32(1); ; pages++ {
 		result, err := i.store.ExportVersions(stream.Context(), opts)
 		if err != nil {
 			return errors.WithStack(err)
@@ -834,7 +889,9 @@ func (i *Internal) streamExportRangeVersions(req *pb.ExportRangeVersionsRequest,
 		if err := stream.Send(resp); err != nil {
 			return errors.WithStack(err)
 		}
-		if result.Done {
+		// A caller that checkpoints one page must not trigger another scan
+		// while cancelling this stream. Preserve the resumable cursor/Done.
+		if result.Done || (req.GetMaxPages() != 0 && pages >= req.GetMaxPages()) {
 			return nil
 		}
 		opts.Cursor = result.NextCursor

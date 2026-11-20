@@ -127,7 +127,11 @@
                              (or (:queue-name opts)
                                  (str "jepsen-standard-" (java.util.UUID/randomUUID)))
                              (atom 0) nil (atom nil) (PendingDeletes. (atom {})))
-   :generator (gen/mix [(gen/repeat {:f :send}) (gen/repeat {:f :recv})])
+   :generator (gen/phases
+                ;; Keep short smoke runs from spending their entire main phase
+                ;; on serialized empty-queue polls before any send is issued.
+                (gen/once {:f :send})
+                (gen/mix [(gen/repeat {:f :send}) (gen/repeat {:f :recv})]))
    :checker (standard-checker)})
 
 (defn elastickv-sqs-test

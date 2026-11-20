@@ -1,0 +1,29 @@
+File: server-linux.test
+Build ID: 025ea163a0dce47d954f0b52a9d46bd844bd2617
+Type: cpu
+Time: 2026-11-19 18:11:12 JST
+Duration: 251.11s, Total samples = 1105.65s (440.30%)
+Showing nodes accounting for 266.49s, 24.10% of 1105.65s total
+Dropped 3276 nodes (cum <= 5.53s)
+Showing top 20 nodes out of 380
+      flat  flat%   sum%        cum   cum%
+     0.42s 0.038% 0.038%    337.94s 30.56%  google.golang.org/grpc.(*Server).serveStreams.func2.1
+     0.41s 0.037% 0.075%    336.94s 30.47%  google.golang.org/grpc.(*Server).handleStream
+     1.28s  0.12%  0.19%    333.48s 30.16%  google.golang.org/grpc.(*Server).processRPC
+     0.52s 0.047%  0.24%    295.39s 26.72%  google.golang.org/grpc.(*Server).wrapUnaryHandler.func1
+   255.81s 23.14% 23.37%    255.81s 23.14%  internal/runtime/syscall/linux.Syscall6
+     1.26s  0.11% 23.49%    238.65s 21.58%  google.golang.org/grpc/internal/transport.(*loopyWriter).run
+     0.31s 0.028% 23.52%    231.83s 20.97%  syscall.Syscall
+     0.39s 0.035% 23.55%    228.44s 20.66%  google.golang.org/grpc.chainUnaryInterceptors.func1
+     0.42s 0.038% 23.59%    227.44s 20.57%  github.com/bootjp/elastickv/adapter.SplitMigrationTokenAuth.func3
+     0.53s 0.048% 23.64%       227s 20.53%  syscall.RawSyscall6
+     0.72s 0.065% 23.70%    226.37s 20.47%  github.com/bootjp/elastickv/adapter.bearerTokenAuth.func2
+     0.25s 0.023% 23.73%    222.98s 20.17%  google.golang.org/grpc.getChainUnaryHandler.func1
+     0.23s 0.021% 23.75%    222.73s 20.14%  github.com/bootjp/elastickv/adapter.NewMigrationCoverageUnaryGate.func1
+     0.49s 0.044% 23.79%    222.50s 20.12%  github.com/bootjp/elastickv/adapter.MigrationCoverageUnaryGate
+     0.03s 0.0027% 23.79%    215.67s 19.51%  internal/poll.ignoringEINTRIO (inline)
+     0.16s 0.014% 23.81%    188.65s 17.06%  github.com/bootjp/elastickv/proto._RawKV_RawGet_Handler
+     0.15s 0.014% 23.82%    165.22s 14.94%  google.golang.org/grpc/internal/transport.(*bufWriter).Flush
+     0.73s 0.066% 23.89%    164.32s 14.86%  google.golang.org/grpc/internal/transport.(*bufWriter).flushKeepBuffer
+     1.42s  0.13% 24.02%    162.81s 14.73%  crypto/tls.(*Conn).Write
+     0.96s 0.087% 24.10%    159.08s 14.39%  crypto/tls.(*Conn).writeRecordLocked
