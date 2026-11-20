@@ -7,7 +7,7 @@ test:
 	go test -v -race ./...
 
 lean-check:
-	cd lean && lean -DwarningAsError=true MVCCHistory.lean
+	cd lean && for proof in *.lean; do lean -DwarningAsError=true "$$proof" || exit 1; done
 
 run:
 	go run cmd/server/demo.go

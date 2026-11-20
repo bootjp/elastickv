@@ -49,7 +49,7 @@ func TestSingleShardTxnRequiresNonNilDecision(t *testing.T) {
 	t.Parallel()
 	coord := &ShardedCoordinator{groups: map[uint64]*ShardGroup{1: {Txn: nilDecisionTransactional{}}}}
 	_, err := coord.dispatchSingleShardTxn(context.Background(), 10, 20, 0, []byte("primary"), 1,
-		[]*Elem[OP]{{Op: Put, Key: []byte("primary"), Value: []byte("value")}}, nil, 0, nil)
+		[]*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("primary"), Value: []byte("value")}}, nil, 0, nil)
 	require.ErrorIs(t, err, ErrTransactionOutcomeUnknown)
 }
 

@@ -246,39 +246,23 @@ func (s RouteHistorySnapshot) Version() uint64 { return s.version }
 // Engine.GetRoute's right-half-open interval semantics but against
 // the historical snapshot, not the live engine state.
 //
-// Routes are sorted by Start (recordHistorySnapshotLocked clones from
-// e.routes, which Engine.UpdateRoute / routesFromCatalog keep sorted),
-// so the scan can break the moment key < r.Start — every later route
-// has a strictly greater Start and cannot cover key either.  This
-// matters because M3 puts OwnerOf on every txn commit's apply path
-// (claude review on PR #894 — break-vs-continue lifts the worst-case
-// scan from O(N) to "first non-covering gap" without changing the
-// resolution semantics).
+// Catalog snapshots have ordered, disjoint ranges, so only the predecessor
+// of the first Start greater than key can cover it.
 func (s RouteHistorySnapshot) OwnerOf(key []byte) (uint64, bool) {
-	for _, r := range s.routes {
-		if bytes.Compare(key, r.Start) < 0 {
-			break
-		}
-		if r.End != nil && bytes.Compare(key, r.End) >= 0 {
-			continue
-		}
-		return r.GroupID, true
+	i := routeIndex(s.routes, key)
+	if i < 0 {
+		return 0, false
 	}
-	return 0, false
+	return s.routes[i].GroupID, true
 }
 
 // RouteOf returns the route that covered key at this snapshot's version.
 func (s RouteHistorySnapshot) RouteOf(key []byte) (Route, bool) {
-	for _, r := range s.routes {
-		if bytes.Compare(key, r.Start) < 0 {
-			break
-		}
-		if r.End != nil && bytes.Compare(key, r.End) >= 0 {
-			continue
-		}
-		return cloneRoute(r), true
+	i := routeIndex(s.routes, key)
+	if i < 0 {
+		return Route{}, false
 	}
-	return Route{}, false
+	return cloneRoute(s.routes[i]), true
 }
 
 // IntersectingRoutes returns every route whose range intersects [start, end)
@@ -435,8 +419,8 @@ func (e *Engine) UpdateRoute(start, end []byte, group uint64) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.routes = append(e.routes, Route{
-		Start:   start,
-		End:     end,
+		Start:   CloneBytes(start),
+		End:     CloneBytes(end),
 		GroupID: group,
 		State:   RouteStateActive,
 	})
@@ -456,7 +440,7 @@ func (e *Engine) GetRoute(key []byte) (Route, bool) {
 func (e *Engine) GetRouteWithVersion(key []byte) (Route, uint64, bool) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	idx := e.routeIndex(key)
+	idx := routeIndex(e.routes, key)
 	if idx < 0 {
 		return Route{}, e.catalogVersion, false
 	}
@@ -497,7 +481,7 @@ func (e *Engine) ResolveRoutesWithVersion(queries ...RouteQuery) ([][]Route, uin
 }
 
 func (e *Engine) exactRouteLocked(key []byte) []Route {
-	idx := e.routeIndex(key)
+	idx := routeIndex(e.routes, key)
 	if idx < 0 {
 		return nil
 	}
@@ -597,18 +581,21 @@ func cloneRoute(r Route) Route {
 	}
 }
 
-func (e *Engine) routeIndex(key []byte) int {
-	if len(e.routes) == 0 {
-		return -1
+func routeIndex(routes []Route, key []byte) int {
+	i := 0
+	if len(routes) == 1 {
+		if bytes.Compare(key, routes[0].Start) < 0 {
+			return -1
+		}
+	} else {
+		i = sort.Search(len(routes), func(i int) bool {
+			return bytes.Compare(routes[i].Start, key) > 0
+		}) - 1
+		if i < 0 {
+			return -1
+		}
 	}
-	i := sort.Search(len(e.routes), func(i int) bool {
-		return bytes.Compare(e.routes[i].Start, key) > 0
-	})
-	if i == 0 {
-		return -1
-	}
-	i--
-	if end := e.routes[i].End; end != nil && bytes.Compare(key, end) >= 0 {
+	if end := routes[i].End; end != nil && bytes.Compare(key, end) >= 0 {
 		return -1
 	}
 	return i

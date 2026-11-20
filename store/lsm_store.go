@@ -1697,10 +1697,14 @@ func appendScanKeyResult(result [][]byte, seen map[string]struct{}, key []byte, 
 	keyCopy := make([]byte, len(key))
 	copy(keyCopy, key)
 	seen[string(keyCopy)] = struct{}{}
+	n := len(result)
 	result = append(result, keyCopy)
-	sort.Slice(result, func(i, j int) bool {
-		return bytes.Compare(result[i], result[j]) < 0
-	})
+	// The retained keys are sorted. A late prefix can precede the previous tail.
+	if n > 0 && bytes.Compare(result[n-1], keyCopy) > 0 {
+		sort.Slice(result, func(i, j int) bool {
+			return bytes.Compare(result[i], result[j]) < 0
+		})
+	}
 	for len(result) > limit {
 		delete(seen, string(result[len(result)-1]))
 		result = result[:len(result)-1]

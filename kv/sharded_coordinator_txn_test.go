@@ -1826,3 +1826,87 @@ func TestShardedCoordinatorFloorPrecheckSkipsResolverOwnedKeys(t *testing.T) {
 		c.rejectWriteTimestampFloorPointKey([]byte("ordinary-key"), 100),
 		ErrRouteWriteTimestampTooLow)
 }
+
+func TestShardedCoordinatorOnePhaseRoutedPayload(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		commitTS uint64
+	}{
+		{name: "coordinator-stamped", commitTS: 30},
+		{name: "leader-stamped"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			engine := distribution.NewEngine()
+			engine.UpdateRoute(nil, []byte("m"), 1)
+			engine.UpdateRoute([]byte("m"), nil, 2)
+			writer := &recordingTransactional{responses: []*TransactionResponse{{CommitIndex: 7, CommitTS: 30}}}
+			unused := &recordingTransactional{}
+			coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+				1: {Txn: writer}, 2: {Txn: unused},
+			}, 1, NewHLC(), nil)
+			defer coord.Close()
+
+			// The journal may pin a receipt to the effect's participant. Keep
+			// the selected primary and every repeated write in caller order.
+			value := make([]byte, 1+commitTSPatchLen)
+			req := &OperationGroup[OP]{
+				IsTxn: true, StartTS: 10, CommitTS: tc.commitTS, PrevCommitTS: 21,
+				PrimaryKey: []byte("receipt"), ObservedRouteVersion: 3,
+				ReadKeys: [][]byte{[]byte("b"), []byte("b")},
+				Elems: []*Elem[OP]{
+					{Op: Put, Key: []byte("b"), Value: []byte("first")},
+					{Op: Del, Key: []byte("b")},
+					{Op: Put, Key: []byte("receipt"), GroupID: 1, Value: value, CommitTSValueOffset: 1},
+					{Op: Put, Key: []byte("b"), Value: []byte("last"), RequireGroupMatch: true, ExpectedGroupID: 1},
+				},
+			}
+			want := onePhaseTxnRequestWithPrevCommit(req.StartTS, req.CommitTS, req.PrevCommitTS, req.PrimaryKey, req.Elems, req.ReadKeys, req.ObservedRouteVersion, [][]byte{[]byte("receipt")})
+			resp, err := DispatchWithLeaderIssuedCommitTS(t.Context(), coord, req)
+			require.NoError(t, err)
+			require.Equal(t, uint64(30), resp.CommitTS)
+			require.Equal(t, uint64(7), resp.CommitIndex)
+			require.Len(t, writer.requests, 1)
+			require.True(t, proto.Equal(want, writer.requests[0]), "got %v, want %v", writer.requests[0], want)
+			require.Empty(t, unused.requests)
+			require.Equal(t, make([]byte, len(value)), value, "a retry still owns its unpatched input")
+			require.Equal(t, uint64(1), req.Elems[2].CommitTSValueOffset)
+		})
+	}
+}
+
+func TestShardedCoordinatorOneWriterRequiresRemoteReadValidation(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		remote *ShardGroup
+		want   error
+	}{
+		{name: "missing group", want: ErrInvalidRequest},
+		{name: "missing store", remote: &ShardGroup{Engine: newStubLeaderEngine()}, want: ErrInvalidRequest},
+		{name: "newer remote version", remote: &ShardGroup{Engine: newStubLeaderEngine(),
+			Store: &stubMVCCStore{latestTS: map[string]uint64{"y": 11}}}, want: store.ErrWriteConflict},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			engine := distribution.NewEngine()
+			engine.UpdateRoute(nil, []byte("m"), 1)
+			engine.UpdateRoute([]byte("m"), nil, 2)
+			writer := &recordingTransactional{}
+			groups := map[uint64]*ShardGroup{1: {Txn: writer}}
+			if tc.remote != nil {
+				groups[2] = tc.remote
+			}
+			coord := NewShardedCoordinator(engine, groups, 1, NewHLC(), nil)
+			defer coord.Close()
+			resp, err := coord.Dispatch(t.Context(), &OperationGroup[OP]{
+				IsTxn: true, StartTS: 10, CommitTS: 20, ReadKeys: [][]byte{[]byte("y")},
+				Elems: []*Elem[OP]{{Op: Put, Key: []byte("b"), Value: []byte("stale")}},
+			})
+			require.ErrorIs(t, err, tc.want)
+			require.Nil(t, resp)
+			require.Len(t, writer.requests, 2)
+			require.Equal(t, pb.Phase_PREPARE, writer.requests[0].Phase)
+			require.Equal(t, pb.Phase_ABORT, writer.requests[1].Phase)
+		})
+	}
+}

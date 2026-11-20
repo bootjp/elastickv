@@ -3,6 +3,7 @@ package kv
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -11,6 +12,8 @@ import (
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func TestShardStoreCommittedTimestampFloorForKeysSkipsUnrelatedUnavailableGroup(t *testing.T) {
@@ -102,6 +105,55 @@ func TestShardStoreGlobalCommittedTimestampFloorUsesEveryGroupLeader(t *testing.
 	floor, err := shards.GlobalCommittedTimestampFloor(context.Background())
 	require.NoError(t, err)
 	require.Equal(t, uint64(99), floor)
+}
+
+type interruptedFloorServer struct {
+	pb.UnimplementedRawKVServer
+	calls     atomic.Int32
+	firstCode codes.Code
+	second    *pb.RawLatestCommitTSResponse
+}
+
+func (s *interruptedFloorServer) RawLatestCommitTS(_ context.Context, _ *pb.RawLatestCommitTSRequest) (*pb.RawLatestCommitTSResponse, error) {
+	if s.calls.Add(1) == 1 || s.second == nil {
+		return nil, status.Error(s.firstCode, "read watermark interrupted")
+	}
+	return s.second, nil
+}
+
+func TestCommittedFloorAfterInterruptedRead(t *testing.T) {
+	fenced := &pb.RawLatestCommitTSResponse{Ts: 99, Exists: true, GroupId: 2, LeaderFenced: true}
+	for _, tc := range []struct {
+		name   string
+		code   codes.Code
+		second *pb.RawLatestCommitTSResponse
+		calls  int32
+		want   uint64
+	}{
+		{"reconnected", codes.Unavailable, fenced, 2, 99},
+		{"still unavailable", codes.Unavailable, nil, 2, 0},
+		{"wrong group after reconnect", codes.Unavailable, &pb.RawLatestCommitTSResponse{Ts: 99, GroupId: 3, LeaderFenced: true}, 2, 0},
+		{"missing fence after reconnect", codes.Unavailable, &pb.RawLatestCommitTSResponse{Ts: 99, GroupId: 2}, 2, 0},
+		{"permission denied", codes.PermissionDenied, fenced, 1, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := &interruptedFloorServer{firstCode: tc.code, second: tc.second}
+			addr := startRawKVServer(t, server)
+			shards := NewShardStore(nil, map[uint64]*ShardGroup{2: {
+				Engine: &recordingTSOEngine{state: raftengine.StateFollower, leader: raftengine.LeaderInfo{Address: addr}},
+				Store:  store.NewMVCCStore(),
+			}})
+			t.Cleanup(func() { require.NoError(t, shards.Close()) })
+			floor, err := shards.GlobalCommittedTimestampFloor(t.Context())
+			if tc.want == 0 {
+				require.ErrorIs(t, err, ErrTSOCommitFloorUnavailable)
+			} else {
+				require.NoError(t, err)
+			}
+			require.Equal(t, tc.want, floor)
+			require.Equal(t, tc.calls, server.calls.Load())
+		})
+	}
 }
 
 func TestShardStoreGlobalCommittedTimestampFloorRejectsUnfencedRemoteResponse(t *testing.T) {

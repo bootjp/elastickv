@@ -103,6 +103,18 @@
   (ex-info (str "Command exited with non-zero status 1 on node n1:\n" cmd "\n\nSTDERR:\n" err)
            {:type :jepsen.control/nonzero-exit :cmd cmd :exit 1 :out "" :err err}))
 
+(deftest remote-read-reports-which-mount-check-failed
+  (let [mount (scratch-dir)
+        cmd (workload/remote-read-cmd mount (str mount "/jepsen/reg-0"))]
+    (try
+      (doseq [[mount-status reason] [[1 "mountpoint check failed"] [0 "workload directory check failed"]]]
+        (let [{:keys [exit err]} (clojure.java.shell/sh "sh" "-c"
+                                  (str "mountpoint() { return " mount-status "; }; " cmd))]
+          (is (= 1 exit))
+          (is (str/includes? err (str "mount unavailable: " reason)))
+          (is (nil? (workload/data-loss-kind (nonzero-exit cmd err))))))
+      (finally (delete-tree! mount)))))
+
 (deftest error-text-ignores-the-remote-command-line
   (let [cmd (workload/remote-read-cmd "/mnt/fs" "/mnt/fs/jepsen/reg-1")]
     (is (= "head: error reading 'reg-1': Input/output error\n"
@@ -402,7 +414,6 @@
     (is (zero? (:exit (clojure.java.shell/sh "bash" "-n" "-c" rename)))))
   (let [read (workload/remote-read-cmd "/mnt/fs" "/mnt/fs/jepsen/reg-1")]
     (is (zero? (:exit (clojure.java.shell/sh "bash" "-n" "-c" read))))
-    (is (str/starts-with? read "{ mountpoint -q '/mnt/fs' && [ -d '/mnt/fs/jepsen' ]; } || { echo 'mount unavailable: /mnt/fs' >&2; exit 1; }; "))
     (is (str/includes? read "s=$(stat -c %s '/mnt/fs/jepsen/reg-1') || exit 1; "))
     (is (str/includes? read "[ \"$s\" -ge 16 ] || { echo 'short record' >&2; exit 1; }; "))
     (is (str/ends-with? read "exec head -c 16 '/mnt/fs/jepsen/reg-1'")))
