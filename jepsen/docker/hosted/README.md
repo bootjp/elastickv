@@ -234,6 +234,9 @@ rename and SQLite entries use mandatory strict mode and also run Elle. The
 `strict-mode` dispatch input and legacy benchmark entries are removed. Old legacy
 benchmark names are explicitly rejected; single-group and two-group strict
 benchmarks remain. Its fault matrix adds both gRPC APIs and both Filesystem modes.
+SQS Standard begins its measured generator with one send, then runs the mixed
+send/receive phase. This prevents a short smoke run from sampling only serialized
+empty-queue polls; failed sends and zero committed sends still fail validation.
 SQS retains its dedicated delivery/acknowledgement checkers. Distribution,
 RaftAdmin, backup, monitoring and internal replication/control RPCs do not expose
 application register transactions and are not presented as Elle-tested data
