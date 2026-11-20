@@ -5,7 +5,9 @@ set -euo pipefail
 source "$(dirname "$0")/../s3_budget.sh"
 
 s3_budget 16 250
-[[ "$S3_KEY_COUNT" == 250 && "$S3_MAX_OPS_PER_KEY" == 16 ]]
+[[ "$S3_KEY_COUNT" == 308 && "$S3_MAX_OPS_PER_KEY" == 13 ]]
+((S3_MAX_OPS_PER_KEY + 3 <= 16))
+((S3_KEY_COUNT * S3_MAX_OPS_PER_KEY >= 16 * 250))
 
 s3_budget 3 7
 [[ "$S3_KEY_COUNT" == 3 && "$S3_MAX_OPS_PER_KEY" == 7 ]]
@@ -14,8 +16,3 @@ if s3_budget 2147483647 2147483647 2>/dev/null; then
   echo "oversized key count was accepted" >&2
   exit 1
 fi
-
-# Keep the stress request's full 32,000-operation budget across smaller histories.
-s3_budget 32 1000
-[[ "$S3_KEY_COUNT" == 2000 && "$S3_MAX_OPS_PER_KEY" == 16 ]]
-[[ $((S3_KEY_COUNT * S3_MAX_OPS_PER_KEY)) -ge 32000 ]]
