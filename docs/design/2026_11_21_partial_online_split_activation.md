@@ -105,10 +105,18 @@ online protocol before their membership authorization is committed.
 
 A runner catch-up pass processes at most 128 frames, 200 ms and 4 MiB; it
 checkpoints accepted receipts once per pass. Online progress uses a 10 ms
-continuation delay. ACK of the exported head is sufficient for catch-up even when a writer appends
-before the next export. A subsequent seal captures that remaining tail.
-Once caught up, it reloads and readmits the job before
-fencing in the same attempt, so continuous writers do not require an idle tick.
+continuation delay. Preflight completion atomically records the source head in the job manifest.
+Its sequence is a fixed catch-up goal across passes, ticks and runner restarts;
+new exports never move that goal. Once reached, the runner reloads and readmits
+the job and samples the current source head before installing the first fence.
+Observed remaining lag must fit eight frames and 512 KiB. If it exceeds either
+limit, the source stays writable and a new fixed goal is persisted with OCC
+guards on the job, catalog version and source route. A concurrent catalog fence
+therefore cannot be overwritten by a stale goal refresh. An already installed
+fence resumes without refreshing its goal. Seal captures the remaining tail.
+This avoids requiring an idle tick and avoids fencing a large backlog after a
+stalled runner. These are observed lag budgets, not a real-time pause guarantee
+under overload, partitions or slow storage.
 RawKV handoff waiting is limited to two seconds, 256 concurrent waiters and
 8 MiB including waiter overhead. Cancellation before another dispatch retains
 the previous noncommit proof; a dispatched attempt returns its actual outcome.

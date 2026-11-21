@@ -3,6 +3,7 @@ package adapter
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/bootjp/elastickv/distribution"
 	pb "github.com/bootjp/elastickv/proto"
@@ -151,25 +152,38 @@ func (c writeAfterOnlineImport) ImportRangeVersions(ctx context.Context, req *pb
 
 func TestOnlineSplitFencesWithWriterBetweenEveryFrameAckAndExport(t *testing.T) {
 	t.Parallel()
+	for _, delay := range []time.Duration{0, preflightTimePerTick + time.Millisecond} {
+		t.Run(delay.String(), func(t *testing.T) { onlineSplitWriterBetweenFrames(t, delay) })
+	}
+}
+
+func onlineSplitWriterBetweenFrames(t *testing.T, delay time.Duration) {
+	t.Helper()
 	r := newResplitAcceptanceRuntime(t)
 	snapshot, err := r.server.catalog.Snapshot(t.Context())
 	require.NoError(t, err)
 	started, err := r.client.StartSplitMigration(t.Context(), &pb.StartSplitMigrationRequest{ExpectedCatalogVersion: snapshot.Version, RouteId: 1, TargetGroupId: 2, SplitKey: []byte("m")})
 	require.NoError(t, err)
 	var job distribution.SplitJob
+	seeded := false
 	for range 200 {
 		require.NoError(t, r.server.RunSplitJobRunnerOnce(t.Context()))
 		var found bool
 		job, found, err = r.server.catalog.SplitJob(t.Context(), started.JobId)
 		require.NoError(t, err)
 		require.True(t, found)
+		if job.Phase == distribution.SplitJobPhaseFence && !job.TransferPreflightDone && !seeded {
+			require.NoError(t, r.put(t, 1, "n", "seed-one", 100))
+			require.NoError(t, r.put(t, 1, "n", "seed-two", 101))
+			seeded = true
+		}
 		if job.Phase == distribution.SplitJobPhaseFence && job.TransferPreflightDone {
 			break
 		}
 	}
 	require.Equal(t, distribution.SplitJobPhaseFence, job.Phase)
 	require.True(t, job.TransferPreflightDone)
-	require.NoError(t, r.put(t, 1, "n", "seed", 100))
+	require.True(t, seeded)
 	writes := uint64(0)
 	original := r.server.splitMigrationClientFactory
 	r.server.splitMigrationClientFactory = func(ctx context.Context, job distribution.SplitJob, group uint64) (SplitMigrationClient, SplitMigrationClient, error) {
@@ -177,19 +191,13 @@ func TestOnlineSplitFencesWithWriterBetweenEveryFrameAckAndExport(t *testing.T) 
 		if job.Phase == distribution.SplitJobPhaseFence {
 			target = writeAfterOnlineImport{SplitMigrationClient: target, write: func() {
 				writes++
-				require.NoError(t, r.put(t, 1, "n", "between-frames", 100+writes))
+				require.NoError(t, r.put(t, 1, "n", "between-frames", 200+writes))
+				time.Sleep(delay)
 			}}
 		}
 		return source, target, err
 	}
-	for range 5 {
-		require.NoError(t, r.server.RunSplitJobRunnerOnce(t.Context()))
-		job, _, err = r.server.catalog.SplitJob(t.Context(), started.JobId)
-		require.NoError(t, err)
-		if job.Phase != distribution.SplitJobPhaseFence {
-			break
-		}
-	}
+	job = advanceOnlineSplitBeyondFence(t, r, started.JobId)
 	require.Positive(t, writes)
 	require.NotEqual(t, distribution.SplitJobPhaseFence, job.Phase, "ACK of the exported head must permit fencing despite the newly appended frame")
 	for range 200 {
@@ -202,4 +210,19 @@ func TestOnlineSplitFencesWithWriterBetweenEveryFrameAckAndExport(t *testing.T) 
 	}
 	require.Equal(t, distribution.SplitJobPhaseDone, job.Phase)
 	r.read(t, "n", "between-frames")
+}
+
+func advanceOnlineSplitBeyondFence(t *testing.T, r *resplitAcceptanceRuntime, jobID uint64) distribution.SplitJob {
+	t.Helper()
+	var job distribution.SplitJob
+	var err error
+	for range 5 {
+		require.NoError(t, r.server.RunSplitJobRunnerOnce(t.Context()))
+		job, _, err = r.server.catalog.SplitJob(t.Context(), jobID)
+		require.NoError(t, err)
+		if job.Phase != distribution.SplitJobPhaseFence {
+			break
+		}
+	}
+	return job
 }

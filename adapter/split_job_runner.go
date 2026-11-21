@@ -2433,6 +2433,10 @@ func (s *DistributionServer) catchUpAndFenceOnlineSplit(ctx context.Context, job
 	if err != nil || !ready {
 		return err
 	}
+	admitted, err := s.admitOnlineSplitHandoff(ctx, current)
+	if err != nil || !admitted {
+		return err
+	}
 	return s.finalizeSplitJobFence(ctx, current)
 }
 

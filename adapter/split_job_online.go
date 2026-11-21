@@ -73,11 +73,10 @@ const onlineSplitContinuationDelay = 10 * time.Millisecond
 // A bounded pass checkpoints only positions already durable at the target.
 // Replaying a pass whose catalog response was lost verifies each exact receipt.
 func (s *DistributionServer) copyOnlineSplitPage(ctx context.Context, job distribution.SplitJob) (bool, error) {
-	source, target, end, err := s.splitJobMigrationClients(ctx, job)
+	pass, err := s.openOnlineSplitPass(ctx, job)
 	if err != nil {
 		return false, err
 	}
-	pass := onlineSplitPass{source: source, target: target, end: end, next: distribution.CloneSplitJob(job)}
 	deadline := time.Now().Add(preflightTimePerTick)
 	bytesLeft := preflightBytesPerTick
 	complete := false
@@ -102,6 +101,7 @@ func (s *DistributionServer) copyOnlineSplitPage(ctx context.Context, job distri
 }
 
 type onlineSplitPass struct {
+	goal               uint64
 	sealedTailAttested bool
 	source             SplitMigrationClient
 	target             SplitMigrationClient
@@ -111,12 +111,15 @@ type onlineSplitPass struct {
 
 func (pass *onlineSplitPass) advance(ctx context.Context, server *DistributionServer) (int, bool, error) {
 	job := pass.next
+	if pass.catchUpGoalReached() {
+		return 0, true, nil
+	}
 	page, manifest, err := exportOnlineSplitPage(ctx, pass.source, job.JobID, job.SplitKey, pass.end, job.OnlineSequence)
 	if err != nil {
 		return 0, false, err
 	}
-	if !sameOnlineSplitManifest(job.OnlineManifest, manifest) {
-		return 0, false, errors.WithStack(store.ErrOnlineMigrationIdentity)
+	if err := pass.verifySourceManifest(manifest); err != nil {
+		return 0, false, err
 	}
 	if page.GetDone() {
 		return 0, true, validateOnlineSplitEnd(job, page, manifest)
@@ -138,9 +141,9 @@ func (pass *onlineSplitPass) advance(ctx context.Context, server *DistributionSe
 	for _, effect := range frame.Entry.Effects {
 		pass.next.MaxImportedTS = max(pass.next.MaxImportedTS, effect.CommitTS)
 	}
-	// The exported head is a finite catch-up goal. Writers may append before
-	// the next export; the subsequent durable fence/seal captures that tail.
-	caughtUp := job.Phase == distribution.SplitJobPhaseFence && frame.Sequence == manifest.Sequence
+	// The preflight completion checkpoint fixes this goal across passes.
+	// Later writers belong to the tail captured by the subsequent seal.
+	caughtUp := pass.catchUpGoalReached()
 	return len(page.GetOnlineFrame()), caughtUp, nil
 }
 
@@ -391,6 +394,49 @@ func (s *DistributionServer) prepareOnlineSplitTarget(ctx context.Context, job d
 	control.RequireConfigurationIndex, control.ExpectedConfigurationIndex = true, targetMembers.ConfigurationIndex
 	if _, err := target.ApplyTargetStagedReadiness(ctx, control); err != nil {
 		return errors.WithStack(err)
+	}
+	return nil
+}
+
+func (s *DistributionServer) openOnlineSplitPass(ctx context.Context, job distribution.SplitJob) (onlineSplitPass, error) {
+	source, target, end, err := s.splitJobMigrationClients(ctx, job)
+	if err != nil {
+		return onlineSplitPass{}, err
+	}
+	saved, err := store.DecodeOnlineMigrationManifest(job.OnlineManifest)
+	if err != nil {
+		return onlineSplitPass{}, errors.WithStack(err)
+	}
+	return onlineSplitPass{source: source, target: target, end: end, next: distribution.CloneSplitJob(job), goal: saved.Sequence}, nil
+}
+
+// This observation is persisted atomically with preflight completion. Retrying
+// a lost completion response reloads that checkpoint rather than moving the goal.
+func recordOnlineSplitCatchUpGoal(ctx context.Context, next *distribution.SplitJob, source SplitMigrationClient, end []byte) error {
+	if next.OnlineCaptureVersion == 0 || next.Phase != distribution.SplitJobPhaseFence || !next.TransferPreflightDone {
+		return nil
+	}
+	page, manifest, err := exportOnlineSplitPage(ctx, source, next.JobID, next.SplitKey, end, next.OnlineSequence)
+	if err != nil {
+		return err
+	}
+	if !sameOnlineSplitManifest(next.OnlineManifest, manifest) || manifest.Sealed {
+		return errors.WithStack(store.ErrOnlineMigrationIdentity)
+	}
+	next.OnlineManifest = bytes.Clone(page.GetOnlineManifest())
+	return nil
+}
+
+func (pass *onlineSplitPass) catchUpGoalReached() bool {
+	return pass.next.Phase == distribution.SplitJobPhaseFence && pass.next.OnlineSequence >= pass.goal
+}
+
+func (pass *onlineSplitPass) verifySourceManifest(manifest store.OnlineMigrationSession) error {
+	if !sameOnlineSplitManifest(pass.next.OnlineManifest, manifest) {
+		return errors.WithStack(store.ErrOnlineMigrationIdentity)
+	}
+	if pass.next.Phase == distribution.SplitJobPhaseFence && manifest.Sequence < pass.goal {
+		return errors.WithStack(store.ErrMigrationCaptureCorrupt)
 	}
 	return nil
 }
