@@ -20,6 +20,8 @@ storeが同じentryの再送と判定して省略したmutationはeffectに含�
 recordは`R/migration-capture/v1/`以下に置き、indexなしのmetadata更新から保護する。
 データ、record、applied indexは同じ同期batchに入り、sourceの通常データと同じ保存時暗号化を使う。
 snapshotへの保存と復元も既存のnative形式とSST形式を使う。
+鍵切り替え後の復元試験は、旧鍵を保持した構成で行う。
+active sessionのretentionと鍵GCを結び付ける制御まで実装したという意味ではない。
 
 ## 再送と記録の上限
 
@@ -76,3 +78,19 @@ job全体の容量管理、retention、active sessionの永続化、最低runtim
 全更新経路のcoverage、変更のないindexのcoverage、baseの一貫snapshot、連続したtarget cursorも必要になる。
 その後にtargetへの継続転送と事前準備、排他的なCommitとAbort、sourceのseal、短時間の要求待機を接続する。
 現段階のshadow recordを、その証拠として読み替えない。
+
+## 保存処理単体のbenchmark
+
+`BenchmarkMigrationCaptureEntry`は、1KiBのpoint更新16件を1つの同期entryで保存するinactiveとshadowを比較する。
+macOSの開発機で、100 entryを3回ずつ実行した暫定値は次のとおりだった。
+
+| 指標の中央値 | inactive | shadow |
+| --- | ---: | ---: |
+| entryあたり時間 | 5.166ms | 5.460ms |
+| entryあたり割当bytes | 23,314 | 130,848 |
+| entryあたり割当回数 | 36 | 157 |
+
+これはSplitやLinuxクラスタのスループットを測った結果ではなく、他の検証と並行した開発機での診断値である。
+既存のinactive経路の変更前後を比較した試験でもない。
+shadowのJSON記録と値の複製には割当の増加があり、active sessionをproductionで有効化する前に、記録形式とbufferのprofileを確認する必要がある。
+正式な性能採用条件を満たしたとは評価しない。
