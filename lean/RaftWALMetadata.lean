@@ -4,8 +4,9 @@ import Std
 Model of the indexed Raft data commit in store/lsm_store.go and
 store/raft_entry.go, with the default synchronous Pebble write options.
 
-An entry represents the whole batch, including the sequence of data writes
-and its largest advertised commit timestamp. Pebble publishes a batch to
+An entry represents the whole batch, including each staged operation's
+timestamp and the largest advertised commit timestamp. The staged list
+includes operations with no new versions, as the Go minimum does. Pebble publishes a batch to
 its readers atomically, may do so before sync completes, and reports success
 only after sync. Before sync is observed, recovery may retain or drop the
 whole batch. A fatal WAL error is modeled by the same recovery alternatives.
@@ -14,6 +15,10 @@ Ordinary errors before the Pebble batch takes effect leave the prior image.
 From staging the metadata through returning from the helper, applyMu
 excludes other watermark writers and the shared dbMu prevents a DB swap.
 For the batched path this interval starts after the DB identity check.
+The metadata lock can be released during sync only for indexed data batches
+whose minimum staged timestamp exceeds the previously published watermark.
+The model gates new metadata reads during apply. Retention and admission for
+reads that already acquired a snapshot belong to the surrounding protocol.
 The caller supplies an already committed Raft entry with a positive
 index at least as large as the existing applied index. The surrounding
 protocol handles stale-entry checks, replay, snapshot replacement, and
@@ -22,10 +27,43 @@ surviving images. Natural numbers model the comparisons and max used here.
 -/
 namespace RaftWALMetadata
 
+structure StagedWrite (Mutation : Type) where
+  timestamp : Nat
+  mutations : List Mutation
+
 structure Entry (Mutation : Type) where
   index : Nat
   advertisedTS : Nat
-  mutations : List Mutation
+  staged : List (StagedWrite Mutation)
+  advance : Bool
+  forceSync : Bool
+  readinessCount : Nat
+
+def Entry.minStagedTS (entry : Entry Mutation) : Nat :=
+  (entry.staged.map StagedWrite.timestamp).min?.getD 0
+
+-- Eligibility in commitMutationBatch and raftEntryScope.canCommitWithoutMetadataLock.
+def singleFastPath (index : Nat) (advance : Bool) (watermark timestamp : Nat) : Bool :=
+  (index != 0) && advance && decide (watermark < timestamp)
+
+def scopedFastPath (entry : Entry Mutation) (watermark : Nat) : Bool :=
+  singleFastPath entry.index entry.advance watermark entry.minStagedTS &&
+    !entry.forceSync && (entry.readinessCount == 0)
+
+theorem scoped_path_requires_data_only (h : scopedFastPath entry watermark = true) :
+    entry.index ≠ 0 ∧ entry.advance = true ∧ entry.forceSync = false ∧
+      entry.readinessCount = 0 ∧ watermark < entry.minStagedTS := by
+  simp [scopedFastPath, singleFastPath] at h
+  exact ⟨h.1.1.1.1, h.1.1.1.2, h.1.2, h.2, h.1.1.2⟩
+
+private theorem minimum_le_staged_timestamp {entry : Entry Mutation} {write : StagedWrite Mutation}
+    (member : write ∈ entry.staged) : entry.minStagedTS ≤ write.timestamp := by
+  have mapped : write.timestamp ∈ entry.staged.map StagedWrite.timestamp :=
+    List.mem_map.mpr ⟨write, member, rfl⟩
+  unfold Entry.minStagedTS
+  cases h : (entry.staged.map StagedWrite.timestamp).min? with
+  | none => exact Nat.zero_le _
+  | some minimum => exact (List.min?_eq_some_iff.mp h).2 _ mapped
 
 structure Image (Mutation : Type) where
   entries : List (Entry Mutation)
@@ -59,6 +97,11 @@ def State.ordered : State Mutation → Prop
   | .staged prior entry | .visible prior entry | .synced prior entry
   | .published prior entry => prior.appliedIndex ≤ entry.index
 
+def State.canReadMetadata : State Mutation → Prop
+  | .idle _ | .published _ _ => True
+  | .staged prior entry | .visible prior entry | .synced prior entry =>
+      scopedFastPath entry prior.watermark = true
+
 inductive Event (Mutation : Type)
   | begin (entry : Entry Mutation)
   | visible
@@ -84,7 +127,7 @@ inductive Step : State Mutation → Event Mutation → State Mutation → Prop
   | reopenVisibleKeep : Step (.visible prior entry) .recover (.idle (prior.install entry))
   | reopenSynced : Step (.synced prior entry) .recover (.idle (prior.install entry))
   | reopenPublished : Step (.published prior entry) .recover (.idle (prior.install entry))
-  | read : Step s (.read s.lastCommitTS) s
+  | read (allowed : s.canReadMetadata) : Step s (.read s.lastCommitTS) s
 
 theorem published_watermark_is_durable (s : State Mutation) :
     s.lastCommitTS ≤ s.durable.watermark := by
@@ -110,25 +153,40 @@ theorem next_writer_requires_idle (h : Step s (Event.begin entry) next) :
   cases h with
   | begin ordered indexed => exact ⟨_, rfl, indexed, ordered⟩
 
-theorem metadata_read_during_sync (prior : Image Mutation) (entry : Entry Mutation) :
+theorem metadata_read_during_sync (prior : Image Mutation) (entry : Entry Mutation)
+    (eligible : scopedFastPath entry prior.watermark = true) :
     Step (.visible prior entry) (.read prior.watermark) (.visible prior entry) :=
-  Step.read
+  Step.read eligible
 
--- Even if the Pebble batch is already visible, an old timestamp selects the
--- same versions when every new version was fenced above that timestamp.
-def versionsAtOrBefore (stamp : Mutation → Nat) (ts : Nat) (image : Image Mutation) :
-    List Mutation :=
-  (image.entries.flatMap Entry.mutations).filter (fun m => stamp m ≤ ts)
+theorem visible_batch_at_or_below_watermark_blocks_metadata_read
+    (member : write ∈ entry.staged) (old : write.timestamp ≤ prior.watermark) :
+    ¬ Step (.visible prior entry) (.read prior.watermark) (.visible prior entry) := by
+  intro read
+  cases read with
+  | read allowed =>
+    have fresh := (scoped_path_requires_data_only allowed).2.2.2.2
+    have bound := minimum_le_staged_timestamp member
+    omega
 
-theorem fenced_snapshot_unchanged_during_sync (prior : Image Mutation) (entry : Entry Mutation)
-    (stamp : Mutation → Nat) (fresh : ∀ m ∈ entry.mutations, prior.watermark < stamp m) :
-    versionsAtOrBefore stamp prior.watermark (State.visible prior entry).readable =
-      versionsAtOrBefore stamp prior.watermark prior := by
-  have empty : (entry.mutations.filter (fun m => stamp m ≤ prior.watermark)) = [] := by
-    rw [List.filter_eq_nil_iff]
-    intro m member
-    simp [Nat.not_le.mpr (fresh m member)]
-  simp [versionsAtOrBefore, State.readable, Image.install, List.filter_append, empty]
+def versionsAtOrBefore (ts : Nat) (image : Image Mutation) : List Mutation :=
+  image.entries.flatMap (fun entry =>
+    (entry.staged.filter (fun write => write.timestamp ≤ ts)).flatMap StagedWrite.mutations)
+
+-- The production eligibility gate supplies freshness for every staged operation.
+theorem snapshot_unchanged_for_overlapping_metadata_read (prior : Image Mutation)
+    (entry : Entry Mutation)
+    (read : Step (.visible prior entry) (.read prior.watermark) (.visible prior entry)) :
+    versionsAtOrBefore prior.watermark (State.visible prior entry).readable =
+      versionsAtOrBefore prior.watermark prior := by
+  cases read with
+  | read allowed =>
+    have fresh := (scoped_path_requires_data_only allowed).2.2.2.2
+    have empty : (entry.staged.filter (fun write => write.timestamp ≤ prior.watermark)) = [] := by
+      rw [List.filter_eq_nil_iff]
+      intro write member
+      have := Nat.lt_of_lt_of_le fresh (minimum_le_staged_timestamp member)
+      simp [Nat.not_le.mpr this]
+    simp [versionsAtOrBefore, State.readable, Image.install, empty]
 
 theorem recovery_selects_whole_image (h : Step (.visible prior entry) .recover next) :
     next = State.idle prior ∨ next = State.idle (prior.install entry) := by
@@ -185,18 +243,5 @@ theorem acknowledged_batch_survives_recovery (h : Run s events final)
       obtain ⟨_, _, _, member⟩ := ack_requires_synced_publication step
       exact run_preserves_durable_entries tail member
     · exact ih later
-
--- Eligibility in commitMutationBatch and raftEntryScope.isIndexedRaftDataOnly.
-def singleFastPath (index : Nat) (advance : Bool) : Bool :=
-  (index != 0) && advance
-
-def scopedFastPath (index : Nat) (advance forceSync : Bool) (readinessCount : Nat) : Bool :=
-  singleFastPath index advance && !forceSync && (readinessCount == 0)
-
-theorem scoped_path_requires_data_only {index : Nat} {advance forceSync : Bool}
-    {readinessCount : Nat} (h : scopedFastPath index advance forceSync readinessCount = true) :
-    index ≠ 0 ∧ advance = true ∧ forceSync = false ∧ readinessCount = 0 := by
-  simp [scopedFastPath, singleFastPath] at h
-  exact ⟨h.1.1.1, h.1.1.2, h.1.2, h.2⟩
 
 end RaftWALMetadata

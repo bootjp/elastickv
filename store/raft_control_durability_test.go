@@ -119,23 +119,29 @@ func TestRaftControlMetadataForcesActualWALSync(t *testing.T) {
 	}
 }
 
+func newRaftDataWALSyncStore(t *testing.T) (*pebbleStore, *controlSyncFS, func()) {
+	t.Helper()
+	dir := t.TempDir()
+	fs := &controlSyncFS{FS: vfs.Default, entered: make(chan struct{}), release: make(chan struct{})}
+	opts, cache := defaultPebbleOptionsWithCache(false)
+	opts.FS = fs
+	db, err := pebble.Open(dir, opts)
+	require.NoError(t, err)
+	ps := &pebbleStore{db: db, cache: cache, dir: dir, fsmApplyWriteOpts: pebble.Sync}
+	t.Cleanup(func() { require.NoError(t, ps.Close()) })
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(fs.release) }) }
+	t.Cleanup(release)
+	return ps, fs, release
+}
+
 func TestRaftDataWALSyncDoesNotBlockMetadataReads(t *testing.T) {
 	t.Parallel()
 	for _, mode := range []string{"single", "batch"} {
 		t.Run(mode, func(t *testing.T) {
-			dir := t.TempDir()
-			fs := &controlSyncFS{FS: vfs.Default, entered: make(chan struct{}), release: make(chan struct{})}
-			opts, cache := defaultPebbleOptionsWithCache(false)
-			opts.FS = fs
-			db, err := pebble.Open(dir, opts)
-			require.NoError(t, err)
-			ps := &pebbleStore{db: db, cache: cache, dir: dir, fsmApplyWriteOpts: pebble.Sync}
-			t.Cleanup(func() { require.NoError(t, ps.Close()) })
+			ps, fs, release := newRaftDataWALSyncStore(t)
 			require.NoError(t, ps.ApplyMutationsRaftAt(t.Context(), raftEntryPut("key", "old"), nil, 5, 5, 6))
 
-			var releaseOnce sync.Once
-			release := func() { releaseOnce.Do(func() { close(fs.release) }) }
-			t.Cleanup(release)
 			fs.armed.Store(true)
 			done := make(chan error, 1)
 			go func() {
@@ -187,6 +193,66 @@ func TestRaftDataWALSyncDoesNotBlockMetadataReads(t *testing.T) {
 			require.True(t, present)
 			require.Equal(t, uint64(7), index)
 			value, err := ps.GetAt(t.Context(), []byte("key"), 10)
+			require.NoError(t, err)
+			require.Equal(t, "new", string(value))
+		})
+	}
+}
+
+func TestRaftDataWALSyncHoldsMetadataLockAtOrBelowWatermark(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name    string
+		oldTS   uint64
+		newerTS uint64
+		wantTS  uint64
+	}{
+		{name: "single at watermark", oldTS: 10, wantTS: 10},
+		{name: "single below watermark", oldTS: 9, wantTS: 10},
+		{name: "batch with a newer and an older write", oldTS: 9, newerTS: 12, wantTS: 12},
+		{name: "batch with an equal and a newer write", oldTS: 10, newerTS: 12, wantTS: 12},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ps, fs, release := newRaftDataWALSyncStore(t)
+			require.NoError(t, ps.ApplyMutationsRaftAt(t.Context(), raftEntryPut("seed", "value"), nil, 10, 10, 6))
+
+			fs.armed.Store(true)
+			done := make(chan error, 1)
+			go func() {
+				stageOld := func(ctx context.Context) error {
+					return ps.ApplyMutationsRaftAt(ctx, raftEntryPut("at-or-below", "new"), nil, tc.oldTS, tc.oldTS, 7)
+				}
+				if tc.newerTS == 0 {
+					done <- stageOld(t.Context())
+					return
+				}
+				done <- ps.ApplyRaftEntry(t.Context(), 7, func(ctx context.Context) error {
+					if err := ps.ApplyMutationsRaftAt(ctx, raftEntryPut("above", "new"), nil, tc.newerTS, tc.newerTS, 7); err != nil {
+						return err
+					}
+					return stageOld(ctx)
+				})
+			}()
+			select {
+			case <-fs.entered:
+			case err := <-done:
+				t.Fatalf("apply returned before WAL sync: %v", err)
+			case <-time.After(5 * time.Second):
+				t.Fatal("apply never reached WAL sync")
+			}
+
+			readable := ps.mtx.TryRLock()
+			if readable {
+				ps.mtx.RUnlock()
+			}
+			release()
+			require.NoError(t, <-done)
+			require.False(t, readable, "the metadata lock must cover sync for versions at or below the published watermark")
+			require.Equal(t, tc.wantTS, ps.LastCommitTS())
+			index, present := raftEntryAppliedIndex(t, ps)
+			require.True(t, present)
+			require.Equal(t, uint64(7), index)
+			value, err := ps.GetAt(t.Context(), []byte("at-or-below"), tc.oldTS)
 			require.NoError(t, err)
 			require.Equal(t, "new", string(value))
 		})

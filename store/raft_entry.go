@@ -77,6 +77,7 @@ type raftEntryScope struct {
 	appliedIndex uint64
 	// OCC counts every staged version, including non-advertised projections.
 	// Only advertised commits may advance the data watermark at publication.
+	minStagedTS           uint64 // lowest timestamp that could become visible before sync
 	maxStagedTS           uint64
 	maxAdvertisedCommitTS uint64
 	// advance records that at least one staged request advances
@@ -118,6 +119,9 @@ func (s *pebbleStore) raftEntryReader(ctx context.Context) pebble.Reader {
 
 func (sc *raftEntryScope) observe(commitTS uint64, advance bool) {
 	sc.touched = true
+	if !sc.dataTouched || commitTS < sc.minStagedTS {
+		sc.minStagedTS = commitTS
+	}
 	sc.dataTouched = true
 	sc.maxStagedTS = max(sc.maxStagedTS, commitTS)
 	if !advance {
@@ -238,8 +242,9 @@ func (s *pebbleStore) commitRaftEntryScope(scope *raftEntryScope) error {
 	if err := s.validateRaftControlIndex(scope); err != nil {
 		return err
 	}
-	if scope.isIndexedRaftDataOnly() {
-		return s.commitIndexedRaftDataBatch(scope.batch, s.raftApplyWriteOpts(), scope.maxAdvertisedCommitTS, scope.appliedIndex)
+	watermark := s.LastCommitTS()
+	if scope.canCommitWithoutMetadataLock(watermark) {
+		return s.commitIndexedRaftDataBatch(scope.batch, s.raftApplyWriteOpts(), max(watermark, scope.maxAdvertisedCommitTS), scope.appliedIndex)
 	}
 
 	s.mtx.Lock()
@@ -262,8 +267,11 @@ func (s *pebbleStore) commitRaftEntryScope(scope *raftEntryScope) error {
 	return nil
 }
 
-func (sc *raftEntryScope) isIndexedRaftDataOnly() bool {
-	return sc.appliedIndex != 0 && sc.advance && !sc.forceSync && len(sc.readiness) == 0
+func (sc *raftEntryScope) canCommitWithoutMetadataLock(watermark uint64) bool {
+	// A snapshot taken at watermark must exclude every staged version while
+	// Pebble can make the batch visible ahead of WAL sync.
+	return sc.appliedIndex != 0 && sc.advance && !sc.forceSync &&
+		len(sc.readiness) == 0 && sc.minStagedTS > watermark
 }
 
 func (s *pebbleStore) publishRaftEntryMirrors(scope *raftEntryScope, newLastTS uint64) {
