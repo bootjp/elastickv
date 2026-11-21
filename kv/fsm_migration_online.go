@@ -236,6 +236,11 @@ func (f *kvFSM) verifyOnlineSourceNotSealed(ctx context.Context, req *pb.Request
 }
 
 func onlineAffectedPointRequests(requests []*pb.Request, session store.OnlineMigrationSession) bool {
+	// The writer records one outcome for every request, including requests
+	// outside the moving range. Bound the complete entry before capture.
+	if len(requests) > store.MaxMigrationCaptureRequests {
+		return false
+	}
 	for _, request := range requests {
 		if onlineRequestIntersects(request, session) && !onlinePointRequests([]*pb.Request{request}) {
 			return false
