@@ -131,3 +131,16 @@
                                  [{:type :invoke :process 0 :f :write :value [:x -1]}]))))
       (doseq [kind [:grpc :filesystem :independent-register]]
         (is (true? (:valid? (elle/check-history kind (s3-history 1 :ok) dir))))))))
+
+(deftest offline-register-replay-requires-a-causal-writer
+  (with-directory
+    (fn [dir]
+      (let [h (s3-history 1 :ok)
+            read (mapv #(assoc % :value (independent/tuple :x (when (= :ok (:type %)) 99)))
+                       (drop 2 h))
+            write (mapv #(assoc % :value (independent/tuple :x 99)) (take 2 h))
+            replay (fn [ops] (elle/analyze-history! :grpc (map-indexed #(assoc %2 :time %1) ops) dir))]
+        (is (false? (:valid? (replay (concat h read)))))
+        (is (false? (:valid? (replay (concat h read write)))))
+        (is (true? (:valid? (replay (concat h write read)))))
+        (is (true? (:valid? (replay (concat h [(first write)] read [(second write)])))))))))

@@ -3,6 +3,8 @@
   (:require [clojure.string :as str]
             [elastickv.cli :as cli]
             [elastickv.db :as ekdb]
+            [elastickv.elle-checker :as elle]
+            [jepsen.checker :as checker]
             [jepsen.db :as jdb]
             [jepsen [client :as client]
                     [generator :as gen]
@@ -55,14 +57,44 @@
          (mapv (partial redis-append/parse-read conn))
          (assoc op :type :ok, :value))))
 
-(defn- complete-exec-results [conn op exec-results]
-  (if-let [e (first-exception exec-results)]
-    (exec-array-error-op op e)
-    (let [mops (mapv (fn [[f k v] r]
-                       [f k (if (= f :r) r v)])
-                     (:value op)
-                     exec-results)]
-      (complete-mops-or-error conn op mops))))
+(defn- archive-reply [reply]
+  (cond (bytes? reply) {:bytes (mapv #(bit-and 255 %) reply)}
+        (sequential? reply) (mapv archive-reply reply)
+        :else reply))
+
+(defn- valid-slot? [[f] reply]
+  (case f
+    :append (and (integer? reply) (pos? reply))
+    :r (and (sequential? reply) (every? #(and (string? %) (some? (parse-long %))) reply))))
+
+(defn- complete-exec-results [conn op replies]
+  (let [mops (:value op)
+        arity? (and (sequential? replies) (= (count mops) (count replies)))
+        e (when (sequential? replies) (first-exception replies))
+        invalid (when arity?
+                  (keep-indexed (fn [i reply]
+                                  (when (and (not (redis-exception? reply))
+                                             (not (valid-slot? (nth mops i) reply))) i))
+                                replies))]
+    (if (and arity? (nil? e) (empty? invalid))
+      (let [lengths (into {} (keep-indexed (fn [i [f]] (when (= :append f) [i (nth replies i)])) mops))
+            result (complete-mops-or-error conn op
+                     (mapv (fn [[f k v] reply] [f k (if (= :r f) reply v)]) mops replies))]
+        (cond-> result (seq lengths) (assoc :exec-lengths lengths)))
+      (cond-> (assoc (if e (exec-array-error-op op e) (assoc op :type :info :error :invalid-exec-reply))
+                     :exec-observations
+                     (vec (when (sequential? replies)
+                            (keep-indexed (fn [i reply]
+                                            (when-not (redis-exception? reply)
+                                              {:index i :operation (get mops i) :reply (archive-reply reply)}))
+                                          replies))))
+        e (assoc :exec-errors (vec (keep-indexed (fn [i reply]
+                                                   (when (redis-exception? reply)
+                                                     {:index i :operation (get mops i) :error (redis-error-label reply)}))
+                                                 replies)))
+        (not arity?) (assoc :exec-arity {:expected (count mops)
+                                         :actual (when (sequential? replies) (count replies))})
+        (seq invalid) (assoc :invalid-exec-slots (vec invalid))))))
 
 (defn- apply-multi-op! [conn op]
   (let [exec-results (rc/with-txn conn
@@ -118,7 +150,10 @@
         client (->ElastickvRedisClient (or (:node->port opts)
                                            (zipmap default-nodes (repeat 6379)))
                                        nil)]
-    (assoc workload :client client)))
+    (assoc workload :client client
+           :checker (reify checker/Checker
+                      (check [_ test h opts]
+                        (elle/check-exec-replies (checker/check (:checker workload) test h opts) h))))))
 
 (defn elastickv-redis-test
   "Builds a Jepsen test map that drives elastickv's Redis protocol with the
