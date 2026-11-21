@@ -22,7 +22,7 @@ require (
 	github.com/getsentry/sentry-go v0.50.0
 	github.com/goccy/go-json v0.12.0
 	github.com/hanwen/go-fuse/v2 v2.12.1
-	github.com/klauspost/compress v1.20.3
+	github.com/klauspost/compress v1.20.4
 	github.com/pkg/errors v0.9.1
 	github.com/prometheus/client_golang v1.25.0
 	github.com/prometheus/client_model v0.6.3
