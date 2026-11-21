@@ -35,6 +35,29 @@
       (with-redefs [grpc/exchange! (fn [& _] (throw (ex-info "process exited" {})))]
         (is (= :info (:type (client/invoke! c {} write))))))))
 
+(deftest final-read-retries-indeterminate-observations
+  (doseq [api [:raw :transactional]]
+    (let [c (:client (grpc/grpc-register-workload {:grpc-api api}))
+          read {:f :read :type :invoke :final true
+                :value (independent/tuple 1 nil)}
+          calls (atom 0)]
+      (with-redefs [grpc/exchange! (fn [& _]
+                                    (if (< (swap! calls inc) 3)
+                                      {:type "info" :error "connection reset"}
+                                      {:type "ok" :value 7}))]
+        (is (= (independent/tuple 1 7)
+               (:value (client/invoke! c {} read))))
+        (is (= 3 @calls)))
+      (reset! calls 0)
+      (with-redefs [grpc/exchange! (fn [& _]
+                                    (swap! calls inc)
+                                    {:type "info" :error "unavailable"})]
+        (is (= :info (:type (client/invoke! c {} read))))
+        (is (= 5 @calls))
+        (reset! calls 0)
+        (is (= :info (:type (client/invoke! c {} (dissoc read :final)))))
+        (is (= 1 @calls))))))
+
 (deftest gRPC-builder-requires-real-local-endpoints-or-hosted-nemesis
   (is (thrown? Exception (grpc/elastickv-grpc-test {})))
   (is (thrown? Exception (grpc/elastickv-grpc-test {:local true :concurrency 5})))
