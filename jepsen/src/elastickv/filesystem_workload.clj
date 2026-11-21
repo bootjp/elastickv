@@ -460,8 +460,10 @@
   (let [m (sh-quote mount-dir)
         w (sh-quote (workload-dir mount-dir))
         q (sh-quote path)]
-    (str "{ mountpoint -q " m " && [ -d " w " ]; } || { echo "
-         (sh-quote (str mount-unavailable-message ": " mount-dir)) " >&2; exit 1; }; "
+    (str "mountpoint -q " m " || { echo "
+         (sh-quote (str mount-unavailable-message ": mountpoint check failed: " mount-dir)) " >&2; exit 1; }; "
+         "[ -d " w " ] || { echo "
+         (sh-quote (str mount-unavailable-message ": workload directory check failed: " (workload-dir mount-dir))) " >&2; exit 1; }; "
          "s=$(stat -c %s " q ") || exit 1; "
          "[ \"$s\" -ge " record-width " ] || { echo " (sh-quote short-record-message) " >&2; exit 1; }; "
          "exec head -c " record-width " " q)))

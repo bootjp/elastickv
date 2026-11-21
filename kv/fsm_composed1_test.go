@@ -376,3 +376,26 @@ func TestVerifyComposed1_DynamoMetaKeyNormalizedToRouteKeyBeforeOwnerOf(t *testi
 	require.NoError(t, fsm.verifyComposed1(context.Background(), commitTxnRequest(1, string(rawMetaKey))),
 		"issue #930: verifyOwnerFromSnapshot must routeKey-normalize raw adapter keys before OwnerOf, so the gate routes the same way as ShardRouter.ResolveGroup; without normalization the raw \"!ddb|meta|...\" key sorts below the \"!ddb|route|...\" range and is falsely owned by group 1")
 }
+
+type countedOwnerSnapshot struct {
+	RouteSnapshot
+	lookups int
+}
+
+func (s *countedOwnerSnapshot) OwnerOf(key []byte) (uint64, bool) {
+	s.lookups++
+	return s.RouteSnapshot.OwnerOf(key)
+}
+
+func TestVerifyComposed1ChecksUnchangedVersionOnce(t *testing.T) {
+	t.Parallel()
+	h := applyRouteContextHistory(t, 1, distribution.RouteDescriptor{
+		RouteID: 1, GroupID: 1, State: distribution.RouteStateActive,
+	})
+	snap, ok := h.Current()
+	require.True(t, ok)
+	counted := &countedOwnerSnapshot{RouteSnapshot: snap}
+	f := &kvFSM{routes: immutableApplyRouteHistory{current: counted}, shardGroupID: 1}
+	require.NoError(t, f.verifyComposed1(t.Context(), commitTxnRequest(1, "a", "b")))
+	require.Equal(t, 2, counted.lookups)
+}

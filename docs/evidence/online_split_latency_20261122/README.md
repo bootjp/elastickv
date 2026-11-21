@@ -1,3 +1,5 @@
+> Superseded intermediate measurement: concurrent VM use was later discovered, and the measured revision lacked the newer low/equal-timestamp WAL visibility guard. Its performance figures are not accepted as an isolated comparison or final-runtime evidence. ACK integrity observations remain recorded. An exclusive rerun of the guarded merged revision is pending.
+
 # Online Split latency and review corrections, 2026-11-22
 
 The measured revision is `663c2e2b755b1456eb83238e54afad6d4d921fed`. The baseline is the previous online release `8c2282837ecee54d51c664c67576a8f90e5f90e4`, rather than the older legacy implementation. The earlier legacy/online comparison remains in `../online_split_20261121/`.

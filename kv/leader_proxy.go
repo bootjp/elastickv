@@ -11,7 +11,9 @@ import (
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 const leaderForwardTimeout = 5 * time.Second
@@ -362,16 +364,26 @@ func (p *LeaderProxy) forwardLeaseRead(callerCtx context.Context) (leaseReadResu
 	ctx, cancel := context.WithDeadline(callerCtx, deadline)
 	defer cancel()
 	var lastErr error
-	for time.Now().Before(deadline) {
+	retriedUnavailable := false
+	for ctx.Err() == nil {
 		result, err := p.forwardLeaseReadOnce(ctx)
 		if err == nil {
 			return result, nil
 		}
 		lastErr = err
 		if !isTransientLeaderError(err) {
-			return leaseReadResult{}, err
+			// A healed partition can leave a reset connection in the pool.
+			// Re-resolve the leader and request a fresh fence once. No read
+			// can succeed until a leader answers the new RPC.
+			if status.Code(err) != codes.Unavailable || retriedUnavailable {
+				return leaseReadResult{}, err
+			}
+			retriedUnavailable = true
 		}
 		waitLeaderProxyBackoff(ctx, leaderProxyRetryInterval, deadline)
+	}
+	if err := callerCtx.Err(); err != nil {
+		return leaseReadResult{}, errors.WithStack(err)
 	}
 	if lastErr == nil {
 		lastErr = ErrLeaderNotFound

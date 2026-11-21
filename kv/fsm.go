@@ -1894,6 +1894,11 @@ func (f *kvFSM) verifyComposed1(ctx context.Context, r *pb.Request) error {
 		// short-circuit posture of an unwired FSM).
 		return nil
 	}
+	// A catalog version names an immutable ownership map. Once every mutation
+	// passed the observed check, the same version has no new owner to check.
+	if currentSnap.Version() == observedVer {
+		return nil
+	}
 	return f.verifyOwnerFromSnapshot(r.GetMutations(), bypassKeys, currentSnap, currentSnap.Version(), "current")
 }
 

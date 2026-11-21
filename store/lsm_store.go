@@ -1705,10 +1705,14 @@ func appendScanKeyResult(result [][]byte, seen map[string]struct{}, key []byte, 
 	keyCopy := make([]byte, len(key))
 	copy(keyCopy, key)
 	seen[string(keyCopy)] = struct{}{}
+	n := len(result)
 	result = append(result, keyCopy)
-	sort.Slice(result, func(i, j int) bool {
-		return bytes.Compare(result[i], result[j]) < 0
-	})
+	// The retained keys are sorted. A late prefix can precede the previous tail.
+	if n > 0 && bytes.Compare(result[n-1], keyCopy) > 0 {
+		sort.Slice(result, func(i, j int) bool {
+			return bytes.Compare(result[i], result[j]) < 0
+		})
+	}
 	for len(result) > limit {
 		delete(seen, string(result[len(result)-1]))
 		result = result[:len(result)-1]
@@ -2656,7 +2660,8 @@ func (s *pebbleStore) applyMutationsWithOpts(ctx context.Context, mutations []*K
 	if fastPathDone {
 		return nil
 	}
-	if err := checkCommitTSFence(mutations, commitTS, s.LastCommitTS(), fenceCommitTS); err != nil {
+	watermark := s.LastCommitTS()
+	if err := checkCommitTSFence(mutations, commitTS, watermark, fenceCommitTS); err != nil {
 		return err
 	}
 
@@ -2674,10 +2679,19 @@ func (s *pebbleStore) applyMutationsWithOpts(ctx context.Context, mutations []*K
 		return err
 	}
 
-	newLastTS, err := s.stageLastCommitTSInBatch(b, commitTS, advanceLastCommitTS)
+	return s.commitMutationBatch(b, writeOpts, commitTS, appliedIndex, watermark, advanceLastCommitTS)
+}
+
+func (s *pebbleStore) commitMutationBatch(b *pebble.Batch, writeOpts *pebble.WriteOptions, commitTS, appliedIndex, watermark uint64, advanceLastCommitTS bool) error {
+	if appliedIndex != 0 && advanceLastCommitTS && commitTS > watermark {
+		return s.commitIndexedRaftDataBatch(b, writeOpts, commitTS, appliedIndex)
+	}
+
+	newLastTS, unlockLastCommitTS, err := s.stageLastCommitTSInBatch(b, commitTS, advanceLastCommitTS)
 	if err != nil {
 		return err
 	}
+	defer unlockLastCommitTS()
 	// Bundle metaAppliedIndex in the same batch as the data + commitTS
 	// meta key so a crash either commits all three atomically or none.
 	// appliedIndex==0 is the legacy / non-raft callers (ApplyMutations
@@ -2689,11 +2703,29 @@ func (s *pebbleStore) applyMutationsWithOpts(ctx context.Context, mutations []*K
 		return errors.WithStack(err)
 	}
 	if advanceLastCommitTS {
-		s.mtx.Lock()
 		s.updateLastCommitTS(newLastTS)
-		s.mtx.Unlock()
 	}
 
+	return nil
+}
+
+// commitIndexedRaftDataBatch persists an already committed Raft entry
+// while readers can take the metadata lock during WAL sync. The caller verifies that
+// every staged timestamp is above the published watermark while holding
+// applyMu and dbMu. The advertised watermark advances after the batch commits.
+func (s *pebbleStore) commitIndexedRaftDataBatch(b *pebble.Batch, opts *pebble.WriteOptions, lastTS, appliedIndex uint64) error {
+	if err := setPebbleUint64InBatch(b, metaLastCommitTSBytes, lastTS); err != nil {
+		return err
+	}
+	if err := stageAppliedIndexInBatch(b, appliedIndex); err != nil {
+		return err
+	}
+	if err := b.Commit(opts); err != nil {
+		return errors.WithStack(err)
+	}
+	s.mtx.Lock()
+	s.updateLastCommitTS(lastTS)
+	s.mtx.Unlock()
 	return nil
 }
 
@@ -2704,17 +2736,25 @@ func stageAppliedIndexInBatch(b *pebble.Batch, appliedIndex uint64) error {
 	return setPebbleUint64InBatch(b, metaAppliedIndexBytes, appliedIndex)
 }
 
-// The caller holds applyMu across staging, commit, and mirror publication.
-// All watermark writers, including direct writes, take applyMu first. Readers
-// may keep using the preceding committed watermark while this batch syncs.
-func (s *pebbleStore) stageLastCommitTSInBatch(b *pebble.Batch, commitTS uint64, advance bool) (uint64, error) {
+func (s *pebbleStore) stageLastCommitTSInBatch(b *pebble.Batch, commitTS uint64, advance bool) (uint64, func(), error) {
 	if !advance {
-		return 0, nil
+		return 0, func() {}, nil
 	}
-	s.mtx.RLock()
-	newLastTS := max(s.lastCommitTS, commitTS)
-	s.mtx.RUnlock()
-	return newLastTS, setPebbleUint64InBatch(b, metaLastCommitTSBytes, newLastTS)
+
+	// Hold mtx across read → batch-set → commit → in-memory update so that a
+	// concurrent alignCommitTS (PutAt/DeleteAt/ExpireAt) cannot advance+persist
+	// metaLastCommitTS between our read and batch commit, which would let this
+	// batch overwrite the meta key with a smaller value.
+	s.mtx.Lock()
+	newLastTS := s.lastCommitTS
+	if commitTS > newLastTS {
+		newLastTS = commitTS
+	}
+	if err := setPebbleUint64InBatch(b, metaLastCommitTSBytes, newLastTS); err != nil {
+		s.mtx.Unlock()
+		return 0, nil, err
+	}
+	return newLastTS, s.mtx.Unlock, nil
 }
 
 // DeletePrefixAt atomically deletes all visible keys matching prefix by writing

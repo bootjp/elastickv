@@ -100,6 +100,24 @@ func newStubFollowerEngine(leaderAddr string) *testEngine {
 	}
 }
 
+func TestForwardLeaseReadHonorsCallerDeadlineDuringElection(t *testing.T) {
+	p := NewLeaderProxyWithEngine(newStubFollowerEngine(""))
+	t.Cleanup(func() { require.NoError(t, p.Close()) })
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.forwardLeaseRead(ctx)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+	case <-time.After(time.Second):
+		t.Fatal("lease read outlived its caller's deadline")
+	}
+}
+
 func TestLeaderProxy_CommitLocalWhenLeader(t *testing.T) {
 	t.Parallel()
 

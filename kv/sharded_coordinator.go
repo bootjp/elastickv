@@ -1628,45 +1628,32 @@ func (c *ShardedCoordinator) partitionResolverRecognisesPointKey(key []byte) boo
 	return c.router.partitionResolver.RecognisesPartitionedKey(key)
 }
 
-func (c *ShardedCoordinator) writeFenceBypassKeysForElems(elems []*Elem[OP]) [][]byte {
-	if len(elems) == 0 {
-		return nil
-	}
-	out := make([][]byte, 0, len(elems))
-	for _, elem := range elems {
-		if elem == nil || elem.Op == DelPrefix || (elem.GroupID == 0 && !c.partitionResolverClaimsPointKey(elem.Key)) {
-			continue
-		}
-		out = append(out, bytes.Clone(elem.Key))
-	}
-	return out
-}
-
 func (c *ShardedCoordinator) writeFenceBypassKeysByGroup(elems []*Elem[OP]) map[uint64][][]byte {
-	out := make(map[uint64][][]byte)
+	var out map[uint64][][]byte
 	for _, elem := range elems {
-		if elem == nil || elem.Op == DelPrefix {
+		gid, ok := c.writeFenceBypassGroup(elem)
+		if !ok {
 			continue
 		}
-		gid := elem.GroupID
-		if gid == 0 {
-			var ok bool
-			gid, ok = c.router.ResolveGroup(elem.Key)
-			if !ok || !c.partitionResolverClaimsPointKey(elem.Key) {
-				continue
-			}
+		if out == nil {
+			out = make(map[uint64][][]byte)
 		}
 		out[gid] = append(out[gid], bytes.Clone(elem.Key))
 	}
 	return out
 }
 
-func (c *ShardedCoordinator) partitionResolverClaimsPointKey(key []byte) bool {
-	if c == nil || c.router == nil || c.router.partitionResolver == nil || len(key) == 0 {
-		return false
+func (c *ShardedCoordinator) writeFenceBypassGroup(elem *Elem[OP]) (uint64, bool) {
+	if elem == nil || elem.Op == DelPrefix {
+		return 0, false
 	}
-	_, ok := c.router.partitionResolver.ResolveGroup(key)
-	return ok
+	if elem.GroupID != 0 {
+		return elem.GroupID, true
+	}
+	if len(elem.Key) == 0 || c.router == nil || c.router.partitionResolver == nil {
+		return 0, false
+	}
+	return c.router.partitionResolver.ResolveGroup(elem.Key)
 }
 
 func (c *ShardedCoordinator) rejectWriteFencedDelPrefixes(elems []*Elem[OP]) error {
@@ -1861,25 +1848,15 @@ func (c *ShardedCoordinator) dispatchTxn(
 	if err := c.validateCallerSuppliedTxnStart(ctx, startTS, singleShard, callerSuppliedStartTS); err != nil {
 		return nil, err
 	}
-	if resp, handled, err := c.maybeDispatchLeaderStampedTxn(ctx, singleShard, startTS, commitTS, prevCommitTS, primaryKey, gids, elems, readKeys, observedRouteVersion); handled {
-		return resp, err
-	}
-
-	commitTS, err = c.settleTxnCommitTimestamp(ctx, startTS, commitTS, elems, grouped, bypassKeysByGroup)
+	commitTS, err = c.settleTxnCommitTimestamp(ctx, singleShard, startTS, commitTS, elems, grouped, bypassKeysByGroup)
 	if err != nil {
 		return nil, err
 	}
-
 	if singleShard {
-		// Fast path: all mutations and read keys are in a single shard.
-		// Use the one-phase path without allocating a grouped-read-keys map.
-		// If any read key belongs to a different shard the 2PC path is required
-		// so that validateReadOnlyShards can issue a linearizable read barrier,
-		// preserving SSI.
-		return c.dispatchSingleShardTxn(ctx, startTS, commitTS, prevCommitTS, primaryKey, gids[0], elems, readKeys, observedRouteVersion, c.writeFenceBypassKeysForElems(elems))
-	}
-	if err := StampGroupedMutationCommitTS(grouped, commitTS); err != nil {
-		return nil, err
+		// groupMutations appends in input order, so this bucket is the entire
+		// original mutation sequence, including repeated keys.
+		gid := gids[0]
+		return c.dispatchSingleShardTxn(ctx, startTS, commitTS, prevCommitTS, primaryKey, gid, grouped[gid], readKeys, observedRouteVersion, bypassKeysByGroup[gid])
 	}
 	return c.dispatchMultiShardTxn(ctx, startTS, commitTS, prevCommitTS, primaryKey, grouped, gids, readKeys, observedRouteVersion, bypassKeysByGroup, requireAllParticipants)
 }
@@ -1899,60 +1876,28 @@ func requireAllParticipantsFlag(flags []bool) bool {
 	return len(flags) > 0 && flags[0]
 }
 
-func (c *ShardedCoordinator) maybeDispatchLeaderStampedTxn(ctx context.Context, singleShard bool, startTS, commitTS, prevCommitTS uint64, primaryKey []byte, gids []uint64, elems []*Elem[OP], readKeys [][]byte, observedRouteVersion uint64) (*CoordinateResponse, bool, error) {
-	if !singleShard || commitTS != 0 || ctx.Value(leaderIssuedCommitTSContextKey{}) != true {
-		return nil, false, nil
-	}
-	resp, err := c.dispatchSingleShardTxnLeaderStamped(ctx, startTS, prevCommitTS, primaryKey, gids[0], elems, readKeys, observedRouteVersion, c.writeFenceBypassKeysForElems(elems))
-	return resp, true, err
-}
-
-func (c *ShardedCoordinator) dispatchSingleShardTxnLeaderStamped(ctx context.Context, startTS, prevCommitTS uint64, primaryKey []byte, gid uint64, elems []*Elem[OP], readKeys [][]byte, observedRouteVersion uint64, writeFenceBypassKeys [][]byte) (*CoordinateResponse, error) {
-	g, err := c.txnGroupForID(gid)
-	if err != nil {
-		return nil, err
-	}
-	readKeys = c.readKeysWithStagedVisibilityAliasesForGroup(gid, readKeys)
-	readKeys = c.readKeysWithStagedVisibilityMutationAliasesForGroup(gid, readKeys, elems)
-	if len(readKeys) > maxReadKeys {
-		return nil, errors.WithStack(ErrInvalidRequest)
-	}
-	resp, err := g.Txn.Commit(ctx, []*pb.Request{
-		onePhaseTxnRequestWithPrevCommit(startTS, 0, prevCommitTS, primaryKey, elems, readKeys, observedRouteVersion, writeFenceBypassKeys),
-	})
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-	if resp == nil || resp.CommitTS <= startTS {
-		return nil, errors.WithStack(ErrTxnCommitTSRequired)
-	}
-	if c.clock != nil {
-		c.clock.Observe(resp.CommitTS)
-	}
-	return &CoordinateResponse{CommitIndex: resp.CommitIndex, CommitTS: resp.CommitTS}, nil
-}
-
-// settleTxnCommitTimestamp resolves the commit timestamp and then applies the
-// two checks that depend on it: the per-element commit-ts patches have to agree
-// with the settled value, and the route write floors have to admit a write at
-// it. Both belong after allocation and before any dispatch, so they travel with
-// the allocation rather than being repeated at each call site.
+// settleTxnCommitTimestamp checks write floors before stamping the routed mutations.
 func (c *ShardedCoordinator) settleTxnCommitTimestamp(
 	ctx context.Context,
+	singleShard bool,
 	startTS uint64,
 	commitTS uint64,
 	elems []*Elem[OP],
 	grouped map[uint64][]*pb.Mutation,
 	bypassKeysByGroup map[uint64][][]byte,
 ) (uint64, error) {
+	if singleShard && commitTS == 0 && ctx.Value(leaderIssuedCommitTSContextKey{}) == true {
+		// Forward offsets intact so the leader can stamp its chosen timestamp.
+		return 0, nil
+	}
 	settled, err := c.prepareTxnCommitTimestamp(ctx, startTS, commitTS, elems)
 	if err != nil {
 		return 0, err
 	}
-	if err := ValidateElemCommitTSPatches(elems, settled); err != nil {
+	if err := c.ensureGroupedMutationsWriteAllowedWithBypass(grouped, settled, bypassKeysByGroup); err != nil {
 		return 0, err
 	}
-	if err := c.ensureGroupedMutationsWriteAllowedWithBypass(grouped, settled, bypassKeysByGroup); err != nil {
+	if err := StampGroupedMutationCommitTS(grouped, settled); err != nil {
 		return 0, err
 	}
 	return settled, nil
@@ -2158,13 +2103,13 @@ func (c *ShardedCoordinator) allReadKeysInShard(readKeys [][]byte, gid uint64) b
 	return true
 }
 
-func (c *ShardedCoordinator) dispatchSingleShardTxn(ctx context.Context, startTS, commitTS, prevCommitTS uint64, primaryKey []byte, gid uint64, elems []*Elem[OP], readKeys [][]byte, observedRouteVersion uint64, writeFenceBypassKeys [][]byte) (*CoordinateResponse, error) {
+func (c *ShardedCoordinator) dispatchSingleShardTxn(ctx context.Context, startTS, commitTS, prevCommitTS uint64, primaryKey []byte, gid uint64, muts []*pb.Mutation, readKeys [][]byte, observedRouteVersion uint64, writeFenceBypassKeys [][]byte) (*CoordinateResponse, error) {
 	g, err := c.txnGroupForID(gid)
 	if err != nil {
 		return nil, err
 	}
 	readKeys = c.readKeysWithStagedVisibilityAliasesForGroup(gid, readKeys)
-	readKeys = c.readKeysWithStagedVisibilityMutationAliasesForGroup(gid, readKeys, elems)
+	readKeys = c.readKeysWithStagedVisibilityMutationAliasesForGroup(gid, readKeys, muts)
 	if len(readKeys) > maxReadKeys {
 		return nil, errors.WithStack(ErrInvalidRequest)
 	}
@@ -2172,11 +2117,21 @@ func (c *ShardedCoordinator) dispatchSingleShardTxn(ctx context.Context, startTS
 	// read-write conflicts atomically under applyMu. prevCommitTS, when set,
 	// carries the one-phase dedup probe key for a retry that reuses a failed
 	// attempt's write set.
-	resp, err := g.Txn.Commit(ctx, []*pb.Request{
-		onePhaseTxnRequestWithPrevCommit(startTS, commitTS, prevCommitTS, primaryKey, elems, readKeys, observedRouteVersion, writeFenceBypassKeys),
-	})
+	request := newOnePhaseTxnRequest(startTS, commitTS, prevCommitTS, primaryKey, len(muts), readKeys, observedRouteVersion, writeFenceBypassKeys)
+	request.Mutations = append(request.Mutations, muts...)
+	resp, err := g.Txn.Commit(ctx, []*pb.Request{request})
 	if err != nil {
 		return nil, errors.WithStack(err)
+	}
+	if commitTS == 0 {
+		// The leader stamps these requests immediately before proposal.
+		if resp == nil || resp.CommitTS <= startTS {
+			return nil, errors.WithStack(ErrTxnCommitTSRequired)
+		}
+		commitTS = resp.CommitTS
+		if c.clock != nil {
+			c.clock.Observe(commitTS)
+		}
 	}
 	if resp == nil {
 		return nil, errors.WithStack(ErrTransactionOutcomeUnknown)
@@ -2205,13 +2160,13 @@ func (c *ShardedCoordinator) readKeysWithStagedVisibilityAliasesForGroup(gid uin
 	return out
 }
 
-func (c *ShardedCoordinator) readKeysWithStagedVisibilityMutationAliasesForGroup(gid uint64, readKeys [][]byte, elems []*Elem[OP]) [][]byte {
+func (c *ShardedCoordinator) readKeysWithStagedVisibilityMutationAliasesForGroup(gid uint64, readKeys [][]byte, muts []*pb.Mutation) [][]byte {
 	var out [][]byte
-	for _, elem := range elems {
-		if elem == nil {
+	for _, mut := range muts {
+		if mut == nil {
 			continue
 		}
-		alias, ok := c.stagedVisibilityReadKeyAlias(gid, elem.Key)
+		alias, ok := c.stagedVisibilityReadKeyAlias(gid, mut.Key)
 		if !ok {
 			continue
 		}
@@ -3343,9 +3298,9 @@ func (c *ShardedCoordinator) validateReadOnlyShards(ctx context.Context, grouped
 }
 
 func (c *ShardedCoordinator) validateReadKeysOnShard(ctx context.Context, gid uint64, keys [][]byte, startTS uint64) error {
-	g, ok := c.groups[gid]
-	if !ok {
-		return nil
+	g := c.groups[gid]
+	if g == nil || g.Store == nil {
+		return errors.Wrapf(ErrInvalidRequest, "no store for read-only transaction group %d", gid)
 	}
 	// Linearizable read barrier: wait until the shard's FSM has applied
 	// all Raft-committed entries so LatestCommitTS reflects the latest
@@ -3764,14 +3719,12 @@ func (c *ShardedCoordinator) groupMutations(reqs []*Elem[OP], label keyviz.Label
 		}
 		mut := elemToMutation(req)
 		gid := req.GroupID
-		_, routeID, routeOK := c.resolveGroupAndRouteForKey(mut.Key)
+		resolvedGID, routeID, routeOK := c.resolveGroupAndRouteForKey(mut.Key)
 		if gid == 0 {
-			resolvedGID, resolvedRouteID, ok := c.resolveGroupAndRouteForKey(mut.Key)
-			if !ok {
+			if !routeOK {
 				return nil, nil, errors.Wrapf(ErrInvalidRequest, "no route for key %q", mut.Key)
 			}
 			gid = resolvedGID
-			routeID = resolvedRouteID
 		} else if _, ok := c.groups[gid]; !ok {
 			return nil, nil, errors.Wrapf(ErrInvalidRequest, "no shard group %d for key %q", gid, mut.Key)
 		} else if !routeOK {
