@@ -37,3 +37,14 @@ func TestScopeForKeyStillScopesChunkRef(t *testing.T) {
 	require.Equal(t, "s3", scope.Adapter)
 	require.Equal(t, "bucket", scope.Name)
 }
+
+func TestMigrationIntentIsInternalAndRecognized(t *testing.T) {
+	t.Parallel()
+	key := s3keys.MigrationIntentKey("bucket", 3, "object")
+	adapter, ok := AdapterForKey(key)
+	require.True(t, ok)
+	require.Equal(t, "s3", adapter)
+	_, scoped, err := ScopeForKey(key)
+	require.NoError(t, err)
+	require.False(t, scoped)
+}

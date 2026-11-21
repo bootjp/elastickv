@@ -23,6 +23,11 @@ func (s *S3Server) runBucketCleanupRecovery(ctx context.Context, generation uint
 			if ctx.Err() == nil {
 				slog.WarnContext(ctx, "s3 bucket cleanup recovery failed", "err", err)
 			}
+		} else if err := s.recoverPendingS3Migrations(ctx); err != nil {
+			s.setBlobGCReadyIfCurrent(ctx, generation, false)
+			if ctx.Err() == nil {
+				slog.WarnContext(ctx, "s3 migration recovery failed", "err", err)
+			}
 		} else if ctx.Err() == nil {
 			s.setBlobGCReadyIfCurrent(ctx, generation, true)
 		}

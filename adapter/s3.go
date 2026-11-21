@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -124,6 +125,8 @@ type S3Server struct {
 	blobMinReplicas      int
 	blobPushBlocked      func() bool
 	blobBackfiller       *S3BlobBackfiller
+	legacyMigration      *s3LegacyBlobMigrationWorker
+	activeMigrations     sync.Map
 	// adminBlobUsers counts the admin object operations that may use
 	// blobCluster from outside the HTTP listener (see enterAdminBlobUse),
 	// so Stop can wait for them before closing the cluster.
@@ -466,6 +469,9 @@ func (s *S3Server) Run() error {
 func (s *S3Server) Stop() {
 	if s == nil {
 		return
+	}
+	if s.legacyMigration != nil {
+		s.legacyMigration.stop()
 	}
 	s.stopBlobGC()
 	if s.blobBackfiller != nil {
