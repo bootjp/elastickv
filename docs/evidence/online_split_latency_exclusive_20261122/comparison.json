@@ -1,0 +1,282 @@
+{
+  "binary_sha256": {
+    "candidate-server.test": "bd98c2ca5c46ce35d9aad99d4e34acc76be9c5d6f467a2542b6e7c85dca78f82",
+    "baseline-server.test": "33b97a8b6b2707eb3d052b21ed89cf7831fab222a72bbd596f397ecc0c77446e",
+    "loadtest-window": "8350c069ee061ac2c89a1c876b3391a977d86eb724eca25837625aba993f8acc"
+  },
+  "source_commits": {
+    "baseline": "8c2282837ecee54d51c664c67576a8f90e5f90e4",
+    "candidate": "c664c80bb954a462b145846b602f6e13849b0cbe"
+  },
+  "vm": {
+    "id": 150,
+    "vcpus": 8,
+    "memory_gib": 8,
+    "nodes": 3,
+    "replication_groups": 2,
+    "sync_persistence": true,
+    "profiling": false
+  },
+  "common_duration_seconds": 58.0,
+  "method": "Each cross-group window starts at the reported migration request start, anchored to the streamed Done observation (phase polling at 100ms). Count client RPC completions within the window. p99 uses successful single primary RPCs, excluding verification and audit. Common rate comparison covers equal whole seconds after request start within stage 300. Exclusive VM handoff followed by baseline/candidate in A/B order; one pair, no mutation retries. Both server binaries built with Go 1.27.3. Historical concurrent/intermediate runs are excluded.",
+  "baseline": {
+    "config": {
+      "rates": [
+        100,
+        300,
+        500,
+        1000
+      ],
+      "stage_duration_ns": 90000000000,
+      "concurrency": 32,
+      "read_percent": 50,
+      "seed_keys": 256,
+      "value_bytes": 1024,
+      "max_requests": 1000000,
+      "prefix": "split-ramp",
+      "request_timeout_ns": 2000000000,
+      "verify_writes": true
+    },
+    "split_all": {
+      "seconds": 64.239,
+      "read": {
+        "attempts": 9634,
+        "success": 9628,
+        "ops_s": 149.87780009028782,
+        "success_p99_ms": 12.534968,
+        "all_p99_ms": 12.534968,
+        "errors": {
+          "Unknown": 6
+        }
+      },
+      "write": {
+        "attempts": 9634,
+        "success": 9631,
+        "ops_s": 149.9245006927256,
+        "success_p99_ms": 22.646479,
+        "all_p99_ms": 22.646479,
+        "errors": {
+          "Unavailable": 3
+        }
+      }
+    },
+    "full_run": {
+      "read": {
+        "success": 83180,
+        "errors": {
+          "Unknown": 6
+        }
+      },
+      "write": {
+        "success": 83170,
+        "errors": {
+          "Unavailable": 3
+        }
+      }
+    },
+    "start_ns": 1795284388800346228,
+    "done_observed_ns": 1795284453039346228,
+    "phase_clock_offset_spread_ms": 0.302091,
+    "timing": {
+      "lower_ms": 1620.202,
+      "upper_ms": 1642.217,
+      "families": 46,
+      "completed": 46,
+      "versions": 2080,
+      "capture_version": 1,
+      "sequence": 1428,
+      "seal_sequence": 1428
+    },
+    "ingress_count": 3,
+    "ack_count": 83170,
+    "expected_observations": 249510,
+    "readback_success": 249510,
+    "audit_verified": true,
+    "post_done_paths": {
+      "retained-forwarded": [
+        600,
+        600,
+        600,
+        0
+      ],
+      "moved-direct": [
+        600,
+        600,
+        600,
+        0
+      ],
+      "outside-direct": [
+        600,
+        600,
+        600,
+        0
+      ],
+      "moved-forwarded": [
+        600,
+        600,
+        600,
+        0
+      ],
+      "retained-direct": [
+        600,
+        600,
+        600,
+        0
+      ]
+    },
+    "dropped_capacity": 795,
+    "dropped_scheduler": 3846,
+    "driver_exit": "exit status 1",
+    "server_test_exit": 0,
+    "split_common_rate": {
+      "seconds": 58.0,
+      "read": {
+        "attempts": 8698,
+        "success": 8692,
+        "ops_s": 149.86206896551724,
+        "success_p99_ms": 12.599608,
+        "all_p99_ms": 12.599608,
+        "errors": {
+          "Unknown": 6
+        }
+      },
+      "write": {
+        "attempts": 8699,
+        "success": 8696,
+        "ops_s": 149.93103448275863,
+        "success_p99_ms": 23.040895,
+        "all_p99_ms": 23.040895,
+        "errors": {
+          "Unavailable": 3
+        }
+      }
+    }
+  },
+  "candidate": {
+    "config": {
+      "rates": [
+        100,
+        300,
+        500,
+        1000
+      ],
+      "stage_duration_ns": 90000000000,
+      "concurrency": 32,
+      "read_percent": 50,
+      "seed_keys": 256,
+      "value_bytes": 1024,
+      "max_requests": 1000000,
+      "prefix": "split-ramp",
+      "request_timeout_ns": 2000000000,
+      "verify_writes": true
+    },
+    "split_all": {
+      "seconds": 58.166,
+      "read": {
+        "attempts": 8723,
+        "success": 8723,
+        "ops_s": 149.96733486916756,
+        "success_p99_ms": 11.109259,
+        "all_p99_ms": 11.109259,
+        "errors": {}
+      },
+      "write": {
+        "attempts": 8723,
+        "success": 8722,
+        "ops_s": 149.95014269504523,
+        "success_p99_ms": 22.220758,
+        "all_p99_ms": 22.220758,
+        "errors": {
+          "Unavailable": 1
+        }
+      }
+    },
+    "full_run": {
+      "read": {
+        "success": 83297,
+        "errors": {}
+      },
+      "write": {
+        "success": 83303,
+        "errors": {
+          "Unavailable": 1
+        }
+      }
+    },
+    "start_ns": 1795285352292306312,
+    "done_observed_ns": 1795285410458306312,
+    "phase_clock_offset_spread_ms": 0.815813,
+    "timing": {
+      "lower_ms": 1489.679,
+      "upper_ms": 1510.243,
+      "families": 46,
+      "completed": 46,
+      "versions": 2073,
+      "capture_version": 1,
+      "sequence": 1130,
+      "seal_sequence": 1130
+    },
+    "ingress_count": 3,
+    "ack_count": 83303,
+    "expected_observations": 249909,
+    "readback_success": 249909,
+    "audit_verified": true,
+    "post_done_paths": {
+      "moved-direct": [
+        600,
+        600,
+        600,
+        0
+      ],
+      "moved-forwarded": [
+        600,
+        600,
+        600,
+        0
+      ],
+      "retained-direct": [
+        600,
+        600,
+        600,
+        0
+      ],
+      "retained-forwarded": [
+        600,
+        600,
+        600,
+        0
+      ],
+      "outside-direct": [
+        600,
+        600,
+        600,
+        0
+      ]
+    },
+    "dropped_capacity": 621,
+    "dropped_scheduler": 3778,
+    "driver_exit": "exit status 1",
+    "server_test_exit": 0,
+    "split_common_rate": {
+      "seconds": 58.0,
+      "read": {
+        "attempts": 8697,
+        "success": 8697,
+        "ops_s": 149.94827586206895,
+        "success_p99_ms": 11.109259,
+        "all_p99_ms": 11.109259,
+        "errors": {}
+      },
+      "write": {
+        "attempts": 8698,
+        "success": 8697,
+        "ops_s": 149.94827586206895,
+        "success_p99_ms": 22.319184,
+        "all_p99_ms": 22.319184,
+        "errors": {
+          "Unavailable": 1
+        }
+      }
+    }
+  }
+}

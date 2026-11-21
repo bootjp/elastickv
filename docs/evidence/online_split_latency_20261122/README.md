@@ -1,4 +1,4 @@
-> Superseded intermediate measurement: concurrent VM use was later discovered, and the measured revision lacked the newer low/equal-timestamp WAL visibility guard. Its performance figures are not accepted as an isolated comparison or final-runtime evidence. ACK integrity observations remain recorded. An exclusive rerun of the guarded merged revision is pending.
+> Superseded intermediate measurement: concurrent VM use was later discovered, and the measured revision lacked the newer low/equal-timestamp WAL visibility guard. Its performance figures are not accepted as an isolated comparison or final-runtime evidence. ACK integrity observations remain recorded. The final exclusive rerun is recorded in [online_split_latency_exclusive_20261122](../online_split_latency_exclusive_20261122/README.md).
 
 # Online Split latency and review corrections, 2026-11-22
 
