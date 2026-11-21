@@ -10,11 +10,13 @@ import (
 )
 
 const (
-	rawHandoffMaxWait        = 2 * time.Second
-	rawHandoffRetryDelay     = 10 * time.Millisecond
-	rawHandoffMaxWaiters     = 256
-	rawHandoffMaxBytes       = 8 << 20
-	rawHandoffWaiterOverhead = 256
+	rawHandoffResponseReserve = 100 * time.Millisecond
+	rawHandoffReserveFraction = 4
+	rawHandoffMaxWait         = 2 * time.Second
+	rawHandoffRetryDelay      = 10 * time.Millisecond
+	rawHandoffMaxWaiters      = 256
+	rawHandoffMaxBytes        = 8 << 20
+	rawHandoffWaiterOverhead  = 256
 )
 
 var rawHandoffWaiters = make(chan struct{}, rawHandoffMaxWaiters)
@@ -44,7 +46,11 @@ func (r *GRPCServer) dispatchRawHandoff(ctx context.Context, key []byte, payload
 		return response, err
 	}
 	defer release()
-	waiting, cancel := context.WithTimeout(ctx, rawHandoffMaxWait)
+	wait := rawHandoffWaitBudget(ctx)
+	if wait <= 0 {
+		return response, err
+	}
+	waiting, cancel := context.WithTimeout(ctx, wait)
 	defer cancel()
 	return waitRawHandoff(waiting, dispatch, response, err)
 }
@@ -92,4 +98,16 @@ func waitRawHandoff(ctx context.Context, dispatch func(context.Context) (*kv.Coo
 
 func retryableRawHandoff(err error) bool {
 	return kv.IsMigrationAdmissionRejection(err) && (kv.IsMutationNotAdmitted(err) || kv.IsMutationApplyRejected(err))
+}
+
+// Leave response time after a proof-preserving wait. The client deadline can
+// otherwise expire while a known noncommit result is still waiting to return.
+func rawHandoffWaitBudget(ctx context.Context) time.Duration {
+	wait := rawHandoffMaxWait
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		reserve := min(rawHandoffResponseReserve, remaining/rawHandoffReserveFraction)
+		wait = min(wait, remaining-reserve)
+	}
+	return wait
 }

@@ -217,7 +217,7 @@ func (r *GRPCServer) grpcServesScanTargets(targets []kv.ReadFenceTarget) bool {
 	return false
 }
 
-func (r *GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.RawGetResponse, error) {
+func (r *GRPCServer) rawGetOnce(ctx context.Context, req *pb.RawGetRequest) (*pb.RawGetResponse, error) {
 	readRequest := kv.NewReadRequest(ctx, r.coordinator, r.store, r.readTracker)
 	defer readRequest.Close()
 	ctx = readRequest.Context()

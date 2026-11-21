@@ -2666,11 +2666,10 @@ func (s *pebbleStore) applyMutationsWithOpts(ctx context.Context, mutations []*K
 		return err
 	}
 
-	newLastTS, unlockLastCommitTS, err := s.stageLastCommitTSInBatch(b, commitTS, advanceLastCommitTS)
+	newLastTS, err := s.stageLastCommitTSInBatch(b, commitTS, advanceLastCommitTS)
 	if err != nil {
 		return err
 	}
-	defer unlockLastCommitTS()
 	// Bundle metaAppliedIndex in the same batch as the data + commitTS
 	// meta key so a crash either commits all three atomically or none.
 	// appliedIndex==0 is the legacy / non-raft callers (ApplyMutations
@@ -2682,7 +2681,9 @@ func (s *pebbleStore) applyMutationsWithOpts(ctx context.Context, mutations []*K
 		return errors.WithStack(err)
 	}
 	if advanceLastCommitTS {
+		s.mtx.Lock()
 		s.updateLastCommitTS(newLastTS)
+		s.mtx.Unlock()
 	}
 
 	return nil
@@ -2695,25 +2696,17 @@ func stageAppliedIndexInBatch(b *pebble.Batch, appliedIndex uint64) error {
 	return setPebbleUint64InBatch(b, metaAppliedIndexBytes, appliedIndex)
 }
 
-func (s *pebbleStore) stageLastCommitTSInBatch(b *pebble.Batch, commitTS uint64, advance bool) (uint64, func(), error) {
+// The caller holds applyMu across staging, commit, and mirror publication.
+// All watermark writers, including direct writes, take applyMu first. Readers
+// may keep using the preceding committed watermark while this batch syncs.
+func (s *pebbleStore) stageLastCommitTSInBatch(b *pebble.Batch, commitTS uint64, advance bool) (uint64, error) {
 	if !advance {
-		return 0, func() {}, nil
+		return 0, nil
 	}
-
-	// Hold mtx across read → batch-set → commit → in-memory update so that a
-	// concurrent alignCommitTS (PutAt/DeleteAt/ExpireAt) cannot advance+persist
-	// metaLastCommitTS between our read and batch commit, which would let this
-	// batch overwrite the meta key with a smaller value.
-	s.mtx.Lock()
-	newLastTS := s.lastCommitTS
-	if commitTS > newLastTS {
-		newLastTS = commitTS
-	}
-	if err := setPebbleUint64InBatch(b, metaLastCommitTSBytes, newLastTS); err != nil {
-		s.mtx.Unlock()
-		return 0, nil, err
-	}
-	return newLastTS, s.mtx.Unlock, nil
+	s.mtx.RLock()
+	newLastTS := max(s.lastCommitTS, commitTS)
+	s.mtx.RUnlock()
+	return newLastTS, setPebbleUint64InBatch(b, metaLastCommitTSBytes, newLastTS)
 }
 
 // DeletePrefixAt atomically deletes all visible keys matching prefix by writing
