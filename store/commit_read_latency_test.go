@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -76,6 +77,59 @@ func TestCommittedReadDoesNotWaitForUnrelatedWALSync(t *testing.T) {
 			case <-time.After(100 * time.Millisecond):
 				blocked = true
 				t.Error("committed historical read blocked behind unrelated WAL fsync")
+			}
+			close(fs.release)
+			if blocked {
+				require.NoError(t, <-readDone)
+			}
+			require.NoError(t, <-applyDone)
+			require.Equal(t, uint64(2), s.LastCommitTS())
+		})
+	}
+}
+func TestCommittedWatermarkDoesNotWaitForUnrelatedWALSync(t *testing.T) {
+	for _, scoped := range []bool{false, true} {
+		t.Run(map[bool]string{false: "single", true: "entry"}[scoped], func(t *testing.T) {
+			fs := &pausedSyncFS{FS: vfs.NewMem(), entered: make(chan struct{}), release: make(chan struct{})}
+			db, err := pebble.Open("db", &pebble.Options{FS: fs})
+			require.NoError(t, err)
+			defer func() { require.NoError(t, db.Close()) }()
+			s := &pebbleStore{db: db, fsmApplyWriteOpts: pebble.Sync, writeConflicts: newWriteConflictCounter()}
+			require.NoError(t, s.ApplyMutationsRaftAt(t.Context(), raftEntryPut("old", "value"), nil, 1, 1, 1))
+			fs.armed.Store(true)
+			applyDone := make(chan error, 1)
+			go func() {
+				apply := func(ctx context.Context) error {
+					return s.ApplyMutationsRaftAt(ctx, raftEntryPut("new", "value"), nil, 2, 2, 2)
+				}
+				if scoped {
+					applyDone <- s.ApplyRaftEntry(t.Context(), 2, apply)
+				} else {
+					applyDone <- apply(t.Context())
+				}
+			}()
+			select {
+			case <-fs.entered:
+			case <-time.After(time.Second):
+				close(fs.release)
+				t.Fatal("WAL sync was not reached")
+			}
+			readDone := make(chan error, 1)
+			go func() {
+				ts := s.LastCommitTS()
+				if ts != 1 {
+					readDone <- fmt.Errorf("watermark advanced before sync: %d", ts)
+					return
+				}
+				readDone <- nil
+			}()
+			blocked := false
+			select {
+			case e := <-readDone:
+				require.NoError(t, e)
+			case <-time.After(100 * time.Millisecond):
+				blocked = true
+				t.Error("committed watermark blocked behind unrelated WAL fsync")
 			}
 			close(fs.release)
 			if blocked {

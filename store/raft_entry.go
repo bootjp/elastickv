@@ -255,7 +255,7 @@ func (s *pebbleStore) commitRaftEntryScope(scope *raftEntryScope) error {
 	if scope.forceSync {
 		opts = pebble.Sync
 	}
-	if err := scope.batch.Commit(opts); err != nil {
+	if err := s.commitRaftEntryBatch(scope, opts); err != nil {
 		return errors.WithStack(err)
 	}
 	s.publishRaftEntryMirrors(scope, newLastTS)
@@ -443,4 +443,17 @@ func (s *pebbleStore) stagePrefixDeletesInRaftEntry(scope *raftEntryScope, delet
 	}
 	scope.observe(commitTS, true)
 	return nil
+}
+
+// The caller holds applyMu and mtx. Readiness transitions keep their exclusive
+// publication boundary. Data-only commits let readers use the preceding
+// watermark until the batch has synced and its mirrors can be published.
+func (s *pebbleStore) commitRaftEntryBatch(scope *raftEntryScope, opts *pebble.WriteOptions) error {
+	if scope.controlOnly || !scope.dataTouched || len(scope.readiness) != 0 {
+		return errors.WithStack(scope.batch.Commit(opts))
+	}
+	s.mtx.Unlock()
+	err := scope.batch.Commit(opts)
+	s.mtx.Lock()
+	return errors.WithStack(err)
 }

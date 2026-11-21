@@ -41,7 +41,7 @@ func retryRawReadHandoff(ctx context.Context, req *pb.RawGetRequest, attempt fun
 	}
 }
 func retryableRawReadHandoff(err error) bool {
-	return errors.Is(err, kv.ErrRouteCutoverPending) && !mixedMutationDispatchFailure(err)
+	return !mixedMutationDispatchFailure(err) && (errors.Is(err, kv.ErrRouteCutoverPending) || status.Code(err) == codes.Unavailable)
 }
 
 func rawReadHandoffTimeout(ctx context.Context) error {
@@ -49,4 +49,13 @@ func rawReadHandoffTimeout(ctx context.Context) error {
 		return errors.WithStack(status.FromContextError(err).Err())
 	}
 	return errors.WithStack(status.Error(codes.Unavailable, "Route unavailable"))
+}
+
+// Reads can retry an unavailable route after crossing a gRPC hop, where the
+// process-local sentinel is represented by its status code.
+func projectRawReadHandoffError(err error) error {
+	if !errors.Is(err, kv.ErrRouteCutoverPending) || mixedMutationDispatchFailure(err) {
+		return err
+	}
+	return errors.WithStack(errors.Mark(status.Error(codes.Unavailable, "Route unavailable"), kv.ErrRouteCutoverPending))
 }
