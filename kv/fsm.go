@@ -124,8 +124,9 @@ type kvFSM struct {
 	// deferApplyNotices holds observer notifications back while a batched
 	// Raft entry is staged (applyBatchedRequests); they are delivered once
 	// the entry commits and dropped if it does not.
-	deferApplyNotices    bool
-	deferredApplyNotices []func()
+	deferApplyNotices      bool
+	deferredApplyNotices   []func()
+	migrationCaptureShadow *MigrationCaptureShadowConfig
 	// backupTimestampFloor is the highest replicated BackupPin read timestamp.
 	// New raw, one-phase, and PREPARE entries at or below this floor were
 	// timestamped before the backup cut and reached apply too late.
@@ -437,6 +438,9 @@ func (f *kvFSM) Apply(data []byte) any {
 	reqs, err := decodeRaftRequests(data)
 	if err != nil {
 		return errors.WithStack(err)
+	}
+	if f.migrationCaptureShadow != nil && migrationCaptureShadowEligible(reqs) {
+		return f.applyMigrationCaptureShadow(ctx, data, reqs)
 	}
 	return f.applyDecodedRequests(ctx, reqs)
 }
