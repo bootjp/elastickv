@@ -139,6 +139,6 @@ func (i *Internal) decorateOnlineSourceGeneration(ctx context.Context, req *pb.P
 	if source.Closed {
 		return nil
 	}
-	resp.OwnershipGeneration = source.OwnershipGeneration
+	resp.OnlineSourceGeneration = source.OwnershipGeneration
 	return nil
 }

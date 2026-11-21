@@ -448,6 +448,8 @@ message ProbeMigrationStateResponse {
   uint32 namespace_admission_version = 11;
   bytes partition_receipt_id = 12;
   uint32 online_capture_version = 13;
+  // Resume nonce for this job's capture session before ownership activation.
+  string online_source_generation = 14;
 }
 
 message IssueMigrationTimestampRequest {}

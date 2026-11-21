@@ -113,8 +113,12 @@ func TestBootstrapNetworkRedisFollowerAfterAcceptedBaseline(t *testing.T) {
 	require.ErrorIs(t, err, redis.Nil)
 	for _, process := range processes {
 		multiEnablementReplicatedRead(t, process, "legacy-key", "replicated-original")
-		policy, err := kv.LoadAppliedBootstrapPolicy(ctx, process.runtime.Store, manifest.Identity, process.runtime.Engine.Status().AppliedIndex)
-		require.NoError(t, err)
-		require.EqualValues(t, 1, policy.Generation)
+		// The live engine can apply another entry between its status sample
+		// and the durable-index read. Each successful observation still
+		// requires the exact startup proof.
+		require.Eventually(t, func() bool {
+			policy, err := kv.LoadAppliedBootstrapPolicy(ctx, process.runtime.Store, manifest.Identity, process.runtime.Engine.Status().AppliedIndex)
+			return err == nil && policy.Generation == 1
+		}, bootstrapE2EWaitTimeout, bootstrapE2EWaitInterval)
 	}
 }

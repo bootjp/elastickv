@@ -3038,8 +3038,10 @@ type ProbeMigrationStateResponse struct {
 	NamespaceAdmissionVersion uint32 `protobuf:"varint,11,opt,name=namespace_admission_version,json=namespaceAdmissionVersion,proto3" json:"namespace_admission_version,omitempty"`
 	PartitionReceiptId        []byte `protobuf:"bytes,12,opt,name=partition_receipt_id,json=partitionReceiptId,proto3" json:"partition_receipt_id,omitempty"`
 	OnlineCaptureVersion      uint32 `protobuf:"varint,13,opt,name=online_capture_version,json=onlineCaptureVersion,proto3" json:"online_capture_version,omitempty"`
-	unknownFields             protoimpl.UnknownFields
-	sizeCache                 protoimpl.SizeCache
+	// Resume nonce for this job's capture session before ownership activation.
+	OnlineSourceGeneration string `protobuf:"bytes,14,opt,name=online_source_generation,json=onlineSourceGeneration,proto3" json:"online_source_generation,omitempty"`
+	unknownFields          protoimpl.UnknownFields
+	sizeCache              protoimpl.SizeCache
 }
 
 func (x *ProbeMigrationStateResponse) Reset() {
@@ -3161,6 +3163,13 @@ func (x *ProbeMigrationStateResponse) GetOnlineCaptureVersion() uint32 {
 		return x.OnlineCaptureVersion
 	}
 	return 0
+}
+
+func (x *ProbeMigrationStateResponse) GetOnlineSourceGeneration() string {
+	if x != nil {
+		return x.OnlineSourceGeneration
+	}
+	return ""
 }
 
 type IssueMigrationTimestampRequest struct {
@@ -3704,7 +3713,7 @@ const file_internal_proto_rawDesc = "" +
 	"\x16online_capture_version\x18\x14 \x01(\rR\x14onlineCaptureVersion\x12'\n" +
 	"\x0fonline_sequence\x18\x15 \x01(\x04R\x0eonlineSequence\x12!\n" +
 	"\fonline_ready\x18\x16 \x01(\bR\vonlineReady\x124\n" +
-	"\x16online_sealed_manifest\x18\x17 \x01(\fR\x14onlineSealedManifest\"\xb4\x05\n" +
+	"\x16online_sealed_manifest\x18\x17 \x01(\fR\x14onlineSealedManifest\"\xee\x05\n" +
 	"\x1bProbeMigrationStateResponse\x12\x14\n" +
 	"\x05ready\x18\x01 \x01(\bR\x05ready\x12'\n" +
 	"\x0fcatalog_version\x18\x02 \x01(\x04R\x0ecatalogVersion\x12&\n" +
@@ -3719,7 +3728,8 @@ const file_internal_proto_rawDesc = "" +
 	" \x01(\rR\x1aownershipPartitionProtocol\x12>\n" +
 	"\x1bnamespace_admission_version\x18\v \x01(\rR\x19namespaceAdmissionVersion\x120\n" +
 	"\x14partition_receipt_id\x18\f \x01(\fR\x12partitionReceiptId\x124\n" +
-	"\x16online_capture_version\x18\r \x01(\rR\x14onlineCaptureVersion\" \n" +
+	"\x16online_capture_version\x18\r \x01(\rR\x14onlineCaptureVersion\x128\n" +
+	"\x18online_source_generation\x18\x0e \x01(\tR\x16onlineSourceGeneration\" \n" +
 	"\x1eIssueMigrationTimestampRequest\"e\n" +
 	"\x1fIssueMigrationTimestampResponse\x12\x1c\n" +
 	"\ttimestamp\x18\x01 \x01(\x04R\ttimestamp\x12$\n" +

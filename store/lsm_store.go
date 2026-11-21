@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/cockroachdb/errors"
@@ -243,6 +244,8 @@ var metaAppliedIndexBytes = []byte(metaAppliedIndex)
 //  4. mtx           – guards the in-memory metadata fields
 //     (lastCommitTS, minRetainedTS, pendingMinRetainedTS, migrationReadinessCache).
 type pebbleStore struct {
+	// Published with retention changes so version reads need no commit mutex.
+	readMinRetainedTS       atomic.Uint64
 	db                      *pebble.DB
 	cache                   *pebble.Cache // owns one ref; Unref on Close / reopen.
 	dbMu                    sync.RWMutex  // guards s.db pointer – see lock ordering above
@@ -462,7 +465,9 @@ func NewPebbleStore(dir string, opts ...PebbleStoreOption) (MVCCStore, error) {
 	}
 	s.lastCommitTS = maxTS
 	s.minRetainedTS = minRetainedTS
+	s.readMinRetainedTS.Store(s.effectiveMinRetainedTSLocked())
 	s.pendingMinRetainedTS = pendingMinRetainedTS
+	s.readMinRetainedTS.Store(s.effectiveMinRetainedTSLocked())
 	s.migrationReadinessCache = readinessStates
 	// A backup is only stale after the live directory has opened and its
 	// metadata has been read successfully. Before this point it is the recovery
@@ -1038,9 +1043,7 @@ func (s *pebbleStore) effectiveMinRetainedTSLocked() uint64 {
 }
 
 func (s *pebbleStore) effectiveMinRetainedTS() uint64 {
-	s.mtx.RLock()
-	defer s.mtx.RUnlock()
-	return s.effectiveMinRetainedTSLocked()
+	return s.readMinRetainedTS.Load()
 }
 
 func (s *pebbleStore) updateLastCommitTS(ts uint64) {
@@ -1070,6 +1073,7 @@ func (s *pebbleStore) setMinRetainedTSLocked(ts uint64) error {
 		return err
 	}
 	s.minRetainedTS = ts
+	s.readMinRetainedTS.Store(s.effectiveMinRetainedTSLocked())
 	if s.pendingMinRetainedTS != 0 && s.pendingMinRetainedTS <= ts {
 		return s.clearPendingMinRetainedTSLocked(pebble.NoSync)
 	}
@@ -1097,6 +1101,7 @@ func (s *pebbleStore) setPendingMinRetainedTSLocked(ts uint64, opts *pebble.Writ
 		return err
 	}
 	s.pendingMinRetainedTS = ts
+	s.readMinRetainedTS.Store(s.effectiveMinRetainedTSLocked())
 	return nil
 }
 
@@ -1108,6 +1113,7 @@ func (s *pebbleStore) clearPendingMinRetainedTSLocked(opts *pebble.WriteOptions)
 		return err
 	}
 	s.pendingMinRetainedTS = 0
+	s.readMinRetainedTS.Store(s.effectiveMinRetainedTSLocked())
 	return nil
 }
 
@@ -1140,8 +1146,10 @@ func (s *pebbleStore) commitMinRetainedTSLocked(ts uint64, opts *pebble.WriteOpt
 	}
 	if ts > s.minRetainedTS {
 		s.minRetainedTS = ts
+		s.readMinRetainedTS.Store(s.effectiveMinRetainedTSLocked())
 	}
 	s.pendingMinRetainedTS = 0
+	s.readMinRetainedTS.Store(s.effectiveMinRetainedTSLocked())
 	return nil
 }
 
@@ -2666,10 +2674,11 @@ func (s *pebbleStore) applyMutationsWithOpts(ctx context.Context, mutations []*K
 		return err
 	}
 
-	newLastTS, err := s.stageLastCommitTSInBatch(b, commitTS, advanceLastCommitTS)
+	newLastTS, unlockLastCommitTS, err := s.stageLastCommitTSInBatch(b, commitTS, advanceLastCommitTS)
 	if err != nil {
 		return err
 	}
+	defer unlockLastCommitTS()
 	// Bundle metaAppliedIndex in the same batch as the data + commitTS
 	// meta key so a crash either commits all three atomically or none.
 	// appliedIndex==0 is the legacy / non-raft callers (ApplyMutations
@@ -2681,9 +2690,7 @@ func (s *pebbleStore) applyMutationsWithOpts(ctx context.Context, mutations []*K
 		return errors.WithStack(err)
 	}
 	if advanceLastCommitTS {
-		s.mtx.Lock()
 		s.updateLastCommitTS(newLastTS)
-		s.mtx.Unlock()
 	}
 
 	return nil
@@ -2696,17 +2703,25 @@ func stageAppliedIndexInBatch(b *pebble.Batch, appliedIndex uint64) error {
 	return setPebbleUint64InBatch(b, metaAppliedIndexBytes, appliedIndex)
 }
 
-// The caller holds applyMu across staging, commit, and mirror publication.
-// All watermark writers, including direct writes, take applyMu first. Readers
-// may keep using the preceding committed watermark while this batch syncs.
-func (s *pebbleStore) stageLastCommitTSInBatch(b *pebble.Batch, commitTS uint64, advance bool) (uint64, error) {
+func (s *pebbleStore) stageLastCommitTSInBatch(b *pebble.Batch, commitTS uint64, advance bool) (uint64, func(), error) {
 	if !advance {
-		return 0, nil
+		return 0, func() {}, nil
 	}
-	s.mtx.RLock()
-	newLastTS := max(s.lastCommitTS, commitTS)
-	s.mtx.RUnlock()
-	return newLastTS, setPebbleUint64InBatch(b, metaLastCommitTSBytes, newLastTS)
+
+	// Hold mtx across read → batch-set → commit → in-memory update so that a
+	// concurrent alignCommitTS (PutAt/DeleteAt/ExpireAt) cannot advance+persist
+	// metaLastCommitTS between our read and batch commit, which would let this
+	// batch overwrite the meta key with a smaller value.
+	s.mtx.Lock()
+	newLastTS := s.lastCommitTS
+	if commitTS > newLastTS {
+		newLastTS = commitTS
+	}
+	if err := setPebbleUint64InBatch(b, metaLastCommitTSBytes, newLastTS); err != nil {
+		s.mtx.Unlock()
+		return 0, nil, err
+	}
+	return newLastTS, s.mtx.Unlock, nil
 }
 
 // DeletePrefixAt atomically deletes all visible keys matching prefix by writing
@@ -3404,7 +3419,9 @@ func (s *pebbleStore) handleRestorePeekError(err error, header []byte) error {
 	}
 	s.lastCommitTS = 0
 	s.minRetainedTS = 0
+	s.readMinRetainedTS.Store(s.effectiveMinRetainedTSLocked())
 	s.pendingMinRetainedTS = 0
+	s.readMinRetainedTS.Store(s.effectiveMinRetainedTSLocked())
 	s.migrationReadinessCache = nil
 	s.migrationAdmission = migrationServingAdmissionIndex{}
 	if setErr := writePebbleUint64(s.db, metaLastCommitTSBytes, 0, pebble.NoSync); setErr != nil {
@@ -3708,7 +3725,9 @@ func (s *pebbleStore) swapInTempDBWithMetadata(tmpDir string, expected *pebbleSn
 	}
 	s.lastCommitTS = lastCommitTS
 	s.minRetainedTS = minRetainedTS
+	s.readMinRetainedTS.Store(s.effectiveMinRetainedTSLocked())
 	s.pendingMinRetainedTS = pendingMinRetainedTS
+	s.readMinRetainedTS.Store(s.effectiveMinRetainedTSLocked())
 	s.migrationReadinessCache = readinessStates
 	if err := os.RemoveAll(backupDir); err != nil {
 		s.log.Warn("failed to remove restore backup", "path", backupDir, "error", err)
