@@ -40,6 +40,11 @@ func (f *kvFSM) withMigrationOwnershipEvidence(ctx context.Context, req *pb.Requ
 	if err != nil {
 		return ctx, err
 	}
+	if onlineSourceFencePresent(view.Readiness) {
+		if err := f.verifyOnlineSourceNotSealed(ctx, req); err != nil {
+			return ctx, err
+		}
+	}
 	if !migrationApplyIntersects(view, ranges) {
 		return ctx, nil
 	}
@@ -309,4 +314,13 @@ func (f *kvFSM) migrationPrimaryRollbackMatches(ctx context.Context, req *pb.Req
 		return false, errors.WithStack(ErrTxnAlreadyAborted)
 	}
 	return exists, nil
+}
+
+func onlineSourceFencePresent(states []store.TargetStagedReadinessState) bool {
+	for _, state := range states {
+		if state.Armed && state.TrackWrites && state.SourceWriteFence {
+			return true
+		}
+	}
+	return false
 }

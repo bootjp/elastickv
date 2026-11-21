@@ -21,9 +21,10 @@ var ErrMigrationNamespaceProtocol = errors.New("namespace admission protocol is 
 // NamespaceMemberCapability is a trusted peer's acknowledgement of support for
 // the protocol at ConfigurationIndex. Include learners, not just voters.
 type NamespaceMemberCapability struct {
-	MemberID           uint64
-	Version            uint32
-	ConfigurationIndex uint64
+	OnlineCaptureVersion uint32 `json:",omitempty"`
+	MemberID             uint64
+	Version              uint32
+	ConfigurationIndex   uint64
 }
 
 // NamespaceAdmissionCommand must only be proposed after probing every apply
@@ -226,6 +227,9 @@ func (f *kvFSM) applyNamespaceAdmission(ctx context.Context, data []byte) any {
 	if err != nil {
 		return err
 	}
+	if response := f.checkJoiningOnlineCapabilities(ctx, command.Joining); response != nil {
+		return response
+	}
 	// Concurrent controllers may refresh activation while membership admission
 	// is between its prejoin control and ConfChange. Never revoke an already
 	// committed permission inside the same configuration.
@@ -237,6 +241,24 @@ func (f *kvFSM) applyNamespaceAdmission(ctx context.Context, data []byte) any {
 	}
 	if err := f.persistNamespaceConfiguration(ctx, state, f.pendingApplyIdx); err != nil {
 		return haltErr(errors.Wrap(err, "persist namespace admission control"))
+	}
+	return nil
+}
+
+func (f *kvFSM) checkJoiningOnlineCapabilities(ctx context.Context, joining []NamespaceMemberCapability) any {
+	if len(joining) == 0 {
+		return nil
+	}
+	active, err := f.hasActiveOnlineMigration(ctx)
+	if err != nil {
+		return haltErr(errors.Mark(err, ErrRaftEntryApply))
+	}
+	if active {
+		for _, candidate := range joining {
+			if candidate.OnlineCaptureVersion != store.OnlineMigrationVersion {
+				return errors.WithStack(ErrMigrationNamespaceProtocol)
+			}
+		}
 	}
 	return nil
 }

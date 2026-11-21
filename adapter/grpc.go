@@ -755,12 +755,9 @@ func (r *GRPCServer) RawPut(ctx context.Context, req *pb.RawPutRequest) (*pb.Raw
 	if err := validatePublicMutationKey(req.GetKey()); err != nil {
 		return nil, err
 	}
-	m, err := r.grpcTranscoder.RawPutToRequest(req)
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-
-	res, err := r.coordinator.Dispatch(ctx, m)
+	res, err := r.dispatchRawHandoff(ctx, req.GetKey(), len(req.GetKey())+len(req.GetValue()), func() (*kv.OperationGroup[kv.OP], error) {
+		return r.grpcTranscoder.RawPutToRequest(req)
+	})
 	if err != nil {
 		return &pb.RawPutResponse{
 			CommitIndex: uint64(0),
@@ -778,12 +775,9 @@ func (r *GRPCServer) RawDelete(ctx context.Context, req *pb.RawDeleteRequest) (*
 	if err := validatePublicMutationKey(req.GetKey()); err != nil {
 		return nil, err
 	}
-	m, err := r.grpcTranscoder.RawDeleteToRequest(req)
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-
-	res, err := r.coordinator.Dispatch(ctx, m)
+	res, err := r.dispatchRawHandoff(ctx, req.GetKey(), len(req.GetKey()), func() (*kv.OperationGroup[kv.OP], error) {
+		return r.grpcTranscoder.RawDeleteToRequest(req)
+	})
 	if err != nil {
 		return &pb.RawDeleteResponse{
 			CommitIndex: uint64(0),

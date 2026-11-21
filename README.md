@@ -322,6 +322,21 @@ Use `proto.Distribution/ListRoutes` to get the route ID, bounds, and current cat
 - `SplitRange` returns both child routes. Both stay in the parent's Raft group.
 - `StartSplitMigration` also takes a `targetGroupId` naming a different, preconfigured data group. It returns a durable job ID. The job moves the right child `[splitKey, parent.end)` to the target and leaves the left child on the source. The moving range must exclude reserved migration and distribution keys and the SQS global routing key. Follow the job with `GetSplitJob` or `ListSplitJobs` through completion.
 
+New cross-group jobs on persistent, unencrypted Pebble stores use online RawKV
+point-write capture by default; no additional flag is needed. Base transfer and
+preflight accept writes, and the target replays the source's committed effects
+before cutover. A short, bounded handoff wait is available for RawKV Put/Delete
+only when the previous attempt is proven not to have committed. Unknown outcomes
+are never retried automatically.
+
+This initial online path requires a fresh target group and support from every
+apply member, including learners. An intersecting unsupported mutation (for
+example a transactional or collection write) invalidates capture and abandons
+the migration while preserving the ordinary write path. In-memory and encrypted
+stores retain the existing migration path. The automatic split scheduler remains
+controlled by the flags below. See [online Split activation](docs/design/2026_11_21_partial_online_split_activation.md)
+for limits and recovery invariants.
+
 For this same-group example, set `CATALOG_LEADER` to the leader's gRPC host and port, `CA_FILE` to its CA certificate file, and export `MIGRATION_TOKEN` with the dedicated split-migration bearer token.
 
 ```bash

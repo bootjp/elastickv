@@ -49,10 +49,14 @@ func splitPreflightProgressEqual(a, b distribution.SplitJobBracketProgress) bool
 	return a.BracketID == b.BracketID && a.Family == b.Family && a.ExportPhase == b.ExportPhase && a.Done == b.Done && a.AcceptedRows == b.AcceptedRows && a.ScannedBytes == b.ScannedBytes && a.LastAckedBatchSeq == b.LastAckedBatchSeq && bytes.Equal(a.Cursor, b.Cursor)
 }
 
-func waitSplitJobRunner(ctx context.Context, tick <-chan time.Time, continueSoon bool) bool {
+func waitSplitJobRunner(ctx context.Context, tick <-chan time.Time, continueSoon bool, delay ...time.Duration) bool {
 	var wake <-chan time.Time
 	if continueSoon {
-		timer := time.NewTimer(splitPreflightContinuationDelay)
+		interval := splitPreflightContinuationDelay
+		if len(delay) != 0 && delay[0] > 0 {
+			interval = delay[0]
+		}
+		timer := time.NewTimer(interval)
 		defer timer.Stop()
 		wake = timer.C
 	}

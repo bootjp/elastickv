@@ -100,3 +100,12 @@ macOSの開発機で、100 entryを3回ずつ実行した暫定値は次のと�
 既存のinactive経路の変更前後を比較した試験でもない。
 shadowのJSON記録と値の複製には割当の増加があり、active sessionをproductionで有効化する前に、記録形式とbufferのprofileを確認する必要がある。
 正式な性能採用条件を満たしたとは評価しない。
+
+## Online activation follow-up
+
+The separate [online activation implementation](2026_11_21_partial_online_split_activation.md)
+now starts a bounded, contiguous per-job source journal before BASE and replays
+actual effects at the target. That journal has explicit membership, quota,
+seal and receipt checks. Diagnostic shadow records described above remain
+separate and are not used as transfer evidence. New persistent plaintext
+RawKV migrations select the online journal by default.

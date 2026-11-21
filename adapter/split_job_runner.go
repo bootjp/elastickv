@@ -244,6 +244,9 @@ func (s *DistributionServer) runSplitJobPhase(ctx context.Context, job distribut
 }
 
 func (s *DistributionServer) runAdmittedSplitJobPhase(ctx context.Context, job distribution.SplitJob) error {
+	if job.OnlineCaptureVersion != 0 && job.Phase == distribution.SplitJobPhaseFence && job.TransferPreflightDone {
+		return s.catchUpAndFenceOnlineSplit(ctx, job)
+	}
 	// Only the full runner repeats pages after namespace admission. Yield on
 	// completion so the next attempt independently admits the fence or delta.
 	if !job.TransferPreflightDone && (job.Phase == distribution.SplitJobPhaseFence || job.Phase == distribution.SplitJobPhaseDeltaCopy) {
@@ -463,6 +466,13 @@ func splitJobPhaseNeedsSourceGroup(phase distribution.SplitJobPhase) bool {
 }
 
 func (s *DistributionServer) runSplitJobCopyPhase(ctx context.Context, job distribution.SplitJob) error {
+	if job.OnlineCaptureVersion != 0 && job.Phase == distribution.SplitJobPhaseDeltaCopy {
+		complete, err := s.copyOnlineSplitPage(ctx, job)
+		if err != nil || !complete {
+			return err
+		}
+		return s.advanceCompletedCopyPhase(ctx, job, distribution.SplitJobExportPhaseDeltaCopy)
+	}
 	if job.Phase == distribution.SplitJobPhaseBackfill {
 		return s.copySplitJobPhase(ctx, job, distribution.SplitJobExportPhaseBackfill, 0, job.SnapshotTS)
 	}
@@ -1368,11 +1378,25 @@ func (s *DistributionServer) openSplitJobBackfill(ctx context.Context, job distr
 	if err := s.revalidateSplitTransferAdmission(ctx, witness); err != nil {
 		return err
 	}
+	// The source tracker already precedes snapshotTS in its data log. Install
+	// the target only after checking that timestamp issuance kept the same
+	// source configuration, then recheck before publishing the job record.
+	job, err = s.startOnlineSplit(ctx, job, source, witness)
+	if err != nil {
+		return err
+	}
+	if job.OnlineCaptureVersion != 0 {
+		if err := s.revalidateSplitTransferAdmission(ctx, witness); err != nil {
+			return err
+		}
+	}
 	return s.updateSplitJobViaCoordinator(ctx, job.JobID, func(current distribution.SplitJob) (distribution.SplitJob, error) {
 		if current.Phase != distribution.SplitJobPhasePlanned {
 			return current, nil
 		}
 		current.Phase = distribution.SplitJobPhaseBackfill
+		current.OnlineCaptureVersion = job.OnlineCaptureVersion
+		current.OnlineManifest = distribution.CloneBytes(job.OnlineManifest)
 		current.SnapshotTS = snapshotTS
 		current.WriteTrackerArmed = true
 		current.SourceRetentionPinTS = initialMigrationRetentionPinTS
@@ -1647,17 +1671,18 @@ func (s *DistributionServer) finalizeSplitJobFence(ctx context.Context, job dist
 	if err != nil {
 		return err
 	}
-	issued, err := issueSplitMigrationTimestamp(ctx, source)
+	job, err = s.sealOnlineSplitJob(ctx, job, source, witness)
 	if err != nil {
-		return errors.WithStack(err)
+		return err
 	}
-	if issued.GetTimestamp() == 0 || issued.GetTimestamp() <= issued.GetLastCommitTs() {
-		return errors.New("split migration source issued an invalid fence timestamp")
+	fenceTS, err := issueOnlineSplitFenceTimestamp(ctx, source)
+	if err != nil {
+		return err
 	}
 	if err := s.revalidateSplitTransferAdmission(ctx, witness); err != nil {
 		return err
 	}
-	return s.commitSplitJobFenceState(ctx, job, snapshot.Version, minAdmittedTS, ackCursor, issued.GetTimestamp())
+	return s.commitSplitJobFenceState(ctx, job, snapshot.Version, minAdmittedTS, ackCursor, fenceTS)
 }
 
 func (s *DistributionServer) prepareSplitJobCatalogFence(ctx context.Context, job distribution.SplitJob) (distribution.CatalogSnapshot, distribution.RouteDescriptor, bool, error) {
@@ -1761,6 +1786,8 @@ func (s *DistributionServer) commitSplitJobFenceState(ctx context.Context, job d
 			return current, nil
 		}
 		current.Phase = distribution.SplitJobPhaseDeltaCopy
+		current.OnlineSealSequence = job.OnlineSealSequence
+		current.OnlineManifest = distribution.CloneBytes(job.OnlineManifest)
 		current.PostFenceDrainCompleted = true
 		current.SnapshotMinAdmittedTS = minAdmittedTS
 		current.DeltaFloor = deltaFloor
@@ -1874,25 +1901,28 @@ func (s *DistributionServer) applySplitJobCutoverBarriers(
 	if err != nil {
 		return nil, nil, false, false, errors.WithStack(err)
 	}
-	if _, err := applySplitMigrationControl(ctx, target, job, sourceRoute.End, expectedVersion, job.FenceTS, false, false, false, 0); err != nil {
+	if err := s.prepareSplitCutoverTarget(ctx, job, target, sourceRoute.End, expectedVersion); err != nil {
 		return nil, nil, false, false, err
 	}
+
 	if _, err := applySplitMigrationControl(ctx, source, job, sourceRoute.End, expectedVersion, job.FenceTS, true, true, job.WriteTrackerArmed, 1); err != nil {
 		return nil, nil, false, false, err
 	}
-	targetCursor, targetComplete, err := s.syncSplitMigrationVoterBarrier(ctx, job.TargetGroupID, job.TargetStagedReadinessAckCursor, target, &pb.ProbeMigrationStateRequest{
-		JobId:                  job.JobID,
+	targetProbe := &pb.ProbeMigrationStateRequest{
+		JobId:                job.JobID,
+		OnlineCaptureVersion: job.OnlineCaptureVersion, OnlineSequence: job.OnlineSealSequence, OnlineReady: job.OnlineCaptureVersion != 0,
 		Kind:                   pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_CONTROL_APPLIED,
 		RouteStart:             job.SplitKey,
 		RouteEnd:               sourceRoute.End,
 		ExpectedCatalogVersion: expectedVersion,
 		MigrationJobId:         job.JobID,
 		MinWriteTsExclusive:    job.FenceTS,
-	})
+	}
+	targetCursor, targetComplete, err := s.syncSplitMigrationVoterBarrier(ctx, job.TargetGroupID, job.TargetStagedReadinessAckCursor, target, targetProbe)
 	if err != nil {
 		return nil, nil, false, false, err
 	}
-	sourceCursor, sourceComplete, err := s.syncSplitMigrationVoterBarrier(ctx, sourceRoute.GroupID, job.SourceCutoverReadFenceAckCursor, source, &pb.ProbeMigrationStateRequest{
+	sourceProbe := &pb.ProbeMigrationStateRequest{
 		JobId:                  job.JobID,
 		Kind:                   pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_CONTROL_APPLIED,
 		RouteStart:             job.SplitKey,
@@ -1904,9 +1934,15 @@ func (s *DistributionServer) applySplitJobCutoverBarriers(
 		SourceReadFence:        true,
 		TrackWrites:            job.WriteTrackerArmed,
 		RetentionPinTs:         1,
-	})
+	}
+	sourceCursor, sourceComplete, err := s.syncSplitMigrationVoterBarrier(ctx, sourceRoute.GroupID, job.SourceCutoverReadFenceAckCursor, source, sourceProbe)
 	if err != nil {
 		return nil, nil, false, false, err
+	}
+	if job.OnlineCaptureVersion != 0 && targetComplete && sourceComplete {
+		if err := s.confirmOnlineCutoverSides(ctx, job, targetProbe, sourceProbe, sourceRoute.GroupID); err != nil {
+			return nil, nil, false, false, err
+		}
 	}
 	return targetCursor, sourceCursor, targetComplete, sourceComplete, nil
 }
@@ -2386,4 +2422,68 @@ func (s *DistributionServer) commitSplitJobCutover(
 		return err
 	}
 	return s.applyEngineSnapshot(updated)
+}
+
+func (s *DistributionServer) catchUpAndFenceOnlineSplit(ctx context.Context, job distribution.SplitJob) error {
+	caughtUp, err := s.copyOnlineSplitPage(ctx, job)
+	if err != nil || !caughtUp {
+		return err
+	}
+	current, ready, err := s.admitOnlineSplitFence(ctx, job)
+	if err != nil || !ready {
+		return err
+	}
+	return s.finalizeSplitJobFence(ctx, current)
+}
+
+func (s *DistributionServer) sealOnlineSplitJob(ctx context.Context, job distribution.SplitJob, source SplitMigrationClient, witness *splitTransferAdmissionWitness) (distribution.SplitJob, error) {
+	if job.OnlineCaptureVersion != 0 {
+		sealed, err := s.sealOnlineSplit(ctx, job, source, witness)
+		if err != nil {
+			return job, err
+		}
+		job.OnlineSealSequence = sealed.Sequence
+		job.OnlineManifest, err = store.EncodeOnlineMigrationManifest(sealed)
+		if err != nil {
+			return job, errors.WithStack(err)
+		}
+	}
+	return job, nil
+}
+
+func (s *DistributionServer) prepareSplitCutoverTarget(ctx context.Context, job distribution.SplitJob, target SplitMigrationClient, end []byte, version uint64) error {
+	if job.OnlineCaptureVersion != 0 {
+		if err := s.readyOnlineSplitTarget(ctx, job, target, end, version); err != nil {
+			return err
+		}
+	} else if _, err := applySplitMigrationControl(ctx, target, job, end, version, job.FenceTS, false, false, false, 0); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *DistributionServer) confirmOnlineCutoverSides(ctx context.Context, job distribution.SplitJob, targetProbe, sourceProbe *pb.ProbeMigrationStateRequest, sourceGroup uint64) error {
+	for _, side := range []struct {
+		group uint64
+		probe *pb.ProbeMigrationStateRequest
+	}{{job.TargetGroupID, targetProbe}, {sourceGroup, sourceProbe}} {
+		side.probe.OnlineCaptureVersion = job.OnlineCaptureVersion
+		side.probe.OnlineSequence = job.OnlineSealSequence
+		side.probe.OnlineSealedManifest = job.OnlineManifest
+		if err := s.confirmOnlineCutover(ctx, side.group, side.probe); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func issueOnlineSplitFenceTimestamp(ctx context.Context, source SplitMigrationClient) (uint64, error) {
+	issued, err := issueSplitMigrationTimestamp(ctx, source)
+	if err != nil {
+		return 0, errors.WithStack(err)
+	}
+	if issued.GetTimestamp() == 0 || issued.GetTimestamp() <= issued.GetLastCommitTs() {
+		return 0, errors.New("split migration source issued an invalid fence timestamp")
+	}
+	return issued.GetTimestamp(), nil
 }

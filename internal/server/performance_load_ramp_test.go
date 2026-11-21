@@ -246,6 +246,16 @@ ready:
 	require.True(t, done, "phase=%d error=%s", phase, lastError)
 	require.Equal(t, distribution.SplitJobPhaseDone, phase)
 	t.Logf("LOAD split_cross_done job=%s elapsed_ms=%d", strconv.FormatUint(result.JobID, 10), time.Since(started).Milliseconds())
+	finalJob, found, err := catalog.SplitJob(t.Context(), result.JobID)
+	require.NoError(t, err)
+	require.True(t, found)
+	t.Logf("LOAD online_capture_version=%d sequence=%d seal_sequence=%d", finalJob.OnlineCaptureVersion, finalJob.OnlineSequence, finalJob.OnlineSealSequence)
+	if os.Getenv("ELASTICKV_LOAD_REQUIRE_ONLINE") == "1" {
+		require.Equal(t, uint32(1), finalJob.OnlineCaptureVersion)
+		require.Positive(t, finalJob.OnlineSequence)
+		require.Equal(t, finalJob.OnlineSequence, finalJob.OnlineSealSequence)
+	}
+
 	waitForSplitRecoveryRoutes(t, cluster.nodes, source)
 }
 

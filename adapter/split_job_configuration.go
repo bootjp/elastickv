@@ -44,6 +44,20 @@ func (s *DistributionServer) bindSplitSourceCleanup(ctx context.Context, job dis
 	if err != nil {
 		return err
 	}
+	if job.OnlineCaptureVersion != 0 && job.Phase == distribution.SplitJobPhaseCleanup {
+		prior, err := probeSplitSourceOwnershipState(ctx, source, job.JobID, index)
+		if err != nil {
+			return err
+		}
+		snapshot, err := s.loadCommittedMigrationCatalog(ctx)
+		if err != nil {
+			return err
+		}
+		req.Ownership, err = splitOwnershipProof(snapshot, job, job.SourceGroupID, prior.GetOwnership().GetGeneration())
+		if err != nil {
+			return err
+		}
+	}
 	req.RequireConfigurationIndex = true
 	req.ExpectedConfigurationIndex = index
 	return nil

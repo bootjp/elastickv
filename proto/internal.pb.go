@@ -1387,9 +1387,12 @@ type ExportRangeVersionsRequest struct {
 	ExcludePrefixes [][]byte `protobuf:"bytes,12,rep,name=exclude_prefixes,json=excludePrefixes,proto3" json:"exclude_prefixes,omitempty"`
 	// Optional response-page limit. Zero preserves the full streaming export.
 	// A limited response keeps done=false and next_cursor when more data exists.
-	MaxPages      uint32 `protobuf:"varint,13,opt,name=max_pages,json=maxPages,proto3" json:"max_pages,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	MaxPages uint32 `protobuf:"varint,13,opt,name=max_pages,json=maxPages,proto3" json:"max_pages,omitempty"`
+	// Online capture export returns one durable sequential frame.
+	OnlineJobId         uint64 `protobuf:"varint,14,opt,name=online_job_id,json=onlineJobId,proto3" json:"online_job_id,omitempty"`
+	OnlineAfterSequence uint64 `protobuf:"varint,15,opt,name=online_after_sequence,json=onlineAfterSequence,proto3" json:"online_after_sequence,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *ExportRangeVersionsRequest) Reset() {
@@ -1513,13 +1516,29 @@ func (x *ExportRangeVersionsRequest) GetMaxPages() uint32 {
 	return 0
 }
 
+func (x *ExportRangeVersionsRequest) GetOnlineJobId() uint64 {
+	if x != nil {
+		return x.OnlineJobId
+	}
+	return 0
+}
+
+func (x *ExportRangeVersionsRequest) GetOnlineAfterSequence() uint64 {
+	if x != nil {
+		return x.OnlineAfterSequence
+	}
+	return 0
+}
+
 type ExportRangeVersionsResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Versions      []*MVCCVersion         `protobuf:"bytes,1,rep,name=versions,proto3" json:"versions,omitempty"`
-	NextCursor    []byte                 `protobuf:"bytes,2,opt,name=next_cursor,json=nextCursor,proto3" json:"next_cursor,omitempty"`
-	Done          bool                   `protobuf:"varint,3,opt,name=done,proto3" json:"done,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	Versions       []*MVCCVersion         `protobuf:"bytes,1,rep,name=versions,proto3" json:"versions,omitempty"`
+	NextCursor     []byte                 `protobuf:"bytes,2,opt,name=next_cursor,json=nextCursor,proto3" json:"next_cursor,omitempty"`
+	Done           bool                   `protobuf:"varint,3,opt,name=done,proto3" json:"done,omitempty"`
+	OnlineManifest []byte                 `protobuf:"bytes,4,opt,name=online_manifest,json=onlineManifest,proto3" json:"online_manifest,omitempty"`
+	OnlineFrame    []byte                 `protobuf:"bytes,5,opt,name=online_frame,json=onlineFrame,proto3" json:"online_frame,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *ExportRangeVersionsResponse) Reset() {
@@ -1571,6 +1590,20 @@ func (x *ExportRangeVersionsResponse) GetDone() bool {
 		return x.Done
 	}
 	return false
+}
+
+func (x *ExportRangeVersionsResponse) GetOnlineManifest() []byte {
+	if x != nil {
+		return x.OnlineManifest
+	}
+	return nil
+}
+
+func (x *ExportRangeVersionsResponse) GetOnlineFrame() []byte {
+	if x != nil {
+		return x.OnlineFrame
+	}
+	return nil
 }
 
 type MVCCVersion struct {
@@ -1658,14 +1691,16 @@ func (x *MVCCVersion) GetExpireAt() uint64 {
 }
 
 type ImportRangeVersionsRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	JobId         uint64                 `protobuf:"varint,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
-	Versions      []*MVCCVersion         `protobuf:"bytes,2,rep,name=versions,proto3" json:"versions,omitempty"`
-	Cursor        []byte                 `protobuf:"bytes,3,opt,name=cursor,proto3" json:"cursor,omitempty"`
-	BracketId     uint64                 `protobuf:"varint,4,opt,name=bracket_id,json=bracketId,proto3" json:"bracket_id,omitempty"`
-	BatchSeq      uint64                 `protobuf:"varint,5,opt,name=batch_seq,json=batchSeq,proto3" json:"batch_seq,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	JobId          uint64                 `protobuf:"varint,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
+	Versions       []*MVCCVersion         `protobuf:"bytes,2,rep,name=versions,proto3" json:"versions,omitempty"`
+	Cursor         []byte                 `protobuf:"bytes,3,opt,name=cursor,proto3" json:"cursor,omitempty"`
+	BracketId      uint64                 `protobuf:"varint,4,opt,name=bracket_id,json=bracketId,proto3" json:"bracket_id,omitempty"`
+	BatchSeq       uint64                 `protobuf:"varint,5,opt,name=batch_seq,json=batchSeq,proto3" json:"batch_seq,omitempty"`
+	OnlineManifest []byte                 `protobuf:"bytes,6,opt,name=online_manifest,json=onlineManifest,proto3" json:"online_manifest,omitempty"`
+	OnlineFrame    []byte                 `protobuf:"bytes,7,opt,name=online_frame,json=onlineFrame,proto3" json:"online_frame,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *ImportRangeVersionsRequest) Reset() {
@@ -1731,6 +1766,20 @@ func (x *ImportRangeVersionsRequest) GetBatchSeq() uint64 {
 		return x.BatchSeq
 	}
 	return 0
+}
+
+func (x *ImportRangeVersionsRequest) GetOnlineManifest() []byte {
+	if x != nil {
+		return x.OnlineManifest
+	}
+	return nil
+}
+
+func (x *ImportRangeVersionsRequest) GetOnlineFrame() []byte {
+	if x != nil {
+		return x.OnlineFrame
+	}
+	return nil
 }
 
 type ImportRangeVersionsResponse struct {
@@ -1953,8 +2002,16 @@ type TargetStagedReadinessRequest struct {
 	TransferSizeGuardVersion   uint32 `protobuf:"varint,13,opt,name=transfer_size_guard_version,json=transferSizeGuardVersion,proto3" json:"transfer_size_guard_version,omitempty"`
 	RequireConfigurationIndex  bool   `protobuf:"varint,14,opt,name=require_configuration_index,json=requireConfigurationIndex,proto3" json:"require_configuration_index,omitempty"`
 	ExpectedConfigurationIndex uint64 `protobuf:"varint,15,opt,name=expected_configuration_index,json=expectedConfigurationIndex,proto3" json:"expected_configuration_index,omitempty"`
-	unknownFields              protoimpl.UnknownFields
-	sizeCache                  protoimpl.SizeCache
+	OnlineCaptureVersion       uint32 `protobuf:"varint,16,opt,name=online_capture_version,json=onlineCaptureVersion,proto3" json:"online_capture_version,omitempty"`
+	OnlineLineage              []byte `protobuf:"bytes,17,opt,name=online_lineage,json=onlineLineage,proto3" json:"online_lineage,omitempty"`
+	OnlineTargetManifest       []byte `protobuf:"bytes,18,opt,name=online_target_manifest,json=onlineTargetManifest,proto3" json:"online_target_manifest,omitempty"`
+	OnlineReady                bool   `protobuf:"varint,19,opt,name=online_ready,json=onlineReady,proto3" json:"online_ready,omitempty"`
+	OnlineSequence             uint64 `protobuf:"varint,20,opt,name=online_sequence,json=onlineSequence,proto3" json:"online_sequence,omitempty"`
+	OnlineSeal                 bool   `protobuf:"varint,21,opt,name=online_seal,json=onlineSeal,proto3" json:"online_seal,omitempty"`
+	// Durable nonce discovery if the first capture response is lost.
+	OnlineSourceGeneration string `protobuf:"bytes,22,opt,name=online_source_generation,json=onlineSourceGeneration,proto3" json:"online_source_generation,omitempty"`
+	unknownFields          protoimpl.UnknownFields
+	sizeCache              protoimpl.SizeCache
 }
 
 func (x *TargetStagedReadinessRequest) Reset() {
@@ -2092,11 +2149,61 @@ func (x *TargetStagedReadinessRequest) GetExpectedConfigurationIndex() uint64 {
 	return 0
 }
 
+func (x *TargetStagedReadinessRequest) GetOnlineCaptureVersion() uint32 {
+	if x != nil {
+		return x.OnlineCaptureVersion
+	}
+	return 0
+}
+
+func (x *TargetStagedReadinessRequest) GetOnlineLineage() []byte {
+	if x != nil {
+		return x.OnlineLineage
+	}
+	return nil
+}
+
+func (x *TargetStagedReadinessRequest) GetOnlineTargetManifest() []byte {
+	if x != nil {
+		return x.OnlineTargetManifest
+	}
+	return nil
+}
+
+func (x *TargetStagedReadinessRequest) GetOnlineReady() bool {
+	if x != nil {
+		return x.OnlineReady
+	}
+	return false
+}
+
+func (x *TargetStagedReadinessRequest) GetOnlineSequence() uint64 {
+	if x != nil {
+		return x.OnlineSequence
+	}
+	return 0
+}
+
+func (x *TargetStagedReadinessRequest) GetOnlineSeal() bool {
+	if x != nil {
+		return x.OnlineSeal
+	}
+	return false
+}
+
+func (x *TargetStagedReadinessRequest) GetOnlineSourceGeneration() string {
+	if x != nil {
+		return x.OnlineSourceGeneration
+	}
+	return ""
+}
+
 type TargetStagedReadinessResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	MinAdmittedTs uint64                 `protobuf:"varint,1,opt,name=min_admitted_ts,json=minAdmittedTs,proto3" json:"min_admitted_ts,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	MinAdmittedTs  uint64                 `protobuf:"varint,1,opt,name=min_admitted_ts,json=minAdmittedTs,proto3" json:"min_admitted_ts,omitempty"`
+	OnlineSequence uint64                 `protobuf:"varint,2,opt,name=online_sequence,json=onlineSequence,proto3" json:"online_sequence,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *TargetStagedReadinessResponse) Reset() {
@@ -2132,6 +2239,13 @@ func (*TargetStagedReadinessResponse) Descriptor() ([]byte, []int) {
 func (x *TargetStagedReadinessResponse) GetMinAdmittedTs() uint64 {
 	if x != nil {
 		return x.MinAdmittedTs
+	}
+	return 0
+}
+
+func (x *TargetStagedReadinessResponse) GetOnlineSequence() uint64 {
+	if x != nil {
+		return x.OnlineSequence
 	}
 	return 0
 }
@@ -2705,8 +2819,13 @@ type ProbeMigrationStateRequest struct {
 	Ownership                  *MigrationOwnershipProof `protobuf:"bytes,17,opt,name=ownership,proto3" json:"ownership,omitempty"`
 	TransferSizeGuardVersion   uint32                   `protobuf:"varint,18,opt,name=transfer_size_guard_version,json=transferSizeGuardVersion,proto3" json:"transfer_size_guard_version,omitempty"`
 	PartitionTransition        []byte                   `protobuf:"bytes,19,opt,name=partition_transition,json=partitionTransition,proto3" json:"partition_transition,omitempty"`
-	unknownFields              protoimpl.UnknownFields
-	sizeCache                  protoimpl.SizeCache
+	OnlineCaptureVersion       uint32                   `protobuf:"varint,20,opt,name=online_capture_version,json=onlineCaptureVersion,proto3" json:"online_capture_version,omitempty"`
+	OnlineSequence             uint64                   `protobuf:"varint,21,opt,name=online_sequence,json=onlineSequence,proto3" json:"online_sequence,omitempty"`
+	OnlineReady                bool                     `protobuf:"varint,22,opt,name=online_ready,json=onlineReady,proto3" json:"online_ready,omitempty"`
+	// Canonical, immutable source seal required by the current apply members.
+	OnlineSealedManifest []byte `protobuf:"bytes,23,opt,name=online_sealed_manifest,json=onlineSealedManifest,proto3" json:"online_sealed_manifest,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *ProbeMigrationStateRequest) Reset() {
@@ -2872,6 +2991,34 @@ func (x *ProbeMigrationStateRequest) GetPartitionTransition() []byte {
 	return nil
 }
 
+func (x *ProbeMigrationStateRequest) GetOnlineCaptureVersion() uint32 {
+	if x != nil {
+		return x.OnlineCaptureVersion
+	}
+	return 0
+}
+
+func (x *ProbeMigrationStateRequest) GetOnlineSequence() uint64 {
+	if x != nil {
+		return x.OnlineSequence
+	}
+	return 0
+}
+
+func (x *ProbeMigrationStateRequest) GetOnlineReady() bool {
+	if x != nil {
+		return x.OnlineReady
+	}
+	return false
+}
+
+func (x *ProbeMigrationStateRequest) GetOnlineSealedManifest() []byte {
+	if x != nil {
+		return x.OnlineSealedManifest
+	}
+	return nil
+}
+
 type ProbeMigrationStateResponse struct {
 	state                     protoimpl.MessageState   `protogen:"open.v1"`
 	Ready                     bool                     `protobuf:"varint,1,opt,name=ready,proto3" json:"ready,omitempty"`
@@ -2890,6 +3037,7 @@ type ProbeMigrationStateResponse struct {
 	// Installed support only; the durable group activation is separately probed.
 	NamespaceAdmissionVersion uint32 `protobuf:"varint,11,opt,name=namespace_admission_version,json=namespaceAdmissionVersion,proto3" json:"namespace_admission_version,omitempty"`
 	PartitionReceiptId        []byte `protobuf:"bytes,12,opt,name=partition_receipt_id,json=partitionReceiptId,proto3" json:"partition_receipt_id,omitempty"`
+	OnlineCaptureVersion      uint32 `protobuf:"varint,13,opt,name=online_capture_version,json=onlineCaptureVersion,proto3" json:"online_capture_version,omitempty"`
 	unknownFields             protoimpl.UnknownFields
 	sizeCache                 protoimpl.SizeCache
 }
@@ -3006,6 +3154,13 @@ func (x *ProbeMigrationStateResponse) GetPartitionReceiptId() []byte {
 		return x.PartitionReceiptId
 	}
 	return nil
+}
+
+func (x *ProbeMigrationStateResponse) GetOnlineCaptureVersion() uint32 {
+	if x != nil {
+		return x.OnlineCaptureVersion
+	}
+	return 0
 }
 
 type IssueMigrationTimestampRequest struct {
@@ -3374,7 +3529,7 @@ const file_internal_proto_rawDesc = "" +
 	"\achannel\x18\x01 \x01(\fR\achannel\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\fR\amessage\"8\n" +
 	"\x14RelayPublishResponse\x12 \n" +
-	"\vsubscribers\x18\x01 \x01(\x03R\vsubscribers\"\xe2\x03\n" +
+	"\vsubscribers\x18\x01 \x01(\x03R\vsubscribers\"\xba\x04\n" +
 	"\x1aExportRangeVersionsRequest\x12\x1f\n" +
 	"\vrange_start\x18\x01 \x01(\fR\n" +
 	"rangeStart\x12\x1b\n" +
@@ -3393,12 +3548,16 @@ const file_internal_proto_rawDesc = "" +
 	" \x01(\rR\tkeyFamily\x124\n" +
 	"\x16exclude_known_internal\x18\v \x01(\bR\x14excludeKnownInternal\x12)\n" +
 	"\x10exclude_prefixes\x18\f \x03(\fR\x0fexcludePrefixes\x12\x1b\n" +
-	"\tmax_pages\x18\r \x01(\rR\bmaxPages\"|\n" +
+	"\tmax_pages\x18\r \x01(\rR\bmaxPages\x12\"\n" +
+	"\ronline_job_id\x18\x0e \x01(\x04R\vonlineJobId\x122\n" +
+	"\x15online_after_sequence\x18\x0f \x01(\x04R\x13onlineAfterSequence\"\xc8\x01\n" +
 	"\x1bExportRangeVersionsResponse\x12(\n" +
 	"\bversions\x18\x01 \x03(\v2\f.MVCCVersionR\bversions\x12\x1f\n" +
 	"\vnext_cursor\x18\x02 \x01(\fR\n" +
 	"nextCursor\x12\x12\n" +
-	"\x04done\x18\x03 \x01(\bR\x04done\"\xac\x01\n" +
+	"\x04done\x18\x03 \x01(\bR\x04done\x12'\n" +
+	"\x0fonline_manifest\x18\x04 \x01(\fR\x0eonlineManifest\x12!\n" +
+	"\fonline_frame\x18\x05 \x01(\fR\vonlineFrame\"\xac\x01\n" +
 	"\vMVCCVersion\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\fR\x03key\x12\x1b\n" +
 	"\tcommit_ts\x18\x02 \x01(\x04R\bcommitTs\x12\x1c\n" +
@@ -3406,14 +3565,16 @@ const file_internal_proto_rawDesc = "" +
 	"\x05value\x18\x04 \x01(\fR\x05value\x12\x1d\n" +
 	"\n" +
 	"key_family\x18\x05 \x01(\rR\tkeyFamily\x12\x1b\n" +
-	"\texpire_at\x18\x06 \x01(\x04R\bexpireAt\"\xb1\x01\n" +
+	"\texpire_at\x18\x06 \x01(\x04R\bexpireAt\"\xfd\x01\n" +
 	"\x1aImportRangeVersionsRequest\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\x04R\x05jobId\x12(\n" +
 	"\bversions\x18\x02 \x03(\v2\f.MVCCVersionR\bversions\x12\x16\n" +
 	"\x06cursor\x18\x03 \x01(\fR\x06cursor\x12\x1d\n" +
 	"\n" +
 	"bracket_id\x18\x04 \x01(\x04R\tbracketId\x12\x1b\n" +
-	"\tbatch_seq\x18\x05 \x01(\x04R\bbatchSeq\"^\n" +
+	"\tbatch_seq\x18\x05 \x01(\x04R\bbatchSeq\x12'\n" +
+	"\x0fonline_manifest\x18\x06 \x01(\fR\x0eonlineManifest\x12!\n" +
+	"\fonline_frame\x18\a \x01(\fR\vonlineFrame\"^\n" +
 	"\x1bImportRangeVersionsResponse\x12!\n" +
 	"\facked_cursor\x18\x01 \x01(\fR\vackedCursor\x12\x1c\n" +
 	"\tduplicate\x18\x02 \x01(\bR\tduplicate\"\xb9\x01\n" +
@@ -3428,7 +3589,7 @@ const file_internal_proto_rawDesc = "" +
 	"nextCursor\x12\x12\n" +
 	"\x04done\x18\x02 \x01(\bR\x04done\x12#\n" +
 	"\rpromoted_rows\x18\x03 \x01(\x04R\fpromotedRows\x12&\n" +
-	"\x0fmax_promoted_ts\x18\x04 \x01(\x04R\rmaxPromotedTs\"\xb2\x05\n" +
+	"\x0fmax_promoted_ts\x18\x04 \x01(\x04R\rmaxPromotedTs\"\xec\a\n" +
 	"\x1cTargetStagedReadinessRequest\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\x04R\x05jobId\x12\x1f\n" +
 	"\vroute_start\x18\x02 \x01(\fR\n" +
@@ -3446,9 +3607,18 @@ const file_internal_proto_rawDesc = "" +
 	"\x0fmin_admitted_ts\x18\f \x01(\x04R\rminAdmittedTs\x12=\n" +
 	"\x1btransfer_size_guard_version\x18\r \x01(\rR\x18transferSizeGuardVersion\x12>\n" +
 	"\x1brequire_configuration_index\x18\x0e \x01(\bR\x19requireConfigurationIndex\x12@\n" +
-	"\x1cexpected_configuration_index\x18\x0f \x01(\x04R\x1aexpectedConfigurationIndex\"G\n" +
+	"\x1cexpected_configuration_index\x18\x0f \x01(\x04R\x1aexpectedConfigurationIndex\x124\n" +
+	"\x16online_capture_version\x18\x10 \x01(\rR\x14onlineCaptureVersion\x12%\n" +
+	"\x0eonline_lineage\x18\x11 \x01(\fR\ronlineLineage\x124\n" +
+	"\x16online_target_manifest\x18\x12 \x01(\fR\x14onlineTargetManifest\x12!\n" +
+	"\fonline_ready\x18\x13 \x01(\bR\vonlineReady\x12'\n" +
+	"\x0fonline_sequence\x18\x14 \x01(\x04R\x0eonlineSequence\x12\x1f\n" +
+	"\vonline_seal\x18\x15 \x01(\bR\n" +
+	"onlineSeal\x128\n" +
+	"\x18online_source_generation\x18\x16 \x01(\tR\x16onlineSourceGeneration\"p\n" +
 	"\x1dTargetStagedReadinessResponse\x12&\n" +
-	"\x0fmin_admitted_ts\x18\x01 \x01(\x04R\rminAdmittedTs\"p\n" +
+	"\x0fmin_admitted_ts\x18\x01 \x01(\x04R\rminAdmittedTs\x12'\n" +
+	"\x0fonline_sequence\x18\x02 \x01(\x04R\x0eonlineSequence\"p\n" +
 	"\x1aProbeMigrationLocksRequest\x12\x1f\n" +
 	"\vroute_start\x18\x01 \x01(\fR\n" +
 	"routeStart\x12\x1b\n" +
@@ -3508,7 +3678,7 @@ const file_internal_proto_rawDesc = "" +
 	"\x04done\x18\x02 \x01(\bR\x04done\x12!\n" +
 	"\fdeleted_rows\x18\x03 \x01(\x04R\vdeletedRows\x12#\n" +
 	"\rdeleted_bytes\x18\x04 \x01(\x04R\fdeletedBytes\x12#\n" +
-	"\rscanned_bytes\x18\x05 \x01(\x04R\fscannedBytes\"\x9a\a\n" +
+	"\rscanned_bytes\x18\x05 \x01(\x04R\fscannedBytes\"\xd2\b\n" +
 	"\x1aProbeMigrationStateRequest\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\x04R\x05jobId\x12,\n" +
 	"\x04kind\x18\x02 \x01(\x0e2\x18.MigrationStateProbeKindR\x04kind\x12\x1f\n" +
@@ -3530,7 +3700,11 @@ const file_internal_proto_rawDesc = "" +
 	"\x1cexpected_configuration_index\x18\x10 \x01(\x04R\x1aexpectedConfigurationIndex\x126\n" +
 	"\townership\x18\x11 \x01(\v2\x18.MigrationOwnershipProofR\townership\x12=\n" +
 	"\x1btransfer_size_guard_version\x18\x12 \x01(\rR\x18transferSizeGuardVersion\x121\n" +
-	"\x14partition_transition\x18\x13 \x01(\fR\x13partitionTransition\"\xfe\x04\n" +
+	"\x14partition_transition\x18\x13 \x01(\fR\x13partitionTransition\x124\n" +
+	"\x16online_capture_version\x18\x14 \x01(\rR\x14onlineCaptureVersion\x12'\n" +
+	"\x0fonline_sequence\x18\x15 \x01(\x04R\x0eonlineSequence\x12!\n" +
+	"\fonline_ready\x18\x16 \x01(\bR\vonlineReady\x124\n" +
+	"\x16online_sealed_manifest\x18\x17 \x01(\fR\x14onlineSealedManifest\"\xb4\x05\n" +
 	"\x1bProbeMigrationStateResponse\x12\x14\n" +
 	"\x05ready\x18\x01 \x01(\bR\x05ready\x12'\n" +
 	"\x0fcatalog_version\x18\x02 \x01(\x04R\x0ecatalogVersion\x12&\n" +
@@ -3544,7 +3718,8 @@ const file_internal_proto_rawDesc = "" +
 	"\x1cownership_partition_protocol\x18\n" +
 	" \x01(\rR\x1aownershipPartitionProtocol\x12>\n" +
 	"\x1bnamespace_admission_version\x18\v \x01(\rR\x19namespaceAdmissionVersion\x120\n" +
-	"\x14partition_receipt_id\x18\f \x01(\fR\x12partitionReceiptId\" \n" +
+	"\x14partition_receipt_id\x18\f \x01(\fR\x12partitionReceiptId\x124\n" +
+	"\x16online_capture_version\x18\r \x01(\rR\x14onlineCaptureVersion\" \n" +
 	"\x1eIssueMigrationTimestampRequest\"e\n" +
 	"\x1fIssueMigrationTimestampResponse\x12\x1c\n" +
 	"\ttimestamp\x18\x01 \x01(\x04R\ttimestamp\x12$\n" +

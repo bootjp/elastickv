@@ -125,6 +125,9 @@ func (s *pebbleStore) CleanupVersions(ctx context.Context, opts CleanupVersionsO
 	}
 	batch := s.db.NewBatch()
 	defer batch.Close()
+	if err := s.stageOnlineMaintenanceGuard(batch, opts.OnlineGuard, exported.Versions); err != nil {
+		return CleanupVersionsResult{}, err
+	}
 	for _, version := range exported.Versions {
 		if err := batch.Delete(encodeKey(version.Key, version.CommitTS), nil); err != nil {
 			return CleanupVersionsResult{}, errors.WithStack(err)
@@ -157,10 +160,18 @@ func (s *pebbleStore) ClearMigrationState(_ context.Context, jobID, appliedIndex
 
 	batch := s.db.NewBatch()
 	defer batch.Close()
+	onlineCleanup, err := s.stageOnlineMigrationCleanup(batch, jobID, appliedIndex)
+	if err != nil {
+		return err
+	}
 	if err := stageMigrationMetadataCleanup(batch, jobID, appliedIndex, metadata); err != nil {
 		return err
 	}
-	if err := batch.Commit(s.cleanupWriteOpts(appliedIndex)); err != nil {
+	writeOpts := s.cleanupWriteOpts(appliedIndex)
+	if onlineCleanup {
+		writeOpts = pebble.Sync
+	}
+	if err := batch.Commit(writeOpts); err != nil {
 		return errors.WithStack(err)
 	}
 	s.mtx.Lock()

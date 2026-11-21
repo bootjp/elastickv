@@ -69,23 +69,32 @@ func (f *kvFSM) applyMigrationPromote(ctx context.Context, data []byte) any {
 		}
 		return key, valid
 	}
+	guard, err := f.onlineMaintenanceGuard(ctx, nil)
+	if err != nil {
+		return haltErr(errors.Mark(err, ErrMigrationPromoteApply))
+	}
+	opts.OnlineGuard = guard
 	result, err := promoter.PromoteVersions(ctx, opts)
 	if err != nil {
-		// A legacy staged control row is a deterministic input refusal, not
-		// a store failure that should halt replication. Promotion plans the
-		// entire chunk before applying it, so no row has been moved here.
-		if rejectedPeerLocal {
-			return errors.Wrap(ErrInvalidRequest, "migration cannot promote peer-local timestamp protocol state")
-		}
-		if isMigrationPromoteOrdinaryApplyError(err) {
-			return errors.Wrap(err, "kv/fsm: apply migration promote")
-		}
-		return haltErr(errors.Wrap(errors.Mark(err, ErrMigrationPromoteApply), "kv/fsm: apply migration promote"))
+		return migrationPromoteFailure(err, rejectedPeerLocal)
 	}
 	if f.hlc != nil && result.MaxPromotedTS > 0 {
 		f.hlc.Observe(result.MaxPromotedTS)
 	}
 	return result
+}
+
+func migrationPromoteFailure(err error, rejectedPeerLocal bool) any {
+	// A legacy staged control row is a deterministic input refusal, not
+	// a store failure that should halt replication. Promotion plans the
+	// entire chunk before applying it, so no row has been moved here.
+	if rejectedPeerLocal {
+		return errors.Wrap(ErrInvalidRequest, "migration cannot promote peer-local timestamp protocol state")
+	}
+	if isMigrationPromoteOrdinaryApplyError(err) {
+		return errors.Wrap(err, "kv/fsm: apply migration promote")
+	}
+	return haltErr(errors.Wrap(errors.Mark(err, ErrMigrationPromoteApply), "kv/fsm: apply migration promote"))
 }
 
 func migrationPromoteOptionsFromProto(req *pb.PromoteStagedVersionsRequest, appliedIndex uint64) store.PromoteVersionsOptions {
@@ -126,7 +135,7 @@ func clampMigrationPromoteBound(requested, fallback, ceiling uint64) uint64 {
 }
 
 func isMigrationPromoteOrdinaryApplyError(err error) bool {
-	return errors.Is(err, store.ErrMigrationRetired) || errors.Is(err, store.ErrInvalidExportCursor) || errors.Is(err, store.ErrInvalidImportVersion)
+	return errors.Is(err, store.ErrOnlineMigrationSealed) || errors.Is(err, store.ErrMigrationRetired) || errors.Is(err, store.ErrInvalidExportCursor) || errors.Is(err, store.ErrInvalidImportVersion)
 }
 
 func migrationPromoteTargetKey(jobID uint64) func([]byte) ([]byte, bool) {

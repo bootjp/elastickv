@@ -53,12 +53,23 @@ func (f *kvFSM) RecordAppliedConfiguration(index uint64) error {
 
 func (f *kvFSM) reloadMigrationConfiguration(ctx context.Context) error {
 	state, err := readNamespaceConfiguration(ctx, f.store)
-	if err == nil {
-		f.migrationConfigurationIndex.Store(state.Index)
-		f.migrationNamespaceVersion.Store(state.Version)
-		f.migrationNamespaceMembers = state.Members
+	if err != nil {
+		return err
 	}
-	return err
+	f.migrationConfigurationIndex.Store(state.Index)
+	f.migrationNamespaceVersion.Store(state.Version)
+	f.migrationNamespaceMembers = state.Members
+	if state.Version == 0 || store.OnlineMigrationSupported(f.store) {
+		return nil
+	}
+	active, err := f.hasActiveOnlineMigration(ctx)
+	if err != nil {
+		return err
+	}
+	if active {
+		return errors.Wrap(store.ErrNotSupported, "local store cannot apply installed online migration")
+	}
+	return nil
 }
 
 func (f *kvFSM) verifyMigrationCleanupConfiguration(ctx context.Context, req *pb.CleanupMigrationRequest) error {

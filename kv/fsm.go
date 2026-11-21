@@ -428,6 +428,12 @@ func (f *kvFSM) Apply(data []byte) any {
 		return haltErr(errors.Wrap(errors.Mark(f.backupFloorLoadErr, ErrBackupApply), "kv/fsm: load backup timestamp floor"))
 	}
 	ctx := context.TODO()
+	if err := f.invalidateOnlineMigrationControl(ctx, data); err != nil {
+		if errors.Is(err, store.ErrOnlineMigrationSealed) {
+			return err
+		}
+		return haltErr(errors.Mark(err, ErrRaftEntryApply))
+	}
 	if resp, handled := f.applyGuardedBootstrap(ctx, data); handled {
 		return resp
 	}
@@ -435,9 +441,16 @@ func (f *kvFSM) Apply(data []byte) any {
 		return resp
 	}
 
+	return f.applyRaftDataRequests(ctx, data)
+}
+
+func (f *kvFSM) applyRaftDataRequests(ctx context.Context, data []byte) any {
 	reqs, err := decodeRaftRequests(data)
 	if err != nil {
 		return errors.WithStack(err)
+	}
+	if response, handled := f.applyOnlineMigrationRequests(ctx, data, reqs); handled {
+		return response
 	}
 	if f.migrationCaptureShadow != nil && migrationCaptureShadowEligible(reqs) {
 		return f.applyMigrationCaptureShadow(ctx, data, reqs)

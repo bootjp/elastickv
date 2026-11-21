@@ -1,8 +1,8 @@
 # Online Split activation
 
-Status: reviewed implementation plan. Builds on the online Split proposal and
-its atomic RawKV point capture implementation. Existing deployments do not
-require a rolling upgrade or data conversion.
+Status: implemented online RawKV point path; broader mutation coverage and
+additional failure campaigns remain open. Builds on atomic RawKV point capture.
+Existing deployments do not require a rolling upgrade or data conversion.
 
 ## Scope and default
 
@@ -18,7 +18,9 @@ user write. It must not be possible to seal an invalid session.
 
 A source session records group, lineage, job, generation, moving range,
 configuration, start index, sequential frame count, storage budget and seal.
-Activation shares an indexed transaction with the retained source tracker.
+Activation shares an indexed transaction with the retained source tracker and
+the ownership generation nonce. A lost initial response rediscovers that exact
+nonce from the source capability probe before retrying.
 Reapplying activation never clears invalidation, advances the start position,
 or reopens a sealed session. Capture data, frame, sequence and applied index
 commit atomically. Frames, including empty ones, consume the bounded budget.
@@ -83,3 +85,36 @@ and target failover/restart, and cutover/abort exclusivity. Compare successful
 writes at the target, not merely runner phase completion. Run focused race,
 full Go tests, lint and the Jepsen harness. Linux load validation is separate
 from local unit or harness passes.
+
+## Implementation decisions
+
+Capture stores at most 16,384 frames and 256 MiB per source session. Quota
+exhaustion invalidates migration atomically with the acknowledged source data;
+it does not reject that user mutation. Unsupported ordinary mutations first
+persist invalidation. Physical promotion/cleanup checks concrete affected live
+rows in its indexed batch; unrelated private imports do not invalidate a seal.
+Authorized source cleanup requires the exact committed NONOWNER proof, matching
+job, lineage, range, floor, current configuration and durable read/write fences.
+Closed headers remain terminal; range tombstones reclaim frames and receipts.
+
+An immutable source seal retains its original capture configuration. If native
+membership changes after sealing, existing manifests are reattested through an
+indexed target control and fresh current-member probes of the exact seal. Old
+ACK cursors alone never authorize cutover. Joining members must advertise the
+online protocol before their membership authorization is committed.
+
+A runner catch-up pass processes at most 128 frames, 200 ms and 4 MiB; it
+checkpoints accepted receipts once per pass. Online progress uses a 10 ms
+continuation delay. Once caught up, it reloads and readmits the job before
+fencing in the same attempt, so continuous writers do not require an idle tick.
+RawKV handoff waiting is limited to two seconds, 256 concurrent waiters and
+8 MiB including waiter overhead. Cancellation before another dispatch retains
+the previous noncommit proof; a dispatched attempt returns its actual outcome.
+
+## Remaining scope
+
+The online path is currently for plaintext persistent RawKV point entries and
+a fresh dedicated target. Collection and transactional entries conservatively
+abort capture; encrypted journal key retention is not implemented. This does
+not enable the automatic scheduler or provision groups. Larger journals,
+general target reuse and broader failure/performance campaigns are future work.

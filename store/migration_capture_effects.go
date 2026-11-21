@@ -15,6 +15,7 @@ type migrationCaptureCollector struct {
 	request       uint64
 	recording     bool
 	stagedRequest bool
+	accept        func([]byte) bool
 }
 
 func captureStagedMigrationMutations(scope *raftEntryScope, mutations []encodedMutation) error {
@@ -32,6 +33,12 @@ func (c *migrationCaptureCollector) staged(scope *raftEntryScope, mutations []en
 		c.stagedRequest = true
 	}
 	for _, mutation := range mutations {
+		if c.accept != nil {
+			key, _ := decodeKeyView(mutation.key)
+			if !c.accept(key) {
+				continue
+			}
+		}
 		if !c.entry.Complete {
 			break
 		}

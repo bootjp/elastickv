@@ -387,6 +387,7 @@ func (i *Internal) ProbeMigrationState(ctx context.Context, req *pb.ProbeMigrati
 	if err != nil {
 		return nil, err
 	}
+	i.decorateOnlineMigrationProbe(ctx, req, resp)
 	resp.NamespaceAdmissionVersion = i.migrationNamespaceProtocolVersion()
 	i.decorateMigrationTransferCapability(req, resp)
 	i.bindMigrationProbeConfiguration(req, resp)
@@ -845,6 +846,9 @@ func (i *Internal) RelayPublish(_ context.Context, req *pb.RelayPublishRequest) 
 }
 
 func (i *Internal) ExportRangeVersions(req *pb.ExportRangeVersionsRequest, stream pb.Internal_ExportRangeVersionsServer) error {
+	if req != nil && req.GetOnlineJobId() != 0 {
+		return i.exportOnlineMigration(req, stream)
+	}
 	if err := i.validateExportRangeVersionsRequest(req); err != nil {
 		return err
 	}
@@ -970,7 +974,7 @@ func (i *Internal) ImportRangeVersions(ctx context.Context, req *pb.ImportRangeV
 	}
 	result, err := i.proposeMigrationImport(ctx, req)
 	if err != nil {
-		return nil, errors.WithStack(err)
+		return nil, onlineMigrationRPCError(err)
 	}
 	if i.clock != nil && result.MaxImportedTS > 0 {
 		i.clock.Observe(result.MaxImportedTS)
@@ -1046,7 +1050,7 @@ func (i *Internal) ApplyTargetStagedReadiness(ctx context.Context, req *pb.Targe
 		return nil, err
 	}
 	if err := i.proposeTargetStagedReadiness(ctx, req); err != nil {
-		return nil, errors.WithStack(err)
+		return nil, onlineMigrationRPCError(err)
 	}
 	if req.GetArmed() && i.clock != nil {
 		floor := req.GetMinWriteTsExclusive()
@@ -2040,4 +2044,18 @@ func forwardRawNotSubmitted(reqs []*pb.Request, err error, commitAttempt bool) b
 		return kv.IsDataRequestNotSubmitted(err)
 	}
 	return kv.IsMigrationAdmissionRejection(err)
+}
+
+func (i *Internal) decorateOnlineMigrationProbe(ctx context.Context, req *pb.ProbeMigrationStateRequest, resp *pb.ProbeMigrationStateResponse) {
+	if store.OnlineMigrationSupported(i.store) {
+		resp.OnlineCaptureVersion = store.OnlineMigrationVersion
+		if err := i.decorateOnlineSourceGeneration(ctx, req, resp); err != nil {
+			resp.Ready = false
+		}
+	}
+	if req.GetOnlineCaptureVersion() != 0 {
+		if err := i.probeOnlineMigration(ctx, req); err != nil {
+			resp.Ready = false
+		}
+	}
 }

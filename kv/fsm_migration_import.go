@@ -36,23 +36,39 @@ func (f *kvFSM) applyMigrationImport(ctx context.Context, data []byte) any {
 	if err := proto.Unmarshal(data, req); err != nil {
 		return haltErr(errors.Wrap(errors.Mark(err, ErrMigrationImportApply), "kv/fsm: decode migration import"))
 	}
+	if err := f.verifyOnlineImportConfiguration(ctx, req); err != nil {
+		if errors.Is(err, store.ErrOnlineMigrationIdentity) || errors.Is(err, ErrMigrationConfigurationChanged) {
+			return err
+		}
+		return haltErr(errors.Mark(err, ErrMigrationImportApply))
+	}
 	if err := f.validateImportedPrepareEvidence(req.GetVersions()); err != nil {
 		return err
 	}
-	staged := migrationStoreVersionsFromProto(req.GetJobId(), req.GetVersions())
-	if err := validateStagedKeySizes(staged); err != nil {
-		// Ordinary, not halting: the batch is rejected and the migrator can
-		// surface it, where halting would wedge apply on every voter.
+	opts, err := migrationImportOptions(req, f.pendingApplyIdx)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	return f.applyMigrationImportBatch(ctx, req, opts)
+}
+
+func migrationImportOptions(req *pb.ImportRangeVersionsRequest, index uint64) (store.ImportVersionsOptions, error) {
+	if len(req.GetOnlineFrame()) != 0 || len(req.GetOnlineManifest()) != 0 {
+		opts, err := onlineMigrationImportOptions(req)
+		opts.AppliedIndex = index
+		return opts, err
+	}
+	return store.ImportVersionsOptions{
+		JobID: req.GetJobId(), AppliedIndex: index, BracketID: req.GetBracketId(),
+		BatchSeq: req.GetBatchSeq(), Cursor: req.GetCursor(), Versions: migrationStoreVersionsFromProto(req.GetJobId(), req.GetVersions()),
+	}, nil
+}
+
+func (f *kvFSM) applyMigrationImportBatch(ctx context.Context, req *pb.ImportRangeVersionsRequest, opts store.ImportVersionsOptions) any {
+	if err := validateStagedKeySizes(opts.Versions); err != nil {
 		return errors.Wrap(err, "kv/fsm: apply migration import")
 	}
-	result, err := f.store.ImportVersionsRaft(ctx, store.ImportVersionsOptions{
-		JobID:        req.GetJobId(),
-		AppliedIndex: f.pendingApplyIdx,
-		BracketID:    req.GetBracketId(),
-		BatchSeq:     req.GetBatchSeq(),
-		Cursor:       req.GetCursor(),
-		Versions:     staged,
-	})
+	result, err := f.store.ImportVersionsRaft(ctx, opts)
 	if err != nil {
 		if isMigrationImportOrdinaryApplyError(err) {
 			return errors.Wrap(err, "kv/fsm: apply migration import")
@@ -120,7 +136,10 @@ func validateStagedKeySizes(versions []store.MVCCVersion) error {
 }
 
 func isMigrationImportOrdinaryApplyError(err error) bool {
-	return errors.Is(err, store.ErrMigrationRetired) ||
+	return errors.Is(err, store.ErrOnlineMigrationIdentity) ||
+		errors.Is(err, store.ErrOnlineMigrationTargetClosed) ||
+		errors.Is(err, store.ErrMigrationCaptureConflict) ||
+		errors.Is(err, store.ErrMigrationRetired) ||
 		errors.Is(err, store.ErrImportBatchGap) ||
 		errors.Is(err, store.ErrInvalidImportVersion) ||
 		errors.Is(err, store.ErrValueTooLarge) ||
