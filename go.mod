@@ -14,7 +14,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.73.2
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.114.9
 	github.com/aws/aws-sdk-go-v2/service/sqs v1.52.11
-	github.com/aws/smithy-go v1.28.8
+	github.com/aws/smithy-go v1.28.9
 	github.com/cockroachdb/errors v1.14.0
 	github.com/cockroachdb/pebble/v2 v2.1.7
 	github.com/coreos/go-semver v0.3.1
