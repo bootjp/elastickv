@@ -126,6 +126,9 @@ snapshot handleはローカルな資源として扱う。
 leader交代や再起動で同じBのviewを提供できなくなった場合、古いcursorで別のviewを読むことはせず、generationを更新してtargetの非公開baseを作り直す。
 sealはbase完成後にしか許可しないため、このやり直し中もsourceで書き込みを続けられる。
 各generationの変更ログ、snapshot pin、cursor、target側領域を区別し、古い転送応答を新generationへ混ぜない。
+既存staged keyとpromotion cursorはjob ID単位であるため、既存formatを使う最初の実装では、baseを取り直すたびに旧jobをAbortして新job IDを割り当てる。
+同じjob IDのgeneration番号だけを書き換えて、既存staged領域を再利用しない。
+旧jobのImportとPromoteはtargetの永続した終端markerで拒否し、新jobへそのcursorや残存rowを引き継がない。
 
 ### targetへの追従
 
@@ -143,6 +146,9 @@ targetが返す永続cursorは、対応するshadow本体、base manifest、rece
 sourceは、この復元可能性をcapabilityと試験で確認したtargetのcursorだけをGCに使う。
 古いbackupへの外部復元などでtargetのcursorがsourceのGC済み位置より戻った場合、欠落を飛ばしてactivationしない。
 seal前は新generationでやり直し、seal後は必要な状態の復旧を行うまで公開を保留する。
+activation後はtarget自身がACKした通常更新も存在するため、転送cursorがSと一致しているだけではserving再開の証拠にならない。
+通常のRaft復旧ではtargetのコミット済み履歴まで追従してからservingを許可し、その履歴を証明できない外部backup復元では自動再開を禁止する。
+sourceのjournalはSで閉じているため、targetのactivation後の更新をそのjournalから取り戻せるとは扱わない。
 
 ## 所有権切り替え
 
@@ -194,13 +200,37 @@ sequenceDiagram
    sourceはsealを維持し、古いrouteを使った要求には新しい所有者への照会を促す。
 8. **Cleanup**：sourceのread drainとretention条件を満たしてから、旧データとjournalを段階的に回収する。
 
-現在のpromotionを切り替え後に全件実行する形は、この手順に適合しない。
-targetは事前に別generationの読み書き可能なviewを準備し、activation時に所有権の証拠とviewへの参照を同じtarget applyで公開する設計とする。
+promotionの全件完了を、切り替え後の書き込み再開の条件にしない。
+現行の`ShardStore`には既に、`StagedVisibilityActive`に従ってliveとstagedを合成するGet、scan、OCC検査、prefix削除の実装とテストがある。
+この既存機能を利用できる場合、promotion自体は切り替え後の上限付き非同期処理として残せる。
+targetは事前に読み書き可能なviewを準備し、activation時に所有権の証拠とviewへの参照を同じtarget applyで公開する設計とする。
 MVCC versionとTTLを変えず、旧generationの遅延batchが新規の通常更新を上書きできないようにする。
-このviewの切り替えは新規機能であり、既存の`StagedVisibilityActive`や`PromoteVersions`で既に可能とは扱わない。
-採用する格納形式とnamespace manifestの更新方法は、実装前の試作で確定する。
+オンラインhandoffに必要なviewの完成証拠やactivationは新規機能であり、既存の合成読み取りだけで既に満たしているとは扱わない。
 
-格納形式の第一候補は、jobのgenerationに対応する物理namespaceを作り、targetの所有権証拠が指すmanifestで解決する方式とする。
+| targetの格納方式 | 必要な証拠と制約 | 試作での扱い |
+| --- | --- | --- |
+| 既存stagedとliveの合成 | 開始前に移動範囲のliveが空で、旧prepare、旧read pin、他jobの遅延更新がないことを全familyで証明。activation後のpoint更新はliveへ書き、range削除のstaged効果も保護する | 専用のfresh targetを使うRawKVの最初の試作候補 |
+| generationごとの物理namespace | 現役viewの全readとwriteをmanifestから解決し、旧namespaceへfallbackしない。再移動と旧版起動も扱う新しいstore formatが必要 | 非空の移動先や一般の再移動に対する候補 |
+
+最初の候補では、targetが非所有者であることを確認してjob専用の事前準備guardをRaft適用し、そのguardの下でliveが空であることと旧readerやintentがないことを確認する。
+guardの適用時に旧prepareが存在すれば、黙って破棄せずこの簡略経路の開始を拒否する。
+単に移動先の`Get`がnilだったことや、最新timestampのscanが空だったことでは証明できない。
+必要な全familyと保持中の履歴、既存job、解決例外を確認し、scan中や証明後にも旧処理がliveを更新できない状態を維持する。
+検証は上限付きのページで行い、handoff中に全件scanを追加しない。
+既存の合成処理を通らない読み書き経路があれば、その構成では採用しない。
+activation後の通常更新と非同期promotionが同じMVCC版を上書きしないこと、staged削除とlive反映が原子的であることを追加試験する。
+この条件を証明できない移動先へは、この簡略経路を使わずsourceで通常更新を続けて移行を延期する。
+
+この候補でも、既存実装へ追加修正が必要な箇所がある。
+`committedVersionAtForRoute`のexact-version照会はliveを先に読んでいるため、次のstaged照会との間にpromotionが入ると、実在する版を見逃し得る。
+通常の`GetAt`と同じstaged優先の照会、または両方を同じsnapshotから読む方式に修正し、`RawLatestCommitTS`を含む決定的な競合テストを通すまで有効化しない。
+
+prefix削除は、stagedにしかないキーを削除するためにstaged側へも通常更新のtombstoneを作る。
+この効果を「baseとjournalの入力を閉じた」という理由で拒否または破棄しない。
+通常更新はsourceの最終floorを超えるtimestampを使い、promotionとその後のretirementでもこれらの版を保持する。
+「stagedだけにあるキーをprefix削除してACKし、その後promotionを完了してもキーが復活しない」を必須テストにする。
+
+一般化する場合の候補は、jobのgenerationに対応する物理namespaceを作り、targetの所有権証拠が指すmanifestで解決する方式とする。
 移行する論理キーとfamilyは保持し、物理配置だけを変える。
 公開後のpoint read、scan、OCC、lock解決、TTL、新規書き込みは同じviewを使い、**新viewにキーがない場合に旧namespaceへfallbackしない**。
 旧namespaceに値が残り、新generationで削除済みのキーが復活する経路をこの規則で閉じる。
@@ -212,6 +242,9 @@ MVCC versionとTTLを変えず、旧generationの遅延batchが新規の通常�
 受領済み位置の同一digestに対する再送には保存済みreceiptだけを返し、データを再適用しない。
 Sを超えるbatch、異なるdigest、未知のgenerationは拒否する。
 この検査はworkerの状態だけに頼らずtarget FSMで行い、activation後の新規ユーザー更新を古い同世代batchが上書きする経路も閉じる。
+既存staged合成を採用する場合のpromotionは、凍結済みの同じMVCC版をstagedからliveへ原子的に移す別の制御操作として許可する。
+新しいbaseやjournalの取り込みを再開する操作にはしない。
+通常要求が生成した上記のstaged tombstoneも、そのcommitTSを保持して同じ原則で移す。
 
 読み取りはsourceが所有している間はsourceへ送る。
 targetの非公開データへ途中から通常読み取りを振り分けず、read-your-writesを保つ。
@@ -279,8 +312,14 @@ coordinator停止時にqueueが失われても成功済みと扱われず、ク�
 handoffの決定はdefault groupのjobに`Preparing`、`Committed`、`Aborted`の排他的な状態として保存する。
 この状態は、sourceのseal receiptとtargetのready receipt、次のowner epoch、期待catalog versionに結び付ける。
 CommitとAbortは同じjob revisionを条件とするCASで競合させ、一方が成立した後に他方を成立させない。
-`Preparing`は最初のholdを要求する前に作成する。
+`Preparing`はオンラインjobの開始時に作成し、最初のcaptureとholdの要求より先に永続化する。
 Commitには両方のreceiptを要求するが、Abortにはseal receiptもready receiptも要求せず、片側のholdしか取得できていなくても決定できるようにする。
+このjobのすべてのAbortでsourceの所有権epochをE+1へ進め、CatchUp中や片側holdだけの場合も例外にしない。
+default groupはAbortとsource所有routeのE+1を同じtransactionで確定し、sourceがReopen authorizationをRaft適用した位置で旧Eの新規受付を閉じる。
+それ以前のsourceは、元のActiveまたはDrainまたはSealedの状態を維持する。
+元からActiveだった場合、同じsource group内のepoch切り替えであり、targetへの公開は発生しない。
+既存prepareの解決規則は、下記のseal前Abortの規則をすべてのAbortに適用する。
+オンラインjobを作成する前の候補調査やcapability検査の中止では、所有権epochを変更しない。
 
 | 発生箇所 | 復旧または中止の処理 |
 | --- | --- |
@@ -343,7 +382,7 @@ sourceごとの同時移行数とsnapshot保持時間にも上限を設け、容
 | --- | --- | --- |
 | 1. 原子的な変更捕捉 | storeの全apply経路、typed apply、journal暗号化、snapshot保存と復元 | user data、journal、applied indexのcrash原子性、全writer coverage、鍵ローテーション後の復元を確認 |
 | 2. 継続転送 | 内部RPC、generation、source export、target receipt | baseとjournalの欠落、重複、順序逆転、leader交代を検出し、cursorを再開可能 |
-| 3. targetの事前準備 | 非公開view、namespace manifest、clock floor、activation | 全件promotionをhandoff後に残さず、旧generationと通常更新が競合しない |
+| 3. targetの事前準備 | 既存staged合成またはgeneration view、clock floor、activation | promotion完了をwrite再開条件にせず、旧データや再送と通常更新が競合しない |
 | 4. 排他的handoff | SplitJobの新protocol version、source seal、membership hold、default決定、ownership gate | CommitとAbort、voter変更、応答喪失を含めて所有者重複なし |
 | 5. 短時間待機 | coordinatorのadmission、キャンセル、noncommit証拠の集約 | Unknownを再実行せず、未投入要求を上限内で新ownerへ提出 |
 | 6. Linuxでの有効化判定 | 負荷生成器、履歴検証、障害注入、profile | 下記の正しさと性能条件を満たす |
@@ -354,7 +393,9 @@ learnerもcatch-up中にlogとsnapshotを適用するため、capabilityの確�
 最初は明示opt-inとし、未対応の構成ではsourceがActiveな段階でオンライン移行を開始しない。
 既存jobの復旧、abandon、cleanupを維持する。
 
-公開済みgeneration manifestが残る間は、job完了後も必要なstore formatとprotocolの最小versionを永続化する。
+sourceで最初のcapture状態を永続化する前に、必要なstore formatとprotocolの最小versionを永続化し、旧版の起動制限を有効にする。
+journalが存在する間に旧版で通常更新だけが進む経路を作らない。
+公開済みgeneration manifestが残る場合も、job完了後まで最小versionを保持する。
 未対応ノードのserving、learner追加、昇格、snapshot install、旧版バイナリでの再openを拒否し、既存memberのバイナリ差し戻しにも適用する。
 未知の新規metadataキーを追加するだけでは旧版に理解を強制できないため、既存の検証済みconfiguration envelopeと起動時のformat gateを拡張する。
 実際の旧版バイナリを使うnegative試験で拒否を確認し、guardを理解する版の先行配布が必要ならformat activationより前に全台へ配布する。
@@ -375,7 +416,9 @@ RawKVの単一操作はlinearizabilityで確認し、transactionは既存のOCC�
 小さな状態モデルでは、source seal、target ready、default CommitまたはAbort、target activation、source再開、leader交代、古い応答の再到着を列挙する。
 二重owner、ACK済み変更の欠落、S未満のcursorでのactivation、Commit後のsource再開が到達不能であることを調べる。
 実装テストでは、各永続化境界の直前と直後で停止し、snapshot restoreとRaft再送後の一致を確認する。
-片側holdだけのAbortとvoter交換、未解決prepareを残したAbort後の解決、source journal GC後のtarget復元、activationと通常更新後の同世代batch再送、公開済みstoreの旧版起動も必須ケースにする。
+片側holdだけのAbortとvoter交換、未解決prepareを残したAbort後の解決、source journal GC後のtarget復元、activationと通常更新後の同世代batch再送も必須ケースにする。
+段階1からcapture中のsourceを旧版で再起動する試験を行い、段階3以降は公開済みstoreの旧版起動も確認する。
+既存staged合成の候補では、exact-version照会中のpromotion、prefix削除後のpromotion、新job IDでのbaseやり直しと旧job batchの遅着を必須ケースにする。
 
 性能はSplitなしとSplitありを同じLinux構成で比較する。
 まず既存の3 node、2 group、1KiB、read/write各50%、並行数32、2秒RPC、同期永続化を固定し、100、200、300、400、500要求/秒を段階的に試す。
