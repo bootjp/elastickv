@@ -157,12 +157,7 @@ func (f *kvFSM) applyOnlineTargetReadiness(ctx context.Context, req *pb.TargetSt
 	if source.Identity.JobID != req.GetJobId() || source.Identity.SourceGroupID == f.shardGroupID || !onlineRangeMatches(req.GetRouteStart(), req.GetRouteEnd(), source) {
 		return errors.WithStack(store.ErrOnlineMigrationIdentity)
 	}
-	lockConflict := ErrTxnLocked
-	if !source.Sealed && !req.GetOnlineReady() {
-		// Initial preparation requires a fresh target. Later phases wait for locks to drain.
-		lockConflict = store.ErrOnlineMigrationTargetNotEmpty
-	}
-	if err := f.checkOnlineMigrationLocks(ctx, lockConflict); err != nil {
+	if err := f.checkOnlineTargetLocks(ctx, req, source); err != nil {
 		return err
 	}
 	if !req.GetOnlineReady() {
@@ -235,4 +230,34 @@ func (f *kvFSM) hasActiveOnlineMigration(ctx context.Context) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+func (f *kvFSM) onlineTargetPreparationLockConflict(ctx context.Context, source store.OnlineMigrationSession) (error, error) {
+	_, err := store.ReadOnlineMigrationTarget(ctx, f.store, source.Identity.JobID)
+	if errors.Is(err, store.ErrKeyNotFound) {
+		return store.ErrOnlineMigrationTargetNotEmpty, nil
+	}
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	// An exact receipt makes this a retry, even if the preceding reply was lost.
+	if err := store.PrepareOnlineMigrationTarget(ctx, f.store, source, f.AppliedConfigurationIndex(), func(key []byte) bool { return !isTxnPeerLocalControlKey(key) }); err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return ErrTxnLocked, nil
+}
+
+func (f *kvFSM) checkOnlineTargetLocks(ctx context.Context, req *pb.TargetStagedReadinessRequest, source store.OnlineMigrationSession) error {
+	lockConflict := ErrTxnLocked
+	if !source.Sealed && !req.GetOnlineReady() {
+		var err error
+		lockConflict, err = f.onlineTargetPreparationLockConflict(ctx, source)
+		if err != nil {
+			return err
+		}
+	}
+	if err := f.checkOnlineMigrationLocks(ctx, lockConflict); err != nil {
+		return err
+	}
+	return nil
 }

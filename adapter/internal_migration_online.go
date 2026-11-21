@@ -123,9 +123,6 @@ func (i *Internal) probeOnlineMigrationTarget(ctx context.Context, req *pb.Probe
 // Capture activation precedes the source ownership certificate. Its committed
 // nonce must be discoverable even when the activation response is lost.
 func (i *Internal) decorateOnlineSourceGeneration(ctx context.Context, req *pb.ProbeMigrationStateRequest, resp *pb.ProbeMigrationStateResponse) error {
-	if resp.GetOwnershipGeneration() != "" {
-		return nil
-	}
 	if req.GetKind() != pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_OWNERSHIP_CAPABILITY && req.GetKind() != pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_OWNERSHIP_APPLIED {
 		return nil
 	}

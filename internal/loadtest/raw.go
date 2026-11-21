@@ -113,7 +113,13 @@ func (r *Runner) Audit(ctx context.Context) Metric {
 		go func() {
 			var result samples
 			for id := range jobs {
+				if ctx.Err() != nil {
+					break
+				}
 				for _, client := range r.clients {
+					if ctx.Err() != nil {
+						break
+					}
 					started := time.Now()
 					err := r.get(ctx, client, "write", id)
 					result.record(time.Since(started), err)
@@ -122,8 +128,13 @@ func (r *Runner) Audit(ctx context.Context) Metric {
 			results <- result
 		}()
 	}
+auditJobs:
 	for _, id := range r.acknowledged {
-		jobs <- id
+		select {
+		case <-ctx.Done():
+			break auditJobs
+		case jobs <- id:
+		}
 	}
 	close(jobs)
 	var total samples

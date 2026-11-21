@@ -111,9 +111,10 @@ func TestOnlineCaptureTargetLockOnlyIsNotFresh(t *testing.T) {
 
 func TestOnlinePreparedTargetRetriesAfterUnrelatedLock(t *testing.T) {
 	for _, tc := range []struct {
-		name  string
-		ready bool
-	}{{"sealed reattestation", false}, {"ready", true}} {
+		name     string
+		ready    bool
+		reattest bool
+	}{{"sealed reattestation", false, true}, {"ready", true, true}, {"lost prepare response", false, false}} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := t.Context()
 			st := g17OpenStore(t, t.TempDir())
@@ -145,11 +146,15 @@ func TestOnlinePreparedTargetRetriesAfterUnrelatedLock(t *testing.T) {
 			prepared := target()
 			require.False(t, prepared.Ready)
 
-			require.NoError(t, f.RecordAppliedConfiguration(11))
-			source.Sealed = true
+			configuration := uint64(9)
+			if tc.reattest {
+				configuration = 11
+			}
+			require.NoError(t, f.RecordAppliedConfiguration(configuration))
+			source.Sealed = tc.reattest
 			req.OnlineTargetManifest, err = store.EncodeOnlineMigrationManifest(source)
 			require.NoError(t, err)
-			req.ExpectedConfigurationIndex = 11
+			req.ExpectedConfigurationIndex = configuration
 			req.OnlineReady = tc.ready
 			key := []byte("a") // Outside the moving range [m, z).
 			require.NoError(t, st.PutAt(ctx, txnLockKey(key), encodeTxnLock(txnLock{PrimaryKey: key, StartTS: 5}), 5, 0))
@@ -160,9 +165,12 @@ func TestOnlinePreparedTargetRetriesAfterUnrelatedLock(t *testing.T) {
 			require.NoError(t, st.DeleteAt(ctx, txnLockKey(key), 6))
 			require.Nil(t, apply(18))
 			state := target()
-			require.Equal(t, uint64(11), state.ConfigurationIndex)
+			require.Equal(t, configuration, state.ConfigurationIndex)
 			require.Equal(t, tc.ready, state.Ready)
 			if !tc.ready {
+				source.Sealed = true
+				req.OnlineTargetManifest, err = store.EncodeOnlineMigrationManifest(source)
+				require.NoError(t, err)
 				req.OnlineReady = true
 				require.Nil(t, apply(19))
 			}

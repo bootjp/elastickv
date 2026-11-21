@@ -110,15 +110,26 @@ func probeSplitSourceOwnershipState(ctx context.Context, source SplitMigrationCl
 }
 
 func (s *DistributionServer) configureOnlineSourceTracker(ctx context.Context, job distribution.SplitJob, prior *pb.ProbeMigrationStateResponse, proof *pb.MigrationOwnershipProof, configuration uint64, control *pb.TargetStagedReadinessRequest) error {
-	if prior.GetOnlineCaptureVersion() == store.OnlineMigrationVersion {
-		if err := s.requireOnlineSplitMembers(ctx, job); err != nil {
-			return err
-		}
-		lineage := store.OnlineMigrationLineage(proof.GetGeneration())
-		control.OnlineCaptureVersion = store.OnlineMigrationVersion
-		control.OnlineLineage = lineage[:]
-		control.OnlineSourceGeneration = proof.GetGeneration()
-		control.RequireConfigurationIndex, control.ExpectedConfigurationIndex = true, configuration
+	if prior.GetOnlineCaptureVersion() != store.OnlineMigrationVersion {
+		return onlineSplitFallbackError(job, prior)
+	}
+	supported, err := s.onlineSplitMembersSupported(ctx, job)
+	if err != nil {
+		return err
+	}
+	if !supported {
+		return onlineSplitFallbackError(job, prior)
+	}
+	lineage := store.OnlineMigrationLineage(proof.GetGeneration())
+	control.OnlineCaptureVersion = store.OnlineMigrationVersion
+	control.OnlineLineage = lineage[:]
+	control.OnlineSourceGeneration = proof.GetGeneration()
+	control.RequireConfigurationIndex, control.ExpectedConfigurationIndex = true, configuration
+	return nil
+}
+func onlineSplitFallbackError(job distribution.SplitJob, prior *pb.ProbeMigrationStateResponse) error {
+	if job.OnlineCaptureVersion != 0 || prior.GetOnlineSourceGeneration() != "" {
+		return errors.WithStack(store.ErrOnlineMigrationIdentity)
 	}
 	return nil
 }

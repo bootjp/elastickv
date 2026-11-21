@@ -19,7 +19,7 @@ func (s *DistributionServer) startOnlineSplit(ctx context.Context, job distribut
 	if err != nil {
 		return job, err
 	}
-	if state.GetOnlineCaptureVersion() != store.OnlineMigrationVersion {
+	if state.GetOnlineCaptureVersion() != store.OnlineMigrationVersion || state.GetOnlineSourceGeneration() == "" {
 		return job, nil
 	}
 	sourceProbe := &pb.ProbeMigrationStateRequest{JobId: job.JobID, Kind: pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_CONTROL_APPLIED, RouteStart: witness.control.GetRouteStart(), RouteEnd: witness.control.GetRouteEnd(), ExpectedCatalogVersion: witness.control.GetExpectedCutoverVersion(), MigrationJobId: job.JobID, MinWriteTsExclusive: witness.control.GetMinWriteTsExclusive(), TrackWrites: true, RetentionPinTs: initialMigrationRetentionPinTS, RequireConfigurationIndex: true, ExpectedConfigurationIndex: witness.snapshot.ConfigurationIndex, OnlineCaptureVersion: store.OnlineMigrationVersion}
@@ -295,19 +295,28 @@ func (s *DistributionServer) onlineSplitContinuation(ctx context.Context, previo
 }
 
 func verifyOnlineMemberCapabilities(ctx context.Context, jobID uint64, members SplitMigrationApplyMemberSnapshot) error {
+	supported, err := onlineMemberCapabilities(ctx, jobID, members)
+	if err != nil {
+		return err
+	}
+	if !supported {
+		return errors.WithStack(store.ErrOnlineMigrationIdentity)
+	}
+	return nil
+}
+func onlineMemberCapabilities(ctx context.Context, jobID uint64, members SplitMigrationApplyMemberSnapshot) (bool, error) {
+	supported := true
 	for _, member := range members.Members {
 		resp, err := probeSplitOwnershipCapability(ctx, member, jobID)
 		if err != nil {
-			return err
+			return false, err
 		}
 		if resp.GetAppliedConfigurationIndex() != members.ConfigurationIndex {
-			return errors.WithStack(errSplitMigrationVoterBarrierIncomplete)
+			return false, errors.WithStack(errSplitMigrationVoterBarrierIncomplete)
 		}
-		if resp.GetOnlineCaptureVersion() != store.OnlineMigrationVersion {
-			return errors.WithStack(store.ErrOnlineMigrationIdentity)
-		}
+		supported = supported && resp.GetOnlineCaptureVersion() == store.OnlineMigrationVersion
 	}
-	return nil
+	return supported, nil
 }
 
 func (s *DistributionServer) confirmOnlineCutover(ctx context.Context, groupID uint64, probe *pb.ProbeMigrationStateRequest) error {
@@ -326,20 +335,23 @@ func (s *DistributionServer) confirmOnlineCutover(ctx context.Context, groupID u
 	return err
 }
 
-func (s *DistributionServer) requireOnlineSplitMembers(ctx context.Context, job distribution.SplitJob) error {
+func (s *DistributionServer) onlineSplitMembersSupported(ctx context.Context, job distribution.SplitJob) (bool, error) {
+	supported := true
 	for _, group := range []uint64{job.SourceGroupID, job.TargetGroupID} {
 		members, err := s.splitTransferApplyMembers(ctx, group)
 		if err != nil {
-			return err
+			return false, err
 		}
-		if err := verifyOnlineMemberCapabilities(ctx, job.JobID, members); err != nil {
-			return err
+		groupSupported, err := onlineMemberCapabilities(ctx, job.JobID, members)
+		if err != nil {
+			return false, err
 		}
+		supported = supported && groupSupported
 		if _, err := s.revalidateSplitTransferMembers(ctx, &splitTransferAdmissionWitness{groupID: group, snapshot: members}); err != nil {
-			return err
+			return false, err
 		}
 	}
-	return nil
+	return supported, nil
 }
 
 func (s *DistributionServer) admitOnlineSplitFence(ctx context.Context, job distribution.SplitJob) (distribution.SplitJob, bool, error) {

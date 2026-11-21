@@ -109,7 +109,7 @@ func (f *kvFSM) applyOnlineMigrationRequests(ctx context.Context, data []byte, r
 		return nil, false
 	}
 	ctx = context.WithValue(ctx, onlineMigrationWriteContextKey{}, true)
-	if len(affected) != 1 || !onlinePointRequests(requests) {
+	if len(affected) != 1 || !onlineAffectedPointRequests(requests, affected[0]) {
 		if err := f.invalidateUnsupportedOnlineSessions(ctx, affected); err != nil {
 			return haltErr(errors.Mark(err, ErrRaftEntryApply)), true
 		}
@@ -225,7 +225,7 @@ func (f *kvFSM) invalidateOnlineMigrationControl(ctx context.Context, data []byt
 func (f *kvFSM) verifyOnlineSourceNotSealed(ctx context.Context, req *pb.Request) error {
 	sessions, err := f.onlineMigrationSessions(ctx)
 	if err != nil {
-		return err
+		return errors.WithStack(errors.Mark(err, errTargetReadinessUnproven))
 	}
 	for _, session := range sessions {
 		if session.Sealed && onlineRequestIntersects(req, session) {
@@ -233,4 +233,13 @@ func (f *kvFSM) verifyOnlineSourceNotSealed(ctx context.Context, req *pb.Request
 		}
 	}
 	return nil
+}
+
+func onlineAffectedPointRequests(requests []*pb.Request, session store.OnlineMigrationSession) bool {
+	for _, request := range requests {
+		if onlineRequestIntersects(request, session) && !onlinePointRequests([]*pb.Request{request}) {
+			return false
+		}
+	}
+	return true
 }
