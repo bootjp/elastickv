@@ -131,9 +131,9 @@ func (e *Engine) publishRecoveredAdmission() error {
 	if !validRecoveryPrefix(hardState, confState, e.applied, e.currentConfigIndex(), snapshot.GetMetadata().GetIndex()) {
 		return errors.New("native recovery admission prefix is not reconciled")
 	}
-	peers := make([]Peer, 0, len(e.peers))
-	for _, peer := range e.peers {
-		peers = append(peers, peer)
+	peers, err := snapshotPeerInventory(e.peers, confState)
+	if err != nil {
+		return err
 	}
 	state := RecoveredState{identity: copyWALIdentity([]*WALIdentity{e.recoveredIdentity}),
 		hardState: hardState, confState: confState,

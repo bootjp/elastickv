@@ -63,6 +63,7 @@ const (
 type Inspection struct {
 	Class  Classification
 	Marker MarkerState
+	Fenced bool
 	Intent *Intent
 }
 
@@ -77,6 +78,54 @@ type Store struct {
 }
 
 func NewStore(dir string) *Store { return &Store{dir: dir, ops: realFileOps()} }
+
+// UpgradeRequiredMarkerFence is an explicit offline-only V1 to V2 transition.
+// The caller must hold exclusive native Raft directory and WAL ownership.
+// It never changes intent, policy, or an unprotected marker.
+func (s *Store) UpgradeRequiredMarkerFence(expected Identity) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fenced, err := s.inspectRequiredMarkerFence(expected)
+	if err != nil || fenced {
+		return false, err
+	}
+	if err := s.replace(MarkerFile, []byte(MarkerV2)); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// InspectRequiredMarkerFence reports the marker format without changing disk.
+func (s *Store) InspectRequiredMarkerFence(expected Identity) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.inspectRequiredMarkerFence(expected)
+}
+
+func (s *Store) inspectRequiredMarkerFence(expected Identity) (bool, error) {
+	marker, present, err := readBounded(s.dir, MarkerFile)
+	if err != nil {
+		return false, err
+	}
+	if !present || (string(marker) != MarkerV1 && string(marker) != MarkerV2) {
+		return false, errors.WithStack(ErrInconsistent)
+	}
+	data, present, err := readBounded(s.dir, IntentFile)
+	if err != nil {
+		return false, err
+	}
+	if !present {
+		return false, errors.WithStack(ErrInconsistent)
+	}
+	intent, err := ParseIntent(data)
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+	if intent.Identity != expected {
+		return false, errors.WithStack(ErrInconsistent)
+	}
+	return string(marker) == MarkerV2, nil
+}
 
 // LoadIntent returns the strict durable intent when present. It does not
 // classify Raft state or grant admission; callers must still reconcile the
@@ -163,9 +212,9 @@ func (s *Store) AdvancePolicy(expected Witness, next PolicyRecord) error {
 
 func ParseMarker(data []byte) (MarkerState, error) {
 	switch string(data) {
-	case MarkerV1:
+	case MarkerV1, MarkerV2:
 		return MarkerRequired, nil
-	case "etcd", "etcd\n":
+	case "etcd", "etcd\n", MarkerLegacyFenced:
 		return MarkerLegacy, nil
 	case "":
 		return MarkerCorrupt, ErrInvalid
@@ -193,6 +242,7 @@ func (s *Store) inspect(e Evidence) (Inspection, error) {
 		if err != nil {
 			return classifiedError(r, err)
 		}
+		r.Fenced = string(b) == MarkerLegacyFenced || string(b) == MarkerV2
 	}
 	b, present, err = readBounded(s.dir, IntentFile)
 	if err != nil {
@@ -354,7 +404,11 @@ func (s *Store) publish(in Intent, e Evidence, validate func(Intent, Evidence) e
 	if err := s.replace(IntentFile, data); err != nil {
 		return err
 	}
-	return s.replace(MarkerFile, []byte(MarkerV1))
+	marker := MarkerV1
+	if old.Fenced {
+		marker = MarkerV2
+	}
+	return s.replace(MarkerFile, []byte(marker))
 }
 
 func validateExisting(old Inspection, in Intent, e Evidence) error {

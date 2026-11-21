@@ -14,6 +14,7 @@ func BootstrapPublicGRPCMethods() []string {
 	for _, method := range BootstrapSharedGRPCMethods(0) {
 		mixed[method.Name] = true
 	}
+	mixed[pb.Internal_GetTTLInlineCapability_FullMethodName] = true
 	var methods []string
 	for _, service := range []*grpc.ServiceDesc{
 		&pb.RawKV_ServiceDesc, &pb.TransactionalKV_ServiceDesc, &pb.Internal_ServiceDesc,

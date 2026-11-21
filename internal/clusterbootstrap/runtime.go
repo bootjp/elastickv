@@ -34,7 +34,8 @@ func newBootstrapStartupForGroup(config *BootstrapPeerConfig, files *raftbootstr
 			Local: config.Local, Provisioned: config.Provisions, Versions: intent.Minimum,
 			PublicMethods: publicMethods,
 			MethodFactory: func(owner *peersession.Owner) ([]peersession.Method, error) {
-				return append(etcd.PeerSessionMethodsForOwner(cfg.GroupID, owner), BootstrapSharedGRPCMethods(cfg.GroupID)...), nil
+				methods := append(etcd.PeerSessionMethodsForOwner(cfg.GroupID, owner), BootstrapSharedGRPCMethods(cfg.GroupID)...)
+				return append(methods, TTLInlinePeerMethod(cfg.GroupID)), nil
 			},
 		})
 		if err != nil {
@@ -72,6 +73,12 @@ func newBootstrapStartupForGroup(config *BootstrapPeerConfig, files *raftbootstr
 				defer mu.Unlock()
 				// Any failed re-publication permanently closes this owner rather than
 				// retaining an earlier projection's authority.
+				if err := installTTLInlineRecoveryProof(context.Background(), cfg.StateMachine,
+					&GroupBootstrapSpec{Config: config, Files: files, Intent: intent, Dir: cfg.DataDir}, state); err != nil {
+					admission.LatchFatal(err)
+					owner.Close()
+					return err
+				}
 				if err := publishBootstrapAdmissionRecovery(admission, owner, files, st, identity, state, config.Activation, domain.encryptionRequest.Configured); err != nil {
 					admission.LatchFatal(err)
 					owner.Close()

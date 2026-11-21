@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -164,6 +165,7 @@ var (
 	errLeadershipTransferTargetNotCaughtUp = errors.Mark(errors.New("etcd raft leadership transfer target is not caught up"), raftengine.ErrLeadershipTransferTargetNotCaughtUp)
 	errLeadershipTransferConfChangePending = errors.Mark(errors.New("etcd raft leadership transfer blocked by pending config change"), raftengine.ErrLeadershipTransferConfChangePending)
 	errMembershipConfChangePending         = errors.Mark(errors.New("etcd raft membership change blocked by pending config change"), raftengine.ErrMembershipChangePending)
+	errTTLInlineMembershipProofRequired    = errors.New("etcd raft membership change requires TTL-inline member capability proof")
 	errTooManyPendingConfigs               = errors.New("etcd raft engine has too many pending config changes")
 	errPromoteLearnerNotLearner            = errors.New("etcd raft promote-learner target is not a learner")
 	errPromoteLearnerNoProgress            = errors.New("etcd raft promote-learner target has no leader-side progress entry")
@@ -330,16 +332,19 @@ type Engine struct {
 	nativeAdmission          raftengine.NativeAdmission
 	groupID                  uint64
 	nativeConfigurationIndex uint64 // actual native configuration, owned by the loop
-	admissionDirty           bool   // owned by the native loop, like RawNode
-	admissionPublished       bool
-	recoveredIdentity        *WALIdentity
-	nodeID                   uint64
-	localID                  string
-	localAddress             string
-	dataDir                  string
-	fsmSnapDir               string
-	tickInterval             time.Duration
-	electionTick             int
+	// Published with status under mu; never read RawNode from an RPC goroutine.
+	nativeConfigurationView         *raftengine.NativeConfiguration
+	admissionDirty                  bool // owned by the native loop, like RawNode
+	admissionPublished              bool
+	recoveredIdentity               *WALIdentity
+	pipelineSnapshotRecoveryPending bool
+	nodeID                          uint64
+	localID                         string
+	localAddress                    string
+	dataDir                         string
+	fsmSnapDir                      string
+	tickInterval                    time.Duration
+	electionTick                    int
 	// joinAsLearner is captured from OpenConfig; consulted by
 	// alarmIfJoinedAsVoter on every post-apply ConfState. See §4.5 of
 	// the learner design doc.
@@ -598,6 +603,7 @@ type proposalRequest struct {
 	id            uint64
 	payload       []byte
 	payloadDigest [32]byte
+	ttlInlineCut  *ttlInlineProposalCut
 	done          chan proposalResult
 }
 
@@ -1221,6 +1227,10 @@ func (e *Engine) ProposeAdmin(ctx context.Context, data []byte) (*raftengine.Pro
 }
 
 func (e *Engine) propose(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
+	return e.proposeWithTTLInlineCut(ctx, data, nil)
+}
+
+func (e *Engine) proposeWithTTLInlineCut(ctx context.Context, data []byte, cut *ttlInlineProposalCut) (*raftengine.ProposalResult, error) {
 	if err := contextErr(ctx); err != nil {
 		return nil, err
 	}
@@ -1237,6 +1247,7 @@ func (e *Engine) propose(ctx context.Context, data []byte) (*raftengine.Proposal
 	if err != nil {
 		return nil, err
 	}
+	req.ttlInlineCut = cut
 
 	select {
 	case <-ctx.Done():
@@ -2209,6 +2220,10 @@ func (e *Engine) handleProposal(req proposalRequest) {
 		req.done <- proposalResult{err: err}
 		return
 	}
+	if err := e.authorizeTTLInlineMarkerProposal(req); err != nil {
+		req.done <- proposalResult{err: err}
+		return
+	}
 	if e.State() != raftengine.StateLeader {
 		req.done <- proposalResult{err: errors.WithStack(errNotLeader)}
 		return
@@ -2368,6 +2383,10 @@ func (e *Engine) proposeMembershipChange(req adminRequest, changeType raftpb.Con
 	}
 	if e.hasPendingConfChange() {
 		req.done <- adminResult{err: errors.WithStack(errMembershipConfChangePending)}
+		return
+	}
+	if err := e.ttlInlineMembershipAdmission(req, changeType, peer.NodeID); err != nil {
+		req.done <- adminResult{err: err}
 		return
 	}
 	contextBytes, err := encodeConfChangeContext(req.id, peer)
@@ -3375,6 +3394,7 @@ func (e *Engine) publishConfigChange(changeType raftpb.ConfChangeType, nodeID ui
 	e.applyConfigPeerChange(changeType, nodeID, context)
 	e.refreshConfigServers(confState)
 	e.setConfigIndex(index)
+	e.invalidateTTLInlineRecoveryProof()
 }
 
 func (e *Engine) applyConfigChangeV2(cc raftpb.ConfChangeV2, index uint64, confState raftpb.ConfState) {
@@ -3390,6 +3410,13 @@ func (e *Engine) publishConfigChangeV2(cc raftpb.ConfChangeV2, index uint64, con
 	}
 	e.refreshConfigServers(confState)
 	e.setConfigIndex(index)
+	e.invalidateTTLInlineRecoveryProof()
+}
+
+func (e *Engine) invalidateTTLInlineRecoveryProof() {
+	if aware, ok := e.fsm.(interface{ InvalidateTTLInlineRecoveryProof() }); ok {
+		aware.InvalidateTTLInlineRecoveryProof()
+	}
 }
 
 // alarmIfJoinedAsVoter implements the operator-alarm semantics from
@@ -4131,6 +4158,7 @@ func (e *Engine) refreshStatus() {
 	lastLogIndex, _ := e.storage.LastIndex()
 	lastSnapshotIndex, _ := e.storedSnapshotIndex()
 	config := e.currentConfiguration()
+	nativeConfiguration := e.captureApplyNativeConfiguration()
 
 	state := translateState(basic.RaftState)
 	leader := e.leaderInfo(basic.Lead)
@@ -4159,6 +4187,7 @@ func (e *Engine) refreshStatus() {
 		status.PerPeer = nil
 	}
 	e.status = status
+	e.nativeConfigurationView = nativeConfiguration
 	e.statusObservedMonoNs.Store(monoclock.Now().Nanos())
 	// Use the voter count, NOT len(e.peers), so a 1-voter + N-learner
 	// cluster correctly hits the leader-of-1 fast path: a learner does
@@ -4210,6 +4239,33 @@ func (e *Engine) refreshStatus() {
 		// successor leader is already accepting writes.
 		e.fireLeaderLossCallbacks()
 	}
+}
+
+// NativeConfigurationSnapshot returns a copied, same-publication native image
+// and term. A pending or unpublished configuration change has no usable proof.
+func (e *Engine) NativeConfigurationSnapshot() (raftengine.NativeConfiguration, uint64, bool) {
+	if e == nil {
+		return raftengine.NativeConfiguration{}, 0, false
+	}
+	e.mu.RLock()
+	view := e.nativeConfigurationView
+	status := e.status
+	closed := e.closed
+	if view == nil || closed || status.State == raftengine.StateShutdown || view.Index != status.ConfigurationIndex {
+		e.mu.RUnlock()
+		return raftengine.NativeConfiguration{}, 0, false
+	}
+	copy := *view
+	copy.Voters = slices.Clone(view.Voters)
+	copy.VotersOutgoing = slices.Clone(view.VotersOutgoing)
+	copy.Learners = slices.Clone(view.Learners)
+	copy.LearnersNext = slices.Clone(view.LearnersNext)
+	copy.Members = slices.Clone(view.Members)
+	e.mu.RUnlock()
+	if e.currentConfigIndex() != copy.Index {
+		return raftengine.NativeConfiguration{}, 0, false
+	}
+	return copy, status.Term, true
 }
 
 func (e *Engine) markStarted() {

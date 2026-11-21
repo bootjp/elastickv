@@ -128,6 +128,58 @@ func (SampleRole) EnumDescriptor() ([]byte, []int) {
 	return file_admin_proto_rawDescGZIP(), []int{1}
 }
 
+type RedisLegacyMetadataAuditStatus int32
+
+const (
+	RedisLegacyMetadataAuditStatus_REDIS_LEGACY_METADATA_AUDIT_STATUS_UNSPECIFIED RedisLegacyMetadataAuditStatus = 0
+	RedisLegacyMetadataAuditStatus_REDIS_LEGACY_METADATA_AUDIT_COMPLETE           RedisLegacyMetadataAuditStatus = 1
+	RedisLegacyMetadataAuditStatus_REDIS_LEGACY_METADATA_AUDIT_INCOMPLETE         RedisLegacyMetadataAuditStatus = 2
+	RedisLegacyMetadataAuditStatus_REDIS_LEGACY_METADATA_AUDIT_RESTARTED          RedisLegacyMetadataAuditStatus = 3
+)
+
+// Enum value maps for RedisLegacyMetadataAuditStatus.
+var (
+	RedisLegacyMetadataAuditStatus_name = map[int32]string{
+		0: "REDIS_LEGACY_METADATA_AUDIT_STATUS_UNSPECIFIED",
+		1: "REDIS_LEGACY_METADATA_AUDIT_COMPLETE",
+		2: "REDIS_LEGACY_METADATA_AUDIT_INCOMPLETE",
+		3: "REDIS_LEGACY_METADATA_AUDIT_RESTARTED",
+	}
+	RedisLegacyMetadataAuditStatus_value = map[string]int32{
+		"REDIS_LEGACY_METADATA_AUDIT_STATUS_UNSPECIFIED": 0,
+		"REDIS_LEGACY_METADATA_AUDIT_COMPLETE":           1,
+		"REDIS_LEGACY_METADATA_AUDIT_INCOMPLETE":         2,
+		"REDIS_LEGACY_METADATA_AUDIT_RESTARTED":          3,
+	}
+)
+
+func (x RedisLegacyMetadataAuditStatus) Enum() *RedisLegacyMetadataAuditStatus {
+	p := new(RedisLegacyMetadataAuditStatus)
+	*p = x
+	return p
+}
+
+func (x RedisLegacyMetadataAuditStatus) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (RedisLegacyMetadataAuditStatus) Descriptor() protoreflect.EnumDescriptor {
+	return file_admin_proto_enumTypes[2].Descriptor()
+}
+
+func (RedisLegacyMetadataAuditStatus) Type() protoreflect.EnumType {
+	return &file_admin_proto_enumTypes[2]
+}
+
+func (x RedisLegacyMetadataAuditStatus) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use RedisLegacyMetadataAuditStatus.Descriptor instead.
+func (RedisLegacyMetadataAuditStatus) EnumDescriptor() ([]byte, []int) {
+	return file_admin_proto_rawDescGZIP(), []int{2}
+}
+
 type SetAutoSplitEnabledRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Enabled       bool                   `protobuf:"varint,1,opt,name=enabled,proto3" json:"enabled,omitempty"`
@@ -618,6 +670,290 @@ func (x *GetRaftGroupsResponse) GetGroups() []*RaftGroupState {
 	return nil
 }
 
+// Diagnostic M1 snapshots only. A successful response requires one completed,
+// current pass for each hash, set, zset and stream plan of the requested group.
+// It is not an M4/Phase-3 gate verdict. Missing or stale passes return an RPC
+// error, never an empty response that can be mistaken for zero backlog.
+type GetRedisLegacyMetadataPassesRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	GroupId       uint64                 `protobuf:"varint,1,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetRedisLegacyMetadataPassesRequest) Reset() {
+	*x = GetRedisLegacyMetadataPassesRequest{}
+	mi := &file_admin_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetRedisLegacyMetadataPassesRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetRedisLegacyMetadataPassesRequest) ProtoMessage() {}
+
+func (x *GetRedisLegacyMetadataPassesRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_admin_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetRedisLegacyMetadataPassesRequest.ProtoReflect.Descriptor instead.
+func (*GetRedisLegacyMetadataPassesRequest) Descriptor() ([]byte, []int) {
+	return file_admin_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *GetRedisLegacyMetadataPassesRequest) GetGroupId() uint64 {
+	if x != nil {
+		return x.GroupId
+	}
+	return 0
+}
+
+type RedisLegacyMetadataReasonCounts struct {
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	OwnerGroupId      uint64                 `protobuf:"varint,1,opt,name=owner_group_id,json=ownerGroupId,proto3" json:"owner_group_id,omitempty"`
+	Served            uint64                 `protobuf:"varint,2,opt,name=served,proto3" json:"served,omitempty"`
+	OwnerHasVersion   uint64                 `protobuf:"varint,3,opt,name=owner_has_version,json=ownerHasVersion,proto3" json:"owner_has_version,omitempty"`
+	OwnerLedElsewhere uint64                 `protobuf:"varint,4,opt,name=owner_led_elsewhere,json=ownerLedElsewhere,proto3" json:"owner_led_elsewhere,omitempty"`
+	StagedVisibility  uint64                 `protobuf:"varint,5,opt,name=staged_visibility,json=stagedVisibility,proto3" json:"staged_visibility,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
+}
+
+func (x *RedisLegacyMetadataReasonCounts) Reset() {
+	*x = RedisLegacyMetadataReasonCounts{}
+	mi := &file_admin_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RedisLegacyMetadataReasonCounts) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RedisLegacyMetadataReasonCounts) ProtoMessage() {}
+
+func (x *RedisLegacyMetadataReasonCounts) ProtoReflect() protoreflect.Message {
+	mi := &file_admin_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RedisLegacyMetadataReasonCounts.ProtoReflect.Descriptor instead.
+func (*RedisLegacyMetadataReasonCounts) Descriptor() ([]byte, []int) {
+	return file_admin_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *RedisLegacyMetadataReasonCounts) GetOwnerGroupId() uint64 {
+	if x != nil {
+		return x.OwnerGroupId
+	}
+	return 0
+}
+
+func (x *RedisLegacyMetadataReasonCounts) GetServed() uint64 {
+	if x != nil {
+		return x.Served
+	}
+	return 0
+}
+
+func (x *RedisLegacyMetadataReasonCounts) GetOwnerHasVersion() uint64 {
+	if x != nil {
+		return x.OwnerHasVersion
+	}
+	return 0
+}
+
+func (x *RedisLegacyMetadataReasonCounts) GetOwnerLedElsewhere() uint64 {
+	if x != nil {
+		return x.OwnerLedElsewhere
+	}
+	return 0
+}
+
+func (x *RedisLegacyMetadataReasonCounts) GetStagedVisibility() uint64 {
+	if x != nil {
+		return x.StagedVisibility
+	}
+	return 0
+}
+
+type RedisLegacyMetadataPass struct {
+	state                    protoimpl.MessageState             `protogen:"open.v1"`
+	GroupId                  uint64                             `protobuf:"varint,1,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`
+	Plan                     string                             `protobuf:"bytes,2,opt,name=plan,proto3" json:"plan,omitempty"`
+	CatalogVersion           uint64                             `protobuf:"varint,3,opt,name=catalog_version,json=catalogVersion,proto3" json:"catalog_version,omitempty"`
+	LeaderTerm               uint64                             `protobuf:"varint,4,opt,name=leader_term,json=leaderTerm,proto3" json:"leader_term,omitempty"`
+	StartedAtUnixNanos       int64                              `protobuf:"varint,5,opt,name=started_at_unix_nanos,json=startedAtUnixNanos,proto3" json:"started_at_unix_nanos,omitempty"`
+	CompletionEpochUnixNanos int64                              `protobuf:"varint,6,opt,name=completion_epoch_unix_nanos,json=completionEpochUnixNanos,proto3" json:"completion_epoch_unix_nanos,omitempty"`
+	Counts                   []*RedisLegacyMetadataReasonCounts `protobuf:"bytes,7,rep,name=counts,proto3" json:"counts,omitempty"`
+	unknownFields            protoimpl.UnknownFields
+	sizeCache                protoimpl.SizeCache
+}
+
+func (x *RedisLegacyMetadataPass) Reset() {
+	*x = RedisLegacyMetadataPass{}
+	mi := &file_admin_proto_msgTypes[11]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RedisLegacyMetadataPass) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RedisLegacyMetadataPass) ProtoMessage() {}
+
+func (x *RedisLegacyMetadataPass) ProtoReflect() protoreflect.Message {
+	mi := &file_admin_proto_msgTypes[11]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RedisLegacyMetadataPass.ProtoReflect.Descriptor instead.
+func (*RedisLegacyMetadataPass) Descriptor() ([]byte, []int) {
+	return file_admin_proto_rawDescGZIP(), []int{11}
+}
+
+func (x *RedisLegacyMetadataPass) GetGroupId() uint64 {
+	if x != nil {
+		return x.GroupId
+	}
+	return 0
+}
+
+func (x *RedisLegacyMetadataPass) GetPlan() string {
+	if x != nil {
+		return x.Plan
+	}
+	return ""
+}
+
+func (x *RedisLegacyMetadataPass) GetCatalogVersion() uint64 {
+	if x != nil {
+		return x.CatalogVersion
+	}
+	return 0
+}
+
+func (x *RedisLegacyMetadataPass) GetLeaderTerm() uint64 {
+	if x != nil {
+		return x.LeaderTerm
+	}
+	return 0
+}
+
+func (x *RedisLegacyMetadataPass) GetStartedAtUnixNanos() int64 {
+	if x != nil {
+		return x.StartedAtUnixNanos
+	}
+	return 0
+}
+
+func (x *RedisLegacyMetadataPass) GetCompletionEpochUnixNanos() int64 {
+	if x != nil {
+		return x.CompletionEpochUnixNanos
+	}
+	return 0
+}
+
+func (x *RedisLegacyMetadataPass) GetCounts() []*RedisLegacyMetadataReasonCounts {
+	if x != nil {
+		return x.Counts
+	}
+	return nil
+}
+
+type GetRedisLegacyMetadataPassesResponse struct {
+	state          protoimpl.MessageState     `protogen:"open.v1"`
+	GroupId        uint64                     `protobuf:"varint,1,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`
+	CatalogVersion uint64                     `protobuf:"varint,2,opt,name=catalog_version,json=catalogVersion,proto3" json:"catalog_version,omitempty"`
+	LeaderTerm     uint64                     `protobuf:"varint,3,opt,name=leader_term,json=leaderTerm,proto3" json:"leader_term,omitempty"`
+	Passes         []*RedisLegacyMetadataPass `protobuf:"bytes,4,rep,name=passes,proto3" json:"passes,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *GetRedisLegacyMetadataPassesResponse) Reset() {
+	*x = GetRedisLegacyMetadataPassesResponse{}
+	mi := &file_admin_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetRedisLegacyMetadataPassesResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetRedisLegacyMetadataPassesResponse) ProtoMessage() {}
+
+func (x *GetRedisLegacyMetadataPassesResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_admin_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetRedisLegacyMetadataPassesResponse.ProtoReflect.Descriptor instead.
+func (*GetRedisLegacyMetadataPassesResponse) Descriptor() ([]byte, []int) {
+	return file_admin_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *GetRedisLegacyMetadataPassesResponse) GetGroupId() uint64 {
+	if x != nil {
+		return x.GroupId
+	}
+	return 0
+}
+
+func (x *GetRedisLegacyMetadataPassesResponse) GetCatalogVersion() uint64 {
+	if x != nil {
+		return x.CatalogVersion
+	}
+	return 0
+}
+
+func (x *GetRedisLegacyMetadataPassesResponse) GetLeaderTerm() uint64 {
+	if x != nil {
+		return x.LeaderTerm
+	}
+	return 0
+}
+
+func (x *GetRedisLegacyMetadataPassesResponse) GetPasses() []*RedisLegacyMetadataPass {
+	if x != nil {
+		return x.Passes
+	}
+	return nil
+}
+
 type AdapterSummary struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Adapter       string                 `protobuf:"bytes,1,opt,name=adapter,proto3" json:"adapter,omitempty"`
@@ -635,7 +971,7 @@ type AdapterSummary struct {
 
 func (x *AdapterSummary) Reset() {
 	*x = AdapterSummary{}
-	mi := &file_admin_proto_msgTypes[9]
+	mi := &file_admin_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -647,7 +983,7 @@ func (x *AdapterSummary) String() string {
 func (*AdapterSummary) ProtoMessage() {}
 
 func (x *AdapterSummary) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[9]
+	mi := &file_admin_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -660,7 +996,7 @@ func (x *AdapterSummary) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AdapterSummary.ProtoReflect.Descriptor instead.
 func (*AdapterSummary) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{9}
+	return file_admin_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *AdapterSummary) GetAdapter() string {
@@ -734,7 +1070,7 @@ type GetAdapterSummaryRequest struct {
 
 func (x *GetAdapterSummaryRequest) Reset() {
 	*x = GetAdapterSummaryRequest{}
-	mi := &file_admin_proto_msgTypes[10]
+	mi := &file_admin_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -746,7 +1082,7 @@ func (x *GetAdapterSummaryRequest) String() string {
 func (*GetAdapterSummaryRequest) ProtoMessage() {}
 
 func (x *GetAdapterSummaryRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[10]
+	mi := &file_admin_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -759,7 +1095,7 @@ func (x *GetAdapterSummaryRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetAdapterSummaryRequest.ProtoReflect.Descriptor instead.
 func (*GetAdapterSummaryRequest) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{10}
+	return file_admin_proto_rawDescGZIP(), []int{14}
 }
 
 type GetAdapterSummaryResponse struct {
@@ -771,7 +1107,7 @@ type GetAdapterSummaryResponse struct {
 
 func (x *GetAdapterSummaryResponse) Reset() {
 	*x = GetAdapterSummaryResponse{}
-	mi := &file_admin_proto_msgTypes[11]
+	mi := &file_admin_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -783,7 +1119,7 @@ func (x *GetAdapterSummaryResponse) String() string {
 func (*GetAdapterSummaryResponse) ProtoMessage() {}
 
 func (x *GetAdapterSummaryResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[11]
+	mi := &file_admin_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -796,7 +1132,7 @@ func (x *GetAdapterSummaryResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetAdapterSummaryResponse.ProtoReflect.Descriptor instead.
 func (*GetAdapterSummaryResponse) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{11}
+	return file_admin_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *GetAdapterSummaryResponse) GetSummaries() []*AdapterSummary {
@@ -853,7 +1189,7 @@ type KeyVizRow struct {
 
 func (x *KeyVizRow) Reset() {
 	*x = KeyVizRow{}
-	mi := &file_admin_proto_msgTypes[12]
+	mi := &file_admin_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -865,7 +1201,7 @@ func (x *KeyVizRow) String() string {
 func (*KeyVizRow) ProtoMessage() {}
 
 func (x *KeyVizRow) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[12]
+	mi := &file_admin_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -878,7 +1214,7 @@ func (x *KeyVizRow) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use KeyVizRow.ProtoReflect.Descriptor instead.
 func (*KeyVizRow) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{12}
+	return file_admin_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *KeyVizRow) GetBucketId() string {
@@ -991,7 +1327,7 @@ type GetKeyVizMatrixRequest struct {
 
 func (x *GetKeyVizMatrixRequest) Reset() {
 	*x = GetKeyVizMatrixRequest{}
-	mi := &file_admin_proto_msgTypes[13]
+	mi := &file_admin_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1003,7 +1339,7 @@ func (x *GetKeyVizMatrixRequest) String() string {
 func (*GetKeyVizMatrixRequest) ProtoMessage() {}
 
 func (x *GetKeyVizMatrixRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[13]
+	mi := &file_admin_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1016,7 +1352,7 @@ func (x *GetKeyVizMatrixRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetKeyVizMatrixRequest.ProtoReflect.Descriptor instead.
 func (*GetKeyVizMatrixRequest) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{13}
+	return file_admin_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *GetKeyVizMatrixRequest) GetSeries() KeyVizSeries {
@@ -1057,7 +1393,7 @@ type GetKeyVizMatrixResponse struct {
 
 func (x *GetKeyVizMatrixResponse) Reset() {
 	*x = GetKeyVizMatrixResponse{}
-	mi := &file_admin_proto_msgTypes[14]
+	mi := &file_admin_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1069,7 +1405,7 @@ func (x *GetKeyVizMatrixResponse) String() string {
 func (*GetKeyVizMatrixResponse) ProtoMessage() {}
 
 func (x *GetKeyVizMatrixResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[14]
+	mi := &file_admin_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1082,7 +1418,7 @@ func (x *GetKeyVizMatrixResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetKeyVizMatrixResponse.ProtoReflect.Descriptor instead.
 func (*GetKeyVizMatrixResponse) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{14}
+	return file_admin_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *GetKeyVizMatrixResponse) GetColumnUnixMs() []int64 {
@@ -1112,7 +1448,7 @@ type GetRouteDetailRequest struct {
 
 func (x *GetRouteDetailRequest) Reset() {
 	*x = GetRouteDetailRequest{}
-	mi := &file_admin_proto_msgTypes[15]
+	mi := &file_admin_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1124,7 +1460,7 @@ func (x *GetRouteDetailRequest) String() string {
 func (*GetRouteDetailRequest) ProtoMessage() {}
 
 func (x *GetRouteDetailRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[15]
+	mi := &file_admin_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1137,7 +1473,7 @@ func (x *GetRouteDetailRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetRouteDetailRequest.ProtoReflect.Descriptor instead.
 func (*GetRouteDetailRequest) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{15}
+	return file_admin_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *GetRouteDetailRequest) GetBucketId() string {
@@ -1171,7 +1507,7 @@ type GetRouteDetailResponse struct {
 
 func (x *GetRouteDetailResponse) Reset() {
 	*x = GetRouteDetailResponse{}
-	mi := &file_admin_proto_msgTypes[16]
+	mi := &file_admin_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1183,7 +1519,7 @@ func (x *GetRouteDetailResponse) String() string {
 func (*GetRouteDetailResponse) ProtoMessage() {}
 
 func (x *GetRouteDetailResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[16]
+	mi := &file_admin_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1196,7 +1532,7 @@ func (x *GetRouteDetailResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetRouteDetailResponse.ProtoReflect.Descriptor instead.
 func (*GetRouteDetailResponse) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{16}
+	return file_admin_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *GetRouteDetailResponse) GetRow() *KeyVizRow {
@@ -1223,7 +1559,7 @@ type BackupShardApplied struct {
 
 func (x *BackupShardApplied) Reset() {
 	*x = BackupShardApplied{}
-	mi := &file_admin_proto_msgTypes[17]
+	mi := &file_admin_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1235,7 +1571,7 @@ func (x *BackupShardApplied) String() string {
 func (*BackupShardApplied) ProtoMessage() {}
 
 func (x *BackupShardApplied) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[17]
+	mi := &file_admin_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1248,7 +1584,7 @@ func (x *BackupShardApplied) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BackupShardApplied.ProtoReflect.Descriptor instead.
 func (*BackupShardApplied) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{17}
+	return file_admin_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *BackupShardApplied) GetRaftGroupId() uint64 {
@@ -1277,7 +1613,7 @@ type BackupExpectedKeys struct {
 
 func (x *BackupExpectedKeys) Reset() {
 	*x = BackupExpectedKeys{}
-	mi := &file_admin_proto_msgTypes[18]
+	mi := &file_admin_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1289,7 +1625,7 @@ func (x *BackupExpectedKeys) String() string {
 func (*BackupExpectedKeys) ProtoMessage() {}
 
 func (x *BackupExpectedKeys) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[18]
+	mi := &file_admin_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1302,7 +1638,7 @@ func (x *BackupExpectedKeys) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BackupExpectedKeys.ProtoReflect.Descriptor instead.
 func (*BackupExpectedKeys) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{18}
+	return file_admin_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *BackupExpectedKeys) GetAdapter() string {
@@ -1349,7 +1685,7 @@ type BeginBackupRequest struct {
 
 func (x *BeginBackupRequest) Reset() {
 	*x = BeginBackupRequest{}
-	mi := &file_admin_proto_msgTypes[19]
+	mi := &file_admin_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1361,7 +1697,7 @@ func (x *BeginBackupRequest) String() string {
 func (*BeginBackupRequest) ProtoMessage() {}
 
 func (x *BeginBackupRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[19]
+	mi := &file_admin_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1374,7 +1710,7 @@ func (x *BeginBackupRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BeginBackupRequest.ProtoReflect.Descriptor instead.
 func (*BeginBackupRequest) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{19}
+	return file_admin_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *BeginBackupRequest) GetTtlMs() uint64 {
@@ -1417,7 +1753,7 @@ type BeginBackupResponse struct {
 
 func (x *BeginBackupResponse) Reset() {
 	*x = BeginBackupResponse{}
-	mi := &file_admin_proto_msgTypes[20]
+	mi := &file_admin_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1429,7 +1765,7 @@ func (x *BeginBackupResponse) String() string {
 func (*BeginBackupResponse) ProtoMessage() {}
 
 func (x *BeginBackupResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[20]
+	mi := &file_admin_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1442,7 +1778,7 @@ func (x *BeginBackupResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BeginBackupResponse.ProtoReflect.Descriptor instead.
 func (*BeginBackupResponse) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{20}
+	return file_admin_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *BeginBackupResponse) GetReadTs() uint64 {
@@ -1504,7 +1840,7 @@ type RenewBackupRequest struct {
 
 func (x *RenewBackupRequest) Reset() {
 	*x = RenewBackupRequest{}
-	mi := &file_admin_proto_msgTypes[21]
+	mi := &file_admin_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1516,7 +1852,7 @@ func (x *RenewBackupRequest) String() string {
 func (*RenewBackupRequest) ProtoMessage() {}
 
 func (x *RenewBackupRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[21]
+	mi := &file_admin_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1529,7 +1865,7 @@ func (x *RenewBackupRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RenewBackupRequest.ProtoReflect.Descriptor instead.
 func (*RenewBackupRequest) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{21}
+	return file_admin_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *RenewBackupRequest) GetPinToken() []byte {
@@ -1557,7 +1893,7 @@ type RenewBackupResponse struct {
 
 func (x *RenewBackupResponse) Reset() {
 	*x = RenewBackupResponse{}
-	mi := &file_admin_proto_msgTypes[22]
+	mi := &file_admin_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1569,7 +1905,7 @@ func (x *RenewBackupResponse) String() string {
 func (*RenewBackupResponse) ProtoMessage() {}
 
 func (x *RenewBackupResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[22]
+	mi := &file_admin_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1582,7 +1918,7 @@ func (x *RenewBackupResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RenewBackupResponse.ProtoReflect.Descriptor instead.
 func (*RenewBackupResponse) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{22}
+	return file_admin_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *RenewBackupResponse) GetTtlMsEffective() uint64 {
@@ -1608,7 +1944,7 @@ type EndBackupRequest struct {
 
 func (x *EndBackupRequest) Reset() {
 	*x = EndBackupRequest{}
-	mi := &file_admin_proto_msgTypes[23]
+	mi := &file_admin_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1620,7 +1956,7 @@ func (x *EndBackupRequest) String() string {
 func (*EndBackupRequest) ProtoMessage() {}
 
 func (x *EndBackupRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[23]
+	mi := &file_admin_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1633,7 +1969,7 @@ func (x *EndBackupRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EndBackupRequest.ProtoReflect.Descriptor instead.
 func (*EndBackupRequest) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{23}
+	return file_admin_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *EndBackupRequest) GetPinToken() []byte {
@@ -1651,7 +1987,7 @@ type EndBackupResponse struct {
 
 func (x *EndBackupResponse) Reset() {
 	*x = EndBackupResponse{}
-	mi := &file_admin_proto_msgTypes[24]
+	mi := &file_admin_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1663,7 +1999,7 @@ func (x *EndBackupResponse) String() string {
 func (*EndBackupResponse) ProtoMessage() {}
 
 func (x *EndBackupResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[24]
+	mi := &file_admin_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1676,7 +2012,7 @@ func (x *EndBackupResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EndBackupResponse.ProtoReflect.Descriptor instead.
 func (*EndBackupResponse) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{24}
+	return file_admin_proto_rawDescGZIP(), []int{28}
 }
 
 type ListAdaptersAndScopesRequest struct {
@@ -1688,7 +2024,7 @@ type ListAdaptersAndScopesRequest struct {
 
 func (x *ListAdaptersAndScopesRequest) Reset() {
 	*x = ListAdaptersAndScopesRequest{}
-	mi := &file_admin_proto_msgTypes[25]
+	mi := &file_admin_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1700,7 +2036,7 @@ func (x *ListAdaptersAndScopesRequest) String() string {
 func (*ListAdaptersAndScopesRequest) ProtoMessage() {}
 
 func (x *ListAdaptersAndScopesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[25]
+	mi := &file_admin_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1713,7 +2049,7 @@ func (x *ListAdaptersAndScopesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListAdaptersAndScopesRequest.ProtoReflect.Descriptor instead.
 func (*ListAdaptersAndScopesRequest) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{25}
+	return file_admin_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *ListAdaptersAndScopesRequest) GetPinToken() []byte {
@@ -1733,7 +2069,7 @@ type BackupScope struct {
 
 func (x *BackupScope) Reset() {
 	*x = BackupScope{}
-	mi := &file_admin_proto_msgTypes[26]
+	mi := &file_admin_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1745,7 +2081,7 @@ func (x *BackupScope) String() string {
 func (*BackupScope) ProtoMessage() {}
 
 func (x *BackupScope) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[26]
+	mi := &file_admin_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1758,7 +2094,7 @@ func (x *BackupScope) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BackupScope.ProtoReflect.Descriptor instead.
 func (*BackupScope) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{26}
+	return file_admin_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *BackupScope) GetAdapter() string {
@@ -1784,7 +2120,7 @@ type ListAdaptersAndScopesResponse struct {
 
 func (x *ListAdaptersAndScopesResponse) Reset() {
 	*x = ListAdaptersAndScopesResponse{}
-	mi := &file_admin_proto_msgTypes[27]
+	mi := &file_admin_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1796,7 +2132,7 @@ func (x *ListAdaptersAndScopesResponse) String() string {
 func (*ListAdaptersAndScopesResponse) ProtoMessage() {}
 
 func (x *ListAdaptersAndScopesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[27]
+	mi := &file_admin_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1809,7 +2145,7 @@ func (x *ListAdaptersAndScopesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListAdaptersAndScopesResponse.ProtoReflect.Descriptor instead.
 func (*ListAdaptersAndScopesResponse) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{27}
+	return file_admin_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *ListAdaptersAndScopesResponse) GetScopes() []*BackupScope {
@@ -1831,7 +2167,7 @@ type StreamBackupRequest struct {
 
 func (x *StreamBackupRequest) Reset() {
 	*x = StreamBackupRequest{}
-	mi := &file_admin_proto_msgTypes[28]
+	mi := &file_admin_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1843,7 +2179,7 @@ func (x *StreamBackupRequest) String() string {
 func (*StreamBackupRequest) ProtoMessage() {}
 
 func (x *StreamBackupRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[28]
+	mi := &file_admin_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1856,7 +2192,7 @@ func (x *StreamBackupRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StreamBackupRequest.ProtoReflect.Descriptor instead.
 func (*StreamBackupRequest) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{28}
+	return file_admin_proto_rawDescGZIP(), []int{32}
 }
 
 func (x *StreamBackupRequest) GetPinToken() []byte {
@@ -1883,7 +2219,7 @@ type BackupKV struct {
 
 func (x *BackupKV) Reset() {
 	*x = BackupKV{}
-	mi := &file_admin_proto_msgTypes[29]
+	mi := &file_admin_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1895,7 +2231,7 @@ func (x *BackupKV) String() string {
 func (*BackupKV) ProtoMessage() {}
 
 func (x *BackupKV) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[29]
+	mi := &file_admin_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1908,7 +2244,7 @@ func (x *BackupKV) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BackupKV.ProtoReflect.Descriptor instead.
 func (*BackupKV) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{29}
+	return file_admin_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *BackupKV) GetKey() []byte {
@@ -1933,7 +2269,7 @@ type GetNodeVersionRequest struct {
 
 func (x *GetNodeVersionRequest) Reset() {
 	*x = GetNodeVersionRequest{}
-	mi := &file_admin_proto_msgTypes[30]
+	mi := &file_admin_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1945,7 +2281,7 @@ func (x *GetNodeVersionRequest) String() string {
 func (*GetNodeVersionRequest) ProtoMessage() {}
 
 func (x *GetNodeVersionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[30]
+	mi := &file_admin_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1958,7 +2294,7 @@ func (x *GetNodeVersionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetNodeVersionRequest.ProtoReflect.Descriptor instead.
 func (*GetNodeVersionRequest) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{30}
+	return file_admin_proto_rawDescGZIP(), []int{34}
 }
 
 type GetNodeVersionResponse struct {
@@ -1974,7 +2310,7 @@ type GetNodeVersionResponse struct {
 
 func (x *GetNodeVersionResponse) Reset() {
 	*x = GetNodeVersionResponse{}
-	mi := &file_admin_proto_msgTypes[31]
+	mi := &file_admin_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1986,7 +2322,7 @@ func (x *GetNodeVersionResponse) String() string {
 func (*GetNodeVersionResponse) ProtoMessage() {}
 
 func (x *GetNodeVersionResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[31]
+	mi := &file_admin_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1999,7 +2335,7 @@ func (x *GetNodeVersionResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetNodeVersionResponse.ProtoReflect.Descriptor instead.
 func (*GetNodeVersionResponse) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{31}
+	return file_admin_proto_rawDescGZIP(), []int{35}
 }
 
 func (x *GetNodeVersionResponse) GetNodeVersion() string {
@@ -2024,7 +2360,7 @@ type StreamEventsRequest struct {
 
 func (x *StreamEventsRequest) Reset() {
 	*x = StreamEventsRequest{}
-	mi := &file_admin_proto_msgTypes[32]
+	mi := &file_admin_proto_msgTypes[36]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2036,7 +2372,7 @@ func (x *StreamEventsRequest) String() string {
 func (*StreamEventsRequest) ProtoMessage() {}
 
 func (x *StreamEventsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[32]
+	mi := &file_admin_proto_msgTypes[36]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2049,7 +2385,7 @@ func (x *StreamEventsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StreamEventsRequest.ProtoReflect.Descriptor instead.
 func (*StreamEventsRequest) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{32}
+	return file_admin_proto_rawDescGZIP(), []int{36}
 }
 
 type StreamEventsEvent struct {
@@ -2065,7 +2401,7 @@ type StreamEventsEvent struct {
 
 func (x *StreamEventsEvent) Reset() {
 	*x = StreamEventsEvent{}
-	mi := &file_admin_proto_msgTypes[33]
+	mi := &file_admin_proto_msgTypes[37]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2077,7 +2413,7 @@ func (x *StreamEventsEvent) String() string {
 func (*StreamEventsEvent) ProtoMessage() {}
 
 func (x *StreamEventsEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[33]
+	mi := &file_admin_proto_msgTypes[37]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2090,7 +2426,7 @@ func (x *StreamEventsEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StreamEventsEvent.ProtoReflect.Descriptor instead.
 func (*StreamEventsEvent) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{33}
+	return file_admin_proto_rawDescGZIP(), []int{37}
 }
 
 func (x *StreamEventsEvent) GetEvent() isStreamEventsEvent_Event {
@@ -2146,7 +2482,7 @@ type RouteTransition struct {
 
 func (x *RouteTransition) Reset() {
 	*x = RouteTransition{}
-	mi := &file_admin_proto_msgTypes[34]
+	mi := &file_admin_proto_msgTypes[38]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2158,7 +2494,7 @@ func (x *RouteTransition) String() string {
 func (*RouteTransition) ProtoMessage() {}
 
 func (x *RouteTransition) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[34]
+	mi := &file_admin_proto_msgTypes[38]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2171,7 +2507,7 @@ func (x *RouteTransition) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RouteTransition.ProtoReflect.Descriptor instead.
 func (*RouteTransition) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{34}
+	return file_admin_proto_rawDescGZIP(), []int{38}
 }
 
 func (x *RouteTransition) GetParentRouteId() uint64 {
@@ -2213,7 +2549,7 @@ type KeyVizColumn struct {
 
 func (x *KeyVizColumn) Reset() {
 	*x = KeyVizColumn{}
-	mi := &file_admin_proto_msgTypes[35]
+	mi := &file_admin_proto_msgTypes[39]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2225,7 +2561,7 @@ func (x *KeyVizColumn) String() string {
 func (*KeyVizColumn) ProtoMessage() {}
 
 func (x *KeyVizColumn) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[35]
+	mi := &file_admin_proto_msgTypes[39]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2238,7 +2574,7 @@ func (x *KeyVizColumn) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use KeyVizColumn.ProtoReflect.Descriptor instead.
 func (*KeyVizColumn) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{35}
+	return file_admin_proto_rawDescGZIP(), []int{39}
 }
 
 func (x *KeyVizColumn) GetColumnUnixMs() int64 {
@@ -2258,6 +2594,154 @@ func (x *KeyVizColumn) GetSeries() KeyVizSeries {
 func (x *KeyVizColumn) GetRows() []*KeyVizRow {
 	if x != nil {
 		return x.Rows
+	}
+	return nil
+}
+
+// A one-shot, read-only diagnostic. Counts are present only on COMPLETE.
+// INCOMPLETE and RESTARTED are never zero-backlog evidence or M4 gate input.
+type AuditRedisLegacyMetadataRequest struct {
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	GroupId uint64                 `protobuf:"varint,1,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`
+	// Maximum physical pages across all four plans. Zero uses the server default.
+	MaxPages      uint32 `protobuf:"varint,2,opt,name=max_pages,json=maxPages,proto3" json:"max_pages,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *AuditRedisLegacyMetadataRequest) Reset() {
+	*x = AuditRedisLegacyMetadataRequest{}
+	mi := &file_admin_proto_msgTypes[40]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AuditRedisLegacyMetadataRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AuditRedisLegacyMetadataRequest) ProtoMessage() {}
+
+func (x *AuditRedisLegacyMetadataRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_admin_proto_msgTypes[40]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AuditRedisLegacyMetadataRequest.ProtoReflect.Descriptor instead.
+func (*AuditRedisLegacyMetadataRequest) Descriptor() ([]byte, []int) {
+	return file_admin_proto_rawDescGZIP(), []int{40}
+}
+
+func (x *AuditRedisLegacyMetadataRequest) GetGroupId() uint64 {
+	if x != nil {
+		return x.GroupId
+	}
+	return 0
+}
+
+func (x *AuditRedisLegacyMetadataRequest) GetMaxPages() uint32 {
+	if x != nil {
+		return x.MaxPages
+	}
+	return 0
+}
+
+type AuditRedisLegacyMetadataResponse struct {
+	state          protoimpl.MessageState         `protogen:"open.v1"`
+	Status         RedisLegacyMetadataAuditStatus `protobuf:"varint,1,opt,name=status,proto3,enum=RedisLegacyMetadataAuditStatus" json:"status,omitempty"`
+	GroupId        uint64                         `protobuf:"varint,2,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`
+	ReadTs         uint64                         `protobuf:"varint,3,opt,name=read_ts,json=readTs,proto3" json:"read_ts,omitempty"`
+	CatalogVersion uint64                         `protobuf:"varint,4,opt,name=catalog_version,json=catalogVersion,proto3" json:"catalog_version,omitempty"`
+	LeaderTerm     uint64                         `protobuf:"varint,5,opt,name=leader_term,json=leaderTerm,proto3" json:"leader_term,omitempty"`
+	PagesScanned   uint32                         `protobuf:"varint,6,opt,name=pages_scanned,json=pagesScanned,proto3" json:"pages_scanned,omitempty"`
+	// Exactly four entries on COMPLETE; absent for every other status.
+	Passes        []*RedisLegacyMetadataPass `protobuf:"bytes,7,rep,name=passes,proto3" json:"passes,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *AuditRedisLegacyMetadataResponse) Reset() {
+	*x = AuditRedisLegacyMetadataResponse{}
+	mi := &file_admin_proto_msgTypes[41]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AuditRedisLegacyMetadataResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AuditRedisLegacyMetadataResponse) ProtoMessage() {}
+
+func (x *AuditRedisLegacyMetadataResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_admin_proto_msgTypes[41]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AuditRedisLegacyMetadataResponse.ProtoReflect.Descriptor instead.
+func (*AuditRedisLegacyMetadataResponse) Descriptor() ([]byte, []int) {
+	return file_admin_proto_rawDescGZIP(), []int{41}
+}
+
+func (x *AuditRedisLegacyMetadataResponse) GetStatus() RedisLegacyMetadataAuditStatus {
+	if x != nil {
+		return x.Status
+	}
+	return RedisLegacyMetadataAuditStatus_REDIS_LEGACY_METADATA_AUDIT_STATUS_UNSPECIFIED
+}
+
+func (x *AuditRedisLegacyMetadataResponse) GetGroupId() uint64 {
+	if x != nil {
+		return x.GroupId
+	}
+	return 0
+}
+
+func (x *AuditRedisLegacyMetadataResponse) GetReadTs() uint64 {
+	if x != nil {
+		return x.ReadTs
+	}
+	return 0
+}
+
+func (x *AuditRedisLegacyMetadataResponse) GetCatalogVersion() uint64 {
+	if x != nil {
+		return x.CatalogVersion
+	}
+	return 0
+}
+
+func (x *AuditRedisLegacyMetadataResponse) GetLeaderTerm() uint64 {
+	if x != nil {
+		return x.LeaderTerm
+	}
+	return 0
+}
+
+func (x *AuditRedisLegacyMetadataResponse) GetPagesScanned() uint32 {
+	if x != nil {
+		return x.PagesScanned
+	}
+	return 0
+}
+
+func (x *AuditRedisLegacyMetadataResponse) GetPasses() []*RedisLegacyMetadataPass {
+	if x != nil {
+		return x.Passes
 	}
 	return nil
 }
@@ -2300,7 +2784,30 @@ const file_admin_proto_rawDesc = "" +
 	"\x13leader_node_version\x18\a \x01(\tR\x11leaderNodeVersion\"\x16\n" +
 	"\x14GetRaftGroupsRequest\"@\n" +
 	"\x15GetRaftGroupsResponse\x12'\n" +
-	"\x06groups\x18\x01 \x03(\v2\x0f.RaftGroupStateR\x06groups\"\xfe\x01\n" +
+	"\x06groups\x18\x01 \x03(\v2\x0f.RaftGroupStateR\x06groups\"@\n" +
+	"#GetRedisLegacyMetadataPassesRequest\x12\x19\n" +
+	"\bgroup_id\x18\x01 \x01(\x04R\agroupId\"\xe8\x01\n" +
+	"\x1fRedisLegacyMetadataReasonCounts\x12$\n" +
+	"\x0eowner_group_id\x18\x01 \x01(\x04R\fownerGroupId\x12\x16\n" +
+	"\x06served\x18\x02 \x01(\x04R\x06served\x12*\n" +
+	"\x11owner_has_version\x18\x03 \x01(\x04R\x0fownerHasVersion\x12.\n" +
+	"\x13owner_led_elsewhere\x18\x04 \x01(\x04R\x11ownerLedElsewhere\x12+\n" +
+	"\x11staged_visibility\x18\x05 \x01(\x04R\x10stagedVisibility\"\xbe\x02\n" +
+	"\x17RedisLegacyMetadataPass\x12\x19\n" +
+	"\bgroup_id\x18\x01 \x01(\x04R\agroupId\x12\x12\n" +
+	"\x04plan\x18\x02 \x01(\tR\x04plan\x12'\n" +
+	"\x0fcatalog_version\x18\x03 \x01(\x04R\x0ecatalogVersion\x12\x1f\n" +
+	"\vleader_term\x18\x04 \x01(\x04R\n" +
+	"leaderTerm\x121\n" +
+	"\x15started_at_unix_nanos\x18\x05 \x01(\x03R\x12startedAtUnixNanos\x12=\n" +
+	"\x1bcompletion_epoch_unix_nanos\x18\x06 \x01(\x03R\x18completionEpochUnixNanos\x128\n" +
+	"\x06counts\x18\a \x03(\v2 .RedisLegacyMetadataReasonCountsR\x06counts\"\xbd\x01\n" +
+	"$GetRedisLegacyMetadataPassesResponse\x12\x19\n" +
+	"\bgroup_id\x18\x01 \x01(\x04R\agroupId\x12'\n" +
+	"\x0fcatalog_version\x18\x02 \x01(\x04R\x0ecatalogVersion\x12\x1f\n" +
+	"\vleader_term\x18\x03 \x01(\x04R\n" +
+	"leaderTerm\x120\n" +
+	"\x06passes\x18\x04 \x03(\v2\x18.RedisLegacyMetadataPassR\x06passes\"\xfe\x01\n" +
 	"\x0eAdapterSummary\x12\x18\n" +
 	"\aadapter\x18\x01 \x01(\tR\aadapter\x12\x1c\n" +
 	"\toperation\x18\x02 \x01(\tR\toperation\x12\x1a\n" +
@@ -2415,7 +2922,19 @@ const file_admin_proto_rawDesc = "" +
 	"\x0ecolumn_unix_ms\x18\x01 \x01(\x03R\fcolumnUnixMs\x12%\n" +
 	"\x06series\x18\x02 \x01(\x0e2\r.KeyVizSeriesR\x06series\x12\x1e\n" +
 	"\x04rows\x18\x03 \x03(\v2\n" +
-	".KeyVizRowR\x04rows*\x9d\x01\n" +
+	".KeyVizRowR\x04rows\"Y\n" +
+	"\x1fAuditRedisLegacyMetadataRequest\x12\x19\n" +
+	"\bgroup_id\x18\x01 \x01(\x04R\agroupId\x12\x1b\n" +
+	"\tmax_pages\x18\x02 \x01(\rR\bmaxPages\"\xb0\x02\n" +
+	" AuditRedisLegacyMetadataResponse\x127\n" +
+	"\x06status\x18\x01 \x01(\x0e2\x1f.RedisLegacyMetadataAuditStatusR\x06status\x12\x19\n" +
+	"\bgroup_id\x18\x02 \x01(\x04R\agroupId\x12\x17\n" +
+	"\aread_ts\x18\x03 \x01(\x04R\x06readTs\x12'\n" +
+	"\x0fcatalog_version\x18\x04 \x01(\x04R\x0ecatalogVersion\x12\x1f\n" +
+	"\vleader_term\x18\x05 \x01(\x04R\n" +
+	"leaderTerm\x12#\n" +
+	"\rpages_scanned\x18\x06 \x01(\rR\fpagesScanned\x120\n" +
+	"\x06passes\x18\a \x03(\v2\x18.RedisLegacyMetadataPassR\x06passes*\x9d\x01\n" +
 	"\fKeyVizSeries\x12\x1d\n" +
 	"\x19KEYVIZ_SERIES_UNSPECIFIED\x10\x00\x12\x17\n" +
 	"\x13KEYVIZ_SERIES_READS\x10\x01\x12\x18\n" +
@@ -2427,10 +2946,17 @@ const file_admin_proto_rawDesc = "" +
 	"\x17SAMPLE_ROLE_UNSPECIFIED\x10\x00\x12\x1c\n" +
 	"\x18SAMPLE_ROLE_LEADER_WRITE\x10\x01\x12\x1b\n" +
 	"\x17SAMPLE_ROLE_LEADER_READ\x10\x02\x12\x1d\n" +
-	"\x19SAMPLE_ROLE_FOLLOWER_READ\x10\x032\x89\a\n" +
+	"\x19SAMPLE_ROLE_FOLLOWER_READ\x10\x03*\xd5\x01\n" +
+	"\x1eRedisLegacyMetadataAuditStatus\x122\n" +
+	".REDIS_LEGACY_METADATA_AUDIT_STATUS_UNSPECIFIED\x10\x00\x12(\n" +
+	"$REDIS_LEGACY_METADATA_AUDIT_COMPLETE\x10\x01\x12*\n" +
+	"&REDIS_LEGACY_METADATA_AUDIT_INCOMPLETE\x10\x02\x12)\n" +
+	"%REDIS_LEGACY_METADATA_AUDIT_RESTARTED\x10\x032\xdb\b\n" +
 	"\x05Admin\x12O\n" +
 	"\x12GetClusterOverview\x12\x1a.GetClusterOverviewRequest\x1a\x1b.GetClusterOverviewResponse\"\x00\x12@\n" +
-	"\rGetRaftGroups\x12\x15.GetRaftGroupsRequest\x1a\x16.GetRaftGroupsResponse\"\x00\x12L\n" +
+	"\rGetRaftGroups\x12\x15.GetRaftGroupsRequest\x1a\x16.GetRaftGroupsResponse\"\x00\x12m\n" +
+	"\x1cGetRedisLegacyMetadataPasses\x12$.GetRedisLegacyMetadataPassesRequest\x1a%.GetRedisLegacyMetadataPassesResponse\"\x00\x12a\n" +
+	"\x18AuditRedisLegacyMetadata\x12 .AuditRedisLegacyMetadataRequest\x1a!.AuditRedisLegacyMetadataResponse\"\x00\x12L\n" +
 	"\x11GetAdapterSummary\x12\x19.GetAdapterSummaryRequest\x1a\x1a.GetAdapterSummaryResponse\"\x00\x12F\n" +
 	"\x0fGetKeyVizMatrix\x12\x17.GetKeyVizMatrixRequest\x1a\x18.GetKeyVizMatrixResponse\"\x00\x12C\n" +
 	"\x0eGetRouteDetail\x12\x16.GetRouteDetailRequest\x1a\x17.GetRouteDetailResponse\"\x00\x12R\n" +
@@ -2455,101 +2981,116 @@ func file_admin_proto_rawDescGZIP() []byte {
 	return file_admin_proto_rawDescData
 }
 
-var file_admin_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_admin_proto_msgTypes = make([]protoimpl.MessageInfo, 37)
+var file_admin_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
+var file_admin_proto_msgTypes = make([]protoimpl.MessageInfo, 43)
 var file_admin_proto_goTypes = []any{
-	(KeyVizSeries)(0),                     // 0: KeyVizSeries
-	(SampleRole)(0),                       // 1: SampleRole
-	(*SetAutoSplitEnabledRequest)(nil),    // 2: SetAutoSplitEnabledRequest
-	(*SetAutoSplitEnabledResponse)(nil),   // 3: SetAutoSplitEnabledResponse
-	(*NodeIdentity)(nil),                  // 4: NodeIdentity
-	(*GroupLeader)(nil),                   // 5: GroupLeader
-	(*GetClusterOverviewRequest)(nil),     // 6: GetClusterOverviewRequest
-	(*GetClusterOverviewResponse)(nil),    // 7: GetClusterOverviewResponse
-	(*RaftGroupState)(nil),                // 8: RaftGroupState
-	(*GetRaftGroupsRequest)(nil),          // 9: GetRaftGroupsRequest
-	(*GetRaftGroupsResponse)(nil),         // 10: GetRaftGroupsResponse
-	(*AdapterSummary)(nil),                // 11: AdapterSummary
-	(*GetAdapterSummaryRequest)(nil),      // 12: GetAdapterSummaryRequest
-	(*GetAdapterSummaryResponse)(nil),     // 13: GetAdapterSummaryResponse
-	(*KeyVizRow)(nil),                     // 14: KeyVizRow
-	(*GetKeyVizMatrixRequest)(nil),        // 15: GetKeyVizMatrixRequest
-	(*GetKeyVizMatrixResponse)(nil),       // 16: GetKeyVizMatrixResponse
-	(*GetRouteDetailRequest)(nil),         // 17: GetRouteDetailRequest
-	(*GetRouteDetailResponse)(nil),        // 18: GetRouteDetailResponse
-	(*BackupShardApplied)(nil),            // 19: BackupShardApplied
-	(*BackupExpectedKeys)(nil),            // 20: BackupExpectedKeys
-	(*BeginBackupRequest)(nil),            // 21: BeginBackupRequest
-	(*BeginBackupResponse)(nil),           // 22: BeginBackupResponse
-	(*RenewBackupRequest)(nil),            // 23: RenewBackupRequest
-	(*RenewBackupResponse)(nil),           // 24: RenewBackupResponse
-	(*EndBackupRequest)(nil),              // 25: EndBackupRequest
-	(*EndBackupResponse)(nil),             // 26: EndBackupResponse
-	(*ListAdaptersAndScopesRequest)(nil),  // 27: ListAdaptersAndScopesRequest
-	(*BackupScope)(nil),                   // 28: BackupScope
-	(*ListAdaptersAndScopesResponse)(nil), // 29: ListAdaptersAndScopesResponse
-	(*StreamBackupRequest)(nil),           // 30: StreamBackupRequest
-	(*BackupKV)(nil),                      // 31: BackupKV
-	(*GetNodeVersionRequest)(nil),         // 32: GetNodeVersionRequest
-	(*GetNodeVersionResponse)(nil),        // 33: GetNodeVersionResponse
-	(*StreamEventsRequest)(nil),           // 34: StreamEventsRequest
-	(*StreamEventsEvent)(nil),             // 35: StreamEventsEvent
-	(*RouteTransition)(nil),               // 36: RouteTransition
-	(*KeyVizColumn)(nil),                  // 37: KeyVizColumn
-	nil,                                   // 38: GetClusterOverviewResponse.CapabilitiesEntry
+	(KeyVizSeries)(0),                            // 0: KeyVizSeries
+	(SampleRole)(0),                              // 1: SampleRole
+	(RedisLegacyMetadataAuditStatus)(0),          // 2: RedisLegacyMetadataAuditStatus
+	(*SetAutoSplitEnabledRequest)(nil),           // 3: SetAutoSplitEnabledRequest
+	(*SetAutoSplitEnabledResponse)(nil),          // 4: SetAutoSplitEnabledResponse
+	(*NodeIdentity)(nil),                         // 5: NodeIdentity
+	(*GroupLeader)(nil),                          // 6: GroupLeader
+	(*GetClusterOverviewRequest)(nil),            // 7: GetClusterOverviewRequest
+	(*GetClusterOverviewResponse)(nil),           // 8: GetClusterOverviewResponse
+	(*RaftGroupState)(nil),                       // 9: RaftGroupState
+	(*GetRaftGroupsRequest)(nil),                 // 10: GetRaftGroupsRequest
+	(*GetRaftGroupsResponse)(nil),                // 11: GetRaftGroupsResponse
+	(*GetRedisLegacyMetadataPassesRequest)(nil),  // 12: GetRedisLegacyMetadataPassesRequest
+	(*RedisLegacyMetadataReasonCounts)(nil),      // 13: RedisLegacyMetadataReasonCounts
+	(*RedisLegacyMetadataPass)(nil),              // 14: RedisLegacyMetadataPass
+	(*GetRedisLegacyMetadataPassesResponse)(nil), // 15: GetRedisLegacyMetadataPassesResponse
+	(*AdapterSummary)(nil),                       // 16: AdapterSummary
+	(*GetAdapterSummaryRequest)(nil),             // 17: GetAdapterSummaryRequest
+	(*GetAdapterSummaryResponse)(nil),            // 18: GetAdapterSummaryResponse
+	(*KeyVizRow)(nil),                            // 19: KeyVizRow
+	(*GetKeyVizMatrixRequest)(nil),               // 20: GetKeyVizMatrixRequest
+	(*GetKeyVizMatrixResponse)(nil),              // 21: GetKeyVizMatrixResponse
+	(*GetRouteDetailRequest)(nil),                // 22: GetRouteDetailRequest
+	(*GetRouteDetailResponse)(nil),               // 23: GetRouteDetailResponse
+	(*BackupShardApplied)(nil),                   // 24: BackupShardApplied
+	(*BackupExpectedKeys)(nil),                   // 25: BackupExpectedKeys
+	(*BeginBackupRequest)(nil),                   // 26: BeginBackupRequest
+	(*BeginBackupResponse)(nil),                  // 27: BeginBackupResponse
+	(*RenewBackupRequest)(nil),                   // 28: RenewBackupRequest
+	(*RenewBackupResponse)(nil),                  // 29: RenewBackupResponse
+	(*EndBackupRequest)(nil),                     // 30: EndBackupRequest
+	(*EndBackupResponse)(nil),                    // 31: EndBackupResponse
+	(*ListAdaptersAndScopesRequest)(nil),         // 32: ListAdaptersAndScopesRequest
+	(*BackupScope)(nil),                          // 33: BackupScope
+	(*ListAdaptersAndScopesResponse)(nil),        // 34: ListAdaptersAndScopesResponse
+	(*StreamBackupRequest)(nil),                  // 35: StreamBackupRequest
+	(*BackupKV)(nil),                             // 36: BackupKV
+	(*GetNodeVersionRequest)(nil),                // 37: GetNodeVersionRequest
+	(*GetNodeVersionResponse)(nil),               // 38: GetNodeVersionResponse
+	(*StreamEventsRequest)(nil),                  // 39: StreamEventsRequest
+	(*StreamEventsEvent)(nil),                    // 40: StreamEventsEvent
+	(*RouteTransition)(nil),                      // 41: RouteTransition
+	(*KeyVizColumn)(nil),                         // 42: KeyVizColumn
+	(*AuditRedisLegacyMetadataRequest)(nil),      // 43: AuditRedisLegacyMetadataRequest
+	(*AuditRedisLegacyMetadataResponse)(nil),     // 44: AuditRedisLegacyMetadataResponse
+	nil,                                          // 45: GetClusterOverviewResponse.CapabilitiesEntry
 }
 var file_admin_proto_depIdxs = []int32{
-	4,  // 0: GetClusterOverviewResponse.self:type_name -> NodeIdentity
-	4,  // 1: GetClusterOverviewResponse.members:type_name -> NodeIdentity
-	5,  // 2: GetClusterOverviewResponse.group_leaders:type_name -> GroupLeader
-	38, // 3: GetClusterOverviewResponse.capabilities:type_name -> GetClusterOverviewResponse.CapabilitiesEntry
-	8,  // 4: GetRaftGroupsResponse.groups:type_name -> RaftGroupState
-	11, // 5: GetAdapterSummaryResponse.summaries:type_name -> AdapterSummary
-	1,  // 6: KeyVizRow.sample_roles:type_name -> SampleRole
-	0,  // 7: GetKeyVizMatrixRequest.series:type_name -> KeyVizSeries
-	14, // 8: GetKeyVizMatrixResponse.rows:type_name -> KeyVizRow
-	14, // 9: GetRouteDetailResponse.row:type_name -> KeyVizRow
-	11, // 10: GetRouteDetailResponse.per_adapter:type_name -> AdapterSummary
-	28, // 11: BeginBackupRequest.scopes:type_name -> BackupScope
-	19, // 12: BeginBackupResponse.shards:type_name -> BackupShardApplied
-	20, // 13: BeginBackupResponse.expected_keys:type_name -> BackupExpectedKeys
-	28, // 14: ListAdaptersAndScopesResponse.scopes:type_name -> BackupScope
-	28, // 15: StreamBackupRequest.scopes:type_name -> BackupScope
-	36, // 16: StreamEventsEvent.route_transition:type_name -> RouteTransition
-	37, // 17: StreamEventsEvent.keyviz_column:type_name -> KeyVizColumn
-	0,  // 18: KeyVizColumn.series:type_name -> KeyVizSeries
-	14, // 19: KeyVizColumn.rows:type_name -> KeyVizRow
-	6,  // 20: Admin.GetClusterOverview:input_type -> GetClusterOverviewRequest
-	9,  // 21: Admin.GetRaftGroups:input_type -> GetRaftGroupsRequest
-	12, // 22: Admin.GetAdapterSummary:input_type -> GetAdapterSummaryRequest
-	15, // 23: Admin.GetKeyVizMatrix:input_type -> GetKeyVizMatrixRequest
-	17, // 24: Admin.GetRouteDetail:input_type -> GetRouteDetailRequest
-	2,  // 25: Admin.SetAutoSplitEnabled:input_type -> SetAutoSplitEnabledRequest
-	21, // 26: Admin.BeginBackup:input_type -> BeginBackupRequest
-	23, // 27: Admin.RenewBackup:input_type -> RenewBackupRequest
-	25, // 28: Admin.EndBackup:input_type -> EndBackupRequest
-	27, // 29: Admin.ListAdaptersAndScopes:input_type -> ListAdaptersAndScopesRequest
-	30, // 30: Admin.StreamBackup:input_type -> StreamBackupRequest
-	32, // 31: Admin.GetNodeVersion:input_type -> GetNodeVersionRequest
-	34, // 32: Admin.StreamEvents:input_type -> StreamEventsRequest
-	7,  // 33: Admin.GetClusterOverview:output_type -> GetClusterOverviewResponse
-	10, // 34: Admin.GetRaftGroups:output_type -> GetRaftGroupsResponse
-	13, // 35: Admin.GetAdapterSummary:output_type -> GetAdapterSummaryResponse
-	16, // 36: Admin.GetKeyVizMatrix:output_type -> GetKeyVizMatrixResponse
-	18, // 37: Admin.GetRouteDetail:output_type -> GetRouteDetailResponse
-	3,  // 38: Admin.SetAutoSplitEnabled:output_type -> SetAutoSplitEnabledResponse
-	22, // 39: Admin.BeginBackup:output_type -> BeginBackupResponse
-	24, // 40: Admin.RenewBackup:output_type -> RenewBackupResponse
-	26, // 41: Admin.EndBackup:output_type -> EndBackupResponse
-	29, // 42: Admin.ListAdaptersAndScopes:output_type -> ListAdaptersAndScopesResponse
-	31, // 43: Admin.StreamBackup:output_type -> BackupKV
-	33, // 44: Admin.GetNodeVersion:output_type -> GetNodeVersionResponse
-	35, // 45: Admin.StreamEvents:output_type -> StreamEventsEvent
-	33, // [33:46] is the sub-list for method output_type
-	20, // [20:33] is the sub-list for method input_type
-	20, // [20:20] is the sub-list for extension type_name
-	20, // [20:20] is the sub-list for extension extendee
-	0,  // [0:20] is the sub-list for field type_name
+	5,  // 0: GetClusterOverviewResponse.self:type_name -> NodeIdentity
+	5,  // 1: GetClusterOverviewResponse.members:type_name -> NodeIdentity
+	6,  // 2: GetClusterOverviewResponse.group_leaders:type_name -> GroupLeader
+	45, // 3: GetClusterOverviewResponse.capabilities:type_name -> GetClusterOverviewResponse.CapabilitiesEntry
+	9,  // 4: GetRaftGroupsResponse.groups:type_name -> RaftGroupState
+	13, // 5: RedisLegacyMetadataPass.counts:type_name -> RedisLegacyMetadataReasonCounts
+	14, // 6: GetRedisLegacyMetadataPassesResponse.passes:type_name -> RedisLegacyMetadataPass
+	16, // 7: GetAdapterSummaryResponse.summaries:type_name -> AdapterSummary
+	1,  // 8: KeyVizRow.sample_roles:type_name -> SampleRole
+	0,  // 9: GetKeyVizMatrixRequest.series:type_name -> KeyVizSeries
+	19, // 10: GetKeyVizMatrixResponse.rows:type_name -> KeyVizRow
+	19, // 11: GetRouteDetailResponse.row:type_name -> KeyVizRow
+	16, // 12: GetRouteDetailResponse.per_adapter:type_name -> AdapterSummary
+	33, // 13: BeginBackupRequest.scopes:type_name -> BackupScope
+	24, // 14: BeginBackupResponse.shards:type_name -> BackupShardApplied
+	25, // 15: BeginBackupResponse.expected_keys:type_name -> BackupExpectedKeys
+	33, // 16: ListAdaptersAndScopesResponse.scopes:type_name -> BackupScope
+	33, // 17: StreamBackupRequest.scopes:type_name -> BackupScope
+	41, // 18: StreamEventsEvent.route_transition:type_name -> RouteTransition
+	42, // 19: StreamEventsEvent.keyviz_column:type_name -> KeyVizColumn
+	0,  // 20: KeyVizColumn.series:type_name -> KeyVizSeries
+	19, // 21: KeyVizColumn.rows:type_name -> KeyVizRow
+	2,  // 22: AuditRedisLegacyMetadataResponse.status:type_name -> RedisLegacyMetadataAuditStatus
+	14, // 23: AuditRedisLegacyMetadataResponse.passes:type_name -> RedisLegacyMetadataPass
+	7,  // 24: Admin.GetClusterOverview:input_type -> GetClusterOverviewRequest
+	10, // 25: Admin.GetRaftGroups:input_type -> GetRaftGroupsRequest
+	12, // 26: Admin.GetRedisLegacyMetadataPasses:input_type -> GetRedisLegacyMetadataPassesRequest
+	43, // 27: Admin.AuditRedisLegacyMetadata:input_type -> AuditRedisLegacyMetadataRequest
+	17, // 28: Admin.GetAdapterSummary:input_type -> GetAdapterSummaryRequest
+	20, // 29: Admin.GetKeyVizMatrix:input_type -> GetKeyVizMatrixRequest
+	22, // 30: Admin.GetRouteDetail:input_type -> GetRouteDetailRequest
+	3,  // 31: Admin.SetAutoSplitEnabled:input_type -> SetAutoSplitEnabledRequest
+	26, // 32: Admin.BeginBackup:input_type -> BeginBackupRequest
+	28, // 33: Admin.RenewBackup:input_type -> RenewBackupRequest
+	30, // 34: Admin.EndBackup:input_type -> EndBackupRequest
+	32, // 35: Admin.ListAdaptersAndScopes:input_type -> ListAdaptersAndScopesRequest
+	35, // 36: Admin.StreamBackup:input_type -> StreamBackupRequest
+	37, // 37: Admin.GetNodeVersion:input_type -> GetNodeVersionRequest
+	39, // 38: Admin.StreamEvents:input_type -> StreamEventsRequest
+	8,  // 39: Admin.GetClusterOverview:output_type -> GetClusterOverviewResponse
+	11, // 40: Admin.GetRaftGroups:output_type -> GetRaftGroupsResponse
+	15, // 41: Admin.GetRedisLegacyMetadataPasses:output_type -> GetRedisLegacyMetadataPassesResponse
+	44, // 42: Admin.AuditRedisLegacyMetadata:output_type -> AuditRedisLegacyMetadataResponse
+	18, // 43: Admin.GetAdapterSummary:output_type -> GetAdapterSummaryResponse
+	21, // 44: Admin.GetKeyVizMatrix:output_type -> GetKeyVizMatrixResponse
+	23, // 45: Admin.GetRouteDetail:output_type -> GetRouteDetailResponse
+	4,  // 46: Admin.SetAutoSplitEnabled:output_type -> SetAutoSplitEnabledResponse
+	27, // 47: Admin.BeginBackup:output_type -> BeginBackupResponse
+	29, // 48: Admin.RenewBackup:output_type -> RenewBackupResponse
+	31, // 49: Admin.EndBackup:output_type -> EndBackupResponse
+	34, // 50: Admin.ListAdaptersAndScopes:output_type -> ListAdaptersAndScopesResponse
+	36, // 51: Admin.StreamBackup:output_type -> BackupKV
+	38, // 52: Admin.GetNodeVersion:output_type -> GetNodeVersionResponse
+	40, // 53: Admin.StreamEvents:output_type -> StreamEventsEvent
+	39, // [39:54] is the sub-list for method output_type
+	24, // [24:39] is the sub-list for method input_type
+	24, // [24:24] is the sub-list for extension type_name
+	24, // [24:24] is the sub-list for extension extendee
+	0,  // [0:24] is the sub-list for field type_name
 }
 
 func init() { file_admin_proto_init() }
@@ -2557,7 +3098,7 @@ func file_admin_proto_init() {
 	if File_admin_proto != nil {
 		return
 	}
-	file_admin_proto_msgTypes[33].OneofWrappers = []any{
+	file_admin_proto_msgTypes[37].OneofWrappers = []any{
 		(*StreamEventsEvent_RouteTransition)(nil),
 		(*StreamEventsEvent_KeyvizColumn)(nil),
 	}
@@ -2566,8 +3107,8 @@ func file_admin_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_admin_proto_rawDesc), len(file_admin_proto_rawDesc)),
-			NumEnums:      2,
-			NumMessages:   37,
+			NumEnums:      3,
+			NumMessages:   43,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

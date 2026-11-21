@@ -73,11 +73,29 @@ func verifyBootstrapRequiredFormat(c etcd.BaselinePreparationContext) error {
 	if inspection.Marker != raftbootstrap.MarkerRequired || inspection.Class != raftbootstrap.Required || inspection.Intent == nil {
 		return errors.WithStack(raftbootstrap.ErrInconsistent)
 	}
+	if err := verifyPreparedMarkerFence(c.BackupDir, inspection.Fenced); err != nil {
+		return err
+	}
+	return verifyPreparedIntent(want, *inspection.Intent)
+}
+
+func verifyPreparedMarkerFence(backupDir string, preparedFenced bool) error {
+	source, err := raftbootstrap.NewStore(backupDir).Inspect(raftbootstrap.Evidence{})
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if source.Fenced && !preparedFenced {
+		return errors.WithStack(raftbootstrap.ErrInconsistent)
+	}
+	return nil
+}
+
+func verifyPreparedIntent(want, got raftbootstrap.Intent) error {
 	expected, err := raftbootstrap.MarshalIntent(want)
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	actual, err := raftbootstrap.MarshalIntent(*inspection.Intent)
+	actual, err := raftbootstrap.MarshalIntent(got)
 	if err != nil {
 		return errors.WithStack(err)
 	}

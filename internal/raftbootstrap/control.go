@@ -142,7 +142,7 @@ func validateGuardedCommand(command GuardedCommand, validateInner GuardedInnerVa
 }
 
 func guardedControlKind(kind ControlKind) bool {
-	return kind == ControlGuardedWatermark || kind == ControlGuardedCatalog
+	return kind == ControlReserve || kind == ControlGuardedWatermark || kind == ControlGuardedCatalog
 }
 
 func validActiveWitness(w Witness) bool {

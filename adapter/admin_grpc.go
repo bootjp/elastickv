@@ -136,8 +136,10 @@ type AdminServer struct {
 	// Nil means keyviz is disabled — the RPC returns Unavailable.
 	// Guarded by groupsMu (same lock as groups/now) so RegisterSampler
 	// pairs atomically with concurrent RPC reads.
-	sampler          KeyVizSampler
-	autoSplitRuntime AutoSplitRuntime
+	sampler                   KeyVizSampler
+	autoSplitRuntime          AutoSplitRuntime
+	legacyMetadataSource      LegacyMetadataPassSource
+	legacyMetadataAuditSource LegacyMetadataAuditSource
 
 	nodeVersion               string
 	leaderVersionProbe        LeaderVersionProbe

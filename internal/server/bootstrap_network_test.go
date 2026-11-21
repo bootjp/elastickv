@@ -49,7 +49,8 @@ func bootstrapNetworkTestPolicy(t *testing.T, server, client peersession.Node) r
 
 func bootstrapNetworkTestDomain(t *testing.T, local peersession.Node, provisions []peersession.Provision, policy raftbootstrap.PolicyRecord) *clusterbootstrap.BootstrapDomain {
 	t.Helper()
-	owner, err := peersession.NewOwner(peersession.Config{Local: local, Provisioned: provisions, Versions: policy.Minimum, Methods: clusterbootstrap.BootstrapSharedGRPCMethods(bootstrapNetworkTestGroup)})
+	methods := append(clusterbootstrap.BootstrapSharedGRPCMethods(bootstrapNetworkTestGroup), clusterbootstrap.TTLInlinePeerMethod(bootstrapNetworkTestGroup))
+	owner, err := peersession.NewOwner(peersession.Config{Local: local, Provisioned: provisions, Versions: policy.Minimum, Methods: methods})
 	require.NoError(t, err)
 	t.Cleanup(owner.Close)
 	digest, err := raftbootstrap.PolicyDigest(policy)

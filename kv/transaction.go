@@ -16,9 +16,10 @@ import (
 type TransactionManager struct {
 	proposer raftengine.Proposer
 
-	proposalObserver   ProposalObserver
-	timestampAdmission atomic.Pointer[transactionTimestampAdmission]
-	migrationAdmission atomic.Pointer[transactionMigrationAdmission]
+	proposalObserver    ProposalObserver
+	timestampAdmission  atomic.Pointer[transactionTimestampAdmission]
+	migrationAdmission  atomic.Pointer[transactionMigrationAdmission]
+	ttlInlineCapability TTLInlineCapabilityReader
 
 	mu          sync.Mutex
 	rawPending  []*rawCommitItem
@@ -74,6 +75,12 @@ func NewTransactionWithProposer(proposer raftengine.Proposer, opts ...Transactio
 		}
 	}
 	return t
+}
+
+// WithTTLInlineCapabilityAdmission permits guarded relocations only while the
+// local FSM reports that its replicated capability marker is active.
+func WithTTLInlineCapabilityAdmission(capability TTLInlineCapabilityReader) TransactionOption {
+	return func(t *TransactionManager) { t.ttlInlineCapability = capability }
 }
 
 var errShuttingDown = errors.New("transaction manager is shutting down")
@@ -215,7 +222,7 @@ func (t *TransactionManager) Commit(ctx context.Context, reqs []*pb.Request) (*T
 	if len(reqs) == 0 {
 		return &TransactionResponse{}, nil
 	}
-	if err := refuseAbsenceProposal(reqs); err != nil {
+	if err := refuseAbsenceProposal(reqs, t.ttlInlineCapability); err != nil {
 		return nil, err
 	}
 	owned, err := t.timestampAdmission.Load().prepare(ctx, reqs)
@@ -227,6 +234,13 @@ func (t *TransactionManager) Commit(ctx context.Context, reqs []*pb.Request) (*T
 		return t.commitSequential(ctx, reqs)
 	}
 	return t.commitRaw(ctx, reqs)
+}
+
+func (t *TransactionManager) applyRequests(ctx context.Context, reqs []*pb.Request) (uint64, []error, error) {
+	if err := refuseAbsenceProposal(reqs, t.ttlInlineCapability); err != nil {
+		return 0, nil, err
+	}
+	return applyRequests(ctx, t.proposer, reqs, t.proposalObserver, t.migrationAdmission.Load())
 }
 
 func hasTxnRequests(reqs []*pb.Request) bool {
@@ -255,7 +269,7 @@ func (t *TransactionManager) commitSequential(ctx context.Context, reqs []*pb.Re
 func (t *TransactionManager) applySequentialRequests(ctx context.Context, reqs []*pb.Request) (uint64, error) {
 	commitIndex := uint64(0)
 	for _, req := range reqs {
-		idx, results, err := applyRequests(ctx, t.proposer, []*pb.Request{req}, t.proposalObserver, t.migrationAdmission.Load())
+		idx, results, err := t.applyRequests(ctx, []*pb.Request{req})
 		if err != nil {
 			return 0, err
 		}
@@ -330,7 +344,7 @@ func (t *TransactionManager) commitRawOwned(ctx context.Context, reqs []*pb.Requ
 		return nil, errShuttingDown
 	default:
 	}
-	index, results, err := applyRequests(ctx, t.proposer, reqs, t.proposalObserver, t.migrationAdmission.Load())
+	index, results, err := t.applyRequests(ctx, reqs)
 	if err != nil {
 		return nil, err
 	}
@@ -417,7 +431,7 @@ func (t *TransactionManager) applyRawBatch(batch []*rawCommitItem) {
 	// see the commitRaw comment. Use Background here; per-caller
 	// cancellation is honoured at the wait site in commitRaw via select
 	// on item.done vs ctx.Done.
-	idx, results, err := applyRequests(context.Background(), t.proposer, reqs, t.proposalObserver, t.migrationAdmission.Load())
+	idx, results, err := t.applyRequests(context.Background(), reqs)
 	if err != nil {
 		for _, item := range batch {
 			item.done <- rawCommitResult{err: err}
@@ -456,7 +470,7 @@ func (t *TransactionManager) Abort(ctx context.Context, reqs []*pb.Request) (*Tr
 
 	var commitIndex uint64
 	for _, req := range abortReqs {
-		idx, results, err := applyRequests(ctx, t.proposer, []*pb.Request{req}, t.proposalObserver, t.migrationAdmission.Load())
+		idx, results, err := t.applyRequests(ctx, []*pb.Request{req})
 		if err != nil {
 			return nil, err
 		}

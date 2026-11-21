@@ -955,12 +955,23 @@ func (e *Engine) preparePipelineTurn() (bool, error) {
 	if !p.quiescing {
 		e.retirePipelineReadOwnership()
 	}
-	again, err := e.progressPipelineActors()
+	again, err := e.progressPipelineRecoveryActors()
 	if err != nil || again {
 		return again, err
 	}
 	p.updateAdmission()
 	return e.consumeDeferredPipelineSnapshot()
+}
+
+func (e *Engine) progressPipelineRecoveryActors() (bool, error) {
+	again, err := e.progressPipelineActors()
+	if err != nil {
+		return false, err
+	}
+	if err := e.completePipelineSnapshotRecovery(); err != nil {
+		return false, err
+	}
+	return again, nil
 }
 
 func (e *Engine) queuePipelineRecoveryNormalization() error {

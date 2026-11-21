@@ -28,6 +28,7 @@ func TestAbsenceGuardRejectsBelowSnapshotUserWrite(t *testing.T) {
 			require.True(t, ok)
 			// Fixture for a committed capability; runtime activation is separately gated.
 			f.ttlInlineCapability.Store(true)
+			f.ttlInlineCapabilityRecorded.Store(true)
 			key := []byte("metadata")
 			reader, ok := s.(store.VersionPresenceReader)
 			require.True(t, ok)
@@ -59,6 +60,7 @@ func TestAbsenceGuardCapabilityAndPhaseAdmission(t *testing.T) {
 	key := []byte("metadata")
 	require.ErrorIs(t, applyFSMRequest(t, f, absenceRequest(key, true)), ErrTTLInlineCapabilityRequired)
 	f.ttlInlineCapability.Store(true)
+	f.ttlInlineCapabilityRecorded.Store(true)
 	for _, phase := range []pb.Phase{pb.Phase_PREPARE, pb.Phase_COMMIT, pb.Phase_ABORT} {
 		r := absenceRequest(key, true)
 		r.Phase = phase
@@ -71,6 +73,33 @@ func TestAbsenceGuardCapabilityAndPhaseAdmission(t *testing.T) {
 	got, err := s.GetAt(context.Background(), key, 200)
 	require.NoError(t, err)
 	require.Equal(t, []byte("migration"), got)
+}
+
+func TestAbsenceGuardReplaysBeforeLocalRecoveryProof(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	st, err := store.NewPebbleStore(dir)
+	require.NoError(t, err)
+	writer, ok := st.(store.ReplicatedControlStore)
+	require.True(t, ok)
+	_, err = writer.ApplyReplicatedControlState(t.Context(), ttlInlineCapabilityKey,
+		[]byte(`{"version":1,"index":2,"voters":[1]}`), 3)
+	require.NoError(t, err)
+	require.NoError(t, st.Close())
+	reopened, err := store.NewPebbleStore(dir)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, reopened.Close()) })
+	f := newTTLInlineFSM(t, reopened)
+	require.True(t, f.TTLInlineCapabilityRecorded())
+	require.False(t, f.TTLInlineCapabilityActive(), "local proof has not been restored")
+	request := absenceRequest([]byte("replayed-metadata"), true)
+	require.ErrorIs(t, refuseAbsenceProposal([]*pb.Request{request}, f), ErrTTLInlineCapabilityRequired,
+		"new proposals remain closed without local proof")
+	f.SetApplyIndex(4)
+	require.NoError(t, applyFSMRequest(t, f, request))
+	value, err := reopened.GetAt(t.Context(), []byte("replayed-metadata"), 200)
+	require.NoError(t, err)
+	require.Equal(t, []byte("migration"), value)
 }
 
 func TestAbsenceGuardRawBatchRefusalDoesNotHalt(t *testing.T) {
@@ -129,6 +158,7 @@ func TestAbsenceGuardRejectsDuplicateThatChangesOperation(t *testing.T) {
 	f, ok := NewKvFSMWithHLC(s, NewHLC()).(*kvFSM)
 	require.True(t, ok)
 	f.ttlInlineCapability.Store(true)
+	f.ttlInlineCapabilityRecorded.Store(true)
 	key := []byte("metadata")
 	r := absenceRequest(key, true)
 	r.Mutations = append(r.Mutations, &pb.Mutation{Op: pb.Op_DEL, Key: key})

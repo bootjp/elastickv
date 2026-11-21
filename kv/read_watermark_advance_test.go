@@ -106,6 +106,54 @@ func TestShardStoreSnapshotReadAdvancesLaggingGroupWatermark(t *testing.T) {
 	require.NoError(t, f.onePhase(t, 2, s, 40, "b-k", "old+1", "b-k"))
 }
 
+func TestLegacyMetadataDiagnosticPageAdvancesLaggingGroupWatermark(t *testing.T) {
+	t.Parallel()
+	f := newTwoGroupReadFixture(t)
+	require.NoError(t, f.shards.engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 2,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: []byte("m"), GroupID: 2, State: distribution.RouteStateActive},
+		},
+	}))
+	key := store.HashMetaKey([]byte("zebra"))
+	require.NoError(t, f.stores[1].PutAt(t.Context(), key, []byte("legacy"), 5, 0))
+	require.NoError(t, f.onePhase(t, 2, 10, 30, "m-watermark", "x"))
+	require.Less(t, f.stores[1].LastCommitTS(), uint64(30))
+
+	page, err := f.shards.ScanGroupOwnedPageAt(t.Context(), 1, []byte(store.HashMetaPrefix),
+		store.PrefixScanEnd([]byte(store.HashMetaPrefix)), 10, 30)
+	require.NoError(t, err)
+	require.Len(t, page.LegacyRows, 1)
+	require.GreaterOrEqual(t, f.stores[1].LastCommitTS(), uint64(30),
+		"diagnostic scans must fence late writes before reading the page")
+	require.ErrorIs(t, f.onePhase(t, 1, 10, 20, "a-late", "new"), store.ErrWriteConflict)
+}
+
+func TestLegacyMetadataDiagnosticPageSkipsRemoteOwnerWatermark(t *testing.T) {
+	t.Parallel()
+	f := newTwoGroupReadFixture(t)
+	require.NoError(t, f.shards.engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 2,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: []byte("m"), GroupID: 2, State: distribution.RouteStateActive},
+		},
+	}))
+	key := store.HashMetaKey([]byte("zebra"))
+	require.NoError(t, f.stores[1].PutAt(t.Context(), key, []byte("legacy"), 5, 0))
+	require.NoError(t, f.stores[2].PutAt(t.Context(), []byte("m-old"), []byte("old"), 5, 0))
+	require.NoError(t, f.onePhase(t, 1, 10, 30, "a-watermark", "x"))
+	f.groups[2].Engine = watermarkFollowerEngine{leader: raftengine.LeaderInfo{ID: "remote", Address: "127.0.0.1:1"}}
+
+	page, err := f.shards.ScanGroupOwnedPageAt(t.Context(), 1, []byte(store.HashMetaPrefix),
+		store.PrefixScanEnd([]byte(store.HashMetaPrefix)), 10, 30)
+	require.NoError(t, err)
+	require.Equal(t, []LegacyMetadataRow{{Row: &store.KVPair{Key: key, Value: []byte("legacy")},
+		OwnerGroupID: 2, Reason: LegacyMetadataOwnerLedElsewhere}}, page.LegacyRows)
+	require.Equal(t, uint64(5), f.stores[2].LastCommitTS(), "the audit must not advance a remote owner's watermark")
+}
+
 func TestAdvanceReadWatermarkForGroupReturnsLocalApplyReceipt(t *testing.T) {
 	t.Parallel()
 	f := newTwoGroupReadFixture(t)

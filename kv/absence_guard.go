@@ -7,6 +7,12 @@ import (
 
 var ErrTTLInlineCapabilityRequired = errors.New("TTL-inline replicated capability is not active")
 
+type TTLInlineCapabilityReader interface {
+	TTLInlineCapabilityActive() bool
+}
+
+var _ TTLInlineCapabilityReader = (*kvFSM)(nil)
+
 // Relocations are single-owner 1PCs. Refuse other phases explicitly instead
 // of allowing an intent encoder or raw request path to discard the condition.
 func (f *kvFSM) validateAbsenceRequest(request *pb.Request) error {
@@ -14,7 +20,9 @@ func (f *kvFSM) validateAbsenceRequest(request *pb.Request) error {
 		if mutation == nil || !mutation.RequireAbsent {
 			continue
 		}
-		if !f.ttlInlineCapability.Load() {
+		// Apply must be a function of replicated state. Startup can replay a
+		// committed guarded write before local recovery proof is installed.
+		if !f.TTLInlineCapabilityRecorded() {
 			return errors.WithStack(ErrTTLInlineCapabilityRequired)
 		}
 		if !request.IsTxn || request.Phase != pb.Phase_NONE || mutation.Op != pb.Op_PUT || isTxnInternalKey(mutation.Key) {
@@ -33,16 +41,19 @@ func validateAbsenceMutationKinds(mutations []*pb.Mutation) error {
 	return nil
 }
 
-// refuseAbsenceProposal keeps require_absent out of the log entirely until
-// M1b fences every voter and learner onto the capability. A pre-capability
-// binary decodes the field as unknown and applies the PUT that a current FSM
-// refuses, so proposing it in a mixed-version group diverges replicas at the
-// same applied index. Internal.Forward hands caller-supplied mutations here.
-func refuseAbsenceProposal(reqs []*pb.Request) error {
+// A pre-capability binary decodes require_absent as an unknown field and
+// applies the PUT, so caller-supplied Forward mutations must be checked before
+// proposal as well as by the FSM at apply.
+func refuseAbsenceProposal(reqs []*pb.Request, capability TTLInlineCapabilityReader) error {
 	for _, req := range reqs {
 		for _, mutation := range req.GetMutations() {
 			if mutation.GetRequireAbsent() {
-				return errors.WithStack(ErrTTLInlineCapabilityRequired)
+				if capability == nil || !capability.TTLInlineCapabilityActive() {
+					return errors.WithStack(ErrTTLInlineCapabilityRequired)
+				}
+				if !req.IsTxn || req.Phase != pb.Phase_NONE || mutation.Op != pb.Op_PUT || isTxnInternalKey(mutation.Key) {
+					return errors.WithStack(ErrInvalidRequest)
+				}
 			}
 		}
 	}

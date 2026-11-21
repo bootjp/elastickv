@@ -163,18 +163,8 @@ func hasHashicorpRaftArtifacts(dir string) (bool, error) {
 }
 
 func ReadRaftEngineMarker(path string) (RaftEngineType, bool, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return "", false, nil
-		}
-		return "", false, errors.WithStack(err)
-	}
-	engineType, err := ParseRaftEngineType(strings.TrimSpace(string(data)))
-	if err != nil {
-		return "", false, errors.Wrapf(err, "invalid raft engine marker %s", path)
-	}
-	return engineType, true, nil
+	marker, ok, err := ReadRaftEngineMarkerFence(path)
+	return marker.Engine, ok, err
 }
 
 func detectRaftEngineFromDataDir(dir string) (RaftEngineType, bool, error) {

@@ -3312,6 +3312,206 @@ func (x *LookupTimestampBindingResponse) GetAppliedIndex() uint64 {
 	return 0
 }
 
+type GetTTLInlineCapabilityRequest struct {
+	state                      protoimpl.MessageState `protogen:"open.v1"`
+	GroupId                    uint64                 `protobuf:"varint,1,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`
+	Challenge                  []byte                 `protobuf:"bytes,2,opt,name=challenge,proto3" json:"challenge,omitempty"`
+	ExpectedConfigurationIndex uint64                 `protobuf:"varint,3,opt,name=expected_configuration_index,json=expectedConfigurationIndex,proto3" json:"expected_configuration_index,omitempty"`
+	ExpectedTerm               uint64                 `protobuf:"varint,4,opt,name=expected_term,json=expectedTerm,proto3" json:"expected_term,omitempty"`
+	unknownFields              protoimpl.UnknownFields
+	sizeCache                  protoimpl.SizeCache
+}
+
+func (x *GetTTLInlineCapabilityRequest) Reset() {
+	*x = GetTTLInlineCapabilityRequest{}
+	mi := &file_internal_proto_msgTypes[36]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetTTLInlineCapabilityRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetTTLInlineCapabilityRequest) ProtoMessage() {}
+
+func (x *GetTTLInlineCapabilityRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[36]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetTTLInlineCapabilityRequest.ProtoReflect.Descriptor instead.
+func (*GetTTLInlineCapabilityRequest) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{36}
+}
+
+func (x *GetTTLInlineCapabilityRequest) GetGroupId() uint64 {
+	if x != nil {
+		return x.GroupId
+	}
+	return 0
+}
+
+func (x *GetTTLInlineCapabilityRequest) GetChallenge() []byte {
+	if x != nil {
+		return x.Challenge
+	}
+	return nil
+}
+
+func (x *GetTTLInlineCapabilityRequest) GetExpectedConfigurationIndex() uint64 {
+	if x != nil {
+		return x.ExpectedConfigurationIndex
+	}
+	return 0
+}
+
+func (x *GetTTLInlineCapabilityRequest) GetExpectedTerm() uint64 {
+	if x != nil {
+		return x.ExpectedTerm
+	}
+	return 0
+}
+
+type GetTTLInlineCapabilityResponse struct {
+	state              protoimpl.MessageState `protogen:"open.v1"`
+	GroupId            uint64                 `protobuf:"varint,1,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`
+	MemberId           uint64                 `protobuf:"varint,2,opt,name=member_id,json=memberId,proto3" json:"member_id,omitempty"`
+	ConfigurationIndex uint64                 `protobuf:"varint,3,opt,name=configuration_index,json=configurationIndex,proto3" json:"configuration_index,omitempty"`
+	Term               uint64                 `protobuf:"varint,4,opt,name=term,proto3" json:"term,omitempty"`
+	Voters             []uint64               `protobuf:"varint,5,rep,packed,name=voters,proto3" json:"voters,omitempty"`
+	VotersOutgoing     []uint64               `protobuf:"varint,6,rep,packed,name=voters_outgoing,json=votersOutgoing,proto3" json:"voters_outgoing,omitempty"`
+	Learners           []uint64               `protobuf:"varint,7,rep,packed,name=learners,proto3" json:"learners,omitempty"`
+	LearnersNext       []uint64               `protobuf:"varint,8,rep,packed,name=learners_next,json=learnersNext,proto3" json:"learners_next,omitempty"`
+	AutoLeave          bool                   `protobuf:"varint,9,opt,name=auto_leave,json=autoLeave,proto3" json:"auto_leave,omitempty"`
+	Fenced             bool                   `protobuf:"varint,10,opt,name=fenced,proto3" json:"fenced,omitempty"`
+	Supported          bool                   `protobuf:"varint,11,opt,name=supported,proto3" json:"supported,omitempty"`
+	Challenge          []byte                 `protobuf:"bytes,12,opt,name=challenge,proto3" json:"challenge,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
+}
+
+func (x *GetTTLInlineCapabilityResponse) Reset() {
+	*x = GetTTLInlineCapabilityResponse{}
+	mi := &file_internal_proto_msgTypes[37]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetTTLInlineCapabilityResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetTTLInlineCapabilityResponse) ProtoMessage() {}
+
+func (x *GetTTLInlineCapabilityResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[37]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetTTLInlineCapabilityResponse.ProtoReflect.Descriptor instead.
+func (*GetTTLInlineCapabilityResponse) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{37}
+}
+
+func (x *GetTTLInlineCapabilityResponse) GetGroupId() uint64 {
+	if x != nil {
+		return x.GroupId
+	}
+	return 0
+}
+
+func (x *GetTTLInlineCapabilityResponse) GetMemberId() uint64 {
+	if x != nil {
+		return x.MemberId
+	}
+	return 0
+}
+
+func (x *GetTTLInlineCapabilityResponse) GetConfigurationIndex() uint64 {
+	if x != nil {
+		return x.ConfigurationIndex
+	}
+	return 0
+}
+
+func (x *GetTTLInlineCapabilityResponse) GetTerm() uint64 {
+	if x != nil {
+		return x.Term
+	}
+	return 0
+}
+
+func (x *GetTTLInlineCapabilityResponse) GetVoters() []uint64 {
+	if x != nil {
+		return x.Voters
+	}
+	return nil
+}
+
+func (x *GetTTLInlineCapabilityResponse) GetVotersOutgoing() []uint64 {
+	if x != nil {
+		return x.VotersOutgoing
+	}
+	return nil
+}
+
+func (x *GetTTLInlineCapabilityResponse) GetLearners() []uint64 {
+	if x != nil {
+		return x.Learners
+	}
+	return nil
+}
+
+func (x *GetTTLInlineCapabilityResponse) GetLearnersNext() []uint64 {
+	if x != nil {
+		return x.LearnersNext
+	}
+	return nil
+}
+
+func (x *GetTTLInlineCapabilityResponse) GetAutoLeave() bool {
+	if x != nil {
+		return x.AutoLeave
+	}
+	return false
+}
+
+func (x *GetTTLInlineCapabilityResponse) GetFenced() bool {
+	if x != nil {
+		return x.Fenced
+	}
+	return false
+}
+
+func (x *GetTTLInlineCapabilityResponse) GetSupported() bool {
+	if x != nil {
+		return x.Supported
+	}
+	return false
+}
+
+func (x *GetTTLInlineCapabilityResponse) GetChallenge() []byte {
+	if x != nil {
+		return x.Challenge
+	}
+	return nil
+}
+
 var File_internal_proto protoreflect.FileDescriptor
 
 const file_internal_proto_rawDesc = "" +
@@ -3561,7 +3761,27 @@ const file_internal_proto_rawDesc = "" +
 	"\x0fmanifest_digest\x18\x03 \x01(\fR\x0emanifestDigest\x12\x15\n" +
 	"\x06is_txn\x18\x04 \x01(\bR\x05isTxn\x12\x1c\n" +
 	"\x05phase\x18\x05 \x01(\x0e2\x06.PhaseR\x05phase\x12#\n" +
-	"\rapplied_index\x18\x06 \x01(\x04R\fappliedIndex*&\n" +
+	"\rapplied_index\x18\x06 \x01(\x04R\fappliedIndex\"\xbf\x01\n" +
+	"\x1dGetTTLInlineCapabilityRequest\x12\x19\n" +
+	"\bgroup_id\x18\x01 \x01(\x04R\agroupId\x12\x1c\n" +
+	"\tchallenge\x18\x02 \x01(\fR\tchallenge\x12@\n" +
+	"\x1cexpected_configuration_index\x18\x03 \x01(\x04R\x1aexpectedConfigurationIndex\x12#\n" +
+	"\rexpected_term\x18\x04 \x01(\x04R\fexpectedTerm\"\x92\x03\n" +
+	"\x1eGetTTLInlineCapabilityResponse\x12\x19\n" +
+	"\bgroup_id\x18\x01 \x01(\x04R\agroupId\x12\x1b\n" +
+	"\tmember_id\x18\x02 \x01(\x04R\bmemberId\x12/\n" +
+	"\x13configuration_index\x18\x03 \x01(\x04R\x12configurationIndex\x12\x12\n" +
+	"\x04term\x18\x04 \x01(\x04R\x04term\x12\x16\n" +
+	"\x06voters\x18\x05 \x03(\x04R\x06voters\x12'\n" +
+	"\x0fvoters_outgoing\x18\x06 \x03(\x04R\x0evotersOutgoing\x12\x1a\n" +
+	"\blearners\x18\a \x03(\x04R\blearners\x12#\n" +
+	"\rlearners_next\x18\b \x03(\x04R\flearnersNext\x12\x1d\n" +
+	"\n" +
+	"auto_leave\x18\t \x01(\bR\tautoLeave\x12\x16\n" +
+	"\x06fenced\x18\n" +
+	" \x01(\bR\x06fenced\x12\x1c\n" +
+	"\tsupported\x18\v \x01(\bR\tsupported\x12\x1c\n" +
+	"\tchallenge\x18\f \x01(\fR\tchallenge*&\n" +
 	"\x02Op\x12\a\n" +
 	"\x03PUT\x10\x00\x12\a\n" +
 	"\x03DEL\x10\x01\x12\x0e\n" +
@@ -3617,12 +3837,14 @@ const file_internal_proto_rawDesc = "" +
 	",MIGRATION_STATE_PROBE_KIND_OWNERSHIP_APPLIED\x10\b\x120\n" +
 	",MIGRATION_STATE_PROBE_KIND_PARTITION_APPLIED\x10\t\x122\n" +
 	".MIGRATION_STATE_PROBE_KIND_NAMESPACE_ADMISSION\x10\n" +
-	"2\xdc\t\n" +
+	"2\xb9\n" +
+	"\n" +
 	"\bInternal\x12.\n" +
 	"\aForward\x12\x0f.ForwardRequest\x1a\x10.ForwardResponse\"\x00\x12U\n" +
 	"\x14ForwardAdminProposal\x12\x1c.ForwardAdminProposalRequest\x1a\x1d.ForwardAdminProposalResponse\"\x00\x12I\n" +
 	"\x10ForwardLeaseRead\x12\x18.ForwardLeaseReadRequest\x1a\x19.ForwardLeaseReadResponse\"\x00\x12X\n" +
-	"\x17GetPrepareEvidenceState\x12\x1c.PrepareEvidenceStateRequest\x1a\x1d.PrepareEvidenceStateResponse\"\x00\x12=\n" +
+	"\x17GetPrepareEvidenceState\x12\x1c.PrepareEvidenceStateRequest\x1a\x1d.PrepareEvidenceStateResponse\"\x00\x12[\n" +
+	"\x16GetTTLInlineCapability\x12\x1e.GetTTLInlineCapabilityRequest\x1a\x1f.GetTTLInlineCapabilityResponse\"\x00\x12=\n" +
 	"\fRelayPublish\x12\x14.RelayPublishRequest\x1a\x15.RelayPublishResponse\"\x00\x12T\n" +
 	"\x13ExportRangeVersions\x12\x1b.ExportRangeVersionsRequest\x1a\x1c.ExportRangeVersionsResponse\"\x000\x01\x12R\n" +
 	"\x13ImportRangeVersions\x12\x1b.ImportRangeVersionsRequest\x1a\x1c.ImportRangeVersionsResponse\"\x00\x12X\n" +
@@ -3648,7 +3870,7 @@ func file_internal_proto_rawDescGZIP() []byte {
 }
 
 var file_internal_proto_enumTypes = make([]protoimpl.EnumInfo, 8)
-var file_internal_proto_msgTypes = make([]protoimpl.MessageInfo, 36)
+var file_internal_proto_msgTypes = make([]protoimpl.MessageInfo, 38)
 var file_internal_proto_goTypes = []any{
 	(Op)(0),                                 // 0: Op
 	(Phase)(0),                              // 1: Phase
@@ -3694,6 +3916,8 @@ var file_internal_proto_goTypes = []any{
 	(*IssueBoundTimestampResponse)(nil),     // 41: IssueBoundTimestampResponse
 	(*LookupTimestampBindingRequest)(nil),   // 42: LookupTimestampBindingRequest
 	(*LookupTimestampBindingResponse)(nil),  // 43: LookupTimestampBindingResponse
+	(*GetTTLInlineCapabilityRequest)(nil),   // 44: GetTTLInlineCapabilityRequest
+	(*GetTTLInlineCapabilityResponse)(nil),  // 45: GetTTLInlineCapabilityResponse
 }
 var file_internal_proto_depIdxs = []int32{
 	0,  // 0: Mutation.op:type_name -> Op
@@ -3717,34 +3941,36 @@ var file_internal_proto_depIdxs = []int32{
 	14, // 18: Internal.ForwardAdminProposal:input_type -> ForwardAdminProposalRequest
 	16, // 19: Internal.ForwardLeaseRead:input_type -> ForwardLeaseReadRequest
 	18, // 20: Internal.GetPrepareEvidenceState:input_type -> PrepareEvidenceStateRequest
-	20, // 21: Internal.RelayPublish:input_type -> RelayPublishRequest
-	22, // 22: Internal.ExportRangeVersions:input_type -> ExportRangeVersionsRequest
-	25, // 23: Internal.ImportRangeVersions:input_type -> ImportRangeVersionsRequest
-	27, // 24: Internal.PromoteStagedVersions:input_type -> PromoteStagedVersionsRequest
-	29, // 25: Internal.ApplyTargetStagedReadiness:input_type -> TargetStagedReadinessRequest
-	31, // 26: Internal.ProbeMigrationLocks:input_type -> ProbeMigrationLocksRequest
-	34, // 27: Internal.CleanupMigration:input_type -> CleanupMigrationRequest
-	36, // 28: Internal.ProbeMigrationState:input_type -> ProbeMigrationStateRequest
-	38, // 29: Internal.IssueMigrationTimestamp:input_type -> IssueMigrationTimestampRequest
-	40, // 30: Internal.IssueBoundTimestamp:input_type -> IssueBoundTimestampRequest
-	42, // 31: Internal.LookupTimestampBinding:input_type -> LookupTimestampBindingRequest
-	12, // 32: Internal.Forward:output_type -> ForwardResponse
-	15, // 33: Internal.ForwardAdminProposal:output_type -> ForwardAdminProposalResponse
-	17, // 34: Internal.ForwardLeaseRead:output_type -> ForwardLeaseReadResponse
-	19, // 35: Internal.GetPrepareEvidenceState:output_type -> PrepareEvidenceStateResponse
-	21, // 36: Internal.RelayPublish:output_type -> RelayPublishResponse
-	23, // 37: Internal.ExportRangeVersions:output_type -> ExportRangeVersionsResponse
-	26, // 38: Internal.ImportRangeVersions:output_type -> ImportRangeVersionsResponse
-	28, // 39: Internal.PromoteStagedVersions:output_type -> PromoteStagedVersionsResponse
-	30, // 40: Internal.ApplyTargetStagedReadiness:output_type -> TargetStagedReadinessResponse
-	32, // 41: Internal.ProbeMigrationLocks:output_type -> ProbeMigrationLocksResponse
-	35, // 42: Internal.CleanupMigration:output_type -> CleanupMigrationResponse
-	37, // 43: Internal.ProbeMigrationState:output_type -> ProbeMigrationStateResponse
-	39, // 44: Internal.IssueMigrationTimestamp:output_type -> IssueMigrationTimestampResponse
-	41, // 45: Internal.IssueBoundTimestamp:output_type -> IssueBoundTimestampResponse
-	43, // 46: Internal.LookupTimestampBinding:output_type -> LookupTimestampBindingResponse
-	32, // [32:47] is the sub-list for method output_type
-	17, // [17:32] is the sub-list for method input_type
+	44, // 21: Internal.GetTTLInlineCapability:input_type -> GetTTLInlineCapabilityRequest
+	20, // 22: Internal.RelayPublish:input_type -> RelayPublishRequest
+	22, // 23: Internal.ExportRangeVersions:input_type -> ExportRangeVersionsRequest
+	25, // 24: Internal.ImportRangeVersions:input_type -> ImportRangeVersionsRequest
+	27, // 25: Internal.PromoteStagedVersions:input_type -> PromoteStagedVersionsRequest
+	29, // 26: Internal.ApplyTargetStagedReadiness:input_type -> TargetStagedReadinessRequest
+	31, // 27: Internal.ProbeMigrationLocks:input_type -> ProbeMigrationLocksRequest
+	34, // 28: Internal.CleanupMigration:input_type -> CleanupMigrationRequest
+	36, // 29: Internal.ProbeMigrationState:input_type -> ProbeMigrationStateRequest
+	38, // 30: Internal.IssueMigrationTimestamp:input_type -> IssueMigrationTimestampRequest
+	40, // 31: Internal.IssueBoundTimestamp:input_type -> IssueBoundTimestampRequest
+	42, // 32: Internal.LookupTimestampBinding:input_type -> LookupTimestampBindingRequest
+	12, // 33: Internal.Forward:output_type -> ForwardResponse
+	15, // 34: Internal.ForwardAdminProposal:output_type -> ForwardAdminProposalResponse
+	17, // 35: Internal.ForwardLeaseRead:output_type -> ForwardLeaseReadResponse
+	19, // 36: Internal.GetPrepareEvidenceState:output_type -> PrepareEvidenceStateResponse
+	45, // 37: Internal.GetTTLInlineCapability:output_type -> GetTTLInlineCapabilityResponse
+	21, // 38: Internal.RelayPublish:output_type -> RelayPublishResponse
+	23, // 39: Internal.ExportRangeVersions:output_type -> ExportRangeVersionsResponse
+	26, // 40: Internal.ImportRangeVersions:output_type -> ImportRangeVersionsResponse
+	28, // 41: Internal.PromoteStagedVersions:output_type -> PromoteStagedVersionsResponse
+	30, // 42: Internal.ApplyTargetStagedReadiness:output_type -> TargetStagedReadinessResponse
+	32, // 43: Internal.ProbeMigrationLocks:output_type -> ProbeMigrationLocksResponse
+	35, // 44: Internal.CleanupMigration:output_type -> CleanupMigrationResponse
+	37, // 45: Internal.ProbeMigrationState:output_type -> ProbeMigrationStateResponse
+	39, // 46: Internal.IssueMigrationTimestamp:output_type -> IssueMigrationTimestampResponse
+	41, // 47: Internal.IssueBoundTimestamp:output_type -> IssueBoundTimestampResponse
+	43, // 48: Internal.LookupTimestampBinding:output_type -> LookupTimestampBindingResponse
+	33, // [33:49] is the sub-list for method output_type
+	17, // [17:33] is the sub-list for method input_type
 	17, // [17:17] is the sub-list for extension type_name
 	17, // [17:17] is the sub-list for extension extendee
 	0,  // [0:17] is the sub-list for field type_name
@@ -3761,7 +3987,7 @@ func file_internal_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_internal_proto_rawDesc), len(file_internal_proto_rawDesc)),
 			NumEnums:      8,
-			NumMessages:   36,
+			NumMessages:   38,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

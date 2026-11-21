@@ -70,7 +70,8 @@ type DeltaCompactor struct {
 	// ttlInlinePlans tracks each TTL-inline scan plan's pass, keyed like
 	// cursors by the plan's cursor name. Guarded by cursorMu so a pass moves
 	// together with its plan's cursor.
-	ttlInlinePlans map[string]*ttlInlineMigrationPlanState
+	ttlInlinePlans       map[string]*ttlInlineMigrationPlanState
+	legacyMetadataPasses map[string]legacyMetadataPublishedPass
 	// ttlInlineObserver, when set, receives every completed TTL-inline pass.
 	ttlInlineObserver monitoring.RedisTTLInlineMigrationObserver
 
@@ -157,16 +158,17 @@ func WithDeltaCompactorTTLInlineMigrationObserver(o monitoring.RedisTTLInlineMig
 // NewDeltaCompactor creates a DeltaCompactor that operates on st using coord.
 func NewDeltaCompactor(st store.MVCCStore, coord kv.Coordinator, opts ...DeltaCompactorOption) *DeltaCompactor {
 	c := &DeltaCompactor{
-		st:             st,
-		coord:          kv.WithKeyVizLabel(coord, keyviz.LabelRedis),
-		logger:         slog.Default(),
-		maxCount:       defaultDeltaCompactorMaxDeltaCount,
-		interval:       defaultDeltaCompactorScanInterval,
-		timeout:        defaultDeltaCompactorTimeout,
-		timeoutBackoff: defaultDeltaCompactorTimeoutBackoff,
-		cursors:        make(map[string][]byte),
-		ttlInlinePlans: make(map[string]*ttlInlineMigrationPlanState),
-		urgentCh:       make(chan urgentCompactionRequest, urgentCompactionChanSize),
+		st:                   st,
+		coord:                kv.WithKeyVizLabel(coord, keyviz.LabelRedis),
+		logger:               slog.Default(),
+		maxCount:             defaultDeltaCompactorMaxDeltaCount,
+		interval:             defaultDeltaCompactorScanInterval,
+		timeout:              defaultDeltaCompactorTimeout,
+		timeoutBackoff:       defaultDeltaCompactorTimeoutBackoff,
+		cursors:              make(map[string][]byte),
+		ttlInlinePlans:       make(map[string]*ttlInlineMigrationPlanState),
+		legacyMetadataPasses: make(map[string]legacyMetadataPublishedPass),
+		urgentCh:             make(chan urgentCompactionRequest, urgentCompactionChanSize),
 	}
 	for _, opt := range opts {
 		if opt != nil {

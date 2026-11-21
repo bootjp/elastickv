@@ -28,6 +28,11 @@ import (
 
 type testStateMachine = raftenginetest.TestStateMachine
 
+type recordedTTLInlineStateMachine struct{ StateMachine }
+
+func (*recordedTTLInlineStateMachine) TTLInlineCapabilityRecorded() bool { return true }
+func (*recordedTTLInlineStateMachine) TTLInlineCapabilityActive() bool   { return false }
+
 type testSnapshot struct {
 	data []byte
 }
@@ -2119,6 +2124,27 @@ func TestProposeMembershipChangeRejectsPendingConfig(t *testing.T) {
 	result := <-done
 	require.ErrorIs(t, result.err, errMembershipConfChangePending)
 	require.Empty(t, engine.pendingConfigs)
+}
+
+func TestProposeMembershipChangeRejectsUnprovenTTLInlineMember(t *testing.T) {
+	t.Parallel()
+	for _, changeType := range []raftpb.ConfChangeType{
+		raftpb.ConfChangeAddNode,
+		raftpb.ConfChangeAddLearnerNode,
+	} {
+		t.Run(changeType.String(), func(t *testing.T) {
+			t.Parallel()
+			engine := &Engine{fsm: &recordedTTLInlineStateMachine{}}
+			done := make(chan adminResult, 1)
+			req := adminRequest{id: 17, done: done}
+
+			engine.proposeMembershipChange(req, changeType, Peer{NodeID: 2, ID: "n2"})
+
+			result := <-done
+			require.ErrorIs(t, result.err, errTTLInlineMembershipProofRequired)
+			require.Empty(t, engine.pendingConfigs)
+		})
+	}
 }
 
 func TestReconcilePendingConfChangeFenceClearsOverwrittenProposal(t *testing.T) {

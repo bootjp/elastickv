@@ -42,6 +42,41 @@ type GroupOwnedScanPage struct {
 	LegacyRows     []LegacyMetadataRow
 	Resume         []byte
 	CatalogVersion uint64
+	LeaderTerm     uint64
+}
+
+// GroupOwnedScanIdentity fences a completed diagnostic pass to the current
+// local leader term and catalog version.
+func (s *ShardStore) GroupOwnedScanIdentity(ctx context.Context, groupID uint64) (uint64, uint64, error) {
+	g, _ := s.groupForID(groupID)
+	if g == nil || g.Store == nil {
+		return 0, 0, errors.WithStack(ErrLeaderNotFound)
+	}
+	version := s.ReadRouteVersion()
+	var term uint64
+	engine := engineForGroup(g)
+	if engine != nil {
+		status := engine.Status()
+		term = status.Term
+		if status.State != raftengine.StateLeader || term == 0 {
+			return 0, 0, errors.WithStack(raftengine.ErrNotLeader)
+		}
+	}
+	if err := requireLocalMetadataScanLeader(ctx, g); err != nil {
+		return 0, 0, err
+	}
+	if s.ReadRouteVersion() != version || metadataScanTermChanged(engineForGroup(g), term) {
+		return 0, 0, errors.WithStack(ErrReadRouteVersionUnavailable)
+	}
+	return version, term, nil
+}
+
+func metadataScanTermChanged(engine raftengine.Engine, term uint64) bool {
+	if engine == nil {
+		return term != 0
+	}
+	status := engine.Status()
+	return status.State != raftengine.StateLeader || status.Term != term
 }
 
 // ScanGroupOwnedPageAt is the local-leader diagnostic form of ScanGroupOwnedAt.
@@ -51,17 +86,10 @@ type GroupOwnedScanPage struct {
 // pages before publishing a completed pass. This method alone is not an audit
 // or evidence that migration has completed.
 func (s *ShardStore) ScanGroupOwnedPageAt(ctx context.Context, groupID uint64, start, end []byte, limit int, ts uint64) (GroupOwnedScanPage, error) {
-	if limit <= 0 || limit > legacyMetadataScanMaxRows {
-		return GroupOwnedScanPage{}, errors.New("legacy metadata scan limit must be between 1 and 512")
-	}
-	g, _ := s.groupForID(groupID)
-	if g == nil || g.Store == nil {
-		return GroupOwnedScanPage{}, errors.WithStack(ErrLeaderNotFound)
-	}
-	if err := requireLocalMetadataScanLeader(ctx, g); err != nil {
+	g, version, term, err := s.groupOwnedPageSource(ctx, groupID, limit)
+	if err != nil {
 		return GroupOwnedScanPage{}, err
 	}
-	version := s.ReadRouteVersion()
 	page, err := s.scanGroupOwnedLocalPage(ctx, groupID, g, start, end, limit, ts)
 	if err != nil {
 		return GroupOwnedScanPage{}, err
@@ -70,17 +98,34 @@ func (s *ShardStore) ScanGroupOwnedPageAt(ctx context.Context, groupID uint64, s
 	if err != nil {
 		return GroupOwnedScanPage{}, err
 	}
-	if err := requireLocalMetadataScanLeader(ctx, g); err != nil {
+	currentVersion, currentTerm, err := s.GroupOwnedScanIdentity(ctx, groupID)
+	if err != nil {
 		return GroupOwnedScanPage{}, err
 	}
-	if s.ReadRouteVersion() != version {
+	if currentVersion != version || currentTerm != term {
 		return GroupOwnedScanPage{}, errors.WithStack(ErrReadRouteVersionUnavailable)
 	}
 	out.CatalogVersion = version
+	out.LeaderTerm = term
 	return out, nil
 }
 
+func (s *ShardStore) groupOwnedPageSource(ctx context.Context, groupID uint64, limit int) (*ShardGroup, uint64, uint64, error) {
+	if limit <= 0 || limit > legacyMetadataScanMaxRows {
+		return nil, 0, 0, errors.New("legacy metadata scan limit must be between 1 and 512")
+	}
+	g, _ := s.groupForID(groupID)
+	if g == nil || g.Store == nil {
+		return nil, 0, 0, errors.WithStack(ErrLeaderNotFound)
+	}
+	version, term, err := s.GroupOwnedScanIdentity(ctx, groupID)
+	return g, version, term, err
+}
+
 func (s *ShardStore) scanGroupOwnedLocalPage(ctx context.Context, groupID uint64, g *ShardGroup, start, end []byte, limit int, ts uint64) (scanRoutePage, error) {
+	if err := s.ensureReadWatermark(ctx, g, ts); err != nil {
+		return scanRoutePage{}, err
+	}
 	route := distribution.Route{GroupID: groupID}
 	if engineForGroup(g) == nil {
 		return s.scanRouteAtForwardLocalPage(ctx, g, route, start, end, limit, ts)
@@ -148,8 +193,8 @@ func (s *ShardStore) classifyLegacyMetadataRowAt(ctx context.Context, groupID ui
 }
 
 func (s *ShardStore) legacyMetadataOwnerReasonAt(ctx context.Context, owner distribution.Route, key []byte, ts uint64) (LegacyMetadataRowReason, error) {
-	g, ok := s.groupForID(owner.GroupID)
-	if !ok || g == nil || g.Store == nil {
+	g, localLeader := s.localLegacyMetadataOwner(ctx, owner.GroupID)
+	if !localLeader {
 		return LegacyMetadataOwnerLedElsewhere, nil
 	}
 	exists, answered, err := s.routeHasVersionAtOrBefore(ctx, owner, key, ts)
@@ -166,6 +211,17 @@ func (s *ShardStore) legacyMetadataOwnerReasonAt(ctx context.Context, owner dist
 		return LegacyMetadataServed, nil
 	}
 	return LegacyMetadataOwnerHasVersion, nil
+}
+
+func (s *ShardStore) localLegacyMetadataOwner(ctx context.Context, groupID uint64) (*ShardGroup, bool) {
+	g, ok := s.groupForID(groupID)
+	if !ok || g == nil || g.Store == nil {
+		return nil, false
+	}
+	if engine := engineForGroup(g); engine != nil && !isLinearizableRaftLeader(ctx, engine) {
+		return nil, false
+	}
+	return g, true
 }
 
 func isLegacyMigrationMetadataKey(key []byte) bool {

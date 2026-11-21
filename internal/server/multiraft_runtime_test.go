@@ -211,6 +211,13 @@ func TestBuildShardGroupsWithEtcdEngineRoutesAcrossGroups(t *testing.T) {
 	runtimes, shardGroups, err := buildShardGroups("n1", baseDir, groups, true, true, noderuntime.BootstrapConfig{},
 		factory, nil, clock, kv.NewActiveTimestampTracker(), nil, nil, "", encryptionwiring.WriteWiring{}, nil)
 	require.NoError(t, err)
+	for _, group := range groups {
+		markerPath := filepath.Join(noderuntime.GroupDataDir(baseDir, "n1", group.ID, true), noderuntime.RaftEngineMarkerFile)
+		marker, present, err := noderuntime.ReadRaftEngineMarkerFence(markerPath)
+		require.NoError(t, err)
+		require.True(t, present)
+		require.Equal(t, noderuntime.RaftEngineMarker{Engine: noderuntime.RaftEngineEtcd, Fenced: true}, marker)
+	}
 
 	engine := distribution.NewEngine()
 	engine.UpdateRoute([]byte("a"), []byte("m"), 1)

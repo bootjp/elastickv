@@ -500,6 +500,9 @@ func (r *runtimeServerRunner) preparePublicServices() error {
 	r.redisServer = redisServer
 	r.redisCompactor = redisCompactor
 	r.redisListener = redisListener
+	if r.adminServer != nil && redisCompactor != nil {
+		r.adminServer.RegisterLegacyMetadataPassSource(redisCompactor)
+	}
 
 	dynamoListener, err := bindDynamoDBServer(r.ctx, r.lc, r.dynamoAddress, r.dynamoServer)
 	if err != nil {

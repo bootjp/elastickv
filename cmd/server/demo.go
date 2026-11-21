@@ -16,6 +16,7 @@ import (
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/distribution/autosplit"
 	internalutil "github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/internal/noderuntime"
 	internalraftadmin "github.com/bootjp/elastickv/internal/raftadmin"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
@@ -334,9 +335,9 @@ func setupFSMStore(raftDataDir string, cleanup *internalutil.CleanupStack) (stor
 	return st, nil
 }
 
-func setupGRPC(ctx context.Context, engine raftengine.Engine, registerTransport func(grpc.ServiceRegistrar), st store.MVCCStore, coordinator *kv.Coordinate, distServer *adapter.DistributionServer, relay *adapter.RedisPubSubRelay, proposalObserver kv.ProposalObserver) (*grpc.Server, *adapter.GRPCServer) {
+func setupGRPC(ctx context.Context, engine raftengine.Engine, registerTransport func(grpc.ServiceRegistrar), st store.MVCCStore, coordinator *kv.Coordinate, distServer *adapter.DistributionServer, relay *adapter.RedisPubSubRelay, proposalObserver kv.ProposalObserver, capability kv.TTLInlineCapabilityReader) (*grpc.Server, *adapter.GRPCServer) {
 	s := grpc.NewServer(internalutil.GRPCServerOptions()...)
-	trx := kv.NewTransactionWithProposer(engine, kv.WithProposalObserver(proposalObserver))
+	trx := kv.NewTransactionWithProposer(engine, kv.WithProposalObserver(proposalObserver), kv.WithTTLInlineCapabilityAdmission(capability))
 	routedStore := kv.NewLeaderRoutedStore(st, coordinator)
 	gs := adapter.NewGRPCServer(routedStore, coordinator, adapter.WithCloseStore())
 	if registerTransport != nil {
@@ -528,6 +529,9 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	cleanup := internalutil.CleanupStack{}
 	defer cleanup.Run()
 
+	if err := prepareDemoRaftDataDir(cfg.raftDataDir); err != nil {
+		return err
+	}
 	st, err := setupFSMStore(cfg.raftDataDir, &cleanup)
 	if err != nil {
 		return err
@@ -535,7 +539,7 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	cleanup.Add(func() { st.Close() })
 	hlc := kv.NewHLC()
 	redisApplyObserver := adapter.NewRedisApplyObserver()
-	fsm := kv.NewKvFSMWithHLC(st, hlc, kv.WithApplyObserver(redisApplyObserver))
+	fsm := newDemoFSM(st, hlc, redisApplyObserver)
 	readTracker := kv.NewActiveTimestampTracker()
 
 	result, err := openRaftEngine(cfg, fsm, &cleanup)
@@ -546,7 +550,8 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	metricsRegistry := monitoring.NewRegistry(cfg.raftID, cfg.address)
 	proposalObserver := metricsRegistry.RaftProposalObserver(1)
 	engine := result.Engine
-	trx := kv.NewTransactionWithProposer(engine, kv.WithProposalObserver(proposalObserver))
+	capability, _ := fsm.(kv.TTLInlineCapabilityReader)
+	trx := kv.NewTransactionWithProposer(engine, kv.WithProposalObserver(proposalObserver), kv.WithTTLInlineCapabilityAdmission(capability))
 	coordinator := kv.NewCoordinatorWithEngine(trx, engine, kv.WithHLC(hlc))
 	defer func() {
 		// Release the leader-loss callback slot on the engine before
@@ -580,7 +585,7 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 	)
 	relay := adapter.NewRedisPubSubRelay()
 
-	s, grpcSvc := setupGRPC(ctx, engine, result.RegisterTransport, st, coordinator, distServer, relay, proposalObserver)
+	s, grpcSvc := setupGRPC(ctx, engine, result.RegisterTransport, st, coordinator, distServer, relay, proposalObserver, capability)
 
 	grpcSock, err := lc.Listen(ctx, "tcp", cfg.address)
 	if err != nil {
@@ -635,6 +640,19 @@ func run(ctx context.Context, eg *errgroup.Group, cfg config) error {
 
 	cleanup.Release()
 	return nil
+}
+
+func newDemoFSM(st store.MVCCStore, hlc *kv.HLC, observer kv.ApplyObserver) kv.FSM {
+	// The direct single-group factory has no downgrade fence. Older binaries
+	// may ignore its Raft-engine marker, so it must never activate M1b.
+	return kv.NewKvFSMWithHLC(st, hlc, kv.WithApplyObserver(observer), kv.WithTTLInlineCapabilityDisabled())
+}
+
+func prepareDemoRaftDataDir(dir string) error {
+	if dir == "" {
+		return nil
+	}
+	return errors.Wrap(noderuntime.PrepareFreshRaftEngineMarkerFence(dir), "prepare fresh raft directory")
 }
 
 func setupObservabilityServers(ctx context.Context, lc net.ListenConfig, cleanup *internalutil.CleanupStack, cfg config, metricsHandler http.Handler) (metricsL net.Listener, ms *http.Server, pprofL net.Listener, ps *http.Server, err error) {

@@ -37,9 +37,12 @@ type ttlInlineMigrationPass struct {
 	// full reports that the pass started at the beginning of the prefix and
 	// its group stayed in every tick's plans since. A pass that resumes a
 	// cursor left before its group dropped out of the plans is not full.
-	full      bool
-	pages     int
-	startedAt time.Time
+	full           bool
+	pages          int
+	startedAt      time.Time
+	catalogVersion uint64
+	leaderTerm     uint64
+	legacyCounts   map[uint64]LegacyMetadataReasonCounts
 }
 
 // clean reports that the pass read every anchor of its plan and found each one
@@ -88,7 +91,8 @@ func (c *DeltaCompactor) openTTLInlineMigrationPassLocked(name string, page ttlI
 		c.ttlInlinePlans[name] = state
 	}
 	if state.pass == nil || (page.fromStart && state.pass.pages > 0) {
-		state.pass = &ttlInlineMigrationPass{full: page.fromStart, startedAt: page.snapshotAt}
+		state.pass = &ttlInlineMigrationPass{full: page.fromStart, startedAt: page.snapshotAt,
+			catalogVersion: page.catalogVersion, leaderTerm: page.leaderTerm}
 	}
 	return state.pass
 }
@@ -118,6 +122,7 @@ func (c *DeltaCompactor) finishTTLInlineMigrationPage(
 	defer c.cursorMu.Unlock()
 	open := c.openTTLInlineMigrationPassLocked(name, page)
 	open.add(tally)
+	open.addLegacyMetadataPage(page)
 	open.pages++
 	if !c.advanceCursorLocked(name, page.cursorKey, page.truncated) {
 		return ttlInlineMigrationPass{}, false, false
@@ -136,7 +141,7 @@ func (c *DeltaCompactor) finishTTLInlineMigrationPage(
 func (c *DeltaCompactor) pruneTTLInlineMigrationPlanStates(plans []ttlInlineMigrationTickPlan) {
 	c.cursorMu.Lock()
 	defer c.cursorMu.Unlock()
-	if len(c.ttlInlinePlans) == 0 {
+	if len(c.ttlInlinePlans) == 0 && len(c.legacyMetadataPasses) == 0 {
 		return
 	}
 	live := make(map[string]struct{}, len(plans))
@@ -146,6 +151,11 @@ func (c *DeltaCompactor) pruneTTLInlineMigrationPlanStates(plans []ttlInlineMigr
 	for name := range c.ttlInlinePlans {
 		if _, ok := live[name]; !ok {
 			delete(c.ttlInlinePlans, name)
+		}
+	}
+	for name := range c.legacyMetadataPasses {
+		if _, ok := live[name]; !ok {
+			delete(c.legacyMetadataPasses, name)
 		}
 	}
 }

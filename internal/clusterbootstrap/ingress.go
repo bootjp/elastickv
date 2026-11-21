@@ -8,6 +8,7 @@ import (
 	"github.com/bootjp/elastickv/internal/peersession"
 	"github.com/bootjp/elastickv/internal/raftadmission"
 	"github.com/bootjp/elastickv/kv"
+	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -46,6 +47,12 @@ func bootstrapResultOutcomeUnknown(cause error) error {
 func (g *StartupPublicKVGate) protectedUnary(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (response any, err error) {
 	if reply, handled, controlErr := HandleBootstrapStartupControl(ctx, g.Domain.StartupToken, g.Domain.Admission, info.FullMethod, req, handler); handled {
 		return reply, controlErr
+	}
+	if info.FullMethod == pb.Internal_GetTTLInlineCapability_FullMethodName {
+		if peersession.CapturedReceipt(ctx) == nil {
+			return nil, errors.WithStack(status.Error(codes.PermissionDenied, "typed TTL-inline peer session required"))
+		}
+		return handler(ctx, req)
 	}
 	if !bootstrapBusinessMethod(info.FullMethod) {
 		return handler(ctx, req)

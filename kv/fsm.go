@@ -42,7 +42,13 @@ type kvFSM struct {
 	store store.MVCCStore
 	log   *slog.Logger
 	// Set only by the replicated protocol activation, never by a process flag.
-	ttlInlineCapability atomic.Bool
+	ttlInlineCapability         atomic.Bool
+	ttlInlineCapabilityRecorded atomic.Bool
+	ttlInlineCapabilityLoadErr  error
+	ttlInlineCapabilityDisabled bool
+	// Recovery needs independent local directory-fence and native ConfState proof.
+	ttlInlineRecoveryProof func() (fenced bool, native raftengine.NativeConfiguration)
+	ttlInlineFenceReady    atomic.Bool
 	// Disabled until every data-group member and ingress has adopted the
 	// timestamp-binding protocol. Tests may enable it directly.
 	timestampBindingEnabled atomic.Bool
@@ -355,6 +361,7 @@ func NewKvFSMWithHLC(store store.MVCCStore, hlc *HLC, opts ...FSMOption) FSM {
 	}
 	f.backupFloorLoadErr = f.reloadBackupTimestampFloor(context.Background())
 	f.replicatedPinLoadErr = f.reloadReplicatedBackupPins(context.Background())
+	f.ttlInlineCapabilityLoadErr = f.reloadTTLInlineCapability(context.Background())
 	f.snapLatch.log = f.log
 	observeStoreLastCommitTS(hlc, store)
 	return f
@@ -422,6 +429,9 @@ func (f *kvFSM) Apply(data []byte) any {
 	defer f.ClearApplyEntryIdentity()
 	if f.replicatedPinLoadErr != nil {
 		return replicatedBackupHalt(f.replicatedPinLoadErr, "load journal")
+	}
+	if f.ttlInlineCapabilityLoadErr != nil {
+		return haltErr(errors.Wrap(f.ttlInlineCapabilityLoadErr, "kv/fsm: load TTL-inline capability"))
 	}
 	if f.backupFloorLoadErr != nil {
 		return haltErr(errors.Wrap(errors.Mark(f.backupFloorLoadErr, ErrBackupApply), "kv/fsm: load backup timestamp floor"))
@@ -619,6 +629,8 @@ func (f *kvFSM) applyReservedOpcode(ctx context.Context, data []byte) (any, bool
 		return f.applyCommitTSFenceActivation(ctx, data[1:]), true
 	case data[0] == raftEncodeWatermarkAdvance:
 		return f.applyWatermarkAdvance(ctx, data[1:]), true
+	case data[0] == raftEncodeTTLInlineCapability:
+		return f.applyTTLInlineCapability(ctx, data[1:]), true
 	case data[0] >= fsmwire.OpEncryptionMin && data[0] <= fsmwire.OpEncryptionMax:
 		return f.applyEncryption(f.pendingApplyIdx, data[0], data[1:]), true
 	default:
@@ -1650,6 +1662,7 @@ func (f *kvFSM) Restore(r io.Reader) error {
 }
 
 func (f *kvFSM) restoreSnapshot(r io.Reader, restoreStore func(io.Reader) error) error {
+	f.InvalidateTTLInlineRecoveryProof()
 	// Stage 8a §3.2: the bufio.Reader is owned by the caller (us) and
 	// MUST be passed unchanged to the inner-store path on every branch
 	// — buffered bytes can sit between the header consumption and the
@@ -1689,6 +1702,14 @@ func (f *kvFSM) restoreSnapshot(r io.Reader, restoreStore func(io.Reader) error)
 	if f.readTracker != nil {
 		f.readTracker.ClearBackupPinsForGroup(f.shardGroupID)
 	}
+	if err := f.reloadSnapshotControlState(); err != nil {
+		return err
+	}
+	observeStoreLastCommitTS(f.hlc, f.store)
+	return nil
+}
+
+func (f *kvFSM) reloadSnapshotControlState() error {
 	f.backupFloorLoadErr = f.reloadBackupTimestampFloor(context.Background())
 	if f.backupFloorLoadErr != nil {
 		return errors.Wrap(f.backupFloorLoadErr, "restore backup timestamp floor")
@@ -1697,7 +1718,10 @@ func (f *kvFSM) restoreSnapshot(r io.Reader, restoreStore func(io.Reader) error)
 	if f.replicatedPinLoadErr != nil {
 		return errors.Wrap(f.replicatedPinLoadErr, "restore replicated backup pins")
 	}
-	observeStoreLastCommitTS(f.hlc, f.store)
+	f.ttlInlineCapabilityLoadErr = f.reloadTTLInlineCapability(context.Background())
+	if f.ttlInlineCapabilityLoadErr != nil {
+		return errors.Wrap(f.ttlInlineCapabilityLoadErr, "restore TTL-inline capability")
+	}
 	return nil
 }
 

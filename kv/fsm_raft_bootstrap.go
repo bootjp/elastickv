@@ -119,7 +119,7 @@ func (f *kvFSM) stageGuardedBootstrap(ctx context.Context, identity raftbootstra
 		return receipt, err
 	}
 	if receipt.Verdict == raftbootstrap.GuardedReceiptApplied {
-		if err := f.stageGuardedBootstrapInner(ctx, command, &receipt); err != nil {
+		if err := f.stageGuardedBootstrapInner(ctx, identity, policy, command, &receipt); err != nil {
 			return receipt, err
 		}
 	}
@@ -176,7 +176,14 @@ func guardedBootstrapVerdict(identity raftbootstrap.EntryIdentity, command raftb
 	return receipt, nil
 }
 
-func (f *kvFSM) stageGuardedBootstrapInner(ctx context.Context, command raftbootstrap.GuardedCommand, receipt *raftbootstrap.GuardedReceipt) error {
+func (f *kvFSM) stageGuardedBootstrapInner(ctx context.Context, identity raftbootstrap.EntryIdentity, policy raftbootstrap.PolicyRecord, command raftbootstrap.GuardedCommand, receipt *raftbootstrap.GuardedReceipt) error {
+	if command.Kind == raftbootstrap.ControlReserve {
+		return f.stageGuardedMembershipReserve(ctx, identity, policy, command)
+	}
+	return f.stageGuardedBootstrapNonReserve(ctx, command, receipt)
+}
+
+func (f *kvFSM) stageGuardedBootstrapNonReserve(ctx context.Context, command raftbootstrap.GuardedCommand, receipt *raftbootstrap.GuardedReceipt) error {
 	switch command.Kind {
 	case raftbootstrap.ControlGuardedWatermark:
 		ts := receipt.RequestedWatermark
@@ -207,6 +214,30 @@ func (f *kvFSM) stageGuardedBootstrapInner(ctx context.Context, command raftboot
 		return errors.WithStack(ErrInvalidGuardedBootstrapInner)
 	}
 	return errors.WithStack(ErrInvalidGuardedBootstrapInner)
+}
+
+func (f *kvFSM) stageGuardedMembershipReserve(ctx context.Context, identity raftbootstrap.EntryIdentity, previous raftbootstrap.PolicyRecord, command raftbootstrap.GuardedCommand) error {
+	next, err := raftbootstrap.ParsePolicyRecord(command.Inner)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	reservation := next.Reservation
+	if reservation == nil || reservation.ID.ReserveIndex != identity.Index || reservation.ID.OperationID != command.OperationID ||
+		reservation.Expected != command.Witness {
+		return errors.WithStack(ErrInvalidGuardedBootstrapInner)
+	}
+	if err := raftbootstrap.ValidateReservationTransition(previous, next); err != nil {
+		return errors.WithStack(err)
+	}
+	key, err := BootstrapPolicyMetadataKey(previous.Identity)
+	if err != nil {
+		return err
+	}
+	metadata, ok := f.store.(store.RaftControlMetadataStore)
+	if !ok {
+		return errors.WithStack(ErrGuardedBootstrapApply)
+	}
+	return errors.WithStack(metadata.StageRaftControlMetadata(ctx, key, command.Inner))
 }
 
 func (f *kvFSM) stageGuardedCatalogTransaction(ctx context.Context, request *pb.Request, commitTS uint64) error {

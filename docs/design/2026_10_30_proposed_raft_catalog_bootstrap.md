@@ -1258,7 +1258,25 @@ boundary. Catch-up grant-owner admission remains closed at this scope.
 This does not complete runtime admission. TSO policy recovery is still rejected
 instead of starting a partially protected domain. DataReady/control admission,
 cross-group rotation dependencies, background-writer admission, protected
-membership reservations and enqueue/install receipt rechecks remain required.
+membership orchestration and enqueue/install receipt rechecks remain required.
+The data-group FSM can atomically apply a witnessed `ControlReserve` policy
+transition with its receipt and revokes admission before that apply. Production
+ingress still rejects this opcode: native ConfChange binding, terminal completion
+or abort, and ambiguous-outcome reconciliation are not implemented yet.
+The strict v4 ConfChange context codec binds the operation/reservation IDs,
+expected witness, transition, target-configuration digest, candidate identity
+and peer address. It is not yet connected to native proposal or committed
+apply; protected configuration changes remain rejected at that boundary.
+The current `ControlReserve` FSM accepts a complete policy record only when
+its reservation ID already names the exact Reserve entry index. A normal
+proposer cannot know that index before Raft appends the entry, and the exact
+future ConfChange index is likewise not known when the target configuration
+is reserved. Production activation must first replace this proposal shape
+with an index-free intent whose reservation index is bound at Reserve apply
+and target configuration index at ConfChange apply, or provide an owner-side
+exact-slot protocol with the same
+guarantee. Neither is implemented. Opening Reserve ingress before this and
+the terminal/replay protocol would strand an unresolvable reservation.
 The legacy startup regression remains separately retained and red. No usable
 production rollout, complete bootstrap, or completion of the parent isolation
 audit is claimed by this integration checkpoint.

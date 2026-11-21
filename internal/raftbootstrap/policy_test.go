@@ -246,6 +246,66 @@ func TestValidatePolicyTransitionConsumesExactReservation(t *testing.T) {
 	require.ErrorIs(t, ValidatePolicyTransition(previous, aborted), ErrInvalid)
 }
 
+func TestValidateReservationTransition(t *testing.T) {
+	t.Parallel()
+	previous := policyFixture(t)
+	reservedPrevious := previous.Reservation
+	reservation := *previous.Reservation
+	previous.Reservation = nil
+	witness, err := previous.Witness()
+	require.NoError(t, err)
+	next := previous
+	next.Generation++
+	reservation.Expected = witness
+	reservation.ID.ReserveIndex = 42 // The caller, not this validator, checks the entry index.
+	next.Reservation = &reservation
+	require.NoError(t, ValidateReservationTransition(previous, next))
+
+	tests := []struct {
+		name   string
+		change func(*PolicyRecord, *PolicyRecord)
+		want   error
+	}{
+		{"invalid-previous", func(p, _ *PolicyRecord) { p.Version = 2 }, ErrUnsupported},
+		{"invalid-next", func(_, n *PolicyRecord) { n.Reservation.EvidenceDigest = Digest{} }, ErrInvalid},
+		{"previous-reserved", func(p, _ *PolicyRecord) { p.Reservation = reservedPrevious }, ErrInvalid},
+		{"next-unreserved", func(_, n *PolicyRecord) { n.Reservation = nil }, ErrInvalid},
+		{"generation-unchanged", func(_, n *PolicyRecord) { n.Generation-- }, ErrInvalid},
+		{"generation-skipped", func(_, n *PolicyRecord) {
+			n.Generation++
+			n.Reservation.Expected.Generation++
+		}, ErrInvalid},
+		{"lineage-changed", func(_, n *PolicyRecord) { n.BaselineDigest[0]++ }, ErrInvalid},
+		{"configuration-changed", func(_, n *PolicyRecord) {
+			n.Configuration.Members = slices.Clone(n.Configuration.Members)
+			n.Configuration.Members[0].Address = "other:9000"
+		}, ErrInvalid},
+		{"last-index-changed", func(_, n *PolicyRecord) {
+			n.Configuration.Index++
+			n.LastConfigurationIndex++
+		}, ErrInvalid},
+		{"retired-changed", func(_, n *PolicyRecord) {
+			n.RetiredMemberIDs = append(slices.Clone(n.RetiredMemberIDs), 10)
+		}, ErrInvalid},
+		{"terminals-changed", func(_, n *PolicyRecord) {
+			n.TerminalOperations = append(slices.Clone(n.TerminalOperations), TerminalMembershipOperation{
+				ID: ReservationID{ReserveIndex: 19, OperationID: OperationID{4}}, Outcome: MembershipAborted, Member: 8,
+			})
+		}, ErrInvalid},
+		{"witness-changed", func(_, n *PolicyRecord) { n.Reservation.Expected.ConfigurationDigest[0]++ }, ErrInvalid},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			old := previous
+			updated := next
+			copyReservation := *next.Reservation
+			updated.Reservation = &copyReservation
+			tc.change(&old, &updated)
+			require.ErrorIs(t, ValidateReservationTransition(old, updated), tc.want)
+		})
+	}
+}
+
 func TestCompletedRemovalMustRetireMemberID(t *testing.T) {
 	t.Parallel()
 	previous := policyFixture(t)

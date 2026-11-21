@@ -689,6 +689,9 @@ func TestDeltaCompactor_TTLInlineRotatesPlansAcrossTicksThatRunOutOfBudget(t *te
 type localCompactionReadEngine struct{ raftengine.Engine }
 
 func (*localCompactionReadEngine) State() raftengine.State { return raftengine.StateLeader }
+func (*localCompactionReadEngine) Status() raftengine.Status {
+	return raftengine.Status{State: raftengine.StateLeader, Term: 1}
+}
 func (*localCompactionReadEngine) LinearizableRead(ctx context.Context) (uint64, error) {
 	return 0, ctx.Err()
 }
