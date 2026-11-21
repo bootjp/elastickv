@@ -74,6 +74,12 @@ job全体の容量管理、retention、active sessionの永続化、最低runtim
 
 ## 未接続の処理
 
+有効化の前提として、stagedからliveへのpromotionとexact-version照会の競合を修正した。
+liveを先に照会すると、2回の照会の間に版が移動した場合に、コミット済みの値やtombstoneを両方で見失う。
+既存のGetと同じくstagedを先に照会し、見つからなければliveを照会する。
+memoryとPebbleの実際のpromotionを照会の間に挟む回帰テストで検証する。
+この修正だけでは、shadow記録やオンラインSplitを有効化しない。
+
 次の段階では、最低runtime versionと全apply memberの対応を先に有効化してから、active capture sessionをRaft controlとして導入する。
 全更新経路のcoverage、変更のないindexのcoverage、baseの一貫snapshot、連続したtarget cursorも必要になる。
 その後にtargetへの継続転送と事前準備、排他的なCommitとAbort、sourceのseal、短時間の要求待機を接続する。

@@ -1092,15 +1092,20 @@ func (s *ShardStore) CommittedVersionAtWithReadFence(ctx context.Context, key []
 }
 
 func committedVersionAtForRoute(ctx context.Context, st store.MVCCStore, route distribution.Route, key []byte, commitTS uint64) (bool, error) {
+	if routeHasStagedVisibility(route) {
+		// Promotion atomically moves staged versions to live keys. Probe the
+		// shrinking staged side first so a move between reads cannot hide a
+		// committed version from both probes.
+		stagedKey := distribution.MigrationStagedDataKey(route.MigrationJobID, key)
+		exists, err := st.CommittedVersionAt(ctx, stagedKey, commitTS)
+		if err != nil {
+			return false, errors.WithStack(err)
+		}
+		if exists {
+			return true, nil
+		}
+	}
 	exists, err := st.CommittedVersionAt(ctx, key, commitTS)
-	if err != nil {
-		return false, errors.WithStack(err)
-	}
-	if exists || !routeHasStagedVisibility(route) {
-		return exists, nil
-	}
-	stagedKey := distribution.MigrationStagedDataKey(route.MigrationJobID, key)
-	exists, err = st.CommittedVersionAt(ctx, stagedKey, commitTS)
 	if err != nil {
 		return false, errors.WithStack(err)
 	}
