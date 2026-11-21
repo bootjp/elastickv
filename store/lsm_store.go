@@ -2670,6 +2670,14 @@ func (s *pebbleStore) applyMutationsWithOpts(ctx context.Context, mutations []*K
 		return err
 	}
 
+	return s.commitMutationBatch(b, writeOpts, commitTS, appliedIndex, advanceLastCommitTS)
+}
+
+func (s *pebbleStore) commitMutationBatch(b *pebble.Batch, writeOpts *pebble.WriteOptions, commitTS, appliedIndex uint64, advanceLastCommitTS bool) error {
+	if appliedIndex != 0 && advanceLastCommitTS {
+		return s.commitIndexedRaftDataBatch(b, writeOpts, commitTS, appliedIndex)
+	}
+
 	newLastTS, unlockLastCommitTS, err := s.stageLastCommitTSInBatch(b, commitTS, advanceLastCommitTS)
 	if err != nil {
 		return err
@@ -2689,6 +2697,27 @@ func (s *pebbleStore) applyMutationsWithOpts(ctx context.Context, mutations []*K
 		s.updateLastCommitTS(newLastTS)
 	}
 
+	return nil
+}
+
+// commitIndexedRaftDataBatch persists an already committed Raft entry without
+// blocking reads of the store's metadata during WAL sync. applyMu serializes
+// watermark writers and dbMu prevents a restore from replacing the store.
+// Publish the new watermark only after the data and applied index commit.
+func (s *pebbleStore) commitIndexedRaftDataBatch(b *pebble.Batch, opts *pebble.WriteOptions, commitTS, appliedIndex uint64) error {
+	lastTS := max(commitTS, s.LastCommitTS())
+	if err := setPebbleUint64InBatch(b, metaLastCommitTSBytes, lastTS); err != nil {
+		return err
+	}
+	if err := stageAppliedIndexInBatch(b, appliedIndex); err != nil {
+		return err
+	}
+	if err := b.Commit(opts); err != nil {
+		return errors.WithStack(err)
+	}
+	s.mtx.Lock()
+	s.updateLastCommitTS(lastTS)
+	s.mtx.Unlock()
 	return nil
 }
 

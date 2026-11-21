@@ -238,14 +238,15 @@ func (s *pebbleStore) commitRaftEntryScope(scope *raftEntryScope) error {
 	if err := s.validateRaftControlIndex(scope); err != nil {
 		return err
 	}
+	if scope.isIndexedRaftDataOnly() {
+		return s.commitIndexedRaftDataBatch(scope.batch, s.raftApplyWriteOpts(), scope.maxAdvertisedCommitTS, scope.appliedIndex)
+	}
 
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 	newLastTS := s.lastCommitTS
 	if scope.advance {
-		if scope.maxAdvertisedCommitTS > newLastTS {
-			newLastTS = scope.maxAdvertisedCommitTS
-		}
+		newLastTS = max(newLastTS, scope.maxAdvertisedCommitTS)
 	}
 	if err := stageRaftEntryCommitMetadata(scope, newLastTS); err != nil {
 		return err
@@ -259,6 +260,10 @@ func (s *pebbleStore) commitRaftEntryScope(scope *raftEntryScope) error {
 	}
 	s.publishRaftEntryMirrors(scope, newLastTS)
 	return nil
+}
+
+func (sc *raftEntryScope) isIndexedRaftDataOnly() bool {
+	return sc.appliedIndex != 0 && sc.advance && !sc.forceSync && len(sc.readiness) == 0
 }
 
 func (s *pebbleStore) publishRaftEntryMirrors(scope *raftEntryScope, newLastTS uint64) {

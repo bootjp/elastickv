@@ -119,6 +119,80 @@ func TestRaftControlMetadataForcesActualWALSync(t *testing.T) {
 	}
 }
 
+func TestRaftDataWALSyncDoesNotBlockMetadataReads(t *testing.T) {
+	t.Parallel()
+	for _, mode := range []string{"single", "batch"} {
+		t.Run(mode, func(t *testing.T) {
+			dir := t.TempDir()
+			fs := &controlSyncFS{FS: vfs.Default, entered: make(chan struct{}), release: make(chan struct{})}
+			opts, cache := defaultPebbleOptionsWithCache(false)
+			opts.FS = fs
+			db, err := pebble.Open(dir, opts)
+			require.NoError(t, err)
+			ps := &pebbleStore{db: db, cache: cache, dir: dir, fsmApplyWriteOpts: pebble.Sync}
+			t.Cleanup(func() { require.NoError(t, ps.Close()) })
+			require.NoError(t, ps.ApplyMutationsRaftAt(t.Context(), raftEntryPut("key", "old"), nil, 5, 5, 6))
+
+			var releaseOnce sync.Once
+			release := func() { releaseOnce.Do(func() { close(fs.release) }) }
+			t.Cleanup(release)
+			fs.armed.Store(true)
+			done := make(chan error, 1)
+			go func() {
+				apply := func(ctx context.Context) error {
+					return ps.ApplyMutationsRaftAt(ctx, raftEntryPut("key", "new"), nil, 10, 10, 7)
+				}
+				if mode == "batch" {
+					done <- ps.ApplyRaftEntry(t.Context(), 7, apply)
+					return
+				}
+				done <- apply(t.Context())
+			}()
+			select {
+			case <-fs.entered:
+			case err := <-done:
+				t.Fatalf("apply returned before WAL sync: %v", err)
+			case <-time.After(5 * time.Second):
+				t.Fatal("apply never reached WAL sync")
+			}
+
+			type observation struct {
+				lastTS  uint64
+				summary MigrationServingSummary
+				err     error
+			}
+			read := make(chan observation, 1)
+			go func() {
+				summary, err := ps.MigrationServingSummary(t.Context())
+				read <- observation{lastTS: ps.LastCommitTS(), summary: summary, err: err}
+			}()
+			select {
+			case observed := <-read:
+				require.NoError(t, observed.err)
+				require.Equal(t, uint64(5), observed.lastTS)
+				require.False(t, observed.summary.Present)
+			case <-time.After(time.Second):
+				t.Fatal("metadata read waited for Raft data WAL sync")
+			}
+			select {
+			case err := <-done:
+				t.Fatalf("apply returned while WAL sync was blocked: %v", err)
+			default:
+			}
+
+			release()
+			require.NoError(t, <-done)
+			require.Equal(t, uint64(10), ps.LastCommitTS())
+			index, present := raftEntryAppliedIndex(t, ps)
+			require.True(t, present)
+			require.Equal(t, uint64(7), index)
+			value, err := ps.GetAt(t.Context(), []byte("key"), 10)
+			require.NoError(t, err)
+			require.Equal(t, "new", string(value))
+		})
+	}
+}
+
 type controlFailingNonce struct{ err error }
 
 func (f controlFailingNonce) Next() ([encryption.NonceSize]byte, error) {
