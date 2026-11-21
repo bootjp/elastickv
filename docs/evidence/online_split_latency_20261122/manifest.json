@@ -1,0 +1,173 @@
+{
+  "runtime_commit": "663c2e2b755b1456eb83238e54afad6d4d921fed",
+  "runtime_tree": "ff3b935097b7f4df7b74927310cffb6d14f9d9e1",
+  "baseline_commit": "8c2282837ecee54d51c664c67576a8f90e5f90e4",
+  "binary_sha256": {
+    "candidate-server.test": "b4598632716a4a51e680c930633a5a75a103a235ae7b2aab3613e74b56ee1479",
+    "baseline-server.test": "33b97a8b6b2707eb3d052b21ed89cf7831fab222a72bbd596f397ecc0c77446e",
+    "loadtest-window": "8350c069ee061ac2c89a1c876b3391a977d86eb724eca25837625aba993f8acc"
+  },
+  "vm": {
+    "id": 150,
+    "vcpus": 8,
+    "memory_gib": 8,
+    "sync_persistence": true,
+    "comparison_profiles": false
+  },
+  "artifact_root": "/private/tmp/elastickv-online-latency-artifacts-20261122/final2",
+  "runs": {
+    "baseline": {
+      "status": "complete, earlier control",
+      "exit": 0
+    },
+    "candidate": {
+      "status": "complete, fixed runtime",
+      "exit": 0
+    },
+    "baseline-retry-failed": {
+      "status": "failed fresh baseline retry, never Done, no final audit",
+      "exit": 1
+    }
+  },
+  "raw_files": {
+    "baseline/run.log": {
+      "sha256": "a495ed9bc46903a69ae759c5da46005fa14e7baf6561570384943d7c52867949",
+      "bytes": 29405
+    },
+    "baseline/markers.jsonl": {
+      "sha256": "8941949e8195e85c68f76317ed4168cc516c8dc5ec08e156ec0637e8b23ac888",
+      "bytes": 15388
+    },
+    "baseline/rpc.csv.gz": {
+      "sha256": "3772e527af1a9af1372bafc5812e3d5ad6e20c98491e87426f443fb6df9c9fc9",
+      "bytes": 1444784
+    },
+    "baseline/exit.txt": {
+      "sha256": "5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9",
+      "bytes": 1
+    },
+    "candidate/run.log": {
+      "sha256": "f9ecae526ac4a367643820940ba02ad316c678d88587dcb0ff7de8613ee706f2",
+      "bytes": 22967
+    },
+    "candidate/markers.jsonl": {
+      "sha256": "52ac5ef240c068097195a159c70fdd2d351f75e14883d2212bfe6072ad742d7a",
+      "bytes": 14978
+    },
+    "candidate/rpc.csv.gz": {
+      "sha256": "15df38d51966f4134fd8595d23aeff59325172b8aac1dda854916c1177ae137c",
+      "bytes": 1489863
+    },
+    "candidate/exit.txt": {
+      "sha256": "5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9",
+      "bytes": 1
+    },
+    "baseline-retry-failed/run.log": {
+      "sha256": "5063ba8252d35f0b4bca0d664f643ed6ea9c0a8f0a73fb85dc1f70aa0e4778f4",
+      "bytes": 41912
+    },
+    "baseline-retry-failed/markers.jsonl": {
+      "sha256": "22fa315703779ef0e79e9533600c81ad027355cfaca0ad2374672a3799f6ad8f",
+      "bytes": 11774
+    },
+    "baseline-retry-failed/rpc.csv.gz": {
+      "sha256": "54f19e046364aa8219e4b309049d8d8d5df7feb3342c6c4dbbb936f6f299ebf1",
+      "bytes": 1343860
+    },
+    "baseline-retry-failed/exit.txt": {
+      "sha256": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b",
+      "bytes": 1
+    },
+    "../final2-full-go.log": {
+      "sha256": "e47c3a5092f0cc93c4619754089e4f4b57ab03d9d6a3a2e4a8db3eafbf36153e",
+      "bytes": 4486
+    },
+    "../final2-kv-race.log": {
+      "sha256": "a86499cfe0ae62c298d93e5c0689391dae50fea8c9a45b95d983d6c746c9a52b",
+      "bytes": 45
+    },
+    "../final2-store-kv-race.log": {
+      "sha256": "631065f4aa92a0d6200e4668d9491a786a64e41cc82d8ae086f4a0c70bc2ff78",
+      "bytes": 407316
+    },
+    "../final2-focused-race.log": {
+      "sha256": "941170f446a533bb6d1913c8a8aaef90aba57c6edda7ca35ee9cb99f081d64da",
+      "bytes": 95
+    },
+    "../request-limit-red.log": {
+      "sha256": "81e10533b0054e4650d221d97b28fb54eb4d566dddf8d14c1c4efee84db374d5",
+      "bytes": 18557
+    },
+    "../request-limit-green.log": {
+      "sha256": "238a8c302e05fe7454811466bd14414ba825c14ffd9485743675cd19a6fabe62",
+      "bytes": 43
+    },
+    "../read-wire-red.log": {
+      "sha256": "b7b3a1cc78a336e1f0c920e2296198236ac577b5bc6b2addfe9a7d01b961d027",
+      "bytes": 5426
+    },
+    "../read-wire-green.log": {
+      "sha256": "bad19df90ec98e913153e0b2aba85558793a175bf47c71acbde8438d9b4b8d60",
+      "bytes": 48
+    },
+    "../watermark-red.log": {
+      "sha256": "0b5eda50fdd7df35488925054212b8afa2cd31a818de65bcc21c3acc2ab88a75",
+      "bytes": 1251
+    },
+    "../watermark-green.log": {
+      "sha256": "200368eea6e87d4a727f8bebab528d2aef4545baed846131af8633ce05f01e57",
+      "bytes": 46
+    },
+    "../final2-jepsen.log": {
+      "sha256": "c500a0d0f81b959849412744667ff743c3541d2f5b541303e8e9a9e4b1330777",
+      "bytes": 70177
+    },
+    "../final2-jepsen-redis.log": {
+      "sha256": "ae080fbff2fc5212fbf8f699a7247a59bed245019351e90ededfc4d2b37b8092",
+      "bytes": 3715
+    },
+    "../final2-commit.log": {
+      "sha256": "ae86e43f0addc6f6157ea4931ed0e2592475cf05a006b631e9feae2602ce5e6a",
+      "bytes": 285
+    },
+    "../cleanup-profiles/cutover-profile.pprof": {
+      "sha256": "2c0939e5501d270a8cd38534146c44f01b9b3c97671d2dfd4d0bf33ddb5617be",
+      "bytes": 196510
+    },
+    "../cleanup-profiles/cutover-mutex.pprof": {
+      "sha256": "56ec164bd4ad3d87a2c17b7df5867a4acbd3cc39b2d2ba054ac9679d829a23df",
+      "bytes": 74291
+    },
+    "../cleanup-profiles/cutover-block.pprof": {
+      "sha256": "ed5611de5c05260b7b38243095b9fc21abe29239840b41a12097f2fc46d7611b",
+      "bytes": 58225
+    },
+    "../cleanup-profiles/cutover-goroutine.pprof": {
+      "sha256": "195a2b7b4656d230ba593009ece48cf5859ddcd164180b5f53759b7170e0f61f",
+      "bytes": 702968
+    }
+  },
+  "remote_hashes": {
+    "candidate-ready.json": "74e3b2e3b36246d9da0931b659dcb371452b1e47380a1406f4784a8362bc0e24",
+    "expected.json": "ea3313a4d0bfcdceed9f412eb5b8f5889febeb2d9fd3266850ebaa21bc14da74",
+    "verified.json": "f047cbab3710d8b47f5243cdf4a222ffb35eb7cb45d29f2ef9c4854af68ebfea",
+    "candidate/run.log": "f9ecae526ac4a367643820940ba02ad316c678d88587dcb0ff7de8613ee706f2",
+    "candidate/rpc.csv.gz": "15df38d51966f4134fd8595d23aeff59325172b8aac1dda854916c1177ae137c",
+    "candidate/markers.jsonl": "52ac5ef240c068097195a159c70fdd2d351f75e14883d2212bfe6072ad742d7a",
+    "candidate/exit.txt": "5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9",
+    "baseline/run.log": "5063ba8252d35f0b4bca0d664f643ed6ea9c0a8f0a73fb85dc1f70aa0e4778f4",
+    "baseline/rpc.csv.gz": "54f19e046364aa8219e4b309049d8d8d5df7feb3342c6c4dbbb936f6f299ebf1",
+    "baseline/markers.jsonl": "22fa315703779ef0e79e9533600c81ad027355cfaca0ad2374672a3799f6ad8f",
+    "baseline/exit.txt": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b"
+  },
+  "remote_hashes_note": "Remote baseline/* hashes refer to local baseline-retry-failed/*; completed baseline came from the preserved earlier control and its original collection hashes were revalidated.",
+  "diagnostic_commit": "6263ac0a6ceb6e7375db9020aea2dd762c21877b",
+  "diagnostic_same_tree_signed_commit": "ffae139c44696c0a6a5bd384c3b277549a84e687",
+  "excluded_intermediate_commit": "487f16bb8",
+  "date_jst": "2026-11-22",
+  "cleanup": {
+    "vm_150_status": "stopped",
+    "all_measurement_processes_exited": true,
+    "hashes_verified_before_shutdown": true
+  }
+}
