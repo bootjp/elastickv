@@ -1653,7 +1653,9 @@ func (r *RedisServer) resolveListMeta(ctx context.Context, key []byte, readTS ui
 	baseMeta.Len += lenSum
 
 	if baseMeta.Len < 0 {
-		slog.Warn("resolveListMeta: clamping negative Len to 0", "key", string(key), "len", baseMeta.Len)
+		if logger := slog.Default(); logger.Enabled(context.Background(), slog.LevelWarn) {
+			logger.Warn("resolveListMeta: clamping negative Len to 0", "key", string(key), "len", baseMeta.Len)
+		}
 		baseMeta.Len = 0
 	}
 	baseMeta.Tail = baseMeta.Head + baseMeta.Len
@@ -1698,7 +1700,9 @@ func (r *RedisServer) resolveCollectionLen(
 
 	length := baseLen + deltaSum
 	if length < 0 {
-		slog.Warn(clampMsg, "key", string(key), "len", length)
+		if logger := slog.Default(); logger.Enabled(context.Background(), slog.LevelWarn) {
+			logger.Warn(clampMsg, "key", string(key), "len", length)
+		}
 		length = 0
 	}
 	return length, exists || hasDeltas, nil

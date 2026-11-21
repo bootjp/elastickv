@@ -235,10 +235,12 @@ func (c *DeltaCompactor) handlerByTypeName(typeName string) *collectionDeltaHand
 func (c *DeltaCompactor) compactUrgentKey(ctx context.Context, req urgentCompactionRequest) {
 	defer func() {
 		if rec := recover(); rec != nil {
-			c.logger.Error("DeltaCompactor: panic in urgent compaction",
-				slog.String("type", req.typeName),
-				slog.String("key", string(req.userKey)),
-				slog.Any("panic", rec))
+			if c.logger.Enabled(context.Background(), slog.LevelError) {
+				c.logger.Error("DeltaCompactor: panic in urgent compaction",
+					slog.String("type", req.typeName),
+					slog.String("key", string(req.userKey)),
+					slog.Any("panic", rec))
+			}
 		}
 	}()
 	// Use per-key leadership so that in sharded deployments this node compacts
@@ -263,7 +265,7 @@ func (c *DeltaCompactor) compactUrgentKey(ctx context.Context, req urgentCompact
 			break
 		}
 	}
-	if totalCompacted > 0 {
+	if totalCompacted > 0 && c.logger.Enabled(tickCtx, slog.LevelInfo) {
 		c.logger.InfoContext(tickCtx, "delta compactor urgent: compacted key",
 			"type", req.typeName, "key", string(req.userKey), "total_delta_count", totalCompacted)
 	}
@@ -280,8 +282,7 @@ func (c *DeltaCompactor) compactUrgentKeyBatch(ctx context.Context, req urgentCo
 	readTimestamp, err := beginFencedReadSnapshot(ctx, c.coord, c.st,
 		"redis delta compactor urgent: begin read timestamp")
 	if err != nil {
-		c.logger.WarnContext(ctx, "delta compactor urgent: timestamp allocation failed",
-			"type", req.typeName, "key", string(req.userKey), "error", err)
+		c.warnUrgentCompaction(ctx, "delta compactor urgent: timestamp allocation failed", req, err)
 		return 0, true
 	}
 	ctx = readTimestamp.WithDispatchVoucher(ctx)
@@ -289,8 +290,7 @@ func (c *DeltaCompactor) compactUrgentKeyBatch(ctx context.Context, req urgentCo
 
 	kvs, truncated, err := scanAcceptedDeltaKVsAt(ctx, c.st, prefix, store.MaxDeltaScanLimit, readTS, h.acceptDeltaKV)
 	if err != nil {
-		c.logger.WarnContext(ctx, "delta compactor urgent: scan failed",
-			"type", req.typeName, "key", string(req.userKey), "error", err)
+		c.warnUrgentCompaction(ctx, "delta compactor urgent: scan failed", req, err)
 		return 0, true
 	}
 	if len(kvs) == 0 {
@@ -299,16 +299,20 @@ func (c *DeltaCompactor) compactUrgentKeyBatch(ctx context.Context, req urgentCo
 
 	elems, err := h.buildElems(ctx, req.userKey, kvs, readTS)
 	if err != nil {
-		c.logger.WarnContext(ctx, "delta compactor urgent: buildElems failed",
-			"type", req.typeName, "key", string(req.userKey), "error", err)
+		c.warnUrgentCompaction(ctx, "delta compactor urgent: buildElems failed", req, err)
 		return 0, true
 	}
 	if err := c.dispatchCompaction(ctx, readTS, elems); err != nil {
-		c.logger.WarnContext(ctx, "delta compactor urgent: dispatch failed",
-			"type", req.typeName, "key", string(req.userKey), "error", err)
+		c.warnUrgentCompaction(ctx, "delta compactor urgent: dispatch failed", req, err)
 		return 0, true
 	}
 	return len(kvs), !truncated
+}
+
+func (c *DeltaCompactor) warnUrgentCompaction(ctx context.Context, message string, req urgentCompactionRequest, err error) {
+	if c.logger.Enabled(ctx, slog.LevelWarn) {
+		c.logger.WarnContext(ctx, message, "type", req.typeName, "key", string(req.userKey), "error", err)
+	}
 }
 
 // SyncOnce runs one compaction pass. The IsLeader() guard avoids the
@@ -932,8 +936,10 @@ func (c *DeltaCompactor) buildListCompactElemsWithDeltaPrefix(ctx context.Contex
 		ExpireAt: expireAt,
 	}
 	if newMeta.Len < 0 {
-		c.logger.WarnContext(ctx, "delta compactor: clamping negative list length to 0",
-			"key", string(userKey), "computed_len", newMeta.Len)
+		if c.logger.Enabled(ctx, slog.LevelWarn) {
+			c.logger.WarnContext(ctx, "delta compactor: clamping negative list length to 0",
+				"key", string(userKey), "computed_len", newMeta.Len)
+		}
 		newMeta.Len = 0
 	}
 	newMeta.Tail = newMeta.Head + newMeta.Len
@@ -948,8 +954,10 @@ func (c *DeltaCompactor) buildListCompactElemsWithDeltaPrefix(ctx context.Contex
 	// slice reallocations when the claim list is large.
 	claimElems, claimErr := c.collectStaleClaimElems(ctx, userKey, newMeta, readTS)
 	if claimErr != nil {
-		c.logger.WarnContext(ctx, "delta compactor: claim key GC scan failed; skipping",
-			"key", string(userKey), "error", claimErr)
+		if c.logger.Enabled(ctx, slog.LevelWarn) {
+			c.logger.WarnContext(ctx, "delta compactor: claim key GC scan failed; skipping",
+				"key", string(userKey), "error", claimErr)
+		}
 		claimElems = nil
 	}
 

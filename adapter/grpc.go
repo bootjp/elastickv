@@ -253,11 +253,16 @@ func (r *GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.Raw
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	r.log.InfoContext(ctx, "Get",
-		slog.String("key", string(req.Key)),
-		slog.String("value", string(v)))
-
+	r.logGet(ctx, req.Key, v)
 	return &pb.RawGetResponse{Value: v, Exists: true}, nil
+}
+
+func (r *GRPCServer) logGet(ctx context.Context, key, value []byte) {
+	if r.log.Enabled(ctx, slog.LevelInfo) {
+		r.log.InfoContext(ctx, "Get",
+			slog.String("key", string(key)),
+			slog.String("value", string(value)))
+	}
 }
 
 // rawGroupWatermark answers the keyless leader-fenced watermark for one Raft
@@ -818,7 +823,9 @@ func (r *GRPCServer) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutRespon
 		return nil, errors.WithStack(err)
 	}
 
-	r.log.InfoContext(ctx, "Put", slog.Any("reqs", reqs))
+	if r.log.Enabled(ctx, slog.LevelInfo) {
+		r.log.InfoContext(ctx, "Put", slog.Any("reqs", reqs))
+	}
 
 	res, err := r.coordinator.Dispatch(ctx, reqs)
 	if err != nil {
@@ -859,9 +866,7 @@ func (r *GRPCServer) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetRespon
 			return nil, errors.WithStack(err)
 		}
 	}
-	r.log.InfoContext(ctx, "Get",
-		slog.String("key", string(req.Key)),
-		slog.String("value", string(v)))
+	r.logGet(ctx, req.Key, v)
 
 	return &pb.GetResponse{
 		Value: v,
@@ -877,7 +882,9 @@ func (r *GRPCServer) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.Del
 		return nil, errors.WithStack(err)
 	}
 
-	r.log.InfoContext(ctx, "Delete", slog.Any("reqs", reqs))
+	if r.log.Enabled(ctx, slog.LevelInfo) {
+		r.log.InfoContext(ctx, "Delete", slog.Any("reqs", reqs))
+	}
 
 	res, err := r.coordinator.Dispatch(ctx, reqs)
 	if err != nil {
@@ -924,11 +931,13 @@ func (r *GRPCServer) Scan(ctx context.Context, req *pb.ScanRequest) (*pb.ScanRes
 	}
 	r.markGRPCScanRead(0, req.GetStartKey(), req.GetEndKey(), storeKeysFromKVPairs(res))
 
-	r.log.InfoContext(ctx, "Scan",
-		slog.String("startKey", string(req.StartKey)),
-		slog.String("endKey", string(req.EndKey)),
-		slog.Uint64("limit", req.Limit),
-	)
+	if r.log.Enabled(ctx, slog.LevelInfo) {
+		r.log.InfoContext(ctx, "Scan",
+			slog.String("startKey", string(req.StartKey)),
+			slog.String("endKey", string(req.EndKey)),
+			slog.Uint64("limit", req.Limit),
+		)
+	}
 
 	var kvs []*pb.Kv
 	for _, v := range res {

@@ -282,11 +282,13 @@ func (s *mvccStore) PutAt(ctx context.Context, key []byte, value []byte, commitT
 
 	commitTS = s.alignCommitTS(commitTS)
 	s.putVersionLocked(key, value, commitTS, expireAt)
-	s.log.InfoContext(ctx, "put_at",
-		slog.String("key", string(key)),
-		slog.String("value", string(value)),
-		slog.Uint64("commit_ts", commitTS),
-	)
+	if s.log.Enabled(ctx, slog.LevelInfo) {
+		s.log.InfoContext(ctx, "put_at",
+			slog.String("key", string(key)),
+			slog.String("value", string(value)),
+			slog.Uint64("commit_ts", commitTS),
+		)
+	}
 	return nil
 }
 
@@ -301,10 +303,12 @@ func (s *mvccStore) DeleteAt(ctx context.Context, key []byte, commitTS uint64) e
 
 	commitTS = s.alignCommitTS(commitTS)
 	s.deleteVersionLocked(key, commitTS)
-	s.log.InfoContext(ctx, "delete_at",
-		slog.String("key", string(key)),
-		slog.Uint64("commit_ts", commitTS),
-	)
+	if s.log.Enabled(ctx, slog.LevelInfo) {
+		s.log.InfoContext(ctx, "delete_at",
+			slog.String("key", string(key)),
+			slog.Uint64("commit_ts", commitTS),
+		)
+	}
 	return nil
 }
 
@@ -799,11 +803,7 @@ func (s *mvccStore) applyMutations(ctx context.Context, mutations []*KVPairMutat
 		case OpTypeDelete:
 			s.deleteVersionLocked(mut.Key, commitTS)
 		}
-		s.log.InfoContext(ctx, "apply mutation",
-			slog.String("key", string(mut.Key)),
-			slog.Uint64("commit_ts", commitTS),
-			slog.Bool("delete", mut.Op == OpTypeDelete),
-		)
+		s.logMutation(ctx, "apply mutation", mut, commitTS)
 	}
 
 	return nil
@@ -839,14 +839,19 @@ func (s *mvccStore) ApplyMutationsPreservingLastCommitTS(ctx context.Context, mu
 		default:
 			return errors.WithStack(ErrUnknownOp)
 		}
-		s.log.InfoContext(ctx, "apply mutation preserving last commit timestamp",
-			slog.String("key", string(mut.Key)),
-			slog.Uint64("commit_ts", commitTS),
-			slog.Bool("delete", mut.Op == OpTypeDelete),
-		)
+		s.logMutation(ctx, "apply mutation preserving last commit timestamp", mut, commitTS)
 	}
 
 	return nil
+}
+
+func (s *mvccStore) logMutation(ctx context.Context, message string, mut *KVPairMutation, commitTS uint64) {
+	if s.log.Enabled(ctx, slog.LevelInfo) {
+		s.log.LogAttrs(ctx, slog.LevelInfo, message,
+			slog.String("key", string(mut.Key)),
+			slog.Uint64("commit_ts", commitTS),
+			slog.Bool("delete", mut.Op == OpTypeDelete))
+	}
 }
 
 func (s *mvccStore) checkConflictsLocked(mutations []*KVPairMutation, readKeys [][]byte, startTS uint64) error {
@@ -961,10 +966,12 @@ func (s *mvccStore) ExpireAt(ctx context.Context, key []byte, expireAt uint64, c
 	}
 
 	s.putVersionLocked(key, ver.Value, s.alignCommitTS(commitTS), expireAt)
-	s.log.InfoContext(ctx, "expire",
-		slog.String("key", string(key)),
-		slog.Uint64("expire_at", expireAt),
-	)
+	if s.log.Enabled(ctx, slog.LevelInfo) {
+		s.log.InfoContext(ctx, "expire",
+			slog.String("key", string(key)),
+			slog.Uint64("expire_at", expireAt),
+		)
+	}
 	return nil
 }
 

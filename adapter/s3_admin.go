@@ -540,12 +540,14 @@ func (s *S3Server) runBucketDeleteSafetyNet(ctx context.Context, bucket string, 
 		return errors.WithStack(err)
 	})
 	if err != nil {
-		slog.WarnContext(ctx,
-			"bucket delete safety-net DEL_PREFIX failed; recovery marker retained",
-			slog.String("bucket", bucket),
-			slog.Uint64("generation", generation),
-			slog.String("error", err.Error()),
-		)
+		if logger := slog.Default(); logger.Enabled(ctx, slog.LevelWarn) {
+			logger.WarnContext(ctx,
+				"bucket delete safety-net DEL_PREFIX failed; recovery marker retained",
+				slog.String("bucket", bucket),
+				slog.Uint64("generation", generation),
+				slog.String("error", err.Error()),
+			)
+		}
 		return errors.WithStack(err)
 	}
 	return s.retryS3Mutation(ctx, func() error {

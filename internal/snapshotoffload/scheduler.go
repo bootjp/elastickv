@@ -442,14 +442,20 @@ func (s *Scheduler) publishGroup(ctx context.Context, group OffloadGroup) {
 			s.observer.ObserveSnapshotOffloadSkipped(group.GroupID, "object_claimed")
 			return
 		}
-		s.observer.ObserveSnapshotOffloadFailed(group.GroupID, err)
-		s.logger.WarnContext(ctx, "snapshot offload publish failed",
-			slog.Uint64("group_id", group.GroupID), slog.String("error", err.Error()))
+		s.reportPublishFailure(ctx, group.GroupID, err)
 		return
 	}
 	s.markPublished(group.GroupID, manifest.SnapshotIndex)
 	s.observer.ObserveSnapshotOffloadPublished(
 		group.GroupID, manifest.SnapshotIndex, manifest.Payload.Bytes, s.now().Sub(started))
+}
+
+func (s *Scheduler) reportPublishFailure(ctx context.Context, groupID uint64, err error) {
+	s.observer.ObserveSnapshotOffloadFailed(groupID, err)
+	if s.logger.Enabled(ctx, slog.LevelWarn) {
+		s.logger.WarnContext(ctx, "snapshot offload publish failed",
+			slog.Uint64("group_id", groupID), slog.String("error", err.Error()))
+	}
 }
 
 // verifyLeaderTimeout bounds one pre-commit leadership recheck. It

@@ -1,8 +1,10 @@
 package admin
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -70,6 +72,35 @@ func TestClusterHandler_SourceErrorReturns500(t *testing.T) {
 	// The raw error must not leak to the client.
 	require.NotContains(t, rec.Body.String(), "XYZ123")
 	require.NotContains(t, rec.Body.String(), "raft storage sentinel")
+}
+
+type countingClusterError struct{ calls int }
+
+func (e *countingClusterError) Error() string {
+	e.calls++
+	return "cluster diagnostic"
+}
+
+func TestClusterErrorFormattingFollowsLogLevel(t *testing.T) {
+	t.Parallel()
+	failure := &countingClusterError{}
+	var logs bytes.Buffer
+	var level slog.LevelVar
+	h := NewClusterHandler(ClusterInfoFunc(func(context.Context) (ClusterInfo, error) {
+		return ClusterInfo{}, failure
+	})).WithLogger(slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: &level})))
+	request := httptest.NewRequest(http.MethodGet, "/admin/api/v1/cluster", nil)
+	level.Set(slog.LevelError + 1)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, request)
+	require.Equal(t, http.StatusInternalServerError, rec.Code)
+	require.Zero(t, failure.calls)
+	level.Set(slog.LevelError)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, request)
+	require.Equal(t, http.StatusInternalServerError, rec.Code)
+	require.Equal(t, 1, failure.calls)
+	require.Contains(t, logs.String(), `"error":"cluster diagnostic"`)
 }
 
 func TestClusterHandler_OnlyGET(t *testing.T) {

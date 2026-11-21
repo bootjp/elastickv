@@ -573,9 +573,7 @@ type listQueuesResponse struct {
 func (h *SqsHandler) handleList(w http.ResponseWriter, r *http.Request) {
 	names, err := h.source.AdminListQueues(r.Context())
 	if err != nil {
-		h.logger.LogAttrs(r.Context(), slog.LevelError, "admin sqs list queues failed",
-			slog.String("error", err.Error()),
-		)
+		logRequestError(r.Context(), h.logger, slog.LevelError, "admin sqs list queues failed", err)
 		writeJSONError(w, http.StatusInternalServerError, "list_failed",
 			"failed to list queues; see server logs")
 		return
@@ -591,9 +589,7 @@ func (h *SqsHandler) handleList(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
 	if err := json.NewEncoder(w).Encode(listQueuesResponse{Queues: names}); err != nil {
-		h.logger.LogAttrs(r.Context(), slog.LevelWarn, "admin sqs list response encode failed",
-			slog.String("error", err.Error()),
-		)
+		logRequestError(r.Context(), h.logger, slog.LevelWarn, "admin sqs list response encode failed", err)
 	}
 }
 
@@ -654,9 +650,7 @@ func (h *SqsHandler) handleDescribe(w http.ResponseWriter, r *http.Request, name
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
 	if err := json.NewEncoder(w).Encode(summary); err != nil {
-		h.logger.LogAttrs(r.Context(), slog.LevelWarn, "admin sqs describe response encode failed",
-			slog.String("error", err.Error()),
-		)
+		logRequestError(r.Context(), h.logger, slog.LevelWarn, "admin sqs describe response encode failed", err)
 	}
 }
 
@@ -738,9 +732,7 @@ func (h *SqsHandler) handlePeek(w http.ResponseWriter, r *http.Request, name str
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
 	if err := json.NewEncoder(w).Encode(result); err != nil {
-		h.logger.LogAttrs(r.Context(), slog.LevelWarn, "admin sqs peek response encode failed",
-			slog.String("error", err.Error()),
-		)
+		logRequestError(r.Context(), h.logger, slog.LevelWarn, "admin sqs peek response encode failed", err)
 	}
 }
 
@@ -873,9 +865,7 @@ func writeQueuesError(w http.ResponseWriter, err error, logger *slog.Logger, r *
 	case errors.Is(err, ErrQueuesValidation):
 		writeJSONError(w, http.StatusBadRequest, "invalid_request", err.Error())
 	default:
-		logger.LogAttrs(r.Context(), slog.LevelError, "admin sqs operation failed",
-			slog.String("error", err.Error()),
-		)
+		logRequestError(r.Context(), logger, slog.LevelError, "admin sqs operation failed", err)
 		writeJSONError(w, http.StatusInternalServerError, "internal",
 			"queue operation failed; see server logs")
 	}

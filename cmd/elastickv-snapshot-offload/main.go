@@ -313,15 +313,17 @@ func runRestore(ctx context.Context, cfg *restoreConfig, logger *slog.Logger) (r
 	if err != nil {
 		return errors.Wrap(err, "restore physical snapshot")
 	}
-	logger.Info("snapshot offload restore data dir prepared",
-		"data_dir", result.DataDir,
-		"fsm", result.FSMPath,
-		"snap", result.SnapPath,
-		"crc32c", fmt.Sprintf("%08x", result.CRC32C),
-		"payload_sha256", result.PayloadSHA256,
-		"payload_bytes", result.PayloadBytes,
-		"peers", result.Peers,
-	)
+	if logger.Enabled(context.Background(), slog.LevelInfo) {
+		logger.Info("snapshot offload restore data dir prepared",
+			"data_dir", result.DataDir,
+			"fsm", result.FSMPath,
+			"snap", result.SnapPath,
+			"crc32c", fmt.Sprintf("%08x", result.CRC32C),
+			"payload_sha256", result.PayloadSHA256,
+			"payload_bytes", result.PayloadBytes,
+			"peers", result.Peers,
+		)
+	}
 	return nil
 }
 

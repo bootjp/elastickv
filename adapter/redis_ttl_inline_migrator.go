@@ -3,6 +3,7 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"log/slog"
 	"strconv"
 	"time"
 
@@ -280,8 +281,10 @@ func (c *DeltaCompactor) migrateTTLInlinePage(
 		built, buildErr := h.buildElems(ctx, pair, readTS)
 		if buildErr != nil {
 			tally.keysFailed++
-			c.logger.WarnContext(ctx, "ttl inline migrator: failed to build elems",
-				"type", h.typeName, "key", string(userKey), "error", buildErr)
+			if c.logger.Enabled(ctx, slog.LevelWarn) {
+				c.logger.WarnContext(ctx, "ttl inline migrator: failed to build elems",
+					"type", h.typeName, "key", string(userKey), "error", buildErr)
+			}
 			continue
 		}
 		if len(built) > 0 {

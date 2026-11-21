@@ -191,10 +191,12 @@ func (r *RedisServer) runLuaScript(conn redcon.Conn, script string, evalArgs [][
 		})
 	}
 	if err != nil {
-		slog.Default().Warn("lua script execution failed",
-			"sha", luaScriptSHA(script),
-			"elapsed", elapsed, "attempts", attempts,
-			"redis_call_count", totalRedisCallCount, "err", err)
+		if logger := slog.Default(); logger.Enabled(context.Background(), slog.LevelWarn) {
+			logger.Warn("lua script execution failed",
+				"sha", luaScriptSHA(script),
+				"elapsed", elapsed, "attempts", attempts,
+				"redis_call_count", totalRedisCallCount, "err", err)
+		}
 		writeRedisError(conn, err)
 		return
 	}

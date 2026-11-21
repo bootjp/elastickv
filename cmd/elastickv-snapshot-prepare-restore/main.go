@@ -5,6 +5,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"flag"
@@ -182,16 +183,18 @@ func prepare(cfg *config, logger *slog.Logger) error {
 	if err != nil {
 		return errors.Wrap(err, "prepare external snapshot restore")
 	}
-	logger.Info("snapshot restore data dir prepared",
-		"data_dir", result.DataDir,
-		"fsm", result.FSMPath,
-		"snap", result.SnapPath,
-		"crc32c", fmt.Sprintf("%08x", result.CRC32C),
-		"payload_sha256", result.PayloadSHA256,
-		"payload_bytes", result.PayloadBytes,
-		"last_commit_ts", header.LastCommitTS,
-		"peers", result.Peers,
-	)
+	if logger.Enabled(context.Background(), slog.LevelInfo) {
+		logger.Info("snapshot restore data dir prepared",
+			"data_dir", result.DataDir,
+			"fsm", result.FSMPath,
+			"snap", result.SnapPath,
+			"crc32c", fmt.Sprintf("%08x", result.CRC32C),
+			"payload_sha256", result.PayloadSHA256,
+			"payload_bytes", result.PayloadBytes,
+			"last_commit_ts", header.LastCommitTS,
+			"peers", result.Peers,
+		)
+	}
 	return nil
 }
 

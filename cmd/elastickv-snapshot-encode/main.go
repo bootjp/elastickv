@@ -23,6 +23,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"flag"
@@ -454,12 +455,14 @@ func encodeOne(cfg *config, logger *slog.Logger) error {
 	if publishErr != nil {
 		return publishErr
 	}
-	logger.Info("encode complete",
-		"output", cfg.outputPath,
-		"bytes", result.BytesWritten,
-		"self_test", cfg.selfTest,
-		"adapters", strings.Join(result.AdaptersEnabled, ","),
-	)
+	if logger.Enabled(context.Background(), slog.LevelInfo) {
+		logger.Info("encode complete",
+			"output", cfg.outputPath,
+			"bytes", result.BytesWritten,
+			"self_test", cfg.selfTest,
+			"adapters", strings.Join(result.AdaptersEnabled, ","),
+		)
+	}
 	return nil
 }
 

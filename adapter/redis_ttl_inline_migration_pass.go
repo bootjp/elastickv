@@ -167,18 +167,20 @@ func (c *DeltaCompactor) reportTTLInlineMigrationPass(
 	if clean && prevClean {
 		level = slog.LevelDebug
 	}
-	c.logger.Log(ctx, level, "ttl inline migrator: pass complete",
-		"type", h.typeName,
-		"group_id", plan.groupID,
-		"clean", clean,
-		"full_pass", pass.full,
-		"pages", pass.pages,
-		"keys_scanned", pass.keysScanned,
-		"keys_migrated", pass.keysMigrated,
-		"keys_skipped", pass.keysSkipped,
-		"keys_failed", pass.keysFailed,
-		"duration", time.Since(pass.startedAt),
-	)
+	if c.logger.Enabled(ctx, level) {
+		c.logger.Log(ctx, level, "ttl inline migrator: pass complete",
+			"type", h.typeName,
+			"group_id", plan.groupID,
+			"clean", clean,
+			"full_pass", pass.full,
+			"pages", pass.pages,
+			"keys_scanned", pass.keysScanned,
+			"keys_migrated", pass.keysMigrated,
+			"keys_skipped", pass.keysSkipped,
+			"keys_failed", pass.keysFailed,
+			"duration", time.Since(pass.startedAt),
+		)
+	}
 	if c.ttlInlineObserver != nil {
 		c.ttlInlineObserver.ObserveRedisTTLInlineMigrationPass(h.typeName, plan.groupID, pass.outcome(), pass.startedAt)
 	}

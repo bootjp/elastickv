@@ -1,6 +1,7 @@
 package kv
 
 import (
+	"context"
 	"encoding/hex"
 	"log/slog"
 	"sync"
@@ -448,7 +449,9 @@ func (t *ActiveTimestampTracker) activeBackupPinIDCountLocked() int {
 
 func (t *ActiveTimestampTracker) logExpiredBackupPins(expired []expiredBackupPin) {
 	for _, pin := range expired {
-		t.logger.Warn("backup_pin_expired", "pin_id", pin.key.id.String(), "raft_group_id", pin.key.groupID, "read_ts", pin.ts)
+		if t.logger.Enabled(context.Background(), slog.LevelWarn) {
+			t.logger.Warn("backup_pin_expired", "pin_id", pin.key.id.String(), "raft_group_id", pin.key.groupID, "read_ts", pin.ts)
+		}
 	}
 }
 

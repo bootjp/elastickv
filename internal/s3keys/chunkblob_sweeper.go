@@ -276,8 +276,10 @@ func (s *ChunkBlobSweeper) Run(ctx context.Context) error {
 		// than a lost reclaim. Cancellation is handled above and in
 		// the select, so it is never reported as a sweep failure.
 		if err := s.SweepOnce(ctx); err != nil && !sweepCancelled(ctx) {
-			s.logger.WarnContext(ctx, "chunkblob gc sweep failed",
-				slog.String("error", err.Error()))
+			if s.logger.Enabled(ctx, slog.LevelWarn) {
+				s.logger.WarnContext(ctx, "chunkblob gc sweep failed",
+					slog.String("error", err.Error()))
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -364,8 +366,10 @@ func (s *ChunkBlobSweeper) sweepPage(
 			return failures, true
 		}
 		if err := s.sweepEntry(ctx, entry); err != nil {
-			s.logger.WarnContext(ctx, "chunkblob gc: entry failed, continuing",
-				slog.String("err", err.Error()))
+			if s.logger.Enabled(ctx, slog.LevelWarn) {
+				s.logger.WarnContext(ctx, "chunkblob gc: entry failed, continuing",
+					slog.String("err", err.Error()))
+			}
 			failures = append(failures, err)
 		}
 	}

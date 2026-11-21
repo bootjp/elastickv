@@ -523,14 +523,16 @@ func (s *Scheduler) executeSplit(
 	execCtx, cancel := context.WithTimeout(ctx, s.cfg.SplitTimeout)
 	defer cancel()
 
-	s.cfg.Logger.InfoContext(ctx, "autosplit: scheduling split",
-		slog.Uint64("route_id", routeID),
-		slog.Uint64("catalog_version", catalogVersion),
-		slog.String("split_key", loggedSplitKey(splitKey)),
-		slog.String("split_origin", string(splitOrigin)),
-		slog.Float64("score", score),
-		slog.Int("consecutive_over", consecutiveOver),
-		slog.Uint64("target_group_id", targetGroupID))
+	if s.cfg.Logger.Enabled(ctx, slog.LevelInfo) {
+		s.cfg.Logger.InfoContext(ctx, "autosplit: scheduling split",
+			slog.Uint64("route_id", routeID),
+			slog.Uint64("catalog_version", catalogVersion),
+			slog.String("split_key", loggedSplitKey(splitKey)),
+			slog.String("split_origin", string(splitOrigin)),
+			slog.Float64("score", score),
+			slog.Int("consecutive_over", consecutiveOver),
+			slog.Uint64("target_group_id", targetGroupID))
+	}
 
 	result, err := s.splitter.SplitRange(execCtx, SplitRequest{
 		ExpectedCatalogVersion: catalogVersion,
@@ -554,12 +556,14 @@ func (s *Scheduler) executeSplit(
 	if result.JobID != 0 {
 		message = "autosplit: migration job started"
 	}
-	s.cfg.Logger.InfoContext(ctx, message,
-		slog.Uint64("route_id", routeID),
-		slog.Uint64("catalog_version", result.CatalogVersion),
-		slog.Uint64("job_id", result.JobID),
-		slog.String("split_key", loggedSplitKey(splitKey)),
-		slog.String("split_origin", string(splitOrigin)))
+	if s.cfg.Logger.Enabled(ctx, slog.LevelInfo) {
+		s.cfg.Logger.InfoContext(ctx, message,
+			slog.Uint64("route_id", routeID),
+			slog.Uint64("catalog_version", result.CatalogVersion),
+			slog.Uint64("job_id", result.JobID),
+			slog.String("split_key", loggedSplitKey(splitKey)),
+			slog.String("split_origin", string(splitOrigin)))
+	}
 	return result, nil
 }
 
@@ -570,13 +574,15 @@ func (s *Scheduler) executeDecisions(ctx context.Context, catalogVersion uint64,
 		nextCatalogVersion, err := s.executeDecision(ctx, catalogVersion, decision)
 		if err != nil {
 			failed++
-			s.cfg.Logger.WarnContext(ctx, "autosplit: split failed",
-				slog.Uint64("route_id", decision.RouteID),
-				slog.Uint64("catalog_version", catalogVersion),
-				slog.String("split_key", loggedSplitKey(decision.SplitKey)),
-				slog.String("split_origin", string(decision.SplitOrigin)),
-				slog.Uint64("target_group_id", decision.TargetGroupID),
-				slog.Any("err", err))
+			if s.cfg.Logger.Enabled(ctx, slog.LevelWarn) {
+				s.cfg.Logger.WarnContext(ctx, "autosplit: split failed",
+					slog.Uint64("route_id", decision.RouteID),
+					slog.Uint64("catalog_version", catalogVersion),
+					slog.String("split_key", loggedSplitKey(decision.SplitKey)),
+					slog.String("split_origin", string(decision.SplitOrigin)),
+					slog.Uint64("target_group_id", decision.TargetGroupID),
+					slog.Any("err", err))
+			}
 			if nextCatalogVersion > catalogVersion {
 				catalogVersion = nextCatalogVersion
 			}

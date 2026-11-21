@@ -187,11 +187,13 @@ func (h *S3Handler) handleObjectGet(w http.ResponseWriter, r *http.Request, buck
 	}
 	defer func() {
 		if cerr := body.Close(); cerr != nil {
-			h.logger.LogAttrs(r.Context(), slog.LevelWarn, "admin s3 get object body close failed",
-				slog.String("bucket", bucket),
-				slog.String("key", key),
-				slog.String("error", cerr.Error()),
-			)
+			if h.logger.Enabled(r.Context(), slog.LevelWarn) {
+				h.logger.LogAttrs(r.Context(), slog.LevelWarn, "admin s3 get object body close failed",
+					slog.String("bucket", bucket),
+					slog.String("key", key),
+					slog.String("error", cerr.Error()),
+				)
+			}
 		}
 	}()
 	writeAdminObjectGetHeaders(w, meta)
@@ -200,11 +202,13 @@ func (h *S3Handler) handleObjectGet(w http.ResponseWriter, r *http.Request, buck
 		// (downloads cancelled in the browser). Log at warn rather
 		// than error so an operator can still spot a sustained
 		// pattern without alerts firing on every cancelled tab.
-		h.logger.LogAttrs(r.Context(), slog.LevelWarn, "admin s3 get object body copy failed",
-			slog.String("bucket", bucket),
-			slog.String("key", key),
-			slog.String("error", err.Error()),
-		)
+		if h.logger.Enabled(r.Context(), slog.LevelWarn) {
+			h.logger.LogAttrs(r.Context(), slog.LevelWarn, "admin s3 get object body copy failed",
+				slog.String("bucket", bucket),
+				slog.String("key", key),
+				slog.String("error", err.Error()),
+			)
+		}
 	}
 }
 
@@ -219,11 +223,13 @@ func (h *S3Handler) handleObjectPut(w http.ResponseWriter, r *http.Request, buck
 	limited := http.MaxBytesReader(w, r.Body, adminObjectUploadCap)
 	defer func() {
 		if cerr := limited.Close(); cerr != nil {
-			h.logger.LogAttrs(r.Context(), slog.LevelWarn, "admin s3 put object body close failed",
-				slog.String("bucket", bucket),
-				slog.String("key", key),
-				slog.String("error", cerr.Error()),
-			)
+			if h.logger.Enabled(r.Context(), slog.LevelWarn) {
+				h.logger.LogAttrs(r.Context(), slog.LevelWarn, "admin s3 put object body close failed",
+					slog.String("bucket", bucket),
+					slog.String("key", key),
+					slog.String("error", cerr.Error()),
+				)
+			}
 		}
 	}()
 	contentType := strings.TrimSpace(r.Header.Get("Content-Type"))
@@ -463,10 +469,12 @@ func (h *S3Handler) writeObjectsError(w http.ResponseWriter, r *http.Request, op
 		writeJSONError(w, http.StatusServiceUnavailable, "upload_throttled",
 			"this node's upload budget is exhausted; retry shortly")
 	default:
-		h.logger.LogAttrs(r.Context(), slog.LevelError, "admin s3 "+op+" object failed",
-			slog.String("bucket", bucket),
-			slog.String("error", err.Error()),
-		)
+		if h.logger.Enabled(r.Context(), slog.LevelError) {
+			h.logger.LogAttrs(r.Context(), slog.LevelError, "admin s3 "+op+" object failed",
+				slog.String("bucket", bucket),
+				slog.String("error", err.Error()),
+			)
+		}
 		writeJSONError(w, http.StatusInternalServerError, "s3_"+op+"_failed",
 			"failed to "+op+" object; see server logs")
 	}

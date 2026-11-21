@@ -118,8 +118,7 @@ func releaseCapabilityMonitorConns(release func() error) {
 		return
 	}
 	if err := release(); err != nil {
-		slog.Warn("encryption: close storage envelope capability monitor connections",
-			slog.String("error", err.Error()))
+		warnEncryptionError("encryption: close storage envelope capability monitor connections", err)
 	}
 }
 

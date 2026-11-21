@@ -1672,12 +1672,14 @@ func (e *Engine) invokeLeaderAcquiredCallback(fn func()) {
 			// leadership-refusal hook panicking in production
 			// would leave only the recovered value to grep on
 			// (gemini medium / claude finding 1 on PR #723).
-			slog.Error("etcd raft engine: leader-acquired callback panicked",
-				slog.String("node_id", e.localID),
-				slog.Uint64("raft_node_id", e.nodeID),
-				slog.Any("panic", r),
-				slog.String("stack", string(debug.Stack())),
-			)
+			if logger := slog.Default(); logger.Enabled(context.Background(), slog.LevelError) {
+				logger.Error("etcd raft engine: leader-acquired callback panicked",
+					slog.String("node_id", e.localID),
+					slog.Uint64("raft_node_id", e.nodeID),
+					slog.Any("panic", r),
+					slog.String("stack", string(debug.Stack())),
+				)
+			}
 		}
 	}()
 	fn()
@@ -1698,12 +1700,14 @@ func (e *Engine) invokeLeaderLossCallback(fn func()) {
 			// not by the slow-path re-verification. The slow path
 			// re-verifies leadership only once the lease has
 			// naturally expired.
-			slog.Error("etcd raft engine: leader-loss callback panicked",
-				slog.String("node_id", e.localID),
-				slog.Uint64("raft_node_id", e.nodeID),
-				slog.Any("panic", r),
-				slog.String("stack", string(debug.Stack())),
-			)
+			if logger := slog.Default(); logger.Enabled(context.Background(), slog.LevelError) {
+				logger.Error("etcd raft engine: leader-loss callback panicked",
+					slog.String("node_id", e.localID),
+					slog.Uint64("raft_node_id", e.nodeID),
+					slog.Any("panic", r),
+					slog.String("stack", string(debug.Stack())),
+				)
+			}
 		}
 	}()
 	fn()
@@ -2182,10 +2186,12 @@ func (e *Engine) postDispatchReport(report dispatchReport) {
 	case e.dispatchReportCh <- report:
 	case <-e.closeCh:
 	default:
-		slog.Warn("etcd raft dispatch report dropped (channel full)",
-			"to", report.to,
-			"type", report.msgType.String(),
-		)
+		if logger := slog.Default(); logger.Enabled(context.Background(), slog.LevelWarn) {
+			logger.Warn("etcd raft dispatch report dropped (channel full)",
+				"to", report.to,
+				"type", report.msgType.String(),
+			)
+		}
 	}
 }
 
@@ -5148,14 +5154,16 @@ func (e *Engine) handleDispatchRequest(ctx context.Context, req dispatchRequest)
 	code := dispatchErrorCodeOf(dispatchErr)
 	count := e.recordDispatchErrorCode(code)
 	if shouldLogDispatchEvent(count) {
-		slog.Warn("etcd raft outbound dispatch failed",
-			"node_id", e.nodeID,
-			"to", req.msg.GetTo(),
-			"type", req.msg.GetType().String(),
-			"dispatch_error_count", count,
-			"code", code,
-			"err", dispatchErr,
-		)
+		if logger := slog.Default(); logger.Enabled(context.Background(), slog.LevelWarn) {
+			logger.Warn("etcd raft outbound dispatch failed",
+				"node_id", e.nodeID,
+				"to", req.msg.GetTo(),
+				"type", req.msg.GetType().String(),
+				"dispatch_error_count", count,
+				"code", code,
+				"err", dispatchErr,
+			)
+		}
 	}
 	// Inform etcd/raft that the peer is unreachable so Progress transitions
 	// out of StateReplicate / StateSnapshot. Without this the leader keeps
@@ -5513,12 +5521,14 @@ func shouldLogDispatchEvent(count uint64) bool {
 func (e *Engine) recordDroppedDispatch(msg raftpb.Message) {
 	count := e.dispatchDropCount.Add(1)
 	if shouldLogDispatchEvent(count) {
-		slog.Warn("dropping etcd raft outbound message",
-			"node_id", e.nodeID,
-			"to", msg.GetTo(),
-			"type", msg.GetType().String(),
-			"drop_count", count,
-		)
+		if logger := slog.Default(); logger.Enabled(context.Background(), slog.LevelWarn) {
+			logger.Warn("dropping etcd raft outbound message",
+				"node_id", e.nodeID,
+				"to", msg.GetTo(),
+				"type", msg.GetType().String(),
+				"drop_count", count,
+			)
+		}
 	}
 	e.reportDroppedDispatch(msg)
 }
