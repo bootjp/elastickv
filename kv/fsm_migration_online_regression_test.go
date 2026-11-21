@@ -109,6 +109,70 @@ func TestOnlineCaptureTargetLockOnlyIsNotFresh(t *testing.T) {
 	require.ErrorIs(t, err, store.ErrKeyNotFound)
 }
 
+func TestOnlinePreparedTargetRetriesAfterUnrelatedLock(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		ready bool
+	}{{"sealed reattestation", false}, {"ready", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			st := g17OpenStore(t, t.TempDir())
+			f := g17FSM(t, st, WithRouteHistory(nil, 2))
+			source := onlineRegressionSession()
+			require.NoError(t, f.RecordAppliedConfiguration(9))
+			manifest, err := store.EncodeOnlineMigrationManifest(source)
+			require.NoError(t, err)
+			req := &pb.TargetStagedReadinessRequest{
+				JobId: source.Identity.JobID, MigrationJobId: source.Identity.JobID, Armed: true,
+				MinWriteTsExclusive: 1, RouteStart: source.RouteStart, RouteEnd: source.RouteEnd,
+				RequireConfigurationIndex: true, ExpectedConfigurationIndex: 9,
+				OnlineCaptureVersion: store.OnlineMigrationVersion, OnlineTargetManifest: manifest,
+			}
+			apply := func(index uint64) any {
+				t.Helper()
+				cmd, err := MarshalTargetStagedReadinessCommand(req)
+				require.NoError(t, err)
+				f.SetApplyIndex(index)
+				return f.Apply(cmd)
+			}
+			target := func() store.OnlineMigrationTarget {
+				t.Helper()
+				state, err := store.ReadOnlineMigrationTarget(ctx, st, req.GetJobId())
+				require.NoError(t, err)
+				return state
+			}
+			require.Nil(t, apply(10))
+			prepared := target()
+			require.False(t, prepared.Ready)
+
+			require.NoError(t, f.RecordAppliedConfiguration(11))
+			source.Sealed = true
+			req.OnlineTargetManifest, err = store.EncodeOnlineMigrationManifest(source)
+			require.NoError(t, err)
+			req.ExpectedConfigurationIndex = 11
+			req.OnlineReady = tc.ready
+			key := []byte("a") // Outside the moving range [m, z).
+			require.NoError(t, st.PutAt(ctx, txnLockKey(key), encodeTxnLock(txnLock{PrimaryKey: key, StartTS: 5}), 5, 0))
+			for index := uint64(12); index < 18; index++ {
+				requireOnlineVerdict(t, apply(index), ErrTxnLocked)
+			}
+			require.Equal(t, prepared, target())
+			require.NoError(t, st.DeleteAt(ctx, txnLockKey(key), 6))
+			require.Nil(t, apply(18))
+			state := target()
+			require.Equal(t, uint64(11), state.ConfigurationIndex)
+			require.Equal(t, tc.ready, state.Ready)
+			if !tc.ready {
+				req.OnlineReady = true
+				require.Nil(t, apply(19))
+			}
+			state = target()
+			require.True(t, state.Ready)
+			require.Equal(t, source, state.Source)
+		})
+	}
+}
+
 func TestOnlineSealRetryWithUnrelatedLock(t *testing.T) {
 	for _, tc := range []struct {
 		name   string

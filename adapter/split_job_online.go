@@ -138,7 +138,10 @@ func (pass *onlineSplitPass) advance(ctx context.Context, server *DistributionSe
 	for _, effect := range frame.Entry.Effects {
 		pass.next.MaxImportedTS = max(pass.next.MaxImportedTS, effect.CommitTS)
 	}
-	return len(page.GetOnlineFrame()), false, nil
+	// The exported head is a finite catch-up goal. Writers may append before
+	// the next export; the subsequent durable fence/seal captures that tail.
+	caughtUp := job.Phase == distribution.SplitJobPhaseFence && frame.Sequence == manifest.Sequence
+	return len(page.GetOnlineFrame()), caughtUp, nil
 }
 
 // Before importing a sealed tail, bind the existing target to its current

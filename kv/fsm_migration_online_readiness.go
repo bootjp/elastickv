@@ -75,7 +75,7 @@ func validOnlineTrackerRequest(req *pb.TargetStagedReadinessRequest) bool {
 }
 
 func (f *kvFSM) startOnlineSourceTracker(ctx context.Context, req *pb.TargetStagedReadinessRequest, lineage [sha256LineageBytes]byte) error {
-	if err := f.checkOnlineMigrationLocks(ctx, req); err != nil {
+	if err := f.checkOnlineMigrationLocks(ctx, ErrTxnLocked); err != nil {
 		return err
 	}
 	identity := store.MigrationCaptureIdentity{SourceGroupID: f.shardGroupID, JobID: req.GetJobId(), Generation: 1, Index: f.pendingApplyIdx, Lineage: lineage}
@@ -107,7 +107,7 @@ func (f *kvFSM) applyOnlineSourceSeal(ctx context.Context, req *pb.TargetStagedR
 	// Locks elsewhere in the group may have appeared since the durable seal.
 	// Drain the whole group on first seal only.
 	if !session.Sealed {
-		if err := f.checkOnlineMigrationLocks(ctx, req); err != nil {
+		if err := f.checkOnlineMigrationLocks(ctx, ErrTxnLocked); err != nil {
 			return err
 		}
 	}
@@ -157,7 +157,12 @@ func (f *kvFSM) applyOnlineTargetReadiness(ctx context.Context, req *pb.TargetSt
 	if source.Identity.JobID != req.GetJobId() || source.Identity.SourceGroupID == f.shardGroupID || !onlineRangeMatches(req.GetRouteStart(), req.GetRouteEnd(), source) {
 		return errors.WithStack(store.ErrOnlineMigrationIdentity)
 	}
-	if err := f.checkOnlineMigrationLocks(ctx, req); err != nil {
+	lockConflict := ErrTxnLocked
+	if !source.Sealed && !req.GetOnlineReady() {
+		// Initial preparation requires a fresh target. Later phases wait for locks to drain.
+		lockConflict = store.ErrOnlineMigrationTargetNotEmpty
+	}
+	if err := f.checkOnlineMigrationLocks(ctx, lockConflict); err != nil {
 		return err
 	}
 	if !req.GetOnlineReady() {
@@ -182,16 +187,13 @@ func (f *kvFSM) prepareOnlineTarget(ctx context.Context, req *pb.TargetStagedRea
 	return onlineReadinessResponseError(f.applyTargetStagedReadinessRequest(ctx, req))
 }
 
-func (f *kvFSM) checkOnlineMigrationLocks(ctx context.Context, req *pb.TargetStagedReadinessRequest) error {
+func (f *kvFSM) checkOnlineMigrationLocks(ctx context.Context, lockConflict error) error {
 	pending, err := PendingTxnLocksInRoute(ctx, f.store, nil, nil, ^uint64(0), 1)
 	if err != nil {
 		return errors.WithStack(err)
 	}
 	if len(pending) != 0 {
-		if len(req.GetOnlineTargetManifest()) != 0 {
-			return errors.WithStack(store.ErrOnlineMigrationTargetNotEmpty)
-		}
-		return errors.WithStack(ErrTxnLocked)
+		return errors.WithStack(lockConflict)
 	}
 	return nil
 }

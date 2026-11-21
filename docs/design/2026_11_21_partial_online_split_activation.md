@@ -105,7 +105,9 @@ online protocol before their membership authorization is committed.
 
 A runner catch-up pass processes at most 128 frames, 200 ms and 4 MiB; it
 checkpoints accepted receipts once per pass. Online progress uses a 10 ms
-continuation delay. Once caught up, it reloads and readmits the job before
+continuation delay. ACK of the exported head is sufficient for catch-up even when a writer appends
+before the next export. A subsequent seal captures that remaining tail.
+Once caught up, it reloads and readmits the job before
 fencing in the same attempt, so continuous writers do not require an idle tick.
 RawKV handoff waiting is limited to two seconds, 256 concurrent waiters and
 8 MiB including waiter overhead. Cancellation before another dispatch retains
@@ -118,3 +120,7 @@ a fresh dedicated target. Collection and transactional entries conservatively
 abort capture; encrypted journal key retention is not implemented. This does
 not enable the automatic scheduler or provision groups. Larger journals,
 general target reuse and broader failure/performance campaigns are future work.
+
+A target lock is a freshness violation during initial preparation. After a
+source seal, transient locks keep target reattestation/Ready retryable instead
+of terminalizing the job. State and receipts remain unchanged until they drain.

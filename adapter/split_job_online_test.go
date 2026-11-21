@@ -135,3 +135,71 @@ func TestOnlineSplitLostInitialTrackerResponsePreservesGeneration(t *testing.T) 
 	require.Equal(t, before.Identity, after.Identity)
 	require.Equal(t, before.StartIndex, after.StartIndex)
 }
+
+type writeAfterOnlineImport struct {
+	SplitMigrationClient
+	write func()
+}
+
+func (c writeAfterOnlineImport) ImportRangeVersions(ctx context.Context, req *pb.ImportRangeVersionsRequest, opts ...grpc.CallOption) (*pb.ImportRangeVersionsResponse, error) {
+	response, err := c.SplitMigrationClient.ImportRangeVersions(ctx, req, opts...)
+	if err == nil && len(req.GetOnlineFrame()) != 0 {
+		c.write()
+	}
+	return response, err
+}
+
+func TestOnlineSplitFencesWithWriterBetweenEveryFrameAckAndExport(t *testing.T) {
+	t.Parallel()
+	r := newResplitAcceptanceRuntime(t)
+	snapshot, err := r.server.catalog.Snapshot(t.Context())
+	require.NoError(t, err)
+	started, err := r.client.StartSplitMigration(t.Context(), &pb.StartSplitMigrationRequest{ExpectedCatalogVersion: snapshot.Version, RouteId: 1, TargetGroupId: 2, SplitKey: []byte("m")})
+	require.NoError(t, err)
+	var job distribution.SplitJob
+	for range 200 {
+		require.NoError(t, r.server.RunSplitJobRunnerOnce(t.Context()))
+		var found bool
+		job, found, err = r.server.catalog.SplitJob(t.Context(), started.JobId)
+		require.NoError(t, err)
+		require.True(t, found)
+		if job.Phase == distribution.SplitJobPhaseFence && job.TransferPreflightDone {
+			break
+		}
+	}
+	require.Equal(t, distribution.SplitJobPhaseFence, job.Phase)
+	require.True(t, job.TransferPreflightDone)
+	require.NoError(t, r.put(t, 1, "n", "seed", 100))
+	writes := uint64(0)
+	original := r.server.splitMigrationClientFactory
+	r.server.splitMigrationClientFactory = func(ctx context.Context, job distribution.SplitJob, group uint64) (SplitMigrationClient, SplitMigrationClient, error) {
+		source, target, err := original(ctx, job, group)
+		if job.Phase == distribution.SplitJobPhaseFence {
+			target = writeAfterOnlineImport{SplitMigrationClient: target, write: func() {
+				writes++
+				require.NoError(t, r.put(t, 1, "n", "between-frames", 100+writes))
+			}}
+		}
+		return source, target, err
+	}
+	for range 5 {
+		require.NoError(t, r.server.RunSplitJobRunnerOnce(t.Context()))
+		job, _, err = r.server.catalog.SplitJob(t.Context(), started.JobId)
+		require.NoError(t, err)
+		if job.Phase != distribution.SplitJobPhaseFence {
+			break
+		}
+	}
+	require.Positive(t, writes)
+	require.NotEqual(t, distribution.SplitJobPhaseFence, job.Phase, "ACK of the exported head must permit fencing despite the newly appended frame")
+	for range 200 {
+		if job.Phase == distribution.SplitJobPhaseDone {
+			break
+		}
+		require.NoError(t, r.server.RunSplitJobRunnerOnce(t.Context()))
+		job, _, err = r.server.catalog.SplitJob(t.Context(), started.JobId)
+		require.NoError(t, err)
+	}
+	require.Equal(t, distribution.SplitJobPhaseDone, job.Phase)
+	r.read(t, "n", "between-frames")
+}
