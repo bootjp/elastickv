@@ -549,11 +549,12 @@ type Engine struct {
 	leaderAcquiredCbsMu sync.Mutex
 	leaderAcquiredCbs   []leaderAcquiredSlot
 
-	pendingProposals map[uint64]proposalRequest
-	pendingReads     map[uint64]readRequest
-	pendingConfigs   map[uint64]adminRequest
-	snapshotInFlight bool
-	dispatchFn       func(context.Context, dispatchRequest) error
+	pendingProposals   map[uint64]proposalRequest
+	pendingReads       map[uint64]readRequest
+	pendingReadBatches map[uint64]*readIndexBatch
+	pendingConfigs     map[uint64]adminRequest
+	snapshotInFlight   bool
+	dispatchFn         func(context.Context, dispatchRequest) error
 }
 
 type adminAction byte
@@ -613,6 +614,7 @@ type readRequest struct {
 	done        chan readResult
 	target      uint64
 	waitApplied bool
+	batch       *readIndexBatch // protected by Engine.pending
 }
 
 type readResult struct {
@@ -2078,7 +2080,7 @@ func (e *Engine) handleBlockingEvent(tick <-chan time.Time) (bool, error) { //no
 	case req := <-e.proposeCh:
 		e.handleProposal(req)
 	case req := <-e.readCh:
-		e.handleRead(req)
+		e.handleReadQueue(req)
 	case req := <-e.adminCh:
 		e.handleAdmin(req)
 	case msg := <-e.priorityStepCh:
@@ -2238,18 +2240,8 @@ func (e *Engine) handleRead(req readRequest) {
 		req.done <- readResult{err: err}
 		return
 	}
-	if !e.readRoleAllowed(req.recovery) {
-		req.done <- readResult{err: errors.WithStack(errNotLeader)}
-		return
-	}
-	// etcd/raft silently drops MsgReadIndex while a leadership transfer
-	// is in flight (LeadTransferee != 0) -- ReadIndex does not return an
-	// error on drop, so without this fast-fail the caller would block on
-	// req.done until ctx deadline. Surface the drop as
-	// ErrLeadershipTransferInProgress so LeaseRead falls through to the
-	// new leader instead of stalling ~electionTimeout.
-	if e.rawNode.BasicStatus().LeadTransferee != 0 {
-		req.done <- readResult{err: errors.WithStack(errLeadershipTransferInProgress)}
+	if err := e.checkReadAdmission(req.recovery); err != nil {
+		req.done <- readResult{err: err}
 		return
 	}
 	e.storePendingRead(req)
@@ -2264,6 +2256,18 @@ func (e *Engine) handleRead(req readRequest) {
 		e.cancelPendingRead(req.id)
 		req.done <- readResult{err: err}
 	}
+}
+
+func (e *Engine) checkReadAdmission(recovery bool) error {
+	if !e.readRoleAllowed(recovery) {
+		return errors.WithStack(errNotLeader)
+	}
+	// etcd/raft silently drops MsgReadIndex during leadership transfer.
+	// Return a verdict so callers can resolve the new leader immediately.
+	if e.rawNode.BasicStatus().LeadTransferee != 0 {
+		return errors.WithStack(errLeadershipTransferInProgress)
+	}
+	return nil
 }
 
 func (e *Engine) handleAdmin(req adminRequest) {
@@ -2494,7 +2498,12 @@ func (e *Engine) checkGatedTransferTarget(req adminRequest, target Peer) error {
 }
 
 func (e *Engine) drainReady() error {
-	for e.rawNode.HasReady() {
+	if !e.rawNode.HasReady() {
+		// Contacts and transfer state can change without emitting a Ready.
+		e.refreshStatus()
+		return nil
+	}
+	for {
 		rd := e.rawNode.Ready()
 		e.invalidateNativeAuthority()
 		if err := e.persistReady(rd); err != nil {
@@ -2515,9 +2524,10 @@ func (e *Engine) drainReady() error {
 		}
 		e.refreshStatus()
 		e.resolveReadyReads()
+		if !e.rawNode.HasReady() {
+			return nil
+		}
 	}
-	e.refreshStatus()
-	return nil
 }
 
 func (e *Engine) persistReady(rd etcdraft.Ready) error {
@@ -2585,7 +2595,7 @@ func (e *Engine) handleStepWithAdmission(msg raftpb.Message, request *raftengine
 	if e.rawNode == nil {
 		return
 	}
-	commitBeforeStep := e.rawNode.Status().GetCommit()
+	commitBeforeStep := e.rawNode.BasicStatus().GetCommit()
 	err := e.mutateNative(context.Background(), request, msg.GetType() == raftpb.MsgSnap, func() error {
 		return admit(func() error {
 			e.recordLeaderContact(msg)
@@ -4058,17 +4068,7 @@ func (e *Engine) handleReadStates(states []etcdraft.ReadState) {
 		if !ok {
 			continue
 		}
-		req, ok := e.pendingRead(id)
-		if !ok {
-			continue
-		}
-		req.target = state.Index
-		if !req.waitApplied {
-			e.popPendingRead(id)
-			req.done <- readResult{index: state.Index}
-			continue
-		}
-		e.storePendingRead(req)
+		e.recordReadIndex(id, state.Index)
 	}
 }
 
@@ -4126,12 +4126,11 @@ func (e *Engine) refreshStatus() {
 	e.mu.RLock()
 	oldStatus := e.status
 	previous := oldStatus.State
+	numPeers := numRemoteServers(e.config.Servers, e.localID)
 	e.mu.RUnlock()
 	basic := e.rawNode.BasicStatus()
 	lastLogIndex, _ := e.storage.LastIndex()
 	lastSnapshotIndex, _ := e.storedSnapshotIndex()
-	config := e.currentConfiguration()
-
 	state := translateState(basic.RaftState)
 	leader := e.leaderInfo(basic.Lead)
 
@@ -4144,7 +4143,7 @@ func (e *Engine) refreshStatus() {
 		LastLogIndex:       lastLogIndex,
 		LastSnapshotIndex:  lastSnapshotIndex,
 		FSMPending:         pendingEntries(basic.GetCommit(), e.applied),
-		NumPeers:           numRemoteServers(config.Servers, e.localID),
+		NumPeers:           numPeers,
 		LastContact:        lastContactFor(state, basic.Lead, e.lastLeaderContactFrom, e.lastLeaderContactAt),
 		ConfigurationIndex: e.currentConfigIndex(),
 		LeadTransferee:     basic.LeadTransferee,
@@ -4343,21 +4342,17 @@ func (e *Engine) pendingRead(id uint64) (readRequest, bool) {
 	return req, ok
 }
 
-func (e *Engine) popPendingRead(id uint64) (readRequest, bool) {
-	e.pending.Lock()
-	defer e.pending.Unlock()
-	req, ok := e.pendingReads[id]
-	if ok {
-		delete(e.pendingReads, id)
-	}
-	return req, ok
-}
-
 func (e *Engine) cancelPendingRead(id uint64) {
 	if id == 0 {
 		return
 	}
 	e.pending.Lock()
+	if req := e.pendingReads[id]; req.batch != nil {
+		req.batch.remaining--
+		if req.batch.remaining == 0 {
+			delete(e.pendingReadBatches, req.batch.ids[0])
+		}
+	}
 	delete(e.pendingReads, id)
 	e.pending.Unlock()
 }
@@ -4420,6 +4415,7 @@ func (e *Engine) drainPending() ([]proposalRequest, []readRequest, []adminReques
 		delete(e.pendingReads, id)
 		reads = append(reads, req)
 	}
+	clear(e.pendingReadBatches)
 	configs := make([]adminRequest, 0, len(e.pendingConfigs))
 	for id, req := range e.pendingConfigs {
 		delete(e.pendingConfigs, id)
