@@ -140,3 +140,51 @@ func TestCommittedWatermarkDoesNotWaitForUnrelatedWALSync(t *testing.T) {
 		})
 	}
 }
+
+func TestHistoricalReadWaitsForLowTimestampWALSync(t *testing.T) {
+	for _, scoped := range []bool{false, true} {
+		for _, commitTS := range []uint64{5, 7, 10} {
+			t.Run(fmt.Sprintf("entry=%t/ts=%d", scoped, commitTS), func(t *testing.T) {
+				s, fs, release := newRaftDataWALSyncStore(t)
+				require.NoError(t, s.ApplyMutationsRaftAt(t.Context(), raftEntryPut("key", "old"), nil, 5, 5, 1))
+				require.NoError(t, s.ApplyMutationsRaftAt(t.Context(), raftEntryPut("seed", "v"), nil, 10, 10, 2))
+				fs.armed.Store(true)
+				done := make(chan error, 1)
+				go func() {
+					apply := func(ctx context.Context) error {
+						return s.ApplyMutationsRaftAt(ctx, raftEntryPut("key", "new"), nil, commitTS, commitTS, 3)
+					}
+					if scoped {
+						done <- s.ApplyRaftEntry(t.Context(), 3, apply)
+					} else {
+						done <- apply(t.Context())
+					}
+				}()
+				select {
+				case <-fs.entered:
+				case err := <-done:
+					t.Fatalf("apply did not wait for WAL sync: %v", err)
+				case <-time.After(time.Second):
+					t.Fatal("WAL sync was not reached")
+				}
+				read := make(chan error, 1)
+				go func() { _, err := s.GetAt(t.Context(), []byte("key"), 10); read <- err }()
+				early := false
+				select {
+				case <-read:
+					early = true
+					t.Error("historical read bypassed the low-timestamp publication guard")
+				case <-time.After(100 * time.Millisecond):
+				}
+				release()
+				require.NoError(t, <-done)
+				if !early {
+					require.NoError(t, <-read)
+				}
+				value, err := s.GetAt(t.Context(), []byte("key"), 10)
+				require.NoError(t, err)
+				require.Equal(t, []byte("new"), value)
+			})
+		}
+	}
+}
