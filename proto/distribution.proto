@@ -205,6 +205,10 @@ message SplitJob {
   bool transfer_preflight_done = 39;
   // Durable moving child created with its same-owner partition manifest.
   uint64 working_source_route_id = 40;
+  uint32 online_capture_version = 41;
+  uint64 online_sequence = 42;
+  uint64 online_seal_sequence = 43;
+  bytes online_manifest = 44;
 }
 
 message ListRoutesRequest {}

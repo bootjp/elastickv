@@ -335,7 +335,7 @@ func (t *TransactionManager) commitRawOwned(ctx context.Context, reqs []*pb.Requ
 		return nil, err
 	}
 	if err := combineApplyErrors(results); err != nil {
-		return nil, err
+		return nil, rawIndexedMigrationRejection(reqs, index, err)
 	}
 	return &TransactionResponse{CommitIndex: index}, nil
 }
@@ -428,7 +428,7 @@ func (t *TransactionManager) applyRawBatch(batch []*rawCommitItem) {
 	for i, item := range batch {
 		itemErr := combineApplyErrors(results[offsets[i]:offsets[i+1]])
 		if itemErr != nil {
-			item.done <- rawCommitResult{err: itemErr}
+			item.done <- rawCommitResult{err: rawIndexedMigrationRejection(item.reqs, idx, itemErr)}
 			continue
 		}
 		item.done <- rawCommitResult{commitIndex: idx}

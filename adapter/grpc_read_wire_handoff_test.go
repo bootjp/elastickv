@@ -1,0 +1,47 @@
+package adapter
+
+import (
+	"context"
+	"net"
+	"testing"
+
+	pb "github.com/bootjp/elastickv/proto"
+	"github.com/bootjp/elastickv/store"
+	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/test/bufconn"
+)
+
+type forwardedReadStore struct {
+	store.MVCCStore
+	client pb.RawKVClient
+}
+
+func (s *forwardedReadStore) GetAtWithReadFence(ctx context.Context, key []byte, ts, _, _ uint64) ([]byte, error) {
+	response, err := s.client.RawGet(ctx, &pb.RawGetRequest{Key: key, Ts: ts, GroupId: 1, ReadRouteVersion: 1})
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return response.GetValue(), nil
+}
+func TestRawGetRetriesCutoverAcrossGRPCForwarding(t *testing.T) {
+	source := &handoffReadStore{MVCCStore: store.NewMVCCStore()}
+	listener := bufconn.Listen(1 << 20)
+	server := grpc.NewServer()
+	pb.RegisterRawKVServer(server, NewGRPCServer(source, &stubAdapterCoordinator{}))
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(server.Stop)
+	conn, err := grpc.NewClient("passthrough:///read-handoff", grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+		connection, err := listener.DialContext(ctx)
+		return connection, errors.WithStack(err)
+	}))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, conn.Close()) })
+	ingress := NewGRPCServer(&forwardedReadStore{MVCCStore: store.NewMVCCStore(), client: pb.NewRawKVClient(conn)}, &stubAdapterCoordinator{})
+	response, err := ingress.RawGet(t.Context(), &pb.RawGetRequest{Key: []byte("n"), Ts: 1})
+	require.NoError(t, err)
+	require.Equal(t, []byte("v"), response.GetValue())
+	require.Equal(t, 2, source.attempts)
+}

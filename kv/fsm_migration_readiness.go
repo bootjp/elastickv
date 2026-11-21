@@ -38,6 +38,9 @@ func (f *kvFSM) applyTargetStagedReadiness(ctx context.Context, data []byte) any
 			req.GetExpectedConfigurationIndex() != f.AppliedConfigurationIndex()) {
 		return errors.WithStack(ErrMigrationConfigurationChanged)
 	}
+	if req.GetOnlineCaptureVersion() != 0 {
+		return f.applyOnlineMigrationReadiness(ctx, req)
+	}
 	return f.applyTargetStagedReadinessRequest(ctx, req)
 }
 

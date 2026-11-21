@@ -1,0 +1,2 @@
+ok  	github.com/bootjp/elastickv/internal/filesystem	95.094s
+ok  	github.com/bootjp/elastickv/internal/filesystem/fuseadapter	9.319s

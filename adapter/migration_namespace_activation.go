@@ -161,7 +161,7 @@ func probeNamespaceJoining(ctx context.Context, configuration uint64, joining []
 			return nil, err
 		}
 		ids[member.MemberID], addresses[member.Address] = true, true
-		capabilities = append(capabilities, kv.NamespaceMemberCapability{MemberID: member.MemberID, Version: response.GetNamespaceAdmissionVersion(), ConfigurationIndex: configuration})
+		capabilities = append(capabilities, kv.NamespaceMemberCapability{MemberID: member.MemberID, Version: response.GetNamespaceAdmissionVersion(), ConfigurationIndex: configuration, OnlineCaptureVersion: response.GetOnlineCaptureVersion()})
 	}
 	return capabilities, nil
 }

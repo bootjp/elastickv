@@ -1,0 +1,3 @@
+    performance_split_timing_test.go:30: PERF preflight-duration lower_ms=3599.952 upper_ms=3620.687
+    performance_load_ramp_test.go:147: [DEBUG-remaining-outcome] total=map[public=Unavailable fence=false cutover=true unknown=false forward=none:66 public=Unavailable fence=true cutover=false unknown=false forward=none:4272 public=Unknown fence=false cutover=false unknown=true forward=FORWARD_FAILURE_REASON_INTERRUPTED/FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN:1 public=Unknown fence=false cutover=true unknown=false forward=none:1]
+--- PASS: TestLinuxSplitLoadRamp (393.38s)

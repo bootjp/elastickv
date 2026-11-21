@@ -135,6 +135,10 @@ type SplitJobBracketProgress struct {
 
 // SplitJob is the durable default-group state for a range split migration.
 type SplitJob struct {
+	OnlineCaptureVersion             uint32
+	OnlineSequence                   uint64
+	OnlineSealSequence               uint64
+	OnlineManifest                   []byte
 	TransferPreflightVersion         uint32
 	TransferPreflightTS              uint64
 	TransferPreflightProgress        []SplitJobBracketProgress
@@ -596,7 +600,10 @@ func validateSplitJob(job SplitJob) error {
 	if err := validateSplitJobBracketProgress(job.BracketProgress); err != nil {
 		return err
 	}
-	return validateSplitJobBracketProgress(job.TransferPreflightProgress)
+	if err := validateSplitJobBracketProgress(job.TransferPreflightProgress); err != nil {
+		return err
+	}
+	return validateOnlineSplitJob(job)
 }
 
 func validateSplitJobPhases(job SplitJob) error {
@@ -932,6 +939,7 @@ func splitJobLess(left, right SplitJob) bool {
 
 func CloneSplitJob(job SplitJob) SplitJob {
 	return SplitJob{
+		OnlineCaptureVersion: job.OnlineCaptureVersion, OnlineSequence: job.OnlineSequence, OnlineSealSequence: job.OnlineSealSequence, OnlineManifest: CloneBytes(job.OnlineManifest),
 		TransferPreflightVersion:         job.TransferPreflightVersion,
 		TransferPreflightTS:              job.TransferPreflightTS,
 		TransferPreflightProgress:        cloneSplitJobBracketProgress(job.TransferPreflightProgress),
@@ -983,6 +991,7 @@ func SplitJobToProto(job SplitJob) *pb.SplitJob {
 func splitJobToProto(job SplitJob) *pb.SplitJob {
 	job = CloneSplitJob(job)
 	return &pb.SplitJob{
+		OnlineCaptureVersion: job.OnlineCaptureVersion, OnlineSequence: job.OnlineSequence, OnlineSealSequence: job.OnlineSealSequence, OnlineManifest: job.OnlineManifest,
 		TransferPreflightVersion:         job.TransferPreflightVersion,
 		TransferPreflightTs:              job.TransferPreflightTS,
 		TransferPreflightProgress:        splitJobBracketProgressToProto(job.TransferPreflightProgress),
@@ -1059,6 +1068,7 @@ func splitJobFromProto(msg *pb.SplitJob) (SplitJob, error) {
 		return SplitJob{}, err
 	}
 	return SplitJob{
+		OnlineCaptureVersion: msg.GetOnlineCaptureVersion(), OnlineSequence: msg.GetOnlineSequence(), OnlineSealSequence: msg.GetOnlineSealSequence(), OnlineManifest: CloneBytes(msg.GetOnlineManifest()),
 		JobID:                            msg.GetJobId(),
 		SourceRouteID:                    msg.GetSourceRouteId(),
 		WorkingSourceRouteID:             msg.GetWorkingSourceRouteId(),

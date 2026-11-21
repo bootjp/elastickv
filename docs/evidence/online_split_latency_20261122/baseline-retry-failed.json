@@ -1,0 +1,33 @@
+{
+  "source_commit": "8c2282837ecee54d51c664c67576a8f90e5f90e4",
+  "fixture_exit": 1,
+  "status": "Split did not reach Done within the fixture deadline; catalog split job conflicts were logged",
+  "last_phase": 3,
+  "split_completed": false,
+  "ack_audit_completed": false,
+  "post_done_checks_completed": false,
+  "reported_write_success_without_final_audit": 46166,
+  "primary_trace_matches_all_stage_metrics": true,
+  "common_rate_window": {
+    "seconds": 62.0,
+    "read": {
+      "attempts": 9003,
+      "success": 9003,
+      "ops_s": 145.20967741935485,
+      "success_p99_ms": 68.606769,
+      "all_p99_ms": 68.606769,
+      "errors": {}
+    },
+    "write": {
+      "attempts": 8985,
+      "success": 8985,
+      "ops_s": 144.91935483870967,
+      "success_p99_ms": 189.566875,
+      "all_p99_ms": 189.566875,
+      "errors": {}
+    }
+  },
+  "phase_clock_offset_spread_ms": 2.333105,
+  "dropped_capacity": 69321,
+  "dropped_scheduler": 9369
+}

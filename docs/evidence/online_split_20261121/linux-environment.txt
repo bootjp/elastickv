@@ -1,0 +1,9 @@
+Linux 6.8.0-149-generic x86_64 GNU/Linux
+8
+               total        used        free      shared  buff/cache   available
+Mem:      8325488640   594591744  7461793792     1077248   521019392  7730896896
+Swap:              0           0           0
+Filesystem     Type 1K-blocks    Used Available Use% Mounted on
+/dev/vda1      ext4  47660024 9884848  37758792  21% /
+a0a379b09cc1cdb2cafa5eeba2c334e44b7345aa1cfbcfa355f56af643504cb7  /tmp/baseline-server-linux.test
+8068a61694d20f0b1d383daee1123db664cd85b46380edf47bc385cb09a70483  /tmp/loadtest-linux

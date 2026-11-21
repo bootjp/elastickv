@@ -690,6 +690,10 @@ func (s *pebbleStore) clearMigrationStateWithOwnershipLocked(jobID, appliedIndex
 	}
 	batch := s.db.NewBatch()
 	defer batch.Close()
+	onlineCleanup, err := s.stageOnlineMigrationCleanup(batch, jobID, appliedIndex)
+	if err != nil {
+		return err
+	}
 	if err := stageMigrationMetadataCleanup(batch, jobID, appliedIndex, metadata); err != nil {
 		return err
 	}
@@ -702,7 +706,11 @@ func (s *pebbleStore) clearMigrationStateWithOwnershipLocked(jobID, appliedIndex
 	if err := s.stagePartitionAppliedIndex(batch, appliedIndex); err != nil {
 		return err
 	}
-	if err := batch.Commit(s.cleanupWriteOpts(appliedIndex)); err != nil {
+	writeOpts := s.cleanupWriteOpts(appliedIndex)
+	if onlineCleanup {
+		writeOpts = pebble.Sync
+	}
+	if err := batch.Commit(writeOpts); err != nil {
 		return errors.WithStack(err)
 	}
 	s.mtx.Lock()

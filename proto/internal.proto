@@ -209,12 +209,17 @@ message ExportRangeVersionsRequest {
   // Optional response-page limit. Zero preserves the full streaming export.
   // A limited response keeps done=false and next_cursor when more data exists.
   uint32 max_pages = 13;
+  // Online capture export returns one durable sequential frame.
+  uint64 online_job_id = 14;
+  uint64 online_after_sequence = 15;
 }
 
 message ExportRangeVersionsResponse {
   repeated MVCCVersion versions = 1;
   bytes next_cursor = 2;
   bool done = 3;
+  bytes online_manifest = 4;
+  bytes online_frame = 5;
 }
 
 message MVCCVersion {
@@ -232,6 +237,8 @@ message ImportRangeVersionsRequest {
   bytes cursor = 3;
   uint64 bracket_id = 4;
   uint64 batch_seq = 5;
+  bytes online_manifest = 6;
+  bytes online_frame = 7;
 }
 
 message ImportRangeVersionsResponse {
@@ -277,10 +284,19 @@ message TargetStagedReadinessRequest {
   uint32 transfer_size_guard_version = 13;
   bool require_configuration_index = 14;
   uint64 expected_configuration_index = 15;
+  uint32 online_capture_version = 16;
+  bytes online_lineage = 17;
+  bytes online_target_manifest = 18;
+  bool online_ready = 19;
+  uint64 online_sequence = 20;
+  bool online_seal = 21;
+  // Durable nonce discovery if the first capture response is lost.
+  string online_source_generation = 22;
 }
 
 message TargetStagedReadinessResponse {
   uint64 min_admitted_ts = 1;
+  uint64 online_sequence = 2;
 }
 
 message ProbeMigrationLocksRequest {
@@ -407,6 +423,11 @@ message ProbeMigrationStateRequest {
   MigrationOwnershipProof ownership = 17;
   uint32 transfer_size_guard_version = 18;
   bytes partition_transition = 19;
+  uint32 online_capture_version = 20;
+  uint64 online_sequence = 21;
+  bool online_ready = 22;
+  // Canonical, immutable source seal required by the current apply members.
+  bytes online_sealed_manifest = 23;
 }
 
 message ProbeMigrationStateResponse {
@@ -426,6 +447,9 @@ message ProbeMigrationStateResponse {
   // Installed support only; the durable group activation is separately probed.
   uint32 namespace_admission_version = 11;
   bytes partition_receipt_id = 12;
+  uint32 online_capture_version = 13;
+  // Resume nonce for this job's capture session before ownership activation.
+  string online_source_generation = 14;
 }
 
 message IssueMigrationTimestampRequest {}

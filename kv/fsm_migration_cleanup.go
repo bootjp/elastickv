@@ -67,7 +67,13 @@ func (f *kvFSM) applyMigrationCleanupRequest(ctx context.Context, req *pb.Cleanu
 	if req.GetMode() == pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_METADATA {
 		return f.applyLegacyMigrationMetadataClear(ctx, cleaner, req.GetJobId())
 	}
-	result, err := cleaner.CleanupVersions(ctx, migrationCleanupOptionsFromProto(req, f.pendingApplyIdx))
+	guard, err := f.onlineMaintenanceGuard(ctx, req)
+	if err != nil {
+		return haltErr(errors.Mark(err, ErrMigrationCleanupApply))
+	}
+	opts := migrationCleanupOptionsFromProto(req, f.pendingApplyIdx)
+	opts.OnlineGuard = guard
+	result, err := cleaner.CleanupVersions(ctx, opts)
 	if err != nil {
 		if isMigrationCleanupOrdinaryApplyError(err) {
 			return errors.Wrap(err, "kv/fsm: apply migration cleanup")
@@ -96,7 +102,7 @@ func (f *kvFSM) applyLegacyMigrationMetadataClear(ctx context.Context, cleaner s
 // (Pebble read, decrypt, batch, commit), which must halt rather than let this
 // voter skip a committed cleanup.
 func isMigrationCleanupOrdinaryApplyError(err error) bool {
-	return errors.Is(err, store.ErrMigrationRetired) ||
+	return errors.Is(err, store.ErrOnlineMigrationSealed) || errors.Is(err, store.ErrMigrationRetired) ||
 		errors.Is(err, ErrInvalidRequest) ||
 		errors.Is(err, store.ErrInvalidImportVersion) ||
 		// A malformed or out-of-range cursor is decided from the request alone,

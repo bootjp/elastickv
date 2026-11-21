@@ -1,0 +1,27 @@
+    performance_load_ramp_test.go:152: LOAD split_start stage=1 offered_rps=300 stage_started=2026-11-21T08:08:31.139877048Z
+    performance_load_ramp_test.go:152: LOAD split_same_done version=2
+    performance_load_ramp_test.go:152: PERF migration elapsed_ms=42 phase=1 last_error=""
+    performance_load_ramp_test.go:152: PERF migration elapsed_ms=850 phase=2 last_error=""
+    performance_load_ramp_test.go:152: PERF migration elapsed_ms=49687 phase=3 last_error=""
+    performance_split_timing_test.go:30: PERF preflight-duration lower_ms=2859.574 upper_ms=2880.506
+    performance_split_timing_test.go:30: PERF preflight-work families=46 completed=46 versions=4362
+    performance_load_ramp_test.go:152: PERF migration elapsed_ms=53701 phase=4 last_error=""
+    performance_load_ramp_test.go:152: PERF migration elapsed_ms=100842 phase=5 last_error=""
+    performance_load_ramp_test.go:152: PERF migration elapsed_ms=104887 phase=6 last_error=""
+    performance_load_ramp_test.go:152: PERF migration elapsed_ms=190917 phase=7 last_error=""
+    performance_load_ramp_test.go:152: LOAD split_cross_done job=1 elapsed_ms=190917
+    performance_load_ramp_test.go:152: PERF recovery routing_convergence_ms=0 catalog_version=6
+    performance_load_ramp_test.go:157: LOAD process_exit=exit status 1
+    performance_load_ramp_test.go:191: PERF recovery routing_convergence_ms=0 catalog_version=6
+    performance_load_ramp_test.go:191: PERF recovery path=outside-direct group=1 ingress=0 leader=0 term=2
+    performance_load_ramp_test.go:191: PERF recovery path=retained-direct group=1 ingress=0 leader=0 term=2
+    performance_load_ramp_test.go:191: PERF recovery path=retained-forwarded group=1 ingress=1 leader=0 term=2
+    performance_load_ramp_test.go:191: PERF recovery path=moved-direct group=2 ingress=1 leader=1 term=3
+    performance_load_ramp_test.go:191: PERF recovery path=moved-forwarded group=2 ingress=0 leader=1 term=3
+    performance_load_ramp_test.go:191: PERF recovery path=moved-direct planned=600 sent=600 success=600 errors=0 first_success_ms=41 max_lag_ms=65 error_details=map[] first_error=<nil>
+    performance_load_ramp_test.go:191: PERF recovery path=moved-forwarded planned=600 sent=600 success=600 errors=0 first_success_ms=41 max_lag_ms=65 error_details=map[] first_error=<nil>
+    performance_load_ramp_test.go:191: PERF recovery path=outside-direct planned=600 sent=600 success=600 errors=0 first_success_ms=52 max_lag_ms=76 error_details=map[] first_error=<nil>
+    performance_load_ramp_test.go:191: PERF recovery path=retained-forwarded planned=600 sent=600 success=600 errors=0 first_success_ms=53 max_lag_ms=73 error_details=map[] first_error=<nil>
+    performance_load_ramp_test.go:191: PERF recovery path=retained-direct planned=600 sent=600 success=600 errors=0 first_success_ms=53 max_lag_ms=73 error_details=map[] first_error=<nil>
+--- PASS: TestLinuxSplitLoadRamp (453.93s)
+PASS

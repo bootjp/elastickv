@@ -1,0 +1,21 @@
+2026/11/21 14:04:44 Found 0 WALs
+--- FAIL: TestMigrationCaptureRecordsPostImageRatherThanInput (0.07s)
+    migration_capture_test.go:128: 
+        	Error Trace:	/private/tmp/elastickv-online-split-design-20261121/store/migration_capture_test.go:128
+        	Error:      	Not equal: 
+        	            	expected: []byte{0x66, 0x69, 0x72, 0x73, 0x74}
+        	            	actual  : []byte{0x64, 0x69, 0x66, 0x66, 0x65, 0x72, 0x65, 0x6e, 0x74}
+        	            	
+        	            	Diff:
+        	            	--- Expected
+        	            	+++ Actual
+        	            	@@ -1,3 +1,3 @@
+        	            	-([]uint8) (len=5) {
+        	            	- 00000000  66 69 72 73 74                                    |first|
+        	            	+([]uint8) (len=9) {
+        	            	+ 00000000  64 69 66 66 65 72 65 6e  74                       |different|
+        	            	 }
+        	Test:       	TestMigrationCaptureRecordsPostImageRatherThanInput
+FAIL
+FAIL	github.com/bootjp/elastickv/store	0.511s
+FAIL

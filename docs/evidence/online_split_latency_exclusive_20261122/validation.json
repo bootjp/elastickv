@@ -1,0 +1,305 @@
+{
+  "measured_runtime": "c664c80bb954a462b145846b602f6e13849b0cbe",
+  "post_measurement_changes": "8be255c00 changes only a bootstrap test observation; production Go code is identical to measured runtime.",
+  "full_go": {
+    "command": "GOMAXPROCS=4 go test -p 3 -short ./... -timeout=20m",
+    "initial_exit": 1,
+    "initial_failure": "TestBootstrapEnablementThreeMembersPreparedSnapshotCatchup sampled engine/store at inconsistent applied indexes; strict production proof correctly rejected it.",
+    "correction": "Wait for a consistent observation that still requires ErrKeyNotFound before activation workers start. Production evidence guards unchanged.",
+    "retry_exit": 0,
+    "cached_results_included": true
+  },
+  "full_race": {
+    "command": "GOMAXPROCS=4 go test -p 2 -parallel 4 -race ./store ./kv -timeout=20m",
+    "runtime": "c664c80bb",
+    "exit": 0,
+    "store_seconds": 343.04,
+    "kv_seconds": 187.981
+  },
+  "historical_read_guard": {
+    "before": "RED: six single/batched low/equal timestamp reads bypassed the publication guard while actual WAL sync was stopped (2.892s).",
+    "after": "GREEN with -race: historical reads wait for low/equal timestamp sync; higher-timestamp historical reads and watermark readers progress (6.230s).",
+    "lsm_equals_main_82133d2fd": true
+  },
+  "merge_timestamp_guard": {
+    "before": "RED: mixed low/equal/newer batches released metadata lock",
+    "after": "GREEN -race store5.697s, adapter108.132s, kv10.193s; later historical-read regression removed the atomic retention mirror."
+  },
+  "review_regressions": "All six review threads fixed with regressions. Includes 256/257 requests, local second metadata read failure, target preparation replay with locks, full source/target capability fallback, canceled audits and mixed-range batches.",
+  "lint": {
+    "command": "golangci-lint --config=.golangci.yaml run --fix",
+    "issues": 0,
+    "exit": 0
+  },
+  "jepsen_root": {
+    "tests": 442,
+    "assertions": 6184,
+    "failures": 0,
+    "errors": 0,
+    "exit": 0,
+    "kind": "harness unit suite",
+    "harness_unchanged_after_main_merge": true
+  },
+  "jepsen_upstream_redis": {
+    "exit": 1,
+    "reason": "unmodified upstream test requires missing jepsen.redis namespace; its template also asserts (= 0 1)",
+    "submodule": "54ab5c10ace229fc780e43e188ef1b64c3a32ee4"
+  },
+  "runtime_ci": {
+    "all_required_passed": true,
+    "checks": [
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-21T18:17:08Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/bootjp/elastickv/actions/runs/44934607442/job/136938397958",
+        "name": "Analyze (actions)",
+        "startedAt": "2026-11-21T18:16:28Z",
+        "status": "COMPLETED",
+        "workflowName": "CodeQL"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-21T18:18:48Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/bootjp/elastickv/actions/runs/44934611763/job/136938407337",
+        "name": "build",
+        "startedAt": "2026-11-21T18:16:30Z",
+        "status": "COMPLETED",
+        "workflowName": "Docker Image CI"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-21T18:22:15Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/bootjp/elastickv/actions/runs/44934611844/job/136938408844",
+        "name": "Jepsen (redis, partition)",
+        "startedAt": "2026-11-21T18:17:10Z",
+        "status": "COMPLETED",
+        "workflowName": "Jepsen Hosted Faults"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-21T18:20:23Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/bootjp/elastickv/actions/runs/44934611738/job/136938407314",
+        "name": "voter-pause",
+        "startedAt": "2026-11-21T18:16:30Z",
+        "status": "COMPLETED",
+        "workflowName": "Jepsen Split Preflight"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-21T18:29:44Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/bootjp/elastickv/actions/runs/44934606162/job/136938958992",
+        "name": "test (encryption=off)",
+        "startedAt": "2026-11-21T18:18:28Z",
+        "status": "COMPLETED",
+        "workflowName": "Jepsen Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-21T18:20:32Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/bootjp/elastickv/actions/runs/44934611842/job/136938407695",
+        "name": "proto",
+        "startedAt": "2026-11-21T18:17:09Z",
+        "status": "COMPLETED",
+        "workflowName": "Proto"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-21T18:20:55Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/bootjp/elastickv/actions/runs/44934611712/job/136938407467",
+        "name": "golangci-lint",
+        "startedAt": "2026-11-21T18:16:30Z",
+        "status": "COMPLETED",
+        "workflowName": "Reviewdog"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-21T18:18:24Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/bootjp/elastickv/actions/runs/44934611843/job/136938408557",
+        "name": "tla-check",
+        "startedAt": "2026-11-21T18:17:24Z",
+        "status": "COMPLETED",
+        "workflowName": "TLA+ model check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-21T18:17:08Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/bootjp/elastickv/actions/runs/44934611757/job/136938407455",
+        "name": "Request Claude + Codex spec-divergence review",
+        "startedAt": "2026-11-21T18:16:57Z",
+        "status": "COMPLETED",
+        "workflowName": "TLA+ spec divergence \u2014 AI review"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-21T18:23:14Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/bootjp/elastickv/actions/runs/44934606242/job/136938392106",
+        "name": "test shard (adapter)",
+        "startedAt": "2026-11-21T18:16:27Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-21T18:16:55Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/bootjp/elastickv/actions/runs/44934608889/job/136938402887",
+        "name": "reconcile",
+        "startedAt": "2026-11-21T18:16:29Z",
+        "status": "COMPLETED",
+        "workflowName": "Update review approval label"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-21T18:20:33Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/bootjp/elastickv/actions/runs/44934607442/job/136938398199",
+        "name": "Analyze (go)",
+        "startedAt": "2026-11-21T18:16:28Z",
+        "status": "COMPLETED",
+        "workflowName": "CodeQL"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-21T18:21:26Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/bootjp/elastickv/actions/runs/44934611844/job/136938409048",
+        "name": "Jepsen (redis, kill)",
+        "startedAt": "2026-11-21T18:17:10Z",
+        "status": "COMPLETED",
+        "workflowName": "Jepsen Hosted Faults"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-21T18:30:15Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/bootjp/elastickv/actions/runs/44934606162/job/136938959281",
+        "name": "test (encryption=on)",
+        "startedAt": "2026-11-21T18:18:28Z",
+        "status": "COMPLETED",
+        "workflowName": "Jepsen Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-21T18:19:29Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/bootjp/elastickv/actions/runs/44934606242/job/136938392067",
+        "name": "test shard (adapter-seq)",
+        "startedAt": "2026-11-21T18:16:27Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-21T18:17:23Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/bootjp/elastickv/actions/runs/44934607442/job/136938398212",
+        "name": "Analyze (javascript-typescript)",
+        "startedAt": "2026-11-21T18:16:29Z",
+        "status": "COMPLETED",
+        "workflowName": "CodeQL"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-21T18:22:27Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/bootjp/elastickv/actions/runs/44934611844/job/136938409072",
+        "name": "Jepsen (redis, pause)",
+        "startedAt": "2026-11-21T18:17:13Z",
+        "status": "COMPLETED",
+        "workflowName": "Jepsen Hosted Faults"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-21T18:22:24Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/bootjp/elastickv/actions/runs/44934606242/job/136938391859",
+        "name": "test shard (root)",
+        "startedAt": "2026-11-21T18:16:26Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-21T18:17:11Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/bootjp/elastickv/actions/runs/44934607442/job/136938398213",
+        "name": "Analyze (python)",
+        "startedAt": "2026-11-21T18:16:28Z",
+        "status": "COMPLETED",
+        "workflowName": "CodeQL"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-21T18:20:19Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/bootjp/elastickv/actions/runs/44934606242/job/136938392148",
+        "name": "test shard (raft-crypto)",
+        "startedAt": "2026-11-21T18:16:27Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-21T18:21:26Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/bootjp/elastickv/actions/runs/44934606242/job/136938392204",
+        "name": "test shard (rest)",
+        "startedAt": "2026-11-21T18:16:27Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-21T18:23:19Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/bootjp/elastickv/actions/runs/44934606242/job/136940309224",
+        "name": "test (ubuntu-latest)",
+        "startedAt": "2026-11-21T18:23:16Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-21T18:17:02Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/bootjp/elastickv/runs/136938559880",
+        "name": "CodeQL",
+        "startedAt": "2026-11-21T18:17:00Z",
+        "status": "COMPLETED",
+        "workflowName": ""
+      },
+      {
+        "__typename": "StatusContext",
+        "context": "CodeRabbit",
+        "startedAt": "2026-11-21T18:16:33Z",
+        "state": "SUCCESS",
+        "targetUrl": ""
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-21T18:16:25Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://probot.github.io/apps/dco/",
+        "name": "DCO",
+        "startedAt": "2026-11-21T18:16:25Z",
+        "status": "COMPLETED",
+        "workflowName": ""
+      }
+    ]
+  },
+  "comparison_fixture_exits": {
+    "baseline": 0,
+    "candidate": 0
+  },
+  "client_exit_note": "Both clients report degraded load because RPC errors/drops remain; fixture success requires all ACK and post-Done checks."
+}

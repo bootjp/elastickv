@@ -1,0 +1,15 @@
+--- FAIL: TestRawMigrationGuardRaceKeepsIndexedRejection (0.00s)
+    migration_apply_rejection_test.go:27: 
+        	Error Trace:	/private/tmp/elastickv-load-ramp-20261121/kv/migration_apply_rejection_test.go:27
+        	Error:      	Should be in error chain:
+        	            	expected: *kv.AppliedRequestRejection
+        	            	in chain: "route cutover pending" (*withstack.withStack)
+        	            		"route cutover pending" (*withstack.withStack)
+        	            		"route cutover pending" (*withstack.withStack)
+        	            		"route cutover pending" (*withstack.withStack)
+        	            		"route cutover pending" (*errutil.leafError)
+        	Test:       	TestRawMigrationGuardRaceKeepsIndexedRejection
+        	Messages:   	the committed no-effect apply verdict must retain its index
+FAIL
+FAIL	github.com/bootjp/elastickv/kv	0.566s
+FAIL

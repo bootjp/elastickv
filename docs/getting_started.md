@@ -63,7 +63,7 @@ These are the listeners enabled by this example:
 | `127.0.0.1:8081/readyz` | Local runtime readiness |
 
 S3, SQS, the admin dashboard, and FUSE are opt-in and remain disabled here.
-`--pprofAddress=` disables the default debug listener.
+Debug profiling is disabled by default. Explicitly set `--pprofAddress=127.0.0.1:6060` to enable the debug listener; `--pprofAddress=` keeps it disabled.
 
 ### Docker alternative
 

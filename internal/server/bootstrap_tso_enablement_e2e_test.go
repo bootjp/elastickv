@@ -176,10 +176,17 @@ func tsoEnablementCapture(t *testing.T, node *tsoEnablementNode) tsoEnablementSt
 		cutover: state.CutoverActive(), phaseD: state.PhaseDActive(), phaseDFloor: state.PhaseDFloor(),
 		policies: make(map[uint64]raftbootstrap.PolicyRecord)}
 	for _, runtime := range node.runtimes {
-		policy, err := kv.LoadAppliedBootstrapPolicy(t.Context(), runtime.Store,
-			raftbootstrap.Identity{Cluster: node.cluster, Group: runtime.Spec.ID}, runtime.Engine.Status().AppliedIndex)
-		require.NoError(t, err)
-		image.policies[runtime.Spec.ID] = policy
+		// These runtimes keep applying entries while the test captures them.
+		// Retry the exact proof if apply advances between the two samples.
+		require.Eventually(t, func() bool {
+			policy, err := kv.LoadAppliedBootstrapPolicy(t.Context(), runtime.Store,
+				raftbootstrap.Identity{Cluster: node.cluster, Group: runtime.Spec.ID}, runtime.Engine.Status().AppliedIndex)
+			if err != nil {
+				return false
+			}
+			image.policies[runtime.Spec.ID] = policy
+			return true
+		}, enablementE2EWait, bootstrapE2EWaitInterval)
 	}
 	return image
 }

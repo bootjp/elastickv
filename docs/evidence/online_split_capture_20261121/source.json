@@ -1,0 +1,24 @@
+{
+  "code_commit": "3867cd45fcaee145b244079e0e4372ea229c2786",
+  "design_base": "5f77329d1",
+  "verification_worktree": "/private/tmp/elastickv-capture-verify-20261121",
+  "full_go_command": "GOMAXPROCS=4 go test -p 2 -parallel 4 -timeout=30m ./...",
+  "focused_race_command": "GOMAXPROCS=3 go test -p 2 -race ./store ./kv -run '^(TestMigrationCapture|TestFSMShadowCapture)' -count=1",
+  "full_go_exit": 0,
+  "focused_race_exit": 0,
+  "single_node_etcd_integration_exit": 0,
+  "main_jepsen_harness_exit": 0,
+  "upstream_redis_suite_exit": 1,
+  "online_split_enabled": false,
+  "server_cli_flag_added": false,
+  "continuous_cursor_proven": false,
+  "runtime_source_sha256": {
+    "kv/fsm.go": "cfdb9b501249ec437e5cb93abeb8625aac163ab611c9f78d49a46e63140a9070",
+    "kv/fsm_migration_capture_shadow.go": "49f7496e6874b5ff0618308b675b26b94ff8f29d35c8d192c182e7a9675599ed",
+    "store/migration_capture.go": "7009efdcc933b7cd8d9f0871dd1783a3ca996245ccea33e57441092eecf56d3b",
+    "store/migration_capture_codec.go": "04d3117e63c0947f13a241429cf6fec28cdd4e137864443f094b2b1257db514d",
+    "store/migration_capture_effects.go": "3b30834796d7754f624157ce7a9293c0a32bda5cf3a1e7c396dc879a4d791a2d",
+    "store/migration_capture_writer.go": "51fe1818f8c6d47faebbf1b5a98be91cfab055c05bbaa594f2cee8b6b9c807c2",
+    "store/raft_entry.go": "ed1332b335ee146e48f3c49301ef5363e0bdc3c45e795ec855a4f4596c90e8b6"
+  }
+}

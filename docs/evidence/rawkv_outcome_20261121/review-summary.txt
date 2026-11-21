@@ -1,0 +1,6 @@
+Independent static review of the outcome changes:
+- Identified public fallback selecting a terminal sentinel from joined errors; regression added and fixed.
+- Identified Forward status decoding selecting one joined status and discarding EOF; six mixed-status cases added, red then green with race detector.
+- Final Forward decoding review reported no measurement-blocking issue; independent test execution was not performed by reviewer.
+- Scope correction preserves the strict public RawKV predicate while restoring existing SQS joined-fence behavior. Reviewer noted an existing baseline SQS hidden-secondary receive issue, outside this RawKV load path.
+- Final independent review regenerated all four summaries from run.log and confirmed Unknown counts, throughput, p99, Split timings and ACK audit results. Documentation was corrected to distinguish measured status codes from unit-tested ErrorInfo contracts, first sampled stack locations from aggregate error-class counts, and pre-launch hash recording from aggregation-time manifest checks. No remeasurement was required.

@@ -1,0 +1,26 @@
+File: candidate-server.test
+Build ID: 41af091b0cfdf03f3900ebffc9d304fb7125f4c2
+Type: delay
+Time: 2026-11-22 02:11:48 JST
+Showing nodes accounting for 87.66s, 96.77% of 90.59s total
+Dropped 1143 nodes (cum <= 0.45s)
+Showing top 18 nodes out of 45
+      flat  flat%   sum%        cum   cum%
+         0     0%     0%     87.94s 97.08%  github.com/bootjp/elastickv/internal/raftengine/etcd.(*Engine).run
+         0     0%     0%     87.94s 97.08%  github.com/bootjp/elastickv/internal/raftengine/etcd.(*Engine).drainReady
+         0     0%     0%     87.93s 97.07%  github.com/bootjp/elastickv/internal/raftengine/etcd.Open.gowrap2
+    87.66s 96.77% 96.77%     87.68s 96.79%  sync.(*RWMutex).Unlock
+         0     0% 96.77%     87.62s 96.73%  github.com/bootjp/elastickv/internal/raftengine/etcd.(*Engine).applyAndDispatchReady
+         0     0% 96.77%     87.62s 96.73%  github.com/bootjp/elastickv/internal/raftengine/etcd.(*Engine).applyCommitted
+         0     0% 96.77%     87.62s 96.73%  github.com/bootjp/elastickv/internal/raftengine/etcd.(*Engine).applyNormalCommitted
+         0     0% 96.77%     87.62s 96.73%  github.com/bootjp/elastickv/internal/raftengine/etcd.executeNormalApply
+         0     0% 96.77%     87.62s 96.73%  github.com/bootjp/elastickv/internal/raftengine/etcd.normalApplyInput.applyCleartext
+         0     0% 96.77%     87.62s 96.73%  github.com/bootjp/elastickv/internal/raftengine/etcd.normalApplyInput.applyNormalEntry
+         0     0% 96.77%     87.62s 96.73%  github.com/bootjp/elastickv/kv.(*kvFSM).Apply
+         0     0% 96.77%     87.47s 96.56%  github.com/bootjp/elastickv/kv.(*kvFSM).applyRaftDataRequests
+         0     0% 96.77%     84.06s 92.79%  github.com/bootjp/elastickv/kv.(*kvFSM).applyDecodedRequests
+         0     0% 96.77%     45.99s 50.77%  runtime.deferreturn
+         0     0% 96.77%     45.75s 50.50%  github.com/bootjp/elastickv/kv.(*kvFSM).applyRequestData
+         0     0% 96.77%     45.75s 50.50%  github.com/bootjp/elastickv/kv.(*kvFSM).applyRequestErr
+         0     0% 96.77%     45.75s 50.50%  github.com/bootjp/elastickv/kv.(*kvFSM).applyRequest
+         0     0% 96.77%     45.75s 50.50%  github.com/bootjp/elastickv/kv.(*kvFSM).handleRequest

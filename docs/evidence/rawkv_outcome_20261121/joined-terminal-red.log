@@ -1,0 +1,11 @@
+--- FAIL: TestJoinedTerminalCausesCannotProveNonadmission (0.00s)
+    grpc_mutation_secondary_test.go:25: 
+        	Error Trace:	/private/tmp/elastickv-load-ramp-20261121/adapter/grpc_mutation_secondary_test.go:25
+        	Error:      	Not equal: 
+        	            	expected: 0x2
+        	            	actual  : 0xe
+        	Test:       	TestJoinedTerminalCausesCannotProveNonadmission
+        	Messages:   	a circuit error cannot erase another outcome
+FAIL
+FAIL	command-line-arguments	0.463s
+FAIL

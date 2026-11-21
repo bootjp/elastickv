@@ -1,0 +1,144 @@
+--- FAIL: TestSQSSelectedHeadCleanupJoinedErrors (0.00s)
+    --- FAIL: TestSQSSelectedHeadCleanupJoinedErrors/fence_with_locked/redrive_false/partitions_1 (0.00s)
+        sqs_fifo_selected_head_test.go:284: actual base64 visibility-key order: [00000000000000000000000000000000 00000000000000000000000000000001 00000000000000000000000000000002 00000000000000000000000000000003]; sequence-1 head=00000000000000000000000000000003 partition=0 generation=7
+        sqs_fifo_selected_head_test.go:284: 
+            	Error Trace:	/private/tmp/elastickv-load-ramp-20261121/adapter/sqs_fifo_selected_head_test.go:311
+            	            				/private/tmp/elastickv-load-ramp-20261121/adapter/sqs_fifo_selected_head_test.go:284
+            	Error:      	Target error should be in err chain:
+            	            	expected: "route is write-fenced; retry after route migration\ntxn locked"
+            	            	in chain: "transaction outcome unknown"
+            	            		"transaction outcome unknown"
+            	            		"transaction outcome unknown"
+            	            		"transaction outcome unknown"
+            	Test:       	TestSQSSelectedHeadCleanupJoinedErrors/fence_with_locked/redrive_false/partitions_1
+            	Messages:   	joined unknown/fence must propagate instead of becoming an empty successful receive
+    --- FAIL: TestSQSSelectedHeadCleanupJoinedErrors/fence_with_locked/redrive_false/partitions_4 (0.00s)
+--- FAIL: TestSQSFIFOAttemptReceiveRaceClassification (0.00s)
+    --- FAIL: TestSQSFIFOAttemptReceiveRaceClassification/joined_races (0.00s)
+        sqs_fifo_attempt_test.go:305: 
+            	Error Trace:	/private/tmp/elastickv-load-ramp-20261121/adapter/sqs_fifo_attempt_test.go:305
+            	Error:      	Not equal: 
+            	            	expected: true
+            	            	actual  : false
+            	Test:       	TestSQSFIFOAttemptReceiveRaceClassification/joined_races
+--- FAIL: TestSQSFIFOAttemptDispatchErrorsPropagate (0.00s)
+    --- FAIL: TestSQSFIFOAttemptDispatchErrorsPropagate/fence_with_race (0.00s)
+        sqs_fifo_attempt_test.go:228: actual base64 visibility-key order: [00000000000000000000000000000000 00000000000000000000000000000001 00000000000000000000000000000002 00000000000000000000000000000003 00000000000000000000000000000004]; sequence-1 head=00000000000000000000000000000004 partition=2 generation=7
+        sqs_fifo_attempt_test.go:236: 
+            	Error Trace:	/private/tmp/elastickv-load-ramp-20261121/adapter/sqs_fifo_attempt_test.go:236
+            	Error:      	Target error should be in err chain:
+            	            	expected: "route is write-fenced; retry after route migration\ntxn locked"
+--- FAIL: TestSQSFIFOAttemptDispatchErrorsPropagate (0.00s)
+    --- FAIL: TestSQSFIFOAttemptDispatchErrorsPropagate/fence_with_race (0.00s)
+        sqs_fifo_attempt_test.go:228: actual base64 visibility-key order: [00000000000000000000000000000000 00000000000000000000000000000001 00000000000000000000000000000002 00000000000000000000000000000003 00000000000000000000000000000004]; sequence-1 head=00000000000000000000000000000004 partition=2 generation=7
+        sqs_fifo_attempt_test.go:236: 
+            	Error Trace:	/private/tmp/elastickv-load-ramp-20261121/adapter/sqs_fifo_attempt_test.go:236
+            	Error:      	Target error should be in err chain:
+            	            	expected: "route is write-fenced; retry after route migration\ntxn locked"
+            	            	in chain: "transaction outcome unknown"
+            	            		"transaction outcome unknown"
+            	            		"transaction outcome unknown"
+            	            		"transaction outcome unknown"
+            	Test:       	TestSQSFIFOAttemptDispatchErrorsPropagate/fence_with_race
+            	Messages:   	must not convert a delivery failure into an empty success
+raft2026/11/21 04:13:31 INFO: af63ad4c86019caf switched to configuration voters=(af63ad4c86019caf)
+raft2026/11/21 04:13:31 INFO: af63ad4c86019caf became follower at term 1
+--- FAIL: TestJournalReceiptsSurviveProcessKill (0.38s)
+    operation_crash_test.go:207: 
+        	Error Trace:	/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/operation_crash_test.go:207
+        	Error:      	An error is expected but got nil.
+        	            	expected: *exec.ExitError
+        	Test:       	TestJournalReceiptsSurviveProcessKill
+        	Messages:   	2026/11/21 04:13:19 Found 0 WALs
+        	            	PASS
+2026/11/21 04:13:19 Found 1 WALs
+2026/11/21 04:13:19   - 000002: {(/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestJournalGenerationFenceSurvivesProcessKill1053499951/001/pebble,000)}
+2026/11/21 04:13:19 [JOB 1] WAL 000002: {(/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestJournalGenerationFenceSurvivesProcessKill1053499951/001/pebble,000)} stopped reading at offset: (/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestJournalGenerationFenceSurvivesProcessKill1053499951/001/pebble/000002.log: 3649); replayed 14 keys in 5 batches
+--- FAIL: TestJournalCommittedAttemptDecisionSurvivesProcessKill (0.31s)
+    operation_crash_test.go:52: 
+        	Error Trace:	/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/operation_crash_test.go:52
+        	Error:      	An error is expected but got nil.
+--- FAIL: TestJournalCommittedAttemptDecisionSurvivesProcessKill (0.31s)
+    operation_crash_test.go:52: 
+        	Error Trace:	/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/operation_crash_test.go:52
+        	Error:      	An error is expected but got nil.
+        	            	expected: *exec.ExitError
+        	Test:       	TestJournalCommittedAttemptDecisionSurvivesProcessKill
+        	Messages:   	2026/11/21 04:13:20 Found 0 WALs
+        	            	PASS
+FAIL
+FAIL	github.com/bootjp/elastickv/internal/filesystem	65.452s
+ok  	github.com/bootjp/elastickv/internal/filesystem/fstest	0.526s
+ok  	github.com/bootjp/elastickv/internal/filesystem/fuseadapter	10.654s
+ok  	github.com/bootjp/elastickv/internal/fskeys	0.264s
+ok  	github.com/bootjp/elastickv/internal/fsmount	2.495s
+ok  	github.com/bootjp/elastickv/internal/leaderbalance	0.435s
+ok  	github.com/bootjp/elastickv	19.189s
+FAIL
+FAIL	github.com/bootjp/elastickv/adapter	1025.534s
+ok  	github.com/bootjp/elastickv/cmd/elastickv-admin	1.121s
+ok  	github.com/bootjp/elastickv/cmd/elastickv-backup	0.360s
+ok  	github.com/bootjp/elastickv/cmd/elastickv-list-routes	0.405s
+ok  	github.com/bootjp/elastickv/cmd/elastickv-route-key	0.243s
+ok  	github.com/bootjp/elastickv/cmd/elastickv-snapshot-archive	0.415s
+ok  	github.com/bootjp/elastickv/cmd/elastickv-snapshot-decode	0.764s
+ok  	github.com/bootjp/elastickv/cmd/elastickv-snapshot-encode	0.725s
+ok  	github.com/bootjp/elastickv/cmd/elastickv-snapshot-offload	1.126s
+ok  	github.com/bootjp/elastickv/cmd/elastickv-snapshot-prepare-restore	1.105s
+ok  	github.com/bootjp/elastickv/cmd/elastickv-split	0.503s
+ok  	github.com/bootjp/elastickv/cmd/jepsen-encryption-setup	0.393s
+ok  	github.com/bootjp/elastickv/cmd/jepsen-grpc-client	0.333s
+ok  	github.com/bootjp/elastickv/cmd/loadtest	0.469s
+ok  	github.com/bootjp/elastickv/cmd/raftadmin	0.413s
+ok  	github.com/bootjp/elastickv/cmd/redis-proxy	0.315s
+ok  	github.com/bootjp/elastickv/cmd/server	0.484s
+ok  	github.com/bootjp/elastickv/distribution	1.281s
+ok  	github.com/bootjp/elastickv/distribution/autosplit	0.443s
+ok  	github.com/bootjp/elastickv/internal	0.393s
+ok  	github.com/bootjp/elastickv/internal/admin	0.545s
+ok  	github.com/bootjp/elastickv/internal/adminbridge	0.485s
+ok  	github.com/bootjp/elastickv/internal/backup	2.670s
+ok  	github.com/bootjp/elastickv/internal/clusterbootstrap	0.550s
+ok  	github.com/bootjp/elastickv/internal/encryption	11.538s
+ok  	github.com/bootjp/elastickv/internal/encryption/encryptiontest	0.393s
+ok  	github.com/bootjp/elastickv/internal/encryption/fsmwire	0.256s
+ok  	github.com/bootjp/elastickv/internal/encryption/kek	0.432s
+ok  	github.com/bootjp/elastickv/internal/encryptionwiring	14.870s
+FAIL
+FAIL	github.com/bootjp/elastickv/internal/filesystem	65.452s
+ok  	github.com/bootjp/elastickv/internal/filesystem/fstest	0.526s
+ok  	github.com/bootjp/elastickv/internal/filesystem/fuseadapter	10.654s
+ok  	github.com/bootjp/elastickv/internal/fskeys	0.264s
+ok  	github.com/bootjp/elastickv/internal/fsmount	2.495s
+ok  	github.com/bootjp/elastickv/internal/leaderbalance	0.435s
+ok  	github.com/bootjp/elastickv/internal/loadtest	0.771s
+ok  	github.com/bootjp/elastickv/internal/memwatch	0.310s
+ok  	github.com/bootjp/elastickv/internal/monoclock	0.260s
+ok  	github.com/bootjp/elastickv/internal/nodeauth	0.476s
+ok  	github.com/bootjp/elastickv/internal/noderuntime	0.593s
+ok  	github.com/bootjp/elastickv/internal/peersession	0.975s
+ok  	github.com/bootjp/elastickv/internal/raftadmin	0.564s
+ok  	github.com/bootjp/elastickv/internal/raftadmission	0.372s
+ok  	github.com/bootjp/elastickv/internal/raftbootstrap	6.065s
+ok  	github.com/bootjp/elastickv/internal/raftengine	0.339s
+ok  	github.com/bootjp/elastickv/internal/raftengine/etcd	185.038s
+ok  	github.com/bootjp/elastickv/internal/raftengine/etcd/transportsoak	1.150s
+ok  	github.com/bootjp/elastickv/internal/raftengine/raftenginetest	0.929s
+ok  	github.com/bootjp/elastickv/internal/runtimehealth	1.379s
+ok  	github.com/bootjp/elastickv/internal/s3keys	0.482s
+ok  	github.com/bootjp/elastickv/internal/server	729.741s
+ok  	github.com/bootjp/elastickv/internal/serverwiring	0.552s
+ok  	github.com/bootjp/elastickv/internal/snapshotoffload	22.509s
+ok  	github.com/bootjp/elastickv/internal/snapshotoffloadwiring	1.124s
+ok  	github.com/bootjp/elastickv/internal/testutil	0.762s
+ok  	github.com/bootjp/elastickv/internal/testutil/cmd/importguard	0.267s
+ok  	github.com/bootjp/elastickv/internal/testutil/grpctest	0.359s
+ok  	github.com/bootjp/elastickv/internal/tsowiring	0.444s
+ok  	github.com/bootjp/elastickv/keyviz	0.358s
+ok  	github.com/bootjp/elastickv/kv	81.189s
+ok  	github.com/bootjp/elastickv/kv/kvtest	0.754s
+ok  	github.com/bootjp/elastickv/monitoring	2.097s
+ok  	github.com/bootjp/elastickv/proxy	4.319s
+ok  	github.com/bootjp/elastickv/store	158.875s
+ok  	github.com/bootjp/elastickv/store/storetest	0.511s
+FAIL
