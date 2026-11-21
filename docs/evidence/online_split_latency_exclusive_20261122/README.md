@@ -64,6 +64,8 @@ To recompute, run `python3 compare.py` in the raw artifact root. The supplied A/
 
 The candidate had a transient slowdown 75–85 seconds after Split start, approximately 17–27 seconds after Done. The full 300 ops/s stage therefore worsened: read p99 12.056 → 24.765 ms, write p99 21.886 → 159.050 ms. These events are outside the predefined Split windows; they are retained in the full traces. Their cause was not established, and no storage/CPU attribution or uniform whole-stage latency improvement is claimed. The full workload nevertheless had zero candidate DeadlineExceeded/Unknown, and every ACK passed audit.
 
+Follow-up: the remaining tail was subsequently reproduced by cold `fwupd` discovery, including in a Split-free control. The [post-cutover diagnosis and isolated rerun](../online_split_postcutover_20261122/README.md) records the cause, measurement-host correction and new A/B audit. The measurements above remain the original historical observations.
+
 ## Validation
 
 The final native full-short Go suite passed after a bootstrap test observation race was corrected; the initial failed log is retained. Store/KV full race suites passed (343.040/187.981 s), the real-WAL guard regressions passed with race detection, and full commit-hook lint reports zero issues. All GitHub checks for measured runtime c664c80bb passed, including the available Redis fault jobs; this report does not claim a new live Split-specific Jepsen campaign. Root Jepsen harness: 442 tests / 6,184 assertions, zero failures/errors. The unmodified upstream Redis submodule unit test still fails on its missing namespace, as recorded in validation.json.
