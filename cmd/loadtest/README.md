@@ -65,6 +65,20 @@ command is a separate process. This measures load scaling on that placement;
 it does not establish multi-host throughput scaling or failure isolation.
 `ELASTICKV_LOAD_SPLIT` selects `none`, `same`, or `cross`.
 The wrapper builds the child binary and sets `ELASTICKV_LOAD_BINARY` for you.
+On a dedicated systemd Linux host, set `ELASTICKV_LOAD_EXCLUSIVE_HOST=1` to
+hold a host lock and temporarily runtime-mask `fwupd-refresh.timer`,
+`fwupd-refresh.service`, and `fwupd.service` for the whole run, including the ACK
+audit. Cold firmware discovery can compete with synchronous WAL I/O even when
+no other benchmark is running. Both comparison arms must use the same isolation.
+This option needs noninteractive sudo for systemctl. It refuses running service
+maintenance; wait for that work to finish before starting the comparison.
+Existing masks remain intact, and previously active timers are restored after
+success, failure, or interruption. `host-isolation.json` records those states.
+Runtime masks do not survive a reboot; an uncatchable kill requires restoring
+only this run's recorded masks before reusing the host. For prebuilt binaries,
+wrap the entire comparison with
+`python3 scripts/isolate-load-host.py /absolute/path/to/results -- COMMAND ...`.
+Other VMs sharing the physical disk can still introduce I/O variability.
 Other fixture controls (the standalone CLI has the full set of flags above):
 
 | Environment variable | Default | Meaning |

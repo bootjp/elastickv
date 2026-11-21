@@ -12,6 +12,10 @@ output_dir=$(cd "$output_dir" && pwd -P)
 case "$output_dir/" in
   "$repo_dir/"*) echo 'Results must be outside the repository to keep source snapshots bounded.' >&2; exit 2 ;;
 esac
+if [[ ${ELASTICKV_LOAD_EXCLUSIVE_HOST:-0} == 1 ]]; then
+  exec python3 "$repo_dir/scripts/isolate-load-host.py" "$output_dir" -- \
+    env -u ELASTICKV_LOAD_EXCLUSIVE_HOST bash "$0" "$output_dir"
+fi
 {
   date -u +%FT%TZ
   uname -srmo
