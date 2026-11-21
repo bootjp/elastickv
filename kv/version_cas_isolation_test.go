@@ -31,8 +31,7 @@ func TestVersionCASAndReadSetWriteSkew(t *testing.T) {
 			for i, k := range keys {
 				req := onePhaseReq(snapshot, uint64(30+i), 0, k, []byte("off"))
 				if mode == "exact-key" {
-					req.Mutations[1].Op = pb.Op_COMPARE_AND_SWAP
-					req.Mutations[1].ExpectedCommitTs = expected[i]
+					req = casApplyRequest(snapshot, uint64(30+i), expected[i], string(k), "off")
 				} else {
 					req.ReadKeys = keys
 				}

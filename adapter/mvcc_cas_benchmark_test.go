@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/bootjp/elastickv/kv"
@@ -52,10 +53,10 @@ type casBenchMeter struct {
 }
 
 type casBenchParked struct {
-	startTS, commitTS uint64
-	client            int
-	release           chan struct{}
-	done              chan struct{}
+	commitTS uint64
+	client   int
+	release  chan struct{}
+	done     chan struct{}
 }
 
 type casBenchMeterKey struct{}
@@ -104,7 +105,7 @@ func (m *casBenchMeter) parkProposal(ctx context.Context, data []byte) (casBench
 	if err != nil || meta.CommitTS == 0 {
 		return casBenchParked{}, errors.New("parked trial could not find the 1PC commit timestamp")
 	}
-	parked.startTS, parked.commitTS = req.GetTs(), meta.CommitTS
+	parked.commitTS = meta.CommitTS
 	md, _ := metadata.FromIncomingContext(ctx)
 	parked.client, err = strconv.Atoi(casBenchMD(md, casBenchClient))
 	if err != nil {
@@ -467,7 +468,8 @@ func newCASBenchFixture(t testing.TB, parked bool) *casBenchFixture {
 	})
 	node, err := factory.Create(raftengine.FactoryConfig{
 		LocalID: "cas-bench-1", LocalAddress: "cas-bench-1", DataDir: t.TempDir(), Bootstrap: true,
-		StateMachine: kv.NewKvFSMWithHLCAndTracker(local, hlc, tracker, kv.WithRouteHistory(kv.WrapDistributionEngine(routes), 1)),
+		StateMachine: kv.NewKvFSMWithHLCAndTracker(local, hlc, tracker, kv.WithRouteHistory(kv.WrapDistributionEngine(routes), 1),
+			kv.WithRaftBootstrapIdentity(raftbootstrap.UUID{1}, 1)),
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() {
@@ -492,6 +494,7 @@ func newCASBenchFixture(t testing.TB, parked bool) *casBenchFixture {
 	require.NoError(t, err)
 	require.NotNil(t, activation)
 	require.Nil(t, activation.Response)
+	replicateCASFixtureCatalog(t, ctx, engine, local, 1)
 	active, err := kv.CommitTSFenceEnabled(ctx, local)
 	require.NoError(t, err)
 	require.True(t, active)
@@ -908,9 +911,6 @@ func casBenchVerifyParked(t testing.TB, arm casBenchArm, order []casBenchParked,
 		case loser.commitTS <= winner.commitTS:
 			require.Equal(t, "cas_timestamp_conflict", got)
 			got = "timestamp_order"
-		case loser.startTS < winner.commitTS:
-			require.Equal(t, "cas_timestamp_conflict", got)
-			got = "cas_start_conflict"
 		default:
 			require.Equal(t, "exact_mismatch", got)
 		}
@@ -967,7 +967,7 @@ func (f *casBenchFixture) verify(t testing.TB, arm casBenchArm, attempts []casBe
 			require.False(t, a.injectedStale, "stale token applied")
 			require.Greater(t, r.version, a.before)
 			history[key].applied = append(history[key].applied, store.MVCCVersion{CommitTS: r.version, Value: a.value})
-		case "exact_mismatch", "precheck_mismatch", "one_phase_conflict", "cas_timestamp_conflict", "timestamp_order", "occ_conflict", "cas_start_conflict":
+		case "exact_mismatch", "precheck_mismatch", "one_phase_conflict", "cas_timestamp_conflict", "timestamp_order", "occ_conflict":
 			if a.injectedStale {
 				require.Equal(t, casBenchStaleReason(arm), r.reason)
 			}

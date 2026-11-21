@@ -22,6 +22,7 @@ func TestGRPCVersionedPointReads(t *testing.T) {
 	defer cancel()
 	st := store.NewMVCCStore()
 	t.Cleanup(func() { require.NoError(t, st.Close()) })
+	seedVersionReadCatalog(t, st, 1)
 	key := []byte("key")
 	require.NoError(t, st.PutAt(ctx, key, []byte("old"), 10, 0))
 	require.NoError(t, st.PutAt(ctx, key, []byte{}, 20, 0))
@@ -116,6 +117,7 @@ func TestGRPCVersionedRawGetHonorsExplicitGroup(t *testing.T) {
 		t.Cleanup(func() { require.NoError(t, group.Store.Close()) })
 	}
 	groups[2].ConfigureVersionReadAdmission(func(context.Context) error { return nil })
+	seedVersionReadCatalog(t, groups[2].Store, 2)
 	st := kv.NewShardStore(engine, groups)
 	t.Cleanup(func() { require.NoError(t, st.Close()) })
 	key := []byte("key")
@@ -130,4 +132,13 @@ func TestGRPCVersionedRawGetHonorsExplicitGroup(t *testing.T) {
 
 	_, err = server.RawGet(ctx, &pb.RawGetRequest{Key: key, Ts: 30, GroupId: 1, ReadRouteVersion: 8, NeedCommitTs: true})
 	require.Equal(t, codes.Unimplemented, status.Code(err))
+}
+
+func seedVersionReadCatalog(t *testing.T, st store.MVCCStore, groupID uint64) {
+	t.Helper()
+	plan, err := distribution.NewCatalogStore(st).BuildBootstrapPlanAt(t.Context(), 1, []distribution.Route{
+		{GroupID: groupID, State: distribution.RouteStateActive},
+	})
+	require.NoError(t, err)
+	require.NoError(t, st.ApplyMutationsRaftAtFenced(t.Context(), plan.Mutations, plan.ReadKeys, 1, 2, 0))
 }

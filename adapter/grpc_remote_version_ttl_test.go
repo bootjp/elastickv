@@ -24,6 +24,7 @@ func TestFollowerVersionReadEncryptedTTL(t *testing.T) {
 		encryption.NewDeterministicNonceFactory(1, 1), func() (uint32, bool) { return 1, true }))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, primary.Close()) })
+	seedVersionReadCatalog(t, primary, 1)
 	key := []byte("ttl-key")
 	require.NoError(t, primary.PutAt(t.Context(), key, []byte("secret"), 10, 20))
 	require.NoError(t, primary.PutAt(t.Context(), []byte("watermark"), []byte("later"), 30, 0))

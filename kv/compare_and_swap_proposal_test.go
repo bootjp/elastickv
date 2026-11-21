@@ -12,7 +12,9 @@ func TestCASProposalShape(t *testing.T) {
 	key := []byte("cas-key")
 	elem := &Elem[OP]{Op: CompareAndSwap, Key: key, ExpectedCommitTS: 5}
 	makeProposal := func(start, commit uint64) *pb.Request {
-		return onePhaseTxnRequestWithPrevCommit(start, commit, 0, key, []*Elem[OP]{elem}, nil, 0, nil)
+		req := onePhaseTxnRequestWithPrevCommit(start, commit, 0, key, []*Elem[OP]{elem}, nil, 0, nil)
+		req.VersionCasGroupId = 1
+		return req
 	}
 	require.NoError(t, ValidateCASProposalShape([]*pb.Request{makeProposal(6, 7)}))
 	unstamped := []*pb.Request{makeProposal(0, 0)}
@@ -27,6 +29,7 @@ func TestCASProposalShape(t *testing.T) {
 	}{
 		{"raw", func(req *pb.Request) { req.IsTxn = false }},
 		{"prepare", func(req *pb.Request) { req.Phase = pb.Phase_PREPARE }},
+		{"missing group binding", func(req *pb.Request) { req.VersionCasGroupId = 0 }},
 		{"missing predicate", func(req *pb.Request) { req.Mutations[1].ExpectedCommitTs = 0 }},
 		{"predicate on ordinary put", func(req *pb.Request) { req.Mutations[1].Op = pb.Op_PUT }},
 		{"extra mutation", func(req *pb.Request) { req.Mutations = append(req.Mutations, req.Mutations[1]) }},
@@ -58,6 +61,7 @@ func TestCASForwardMismatchRequiresMatchingRequestShape(t *testing.T) {
 		pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_DEFINITIVELY_ABORTED)
 	elem := &Elem[OP]{Op: CompareAndSwap, Key: key, ExpectedCommitTS: 5}
 	req := onePhaseTxnRequestWithPrevCommit(0, 0, 0, key, []*Elem[OP]{elem}, nil, 0, nil)
+	req.VersionCasGroupId = 1
 	proven := classifyForwardRPCError(err, []*pb.Request{req})
 	require.True(t, IsCertifiedCASMismatch(proven))
 	req.Mutations[1].Op = pb.Op_PUT

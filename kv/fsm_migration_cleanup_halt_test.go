@@ -88,3 +88,44 @@ func TestApplyMigrationCleanupKeepsDeterministicErrorsOrdinary(t *testing.T) {
 	require.True(t, ok)
 	require.ErrorIs(t, err, store.ErrValueTooLarge)
 }
+
+type cleanupCoverageFailureStore struct {
+	store.MVCCStore
+	store.RaftControlMetadataStore
+	store.RaftEntryApplier
+	err error
+}
+
+func (s *cleanupCoverageFailureStore) MigrationServingAdmissionState(context.Context) (store.MigrationServingState, error) {
+	return store.MigrationServingState{}, s.err
+}
+
+func TestVersionIdentityCleanupCoverageReadFailureLeavesProgressUnchanged(t *testing.T) {
+	t.Parallel()
+	backing, err := store.NewPebbleStore(t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, backing.Close()) })
+	fsm, ok := NewKvFSMWithHLC(backing, nil).(*kvFSM)
+	require.True(t, ok)
+	enableCASApplyForTest(t, fsm)
+	key := []byte("a")
+	require.NoError(t, backing.PutAt(t.Context(), key, []byte("live"), 10, 0))
+	metadata, ok := backing.(store.RaftControlMetadataStore)
+	require.True(t, ok)
+	applier, ok := backing.(store.RaftEntryApplier)
+	require.True(t, ok)
+	local := errors.New("cannot read ownership coverage")
+	fsm.store = &cleanupCoverageFailureStore{MVCCStore: backing, RaftControlMetadataStore: metadata, RaftEntryApplier: applier, err: local}
+	fsm.SetApplyIndex(2)
+	halt := haltApplyOf(fsm.Apply(cleanupCommand(t, pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_VERSIONS)))
+	require.True(t, errors.Is(halt, ErrMigrationCleanupApply), "got %v", halt)
+	require.ErrorIs(t, halt, local)
+	fsm.store = backing
+	fsm.SetApplyIndex(2)
+	halt = haltApplyOf(fsm.Apply(prependByte(raftEncodeMigrationCleanup, []byte{0xff})))
+	require.True(t, errors.Is(halt, ErrMigrationCleanupApply), "got %v", halt)
+	requireCASProgress(t, fsm, 1)
+	row, err := store.GetVersionAt(t.Context(), backing, key, 20)
+	require.NoError(t, err)
+	require.Equal(t, store.VersionedValue{TS: 10, Value: []byte("live")}, row)
+}

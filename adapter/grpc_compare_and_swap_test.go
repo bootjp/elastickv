@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/bootjp/elastickv/kv"
@@ -36,17 +37,22 @@ func (e *casRPCFollower) Status() raftengine.Status {
 
 type casRPCProposalFault struct {
 	*etcdraftengine.Engine
-	attempts   atomic.Int32
-	loseResult atomic.Bool
-	park       atomic.Bool
-	parked     chan struct{}
-	release    chan struct{}
+	attempts     atomic.Int32
+	loseResult   atomic.Bool
+	fenceVerdict atomic.Bool
+	park         atomic.Bool
+	parked       chan struct{}
+	release      chan struct{}
 }
 
 func (e *casRPCProposalFault) Propose(ctx context.Context, payload []byte) (*raftengine.ProposalResult, error) {
 	isCAS := raftengine.IsVersionCASRaftPayload(payload)
 	if isCAS {
 		e.attempts.Add(1)
+		if e.fenceVerdict.Load() {
+			// Inject an indexed FSM refusal at the proposer result boundary.
+			return &raftengine.ProposalResult{CommitIndex: 17, Response: kv.ErrRouteWriteFenced}, nil
+		}
 		if e.park.Load() {
 			close(e.parked)
 			select {
@@ -74,7 +80,38 @@ type casRPCFixture struct {
 	allowCAS                 atomic.Bool
 }
 
+func replicateCASFixtureCatalog(t testing.TB, ctx context.Context, proposer raftengine.Proposer, local store.MVCCStore, group uint64) {
+	t.Helper()
+	catalog := distribution.NewCatalogStore(local)
+	plan, err := catalog.BuildBootstrapPlanAt(ctx, 1, []distribution.Route{
+		{GroupID: group, State: distribution.RouteStateActive},
+	})
+	require.NoError(t, err)
+	replicateCASCatalogMutations(t, ctx, proposer, 1, plan.Mutations)
+}
+
+func replicateCASCatalogMutations(t testing.TB, ctx context.Context, proposer raftengine.Proposer, startTS uint64, muts []*store.KVPairMutation) {
+	t.Helper()
+	key := distribution.CatalogVersionKey()
+	request := &pb.Request{IsTxn: true, Ts: startTS, Mutations: []*pb.Mutation{
+		{Op: pb.Op_PUT, Key: []byte(kv.TxnMetaPrefix), Value: kv.EncodeTxnMeta(kv.TxnMeta{PrimaryKey: key, CommitTS: startTS + 1})},
+	}}
+	for _, mut := range muts {
+		request.Mutations = append(request.Mutations, &pb.Mutation{Op: pb.Op_PUT, Key: mut.Key, Value: mut.Value})
+		request.ReadKeys = append(request.ReadKeys, mut.Key)
+	}
+	txn := kv.NewTransactionWithProposer(proposer)
+	defer txn.Close()
+	_, err := txn.Commit(ctx, []*pb.Request{request})
+	require.NoError(t, err)
+}
+
 func newCASRPCFixture(t *testing.T) *casRPCFixture {
+	t.Helper()
+	return newCASRPCFixtureWithAllocator(t, nil)
+}
+
+func newCASRPCFixtureWithAllocator(t *testing.T, allocator kv.TimestampAllocator) *casRPCFixture {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
 	t.Cleanup(cancel)
@@ -94,7 +131,8 @@ func newCASRPCFixture(t *testing.T) *casRPCFixture {
 	})
 	node, err := factory.Create(raftengine.FactoryConfig{
 		LocalID: "cas-rpc-leader", LocalAddress: "cas-rpc-leader", DataDir: t.TempDir(), Bootstrap: true,
-		StateMachine: kv.NewKvFSMWithHLC(local, hlc, kv.WithRouteHistory(kv.WrapDistributionEngine(routes), casRPCGroup)),
+		StateMachine: kv.NewKvFSMWithHLC(local, hlc, kv.WithRouteHistory(kv.WrapDistributionEngine(routes), casRPCGroup),
+			kv.WithRaftBootstrapIdentity(raftbootstrap.UUID{1}, casRPCGroup)),
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() {
@@ -125,11 +163,13 @@ func newCASRPCFixture(t *testing.T) *casRPCFixture {
 	groups := map[uint64]*kv.ShardGroup{casRPCGroup: group}
 	shards := kv.NewShardStore(routes, groups)
 	coord := kv.NewShardedCoordinator(routes, groups, casRPCGroup, hlc, shards)
+	coord.WithTSOAllocator(allocator)
 	t.Cleanup(func() { require.NoError(t, coord.Close()) })
 	activated, err := engine.Propose(ctx, kv.EncodeCommitTSFenceActivation())
 	require.NoError(t, err)
 	require.NotNil(t, activated)
 	require.Nil(t, activated.Response)
+	replicateCASFixtureCatalog(t, ctx, engine, local, casRPCGroup)
 	proofCtx, err := localProof(ctx)
 	require.NoError(t, err)
 	identity, err := engine.Propose(proofCtx, kv.EncodeMigrationVersionIdentityActivation())
@@ -141,7 +181,7 @@ func newCASRPCFixture(t *testing.T) *casRPCFixture {
 	txn := NewInternalMigrationTransaction(engine, nil, local, casRPCGroup, proof)
 	t.Cleanup(txn.Close)
 	leaderRPC := grpc.NewServer(grpc.UnaryInterceptor(func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
-		if info.FullMethod != pb.Internal_ForwardCompareAndSwap_FullMethodName {
+		if info.FullMethod != pb.Internal_ForwardCompareAndSwapV2_FullMethodName {
 			return handler(ctx, req)
 		}
 		f.forwards.Add(1)
@@ -153,8 +193,8 @@ func newCASRPCFixture(t *testing.T) *casRPCFixture {
 	}))
 	pb.RegisterTransactionalKVServer(leaderRPC, NewGRPCServer(shards, coord))
 	pb.RegisterInternalServer(leaderRPC, NewInternalWithEngine(txn, engine, hlc, nil,
-		WithInternalStore(local), WithInternalWriteGate(coord), WithInternalLastCommitTimestamp(local.LastCommitTS),
-		WithInternalCASForwardRouting(casRPCGroup, shards.ResolveVersionCASGroupForKey)))
+		WithInternalTimestampAllocator(allocator), WithInternalStore(local), WithInternalWriteGate(coord), WithInternalLastCommitTimestamp(local.LastCommitTS),
+		WithInternalCASForwardRouting(casRPCGroup, shards.CheckVersionCASForwardRoute)))
 	leaderAddr, leaderConn := serveCASRPC(t, leaderRPC)
 	f.leader = pb.NewTransactionalKVClient(leaderConn)
 	f.internal = pb.NewInternalClient(leaderConn)
@@ -358,7 +398,8 @@ func TestCompareAndSwapForwardPreflight(t *testing.T) {
 	key := []byte("protected-from-forged-stamp")
 	original := f.put(t, key, []byte("before"))
 	req := &pb.Request{
-		IsTxn: true,
+		IsTxn:             true,
+		VersionCasGroupId: casRPCGroup,
 		Mutations: []*pb.Mutation{
 			{Op: pb.Op_PUT, Key: []byte(kv.TxnMetaPrefix), Value: kv.EncodeTxnMeta(kv.TxnMeta{PrimaryKey: key})},
 			{Op: pb.Op_COMPARE_AND_SWAP, Key: key, ExpectedCommitTs: original, Value: []byte("after")},
@@ -370,12 +411,22 @@ func TestCompareAndSwapForwardPreflight(t *testing.T) {
 	require.Equal(t, codes.FailedPrecondition, status.Code(err))
 
 	req.Ts = original
-	resp, err := f.internal.ForwardCompareAndSwap(f.ctx, envelope)
+	resp, err := f.internal.ForwardCompareAndSwapV2(f.ctx, envelope)
 	require.Nil(t, resp)
 	require.Equal(t, codes.InvalidArgument, status.Code(err))
 	req.Ts = 0
+	req.VersionCasGroupId = casRPCGroup + 1
+	resp, err = f.internal.ForwardCompareAndSwapV2(f.ctx, envelope)
+	require.Nil(t, resp)
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	req.VersionCasGroupId = casRPCGroup
+	req.ObservedRouteVersion = 1
+	resp, err = f.internal.ForwardCompareAndSwapV2(f.ctx, envelope)
+	require.Nil(t, resp)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	req.ObservedRouteVersion = 0
 	req.WriteFenceBypassKeys = [][]byte{key}
-	resp, err = f.internal.ForwardCompareAndSwap(f.ctx, envelope)
+	resp, err = f.internal.ForwardCompareAndSwapV2(f.ctx, envelope)
 	require.Nil(t, resp)
 	require.Equal(t, codes.PermissionDenied, status.Code(err))
 	req.WriteFenceBypassKeys = nil
@@ -400,7 +451,7 @@ func TestCompareAndSwapForwardRequiresConfiguredPeerAuth(t *testing.T) {
 	pb.RegisterInternalServer(server, &pb.UnimplementedInternalServer{})
 	_, conn := serveCASRPC(t, server)
 	client := pb.NewInternalClient(conn)
-	_, err := client.ForwardCompareAndSwap(t.Context(), &pb.ForwardRequest{Requests: []*pb.Request{{
+	_, err := client.ForwardCompareAndSwapV2(t.Context(), &pb.ForwardRequest{Requests: []*pb.Request{{
 		Mutations: []*pb.Mutation{{Op: pb.Op_COMPARE_AND_SWAP}},
 	}}})
 	require.Equal(t, codes.Unauthenticated, status.Code(err))
@@ -433,4 +484,95 @@ func TestCompareAndSwapIndexedLockRejection(t *testing.T) {
 	value, err := f.local.GetAt(f.ctx, key, ^uint64(0))
 	require.NoError(t, err)
 	require.Equal(t, []byte("original"), value)
+}
+
+func TestCompareAndSwapCertifiedRouteFence(t *testing.T) {
+	f := newCASRPCFixture(t)
+	key := []byte("route-fence")
+	version := f.put(t, key, []byte("before"))
+	f.proposals.fenceVerdict.Store(true)
+	for _, tc := range []struct {
+		name   string
+		client pb.TransactionalKVClient
+	}{{"leader", f.leader}, {"follower", f.follower}} {
+		t.Run(tc.name, func(t *testing.T) {
+			reply, err := tc.client.CompareAndSwap(f.ctx, &pb.CompareAndSwapRequest{
+				Key: key, ExpectedCommitTs: version, Value: []byte("after"),
+			})
+			require.Nil(t, reply)
+			st := status.Convert(err)
+			require.Equal(t, codes.Aborted, st.Code())
+			require.Len(t, st.Details(), 1)
+			info, ok := st.Details()[0].(*errdetails.ErrorInfo)
+			require.True(t, ok)
+			require.Equal(t, "CAS_ROUTE_FENCED", info.GetReason())
+		})
+	}
+	require.EqualValues(t, 1, f.forwards.Load())
+	require.EqualValues(t, 2, f.proposals.attempts.Load())
+}
+
+// Reserve the CAS start timestamp and pause before issuing its commit
+// timestamp. Other callers can still obtain timestamps and commit writes.
+type casCommitTimestampGate struct {
+	clock   *kv.HLC
+	calls   atomic.Int32
+	parked  chan struct{}
+	release chan struct{}
+}
+
+func (g *casCommitTimestampGate) Next(ctx context.Context) (uint64, error) {
+	if g.calls.Add(1) == 2 {
+		close(g.parked)
+		select {
+		case <-g.release:
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+	}
+	return g.clock.Next(), nil
+}
+
+func TestCompareAndSwapInterveningKeyChangeReturnsMismatch(t *testing.T) {
+	for _, ingress := range []string{"leader", "follower"} {
+		t.Run(ingress, func(t *testing.T) {
+			gate := &casCommitTimestampGate{clock: kv.NewHLC(), parked: make(chan struct{}), release: make(chan struct{})}
+			gate.calls.Store(2) // Fixture setup may allocate timestamps.
+			f := newCASRPCFixtureWithAllocator(t, gate)
+			key := []byte("intervening")
+			version := f.put(t, key, []byte("before"))
+			client := f.leader
+			if ingress == "follower" {
+				client = f.follower
+			}
+			gate.calls.Store(0)
+			type result struct {
+				reply *pb.CompareAndSwapResponse
+				err   error
+			}
+			done := make(chan result, 1)
+			go func() {
+				resp, err := client.CompareAndSwap(f.ctx, &pb.CompareAndSwapRequest{
+					Key: key, ExpectedCommitTs: version, Value: []byte("stale replacement"),
+				})
+				done <- result{resp, err}
+			}()
+			select {
+			case <-gate.parked:
+			case early := <-done:
+				t.Fatalf("CAS returned before timestamp barrier: %v, %v", early.reply, early.err)
+			case <-f.ctx.Done():
+				t.Fatal(f.ctx.Err())
+			}
+			intervening := f.put(t, key, []byte("new value"))
+			close(gate.release)
+			got := <-done
+			require.NoError(t, got.err)
+			require.True(t, got.reply.GetMismatch())
+			stored, err := f.leader.Get(f.ctx, &pb.GetRequest{Key: key, NeedCommitTs: true})
+			require.NoError(t, err)
+			require.Equal(t, intervening, stored.GetCommitTs())
+			require.Equal(t, []byte("new value"), stored.GetValue())
+		})
+	}
 }

@@ -644,7 +644,7 @@ func (s *ShardStore) localReadPoint(ctx context.Context, g *ShardGroup, route di
 		return store.VersionedValue{Value: value}, err
 	}
 	if needCommitTS {
-		return s.readVersionOnInitialRoute(ctx, g, route, key, ts)
+		return readVersionOnInitialRoute(ctx, g, route, key, ts)
 	}
 	value, err := g.Store.GetAt(ctx, key, ts)
 	return store.VersionedValue{Value: value}, errors.WithStack(err)

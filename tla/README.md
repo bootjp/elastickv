@@ -7,6 +7,9 @@ Machine-checkable safety models for the four cross-cutting subsystems
 This directory is **independent of the Go module**; you can navigate and
 run it without touching anything under the Go source tree.
 
+The [single-key MVCC CAS model](cas/README.md) has a focused
+`make tla-cas-check` target and also runs under `make tla-check`.
+
 ## Status
 
 | Milestone | Scope | Status |

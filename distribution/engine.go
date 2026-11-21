@@ -649,6 +649,32 @@ func RoutesFromCatalogSnapshot(snapshot CatalogSnapshot) ([]Route, error) {
 	return routesFromCatalog(snapshot.Routes)
 }
 
+// RouteSnapshotFromCatalog builds an immutable lookup over a durable catalog.
+func RouteSnapshotFromCatalog(snapshot CatalogSnapshot) (RouteHistorySnapshot, error) {
+	routes, err := RoutesFromCatalogSnapshot(snapshot)
+	return RouteHistorySnapshot{version: snapshot.Version, routes: routes}, err
+}
+
+// OwnsCatalogRoutes reports whether one group owns both the version record and
+// the complete route descriptor key range.
+func (s RouteHistorySnapshot) OwnsCatalogRoutes(groupID uint64) bool {
+	if owner, ok := s.OwnerOf(CatalogVersionKey()); !ok || owner != groupID {
+		return false
+	}
+	cursor := []byte(catalogRoutePrefix)
+	end := prefixScanEnd(cursor)
+	for _, route := range s.IntersectingRoutes(cursor, end) {
+		if route.GroupID != groupID || bytes.Compare(route.Start, cursor) > 0 {
+			return false
+		}
+		if route.End == nil || bytes.Compare(route.End, end) >= 0 {
+			return true
+		}
+		cursor = route.End
+	}
+	return false
+}
+
 func validateRouteOrder(routes []Route) error {
 	if len(routes) < minRouteCountForOrderValidation {
 		return nil

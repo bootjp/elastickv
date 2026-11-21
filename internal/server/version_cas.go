@@ -7,6 +7,7 @@ import (
 	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/internal/noderuntime"
+	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/bootjp/elastickv/kv"
@@ -76,6 +77,10 @@ func configureVersionCASGroup(rt *clusterbootstrap.GroupRuntime, group *kv.Shard
 	_, hasMetadata := rt.Store.(store.RaftControlMetadataStore)
 	if !canApply || !hasMetadata {
 		return unsupportedVersionCASGroup(enabled, "group lacks replicated metadata storage")
+	}
+	native, ok := rt.StateMachine.(interface{ NativeGroupIdentity() raftbootstrap.Identity })
+	if !ok || native.NativeGroupIdentity() != (raftbootstrap.Identity{Cluster: rt.BootstrapPeerConfig.Local.Cluster, Group: rt.Spec.ID}) {
+		return unsupportedVersionCASGroup(enabled, "FSM is not bound to the protected data group")
 	}
 	rt.VersionCASCapable = true
 	if !enabled {
@@ -251,7 +256,7 @@ func versionCASPeerCheck(rt *clusterbootstrap.GroupRuntime, conns *kv.GRPCConnCa
 		if err != nil {
 			return errors.Wrapf(err, "check replica %s", peer.ID)
 		}
-		if !status.GetSupportsVersionCas() || status.GetPendingConfChange() || status.GetConfigurationIndex() != index {
+		if !status.GetSupportsReplicatedCatalogCas() || status.GetPendingConfChange() || status.GetConfigurationIndex() != index {
 			return errors.Newf("replica %s lacks version CAS capability at configuration %d", peer.ID, index)
 		}
 		return nil

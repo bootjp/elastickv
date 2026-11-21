@@ -10,9 +10,13 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// Using a distinct method keeps an old leader from appending a CAS in its
-// legacy log format before discovering the unsupported mutation during apply.
-func (i *Internal) ForwardCompareAndSwap(ctx context.Context, req *pb.ForwardRequest) (*pb.ForwardResponse, error) {
+func (i *Internal) ForwardCompareAndSwap(context.Context, *pb.ForwardRequest) (*pb.ForwardResponse, error) {
+	return nil, errors.WithStack(kv.VersionCASForwardUnavailable(kv.ErrVersionCASUnavailable))
+}
+
+// The receiver must support Raft-ordered routing before it can accept this
+// request. An older server has no V2 method and cannot submit the write.
+func (i *Internal) ForwardCompareAndSwapV2(ctx context.Context, req *pb.ForwardRequest) (*pb.ForwardResponse, error) {
 	if !kv.HasCASMutation(req.GetRequests()) {
 		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "expected compare-and-swap"))
 	}

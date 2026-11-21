@@ -1,6 +1,7 @@
 package kv
 
 import (
+	"bytes"
 	"context"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -21,8 +22,8 @@ func IsVersionCASRaftPayload(payload []byte) bool {
 }
 
 func DecodeVersionCASRaftPayload(payload []byte) (*pb.Request, error) {
-	if !raftengine.IsVersionCASRaftPayload(payload) {
-		return nil, errors.WithStack(ErrInvalidRequest)
+	if !bytes.HasPrefix(payload, []byte(versionCASFrame)) {
+		return nil, errors.Wrap(ErrInvalidRequest, "unsupported version CAS Raft frame")
 	}
 	var request pb.Request
 	if err := proto.Unmarshal(payload[len(versionCASFrame):], &request); err != nil {
@@ -33,6 +34,9 @@ func DecodeVersionCASRaftPayload(payload []byte) (*pb.Request, error) {
 	}
 	if err := ValidateCASProposalShape([]*pb.Request{&request}); err != nil {
 		return nil, err
+	}
+	if version, _ := DecodeObservedRouteVersion(request.GetObservedRouteVersion()); version == 0 || len(request.GetWriteFenceBypassKeys()) != 0 {
+		return nil, errors.Wrap(ErrInvalidRequest, "version CAS frame requires a catalog version and forbids routing bypasses")
 	}
 	return &request, nil
 }
@@ -50,7 +54,10 @@ func (f *kvFSM) applyVersionCASFrame(ctx context.Context, payload []byte) any {
 		return haltErr(errors.Mark(errors.Wrap(errors.Join(ErrVersionCASUnavailable, err),
 			"version CAS entry requires migration version identity activation"), ErrRaftEntryApply))
 	}
-	return f.applyCASEntry(ctx, []*pb.Request{req}, true)
+	if f.pendingApplyIdx == 0 {
+		return casEntryHalt(errors.New("CAS entry requires a Raft applied index"))
+	}
+	return f.applyCASEntry(ctx, []*pb.Request{req}, f.applyFramedCAS)
 }
 
 // VersionCASAdmission verifies the local leader and every configured replica.
@@ -65,6 +72,27 @@ func WithVersionCASAdmission(check VersionCASAdmission) TransactionOption {
 // ConfigureVersionCASAdmission is called during startup before the proxy serves requests.
 func (p *LeaderProxy) ConfigureVersionCASAdmission(check VersionCASAdmission) {
 	WithVersionCASAdmission(check)(p.tm)
+}
+
+func (t *TransactionManager) admitVersionCASRequest(ctx context.Context, req *pb.Request) (*pb.Request, error) {
+	if req.GetObservedRouteVersion() != 0 || len(req.GetWriteFenceBypassKeys()) != 0 {
+		return nil, errors.Wrap(ErrInvalidRequest, "CAS leader must supply the route proof")
+	}
+	admission := t.migrationAdmission.Load()
+	if admission == nil || admission.store == nil || admission.groupID != req.GetVersionCasGroupId() {
+		return nil, errors.Wrap(ErrVersionCASUnavailable, "CAS proposal is not bound to its receiving data group")
+	}
+	key := req.GetMutations()[1].GetKey()
+	if err := checkVersionCASMigrationRange(ctx, admission.store, key); err != nil {
+		return nil, errors.Join(ErrVersionCASUnavailable, err)
+	}
+	version, err := admitVersionCASRoute(ctx, admission.store, admission.groupID, key)
+	if err != nil {
+		return nil, err
+	}
+	owned := proto.CloneOf(req)
+	owned.ObservedRouteVersion = version
+	return owned, nil
 }
 
 const versionCASForwardDomain = "elastickv.internal.version_cas"

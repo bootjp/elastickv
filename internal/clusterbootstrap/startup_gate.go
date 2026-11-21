@@ -147,7 +147,7 @@ func (g *StartupPublicKVGate) Blocked() bool {
 
 func startupRotationGatedMethod(fullMethod string) bool {
 	switch fullMethod {
-	case pb.Internal_Forward_FullMethodName, pb.Internal_ForwardCompareAndSwap_FullMethodName,
+	case pb.Internal_Forward_FullMethodName, pb.Internal_ForwardCompareAndSwap_FullMethodName, pb.Internal_ForwardCompareAndSwapV2_FullMethodName,
 		pb.Internal_ApplyTargetStagedReadiness_FullMethodName,
 		pb.Internal_ImportRangeVersions_FullMethodName,
 		pb.Internal_PromoteStagedVersions_FullMethodName,

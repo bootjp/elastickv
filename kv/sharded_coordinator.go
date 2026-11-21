@@ -2140,6 +2140,9 @@ func (c *ShardedCoordinator) dispatchSingleShardTxn(ctx context.Context, startTS
 	// attempt's write set.
 	request := newOnePhaseTxnRequest(startTS, commitTS, prevCommitTS, primaryKey, len(muts), readKeys, observedRouteVersion, writeFenceBypassKeys)
 	request.Mutations = append(request.Mutations, muts...)
+	if singleCASMutation(muts) {
+		request.VersionCasGroupId = gid
+	}
 	resp, err := g.Txn.Commit(ctx, []*pb.Request{request})
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -2160,10 +2163,14 @@ func (c *ShardedCoordinator) dispatchSingleShardTxn(ctx context.Context, startTS
 	return &CoordinateResponse{CommitIndex: resp.CommitIndex, CommitTS: commitTS}, nil
 }
 
+func singleCASMutation(muts []*pb.Mutation) bool {
+	return len(muts) == 1 && muts[0].GetOp() == pb.Op_COMPARE_AND_SWAP
+}
+
 func (c *ShardedCoordinator) onePhaseReadKeys(gid uint64, readKeys [][]byte, muts []*pb.Mutation) [][]byte {
 	// A standalone CAS uses an exact-version predicate and is admitted only on
 	// initial routes. Keep its wire shape free of auxiliary OCC read keys.
-	if len(muts) == 1 && muts[0].GetOp() == pb.Op_COMPARE_AND_SWAP {
+	if singleCASMutation(muts) {
 		return readKeys
 	}
 	readKeys = c.readKeysWithStagedVisibilityAliasesForGroup(gid, readKeys)

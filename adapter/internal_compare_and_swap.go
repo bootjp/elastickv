@@ -1,6 +1,8 @@
 package adapter
 
 import (
+	"context"
+
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
@@ -9,15 +11,15 @@ import (
 )
 
 // WithInternalCASForwardRouting binds CAS forwarding to the group served by
-// this Internal endpoint and the same key router used by public dispatch.
-func WithInternalCASForwardRouting(groupID uint64, resolve func([]byte) (uint64, error)) InternalOption {
+// this endpoint and checks that group's applied catalog.
+func WithInternalCASForwardRouting(groupID uint64, check func(context.Context, uint64, []byte) error) InternalOption {
 	return func(i *Internal) {
 		i.casForwardGroup = groupID
-		i.casForwardRoute = resolve
+		i.casForwardRoute = check
 	}
 }
 
-func (i *Internal) preflightForwardCAS(req *pb.ForwardRequest) error {
+func (i *Internal) preflightForwardCAS(ctx context.Context, req *pb.ForwardRequest) error {
 	reqs := req.GetRequests()
 	if !kv.HasCASMutation(reqs) {
 		return nil
@@ -26,25 +28,14 @@ func (i *Internal) preflightForwardCAS(req *pb.ForwardRequest) error {
 	if err != nil || !req.GetIsTxn() {
 		return errors.WithStack(status.Error(codes.InvalidArgument, "invalid forwarded compare-and-swap"))
 	}
-	if i.casForwardRoute != nil {
-		group, err := i.casForwardRoute(mut.Key)
-		if errors.Is(err, kv.ErrVersionCASUnavailable) {
-			return errors.WithStack(kv.VersionCASForwardUnavailable(err))
-		}
-		if err != nil || group != i.casForwardGroup {
-			return errors.WithStack(status.Error(codes.FailedPrecondition, "compare-and-swap key is not owned by this group"))
-		}
+	if i.casForwardGroup != reqs[0].GetVersionCasGroupId() || i.casForwardRoute == nil {
+		return errors.WithStack(kv.VersionCASForwardUnavailable(kv.ErrVersionCASUnavailable))
 	}
-	if len(reqs[0].GetWriteFenceBypassKeys()) != 0 && !i.canBypassCASWriteFence(mut.Key) {
+	if len(reqs[0].GetWriteFenceBypassKeys()) != 0 {
 		return errors.WithStack(status.Error(codes.PermissionDenied, "compare-and-swap write fence bypass is unauthorized"))
 	}
-	return nil
-}
-
-func (i *Internal) canBypassCASWriteFence(key []byte) bool {
-	if i.migrationExportResolver == nil || i.casForwardGroup == 0 {
-		return false
+	if err := i.casForwardRoute(ctx, i.casForwardGroup, mut.Key); err != nil {
+		return errors.WithStack(kv.VersionCASForwardUnavailable(err))
 	}
-	owner, ok := i.migrationExportResolver.ResolveGroup(key)
-	return ok && owner == i.casForwardGroup
+	return nil
 }

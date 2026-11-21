@@ -14,10 +14,14 @@ import (
 func TestVersionCASMoveToUnactivatedGroupAndBack(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
-	source, target := store.NewMVCCStore(), store.NewMVCCStore()
-	sourceFSM, targetFSM := &kvFSM{store: source}, &kvFSM{store: target}
+	dir := t.TempDir()
+	source, err := store.NewPebbleStore(dir)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, source.Close()) })
+	target := store.NewMVCCStore()
+	sourceFSM, targetFSM := &kvFSM{store: source, shardGroupID: 1}, &kvFSM{store: target}
 	enableCASApplyForTest(t, sourceFSM)
-	key := []byte("key")
+	key := []byte("n")
 	require.NoError(t, source.PutAt(ctx, key, []byte("source"), 10, 0))
 	routes := distribution.NewEngine()
 	setOwner := func(version, groupID, floor uint64) {
@@ -94,21 +98,65 @@ func TestVersionCASMoveToUnactivatedGroupAndBack(t *testing.T) {
 	// Cleanup removes the old source row. A return import can then carry
 	// the substituted bytes at the same timestamp without an exact row
 	// remaining in the source against which to detect the old overwrite.
-	cleanup, err := MarshalMigrationCleanupCommand(&pb.CleanupMigrationRequest{
-		JobId: 1, Mode: pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_VERSIONS,
-		RangeStart: key, RangeEnd: nextScanCursor(key), MaxCommitTs: 20,
-	})
+	installSourceOwnershipForTest(t, sourceFSM, 0)
+	cleanupReq := &pb.CleanupMigrationRequest{
+		JobId: 11, Mode: pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_VERSIONS,
+		RangeStart: []byte("a"), RangeEnd: []byte("z"), MaxCommitTs: 20,
+		RouteStart: []byte("m"), RouteEnd: []byte("z"),
+		RequireConfigurationIndex: true, ExpectedConfigurationIndex: 9,
+	}
+	cleanup, err := MarshalMigrationCleanupCommand(cleanupReq)
 	require.NoError(t, err)
-	sourceFSM.SetApplyIndex(2)
+	sourceFSM.SetApplyIndex(12)
+	requireCASRejection(t, sourceFSM.Apply(cleanup), store.ErrMigrationOwnership)
+	requireCASProgress(t, sourceFSM, 12)
+	cleanupReq.RequiresRouteKeyCheck = true
+	cleanup, err = MarshalMigrationCleanupCommand(cleanupReq)
+	require.NoError(t, err)
+	sourceFSM.SetApplyIndex(13)
 	cleaned, ok := sourceFSM.Apply(cleanup).(store.CleanupVersionsResult)
 	require.True(t, ok)
 	require.Equal(t, uint64(1), cleaned.DeletedRows)
+	requireCASProgress(t, sourceFSM, 13)
+	_, err = store.GetVersionAt(ctx, source, key, 50)
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+	fence, err := MarshalTargetStagedReadinessCommand(&pb.TargetStagedReadinessRequest{
+		JobId: 11, MigrationJobId: 11, Armed: true, TrackWrites: true, SourceWriteFence: true, SourceReadFence: true,
+		RouteStart: []byte("m"), RouteEnd: []byte("z"), ExpectedCutoverVersion: 2, MinWriteTsExclusive: 20, RetentionPinTs: 1,
+	})
+	require.NoError(t, err)
+	sourceFSM.SetApplyIndex(14)
+	require.Nil(t, sourceFSM.Apply(fence))
+	retire, err := MarshalMigrationCleanupCommand(&pb.CleanupMigrationRequest{
+		JobId: 11, Mode: pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_OWNERSHIP_CLEAR,
+		RequireConfigurationIndex: true, ExpectedConfigurationIndex: 9,
+		Ownership: &pb.MigrationOwnershipProof{
+			Generation: "0123456789abcdef0123456789abcdef", RouteId: 2, LocalGroupId: 1, OwnerGroupId: 2,
+			Role: pb.MigrationOwnershipRole_MIGRATION_OWNERSHIP_ROLE_NONOWNER, CatalogVersion: 2,
+			RouteStart: []byte("m"), RouteEnd: []byte("z"), MinWriteTsExclusive: 20, DescriptorHash: bytes.Repeat([]byte{1}, 32),
+		},
+	})
+	require.NoError(t, err)
+	sourceFSM.SetApplyIndex(15)
+	require.IsType(t, store.CleanupVersionsResult{}, sourceFSM.Apply(retire))
 	importReq.JobId, importReq.BatchSeq = 2, 1
-	require.IsType(t, store.ImportVersionsResult{}, applyMigrationVersionIdentityImport(t, sourceFSM, importReq, 3))
+	require.IsType(t, store.ImportVersionsResult{}, applyMigrationVersionIdentityImport(t, sourceFSM, importReq, 16))
 	promote, err = MarshalMigrationPromoteCommand(&pb.PromoteStagedVersionsRequest{JobId: 2})
 	require.NoError(t, err)
-	sourceFSM.SetApplyIndex(4)
+	sourceFSM.SetApplyIndex(17)
 	require.IsType(t, store.PromoteVersionsResult{}, sourceFSM.Apply(promote))
+	require.NoError(t, source.Close())
+	source, err = store.NewPebbleStore(dir)
+	require.NoError(t, err)
+	groups[1].Store = source
+	sourceFSM, ok = NewKvFSMWithHLC(source, NewHLC()).(*kvFSM)
+	require.True(t, ok)
+	requireCASProgress(t, sourceFSM, 17)
+	view, err := readMigrationServingState(ctx, source)
+	require.NoError(t, err)
+	require.Empty(t, view.Readiness)
+	requireCASRejection(t, applyCASFrame(t, sourceFSM, 18, casApplyRequest(50, 60, token.TS, string(key), "wrong")), ErrVersionCASUnavailable)
+	requireCASProgress(t, sourceFSM, 18)
 	setOwner(3, 1, 40)
 	returned, err := store.GetVersionAt(ctx, source, key, 50)
 	require.NoError(t, err)
@@ -137,7 +185,7 @@ func TestVersionCASApplyRejectsMigrationGuardAfterAdmission(t *testing.T) {
 		store.TargetStagedReadinessState{JobID: 7, MigrationJobID: 7, Armed: true,
 			SourceWriteFence: true, RetentionPinTS: 1, RouteStart: key, MinWriteTSExclusive: 20, ExpectedCutoverVersion: 2}, 2))
 	require.ErrorIs(t, CheckMigrationRequest(ctx, st, 1, request), ErrVersionCASUnavailable)
-	requireCASRejection(t, applyCASFrame(t, f, 3, request), ErrVersionCASUnavailable)
+	requireCASRejection(t, applyCASFrame(t, f, 3, request), ErrRouteWriteFenced)
 	requireCASProgress(t, f, 3)
 	value, err := st.GetAt(ctx, key, 50)
 	require.NoError(t, err)

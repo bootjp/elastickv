@@ -265,6 +265,7 @@ message RaftAdminStatusResponse {
   uint64 configuration_index = 12;
   bool pending_conf_change = 13;
   bool supports_version_cas = 14;
+  bool supports_replicated_catalog_cas = 15;
 }
 
 message RaftAdminConfigurationRequest {}

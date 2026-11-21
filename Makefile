@@ -1,5 +1,7 @@
 .PHONY: build test lean-check
 
+LEAN ?= lean
+
 build:
 	go build ./...
 
@@ -7,7 +9,7 @@ test:
 	go test -v -race ./...
 
 lean-check:
-	cd lean && for proof in *.lean; do lean -DwarningAsError=true "$$proof" || exit 1; done
+	cd lean && for proof in *.lean; do "$(LEAN)" -DwarningAsError=true "$$proof" || exit 1; done
 
 run:
 	go run cmd/server/demo.go
@@ -35,7 +37,7 @@ TLA_SHA256   := 936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88
 TLA_URL      := https://github.com/tlaplus/tlaplus/releases/download/$(TLA_VERSION)/tla2tools.jar
 TLA_LIB      := ../lib
 
-.PHONY: tla-check tla-tools
+.PHONY: tla-check tla-cas-check tla-tools
 
 tla-tools:
 	@mkdir -p $(dir $(TLA_JAR))
@@ -71,7 +73,10 @@ tla-tools:
 	trap - EXIT HUP INT TERM; \
 	echo "tla2tools.jar ready at $(TLA_JAR) (SHA-256 $(TLA_SHA256))"
 
-tla-check: tla-tools
+tla-cas-check: tla-tools
+	@bash tla/cas/check.sh "$(abspath $(TLA_JAR))"
+
+tla-check: tla-cas-check
 	@# Per-module orchestration lives in scripts/tla-check.sh so adding
 	@# M3..M5 only needs an entry in that script's TLA_MODULES array
 	@# and a `case` line for the gap-invariant string.  The script does

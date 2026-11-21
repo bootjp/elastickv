@@ -304,11 +304,15 @@ func (t *TransactionManager) commitClassified(ctx context.Context, reqs []*pb.Re
 	}
 	reqs = owned
 	if conditions.cas {
+		req, err := t.admitVersionCASRequest(ctx, reqs[0])
+		if err != nil {
+			return nil, err
+		}
 		ctx, err = t.versionCASAdmission(ctx)
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}
-		return t.commitSequential(ctx, reqs, true)
+		return t.commitSequential(ctx, []*pb.Request{req}, true)
 	}
 	if hasTxnRequests(reqs) {
 		return t.commitSequential(ctx, reqs, false)

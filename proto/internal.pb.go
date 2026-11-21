@@ -624,8 +624,11 @@ type Request struct {
 	// timestamp source before proposing this field; replicas recompute the
 	// manifest digest from the request rather than trusting a supplied hash.
 	TimestampBindingOperationId []byte `protobuf:"bytes,9,opt,name=timestamp_binding_operation_id,json=timestampBindingOperationId,proto3" json:"timestamp_binding_operation_id,omitempty"`
-	unknownFields               protoimpl.UnknownFields
-	sizeCache                   protoimpl.SizeCache
+	// The data group selected for a standalone CAS. Only its leader stamps
+	// observed_route_version, using that group's applied catalog.
+	VersionCasGroupId uint64 `protobuf:"varint,10,opt,name=version_cas_group_id,json=versionCasGroupId,proto3" json:"version_cas_group_id,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *Request) Reset() {
@@ -719,6 +722,13 @@ func (x *Request) GetTimestampBindingOperationId() []byte {
 		return x.TimestampBindingOperationId
 	}
 	return nil
+}
+
+func (x *Request) GetVersionCasGroupId() uint64 {
+	if x != nil {
+		return x.VersionCasGroupId
+	}
+	return 0
 }
 
 type RaftCommand struct {
@@ -3341,7 +3351,7 @@ const file_internal_proto_rawDesc = "" +
 	"\x05value\x18\x03 \x01(\fR\x05value\x123\n" +
 	"\x16commit_ts_value_offset\x18\x04 \x01(\x04R\x13commitTsValueOffset\x12%\n" +
 	"\x0erequire_absent\x18\x05 \x01(\bR\rrequireAbsent\x12,\n" +
-	"\x12expected_commit_ts\x18\x06 \x01(\x04R\x10expectedCommitTs\"\x82\x03\n" +
+	"\x12expected_commit_ts\x18\x06 \x01(\x04R\x10expectedCommitTs\"\xb3\x03\n" +
 	"\aRequest\x12\x15\n" +
 	"\x06is_txn\x18\x01 \x01(\bR\x05isTxn\x12\x1c\n" +
 	"\x05phase\x18\x02 \x01(\x0e2\x06.PhaseR\x05phase\x12\x0e\n" +
@@ -3351,7 +3361,9 @@ const file_internal_proto_rawDesc = "" +
 	"\x16observed_route_version\x18\x06 \x01(\x04R\x14observedRouteVersion\x125\n" +
 	"\x17write_fence_bypass_keys\x18\a \x03(\fR\x14writeFenceBypassKeys\x12:\n" +
 	"\x19timestamp_admission_floor\x18\b \x01(\x04R\x17timestampAdmissionFloor\x12C\n" +
-	"\x1etimestamp_binding_operation_id\x18\t \x01(\fR\x1btimestampBindingOperationId\"3\n" +
+	"\x1etimestamp_binding_operation_id\x18\t \x01(\fR\x1btimestampBindingOperationId\x12/\n" +
+	"\x14version_cas_group_id\x18\n" +
+	" \x01(\x04R\x11versionCasGroupId\"3\n" +
 	"\vRaftCommand\x12$\n" +
 	"\brequests\x18\x01 \x03(\v2\b.RequestR\brequests\"\x85\x01\n" +
 	"\x0eForwardRequest\x12\x15\n" +
@@ -3639,11 +3651,12 @@ const file_internal_proto_rawDesc = "" +
 	",MIGRATION_STATE_PROBE_KIND_OWNERSHIP_APPLIED\x10\b\x120\n" +
 	",MIGRATION_STATE_PROBE_KIND_PARTITION_APPLIED\x10\t\x122\n" +
 	".MIGRATION_STATE_PROBE_KIND_NAMESPACE_ADMISSION\x10\n" +
-	"2\x9a\n" +
+	"2\xda\n" +
 	"\n" +
 	"\bInternal\x12.\n" +
 	"\aForward\x12\x0f.ForwardRequest\x1a\x10.ForwardResponse\"\x00\x12<\n" +
-	"\x15ForwardCompareAndSwap\x12\x0f.ForwardRequest\x1a\x10.ForwardResponse\"\x00\x12U\n" +
+	"\x15ForwardCompareAndSwap\x12\x0f.ForwardRequest\x1a\x10.ForwardResponse\"\x00\x12>\n" +
+	"\x17ForwardCompareAndSwapV2\x12\x0f.ForwardRequest\x1a\x10.ForwardResponse\"\x00\x12U\n" +
 	"\x14ForwardAdminProposal\x12\x1c.ForwardAdminProposalRequest\x1a\x1d.ForwardAdminProposalResponse\"\x00\x12I\n" +
 	"\x10ForwardLeaseRead\x12\x18.ForwardLeaseReadRequest\x1a\x19.ForwardLeaseReadResponse\"\x00\x12X\n" +
 	"\x17GetPrepareEvidenceState\x12\x1c.PrepareEvidenceStateRequest\x1a\x1d.PrepareEvidenceStateResponse\"\x00\x12=\n" +
@@ -3739,38 +3752,40 @@ var file_internal_proto_depIdxs = []int32{
 	1,  // 16: LookupTimestampBindingResponse.phase:type_name -> Phase
 	11, // 17: Internal.Forward:input_type -> ForwardRequest
 	11, // 18: Internal.ForwardCompareAndSwap:input_type -> ForwardRequest
-	14, // 19: Internal.ForwardAdminProposal:input_type -> ForwardAdminProposalRequest
-	16, // 20: Internal.ForwardLeaseRead:input_type -> ForwardLeaseReadRequest
-	18, // 21: Internal.GetPrepareEvidenceState:input_type -> PrepareEvidenceStateRequest
-	20, // 22: Internal.RelayPublish:input_type -> RelayPublishRequest
-	22, // 23: Internal.ExportRangeVersions:input_type -> ExportRangeVersionsRequest
-	25, // 24: Internal.ImportRangeVersions:input_type -> ImportRangeVersionsRequest
-	27, // 25: Internal.PromoteStagedVersions:input_type -> PromoteStagedVersionsRequest
-	29, // 26: Internal.ApplyTargetStagedReadiness:input_type -> TargetStagedReadinessRequest
-	31, // 27: Internal.ProbeMigrationLocks:input_type -> ProbeMigrationLocksRequest
-	34, // 28: Internal.CleanupMigration:input_type -> CleanupMigrationRequest
-	36, // 29: Internal.ProbeMigrationState:input_type -> ProbeMigrationStateRequest
-	38, // 30: Internal.IssueMigrationTimestamp:input_type -> IssueMigrationTimestampRequest
-	40, // 31: Internal.IssueBoundTimestamp:input_type -> IssueBoundTimestampRequest
-	42, // 32: Internal.LookupTimestampBinding:input_type -> LookupTimestampBindingRequest
-	12, // 33: Internal.Forward:output_type -> ForwardResponse
-	12, // 34: Internal.ForwardCompareAndSwap:output_type -> ForwardResponse
-	15, // 35: Internal.ForwardAdminProposal:output_type -> ForwardAdminProposalResponse
-	17, // 36: Internal.ForwardLeaseRead:output_type -> ForwardLeaseReadResponse
-	19, // 37: Internal.GetPrepareEvidenceState:output_type -> PrepareEvidenceStateResponse
-	21, // 38: Internal.RelayPublish:output_type -> RelayPublishResponse
-	23, // 39: Internal.ExportRangeVersions:output_type -> ExportRangeVersionsResponse
-	26, // 40: Internal.ImportRangeVersions:output_type -> ImportRangeVersionsResponse
-	28, // 41: Internal.PromoteStagedVersions:output_type -> PromoteStagedVersionsResponse
-	30, // 42: Internal.ApplyTargetStagedReadiness:output_type -> TargetStagedReadinessResponse
-	32, // 43: Internal.ProbeMigrationLocks:output_type -> ProbeMigrationLocksResponse
-	35, // 44: Internal.CleanupMigration:output_type -> CleanupMigrationResponse
-	37, // 45: Internal.ProbeMigrationState:output_type -> ProbeMigrationStateResponse
-	39, // 46: Internal.IssueMigrationTimestamp:output_type -> IssueMigrationTimestampResponse
-	41, // 47: Internal.IssueBoundTimestamp:output_type -> IssueBoundTimestampResponse
-	43, // 48: Internal.LookupTimestampBinding:output_type -> LookupTimestampBindingResponse
-	33, // [33:49] is the sub-list for method output_type
-	17, // [17:33] is the sub-list for method input_type
+	11, // 19: Internal.ForwardCompareAndSwapV2:input_type -> ForwardRequest
+	14, // 20: Internal.ForwardAdminProposal:input_type -> ForwardAdminProposalRequest
+	16, // 21: Internal.ForwardLeaseRead:input_type -> ForwardLeaseReadRequest
+	18, // 22: Internal.GetPrepareEvidenceState:input_type -> PrepareEvidenceStateRequest
+	20, // 23: Internal.RelayPublish:input_type -> RelayPublishRequest
+	22, // 24: Internal.ExportRangeVersions:input_type -> ExportRangeVersionsRequest
+	25, // 25: Internal.ImportRangeVersions:input_type -> ImportRangeVersionsRequest
+	27, // 26: Internal.PromoteStagedVersions:input_type -> PromoteStagedVersionsRequest
+	29, // 27: Internal.ApplyTargetStagedReadiness:input_type -> TargetStagedReadinessRequest
+	31, // 28: Internal.ProbeMigrationLocks:input_type -> ProbeMigrationLocksRequest
+	34, // 29: Internal.CleanupMigration:input_type -> CleanupMigrationRequest
+	36, // 30: Internal.ProbeMigrationState:input_type -> ProbeMigrationStateRequest
+	38, // 31: Internal.IssueMigrationTimestamp:input_type -> IssueMigrationTimestampRequest
+	40, // 32: Internal.IssueBoundTimestamp:input_type -> IssueBoundTimestampRequest
+	42, // 33: Internal.LookupTimestampBinding:input_type -> LookupTimestampBindingRequest
+	12, // 34: Internal.Forward:output_type -> ForwardResponse
+	12, // 35: Internal.ForwardCompareAndSwap:output_type -> ForwardResponse
+	12, // 36: Internal.ForwardCompareAndSwapV2:output_type -> ForwardResponse
+	15, // 37: Internal.ForwardAdminProposal:output_type -> ForwardAdminProposalResponse
+	17, // 38: Internal.ForwardLeaseRead:output_type -> ForwardLeaseReadResponse
+	19, // 39: Internal.GetPrepareEvidenceState:output_type -> PrepareEvidenceStateResponse
+	21, // 40: Internal.RelayPublish:output_type -> RelayPublishResponse
+	23, // 41: Internal.ExportRangeVersions:output_type -> ExportRangeVersionsResponse
+	26, // 42: Internal.ImportRangeVersions:output_type -> ImportRangeVersionsResponse
+	28, // 43: Internal.PromoteStagedVersions:output_type -> PromoteStagedVersionsResponse
+	30, // 44: Internal.ApplyTargetStagedReadiness:output_type -> TargetStagedReadinessResponse
+	32, // 45: Internal.ProbeMigrationLocks:output_type -> ProbeMigrationLocksResponse
+	35, // 46: Internal.CleanupMigration:output_type -> CleanupMigrationResponse
+	37, // 47: Internal.ProbeMigrationState:output_type -> ProbeMigrationStateResponse
+	39, // 48: Internal.IssueMigrationTimestamp:output_type -> IssueMigrationTimestampResponse
+	41, // 49: Internal.IssueBoundTimestamp:output_type -> IssueBoundTimestampResponse
+	43, // 50: Internal.LookupTimestampBinding:output_type -> LookupTimestampBindingResponse
+	34, // [34:51] is the sub-list for method output_type
+	17, // [17:34] is the sub-list for method input_type
 	17, // [17:17] is the sub-list for extension type_name
 	17, // [17:17] is the sub-list for extension extendee
 	0,  // [0:17] is the sub-list for field type_name

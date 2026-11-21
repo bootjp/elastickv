@@ -316,7 +316,7 @@ func (p *LeaderProxy) forward(callerCtx context.Context, parentCtx context.Conte
 
 	forward := cli.Forward
 	if HasCASMutation(reqs) {
-		forward = cli.ForwardCompareAndSwap
+		forward = cli.ForwardCompareAndSwapV2
 	}
 	resp, err := forward(ctx, &pb.ForwardRequest{
 		IsTxn:                 reqs[0].IsTxn,

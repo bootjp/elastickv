@@ -8,6 +8,7 @@ service Internal {
   rpc Forward(ForwardRequest) returns (ForwardResponse) {}
   // A legacy leader must reject a forwarded CAS before proposing it.
   rpc ForwardCompareAndSwap(ForwardRequest) returns (ForwardResponse) {}
+  rpc ForwardCompareAndSwapV2(ForwardRequest) returns (ForwardResponse) {}
   rpc ForwardAdminProposal(ForwardAdminProposalRequest) returns (ForwardAdminProposalResponse) {}
   rpc ForwardLeaseRead(ForwardLeaseReadRequest) returns (ForwardLeaseReadResponse) {}
   rpc GetPrepareEvidenceState(PrepareEvidenceStateRequest) returns (PrepareEvidenceStateResponse) {}
@@ -96,6 +97,9 @@ message Request {
   // timestamp source before proposing this field; replicas recompute the
   // manifest digest from the request rather than trusting a supplied hash.
   bytes timestamp_binding_operation_id = 9;
+  // The data group selected for a standalone CAS. Only its leader stamps
+  // observed_route_version, using that group's applied catalog.
+  uint64 version_cas_group_id = 10;
 }
 
 message RaftCommand {

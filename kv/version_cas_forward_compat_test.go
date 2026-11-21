@@ -18,6 +18,7 @@ func TestVersionCASForwardRejectsNilRequests(t *testing.T) {
 	req := onePhaseReq(0, 0, 0, []byte("switch"), []byte("off"))
 	req.Mutations[1].Op = pb.Op_COMPARE_AND_SWAP
 	req.Mutations[1].ExpectedCommitTs = 10
+	req.VersionCasGroupId = 1
 	for _, requests := range [][]*pb.Request{{nil, req}, {req, nil}, {nil}} {
 		_, err := proxy.Commit(t.Context(), requests)
 		require.ErrorIs(t, err, ErrInvalidRequest)
@@ -32,14 +33,14 @@ func TestVersionCASForwardToLegacyLeader(t *testing.T) {
 		desc := pb.Internal_ServiceDesc
 		desc.Methods = nil
 		for _, method := range pb.Internal_ServiceDesc.Methods {
-			if method.MethodName != "ForwardCompareAndSwap" {
+			if method.MethodName != "ForwardCompareAndSwapV2" {
 				desc.Methods = append(desc.Methods, method)
 			}
 		}
 		s.RegisterService(&desc, legacy)
 	}, grpc.UnknownServiceHandler(func(_ any, stream grpc.ServerStream) error {
 		method, _ := grpc.MethodFromServerStream(stream)
-		if method == pb.Internal_ForwardCompareAndSwap_FullMethodName {
+		if method == pb.Internal_ForwardCompareAndSwapV2_FullMethodName {
 			dedicatedCalls.Add(1)
 		}
 		return status.Error(codes.Unimplemented, "unknown method")
@@ -49,6 +50,7 @@ func TestVersionCASForwardToLegacyLeader(t *testing.T) {
 	req := onePhaseReq(0, 0, 0, []byte("switch"), []byte("off"))
 	req.Mutations[1].Op = pb.Op_COMPARE_AND_SWAP
 	req.Mutations[1].ExpectedCommitTs = 10
+	req.VersionCasGroupId = 1
 
 	_, err := proxy.Commit(t.Context(), []*pb.Request{req})
 	require.ErrorIs(t, err, ErrVersionCASUnavailable)

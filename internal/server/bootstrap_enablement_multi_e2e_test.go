@@ -246,6 +246,7 @@ func multiEnablementServices(process *multiEnablementProcess, clock *kv.HLC) {
 	proposer := process.shard.Proposer()
 	process.transaction = adapter.NewInternalMigrationTransaction(proposer, nil, process.runtime.Store, process.runtime.Spec.ID, kv.WithVersionCASAdmission(process.runtime.VersionCASAdmission))
 	options := internalServerOptions(coordinate, nil, proposer, process.shard, process.runtime.Spec.ID)
+	options = append(options, adapter.WithInternalCASForwardRouting(process.runtime.Spec.ID, process.shards.CheckVersionCASForwardRoute))
 	options = append(options, adapter.WithInternalStore(process.runtime.Store), adapter.WithInternalPrimaryCommitEvidence(process.shards))
 	pb.RegisterInternalServer(process.server, adapter.NewInternalWithEngine(process.transaction, process.runtime.Engine, clock, nil, options...))
 	pb.RegisterRaftAdminServer(process.server, raftadmin.NewServerWithInterceptor(process.runtime.Engine, nil, process.runtime.VersionCASCapable))

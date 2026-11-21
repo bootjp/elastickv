@@ -54,21 +54,22 @@ func (s *Server) Status(context.Context, *pb.RaftAdminStatusRequest) (*pb.RaftAd
 		return nil, grpcStatus(codes.FailedPrecondition, "raft engine is not configured")
 	}
 	current := s.engine.Status()
+	// Leave the V1 capability unset. V1 proposals use watcher routing.
 	return &pb.RaftAdminStatusResponse{
-		State:              stateToProto(current.State),
-		LeaderId:           current.Leader.ID,
-		LeaderAddress:      current.Leader.Address,
-		Term:               current.Term,
-		CommitIndex:        current.CommitIndex,
-		AppliedIndex:       current.AppliedIndex,
-		LastLogIndex:       current.LastLogIndex,
-		LastSnapshotIndex:  current.LastSnapshotIndex,
-		FsmPending:         current.FSMPending,
-		NumPeers:           current.NumPeers,
-		LastContactNanos:   current.LastContact.Nanoseconds(),
-		ConfigurationIndex: current.ConfigurationIndex,
-		PendingConfChange:  current.PendingConfChange,
-		SupportsVersionCas: s.versionCASCapable && current.State != raftengine.StateShutdown,
+		State:                        stateToProto(current.State),
+		LeaderId:                     current.Leader.ID,
+		LeaderAddress:                current.Leader.Address,
+		Term:                         current.Term,
+		CommitIndex:                  current.CommitIndex,
+		AppliedIndex:                 current.AppliedIndex,
+		LastLogIndex:                 current.LastLogIndex,
+		LastSnapshotIndex:            current.LastSnapshotIndex,
+		FsmPending:                   current.FSMPending,
+		NumPeers:                     current.NumPeers,
+		LastContactNanos:             current.LastContact.Nanoseconds(),
+		ConfigurationIndex:           current.ConfigurationIndex,
+		PendingConfChange:            current.PendingConfChange,
+		SupportsReplicatedCatalogCas: s.versionCASCapable && current.State != raftengine.StateShutdown,
 	}, nil
 }
 

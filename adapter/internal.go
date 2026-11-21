@@ -197,7 +197,7 @@ type Internal struct {
 	migrationPartitionProtocolReady func() bool
 	migrationNamespaceReady         func() bool
 	transferSizeReady               func() bool
-	casForwardRoute                 func([]byte) (uint64, error)
+	casForwardRoute                 func(context.Context, uint64, []byte) error
 	casForwardGroup                 uint64
 	routeEngine                     *distribution.Engine
 	readTracker                     *kv.ActiveTimestampTracker
@@ -260,7 +260,7 @@ func (i *Internal) preflightForwardRequests(ctx context.Context, req *pb.Forward
 	if i.kvForwardRejected {
 		return forwardStatusForReceiver(req, ErrKVForwardNotSupported, false)
 	}
-	if err := i.preflightForwardCAS(req); err != nil {
+	if err := i.preflightForwardCAS(ctx, req); err != nil {
 		return err
 	}
 	if i.leader == nil || i.leader.State() != raftengine.StateLeader {

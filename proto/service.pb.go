@@ -1945,23 +1945,24 @@ func (*RaftAdminStatusRequest) Descriptor() ([]byte, []int) {
 }
 
 type RaftAdminStatusResponse struct {
-	state              protoimpl.MessageState `protogen:"open.v1"`
-	State              RaftAdminState         `protobuf:"varint,1,opt,name=state,proto3,enum=RaftAdminState" json:"state,omitempty"`
-	LeaderId           string                 `protobuf:"bytes,2,opt,name=leader_id,json=leaderId,proto3" json:"leader_id,omitempty"`
-	LeaderAddress      string                 `protobuf:"bytes,3,opt,name=leader_address,json=leaderAddress,proto3" json:"leader_address,omitempty"`
-	Term               uint64                 `protobuf:"varint,4,opt,name=term,proto3" json:"term,omitempty"`
-	CommitIndex        uint64                 `protobuf:"varint,5,opt,name=commit_index,json=commitIndex,proto3" json:"commit_index,omitempty"`
-	AppliedIndex       uint64                 `protobuf:"varint,6,opt,name=applied_index,json=appliedIndex,proto3" json:"applied_index,omitempty"`
-	LastLogIndex       uint64                 `protobuf:"varint,7,opt,name=last_log_index,json=lastLogIndex,proto3" json:"last_log_index,omitempty"`
-	LastSnapshotIndex  uint64                 `protobuf:"varint,8,opt,name=last_snapshot_index,json=lastSnapshotIndex,proto3" json:"last_snapshot_index,omitempty"`
-	FsmPending         uint64                 `protobuf:"varint,9,opt,name=fsm_pending,json=fsmPending,proto3" json:"fsm_pending,omitempty"`
-	NumPeers           uint64                 `protobuf:"varint,10,opt,name=num_peers,json=numPeers,proto3" json:"num_peers,omitempty"`
-	LastContactNanos   int64                  `protobuf:"varint,11,opt,name=last_contact_nanos,json=lastContactNanos,proto3" json:"last_contact_nanos,omitempty"`
-	ConfigurationIndex uint64                 `protobuf:"varint,12,opt,name=configuration_index,json=configurationIndex,proto3" json:"configuration_index,omitempty"`
-	PendingConfChange  bool                   `protobuf:"varint,13,opt,name=pending_conf_change,json=pendingConfChange,proto3" json:"pending_conf_change,omitempty"`
-	SupportsVersionCas bool                   `protobuf:"varint,14,opt,name=supports_version_cas,json=supportsVersionCas,proto3" json:"supports_version_cas,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	state                        protoimpl.MessageState `protogen:"open.v1"`
+	State                        RaftAdminState         `protobuf:"varint,1,opt,name=state,proto3,enum=RaftAdminState" json:"state,omitempty"`
+	LeaderId                     string                 `protobuf:"bytes,2,opt,name=leader_id,json=leaderId,proto3" json:"leader_id,omitempty"`
+	LeaderAddress                string                 `protobuf:"bytes,3,opt,name=leader_address,json=leaderAddress,proto3" json:"leader_address,omitempty"`
+	Term                         uint64                 `protobuf:"varint,4,opt,name=term,proto3" json:"term,omitempty"`
+	CommitIndex                  uint64                 `protobuf:"varint,5,opt,name=commit_index,json=commitIndex,proto3" json:"commit_index,omitempty"`
+	AppliedIndex                 uint64                 `protobuf:"varint,6,opt,name=applied_index,json=appliedIndex,proto3" json:"applied_index,omitempty"`
+	LastLogIndex                 uint64                 `protobuf:"varint,7,opt,name=last_log_index,json=lastLogIndex,proto3" json:"last_log_index,omitempty"`
+	LastSnapshotIndex            uint64                 `protobuf:"varint,8,opt,name=last_snapshot_index,json=lastSnapshotIndex,proto3" json:"last_snapshot_index,omitempty"`
+	FsmPending                   uint64                 `protobuf:"varint,9,opt,name=fsm_pending,json=fsmPending,proto3" json:"fsm_pending,omitempty"`
+	NumPeers                     uint64                 `protobuf:"varint,10,opt,name=num_peers,json=numPeers,proto3" json:"num_peers,omitempty"`
+	LastContactNanos             int64                  `protobuf:"varint,11,opt,name=last_contact_nanos,json=lastContactNanos,proto3" json:"last_contact_nanos,omitempty"`
+	ConfigurationIndex           uint64                 `protobuf:"varint,12,opt,name=configuration_index,json=configurationIndex,proto3" json:"configuration_index,omitempty"`
+	PendingConfChange            bool                   `protobuf:"varint,13,opt,name=pending_conf_change,json=pendingConfChange,proto3" json:"pending_conf_change,omitempty"`
+	SupportsVersionCas           bool                   `protobuf:"varint,14,opt,name=supports_version_cas,json=supportsVersionCas,proto3" json:"supports_version_cas,omitempty"`
+	SupportsReplicatedCatalogCas bool                   `protobuf:"varint,15,opt,name=supports_replicated_catalog_cas,json=supportsReplicatedCatalogCas,proto3" json:"supports_replicated_catalog_cas,omitempty"`
+	unknownFields                protoimpl.UnknownFields
+	sizeCache                    protoimpl.SizeCache
 }
 
 func (x *RaftAdminStatusResponse) Reset() {
@@ -2088,6 +2089,13 @@ func (x *RaftAdminStatusResponse) GetPendingConfChange() bool {
 func (x *RaftAdminStatusResponse) GetSupportsVersionCas() bool {
 	if x != nil {
 		return x.SupportsVersionCas
+	}
+	return false
+}
+
+func (x *RaftAdminStatusResponse) GetSupportsReplicatedCatalogCas() bool {
+	if x != nil {
+		return x.SupportsReplicatedCatalogCas
 	}
 	return false
 }
@@ -3025,7 +3033,7 @@ const file_service_proto_rawDesc = "" +
 	"\bstart_ts\x18\x01 \x01(\x04R\astartTs\",\n" +
 	"\x10RollbackResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\"\x18\n" +
-	"\x16RaftAdminStatusRequest\"\xb5\x04\n" +
+	"\x16RaftAdminStatusRequest\"\xfc\x04\n" +
 	"\x17RaftAdminStatusResponse\x12%\n" +
 	"\x05state\x18\x01 \x01(\x0e2\x0f.RaftAdminStateR\x05state\x12\x1b\n" +
 	"\tleader_id\x18\x02 \x01(\tR\bleaderId\x12%\n" +
@@ -3042,7 +3050,8 @@ const file_service_proto_rawDesc = "" +
 	"\x12last_contact_nanos\x18\v \x01(\x03R\x10lastContactNanos\x12/\n" +
 	"\x13configuration_index\x18\f \x01(\x04R\x12configurationIndex\x12.\n" +
 	"\x13pending_conf_change\x18\r \x01(\bR\x11pendingConfChange\x120\n" +
-	"\x14supports_version_cas\x18\x0e \x01(\bR\x12supportsVersionCas\"\x1f\n" +
+	"\x14supports_version_cas\x18\x0e \x01(\bR\x12supportsVersionCas\x12E\n" +
+	"\x1fsupports_replicated_catalog_cas\x18\x0f \x01(\bR\x1csupportsReplicatedCatalogCas\"\x1f\n" +
 	"\x1dRaftAdminConfigurationRequest\"W\n" +
 	"\x0fRaftAdminMember\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x18\n" +

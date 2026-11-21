@@ -171,7 +171,7 @@ func validateBootstrapDataPayload(payload []byte) error {
 		return nil
 	}
 	if raftengine.IsVersionCASRaftPayload(payload) {
-		return validateBootstrapVersionCASPayload(payload[len(raftengine.VersionCASFrame):])
+		return validateBootstrapVersionCASPayload(payload)
 	}
 	switch payload[0] {
 	case BootstrapPayloadSingle:
@@ -198,19 +198,15 @@ func validateBootstrapKVSingle(body []byte) error {
 	return validateBootstrapKVRequest(&request)
 }
 
-func validateBootstrapVersionCASPayload(body []byte) error {
-	var request pb.Request
-	if err := decodeBootstrapAdmissionProto(body, &request); err != nil {
-		return err
-	}
-	reqs := []*pb.Request{&request}
-	if !kv.HasCASMutation(reqs) {
-		return errors.WithStack(ErrBootstrapAdmissionPayload)
-	}
-	if err := kv.ValidateCASProposalShape(reqs); err != nil {
+func validateBootstrapVersionCASPayload(payload []byte) error {
+	request, err := kv.DecodeVersionCASRaftPayload(payload)
+	if err != nil {
 		return errors.WithStack(err)
 	}
-	return validateBootstrapKVRequest(&request)
+	if err := decodeBootstrapAdmissionProto(payload[len(raftengine.VersionCASFrame):], request); err != nil {
+		return err
+	}
+	return validateBootstrapKVRequest(request)
 }
 
 func validateBootstrapKVBatch(payload []byte) error {

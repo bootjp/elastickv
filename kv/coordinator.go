@@ -1597,11 +1597,8 @@ func (c *Coordinate) redirect(ctx context.Context, reqs *OperationGroup[OP]) (*C
 
 	fwdCtx, cancel := context.WithTimeout(ctx, redirectForwardTimeout)
 	defer cancel()
-	forward := cli.Forward
-	if HasCASMutation(requests) {
-		forward = cli.ForwardCompareAndSwap
-	}
-	r, err := forward(fwdCtx, c.toForwardRequest(requests))
+	// Dispatch rejects CAS on this legacy coordinator before routing.
+	r, err := cli.Forward(fwdCtx, c.toForwardRequest(requests))
 	if err != nil {
 		return nil, classifyForwardRPCError(err, requests)
 	}

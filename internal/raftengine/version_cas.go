@@ -8,14 +8,15 @@ import (
 
 var ErrVersionCASUnavailable = errors.New("version CAS admission unavailable")
 
-// VersionCASFrame begins with an opcode for which preceding KV binaries
-// halt rather than advance their applied index.
-const VersionCASFrame = "\x06CAS\x01"
+// VersionCASFrame requires routing evidence from the same Raft log as the CAS.
+const VersionCASFrame = "\x06CAS\x02"
+
+const versionCASFramePrefix = "\x06CAS"
 
 const MigrationVersionIdentityFrame = "\x06MVI\x01"
 
 func IsVersionCASRaftPayload(payload []byte) bool {
-	return bytes.HasPrefix(payload, []byte(VersionCASFrame))
+	return bytes.HasPrefix(payload, []byte(versionCASFramePrefix))
 }
 
 // RequiresVersionCASProof covers both the activation and subsequent CAS.

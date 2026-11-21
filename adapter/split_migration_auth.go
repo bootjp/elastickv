@@ -49,7 +49,11 @@ func splitMigrationProtectedMethod(method string) bool {
 func splitMigrationAuthenticatedMethod(method string, peerAuthEnforced bool) bool {
 	// Forward can write arbitrary system/transaction metadata. In a migration
 	// cluster it is a privileged peer RPC, not an alternative public write API.
-	return splitMigrationProtectedMethod(method) || (peerAuthEnforced && (method == pb.Internal_Forward_FullMethodName || method == pb.Internal_ForwardCompareAndSwap_FullMethodName))
+	return splitMigrationProtectedMethod(method) || (peerAuthEnforced && (method == pb.Internal_Forward_FullMethodName || isCASForwardMethod(method)))
+}
+
+func isCASForwardMethod(method string) bool {
+	return method == pb.Internal_ForwardCompareAndSwap_FullMethodName || method == pb.Internal_ForwardCompareAndSwapV2_FullMethodName
 }
 
 // SplitMigrationTokenAuth protects catalog splits, migration control and raw MVCC exports.
@@ -93,8 +97,9 @@ func SplitMigrationTokenAuth(token string, insecureNoAuth, peerAuthEnforced bool
 }
 
 func splitForwardRequiresPeerAuth(method, token string, req any) bool {
-	return (method == pb.Internal_Forward_FullMethodName || method == pb.Internal_ForwardCompareAndSwap_FullMethodName) &&
-		(splitForwardWritesJobControl(req) || (token != "" && method == pb.Internal_ForwardCompareAndSwap_FullMethodName))
+	cas := isCASForwardMethod(method)
+	return (method == pb.Internal_Forward_FullMethodName || cas) &&
+		(splitForwardWritesJobControl(req) || (token != "" && cas))
 }
 
 // Job authority and typed migration metadata must never be planted during

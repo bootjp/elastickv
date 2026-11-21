@@ -14,6 +14,7 @@ func validCASOperation(group *OperationGroup[OP], elem *Elem[OP]) bool {
 	return group.IsTxn && len(group.Elems) == 1 && len(group.ReadKeys) == 0 &&
 		len(group.PrimaryKey) == 0 && !group.RequireAllParticipants &&
 		group.StartTS == 0 && group.CommitTS == 0 && group.PrevCommitTS == 0 &&
+		group.ObservedRouteVersion == 0 &&
 		validCASElem(elem)
 }
 
@@ -50,17 +51,18 @@ func ValidateCASProposalShape(reqs []*pb.Request) error {
 
 func validateCASProposalShape(reqs []*pb.Request) error {
 	_, meta, ok := casRequestMutation(reqs)
-	if !ok || reqs[0].Ts == 0 || meta.CommitTS <= reqs[0].Ts {
+	if !ok || reqs[0].GetVersionCasGroupId() == 0 || reqs[0].Ts == 0 || meta.CommitTS <= reqs[0].Ts {
 		return errors.WithStack(ErrInvalidRequest)
 	}
 	return nil
 }
 
-// ForwardCASMutation validates the CAS shape and confirms the sender left
-// both write timestamps and their admission evidence for the receiving leader.
+// ForwardCASMutation leaves timestamp and catalog proof stamping to the
+// receiving leader.
 func ForwardCASMutation(reqs []*pb.Request) (*pb.Mutation, error) {
 	mut, meta, ok := casRequestMutation(reqs)
-	if !ok || reqs[0].Ts != 0 || meta.CommitTS != 0 || reqs[0].TimestampAdmissionFloor != 0 {
+	if !ok || reqs[0].GetVersionCasGroupId() == 0 || reqs[0].Ts != 0 || meta.CommitTS != 0 || reqs[0].TimestampAdmissionFloor != 0 ||
+		reqs[0].ObservedRouteVersion != 0 {
 		return nil, errors.WithStack(ErrInvalidRequest)
 	}
 	return mut, nil
@@ -122,10 +124,9 @@ func (c *ShardedCoordinator) dispatchCAS(ctx context.Context, group *OperationGr
 	if !ok || !versionCASInitialRoute(route) {
 		return nil, errors.Wrap(ErrVersionCASUnavailable, "route has migration history or is unavailable")
 	}
-	c.maybeAutoPinObservedRouteVersion(group, false)
 	mut := elemToMutation(elem)
 	c.observeMutation(route.RouteID, mut, group.KeyVizLabel)
 	ctx = context.WithValue(ctx, leaderIssuedCommitTSContextKey{}, true)
 	return c.dispatchSingleShardTxn(ctx, 0, 0, 0, elem.Key, route.GroupID, []*pb.Mutation{mut}, nil,
-		group.ObservedRouteVersion, c.writeFenceBypassKeysByGroup(group.Elems)[route.GroupID])
+		0, nil)
 }

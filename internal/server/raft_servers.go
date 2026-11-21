@@ -132,7 +132,7 @@ func startRaftServers(
 		pb.RegisterRawKVServer(gs, grpcSvc)
 		pb.RegisterTransactionalKVServer(gs, grpcSvc)
 		internalOpts := internalServerOptions(coordinate, adminServer, proposerForGroup(rt, shardGroups), shardGroups[rt.Spec.ID], rt.Spec.ID)
-		internalOpts = append(internalOpts, adapter.WithInternalCASForwardRouting(rt.Spec.ID, shardStore.ResolveVersionCASGroupForKey))
+		internalOpts = append(internalOpts, adapter.WithInternalCASForwardRouting(rt.Spec.ID, shardStore.CheckVersionCASForwardRoute))
 		internalOpts = append(internalOpts, clusterbootstrap.BootstrapInternalPolicyOptions(rt, proposerForGroup(rt, shardGroups))...)
 		internalOpts = append(internalOpts, dedicatedTimestampCutoverOptions(shardGroups)...)
 		internalOpts = append(internalOpts, adapter.WithInternalMigrationOwnershipReady(func() bool {
@@ -248,9 +248,6 @@ func internalServerOptions(
 	groupID uint64,
 ) []adapter.InternalOption {
 	opts := internalTimestampOptions(coordinate)
-	if resolver, ok := coordinate.(interface{ ResolveOperationGroupForKey([]byte) (uint64, error) }); ok && groupID != 0 {
-		opts = append(opts, adapter.WithInternalCASForwardRouting(groupID, resolver.ResolveOperationGroupForKey))
-	}
 	if adminServer != nil {
 		opts = append(opts, adapter.WithInternalAdminProposer(proposer))
 	}

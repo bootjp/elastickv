@@ -25,10 +25,7 @@ func usesCAS(mut *pb.Mutation) bool {
 	return mut.GetOp() == pb.Op_COMPARE_AND_SWAP || mut.GetExpectedCommitTs() != 0
 }
 
-func (f *kvFSM) applyCASEntry(ctx context.Context, reqs []*pb.Request, protectMigrationRange bool) any {
-	if protectMigrationRange && f.pendingApplyIdx == 0 {
-		return casEntryHalt(errors.New("CAS entry requires a Raft applied index"))
-	}
+func (f *kvFSM) applyCASEntry(ctx context.Context, reqs []*pb.Request, apply func(context.Context, *pb.Request) error) any {
 	applier, ok := f.store.(store.RaftEntryApplier)
 	if !ok {
 		return casEntryHalt(store.ErrNotSupported)
@@ -36,7 +33,7 @@ func (f *kvFSM) applyCASEntry(ctx context.Context, reqs []*pb.Request, protectMi
 	resp := &fsmApplyResponse{results: make([]error, len(reqs))}
 	f.beginDeferredApplyNotices()
 	err := applier.ApplyRaftEntry(ctx, f.pendingApplyIdx, func(ctx context.Context) error {
-		return f.stageCASEntry(ctx, reqs, resp.results, protectMigrationRange)
+		return f.stageCASEntry(ctx, reqs, resp.results, apply)
 	})
 	if err != nil {
 		f.discardDeferredApplyNotices()
@@ -54,38 +51,13 @@ func (f *kvFSM) applyCASEntry(ctx context.Context, reqs []*pb.Request, protectMi
 	return nil
 }
 
-func (f *kvFSM) stageCASEntry(ctx context.Context, reqs []*pb.Request, results []error, protectMigrationRange bool) error {
+func (f *kvFSM) stageCASEntry(ctx context.Context, reqs []*pb.Request, results []error, apply func(context.Context, *pb.Request) error) error {
 	replayed, err := store.StageRaftEntryProgress(ctx, f.pendingApplyIdx)
 	if err != nil || replayed {
 		return errors.WithStack(err)
 	}
-	if protectMigrationRange {
-		// Frame decoding validated the standalone request and mutation layout.
-		err := checkVersionCASMigrationRange(ctx, f.store, reqs[0].Mutations[1].Key)
-		if errors.Is(err, ErrVersionCASUnavailable) {
-			results[0] = err
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-	}
-	return f.stageCASRequests(ctx, reqs, results)
-}
-
-func (f *kvFSM) stageCASRequests(ctx context.Context, reqs []*pb.Request, results []error) error {
-	// The replicated frame only admits a standalone CAS. Keep the scoped
-	// path fail-closed to non-CAS requests if used with a decoded batch.
-	for _, req := range reqs {
-		if !requestUsesCAS(req) {
-			for i := range results {
-				results[i] = ErrInvalidRequest
-			}
-			return nil
-		}
-	}
 	for i, req := range reqs {
-		err := f.applyPreparedCAS(ctx, req)
+		err := apply(ctx, req)
 		if err != nil && !isCASApplyVerdict(err) {
 			return errors.Wrapf(err, "CAS request %d", i)
 		}
@@ -94,15 +66,26 @@ func (f *kvFSM) stageCASRequests(ctx context.Context, reqs []*pb.Request, result
 	return nil
 }
 
-func (f *kvFSM) applyPreparedCAS(ctx context.Context, req *pb.Request) error {
-	if err := f.validateCASForApply(req); err != nil {
+func (f *kvFSM) applyFramedCAS(ctx context.Context, req *pb.Request) error {
+	mut := req.Mutations[1]
+	// A committed owner change or write fence takes precedence over the
+	// more general exclusion of ranges with migration history.
+	if err := f.checkAppliedVersionCASRoute(ctx, req.GetVersionCasGroupId(), req.GetObservedRouteVersion(), mut.Key); err != nil {
+		return err
+	}
+	if err := f.verifySourceWriteFenceForRange(ctx, mut.Key, nextScanCursor(mut.Key)); err != nil {
+		return err
+	}
+	if err := checkVersionCASMigrationRange(ctx, f.store, mut.Key); err != nil {
 		return err
 	}
 	ctx, commitTS, err := f.prepareRequestForApply(ctx, req)
 	if err != nil {
 		return err
 	}
-	return f.handleCASRequest(ctx, req, commitTS)
+	// The catalog and migration guards proved this is an initial range
+	// without staged visibility aliases.
+	return f.compareAndStageCAS(ctx, mut, nil, req.GetTs(), commitTS)
 }
 
 func casEntryHalt(err error) any {
@@ -117,33 +100,7 @@ func isCASApplyVerdict(err error) bool {
 		return false
 	}
 	return isRawApplyVerdict(err) || errors.Is(err, ErrCASMismatch) ||
-		errors.Is(err, ErrTxnCommitTSRequired) || errors.Is(err, ErrComposed1Violation)
-}
-
-func (f *kvFSM) validateCASForApply(r *pb.Request) error {
-	if !requestUsesCAS(r) {
-		return nil
-	}
-	if !f.commitTSFenceEnabled.Load() {
-		return errors.Wrap(ErrInvalidRequest, "CAS requires the replicated commit timestamp fence")
-	}
-	return ValidateCASProposalShape([]*pb.Request{r})
-}
-
-func (f *kvFSM) handleCASRequest(ctx context.Context, r *pb.Request, commitTS uint64) error {
-	muts := r.Mutations[1:]
-	mut := muts[0]
-	if err := f.verifyTxnRouteAdmission(ctx, r); err != nil {
-		return err
-	}
-	if _, err := f.uniqueMutationsAboveFloorForRequest(ctx, r, muts, commitTS); err != nil {
-		return err
-	}
-	readKeys, err := f.onePhaseConflictReadKeys(ctx, muts, r.ReadKeys)
-	if err != nil {
-		return err
-	}
-	return f.compareAndStageCAS(ctx, mut, readKeys, r.Ts, commitTS)
+		errors.Is(err, ErrTxnCommitTSRequired) || errors.Is(err, ErrVersionCASUnavailable)
 }
 
 func (f *kvFSM) compareAndStageCAS(ctx context.Context, mut *pb.Mutation, readKeys [][]byte, startTS, commitTS uint64) error {
@@ -165,11 +122,12 @@ func (f *kvFSM) compareAndStageCAS(ctx context.Context, mut *pb.Mutation, readKe
 	if err != nil {
 		return err
 	}
-	if head.TS > startTS {
-		return errors.WithStack(store.NewWriteConflictError(mut.Key))
-	}
 	if !casRecordMatches(head, mut.ExpectedCommitTs, commitTS) {
 		return ErrCASMismatch
+	}
+	// The token matches. A start timestamp behind that version still fails OCC.
+	if head.TS > startTS {
+		return errors.WithStack(store.NewWriteConflictError(mut.Key))
 	}
 	return f.stageCASReplacement(ctx, mut, readKeys, startTS, commitTS, head.ExpireAt)
 }

@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/raftbootstrap"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
@@ -13,18 +14,35 @@ import (
 
 func applyDecodedCASBatch(t *testing.T, f *kvFSM, reqs []*pb.Request) any {
 	t.Helper()
-	return f.applyCASEntry(t.Context(), reqs, false)
+	return f.applyCASEntry(t.Context(), reqs, func(ctx context.Context, r *pb.Request) error {
+		if err := validateCASProposalShape([]*pb.Request{r}); err != nil {
+			return err
+		}
+		ctx, commitTS, err := f.prepareRequestForApply(ctx, r)
+		if err != nil {
+			return err
+		}
+		muts := r.Mutations[1:]
+		readKeys, err := f.onePhaseConflictReadKeys(ctx, muts, r.ReadKeys)
+		if err != nil {
+			return err
+		}
+		return f.compareAndStageCAS(ctx, muts[0], readKeys, r.Ts, commitTS)
+	})
 }
 
 func casApplyRequest(startTS, commitTS, expectedTS uint64, key, value string) *pb.Request {
 	req := onePhaseReq(startTS, commitTS, 0, []byte(key), []byte(value))
 	req.Mutations[1].Op = pb.Op_COMPARE_AND_SWAP
 	req.Mutations[1].ExpectedCommitTs = expectedTS
+	req.VersionCasGroupId = 1
+	req.ObservedRouteVersion = 1
 	return req
 }
 
 func applyCASFrame(t *testing.T, f *kvFSM, index uint64, req *pb.Request) any {
 	t.Helper()
+	bindCASTestGroup(f)
 	payload, err := marshalRaftCommand([]*pb.Request{req})
 	require.NoError(t, err)
 	f.SetApplyIndex(index)
@@ -40,6 +58,29 @@ func applyCASInScope(t *testing.T, f *kvFSM, index uint64, req *pb.Request) any 
 }
 
 func enableCASApplyForTest(t *testing.T, f *kvFSM) {
+	t.Helper()
+	bindCASTestGroup(f)
+	seedCASTestCatalog(t, f.store, f.shardGroupID)
+	enableCASMarkersForTest(t, f)
+}
+
+func bindCASTestGroup(f *kvFSM) {
+	if f.shardGroupID == 0 {
+		f.shardGroupID = 1
+	}
+	f.raftBootstrapIdentity = raftbootstrap.Identity{Cluster: raftbootstrap.UUID{1}, Group: f.shardGroupID}
+}
+
+func seedCASTestCatalog(t *testing.T, st store.MVCCStore, groupID uint64) {
+	t.Helper()
+	plan, err := distribution.NewCatalogStore(st).BuildBootstrapPlanAt(t.Context(), 1, []distribution.Route{
+		{GroupID: groupID, State: distribution.RouteStateActive},
+	})
+	require.NoError(t, err)
+	require.NoError(t, st.ApplyMutationsRaftAtFenced(t.Context(), plan.Mutations, plan.ReadKeys, 1, 2, 0))
+}
+
+func enableCASMarkersForTest(t *testing.T, f *kvFSM) {
 	t.Helper()
 	activateCommitTSFence(t, f)
 	f.SetApplyIndex(1)
@@ -117,7 +158,7 @@ func TestFSMCASRejectsInvalidApplyShapes(t *testing.T) {
 	resp := applyCASFrame(t, f, 1, casApplyRequest(11, 20, 10, "k", "no fence"))
 	_, halted := resp.(interface{ HaltApply() error })
 	require.True(t, halted, "frame without the replicated fence returned %v", resp)
-	enableCASApplyForTest(t, f)
+	enableCASMarkersForTest(t, f)
 
 	raw := casApplyRequest(11, 20, 10, "k", "raw")
 	raw.IsTxn = false
@@ -160,9 +201,9 @@ func TestFSMCASUsesStagedHeadAndLocks(t *testing.T) {
 	require.NoError(t, st.PutAt(ctx, key, []byte("old live"), 10, 0))
 	require.NoError(t, st.PutAt(ctx, stagedKey, []byte("newer staged"), 30, 100))
 	stale := casApplyRequest(40, 50, 10, "n", "stale")
-	stale.ObservedRouteVersion = 2
 	requireCASRejection(t, applyCASFrame(t, f, 4, stale), ErrVersionCASUnavailable)
 	requireCASProgress(t, f, 4)
+	stale.ObservedRouteVersion = 2
 	requireCASRejection(t, applyCASInScope(t, f, 5, stale), ErrCASMismatch)
 
 	stagedLockKey := distribution.MigrationStagedDataKey(9, txnLockKey(key))
@@ -352,4 +393,18 @@ func requireCASValue(t *testing.T, st store.MVCCStore, readTS, wantTS uint64, va
 	got, err := store.GetVersionAt(t.Context(), st, []byte("n"), readTS)
 	require.NoError(t, err)
 	require.Equal(t, store.VersionedValue{TS: wantTS, Value: []byte(value), ExpireAt: 100}, got)
+}
+
+func TestFSMCASNewerHeadIsAnExactMismatch(t *testing.T) {
+	f, st := newCommitTSFenceFSM(t)
+	enableCASApplyForTest(t, f)
+	key := []byte("target")
+	require.NoError(t, st.PutAt(t.Context(), key, []byte("original"), 10, 0))
+	require.NoError(t, st.PutAt(t.Context(), key, []byte("intervening write"), 30, 0))
+	rejected := applyCASFrame(t, f, 2, casApplyRequest(20, 40, 10, string(key), "replacement"))
+	requireCASRejection(t, rejected, ErrCASMismatch)
+	requireCASProgress(t, f, 2)
+	row, err := store.GetVersionAt(t.Context(), st, key, 40)
+	require.NoError(t, err)
+	require.Equal(t, uint64(30), row.TS)
 }
