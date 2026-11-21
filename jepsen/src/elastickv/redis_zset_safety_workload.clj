@@ -1330,6 +1330,29 @@
                                                bounds))
         @errors))))
 
+(defn- impossible-mutation-reply [mutations]
+  ;; At a quiescent boundary all earlier acknowledged mutations must fit,
+  ;; even when no later range read succeeds. Enumerate only overlapping
+  ;; intervals together and carry the reachable states into the next batch.
+  (loop [states #{absent-state}
+         remaining (sort-by :invoke-idx (remove #(= :fail (:type %)) mutations))]
+    (when-let [first-op (first remaining)]
+      (let [[batch tail]
+            (loop [batch [first-op]
+                   end (or (:complete-idx first-op) Long/MAX_VALUE)
+                   tail (next remaining)]
+              (if (and (seq tail) (<= (:invoke-idx (first tail)) end))
+                (recur (conj batch (first tail))
+                       (max end (or (:complete-idx (first tail)) Long/MAX_VALUE))
+                       (next tail))
+                [batch tail]))
+            {required :ok info :info pending :pending} (group-by :type batch)
+            reachable (linearized-read-states states required (concat info pending))]
+        (if (empty? reachable)
+          {:kind :impossible-mutation-reply :member (:member first-op)
+           :invoke-indices (mapv :invoke-idx batch)}
+          (recur reachable tail))))))
+
 (defn zset-safety-checker
   "Custom Jepsen checker: validates ZSet safety properties using a
   last-writer model combined with a concurrent-write relaxation."
@@ -1353,6 +1376,7 @@
                                    :zrangebyscore (check-zrangebyscore mutations-by-m pair))))
                          []
                          read-pairs)
+            all-errors (into all-errors (keep impossible-mutation-reply (vals mutations-by-m)))
             all-errors (into all-errors
                              (check-read-stability mutations-by-m read-pairs))
             by-kind (group-by :kind all-errors)

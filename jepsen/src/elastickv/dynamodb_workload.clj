@@ -16,6 +16,7 @@
             [elastickv.cli :as cli]
             [elastickv.fault-transport :as fault-transport]
             [elastickv.db :as ekdb]
+            [elastickv.dynamodb-conditions :as conditions]
             [jepsen [client :as client]
                     [core :as jepsen]
                     [generator :as gen]
@@ -68,7 +69,10 @@
    ex-data keys: :type (DynamoDB __type string or nil), :category (anomaly
    keyword), :resp (raw cognitect/aws-api response)."
   [ddb-client op request]
-  (let [resp (aws/invoke ddb-client {:op op :request request})]
+  (let [resp (aws/invoke ddb-client
+                         (cond-> {:op op :request request}
+                           ;; Replaying an append can duplicate it or reject an already committed write.
+                           (#{:TransactWriteItems :UpdateItem} op) (assoc :retriable? (constantly false))))]
     (if (anomaly? resp)
       (let [err-type (:__type resp)
             category (:cognitect.anomalies/category resp)
@@ -159,9 +163,8 @@
    - Adds a ConditionExpression asserting the current DynamoDB value matches
      snapshot[k] (nil → attribute_not_exists; list → #v = :cv).
    If any pre-read value has changed since the snapshot was taken, the server
-   returns TransactionCanceledException.  The client records that response as
-   :info because the observed outcome is indeterminate to Jepsen under
-   contention.
+   rejects the transaction. The checker verifies that a concurrent append
+   could have invalidated the snapshot.
 
    For each key k that was read but NOT written:
    - Adds a ConditionCheck entry asserting the same invariant.
@@ -209,8 +212,8 @@
                             {:ConditionExpression "attribute_not_exists(#v)"}
                             {:ConditionExpression "#v = :cv"}))}))
               by-key)]
-    (ddb-invoke! ddb :TransactWriteItems
-                 {:TransactItems (into checks updates)})))
+    (conditions/transact-write! ddb-invoke! ddb (into checks updates)
+                                (concat read-only (keys by-key)) snapshot)))
 
 ;; ---------------------------------------------------------------------------
 ;; Jepsen client
@@ -277,16 +280,18 @@
               err-type (:type data)
               category (:category data)]
           (cond
+            (:write-rejection data) (merge op (:write-rejection data))
+
             ;; Network / transport error (no DynamoDB __type)
             (and (nil? err-type)
                  (#{:cognitect.anomalies/fault
                     :cognitect.anomalies/unavailable} category))
             (assoc op :type :info :error :network-error)
 
-            ;; Retryable or indeterminate DynamoDB server-side errors.
-            (contains? #{"ConditionalCheckFailedException"
-                         "InternalServerError"
-                         "TransactionCanceledException"} err-type)
+            (contains? #{"ConditionalCheckFailedException" "TransactionCanceledException"} err-type)
+            (assoc op :type :fail :error err-type)
+
+            (= "InternalServerError" err-type)
             (assoc op :type :info :error (str err-type))
 
             ;; Definite API-level failures
@@ -322,7 +327,7 @@
         client   (->DynamoDBClient (or (:node->port opts)
                                        (zipmap default-nodes (repeat 8000)))
                                    nil)]
-    (assoc workload :client client)))
+    (conditions/with-condition-checker (assoc workload :client client))))
 
 (defn elastickv-dynamodb-test
   "Builds a Jepsen test map that drives elastickv's DynamoDB-compatible API

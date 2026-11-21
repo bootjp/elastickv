@@ -1485,3 +1485,16 @@
         clojure.lang.ExceptionInfo
         #"odd element count"
         (#'workload/parse-withscores ["m1" "1.0" "m2-dangling"]))))
+
+(deftest mutation-replies-still-constrain-the-tail-after-the-last-read
+  (let [op (fn [p type f value] {:process p :type type :f f :value value})
+        add [(op 0 :invoke :zadd ["m" 1]) (op 0 :ok :zadd ["m" 1])]
+        read [(op 0 :invoke :zrange-all nil) (op 0 :ok :zrange-all [["m" 1.0]])]
+        rem [(op 0 :invoke :zrem "m") (op 0 :ok :zrem ["m" false])]
+        failed-final [(op 0 :invoke :zrange-all nil) (op 0 :info :zrange-all nil)]
+        check (fn [middle] (run-checker (map-indexed #(assoc %2 :index %1)
+                                                      (concat add read middle failed-final))))]
+    (is (false? (:valid? (check rem))))
+    (is (:valid? (check [(op 1 :invoke :zrem "m") (first rem)
+                         (second rem) (op 1 :ok :zrem ["m" true])])))
+    (is (:valid? (check (concat [(op 1 :invoke :zrem "m") (op 1 :info :zrem nil)] rem))))))

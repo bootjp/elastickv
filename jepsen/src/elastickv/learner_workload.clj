@@ -37,7 +37,9 @@
      `quorumAckTracker` gates `LastQuorumAck` and the lease-read fast path,
      not the write-commit quorum. See `learner-partition-read-failures`."
   (:gen-class)
-  (:require [clojure.tools.logging :refer [warn]]
+  (:require [clojure.string :as str]
+            [elastickv.history-windows :as windows]
+            [clojure.tools.logging :refer [warn]]
             [elastickv.cli :as cli]
             [elastickv.db :as ekdb]
             [jepsen.control :as c]
@@ -201,6 +203,32 @@
   (empty? (filter #(and (= :promote-learner-early (:f %))
                         (contains? #{:ok :fail :info} (:type %)))
                   history)))
+
+(defn- confirmed-min-index-refusal? [op]
+  (and (= :promote-learner-early (:f op))
+       (= :fail (:type op))
+       (string? (:error op))
+       (or (= "min_applied_index not reached" (:error op))
+           (str/includes? (:error op) "target has not caught up to min_applied_index"))))
+
+(defn- unwritten-reads [history]
+  (let [ops (windows/operations history)
+        writes (filter #(= :write (:f (or (:invoke %) (:completion %)))) ops)
+        earliest (reduce (fn [starts {:keys [invoke completion start]}]
+                           (if (= :fail (:type completion))
+                             starts
+                             (update starts (:value (or invoke completion)) (fnil min start) start)))
+                         {} writes)
+        first-ack (reduce min Long/MAX_VALUE
+                          (keep #(when (= :ok (get-in % [:completion :type])) (:end %)) writes))]
+    (keep (fn [{:keys [completion start end]}]
+            (when (and (= :read (:f completion)) (= :ok (:type completion)))
+              (let [v (get-in completion [:value :value])]
+                (when (if (nil? v)
+                        (< first-ack start)
+                        (> (get earliest v Long/MAX_VALUE) end))
+                  completion))))
+          ops)))
 
 (defn promotions-without-a-sampled-target
   "Promotions whose catch-up target did not come from the leader.
@@ -522,6 +550,8 @@
             unmeasured   (unmeasured-partition-windows history)
             unenforced   (unenforced-min-applied-index history)
             no-probe     (unattempted-min-applied-index-probe history)
+            refused?     (boolean (some confirmed-min-index-refusal? history))
+            unwritten    (vec (unwritten-reads history))
             writes       (count (filter #(and (= :write (:f %)) (= :ok (:type %))) history))
             reads        (count (filter #(and (= :read (:f %)) (= :ok (:type %))) history))]
         (when (seq premature)
@@ -535,7 +565,8 @@
         {:valid?               (and (pos? (count promotions))
                                     (pos? writes)
                                     (pos? reads)
-                                    (not no-probe)
+                                    refused?
+                                    (empty? unwritten)
                                     (empty? premature)
                                     (empty? unmeasurable)
                                     (empty? unsampled)
@@ -553,6 +584,8 @@
          :unsampled-targets    unsampled
          :promotions-without-post-read-evidence no-evidence
          :lost-writes          lost
+         :unwritten-reads      unwritten
+         :min-applied-index-refused? refused?
          :learner-read-failures stalls
          :lease-fast-path-losses fallbacks
          :unmeasured-partition-windows unmeasured
@@ -562,8 +595,6 @@
 ;; ---------------------------------------------------------------------------
 ;; Client
 ;; ---------------------------------------------------------------------------
-
-(def ^:private register-key "learner-register")
 
 (defn- raftadmin!
   "Runs raftadmin on node against the leader address."
@@ -630,7 +661,8 @@
   (teardown! [_this _test])
 
   (invoke! [this test op]
-    (let [conn   (:conn this)
+    (let [register-key (:register-key test)
+          conn   (:conn this)
           nodes  (:nodes test)
           leader (first nodes)
           addr   (or leader-addr (str leader ":50051"))]
@@ -710,14 +742,10 @@
           ;; every real read exception without it, so
           ;; learner-partition-read-failures filtered them all out and the
           ;; lease regression could never invalidate a run.
-          ;; :promote-learner-early lands here on the happy path -- its
-          ;; rejection is the property holding, not a workload failure, which
-          ;; is why only an :ok from it is reported as a defect.
-          (if (= :read (:f op))
-            (assoc op :type :fail
-                      :value {:lease? true}
-                      :error (.getMessage e))
-            (assoc op :type :fail :error (.getMessage e))))))))
+          (case (:f op)
+            :read (assoc op :type :fail :value {:lease? true} :error (.getMessage e))
+            :write (assoc op :type :info :error (.getMessage e))
+            (assoc op :type :fail :error (or (:err (ex-data e)) (.getMessage e)))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Nemesis
@@ -853,6 +881,7 @@
                         (cli/ports->node-map
                           (repeat (count nodes) redis-port) nodes))]
      {:name        "elastickv-learner"
+      :register-key (str "learner-register-" (java.util.UUID/randomUUID))
       :nodes       nodes
       :encryption  (boolean (:encryption opts))
       ;; Carried into the test map so LearnerClient.open! can honour it.

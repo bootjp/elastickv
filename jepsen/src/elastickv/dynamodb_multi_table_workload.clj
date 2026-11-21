@@ -39,6 +39,7 @@
             [elastickv.cli :as cli]
             [elastickv.composed1-nemesis :as composed1]
             [elastickv.db :as ekdb]
+            [elastickv.dynamodb-conditions :as conditions]
             [jepsen [client :as client]
                     [generator :as gen]
                     [net :as net]]
@@ -114,7 +115,10 @@
 
 (defn- ddb-invoke!
   [ddb-client op request]
-  (let [resp (aws/invoke ddb-client {:op op :request request})]
+  (let [resp (aws/invoke ddb-client
+                         (cond-> {:op op :request request}
+                           ;; Replaying an append can duplicate it or reject an already committed write.
+                           (#{:TransactWriteItems :UpdateItem} op) (assoc :retriable? (constantly false))))]
     (if (anomaly? resp)
       (let [err-type (:__type resp)
             category (:cognitect.anomalies/category resp)
@@ -284,8 +288,8 @@
                             {:ConditionExpression "attribute_not_exists(#v)"}
                             {:ConditionExpression "#v = :cv"}))}))
               by-key)]
-    (ddb-invoke! ddb :TransactWriteItems
-                 {:TransactItems (into checks updates)})))
+    (conditions/transact-write! ddb-invoke! ddb (into checks updates)
+                                (concat read-only (keys by-key)) snapshot)))
 
 ;; ---------------------------------------------------------------------------
 ;; M5a setup-hook verification (design doc §3.3)
@@ -453,14 +457,17 @@
               err-type (:type data)
               category (:category data)]
           (cond
+            (:write-rejection data) (merge op (:write-rejection data))
+
             (and (nil? err-type)
                  (#{:cognitect.anomalies/fault
                     :cognitect.anomalies/unavailable} category))
             (assoc op :type :info :error :network-error)
 
-            (contains? #{"ConditionalCheckFailedException"
-                         "InternalServerError"
-                         "TransactionCanceledException"} err-type)
+            (contains? #{"ConditionalCheckFailedException" "TransactionCanceledException"} err-type)
+            (assoc op :type :fail :error err-type)
+
+            (= "InternalServerError" err-type)
             (assoc op :type :info :error (str err-type))
 
             (= "ValidationException" err-type)
@@ -506,7 +513,7 @@
           client   (->DynamoDBMultiTableClient (or (:node->port opts)
                                                    (zipmap default-nodes (repeat 8000)))
                                                nil)]
-      (assoc workload :client client))))
+      (conditions/with-condition-checker (assoc workload :client client)))))
 
 (defn elastickv-dynamodb-multi-table-test
   "Builds a Jepsen test map driving the multi-table list-append workload

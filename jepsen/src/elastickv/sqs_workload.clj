@@ -8,6 +8,7 @@
             [clojure.string :as str]
             [cognitect.aws.client.api :as aws]
             [elastickv.cli :as cli]
+            [elastickv.history-windows :as windows]
             [elastickv.sqs-common :as sqs]
             [jepsen.checker :as checker]
             [jepsen.client :as client]
@@ -64,6 +65,9 @@
        :delete-errors (mapv :error (filter :error acknowledgements))
        :delete-error-details (mapv :details (filter :error acknowledgements))})))
 
+(defn- next-body [counter]
+  (str "jepsen-standard-" (swap! counter inc)))
+
 (defrecord StandardClient [node->port region queue-name counter conn queue-url pending-deletes]
   client/Client
   (open! [this test node]
@@ -78,19 +82,17 @@
         (do (reset! queue-url url) this)
         (throw (ex-info "CreateQueue did not return QueueUrl" {:response response})))))
   (invoke! [_this _test op]
-    ;; Allocate before I/O and retain the identity on ambiguous outcomes.
-    (let [op (if (= :send (:f op))
-               (assoc op :value (str "jepsen-standard-" (swap! counter inc)))
+    ;; Direct clients can omit the body. Generated histories record it on invocation.
+    (let [op (if (and (= :send (:f op)) (nil? (:value op)))
+               (assoc op :value (next-body counter))
                op)]
       (try
         (case (:f op)
           :send (do (sqs/invoke! conn :SendMessage
-                                {:QueueUrl @queue-url :MessageBody (:value op)})
+                                 {:QueueUrl @queue-url :MessageBody (:value op)})
                     (assoc op :type :ok))
           :recv (merge op {:type :ok} (receive-and-delete! conn @queue-url pending-deletes)))
         (catch Exception e
-          ;; A transport error or server error may happen after commit.
-          ;; Conservatively keep these sends in the possible-send set.
           (assoc op :type :info :error (.getMessage e))))))
   (teardown! [_this _test] nil)
   (close! [this _test]
@@ -100,18 +102,40 @@
 (defn standard-checker []
   (reify checker/Checker
     (check [_ _test history _opts]
-      (let [sends (filter #(= :send (:f %)) history)
+      (let [ops (windows/operations history)
+            send-starts (into {} (for [{:keys [invoke completion start]} ops
+                                       :when (and (= :send (:f (or invoke completion)))
+                                                  (not= :fail (:type completion)))
+                                       :let [body (or (:value invoke) (:value completion))]
+                                       :when (some? body)]
+                                   [body start]))
+            ;; Old clients assigned the body inside invoke!. A pending legacy
+            ;; send can explain one unidentified delivery, but cannot certify it.
+            unlabelled-start (reduce min Long/MAX_VALUE
+                                     (keep (fn [{:keys [invoke completion start]}]
+                                             (when (and (= :send (:f invoke)) (nil? (:value invoke))
+                                                        (nil? completion))
+                                               start))
+                                           ops))
+            sends (filter #(= :send (:f %)) history)
             committed (set (map :value (filter #(= :ok (:type %)) sends)))
-            possible (set (map :value (filter #(#{:ok :info} (:type %)) sends)))
+            possible (set (keys send-starts))
             receives (filter #(and (= :recv (:f %)) (= :ok (:type %))) history)
             deliveries (mapcat :value receives)
             received (set deliveries)
             deleted (set (mapcat :deleted receives))
             lost (set/difference committed received)
             unacked (set/difference committed deleted)
-            unexpected (set/difference received possible)]
-        {:valid? (and (pos? (count committed))
-                      (empty? lost) (empty? unacked) (empty? unexpected))
+            missing (for [{:keys [completion end]} ops
+                          :when (and (= :recv (:f completion)) (= :ok (:type completion)))
+                          body (:value completion)
+                          :when (> (get send-starts body Long/MAX_VALUE) end)]
+                      [body end])
+            unexpected (set (for [[body end] missing :when (or (nil? body) (< end unlabelled-start))] body))]
+        {:valid? (cond
+                   (or (empty? committed) (seq lost) (seq unacked) (seq unexpected)) false
+                   (seq missing) :unknown
+                   :else true)
          :committed-sends (count committed)
          :in-flight-sends (count (set/difference possible committed))
          :received (count received)
@@ -120,19 +144,17 @@
          :delete-errors (count (mapcat :delete-errors receives))
          :lost lost
          :unacked unacked
-         :unexpected unexpected}))))
+         :unexpected unexpected
+         :unattributed (set (map first missing))}))))
 
 (defn sqs-workload [opts]
-  {:client (->StandardClient (:node->port opts) (:sqs-region opts)
-                             (or (:queue-name opts)
-                                 (str "jepsen-standard-" (java.util.UUID/randomUUID)))
-                             (atom 0) nil (atom nil) (PendingDeletes. (atom {})))
-   :generator (gen/phases
-                ;; Keep short smoke runs from spending their entire main phase
-                ;; on serialized empty-queue polls before any send is issued.
-                (gen/once {:f :send})
-                (gen/mix [(gen/repeat {:f :send}) (gen/repeat {:f :recv})]))
-   :checker (standard-checker)})
+  (let [counter (atom 0)
+        send (fn [] {:f :send :value (next-body counter)})]
+    {:client (->StandardClient (:node->port opts) (:sqs-region opts)
+                               (or (:queue-name opts) (str "jepsen-standard-" (java.util.UUID/randomUUID)))
+                               counter nil (atom nil) (PendingDeletes. (atom {})))
+     :generator (gen/phases (gen/once send) (gen/mix [send (gen/repeat {:f :recv})]))
+     :checker (standard-checker)}))
 
 (defn elastickv-sqs-test
   ([] (elastickv-sqs-test {}))

@@ -5,6 +5,7 @@
             [clojure.java.io :as io]
             [elle.list-append :as append]
             [elle.rw-register :as register]
+            [elastickv.history-windows :as windows]
             [jepsen.checker :as checker]
             [jepsen.history :as history]
             [jepsen.store :as store])
@@ -39,6 +40,24 @@
     (:list-append :rw-register) (history/history events)
     (throw (ex-info "Unsupported Elle history kind" {:kind kind}))))
 
+(defn- unexplained-register-reads [h]
+  ;; Writes are unique per key. A transaction may also read its own earlier write.
+  (let [txns (windows/operations (filter #(= :txn (:f %)) h))
+        writers (into {} (for [{:keys [start invoke completion]} txns
+                               :when (not= :fail (:type completion))
+                               [f k v] (:value (or invoke completion))
+                               :when (= :w f)]
+                           [[k v] start]))]
+    (for [{:keys [start end completion]} txns
+          :when (= :ok (:type completion))
+          [i [f k v]] (map-indexed vector (:value completion))
+          :when (and (= :r f) (some? v))
+          :let [writer (get writers [k v])]
+          :when (or (nil? writer) (> writer end)
+                    (and (= writer start)
+                         (not-any? #{[:w k v]} (take i (:value completion)))))]
+      {:index (:index completion) :key k :value v})))
+
 (defn check-history [kind events directory]
   (let [h (transaction-history kind events)
         opts {:consistency-models models :directory (str directory)}]
@@ -55,7 +74,11 @@
           (throw (ex-info "Elle register writes must use unique non-nil values per key" {})))))
     (case kind
       :list-append (append/check opts h)
-      (:rw-register :s3 :grpc :filesystem :independent-register) (register/check opts h))))
+      (:rw-register :s3 :grpc :filesystem :independent-register)
+      (let [result (register/check opts h)
+            errors (vec (unexplained-register-reads h))]
+        (cond-> result
+          (seq errors) (assoc :valid? false :unexplained-reads errors))))))
 
 (defn read-history [file]
   ;; Jepsen history.edn contains one EDN operation per form, not a vector.
