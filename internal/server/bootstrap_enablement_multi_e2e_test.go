@@ -513,8 +513,12 @@ func multiEnablementRun(t *testing.T, lagging bool) {
 	}
 	leader := multiEnablementLeader(t, protected)
 	for _, process := range protected {
-		_, err := kv.LoadAppliedBootstrapPolicy(t.Context(), process.runtime.Store, manifest.Identity, process.runtime.Engine.Status().AppliedIndex)
-		require.ErrorIs(t, err, store.ErrKeyNotFound, "no activation worker has started")
+		// The engine and durable store publish their applied indexes separately.
+		// Require an absent policy at a consistent observed boundary.
+		require.Eventually(t, func() bool {
+			_, err := kv.LoadAppliedBootstrapPolicy(t.Context(), process.runtime.Store, manifest.Identity, process.runtime.Engine.Status().AppliedIndex)
+			return errors.Is(err, store.ErrKeyNotFound)
+		}, bootstrapE2EWaitTimeout, bootstrapE2EWaitInterval, "no activation worker has started")
 	}
 	clusterbootstrap.StartBootstrapActivationWorkers(leader.ctx, leader.eg, []*clusterbootstrap.GroupRuntime{leader.runtime}, map[uint64]*kv.ShardGroup{1: leader.shard})
 	activation := multiEnablementAssertActivePolicy(t, protected, manifest)
