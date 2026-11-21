@@ -2652,7 +2652,8 @@ func (s *pebbleStore) applyMutationsWithOpts(ctx context.Context, mutations []*K
 	if fastPathDone {
 		return nil
 	}
-	if err := checkCommitTSFence(mutations, commitTS, s.LastCommitTS(), fenceCommitTS); err != nil {
+	watermark := s.LastCommitTS()
+	if err := checkCommitTSFence(mutations, commitTS, watermark, fenceCommitTS); err != nil {
 		return err
 	}
 
@@ -2668,6 +2669,14 @@ func (s *pebbleStore) applyMutationsWithOpts(ctx context.Context, mutations []*K
 
 	if err := s.applyMutationsBatch(b, mutations, commitTS, gateRegistration); err != nil {
 		return err
+	}
+
+	return s.commitMutationBatch(b, writeOpts, commitTS, appliedIndex, watermark, advanceLastCommitTS)
+}
+
+func (s *pebbleStore) commitMutationBatch(b *pebble.Batch, writeOpts *pebble.WriteOptions, commitTS, appliedIndex, watermark uint64, advanceLastCommitTS bool) error {
+	if appliedIndex != 0 && advanceLastCommitTS && commitTS > watermark {
+		return s.commitIndexedRaftDataBatch(b, writeOpts, commitTS, appliedIndex)
 	}
 
 	newLastTS, unlockLastCommitTS, err := s.stageLastCommitTSInBatch(b, commitTS, advanceLastCommitTS)
@@ -2689,6 +2698,26 @@ func (s *pebbleStore) applyMutationsWithOpts(ctx context.Context, mutations []*K
 		s.updateLastCommitTS(newLastTS)
 	}
 
+	return nil
+}
+
+// commitIndexedRaftDataBatch persists an already committed Raft entry
+// while readers can take the metadata lock during WAL sync. The caller verifies that
+// every staged timestamp is above the published watermark while holding
+// applyMu and dbMu. The advertised watermark advances after the batch commits.
+func (s *pebbleStore) commitIndexedRaftDataBatch(b *pebble.Batch, opts *pebble.WriteOptions, lastTS, appliedIndex uint64) error {
+	if err := setPebbleUint64InBatch(b, metaLastCommitTSBytes, lastTS); err != nil {
+		return err
+	}
+	if err := stageAppliedIndexInBatch(b, appliedIndex); err != nil {
+		return err
+	}
+	if err := b.Commit(opts); err != nil {
+		return errors.WithStack(err)
+	}
+	s.mtx.Lock()
+	s.updateLastCommitTS(lastTS)
+	s.mtx.Unlock()
 	return nil
 }
 

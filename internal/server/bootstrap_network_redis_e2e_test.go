@@ -14,6 +14,7 @@ import (
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/monitoring"
 	"github.com/redis/go-redis/v9"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -113,8 +114,14 @@ func TestBootstrapNetworkRedisFollowerAfterAcceptedBaseline(t *testing.T) {
 	require.ErrorIs(t, err, redis.Nil)
 	for _, process := range processes {
 		multiEnablementReplicatedRead(t, process, "legacy-key", "replicated-original")
-		policy, err := kv.LoadAppliedBootstrapPolicy(ctx, process.runtime.Store, manifest.Identity, process.runtime.Engine.Status().AppliedIndex)
-		require.NoError(t, err)
-		require.EqualValues(t, 1, policy.Generation)
+		// Raft and the store publish their applied indexes separately. Sample
+		// until policy reconstruction succeeds at a consistent boundary.
+		require.EventuallyWithT(t, func(c *assert.CollectT) {
+			applied := process.runtime.Engine.Status().AppliedIndex
+			policy, err := kv.LoadAppliedBootstrapPolicy(ctx, process.runtime.Store, manifest.Identity, applied)
+			if assert.NoError(c, err) {
+				assert.EqualValues(c, 1, policy.Generation)
+			}
+		}, bootstrapE2EWaitTimeout, 10*time.Millisecond)
 	}
 }
