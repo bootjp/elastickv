@@ -15,8 +15,8 @@ const rawReadHandoffMaxWait = 250 * time.Millisecond
 
 // Each attempt owns and closes its read request. Keeping a pin across the
 // retry would prevent cutover from draining the preceding ownership epoch.
-func (r *GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.RawGetResponse, error) {
-	response, err := r.rawGetOnce(ctx, req)
+func retryRawReadHandoff(ctx context.Context, req *pb.RawGetRequest, attempt func(context.Context) (*pb.RawGetResponse, error)) (*pb.RawGetResponse, error) {
+	response, err := attempt(ctx)
 	if !retryableRawReadHandoff(err) || req.GetGroupId() != 0 || req.GetReadRouteVersion() != 0 {
 		return response, err
 	}
@@ -29,7 +29,7 @@ func (r *GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.Raw
 		case <-waiting.Done():
 			return nil, rawReadHandoffTimeout(ctx)
 		case <-timer.C:
-			response, err = r.rawGetOnce(waiting, req)
+			response, err = attempt(waiting)
 			if waiting.Err() != nil {
 				return nil, rawReadHandoffTimeout(ctx)
 			}

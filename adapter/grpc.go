@@ -217,47 +217,50 @@ func (r *GRPCServer) grpcServesScanTargets(targets []kv.ReadFenceTarget) bool {
 	return false
 }
 
-func (r *GRPCServer) rawGetOnce(ctx context.Context, req *pb.RawGetRequest) (*pb.RawGetResponse, error) {
-	readRequest := kv.NewReadRequest(ctx, r.coordinator, r.store, r.readTracker)
-	defer readRequest.Close()
-	ctx = readRequest.Context()
-	if err := r.requireReadReady(); err != nil {
-		return nil, errors.WithStack(err)
-	}
-	readTS, err := r.resolveRawReadSnapshot(ctx, req.GetTs(), req.GetGroupId(), req.GetKey())
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-
-	var v []byte
-	if fenceGetter, ok := r.store.(rawReadFenceGetter); ok {
-		v, err = requestGetAtWithReadFence(ctx, fenceGetter, req.Key, readTS, req.GetGroupId(), r.readRouteVersion(req.GetReadRouteVersion()))
-	} else if req.GetReadRouteVersion() != 0 {
-		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "raw get with read fence requires a read-fence-aware store"))
-	} else if groupID := req.GetGroupId(); groupID != 0 {
-		groupGetter, ok := r.store.(rawGroupGetter)
-		if !ok {
-			return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "raw get with explicit group requires a group-aware store"))
+func (r *GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.RawGetResponse, error) {
+	return retryRawReadHandoff(ctx, req, func(ctx context.Context) (*pb.RawGetResponse, error) {
+		readRequest := kv.NewReadRequest(ctx, r.coordinator, r.store, r.readTracker)
+		defer readRequest.Close()
+		ctx = readRequest.Context()
+		if err := r.requireReadReady(); err != nil {
+			return nil, errors.WithStack(err)
 		}
-		v, err = requestGetGroupAt(ctx, groupGetter, groupID, req.Key, readTS)
-	} else {
-		v, err = requestGetAt(ctx, r.store, req.Key, readTS)
-	}
-	r.observeGRPCPointRead(ctx, req.GetKey(), req.GetGroupId())
-	if errors.Is(err, store.ErrKeyNotFound) {
-		return &pb.RawGetResponse{Value: nil, Exists: false}, nil
-	}
-	if errors.Is(err, store.ErrReadTSCompacted) {
-		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, store.ErrReadTSCompacted.Error()))
-	}
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-	r.log.InfoContext(ctx, "Get",
-		slog.String("key", string(req.Key)),
-		slog.String("value", string(v)))
+		readTS, err := r.resolveRawReadSnapshot(ctx, req.GetTs(), req.GetGroupId(), req.GetKey())
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
 
-	return &pb.RawGetResponse{Value: v, Exists: true}, nil
+		var v []byte
+		if fenceGetter, ok := r.store.(rawReadFenceGetter); ok {
+			v, err = requestGetAtWithReadFence(ctx, fenceGetter, req.Key, readTS, req.GetGroupId(), r.readRouteVersion(req.GetReadRouteVersion()))
+		} else if req.GetReadRouteVersion() != 0 {
+			return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "raw get with read fence requires a read-fence-aware store"))
+		} else if groupID := req.GetGroupId(); groupID != 0 {
+			groupGetter, ok := r.store.(rawGroupGetter)
+			if !ok {
+				return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "raw get with explicit group requires a group-aware store"))
+			}
+			v, err = requestGetGroupAt(ctx, groupGetter, groupID, req.Key, readTS)
+		} else {
+			v, err = requestGetAt(ctx, r.store, req.Key, readTS)
+		}
+		r.observeGRPCPointRead(ctx, req.GetKey(), req.GetGroupId())
+		if errors.Is(err, store.ErrKeyNotFound) {
+			return &pb.RawGetResponse{Value: nil, Exists: false}, nil
+		}
+		if errors.Is(err, store.ErrReadTSCompacted) {
+			return nil, errors.WithStack(status.Error(codes.FailedPrecondition, store.ErrReadTSCompacted.Error()))
+		}
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		r.log.InfoContext(ctx, "Get",
+			slog.String("key", string(req.Key)),
+			slog.String("value", string(v)))
+
+		return &pb.RawGetResponse{Value: v, Exists: true}, nil
+
+	})
 }
 
 // rawGroupWatermark answers the keyless leader-fenced watermark for one Raft
