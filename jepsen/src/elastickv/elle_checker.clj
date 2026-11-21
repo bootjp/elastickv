@@ -6,6 +6,8 @@
             [elle.list-append :as append]
             [elle.rw-register :as register]
             [elastickv.history-windows :as windows]
+            [elastickv.dynamodb-conditions :as conditions]
+            [elastickv.dynamodb-write-skew :as skew]
             [jepsen.checker :as checker]
             [jepsen.history :as history]
             [jepsen.store :as store])
@@ -37,7 +39,7 @@
   (case kind
     (:s3 :grpc :filesystem :independent-register)
     (history/history (mapv #(register-operation kind %) events))
-    (:list-append :rw-register) (history/history events)
+    (:list-append :write-skew :rw-register) (history/history events)
     (throw (ex-info "Unsupported Elle history kind" {:kind kind}))))
 
 (defn- unexplained-register-reads [h]
@@ -58,6 +60,32 @@
                          (not-any? #{[:w k v]} (take i (:value completion)))))]
       {:index (:index completion) :key k :value v})))
 
+(defn- rejected-append-reads [history]
+  ;; The list-append generator uses unique tokens per key. WRONGTYPE
+  ;; definitively rejects that RPUSH even if an adjacent reply is ambiguous.
+  (let [rejected (into #{} (for [op history, {:keys [operation error]} (:exec-errors op)
+                                 :let [[f k token] operation]
+                                 :when (and (= :append f) (= :wrongtype error))] [k token]))]
+    (when (seq rejected)
+      (for [op history :when (= :ok (:type op)), [f k values] (:value op) :when (= :r f)
+            token values :when (contains? rejected [k token])]
+        {:index (:index op) :key k :token token}))))
+
+(defn check-exec-replies [result history]
+  (let [reads (rejected-append-reads history)
+        errors (filter #(or (:exec-arity %) (:invalid-exec-slots %)) history)
+        partial (filter #(contains? % :exec-observations) history)
+        lengths? (and (empty? partial) (some :exec-lengths history))
+        lengths (when lengths? (conditions/append-witness history))]
+    (cond-> result
+      lengths? (assoc :exec-lengths {:valid? lengths}
+                      :valid? (checker/merge-valid [(:valid? result) lengths]))
+      (seq partial) (assoc :partial-exec-replies (mapv #(select-keys % [:index :process :exec-observations :exec-errors]) partial)
+                           :valid? (checker/merge-valid [(:valid? result) :unknown]))
+      (seq reads) (assoc :valid? false :rejected-append-reads (vec reads))
+      (seq errors) (assoc :valid? false :invalid-exec-replies
+                          (mapv #(select-keys % [:index :process :exec-arity :invalid-exec-slots]) errors)))))
+
 (defn check-history [kind events directory]
   (let [h (transaction-history kind events)
         opts {:consistency-models models :directory (str directory)}]
@@ -73,7 +101,13 @@
                   (not= (count writes) (count (set writes))))
           (throw (ex-info "Elle register writes must use unique non-nil values per key" {})))))
     (case kind
-      :list-append (append/check opts h)
+      (:list-append :write-skew)
+      (let [consistency (-> (append/check opts h) (conditions/check-result h) (check-exec-replies h))]
+        (if (or (= :write-skew kind) (some (comp (set (map :round skew/rounds)) :round) h))
+          (let [coverage (skew/coverage-result h)]
+            {:consistency consistency :coverage coverage
+             :valid? (checker/merge-valid [(:valid? consistency) (:valid? coverage)])})
+          consistency))
       (:rw-register :s3 :grpc :filesystem :independent-register)
       (let [result (register/check opts h)
             errors (vec (unexplained-register-reads h))]
@@ -122,7 +156,7 @@
 (defn -main [& args]
   (try
     (when-not (= 3 (count args))
-      (throw (ex-info "Usage: KIND HISTORY.edn OUTPUT-DIRECTORY; KIND=list-append|rw-register|s3|grpc|filesystem|independent-register" {})))
+      (throw (ex-info "Usage: KIND HISTORY.edn OUTPUT-DIRECTORY; KIND=list-append|write-skew|rw-register|s3|grpc|filesystem|independent-register" {})))
     (let [[kind input directory] args
           result (analyze-file! (keyword kind) input directory)]
       (prn result)

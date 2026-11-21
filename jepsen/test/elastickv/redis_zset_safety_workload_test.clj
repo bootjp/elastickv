@@ -51,7 +51,7 @@
                  {:type :invoke :process 0 :f :zrange-all :index 4}
                  {:type :ok     :process 0 :f :zrange-all :value [["m1" 1.0]] :index 5}]
         result  (run-checker history)]
-    (is (:valid? result) (str "expected valid, got: " result))))
+    (is (true? (:valid? result)) (str "expected valid, got: " result))))
 
 (deftest info-zincrby-allows-derived-score
   ;; ZINCRBY whose response was lost (:info) still has a known delta. A
@@ -63,7 +63,7 @@
                  {:type :ok     :process 0 :f :zrange-all :value [["m1" 6.0]] :index 4}
                  {:type :info   :process 1 :f :zincrby :value ["m1" 5] :index 5}]
         result  (run-checker history)]
-    (is (:valid? result) (str "expected valid, got: " result))))
+    (is (true? (:valid? result)) (str "expected valid, got: " result))))
 
 (deftest score-mismatch-is-detected-when-no-uncertainty
   ;; Sanity check: with all ops :ok and no concurrency, an obviously
@@ -110,7 +110,7 @@
                  {:type :ok     :process 1 :f :zincrby :value ["m1" 3.0] :index 6}
                  {:type :ok     :process 2 :f :zincrby :value ["m1" 6.0] :index 7}]
         result  (run-checker history)]
-    (is (:valid? result)
+    (is (true? (:valid? result))
         (str "expected reachable prefix for >=2 concurrent ZINCRBYs, got: " result))))
 
 (deftest no-op-zrem-alone-does-not-false-positive
@@ -123,7 +123,7 @@
                  {:type :ok     :process 1 :f :zrange-all :value [] :index 2}
                  {:type :ok     :process 0 :f :zrem :value ["never-added" false] :index 3}]
         result  (run-checker history)]
-    (is (:valid? result) (str "expected valid, got: " result))))
+    (is (true? (:valid? result)) (str "expected valid, got: " result))))
 
 (deftest no-op-zrem-does-not-admit-impossible-absence
   ;; If ZADD and ZREM overlap, a ZREM returning 0 constrains the ZREM to
@@ -193,7 +193,7 @@
                  {:type :ok     :process 2 :f :zrange-all
                   :value [["m1" 5.0]] :index 5}]
         result  (run-checker history)]
-    (is (:valid? result)
+    (is (true? (:valid? result))
         (str "expected valid under overlapping-writes relaxation, got: " result))))
 
 (deftest overlapping-base-zadds-are-enumerated-before-tail-zincrby
@@ -212,7 +212,7 @@
                  {:type :ok     :process 3 :f :zrange-all
                   :value [["m1" 3.0]] :index 7}]
         result  (run-checker history)]
-    (is (:valid? result)
+    (is (true? (:valid? result))
         (str "expected base ZADD order score 2 -> ZINCRBY +1 to be valid, got: "
              result))))
 
@@ -233,7 +233,7 @@
                  {:type :ok     :process 2 :f :zrange-all
                   :value [["m1" 6.0]] :index 5}]
         result  (run-checker history)]
-    (is (:valid? result)
+    (is (true? (:valid? result))
         (str "expected :info-before-read derived score to be valid, got: " result))))
 
 (deftest pre-read-info-zincrby-can-feed-later-ok-zincrby
@@ -248,7 +248,7 @@
                  {:type :ok     :process 2 :f :zrange-all
                   :value [["m1" 6.0]] :index 5}]
         result  (run-checker history)]
-    (is (:valid? result)
+    (is (true? (:valid? result))
         (str "expected earlier :info increment to remain admissible, got: "
              result))))
 
@@ -267,15 +267,12 @@
                  {:type :ok     :process 3 :f :zrange-all
                   :value [["m1" 35.0]] :index 7}]
         result (run-checker history)]
-    (is (:valid? result)
+    (is (true? (:valid? result))
         (str "expected dependent :info ZADD to remain admissible, got: "
              result))))
 
-(deftest pre-read-info-zincrby-superseded-by-later-zadd
-  ;; A pre-read :info ZINCRBY is uncertainty only until a later committed
-  ;; state-changing op strictly follows it before the read. The later ZADD
-  ;; overwrites any possible increment outcome, so an arbitrary score must
-  ;; be rejected.
+(deftest late-increment-cannot-produce-arbitrary-score
+  ;; Applying +5 before or after ZADD 2 cannot produce 42.
   (let [history [{:type :invoke :process 0 :f :zincrby :value ["m1" 5] :index 0}
                  {:type :info   :process 0 :f :zincrby :value ["m1" 5] :index 1}
                  {:type :invoke :process 1 :f :zadd    :value ["m1" 2] :index 2}
@@ -290,21 +287,15 @@
     (is (contains? kinds :score-mismatch)
         (str "expected :score-mismatch, got kinds=" kinds))))
 
-(deftest pre-read-info-zrem-superseded-by-later-zadd
-  ;; Same supersession rule for presence: an :info ZREM completed before a
-  ;; later committed ZADD cannot make a post-ZADD read's absence valid.
+(deftest timed-out-removal-can-follow-a-later-add
   (let [history [{:type :invoke :process 0 :f :zrem :value "m1" :index 0}
                  {:type :info   :process 0 :f :zrem :value "m1" :index 1}
                  {:type :invoke :process 1 :f :zadd :value ["m1" 1] :index 2}
                  {:type :ok     :process 1 :f :zadd :value ["m1" 1] :index 3}
                  {:type :invoke :process 2 :f :zrange-all :index 4}
                  {:type :ok     :process 2 :f :zrange-all :value [] :index 5}]
-        result  (run-checker history)
-        kinds   (set (map :kind (:first-errors result)))]
-    (is (not (:valid? result))
-        (str "expected superseded :info ZREM not to admit absence, got: " result))
-    (is (contains? kinds :missing-member)
-        (str "expected :missing-member, got kinds=" kinds))))
+        result (run-checker history)]
+    (is (true? (:valid? result)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Stale-read / phantom / superseded-committed checks
@@ -415,7 +406,7 @@
                         :value [] :index 5})]
     (is (not (:valid? (run-checker hist-present)))
         "expected read observing ZADD's outcome to be rejected")
-    (is (:valid? (run-checker hist-absent))
+    (is (true? (:valid? (run-checker hist-absent)))
         "expected read observing ZREM's outcome (absent) to be accepted")))
 
 (deftest info-zrem-concurrent-with-read-allows-missing-member
@@ -433,7 +424,7 @@
                  {:type :ok     :process 0 :f :zrange-all :value [] :index 4}
                  {:type :info   :process 1 :f :zrem :value "m1" :index 5}]
         result  (run-checker history)]
-    (is (:valid? result)
+    (is (true? (:valid? result))
         (str "expected :info ZREM to make absence acceptable, got: " result))))
 
 (deftest info-zincrby-does-not-flag-zrangebyscore-completeness
@@ -454,7 +445,7 @@
                  {:type :ok     :process 2 :f :zrangebyscore
                   :value {:bounds [0.0 10.0] :members []} :index 5}]
         result  (run-checker history)]
-    (is (:valid? result)
+    (is (true? (:valid? result))
         (str "expected :info ZINCRBY to skip completeness, got: " result))))
 
 (deftest zrangebyscore-completeness-still-detects-truly-missing-member
@@ -629,7 +620,7 @@
                  {:type :ok     :process 1 :f :zrange-all
                   :value [["m1" 6.0]] :index 7}]
         result  (run-checker history)]
-    (is (:valid? result)
+    (is (true? (:valid? result))
         (str "expected chain-tail score to be accepted, got: " result))))
 
 (deftest committed-zincrby-return-values-constrain-final-score
@@ -657,7 +648,7 @@
                   :value [["m1" 6.0]] :index 7})]
     (is (not (:valid? (run-checker read-a)))
         "expected B's intermediate return value (4.0) to be rejected")
-    (is (:valid? (run-checker read-b))
+    (is (true? (:valid? (run-checker read-b)))
         "expected A's final return value (6.0) to be accepted")))
 
 (deftest zadd-resets-zincrby-chain
@@ -684,7 +675,7 @@
                    {:type :invoke :process 1 :f :zrange-all :index 8}
                    {:type :ok     :process 1 :f :zrange-all
                     :value [["m1" 3.0]] :index 9})]
-    (is (:valid? (run-checker read-ok))
+    (is (true? (:valid? (run-checker read-ok)))
         "expected post-reset chain tail (11.0) to be accepted")
     (is (not (:valid? (run-checker read-bad)))
         "expected pre-reset intermediate (3.0) to be flagged")))
@@ -705,7 +696,7 @@
                     {:type :invoke :process 2 :f :zrange-all :index 4}
                     {:type :ok     :process 2 :f :zrange-all
                      :value [["m1" 1.0]] :index 5})]
-    (is (:valid? (run-checker read-zadd))
+    (is (true? (:valid? (run-checker read-zadd)))
         "expected ZADD's final score to be accepted")
     (is (not (:valid? (run-checker read-incr)))
         "expected ZINCRBY's pre-ZADD return to be rejected")))
@@ -759,7 +750,7 @@
                       {:type :invoke :process 3 :f :zrange-all :index 6}
                       {:type :ok     :process 3 :f :zrange-all
                        :value [["m1" 3.0]] :index 7})]
-    (is (:valid? (run-checker read-tail))
+    (is (true? (:valid? (run-checker read-tail)))
         "expected negative-delta final tail to be accepted")
     (is (not (:valid? (run-checker read-prefix)))
         "expected intermediate negative-delta return to be rejected")))
@@ -828,7 +819,7 @@
                  {:type :invoke :process 3 :f :zrange-all :index 6}
                  {:type :ok     :process 3 :f :zrange-all
                   :value [["m1" 3.0]] :index 7})]
-    (is (:valid? (run-checker read-6))
+    (is (true? (:valid? (run-checker read-6)))
         "expected 6.0 (one linearization) to be accepted")
     (is (not (:valid? (run-checker read-3)))
         "expected 3.0 intermediate return value to be rejected")))
@@ -847,7 +838,7 @@
                  {:type :invoke :process 3 :f :zrange-all                :index 6}
                  {:type :ok     :process 3 :f :zrange-all
                   :value [["m1" 3.0]] :index 7}]]
-    (is (:valid? (run-checker history))
+    (is (true? (:valid? (run-checker history)))
         "expected overlapping base mutation to remain reorderable with the tail")))
 
 (deftest later-read-cannot-switch-overlapping-write-order
@@ -902,8 +893,8 @@
   (let [history [{:type :invoke :process 0 :f :zadd         :value ["m1" 1] :index 0}
                  {:type :ok     :process 0 :f :zadd         :value ["m1" 1] :index 1}
                  {:type :invoke :process 1 :f :zrem         :value "m1"     :index 2}
-                 {:type :info   :process 1 :f :zrem
-                  :value "m1" :error "conn reset" :index 3}
+                 {:type :fail   :process 1 :f :zrem
+                  :value "m1" :error "definitively rejected" :index 3}
                  {:type :invoke :process 2 :f :zrangebyscore
                   :value [0.0 10.0] :index 4}
                  {:type :ok     :process 2 :f :zrangebyscore
@@ -991,7 +982,7 @@
                  {:type :ok     :process 1 :f :zrangebyscore
                   :value {:bounds [0.0 10.0]
                           :members [["m1" 1.0]]} :index 5}]]
-    (is (:valid? (run-checker history)))))
+    (is (true? (:valid? (run-checker history))))))
 
 (deftest zrangebyscore-prefix-check-detects-stale-in-range-predecessor
   ;; A predecessor may be optional for omission because its forced state is
@@ -1495,6 +1486,28 @@
         check (fn [middle] (run-checker (map-indexed #(assoc %2 :index %1)
                                                       (concat add read middle failed-final))))]
     (is (false? (:valid? (check rem))))
-    (is (:valid? (check [(op 1 :invoke :zrem "m") (first rem)
-                         (second rem) (op 1 :ok :zrem ["m" true])])))
-    (is (:valid? (check (concat [(op 1 :invoke :zrem "m") (op 1 :info :zrem nil)] rem))))))
+    (is (true? (:valid? (check [(op 1 :invoke :zrem "m") (first rem)
+                         (second rem) (op 1 :ok :zrem ["m" true])]))))
+    (is (true? (:valid? (check (concat [(op 1 :invoke :zrem "m") (op 1 :info :zrem nil)] rem)))))))
+
+(deftest timed-out-removal-can-explain-a-later-noop
+  (let [op (fn [p type f value] {:process p :type type :f f :value value})
+        start [(op 0 :invoke :zrange-all nil) (op 0 :ok :zrange-all [])]
+        remove [(op 1 :invoke :zrem "m") (op 1 :info :zrem nil)]
+        tail [(op 2 :invoke :zadd ["m" 1]) (op 2 :ok :zadd ["m" 1])
+              (op 3 :invoke :zrem "m") (op 3 :ok :zrem ["m" false])]
+        valid? #(->> (concat start % tail) (map-indexed (fn [i o] (assoc o :index i)))
+                     run-checker :valid?)]
+    (is (true? (valid? remove)))
+    (is (false? (valid? [])))))
+
+(deftest one-unknown-increment-cannot-explain-two-incompatible-reads
+  (let [h [{:process 0 :type :invoke :f :zincrby :value ["m" 1]}
+           {:process 0 :type :info :f :zincrby}
+           {:process 1 :type :invoke :f :zrange-all}
+           {:process 1 :type :ok :f :zrange-all :value [["m" 1.0]]}
+           {:process 1 :type :invoke :f :zrange-all}
+           {:process 1 :type :ok :f :zrange-all :value []}]
+        check (fn [h] (:valid? (run-checker (map-indexed #(assoc %2 :index %1) h))))]
+    (is (false? (check h)))
+    (is (true? (check (assoc-in h [5 :value] [["m" 1.0]]))))))

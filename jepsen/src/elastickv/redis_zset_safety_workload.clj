@@ -34,7 +34,8 @@
      client, but the checker treats every :ok operation as atomic — any
      visible inconsistency (member present with no matching op, score
      disagreeing with any known write, etc.) is reported."
-  (:require [clojure.string :as str]
+  (:require [elastickv.history-windows :as windows]
+            [clojure.string :as str]
             [clojure.tools.logging :refer [warn]]
             [elastickv.cli :as cli]
             [elastickv.db :as ekdb]
@@ -415,7 +416,8 @@
         (let [f (:f invoke)
               t (if complete (:type complete) :pending)
               inv-idx (:index invoke)
-              cmp-idx (when complete (:index complete))]
+              ;; An indeterminate response puts no upper bound on server execution.
+              cmp-idx (when (#{:ok :fail} t) (:index complete))]
           (case f
             :zadd
             (let [[m s] (:value invoke)]
@@ -463,18 +465,7 @@
        (or (nil? (:complete-idx m))
            (>= (:complete-idx m) read-inv-idx))))
 
-(defn- pre-read-info?
-  "True when an indeterminate operation completed before a read began.
-  Such a mutation may have taken effect server-side; when an observed
-  value requires it, it anchors the read prefix even though it is no
-  longer concurrent with the read window."
-  [m read-inv-idx]
-  (and (= :info (:type m))
-       (some? (:complete-idx m))
-       (< (:complete-idx m) read-inv-idx)))
-
 (def ^:private absent-state {:present? false :score nil})
-(def ^:private impossible-state {:present? false :score nil :impossible? true})
 
 (defn- score-eq?
   [a b]
@@ -527,35 +518,6 @@
   [states m]
   (set (mapcat #(apply-mutation-possibilities % m) states)))
 
-(declare linearized-read-states)
-
-(defn- model-before
-  "Construct authoritative per-member state from mutations whose
-  completions strictly precede read-inv-idx. Returns
-  {member -> {:present? bool :score s}}. :ok mutations before the read
-  are required; pre-read :info mutations are optional because they may
-  have taken effect server-side and may be necessary to make a later :ok
-  relative mutation reply consistent. Pending operations without a
-  completion are deferred to the concurrent-window check."
-  [mutations-by-m read-inv-idx]
-  (reduce-kv
-    (fn [model member muts]
-      (let [before-read? #(and (some? (:complete-idx %))
-                               (< (:complete-idx %) read-inv-idx))
-            required (->> muts
-                          (filter #(and (= :ok (:type %))
-                                        (before-read? %)))
-                          vec)
-            optional (->> muts
-                          (filter #(and (= :info (:type %))
-                                        (before-read? %)))
-                          vec)
-            states (linearized-read-states #{absent-state} required optional)
-            state (first states)]
-        (assoc model member (or state impossible-state))))
-    {}
-    mutations-by-m))
-
 (defn- concurrent-mutations-for-member
   "All mutations concurrent with the read window that could have taken
   effect. :fail completions are excluded: in Jepsen, :fail means the op
@@ -575,42 +537,10 @@
   (and (= :zrem (:f m))
        (not= false (:removed? m))))
 
-(defn- strictly-follows?
-  "True iff `later` is ordered after `earlier` by real time."
-  [later earlier]
-  (and (some? (:complete-idx earlier))
-       (> (:invoke-idx later) (:complete-idx earlier))))
-
 (defn- real-time-before?
   [a b]
   (and (some? (:complete-idx a))
        (< (:complete-idx a) (:invoke-idx b))))
-
-(defn- could-linearize-between?
-  "True when candidate can be ordered after earlier and before later without
-  violating either operation's real-time window."
-  [candidate earlier later]
-  (and (not (real-time-before? candidate earlier))
-       (not (real-time-before? later candidate))))
-
-(defn- superseded-by-preceding-state-change?
-  "True iff an unconditional committed ZADD before the read makes m's
-  pre-read uncertainty irrelevant.
-
-  ZINCRBY and ZREM are state-dependent: their replies can require m to have
-  taken effect. When either could linearize between m and a later ZADD, keep
-  m so the checker can validate that dependent reply before the ZADD resets
-  the member state. A successful ZREM is also state-dependent (it can return
-  true only for a present member), so it cannot supersede uncertainty by
-  itself."
-  [preceding m]
-  (some (fn [reset]
-          (and (= :zadd (:f reset))
-               (strictly-follows? reset m)
-               (not-any? #(and (#{:zincrby :zrem} (:f %))
-                                (could-linearize-between? % m reset))
-                         preceding)))
-        preceding))
 
 (defn- unique-mutations
   [muts]
@@ -634,20 +564,18 @@
         [idx m]))
     remaining))
 
-(defn- linearized-read-states
-  "Enumerate possible member states at a read. Required mutations are
-  committed tail candidates and must appear before the read. Optional
-  mutations are :info/pending or concurrent ops and may either be absent
-  from the read's prefix or appear in any real-time-consistent order."
-  [initial-states required optional]
-  (let [items (vec (concat (map #(assoc % ::required? true) required)
-                           (map #(assoc % ::required? false) optional)))
-        memo (atom {})]
+(defn- search-limit! []
+  (throw (ex-info "ZSET linearization search exceeded its budget" {:reason ::search-limit})))
+
+(defn- linearized-batch-states [initial-states items]
+  (when (> (count items) 96) (search-limit!))
+  (let [memo (atom {})]
     (letfn [(step [states remaining]
               (let [k [states remaining]]
                 (if (contains? @memo k)
                   (get @memo k)
-                  (let [result (if (empty? remaining)
+                  (let [_ (when (>= (count @memo) 8000) (search-limit!))
+                        result (if (empty? remaining)
                                  states
                                  (reduce
                                    (fn [acc [idx item]]
@@ -664,6 +592,22 @@
                     (swap! memo assoc k result)
                     result))))]
       (step initial-states items))))
+
+(defn- linearized-read-states
+  "Only overlapping calls need a joint search. Carry every reachable state
+   across the gap between batches. An unknown completion keeps its end open."
+  [initial-states required optional]
+  (let [items (sort-by :invoke-idx (concat (map #(assoc % ::required? true) required) optional))]
+    (loop [states initial-states, xs items]
+      (if (or (empty? xs) (empty? states))
+        states
+        (let [[batch tail]
+              (loop [batch [(first xs)], end (or (:complete-idx (first xs)) Long/MAX_VALUE), tail (next xs)]
+                (if (and (seq tail) (<= (:invoke-idx (first tail)) end))
+                  (recur (conj batch (first tail))
+                         (max end (or (:complete-idx (first tail)) Long/MAX_VALUE)) (next tail))
+                  [batch tail]))]
+          (recur (linearized-batch-states states batch) tail))))))
 
 (defn- possible-states-for-member
   "Enumerate possible states for one member at a read. `force-required?`
@@ -688,20 +632,13 @@
                        unique-mutations)
          required-ids (set (map :invoke-idx required))
          required? #(contains? required-ids (:invoke-idx %))
-         pre-read-info (->> muts
-                            (filter #(and (= :info (:type %))
-                                          (some? (:complete-idx %))
-                                          (< (:complete-idx %) read-inv-idx)
-                                          (not (required? %))
-                                          (not (superseded-by-preceding-state-change?
-                                                 required %)))))
          concurrent (->> (concurrent-mutations-for-member muts
                                                           read-inv-idx
                                                           read-cmp-idx)
                          (remove required?))]
      (linearized-read-states #{absent-state}
                              required
-                             (concat pre-read-info concurrent)))))
+                             concurrent))))
 
 (defn- allowed-scores-for-member
   "Compute the set of states considered valid for `member` by a read
@@ -723,7 +660,8 @@
         can-be-present? (boolean (seq present-states))
         must-be-present? (boolean (and (seq possible-states)
                                        (every? :present? possible-states)))]
-    {:scores           scores
+    {:impossible?      (empty? possible-states)
+     :scores           scores
      :can-be-present?  (boolean can-be-present?)
      :must-be-present? must-be-present?}))
 
@@ -761,11 +699,6 @@
                                       muts))]))
           mutations-by-m)))
 
-(defn- read-visible-mutation?
-  [m read-inv-idx read-cmp-idx]
-  (or (concurrent? m read-inv-idx read-cmp-idx)
-      (pre-read-info? m read-inv-idx)))
-
 (defn- mutation-can-produce-score?
   [mutations-by-m m member score read-inv-idx read-cmp-idx]
   (case (:f m)
@@ -791,7 +724,7 @@
   [mutations-by-m m member score read-inv-idx read-cmp-idx]
   (and (not= :fail (:type m))
        (= member (:member m))
-       (read-visible-mutation? m read-inv-idx read-cmp-idx)
+       (concurrent? m read-inv-idx read-cmp-idx)
        (mutation-can-produce-score? mutations-by-m m member score
                                     read-inv-idx read-cmp-idx)))
 
@@ -830,7 +763,7 @@
   (and (effective-zrem? m)
        (not= :fail (:type m))
        (= member (:member m))
-       (read-visible-mutation? m read-inv-idx read-cmp-idx)
+       (concurrent? m read-inv-idx read-cmp-idx)
        (let [states (possible-states-for-member (without-mutation mutations-by-m m)
                                                 member
                                                 read-inv-idx
@@ -844,7 +777,7 @@
        (#{:zadd :zincrby} (:f m))
        (not= :fail (:type m))
        (= member (:member m))
-       (read-visible-mutation? m read-inv-idx read-cmp-idx)
+       (concurrent? m read-inv-idx read-cmp-idx)
        (let [before-states (possible-states-for-member
                              (without-mutation mutations-by-m m)
                              member
@@ -862,7 +795,7 @@
        (#{:zadd :zincrby} (:f m))
        (not= :fail (:type m))
        (= member (:member m))
-       (read-visible-mutation? m read-inv-idx read-cmp-idx)
+       (concurrent? m read-inv-idx read-cmp-idx)
        (let [before-states (possible-states-for-member
                              (without-mutation mutations-by-m m)
                              member
@@ -919,7 +852,7 @@
   [mutations-by-m m member read-inv-idx read-cmp-idx bounds]
   (and (not= :fail (:type m))
        (= member (:member m))
-       (read-visible-mutation? m read-inv-idx read-cmp-idx)
+       (concurrent? m read-inv-idx read-cmp-idx)
        (or (effective-zrem? m)
            (score-change-can-hide-range-member-candidate?
              mutations-by-m
@@ -1221,15 +1154,14 @@
         ;;    linearization leaves it present (must-be-present?). This
         ;;    correctly skips members that an :info or concurrent ZREM
         ;;    might have removed before the read.
-        (let [model (model-before mutations-by-m inv-idx)
-              observed-members (into #{} (map first) entries)]
-          (doseq [[member state] model]
-            (if (:impossible? state)
+        (let [observed-members (into #{} (map first) entries)]
+          (doseq [member (keys mutations-by-m)
+                  :let [allowed (allowed-scores-for-member mutations-by-m member inv-idx cmp-idx)]]
+            (if (:impossible? allowed)
               (swap! errors conj {:kind :impossible-mutation-chain
                                   :index cmp-idx
                                   :member member})
-              (let [{:keys [must-be-present?]}
-                    (allowed-scores-for-member mutations-by-m member inv-idx cmp-idx)]
+              (let [{:keys [must-be-present?]} allowed]
                 (when (and must-be-present?
                            (not (contains? observed-members member)))
                   (swap! errors conj {:kind :missing-member
@@ -1294,16 +1226,15 @@
         ;;     (must-be-present?), AND
         ;; (b) its score is definitively within [lo, hi] across all
         ;;     admissible linearizations.
-        (let [model (model-before mutations-by-m inv-idx)
-              observed-members (into #{} (map first) members)]
-          (doseq [[member state] model]
-            (if (:impossible? state)
+        (let [observed-members (into #{} (map first) members)]
+          (doseq [member (keys mutations-by-m)
+                  :let [allowed (allowed-scores-for-member mutations-by-m member inv-idx cmp-idx)]]
+            (if (:impossible? allowed)
               (swap! errors conj {:kind :impossible-mutation-chain
                                   :index cmp-idx
                                   :bounds bounds
                                   :member member})
-              (let [{:keys [must-be-present? scores]}
-                    (allowed-scores-for-member mutations-by-m member inv-idx cmp-idx)]
+              (let [{:keys [must-be-present? scores]} allowed]
                 (when (and must-be-present?
                            (score-definitely-in-range? scores lo hi)
                            (not (contains? observed-members member)))
@@ -1331,81 +1262,101 @@
         @errors))))
 
 (defn- impossible-mutation-reply [mutations]
-  ;; At a quiescent boundary all earlier acknowledged mutations must fit,
-  ;; even when no later range read succeeds. Enumerate only overlapping
-  ;; intervals together and carry the reachable states into the next batch.
-  (loop [states #{absent-state}
-         remaining (sort-by :invoke-idx (remove #(= :fail (:type %)) mutations))]
-    (when-let [first-op (first remaining)]
-      (let [[batch tail]
-            (loop [batch [first-op]
-                   end (or (:complete-idx first-op) Long/MAX_VALUE)
-                   tail (next remaining)]
-              (if (and (seq tail) (<= (:invoke-idx (first tail)) end))
-                (recur (conj batch (first tail))
-                       (max end (or (:complete-idx (first tail)) Long/MAX_VALUE))
-                       (next tail))
-                [batch tail]))
-            {required :ok info :info pending :pending} (group-by :type batch)
-            reachable (linearized-read-states states required (concat info pending))]
-        (if (empty? reachable)
-          {:kind :impossible-mutation-reply :member (:member first-op)
-           :invoke-indices (mapv :invoke-idx batch)}
-          (recur reachable tail))))))
+  (let [{required :ok info :info pending :pending} (group-by :type mutations)]
+    (when (empty? (linearized-read-states #{absent-state} required (concat info pending)))
+      {:kind :impossible-mutation-reply :member (:member (first mutations))
+       :invoke-indices (mapv :invoke-idx mutations)})))
 
-(defn zset-safety-checker
+(defn- range-matches? [db {:keys [f value]}]
+  (let [[lo hi] (:bounds value)
+        entries (if (= :zrange-all f) value (:members value))
+        visible (if (= :zrange-all f) db (filter (fn [[_ score]] (<= lo score hi)) db))]
+    (and (= (count visible) (count entries))
+         (every? (fn [[member score]] (score-eq? (get db member) score)) entries))))
+
+(defn- advance-zset [db remaining [id op]]
+  (let [member (:member op)
+        next-db (cond
+                  (:read op) (when (range-matches? db (:read op)) db)
+                  (and (= :zrem (:f op)) (not= :ok (:type op))) (dissoc db member)
+                  :else
+                  (let [score (get db member)
+                        st (if (some? score) {:present? true :score score} absent-state)]
+                    (when-let [after (first (apply-mutation-possibilities st op))]
+                      (if (:present? after) (assoc db member (:score after)) (dissoc db member)))))]
+    (when next-db [next-db (dissoc remaining id)])))
+
+(defn- zset-witness [mutations reads]
+  (windows/serial-witness
+    (concat (for [m mutations :when (not= :fail (:type m))]
+              (assoc m :start (:invoke-idx m) :end (or (:complete-idx m) Long/MAX_VALUE)))
+            (for [{:keys [invoke complete]} reads]
+              {:start (:index invoke) :end (:index complete) :read complete}))
+    advance-zset))
+
+(defn- check-zset-history
   "Custom Jepsen checker: validates ZSet safety properties using a
   last-writer model combined with a concurrent-write relaxation."
-  []
+  [history]
+  (let [pairs (pair-invokes-with-completions history)
+        mutations (completed-mutation-window pairs)
+        mutations-by-m (mutations-by-member mutations)
+        read-pairs (filter (fn [{:keys [invoke complete]}]
+                             (and invoke complete
+                                  (= :ok (:type complete))
+                                  (#{:zrange-all :zrangebyscore}
+                                   (:f invoke))))
+                           pairs)
+        all-errors (reduce
+                     (fn [acc {:keys [invoke] :as pair}]
+                       (into acc
+                             (case (:f invoke)
+                               :zrange-all    (check-zrange-all mutations-by-m pair)
+                               :zrangebyscore (check-zrangebyscore mutations-by-m pair))))
+                     []
+                     read-pairs)
+        all-errors (into all-errors (keep impossible-mutation-reply (vals mutations-by-m)))
+        all-errors (into all-errors
+                         (check-read-stability mutations-by-m read-pairs))
+        witness (when (and (empty? all-errors) (seq read-pairs)) (zset-witness mutations read-pairs))
+        all-errors (cond-> all-errors (false? witness) (conj {:kind :no-consistent-zset-history}))
+        by-kind (group-by :kind all-errors)
+        ;; Vacuous-pass guard: if the run produced zero
+        ;; successful reads, we have no evidence that the system
+        ;; under test actually satisfies ZSet safety -- every op
+        ;; may have been downgraded to :info because Redis was
+        ;; unreachable or every read timed out. Returning
+        ;; `:valid? true` in that case would be a false-green.
+        ;; Emit `:valid? :unknown` with a diagnostic reason; the
+        ;; cli's `fail-on-invalid!` treats anything other than
+        ;; `true` as a failure (see elastickv.cli/fail-on-invalid!).
+        no-successful-reads? (zero? (count read-pairs))
+        valid? (cond
+                 (seq all-errors)      false
+                 no-successful-reads?  :unknown
+                 :else                 witness)]
+    (cond-> {:valid? valid?
+             :reads  (count read-pairs)
+             :mutations (count mutations)
+             :error-count (count all-errors)
+             :errors-by-kind (into {} (map (fn [[k v]] [k (count v)]) by-kind))
+             :first-errors (take 20 all-errors)}
+      (= :unknown witness) (assoc :reason :zset-search-limit)
+      no-successful-reads?
+      (assoc :reason
+             (str "No successful :zrange-all / :zrangebyscore reads"
+                  " completed -- cannot assert ZSet safety. Likely"
+                  " Redis was unreachable or every read timed out;"
+                  " re-run against a healthy cluster.")))))
+
+(defn zset-safety-checker []
   (reify checker/Checker
     (check [_ _test history _opts]
-      (let [pairs (pair-invokes-with-completions history)
-            mutations (completed-mutation-window pairs)
-            mutations-by-m (mutations-by-member mutations)
-            read-pairs (filter (fn [{:keys [invoke complete]}]
-                                 (and invoke complete
-                                      (= :ok (:type complete))
-                                      (#{:zrange-all :zrangebyscore}
-                                       (:f invoke))))
-                               pairs)
-            all-errors (reduce
-                         (fn [acc {:keys [invoke] :as pair}]
-                           (into acc
-                                 (case (:f invoke)
-                                   :zrange-all    (check-zrange-all mutations-by-m pair)
-                                   :zrangebyscore (check-zrangebyscore mutations-by-m pair))))
-                         []
-                         read-pairs)
-            all-errors (into all-errors (keep impossible-mutation-reply (vals mutations-by-m)))
-            all-errors (into all-errors
-                             (check-read-stability mutations-by-m read-pairs))
-            by-kind (group-by :kind all-errors)
-            ;; Vacuous-pass guard: if the run produced zero
-            ;; successful reads, we have no evidence that the system
-            ;; under test actually satisfies ZSet safety -- every op
-            ;; may have been downgraded to :info because Redis was
-            ;; unreachable or every read timed out. Returning
-            ;; `:valid? true` in that case would be a false-green.
-            ;; Emit `:valid? :unknown` with a diagnostic reason; the
-            ;; cli's `fail-on-invalid!` treats anything other than
-            ;; `true` as a failure (see elastickv.cli/fail-on-invalid!).
-            no-successful-reads? (zero? (count read-pairs))
-            valid? (cond
-                     (seq all-errors)      false
-                     no-successful-reads?  :unknown
-                     :else                 true)]
-        (cond-> {:valid? valid?
-                 :reads  (count read-pairs)
-                 :mutations (count mutations)
-                 :error-count (count all-errors)
-                 :errors-by-kind (into {} (map (fn [[k v]] [k (count v)]) by-kind))
-                 :first-errors (take 20 all-errors)}
-          no-successful-reads?
-          (assoc :reason
-                 (str "No successful :zrange-all / :zrangebyscore reads"
-                      " completed -- cannot assert ZSet safety. Likely"
-                      " Redis was unreachable or every read timed out;"
-                      " re-run against a healthy cluster.")))))))
+      (try (check-zset-history history)
+           (catch clojure.lang.ExceptionInfo e
+             (if (= ::search-limit (:reason (ex-data e)))
+               {:valid? :unknown :reason :zset-search-limit}
+               (throw e)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Workload

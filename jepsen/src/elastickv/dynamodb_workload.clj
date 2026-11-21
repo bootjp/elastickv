@@ -148,7 +148,7 @@
                  [k (when-let [lv (get-in entry [:Item (keyword val-attr) :L])]
                       (mapv #(Long/parseLong (:N %)) lv))])
                ks-vec
-               (:Responses resp)))))
+               (conditions/snapshot-responses resp ks-vec)))))
 
 (defn- list-attr
   "Convert a Clojure vector of longs to a DynamoDB {:L [...]} attribute."
@@ -259,7 +259,7 @@
             ;; 3. Dispatch all writes atomically via TransactWriteItems,
             ;;    merging same-key appends into one UpdateItem entry.
             (let [all-keys      (into #{} (map second mops))
-                  snapshot      (dynamo-transact-get! ddb all-keys)
+                  snapshot      (conditions/read-snapshot! dynamo-transact-get! ddb all-keys)
                   local-appends (volatile! {})
                   value' (mapv (fn [[f k v :as mop]]
                                  (case f
@@ -273,39 +273,11 @@
                                mops)
                   writes (filterv (fn [[f _ _]] (= f :append)) mops)]
               (when (seq writes) (dynamo-transact-write! ddb writes snapshot))
-              (assoc op :type :ok :value value')))))
-
-      (catch clojure.lang.ExceptionInfo e
-        (let [data     (ex-data e)
-              err-type (:type data)
-              category (:category data)]
-          (cond
-            (:write-rejection data) (merge op (:write-rejection data))
-
-            ;; Network / transport error (no DynamoDB __type)
-            (and (nil? err-type)
-                 (#{:cognitect.anomalies/fault
-                    :cognitect.anomalies/unavailable} category))
-            (assoc op :type :info :error :network-error)
-
-            (contains? #{"ConditionalCheckFailedException" "TransactionCanceledException"} err-type)
-            (assoc op :type :fail :error err-type)
-
-            (= "InternalServerError" err-type)
-            (assoc op :type :info :error (str err-type))
-
-            ;; Definite API-level failures
-            (= "ValidationException" err-type)
-            (assoc op :type :fail
-                      :error (str err-type ": "
-                                  (get-in data [:resp :message]
-                                    (get-in data [:resp :Message] ""))))
-
-            :else
-            (assoc op :type :info :error (.getMessage e)))))
+              (cond-> (assoc op :type :ok :value value')
+                (seq writes) (assoc :write-snapshot snapshot))))))
 
       (catch Exception e
-        (assoc op :type :info :error (.getMessage e))))))
+        (conditions/failure-op op e)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Workload & Test builders

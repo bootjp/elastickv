@@ -40,6 +40,7 @@
             [elastickv.composed1-nemesis :as composed1]
             [elastickv.db :as ekdb]
             [elastickv.dynamodb-conditions :as conditions]
+            [elastickv.dynamodb-write-skew :as skew]
             [jepsen [client :as client]
                     [generator :as gen]
                     [net :as net]]
@@ -228,17 +229,10 @@
                               :Key       {pk-attr {:S (key->pk k)}}}})
                      ks-vec)
         resp   (ddb-invoke! ddb :TransactGetItems {:TransactItems items})]
-    ;; DynamoDB guarantees :Responses is positionally aligned with the
-    ;; :TransactItems we sent.  Assert it so a future cognitect SDK
-    ;; that ever normalises / re-orders the response surfaces loudly
-    ;; rather than silently corrupting the snapshot map (review feedback
-    ;; on PR #916).
-    (assert (= (count ks-vec) (count (:Responses resp)))
-            "TransactGetItems :Responses must be positionally aligned with the requested items")
     (into {}
           (map (fn [k entry] [k (read-list-attr (:Item entry))])
                ks-vec
-               (:Responses resp)))))
+               (conditions/snapshot-responses resp ks-vec)))))
 
 (defn- dynamo-transact-write!
   "Cross-table TransactWriteItems.  Mirrors the single-table workload's
@@ -373,6 +367,7 @@
                   :bin      bin
                   :address  addr
                   :raw-out  (:out result)})))
+      (when-let [capture (:capture-skew-routes test)] (capture (:out result) key->table-name))
       groups)))
 
 ;; ---------------------------------------------------------------------------
@@ -419,7 +414,7 @@
     (when ddb (aws/stop ddb))
     (assoc this :ddb nil))
 
-  (invoke! [_this _test op]
+  (invoke! [_this test op]
     (try
       (case (:f op)
         :txn
@@ -436,7 +431,8 @@
             ;; Multi-op: atomic cross-table TransactGetItems pre-read,
             ;; then RYOW simulation, then cross-table TransactWriteItems.
             (let [all-keys      (into #{} (map second mops))
-                  snapshot      (dynamo-transact-get! ddb all-keys)
+                  snapshot      (conditions/read-snapshot! dynamo-transact-get! ddb all-keys)
+                  _ (when-let [observe (:after-skew-read test)] (observe snapshot))
                   local-appends (volatile! {})
                   value' (mapv (fn [[f k v :as mop]]
                                  (case f
@@ -450,37 +446,11 @@
                                mops)
                   writes (filterv (fn [[f _ _]] (= f :append)) mops)]
               (when (seq writes) (dynamo-transact-write! ddb writes snapshot))
-              (assoc op :type :ok :value value')))))
-
-      (catch clojure.lang.ExceptionInfo e
-        (let [data     (ex-data e)
-              err-type (:type data)
-              category (:category data)]
-          (cond
-            (:write-rejection data) (merge op (:write-rejection data))
-
-            (and (nil? err-type)
-                 (#{:cognitect.anomalies/fault
-                    :cognitect.anomalies/unavailable} category))
-            (assoc op :type :info :error :network-error)
-
-            (contains? #{"ConditionalCheckFailedException" "TransactionCanceledException"} err-type)
-            (assoc op :type :fail :error err-type)
-
-            (= "InternalServerError" err-type)
-            (assoc op :type :info :error (str err-type))
-
-            (= "ValidationException" err-type)
-            (assoc op :type :fail
-                      :error (str err-type ": "
-                                  (get-in data [:resp :message]
-                                    (get-in data [:resp :Message] ""))))
-
-            :else
-            (assoc op :type :info :error (.getMessage e)))))
+              (cond-> (assoc op :type :ok :value value')
+                (seq writes) (assoc :write-snapshot snapshot))))))
 
       (catch Exception e
-        (assoc op :type :info :error (.getMessage e))))))
+        (conditions/failure-op op e)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Workload & Test builders
@@ -594,7 +564,8 @@
   "DynamoDB-specific CLI options, appended to common opts.  Same
    surface as elastickv.dynamodb-workload's CLI so the same shell
    invocations work against either workload."
-  [[nil "--dynamo-ports PORTS" "Comma-separated DynamoDB ports (one per node)."
+  [[nil "--write-skew" "Run the synchronized write-skew and serial controls on the local M5 topology."]
+   [nil "--dynamo-ports PORTS" "Comma-separated DynamoDB ports (one per node)."
     :default nil
     :parse-fn (fn [s]
                 (->> (str/split s #",")
@@ -651,4 +622,8 @@
   (cli/run-workload! args
                      (into cli/common-cli-opts dynamo-cli-opts)
                      prepare-dynamo-opts
-                     elastickv-dynamodb-multi-table-test))
+                     (fn [opts]
+                       (when (and (:write-skew opts) (or (not (:local opts)) (:composed1-route-shuffle opts)))
+                         (throw (ex-info "Write-skew requires a stable local M5 layout" {})))
+                       (cond-> (elastickv-dynamodb-multi-table-test opts)
+                         (:write-skew opts) skew/test-spec))))
