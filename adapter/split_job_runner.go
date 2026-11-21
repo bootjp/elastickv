@@ -1819,12 +1819,11 @@ func (s *DistributionServer) ensureSplitJobCatalogFence(
 	if sourceRoute.RouteID != job.SourceRouteID {
 		return snapshot, sourceRoute, nil
 	}
-	current, found, err := s.catalog.SplitJobAt(ctx, job.JobID, snapshot.ReadTS)
-	if err != nil {
-		return distribution.CatalogSnapshot{}, distribution.RouteDescriptor{}, errors.WithStack(err)
-	}
-	if !found || current.Phase != distribution.SplitJobPhaseFence {
-		return distribution.CatalogSnapshot{}, distribution.RouteDescriptor{}, errors.WithStack(store.ErrWriteConflict)
+	if err := s.verifyWorkingSourceFenceJob(ctx, job, snapshot.ReadTS); err != nil {
+		if errors.Is(err, distribution.ErrCatalogSplitJobConflict) {
+			return distribution.CatalogSnapshot{}, distribution.RouteDescriptor{}, errors.WithStack(store.ErrWriteConflict)
+		}
+		return distribution.CatalogSnapshot{}, distribution.RouteDescriptor{}, err
 	}
 	leftID, rightID, err := s.allocateChildRouteIDs(ctx, snapshot.ReadTS, snapshot.Routes)
 	if err != nil {
