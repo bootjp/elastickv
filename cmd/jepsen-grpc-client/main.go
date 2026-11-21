@@ -31,15 +31,18 @@ const (
 )
 
 type request struct {
-	Op    string `json:"op"`
-	Key   string `json:"key"`
-	Value *int64 `json:"value"`
+	Op       string `json:"op"`
+	Key      string `json:"key"`
+	Value    *int64 `json:"value"`
+	Expected uint64 `json:"expected,omitempty"`
 }
 
 type response struct {
-	Type  string `json:"type"`
-	Value any    `json:"value"`
-	Error string `json:"error,omitempty"`
+	Type    string `json:"type"`
+	Value   any    `json:"value"`
+	Error   string `json:"error,omitempty"`
+	Version uint64 `json:"version,omitempty"`
+	Missing bool   `json:"missing,omitempty"`
 }
 
 type rpcClient struct {
@@ -95,6 +98,8 @@ func (c rpcClient) invoke(ctx context.Context, req request) response {
 		return response{Type: outcomeFail, Error: "key is required"}
 	}
 	switch req.Op {
+	case "version-read", "cas":
+		return c.versionOperation(ctx, req)
 	case "write":
 		if req.Value == nil {
 			return response{Type: outcomeFail, Error: "write value is required"}
@@ -113,13 +118,7 @@ func (c rpcClient) invoke(ctx context.Context, req request) response {
 		if value == nil {
 			return response{Type: outcomeOK}
 		}
-		n, err := strconv.ParseInt(string(value), 10, 64)
-		if err != nil {
-			// Preserve corrupt/unexpected data as an observed value. Turning
-			// it into a failed read would hide it from the register checkers.
-			return response{Type: outcomeOK, Value: "invalid integer: " + string(value)}
-		}
-		return response{Type: outcomeOK, Value: n}
+		return response{Type: outcomeOK, Value: registerValue(value)}
 	default:
 		return response{Type: outcomeFail, Error: "unsupported operation"}
 	}

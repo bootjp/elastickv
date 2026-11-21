@@ -703,10 +703,10 @@ func (s *mvccStore) ImportVersions(ctx context.Context, opts ImportVersionsOptio
 	if err := s.rejectMemoryEntry(ctx); err != nil {
 		return ImportVersionsResult{}, err
 	}
-	return s.importMemoryVersions(opts)
+	return s.importMemoryVersions(opts, s.lookupMigrationVersion)
 }
 
-func (s *mvccStore) importMemoryVersions(opts ImportVersionsOptions) (ImportVersionsResult, error) {
+func (s *mvccStore) importMemoryVersions(opts ImportVersionsOptions, lookup migrationVersionLookup) (ImportVersionsResult, error) {
 	s.applyMu.Lock()
 	s.mtx.Lock()
 	defer s.applyMu.Unlock()
@@ -725,19 +725,9 @@ func (s *mvccStore) importMemoryVersions(opts ImportVersionsOptions) (ImportVers
 		return ImportVersionsResult{AckedCursor: bytes.Clone(existing.cursor), Duplicate: true}, nil
 	}
 
-	for _, version := range opts.Versions {
-		if err := validateImportVersion(version); err != nil {
-			return ImportVersionsResult{}, err
-		}
+	if err := s.applyMemoryImportVersionsLocked(opts, lookup); err != nil {
+		return ImportVersionsResult{}, err
 	}
-	for _, version := range opts.Versions {
-		if version.Tombstone {
-			s.deleteVersionLocked(version.Key, version.CommitTS)
-			continue
-		}
-		s.putVersionLocked(version.Key, version.Value, version.CommitTS, version.ExpireAt)
-	}
-
 	batchMax := importBatchMaxTS(opts.Versions)
 	if batchMax > s.lastCommitTS {
 		s.lastCommitTS = batchMax
@@ -749,8 +739,35 @@ func (s *mvccStore) importMemoryVersions(opts ImportVersionsOptions) (ImportVers
 	return ImportVersionsResult{AckedCursor: bytes.Clone(opts.Cursor), MaxImportedTS: batchMax}, nil
 }
 
+func (s *mvccStore) applyMemoryImportVersionsLocked(opts ImportVersionsOptions, lookup migrationVersionLookup) error {
+	for _, version := range opts.Versions {
+		if err := validateImportVersion(version); err != nil {
+			return err
+		}
+	}
+	writes := opts.Versions
+	if !opts.AllowLegacyVersionOverwrite {
+		var err error
+		writes, err = immutableMigrationWrites(writes, opts.LogicalKey, lookup)
+		if err != nil {
+			return err
+		}
+	}
+	for _, version := range writes {
+		if version.Tombstone {
+			s.deleteVersionLocked(version.Key, version.CommitTS)
+			continue
+		}
+		s.putVersionLocked(version.Key, version.Value, version.CommitTS, version.ExpireAt)
+	}
+	return nil
+}
+
 func (s *mvccStore) ImportVersionsRaft(ctx context.Context, opts ImportVersionsOptions) (ImportVersionsResult, error) {
-	return s.ImportVersions(ctx, opts)
+	if err := s.rejectMemoryEntry(ctx); err != nil {
+		return ImportVersionsResult{}, err
+	}
+	return s.importMemoryVersions(opts, s.lookupMigrationHead)
 }
 
 func (s *mvccStore) MigrationHLCFloor(ctx context.Context, jobID uint64) (uint64, error) {

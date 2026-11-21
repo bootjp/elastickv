@@ -22,10 +22,12 @@ func configureCommitTSFenceActivation(coordinate *kv.ShardedCoordinator, enabled
 // enabled.
 type consistencyFlags struct {
 	commitTSFence        bool
+	versionCAS           bool
 	readWatermarkAdvance bool
 }
 
 func (f *consistencyFlags) register(fs *flag.FlagSet) {
+	fs.BoolVar(&f.versionCAS, "versionCAS", false, "Enable MVCC version tokens and CAS for unmigrated keys on protected Raft data groups after replicated activation and live replica checks")
 	fs.BoolVar(&f.commitTSFence, "commitTSFence", false, "Reserved for replicated catalog bootstrap; activation is rejected until the startup catalog no longer writes outside Raft")
 	fs.BoolVar(&f.readWatermarkAdvance, "readWatermarkAdvance", false, "Raise a lagging group's commit watermark before a cross-group snapshot read so late one-phase writes cannot land below the snapshot; enable only after every node runs a binary that understands the advance entry")
 }

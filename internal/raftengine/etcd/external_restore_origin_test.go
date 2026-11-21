@@ -228,6 +228,12 @@ func TestExternalOriginSuccessfulOpenRetainsCompletedBinding(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, marker)
 	require.True(t, marker.Completed)
+	rebased, err := HasExternalRestoreOrigin(dir)
+	require.NoError(t, err)
+	require.True(t, rebased, "CAS must still see the origin after the external restore finishes")
+	rebased, err = HasExternalRestoreOrigin(t.TempDir())
+	require.NoError(t, err)
+	require.False(t, rebased)
 	require.NoError(t, engine.Close())
 	require.Equal(t, []raftengine.SnapshotRestoreOrigin{raftengine.SnapshotRestoreExternalRebase}, fsm.origins)
 	// Completion never lets the original bytes bypass origin validation.

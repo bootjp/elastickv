@@ -62,6 +62,9 @@ func (d *MemoryDispatcher) Dispatch(
 func memoryMutations(elems []*kv.Elem[kv.OP], commitTS uint64) ([]*store.KVPairMutation, error) {
 	mutations := make([]*store.KVPairMutation, 0, len(elems))
 	for _, elem := range elems {
+		if elem.ExpectedCommitTS != 0 {
+			return nil, errors.WithStack(kv.ErrVersionCASUnavailable)
+		}
 		value := append([]byte(nil), elem.Value...)
 		if elem.CommitTSValueOffset != 0 {
 			if len(value) < commitTimestampBytes || elem.CommitTSValueOffset > uint64(len(value)-commitTimestampBytes) {
@@ -74,15 +77,17 @@ func memoryMutations(elems []*kv.Elem[kv.OP], commitTS uint64) ([]*store.KVPairM
 			mutations = append(mutations, &store.KVPairMutation{
 				Op: store.OpTypePut, Key: append([]byte(nil), elem.Key...), Value: value,
 			})
+			continue
 		case kv.Del:
 			mutations = append(mutations, &store.KVPairMutation{
 				Op: store.OpTypeDelete, Key: append([]byte(nil), elem.Key...),
 			})
+			continue
+		case kv.CompareAndSwap:
+			return nil, errors.WithStack(kv.ErrVersionCASUnavailable)
 		case kv.DelPrefix:
-			return nil, errors.WithStack(store.ErrUnknownOp)
-		default:
-			return nil, errors.WithStack(store.ErrUnknownOp)
 		}
+		return nil, errors.WithStack(store.ErrUnknownOp)
 	}
 	return mutations, nil
 }

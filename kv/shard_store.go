@@ -309,6 +309,37 @@ func (s *ShardStore) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte, 
 	return s.GetAtWithReadFence(ctx, key, ts, 0, 0)
 }
 
+func (s *ShardStore) GetVersionAt(ctx context.Context, key []byte, ts uint64) (store.VersionedValue, error) {
+	return s.GetVersionAtWithReadFence(ctx, key, ts, 0, 0)
+}
+
+func (s *ShardStore) GetVersionAtWithReadFence(ctx context.Context, key []byte, ts uint64, groupID uint64, readRouteVersion uint64) (store.VersionedValue, error) {
+	ctx = migrationServingReadContext(ctx, readRouteVersion)
+	if err := s.awaitReadRouteVersion(ctx, readRouteVersion); err != nil {
+		return store.VersionedValue{}, err
+	}
+	route, version, ok := s.versionReadRoute(key, groupID)
+	if !ok {
+		return store.VersionedValue{}, store.ErrNotSupported
+	}
+	g, ok := s.groupForID(route.GroupID)
+	if !ok || g == nil || g.Store == nil || g.versionReadAdmission == nil {
+		return store.VersionedValue{}, store.ErrNotSupported
+	}
+	return s.readPointInGroup(ctx, g, route, key, ts, route.GroupID, max(version, readRouteVersion), true)
+}
+
+func (s *ShardStore) versionReadRoute(key []byte, groupID uint64) (distribution.Route, uint64, bool) {
+	if s.engine == nil || !versionCASDirectKey(key) {
+		return distribution.Route{}, 0, false
+	}
+	if _, partitioned, err := s.partitionOwner(key); partitioned || err != nil {
+		return distribution.Route{}, 0, false
+	}
+	route, version, ok := s.engine.GetRouteWithVersion(key)
+	return route, version, ok && versionCASInitialRoute(route) && (groupID == 0 || groupID == route.GroupID)
+}
+
 func (s *ShardStore) GetAtWithReadFence(ctx context.Context, key []byte, ts uint64, groupID uint64, readRouteVersion uint64) ([]byte, error) {
 	ctx = migrationServingReadContext(ctx, readRouteVersion)
 	if err := s.awaitReadRouteVersion(ctx, readRouteVersion); err != nil {
@@ -357,7 +388,7 @@ func (s *ShardStore) getGroupAtWithReadFence(ctx context.Context, groupID uint64
 		return nil, err
 	}
 	g, ok := s.groupForID(groupID)
-	if !ok || g.Store == nil {
+	if !ok || g == nil || g.Store == nil {
 		return nil, store.ErrKeyNotFound
 	}
 	route, err := s.routeForExplicitGroupKey(groupID, key)
@@ -370,26 +401,38 @@ func (s *ShardStore) getGroupAtWithReadFence(ctx context.Context, groupID uint64
 
 func (s *ShardStore) getRouteAt(ctx context.Context, route distribution.Route, key []byte, ts uint64, readRouteVersion uint64) ([]byte, error) {
 	g, ok := s.groupForID(route.GroupID)
-	if !ok || g.Store == nil {
+	if !ok || g == nil || g.Store == nil {
 		return nil, store.ErrKeyNotFound
 	}
 	return s.getGroupAt(ctx, g, route, key, ts, route.GroupID, readRouteVersion)
 }
 
 func (s *ShardStore) getGroupAt(ctx context.Context, g *ShardGroup, route distribution.Route, key []byte, ts uint64, groupID uint64, readRouteVersion uint64) ([]byte, error) {
+	record, err := s.readPointInGroup(ctx, g, route, key, ts, groupID, readRouteVersion, false)
+	return record.Value, err
+}
+
+func unavailablePointRead(needCommitTS bool) error {
+	if needCommitTS {
+		return store.ErrNotSupported
+	}
+	return store.ErrKeyNotFound
+}
+
+func (s *ShardStore) readPointInGroup(ctx context.Context, g *ShardGroup, route distribution.Route, key []byte, ts uint64, groupID uint64, readRouteVersion uint64, needCommitTS bool) (store.VersionedValue, error) {
 	if err := s.ensureReadWatermark(ctx, g, ts); err != nil {
-		return nil, err
+		return store.VersionedValue{}, err
 	}
 	if engineForGroup(g) == nil {
-		return s.localGetAt(ctx, g, route, key, ts)
+		return s.localReadPoint(ctx, g, route, key, ts, needCommitTS)
 	}
 	if isLinearizableRaftLeader(ctx, engineForGroup(g)) {
-		return s.leaderGetAt(ctx, g, route, key, ts)
+		return s.leaderReadPoint(ctx, g, route, key, ts, needCommitTS)
 	}
 	if err := s.verifyTargetReadinessForRange(ctx, g, route, key, nextScanCursor(key)); err != nil {
-		return nil, err
+		return store.VersionedValue{}, err
 	}
-	return s.proxyRawGet(ctx, g, key, ts, groupID, readRouteVersion)
+	return s.proxyRawGet(ctx, g, &pb.RawGetRequest{Key: key, Ts: ts, GroupId: groupID, ReadRouteVersion: readRouteVersion, NeedCommitTs: needCommitTS})
 }
 
 // routeHasLatestVersionVisibleAt reports whether this route can answer the read
@@ -567,34 +610,44 @@ func isLinearizableRaftLeader(ctx context.Context, engine raftengine.LeaderView)
 	return err == nil
 }
 
-func (s *ShardStore) leaderGetAt(ctx context.Context, g *ShardGroup, route distribution.Route, key []byte, ts uint64) ([]byte, error) {
+func (s *ShardStore) leaderReadPoint(ctx context.Context, g *ShardGroup, route distribution.Route, key []byte, ts uint64, needCommitTS bool) (store.VersionedValue, error) {
 	var err error
 	route, err = s.targetReadyRouteForRange(ctx, g, route, key, nextScanCursor(key))
 	if err != nil {
-		return nil, err
+		return store.VersionedValue{}, err
 	}
 	if !isTxnInternalKey(key) {
 		if err := s.maybeResolveTxnLock(ctx, g, key, ts); err != nil {
-			return nil, err
+			return store.VersionedValue{}, err
 		}
 	}
-	return s.localGetAt(ctx, g, route, key, ts)
+	return s.localReadPoint(ctx, g, route, key, ts, needCommitTS)
 }
 
 func (s *ShardStore) localGetAt(ctx context.Context, g *ShardGroup, route distribution.Route, key []byte, ts uint64) ([]byte, error) {
+	result, err := s.localReadPoint(ctx, g, route, key, ts, false)
+	return result.Value, err
+}
+
+func (s *ShardStore) localReadPoint(ctx context.Context, g *ShardGroup, route distribution.Route, key []byte, ts uint64, needCommitTS bool) (store.VersionedValue, error) {
 	var err error
 	route, err = s.targetReadyRouteForRange(ctx, g, route, key, nextScanCursor(key))
 	if err != nil {
-		return nil, err
+		return store.VersionedValue{}, err
 	}
 	if routeHasStagedVisibility(route) {
-		return s.getAtWithStagedVisibility(ctx, g, route, key, ts)
+		// This path merges a staged and live key using separate store reads.
+		if needCommitTS {
+			return store.VersionedValue{}, store.ErrNotSupported
+		}
+		value, err := s.getAtWithStagedVisibility(ctx, g, route, key, ts)
+		return store.VersionedValue{Value: value}, err
 	}
-	val, err := g.Store.GetAt(ctx, key, ts)
-	if err != nil {
-		return nil, errors.WithStack(err)
+	if needCommitTS {
+		return readVersionOnInitialRoute(ctx, g, route, key, ts)
 	}
-	return val, nil
+	value, err := g.Store.GetAt(ctx, key, ts)
+	return store.VersionedValue{Value: value}, errors.WithStack(err)
 }
 
 func routeHasStagedVisibility(route distribution.Route) bool {
@@ -6766,34 +6819,24 @@ func (s *ShardStore) s3BucketAuxiliaryOwnerRouteForKey(key []byte) (distribution
 	return s3BucketAuxiliaryOwnerRouteFromRange(start, end, s.engine.GetIntersectingRoutes(start, end))
 }
 
-func (s *ShardStore) proxyRawGet(ctx context.Context, g *ShardGroup, key []byte, ts uint64, groupID uint64, readRouteVersion uint64) ([]byte, error) {
+func (s *ShardStore) proxyRawGet(ctx context.Context, g *ShardGroup, req *pb.RawGetRequest) (store.VersionedValue, error) {
 	engine := engineForGroup(g)
 	if engine == nil {
-		return nil, store.ErrKeyNotFound
+		return store.VersionedValue{}, unavailablePointRead(req.NeedCommitTs)
 	}
 	addr := leaderAddrFromEngine(engine)
 	if addr == "" {
-		return nil, errors.WithStack(ErrLeaderNotFound)
+		return store.VersionedValue{}, errors.WithStack(ErrLeaderNotFound)
 	}
 
 	conn, err := s.connCache.ConnFor(addr)
 	if err != nil {
-		return nil, err
+		return store.VersionedValue{}, err
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, proxyForwardTimeout)
 	defer cancel()
-	cli := pb.NewRawKVClient(conn)
-	resp, err := cli.RawGet(ctx, &pb.RawGetRequest{Key: key, Ts: ts, GroupId: groupID, ReadRouteVersion: readRouteVersion})
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-	// Compatibility with older nodes that don't set RawGetResponse.exists:
-	// treat any non-nil payload as found even when exists=false.
-	if !resp.GetExists() && resp.GetValue() == nil {
-		return nil, store.ErrKeyNotFound
-	}
-	return resp.Value, nil
+	return readRawPoint(ctx, conn, req)
 }
 
 func (s *ShardStore) proxyRawScanAt(

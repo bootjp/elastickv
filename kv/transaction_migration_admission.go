@@ -6,6 +6,7 @@ import (
 	"github.com/bootjp/elastickv/internal/raftengine"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
+	"github.com/cockroachdb/errors"
 )
 
 type transactionMigrationAdmission struct {
@@ -57,12 +58,15 @@ func configureMigrationRequestAdmission(tx Transactional, st store.MVCCStore, gr
 	}
 }
 
-func (a *transactionMigrationAdmission) apply(ctx context.Context, proposer raftengine.Proposer, reqs []*pb.Request, observer ProposalObserver) (uint64, []error, error) {
+func (a *transactionMigrationAdmission) apply(ctx context.Context, proposer raftengine.Proposer, reqs []*pb.Request, observer ProposalObserver, cas bool) (uint64, []error, error) {
 	results := make([]error, len(reqs))
 	accepted := make([]*pb.Request, 0, len(reqs))
 	positions := make([]int, 0, len(reqs))
 	for i, req := range reqs {
-		results[i] = CheckMigrationRequest(ctx, a.store, a.groupID, req)
+		results[i] = checkMigrationRequest(ctx, a.store, a.groupID, req, cas)
+		if errors.Is(results[i], ErrVersionCASUnavailable) {
+			return 0, nil, results[i]
+		}
 		if results[i] == nil {
 			accepted, positions = append(accepted, req), append(positions, i)
 		}
@@ -70,7 +74,7 @@ func (a *transactionMigrationAdmission) apply(ctx context.Context, proposer raft
 	if len(accepted) == 0 {
 		return 0, results, nil
 	}
-	index, applied, err := applyRequests(ctx, proposer, accepted, observer)
+	index, applied, err := applyClassifiedRequests(ctx, proposer, accepted, observer, nil, cas)
 	if err != nil {
 		return 0, nil, err
 	}

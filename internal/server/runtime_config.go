@@ -61,6 +61,9 @@ func (f *topologyFlags) register(fs *flag.FlagSet) {
 }
 
 func resolveValidatedRuntimeInputs(flags *Flags) (noderuntime.RuntimeConfig, noderuntime.RaftEngineType, noderuntime.BootstrapConfig, bool, error) {
+	if flags.consistency.versionCAS && !flags.consistency.commitTSFence {
+		return noderuntime.RuntimeConfig{}, "", noderuntime.BootstrapConfig{}, false, errors.New("versionCAS requires --commitTSFence")
+	}
 	if err := validateCommitTSFenceStartup(flags.consistency.commitTSFence, flags.bootstrap.peerConfigDir != ""); err != nil {
 		return noderuntime.RuntimeConfig{}, "", noderuntime.BootstrapConfig{}, false, err
 	}

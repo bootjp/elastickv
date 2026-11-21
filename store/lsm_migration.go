@@ -17,6 +17,10 @@ func (s *pebbleStore) ExportVersions(ctx context.Context, opts ExportVersionsOpt
 }
 
 func (s *pebbleStore) exportVersionsLocked(ctx context.Context, opts ExportVersionsOptions) (ExportVersionsResult, error) {
+	return s.exportVersionsFromLocked(ctx, s.db, opts, false)
+}
+
+func (s *pebbleStore) exportVersionsFromLocked(ctx context.Context, reader pebble.Reader, opts ExportVersionsOptions, checkIteratorClose bool) (_ ExportVersionsResult, err error) {
 	opts = normalizeExportVersionsOptions(opts)
 	pos, err := decodeExportCursorForOptions(opts)
 	if err != nil {
@@ -29,12 +33,20 @@ func (s *pebbleStore) exportVersionsLocked(ctx context.Context, opts ExportVersi
 		return ExportVersionsResult{}, ErrReadTSCompacted
 	}
 
-	iter, err := s.db.NewIter(pebbleExportIterOptions(opts))
+	iter, err := reader.NewIter(pebbleExportIterOptions(opts))
 	if err != nil {
 		return ExportVersionsResult{}, errors.WithStack(err)
 	}
-	defer iter.Close()
+	defer func() {
+		closeErr := iter.Close()
+		if checkIteratorClose {
+			err = errors.Join(err, closeErr)
+		}
+	}()
+	return s.scanPebbleExport(ctx, iter, opts, pos)
+}
 
+func (s *pebbleStore) scanPebbleExport(ctx context.Context, iter *pebble.Iterator, opts ExportVersionsOptions, pos exportCursorPosition) (ExportVersionsResult, error) {
 	seek, err := pebbleExportSeekKey(opts, pos)
 	if err != nil {
 		return ExportVersionsResult{}, err
@@ -418,9 +430,21 @@ func (s *pebbleStore) validatePebbleImportBatch(opts ImportVersionsOptions) (boo
 }
 
 func (s *pebbleStore) commitPebbleImportBatch(opts ImportVersionsOptions, batchMax uint64, writeOpts *pebble.WriteOptions, gateRegistration bool) error {
+	writes := opts.Versions
+	if !opts.AllowLegacyVersionOverwrite {
+		var err error
+		lookup := s.lookupMigrationHead
+		if gateRegistration {
+			lookup = s.lookupMigrationVersion
+		}
+		writes, err = immutableMigrationWrites(writes, opts.LogicalKey, lookup)
+		if err != nil {
+			return err
+		}
+	}
 	batch := s.db.NewBatch()
 	defer batch.Close()
-	if err := s.applyImportVersionsBatch(batch, opts.Versions, gateRegistration); err != nil {
+	if err := s.applyImportVersionsBatch(batch, writes, gateRegistration); err != nil {
 		return err
 	}
 	if err := s.stageMigrationImportAck(batch, opts.JobID, opts.BracketID, migrationImportAck{

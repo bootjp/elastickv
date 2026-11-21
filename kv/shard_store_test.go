@@ -2076,6 +2076,13 @@ func TestShardStoreReadFenceFailsClosedWhileCatalogVersionIsBehind(t *testing.T)
 			},
 		},
 		{
+			name: "versioned point read",
+			read: func(ctx context.Context) error {
+				_, err := st.GetVersionAtWithReadFence(ctx, []byte("k"), 1, 0, 2)
+				return err
+			},
+		},
+		{
 			name: "latest commit timestamp",
 			read: func(ctx context.Context) error {
 				_, _, err := st.LatestCommitTSWithReadFence(ctx, []byte("k"), 2)
@@ -5129,6 +5136,11 @@ func TestShardStoreSourceReadFenceRejectsPointRead(t *testing.T) {
 	require.NoError(t, group.Store.PutAt(ctx, []byte("n"), []byte("live"), 60, 0))
 
 	_, err := st.GetAt(ctx, []byte("n"), 60)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+	group.ConfigureVersionReadAdmission(func(context.Context) error { return nil })
+	_, err = st.GetVersionAt(ctx, []byte("n"), 60)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+	_, err = st.GetVersionAtWithReadFence(ctx, []byte("n"), 60, 1, 0)
 	require.ErrorIs(t, err, ErrRouteCutoverPending)
 
 	_, _, err = st.LatestCommitTSGroupWithReadFence(ctx, []byte("n"), 1, 0)

@@ -224,24 +224,32 @@ func (r *GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.Raw
 	if err := r.requireReadReady(); err != nil {
 		return nil, errors.WithStack(err)
 	}
-	readTS, err := r.resolveRawReadSnapshot(ctx, req.GetTs(), req.GetGroupId(), req.GetKey())
+	snapshot, err := resolveRawReadSnapshot(ctx, readRequest, req.GetTs(), req.GetGroupId(), req.GetKey())
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
 
+	if req.GetNeedCommitTs() {
+		return r.rawGetVersion(ctx, readRequest, snapshot, req)
+	}
+	return r.rawGetValue(ctx, readRequest, snapshot, req)
+}
+
+func (r *GRPCServer) rawGetValue(ctx context.Context, readRequest *kv.ReadRequest, snapshot kv.ReadSnapshot, req *pb.RawGetRequest) (*pb.RawGetResponse, error) {
 	var v []byte
-	if fenceGetter, ok := r.store.(rawReadFenceGetter); ok {
-		v, err = requestGetAtWithReadFence(ctx, fenceGetter, req.Key, readTS, req.GetGroupId(), r.readRouteVersion(req.GetReadRouteVersion()))
+	var err error
+	if _, ok := r.store.(rawReadFenceGetter); ok {
+		v, err = readRequest.GetWithFence(ctx, snapshot, req.Key, req.GetGroupId(), r.readRouteVersion(req.GetReadRouteVersion()))
 	} else if req.GetReadRouteVersion() != 0 {
 		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "raw get with read fence requires a read-fence-aware store"))
 	} else if groupID := req.GetGroupId(); groupID != 0 {
-		groupGetter, ok := r.store.(rawGroupGetter)
+		_, ok := r.store.(rawGroupGetter)
 		if !ok {
 			return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "raw get with explicit group requires a group-aware store"))
 		}
-		v, err = requestGetGroupAt(ctx, groupGetter, groupID, req.Key, readTS)
+		v, err = readRequest.GetGroup(ctx, snapshot, groupID, req.Key)
 	} else {
-		v, err = requestGetAt(ctx, r.store, req.Key, readTS)
+		v, err = readRequest.Get(ctx, snapshot, req.Key)
 	}
 	r.observeGRPCPointRead(ctx, req.GetKey(), req.GetGroupId())
 	if errors.Is(err, store.ErrKeyNotFound) {
@@ -258,6 +266,31 @@ func (r *GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.Raw
 		slog.String("value", string(v)))
 
 	return &pb.RawGetResponse{Value: v, Exists: true}, nil
+}
+
+func (r *GRPCServer) rawGetVersion(ctx context.Context, readRequest *kv.ReadRequest, snapshot kv.ReadSnapshot, req *pb.RawGetRequest) (*pb.RawGetResponse, error) {
+	record, err := readRequest.GetVersionWithFence(ctx, snapshot, req.GetKey(), req.GetGroupId(), r.readRouteVersion(req.GetReadRouteVersion()))
+	r.observeGRPCPointRead(ctx, req.GetKey(), req.GetGroupId())
+	if errors.Is(err, store.ErrKeyNotFound) {
+		return &pb.RawGetResponse{Version: &pb.RawGetResponse_Missing{Missing: true}}, nil
+	}
+	if errors.Is(err, store.ErrReadTSCompacted) {
+		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, store.ErrReadTSCompacted.Error()))
+	}
+	if err := versionedGetError(record, err); err != nil {
+		return nil, err
+	}
+	return &pb.RawGetResponse{Value: record.Value, Exists: true, Version: &pb.RawGetResponse_CommitTs{CommitTs: record.TS}}, nil
+}
+
+func versionedGetError(record store.VersionedValue, err error) error {
+	if errors.Is(err, kv.ErrVersionCASUnavailable) {
+		return errors.WithStack(status.Error(codes.FailedPrecondition, "version token admission unavailable"))
+	}
+	if errors.Is(err, store.ErrNotSupported) || (err == nil && record.TS == 0) {
+		return errors.WithStack(status.Error(codes.Unimplemented, "commit timestamp is unavailable for this read"))
+	}
+	return errors.WithStack(err)
 }
 
 // rawGroupWatermark answers the keyless leader-fenced watermark for one Raft
@@ -849,6 +882,18 @@ func (r *GRPCServer) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetRespon
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
+	if req.GetNeedCommitTs() {
+		record, err := readRequest.GetVersion(ctx, snapshot, req.GetKey())
+		r.observeGRPCPointRead(ctx, req.GetKey(), 0)
+		if errors.Is(err, store.ErrKeyNotFound) {
+			return &pb.GetResponse{Version: &pb.GetResponse_Missing{Missing: true}}, nil
+		}
+		if err := versionedGetError(record, err); err != nil {
+			return nil, err
+		}
+		return &pb.GetResponse{Value: record.Value, Version: &pb.GetResponse_CommitTs{CommitTs: record.TS}}, nil
+	}
+
 	v, err := readRequest.Get(ctx, snapshot, req.Key)
 	r.observeGRPCPointRead(ctx, req.GetKey(), 0)
 	if err != nil {
@@ -968,15 +1013,21 @@ func (r *GRPCServer) beginLatestReadSnapshot(ctx context.Context, groupID uint64
 	return stamp.Timestamp(), err
 }
 
-func (r *GRPCServer) resolveRawReadSnapshot(ctx context.Context, requested, groupID uint64, key []byte) (uint64, error) {
+func resolveRawReadSnapshot(ctx context.Context, request *kv.ReadRequest, requested, groupID uint64, key []byte) (kv.ReadSnapshot, error) {
 	if requested != 0 {
-		if request, ok := kv.ReadRequestFromContext(ctx); ok {
-			snapshot, err := request.Historical(ctx, requested)
-			return snapshot.Timestamp(), err
-		}
-		return requested, nil
+		snapshot, err := request.Historical(ctx, requested)
+		return snapshot, errors.WithStack(err)
 	}
-	return r.beginLatestReadSnapshot(ctx, groupID, key)
+	if groupID != 0 {
+		snapshot, err := request.LatestTargets(ctx, "grpc group read", []kv.ReadFenceTarget{{GroupID: groupID, Key: key}})
+		return snapshot, errors.WithStack(err)
+	}
+	var keys [][]byte
+	if key != nil {
+		keys = [][]byte{key}
+	}
+	snapshot, err := request.Latest(ctx, "grpc latest read", keys...)
+	return snapshot, errors.WithStack(err)
 }
 
 func WithGRPCActiveTimestampTracker(tracker *kv.ActiveTimestampTracker) GRPCServerOption {

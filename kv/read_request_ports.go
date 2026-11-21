@@ -25,6 +25,28 @@ func withReadSnapshot[T any](r *ReadRequest, ctx context.Context, snapshot ReadS
 	return value, errors.WithStack(err)
 }
 
+// GetVersion reads the visible record behind the request's point-read snapshot.
+func (r *ReadRequest) GetVersion(ctx context.Context, snapshot ReadSnapshot, key []byte) (store.VersionedValue, error) {
+	return withReadSnapshot(r, ctx, snapshot, func() error { return r.validateKeyScope(snapshot, key) }, func(timestamp uint64) (store.VersionedValue, error) {
+		shards, ok := r.st.(*ShardStore)
+		if !ok {
+			return store.VersionedValue{}, store.ErrNotSupported
+		}
+		return shards.GetVersionAt(ctx, key, timestamp)
+	})
+}
+
+// GetVersionWithFence preserves the explicit group and route fence on RawGet.
+func (r *ReadRequest) GetVersionWithFence(ctx context.Context, snapshot ReadSnapshot, key []byte, groupID uint64, readRouteVersion uint64) (store.VersionedValue, error) {
+	return withReadSnapshot(r, ctx, snapshot, func() error { return r.validateGroupScope(snapshot, groupID, key) }, func(timestamp uint64) (store.VersionedValue, error) {
+		reader, ok := r.st.(*ShardStore)
+		if !ok {
+			return store.VersionedValue{}, store.ErrNotSupported
+		}
+		return reader.GetVersionAtWithReadFence(ctx, key, timestamp, groupID, readRouteVersion)
+	})
+}
+
 func (r *ReadRequest) Exists(ctx context.Context, snapshot ReadSnapshot, key []byte) (bool, error) {
 	return withReadSnapshot(r, ctx, snapshot, func() error { return r.validateKeyScope(snapshot, key) }, func(timestamp uint64) (bool, error) {
 		reader, ok := r.st.(interface {

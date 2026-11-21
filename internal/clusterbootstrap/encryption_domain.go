@@ -8,6 +8,7 @@ import (
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftadmission"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
@@ -157,7 +158,7 @@ func (d *BootstrapDomain) InspectPayload(kind raftadmission.Kind, group uint64, 
 		if err := BootstrapPayloadValidator(d.cluster)(kind, group, final); err != nil {
 			return zero, err
 		}
-		return raftadmission.PayloadInspection{PlaintextDigest: sha256.Sum256(final)}, nil
+		return raftadmission.PayloadInspection{PlaintextDigest: sha256.Sum256(final), RequiresVersionCASProof: raftengine.RequiresVersionCASProof(final)}, nil
 	}
 	if kind == raftadmission.Rotation && recipe == (raftbootstrap.Digest{}) {
 		return zero, errors.WithStack(ErrBootstrapRotationRecipe)
@@ -172,7 +173,7 @@ func (d *BootstrapDomain) InspectPayload(kind raftadmission.Kind, group uint64, 
 	if err != nil {
 		return zero, err
 	}
-	return raftadmission.PayloadInspection{PlaintextDigest: proof.PlaintextDigest, ProjectionGeneration: proof.ProjectionGeneration}, nil
+	return raftadmission.PayloadInspection{PlaintextDigest: proof.PlaintextDigest, ProjectionGeneration: proof.ProjectionGeneration, RequiresVersionCASProof: proof.RequiresVersionCASProof}, nil
 }
 
 func (d *BootstrapDomain) loadEncryptionPayloadProjection(id uint64, recipe raftbootstrap.Digest) (BootstrapPayloadProjection, error) {

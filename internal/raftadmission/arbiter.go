@@ -54,8 +54,9 @@ type Config struct {
 }
 
 type PayloadInspection struct {
-	PlaintextDigest      raftbootstrap.Digest
-	ProjectionGeneration uint64
+	RequiresVersionCASProof bool
+	PlaintextDigest         raftbootstrap.Digest
+	ProjectionGeneration    uint64
 }
 
 type group struct {

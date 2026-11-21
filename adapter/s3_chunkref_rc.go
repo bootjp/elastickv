@@ -88,20 +88,29 @@ func collectS3ChunkRefChanges(elems []*kv.Elem[kv.OP]) ([]*s3ChunkRefChange, err
 			changes[key] = change
 			order = append(order, change)
 		}
-		switch elem.Op {
-		case kv.Put:
-			ref, ok := s3keys.DecodeChunkRefValue(elem.Value)
-			if !ok {
-				return nil, errors.New("s3: malformed chunkref value")
-			}
-			change.after = &ref
-		case kv.Del:
-			change.after = nil
-		case kv.DelPrefix:
-			return nil, errors.New("s3: prefix deletion requires explicit chunkref accounting")
+		if err := change.applyMutation(elem); err != nil {
+			return nil, err
 		}
 	}
 	return order, nil
+}
+
+func (change *s3ChunkRefChange) applyMutation(elem *kv.Elem[kv.OP]) error {
+	switch elem.Op {
+	case kv.Put:
+		ref, ok := s3keys.DecodeChunkRefValue(elem.Value)
+		if !ok {
+			return errors.New("s3: malformed chunkref value")
+		}
+		change.after = &ref
+	case kv.Del:
+		change.after = nil
+	case kv.DelPrefix:
+		return errors.New("s3: prefix deletion requires explicit chunkref accounting")
+	case kv.CompareAndSwap:
+		return errors.New("s3: conditional chunkref changes require explicit accounting")
+	}
+	return nil
 }
 
 func (s *S3Server) readS3ChunkRefAt(ctx context.Context, key []byte, readTS uint64) (*s3keys.ChunkRefValue, error) {

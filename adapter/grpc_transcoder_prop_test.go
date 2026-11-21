@@ -111,6 +111,8 @@ func applyOps(t interface {
 					delete(mem, k)
 				}
 			}
+		case kv.CompareAndSwap:
+			require.FailNow(t, "unconditional transcoder produced a conditional operation")
 		default:
 			require.Fail(t, "unknown operation", "op=%v", elem.Op)
 		}

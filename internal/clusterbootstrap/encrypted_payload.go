@@ -7,6 +7,7 @@ import (
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/raftadmission"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/cockroachdb/errors"
 )
 
@@ -65,9 +66,10 @@ func (p BootstrapPayloadProjection) validate(group uint64) error {
 }
 
 type bootstrapPayloadValidation struct {
-	FinalDigest          [sha256.Size]byte
-	PlaintextDigest      [sha256.Size]byte
-	ProjectionGeneration uint64
+	RequiresVersionCASProof bool
+	FinalDigest             [sha256.Size]byte
+	PlaintextDigest         [sha256.Size]byte
+	ProjectionGeneration    uint64
 }
 
 // Validate OUTSIDE A against a pinned installed projection. Seal the ACTUAL
@@ -97,7 +99,7 @@ func ValidateBootstrapFinalPayload(cluster raftbootstrap.UUID, kind raftadmissio
 	if kind == raftadmission.Rotation && !projection.authorizesRotation(plain) {
 		return zero, errors.Join(ErrBootstrapAdmissionPayload, ErrBootstrapRotationRecipe)
 	}
-	return bootstrapPayloadValidation{FinalDigest: sha256.Sum256(final), PlaintextDigest: sha256.Sum256(plain), ProjectionGeneration: projection.Generation}, nil
+	return bootstrapPayloadValidation{FinalDigest: sha256.Sum256(final), PlaintextDigest: sha256.Sum256(plain), ProjectionGeneration: projection.Generation, RequiresVersionCASProof: raftengine.RequiresVersionCASProof(plain)}, nil
 }
 
 func (p BootstrapPayloadProjection) Plaintext(final []byte) ([]byte, error) {

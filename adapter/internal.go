@@ -197,6 +197,8 @@ type Internal struct {
 	migrationPartitionProtocolReady func() bool
 	migrationNamespaceReady         func() bool
 	transferSizeReady               func() bool
+	casForwardRoute                 func(context.Context, uint64, []byte) error
+	casForwardGroup                 uint64
 	routeEngine                     *distribution.Engine
 	readTracker                     *kv.ActiveTimestampTracker
 	migrationExportGroupID          uint64
@@ -246,19 +248,36 @@ const (
 )
 
 func (i *Internal) Forward(ctx context.Context, req *pb.ForwardRequest) (*pb.ForwardResponse, error) {
+	if kv.HasCASMutation(req.GetRequests()) {
+		return nil, errors.WithStack(kv.VersionCASForwardUnavailable(kv.ErrVersionCASUnavailable))
+	}
+	return i.forwardRequests(ctx, req)
+}
+
+func (i *Internal) preflightForwardRequests(ctx context.Context, req *pb.ForwardRequest) error {
 	// Before the leader check, so a non-leader gets the accurate reason and a
 	// leader can never reach stampTimestamps and propose.
 	if i.kvForwardRejected {
-		return nil, forwardStatusForReceiver(req, ErrKVForwardNotSupported, false)
+		return forwardStatusForReceiver(req, ErrKVForwardNotSupported, false)
+	}
+	if err := i.preflightForwardCAS(ctx, req); err != nil {
+		return err
 	}
 	if i.leader == nil || i.leader.State() != raftengine.StateLeader {
-		return nil, forwardStatusForReceiver(req, kv.ErrLeaderNotFound, false)
+		return forwardStatusForReceiver(req, kv.ErrLeaderNotFound, false)
 	}
 	if err := i.leader.VerifyLeader(ctx); err != nil {
-		return nil, forwardStatusForReceiver(req, err, false)
+		return forwardStatusForReceiver(req, err, false)
 	}
 	if err := rejectUnactivatedBoundForward(req.GetRequests()); err != nil {
-		return nil, forwardStatusForReceiver(req, err, false)
+		return forwardStatusForReceiver(req, err, false)
+	}
+	return nil
+}
+
+func (i *Internal) forwardRequests(ctx context.Context, req *pb.ForwardRequest) (*pb.ForwardResponse, error) {
+	if err := i.preflightForwardRequests(ctx, req); err != nil {
+		return nil, err
 	}
 
 	commitTS, err := i.stampTimestamps(ctx, req)
@@ -273,6 +292,9 @@ func (i *Internal) Forward(ctx context.Context, req *pb.ForwardRequest) (*pb.For
 	}
 
 	r, err := i.transactionManager.Commit(ctx, req.Requests)
+	if errors.Is(err, kv.ErrVersionCASUnavailable) && !errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+		return nil, errors.WithStack(kv.VersionCASForwardUnavailable(err))
+	}
 	if err != nil {
 		return &pb.ForwardResponse{
 			Success:     false,
@@ -297,31 +319,66 @@ func forwardStatusForReceiver(req *pb.ForwardRequest, err error, commitAttempt b
 	if commitAttempt {
 		return forwardCommitStatus(req.GetRequests(), err)
 	}
+	if _, shapeErr := kv.ForwardCASMutation(req.GetRequests()); shapeErr == nil &&
+		(errors.Is(err, kv.ErrLeaderNotFound) || errors.Is(err, raftengine.ErrNotLeader)) {
+		return &forwardWireFailure{
+			wire: kv.ForwardDecisionStatus(pb.ForwardFailurePhase_FORWARD_FAILURE_PHASE_ONE_PHASE_APPLY,
+				pb.ForwardFailureReason_FORWARD_FAILURE_REASON_NO_LEADER,
+				pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_REJECTED_BEFORE_SUBMISSION),
+			cause: err,
+		}
+	}
 	return forwardUnknownStatus(req.GetRequests(), err)
 }
 
 func forwardCommitStatus(reqs []*pb.Request, err error) error {
 	phase, ok := kv.ForwardFailurePhaseForRequests(reqs)
+	if !ok || phase != pb.ForwardFailurePhase_FORWARD_FAILURE_PHASE_ONE_PHASE_APPLY ||
+		!kv.ForwardOnePhaseDecisionEligible(reqs) || errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+		return forwardUnknownStatus(reqs, err)
+	}
+
+	// Only an indexed local apply verdict certifies that this submitted
+	// request had no effect. A forwarded rejection cannot be re-certified.
 	var rejected *kv.AppliedRequestRejection
-	// Only an indexed, terminal one-phase apply verdict proves this attempt
-	// had no effect. The receiver must separately rule out earlier attempts.
+	if !errors.As(err, &rejected) || rejected.CommitIndex() == 0 {
+		return forwardUnknownStatus(reqs, err)
+	}
+	reason := forwardApplyRejectionReason(reqs, err)
+	if reason == pb.ForwardFailureReason_FORWARD_FAILURE_REASON_UNSPECIFIED {
+		return forwardUnknownStatus(reqs, err)
+	}
+	return &forwardWireFailure{
+		wire:  kv.ForwardDecisionStatus(phase, reason, pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_DEFINITIVELY_ABORTED),
+		cause: err,
+	}
+}
+
+func forwardApplyRejectionReason(reqs []*pb.Request, err error) pb.ForwardFailureReason {
 	conflict := errors.Is(err, store.ErrWriteConflict)
 	fence := errors.Is(err, kv.ErrRouteWriteFenced)
-	if ok && phase == pb.ForwardFailurePhase_FORWARD_FAILURE_PHASE_ONE_PHASE_APPLY &&
-		kv.ForwardOnePhaseDecisionEligible(reqs) &&
-		!errors.Is(err, kv.ErrTransactionOutcomeUnknown) && errors.As(err, &rejected) &&
-		rejected.CommitIndex() != 0 && conflict != fence {
-		reason := pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CONFLICT
-		if fence {
-			reason = pb.ForwardFailureReason_FORWARD_FAILURE_REASON_FENCE
-		}
-		return &forwardWireFailure{
-			wire: kv.ForwardDecisionStatus(phase, reason,
-				pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_DEFINITIVELY_ABORTED),
-			cause: err,
-		}
+	switch {
+	case conflict && fence:
+		return pb.ForwardFailureReason_FORWARD_FAILURE_REASON_UNSPECIFIED
+	case conflict:
+		return pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CONFLICT
+	case fence:
+		return pb.ForwardFailureReason_FORWARD_FAILURE_REASON_FENCE
 	}
-	return forwardUnknownStatus(reqs, err)
+
+	var reason pb.ForwardFailureReason
+	switch {
+	case errors.Is(err, kv.ErrTxnLocked):
+		reason = pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CAS_LOCKED
+	case errors.Is(err, kv.ErrCASMismatch):
+		reason = pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CAS_MISMATCH
+	default:
+		return pb.ForwardFailureReason_FORWARD_FAILURE_REASON_UNSPECIFIED
+	}
+	if !kv.HasCASMutation(reqs) || kv.ValidateCASProposalShape(reqs) != nil {
+		return pb.ForwardFailureReason_FORWARD_FAILURE_REASON_UNSPECIFIED
+	}
+	return reason
 }
 
 func forwardUnknownStatus(reqs []*pb.Request, err error) error {

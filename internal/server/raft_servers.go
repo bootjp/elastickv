@@ -127,11 +127,12 @@ func startRaftServers(
 	for _, rt := range runtimes {
 		serverOptions := append(slices.Clone(rt.TransportServerOptions), raftGRPCServerOptions(adminGRPCOpts)...)
 		gs := grpc.NewServer(serverOptions...)
-		trx := adapter.NewInternalMigrationTransaction(proposerForGroup(rt, shardGroups), observerForGroup(proposalObserverForGroup, rt.Spec.ID), rt.Store, rt.Spec.ID)
+		trx := adapter.NewInternalMigrationTransaction(proposerForGroup(rt, shardGroups), observerForGroup(proposalObserverForGroup, rt.Spec.ID), rt.Store, rt.Spec.ID, kv.WithVersionCASAdmission(rt.VersionCASAdmission))
 		grpcSvc := adapter.NewGRPCServer(shardStore, coordinate, adapter.WithGRPCActiveTimestampTracker(readTracker))
 		pb.RegisterRawKVServer(gs, grpcSvc)
 		pb.RegisterTransactionalKVServer(gs, grpcSvc)
 		internalOpts := internalServerOptions(coordinate, adminServer, proposerForGroup(rt, shardGroups), shardGroups[rt.Spec.ID], rt.Spec.ID)
+		internalOpts = append(internalOpts, adapter.WithInternalCASForwardRouting(rt.Spec.ID, shardStore.CheckVersionCASForwardRoute))
 		internalOpts = append(internalOpts, clusterbootstrap.BootstrapInternalPolicyOptions(rt, proposerForGroup(rt, shardGroups))...)
 		internalOpts = append(internalOpts, dedicatedTimestampCutoverOptions(shardGroups)...)
 		internalOpts = append(internalOpts, adapter.WithInternalMigrationOwnershipReady(func() bool {
@@ -194,6 +195,7 @@ func startRaftServers(
 			[]string{"RawKV"},
 			staticServingServices,
 			migrationMembershipInterceptor(rt, shardStore, proposerForGroup(rt, shardGroups), adminGRPCOpts.MigrationToken, confChangeInterceptor),
+			rt.VersionCASCapable,
 		)
 		reflection.Register(gs)
 

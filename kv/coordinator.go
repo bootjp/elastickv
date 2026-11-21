@@ -583,14 +583,23 @@ func (c *Coordinate) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*C
 	})
 }
 
+func validateLegacyCoordinatorRequest(reqs *OperationGroup[OP]) error {
+	if err := validateOperationGroup(reqs); err != nil {
+		return err
+	}
+	// Single-group production servers use ShardedCoordinator for version CAS.
+	if reqs.Elems[0].Op == CompareAndSwap {
+		return errors.WithStack(ErrVersionCASUnavailable)
+	}
+	return nil
+}
+
 func (c *Coordinate) dispatchWithRetry(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 
-	// Validate the request before any use to avoid panics on malformed input.
-	// Validation errors are not retryable, so do this once outside the loop.
-	if err := validateOperationGroup(reqs); err != nil {
+	if err := validateLegacyCoordinatorRequest(reqs); err != nil {
 		return nil, err
 	}
 
@@ -1534,6 +1543,8 @@ func (c *Coordinate) toRawRequest(req *Elem[OP]) *pb.Request {
 				},
 			},
 		}
+	case CompareAndSwap:
+		panic("compare-and-swap requires a transaction")
 	}
 
 	panic("unreachable")
@@ -1586,6 +1597,7 @@ func (c *Coordinate) redirect(ctx context.Context, reqs *OperationGroup[OP]) (*C
 
 	fwdCtx, cancel := context.WithTimeout(ctx, redirectForwardTimeout)
 	defer cancel()
+	// Dispatch rejects CAS on this legacy coordinator before routing.
 	r, err := cli.Forward(fwdCtx, c.toForwardRequest(requests))
 	if err != nil {
 		return nil, classifyForwardRPCError(err, requests)
@@ -1653,6 +1665,10 @@ func (c *Coordinate) toForwardRequest(reqs []*pb.Request) *pb.ForwardRequest {
 
 func elemToMutation(req *Elem[OP]) *pb.Mutation {
 	switch req.Op {
+	case CompareAndSwap:
+		return &pb.Mutation{
+			Op: pb.Op_COMPARE_AND_SWAP, Key: req.Key, Value: req.Value, ExpectedCommitTs: req.ExpectedCommitTS,
+		}
 	case Put:
 		value := req.Value
 		if req.CommitTSValueOffset != 0 {

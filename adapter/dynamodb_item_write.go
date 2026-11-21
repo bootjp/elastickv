@@ -464,7 +464,7 @@ func (d *DynamoDBServer) reuseMutationMatches(ctx context.Context, elem *kv.Elem
 			return true, nil
 		}
 		return false, errors.Wrap(err, "read reuse tombstone")
-	case kv.DelPrefix:
+	case kv.DelPrefix, kv.CompareAndSwap:
 		return false, nil
 	}
 	return false, nil

@@ -107,6 +107,21 @@ func (n *BootstrapNetwork) target(address string) (bootstrapNetworkTarget, error
 	return target, err
 }
 
+// HasStableConfiguration checks the protected projection, whose ConfState
+// includes outgoing voters that are absent from the ordinary engine listing.
+func (n *BootstrapNetwork) HasStableConfiguration(group, index uint64) bool {
+	local, ok := n.Control.groups[group]
+	if !ok {
+		return false
+	}
+	projection, ok := local.owner.GroupProjection(group)
+	if !ok || projection.Configuration.Index != index || projection.Pending != peersession.PendingClear {
+		return false
+	}
+	conf := projection.Configuration.State
+	return len(conf.VotersOutgoing) == 0 && len(conf.LearnersNext) == 0 && !conf.AutoLeave
+}
+
 func (n *BootstrapNetwork) DialOptions(address string) ([]grpc.DialOption, error) {
 	target, err := n.target(address)
 	if err != nil {

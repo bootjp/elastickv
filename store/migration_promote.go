@@ -116,18 +116,34 @@ func (s *mvccStore) planMemoryPromotionLocked(
 		return ExportVersionsResult{}, nil, PromoteVersionsResult{}, err
 	}
 	toPromote, promoted, err := promotedVersionsFromStaged(opts, exported.Versions)
+	if err == nil {
+		err = s.validateMemoryPromotionVersions(opts, toPromote)
+	}
 	return exported, toPromote, promoted, err
 }
 
 func (s *mvccStore) applyMemoryPromotionLocked(toPromote []promotedVersion) {
 	for _, version := range toPromote {
-		if version.target.Tombstone {
-			s.deleteVersionLocked(version.target.Key, version.target.CommitTS)
+		target := version.target
+		if target.Tombstone {
+			s.deleteVersionLocked(target.Key, target.CommitTS)
 		} else {
-			s.putVersionLocked(version.target.Key, version.target.Value, version.target.CommitTS, version.target.ExpireAt)
+			s.putVersionLocked(target.Key, target.Value, target.CommitTS, target.ExpireAt)
 		}
 		s.removeVersionLocked(version.staged.Key, version.staged.CommitTS)
 	}
+}
+
+func (s *mvccStore) validateMemoryPromotionVersions(opts PromoteVersionsOptions, versions []promotedVersion) error {
+	if opts.AllowLegacyVersionOverwrite {
+		return nil
+	}
+	lookup := s.lookupMigrationHead
+	if opts.AppliedIndex == 0 {
+		lookup = s.lookupMigrationVersion
+	}
+	_, err := promotionWrites(versions, false, lookup)
+	return err
 }
 
 func (s *mvccStore) promotionStateAndCursorLocked(opts PromoteVersionsOptions) (PromotionState, []byte) {
@@ -200,16 +216,25 @@ func (s *pebbleStore) PromoteVersions(ctx context.Context, opts PromoteVersionsO
 	writeOpts := s.promotionWriteOpts(opts.AppliedIndex)
 	if opts.JobID != 0 && state.Done {
 		result := PromoteVersionsResult{Done: true, TotalPromotedRows: state.PromotedRows, MaxPromotedTS: state.MaxPromotedTS}
-		return s.finishPebblePromotion(nil, opts.JobID, nil, result, opts.AppliedIndex, state.MaxPromotedTS, writeOpts)
+		return s.finishPebblePromotion(nil, nil, opts.JobID, nil, result, opts.AppliedIndex, state.MaxPromotedTS, writeOpts)
 	}
 	opts.Cursor = cursor
 	exported, toPromote, promoted, err := s.planPebblePromotionLocked(ctx, opts)
 	if err != nil {
 		return PromoteVersionsResult{}, err
 	}
+	lookup := s.lookupMigrationHead
+	if opts.AppliedIndex == 0 {
+		lookup = s.lookupMigrationVersion
+	}
+	targets, err := promotionWrites(toPromote, opts.AllowLegacyVersionOverwrite, lookup)
+	if err != nil {
+		return PromoteVersionsResult{}, err
+	}
 	result, stateToWrite := finishPromotionResult(opts, state, exported, promoted)
 	return s.finishPebblePromotion(
 		toPromote,
+		targets,
 		opts.JobID,
 		stateToWrite,
 		result,
@@ -228,6 +253,7 @@ func (s *pebbleStore) promotionWriteOpts(appliedIndex uint64) *pebble.WriteOptio
 
 func (s *pebbleStore) finishPebblePromotion(
 	toPromote []promotedVersion,
+	targets []MVCCVersion,
 	jobID uint64,
 	stateToWrite *PromotionState,
 	result PromoteVersionsResult,
@@ -240,6 +266,7 @@ func (s *pebbleStore) finishPebblePromotion(
 	}
 	if err := s.commitPebblePromoteVersions(
 		toPromote,
+		targets,
 		jobID,
 		stateToWrite,
 		appliedIndex,
@@ -351,6 +378,7 @@ func (s *pebbleStore) stagePebblePromotionState(batch *pebble.Batch, jobID uint6
 
 func (s *pebbleStore) commitPebblePromoteVersions(
 	versions []promotedVersion,
+	targets []MVCCVersion,
 	jobID uint64,
 	state *PromotionState,
 	appliedIndex uint64,
@@ -359,10 +387,6 @@ func (s *pebbleStore) commitPebblePromoteVersions(
 ) error {
 	batch := s.db.NewBatch()
 	defer batch.Close()
-	targets := make([]MVCCVersion, 0, len(versions))
-	for _, version := range versions {
-		targets = append(targets, version.target)
-	}
 	// Promotion is replayed from the Raft FSM, so it must not fail closed on
 	// this node's local writer-registration state.
 	if err := s.applyImportVersionsBatch(batch, targets, false); err != nil {
@@ -384,6 +408,17 @@ func (s *pebbleStore) commitPebblePromoteVersions(
 		}
 	}
 	return s.commitPebblePromotionBatch(batch, maxPromotedTS, writeOpts)
+}
+
+func promotionWrites(versions []promotedVersion, allowLegacyOverwrite bool, lookup migrationVersionLookup) ([]MVCCVersion, error) {
+	targets := make([]MVCCVersion, 0, len(versions))
+	for _, version := range versions {
+		targets = append(targets, version.target)
+	}
+	if allowLegacyOverwrite {
+		return targets, nil
+	}
+	return immutableMigrationWrites(targets, nil, lookup)
 }
 
 func (s *pebbleStore) commitPebblePromotionBatch(

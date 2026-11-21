@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"math"
 
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/v2"
@@ -44,6 +45,10 @@ func (s *mvccStore) CleanupVersions(ctx context.Context, opts CleanupVersionsOpt
 	s.mtx.Lock()
 	defer s.applyMu.Unlock()
 	defer s.mtx.Unlock()
+	return s.cleanupMemoryVersionsLocked(ctx, opts)
+}
+
+func (s *mvccStore) cleanupMemoryVersionsLocked(ctx context.Context, opts CleanupVersionsOptions) (CleanupVersionsResult, error) {
 	if _, retired := s.migrationRetired[opts.JobID]; retired {
 		return CleanupVersionsResult{}, errors.WithStack(ErrMigrationRetired)
 	}
@@ -63,6 +68,55 @@ func (s *mvccStore) CleanupVersions(ctx context.Context, opts CleanupVersionsOpt
 	for _, version := range exported.Versions {
 		s.removeVersionLocked(version.Key, version.CommitTS)
 	}
+	return cleanupResult(exported), nil
+}
+
+// StageRaftEntryMigrationCleanup removes a bounded page in the caller's data
+// scope. The caller stages progress and authorizes the complete range first.
+func StageRaftEntryMigrationCleanup(ctx context.Context, opts CleanupVersionsOptions) (CleanupVersionsResult, error) {
+	if sc, _ := ctx.Value(raftEntryScopeKey{}).(*raftEntryScope); sc != nil {
+		return sc.stageMigrationCleanup(ctx, opts)
+	}
+	if sc, _ := ctx.Value(memoryEntryKey{}).(*memoryRaftEntry); sc != nil {
+		if err := sc.allowData(); err != nil {
+			return CleanupVersionsResult{}, err
+		}
+		if err := sc.owner.memoryEntryIndex(ctx, opts.AppliedIndex); err != nil {
+			return CleanupVersionsResult{}, err
+		}
+		return sc.staged.cleanupMemoryVersionsLocked(ctx, opts)
+	}
+	return CleanupVersionsResult{}, errors.WithStack(ErrRaftControlScopeRequired)
+}
+
+func (sc *raftEntryScope) stageMigrationCleanup(ctx context.Context, opts CleanupVersionsOptions) (CleanupVersionsResult, error) {
+	if err := sc.checkDataIndex(opts.AppliedIndex); err != nil {
+		return CleanupVersionsResult{}, err
+	}
+	s := sc.store
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+	if s.db != sc.db {
+		return CleanupVersionsResult{}, sc.fail(errors.WithStack(ErrRaftEntryStoreSwapped))
+	}
+	if err := s.checkMigrationNotRetiredLocked(opts.JobID); err != nil {
+		return CleanupVersionsResult{}, err
+	}
+	if opts.MaxVersions <= 0 {
+		return CleanupVersionsResult{Done: true}, nil
+	}
+	exportOpts := cleanupExportOptions(opts)
+	// Physical cleanup scans whatever remains. MaxCommitTS is a selection
+	// bound, not a historical read that requires complete retained history.
+	exportOpts.ReadTS = math.MaxUint64
+	exported, err := s.exportVersionsFromLocked(ctx, sc.batch, exportOpts, true)
+	if err != nil {
+		return CleanupVersionsResult{}, err
+	}
+	if err := stageCleanupVersionDeletes(sc.batch, exported.Versions); err != nil {
+		return CleanupVersionsResult{}, sc.fail(err)
+	}
+	sc.touched = true
 	return cleanupResult(exported), nil
 }
 
@@ -125,10 +179,8 @@ func (s *pebbleStore) CleanupVersions(ctx context.Context, opts CleanupVersionsO
 	}
 	batch := s.db.NewBatch()
 	defer batch.Close()
-	for _, version := range exported.Versions {
-		if err := batch.Delete(encodeKey(version.Key, version.CommitTS), nil); err != nil {
-			return CleanupVersionsResult{}, errors.WithStack(err)
-		}
+	if err := stageCleanupVersionDeletes(batch, exported.Versions); err != nil {
+		return CleanupVersionsResult{}, err
 	}
 	if opts.AppliedIndex > 0 {
 		if err := setPebbleUint64InBatch(batch, metaAppliedIndexBytes, opts.AppliedIndex); err != nil {
@@ -139,6 +191,15 @@ func (s *pebbleStore) CleanupVersions(ctx context.Context, opts CleanupVersionsO
 		return CleanupVersionsResult{}, errors.WithStack(err)
 	}
 	return cleanupResult(exported), nil
+}
+
+func stageCleanupVersionDeletes(batch *pebble.Batch, versions []MVCCVersion) error {
+	for _, version := range versions {
+		if err := batch.Delete(encodeKey(version.Key, version.CommitTS), nil); err != nil {
+			return errors.WithStack(err)
+		}
+	}
+	return nil
 }
 
 func (s *pebbleStore) ClearMigrationState(_ context.Context, jobID, appliedIndex uint64) error {
