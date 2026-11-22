@@ -141,3 +141,14 @@ general target reuse and broader failure/performance campaigns are future work.
 A target lock is a freshness violation during initial preparation. After a
 source seal, transient locks keep target reattestation/Ready retryable instead
 of terminalizing the job. State and receipts remain unchanged until they drain.
+
+## Online maintenance admission
+
+Online RawKV jobs limit each target promotion and source version-cleanup
+proposal to 256 versions and 512 KiB of effects. The existing 16 MiB scan
+budget and cursor/oversized-row progress rules remain in force. Promotion
+and cleanup still use synchronous indexed Raft application and the same
+ownership barriers. This limits the uninterrupted foreground apply work per
+proposal; it does not guarantee a latency bound for disk synchronization.
+Legacy jobs retain their existing page budgets. Validate this choice against
+identical Linux load, including completion time and complete ACK readback.
