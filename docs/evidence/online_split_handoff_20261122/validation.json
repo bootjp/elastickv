@@ -1,0 +1,62 @@
+{
+  "source_commit": "5226ac75744e3575daccee23690a36e44178e30f",
+  "full_go": {
+    "command": "GOCACHE=/private/tmp/elastickv-load-ramp-gocache GOMAXPROCS=4 go test -p 3 -short ./... -timeout=20m",
+    "exit": 0,
+    "adapter_seconds": 437.92,
+    "internal_server_seconds": 462.241,
+    "store_seconds": 243.284,
+    "cached_results_included": true,
+    "log": "release-full-go.log"
+  },
+  "store_race": {
+    "command": "GOMAXPROCS=4 go test -p 2 -parallel 4 -race ./store -timeout=20m",
+    "exit": 0,
+    "seconds": 262.42
+  },
+  "focused_race": {
+    "handoff_before_prefix": {
+      "adapter_seconds": 99.37,
+      "kv_seconds": 7.899
+    },
+    "handoff_with_prefix_seconds": 15.019,
+    "prefix_final": {
+      "kv_seconds": 2.496,
+      "store_seconds": 4.569
+    }
+  },
+  "lint": {
+    "final_commit_hook_exit": 0,
+    "issues": 0
+  },
+  "host_tests": {
+    "tests": 7,
+    "failures": 0,
+    "shell_syntax": true
+  },
+  "jepsen_root": {
+    "kind": "harness unit suite, not live fault campaign",
+    "tests": 442,
+    "assertions": 6184,
+    "failures": 0,
+    "errors": 0,
+    "exit": 0
+  },
+  "jepsen_upstream_redis": {
+    "exit": 1,
+    "submodule": "54ab5c10ace229fc780e43e188ef1b64c3a32ee4",
+    "reason": "unmodified upstream unit requires missing jepsen.redis namespace"
+  },
+  "excluded_nonfinal_full_go": "The 409f95e3a run completed successfully but its source tree changed while the maintenance experiment was withdrawn; not counted as final-source validation.",
+  "runtime_ci": {
+    "commit": "5226ac75744e3575daccee23690a36e44178e30f",
+    "pass": 26,
+    "skipping": 2,
+    "pending": 0,
+    "failures": 0
+  },
+  "review_threads": {
+    "total": 8,
+    "unresolved": 0
+  }
+}

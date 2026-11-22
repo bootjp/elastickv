@@ -1,0 +1,46 @@
+{
+  "A1": {
+    "read": {
+      "success": 49290,
+      "errors": {}
+    },
+    "write": {
+      "success": 49229,
+      "errors": {
+        "Unavailable": 3
+      }
+    }
+  },
+  "B1": {
+    "read": {
+      "success": 48902,
+      "errors": {}
+    },
+    "write": {
+      "success": 48879,
+      "errors": {}
+    }
+  },
+  "B2": {
+    "read": {
+      "success": 48682,
+      "errors": {}
+    },
+    "write": {
+      "success": 48678,
+      "errors": {}
+    }
+  },
+  "A2": {
+    "read": {
+      "success": 50848,
+      "errors": {}
+    },
+    "write": {
+      "success": 50759,
+      "errors": {
+        "Unavailable": 2
+      }
+    }
+  }
+}

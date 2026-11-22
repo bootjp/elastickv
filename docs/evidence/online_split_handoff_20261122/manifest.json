@@ -1,0 +1,320 @@
+{
+  "date_jst": "2026-11-22",
+  "pr": "https://github.com/bootjp/elastickv/pull/1544",
+  "measured_runtime": "5226ac75744e3575daccee23690a36e44178e30f",
+  "baseline_production": "c664c80bb954a462b145846b602f6e13849b0cbe",
+  "baseline_previous_published_head": "a9f318f16d78d8b658f3bfa579c714f566656c54",
+  "binary_identities": {
+    "final/baseline-server.test": "bd98c2ca5c46ce35d9aad99d4e34acc76be9c5d6f467a2542b6e7c85dca78f82",
+    "final/candidate-server.test": "0e61b1751290c0cff702dd016a3a16f72b2c956fb0f276951ae087126703b9c4",
+    "final/loadtest-window": "8350c069ee061ac2c89a1c876b3391a977d86eb724eca25837625aba993f8acc",
+    "replica/baseline-server.test": "bd98c2ca5c46ce35d9aad99d4e34acc76be9c5d6f467a2542b6e7c85dca78f82",
+    "replica/candidate-server.test": "0e61b1751290c0cff702dd016a3a16f72b2c956fb0f276951ae087126703b9c4",
+    "replica/loadtest-window": "8350c069ee061ac2c89a1c876b3391a977d86eb724eca25837625aba993f8acc"
+  },
+  "vm": {
+    "id": 150,
+    "vcpus": 8,
+    "memory_gib": 8,
+    "nodes": 3,
+    "groups": 2,
+    "node_processes": 1,
+    "load_generator_processes": 1,
+    "sync": true,
+    "toolchain": "go1.27.3",
+    "formal_profiles": false,
+    "physical_disk_shared": true
+  },
+  "collection": {
+    "files": 130,
+    "mismatches": 0,
+    "archive_sha256": "2f09ec2dbfaa9f0e1c57e4e87181f6b694d0e3b2d54d1cf4b5d0fb3921373688",
+    "durable_root": "/Users/bootjp/.codex/visualizations/2026/11/19/01a1f333-53dc-7602-92f8-e3df6c957124/vm150-handoff-20261122",
+    "durable_hashes_verified": true
+  },
+  "remote_file_sha256": {
+    "diagnostic-isolation-1/host-isolation.json": "d135e44a0d0aa86d1a92638fd882d3c4f9b82f60ebbe9a8af757c143d673b4de",
+    "diagnostic-isolation-2/host-isolation.json": "252933dea2cdf787f3f79810fbd41f2e159ec26c92c1536c626fcbdd4e8b1ff7",
+    "diagnostic-v4.py": "2c07eed4d55fe498011fc924a5af9cec58c9946bd2a05688923e2fa861517a77",
+    "diagnostic.py": "9ec81651bfe9068985cb8280f3fa500377cf6894abb406250fd8a050c144a700",
+    "final/all-complete": "d117fa006ba9208500b2930ce69cbde436c647afa917cb7396a9bc9111a46dd2",
+    "final/await-control.py": "909590e647ce798bfee4dce318f87455c71d6a17eb684317b56c769357487e0b",
+    "final/baseline/exit.txt": "5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9",
+    "final/baseline/markers.jsonl": "6ff504b52dd26c323a7948dc1ac940207d3cb7c4068d223b07d17c3f9e685e2d",
+    "final/baseline/rpc.csv": "ebbe5216fdb68ede55e2f522b089d8765587f29e438a689c2ffe670fb9625f72",
+    "final/baseline/rpc.csv.gz": "06956cc1c7bb58c4a38f14ac8103ff7669b68f24771ea01a7f1004d394a8c57d",
+    "final/baseline/run.log": "3c8394e1e3bc829ffe77be55dc399d848847fe0f35e36a95c024924ed4ae7f6a",
+    "final/candidate/exit.txt": "5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9",
+    "final/candidate/markers.jsonl": "36edf00ce82491b9679f12f9152869a9e7c21f872bb421cd8dc9d1f3802177e7",
+    "final/candidate/rpc.csv": "324b22cec5b01ebefe13d125dc293c3601b149930d12e3f9d95b81374049cbb5",
+    "final/candidate/rpc.csv.gz": "2035a857aefcb80592bff43f84a557804bcd56df8d0b08f044af51e8b6085533",
+    "final/candidate/run.log": "60156cf772e8cdaf37b52e026184d9b5235cb525f63ebdb6dadaed01c2b20536",
+    "final/candidate-ready.json": "005dca27c4753ae2b41cb07a01db764f5e4c8abd2b6f69a205dff46b60ab4302",
+    "final/complete": "d117fa006ba9208500b2930ce69cbde436c647afa917cb7396a9bc9111a46dd2",
+    "final/controller-final.log": "43a1433b5a8198a0fb6098bceb16cd52c566dedef462f02384800094872d20cb",
+    "final/controller.log": "4d0e60428d064c744ed5a33bc4c8c2c5430d85f1fd3075945a745dedb585b932",
+    "final/expected.json": "9d32f7b7306e02fbc6a35a035cad97daabdd791542916a1229b52dc84344f73c",
+    "final/isolate-load-host.py": "a75a42baa5c57ae6e19b8a29b4ae67aa849e8271100bfede80ba2f9a5d02fdd0",
+    "final/isolation-final/host-isolation.json": "c7f0536c659c0aad1fb8279e4e394c79b1c1aab0e52b3a0daf581452b5b06c78",
+    "final/measure.py": "4a6ad9840ed583bef35d8d71d484a1b5890b89407d5aa2bb945d4da4403a94a0",
+    "final/protocol.json": "f412135d2db1e386018f304b1e8ec864f652c9cd6e4891e16fd793abe6a7d114",
+    "final/run-all.py": "6015581ac6643bd0b26ec7d45256450ac661dec0613b3f3dd8b4d3f9a0c76adb",
+    "final/verified.json": "7bab8b543dd201d858d145ef7412c4bec98b70bb46b389251add163b3876ee81",
+    "formal/A1/exit.txt": "5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9",
+    "formal/A1/markers.jsonl": "bb3709a942342c0ecaa97cbee0975e4a04b41e58a62fbe3e208b37f2847af301",
+    "formal/A1/rpc.csv": "b902f513bcb3e86ca64668c887181f3c2b625e3274f5574fe1981b8fcab71f08",
+    "formal/A1/rpc.csv.gz": "5f6595f125af867cb8aac4f38ae67eb97e34ce0e74a2cfbaf47c2e464f77c67d",
+    "formal/A1/run.log": "1fb45b54d2b97c32daa50aca28aea8ac56757ad6519ac3327c3a7fa1b0bdd306",
+    "formal/A2/exit.txt": "5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9",
+    "formal/A2/markers.jsonl": "ff9e65fe6a94a528872ff4d5a515636055b1ae361d4c15d28589abe032f67fc5",
+    "formal/A2/rpc.csv": "d98ab5834612e3781a90ea24910989432716f87ba57cf6c56f0b2d34b9475c80",
+    "formal/A2/rpc.csv.gz": "c555dbea729c075657219ae2d7b9d51086ee530cd115cc2ccf8b57f3914626fb",
+    "formal/A2/run.log": "0cb14aa14a5b25494a5866fa37ec042697cbeca22dd45fa70ffb64401efc2fdc",
+    "formal/B1/exit.txt": "5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9",
+    "formal/B1/markers.jsonl": "6b310aa660208da73dcee0048469936236dc7a2ff0e0b99136dd3340f75d0dbc",
+    "formal/B1/rpc.csv": "1c31f1794bc72456680a21efe249ac25d0bec71a25c9f89b890e83809501b4fc",
+    "formal/B1/rpc.csv.gz": "a00597e28b6b971764c57e688f5004a9c17ef9ad82b21cc6c375cb9ad47f5bc6",
+    "formal/B1/run.log": "2adb7833e1922a2ca9b4829490e55078b37fde97f61938e2409b2f75dc1f0411",
+    "formal/B2/exit.txt": "5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9",
+    "formal/B2/markers.jsonl": "85c9c1cf6fc20a468135a32ba18edd8251bf072a59e00510877e541bf6b3518b",
+    "formal/B2/rpc.csv": "6870cada83a3b5a75ee7d3471be91e572aeb1ed49503984461d03b207533ba76",
+    "formal/B2/rpc.csv.gz": "d4ba88b9a0607bb7a75926b1a2d805bc29bf50e8ddff7ef34bb7e22189d7ada4",
+    "formal/B2/run.log": "c32f1808e32da4c9e2276229096849e6953fbc81e76e5e848d327f166e015487",
+    "formal/candidate-ready.json": "8b753932de056dfb639907934a0e29d93257aef909784f9489756b4039f94601",
+    "formal/complete": "d117fa006ba9208500b2930ce69cbde436c647afa917cb7396a9bc9111a46dd2",
+    "formal/controller.log": "450ab5946344f25b69c3b2f53d46ef6ce1746d2b46fd04168e43daca70aa3dca",
+    "formal/expected.json": "8c11b73a8efb5047598cfadc1971aa01fd2f7af60cd3e1116606453eea6d639e",
+    "formal/isolate-load-host.py": "a75a42baa5c57ae6e19b8a29b4ae67aa849e8271100bfede80ba2f9a5d02fdd0",
+    "formal/isolation/host-isolation.json": "1c372fe06c16b79b1737d6ccdfbd44bafa18125595150d5578c606a1bba9ae54",
+    "formal/measure.py": "d7d064c859cdea1a011e78ac45b1ffedef3057fe1f2e449905b72298f1443e30",
+    "formal/protocol.json": "f12dab033adadcef4b79fec8857f42166766ee590b2b0f490b8ce82c53c70542",
+    "formal/verified.json": "0a362ddc1f231a7fb59ace69d761822918465351f7c8256d4e9b1f68e1f48351",
+    "isolate-load-host.py": "a75a42baa5c57ae6e19b8a29b4ae67aa849e8271100bfede80ba2f9a5d02fdd0",
+    "linux-diagnostic-1/after-block.pprof": "4cf328d01a47a18ed6cb125d7ce66cbe1363a23800ef9df40b3231389a8b2b8b",
+    "linux-diagnostic-1/after-heap.pprof": "9e284745782686a8525d3d2d6cee7afaf0d27c7651926f8127952a2460b4d647",
+    "linux-diagnostic-1/after-mutex.pprof": "7aa84dcf054af77dfa8ee9c226b064ebbdbd1e313490e2190f1a858e82b137c9",
+    "linux-diagnostic-1/before-block.pprof": "4f6ab17b5fb5aa0276ef5391fabb3e6de728e99df6ee69d9ab3e4a45e7135d82",
+    "linux-diagnostic-1/before-mutex.pprof": "de28db12b921a3eee01616e6f5b10c234165b84fceb1ee349ec588306736b5cd",
+    "linux-diagnostic-1/cleanup-cpu.pprof": "493c9870cdadf23c5e8c559c3705f32d5fcc42453a9304ced2742d671a93803f",
+    "linux-diagnostic-1/cleanup-goroutine-0.pprof": "9bbd8da225603f1adc3c1f84dc7066d4627b05c4d361c2e992120674f1fb232c",
+    "linux-diagnostic-1/cleanup-goroutine-1.pprof": "7581ac776aac863ede8f3fd1f87e5e3bd4f3113139686157e35f6be96c889300",
+    "linux-diagnostic-1/cleanup-goroutine-2.pprof": "ea56ade2d97bd9c0b35707d7f8fe465ede9f84691890660151955a9c917c901a",
+    "linux-diagnostic-1/cleanup-goroutine-3.pprof": "7ec52e65647a7933b6b6d6a6361ba544a4d331014e3b50756e34bdb5d35cb4b9",
+    "linux-diagnostic-1/cleanup-goroutine-4.pprof": "796d5a0e38a6f5be85025a7a32c5abb43ee57f99ff1cad30b79ac7d4735e6d7a",
+    "linux-diagnostic-1/exit.txt": "5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9",
+    "linux-diagnostic-1/iostat.log": "62b0c70efe06b50fd0ec4d32558c91ce9ac978f61569cda666e278730147e24a",
+    "linux-diagnostic-1/markers.jsonl": "5eff0f36fc952e99150e68f32245c6d6b6e7f1f732cb859992509810a4cc609c",
+    "linux-diagnostic-1/pidstat.log": "75a0a998a8014908615ba69fbd9ae0477b7823d945a683660646c0893515fb55",
+    "linux-diagnostic-1/profile-windows.jsonl": "622463be447982aca5e331dc1ec753515ad92262fb270319354ea8852a253766",
+    "linux-diagnostic-1/rpc.csv": "de8a2c2ec9f0d8203d8cebaa1a38fe52a7c9ab5c049be87d47864c07521d40ac",
+    "linux-diagnostic-1/rpc.csv.gz": "c82f4901f936fed256a4d72c517e7793f98b374bcd0fbce054b7d7f0c1b282da",
+    "linux-diagnostic-1/run.log": "bb3fc7a26915e2c21f92d8f1e58bbef1a36983652ebeae6a3030f6c0146fef4d",
+    "linux-diagnostic-2/cleanup-after-block.pprof": "f77327093dd0f1e82439064639fe00d48ef3f58c2f6c328ee252ebae2f4def0e",
+    "linux-diagnostic-2/cleanup-after-heap.pprof": "ae2f1e625b6af35048b11d347a4a10c80eae31c008a9893dbb641d0e7f026b6c",
+    "linux-diagnostic-2/cleanup-after-mutex.pprof": "2725a32e1bd215b654e96b458fc4ab44701a7ebd39313d5e05619ea9af323974",
+    "linux-diagnostic-2/cleanup-before-block.pprof": "831ac4887caa8bfc9e8ded70317d8c3c11c09c5f9c16c06cc081e9e48ef13563",
+    "linux-diagnostic-2/cleanup-before-mutex.pprof": "7094b32bf97e4c6d981072837e454bcba308c6f2cb8e92457f63465f400c3e82",
+    "linux-diagnostic-2/cleanup-cpu.pprof": "0fc38af6d2ad8614e87694c6868cfe76e1fded04286fc2c9e01b33c6b5f359b6",
+    "linux-diagnostic-2/cleanup-goroutine-0.pprof": "7a59632b458d9970ab7e0a43d473ccc496483914694a942f8e3ddfc8282cf209",
+    "linux-diagnostic-2/cleanup-goroutine-1.pprof": "03fb78ea05293fd29f808a8055f0275f937fd42f3e9062979907b94c68c90be5",
+    "linux-diagnostic-2/cleanup-goroutine-2.pprof": "d5175895b2cab123a60bf786a1bddb00a46c382cbd4b16ef0c377fae1e75510c",
+    "linux-diagnostic-2/cleanup-goroutine-3.pprof": "cb1812c6c43edeb444adadc60982f46c74011fea3b1b68f76976f3eed9aa1e47",
+    "linux-diagnostic-2/cleanup-goroutine-4.pprof": "a2fcfd4a33ca37e3636eaaa570382c01c8d036c67364ca3763a4609ba6b17cb5",
+    "linux-diagnostic-2/exit.txt": "5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9",
+    "linux-diagnostic-2/iostat.log": "a50aa5242363f467f117d6d28c3c76cdbffc4b5986af5ed5ea366b227f527762",
+    "linux-diagnostic-2/markers.jsonl": "8fb2956f9c6d69dd8a53c809e38f4b4b9838271e9ac477e4d6a926e30146c3ed",
+    "linux-diagnostic-2/pidstat.log": "077eb816cad3b492b2dde88588ec6477e7bd9d9d55410213b4c625eaea8f0b2c",
+    "linux-diagnostic-2/profile-windows.jsonl": "5c0ff3608fa0e30e8744cf207951b7df622f72de9df602e197ef9491c97f8268",
+    "linux-diagnostic-2/rpc.csv": "0ac18126a8e4284284e4cdcbfe9287e9c371311b13a55b368015455fbb1d4edc",
+    "linux-diagnostic-2/rpc.csv.gz": "d9617d6c804956789febb1800f5832af171e7b2f96b63d6739fc4631e4d2dff3",
+    "linux-diagnostic-2/run.log": "540826dea4f78439f7c5c721fd758b72669f65cc436356ab5fd8c51832d284c7",
+    "linux-diagnostic-2/sync-latency.jsonl": "55e83f0ce30d37925ffc87478c663b9137b22ac9c23d013c0519c60ff1a2672f",
+    "no-split-controller.log": "25231f20d8be769a4783477a7ec11709f305a64f14e4f384cac75c3effb268f4",
+    "no-split-isolation/host-isolation.json": "4b558a7461cdd91a5869626f61bdbd68f0c79e7e7f52fa5e7ea24167d94d08dc",
+    "no-split-sync-2/exit.txt": "5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9",
+    "no-split-sync-2/iostat.log": "5d7ca4dba23913b980c8a515e51cf8a7762547d557298853548adaa59fd7e742",
+    "no-split-sync-2/markers.jsonl": "144e2cc33f1a402ced13e123b5574c02b8a12b507ff54e0a8dbd309e7f12fd1e",
+    "no-split-sync-2/pidstat.log": "32b33e161c78610e66e3c26fe87caa0e8f73e04906e2e5bd322cec16c839fe35",
+    "no-split-sync-2/rpc.csv": "581aca23ed04985c2f8db43849f4ff655c4b28ef45917c799d31edaa1a758567",
+    "no-split-sync-2/rpc.csv.gz": "a1c6865efc009863a88b601d0849daebf9aa31ead3b88b177b9a1b4e2f61bec8",
+    "no-split-sync-2/run.log": "83b9a5d9617270c2d52ca85885ca9fd7e5d8c14349279addd1bc300802e365ac",
+    "no-split-sync-2/sync-latency.jsonl": "7a0df72192abdb7b359f8942911bc5cd7f8e96fac0193117d5eccf7f27a79dd3",
+    "no-split-sync.py": "c086d6c31e72e62837a49d05d2a5cf10d67c0e2356ec00d4041b7960dc149034",
+    "postrun-binary-identities.json": "7d3c8e4aff5c4e5de3c48b8de17fdd20336efb0ffe402ed9a4a5bfb369656ea9",
+    "replica/baseline/exit.txt": "5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9",
+    "replica/baseline/markers.jsonl": "c4b549f3807f41eb1e0cc162f916fe221ec7acc97bc660e33c6088f92bd89b8b",
+    "replica/baseline/rpc.csv": "19d819b8a7137c1b2949a226cd0beabb415f054079e00c96037dcdf4657bbdb1",
+    "replica/baseline/rpc.csv.gz": "6cf05ad596697828ed1fea1f08f017a8195a45c3e6d21cdbc38d390a06ef2690",
+    "replica/baseline/run.log": "3f4574b75add365166e4d80916e6ad5e8c64cd3da46777a57a4760fe2adb1056",
+    "replica/candidate/exit.txt": "5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9",
+    "replica/candidate/markers.jsonl": "6362751b76199acc6453a187e3cdd2395b87337ae38f9fa8774aa7a98bc59e7d",
+    "replica/candidate/rpc.csv": "b88860b8be3a2f061a8f41abbc33f2cef544eed2bb4866db111aa2452920f2db",
+    "replica/candidate/rpc.csv.gz": "157e73310727361b11343236a1574dd8bd1ce067cc26edb88e2c175d723f25b8",
+    "replica/candidate/run.log": "1ab2dd4eb588892bedd156d33231d4c4644470e4dc6f6eaaa6b8ccd6c7924cf7",
+    "replica/candidate-ready.json": "005dca27c4753ae2b41cb07a01db764f5e4c8abd2b6f69a205dff46b60ab4302",
+    "replica/complete": "d117fa006ba9208500b2930ce69cbde436c647afa917cb7396a9bc9111a46dd2",
+    "replica/controller.log": "042246f771c7384c387c7bc6a8ec84591b9ccf6d29cc87b381bb4309f7c3a374",
+    "replica/expected.json": "81ce67734c92320e03cebdcea3075502e422e93a5fffe39c4d03dc5f874addf3",
+    "replica/isolate-load-host.py": "a75a42baa5c57ae6e19b8a29b4ae67aa849e8271100bfede80ba2f9a5d02fdd0",
+    "replica/isolation-1/host-isolation.json": "0f9330ba121cbb7e79235f66c107df2c4c9d5cb1a2cf46e23cf9e2dc9ad1de45",
+    "replica/measure.py": "3bbc7cdcd78938c6e7aa1a81c0571e02b16b3cbf70ba1b42c7a3569a5d0df4f8",
+    "replica/protocol.json": "ed87e5147c77606eecca89171ee4615a898ec529a2b8f948aa10fd3c0ded4983",
+    "replica/queue-complete": "d117fa006ba9208500b2930ce69cbde436c647afa917cb7396a9bc9111a46dd2",
+    "replica/queue.py": "a1158a399f4da809fda4c848abaea8a2f686f12a739f5c893a55ad6e077c64e1",
+    "replica/verified.json": "6a6e6b67848dd43564e165b450d193e6d52610fa62fbc2936a08edff33ca54b0",
+    "sync_latency.bt": "1f72431ce1b03a7580c13ba8c853c6ec994501587b0e9bdb131afdaf1c40586c"
+  },
+  "raw_archive": {
+    "path": "/Users/bootjp/.codex/visualizations/2026/11/19/01a1f333-53dc-7602-92f8-e3df6c957124/vm150-handoff-20261122/raw-evidence.zip",
+    "sha256": "feee6ba6f8fc51d40bfdb87f4c59b4507a0bf4b4cf382caf2a5f81b11ba949ad",
+    "bytes": 15660922,
+    "files": 251
+  },
+  "cleanup": {
+    "all_workload_and_profiler_processes_exited": true,
+    "firmware_activity_during_isolation": 0,
+    "runtime_masks_restored": true,
+    "vm150_status": "stopped",
+    "original_output_files_verified_before_shutdown": 130,
+    "durable_copy_verified_before_shutdown": true,
+    "owner_reservation_released": true
+  },
+  "isolation_checks": {
+    "time_ns": 1795335213570940712,
+    "isolation_windows": [
+      {
+        "name": "formal/isolation",
+        "activity": [],
+        "before": {
+          "fwupd-refresh.timer": {
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "UnitFileState": "enabled"
+          },
+          "fwupd-refresh.service": {
+            "LoadState": "loaded",
+            "ActiveState": "inactive",
+            "UnitFileState": "static"
+          },
+          "fwupd.service": {
+            "LoadState": "loaded",
+            "ActiveState": "inactive",
+            "UnitFileState": "static"
+          }
+        },
+        "restored": {
+          "fwupd-refresh.timer": {
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "UnitFileState": "enabled"
+          },
+          "fwupd-refresh.service": {
+            "LoadState": "loaded",
+            "ActiveState": "activating",
+            "UnitFileState": "static"
+          },
+          "fwupd.service": {
+            "LoadState": "loaded",
+            "ActiveState": "inactive",
+            "UnitFileState": "static"
+          }
+        },
+        "restore_errors": []
+      },
+      {
+        "name": "final/isolation-final",
+        "activity": [],
+        "before": {
+          "fwupd-refresh.timer": {
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "UnitFileState": "enabled"
+          },
+          "fwupd-refresh.service": {
+            "LoadState": "loaded",
+            "ActiveState": "inactive",
+            "UnitFileState": "static"
+          },
+          "fwupd.service": {
+            "LoadState": "loaded",
+            "ActiveState": "inactive",
+            "UnitFileState": "static"
+          }
+        },
+        "restored": {
+          "fwupd-refresh.timer": {
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "UnitFileState": "enabled"
+          },
+          "fwupd-refresh.service": {
+            "LoadState": "loaded",
+            "ActiveState": "inactive",
+            "UnitFileState": "static"
+          },
+          "fwupd.service": {
+            "LoadState": "loaded",
+            "ActiveState": "inactive",
+            "UnitFileState": "static"
+          }
+        },
+        "restore_errors": []
+      },
+      {
+        "name": "replica/isolation-1",
+        "activity": [],
+        "before": {
+          "fwupd-refresh.timer": {
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "UnitFileState": "enabled"
+          },
+          "fwupd-refresh.service": {
+            "LoadState": "loaded",
+            "ActiveState": "inactive",
+            "UnitFileState": "static"
+          },
+          "fwupd.service": {
+            "LoadState": "loaded",
+            "ActiveState": "inactive",
+            "UnitFileState": "static"
+          }
+        },
+        "restored": {
+          "fwupd-refresh.timer": {
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "UnitFileState": "enabled"
+          },
+          "fwupd-refresh.service": {
+            "LoadState": "loaded",
+            "ActiveState": "inactive",
+            "UnitFileState": "static"
+          },
+          "fwupd.service": {
+            "LoadState": "loaded",
+            "ActiveState": "inactive",
+            "UnitFileState": "static"
+          }
+        },
+        "restore_errors": []
+      }
+    ],
+    "live_workload_or_profiler": [],
+    "mount": "/dev/vda1 ext4   rw,relatime,discard,errors=remount-ro,commit=30"
+  },
+  "excluded": [
+    "native diagnostic failed load-window guard; not Linux performance",
+    "256-version/512KiB maintenance experiment; final runtime restores old budgets",
+    "profiled/error-instrumented diagnostics; not formal comparative results",
+    "active-fwupd admission rejection and dependent controller error before workload launch"
+  ],
+  "limits": [
+    "Two trials per variant; no statistical significance",
+    "Write/read p99 worsen in second pair; no consistent improvement",
+    "Complete-workload successful ops/s are lower in fixed trials; high-load drops persist",
+    "Three logical nodes share one process/disk",
+    "No new live Jepsen fault campaign",
+    "Root trace CSV hashes verified from included gzip expansion"
+  ]
+}
