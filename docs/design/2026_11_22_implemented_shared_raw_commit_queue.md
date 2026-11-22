@@ -1,5 +1,7 @@
 # Share the local and forwarded raw commit queue within one Raft group
 
+Status: implemented. Performance acceptance is recorded in the Linux evidence.
+
 The full VM150 profile shows two TransactionManager flushers for each of two
 leader Engine pointers. The local ShardGroup LeaderProxy uses a wrapped proposer,
 while Internal.Forward uses a separately constructed manager for the same engine.
@@ -37,3 +39,11 @@ context/cancellation, fallback and dynamic envelope wrapping. Run focused race,
 full Go/lint/Jepsen and a fresh profile-free exclusive VM150 ABBA with the original
 four-rate workload and all ACKs audited at three ingresses. Performance remains
 an acceptance criterion, not a claim of the design alone.
+
+The real server factory regression reproduced the independently flushing
+forward queue before the change. Afterward local and forwarded callers share
+one proposal and neither ACK precedes its completion. Receiver-epoch, local
+preparation, dynamic-wrapper, owned-context, unknown-outcome, lifecycle and
+fallback regressions pass. The port checks the configured group identity and
+shares only a known group-owned proxy, preserving custom-transaction fallback.
+No gathering delay or changed batch limit was added.

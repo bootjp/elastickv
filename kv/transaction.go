@@ -212,13 +212,17 @@ func recordProposalFailure(observer ProposalObserver) {
 }
 
 func (t *TransactionManager) Commit(ctx context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
+	return t.commitWithTimestampAdmission(ctx, reqs, t.timestampAdmission.Load())
+}
+
+func (t *TransactionManager) commitWithTimestampAdmission(ctx context.Context, reqs []*pb.Request, admission *transactionTimestampAdmission) (*TransactionResponse, error) {
 	if len(reqs) == 0 {
 		return &TransactionResponse{}, nil
 	}
 	if err := refuseAbsenceProposal(reqs); err != nil {
 		return nil, err
 	}
-	owned, err := t.timestampAdmission.Load().prepare(ctx, reqs)
+	owned, err := admission.prepare(ctx, reqs)
 	if err != nil {
 		return nil, err
 	}

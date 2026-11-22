@@ -25,6 +25,8 @@ func MigrationRequestAdmissionReady(tx Transactional) bool {
 	switch t := tx.(type) {
 	case *TransactionManager:
 		return migrationTransactionManagerReady(t)
+	case *forwardedGroupTransaction:
+		return migrationTransactionManagerReady(t.configuredManager())
 	case *LeaderProxy:
 		return t != nil && MigrationRequestAdmissionReady(t.tm)
 	case *leaseRefreshingTxn:
