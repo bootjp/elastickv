@@ -121,6 +121,15 @@ RawKV handoff waiting is limited to two seconds, 256 concurrent waiters and
 8 MiB including waiter overhead. Cancellation before another dispatch retains
 the previous noncommit proof; a dispatched attempt returns its actual outcome.
 
+Promotion may remove the target's staged descriptor and retire its admission
+guard while a rejection from the old source is still returning to ingress.
+The error-path handoff hint must therefore consult matching active source
+trackers across the node's local groups after the route changes. Looking only
+at the route's current group loses that evidence during source cleanup. This
+lookup is not write authority: whole-mutation noncommit proof, a fresh dispatch,
+the same bounded waiter/byte/deadline budgets, and normal proposal/apply guards
+remain mandatory. Retiring the source tracker ends this hint as well.
+
 ## Remaining scope
 
 The online path is currently for plaintext persistent RawKV point entries and
