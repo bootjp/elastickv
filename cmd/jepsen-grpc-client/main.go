@@ -90,6 +90,37 @@ func (c rpcClient) write(ctx context.Context, key, value []byte) error {
 	return nil
 }
 
+func (c rpcClient) deleteResponse(ctx context.Context, key []byte) response {
+	if c.api != apiRaw {
+		return response{Type: outcomeFail, Error: "delete requires the raw API"}
+	}
+	result, err := c.raw.RawDelete(ctx, &pb.RawDeleteRequest{Key: key})
+	if err != nil {
+		return response{Type: outcomeInfo, Error: fmt.Sprintf("delete register: %v", err)}
+	}
+	if !result.GetSuccess() {
+		return response{Type: outcomeInfo, Error: "delete response did not confirm success"}
+	}
+	return response{Type: outcomeOK}
+}
+
+func (c rpcClient) readResponse(ctx context.Context, key []byte) response {
+	value, err := c.read(ctx, key)
+	if err != nil {
+		return response{Type: outcomeInfo, Error: err.Error()}
+	}
+	if value == nil {
+		return response{Type: outcomeOK}
+	}
+	n, err := strconv.ParseInt(string(value), 10, 64)
+	if err != nil {
+		// Preserve corrupt/unexpected data as an observed value. Turning
+		// it into a failed read would hide it from the register checkers.
+		return response{Type: outcomeOK, Value: "invalid integer: " + string(value)}
+	}
+	return response{Type: outcomeOK, Value: n}
+}
+
 func (c rpcClient) invoke(ctx context.Context, req request) response {
 	if req.Key == "" {
 		return response{Type: outcomeFail, Error: "key is required"}
@@ -105,21 +136,10 @@ func (c rpcClient) invoke(ctx context.Context, req request) response {
 			return response{Type: outcomeInfo, Error: err.Error()}
 		}
 		return response{Type: outcomeOK, Value: *req.Value}
+	case "delete":
+		return c.deleteResponse(ctx, []byte(req.Key))
 	case "read":
-		value, err := c.read(ctx, []byte(req.Key))
-		if err != nil {
-			return response{Type: outcomeInfo, Error: err.Error()}
-		}
-		if value == nil {
-			return response{Type: outcomeOK}
-		}
-		n, err := strconv.ParseInt(string(value), 10, 64)
-		if err != nil {
-			// Preserve corrupt/unexpected data as an observed value. Turning
-			// it into a failed read would hide it from the register checkers.
-			return response{Type: outcomeOK, Value: "invalid integer: " + string(value)}
-		}
-		return response{Type: outcomeOK, Value: n}
+		return c.readResponse(ctx, []byte(req.Key))
 	default:
 		return response{Type: outcomeFail, Error: "unsupported operation"}
 	}

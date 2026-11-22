@@ -28,7 +28,7 @@ if [ ! -f "$TLA_JAR" ]; then
 fi
 
 # Modules to check, in dependency order (libs before consumers).
-TLA_MODULES=( "hlc" "occ" "mvcc" "routes" "composed" )
+TLA_MODULES=( "hlc" "occ" "mvcc" "routes" "composed" "online_split" "split_membership" )
 
 # Per-module list of gap configurations to run.  Each entry is
 # "<cfg-stem>|<expected-invariant-string>", one per line.  Modules
@@ -67,6 +67,18 @@ gap_configs_for() {
             printf '_gap|Invariant Composed1_CommitToOwningGroup is violated\n'
             printf '_currentfence_gap|Invariant Composed1a_CommitToCurrentOwner is violated\n'
             ;;
+        online_split)
+            printf '_gap|Invariant ImportIsExactPrefix is violated\n'
+            printf '_tail_gap|Invariant VisibleImageMatchesCommits is violated\n'
+            printf '_config_gap|Invariant PublicationHasCurrentEvidence is violated\n'
+            printf '_cleanup_gap|Invariant CleanupAfterPublication is violated\n'
+            printf '_owner_gap|Invariant NoStaleOwnerAck is violated\n'
+            printf '_invalid_gap|Invariant InvalidatedGenerationNeverPublished is violated\n'
+            ;;
+        split_membership)
+            printf '_gap|Invariant AcknowledgedOverwriteVisible is violated\n'
+            printf '_stale_gap|Invariant DeletedValueNeverRevives is violated\n'
+            ;;
         *)
             echo "ERROR: no gap-config list registered for module '$1'." \
                 "Add a case to scripts/tla-check.sh." >&2
@@ -82,7 +94,8 @@ gap_configs_for() {
 pass_configs_for() {
     case "$1" in
         occ) printf '_onephase\n_multigroup\n_multigroup_2pc\n_g0\n' ;;
-        hlc|mvcc|routes|composed) ;;
+        online_split) printf '_revalidated\n' ;;
+        hlc|mvcc|routes|composed|split_membership) ;;
         *)
             echo "ERROR: no pass-config list registered for module '$1'." \
                 "Add a case to scripts/tla-check.sh." >&2
@@ -104,7 +117,7 @@ live_configs_for() {
         routes) printf '_live\n' ;;
         hlc)      ;; # no liveness config yet (HLC-L1 deferred)
         mvcc)     ;; # no liveness config yet
-        composed) ;; # no liveness config yet (cross-module liveness deferred)
+        composed|online_split|split_membership) ;; # no liveness config
         *)
             echo "ERROR: no live-config list registered for module '$1'." \
                 "Add a case to scripts/tla-check.sh." >&2
@@ -125,6 +138,8 @@ mc_basename() {
         mvcc)     printf 'MCMVCC' ;;
         routes)   printf 'MCRoutes' ;;
         composed) printf 'MCComposed' ;;
+        online_split) printf 'MCOnlineSplit' ;;
+        split_membership) printf 'MCSplitMembership' ;;
         *)
             echo "ERROR: no mc_basename mapping for module '$1'." \
                 "Add a case to scripts/tla-check.sh." >&2

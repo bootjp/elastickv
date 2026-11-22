@@ -20,6 +20,51 @@ restores the voter. The job must reach DONE with every bracket complete,
 the expected route owners, and both original values readable through all
 three nodes. The test fails if it misses the preflight window.
 
+## Leader failover after captured RawKV mutations
+
+Run the same three-process harness with `--online-leader-failover`:
+
+```sh
+PREFLIGHT_LOG_DIR=/path/to/logs bash scripts/jepsen-split-preflight.sh --online-leader-failover
+```
+
+The workload requires an unfinished preflight checkpoint with online capture
+active. It acknowledges a moving-range overwrite and delete, stops the
+catalog/source leader, and requires a higher-term replacement to observe the
+same unfinished generation while the old leader remains stopped. It resumes
+the voter and waits for DONE and the exact sealed import position. After a
+new write on the moved range, it requires the retained value, the overwrite,
+absence of the deleted key, and the new value on all three ingresses.
+
+The checker treats a missed fault window, missing ACK, resurrected delete,
+or missing or incorrect ingress read as a failed run. History is recorded
+under `jepsen/store/elastickv-split-online-failover/`. The preflight workflow
+runs each scenario using fresh stores. See the [safety evidence](../docs/evidence/online_split_safety_20261122/README.md)
+for the accompanying Lean and TLC checks and the remaining fault cases.
+
+## Target learner promotion between final confirmation and catalog publication
+
+```sh
+PREFLIGHT_LOG_DIR=/path/to/logs bash scripts/jepsen-split-preflight.sh --online-member-change
+```
+
+This variant also needs Python 3 and starts a fourth process on ports 25104,
+25204 and 25304. A Go build overlay pauses the cutover controller after the
+last readiness probes and delays catalog cache updates on ingress `n3`.
+The fault uses the real Raft admin API to add `n4` as a target learner, wait
+for its committed prefix to apply, and promote it. The same paused cutover
+attempt must publish the new owner only after that promotion applies.
+
+The checker requires successful overwrite and delete ACKs during online
+capture. Read probes through `n3` and `n4` may return the correct value or
+`Unavailable` from the route guard while `n3` is stale and the target leader. After target
+leadership transfers to `n4`, it must read the correct overwrite and absence
+of the deleted key while `n3` is still stale. After healing and DONE, both
+ingresses must return all four expected values, including a post-cutover
+write. History lives under `jepsen/store/elastickv-split-target-membership/`.
+The log directory also preserves the before/after attempt stamps and cache
+observations. See the [membership evidence](../docs/evidence/online_split_membership_20261122/README.md).
+
 ## Repeated splits
 
 `elastickv.split-workload --repeat-splits` opts into exactly three splits:
@@ -89,11 +134,11 @@ these data-quorum tests is explicitly stubbed; they do not establish TLS/auth
 or full cross-group root/data fault-injection acceptance. Deterministic controller
 regressions separately cover repeated cross-group moves and retained negative owners.
 
-Production activation remains opt-in through authentication and opcode flags,
-installed read/proposal/consumer hooks, a supported applied configuration and
+Namespace activation requires authentication, opcode support, installed
+read/proposal/consumer hooks, a supported applied configuration and
 all-current-apply-member negotiation. Flags alone cannot bypass namespace
-activation or authorize imported data. The Jepsen additions here are scheduling
-and oracle unit coverage, not a completed real-cluster fault-injection campaign.
+activation or authorize imported data. See [online split activation](../docs/design/2026_11_21_partial_online_split_activation.md)
+for the persistent RawKV default and its fallback behavior.
 
 Run focused coverage and the full harness suite from `jepsen/`:
 

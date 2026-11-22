@@ -21,10 +21,12 @@ import (
 type testServer struct {
 	pb.UnimplementedRawKVServer
 	pb.UnimplementedTransactionalKVServer
-	mu        sync.Mutex
-	value     []byte
-	writes    int
-	loseReply bool
+	mu           sync.Mutex
+	value        []byte
+	writes       int
+	calls        int
+	loseReply    bool
+	rejectDelete bool
 }
 
 func (s *testServer) put(value []byte) error {
@@ -54,6 +56,26 @@ func (s *testServer) Put(_ context.Context, req *pb.PutRequest) (*pb.PutResponse
 	return &pb.PutResponse{Success: err == nil}, err
 }
 
+func (s *testServer) RawDelete(context.Context, *pb.RawDeleteRequest) (*pb.RawDeleteResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.rejectDelete {
+		return &pb.RawDeleteResponse{Success: false}, nil
+	}
+	s.value = nil
+	if s.loseReply {
+		return nil, status.Error(codes.Unavailable, "reply lost after commit")
+	}
+	return &pb.RawDeleteResponse{Success: true}, nil
+}
+
+func (s *testServer) countRPC(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+	s.mu.Lock()
+	s.calls++
+	s.mu.Unlock()
+	return handler(ctx, req)
+}
+
 func (s *testServer) RawGet(context.Context, *pb.RawGetRequest) (*pb.RawGetResponse, error) {
 	v := s.get()
 	return &pb.RawGetResponse{Exists: v != nil, Value: v}, nil
@@ -67,8 +89,8 @@ func fixture(t *testing.T, api string) (rpcClient, *testServer) {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
-	server := grpc.NewServer()
 	backend := &testServer{}
+	server := grpc.NewServer(grpc.UnaryInterceptor(backend.countRPC))
 	pb.RegisterRawKVServer(server, backend)
 	pb.RegisterTransactionalKVServer(server, backend)
 	go func() { _ = server.Serve(listener) }()
@@ -114,6 +136,62 @@ func TestPublicAPIsPreserveObservedOutcomes(t *testing.T) {
 				// distinguish an empty value from an absent key.
 				require.Nil(t, observed.Value)
 			}
+		})
+	}
+}
+
+func TestDeleteOutcomes(t *testing.T) {
+	const seed = int64(17)
+	for _, tc := range []struct {
+		name         string
+		api          string
+		loseReply    bool
+		rejectDelete bool
+		wantType     string
+		wantError    string
+		wantValue    any
+		wantCalls    int
+	}{
+		{name: "acknowledged raw delete", api: apiRaw, wantType: outcomeOK, wantCalls: 1},
+		{
+			name: "committed raw delete with lost reply", api: apiRaw, loseReply: true,
+			wantType: outcomeInfo, wantError: "reply lost after commit", wantCalls: 1,
+		},
+		{
+			name: "unconfirmed raw delete", api: apiRaw, rejectDelete: true,
+			wantType: outcomeInfo, wantError: "delete response did not confirm success",
+			wantValue: seed, wantCalls: 1,
+		},
+		{
+			name: "transactional delete rejected locally", api: apiTransactional,
+			wantType: outcomeFail, wantError: "delete requires the raw API", wantValue: seed,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client, backend := fixture(t, tc.api)
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			value := seed
+			require.Equal(t, outcomeOK, client.invoke(ctx, request{Op: "write", Key: "key", Value: &value}).Type)
+
+			backend.mu.Lock()
+			backend.loseReply = tc.loseReply
+			backend.rejectDelete = tc.rejectDelete
+			before := backend.calls
+			backend.mu.Unlock()
+			observed := client.invoke(ctx, request{Op: "delete", Key: "key"})
+			backend.mu.Lock()
+			calls := backend.calls - before
+			backend.mu.Unlock()
+
+			require.Equal(t, tc.wantType, observed.Type)
+			if tc.wantError == "" {
+				require.Empty(t, observed.Error)
+			} else {
+				require.Contains(t, observed.Error, tc.wantError)
+			}
+			require.Equal(t, tc.wantCalls, calls)
+			require.Equal(t, response{Type: outcomeOK, Value: tc.wantValue}, client.invoke(ctx, request{Op: "read", Key: "key"}))
 		})
 	}
 }
