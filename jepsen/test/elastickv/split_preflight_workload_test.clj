@@ -139,6 +139,7 @@
                         [[8 :value :attempt] 101]
                         [[8 :value :cached-version] 4]
                         [[9 :error] "rpc error: code = Unknown"]
+                        [[9 :error] "rpc error: code = Unavailable desc = connection refused"]
                         [[10 :type] :ok]
                         [[11 :value] [1 4202]]
                         [[12 :value] [2 4303]]

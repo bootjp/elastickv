@@ -23,6 +23,7 @@ trap 'exit 143' TERM
 export PREFLIGHT_DIR="$work"
 logs=${PREFLIGHT_LOG_DIR:-$work/logs}
 mkdir -p "$logs"
+logs=$(cd "$logs" && pwd -P)
 unset SPLIT_MEMBERSHIP_FIXTURE
 build_args=()
 for arg in "$@"; do

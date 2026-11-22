@@ -516,7 +516,7 @@
   (let [[key got] value]
     (case type
       :ok (= (online-final-values key) got)
-      :info (boolean (re-find #"code = Unavailable\b" (str error)))
+      :info (boolean (re-find #"code = Unavailable desc = Route unavailable\b" (str error)))
       false)))
 
 (defn membership-checker []

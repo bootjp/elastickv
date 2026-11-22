@@ -35,16 +35,19 @@ requires DONE, equality of the imported and sealed sequences, a successful
 post-cutover write and four exact reads on each ingress. This covers the
 retained key, overwritten key, deleted key and new key.
 
-The fixed Go 1.27.4 build passed twice on Darwin/arm64 with fresh stores.
-Both attempts published catalog version 4 while `n3` held version 3 with
+The fixed Go 1.27.4 build passed three runs on Darwin/arm64 with fresh stores.
+All three attempts published catalog version 4 while `n3` held version 3 with
 source owner 1. The before/after attempt markers matched byte-for-byte.
 
 | Run | Target configuration at confirmation | Add index | Sampled commit / learner applied | Promote / voter applied | Stale probes | Reads led by `n4` while `n3` was stale | Final audit |
 |---|---:|---:|---:|---:|---|---|---|
 | 21:56 JST | 1 | 74 | 74 / 74 | 75 / 75 | 4 `Unavailable` | 5101, absent | 8/8 |
 | 21:57 JST | 1 | 74 | 75 / 75 | 76 / 76 | 4 `Unavailable` | 5101, absent | 8/8 |
+| 22:04 JST | 1 | 80 | 81 / 81 | 82 / 82 | 4 `Unavailable` | 5101, absent | 8/8 |
 
-All four stale probes per run completed without a value. Both runs ACKed
+All four stale probes per run returned the route guard’s `Unavailable`.
+The last run enforced that status and message in the oracle and used a relative
+log directory to verify marker collection. Every run ACKed
 all six mutations, including all three seeds, the in-flight overwrite and
 delete, and the post-cutover write. The final audit checks their resulting
 state, where the overwritten and deleted seeds have been superseded.
@@ -62,6 +65,11 @@ existing bounded retry for unpinned requests. Pinned requests return without
 retrying. A Bufconn regression built from the real shard-store error fails
 on the original wrapper and passes with the fix. Genuinely mixed errors still
 avoid both classification and retries.
+
+The existing voter-pause and catalog-leader failover scenarios also passed in
+fresh clusters. The full Jepsen harness ran 444 tests with 6,217 assertions
+and no failures or errors. The RawGet and shard-store read-fence regression
+tests passed with Go’s race detector.
 
 ## Model checks and correspondence
 
