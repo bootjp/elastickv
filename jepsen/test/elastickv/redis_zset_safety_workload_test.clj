@@ -892,24 +892,28 @@
                                 [{:type :invoke :process 1 :f :zrange-all :index 10}
                                  {:type :ok :process 1 :f :zrange-all :value [["m1" 49.0]] :index 11}])))))))
 
-(deftest ambiguous-zadds-cannot-explain-more-transitions-than-writes
-  (let [scores [1 1 2 2]
-        history (mapv #(assoc %1 :index %2)
-                      (concat
-                        (map-indexed (fn [process score]
-                                       {:type :invoke :process process :f :zadd :value ["m1" score]})
-                                     scores)
-                        (map-indexed (fn [process score]
-                                       {:type :info :process process :f :zadd :value ["m1" score]})
-                                     scores)
-                        (mapcat (fn [score]
-                                  [{:type :invoke :process 4 :f :zrange-all}
-                                   {:type :ok :process 4 :f :zrange-all :value [["m1" score]]}])
-                                [1.0 2.0 1.0 2.0 1.0]))
-                      (range))
-        result (run-checker history)]
-    (is (false? (:valid? result)))
-    (is (contains? (:errors-by-kind result) :unstable-read-without-mutation))))
+(deftest timed-out-zadds-with-the-same-score-can-each-apply-once
+  (let [scores [49 49 7 7]
+        writes (mapcat (fn [type]
+                         (map-indexed (fn [process score]
+                                        {:type type :process process :f :zadd :value ["m1" score]})
+                                      scores))
+                       [:invoke :info])
+        check-scores (fn [reads]
+                       (run-checker
+                         (mapv #(assoc %1 :index %2)
+                               (concat writes
+                                       (mapcat (fn [score]
+                                                 [{:type :invoke :process 4 :f :zrange-all}
+                                                  {:type :ok :process 4 :f :zrange-all
+                                                   :value (if (nil? score) [] [["m1" score]])}])
+                                               reads))
+                               (range))))
+        four-changes [nil 49.0 7.0 49.0 7.0]
+        impossible (check-scores (conj four-changes 49.0))]
+    (is (true? (:valid? (check-scores four-changes))))
+    (is (false? (:valid? impossible)))
+    (is (contains? (:errors-by-kind impossible) :unstable-read-without-mutation))))
 
 (deftest range-reads-cannot-switch-overlapping-write-order
   ;; Stability is not just a full-read property. Two non-overlapping bounded

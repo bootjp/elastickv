@@ -49,6 +49,8 @@
             [jepsen.nemesis.combined :as combined]
             [jepsen.os :as os]
             [jepsen.os.debian :as debian]
+            [knossos.linear :as linear]
+            [knossos.model :as model]
             [taoensso.carmine :as car]))
 
 ;; ---------------------------------------------------------------------------
@@ -575,15 +577,14 @@
   (and (= :zrem (:f m))
        (not= false (:removed? m))))
 
-(defn- strictly-follows?
-  "True iff `later` is ordered after `earlier` by real time."
-  [later earlier]
-  (and (some? (:complete-idx earlier))
-       (> (:invoke-idx later) (:complete-idx earlier))))
+(defn- indeterminate-zadd? [m]
+  (and (= :zadd (:f m)) (= :info (:type m))))
 
 (defn- real-time-before?
+  "A timed-out ZADD has no observed server-side completion."
   [a b]
-  (and (some? (:complete-idx a))
+  (and (not (indeterminate-zadd? a))
+       (some? (:complete-idx a))
        (< (:complete-idx a) (:invoke-idx b))))
 
 (defn- could-linearize-between?
@@ -606,7 +607,7 @@
   [preceding m]
   (some (fn [reset]
           (and (= :zadd (:f reset))
-               (strictly-follows? reset m)
+               (real-time-before? m reset)
                (not-any? #(and (#{:zincrby :zrem} (:f %))
                                 (could-linearize-between? % m reset))
                          preceding)))
@@ -1105,24 +1106,47 @@
        (or (nil? (:complete-idx m))
            (>= (:complete-idx m) first-read-inv-idx))))
 
-(defn- required-zadd-observations
-  [mutations-by-m reads]
-  (let [uncertain (mutations-by-member
-                    (filter #(and (= :info (:type %)) (= :zadd (:f %)))
-                            (mapcat val mutations-by-m)))]
-    (when (seq uncertain)
-      (reduce (fn [observed {:keys [invoke complete] :as read}]
-                (let [inv-idx (:index invoke)
-                      cmp-idx (:index complete)]
-                  (reduce (fn [out [member score]]
-                            (reduce (fn [acc m]
-                                      (if (observed-score-requires-mutation?
-                                            mutations-by-m m member score inv-idx cmp-idx)
-                                        (update acc (:invoke-idx m) #(min (or % cmp-idx) cmp-idx))
-                                        acc))
-                                    out (get uncertain member [])))
-                          observed (read-entries read))))
-              {} reads))))
+(defrecord ZSetMember [states]
+  knossos.model.Model
+  (step [_ {:keys [f value]}]
+    (let [next-states
+          (case f
+            :read (set (filter (fn [state]
+                                 (= (:score value)
+                                    (when (visible-state? state (:bounds value))
+                                      (:score state))))
+                               states))
+            :mutation (let [applied (advance-states states value)]
+                        ;; Other indeterminate mutations keep their bounded
+                        ;; window and can be skipped.
+                        (if (and (= :info (:type value)) (not (indeterminate-zadd? value)))
+                          (into states applied)
+                          applied)))]
+      (if (seq next-states)
+        (->ZSetMember next-states)
+        (model/inconsistent (str "Cannot apply " f " " (pr-str value)))))))
+
+(defn- projected-operation [f value start end]
+  ;; A client can submit another operation after a timed-out ZADD while the
+  ;; original request is still in flight. Give each operation its own process
+  ;; and use the original invocation and completion indices for ordering.
+  (cond-> [{:f f :value value :process start :type :invoke :index start}]
+    end (conj {:f f :value value :process start :type :ok :index end})))
+
+(defn- check-indeterminate-zadds [member mutations reads]
+  (let [writes (for [m mutations :when (not= :fail (:type m))]
+                 (projected-operation :mutation m (:invoke-idx m)
+                                      (when-not (indeterminate-zadd? m) (:complete-idx m))))
+        observations (for [{:keys [invoke complete entries] :as read} reads]
+                       (projected-operation :read
+                                            {:score (get entries member) :bounds (read-bounds read)}
+                                            (:index invoke) (:index complete)))
+        history (sort-by :index (mapcat identity (concat writes observations)))
+        {:keys [valid? op cause]} (linear/analysis (->ZSetMember #{absent-state}) history)]
+    (case valid?
+      true nil
+      false {:kind :unstable-read-without-mutation :member member :index (:index op)}
+      {:kind :inconclusive-zadd-history :member member :cause cause})))
 
 (defn- comparable-stability-members
   [mutations-by-m first-read second-read first-entries second-entries]
@@ -1158,46 +1182,41 @@
   (let [reads (->> read-pairs
                    (filter (complement malformed-read?))
                    (sort-by #(-> % :invoke :index))
-                   vec)
-        observed (required-zadd-observations mutations-by-m reads)]
-    (->> (for [[idx later] (map-indexed vector reads)
-               earlier (subvec reads 0 idx)
-               :let [first-cmp-idx (-> earlier :complete :index)
-                     second-inv-idx (-> later :invoke :index)]
-               :when (< first-cmp-idx second-inv-idx)
-               :let [first-inv-idx (-> earlier :invoke :index)
-                     second-cmp-idx (-> later :complete :index)
-                     first-entries (entry-map (read-entries earlier))
-                     second-entries (entry-map (read-entries later))
-                     members (comparable-stability-members mutations-by-m
-                                                           earlier
-                                                           later
-                                                           first-entries
-                                                           second-entries)]
-               member members
-               :let [first-state (member-state-in-read first-entries member)
-                     second-state (member-state-in-read second-entries member)]
-               :when (and (not= first-state second-state)
-                          (not-any? #(or (mutation-could-affect-read-gap?
-                                           % first-inv-idx second-cmp-idx)
-                                         ;; A later read must require this ZADD
-                                         ;; before it can explain a delayed score.
-                                         ;; Ambiguous producers cannot be reused
-                                         ;; for an unbounded number of changes.
-                                         (and (= :zadd (:f %))
-                                              (pre-read-info? % first-inv-idx)
-                                              (score-eq? (:score %) (:score second-state))
-                                              (when-let [required-idx (get observed (:invoke-idx %))]
-                                                (< first-cmp-idx required-idx (inc second-cmp-idx)))))
-                                    (get mutations-by-m member [])))]
-           {:kind :unstable-read-without-mutation
-            :first-index first-cmp-idx
-            :second-index second-cmp-idx
-            :member member
-            :first-state first-state
-            :second-state second-state})
-         distinct
-         vec)))
+                   (mapv #(assoc % :entries (entry-map (read-entries %)))))
+        affected (into {} (filter (fn [[_ mutations]] (some indeterminate-zadd? mutations)))
+                       mutations-by-m)
+        ;; One search across all observations retains the identities of
+        ;; pending ZADDs. A read cannot reuse a write already linearized by
+        ;; another read, even when several requests carry the same score.
+        checked (when (seq reads)
+                  (keep (fn [[member mutations]] (check-indeterminate-zadds member mutations reads))
+                        affected))
+        stable-errors
+        (for [[idx later] (map-indexed vector reads)
+              earlier (subvec reads 0 idx)
+              :let [first-cmp-idx (-> earlier :complete :index)
+                    second-inv-idx (-> later :invoke :index)]
+              :when (< first-cmp-idx second-inv-idx)
+              :let [first-inv-idx (-> earlier :invoke :index)
+                    second-cmp-idx (-> later :complete :index)
+                    first-entries (:entries earlier)
+                    second-entries (:entries later)
+                    members (comparable-stability-members mutations-by-m earlier later
+                                                          first-entries second-entries)]
+              member members
+              :when (not (contains? affected member))
+              :let [first-state (member-state-in-read first-entries member)
+                    second-state (member-state-in-read second-entries member)]
+              :when (and (not= first-state second-state)
+                         (not-any? #(mutation-could-affect-read-gap? % first-inv-idx second-cmp-idx)
+                                   (get mutations-by-m member [])))]
+          {:kind :unstable-read-without-mutation
+           :first-index first-cmp-idx
+           :second-index second-cmp-idx
+           :member member
+           :first-state first-state
+           :second-state second-state})]
+    (into (vec (distinct stable-errors)) checked)))
 
 (defn- check-zrange-all
   [mutations-by-m {:keys [invoke complete] :as _pair}]
@@ -1394,9 +1413,9 @@
             ;; `true` as a failure (see elastickv.cli/fail-on-invalid!).
             no-successful-reads? (zero? (count read-pairs))
             valid? (cond
-                     (seq all-errors)      false
-                     no-successful-reads?  :unknown
-                     :else                 true)]
+                     (some #(not= :inconclusive-zadd-history (:kind %)) all-errors) false
+                     (or no-successful-reads? (seq all-errors)) :unknown
+                     :else true)]
         (cond-> {:valid? valid?
                  :reads  (count read-pairs)
                  :mutations (count mutations)
