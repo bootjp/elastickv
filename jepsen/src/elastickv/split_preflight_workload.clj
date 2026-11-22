@@ -1,5 +1,5 @@
 (ns elastickv.split-preflight-workload
-  "Pause one voting process only after the catalog leader reports a partial preflight."
+  "Exercise catalog preflight and online split recovery with a stopped voter."
   (:refer-clojure :exclude [run!])
   (:require [clojure.data.json :as json]
             [clojure.java.shell :as sh]
@@ -46,6 +46,8 @@
      :plan (ids progress) :completed (ids (filter :done progress))
      :done (:transfer_preflight_done j) :fence (:fence_ts j)
      :source (:source_group_id j) :target (:target_group_id j)
+     :online-version (:online_capture_version j) :online-sequence (:online_sequence j)
+     :seal-sequence (:online_seal_sequence j) :online-manifest (:online_manifest j)
      :capability-regressed (:capability_regressed j) :error (:last_error j)}))
 
 (defn partial-scan? [s]
@@ -65,22 +67,27 @@
               :else (do (Thread/sleep poll-ms) (recur)))))))
 
 (defn- process-state [pid] (run! "ps" "-o" "stat=" "-p" pid))
-(defn- stopped? [state] (str/starts-with? state "T"))
+(defn- stopped? [state] (and (string? state) (str/starts-with? state "T")))
+
+(defn- submit-split! [leader]
+  (let [catalog (routes leader)
+        [route] (:routes catalog)]
+    (when-not (and (= 1 (count (:routes catalog)))
+                   (= 1 (:raft_group_id route)) (= "" (:start route) (:end route)))
+      (throw (ex-info "Expected the initial single group-1 route on the catalog leader" catalog)))
+    (let [out (split leader "--route-id" (str (:route_id route)) "--expected-version"
+                     (str (:catalog_version catalog)) "--split-key" split-key "--target-group-id" "2")
+          job (second (re-find #"job_id:\s*(\d+)" out))]
+      (or job (throw (ex-info "No migration job ID" {:output out}))))))
 
 (defn- pause! [active]
   (let [leader (:leader_id (status "n1"))
         address-status (status leader)
         victim (first (remove #{leader} nodes))
-        pid (str/trim (slurp (path (str victim ".pid"))))
-        catalog (routes leader)
-        [route] (:routes catalog)]
-    (when-not (and (= "LEADER" (:state address-status)) (= 1 (count (:routes catalog)))
-                   (= 1 (:raft_group_id route)) (= "" (:start route) (:end route)))
-      (throw (ex-info "Expected the initial single group-1 route on the catalog leader" catalog)))
-    (let [out (split leader "--route-id" (str (:route_id route)) "--expected-version"
-                     (str (:catalog_version catalog)) "--split-key" split-key "--target-group-id" "2")
-          job (second (re-find #"job_id:\s*(\d+)" out))
-          _ (when-not job (throw (ex-info "No migration job ID" {:output out})))
+        pid (str/trim (slurp (path (str victim ".pid"))))]
+    (when-not (= "LEADER" (:state address-status))
+      (throw (ex-info "Expected a catalog leader" address-status)))
+    (let [job (submit-split! leader)
           before (await-sample leader job 180 150 partial-scan?)]
       (reset! active {:leader leader :pid pid :victim victim :job job})
       (run! "kill" "-STOP" pid)
@@ -106,6 +113,55 @@
         catalog (routes leader)]
     {:final final :routes (:routes catalog)}))
 
+(defn- online-checkpoint? [s]
+  (and (partial-scan? s) (= 1 (:online-version s))
+       (not (str/blank? (:online-manifest s))) (= "0" (:seal-sequence s))))
+
+(defn- start-online! [active]
+  (let [leader (:leader_id (status "n1"))
+        current (status leader)]
+    (when-not (and (= "LEADER" (:state current)) (= leader (:leader_id current))
+                   (integer? (:term current)))
+      (throw (ex-info "Expected a catalog leader with a term" current)))
+    (let [job (submit-split! leader)
+          checkpoint (await-sample leader job 180 25 online-checkpoint?)]
+      (reset! active {:leader leader :term (:term current) :job job})
+      {:leader leader :term (:term current) :sample checkpoint})))
+
+(defn- replacement-leader! [victim term]
+  (let [deadline (+ (System/nanoTime) 25000000000)]
+    (loop []
+      (or (some (fn [node]
+                  (when-let [s (try (status node) (catch Exception _ nil))]
+                    (when (and (= "LEADER" (:state s)) (= node (:leader_id s))
+                               (integer? (:term s)) (> (:term s) term))
+                      {:leader node :term (:term s)})))
+                (remove #{victim} nodes))
+          (if (< (System/nanoTime) deadline)
+            (do (Thread/sleep 100) (recur))
+            (throw (ex-info "No new catalog leader while the original was stopped"
+                            {:victim victim :term term})))))))
+
+(defn- failover! [active]
+  (let [{old :leader old-term :term job :job} @active
+        before (sample old job)
+        current (status old)
+        pid (str/trim (slurp (path (str old ".pid"))))]
+    (when-not (and (online-checkpoint? before) (= "LEADER" (:state current))
+                   (= old (:leader_id current)) (= old-term (:term current)))
+      (throw (ex-info "Online checkpoint or original leader was lost before injection"
+                      {:before before :status current})))
+    (swap! active assoc :pid pid :victim old)
+    (run! "kill" "-STOP" pid)
+    (let [{:keys [leader term]} (replacement-leader! old old-term)
+          state (process-state pid)
+          during (sample leader job)]
+      (when-not (and (stopped? state) (online-checkpoint? during))
+        (throw (ex-info "The new leader did not observe the unfinished online checkpoint"
+                        {:state state :term term :sample during})))
+      (swap! active assoc :leader leader)
+      {:victim old :leader leader :term term :state state :before before :during during})))
+
 (defn- preflight-nemesis []
   (let [active (atom nil)]
     (reify nemesis/Nemesis
@@ -115,6 +171,8 @@
           (assoc op :confirmed true :value
                  (case (:f op)
                    :pause-preflight (pause! active)
+                   :start-online (start-online! active)
+                   :failover (failover! active)
                    :resume-voter (resume! @active)
                    :finish-split (finish! @active)))
           (catch Exception e
@@ -174,24 +232,102 @@
          :errors (vec (keep #(when (and (= :nemesis (:process %)) (:error %))
                                (select-keys % [:f :error :details])) history))}))))
 
-(defn- probe-reads [tag]
+(def online-seeds {0 4101, 1 4202, 2 4303})
+(def captured-mutations #{[:write [1 5101]] [:delete [2 nil]]})
+(def post-cutover-mutations #{[:write [3 5303]]})
+(def online-final-values {0 4101, 1 5101, 2 nil, 3 5303})
+
+(defn- acknowledged-between? [history tag expected lower upper]
+  (let [completed (filter #(and (= tag (:tag %)) (not= :invoke (:type %))) history)]
+    (and (= (count expected) (count completed))
+         (= expected (set (map (juxt :f :value) completed)))
+         (every? #(and (= :ok (:type %)) (< lower (:index %) upper)) completed))))
+
+(defn online-failover-checker []
+  (reify checker/Checker
+    (check [_ _ history _]
+      (let [[start fault heal finish :as events] (filter :confirmed history)
+            {initial :sample old :leader old-term :term} (:value start)
+            {:keys [before during leader victim state term]} (:value fault)
+            {:keys [final routes]} (:value finish)
+            final-reads (filter #(and (= :read (:f %)) (:final %)
+                                      (not= :invoke (:type %))) history)
+            expected (set (for [n nodes [k v] online-final-values] [n [k v]]))
+            actual (set (map (juxt :node :value) final-reads))
+            post-writes (filter #(and (= :post-cutover (:tag %)) (= :ok (:type %))) history)
+            errors (vec (filter #(and (= :nemesis (:process %)) (:error %)) history))]
+        {:valid? (boolean
+                   (and (empty? errors)
+                        (= [:start-online :failover :resume-voter :finish-split] (mapv :f events))
+                        (apply < (map :index events))
+                        (every? online-checkpoint? [initial before during])
+                        (= (:job initial) (:job before) (:job during) (:job final))
+                        (= (:scan-ts initial) (:scan-ts before))
+                        (= (:plan initial) (:plan before))
+                        (= (:online-manifest initial) (:online-manifest before) (:online-manifest during))
+                        (set/subset? (:completed initial) (:completed before))
+                        (= old victim (get-in heal [:value :victim]))
+                        (contains? (set nodes) old) (contains? (set nodes) leader) (not= old leader)
+                        (integer? old-term) (integer? term) (> term old-term)
+                        (stopped? state) (not (str/blank? (get-in heal [:value :state])))
+                        (not (stopped? (get-in heal [:value :state])))
+                        (valid-checkpoints? before during final) (correct-routes? routes)
+                        (= 1 (:online-version final))
+                        (= (:online-sequence final) (:seal-sequence final))
+                        (some-> (:seal-sequence final) parse-long pos?)
+                        (acknowledged-between? history :seed
+                                               (set (map (fn [kv] [:write (vec kv)]) online-seeds))
+                                               -1 (:index start))
+                        (acknowledged-between? history :captured captured-mutations
+                                               (:index start) (:index fault))
+                        (acknowledged-between? history :post-cutover post-cutover-mutations
+                                               (:index finish) Long/MAX_VALUE)
+                        (= expected actual) (= (count expected) (count final-reads))
+                        (every? #(and (= :ok (:type %))
+                                      (< (:index (first post-writes)) (:index %))) final-reads)))
+         :old-leader old :new-leader leader :old-term old-term :new-term term
+         :job (:job initial) :sealed-sequence (:seal-sequence final)
+         :completed-before (count (:completed before)) :completed-after (count (:completed during))
+         :final-reads (count final-reads)
+         :missing-or-incorrect-final-values (set/difference expected actual)
+         :errors errors}))))
+
+(defn- probe-reads [tag keys-to-read]
   (apply gen/any
          (for [i (range (count nodes))]
            (gen/on-threads #{i} (mapv (fn [k] {:f :read :value (independent/tuple k nil) tag true})
-                                      (keys seeds))))))
+                                      keys-to-read)))))
 
-(defn- workload [_]
+(defn- mutation-phase [tag entries]
+  (gen/clients
+    (map (fn [[f [k v]]] {:f f :value (independent/tuple k v) :tag tag}) entries)))
+
+(defn- workload [{:keys [online-leader-failover]}]
   (let [client (grpc/->GRPCClient ports :raw (path "jepsen-grpc-client") nil nil nil)
         event #(gen/nemesis (gen/once {:type :info :f %}))]
     (merge tests/noop-test
-           {:name "elastickv-split-preflight-pause" :nodes nodes :concurrency 3 :net net/noop
+           {:name (if online-leader-failover "elastickv-split-online-failover"
+                                             "elastickv-split-preflight-pause")
+            :nodes nodes :concurrency 3 :net net/noop
             :grpc-host "127.0.0.1" :grpc-tls-ca-file (path "cert.pem")
             :client (hosted/->ObservedClient client nil) :nemesis (preflight-nemesis)
-            :checker (recovery-checker)
-            :generator (gen/phases
-                         (gen/clients (map (fn [[k v]] {:f :write :value (independent/tuple k v)}) seeds))
-                         (event :pause-preflight) (gen/clients (probe-reads :during))
-                         (event :resume-voter) (event :finish-split) (gen/clients (probe-reads :final)))})))
+            :checker (if online-leader-failover (online-failover-checker) (recovery-checker))
+            :generator (if online-leader-failover
+                         (gen/phases
+                           (mutation-phase :seed (map #(vector :write %) online-seeds))
+                           (event :start-online)
+                           (mutation-phase :captured captured-mutations)
+                           (event :failover) (event :resume-voter) (event :finish-split)
+                           (mutation-phase :post-cutover post-cutover-mutations)
+                           (gen/clients (probe-reads :final (keys online-final-values))))
+                         (gen/phases
+                           (mutation-phase :seed (map #(vector :write %) seeds))
+                           (event :pause-preflight) (gen/clients (probe-reads :during (keys seeds)))
+                           (event :resume-voter) (event :finish-split)
+                           (gen/clients (probe-reads :final (keys seeds)))))})))
 
 (defn -main [& args]
-  (cli/run-workload! args cli/common-cli-opts #(cli/parse-common-opts % nil) workload))
+  (cli/run-workload! args
+                     (conj cli/common-cli-opts
+                           [nil "--online-leader-failover" "Stop the catalog leader during online capture."])
+                     #(cli/parse-common-opts % nil) workload))

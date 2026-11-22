@@ -54,4 +54,4 @@ for n in 1 2 3; do
   if [[ $ready != true ]]; then tail -50 "$logs/n$n.log" >&2; exit 1; fi
 done
 cd jepsen
-"${LEIN:-lein}" run -m elastickv.split-preflight-workload --local
+"${LEIN:-lein}" run -m elastickv.split-preflight-workload --local "$@"

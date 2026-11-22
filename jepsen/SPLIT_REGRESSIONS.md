@@ -20,6 +20,28 @@ restores the voter. The job must reach DONE with every bracket complete,
 the expected route owners, and both original values readable through all
 three nodes. The test fails if it misses the preflight window.
 
+## Leader failover after captured RawKV mutations
+
+Run the same three-process harness with `--online-leader-failover`:
+
+```sh
+PREFLIGHT_LOG_DIR=/path/to/logs bash scripts/jepsen-split-preflight.sh --online-leader-failover
+```
+
+The workload requires an unfinished preflight checkpoint with online capture
+active. It acknowledges a moving-range overwrite and delete, stops the
+catalog/source leader, and requires a higher-term replacement to observe the
+same unfinished generation while the old leader remains stopped. It resumes
+the voter and waits for DONE and the exact sealed import position. After a
+new write on the moved range, it requires the retained value, the overwrite,
+absence of the deleted key, and the new value on all three ingresses.
+
+The checker treats a missed fault window, missing ACK, resurrected delete,
+or missing or incorrect ingress read as a failed run. History is recorded
+under `jepsen/store/elastickv-split-online-failover/`. The preflight workflow
+runs both scenarios using fresh stores. See the [safety evidence](../docs/evidence/online_split_safety_20261122/README.md)
+for the accompanying Lean and TLC checks and the remaining fault cases.
+
 ## Repeated splits
 
 `elastickv.split-workload --repeat-splits` opts into exactly three splits:
@@ -89,11 +111,11 @@ these data-quorum tests is explicitly stubbed; they do not establish TLS/auth
 or full cross-group root/data fault-injection acceptance. Deterministic controller
 regressions separately cover repeated cross-group moves and retained negative owners.
 
-Production activation remains opt-in through authentication and opcode flags,
-installed read/proposal/consumer hooks, a supported applied configuration and
+Namespace activation requires authentication, opcode support, installed
+read/proposal/consumer hooks, a supported applied configuration and
 all-current-apply-member negotiation. Flags alone cannot bypass namespace
-activation or authorize imported data. The Jepsen additions here are scheduling
-and oracle unit coverage, not a completed real-cluster fault-injection campaign.
+activation or authorize imported data. See [online split activation](../docs/design/2026_11_21_partial_online_split_activation.md)
+for the persistent RawKV default and its fallback behavior.
 
 Run focused coverage and the full harness suite from `jepsen/`:
 
