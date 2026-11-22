@@ -195,9 +195,27 @@ func (s *S3Server) s3BlobDurableTarget(replicas []S3BlobReplica, selfNodeID stri
 	return target, voterTarget, true, nil
 }
 
-func validateS3BlobMembership(replicas []S3BlobReplica, selfNodeID string) (int, error) {
+// Replication starts one push per entry. Its count is a copy count only if
+// neither the member identity nor the destination endpoint is repeated.
+func validateS3BlobDestinations(replicas []S3BlobReplica) error {
 	if len(replicas) < s3BlobMinimumDurableCopies {
-		return 0, s3BlobUnavailable("s3 chunkblob replication requires at least two members")
+		return s3BlobUnavailable("s3 chunkblob replication requires at least two members")
+	}
+	ids := make(map[string]bool, len(replicas))
+	addresses := make(map[string]bool, len(replicas))
+	for _, replica := range replicas {
+		if replica.NodeID == "" || replica.Address == "" || ids[replica.NodeID] || addresses[replica.Address] {
+			return s3BlobUnavailable("s3 blob members require distinct nonempty node IDs and addresses")
+		}
+		ids[replica.NodeID] = true
+		addresses[replica.Address] = true
+	}
+	return nil
+}
+
+func validateS3BlobMembership(replicas []S3BlobReplica, selfNodeID string) (int, error) {
+	if err := validateS3BlobDestinations(replicas); err != nil {
+		return 0, err
 	}
 	selfFound := false
 	selfVoter := false

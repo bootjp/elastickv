@@ -948,3 +948,33 @@ func BenchmarkShuffleS3BlobPeers(b *testing.B) {
 		})
 	}
 }
+
+func TestS3PutRejectsRepeatedDurabilityMember(t *testing.T) {
+	t.Parallel()
+	for _, field := range []string{"node", "address"} {
+		t.Run(field, func(t *testing.T) {
+			st := store.NewMVCCStore()
+			cluster := newFakeS3BlobCluster()
+			cluster.replicas = cluster.replicas[:2]
+			if field == "node" {
+				cluster.replicas[1].NodeID = cluster.self
+			} else {
+				cluster.replicas[1].Address = cluster.replicas[0].Address
+			}
+			s := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil,
+				WithS3BlobOffloadEnabled(true), WithS3BlobCluster(cluster),
+				WithS3BlobLocalStoreResolver(&mutableS3BlobLocalStore{store: st}),
+				withS3BlobOffloadGCReadyForTest())
+			rec := httptest.NewRecorder()
+			s.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-a", nil))
+			require.Equal(t, http.StatusOK, rec.Code)
+			rec = httptest.NewRecorder()
+			s.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-a/object", bytes.NewReader([]byte("payload"))))
+			require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+			require.Zero(t, cluster.pushCount())
+			rec = httptest.NewRecorder()
+			s.handle(rec, newS3TestRequest(http.MethodGet, "/bucket-a/object", nil))
+			require.Equal(t, http.StatusNotFound, rec.Code)
+		})
+	}
+}

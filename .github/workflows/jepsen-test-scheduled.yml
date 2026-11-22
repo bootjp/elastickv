@@ -53,7 +53,7 @@ jobs:
     if: ${{ inputs.faults-only || !inputs.workloads-json }}
     uses: ./.github/workflows/jepsen-hosted-faults.yml
     with:
-      adapters-json: '["redis","dynamodb","s3","grpc-raw","grpc-transactional","filesystem-overwrite","filesystem-rename","sqs-standard","sqs-htfifo"]'
+      adapters-json: '["redis","dynamodb","s3","s3-offload","grpc-raw","grpc-transactional","filesystem-overwrite","filesystem-rename","sqs-standard","sqs-htfifo"]'
       time-limit: ${{ inputs.time-limit || '300' }}
       repeat-faults: true
       min-fault-cycles: 2

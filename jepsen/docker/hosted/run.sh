@@ -4,7 +4,7 @@ set -euo pipefail
 fault=${1:?Usage: run.sh partition|kill|pause}
 case "$fault" in partition|kill|pause) ;; *) echo 'Unsupported fault' >&2; exit 2 ;; esac
 adapter=${2:-redis}
-case "$adapter" in redis|dynamodb|s3|grpc-raw|grpc-transactional|filesystem-overwrite|filesystem-rename|sqs-standard|sqs-htfifo|hotspot) ;; *) echo 'Unsupported adapter' >&2; exit 2 ;; esac
+case "$adapter" in redis|dynamodb|s3|s3-offload|grpc-raw|grpc-transactional|filesystem-overwrite|filesystem-rename|sqs-standard|sqs-htfifo|hotspot) ;; *) echo 'Unsupported adapter' >&2; exit 2 ;; esac
 if [[ $adapter == hotspot && $fault == pause ]]; then
   echo 'Hotspot acceptance supports partition and kill only' >&2
   exit 2
@@ -42,7 +42,7 @@ for value in "$time_limit" "$concurrency" "$key_count" "$max_writes" "$max_txn_l
     exit 2
   fi
 done
-if [[ "$adapter" == s3 || "$adapter" == grpc-* ]]; then
+if [[ "$adapter" == s3* || "$adapter" == grpc-* ]]; then
   # Preserve the aggregate budget while bounding each Knossos search.
   source jepsen/s3_budget.sh
   s3_budget "$key_count" "$max_writes"
@@ -107,6 +107,19 @@ go_version=$(awk '$1 == "toolchain" {sub(/^go/, "", $2); print $2}' go.mod)
 docker build --build-arg "GO_VERSION=$go_version" -t "$JEPSEN_IMAGE" jepsen/docker/hosted
 "${compose[@]}" up -d --wait n1 n2 n3
 
+workload_adapter=$adapter
+if [[ $adapter == s3-offload ]]; then
+  workload_adapter=s3
+  extra_args+=(--s3-offload)
+  for purpose in admin peer; do
+    token="$JEPSEN_SSH_DIR/$purpose.token"
+    (umask 077; openssl rand -hex 32 > "$token")
+    for node in n1 n2 n3; do
+      "${compose[@]}" cp "$token" "$node:/run/jepsen-$purpose.token"
+    done
+  done
+fi
+
 git rev-parse HEAD > "$artifact_dir/commit.txt"
 printf 'adapter=%s\nfault=%s\ntime-limit=%s\nfault-interval=5\nrecovery-time=%s\nrate=%s\nconcurrency=%s\nkey-count=%s\nmax-writes-per-key=%s\nmax-txn-length=%s\nrepeat-faults=%s\nmin-fault-cycles=%s\n' \
   "$adapter" "$fault" "$time_limit" "$recovery_time" "$rate" "$concurrency" "$key_count" "$max_writes" \
@@ -120,10 +133,21 @@ if [[ $adapter == hotspot ]]; then
     --rate "$rate" --concurrency "$concurrency" --max-writes-per-key "$max_writes")
 else
   workload=(lein run -m elastickv.hosted-fault-workload
-    --adapter "$adapter" --nodes 'n1,n2,n3' --ssh-user root --ssh-key /run/jepsen-ssh/id_ed25519
+    --adapter "$workload_adapter" --nodes 'n1,n2,n3' --ssh-user root --ssh-key /run/jepsen-ssh/id_ed25519
     --faults "$fault" --fault-interval 5 --time-limit "$time_limit"
     --recovery-time "$recovery_time" --rate "$rate" --concurrency "$concurrency" --key-count "$key_count"
     --max-writes-per-key "$max_writes" --max-txn-length "$max_txn_length"
     --min-fault-cycles "$min_cycles" "${extra_args[@]}")
 fi
 "${compose[@]}" run --rm control "${workload[@]}" 2>&1 | tee "$artifact_dir/control.log"
+if [[ $adapter == s3-offload ]]; then
+  for node in n1 n2 n3; do
+    "${compose[@]}" cp "$node:/var/log/elastickv-transport-metrics.prom" "$artifact_dir/$node.prom"
+  done
+  for op in put get; do
+    awk -v op="$op" '/^elastickv_s3_object_duration_seconds_count[{]/ && /mode="offload"/ && /outcome="success"/ && index($0, "operation=\"" op "\"") && $NF+0 > 0 { found=1 } END { exit !found }' "$artifact_dir"/*.prom || {
+      echo "Missing successful offloaded $op in node metrics" >&2
+      exit 1
+    }
+  done
+fi
