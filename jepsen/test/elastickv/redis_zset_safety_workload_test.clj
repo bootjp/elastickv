@@ -915,6 +915,25 @@
     (is (false? (:valid? impossible)))
     (is (contains? (:errors-by-kind impossible) :unstable-read-without-mutation))))
 
+(deftest many-timed-out-zadds-return-unknown-when-read-search-is-exhausted
+  (let [history (mapv #(assoc %1 :index %2)
+                      (concat
+                        (for [type [:invoke :info] process (range 12)]
+                          {:type type :process process :f :zadd :value ["m1" 49]})
+                        [{:type :invoke :process 12 :f :zadd :value ["m1" 7]}
+                         {:type :ok :process 12 :f :zadd :value ["m1" 7]}
+                         {:type :invoke :process 12 :f :zadd :value ["m1" 11]}
+                         {:type :ok :process 12 :f :zadd :value ["m1" 11]}
+                         {:type :invoke :process 12 :f :zrange-all}
+                         {:type :ok :process 12 :f :zrange-all :value [["m1" 11.0]]}
+                         {:type :invoke :process 12 :f :zrange-all}
+                         {:type :ok :process 12 :f :zrange-all :value [["m1" 49.0]]}])
+                      (range))
+        result (run-checker history)]
+    (is (= :unknown (:valid? result)))
+    (is (= 1 (get-in result [:errors-by-kind :inconclusive-zadd-history])))
+    (is (= :read-search-budget-exhausted (:cause (first (:first-errors result)))))))
+
 (deftest range-reads-cannot-switch-overlapping-write-order
   ;; Stability is not just a full-read property. Two non-overlapping bounded
   ;; reads cannot pick different serializations of the same completed writes.

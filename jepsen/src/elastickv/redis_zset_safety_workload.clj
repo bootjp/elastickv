@@ -51,6 +51,7 @@
             [jepsen.os.debian :as debian]
             [knossos.linear :as linear]
             [knossos.model :as model]
+            [knossos.search :as search]
             [taoensso.carmine :as car]))
 
 ;; ---------------------------------------------------------------------------
@@ -635,6 +636,18 @@
         [idx m]))
     remaining))
 
+;; A late ZADD stays in the search across acknowledged overwrites. Bound
+;; recursion depth and memo size for read searches that include one.
+(def ^:private max-late-zadd-read-operations 256)
+(def ^:private max-late-zadd-read-states 4096)
+
+(defn- read-search-exhausted! [budget limit]
+  (throw (ex-info "Timed-out ZADD read search exhausted its budget"
+                  {:kind :inconclusive-zadd-history
+                   :cause :read-search-budget-exhausted
+                   :budget budget
+                   :limit limit})))
+
 (defn- linearized-read-states
   "Enumerate possible member states at a read. Required mutations are
   committed tail candidates and must appear before the read. Optional
@@ -643,27 +656,38 @@
   [initial-states required optional]
   (let [items (vec (concat (map #(assoc % ::required? true) required)
                            (map #(assoc % ::required? false) optional)))
+        budget (when (some indeterminate-zadd? optional)
+                 (volatile! max-late-zadd-read-states))
         memo (atom {})]
-    (letfn [(step [states remaining]
+    (when (and budget (> (count items) max-late-zadd-read-operations))
+      (read-search-exhausted! :operations max-late-zadd-read-operations))
+    (letfn [(charge! [size]
+              (when (and budget (neg? (vswap! budget - size)))
+                (read-search-exhausted! :states max-late-zadd-read-states)))
+            (step [states remaining]
               (let [k [states remaining]]
-                (if (contains? @memo k)
-                  (get @memo k)
-                  (let [result (if (empty? remaining)
-                                 states
-                                 (reduce
-                                   (fn [acc [idx item]]
-                                     (let [remaining' (drop-index remaining idx)
-                                           applied (advance-states states item)
-                                           acc (if (::required? item)
-                                                 acc
-                                                 (into acc (step states remaining')))]
-                                       (if (seq applied)
-                                         (into acc (step applied remaining'))
-                                         acc)))
-                                   #{}
-                                   (enabled-indexed remaining)))]
-                    (swap! memo assoc k result)
-                    result))))]
+                (if-some [cached (get @memo k)]
+                  cached
+                  (do
+                    (charge! 1)
+                    (let [result
+                          (if (empty? remaining)
+                            states
+                            (reduce
+                              (fn [acc [idx item]]
+                                (let [remaining' (drop-index remaining idx)
+                                      applied (advance-states states item)
+                                      acc (if (::required? item)
+                                            acc
+                                            (into acc (step states remaining')))]
+                                  (if (seq applied)
+                                    (into acc (step applied remaining'))
+                                    acc)))
+                              #{}
+                              (enabled-indexed remaining)))]
+                      (charge! (max 0 (dec (count result))))
+                      (swap! memo assoc k result)
+                      result)))))]
       (step initial-states items))))
 
 (defn- possible-states-for-member
@@ -1142,7 +1166,10 @@
                                             {:score (get entries member) :bounds (read-bounds read)}
                                             (:index invoke) (:index complete)))
         history (sort-by :index (mapcat identity (concat writes observations)))
-        {:keys [valid? op cause]} (linear/analysis (->ZSetMember #{absent-state}) history)]
+        analysis (linear/start-analysis (->ZSetMember #{absent-state}) history)
+        {:keys [valid? op cause]} (try
+                                    (search/run analysis {:time-limit 30000})
+                                    (finally (search/abort! analysis :finished)))]
     (case valid?
       true nil
       false {:kind :unstable-read-without-mutation :member member :index (:index op)}
@@ -1376,6 +1403,19 @@
                                                bounds))
         @errors))))
 
+(defn- check-reads [mutations-by-m read-pairs]
+  (reduce (fn [errors {:keys [invoke complete] :as read}]
+            (try
+              (into errors (case (:f invoke)
+                             :zrange-all (check-zrange-all mutations-by-m read)
+                             :zrangebyscore (check-zrangebyscore mutations-by-m read)))
+              (catch clojure.lang.ExceptionInfo e
+                (let [details (ex-data e)]
+                  (if (= :read-search-budget-exhausted (:cause details))
+                    (reduced (conj errors (assoc details :index (:index complete))))
+                    (throw e))))))
+          [] read-pairs))
+
 (defn zset-safety-checker
   "Custom Jepsen checker: validates ZSet safety properties using a
   last-writer model combined with a concurrent-write relaxation."
@@ -1391,16 +1431,10 @@
                                       (#{:zrange-all :zrangebyscore}
                                        (:f invoke))))
                                pairs)
-            all-errors (reduce
-                         (fn [acc {:keys [invoke] :as pair}]
-                           (into acc
-                                 (case (:f invoke)
-                                   :zrange-all    (check-zrange-all mutations-by-m pair)
-                                   :zrangebyscore (check-zrangebyscore mutations-by-m pair))))
-                         []
-                         read-pairs)
-            all-errors (into all-errors
-                             (check-read-stability mutations-by-m read-pairs))
+            read-errors (check-reads mutations-by-m read-pairs)
+            all-errors (if (some #(= :read-search-budget-exhausted (:cause %)) read-errors)
+                         read-errors
+                         (into read-errors (check-read-stability mutations-by-m read-pairs)))
             by-kind (group-by :kind all-errors)
             ;; Vacuous-pass guard: if the run produced zero
             ;; successful reads, we have no evidence that the system
