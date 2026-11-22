@@ -2,10 +2,12 @@ package kv
 
 import (
 	"context"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/raftengine"
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -152,6 +154,98 @@ func TestTransactionManagerBatchesConcurrentRawCommits(t *testing.T) {
 	got, err = st.GetAt(context.Background(), []byte("k2"), ^uint64(0))
 	require.NoError(t, err)
 	require.Equal(t, []byte("v2"), got)
+}
+
+type rawBacklogProposer struct {
+	fakeProposer
+	first   chan struct{}
+	release chan struct{}
+}
+
+func (p *rawBacklogProposer) Propose(_ context.Context, _ []byte) (*raftengine.ProposalResult, error) {
+	index := p.calls.Add(1)
+	if index == 1 {
+		close(p.first)
+		<-p.release
+	}
+	return &raftengine.ProposalResult{CommitIndex: uint64(index)}, nil
+}
+
+func TestRawCommitDrainsSmallWriteBacklogAfterProposalStall(t *testing.T) {
+	t.Parallel()
+	proposer := &rawBacklogProposer{first: make(chan struct{}), release: make(chan struct{})}
+	release := sync.OnceFunc(func() { close(proposer.release) })
+	defer release()
+	manager := NewTransactionWithProposer(proposer)
+	defer manager.Close()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	const queued = 256
+	type outcome struct {
+		response *TransactionResponse
+		err      error
+	}
+	results := make(chan outcome, queued)
+	submit := func(i int, result chan<- outcome) {
+		request := &pb.Request{Ts: uint64(i + 1), Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte("buffered-" + strconv.Itoa(i)), Value: make([]byte, 1024)},
+		}}
+		response, err := manager.Commit(ctx, []*pb.Request{request})
+		result <- outcome{response: response, err: err}
+	}
+	first := make(chan outcome, 1)
+	go submit(0, first)
+	select {
+	case <-proposer.first:
+	case <-ctx.Done():
+		t.Fatal("first proposal never reached the proposer")
+	}
+	for i := 1; i <= queued; i++ {
+		go submit(i, results)
+	}
+	require.Eventually(t, func() bool {
+		manager.mu.Lock()
+		defer manager.mu.Unlock()
+		return len(manager.rawPending) == queued
+	}, 3*time.Second, time.Millisecond)
+	require.Empty(t, results)
+	release()
+
+	head := <-first
+	require.NoError(t, head.err)
+	require.Equal(t, uint64(1), head.response.CommitIndex)
+	for range queued {
+		result := <-results
+		require.NoError(t, result.err)
+		require.Equal(t, uint64(2), result.response.CommitIndex, "all queued writes should share the next proposal")
+	}
+	require.Equal(t, int32(2), proposer.calls.Load())
+}
+
+func TestRawBatchCoalescingBoundsBytesAndKeepsRequestGroupsIntact(t *testing.T) {
+	t.Parallel()
+	item := func(valueSizes ...int) *rawCommitItem {
+		reqs := make([]*pb.Request, 0, len(valueSizes))
+		for i, size := range valueSizes {
+			reqs = append(reqs, &pb.Request{Ts: uint64(i + 1), Mutations: []*pb.Mutation{
+				{Op: pb.Op_PUT, Key: []byte("key-" + strconv.Itoa(i)), Value: make([]byte, size)},
+			}})
+		}
+		return &rawCommitItem{reqs: reqs, encodedBytes: proto.Size(&pb.RaftCommand{Requests: reqs})}
+	}
+	first, second, third := item(200*1024), item(200*1024), item(200*1024)
+	large := item(300*1024, 300*1024)
+	last := item(1)
+	manager := NewTransactionWithProposer(nil)
+	manager.rawPending = []*rawCommitItem{first, second, third, large, last}
+
+	require.Equal(t, []*rawCommitItem{first, second}, manager.takeRawBatch())
+	require.Equal(t, []*rawCommitItem{third}, manager.takeRawBatch())
+	require.Equal(t, []*rawCommitItem{large}, manager.takeRawBatch())
+	require.Len(t, large.reqs, 2)
+	require.Equal(t, []*rawCommitItem{last}, manager.takeRawBatch())
+	require.Empty(t, manager.takeRawBatch())
 }
 
 func TestApplyRequestsCountsProposalFailureOnRaftApplyError(t *testing.T) {
