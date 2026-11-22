@@ -158,6 +158,9 @@
 (defn workload [{:keys [phase fixture redis-ports sqs-ports s3-ports]}]
   (let [nodes ["n1" "n2" "n3"]
         ports (zipmap nodes (mapv vector redis-ports sqs-ports s3-ports))
+        adapter-round (fn [ops]
+                        (apply gen/any (map-indexed (fn [i op]
+                          (gen/on-threads #{i} (gen/once {:f op}))) ops)))
         each (fn [f] (gen/each-thread (gen/once {:f f})))]
     (when-not (and (#{:seed :recover} phase) (re-matches #"[a-zA-Z0-9-]{1,64}" (or fixture ""))
                    (every? #(= 3 (count %)) [redis-ports sqs-ports s3-ports]))
@@ -166,11 +169,9 @@
            {:name (str "elastickv-protocol-" (name phase)) :nodes nodes :concurrency 3
             :ssh {:dummy true}
             :client (map->ProtocolClient {:ports ports :id fixture :phase phase})
-            :generator (gen/clients (gen/phases (apply gen/any
-                                      (map-indexed (fn [i ops]
-                                        (gen/on-threads #{i} (map #(hash-map :f %) ops)))
-                                        [[:ttl :multipart :visibility] [:visibility :ttl :multipart]
-                                         [:multipart :visibility :ttl]]))
+            :generator (gen/clients (gen/phases (adapter-round [:ttl :visibility :multipart])
+                                      (adapter-round [:multipart :ttl :visibility])
+                                      (adapter-round [:visibility :multipart :ttl])
                                       (when (= phase :seed)
                                         (mapcat (fn [_] [{:f :increment} {:f :read}]) (range increments)))
                                       (each :final-read)))

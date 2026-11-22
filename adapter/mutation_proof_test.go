@@ -28,11 +28,11 @@ type mutationEvidence struct {
 type mutationProofCase struct {
 	Evidence                       mutationEvidence
 	RetryRedis, RetryAWS, SkipRace bool
-	GRPCReason                     string
+	GRPCReason, GRPCMixedReason    string
 }
 
-func (e mutationEvidence) dispatchError(uncertainty, composed error) error {
-	causes := []error{errors.New("unclassified dispatch failure")}
+func (e mutationEvidence) causes(uncertainty, composed error) []error {
+	var causes []error
 	for _, flag := range []struct {
 		set bool
 		err error
@@ -45,7 +45,7 @@ func (e mutationEvidence) dispatchError(uncertainty, composed error) error {
 			causes = append(causes, flag.err)
 		}
 	}
-	return errors.Wrap(errors.Join(causes...), "dispatch")
+	return causes
 }
 
 // make lean-check supplies every input and its expected decisions from the
@@ -74,7 +74,12 @@ func TestAdapterMutationLeanConformance(t *testing.T) {
 			}
 			for _, uncertainty := range uncertainties {
 				for _, route := range []error{kv.ErrComposed1Violation, kv.ErrComposed1VersionGCd} {
-					c.check(t, c.Evidence.dispatchError(uncertainty, route))
+					causes := c.Evidence.causes(uncertainty, route)
+					if len(causes) == 1 {
+						c.check(t, errors.Wrap(causes[0], "dispatch"), c.GRPCReason)
+					}
+					mixed := append([]error{errors.New("unclassified dispatch failure")}, causes...)
+					c.check(t, errors.Wrap(errors.Join(mixed...), "dispatch"), c.GRPCMixedReason)
 				}
 			}
 		})
@@ -82,7 +87,7 @@ func TestAdapterMutationLeanConformance(t *testing.T) {
 	require.Len(t, seen, 64)
 }
 
-func (c mutationProofCase) check(t *testing.T, err error) {
+func (c mutationProofCase) check(t *testing.T, err error, grpcReason string) {
 	t.Helper()
 	require.Equal(t, c.RetryRedis, isRetryableRedisTxnErr(err), "%+v", err)
 	require.Equal(t, c.RetryAWS, isRetryableTransactWriteError(err))
@@ -93,7 +98,7 @@ func (c mutationProofCase) check(t *testing.T, err error) {
 	require.Len(t, details, 1)
 	info, ok := details[0].(*errdetails.ErrorInfo)
 	require.True(t, ok)
-	require.Equal(t, c.GRPCReason, info.GetReason())
+	require.Equal(t, grpcReason, info.GetReason())
 	for _, normalize := range []func(error) error{
 		normalizeDynamoWriteDispatchError, normalizeS3MetadataDispatchError, normalizeSQSDispatchError,
 	} {

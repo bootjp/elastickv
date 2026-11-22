@@ -28,8 +28,10 @@ inductive GRPCFailure where
   | indeterminate | notAdmitted | aborted
   deriving DecidableEq, Repr
 
-def grpcFailure (e : Evidence) : GRPCFailure :=
-  if e.uncertain || e.fenced || e.locked then .indeterminate
+-- Projection of unmarked dispatch errors. Isolated coordinator witnesses
+-- use their own public evidence path. A secondary or joined cause is mixed.
+def grpcFailure (e : Evidence) (mixed : Bool := false) : GRPCFailure :=
+  if e.uncertain || mixed || e.fenced || e.locked then .indeterminate
   else if e.circuitOpen then .notAdmitted
   else if e.conflict then .aborted
   else .indeterminate
@@ -66,16 +68,19 @@ structure Case where
   retryAWS : Bool
   skipRace : Bool
   grpcReason : String
+  grpcMixedReason : String
   deriving Lean.ToJson
+
+private def GRPCFailure.reason : GRPCFailure → String
+  | .indeterminate => "INDETERMINATE"
+  | .notAdmitted => "NOT_ADMITTED"
+  | .aborted => "PROVEN_NONCOMMIT"
 
 def cases : List Case := List.ofFn fun (i : Fin 64) =>
   let bit := i.val.testBit
   let e := Evidence.mk (bit 0) (bit 1) (bit 2) (bit 3) (bit 4) (bit 5)
-  let reason := match grpcFailure e with
-    | .indeterminate => "INDETERMINATE"
-    | .notAdmitted => "NOT_ADMITTED"
-    | .aborted => "PROVEN_NONCOMMIT"
-  ⟨e, retry .redis e, retry .aws e, skipReceiveRace e, reason⟩
+  ⟨e, retry .redis e, retry .aws e, skipReceiveRace e,
+    (grpcFailure e).reason, (grpcFailure e true).reason⟩
 
 end AdapterMutation
 

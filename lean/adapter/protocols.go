@@ -75,22 +75,22 @@ func transactionSource(file, name string) string {
 	if len(groups) != 1 {
 		panic("expected exactly one transaction literal in " + name)
 	}
-	return transactionFields(groups[0])
+	return transactionFields(groups[0], name)
 }
 
-func transactionFields(group *ast.CompositeLit) string {
+func transactionFields(group *ast.CompositeLit, name string) string {
 	var fields []string
 	for _, e := range group.Elts {
 		field, ok := e.(*ast.KeyValueExpr)
 		if !ok {
-			panic("expected named transaction field in ")
+			panic("expected named transaction field in " + name)
 		}
 		if elems, ok := field.Value.(*ast.CompositeLit); ok && source(field.Key) == "Elems" {
 			for _, elem := range elems.Elts {
 				var parts []string
 				members, ok := elem.(*ast.CompositeLit)
 				if !ok {
-					panic("expected transaction operation literal in ")
+					panic("expected transaction operation literal in " + name)
 				}
 				for _, member := range members.Elts {
 					parts = append(parts, source(member))
