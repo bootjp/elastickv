@@ -126,7 +126,13 @@
                  :increment (lua! redis id true)
                  (:read :final-read) (lua! redis id false)))
         (catch Exception e
-          (assoc op :node node :type :fail :error (.getMessage e)))))))
+          (let [{:keys [status body]} (ex-data e)]
+            (cond-> (assoc op :node node :type :fail :error (.getMessage e))
+              status (assoc :http-status status
+                            :s3-code (when (string? body) (second (re-find #"<Code>([^<]+)</Code>" body)))
+                            :fixture-line (some (fn [^StackTraceElement frame]
+                              (when (str/includes? (.getClassName frame) "s3_workload$check_")
+                                (.getLineNumber frame))) (.getStackTrace e))))))))))
 
 (defn transition-checker [phase nodes]
   (reify checker/Checker
