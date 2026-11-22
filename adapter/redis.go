@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"log"
 	"log/slog"
 	"net"
@@ -26,7 +25,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/redis/go-redis/v9"
 	"github.com/tidwall/redcon"
-	"google.golang.org/grpc/status"
 )
 
 const (
@@ -435,21 +433,9 @@ func writeRedisError(conn redcon.Conn, err error) {
 	conn.WriteError(msg)
 }
 
-func isRedisTransportUncertain(err error) bool {
-	if err == nil {
-		return false
-	}
-	if _, ok := status.FromError(err); ok {
-		return true
-	}
-	var netErr net.Error
-	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) ||
-		errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.As(err, &netErr)
-}
-
 func isRedisIndeterminate(err error) bool {
 	return errors.Is(err, kv.ErrTransactionOutcomeUnknown) ||
-		errors.Is(err, raftengine.ErrLeadershipLost) || isRedisTransportUncertain(err)
+		isIndeterminateMutationDispatchFailure(err)
 }
 
 func isRedisNotLeaderReply(err error) bool {

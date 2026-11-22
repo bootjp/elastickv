@@ -9,7 +9,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -298,8 +297,7 @@ func isTerminalProxyTxnError(err error) bool {
 		isRedisExecTerminalProxyError(err) ||
 		isTransientLeaderRedisError(err) ||
 		isRedisNotLeaderReply(err) ||
-		errors.Is(err, raftengine.ErrLeadershipLost) ||
-		isRedisTransportUncertain(err)
+		isIndeterminateMutationDispatchFailure(err)
 }
 
 func isRedisExecTerminalProxyError(err error) bool {

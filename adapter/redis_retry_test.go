@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -804,4 +805,19 @@ func readTestBulk(n int64, reader io.Reader) []byte {
 		panic(err)
 	}
 	return bulk
+}
+
+func TestRedisRetryStopsAfterLeadershipLossWithConflict(t *testing.T) {
+	t.Parallel()
+	var server RedisServer
+	attempts := 0
+	err := server.retryRedisWrite(t.Context(), func() error {
+		attempts++
+		if attempts == 1 {
+			return errors.Join(raftengine.ErrLeadershipLost, store.ErrWriteConflict)
+		}
+		return nil
+	})
+	require.Equal(t, 1, attempts)
+	require.ErrorIs(t, err, kv.ErrTransactionOutcomeUnknown)
 }

@@ -8,6 +8,7 @@ test:
 
 lean-check:
 	cd lean && for proof in *.lean; do lean -DwarningAsError=true "$$proof" || exit 1; done
+	sh lean/adapter/check.sh
 
 run:
 	go run cmd/server/demo.go

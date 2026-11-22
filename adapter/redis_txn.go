@@ -3408,7 +3408,7 @@ func (r *RedisServer) firstExecAttempt(dispatchCtx context.Context, queue []redc
 }
 
 func isAmbiguousRedisExecDispatchErr(err error) bool {
-	return !errors.Is(err, kv.ErrTransactionOutcomeUnknown) && !isRedisTransportUncertain(err) &&
+	return !isRedisIndeterminate(err) &&
 		errors.Is(err, store.ErrWriteConflict)
 }
 
