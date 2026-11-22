@@ -65,6 +65,17 @@ write. History lives under `jepsen/store/elastickv-split-target-membership/`.
 The log directory also preserves the before/after attempt stamps and cache
 observations. See the [membership evidence](../docs/evidence/online_split_membership_20261122/README.md).
 
+The scheduled stress workflow includes `split-membership` in its default
+matrix. To run that workload by itself on a branch:
+
+```sh
+gh workflow run jepsen-test-scheduled.yml --ref BRANCH -f 'workloads-json=["split-membership"]'
+```
+
+The job uploads `jepsen-store-split-membership` with the history and checker
+result and `jepsen-split-membership-logs` with all four node logs and the
+cutover and ingress markers.
+
 ## Repeated splits
 
 `elastickv.split-workload --repeat-splits` opts into exactly three splits:
