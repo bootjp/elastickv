@@ -1,5 +1,7 @@
 # Overlap legacy leader WAL sync with follower replication
 
+Status: implemented; VM150 performance validation is recorded separately.
+
 The synchronous etcd engine currently persists a Ready before dispatching its
 messages. A VM150 diagnostic at 100/300/1000 offered requests/s confirms almost
 one Raft entry per raw batch at 300 requests/s, with both Raft and FSM WAL sync
@@ -28,3 +30,9 @@ snapshot/MVCC publication tests. Measure before/after with no profiles in ABBA
 on exclusive VM150, original 100/300/500/1000 requests/s x90s, concurrency32,
 read50%, Sync, TLS, unique writes, and all ACK reads through three ingresses.
 Latency benefits and throughput are empirical; no fault-time bound is promised.
+
+The real engine/WAL regression failed before the change because the follower
+append could not start while leader Save was held. It passes after the change
+without ACK, FSM effects, or applied-index publication before release. Save
+failure, deferred responses, deep-copy ownership, exactly-once dispatch, and
+eligibility boundary tests pass. No sync mode or batch policy changed.
