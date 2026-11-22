@@ -565,8 +565,8 @@ func promoteSplitJobTarget(ctx context.Context, client SplitPromotionClient, job
 		resp, err := client.PromoteStagedVersions(attemptCtx, &pb.PromoteStagedVersionsRequest{
 			JobId:           job.JobID,
 			Cursor:          cursor,
-			MaxVersions:     splitMaintenanceMaxVersions(job),
-			MaxBytes:        splitMaintenanceMaxBytes(job),
+			MaxVersions:     defaultSplitPromotionMaxVersions,
+			MaxBytes:        defaultSplitPromotionMaxBytes,
 			MaxScannedBytes: defaultSplitPromotionMaxScanned,
 		})
 		cancel()

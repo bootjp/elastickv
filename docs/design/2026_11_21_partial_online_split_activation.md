@@ -142,17 +142,6 @@ A target lock is a freshness violation during initial preparation. After a
 source seal, transient locks keep target reattestation/Ready retryable instead
 of terminalizing the job. State and receipts remain unchanged until they drain.
 
-## Online maintenance admission
-
-Online RawKV jobs limit each target promotion and source version-cleanup
-proposal to 256 versions and 512 KiB of effects. The existing 16 MiB scan
-budget and cursor/oversized-row progress rules remain in force. Promotion
-and cleanup still use synchronous indexed Raft application and the same
-ownership barriers. This limits the uninterrupted foreground apply work per
-proposal; it does not guarantee a latency bound for disk synchronization.
-Legacy jobs retain their existing page budgets. Validate this choice against
-identical Linux load, including completion time and complete ACK readback.
-
 ## Unrelated prefix mutations in captured batches
 
 A full batch may contain a captured point request and prefix requests whose
@@ -164,3 +153,11 @@ Reject the entire atomic entry if any selected capture key would change.
 The explicit unfiltered shadow primitive still rejects prefix writes. An
 intersecting prefix request continues to invalidate the session before normal
 application. Preserve per-request outcomes, failure latching and atomic replay.
+
+## Maintenance latency evaluation
+
+A 256-version/512-KiB online maintenance-page experiment did not consistently
+improve successful write p99 in the exclusive Linux A/B/B/A evaluation. Keep
+the existing 1,024-version/4-MiB maintenance budgets and 16-MiB scan bound.
+The experiment and ordinary synchronous WAL stalls are retained in the
+evidence; reduced page size alone is not a demonstrated p99 correction.
