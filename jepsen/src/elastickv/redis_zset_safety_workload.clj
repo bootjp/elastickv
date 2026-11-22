@@ -1180,14 +1180,15 @@
                :when (and (not= first-state second-state)
                           (not-any? #(or (mutation-could-affect-read-gap?
                                            % first-inv-idx second-cmp-idx)
-                                         ;; An indeterminate ZADD may apply after
-                                         ;; its reply timeout. It can explain its
-                                         ;; own score until a read requires it.
+                                         ;; A later read must require this ZADD
+                                         ;; before it can explain a delayed score.
+                                         ;; Ambiguous producers cannot be reused
+                                         ;; for an unbounded number of changes.
                                          (and (= :zadd (:f %))
                                               (pre-read-info? % first-inv-idx)
                                               (score-eq? (:score %) (:score second-state))
-                                              (> (get observed (:invoke-idx %) Long/MAX_VALUE)
-                                                 first-cmp-idx)))
+                                              (when-let [required-idx (get observed (:invoke-idx %))]
+                                                (< first-cmp-idx required-idx (inc second-cmp-idx)))))
                                     (get mutations-by-m member [])))]
            {:kind :unstable-read-without-mutation
             :first-index first-cmp-idx

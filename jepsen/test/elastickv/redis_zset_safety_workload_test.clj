@@ -892,6 +892,25 @@
                                 [{:type :invoke :process 1 :f :zrange-all :index 10}
                                  {:type :ok :process 1 :f :zrange-all :value [["m1" 49.0]] :index 11}])))))))
 
+(deftest ambiguous-zadds-cannot-explain-more-transitions-than-writes
+  (let [scores [1 1 2 2]
+        history (mapv #(assoc %1 :index %2)
+                      (concat
+                        (map-indexed (fn [process score]
+                                       {:type :invoke :process process :f :zadd :value ["m1" score]})
+                                     scores)
+                        (map-indexed (fn [process score]
+                                       {:type :info :process process :f :zadd :value ["m1" score]})
+                                     scores)
+                        (mapcat (fn [score]
+                                  [{:type :invoke :process 4 :f :zrange-all}
+                                   {:type :ok :process 4 :f :zrange-all :value [["m1" score]]}])
+                                [1.0 2.0 1.0 2.0 1.0]))
+                      (range))
+        result (run-checker history)]
+    (is (false? (:valid? result)))
+    (is (contains? (:errors-by-kind result) :unstable-read-without-mutation))))
+
 (deftest range-reads-cannot-switch-overlapping-write-order
   ;; Stability is not just a full-read property. Two non-overlapping bounded
   ;; reads cannot pick different serializations of the same completed writes.
