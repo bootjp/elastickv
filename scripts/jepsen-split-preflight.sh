@@ -10,9 +10,9 @@ cleanup() {
     kill -TERM "$pid" 2>/dev/null || true
   done
   wait || true
-  for marker in before-publish published-attempt held-n3 caught-n3 caught-n4; do
-    if [[ -f "$work/$marker" && -n "${logs:-}" ]]; then
-      cp "$work/$marker" "$logs/$marker"
+  for marker in "$work"/{before-publish,published-attempt,held-n3,caught-n3,caught-n4,killed-n3} "$work"/partition-drop-*; do
+    if [[ -f "$marker" && -n "${logs:-}" ]]; then
+      cp "$marker" "$logs/"
     fi
   done
   rm -rf "$work"
@@ -26,9 +26,14 @@ mkdir -p "$logs"
 logs=$(cd "$logs" && pwd -P)
 unset SPLIT_MEMBERSHIP_FIXTURE
 build_args=()
+export SPLIT_MEMBERSHIP_FAULT=${SPLIT_MEMBERSHIP_FAULT:-none}
+case "$SPLIT_MEMBERSHIP_FAULT" in
+  none|kill|partition|pause) ;;
+  *) echo "Invalid SPLIT_MEMBERSHIP_FAULT: $SPLIT_MEMBERSHIP_FAULT" >&2; exit 2 ;;
+esac
 for arg in "$@"; do
   if [[ "$arg" == --online-member-change ]]; then
-    python3 scripts/jepsen-split-membership-overlay.py "$PWD" "$work/overlay"
+    python3 scripts/jepsen-split-membership-overlay.py "$PWD" "$work/overlay" "$SPLIT_MEMBERSHIP_FAULT"
     build_args=(-overlay "$work/overlay/overlay.json")
     export SPLIT_MEMBERSHIP_FIXTURE="$work"
   fi
@@ -43,25 +48,48 @@ openssl rand -hex 32 > "$work/token"
 export RAFTADMIN_TLS=true RAFTADMIN_TLS_CA_CERT="$work/cert.pem"
 export ELASTICKV_ENABLE_MIGRATION_IMPORT_OPCODE=true ELASTICKV_ENABLE_MIGRATION_PROMOTE_OPCODE=true ELASTICKV_ENABLE_MIGRATION_CLEANUP_OPCODE=true
 peers='1=n1@127.0.0.1:25101,n2@127.0.0.1:25102,n3@127.0.0.1:25103;2=n1@127.0.0.1:25201,n2@127.0.0.1:25202,n3@127.0.0.1:25203'
-for n in 1 2 3; do
+launch_node() {
+  local n=$1 node_peers=$2 pid
+  if [[ ! -f "$work/n$n.pid" ]]; then : > "$logs/n$n.log"; fi
   SPLIT_MEMBERSHIP_NODE="n$n" "$work/server" --raftId "n$n" --raftEngine etcd --raftDataDir "$work/data$n" \
     --address "127.0.0.1:2510$n" --raftGroups "1=127.0.0.1:2510$n,2=127.0.0.1:2520$n" \
-    --raftGroupPeers "$peers" --shardRanges ':=1' --redisAddress "127.0.0.1:2530$n" \
+    --raftGroupPeers "$node_peers" --shardRanges ':=1' --redisAddress "127.0.0.1:2530$n" \
     --metricsAddress '' --pprofAddress '' --dynamoAddress '' \
     --grpcTLSCAFile "$work/cert.pem" --grpcTLSCertFile "$work/cert.pem" --grpcTLSKeyFile "$work/key.pem" \
-    --splitMigrationTokenFile "$work/token" --splitMigrationPeerAuthEnforced > "$logs/n$n.log" 2>&1 &
-  pids+=("$!")
-  echo "$!" > "$work/n$n.pid"
+    --splitMigrationTokenFile "$work/token" --splitMigrationPeerAuthEnforced >> "$logs/n$n.log" 2>&1 &
+  pid=$!
+  printf '%s\n' "$pid" > "$work/n$n.pid.tmp"
+  mv "$work/n$n.pid.tmp" "$work/n$n.pid"
+}
+restartable_target_leader() (
+  local server_pid=''
+  trap 'if [[ -n "$server_pid" ]]; then kill -TERM "$server_pid" 2>/dev/null || true; wait "$server_pid" || true; fi; exit 0' TERM
+  launch_node 3 "$peers"
+  server_pid=$(< "$work/n3.pid")
+  local first_pid=$server_pid exit_code=0
+  wait "$server_pid" || exit_code=$?
+  server_pid=''
+  [[ "$exit_code" -eq 137 ]] || exit 1
+  printf '%s %s\n' "$first_pid" "$exit_code" > "$work/killed-n3.tmp"
+  mv "$work/killed-n3.tmp" "$work/killed-n3"
+  until [[ -f "$work/restart-n3" ]]; do sleep 0.1; done
+  launch_node 3 "$peers"
+  server_pid=$(< "$work/n3.pid")
+  wait "$server_pid"
+)
+for n in 1 2 3; do
+  if [[ "$n" == 3 && -n "${SPLIT_MEMBERSHIP_FIXTURE:-}" && "$SPLIT_MEMBERSHIP_FAULT" == kill ]]; then
+    restartable_target_leader &
+    pids+=("$!")
+  else
+    launch_node "$n" "$peers"
+    pids+=("$(< "$work/n$n.pid")")
+  fi
 done
 if [[ -n "${SPLIT_MEMBERSHIP_FIXTURE:-}" ]]; then
   joining_peers='1=n1@127.0.0.1:25101,n2@127.0.0.1:25102,n3@127.0.0.1:25103,n4@127.0.0.1:25104;2=n1@127.0.0.1:25201,n2@127.0.0.1:25202,n3@127.0.0.1:25203,n4@127.0.0.1:25204'
-  SPLIT_MEMBERSHIP_NODE=n4 "$work/server" --raftId n4 --raftEngine etcd --raftDataDir "$work/data4" \
-    --address 127.0.0.1:25104 --raftGroups '1=127.0.0.1:25104,2=127.0.0.1:25204' \
-    --raftGroupPeers "$joining_peers" --shardRanges ':=1' --redisAddress 127.0.0.1:25304 \
-    --metricsAddress '' --pprofAddress '' --dynamoAddress '' \
-    --grpcTLSCAFile "$work/cert.pem" --grpcTLSCertFile "$work/cert.pem" --grpcTLSKeyFile "$work/key.pem" \
-    --splitMigrationTokenFile "$work/token" --splitMigrationPeerAuthEnforced > "$logs/n4.log" 2>&1 &
-  pids+=("$!")
+  launch_node 4 "$joining_peers"
+  pids+=("$(< "$work/n4.pid")")
 fi
 for n in 1 2 3; do
   ready=false

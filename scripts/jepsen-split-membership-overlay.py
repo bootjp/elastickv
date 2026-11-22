@@ -19,7 +19,8 @@ def edit(name, replacements, appended=""):
         if source.count(old) != 1:
             raise SystemExit(f"fixture anchor changed: {name}: {old!r}")
         source = source.replace(old, new, 1)
-    overlay = out / path.name
+    overlay = out / name
+    overlay.parent.mkdir(parents=True, exist_ok=True)
     overlay.write_text(source + appended)
     replace[str(path)] = str(overlay)
 
@@ -189,4 +190,43 @@ edit(
         ),
     ],
 )
+if sys.argv[3] == "partition":
+    edit(
+        "internal/raftengine/etcd/engine.go",
+        [
+            (
+                "func (e *Engine) dispatchTransport(ctx context.Context, req dispatchRequest) error {",
+                """func (e *Engine) dispatchTransport(ctx context.Context, req dispatchRequest) error {
+	if err := e.testSplitMembershipPartition(req.msg); err != nil {
+		return err
+	}""",
+            ),
+        ],
+        """
+// Intercept only group-2 Raft traffic across the n4 partition. Public and
+// admin RPCs remain connected so the test can inspect the isolated replica.
+func (e *Engine) testSplitMembershipPartition(msg raftpb.Message) error {
+	candidate := DeriveNodeID("n4")
+	if e.groupID != 2 || (e.nodeID != candidate && msg.GetTo() != candidate) {
+		return nil
+	}
+	dir := os.Getenv("SPLIT_MEMBERSHIP_FIXTURE")
+	if _, err := os.Stat(filepath.Join(dir, "partition-n4")); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if e.nodeID != candidate {
+		marker := filepath.Join(dir, "partition-drop-" + os.Getenv("SPLIT_MEMBERSHIP_NODE"))
+		if f, err := os.OpenFile(marker, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600); err == nil {
+			_, _ = f.WriteString("group 2 to n4\\n")
+			_ = f.Close()
+		}
+	}
+	return errors.New("split membership test dropped partitioned Raft traffic")
+}
+""",
+    )
+
 (out / "overlay.json").write_text(json.dumps({"Replace": replace}))

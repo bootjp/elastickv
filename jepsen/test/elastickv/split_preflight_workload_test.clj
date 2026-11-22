@@ -152,3 +152,27 @@
                           (= path [10 :type]) (assoc-in [10 :value] [2 4303]))]
         (is (false? (valid? bad-history)) (str path))))
     (is (false? (valid? (pop h))))))
+
+(deftest target-membership-requires-evidence-of-the-selected-fault
+  (let [base (target-membership-history)
+        cert [7 :value :fault]
+        valid? (fn [fault h] (:valid? (checker/check (pf/membership-checker fault) {} h {})))]
+    (doseq [[kind evidence corrupt]
+            [[:kill {:kind :kill :victim "n3" :exit-code 137 :killed-pid 54 :restarted-pid 81
+                     :old-term 4 :replacement "n4" :replacement-term 5 :restart-applied 73}
+              {:exit-code 0 :restarted-pid 54 :replacement-term 4 :restart-applied 72}]
+             [:partition {:kind :partition :victim "n4" :blocked-sender "n3" :threshold 72
+                          :isolated-applied 70 :rejected-index 71 :rejection-gate :namespace-admission
+                          :rejection "code = FailedPrecondition desc = namespace member 4 support/configuration/activation unproven: namespace admission protocol is not proven for this configuration"}
+              {:blocked-sender nil :isolated-applied 72 :rejected-index 72 :rejection-gate :catch-up
+               :rejection "context deadline exceeded"}]
+             [:pause {:kind :pause :victim "n4" :pid 54 :resumed-pid 54
+                      :stopped-state "T" :publication-state "T" :resumed-state "S" :published-version 4}
+              {:publication-state "S" :resumed-state "T" :resumed-pid 81 :published-version 3}]]]
+      (let [with-fault (assoc-in base cert evidence)]
+        (is (valid? kind with-fault) (str kind))
+        (is (false? (valid? kind base)) (str kind " with no injection"))
+        (is (false? (valid? :none with-fault)) (str kind " under baseline mode"))
+        (is (false? (valid? kind (assoc-in with-fault [20 :value] [2 4303]))) (str kind " with a resurrected delete"))
+        (doseq [[k bad] corrupt]
+          (is (false? (valid? kind (assoc-in base cert (assoc evidence k bad)))) (str kind " " k)))))))

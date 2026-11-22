@@ -26,11 +26,14 @@ on:
       membership-only:
         type: boolean
         default: false
+      membership-fault:
+        type: string
+        default: none
 permissions:
   contents: read
 jobs:
   voter-pause:
-    name: ${{ inputs.membership-only && 'Jepsen (split membership)' || 'voter-pause' }}
+    name: ${{ inputs.membership-only && format('Jepsen (split membership, {0})', inputs.membership-fault) || 'voter-pause' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -69,6 +72,8 @@ jobs:
         if: ${{ !inputs.membership-only }}
         run: PREFLIGHT_LOG_DIR="$RUNNER_TEMP/failover-logs" bash scripts/jepsen-split-preflight.sh --online-leader-failover
       - name: Promote a target learner after the final cutover confirmation
+        env:
+          SPLIT_MEMBERSHIP_FAULT: ${{ inputs.membership-fault || 'none' }}
         run: PREFLIGHT_LOG_DIR="$RUNNER_TEMP/membership-logs" bash scripts/jepsen-split-preflight.sh --online-member-change
       - name: Archive Jepsen history
         if: always()
@@ -79,7 +84,7 @@ jobs:
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: ${{ inputs.membership-only && format('jepsen-split-membership-{0}', github.run_attempt) || 'jepsen-split-preflight-pause' }}
+          name: ${{ inputs.membership-only && format('jepsen-split-membership-{0}-{1}', inputs.membership-fault, github.run_attempt) || 'jepsen-split-preflight-pause' }}
           path: |
             ${{ runner.temp }}/preflight-history.tar.gz
             ${{ runner.temp }}/preflight-logs/

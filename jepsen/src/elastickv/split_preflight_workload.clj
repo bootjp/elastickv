@@ -1,5 +1,5 @@
 (ns elastickv.split-preflight-workload
-  "Exercise catalog preflight and online split recovery with a stopped voter."
+  "Exercise catalog preflight and online split recovery under faults."
   (:refer-clojure :exclude [run!])
   (:require [clojure.data.json :as json]
             [clojure.java.io :as io]
@@ -355,9 +355,9 @@
                (when (= "LEADER" (:state s)) (assoc s :node node))))
            nodes)))
 
-(defn- candidate-role [group]
+(defn- candidate-role [group observer]
   (some-> (re-find #"(?s)id: \"n4\"\s+address: \"[^\"]+\"\s+suffrage: \"([^\"]+)\""
-                   (group-admin group "n4" "configuration"))
+                   (group-admin group observer "configuration"))
           second str/lower-case))
 
 (defn- wait-candidate! [group min-index role?]
@@ -365,8 +365,8 @@
     #(let [s (group-status group "n4")]
        (when (and (>= (:applied_index s) min-index)
                   (>= (:configuration_index s) min-index)
-                  (role? (candidate-role group)))
-         (assoc s :role (candidate-role group))))))
+                  (role? (candidate-role group "n4")))
+         (assoc s :role (candidate-role group "n4"))))))
 
 (defn- change-index [output]
   (or (some-> (re-find #"index:\s*(\d+)" output) second parse-long)
@@ -403,43 +403,138 @@
   (let [boundary (.encodeToString (java.util.Base64/getEncoder) (.getBytes split-key "UTF-8"))]
     (:raft_group_id (some #(when (= boundary (:start %)) %) (:routes catalog)))))
 
-(defn- add-and-promote! [active]
+(defn- require-unpublished! [leader job old-version]
+  (let [s (sample leader job)
+        catalog (routes leader)]
+    (when-not (and (= "SPLIT_JOB_PHASE_CUTOVER" (:phase s))
+                   (= old-version (:catalog_version catalog)) (= 1 (moving-owner catalog)))
+      (throw (ex-info "Fault missed the pre-publication window" {:job s :catalog catalog})))))
+
+(defn- promote-test-learner! [leader added threshold]
+  (change-index (group-admin 2 (:node leader) "promote_learner" "n4"
+                             (str added) (str threshold))))
+
+(defn- learner-rejection-gate [rejection]
+  (when (and (string? rejection) (str/includes? rejection "code = FailedPrecondition"))
+    (cond
+      (str/includes? rejection "has not caught up to min_applied_index") :catch-up
+      (and (str/includes? rejection "support/configuration/activation unproven")
+           (str/includes? rejection "namespace admission protocol is not proven for this configuration"))
+      :namespace-admission)))
+
+(defn- rejected-while-partitioned! [added]
+  (let [leader (leader! 2)
+        target (:node leader)
+        threshold (:commit_index leader)
+        behind (get (group-status 2 "n4") :applied_index 0)
+        marker (path (str "partition-drop-" target))]
+    (when-not (and (<= added threshold) (< behind threshold)
+                   (contains? #{"learner" "nonvoter"} (candidate-role 2 target)))
+      (throw (ex-info "Expected an isolated learner behind the target commit index"
+                      {:added added :commit threshold :applied behind})))
+    (poll! 10 "Target Raft dispatch did not hit the partition"
+           #(and (.exists (io/file marker)) (= "group 2 to n4" (str/trim (slurp marker)))))
+    (let [rejection (try (promote-test-learner! leader added threshold)
+                         (catch clojure.lang.ExceptionInfo e (:stderr (ex-data e))))
+          gate (learner-rejection-gate rejection)
+          after (group-status 2 target)]
+      (when-not (and gate (= added (:configuration_index after))
+                     (contains? #{"learner" "nonvoter"} (candidate-role 2 target)))
+        (throw (ex-info "Isolated learner was not rejected by an admission or catch-up guard"
+                        {:rejection rejection :configuration after})))
+      (io/delete-file (path "partition-n4"))
+      {:kind :partition :victim "n4" :blocked-sender target :threshold threshold
+       :isolated-applied behind :rejected-index (:configuration_index after)
+       :rejection-gate gate :rejection rejection})))
+
+(defn- node-pid [node]
+  (str/trim (slurp (path (str node ".pid")))))
+
+(defn- kill-and-restart-target! [promoted]
+  (let [old (leader! 2)
+        pid (node-pid "n3")]
+    (when-not (= "n3" (:node old))
+      (throw (ex-info "Expected n3 to lead the target group before SIGKILL" old)))
+    (run! "kill" "-KILL" pid)
+    (let [[killed-pid exit-code] (poll! 10 "No SIGKILL exit was observed" #(fixture-ints "killed-n3" 2))
+          replacement (poll! 20 "Target did not elect a new leader while n3 was down"
+                       #(some (fn [node]
+                                (let [s (group-status 2 node)]
+                                  (when (and (= "LEADER" (:state s)) (= node (:leader_id s))
+                                             (> (:term s) (:term old)) (>= (:applied_index s) promoted))
+                                    (assoc s :node node))))
+                              ["n1" "n2" "n4"]))]
+      (when-not (and (= (parse-long pid) killed-pid) (= 137 exit-code))
+        (throw (ex-info "Wrong target process kill receipt" {:expected pid :killed killed-pid :exit exit-code})))
+      (spit (path "restart-n3") "restart")
+      (let [restarted (poll! 20 "Restarted n3 did not rejoin the target group"
+                         #(when-not (= pid (node-pid "n3"))
+                            (when-let [s (try (group-status 2 "n3") (catch clojure.lang.ExceptionInfo _ nil))]
+                              (when (and (>= (:configuration_index s) promoted)
+                                         (>= (:applied_index s) promoted)) s))))]
+        (transfer-test-leader! 2 replacement "n3")
+        {:kind :kill :victim "n3" :killed-pid killed-pid :exit-code exit-code
+         :restarted-pid (parse-long (node-pid "n3")) :old-term (:term old)
+         :replacement (:node replacement) :replacement-term (:term replacement)
+         :restart-applied (:applied_index restarted)}))))
+
+(defn- publish-with-paused-voter! [leader boundary]
+  (let [pid (node-pid "n4")]
+    (run! "kill" "-STOP" pid)
+    (try
+      (let [stopped (poll! 10 "New voter did not stop" #(let [s (process-state pid)] (when (stopped? s) s)))]
+        (spit (path "release-publish") "continue")
+        (let [version (poll! 20 "Catalog did not publish the paused attempt while n4 was stopped"
+                        #(when (= boundary (fixture-ints "published-attempt" 5))
+                           (let [catalog (routes leader)
+                                 version (parse-long (:cutover-version (sample leader (str (first boundary)))))]
+                             (when (and (= 2 (moving-owner catalog)) version
+                                        (< (second boundary) version)
+                                        (<= version (:catalog_version catalog)))
+                               version))))
+              after (process-state pid)]
+          (when-not (stopped? after)
+            (throw (ex-info "New voter resumed before publication was observed" {:state after})))
+          {:kind :pause :victim "n4" :pid (parse-long pid) :stopped-state stopped
+           :publication-state after :published-version version}))
+      (finally (run! "kill" "-CONT" pid)))))
+
+(defn- add-and-promote! [active fault]
   (let [{:keys [leader job]} @active
         [gate-job old-version certified seal nonce :as boundary]
         (poll! 150 "No final-confirmation checkpoint" #(fixture-ints "before-publish" 5))
-        previous (leader! 2)
-        before (sample leader job)
-        catalog (routes leader)]
+        previous (leader! 2)]
     (when-not (and (= (parse-long job) gate-job) (= leader "n1")
-                   (= certified (:configuration_index previous)) (pos? seal)
-                   (= "SPLIT_JOB_PHASE_CUTOVER" (:phase before))
-                   (= old-version (:catalog_version catalog)) (= 1 (moving-owner catalog)))
-      (throw (ex-info "Membership fault missed the intended cutover checkpoint"
-                      {:checkpoint [gate-job old-version certified seal] :job before :catalog catalog})))
+                   (= certified (:configuration_index previous)) (pos? seal))
+      (throw (ex-info "Membership fault missed the intended cutover checkpoint" {:checkpoint boundary})))
+    (require-unpublished! leader job old-version)
     (spit (path "hold-n3") (str old-version))
+    (when (= :partition fault) (spit (path "partition-n4") "isolate"))
     (let [added (add-test-learner! 2 previous)
+          partition (when (= :partition fault) (rejected-while-partitioned! added))
           caught (wait-candidate! 2 added #{"learner" "nonvoter"})
           target-leader (leader! 2)
           threshold (:commit_index target-leader)
           caught-up (poll! 35 "Learner did not reach the target leader commit index"
                       #(let [status (group-status 2 "n4")]
                          (when (>= (:applied_index status) threshold) (:applied_index status))))
-          promoted (change-index (group-admin 2 (:node target-leader) "promote_learner" "n4"
-                                              (str added) (str threshold)))
+          promoted (promote-test-learner! target-leader added threshold)
           voter (wait-candidate! 2 promoted #{"voter"})
-          after (sample leader job)
-          unchanged (routes leader)]
-      (when-not (and (= "SPLIT_JOB_PHASE_CUTOVER" (:phase after))
-                     (= old-version (:catalog_version unchanged)) (= 1 (moving-owner unchanged))
-                     (< certified added promoted) (>= (:applied_index voter) promoted))
-        (throw (ex-info "Target promotion was not applied before publication"
-                        {:after after :catalog unchanged :voter voter})))
+          killed (when (= :kill fault) (kill-and-restart-target! promoted))]
+      (require-unpublished! leader job old-version)
       (swap! active assoc :old-version old-version :boundary boundary)
-      (spit (path "release-publish") "continue")
-      {:job job :certified certified :add-index added :promote-index promoted
-       :learner-role (:role caught) :voter-role (:role voter)
-       :threshold threshold :learner-applied caught-up :voter-applied (:applied_index voter)
-       :old-version old-version :seal seal :attempt nonce :before-owner 1 :after-promotion-owner 1})))
+      (let [injection (if (= :pause fault)
+                        (let [evidence (publish-with-paused-voter! leader boundary)
+                              recovered (poll! 10 "Published voter did not resume"
+                                          #(let [s (process-state (node-pid "n4"))]
+                                             (when-not (stopped? s) s)))]
+                          (assoc evidence :resumed-state recovered :resumed-pid (parse-long (node-pid "n4"))))
+                        (do (spit (path "release-publish") "continue") (or partition killed)))]
+        {:job job :certified certified :add-index added :promote-index promoted
+         :learner-role (:role caught) :voter-role (:role voter)
+         :threshold threshold :learner-applied caught-up :voter-applied (:applied_index voter)
+         :old-version old-version :seal seal :attempt nonce :before-owner 1 :after-promotion-owner 1
+         :fault injection}))))
 
 (defn- await-membership-publication! [active]
   (let [{:keys [leader job old-version boundary]} @active
@@ -486,24 +581,28 @@
     (assoc finished :healed-version caught
            :target-leader (:leader_id target) :target-applied (:applied_index target))))
 
-(defn- membership-nemesis []
+(defn- membership-nemesis [fault]
   (let [active (atom nil)]
     (reify nemesis/Nemesis
       (setup! [this _] this)
       (invoke! [_ _ op]
-        (try
-          (assoc op :confirmed true :value
+        (if (:fault-failed @active)
+          (assoc op :error "Skipped after the first membership fault error")
+          (try
+            (assoc op :confirmed true :value
                  (case (:f op)
                    :prepare-member (prepare-membership!)
                    :start-online (start-online! active)
-                   :promote-before-publish (add-and-promote! active)
+                   :promote-before-publish (add-and-promote! active fault)
                    :await-publication (await-membership-publication! active)
                    :lead-new-member (lead-new-member!)
                    :heal-member-views (heal-membership! active)))
-          (catch Exception e
-            (assoc op :error (.getMessage e) :details (ex-data e)))))
+            (catch Exception e
+              (swap! active assoc :fault-failed true)
+              (assoc op :error (.getMessage e) :details (ex-data e))))))
       (teardown! [_ _]
         (io/delete-file (path "hold-n3") true)
+        (io/delete-file (path "partition-n4") true)
         (spit (path "release-publish") "cleanup")))))
 
 (defn- member-reads [tag threads register-keys]
@@ -519,8 +618,37 @@
       :info (boolean (re-find #"code = Unavailable desc = Route unavailable\b" (str error)))
       false)))
 
-(defn membership-checker []
-  (reify checker/Checker
+(defn- valid-membership-fault? [expected membership publication]
+  (let [{:keys [kind victim] :as evidence} (:fault membership)]
+    (case expected
+      :none (nil? evidence)
+      :kill (and (= :kill kind) (= "n3" victim) (= 137 (:exit-code evidence))
+                 (contains? #{"n1" "n2" "n4"} (:replacement evidence))
+                 (every? integer? ((juxt :killed-pid :restarted-pid :old-term :replacement-term :restart-applied) evidence))
+                 (pos? (:killed-pid evidence)) (pos? (:restarted-pid evidence))
+                 (not= (:killed-pid evidence) (:restarted-pid evidence))
+                 (< (:old-term evidence) (:replacement-term evidence))
+                 (<= (:promote-index membership) (:restart-applied evidence)))
+      :partition (and (= :partition kind) (= "n4" victim)
+                      (contains? #{"n1" "n2" "n3"} (:blocked-sender evidence))
+                      (= (:add-index membership) (:rejected-index evidence))
+                      (every? integer? ((juxt :isolated-applied :threshold) evidence))
+                      (< (:isolated-applied evidence) (:threshold evidence))
+                      (<= (:add-index membership) (:threshold evidence) (:learner-applied membership))
+                      (contains? #{:catch-up :namespace-admission} (:rejection-gate evidence))
+                      (= (:rejection-gate evidence) (learner-rejection-gate (:rejection evidence))))
+      :pause (and (= :pause kind) (= "n4" victim)
+                  (stopped? (:stopped-state evidence)) (stopped? (:publication-state evidence))
+                  (string? (:resumed-state evidence)) (not (stopped? (:resumed-state evidence)))
+                  (integer? (:pid evidence)) (pos? (:pid evidence))
+                  (= (:pid evidence) (:resumed-pid evidence))
+                  (= (:version publication) (:published-version evidence)))
+      false)))
+
+(defn membership-checker
+  ([] (membership-checker :none))
+  ([fault]
+   (reify checker/Checker
     (check [_ _ history _]
       (let [[prepare start change publish lead heal :as events] (filter :confirmed history)
             m (:value change) p (:value publish) l (:value lead) h (:value heal)
@@ -549,6 +677,7 @@
                         (<= (:add-index m) (:threshold m) (:learner-applied m))
                         (<= (:promote-index m) (:voter-applied m) (:target-applied l) (:target-applied h))
                         (= (:attempt m) (:attempt p)) (pos? (:attempt p))
+                        (valid-membership-fault? fault m p)
                         (= 2 (:new-owner p)) (= "n3" (:old-ingress p))
                         (>= (:new-member-version p) (:version p))
                         (<= (:cached-version p) (:old-version m))
@@ -584,22 +713,22 @@
                         (acknowledged-between? history :post-cutover post-cutover-mutations
                                                (:index heal) (apply min (map :index final)))
                         (every? #(= :ok (:type %)) final)))
-         :membership m :publication p
+         :membership m :publication p :fault (:fault m)
          :stale-reads (mapv #(select-keys % [:node :type :value :error]) stale)
          :new-member-reads-while-stale (mapv #(select-keys % [:node :type :value :error]) new-while-stale)
          :joined-leader-reads (mapv #(select-keys % [:node :type :value]) joined-leader)
          :target-leader (:target-leader h)
          :final-reads (count final) :errors errors
-         :incorrect-or-missing-final-values (set/difference expected actual)}))))
+         :incorrect-or-missing-final-values (set/difference expected actual)})))))
 
-(defn- membership-workload []
+(defn- membership-workload [fault]
   (let [client (grpc/->GRPCClient membership-ports :raw (path "jepsen-grpc-client") nil nil nil)
         event #(gen/nemesis (gen/once {:type :info :f %}))]
     (merge tests/noop-test
            {:name "elastickv-split-target-membership" :nodes membership-nodes :concurrency 4 :net net/noop
             :grpc-host "127.0.0.1" :grpc-tls-ca-file (path "cert.pem")
-            :client (hosted/->ObservedClient client nil) :nemesis (membership-nemesis)
-            :checker (membership-checker)
+            :client (hosted/->ObservedClient client nil) :nemesis (membership-nemesis fault)
+            :checker (membership-checker fault)
             :generator
             (gen/phases
               (event :prepare-member)
@@ -622,5 +751,5 @@
                            [[nil "--online-leader-failover" "Stop the catalog leader during online capture."]
                             [nil "--online-member-change" "Promote a target voter before catalog publication."]])
                      #(cli/parse-common-opts % nil)
-                     #(if (:online-member-change %) (membership-workload)
+                     #(if (:online-member-change %) (membership-workload (keyword (or (System/getenv "SPLIT_MEMBERSHIP_FAULT") "none")))
                           (follower-or-leader-workload %))))

@@ -74,8 +74,21 @@ gh workflow run jepsen-test-scheduled.yml --ref BRANCH \
   -f faults-only=true -f 'fault-adapters-json=["redis"]'
 ```
 
-The `jepsen-split-membership-<run-attempt>` artifact contains the history,
-checker result, all four node logs, and the cutover and ingress markers.
+The fault group runs four independent membership jobs on fresh stores:
+
+| Case | Required evidence |
+| --- | --- |
+| `none` | Learner promotion and stale-route isolation at the publication boundary. |
+| `kill` | `SIGKILL` of the target leader after promotion and before publication, a higher-term replacement while the former leader is down, and the former leader replaying the promoted configuration after restart. |
+| `partition` | Dropped Raft traffic to the target learner during catch-up, a namespace-admission or catch-up rejection while the learner is behind the required index, and promotion after the link heals. |
+| `pause` | The new voter is stopped when the catalog publishes the same cutover attempt, then resumes with the same PID. |
+
+All four jobs require all six mutation ACKs, correct reads from the new
+leader while the old route is held, and all eight final reads after healing.
+The `jepsen-split-membership-<case>-<run-attempt>` artifact contains the
+history, checker result, four node logs, and cutover and ingress markers.
+Use `SPLIT_MEMBERSHIP_FAULT=kill`, `partition`, or `pause` with the local
+script to select an additional fault.
 
 ## Repeated splits
 
