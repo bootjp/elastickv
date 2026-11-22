@@ -152,3 +152,15 @@ ownership barriers. This limits the uninterrupted foreground apply work per
 proposal; it does not guarantee a latency bound for disk synchronization.
 Legacy jobs retain their existing page budgets. Validate this choice against
 identical Linux load, including completion time and complete ACK readback.
+
+## Unrelated prefix mutations in captured batches
+
+A full batch may contain a captured point request and prefix requests whose
+logical footprints do not intersect any active source session. Keep the
+existing per-request footprint admission. For such requests the indexed
+store additionally checks every matching physical key against the capture
+filter, including prior writes in the same batch, before staging tombstones.
+Reject the entire atomic entry if any selected capture key would change.
+The explicit unfiltered shadow primitive still rejects prefix writes. An
+intersecting prefix request continues to invalidate the session before normal
+application. Preserve per-request outcomes, failure latching and atomic replay.
