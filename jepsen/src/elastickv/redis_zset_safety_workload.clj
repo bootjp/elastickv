@@ -1105,6 +1105,25 @@
        (or (nil? (:complete-idx m))
            (>= (:complete-idx m) first-read-inv-idx))))
 
+(defn- required-zadd-observations
+  [mutations-by-m reads]
+  (let [uncertain (mutations-by-member
+                    (filter #(and (= :info (:type %)) (= :zadd (:f %)))
+                            (mapcat val mutations-by-m)))]
+    (when (seq uncertain)
+      (reduce (fn [observed {:keys [invoke complete] :as read}]
+                (let [inv-idx (:index invoke)
+                      cmp-idx (:index complete)]
+                  (reduce (fn [out [member score]]
+                            (reduce (fn [acc m]
+                                      (if (observed-score-requires-mutation?
+                                            mutations-by-m m member score inv-idx cmp-idx)
+                                        (update acc (:invoke-idx m) #(min (or % cmp-idx) cmp-idx))
+                                        acc))
+                                    out (get uncertain member [])))
+                          observed (read-entries read))))
+              {} reads))))
+
 (defn- comparable-stability-members
   [mutations-by-m first-read second-read first-entries second-entries]
   (if (and (full-read? first-read) (full-read? second-read))
@@ -1139,7 +1158,8 @@
   (let [reads (->> read-pairs
                    (filter (complement malformed-read?))
                    (sort-by #(-> % :invoke :index))
-                   vec)]
+                   vec)
+        observed (required-zadd-observations mutations-by-m reads)]
     (->> (for [[idx later] (map-indexed vector reads)
                earlier (subvec reads 0 idx)
                :let [first-cmp-idx (-> earlier :complete :index)
@@ -1158,10 +1178,16 @@
                :let [first-state (member-state-in-read first-entries member)
                      second-state (member-state-in-read second-entries member)]
                :when (and (not= first-state second-state)
-                          (not-any? #(mutation-could-affect-read-gap?
-                                        %
-                                        first-inv-idx
-                                        second-cmp-idx)
+                          (not-any? #(or (mutation-could-affect-read-gap?
+                                           % first-inv-idx second-cmp-idx)
+                                         ;; An indeterminate ZADD may apply after
+                                         ;; its reply timeout. It can explain its
+                                         ;; own score until a read requires it.
+                                         (and (= :zadd (:f %))
+                                              (pre-read-info? % first-inv-idx)
+                                              (score-eq? (:score %) (:score second-state))
+                                              (> (get observed (:invoke-idx %) Long/MAX_VALUE)
+                                                 first-cmp-idx)))
                                     (get mutations-by-m member [])))]
            {:kind :unstable-read-without-mutation
             :first-index first-cmp-idx

@@ -871,6 +871,27 @@
     (is (contains? kinds :unstable-read-without-mutation)
         (str "expected :unstable-read-without-mutation, got kinds=" kinds))))
 
+(deftest timed-out-zadd-can-become-visible-once-after-its-response
+  (let [history [{:type :invoke :process 0 :f :zadd :value ["m1" 49] :index 0}
+                 {:type :info :process 0 :f :zadd :value ["m1" 49] :index 1}
+                 {:type :invoke :process 1 :f :zrange-all :index 2}
+                 {:type :ok :process 1 :f :zrange-all :value [] :index 3}
+                 {:type :invoke :process 1 :f :zrange-all :index 4}
+                 {:type :ok :process 1 :f :zrange-all :value [["m1" 49.0]] :index 5}]
+        overwritten (into history
+                          [{:type :invoke :process 2 :f :zadd :value ["m1" 7] :index 6}
+                           {:type :ok :process 2 :f :zadd :value ["m1" 7] :index 7}
+                           {:type :invoke :process 1 :f :zrange-all :index 8}
+                           {:type :ok :process 1 :f :zrange-all :value [["m1" 7.0]] :index 9}])]
+    (is (true? (:valid? (run-checker history))))
+    (is (false? (:valid? (run-checker
+                          (assoc-in history [5 :value] [["m1" 50.0]])))))
+    (is (true? (:valid? (run-checker overwritten))))
+    (is (false? (:valid? (run-checker
+                          (into overwritten
+                                [{:type :invoke :process 1 :f :zrange-all :index 10}
+                                 {:type :ok :process 1 :f :zrange-all :value [["m1" 49.0]] :index 11}])))))))
+
 (deftest range-reads-cannot-switch-overlapping-write-order
   ;; Stability is not just a full-read property. Two non-overlapping bounded
   ;; reads cannot pick different serializations of the same completed writes.
