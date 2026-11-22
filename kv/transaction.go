@@ -28,8 +28,9 @@ type TransactionManager struct {
 }
 
 type rawCommitItem struct {
-	reqs []*pb.Request
-	done chan rawCommitResult
+	reqs         []*pb.Request
+	done         chan rawCommitResult
+	encodedBytes int
 }
 
 type rawCommitResult struct {
@@ -37,7 +38,11 @@ type rawCommitResult struct {
 	err         error
 }
 
-const maxRawBatchRequests = 64
+// The single flusher waits for each proposal to apply before taking the next
+// batch. A larger batch drains more of an existing backlog after slow syncs.
+// Bound coalesced commands below the Raft append target of 1 MiB.
+const maxRawBatchRequests = 256
+const maxRawBatchBytes = 512 * 1024
 const maxRawPendingItems = 4096
 
 // maxMarshaledCommandSize is the upper bound on a marshaled Raft command.
@@ -275,8 +280,9 @@ func (t *TransactionManager) commitRaw(ctx context.Context, reqs []*pb.Request) 
 		return t.commitRawOwned(ctx, reqs)
 	}
 	item := &rawCommitItem{
-		reqs: reqs,
-		done: make(chan rawCommitResult, 1),
+		reqs:         reqs,
+		done:         make(chan rawCommitResult, 1),
+		encodedBytes: proto.Size(&pb.RaftCommand{Requests: reqs}),
 	}
 
 	shouldFlush := false
@@ -388,24 +394,29 @@ func (t *TransactionManager) takeRawBatch() []*rawCommitItem {
 		return nil
 	}
 
-	count := 0
+	count, encodedBytes := 0, 1 // The command encoding prefix occupies one byte.
 	n := 0
 	for n < len(t.rawPending) {
-		next := count + len(t.rawPending[n].reqs)
-		if n > 0 && next > maxRawBatchRequests {
+		item := t.rawPending[n]
+		nextCount := count + len(item.reqs)
+		// Preserve an individual caller's request group as one command, even
+		// when it alone exceeds the coalescing limits.
+		if n > 0 && (nextCount > maxRawBatchRequests || item.encodedBytes > maxRawBatchBytes-encodedBytes) {
 			break
 		}
-		count = next
+		count = nextCount
+		encodedBytes += item.encodedBytes
 		n++
 	}
 
 	batch := append([]*rawCommitItem(nil), t.rawPending[:n]...)
+	clear(t.rawPending[:n])
 	t.rawPending = t.rawPending[n:]
 	return batch
 }
 
 func (t *TransactionManager) applyRawBatch(batch []*rawCommitItem) {
-	reqs := make([]*pb.Request, 0, maxRawBatchRequests)
+	reqs := make([]*pb.Request, 0, len(batch))
 	offsets := make([]int, 0, len(batch)+1)
 	for _, item := range batch {
 		offsets = append(offsets, len(reqs))
