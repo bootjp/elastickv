@@ -67,6 +67,7 @@ func withUpper(extra ...string) []string {
 // and should be inverted (an interface or callback owned by the lower
 // package) rather than allowed here.
 var layerRules = []layerRule{
+	{Dir: "lean/adapter", Exact: true, Deny: []string{anyModulePackage}, Why: "the proof extractor reads Go syntax using the standard library"},
 	{Dir: "proto", Deny: []string{anyModulePackage}, Why: "generated protobuf code is a leaf"},
 	{Dir: "keyviz", Deny: []string{anyModulePackage}, Why: "the key visualizer sampler is a leaf the data plane calls into"},
 	{Dir: "proxy", Deny: []string{anyModulePackage}, Why: "the Redis migration proxy reaches Elastickv over the wire only"},
