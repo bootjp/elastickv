@@ -32,6 +32,7 @@ type handoffReadStore struct {
 	attempts   int
 	persistent bool
 	failure    error
+	firstError error
 	requests   []*kv.ReadRequest
 }
 
@@ -41,6 +42,9 @@ func (s *handoffReadStore) GetAtWithReadFence(ctx context.Context, _ []byte, _ u
 	s.requests = append(s.requests, request)
 	if s.failure != nil {
 		return nil, s.failure
+	}
+	if s.attempts == 1 && s.firstError != nil {
+		return nil, s.firstError
 	}
 	if s.persistent || s.attempts == 1 {
 		return nil, kv.ErrRouteCutoverPending
@@ -73,15 +77,18 @@ func TestRawGetDoesNotRetryPinnedOrMixedCutover(t *testing.T) {
 		name    string
 		version uint64
 		failure error
+		code    codes.Code
 	}{
-		{"pinned", 9, kv.ErrRouteCutoverPending},
-		{"mixed", 0, errors.Join(kv.ErrRouteCutoverPending, io.EOF)},
+		{"pinned", 9, kv.ErrRouteCutoverPending, codes.Unavailable},
+		{"pinned version lag", 9, kv.ErrReadRouteVersionUnavailable, codes.Unavailable},
+		{"mixed", 0, errors.Join(kv.ErrRouteCutoverPending, io.EOF), codes.Unknown},
+		{"mixed version lag", 0, errors.Join(kv.ErrReadRouteVersionUnavailable, io.EOF), codes.Unknown},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			st := &handoffReadStore{MVCCStore: store.NewMVCCStore(), failure: tc.failure}
 			server := NewGRPCServer(st, &stubAdapterCoordinator{})
 			_, err := server.RawGet(t.Context(), &pb.RawGetRequest{Key: []byte("n"), Ts: 1, ReadRouteVersion: tc.version})
-			require.Error(t, err)
+			require.Equal(t, tc.code, status.Code(err))
 			require.Equal(t, 1, st.attempts)
 		})
 	}

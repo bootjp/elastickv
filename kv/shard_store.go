@@ -158,7 +158,9 @@ func (s *ShardStore) awaitReadRouteVersion(ctx context.Context, requested uint64
 	for {
 		select {
 		case <-waitCtx.Done():
-			return errors.Wrapf(ErrReadRouteVersionUnavailable, "requested=%d current=%d: %v", requested, s.ReadRouteVersion(), waitCtx.Err())
+			// The wait ending explains the route lag. Keep one error cause so
+			// the receiver can classify it without masking a secondary failure.
+			return errors.Wrapf(ErrReadRouteVersionUnavailable, "requested=%d current=%d: %s", requested, s.ReadRouteVersion(), waitCtx.Err().Error())
 		case <-ticker.C:
 			if s.ReadRouteVersion() >= requested {
 				return nil

@@ -18,6 +18,7 @@ run it without touching anything under the Go source tree.
 | M5 | `composed/Composed.tla` (Composed-1 + Composed-1a + Composed-3; Composed-2 not modelled) | Landed |
 | M6 | Liveness checking — OCC-L1 (every Active txn eventually terminates), Routes-L1 (eventual fan-out). HLC / MVCC / Composed liveness deferred. | Partial |
 | Online split | Exact durable import prefix, sealed data at cutover, ownership and cleanup, invalidated generations, and the configuration-revalidation boundary | [Safety evidence](../docs/evidence/online_split_safety_20261122/README.md) |
+| Target membership during split | Applied learner promotion after final confirmation, stale-ingress rejection, and read-back after target leadership transfer | [Membership evidence](../docs/evidence/online_split_membership_20261122/README.md) |
 
 The modules describe the code on `main` (reconciled 2026-10-28, see
 §12 of the design doc).  Where the code falls short of an invariant,
@@ -56,8 +57,8 @@ make tla-check
 
 This runs TLC against the safe + gap configuration pair for every
 module declared in `scripts/tla-check.sh` (currently HLC, OCC, MVCC,
-Routes, Composed, and Online Split; M6 liveness extension is optional and may
-follow), and prints whether the outcome matches the design contract:
+Routes, Composed, Online Split, and Split Membership; M6 liveness extension
+is optional and may follow), and prints whether the outcome matches the design contract:
 
 - **Safe config (`tla/<module>/MC<MODULE>.cfg`)** — the correct
   design, with each module's preconditions or commit guards enabled.

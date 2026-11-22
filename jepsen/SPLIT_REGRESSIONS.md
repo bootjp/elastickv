@@ -39,8 +39,31 @@ absence of the deleted key, and the new value on all three ingresses.
 The checker treats a missed fault window, missing ACK, resurrected delete,
 or missing or incorrect ingress read as a failed run. History is recorded
 under `jepsen/store/elastickv-split-online-failover/`. The preflight workflow
-runs both scenarios using fresh stores. See the [safety evidence](../docs/evidence/online_split_safety_20261122/README.md)
+runs each scenario using fresh stores. See the [safety evidence](../docs/evidence/online_split_safety_20261122/README.md)
 for the accompanying Lean and TLC checks and the remaining fault cases.
+
+## Target learner promotion between final confirmation and catalog publication
+
+```sh
+PREFLIGHT_LOG_DIR=/path/to/logs bash scripts/jepsen-split-preflight.sh --online-member-change
+```
+
+This variant also needs Python 3 and starts a fourth process on ports 25104,
+25204 and 25304. A Go build overlay pauses the cutover controller after the
+last readiness probes and delays catalog cache updates on ingress `n3`.
+The fault uses the real Raft admin API to add `n4` as a target learner, wait
+for its committed prefix to apply, and promote it. The same paused cutover
+attempt must publish the new owner only after that promotion applies.
+
+The checker requires successful overwrite and delete ACKs during online
+capture. Read probes through `n3` and `n4` may return the correct value or
+`Unavailable` while `n3` is both stale and the target leader. After target
+leadership transfers to `n4`, it must read the correct overwrite and absence
+of the deleted key while `n3` is still stale. After healing and DONE, both
+ingresses must return all four expected values, including a post-cutover
+write. History lives under `jepsen/store/elastickv-split-target-membership/`.
+The log directory also preserves the before/after attempt stamps and cache
+observations. See the [membership evidence](../docs/evidence/online_split_membership_20261122/README.md).
 
 ## Repeated splits
 
