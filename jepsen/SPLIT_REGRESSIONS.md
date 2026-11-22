@@ -65,28 +65,36 @@ write. History lives under `jepsen/store/elastickv-split-target-membership/`.
 The log directory also preserves the before/after attempt stamps and cache
 observations. See the [membership evidence](../docs/evidence/online_split_membership_20261122/README.md).
 
-Jepsen Scheduled Stress Test runs this scenario under `faults` on the regular
-schedule and in `faults-only` runs. To validate the fault suite on a branch
-with the three Redis faults and the Split membership scenario:
+Jepsen Scheduled Stress Test runs the `none` case as the regular
+`test (split-membership)` job. It keeps the publication hold, learner
+promotion, and stale-route checks. To run that job on its own:
+
+```sh
+gh workflow run jepsen-test-scheduled.yml --ref BRANCH \
+  -f 'workloads-json=["split-membership"]'
+```
+
+The same schedule runs the three additional membership cases under `faults`.
+To run those cases and the three Redis faults on a branch:
 
 ```sh
 gh workflow run jepsen-test-scheduled.yml --ref BRANCH \
   -f faults-only=true -f 'fault-adapters-json=["redis"]'
 ```
 
-The fault group runs four independent membership jobs on fresh stores:
+The fault group runs three independent membership jobs on fresh stores:
 
 | Case | Required evidence |
 | --- | --- |
-| `none` | Learner promotion and stale-route isolation at the publication boundary. |
-| `kill` | `SIGKILL` of the target leader after promotion and before publication, a higher-term replacement while the former leader is down, and the former leader replaying the promoted configuration after restart. |
+| `kill` | `SIGKILL` of the target leader after promotion and before publication, a higher-term replacement while the former leader is down, and the former leader replaying the promoted configuration after restart. The `cleanup-n3` marker records the restarted process PID after it has exited. |
 | `partition` | Dropped Raft traffic to the target learner during catch-up, a namespace-admission or catch-up rejection while the learner is behind the required index, and promotion after the link heals. |
 | `pause` | The new voter is stopped when the catalog publishes the same cutover attempt, then resumes with the same PID. |
 
 All four jobs require all six mutation ACKs, correct reads from the new
 leader while the old route is held, and all eight final reads after healing.
-The `jepsen-split-membership-<case>-<run-attempt>` artifact contains the
-history, checker result, four node logs, and cutover and ingress markers.
+The regular job publishes `jepsen-store-split-membership` for history and
+`jepsen-split-membership-logs` for node logs and cutover and ingress markers.
+Each fault job publishes both in `jepsen-split-membership-<case>-<run-attempt>`.
 Use `SPLIT_MEMBERSHIP_FAULT=kill`, `partition`, or `pause` with the local
 script to select an additional fault.
 

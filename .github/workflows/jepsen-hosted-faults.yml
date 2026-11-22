@@ -56,7 +56,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        membership-fault: [none, kill, partition, pause]
+        membership-fault: [kill, partition, pause]
     uses: ./.github/workflows/jepsen-split-preflight.yml
     with:
       membership-only: true
