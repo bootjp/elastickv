@@ -41,6 +41,11 @@ jobs:
       - name: Reject production imports of test support
         if: matrix.shard == 'rest'
         run: bash scripts/check-production-imports.sh
+      - name: Test load host isolation and restoration
+        if: matrix.shard == 'rest'
+        run: |
+          python3 -m unittest discover -s scripts -p test_isolate_load_host.py -v
+          bash -n scripts/run-split-load-ramp.sh
       - name: Run race tests
         run: bash scripts/go-test-shard.sh "${{ matrix.shard }}" "$RAFT_NATIVE_MEMORY_TESTS"
         env:

@@ -1,0 +1,10 @@
+{
+  "source": "d403e0c8991bf5f5562f0b8d84bdcefef4ce0404",
+  "path": "/Users/bootjp/.codex/visualizations/2026/11/19/01a1f333-53dc-7602-92f8-e3df6c957124/vm150-sync-throughput-20261122/parallel-append-first-pass.zip",
+  "sha256": "ea7310345f85a5a4a79fb5fedb9466aff72e27a7f1c98ac7eb45b8c0b26db5fe",
+  "bytes": 8075309,
+  "files": 117,
+  "selected_vm_originals": 59,
+  "all_vm_original_hashes_verified": true,
+  "outcome": "safe but performance goal not met; retained as first-pass evidence"
+}

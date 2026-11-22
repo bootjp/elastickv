@@ -1,0 +1,44 @@
+{
+  "before": {
+    "seconds": 5.0,
+    "read": {
+      "attempts": 750,
+      "success": 750,
+      "ops_s": 150.0,
+      "success_p99_ms": 9.15707,
+      "all_p99_ms": 9.15707,
+      "errors": {}
+    },
+    "write": {
+      "attempts": 749,
+      "success": 749,
+      "ops_s": 149.8,
+      "success_p99_ms": 17.616353,
+      "all_p99_ms": 17.616353,
+      "errors": {}
+    }
+  },
+  "during": {
+    "seconds": 5.0,
+    "read": {
+      "attempts": 561,
+      "success": 561,
+      "ops_s": 112.2,
+      "success_p99_ms": 405.913762,
+      "all_p99_ms": 405.913762,
+      "errors": {}
+    },
+    "write": {
+      "attempts": 559,
+      "success": 559,
+      "ops_s": 111.8,
+      "success_p99_ms": 717.199252,
+      "all_p99_ms": 717.199252,
+      "errors": {}
+    }
+  },
+  "ack_count": 4309,
+  "audit_success": 12927,
+  "verified": true,
+  "split": "none"
+}

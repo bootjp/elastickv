@@ -1,0 +1,23 @@
+{
+  "baseline": {
+    "read": {
+      "p99_ms": 7.577854,
+      "success_ops_s": 150.0
+    },
+    "write": {
+      "p99_ms": 12.356654,
+      "success_ops_s": 150.0
+    }
+  },
+  "candidate": {
+    "read": {
+      "p99_ms": 290.213013,
+      "success_ops_s": 138.9
+    },
+    "write": {
+      "p99_ms": 747.521368,
+      "success_ops_s": 140.6
+    }
+  }
+}
+RED: post-cutover read tail regression

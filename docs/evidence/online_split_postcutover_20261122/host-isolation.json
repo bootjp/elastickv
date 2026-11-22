@@ -1,0 +1,61 @@
+{
+  "command": [
+    "python3",
+    "/var/tmp/elastickv-postcutover-formal-20261122/measure.py"
+  ],
+  "before": {
+    "fwupd-refresh.timer": {
+      "LoadState": "loaded",
+      "ActiveState": "active",
+      "UnitFileState": "enabled"
+    },
+    "fwupd-refresh.service": {
+      "LoadState": "loaded",
+      "ActiveState": "inactive",
+      "UnitFileState": "static"
+    },
+    "fwupd.service": {
+      "LoadState": "loaded",
+      "ActiveState": "inactive",
+      "UnitFileState": "static"
+    }
+  },
+  "isolated": {
+    "fwupd-refresh.timer": {
+      "LoadState": "masked",
+      "ActiveState": "failed",
+      "UnitFileState": "masked-runtime"
+    },
+    "fwupd-refresh.service": {
+      "LoadState": "masked",
+      "ActiveState": "inactive",
+      "UnitFileState": "masked-runtime"
+    },
+    "fwupd.service": {
+      "LoadState": "masked",
+      "ActiveState": "inactive",
+      "UnitFileState": "masked-runtime"
+    }
+  },
+  "started_ns": 1795290172447767837,
+  "ended_ns": 1795291076548952627,
+  "exit_code": 0,
+  "restored": {
+    "fwupd-refresh.timer": {
+      "LoadState": "loaded",
+      "ActiveState": "active",
+      "UnitFileState": "enabled"
+    },
+    "fwupd-refresh.service": {
+      "LoadState": "loaded",
+      "ActiveState": "inactive",
+      "UnitFileState": "static"
+    },
+    "fwupd.service": {
+      "LoadState": "loaded",
+      "ActiveState": "inactive",
+      "UnitFileState": "static"
+    }
+  },
+  "restore_errors": []
+}

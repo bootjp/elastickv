@@ -15,6 +15,9 @@ var ErrMigrationTransferTooLarge = errors.Wrap(store.ErrValueTooLarge, "new vers
 // recording tracker progress or applying any row of the request. COMMIT/ABORT
 // intentionally do not call this: already authenticated old resolutions drain.
 func (f *kvFSM) verifyMigrationTransferSize(ctx context.Context, muts []*store.KVPairMutation) error {
+	if ctx.Value(onlineMigrationWriteContextKey{}) == true {
+		return nil
+	}
 	// Most requests contain only small rows. Avoid a metadata read entirely
 	// unless a row can violate the per-version transfer budget.
 	var states []store.TargetStagedReadinessState

@@ -1,0 +1,42 @@
+{
+  "baseline_source": "18a509addeef3f10cf36c7751f26e87a4887b477",
+  "baseline_production": "5226ac75744e3575daccee23690a36e44178e30f",
+  "baseline_binary": "0e61b1751290c0cff702dd016a3a16f72b2c956fb0f276951ae087126703b9c4",
+  "order": [
+    "A1",
+    "B1",
+    "B2",
+    "A2"
+  ],
+  "rates": [
+    100,
+    300,
+    500,
+    1000
+  ],
+  "seconds_per_stage": 90,
+  "concurrency": 32,
+  "read_percent": 50,
+  "value_bytes": 1024,
+  "seed_keys": 256,
+  "rpc_timeout_seconds": 2,
+  "sync": true,
+  "profiles": false,
+  "fresh_stores": true,
+  "require_online": true,
+  "mutation_retries": false,
+  "audit": "all acknowledged writes at all three ingress nodes after Split Done and route convergence",
+  "primary_window": "first min(60, floor(shortest Split Done duration in stage300)) seconds after cross-group Split request, common to all four runs",
+  "secondary_windows": [
+    "full Split",
+    "each stage",
+    "whole run success / actual total stage elapsed",
+    "last10s of stage300",
+    "postDone8s if entirely inside stage300"
+  ],
+  "isolation": "exclusive VM150, firmware runtime masks across entire ABBA; original unit state restored afterward",
+  "no_latency_claim": "No guarantee under arbitrary failures; two trials per arm do not establish statistical significance.",
+  "candidate_source": "d0ee76e0a1268d9af39e64560ba3e78814e2fb06",
+  "candidate_change": "shared group-owned local/Forward queue, receiver epoch preserved; no added gathering delay; existing parallel-append change retained",
+  "intermediate": "d403e0c89 ABBA retained separately and not pooled into this comparison"
+}

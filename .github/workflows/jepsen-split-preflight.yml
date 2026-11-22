@@ -5,15 +5,35 @@ on:
       - '.github/workflows/jepsen-split-preflight.yml'
       - 'adapter/split_job*.go'
       - 'adapter/distribution_server.go'
+      - 'adapter/grpc.go'
+      - 'adapter/grpc_read_handoff.go'
+      - 'store/migration_online*.go'
+      - 'store/migration_capture*.go'
+      - 'kv/fsm_migration*.go'
+      - 'kv/shard_store.go'
+      - 'distribution/engine.go'
+      - 'internal/noderuntime/peers.go'
+      - 'internal/raftadmin/**'
+      - 'internal/raftengine/etcd/engine.go'
       - 'cmd/elastickv-split/**'
       - 'cmd/jepsen-grpc-client/**'
       - 'scripts/jepsen-split-preflight.sh'
+      - 'scripts/jepsen-split-membership-overlay.py'
       - 'jepsen/**'
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      membership-only:
+        type: boolean
+        default: false
+      membership-fault:
+        type: string
+        default: none
 permissions:
   contents: read
 jobs:
   voter-pause:
+    name: ${{ inputs.membership-only && format('Jepsen (split membership, {0})', inputs.membership-fault) || 'voter-pause' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -46,15 +66,30 @@ jobs:
         working-directory: jepsen
         run: lein test elastickv.split-preflight-workload-test
       - name: Pause a voter during split preflight
+        if: ${{ !inputs.membership-only }}
         run: PREFLIGHT_LOG_DIR="$RUNNER_TEMP/preflight-logs" bash scripts/jepsen-split-preflight.sh
+      - name: Stop the catalog leader after captured mutations
+        if: ${{ !inputs.membership-only }}
+        run: PREFLIGHT_LOG_DIR="$RUNNER_TEMP/failover-logs" bash scripts/jepsen-split-preflight.sh --online-leader-failover
+      - name: Promote a target learner after the final cutover confirmation
+        env:
+          SPLIT_MEMBERSHIP_FAULT: ${{ inputs.membership-fault || 'none' }}
+        run: PREFLIGHT_LOG_DIR="$RUNNER_TEMP/membership-logs" bash scripts/jepsen-split-preflight.sh --online-member-change
       - name: Archive Jepsen history
         if: always()
-        run: bash scripts/archive-jepsen-store.sh jepsen/store/elastickv-split-preflight-pause "$RUNNER_TEMP/preflight-history.tar.gz"
+        run: |
+          bash scripts/archive-jepsen-store.sh jepsen/store/elastickv-split-preflight-pause "$RUNNER_TEMP/preflight-history.tar.gz"
+          bash scripts/archive-jepsen-store.sh jepsen/store/elastickv-split-online-failover "$RUNNER_TEMP/failover-history.tar.gz"
+          bash scripts/archive-jepsen-store.sh jepsen/store/elastickv-split-target-membership "$RUNNER_TEMP/membership-history.tar.gz"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: jepsen-split-preflight-pause
+          name: ${{ inputs.membership-only && format('jepsen-split-membership-{0}-{1}', inputs.membership-fault, github.run_attempt) || 'jepsen-split-preflight-pause' }}
           path: |
             ${{ runner.temp }}/preflight-history.tar.gz
             ${{ runner.temp }}/preflight-logs/
+            ${{ runner.temp }}/failover-history.tar.gz
+            ${{ runner.temp }}/failover-logs/
+            ${{ runner.temp }}/membership-history.tar.gz
+            ${{ runner.temp }}/membership-logs/
           retention-days: 14

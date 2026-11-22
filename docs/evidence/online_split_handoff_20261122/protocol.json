@@ -1,0 +1,30 @@
+{
+  "baseline_runtime": "a9f318f16 / c664c80bb (identical production)",
+  "order": [
+    "baseline",
+    "candidate"
+  ],
+  "rates": [
+    100,
+    300,
+    500,
+    1000
+  ],
+  "stage_seconds": 90,
+  "concurrency": 32,
+  "read_percent": 50,
+  "gomaxprocs": 8,
+  "profiles": false,
+  "primary_comparison_window": "first 60 seconds after observed cross-group Split start, shorten equally if any Done precedes 60s",
+  "additional_windows": [
+    "entire 300 offered ops/s stage",
+    "each observed Split phase",
+    "8 seconds after observed Done if stage 300 covers it"
+  ],
+  "payload_bytes": 1024,
+  "seed_keys": 256,
+  "rpc_deadline_seconds": 2,
+  "automatic_mutation_client_retry": false,
+  "audit": "all ACK IDs at all three ingresses after Done and routing convergence; five postDone paths x600",
+  "source_note": "Final production excludes rejected 256-version/512KiB maintenance experiment; retains handoff and reviewed prefix/script fixes. ABBA experiment preserved separately."
+}

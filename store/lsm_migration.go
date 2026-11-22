@@ -357,15 +357,25 @@ func (s *pebbleStore) importVersionsWithOpts(ctx context.Context, opts ImportVer
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
 
+	online, receipt, err := s.validateOnlineImport(opts)
+	if err != nil {
+		return ImportVersionsResult{}, err
+	}
+	if online != nil {
+		writeOpts = pebble.Sync
+	}
+	if receipt != nil {
+		return s.ackDuplicateImport(opts.AppliedIndex, writeOpts, bytes.Clone(receipt.Cursor))
+	}
 	duplicate, ackedCursor, err := s.validatePebbleImportBatch(opts)
 	if err != nil {
 		return ImportVersionsResult{}, err
 	}
+	if duplicate && opts.OnlineSequence != 0 {
+		return ImportVersionsResult{}, errors.WithStack(ErrMigrationCaptureCorrupt)
+	}
 	if duplicate {
-		if err := s.commitPebbleImportAppliedIndex(opts.AppliedIndex, writeOpts); err != nil {
-			return ImportVersionsResult{}, err
-		}
-		return ImportVersionsResult{AckedCursor: ackedCursor, Duplicate: true}, nil
+		return s.ackDuplicateImport(opts.AppliedIndex, writeOpts, ackedCursor)
 	}
 
 	batchMax := importBatchMaxTS(opts.Versions)
@@ -380,6 +390,13 @@ func (s *pebbleStore) importVersionsWithOpts(ctx context.Context, opts ImportVer
 		"max_imported_ts", batchMax,
 	)
 	return ImportVersionsResult{AckedCursor: bytes.Clone(opts.Cursor), MaxImportedTS: batchMax}, nil
+}
+
+func (s *pebbleStore) ackDuplicateImport(index uint64, writeOpts *pebble.WriteOptions, cursor []byte) (ImportVersionsResult, error) {
+	if err := s.commitPebbleImportAppliedIndex(index, writeOpts); err != nil {
+		return ImportVersionsResult{}, err
+	}
+	return ImportVersionsResult{AckedCursor: cursor, Duplicate: true}, nil
 }
 
 func (s *pebbleStore) commitPebbleImportAppliedIndex(appliedIndex uint64, writeOpts *pebble.WriteOptions) error {
@@ -420,6 +437,9 @@ func (s *pebbleStore) validatePebbleImportBatch(opts ImportVersionsOptions) (boo
 func (s *pebbleStore) commitPebbleImportBatch(opts ImportVersionsOptions, batchMax uint64, writeOpts *pebble.WriteOptions, gateRegistration bool) error {
 	batch := s.db.NewBatch()
 	defer batch.Close()
+	if err := s.stageOnlineImport(batch, opts); err != nil {
+		return err
+	}
 	if err := s.applyImportVersionsBatch(batch, opts.Versions, gateRegistration); err != nil {
 		return err
 	}

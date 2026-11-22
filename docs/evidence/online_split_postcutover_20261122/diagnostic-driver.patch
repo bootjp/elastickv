@@ -1,0 +1,10 @@
+--- a/raw-trace-overlay.go
++++ b/raw-trace-overlay.go
+@@ -154,6 +154,7 @@
+   if errors.Is(err,ErrMismatch) {code="value_mismatch"}
+  }
+  r.trace[id]=windowRPC{end.UnixNano(),elapsed,kind,code}
++ if elapsed > 50*time.Millisecond { fmt.Fprintf(os.Stderr,"PROFILE_POSTCUTOVER_RPC %d %s %d %d %s\n",id,kind,end.UnixNano(),elapsed.Nanoseconds(),code) }
+ }
+ func (r *Runner) writeWindowTrace() error {
+  f,err:=os.OpenFile(os.Getenv("ELASTICKV_RPC_TRACE"),os.O_CREATE|os.O_EXCL|os.O_WRONLY,0600)

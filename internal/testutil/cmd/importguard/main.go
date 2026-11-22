@@ -46,7 +46,7 @@ func (c *treeChecker) visit(path string, entry fs.DirEntry, walkErr error) error
 		return fmt.Errorf("read production source: %w", walkErr)
 	}
 	if entry.IsDir() {
-		if path != c.root && ignoredDirectory(entry.Name()) {
+		if path != c.root && ignoredDirectory(c.root, path, entry.Name()) {
 			return filepath.SkipDir
 		}
 		return nil
@@ -66,7 +66,11 @@ func (c *treeChecker) visit(path string, entry fs.DirEntry, walkErr error) error
 	return nil
 }
 
-func ignoredDirectory(name string) bool {
+func ignoredDirectory(root, path, name string) bool {
+	rel, err := filepath.Rel(root, path)
+	if err == nil && productionLoadPackage(modulePath+"/"+filepath.ToSlash(rel)) {
+		return false
+	}
 	return strings.HasPrefix(name, ".") || name == "vendor" || name == "testdata" || name == "testutil" || strings.HasSuffix(name, "test")
 }
 
@@ -92,7 +96,16 @@ func checkFile(root, path string) error {
 	return errors.Join(violations...)
 }
 
+// Exempt only the two production load packages, never arbitrary test suffixes
+// or their subpackages. Their files still receive all ordinary import checks.
+func productionLoadPackage(path string) bool {
+	return path == modulePath+"/internal/loadtest" || path == modulePath+"/cmd/loadtest"
+}
+
 func forbiddenImport(path string) bool {
+	if productionLoadPackage(path) {
+		return false
+	}
 	if path == "internal/synctest" || path == "github.com/cockroachdb/pebble/v2/internal/blobtest" {
 		return false
 	}
@@ -101,6 +114,10 @@ func forbiddenImport(path string) bool {
 		strings.Contains("/"+path+"/", "/internal/testutil/") {
 		return true
 	}
+	return testNamedImport(path)
+}
+
+func testNamedImport(path string) bool {
 	for _, part := range strings.Split(path, "/") {
 		if strings.HasSuffix(part, "test") {
 			return true

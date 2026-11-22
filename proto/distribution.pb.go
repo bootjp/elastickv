@@ -1025,6 +1025,10 @@ type SplitJob struct {
 	TransferPreflightDone     bool                       `protobuf:"varint,39,opt,name=transfer_preflight_done,json=transferPreflightDone,proto3" json:"transfer_preflight_done,omitempty"`
 	// Durable moving child created with its same-owner partition manifest.
 	WorkingSourceRouteId uint64 `protobuf:"varint,40,opt,name=working_source_route_id,json=workingSourceRouteId,proto3" json:"working_source_route_id,omitempty"`
+	OnlineCaptureVersion uint32 `protobuf:"varint,41,opt,name=online_capture_version,json=onlineCaptureVersion,proto3" json:"online_capture_version,omitempty"`
+	OnlineSequence       uint64 `protobuf:"varint,42,opt,name=online_sequence,json=onlineSequence,proto3" json:"online_sequence,omitempty"`
+	OnlineSealSequence   uint64 `protobuf:"varint,43,opt,name=online_seal_sequence,json=onlineSealSequence,proto3" json:"online_seal_sequence,omitempty"`
+	OnlineManifest       []byte `protobuf:"bytes,44,opt,name=online_manifest,json=onlineManifest,proto3" json:"online_manifest,omitempty"`
 	unknownFields        protoimpl.UnknownFields
 	sizeCache            protoimpl.SizeCache
 }
@@ -1337,6 +1341,34 @@ func (x *SplitJob) GetWorkingSourceRouteId() uint64 {
 		return x.WorkingSourceRouteId
 	}
 	return 0
+}
+
+func (x *SplitJob) GetOnlineCaptureVersion() uint32 {
+	if x != nil {
+		return x.OnlineCaptureVersion
+	}
+	return 0
+}
+
+func (x *SplitJob) GetOnlineSequence() uint64 {
+	if x != nil {
+		return x.OnlineSequence
+	}
+	return 0
+}
+
+func (x *SplitJob) GetOnlineSealSequence() uint64 {
+	if x != nil {
+		return x.OnlineSealSequence
+	}
+	return 0
+}
+
+func (x *SplitJob) GetOnlineManifest() []byte {
+	if x != nil {
+		return x.OnlineManifest
+	}
+	return nil
 }
 
 type ListRoutesRequest struct {
@@ -2954,7 +2986,7 @@ const file_distribution_proto_rawDesc = "" +
 	"\x04done\x18\x05 \x01(\bR\x04done\x12#\n" +
 	"\rscanned_bytes\x18\x06 \x01(\x04R\fscannedBytes\x12#\n" +
 	"\raccepted_rows\x18\a \x01(\x04R\facceptedRows\x12/\n" +
-	"\x14last_acked_batch_seq\x18\b \x01(\x04R\x11lastAckedBatchSeq\"\xff\x0f\n" +
+	"\x14last_acked_batch_seq\x18\b \x01(\x04R\x11lastAckedBatchSeq\"\xb9\x11\n" +
 	"\bSplitJob\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\x04R\x05jobId\x12&\n" +
 	"\x0fsource_route_id\x18\x02 \x01(\x04R\rsourceRouteId\x12\x1b\n" +
@@ -3000,7 +3032,11 @@ const file_distribution_proto_rawDesc = "" +
 	"\x15transfer_preflight_ts\x18% \x01(\x04R\x13transferPreflightTs\x12X\n" +
 	"\x1btransfer_preflight_progress\x18& \x03(\v2\x18.SplitJobBracketProgressR\x19transferPreflightProgress\x126\n" +
 	"\x17transfer_preflight_done\x18' \x01(\bR\x15transferPreflightDone\x125\n" +
-	"\x17working_source_route_id\x18( \x01(\x04R\x14workingSourceRouteId\"\x13\n" +
+	"\x17working_source_route_id\x18( \x01(\x04R\x14workingSourceRouteId\x124\n" +
+	"\x16online_capture_version\x18) \x01(\rR\x14onlineCaptureVersion\x12'\n" +
+	"\x0fonline_sequence\x18* \x01(\x04R\x0eonlineSequence\x120\n" +
+	"\x14online_seal_sequence\x18+ \x01(\x04R\x12onlineSealSequence\x12'\n" +
+	"\x0fonline_manifest\x18, \x01(\fR\x0eonlineManifest\"\x13\n" +
 	"\x11ListRoutesRequest\"g\n" +
 	"\x12ListRoutesResponse\x12'\n" +
 	"\x0fcatalog_version\x18\x01 \x01(\x04R\x0ecatalogVersion\x12(\n" +

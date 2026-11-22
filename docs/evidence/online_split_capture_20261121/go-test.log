@@ -1,0 +1,72 @@
+ok  	github.com/bootjp/elastickv	14.516s
+ok  	github.com/bootjp/elastickv/adapter	872.025s
+?   	github.com/bootjp/elastickv/cmd	[no test files]
+?   	github.com/bootjp/elastickv/cmd/client	[no test files]
+ok  	github.com/bootjp/elastickv/cmd/elastickv-admin	0.981s
+ok  	github.com/bootjp/elastickv/cmd/elastickv-backup	0.384s
+ok  	github.com/bootjp/elastickv/cmd/elastickv-list-routes	0.401s
+?   	github.com/bootjp/elastickv/cmd/elastickv-raft-stream-soak	[no test files]
+ok  	github.com/bootjp/elastickv/cmd/elastickv-route-key	0.287s
+ok  	github.com/bootjp/elastickv/cmd/elastickv-snapshot-archive	0.437s
+ok  	github.com/bootjp/elastickv/cmd/elastickv-snapshot-decode	1.092s
+ok  	github.com/bootjp/elastickv/cmd/elastickv-snapshot-encode	0.875s
+ok  	github.com/bootjp/elastickv/cmd/elastickv-snapshot-offload	1.146s
+ok  	github.com/bootjp/elastickv/cmd/elastickv-snapshot-prepare-restore	0.883s
+ok  	github.com/bootjp/elastickv/cmd/elastickv-split	0.492s
+ok  	github.com/bootjp/elastickv/cmd/jepsen-encryption-setup	0.392s
+ok  	github.com/bootjp/elastickv/cmd/jepsen-grpc-client	0.352s
+ok  	github.com/bootjp/elastickv/cmd/loadtest	0.455s
+ok  	github.com/bootjp/elastickv/cmd/raftadmin	0.412s
+ok  	github.com/bootjp/elastickv/cmd/redis-proxy	0.279s
+ok  	github.com/bootjp/elastickv/cmd/server	0.492s
+ok  	github.com/bootjp/elastickv/distribution	1.074s
+ok  	github.com/bootjp/elastickv/distribution/autosplit	0.425s
+ok  	github.com/bootjp/elastickv/internal	0.400s
+ok  	github.com/bootjp/elastickv/internal/admin	0.522s
+ok  	github.com/bootjp/elastickv/internal/adminbridge	0.469s
+ok  	github.com/bootjp/elastickv/internal/backup	2.338s
+ok  	github.com/bootjp/elastickv/internal/clusterbootstrap	0.516s
+ok  	github.com/bootjp/elastickv/internal/encryption	8.730s
+ok  	github.com/bootjp/elastickv/internal/encryption/encryptiontest	0.377s
+ok  	github.com/bootjp/elastickv/internal/encryption/fsmwire	0.287s
+ok  	github.com/bootjp/elastickv/internal/encryption/kek	0.443s
+ok  	github.com/bootjp/elastickv/internal/encryptionwiring	11.429s
+ok  	github.com/bootjp/elastickv/internal/filesystem	80.306s
+ok  	github.com/bootjp/elastickv/internal/filesystem/fstest	0.483s
+ok  	github.com/bootjp/elastickv/internal/filesystem/fuseadapter	10.502s
+ok  	github.com/bootjp/elastickv/internal/fskeys	0.273s
+ok  	github.com/bootjp/elastickv/internal/fsmount	2.469s
+ok  	github.com/bootjp/elastickv/internal/leaderbalance	0.535s
+ok  	github.com/bootjp/elastickv/internal/loadtest	0.818s
+ok  	github.com/bootjp/elastickv/internal/memwatch	0.304s
+ok  	github.com/bootjp/elastickv/internal/monoclock	0.240s
+ok  	github.com/bootjp/elastickv/internal/nodeauth	0.538s
+ok  	github.com/bootjp/elastickv/internal/noderuntime	0.544s
+?   	github.com/bootjp/elastickv/internal/pathsafety	[no test files]
+ok  	github.com/bootjp/elastickv/internal/peersession	0.696s
+?   	github.com/bootjp/elastickv/internal/peersession/wire	[no test files]
+ok  	github.com/bootjp/elastickv/internal/raftadmin	0.593s
+ok  	github.com/bootjp/elastickv/internal/raftadmission	0.378s
+ok  	github.com/bootjp/elastickv/internal/raftbootstrap	9.285s
+ok  	github.com/bootjp/elastickv/internal/raftengine	0.333s
+ok  	github.com/bootjp/elastickv/internal/raftengine/etcd	338.059s
+ok  	github.com/bootjp/elastickv/internal/raftengine/etcd/transportsoak	1.193s
+ok  	github.com/bootjp/elastickv/internal/raftengine/raftenginetest	0.879s
+ok  	github.com/bootjp/elastickv/internal/runtimehealth	1.369s
+ok  	github.com/bootjp/elastickv/internal/s3keys	0.479s
+ok  	github.com/bootjp/elastickv/internal/server	603.136s
+ok  	github.com/bootjp/elastickv/internal/serverwiring	0.510s
+ok  	github.com/bootjp/elastickv/internal/snapshotoffload	23.131s
+ok  	github.com/bootjp/elastickv/internal/snapshotoffloadwiring	1.242s
+ok  	github.com/bootjp/elastickv/internal/testutil	0.791s
+ok  	github.com/bootjp/elastickv/internal/testutil/cmd/importguard	0.283s
+ok  	github.com/bootjp/elastickv/internal/testutil/grpctest	0.355s
+ok  	github.com/bootjp/elastickv/internal/tsowiring	0.468s
+ok  	github.com/bootjp/elastickv/keyviz	0.336s
+ok  	github.com/bootjp/elastickv/kv	56.355s
+ok  	github.com/bootjp/elastickv/kv/kvtest	0.528s
+ok  	github.com/bootjp/elastickv/monitoring	2.105s
+?   	github.com/bootjp/elastickv/proto	[no test files]
+ok  	github.com/bootjp/elastickv/proxy	2.807s
+ok  	github.com/bootjp/elastickv/store	123.137s
+ok  	github.com/bootjp/elastickv/store/storetest	0.548s

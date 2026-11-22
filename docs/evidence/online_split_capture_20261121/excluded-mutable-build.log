@@ -1,0 +1,3 @@
+Excluded: source files changed during this build; validation was restarted from immutable commit 3867cd45fcaee145b244079e0e4372ea229c2786
+# github.com/bootjp/elastickv/kv [github.com/bootjp/elastickv/kv.test]
+kv/fsm_migration_capture_shadow.go:31:49: undefined: store.MaxMigrationCaptureRequests

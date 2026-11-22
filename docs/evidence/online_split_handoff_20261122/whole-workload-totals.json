@@ -1,0 +1,20 @@
+{
+  "baseline": {
+    "actual_stage_seconds": 720.532698726,
+    "read_success": 100138,
+    "write_success": 99988,
+    "dropped_capacity": 128677,
+    "dropped_scheduler": 13192,
+    "read_success_ops_s": 138.97773158256055,
+    "write_success_ops_s": 138.7695522726344
+  },
+  "fixed": {
+    "actual_stage_seconds": 720.48674124,
+    "read_success": 97584,
+    "write_success": 97557,
+    "dropped_capacity": 133679,
+    "dropped_scheduler": 13180,
+    "read_success_ops_s": 135.44177070080735,
+    "write_success_ops_s": 135.40429603478708
+  }
+}

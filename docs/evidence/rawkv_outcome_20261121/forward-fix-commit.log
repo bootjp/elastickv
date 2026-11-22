@@ -1,0 +1,4 @@
+golangci-lint --config=.golangci.yaml run --fix
+0 issues.
+[perf/linux-split-load-ramp f78f24e4f] Reject mixed Forward errors before decoding outcomes
+ 2 files changed, 17 insertions(+)

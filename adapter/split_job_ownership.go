@@ -124,10 +124,11 @@ func (s *DistributionServer) splitOwnershipConfiguration(ctx context.Context, jo
 		if err != nil {
 			return 0, "", err
 		}
+		peerGeneration := splitProbeOwnershipGeneration(resp)
 		if n == 0 {
-			index, generation = resp.GetAppliedConfigurationIndex(), resp.GetOwnershipGeneration()
+			index, generation = resp.GetAppliedConfigurationIndex(), peerGeneration
 		}
-		if index != resp.GetAppliedConfigurationIndex() || generation != resp.GetOwnershipGeneration() {
+		if index != resp.GetAppliedConfigurationIndex() || generation != peerGeneration {
 			return 0, "", errors.WithStack(errSplitMigrationVoterBarrierIncomplete)
 		}
 	}
@@ -272,4 +273,11 @@ func (s *DistributionServer) verifySplitOwnershipRuntimes(ctx context.Context, j
 	}
 	_, _, err = s.splitOwnershipConfiguration(ctx, job.JobID, job.TargetGroupID, target)
 	return err
+}
+
+func splitProbeOwnershipGeneration(response *pb.ProbeMigrationStateResponse) string {
+	if generation := response.GetOwnershipGeneration(); generation != "" {
+		return generation
+	}
+	return response.GetOnlineSourceGeneration()
 }

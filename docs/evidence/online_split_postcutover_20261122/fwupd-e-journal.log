@@ -1,0 +1,11 @@
+Nov 21 19:41:04 elastickv-perf-20261119 systemd[1]: Starting fwupd-refresh.service - Refresh fwupd metadata and update motd...
+Nov 21 19:41:04 elastickv-perf-20261119 systemd[1]: Starting fwupd.service - Firmware update daemon...
+Nov 21 19:41:07 elastickv-perf-20261119 fwupd[4380]: 19:41:07.247 FuEngine             failed to add device /sys/devices/pci0000:00/0000:00:01.1/ata2/host1/target1:0:0/1:0:0:0/block/sr0: failed to subclass open: failed to open /dev/sr0: Operation not permitted
+Nov 21 19:41:07 elastickv-perf-20261119 fwupd[4380]: 19:41:07.254 FuEngine             failed to add device /sys/devices/pci0000:00/0000:00:01.1/ata2/host1/target1:0:0/1:0:0:0/block/sr0: failed to subclass open: failed to open /dev/sr0: Operation not permitted
+Nov 21 19:41:07 elastickv-perf-20261119 fwupd[4380]: 19:41:07.296 FuMain               fwupd 2.0.20 ready for requests (locale C.UTF-8)
+Nov 21 19:41:07 elastickv-perf-20261119 systemd[1]: Started fwupd.service - Firmware update daemon.
+Nov 21 19:41:07 elastickv-perf-20261119 fwupdmgr[4370]: Updating lvfs
+Nov 21 19:41:07 elastickv-perf-20261119 fwupdmgr[4370]: Successfully downloaded new metadata:
+Nov 21 19:41:07 elastickv-perf-20261119 fwupdmgr[4370]:  • No devices are updatable
+Nov 21 19:41:07 elastickv-perf-20261119 systemd[1]: fwupd-refresh.service: Deactivated successfully.
+Nov 21 19:41:07 elastickv-perf-20261119 systemd[1]: Finished fwupd-refresh.service - Refresh fwupd metadata and update motd.

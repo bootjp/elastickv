@@ -302,7 +302,7 @@ func (t *leaseRefreshingTxn) commitAdmitted(ctx context.Context, reqs []*pb.Requ
 		return nil, err
 	}
 	if err := t.stampRawTimestampsForLocalCommit(ctx, reqs); err != nil {
-		return nil, err
+		return nil, markDataRequestNotSubmitted(reqs, err)
 	}
 	resp, leaderCommitTS, err := t.commitWithLocalStamp(ctx, reqs)
 	if err != nil {
@@ -1136,7 +1136,7 @@ func (c *ShardedCoordinator) dispatchBeforeShardRouting(ctx context.Context, req
 		return resp, true, err
 	}
 	if err := c.rejectWriteFencedPointElems(reqs.Elems); err != nil {
-		return nil, true, err
+		return nil, true, markRawPointAdmission(reqs, err)
 	}
 	return nil, false, nil
 }
@@ -1411,14 +1411,16 @@ func isComposed1RetryableError(err error) bool {
 // count within the cyclop budget after the 7a registration gate landed.
 func (c *ShardedCoordinator) dispatchNonTxn(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, rawDispatchShape, error) {
 	if err := c.rejectWriteFencedPointElems(reqs.Elems); err != nil {
-		return nil, rawDispatchShape{}, err
+		rejected := markRawPointAdmission(reqs, err)
+		return nil, rawPointAdmissionShape(reqs, rejected), rejected
 	}
 	if hasExplicitGroupElem(reqs.Elems) {
 		return c.dispatchExplicitGroupNonTxn(ctx, reqs)
 	}
 	logs, err := c.requestLogs(ctx, reqs)
 	if err != nil {
-		return nil, rawDispatchShape{}, err
+		rejected := markRawPointAdmission(reqs, err)
+		return nil, rawPointAdmissionShape(reqs, rejected), rejected
 	}
 	r, groupCount, err := c.router.commitWithGroupCount(ctx, logs)
 	shape := rawDispatchShape{groupCount: groupCount, requestCount: len(logs)}
@@ -1461,16 +1463,19 @@ func (c *ShardedCoordinator) dispatchExplicitGroupNonTxn(ctx context.Context, re
 }
 
 func (c *ShardedCoordinator) dispatchRawWithComposed1Retry(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
+	if err := c.initialRawAdmission(reqs); err != nil {
+		return nil, err
+	}
+
 	for attempt := 0; attempt <= composed1RetryAttempts; attempt++ {
 		resp, shape, err := c.dispatchRawWithFenceRetry(ctx, reqs)
 		if err == nil {
 			return resp, nil
 		}
-		if errors.Is(err, ErrTransactionOutcomeUnknown) ||
-			!errors.Is(err, ErrComposed1VersionGCd) || attempt == composed1RetryAttempts || c.engine == nil {
-			return resp, err
+		if rejection, proven := classifyFirstRawRejection(err, shape, attempt == 0); proven {
+			return resp, rejection
 		}
-		if !shape.singleRequest() || !c.canRetryRawVersionGC(reqs) {
+		if !c.retryableRawVersionGCFailure(reqs, shape, err, attempt) {
 			return resp, err
 		}
 		reqs.ObservedRouteVersion = c.engine.Version()

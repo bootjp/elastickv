@@ -1,0 +1,1424 @@
+{
+  "binary_sha256": {
+    "baseline-server.test": "33b97a8b6b2707eb3d052b21ed89cf7831fab222a72bbd596f397ecc0c77446e",
+    "candidate-server.test": "bd98c2ca5c46ce35d9aad99d4e34acc76be9c5d6f467a2542b6e7c85dca78f82",
+    "loadtest-window": "8350c069ee061ac2c89a1c876b3391a977d86eb724eca25837625aba993f8acc"
+  },
+  "source_commits": {
+    "baseline": "8c2282837ecee54d51c664c67576a8f90e5f90e4",
+    "candidate": "c664c80bb954a462b145846b602f6e13849b0cbe"
+  },
+  "vm": {
+    "id": 150,
+    "vcpus": 8,
+    "memory_gib": 8,
+    "nodes": 3,
+    "replication_groups": 2,
+    "sync_persistence": true,
+    "profiling": false
+  },
+  "common_duration_seconds": 65.0,
+  "common_post_done_seconds": 8.0,
+  "method": "Each cross-group window starts at the reported migration request start, anchored to the streamed Done observation (phase polling at 100ms). Count client RPC completions within the window. p99 uses successful single primary RPCs, excluding verification and audit. Common rate comparison covers equal whole seconds after request start within stage 300. Exclusive VM reservation and the same runtime firmware-service masks cover both baseline/candidate runs in A/B order; one pair, no mutation retries. Both server binaries built with Go 1.27.3. The fixed tail is the last 10 seconds of stage 300 after catalog cutover; a tail overlapping Cleanup is explicitly flagged. The post-Done comparison uses the largest common whole-second duration remaining at rate 300. Historical concurrent/intermediate runs are excluded.",
+  "baseline": {
+    "config": {
+      "rates": [
+        100,
+        300,
+        500,
+        1000
+      ],
+      "stage_duration_ns": 90000000000,
+      "concurrency": 32,
+      "read_percent": 50,
+      "seed_keys": 256,
+      "value_bytes": 1024,
+      "max_requests": 1000000,
+      "prefix": "split-ramp",
+      "request_timeout_ns": 2000000000,
+      "verify_writes": true
+    },
+    "stages": [
+      {
+        "index": 0,
+        "offered_rps": 100,
+        "started": "2026-11-21T19:42:59.335222749Z",
+        "elapsed_seconds": 90.005709513,
+        "planned": 9000,
+        "offered": 9000,
+        "dropped_capacity": 0,
+        "dropped_scheduler": 0,
+        "cancelled": false,
+        "read": {
+          "attempts": 4500,
+          "success": 4500,
+          "errors": {},
+          "latency": {
+            "samples": 4500,
+            "p50_ms": 3.046163,
+            "p95_ms": 6.633242,
+            "p99_ms": 8.357441,
+            "max_ms": 12.325031
+          },
+          "successful_latency": {
+            "samples": 4500,
+            "p50_ms": 3.046163,
+            "p95_ms": 6.633242,
+            "p99_ms": 8.357441,
+            "max_ms": 12.325031
+          }
+        },
+        "write": {
+          "attempts": 4500,
+          "success": 4500,
+          "errors": {},
+          "latency": {
+            "samples": 4500,
+            "p50_ms": 10.723174,
+            "p95_ms": 14.54332,
+            "p99_ms": 16.141275,
+            "max_ms": 27.16456
+          },
+          "successful_latency": {
+            "samples": 4500,
+            "p50_ms": 10.723174,
+            "p95_ms": 14.54332,
+            "p99_ms": 16.141275,
+            "max_ms": 27.16456
+          }
+        },
+        "verification": {
+          "attempts": 4500,
+          "success": 4500,
+          "errors": {},
+          "latency": {
+            "samples": 4500,
+            "p50_ms": 2.806879,
+            "p95_ms": 3.993452,
+            "p99_ms": 6.286887,
+            "max_ms": 11.661944
+          },
+          "successful_latency": {
+            "samples": 4500,
+            "p50_ms": 2.806879,
+            "p95_ms": 3.993452,
+            "p99_ms": 6.286887,
+            "max_ms": 11.661944
+          }
+        },
+        "logical_scheduled_latency": {
+          "attempts": 9000,
+          "success": 9000,
+          "errors": {},
+          "latency": {
+            "samples": 9000,
+            "p50_ms": 9.654002,
+            "p95_ms": 17.880369,
+            "p99_ms": 19.816773,
+            "max_ms": 31.234444
+          },
+          "successful_latency": {
+            "samples": 9000,
+            "p50_ms": 9.654002,
+            "p95_ms": 17.880369,
+            "p99_ms": 19.816773,
+            "max_ms": 31.234444
+          }
+        },
+        "read_scheduled_latency": {
+          "attempts": 4500,
+          "success": 4500,
+          "errors": {},
+          "latency": {
+            "samples": 4500,
+            "p50_ms": 3.66131,
+            "p95_ms": 7.292018,
+            "p99_ms": 8.985762,
+            "max_ms": 12.810426
+          },
+          "successful_latency": {
+            "samples": 4500,
+            "p50_ms": 3.66131,
+            "p95_ms": 7.292018,
+            "p99_ms": 8.985762,
+            "max_ms": 12.810426
+          }
+        },
+        "write_scheduled_latency": {
+          "attempts": 4500,
+          "success": 4500,
+          "errors": {},
+          "latency": {
+            "samples": 4500,
+            "p50_ms": 14.25462,
+            "p95_ms": 18.751306,
+            "p99_ms": 20.620771,
+            "max_ms": 31.234444
+          },
+          "successful_latency": {
+            "samples": 4500,
+            "p50_ms": 14.25462,
+            "p95_ms": 18.751306,
+            "p99_ms": 20.620771,
+            "max_ms": 31.234444
+          }
+        },
+        "admitted": 9000,
+        "read_success_rps": 49.99682824954612,
+        "write_success_rps": 49.99682824954612,
+        "verification_success_rps": 49.99682824954612
+      },
+      {
+        "index": 1,
+        "offered_rps": 300,
+        "started": "2026-11-21T19:44:29.354615621Z",
+        "elapsed_seconds": 90.08226327,
+        "planned": 27000,
+        "offered": 27000,
+        "dropped_capacity": 217,
+        "dropped_scheduler": 3,
+        "cancelled": false,
+        "read": {
+          "attempts": 13393,
+          "success": 13387,
+          "errors": {
+            "Unknown": 6
+          },
+          "first_error": "rpc error: code = Unknown desc = route cutover pending",
+          "latency": {
+            "samples": 13393,
+            "p50_ms": 3.763336,
+            "p95_ms": 18.801226,
+            "p99_ms": 42.336151,
+            "max_ms": 600.186898
+          },
+          "successful_latency": {
+            "samples": 13387,
+            "p50_ms": 3.764038,
+            "p95_ms": 18.801226,
+            "p99_ms": 42.336151,
+            "max_ms": 600.186898
+          }
+        },
+        "write": {
+          "attempts": 13387,
+          "success": 13386,
+          "errors": {
+            "Unavailable": 1
+          },
+          "first_error": "rpc error: code = Unavailable desc = Route unavailable",
+          "latency": {
+            "samples": 13387,
+            "p50_ms": 10.055666,
+            "p95_ms": 64.362773,
+            "p99_ms": 109.65402,
+            "max_ms": 888.013596
+          },
+          "successful_latency": {
+            "samples": 13386,
+            "p50_ms": 10.055666,
+            "p95_ms": 64.362773,
+            "p99_ms": 109.65402,
+            "max_ms": 888.013596
+          }
+        },
+        "verification": {
+          "attempts": 13386,
+          "success": 13386,
+          "errors": {},
+          "latency": {
+            "samples": 13386,
+            "p50_ms": 2.201584,
+            "p95_ms": 18.709798,
+            "p99_ms": 44.291216,
+            "max_ms": 355.831225
+          },
+          "successful_latency": {
+            "samples": 13386,
+            "p50_ms": 2.201584,
+            "p95_ms": 18.709798,
+            "p99_ms": 44.291216,
+            "max_ms": 355.831225
+          }
+        },
+        "logical_scheduled_latency": {
+          "attempts": 26780,
+          "success": 26773,
+          "errors": {
+            "Unavailable": 1,
+            "Unknown": 6
+          },
+          "first_error": "rpc error: code = Unknown desc = route cutover pending",
+          "latency": {
+            "samples": 26780,
+            "p50_ms": 8.480784,
+            "p95_ms": 37.602491,
+            "p99_ms": 131.127176,
+            "max_ms": 918.361586
+          },
+          "successful_latency": {
+            "samples": 26773,
+            "p50_ms": 8.481369,
+            "p95_ms": 37.602491,
+            "p99_ms": 131.127176,
+            "max_ms": 918.361586
+          }
+        },
+        "read_scheduled_latency": {
+          "attempts": 13393,
+          "success": 13387,
+          "errors": {
+            "Unknown": 6
+          },
+          "first_error": "rpc error: code = Unknown desc = route cutover pending",
+          "latency": {
+            "samples": 13393,
+            "p50_ms": 4.310641,
+            "p95_ms": 19.439562,
+            "p99_ms": 42.826839,
+            "max_ms": 600.71298
+          },
+          "successful_latency": {
+            "samples": 13387,
+            "p50_ms": 4.313409,
+            "p95_ms": 19.439562,
+            "p99_ms": 42.826839,
+            "max_ms": 600.71298
+          }
+        },
+        "write_scheduled_latency": {
+          "attempts": 13387,
+          "success": 13386,
+          "errors": {
+            "Unavailable": 1
+          },
+          "first_error": "rpc error: code = Unavailable desc = Route unavailable",
+          "latency": {
+            "samples": 13387,
+            "p50_ms": 13.104083,
+            "p95_ms": 87.828456,
+            "p99_ms": 146.760255,
+            "max_ms": 918.361586
+          },
+          "successful_latency": {
+            "samples": 13386,
+            "p50_ms": 13.104083,
+            "p95_ms": 87.828456,
+            "p99_ms": 146.760255,
+            "max_ms": 918.361586
+          }
+        },
+        "admitted": 26780,
+        "read_success_rps": 148.60861077475013,
+        "write_success_rps": 148.59750981032386,
+        "verification_success_rps": 148.59750981032386
+      },
+      {
+        "index": 2,
+        "offered_rps": 500,
+        "started": "2026-11-21T19:45:59.46135221Z",
+        "elapsed_seconds": 90.109944802,
+        "planned": 45000,
+        "offered": 45000,
+        "dropped_capacity": 12842,
+        "dropped_scheduler": 61,
+        "cancelled": false,
+        "read": {
+          "attempts": 16020,
+          "success": 16020,
+          "errors": {},
+          "latency": {
+            "samples": 16020,
+            "p50_ms": 30.394619,
+            "p95_ms": 60.269347,
+            "p99_ms": 78.625248,
+            "max_ms": 134.704538
+          },
+          "successful_latency": {
+            "samples": 16020,
+            "p50_ms": 30.394619,
+            "p95_ms": 60.269347,
+            "p99_ms": 78.625248,
+            "max_ms": 134.704538
+          }
+        },
+        "write": {
+          "attempts": 16077,
+          "success": 16077,
+          "errors": {},
+          "latency": {
+            "samples": 16077,
+            "p50_ms": 96.680753,
+            "p95_ms": 142.301417,
+            "p99_ms": 161.57201,
+            "max_ms": 238.766717
+          },
+          "successful_latency": {
+            "samples": 16077,
+            "p50_ms": 96.680753,
+            "p95_ms": 142.301417,
+            "p99_ms": 161.57201,
+            "max_ms": 238.766717
+          }
+        },
+        "verification": {
+          "attempts": 16077,
+          "success": 16077,
+          "errors": {},
+          "latency": {
+            "samples": 16077,
+            "p50_ms": 33.767693,
+            "p95_ms": 64.056341,
+            "p99_ms": 83.621442,
+            "max_ms": 131.058448
+          },
+          "successful_latency": {
+            "samples": 16077,
+            "p50_ms": 33.767693,
+            "p95_ms": 64.056341,
+            "p99_ms": 83.621442,
+            "max_ms": 131.058448
+          }
+        },
+        "logical_scheduled_latency": {
+          "attempts": 32097,
+          "success": 32097,
+          "errors": {},
+          "latency": {
+            "samples": 32097,
+            "p50_ms": 63.974202,
+            "p95_ms": 177.729739,
+            "p99_ms": 205.68212,
+            "max_ms": 305.834148
+          },
+          "successful_latency": {
+            "samples": 32097,
+            "p50_ms": 63.974202,
+            "p95_ms": 177.729739,
+            "p99_ms": 205.68212,
+            "max_ms": 305.834148
+          }
+        },
+        "read_scheduled_latency": {
+          "attempts": 16020,
+          "success": 16020,
+          "errors": {},
+          "latency": {
+            "samples": 16020,
+            "p50_ms": 30.953525,
+            "p95_ms": 60.812349,
+            "p99_ms": 79.223709,
+            "max_ms": 135.409199
+          },
+          "successful_latency": {
+            "samples": 16020,
+            "p50_ms": 30.953525,
+            "p95_ms": 60.812349,
+            "p99_ms": 79.223709,
+            "max_ms": 135.409199
+          }
+        },
+        "write_scheduled_latency": {
+          "attempts": 16077,
+          "success": 16077,
+          "errors": {},
+          "latency": {
+            "samples": 16077,
+            "p50_ms": 133.189651,
+            "p95_ms": 190.476696,
+            "p99_ms": 217.536725,
+            "max_ms": 305.834148
+          },
+          "successful_latency": {
+            "samples": 16077,
+            "p50_ms": 133.189651,
+            "p95_ms": 190.476696,
+            "p99_ms": 217.536725,
+            "max_ms": 305.834148
+          }
+        },
+        "admitted": 32097,
+        "read_success_rps": 177.78281892415978,
+        "write_success_rps": 178.41537951583751,
+        "verification_success_rps": 178.41537951583751
+      },
+      {
+        "index": 3,
+        "offered_rps": 1000,
+        "started": "2026-11-21T19:47:29.600796425Z",
+        "elapsed_seconds": 90.118538056,
+        "planned": 90000,
+        "offered": 90000,
+        "dropped_capacity": 49751,
+        "dropped_scheduler": 6725,
+        "cancelled": false,
+        "read": {
+          "attempts": 16788,
+          "success": 16788,
+          "errors": {},
+          "latency": {
+            "samples": 16788,
+            "p50_ms": 30.530927,
+            "p95_ms": 61.914254,
+            "p99_ms": 82.668134,
+            "max_ms": 379.603795
+          },
+          "successful_latency": {
+            "samples": 16788,
+            "p50_ms": 30.530927,
+            "p95_ms": 61.914254,
+            "p99_ms": 82.668134,
+            "max_ms": 379.603795
+          }
+        },
+        "write": {
+          "attempts": 16736,
+          "success": 16736,
+          "errors": {},
+          "latency": {
+            "samples": 16736,
+            "p50_ms": 96.77805,
+            "p95_ms": 142.297338,
+            "p99_ms": 169.004245,
+            "max_ms": 973.259231
+          },
+          "successful_latency": {
+            "samples": 16736,
+            "p50_ms": 96.77805,
+            "p95_ms": 142.297338,
+            "p99_ms": 169.004245,
+            "max_ms": 973.259231
+          }
+        },
+        "verification": {
+          "attempts": 16736,
+          "success": 16736,
+          "errors": {},
+          "latency": {
+            "samples": 16736,
+            "p50_ms": 33.464247,
+            "p95_ms": 63.707677,
+            "p99_ms": 81.701333,
+            "max_ms": 369.293129
+          },
+          "successful_latency": {
+            "samples": 16736,
+            "p50_ms": 33.464247,
+            "p95_ms": 63.707677,
+            "p99_ms": 81.701333,
+            "max_ms": 369.293129
+          }
+        },
+        "logical_scheduled_latency": {
+          "attempts": 33524,
+          "success": 33524,
+          "errors": {},
+          "latency": {
+            "samples": 33524,
+            "p50_ms": 65.987326,
+            "p95_ms": 176.190031,
+            "p99_ms": 211.184922,
+            "max_ms": 1050.055344
+          },
+          "successful_latency": {
+            "samples": 33524,
+            "p50_ms": 65.987326,
+            "p95_ms": 176.190031,
+            "p99_ms": 211.184922,
+            "max_ms": 1050.055344
+          }
+        },
+        "read_scheduled_latency": {
+          "attempts": 16788,
+          "success": 16788,
+          "errors": {},
+          "latency": {
+            "samples": 16788,
+            "p50_ms": 30.871206,
+            "p95_ms": 62.363118,
+            "p99_ms": 83.127647,
+            "max_ms": 379.685899
+          },
+          "successful_latency": {
+            "samples": 16788,
+            "p50_ms": 30.871206,
+            "p95_ms": 62.363118,
+            "p99_ms": 83.127647,
+            "max_ms": 379.685899
+          }
+        },
+        "write_scheduled_latency": {
+          "attempts": 16736,
+          "success": 16736,
+          "errors": {},
+          "latency": {
+            "samples": 16736,
+            "p50_ms": 132.134671,
+            "p95_ms": 190.322955,
+            "p99_ms": 226.717598,
+            "max_ms": 1050.055344
+          },
+          "successful_latency": {
+            "samples": 16736,
+            "p50_ms": 132.134671,
+            "p95_ms": 190.322955,
+            "p99_ms": 226.717598,
+            "max_ms": 1050.055344
+          }
+        },
+        "admitted": 33524,
+        "read_success_rps": 186.28797539489457,
+        "write_success_rps": 185.7109576012006,
+        "verification_success_rps": 185.7109576012006
+      }
+    ],
+    "stage_300_end_ns": 1795290359354615621,
+    "after_cutover_300_tail": {
+      "seconds": 10.0,
+      "read": {
+        "attempts": 1497,
+        "success": 1497,
+        "ops_s": 149.7,
+        "success_p99_ms": 59.896347,
+        "all_p99_ms": 59.896347,
+        "errors": {}
+      },
+      "write": {
+        "attempts": 1486,
+        "success": 1486,
+        "ops_s": 148.6,
+        "success_p99_ms": 132.175554,
+        "all_p99_ms": 132.175554,
+        "errors": {}
+      }
+    },
+    "tail_includes_cleanup": true,
+    "split_all": {
+      "seconds": 76.551,
+      "read": {
+        "attempts": 11375,
+        "success": 11369,
+        "ops_s": 148.5153688390746,
+        "success_p99_ms": 16.329364,
+        "all_p99_ms": 16.329364,
+        "errors": {
+          "Unknown": 6
+        }
+      },
+      "write": {
+        "attempts": 11375,
+        "success": 11374,
+        "ops_s": 148.58068477224333,
+        "success_p99_ms": 32.923902,
+        "all_p99_ms": 32.923902,
+        "errors": {
+          "Unavailable": 1
+        }
+      }
+    },
+    "full_run": {
+      "read": {
+        "success": 50695,
+        "errors": {
+          "Unknown": 6
+        }
+      },
+      "write": {
+        "success": 50699,
+        "errors": {
+          "Unavailable": 1
+        }
+      }
+    },
+    "start_ns": 1795290274379183578,
+    "done_observed_ns": 1795290350930183578,
+    "phase_clock_offset_spread_ms": 0.803195,
+    "timing": {
+      "lower_ms": 1588.461,
+      "upper_ms": 1610.657,
+      "families": 46,
+      "completed": 46,
+      "versions": 2093,
+      "capture_version": 1,
+      "sequence": 2059,
+      "seal_sequence": 2059
+    },
+    "ingress_count": 3,
+    "ack_count": 50699,
+    "expected_observations": 152097,
+    "readback_success": 152097,
+    "audit_verified": true,
+    "post_done_paths": {
+      "moved-direct": [
+        600,
+        600,
+        600,
+        0
+      ],
+      "moved-forwarded": [
+        600,
+        600,
+        600,
+        0
+      ],
+      "outside-direct": [
+        600,
+        600,
+        600,
+        0
+      ],
+      "retained-direct": [
+        600,
+        600,
+        600,
+        0
+      ],
+      "retained-forwarded": [
+        600,
+        600,
+        600,
+        0
+      ]
+    },
+    "dropped_capacity": 62810,
+    "dropped_scheduler": 6789,
+    "driver_exit": "exit status 1",
+    "server_test_exit": 0,
+    "split_common_rate": {
+      "seconds": 65.0,
+      "read": {
+        "attempts": 9644,
+        "success": 9638,
+        "ops_s": 148.27692307692308,
+        "success_p99_ms": 16.732233,
+        "all_p99_ms": 16.732233,
+        "errors": {
+          "Unknown": 6
+        }
+      },
+      "write": {
+        "attempts": 9640,
+        "success": 9639,
+        "ops_s": 148.2923076923077,
+        "success_p99_ms": 35.382071,
+        "all_p99_ms": 35.382071,
+        "errors": {
+          "Unavailable": 1
+        }
+      }
+    },
+    "post_done_common_rate": {
+      "seconds": 8.0,
+      "read": {
+        "attempts": 1197,
+        "success": 1197,
+        "ops_s": 149.625,
+        "success_p99_ms": 61.727881,
+        "all_p99_ms": 61.727881,
+        "errors": {}
+      },
+      "write": {
+        "attempts": 1183,
+        "success": 1183,
+        "ops_s": 147.875,
+        "success_p99_ms": 133.167309,
+        "all_p99_ms": 133.167309,
+        "errors": {}
+      }
+    }
+  },
+  "candidate": {
+    "config": {
+      "rates": [
+        100,
+        300,
+        500,
+        1000
+      ],
+      "stage_duration_ns": 90000000000,
+      "concurrency": 32,
+      "read_percent": 50,
+      "seed_keys": 256,
+      "value_bytes": 1024,
+      "max_requests": 1000000,
+      "prefix": "split-ramp",
+      "request_timeout_ns": 2000000000,
+      "verify_writes": true
+    },
+    "stages": [
+      {
+        "index": 0,
+        "offered_rps": 100,
+        "started": "2026-11-21T19:50:31.249225237Z",
+        "elapsed_seconds": 90.005350835,
+        "planned": 9000,
+        "offered": 9000,
+        "dropped_capacity": 0,
+        "dropped_scheduler": 0,
+        "cancelled": false,
+        "read": {
+          "attempts": 4500,
+          "success": 4500,
+          "errors": {},
+          "latency": {
+            "samples": 4500,
+            "p50_ms": 3.10888,
+            "p95_ms": 6.521814,
+            "p99_ms": 8.534965,
+            "max_ms": 19.032466
+          },
+          "successful_latency": {
+            "samples": 4500,
+            "p50_ms": 3.10888,
+            "p95_ms": 6.521814,
+            "p99_ms": 8.534965,
+            "max_ms": 19.032466
+          }
+        },
+        "write": {
+          "attempts": 4500,
+          "success": 4500,
+          "errors": {},
+          "latency": {
+            "samples": 4500,
+            "p50_ms": 10.842276,
+            "p95_ms": 14.602709,
+            "p99_ms": 16.807082,
+            "max_ms": 22.042096
+          },
+          "successful_latency": {
+            "samples": 4500,
+            "p50_ms": 10.842276,
+            "p95_ms": 14.602709,
+            "p99_ms": 16.807082,
+            "max_ms": 22.042096
+          }
+        },
+        "verification": {
+          "attempts": 4500,
+          "success": 4500,
+          "errors": {},
+          "latency": {
+            "samples": 4500,
+            "p50_ms": 2.913566,
+            "p95_ms": 4.186146,
+            "p99_ms": 6.413073,
+            "max_ms": 16.084434
+          },
+          "successful_latency": {
+            "samples": 4500,
+            "p50_ms": 2.913566,
+            "p95_ms": 4.186146,
+            "p99_ms": 6.413073,
+            "max_ms": 16.084434
+          }
+        },
+        "logical_scheduled_latency": {
+          "attempts": 9000,
+          "success": 9000,
+          "errors": {},
+          "latency": {
+            "samples": 9000,
+            "p50_ms": 10.335426,
+            "p95_ms": 18.124426,
+            "p99_ms": 20.070331,
+            "max_ms": 29.944089
+          },
+          "successful_latency": {
+            "samples": 9000,
+            "p50_ms": 10.335426,
+            "p95_ms": 18.124426,
+            "p99_ms": 20.070331,
+            "max_ms": 29.944089
+          }
+        },
+        "read_scheduled_latency": {
+          "attempts": 4500,
+          "success": 4500,
+          "errors": {},
+          "latency": {
+            "samples": 4500,
+            "p50_ms": 3.740703,
+            "p95_ms": 7.158109,
+            "p99_ms": 9.149179,
+            "max_ms": 20.011605
+          },
+          "successful_latency": {
+            "samples": 4500,
+            "p50_ms": 3.740703,
+            "p95_ms": 7.158109,
+            "p99_ms": 9.149179,
+            "max_ms": 20.011605
+          }
+        },
+        "write_scheduled_latency": {
+          "attempts": 4500,
+          "success": 4500,
+          "errors": {},
+          "latency": {
+            "samples": 4500,
+            "p50_ms": 14.5449,
+            "p95_ms": 18.880139,
+            "p99_ms": 22.281649,
+            "max_ms": 29.944089
+          },
+          "successful_latency": {
+            "samples": 4500,
+            "p50_ms": 14.5449,
+            "p95_ms": 18.880139,
+            "p99_ms": 22.281649,
+            "max_ms": 29.944089
+          }
+        },
+        "admitted": 9000,
+        "read_success_rps": 49.997027490615636,
+        "write_success_rps": 49.997027490615636,
+        "verification_success_rps": 49.997027490615636
+      },
+      {
+        "index": 1,
+        "offered_rps": 300,
+        "started": "2026-11-21T19:52:01.268773196Z",
+        "elapsed_seconds": 90.004872286,
+        "planned": 27000,
+        "offered": 27000,
+        "dropped_capacity": 228,
+        "dropped_scheduler": 3,
+        "cancelled": false,
+        "read": {
+          "attempts": 13383,
+          "success": 13383,
+          "errors": {},
+          "latency": {
+            "samples": 13383,
+            "p50_ms": 2.997449,
+            "p95_ms": 8.10569,
+            "p99_ms": 12.399086,
+            "max_ms": 849.377673
+          },
+          "successful_latency": {
+            "samples": 13383,
+            "p50_ms": 2.997449,
+            "p95_ms": 8.10569,
+            "p99_ms": 12.399086,
+            "max_ms": 849.377673
+          }
+        },
+        "write": {
+          "attempts": 13386,
+          "success": 13382,
+          "errors": {
+            "Unavailable": 4
+          },
+          "first_error": "rpc error: code = Unavailable desc = Route unavailable",
+          "latency": {
+            "samples": 13386,
+            "p50_ms": 8.649431,
+            "p95_ms": 16.848563,
+            "p99_ms": 26.23459,
+            "max_ms": 926.375304
+          },
+          "successful_latency": {
+            "samples": 13382,
+            "p50_ms": 8.649759,
+            "p95_ms": 16.848563,
+            "p99_ms": 26.23459,
+            "max_ms": 926.375304
+          }
+        },
+        "verification": {
+          "attempts": 13382,
+          "success": 13382,
+          "errors": {},
+          "latency": {
+            "samples": 13382,
+            "p50_ms": 1.864338,
+            "p95_ms": 7.431765,
+            "p99_ms": 11.873022,
+            "max_ms": 397.734567
+          },
+          "successful_latency": {
+            "samples": 13382,
+            "p50_ms": 1.864338,
+            "p95_ms": 7.431765,
+            "p99_ms": 11.873022,
+            "max_ms": 397.734567
+          }
+        },
+        "logical_scheduled_latency": {
+          "attempts": 26769,
+          "success": 26765,
+          "errors": {
+            "Unavailable": 4
+          },
+          "first_error": "rpc error: code = Unavailable desc = Route unavailable",
+          "latency": {
+            "samples": 26769,
+            "p50_ms": 7.506959,
+            "p95_ms": 20.284912,
+            "p99_ms": 29.798477,
+            "max_ms": 973.757525
+          },
+          "successful_latency": {
+            "samples": 26765,
+            "p50_ms": 7.507265,
+            "p95_ms": 20.284912,
+            "p99_ms": 29.798477,
+            "max_ms": 973.757525
+          }
+        },
+        "read_scheduled_latency": {
+          "attempts": 13383,
+          "success": 13383,
+          "errors": {},
+          "latency": {
+            "samples": 13383,
+            "p50_ms": 3.531726,
+            "p95_ms": 8.598679,
+            "p99_ms": 13.026611,
+            "max_ms": 850.247404
+          },
+          "successful_latency": {
+            "samples": 13383,
+            "p50_ms": 3.531726,
+            "p95_ms": 8.598679,
+            "p99_ms": 13.026611,
+            "max_ms": 850.247404
+          }
+        },
+        "write_scheduled_latency": {
+          "attempts": 13386,
+          "success": 13382,
+          "errors": {
+            "Unavailable": 4
+          },
+          "first_error": "rpc error: code = Unavailable desc = Route unavailable",
+          "latency": {
+            "samples": 13386,
+            "p50_ms": 11.165497,
+            "p95_ms": 23.402146,
+            "p99_ms": 35.918747,
+            "max_ms": 973.757525
+          },
+          "successful_latency": {
+            "samples": 13382,
+            "p50_ms": 11.165765,
+            "p95_ms": 23.402146,
+            "p99_ms": 35.918747,
+            "max_ms": 973.757525
+          }
+        },
+        "admitted": 26769,
+        "read_success_rps": 148.6919503365785,
+        "write_success_rps": 148.6808398269516,
+        "verification_success_rps": 148.6808398269516
+      },
+      {
+        "index": 2,
+        "offered_rps": 500,
+        "started": "2026-11-21T19:53:31.294794913Z",
+        "elapsed_seconds": 90.086116904,
+        "planned": 45000,
+        "offered": 45000,
+        "dropped_capacity": 12920,
+        "dropped_scheduler": 45,
+        "cancelled": false,
+        "read": {
+          "attempts": 15935,
+          "success": 15935,
+          "errors": {},
+          "latency": {
+            "samples": 15935,
+            "p50_ms": 28.921148,
+            "p95_ms": 59.5565,
+            "p99_ms": 80.368391,
+            "max_ms": 131.667702
+          },
+          "successful_latency": {
+            "samples": 15935,
+            "p50_ms": 28.921148,
+            "p95_ms": 59.5565,
+            "p99_ms": 80.368391,
+            "max_ms": 131.667702
+          }
+        },
+        "write": {
+          "attempts": 16100,
+          "success": 16100,
+          "errors": {},
+          "latency": {
+            "samples": 16100,
+            "p50_ms": 96.997531,
+            "p95_ms": 145.275064,
+            "p99_ms": 169.360773,
+            "max_ms": 229.756432
+          },
+          "successful_latency": {
+            "samples": 16100,
+            "p50_ms": 96.997531,
+            "p95_ms": 145.275064,
+            "p99_ms": 169.360773,
+            "max_ms": 229.756432
+          }
+        },
+        "verification": {
+          "attempts": 16100,
+          "success": 16100,
+          "errors": {},
+          "latency": {
+            "samples": 16100,
+            "p50_ms": 31.7249,
+            "p95_ms": 62.839443,
+            "p99_ms": 80.123678,
+            "max_ms": 146.048122
+          },
+          "successful_latency": {
+            "samples": 16100,
+            "p50_ms": 31.7249,
+            "p95_ms": 62.839443,
+            "p99_ms": 80.123678,
+            "max_ms": 146.048122
+          }
+        },
+        "logical_scheduled_latency": {
+          "attempts": 32035,
+          "success": 32035,
+          "errors": {},
+          "latency": {
+            "samples": 32035,
+            "p50_ms": 60.032747,
+            "p95_ms": 179.02662,
+            "p99_ms": 211.138109,
+            "max_ms": 299.754251
+          },
+          "successful_latency": {
+            "samples": 32035,
+            "p50_ms": 60.032747,
+            "p95_ms": 179.02662,
+            "p99_ms": 211.138109,
+            "max_ms": 299.754251
+          }
+        },
+        "read_scheduled_latency": {
+          "attempts": 15935,
+          "success": 15935,
+          "errors": {},
+          "latency": {
+            "samples": 15935,
+            "p50_ms": 29.463435,
+            "p95_ms": 60.126976,
+            "p99_ms": 80.598406,
+            "max_ms": 131.693349
+          },
+          "successful_latency": {
+            "samples": 15935,
+            "p50_ms": 29.463435,
+            "p95_ms": 60.126976,
+            "p99_ms": 80.598406,
+            "max_ms": 131.693349
+          }
+        },
+        "write_scheduled_latency": {
+          "attempts": 16100,
+          "success": 16100,
+          "errors": {},
+          "latency": {
+            "samples": 16100,
+            "p50_ms": 131.795512,
+            "p95_ms": 193.53959,
+            "p99_ms": 224.054597,
+            "max_ms": 299.754251
+          },
+          "successful_latency": {
+            "samples": 16100,
+            "p50_ms": 131.795512,
+            "p95_ms": 193.53959,
+            "p99_ms": 224.054597,
+            "max_ms": 299.754251
+          }
+        },
+        "admitted": 32035,
+        "read_success_rps": 176.88630110432095,
+        "write_success_rps": 178.717881881366,
+        "verification_success_rps": 178.717881881366
+      },
+      {
+        "index": 3,
+        "offered_rps": 1000,
+        "started": "2026-11-21T19:55:01.412163182Z",
+        "elapsed_seconds": 90.121335887,
+        "planned": 90000,
+        "offered": 90000,
+        "dropped_capacity": 48838,
+        "dropped_scheduler": 6365,
+        "cancelled": false,
+        "read": {
+          "attempts": 17431,
+          "success": 17431,
+          "errors": {},
+          "latency": {
+            "samples": 17431,
+            "p50_ms": 28.40762,
+            "p95_ms": 58.46561,
+            "p99_ms": 77.760175,
+            "max_ms": 811.470708
+          },
+          "successful_latency": {
+            "samples": 17431,
+            "p50_ms": 28.40762,
+            "p95_ms": 58.46561,
+            "p99_ms": 77.760175,
+            "max_ms": 811.470708
+          }
+        },
+        "write": {
+          "attempts": 17366,
+          "success": 17366,
+          "errors": {},
+          "latency": {
+            "samples": 17366,
+            "p50_ms": 93.553305,
+            "p95_ms": 138.832377,
+            "p99_ms": 162.356112,
+            "max_ms": 973.788263
+          },
+          "successful_latency": {
+            "samples": 17366,
+            "p50_ms": 93.553305,
+            "p95_ms": 138.832377,
+            "p99_ms": 162.356112,
+            "max_ms": 973.788263
+          }
+        },
+        "verification": {
+          "attempts": 17366,
+          "success": 17366,
+          "errors": {},
+          "latency": {
+            "samples": 17366,
+            "p50_ms": 31.889543,
+            "p95_ms": 61.09829,
+            "p99_ms": 79.160924,
+            "max_ms": 714.047624
+          },
+          "successful_latency": {
+            "samples": 17366,
+            "p50_ms": 31.889543,
+            "p95_ms": 61.09829,
+            "p99_ms": 79.160924,
+            "max_ms": 714.047624
+          }
+        },
+        "logical_scheduled_latency": {
+          "attempts": 34797,
+          "success": 34797,
+          "errors": {},
+          "latency": {
+            "samples": 34797,
+            "p50_ms": 62.992261,
+            "p95_ms": 171.124249,
+            "p99_ms": 201.382627,
+            "max_ms": 1046.491477
+          },
+          "successful_latency": {
+            "samples": 34797,
+            "p50_ms": 62.992261,
+            "p95_ms": 171.124249,
+            "p99_ms": 201.382627,
+            "max_ms": 1046.491477
+          }
+        },
+        "read_scheduled_latency": {
+          "attempts": 17431,
+          "success": 17431,
+          "errors": {},
+          "latency": {
+            "samples": 17431,
+            "p50_ms": 28.812993,
+            "p95_ms": 58.850544,
+            "p99_ms": 78.296861,
+            "max_ms": 812.402547
+          },
+          "successful_latency": {
+            "samples": 17431,
+            "p50_ms": 28.812993,
+            "p95_ms": 58.850544,
+            "p99_ms": 78.296861,
+            "max_ms": 812.402547
+          }
+        },
+        "write_scheduled_latency": {
+          "attempts": 17366,
+          "success": 17366,
+          "errors": {},
+          "latency": {
+            "samples": 17366,
+            "p50_ms": 127.656983,
+            "p95_ms": 183.421546,
+            "p99_ms": 213.814437,
+            "max_ms": 1046.491477
+          },
+          "successful_latency": {
+            "samples": 17366,
+            "p50_ms": 127.656983,
+            "p95_ms": 183.421546,
+            "p99_ms": 213.814437,
+            "max_ms": 1046.491477
+          }
+        },
+        "admitted": 34797,
+        "read_success_rps": 193.4170174957917,
+        "write_success_rps": 192.69576764568404,
+        "verification_success_rps": 192.69576764568404
+      }
+    ],
+    "stage_300_end_ns": 1795290811268773196,
+    "after_cutover_300_tail": {
+      "seconds": 10.0,
+      "read": {
+        "attempts": 1500,
+        "success": 1500,
+        "ops_s": 150.0,
+        "success_p99_ms": 7.061901,
+        "all_p99_ms": 7.061901,
+        "errors": {}
+      },
+      "write": {
+        "attempts": 1500,
+        "success": 1500,
+        "ops_s": 150.0,
+        "success_p99_ms": 12.196355,
+        "all_p99_ms": 12.196355,
+        "errors": {}
+      }
+    },
+    "tail_includes_cleanup": false,
+    "split_all": {
+      "seconds": 65.122,
+      "read": {
+        "attempts": 9651,
+        "success": 9651,
+        "ops_s": 148.19876539418323,
+        "success_p99_ms": 14.387807,
+        "all_p99_ms": 14.387807,
+        "errors": {}
+      },
+      "write": {
+        "attempts": 9656,
+        "success": 9652,
+        "ops_s": 148.2141211879242,
+        "success_p99_ms": 38.033656,
+        "all_p99_ms": 38.033656,
+        "errors": {
+          "Unavailable": 4
+        }
+      }
+    },
+    "full_run": {
+      "read": {
+        "success": 51249,
+        "errors": {}
+      },
+      "write": {
+        "success": 51348,
+        "errors": {
+          "Unavailable": 4
+        }
+      }
+    },
+    "start_ns": 1795290726398396766,
+    "done_observed_ns": 1795290791520396766,
+    "phase_clock_offset_spread_ms": 0.741938,
+    "timing": {
+      "lower_ms": 1508.267,
+      "upper_ms": 1530.22,
+      "families": 46,
+      "completed": 46,
+      "versions": 2123,
+      "capture_version": 1,
+      "sequence": 1450,
+      "seal_sequence": 1450
+    },
+    "ingress_count": 3,
+    "ack_count": 51348,
+    "expected_observations": 154044,
+    "readback_success": 154044,
+    "audit_verified": true,
+    "post_done_paths": {
+      "moved-forwarded": [
+        600,
+        600,
+        600,
+        0
+      ],
+      "retained-forwarded": [
+        600,
+        600,
+        600,
+        0
+      ],
+      "moved-direct": [
+        600,
+        600,
+        600,
+        0
+      ],
+      "retained-direct": [
+        600,
+        600,
+        600,
+        0
+      ],
+      "outside-direct": [
+        600,
+        600,
+        600,
+        0
+      ]
+    },
+    "dropped_capacity": 61986,
+    "dropped_scheduler": 6413,
+    "driver_exit": "exit status 1",
+    "server_test_exit": 0,
+    "split_common_rate": {
+      "seconds": 65.0,
+      "read": {
+        "attempts": 9633,
+        "success": 9633,
+        "ops_s": 148.2,
+        "success_p99_ms": 14.387807,
+        "all_p99_ms": 14.387807,
+        "errors": {}
+      },
+      "write": {
+        "attempts": 9637,
+        "success": 9633,
+        "ops_s": 148.2,
+        "success_p99_ms": 38.033656,
+        "all_p99_ms": 38.033656,
+        "errors": {
+          "Unavailable": 4
+        }
+      }
+    },
+    "post_done_common_rate": {
+      "seconds": 8.0,
+      "read": {
+        "attempts": 1200,
+        "success": 1200,
+        "ops_s": 150.0,
+        "success_p99_ms": 6.827293,
+        "all_p99_ms": 6.827293,
+        "errors": {}
+      },
+      "write": {
+        "attempts": 1199,
+        "success": 1199,
+        "ops_s": 149.875,
+        "success_p99_ms": 12.159535,
+        "all_p99_ms": 12.159535,
+        "errors": {}
+      }
+    }
+  }
+}

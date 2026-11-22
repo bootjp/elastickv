@@ -1,0 +1,89 @@
+{
+  "observed_ns": 1795345416493707865,
+  "isolation": {
+    "command": [
+      "python3",
+      "-u",
+      "/var/tmp/elastickv-sync-throughput-20261122/taskqueue.py"
+    ],
+    "before": {
+      "fwupd-refresh.timer": {
+        "LoadState": "loaded",
+        "ActiveState": "active",
+        "UnitFileState": "enabled"
+      },
+      "fwupd-refresh.service": {
+        "LoadState": "loaded",
+        "ActiveState": "inactive",
+        "UnitFileState": "static"
+      },
+      "fwupd.service": {
+        "LoadState": "loaded",
+        "ActiveState": "inactive",
+        "UnitFileState": "static"
+      }
+    },
+    "isolated": {
+      "fwupd-refresh.timer": {
+        "LoadState": "masked",
+        "ActiveState": "failed",
+        "UnitFileState": "masked-runtime"
+      },
+      "fwupd-refresh.service": {
+        "LoadState": "masked",
+        "ActiveState": "inactive",
+        "UnitFileState": "masked-runtime"
+      },
+      "fwupd.service": {
+        "LoadState": "masked",
+        "ActiveState": "inactive",
+        "UnitFileState": "masked-runtime"
+      }
+    },
+    "started_ns": 1795340995698795467,
+    "ended_ns": 1795345366580541193,
+    "exit_code": 0,
+    "restored": {
+      "fwupd-refresh.timer": {
+        "LoadState": "loaded",
+        "ActiveState": "active",
+        "UnitFileState": "enabled"
+      },
+      "fwupd-refresh.service": {
+        "LoadState": "loaded",
+        "ActiveState": "activating",
+        "UnitFileState": "static"
+      },
+      "fwupd.service": {
+        "LoadState": "loaded",
+        "ActiveState": "inactive",
+        "UnitFileState": "static"
+      }
+    },
+    "restore_errors": []
+  },
+  "current_unit_states": {
+    "fwupd-refresh.timer": {
+      "LoadState": "loaded",
+      "ActiveState": "active",
+      "UnitFileState": "enabled"
+    },
+    "fwupd-refresh.service": {
+      "LoadState": "loaded",
+      "ActiveState": "inactive",
+      "UnitFileState": "static"
+    },
+    "fwupd.service": {
+      "LoadState": "loaded",
+      "ActiveState": "active",
+      "UnitFileState": "static"
+    }
+  },
+  "restoration_note": "Original unit configuration and timer state are restored. Restarting the overdue timer may activate its normal firmware service after isolation ended.",
+  "firmware_service_events_during_isolation": 0,
+  "live_workload_or_profiler": [],
+  "host_lock_available": true,
+  "mount": "/dev/vda1 ext4   rw,relatime,discard,errors=remount-ro,commit=30",
+  "uname": "Linux elastickv-perf-20261119 6.8.0-149-generic #149-Ubuntu SMP PREEMPT_DYNAMIC Fri Oct 23 13:21:10 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux",
+  "online_cpus": 8
+}

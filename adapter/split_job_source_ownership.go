@@ -7,6 +7,7 @@ import (
 
 	"github.com/bootjp/elastickv/distribution"
 	pb "github.com/bootjp/elastickv/proto"
+	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"google.golang.org/protobuf/proto"
 )
@@ -35,23 +36,15 @@ func (s *DistributionServer) armSplitSourceOwnership(ctx context.Context, job di
 		return nil, false, err
 	}
 	minimum := max(initialMigrationRetentionPinTS, proof.GetMinWriteTsExclusive())
-	if _, err := applySplitMigrationControl(ctx, source, job, proof.GetRouteEnd(), proof.GetSourceTrackerVersion(), minimum,
-		false, false, true, initialMigrationRetentionPinTS); err != nil {
+	control := splitMigrationControlRequest(job, proof.GetRouteEnd(), proof.GetSourceTrackerVersion(), minimum, false, false, true, initialMigrationRetentionPinTS)
+	if err := s.configureOnlineSourceTracker(ctx, job, prior, proof, configuration, control); err != nil {
 		return nil, false, err
 	}
-	acks, complete, err := s.syncSplitMigrationVoterBarrier(ctx, groupID, job.FenceAckCursor, source, &pb.ProbeMigrationStateRequest{
-		JobId: job.JobID, Kind: pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_CONTROL_APPLIED,
-		RouteStart: job.SplitKey, RouteEnd: proof.GetRouteEnd(), ExpectedCatalogVersion: proof.GetSourceTrackerVersion(),
-		MigrationJobId: job.JobID, MinWriteTsExclusive: minimum, TrackWrites: true, RetentionPinTs: initialMigrationRetentionPinTS,
-		RequireConfigurationIndex: true, ExpectedConfigurationIndex: configuration})
-	if err != nil || !complete {
-		return acks, false, err
+	if _, err := source.ApplyTargetStagedReadiness(ctx, control); err != nil {
+		return nil, false, errors.WithStack(err)
 	}
-	if _, err := cleanupSplitMigration(ctx, source, &pb.CleanupMigrationRequest{JobId: job.JobID, Mode: mode,
-		RequireConfigurationIndex: true, ExpectedConfigurationIndex: configuration, Ownership: proof}); err != nil {
-		return nil, false, err
-	}
-	return s.ackSplitSourceOwnership(ctx, job, groupID, configuration, source, proof)
+
+	return s.finishArmingSplitSourceOwnership(ctx, job, groupID, configuration, source, proof, mode, minimum)
 }
 
 func splitSourceOwnershipProof(snapshot distribution.CatalogSnapshot, job distribution.SplitJob, groupID uint64, generation string) (*pb.MigrationOwnershipProof, error) {
@@ -114,4 +107,45 @@ func probeSplitSourceOwnershipState(ctx context.Context, source SplitMigrationCl
 		Kind:                      pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_OWNERSHIP_APPLIED,
 		RequireConfigurationIndex: true, ExpectedConfigurationIndex: configuration})
 	return resp, errors.WithStack(err)
+}
+
+func (s *DistributionServer) configureOnlineSourceTracker(ctx context.Context, job distribution.SplitJob, prior *pb.ProbeMigrationStateResponse, proof *pb.MigrationOwnershipProof, configuration uint64, control *pb.TargetStagedReadinessRequest) error {
+	if prior.GetOnlineCaptureVersion() != store.OnlineMigrationVersion {
+		return onlineSplitFallbackError(job, prior)
+	}
+	supported, err := s.onlineSplitMembersSupported(ctx, job)
+	if err != nil {
+		return err
+	}
+	if !supported {
+		return onlineSplitFallbackError(job, prior)
+	}
+	lineage := store.OnlineMigrationLineage(proof.GetGeneration())
+	control.OnlineCaptureVersion = store.OnlineMigrationVersion
+	control.OnlineLineage = lineage[:]
+	control.OnlineSourceGeneration = proof.GetGeneration()
+	control.RequireConfigurationIndex, control.ExpectedConfigurationIndex = true, configuration
+	return nil
+}
+func onlineSplitFallbackError(job distribution.SplitJob, prior *pb.ProbeMigrationStateResponse) error {
+	if job.OnlineCaptureVersion != 0 || prior.GetOnlineSourceGeneration() != "" {
+		return errors.WithStack(store.ErrOnlineMigrationIdentity)
+	}
+	return nil
+}
+
+func (s *DistributionServer) finishArmingSplitSourceOwnership(ctx context.Context, job distribution.SplitJob, groupID, configuration uint64, source SplitMigrationClient, proof *pb.MigrationOwnershipProof, mode pb.MigrationCleanupMode, minimum uint64) ([]byte, bool, error) {
+	acks, complete, err := s.syncSplitMigrationVoterBarrier(ctx, groupID, job.FenceAckCursor, source, &pb.ProbeMigrationStateRequest{
+		JobId: job.JobID, Kind: pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_CONTROL_APPLIED,
+		RouteStart: job.SplitKey, RouteEnd: proof.GetRouteEnd(), ExpectedCatalogVersion: proof.GetSourceTrackerVersion(),
+		MigrationJobId: job.JobID, MinWriteTsExclusive: minimum, TrackWrites: true, RetentionPinTs: initialMigrationRetentionPinTS,
+		RequireConfigurationIndex: true, ExpectedConfigurationIndex: configuration})
+	if err != nil || !complete {
+		return acks, false, err
+	}
+	if _, err := cleanupSplitMigration(ctx, source, &pb.CleanupMigrationRequest{JobId: job.JobID, Mode: mode,
+		RequireConfigurationIndex: true, ExpectedConfigurationIndex: configuration, Ownership: proof}); err != nil {
+		return nil, false, err
+	}
+	return s.ackSplitSourceOwnership(ctx, job, groupID, configuration, source, proof)
 }

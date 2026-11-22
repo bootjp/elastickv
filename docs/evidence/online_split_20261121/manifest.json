@@ -1,0 +1,34 @@
+{
+  "toolchain": "go1.27.3",
+  "GOOS": "linux",
+  "GOARCH": "amd64",
+  "CGO_ENABLED": "0",
+  "GOMAXPROCS": 8,
+  "rates": [
+    100,
+    300,
+    500,
+    1000
+  ],
+  "stage_duration": "90s",
+  "concurrency": 32,
+  "read_percent": 50,
+  "split_stage": 1,
+  "split": "cross",
+  "persistence": "default synchronous",
+  "profiles": false,
+  "binaries": {
+    "baseline-server-linux.test": {
+      "source_commit": "5f6ef4e20f4eb77726d84768284c89709c379bf7",
+      "sha256": "a0a379b09cc1cdb2cafa5eeba2c334e44b7345aa1cfbcfa355f56af643504cb7"
+    },
+    "online-release-server-linux.test": {
+      "source_commit": "8c2282837ecee54d51c664c67576a8f90e5f90e4",
+      "sha256": "33b97a8b6b2707eb3d052b21ed89cf7831fab222a72bbd596f397ecc0c77446e"
+    },
+    "loadtest-linux": {
+      "source_commit": "5f6ef4e20f4eb77726d84768284c89709c379bf7",
+      "sha256": "8068a61694d20f0b1d383daee1123db664cd85b46380edf47bc385cb09a70483"
+    }
+  }
+}

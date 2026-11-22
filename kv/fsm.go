@@ -124,8 +124,9 @@ type kvFSM struct {
 	// deferApplyNotices holds observer notifications back while a batched
 	// Raft entry is staged (applyBatchedRequests); they are delivered once
 	// the entry commits and dropped if it does not.
-	deferApplyNotices    bool
-	deferredApplyNotices []func()
+	deferApplyNotices      bool
+	deferredApplyNotices   []func()
+	migrationCaptureShadow *MigrationCaptureShadowConfig
 	// backupTimestampFloor is the highest replicated BackupPin read timestamp.
 	// New raw, one-phase, and PREPARE entries at or below this floor were
 	// timestamped before the backup cut and reached apply too late.
@@ -427,6 +428,12 @@ func (f *kvFSM) Apply(data []byte) any {
 		return haltErr(errors.Wrap(errors.Mark(f.backupFloorLoadErr, ErrBackupApply), "kv/fsm: load backup timestamp floor"))
 	}
 	ctx := context.TODO()
+	if err := f.invalidateOnlineMigrationControl(ctx, data); err != nil {
+		if errors.Is(err, store.ErrOnlineMigrationSealed) {
+			return err
+		}
+		return haltErr(errors.Mark(err, ErrRaftEntryApply))
+	}
 	if resp, handled := f.applyGuardedBootstrap(ctx, data); handled {
 		return resp
 	}
@@ -434,9 +441,19 @@ func (f *kvFSM) Apply(data []byte) any {
 		return resp
 	}
 
+	return f.applyRaftDataRequests(ctx, data)
+}
+
+func (f *kvFSM) applyRaftDataRequests(ctx context.Context, data []byte) any {
 	reqs, err := decodeRaftRequests(data)
 	if err != nil {
 		return errors.WithStack(err)
+	}
+	if response, handled := f.applyOnlineMigrationRequests(ctx, data, reqs); handled {
+		return response
+	}
+	if f.migrationCaptureShadow != nil && migrationCaptureShadowEligible(reqs) {
+		return f.applyMigrationCaptureShadow(ctx, data, reqs)
 	}
 	return f.applyDecodedRequests(ctx, reqs)
 }
@@ -851,7 +868,7 @@ func (f *kvFSM) applyRequestData(ctx context.Context, r *pb.Request) (uint64, er
 	var err error
 	ctx, err = f.withMigrationOwnershipEvidence(ctx, r)
 	if err != nil {
-		return 0, err
+		return 0, markMigrationApplyRejection(r, err)
 	}
 	if err := f.verifyPrepareCreationGate(r); err != nil {
 		return 0, err
@@ -883,7 +900,7 @@ func (f *kvFSM) handleRequest(ctx context.Context, r *pb.Request, commitTS uint6
 
 func (f *kvFSM) handleRawRequest(ctx context.Context, r *pb.Request, commitTS uint64) error {
 	if err := f.verifyWriteFence(ctx, r); err != nil {
-		return err
+		return markMigrationApplyRejection(r, err)
 	}
 	floorSnap, err := f.routeFloorSnapshotForRequest(ctx, r)
 	if err != nil {

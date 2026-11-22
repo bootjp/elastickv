@@ -8,6 +8,10 @@ violations=$(printf '%s\n' "$deps" | awk '
   # Keep the exceptions exact: repository test support is never allowed.
   $0 == "internal/synctest" ||
   $0 == "github.com/cockroachdb/pebble/v2/internal/blobtest" { next }
+  # These exact packages implement the executable load generator, not test
+  # support. Their production files are still checked by importguard below.
+  $0 == "github.com/bootjp/elastickv/internal/loadtest" ||
+  $0 == "github.com/bootjp/elastickv/cmd/loadtest" { next }
   $0 == "testing" || /^testing\// ||
   /^github.com\/stretchr\/testify($|\/)/ ||
   /(^|\/)internal\/testutil($|\/)/ || /(^|\/)[^\/]*test($|\/)/ { print }

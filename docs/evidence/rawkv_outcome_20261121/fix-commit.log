@@ -1,0 +1,10 @@
+golangci-lint --config=.golangci.yaml run --fix
+0 issues.
+[perf/linux-split-load-ramp b453a22de] Preserve definitive RawKV migration rejection outcomes
+ 17 files changed, 637 insertions(+), 52 deletions(-)
+ create mode 100644 adapter/grpc_fenced_admission_test.go
+ create mode 100644 adapter/grpc_mutation_secondary_test.go
+ create mode 100644 kv/migration_apply_rejection.go
+ create mode 100644 kv/migration_apply_rejection_test.go
+ create mode 100644 kv/mutation_nonadmission.go
+ create mode 100644 kv/mutation_nonadmission_test.go

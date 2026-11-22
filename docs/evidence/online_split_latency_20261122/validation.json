@@ -1,0 +1,221 @@
+{
+  "runtime_commit": "663c2e2b755b1456eb83238e54afad6d4d921fed",
+  "go_full": {
+    "command": "GOMAXPROCS=4 go test -p 2 -short ./...",
+    "exit": 0,
+    "cached_results_included": true,
+    "package_success_lines": 66
+  },
+  "store_race": {
+    "command": "GOMAXPROCS=4 go test -p 2 -race ./store ./kv",
+    "store_result": "PASS 234.180s",
+    "combined_exit": 1,
+    "note": "KV socket tests hit sandbox bind restrictions. The store result passed; KV was rerun separately with socket access."
+  },
+  "kv_race": {
+    "command": "GOMAXPROCS=4 go test -p 2 -race ./kv",
+    "exit": 0,
+    "seconds": 184.235
+  },
+  "focused_store_adapter_race": {
+    "exit": 0,
+    "store_seconds": 4.053,
+    "adapter_seconds": 42.159
+  },
+  "capture_request_limit_regression": {
+    "before": "RED: 257-request all-inside and mixed-range entries halted",
+    "after": "GREEN -race 2.462s; 256 stays captured and 257 writes remain stored without halting"
+  },
+  "grpc_forwarded_read_regression": {
+    "before": "RED: Unknown containing route cutover pending across real gRPC hop",
+    "after": "GREEN -race 4.059s with adjacent handoff/import guards"
+  },
+  "wal_sync_regression": {
+    "before": "RED: watermark read blocks during unrelated data WAL sync",
+    "after": "GREEN -race 2.431s; old watermark readable until sync, then advances"
+  },
+  "lint": {
+    "command": "golangci-lint --config=.golangci.yaml run --fix",
+    "issues": 0,
+    "exit": 0
+  },
+  "jepsen_root": {
+    "command": "lein test",
+    "exit": 0,
+    "tests": 441,
+    "assertions": 6179,
+    "failures": 0,
+    "errors": 0,
+    "kind": "harness unit suite, not a live fault-injection campaign"
+  },
+  "jepsen_redis_upstream": {
+    "command": "lein test",
+    "exit": 1,
+    "reason": "upstream test requires missing jepsen.redis namespace; test template also asserts (= 0 1)",
+    "submodule_commit": "54ab5c10ace229fc780e43e188ef1b64c3a32ee4",
+    "modified": false
+  },
+  "runtime_github_checks": {
+    "all_success": true,
+    "checks": [
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-21T17:29:30Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/bootjp/elastickv/actions/runs/44930253799/job/136925108664",
+        "name": "Analyze (actions)",
+        "startedAt": "2026-11-21T17:28:48Z",
+        "status": "COMPLETED",
+        "workflowName": "CodeQL"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-21T17:42:32Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/bootjp/elastickv/actions/runs/44930252711/job/136925102877",
+        "name": "test (encryption=off)",
+        "startedAt": "2026-11-21T17:28:46Z",
+        "status": "COMPLETED",
+        "workflowName": "Jepsen Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-21T17:37:22Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/bootjp/elastickv/actions/runs/44930252625/job/136925101909",
+        "name": "test shard (adapter)",
+        "startedAt": "2026-11-21T17:28:47Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-21T17:29:15Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/bootjp/elastickv/actions/runs/44930254856/job/136925111936",
+        "name": "reconcile",
+        "startedAt": "2026-11-21T17:28:48Z",
+        "status": "COMPLETED",
+        "workflowName": "Update review approval label"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-21T17:33:19Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/bootjp/elastickv/actions/runs/44930253799/job/136925108532",
+        "name": "Analyze (go)",
+        "startedAt": "2026-11-21T17:28:48Z",
+        "status": "COMPLETED",
+        "workflowName": "CodeQL"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-21T17:41:06Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/bootjp/elastickv/actions/runs/44930252711/job/136925102350",
+        "name": "test (encryption=on)",
+        "startedAt": "2026-11-21T17:28:46Z",
+        "status": "COMPLETED",
+        "workflowName": "Jepsen Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-21T17:34:35Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/bootjp/elastickv/actions/runs/44930252625/job/136925101950",
+        "name": "test shard (adapter-seq)",
+        "startedAt": "2026-11-21T17:28:46Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-21T17:29:47Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/bootjp/elastickv/actions/runs/44930253799/job/136925108809",
+        "name": "Analyze (javascript-typescript)",
+        "startedAt": "2026-11-21T17:28:48Z",
+        "status": "COMPLETED",
+        "workflowName": "CodeQL"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-21T17:37:13Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/bootjp/elastickv/actions/runs/44930252625/job/136925101737",
+        "name": "test shard (root)",
+        "startedAt": "2026-11-21T17:28:46Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-21T17:29:34Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/bootjp/elastickv/actions/runs/44930253799/job/136925108725",
+        "name": "Analyze (python)",
+        "startedAt": "2026-11-21T17:28:48Z",
+        "status": "COMPLETED",
+        "workflowName": "CodeQL"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-21T17:35:29Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/bootjp/elastickv/actions/runs/44930252625/job/136925101977",
+        "name": "test shard (raft-crypto)",
+        "startedAt": "2026-11-21T17:28:47Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-21T17:34:42Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/bootjp/elastickv/actions/runs/44930252625/job/136925101910",
+        "name": "test shard (rest)",
+        "startedAt": "2026-11-21T17:28:47Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-21T17:37:29Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/bootjp/elastickv/actions/runs/44930252625/job/136927559614",
+        "name": "test (ubuntu-latest)",
+        "startedAt": "2026-11-21T17:37:27Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-21T17:29:25Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/bootjp/elastickv/runs/136925260975",
+        "name": "CodeQL",
+        "startedAt": "2026-11-21T17:29:20Z",
+        "status": "COMPLETED",
+        "workflowName": ""
+      },
+      {
+        "__typename": "StatusContext",
+        "context": "CodeRabbit",
+        "startedAt": "2026-11-21T17:28:54Z",
+        "state": "SUCCESS",
+        "targetUrl": ""
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-21T17:28:45Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://probot.github.io/apps/dco/",
+        "name": "DCO",
+        "startedAt": "2026-11-21T17:28:45Z",
+        "status": "COMPLETED",
+        "workflowName": ""
+      }
+    ]
+  },
+  "sandbox_attempts": "Blocked local socket runs are retained separately; they are not reported as test regressions or passing suites."
+}

@@ -1,0 +1,11 @@
+{
+  "vm": 150,
+  "after": "all four fixtures, every ACK audit and durable ZIP replay passed",
+  "observed_status": "stopped",
+  "normal_shutdown": true,
+  "reservation_released": true,
+  "physical_disk_shared": true,
+  "task_workload_or_profiler_remaining": [],
+  "durable_archive_sha256": "409d271a589de5ffbd97254bbe7360d5be12225aea76b1e0eee06121d91adf21",
+  "note": "The firmware wrapper restored original unit configuration/timer state; its overdue service may restart normally after isolation. No firmware activity occurred inside the measured isolation interval."
+}

@@ -1,0 +1,2003 @@
+{
+  "protocol": {
+    "baseline_runtime": "a9f318f16 / c664c80bb (identical production)",
+    "order": [
+      "A1",
+      "B1",
+      "B2",
+      "A2"
+    ],
+    "rates": [
+      100,
+      300,
+      500,
+      1000
+    ],
+    "stage_seconds": 90,
+    "concurrency": 32,
+    "read_percent": 50,
+    "gomaxprocs": 8,
+    "profiles": false,
+    "primary_comparison_window": "first 60 seconds after observed cross-group Split start, shorten equally if any Done precedes 60s",
+    "additional_windows": [
+      "entire 300 offered ops/s stage",
+      "each observed Split phase",
+      "8 seconds after observed Done if stage 300 covers it"
+    ],
+    "payload_bytes": 1024,
+    "seed_keys": 256,
+    "rpc_deadline_seconds": 2,
+    "automatic_mutation_client_retry": false,
+    "audit": "all ACK IDs at all three ingresses after Done and routing convergence; five postDone paths x600"
+  },
+  "primary_window_seconds": 55.0,
+  "baseline_runtime": "a9f318f16 / c664c80bb",
+  "candidate": {
+    "source_commit": "e77fbfaefc79eedc0ec337624fb5771280bf90aa",
+    "sha256": "623c82213575da3e77ef995676731c1e7f8d074e5ccbd5135351a71684c7d563",
+    "toolchain": "go1.27.3",
+    "overlay": false,
+    "production_diagnostics": false
+  },
+  "vm": {
+    "id": 150,
+    "vcpus": 8,
+    "memory_gib": 8,
+    "sync": true,
+    "profiles": false
+  },
+  "runs": {
+    "A1": {
+      "phases": [
+        {
+          "phase": 1,
+          "observed_elapsed_ms": 38,
+          "metrics": {
+            "seconds": 1.908148069,
+            "read": {
+              "attempts": 285,
+              "success": 285,
+              "ops_s": 149.35947824497683,
+              "success_p99_ms": 14.442293,
+              "all_p99_ms": 14.442293,
+              "errors": {}
+            },
+            "write": {
+              "attempts": 285,
+              "success": 285,
+              "ops_s": 149.35947824497683,
+              "success_p99_ms": 26.498415,
+              "all_p99_ms": 26.498415,
+              "errors": {}
+            }
+          }
+        },
+        {
+          "phase": 2,
+          "observed_elapsed_ms": 1946,
+          "metrics": {
+            "seconds": 4.321816244,
+            "read": {
+              "attempts": 649,
+              "success": 649,
+              "ops_s": 150.1683466762406,
+              "success_p99_ms": 12.805611,
+              "all_p99_ms": 12.805611,
+              "errors": {}
+            },
+            "write": {
+              "attempts": 649,
+              "success": 649,
+              "ops_s": 150.1683466762406,
+              "success_p99_ms": 24.05729,
+              "all_p99_ms": 24.05729,
+              "errors": {}
+            }
+          }
+        },
+        {
+          "phase": 3,
+          "observed_elapsed_ms": 6268,
+          "metrics": {
+            "seconds": 37.764284255,
+            "read": {
+              "attempts": 5548,
+              "success": 5548,
+              "ops_s": 146.9112975248682,
+              "success_p99_ms": 25.806509,
+              "all_p99_ms": 25.806509,
+              "errors": {}
+            },
+            "write": {
+              "attempts": 5546,
+              "success": 5546,
+              "ops_s": 146.85833743203298,
+              "success_p99_ms": 94.614713,
+              "all_p99_ms": 94.614713,
+              "errors": {}
+            }
+          }
+        },
+        {
+          "phase": 4,
+          "observed_elapsed_ms": 44032,
+          "metrics": {
+            "seconds": 0.099974674,
+            "read": {
+              "attempts": 15,
+              "success": 15,
+              "ops_s": 150.0379986235314,
+              "success_p99_ms": 5.508565,
+              "all_p99_ms": 5.508565,
+              "errors": {}
+            },
+            "write": {
+              "attempts": 10,
+              "success": 10,
+              "ops_s": 100.0253324156876,
+              "success_p99_ms": 9.404505,
+              "all_p99_ms": 9.404505,
+              "errors": {}
+            }
+          }
+        },
+        {
+          "phase": 5,
+          "observed_elapsed_ms": 44132,
+          "metrics": {
+            "seconds": 0.201522988,
+            "read": {
+              "attempts": 23,
+              "success": 23,
+              "ops_s": 114.1309000440188,
+              "success_p99_ms": 5.609276,
+              "all_p99_ms": 5.609276,
+              "errors": {}
+            },
+            "write": {
+              "attempts": 24,
+              "success": 24,
+              "ops_s": 119.09311308941093,
+              "success_p99_ms": 84.266053,
+              "all_p99_ms": 84.266053,
+              "errors": {}
+            }
+          }
+        },
+        {
+          "phase": 6,
+          "observed_elapsed_ms": 44333,
+          "metrics": {
+            "seconds": 50.236101141,
+            "read": {
+              "attempts": 7160,
+              "success": 7160,
+              "ops_s": 142.52698432753957,
+              "success_p99_ms": 120.235295,
+              "all_p99_ms": 120.235295,
+              "errors": {}
+            },
+            "write": {
+              "attempts": 7243,
+              "success": 7241,
+              "ops_s": 144.13937060275336,
+              "success_p99_ms": 265.376817,
+              "all_p99_ms": 265.376817,
+              "errors": {
+                "Unavailable": 2
+              }
+            }
+          }
+        }
+      ],
+      "config": {
+        "rates": [
+          100,
+          300,
+          500,
+          1000
+        ],
+        "stage_duration_ns": 90000000000,
+        "concurrency": 32,
+        "read_percent": 50,
+        "seed_keys": 256,
+        "value_bytes": 1024,
+        "max_requests": 1000000,
+        "prefix": "split-ramp",
+        "request_timeout_ns": 2000000000,
+        "verify_writes": true
+      },
+      "stage_300_end_ns": 1795330886644509485,
+      "after_cutover_300_tail": {
+        "seconds": 10.0,
+        "read": {
+          "attempts": 1265,
+          "success": 1265,
+          "ops_s": 126.5,
+          "success_p99_ms": 133.882277,
+          "all_p99_ms": 133.882277,
+          "errors": {}
+        },
+        "write": {
+          "attempts": 1281,
+          "success": 1281,
+          "ops_s": 128.1,
+          "success_p99_ms": 251.731849,
+          "all_p99_ms": 251.731849,
+          "errors": {}
+        }
+      },
+      "tail_includes_cleanup": true,
+      "split_all": {
+        "seconds": 94.568,
+        "read": {
+          "attempts": 13686,
+          "success": 13686,
+          "ops_s": 144.72125877675325,
+          "success_p99_ms": 109.507828,
+          "all_p99_ms": 109.507828,
+          "errors": {}
+        },
+        "write": {
+          "attempts": 13763,
+          "success": 13761,
+          "ops_s": 145.5143388884189,
+          "success_p99_ms": 241.586277,
+          "all_p99_ms": 241.586277,
+          "errors": {
+            "Unavailable": 2
+          }
+        }
+      },
+      "full_run": {
+        "read": {
+          "success": 61314,
+          "errors": {}
+        },
+        "write": {
+          "success": 61328,
+          "errors": {
+            "Unavailable": 2
+          }
+        }
+      },
+      "start_ns": 1795330801679072176,
+      "done_observed_ns": 1795330896247072176,
+      "phase_clock_offset_spread_ms": 1.883058,
+      "timing": {
+        "lower_ms": 1550.123,
+        "upper_ms": 1570.76,
+        "families": 46,
+        "completed": 46,
+        "versions": 2150,
+        "capture_version": 1,
+        "sequence": 2055,
+        "seal_sequence": 2055
+      },
+      "ingress_count": 3,
+      "ack_count": 61328,
+      "expected_observations": 183984,
+      "readback_success": 183984,
+      "audit_verified": true,
+      "post_done_paths": {
+        "moved-direct": [
+          600,
+          600,
+          600,
+          0
+        ],
+        "moved-forwarded": [
+          600,
+          600,
+          600,
+          0
+        ],
+        "retained-direct": [
+          600,
+          600,
+          600,
+          0
+        ],
+        "retained-forwarded": [
+          600,
+          600,
+          600,
+          0
+        ],
+        "outside-direct": [
+          600,
+          600,
+          600,
+          0
+        ]
+      },
+      "dropped_capacity": 42601,
+      "dropped_scheduler": 5755,
+      "driver_exit": "exit status 1",
+      "server_test_exit": 0,
+      "split_common_rate": {
+        "seconds": 55.0,
+        "read": {
+          "attempts": 8133,
+          "success": 8133,
+          "ops_s": 147.87272727272727,
+          "success_p99_ms": 21.569741,
+          "all_p99_ms": 21.569741,
+          "errors": {}
+        },
+        "write": {
+          "attempts": 8137,
+          "success": 8135,
+          "ops_s": 147.9090909090909,
+          "success_p99_ms": 87.694592,
+          "all_p99_ms": 87.694592,
+          "errors": {
+            "Unavailable": 2
+          }
+        }
+      },
+      "post_done_8s_at_300": null,
+      "split_done_seconds": 94.568,
+      "stages": [
+        {
+          "index": 0,
+          "offered_rps": 100,
+          "started": "2026-11-22T06:58:26.625208559Z",
+          "elapsed_seconds": 90.007758988,
+          "planned": 9000,
+          "offered": 9000,
+          "admitted": 9000,
+          "dropped_capacity": 0,
+          "dropped_scheduler": 0,
+          "read": {
+            "attempts": 4500,
+            "success": 4500,
+            "errors": {},
+            "successful_latency": {
+              "samples": 4500,
+              "p50_ms": 3.046725,
+              "p95_ms": 6.096263,
+              "p99_ms": 7.757807,
+              "max_ms": 25.581185
+            }
+          },
+          "write": {
+            "attempts": 4500,
+            "success": 4500,
+            "errors": {},
+            "successful_latency": {
+              "samples": 4500,
+              "p50_ms": 10.45468,
+              "p95_ms": 14.28757,
+              "p99_ms": 16.131527,
+              "max_ms": 44.347897
+            }
+          },
+          "verification": {
+            "attempts": 4500,
+            "success": 4500,
+            "errors": {},
+            "successful_latency": {
+              "samples": 4500,
+              "p50_ms": 2.897284,
+              "p95_ms": 4.011041,
+              "p99_ms": 6.089762,
+              "max_ms": 12.522184
+            }
+          }
+        },
+        {
+          "index": 1,
+          "offered_rps": 300,
+          "started": "2026-11-22T06:59:56.644509485Z",
+          "elapsed_seconds": 90.117147036,
+          "planned": 27000,
+          "offered": 27000,
+          "admitted": 25869,
+          "dropped_capacity": 1127,
+          "dropped_scheduler": 4,
+          "read": {
+            "attempts": 12915,
+            "success": 12915,
+            "errors": {},
+            "successful_latency": {
+              "samples": 12915,
+              "p50_ms": 4.607589,
+              "p95_ms": 47.032555,
+              "p99_ms": 105.008235,
+              "max_ms": 633.183173
+            }
+          },
+          "write": {
+            "attempts": 12954,
+            "success": 12952,
+            "errors": {
+              "Unavailable": 2
+            },
+            "successful_latency": {
+              "samples": 12952,
+              "p50_ms": 11.839675,
+              "p95_ms": 144.498556,
+              "p99_ms": 233.47022,
+              "max_ms": 952.143175
+            }
+          },
+          "verification": {
+            "attempts": 12952,
+            "success": 12952,
+            "errors": {},
+            "successful_latency": {
+              "samples": 12952,
+              "p50_ms": 3.02394,
+              "p95_ms": 48.484849,
+              "p99_ms": 98.209664,
+              "max_ms": 513.292776
+            }
+          }
+        },
+        {
+          "index": 2,
+          "offered_rps": 500,
+          "started": "2026-11-22T07:01:26.781762707Z",
+          "elapsed_seconds": 90.01078913,
+          "planned": 45000,
+          "offered": 45000,
+          "admitted": 43098,
+          "dropped_capacity": 1867,
+          "dropped_scheduler": 35,
+          "read": {
+            "attempts": 21528,
+            "success": 21528,
+            "errors": {},
+            "successful_latency": {
+              "samples": 21528,
+              "p50_ms": 2.191604,
+              "p95_ms": 26.937257,
+              "p99_ms": 66.888118,
+              "max_ms": 197.434655
+            }
+          },
+          "write": {
+            "attempts": 21570,
+            "success": 21570,
+            "errors": {},
+            "successful_latency": {
+              "samples": 21570,
+              "p50_ms": 7.055864,
+              "p95_ms": 82.756812,
+              "p99_ms": 162.042506,
+              "max_ms": 278.518208
+            }
+          },
+          "verification": {
+            "attempts": 21570,
+            "success": 21570,
+            "errors": {},
+            "successful_latency": {
+              "samples": 21570,
+              "p50_ms": 1.313701,
+              "p95_ms": 18.324593,
+              "p99_ms": 58.458416,
+              "max_ms": 160.556968
+            }
+          }
+        },
+        {
+          "index": 3,
+          "offered_rps": 1000,
+          "started": "2026-11-22T07:02:56.831986879Z",
+          "elapsed_seconds": 90.07929363,
+          "planned": 90000,
+          "offered": 90000,
+          "admitted": 44677,
+          "dropped_capacity": 39607,
+          "dropped_scheduler": 5716,
+          "read": {
+            "attempts": 22371,
+            "success": 22371,
+            "errors": {},
+            "successful_latency": {
+              "samples": 22371,
+              "p50_ms": 15.90242,
+              "p95_ms": 55.414468,
+              "p99_ms": 76.301517,
+              "max_ms": 512.669678
+            }
+          },
+          "write": {
+            "attempts": 22306,
+            "success": 22306,
+            "errors": {},
+            "successful_latency": {
+              "samples": 22306,
+              "p50_ms": 69.022057,
+              "p95_ms": 136.379216,
+              "p99_ms": 160.582573,
+              "max_ms": 973.778821
+            }
+          },
+          "verification": {
+            "attempts": 22306,
+            "success": 22306,
+            "errors": {},
+            "successful_latency": {
+              "samples": 22306,
+              "p50_ms": 17.828204,
+              "p95_ms": 57.741051,
+              "p99_ms": 74.491005,
+              "max_ms": 556.732053
+            }
+          }
+        }
+      ]
+    },
+    "B1": {
+      "phases": [
+        {
+          "phase": 1,
+          "observed_elapsed_ms": 35,
+          "metrics": {
+            "seconds": 1.703784588,
+            "read": {
+              "attempts": 255,
+              "success": 255,
+              "ops_s": 149.66680752719662,
+              "success_p99_ms": 10.577812,
+              "all_p99_ms": 10.577812,
+              "errors": {}
+            },
+            "write": {
+              "attempts": 256,
+              "success": 256,
+              "ops_s": 150.25373618416603,
+              "success_p99_ms": 20.19822,
+              "all_p99_ms": 20.19822,
+              "errors": {}
+            }
+          }
+        },
+        {
+          "phase": 2,
+          "observed_elapsed_ms": 1739,
+          "metrics": {
+            "seconds": 3.515974199,
+            "read": {
+              "attempts": 528,
+              "success": 528,
+              "ops_s": 150.17175044975352,
+              "success_p99_ms": 12.585066,
+              "all_p99_ms": 12.585066,
+              "errors": {}
+            },
+            "write": {
+              "attempts": 527,
+              "success": 527,
+              "ops_s": 149.88733425571988,
+              "success_p99_ms": 27.19196,
+              "all_p99_ms": 27.19196,
+              "errors": {}
+            }
+          }
+        },
+        {
+          "phase": 3,
+          "observed_elapsed_ms": 5255,
+          "metrics": {
+            "seconds": 27.214884199,
+            "read": {
+              "attempts": 3968,
+              "success": 3968,
+              "ops_s": 145.80256785166856,
+              "success_p99_ms": 48.310652,
+              "all_p99_ms": 48.310652,
+              "errors": {}
+            },
+            "write": {
+              "attempts": 3963,
+              "success": 3963,
+              "ops_s": 145.61884485790387,
+              "success_p99_ms": 123.230853,
+              "all_p99_ms": 123.230853,
+              "errors": {}
+            }
+          }
+        },
+        {
+          "phase": 4,
+          "observed_elapsed_ms": 32470,
+          "metrics": {
+            "seconds": 0.100531682,
+            "read": {
+              "attempts": 15,
+              "success": 15,
+              "ops_s": 149.2066948606311,
+              "success_p99_ms": 6.694161,
+              "all_p99_ms": 6.694161,
+              "errors": {}
+            },
+            "write": {
+              "attempts": 11,
+              "success": 11,
+              "ops_s": 109.41824289779615,
+              "success_p99_ms": 10.876411,
+              "all_p99_ms": 10.876411,
+              "errors": {}
+            }
+          }
+        },
+        {
+          "phase": 5,
+          "observed_elapsed_ms": 32570,
+          "metrics": {
+            "seconds": 0.20081661,
+            "read": {
+              "attempts": 24,
+              "success": 24,
+              "ops_s": 119.51202642052368,
+              "success_p99_ms": 113.626284,
+              "all_p99_ms": 113.626284,
+              "errors": {}
+            },
+            "write": {
+              "attempts": 26,
+              "success": 26,
+              "ops_s": 129.47136195556732,
+              "success_p99_ms": 296.942133,
+              "all_p99_ms": 296.942133,
+              "errors": {}
+            }
+          }
+        },
+        {
+          "phase": 6,
+          "observed_elapsed_ms": 32771,
+          "metrics": {
+            "seconds": 59.662818781,
+            "read": {
+              "attempts": 8873,
+              "success": 8873,
+              "ops_s": 148.71908805665853,
+              "success_p99_ms": 77.664686,
+              "all_p99_ms": 77.664686,
+              "errors": {}
+            },
+            "write": {
+              "attempts": 8882,
+              "success": 8882,
+              "ops_s": 148.86993577360997,
+              "success_p99_ms": 173.034011,
+              "all_p99_ms": 173.034011,
+              "errors": {}
+            }
+          }
+        }
+      ],
+      "config": {
+        "rates": [
+          100,
+          300,
+          500,
+          1000
+        ],
+        "stage_duration_ns": 90000000000,
+        "concurrency": 32,
+        "read_percent": 50,
+        "seed_keys": 256,
+        "value_bytes": 1024,
+        "max_requests": 1000000,
+        "prefix": "split-ramp",
+        "request_timeout_ns": 2000000000,
+        "verify_writes": true
+      },
+      "stage_300_end_ns": 1795331347912108595,
+      "after_cutover_300_tail": {
+        "seconds": 10.0,
+        "read": {
+          "attempts": 1471,
+          "success": 1471,
+          "ops_s": 147.1,
+          "success_p99_ms": 74.786599,
+          "all_p99_ms": 74.786599,
+          "errors": {}
+        },
+        "write": {
+          "attempts": 1468,
+          "success": 1468,
+          "ops_s": 146.8,
+          "success_p99_ms": 182.052103,
+          "all_p99_ms": 182.052103,
+          "errors": {}
+        }
+      },
+      "tail_includes_cleanup": true,
+      "split_all": {
+        "seconds": 92.434,
+        "read": {
+          "attempts": 13667,
+          "success": 13667,
+          "ops_s": 147.85684921132918,
+          "success_p99_ms": 74.779273,
+          "all_p99_ms": 74.779273,
+          "errors": {}
+        },
+        "write": {
+          "attempts": 13670,
+          "success": 13670,
+          "ops_s": 147.88930480126362,
+          "success_p99_ms": 171.735131,
+          "all_p99_ms": 171.735131,
+          "errors": {}
+        }
+      },
+      "full_run": {
+        "read": {
+          "success": 49266,
+          "errors": {}
+        },
+        "write": {
+          "success": 49389,
+          "errors": {}
+        }
+      },
+      "start_ns": 1795331262946515590,
+      "done_observed_ns": 1795331355380515590,
+      "phase_clock_offset_spread_ms": 0.531682,
+      "timing": {
+        "lower_ms": 1450.192,
+        "upper_ms": 1470.976,
+        "families": 46,
+        "completed": 46,
+        "versions": 2102,
+        "capture_version": 1,
+        "sequence": 1486,
+        "seal_sequence": 1486
+      },
+      "ingress_count": 3,
+      "ack_count": 49389,
+      "expected_observations": 148167,
+      "readback_success": 148167,
+      "audit_verified": true,
+      "post_done_paths": {
+        "retained-direct": [
+          600,
+          600,
+          600,
+          0
+        ],
+        "outside-direct": [
+          600,
+          600,
+          600,
+          0
+        ],
+        "moved-direct": [
+          600,
+          600,
+          600,
+          0
+        ],
+        "retained-forwarded": [
+          600,
+          600,
+          600,
+          0
+        ],
+        "moved-forwarded": [
+          600,
+          600,
+          600,
+          0
+        ]
+      },
+      "dropped_capacity": 66123,
+      "dropped_scheduler": 6222,
+      "driver_exit": "exit status 1",
+      "server_test_exit": 0,
+      "split_common_rate": {
+        "seconds": 55.0,
+        "read": {
+          "attempts": 8074,
+          "success": 8074,
+          "ops_s": 146.8,
+          "success_p99_ms": 65.624144,
+          "all_p99_ms": 65.624144,
+          "errors": {}
+        },
+        "write": {
+          "attempts": 8065,
+          "success": 8065,
+          "ops_s": 146.63636363636363,
+          "success_p99_ms": 157.663265,
+          "all_p99_ms": 157.663265,
+          "errors": {}
+        }
+      },
+      "post_done_8s_at_300": null,
+      "split_done_seconds": 92.434,
+      "stages": [
+        {
+          "index": 0,
+          "offered_rps": 100,
+          "started": "2026-11-22T07:06:07.893348549Z",
+          "elapsed_seconds": 90.005735369,
+          "planned": 9000,
+          "offered": 9000,
+          "admitted": 9000,
+          "dropped_capacity": 0,
+          "dropped_scheduler": 0,
+          "read": {
+            "attempts": 4500,
+            "success": 4500,
+            "errors": {},
+            "successful_latency": {
+              "samples": 4500,
+              "p50_ms": 3.2359,
+              "p95_ms": 6.805073,
+              "p99_ms": 8.866679,
+              "max_ms": 14.521235
+            }
+          },
+          "write": {
+            "attempts": 4500,
+            "success": 4500,
+            "errors": {},
+            "successful_latency": {
+              "samples": 4500,
+              "p50_ms": 10.830431,
+              "p95_ms": 15.092228,
+              "p99_ms": 17.771763,
+              "max_ms": 23.489023
+            }
+          },
+          "verification": {
+            "attempts": 4500,
+            "success": 4500,
+            "errors": {},
+            "successful_latency": {
+              "samples": 4500,
+              "p50_ms": 2.989337,
+              "p95_ms": 4.353279,
+              "p99_ms": 7.710398,
+              "max_ms": 11.576399
+            }
+          }
+        },
+        {
+          "index": 1,
+          "offered_rps": 300,
+          "started": "2026-11-22T07:07:37.912108595Z",
+          "elapsed_seconds": 90.114815511,
+          "planned": 27000,
+          "offered": 27000,
+          "admitted": 26420,
+          "dropped_capacity": 568,
+          "dropped_scheduler": 12,
+          "read": {
+            "attempts": 13212,
+            "success": 13212,
+            "errors": {},
+            "successful_latency": {
+              "samples": 13212,
+              "p50_ms": 7.104021,
+              "p95_ms": 49.71688,
+              "p99_ms": 72.374394,
+              "max_ms": 568.858962
+            }
+          },
+          "write": {
+            "attempts": 13208,
+            "success": 13208,
+            "errors": {},
+            "successful_latency": {
+              "samples": 13208,
+              "p50_ms": 16.363616,
+              "p95_ms": 141.200075,
+              "p99_ms": 169.873377,
+              "max_ms": 912.92602
+            }
+          },
+          "verification": {
+            "attempts": 13208,
+            "success": 13208,
+            "errors": {},
+            "successful_latency": {
+              "samples": 13208,
+              "p50_ms": 6.269112,
+              "p95_ms": 53.545456,
+              "p99_ms": 72.713916,
+              "max_ms": 458.663376
+            }
+          }
+        },
+        {
+          "index": 2,
+          "offered_rps": 500,
+          "started": "2026-11-22T07:09:08.053680203Z",
+          "elapsed_seconds": 90.103559171,
+          "planned": 45000,
+          "offered": 45000,
+          "admitted": 31655,
+          "dropped_capacity": 13282,
+          "dropped_scheduler": 63,
+          "read": {
+            "attempts": 15767,
+            "success": 15767,
+            "errors": {},
+            "successful_latency": {
+              "samples": 15767,
+              "p50_ms": 29.208557,
+              "p95_ms": 60.755443,
+              "p99_ms": 80.893126,
+              "max_ms": 142.720671
+            }
+          },
+          "write": {
+            "attempts": 15888,
+            "success": 15888,
+            "errors": {},
+            "successful_latency": {
+              "samples": 15888,
+              "p50_ms": 99.234842,
+              "p95_ms": 146.66651,
+              "p99_ms": 168.50313,
+              "max_ms": 241.999978
+            }
+          },
+          "verification": {
+            "attempts": 15888,
+            "success": 15888,
+            "errors": {},
+            "successful_latency": {
+              "samples": 15888,
+              "p50_ms": 32.451181,
+              "p95_ms": 63.259634,
+              "p99_ms": 83.851948,
+              "max_ms": 136.067321
+            }
+          }
+        },
+        {
+          "index": 3,
+          "offered_rps": 1000,
+          "started": "2026-11-22T07:10:38.184914159Z",
+          "elapsed_seconds": 90.099104287,
+          "planned": 90000,
+          "offered": 90000,
+          "admitted": 31580,
+          "dropped_capacity": 52273,
+          "dropped_scheduler": 6147,
+          "read": {
+            "attempts": 15787,
+            "success": 15787,
+            "errors": {},
+            "successful_latency": {
+              "samples": 15787,
+              "p50_ms": 30.757497,
+              "p95_ms": 64.066748,
+              "p99_ms": 85.809745,
+              "max_ms": 885.294408
+            }
+          },
+          "write": {
+            "attempts": 15793,
+            "success": 15793,
+            "errors": {},
+            "successful_latency": {
+              "samples": 15793,
+              "p50_ms": 104.226425,
+              "p95_ms": 153.364763,
+              "p99_ms": 185.059566,
+              "max_ms": 1087.767376
+            }
+          },
+          "verification": {
+            "attempts": 15793,
+            "success": 15793,
+            "errors": {},
+            "successful_latency": {
+              "samples": 15793,
+              "p50_ms": 33.918894,
+              "p95_ms": 67.111789,
+              "p99_ms": 85.950015,
+              "max_ms": 888.112332
+            }
+          }
+        }
+      ]
+    },
+    "B2": {
+      "phases": [
+        {
+          "phase": 1,
+          "observed_elapsed_ms": 27,
+          "metrics": {
+            "seconds": 0.701430773,
+            "read": {
+              "attempts": 104,
+              "success": 104,
+              "ops_s": 148.26837373443837,
+              "success_p99_ms": 11.863235,
+              "all_p99_ms": 11.863235,
+              "errors": {}
+            },
+            "write": {
+              "attempts": 105,
+              "success": 105,
+              "ops_s": 149.6940311741926,
+              "success_p99_ms": 36.092814,
+              "all_p99_ms": 36.092814,
+              "errors": {}
+            }
+          }
+        },
+        {
+          "phase": 2,
+          "observed_elapsed_ms": 728,
+          "metrics": {
+            "seconds": 3.611961271,
+            "read": {
+              "attempts": 543,
+              "success": 543,
+              "ops_s": 150.33383784031165,
+              "success_p99_ms": 13.023102,
+              "all_p99_ms": 13.023102,
+              "errors": {}
+            },
+            "write": {
+              "attempts": 542,
+              "success": 542,
+              "ops_s": 150.05697994373648,
+              "success_p99_ms": 21.567842,
+              "all_p99_ms": 21.567842,
+              "errors": {}
+            }
+          }
+        },
+        {
+          "phase": 3,
+          "observed_elapsed_ms": 4340,
+          "metrics": {
+            "seconds": 25.452445973,
+            "read": {
+              "attempts": 3818,
+              "success": 3818,
+              "ops_s": 150.00522951900737,
+              "success_p99_ms": 13.839656,
+              "all_p99_ms": 13.839656,
+              "errors": {}
+            },
+            "write": {
+              "attempts": 3809,
+              "success": 3809,
+              "ops_s": 149.65162892558908,
+              "success_p99_ms": 24.37364,
+              "all_p99_ms": 24.37364,
+              "errors": {}
+            }
+          }
+        },
+        {
+          "phase": 4,
+          "observed_elapsed_ms": 29792,
+          "metrics": {
+            "seconds": 0.100271251,
+            "read": {
+              "attempts": 15,
+              "success": 15,
+              "ops_s": 149.59422417099393,
+              "success_p99_ms": 3.72492,
+              "all_p99_ms": 3.72492,
+              "errors": {}
+            },
+            "write": {
+              "attempts": 8,
+              "success": 8,
+              "ops_s": 79.7835862245301,
+              "success_p99_ms": 9.387003,
+              "all_p99_ms": 9.387003,
+              "errors": {}
+            }
+          }
+        },
+        {
+          "phase": 5,
+          "observed_elapsed_ms": 29893,
+          "metrics": {
+            "seconds": 0.100186902,
+            "read": {
+              "attempts": 11,
+              "success": 11,
+              "ops_s": 109.79479133909142,
+              "success_p99_ms": 2.839349,
+              "all_p99_ms": 2.839349,
+              "errors": {}
+            },
+            "write": {
+              "attempts": 10,
+              "success": 10,
+              "ops_s": 99.81344667190129,
+              "success_p99_ms": 8.976953,
+              "all_p99_ms": 8.976953,
+              "errors": {}
+            }
+          }
+        },
+        {
+          "phase": 6,
+          "observed_elapsed_ms": 29993,
+          "metrics": {
+            "seconds": 33.747223701,
+            "read": {
+              "attempts": 4943,
+              "success": 4943,
+              "ops_s": 146.47130809322036,
+              "success_p99_ms": 26.795942,
+              "all_p99_ms": 26.795942,
+              "errors": {}
+            },
+            "write": {
+              "attempts": 4964,
+              "success": 4964,
+              "ops_s": 147.09358150409588,
+              "success_p99_ms": 123.735208,
+              "all_p99_ms": 123.735208,
+              "errors": {}
+            }
+          }
+        }
+      ],
+      "config": {
+        "rates": [
+          100,
+          300,
+          500,
+          1000
+        ],
+        "stage_duration_ns": 90000000000,
+        "concurrency": 32,
+        "read_percent": 50,
+        "seed_keys": 256,
+        "value_bytes": 1024,
+        "max_requests": 1000000,
+        "prefix": "split-ramp",
+        "request_timeout_ns": 2000000000,
+        "verify_writes": true
+      },
+      "stage_300_end_ns": 1795331798478965596,
+      "after_cutover_300_tail": {
+        "seconds": 10.0,
+        "read": {
+          "attempts": 1461,
+          "success": 1461,
+          "ops_s": 146.1,
+          "success_p99_ms": 82.501979,
+          "all_p99_ms": 82.501979,
+          "errors": {}
+        },
+        "write": {
+          "attempts": 1466,
+          "success": 1466,
+          "ops_s": 146.6,
+          "success_p99_ms": 158.700452,
+          "all_p99_ms": 158.700452,
+          "errors": {}
+        }
+      },
+      "tail_includes_cleanup": false,
+      "split_all": {
+        "seconds": 63.74,
+        "read": {
+          "attempts": 9438,
+          "success": 9438,
+          "ops_s": 148.07028553498589,
+          "success_p99_ms": 17.022098,
+          "all_p99_ms": 17.022098,
+          "errors": {}
+        },
+        "write": {
+          "attempts": 9442,
+          "success": 9442,
+          "ops_s": 148.13304047693757,
+          "success_p99_ms": 63.940445,
+          "all_p99_ms": 63.940445,
+          "errors": {}
+        }
+      },
+      "full_run": {
+        "read": {
+          "success": 49750,
+          "errors": {}
+        },
+        "write": {
+          "success": 49914,
+          "errors": {}
+        }
+      },
+      "start_ns": 1795331713616792268,
+      "done_observed_ns": 1795331777356792268,
+      "phase_clock_offset_spread_ms": 0.838017,
+      "timing": {
+        "lower_ms": 1440.902,
+        "upper_ms": 1460.482,
+        "families": 46,
+        "completed": 46,
+        "versions": 2056,
+        "capture_version": 1,
+        "sequence": 1449,
+        "seal_sequence": 1449
+      },
+      "ingress_count": 3,
+      "ack_count": 49914,
+      "expected_observations": 149742,
+      "readback_success": 149742,
+      "audit_verified": true,
+      "post_done_paths": {
+        "retained-direct": [
+          600,
+          600,
+          600,
+          0
+        ],
+        "moved-direct": [
+          600,
+          600,
+          600,
+          0
+        ],
+        "moved-forwarded": [
+          600,
+          600,
+          600,
+          0
+        ],
+        "retained-forwarded": [
+          600,
+          600,
+          600,
+          0
+        ],
+        "outside-direct": [
+          600,
+          600,
+          600,
+          0
+        ]
+      },
+      "dropped_capacity": 64627,
+      "dropped_scheduler": 6709,
+      "driver_exit": "exit status 1",
+      "server_test_exit": 0,
+      "split_common_rate": {
+        "seconds": 55.0,
+        "read": {
+          "attempts": 8128,
+          "success": 8128,
+          "ops_s": 147.78181818181818,
+          "success_p99_ms": 18.676734,
+          "all_p99_ms": 18.676734,
+          "errors": {}
+        },
+        "write": {
+          "attempts": 8131,
+          "success": 8131,
+          "ops_s": 147.83636363636364,
+          "success_p99_ms": 75.325145,
+          "all_p99_ms": 75.325145,
+          "errors": {}
+        }
+      },
+      "post_done_8s_at_300": {
+        "seconds": 8.0,
+        "read": {
+          "attempts": 1191,
+          "success": 1191,
+          "ops_s": 148.875,
+          "success_p99_ms": 64.309028,
+          "all_p99_ms": 64.309028,
+          "errors": {}
+        },
+        "write": {
+          "attempts": 1182,
+          "success": 1182,
+          "ops_s": 147.75,
+          "success_p99_ms": 141.406431,
+          "all_p99_ms": 141.406431,
+          "errors": {}
+        }
+      },
+      "split_done_seconds": 63.74,
+      "stages": [
+        {
+          "index": 0,
+          "offered_rps": 100,
+          "started": "2026-11-22T07:13:38.457204349Z",
+          "elapsed_seconds": 90.00775889,
+          "planned": 9000,
+          "offered": 9000,
+          "admitted": 9000,
+          "dropped_capacity": 0,
+          "dropped_scheduler": 0,
+          "read": {
+            "attempts": 4500,
+            "success": 4500,
+            "errors": {},
+            "successful_latency": {
+              "samples": 4500,
+              "p50_ms": 3.058032,
+              "p95_ms": 6.296553,
+              "p99_ms": 7.734826,
+              "max_ms": 13.544427
+            }
+          },
+          "write": {
+            "attempts": 4500,
+            "success": 4500,
+            "errors": {},
+            "successful_latency": {
+              "samples": 4500,
+              "p50_ms": 10.567016,
+              "p95_ms": 14.574978,
+              "p99_ms": 16.404088,
+              "max_ms": 21.596436
+            }
+          },
+          "verification": {
+            "attempts": 4500,
+            "success": 4500,
+            "errors": {},
+            "successful_latency": {
+              "samples": 4500,
+              "p50_ms": 2.878932,
+              "p95_ms": 4.082564,
+              "p99_ms": 6.346553,
+              "max_ms": 10.832788
+            }
+          }
+        },
+        {
+          "index": 1,
+          "offered_rps": 300,
+          "started": "2026-11-22T07:15:08.478965596Z",
+          "elapsed_seconds": 90.084068899,
+          "planned": 27000,
+          "offered": 27000,
+          "admitted": 26678,
+          "dropped_capacity": 320,
+          "dropped_scheduler": 2,
+          "read": {
+            "attempts": 13333,
+            "success": 13333,
+            "errors": {},
+            "successful_latency": {
+              "samples": 13333,
+              "p50_ms": 4.176576,
+              "p95_ms": 38.410964,
+              "p99_ms": 61.673436,
+              "max_ms": 771.183033
+            }
+          },
+          "write": {
+            "attempts": 13345,
+            "success": 13345,
+            "errors": {},
+            "successful_latency": {
+              "samples": 13345,
+              "p50_ms": 10.753541,
+              "p95_ms": 111.64485,
+              "p99_ms": 143.509539,
+              "max_ms": 945.049236
+            }
+          },
+          "verification": {
+            "attempts": 13345,
+            "success": 13345,
+            "errors": {},
+            "successful_latency": {
+              "samples": 13345,
+              "p50_ms": 2.439127,
+              "p95_ms": 42.91351,
+              "p99_ms": 61.521437,
+              "max_ms": 541.325154
+            }
+          }
+        },
+        {
+          "index": 2,
+          "offered_rps": 500,
+          "started": "2026-11-22T07:16:38.586682984Z",
+          "elapsed_seconds": 90.0990797,
+          "planned": 45000,
+          "offered": 45000,
+          "admitted": 32026,
+          "dropped_capacity": 12915,
+          "dropped_scheduler": 59,
+          "read": {
+            "attempts": 15981,
+            "success": 15981,
+            "errors": {},
+            "successful_latency": {
+              "samples": 15981,
+              "p50_ms": 29.665768,
+              "p95_ms": 59.616375,
+              "p99_ms": 77.517413,
+              "max_ms": 134.301492
+            }
+          },
+          "write": {
+            "attempts": 16045,
+            "success": 16045,
+            "errors": {},
+            "successful_latency": {
+              "samples": 16045,
+              "p50_ms": 97.351434,
+              "p95_ms": 142.951571,
+              "p99_ms": 162.166739,
+              "max_ms": 227.757656
+            }
+          },
+          "verification": {
+            "attempts": 16045,
+            "success": 16045,
+            "errors": {},
+            "successful_latency": {
+              "samples": 16045,
+              "p50_ms": 33.056349,
+              "p95_ms": 62.541126,
+              "p99_ms": 80.308535,
+              "max_ms": 135.519221
+            }
+          }
+        },
+        {
+          "index": 3,
+          "offered_rps": 1000,
+          "started": "2026-11-22T07:18:08.715076841Z",
+          "elapsed_seconds": 90.088276854,
+          "planned": 90000,
+          "offered": 90000,
+          "admitted": 31960,
+          "dropped_capacity": 51392,
+          "dropped_scheduler": 6648,
+          "read": {
+            "attempts": 15936,
+            "success": 15936,
+            "errors": {},
+            "successful_latency": {
+              "samples": 15936,
+              "p50_ms": 30.816325,
+              "p95_ms": 63.857767,
+              "p99_ms": 84.905065,
+              "max_ms": 1004.506055
+            }
+          },
+          "write": {
+            "attempts": 16024,
+            "success": 16024,
+            "errors": {},
+            "successful_latency": {
+              "samples": 16024,
+              "p50_ms": 102.304143,
+              "p95_ms": 149.039314,
+              "p99_ms": 173.94403,
+              "max_ms": 1190.144774
+            }
+          },
+          "verification": {
+            "attempts": 16024,
+            "success": 16024,
+            "errors": {},
+            "successful_latency": {
+              "samples": 16024,
+              "p50_ms": 33.976818,
+              "p95_ms": 66.409852,
+              "p99_ms": 86.709134,
+              "max_ms": 1010.854582
+            }
+          }
+        }
+      ]
+    },
+    "A2": {
+      "phases": [
+        {
+          "phase": 1,
+          "observed_elapsed_ms": 30,
+          "metrics": {
+            "seconds": 0.704159927,
+            "read": {
+              "attempts": 105,
+              "success": 105,
+              "ops_s": 149.1138532227211,
+              "success_p99_ms": 9.400211,
+              "all_p99_ms": 9.400211,
+              "errors": {}
+            },
+            "write": {
+              "attempts": 106,
+              "success": 106,
+              "ops_s": 150.5339851581756,
+              "success_p99_ms": 17.806874,
+              "all_p99_ms": 17.806874,
+              "errors": {}
+            }
+          }
+        },
+        {
+          "phase": 2,
+          "observed_elapsed_ms": 734,
+          "metrics": {
+            "seconds": 3.418220318,
+            "read": {
+              "attempts": 514,
+              "success": 514,
+              "ops_s": 150.3706467641446,
+              "success_p99_ms": 13.652369,
+              "all_p99_ms": 13.652369,
+              "errors": {}
+            },
+            "write": {
+              "attempts": 513,
+              "success": 513,
+              "ops_s": 150.0780968677163,
+              "success_p99_ms": 27.038072,
+              "all_p99_ms": 27.038072,
+              "errors": {}
+            }
+          }
+        },
+        {
+          "phase": 3,
+          "observed_elapsed_ms": 4152,
+          "metrics": {
+            "seconds": 17.400358357,
+            "read": {
+              "attempts": 2610,
+              "success": 2610,
+              "ops_s": 149.99691077914045,
+              "success_p99_ms": 27.562291,
+              "all_p99_ms": 27.562291,
+              "errors": {}
+            },
+            "write": {
+              "attempts": 2601,
+              "success": 2601,
+              "ops_s": 149.4796800523158,
+              "success_p99_ms": 64.772752,
+              "all_p99_ms": 64.772752,
+              "errors": {}
+            }
+          }
+        },
+        {
+          "phase": 4,
+          "observed_elapsed_ms": 21553,
+          "metrics": {
+            "seconds": 0.100238173,
+            "read": {
+              "attempts": 14,
+              "success": 14,
+              "ops_s": 139.66735008228852,
+              "success_p99_ms": 5.194838,
+              "all_p99_ms": 5.194838,
+              "errors": {}
+            },
+            "write": {
+              "attempts": 10,
+              "success": 10,
+              "ops_s": 99.76239291592036,
+              "success_p99_ms": 11.050345,
+              "all_p99_ms": 11.050345,
+              "errors": {}
+            }
+          }
+        },
+        {
+          "phase": 5,
+          "observed_elapsed_ms": 21653,
+          "metrics": {
+            "seconds": 0.200241164,
+            "read": {
+              "attempts": 21,
+              "success": 21,
+              "ops_s": 104.87354138632554,
+              "success_p99_ms": 4.994536,
+              "all_p99_ms": 4.994536,
+              "errors": {}
+            },
+            "write": {
+              "attempts": 24,
+              "success": 24,
+              "ops_s": 119.85547587008634,
+              "success_p99_ms": 289.461491,
+              "all_p99_ms": 289.461491,
+              "errors": {}
+            }
+          }
+        },
+        {
+          "phase": 6,
+          "observed_elapsed_ms": 21853,
+          "metrics": {
+            "seconds": 33.930982053,
+            "read": {
+              "attempts": 5095,
+              "success": 5095,
+              "ops_s": 150.1577523468563,
+              "success_p99_ms": 19.108919,
+              "all_p99_ms": 19.108919,
+              "errors": {}
+            },
+            "write": {
+              "attempts": 5106,
+              "success": 5104,
+              "ops_s": 150.42299665914712,
+              "success_p99_ms": 36.081927,
+              "all_p99_ms": 36.081927,
+              "errors": {
+                "Unavailable": 2
+              }
+            }
+          }
+        }
+      ],
+      "config": {
+        "rates": [
+          100,
+          300,
+          500,
+          1000
+        ],
+        "stage_duration_ns": 90000000000,
+        "concurrency": 32,
+        "read_percent": 50,
+        "seed_keys": 256,
+        "value_bytes": 1024,
+        "max_requests": 1000000,
+        "prefix": "split-ramp",
+        "request_timeout_ns": 2000000000,
+        "verify_writes": true
+      },
+      "stage_300_end_ns": 1795332249020485109,
+      "after_cutover_300_tail": {
+        "seconds": 10.0,
+        "read": {
+          "attempts": 1495,
+          "success": 1495,
+          "ops_s": 149.5,
+          "success_p99_ms": 39.640506,
+          "all_p99_ms": 39.640506,
+          "errors": {}
+        },
+        "write": {
+          "attempts": 1490,
+          "success": 1490,
+          "ops_s": 149.0,
+          "success_p99_ms": 112.474545,
+          "all_p99_ms": 112.474545,
+          "errors": {}
+        }
+      },
+      "tail_includes_cleanup": false,
+      "split_all": {
+        "seconds": 55.784,
+        "read": {
+          "attempts": 8364,
+          "success": 8364,
+          "ops_s": 149.93546536641333,
+          "success_p99_ms": 21.73414,
+          "all_p99_ms": 21.73414,
+          "errors": {}
+        },
+        "write": {
+          "attempts": 8365,
+          "success": 8363,
+          "ops_s": 149.9175390793059,
+          "success_p99_ms": 45.398607,
+          "all_p99_ms": 45.398607,
+          "errors": {
+            "Unavailable": 2
+          }
+        }
+      },
+      "full_run": {
+        "read": {
+          "success": 49419,
+          "errors": {}
+        },
+        "write": {
+          "success": 49425,
+          "errors": {
+            "Unavailable": 2
+          }
+        }
+      },
+      "start_ns": 1795332164154072879,
+      "done_observed_ns": 1795332219938072879,
+      "phase_clock_offset_spread_ms": 0.641643,
+      "timing": {
+        "lower_ms": 1189.692,
+        "upper_ms": 1210.082,
+        "families": 46,
+        "completed": 46,
+        "versions": 2050,
+        "capture_version": 1,
+        "sequence": 1038,
+        "seal_sequence": 1038
+      },
+      "ingress_count": 3,
+      "ack_count": 49425,
+      "expected_observations": 148275,
+      "readback_success": 148275,
+      "audit_verified": true,
+      "post_done_paths": {
+        "moved-direct": [
+          600,
+          600,
+          600,
+          0
+        ],
+        "moved-forwarded": [
+          600,
+          600,
+          600,
+          0
+        ],
+        "outside-direct": [
+          600,
+          600,
+          600,
+          0
+        ],
+        "retained-forwarded": [
+          600,
+          600,
+          600,
+          0
+        ],
+        "retained-direct": [
+          600,
+          600,
+          600,
+          0
+        ]
+      },
+      "dropped_capacity": 65535,
+      "dropped_scheduler": 6619,
+      "driver_exit": "exit status 1",
+      "server_test_exit": 0,
+      "split_common_rate": {
+        "seconds": 55.0,
+        "read": {
+          "attempts": 8247,
+          "success": 8247,
+          "ops_s": 149.94545454545454,
+          "success_p99_ms": 21.888702,
+          "all_p99_ms": 21.888702,
+          "errors": {}
+        },
+        "write": {
+          "attempts": 8247,
+          "success": 8245,
+          "ops_s": 149.9090909090909,
+          "success_p99_ms": 45.556608,
+          "all_p99_ms": 45.556608,
+          "errors": {
+            "Unavailable": 2
+          }
+        }
+      },
+      "post_done_8s_at_300": {
+        "seconds": 8.0,
+        "read": {
+          "attempts": 1077,
+          "success": 1077,
+          "ops_s": 134.625,
+          "success_p99_ms": 285.043266,
+          "all_p99_ms": 285.043266,
+          "errors": {}
+        },
+        "write": {
+          "attempts": 1080,
+          "success": 1080,
+          "ops_s": 135.0,
+          "success_p99_ms": 727.049932,
+          "all_p99_ms": 727.049932,
+          "errors": {}
+        }
+      },
+      "split_done_seconds": 55.784,
+      "stages": [
+        {
+          "index": 0,
+          "offered_rps": 100,
+          "started": "2026-11-22T07:21:09.001294947Z",
+          "elapsed_seconds": 90.005421986,
+          "planned": 9000,
+          "offered": 9000,
+          "admitted": 9000,
+          "dropped_capacity": 0,
+          "dropped_scheduler": 0,
+          "read": {
+            "attempts": 4500,
+            "success": 4500,
+            "errors": {},
+            "successful_latency": {
+              "samples": 4500,
+              "p50_ms": 3.06957,
+              "p95_ms": 6.486733,
+              "p99_ms": 13.470926,
+              "max_ms": 77.990615
+            }
+          },
+          "write": {
+            "attempts": 4500,
+            "success": 4500,
+            "errors": {},
+            "successful_latency": {
+              "samples": 4500,
+              "p50_ms": 10.583503,
+              "p95_ms": 14.59836,
+              "p99_ms": 31.377798,
+              "max_ms": 86.933659
+            }
+          },
+          "verification": {
+            "attempts": 4500,
+            "success": 4500,
+            "errors": {},
+            "successful_latency": {
+              "samples": 4500,
+              "p50_ms": 2.899429,
+              "p95_ms": 4.31158,
+              "p99_ms": 7.915978,
+              "max_ms": 75.732381
+            }
+          }
+        },
+        {
+          "index": 1,
+          "offered_rps": 300,
+          "started": "2026-11-22T07:22:39.020485109Z",
+          "elapsed_seconds": 90.073600464,
+          "planned": 27000,
+          "offered": 27000,
+          "admitted": 26747,
+          "dropped_capacity": 247,
+          "dropped_scheduler": 6,
+          "read": {
+            "attempts": 13372,
+            "success": 13372,
+            "errors": {},
+            "successful_latency": {
+              "samples": 13372,
+              "p50_ms": 2.926112,
+              "p95_ms": 8.869007,
+              "p99_ms": 33.405459,
+              "max_ms": 594.98532
+            }
+          },
+          "write": {
+            "attempts": 13375,
+            "success": 13373,
+            "errors": {
+              "Unavailable": 2
+            },
+            "successful_latency": {
+              "samples": 13373,
+              "p50_ms": 8.736037,
+              "p95_ms": 18.273877,
+              "p99_ms": 83.837182,
+              "max_ms": 953.827884
+            }
+          },
+          "verification": {
+            "attempts": 13373,
+            "success": 13373,
+            "errors": {},
+            "successful_latency": {
+              "samples": 13373,
+              "p50_ms": 1.803803,
+              "p95_ms": 7.599494,
+              "p99_ms": 19.54833,
+              "max_ms": 491.523019
+            }
+          }
+        },
+        {
+          "index": 2,
+          "offered_rps": 500,
+          "started": "2026-11-22T07:24:09.122364867Z",
+          "elapsed_seconds": 90.120217505,
+          "planned": 45000,
+          "offered": 45000,
+          "admitted": 31292,
+          "dropped_capacity": 13671,
+          "dropped_scheduler": 37,
+          "read": {
+            "attempts": 15642,
+            "success": 15642,
+            "errors": {},
+            "successful_latency": {
+              "samples": 15642,
+              "p50_ms": 29.757998,
+              "p95_ms": 62.222952,
+              "p99_ms": 86.439393,
+              "max_ms": 236.091371
+            }
+          },
+          "write": {
+            "attempts": 15650,
+            "success": 15650,
+            "errors": {},
+            "successful_latency": {
+              "samples": 15650,
+              "p50_ms": 99.740649,
+              "p95_ms": 149.246434,
+              "p99_ms": 177.367382,
+              "max_ms": 307.444766
+            }
+          },
+          "verification": {
+            "attempts": 15650,
+            "success": 15650,
+            "errors": {},
+            "successful_latency": {
+              "samples": 15650,
+              "p50_ms": 33.2075,
+              "p95_ms": 64.709279,
+              "p99_ms": 86.259501,
+              "max_ms": 233.043977
+            }
+          }
+        },
+        {
+          "index": 3,
+          "offered_rps": 1000,
+          "started": "2026-11-22T07:25:39.270304374Z",
+          "elapsed_seconds": 90.09540221,
+          "planned": 90000,
+          "offered": 90000,
+          "admitted": 31807,
+          "dropped_capacity": 51617,
+          "dropped_scheduler": 6576,
+          "read": {
+            "attempts": 15905,
+            "success": 15905,
+            "errors": {},
+            "successful_latency": {
+              "samples": 15905,
+              "p50_ms": 30.852604,
+              "p95_ms": 65.266366,
+              "p99_ms": 89.210991,
+              "max_ms": 576.319758
+            }
+          },
+          "write": {
+            "attempts": 15902,
+            "success": 15902,
+            "errors": {},
+            "successful_latency": {
+              "samples": 15902,
+              "p50_ms": 101.674309,
+              "p95_ms": 156.473379,
+              "p99_ms": 203.102977,
+              "max_ms": 967.155045
+            }
+          },
+          "verification": {
+            "attempts": 15902,
+            "success": 15902,
+            "errors": {},
+            "successful_latency": {
+              "samples": 15902,
+              "p50_ms": 33.785055,
+              "p95_ms": 66.648664,
+              "p99_ms": 93.425539,
+              "max_ms": 578.402553
+            }
+          }
+        }
+      ]
+    }
+  }
+}

@@ -13,6 +13,8 @@ func MigrationPartitionRequestAdmissionReady(tx Transactional) bool {
 	switch t := tx.(type) {
 	case *TransactionManager:
 		return migrationPartitionManagerReady(t)
+	case *forwardedGroupTransaction:
+		return migrationPartitionManagerReady(t.configuredManager())
 	case *LeaderProxy:
 		return t != nil && MigrationPartitionRequestAdmissionReady(t.tm)
 	case *leaseRefreshingTxn:

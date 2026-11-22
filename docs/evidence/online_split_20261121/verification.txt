@@ -1,0 +1,21 @@
+Implementation: 8c2282837ecee54d51c664c67576a8f90e5f90e4
+Independent final review: no remaining P0/P1 in the final fence correction.
+
+go test -p 3 -short ./... -timeout=15m: exit 0
+  GOMAXPROCS=4; fixed clean worktree; adapter 343.247s; internal/server 363.943s.
+go test -race -p 2 ./adapter -run 'TestOnline|TestRawHandoff|TestSplitPreflight|TestTransferStaleFenceCannotRunAfterAbandon|TestTransferFenceTransactionDependsOnLiveJob' -count=1 -timeout=5m: exit 0, 101.367s
+  GOMAXPROCS=4; same fixed clean worktree.
+KV/store/distribution focused race on 22536eca8: exit 0; these packages are unchanged in final 8c2282837.
+Full golangci-lint commit hook: 0 issues on 8c2282837.
+buf breaking against 5f6ef4e20/proto: exit 0 (additive schema).
+Jepsen harness unit suite: 441 tests, 6179 assertions, 0 failures, 0 errors.
+  Offline Leiningen, isolated HOME; not a live fault-injection campaign.
+Linux baseline fixture: exit 0, 453.93s.
+Linux final candidate fixture: exit 0, 450.46s.
+  Both load drivers report load degraded (exit 1) due to recorded errors/drops.
+VM150: started from stopped for this task, evidence collected, normal shutdown,
+  Proxmox qm status verified stopped. Disk and binaries retained for reproduction.
+
+An intermediate concurrent full-short run at 22536eca8 failed the existing
+TestLua_HGET_WRONGTYPE readiness wait. The final 8c2282837 full-short run passed,
+including that test; Lua implementation was not changed in this work.

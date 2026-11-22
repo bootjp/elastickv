@@ -1,0 +1,226 @@
+[
+  {
+    "rate": 100,
+    "sample": "interior complete-second aggregate bins; all three engines combined",
+    "metrics": {
+      "engine0": {
+        "calls": 13050,
+        "units": 13050,
+        "mean_units": 1.0,
+        "mean_ms": 2.138416442145594,
+        "max_ms": 9.930733,
+        "mean_queue_ms": 0.0
+      },
+      "engine1": {
+        "calls": 13050,
+        "units": 0,
+        "mean_units": 0.0,
+        "mean_ms": 0.021047771034482757,
+        "max_ms": 0.165962,
+        "mean_queue_ms": 0.0
+      },
+      "store2": {
+        "calls": 13050,
+        "units": 39150,
+        "mean_units": 3.0,
+        "mean_ms": 3.264344405440613,
+        "max_ms": 13.282191,
+        "mean_queue_ms": 0.0
+      },
+      "kv0": {
+        "calls": 4350,
+        "units": 4350,
+        "mean_units": 1.0,
+        "mean_ms": 6.327255888965517,
+        "max_ms": 17.901551,
+        "mean_queue_ms": 1.2034793016091954
+      }
+    }
+  },
+  {
+    "rate": 300,
+    "sample": "interior complete-second aggregate bins; all three engines combined",
+    "metrics": {
+      "engine0": {
+        "calls": 41046,
+        "units": 41046,
+        "mean_units": 1.0,
+        "mean_ms": 1.7558288632266237,
+        "max_ms": 177.376817,
+        "mean_queue_ms": 0.0
+      },
+      "engine1": {
+        "calls": 41046,
+        "units": 0,
+        "mean_units": 0.0,
+        "mean_ms": 0.011584590556936121,
+        "max_ms": 0.36067,
+        "mean_queue_ms": 0.0
+      },
+      "store2": {
+        "calls": 36723,
+        "units": 110640,
+        "mean_units": 3.012825749530267,
+        "mean_ms": 2.4333864869155573,
+        "max_ms": 158.290481,
+        "mean_queue_ms": 0.0
+      },
+      "kv0": {
+        "calls": 12786,
+        "units": 12996,
+        "mean_units": 1.0164242139840451,
+        "mean_ms": 5.069208542468324,
+        "max_ms": 510.867657,
+        "mean_queue_ms": 1.2002212121852027
+      },
+      "kv2": {
+        "calls": 56,
+        "units": 56,
+        "mean_units": 1.0,
+        "mean_ms": 0.00047069642857142856,
+        "max_ms": 0.017017,
+        "mean_queue_ms": 0.0
+      },
+      "kv3": {
+        "calls": 44,
+        "units": 44,
+        "mean_units": 1.0,
+        "mean_ms": 0.00025295454545454547,
+        "max_ms": 0.000567,
+        "mean_queue_ms": 0.0
+      },
+      "store1": {
+        "calls": 1839,
+        "units": 9309,
+        "mean_units": 5.061990212071779,
+        "mean_ms": 2.732104450244698,
+        "max_ms": 8.379532,
+        "mean_queue_ms": 0.0
+      },
+      "adapter0": {
+        "calls": 26,
+        "units": 26,
+        "mean_units": 1.0,
+        "mean_ms": 0.0002348846153846154,
+        "max_ms": 0.000441,
+        "mean_queue_ms": 0.0
+      },
+      "adapter1": {
+        "calls": 26,
+        "units": 26,
+        "mean_units": 1.0,
+        "mean_ms": 0.0001633846153846154,
+        "max_ms": 0.000378,
+        "mean_queue_ms": 0.0
+      },
+      "adapter2": {
+        "calls": 426,
+        "units": 426,
+        "mean_units": 1.0,
+        "mean_ms": 0.0001834413145539906,
+        "max_ms": 0.000653,
+        "mean_queue_ms": 0.0
+      },
+      "store0": {
+        "calls": 48,
+        "units": 219,
+        "mean_units": 4.5625,
+        "mean_ms": 13.224024666666667,
+        "max_ms": 127.483498,
+        "mean_queue_ms": 0.0
+      }
+    }
+  },
+  {
+    "rate": 500,
+    "sample": "interior complete-second aggregate bins; all three engines combined",
+    "metrics": {
+      "engine0": {
+        "calls": 26763,
+        "units": 26763,
+        "mean_units": 1.0,
+        "mean_ms": 10.017226654074657,
+        "max_ms": 57.537693,
+        "mean_queue_ms": 0.0
+      },
+      "engine1": {
+        "calls": 26763,
+        "units": 0,
+        "mean_units": 0.0,
+        "mean_ms": 0.01253970190187946,
+        "max_ms": 0.334147,
+        "mean_queue_ms": 0.0
+      },
+      "store2": {
+        "calls": 20589,
+        "units": 69762,
+        "mean_units": 3.3883141483316335,
+        "mean_ms": 6.2358551034533,
+        "max_ms": 45.07596,
+        "mean_queue_ms": 0.0
+      },
+      "kv0": {
+        "calls": 8921,
+        "units": 15941,
+        "mean_units": 1.7869072973881852,
+        "mean_ms": 32.112356039569555,
+        "max_ms": 120.565874,
+        "mean_queue_ms": 17.207518183835894
+      },
+      "store0": {
+        "calls": 5060,
+        "units": 28244,
+        "mean_units": 5.581818181818182,
+        "mean_ms": 8.780366990316205,
+        "max_ms": 41.89739,
+        "mean_queue_ms": 0.0
+      }
+    }
+  },
+  {
+    "rate": 1000,
+    "sample": "interior complete-second aggregate bins; all three engines combined",
+    "metrics": {
+      "engine0": {
+        "calls": 22328,
+        "units": 22328,
+        "mean_units": 1.0,
+        "mean_ms": 13.287332294383733,
+        "max_ms": 250.58159,
+        "mean_queue_ms": 0.0
+      },
+      "engine1": {
+        "calls": 22327,
+        "units": 0,
+        "mean_units": 0.0,
+        "mean_ms": 0.01371680955793434,
+        "max_ms": 0.133992,
+        "mean_queue_ms": 0.0
+      },
+      "store0": {
+        "calls": 5598,
+        "units": 32673,
+        "mean_units": 5.836548767416935,
+        "mean_ms": 8.208095116648803,
+        "max_ms": 114.310379,
+        "mean_queue_ms": 0.0
+      },
+      "store2": {
+        "calls": 15531,
+        "units": 56819,
+        "mean_units": 3.6584250853132443,
+        "mean_ms": 8.243558693709355,
+        "max_ms": 122.997351,
+        "mean_queue_ms": 0.0
+      },
+      "kv0": {
+        "calls": 7443,
+        "units": 16145,
+        "mean_units": 2.1691522235657663,
+        "mean_ms": 41.094499012091894,
+        "max_ms": 390.506524,
+        "mean_queue_ms": 21.383395347171838
+      }
+    }
+  }
+]

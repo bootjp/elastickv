@@ -1,0 +1,9 @@
+{
+  "source_commit": "d0ee76e0a1268d9af39e64560ba3e78814e2fb06",
+  "sha256": "133bb73cdaf456d30e424e23af65c6b4fe0a5fa96c930f60d1832fe12ee54f98",
+  "toolchain": "go1.27.3",
+  "overlay": false,
+  "production_diagnostics": false,
+  "sync": true,
+  "additional_gather_delay": false
+}

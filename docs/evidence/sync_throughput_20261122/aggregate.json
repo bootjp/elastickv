@@ -1,0 +1,24 @@
+{
+  "baseline": {
+    "stage_elapsed_seconds": 720.425644974,
+    "success_ops_s": {
+      "read": 139.4939237672846,
+      "write": 139.79097038339685
+    },
+    "capacity_drops": 127350,
+    "scheduler_drops": 13446,
+    "ack_writes": 100709,
+    "exact_observations": 302127
+  },
+  "fixed": {
+    "stage_elapsed_seconds": 720.348519402,
+    "success_ops_s": {
+      "read": 172.42209382634454,
+      "write": 172.78441844140264
+    },
+    "capacity_drops": 79920,
+    "scheduler_drops": 13411,
+    "ack_writes": 124465,
+    "exact_observations": 373395
+  }
+}

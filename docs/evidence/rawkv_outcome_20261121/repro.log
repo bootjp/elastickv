@@ -1,0 +1,11 @@
+--- FAIL: TestRawPutKnownPreDispatchFenceIsNotIndeterminate (0.00s)
+    grpc_fenced_admission_test.go:34: 
+        	Error Trace:	/private/tmp/elastickv-load-ramp-20261121/adapter/grpc_fenced_admission_test.go:34
+        	Error:      	Not equal: 
+        	            	expected: 0xe
+        	            	actual  : 0x2
+        	Test:       	TestRawPutKnownPreDispatchFenceIsNotIndeterminate
+        	Messages:   	known pre-dispatch rejection must not be reported as indeterminate
+FAIL
+FAIL	github.com/bootjp/elastickv/adapter	0.771s
+FAIL
