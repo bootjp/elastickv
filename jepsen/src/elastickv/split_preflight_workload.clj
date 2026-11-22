@@ -612,20 +612,29 @@
       (gen/on-threads #{thread}
         (mapv (fn [k] {:f :read :tag tag :value (independent/tuple k nil)}) register-keys)))))
 
-(defn- invoke-membership-operation [invoke op]
-  (loop [timeouts []]
-    (let [{:keys [type error] :as result} (invoke op)]
-      ;; A timed-out watermark RPC occurs before routing. The probe must
-      ;; still get a value or reach the route guard while the old view is held.
-      (if (and (= :read (:f op))
-               (#{:stale :new-while-stale} (:tag op))
-               (< (count timeouts) 2)
-               (= :info type)
-               (str/includes? (str error) "grpc latest read: read fence: tso commit floor:")
-               (str/includes? (str error) "watermark: rpc error: code = DeadlineExceeded")
-               (str/includes? (str error) "authoritative data-group commit floor is unavailable"))
-        (recur (conj timeouts error))
-        (cond-> result (seq timeouts) (assoc :watermark-timeouts timeouts))))))
+(defn- membership-probe-timeout [tag error]
+  (let [message (str error)]
+    (cond
+      (and (str/includes? message "grpc latest read: read fence: tso commit floor:")
+           (str/includes? message "watermark: rpc error: code = DeadlineExceeded")
+           (str/includes? message "authoritative data-group commit floor is unavailable"))
+      :watermark-timeouts
+
+      (and (= :new-while-stale tag)
+           (re-matches #"read register: rpc error: code = DeadlineExceeded desc = (?:rpc error: code = DeadlineExceeded desc = )?stream terminated by RST_STREAM with error code: CANCEL"
+                       message))
+      :transport-timeouts)))
+
+(defn- invoke-membership-operation [invoke {:keys [f tag] :as op}]
+  (loop [retries-left 2 timeouts {}]
+    (let [{:keys [type error] :as result} (invoke op)
+          timeout (when (and (= :read f) (#{:stale :new-while-stale} tag) (= :info type))
+                    (membership-probe-timeout tag error))]
+      ;; Keep the probe in the same generator operation so the old view
+      ;; stays held. The checker still validates the terminal outcome.
+      (if (and (pos? retries-left) timeout)
+        (recur (dec retries-left) (update timeouts timeout (fnil conj []) error))
+        (merge result timeouts)))))
 
 (defrecord MembershipClient [delegate]
   client/Client

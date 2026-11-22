@@ -3,11 +3,14 @@
             [elastickv.split-preflight-workload :as pf]
             [jepsen.checker :as checker]))
 
-(deftest membership-probes-retry-only-watermark-timeouts
+(deftest membership-probes-retry-transient-read-errors
   (let [invoke #'pf/invoke-membership-operation
         timeout "read register: rpc error: code = Unknown desc = grpc latest read: read fence: tso commit floor: group 1: read data group 1 leader 127.0.0.1:25101 watermark: rpc error: code = DeadlineExceeded desc = context deadline exceeded: tso: authoritative data-group commit floor is unavailable"
+        reset "read register: rpc error: code = DeadlineExceeded desc = rpc error: code = DeadlineExceeded desc = stream terminated by RST_STREAM with error code: CANCEL"
         unavailable "read register: rpc error: code = Unavailable desc = Route unavailable"
         op {:f :read :tag :stale :value [1 nil]}
+        new-member (assoc op :tag :new-while-stale)
+        reset-result {:type :info :error reset}
         run (fn [operation responses]
               (let [remaining (atom responses)
                     result (invoke (fn [_]
@@ -28,7 +31,19 @@
            (run (assoc op :tag :member-read) [{:type :info :error timeout} {:type :ok}])))
     (is (= [{:type :info :error timeout :watermark-timeouts [timeout timeout]} 1]
            (run op (concat (repeat 3 {:type :info :error timeout})
-                           [{:type :info :error unavailable}]))))))
+                           [{:type :info :error unavailable}]))))
+    (is (= [{:type :info :error unavailable :transport-timeouts [reset]} 0]
+           (run new-member [reset-result {:type :info :error unavailable}])))
+    (is (= [{:type :ok :value [1 4202] :transport-timeouts [reset]} 1]
+           (run new-member [reset-result {:type :ok :value [1 4202]}
+                            {:type :ok :value [1 5101]}])))
+    (doseq [other [(assoc new-member :f :write)
+                   (assoc new-member :tag :member-read)
+                   op]]
+      (is (= [reset-result 1]
+             (run other [reset-result {:type :ok}]))))
+    (is (= [(assoc reset-result :watermark-timeouts [timeout] :transport-timeouts [reset]) 1]
+           (run new-member [{:type :info :error timeout} reset-result reset-result {:type :ok}])))))
 
 (defn- history []
   (let [a {:job "7" :scan-ts "11" :phase "SPLIT_JOB_PHASE_FENCE"
