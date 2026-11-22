@@ -188,7 +188,7 @@ class SourceAuditTests(unittest.TestCase):
                 "const SnapshotFormatVersion uint32 = 1",
                 "const snapshotFormatVersion uint32 = 1",
             ),
-            ('var snapshotMagic = []byte("EKV")', 'var SnapshotMagic = []byte("EKV")'),
+            ('const snapshotMagic = "EKV"', 'const SnapshotMagic = "EKV"'),
         ]:
             with self.subTest(old=old, new=new):
                 report = self.assess("kv/format.go", old, new)
@@ -202,6 +202,7 @@ class SourceAuditTests(unittest.TestCase):
 
     def test_marker_rename_never_hides_value_type_or_kind_change(self):
         cases = [
+            ("var snapshotVersion = 1", "var SnapshotVersion = 1"),
             ("const snapshotVersion = 1", "const SnapshotVersion uint32 = 2"),
             ("const snapshotVersion uint32 = 1", "const SnapshotVersion uint64 = 1"),
             ("const snapshotVersion = 1", "var SnapshotVersion uint32 = 1"),

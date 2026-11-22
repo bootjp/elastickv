@@ -68,12 +68,12 @@ Unknown binaries, executable/symlink modes, runtime paths, `.go`/`.proto` source
 and independent persistence-removal findings are not exempt. Reviewers must still
 check any runtime/build use of an artifact; its path does not prove non-use.
 
-Within one changed file, the audit can match a unique marker rename that changes
+Within one changed file, the audit can match a unique constant marker rename that changes
 only the first letter's export case, such as `snapshotVersion` to `SnapshotVersion`.
 Its complete initializer and declaration kind must remain unchanged. Explicit
 types must match; a standalone untyped decimal `const` may acquire a fixed-width
 unsigned type only if that identical literal fits. Arbitrary renames, ambiguous
-spellings or duplicate declarations cannot justify the exception. Value changes,
+spellings, mutable variable renames or duplicate declarations cannot justify the exception. Value changes,
 explicit type changes, removals and incomplete initializers still block. A matched
 rename is recorded as attention, not a proof of call-site semantic equivalence.
 

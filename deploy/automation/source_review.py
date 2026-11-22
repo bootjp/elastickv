@@ -235,8 +235,10 @@ def retained_marker(name, old, new):
     after = [n for n in new if n[0].lower() + n[1:] == key]
     if len(before) == len(after) == 1:
         target = after[0]
-        if old[name]["count"] == new[target]["count"] == 1 and same_marker_value(
-            old[name], new[target]
+        if (
+            old[name]["kind"] == new[target]["kind"] == "const"
+            and old[name]["count"] == new[target]["count"] == 1
+            and same_marker_value(old[name], new[target])
         ):
             return target
     return None
@@ -434,7 +436,7 @@ def analyze(
                         "attention",
                         "persistent-marker-rename",
                         path,
-                        "Review export-only marker rename with unchanged initializer: "
+                        "Review export-only constant marker rename with unchanged initializer: "
                         + name
                         + " -> "
                         + target,
