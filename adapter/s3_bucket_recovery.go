@@ -6,30 +6,41 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/internal/s3keys"
+	"github.com/bootjp/elastickv/kv"
 	"github.com/cockroachdb/errors"
 )
 
-const s3BucketCleanupRecoveryInterval = 5 * time.Minute
+const (
+	s3BucketCleanupRecoveryInterval = 5 * time.Minute
+	s3BucketRecoveryBackoffFactor   = 2
+)
 
 func (s *S3Server) runBucketCleanupRecovery(ctx context.Context, generation uint64) {
-	ticker := time.NewTicker(s3BucketCleanupRecoveryInterval)
-	defer ticker.Stop()
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+	retry := time.Second
 	for {
-		if ctx.Err() != nil {
-			return
-		}
-		if err := s.recoverPendingBucketDeletes(ctx); err != nil {
-			s.setBlobGCReadyIfCurrent(ctx, generation, false)
-			if ctx.Err() == nil {
-				slog.WarnContext(ctx, "s3 bucket cleanup recovery failed", "err", err)
-			}
-		} else if ctx.Err() == nil {
-			s.setBlobGCReadyIfCurrent(ctx, generation, true)
-		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-timer.C:
+		}
+		err := s.recoverPendingBucketDeletes(ctx)
+		if ctx.Err() != nil {
+			return
+		}
+		s.setBlobGCReadyIfCurrent(ctx, generation, err == nil)
+		if err != nil {
+			slog.WarnContext(ctx, "s3 bucket cleanup recovery failed", "err", err)
+		}
+		// A cluster can open its stores before electing its first leader.
+		// Retry the fenced scan without waiting a full maintenance period.
+		if s.blobOffloadEnabled && errors.Is(err, kv.ErrTSOCommitFloorUnavailable) {
+			timer.Reset(retry)
+			retry = min(s3BucketRecoveryBackoffFactor*retry, s3BucketCleanupRecoveryInterval)
+		} else {
+			retry = time.Second
+			timer.Reset(s3BucketCleanupRecoveryInterval)
 		}
 	}
 }

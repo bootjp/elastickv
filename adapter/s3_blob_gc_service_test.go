@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/bootjp/elastickv/internal/s3keys"
+	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 )
@@ -104,4 +106,35 @@ func TestS3BlobGCReadinessWaitsForBucketRecovery(t *testing.T) {
 	close(blocking.release)
 	require.Eventually(t, server.blobOffloadGCReady.Load, time.Second, time.Millisecond)
 	server.Stop()
+}
+
+type unavailableS3RecoveryStore struct {
+	s3GCTestLocalStores
+	recovered atomic.Bool
+	attempted chan struct{}
+	once      sync.Once
+}
+
+func (st *unavailableS3RecoveryStore) ScanAt(ctx context.Context, start, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
+	if bytes.Equal(start, []byte(s3keys.BucketCleanupPrefix)) && !st.recovered.Load() {
+		st.once.Do(func() { close(st.attempted) })
+		return nil, kv.ErrTSOCommitFloorUnavailable
+	}
+	return st.MVCCStore.ScanAt(ctx, start, end, limit, ts)
+}
+
+func TestS3BlobGCReadinessRecoversAfterLeaderElection(t *testing.T) {
+	local := store.NewMVCCStore()
+	st := &unavailableS3RecoveryStore{s3GCTestLocalStores: s3GCTestLocalStores{MVCCStore: local, locals: []store.MVCCStore{local}}, attempted: make(chan struct{})}
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil, WithS3BlobOffloadEnabled(true))
+	require.NoError(t, server.StartBlobGC(t.Context()))
+	t.Cleanup(server.Stop)
+	select {
+	case <-st.attempted:
+	case <-time.After(time.Second):
+		t.Fatal("missing initial bucket recovery scan")
+	}
+	require.False(t, server.blobOffloadGCReady.Load())
+	st.recovered.Store(true)
+	require.Eventually(t, server.blobOffloadGCReady.Load, 5*time.Second, 10*time.Millisecond)
 }

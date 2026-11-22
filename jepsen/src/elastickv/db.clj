@@ -392,7 +392,7 @@
       (c/exec :bash "-c"
               (str "tmp=$(mktemp /var/log/elastickv-transport-metrics.XXXXXX); "
                    "if curl --connect-timeout 2 --max-time 5 -fsS http://127.0.0.1:9090/metrics "
-                   "| grep -E '^elastickv_(raft_(send_stream|snapshot_stream|dispatch_errors|dispatch_dropped|step_queue_full)|s3_object_duration_seconds_count)' > \"$tmp\"; "
+                   "| grep -E '^elastickv_(raft_(send_stream|snapshot_stream|dispatch_errors|dispatch_dropped|step_queue_full)|s3_(object_duration_seconds_count|blob_offload_write_decisions_total))' > \"$tmp\"; "
                    "then { printf '# transport metrics snapshot node=" (name node) " captured_at=%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"; cat \"$tmp\"; } >> " transport-metrics-file "; "
                    "else printf '# metrics unavailable node=" (name node) " captured_at=%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" >> " transport-metrics-file "; fi; "
                    "rm -f \"$tmp\"")))))
