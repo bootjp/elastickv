@@ -424,9 +424,6 @@ func (sc *raftEntryScope) failUnlessVerdict(err error) error {
 // after a per-request commit; the iterator does not observe the tombstones
 // this call stages, which matches the DB iterator of the per-request path.
 func (s *pebbleStore) stagePrefixDeletesInRaftEntry(scope *raftEntryScope, deletes []PrefixDelete, commitTS, appliedIndex uint64) error {
-	if scope.capture != nil {
-		return scope.fail(errors.WithStack(ErrNotSupported))
-	}
 	if scope.controlOnly {
 		return scope.fail(errors.Wrap(ErrNotSupported, "prefix delete in journal-only scope"))
 	}
@@ -451,7 +448,7 @@ func (s *pebbleStore) stagePrefixDeletesInRaftEntry(scope *raftEntryScope, delet
 	}
 	defer iter.Close()
 
-	if err := s.stageDeletePrefixes(iter, scope.batch, deletes, commitTS); err != nil {
+	if err := s.stageCaptureSafePrefixDeletes(scope, iter, deletes, commitTS); err != nil {
 		return scope.fail(err)
 	}
 	scope.observe(commitTS, true)

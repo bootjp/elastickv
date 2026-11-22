@@ -14,7 +14,7 @@ case "$output_dir/" in
 esac
 if [[ ${ELASTICKV_LOAD_EXCLUSIVE_HOST:-0} == 1 ]]; then
   exec python3 "$repo_dir/scripts/isolate-load-host.py" "$output_dir" -- \
-    env -u ELASTICKV_LOAD_EXCLUSIVE_HOST bash "$0" "$output_dir"
+    env -u ELASTICKV_LOAD_EXCLUSIVE_HOST bash "$repo_dir/scripts/run-split-load-ramp.sh" "$output_dir"
 fi
 {
   date -u +%FT%TZ

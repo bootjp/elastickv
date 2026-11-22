@@ -1,4 +1,8 @@
 import importlib.util
+import os
+import shutil
+import subprocess
+import tempfile
 import unittest
 from unittest.mock import Mock, patch
 from pathlib import Path
@@ -36,6 +40,30 @@ class FakeSystemd:
 
 
 class IsolationTest(unittest.TestCase):
+    def test_relative_script_invocation_keeps_child_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scripts = root / "repo" / "scripts"
+            scripts.mkdir(parents=True)
+            shutil.copy2(Path(__file__).with_name("run-split-load-ramp.sh"), scripts)
+            (scripts / "isolate-load-host.py").write_text(
+                "import pathlib, sys\n"
+                "assert pathlib.Path(sys.argv[-2]).is_file(), sys.argv[-2]\n"
+            )
+            commands = root / "bin"
+            commands.mkdir()
+            uname = commands / "uname"
+            uname.write_text("#!/bin/sh\nprintf 'Linux\\n'\n")
+            uname.chmod(0o755)
+            environment = dict(os.environ, ELASTICKV_LOAD_EXCLUSIVE_HOST="1")
+            environment["PATH"] = str(commands) + os.pathsep + environment["PATH"]
+            result = subprocess.run(
+                ["bash", "./run-split-load-ramp.sh", str(root / "results")],
+                cwd=scripts, env=environment, capture_output=True, text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def run_isolated(self, controller, body=lambda: None):
         record = {}
         isolation = module.Isolation(controller, record.update)
