@@ -3,7 +3,6 @@ package encryptionwiring
 import (
 	"context"
 	stderrors "errors"
-	"log/slog"
 	"time"
 
 	"github.com/bootjp/elastickv/internal/encryption"
@@ -196,7 +195,7 @@ func getStorageEnvelopeV2Capability(ctx context.Context, address string) (*pb.Ca
 	connCache := &kv.GRPCConnCache{}
 	defer func() {
 		if err := connCache.Close(); err != nil {
-			slog.Warn("encryption: failed to close membership capability connection", slog.String("error", err.Error()))
+			warnEncryptionError("encryption: failed to close membership capability connection", err)
 		}
 	}()
 	conn, err := connCache.ConnFor(address)
@@ -287,8 +286,7 @@ func (e *encryptionPreRegister) preRegisterDEK(ctx context.Context, activeDEK ui
 	connCache := &kv.GRPCConnCache{}
 	defer func() {
 		if cerr := connCache.Close(); cerr != nil {
-			slog.Warn("encryption: 7c pre-register failed to close gRPC connection cache",
-				slog.String("error", cerr.Error()))
+			warnEncryptionError("encryption: 7c pre-register failed to close gRPC connection cache", cerr)
 		}
 	}()
 	// TOCTOU residual for concurrent same-raftID AddVoter calls

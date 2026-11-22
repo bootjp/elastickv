@@ -366,10 +366,12 @@ func fetchPeerJSON(
 		// A peer that hangs on body close can wedge our goroutine
 		// against the deadline; log and move on rather than blocking.
 		if cerr := resp.Body.Close(); cerr != nil {
-			logger.LogAttrs(ctx, slog.LevelDebug, "keyviz fan-out: peer body close failed",
-				slog.String("peer", peer),
-				slog.String("error", cerr.Error()),
-			)
+			if logger.Enabled(ctx, slog.LevelDebug) {
+				logger.LogAttrs(ctx, slog.LevelDebug, "keyviz fan-out: peer body close failed",
+					slog.String("peer", peer),
+					slog.String("error", cerr.Error()),
+				)
+			}
 		}
 	}()
 	if resp.StatusCode != http.StatusOK {

@@ -284,8 +284,10 @@ func (s *ChunkBlobOrphanScanner) Run(ctx context.Context) error {
 			return nil
 		}
 		if err := s.ScanOnce(ctx); err != nil && !sweepCancelled(ctx) {
-			s.logger.WarnContext(ctx, "chunkblob orphan scan failed",
-				slog.String("error", err.Error()))
+			if s.logger.Enabled(ctx, slog.LevelWarn) {
+				s.logger.WarnContext(ctx, "chunkblob orphan scan failed",
+					slog.String("error", err.Error()))
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -324,8 +326,10 @@ func (s *ChunkBlobOrphanScanner) ScanOnce(ctx context.Context) error {
 		if err := s.scanBlob(ctx, blob, boundary); err != nil {
 			failureCount++
 			if len(failures) < MaxRetainedSweepFailures {
-				s.logger.WarnContext(ctx, "chunkblob orphan scan: blob failed, continuing",
-					slog.String("err", err.Error()))
+				if s.logger.Enabled(ctx, slog.LevelWarn) {
+					s.logger.WarnContext(ctx, "chunkblob orphan scan: blob failed, continuing",
+						slog.String("err", err.Error()))
+				}
 				failures = append(failures, err)
 			}
 		}

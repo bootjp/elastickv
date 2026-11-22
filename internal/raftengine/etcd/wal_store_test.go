@@ -9,8 +9,29 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	etcdraft "go.etcd.io/raft/v3"
 	raftpb "go.etcd.io/raft/v3/raftpb"
 )
+
+func TestPersistReadyVoteWithoutEntries(t *testing.T) {
+	t.Parallel()
+	cfg := OpenConfig{DataDir: t.TempDir(), StateMachine: &dummyFSM{}}
+	vote := &raftpb.HardState{Term: uint64Ptr(2), Vote: uint64Ptr(3)}
+	t.Run("save", func(t *testing.T) {
+		disk, err := openDiskState(cfg, nil)
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, closePersist(disk.Persist)) })
+		e := &Engine{persist: disk.Persist, storage: disk.Storage}
+		require.NoError(t, e.persistReady(etcdraft.Ready{HardState: vote, MustSync: true}))
+	})
+	disk, err := openDiskState(cfg, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, closePersist(disk.Persist)) })
+	state, _, err := disk.Storage.InitialState()
+	require.NoError(t, err)
+	require.Equal(t, vote.GetTerm(), state.GetTerm())
+	require.Equal(t, vote.GetVote(), state.GetVote())
+}
 
 // --- restoreSnapshotState tests ---
 //

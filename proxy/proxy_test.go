@@ -14,6 +14,7 @@ import (
 	"time"
 
 	waitutil "github.com/bootjp/elastickv/internal/testutil"
+	"github.com/getsentry/sentry-go"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/redis/go-redis/v9"
@@ -1921,6 +1922,33 @@ func TestShadowReader_Compare_DataMismatch(t *testing.T) {
 	sr.Compare(context.Background(), "GET", [][]byte{[]byte("GET"), []byte("k")}, "hello", nil)
 
 	assert.InDelta(t, 1, testutil.ToFloat64(metrics.Divergences.WithLabelValues("GET", "data_mismatch")), 0.001)
+}
+
+func TestDivergenceReportingWithWarningsDisabled(t *testing.T) {
+	t.Parallel()
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sentry_%t", enabled), func(t *testing.T) {
+			var logs bytes.Buffer
+			logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelError}))
+			reporter := newTestSentry()
+			reporter.enabled = enabled
+			reporter.hub = sentry.NewHub(nil, sentry.NewScope())
+			metrics := newTestMetrics()
+			secondary := newMockBackend("secondary")
+			secondary.doFunc = makeCmd("other", nil)
+			reader := NewShadowReader(secondary, metrics, reporter, logger, time.Second)
+			reader.Compare(t.Context(), "GET", [][]byte{[]byte("GET"), []byte("key")}, "value", nil)
+			sp := &shadowPubSub{metrics: metrics, logger: logger, sentry: reporter}
+			sp.reportDivergence(divergenceEvent{kind: DivExtraData, channel: "updates", payload: "value"})
+			assert.Empty(t, logs.String())
+			assert.InDelta(t, 1, testutil.ToFloat64(metrics.Divergences.WithLabelValues("GET", "data_mismatch")), 0.001)
+			assert.InDelta(t, 1, testutil.ToFloat64(metrics.PubSubShadowDivergences.WithLabelValues("extra_data")), 0.001)
+			_, readReported := reporter.lastReport["divergence_data_mismatch_GET"]
+			_, subscriptionReported := reporter.lastReport["divergence_extra_data_SUBSCRIBE"]
+			assert.Equal(t, enabled, readReported)
+			assert.Equal(t, enabled, subscriptionReported)
+		})
+	}
 }
 
 func TestShadowReader_Compare_ExtraData(t *testing.T) {

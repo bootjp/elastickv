@@ -217,6 +217,9 @@ func Audit(logger *slog.Logger) func(http.Handler) http.Handler {
 			rec := &auditRecorder{ResponseWriter: w}
 			start := time.Now()
 			next.ServeHTTP(rec, r)
+			if !logger.Enabled(r.Context(), slog.LevelInfo) {
+				return
+			}
 			principal, _ := PrincipalFromContext(r.Context())
 			logger.LogAttrs(r.Context(), slog.LevelInfo, "admin_audit",
 				slog.String("actor", principal.AccessKey),
@@ -228,5 +231,11 @@ func Audit(logger *slog.Logger) func(http.Handler) http.Handler {
 				slog.Duration("duration", time.Since(start)),
 			)
 		})
+	}
+}
+
+func logRequestError(ctx context.Context, logger *slog.Logger, level slog.Level, message string, err error) {
+	if logger.Enabled(ctx, level) {
+		logger.LogAttrs(ctx, level, message, slog.String("error", err.Error()))
 	}
 }

@@ -379,15 +379,20 @@ func (sp *shadowPubSub) sweepAll() {
 
 func (sp *shadowPubSub) reportDivergence(d divergenceEvent) {
 	sp.metrics.PubSubShadowDivergences.WithLabelValues(d.kind.String()).Inc()
-	logAttrs := []any{
-		"channel", truncateValue(d.channel),
-		"payload", truncateValue(d.payload),
-		labelKind, d.kind.String(),
+	if sp.logger.Enabled(context.Background(), slog.LevelWarn) {
+		logAttrs := []any{
+			"channel", truncateValue(d.channel),
+			"payload", truncateValue(d.payload),
+			labelKind, d.kind.String(),
+		}
+		if d.pattern != "" {
+			logAttrs = append(logAttrs, "pattern", truncateValue(d.pattern))
+		}
+		sp.logger.Warn("pubsub shadow divergence", logAttrs...)
 	}
-	if d.pattern != "" {
-		logAttrs = append(logAttrs, "pattern", truncateValue(d.pattern))
+	if !sp.sentry.enabled {
+		return
 	}
-	sp.logger.Warn("pubsub shadow divergence", logAttrs...)
 
 	cmd := "SUBSCRIBE"
 	if d.isPattern {

@@ -41,7 +41,7 @@ func (a *Adapter) retainLatestLeaseReceipt(ctx context.Context, inode, fh uint64
 	}
 	for _, old := range previous {
 		if err := verifier.VerifyOperationReceipt(ctx, old); err != nil && !errors.Is(err, filesystem.ErrOperationRetired) {
-			slog.WarnContext(ctx, "filesystem lease receipt verification failed", "inode", inode, "fh", fh, "error", err.Error())
+			warnFuseOperation(ctx, "filesystem lease receipt verification failed", err, slog.Uint64("inode", inode), slog.Uint64("fh", fh))
 			return
 		}
 	}

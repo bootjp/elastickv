@@ -2364,13 +2364,15 @@ func (c *ShardedCoordinator) secondaryCommitFailure(err error, gid, startTS, com
 	if isComposed1RetryableError(err) {
 		message = "txn secondary commit failed Composed-1 — surfacing as fatal"
 	}
-	c.logger().Warn(message,
-		slog.Uint64("gid", gid),
-		slog.String("primary_key", string(primaryKey)),
-		slog.Uint64("start_ts", startTS),
-		slog.Uint64("commit_ts", commitTS),
-		slog.Any("err", err),
-	)
+	if logger := c.logger(); logger.Enabled(context.Background(), slog.LevelWarn) {
+		logger.Warn(message,
+			slog.Uint64("gid", gid),
+			slog.String("primary_key", string(primaryKey)),
+			slog.Uint64("start_ts", startTS),
+			slog.Uint64("commit_ts", commitTS),
+			slog.Any("err", err),
+		)
+	}
 	if isComposed1RetryableError(err) {
 		return errors.WithStack(ErrTxnSecondaryRouteShiftedAfterPrimaryCommit)
 	}
@@ -2444,13 +2446,15 @@ func (c *ShardedCoordinator) abortPreparedGroup(ctx context.Context, startTS uin
 		return true
 	}
 	if err != nil {
-		c.logger().Warn("txn abort failed; locks may remain until TTL expiry",
-			slog.Uint64("gid", pg.gid),
-			slog.String("primary_key", string(primaryKey)),
-			slog.Uint64("start_ts", startTS),
-			slog.Uint64("abort_ts", abortTS),
-			slog.Any("err", err),
-		)
+		if logger := c.logger(); logger.Enabled(context.Background(), slog.LevelWarn) {
+			logger.Warn("txn abort failed; locks may remain until TTL expiry",
+				slog.Uint64("gid", pg.gid),
+				slog.String("primary_key", string(primaryKey)),
+				slog.Uint64("start_ts", startTS),
+				slog.Uint64("abort_ts", abortTS),
+				slog.Any("err", err),
+			)
+		}
 		return false
 	}
 	return true

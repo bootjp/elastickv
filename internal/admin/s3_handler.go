@@ -284,9 +284,7 @@ func (h *S3Handler) handleList(w http.ResponseWriter, r *http.Request) {
 				"this endpoint requires a full-access role")
 			return
 		}
-		h.logger.LogAttrs(r.Context(), slog.LevelError, "admin s3 list buckets failed",
-			slog.String("error", err.Error()),
-		)
+		logRequestError(r.Context(), h.logger, slog.LevelError, "admin s3 list buckets failed", err)
 		writeJSONError(w, http.StatusInternalServerError, "s3_list_failed",
 			"failed to list buckets; see server logs")
 		return
@@ -315,10 +313,12 @@ func (h *S3Handler) handleDescribe(w http.ResponseWriter, r *http.Request, name 
 				"this endpoint requires a full-access role")
 			return
 		}
-		h.logger.LogAttrs(r.Context(), slog.LevelError, "admin s3 describe bucket failed",
-			slog.String("bucket", name),
-			slog.String("error", err.Error()),
-		)
+		if h.logger.Enabled(r.Context(), slog.LevelError) {
+			h.logger.LogAttrs(r.Context(), slog.LevelError, "admin s3 describe bucket failed",
+				slog.String("bucket", name),
+				slog.String("error", err.Error()),
+			)
+		}
 		writeJSONError(w, http.StatusInternalServerError, "s3_describe_failed",
 			"failed to describe bucket; see server logs")
 		return
@@ -485,9 +485,11 @@ func (h *S3Handler) writeBucketsError(w http.ResponseWriter, r *http.Request, op
 			writeJSONError(w, http.StatusBadRequest, "invalid_request", verr.Error())
 			return
 		}
-		h.logger.LogAttrs(r.Context(), slog.LevelError, "admin s3 "+op+" bucket failed",
-			slog.String("error", err.Error()),
-		)
+		if h.logger.Enabled(r.Context(), slog.LevelError) {
+			h.logger.LogAttrs(r.Context(), slog.LevelError, "admin s3 "+op+" bucket failed",
+				slog.String("error", err.Error()),
+			)
+		}
 		writeJSONError(w, http.StatusInternalServerError, "s3_"+op+"_failed",
 			"failed to "+op+" bucket; see server logs")
 	}
@@ -626,9 +628,11 @@ func (h *S3Handler) writeForwardResult(w http.ResponseWriter, r *http.Request, r
 // operators can investigate.
 func (h *S3Handler) writeForwardFailure(w http.ResponseWriter, r *http.Request, op string, err error) {
 	if !errors.Is(err, ErrLeaderUnavailable) {
-		h.logger.LogAttrs(r.Context(), slog.LevelError, "admin s3 "+op+" forward failed",
-			slog.String("error", err.Error()),
-		)
+		if h.logger.Enabled(r.Context(), slog.LevelError) {
+			h.logger.LogAttrs(r.Context(), slog.LevelError, "admin s3 "+op+" forward failed",
+				slog.String("error", err.Error()),
+			)
+		}
 	}
 	w.Header().Set("Retry-After", "1")
 	writeJSONError(w, http.StatusServiceUnavailable, "leader_unavailable",

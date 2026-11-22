@@ -562,11 +562,13 @@ func (s *ForwardServer) logUnexpectedSourceError(ctx context.Context, op, resour
 	if isStructuredSourceError(err) {
 		return
 	}
-	s.logger.LogAttrs(ctx, slog.LevelError, "admin_forward_"+op+"_failed",
-		slog.String("resource", resource),
-		slog.String("forwarded_from", forwardedFrom),
-		slog.String("error", err.Error()),
-	)
+	if s.logger.Enabled(ctx, slog.LevelError) {
+		s.logger.LogAttrs(ctx, slog.LevelError, "admin_forward_"+op+"_failed",
+			slog.String("resource", resource),
+			slog.String("forwarded_from", forwardedFrom),
+			slog.String("error", err.Error()),
+		)
+	}
 }
 
 // isStructuredSourceError reports whether err is one of the

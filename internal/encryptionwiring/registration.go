@@ -114,14 +114,12 @@ func InstallRaftRegistrationVerifier(defaultGroup *kv.ShardGroup, w WriteWiring,
 	w.RaftEnvelope.setRegistrationVerifier(func(activeRaftDEKID uint32, raftEpoch uint16) bool {
 		reg, err := store.WriterRegistryFor(defaultGroup.Store)
 		if err != nil {
-			slog.Warn("encryption: raft writer registration verifier failed to obtain writer registry handle",
-				slog.String("error", err.Error()))
+			warnEncryptionError("encryption: raft writer registration verifier failed to obtain writer registry handle", err)
 			return false
 		}
 		registered, err := registrationCommittedAtEpoch(reg, activeRaftDEKID, fullNodeID, raftEpoch)
 		if err != nil {
-			slog.Warn("encryption: raft writer registration verifier failed to verify registry row",
-				slog.String("error", err.Error()))
+			warnEncryptionError("encryption: raft writer registration verifier failed to verify registry row", err)
 			return false
 		}
 		return registered
@@ -196,6 +194,12 @@ func runRuntimeRaftRegistrationWatcher(
 	}
 }
 
+func warnEncryptionError(message string, err error) {
+	if logger := slog.Default(); logger.Enabled(context.Background(), slog.LevelWarn) {
+		logger.LogAttrs(context.Background(), slog.LevelWarn, message, slog.String("error", err.Error()))
+	}
+}
+
 func runtimeRaftRegistrationTick(
 	ctx context.Context,
 	coordinate *kv.ShardedCoordinator,
@@ -220,13 +224,14 @@ func runtimeRaftRegistrationTick(
 	}
 	lastSeen, err := registryLastSeen(reg, activeRaftDEKID, fullNodeID)
 	if err != nil {
-		slog.Warn("encryption: raft writer registration watcher failed to read registry last_seen; will retry",
-			slog.String("error", err.Error()))
+		warnEncryptionError("encryption: raft writer registration watcher failed to read registry last_seen; will retry", err)
 		return
 	}
 	if err := validateRaftRegistrationEpoch(activeRaftDEKID, w.RaftEpoch, lastSeen, fullNodeID); err != nil {
-		slog.Error("encryption: raft writer registration refused",
-			slog.String("error", err.Error()))
+		if logger := slog.Default(); logger.Enabled(context.Background(), slog.LevelError) {
+			logger.Error("encryption: raft writer registration refused",
+				slog.String("error", err.Error()))
+		}
 		return
 	}
 	slog.Info("encryption: raft writer registration watcher proposing registration",
@@ -253,8 +258,7 @@ func runtimeRaftRegistrationTick(
 func runtimeRaftRegistrationTarget(sidecarPath string, gate *RaftRegistrationGate, raftEpoch uint16) (uint32, bool) {
 	activeRaftDEKID, inScope, err := activeRaftDEKForRegistration(sidecarPath)
 	if err != nil {
-		slog.Warn("encryption: raft writer registration watcher failed to read sidecar; will retry",
-			slog.String("error", err.Error()))
+		warnEncryptionError("encryption: raft writer registration watcher failed to read sidecar; will retry", err)
 		return 0, false
 	}
 	if !inScope || gate.Registered(activeRaftDEKID, raftEpoch) {
@@ -266,8 +270,7 @@ func runtimeRaftRegistrationTarget(sidecarPath string, gate *RaftRegistrationGat
 func writerRegistryForRaftRegistration(defaultGroup *kv.ShardGroup) (encryption.WriterRegistryStore, bool) {
 	reg, err := store.WriterRegistryFor(defaultGroup.Store)
 	if err != nil {
-		slog.Warn("encryption: raft writer registration watcher failed to obtain writer registry handle; will retry",
-			slog.String("error", err.Error()))
+		warnEncryptionError("encryption: raft writer registration watcher failed to obtain writer registry handle; will retry", err)
 		return nil, false
 	}
 	return reg, true
@@ -276,8 +279,7 @@ func writerRegistryForRaftRegistration(defaultGroup *kv.ShardGroup) (encryption.
 func markRaftRegistrationIfCommitted(reg encryption.WriterRegistryStore, gate *RaftRegistrationGate, activeRaftDEKID uint32, fullNodeID uint64, raftEpoch uint16) bool {
 	registered, err := registrationCommittedAtEpoch(reg, activeRaftDEKID, fullNodeID, raftEpoch)
 	if err != nil {
-		slog.Warn("encryption: raft writer registration watcher failed to verify registry row; will retry",
-			slog.String("error", err.Error()))
+		warnEncryptionError("encryption: raft writer registration watcher failed to verify registry row; will retry", err)
 		return true
 	}
 	if !registered {
@@ -591,8 +593,7 @@ func runWriterRegistrationWithProposer(
 	connCache := &kv.GRPCConnCache{}
 	defer func() {
 		if err := connCache.Close(); err != nil {
-			slog.Warn("encryption: failed to close writer-registration gRPC connection cache",
-				slog.String("error", err.Error()))
+			warnEncryptionError("encryption: failed to close writer-registration gRPC connection cache", err)
 		}
 	}()
 
@@ -622,8 +623,10 @@ func runWriterRegistrationWithProposer(
 		if ctx.Err() != nil {
 			return
 		}
-		slog.Warn("encryption: writer registration attempt failed; retrying",
-			slog.String("error", err.Error()), slog.Duration("backoff", backoff))
+		if logger := slog.Default(); logger.Enabled(context.Background(), slog.LevelWarn) {
+			logger.Warn("encryption: writer registration attempt failed; retrying",
+				slog.String("error", err.Error()), slog.Duration("backoff", backoff))
+		}
 		select {
 		case <-ctx.Done():
 			return // shutdown before commit: leave barrier open (fail-closed)
@@ -913,8 +916,7 @@ func runtimeRegistrationTick(
 		slog.Uint64("boot_dek_id", uint64(bootDEKID)))
 	reg, err := store.WriterRegistryFor(defaultGroup.Store)
 	if err != nil {
-		slog.Warn("encryption: 7b runtime watcher failed to obtain writer registry handle; will retry",
-			slog.String("error", err.Error()))
+		warnEncryptionError("encryption: 7b runtime watcher failed to obtain writer registry handle; will retry", err)
 		return
 	}
 	// Per design §5 item 5: explicit ok=true gating on GetRegistryRow,

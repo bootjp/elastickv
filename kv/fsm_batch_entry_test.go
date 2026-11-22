@@ -435,13 +435,15 @@ func TestFSMApplyBatch_OperationalRequestFailureHaltsApply(t *testing.T) {
 func TestFSMApplyBatch_VerdictsStayPerRequest(t *testing.T) {
 	t.Parallel()
 	st := g17OpenStore(t, t.TempDir())
-	fsm := g17FSM(t, st)
+	obs := &g17Observer{t: t, st: st}
+	fsm := g17FSM(t, st, WithApplyObserver(obs))
 
 	unknownOp := g17RawPut(12, "unknown", "v")
 	unknownOp.Mutations[0].Op = pb.Op(99)
 	resp := fsm.Apply(g17Entry(t,
 		g17RawPut(10, "k", "first"),
 		g17RawPut(9, "k", "stale"),
+		g17RawPut(11, "k", "second"),
 		unknownOp,
 		g17RawPut(13, "", "bad"),
 		g17RawPut(14, "last", "v"),
@@ -449,16 +451,21 @@ func TestFSMApplyBatch_VerdictsStayPerRequest(t *testing.T) {
 
 	applyResp, ok := resp.(*fsmApplyResponse)
 	require.True(t, ok, "verdicts must not halt the engine, got %T", resp)
-	require.Len(t, applyResp.results, 5)
+	require.Len(t, applyResp.results, 6)
 	require.NoError(t, applyResp.results[0])
 	require.True(t, errors.Is(applyResp.results[1], store.ErrWriteConflict), "err = %v", applyResp.results[1])
-	require.True(t, errors.Is(applyResp.results[2], ErrUnknownRequestType), "err = %v", applyResp.results[2])
-	require.True(t, errors.Is(applyResp.results[3], ErrInvalidRequest), "err = %v", applyResp.results[3])
-	require.NoError(t, applyResp.results[4])
+	require.NoError(t, applyResp.results[2])
+	require.True(t, errors.Is(applyResp.results[3], ErrUnknownRequestType), "err = %v", applyResp.results[3])
+	require.True(t, errors.Is(applyResp.results[4], ErrInvalidRequest), "err = %v", applyResp.results[4])
+	require.NoError(t, applyResp.results[5])
+	require.Equal(t, []string{"k", "k", "last"}, obs.seen)
 
-	got, err := st.GetAt(context.Background(), []byte("k"), ^uint64(0))
+	got, err := st.GetAt(t.Context(), []byte("k"), 10)
 	require.NoError(t, err)
 	require.Equal(t, []byte("first"), got)
+	got, err = st.GetAt(t.Context(), []byte("k"), ^uint64(0))
+	require.NoError(t, err)
+	require.Equal(t, []byte("second"), got)
 	require.True(t, g17Exists(t, st, "last"))
 	idx, present := g17AppliedIndex(t, st)
 	require.True(t, present)

@@ -126,7 +126,7 @@ func main() {
 			raftDynamoMap:  *raftDynamoMap,
 		}
 		if err := run(runCtx, eg, cfg); err != nil {
-			slog.Error(err.Error())
+			logServerError(err)
 			os.Exit(1)
 		}
 	} else {
@@ -213,7 +213,7 @@ func main() {
 			n.raftBootstrap = true
 			cfg := n // capture loop variable
 			if err := run(runCtx, eg, cfg); err != nil {
-				slog.Error(err.Error())
+				logServerError(err)
 				os.Exit(1)
 			}
 		}
@@ -229,8 +229,14 @@ func main() {
 	}
 
 	if err := eg.Wait(); err != nil {
-		slog.Error(err.Error())
+		logServerError(err)
 		os.Exit(1)
+	}
+}
+
+func logServerError(err error) {
+	if logger := slog.Default(); logger.Enabled(context.Background(), slog.LevelError) {
+		logger.Error(err.Error())
 	}
 }
 

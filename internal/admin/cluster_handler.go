@@ -80,9 +80,7 @@ func (h *ClusterHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	info, err := h.source.Describe(r.Context())
 	if err != nil {
-		h.logger.LogAttrs(r.Context(), slog.LevelError, "admin cluster describe failed",
-			slog.String("error", err.Error()),
-		)
+		logRequestError(r.Context(), h.logger, slog.LevelError, "admin cluster describe failed", err)
 		writeJSONError(w, http.StatusInternalServerError, "cluster_describe_failed",
 			"failed to describe cluster state; see server logs")
 		return
@@ -97,8 +95,6 @@ func (h *ClusterHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// The 200 header is already on the wire, so we cannot
 		// change the status — but a truncated JSON body is hard
 		// to diagnose without a breadcrumb.
-		h.logger.LogAttrs(r.Context(), slog.LevelWarn, "admin cluster response encode failed",
-			slog.String("error", err.Error()),
-		)
+		logRequestError(r.Context(), h.logger, slog.LevelWarn, "admin cluster response encode failed", err)
 	}
 }

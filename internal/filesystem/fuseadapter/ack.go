@@ -120,7 +120,9 @@ func (a *Adapter) processAcknowledgementBatch(ctx context.Context) bool {
 		err := a.acknowledgeReceipt(attemptCtx, id)
 		cancel()
 		if err != nil {
-			slog.Warn("filesystem FUSE operation acknowledgement deferred", "sequence", id.Sequence, "error", err.Error())
+			if logger := slog.Default(); logger.Enabled(context.Background(), slog.LevelWarn) {
+				logger.Warn("filesystem FUSE operation acknowledgement deferred", "sequence", id.Sequence, "error", err.Error())
+			}
 			continue
 		}
 		a.replyMu.Lock()
