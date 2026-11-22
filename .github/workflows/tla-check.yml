@@ -1,20 +1,13 @@
 name: TLA+ model check
 
-# Runs `make tla-check` on PRs (and pushes to main) that touch the
-# subsystems modelled by the spec or the spec / tooling themselves.
-# Per docs/design/2026_05_28_implemented_tla_safety_spec.md §7.3.
-#
-# The job runs both MCHLC.cfg (correct design — expected PASS) and
-# MCHLC_gap.cfg (preconditions disabled — expected FAIL with the HLC-4
-# counterexample); the Makefile target greps for the specific HLC-4
-# violation string so the gap evidence is validated, not just the exit
-# code.
+# Checks the Lean proofs and bounded TLC models for the affected subsystems.
 
 on:
   pull_request:
     types: [opened, synchronize, reopened]
     paths:
       - 'tla/**'
+      - 'lean/**'
       - 'Makefile'
       - 'kv/hlc*.go'
       - 'kv/tso*.go'
@@ -22,10 +15,16 @@ on:
       - 'kv/sharded_coordinator.go'
       - 'kv/transaction.go'
       - 'kv/fsm.go'
+      - 'kv/fsm_cas.go'
+      - 'kv/fsm_migration_cleanup.go'
+      - 'kv/migration_version_identity.go'
+      - 'kv/version_cas_*.go'
       - 'kv/fsm_migration_serving.go'
       - 'kv/lock_resolver.go'
       - 'store/mvcc_store.go'
       - 'store/lsm_store.go'
+      - 'store/migration_cleanup.go'
+      - 'store/raft_entry*.go'
       - 'adapter/ts.go'
       - 'scripts/tla-check.sh'
       - 'distribution/**'
@@ -34,6 +33,7 @@ on:
     branches: [main]
     paths:
       - 'tla/**'
+      - 'lean/**'
       - 'Makefile'
       - 'kv/hlc*.go'
       - 'kv/tso*.go'
@@ -41,10 +41,16 @@ on:
       - 'kv/sharded_coordinator.go'
       - 'kv/transaction.go'
       - 'kv/fsm.go'
+      - 'kv/fsm_cas.go'
+      - 'kv/fsm_migration_cleanup.go'
+      - 'kv/migration_version_identity.go'
+      - 'kv/version_cas_*.go'
       - 'kv/fsm_migration_serving.go'
       - 'kv/lock_resolver.go'
       - 'store/mvcc_store.go'
       - 'store/lsm_store.go'
+      - 'store/migration_cleanup.go'
+      - 'store/raft_entry*.go'
       - 'adapter/ts.go'
       - 'scripts/tla-check.sh'
       - 'distribution/**'
@@ -94,3 +100,23 @@ jobs:
 
       - name: Run make tla-check
         run: make tla-check
+
+  lean-check:
+    name: lean-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      - name: Install pinned Lean
+        run: |
+          version="$(cut -d: -f2 lean/lean-toolchain)"
+          release="lean-${version#v}-linux"
+          archive="$RUNNER_TEMP/$release.tar.zst"
+          curl -fsSL "https://github.com/leanprover/lean4/releases/download/$version/$release.tar.zst" -o "$archive"
+          tar --zstd -xf "$archive" -C "$RUNNER_TEMP"
+          printf '%s\n' "$RUNNER_TEMP/$release/bin" >> "$GITHUB_PATH"
+
+      - name: Run make lean-check
+        run: make lean-check

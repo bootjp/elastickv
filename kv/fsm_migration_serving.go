@@ -15,11 +15,26 @@ import (
 // timestamps, metadata and footprint. The FSM repeats this check at apply;
 // a successful check does not authorize a different or later request.
 func CheckMigrationRequest(ctx context.Context, localStore store.MVCCStore, groupID uint64, req *pb.Request) error {
+	return checkMigrationRequest(ctx, localStore, groupID, req, requestUsesCAS(req))
+}
+
+func checkMigrationRequest(ctx context.Context, localStore store.MVCCStore, groupID uint64, req *pb.Request, cas bool) error {
 	if localStore == nil || req == nil {
 		return errors.WithStack(ErrInvalidRequest)
 	}
 	if err := verifyRequestMigrationControlKeys(req); err != nil {
 		return err
+	}
+	if cas {
+		// The transaction manager validates the standalone CAS shape before
+		// entering migration admission.
+		if err := validateCASProposalShape([]*pb.Request{req}); err != nil {
+			return err
+		}
+		if err := checkVersionCASMigrationRange(ctx, localStore, req.Mutations[1].Key); err != nil {
+			return errors.Join(ErrVersionCASUnavailable, err)
+		}
+		return nil
 	}
 	f := &kvFSM{store: localStore, shardGroupID: groupID}
 	index, err := MigrationConfigurationIndex(ctx, localStore)

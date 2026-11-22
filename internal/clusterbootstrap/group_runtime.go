@@ -3,6 +3,7 @@ package clusterbootstrap
 import (
 	"github.com/bootjp/elastickv/internal/noderuntime"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/kv"
 )
 
 // GroupRuntime is a Raft group's runtime plus the protected-bootstrap
@@ -13,6 +14,8 @@ type GroupRuntime struct {
 	BootstrapDomain     *BootstrapDomain
 	BootstrapPeerConfig *BootstrapPeerConfig
 	BootstrapNetwork    *BootstrapNetwork
+	VersionCASCapable   bool
+	VersionCASAdmission kv.VersionCASAdmission
 }
 
 // snapshotEngine is GroupRuntime.SnapshotEngine, nil-safe on the wrapper.

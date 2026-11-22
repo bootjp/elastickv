@@ -29,6 +29,10 @@ func projectPublicGRPCMutationError(err error) error {
 		!errors.Is(err, kv.ErrTxnLocked) &&
 		!isIndeterminateMutationDispatchFailure(err) {
 		switch {
+		case errors.Is(err, kv.ErrVersionCASUnavailable):
+			code = codes.FailedPrecondition
+			message = "Version CAS admission unavailable"
+			reason = publicGRPCNotAdmittedReason
 		case errors.Is(err, kv.ErrLeaderProxyCircuitOpen):
 			code = codes.Unavailable
 			message = "Route unavailable"
@@ -39,6 +43,10 @@ func projectPublicGRPCMutationError(err error) error {
 			reason = publicGRPCAbortedReason
 		}
 	}
+	return publicMutationStatus(code, message, reason)
+}
+
+func publicMutationStatus(code codes.Code, message, reason string) error {
 	st, detailErr := status.New(code, message).WithDetails(&errdetails.ErrorInfo{
 		Domain: publicGRPCFailureDomain,
 		Reason: reason,

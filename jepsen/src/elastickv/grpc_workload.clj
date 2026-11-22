@@ -5,6 +5,7 @@
             [clojure.java.io :as io]
             [clojure.string :as str]
             [elastickv.cli :as cli]
+            [elastickv.version-cas :as version-cas]
             [elastickv.elle-checker :as elle]
             [elastickv.redis-workload :as redis]
             [elastickv.s3-workload :as s3]
@@ -77,22 +78,30 @@
     (throw (ex-info "Use hosted-fault-workload for managed gRPC fault tests" {})))
   (let [ports (or (:node->port opts) (zipmap (:nodes opts) (repeat (or (:grpc-port opts) 50051))))
         concurrency (or (:concurrency opts) 6)
-        workload (grpc-register-workload (assoc opts :node->port ports))]
+        cas? (= :version-cas (:grpc-api opts))
+        workload (if cas?
+                   (version-cas/workload
+                     (->GRPCClient ports :transactional
+                                   (or (:grpc-client-bin opts) "/tmp/jepsen-grpc-client") nil nil nil)
+                     exchange! opts)
+                   (grpc-register-workload (assoc opts :node->port ports)))]
     (when-not (and (pos? concurrency) (even? concurrency))
       (throw (ex-info "gRPC concurrency must be positive and divisible by two" {})))
     (merge (redis/elastickv-redis-test opts) workload
            {:name (str "elastickv-grpc-" (name (or (:grpc-api opts) :raw)))
-            :grpc-host (:grpc-host opts)
+            :grpc-host (:grpc-host opts) :grpc-tls-ca-file (:grpc-tls-ca-file opts)
             :concurrency concurrency :wrap-generator nil :final-generator nil
-            :generator (->> (:generator workload)
+            :generator (if cas? (gen/clients (:generator workload))
+                        (->> (:generator workload)
                             (gen/stagger (/ (double (or (:rate opts) 5))))
-                            (gen/time-limit (or (:time-limit opts) 30)))})))
+                            (gen/time-limit (or (:time-limit opts) 30))))})))
 
 (def grpc-cli-opts
   [[nil "--grpc-ports PORTS" "Comma-separated public gRPC ports."
     :parse-fn #(mapv (fn [port] (Integer/parseInt port)) (str/split % #","))]
    [nil "--concurrency N" "Workers, divisible by two." :default 6 :parse-fn #(Integer/parseInt %)]
-   [nil "--grpc-api API" "raw or transactional" :default :raw :parse-fn keyword]
+   [nil "--grpc-tls-ca-file PATH" "CA certificate for the public gRPC endpoints."]
+   [nil "--grpc-api API" "raw, transactional, or version-cas" :default :raw :parse-fn keyword]
    [nil "--grpc-client-bin PATH" "JSON-line gRPC helper binary." :default "/tmp/jepsen-grpc-client"]])
 
 (defn prepare-opts [options]

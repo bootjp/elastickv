@@ -36,6 +36,10 @@ func MarshalMigrationCleanupCommand(req *pb.CleanupMigrationRequest) ([]byte, er
 func (f *kvFSM) applyMigrationCleanup(ctx context.Context, data []byte) any {
 	req := &pb.CleanupMigrationRequest{}
 	if err := proto.Unmarshal(data, req); err != nil {
+		protected, markerErr := MigrationVersionIdentityEnabled(ctx, f.store)
+		if protected || markerErr != nil {
+			return haltErr(errors.Wrap(errors.Mark(errors.Join(err, markerErr), ErrMigrationCleanupApply), "kv/fsm: decode migration cleanup"))
+		}
 		return errors.WithStack(err)
 	}
 	if req.GetMode() == pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_NAMESPACE_ADMISSION {
@@ -51,6 +55,20 @@ func (f *kvFSM) applyMigrationCleanup(ctx context.Context, data []byte) any {
 }
 
 func (f *kvFSM) applyMigrationCleanupRequest(ctx context.Context, req *pb.CleanupMigrationRequest) any {
+	if migrationOwnershipControlMode(req.GetMode()) || req.GetMode() == pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_METADATA {
+		return f.applyLegacyMigrationCleanupRequest(ctx, req)
+	}
+	protected, err := MigrationVersionIdentityEnabled(ctx, f.store)
+	if err != nil {
+		return haltErr(errors.Wrap(errors.Mark(err, ErrMigrationCleanupApply), "kv/fsm: load migration version identity"))
+	}
+	if protected {
+		return f.applyVersionIdentityCleanup(ctx, req)
+	}
+	return f.applyLegacyMigrationCleanupRequest(ctx, req)
+}
+
+func (f *kvFSM) applyLegacyMigrationCleanupRequest(ctx context.Context, req *pb.CleanupMigrationRequest) any {
 	if err := f.verifyMigrationCleanupConfiguration(ctx, req); err != nil {
 		if errors.Is(err, ErrMigrationConfigurationChanged) {
 			return err
@@ -75,6 +93,50 @@ func (f *kvFSM) applyMigrationCleanupRequest(ctx context.Context, req *pb.Cleanu
 		return haltErr(errors.Wrap(errors.Mark(err, ErrMigrationCleanupApply), "kv/fsm: apply migration cleanup"))
 	}
 	return result
+}
+
+func (f *kvFSM) applyVersionIdentityCleanup(ctx context.Context, req *pb.CleanupMigrationRequest) any {
+	applier, ok := f.store.(store.RaftEntryApplier)
+	if !ok || f.pendingApplyIdx == 0 {
+		return haltErr(errors.Mark(store.ErrRaftControlScopeRequired, ErrMigrationCleanupApply))
+	}
+	var response any
+	err := applier.ApplyRaftEntry(ctx, f.pendingApplyIdx, func(ctx context.Context) error {
+		replayed, err := store.StageRaftEntryProgress(ctx, f.pendingApplyIdx)
+		if err != nil || replayed {
+			return errors.WithStack(err)
+		}
+		result, err := f.stageVersionIdentityCleanup(ctx, req)
+		if err == nil {
+			response = result
+			return nil
+		}
+		if isVersionIdentityCleanupVerdict(err) {
+			response = err
+			return nil
+		}
+		return err
+	})
+	if err != nil {
+		return haltErr(errors.Wrap(errors.Mark(err, ErrMigrationCleanupApply), "kv/fsm: apply version identity cleanup"))
+	}
+	return response
+}
+
+func isVersionIdentityCleanupVerdict(err error) bool {
+	return errors.Is(err, ErrMigrationConfigurationChanged) || errors.Is(err, store.ErrMigrationOwnership) ||
+		errors.Is(err, store.ErrMigrationRetired) || errors.Is(err, store.ErrInvalidExportCursor)
+}
+
+func (f *kvFSM) stageVersionIdentityCleanup(ctx context.Context, req *pb.CleanupMigrationRequest) (store.CleanupVersionsResult, error) {
+	if err := f.verifyMigrationCleanupConfiguration(ctx, req); err != nil {
+		return store.CleanupVersionsResult{}, err
+	}
+	if err := verifyMigrationVersionCleanupCoverage(ctx, f.store, req); err != nil {
+		return store.CleanupVersionsResult{}, err
+	}
+	result, err := store.StageRaftEntryMigrationCleanup(ctx, migrationCleanupOptionsFromProto(req, f.pendingApplyIdx))
+	return result, errors.WithStack(err)
 }
 
 func (f *kvFSM) applyLegacyMigrationMetadataClear(ctx context.Context, cleaner store.MigrationCleaner, jobID uint64) any {

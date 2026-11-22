@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"slices"
 	"sync/atomic"
 	"time"
 
@@ -61,6 +62,10 @@ func (p *LeaderProxy) Commit(ctx context.Context, reqs []*pb.Request) (*Transact
 // hook only after the proxy has selected and verified the local leader path.
 // A follower can become leader after the coordinator chose to forward a seal.
 func (p *LeaderProxy) commitWithLocalStamp(ctx context.Context, reqs []*pb.Request, stamp func(context.Context, []*pb.Request) (uint64, error)) (*TransactionResponse, error) {
+	conditions := classifyProposalConditions(reqs)
+	if conditions.cas && p.tm.versionCASAdmission == nil {
+		return nil, errors.WithStack(ErrVersionCASUnavailable)
+	}
 	if !isLeaderEngine(p.engine) {
 		return p.forwardWithRetry(ctx, reqs)
 	}
@@ -71,7 +76,13 @@ func (p *LeaderProxy) commitWithLocalStamp(ctx context.Context, reqs []*pb.Reque
 		return p.forwardWithRetry(ctx, reqs)
 	}
 	p.forwardBreaker.reset(leaderProxyIdentityFromEngine(p.engine))
+	return p.commitVerifiedLocal(ctx, reqs, stamp, conditions)
+}
+
+func (p *LeaderProxy) commitVerifiedLocal(ctx context.Context, reqs []*pb.Request, stamp func(context.Context, []*pb.Request) (uint64, error), conditions proposalConditions) (*TransactionResponse, error) {
 	var commitTS uint64
+	// The internal stamp hook changes timestamps and values, preserving all
+	// mutation operations and predicates classified before leader selection.
 	if stamp != nil {
 		var err error
 		commitTS, err = stamp(ctx, reqs)
@@ -79,7 +90,7 @@ func (p *LeaderProxy) commitWithLocalStamp(ctx context.Context, reqs []*pb.Reque
 			return nil, err
 		}
 	}
-	resp, err := p.tm.Commit(ctx, reqs)
+	resp, err := p.tm.commitClassified(ctx, reqs, conditions)
 	if err != nil || resp == nil || commitTS == 0 {
 		return resp, err
 	}
@@ -91,6 +102,9 @@ func (p *LeaderProxy) commitWithLocalStamp(ctx context.Context, reqs []*pb.Reque
 }
 
 func (p *LeaderProxy) Abort(ctx context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
+	if HasCASMutation(reqs) {
+		return nil, errors.WithStack(ErrInvalidRequest)
+	}
 	if !isLeaderEngine(p.engine) {
 		return p.forwardWithRetry(ctx, reqs)
 	}
@@ -128,6 +142,9 @@ func (p *LeaderProxy) Abort(ctx context.Context, reqs []*pb.Request) (*Transacti
 func (p *LeaderProxy) forwardWithRetry(callerCtx context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
 	if len(reqs) == 0 {
 		return &TransactionResponse{}, nil
+	}
+	if slices.Contains(reqs, nil) {
+		return nil, errors.WithStack(ErrInvalidRequest)
 	}
 
 	deadline := time.Now().Add(leaderProxyRetryBudget)
@@ -245,6 +262,8 @@ func (p *LeaderProxy) runForwardCycle(callerCtx context.Context, parentCtx conte
 
 func isTerminalForwardError(err error) bool {
 	return errors.Is(err, ErrTransactionOutcomeUnknown) ||
+		errors.Is(err, ErrCASMismatch) ||
+		errors.Is(err, ErrVersionCASUnavailable) ||
 		errors.Is(err, store.ErrWriteConflict) ||
 		errors.Is(err, ErrRouteWriteFenced) ||
 		errors.Is(err, ErrTxnLocked) ||
@@ -295,7 +314,11 @@ func (p *LeaderProxy) forward(callerCtx context.Context, parentCtx context.Conte
 	ctx, cancel := context.WithTimeout(parentCtx, leaderForwardTimeout)
 	defer cancel()
 
-	resp, err := cli.Forward(ctx, &pb.ForwardRequest{
+	forward := cli.Forward
+	if HasCASMutation(reqs) {
+		forward = cli.ForwardCompareAndSwapV2
+	}
+	resp, err := forward(ctx, &pb.ForwardRequest{
 		IsTxn:                 reqs[0].IsTxn,
 		Requests:              reqs,
 		DecisionDetailVersion: ForwardDecisionSchemaVersion,
@@ -314,15 +337,27 @@ func (p *LeaderProxy) forward(callerCtx context.Context, parentCtx context.Conte
 }
 
 func classifyForwardRPCError(err error, reqs []*pb.Request) error {
-	if phase, ok := ForwardFailurePhaseForRequests(reqs); ok {
-		reason, decision, valid := DecodeForwardDecisionStatus(err, phase)
-		if valid {
-			return classifyValidatedForwardFailure(phase, reason, decision, ForwardOnePhaseDecisionEligible(reqs))
-		}
+	_, casErr := ForwardCASMutation(reqs)
+	if casErr == nil && isVersionCASForwardUnavailable(err) {
+		return errors.WithStack(ErrVersionCASUnavailable)
 	}
 	// Legacy ErrorInfo, malformed details, and unrecognized decisions do
 	// not prove the logical operation was absent or aborted.
-	return &ForwardFailure{Decision: pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN}
+	unknown := &ForwardFailure{Decision: pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN}
+	phase, ok := ForwardFailurePhaseForRequests(reqs)
+	if !ok {
+		return unknown
+	}
+	reason, decision, valid := DecodeForwardDecisionStatus(err, phase)
+	if !valid {
+		return unknown
+	}
+	if casErr == nil {
+		if err := classifyDedicatedCASForwardFailure(reason, decision); err != nil {
+			return err
+		}
+	}
+	return classifyValidatedForwardFailure(phase, reason, decision, ForwardOnePhaseDecisionEligible(reqs))
 }
 
 func classifyValidatedForwardFailure(phase pb.ForwardFailurePhase, reason pb.ForwardFailureReason, decision pb.ForwardDecisionClass, onePhaseEligible bool) error {
@@ -341,13 +376,28 @@ func classifyValidatedForwardFailure(phase pb.ForwardFailurePhase, reason pb.For
 		case pb.ForwardFailureReason_FORWARD_FAILURE_REASON_UNSPECIFIED,
 			pb.ForwardFailureReason_FORWARD_FAILURE_REASON_NO_LEADER,
 			pb.ForwardFailureReason_FORWARD_FAILURE_REASON_INTERRUPTED,
-			pb.ForwardFailureReason_FORWARD_FAILURE_REASON_ABORTED:
-			return &ForwardFailure{Decision: pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN}
-		default:
-			return &ForwardFailure{Decision: pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN}
+			pb.ForwardFailureReason_FORWARD_FAILURE_REASON_ABORTED,
+			pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CAS_MISMATCH,
+			pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CAS_LOCKED:
+			// These reasons carry no definitive verdict through the generic path.
 		}
 	}
 	return &ForwardFailure{Decision: pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN}
+}
+
+func classifyDedicatedCASForwardFailure(reason pb.ForwardFailureReason, decision pb.ForwardDecisionClass) error {
+	switch {
+	case reason == pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CAS_LOCKED &&
+		decision == pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_DEFINITIVELY_ABORTED:
+		return errors.WithStack(&ForwardApplyRejection{cause: ErrTxnLocked})
+	case reason == pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CAS_MISMATCH &&
+		decision == pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_DEFINITIVELY_ABORTED:
+		return errors.WithStack(&ForwardApplyRejection{cause: ErrCASMismatch})
+	case reason == pb.ForwardFailureReason_FORWARD_FAILURE_REASON_NO_LEADER &&
+		decision == pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_REJECTED_BEFORE_SUBMISSION:
+		return errors.WithStack(ErrLeaderNotFound)
+	}
+	return nil
 }
 
 func (p *LeaderProxy) forwardLeaseRead(callerCtx context.Context) (leaseReadResult, error) {

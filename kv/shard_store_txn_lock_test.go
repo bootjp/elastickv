@@ -112,6 +112,9 @@ func TestShardStoreGetAt_ReturnsTxnLockedForPendingLock(t *testing.T) {
 	_, err = shardStore.GetAt(ctx, key, ^uint64(0))
 	require.Error(t, err)
 	require.True(t, errors.Is(err, ErrTxnLocked), "expected ErrTxnLocked, got %v", err)
+	groups[1].ConfigureVersionReadAdmission(func(context.Context) error { return nil })
+	_, err = shardStore.GetVersionAt(ctx, key, ^uint64(0))
+	require.ErrorIs(t, err, ErrTxnLocked)
 }
 
 func TestShardStoreLeaderGetAtChecksReadinessBeforeResolvingPendingLock(t *testing.T) {
@@ -137,7 +140,7 @@ func TestShardStoreLeaderGetAtChecksReadinessBeforeResolvingPendingLock(t *testi
 
 	resolvedRoute, _, ok := shardStore.routeAndGroupForKey(key)
 	require.True(t, ok)
-	_, err := shardStore.leaderGetAt(ctx, group, resolvedRoute, key, ^uint64(0))
+	_, err := shardStore.leaderReadPoint(ctx, group, resolvedRoute, key, ^uint64(0), false)
 	require.ErrorIs(t, err, ErrRouteCutoverPending)
 
 	_, lockErr := group.Store.GetAt(ctx, txnLockKey(key), ^uint64(0))

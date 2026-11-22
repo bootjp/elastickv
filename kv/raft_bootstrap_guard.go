@@ -148,7 +148,8 @@ func validGuardedCatalogCommitHeader(request *pb.Request) bool {
 }
 
 func guardedCatalogMutationOptionsValid(mutation *pb.Mutation) bool {
-	return len(mutation.ProtoReflect().GetUnknown()) == 0 && mutation.CommitTsValueOffset == 0 && !mutation.RequireAbsent
+	return len(mutation.ProtoReflect().GetUnknown()) == 0 && mutation.CommitTsValueOffset == 0 &&
+		!mutation.RequireAbsent && mutation.ExpectedCommitTs == 0
 }
 
 func validateGuardedCatalogMutation(mutation *pb.Mutation) error {
@@ -167,7 +168,7 @@ func validateGuardedCatalogMutation(mutation *pb.Mutation) error {
 			return errors.WithStack(ErrInvalidGuardedBootstrapInner)
 		}
 		return nil
-	case pb.Op_DEL_PREFIX:
+	case pb.Op_DEL_PREFIX, pb.Op_COMPARE_AND_SWAP:
 		return errors.WithStack(ErrInvalidGuardedBootstrapInner)
 	}
 	return errors.WithStack(ErrInvalidGuardedBootstrapInner)

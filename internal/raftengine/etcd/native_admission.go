@@ -132,3 +132,22 @@ func (e *Engine) nativeProposalResult(ctx context.Context, result proposalResult
 	}
 	return result.result, nil
 }
+
+// checkVersionCASProposal runs on the RawNode owner immediately before append.
+// Protected payload inspection also requires a proof when the frame is encrypted.
+func (e *Engine) checkVersionCASProposal(req proposalRequest) error {
+	proof, ok := raftengine.VersionCASProposalProof(req.ctx)
+	if !ok {
+		if raftengine.RequiresVersionCASProof(req.payload) {
+			return raftengine.ErrVersionCASUnavailable
+		}
+		return nil
+	}
+	if proof.Term == 0 || proof.ConfigurationIndex == 0 ||
+		proof.Term != e.rawNode.BasicStatus().GetTerm() ||
+		proof.ConfigurationIndex != e.currentConfigIndex() ||
+		proof.ConfigurationIndex != e.nativeConfigurationIndex || e.hasPendingConfChange() {
+		return raftengine.ErrVersionCASUnavailable
+	}
+	return nil
+}

@@ -77,49 +77,52 @@ func (s *LeaderRoutedStore) leaderAddrForKey(key []byte) string {
 	return s.coordinator.RaftLeaderForKey(key)
 }
 
-func (s *LeaderRoutedStore) proxyRawGet(ctx context.Context, key []byte, ts uint64) ([]byte, error) {
-	return s.proxyRawGetWithReadFence(ctx, key, ts, 0)
-}
-
-func (s *LeaderRoutedStore) proxyRawGetWithReadFence(ctx context.Context, key []byte, ts uint64, readRouteVersion uint64) ([]byte, error) {
-	addr := s.leaderAddrForKey(key)
+func (s *LeaderRoutedStore) proxyRawGet(ctx context.Context, req *pb.RawGetRequest) (store.VersionedValue, error) {
+	addr := s.leaderAddrForKey(req.Key)
 	if addr == "" {
-		return nil, errors.WithStack(ErrLeaderNotFound)
+		return store.VersionedValue{}, errors.WithStack(ErrLeaderNotFound)
 	}
 
 	conn, err := s.connCache.ConnFor(addr)
 	if err != nil {
-		return nil, err
+		return store.VersionedValue{}, err
 	}
 
-	cli := pb.NewRawKVClient(conn)
 	ctx, cancel := context.WithTimeout(ctx, proxyForwardTimeout)
 	defer cancel()
-	resp, err := cli.RawGet(ctx, &pb.RawGetRequest{Key: key, Ts: ts, ReadRouteVersion: readRouteVersion})
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-	// Compatibility with older nodes that don't set RawGetResponse.exists:
-	// treat any non-nil payload as found even when exists=false.
-	if !resp.GetExists() && resp.GetValue() == nil {
-		return nil, store.ErrKeyNotFound
-	}
-	return resp.Value, nil
+	return readRawPoint(ctx, conn, req)
 }
 
 func (s *LeaderRoutedStore) GetAtWithReadFence(ctx context.Context, key []byte, ts uint64, groupID uint64, readRouteVersion uint64) ([]byte, error) {
+	result, err := s.readPointWithFence(ctx, key, ts, groupID, readRouteVersion, false)
+	return result.Value, err
+}
+
+func (s *LeaderRoutedStore) GetVersionAt(ctx context.Context, key []byte, ts uint64) (store.VersionedValue, error) {
+	return s.GetVersionAtWithReadFence(ctx, key, ts, 0, 0)
+}
+
+func (s *LeaderRoutedStore) GetVersionAtWithReadFence(ctx context.Context, key []byte, ts uint64, groupID uint64, readRouteVersion uint64) (store.VersionedValue, error) {
+	return s.readPointWithFence(ctx, key, ts, groupID, readRouteVersion, true)
+}
+
+func (s *LeaderRoutedStore) readPointWithFence(ctx context.Context, key []byte, ts uint64, groupID uint64, readRouteVersion uint64, needCommitTS bool) (store.VersionedValue, error) {
 	if s == nil || s.local == nil {
-		return nil, store.ErrKeyNotFound
+		return store.VersionedValue{}, unavailablePointRead(needCommitTS)
 	}
 	if groupID != 0 {
-		return nil, store.ErrNotSupported
+		return store.VersionedValue{}, store.ErrNotSupported
 	}
 	ok, fenceTS := s.leaderFenceTS(ctx, key)
 	if ok {
+		if needCommitTS {
+			value, err := store.GetVersionAt(ctx, s.local, key, max(ts, fenceTS))
+			return value, errors.WithStack(err)
+		}
 		val, err := s.local.GetAt(ctx, key, max(ts, fenceTS))
-		return val, errors.WithStack(err)
+		return store.VersionedValue{Value: val}, errors.WithStack(err)
 	}
-	return s.proxyRawGetWithReadFence(ctx, key, ts, readRouteVersion)
+	return s.proxyRawGet(ctx, &pb.RawGetRequest{Key: key, Ts: ts, ReadRouteVersion: readRouteVersion, NeedCommitTs: needCommitTS})
 }
 
 func (s *LeaderRoutedStore) proxyRawLatestCommitTS(ctx context.Context, key []byte) (uint64, bool, error) {
@@ -319,15 +322,7 @@ func (s *LeaderRoutedStore) scanLocalRouteFilteredAt(ctx context.Context, start 
 }
 
 func (s *LeaderRoutedStore) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte, error) {
-	if s == nil || s.local == nil {
-		return nil, store.ErrKeyNotFound
-	}
-	ok, fenceTS := s.leaderFenceTS(ctx, key)
-	if ok {
-		val, err := s.local.GetAt(ctx, key, max(ts, fenceTS))
-		return val, errors.WithStack(err)
-	}
-	return s.proxyRawGet(ctx, key, ts)
+	return s.GetAtWithReadFence(ctx, key, ts, 0, 0)
 }
 
 func (s *LeaderRoutedStore) ExistsAt(ctx context.Context, key []byte, ts uint64) (bool, error) {
@@ -346,7 +341,7 @@ func (s *LeaderRoutedStore) ExistsAt(ctx context.Context, key []byte, ts uint64)
 	// Via proxy path: RawGet returns a nil Value for a key that exists with an
 	// empty value because proto3 strips zero-valued bytes fields on the wire.
 	// Determine existence from the error alone, not from whether Value is non-nil.
-	_, err := s.proxyRawGet(ctx, key, ts)
+	_, err := s.proxyRawGet(ctx, &pb.RawGetRequest{Key: key, Ts: ts})
 	if errors.Is(err, store.ErrKeyNotFound) {
 		return false, nil
 	}

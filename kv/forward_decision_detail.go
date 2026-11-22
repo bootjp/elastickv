@@ -83,7 +83,10 @@ func validOnePhaseForwardDecision(reason pb.ForwardFailureReason, decision pb.Fo
 		return reason == pb.ForwardFailureReason_FORWARD_FAILURE_REASON_NO_LEADER || reason == pb.ForwardFailureReason_FORWARD_FAILURE_REASON_FENCE
 	}
 	if decision == pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_DEFINITIVELY_ABORTED {
-		return reason == pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CONFLICT || reason == pb.ForwardFailureReason_FORWARD_FAILURE_REASON_FENCE
+		return reason == pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CONFLICT ||
+			reason == pb.ForwardFailureReason_FORWARD_FAILURE_REASON_FENCE ||
+			reason == pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CAS_MISMATCH ||
+			reason == pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CAS_LOCKED
 	}
 	return decision == pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN && validUnknownForwardReason(reason)
 }
@@ -122,6 +125,9 @@ func forwardDecisionMessage(reason pb.ForwardFailureReason) string {
 	}
 	if reason == pb.ForwardFailureReason_FORWARD_FAILURE_REASON_INTERRUPTED {
 		return "forward interrupted"
+	}
+	if reason == pb.ForwardFailureReason_FORWARD_FAILURE_REASON_CAS_MISMATCH {
+		return "forward compare-and-swap mismatch"
 	}
 	return "forward aborted"
 }

@@ -45,13 +45,19 @@ func (f *kvFSM) applyMigrationImport(ctx context.Context, data []byte) any {
 		// surface it, where halting would wedge apply on every voter.
 		return errors.Wrap(err, "kv/fsm: apply migration import")
 	}
+	protected, err := MigrationVersionIdentityEnabled(ctx, f.store)
+	if err != nil {
+		return haltErr(errors.Wrap(errors.Mark(err, ErrMigrationImportApply), "kv/fsm: load migration version identity"))
+	}
 	result, err := f.store.ImportVersionsRaft(ctx, store.ImportVersionsOptions{
-		JobID:        req.GetJobId(),
-		AppliedIndex: f.pendingApplyIdx,
-		BracketID:    req.GetBracketId(),
-		BatchSeq:     req.GetBatchSeq(),
-		Cursor:       req.GetCursor(),
-		Versions:     staged,
+		JobID:                       req.GetJobId(),
+		AppliedIndex:                f.pendingApplyIdx,
+		BracketID:                   req.GetBracketId(),
+		BatchSeq:                    req.GetBatchSeq(),
+		Cursor:                      req.GetCursor(),
+		Versions:                    staged,
+		LogicalKey:                  migrationImportLogicalKey,
+		AllowLegacyVersionOverwrite: !protected,
 	})
 	if err != nil {
 		if isMigrationImportOrdinaryApplyError(err) {
@@ -91,17 +97,6 @@ func (f *kvFSM) validateImportedPrepareEvidence(versions []*pb.MVCCVersion) erro
 	return nil
 }
 
-// isMigrationImportOrdinaryApplyError reports whether err is a verdict on the
-// request bytes rather than a failure of this replica's store. Only those may
-// be returned as an ordinary apply error: the engine advances setApplied past
-// a response that does not implement HaltApply, and every replica applying the
-// same entry decides an ordinary error identically, so the group stays in step.
-//
-// A store-side failure -- Pebble I/O, an encryption gate rejecting the write --
-// is per-replica. Letting it advance setApplied would leave the leader acking
-// the batch while the failed voter skips the imported versions for good, which
-// surfaces as missing data after failover or promotion. Those halt instead,
-// matching applyMigrationPromote.
 // validateStagedKeySizes rejects a batch whose staged form would not fit in the
 // physical stored-key snapshot budget.
 //
@@ -119,12 +114,24 @@ func validateStagedKeySizes(versions []store.MVCCVersion) error {
 	return nil
 }
 
+// Only verdicts determined by the request and replicated state can advance
+// apply. An I/O or decryption failure must halt this replica so it cannot skip
+// versions that another voter successfully imported.
 func isMigrationImportOrdinaryApplyError(err error) bool {
 	return errors.Is(err, store.ErrMigrationRetired) ||
 		errors.Is(err, store.ErrImportBatchGap) ||
+		errors.Is(err, store.ErrMigrationVersionConflict) ||
 		errors.Is(err, store.ErrInvalidImportVersion) ||
 		errors.Is(err, store.ErrValueTooLarge) ||
 		errors.Is(err, store.ErrSnapshotKeyTooLarge)
+}
+
+func migrationImportLogicalKey(staged []byte) []byte {
+	_, key, ok := distribution.MigrationStagedDataKeyParts(staged)
+	if !ok {
+		return staged
+	}
+	return key
 }
 
 func (f *kvFSM) migrationHLCFloorForApply(ctx context.Context, req *pb.ImportRangeVersionsRequest, result store.ImportVersionsResult) (uint64, error) {

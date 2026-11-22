@@ -10,6 +10,7 @@ import (
 
 	"github.com/bootjp/elastickv/internal/peersession"
 	"github.com/bootjp/elastickv/internal/raftbootstrap"
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/cockroachdb/errors"
 )
 
@@ -295,6 +296,11 @@ func (a *Arbiter) BindProposal(ctx context.Context, id uint64, payload []byte) (
 	inspection, err := a.inspectProposal(op, id, payload)
 	if err != nil {
 		return nil, errors.WithStack(err)
+	}
+	if inspection.RequiresVersionCASProof {
+		if _, ok := raftengine.VersionCASProposalProof(ctx); !ok {
+			return nil, errors.WithStack(raftengine.ErrVersionCASUnavailable)
+		}
 	}
 	digest := sha256.Sum256(payload)
 	a.mu.Lock()

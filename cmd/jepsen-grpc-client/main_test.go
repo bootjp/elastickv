@@ -138,3 +138,13 @@ func TestJSONStreamAndInvalidRequests(t *testing.T) {
 	backend.mu.Unlock()
 	require.Equal(t, 1, writes)
 }
+
+func TestVersionOperationsOnOlderServer(t *testing.T) {
+	client, _ := fixture(t, apiTransactional)
+	ctx := t.Context()
+	require.Equal(t, outcomeInfo, client.invoke(ctx, request{Op: "version-read", Key: "key"}).Type,
+		"a successful Get from a server without version metadata is inconclusive")
+	value := int64(0)
+	require.Equal(t, outcomeInfo, client.invoke(ctx, request{Op: "cas", Key: "key", Value: &value, Expected: 7}).Type,
+		"an RPC error cannot certify a mismatch")
+}

@@ -87,7 +87,11 @@ func TestAbsenceGuardRawBatchRefusalDoesNotHalt(t *testing.T) {
 	f := g17FSM(t, s)
 	guarded := g17RawPut(10, "guarded", "blocked")
 	guarded.Mutations[0].RequireAbsent = true
-	response := f.Apply(g17Entry(t, guarded, g17RawPut(11, "ordinary", "accepted")))
+	// Replay a historical batch directly. Current proposal admission refuses
+	// require_absent before serialization, while replay must classify it.
+	raw, err := proto.Marshal(&pb.RaftCommand{Requests: []*pb.Request{guarded, g17RawPut(11, "ordinary", "accepted")}})
+	require.NoError(t, err)
+	response := f.Apply(prependByte(raftEncodeBatch, raw))
 	result, ok := response.(*fsmApplyResponse)
 	require.True(t, ok, "a deterministic capability refusal must not halt apply: %T", response)
 	require.Len(t, result.results, 2)
