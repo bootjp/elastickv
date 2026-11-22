@@ -57,8 +57,10 @@ attempt must publish the new owner only after that promotion applies.
 
 The checker requires successful overwrite and delete ACKs during online
 capture. Read probes through `n3` and `n4` may return the correct value or
-`Unavailable` from the route guard while `n3` is stale and the target leader. After target
-leadership transfers to `n4`, it must read the correct overwrite and absence
+`Unavailable` from the route guard while `n3` is stale and the target leader.
+A timestamp-oracle watermark timeout before routing permits up to two retries
+of that read while the route is still held. The history records those timeouts.
+After target leadership transfers to `n4`, it must read the correct overwrite and absence
 of the deleted key while `n3` is still stale. After healing and DONE, both
 ingresses must return all four expected values, including a post-cutover
 write. History lives under `jepsen/store/elastickv-split-target-membership/`.

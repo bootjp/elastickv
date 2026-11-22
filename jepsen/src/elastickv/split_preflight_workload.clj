@@ -11,6 +11,7 @@
             [elastickv.grpc-workload :as grpc]
             [elastickv.hosted-fault-workload :as hosted]
             [jepsen.checker :as checker]
+            [jepsen.client :as client]
             [jepsen.generator :as gen]
             [jepsen.independent :as independent]
             [jepsen.nemesis :as nemesis]
@@ -611,6 +612,29 @@
       (gen/on-threads #{thread}
         (mapv (fn [k] {:f :read :tag tag :value (independent/tuple k nil)}) register-keys)))))
 
+(defn- invoke-membership-operation [invoke op]
+  (loop [timeouts []]
+    (let [{:keys [type error] :as result} (invoke op)]
+      ;; A timed-out watermark RPC occurs before routing. The probe must
+      ;; still get a value or reach the route guard while the old view is held.
+      (if (and (= :read (:f op))
+               (#{:stale :new-while-stale} (:tag op))
+               (< (count timeouts) 2)
+               (= :info type)
+               (str/includes? (str error) "grpc latest read: read fence: tso commit floor:")
+               (str/includes? (str error) "watermark: rpc error: code = DeadlineExceeded")
+               (str/includes? (str error) "authoritative data-group commit floor is unavailable"))
+        (recur (conj timeouts error))
+        (cond-> result (seq timeouts) (assoc :watermark-timeouts timeouts))))))
+
+(defrecord MembershipClient [delegate]
+  client/Client
+  (open! [this test node] (assoc this :delegate (client/open! delegate test node)))
+  (setup! [this test] (assoc this :delegate (client/setup! delegate test)))
+  (invoke! [_ test op] (invoke-membership-operation #(client/invoke! delegate test %) op))
+  (teardown! [_ test] (client/teardown! delegate test))
+  (close! [_ test] (client/close! delegate test)))
+
 (defn- safe-stale-read? [{:keys [type value error]}]
   (let [[key got] value]
     (case type
@@ -727,7 +751,8 @@
     (merge tests/noop-test
            {:name "elastickv-split-target-membership" :nodes membership-nodes :concurrency 4 :net net/noop
             :grpc-host "127.0.0.1" :grpc-tls-ca-file (path "cert.pem")
-            :client (hosted/->ObservedClient client nil) :nemesis (membership-nemesis fault)
+            :client (hosted/->ObservedClient (->MembershipClient client) nil)
+            :nemesis (membership-nemesis fault)
             :checker (membership-checker fault)
             :generator
             (gen/phases

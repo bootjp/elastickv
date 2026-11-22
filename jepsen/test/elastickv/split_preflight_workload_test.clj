@@ -3,6 +3,33 @@
             [elastickv.split-preflight-workload :as pf]
             [jepsen.checker :as checker]))
 
+(deftest membership-probes-retry-only-watermark-timeouts
+  (let [invoke #'pf/invoke-membership-operation
+        timeout "read register: rpc error: code = Unknown desc = grpc latest read: read fence: tso commit floor: group 1: read data group 1 leader 127.0.0.1:25101 watermark: rpc error: code = DeadlineExceeded desc = context deadline exceeded: tso: authoritative data-group commit floor is unavailable"
+        unavailable "read register: rpc error: code = Unavailable desc = Route unavailable"
+        op {:f :read :tag :stale :value [1 nil]}
+        run (fn [operation responses]
+              (let [remaining (atom responses)
+                    result (invoke (fn [_]
+                                     (let [response (first @remaining)]
+                                       (swap! remaining rest)
+                                       response))
+                                   operation)]
+                [result (count @remaining)]))]
+    (is (= [{:type :info :error unavailable :watermark-timeouts [timeout]} 0]
+           (run op [{:type :info :error timeout} {:type :info :error unavailable}])))
+    (is (= [{:type :ok :value [1 4202]} 1]
+           (run op [{:type :ok :value [1 4202]} {:type :info :error unavailable}])))
+    (is (= [{:type :info :error "unrelated"} 1]
+           (run op [{:type :info :error "unrelated"} {:type :info :error unavailable}])))
+    (is (= [{:type :info :error timeout} 1]
+           (run (assoc op :f :write) [{:type :info :error timeout} {:type :ok}])))
+    (is (= [{:type :info :error timeout} 1]
+           (run (assoc op :tag :member-read) [{:type :info :error timeout} {:type :ok}])))
+    (is (= [{:type :info :error timeout :watermark-timeouts [timeout timeout]} 1]
+           (run op (concat (repeat 3 {:type :info :error timeout})
+                           [{:type :info :error unavailable}]))))))
+
 (defn- history []
   (let [a {:job "7" :scan-ts "11" :phase "SPLIT_JOB_PHASE_FENCE"
            :fence "0" :plan #{1 2 3} :completed #{1} :done false :source "1" :target "2"}
