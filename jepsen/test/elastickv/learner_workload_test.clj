@@ -493,7 +493,8 @@
                           {:type :ok     :f :write :value 1 :time 40 :process 0}
                           {:type :invoke :f :promote-learner-early :value "n5"
                            :time 42 :process 2}
-                          {:type :fail   :f :promote-learner-early :time 44 :process 2}]
+                          {:type :fail   :f :promote-learner-early :time 44 :process 2
+                           :error "min_applied_index not reached"}]
                          [(promotion {} 50)]
                          [{:type :invoke :f :read :time 60 :process 3}
                           {:type :ok :f :read :value {:lease? true :value 2}
@@ -652,3 +653,21 @@
                                      :raft-redis-map "n2=n2:6379"}))]
     (is (not (contains? args "--raftJoinAsLearner")))
     (is (not (contains? args "--raftJoinMembers")))))
+
+(deftest every-read-needs-a-possible-writer
+  (let [h (vec (healthy-history))
+        write {:process 1 :type :invoke :f :write :value 99 :time 85}
+        read (post-promotion-read 90 99)
+        valid? (fn [events] (:valid? (check events)))]
+    (is (false? (valid? (assoc-in h [3 :value :value] 99))))
+    (is (false? (valid? (concat h read))))
+    (is (false? (valid? (concat h read [(assoc write :time 95)]))))
+    (is (valid? (concat h [write] read)))
+    (is (valid? (concat h [write (assoc write :type :info :time 86)] read)))
+    (is (false? (valid? (concat h [write (assoc write :type :fail :time 86)] read))))))
+
+(deftest early-promotion-requires-the-specific-refusal
+  (let [h (vec (healthy-history))]
+    (is (:valid? (check (assoc-in h [5 :error] "target has not caught up to min_applied_index"))))
+    (is (false? (:valid? (check (assoc-in h [5 :error] "endpoint unavailable")))))
+    (is (false? (:valid? (check (assoc-in h [5 :type] :info)))))))

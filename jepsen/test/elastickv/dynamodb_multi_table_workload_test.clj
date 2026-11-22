@@ -78,7 +78,7 @@
       #(is (nil? (@#'workload/create-one-table! ::ddb "jepsen_append_t1"))))
     (is (= [[:CreateTable "jepsen_append_t1"] [:CreateTable "jepsen_append_t1"]] @calls))))
 
-(deftest transaction-canceled-is-indeterminate
+(deftest cancellation-without-a-predicate-reason-is-a-definite-abort
   (let [c  (workload/->DynamoDBMultiTableClient {} ::ddb)
         op {:type :invoke
             :process 0
@@ -92,7 +92,7 @@
                                                       (ex-info "DynamoDB TransactionCanceledException"
                                                                {:type "TransactionCanceledException"})))]
       (let [result (client/invoke! c {} op)]
-        (is (= :info (:type result)))
+        (is (= :fail (:type result)))
         (is (= "TransactionCanceledException" (:error result)))
         (is (= (:value op) (:value result)))))))
 

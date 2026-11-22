@@ -43,10 +43,12 @@ RAFT_DYNAMO_MAP="$RAFT_ADDR_G1=$DYNAMO_ADDR,$RAFT_ADDR_G2=$DYNAMO_ADDR"
 
 NO_REBUILD=false
 NO_CLUSTER=false
+WORKLOAD_ARGS=(--composed1-route-shuffle --route-shuffle-interval 10)
 for arg in "$@"; do
   case "$arg" in
     --no-rebuild) NO_REBUILD=true ;;
     --no-cluster) NO_CLUSTER=true ;;
+    --write-skew) WORKLOAD_ARGS=(--write-skew) ;;
   esac
 done
 
@@ -234,8 +236,7 @@ HOME="$(pwd)/tmp-home" LEIN_HOME="$(pwd)/.lein" \
     --list-routes-bin "$LIST_ROUTES_BIN" \
     --split-bin "$SPLIT_BIN" \
     --grpc-host-port  "$PROC_ADDR" \
-    --composed1-route-shuffle \
-    --route-shuffle-interval 10 \
+    "${WORKLOAD_ARGS[@]}" \
   || EXIT_CODE=$?
 
 EXIT_CODE=${EXIT_CODE:-0}

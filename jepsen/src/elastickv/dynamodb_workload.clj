@@ -16,6 +16,7 @@
             [elastickv.cli :as cli]
             [elastickv.fault-transport :as fault-transport]
             [elastickv.db :as ekdb]
+            [elastickv.dynamodb-conditions :as conditions]
             [jepsen [client :as client]
                     [core :as jepsen]
                     [generator :as gen]
@@ -68,7 +69,10 @@
    ex-data keys: :type (DynamoDB __type string or nil), :category (anomaly
    keyword), :resp (raw cognitect/aws-api response)."
   [ddb-client op request]
-  (let [resp (aws/invoke ddb-client {:op op :request request})]
+  (let [resp (aws/invoke ddb-client
+                         (cond-> {:op op :request request}
+                           ;; Replaying an append can duplicate it or reject an already committed write.
+                           (#{:TransactWriteItems :UpdateItem} op) (assoc :retriable? (constantly false))))]
     (if (anomaly? resp)
       (let [err-type (:__type resp)
             category (:cognitect.anomalies/category resp)
@@ -144,7 +148,7 @@
                  [k (when-let [lv (get-in entry [:Item (keyword val-attr) :L])]
                       (mapv #(Long/parseLong (:N %)) lv))])
                ks-vec
-               (:Responses resp)))))
+               (conditions/snapshot-responses resp ks-vec)))))
 
 (defn- list-attr
   "Convert a Clojure vector of longs to a DynamoDB {:L [...]} attribute."
@@ -159,9 +163,8 @@
    - Adds a ConditionExpression asserting the current DynamoDB value matches
      snapshot[k] (nil → attribute_not_exists; list → #v = :cv).
    If any pre-read value has changed since the snapshot was taken, the server
-   returns TransactionCanceledException.  The client records that response as
-   :info because the observed outcome is indeterminate to Jepsen under
-   contention.
+   rejects the transaction. The checker verifies that a concurrent append
+   could have invalidated the snapshot.
 
    For each key k that was read but NOT written:
    - Adds a ConditionCheck entry asserting the same invariant.
@@ -209,8 +212,8 @@
                             {:ConditionExpression "attribute_not_exists(#v)"}
                             {:ConditionExpression "#v = :cv"}))}))
               by-key)]
-    (ddb-invoke! ddb :TransactWriteItems
-                 {:TransactItems (into checks updates)})))
+    (conditions/transact-write! ddb-invoke! ddb (into checks updates)
+                                (concat read-only (keys by-key)) snapshot)))
 
 ;; ---------------------------------------------------------------------------
 ;; Jepsen client
@@ -256,7 +259,7 @@
             ;; 3. Dispatch all writes atomically via TransactWriteItems,
             ;;    merging same-key appends into one UpdateItem entry.
             (let [all-keys      (into #{} (map second mops))
-                  snapshot      (dynamo-transact-get! ddb all-keys)
+                  snapshot      (conditions/read-snapshot! dynamo-transact-get! ddb all-keys)
                   local-appends (volatile! {})
                   value' (mapv (fn [[f k v :as mop]]
                                  (case f
@@ -270,37 +273,11 @@
                                mops)
                   writes (filterv (fn [[f _ _]] (= f :append)) mops)]
               (when (seq writes) (dynamo-transact-write! ddb writes snapshot))
-              (assoc op :type :ok :value value')))))
-
-      (catch clojure.lang.ExceptionInfo e
-        (let [data     (ex-data e)
-              err-type (:type data)
-              category (:category data)]
-          (cond
-            ;; Network / transport error (no DynamoDB __type)
-            (and (nil? err-type)
-                 (#{:cognitect.anomalies/fault
-                    :cognitect.anomalies/unavailable} category))
-            (assoc op :type :info :error :network-error)
-
-            ;; Retryable or indeterminate DynamoDB server-side errors.
-            (contains? #{"ConditionalCheckFailedException"
-                         "InternalServerError"
-                         "TransactionCanceledException"} err-type)
-            (assoc op :type :info :error (str err-type))
-
-            ;; Definite API-level failures
-            (= "ValidationException" err-type)
-            (assoc op :type :fail
-                      :error (str err-type ": "
-                                  (get-in data [:resp :message]
-                                    (get-in data [:resp :Message] ""))))
-
-            :else
-            (assoc op :type :info :error (.getMessage e)))))
+              (cond-> (assoc op :type :ok :value value')
+                (seq writes) (assoc :write-snapshot snapshot))))))
 
       (catch Exception e
-        (assoc op :type :info :error (.getMessage e))))))
+        (conditions/failure-op op e)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Workload & Test builders
@@ -322,7 +299,7 @@
         client   (->DynamoDBClient (or (:node->port opts)
                                        (zipmap default-nodes (repeat 8000)))
                                    nil)]
-    (assoc workload :client client)))
+    (conditions/with-condition-checker (assoc workload :client client))))
 
 (defn elastickv-dynamodb-test
   "Builds a Jepsen test map that drives elastickv's DynamoDB-compatible API

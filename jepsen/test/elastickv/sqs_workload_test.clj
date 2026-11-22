@@ -48,7 +48,7 @@
 (deftest client-keeps-send-identity-on-ambiguous-failure
   (let [c (:client (workload/sqs-workload {}))]
     (with-redefs [sqs/invoke! (fn [& _] (throw (ex-info "connection lost" {})))]
-      (let [op (client/invoke! c {} {:type :invoke :f :send})]
+      (let [op (client/invoke! c {} {:type :invoke :f :send :value "jepsen-standard-1"})]
         (is (= :info (:type op)))
         (is (= "jepsen-standard-1" (:value op)))))))
 
@@ -233,4 +233,20 @@
     (let [test {:concurrency 5 :nodes ["n1" "n2" "n3"]}
           context (gen/context test)
           [op _] (gen/op (:generator (workload/sqs-workload {})) test context)]
-      (is (= :send (:f op))))))
+      (is (= :send (:f op)))
+      (is (= "jepsen-standard-1" (:value op))))))
+
+(deftest delivery-must-have-a-possible-send-before-it-completes
+  (let [base [(sent "seed") (received ["seed"] ["seed"])]
+        invoke {:type :invoke :process 0 :f :send :value "a"}
+        ack (assoc invoke :type :ok)
+        recv (assoc (received ["a"] ["a"]) :process 1)
+        valid? (fn [& events] (:valid? (result (into base events))))]
+    (is (false? (valid? recv invoke ack)))
+    (is (valid? invoke recv ack))
+    (is (valid? invoke recv))
+    (is (false? (valid? invoke recv (assoc ack :type :fail))))
+    ;; Histories recorded before bodies moved into the generator.
+    (is (valid? (assoc invoke :value nil) recv ack))
+    (is (= :unknown (valid? (assoc invoke :value nil) recv)))
+    (is (false? (valid? recv (assoc invoke :value nil))))))
