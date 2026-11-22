@@ -301,7 +301,7 @@ func (r *RedisServer) hllExpiredAt(ctx context.Context, key []byte, readTS uint6
 	if err != nil || !found || ttl == nil {
 		return false, err
 	}
-	return !ttl.After(time.Now()), nil
+	return !ttl.After(redisExpiryInstant(ctx)), nil
 }
 
 func (r *RedisServer) collectionMetaExpireElems(

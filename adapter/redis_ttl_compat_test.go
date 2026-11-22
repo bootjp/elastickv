@@ -463,3 +463,45 @@ func TestRedis_ExpiredKey_BecomesInvisible(t *testing.T) {
 		return errors.Is(e, redis.Nil)
 	}, initialTTL+3*time.Second, 25*time.Millisecond, "key must be gone after expiry")
 }
+
+func TestRedisTTLRejectedBeforeMutation(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+	ctx := t.Context()
+	for _, tc := range []struct {
+		name string
+		args []any
+	}{
+		{"setex", []any{"SETEX", "k", "9223372036854775807", "new"}},
+		{"eval-setex", []any{"EVAL", "return redis.call('SETEX',KEYS[1],ARGV[1],'new')", 1, "k", "9223372036854775807"}},
+		{"eval-set-px", []any{"EVAL", "return redis.call('SET',KEYS[1],'new','PX',ARGV[1])", 1, "k", "0"}},
+		{"eval-pexpire", []any{"EVAL", "return redis.call('PEXPIRE',KEYS[1],ARGV[1])", 1, "k", "9223372036854775807"}},
+		{"eval-pexpire-missing", []any{"EVAL", "return redis.call('PEXPIRE',KEYS[1],ARGV[1])", 1, "missing", "9223372036854775807"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, rdb.Set(ctx, "k", "prior", 0).Err())
+			require.ErrorContains(t, rdb.Do(ctx, tc.args...).Err(), "invalid expire time")
+			require.Equal(t, "prior", rdb.Get(ctx, "k").Val())
+		})
+	}
+}
+
+func TestLuaUsesOneExpiryInstant(t *testing.T) {
+	st := store.NewMVCCStore()
+	server := NewRedisServer(nil, "", st, newLocalAdapterCoordinator(st), nil, nil)
+	script, err := newLuaScriptContext(t.Context(), server)
+	require.NoError(t, err)
+	defer script.Close()
+	_, err = script.cmdSet([]string{"clock-key", "value", "PX", "10"})
+	require.NoError(t, err)
+	first, err := script.cmdPTTL([]string{"clock-key"})
+	require.NoError(t, err)
+	time.Sleep(20 * time.Millisecond)
+	last, err := script.cmdPTTL([]string{"clock-key"})
+	require.NoError(t, err)
+	require.Equal(t, first, last)
+	require.Equal(t, luaIntReply(10), first)
+}

@@ -99,6 +99,10 @@ func translate(file, name string) string {
 }
 
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == "protocols" {
+		protocolDefinitions()
+		return
+	}
 	for _, p := range predicates {
 		rhs := translate(p.file, p.name)
 		fmt.Fprintf(os.Stdout, "def %s (s : Signals) : Bool := %s\n", p.name, rhs)

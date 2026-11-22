@@ -368,6 +368,15 @@ func TestSQSServer_ChangeMessageVisibility(t *testing.T) {
 		t.Fatalf("change visibility: %d %v", status, out)
 	}
 
+	// Extending to twelve more hours after delivery exceeds this receipt's budget.
+	time.Sleep(2 * time.Millisecond)
+	status, out = callSQS(t, node, sqsChangeMessageVisibilityTarget, map[string]any{
+		"QueueUrl": queueURL, "ReceiptHandle": receipt, "VisibilityTimeout": sqsChangeVisibilityMaxSeconds,
+	})
+	if status != http.StatusBadRequest {
+		t.Fatalf("extension past receipt budget: %d %v", status, out)
+	}
+
 	// After the original 1s expiry, the message must still be hidden.
 	time.Sleep(1200 * time.Millisecond)
 	status, out = callSQS(t, node, sqsReceiveMessageTarget, map[string]any{

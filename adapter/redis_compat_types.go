@@ -481,18 +481,29 @@ func (r *RedisServer) hasExpired(ctx context.Context, userKey []byte, readTS uin
 	if ttl == nil {
 		return false, nil
 	}
-	return !ttl.After(time.Now()), nil
+	return !ttl.After(redisExpiryInstant(ctx)), nil
 }
 
-func ttlMilliseconds(ttl *time.Time) int64 {
+type redisExpiryInstantKey struct{}
+
+// EVAL checks every logical key against one wall-clock instant per attempt.
+// Its MVCC timestamp independently fixes which persisted versions can be read.
+func redisExpiryInstant(ctx context.Context) time.Time {
+	if instant, ok := ctx.Value(redisExpiryInstantKey{}).(time.Time); ok {
+		return instant
+	}
+	return time.Now()
+}
+
+func ttlMilliseconds(ttl *time.Time, now time.Time) int64 {
 	if ttl == nil {
 		return -1
 	}
-	remaining := time.Until(*ttl).Milliseconds()
-	if remaining < 0 {
+	remaining := ttl.Sub(now)
+	if remaining <= 0 {
 		return -2
 	}
-	return remaining
+	return remaining.Milliseconds()
 }
 
 func sortZSetEntries(entries []redisZSetEntry) {

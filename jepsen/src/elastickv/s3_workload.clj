@@ -220,6 +220,74 @@
       (finally (conn/shutdown-manager manager)))))
 
 ;; ---------------------------------------------------------------------------
+(defn check-multipart-fixture!
+  "Publish two distinct parts and check the same object after a cluster restart."
+  [base-url bucket seed?]
+  (let [bucket-url (str base-url "/" bucket)
+        url (str bucket-url "/object")
+        first-body (.repeat "x" (* 5 1024 1024))
+        second-body (str "end-" bucket)
+        opts {:throw-exceptions false :as :string :conn-timeout 5000 :socket-timeout 30000}]
+    (when seed?
+      (when-not (#{200 409} (:status (http/put bucket-url opts)))
+        (throw (ex-info "Cannot create multipart fixture bucket" {})))
+      (let [upload (result-root! (http/post url (assoc opts :query-params {"uploads" ""}))
+                                 "InitiateMultipartUploadResult")
+            id (xml-field upload "UploadId")
+            part (fn [n body]
+                   (part-etag! (http/put url (assoc opts :body body
+                               :query-params {"partNumber" (str n) "uploadId" id}))))
+            tags [(part 1 first-body) (part 2 second-body)]
+            body (str "<CompleteMultipartUpload>"
+                   (apply str (map-indexed (fn [i tag]
+                     (str "<Part><PartNumber>" (inc i) "</PartNumber><ETag>" tag "</ETag></Part>")) tags))
+                   "</CompleteMultipartUpload>")]
+        (when-not (= 404 (:status (http/get url opts)))
+          (throw (ex-info "Uncompleted upload became visible" {})))
+        (result-root! (http/post url (assoc opts :body body :query-params {"uploadId" id}))
+                      "CompleteMultipartUploadResult")
+        (when-not (no-such-upload? (http/put url (assoc opts :body second-body
+                                    :query-params {"uploadId" id "partNumber" "2"})))
+          (throw (ex-info "Completed upload accepted another part" {})))
+        (let [other (xml-field (result-root! (http/post url (assoc opts :query-params {"uploads" ""}))
+                                "InitiateMultipartUploadResult") "UploadId")
+              query {"uploadId" other}]
+          (part-etag! (http/put url (assoc opts :query-params (assoc query "partNumber" "1")
+                                          :body "aborted")))
+          (when-not (= 204 (:status (http/delete url (assoc opts :query-params query))))
+            (throw (ex-info "AbortMultipartUpload failed" {})))
+          (when-not (no-such-upload? (http/post url (assoc opts :query-params query :body body)))
+            (throw (ex-info "Aborted upload accepted completion" {}))))))
+    (let [res (http/get url opts)]
+      (when-not (and (= 200 (:status res)) (= (str first-body second-body) (:body res)))
+        (throw (ex-info "Multipart contents differ from the ordered parts" {:status (:status res)}))))
+    :checked))
+
+(defn check-pending-upload!
+  "Seed a staged part, then complete that same upload after restart."
+  [base-url bucket pending]
+  (let [url (str base-url "/" bucket "/pending")
+        opts {:throw-exceptions false :as :string :conn-timeout 5000 :socket-timeout 30000}
+        contents (str "staged-" bucket)]
+    (if (nil? pending)
+      (let [id (xml-field (result-root! (http/post url (assoc opts :query-params {"uploads" ""}))
+                                        "InitiateMultipartUploadResult") "UploadId")
+            tag (part-etag! (http/put url (assoc opts :body contents
+                                  :query-params {"uploadId" id "partNumber" "1"})))]
+        (when-not (= 404 (:status (http/get url opts)))
+          (throw (ex-info "Pending upload published its staged part" {})))
+        [id tag])
+      (let [[id tag] pending
+            body (str "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>" tag
+                      "</ETag></Part></CompleteMultipartUpload>")]
+        (when-not (= 404 (:status (http/get url opts)))
+          (throw (ex-info "Restart published a pending upload" {})))
+        (result-root! (http/post url (assoc opts :body body :query-params {"uploadId" id}))
+                      "CompleteMultipartUploadResult")
+        (let [res (http/get url opts)]
+          (when-not (and (= 200 (:status res)) (= contents (:body res)))
+            (throw (ex-info "Recovered upload lost its staged part" {}))))))))
+
 ;; Jepsen client
 ;; ---------------------------------------------------------------------------
 

@@ -12,3 +12,26 @@ Run `make lean-check` with the version in `lean/lean-toolchain` and Go. The chec
 The extractor treats Go sentinel membership and the transport classifier as Boolean observations. Joined causes may set several bits at once. The executable conformance check crosses all 64 combinations of uncertainty, conflict, lock, fence, composed-route rejection and circuit-open with concrete Go errors. It includes both composed-route sentinels, leadership loss, cancellation, EOF, network errors and raw gRPC failures. The retry trace assumes the caller dispatches again only when the predicate allows it. A permitted retry can still require the caller to retain its previous write set or check deduplication evidence.
 
 The FUSE model assumes serialized updates per inode, one resolution per acknowledged unknown operation, and an outstanding count that fits in uint64. Its theorem concerns the local barrier after preceding tickets complete. Storage durability, the origin of the coordinator's verdicts, crash recovery, reader linearizability, and operation-specific protocol semantics require separate arguments.
+
+## Expiry, script, upload and receipt transitions
+
+`AdapterProtocols.lean` specifies the following operations. Run `make lean-check` to check the theorems, extract the Go predicates and transaction shapes, and compare Lean-generated transitions with Go.
+
+| Operation | Proven property | Implementation check |
+| --- | --- | --- |
+| Redis relative TTL and PTTL | A positive duration fits when its value multiplied by its unit fits in a signed Go duration. An expired absolute deadline stays expired as observation time increases. At one script clock tick, setting a positive millisecond TTL and immediately reading PTTL returns that TTL. | Extract the guard in `validRedisTTL`. Compare 12 PTTL observations across the TTL codec with Lean. Exercise SET, SETEX, expiry commands, EXEC and EVAL through Redis, including rejection before mutation. |
+| Redis EVAL | For a finite trace of string reads, writes and deletions, validating every read against the commit state makes the replies and final state equal to serial execution. Untouched keys retain their live values. | Check the full operation group in `luaScriptContext.commit`, exercise read-set coverage, and compare replies and stored values for 25 traces through EVAL. Each execution attempt uses one expiry instant. |
+| S3 multipart initiation, staging, complete and abort | A staged part leaves the public head unchanged. When requested part descriptors validate, completion publishes their versions in request order, checks the ETags and consumes the session. Abort preserves the previous head and prevents a later complete on the same upload. | Check the Go transaction fields for all four transitions. Compare 18 combinations of order, range, presence and ETag through HTTP with the stored manifest and upload row. The multipart race regression checks referenced chunks during part replacement. |
+| SQS receive and change visibility | The initial deadline includes elapsed long-poll time in the 12-hour budget. Positive changes respect the receipt budget. Redelivery invalidates the previous token. Legacy records lacking a receipt start can shorten their existing grant or release immediately. | Extract `visibilityExtensionFits`. Compare 30 persisted message records and deadline decisions with Lean. HTTP tests exercise generation, stale receipts and redelivery. |
+
+The model assumes an atomic OCC commit with validated reads, an intact committed Raft log or snapshot, fresh receipt tokens, and wall-clock readings consistent across nodes. Deadline arithmetic uses representable Unix milliseconds. The Lua theorem starts at a normalized command trace. Translating arbitrary Lua programs, collection commands and VM errors to that trace is outside the theorem. The S3 theorem covers the metadata publication point. Transferring individual object chunks and persisting Raft state to physical media remain implementation assumptions.
+
+Run the following against the same three-node cluster from `jepsen/`. Use a fresh fixture ID for each pair and restart all nodes on their original data directories between commands. The CI workflow runs both phases with encryption enabled and disabled.
+
+```sh
+lein run -m elastickv.protocol-transition-workload --phase seed --fixture trial-1
+# Restart the three ElasticKV processes here.
+lein run -m elastickv.protocol-transition-workload --phase recover --fixture trial-1
+```
+
+The checker requires results from every node, a real-time-compatible order of all 18 Lua increments and the same final counter and mirror on all nodes. It also checks the original Redis deadline, ordered multipart bytes, completion of a pre-restart pending upload and the outstanding SQS receipt across restart. The timing assumptions follow [Redis script expiry semantics](https://redis.io/docs/latest/operate/oss_and_stack/management/replication/#how-redis-replication-deals-with-expires-on-keys) and the [SQS receive visibility limit](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/best-practices-processing-messages-timely-manner.html).

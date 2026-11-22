@@ -61,6 +61,11 @@ func parseRedisSetOptions(args [][]byte, now time.Time) (redisSetOptions, error)
 	return opts, nil
 }
 
+// validRedisTTL bounds the nanosecond multiplication used by relative deadlines.
+func validRedisTTL(n int64, unit time.Duration) bool {
+	return n > 0 && unit > 0 && n <= math.MaxInt64/int64(unit)
+}
+
 func parseRedisSetTTL(args [][]byte, index int, opt string, now time.Time) (*time.Time, int, error) {
 	if index+1 >= len(args) {
 		return nil, index, errors.New("ERR syntax error")
@@ -71,15 +76,12 @@ func parseRedisSetTTL(args [][]byte, index int, opt string, now time.Time) (*tim
 		// internal parsing errors, but return a stable protocol error.
 		return nil, index, errors.New("ERR value is not an integer or out of range")
 	}
-	if n <= 0 {
-		return nil, index, errors.New("ERR invalid expire time in 'set' command")
-	}
 
 	unit := time.Millisecond
 	if opt == "EX" {
 		unit = time.Second
 	}
-	if n > math.MaxInt64/int64(unit) {
+	if !validRedisTTL(n, unit) {
 		return nil, index, errors.New("ERR invalid expire time in 'set' command")
 	}
 
@@ -401,7 +403,7 @@ func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
 	// Use the snapshot variant: LeaseReadForKeyThrough above already
 	// established the ReadIndex fence, so a per-call VerifyLeaderForKey
 	// (inside leaderAwareGetAt) would duplicate the quorum work.
-	v, _, err := r.readRedisStringWith(key, readTS, func(key []byte, ts uint64) ([]byte, error) {
+	v, _, err := r.readRedisStringWith(ctx, key, readTS, func(key []byte, ts uint64) ([]byte, error) {
 		return r.doGetAtContext(ctx, key, ts, false)
 	})
 	if err == nil {

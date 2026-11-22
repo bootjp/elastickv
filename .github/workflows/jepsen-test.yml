@@ -173,6 +173,9 @@ jobs:
             printf 'argument=%s\n' "$argument" >> /tmp/filesystem-legacy-rejection.log
             cat /tmp/filesystem-rejected-argument.log >> /tmp/filesystem-legacy-rejection.log
           done
+      - name: Check adapter transitions (seed)
+        working-directory: jepsen
+        run: timeout 180 ~/lein run -m elastickv.protocol-transition-workload --phase seed --fixture "protocol-${{ github.run_id }}-${{ github.run_attempt }}"
       - name: Capture DynamoDB seal data and compacted snapshots
         timeout-minutes: 4
         run: bash scripts/ci-dynamodb-seal-restart-check.sh capture "${{ matrix.encryption }}"
@@ -205,6 +208,22 @@ jobs:
             fi
           done
           bash scripts/ci-jepsen-start-cluster.sh "$ENCRYPTION_MODE" restart
+      - name: Check adapter transitions (recover)
+        working-directory: jepsen
+        run: timeout 180 ~/lein run -m elastickv.protocol-transition-workload --phase recover --fixture "protocol-${{ github.run_id }}-${{ github.run_attempt }}"
+      - name: Archive adapter transition histories
+        if: always()
+        run: |
+          bash scripts/archive-jepsen-store.sh jepsen/store/elastickv-protocol-seed /tmp/adapter-protocol-seed.tar.gz
+          bash scripts/archive-jepsen-store.sh jepsen/store/elastickv-protocol-recover /tmp/adapter-protocol-recover.tar.gz
+      - name: Upload adapter transition histories
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: adapter-protocol-transitions-encryption-${{ matrix.encryption }}
+          path: /tmp/adapter-protocol-*.tar.gz
+          retention-days: 7
+          if-no-files-found: ignore
       - name: Verify mandatory journal mode on initial and restarted mounts
         run: |
           : > /tmp/filesystem-mount-modes.txt
