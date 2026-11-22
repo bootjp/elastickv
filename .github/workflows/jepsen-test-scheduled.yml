@@ -8,17 +8,22 @@ on:
         required: false
         default: "300"
       faults-only:
-        description: "Run only Docker fault stress jobs (all data adapters x three faults)"
+        description: "Run only fault stress jobs, including Split membership"
         type: boolean
         required: false
         default: false
+      fault-adapters-json:
+        description: "Optional JSON array of Docker fault adapters"
+        type: string
+        required: false
+        default: ""
       long-fuse-run:
         description: "Run FUSE Jepsen workloads for 30 minutes"
         type: boolean
         required: false
         default: false
       workloads-json:
-        description: "Optional JSON array of workload names to run"
+        description: "Optional JSON array of regular workload names to run"
         required: false
         default: ""
       rate:
@@ -53,7 +58,8 @@ jobs:
     if: ${{ inputs.faults-only || !inputs.workloads-json }}
     uses: ./.github/workflows/jepsen-hosted-faults.yml
     with:
-      adapters-json: '["redis","dynamodb","s3","grpc-raw","grpc-transactional","filesystem-overwrite","filesystem-rename","sqs-standard","sqs-htfifo"]'
+      adapters-json: ${{ inputs.fault-adapters-json || '["redis","dynamodb","s3","grpc-raw","grpc-transactional","filesystem-overwrite","filesystem-rename","sqs-standard","sqs-htfifo"]' }}
+      include-split-membership: true
       time-limit: ${{ inputs.time-limit || '300' }}
       repeat-faults: true
       min-fault-cycles: 2
@@ -72,11 +78,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        workload: ${{ fromJSON(inputs.workloads-json || '["unit","split-membership","grpc-raw","grpc-transactional","redis","redis-zset","dynamodb","dynamodb-type-string","dynamodb-type-number","dynamodb-type-binary","dynamodb-type-bool","dynamodb-type-null","dynamodb-type-string-set","dynamodb-type-number-set","dynamodb-type-binary-set","dynamodb-type-list","dynamodb-type-map","s3","sqs-standard","sqs-htfifo","filesystem-cross-mount","filesystem-sqlite-check","filesystem-node-crash","filesystem-benchmark","filesystem-benchmark-multigroup","filesystem-overwrite","filesystem-rename","sqlite"]') }}
+        workload: ${{ fromJSON(inputs.workloads-json || '["unit","grpc-raw","grpc-transactional","redis","redis-zset","dynamodb","dynamodb-type-string","dynamodb-type-number","dynamodb-type-binary","dynamodb-type-bool","dynamodb-type-null","dynamodb-type-string-set","dynamodb-type-number-set","dynamodb-type-binary-set","dynamodb-type-list","dynamodb-type-map","s3","sqs-standard","sqs-htfifo","filesystem-cross-mount","filesystem-sqlite-check","filesystem-node-crash","filesystem-benchmark","filesystem-benchmark-multigroup","filesystem-overwrite","filesystem-rename","sqlite"]') }}
     env:
       GOCACHE: /tmp/go-build
       WORKLOAD: ${{ matrix.workload }}
     steps:
+      - name: Reject Split membership in regular workload selection
+        if: matrix.workload == 'split-membership'
+        run: |
+          echo 'Split membership runs in the fault suite. Use faults-only=true.' >&2
+          exit 2
       - name: Reject retired legacy filesystem workloads
         if: matrix.workload == 'filesystem-benchmark-legacy' || matrix.workload == 'filesystem-benchmark-multigroup-legacy'
         run: |
@@ -133,7 +144,7 @@ jobs:
             sleep "$((attempt * 15))"
           done
       - name: Pre-fetch Go modules and build binaries
-        if: matrix.workload != 'unit' && matrix.workload != 'split-membership'
+        if: matrix.workload != 'unit'
         run: |
           mkdir -p "$GOCACHE" /tmp/go-tmp
           export GOCACHE GOTMPDIR=/tmp/go-tmp
@@ -171,14 +182,8 @@ jobs:
         if: matrix.workload == 'unit'
         working-directory: jepsen
         run: ~/lein test
-      - name: Promote a target learner before Split catalog publication
-        if: matrix.workload == 'split-membership'
-        timeout-minutes: 20
-        env:
-          PREFLIGHT_LOG_DIR: ${{ runner.temp }}/split-membership-logs
-        run: LEIN="$HOME/lein" bash scripts/jepsen-split-preflight.sh --online-member-change
       - name: Launch demo cluster
-        if: matrix.workload != 'unit' && matrix.workload != 'split-membership' && !startsWith(matrix.workload, 'filesystem-') && !startsWith(matrix.workload, 'sqs-') && matrix.workload != 'sqlite'
+        if: matrix.workload != 'unit' && !startsWith(matrix.workload, 'filesystem-') && !startsWith(matrix.workload, 'sqs-') && matrix.workload != 'sqlite'
         run: |
           set -euo pipefail
           nohup /tmp/elastickv-demo > /tmp/elastickv-demo.log 2>&1 &
@@ -581,16 +586,8 @@ jobs:
           path: /tmp/jepsen-store-types.tar.gz
           retention-days: 7
           if-no-files-found: ignore
-      - name: Upload Split membership logs
-        if: always() && matrix.workload == 'split-membership'
-        uses: actions/upload-artifact@v7
-        with:
-          name: jepsen-split-membership-logs
-          path: ${{ runner.temp }}/split-membership-logs/
-          retention-days: 14
-          if-no-files-found: warn
       - name: Dump demo cluster log on failure
-        if: failure() && matrix.workload != 'unit' && matrix.workload != 'split-membership' && !startsWith(matrix.workload, 'filesystem-') && !startsWith(matrix.workload, 'sqs-') && matrix.workload != 'sqlite'
+        if: failure() && matrix.workload != 'unit' && !startsWith(matrix.workload, 'filesystem-') && !startsWith(matrix.workload, 'sqs-') && matrix.workload != 'sqlite'
         # The previous `tail -n 500` truncated a 3-minute workload's
         # log down to startup-only lines, making it impossible to
         # correlate a Jepsen anomaly with the server-side state
@@ -606,7 +603,7 @@ jobs:
           echo "=== full log line count ==="
           wc -l /tmp/elastickv-demo.log || true
       - name: Upload demo cluster log on failure
-        if: failure() && matrix.workload != 'unit' && matrix.workload != 'split-membership' && !startsWith(matrix.workload, 'filesystem-') && !startsWith(matrix.workload, 'sqs-') && matrix.workload != 'sqlite'
+        if: failure() && matrix.workload != 'unit' && !startsWith(matrix.workload, 'filesystem-') && !startsWith(matrix.workload, 'sqs-') && matrix.workload != 'sqlite'
         uses: actions/upload-artifact@v7
         with:
           name: elastickv-demo-log-${{ matrix.workload }}

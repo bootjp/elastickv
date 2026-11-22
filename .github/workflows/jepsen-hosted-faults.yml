@@ -3,6 +3,9 @@ name: Jepsen Hosted Faults
 on:
   workflow_call:
     inputs:
+      include-split-membership:
+        type: boolean
+        default: false
       adapters-json:
         type: string
         default: '["redis"]'
@@ -48,6 +51,11 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  split-membership:
+    if: inputs.include-split-membership
+    uses: ./.github/workflows/jepsen-split-preflight.yml
+    with:
+      membership-only: true
   faults:
     name: Jepsen (${{ matrix.adapter }}, ${{ matrix.fault }})
     runs-on: ubuntu-26.04

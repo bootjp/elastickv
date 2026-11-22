@@ -21,10 +21,16 @@ on:
       - 'scripts/jepsen-split-membership-overlay.py'
       - 'jepsen/**'
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      membership-only:
+        type: boolean
+        default: false
 permissions:
   contents: read
 jobs:
   voter-pause:
+    name: ${{ inputs.membership-only && 'Jepsen (split membership)' || 'voter-pause' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -57,8 +63,10 @@ jobs:
         working-directory: jepsen
         run: lein test elastickv.split-preflight-workload-test
       - name: Pause a voter during split preflight
+        if: ${{ !inputs.membership-only }}
         run: PREFLIGHT_LOG_DIR="$RUNNER_TEMP/preflight-logs" bash scripts/jepsen-split-preflight.sh
       - name: Stop the catalog leader after captured mutations
+        if: ${{ !inputs.membership-only }}
         run: PREFLIGHT_LOG_DIR="$RUNNER_TEMP/failover-logs" bash scripts/jepsen-split-preflight.sh --online-leader-failover
       - name: Promote a target learner after the final cutover confirmation
         run: PREFLIGHT_LOG_DIR="$RUNNER_TEMP/membership-logs" bash scripts/jepsen-split-preflight.sh --online-member-change
@@ -71,7 +79,7 @@ jobs:
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: jepsen-split-preflight-pause
+          name: ${{ inputs.membership-only && format('jepsen-split-membership-{0}', github.run_attempt) || 'jepsen-split-preflight-pause' }}
           path: |
             ${{ runner.temp }}/preflight-history.tar.gz
             ${{ runner.temp }}/preflight-logs/
