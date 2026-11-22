@@ -163,14 +163,15 @@ def version_literals(text):
         text,
     )
     declaration = re.compile(
-        r"^[ \t]*(?:const[ \t]+|var[ \t]+)?([A-Za-z_]\w*)(?:[ \t]+[\w.\[\]]+)?[ \t]*=[ \t]*(.*)$"
+        r"^[ \t]*(?:(?P<kind>const|var)[ \t]+)?(?P<name>[A-Za-z_]\w*)"
+        r"(?:[ \t]+(?P<type>[\w.\[\]]+))?[ \t]*=[ \t]*(?P<expression>.*)$"
     )
     result, index = {}, 0
     lines = text.splitlines(keepends=True)
     while index < len(lines):
         match = declaration.match(lines[index].rstrip("\r\n"))
         if match:
-            name = match[1].lower()
+            name = match["name"].lower()
             if "magic" in name or (
                 "version" in name
                 and any(
@@ -188,11 +189,69 @@ def version_literals(text):
                     )
                 )
             ):
-                result[match[1]], index = marker_expression(
-                    lines, index, match[2] + "\n"
+                expression, index = marker_expression(
+                    lines, index, match["expression"] + "\n"
                 )
+                prior = result.get(match["name"], {})
+                result[match["name"]] = {
+                    "expression": expression,
+                    "kind": match["kind"],
+                    "type": match["type"],
+                    "count": prior.get("count", 0) + 1,
+                }
         index += 1
     return result
+
+
+def same_marker_value(old, new):
+    if old["expression"] is None or (
+        old["expression"] != new["expression"] or old["kind"] != new["kind"]
+    ):
+        return False
+    if old["type"] == new["type"]:
+        return True
+    # Do not evaluate expressions or equate different explicit wire widths.
+    # A standalone untyped decimal const may acquire a fixed unsigned type
+    # only if the identical literal is representable. Call-site semantics
+    # still require source review, exact CI and isolated runtime evidence.
+    bits = re.fullmatch(r"uint(8|16|32|64)", new["type"] or "")
+    if (
+        old["kind"] == "const"
+        and old["type"] is None
+        and bits
+        and re.fullmatch(r"0|[1-9][0-9]{0,19}", old["expression"])
+    ):
+        return int(old["expression"]) < 1 << int(bits[1])
+    return False
+
+
+def retained_marker(name, old, new):
+    if name in new:
+        return name if same_marker_value(old[name], new[name]) else None
+    # Only the leading ASCII export letter may change, within the same file.
+    # Neither a second spelling nor duplicate declarations may justify a move.
+    key = name[0].lower() + name[1:]
+    before = [n for n in old if n[0].lower() + n[1:] == key]
+    after = [n for n in new if n[0].lower() + n[1:] == key]
+    if len(before) == len(after) == 1:
+        target = after[0]
+        if old[name]["count"] == new[target]["count"] == 1 and same_marker_value(
+            old[name], new[target]
+        ):
+            return target
+    return None
+
+
+def diagnostic_evidence(path, data):
+    parts = pathlib.PurePosixPath(path)
+    return (
+        path.startswith("docs/evidence/")
+        and str(parts) == path
+        and ".." not in parts.parts
+        and "\\" not in path
+        and path.endswith((".pprof", ".cpu", ".block", ".mutex", ".log.gz", ".tar.gz"))
+        and (not data or data.startswith(b"\x1f\x8b\x08"))
+    )
 
 
 def feature_defaults(text):
@@ -281,6 +340,22 @@ def analyze(
                 path,
                 "Unreported implementation deletion/addition may move code into persistence",
             )
+        if (
+            all(
+                r is None or r["mode"] == "100644"
+                for r in (old_tree.get(prior), new_tree.get(path))
+            )
+            and diagnostic_evidence(prior, old)
+            and diagnostic_evidence(path, new)
+        ):
+            record["classification"] = "diagnostic-evidence"
+            finding(
+                "attention",
+                "diagnostic-evidence",
+                path,
+                "Opaque gzip diagnostic artifact; contents are not runtime-source analysis",
+            )
+            continue
         try:
             before, after = old.decode("utf-8"), new.decode("utf-8")
         except UnicodeDecodeError:
@@ -336,7 +411,7 @@ def analyze(
             new_versions = version_literals(after)
             old_versions = version_literals(before)
             if any(
-                value is None
+                value["expression"] is None
                 for value in [*old_versions.values(), *new_versions.values()]
             ):
                 finding(
@@ -345,13 +420,24 @@ def analyze(
                     path,
                     "A complete persisted marker initializer could not be established",
                 )
-            for name, value in old_versions.items():
-                if new_versions.get(name) != value:
+            for name in old_versions:
+                target = retained_marker(name, old_versions, new_versions)
+                if target is None:
                     finding(
                         "blocker",
                         "persistent-version-change",
                         path,
                         "Persisted format/version marker changed: " + name,
+                    )
+                elif target != name:
+                    finding(
+                        "attention",
+                        "persistent-marker-rename",
+                        path,
+                        "Review export-only marker rename with unchanged initializer: "
+                        + name
+                        + " -> "
+                        + target,
                     )
             if not path.endswith("_test.go"):
                 finding(

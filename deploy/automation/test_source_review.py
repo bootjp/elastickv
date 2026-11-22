@@ -1,4 +1,5 @@
 import copy
+import gzip
 import io
 import tarfile
 import unittest
@@ -26,8 +27,11 @@ def inventory(files):
 
 class SourceAuditTests(unittest.TestCase):
     def assess(self, path, before, after, status="modified"):
-        old = {path: before.encode()}
-        new = {path: after.encode()} if status != "removed" else {}
+        return self.assess_bytes(path, before.encode(), after.encode(), status)
+
+    def assess_bytes(self, path, before, after, status="modified"):
+        old = {path: before} if status != "added" else {}
+        new = {path: after} if status != "removed" else {}
         return sr.analyze(
             "example/database",
             OLD,
@@ -37,6 +41,208 @@ class SourceAuditTests(unittest.TestCase):
             (inventory(old), inventory(new)),
             (old, new),
             sr.DEFAULT_LIMITS,
+        )
+
+    def test_diagnostic_gzip_artifacts_remain_in_the_verified_report(self):
+        for suffix in (".pprof", ".cpu", ".block", ".mutex", ".log.gz", ".tar.gz"):
+            for status in ("added", "modified", "removed"):
+                with self.subTest(suffix=suffix, status=status):
+                    path = "docs/evidence/trial/profile" + suffix
+                    old, new = (
+                        gzip.compress(b"old evidence"),
+                        gzip.compress(b"new evidence"),
+                    )
+                    with patch.object(
+                        sr.gzip,
+                        "decompress",
+                        side_effect=AssertionError("Do not expand opaque evidence"),
+                    ):
+                        report = self.assess_bytes(path, old, new, status)
+                    self.assertTrue(sr.eligible(report, OLD, NEW, IMAGE))
+                    self.assertEqual(path, report["files"][0]["path"])
+                    self.assertEqual(
+                        sr.git_blob(old) if status != "added" else None,
+                        report["files"][0]["old_blob"],
+                    )
+                    self.assertEqual(
+                        sr.git_blob(new) if status != "removed" else None,
+                        report["files"][0]["new_blob"],
+                    )
+                    self.assertTrue(
+                        any(
+                            f["code"] == "diagnostic-evidence"
+                            for f in report["findings"]
+                        )
+                    )
+
+    def test_evidence_classification_does_not_allow_other_binary_source(self):
+        for path, data in [
+            ("store/snapshot.tar.gz", gzip.compress(b"snapshot")),
+            ("proto/schema.cpu", gzip.compress(b"wire")),
+            ("adapter/profile.cpu", gzip.compress(b"runtime")),
+            ("docs/other/profile.cpu", gzip.compress(b"unknown")),
+            ("docs/evidence/profile.cpu", b"\x7fELF\xff"),
+            ("docs/evidence/helper.py", b"\x00\xff"),
+            ("docs/evidence/unknown.bin", gzip.compress(b"unknown")),
+            ("docs/evidence/../runtime/profile.cpu", gzip.compress(b"alias")),
+        ]:
+            with self.subTest(path=path):
+                self.assertEqual(
+                    "blocked", self.assess_bytes(path, b"", data, "added")["decision"]
+                )
+
+    def test_evidence_classification_keeps_code_and_wire_analysis(self):
+        for path, old, new in [
+            (
+                "docs/evidence/example.go",
+                'flag.Bool("commitTSFence", false, "")',
+                'flag.Bool("commitTSFence", true, "")',
+            ),
+            (
+                "docs/evidence/example.proto",
+                "message KV {\nstring key=1;\n}\n",
+                "message KV {\nbytes key=1;\n}\n",
+            ),
+        ]:
+            with self.subTest(path=path):
+                self.assertEqual("blocked", self.assess(path, old, new)["decision"])
+
+    def test_evidence_executable_and_symlink_modes_are_not_exempt(self):
+        path = "docs/evidence/trial/profile.cpu"
+        data = {path: gzip.compress(b"profile")}
+        for mode in ("100755", "120000", "160000"):
+            with self.subTest(mode=mode):
+                tree = inventory(data)
+                tree[path]["mode"] = mode
+                report = sr.analyze(
+                    "example/database",
+                    OLD,
+                    NEW,
+                    IMAGE,
+                    [{"filename": path, "status": "added"}],
+                    ({}, tree),
+                    ({}, data),
+                    sr.DEFAULT_LIMITS,
+                )
+                self.assertEqual("blocked", report["decision"])
+
+    def test_evidence_still_uses_complete_collection_hashes_and_budgets(self):
+        f = InventoryTests()
+        f.setUp()
+        path = "docs/evidence/trial/profile.cpu"
+        f.new[path] = gzip.compress(b"profile")
+        f.trees[NEW] = inventory(f.new)
+        f.comparison["files"].append({"filename": path, "status": "added"})
+        report = f.collect()
+        self.assertTrue(sr.eligible(report, OLD, NEW, IMAGE))
+        self.assertEqual(2, len(report["files"]))
+        for limit in (
+            {"max_files": 1},
+            {"max_file_bytes": 8},
+            {"max_total_file_bytes": 10},
+        ):
+            with self.subTest(limit=limit), self.assertRaises(ValueError):
+                f.collect(limits=limit)
+        f.new[path] = gzip.compress(b"different profile")
+        with self.assertRaisesRegex(ValueError, "immutable blobs"):
+            f.collect()
+
+    def test_binary_rename_into_evidence_does_not_hide_reader_or_unknown_binary(self):
+        for prior, path in [
+            ("store/reader.go", "docs/evidence/reader.cpu"),
+            ("adapter/reader.bin", "docs/evidence/reader.cpu"),
+            ("docs/evidence/reader.cpu", "adapter/reader.bin"),
+        ]:
+            with self.subTest(prior=prior, path=path):
+                old = {prior: gzip.compress(b"old")}
+                new = {path: gzip.compress(b"new")}
+                report = sr.analyze(
+                    "example/database",
+                    OLD,
+                    NEW,
+                    IMAGE,
+                    [
+                        {
+                            "filename": path,
+                            "previous_filename": prior,
+                            "status": "renamed",
+                        }
+                    ],
+                    (inventory(old), inventory(new)),
+                    (old, new),
+                    sr.DEFAULT_LIMITS,
+                )
+                self.assertEqual("blocked", report["decision"])
+
+    def test_export_only_marker_rename_preserves_value_and_reports_attention(self):
+        for old, new in [
+            (
+                "const forwardDecisionSchemaVersion = 1",
+                "const ForwardDecisionSchemaVersion uint32 = 1",
+            ),
+            (
+                "const snapshotFormatVersion uint32 = 1",
+                "const SnapshotFormatVersion uint32 = 1",
+            ),
+            (
+                "const SnapshotFormatVersion uint32 = 1",
+                "const snapshotFormatVersion uint32 = 1",
+            ),
+            ('var snapshotMagic = []byte("EKV")', 'var SnapshotMagic = []byte("EKV")'),
+        ]:
+            with self.subTest(old=old, new=new):
+                report = self.assess("kv/format.go", old, new)
+                self.assertTrue(sr.eligible(report, OLD, NEW, IMAGE))
+                self.assertTrue(
+                    any(
+                        f["code"] == "persistent-marker-rename"
+                        for f in report["findings"]
+                    )
+                )
+
+    def test_marker_rename_never_hides_value_type_or_kind_change(self):
+        cases = [
+            ("const snapshotVersion = 1", "const SnapshotVersion uint32 = 2"),
+            ("const snapshotVersion uint32 = 1", "const SnapshotVersion uint64 = 1"),
+            ("const snapshotVersion = 1", "var SnapshotVersion uint32 = 1"),
+            ("const snapshotVersion = 1", "const SnapshotVersion int = 1"),
+            ("const snapshotVersion = 256", "const SnapshotVersion uint8 = 256"),
+            ("const snapshotVersion = -1", "const SnapshotVersion uint32 = -1"),
+            (
+                "const snapshotVersion = currentVersion",
+                "const SnapshotVersion uint32 = currentVersion",
+            ),
+            ("const snapshotVersion = 1", "const SnapshotVersion uint32 = 1 + ("),
+            ('var snapshotMagic = []byte("EKV")', 'var SnapshotMagic = []byte("BAD")'),
+            ("const snapshotVersion = 1", "const otherSchemaVersion = 1"),
+            ("const snapshotVersion = 1", ""),
+            (
+                "const snapshotVersion = 1\nconst SnapshotVersion = 2",
+                "const SnapshotVersion = 1",
+            ),
+            (
+                "const snapshotVersion = 1",
+                "const SnapshotVersion = 1\nconst SnapshotVersion = 1",
+            ),
+            (
+                "const snapshotVersion = 1",
+                "const snapshotVersion = 2\nconst SnapshotVersion = 1",
+            ),
+        ]
+        for old, new in cases:
+            with self.subTest(old=old, new=new):
+                self.assertEqual(
+                    "blocked", self.assess("store/format.go", old, new)["decision"]
+                )
+
+    def test_explicit_marker_type_change_remains_blocked_without_rename(self):
+        self.assertEqual(
+            "blocked",
+            self.assess(
+                "store/format.go",
+                "const snapshotVersion uint32 = 1",
+                "const snapshotVersion uint64 = 1",
+            )["decision"],
         )
 
     def test_runtime_code_is_assessed_without_manual_source_pair(self):
