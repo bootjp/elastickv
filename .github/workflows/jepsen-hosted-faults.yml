@@ -53,9 +53,14 @@ concurrency:
 jobs:
   split-membership:
     if: inputs.include-split-membership
+    strategy:
+      fail-fast: false
+      matrix:
+        membership-fault: [kill, partition, pause]
     uses: ./.github/workflows/jepsen-split-preflight.yml
     with:
       membership-only: true
+      membership-fault: ${{ matrix.membership-fault }}
   faults:
     name: Jepsen (${{ matrix.adapter }}, ${{ matrix.fault }})
     runs-on: ubuntu-26.04
