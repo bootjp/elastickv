@@ -1,0 +1,11 @@
+{
+  "measured_source": "d0ee76e0a1268d9af39e64560ba3e78814e2fb06",
+  "path": "/Users/bootjp/.codex/visualizations/2026/11/19/01a1f333-53dc-7602-92f8-e3df6c957124/vm150-sync-throughput-20261122/shared-queue-final.zip",
+  "sha256": "409d271a589de5ffbd97254bbe7360d5be12225aea76b1e0eee06121d91adf21",
+  "bytes": 20445715,
+  "archive_files": 246,
+  "selected_vm_originals": 132,
+  "original_and_expanded_csv_hashes_verified": true,
+  "fresh_replay_matches_all_metrics_and_audit_invariants": true,
+  "excludes": "Executables, database directories, uncompressed CSV duplicates; no failed/intermediate results are pooled with final ABBA."
+}

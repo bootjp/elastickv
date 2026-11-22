@@ -1,0 +1,33 @@
+{
+  "measured_source": "d0ee76e0a1268d9af39e64560ba3e78814e2fb06",
+  "baseline_source": "18a509addeef3f10cf36c7751f26e87a4887b477",
+  "baseline_production": "5226ac75744e3575daccee23690a36e44178e30f",
+  "toolchain": "go1.27.3",
+  "linux_amd64": true,
+  "cgo": false,
+  "overlay": false,
+  "additional_gather_delay": false,
+  "before": {
+    "candidate-server.test": "133bb73cdaf456d30e424e23af65c6b4fe0a5fa96c930f60d1832fe12ee54f98",
+    "baseline-server.test": "0e61b1751290c0cff702dd016a3a16f72b2c956fb0f276951ae087126703b9c4",
+    "loadtest-window": "8350c069ee061ac2c89a1c876b3391a977d86eb724eca25837625aba993f8acc",
+    "measure.py": "7c7bd98957c05f13e3c0d6022d21bf3eea99399f13518841024e66576ee585c0",
+    "protocol.json": "d75f17e02a4f246bfe8027fc4f9162a2ba36dd76f272c86ec6e5e637d815875f"
+  },
+  "candidate": {
+    "source_commit": "d0ee76e0a1268d9af39e64560ba3e78814e2fb06",
+    "sha256": "133bb73cdaf456d30e424e23af65c6b4fe0a5fa96c930f60d1832fe12ee54f98",
+    "toolchain": "go1.27.3",
+    "overlay": false,
+    "production_diagnostics": false,
+    "sync": true,
+    "additional_gather_delay": false
+  },
+  "postrun": {
+    "candidate-server.test": "133bb73cdaf456d30e424e23af65c6b4fe0a5fa96c930f60d1832fe12ee54f98",
+    "baseline-server.test": "0e61b1751290c0cff702dd016a3a16f72b2c956fb0f276951ae087126703b9c4",
+    "loadtest-window": "8350c069ee061ac2c89a1c876b3391a977d86eb724eca25837625aba993f8acc",
+    "measure.py": "7c7bd98957c05f13e3c0d6022d21bf3eea99399f13518841024e66576ee585c0",
+    "protocol.json": "d75f17e02a4f246bfe8027fc4f9162a2ba36dd76f272c86ec6e5e637d815875f"
+  }
+}
