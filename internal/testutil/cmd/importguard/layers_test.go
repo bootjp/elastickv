@@ -18,6 +18,8 @@ func TestCheckLayering(t *testing.T) {
 		violation      bool
 	}{
 		{"stdlib is ignored", "store", "fmt", false},
+		{"load client uses wire API", "internal/loadtest", m + "proto", false},
+		{"load client cannot call data plane", "internal/loadtest", m + "kv", true},
 		{"third party is ignored", "store", "github.com/cockroachdb/pebble/v2", false},
 		{"store below kv", "store", m + "kv", true},
 		{"store subpackage below kv", "store/sub", m + "kv", true},
@@ -143,6 +145,7 @@ func TestCheckCoverage(t *testing.T) {
 		{"deny rule", "kv", true},
 		{"deny rule covers subpackages", "kv/sub", true},
 		{"allowlist", "internal/nodeauth", true},
+		{"production load client", "internal/loadtest", true},
 		{"exact rule does not cover subpackages", "distribution/newsub", false},
 		{"exact allowlist does not cover subpackages", "internal/newpkg", false},
 		{"root is checked by rootImports", ".", true},

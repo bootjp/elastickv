@@ -200,7 +200,7 @@ func (s *pebbleStore) PromoteVersions(ctx context.Context, opts PromoteVersionsO
 	writeOpts := s.promotionWriteOpts(opts.AppliedIndex)
 	if opts.JobID != 0 && state.Done {
 		result := PromoteVersionsResult{Done: true, TotalPromotedRows: state.PromotedRows, MaxPromotedTS: state.MaxPromotedTS}
-		return s.finishPebblePromotion(nil, opts.JobID, nil, result, opts.AppliedIndex, state.MaxPromotedTS, writeOpts)
+		return s.finishPebblePromotion(opts.OnlineGuard, nil, opts.JobID, nil, result, opts.AppliedIndex, state.MaxPromotedTS, writeOpts)
 	}
 	opts.Cursor = cursor
 	exported, toPromote, promoted, err := s.planPebblePromotionLocked(ctx, opts)
@@ -209,6 +209,7 @@ func (s *pebbleStore) PromoteVersions(ctx context.Context, opts PromoteVersionsO
 	}
 	result, stateToWrite := finishPromotionResult(opts, state, exported, promoted)
 	return s.finishPebblePromotion(
+		opts.OnlineGuard,
 		toPromote,
 		opts.JobID,
 		stateToWrite,
@@ -227,6 +228,7 @@ func (s *pebbleStore) promotionWriteOpts(appliedIndex uint64) *pebble.WriteOptio
 }
 
 func (s *pebbleStore) finishPebblePromotion(
+	guard *OnlineMaintenanceGuard,
 	toPromote []promotedVersion,
 	jobID uint64,
 	stateToWrite *PromotionState,
@@ -239,6 +241,7 @@ func (s *pebbleStore) finishPebblePromotion(
 		return result, nil
 	}
 	if err := s.commitPebblePromoteVersions(
+		guard,
 		toPromote,
 		jobID,
 		stateToWrite,
@@ -350,6 +353,7 @@ func (s *pebbleStore) stagePebblePromotionState(batch *pebble.Batch, jobID uint6
 }
 
 func (s *pebbleStore) commitPebblePromoteVersions(
+	guard *OnlineMaintenanceGuard,
 	versions []promotedVersion,
 	jobID uint64,
 	state *PromotionState,
@@ -362,6 +366,9 @@ func (s *pebbleStore) commitPebblePromoteVersions(
 	targets := make([]MVCCVersion, 0, len(versions))
 	for _, version := range versions {
 		targets = append(targets, version.target)
+	}
+	if err := s.stageOnlineMaintenanceGuard(batch, guard, targets); err != nil {
+		return err
 	}
 	// Promotion is replayed from the Raft FSM, so it must not fail closed on
 	// this node's local writer-registration state.

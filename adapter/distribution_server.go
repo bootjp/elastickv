@@ -376,7 +376,7 @@ func (s *DistributionServer) RunSplitJobRunner(ctx context.Context) error {
 				slog.Warn("split job runner tick failed", "err", err)
 			}
 		}
-		if !waitSplitJobRunner(ctx, ticker.C, continueSoon && err == nil) {
+		if !waitSplitJobRunner(ctx, ticker.C, continueSoon && err == nil, s.splitJobContinuationDelay(ctx)) {
 			return nil
 		}
 	}
@@ -417,6 +417,9 @@ func (s *DistributionServer) runSplitJobRunnerJob(ctx context.Context, job distr
 	}
 	if err := s.runSplitJobAttempt(ctx, job); err != nil {
 		return false, err
+	}
+	if fast, err := s.onlineSplitContinuation(ctx, job); fast || err != nil {
+		return fast, err
 	}
 	return s.splitJobPreflightContinuation(ctx, job)
 }

@@ -137,6 +137,7 @@ var layerRules = []layerRule{
 // clusterbootstrap -> server. Widening an allowlist is a layering
 // decision: prefer inverting the dependency.
 var importAllowlists = []layerRule{
+	{Dir: "internal/loadtest", Exact: true, Only: []string{"proto"}, Why: "the production load client uses only the public wire API"},
 	// Data plane, bottom up.
 	{Dir: "internal/encryption", Only: []string{}, Why: "encryption is a library over its own KEK and wire subpackages"},
 	{Dir: "store", Only: []string{"internal/encryption", "internal/raftbootstrap", "internal/s3keys"}, Why: "MVCC storage is the bottom of the data plane"},

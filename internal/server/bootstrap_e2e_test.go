@@ -857,7 +857,7 @@ func startBoundGRPCServer(
 	var trx kv.Transactional = kv.NewTransactionWithProposer(rt.Engine)
 	if len(migration) != 0 {
 		serverOpts = raftGRPCServerOptions(migration[0].auth)
-		trx = adapter.NewInternalMigrationTransaction(rt.Engine, nil, rt.Store, rt.Spec.ID)
+		trx = forwardTransactionForGroup(rt, migration[0].groups, nil)
 	}
 	gs := grpc.NewServer(serverOpts...)
 	grpcSvc := adapter.NewGRPCServer(shardStore, coordinate)

@@ -217,13 +217,17 @@ func recordProposalFailure(observer ProposalObserver) {
 }
 
 func (t *TransactionManager) Commit(ctx context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
+	return t.commitWithTimestampAdmission(ctx, reqs, t.timestampAdmission.Load())
+}
+
+func (t *TransactionManager) commitWithTimestampAdmission(ctx context.Context, reqs []*pb.Request, admission *transactionTimestampAdmission) (*TransactionResponse, error) {
 	if len(reqs) == 0 {
 		return &TransactionResponse{}, nil
 	}
 	if err := refuseAbsenceProposal(reqs); err != nil {
 		return nil, err
 	}
-	owned, err := t.timestampAdmission.Load().prepare(ctx, reqs)
+	owned, err := admission.prepare(ctx, reqs)
 	if err != nil {
 		return nil, err
 	}
@@ -341,7 +345,7 @@ func (t *TransactionManager) commitRawOwned(ctx context.Context, reqs []*pb.Requ
 		return nil, err
 	}
 	if err := combineApplyErrors(results); err != nil {
-		return nil, err
+		return nil, rawIndexedMigrationRejection(reqs, index, err)
 	}
 	return &TransactionResponse{CommitIndex: index}, nil
 }
@@ -439,7 +443,7 @@ func (t *TransactionManager) applyRawBatch(batch []*rawCommitItem) {
 	for i, item := range batch {
 		itemErr := combineApplyErrors(results[offsets[i]:offsets[i+1]])
 		if itemErr != nil {
-			item.done <- rawCommitResult{err: itemErr}
+			item.done <- rawCommitResult{err: rawIndexedMigrationRejection(item.reqs, idx, itemErr)}
 			continue
 		}
 		item.done <- rawCommitResult{commitIndex: idx}

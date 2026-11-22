@@ -1,0 +1,29 @@
+File: diagnostic-current.test
+Build ID: f615123c1b8353138c703d1fe781fc2125b4faae
+Type: cpu
+Time: 2026-11-22 18:54:51 JST
+Duration: 10s, Total samples = 21.32s (213.17%)
+Showing nodes accounting for 10.42s, 48.87% of 21.32s total
+Dropped 1068 nodes (cum <= 0.11s)
+Showing top 20 nodes out of 413
+      flat  flat%   sum%        cum   cum%
+     6.08s 28.52% 28.52%      6.08s 28.52%  internal/runtime/syscall/linux.Syscall6
+     1.22s  5.72% 34.24%      1.22s  5.72%  runtime.futex
+     0.43s  2.02% 36.26%      0.57s  2.67%  runtime.lock2
+     0.26s  1.22% 37.48%      1.53s  7.18%  runtime.selectgo
+     0.24s  1.13% 38.60%      0.33s  1.55%  runtime.step
+     0.22s  1.03% 39.63%      0.22s  1.03%  runtime.memmove
+     0.19s  0.89% 40.53%      0.19s  0.89%  internal/sync.(*Mutex).Unlock
+     0.19s  0.89% 41.42%      0.46s  2.16%  runtime.unlock2
+     0.17s   0.8% 42.21%      0.17s   0.8%  time.runtimeNow
+     0.15s   0.7% 42.92%      0.19s  0.89%  runtime.mallocgcSmallScanNoHeaderSC5
+     0.14s  0.66% 43.57%      0.19s  0.89%  runtime.(*mspan).writeHeapBitsSmall
+     0.14s  0.66% 44.23%      1.40s  6.57%  runtime.mallocgc
+     0.14s  0.66% 44.89%      0.14s  0.66%  runtime.memclrNoHeapPointers
+     0.13s  0.61% 45.50%      0.18s  0.84%  google.golang.org/grpc/internal/transport.(*controlBuffer).getOnceLocked
+     0.12s  0.56% 46.06%      0.19s  0.89%  runtime.casgstatus
+     0.12s  0.56% 46.62%      2.71s 12.71%  runtime.findRunnable
+     0.12s  0.56% 47.19%      0.12s  0.56%  runtime.nanotime (inline)
+     0.12s  0.56% 47.75%      0.12s  0.56%  runtime.nextFreeFast (inline)
+     0.12s  0.56% 48.31%      0.56s  2.63%  runtime.pcvalue
+     0.12s  0.56% 48.87%      0.12s  0.56%  runtime.usleep

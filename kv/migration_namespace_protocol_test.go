@@ -71,7 +71,7 @@ func namespaceActivationTestCommand(t *testing.T, f *kvFSM, kind string) Namespa
 	case "wrong-member-config":
 		command.Members[2].ConfigurationIndex = 4
 	case "extra-member":
-		command.Members = append(command.Members, NamespaceMemberCapability{4, 1, 5})
+		command.Members = append(command.Members, NamespaceMemberCapability{MemberID: 4, Version: 1, ConfigurationIndex: 5})
 	case "duplicate":
 		command.Members[2] = command.Members[1]
 	case "wrong-roster":
@@ -90,7 +90,7 @@ func TestMigrationNamespacePrejoinAndConfigurationMonotonicity(t *testing.T) {
 	f := &kvFSM{store: st}
 	require.NoError(t, f.RecordAppliedNamespaceConfiguration(5, []uint64{1, 2}))
 	command := namespaceCommand(5, 1, 2)
-	command.Joining = []NamespaceMemberCapability{{3, MigrationNamespaceVersion, 5}}
+	command.Joining = []NamespaceMemberCapability{{MemberID: 3, Version: MigrationNamespaceVersion, ConfigurationIndex: 5}}
 	require.Nil(t, applyNamespaceCommand(t, f, 6, command))
 	require.NoError(t, f.RecordAppliedNamespaceConfiguration(7, []uint64{1, 2, 3}))
 	require.NoError(t, RequireMigrationNamespaceAdmission(t.Context(), st))

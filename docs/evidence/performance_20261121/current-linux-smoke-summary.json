@@ -1,0 +1,168 @@
+{
+  "stages": [
+    {
+      "index": 0,
+      "offered_rps": 50,
+      "started": "2026-11-20T17:59:21.495987039Z",
+      "elapsed_seconds": 5.000834711,
+      "planned": 250,
+      "offered": 250,
+      "dropped_capacity": 0,
+      "dropped_scheduler": 0,
+      "cancelled": false,
+      "read": {
+        "attempts": 126,
+        "success": 126,
+        "errors": {},
+        "latency": {
+          "samples": 126,
+          "p50_ms": 3.074326,
+          "p95_ms": 3.641397,
+          "p99_ms": 4.078354,
+          "max_ms": 8.565606
+        },
+        "successful_latency": {
+          "samples": 126,
+          "p50_ms": 3.074326,
+          "p95_ms": 3.641397,
+          "p99_ms": 4.078354,
+          "max_ms": 8.565606
+        }
+      },
+      "write": {
+        "attempts": 124,
+        "success": 124,
+        "errors": {},
+        "latency": {
+          "samples": 124,
+          "p50_ms": 10.280082,
+          "p95_ms": 14.38973,
+          "p99_ms": 15.046808,
+          "max_ms": 18.215449
+        },
+        "successful_latency": {
+          "samples": 124,
+          "p50_ms": 10.280082,
+          "p95_ms": 14.38973,
+          "p99_ms": 15.046808,
+          "max_ms": 18.215449
+        }
+      },
+      "verification": {
+        "attempts": 124,
+        "success": 124,
+        "errors": {},
+        "latency": {
+          "samples": 124,
+          "p50_ms": 3.143294,
+          "p95_ms": 3.668838,
+          "p99_ms": 4.206809,
+          "max_ms": 7.622581
+        },
+        "successful_latency": {
+          "samples": 124,
+          "p50_ms": 3.143294,
+          "p95_ms": 3.668838,
+          "p99_ms": 4.206809,
+          "max_ms": 7.622581
+        }
+      },
+      "logical_scheduled_latency": {
+        "attempts": 250,
+        "success": 250,
+        "errors": {},
+        "latency": {
+          "samples": 250,
+          "p50_ms": 8.229584,
+          "p95_ms": 17.958833,
+          "p99_ms": 19.045752,
+          "max_ms": 21.747492
+        },
+        "successful_latency": {
+          "samples": 250,
+          "p50_ms": 8.229584,
+          "p95_ms": 17.958833,
+          "p99_ms": 19.045752,
+          "max_ms": 21.747492
+        }
+      },
+      "read_scheduled_latency": {
+        "attempts": 126,
+        "success": 126,
+        "errors": {},
+        "latency": {
+          "samples": 126,
+          "p50_ms": 3.611603,
+          "p95_ms": 4.605367,
+          "p99_ms": 5.218008,
+          "max_ms": 9.268036
+        },
+        "successful_latency": {
+          "samples": 126,
+          "p50_ms": 3.611603,
+          "p95_ms": 4.605367,
+          "p99_ms": 5.218008,
+          "max_ms": 9.268036
+        }
+      },
+      "write_scheduled_latency": {
+        "attempts": 124,
+        "success": 124,
+        "errors": {},
+        "latency": {
+          "samples": 124,
+          "p50_ms": 14.215206,
+          "p95_ms": 18.483362,
+          "p99_ms": 19.150369,
+          "max_ms": 21.747492
+        },
+        "successful_latency": {
+          "samples": 124,
+          "p50_ms": 14.215206,
+          "p95_ms": 18.483362,
+          "p99_ms": 19.150369,
+          "max_ms": 21.747492
+        }
+      },
+      "admitted": 250,
+      "read_success_rps": 25.195793758759166,
+      "write_success_rps": 24.795860524493147,
+      "verification_success_rps": 24.795860524493147
+    }
+  ],
+  "availability_clean": true,
+  "acknowledged_writes": 124,
+  "audit": {
+    "acknowledged_writes": 124,
+    "audit": {
+      "attempts": 372,
+      "success": 372,
+      "errors": {},
+      "latency": {
+        "samples": 372,
+        "p50_ms": 1.22694,
+        "p95_ms": 2.300391,
+        "p99_ms": 3.176671,
+        "max_ms": 3.500022
+      },
+      "successful_latency": {
+        "samples": 372,
+        "p50_ms": 1.22694,
+        "p95_ms": 2.300391,
+        "p99_ms": 3.176671,
+        "max_ms": 3.500022
+      }
+    },
+    "complete": true,
+    "expected_observations": 372,
+    "type": "audit",
+    "verified": true
+  },
+  "accounting_valid": true,
+  "ack_audit_valid": true,
+  "split_done_ms": [],
+  "preflight_upper_ms": [],
+  "post_done_paths": [],
+  "profile_events": [],
+  "test_passed": true
+}

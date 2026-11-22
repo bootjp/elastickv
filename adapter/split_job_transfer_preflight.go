@@ -201,6 +201,9 @@ func (pass splitPreflightPass) advance(ctx context.Context, job *distribution.Sp
 }
 
 func (s *DistributionServer) persistSplitTransferPreflight(ctx context.Context, expected distribution.SplitJob, next *distribution.SplitJob, pass splitPreflightPass) error {
+	if err := recordOnlineSplitCatchUpGoal(ctx, next, pass.source, pass.route.End); err != nil {
+		return err
+	}
 	ready, err := s.canContinueSplitPreflight(ctx, expected, pass)
 	if err != nil || !ready {
 		return err

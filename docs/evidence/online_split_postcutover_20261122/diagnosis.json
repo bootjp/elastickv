@@ -1,0 +1,42 @@
+{
+  "production_commit": "c664c80bb954a462b145846b602f6e13849b0cbe",
+  "published_previous_head": "49c6a52ee05f85aa2f4a42796c2b17d9b0f492c9",
+  "isolation_commit": "d1c41e517fb2196af410d941b1ba58fea0ee41c0",
+  "formal_server_sha256": {
+    "baseline-server.test": "33b97a8b6b2707eb3d052b21ed89cf7831fab222a72bbd596f397ecc0c77446e",
+    "candidate-server.test": "bd98c2ca5c46ce35d9aad99d4e34acc76be9c5d6f467a2542b6e7c85dca78f82",
+    "loadtest-window": "8350c069ee061ac2c89a1c876b3391a977d86eb724eca25837625aba993f8acc"
+  },
+  "diagnostic_binary_sha256": {
+    "burst-server.test": "6cf3efad1d6945e00ce57eeb18c9276a18db0ddb24a23f24dc8af8e5ddbdaadb",
+    "burst-driver": "4eb3b9cf52ac4c44f333feae78d114edaab3271180eb2d2c527d9f0c2c99bb80"
+  },
+  "isolation_sha256": "a75a42baa5c57ae6e19b8a29b4ae67aa849e8271100bfede80ba2f9a5d02fdd0",
+  "reproduction": {
+    "command_start_ns": 1795290064115591129,
+    "command_end_ns": 1795290067398553093,
+    "read_p99_ms": 290.213013,
+    "write_p99_ms": 747.521368,
+    "read_success_ops_s": 138.9,
+    "write_success_ops_s": 140.6,
+    "read_max_ms": 935.800074,
+    "write_max_ms": 1029.947516,
+    "raft_fdatasync_max_ms": 428.135,
+    "pebble_fdatasync_max_ms": 356.324,
+    "ack_count": 17517,
+    "audit_attempts": 52551,
+    "audit_success": 52551
+  },
+  "new_validation": {
+    "host_isolation_tests": 6,
+    "full_lint_issues": 0,
+    "production_changed": false
+  },
+  "excluded": [
+    "profiled diagnostic-a (two stages)",
+    "unprofiled observe-b with gctrace (two stages)",
+    "burst-c with event callbacks, syscall timing and warm metadata refresh",
+    "fwupd-d preparation failed before server execution",
+    "fwupd-e intentionally cold firmware daemon start, two stages, diagnostic only"
+  ]
+}

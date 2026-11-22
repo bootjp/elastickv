@@ -16,6 +16,7 @@ import (
 const rawFenceRetryAttempts = 3
 
 type rawDispatchShape struct {
+	retried      bool
 	groupCount   int
 	requestCount int
 }
@@ -122,7 +123,7 @@ func (c *ShardedCoordinator) activateCommitTSFenceForGroup(ctx context.Context, 
 // write-timestamp floor rejection also reads as a write conflict; it keeps
 // its own contract (the caller sees it) and is not retried here.
 func (c *ShardedCoordinator) retryableRawFenceConflict(reqs *OperationGroup[OP], shape rawDispatchShape, err error) bool {
-	return errors.Is(err, store.ErrWriteConflict) &&
+	return isolatedMutationFailure(err) && errors.Is(err, store.ErrWriteConflict) &&
 		!errors.Is(err, ErrTransactionOutcomeUnknown) &&
 		!errors.Is(err, ErrRouteWriteTimestampTooLow) &&
 		shape.singleRequest() && c.canRetryRawVersionGC(reqs)
@@ -139,14 +140,19 @@ func (c *ShardedCoordinator) dispatchRawWithFenceRetry(ctx context.Context, reqs
 	)
 	for attempt := 0; attempt <= rawFenceRetryAttempts; attempt++ {
 		var handled bool
-		shape = rawDispatchShape{}
 		resp, handled, err = c.dispatchBeforeShardRouting(ctx, reqs)
+		shape = rawPointAdmissionShape(reqs, err)
 		if !handled {
 			resp, shape, err = c.dispatchNonTxn(ctx, reqs)
 		}
+		shape.retried = attempt > 0
 		if err == nil || !c.retryableRawFenceConflict(reqs, shape, err) {
 			return resp, shape, err
 		}
 	}
 	return resp, shape, err
+}
+
+func (c *ShardedCoordinator) retryableRawVersionGCFailure(reqs *OperationGroup[OP], shape rawDispatchShape, err error, attempt int) bool {
+	return attempt < composed1RetryAttempts && c.engine != nil && isolatedMutationFailure(err) && errors.Is(err, ErrComposed1VersionGCd) && shape.singleRequest() && c.canRetryRawVersionGC(reqs)
 }

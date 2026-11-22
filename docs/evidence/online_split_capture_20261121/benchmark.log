@@ -1,0 +1,24 @@
+2026/11/21 14:46:49 Found 0 WALs
+goos: darwin
+goarch: arm64
+pkg: github.com/bootjp/elastickv/store
+cpu: Apple M1 Max
+BenchmarkMigrationCaptureEntry/inactive-3         	2026/11/21 14:46:49 Found 0 WALs
+     100	   5068328 ns/op	   3.23 MB/s	   23314 B/op	      36 allocs/op
+BenchmarkMigrationCaptureEntry/inactive-3         	2026/11/21 14:46:50 Found 0 WALs
+2026/11/21 14:46:50 Found 0 WALs
+     100	   5165994 ns/op	   3.17 MB/s	   23315 B/op	      36 allocs/op
+BenchmarkMigrationCaptureEntry/inactive-3         	2026/11/21 14:46:51 Found 0 WALs
+2026/11/21 14:46:51 Found 0 WALs
+     100	   5200408 ns/op	   3.15 MB/s	   23313 B/op	      36 allocs/op
+2026/11/21 14:46:51 Found 0 WALs
+BenchmarkMigrationCaptureEntry/shadow-3           	2026/11/21 14:46:51 Found 0 WALs
+     100	   5460156 ns/op	   3.00 MB/s	  129380 B/op	     156 allocs/op
+BenchmarkMigrationCaptureEntry/shadow-3           	2026/11/21 14:46:52 Found 0 WALs
+2026/11/21 14:46:52 Found 0 WALs
+     100	   5462950 ns/op	   3.00 MB/s	  130848 B/op	     157 allocs/op
+BenchmarkMigrationCaptureEntry/shadow-3           	2026/11/21 14:46:53 Found 0 WALs
+2026/11/21 14:46:53 Found 0 WALs
+     100	   5342265 ns/op	   3.07 MB/s	  130897 B/op	     157 allocs/op
+PASS
+ok  	github.com/bootjp/elastickv/store	4.292s

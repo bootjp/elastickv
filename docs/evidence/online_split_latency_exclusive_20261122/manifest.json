@@ -1,0 +1,134 @@
+{
+  "date_jst": "2026-11-22",
+  "runtime_commit": "c664c80bb954a462b145846b602f6e13849b0cbe",
+  "runtime_tree": "2adb10b08383938c9db00b09cbd3b580a3b92a39",
+  "baseline_commit": "8c2282837ecee54d51c664c67576a8f90e5f90e4",
+  "comparison_binary_toolchain": "Go 1.27.3 for both server binaries and the identical driver",
+  "native_validation_toolchain": "Go 1.27.4 as merged main requests",
+  "executed_binary_sha256": {
+    "candidate-server.test": "bd98c2ca5c46ce35d9aad99d4e34acc76be9c5d6f467a2542b6e7c85dca78f82",
+    "baseline-server.test": "33b97a8b6b2707eb3d052b21ed89cf7831fab222a72bbd596f397ecc0c77446e",
+    "loadtest-window": "8350c069ee061ac2c89a1c876b3391a977d86eb724eca25837625aba993f8acc"
+  },
+  "vm": {
+    "id": 150,
+    "vcpus": 8,
+    "memory_gib": 8,
+    "nodes": 3,
+    "replication_groups": 2,
+    "sync_persistence": true,
+    "profiling": false
+  },
+  "handoff": {
+    "from_thread": "01a1fc58-4aa7-7e62-b848-26db63869aa6",
+    "to_thread": "01a1f333-53dc-7602-92f8-e3df6c957124",
+    "owner_report": "VM 150 is available for the next Split test after all ACK audits and profiles were collected",
+    "planned_order": [
+      "baseline",
+      "candidate"
+    ],
+    "exclusive": true
+  },
+  "artifact_root": "/private/tmp/elastickv-online-latency-artifacts-20261122/final3",
+  "raw_files": {
+    "baseline/run.log": {
+      "sha256": "1e11a02aaf2ac190da50b48df771c7b330524825ee02b39f6fefcae31e18427b",
+      "bytes": 33492
+    },
+    "baseline/rpc.csv.gz": {
+      "sha256": "a4c598d31ba281a3011ed202538bc3b60264e8eeda0682a5cf6c5a0e0d2a5408",
+      "bytes": 2340094
+    },
+    "baseline/markers.jsonl": {
+      "sha256": "5ce69ca4075bbaaf79df464bb924fb46fe826cec10fe25ae7c0a3d9660b0d330",
+      "bytes": 15186
+    },
+    "baseline/exit.txt": {
+      "sha256": "5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9",
+      "bytes": 1
+    },
+    "candidate/run.log": {
+      "sha256": "67b076f125db1d780d2b0963ce5433eb6f91fabce9b3cc39166637592ff41ec6",
+      "bytes": 24807
+    },
+    "candidate/rpc.csv.gz": {
+      "sha256": "510f6c5f8f20cf2e522b08b72ac4bfefbfa119ac2c7b73e77f7e941cf6796f3c",
+      "bytes": 2342200
+    },
+    "candidate/markers.jsonl": {
+      "sha256": "af961cc12c73b1efc7815a9ef708c09537512decf8392f5d75029eefaa396b7f",
+      "bytes": 14874
+    },
+    "candidate/exit.txt": {
+      "sha256": "5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9",
+      "bytes": 1
+    },
+    "final-full-go.log": {
+      "sha256": "1caa6185510b71f7f5f69b6be0d706206289bb858dab7fbf4a707e1c81c603ff",
+      "bytes": 667465
+    },
+    "final-full-go-retry.log": {
+      "sha256": "4f06f1b30e0acd50fc7e2128a3d26c6397f4c9621f3cceca873121520702397e",
+      "bytes": 4529
+    },
+    "final-store-kv-race.log": {
+      "sha256": "1c9b9a0b83526c79fa0850aef31e8ca922c6136f34d42975b70baf51407bc111",
+      "bytes": 93
+    },
+    "retention-guard-red.log": {
+      "sha256": "cd5664ff2712635326cb12db590647a535744fc4e12a14a4a31e53e48adea3ee",
+      "bytes": 1439
+    },
+    "retention-guard-green.log": {
+      "sha256": "67e535695c504cd23618843d1d1b2ca76c17f8d56a619093296dc4995e889eac",
+      "bytes": 46
+    },
+    "retention-guard-commit.log": {
+      "sha256": "2fcffc447e6d89ed1a5c1f97bc88b6f663ba459c79de95c7c99cd660eeae50ca",
+      "bytes": 216
+    },
+    "bootstrap-observation-commit.log": {
+      "sha256": "30a58f1fbedbbaf52ec1519b69982314a6c6e270b61d4e5a35a99da3ec316648",
+      "bytes": 214
+    },
+    "controller-launch-rejected.log": {
+      "sha256": "52473afa9972d7457e9d069dcbb4dc8cef8ea7f40f99638fcca439750e432994",
+      "bytes": 894
+    }
+  },
+  "remote_hashes": {
+    "baseline/run.log": "1e11a02aaf2ac190da50b48df771c7b330524825ee02b39f6fefcae31e18427b",
+    "baseline/rpc.csv.gz": "a4c598d31ba281a3011ed202538bc3b60264e8eeda0682a5cf6c5a0e0d2a5408",
+    "baseline/markers.jsonl": "5ce69ca4075bbaaf79df464bb924fb46fe826cec10fe25ae7c0a3d9660b0d330",
+    "baseline/exit.txt": "5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9",
+    "candidate/run.log": "67b076f125db1d780d2b0963ce5433eb6f91fabce9b3cc39166637592ff41ec6",
+    "candidate/rpc.csv.gz": "510f6c5f8f20cf2e522b08b72ac4bfefbfa119ac2c7b73e77f7e941cf6796f3c",
+    "candidate/markers.jsonl": "af961cc12c73b1efc7815a9ef708c09537512decf8392f5d75029eefaa396b7f",
+    "candidate/exit.txt": "5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9",
+    "candidate-controller-verified.json": "01659e20a5e05297009c5efe62ddca9b8b276fc66449fefc9de24787dd5bae0f"
+  },
+  "baseline_controller_verification": {
+    "candidate-server.test": "668550ff14fdd8518cc08b85b278c356f8a2f282e9dddd94333fe59f286b0c89",
+    "baseline-server.test": "33b97a8b6b2707eb3d052b21ed89cf7831fab222a72bbd596f397ecc0c77446e",
+    "loadtest-window": "8350c069ee061ac2c89a1c876b3391a977d86eb724eca25837625aba993f8acc"
+  },
+  "baseline_controller_note": "Only baseline ran from this controller. Its checked candidate binary was held before execution and is not a measured candidate. The waiting controller was stopped after baseline exit0.",
+  "candidate_controller_verification": {
+    "candidate-server.test": "bd98c2ca5c46ce35d9aad99d4e34acc76be9c5d6f467a2542b6e7c85dca78f82",
+    "loadtest-window": "8350c069ee061ac2c89a1c876b3391a977d86eb724eca25837625aba993f8acc"
+  },
+  "candidate_ready": {
+    "source_commit": "c664c80bb954a462b145846b602f6e13849b0cbe",
+    "sha256": "bd98c2ca5c46ce35d9aad99d4e34acc76be9c5d6f467a2542b6e7c85dca78f82",
+    "go_toolchain": "go1.27.3",
+    "sync_mode": "default sync",
+    "profiles": false
+  },
+  "excluded": "Prior possibly concurrent/profiled measurements, failed old baseline retry, never-executed held candidate8ddc04b2e and one empty permission-denied launch are not final performance evidence.",
+  "cleanup": {
+    "all_workloads_exited": true,
+    "hashes_verified": true,
+    "vm150_status": "stopped"
+  },
+  "durable_artifact_root": "/Users/bootjp/.codex/visualizations/2026/11/19/01a1f333-53dc-7602-92f8-e3df6c957124/vm150-split-exclusive-20261122"
+}

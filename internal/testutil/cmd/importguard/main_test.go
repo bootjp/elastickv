@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 
@@ -66,5 +67,58 @@ func TestForbiddenImport(t *testing.T) {
 	}
 	for _, path := range []string{"fmt", "github.com/bootjp/elastickv/kv", "internal/synctest", "github.com/cockroachdb/pebble/v2/internal/blobtest"} {
 		require.False(t, forbiddenImport(path), "%s", path)
+	}
+}
+
+func TestCheckTreeInspectsProductionLoadTool(t *testing.T) {
+	t.Parallel()
+	for _, dir := range []string{"internal/loadtest", "cmd/loadtest"} {
+		t.Run(dir, func(t *testing.T) {
+			root := t.TempDir()
+			writeSource(t, root, dir+"/main.go", "package loadtest\nimport _ \"testing\"\n")
+			require.ErrorContains(t, checkTree(root), "production import of test support")
+		})
+	}
+	root := t.TempDir()
+	writeSource(t, root, "internal/loadtest/main.go", "package loadtest\nimport _ \"github.com/bootjp/elastickv/proto\"\n")
+	writeSource(t, root, "cmd/loadtest/main.go", "package main\nimport _ \"github.com/bootjp/elastickv/internal/loadtest\"\n")
+	require.NoError(t, checkTree(root))
+}
+
+func TestProductionLoadImportsRemainExact(t *testing.T) {
+	t.Parallel()
+	require.False(t, forbiddenImport(modulePath+"/internal/loadtest"))
+	require.False(t, forbiddenImport(modulePath+"/cmd/loadtest"))
+	require.True(t, forbiddenImport(modulePath+"/internal/loadtest/helpers/newtest"))
+	require.True(t, forbiddenImport("example.com/loadtest"))
+}
+
+func TestShellProductionLoadGuard(t *testing.T) {
+	t.Parallel()
+	script, err := filepath.Abs(filepath.Join("..", "..", "..", "..", "scripts", "check-production-imports.sh"))
+	require.NoError(t, err)
+	for _, tc := range []struct {
+		name, deps string
+		allowed    bool
+	}{
+		{"production load tool", modulePath + "/internal/loadtest\n" + modulePath + "/cmd/loadtest", true},
+		{"real test support", modulePath + "/kv/kvtest", false},
+		{"nested support", modulePath + "/internal/loadtest/helpers/newtest", false},
+		{"foreign package", "example.com/loadtest", false},
+		{"testing package", "testing", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bin := t.TempDir()
+			require.NoError(t, os.WriteFile(filepath.Join(bin, "go"), []byte("#!/bin/sh\nif [ \"$1\" = list ]; then echo \"$GUARD_TEST_DEPS\"; fi\n"), 0700))
+			cmd := exec.Command("bash", script)
+			cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "GUARD_TEST_DEPS="+tc.deps)
+			output, err := cmd.CombinedOutput()
+			if tc.allowed {
+				require.NoError(t, err, "%s", output)
+			} else {
+				require.Error(t, err)
+				require.Contains(t, string(output), "Production dependency on test support")
+			}
+		})
 	}
 }

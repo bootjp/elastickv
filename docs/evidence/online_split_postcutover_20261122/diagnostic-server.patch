@@ -1,0 +1,31 @@
+--- a/store/lsm_store.go
++++ b/store/lsm_store.go
+@@ -16,6 +16,7 @@
+ 	"strconv"
+ 	"strings"
+ 	"sync"
++	"time"
+ 
+ 	"github.com/bootjp/elastickv/internal/encryption"
+ 	"github.com/cockroachdb/errors"
+@@ -368,6 +369,7 @@
+ 	}
+ 	// Enable automatic compactions and apply all other Pebble defaults.
+ 	// EnsureDefaults leaves Cache alone because we already set it.
++if os.Getenv("ELASTICKV_DEBUG_LSM_EVENTS") == "1" { opts.EventListener = &pebble.EventListener{FlushBegin: func(i pebble.FlushInfo) { slog.Info("PROFILE_POSTCUTOVER_LSM", "time_ns", time.Now().UnixNano(), "event", "FlushBegin", "detail", i.String()) },FlushEnd: func(i pebble.FlushInfo) { slog.Info("PROFILE_POSTCUTOVER_LSM", "time_ns", time.Now().UnixNano(), "event", "FlushEnd", "detail", i.String()) },CompactionBegin: func(i pebble.CompactionInfo) { slog.Info("PROFILE_POSTCUTOVER_LSM", "time_ns", time.Now().UnixNano(), "event", "CompactionBegin", "detail", i.String()) },CompactionEnd: func(i pebble.CompactionInfo) { slog.Info("PROFILE_POSTCUTOVER_LSM", "time_ns", time.Now().UnixNano(), "event", "CompactionEnd", "detail", i.String()) },WALCreated: func(i pebble.WALCreateInfo) { slog.Info("PROFILE_POSTCUTOVER_LSM", "time_ns", time.Now().UnixNano(), "event", "WALCreated", "detail", i.String()) },WALDeleted: func(i pebble.WALDeleteInfo) { slog.Info("PROFILE_POSTCUTOVER_LSM", "time_ns", time.Now().UnixNano(), "event", "WALDeleted", "detail", i.String()) },WriteStallBegin: func(i pebble.WriteStallBeginInfo) { slog.Info("PROFILE_POSTCUTOVER_LSM", "time_ns", time.Now().UnixNano(), "event", "WriteStallBegin", "detail", i.String()) },WriteStallEnd: func() { slog.Info("PROFILE_POSTCUTOVER_LSM", "time_ns", time.Now().UnixNano(), "event", "WriteStallEnd") },} }
+ 	opts.EnsureDefaults()
+ 	if disableCompression {
+ 		// Storage-envelope payloads are compressed before encryption. The
+--- a/internal/server/performance_load_profile_test.go
++++ b/internal/server/performance_load_profile_test.go
+@@ -36,8 +36,8 @@
+ 	server, listener, _, err := serverwiring.PreparePprofServer(t.Context(), &net.ListenConfig{}, "127.0.0.1:0", "")
+ 	require.NoError(t, err)
+ 	p.address = "http://" + listener.Addr().String() + "/debug/pprof/"
+-	previous := runtime.SetMutexProfileFraction(1)
+-	runtime.SetBlockProfileRate(1)
++	previous := runtime.SetMutexProfileFraction(0)
++	runtime.SetBlockProfileRate(0)
+ 	t.Cleanup(func() {
+ 		p.wait()
+ 		runtime.SetMutexProfileFraction(previous)

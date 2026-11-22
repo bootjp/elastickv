@@ -2506,11 +2506,15 @@ func (e *Engine) drainReady() error {
 	for {
 		rd := e.rawNode.Ready()
 		e.invalidateNativeAuthority()
+		dispatchReady, err := e.dispatchParallelAppend(rd)
+		if err != nil {
+			return err
+		}
 		if err := e.persistReady(rd); err != nil {
 			return err
 		}
 		e.releaseIgnoredReceivedFSMSnapshotSteps(rd)
-		if err := e.applyAndDispatchReady(rd); err != nil {
+		if err := e.applyAndDispatchReady(dispatchReady); err != nil {
 			return err
 		}
 		e.releaseProtectedReceivedFSMSnapshotsUpTo(e.appliedIndex.Load())

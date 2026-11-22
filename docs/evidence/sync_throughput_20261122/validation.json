@@ -1,0 +1,205 @@
+{
+  "measured_source": "d0ee76e0a1268d9af39e64560ba3e78814e2fb06",
+  "full_go_short": {
+    "exit": 0,
+    "log": "shared-go-short.log",
+    "adapter_seconds": 309.406,
+    "server_seconds": 358.945,
+    "store_seconds": 107.841,
+    "filesystem_seconds": 50.116
+  },
+  "focused_race": {
+    "kv_seconds": 1.651,
+    "server_seconds": 1.999,
+    "exit": 0,
+    "log": "shared-port-final-race.log"
+  },
+  "related_race": {
+    "kv_seconds": 5.674,
+    "adapter_seconds": 121.845,
+    "server_seconds": 2.12,
+    "exit": 0,
+    "log": "shared-related-race.log"
+  },
+  "full_lint": {
+    "exit": 0,
+    "issues": 0,
+    "log": "shared-port-lint-release.log",
+    "commit_hook_pass": true
+  },
+  "root_jepsen": {
+    "tests": 442,
+    "assertions": 6184,
+    "failures": 0,
+    "errors": 0,
+    "log": "shared-jepsen-root.log"
+  },
+  "live_jepsen": {
+    "nodes": 3,
+    "real_etcd": true,
+    "seconds_per_api": 30,
+    "nemesis": false,
+    "exit": 0,
+    "log": "shared-jepsen-live.log",
+    "raw": {
+      "reads_ok": 1335,
+      "writes_ok": 1352,
+      "elle_valid": true
+    },
+    "transactional": {
+      "reads_ok": 1363,
+      "writes_ok": 759,
+      "elle_valid": true
+    }
+  },
+  "upstream_redis_unit": {
+    "exit": 1,
+    "unchanged_failure": "missing namespace jepsen.redis",
+    "log": "jepsen-redis.log"
+  },
+  "measured_source_ci": {
+    "success": 25,
+    "other": 0,
+    "checks": [
+      {
+        "link": "https://github.com/bootjp/elastickv/actions/runs/45012701313/job/137180061942",
+        "name": "test (ubuntu-latest)",
+        "state": "SUCCESS"
+      },
+      {
+        "link": "https://github.com/bootjp/elastickv/runs/137178448284",
+        "name": "CodeQL",
+        "state": "SUCCESS"
+      },
+      {
+        "link": "https://github.com/bootjp/elastickv/actions/runs/45012705432/job/137178330911",
+        "name": "proto",
+        "state": "SUCCESS"
+      },
+      {
+        "link": "https://github.com/bootjp/elastickv/actions/runs/45012705437/job/137178330718",
+        "name": "Request Claude + Codex spec-divergence review",
+        "state": "SUCCESS"
+      },
+      {
+        "link": "https://github.com/bootjp/elastickv/actions/runs/45012705355/job/137178330759",
+        "name": "Jepsen (redis, kill)",
+        "state": "SUCCESS"
+      },
+      {
+        "link": "https://github.com/bootjp/elastickv/actions/runs/45012705355/job/137178330498",
+        "name": "Jepsen (redis, pause)",
+        "state": "SUCCESS"
+      },
+      {
+        "link": "https://github.com/bootjp/elastickv/actions/runs/45012705431/job/137178330750",
+        "name": "golangci-lint",
+        "state": "SUCCESS"
+      },
+      {
+        "link": "https://github.com/bootjp/elastickv/actions/runs/45012705463/job/137178330845",
+        "name": "tla-check",
+        "state": "SUCCESS"
+      },
+      {
+        "link": "https://github.com/bootjp/elastickv/actions/runs/45012705403/job/137178330319",
+        "name": "voter-pause",
+        "state": "SUCCESS"
+      },
+      {
+        "link": "https://github.com/bootjp/elastickv/actions/runs/45012705394/job/137178330529",
+        "name": "build",
+        "state": "SUCCESS"
+      },
+      {
+        "link": "https://github.com/bootjp/elastickv/actions/runs/45012705355/job/137178330724",
+        "name": "Jepsen (redis, partition)",
+        "state": "SUCCESS"
+      },
+      {
+        "link": "https://github.com/bootjp/elastickv/actions/runs/45012702372/job/137178324968",
+        "name": "Analyze (javascript-typescript)",
+        "state": "SUCCESS"
+      },
+      {
+        "link": "https://github.com/bootjp/elastickv/actions/runs/45012703796/job/137178327571",
+        "name": "reconcile",
+        "state": "SUCCESS"
+      },
+      {
+        "link": "https://github.com/bootjp/elastickv/actions/runs/45012702372/job/137178324712",
+        "name": "Analyze (actions)",
+        "state": "SUCCESS"
+      },
+      {
+        "link": "https://github.com/bootjp/elastickv/actions/runs/45012702372/job/137178324971",
+        "name": "Analyze (python)",
+        "state": "SUCCESS"
+      },
+      {
+        "link": "https://github.com/bootjp/elastickv/actions/runs/45012702372/job/137178324973",
+        "name": "Analyze (go)",
+        "state": "SUCCESS"
+      },
+      {
+        "link": "https://github.com/bootjp/elastickv/actions/runs/45012701318/job/137178317774",
+        "name": "test (encryption=off)",
+        "state": "SUCCESS"
+      },
+      {
+        "link": "https://github.com/bootjp/elastickv/actions/runs/45012701313/job/137178317564",
+        "name": "test shard (root)",
+        "state": "SUCCESS"
+      },
+      {
+        "link": "https://github.com/bootjp/elastickv/actions/runs/45012701313/job/137178317405",
+        "name": "test shard (adapter-seq)",
+        "state": "SUCCESS"
+      },
+      {
+        "link": "https://github.com/bootjp/elastickv/actions/runs/45012701313/job/137178317476",
+        "name": "test shard (raft-crypto)",
+        "state": "SUCCESS"
+      },
+      {
+        "link": "https://github.com/bootjp/elastickv/actions/runs/45012701313/job/137178317294",
+        "name": "test shard (rest)",
+        "state": "SUCCESS"
+      },
+      {
+        "link": "https://github.com/bootjp/elastickv/actions/runs/45012701318/job/137178317526",
+        "name": "test (encryption=on)",
+        "state": "SUCCESS"
+      },
+      {
+        "link": "https://github.com/bootjp/elastickv/actions/runs/45012701313/job/137178317540",
+        "name": "test shard (adapter)",
+        "state": "SUCCESS"
+      },
+      {
+        "link": "https://probot.github.io/apps/dco/",
+        "name": "DCO",
+        "state": "SUCCESS"
+      },
+      {
+        "link": "",
+        "name": "CodeRabbit",
+        "state": "SUCCESS"
+      }
+    ]
+  },
+  "scope": "The live no-nemesis histories, root harness and CI fault jobs are separate evidence. They are not a new VM150 Jepsen fault campaign.",
+  "full_go": {
+    "all_packages_pass_after_budget_corrected": true,
+    "initial_command": "go test -p 2 ./...",
+    "initial_exit": 1,
+    "initial_log": "shared-go-full.log",
+    "initial_failure": "Default 10m budget expired while the two existing 9,999-iteration adapter sequences were running; no assertion failure reported. All other packages passed.",
+    "passed_packages_including_no_tests": 71,
+    "adapter_rerun_command": "go test -p 2 -timeout=30m ./adapter",
+    "adapter_rerun_exit": 0,
+    "adapter_rerun_seconds": 724.101,
+    "adapter_rerun_log": "shared-adapter-full-30m.log",
+    "note": "30m is the existing repository CI test budget; no source or assertions changed for rerun."
+  }
+}

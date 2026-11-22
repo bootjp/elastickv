@@ -1,0 +1,213 @@
+package loadtest
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"math"
+	"sync"
+	"time"
+
+	pb "github.com/bootjp/elastickv/proto"
+)
+
+type Config struct {
+	Rates          []int         `json:"rates"`
+	StageDuration  time.Duration `json:"stage_duration_ns"`
+	Concurrency    int           `json:"concurrency"`
+	ReadPercent    int           `json:"read_percent"`
+	Keys           int           `json:"seed_keys"`
+	ValueBytes     int           `json:"value_bytes"`
+	MaxRequests    int           `json:"max_requests"`
+	Prefix         string        `json:"prefix"`
+	RequestTimeout time.Duration `json:"request_timeout_ns"`
+	VerifyWrites   bool          `json:"verify_writes"`
+}
+
+type Stage struct {
+	Index                  int       `json:"index"`
+	Rate                   int       `json:"offered_rps"`
+	Started                time.Time `json:"started"`
+	ElapsedSeconds         float64   `json:"elapsed_seconds"`
+	Planned                int       `json:"planned"`
+	Offered                int       `json:"offered"`
+	DroppedCapacity        int       `json:"dropped_capacity"`
+	DroppedLate            int       `json:"dropped_scheduler"`
+	Cancelled              bool      `json:"cancelled"`
+	Read                   Metric    `json:"read"`
+	Write                  Metric    `json:"write"`
+	Verification           Metric    `json:"verification"`
+	Logical                Metric    `json:"logical_scheduled_latency"`
+	LogicalRead            Metric    `json:"read_scheduled_latency"`
+	LogicalWrite           Metric    `json:"write_scheduled_latency"`
+	Admitted               int       `json:"admitted"`
+	ReadSuccessRPS         float64   `json:"read_success_rps"`
+	WriteSuccessRPS        float64   `json:"write_success_rps"`
+	VerificationSuccessRPS float64   `json:"verification_success_rps"`
+}
+
+// Runner owns one fresh key namespace. Seed, Run and Audit are called serially.
+type Runner struct {
+ trace []windowRPC
+	OnStageStart func(index, rate int)
+	config       Config
+	clients      []pb.RawKVClient
+	next         uint64
+	acknowledged []uint64
+	seeded       bool
+	started      bool
+}
+
+func New(config Config, clients ...pb.RawKVClient) (*Runner, error) {
+	if err := validate(config); err != nil {
+		return nil, err
+	}
+	if len(clients) == 0 {
+		return nil, errors.New("loadtest: at least one client required")
+	}
+	for _, client := range clients {
+		if client == nil {
+			return nil, errors.New("loadtest: nil client")
+		}
+	}
+	return &Runner{config: config, clients: clients, trace:make([]windowRPC,config.MaxRequests)}, nil
+}
+
+type request struct {
+	id        uint64
+	scheduled time.Time
+}
+
+// Run executes stages serially, draining in-flight requests before the next
+// stage. Each offered slot is sent once or recorded as a drop; no catch-up burst
+// or automatic RPC retry is introduced. The callback runs between stages.
+func (r *Runner) Run(ctx context.Context, completed func(Stage)) ([]Stage, error) {
+	if !r.seeded || r.started {
+		return nil, errors.New("loadtest: seed once, then run once per fresh prefix")
+	}
+	r.started = true
+	stages := make([]Stage, 0, len(r.config.Rates))
+	for index, rate := range r.config.Rates {
+		if r.OnStageStart != nil {
+			r.OnStageStart(index, rate)
+		}
+		stage := r.runStage(ctx, index, rate)
+		stages = append(stages, stage)
+		if completed != nil {
+			completed(stage)
+		}
+		if stage.Cancelled {
+			break
+		}
+	}
+	return stages, r.writeWindowTrace()
+}
+
+func (r *Runner) runStage(ctx context.Context, index, rate int) Stage {
+	stage := Stage{Index: index, Rate: rate, Started: time.Now().UTC(), Planned: int(math.Ceil(r.config.StageDuration.Seconds() * float64(rate)))}
+	jobs := make(chan request)
+	results := make([]workerResult, r.config.Concurrency)
+	var wg, ready sync.WaitGroup
+	ready.Add(len(results))
+	for worker := range results {
+		wg.Go(func() {
+			ready.Done()
+			for job := range jobs {
+				r.execute(ctx, job, &results[worker])
+			}
+		})
+	}
+	ready.Wait()
+	start := time.Now()
+	stage.Started = start.UTC()
+	r.offer(ctx, start, rate, jobs, &stage)
+	close(jobs)
+	wg.Wait()
+	var read, write, verification, logical, logicalRead, logicalWrite samples
+	for _, result := range results {
+		read.merge(result.read)
+		write.merge(result.write)
+		verification.merge(result.verification)
+		logical.merge(result.logical)
+		logicalRead.merge(result.logicalRead)
+		logicalWrite.merge(result.logicalWrite)
+		r.acknowledged = append(r.acknowledged, result.acknowledged...)
+	}
+	stage.ElapsedSeconds = time.Since(start).Seconds()
+	stage.Read = read.metric()
+	stage.Write = write.metric()
+	stage.Verification = verification.metric()
+	stage.Logical = logical.metric()
+	stage.LogicalRead = logicalRead.metric()
+	stage.LogicalWrite = logicalWrite.metric()
+	stage.Admitted = stage.Logical.Attempts
+	stage.ReadSuccessRPS = float64(stage.Read.Success) / stage.ElapsedSeconds
+	stage.WriteSuccessRPS = float64(stage.Write.Success) / stage.ElapsedSeconds
+	stage.VerificationSuccessRPS = float64(stage.Verification.Success) / stage.ElapsedSeconds
+	return stage
+}
+
+func (r *Runner) offer(ctx context.Context, start time.Time, rate int, jobs chan<- request, stage *Stage) {
+	period := time.Second / time.Duration(rate)
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+	offset := r.next
+	r.next += uint64(stage.Planned)
+	for slot := 0; slot < stage.Planned; slot++ {
+		arrival := start.Add(time.Duration(slot) * period)
+		if !waitArrival(ctx, timer, arrival) {
+			stage.Cancelled = true
+			return
+		}
+		due := min(int(time.Since(start)/period), stage.Planned)
+		if due > slot {
+			stage.DroppedLate += due - slot
+			stage.Offered += due - slot
+			slot = due
+			if slot == stage.Planned {
+				return
+			}
+			arrival = start.Add(time.Duration(slot) * period)
+		}
+		stage.Offered++
+		select {
+		case jobs <- request{id: offset + uint64(slot), scheduled: arrival}:
+		default:
+			stage.DroppedCapacity++
+		}
+	}
+	if !waitArrival(ctx, timer, start.Add(r.config.StageDuration)) {
+		stage.Cancelled = true
+	}
+}
+
+func (r *Runner) Acknowledged() int { return len(r.acknowledged) }
+
+func waitArrival(ctx context.Context, timer *time.Timer, arrival time.Time) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	timer.Reset(max(time.Until(arrival), 0))
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return ctx.Err() == nil
+	}
+}
+
+// ValidateLedger cross-checks independently counted successful write responses
+// against both ledger cardinality and unique IDs before any audit can pass.
+func (r *Runner) ValidateLedger(expected int) error {
+	if len(r.acknowledged) != expected {
+		return fmt.Errorf("ACK count: ledger=%d successful responses=%d", len(r.acknowledged), expected)
+	}
+	unique := make(map[uint64]struct{}, len(r.acknowledged))
+	for _, id := range r.acknowledged {
+		if _, exists := unique[id]; exists {
+			return fmt.Errorf("duplicate ACK ID: %d", id)
+		}
+		unique[id] = struct{}{}
+	}
+	return nil
+}

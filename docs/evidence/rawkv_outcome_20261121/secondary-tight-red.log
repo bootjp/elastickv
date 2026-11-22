@@ -1,0 +1,11 @@
+--- FAIL: TestSecondaryMutationFailureStaysIndeterminate (0.00s)
+    grpc_mutation_secondary_test.go:18: 
+        	Error Trace:	/private/tmp/elastickv-load-ramp-20261121/adapter/grpc_mutation_secondary_test.go:18
+        	Error:      	Not equal: 
+        	            	expected: 0x2
+        	            	actual  : 0xa
+        	Test:       	TestSecondaryMutationFailureStaysIndeterminate
+        	Messages:   	a hidden lost reply must dominate the primary error
+FAIL
+FAIL	command-line-arguments	0.465s
+FAIL

@@ -1,0 +1,8 @@
+{
+  "source_commit": "5226ac75744e3575daccee23690a36e44178e30f",
+  "correctness": "Stale-source rejection is retried after both target descriptor and target guard retirement; final source retirement removes the hint. Prefix admission first uses logical footprints, then scans indexed matching keys including earlier writes in the same entry. Intersecting prefixes invalidate capture and apply normally.",
+  "security": "Hint lookup grants no write authority; unknown, joined, transport, partial and prior-attempt outcomes remain terminal. Waiter count/bytes/deadline limits unchanged. Unfiltered shadow prefix writes still fail; protected/empty prefixes cannot erase captured rows.",
+  "performance": "Success-path RawKV point code unchanged. Handoff group scan runs only on an existing error/wait path. Unrelated online prefix deletion adds a constant-memory indexed scan. Smaller maintenance pages failed consistent p99 improvement and were reverted; original budgets retained. Sync I/O variability remains explicitly measured.",
+  "data_consistency": "Data, all per-request outcomes, capture frame/sequence and applied index still commit atomically under Sync. Prefix rejection/false verdict rolls back earlier writes and index; receipt replay preserves the complete result. Timestamp publication, historical-read and ownership/member barriers unchanged.",
+  "coverage": "Real-FSM/public-RawPut RED->GREEN for two retirement positions; mixed point/prefix RED->GREEN; guarded captured/empty/excluded prefixes and false verdict rollback; seven shell/isolation tests. Focused races, final full Go suite and full store race pass. Linux comparison and ACKx3 audit are required independently."
+}

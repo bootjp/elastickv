@@ -25,6 +25,8 @@ func MigrationRequestAdmissionReady(tx Transactional) bool {
 	switch t := tx.(type) {
 	case *TransactionManager:
 		return migrationTransactionManagerReady(t)
+	case *forwardedGroupTransaction:
+		return migrationTransactionManagerReady(t.configuredManager())
 	case *LeaderProxy:
 		return t != nil && MigrationRequestAdmissionReady(t.tm)
 	case *leaseRefreshingTxn:
@@ -62,7 +64,7 @@ func (a *transactionMigrationAdmission) apply(ctx context.Context, proposer raft
 	accepted := make([]*pb.Request, 0, len(reqs))
 	positions := make([]int, 0, len(reqs))
 	for i, req := range reqs {
-		results[i] = CheckMigrationRequest(ctx, a.store, a.groupID, req)
+		results[i] = markDataRequestNotSubmitted([]*pb.Request{req}, CheckMigrationRequest(ctx, a.store, a.groupID, req))
 		if results[i] == nil {
 			accepted, positions = append(accepted, req), append(positions, i)
 		}

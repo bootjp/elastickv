@@ -1,0 +1,72 @@
+ok  	github.com/bootjp/elastickv	13.470s
+ok  	github.com/bootjp/elastickv/adapter	343.247s
+?   	github.com/bootjp/elastickv/cmd	[no test files]
+?   	github.com/bootjp/elastickv/cmd/client	[no test files]
+ok  	github.com/bootjp/elastickv/cmd/elastickv-admin	1.090s
+ok  	github.com/bootjp/elastickv/cmd/elastickv-backup	(cached)
+ok  	github.com/bootjp/elastickv/cmd/elastickv-list-routes	(cached)
+?   	github.com/bootjp/elastickv/cmd/elastickv-raft-stream-soak	[no test files]
+ok  	github.com/bootjp/elastickv/cmd/elastickv-route-key	(cached)
+ok  	github.com/bootjp/elastickv/cmd/elastickv-snapshot-archive	(cached)
+ok  	github.com/bootjp/elastickv/cmd/elastickv-snapshot-decode	(cached)
+ok  	github.com/bootjp/elastickv/cmd/elastickv-snapshot-encode	(cached)
+ok  	github.com/bootjp/elastickv/cmd/elastickv-snapshot-offload	(cached)
+ok  	github.com/bootjp/elastickv/cmd/elastickv-snapshot-prepare-restore	(cached)
+ok  	github.com/bootjp/elastickv/cmd/elastickv-split	0.526s
+ok  	github.com/bootjp/elastickv/cmd/jepsen-encryption-setup	(cached)
+ok  	github.com/bootjp/elastickv/cmd/jepsen-grpc-client	(cached)
+ok  	github.com/bootjp/elastickv/cmd/loadtest	(cached)
+ok  	github.com/bootjp/elastickv/cmd/raftadmin	(cached)
+ok  	github.com/bootjp/elastickv/cmd/redis-proxy	(cached)
+ok  	github.com/bootjp/elastickv/cmd/server	0.490s
+ok  	github.com/bootjp/elastickv/distribution	(cached)
+ok  	github.com/bootjp/elastickv/distribution/autosplit	(cached)
+ok  	github.com/bootjp/elastickv/internal	(cached)
+ok  	github.com/bootjp/elastickv/internal/admin	(cached)
+ok  	github.com/bootjp/elastickv/internal/adminbridge	0.478s
+ok  	github.com/bootjp/elastickv/internal/backup	(cached)
+ok  	github.com/bootjp/elastickv/internal/clusterbootstrap	0.514s
+ok  	github.com/bootjp/elastickv/internal/encryption	(cached)
+ok  	github.com/bootjp/elastickv/internal/encryption/encryptiontest	(cached)
+ok  	github.com/bootjp/elastickv/internal/encryption/fsmwire	(cached)
+ok  	github.com/bootjp/elastickv/internal/encryption/kek	(cached)
+ok  	github.com/bootjp/elastickv/internal/encryptionwiring	14.443s
+ok  	github.com/bootjp/elastickv/internal/filesystem	(cached)
+ok  	github.com/bootjp/elastickv/internal/filesystem/fstest	(cached)
+ok  	github.com/bootjp/elastickv/internal/filesystem/fuseadapter	(cached)
+ok  	github.com/bootjp/elastickv/internal/fskeys	(cached)
+ok  	github.com/bootjp/elastickv/internal/fsmount	(cached)
+ok  	github.com/bootjp/elastickv/internal/leaderbalance	(cached)
+ok  	github.com/bootjp/elastickv/internal/loadtest	(cached)
+ok  	github.com/bootjp/elastickv/internal/memwatch	(cached)
+ok  	github.com/bootjp/elastickv/internal/monoclock	(cached)
+ok  	github.com/bootjp/elastickv/internal/nodeauth	0.643s
+ok  	github.com/bootjp/elastickv/internal/noderuntime	0.882s
+?   	github.com/bootjp/elastickv/internal/pathsafety	[no test files]
+ok  	github.com/bootjp/elastickv/internal/peersession	(cached)
+?   	github.com/bootjp/elastickv/internal/peersession/wire	[no test files]
+ok  	github.com/bootjp/elastickv/internal/raftadmin	(cached)
+ok  	github.com/bootjp/elastickv/internal/raftadmission	(cached)
+ok  	github.com/bootjp/elastickv/internal/raftbootstrap	(cached)
+ok  	github.com/bootjp/elastickv/internal/raftengine	(cached)
+ok  	github.com/bootjp/elastickv/internal/raftengine/etcd	(cached)
+ok  	github.com/bootjp/elastickv/internal/raftengine/etcd/transportsoak	(cached)
+ok  	github.com/bootjp/elastickv/internal/raftengine/raftenginetest	(cached)
+ok  	github.com/bootjp/elastickv/internal/runtimehealth	(cached)
+ok  	github.com/bootjp/elastickv/internal/s3keys	(cached)
+ok  	github.com/bootjp/elastickv/internal/server	363.943s
+ok  	github.com/bootjp/elastickv/internal/serverwiring	0.473s
+ok  	github.com/bootjp/elastickv/internal/snapshotoffload	(cached)
+ok  	github.com/bootjp/elastickv/internal/snapshotoffloadwiring	(cached)
+ok  	github.com/bootjp/elastickv/internal/testutil	(cached)
+ok  	github.com/bootjp/elastickv/internal/testutil/cmd/importguard	0.238s
+ok  	github.com/bootjp/elastickv/internal/testutil/grpctest	(cached)
+ok  	github.com/bootjp/elastickv/internal/tsowiring	(cached)
+ok  	github.com/bootjp/elastickv/keyviz	(cached)
+ok  	github.com/bootjp/elastickv/kv	(cached)
+ok  	github.com/bootjp/elastickv/kv/kvtest	(cached)
+ok  	github.com/bootjp/elastickv/monitoring	(cached)
+?   	github.com/bootjp/elastickv/proto	[no test files]
+ok  	github.com/bootjp/elastickv/proxy	(cached)
+ok  	github.com/bootjp/elastickv/store	(cached)
+ok  	github.com/bootjp/elastickv/store/storetest	(cached)

@@ -1,0 +1,25 @@
+{
+  "baseline_source_commit": "dfe649016",
+  "candidate_source_commit": "59088d5c1e8454f2ff403cb9fe39a58b88bbc344",
+  "candidate_binary_sha256": "c43e785d5b0b424901ea8ff73cd2b79104116bb6268ae814677fbd3fdf52b868",
+  "baseline_binary_sha256": "4ac7a2ea163ce791fb91a637a4a026c88bf879ebf601fecd0f81abd3dd1a41ea",
+  "load_driver_sha256": "4466191bf18b096233b765ae1c626eb0d957870e065d3ea27cdad1d0306ec8a6",
+  "offered_rps": 500,
+  "duration_seconds": 300,
+  "concurrency": 32,
+  "read_percent": 50,
+  "seed_keys": 256,
+  "value_bytes": 1024,
+  "per_rpc_timeout_seconds": 2,
+  "mutation_retries": 0,
+  "sync_override": null,
+  "profiles_enabled": false,
+  "trial_order": [
+    "A1",
+    "B1",
+    "B2",
+    "A2"
+  ],
+  "note": "Baseline binary has unchanged program source at eb804ce63; dfe649016 adds evidence only.",
+  "excluded_intermediate_candidate": "scope-excluded-B1 uses f78f24e4f; after A1, before final B1; excluded because strict mixed checks were subsequently scoped to public RawKV to preserve SQS contracts"
+}

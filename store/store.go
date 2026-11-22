@@ -134,7 +134,11 @@ type ExportVersionsResult struct {
 
 // ImportVersionsOptions applies one idempotent migration-import batch.
 type ImportVersionsOptions struct {
-	JobID uint64
+	JobID                uint64
+	OnlineSequence       uint64
+	OnlineDigest         [32]byte
+	OnlineSourceIdentity MigrationCaptureIdentity
+	OnlineSourceIndex    uint64
 	// AppliedIndex is the optional Raft entry index to bundle with Pebble
 	// import batches as metaAppliedIndex. Zero leaves the meta key unchanged.
 	AppliedIndex uint64
@@ -154,7 +158,8 @@ type ImportVersionsResult struct {
 // PromoteVersionsOptions atomically copies staged MVCC versions to their
 // target keys and physically removes the staged versions.
 type PromoteVersionsOptions struct {
-	JobID uint64
+	OnlineGuard *OnlineMaintenanceGuard
+	JobID       uint64
 	// AppliedIndex is the optional Raft entry index to bundle with Pebble
 	// promotion batches as metaAppliedIndex. Zero leaves the meta key unchanged.
 	AppliedIndex    uint64
@@ -191,6 +196,7 @@ type PromotionState struct {
 // by the migration bracket filter. It is cursor-resumable and is used only
 // after ownership has moved or while abandoning an unpublished migration.
 type CleanupVersionsOptions struct {
+	OnlineGuard     *OnlineMaintenanceGuard
 	JobID           uint64
 	AppliedIndex    uint64
 	StartKey        []byte

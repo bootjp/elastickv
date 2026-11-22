@@ -1,0 +1,21 @@
+tracepoint:syscalls:sys_enter_fsync,
+tracepoint:syscalls:sys_enter_fdatasync
+/pid == $1/
+{
+  @begun[tid] = nsecs;
+  @fd[tid] = args->fd;
+}
+
+tracepoint:syscalls:sys_exit_fsync,
+tracepoint:syscalls:sys_exit_fdatasync
+/pid == $1 && @begun[tid]/
+{
+  $duration = nsecs - @begun[tid];
+  if ($duration > 5000000) {
+    printf("PROFILE_POSTCUTOVER_SYNC %d %d %d %llu %s\n", pid, tid, @fd[tid], $duration / 1000, probe);
+  }
+  delete(@begun[tid]);
+  delete(@fd[tid]);
+}
+
+END { clear(@begun); clear(@fd); }

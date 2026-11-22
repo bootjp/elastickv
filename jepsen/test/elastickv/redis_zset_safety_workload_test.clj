@@ -871,6 +871,69 @@
     (is (contains? kinds :unstable-read-without-mutation)
         (str "expected :unstable-read-without-mutation, got kinds=" kinds))))
 
+(deftest timed-out-zadd-can-become-visible-once-after-its-response
+  (let [history [{:type :invoke :process 0 :f :zadd :value ["m1" 49] :index 0}
+                 {:type :info :process 0 :f :zadd :value ["m1" 49] :index 1}
+                 {:type :invoke :process 1 :f :zrange-all :index 2}
+                 {:type :ok :process 1 :f :zrange-all :value [] :index 3}
+                 {:type :invoke :process 1 :f :zrange-all :index 4}
+                 {:type :ok :process 1 :f :zrange-all :value [["m1" 49.0]] :index 5}]
+        overwritten (into history
+                          [{:type :invoke :process 2 :f :zadd :value ["m1" 7] :index 6}
+                           {:type :ok :process 2 :f :zadd :value ["m1" 7] :index 7}
+                           {:type :invoke :process 1 :f :zrange-all :index 8}
+                           {:type :ok :process 1 :f :zrange-all :value [["m1" 7.0]] :index 9}])]
+    (is (true? (:valid? (run-checker history))))
+    (is (false? (:valid? (run-checker
+                          (assoc-in history [5 :value] [["m1" 50.0]])))))
+    (is (true? (:valid? (run-checker overwritten))))
+    (is (false? (:valid? (run-checker
+                          (into overwritten
+                                [{:type :invoke :process 1 :f :zrange-all :index 10}
+                                 {:type :ok :process 1 :f :zrange-all :value [["m1" 49.0]] :index 11}])))))))
+
+(deftest timed-out-zadds-with-the-same-score-can-each-apply-once
+  (let [scores [49 49 7 7]
+        writes (mapcat (fn [type]
+                         (map-indexed (fn [process score]
+                                        {:type type :process process :f :zadd :value ["m1" score]})
+                                      scores))
+                       [:invoke :info])
+        check-scores (fn [reads]
+                       (run-checker
+                         (mapv #(assoc %1 :index %2)
+                               (concat writes
+                                       (mapcat (fn [score]
+                                                 [{:type :invoke :process 4 :f :zrange-all}
+                                                  {:type :ok :process 4 :f :zrange-all
+                                                   :value (if (nil? score) [] [["m1" score]])}])
+                                               reads))
+                               (range))))
+        four-changes [nil 49.0 7.0 49.0 7.0]
+        impossible (check-scores (conj four-changes 49.0))]
+    (is (true? (:valid? (check-scores four-changes))))
+    (is (false? (:valid? impossible)))
+    (is (contains? (:errors-by-kind impossible) :unstable-read-without-mutation))))
+
+(deftest many-timed-out-zadds-return-unknown-when-read-search-is-exhausted
+  (let [history (mapv #(assoc %1 :index %2)
+                      (concat
+                        (for [type [:invoke :info] process (range 12)]
+                          {:type type :process process :f :zadd :value ["m1" 49]})
+                        [{:type :invoke :process 12 :f :zadd :value ["m1" 7]}
+                         {:type :ok :process 12 :f :zadd :value ["m1" 7]}
+                         {:type :invoke :process 12 :f :zadd :value ["m1" 11]}
+                         {:type :ok :process 12 :f :zadd :value ["m1" 11]}
+                         {:type :invoke :process 12 :f :zrange-all}
+                         {:type :ok :process 12 :f :zrange-all :value [["m1" 11.0]]}
+                         {:type :invoke :process 12 :f :zrange-all}
+                         {:type :ok :process 12 :f :zrange-all :value [["m1" 49.0]]}])
+                      (range))
+        result (run-checker history)]
+    (is (= :unknown (:valid? result)))
+    (is (= 1 (get-in result [:errors-by-kind :inconclusive-zadd-history])))
+    (is (= :read-search-budget-exhausted (:cause (first (:first-errors result)))))))
+
 (deftest range-reads-cannot-switch-overlapping-write-order
   ;; Stability is not just a full-read property. Two non-overlapping bounded
   ;; reads cannot pick different serializations of the same completed writes.

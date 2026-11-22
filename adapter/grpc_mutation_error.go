@@ -21,24 +21,7 @@ func projectPublicGRPCMutationError(err error) error {
 	if err == nil {
 		return nil
 	}
-	code := codes.Unknown
-	message := "Operation outcome unknown"
-	reason := publicGRPCUnknownReason
-	if !errors.Is(err, kv.ErrTransactionOutcomeUnknown) &&
-		!errors.Is(err, kv.ErrRouteWriteFenced) &&
-		!errors.Is(err, kv.ErrTxnLocked) &&
-		!isIndeterminateMutationDispatchFailure(err) {
-		switch {
-		case errors.Is(err, kv.ErrLeaderProxyCircuitOpen):
-			code = codes.Unavailable
-			message = "Route unavailable"
-			reason = publicGRPCNotAdmittedReason
-		case errors.Is(err, store.ErrWriteConflict):
-			code = codes.Aborted
-			message = "Operation aborted"
-			reason = publicGRPCAbortedReason
-		}
-	}
+	code, message, reason := publicGRPCMutationFailure(err)
 	st, detailErr := status.New(code, message).WithDetails(&errdetails.ErrorInfo{
 		Domain: publicGRPCFailureDomain,
 		Reason: reason,
@@ -49,4 +32,27 @@ func projectPublicGRPCMutationError(err error) error {
 	}
 	//nolint:wrapcheck // Preserve the fixed message and public failure detail.
 	return st.Err()
+}
+
+func publicGRPCMutationFailure(err error) (codes.Code, string, string) {
+	if kv.IsMutationNotAdmitted(err) {
+		return codes.Unavailable, "Route unavailable", publicGRPCNotAdmittedReason
+	}
+	if kv.IsMutationApplyRejected(err) {
+		return codes.Aborted, "Operation aborted", publicGRPCAbortedReason
+	}
+	if uncertainPublicMutationFailure(err) {
+		return codes.Unknown, "Operation outcome unknown", publicGRPCUnknownReason
+	}
+	switch {
+	case errors.Is(err, kv.ErrLeaderProxyCircuitOpen):
+		return codes.Unavailable, "Route unavailable", publicGRPCNotAdmittedReason
+	case errors.Is(err, store.ErrWriteConflict):
+		return codes.Aborted, "Operation aborted", publicGRPCAbortedReason
+	}
+	return codes.Unknown, "Operation outcome unknown", publicGRPCUnknownReason
+}
+
+func uncertainPublicMutationFailure(err error) bool {
+	return mixedMutationDispatchFailure(err) || errors.Is(err, kv.ErrTransactionOutcomeUnknown) || errors.Is(err, kv.ErrRouteWriteFenced) || errors.Is(err, kv.ErrTxnLocked) || isIndeterminateMutationDispatchFailure(err)
 }

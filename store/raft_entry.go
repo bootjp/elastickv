@@ -92,6 +92,7 @@ type raftEntryScope struct {
 	forceSync   bool
 	controlOnly bool
 	readiness   map[uint64]TargetStagedReadinessState
+	capture     *migrationCaptureCollector
 	// failed is the first staging error; once set, every later staging call
 	// and the commit return it, so a partially staged request can never
 	// land.
@@ -347,6 +348,9 @@ func (s *pebbleStore) stageMutationsInRaftEntryWithFence(ctx context.Context, sc
 	if err := stageEncodedMutations(scope.batch, encoded); err != nil {
 		return scope.fail(err)
 	}
+	if err := captureStagedMigrationMutations(scope, encoded); err != nil {
+		return scope.fail(err)
+	}
 	scope.observe(commitTS, true)
 	return nil
 }
@@ -359,6 +363,9 @@ func (s *pebbleStore) checkRaftEntryMutationConflicts(ctx context.Context, scope
 }
 
 func (s *pebbleStore) stagePreservingMutationsInRaftEntry(ctx context.Context, scope *raftEntryScope, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS uint64) error {
+	if scope.capture != nil {
+		return scope.fail(errors.WithStack(ErrNotSupported))
+	}
 	if scope.failed != nil {
 		return scope.failed
 	}
@@ -441,7 +448,7 @@ func (s *pebbleStore) stagePrefixDeletesInRaftEntry(scope *raftEntryScope, delet
 	}
 	defer iter.Close()
 
-	if err := s.stageDeletePrefixes(iter, scope.batch, deletes, commitTS); err != nil {
+	if err := s.stageCaptureSafePrefixDeletes(scope, iter, deletes, commitTS); err != nil {
 		return scope.fail(err)
 	}
 	scope.observe(commitTS, true)

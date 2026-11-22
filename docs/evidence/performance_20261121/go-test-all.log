@@ -1,0 +1,211 @@
+ok  	github.com/bootjp/elastickv	25.345s
+ok  	github.com/bootjp/elastickv/adapter	1174.570s
+?   	github.com/bootjp/elastickv/cmd	[no test files]
+?   	github.com/bootjp/elastickv/cmd/client	[no test files]
+ok  	github.com/bootjp/elastickv/cmd/elastickv-admin	1.762s
+ok  	github.com/bootjp/elastickv/cmd/elastickv-backup	0.598s
+ok  	github.com/bootjp/elastickv/cmd/elastickv-list-routes	1.158s
+?   	github.com/bootjp/elastickv/cmd/elastickv-raft-stream-soak	[no test files]
+ok  	github.com/bootjp/elastickv/cmd/elastickv-route-key	0.525s
+ok  	github.com/bootjp/elastickv/cmd/elastickv-snapshot-archive	1.646s
+ok  	github.com/bootjp/elastickv/cmd/elastickv-snapshot-decode	2.978s
+ok  	github.com/bootjp/elastickv/cmd/elastickv-snapshot-encode	3.892s
+ok  	github.com/bootjp/elastickv/cmd/elastickv-snapshot-offload	3.317s
+ok  	github.com/bootjp/elastickv/cmd/elastickv-snapshot-prepare-restore	3.763s
+ok  	github.com/bootjp/elastickv/cmd/elastickv-split	0.540s
+ok  	github.com/bootjp/elastickv/cmd/jepsen-encryption-setup	0.444s
+ok  	github.com/bootjp/elastickv/cmd/jepsen-grpc-client	0.356s
+ok  	github.com/bootjp/elastickv/cmd/loadtest	0.530s
+ok  	github.com/bootjp/elastickv/cmd/raftadmin	0.579s
+ok  	github.com/bootjp/elastickv/cmd/redis-proxy	0.285s
+ok  	github.com/bootjp/elastickv/cmd/server	0.566s
+ok  	github.com/bootjp/elastickv/distribution	2.638s
+ok  	github.com/bootjp/elastickv/distribution/autosplit	0.457s
+ok  	github.com/bootjp/elastickv/internal	0.466s
+ok  	github.com/bootjp/elastickv/internal/admin	0.570s
+ok  	github.com/bootjp/elastickv/internal/adminbridge	0.533s
+ok  	github.com/bootjp/elastickv/internal/backup	7.850s
+ok  	github.com/bootjp/elastickv/internal/clusterbootstrap	0.698s
+ok  	github.com/bootjp/elastickv/internal/encryption	13.108s
+ok  	github.com/bootjp/elastickv/internal/encryption/encryptiontest	0.509s
+ok  	github.com/bootjp/elastickv/internal/encryption/fsmwire	0.341s
+ok  	github.com/bootjp/elastickv/internal/encryption/kek	1.049s
+ok  	github.com/bootjp/elastickv/internal/encryptionwiring	28.408s
+2026/11/21 02:33:09 Found 0 WALs
+2026/11/21 02:33:09 Found 0 WALs
+2026/11/21 02:33:09 Found 0 WALs
+2026/11/21 02:33:10 Found 1 WALs
+2026/11/21 02:33:10   - 000002: {(/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestVerifyOperationReceiptAfterPebbleReopen700256430/001/pebble,000)}
+2026/11/21 02:33:10 [JOB 1] WAL 000002: {(/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestVerifyOperationReceiptAfterPebbleReopen700256430/001/pebble,000)} stopped reading at offset: (/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestVerifyOperationReceiptAfterPebbleReopen700256430/001/pebble/000002.log: 6404); replayed 33 keys in 8 batches
+2026/11/21 02:33:10 Found 1 WALs
+2026/11/21 02:33:10   - 000002: {(/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestCreateReceiptsAfterPebbleReopen3230671308/001/pebble,000)}
+2026/11/21 02:33:10 [JOB 1] WAL 000002: {(/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestCreateReceiptsAfterPebbleReopen3230671308/001/pebble,000)} stopped reading at offset: (/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestCreateReceiptsAfterPebbleReopen3230671308/001/pebble/000002.log: 15468); replayed 55 keys in 12 batches
+2026/11/21 02:33:10 Found 1 WALs
+2026/11/21 02:33:10   - 000002: {(/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestNamespaceAndMetadataReceiptsAfterPebbleReopen486486185/001/pebble,000)}
+2026/11/21 02:33:10 [JOB 1] WAL 000002: {(/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestNamespaceAndMetadataReceiptsAfterPebbleReopen486486185/001/pebble,000)} stopped reading at offset: (/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestNamespaceAndMetadataReceiptsAfterPebbleReopen486486185/001/pebble/000002.log: 26253); replayed 114 keys in 24 batches
+2026/11/21 02:33:10 Found 0 WALs
+2026/11/21 02:33:11 Found 0 WALs
+raft2026/11/21 02:33:11 INFO: c7daaf382d3361ff switched to configuration voters=(c7daaf382d3361ff)
+raft2026/11/21 02:33:11 INFO: c7daaf382d3361ff became follower at term 1
+raft2026/11/21 02:33:11 INFO: newRaft c7daaf382d3361ff [peers: [c7daaf382d3361ff], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+2026/11/21 02:33:11 WARN etcd raft engine: lease read disabled (non-positive LeaseDuration) tick_interval=10ms election_tick=10 lease_safety_margin=300ms computed_lease=0s
+raft2026/11/21 02:33:11 INFO: c7daaf382d3361ff is starting a new election at term 1
+raft2026/11/21 02:33:11 INFO: c7daaf382d3361ff became pre-candidate at term 1
+raft2026/11/21 02:33:11 INFO: c7daaf382d3361ff received MsgPreVoteResp from c7daaf382d3361ff at term 1
+raft2026/11/21 02:33:11 INFO: c7daaf382d3361ff has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft2026/11/21 02:33:11 INFO: c7daaf382d3361ff became candidate at term 2
+raft2026/11/21 02:33:11 INFO: c7daaf382d3361ff received MsgVoteResp from c7daaf382d3361ff at term 2
+raft2026/11/21 02:33:11 INFO: c7daaf382d3361ff has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/11/21 02:33:11 INFO: c7daaf382d3361ff became leader at term 2
+2026/11/21 02:33:11 Found 0 WALs
+2026/11/21 02:33:11 Found 0 WALs
+raft2026/11/21 02:33:11 INFO: c7dab0382d3363b2 switched to configuration voters=(c7dab0382d3363b2)
+raft2026/11/21 02:33:11 INFO: c7dab0382d3363b2 became follower at term 1
+raft2026/11/21 02:33:11 INFO: newRaft c7dab0382d3363b2 [peers: [c7dab0382d3363b2], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+2026/11/21 02:33:11 WARN etcd raft engine: lease read disabled (non-positive LeaseDuration) tick_interval=10ms election_tick=10 lease_safety_margin=300ms computed_lease=0s
+raft2026/11/21 02:33:11 INFO: c7dab0382d3363b2 is starting a new election at term 1
+raft2026/11/21 02:33:11 INFO: c7dab0382d3363b2 became pre-candidate at term 1
+raft2026/11/21 02:33:11 INFO: c7dab0382d3363b2 received MsgPreVoteResp from c7dab0382d3363b2 at term 1
+raft2026/11/21 02:33:11 INFO: c7dab0382d3363b2 has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft2026/11/21 02:33:11 INFO: c7dab0382d3363b2 became candidate at term 2
+raft2026/11/21 02:33:11 INFO: c7dab0382d3363b2 received MsgVoteResp from c7dab0382d3363b2 at term 2
+raft2026/11/21 02:33:11 INFO: c7dab0382d3363b2 has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/11/21 02:33:11 INFO: c7dab0382d3363b2 became leader at term 2
+2026/11/21 02:33:11 Found 0 WALs
+2026/11/21 02:33:12 Found 0 WALs
+raft2026/11/21 02:33:12 INFO: 202faaa94bf6ebb0 switched to configuration voters=(202faaa94bf6ebb0)
+raft2026/11/21 02:33:12 INFO: 202faaa94bf6ebb0 became follower at term 1
+raft2026/11/21 02:33:12 INFO: newRaft 202faaa94bf6ebb0 [peers: [202faaa94bf6ebb0], term: 1, commit: 1, applied: 1, lastindex: 1, lastterm: 1]
+2026/11/21 02:33:12 WARN etcd raft engine: lease read disabled (non-positive LeaseDuration) tick_interval=10ms election_tick=10 lease_safety_margin=300ms computed_lease=0s
+raft2026/11/21 02:33:12 INFO: 202faaa94bf6ebb0 is starting a new election at term 1
+raft2026/11/21 02:33:12 INFO: 202faaa94bf6ebb0 became pre-candidate at term 1
+raft2026/11/21 02:33:12 INFO: 202faaa94bf6ebb0 received MsgPreVoteResp from 202faaa94bf6ebb0 at term 1
+raft2026/11/21 02:33:12 INFO: 202faaa94bf6ebb0 has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft2026/11/21 02:33:12 INFO: 202faaa94bf6ebb0 became candidate at term 2
+raft2026/11/21 02:33:12 INFO: 202faaa94bf6ebb0 received MsgVoteResp from 202faaa94bf6ebb0 at term 2
+raft2026/11/21 02:33:12 INFO: 202faaa94bf6ebb0 has received 1 MsgVoteResp votes and 0 vote rejections
+raft2026/11/21 02:33:12 INFO: 202faaa94bf6ebb0 became leader at term 2
+--- FAIL: TestJournalReceiptsSurviveProcessKill (1.09s)
+    operation_crash_test.go:207: 
+        	Error Trace:	/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/operation_crash_test.go:207
+        	Error:      	An error is expected but got nil.
+        	            	expected: *exec.ExitError
+        	Test:       	TestJournalReceiptsSurviveProcessKill
+        	Messages:   	2026/11/21 02:33:13 Found 0 WALs
+        	            	PASS
+2026/11/21 02:33:14 Found 1 WALs
+2026/11/21 02:33:14   - 000002: {(/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestJournalGenerationFenceSurvivesProcessKill988803257/001/pebble,000)}
+2026/11/21 02:33:14 [JOB 1] WAL 000002: {(/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestJournalGenerationFenceSurvivesProcessKill988803257/001/pebble,000)} stopped reading at offset: (/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestJournalGenerationFenceSurvivesProcessKill988803257/001/pebble/000002.log: 3667); replayed 14 keys in 5 batches
+2026/11/21 02:33:15 Found 1 WALs
+2026/11/21 02:33:15   - 000002: {(/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestJournalCommittedAttemptDecisionSurvivesProcessKill1781802022/001/pebble,000)}
+2026/11/21 02:33:15 [JOB 1] WAL 000002: {(/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestJournalCommittedAttemptDecisionSurvivesProcessKill1781802022/001/pebble,000)} stopped reading at offset: (/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestJournalCommittedAttemptDecisionSurvivesProcessKill1781802022/001/pebble/000002.log: 3761); replayed 16 keys in 5 batches
+FAIL
+FAIL	github.com/bootjp/elastickv/internal/filesystem	133.253s
+ok  	github.com/bootjp/elastickv/internal/filesystem/fstest	0.511s
+2026/11/21 02:35:36 WARN filesystem FUSE unmount of an abandoned mount failed, detaching lazily mount_point=/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestReleaseAfterReadinessSharesTheUnmountDeadline4150698055/001 err="context deadline exceeded"
+2026/11/21 02:35:37 WARN filesystem FUSE unmount of an abandoned mount has no time left, detaching lazily mount_point=/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestReleaseAfterReadinessBoundsTheLazyDetach360309384/002 timeout=100ms
+2026/11/21 02:35:38 WARN filesystem FUSE lazy detach of an abandoned mount failed mount_point=/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestReleaseAfterReadinessBoundsTheLazyDetach360309384/002 err="after fusermount3 -u -z /var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestReleaseAfterReadinessBoundsTheLazyDetach360309384/002: signal: killed: lazy unmount /var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestReleaseAfterReadinessBoundsTheLazyDetach360309384/002: lazy unmount is only implemented on Linux\n(1) attached stack trace\n  -- stack trace:\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.afterHelper\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/stale_mount.go:695\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.detachWithKernel\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/stale_mount.go:685\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.detachFUSEMount\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/stale_mount.go:599\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.releaseAbandonedBy\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/server.go:754\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.releaseAfterReadiness\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/server.go:886\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.TestReleaseAfterReadinessBoundsTheLazyDetach\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/release_deadline_test.go:57\n  | testing.tRunner\n  | \t/usr/local/go/src/testing/testing.go:2195\nWraps: (2) after fusermount3 -u -z /var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestReleaseAfterReadinessBoundsTheLazyDetach360309384/002: signal: killed\nWraps: (3) attached stack trace\n  -- stack trace:\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.detachWithKernel\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/stale_mount.go:685\n  | [...repeated from below...]\nWraps: (4) lazy unmount /var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestReleaseAfterReadinessBoundsTheLazyDetach360309384/002\nWraps: (5) attached stack trace\n  -- stack trace:\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.lazyUnmount\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/stale_mount_other.go:15\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.detachWithKernel\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/stale_mount.go:684\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.detachFUSEMount\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/stale_mount.go:599\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.releaseAbandonedBy\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/server.go:754\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.releaseAfterReadiness\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/server.go:886\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.TestReleaseAfterReadinessBoundsTheLazyDetach\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/release_deadline_test.go:57\n  | testing.tRunner\n  | \t/usr/local/go/src/testing/testing.go:2195\n  | runtime.goexit\n  | \t/usr/local/go/src/runtime/asm_arm64.s:1039\nWraps: (6) lazy unmount is only implemented on Linux\nError types: (1) *withstack.withStack (2) *errutil.withPrefix (3) *withstack.withStack (4) *errutil.withPrefix (5) *withstack.withStack (6) *errutil.leafError"
+2026/11/21 02:35:38 WARN filesystem FUSE unmount of an abandoned mount has no time left, detaching lazily mount_point=/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestReleaseAbandonedSkipsUnmountPastItsDeadline1811956594/001 timeout=1s
+2026/11/21 02:35:39 WARN filesystem FUSE lazy detach of an abandoned mount failed mount_point=/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestReleaseAbandonedSkipsUnmountPastItsDeadline1811956594/001 err="after fusermount3 -u -z /var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestReleaseAbandonedSkipsUnmountPastItsDeadline1811956594/001: signal: killed: lazy unmount /var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestReleaseAbandonedSkipsUnmountPastItsDeadline1811956594/001: lazy unmount is only implemented on Linux\n(1) attached stack trace\n  -- stack trace:\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.afterHelper\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/stale_mount.go:695\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.detachWithKernel\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/stale_mount.go:685\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.detachFUSEMount\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/stale_mount.go:599\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.releaseAbandonedBy\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/server.go:754\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.TestReleaseAbandonedSkipsUnmountPastItsDeadline\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/release_deadline_test.go:77\n  | testing.tRunner\n  | \t/usr/local/go/src/testing/testing.go:2195\nWraps: (2) after fusermount3 -u -z /var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestReleaseAbandonedSkipsUnmountPastItsDeadline1811956594/001: signal: killed\nWraps: (3) attached stack trace\n  -- stack trace:\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.detachWithKernel\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/stale_mount.go:685\n  | [...repeated from below...]\nWraps: (4) lazy unmount /var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestReleaseAbandonedSkipsUnmountPastItsDeadline1811956594/001\nWraps: (5) attached stack trace\n  -- stack trace:\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.lazyUnmount\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/stale_mount_other.go:15\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.detachWithKernel\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/stale_mount.go:684\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.detachFUSEMount\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/stale_mount.go:599\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.releaseAbandonedBy\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/server.go:754\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.TestReleaseAbandonedSkipsUnmountPastItsDeadline\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/release_deadline_test.go:77\n  | testing.tRunner\n  | \t/usr/local/go/src/testing/testing.go:2195\n  | runtime.goexit\n  | \t/usr/local/go/src/runtime/asm_arm64.s:1039\nWraps: (6) lazy unmount is only implemented on Linux\nError types: (1) *withstack.withStack (2) *errutil.withPrefix (3) *withstack.withStack (4) *errutil.withPrefix (5) *withstack.withStack (6) *errutil.leafError"
+--- FAIL: TestReleaseAbandonedSkipsUnmountPastItsDeadline (0.70s)
+    release_deadline_test.go:81: 
+        	Error Trace:	/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/release_deadline_test.go:81
+        	Error:      	unable to find file "/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestReleaseAbandonedSkipsUnmountPastItsDeadline1811956594/003/ran"
+        	Test:       	TestReleaseAbandonedSkipsUnmountPastItsDeadline
+        	Messages:   	the lazy detach must still run
+2026/11/21 02:35:39 WARN mount table unavailable, skipping stale FUSE mount check mount_point=/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestMountFailsWhenStartupRecoveryFails2115621749/001 err="open mount table /proc/self/mounts: open /proc/self/mounts: no such file or directory\n(1) attached stack trace\n  -- stack trace:\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.readMountTable\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/stale_mount.go:431\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.topmostMount\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/stale_mount.go:232\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.(*staleMountInspector).staleFUSEMount\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/stale_mount.go:276\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.(*staleMountInspector).detachAll\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/stale_mount.go:182\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.detachStaleMount\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/stale_mount.go:166\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.MountContext\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/server.go:617\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.Mount\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/server.go:597\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.TestMountFailsWhenStartupRecoveryFails\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/server_ops_test.go:806\n  | testing.tRunner\n  | \t/usr/local/go/src/testing/testing.go:2195\n  | runtime.goexit\n  | \t/usr/local/go/src/runtime/asm_arm64.s:1039\nWraps: (2) open mount table /proc/self/mounts\nWraps: (3) open /proc/self/mounts\nWraps: (4) no such file or directory\nError types: (1) *withstack.withStack (2) *fuseadapter.mountTableUnavailableError (3) *fs.PathError (4) syscall.Errno"
+2026/11/21 02:35:41 WARN filesystem FUSE unmount of an abandoned mount failed, detaching lazily mount_point=/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestReleaseAbandonedDetachesWhenUnmountHangs3706103629/001 err="context deadline exceeded"
+2026/11/21 02:35:41 WARN filesystem FUSE unmount of an abandoned mount failed, detaching lazily mount_point=/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestReleaseAbandonedFallsBackOnlyWhenUnmountFails3113283952/001 err="device or resource busy\n(1) attached stack trace\n  -- stack trace:\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.TestReleaseAbandonedFallsBackOnlyWhenUnmountFails.func2\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/stale_mount_test.go:807\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.releaseAbandonedBy\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/server.go:744\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.releaseAbandoned\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/server.go:726\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.TestReleaseAbandonedFallsBackOnlyWhenUnmountFails\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/stale_mount_test.go:807\n  | testing.tRunner\n  | \t/usr/local/go/src/testing/testing.go:2195\n  | runtime.goexit\n  | \t/usr/local/go/src/runtime/asm_arm64.s:1039\nWraps: (2) device or resource busy\nError types: (1) *withstack.withStack (2) *errutil.leafError"
+2026/11/21 02:35:42 WARN filesystem FUSE unmount of an abandoned mount failed, detaching lazily mount_point=/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestAbandonedReleaseReapsOrdinaryHelperBeforeDetach3923666676/002 err="ordinary FUSE unmount helper failed: locate mount helper umount: exec: \"/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestAbandonedReleaseReapsOrdinaryHelperBeforeDetach3923666676/001/umount\": stat /var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestAbandonedReleaseReapsOrdinaryHelperBeforeDetach3923666676/001/umount: no such file or directory\n(1) attached stack trace\n  -- stack trace:\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.unmountFUSEMount\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/unmount_context.go:62\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.TestAbandonedReleaseReapsOrdinaryHelperBeforeDetach.func1\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/unmount_context_test.go:47\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.releaseAbandonedBy\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/server.go:744\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.releaseAbandoned\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/server.go:726\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.TestAbandonedReleaseReapsOrdinaryHelperBeforeDetach\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/unmount_context_test.go:46\n  | [...repeated from below...]\nWraps: (2) ordinary FUSE unmount helper failed\nWraps: (3) attached stack trace\n  -- stack trace:\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.lookupMountHelperIn\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/stale_mount.go:545\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.snapshotMountHelperLookup.func1\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/stale_mount.go:493\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.lookupMountHelperContext.func1\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/stale_mount.go:518\n  | runtime.goexit\n  | \t/usr/local/go/src/runtime/asm_arm64.s:1039\nWraps: (4) locate mount helper umount\nWraps: (5) exec: \"/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestAbandonedReleaseReapsOrdinaryHelperBeforeDetach3923666676/001/umount\"\nWraps: (6) stat /var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestAbandonedReleaseReapsOrdinaryHelperBeforeDetach3923666676/001/umount\nWraps: (7) no such file or directory\nError types: (1) *withstack.withStack (2) *errutil.withPrefix (3) *withstack.withStack (4) *errutil.withPrefix (5) *exec.Error (6) *fs.PathError (7) syscall.Errno"
+2026/11/21 02:35:44 WARN filesystem FUSE lease refresh failed inode=7 fh=9 error="refresh journaled open handle lease: transaction outcome unknown"
+2026/11/21 02:35:44 WARN filesystem FUSE read lease refresh failed inode=7 fh=9 offset=0 size=1
+2026/11/21 02:35:44 WARN filesystem FUSE fsync blocked by prior unknown mutation inode=7 fh=9
+2026/11/21 02:35:44 WARN filesystem FUSE write failed inode=7 offset=0 length=2 error="transaction outcome unknown"
+2026/11/21 02:35:44 WARN filesystem FUSE write failed inode=7 offset=0 length=2 error="transaction outcome unknown"
+2026/11/21 02:35:44 WARN filesystem FUSE operation acknowledgement deferred sequence=1 error="verify operation before acknowledgement: filesystem: operation outcome pending"
+2026/11/21 02:35:44 WARN filesystem FUSE operation acknowledgement deferred sequence=1 error="verify operation before acknowledgement: filesystem: operation outcome pending"
+2026/11/21 02:35:44 WARN filesystem FUSE write failed inode=7 offset=0 length=5 error="storage unavailable"
+2026/11/21 02:35:44 WARN filesystem FUSE write failed inode=7 offset=0 length=1 error="transaction outcome unknown"
+2026/11/21 02:35:44 WARN filesystem FUSE fsync blocked by prior unknown mutation inode=7 fh=9
+2026/11/21 02:35:44 WARN filesystem FUSE write blocked by prior unknown mutation inode=7 offset=0
+2026/11/21 02:35:44 WARN filesystem FUSE write failed inode=7 offset=4 length=5 error="transaction outcome unknown\ncontext deadline exceeded"
+2026/11/21 02:35:44 WARN filesystem FUSE write blocked by prior unknown mutation inode=7 offset=4
+2026/11/21 02:35:44 WARN filesystem FUSE write failed inode=7 offset=4 length=5 error="storage unavailable"
+2026/11/21 02:35:44 WARN filesystem open handle lease refresh failed inode=7 fh=1 errno="operation timed out"
+2026/11/21 02:35:44 WARN filesystem FUSE lease refresh failed inode=7 fh=1 error=boom
+2026/11/21 02:35:44 WARN filesystem FUSE fsync failed inode=7 fh=9 error=boom
+2026/11/21 02:35:44 WARN filesystem FUSE lease refresh failed inode=7 fh=9 error="refresh journaled open handle lease: transaction outcome unknown"
+2026/11/21 02:35:44 WARN filesystem FUSE read lease refresh failed inode=7 fh=9 offset=0 size=1
+2026/11/21 02:35:44 WARN filesystem FUSE fsync blocked by prior unknown mutation inode=7 fh=9
+2026/11/21 02:35:44 WARN filesystem FUSE write failed inode=7 offset=0 length=5 error="transaction outcome unknown"
+2026/11/21 02:35:44 WARN filesystem FUSE fsync blocked by prior unknown mutation inode=7 fh=9
+2026/11/21 02:35:44 WARN filesystem strict session remains open after close error="close strict operation session: filesystem: operation outcome pending"
+2026/11/21 02:35:44 WARN detached stale filesystem FUSE mount left by a previous process mount_point=/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestDetachAllBoundsTheLoop292817268/001 fs_type=fuse.elastickv method=noop
+2026/11/21 02:35:44 WARN detached stale filesystem FUSE mount left by a previous process mount_point=/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestDetachAllBoundsTheLoop292817268/001 fs_type=fuse.elastickv method=noop
+2026/11/21 02:35:44 WARN detached stale filesystem FUSE mount left by a previous process mount_point=/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestDetachAllBoundsTheLoop292817268/001 fs_type=fuse.elastickv method=noop
+2026/11/21 02:35:44 WARN detached stale filesystem FUSE mount left by a previous process mount_point=/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestDetachAllBoundsTheLoop292817268/001 fs_type=fuse.elastickv method=noop
+2026/11/21 02:35:44 WARN detached stale filesystem FUSE mount left by a previous process mount_point=/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestDetachAllBoundsTheLoop292817268/001 fs_type=fuse.elastickv method=noop
+2026/11/21 02:35:44 WARN detached stale filesystem FUSE mount left by a previous process mount_point=/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestDetachAllBoundsTheLoop292817268/001 fs_type=fuse.elastickv method=noop
+2026/11/21 02:35:44 WARN detached stale filesystem FUSE mount left by a previous process mount_point=/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestDetachAllBoundsTheLoop292817268/001 fs_type=fuse.elastickv method=noop
+2026/11/21 02:35:44 WARN detached stale filesystem FUSE mount left by a previous process mount_point=/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestDetachAllBoundsTheLoop292817268/001 fs_type=fuse.elastickv method=noop
+2026/11/21 02:35:44 WARN mount table unavailable, skipping stale FUSE mount check mount_point=/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestDetachAllSkipsCheckWithoutMountTable3094863462/002 err="open mount table /var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestDetachAllSkipsCheckWithoutMountTable3094863462/001/missing: open /var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestDetachAllSkipsCheckWithoutMountTable3094863462/001/missing: no such file or directory\n(1) attached stack trace\n  -- stack trace:\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.readMountTable\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/stale_mount.go:431\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.topmostMount\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/stale_mount.go:232\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.(*staleMountInspector).staleFUSEMount\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/stale_mount.go:276\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.(*staleMountInspector).detachAll\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/stale_mount.go:182\n  | github.com/bootjp/elastickv/internal/filesystem/fuseadapter.TestDetachAllSkipsCheckWithoutMountTable\n  | \t/private/tmp/elastickv-load-ramp-20261121/internal/filesystem/fuseadapter/stale_mount_test.go:246\n  | testing.tRunner\n  | \t/usr/local/go/src/testing/testing.go:2195\n  | runtime.goexit\n  | \t/usr/local/go/src/runtime/asm_arm64.s:1039\nWraps: (2) open mount table /var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestDetachAllSkipsCheckWithoutMountTable3094863462/001/missing\nWraps: (3) open /var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestDetachAllSkipsCheckWithoutMountTable3094863462/001/missing\nWraps: (4) no such file or directory\nError types: (1) *withstack.withStack (2) *fuseadapter.mountTableUnavailableError (3) *fs.PathError (4) syscall.Errno"
+2026/11/21 02:35:44 WARN detached stale filesystem FUSE mount left by a previous process mount_point=/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestDetachAllDetachesUntilClean2766196873/001 fs_type=fuse.elastickv method=fake
+2026/11/21 02:35:44 WARN detached stale filesystem FUSE mount left by a previous process mount_point=/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestDetachAllDetachesUntilClean2766196873/001 fs_type=fuse.elastickv method=fake
+2026/11/21 02:35:44 WARN detached stale filesystem FUSE mount left by a previous process mount_point=/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestDetachAllClearsExactlyTheMaximum3779227346/001 fs_type=fuse.elastickv method=fake
+2026/11/21 02:35:44 WARN detached stale filesystem FUSE mount left by a previous process mount_point=/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestDetachAllClearsExactlyTheMaximum3779227346/001 fs_type=fuse.elastickv method=fake
+2026/11/21 02:35:44 WARN detached stale filesystem FUSE mount left by a previous process mount_point=/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestDetachAllClearsExactlyTheMaximum3779227346/001 fs_type=fuse.elastickv method=fake
+2026/11/21 02:35:44 WARN detached stale filesystem FUSE mount left by a previous process mount_point=/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestDetachAllClearsExactlyTheMaximum3779227346/001 fs_type=fuse.elastickv method=fake
+2026/11/21 02:35:44 WARN detached stale filesystem FUSE mount left by a previous process mount_point=/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestDetachAllClearsExactlyTheMaximum3779227346/001 fs_type=fuse.elastickv method=fake
+2026/11/21 02:35:44 WARN detached stale filesystem FUSE mount left by a previous process mount_point=/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestDetachAllClearsExactlyTheMaximum3779227346/001 fs_type=fuse.elastickv method=fake
+2026/11/21 02:35:44 WARN detached stale filesystem FUSE mount left by a previous process mount_point=/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestDetachAllClearsExactlyTheMaximum3779227346/001 fs_type=fuse.elastickv method=fake
+2026/11/21 02:35:44 WARN detached stale filesystem FUSE mount left by a previous process mount_point=/var/folders/qd/jp6_55yj2510km62wc71vpz40000gn/T/TestDetachAllClearsExactlyTheMaximum3779227346/001 fs_type=fuse.elastickv method=fake
+2026/11/21 02:35:44 WARN filesystem FUSE fsync receipt verification failed inode=7 fh=9 error="verify filesystem operation receipt: filesystem: operation outcome pending"
+2026/11/21 02:35:44 WARN filesystem FUSE release failed inode=7 fh=9 errno="no such file or directory"
+2026/11/21 02:35:44 WARN filesystem FUSE open failed inode=7 sequence=1 error="transaction outcome unknown"
+2026/11/21 02:35:44 WARN filesystem FUSE fsync blocked by prior unknown mutation inode=7 fh=9
+2026/11/21 02:35:44 WARN filesystem FUSE open failed inode=7 sequence=1 error="transaction outcome unknown"
+2026/11/21 02:35:44 WARN filesystem FUSE open blocked by prior unknown mutation inode=7
+2026/11/21 02:35:44 WARN filesystem FUSE operation acknowledgement deferred sequence=1 error="acknowledge operation after reply: context deadline exceeded"
+2026/11/21 02:35:44 WARN filesystem FUSE open blocked by prior unknown mutation inode=7
+2026/11/21 02:35:44 WARN filesystem FUSE lease refresh failed inode=7 fh=9 error="refresh journaled open handle lease: transaction outcome unknown"
+2026/11/21 02:35:44 WARN filesystem open handle lease refresh failed inode=7 fh=9 errno="input/output error"
+2026/11/21 02:35:44 WARN filesystem FUSE operation acknowledgement deferred sequence=1 error="filesystem: operation not supported"
+FAIL
+FAIL	github.com/bootjp/elastickv/internal/filesystem/fuseadapter	13.789s
+ok  	github.com/bootjp/elastickv/internal/fskeys	0.287s
+ok  	github.com/bootjp/elastickv/internal/fsmount	2.500s
+ok  	github.com/bootjp/elastickv/internal/leaderbalance	0.644s
+ok  	github.com/bootjp/elastickv/internal/loadtest	0.852s
+ok  	github.com/bootjp/elastickv/internal/memwatch	0.345s
+ok  	github.com/bootjp/elastickv/internal/monoclock	0.731s
+ok  	github.com/bootjp/elastickv/internal/nodeauth	0.882s
+ok  	github.com/bootjp/elastickv/internal/noderuntime	1.278s
+?   	github.com/bootjp/elastickv/internal/pathsafety	[no test files]
+ok  	github.com/bootjp/elastickv/internal/peersession	2.445s
+?   	github.com/bootjp/elastickv/internal/peersession/wire	[no test files]
+ok  	github.com/bootjp/elastickv/internal/raftadmin	0.678s
+ok  	github.com/bootjp/elastickv/internal/raftadmission	0.555s
+ok  	github.com/bootjp/elastickv/internal/raftbootstrap	20.610s
+ok  	github.com/bootjp/elastickv/internal/raftengine	0.454s
+ok  	github.com/bootjp/elastickv/internal/raftengine/etcd	592.219s
+ok  	github.com/bootjp/elastickv/internal/raftengine/etcd/transportsoak	1.558s
+ok  	github.com/bootjp/elastickv/internal/raftengine/raftenginetest	0.997s
+ok  	github.com/bootjp/elastickv/internal/runtimehealth	1.384s
+ok  	github.com/bootjp/elastickv/internal/s3keys	0.481s
+ok  	github.com/bootjp/elastickv/internal/server	594.224s
+ok  	github.com/bootjp/elastickv/internal/serverwiring	0.543s
+ok  	github.com/bootjp/elastickv/internal/snapshotoffload	19.124s
+ok  	github.com/bootjp/elastickv/internal/snapshotoffloadwiring	1.063s
+ok  	github.com/bootjp/elastickv/internal/testutil	0.748s
+ok  	github.com/bootjp/elastickv/internal/testutil/cmd/importguard	0.250s
+ok  	github.com/bootjp/elastickv/internal/testutil/grpctest	0.354s
+ok  	github.com/bootjp/elastickv/internal/tsowiring	0.434s
+ok  	github.com/bootjp/elastickv/keyviz	0.328s
+ok  	github.com/bootjp/elastickv/kv	49.346s
+ok  	github.com/bootjp/elastickv/kv/kvtest	0.589s
+ok  	github.com/bootjp/elastickv/monitoring	2.139s
+?   	github.com/bootjp/elastickv/proto	[no test files]
+ok  	github.com/bootjp/elastickv/proxy	2.614s
+ok  	github.com/bootjp/elastickv/store	141.310s
+ok  	github.com/bootjp/elastickv/store/storetest	0.558s
+FAIL

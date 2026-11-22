@@ -1,0 +1,28 @@
+File: diagnostic-current.test
+Build ID: f615123c1b8353138c703d1fe781fc2125b4faae
+Type: delay
+Time: 2026-11-22 18:54:51 JST
+Showing nodes accounting for 6783.90ms, 99.27% of 6833.79ms total
+Dropped 478 nodes (cum <= 34.17ms)
+Showing top 20 nodes out of 36
+      flat  flat%   sum%        cum   cum%
+ 6634.07ms 97.08% 97.08%  6634.59ms 97.09%  sync.(*RWMutex).Unlock
+  149.83ms  2.19% 99.27%   149.83ms  2.19%  runtime.unlock
+         0     0% 99.27%  6555.23ms 95.92%  github.com/bootjp/elastickv/internal/raftengine/etcd.(*Engine).applyAndDispatchReady
+         0     0% 99.27%  6555.18ms 95.92%  github.com/bootjp/elastickv/internal/raftengine/etcd.(*Engine).applyCommitted
+         0     0% 99.27%  6555.18ms 95.92%  github.com/bootjp/elastickv/internal/raftengine/etcd.(*Engine).applyNormalCommitted
+         0     0% 99.27%  6634.66ms 97.09%  github.com/bootjp/elastickv/internal/raftengine/etcd.(*Engine).drainReady
+         0     0% 99.27%    79.07ms  1.16%  github.com/bootjp/elastickv/internal/raftengine/etcd.(*Engine).refreshStatus
+         0     0% 99.27%  6634.82ms 97.09%  github.com/bootjp/elastickv/internal/raftengine/etcd.(*Engine).run
+         0     0% 99.27%  6633.77ms 97.07%  github.com/bootjp/elastickv/internal/raftengine/etcd.Open.gowrap2
+         0     0% 99.27%  6555.18ms 95.92%  github.com/bootjp/elastickv/internal/raftengine/etcd.executeNormalApply
+         0     0% 99.27%  6555.18ms 95.92%  github.com/bootjp/elastickv/internal/raftengine/etcd.normalApplyInput.applyCleartext
+         0     0% 99.27%  6555.18ms 95.92%  github.com/bootjp/elastickv/internal/raftengine/etcd.normalApplyInput.applyNormalEntry
+         0     0% 99.27%  6555.18ms 95.92%  github.com/bootjp/elastickv/kv.(*kvFSM).Apply
+         0     0% 99.27%  5529.87ms 80.92%  github.com/bootjp/elastickv/kv.(*kvFSM).applyBatchedRequests
+         0     0% 99.27%  6555.18ms 95.92%  github.com/bootjp/elastickv/kv.(*kvFSM).applyDecodedRequests
+         0     0% 99.27%  6555.18ms 95.92%  github.com/bootjp/elastickv/kv.(*kvFSM).applyRaftDataRequests
+         0     0% 99.27%  1025.31ms 15.00%  github.com/bootjp/elastickv/kv.(*kvFSM).applyRawMutations
+         0     0% 99.27%  1025.31ms 15.00%  github.com/bootjp/elastickv/kv.(*kvFSM).applyRequest
+         0     0% 99.27%  1025.31ms 15.00%  github.com/bootjp/elastickv/kv.(*kvFSM).applyRequestData
+         0     0% 99.27%  1025.31ms 15.00%  github.com/bootjp/elastickv/kv.(*kvFSM).applyRequestErr

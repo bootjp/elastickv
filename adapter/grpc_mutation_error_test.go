@@ -36,6 +36,8 @@ func TestProjectPublicGRPCMutationError(t *testing.T) {
 		{"unmarked status", status.Error(codes.Unavailable, "physical-key"), codes.Unknown, "Operation outcome unknown", publicGRPCUnknownReason},
 		{"route fence", errors.Wrap(kv.ErrRouteWriteFenced, "physical-key"), codes.Unknown, "Operation outcome unknown", publicGRPCUnknownReason},
 		{"lock without decision", kv.ErrTxnLocked, codes.Unknown, "Operation outcome unknown", publicGRPCUnknownReason},
+		{"conflict with hidden lost reply", errors.CombineErrors(store.ErrWriteConflict, io.EOF), codes.Unknown, "Operation outcome unknown", publicGRPCUnknownReason},
+		{"circuit with hidden lost reply", errors.CombineErrors(kv.ErrLeaderProxyCircuitOpen, io.EOF), codes.Unknown, "Operation outcome unknown", publicGRPCUnknownReason},
 		{"conflict joined with lost reply", errors.Join(store.ErrWriteConflict, io.EOF), codes.Unknown, "Operation outcome unknown", publicGRPCUnknownReason},
 		{"conflict joined with route fence", errors.Join(store.ErrWriteConflict, kv.ErrRouteWriteFenced), codes.Unknown, "Operation outcome unknown", publicGRPCUnknownReason},
 	} {
