@@ -195,6 +195,27 @@
         (is (false? (valid? bad-history)) (str path))))
     (is (false? (valid? (pop h))))))
 
+(deftest target-membership-rejects-route-unavailable-after-recovery
+  (let [history (target-membership-history)
+        valid? #(:valid? (checker/check (pf/membership-checker) {} % {}))
+        unavailable (fn [matches?]
+                      (mapv (fn [op]
+                              (if (matches? op)
+                                (assoc op :type :info :value [(first (:value op)) nil]
+                                       :error "rpc error: code = Unavailable desc = Route unavailable")
+                                op))
+                            history))]
+    (is (true? (valid? (unavailable #(#{:stale :new-while-stale} (:tag %)))))
+        "Both ingresses may report route unavailability while the old route is held")
+    (doseq [nodes [#{"n3"} #{"n4"} #{"n3" "n4"}]]
+      (is (false? (valid? (unavailable #(and (= :member-read (:tag %)) (nodes (:node %))))))
+          (str "Every post-recovery probe reports Route unavailable on " nodes)))
+    (doseq [node ["n3" "n4"]]
+      (is (false? (valid? (unavailable #(and (= :member-read (:tag %))
+                                            (= node (:node %))
+                                            (= [2 nil] (:value %))))))
+          (str "Route unavailable on " node " cannot satisfy the deleted key's read-back")))))
+
 (deftest target-membership-requires-evidence-of-the-selected-fault
   (let [base (target-membership-history)
         cert [7 :value :fault]
