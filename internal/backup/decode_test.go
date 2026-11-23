@@ -456,3 +456,18 @@ func TestDecodeSnapshot_ChunkBlobGCKeyspacesDropAsInternal(t *testing.T) {
 		t.Fatalf("Counters.Internal = %d, want 2", res.Counters.Internal)
 	}
 }
+
+func TestDecodeSnapshot_MigrationIntentDropsAsInternal(t *testing.T) {
+	t.Parallel()
+	b := newSnapBuilder(0)
+	b.WriteEntry(s3keys.MigrationIntentKey("bucket", 7, "object"), 1, []byte("intent"), false, 0, snapshotEncStateCleartx)
+	res, err := DecodeSnapshot(bytes.NewReader(b.Bytes()), DecodeOptions{
+		OutRoot: t.TempDir(), Adapters: AllAdapters(),
+	})
+	if err != nil {
+		t.Fatalf("DecodeSnapshot: %v", err)
+	}
+	if res.Counters.Unknown != 0 || res.Counters.Internal != 1 {
+		t.Fatalf("unexpected migration intent counters: %+v", res.Counters)
+	}
+}

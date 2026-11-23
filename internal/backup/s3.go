@@ -21,15 +21,16 @@ import (
 // internal/s3keys/keys.go so a renamed prefix surfaces at compile
 // time via the dispatch tests.
 const (
-	S3BucketMetaPrefix     = s3keys.BucketMetaPrefix
-	S3BucketGenPrefix      = s3keys.BucketGenerationPrefix
-	S3ObjectManifestPrefix = s3keys.ObjectManifestPrefix
-	S3UploadMetaPrefix     = s3keys.UploadMetaPrefix
-	S3UploadPartPrefix     = s3keys.UploadPartPrefix
-	S3BlobPrefix           = s3keys.BlobPrefix
-	S3ChunkRefPrefix       = s3keys.ChunkRefPrefix
-	S3ChunkBlobPrefix      = s3keys.ChunkBlobPrefix
-	S3GCUploadPrefix       = s3keys.GCUploadPrefix
+	S3BucketMetaPrefix      = s3keys.BucketMetaPrefix
+	S3BucketGenPrefix       = s3keys.BucketGenerationPrefix
+	S3ObjectManifestPrefix  = s3keys.ObjectManifestPrefix
+	S3MigrationIntentPrefix = s3keys.MigrationIntentPrefix
+	S3UploadMetaPrefix      = s3keys.UploadMetaPrefix
+	S3UploadPartPrefix      = s3keys.UploadPartPrefix
+	S3BlobPrefix            = s3keys.BlobPrefix
+	S3ChunkRefPrefix        = s3keys.ChunkRefPrefix
+	S3ChunkBlobPrefix       = s3keys.ChunkBlobPrefix
+	S3GCUploadPrefix        = s3keys.GCUploadPrefix
 	// Raft-replicated operational keyspaces for chunkblob GC. They appear
 	// in physical snapshots, so the decoder has to recognise them: an
 	// unrouted prefix counts as Unknown, which this package defines as the

@@ -377,6 +377,7 @@ func buildPrefixRoutes() []prefixRoute {
 		{[]byte(S3BucketMetaPrefix), routeS3BucketMeta},
 		{[]byte(S3BucketGenPrefix), routeS3BucketGen},
 		{[]byte(S3ObjectManifestPrefix), routeS3ObjectManifest},
+		{[]byte(S3MigrationIntentPrefix), routeInternalDrop},
 		{[]byte(S3UploadMetaPrefix), routeS3UploadMeta(S3UploadMetaPrefix)},
 		{[]byte(S3UploadPartPrefix), routeS3UploadMeta(S3UploadPartPrefix)},
 		{[]byte(S3BlobPrefix), routeS3Blob},

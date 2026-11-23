@@ -1624,6 +1624,7 @@ var routeMappedRawPrefixes = append([][]byte{
 	[]byte(s3keys.BucketMetaPrefix),
 	[]byte(s3keys.BucketGenerationPrefix),
 	[]byte(s3keys.ObjectManifestPrefix),
+	[]byte(s3keys.MigrationIntentPrefix),
 	[]byte(s3keys.UploadMetaPrefix),
 	[]byte(s3keys.UploadPartPrefix),
 	[]byte(s3keys.BlobPrefix),

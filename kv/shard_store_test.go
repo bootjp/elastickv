@@ -2409,6 +2409,54 @@ func TestShardStoreScanKeysAt_IncludesKeysAcrossShards(t *testing.T) {
 	require.Equal(t, [][]byte{[]byte("a"), []byte("x")}, keys)
 }
 
+func TestShardStoreScanKeysAt_AllS3ManifestsAcrossRoutes(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	boundary := s3keys.RouteKey("bucket-a", 1, "m")
+	engine.UpdateRoute(nil, boundary, 1)
+	engine.UpdateRoute(boundary, nil, 2)
+	st := NewShardStore(engine, map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	})
+	first := s3keys.ObjectManifestKey("bucket-a", 1, "alpha")
+	second := s3keys.ObjectManifestKey("bucket-a", 1, "zeta")
+	require.NoError(t, st.PutAt(ctx, first, []byte("first"), 1, 0))
+	require.NoError(t, st.PutAt(ctx, second, []byte("second"), 2, 0))
+	end := prefixScanEnd([]byte(s3keys.ObjectManifestPrefix))
+	page, err := st.ScanKeysAt(ctx, []byte(s3keys.ObjectManifestPrefix), end, 1, ^uint64(0))
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{first}, page)
+	page, err = st.ScanKeysAt(ctx, nextScanCursor(first), end, 1, ^uint64(0))
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{second}, page)
+}
+
+func TestShardStoreScanKeysAt_AllS3MigrationIntentsAcrossRoutes(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	boundary := s3keys.RouteKey("bucket-a", 1, "m")
+	engine.UpdateRoute(nil, boundary, 1)
+	engine.UpdateRoute(boundary, nil, 2)
+	st := NewShardStore(engine, map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	})
+	first := s3keys.MigrationIntentKey("bucket-a", 1, "alpha")
+	second := s3keys.MigrationIntentKey("bucket-a", 1, "zeta")
+	require.NoError(t, st.PutAt(ctx, first, []byte("first"), 1, 0))
+	require.NoError(t, st.PutAt(ctx, second, []byte("second"), 2, 0))
+	end := prefixScanEnd([]byte(s3keys.MigrationIntentPrefix))
+	page, err := st.ScanKeysAt(ctx, []byte(s3keys.MigrationIntentPrefix), end, 1, ^uint64(0))
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{first}, page)
+	page, err = st.ScanKeysAt(ctx, nextScanCursor(first), end, 1, ^uint64(0))
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{second}, page)
+}
+
 func TestShardStoreScanKeysAt_DeduplicatesUnclampedGroups(t *testing.T) {
 	t.Parallel()
 
