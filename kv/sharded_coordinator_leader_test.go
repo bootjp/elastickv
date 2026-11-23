@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/internal/testutil/grpctest"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -65,6 +66,33 @@ func TestShardedCoordinatorVerifyLeader_MissingGroup(t *testing.T) {
 
 	require.ErrorIs(t, coord.VerifyLeader(context.Background()), ErrLeaderNotFound)
 	require.ErrorIs(t, coord.VerifyLeaderForKey(context.Background(), []byte("k")), ErrLeaderNotFound)
+}
+
+func TestLeaseRefreshingTxnRejectsUnstampedRawWriteWhenLeaderFenceFails(t *testing.T) {
+	t.Parallel()
+
+	engine := newStubLeaderEngine()
+	engine.VerifyErr = raftengine.ErrLeadershipLost
+	inner := &recordingTransactional{
+		responses: []*TransactionResponse{{CommitIndex: 9}},
+	}
+	txn := &leaseRefreshingTxn{
+		inner: inner,
+		g:     &ShardGroup{Engine: engine},
+		coord: &ShardedCoordinator{},
+	}
+	request := &pb.Request{
+		Mutations: []*pb.Mutation{{
+			Op:    pb.Op_PUT,
+			Key:   []byte("raw"),
+			Value: []byte("new"),
+		}},
+	}
+
+	_, err := txn.commitAdmitted(t.Context(), []*pb.Request{request})
+	require.ErrorIs(t, err, raftengine.ErrLeadershipLost)
+	require.Empty(t, inner.requests, "an unstamped raw write must not reach Commit")
+	require.Zero(t, request.GetTs())
 }
 
 // TestShardedCoordinatorLeaseReadAllGroups_FencesEveryLeader asserts that

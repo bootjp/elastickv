@@ -404,8 +404,8 @@ func (t *leaseRefreshingTxn) stampRawTimestampsForLocalCommit(ctx context.Contex
 		if !isLeaderEngine(t.g.Engine) {
 			return nil
 		}
-		if !canStampRawTimestampsOnEngine(ctx, t.g.Engine) {
-			return nil
+		if err := verifyLeaderEngineCtx(ctx, t.g.Engine); err != nil {
+			return err
 		}
 	}
 	return t.coord.stampRawRequestTimestamps(ctx, reqs)
