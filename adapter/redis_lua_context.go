@@ -4,6 +4,7 @@ import (
 	"context"
 	"maps"
 	"math"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,7 +19,7 @@ import (
 type luaScriptContext struct {
 	server        *RedisServer
 	startTS       uint64
-	readTimestamp kv.ReadTimestamp
+	readTimestamp kv.TimedReadSnapshot
 	readPin       *kv.ActiveTimestampToken
 
 	// ctx is the request-scoped context captured at newLuaScriptContext
@@ -280,16 +281,7 @@ func newLuaScriptContext(ctx context.Context, server *RedisServer) (*luaScriptCo
 	if err := ctx.Err(); err != nil {
 		return nil, errors.WithStack(err)
 	}
-	// LeaseRead confirms leadership at most once per LeaseDuration window;
-	// inside the window it returns immediately without a Raft round-trip.
-	// All subsequent reads within the script use snapshotGetAt at startTS,
-	// so leadership is verified at most once per script and amortised across
-	// scripts via the lease.
-	expiryInstant, err := kv.LeaseReadTimeThrough(server.coordinator, ctx)
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-	readTimestamp, err := server.beginTxnReadTimestamp(ctx, "redis lua: begin read timestamp")
+	readTimestamp, err := kv.BeginTimedReadTimestamp(ctx, server.coordinator, server.store, "redis lua: begin read timestamp")
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -299,7 +291,7 @@ func newLuaScriptContext(ctx context.Context, server *RedisServer) (*luaScriptCo
 		startTS:           startTS,
 		readTimestamp:     readTimestamp,
 		readPin:           server.pinReadTS(startTS),
-		ctx:               context.WithValue(ctx, redisExpiryInstantKey{}, expiryInstant),
+		ctx:               context.WithValue(ctx, redisExpiryInstantKey{}, readTimestamp.Instant),
 		touched:           map[string]struct{}{},
 		readKeys:          map[string][]byte{},
 		deleted:           map[string]bool{},
@@ -3935,11 +3927,7 @@ type luaKeyPlan struct {
 }
 
 func (c *luaScriptContext) commit() error {
-	keys := make([]string, 0, len(c.touched))
-	for key := range c.touched {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
+	keys := slices.Sorted(maps.Keys(c.touched))
 
 	ctx, cancel := context.WithTimeout(c.scriptCtx(), redisLuaDispatchTimeout)
 	defer cancel()
@@ -3947,7 +3935,7 @@ func (c *luaScriptContext) commit() error {
 	// Pre-allocate a commitTS so Delta key bytes can embed it before dispatch.
 	commitTS, err := c.server.nextCommitTSAfter(ctx, luaCommitFloor(c.startTS), "luaScriptContext.commit: allocate commitTS")
 	if err != nil {
-		return errors.WithStack(err)
+		return c.luaExecutionError(err)
 	}
 
 	elems := make([]*kv.Elem[kv.OP], 0, len(keys)*redisPairWidth)
@@ -3955,7 +3943,7 @@ func (c *luaScriptContext) commit() error {
 	for _, key := range keys {
 		plan, err := c.commitPlanForKey(ctx, key, commitTS)
 		if err != nil {
-			return err
+			return c.luaExecutionError(err)
 		}
 		elems = append(elems, plan.elems...)
 		readKeys = appendUniqueLuaReadKeys(readKeys, readKeySet, plan.readKeys...)
@@ -3965,10 +3953,14 @@ func (c *luaScriptContext) commit() error {
 			updateExistingMeta := plan.preserveExisting && !plan.inlineMetaRewritten
 			ttlElems, err := c.nonStringTTLElems(ctx, key, plan.finalType, updateExistingMeta)
 			if err != nil {
-				return err
+				return c.luaExecutionError(err)
 			}
 			elems = append(elems, ttlElems...)
 		}
+	}
+
+	if err := c.readTimestamp.Validate(ctx); err != nil {
+		return errors.WithStack(err)
 	}
 
 	if len(elems) == 0 {

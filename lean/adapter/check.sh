@@ -17,7 +17,7 @@ cat lean/AdapterProtocols.lean > "$protocol"
 go run ./lean/adapter protocols >> "$protocol"
 cat lean/adapter/ProtocolRefinement.lean >> "$protocol"
 lean -DwarningAsError=true "$protocol"
-go test ./adapter -count=1 -run '^(TestRedisTTLRejectedBeforeMutation|TestLuaUsesOneExpiryInstant|TestLua_ReadSetCoversStringReads|TestLua_ReadOfUnwrittenKeyIsNotValidated|TestS3Server_AbortMultipartUpload|TestS3CommitUploadPartReadSet|TestS3CommitMultipartCompletionReadSet|TestS3CompleteMultipartUpload_RacingPartReuploadKeepsReferencedChunks|TestSQSServer_ChangeMessageVisibility)$'
+go test ./adapter -count=1 -run '^(TestRedisTTLRejectedBeforeMutation|TestLuaUsesOneExpiryInstant|TestLuaSnapshotBindsExpiryToVisibleWrites|TestLua_ReadSetCoversStringReads|TestLua_ReadOfUnwrittenKeyIsNotValidated|TestS3Server_AbortMultipartUpload|TestS3CommitUploadPartReadSet|TestS3CommitMultipartCompletionReadSet|TestS3CompleteMultipartUpload_RacingPartReuploadKeepsReferencedChunks|TestSQSServer_ChangeMessageVisibility)$'
 cat lean/AdapterProtocols.lean lean/adapter/ProtocolCases.lean > "$scratch/ProtocolCases.lean"
 lean -DwarningAsError=true --run "$scratch/ProtocolCases.lean" > "$scratch/protocol.json"
 ADAPTER_PROTOCOL_CASES="$scratch/protocol.json" go test ./adapter -count=1 -run '^TestAdapterProtocolTransitions$'

@@ -26,6 +26,17 @@ theorem script_relative_pttl (positive : 0 < ms) :
   have live : tick < tick + ms := by omega
   simp only [pttl, if_pos live]; omega
 
+-- Each group's applied position is monotone. Both collections enclose the
+-- leader clock sample. Equality is checked per group, including quieter groups
+-- whose watermark may be smaller than the global maximum.
+theorem stable_positions_at_expiry_sample {Group : Type}
+    (before sampled after : Group → Nat)
+    (encloses : ∀ g, before g ≤ sampled g ∧ sampled g ≤ after g)
+    (stable : before = after) : sampled = before := by
+  subst after
+  funext g
+  exact Nat.le_antisymm (encloses g).2 (encloses g).1
+
 -- Lua's VM chooses a trace. The read set here consists of the reads in
 -- that trace (the Go planner must also track type/absence and collection
 -- anchors). An uncaught execution error never reaches commit.

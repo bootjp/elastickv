@@ -2,9 +2,11 @@ package kv
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/testutil/grpctest"
@@ -174,4 +176,48 @@ func TestShardedCoordinatorLeaseReadAllGroups_EmptyGroups(t *testing.T) {
 	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{}, 1, NewHLC(), nil)
 
 	require.ErrorIs(t, coord.LeaseReadAllGroups(context.Background()), ErrLeaderNotFound)
+}
+
+type clockDuringRead struct {
+	*ShardedCoordinator
+	sample func() time.Time
+}
+
+func (c clockDuringRead) LeaseReadTime(context.Context) (time.Time, error) { return c.sample(), nil }
+
+func TestTimedSnapshotChecksEachDataGroup(t *testing.T) {
+	t.Parallel()
+	routes := distribution.NewEngine()
+	routes.UpdateRoute(nil, []byte("m"), 1)
+	routes.UpdateRoute([]byte("m"), nil, 2)
+	groups := map[uint64]*ShardGroup{}
+	for _, id := range []uint64{1, 2} {
+		st := store.NewMVCCStore()
+		require.NoError(t, st.PutAt(t.Context(), []byte("initial"), nil, 100/id, 0))
+		raft, stop := newSingleRaft(t, fmt.Sprintf("timed-%d", id), NewKvFSMWithHLC(st, NewHLC()))
+		t.Cleanup(stop)
+		groups[id] = &ShardGroup{Engine: raft, Store: st, Txn: NewLeaderProxyWithEngine(raft)}
+	}
+	st := NewShardStore(routes, groups)
+	leader := NewShardedCoordinator(routes, groups, 1, NewHLC(), st)
+	instant := time.UnixMilli(500)
+	coord := clockDuringRead{leader, func() time.Time {
+		require.NoError(t, groups[2].Store.PutAt(t.Context(), []byte("z"), []byte("new"), 51, 0))
+		return instant
+	}}
+	r := NewReadRequest(t.Context(), coord, st, nil)
+	defer r.Close()
+	_, err := BeginTimedReadTimestamp(r.Context(), coord, st, "script")
+	require.ErrorIs(t, err, store.ErrWriteConflict)
+	// No group changes in the next sample, whose maximum is still 100.
+	quiet := clockDuringRead{leader, func() time.Time { return instant }}
+	second := NewReadRequest(t.Context(), quiet, st, nil)
+	defer second.Close()
+	snap, err := BeginTimedReadTimestamp(second.Context(), quiet, st, "script")
+	require.NoError(t, err)
+	require.EqualValues(t, 100, snap.Timestamp())
+	require.Equal(t, instant, snap.Instant)
+	require.NoError(t, snap.Validate(second.Context()))
+	require.NoError(t, groups[2].Store.PutAt(t.Context(), []byte("z"), []byte("late"), 52, 0))
+	require.ErrorIs(t, snap.Validate(second.Context()), store.ErrWriteConflict)
 }

@@ -10,6 +10,7 @@ import (
 	"github.com/bootjp/elastickv/store"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/redcon"
 )
 
 // ────────────────────────────────────────────────────────────────
@@ -529,4 +530,57 @@ func TestLuaUsesOneExpiryInstant(t *testing.T) {
 		&kv.Elem[kv.OP]{Op: kv.Put, Key: redisTTLKey(key), Value: encodeRedisTTL(deadline)})
 	require.NotNil(t, leader.group)
 	require.Equal(t, expected, leader.group.Elems)
+}
+
+type luaSnapshotRaceCoordinator struct {
+	*luaExpiryTestCoordinator
+	duringClock func()
+	sampleAfter bool
+	samples     int
+}
+
+func (c *luaSnapshotRaceCoordinator) LeaseReadTime(ctx context.Context) (time.Time, error) {
+	c.samples++
+	instant := c.instant
+	if c.duringClock != nil {
+		c.duringClock()
+		c.duringClock = nil
+		if c.sampleAfter {
+			instant = c.instant
+		}
+	}
+	return instant, nil
+}
+
+func TestLuaSnapshotBindsExpiryToVisibleWrites(t *testing.T) {
+	for _, sampleFirst := range []bool{true, false} {
+		t.Run(map[bool]string{true: "new value after sample", false: "old value before sample"}[sampleFirst], func(t *testing.T) {
+			st := store.NewMVCCStore()
+			deadline := time.UnixMilli(500)
+			coord := &luaSnapshotRaceCoordinator{luaExpiryTestCoordinator: &luaExpiryTestCoordinator{localAdapterCoordinator: newLocalAdapterCoordinator(st), instant: deadline.Add(-time.Millisecond)}}
+			srv := NewRedisServer(nil, "", st, coord, nil, nil)
+			put := func(k, v string, ts uint64, expires *time.Time) {
+				require.NoError(t, st.PutAt(t.Context(), redisStrKey([]byte(k)), encodeRedisStr([]byte(v), expires), ts, 0))
+			}
+			put("a", "live", 10, &deadline)
+			put("b", "old", 11, nil)
+			coord.sampleAfter = !sampleFirst
+			coord.duringClock = func() {
+				if sampleFirst {
+					coord.instant = deadline.Add(time.Millisecond)
+					put("b", "new", 12, nil)
+				} else {
+					put("b", "new", 12, nil)
+					coord.instant = deadline.Add(time.Millisecond)
+				}
+			}
+			conn := &recordingConn{}
+			script := "return (redis.call('GET',KEYS[1]) or 'expired') .. '/' .. redis.call('GET',KEYS[2])"
+			srv.eval(conn, redcon.Command{Args: [][]byte{[]byte("EVAL"), []byte(script), []byte("2"), []byte("a"), []byte("b")}})
+			require.Empty(t, conn.err)
+			require.Equal(t, "expired/new", string(conn.bulk))
+			require.Equal(t, 2, coord.samples)
+			require.Nil(t, coord.group, "read-only script dispatched a mutation")
+		})
+	}
 }
