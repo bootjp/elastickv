@@ -4,7 +4,7 @@ WORKDIR /src
 COPY . .
 RUN CGO_ENABLED=0 go build -o /raftadmin ./cmd/raftadmin
 
-FROM python:3.12-slim-bookworm
+FROM python:3.15-slim-bookworm
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates openssl \
     && rm -rf /var/lib/apt/lists/*
 ADD --checksum=sha256:bb766f710eef8ede859c18578c72c327597cd4c8a85b06001b1f3843c6019386 https://github.com/cli/cli/releases/download/v2.102.0/gh_2.102.0_linux_amd64.tar.gz /tmp/gh.tar.gz
