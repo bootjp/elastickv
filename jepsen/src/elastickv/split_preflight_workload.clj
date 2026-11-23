@@ -385,6 +385,25 @@
     #(let [s (group-status group node)]
        (when (and (= "LEADER" (:state s)) (= node (:leader_id s))) s))))
 
+(defn- seed-ingress-readable? [node]
+  (let [result (run! (path "jepsen-grpc-client")
+                     "--address" (group-address 1 node) "--api" "raw"
+                     "--tls-ca-file" (path "cert.pem") "--timeout" "1s"
+                     :in (str (json/write-str {:op "read" :key "jepsen-grpc/raw/0"}) "\n"))]
+    (= "ok" (:type (json/read-str result :key-fn keyword)))))
+
+(defn- wait-seed-ingresses! [catalog target]
+  ;; A transfer is visible on the new leader before every ingress can
+  ;; forward to it. Wait on reads so each seed still gets one write attempt.
+  (let [leadership #(select-keys % [:leader_id :term])]
+    (poll! 25 "Seed ingresses did not converge after leadership transfers"
+      #(when (and (every? (fn [node]
+                           (and (= (leadership catalog) (leadership (group-status 1 node)))
+                                (= (leadership target) (leadership (group-status 2 node)))))
+                         nodes)
+                  (every? seed-ingress-readable? nodes))
+         nodes))))
+
 (defn- prepare-membership! []
   (let [leader (leader! 1)
         added (add-test-learner! 1 leader)
@@ -392,7 +411,8 @@
         status (transfer-test-leader! 1 (leader! 1) "n1")
         target (transfer-test-leader! 2 (leader! 2) "n3")]
     {:catalog-learner-index added :catalog-leader (:leader_id status)
-     :initial-target-leader (:leader_id target)}))
+     :initial-target-leader (:leader_id target)
+     :seed-ready-ingresses (wait-seed-ingresses! status target)}))
 
 (defn- fixture-ints [file expected]
   (let [f (io/file (path file))]
