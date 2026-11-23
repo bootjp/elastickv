@@ -112,6 +112,9 @@ theorem replay_witness (run : Linearization floor s cs last) :
 
 structure Delivery where
   group : String
+  sequence : Nat
+  receiveStart : Nat
+  deleteEnd : Option Nat
   sendStart : Nat
   sendEnd : Option Nat
   receivedAt : Nat
@@ -122,7 +125,14 @@ structure Delivery where
 -- completed before the earlier delivery's send was even invoked.
 def fifoOrdered (a b : Delivery) : Bool :=
   (a.receivedAt < b.receivedAt || (a.receivedAt == b.receivedAt && a.batchIndex < b.batchIndex)) &&
-    (a.group != b.group || b.sendEnd.all (a.sendStart ≤ ·))
+    (a.group != b.group || b.sendEnd.all (a.sendStart ≤ ·)) &&
+    (a.group != b.group || a.sequence != b.sequence || a.deleteEnd.all (b.receiveStart ≤ ·))
+
+-- Overlapping receive/delete calls can both observe the message.
+-- A receive invoked after the successful deletion cannot observe it again.
+private def firstDelivery : Delivery := ⟨"g", 1, 5, some 20, 1, some 2, 10, 0⟩
+example : fifoOrdered firstDelivery {firstDelivery with receiveStart := 19, receivedAt := 25, deleteEnd := none} = true := by decide
+example : fifoOrdered firstDelivery {firstDelivery with receiveStart := 21, receivedAt := 25, deleteEnd := none} = false := by decide
 
 structure Certificate where
   initial : List (String × List Int)

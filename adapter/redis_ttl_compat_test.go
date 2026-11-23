@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
@@ -489,9 +490,25 @@ func TestRedisTTLRejectedBeforeMutation(t *testing.T) {
 	}
 }
 
+type luaExpiryTestCoordinator struct {
+	*localAdapterCoordinator
+	instant time.Time
+	group   *kv.OperationGroup[kv.OP]
+}
+
+func (c *luaExpiryTestCoordinator) LeaseReadTime(context.Context) (time.Time, error) {
+	return c.instant, nil
+}
+
+func (c *luaExpiryTestCoordinator) Dispatch(ctx context.Context, req *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
+	c.group = req
+	return c.localAdapterCoordinator.Dispatch(ctx, req)
+}
+
 func TestLuaUsesOneExpiryInstant(t *testing.T) {
 	st := store.NewMVCCStore()
-	server := NewRedisServer(nil, "", st, newLocalAdapterCoordinator(st), nil, nil)
+	leader := &luaExpiryTestCoordinator{localAdapterCoordinator: newLocalAdapterCoordinator(st), instant: time.UnixMilli(123456789)}
+	server := NewRedisServer(nil, "", st, leader, nil, nil)
 	script, err := newLuaScriptContext(t.Context(), server)
 	require.NoError(t, err)
 	defer script.Close()
@@ -504,4 +521,12 @@ func TestLuaUsesOneExpiryInstant(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, first, last)
 	require.Equal(t, luaIntReply(10), first)
+	require.NoError(t, script.commit())
+	key := []byte("clock-key")
+	deadline := leader.instant.Add(10 * time.Millisecond)
+	expected := append(redisTxnWideCollectionFenceElems(key),
+		&kv.Elem[kv.OP]{Op: kv.Put, Key: redisStrKey(key), Value: encodeRedisStr([]byte("value"), &deadline)},
+		&kv.Elem[kv.OP]{Op: kv.Put, Key: redisTTLKey(key), Value: encodeRedisTTL(deadline)})
+	require.NotNil(t, leader.group)
+	require.Equal(t, expected, leader.group.Elems)
 }

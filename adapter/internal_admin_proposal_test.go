@@ -35,6 +35,7 @@ func TestInternalForwardLeaseReadUsesLeaderBarrier(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, uint64(23), resp.GetAppliedIndex())
 	require.Equal(t, uint64(37), resp.GetLastCommitTs())
+	require.Positive(t, resp.GetLeaderUnixMillis())
 
 	internal.leader = internalAdminLeaderView(raftengine.StateFollower, 0)
 	_, err = internal.ForwardLeaseRead(context.Background(), &pb.ForwardLeaseReadRequest{})

@@ -31,3 +31,10 @@
     (is (valid? lua))
     (is (false? (valid? (assoc-in (vec lua) [3 :value] 0))))
     (is (false? (valid? (drop-last 2 lua))))))
+
+(deftest fixture-names-fit-all-node-buckets
+  (let [workload #(protocol/workload {:fixture % :phase :seed :redis-ports [1 2 3]
+                                      :s3-ports [4 5 6] :sqs-ports [7 8 9]})]
+    (is (map? (workload (apply str (repeat 60 "a")))))
+    (doseq [id ["A" "" (apply str (repeat 61 "a"))]]
+      (is (thrown? clojure.lang.ExceptionInfo (workload id))))))

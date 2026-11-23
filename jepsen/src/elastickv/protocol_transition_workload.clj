@@ -168,7 +168,7 @@
                         (apply gen/any (map-indexed (fn [i op]
                           (gen/on-threads #{i} (gen/once {:f op}))) ops)))
         each (fn [f] (gen/each-thread (gen/once {:f f})))]
-    (when-not (and (#{:seed :recover} phase) (re-matches #"[a-zA-Z0-9-]{1,64}" (or fixture ""))
+    (when-not (and (#{:seed :recover} phase) (re-matches #"[a-z0-9-]{1,60}" (or fixture ""))
                    (every? #(= 3 (count %)) [redis-ports sqs-ports s3-ports]))
       (throw (ex-info "Expected a fixture, phase and three ports per adapter" {})))
     (merge tests/noop-test

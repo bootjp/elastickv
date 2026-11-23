@@ -11,7 +11,7 @@ def require(ok, message):
         raise ValueError(message)
 
 
-def paired(events):
+def paired(workload, events):
     pending = {}
     stops = []
     clients = []
@@ -54,7 +54,10 @@ def paired(events):
     require(kills == starts == nodes and healed is not None, "missing restart")
     finals = [(a, b) for a, b in clients if a.get("final")]
     require(all(a["index"] > healed for a, _ in finals), "early recovery read")
-    require({b.get("node") for _, b in finals if b["type"] == "ok"} == nodes,
+    observed = {b.get("node") for _, b in finals if b["type"] == "ok"
+                and (not workload.startswith("sqs-") or
+                     (b["f"] == "recv" and b.get("receive-performed?") is not False))}
+    require(observed == nodes,
             "missing recovery observation")
     return clients
 
@@ -91,8 +94,10 @@ def projection(workload, a, b):
         require(f == "recv", f)
         if fifo:
             obs = b.get("sqs-observation", {})
-            raw = [d["tuple"] for d in obs.get("deliveries", [])]
-            deleted = rv or []
+            batch = fifo_batch(obs, b)
+            raw = [d["tuple"] for d in batch]
+            deleted = [d["tuple"] for d in batch if d.get("delete", {}).get("type") == "ok"]
+            require(deleted == (rv or []), "FIFO delete acknowledgment mismatch")
         else:
             raw = rv or []
             deleted = b.get("deleted", [])
@@ -233,6 +238,17 @@ def queue(w, fifo):
     return []
 
 
+def fifo_batch(obs, response):
+    batch = obs.get("deliveries")
+    if obs.get("received-at") is None:
+        require(response["type"] != "ok" and batch is None and not response["value"],
+                "missing FIFO receive response")
+        return []
+    require(isinstance(batch, list), "missing FIFO raw batch")
+    require(0 <= obs["receive-start"] <= obs["received-at"], "invalid FIFO receive interval")
+    return batch
+
+
 def fifo_observations(pairs):
     sends = {}
     observed = []
@@ -243,20 +259,30 @@ def fifo_observations(pairs):
             clocks.add(obs["clock-id"])
         if a["f"] == "send" and "send-start" in obs and b["type"] != "fail":
             sends[tuple(b["value"])] = (obs["send-start"], obs.get("send-end"))
-        for raw in obs.get("deliveries", []):
-            observed.append((obs["received-at"], raw["delivery-index"], tuple(raw["tuple"])))
+        if a["f"] == "recv":
+            for i, raw in enumerate(fifo_batch(obs, b)):
+                require(raw["delivery-index"] == i, "invalid FIFO delivery index")
+                deletion = raw.get("delete", {})
+                end = None
+                if deletion.get("type") == "ok":
+                    require(deletion["delivery-index"] == i and deletion["receipt-hash"] == raw["receipt-hash"]
+                            and obs["received-at"] <= deletion["start"] <= deletion["end"],
+                            "invalid FIFO confirmed deletion")
+                    end = deletion["end"]
+                observed.append((obs["received-at"], i, tuple(raw["tuple"]), obs["receive-start"], end))
     require(len(clocks) == 1 and observed, "missing or inconsistent FIFO observation clock")
     result = []
-    for received, idx, identity in sorted(observed):
+    for received, idx, identity, receive_start, delete_end in sorted(observed, key=lambda row: row[:2]):
         start, end = sends[identity]
         require(start <= received, "delivery predates send")
-        result.append(dict(group=identity[0], sendStart=start, sendEnd=end,
+        result.append(dict(group=identity[0], sequence=identity[1], receiveStart=receive_start,
+                           deleteEnd=delete_end, sendStart=start, sendEnd=end,
                            receivedAt=received, batchIndex=idx))
     return result
 
 
 def make(workload, events):
-    pairs = paired(events)
+    pairs = paired(workload, events)
     calls, finals = [], []
     touched = set()
     recovered = defaultdict(set)

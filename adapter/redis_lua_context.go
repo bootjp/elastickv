@@ -285,7 +285,8 @@ func newLuaScriptContext(ctx context.Context, server *RedisServer) (*luaScriptCo
 	// All subsequent reads within the script use snapshotGetAt at startTS,
 	// so leadership is verified at most once per script and amortised across
 	// scripts via the lease.
-	if _, err := kv.LeaseReadThrough(server.coordinator, ctx); err != nil {
+	expiryInstant, err := kv.LeaseReadTimeThrough(server.coordinator, ctx)
+	if err != nil {
 		return nil, errors.WithStack(err)
 	}
 	readTimestamp, err := server.beginTxnReadTimestamp(ctx, "redis lua: begin read timestamp")
@@ -298,7 +299,7 @@ func newLuaScriptContext(ctx context.Context, server *RedisServer) (*luaScriptCo
 		startTS:           startTS,
 		readTimestamp:     readTimestamp,
 		readPin:           server.pinReadTS(startTS),
-		ctx:               context.WithValue(ctx, redisExpiryInstantKey{}, time.Now().Truncate(time.Millisecond)),
+		ctx:               context.WithValue(ctx, redisExpiryInstantKey{}, expiryInstant),
 		touched:           map[string]struct{}{},
 		readKeys:          map[string][]byte{},
 		deleted:           map[string]bool{},

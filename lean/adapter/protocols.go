@@ -10,7 +10,7 @@ import (
 )
 
 func protocolFunc(file, name string) *ast.FuncDecl {
-	f, err := parser.ParseFile(token.NewFileSet(), "adapter/"+file, nil, parser.SkipObjectResolution)
+	f, err := parser.ParseFile(token.NewFileSet(), "adapter/"+file, nil, 0)
 	if err != nil {
 		panic(err)
 	}
@@ -62,20 +62,85 @@ func guardSource(file, name string) string {
 	return protocolExpr(ret.Results[0])
 }
 
-// Read every field of the actual transaction literal, preserving element
-// order. The proof rejects extra dispatch plans or changed keys/values.
-func transactionSource(file, name string) string {
-	var groups []*ast.CompositeLit
-	ast.Inspect(protocolFunc(file, name).Body, func(n ast.Node) bool {
-		if lit, ok := n.(*ast.CompositeLit); ok && lit.Type != nil && source(lit.Type) == "kv.OperationGroup[kv.OP]" {
-			groups = append(groups, lit)
+// Trace the request at the unique dispatch site. A retry loop or callback
+// identifies one attempt; an extra inner loop would dispatch repeatedly.
+func transactionSource(file, name, dispatch, retry string) string {
+	return transactionFields(dispatchedGroup(protocolFunc(file, name), dispatch, retry), name)
+}
+
+func dispatchScope(stack []ast.Node) string {
+	var scopes []string
+	for i, node := range stack {
+		switch n := node.(type) {
+		case *ast.RangeStmt:
+			scopes = append(scopes, "range "+source(n.X))
+		case *ast.FuncLit:
+			call, ok := stack[i-1].(*ast.CallExpr)
+			if !ok {
+				panic("unexpected dispatch closure")
+			}
+			scopes = append(scopes, source(call.Fun))
+		case *ast.ForStmt, *ast.GoStmt, *ast.DeferStmt:
+			panic("unexpected repeated or asynchronous dispatch")
 		}
+	}
+	return strings.Join(scopes, "/")
+}
+
+func dispatchedGroup(fn *ast.FuncDecl, dispatch, retry string) *ast.CompositeLit {
+	request := dispatchArgument(fn, dispatch, retry)
+	if id, ok := request.(*ast.Ident); ok {
+		request = requestBinding(fn, id)
+	}
+	addr, ok := request.(*ast.UnaryExpr)
+	if !ok || addr.Op != token.AND {
+		panic("expected a dispatched request literal in " + fn.Name.Name)
+	}
+	group, ok := addr.X.(*ast.CompositeLit)
+	if !ok || source(group.Type) != "kv.OperationGroup[kv.OP]" {
+		panic("unexpected request type in " + fn.Name.Name)
+	}
+	return group
+}
+
+func dispatchArgument(fn *ast.FuncDecl, dispatch, retry string) ast.Expr {
+	var request ast.Expr
+	ast.PreorderStack(fn.Body, nil, func(node ast.Node, stack []ast.Node) bool {
+		sel, ok := node.(*ast.SelectorExpr)
+		if !ok || !isDispatchSelector(sel.Sel.Name) {
+			return true
+		}
+		call, direct := stack[len(stack)-1].(*ast.CallExpr)
+		if !direct || call.Fun != sel || source(sel) != dispatch || request != nil || dispatchScope(stack) != retry {
+			panic("unexpected dispatch in " + fn.Name.Name)
+		}
+		request = call.Args[len(call.Args)-1]
 		return true
 	})
-	if len(groups) != 1 {
-		panic("expected exactly one transaction literal in " + name)
+	return request
+}
+
+func isDispatchSelector(name string) bool {
+	return name != "WithDispatchVoucher" && strings.Contains(strings.ToLower(name), "dispatch")
+}
+
+func requestBinding(fn *ast.FuncDecl, id *ast.Ident) ast.Expr {
+	// Reject aliases, assignments and field mutations between construction
+	// and dispatch. The only supported uses are the declaration and argument.
+	if id.Obj == nil {
+		panic("unbound dispatch request")
 	}
-	return transactionFields(groups[0], name)
+	uses := 0
+	for node := range ast.Preorder(fn.Body) {
+		if ref, ok := node.(*ast.Ident); ok && ref.Obj == id.Obj {
+			uses++
+		}
+	}
+	decl, ok := id.Obj.Decl.(*ast.AssignStmt)
+	if !ok || uses != 2 || decl.Tok != token.DEFINE || len(decl.Lhs) != 1 || len(decl.Rhs) != 1 {
+		panic("expected one immutable dispatch request in " + fn.Name.Name)
+	}
+	return decl.Rhs[0]
 }
 
 func transactionFields(group *ast.CompositeLit, name string) string {
@@ -108,10 +173,10 @@ func protocolDefinitions() {
 	fmt.Println("namespace ProtocolGo")
 	fmt.Printf("def ttl (n unit : Int) : Prop := %s\n", guardSource("redis_strings.go", "validRedisTTL"))
 	fmt.Printf("def budget (start now seconds : Int) : Prop := %s\n", guardSource("sqs_messages.go", "visibilityExtensionFits"))
-	fmt.Printf("def luaFields : List String := %s\n", transactionSource("redis_lua_context.go", "commit"))
-	fmt.Printf("def beginFields : List String := %s\n", transactionSource("s3.go", "createMultipartUpload"))
-	fmt.Printf("def partFields : List String := %s\n", transactionSource("s3_upload_part.go", "commitS3UploadPart"))
-	fmt.Printf("def visibilityFields : List String := %s\n", transactionSource("sqs_messages.go", "changeVisibilityWithRetry"))
-	fmt.Printf("def abortFields : List String := %s\n", transactionSource("s3.go", "abortMultipartUpload"))
-	fmt.Printf("def multipartFields : List String := %s\n", transactionSource("s3_multipart_complete.go", "commitS3MultipartCompletionAttempt"))
+	fmt.Printf("def luaFields : List String := %s\n", transactionSource("redis_lua_context.go", "commit", "kv.DispatchWithReadTimestamp", ""))
+	fmt.Printf("def beginFields : List String := %s\n", transactionSource("s3.go", "createMultipartUpload", "s.dispatchS3MetadataMutation", ""))
+	fmt.Printf("def partFields : List String := %s\n", transactionSource("s3_upload_part.go", "commitS3UploadPart", "s.dispatchS3MetadataMutation", ""))
+	fmt.Printf("def visibilityFields : List String := %s\n", transactionSource("sqs_messages.go", "changeVisibilityWithRetry", "s.dispatchSQSMutation", "range transactRetryMaxAttempts"))
+	fmt.Printf("def abortFields : List String := %s\n", transactionSource("s3.go", "abortMultipartUpload", "s.dispatchS3MetadataMutation", "s.retryS3Mutation"))
+	fmt.Printf("def multipartFields : List String := %s\n", transactionSource("s3_multipart_complete.go", "commitS3MultipartCompletionAttempt", "s.dispatchS3MetadataMutation", ""))
 }

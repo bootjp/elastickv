@@ -1073,11 +1073,13 @@ func (*ForwardLeaseReadRequest) Descriptor() ([]byte, []int) {
 }
 
 type ForwardLeaseReadResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	AppliedIndex  uint64                 `protobuf:"varint,1,opt,name=applied_index,json=appliedIndex,proto3" json:"applied_index,omitempty"`
-	LastCommitTs  uint64                 `protobuf:"varint,2,opt,name=last_commit_ts,json=lastCommitTs,proto3" json:"last_commit_ts,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	AppliedIndex uint64                 `protobuf:"varint,1,opt,name=applied_index,json=appliedIndex,proto3" json:"applied_index,omitempty"`
+	LastCommitTs uint64                 `protobuf:"varint,2,opt,name=last_commit_ts,json=lastCommitTs,proto3" json:"last_commit_ts,omitempty"`
+	// Unix wall time sampled at the leader's read barrier, independent of the MVCC watermark.
+	LeaderUnixMillis int64 `protobuf:"varint,3,opt,name=leader_unix_millis,json=leaderUnixMillis,proto3" json:"leader_unix_millis,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *ForwardLeaseReadResponse) Reset() {
@@ -1120,6 +1122,13 @@ func (x *ForwardLeaseReadResponse) GetAppliedIndex() uint64 {
 func (x *ForwardLeaseReadResponse) GetLastCommitTs() uint64 {
 	if x != nil {
 		return x.LastCommitTs
+	}
+	return 0
+}
+
+func (x *ForwardLeaseReadResponse) GetLeaderUnixMillis() int64 {
+	if x != nil {
+		return x.LeaderUnixMillis
 	}
 	return 0
 }
@@ -3518,10 +3527,11 @@ const file_internal_proto_rawDesc = "" +
 	"forceEntry\"A\n" +
 	"\x1cForwardAdminProposalResponse\x12!\n" +
 	"\fcommit_index\x18\x01 \x01(\x04R\vcommitIndex\"\x19\n" +
-	"\x17ForwardLeaseReadRequest\"e\n" +
+	"\x17ForwardLeaseReadRequest\"\x93\x01\n" +
 	"\x18ForwardLeaseReadResponse\x12#\n" +
 	"\rapplied_index\x18\x01 \x01(\x04R\fappliedIndex\x12$\n" +
-	"\x0elast_commit_ts\x18\x02 \x01(\x04R\flastCommitTs\"\\\n" +
+	"\x0elast_commit_ts\x18\x02 \x01(\x04R\flastCommitTs\x12,\n" +
+	"\x12leader_unix_millis\x18\x03 \x01(\x03R\x10leaderUnixMillis\"\\\n" +
 	"\x1bPrepareEvidenceStateRequest\x12\x14\n" +
 	"\x05floor\x18\x01 \x01(\x04R\x05floor\x12'\n" +
 	"\x0fcapability_only\x18\x02 \x01(\bR\x0ecapabilityOnly\"\xb1\x02\n" +

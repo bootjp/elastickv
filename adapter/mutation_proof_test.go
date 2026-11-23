@@ -77,6 +77,8 @@ func TestAdapterMutationLeanConformance(t *testing.T) {
 					causes := c.Evidence.causes(uncertainty, route)
 					if len(causes) == 1 {
 						c.check(t, errors.Wrap(causes[0], "dispatch"), c.GRPCReason)
+					} else if len(causes) > 1 {
+						c.check(t, errors.Wrap(errors.Join(causes...), "dispatch"), c.GRPCMixedReason)
 					}
 					mixed := append([]error{errors.New("unclassified dispatch failure")}, causes...)
 					c.check(t, errors.Wrap(errors.Join(mixed...), "dispatch"), c.GRPCMixedReason)

@@ -17,6 +17,7 @@ import (
 
 type leaseReadForwardServer struct {
 	pb.UnimplementedInternalServer
+	clockMillis   atomic.Int64
 	calls         atomic.Int32
 	mu            sync.Mutex
 	authorization []string
@@ -31,7 +32,7 @@ func (s *leaseReadForwardServer) ForwardLeaseRead(
 	s.mu.Lock()
 	s.authorization = append([]string(nil), md.Get("authorization")...)
 	s.mu.Unlock()
-	return &pb.ForwardLeaseReadResponse{AppliedIndex: 44, LastCommitTs: 91}, nil
+	return &pb.ForwardLeaseReadResponse{AppliedIndex: 44, LastCommitTs: 91, LeaderUnixMillis: s.clockMillis.Load()}, nil
 }
 
 func TestShardedCoordinatorVerifyLeader_LeaderReturnsNil(t *testing.T) {
@@ -117,6 +118,13 @@ func TestShardedCoordinatorLeaseReadAllGroups_ForwardsFollowerToGroupLeader(t *t
 	service.mu.Lock()
 	require.Equal(t, []string{"Bearer admin-secret"}, service.authorization)
 	service.mu.Unlock()
+	_, err = LeaseReadTimeThrough(CoordinatorForwarder{Inner: coord}, t.Context())
+	require.ErrorContains(t, err, "missing leader wall time")
+	service.clockMillis.Store(123456789)
+	instant, err := LeaseReadTimeThrough(CoordinatorForwarder{Inner: coord}, t.Context())
+	require.NoError(t, err)
+	require.Equal(t, service.clockMillis.Load(), instant.UnixMilli())
+
 }
 
 func TestShardedCoordinatorLeaseReadAllGroups_UsesConfiguredAllShardGroups(t *testing.T) {

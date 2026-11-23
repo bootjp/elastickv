@@ -2,6 +2,7 @@ package kv
 
 import (
 	"context"
+	"time"
 
 	"github.com/bootjp/elastickv/keyviz"
 	pb "github.com/bootjp/elastickv/proto"
@@ -197,6 +198,10 @@ func (f CoordinatorForwarder) SupportsAppliedReadTimestampVoucher() bool {
 
 func (f CoordinatorForwarder) LeaseRead(ctx context.Context) (uint64, error) {
 	return LeaseReadThrough(f.Inner, ctx)
+}
+
+func (f CoordinatorForwarder) LeaseReadTime(ctx context.Context) (time.Time, error) {
+	return LeaseReadTimeThrough(f.Inner, ctx)
 }
 
 func (f CoordinatorForwarder) LeaseReadForKey(ctx context.Context, key []byte) (uint64, error) {

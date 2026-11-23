@@ -409,7 +409,8 @@ func (p *LeaderProxy) forwardLeaseReadOnce(parentCtx context.Context) (leaseRead
 	if err != nil {
 		return leaseReadResult{}, errors.WithStack(err)
 	}
-	return leaseReadResult{appliedIndex: resp.GetAppliedIndex(), lastCommitTS: resp.GetLastCommitTs()}, nil
+	return leaseReadResult{appliedIndex: resp.GetAppliedIndex(), lastCommitTS: resp.GetLastCommitTs(),
+		forwarded: true, leaderUnixMillis: resp.GetLeaderUnixMillis()}, nil
 }
 
 func (p *LeaderProxy) recordForwardFailure(callerCtx context.Context, identity leaderProxyIdentity, requestID uint64, err error) error {
