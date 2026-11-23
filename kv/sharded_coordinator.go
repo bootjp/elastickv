@@ -2838,6 +2838,26 @@ func (c *ShardedCoordinator) LeaseRead(ctx context.Context) (uint64, error) {
 	return groupLeaseRead(ctx, g, c.leaseObserver)
 }
 
+// LeaseReadTime returns the default leader's wall clock at the same lease
+// barrier as LeaseRead. An older remote peer can still fence normal reads.
+func (c *ShardedCoordinator) LeaseReadTime(ctx context.Context) (time.Time, error) {
+	g := c.groups[c.defaultGroup]
+	if g == nil {
+		return time.Time{}, errors.WithStack(ErrLeaderNotFound)
+	}
+	result, err := groupLeaseReadResult(ctx, g, c.leaseObserver)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if !result.forwarded {
+		return localLeaseTime(c)
+	}
+	if result.leaderUnixMillis <= 0 {
+		return time.Time{}, errors.New("lease read response missing leader wall time")
+	}
+	return time.UnixMilli(result.leaderUnixMillis), nil
+}
+
 // LeaseReadForKey performs the lease check on the shard group that owns key.
 // Each group maintains its own lease since each group has independent
 // leadership and term.
@@ -2948,8 +2968,10 @@ func shouldForwardGroupLeaseRead(g *ShardGroup, engine raftengine.Engine) bool {
 }
 
 type leaseReadResult struct {
-	appliedIndex uint64
-	lastCommitTS uint64
+	forwarded        bool
+	leaderUnixMillis int64
+	appliedIndex     uint64
+	lastCommitTS     uint64
 }
 
 func localLeaseReadResult(g *ShardGroup, appliedIndex uint64) leaseReadResult {

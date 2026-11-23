@@ -3,6 +3,7 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -83,6 +84,7 @@ func TestS3CommitUploadPartReadSet(t *testing.T) {
 			}
 			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 			req := h.coord.lastTxnWriting(t, u.partKey)
+			requireOffloadedPartWrite(t, req, u, "latest")
 			for _, key := range [][]byte{u.uploadMetaKey, s3keys.BucketGenerationKey(u.bucket), u.partKey} {
 				assert.Contains(t, req.ReadKeys, key)
 			}
@@ -93,6 +95,33 @@ func TestS3CommitUploadPartReadSet(t *testing.T) {
 			}
 		})
 	}
+}
+
+// This harness sends one offloaded chunk. Inspect the concrete reference,
+// descriptor, and reference-count writes after dispatch accounting.
+func requireOffloadedPartWrite(t *testing.T, req *kv.OperationGroup[kv.OP], u s3OCCReproUpload, body string) {
+	t.Helper()
+	require.Len(t, req.Elems, 3)
+	ref, descriptor, count := req.Elems[0], req.Elems[1], req.Elems[2]
+	require.Equal(t, kv.Put, descriptor.Op)
+	require.Equal(t, u.partKey, descriptor.Key)
+	part := decodeS3PartDescriptorOrNil(descriptor.Value)
+	require.NotNil(t, part)
+	require.True(t, part.Offloaded)
+	require.EqualValues(t, 1, part.PartNo)
+	require.Equal(t, req.CommitTS, part.PartVersion)
+	require.Equal(t, md5Hex(body), part.ETag)
+	require.EqualValues(t, len(body), part.SizeBytes)
+	digest := sha256.Sum256([]byte(body))
+	require.Equal(t, kv.Put, ref.Op)
+	require.Equal(t, s3keys.VersionedChunkRefKey(u.bucket, u.generation, s3OCCReproObject, u.uploadID, 1, 0, part.ChunkRefVersion), ref.Key)
+	value, ok := s3keys.DecodeChunkRefValue(ref.Value)
+	require.True(t, ok)
+	require.Equal(t, digest, value.ContentSHA256)
+	require.EqualValues(t, len(body), value.Size)
+	require.Equal(t, kv.Put, count.Op)
+	require.Equal(t, s3keys.ChunkRefRCKey(digest), count.Key)
+	require.Equal(t, s3keys.EncodeChunkRefRC(s3keys.ChunkRefRC{Count: 1}), count.Value)
 }
 
 func TestS3UploadPart_ReadSetUsesStartTSAfterConcurrentSamePartWrite(t *testing.T) {

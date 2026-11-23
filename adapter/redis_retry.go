@@ -40,14 +40,14 @@ var (
 )
 
 func isRetryableRedisTxnErr(err error) bool {
-	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) || isRedisTransportUncertain(err) {
+	if isRedisIndeterminate(err) {
 		return false
 	}
 	return isReusableRedisTxnErr(err) || isRedisComposedRouteErr(err)
 }
 
 func isReusableRedisTxnErr(err error) bool {
-	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) || isRedisTransportUncertain(err) {
+	if isRedisIndeterminate(err) {
 		return false
 	}
 	return errors.Is(err, store.ErrWriteConflict) ||
@@ -63,7 +63,7 @@ func shouldPreserveRedisTxnAttempt(err error) bool {
 }
 
 func isRedisComposedRouteErr(err error) bool {
-	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) || isRedisTransportUncertain(err) {
+	if isRedisIndeterminate(err) {
 		return false
 	}
 	if errors.Is(err, kv.ErrComposed1Violation) ||
@@ -141,7 +141,7 @@ func normalizeRetryableRedisTxnErr(err error) error {
 	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
 		return err
 	}
-	if isRedisTransportUncertain(err) {
+	if isIndeterminateMutationDispatchFailure(err) {
 		return errors.WithStack(kv.ErrTransactionOutcomeUnknown)
 	}
 	if errors.Is(err, kv.ErrTxnLocked) {

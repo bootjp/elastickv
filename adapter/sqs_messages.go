@@ -107,6 +107,7 @@ type sqsMessageRecord struct {
 	VisibleAtMillis        int64                               `json:"visible_at_millis"`
 	ReceiveCount           int64                               `json:"receive_count"`
 	FirstReceiveMillis     int64                               `json:"first_receive_millis,omitempty"`
+	ReceiptStartMillis     int64                               `json:"receipt_start_millis,omitempty"`
 	CurrentReceiptToken    []byte                              `json:"current_receipt_token"`
 	QueueGeneration        uint64                              `json:"queue_generation"`
 	MessageGroupId         string                              `json:"message_group_id,omitempty"`
@@ -804,6 +805,7 @@ func buildSendRecordWithIdentity(meta *sqsQueueMeta, in sqsSendMessageInput, id 
 
 //nolint:cyclop // AWS ReceiveMessage branches on per-message eligibility; splitting further just moves the branching around.
 func (s *SQSServer) receiveMessage(w http.ResponseWriter, r *http.Request) {
+	started := time.Now().UnixMilli()
 	var in sqsReceiveMessageInput
 	if err := decodeSQSJSONInput(r, &in); err != nil {
 		writeSQSErrorFromErr(w, err)
@@ -862,6 +864,7 @@ func (s *SQSServer) receiveMessage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	opts := sqsReceiveOptions{
+		RequestStartMillis:    started,
 		Max:                   max,
 		VisibilityTimeout:     visibilityTimeout,
 		WaitSeconds:           waitSeconds,
@@ -889,6 +892,7 @@ func (s *SQSServer) loadReceiveQueueMeta(ctx context.Context, queueName string) 
 }
 
 func (s *SQSServer) receiveMessageCore(ctx context.Context, queueName string, in sqsReceiveMessageInput) ([]map[string]any, error) {
+	started := time.Now().UnixMilli()
 	throttleEpoch := s.throttle.queueEpoch(queueName)
 	meta, exists, err := s.loadReceiveQueueMeta(ctx, queueName)
 	if err != nil {
@@ -916,6 +920,7 @@ func (s *SQSServer) receiveMessageCore(ctx context.Context, queueName string, in
 		return nil, waitErr
 	}
 	return s.longPollReceive(ctx, queueName, sqsReceiveOptions{
+		RequestStartMillis:    started,
 		Max:                   max,
 		VisibilityTimeout:     visibilityTimeout,
 		WaitSeconds:           waitSeconds,
@@ -929,6 +934,7 @@ func (s *SQSServer) receiveMessageCore(ctx context.Context, queueName string, in
 // tryDeliverCandidate → commitReceiveRotation gets unwieldy fast,
 // especially as new optional fields like MessageAttributeNames land.
 type sqsReceiveOptions struct {
+	RequestStartMillis    int64
 	Max                   int
 	VisibilityTimeout     int64
 	WaitSeconds           int64
@@ -1064,12 +1070,9 @@ func (s *SQSServer) scanAndDeliverOnce(ctx context.Context, queueName string, op
 			return delivered, nil
 		}
 		partition := (startOffset + i) % partitions
-		fresh, err := s.scanAndDeliverPartition(ctx, queueName, meta, partition, readTS, deadline, pageSize, sqsReceiveOptions{
-			Max:                   opts.Max - len(delivered),
-			VisibilityTimeout:     opts.VisibilityTimeout,
-			WaitSeconds:           opts.WaitSeconds,
-			MessageAttributeNames: opts.MessageAttributeNames,
-		})
+		batch := opts
+		batch.Max -= len(delivered)
+		fresh, err := s.scanAndDeliverPartition(ctx, queueName, meta, partition, readTS, deadline, pageSize, batch)
 		if err != nil {
 			return delivered, err
 		}
@@ -1139,12 +1142,9 @@ func (s *SQSServer) scanAndDeliverPartition(ctx context.Context, queueName strin
 		if len(page) == 0 {
 			return delivered, nil
 		}
-		fresh, err := s.rotateMessagesForDelivery(ctx, queueName, meta, page, readTS, sqsReceiveOptions{
-			Max:                   opts.Max - len(delivered),
-			VisibilityTimeout:     opts.VisibilityTimeout,
-			WaitSeconds:           opts.WaitSeconds,
-			MessageAttributeNames: opts.MessageAttributeNames,
-		}, &fifoState)
+		batch := opts
+		batch.Max -= len(delivered)
+		fresh, err := s.rotateMessagesForDelivery(ctx, queueName, meta, page, readTS, batch, &fifoState)
 		if err != nil {
 			return delivered, err
 		}
@@ -1484,13 +1484,7 @@ func (s *SQSServer) commitReceiveRotation(ctx context.Context, queueName string,
 		return nil, false, err
 	}
 	now := time.Now().UnixMilli()
-	newVisibleAt := now + opts.VisibilityTimeout*sqsMillisPerSecond
-	rec.VisibleAtMillis = newVisibleAt
-	rec.CurrentReceiptToken = newToken
-	rec.ReceiveCount++
-	if rec.FirstReceiveMillis == 0 {
-		rec.FirstReceiveMillis = now
-	}
+	newVisibleAt := rec.rotateReceipt(opts, newToken, now)
 	recordBytes, err := encodeSQSMessageRecord(rec)
 	if err != nil {
 		return nil, false, err
@@ -1533,6 +1527,22 @@ func (s *SQSServer) commitReceiveRotation(ctx context.Context, queueName string,
 		resp["MD5OfMessageAttributes"] = md5OfAttributesHex(filtered)
 	}
 	return resp, false, nil
+}
+
+func (rec *sqsMessageRecord) rotateReceipt(opts sqsReceiveOptions, newToken []byte, now int64) int64 {
+	start := opts.RequestStartMillis
+	if start == 0 {
+		start = now
+	}
+	newVisibleAt := min(now+opts.VisibilityTimeout*sqsMillisPerSecond, start+sqsChangeVisibilityMaxSeconds*sqsMillisPerSecond)
+	rec.VisibleAtMillis = newVisibleAt
+	rec.ReceiptStartMillis = start
+	rec.CurrentReceiptToken = newToken
+	rec.ReceiveCount++
+	if rec.FirstReceiveMillis == 0 {
+		rec.FirstReceiveMillis = now
+	}
+	return newVisibleAt
 }
 
 // buildReceiveRotationOps assembles the OCC OperationGroup for a
@@ -1842,6 +1852,27 @@ func (s *SQSServer) changeMessageVisibilityCore(ctx context.Context, queueName s
 	return s.changeVisibilityWithRetry(ctx, queueName, handle, timeout)
 }
 
+// visibilityExtensionFits measures twelve hours from the receive that issued
+// this receipt. Releasing it immediately remains possible at any age.
+func visibilityExtensionFits(start, now, seconds int64) bool {
+	return seconds == 0 || (start > 0 && seconds > 0 && seconds <= sqsChangeVisibilityMaxSeconds &&
+		now-start <= (sqsChangeVisibilityMaxSeconds-seconds)*sqsMillisPerSecond)
+}
+
+func (rec *sqsMessageRecord) changedVisibilityDeadline(now, seconds int64) (int64, error) {
+	if rec.VisibleAtMillis <= now {
+		return 0, newSQSAPIError(http.StatusBadRequest, sqsErrMessageNotInflight, "message is not currently in flight")
+	}
+	// An older row lacks the start of this receipt. Honor its existing
+	// grant and allow shortening; redelivery supplies a fresh start.
+	next := now + seconds*sqsMillisPerSecond
+	legacyShorten := rec.ReceiptStartMillis == 0 && next <= rec.VisibleAtMillis
+	if !legacyShorten && !visibilityExtensionFits(rec.ReceiptStartMillis, now, seconds) {
+		return 0, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue, "visibility timeout exceeds the remaining receipt lifetime")
+	}
+	return next, nil
+}
+
 // changeVisibilityWithRetry runs the validate-and-swap flow under an OCC
 // retry budget. ReadKeys cover the data record and the current vis
 // entry; a concurrent receive or delete will bump their commitTS past
@@ -1856,11 +1887,12 @@ func (s *SQSServer) changeVisibilityWithRetry(ctx context.Context, queueName str
 		}
 		readTS := readTimestamp.Timestamp()
 		now := time.Now().UnixMilli()
-		if rec.VisibleAtMillis <= now {
-			return newSQSAPIError(http.StatusBadRequest, sqsErrMessageNotInflight, "message is not currently in flight")
+		next, err := rec.changedVisibilityDeadline(now, newTimeout)
+		if err != nil {
+			return err
 		}
 		oldVisKey := sqsMsgVisKeyDispatch(meta, queueName, handle.Partition, handle.QueueGeneration, rec.VisibleAtMillis, rec.MessageID)
-		rec.VisibleAtMillis = now + newTimeout*sqsMillisPerSecond
+		rec.VisibleAtMillis = next
 		recordBytes, err := encodeSQSMessageRecord(rec)
 		if err != nil {
 			return errors.WithStack(err)

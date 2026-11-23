@@ -234,6 +234,8 @@
                                     :encryption (:encryption opts)
                                     :sqs-region "us-east-1"}
                              db-port (assoc db-port port)
+                             (:s3-offload opts) (assoc :s3-offload true
+                                                       :server-env {"ELASTICKV_S3_BLOB_OFFLOAD" "true"})
                              mount-dir (assoc :filesystem-mount mount-dir)))
           workload (workload (assoc opts :key-count key-count :sqs-region "us-east-1"
                                          :node->port (zipmap nodes (repeat client-port))
@@ -289,6 +291,7 @@
   (into (into cli/common-cli-opts redis/redis-cli-opts)
         [[nil "--adapter NAME" "Data adapter: redis, dynamodb, s3, grpc-raw, grpc-transactional, filesystem-overwrite, filesystem-rename, sqs-standard, sqs-htfifo."
           :default :redis :parse-fn keyword]
+         [nil "--s3-offload" "Exercise offloaded chunks using the hosted runner token files."]
          [nil "--drain-time SECONDS" "SQS receive/delete-only recovery phase."
           :default 40 :parse-fn #(Integer/parseInt %)]
          [nil "--repeat-faults" "Repeat fault cycles throughout the main phase."

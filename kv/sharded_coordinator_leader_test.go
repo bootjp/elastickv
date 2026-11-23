@@ -2,9 +2,11 @@ package kv
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/testutil/grpctest"
@@ -17,6 +19,7 @@ import (
 
 type leaseReadForwardServer struct {
 	pb.UnimplementedInternalServer
+	clockMillis   atomic.Int64
 	calls         atomic.Int32
 	mu            sync.Mutex
 	authorization []string
@@ -31,7 +34,7 @@ func (s *leaseReadForwardServer) ForwardLeaseRead(
 	s.mu.Lock()
 	s.authorization = append([]string(nil), md.Get("authorization")...)
 	s.mu.Unlock()
-	return &pb.ForwardLeaseReadResponse{AppliedIndex: 44, LastCommitTs: 91}, nil
+	return &pb.ForwardLeaseReadResponse{AppliedIndex: 44, LastCommitTs: 91, LeaderUnixMillis: s.clockMillis.Load()}, nil
 }
 
 func TestShardedCoordinatorVerifyLeader_LeaderReturnsNil(t *testing.T) {
@@ -117,6 +120,13 @@ func TestShardedCoordinatorLeaseReadAllGroups_ForwardsFollowerToGroupLeader(t *t
 	service.mu.Lock()
 	require.Equal(t, []string{"Bearer admin-secret"}, service.authorization)
 	service.mu.Unlock()
+	_, err = LeaseReadTimeThrough(CoordinatorForwarder{Inner: coord}, t.Context())
+	require.ErrorContains(t, err, "missing leader wall time")
+	service.clockMillis.Store(123456789)
+	instant, err := LeaseReadTimeThrough(CoordinatorForwarder{Inner: coord}, t.Context())
+	require.NoError(t, err)
+	require.Equal(t, service.clockMillis.Load(), instant.UnixMilli())
+
 }
 
 func TestShardedCoordinatorLeaseReadAllGroups_UsesConfiguredAllShardGroups(t *testing.T) {
@@ -166,4 +176,150 @@ func TestShardedCoordinatorLeaseReadAllGroups_EmptyGroups(t *testing.T) {
 	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{}, 1, NewHLC(), nil)
 
 	require.ErrorIs(t, coord.LeaseReadAllGroups(context.Background()), ErrLeaderNotFound)
+}
+
+type clockDuringRead struct {
+	*ShardedCoordinator
+	sample func() time.Time
+}
+
+func (c clockDuringRead) LeaseReadTime(context.Context) (time.Time, error) { return c.sample(), nil }
+
+func TestTimedSnapshotChecksEachDataGroup(t *testing.T) {
+	t.Parallel()
+	routes := distribution.NewEngine()
+	routes.UpdateRoute(nil, []byte("m"), 1)
+	routes.UpdateRoute([]byte("m"), nil, 2)
+	groups := map[uint64]*ShardGroup{}
+	for _, id := range []uint64{1, 2} {
+		st := store.NewMVCCStore()
+		require.NoError(t, st.PutAt(t.Context(), []byte("initial"), nil, 100/id, 0))
+		raft, stop := newSingleRaft(t, fmt.Sprintf("timed-%d", id), NewKvFSMWithHLC(st, NewHLC()))
+		t.Cleanup(stop)
+		groups[id] = &ShardGroup{Engine: raft, Store: st, Txn: NewLeaderProxyWithEngine(raft)}
+	}
+	st := NewShardStore(routes, groups)
+	leader := NewShardedCoordinator(routes, groups, 1, NewHLC(), st)
+	instant := time.UnixMilli(500)
+	coord := clockDuringRead{leader, func() time.Time {
+		require.NoError(t, groups[2].Store.PutAt(t.Context(), []byte("z"), []byte("new"), 51, 0))
+		return instant
+	}}
+	r := NewReadRequest(t.Context(), coord, st, nil)
+	defer r.Close()
+	_, err := BeginTimedReadTimestamp(r.Context(), coord, st, "script")
+	require.ErrorIs(t, err, store.ErrWriteConflict)
+	// No group changes in the next sample, whose maximum is still 100.
+	quiet := clockDuringRead{leader, func() time.Time { return instant }}
+	second := NewReadRequest(t.Context(), quiet, st, nil)
+	defer second.Close()
+	snap, err := BeginTimedReadTimestamp(second.Context(), quiet, st, "script")
+	require.NoError(t, err)
+	require.EqualValues(t, 100, snap.Timestamp())
+	require.Equal(t, instant, snap.Instant)
+	require.NoError(t, snap.Validate(second.Context()))
+	require.NoError(t, groups[2].Store.PutAt(t.Context(), []byte("z"), []byte("late"), 52, 0))
+	require.ErrorIs(t, snap.Validate(second.Context()), store.ErrWriteConflict)
+}
+
+func TestTimedMutationParticipantWatermarks(t *testing.T) {
+	t.Parallel()
+	f := newTwoGroupReadFixture(t)
+	shards := NewShardStore(f.shards.engine, f.groups)
+	coord := clockDuringRead{NewShardedCoordinator(shards.engine, f.groups, 1, NewHLC(), shards), time.Now}
+	require.NoError(t, f.onePhase(t, 1, 1, 100, "a", "hot"))
+	require.NoError(t, f.onePhase(t, 2, 1, 50, "b", "cold"))
+
+	read := NewReadRequest(t.Context(), coord, shards, nil)
+	defer read.Close()
+	snap, err := BeginTimedReadTimestamp(read.Context(), coord, shards, "lua")
+	require.NoError(t, err)
+	for _, tc := range []struct {
+		name          string
+		writes, reads []string
+		floor         uint64
+	}{
+		{"only hot participant", []string{"a"}, []string{"a"}, 100},
+		{"only cold participant", []string{"b"}, []string{"b", "c"}, 50},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := &OperationGroup[OP]{IsTxn: true, StartTS: snap.Timestamp()}
+			for _, k := range tc.writes {
+				req.Elems = append(req.Elems, &Elem[OP]{Op: Put, Key: []byte(k)})
+			}
+			for _, k := range tc.reads {
+				req.ReadKeys = append(req.ReadKeys, []byte(k))
+			}
+			floor, version, err := snap.mutationFloor(read.Context(), coord, req)
+			require.NoError(t, err)
+			require.Equal(t, tc.floor, floor)
+			require.EqualValues(t, 1, version)
+		})
+	}
+
+	// An unrelated slow group must not prevent an update of a hot key.
+	require.NoError(t, snap.Validate(read.Context()))
+	op := &OperationGroup[OP]{IsTxn: true, StartTS: 100, CommitTS: 101,
+		ReadKeys: [][]byte{[]byte("a")}, Elems: []*Elem[OP]{{Op: Put, Key: []byte("a"), Value: []byte("updated")}}}
+	_, err = snap.Dispatch(read.Context(), coord, op)
+	require.NoError(t, err)
+	require.EqualValues(t, 100, op.StartTS)
+	require.Zero(t, op.ObservedRouteVersion)
+}
+
+type writeBeforeTimedBarrier struct {
+	Transactional
+	pending *pb.Request
+}
+
+func (w *writeBeforeTimedBarrier) Commit(ctx context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
+	if w.pending != nil && len(reqs) == 1 && !reqs[0].IsTxn && len(reqs[0].Mutations) == 0 {
+		req := w.pending
+		w.pending = nil
+		if _, err := w.Transactional.Commit(ctx, []*pb.Request{req}); err != nil {
+			return nil, err
+		}
+	}
+	return w.Transactional.Commit(ctx, reqs)
+}
+
+func TestTimedBarrierRequiresFreshRead(t *testing.T) {
+	t.Parallel()
+	f := newTwoGroupReadFixture(t)
+	shards := NewShardStore(f.shards.engine, f.groups)
+	coord := clockDuringRead{NewShardedCoordinator(shards.engine, f.groups, 1, NewHLC(), shards), time.Now}
+	require.NoError(t, f.onePhase(t, 1, 1, 100, "a", "hot"))
+	require.NoError(t, f.onePhase(t, 2, 1, 50, "b", "old"))
+	before := NewReadRequest(t.Context(), coord, shards, nil)
+	defer before.Close()
+	snap, err := BeginTimedReadTimestamp(before.Context(), coord, shards, "lua")
+	require.NoError(t, err)
+	value, err := shards.GetAt(before.Context(), []byte("b"), snap.Timestamp())
+	require.NoError(t, err)
+	require.Equal(t, []byte("old"), value)
+	require.NoError(t, snap.Validate(before.Context()))
+	key := []byte("b")
+	pending := onePhaseTxnRequestWithPrevCommit(50, 51, 0, key, []*Elem[OP]{{Op: Put, Key: key, Value: []byte("new")}}, nil, 0, nil)
+	group := f.groups[2]
+	group.Txn = &writeBeforeTimedBarrier{group.Txn, pending}
+	op := &OperationGroup[OP]{IsTxn: true, StartTS: snap.Timestamp(), CommitTS: 101, ReadKeys: [][]byte{key}, Elems: []*Elem[OP]{{Op: Put, Key: []byte("a"), Value: value}}}
+	_, err = snap.Dispatch(before.Context(), coord, op)
+	require.ErrorIs(t, err, store.ErrWriteConflict)
+	require.EqualValues(t, 100, group.Store.LastCommitTS())
+	value, err = f.stores[1].GetAt(t.Context(), []byte("a"), 101)
+	require.NoError(t, err)
+	require.Equal(t, []byte("hot"), value, "the attempt that observed old must not publish")
+	after := NewReadRequest(t.Context(), coord, shards, nil)
+	defer after.Close()
+	fresh, err := BeginTimedReadTimestamp(after.Context(), coord, shards, "lua")
+	require.NoError(t, err)
+	value, err = shards.GetAt(after.Context(), key, fresh.Timestamp())
+	require.NoError(t, err)
+	require.Equal(t, []byte("new"), value)
+	op.Elems[0].Value = value
+	_, err = fresh.Dispatch(after.Context(), coord, op)
+	require.NoError(t, err)
+	value, err = f.stores[1].GetAt(t.Context(), []byte("a"), 101)
+	require.NoError(t, err)
+	require.Equal(t, []byte("new"), value)
 }

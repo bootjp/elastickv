@@ -7,7 +7,9 @@ import (
 	"github.com/bootjp/elastickv/distribution"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 )
 
 type immutableApplyRouteHistory struct {
@@ -311,5 +313,69 @@ func TestApplyRouteContextBatchVerdictsAndLegacyFallback(t *testing.T) {
 				require.Equal(t, uint64(42), index)
 			}
 		})
+	}
+}
+
+func TestReplayPinnedWriteAfterSameGroupSplit(t *testing.T) {
+	t.Parallel()
+	key := []byte("!redis|str|m-hot-1")
+	for _, tc := range []struct {
+		name  string
+		group uint64
+		state distribution.RouteState
+		pin   uint64
+		want  error
+	}{
+		{"active", 1, distribution.RouteStateActive, 2, nil},
+		{"fenced", 1, distribution.RouteStateWriteFenced, 2, ErrRouteWriteFenced},
+		{"different owner", 2, distribution.RouteStateActive, 2, ErrComposed1Violation},
+		{"unapplied version", 1, distribution.RouteStateActive, 3, ErrComposed1VersionGCd},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			engine := distribution.NewEngine()
+			original := []distribution.RouteDescriptor{{RouteID: 1, GroupID: 1, State: distribution.RouteStateActive}}
+			applyComposed1Snapshot(t, engine, 1, original)
+			f := newComposed1FSM(t, engine, 1)
+			catalog := distribution.NewCatalogStore(f.store)
+			_, err := catalog.Save(t.Context(), 0, original)
+			require.NoError(t, err)
+			_, err = catalog.Save(t.Context(), 1, []distribution.RouteDescriptor{
+				{RouteID: 2, GroupID: 1, End: []byte("m"), State: distribution.RouteStateActive},
+				{RouteID: 3, GroupID: tc.group, Start: []byte("m"), State: tc.state},
+			})
+			require.NoError(t, err)
+			start := f.store.LastCommitTS() + 1
+			req := &pb.Request{IsTxn: true, Phase: pb.Phase_NONE, Ts: start, ObservedRouteVersion: tc.pin, Mutations: []*pb.Mutation{
+				{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: key, CommitTS: start + 1})},
+				{Op: pb.Op_PUT, Key: key, Value: []byte("2")},
+			}}
+			require.ErrorIs(t, applyObserverTestRequest(t, f, req), tc.want)
+			v, err := f.store.GetAt(t.Context(), key, start+1)
+			if tc.want != nil {
+				require.ErrorIs(t, err, store.ErrKeyNotFound)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, []byte("2"), v)
+			}
+			require.EqualValues(t, 1, engine.Version())
+		})
+	}
+}
+
+func TestReplayWithUnreadableLocalCatalogHaltsApply(t *testing.T) {
+	t.Parallel()
+	engine := distribution.NewEngine()
+	applyComposed1Snapshot(t, engine, 1, []distribution.RouteDescriptor{{RouteID: 1, GroupID: 1, State: distribution.RouteStateActive}})
+	f := newComposed1FSM(t, engine, 1)
+	require.NoError(t, f.store.PutAt(t.Context(), distribution.CatalogVersionKey(), []byte{1}, 10, 0))
+	req := &pb.Request{Ts: 20, ObservedRouteVersion: 2, Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("m-hot-1"), Value: []byte("2")}}}
+	for _, tc := range []struct {
+		msg  proto.Message
+		want error
+	}{{req, errAppliedRouteCatalog}, {&pb.RaftCommand{Requests: []*pb.Request{req, req}}, ErrRaftEntryApply}} {
+		data, err := proto.Marshal(tc.msg)
+		require.NoError(t, err)
+		halt := haltApplyOf(f.Apply(data))
+		require.True(t, errors.Is(halt, tc.want), "halt = %v", halt)
 	}
 }

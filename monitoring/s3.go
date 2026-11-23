@@ -29,6 +29,7 @@ const (
 	s3BlobOffloadReasonFlagDisabled      = "flag_disabled"
 	s3BlobOffloadReasonCapabilityMissing = "capability_missing"
 	s3BlobOffloadReasonDataPathDisabled  = "data_path_disabled"
+	s3BlobOffloadReasonGCNotReady        = "gc_not_ready"
 	s3BlobOffloadReasonEnabled           = "enabled"
 	s3BlobOffloadReasonUnknown           = "unknown"
 )
@@ -274,6 +275,7 @@ func normalizeS3BlobOffloadReason(reason string) string {
 	case s3BlobOffloadReasonFlagDisabled,
 		s3BlobOffloadReasonCapabilityMissing,
 		s3BlobOffloadReasonDataPathDisabled,
+		s3BlobOffloadReasonGCNotReady,
 		s3BlobOffloadReasonEnabled:
 		return reason
 	default:

@@ -2919,7 +2919,7 @@ func (s *Service) openHandleExpiresNsec(now time.Time) int64 {
 func (s *Service) readTS(ctx context.Context) (uint64, error) {
 	fenceTS, err := s.fenceReadSnapshot(ctx)
 	if err != nil {
-		return 0, err
+		return 0, markReadFenceError(err)
 	}
 	if reader, ok := s.dispatch.(allGroupsLeaseTimestampReader); ok {
 		if support, wrapped := reader.(interface{ SupportsAllGroupsLeaseTimestamp() bool }); !wrapped || support.SupportsAllGroupsLeaseTimestamp() {

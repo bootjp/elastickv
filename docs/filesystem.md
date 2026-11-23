@@ -203,8 +203,9 @@ Rules that apply across nodes:
   [Durability and caching](#semantics-worth-knowing)).
 - When bootstrapping a brand-new cluster with per-node joins, start the
   bootstrap node with the mount first and add the mount to the other nodes
-  once they have joined. Root initialization needs a leader; a node that
-  cannot find one exits with `initialize filesystem root` instead of waiting.
+  once they have joined. Root initialization waits up to 90 seconds for a
+  leader, a successful read barrier and a usable HLC lease. If the cluster
+  still cannot serve that barrier, the node exits with `initialize filesystem root`.
   Clusters bootstrapped from a fixed `--raftBootstrapMembers` list can mount
   on every node from the start.
 

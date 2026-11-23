@@ -4,6 +4,7 @@ import (
 	"context"
 	"maps"
 	"math"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,7 +19,7 @@ import (
 type luaScriptContext struct {
 	server        *RedisServer
 	startTS       uint64
-	readTimestamp kv.ReadTimestamp
+	readTimestamp kv.TimedReadSnapshot
 	readPin       *kv.ActiveTimestampToken
 
 	// ctx is the request-scoped context captured at newLuaScriptContext
@@ -280,15 +281,7 @@ func newLuaScriptContext(ctx context.Context, server *RedisServer) (*luaScriptCo
 	if err := ctx.Err(); err != nil {
 		return nil, errors.WithStack(err)
 	}
-	// LeaseRead confirms leadership at most once per LeaseDuration window;
-	// inside the window it returns immediately without a Raft round-trip.
-	// All subsequent reads within the script use snapshotGetAt at startTS,
-	// so leadership is verified at most once per script and amortised across
-	// scripts via the lease.
-	if _, err := kv.LeaseReadThrough(server.coordinator, ctx); err != nil {
-		return nil, errors.WithStack(err)
-	}
-	readTimestamp, err := server.beginTxnReadTimestamp(ctx, "redis lua: begin read timestamp")
+	readTimestamp, err := kv.BeginTimedReadTimestamp(ctx, server.coordinator, server.store, "redis lua: begin read timestamp")
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -298,7 +291,7 @@ func newLuaScriptContext(ctx context.Context, server *RedisServer) (*luaScriptCo
 		startTS:           startTS,
 		readTimestamp:     readTimestamp,
 		readPin:           server.pinReadTS(startTS),
-		ctx:               ctx,
+		ctx:               context.WithValue(ctx, redisExpiryInstantKey{}, readTimestamp.Instant),
 		touched:           map[string]struct{}{},
 		readKeys:          map[string][]byte{},
 		deleted:           map[string]bool{},
@@ -735,7 +728,7 @@ func (c *luaScriptContext) ensureKeyNotExpired(key []byte) error {
 	if err != nil {
 		return err
 	}
-	if ttl != nil && !ttl.After(time.Now()) {
+	if ttl != nil && !ttl.After(redisExpiryInstant(c.scriptCtx())) {
 		return errors.WithStack(store.ErrKeyNotFound)
 	}
 	return nil
@@ -1547,7 +1540,7 @@ func (c *luaScriptContext) cmdSet(args []string) (luaReply, error) {
 		return luaReply{}, err
 	}
 
-	options, err := parseLuaSetOptions(args[2:])
+	options, err := parseLuaSetOptions(args[2:], redisExpiryInstant(c.scriptCtx()))
 	if err != nil {
 		return luaReply{}, err
 	}
@@ -1574,11 +1567,11 @@ func (c *luaScriptContext) cmdSet(args []string) (luaReply, error) {
 func (c *luaScriptContext) cmdSetEx(args []string) (luaReply, error) {
 	key := []byte(args[0])
 	seconds, err := strconv.ParseInt(args[1], 10, 64)
-	if err != nil || seconds <= 0 {
+	if err != nil || !validRedisTTL(seconds, time.Second) {
 		return luaReply{}, errors.New("ERR invalid expire time in 'setex' command")
 	}
 	value := []byte(args[2])
-	ttl := time.Now().Add(time.Duration(seconds) * time.Second)
+	ttl := redisExpiryInstant(c.scriptCtx()).Add(time.Duration(seconds) * time.Second)
 
 	c.deleteLogical(key)
 	c.markStringValue(key, value)
@@ -1665,7 +1658,7 @@ func (c *luaScriptContext) applyLuaSetTTL(key []byte, prevTTL *time.Time, option
 	}
 }
 
-func parseLuaSetOptions(args []string) (luaSetOptions, error) {
+func parseLuaSetOptions(args []string, now time.Time) (luaSetOptions, error) {
 	options := luaSetOptions{}
 	for i := 0; i < len(args); i++ {
 		switch strings.ToUpper(args[i]) {
@@ -1676,7 +1669,7 @@ func parseLuaSetOptions(args []string) (luaSetOptions, error) {
 		case "KEEPTTL":
 			options.keepTTL = true
 		case "PX", "EX":
-			expiresAt, err := parseLuaSetExpiry(args[i], args, i)
+			expiresAt, err := parseLuaSetExpiry(args[i], args, i, now)
 			if err != nil {
 				return luaSetOptions{}, err
 			}
@@ -1689,7 +1682,7 @@ func parseLuaSetOptions(args []string) (luaSetOptions, error) {
 	return options, nil
 }
 
-func parseLuaSetExpiry(unit string, args []string, index int) (*time.Time, error) {
+func parseLuaSetExpiry(unit string, args []string, index int, now time.Time) (*time.Time, error) {
 	if index+1 >= len(args) {
 		return nil, errors.New("ERR syntax error")
 	}
@@ -1704,7 +1697,10 @@ func parseLuaSetExpiry(unit string, args []string, index int) (*time.Time, error
 		durationUnit = time.Second
 	}
 
-	expiresAt := time.Now().Add(time.Duration(durationValue) * durationUnit)
+	if !validRedisTTL(durationValue, durationUnit) {
+		return nil, errors.New("ERR invalid expire time in 'set' command")
+	}
+	expiresAt := now.Add(time.Duration(durationValue) * durationUnit)
 	return &expiresAt, nil
 }
 
@@ -1740,11 +1736,18 @@ func (c *luaScriptContext) cmdPTTL(args []string) (luaReply, error) {
 	if err != nil {
 		return luaReply{}, err
 	}
-	return luaIntReply(ttlMilliseconds(ttl)), nil
+	return luaIntReply(ttlMilliseconds(ttl, redisExpiryInstant(c.scriptCtx()))), nil
 }
 
 func (c *luaScriptContext) cmdPExpire(args []string) (luaReply, error) {
 	key := []byte(args[0])
+	ms, err := strconv.ParseInt(args[1], 10, 64)
+	if err != nil {
+		return luaReply{}, errors.WithStack(err)
+	}
+	if ms > 0 && !validRedisTTL(ms, time.Millisecond) {
+		return luaReply{}, errors.New("ERR invalid expire time in command")
+	}
 	typ, err := c.logicalType(key)
 	if err != nil {
 		return luaReply{}, err
@@ -1754,15 +1757,11 @@ func (c *luaScriptContext) cmdPExpire(args []string) (luaReply, error) {
 		c.trackTypeProbeReadKeys(key, typ)
 		return luaIntReply(0), nil
 	}
-	ms, err := strconv.ParseInt(args[1], 10, 64)
-	if err != nil {
-		return luaReply{}, errors.WithStack(err)
-	}
 	if ms <= 0 {
 		c.deleteLogical(key)
 		return luaIntReply(1), nil
 	}
-	expireAt := time.Now().Add(time.Duration(ms) * time.Millisecond)
+	expireAt := redisExpiryInstant(c.scriptCtx()).Add(time.Duration(ms) * time.Millisecond)
 	c.markTouched(key)
 	c.setTTLValue(key, &expireAt)
 	return luaIntReply(1), nil
@@ -3928,11 +3927,7 @@ type luaKeyPlan struct {
 }
 
 func (c *luaScriptContext) commit() error {
-	keys := make([]string, 0, len(c.touched))
-	for key := range c.touched {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
+	keys := slices.Sorted(maps.Keys(c.touched))
 
 	ctx, cancel := context.WithTimeout(c.scriptCtx(), redisLuaDispatchTimeout)
 	defer cancel()
@@ -3940,7 +3935,7 @@ func (c *luaScriptContext) commit() error {
 	// Pre-allocate a commitTS so Delta key bytes can embed it before dispatch.
 	commitTS, err := c.server.nextCommitTSAfter(ctx, luaCommitFloor(c.startTS), "luaScriptContext.commit: allocate commitTS")
 	if err != nil {
-		return errors.WithStack(err)
+		return c.luaExecutionError(err)
 	}
 
 	elems := make([]*kv.Elem[kv.OP], 0, len(keys)*redisPairWidth)
@@ -3948,7 +3943,7 @@ func (c *luaScriptContext) commit() error {
 	for _, key := range keys {
 		plan, err := c.commitPlanForKey(ctx, key, commitTS)
 		if err != nil {
-			return err
+			return c.luaExecutionError(err)
 		}
 		elems = append(elems, plan.elems...)
 		readKeys = appendUniqueLuaReadKeys(readKeys, readKeySet, plan.readKeys...)
@@ -3958,18 +3953,21 @@ func (c *luaScriptContext) commit() error {
 			updateExistingMeta := plan.preserveExisting && !plan.inlineMetaRewritten
 			ttlElems, err := c.nonStringTTLElems(ctx, key, plan.finalType, updateExistingMeta)
 			if err != nil {
-				return err
+				return c.luaExecutionError(err)
 			}
 			elems = append(elems, ttlElems...)
 		}
+	}
+
+	if err := c.readTimestamp.Validate(ctx); err != nil {
+		return errors.WithStack(err)
 	}
 
 	if len(elems) == 0 {
 		return nil
 	}
 
-	dispatchCtx := c.readTimestamp.WithDispatchVoucher(ctx)
-	if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, c.server.coordinator, &kv.OperationGroup[kv.OP]{
+	if _, err := c.readTimestamp.Dispatch(ctx, c.server.coordinator, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
 		StartTS:  luaCommitFloor(c.startTS),
 		CommitTS: commitTS,
@@ -4902,7 +4900,7 @@ func (c *luaScriptContext) finalTTL(ctx context.Context, key []byte) (*time.Time
 	}
 	// Treat an already-expired TTL as absent so a recreated key does not
 	// inherit the old expired timestamp (which would leave a stale TTL key).
-	if ttl != nil && !ttl.After(time.Now()) {
+	if ttl != nil && !ttl.After(redisExpiryInstant(c.scriptCtx())) {
 		return nil, nil
 	}
 	return ttl, nil

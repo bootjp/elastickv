@@ -6,9 +6,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/redcon"
 )
 
 // ────────────────────────────────────────────────────────────────
@@ -462,4 +464,123 @@ func TestRedis_ExpiredKey_BecomesInvisible(t *testing.T) {
 		_, e := rdb.Get(ctx, "expiry:short").Result()
 		return errors.Is(e, redis.Nil)
 	}, initialTTL+3*time.Second, 25*time.Millisecond, "key must be gone after expiry")
+}
+
+func TestRedisTTLRejectedBeforeMutation(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+	ctx := t.Context()
+	for _, tc := range []struct {
+		name string
+		args []any
+	}{
+		{"setex", []any{"SETEX", "k", "9223372036854775807", "new"}},
+		{"eval-setex", []any{"EVAL", "return redis.call('SETEX',KEYS[1],ARGV[1],'new')", 1, "k", "9223372036854775807"}},
+		{"eval-set-px", []any{"EVAL", "return redis.call('SET',KEYS[1],'new','PX',ARGV[1])", 1, "k", "0"}},
+		{"eval-pexpire", []any{"EVAL", "return redis.call('PEXPIRE',KEYS[1],ARGV[1])", 1, "k", "9223372036854775807"}},
+		{"eval-pexpire-missing", []any{"EVAL", "return redis.call('PEXPIRE',KEYS[1],ARGV[1])", 1, "missing", "9223372036854775807"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, rdb.Set(ctx, "k", "prior", 0).Err())
+			require.ErrorContains(t, rdb.Do(ctx, tc.args...).Err(), "invalid expire time")
+			require.Equal(t, "prior", rdb.Get(ctx, "k").Val())
+		})
+	}
+}
+
+type luaExpiryTestCoordinator struct {
+	*localAdapterCoordinator
+	instant time.Time
+	group   *kv.OperationGroup[kv.OP]
+}
+
+func (c *luaExpiryTestCoordinator) LeaseReadTime(context.Context) (time.Time, error) {
+	return c.instant, nil
+}
+
+func (c *luaExpiryTestCoordinator) Dispatch(ctx context.Context, req *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
+	c.group = req
+	return c.localAdapterCoordinator.Dispatch(ctx, req)
+}
+
+func TestLuaUsesOneExpiryInstant(t *testing.T) {
+	st := store.NewMVCCStore()
+	leader := &luaExpiryTestCoordinator{localAdapterCoordinator: newLocalAdapterCoordinator(st), instant: time.UnixMilli(123456789)}
+	server := NewRedisServer(nil, "", st, leader, nil, nil)
+	script, err := newLuaScriptContext(t.Context(), server)
+	require.NoError(t, err)
+	defer script.Close()
+	_, err = script.cmdSet([]string{"clock-key", "value", "PX", "10"})
+	require.NoError(t, err)
+	first, err := script.cmdPTTL([]string{"clock-key"})
+	require.NoError(t, err)
+	time.Sleep(20 * time.Millisecond)
+	last, err := script.cmdPTTL([]string{"clock-key"})
+	require.NoError(t, err)
+	require.Equal(t, first, last)
+	require.Equal(t, luaIntReply(10), first)
+	require.NoError(t, script.commit())
+	key := []byte("clock-key")
+	deadline := leader.instant.Add(10 * time.Millisecond)
+	expected := append(redisTxnWideCollectionFenceElems(key),
+		&kv.Elem[kv.OP]{Op: kv.Put, Key: redisStrKey(key), Value: encodeRedisStr([]byte("value"), &deadline)},
+		&kv.Elem[kv.OP]{Op: kv.Put, Key: redisTTLKey(key), Value: encodeRedisTTL(deadline)})
+	require.NotNil(t, leader.group)
+	require.Equal(t, expected, leader.group.Elems)
+}
+
+type luaSnapshotRaceCoordinator struct {
+	*luaExpiryTestCoordinator
+	duringClock func()
+	sampleAfter bool
+	samples     int
+}
+
+func (c *luaSnapshotRaceCoordinator) LeaseReadTime(ctx context.Context) (time.Time, error) {
+	c.samples++
+	instant := c.instant
+	if c.duringClock != nil {
+		c.duringClock()
+		c.duringClock = nil
+		if c.sampleAfter {
+			instant = c.instant
+		}
+	}
+	return instant, nil
+}
+
+func TestLuaSnapshotBindsExpiryToVisibleWrites(t *testing.T) {
+	for _, sampleFirst := range []bool{true, false} {
+		t.Run(map[bool]string{true: "new value after sample", false: "old value before sample"}[sampleFirst], func(t *testing.T) {
+			st := store.NewMVCCStore()
+			deadline := time.UnixMilli(500)
+			coord := &luaSnapshotRaceCoordinator{luaExpiryTestCoordinator: &luaExpiryTestCoordinator{localAdapterCoordinator: newLocalAdapterCoordinator(st), instant: deadline.Add(-time.Millisecond)}}
+			srv := NewRedisServer(nil, "", st, coord, nil, nil)
+			put := func(k, v string, ts uint64, expires *time.Time) {
+				require.NoError(t, st.PutAt(t.Context(), redisStrKey([]byte(k)), encodeRedisStr([]byte(v), expires), ts, 0))
+			}
+			put("a", "live", 10, &deadline)
+			put("b", "old", 11, nil)
+			coord.sampleAfter = !sampleFirst
+			coord.duringClock = func() {
+				if sampleFirst {
+					coord.instant = deadline.Add(time.Millisecond)
+					put("b", "new", 12, nil)
+				} else {
+					put("b", "new", 12, nil)
+					coord.instant = deadline.Add(time.Millisecond)
+				}
+			}
+			conn := &recordingConn{}
+			script := "return (redis.call('GET',KEYS[1]) or 'expired') .. '/' .. redis.call('GET',KEYS[2])"
+			srv.eval(conn, redcon.Command{Args: [][]byte{[]byte("EVAL"), []byte(script), []byte("2"), []byte("a"), []byte("b")}})
+			require.Empty(t, conn.err)
+			require.Equal(t, "expired/new", string(conn.bulk))
+			require.Equal(t, 2, coord.samples)
+			require.Nil(t, coord.group, "read-only script dispatched a mutation")
+		})
+	}
 }

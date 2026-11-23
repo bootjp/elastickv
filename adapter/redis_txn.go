@@ -1783,7 +1783,7 @@ func (t *txnContext) effectiveTTLForExpire(key []byte, state *ttlTxnState) *time
 }
 
 func (t *txnContext) applyPositiveExpire(key []byte, ttl int64, unit time.Duration, typ redisValueType, state *ttlTxnState) (redisResult, error) {
-	if ttl > math.MaxInt64/int64(unit) {
+	if !validRedisTTL(ttl, unit) {
 		return redisResult{}, errors.New("ERR invalid expire time in command")
 	}
 	expireAt := time.Now().Add(time.Duration(ttl) * unit)
@@ -3408,7 +3408,7 @@ func (r *RedisServer) firstExecAttempt(dispatchCtx context.Context, queue []redc
 }
 
 func isAmbiguousRedisExecDispatchErr(err error) bool {
-	return !errors.Is(err, kv.ErrTransactionOutcomeUnknown) && !isRedisTransportUncertain(err) &&
+	return !isRedisIndeterminate(err) &&
 		errors.Is(err, store.ErrWriteConflict)
 }
 

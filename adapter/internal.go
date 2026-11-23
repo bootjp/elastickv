@@ -809,6 +809,7 @@ func (i *Internal) ForwardLeaseRead(
 	if i.leader == nil || i.leader.State() != raftengine.StateLeader {
 		return nil, errors.WithStack(ErrNotLeader)
 	}
+	instant := time.Now().UnixMilli()
 	index, err := i.leader.LinearizableRead(ctx)
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -817,7 +818,7 @@ func (i *Internal) ForwardLeaseRead(
 	if i.lastCommitTimestamp != nil {
 		lastCommitTS = i.lastCommitTimestamp()
 	}
-	return &pb.ForwardLeaseReadResponse{AppliedIndex: index, LastCommitTs: lastCommitTS}, nil
+	return &pb.ForwardLeaseReadResponse{AppliedIndex: index, LastCommitTs: lastCommitTS, LeaderUnixMillis: instant}, nil
 }
 
 func forwardedAdminProposalResponseError(result *raftengine.ProposalResult) error {

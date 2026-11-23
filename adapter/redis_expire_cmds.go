@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -27,7 +26,7 @@ func (r *RedisServer) setex(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 	seconds, err := strconv.ParseInt(string(cmd.Args[2]), 10, 64)
-	if err != nil || seconds <= 0 {
+	if err != nil || !validRedisTTL(seconds, time.Second) {
 		conn.WriteError("ERR invalid expire time in 'setex' command")
 		return
 	}
@@ -182,7 +181,7 @@ func (r *RedisServer) writeTTL(conn redcon.Conn, key []byte, milliseconds bool) 
 		writeRedisError(conn, err)
 		return
 	}
-	ms := ttlMilliseconds(ttl)
+	ms := ttlMilliseconds(ttl, time.Now())
 	if ms == -1 {
 		conn.WriteInt64(-1)
 		return
@@ -288,7 +287,7 @@ func (r *RedisServer) setExpire(conn redcon.Conn, cmd redcon.Command, unit time.
 	// the same wall-clock deadline (OCC retries must not push expiry forward).
 	var expireAt time.Time
 	if ttl > 0 {
-		if ttl > math.MaxInt64/int64(unit) {
+		if !validRedisTTL(ttl, unit) {
 			conn.WriteError("ERR invalid expire time in command")
 			return
 		}

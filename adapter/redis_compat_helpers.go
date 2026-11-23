@@ -666,7 +666,7 @@ func (r *RedisServer) decodeHLLSetValueAt(ctx context.Context, key []byte, readT
 			return redisSetValue{}, err
 		}
 	}
-	if ttl != nil && !ttl.After(time.Now()) {
+	if ttl != nil && !ttl.After(redisExpiryInstant(ctx)) {
 		return redisSetValue{}, nil
 	}
 	return val, nil
@@ -875,7 +875,7 @@ func (r *RedisServer) dispatchReadTimestampElemsWithReadKeys(ctx context.Context
 // Expiration is checked locally from the TTL we just decoded.
 func (r *RedisServer) readRedisStringAt(key []byte, readTS uint64, requestContexts ...context.Context) ([]byte, *time.Time, error) {
 	ctx := r.redisContext(requestContexts...)
-	return r.readRedisStringWith(key, readTS, func(key []byte, ts uint64) ([]byte, error) {
+	return r.readRedisStringWith(ctx, key, readTS, func(key []byte, ts uint64) ([]byte, error) {
 		return r.doGetAtContext(ctx, key, ts, true)
 	})
 }
@@ -885,15 +885,15 @@ func (r *RedisServer) readRedisStringAt(key []byte, readTS uint64, requestContex
 // once before invoking this (e.g. at Lua script startTS acquisition time).
 func (r *RedisServer) readRedisStringAtSnapshot(key []byte, readTS uint64, requestContexts ...context.Context) ([]byte, *time.Time, error) {
 	ctx := r.redisContext(requestContexts...)
-	return r.readRedisStringWith(key, readTS, func(key []byte, ts uint64) ([]byte, error) {
+	return r.readRedisStringWith(ctx, key, readTS, func(key []byte, ts uint64) ([]byte, error) {
 		return r.snapshotGetAt(key, ts, ctx)
 	})
 }
 
-func (r *RedisServer) readRedisStringWith(key []byte, readTS uint64, get rawGetFn) ([]byte, *time.Time, error) {
+func (r *RedisServer) readRedisStringWith(ctx context.Context, key []byte, readTS uint64, get rawGetFn) ([]byte, *time.Time, error) {
 	raw, err := get(redisStrKey(key), readTS)
 	if err == nil {
-		return r.decodePrefixedStringWith(key, raw, readTS, get)
+		return r.decodePrefixedStringWith(ctx, key, raw, readTS, get)
 	}
 	if !errors.Is(err, store.ErrKeyNotFound) {
 		return nil, nil, err
@@ -901,13 +901,13 @@ func (r *RedisServer) readRedisStringWith(key []byte, readTS uint64, get rawGetF
 	if !redisLegacyBareReadFenceAllowed(key) {
 		return nil, nil, errors.WithStack(store.ErrKeyNotFound)
 	}
-	return r.readBareLegacyStringWith(key, readTS, get)
+	return r.readBareLegacyStringWith(ctx, key, readTS, get)
 }
 
 // decodePrefixedString handles the !redis|str|<key> payload: new-format values
 // carry their TTL inline, while legacy-format payloads that still sit under
 // the prefixed key during rolling upgrade must consult the secondary index.
-func (r *RedisServer) decodePrefixedStringWith(key, raw []byte, readTS uint64, get rawGetFn) ([]byte, *time.Time, error) {
+func (r *RedisServer) decodePrefixedStringWith(ctx context.Context, key, raw []byte, readTS uint64, get rawGetFn) ([]byte, *time.Time, error) {
 	userValue, ttl, err := decodeRedisStr(raw)
 	if err != nil {
 		return nil, nil, err
@@ -919,7 +919,7 @@ func (r *RedisServer) decodePrefixedStringWith(key, raw []byte, readTS uint64, g
 		}
 		ttl = legacyTTL
 	}
-	if ttl != nil && !ttl.After(time.Now()) {
+	if ttl != nil && !ttl.After(redisExpiryInstant(ctx)) {
 		return nil, nil, errors.WithStack(store.ErrKeyNotFound)
 	}
 	return userValue, ttl, nil
@@ -927,12 +927,12 @@ func (r *RedisServer) decodePrefixedStringWith(key, raw []byte, readTS uint64, g
 
 // readBareLegacyStringWith handles pre-migration data still under the bare user
 // key: TTL in the secondary index, value at the bare key itself.
-func (r *RedisServer) readBareLegacyStringWith(key []byte, readTS uint64, get rawGetFn) ([]byte, *time.Time, error) {
+func (r *RedisServer) readBareLegacyStringWith(ctx context.Context, key []byte, readTS uint64, get rawGetFn) ([]byte, *time.Time, error) {
 	legacyTTL, err := r.readLegacyTTLWith(key, readTS, get)
 	if err != nil {
 		return nil, nil, err
 	}
-	if legacyTTL != nil && !legacyTTL.After(time.Now()) {
+	if legacyTTL != nil && !legacyTTL.After(redisExpiryInstant(ctx)) {
 		return nil, nil, errors.WithStack(store.ErrKeyNotFound)
 	}
 	legacy, err := get(key, readTS)

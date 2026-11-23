@@ -422,6 +422,54 @@ func (h *s3OCCReproHarness) goHandle(fn func() *httptest.ResponseRecorder) <-cha
 	return done
 }
 
+type s3RejectFirstInitiation struct {
+	*s3OCCReproCoordinator
+	bucketKey []byte
+	attempts  int
+}
+
+func (c *s3RejectFirstInitiation) Dispatch(ctx context.Context, req *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
+	if len(req.Elems) == 3 && bytes.Equal(req.Elems[0].Key, c.bucketKey) {
+		c.attempts++
+		if c.attempts == 1 {
+			return nil, store.ErrWriteConflict
+		}
+	}
+	return c.s3OCCReproCoordinator.Dispatch(ctx, req)
+}
+
+func TestS3CreateMultipartUploadRetriesBucketFenceConflict(t *testing.T) {
+	t.Parallel()
+	h := newS3OCCReproHarness(t)
+	const bucket = "initiate-conflict"
+	require.Equal(t, http.StatusOK, h.do(http.MethodPut, "/"+bucket, "").Code)
+	coord := &s3RejectFirstInitiation{s3OCCReproCoordinator: h.coord, bucketKey: s3keys.BucketMetaKey(bucket)}
+	h.server.coordinator = coord
+	rec := h.do(http.MethodPost, "/"+bucket+"/object?uploads=", "")
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	require.Equal(t, 2, coord.attempts)
+	var result s3InitiateMultipartUploadResult
+	require.NoError(t, xml.Unmarshal(rec.Body.Bytes(), &result))
+	require.NotEmpty(t, result.UploadId)
+	list := h.do(http.MethodGet, "/"+bucket+"/object?uploadId="+result.UploadId, "")
+	require.Equal(t, http.StatusOK, list.Code, list.Body.String())
+}
+
+func TestS3CreateMultipartUploadStopsAfterLostCommitReply(t *testing.T) {
+	t.Parallel()
+	h := newS3OCCReproHarness(t)
+	const bucket = "initiate-lost-reply"
+	require.Equal(t, http.StatusOK, h.do(http.MethodPut, "/"+bucket, "").Code)
+	coord := &s3LostMetadataReplyCoordinator{
+		s3OCCReproCoordinator: h.coord, targetKey: s3keys.BucketMetaKey(bucket), err: context.DeadlineExceeded,
+	}
+	h.server.coordinator = coord
+	result := h.do(http.MethodPost, "/"+bucket+"/object?uploads=", "")
+	require.True(t, coord.lost.Load())
+	require.Equal(t, http.StatusConflict, result.Code)
+	require.Contains(t, result.Body.String(), "<Code>OperationOutcomeUnknown</Code>")
+}
+
 func TestS3UploadPart_InlineInitialUploadUsesFreshDescriptorCommitTimestamp(t *testing.T) {
 	t.Parallel()
 	h := newS3OCCReproModeHarness(t, false, false)

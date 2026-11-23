@@ -159,7 +159,7 @@ func (r *RedisServer) runLuaScript(conn redcon.Conn, script string, evalArgs [][
 		totalRedisCall += scriptCtx.redisCallDuration
 		totalRedisCallCount += scriptCtx.redisCallCount
 		if pcallErr != nil {
-			return errors.WithStack(pcallErr)
+			return scriptCtx.luaExecutionError(pcallErr)
 		}
 
 		result := state.Get(-1)
@@ -167,7 +167,7 @@ func (r *RedisServer) runLuaScript(conn redcon.Conn, script string, evalArgs [][
 
 		nextReply, err := luaValueToReply(result)
 		if err != nil {
-			return err
+			return scriptCtx.luaExecutionError(err)
 		}
 
 		commitStart := time.Now()
@@ -856,7 +856,7 @@ func (r *RedisServer) execLuaCompat(conn redcon.Conn, command string, args [][]b
 		defer scriptCtx.Close()
 		nextReply, err := scriptCtx.exec(command, stringArgs)
 		if err != nil {
-			return err
+			return scriptCtx.luaExecutionError(err)
 		}
 		if err := scriptCtx.commit(); err != nil {
 			return err
@@ -1149,4 +1149,13 @@ func (r *RedisServer) zremrangebyscore(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 	r.execLuaCompat(conn, cmdZRemRangeByScore, cmd.Args[1:])
+}
+
+// A Lua error may contain values read by the script. Validate those reads
+// before returning the error, while no mutation has been dispatched.
+func (c *luaScriptContext) luaExecutionError(cause error) error {
+	if err := c.readTimestamp.Validate(c.scriptCtx()); err != nil {
+		return errors.WithStack(err)
+	}
+	return errors.WithStack(cause)
 }

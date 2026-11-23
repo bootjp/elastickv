@@ -1346,62 +1346,56 @@ func validateS3AbsentObjectDelete(r *http.Request, bucket, objectKey string) err
 }
 
 func (s *S3Server) createMultipartUpload(w http.ResponseWriter, r *http.Request, bucket string, objectKey string) {
-	readTimestamp, err := s.beginTxnReadTimestamp(r.Context(), "s3 create multipart upload: begin read timestamp")
-	if err != nil {
-		writeS3InternalError(w, err)
-		return
-	}
-	readTS := readTimestamp.Timestamp()
-	readPin := s.pinReadTS(readTS)
-	defer readPin.Release()
-
-	meta, exists, err := s.loadBucketMetaAt(r.Context(), bucket, readTS)
-	if err != nil {
-		writeS3InternalError(w, err)
-		return
-	}
-	if !exists || meta == nil {
-		writeS3Error(w, http.StatusNotFound, s3ErrNoSuchBucket, s3ErrNoSuchBucketMsg, bucket, objectKey)
-		return
-	}
-
 	uploadID := newS3UploadID(s.clock())
-	startTS := readTS
-	commitTS, err := s.nextTxnCommitTS(r.Context(), startTS)
+	ctx := r.Context()
+	err := s.retryS3Mutation(ctx, func() error {
+		readTimestamp, err := s.beginTxnReadTimestamp(ctx, "s3 create multipart upload: begin read timestamp")
+		if err != nil {
+			return err
+		}
+		startTS := readTimestamp.Timestamp()
+		readPin := s.pinReadTS(startTS)
+		defer readPin.Release()
+
+		meta, exists, err := s.loadBucketMetaAt(ctx, bucket, startTS)
+		if err != nil {
+			return err
+		}
+		if !exists || meta == nil {
+			return newS3ResponseError(http.StatusNotFound, s3ErrNoSuchBucket, s3ErrNoSuchBucketMsg, bucket, objectKey)
+		}
+		commitTS, err := s.nextTxnCommitTS(ctx, startTS)
+		if err != nil {
+			return err
+		}
+		body, err := json.Marshal(&s3UploadMeta{
+			Bucket:      bucket,
+			Object:      objectKey,
+			Generation:  meta.Generation,
+			UploadID:    uploadID,
+			CreatedHLC:  commitTS,
+			ContentType: s3ContentTypeOrDefault(r.Header.Get("Content-Type")),
+			Metadata:    collectS3UserMetadata(r.Header),
+		})
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		bucketFence, err := encodeS3BucketMeta(meta)
+		if err != nil {
+			return err
+		}
+		return s.dispatchS3MetadataMutation(readTimestamp.WithDispatchVoucher(ctx), &kv.OperationGroup[kv.OP]{
+			IsTxn:    true,
+			StartTS:  startTS,
+			CommitTS: commitTS,
+			Elems: []*kv.Elem[kv.OP]{
+				{Op: kv.Put, Key: s3keys.BucketMetaKey(bucket), Value: bucketFence},
+				{Op: kv.Put, Key: s3keys.UploadMetaKey(bucket, meta.Generation, objectKey, uploadID), Value: body},
+				{Op: kv.Put, Key: s3keys.GCUploadKey(bucket, meta.Generation, objectKey, uploadID), Value: body},
+			},
+		})
+	})
 	if err != nil {
-		writeS3InternalError(w, err)
-		return
-	}
-	uploadMeta := &s3UploadMeta{
-		Bucket:      bucket,
-		Object:      objectKey,
-		Generation:  meta.Generation,
-		UploadID:    uploadID,
-		CreatedHLC:  commitTS,
-		ContentType: s3ContentTypeOrDefault(r.Header.Get("Content-Type")),
-		Metadata:    collectS3UserMetadata(r.Header),
-	}
-	body, err := json.Marshal(uploadMeta)
-	if err != nil {
-		writeS3InternalError(w, err)
-		return
-	}
-	bucketFence, err := encodeS3BucketMeta(meta)
-	if err != nil {
-		writeS3InternalError(w, err)
-		return
-	}
-	dispatchCtx := readTimestamp.WithDispatchVoucher(r.Context())
-	if err := s.dispatchS3MetadataMutation(dispatchCtx, &kv.OperationGroup[kv.OP]{
-		IsTxn:    true,
-		StartTS:  startTS,
-		CommitTS: commitTS,
-		Elems: []*kv.Elem[kv.OP]{
-			{Op: kv.Put, Key: s3keys.BucketMetaKey(bucket), Value: bucketFence},
-			{Op: kv.Put, Key: s3keys.UploadMetaKey(bucket, meta.Generation, objectKey, uploadID), Value: body},
-			{Op: kv.Put, Key: s3keys.GCUploadKey(bucket, meta.Generation, objectKey, uploadID), Value: body},
-		},
-	}); err != nil {
 		writeS3MutationError(w, err, bucket, objectKey)
 		return
 	}

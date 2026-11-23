@@ -46,6 +46,7 @@ func TestS3BlobOffloadMetricsObserve(t *testing.T) {
 	metrics := newS3Metrics(reg)
 
 	metrics.ObserveS3BlobOffloadDecision(s3BlobOffloadModeLegacy, s3BlobOffloadReasonCapabilityMissing)
+	metrics.ObserveS3BlobOffloadDecision(s3BlobOffloadModeLegacy, s3BlobOffloadReasonGCNotReady)
 	metrics.ObserveS3BlobOffloadDecision("bogus", "bogus")
 	metrics.ObserveS3ChunkBlobReplicationDegraded()
 	metrics.ObserveS3ChunkBlobSHAMismatch()
@@ -60,6 +61,7 @@ func TestS3BlobOffloadMetricsObserve(t *testing.T) {
 # HELP elastickv_s3_blob_offload_write_decisions_total Total S3 write-path blob offload decisions by selected mode and fallback reason.
 # TYPE elastickv_s3_blob_offload_write_decisions_total counter
 elastickv_s3_blob_offload_write_decisions_total{mode="legacy",reason="capability_missing"} 1
+elastickv_s3_blob_offload_write_decisions_total{mode="legacy",reason="gc_not_ready"} 1
 elastickv_s3_blob_offload_write_decisions_total{mode="unknown",reason="unknown"} 1
 # HELP elastickv_s3_chunkblob_replication_degraded_total Total S3 chunkblob writes that could not reach the configured replication target but remained recoverable.
 # TYPE elastickv_s3_chunkblob_replication_degraded_total counter

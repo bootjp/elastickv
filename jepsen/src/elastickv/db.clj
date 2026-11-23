@@ -213,7 +213,7 @@
   "Builds the production server argv for one managed Jepsen node."
   [{:keys [node grpc redis dynamo s3 sqs sqs-region data-dir raft-engine
            raft-redis-map raft-dynamo-map raft-s3-map raft-sqs-map raft-groups shard-ranges
-           filesystem-mount encryption migration-enabled bootstrap? bootstrap-members
+           filesystem-mount encryption migration-enabled s3-offload bootstrap? bootstrap-members
            join-as-learner join-members auto-split-args] :as opts}]
   (when (contains? opts :filesystem-strict)
     (throw (ex-info "filesystem-strict option has been removed" {})))
@@ -226,6 +226,8 @@
     dynamo (conj "--dynamoAddress" dynamo
                  "--raftDynamoMap" raft-dynamo-map)
     s3 (conj "--s3Address" s3 "--raftS3Map" raft-s3-map)
+    s3-offload (conj "--adminTokenFile" "/run/jepsen-admin.token"
+                     "--s3BlobPeerTokenFile" "/run/jepsen-peer.token")
     sqs (conj "--sqsAddress" sqs "--raftSqsMap" raft-sqs-map)
     (and sqs sqs-region) (conj "--sqsRegion" sqs-region)
     filesystem-mount (conj "--filesystemMount" filesystem-mount)
@@ -324,7 +326,7 @@
         (c/exec :bash "-c" (unmount-filesystem-cmd mount-dir))))))
 
 (defn- start-node!
-  [test node {:keys [bootstrap-node bootstrap-members grpc-port redis-port dynamo-port s3-port sqs-port sqs-region data-dir raft-groups shard-ranges raft-engine server-env migration-enabled filesystem-mount encryption join-as-learner join-members auto-split-args]}]
+  [test node {:keys [bootstrap-node bootstrap-members grpc-port redis-port dynamo-port s3-port sqs-port sqs-region data-dir raft-groups shard-ranges raft-engine server-env migration-enabled filesystem-mount encryption join-as-learner join-members auto-split-args] :as opts}]
   (when (and (seq raft-groups)
              (> (count raft-groups) 1)
              (nil? shard-ranges))
@@ -345,7 +347,7 @@
         bootstrap? (= node bootstrap-node)
         args (server-args
                {:node node :grpc grpc :redis redis :dynamo dynamo :s3 s3 :sqs sqs
-                :sqs-region sqs-region :data-dir data-dir :raft-engine raft-engine
+                :sqs-region sqs-region :s3-offload (:s3-offload opts) :data-dir data-dir :raft-engine raft-engine
                 :raft-redis-map raft-redis-map :raft-dynamo-map raft-dynamo-map
                 :raft-s3-map raft-s3-map :raft-sqs-map raft-sqs-map
                 :raft-groups raft-groups :shard-ranges shard-ranges
@@ -390,7 +392,7 @@
       (c/exec :bash "-c"
               (str "tmp=$(mktemp /var/log/elastickv-transport-metrics.XXXXXX); "
                    "if curl --connect-timeout 2 --max-time 5 -fsS http://127.0.0.1:9090/metrics "
-                   "| grep -E '^elastickv_raft_(send_stream|snapshot_stream|dispatch_errors|dispatch_dropped|step_queue_full)' > \"$tmp\"; "
+                   "| grep -E '^elastickv_(raft_(send_stream|snapshot_stream|dispatch_errors|dispatch_dropped|step_queue_full)|s3_(object_duration_seconds_count|blob_offload_write_decisions_total))' > \"$tmp\"; "
                    "then { printf '# transport metrics snapshot node=" (name node) " captured_at=%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"; cat \"$tmp\"; } >> " transport-metrics-file "; "
                    "else printf '# metrics unavailable node=" (name node) " captured_at=%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" >> " transport-metrics-file "; fi; "
                    "rm -f \"$tmp\"")))))

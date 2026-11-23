@@ -319,6 +319,33 @@ type Coordinator interface {
 	Clock() *HLC
 }
 
+// LeaseReadTimeThrough samples Unix time for absolute protocol expirations.
+// The applied index, snapshot watermark and future HLC lease ceiling are all
+// different from this wall clock.
+func LeaseReadTimeThrough(c Coordinator, ctx context.Context) (time.Time, error) {
+	if c == nil {
+		return time.Time{}, errors.WithStack(ErrLeaderNotFound)
+	}
+	if timed, ok := c.(interface {
+		LeaseReadTime(context.Context) (time.Time, error)
+	}); ok {
+		instant, err := timed.LeaseReadTime(ctx)
+		return instant, errors.WithStack(err)
+	}
+	if _, err := LeaseReadThrough(c, ctx); err != nil {
+		return time.Time{}, err
+	}
+	return localLeaseTime(c)
+}
+
+func localLeaseTime(c Coordinator) (time.Time, error) {
+	instant := time.Now().Truncate(time.Millisecond)
+	if !c.IsLeader() {
+		return time.Time{}, errors.WithStack(ErrLeaderNotFound)
+	}
+	return instant, nil
+}
+
 // LeaseReadableCoordinator is the optional capability implemented by
 // coordinators that participate in the leader-local lease read path
 // (see docs/design/2026_04_20_implemented_lease_read.md). Callers that want lease reads
