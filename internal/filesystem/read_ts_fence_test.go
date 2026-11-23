@@ -2,12 +2,15 @@ package filesystem
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/kv/kvtest"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // allGroupsTimestampFenceCoordinator mimics ShardedCoordinator on a follower:
@@ -142,4 +145,33 @@ func TestServiceFollowerReadsObserveOwnForwardedWrite(t *testing.T) {
 	inode, err := svc.Resolve(ctx, RootInode, []byte("file"))
 	require.NoError(t, err)
 	require.Equal(t, file.Inode, inode)
+}
+
+func TestRootReadFenceDuringRestart(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		code      codes.Code
+		message   string
+		retryable bool
+	}{
+		{codes.Unknown, "not leader", true},
+		{codes.DeadlineExceeded, "context deadline exceeded", true},
+		{codes.Unavailable, "connection refused", true},
+		{codes.PermissionDenied, "not leader", false},
+		{codes.Unknown, "disk failure", false},
+	} {
+		t.Run(tc.code.String()+"/"+tc.message, func(t *testing.T) {
+			st := store.NewMVCCStore()
+			wire := status.Error(tc.code, tc.message)
+			coord := &allGroupsTimestampFenceCoordinator{inner: &testCoordinator{st: st}, fenceErr: wire}
+			svc, err := NewService(st, coord)
+			require.NoError(t, err)
+			err = svc.InitializeRoot(t.Context(), testRootMode, 0, 0)
+			require.ErrorIs(t, err, wire)
+			require.Equal(t, tc.retryable, errors.Is(err, ErrReadFenceUnavailable))
+			require.Zero(t, st.LastCommitTS(), "failed read must not create a root")
+			coord.fenceErr = nil
+			require.NoError(t, svc.InitializeRoot(t.Context(), testRootMode, 0, 0))
+		})
+	}
 }

@@ -104,7 +104,7 @@ func Start(
 func retryFilesystemStartup(ctx context.Context, interval time.Duration, attempt func(context.Context) error) error {
 	for {
 		err := attempt(ctx)
-		if err == nil || (!errors.Is(err, kv.ErrLeaderNotFound) && !errors.Is(err, kv.ErrCeilingExpired)) {
+		if err == nil || !retryableFilesystemStartup(err) {
 			return err
 		}
 		timer := time.NewTimer(interval)
@@ -115,6 +115,11 @@ func retryFilesystemStartup(ctx context.Context, interval time.Duration, attempt
 			return errors.Join(err, ctx.Err())
 		}
 	}
+}
+
+func retryableFilesystemStartup(err error) bool {
+	return !errors.Is(err, kv.ErrTransactionOutcomeUnknown) &&
+		(errors.Is(err, kv.ErrLeaderNotFound) || errors.Is(err, kv.ErrCeilingExpired) || errors.Is(err, filesystem.ErrReadFenceUnavailable))
 }
 
 // MountService mounts service at the configured mount point. ctx
@@ -186,7 +191,7 @@ func registerStrictSession(ctx context.Context, journal strictSessionRegistrar, 
 	defer cancel()
 	session, err := journal.RegisterSession(startupCtx, filesystemID, owner)
 	if err == nil || session.Session == [16]byte{} ||
-		(!errors.Is(err, kv.ErrLeaderNotFound) && !errors.Is(err, kv.ErrCeilingExpired)) {
+		!retryableFilesystemStartup(err) {
 		return session, errors.WithStack(err)
 	}
 	err = retryFilesystemStartup(startupCtx, startupRetryInterval, func(ctx context.Context) error {

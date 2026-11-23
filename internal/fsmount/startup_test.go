@@ -20,25 +20,31 @@ func TestRetryFilesystemStartupWaitsForLeadershipAndHLCLease(t *testing.T) {
 		case 1:
 			return kv.ErrLeaderNotFound
 		case 2:
+			return filesystem.ErrReadFenceUnavailable
+		case 3:
 			return errors.Join(kv.ErrCeilingExpired, errors.New("lease recovery unavailable"))
 		default:
 			return nil
 		}
 	})
 	require.NoError(t, err)
-	require.Equal(t, 3, attempts)
+	require.Equal(t, 4, attempts)
 }
 
 func TestRetryFilesystemStartupRejectsNonTransientError(t *testing.T) {
 	t.Parallel()
-	permanent := errors.New("corrupt filesystem root")
-	attempts := 0
-	err := retryFilesystemStartup(t.Context(), time.Nanosecond, func(context.Context) error {
-		attempts++
-		return permanent
-	})
-	require.ErrorIs(t, err, permanent)
-	require.Equal(t, 1, attempts)
+	for _, permanent := range []error{
+		errors.New("corrupt filesystem root"),
+		errors.Join(kv.ErrTransactionOutcomeUnknown, filesystem.ErrReadFenceUnavailable),
+	} {
+		attempts := 0
+		err := retryFilesystemStartup(t.Context(), time.Nanosecond, func(context.Context) error {
+			attempts++
+			return permanent
+		})
+		require.ErrorIs(t, err, permanent)
+		require.Equal(t, 1, attempts)
+	}
 }
 
 func TestRetryFilesystemStartupStopsAtDeadline(t *testing.T) {
