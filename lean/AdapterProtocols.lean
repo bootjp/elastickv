@@ -37,8 +37,9 @@ theorem stable_positions_at_expiry_sample {Group : Type}
   funext g
   exact Nat.le_antisymm (encloses g).2 (encloses g).1
 
--- OCC rejects a key whose latest committed version exceeds StartTS. Fold the
--- participant watermarks into the MVCC read cut, as in mutationFloor.
+-- An admitted OCC start is the single participant's positive watermark or
+-- the read cut already reached by every participant. The minimum expresses
+-- the maximum common upper bound in both cases.
 def mutationFloor (cut : Nat) (participants : List Nat) := participants.foldl min cut
 
 private theorem mutationFloor_le_cut (participants : List Nat) (cut : Nat) :
@@ -60,6 +61,22 @@ theorem mutationFloor_le_participant (member : p ∈ ps) :
 theorem late_write_fails_occ (member : sampled ∈ participants) (late : sampled < applied) :
     ¬ applied ≤ mutationFloor cut participants :=
   Nat.not_le_of_lt (Nat.lt_of_le_of_lt (mutationFloor_le_participant member) late)
+
+theorem common_mutation_floor (covered : ∀ p ∈ participants, cut ≤ p) :
+    mutationFloor cut participants = cut := by
+  induction participants with
+  | nil => rfl
+  | cons p ps ih =>
+    have first := covered p (List.mem_cons_self ..)
+    have rest : ∀ q ∈ ps, cut ≤ q := fun q h => covered q (List.mem_cons_of_mem p h)
+    simpa [mutationFloor, Nat.min_eq_left first] using ih rest
+
+theorem single_mutation_floor (bounded : p ≤ cut) : mutationFloor cut [p] = p := by
+  simp [mutationFloor, Nat.min_eq_right bounded]
+
+-- The empty raw entry contains no key mutations and raises only LastCommitTS.
+-- A successful fresh sample covers the requested cut even for an empty shard.
+theorem barrier_covers_cut (watermark cut : Nat) : cut ≤ max watermark cut := Nat.le_max_right ..
 
 -- Lua's VM chooses a trace. The read set here consists of the reads in
 -- that trace (the Go planner must also track type/absence and collection

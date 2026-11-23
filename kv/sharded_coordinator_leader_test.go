@@ -238,13 +238,9 @@ func TestTimedMutationParticipantWatermarks(t *testing.T) {
 		name          string
 		writes, reads []string
 		floor         uint64
-		conflict      bool
 	}{
-		{"only hot participant", []string{"a"}, []string{"a"}, 100, false},
-		{"only cold participant", []string{"b"}, []string{"b", "c"}, 50, false},
-		{"cold read covered by intent", []string{"a", "b"}, []string{"a", "b"}, 50, false},
-		{"cold read only participant", []string{"a"}, []string{"b"}, 0, true},
-		{"unlocked key on cold write participant", []string{"a", "b"}, []string{"c"}, 0, true},
+		{"only hot participant", []string{"a"}, []string{"a"}, 100},
+		{"only cold participant", []string{"b"}, []string{"b", "c"}, 50},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			req := &OperationGroup[OP]{IsTxn: true, StartTS: snap.Timestamp()}
@@ -254,11 +250,7 @@ func TestTimedMutationParticipantWatermarks(t *testing.T) {
 			for _, k := range tc.reads {
 				req.ReadKeys = append(req.ReadKeys, []byte(k))
 			}
-			floor, version, err := snap.mutationFloor(req)
-			if tc.conflict {
-				require.ErrorIs(t, err, store.ErrWriteConflict)
-				return
-			}
+			floor, version, err := snap.mutationFloor(read.Context(), coord, req)
 			require.NoError(t, err)
 			require.Equal(t, tc.floor, floor)
 			require.EqualValues(t, 1, version)
@@ -273,4 +265,61 @@ func TestTimedMutationParticipantWatermarks(t *testing.T) {
 	require.NoError(t, err)
 	require.EqualValues(t, 100, op.StartTS)
 	require.Zero(t, op.ObservedRouteVersion)
+}
+
+type writeBeforeTimedBarrier struct {
+	Transactional
+	pending *pb.Request
+}
+
+func (w *writeBeforeTimedBarrier) Commit(ctx context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
+	if w.pending != nil && len(reqs) == 1 && !reqs[0].IsTxn && len(reqs[0].Mutations) == 0 {
+		req := w.pending
+		w.pending = nil
+		if _, err := w.Transactional.Commit(ctx, []*pb.Request{req}); err != nil {
+			return nil, err
+		}
+	}
+	return w.Transactional.Commit(ctx, reqs)
+}
+
+func TestTimedBarrierRequiresFreshRead(t *testing.T) {
+	t.Parallel()
+	f := newTwoGroupReadFixture(t)
+	shards := NewShardStore(f.shards.engine, f.groups)
+	coord := clockDuringRead{NewShardedCoordinator(shards.engine, f.groups, 1, NewHLC(), shards), time.Now}
+	require.NoError(t, f.onePhase(t, 1, 1, 100, "a", "hot"))
+	require.NoError(t, f.onePhase(t, 2, 1, 50, "b", "old"))
+	before := NewReadRequest(t.Context(), coord, shards, nil)
+	defer before.Close()
+	snap, err := BeginTimedReadTimestamp(before.Context(), coord, shards, "lua")
+	require.NoError(t, err)
+	value, err := shards.GetAt(before.Context(), []byte("b"), snap.Timestamp())
+	require.NoError(t, err)
+	require.Equal(t, []byte("old"), value)
+	require.NoError(t, snap.Validate(before.Context()))
+	key := []byte("b")
+	pending := onePhaseTxnRequestWithPrevCommit(50, 51, 0, key, []*Elem[OP]{{Op: Put, Key: key, Value: []byte("new")}}, nil, 0, nil)
+	group := f.groups[2]
+	group.Txn = &writeBeforeTimedBarrier{group.Txn, pending}
+	op := &OperationGroup[OP]{IsTxn: true, StartTS: snap.Timestamp(), CommitTS: 101, ReadKeys: [][]byte{key}, Elems: []*Elem[OP]{{Op: Put, Key: []byte("a"), Value: value}}}
+	_, err = snap.Dispatch(before.Context(), coord, op)
+	require.ErrorIs(t, err, store.ErrWriteConflict)
+	require.EqualValues(t, 100, group.Store.LastCommitTS())
+	value, err = f.stores[1].GetAt(t.Context(), []byte("a"), 101)
+	require.NoError(t, err)
+	require.Equal(t, []byte("hot"), value, "the attempt that observed old must not publish")
+	after := NewReadRequest(t.Context(), coord, shards, nil)
+	defer after.Close()
+	fresh, err := BeginTimedReadTimestamp(after.Context(), coord, shards, "lua")
+	require.NoError(t, err)
+	value, err = shards.GetAt(after.Context(), key, fresh.Timestamp())
+	require.NoError(t, err)
+	require.Equal(t, []byte("new"), value)
+	op.Elems[0].Value = value
+	_, err = fresh.Dispatch(after.Context(), coord, op)
+	require.NoError(t, err)
+	value, err = f.stores[1].GetAt(t.Context(), []byte("a"), 101)
+	require.NoError(t, err)
+	require.Equal(t, []byte("new"), value)
 }
