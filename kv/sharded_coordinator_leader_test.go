@@ -221,3 +221,56 @@ func TestTimedSnapshotChecksEachDataGroup(t *testing.T) {
 	require.NoError(t, groups[2].Store.PutAt(t.Context(), []byte("z"), []byte("late"), 52, 0))
 	require.ErrorIs(t, snap.Validate(second.Context()), store.ErrWriteConflict)
 }
+
+func TestTimedMutationParticipantWatermarks(t *testing.T) {
+	t.Parallel()
+	f := newTwoGroupReadFixture(t)
+	shards := NewShardStore(f.shards.engine, f.groups)
+	coord := clockDuringRead{NewShardedCoordinator(shards.engine, f.groups, 1, NewHLC(), shards), time.Now}
+	require.NoError(t, f.onePhase(t, 1, 1, 100, "a", "hot"))
+	require.NoError(t, f.onePhase(t, 2, 1, 50, "b", "cold"))
+
+	read := NewReadRequest(t.Context(), coord, shards, nil)
+	defer read.Close()
+	snap, err := BeginTimedReadTimestamp(read.Context(), coord, shards, "lua")
+	require.NoError(t, err)
+	for _, tc := range []struct {
+		name          string
+		writes, reads []string
+		floor         uint64
+		conflict      bool
+	}{
+		{"only hot participant", []string{"a"}, []string{"a"}, 100, false},
+		{"only cold participant", []string{"b"}, []string{"b", "c"}, 50, false},
+		{"cold read covered by intent", []string{"a", "b"}, []string{"a", "b"}, 50, false},
+		{"cold read only participant", []string{"a"}, []string{"b"}, 0, true},
+		{"unlocked key on cold write participant", []string{"a", "b"}, []string{"c"}, 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := &OperationGroup[OP]{IsTxn: true, StartTS: snap.Timestamp()}
+			for _, k := range tc.writes {
+				req.Elems = append(req.Elems, &Elem[OP]{Op: Put, Key: []byte(k)})
+			}
+			for _, k := range tc.reads {
+				req.ReadKeys = append(req.ReadKeys, []byte(k))
+			}
+			floor, version, err := snap.mutationFloor(req)
+			if tc.conflict {
+				require.ErrorIs(t, err, store.ErrWriteConflict)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.floor, floor)
+			require.EqualValues(t, 1, version)
+		})
+	}
+
+	// An unrelated slow group must not prevent an update of a hot key.
+	require.NoError(t, snap.Validate(read.Context()))
+	op := &OperationGroup[OP]{IsTxn: true, StartTS: 100, CommitTS: 101,
+		ReadKeys: [][]byte{[]byte("a")}, Elems: []*Elem[OP]{{Op: Put, Key: []byte("a"), Value: []byte("updated")}}}
+	_, err = snap.Dispatch(read.Context(), coord, op)
+	require.NoError(t, err)
+	require.EqualValues(t, 100, op.StartTS)
+	require.Zero(t, op.ObservedRouteVersion)
+}

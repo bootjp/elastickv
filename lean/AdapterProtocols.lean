@@ -37,6 +37,30 @@ theorem stable_positions_at_expiry_sample {Group : Type}
   funext g
   exact Nat.le_antisymm (encloses g).2 (encloses g).1
 
+-- OCC rejects a key whose latest committed version exceeds StartTS. Fold the
+-- participant watermarks into the MVCC read cut, as in mutationFloor.
+def mutationFloor (cut : Nat) (participants : List Nat) := participants.foldl min cut
+
+private theorem mutationFloor_le_cut (participants : List Nat) (cut : Nat) :
+    mutationFloor cut participants ≤ cut := by
+  induction participants generalizing cut with
+  | nil => exact Nat.le_refl _
+  | cons p ps ih => exact Nat.le_trans (ih (min cut p)) (Nat.min_le_left ..)
+
+theorem mutationFloor_le_participant (member : p ∈ ps) :
+    mutationFloor cut ps ≤ p := by
+  induction ps generalizing cut with
+  | nil => simp at member
+  | cons q qs ih =>
+    rcases List.mem_cons.mp member with eq | tail
+    · subst q
+      exact Nat.le_trans (mutationFloor_le_cut qs _) (Nat.min_le_right ..)
+    · exact ih tail
+
+theorem late_write_fails_occ (member : sampled ∈ participants) (late : sampled < applied) :
+    ¬ applied ≤ mutationFloor cut participants :=
+  Nat.not_le_of_lt (Nat.lt_of_le_of_lt (mutationFloor_le_participant member) late)
+
 -- Lua's VM chooses a trace. The read set here consists of the reads in
 -- that trace (the Go planner must also track type/absence and collection
 -- anchors). An uncaught execution error never reaches commit.

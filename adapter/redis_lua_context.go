@@ -3967,8 +3967,7 @@ func (c *luaScriptContext) commit() error {
 		return nil
 	}
 
-	dispatchCtx := c.readTimestamp.WithDispatchVoucher(ctx)
-	if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, c.server.coordinator, &kv.OperationGroup[kv.OP]{
+	if _, err := c.readTimestamp.Dispatch(ctx, c.server.coordinator, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
 		StartTS:  luaCommitFloor(c.startTS),
 		CommitTS: commitTS,

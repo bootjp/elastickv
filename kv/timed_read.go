@@ -23,10 +23,130 @@ type timedPositionReader interface {
 // TimedReadSnapshot pairs the transaction's MVCC boundary with the leader's
 // wall time. A multi-group reader must Validate before publishing its result.
 type TimedReadSnapshot struct {
-	ReadTimestamp
+	stamp     ReadTimestamp
 	Instant   time.Time
 	reader    timedPositionReader
 	positions []timedReadPosition
+	shards    *ShardStore
+	version   uint64
+}
+
+func (s TimedReadSnapshot) Timestamp() uint64 { return s.stamp.Timestamp() }
+
+// Dispatch validates the script's dependencies at Raft apply using a start
+// timestamp already reached by each participant at the wall-clock sample.
+// The read watermark of another group is not an OCC boundary for these keys.
+func (s TimedReadSnapshot) Dispatch(ctx context.Context, coord Coordinator, req *OperationGroup[OP]) (*CoordinateResponse, error) {
+	if req == nil || !req.IsTxn || req.StartTS != s.Timestamp() {
+		return nil, errors.WithStack(ErrReadSnapshotScope)
+	}
+	if len(s.positions) == 0 {
+		return DispatchWithReadTimestamp(s.stamp.WithDispatchVoucher(ctx), coord, req)
+	}
+	floor, version, err := s.mutationFloor(req)
+	if err != nil {
+		return nil, err
+	}
+	if floor == 0 {
+		return nil, errors.Wrap(store.ErrWriteConflict, "timed mutation has no positive participant watermark")
+	}
+	stamp := s.stamp
+	if floor != stamp.Timestamp() {
+		stamp, err = BeginReadTimestampThrough(ctx, coord, floor, "timed mutation OCC boundary")
+		if err != nil {
+			return nil, err
+		}
+	}
+	operation := *req
+	operation.StartTS = floor
+	operation.ObservedRouteVersion = version
+	return DispatchWithReadTimestamp(stamp.WithDispatchVoucher(ctx), coord, &operation)
+}
+
+// A split can move a key to a group with a different sampled watermark.
+// Narrow the bound only when the dispatch can carry the sampled route version.
+func (s TimedReadSnapshot) mutationFloor(req *OperationGroup[OP]) (uint64, uint64, error) {
+	watermarks := make(map[uint64]uint64, len(s.positions))
+	all := s.Timestamp()
+	for _, pos := range s.positions {
+		watermarks[pos.group] = pos.timestamp
+		all = min(all, pos.timestamp)
+	}
+	version := EncodeObservedRouteVersion(s.version)
+	if req.ObservedRouteVersion != 0 && req.ObservedRouteVersion != version {
+		return 0, 0, errors.WithStack(ErrReadSnapshotScope)
+	}
+	if s.shards.ReadFenceRouteVersion() != s.version {
+		return 0, 0, errors.Wrap(store.ErrWriteConflict, "timed mutation route changed")
+	}
+	if all == s.Timestamp() {
+		return all, version, nil
+	}
+	if version == 0 || s.shards == nil {
+		return 0, 0, errors.Wrap(store.ErrWriteConflict, "timed mutation cannot pin divergent group watermarks")
+	}
+	groups, err := s.mutationParticipants(req)
+	if err != nil {
+		return 0, 0, err
+	}
+	floor, err := s.participantFloor(groups, watermarks)
+	return floor, version, err
+}
+
+func (s TimedReadSnapshot) participantFloor(groups map[uint64]bool, watermarks map[uint64]uint64) (uint64, error) {
+	floor := s.Timestamp()
+	for gid, unlockedRead := range groups {
+		ts, found := watermarks[gid]
+		if !found {
+			return 0, errors.Wrap(store.ErrWriteConflict, "timed mutation participant was not sampled")
+		}
+		// A 1PC validates all keys in its apply. In 2PC a read dependency
+		// without a write intent can change after its participant's validation.
+		if len(groups) > 1 && unlockedRead && ts < s.Timestamp() {
+			return 0, errors.Wrap(store.ErrWriteConflict, "timed mutation has an unfenced read participant")
+		}
+		floor = min(floor, ts)
+	}
+	return floor, nil
+}
+
+// The value identifies participants with read keys not covered by a write
+// intent. Redis Lua emits point operations routed through the byte catalog.
+func (s TimedReadSnapshot) mutationParticipants(req *OperationGroup[OP]) (map[uint64]bool, error) {
+	groups := make(map[uint64]bool)
+	written := make(map[string]bool, len(req.Elems))
+	for _, elem := range req.Elems {
+		if elem == nil || elem.GroupID != 0 || (elem.Op != Put && elem.Op != Del) {
+			return nil, errors.Wrap(store.ErrWriteConflict, "timed mutation requires a pinned point operation")
+		}
+		id, err := s.pointParticipant(elem.Key)
+		if err != nil {
+			return nil, err
+		}
+		groups[id] = false
+		written[string(elem.Key)] = true
+	}
+	for _, key := range req.ReadKeys {
+		id, err := s.pointParticipant(key)
+		if err != nil {
+			return nil, err
+		}
+		groups[id] = groups[id] || !written[string(key)]
+	}
+	return groups, nil
+}
+
+func (s TimedReadSnapshot) pointParticipant(key []byte) (uint64, error) {
+	if resolver := s.shards.partitionResolver; resolver != nil {
+		if _, resolved := resolver.ResolveGroup(key); resolved || resolver.RecognisesPartitionedKey(key) {
+			return 0, errors.Wrap(store.ErrWriteConflict, "timed mutation cannot pin partition routing")
+		}
+	}
+	route, _, version, found := s.shards.routeAndGroupForKeyWithVersion(key)
+	if !found || version != s.version {
+		return 0, errors.Wrap(store.ErrWriteConflict, "timed mutation route changed")
+	}
+	return route.GroupID, nil
 }
 
 // Validate catches a later apply in a group whose watermark was below the
@@ -67,6 +187,8 @@ func BeginTimedReadTimestamp(ctx context.Context, coord Coordinator, st store.MV
 	if err := r.validate(ctx); err != nil {
 		return TimedReadSnapshot{}, err
 	}
+	shards, _ := st.(*ShardStore)
+	version := shards.ReadFenceRouteVersion()
 	positions, instant, err := r.timedCommittedBoundary(ctx)
 	if err != nil {
 		return TimedReadSnapshot{}, errors.Wrap(err, label)
@@ -80,10 +202,12 @@ func BeginTimedReadTimestamp(ctx context.Context, coord Coordinator, st store.MV
 		return TimedReadSnapshot{}, err
 	}
 	r.remember(r.register(stamp))
-	snapshot := TimedReadSnapshot{ReadTimestamp: stamp, Instant: instant}
+	snapshot := TimedReadSnapshot{stamp: stamp, Instant: instant}
 	if reader, sharded := r.st.(timedPositionReader); sharded && len(positions) > 1 {
 		snapshot.reader = reader
 		snapshot.positions = positions
+		snapshot.shards = shards
+		snapshot.version = version
 	}
 	return snapshot, nil
 }
