@@ -3,6 +3,7 @@ import argparse
 from collections import defaultdict
 from graphlib import TopologicalSorter
 import json
+import re
 from pathlib import Path
 
 
@@ -34,6 +35,7 @@ def paired(workload, events):
     down = set()
     nodes = {"n1", "n2", "n3"}
     for a, b in zip(stops[::2], stops[1::2]):
+        require(healed is None, "fault after recovery")
         require(a["f"] == b["f"] and a.get("target") == b.get("target")
                 and b["type"] == "info" and not b.get("error"), "incomplete fault")
         if a["f"] == "kill":
@@ -231,6 +233,7 @@ def queue(w, fifo):
             w.before(sends[k], i)
             if k in deletes:
                 w.before(i, deletes[k])
+    require(any(w.calls[i]["status"] == "ok" for i in sends.values()), "no acknowledged send")
     for k, i in sends.items():
         if w.calls[i]["status"] == "ok":
             require(k in deliveries, "acknowledged send missing from drain")
@@ -253,6 +256,8 @@ def fifo_observations(pairs):
     sends = {}
     observed = []
     clocks = set()
+    receipts = set()
+    messages, tuples = {}, {}
     for a, b in pairs:
         obs = b.get("sqs-observation", {})
         if obs:
@@ -262,6 +267,14 @@ def fifo_observations(pairs):
         if a["f"] == "recv":
             for i, raw in enumerate(fifo_batch(obs, b)):
                 require(raw["delivery-index"] == i, "invalid FIFO delivery index")
+                identity = tuple(raw["tuple"])
+                message, receipt = raw.get("message-hash"), raw.get("receipt-hash")
+                require(all(isinstance(h, str) and re.fullmatch("[0-9a-f]{64}", h)
+                            for h in (message, receipt)), "invalid FIFO identity hash")
+                require(receipt not in receipts, "reused FIFO receipt")
+                receipts.add(receipt)
+                require(messages.setdefault(message, identity) == identity, "reused FIFO message ID")
+                require(tuples.setdefault(identity, message) == message, "changed FIFO message ID")
                 deletion = raw.get("delete", {})
                 end = None
                 if deletion.get("type") == "ok":
@@ -269,7 +282,7 @@ def fifo_observations(pairs):
                             and obs["received-at"] <= deletion["start"] <= deletion["end"],
                             "invalid FIFO confirmed deletion")
                     end = deletion["end"]
-                observed.append((obs["received-at"], i, tuple(raw["tuple"]), obs["receive-start"], end))
+                observed.append((obs["received-at"], i, identity, obs["receive-start"], end))
     require(len(clocks) == 1 and observed, "missing or inconsistent FIFO observation clock")
     result = []
     for received, idx, identity, receive_start, delete_end in sorted(observed, key=lambda row: row[:2]):

@@ -8,6 +8,8 @@ bash lean/history/check.sh grpc-raw /path/to/jepsen-grpc-raw-kill/store.tar.gz
 
 If the archive contains several histories, the checker lists their member paths. Repeat the command with the chosen full member path as its third argument.
 
+Keep the hosted artifact's `parameters.txt` beside `store.tar.gz`. The checker matches the selected history to the workload and fault. Both S3 modes use the same history name, so their checks require the parameters file to identify the adapter.
+
 | Workload | Sequential specification used for the recorded operations |
 | --- | --- |
 | gRPC RawKV and TransactionalKV | One current-value register per key for timestamp-free Put/Get. All keys share a single real-time order. |
