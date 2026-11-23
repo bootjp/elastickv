@@ -124,9 +124,7 @@ func TestLuaNegativeTypeCache_SingleProbePerKey(t *testing.T) {
 	nodes, _, _ := createNode(t, 3)
 	defer shutdown(nodes)
 
-	ctx := context.Background()
-	sc, err := newLuaScriptContext(ctx, nodes[0].redisServer)
-	require.NoError(t, err)
+	sc := beginLuaCacheTest(t, nodes[0].redisServer)
 	defer sc.Close()
 
 	// The FIRST keyType call triggers a server probe; the cache must
@@ -152,9 +150,7 @@ func TestLuaNegativeTypeCache_BoundedSize(t *testing.T) {
 	nodes, _, _ := createNode(t, 3)
 	defer shutdown(nodes)
 
-	ctx := context.Background()
-	sc, err := newLuaScriptContext(ctx, nodes[0].redisServer)
-	require.NoError(t, err)
+	sc := beginLuaCacheTest(t, nodes[0].redisServer)
 	defer sc.Close()
 	const cacheLimit = 4
 	sc.negativeTypeLimit = cacheLimit
@@ -215,4 +211,19 @@ func TestLuaRawTypeAtStartCache_BoundedSize(t *testing.T) {
 	sc.rememberRawTypeAtStart(overflowKey, redisTypeNone)
 	require.Equal(t, maxNegativeTypeCacheEntries, len(sc.rawTypeAtStart),
 		"fallback raw type probe must NOT grow the bounded cache")
+}
+
+// These tests inspect a single Lua attempt. Raft can apply a lease renewal
+// while that attempt samples the clock, just as it can during a public EVAL.
+func beginLuaCacheTest(t *testing.T, server *RedisServer) *luaScriptContext {
+	t.Helper()
+	ctx := t.Context()
+	var script *luaScriptContext
+	err := server.retryRedisWrite(ctx, func() error {
+		var err error
+		script, err = newLuaScriptContext(ctx, server)
+		return err
+	})
+	require.NoError(t, err)
+	return script
 }
