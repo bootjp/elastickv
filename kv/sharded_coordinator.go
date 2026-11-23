@@ -348,8 +348,11 @@ func (t *leaseRefreshingTxn) commitWithLocalStamp(ctx context.Context, reqs []*p
 func (t *leaseRefreshingTxn) stampLeaderIssuedTxnForLocalCommit(ctx context.Context, reqs []*pb.Request) (uint64, error) {
 	if t == nil || t.g == nil || t.g.Engine == nil ||
 		ctx.Value(leaderIssuedCommitTSContextKey{}) != true ||
-		!isLeaderEngine(t.g.Engine) || !canStampRawTimestampsOnEngine(ctx, t.g.Engine) {
+		!isLeaderEngine(t.g.Engine) {
 		return 0, nil
+	}
+	if err := verifyLeaderEngineCtx(ctx, t.g.Engine); err != nil {
+		return 0, err
 	}
 	return t.stampLeaderIssuedTxnForVerifiedLocalCommit(ctx, reqs)
 }
@@ -404,15 +407,11 @@ func (t *leaseRefreshingTxn) stampRawTimestampsForLocalCommit(ctx context.Contex
 		if !isLeaderEngine(t.g.Engine) {
 			return nil
 		}
-		if !canStampRawTimestampsOnEngine(ctx, t.g.Engine) {
-			return nil
+		if err := verifyLeaderEngineCtx(ctx, t.g.Engine); err != nil {
+			return err
 		}
 	}
 	return t.coord.stampRawRequestTimestamps(ctx, reqs)
-}
-
-func canStampRawTimestampsOnEngine(ctx context.Context, engine raftengine.Engine) bool {
-	return verifyLeaderEngineCtx(ctx, engine) == nil
 }
 
 func hasUnstampedRawRequests(reqs []*pb.Request) bool {
