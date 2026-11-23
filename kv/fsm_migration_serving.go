@@ -46,7 +46,7 @@ func (f *kvFSM) withMigrationOwnershipEvidence(ctx context.Context, req *pb.Requ
 		}
 	}
 	if !migrationApplyIntersects(view, ranges) {
-		return ctx, nil
+		return f.withAppliedCatalogForReplay(ctx, req)
 	}
 	if drain, err := f.matchesMigrationResolution(ctx, req); drain || err != nil {
 		if err != nil {

@@ -559,7 +559,7 @@ func firstOperationalRequestFailure(results []error) error {
 // isRawApplyVerdict reports whether err is a deterministic verdict of the
 // raw apply path, on the FSM side or the store side.
 func isRawApplyVerdict(err error) bool {
-	if errors.Is(err, errTargetReadinessUnproven) {
+	if errors.Is(err, errTargetReadinessUnproven) || errors.Is(err, errAppliedRouteCatalog) {
 		return false
 	}
 	return isRawProtocolVerdict(err) ||
@@ -840,6 +840,9 @@ func applyErrorResponse(err error) any {
 // to record every error as a per-request result, so a coalesced write carrying
 // an unproven readiness verdict advanced the applied index instead of halting.
 func haltResponseFor(err error) *haltApplyResponse {
+	if errors.Is(err, errAppliedRouteCatalog) {
+		return haltErr(err)
+	}
 	if errors.Is(err, errTargetReadinessUnproven) {
 		return haltErr(errors.Wrap(errors.Mark(err, ErrTargetReadinessApply), "kv/fsm: apply target readiness"))
 	}
@@ -1396,7 +1399,7 @@ func (f *kvFSM) appliedTargetReadyRoutesForRouteRange(ctx context.Context, route
 		routes, _, _ := f.currentShardRoutesForRouteRange(ctx, routeStart, routeEnd)
 		return routes, nil
 	}
-	if _, ok := ctx.Value(applyRouteHistoryKey{}).(applyRouteHistory); !ok {
+	if evidence, _ := ctx.Value(applyRouteHistoryKey{}).(applyRouteHistory); !evidence.migrationEvidence {
 		return nil, errors.WithStack(ErrRouteCutoverPending)
 	}
 	routes, catalogVersion, proof := f.currentShardRoutesForRouteRange(ctx, routeStart, routeEnd)

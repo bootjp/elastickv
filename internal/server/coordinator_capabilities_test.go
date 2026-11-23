@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/bootjp/elastickv/internal/clusterbootstrap"
 	"github.com/bootjp/elastickv/keyviz"
@@ -104,6 +105,11 @@ func (s *shardedCapabilitySpy) LinearizableReadForKey(context.Context, []byte) (
 func (s *shardedCapabilitySpy) LeaseRead(context.Context) (uint64, error) {
 	s.record("LeaseRead")
 	return spyIndex, errSpyForwarded
+}
+
+func (s *shardedCapabilitySpy) LeaseReadTime(context.Context) (time.Time, error) {
+	s.record("LeaseReadTime")
+	return time.UnixMilli(int64(spyIndex)), errSpyForwarded
 }
 
 func (s *shardedCapabilitySpy) LeaseReadForKey(context.Context, []byte) (uint64, error) {
