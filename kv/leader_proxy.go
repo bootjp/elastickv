@@ -359,6 +359,23 @@ func classifyValidatedForwardFailure(phase pb.ForwardFailurePhase, reason pb.For
 	return &ForwardFailure{Decision: pb.ForwardDecisionClass_FORWARD_DECISION_CLASS_OUTCOME_UNKNOWN}
 }
 
+// IsTransientReadBarrierError reports whether an unsuccessful read-only
+// barrier can be retried after a leader election or transport interruption.
+func IsTransientReadBarrierError(err error) bool {
+	if isTransientLeaderError(err) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	// The caller may add group and filesystem context. Read the original
+	// wire status to match the exact response from older leaders.
+	var wire interface{ GRPCStatus() *status.Status }
+	if !errors.As(err, &wire) {
+		return false
+	}
+	st := wire.GRPCStatus()
+	return st.Code() == codes.Unavailable || st.Code() == codes.DeadlineExceeded ||
+		(st.Code() == codes.Unknown && st.Message() == "not leader")
+}
+
 func (p *LeaderProxy) forwardLeaseRead(callerCtx context.Context) (leaseReadResult, error) {
 	deadline := time.Now().Add(leaderProxyRetryBudget)
 	ctx, cancel := context.WithDeadline(callerCtx, deadline)
