@@ -174,7 +174,7 @@ func protocolDefinitions() {
 	fmt.Printf("def ttl (n unit : Int) : Prop := %s\n", guardSource("redis_strings.go", "validRedisTTL"))
 	fmt.Printf("def budget (start now seconds : Int) : Prop := %s\n", guardSource("sqs_messages.go", "visibilityExtensionFits"))
 	fmt.Printf("def luaFields : List String := %s\n", transactionSource("redis_lua_context.go", "commit", "kv.DispatchWithReadTimestamp", ""))
-	fmt.Printf("def beginFields : List String := %s\n", transactionSource("s3.go", "createMultipartUpload", "s.dispatchS3MetadataMutation", ""))
+	fmt.Printf("def beginFields : List String := %s\n", transactionSource("s3.go", "createMultipartUpload", "s.dispatchS3MetadataMutation", "s.retryS3Mutation"))
 	fmt.Printf("def partFields : List String := %s\n", transactionSource("s3_upload_part.go", "commitS3UploadPart", "s.dispatchS3MetadataMutation", ""))
 	fmt.Printf("def visibilityFields : List String := %s\n", transactionSource("sqs_messages.go", "changeVisibilityWithRetry", "s.dispatchSQSMutation", "range transactRetryMaxAttempts"))
 	fmt.Printf("def abortFields : List String := %s\n", transactionSource("s3.go", "abortMultipartUpload", "s.dispatchS3MetadataMutation", "s.retryS3Mutation"))
