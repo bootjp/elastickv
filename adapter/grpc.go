@@ -768,6 +768,9 @@ func (r *GRPCServer) RawPut(ctx context.Context, req *pb.RawPutRequest) (*pb.Raw
 			Success:     false,
 		}, projectPublicGRPCMutationError(err)
 	}
+	if res == nil || res.CommitIndex == 0 {
+		return &pb.RawPutResponse{Success: false}, projectPublicGRPCMutationError(kv.ErrTransactionOutcomeUnknown)
+	}
 
 	return &pb.RawPutResponse{
 		CommitIndex: res.CommitIndex,
@@ -787,6 +790,9 @@ func (r *GRPCServer) RawDelete(ctx context.Context, req *pb.RawDeleteRequest) (*
 			CommitIndex: uint64(0),
 			Success:     false,
 		}, projectPublicGRPCMutationError(err)
+	}
+	if res == nil || res.CommitIndex == 0 {
+		return &pb.RawDeleteResponse{Success: false}, projectPublicGRPCMutationError(kv.ErrTransactionOutcomeUnknown)
 	}
 
 	return &pb.RawDeleteResponse{

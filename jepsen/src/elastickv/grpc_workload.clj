@@ -46,6 +46,7 @@
                                  :value v})]
           (cond-> (assoc op :type (keyword (:type result)))
             (= :read (:f op)) (assoc :value (independent/tuple k (:value result)))
+            (contains? result :commit_index) (assoc :commit-index (:commit_index result))
             (:error result) (assoc :error (:error result))))
         (catch Exception e
           (assoc op :type :info :error (.getMessage e))))))

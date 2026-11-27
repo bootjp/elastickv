@@ -25,6 +25,7 @@ type testServer struct {
 	value        []byte
 	writes       int
 	calls        int
+	commitIndex  uint64
 	loseReply    bool
 	rejectDelete bool
 }
@@ -48,12 +49,39 @@ func (s *testServer) get() []byte {
 
 func (s *testServer) RawPut(_ context.Context, req *pb.RawPutRequest) (*pb.RawPutResponse, error) {
 	err := s.put(req.GetValue())
-	return &pb.RawPutResponse{Success: err == nil}, err
+	return &pb.RawPutResponse{Success: err == nil, CommitIndex: s.commitIndex}, err
 }
 
 func (s *testServer) Put(_ context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
 	err := s.put(req.GetValue())
-	return &pb.PutResponse{Success: err == nil}, err
+	return &pb.PutResponse{Success: err == nil, CommitIndex: 42}, err
+}
+
+func TestWriteEvidenceIncludesCommitIndex(t *testing.T) {
+	for _, api := range []string{apiRaw, apiTransactional} {
+		t.Run(api, func(t *testing.T) {
+			client, _ := fixture(t, api)
+			value := int64(11)
+			got := client.invoke(t.Context(), request{Op: "write", Key: "jepsen-grpc/raw/79", Value: &value})
+			require.Equal(t, outcomeOK, got.Type)
+			require.NotNil(t, got.CommitIndex)
+			require.Equal(t, uint64(42), *got.CommitIndex)
+		})
+	}
+}
+
+func TestRawWriteEvidenceRetainsZeroCommitIndex(t *testing.T) {
+	client, backend := fixture(t, apiRaw)
+	backend.mu.Lock()
+	backend.commitIndex = 0
+	backend.mu.Unlock()
+	value := int64(11)
+	got := client.invoke(t.Context(), request{Op: "write", Key: "jepsen-grpc/raw/79", Value: &value})
+	require.Equal(t, outcomeOK, got.Type)
+	require.NotNil(t, got.CommitIndex)
+	encoded, err := json.Marshal(got)
+	require.NoError(t, err)
+	require.Contains(t, string(encoded), `"commit_index":0`)
 }
 
 func (s *testServer) RawDelete(context.Context, *pb.RawDeleteRequest) (*pb.RawDeleteResponse, error) {
@@ -89,7 +117,7 @@ func fixture(t *testing.T, api string) (rpcClient, *testServer) {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
-	backend := &testServer{}
+	backend := &testServer{commitIndex: 42}
 	server := grpc.NewServer(grpc.UnaryInterceptor(backend.countRPC))
 	pb.RegisterRawKVServer(server, backend)
 	pb.RegisterTransactionalKVServer(server, backend)
