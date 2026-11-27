@@ -33,7 +33,9 @@ jobs:
           go-version-file: 'go.mod'
       - name: Verify module download protection with an empty cache
         if: matrix.shard == 'rest'
-        run: bash scripts/check-go-module-guard.sh
+        run: |
+          python3 -m unittest discover -s scripts -p test_go_module_guard.py -v
+          bash scripts/check-go-module-guard.sh
       - name: Install missing system tools
         # fusermount3 lets the FUSE end-to-end tests mount without root
         # (internal/filesystem/fuseadapter, TestMountFilesystemServiceServesKernelMount).

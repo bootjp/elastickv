@@ -68,6 +68,11 @@ Verified on 2026-11-28:
 - `go mod download` with a separate empty cache and the Guard-only proxy
   fetched the repository's dependencies and `go1.27.4` successfully.
 - The canary rejected a configuration pointing to `proxy.golang.org`.
+- Review regression tests reproduce saved private-module exceptions and
+  an existing Go binary outside `/usr/local/go/bin`. Both failed before
+  the fixes: use nonempty `none` overrides in the canary and the detected
+  Go path in provisioning. The tests run offline in the `rest` shard and
+  leave the caller's Go settings unchanged.
 - `shellcheck` for the canary, `bash -n` for both changed shell scripts,
   and `git diff --check` passed.
 - `actionlint` passed for all eight changed workflows after excluding

@@ -14,7 +14,7 @@ export GOPATH="$work/gopath"
 export GOWORK=off
 export GO111MODULE=on
 # A private-module exception must not bypass this public-module canary.
-export GOPRIVATE='' GONOPROXY='' GONOSUMDB=''
+export GOPRIVATE=none GONOPROXY=none GONOSUMDB=none
 cd "$work"
 go mod init guard-check
 
