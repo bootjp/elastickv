@@ -6,6 +6,11 @@ permissions:
   contents: read
   pull-requests: read
   actions: write
+env:
+  PIP_INDEX_URL: https://pypi.flatt.tech/simple/
+  PIP_CONFIG_FILE: /dev/null
+  PIP_EXTRA_INDEX_URL: ''
+  PIP_FIND_LINKS: ''
 jobs:
   dispatch-approved:
     if: >-
