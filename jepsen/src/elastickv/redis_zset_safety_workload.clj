@@ -639,7 +639,7 @@
 ;; A late ZADD stays in the search across acknowledged overwrites. Bound
 ;; recursion depth and memo size for read searches that include one.
 (def ^:private max-late-zadd-read-operations 256)
-(def ^:private max-late-zadd-read-states 4096)
+(def ^:private max-late-zadd-read-states 262144)
 
 (defn- read-search-exhausted! [budget limit]
   (throw (ex-info "Timed-out ZADD read search exhausted its budget"
@@ -648,7 +648,12 @@
                    :budget budget
                    :limit limit})))
 
-(defn- linearized-read-states
+;; Cross-member prefix checks repeat identical searches for each read. Keep
+;; their results only for this checker invocation, so one history cannot
+;; affect another and long Jepsen runs do not recompute the same search.
+(def ^:private ^:dynamic *read-search-cache* nil)
+
+(defn- linearized-read-states-uncached
   "Enumerate possible member states at a read. Required mutations are
   committed tail candidates and must appear before the read. Optional
   mutations are :info/pending or concurrent ops and may either be absent
@@ -664,31 +669,41 @@
     (letfn [(charge! [size]
               (when (and budget (neg? (vswap! budget - size)))
                 (read-search-exhausted! :states max-late-zadd-read-states)))
-            (step [states remaining]
-              (let [k [states remaining]]
+            (step [state remaining]
+              (let [k [state remaining]]
                 (if-some [cached (get @memo k)]
                   cached
                   (do
                     (charge! 1)
                     (let [result
                           (if (empty? remaining)
-                            states
+                            #{state}
                             (reduce
                               (fn [acc [idx item]]
                                 (let [remaining' (drop-index remaining idx)
-                                      applied (advance-states states item)
+                                      applied (advance-states #{state} item)
                                       acc (if (::required? item)
                                             acc
-                                            (into acc (step states remaining')))]
+                                            (into acc (step state remaining')))]
                                   (if (seq applied)
-                                    (into acc (step applied remaining'))
+                                    (into acc (mapcat #(step % remaining') applied))
                                     acc)))
                               #{}
                               (enabled-indexed remaining)))]
                       (charge! (max 0 (dec (count result))))
                       (swap! memo assoc k result)
                       result)))))]
-      (step initial-states items))))
+      (into #{} (mapcat #(step % items) initial-states)))))
+
+(defn- linearized-read-states [initial-states required optional]
+  (if-let [cache *read-search-cache*]
+    (let [key [initial-states (vec required) (vec optional)]]
+      (if-some [states (get @cache key)]
+        states
+        (let [states (linearized-read-states-uncached initial-states required optional)]
+          (swap! cache assoc key states)
+          states)))
+    (linearized-read-states-uncached initial-states required optional)))
 
 (defn- possible-states-for-member
   "Enumerate possible states for one member at a read. `force-required?`
@@ -1422,46 +1437,47 @@
   []
   (reify checker/Checker
     (check [_ _test history _opts]
-      (let [pairs (pair-invokes-with-completions history)
-            mutations (completed-mutation-window pairs)
-            mutations-by-m (mutations-by-member mutations)
-            read-pairs (filter (fn [{:keys [invoke complete]}]
-                                 (and invoke complete
-                                      (= :ok (:type complete))
-                                      (#{:zrange-all :zrangebyscore}
-                                       (:f invoke))))
-                               pairs)
-            read-errors (check-reads mutations-by-m read-pairs)
-            all-errors (if (some #(= :read-search-budget-exhausted (:cause %)) read-errors)
-                         read-errors
-                         (into read-errors (check-read-stability mutations-by-m read-pairs)))
-            by-kind (group-by :kind all-errors)
-            ;; Vacuous-pass guard: if the run produced zero
-            ;; successful reads, we have no evidence that the system
-            ;; under test actually satisfies ZSet safety -- every op
-            ;; may have been downgraded to :info because Redis was
-            ;; unreachable or every read timed out. Returning
-            ;; `:valid? true` in that case would be a false-green.
-            ;; Emit `:valid? :unknown` with a diagnostic reason; the
-            ;; cli's `fail-on-invalid!` treats anything other than
-            ;; `true` as a failure (see elastickv.cli/fail-on-invalid!).
-            no-successful-reads? (zero? (count read-pairs))
-            valid? (cond
-                     (some #(not= :inconclusive-zadd-history (:kind %)) all-errors) false
-                     (or no-successful-reads? (seq all-errors)) :unknown
-                     :else true)]
-        (cond-> {:valid? valid?
-                 :reads  (count read-pairs)
-                 :mutations (count mutations)
-                 :error-count (count all-errors)
-                 :errors-by-kind (into {} (map (fn [[k v]] [k (count v)]) by-kind))
-                 :first-errors (take 20 all-errors)}
-          no-successful-reads?
-          (assoc :reason
-                 (str "No successful :zrange-all / :zrangebyscore reads"
-                      " completed -- cannot assert ZSet safety. Likely"
-                      " Redis was unreachable or every read timed out;"
-                      " re-run against a healthy cluster.")))))))
+      (binding [*read-search-cache* (atom {})]
+        (let [pairs (pair-invokes-with-completions history)
+             mutations (completed-mutation-window pairs)
+             mutations-by-m (mutations-by-member mutations)
+             read-pairs (filter (fn [{:keys [invoke complete]}]
+                                  (and invoke complete
+                                       (= :ok (:type complete))
+                                       (#{:zrange-all :zrangebyscore}
+                                        (:f invoke))))
+                                pairs)
+             read-errors (check-reads mutations-by-m read-pairs)
+             all-errors (if (some #(= :read-search-budget-exhausted (:cause %)) read-errors)
+                          read-errors
+                          (into read-errors (check-read-stability mutations-by-m read-pairs)))
+             by-kind (group-by :kind all-errors)
+             ;; Vacuous-pass guard: if the run produced zero
+             ;; successful reads, we have no evidence that the system
+             ;; under test actually satisfies ZSet safety -- every op
+             ;; may have been downgraded to :info because Redis was
+             ;; unreachable or every read timed out. Returning
+             ;; `:valid? true` in that case would be a false-green.
+             ;; Emit `:valid? :unknown` with a diagnostic reason; the
+             ;; cli's `fail-on-invalid!` treats anything other than
+             ;; `true` as a failure (see elastickv.cli/fail-on-invalid!).
+             no-successful-reads? (zero? (count read-pairs))
+             valid? (cond
+                      (some #(not= :inconclusive-zadd-history (:kind %)) all-errors) false
+                      (or no-successful-reads? (seq all-errors)) :unknown
+                      :else true)]
+         (cond-> {:valid? valid?
+                  :reads  (count read-pairs)
+                  :mutations (count mutations)
+                  :error-count (count all-errors)
+                  :errors-by-kind (into {} (map (fn [[k v]] [k (count v)]) by-kind))
+                  :first-errors (take 20 all-errors)}
+           no-successful-reads?
+           (assoc :reason
+                  (str "No successful :zrange-all / :zrangebyscore reads"
+                       " completed -- cannot assert ZSet safety. Likely"
+                       " Redis was unreachable or every read timed out;"
+                       " re-run against a healthy cluster."))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Workload
