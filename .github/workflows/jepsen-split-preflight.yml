@@ -31,6 +31,10 @@ on:
         default: none
 permissions:
   contents: read
+# No fallback: module downloads must pass the malware blocklist.
+env:
+  GOPROXY: https://golang.flatt.tech
+
 jobs:
   voter-pause:
     name: ${{ inputs.membership-only && format('Jepsen (split membership, {0})', inputs.membership-fault) || 'voter-pause' }}

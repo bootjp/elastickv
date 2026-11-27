@@ -36,13 +36,16 @@ if [ "$ROLE" = "ctrl" ]; then
     GO_ARCH="amd64"
   fi
 
-  if ! command -v go >/dev/null 2>&1 || [[ "$(go version | awk '{print $3}')" != "go${GO_VERSION}" ]]; then
+  GO_BINARY=$(command -v go || true)
+  if [ -z "$GO_BINARY" ] || [[ "$("$GO_BINARY" version | awk '{print $3}')" != "go${GO_VERSION}" ]]; then
     echo "[jepsen] installing go ${GO_VERSION} for ${GO_ARCH}"
     curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${GO_ARCH}.tar.gz" -o /tmp/go.tar.gz
     sudo rm -rf /usr/local/go
     sudo tar -C /usr/local -xzf /tmp/go.tar.gz
+    GO_BINARY=/usr/local/go/bin/go
   fi
   echo 'export PATH=$PATH:/usr/local/go/bin:$HOME/go/bin' | sudo tee /etc/profile.d/go.sh >/dev/null
+  sudo -u vagrant -H "$GO_BINARY" env -w GOPROXY=https://golang.flatt.tech
 
   if [ ! -f /home/vagrant/.ssh/id_rsa ]; then
     if [ -f /home/vagrant/elastickv/jepsen/.ssh/ctrl_id_rsa ]; then

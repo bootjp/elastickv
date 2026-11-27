@@ -53,6 +53,10 @@ concurrency:
 name: Jepsen Scheduled Stress Test
 permissions:
   contents: read
+# No fallback: module downloads must pass the malware blocklist.
+env:
+  GOPROXY: https://golang.flatt.tech
+
 jobs:
   faults:
     if: ${{ inputs.faults-only || !inputs.workloads-json }}

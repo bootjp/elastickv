@@ -8,6 +8,10 @@ concurrency:
 name: Jepsen Test
 permissions:
   contents: read
+# No fallback: module downloads must pass the malware blocklist.
+env:
+  GOPROXY: https://golang.flatt.tech
+
 jobs:
   test:
     # Every workload runs twice: once against the cleartext cluster and
