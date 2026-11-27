@@ -1,4 +1,4 @@
-# Go dependency downloads through Takumi Guard
+# Dependency downloads through Takumi Guard
 
 Status: Proposed
 Author: bootjp
@@ -10,6 +10,36 @@ Route public Go module downloads in CI, Go image builds, and Jepsen guest
 builds through `https://golang.flatt.tech`. Document the same opt-in setup
 for contributors. Do not change application code, dependency versions,
 production deployments, or machine-wide developer settings.
+
+Extend the same anonymous protection to the admin frontend's npm downloads
+and the deployment controller's pip downloads, including portable GitOps
+workflow examples. Keep all existing dependency versions and integrity data.
+
+## npm and Python boundaries
+
+- Commit `web/admin/.npmrc` pointing to `https://npm.flatt.tech/`. Copy it
+  alongside the manifests before the Docker SPA stage's `npm ci`; runner
+  settings do not propagate into the build stage. Set the CI registry before
+  dependency installation. Existing npmjs lockfile URLs are supported by
+  the provider; verify a cold install rather than updating dependencies.
+- Configure pip's index as `https://pypi.flatt.tech/simple/`. Disable pip
+  configuration-file loading with `PIP_CONFIG_FILE=/dev/null` and clear
+  extra-index and find-links environment settings so an additional source
+  cannot silently bypass the Guard. Apply this in CI, controller images,
+  and the published workflow examples. Local setup remains opt-in.
+- Check npm with an empty cache: fetch a known-good package and require
+  HTTP 403 for `@panda-guard/test-malicious`, without executing scripts or
+  changing the frontend's lockfile. Check pip's effective boundary settings
+  and download a known-good wheel without using the installed/cache state.
+  The provider has no documented PyPI sentinel yet, so do not claim that
+  Python's malicious-package rejection has been demonstrated.
+- Public artifact hosts reached through Guard-issued redirects are expected;
+  direct URL, Git, local, cached, and intentionally private dependencies are
+  outside this registry integration. Publishing requires an explicit public
+  registry and is outside this change.
+
+These boundaries were reviewed before implementation. They add no credentials,
+permissions, package updates, runtime behavior, or production mutations.
 
 ## Decisions
 
@@ -87,3 +117,6 @@ run locally. Production data and backups are outside this change.
 ## Reference
 
 [Provider release note](https://shisho.dev/docs/ja/r/202605-takumi-guard-golang/).
+[npm setup](https://shisho.dev/docs/ja/t/guard/quickstart/npm/),
+[PyPI setup](https://shisho.dev/docs/ja/t/guard/quickstart/pypi/), and
+[sentinel availability](https://shisho.dev/docs/t/guard/features/admin-deployment/).
