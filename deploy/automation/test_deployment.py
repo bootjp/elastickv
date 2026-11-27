@@ -350,6 +350,12 @@ class PublicationTests(unittest.TestCase):
                 str(path),
             )
             for sha in re.findall(r"\b[0-9a-f]{40}\b", text):
+                # Official setup-python v7.1.0 pin is public supply-chain metadata.
+                if (
+                    sha == "6d4fd22b20465ccc0f7354476588e8df7c9ca0e0"
+                    and f"actions/setup-python@{sha}" in text
+                ):
+                    continue
                 self.assertEqual({"0"}, set(sha), str(path))
             for host in re.findall(r"https?://([A-Za-z0-9.-]+)", text):
                 self.assertTrue(

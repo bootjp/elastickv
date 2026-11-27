@@ -24,12 +24,19 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: Create isolated Python environment
+      - name: Set up Python with locked wheel support
+        # actions/setup-python v7.1.0
+        # Pin an interpreter with wheels for the hash-locked parser dependency.
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.14'
+      - name: Create job-local virtual environment
         run: |
           python3 -m venv "$RUNNER_TEMP/guard-python"
           echo "$RUNNER_TEMP/guard-python/bin" >> "$GITHUB_PATH"
       - name: Install YAML parser
-        run: python3 -m pip install PyYAML==6.0.2 ruff==0.9.10
+        run: |
+          python3 -m pip install --require-hashes --only-binary=:all: -r deploy/automation/requirements-ci.lock
       - name: Verify PyPI package download protection with an empty cache
         run: bash scripts/check-pypi-package-guard.sh
       - name: Check Python source

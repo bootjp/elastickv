@@ -8,12 +8,13 @@ Date: 2026-11-28
 
 Route public Go module downloads in CI, Go image builds, and Jepsen guest
 builds through `https://golang.flatt.tech`. Document the same opt-in setup
-for contributors. Do not change application code, dependency versions,
+for contributors. Do not change application code,
 production deployments, or machine-wide developer settings.
 
 Extend the same anonymous protection to the admin frontend's npm downloads
 and the deployment controller's pip downloads, including portable GitOps
-workflow examples. Keep all existing dependency versions and integrity data.
+workflow examples. Keep the application dependency versions and npm integrity
+data. Python's CI parser is aligned to the controller's PyYAML 6.0.3.
 
 ## npm and Python boundaries
 
@@ -41,7 +42,33 @@ workflow examples. Keep all existing dependency versions and integrity data.
   registry and is outside this change.
 
 These boundaries were reviewed before implementation. They add no credentials,
-permissions, package updates, runtime behavior, or production mutations.
+permissions, application behavior changes, or production mutations.
+
+## Python artifact integrity follow-up
+
+A security review identified that pins alone trust a proxy to supply the
+artifact bytes. All controller, CI, and privileged example installs now use
+`--require-hashes --only-binary=:all:`. Commit the full transitive dependency
+closure in `requirements.lock`, CI tooling in `requirements-ci.lock`, and the
+shared parser hashes in `requirements-parser.lock` and its identical portable
+example copy. SHA-256 values come from official PyPI release JSON fetched
+independently of Guard; do not bootstrap trust from the proxy's returned hash.
+Keep the small `requirements.txt` as input pins; tests reject drift from the lock.
+
+Use Python 3.14 for CI and the controller instead of 3.15: PyYAML 6.0.3 has
+3.14 wheels and no 3.15 wheels. Align CI's old 6.0.2 parser pin to that same
+6.0.3 release. Reject source builds to avoid implicit unhashed build-tool
+downloads. Pin the official setup-python v7.1.0 Action by full commit SHA.
+No Go server or data-format behavior changes.
+
+The regression derives the install flags from the real controller Dockerfile.
+It demonstrated acceptance of a substituted, unhashed version-pinned wheel
+before the fix. After the fix, both missing and incorrect local hashes reject
+the artifact before installation; a matching trusted hash still installs.
+Other tests verify all five rendered privileged install paths retain the
+same parser lock even when the code path is customized. All 153 Python tests,
+dependency consistency checks, Ruff, and workflow syntax checks passed locally
+on Python 3.14, including a fresh Guard install using only hash-verified wheels.
 
 ## Decisions
 
@@ -135,3 +162,4 @@ run locally. Production data and backups are outside this change.
 [npm setup](https://shisho.dev/docs/ja/t/guard/quickstart/npm/),
 [PyPI setup](https://shisho.dev/docs/ja/t/guard/quickstart/pypi/), and
 [sentinel availability](https://shisho.dev/docs/t/guard/features/admin-deployment/).
+[pip secure installs](https://pip.pypa.io/en/stable/topics/secure-installs/).

@@ -6,15 +6,16 @@ WORKDIR /src
 COPY . .
 RUN CGO_ENABLED=0 go build -o /raftadmin ./cmd/raftadmin
 
-FROM python:3.15-slim-bookworm
+# PyYAML 6.0.3 publishes CPython 3.14 wheels; do not fetch build dependencies.
+FROM python:3.14-slim-bookworm
 ENV PIP_INDEX_URL=https://pypi.flatt.tech/simple/ PIP_CONFIG_FILE=/dev/null \
     PIP_EXTRA_INDEX_URL="" PIP_FIND_LINKS=""
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates openssl \
     && rm -rf /var/lib/apt/lists/*
 ADD --checksum=sha256:bb766f710eef8ede859c18578c72c327597cd4c8a85b06001b1f3843c6019386 https://github.com/cli/cli/releases/download/v2.102.0/gh_2.102.0_linux_amd64.tar.gz /tmp/gh.tar.gz
 RUN tar -xzf /tmp/gh.tar.gz --strip-components=2 -C /usr/local/bin gh_2.102.0_linux_amd64/bin/gh && rm /tmp/gh.tar.gz
-COPY deploy/automation/requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+COPY deploy/automation/requirements.lock deploy/automation/requirements-parser.lock /app/
+RUN pip install --no-cache-dir --require-hashes --only-binary=:all: -r /app/requirements.lock
 COPY --from=tools /raftadmin /usr/local/bin/raftadmin
 COPY deploy/automation/agent.py deploy/automation/compatibility.py \
      deploy/automation/compatibility_profile.py deploy/automation/compatibility_runtime.py \

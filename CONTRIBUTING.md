@@ -75,7 +75,7 @@ bash scripts/check-npm-package-guard.sh
 
 The Python controller, its CI, and portable GitOps workflow examples use
 the anonymous [PyPI Guard index](https://shisho.dev/docs/ja/t/guard/quickstart/pypi/).
-For local pip use, activate your virtual environment, then configure only
+For local pip use, activate a Python 3.14 virtual environment, then configure only
 the current shell:
 
 ```bash
@@ -83,7 +83,7 @@ export PIP_INDEX_URL=https://pypi.flatt.tech/simple/
 export PIP_CONFIG_FILE=/dev/null
 export PIP_EXTRA_INDEX_URL=''
 export PIP_FIND_LINKS=''
-pip install -r deploy/automation/requirements.txt
+pip install --require-hashes --only-binary=:all: -r deploy/automation/requirements.lock
 bash scripts/check-pypi-package-guard.sh
 ```
 
@@ -92,6 +92,14 @@ extra index or find-links directory from bypassing the Guard. Do not add an
 alternate public index. The PyPI check downloads a fresh known-good wheel;
 the provider does not yet document a harmless PyPI block-test package, so
 this is not evidence of an end-to-end Python block rejection.
+
+Python installs verify locally committed SHA-256 hashes for every dependency
+and use wheels only. Hashes come from official PyPI release metadata fetched
+independently of Guard. Keep `requirements-parser.lock` and its portable
+example copy identical when updating them. CI uses the same PyYAML 6.0.3 as
+the controller; Python 3.14 is selected because that release has no 3.15
+wheels. Unhashed source builds and their implicit build dependencies are not
+permitted in these install paths.
 
 Existing caches/layers, direct URL or Git dependencies, local packages, and
 explicit private/scoped registries are outside these registry checks.

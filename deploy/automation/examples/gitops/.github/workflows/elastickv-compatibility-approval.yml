@@ -36,12 +36,16 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      # actions/setup-python v7.1.0; PyYAML 6.0.3 has CPython 3.14 wheels.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.14'
       - name: Create isolated Python environment
         run: |
           python3 -m venv "$RUNNER_TEMP/guard-python"
           echo "$RUNNER_TEMP/guard-python/bin" >> "$GITHUB_PATH"
       - run: |
-          python3 -m pip install PyYAML==6.0.2
+          python3 -m pip install --require-hashes --only-binary=:all: -r automation/requirements-parser.lock
           ELASTICKV_DEPLOYMENT_CONFIG='' python3 -m unittest discover -s automation -v
   compatibility-review:
     if: github.event_name == 'workflow_dispatch'
@@ -55,13 +59,17 @@ jobs:
         with:
           ref: main
           persist-credentials: false
+      # actions/setup-python v7.1.0; PyYAML 6.0.3 has CPython 3.14 wheels.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.14'
       - name: Create isolated Python environment
         run: |
           python3 -m venv "$RUNNER_TEMP/guard-python"
           echo "$RUNNER_TEMP/guard-python/bin" >> "$GITHUB_PATH"
       - name: Test trusted controller and review gates
         run: |
-          python3 -m pip install PyYAML==6.0.2
+          python3 -m pip install --require-hashes --only-binary=:all: -r automation/requirements-parser.lock
           ELASTICKV_DEPLOYMENT_CONFIG='' python3 -m unittest discover -s automation -v
       - name: Revalidate immutable proposal and record exact-head check
         env:
@@ -82,11 +90,16 @@ jobs:
         with:
           ref: main
           persist-credentials: false
+      # actions/setup-python v7.1.0; PyYAML 6.0.3 has CPython 3.14 wheels.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.14'
       - name: Create isolated Python environment
         run: |
           python3 -m venv "$RUNNER_TEMP/guard-python"
           echo "$RUNNER_TEMP/guard-python/bin" >> "$GITHUB_PATH"
-      - run: python3 -m pip install PyYAML==6.0.2
+      - run: |
+          python3 -m pip install --require-hashes --only-binary=:all: -r automation/requirements-parser.lock
       - name: Recheck human consent and merge only the reviewed head
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

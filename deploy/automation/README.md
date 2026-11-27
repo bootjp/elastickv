@@ -161,13 +161,13 @@ hooks need a separate qualification profile.
 
 ## Prepare a site configuration
 
-Use Python 3.12 or newer and a local virtual environment:
+Use Python 3.14 and a local virtual environment (matching the locked wheels):
 
 ```sh
-python3 -m venv /tmp/elastickv-automation-venv
+python3.14 -m venv /tmp/elastickv-automation-venv
 PIP_INDEX_URL=https://pypi.flatt.tech/simple/ PIP_CONFIG_FILE=/dev/null \
   PIP_EXTRA_INDEX_URL='' PIP_FIND_LINKS='' \
-  /tmp/elastickv-automation-venv/bin/pip install -r deploy/automation/requirements.txt
+  /tmp/elastickv-automation-venv/bin/pip install --require-hashes --only-binary=:all: -r deploy/automation/requirements.lock
 cp deploy/automation/examples/gitops/automation/deployment.json /tmp/site.json
 ```
 
