@@ -2,6 +2,8 @@
   "Unit tests for the ZSet safety workload's test-spec construction and
   the model-based checker's edge cases (no-op ZREM, :info ZINCRBY)."
   (:require [clojure.test :refer :all]
+            [clojure.edn :as edn]
+            [clojure.java.io :as io]
             [jepsen.checker :as checker]
             [jepsen.client :as client]
             [elastickv.redis-zset-safety-workload :as workload]))
@@ -915,24 +917,44 @@
     (is (false? (:valid? impossible)))
     (is (contains? (:errors-by-kind impossible) :unstable-read-without-mutation))))
 
-(deftest many-timed-out-zadds-return-unknown-when-read-search-is-exhausted
+(deftest oversized-timed-out-zadd-search-remains-inconclusive
   (let [history (mapv #(assoc %1 :index %2)
                       (concat
-                        (for [type [:invoke :info] process (range 12)]
+                        (for [type [:invoke :info] process (range 256)]
                           {:type type :process process :f :zadd :value ["m1" 49]})
-                        [{:type :invoke :process 12 :f :zadd :value ["m1" 7]}
-                         {:type :ok :process 12 :f :zadd :value ["m1" 7]}
-                         {:type :invoke :process 12 :f :zadd :value ["m1" 11]}
-                         {:type :ok :process 12 :f :zadd :value ["m1" 11]}
-                         {:type :invoke :process 12 :f :zrange-all}
-                         {:type :ok :process 12 :f :zrange-all :value [["m1" 11.0]]}
-                         {:type :invoke :process 12 :f :zrange-all}
-                         {:type :ok :process 12 :f :zrange-all :value [["m1" 49.0]]}])
+                        [{:type :invoke :process 256 :f :zadd :value ["m1" 7]}
+                         {:type :ok :process 256 :f :zadd :value ["m1" 7]}
+                         {:type :invoke :process 256 :f :zadd :value ["m1" 11]}
+                         {:type :ok :process 256 :f :zadd :value ["m1" 11]}
+                         {:type :invoke :process 256 :f :zrange-all}
+                         {:type :ok :process 256 :f :zrange-all :value [["m1" 11.0]]}
+                         {:type :invoke :process 256 :f :zrange-all}
+                         {:type :ok :process 256 :f :zrange-all :value [["m1" 49.0]]}])
                       (range))
         result (run-checker history)]
     (is (= :unknown (:valid? result)))
     (is (= 1 (get-in result [:errors-by-kind :inconclusive-zadd-history])))
-    (is (= :read-search-budget-exhausted (:cause (first (:first-errors result)))))))
+    (is (= :read-search-budget-exhausted (:cause (first (:first-errors result)))))
+    (is (= :operations (:budget (first (:first-errors result)))))))
+
+(defn- long-uncertain-zset-history []
+  (with-open [reader (io/reader "test/fixtures/redis-zset-read-budget-m6.edn")]
+    (mapv edn/read-string (line-seq reader))))
+
+(deftest confirmed-zset-read-after-long-uncertain-history
+  ;; This is the member-local part of the scheduled Jepsen history whose
+  ;; completed read at index 5169 exhausted the checker's 4096-state budget.
+  (let [result (run-checker (long-uncertain-zset-history))]
+    (is (true? (:valid? result)) (pr-str result))))
+
+(deftest invalid-zset-read-after-long-uncertain-history
+  (let [history (mapv (fn [op]
+                        (if (= 5169 (:index op))
+                          (assoc op :value [["m6" 999.0]])
+                          op))
+                      (long-uncertain-zset-history))
+        result (run-checker history)]
+    (is (false? (:valid? result)) (pr-str result))))
 
 (deftest range-reads-cannot-switch-overlapping-write-order
   ;; Stability is not just a full-read property. Two non-overlapping bounded

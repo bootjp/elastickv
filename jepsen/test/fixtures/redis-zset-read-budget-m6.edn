@@ -1,0 +1,262 @@
+{:index 66, :time 3260936735, :type :invoke, :process 6, :f :zrem, :value "m6"}
+{:index 67, :time 3264166425, :type :ok, :process 6, :f :zrem, :value ["m6" false]}
+{:index 72, :time 3468246578, :type :invoke, :process 0, :f :zadd, :value ["m6" -27.0]}
+{:index 73, :time 3472543087, :type :ok, :process 0, :f :zadd, :value ["m6" -27.0]}
+{:index 144, :time 6992758593, :type :invoke, :process 0, :f :zincrby, :value ["m6" 6.0]}
+{:index 145, :time 7000837225, :type :ok, :process 0, :f :zincrby, :value ["m6" -21.0]}
+{:index 188, :time 8392040048, :type :invoke, :process 4, :f :zadd, :value ["m6" -8.0]}
+{:index 189, :time 8396304648, :type :ok, :process 4, :f :zadd, :value ["m6" -8.0]}
+{:index 192, :time 8558988901, :type :invoke, :process 6, :f :zincrby, :value ["m6" 8.0]}
+{:index 193, :time 8562872415, :type :ok, :process 6, :f :zincrby, :value ["m6" 0.0]}
+{:index 198, :time 8678410408, :type :invoke, :process 0, :f :zadd, :value ["m6" 49.0]}
+{:index 199, :time 8682699013, :type :ok, :process 0, :f :zadd, :value ["m6" 49.0]}
+{:index 270, :time 11994213827, :type :invoke, :process 0, :f :zadd, :value ["m6" -59.0]}
+{:index 271, :time 11998037861, :type :ok, :process 0, :f :zadd, :value ["m6" -59.0]}
+{:index 310, :time 14187984327, :type :invoke, :process 10, :f :zadd, :value ["m6" 39.0]}
+{:index 311, :time 14192096537, :type :ok, :process 10, :f :zadd, :value ["m6" 39.0]}
+{:index 372, :time 16571073601, :type :invoke, :process 15, :f :zadd, :value ["m6" 98.0]}
+{:index 375, :time 16601388708, :type :info, :process 15, :f :zadd, :value ["m6" 98.0], :error "NOTLEADER redis zadd: begin read timestamp: read fence: etcd raft engine is not leader"}
+{:index 412, :time 18341374498, :type :invoke, :process 16, :f :zadd, :value ["m6" -40.0]}
+{:index 413, :time 18344978315, :type :ok, :process 16, :f :zadd, :value ["m6" -40.0]}
+{:index 422, :time 19011001583, :type :invoke, :process 12, :f :zincrby, :value ["m6" 6.0]}
+{:index 423, :time 19014967256, :type :ok, :process 12, :f :zincrby, :value ["m6" -34.0]}
+{:index 546, :time 25117440779, :type :invoke, :process 3, :f :zadd, :value ["m6" -44.0]}
+{:index 547, :time 25120879655, :type :ok, :process 3, :f :zadd, :value ["m6" -44.0]}
+{:index 674, :time 30849542923, :type :invoke, :process 12, :f :zadd, :value ["m6" -9.0]}
+{:index 677, :time 31046802997, :type :invoke, :process 22, :f :zrem, :value "m6"}
+{:index 680, :time 31173989211, :type :ok, :process 12, :f :zadd, :value ["m6" -9.0]}
+{:index 682, :time 31176242210, :type :info, :process 22, :f :zrem, :value "m6", :error "NOTLEADER redis zrem: begin read timestamp: read fence: etcd raft engine is not leader"}
+{:index 690, :time 31470999621, :type :invoke, :process 3, :f :zadd, :value ["m6" -23.0]}
+{:index 691, :time 31495899095, :type :invoke, :process 12, :f :zadd, :value ["m6" 11.0]}
+{:index 692, :time 31499619710, :type :info, :process 3, :f :zadd, :value ["m6" -23.0], :error "ERR operation outcome unknown"}
+{:index 693, :time 31499684718, :type :info, :process 12, :f :zadd, :value ["m6" 11.0], :error "ERR operation outcome unknown"}
+{:index 696, :time 31723713531, :type :invoke, :process 30, :f :zrem, :value "m6"}
+{:index 697, :time 31725194225, :type :info, :process 30, :f :zrem, :value "m6", :error "NOTLEADER leader not found"}
+{:index 708, :time 32399514756, :type :invoke, :process 11, :f :zrem, :value "m6"}
+{:index 709, :time 32403995638, :type :ok, :process 11, :f :zrem, :value ["m6" true]}
+{:index 755, :time 34726537163, :type :invoke, :process 17, :f :zincrby, :value ["m6" -8.0]}
+{:index 758, :time 34932808519, :type :info, :process 17, :f :zincrby, :value ["m6" -8.0], :error "ERR operation outcome unknown"}
+{:index 817, :time 37635239553, :type :invoke, :process 28, :f :zadd, :value ["m6" -53.0]}
+{:index 819, :time 37677608984, :type :ok, :process 28, :f :zadd, :value ["m6" -53.0]}
+{:index 898, :time 40775842547, :type :invoke, :process 48, :f :zrem, :value "m6"}
+{:index 899, :time 40793602626, :type :ok, :process 48, :f :zrem, :value ["m6" true]}
+{:index 900, :time 40927149614, :type :invoke, :process 48, :f :zincrby, :value ["m6" 7.0]}
+{:index 901, :time 40931017414, :type :ok, :process 48, :f :zincrby, :value ["m6" 7.0]}
+{:index 1060, :time 49589220607, :type :invoke, :process 48, :f :zincrby, :value ["m6" -6.0]}
+{:index 1061, :time 49610948626, :type :ok, :process 48, :f :zincrby, :value ["m6" 1.0]}
+{:index 1107, :time 51683081868, :type :invoke, :process 45, :f :zincrby, :value ["m6" 5.0]}
+{:index 1111, :time 51798453278, :type :ok, :process 45, :f :zincrby, :value ["m6" 6.0]}
+{:index 1174, :time 55191588794, :type :invoke, :process 26, :f :zadd, :value ["m6" -13.0]}
+{:index 1175, :time 55195753419, :type :ok, :process 26, :f :zadd, :value ["m6" -13.0]}
+{:index 1182, :time 55949392679, :type :invoke, :process 46, :f :zincrby, :value ["m6" -7.0]}
+{:index 1184, :time 56001112660, :type :ok, :process 46, :f :zincrby, :value ["m6" -20.0]}
+{:index 1206, :time 56885040472, :type :invoke, :process 48, :f :zincrby, :value ["m6" -9.0]}
+{:index 1207, :time 56888599132, :type :ok, :process 48, :f :zincrby, :value ["m6" -29.0]}
+{:index 1216, :time 57406566558, :type :invoke, :process 45, :f :zadd, :value ["m6" -41.0]}
+{:index 1217, :time 57410064295, :type :ok, :process 45, :f :zadd, :value ["m6" -41.0]}
+{:index 1262, :time 59126612076, :type :invoke, :process 41, :f :zrem, :value "m6"}
+{:index 1263, :time 59130371899, :type :ok, :process 41, :f :zrem, :value ["m6" true]}
+{:index 1286, :time 60578691352, :type :invoke, :process 28, :f :zrem, :value "m6"}
+{:index 1287, :time 60581252357, :type :ok, :process 28, :f :zrem, :value ["m6" false]}
+{:index 1296, :time 61350254461, :type :invoke, :process 48, :f :zadd, :value ["m6" 47.0]}
+{:index 1297, :time 61353261419, :type :ok, :process 48, :f :zadd, :value ["m6" 47.0]}
+{:index 1360, :time 65444838799, :type :invoke, :process 45, :f :zadd, :value ["m6" 86.0]}
+{:index 1361, :time 65448121282, :type :ok, :process 45, :f :zadd, :value ["m6" 86.0]}
+{:index 1406, :time 68042406897, :type :invoke, :process 41, :f :zrem, :value "m6"}
+{:index 1407, :time 68046009342, :type :ok, :process 41, :f :zrem, :value ["m6" true]}
+{:index 1449, :time 69618501438, :type :invoke, :process 45, :f :zrem, :value "m6"}
+{:index 1452, :time 69748749583, :type :ok, :process 45, :f :zrem, :value ["m6" false]}
+{:index 1466, :time 70291861694, :type :invoke, :process 28, :f :zincrby, :value ["m6" -1.0]}
+{:index 1467, :time 70302916864, :type :ok, :process 28, :f :zincrby, :value ["m6" -1.0]}
+{:index 1632, :time 77575315588, :type :invoke, :process 46, :f :zadd, :value ["m6" 63.0]}
+{:index 1633, :time 77578352460, :type :ok, :process 46, :f :zadd, :value ["m6" 63.0]}
+{:index 1642, :time 78193969919, :type :invoke, :process 26, :f :zadd, :value ["m6" -12.0]}
+{:index 1643, :time 78197245681, :type :ok, :process 26, :f :zadd, :value ["m6" -12.0]}
+{:index 1808, :time 87196866282, :type :invoke, :process 28, :f :zrem, :value "m6"}
+{:index 1809, :time 87201407935, :type :ok, :process 28, :f :zrem, :value ["m6" true]}
+{:index 1865, :time 90159651042, :type :invoke, :process 31, :f :zadd, :value ["m6" 72.0]}
+{:index 1875, :time 90347172513, :type :info, :process 31, :f :zadd, :value ["m6" 72.0], :error "NOTLEADER redis zadd: begin read timestamp: read fence: etcd raft engine is not leader"}
+{:index 1888, :time 90720855608, :type :invoke, :process 64, :f :zadd, :value ["m6" 93.0]}
+{:index 1889, :time 90723734617, :type :ok, :process 64, :f :zadd, :value ["m6" 93.0]}
+{:index 1890, :time 90786634871, :type :invoke, :process 64, :f :zadd, :value ["m6" 23.0]}
+{:index 1892, :time 90934912591, :type :ok, :process 64, :f :zadd, :value ["m6" 23.0]}
+{:index 1974, :time 94261426380, :type :invoke, :process 62, :f :zadd, :value ["m6" -57.0]}
+{:index 1975, :time 94265097444, :type :ok, :process 62, :f :zadd, :value ["m6" -57.0]}
+{:index 2047, :time 98540116655, :type :invoke, :process 64, :f :zincrby, :value ["m6" 1.0]}
+{:index 2049, :time 98627637851, :type :info, :process 64, :f :zincrby, :value ["m6" 1.0], :error "NOTLEADER leader unavailable"}
+{:index 2222, :time 106089853465, :type :invoke, :process 28, :f :zadd, :value ["m6" -34.0]}
+{:index 2223, :time 106093579074, :type :ok, :process 28, :f :zadd, :value ["m6" -34.0]}
+{:index 2246, :time 107199306603, :type :invoke, :process 47, :f :zadd, :value ["m6" -13.0]}
+{:index 2247, :time 107202562805, :type :ok, :process 47, :f :zadd, :value ["m6" -13.0]}
+{:index 2248, :time 107269778742, :type :invoke, :process 72, :f :zrem, :value "m6"}
+{:index 2249, :time 107314836026, :type :ok, :process 72, :f :zrem, :value ["m6" true]}
+{:index 2252, :time 107564746572, :type :invoke, :process 49, :f :zadd, :value ["m6" -2.0]}
+{:index 2253, :time 107568019499, :type :ok, :process 49, :f :zadd, :value ["m6" -2.0]}
+{:index 2292, :time 110254757186, :type :invoke, :process 35, :f :zadd, :value ["m6" -67.0]}
+{:index 2293, :time 110257902961, :type :ok, :process 35, :f :zadd, :value ["m6" -67.0]}
+{:index 2338, :time 113413906871, :type :invoke, :process 72, :f :zadd, :value ["m6" -38.0]}
+{:index 2339, :time 113417019416, :type :ok, :process 72, :f :zadd, :value ["m6" -38.0]}
+{:index 2448, :time 119265797305, :type :invoke, :process 72, :f :zadd, :value ["m6" 39.0]}
+{:index 2451, :time 119330963474, :type :invoke, :process 43, :f :zincrby, :value ["m6" 3.0]}
+{:index 2452, :time 119432883624, :type :ok, :process 72, :f :zadd, :value ["m6" 39.0]}
+{:index 2453, :time 119438535812, :type :ok, :process 43, :f :zincrby, :value ["m6" 42.0]}
+{:index 2492, :time 121445336323, :type :invoke, :process 36, :f :zadd, :value ["m6" -55.0]}
+{:index 2493, :time 121449468337, :type :ok, :process 36, :f :zadd, :value ["m6" -55.0]}
+{:index 2612, :time 127853251160, :type :invoke, :process 73, :f :zincrby, :value ["m6" -6.0]}
+{:index 2613, :time 127870171849, :type :ok, :process 73, :f :zincrby, :value ["m6" -61.0]}
+{:index 2644, :time 129172214067, :type :invoke, :process 80, :f :zadd, :value ["m6" 6.0]}
+{:index 2645, :time 129176155848, :type :ok, :process 80, :f :zadd, :value ["m6" 6.0]}
+{:index 2686, :time 130981613889, :type :invoke, :process 58, :f :zadd, :value ["m6" -37.0]}
+{:index 2687, :time 130984875743, :type :ok, :process 58, :f :zadd, :value ["m6" -37.0]}
+{:index 2712, :time 132099989713, :type :invoke, :process 78, :f :zrem, :value "m6"}
+{:index 2713, :time 132103166048, :type :ok, :process 78, :f :zrem, :value ["m6" true]}
+{:index 2724, :time 132503808381, :type :invoke, :process 59, :f :zrem, :value "m6"}
+{:index 2725, :time 132506501947, :type :ok, :process 59, :f :zrem, :value ["m6" false]}
+{:index 2820, :time 136868603960, :type :invoke, :process 78, :f :zincrby, :value ["m6" 3.0]}
+{:index 2821, :time 136871981216, :type :ok, :process 78, :f :zincrby, :value ["m6" 3.0]}
+{:index 2854, :time 137959648218, :type :invoke, :process 69, :f :zincrby, :value ["m6" -7.0]}
+{:index 2855, :time 137962885202, :type :ok, :process 69, :f :zincrby, :value ["m6" -4.0]}
+{:index 2900, :time 139576999399, :type :invoke, :process 73, :f :zadd, :value ["m6" 94.0]}
+{:index 2901, :time 139580183833, :type :ok, :process 73, :f :zadd, :value ["m6" 94.0]}
+{:index 2906, :time 139749161769, :type :invoke, :process 36, :f :zadd, :value ["m6" 77.0]}
+{:index 2908, :time 139771135213, :type :ok, :process 36, :f :zadd, :value ["m6" 77.0]}
+{:index 2934, :time 141368807892, :type :invoke, :process 88, :f :zincrby, :value ["m6" -10.0]}
+{:index 2935, :time 141372077084, :type :ok, :process 88, :f :zincrby, :value ["m6" 67.0]}
+{:index 3016, :time 146029156767, :type :invoke, :process 69, :f :zadd, :value ["m6" 18.0]}
+{:index 3017, :time 146032206119, :type :ok, :process 69, :f :zadd, :value ["m6" 18.0]}
+{:index 3066, :time 148247791876, :type :invoke, :process 59, :f :zadd, :value ["m6" -58.0]}
+{:index 3067, :time 148251093583, :type :ok, :process 59, :f :zadd, :value ["m6" -58.0]}
+{:index 3102, :time 149918478087, :type :invoke, :process 67, :f :zincrby, :value ["m6" 7.0]}
+{:index 3103, :time 149921580984, :type :ok, :process 67, :f :zincrby, :value ["m6" -51.0]}
+{:index 3110, :time 150214446560, :type :invoke, :process 71, :f :zincrby, :value ["m6" 3.0]}
+{:index 3111, :time 150217726019, :type :ok, :process 71, :f :zincrby, :value ["m6" -48.0]}
+{:index 3134, :time 151459350209, :type :invoke, :process 81, :f :zincrby, :value ["m6" 1.0]}
+{:index 3135, :time 151494298304, :type :ok, :process 81, :f :zincrby, :value ["m6" -47.0]}
+{:index 3178, :time 153975066148, :type :invoke, :process 69, :f :zadd, :value ["m6" 9.0]}
+{:index 3179, :time 153978182034, :type :ok, :process 69, :f :zadd, :value ["m6" 9.0]}
+{:index 3290, :time 159280156461, :type :invoke, :process 79, :f :zadd, :value ["m6" -90.0]}
+{:index 3291, :time 159281528486, :type :info, :process 79, :f :zadd, :value ["m6" -90.0], :error "NOTLEADER leader unavailable"}
+{:index 3394, :time 163745412112, :type :invoke, :process 93, :f :zincrby, :value ["m6" 8.0]}
+{:index 3395, :time 163748364027, :type :ok, :process 93, :f :zincrby, :value ["m6" 17.0]}
+{:index 3418, :time 165672691286, :type :invoke, :process 128, :f :zrem, :value "m6"}
+{:index 3419, :time 165675908832, :type :ok, :process 128, :f :zrem, :value ["m6" true]}
+{:index 3462, :time 167618895058, :type :invoke, :process 67, :f :zincrby, :value ["m6" -8.0]}
+{:index 3463, :time 167787716354, :type :ok, :process 67, :f :zincrby, :value ["m6" -8.0]}
+{:index 3512, :time 170631242261, :type :invoke, :process 89, :f :zadd, :value ["m6" -97.0]}
+{:index 3513, :time 170669724551, :type :ok, :process 89, :f :zadd, :value ["m6" -97.0]}
+{:index 3538, :time 171890482863, :type :invoke, :process 109, :f :zincrby, :value ["m6" -7.0]}
+{:index 3539, :time 171891609941, :type :info, :process 109, :f :zincrby, :value ["m6" -7.0], :error "NOTLEADER leader unavailable"}
+{:index 3550, :time 172221233728, :type :invoke, :process 90, :f :zrem, :value "m6"}
+{:index 3552, :time 172530857058, :type :ok, :process 90, :f :zrem, :value ["m6" true]}
+{:index 3584, :time 174569130134, :type :invoke, :process 89, :f :zincrby, :value ["m6" 7.0]}
+{:index 3585, :time 174572073316, :type :ok, :process 89, :f :zincrby, :value ["m6" 7.0]}
+{:index 3586, :time 174621953513, :type :invoke, :process 90, :f :zadd, :value ["m6" 90.0]}
+{:index 3587, :time 174625071199, :type :ok, :process 90, :f :zadd, :value ["m6" 90.0]}
+{:index 3638, :time 176806392506, :type :invoke, :process 89, :f :zincrby, :value ["m6" 9.0]}
+{:index 3639, :time 176809612776, :type :ok, :process 89, :f :zincrby, :value ["m6" 99.0]}
+{:index 3648, :time 177209051414, :type :invoke, :process 126, :f :zincrby, :value ["m6" 3.0]}
+{:index 3650, :time 177355028661, :type :ok, :process 126, :f :zincrby, :value ["m6" 102.0]}
+{:index 3692, :time 180431156804, :type :invoke, :process 89, :f :zadd, :value ["m6" 98.0]}
+{:index 3693, :time 180434205275, :type :ok, :process 89, :f :zadd, :value ["m6" 98.0]}
+{:index 3712, :time 181479990481, :type :invoke, :process 90, :f :zincrby, :value ["m6" -10.0]}
+{:index 3713, :time 181483005162, :type :ok, :process 90, :f :zincrby, :value ["m6" 88.0]}
+{:index 3728, :time 182423829842, :type :invoke, :process 89, :f :zadd, :value ["m6" 81.0]}
+{:index 3729, :time 182593974576, :type :ok, :process 89, :f :zadd, :value ["m6" 81.0]}
+{:index 3734, :time 182934531759, :type :invoke, :process 68, :f :zrem, :value "m6"}
+{:index 3735, :time 182938155869, :type :ok, :process 68, :f :zrem, :value ["m6" true]}
+{:index 3794, :time 186232044357, :type :invoke, :process 103, :f :zincrby, :value ["m6" 1.0]}
+{:index 3795, :time 186235212860, :type :ok, :process 103, :f :zincrby, :value ["m6" 1.0]}
+{:index 3950, :time 193103033923, :type :invoke, :process 68, :f :zadd, :value ["m6" -41.0]}
+{:index 3951, :time 193105938478, :type :ok, :process 68, :f :zadd, :value ["m6" -41.0]}
+{:index 4035, :time 196857021553, :type :invoke, :process 90, :f :zrem, :value "m6"}
+{:index 4037, :time 196898570492, :type :ok, :process 90, :f :zrem, :value ["m6" true]}
+{:index 4130, :time 201451427111, :type :invoke, :process 76, :f :zadd, :value ["m6" -45.0]}
+{:index 4131, :time 201454216621, :type :ok, :process 76, :f :zadd, :value ["m6" -45.0]}
+{:index 4272, :time 208255827393, :type :invoke, :process 99, :f :zincrby, :value ["m6" 2.0]}
+{:index 4274, :time 208342429264, :type :ok, :process 99, :f :zincrby, :value ["m6" -43.0]}
+{:index 4374, :time 212970132794, :type :invoke, :process 136, :f :zincrby, :value ["m6" -10.0]}
+{:index 4375, :time 212973091630, :type :ok, :process 136, :f :zincrby, :value ["m6" -53.0]}
+{:index 4380, :time 213376715863, :type :invoke, :process 99, :f :zincrby, :value ["m6" 0.0]}
+{:index 4381, :time 213384871244, :type :ok, :process 99, :f :zincrby, :value ["m6" -53.0]}
+{:index 4446, :time 216781731432, :type :invoke, :process 136, :f :zrem, :value "m6"}
+{:index 4447, :time 216785161710, :type :ok, :process 136, :f :zrem, :value ["m6" true]}
+{:index 4450, :time 216817908270, :type :invoke, :process 98, :f :zincrby, :value ["m6" 9.0]}
+{:index 4451, :time 216820755167, :type :ok, :process 98, :f :zincrby, :value ["m6" 9.0]}
+{:index 4478, :time 218229949462, :type :invoke, :process 111, :f :zincrby, :value ["m6" 4.0]}
+{:index 4479, :time 218233048630, :type :ok, :process 111, :f :zincrby, :value ["m6" 13.0]}
+{:index 4492, :time 219080017866, :type :invoke, :process 117, :f :zadd, :value ["m6" 96.0]}
+{:index 4493, :time 219083156243, :type :ok, :process 117, :f :zadd, :value ["m6" 96.0]}
+{:index 4566, :time 222277655373, :type :invoke, :process 142, :f :zrem, :value "m6"}
+{:index 4567, :time 222281273665, :type :ok, :process 142, :f :zrem, :value ["m6" true]}
+{:index 4596, :time 223813426870, :type :invoke, :process 107, :f :zrem, :value "m6"}
+{:index 4597, :time 223817996042, :type :ok, :process 107, :f :zrem, :value ["m6" false]}
+{:index 4650, :time 226079660398, :type :invoke, :process 107, :f :zincrby, :value ["m6" 3.0]}
+{:index 4651, :time 226106290515, :type :ok, :process 107, :f :zincrby, :value ["m6" 3.0]}
+{:index 4656, :time 226255141526, :type :invoke, :process 150, :f :zincrby, :value ["m6" -8.0]}
+{:index 4657, :time 226305843547, :type :invoke, :process 119, :f :zadd, :value ["m6" 94.0]}
+{:index 4659, :time 226443468343, :type :ok, :process 150, :f :zincrby, :value ["m6" -5.0]}
+{:index 4660, :time 226447234798, :type :ok, :process 119, :f :zadd, :value ["m6" 94.0]}
+{:index 4829, :time 233605580581, :type :invoke, :process 107, :f :zincrby, :value ["m6" -8.0]}
+{:index 4831, :time 233629821226, :type :ok, :process 107, :f :zincrby, :value ["m6" 86.0]}
+{:index 4950, :time 240555564880, :type :invoke, :process 152, :f :zadd, :value ["m6" -64.0]}
+{:index 4951, :time 240558344855, :type :ok, :process 152, :f :zadd, :value ["m6" -64.0]}
+{:index 4963, :time 240954031132, :type :invoke, :process 119, :f :zadd, :value ["m6" -24.0]}
+{:index 4970, :time 241016543298, :type :ok, :process 119, :f :zadd, :value ["m6" -24.0]}
+{:index 5006, :time 242382655018, :type :invoke, :process 113, :f :zincrby, :value ["m6" 5.0]}
+{:index 5008, :time 242430759460, :type :ok, :process 113, :f :zincrby, :value ["m6" -19.0]}
+{:index 5060, :time 245328202707, :type :invoke, :process 113, :f :zadd, :value ["m6" -47.0]}
+{:index 5061, :time 245331011566, :type :ok, :process 113, :f :zadd, :value ["m6" -47.0]}
+{:index 5086, :time 247002975402, :type :invoke, :process 133, :f :zadd, :value ["m6" -10.0]}
+{:index 5087, :time 247005885203, :type :ok, :process 133, :f :zadd, :value ["m6" -10.0]}
+{:index 5168, :time 251731943290, :type :invoke, :process 121, :f :zrange-all, :value nil}
+{:index 5169, :time 251734316122, :type :ok, :process 121, :f :zrange-all, :value [["m6" -10.0]]}
+{:index 5346, :time 259411649081, :type :invoke, :process 152, :f :zadd, :value ["m6" 23.0]}
+{:index 5347, :time 259414331670, :type :ok, :process 152, :f :zadd, :value ["m6" 23.0]}
+{:index 5348, :time 259681448778, :type :invoke, :process 121, :f :zadd, :value ["m6" 37.0]}
+{:index 5349, :time 259684497900, :type :ok, :process 121, :f :zadd, :value ["m6" 37.0]}
+{:index 5444, :time 264183862406, :type :invoke, :process 108, :f :zrem, :value "m6"}
+{:index 5445, :time 264187345914, :type :ok, :process 108, :f :zrem, :value ["m6" true]}
+{:index 5460, :time 264835798834, :type :invoke, :process 131, :f :zrem, :value "m6"}
+{:index 5461, :time 264838267140, :type :ok, :process 131, :f :zrem, :value ["m6" false]}
+{:index 5464, :time 265105986264, :type :invoke, :process 133, :f :zrem, :value "m6"}
+{:index 5465, :time 265108850628, :type :ok, :process 133, :f :zrem, :value ["m6" false]}
+{:index 5468, :time 265220475850, :type :invoke, :process 119, :f :zadd, :value ["m6" -34.0]}
+{:index 5469, :time 265223854215, :type :ok, :process 119, :f :zadd, :value ["m6" -34.0]}
+{:index 5478, :time 265790640836, :type :invoke, :process 131, :f :zadd, :value ["m6" 62.0]}
+{:index 5479, :time 265793752132, :type :ok, :process 131, :f :zadd, :value ["m6" 62.0]}
+{:index 5480, :time 265971819320, :type :invoke, :process 108, :f :zadd, :value ["m6" -40.0]}
+{:index 5481, :time 266032556464, :type :ok, :process 108, :f :zadd, :value ["m6" -40.0]}
+{:index 5534, :time 269037916475, :type :invoke, :process 116, :f :zadd, :value ["m6" 33.0]}
+{:index 5535, :time 269040995041, :type :ok, :process 116, :f :zadd, :value ["m6" 33.0]}
+{:index 5539, :time 269236356973, :type :invoke, :process 127, :f :zadd, :value ["m6" -5.0]}
+{:index 5541, :time 269300382666, :type :ok, :process 127, :f :zadd, :value ["m6" -5.0]}
+{:index 5598, :time 271253584014, :type :invoke, :process 160, :f :zadd, :value ["m6" 61.0]}
+{:index 5602, :time 271514540136, :type :info, :process 160, :f :zadd, :value ["m6" 61.0], :error "ERR operation outcome unknown"}
+{:index 5679, :time 274907587657, :type :invoke, :process 141, :f :zadd, :value ["m6" -27.0]}
+{:index 5682, :time 274956948148, :type :ok, :process 141, :f :zadd, :value ["m6" -27.0]}
+{:index 5712, :time 276285563822, :type :invoke, :process 139, :f :zincrby, :value ["m6" -6.0]}
+{:index 5713, :time 276394662709, :type :ok, :process 139, :f :zincrby, :value ["m6" -33.0]}
+{:index 5824, :time 280411336430, :type :invoke, :process 158, :f :zrem, :value "m6"}
+{:index 5827, :time 280495876515, :type :ok, :process 158, :f :zrem, :value ["m6" true]}
+{:index 5916, :time 284344176281, :type :invoke, :process 135, :f :zrem, :value "m6"}
+{:index 5918, :time 284384625366, :type :ok, :process 135, :f :zrem, :value ["m6" false]}
+{:index 5960, :time 286787928887, :type :invoke, :process 153, :f :zincrby, :value ["m6" 9.0]}
+{:index 5961, :time 286790875993, :type :ok, :process 153, :f :zincrby, :value ["m6" 9.0]}
+{:index 5982, :time 287961079923, :type :invoke, :process 155, :f :zadd, :value ["m6" 73.0]}
+{:index 5984, :time 288089434680, :type :ok, :process 155, :f :zadd, :value ["m6" 73.0]}
+{:index 5988, :time 288584541012, :type :invoke, :process 158, :f :zincrby, :value ["m6" -9.0]}
+{:index 5989, :time 288587423683, :type :ok, :process 158, :f :zincrby, :value ["m6" 64.0]}
+{:index 6005, :time 289478689886, :type :invoke, :process 184, :f :zrem, :value "m6"}
+{:index 6006, :time 289479717577, :type :info, :process 184, :f :zrem, :value "m6", :error "NOTLEADER leader not found"}
+{:index 6060, :time 291663949757, :type :invoke, :process 166, :f :zincrby, :value ["m6" -6.0]}
+{:index 6061, :time 291675873154, :type :ok, :process 166, :f :zincrby, :value ["m6" 58.0]}
+{:index 6134, :time 294942033352, :type :invoke, :process 151, :f :zincrby, :value ["m6" 5.0]}
+{:index 6135, :time 294944943274, :type :ok, :process 151, :f :zincrby, :value ["m6" 63.0]}
+{:index 6152, :time 295792532847, :type :invoke, :process 151, :f :zincrby, :value ["m6" 6.0]}
+{:index 6153, :time 295795706728, :type :ok, :process 151, :f :zincrby, :value ["m6" 69.0]}
+{:index 6176, :time 296894336671, :type :invoke, :process 153, :f :zrem, :value "m6"}
+{:index 6177, :time 296900246712, :type :ok, :process 153, :f :zrem, :value ["m6" true]}
+{:index 6180, :time 297249413233, :type :invoke, :process 155, :f :zrem, :value "m6"}
+{:index 6181, :time 297251911343, :type :ok, :process 155, :f :zrem, :value ["m6" false]}
+{:index 6225, :time 299134812217, :type :invoke, :process 192, :f :zincrby, :value ["m6" -5.0]}
+{:index 6227, :time 299138695058, :type :ok, :process 192, :f :zincrby, :value ["m6" -5.0]}
