@@ -10,6 +10,10 @@ concurrency:
 name: Test
 permissions:
   contents: read
+# No fallback: module downloads must pass the malware blocklist.
+env:
+  GOPROXY: https://golang.flatt.tech
+
 jobs:
   shard:
     name: test shard (${{ matrix.shard }})
@@ -27,6 +31,9 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
+      - name: Verify module download protection with an empty cache
+        if: matrix.shard == 'rest'
+        run: bash scripts/check-go-module-guard.sh
       - name: Install missing system tools
         # fusermount3 lets the FUSE end-to-end tests mount without root
         # (internal/filesystem/fuseadapter, TestMountFilesystemServiceServesKernelMount).

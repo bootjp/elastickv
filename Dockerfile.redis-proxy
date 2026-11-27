@@ -1,4 +1,6 @@
 FROM golang:latest AS build
+# No direct fallback around the module blocklist.
+ENV GOPROXY=https://golang.flatt.tech
 
 WORKDIR $GOPATH/src/app
 COPY go.mod go.sum ./

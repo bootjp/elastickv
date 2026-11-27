@@ -4,6 +4,10 @@ on:
     branches:
       - renovate/*
 
+# No fallback: module downloads must pass the malware blocklist.
+env:
+  GOPROXY: https://golang.flatt.tech
+
 jobs:
   go-mod-fix:
     permissions:

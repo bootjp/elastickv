@@ -19,6 +19,10 @@ on:
         required: false
         default: "partition,kill,clock"
 
+# No fallback: module downloads must pass the malware blocklist.
+env:
+  GOPROXY: https://golang.flatt.tech
+
 jobs:
   jepsen:
     # Requires a self-hosted runner with VirtualBox + Vagrant and at least 12GB RAM free.

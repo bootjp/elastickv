@@ -43,6 +43,7 @@ if [ "$ROLE" = "ctrl" ]; then
     sudo tar -C /usr/local -xzf /tmp/go.tar.gz
   fi
   echo 'export PATH=$PATH:/usr/local/go/bin:$HOME/go/bin' | sudo tee /etc/profile.d/go.sh >/dev/null
+  sudo -u vagrant -H /usr/local/go/bin/go env -w GOPROXY=https://golang.flatt.tech
 
   if [ ! -f /home/vagrant/.ssh/id_rsa ]; then
     if [ -f /home/vagrant/elastickv/jepsen/.ssh/ctrl_id_rsa ]; then

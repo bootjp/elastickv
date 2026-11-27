@@ -1,6 +1,10 @@
 ARG GO_VERSION
 FROM eclipse-temurin:21-jdk-jammy AS java
 FROM golang:${GO_VERSION}-bookworm
+# No direct fallback around the module blocklist.
+ENV GOPROXY=https://golang.flatt.tech
+# SSH sessions do not necessarily inherit the container environment.
+RUN go env -w GOPROXY=https://golang.flatt.tech
 
 # Jepsen's Bifurcan dependency requires Java 21 bytecode support.
 COPY --from=java /opt/java/openjdk /opt/java/openjdk

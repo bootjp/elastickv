@@ -1,5 +1,7 @@
 # syntax=docker/dockerfile:1
 FROM golang:1.27-bookworm AS tools
+# No direct fallback around the module blocklist.
+ENV GOPROXY=https://golang.flatt.tech
 WORKDIR /src
 COPY . .
 RUN CGO_ENABLED=0 go build -o /raftadmin ./cmd/raftadmin

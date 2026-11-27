@@ -16,6 +16,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# No fallback: module downloads must pass the malware blocklist.
+env:
+  GOPROXY: https://golang.flatt.tech
+
 jobs:
   proto:
     runs-on: ubuntu-latest

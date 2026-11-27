@@ -8,6 +8,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-reviewdog
 #  cancel-in-progress: true
 
+# No fallback: module downloads must pass the malware blocklist.
+env:
+  GOPROXY: https://golang.flatt.tech
+
 jobs:
   golangci-lint:
     name: golangci-lint

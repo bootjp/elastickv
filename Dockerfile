@@ -19,6 +19,8 @@ COPY web/admin/ ./
 RUN npm run build -- --outDir /spa/dist
 
 FROM golang:1.26 AS build
+# No direct fallback around the module blocklist.
+ENV GOPROXY=https://golang.flatt.tech
 WORKDIR $GOPATH/src/app
 COPY . .
 # Replace the placeholder dist/ with the real Vite bundle BEFORE the

@@ -31,6 +31,34 @@ make run     # single-process 3-node demo
 
 `make gen` regenerates protobufs and is toolchain-pinned (see `proto/Makefile`).
 
+## Go module download protection
+
+CI and Go image build stages use [Takumi Guard](https://shisho.dev/docs/ja/r/202605-takumi-guard-golang/)
+to block known-malicious public modules. Anonymous blocking needs no account,
+token, or additional GitHub permissions. To use the same policy locally:
+
+```bash
+export GOPROXY=https://golang.flatt.tech
+go mod download
+bash scripts/check-go-module-guard.sh
+```
+
+Keep only this URL: appending `,direct`, `|direct`, or another proxy can
+bypass the blocklist. A Guard outage fails new downloads rather than fetching
+from another source. Keep Go checksum verification enabled. Set `GOPRIVATE`
+only for actual private modules; those intentionally bypass the public proxy.
+The local `third_party/go-fuse` replacement is not downloaded or checked.
+
+Existing module/build caches and Docker layers are not retrospectively
+scanned. The check above uses a temporary empty module cache, verifies a
+known-good download, and requires HTTP 403 for the provider's harmless blocked
+test module. It leaves the repository and existing module cache unchanged.
+For a fresh dependency audit, use a separate empty `GOMODCACHE` with
+`go mod download`; `go mod verify` alone checks cache integrity, not the
+Guard blocklist. Anonymous mode does not enable authenticated download
+history or infection notifications. Continue using vulnerability scans and
+source review alongside this filter.
+
 ## Commits
 
 Short imperative summary with an optional scope prefix matching the touched area (`store:`, `adapter:`, `kv:`, `docs:`, …).
