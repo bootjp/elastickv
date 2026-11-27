@@ -355,7 +355,14 @@ class PublicationTests(unittest.TestCase):
                 self.assertTrue(
                     host.endswith((".svc", ".example.com", ".example.test", ".invalid"))
                     or host
-                    in ("example.com", "github.com", "api.github.com", "kubernetes.io"),
+                    in (
+                        "example.com",
+                        "github.com",
+                        "api.github.com",
+                        "kubernetes.io",
+                        # Public package proxy, not a deployment-specific host.
+                        "pypi.flatt.tech",
+                    ),
                     (str(path), host),
                 )
 

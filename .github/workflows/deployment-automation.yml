@@ -3,13 +3,20 @@ on:
   pull_request:
     paths:
       - 'deploy/automation/**'
+      - 'scripts/check-pypi-package-guard.sh'
       - '.github/workflows/deployment-automation.yml'
   push:
     paths:
       - 'deploy/automation/**'
+      - 'scripts/check-pypi-package-guard.sh'
       - '.github/workflows/deployment-automation.yml'
 permissions:
   contents: read
+env:
+  PIP_INDEX_URL: https://pypi.flatt.tech/simple/
+  PIP_CONFIG_FILE: /dev/null
+  PIP_EXTRA_INDEX_URL: ''
+  PIP_FIND_LINKS: ''
 jobs:
   offline-checks:
     runs-on: ubuntu-latest
@@ -19,6 +26,8 @@ jobs:
           persist-credentials: false
       - name: Install YAML parser
         run: python3 -m pip install PyYAML==6.0.2 ruff==0.9.10
+      - name: Verify PyPI package download protection with an empty cache
+        run: bash scripts/check-pypi-package-guard.sh
       - name: Check Python source
         run: |
           ruff check --select E4,E7,E9,F,I deploy/automation/*.py

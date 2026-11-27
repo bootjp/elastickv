@@ -18,6 +18,10 @@ on:
       - 'automation/**'
       - '.github/workflows/elastickv-compatibility-approval.yml'
 env:
+  PIP_INDEX_URL: https://pypi.flatt.tech/simple/
+  PIP_CONFIG_FILE: /dev/null
+  PIP_EXTRA_INDEX_URL: ''
+  PIP_FIND_LINKS: ''
   ELASTICKV_DEPLOYMENT_CONFIG: automation/deployment.json
 permissions:
   contents: read
@@ -34,7 +38,7 @@ jobs:
           persist-credentials: false
       - run: |
           python3 -m pip install PyYAML==6.0.2
-          ELASTICKV_DEPLOYMENT_CONFIG= python3 -m unittest discover -s automation -v
+          ELASTICKV_DEPLOYMENT_CONFIG='' python3 -m unittest discover -s automation -v
   compatibility-review:
     if: github.event_name == 'workflow_dispatch'
     permissions:
@@ -50,7 +54,7 @@ jobs:
       - name: Test trusted controller and review gates
         run: |
           python3 -m pip install PyYAML==6.0.2
-          ELASTICKV_DEPLOYMENT_CONFIG= python3 -m unittest discover -s automation -v
+          ELASTICKV_DEPLOYMENT_CONFIG='' python3 -m unittest discover -s automation -v
       - name: Revalidate immutable proposal and record exact-head check
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

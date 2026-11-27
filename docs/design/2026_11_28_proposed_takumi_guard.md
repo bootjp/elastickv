@@ -91,6 +91,12 @@ controller provisioner set it independently. The test workflow's `rest`
 shard runs the empty-cache positive/negative check. Contributor instructions
 cover local use, cache limitations, checksum verification, and private modules.
 
+The npm/Python extension adds the frontend project registry and its Docker
+COPY boundary, the frontend CI canary, pip-only configuration in the controller
+image/CI and three portable workflow examples, and a fresh-wheel pip check.
+The example-publication test permits the exact public `pypi.flatt.tech` host;
+private addresses and deployment-specific hosts remain rejected.
+
 Verified on 2026-11-28:
 
 - The cold-cache canary downloaded `github.com/pkg/errors@v0.9.1` and
@@ -98,6 +104,13 @@ Verified on 2026-11-28:
 - `go mod download` with a separate empty cache and the Guard-only proxy
   fetched the repository's dependencies and `go1.27.4` successfully.
 - The canary rejected a configuration pointing to `proxy.golang.org`.
+- Node 26.13.1 / npm 11.20.0 installed the frontend from an empty cache
+  through Guard, with the existing lockfile unchanged. Frontend lint,
+  all 21 tests, and the production build passed. The npm sentinel was
+  rejected with HTTP 403 and a known-good tarball downloaded successfully.
+- A clean Python virtual environment installed all controller dependencies
+  and Ruff through the Guard index. The fresh-wheel check passed. No PyPI
+  sentinel rejection is claimed.
 - Review regression tests reproduce saved private-module exceptions and
   an existing Go binary outside `/usr/local/go/bin`. Both failed before
   the fixes: use nonempty `none` overrides in the canary and the detected

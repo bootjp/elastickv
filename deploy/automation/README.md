@@ -165,7 +165,9 @@ Use Python 3.12 or newer and a local virtual environment:
 
 ```sh
 python3 -m venv /tmp/elastickv-automation-venv
-/tmp/elastickv-automation-venv/bin/pip install -r deploy/automation/requirements.txt
+PIP_INDEX_URL=https://pypi.flatt.tech/simple/ PIP_CONFIG_FILE=/dev/null \
+  PIP_EXTRA_INDEX_URL='' PIP_FIND_LINKS='' \
+  /tmp/elastickv-automation-venv/bin/pip install -r deploy/automation/requirements.txt
 cp deploy/automation/examples/gitops/automation/deployment.json /tmp/site.json
 ```
 

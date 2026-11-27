@@ -3,6 +3,10 @@ on:
   repository_dispatch:
     types: [elastickv-compatibility-qualified]
 env:
+  PIP_INDEX_URL: https://pypi.flatt.tech/simple/
+  PIP_CONFIG_FILE: /dev/null
+  PIP_EXTRA_INDEX_URL: ''
+  PIP_FIND_LINKS: ''
   ELASTICKV_DEPLOYMENT_CONFIG: automation/deployment.json
 permissions:
   contents: read
