@@ -26,7 +26,9 @@ workflow examples. Keep all existing dependency versions and integrity data.
   configuration-file loading with `PIP_CONFIG_FILE=/dev/null` and clear
   extra-index and find-links environment settings so an additional source
   cannot silently bypass the Guard. Apply this in CI, controller images,
-  and the published workflow examples. Local setup remains opt-in.
+  and the published workflow examples. CI and examples create a job-local
+  venv rather than relying on runner pip config to bypass OS package
+  protection (PEP 668). Local setup remains opt-in.
 - Check npm with an empty cache: fetch a known-good package and require
   HTTP 403 for `@panda-guard/test-malicious`, without executing scripts or
   changing the frontend's lockfile. Check pip's effective boundary settings

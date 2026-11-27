@@ -24,6 +24,10 @@ jobs:
         with:
           ref: main
           persist-credentials: false
+      - name: Create isolated Python environment
+        run: |
+          python3 -m venv "$RUNNER_TEMP/guard-python"
+          echo "$RUNNER_TEMP/guard-python/bin" >> "$GITHUB_PATH"
       - name: Install runtime parser
         run: python3 -m pip install PyYAML==6.0.2
       - name: Revalidate machine branch and create its bounded PR
