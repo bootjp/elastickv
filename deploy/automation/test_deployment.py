@@ -4,6 +4,7 @@ import copy
 import json
 import os
 import pathlib
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -115,6 +116,29 @@ class RenderTests(unittest.TestCase):
             "a" * 40,
             self.config["application_image"] + "@sha256:" + "a" * 64,
         )
+
+    def test_rendered_privileged_workflows_keep_the_same_hash_lock(self):
+        self.render()
+        output = self.output
+        canonical = (settings.PACKAGE / "requirements-parser.lock").read_bytes()
+        self.assertEqual(
+            (output / "release-tools/requirements-parser.lock").read_bytes(), canonical
+        )
+        installs = 0
+        for path in (output / ".github/workflows").glob("*.yml"):
+            workflow = yaml.safe_load(path.read_text())
+            for job in workflow["jobs"].values():
+                for step in job["steps"]:
+                    for line in step.get("run", "").splitlines():
+                        if "pip install" not in line:
+                            continue
+                        args = shlex.split(line)
+                        self.assertIn("--require-hashes", args)
+                        self.assertIn("--only-binary=:all:", args)
+                        lock = output / args[args.index("-r") + 1]
+                        self.assertEqual(lock.read_bytes(), canonical)
+                        installs += 1
+        self.assertEqual(installs, 5)
 
     def test_custom_site_renders_consistently_and_stays_suspended(self):
         self.render()

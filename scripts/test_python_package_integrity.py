@@ -1,4 +1,4 @@
-"""Exercise the Docker install boundary with an attacker-substituted wheel."""
+"""Source-only image install checks; not exported into GitOps scaffolds."""
 
 import hashlib
 import pathlib
@@ -9,9 +9,7 @@ import tempfile
 import unittest
 import zipfile
 
-import prepare
 import settings
-import yaml
 
 
 class PackageIntegrityTests(unittest.TestCase):
@@ -78,29 +76,6 @@ class PackageIntegrityTests(unittest.TestCase):
         result = self.install("guard-integrity-probe==1.0 --hash=sha256:" + self.digest)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue((self.root / "installed/guard_integrity_probe.py").is_file())
-
-    def test_rendered_privileged_workflows_keep_the_same_hash_lock(self):
-        output = self.root / "rendered"
-        prepare.render({**settings.DEFAULTS, "code_path": "release-tools"}, output)
-        canonical = (settings.PACKAGE / "requirements-parser.lock").read_bytes()
-        self.assertEqual(
-            (output / "release-tools/requirements-parser.lock").read_bytes(), canonical
-        )
-        installs = 0
-        for path in (output / ".github/workflows").glob("*.yml"):
-            workflow = yaml.safe_load(path.read_text())
-            for job in workflow["jobs"].values():
-                for step in job["steps"]:
-                    for line in step.get("run", "").splitlines():
-                        if "pip install" not in line:
-                            continue
-                        args = shlex.split(line)
-                        self.assertIn("--require-hashes", args)
-                        self.assertIn("--only-binary=:all:", args)
-                        lock = output / args[args.index("-r") + 1]
-                        self.assertEqual(lock.read_bytes(), canonical)
-                        installs += 1
-        self.assertEqual(installs, 5)
 
     def test_runtime_lock_keeps_the_declared_input_pins(self):
         locked = (settings.PACKAGE / "requirements.lock").read_text() + (

@@ -69,6 +69,10 @@ Other tests verify all five rendered privileged install paths retain the
 same parser lock even when the code path is customized. All 153 Python tests,
 dependency consistency checks, Ruff, and workflow syntax checks passed locally
 on Python 3.14, including a fresh Guard install using only hash-verified wheels.
+The four source-only image/lock checks live in `scripts/` and run explicitly
+in repository CI. They are not copied into generated GitOps repositories,
+which intentionally do not contain the controller image's Dockerfile/runtime
+lock. The generated GitOps self-test suite runs all 149 controller/portable-lock tests.
 
 ## Decisions
 

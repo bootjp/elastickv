@@ -4,11 +4,13 @@ on:
     paths:
       - 'deploy/automation/**'
       - 'scripts/check-pypi-package-guard.sh'
+      - 'scripts/test_python_package_integrity.py'
       - '.github/workflows/deployment-automation.yml'
   push:
     paths:
       - 'deploy/automation/**'
       - 'scripts/check-pypi-package-guard.sh'
+      - 'scripts/test_python_package_integrity.py'
       - '.github/workflows/deployment-automation.yml'
 permissions:
   contents: read
@@ -41,8 +43,12 @@ jobs:
         run: bash scripts/check-pypi-package-guard.sh
       - name: Check Python source
         run: |
-          ruff check --select E4,E7,E9,F,I deploy/automation/*.py
-          ruff format --check deploy/automation/*.py
+          ruff check --select E4,E7,E9,F,I deploy/automation/*.py scripts/test_python_package_integrity.py
+          ruff format --check deploy/automation/*.py scripts/test_python_package_integrity.py
+      - name: Verify Python artifact integrity and portable locks
+        env:
+          PYTHONPATH: deploy/automation
+        run: python3 -m unittest discover -s scripts -p test_python_package_integrity.py -v
       - name: Test controllers and render isolated examples
         run: python3 -m unittest discover -s deploy/automation -v
 
