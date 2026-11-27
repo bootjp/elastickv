@@ -37,9 +37,10 @@ type request struct {
 }
 
 type response struct {
-	Type  string `json:"type"`
-	Value any    `json:"value"`
-	Error string `json:"error,omitempty"`
+	Type        string  `json:"type"`
+	Value       any     `json:"value"`
+	Error       string  `json:"error,omitempty"`
+	CommitIndex *uint64 `json:"commit_index,omitempty"`
 }
 
 type rpcClient struct {
@@ -69,25 +70,28 @@ func (c rpcClient) read(ctx context.Context, key []byte) ([]byte, error) {
 	return result.GetValue(), nil
 }
 
-func (c rpcClient) write(ctx context.Context, key, value []byte) error {
+func (c rpcClient) write(ctx context.Context, key, value []byte) (uint64, error) {
 	var success bool
+	var commitIndex uint64
 	if c.api == apiRaw {
 		result, err := c.raw.RawPut(ctx, &pb.RawPutRequest{Key: key, Value: value})
 		if err != nil {
-			return fmt.Errorf("write register: %w", err)
+			return 0, fmt.Errorf("write register: %w", err)
 		}
 		success = result.GetSuccess()
+		commitIndex = result.GetCommitIndex()
 	} else {
 		result, err := c.txn.Put(ctx, &pb.PutRequest{Key: key, Value: value})
 		if err != nil {
-			return fmt.Errorf("write register: %w", err)
+			return 0, fmt.Errorf("write register: %w", err)
 		}
 		success = result.GetSuccess()
+		commitIndex = result.GetCommitIndex()
 	}
 	if !success {
-		return errors.New("write response did not confirm success")
+		return 0, errors.New("write response did not confirm success")
 	}
-	return nil
+	return commitIndex, nil
 }
 
 func (c rpcClient) deleteResponse(ctx context.Context, key []byte) response {
@@ -101,7 +105,8 @@ func (c rpcClient) deleteResponse(ctx context.Context, key []byte) response {
 	if !result.GetSuccess() {
 		return response{Type: outcomeInfo, Error: "delete response did not confirm success"}
 	}
-	return response{Type: outcomeOK}
+	commitIndex := result.GetCommitIndex()
+	return response{Type: outcomeOK, CommitIndex: &commitIndex}
 }
 
 func (c rpcClient) readResponse(ctx context.Context, key []byte) response {
@@ -130,12 +135,13 @@ func (c rpcClient) invoke(ctx context.Context, req request) response {
 		if req.Value == nil {
 			return response{Type: outcomeFail, Error: "write value is required"}
 		}
-		if err := c.write(ctx, []byte(req.Key), []byte(strconv.FormatInt(*req.Value, 10))); err != nil {
+		commitIndex, err := c.write(ctx, []byte(req.Key), []byte(strconv.FormatInt(*req.Value, 10)))
+		if err != nil {
 			// An RPC error can follow a successful commit. Never retry a write
 			// or classify its outcome as a definite abort.
 			return response{Type: outcomeInfo, Error: err.Error()}
 		}
-		return response{Type: outcomeOK, Value: *req.Value}
+		return response{Type: outcomeOK, Value: *req.Value, CommitIndex: &commitIndex}
 	case "delete":
 		return c.deleteResponse(ctx, []byte(req.Key))
 	case "read":

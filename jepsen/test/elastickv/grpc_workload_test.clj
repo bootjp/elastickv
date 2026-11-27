@@ -29,6 +29,8 @@
           (is (= :info (:type result)))
           (is (= (:value write) (:value result)))
           (is (= (str "jepsen-grpc/" (name api) "/2") (:key @request)))))
+      (with-redefs [grpc/exchange! (fn [& _] {:type "ok" :commit_index 42})]
+        (is (= 42 (:commit-index (client/invoke! c {} write)))))
       (with-redefs [grpc/exchange! (fn [& _] {:type "ok" :value nil})]
         (is (= (independent/tuple 2 nil)
                (:value (client/invoke! c {} {:f :read :value (independent/tuple 2 nil)})))))
