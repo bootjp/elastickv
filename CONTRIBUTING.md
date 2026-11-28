@@ -59,6 +59,55 @@ Guard blocklist. Anonymous mode does not enable authenticated download
 history or infection notifications. Continue using vulnerability scans and
 source review alongside this filter.
 
+## npm and Python download protection
+
+The admin frontend's `web/admin/.npmrc` selects the anonymous
+[npm Guard registry](https://shisho.dev/docs/ja/t/guard/quickstart/npm/).
+Run `npm ci` from `web/admin`; CI and the Docker SPA build use the same
+registry. Keep the lockfile's versions and integrity hashes. Guard supports
+existing npmjs lockfile URLs; newly updated entries may contain Guard URLs.
+To check a real download and the provider's harmless blocked package with
+an isolated cache and without executing package scripts:
+
+```bash
+bash scripts/check-npm-package-guard.sh
+```
+
+The Python controller, its CI, and portable GitOps workflow examples use
+the anonymous [PyPI Guard index](https://shisho.dev/docs/ja/t/guard/quickstart/pypi/).
+For local pip use, activate a Python 3.14 virtual environment, then configure only
+the current shell:
+
+```bash
+export PIP_INDEX_URL=https://pypi.flatt.tech/simple/
+export PIP_CONFIG_FILE=/dev/null
+export PIP_EXTRA_INDEX_URL=''
+export PIP_FIND_LINKS=''
+pip install --require-hashes --only-binary=:all: -r deploy/automation/requirements.lock
+bash scripts/check-pypi-package-guard.sh
+```
+
+Disabling config-file loading and clearing extra sources prevents a saved
+extra index or find-links directory from bypassing the Guard. Do not add an
+alternate public index. The PyPI check downloads a fresh known-good wheel;
+the provider does not yet document a harmless PyPI block-test package, so
+this is not evidence of an end-to-end Python block rejection.
+
+Python installs verify locally committed SHA-256 hashes for every dependency
+and use wheels only. Hashes come from official PyPI release metadata fetched
+independently of Guard. Keep `requirements-parser.lock` and its portable
+example copy identical when updating them. CI uses the same PyYAML 6.0.3 as
+the controller; Python 3.14 is selected because that release has no 3.15
+wheels. Unhashed source builds and their implicit build dependencies are not
+permitted in these install paths.
+
+Existing caches/layers, direct URL or Git dependencies, local packages, and
+explicit private/scoped registries are outside these registry checks.
+Guard-issued redirects to public artifact hosts are expected. Anonymous
+mode has no authenticated download history or infection notifications.
+For npm publishing, explicitly select the public registry; Guard is a
+read-only proxy. No tokens belong in the committed `.npmrc` or Docker layers.
+
 ## Commits
 
 Short imperative summary with an optional scope prefix matching the touched area (`store:`, `adapter:`, `kv:`, `docs:`, …).

@@ -18,6 +18,10 @@ on:
       - 'automation/**'
       - '.github/workflows/elastickv-compatibility-approval.yml'
 env:
+  PIP_INDEX_URL: https://pypi.flatt.tech/simple/
+  PIP_CONFIG_FILE: /dev/null
+  PIP_EXTRA_INDEX_URL: ''
+  PIP_FIND_LINKS: ''
   ELASTICKV_DEPLOYMENT_CONFIG: automation/deployment.json
 permissions:
   contents: read
@@ -32,9 +36,17 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      # actions/setup-python v7.1.0; PyYAML 6.0.3 has CPython 3.14 wheels.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.14'
+      - name: Create isolated Python environment
+        run: |
+          python3 -m venv "$RUNNER_TEMP/guard-python"
+          echo "$RUNNER_TEMP/guard-python/bin" >> "$GITHUB_PATH"
       - run: |
-          python3 -m pip install PyYAML==6.0.2
-          ELASTICKV_DEPLOYMENT_CONFIG= python3 -m unittest discover -s automation -v
+          python3 -m pip install --require-hashes --only-binary=:all: -r automation/requirements-parser.lock
+          ELASTICKV_DEPLOYMENT_CONFIG='' python3 -m unittest discover -s automation -v
   compatibility-review:
     if: github.event_name == 'workflow_dispatch'
     permissions:
@@ -47,10 +59,18 @@ jobs:
         with:
           ref: main
           persist-credentials: false
+      # actions/setup-python v7.1.0; PyYAML 6.0.3 has CPython 3.14 wheels.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.14'
+      - name: Create isolated Python environment
+        run: |
+          python3 -m venv "$RUNNER_TEMP/guard-python"
+          echo "$RUNNER_TEMP/guard-python/bin" >> "$GITHUB_PATH"
       - name: Test trusted controller and review gates
         run: |
-          python3 -m pip install PyYAML==6.0.2
-          ELASTICKV_DEPLOYMENT_CONFIG= python3 -m unittest discover -s automation -v
+          python3 -m pip install --require-hashes --only-binary=:all: -r automation/requirements-parser.lock
+          ELASTICKV_DEPLOYMENT_CONFIG='' python3 -m unittest discover -s automation -v
       - name: Revalidate immutable proposal and record exact-head check
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -70,7 +90,16 @@ jobs:
         with:
           ref: main
           persist-credentials: false
-      - run: python3 -m pip install PyYAML==6.0.2
+      # actions/setup-python v7.1.0; PyYAML 6.0.3 has CPython 3.14 wheels.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.14'
+      - name: Create isolated Python environment
+        run: |
+          python3 -m venv "$RUNNER_TEMP/guard-python"
+          echo "$RUNNER_TEMP/guard-python/bin" >> "$GITHUB_PATH"
+      - run: |
+          python3 -m pip install --require-hashes --only-binary=:all: -r automation/requirements-parser.lock
       - name: Recheck human consent and merge only the reviewed head
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

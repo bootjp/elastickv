@@ -1,15 +1,19 @@
 name: Admin Frontend
 permissions:
   contents: read
+env:
+  NPM_CONFIG_REGISTRY: https://npm.flatt.tech/
 
 on:
   push:
     paths:
       - "web/admin/**"
+      - "scripts/check-npm-package-guard.sh"
       - ".github/workflows/admin-frontend.yml"
   pull_request:
     paths:
       - "web/admin/**"
+      - "scripts/check-npm-package-guard.sh"
       - ".github/workflows/admin-frontend.yml"
 
 concurrency:
@@ -33,6 +37,8 @@ jobs:
           node-version: 26
           cache: npm
           cache-dependency-path: web/admin/package-lock.json
+      - name: Verify npm package download protection with an empty cache
+        run: bash ../../scripts/check-npm-package-guard.sh
       - run: npm ci --no-audit --no-fund
       - run: npm run lint
       - run: npm run test:run

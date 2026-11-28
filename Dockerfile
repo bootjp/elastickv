@@ -8,7 +8,7 @@ FROM node:26-alpine AS spa-build
 WORKDIR /spa
 # Bring just the package manifests first so the npm cache survives
 # unrelated source changes; the layer rebuilds only when deps shift.
-COPY web/admin/package.json web/admin/package-lock.json ./
+COPY web/admin/package.json web/admin/package-lock.json web/admin/.npmrc ./
 RUN npm ci --no-audit --no-fund
 COPY web/admin/ ./
 # Use `npm run build` (not `npx vite build`) so the package.json

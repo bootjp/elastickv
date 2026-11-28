@@ -1,4 +1,4 @@
-# Go dependency downloads through Takumi Guard
+# Dependency downloads through Takumi Guard
 
 Status: Proposed
 Author: bootjp
@@ -8,8 +8,71 @@ Date: 2026-11-28
 
 Route public Go module downloads in CI, Go image builds, and Jepsen guest
 builds through `https://golang.flatt.tech`. Document the same opt-in setup
-for contributors. Do not change application code, dependency versions,
+for contributors. Do not change application code,
 production deployments, or machine-wide developer settings.
+
+Extend the same anonymous protection to the admin frontend's npm downloads
+and the deployment controller's pip downloads, including portable GitOps
+workflow examples. Keep the application dependency versions and npm integrity
+data. Python's CI parser is aligned to the controller's PyYAML 6.0.3.
+
+## npm and Python boundaries
+
+- Commit `web/admin/.npmrc` pointing to `https://npm.flatt.tech/`. Copy it
+  alongside the manifests before the Docker SPA stage's `npm ci`; runner
+  settings do not propagate into the build stage. Set the CI registry before
+  dependency installation. Existing npmjs lockfile URLs are supported by
+  the provider; verify a cold install rather than updating dependencies.
+- Configure pip's index as `https://pypi.flatt.tech/simple/`. Disable pip
+  configuration-file loading with `PIP_CONFIG_FILE=/dev/null` and clear
+  extra-index and find-links environment settings so an additional source
+  cannot silently bypass the Guard. Apply this in CI, controller images,
+  and the published workflow examples. CI and examples create a job-local
+  venv rather than relying on runner pip config to bypass OS package
+  protection (PEP 668). Local setup remains opt-in.
+- Check npm with an empty cache: fetch a known-good package and require
+  HTTP 403 for `@panda-guard/test-malicious`, without executing scripts or
+  changing the frontend's lockfile. Check pip's effective boundary settings
+  and download a known-good wheel without using the installed/cache state.
+  The provider has no documented PyPI sentinel yet, so do not claim that
+  Python's malicious-package rejection has been demonstrated.
+- Public artifact hosts reached through Guard-issued redirects are expected;
+  direct URL, Git, local, cached, and intentionally private dependencies are
+  outside this registry integration. Publishing requires an explicit public
+  registry and is outside this change.
+
+These boundaries were reviewed before implementation. They add no credentials,
+permissions, application behavior changes, or production mutations.
+
+## Python artifact integrity follow-up
+
+A security review identified that pins alone trust a proxy to supply the
+artifact bytes. All controller, CI, and privileged example installs now use
+`--require-hashes --only-binary=:all:`. Commit the full transitive dependency
+closure in `requirements.lock`, CI tooling in `requirements-ci.lock`, and the
+shared parser hashes in `requirements-parser.lock` and its identical portable
+example copy. SHA-256 values come from official PyPI release JSON fetched
+independently of Guard; do not bootstrap trust from the proxy's returned hash.
+Keep the small `requirements.txt` as input pins; tests reject drift from the lock.
+
+Use Python 3.14 for CI and the controller instead of 3.15: PyYAML 6.0.3 has
+3.14 wheels and no 3.15 wheels. Align CI's old 6.0.2 parser pin to that same
+6.0.3 release. Reject source builds to avoid implicit unhashed build-tool
+downloads. Pin the official setup-python v7.1.0 Action by full commit SHA.
+No Go server or data-format behavior changes.
+
+The regression derives the install flags from the real controller Dockerfile.
+It demonstrated acceptance of a substituted, unhashed version-pinned wheel
+before the fix. After the fix, both missing and incorrect local hashes reject
+the artifact before installation; a matching trusted hash still installs.
+Other tests verify all five rendered privileged install paths retain the
+same parser lock even when the code path is customized. All 153 Python tests,
+dependency consistency checks, Ruff, and workflow syntax checks passed locally
+on Python 3.14, including a fresh Guard install using only hash-verified wheels.
+The four source-only image/lock checks live in `scripts/` and run explicitly
+in repository CI. They are not copied into generated GitOps repositories,
+which intentionally do not contain the controller image's Dockerfile/runtime
+lock. The generated GitOps self-test suite runs all 149 controller/portable-lock tests.
 
 ## Decisions
 
@@ -61,6 +124,12 @@ controller provisioner set it independently. The test workflow's `rest`
 shard runs the empty-cache positive/negative check. Contributor instructions
 cover local use, cache limitations, checksum verification, and private modules.
 
+The npm/Python extension adds the frontend project registry and its Docker
+COPY boundary, the frontend CI canary, pip-only configuration in the controller
+image/CI and three portable workflow examples, and a fresh-wheel pip check.
+The example-publication test permits the exact public `pypi.flatt.tech` host;
+private addresses and deployment-specific hosts remain rejected.
+
 Verified on 2026-11-28:
 
 - The cold-cache canary downloaded `github.com/pkg/errors@v0.9.1` and
@@ -68,6 +137,13 @@ Verified on 2026-11-28:
 - `go mod download` with a separate empty cache and the Guard-only proxy
   fetched the repository's dependencies and `go1.27.4` successfully.
 - The canary rejected a configuration pointing to `proxy.golang.org`.
+- Node 26.13.1 / npm 11.20.0 installed the frontend from an empty cache
+  through Guard, with the existing lockfile unchanged. Frontend lint,
+  all 21 tests, and the production build passed. The npm sentinel was
+  rejected with HTTP 403 and a known-good tarball downloaded successfully.
+- A clean Python virtual environment installed all controller dependencies
+  and Ruff through the Guard index. The fresh-wheel check passed. No PyPI
+  sentinel rejection is claimed.
 - Review regression tests reproduce saved private-module exceptions and
   an existing Go binary outside `/usr/local/go/bin`. Both failed before
   the fixes: use nonempty `none` overrides in the canary and the detected
@@ -87,3 +163,7 @@ run locally. Production data and backups are outside this change.
 ## Reference
 
 [Provider release note](https://shisho.dev/docs/ja/r/202605-takumi-guard-golang/).
+[npm setup](https://shisho.dev/docs/ja/t/guard/quickstart/npm/),
+[PyPI setup](https://shisho.dev/docs/ja/t/guard/quickstart/pypi/), and
+[sentinel availability](https://shisho.dev/docs/t/guard/features/admin-deployment/).
+[pip secure installs](https://pip.pypa.io/en/stable/topics/secure-installs/).

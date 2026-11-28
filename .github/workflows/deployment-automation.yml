@@ -3,13 +3,22 @@ on:
   pull_request:
     paths:
       - 'deploy/automation/**'
+      - 'scripts/check-pypi-package-guard.sh'
+      - 'scripts/test_python_package_integrity.py'
       - '.github/workflows/deployment-automation.yml'
   push:
     paths:
       - 'deploy/automation/**'
+      - 'scripts/check-pypi-package-guard.sh'
+      - 'scripts/test_python_package_integrity.py'
       - '.github/workflows/deployment-automation.yml'
 permissions:
   contents: read
+env:
+  PIP_INDEX_URL: https://pypi.flatt.tech/simple/
+  PIP_CONFIG_FILE: /dev/null
+  PIP_EXTRA_INDEX_URL: ''
+  PIP_FIND_LINKS: ''
 jobs:
   offline-checks:
     runs-on: ubuntu-latest
@@ -17,12 +26,29 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - name: Set up Python with locked wheel support
+        # actions/setup-python v7.1.0
+        # Pin an interpreter with wheels for the hash-locked parser dependency.
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.14'
+      - name: Create job-local virtual environment
+        run: |
+          python3 -m venv "$RUNNER_TEMP/guard-python"
+          echo "$RUNNER_TEMP/guard-python/bin" >> "$GITHUB_PATH"
       - name: Install YAML parser
-        run: python3 -m pip install PyYAML==6.0.2 ruff==0.9.10
+        run: |
+          python3 -m pip install --require-hashes --only-binary=:all: -r deploy/automation/requirements-ci.lock
+      - name: Verify PyPI package download protection with an empty cache
+        run: bash scripts/check-pypi-package-guard.sh
       - name: Check Python source
         run: |
-          ruff check --select E4,E7,E9,F,I deploy/automation/*.py
-          ruff format --check deploy/automation/*.py
+          ruff check --select E4,E7,E9,F,I deploy/automation/*.py scripts/test_python_package_integrity.py
+          ruff format --check deploy/automation/*.py scripts/test_python_package_integrity.py
+      - name: Verify Python artifact integrity and portable locks
+        env:
+          PYTHONPATH: deploy/automation
+        run: python3 -m unittest discover -s scripts -p test_python_package_integrity.py -v
       - name: Test controllers and render isolated examples
         run: python3 -m unittest discover -s deploy/automation -v
 

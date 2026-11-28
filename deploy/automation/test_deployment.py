@@ -4,6 +4,7 @@ import copy
 import json
 import os
 import pathlib
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -115,6 +116,29 @@ class RenderTests(unittest.TestCase):
             "a" * 40,
             self.config["application_image"] + "@sha256:" + "a" * 64,
         )
+
+    def test_rendered_privileged_workflows_keep_the_same_hash_lock(self):
+        self.render()
+        output = self.output
+        canonical = (settings.PACKAGE / "requirements-parser.lock").read_bytes()
+        self.assertEqual(
+            (output / "release-tools/requirements-parser.lock").read_bytes(), canonical
+        )
+        installs = 0
+        for path in (output / ".github/workflows").glob("*.yml"):
+            workflow = yaml.safe_load(path.read_text())
+            for job in workflow["jobs"].values():
+                for step in job["steps"]:
+                    for line in step.get("run", "").splitlines():
+                        if "pip install" not in line:
+                            continue
+                        args = shlex.split(line)
+                        self.assertIn("--require-hashes", args)
+                        self.assertIn("--only-binary=:all:", args)
+                        lock = output / args[args.index("-r") + 1]
+                        self.assertEqual(lock.read_bytes(), canonical)
+                        installs += 1
+        self.assertEqual(installs, 5)
 
     def test_custom_site_renders_consistently_and_stays_suspended(self):
         self.render()
@@ -350,12 +374,25 @@ class PublicationTests(unittest.TestCase):
                 str(path),
             )
             for sha in re.findall(r"\b[0-9a-f]{40}\b", text):
+                # Official setup-python v7.1.0 pin is public supply-chain metadata.
+                if (
+                    sha == "6d4fd22b20465ccc0f7354476588e8df7c9ca0e0"
+                    and f"actions/setup-python@{sha}" in text
+                ):
+                    continue
                 self.assertEqual({"0"}, set(sha), str(path))
             for host in re.findall(r"https?://([A-Za-z0-9.-]+)", text):
                 self.assertTrue(
                     host.endswith((".svc", ".example.com", ".example.test", ".invalid"))
                     or host
-                    in ("example.com", "github.com", "api.github.com", "kubernetes.io"),
+                    in (
+                        "example.com",
+                        "github.com",
+                        "api.github.com",
+                        "kubernetes.io",
+                        # Public package proxy, not a deployment-specific host.
+                        "pypi.flatt.tech",
+                    ),
                     (str(path), host),
                 )
 

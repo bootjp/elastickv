@@ -6,6 +6,11 @@ permissions:
   contents: read
   pull-requests: read
   actions: write
+env:
+  PIP_INDEX_URL: https://pypi.flatt.tech/simple/
+  PIP_CONFIG_FILE: /dev/null
+  PIP_EXTRA_INDEX_URL: ''
+  PIP_FIND_LINKS: ''
 jobs:
   dispatch-approved:
     if: >-
@@ -18,7 +23,16 @@ jobs:
         with:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
-      - run: python3 -m pip install PyYAML==6.0.2
+      # actions/setup-python v7.1.0; PyYAML 6.0.3 has CPython 3.14 wheels.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.14'
+      - name: Create isolated Python environment
+        run: |
+          python3 -m venv "$RUNNER_TEMP/guard-python"
+          echo "$RUNNER_TEMP/guard-python/bin" >> "$GITHUB_PATH"
+      - run: |
+          python3 -m pip install --require-hashes --only-binary=:all: -r automation/requirements-parser.lock
       - name: Dispatch trusted-main verification for exact human-reviewed head
         env:
           ELASTICKV_DEPLOYMENT_CONFIG: automation/deployment.json
