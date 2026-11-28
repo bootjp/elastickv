@@ -57,6 +57,26 @@ and human approval are independent requirements. A blocker or incomplete/truncat
 analysis cannot be overridden by simply approving or marking a Draft ready; it
 needs a separately designed, reviewed compatibility/migration profile.
 
+Diagnostic gzip artifacts under the canonical `docs/evidence/` path are reported
+as review attention rather than executable source. This narrow classification
+requires non-executable regular files, a gzip header for nonempty blobs, and a `.pprof`, `.cpu`,
+`.block`, `.mutex`, `.log.gz` or `.tar.gz` suffix on both sides of a rename.
+They remain in the complete inventory and hash-verified archive and consume the
+same file, byte and publication budgets. Nested contents are opaque: the audit
+does not decompress or execute diagnostic archives or certify their contents.
+Unknown binaries, executable/symlink modes, runtime paths, `.go`/`.proto` source
+and independent persistence-removal findings are not exempt. Reviewers must still
+check any runtime/build use of an artifact; its path does not prove non-use.
+
+Within one changed file, the audit can match a unique constant marker rename that changes
+only the first letter's export case, such as `snapshotVersion` to `SnapshotVersion`.
+Its complete initializer and declaration kind must remain unchanged. Explicit
+types must match; a standalone untyped decimal `const` may acquire a fixed-width
+unsigned type only if that identical literal fits. Arbitrary renames, ambiguous
+spellings, mutable variable renames or duplicate declarations cannot justify the exception. Value changes,
+explicit type changes, removals and incomplete initializers still block. A matched
+rename is recorded as attention, not a proof of call-site semantic equivalence.
+
 Source review defaults to 200 changed tree paths. An explicitly reviewed profile
 may set `source_review_limits.max_files` up to 1000. At GitHub's 300-file comparison
 cap, complete old/new Git inventories supply every changed path; archive contents
