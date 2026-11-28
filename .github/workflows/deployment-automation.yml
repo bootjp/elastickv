@@ -31,7 +31,7 @@ jobs:
         # Pin an interpreter with wheels for the hash-locked parser dependency.
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
         with:
-          python-version: '3.14'
+          python-version: '3.15'
       - name: Create job-local virtual environment
         run: |
           python3 -m venv "$RUNNER_TEMP/guard-python"
