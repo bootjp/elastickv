@@ -96,9 +96,9 @@ this is not evidence of an end-to-end Python block rejection.
 Python installs verify locally committed SHA-256 hashes for every dependency
 and use wheels only. Hashes come from official PyPI release metadata fetched
 independently of Guard. Keep `requirements-parser.lock` and its portable
-example copy identical when updating them. CI uses the same PyYAML 6.0.3 as
-the controller; Python 3.14 is selected because that release has no 3.15
-wheels. Unhashed source builds and their implicit build dependencies are not
+example copy identical when updating them. CI and the controller share the
+parser lock and use Python 3.14 with compatible wheels. Unhashed source
+builds and their implicit build dependencies are not
 permitted in these install paths.
 
 Existing caches/layers, direct URL or Git dependencies, local packages, and
