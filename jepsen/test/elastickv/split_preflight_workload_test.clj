@@ -170,6 +170,28 @@
               {:f :read :tag :member-read :type :ok :node node :value [k v]}))
           (range))))
 
+(deftest membership-seeds-wait-for-ingress-leadership-and-a-public-read
+  (let [catalog {:leader_id "n1" :term 3}
+        target {:leader_id "n3" :term 3}
+        round (atom 0)
+        probes (atom [])
+        status (fn [group node]
+                 (cond
+                   (= [1 1 "n2"] [@round group node]) {:leader_id "n3" :term 2}
+                   (= [2 2 "n2"] [@round group node]) {:leader_id "n3" :term 2}
+                   (= group 1) catalog
+                   :else target))
+        readable? (fn [node]
+                    (swap! probes conj [@round node])
+                    (not= [3 "n2"] [@round node]))
+        poll (fn [_ _ ready?]
+               (some (fn [attempt] (reset! round attempt) (ready?)) (range 1 5)))]
+    (with-redefs-fn {#'pf/group-status status
+                     #'pf/seed-ingress-readable? readable?
+                     #'pf/poll! poll}
+      #(is (= ["n1" "n2" "n3"] (#'pf/wait-seed-ingresses! catalog target))))
+    (is (= [[3 "n1"] [3 "n2"] [4 "n1"] [4 "n2"] [4 "n3"]] @probes))))
+
 (deftest target-membership-requires-a-paused-cutover-and-correct-recovered-reads
   (let [h (target-membership-history)
         valid? #(:valid? (checker/check (pf/membership-checker) {} % {}))]
