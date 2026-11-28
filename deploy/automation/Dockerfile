@@ -6,7 +6,7 @@ WORKDIR /src
 COPY . .
 RUN CGO_ENABLED=0 go build -o /raftadmin ./cmd/raftadmin
 
-# PyYAML 6.0.3 publishes CPython 3.14 wheels; do not fetch build dependencies.
+# Use an interpreter covered by the locked wheels; do not fetch build dependencies.
 FROM python:3.14-slim-bookworm
 ENV PIP_INDEX_URL=https://pypi.flatt.tech/simple/ PIP_CONFIG_FILE=/dev/null \
     PIP_EXTRA_INDEX_URL="" PIP_FIND_LINKS=""
